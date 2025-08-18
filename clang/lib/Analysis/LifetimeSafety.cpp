@@ -384,11 +384,11 @@ private:
   llvm::BumpPtrAllocator FactAllocator;
 };
 
-class FactGenerator : public ConstStmtVisitor<FactGenerator> {
-  using Base = ConstStmtVisitor<FactGenerator>;
+class FactGeneratorVisitor : public ConstStmtVisitor<FactGeneratorVisitor> {
+  using Base = ConstStmtVisitor<FactGeneratorVisitor>;
 
 public:
-  FactGenerator(FactManager &FactMgr) : FactMgr(FactMgr) {}
+  FactGeneratorVisitor(FactManager &FactMgr) : FactMgr(FactMgr) {}
 
   void startBlock(const CFGBlock *Block) {
     CurrentBlock = Block;
@@ -544,11 +544,13 @@ private:
   llvm::SmallVector<Fact *> CurrentBlockFacts;
 };
 
-class FactGeneratorDriver : public RecursiveASTVisitor<FactGeneratorDriver> {
+class FactGenerator : public RecursiveASTVisitor<FactGenerator> {
 public:
-  FactGeneratorDriver(FactGenerator &FG, AnalysisDeclContext &AC)
-      : FG(FG), AC(AC) {}
+  FactGenerator(FactManager &FactMgr, AnalysisDeclContext &AC)
+      : FG(FactMgr), AC(AC) {}
+
   bool shouldTraversePostOrder() const { return true; }
+
   void run() {
     llvm::TimeTraceScope TimeProfile("FactGenerator");
     // Iterate through the CFG blocks in reverse post-order to ensure that
@@ -579,16 +581,17 @@ public:
 
 private:
   struct FactGeneratorBlockRAII {
-    FactGeneratorBlockRAII(FactGenerator &FG, const CFGBlock *Block) : FG(FG) {
+    FactGeneratorBlockRAII(FactGeneratorVisitor &FG, const CFGBlock *Block)
+        : FG(FG) {
       FG.startBlock(Block);
     }
     ~FactGeneratorBlockRAII() { FG.endBlock(); }
 
   private:
-    FactGenerator FG;
+    FactGeneratorVisitor &FG;
   };
 
-  FactGenerator &FG;
+  FactGeneratorVisitor FG;
   AnalysisDeclContext &AC;
   llvm::DenseSet<const Stmt *> VisitedStmts;
 };
@@ -1136,9 +1139,8 @@ void LifetimeSafetyAnalysis::run() {
   DEBUG_WITH_TYPE("PrintCFG", Cfg.dump(AC.getASTContext().getLangOpts(),
                                        /*ShowColors=*/true));
 
-  FactGenerator Generator(*FactMgr);
-  FactGeneratorDriver Driver(Generator, AC);
-  Driver.run();
+  FactGenerator FG(*FactMgr, AC);
+  FG.run();
   DEBUG_WITH_TYPE("LifetimeFacts", FactMgr->dump(Cfg, AC));
 
   /// TODO(opt): Consider optimizing individual blocks before running the
