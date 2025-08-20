@@ -66,6 +66,7 @@ enum class DisableValidationForModuleKind {
 class PreprocessorOptions {
 public:
   std::vector<std::pair<std::string, bool/*isUndef*/>> Macros;
+  std::vector<std::string> BlockedMacros;
   std::vector<std::string> Includes;
   std::vector<std::string> MacroIncludes;
 
@@ -238,6 +239,10 @@ public:
   }
   void addMacroUndef(StringRef Name) {
     Macros.emplace_back(std::string(Name), true);
+  }
+
+  void addBlockedMacro(StringRef Name) {
+    BlockedMacros.emplace_back(std::string(Name));
   }
 
   void addRemappedFile(StringRef From, StringRef To) {

@@ -8511,3 +8511,12 @@ def spirv : DXCFlag<"spirv">,
 def fspv_target_env_EQ : Joined<["-"], "fspv-target-env=">, Group<dxc_Group>,
   HelpText<"Specify the target environment">,
   Values<"vulkan1.2, vulkan1.3">;
+
+// TENJIN: Command-line options for blocking the expansion of macros.
+def block_macro : Separate<["--"], "block-macro">, Group<Preprocessor_Group>,
+  Visibility<[ClangOption, CC1Option]>, MetaVarName<"<macro>">,
+  HelpText<"Block the macro expansion of <macro>">,
+  MarshallingInfoStringVector<PreprocessorOpts<"BlockedMacros">>;
+def block_macros_file : Joined<["--"], "block-macros-file=">,
+  Group<Preprocessor_Group>, Visibility<[ClangOption, CC1Option]>,
+  MetaVarName<"<file>">, HelpText<"Read macro names to block from <file>">;

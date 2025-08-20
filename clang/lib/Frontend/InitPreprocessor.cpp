@@ -1445,6 +1445,9 @@ void clang::InitializePreprocessor(Preprocessor &PP,
                          PP.getDiagnostics());
   }
 
+  // TENJIN: Pass in the blocked macros to the preprocessor.
+  PP.setBlockedMacros(InitOpts.BlockedMacros);
+
   // Exit the command line and go back to <built-in> (2 is LC_LEAVE).
   Builder.append("# 1 \"<built-in>\" 2");
 
