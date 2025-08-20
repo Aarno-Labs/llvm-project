@@ -4963,6 +4963,38 @@ static bool ParsePreprocessorArgs(PreprocessorOptions &Opts, ArgList &Args,
       Opts.addMacroUndef(A->getValue());
   }
 
+  // TENJIN: check if we have any macros that should be blocked (not expanded)
+  // by the preprocessor.
+  if (const Arg *A = Args.getLastArg(OPT_block_macros_file)) {
+    StringRef MacroFilePath = A->getValue();
+
+    llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> Buffer =
+        llvm::MemoryBuffer::getFile(MacroFilePath);
+
+    // Check if there was an error opening the file.
+    if (auto Err = Buffer.getError()) {
+      // Report the error that the file could not be opened.
+      Diags.Report(clang::diag::err_cannot_open_file)
+          << MacroFilePath << Err.message();
+    } else {
+      // No error, so process the buffer by splitting the content into macros.
+      llvm::StringRef FileContent = Buffer.get()->getBuffer();
+      while (!FileContent.empty()) {
+        llvm::StringRef Macro;
+        std::tie(Macro, FileContent) = FileContent.split("\n");
+        llvm::StringRef TrimmedMacro = Macro.trim();
+
+        // Skip any empty or commented-out lines.
+        if (TrimmedMacro.empty() || TrimmedMacro.starts_with("#"))
+          continue;
+
+        // Add the current macro to the blocked macro list in the preprocessor
+        // options.
+        Opts.addBlockedMacro(TrimmedMacro.str());
+      }
+    }
+  }
+
   // Add the ordered list of -includes.
   for (const auto *A : Args.filtered(OPT_include))
     Opts.Includes.emplace_back(A->getValue());

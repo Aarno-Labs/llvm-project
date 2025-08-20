@@ -304,6 +304,9 @@ class Preprocessor {
   /// True to avoid tearing down the lexer etc on EOF
   bool IncrementalProcessing = false;
 
+  /// Set of all macros for which we will block expansion.
+  llvm::StringSet<> BlockedMacros;
+
 public:
   /// The kind of translation unit we are processing.
   const TranslationUnitKind TUKind;
@@ -1430,6 +1433,17 @@ public:
     if (auto MD = getMacroDefinition(II))
       return MD.getMacroInfo();
     return nullptr;
+  }
+
+  void setBlockedMacros(llvm::ArrayRef<std::string> Names) {
+    BlockedMacros.clear();
+    for (const auto &N : Names) {
+      BlockedMacros.insert(N);
+    }
+  }
+
+  bool isMacroBlocked(const IdentifierInfo &II) const {
+    return BlockedMacros.contains(II.getName());
   }
 
   /// Given an identifier, return the latest non-imported macro

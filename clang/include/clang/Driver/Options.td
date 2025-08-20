@@ -9446,3 +9446,12 @@ def wasm_opt : Flag<["--"], "wasm-opt">,
   Group<m_Group>,
   HelpText<"Enable the wasm-opt optimizer (default)">,
   MarshallingInfoNegativeFlag<LangOpts<"NoWasmOpt">>;
+
+// TENJIN: Command-line options for blocking the expansion of macros.
+def block_macro : Separate<["--"], "block-macro">, Group<Preprocessor_Group>,
+  Visibility<[ClangOption, CC1Option]>, MetaVarName<"<macro>">,
+  HelpText<"Block the macro expansion of <macro>">,
+  MarshallingInfoStringVector<PreprocessorOpts<"BlockedMacros">>;
+def block_macros_file : Joined<["--"], "block-macros-file=">,
+  Group<Preprocessor_Group>, Visibility<[ClangOption, CC1Option]>,
+  MetaVarName<"<file>">, HelpText<"Read macro names to block from <file>">;

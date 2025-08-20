@@ -1061,7 +1061,8 @@ void Clang::AddPreprocessingOptions(Compilation &C, const JobAction &JA,
 
   Args.addAllArgs(CmdArgs,
                   {options::OPT_D, options::OPT_U, options::OPT_I_Group,
-                   options::OPT_F, options::OPT_embed_dir_EQ});
+                   options::OPT_F, options::OPT_embed_dir_EQ,
+                   options::OPT_block_macros_file, options::OPT_block_macro});
 
   // Add -Wp, and -Xpreprocessor if using the preprocessor.
 

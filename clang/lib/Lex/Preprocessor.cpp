@@ -797,6 +797,10 @@ bool Preprocessor::HandleIdentifier(Token &Identifier) {
 
   IdentifierInfo &II = *Identifier.getIdentifierInfo();
 
+  // TENJIN: If it's a macro we are blocking, then don't expand.
+  if (isMacroBlocked(II))
+    return true;
+
   // If the information about this identifier is out of date, update it from
   // the external source.
   // We have to treat __VA_ARGS__ in a special way, since it gets
