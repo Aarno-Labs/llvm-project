@@ -8520,3 +8520,7 @@ def block_macro : Separate<["--"], "block-macro">, Group<Preprocessor_Group>,
 def block_macros_file : Joined<["--"], "block-macros-file=">,
   Group<Preprocessor_Group>, Visibility<[ClangOption, CC1Option]>,
   MetaVarName<"<file>">, HelpText<"Read macro names to block from <file>">;
+def refold_map : Joined<["--"], "refold-map=">,
+  Group<Preprocessor_Group>, Visibility<[ClangOption, CC1Option]>,
+  MetaVarName<"<file>">, HelpText<"Write macro-refolding JSON data to <file>">,
+  MarshallingInfoString<PreprocessorOpts<"RefoldMapFile">>;

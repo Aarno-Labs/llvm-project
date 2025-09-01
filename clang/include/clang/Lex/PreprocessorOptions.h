@@ -104,6 +104,9 @@ public:
   /// The implicit PCH included at the start of the translation unit, or empty.
   std::string ImplicitPCHInclude;
 
+  /// Path to write the refolding JSON (".refold.json").
+  std::string RefoldMapFile;
+
   /// Headers that will be converted to chained PCHs in memory.
   std::vector<std::string> ChainedIncludes;
 

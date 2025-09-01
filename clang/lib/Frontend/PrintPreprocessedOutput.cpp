@@ -11,22 +11,33 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "clang/Frontend/Utils.h"
 #include "clang/Basic/CharInfo.h"
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/SourceManager.h"
+#include "clang/Basic/TokenKinds.h"
 #include "clang/Frontend/PreprocessorOutputOptions.h"
+#include "clang/Frontend/Utils.h"
 #include "clang/Lex/MacroInfo.h"
 #include "clang/Lex/PPCallbacks.h"
 #include "clang/Lex/Pragma.h"
 #include "clang/Lex/Preprocessor.h"
+#include "clang/Lex/PreprocessorOptions.h"
 #include "clang/Lex/TokenConcatenation.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/JSON.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
+#include <cctype>
 #include <cstdio>
+#include <string>
+#include <vector>
+
 using namespace clang;
 
 /// PrintMacroDefinition - Print a macro definition in a form that will be
@@ -76,12 +87,15 @@ static void PrintMacroDefinition(const IdentifierInfo &II, const MacroInfo &MI,
 //===----------------------------------------------------------------------===//
 
 namespace {
+
 class PrintPPOutputPPCallbacks : public PPCallbacks {
   Preprocessor &PP;
   SourceManager &SM;
   TokenConcatenation ConcatInfo;
+
 public:
   raw_ostream *OS;
+
 private:
   unsigned CurLine;
 
@@ -232,6 +246,7 @@ public:
   void BeginModule(const Module *M);
   void EndModule(const Module *M);
 };
+
 }  // end anonymous namespace
 
 void PrintPPOutputPPCallbacks::WriteLineInfo(unsigned LineNo,
@@ -753,18 +768,682 @@ void PrintPPOutputPPCallbacks::HandleNewlinesInToken(const char *TokStr,
   CurLine += NumNewlines;
 }
 
-
 namespace {
+
+struct TokenSpan {
+  // Half-open token range over the printed stream: [Begin, End)
+  uint64_t Begin = 0, End = 0;
+  bool Open = false; // true while we're still inside this contiguous run.
+};
+
+enum ItemKind { IK_Directive, IK_Macro, IK_File };
+
+struct Item {
+  int ID = -1;
+  ItemKind Kind = IK_File;
+  std::string Subkind;        // "#include", "#define", ...
+  std::string Name;           // macro name
+  std::string Text;           // directive text
+  std::string InvocationText; // macro call text
+  SourceLocation Loc;         // primary location
+  std::vector<TokenSpan> Spans;
+
+  // main-file byte range of the macro invocation (if applicable)
+  long long InvBegin = -1;
+  long long InvEnd = -1;
+
+  // --- New: include-site anchors and structure ---
+  long long SiteBegin = -1; // byte offset of '#' in the directive's file
+  long long SiteEnd = -1;   // one-past-end of the directive line (incl. EOL)
+  std::string SitePath;     // file path that contains the directive
+  std::string TargetPath;   // resolved included file, if known
+  bool IsAngled = false;    // <...> vs "..."
+  int Parent = -1;          // parent include item id, or -1 if top-level
+};
+
+// map a printed PP token to its main-file byte range
+struct TokMapEntry {
+  std::string File;  // path of the source file containing [SrcBegin,SrcEnd)
+  uint64_t PPIndex = 0;
+  long long SrcBegin = -1;
+  long long SrcEnd = -1;
+};
+
+struct CondArm {
+  std::string Tag;  // "if","ifdef","ifndef","elif","else"
+  std::string Cond; // optional (if/elif expr, or macro for ifdef/ifndef)
+  uint64_t BodyB = 0, BodyE = 0;
+};
+
+struct CondGroup {
+  std::string File;
+  uint64_t GroupB = 0, GroupE = 0; // [#if .. #endif] as bytes
+  std::vector<CondArm> Arms;
+};
+
+// Normalize keys to file locations so InclusionDirective(HashLoc)
+// and EnterFile(IncludeLoc) agree.
+static inline std::string keyForLoc(const SourceManager &SM,
+                                    SourceLocation Loc) {
+  return std::to_string(SM.getFileLoc(Loc).getRawEncoding());
+}
+
+static inline bool isSpace(char c) {
+  return c == ' ' || c == '\t' || c == '\f' || c == '\v';
+}
+
+// Returns [bol,eol+1) byte span of the line containing 'p'.
+static std::pair<size_t, size_t> lineSpanOf(StringRef S, size_t p) {
+  size_t L = p, R = p;
+  while (L > 0 && S[L - 1] != '\n')
+    --L;
+  while (R < S.size() && S[R] != '\n')
+    ++R;
+  if (R < S.size())
+    ++R; // include '\n'
+  return {L, R};
+}
+
+static std::vector<CondGroup> scanTopLevelConds(StringRef Buf,
+                                                StringRef FilePath) {
+  std::vector<CondGroup> out;
+  size_t N = Buf.size();
+  size_t p = 0;
+  while (p < N) {
+    // Find next directive line beginning with '#' after optional indent.
+    size_t line = p;
+    auto lineSpan = lineSpanOf(Buf, line);
+    size_t bol = lineSpan.first;
+    size_t eol = lineSpan.second;
+    size_t q = bol;
+    while (q < eol && isSpace(Buf[q]))
+      ++q;
+    if (q < eol && Buf[q] == '#') {
+      ++q;
+      while (q < eol && isSpace(Buf[q]))
+        ++q;
+
+      auto kw = [&](const char *s) -> bool {
+        size_t t = q, k = 0;
+        while (t < eol && s[k] && Buf[t] == s[k]) {
+          ++t;
+          ++k;
+        }
+        return !s[k] && (t == eol ||
+                         !(std::isalnum(static_cast<unsigned char>(Buf[t])) ||
+                           Buf[t] == '_'));
+      };
+
+      if (kw("if") || kw("ifdef") || kw("ifndef")) {
+        CondGroup G;
+        G.File = FilePath.str();
+        G.GroupB = bol;
+
+        // First arm starts after this directive line.
+        CondArm A;
+        A.Tag = kw("if") ? "if" : kw("ifdef") ? "ifdef" : "ifndef";
+        // Capture condition token (best-effort, raw slice).
+        size_t condStart = q + (A.Tag == "if" ? 2 : A.Tag == "ifdef" ? 5 : 6);
+        while (condStart < eol && isSpace(Buf[condStart]))
+          ++condStart;
+        A.Cond = std::string(Buf.substr(condStart, eol - condStart));
+        A.BodyB = (eol < N ? eol : N);
+        A.BodyE = A.BodyB; // fill when we see next arm
+        G.Arms.push_back(std::move(A));
+
+        // Advance lines until we meet a peer #elif/#else/#endif.
+        size_t r = (eol < N ? eol : N);
+        for (; r < N;) {
+          auto span2 = lineSpanOf(Buf, r);
+          size_t bol2 = span2.first;
+          size_t eol2 = span2.second;
+          size_t s = bol2;
+          while (s < eol2 && isSpace(Buf[s]))
+            ++s;
+          bool isHash = (s < eol2 && Buf[s] == '#');
+          if (!isHash) {
+            r = eol2;
+            continue;
+          }
+          ++s;
+          while (s < eol2 && isSpace(Buf[s]))
+            ++s;
+
+          auto setPrevBodyEnd = [&](size_t endAt) {
+            if (!G.Arms.empty() && G.Arms.back().BodyE == G.Arms.back().BodyB)
+              G.Arms.back().BodyE = endAt;
+          };
+
+          if (kw("elif")) {
+            setPrevBodyEnd(bol2);
+            CondArm B;
+            B.Tag = "elif";
+            size_t condS = s + 4;
+            while (condS < eol2 && isSpace(Buf[condS]))
+              ++condS;
+            B.Cond = std::string(Buf.substr(condS, eol2 - condS));
+            B.BodyB = (eol2 < N ? eol2 : N);
+            B.BodyE = B.BodyB;
+            G.Arms.push_back(std::move(B));
+            r = (eol2 < N ? eol2 : N);
+            continue;
+          } else if (kw("else")) {
+            setPrevBodyEnd(bol2);
+            CondArm B;
+            B.Tag = "else";
+            B.BodyB = (eol2 < N ? eol2 : N);
+            B.BodyE = B.BodyB;
+            G.Arms.push_back(std::move(B));
+            r = (eol2 < N ? eol2 : N);
+            continue;
+          } else if (kw("endif")) {
+            setPrevBodyEnd(bol2);
+            G.GroupE = (eol2 < N ? eol2 : N);
+            out.push_back(std::move(G));
+            // continue scanning after #endif
+            r = (eol2 < N ? eol2 : N);
+            break;
+          } else {
+            r = (eol2 < N ? eol2 : N);
+            continue;
+          }
+        }
+        p = r;
+        continue;
+      }
+    }
+    p = (eol < N ? eol : N);
+  }
+  return out;
+}
+
+class RefoldMapBuilder {
+  Preprocessor &PP;
+  SourceManager &SM;
+  const LangOptions &Lang;
+  bool IgnoreComments = true;
+  uint64_t TokIndex = 0;
+
+  std::vector<Item> Items;
+  llvm::StringMap<int> MacroKey2Item;
+  llvm::StringMap<int> IncludeKey2Item;
+  std::vector<int> IncludeStack; // item indices (include items), -1 for none
+  int CurrentFileItem = -1;
+
+  std::vector<TokMapEntry> TokMap;
+
+  std::string OutPath;
+
+  // Compute [begin,end) byte offsets (inclusive of newline) for the directive
+  // line.
+  std::pair<long long, long long> computeDirectiveLine(SourceLocation HashLoc) {
+    SourceLocation H = SM.getFileLoc(HashLoc);
+    if (!H.isValid())
+      return {-1, -1};
+    FileID FID = SM.getFileID(H);
+    bool Invalid = false;
+    StringRef Buf = SM.getBufferData(FID, &Invalid);
+    if (Invalid)
+      return {-1, -1};
+    unsigned B = SM.getFileOffset(H);
+    size_t N = Buf.size();
+    size_t P = B;
+    // Scan to end-of-line
+    while (P < N && Buf[P] != '\n' && Buf[P] != '\r')
+      ++P;
+    size_t E = P;
+    if (P < N) {
+      // include EOL
+      if (Buf[P] == '\r' && P + 1 < N && Buf[P + 1] == '\n')
+        E = P + 2;
+      else
+        E = P + 1;
+    }
+    return {(long long)B, (long long)E};
+  }
+
+  static std::string filePathForLoc(const SourceManager &SM, SourceLocation L) {
+    FileID FID = SM.getFileID(SM.getFileLoc(L));
+    if (!FID.isValid())
+      return std::string();
+    if (auto FER = SM.getFileEntryRefForID(FID))
+      return std::string(FER->getName());
+    return std::string();
+  }
+
+public:
+  RefoldMapBuilder(Preprocessor &PP, std::string OutPath)
+      : PP(PP), SM(PP.getSourceManager()), Lang(PP.getLangOpts()),
+        IgnoreComments(!(PP.getCommentRetentionState())),
+        OutPath(std::move(OutPath)) {}
+
+  // Create-or-extend the current open span for a given item so spans are
+  // always half-open [Begin, End) and contiguous per item.
+  void touchSpanForItem(int ItemIdx, uint64_t CurTokIndex) {
+    if (ItemIdx < 0)
+      return;
+    auto &V = Items[(size_t)ItemIdx].Spans;
+    if (!V.empty() && V.back().Open) {
+      V.back().End = CurTokIndex + 1; // extend to one-past-current
+    } else {
+      TokenSpan S;
+      S.Begin = CurTokIndex;
+      S.End = CurTokIndex + 1;
+      S.Open = true;
+      V.push_back(S);
+    }
+  }
+
+  bool enabled() const { return !OutPath.empty(); }
+
+  void onIncludeDirective(SourceLocation HashLoc, const Token &IncludeTok,
+                          StringRef FileName, bool IsAngled,
+                          CharSourceRange FilenameRange,
+                          OptionalFileEntryRef File) {
+    if (!enabled())
+      return;
+
+    // Determine if the directive is an #include or an #include_next...
+    tok::PPKeywordKind K = tok::pp_not_keyword;
+    if (IncludeTok.is(tok::identifier)) {
+      if (auto *II = IncludeTok.getIdentifierInfo())
+        K = II->getPPKeywordID();
+    }
+    const bool IsInclude = (K == tok::pp_include);
+    const bool IsIncludeNext = (K == tok::pp_include_next);
+    assert((IsInclude || IsIncludeNext) &&
+           "include directive must be one of: #include or #include_next");
+
+    Item It;
+    It.ID = (int)Items.size();
+    It.Kind = IK_Directive;
+    It.Subkind = IsIncludeNext ? "#include_next" : "#include";
+    It.Loc = HashLoc;
+    It.IsAngled = IsAngled;
+    std::string DirLine = "#";
+    DirLine += PP.getSpelling(IncludeTok);
+    DirLine += " ";
+    DirLine += IsAngled ? "<" : "\"";
+    DirLine += FileName.str();
+    DirLine += IsAngled ? ">" : "\"";
+    DirLine += "\n";
+    It.Text = std::move(DirLine);
+
+    // Include-site anchors (definition site)
+    auto [B, E] = computeDirectiveLine(HashLoc);
+    It.SiteBegin = B;
+    It.SiteEnd = E;
+    It.SitePath = filePathForLoc(SM, HashLoc);
+
+    // Resolved target path, when available
+    if (File)
+      It.TargetPath = std::string(File->getName());
+
+    Items.push_back(std::move(It));
+    int ThisIdx = (int)Items.size() - 1;
+
+    // Remember multiple anchors for robustness.
+    IncludeKey2Item[keyForLoc(SM, HashLoc)] = ThisIdx;
+    IncludeKey2Item[keyForLoc(SM, FilenameRange.getBegin())] = ThisIdx;
+    IncludeKey2Item[keyForLoc(SM, FilenameRange.getEnd())] = ThisIdx;
+  }
+
+  void onMacroDefined(const Token &MacroNameTok, const MacroDirective *MD) {
+    if (!enabled())
+      return;
+    const MacroInfo *MI = MD->getMacroInfo();
+    if (MI->isBuiltinMacro())
+      return;
+    Item It;
+    It.ID = (int)Items.size();
+    It.Kind = IK_Directive;
+    It.Subkind = "#define";
+    It.Loc = MI->getDefinitionLoc();
+    std::string S;
+    llvm::raw_string_ostream OS(S);
+    PrintMacroDefinition(*MacroNameTok.getIdentifierInfo(), *MI, PP, &OS);
+    OS << "\n";
+    It.Text = OS.str();
+    Items.push_back(std::move(It));
+  }
+
+  void onMacroUndefined(const Token &MacroNameTok, const MacroDefinition &MD,
+                        const MacroDirective *Undef) {
+    if (!enabled())
+      return;
+    Item It;
+    It.ID = (int)Items.size();
+    It.Kind = IK_Directive;
+    It.Subkind = "#undef";
+    It.Loc = MacroNameTok.getLocation();
+    std::string S = "#undef ";
+    S += MacroNameTok.getIdentifierInfo()->getName().str();
+    S += "\n";
+    It.Text = std::move(S);
+    Items.push_back(std::move(It));
+  }
+
+  void onMacroExpands(const Token &MacroNameTok, const MacroDefinition &MD,
+                      SourceRange Range, const MacroArgs *Args) {
+    if (!enabled())
+      return;
+    const MacroInfo *MI = MD.getMacroInfo();
+    Item It;
+    It.ID = (int)Items.size();
+    It.Kind = IK_Macro;
+    It.Subkind = (MI && MI->isFunctionLike()) ? "func" : "obj";
+    if (auto *II = MacroNameTok.getIdentifierInfo())
+      It.Name = II->getName().str();
+    It.Loc = Range.getBegin();
+
+    SourceLocation EndTok =
+        Lexer::getLocForEndOfToken(Range.getEnd(), /*Offset=*/0, SM, Lang);
+    It.InvocationText =
+        Lexer::getSourceText(
+            CharSourceRange::getCharRange(Range.getBegin(), EndTok), SM, Lang)
+            .str();
+
+    // main-file byte offsets for the invocation, if applicable
+    SourceLocation B = SM.getFileLoc(Range.getBegin());
+    SourceLocation E = SM.getFileLoc(EndTok);
+    if (SM.isWrittenInMainFile(B) && SM.isWrittenInMainFile(E) && B.isValid() &&
+        E.isValid()) {
+      It.InvBegin = SM.getFileOffset(B);
+      It.InvEnd = SM.getFileOffset(E);
+    } else {
+      It.InvBegin = It.InvEnd = -1;
+    }
+
+    Items.push_back(std::move(It));
+    MacroKey2Item[keyForLoc(SM, MacroNameTok.getLocation())] =
+        (int)Items.size() - 1;
+  }
+
+  // Record a raw #pragma directive as a directive item. We keep only
+  // source-site anchors and the exact text, no token spans (pragmas don't
+  // contribute to A tokens).
+  void onPragma(SourceLocation HashLoc, StringRef FullText) {
+    if (!enabled())
+      return;
+
+    Item It;
+    It.ID = (int)Items.size();
+    It.Kind = IK_Directive;
+    It.Subkind = "#pragma";
+    It.Loc = HashLoc;
+    It.Text = FullText.str();
+    // Site info (line byte span and file path).
+    auto BE = computeDirectiveLine(HashLoc);
+    It.SiteBegin = BE.first;
+    It.SiteEnd = BE.second;
+    It.SitePath = filePathForLoc(SM, HashLoc);
+    Items.push_back(std::move(It));
+  }
+
+  void onEnterFile(SourceLocation IncludeLoc) {
+    if (!enabled())
+      return;
+    int Idx = -1;
+    if (IncludeLoc.isValid()) {
+      auto It = IncludeKey2Item.find(keyForLoc(SM, IncludeLoc));
+      if (It != IncludeKey2Item.end())
+        Idx = It->second;
+    }
+
+    // Set parent relationship: the include we are about to enter is
+    // conceptually a child of the current top of the stack (if any).
+    if (Idx >= 0 && !IncludeStack.empty() && IncludeStack.back() >= 0) {
+      Items[(size_t)Idx].Parent = IncludeStack.back();
+    }
+
+    IncludeStack.push_back(Idx);
+  }
+
+  void onExitFile() {
+    if (!enabled())
+      return;
+    if (!IncludeStack.empty())
+      IncludeStack.pop_back();
+  }
+
+  void onToken(const Token &Tok) {
+    if (!enabled())
+      return;
+    if (Tok.is(tok::eof))
+      return;
+    if (IgnoreComments && Tok.is(tok::comment))
+      return;
+
+    int ItemIdx = -1;
+    SourceLocation L = Tok.getLocation();
+    if (SM.isMacroArgExpansion(L) || SM.isMacroBodyExpansion(L)) {
+      SourceLocation Caller = SM.getImmediateMacroCallerLoc(L);
+      auto It = MacroKey2Item.find(keyForLoc(SM, Caller));
+      if (It == MacroKey2Item.end()) {
+        // Fallback: some paths prefer expansion loc
+        Caller = SM.getExpansionLoc(L);
+        It = MacroKey2Item.find(keyForLoc(SM, Caller));
+      }
+      if (It != MacroKey2Item.end())
+        ItemIdx = It->second;
+    }
+    if (ItemIdx == -1) {
+      if (!IncludeStack.empty() && IncludeStack.back() != -1) {
+        ItemIdx = IncludeStack.back();
+      } else {
+        if (CurrentFileItem == -1) {
+          Item F;
+          F.ID = (int)Items.size();
+          F.Kind = IK_File;
+          F.Subkind = "file";
+          Items.push_back(std::move(F));
+          CurrentFileItem = (int)Items.size() - 1;
+        }
+        ItemIdx = CurrentFileItem;
+      }
+    }
+
+    // 1) Attribute the token to its primary item (macro, include, or file).
+    touchSpanForItem(ItemIdx, TokIndex);
+    // 2) Grow all active include items transitively so a parent include
+    //    covers its entire subtree (nested includes/macros).
+    for (int idx : IncludeStack) {
+      if (idx < 0 || idx == ItemIdx)
+        continue;
+      touchSpanForItem(idx, TokIndex);
+    }
+
+    // Capture byte range in the spelling file of this token (main or header).
+    {
+      SourceLocation FL = SM.getFileLoc(L);
+      if (FL.isValid()) {
+        SourceLocation EndL =
+            Lexer::getLocForEndOfToken(FL, /*Offset=*/0, SM, Lang);
+        SourceLocation FEL = SM.getFileLoc(EndL);
+        if (FEL.isValid()) {
+          long long B = SM.getFileOffset(FL);
+          long long E = SM.getFileOffset(FEL);
+          TokMapEntry M;
+          M.PPIndex  = TokIndex;
+          M.SrcBegin = B;
+          M.SrcEnd   = E;
+          M.File     = filePathForLoc(SM, FL); // e.g. "./e.h"
+          TokMap.push_back(std::move(M));
+        }
+      }
+    }
+
+    ++TokIndex;
+  }
+
+  void onEndOfStream() {
+    if (!enabled())
+      return;
+    for (auto &It : Items)
+      for (auto &S : It.Spans)
+        S.Open = false;
+  }
+
+  void writeJSON() {
+    if (!enabled())
+      return;
+
+    // Open the refold JSON file for writing.
+    std::error_code EC;
+    llvm::raw_fd_ostream OS(OutPath, EC, llvm::sys::fs::OF_Text);
+    if (EC) {
+      llvm::errs() << "refold: cannot open " << OutPath << ": " << EC.message()
+                   << "\n";
+      return;
+    }
+
+    // Determine the source path.
+    std::string SourcePath = "<unknown>";
+    if (auto FER = SM.getFileEntryRefForID(SM.getMainFileID()))
+      SourcePath = std::string(FER->getName());
+
+    llvm::json::OStream JO(OS, /*Indent=*/2);
+
+    JO.object([&] {
+      JO.attribute("version", "1.0");
+      JO.attribute("source", SourcePath);
+
+      // tokens...
+      JO.attributeObject("tokens", [&] { JO.attribute("count", TokIndex); });
+
+      // items...
+      JO.attributeArray("items", [&] {
+        for (const Item &It : Items) {
+          JO.object([&] {
+            JO.attribute("id", It.ID);
+            const char *KindStr = (It.Kind == IK_Directive) ? "directive"
+                                  : (It.Kind == IK_Macro)   ? "macro"
+                                                            : "file";
+            JO.attribute("kind", KindStr);
+
+            if (!It.Subkind.empty())
+              JO.attribute("subkind", It.Subkind);
+            if (!It.Name.empty())
+              JO.attribute("name", It.Name);
+            if (!It.Text.empty())
+              JO.attribute("text", It.Text);
+            if (!It.InvocationText.empty())
+              JO.attribute("invocation_text", It.InvocationText);
+            if (It.InvBegin >= 0 && It.InvEnd >= 0) {
+              JO.attribute("inv_b", It.InvBegin);
+              JO.attribute("inv_e", It.InvEnd);
+            }
+
+            // Emit site anchors (for directives that exist as lines in a file).
+            if (It.Subkind == "#pragma") {
+              if (It.SiteBegin >= 0 && It.SiteEnd >= 0) {
+                JO.attribute("site_b", It.SiteBegin);
+                JO.attribute("site_e", It.SiteEnd);
+              }
+              if (!It.SitePath.empty())
+                JO.attribute("site_path", It.SitePath);
+            }
+
+            // Include-site anchors and structure for partial refolding
+            if (It.Subkind == "#include" || It.Subkind == "#include_next") {
+              if (It.SiteBegin >= 0 && It.SiteEnd >= 0) {
+                JO.attribute("site_b", It.SiteBegin);
+                JO.attribute("site_e", It.SiteEnd);
+              }
+              if (!It.SitePath.empty())
+                JO.attribute("site_path", It.SitePath);
+              if (!It.TargetPath.empty())
+                JO.attribute("target", It.TargetPath);
+              JO.attribute("angled", It.IsAngled);
+              if (It.Parent >= 0)
+                JO.attribute("parent", It.Parent);
+            }
+
+            JO.attributeArray("spans", [&] {
+              for (const auto &S : It.Spans) {
+                JO.object([&] {
+                  JO.attribute("begin", S.Begin);
+                  JO.attribute("end", S.End);
+                });
+              }
+            });
+          });
+        }
+      });
+
+      // tokmap...
+      JO.attributeArray("tokmap", [&] {
+        for (const auto &M : TokMap) {
+          JO.object([&] {
+            if (!M.File.empty())
+              JO.attribute("file", M.File);
+            JO.attribute("pp", M.PPIndex);
+            JO.attribute("b", M.SrcBegin);
+            JO.attribute("e", M.SrcEnd);
+          });
+        }
+      });
+
+      // conds...
+      JO.attributeArray("conds", [&] {
+        // Emit per-file conditional groups for included files we actually
+        // opened.
+        llvm::StringSet<> Seen;
+        for (const auto &It : Items) {
+          if (It.Subkind != "#include")
+            continue;
+          if (It.TargetPath.empty())
+            continue;
+          std::string H = It.TargetPath;
+          if (!Seen.insert(H).second)
+            continue;
+
+          auto BufOrErr = llvm::MemoryBuffer::getFile(H);
+          if (!BufOrErr)
+            continue;
+          StringRef HB((*BufOrErr)->getBufferStart(),
+                       (*BufOrErr)->getBufferSize());
+
+          for (const auto &G : scanTopLevelConds(HB, H)) {
+            // Only groups that have at least one arm.
+            if (G.Arms.empty())
+              continue;
+            JO.object([&] {
+              JO.attribute("file", G.File);
+              JO.attribute("group_b", (uint64_t)G.GroupB);
+              JO.attribute("group_e", (uint64_t)G.GroupE);
+              JO.attributeArray("arms", [&] {
+                for (const auto &A : G.Arms) {
+                  JO.object([&] {
+                    JO.attribute("tag", A.Tag);
+                    if (!A.Cond.empty())
+                      JO.attribute("cond", A.Cond);
+                    JO.attribute("body_b", (uint64_t)A.BodyB);
+                    JO.attribute("body_e", (uint64_t)A.BodyE);
+                    // We intentionally omit "selected" here; refolder can infer
+                    // or fill it using A/B context.
+                  });
+                }
+              });
+            });
+          }
+        }
+      });
+    });
+  }
+};
+
 struct UnknownPragmaHandler : public PragmaHandler {
   const char *Prefix;
   PrintPPOutputPPCallbacks *Callbacks;
+  RefoldMapBuilder *Recorder; // may be null
 
   // Set to true if tokens should be expanded
   bool ShouldExpandTokens;
 
   UnknownPragmaHandler(const char *prefix, PrintPPOutputPPCallbacks *callbacks,
-                       bool RequireTokenExpansion)
-      : Prefix(prefix), Callbacks(callbacks),
+                       bool RequireTokenExpansion, RefoldMapBuilder *recorder)
+      : Prefix(prefix), Callbacks(callbacks), Recorder(recorder),
         ShouldExpandTokens(RequireTokenExpansion) {}
   void HandlePragma(Preprocessor &PP, PragmaIntroducer Introducer,
                     Token &PragmaTok) override {
@@ -787,6 +1466,9 @@ struct UnknownPragmaHandler : public PragmaHandler {
 
     // Read and print all of the pragma tokens.
     bool IsFirst = true;
+    // Reconstruct exact pragma text for JSON, prefixed (e.g. "#pragma",
+    // "#pragma GCC").
+    std::string PragmaText(Prefix);
     while (PragmaTok.isNot(tok::eod)) {
       Callbacks->HandleWhitespaceBeforeTok(PragmaTok, /*RequireSpace=*/IsFirst,
                                            /*RequireSameLine=*/true);
@@ -795,19 +1477,37 @@ struct UnknownPragmaHandler : public PragmaHandler {
       Callbacks->OS->write(&TokSpell[0], TokSpell.size());
       Callbacks->setEmittedTokensOnThisLine();
 
+      // Mirror spacing in the JSON text with single spaces between tokens.
+      PragmaText.push_back(' ');
+      PragmaText.append(TokSpell);
+
       if (ShouldExpandTokens)
         PP.Lex(PragmaTok);
       else
         PP.LexUnexpandedToken(PragmaTok);
     }
+
+    // Terminate the line to match other directive 'text' fields.
+    PragmaText.push_back('\n');
+
+    // Record into the refold map (if enabled).
+    if (Recorder) {
+      // Prefer the introducer location (the '#' for '#pragma' or the builtin
+      // location for _Pragma)
+      SourceLocation HashLoc =
+          Introducer.Loc.isValid() ? Introducer.Loc : PragmaTok.getLocation();
+      Recorder->onPragma(HashLoc, StringRef(PragmaText));
+    }
+
     Callbacks->setEmittedDirectiveOnThisLine();
   }
 };
+
 } // end anonymous namespace
 
-
 static void PrintPreprocessedTokens(Preprocessor &PP, Token &Tok,
-                                    PrintPPOutputPPCallbacks *Callbacks) {
+                                    PrintPPOutputPPCallbacks *Callbacks,
+                                    RefoldMapBuilder *Recorder) {
   bool DropComments = PP.getLangOpts().TraditionalCPP &&
                       !PP.getCommentRetentionState();
 
@@ -922,6 +1622,9 @@ static void PrintPreprocessedTokens(Preprocessor &PP, Token &Tok,
     Callbacks->setEmittedTokensOnThisLine();
     IsStartOfLine = false;
 
+    if (Recorder)
+      Recorder->onToken(Tok);
+
     if (Tok.is(tok::eof)) break;
 
     PP.Lex(Tok);
@@ -979,6 +1682,12 @@ void clang::DoPrintPreprocessedInput(Preprocessor &PP, raw_ostream *OS,
   // to -C or -CC.
   PP.SetCommentRetentionState(Opts.ShowComments, Opts.ShowMacroComments);
 
+  // Optional recorder for writing out the refolding map data as a JSON file.
+  std::string RefoldMapFile = PP.getPreprocessorOpts().RefoldMapFile;
+  std::unique_ptr<RefoldMapBuilder> Recorder;
+  if (!RefoldMapFile.empty())
+    Recorder = std::make_unique<RefoldMapBuilder>(PP, RefoldMapFile);
+
   PrintPPOutputPPCallbacks *Callbacks = new PrintPPOutputPPCallbacks(
       PP, OS, !Opts.ShowLineMarkers, Opts.ShowMacros,
       Opts.ShowIncludeDirectives, Opts.UseLineDirectives,
@@ -990,15 +1699,16 @@ void clang::DoPrintPreprocessedInput(Preprocessor &PP, raw_ostream *OS,
   std::unique_ptr<UnknownPragmaHandler> MicrosoftExtHandler(
       new UnknownPragmaHandler(
           "#pragma", Callbacks,
-          /*RequireTokenExpansion=*/PP.getLangOpts().MicrosoftExt));
+          /*RequireTokenExpansion=*/PP.getLangOpts().MicrosoftExt,
+          Recorder.get()));
 
   std::unique_ptr<UnknownPragmaHandler> GCCHandler(new UnknownPragmaHandler(
       "#pragma GCC", Callbacks,
-      /*RequireTokenExpansion=*/PP.getLangOpts().MicrosoftExt));
+      /*RequireTokenExpansion=*/PP.getLangOpts().MicrosoftExt, Recorder.get()));
 
   std::unique_ptr<UnknownPragmaHandler> ClangHandler(new UnknownPragmaHandler(
       "#pragma clang", Callbacks,
-      /*RequireTokenExpansion=*/PP.getLangOpts().MicrosoftExt));
+      /*RequireTokenExpansion=*/PP.getLangOpts().MicrosoftExt, Recorder.get()));
 
   PP.AddPragmaHandler(MicrosoftExtHandler.get());
   PP.AddPragmaHandler("GCC", GCCHandler.get());
@@ -1011,10 +1721,56 @@ void clang::DoPrintPreprocessedInput(Preprocessor &PP, raw_ostream *OS,
   //  replacement.
   std::unique_ptr<UnknownPragmaHandler> OpenMPHandler(
       new UnknownPragmaHandler("#pragma omp", Callbacks,
-                               /*RequireTokenExpansion=*/true));
+                               /*RequireTokenExpansion=*/true, Recorder.get()));
   PP.AddPragmaHandler("omp", OpenMPHandler.get());
 
   PP.addPPCallbacks(std::unique_ptr<PPCallbacks>(Callbacks));
+
+  // Attach minimal extra callbacks to feed the recorder.
+  if (Recorder) {
+    struct Rec : PPCallbacks {
+      Preprocessor &PP;
+      SourceManager &SM;
+      RefoldMapBuilder &R;
+      Rec(Preprocessor &PP, RefoldMapBuilder &R)
+          : PP(PP), SM(PP.getSourceManager()), R(R) {}
+      void InclusionDirective(SourceLocation HashLoc, const Token &IncludeTok,
+                              StringRef FileName, bool IsAngled,
+                              CharSourceRange FilenameRange,
+                              OptionalFileEntryRef File, StringRef SearchPath,
+                              StringRef RelativePath, const Module *Imported,
+                              SrcMgr::CharacteristicKind FileType) override {
+        R.onIncludeDirective(HashLoc, IncludeTok, FileName, IsAngled,
+                             FilenameRange, File);
+      }
+      void MacroDefined(const Token &MacroNameTok,
+                        const MacroDirective *MD) override {
+        R.onMacroDefined(MacroNameTok, MD);
+      }
+      void MacroUndefined(const Token &MacroNameTok, const MacroDefinition &MD,
+                          const MacroDirective *Undef) override {
+        R.onMacroUndefined(MacroNameTok, MD, Undef);
+      }
+      void MacroExpands(const Token &MacroNameTok, const MacroDefinition &MD,
+                        SourceRange Range, const MacroArgs *Args) override {
+        R.onMacroExpands(MacroNameTok, MD, Range, Args);
+      }
+      void FileChanged(SourceLocation Loc, FileChangeReason Reason,
+                       SrcMgr::CharacteristicKind, FileID) override {
+        if (Reason == PPCallbacks::EnterFile) {
+          // Use FileID->include site; normalize to file loc for the key.
+          FileID F = SM.getFileID(Loc);
+          SourceLocation Inc = SM.getIncludeLoc(F); // invalid for main file
+          Inc = SM.getFileLoc(Inc);
+          R.onEnterFile(Inc);
+        } else if (Reason == PPCallbacks::ExitFile) {
+          R.onExitFile();
+        }
+      }
+      void EndOfMainFile() override { R.onEndOfStream(); }
+    };
+    PP.addPPCallbacks(std::make_unique<Rec>(PP, *Recorder));
+  }
 
   // After we have configured the preprocessor, enter the main file.
   PP.EnterMainSourceFile();
@@ -1040,8 +1796,12 @@ void clang::DoPrintPreprocessedInput(Preprocessor &PP, raw_ostream *OS,
   } while (true);
 
   // Read all the preprocessed tokens, printing them out to the stream.
-  PrintPreprocessedTokens(PP, Tok, Callbacks);
+  PrintPreprocessedTokens(PP, Tok, Callbacks, Recorder.get());
   *OS << '\n';
+  if (Recorder) {
+    Recorder->onEndOfStream();
+    Recorder->writeJSON();
+  }
 
   // Remove the handlers we just added to leave the preprocessor in a sane state
   // so that it can be reused (for example by a clang::Parser instance).
