@@ -35,6 +35,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include <cctype>
 #include <cstdio>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -785,6 +786,7 @@ struct Item {
   std::string Name;           // macro name
   std::string Text;           // directive text
   std::string InvocationText; // macro call text
+  std::string InvFile;       // file containing the macro invocation
   SourceLocation Loc;         // primary location
   std::vector<TokenSpan> Spans;
 
@@ -796,9 +798,12 @@ struct Item {
   long long SiteBegin = -1; // byte offset of '#' in the directive's file
   long long SiteEnd = -1;   // one-past-end of the directive line (incl. EOL)
   std::string SitePath;     // file path that contains the directive
-  std::string TargetPath;   // resolved included file, if known
+  std::string TargetAsWritten; // as-written header token ("e.h" or <vector>)
+  std::string ResolvedPath;   // filesystem path actually opened for include
+  std::string TargetPath;   // [compat] resolved path, kept for legacy code
   bool IsAngled = false;    // <...> vs "..."
   int Parent = -1;          // parent include item id, or -1 if top-level
+  int OwnerIncludeId = -1;   // include item id that opened the file containing this item
 };
 
 // map a printed PP token to its main-file byte range
@@ -844,116 +849,174 @@ static std::pair<size_t, size_t> lineSpanOf(StringRef S, size_t p) {
   return {L, R};
 }
 
-static std::vector<CondGroup> scanTopLevelConds(StringRef Buf,
-                                                StringRef FilePath) {
+static std::vector<CondGroup> scanTopLevelConds(llvm::StringRef Buf,
+                                                llvm::StringRef FilePath) {
   std::vector<CondGroup> out;
-  size_t N = Buf.size();
+  const size_t N = Buf.size();
   size_t p = 0;
+
+  auto kw_at = [&](size_t start, size_t eol, const char *s) -> bool {
+    size_t t = start, k = 0;
+    while (t < eol && s[k] && Buf[t] == s[k]) {
+      ++t;
+      ++k;
+    }
+    if (s[k])
+      return false; // didn't consume full keyword
+    if (t < eol) {
+      unsigned char c = static_cast<unsigned char>(Buf[t]);
+      if (::isalnum(c) || c == '_')
+        return false; // word boundary
+    }
+    return true;
+  };
+
   while (p < N) {
-    // Find next directive line beginning with '#' after optional indent.
-    size_t line = p;
-    auto lineSpan = lineSpanOf(Buf, line);
-    size_t bol = lineSpan.first;
-    size_t eol = lineSpan.second;
-    size_t q = bol;
-    while (q < eol && isSpace(Buf[q]))
-      ++q;
-    if (q < eol && Buf[q] == '#') {
-      ++q;
+    auto span = lineSpanOf(Buf, p);
+    size_t bol = span.first, eol = span.second;
+    if (eol <= bol) {
+      ++p;
+      continue;
+    } // zero-length/degenerate line
+
+    size_t s = bol;
+    while (s < eol && isSpace(Buf[s]))
+      ++s;
+
+    // Start of a conditional group?
+    if (s < eol && Buf[s] == '#') {
+      size_t q = s + 1;
       while (q < eol && isSpace(Buf[q]))
         ++q;
 
-      auto kw = [&](const char *s) -> bool {
-        size_t t = q, k = 0;
-        while (t < eol && s[k] && Buf[t] == s[k]) {
-          ++t;
-          ++k;
-        }
-        return !s[k] && (t == eol ||
-                         !(std::isalnum(static_cast<unsigned char>(Buf[t])) ||
-                           Buf[t] == '_'));
-      };
+      bool starts = false;
+      llvm::StringRef startTag;
+      if (kw_at(q, eol, "if")) {
+        starts = true;
+        startTag = "if";
+      } else if (kw_at(q, eol, "ifdef")) {
+        starts = true;
+        startTag = "ifdef";
+      } else if (kw_at(q, eol, "ifndef")) {
+        starts = true;
+        startTag = "ifndef";
+      }
 
-      if (kw("if") || kw("ifdef") || kw("ifndef")) {
+      if (starts) {
         CondGroup G;
         G.File = FilePath.str();
         G.GroupB = bol;
 
-        // First arm starts after this directive line.
+        // First arm (#if/ifdef/ifndef)
         CondArm A;
-        A.Tag = kw("if") ? "if" : kw("ifdef") ? "ifdef" : "ifndef";
-        // Capture condition token (best-effort, raw slice).
-        size_t condStart = q + (A.Tag == "if" ? 2 : A.Tag == "ifdef" ? 5 : 6);
-        while (condStart < eol && isSpace(Buf[condStart]))
-          ++condStart;
-        A.Cond = std::string(Buf.substr(condStart, eol - condStart));
-        A.BodyB = (eol < N ? eol : N);
-        A.BodyE = A.BodyB; // fill when we see next arm
+        A.Tag = startTag.str();
+        size_t condBeg = q + (A.Tag == "if" ? 2 : A.Tag == "ifdef" ? 5 : 6);
+        while (condBeg < eol && isSpace(Buf[condBeg]))
+          ++condBeg;
+        A.Cond = std::string(Buf.substr(condBeg, eol - condBeg));
+        A.BodyB = std::min(N, eol);
+        A.BodyE = A.BodyB;
         G.Arms.push_back(std::move(A));
 
-        // Advance lines until we meet a peer #elif/#else/#endif.
-        size_t r = (eol < N ? eol : N);
-        for (; r < N;) {
+        // Walk to the peer #endif, handling nesting.
+        size_t r = std::min(N, eol);
+        size_t last_r = ~size_t(0);
+        int depth = 0;
+        bool closed = false;
+
+        auto setPrevBodyEnd = [&](size_t endAt) {
+          if (!G.Arms.empty() && G.Arms.back().BodyE == G.Arms.back().BodyB)
+            G.Arms.back().BodyE = endAt;
+        };
+
+        while (r < N) {
           auto span2 = lineSpanOf(Buf, r);
-          size_t bol2 = span2.first;
-          size_t eol2 = span2.second;
-          size_t s = bol2;
-          while (s < eol2 && isSpace(Buf[s]))
-            ++s;
-          bool isHash = (s < eol2 && Buf[s] == '#');
-          if (!isHash) {
-            r = eol2;
+          size_t bol2 = span2.first, eol2 = span2.second;
+          if (eol2 <= bol2) {
+            r = std::min(N, r + 1);
             continue;
           }
-          ++s;
-          while (s < eol2 && isSpace(Buf[s]))
-            ++s;
 
-          auto setPrevBodyEnd = [&](size_t endAt) {
-            if (!G.Arms.empty() && G.Arms.back().BodyE == G.Arms.back().BodyB)
-              G.Arms.back().BodyE = endAt;
-          };
+          size_t s2 = bol2;
+          while (s2 < eol2 && isSpace(Buf[s2]))
+            ++s2;
 
-          if (kw("elif")) {
-            setPrevBodyEnd(bol2);
-            CondArm B;
-            B.Tag = "elif";
-            size_t condS = s + 4;
-            while (condS < eol2 && isSpace(Buf[condS]))
-              ++condS;
-            B.Cond = std::string(Buf.substr(condS, eol2 - condS));
-            B.BodyB = (eol2 < N ? eol2 : N);
-            B.BodyE = B.BodyB;
-            G.Arms.push_back(std::move(B));
-            r = (eol2 < N ? eol2 : N);
-            continue;
-          } else if (kw("else")) {
-            setPrevBodyEnd(bol2);
-            CondArm B;
-            B.Tag = "else";
-            B.BodyB = (eol2 < N ? eol2 : N);
-            B.BodyE = B.BodyB;
-            G.Arms.push_back(std::move(B));
-            r = (eol2 < N ? eol2 : N);
-            continue;
-          } else if (kw("endif")) {
-            setPrevBodyEnd(bol2);
-            G.GroupE = (eol2 < N ? eol2 : N);
-            out.push_back(std::move(G));
-            // continue scanning after #endif
-            r = (eol2 < N ? eol2 : N);
-            break;
+          if (s2 < eol2 && Buf[s2] == '#') {
+            size_t t = s2 + 1;
+            while (t < eol2 && isSpace(Buf[t]))
+              ++t;
+
+            // Nested open?
+            if (kw_at(t, eol2, "if") || kw_at(t, eol2, "ifdef") ||
+                kw_at(t, eol2, "ifndef")) {
+              ++depth;
+              r = std::min(N, eol2);
+            }
+            // Peer close?
+            else if (kw_at(t, eol2, "endif")) {
+              if (depth > 0) {
+                --depth;
+                r = std::min(N, eol2);
+              } else {
+                setPrevBodyEnd(bol2);
+                G.GroupE = std::min(N, eol2);
+                out.push_back(std::move(G));
+                r = std::min(N, eol2);
+                closed = true;
+                break;
+              }
+            }
+            // Peer elif/else at depth 0
+            else if (depth == 0 && kw_at(t, eol2, "elif")) {
+              setPrevBodyEnd(bol2);
+              CondArm B;
+              B.Tag = "elif";
+              size_t condS = t + 4;
+              while (condS < eol2 && isSpace(Buf[condS]))
+                ++condS;
+              B.Cond = std::string(Buf.substr(condS, eol2 - condS));
+              B.BodyB = std::min(N, eol2);
+              B.BodyE = B.BodyB;
+              G.Arms.push_back(std::move(B));
+              r = std::min(N, eol2);
+            } else if (depth == 0 && kw_at(t, eol2, "else")) {
+              setPrevBodyEnd(bol2);
+              CondArm B;
+              B.Tag = "else";
+              B.BodyB = std::min(N, eol2);
+              B.BodyE = B.BodyB;
+              G.Arms.push_back(std::move(B));
+              r = std::min(N, eol2);
+            } else {
+              r = std::min(N, eol2); // some other directive -> next line
+            }
           } else {
-            r = (eol2 < N ? eol2 : N);
-            continue;
+            r = std::min(N, eol2); // non-pp line -> next
           }
+
+          // progress guard
+          if (r == last_r)
+            r = std::min(N, r + 1);
+          last_r = r;
         }
-        p = r;
+
+        // Unterminated group (missing #endif): close at EOF so we don't stall.
+        if (!closed) {
+          setPrevBodyEnd(N);
+          G.GroupE = N;
+          out.push_back(std::move(G));
+        }
+
+        // Continue outer scan after the group
+        p = std::min(N, r);
         continue;
       }
     }
-    p = (eol < N ? eol : N);
+
+    // Not a group opener -> next line
+    p = std::min(N, eol);
   }
+
   return out;
 }
 
@@ -1068,6 +1131,8 @@ public:
     DirLine += IsAngled ? ">" : "\"";
     DirLine += "\n";
     It.Text = std::move(DirLine);
+    It.TargetAsWritten = std::string(IsAngled ? ("<" + FileName.str() + ">")
+                                              : ("\"" + FileName.str() + "\""));
 
     // Include-site anchors (definition site)
     auto [B, E] = computeDirectiveLine(HashLoc);
@@ -1076,10 +1141,13 @@ public:
     It.SitePath = filePathForLoc(SM, HashLoc);
 
     // Resolved target path, when available
-    if (File)
-      It.TargetPath = std::string(File->getName());
+    if (File) {
+      It.ResolvedPath = std::string(File->getName());
+      It.TargetPath = It.ResolvedPath;
+    }
 
     Items.push_back(std::move(It));
+    if (!IncludeStack.empty()) Items.back().OwnerIncludeId = IncludeStack.back();
     int ThisIdx = (int)Items.size() - 1;
 
     // Remember multiple anchors for robustness.
@@ -1104,7 +1172,12 @@ public:
     PrintMacroDefinition(*MacroNameTok.getIdentifierInfo(), *MI, PP, &OS);
     OS << "\n";
     It.Text = OS.str();
+    auto BE = computeDirectiveLine(MI->getDefinitionLoc());
+    It.SiteBegin = BE.first;
+    It.SiteEnd = BE.second;
+    It.SitePath = filePathForLoc(SM, MI->getDefinitionLoc());
     Items.push_back(std::move(It));
+    if (!IncludeStack.empty()) Items.back().OwnerIncludeId = IncludeStack.back();
   }
 
   void onMacroUndefined(const Token &MacroNameTok, const MacroDefinition &MD,
@@ -1120,7 +1193,12 @@ public:
     S += MacroNameTok.getIdentifierInfo()->getName().str();
     S += "\n";
     It.Text = std::move(S);
+    auto BE = computeDirectiveLine(MacroNameTok.getLocation());
+    It.SiteBegin = BE.first;
+    It.SiteEnd = BE.second;
+    It.SitePath = filePathForLoc(SM, MacroNameTok.getLocation());
     Items.push_back(std::move(It));
+    if (!IncludeStack.empty()) Items.back().OwnerIncludeId = IncludeStack.back();
   }
 
   void onMacroExpands(const Token &MacroNameTok, const MacroDefinition &MD,
@@ -1143,18 +1221,20 @@ public:
             CharSourceRange::getCharRange(Range.getBegin(), EndTok), SM, Lang)
             .str();
 
-    // main-file byte offsets for the invocation, if applicable
-    SourceLocation B = SM.getFileLoc(Range.getBegin());
-    SourceLocation E = SM.getFileLoc(EndTok);
-    if (SM.isWrittenInMainFile(B) && SM.isWrittenInMainFile(E) && B.isValid() &&
-        E.isValid()) {
-      It.InvBegin = SM.getFileOffset(B);
-      It.InvEnd = SM.getFileOffset(E);
+    // byte offsets within the invocation's own file
+    SourceLocation FB = SM.getFileLoc(Range.getBegin());
+    SourceLocation FE = SM.getFileLoc(EndTok);
+    if (FB.isValid() && FE.isValid()) {
+      It.InvBegin = SM.getFileOffset(FB);
+      It.InvEnd = SM.getFileOffset(FE);
+      It.InvFile = filePathForLoc(SM, FB);
     } else {
       It.InvBegin = It.InvEnd = -1;
     }
 
     Items.push_back(std::move(It));
+    if (!IncludeStack.empty())
+      Items.back().OwnerIncludeId = IncludeStack.back();
     MacroKey2Item[keyForLoc(SM, MacroNameTok.getLocation())] =
         (int)Items.size() - 1;
   }
@@ -1178,6 +1258,7 @@ public:
     It.SiteEnd = BE.second;
     It.SitePath = filePathForLoc(SM, HashLoc);
     Items.push_back(std::move(It));
+    if (!IncludeStack.empty()) Items.back().OwnerIncludeId = IncludeStack.back();
   }
 
   void onEnterFile(SourceLocation IncludeLoc) {
@@ -1305,7 +1386,7 @@ public:
     llvm::json::OStream JO(OS, /*Indent=*/2);
 
     JO.object([&] {
-      JO.attribute("version", "1.0");
+      JO.attribute("version", "1.1");
       JO.attribute("source", SourcePath);
 
       // tokens...
@@ -1332,31 +1413,48 @@ public:
             if (It.InvBegin >= 0 && It.InvEnd >= 0) {
               JO.attribute("inv_b", It.InvBegin);
               JO.attribute("inv_e", It.InvEnd);
+              if (!It.InvFile.empty()) JO.attribute("inv_file", It.InvFile);
             }
 
-            // Emit site anchors (for directives that exist as lines in a file).
-            if (It.Subkind == "#pragma") {
+            // Emit site anchors for all directive kinds.
+            if (It.Kind == IK_Directive) {
               if (It.SiteBegin >= 0 && It.SiteEnd >= 0) {
                 JO.attribute("site_b", It.SiteBegin);
                 JO.attribute("site_e", It.SiteEnd);
               }
-              if (!It.SitePath.empty())
-                JO.attribute("site_path", It.SitePath);
+              // Always write site_path; provide deterministic fallback for
+              // virtual buffers.
+              std::string Path = It.SitePath;
+              if (Path.empty()) {
+                if (SM.isWrittenInBuiltinFile(It.Loc))
+                  Path = "<built-in>";
+                else if (SM.isWrittenInCommandLineFile(It.Loc))
+                  Path = "<command-line>";
+              }
+              if (!Path.empty())
+                JO.attribute("site_path", Path);
             }
 
-            // Include-site anchors and structure for partial refolding
+            // Include-site anchors and structure for partial refolding.
             if (It.Subkind == "#include" || It.Subkind == "#include_next") {
-              if (It.SiteBegin >= 0 && It.SiteEnd >= 0) {
-                JO.attribute("site_b", It.SiteBegin);
-                JO.attribute("site_e", It.SiteEnd);
-              }
-              if (!It.SitePath.empty())
-                JO.attribute("site_path", It.SitePath);
-              if (!It.TargetPath.empty())
-                JO.attribute("target", It.TargetPath);
+              if (!It.TargetAsWritten.empty())
+                JO.attribute("target", It.TargetAsWritten);
+              if (!It.ResolvedPath.empty())
+                JO.attribute("resolved_path", It.ResolvedPath);
               JO.attribute("angled", It.IsAngled);
               if (It.Parent >= 0)
                 JO.attribute("parent", It.Parent);
+            }
+
+            // owner_include_id only for MACRO items and #define/#undef
+            // directives
+            if (It.OwnerIncludeId >= 0) {
+              if (It.Kind == IK_Macro) {
+                JO.attribute("owner_include_id", It.OwnerIncludeId);
+              } else if (It.Kind == IK_Directive &&
+                         (It.Subkind == "#define" || It.Subkind == "#undef")) {
+                JO.attribute("owner_include_id", It.OwnerIncludeId);
+              }
             }
 
             JO.attributeArray("spans", [&] {
@@ -1375,8 +1473,7 @@ public:
       JO.attributeArray("tokmap", [&] {
         for (const auto &M : TokMap) {
           JO.object([&] {
-            if (!M.File.empty())
-              JO.attribute("file", M.File);
+            JO.attribute("file", M.File);
             JO.attribute("pp", M.PPIndex);
             JO.attribute("b", M.SrcBegin);
             JO.attribute("e", M.SrcEnd);
@@ -1384,49 +1481,213 @@ public:
         }
       });
 
+      // slots...
+      JO.attributeArray("slots", [&] {
+        int SlotId = 0;
+        auto emitPoint =
+            [&](llvm::StringRef FilePath, long long off, const char *kind,
+                std::optional<int> ref = std::nullopt, int owner = -1) {
+              const long long o = off < 0 ? 0 : off;  // clamp once here
+              JO.object([&] {
+                JO.attribute("id", SlotId++);
+                JO.attribute("file", FilePath.str());
+                JO.attribute("kind", kind);
+                JO.attribute("b", o);
+                JO.attribute("e", o);
+                if (ref.has_value())
+                  JO.attribute("ref", *ref);
+                if (owner >= 0)
+                  JO.attribute("owner_include_id", owner);
+              });
+            };
+
+        auto computeAfterLastInclude = [&](llvm::StringRef Buf) -> long long {
+          if (Buf.empty())
+            return 0;
+          size_t N = Buf.size();
+          size_t p = 0;
+          int depth = 0;
+          long long lastEnd = -1;
+          while (p < N) {
+            auto span = lineSpanOf(Buf, p);
+            size_t bol = span.first, eol = span.second;
+            size_t q = bol;
+            while (q < eol && isSpace(Buf[q]))
+              ++q;
+            if (q < eol && Buf[q] == '#') {
+              ++q;
+              while (q < eol && isSpace(Buf[q]))
+                ++q;
+              auto kw = [&](const char *s) -> bool {
+                size_t t = q, k = 0;
+                while (t < eol && s[k] && Buf[t] == s[k]) {
+                  ++t;
+                  ++k;
+                }
+                return !s[k] && (t == eol || !(isalnum((unsigned char)Buf[t]) ||
+                                               Buf[t] == '_'));
+              };
+              if (kw("if") || kw("ifdef") || kw("ifndef")) {
+                depth++;
+              } else if (kw("endif")) {
+                if (depth > 0)
+                  depth--;
+              } else if (depth == 0 && (kw("include") || kw("include_next"))) {
+                lastEnd = (long long)eol;
+              }
+            }
+            p = eol;
+          }
+          return lastEnd >= 0 ? lastEnd : 0;
+        };
+
+        // file-level slots for TU
+        {
+          auto MB = llvm::MemoryBuffer::getFile(SourcePath);
+          llvm::StringRef Buf;
+          size_t size = 0;
+          if (MB) {
+            Buf = (*MB)->getMemBufferRef().getBuffer();
+            size = Buf.size();
+          }
+          long long after = computeAfterLastInclude(Buf);
+          emitPoint(SourcePath, 0, "file_begin");
+          emitPoint(SourcePath, (long long)size, "file_end");
+          emitPoint(SourcePath, after, "after_last_include");
+        }
+
+        // include before/after slots + file-level slots per included header
+        // instance
+        for (const auto &It : Items) {
+          if (It.Subkind == "#include" || It.Subkind == "#include_next") {
+            if (!It.SitePath.empty()) {
+              if (It.SiteBegin >= 0)
+                emitPoint(It.SitePath, It.SiteBegin, "before_include", It.ID);
+              if (It.SiteEnd >= 0)
+                emitPoint(It.SitePath, It.SiteEnd, "after_include", It.ID);
+            }
+            if (!It.TargetPath.empty()) {
+              auto MB = llvm::MemoryBuffer::getFile(It.TargetPath);
+              llvm::StringRef HBuf;
+              size_t HSize = 0;
+              if (MB) {
+                HBuf = (*MB)->getMemBufferRef().getBuffer();
+                HSize = HBuf.size();
+              }
+              long long after = computeAfterLastInclude(HBuf);
+              emitPoint(It.TargetPath, 0, "file_begin", std::nullopt, It.ID);
+              emitPoint(It.TargetPath, (long long)HSize, "file_end",
+                        std::nullopt, It.ID);
+              emitPoint(It.TargetPath, after, "after_last_include",
+                        std::nullopt, It.ID);
+            }
+          }
+        }
+      });
+
+      int NextCondGroupId = 0;
+      int NextCondArmId = 0;
+
       // conds...
       JO.attributeArray("conds", [&] {
-        // Emit per-file conditional groups for included files we actually
-        // opened.
-        llvm::StringSet<> Seen;
-        for (const auto &It : Items) {
-          if (It.Subkind != "#include")
-            continue;
-          if (It.TargetPath.empty())
-            continue;
-          std::string H = It.TargetPath;
-          if (!Seen.insert(H).second)
-            continue;
+        auto emitGroups = [&](llvm::StringRef FilePath, int parentIncId) {
+          llvm::StringRef Buf;
 
-          auto BufOrErr = llvm::MemoryBuffer::getFile(H);
-          if (!BufOrErr)
-            continue;
-          StringRef HB((*BufOrErr)->getBufferStart(),
-                       (*BufOrErr)->getBufferSize());
+          // Prefer SourceManager buffers (handles VFS and remaps).
+          if (!FilePath.empty()) {
+            if (auto FER = SM.getFileManager().getOptionalFileRef(FilePath)) {
+              FileID FID = SM.translateFile(*FER); // FileID, not Optional
+              if (FID.isValid()) {
+                if (auto MB = SM.getBufferOrNone(FID))
+                  Buf = MB->getBuffer(); // Optional<MemoryBufferRef> ->
+                                         // MB->getBuffer()
+              }
+            }
+          }
 
-          for (const auto &G : scanTopLevelConds(HB, H)) {
-            // Only groups that have at least one arm.
+          // Fallback to filesystem read.
+          if (Buf.empty() && !FilePath.empty()) {
+            if (auto MB = llvm::MemoryBuffer::getFile(FilePath))
+              Buf = (*MB)->getMemBufferRef().getBuffer();
+          }
+          if (Buf.empty())
+            return;
+
+          auto Groups = scanTopLevelConds(Buf, FilePath);
+          llvm::errs() << "[refold] conds: " << FilePath << " -> "
+                       << Groups.size() << " group(s)\n";
+
+          for (const auto &G : Groups) {
             if (G.Arms.empty())
               continue;
             JO.object([&] {
+              JO.attribute("id", NextCondGroupId++);
               JO.attribute("file", G.File);
               JO.attribute("group_b", (uint64_t)G.GroupB);
               JO.attribute("group_e", (uint64_t)G.GroupE);
+              if (parentIncId >= 0)
+                JO.attribute("parent_include_id", parentIncId);
               JO.attributeArray("arms", [&] {
                 for (const auto &A : G.Arms) {
                   JO.object([&] {
+                    JO.attribute("id", NextCondArmId++);
                     JO.attribute("tag", A.Tag);
                     if (!A.Cond.empty())
                       JO.attribute("cond", A.Cond);
                     JO.attribute("body_b", (uint64_t)A.BodyB);
                     JO.attribute("body_e", (uint64_t)A.BodyE);
-                    // We intentionally omit "selected" here; refolder can infer
-                    // or fill it using A/B context.
                   });
                 }
               });
             });
           }
+        };
+
+        // 1) Main translation unit
+        {
+          FileID MFID = SM.getMainFileID();
+          if (auto MB = SM.getBufferOrNone(MFID)) {
+            llvm::StringRef Buf = MB->getBuffer();
+            auto Groups = scanTopLevelConds(Buf, SourcePath);
+            llvm::errs() << "[refold] conds: TU " << SourcePath << " -> "
+                         << Groups.size() << " group(s)\n";
+            for (const auto &G : Groups) {
+              if (G.Arms.empty())
+                continue;
+              JO.object([&] {
+                JO.attribute("id", NextCondGroupId++);
+                JO.attribute("file", G.File);
+                JO.attribute("group_b", (uint64_t)G.GroupB);
+                JO.attribute("group_e", (uint64_t)G.GroupE);
+                JO.attributeArray("arms", [&] {
+                  for (const auto &A : G.Arms) {
+                    JO.object([&] {
+                      JO.attribute("id", NextCondArmId++);
+                      JO.attribute("tag", A.Tag);
+                      if (!A.Cond.empty())
+                        JO.attribute("cond", A.Cond);
+                      JO.attribute("body_b", (uint64_t)A.BodyB);
+                      JO.attribute("body_e", (uint64_t)A.BodyE);
+                    });
+                  }
+                });
+              });
+            }
+          } else {
+            llvm::errs() << "[refold] conds: TU buffer missing for "
+                         << SourcePath << "\n";
+          }
+        }
+
+        // 2) Each include/include_next instance (per-instance, no dedup)
+        for (const auto &It : Items) {
+          if (!(It.Subkind == "#include" || It.Subkind == "#include_next"))
+            continue;
+          std::string H =
+              !It.ResolvedPath.empty() ? It.ResolvedPath : It.TargetPath;
+          if (H.empty())
+            continue;
+          emitGroups(H, It.ID);
         }
       });
     });
