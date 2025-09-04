@@ -800,7 +800,6 @@ struct Item {
   std::string SitePath;     // file path that contains the directive
   std::string TargetAsWritten; // as-written header token ("e.h" or <vector>)
   std::string ResolvedPath;   // filesystem path actually opened for include
-  std::string TargetPath;   // [compat] resolved path, kept for legacy code
   bool IsAngled = false;    // <...> vs "..."
   int Parent = -1;          // parent include item id, or -1 if top-level
   int OwnerIncludeId = -1;   // include item id that opened the file containing this item
@@ -1036,6 +1035,8 @@ class RefoldMapBuilder {
   std::vector<TokMapEntry> TokMap;
 
   std::string OutPath;
+  std::string TUAbsPath;     // Canonical absolute path of TU (for JSON 'source')
+  bool EmitAbsPaths = false; // Should we emit absolute paths?
 
   // Compute [begin,end) byte offsets (inclusive of newline) for the directive
   // line.
@@ -1065,12 +1066,44 @@ class RefoldMapBuilder {
     return {(long long)B, (long long)E};
   }
 
-  static std::string filePathForLoc(const SourceManager &SM, SourceLocation L) {
-    FileID FID = SM.getFileID(SM.getFileLoc(L));
-    if (!FID.isValid())
+  // Canonical absolute path when possible; preserves pseudo paths.
+  static std::string absolutePathFor(const clang::FileEntryRef &FER) {
+    if (auto RP = FER.getFileEntry().tryGetRealPathName(); !RP.empty())
+      return RP.str();
+
+    llvm::SmallString<256> P(FER.getName());
+
+    // Pseudo paths
+    if (!P.empty() && P.front() == '<')
+      return P.str().str();
+
+    // Try to resolve via host FS; if it fails (VFS), proceed with abs+normalize
+    llvm::SmallString<256> Real;
+    if (!llvm::sys::fs::real_path(P, Real))
+      P = Real;
+
+    if (llvm::sys::path::is_relative(P))
+      llvm::sys::fs::make_absolute(P);
+
+    llvm::sys::path::remove_dots(P, /*remove_dot_dot=*/true);
+    return P.str().str();
+  }
+
+  // Return file path for a SourceLocation; absolute if WantAbs is true.
+  static std::string filePathForLocAbs(clang::SourceManager &SM,
+                                       clang::SourceLocation L, bool WantAbs) {
+    if (!L.isValid())
       return std::string();
-    if (auto FER = SM.getFileEntryRefForID(FID))
-      return std::string(FER->getName());
+
+    if (SM.isWrittenInBuiltinFile(L))
+      return "<built-in>";
+    if (SM.isWrittenInCommandLineFile(L))
+      return "<command-line>";
+
+    clang::FileID FID = SM.getFileID(L);
+    if (auto FER = SM.getFileEntryRefForID(FID)) {
+      return WantAbs ? absolutePathFor(*FER) : std::string(FER->getName());
+    }
     return std::string();
   }
 
@@ -1078,7 +1111,17 @@ public:
   RefoldMapBuilder(Preprocessor &PP, std::string OutPath)
       : PP(PP), SM(PP.getSourceManager()), Lang(PP.getLangOpts()),
         IgnoreComments(!(PP.getCommentRetentionState())),
-        OutPath(std::move(OutPath)) {}
+        OutPath(std::move(OutPath)) {
+    if (auto FER = SM.getFileEntryRefForID(SM.getMainFileID())) {
+      EmitAbsPaths = true;
+      TUAbsPath = absolutePathFor(*FER);
+    } else {
+      auto &Diags = PP.getDiagnostics();
+      unsigned ID = Diags.getCustomDiagID(clang::DiagnosticsEngine::Fatal,
+                                          "[refold-map] no main TU file entry");
+      Diags.Report(ID);
+    }
+  }
 
   // Create-or-extend the current open span for a given item so spans are
   // always half-open [Begin, End) and contiguous per item.
@@ -1138,12 +1181,12 @@ public:
     auto [B, E] = computeDirectiveLine(HashLoc);
     It.SiteBegin = B;
     It.SiteEnd = E;
-    It.SitePath = filePathForLoc(SM, HashLoc);
+    It.SitePath = filePathForLocAbs(SM, HashLoc, EmitAbsPaths);
 
     // Resolved target path, when available
     if (File) {
-      It.ResolvedPath = std::string(File->getName());
-      It.TargetPath = It.ResolvedPath;
+      It.ResolvedPath =
+          EmitAbsPaths ? absolutePathFor(*File) : std::string(File->getName());
     }
 
     Items.push_back(std::move(It));
@@ -1175,7 +1218,7 @@ public:
     auto BE = computeDirectiveLine(MI->getDefinitionLoc());
     It.SiteBegin = BE.first;
     It.SiteEnd = BE.second;
-    It.SitePath = filePathForLoc(SM, MI->getDefinitionLoc());
+    It.SitePath = filePathForLocAbs(SM, MI->getDefinitionLoc(), EmitAbsPaths);
     Items.push_back(std::move(It));
     if (!IncludeStack.empty()) Items.back().OwnerIncludeId = IncludeStack.back();
   }
@@ -1196,7 +1239,7 @@ public:
     auto BE = computeDirectiveLine(MacroNameTok.getLocation());
     It.SiteBegin = BE.first;
     It.SiteEnd = BE.second;
-    It.SitePath = filePathForLoc(SM, MacroNameTok.getLocation());
+    It.SitePath = filePathForLocAbs(SM, MacroNameTok.getLocation(), EmitAbsPaths);
     Items.push_back(std::move(It));
     if (!IncludeStack.empty()) Items.back().OwnerIncludeId = IncludeStack.back();
   }
@@ -1227,7 +1270,7 @@ public:
     if (FB.isValid() && FE.isValid()) {
       It.InvBegin = SM.getFileOffset(FB);
       It.InvEnd = SM.getFileOffset(FE);
-      It.InvFile = filePathForLoc(SM, FB);
+      It.InvFile = filePathForLocAbs(SM, FB, EmitAbsPaths);
     } else {
       It.InvBegin = It.InvEnd = -1;
     }
@@ -1256,7 +1299,7 @@ public:
     auto BE = computeDirectiveLine(HashLoc);
     It.SiteBegin = BE.first;
     It.SiteEnd = BE.second;
-    It.SitePath = filePathForLoc(SM, HashLoc);
+    It.SitePath = filePathForLocAbs(SM, HashLoc, EmitAbsPaths);
     Items.push_back(std::move(It));
     if (!IncludeStack.empty()) Items.back().OwnerIncludeId = IncludeStack.back();
   }
@@ -1348,7 +1391,7 @@ public:
           M.PPIndex  = TokIndex;
           M.SrcBegin = B;
           M.SrcEnd   = E;
-          M.File     = filePathForLoc(SM, FL); // e.g. "./e.h"
+          M.File     = filePathForLocAbs(SM, FL, EmitAbsPaths); // e.g. "./e.h"
           TokMap.push_back(std::move(M));
         }
       }
@@ -1378,16 +1421,11 @@ public:
       return;
     }
 
-    // Determine the source path.
-    std::string SourcePath = "<unknown>";
-    if (auto FER = SM.getFileEntryRefForID(SM.getMainFileID()))
-      SourcePath = std::string(FER->getName());
-
     llvm::json::OStream JO(OS, /*Indent=*/2);
 
     JO.object([&] {
       JO.attribute("version", "1.1");
-      JO.attribute("source", SourcePath);
+      JO.attribute("source", TUAbsPath);
 
       // tokens...
       JO.attributeObject("tokens", [&] { JO.attribute("count", TokIndex); });
@@ -1415,6 +1453,9 @@ public:
               JO.attribute("inv_e", It.InvEnd);
               if (!It.InvFile.empty()) JO.attribute("inv_file", It.InvFile);
             }
+
+            if (It.Kind == IK_File)
+              JO.attribute("path", TUAbsPath);
 
             // Emit site anchors for all directive kinds.
             if (It.Kind == IK_Directive) {
@@ -1487,7 +1528,8 @@ public:
         auto emitPoint =
             [&](llvm::StringRef FilePath, long long off, const char *kind,
                 std::optional<int> ref = std::nullopt, int owner = -1) {
-              const long long o = off < 0 ? 0 : off;  // clamp once here
+              //const long long o = off < 0 ? 0 : off;  // clamp once here
+              const long long o = off;
               JO.object([&] {
                 JO.attribute("id", SlotId++);
                 JO.attribute("file", FilePath.str());
@@ -1543,17 +1585,24 @@ public:
 
         // file-level slots for TU
         {
-          auto MB = llvm::MemoryBuffer::getFile(SourcePath);
           llvm::StringRef Buf;
           size_t size = 0;
-          if (MB) {
-            Buf = (*MB)->getMemBufferRef().getBuffer();
+
+          if (auto MB = SM.getBufferOrNone(SM.getMainFileID())) {
+            Buf = MB->getBuffer(); // authoritative (respects VFS/remaps)
             size = Buf.size();
+          } else {
+            auto &Diags = PP.getDiagnostics();
+            unsigned ID = Diags.getCustomDiagID(
+                clang::DiagnosticsEngine::Fatal,
+                "[refold-map] TU buffer unavailable for '%0'");
+            Diags.Report(ID) << TUAbsPath;
           }
+
           long long after = computeAfterLastInclude(Buf);
-          emitPoint(SourcePath, 0, "file_begin");
-          emitPoint(SourcePath, (long long)size, "file_end");
-          emitPoint(SourcePath, after, "after_last_include");
+          emitPoint(TUAbsPath, 0, "file_begin");
+          emitPoint(TUAbsPath, (long long)size, "file_end");
+          emitPoint(TUAbsPath, after, "after_last_include");
         }
 
         // include before/after slots + file-level slots per included header
@@ -1566,8 +1615,8 @@ public:
               if (It.SiteEnd >= 0)
                 emitPoint(It.SitePath, It.SiteEnd, "after_include", It.ID);
             }
-            if (!It.TargetPath.empty()) {
-              auto MB = llvm::MemoryBuffer::getFile(It.TargetPath);
+            if (!It.ResolvedPath.empty()) {
+              auto MB = llvm::MemoryBuffer::getFile(It.ResolvedPath);
               llvm::StringRef HBuf;
               size_t HSize = 0;
               if (MB) {
@@ -1575,10 +1624,10 @@ public:
                 HSize = HBuf.size();
               }
               long long after = computeAfterLastInclude(HBuf);
-              emitPoint(It.TargetPath, 0, "file_begin", std::nullopt, It.ID);
-              emitPoint(It.TargetPath, (long long)HSize, "file_end",
+              emitPoint(It.ResolvedPath, 0, "file_begin", std::nullopt, It.ID);
+              emitPoint(It.ResolvedPath, (long long)HSize, "file_end",
                         std::nullopt, It.ID);
-              emitPoint(It.TargetPath, after, "after_last_include",
+              emitPoint(It.ResolvedPath, after, "after_last_include",
                         std::nullopt, It.ID);
             }
           }
@@ -1648,8 +1697,8 @@ public:
           FileID MFID = SM.getMainFileID();
           if (auto MB = SM.getBufferOrNone(MFID)) {
             llvm::StringRef Buf = MB->getBuffer();
-            auto Groups = scanTopLevelConds(Buf, SourcePath);
-            llvm::errs() << "[refold] conds: TU " << SourcePath << " -> "
+            auto Groups = scanTopLevelConds(Buf, TUAbsPath);
+            llvm::errs() << "[refold] conds: TU " << TUAbsPath << " -> "
                          << Groups.size() << " group(s)\n";
             for (const auto &G : Groups) {
               if (G.Arms.empty())
@@ -1675,7 +1724,7 @@ public:
             }
           } else {
             llvm::errs() << "[refold] conds: TU buffer missing for "
-                         << SourcePath << "\n";
+                         << TUAbsPath << "\n";
           }
         }
 
@@ -1683,11 +1732,9 @@ public:
         for (const auto &It : Items) {
           if (!(It.Subkind == "#include" || It.Subkind == "#include_next"))
             continue;
-          std::string H =
-              !It.ResolvedPath.empty() ? It.ResolvedPath : It.TargetPath;
-          if (H.empty())
+          if (It.ResolvedPath.empty())
             continue;
-          emitGroups(H, It.ID);
+          emitGroups(It.ResolvedPath, It.ID);
         }
       });
     });
