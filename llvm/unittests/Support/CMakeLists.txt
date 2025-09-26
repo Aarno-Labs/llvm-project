@@ -47,6 +47,7 @@ add_llvm_unittest(SupportTests
   HashBuilderTest.cpp
   IndexedAccessorTest.cpp
   InstructionCostTest.cpp
+  JSONSchemaValidatorTest.cpp
   JSONTest.cpp
   KnownBitsTest.cpp
   LEB128Test.cpp
