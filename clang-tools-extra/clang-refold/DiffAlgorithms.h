@@ -197,8 +197,7 @@ std::vector<Hunk> coalesce(const std::vector<Step> &steps);
 ///
 /// Returns an array `map` of length `A.size()` where `map[i] = j` if
 /// `A[i]` participates in an LCS alignment with `B[j]` (order-preserving),
-/// or `-1` if `A[i]` is unmatched. Element equality is tested using
-/// `Object::equals()`.
+/// or `-1` if `A[i]` is unmatched.
 ///
 /// ### Tie-breaker (determinism)
 /// When backtracking the DP table at a mismatch and both candidate

@@ -69,8 +69,7 @@ namespace clang {
 namespace refold {
 namespace diffutils {
 
-// ========================= LCS (DP with greedy fallback)
-// =========================
+// ====================== LCS (DP with greedy fallback) =======================
 
 std::vector<int> lcsMapAB(const std::vector<std::string> &a,
                           const std::vector<std::string> &b,

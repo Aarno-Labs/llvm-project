@@ -193,13 +193,22 @@ public:
                                       const std::vector<std::size_t> &bTokOff);
 
 private:
-  RefoldEngine() = default;
+  const RefoldModel model_;
+  StringRef aSource_, bSource_;
+  const std::vector<PPTok> &aToks_, &bToks_;
+  std::vector<std::size_t> aTokOff_, bTokOff_; // Keep a copy
 
-  static std::string Refold(const RefoldModel &model, StringRef aSource,
-                            const std::vector<PPTok> &aToks,
-                            const std::vector<std::size_t> &aTokOff,
-                            StringRef bSource, const std::vector<PPTok> &bToks,
-                            const std::vector<std::size_t> &bTokOff);
+  /// Construct an engine from concrete inputs. The instance method `Refold()`
+  /// runs the full pipeline using these captured members.
+  RefoldEngine(RefoldModel model, StringRef aSource,
+               const std::vector<PPTok> &aToks,
+               const std::vector<std::size_t> &aTokOff, StringRef bSource,
+               const std::vector<PPTok> &bToks,
+               const std::vector<std::size_t> &bTokOff)
+      : model_(std::move(model)), aSource_(aSource), bSource_(bSource),
+        aToks_(aToks), bToks_(bToks), aTokOff_(aTokOff), bTokOff_(bTokOff) {}
+
+  std::string Refold();
 
   // ----------------------- small data records -----------------------
   struct TextEdit {
@@ -414,13 +423,12 @@ private:
   /// This function is used by hunk classification to prefer include-based
   /// ownership before macro ownership.
   ///
-  /// \param model    Refold model holding include metadata.
   /// \param aLo      Inclusive start preprocessed-token index in A.
   /// \param aHi      Exclusive end preprocessed-token index in A.
   /// \returns        The smallest covering include item, or `nullptr` if none
   ///                 cover the span.
-  static const RefoldModel::IncludeItem *
-  SmallestCoveringInclude(const RefoldModel &model, int aLo, int aHi);
+  const RefoldModel::IncludeItem *SmallestCoveringInclude(int aLo,
+                                                          int aHi) const;
 
   /// \brief Return the innermost (smallest-width) macro invocation that fully
   ///        covers a given A-span.
@@ -436,13 +444,12 @@ private:
   /// Used during hunk classification to select the most local macro call site
   /// that owns an edit.
   ///
-  /// \param model   Refold model providing macro invocation metadata.
   /// \param aStart  Inclusive start preprocessed-token index in A.
   /// \param aEnd    Exclusive end preprocessed-token index in A.
   /// \returns       The smallest covering macro invocation, or `nullptr` if
   ///                none cover the span.
-  static const RefoldModel::MacroInvocation *
-  SmallestCoveringMacro(const RefoldModel &model, int aStart, int aEnd);
+  const RefoldModel::MacroInvocation *SmallestCoveringMacro(int aStart,
+                                                            int aEnd) const;
 
   /// \brief Determine whether an A-token interval is owned by the translation
   ///        unit (TU).
@@ -460,16 +467,13 @@ private:
   /// file disqualifies the hunk. This keeps refolding deterministic and
   /// prevents edits from being applied to the wrong file.
   ///
-  /// \param model   Refold model containing the PP-token → (file, byte range)
-  ///                map.
   /// \param a0      Inclusive start preprocessed-token index in A.
   /// \param a1      Exclusive end preprocessed-token index in A.
   /// \param tuPath  Absolute canonical path of the TU’s source file.
   /// \returns       `true` if the interval is TU-owned (only TU mappings or
   ///                unmapped/empty);
   ///                `false` if any mapped token belongs to a non-TU file.
-  static bool HunkMapsToTU(const RefoldModel &model, int a0, int a1,
-                           StringRef tuPath);
+  bool HunkMapsToTU(int a0, int a1, StringRef tuPath) const;
 
   /// \brief Compute the TU byte span `[b, e)` corresponding to an A-token
   ///        interval `[a0, a1)`.
@@ -500,34 +504,38 @@ private:
   /// * File length (for EOF) is computed once here; if reading fails, an empty
   ///   length is assumed.
   ///
-  /// \param model   Refold model providing token → file/byte mappings.
   /// \param a0      Inclusive start preprocessed-token index in A.
   /// \param a1      Exclusive end preprocessed-token index in A.
   /// \param tuPath  Absolute canonical path of the TU’s source file.
   /// \returns       A two-element array `{ b, e }` giving the TU byte range
   ///                `[b, e)`.
-  static std::array<int, 2> TUByteSpan(const RefoldModel &model, int a0, int a1,
-                                       StringRef tuPath);
+  std::array<int, 2> TUByteSpan(int a0, int a1, StringRef tuPath) const;
 
   /// \brief Build a fully specified IncludePatch for a pure INSERT hunk,
   ///        carrying the exact bytes from B.
   ///
   /// Constructs an `IncludePatch` that records the A-token interval
   /// (`h.aStart..h.aEnd`), the B-token interval (`h.bStart..h.bEnd`),
-  /// and the literal bytes from **B** computed via `bTokOff`. The slice is
+  /// and the literal bytes from **B** computed via `bTokOff_`. The slice is
   /// half-open in token space and byte-accurate, making it suitable for
   /// deterministic, line-local application.
   ///
   /// \param inc       The include item that owns this hunk.
   /// \param h         The diff hunk describing the A/B token intervals.
-  /// \param bSource   Edited preprocessed source **B** to slice bytes from.
-  /// \param bTokOff   Byte offsets for B tokens (size = |B| + 1).
   /// \returns         A new `IncludePatch` containing the exact insertion
   ///                  payload from **B**.
-  static IncludePatch
-  BuildIncludeInsertionPatch(const RefoldModel::IncludeItem &inc,
-                             const diffutils::Hunk &h, StringRef bSource,
-                             const std::vector<std::size_t> &bTokOff);
+  IncludePatch BuildIncludeInsertionPatch(const RefoldModel::IncludeItem &inc,
+                                          const diffutils::Hunk &h) const {
+    IncludePatch p;
+    p.include = &inc;
+    p.aStart = h.aStart;
+    p.aEnd = h.aEnd;
+    p.bStart = h.bStart;
+    p.bEnd = h.bEnd;
+    p.insertBytes.assign(bSource_.data() + bTokOff_[h.bStart],
+                         bSource_.data() + bTokOff_[h.bEnd]);
+    return p;
+  }
 
   /// \brief Build a macro replacement patch by splicing the macro’s B-side
   ///        expansion into the call site.
@@ -538,7 +546,7 @@ private:
   /// ### Primary Path
   /// * Map the macro’s A-cover `[coverBegin, coverEnd)` to a B-token interval
   ///   using the A→B LCS map (`a2b`).
-  /// * Slice `bSource` via `bTokOff` to obtain the replacement bytes.
+  /// * Slice `bSource_` via `bTokOff_` to obtain the replacement bytes.
   ///
   /// ### Fallbacks (deterministic)
   /// * If the cover cannot be mapped (unmapped or inverted), and the hunk
@@ -556,14 +564,12 @@ private:
   /// \param h         The diff hunk associated with this macro region.
   /// \param a2b       Map from A-token index → matching B-token index (or -1)
   ///                  as produced by the LCS.
-  /// \param bSource   Edited preprocessed source (**B**).
-  /// \param bTokOff   Byte offsets for **B** tokens (size = |B| + 1).
   /// \returns         A `MacroPatch` targeting the macro call site with the
   ///                  computed replacement bytes.
-  static MacroPatch BuildMacroInvocationPatchWholeCover(
-      const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h,
-      const std::vector<int> &a2b, StringRef bSource,
-      const std::vector<std::size_t> &bTokOff);
+  MacroPatch
+  BuildMacroInvocationPatchWholeCover(const RefoldModel::MacroInvocation &m,
+                                      const diffutils::Hunk &h,
+                                      const std::vector<int> &a2b) const;
 
   /// \brief Normalize and coalesce *pure insertion* hunks per include site on
   ///        the B side.
@@ -587,13 +593,8 @@ private:
   ///
   /// \param perInclude Map from include ID → include-scoped edits to normalize
   ///                   (mutated in place).
-  /// \param bSource    Edited preprocessed text (**B**) used to build merged
-  ///                   insertion payloads.
-  /// \param bTokOff    Token byte offsets for **B** (size = `#tokens(B) + 1`).
-  static void
-  NormalizeIncludeInsertions(std::map<int, IncludeEdits> &perInclude,
-                             StringRef bSource,
-                             const std::vector<std::size_t> &bTokOff);
+  void
+  NormalizeIncludeInsertions(std::map<int, IncludeEdits> &perInclude) const;
 
   /// \brief Fully materialize the bytes for a single `#include` instance and
   ///        cache the result.
@@ -626,7 +627,6 @@ private:
   /// * **Coverage (coverBegin / coverEnd):** A-token indices; used to decide
   ///   ownership, not for byte replacement.
   ///
-  /// \param model               Parsed refold model.
   /// \param includeId           Unique ID of the include to materialize.
   /// \param perInclude          Map of include ID → include-level A/B edits
   ///                            (insert/delete/replace).
@@ -638,14 +638,13 @@ private:
   /// \param includeExpansion    Cache/output: include ID → fully materialized
   ///                            header bytes; may be preseeded with raw header
   ///                            text.
-  static void MaterializeIncludeExpansion(
-      const RefoldModel &model, int includeId,
-      const std::map<int, IncludeEdits> &perInclude,
+  void MaterializeIncludeExpansion(
+      int includeId, const std::map<int, IncludeEdits> &perInclude,
       const std::map<std::optional<int>, std::vector<MacroPatch>>
           &macroPatchesByOwner,
       const std::map<int, std::vector<const RefoldModel::IncludeItem *>>
           &children,
-      std::map<int, std::string> &includeExpansion);
+      std::map<int, std::string> &includeExpansion) const;
 
   /// \brief Apply include-scoped insertion and replacement edits to a single
   ///        header’s text.
@@ -673,14 +672,12 @@ private:
   /// **idempotent**; token gluing is avoided by inserting a single space only
   /// when maximal-munch would otherwise alter the token sequence.
   ///
-  /// \param model      Parsed refold map (for PP-index → file byte mapping).
   /// \param ie         Include-scoped edits to apply (already normalized and
   ///                   merged).
   /// \param headerText Entire text of the resolved include file to patch.
   /// \returns          The header text with all include-scoped edits applied.
-  static std::string ApplyIncludeInsertions(const RefoldModel &model,
-                                            const IncludeEdits &ie,
-                                            std::string headerText);
+  std::string ApplyIncludeInsertions(const IncludeEdits &ie,
+                                     std::string headerText) const;
 
   // ----------------------- low-level mapping & utils -----------------------
 
@@ -704,16 +701,15 @@ private:
   /// starting byte offset. If no matching mapping exists, returns \p fileLen
   /// when \p fallbackToEOF is true, otherwise `-1`.
   ///
-  /// \param model         Refold model containing PP→(file, b, e) entries.
   /// \param file          Canonical path of the target file.
   /// \param pp            Preprocessed token index.
   /// \param fallbackToEOF Return \p fileLen when no mapping is found.
   /// \param fileLen       File length used when falling back.
   /// \returns Byte start offset, or `fileLen`/`-1` per fallback policy.
-  static int ByteStartForPPInFile(const RefoldModel &model, StringRef file,
-                                  int pp, bool fallbackToEOF, int fileLen) {
-    auto it = model.GetTokmapByPP().find(pp);
-    if (it != model.GetTokmapByPP().end() && PathsEqual(it->second.file, file))
+  int ByteStartForPPInFile(StringRef file, int pp, bool fallbackToEOF,
+                           int fileLen) const {
+    auto it = model_.GetTokmapByPP().find(pp);
+    if (it != model_.GetTokmapByPP().end() && PathsEqual(it->second.file, file))
       return it->second.b;
     return fallbackToEOF ? fileLen : -1;
   }
@@ -724,16 +720,15 @@ private:
   /// ending byte offset. If no matching mapping exists, returns \p fileLen when
   /// \p fallbackToEOF is true, otherwise `-1`.
   ///
-  /// \param model         Refold model containing PP→(file, b, e) entries.
   /// \param file          Canonical path of the target file.
   /// \param pp            Preprocessed token index.
   /// \param fallbackToEOF Return \p fileLen when no mapping is found.
   /// \param fileLen       File length used when falling back.
   /// \returns Byte end offset, or `fileLen`/`-1` per fallback policy.
-  static int ByteEndForPPInFile(const RefoldModel &model, StringRef file,
-                                int pp, bool fallbackToEOF, int fileLen) {
-    auto it = model.GetTokmapByPP().find(pp);
-    if (it != model.GetTokmapByPP().end() && PathsEqual(it->second.file, file))
+  int ByteEndForPPInFile(StringRef file, int pp, bool fallbackToEOF,
+                         int fileLen) const {
+    auto it = model_.GetTokmapByPP().find(pp);
+    if (it != model_.GetTokmapByPP().end() && PathsEqual(it->second.file, file))
       return it->second.e;
     return fallbackToEOF ? fileLen : -1;
   }
