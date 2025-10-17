@@ -94,6 +94,7 @@ namespace {
 
 // --------------------------- Tokenization ---------------------------------
 
+#if 0
 inline void writeTokensCSV(const std::vector<PPTok> &ppToks,
                            const std::vector<std::size_t> &startOffs,
                            raw_ostream &os) {
@@ -122,6 +123,7 @@ inline void writeTokensCSVToFile(const std::vector<PPTok> &ppToks,
   }
   writeTokensCSV(ppToks, startOffs, os);
 }
+#endif
 
 /// \brief Lex a preprocessed byte buffer into Clang-style tokens.
 ///
@@ -483,6 +485,7 @@ int main(int argc, char **argv) {
   debug("lex", "{0} tokens={1} {2} tokens={3}", aPath, aToks.size(), bPath,
         bToks.size());
 
+#if 0
   // XXX: Write out debug files so that I can compare the preprocessed lexical
   // tokens with the clang/llvm implementation of `clang-refold`. This can go
   // away once we have a stable working version of clang.
@@ -492,6 +495,7 @@ int main(int argc, char **argv) {
   SmallString<256> tokensBFile;
   sys::fs::expand_tilde("~/tokens.b-cpp.txt", tokensBFile);
   writeTokensCSVToFile(bToks, bTokByteOff, tokensBFile.str().str());
+#endif
 
   // Generate the refolded C source as a string.
   Expected<std::string> refoldedOrErr = RefoldEngine::Refold(
