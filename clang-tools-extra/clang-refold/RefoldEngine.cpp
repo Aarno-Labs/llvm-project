@@ -139,6 +139,7 @@ std::string RefoldEngine::Refold(const RefoldModel &model, StringRef aSource,
   auto bSeq = MapLexemes(bToks, bTokOff);
   auto a2b = diffutils::lcsMapAB(aSeq, bSeq);
 
+#if 0
   auto writeMap = [](StringRef filename, const std::vector<int> &a2b) {
     std::error_code ec;
     llvm::raw_fd_ostream os(filename.str(), ec, llvm::sys::fs::OF_Text);
@@ -159,6 +160,7 @@ std::string RefoldEngine::Refold(const RefoldModel &model, StringRef aSource,
   SmallString<256> lcsMapFile;
   sys::fs::expand_tilde("~/lcsmap.cpp.txt", lcsMapFile);
   writeMap(lcsMapFile, a2b);
+#endif
 
   // Sanity check: map must have a strict ordering.
   for (int i = 0, last = -1; i < static_cast<int>(a2b.size()); ++i) {
