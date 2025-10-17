@@ -84,30 +84,24 @@ RefoldEngine::Refold(const json::Object &rootJson, StringRef aSource,
   auto mOrErr = RefoldModel::FromJson(rootJson);
   if (!mOrErr)
     return mOrErr.takeError();
-  return Refold(*mOrErr, aSource, aToks, aTokOff, bSource, bToks, bTokOff);
+
+  // Construct an engine and run the instance pipeline.
+  RefoldEngine engine(std::move(*mOrErr), aSource, aToks, aTokOff, bSource,
+                      bToks, bTokOff);
+  return engine.Refold();
 }
 
-std::string RefoldEngine::Refold(const RefoldModel &model, StringRef aSource,
-                                 const std::vector<PPTok> &aToks,
-                                 const std::vector<std::size_t> &aTokOffIn,
-                                 StringRef bSource,
-                                 const std::vector<PPTok> &bToks,
-                                 const std::vector<std::size_t> &bTokOffIn) {
+std::string RefoldEngine::Refold() {
   const std::size_t expectedCount =
-      static_cast<std::size_t>(model.GetTokensCountA());
-  if (aToks.size() != expectedCount) {
+      static_cast<std::size_t>(model_.GetTokensCountA());
+  if (aToks_.size() != expectedCount) {
     fatal(
         "tok",
         "token count mismatch: JSON says {0} expected, but driver produced {1}",
-        expectedCount, aToks.size());
+        expectedCount, aToks_.size());
   }
 
-  // Copy offsets so we can append sentinel if needed (we won’t mutate caller’s
-  // vectors).
-  std::vector<std::size_t> aTokOff = aTokOffIn;
-  std::vector<std::size_t> bTokOff = bTokOffIn;
-
-  const std::string tuPath = model.GetSourcePath();
+  const std::string tuPath = model_.GetSourcePath();
 
   std::string tuBytes;
   {
@@ -125,18 +119,18 @@ std::string RefoldEngine::Refold(const RefoldModel &model, StringRef aSource,
   }
 
   // Append the sentinel to both source offsets.
-  if (bTokOff.empty() || bTokOff.back() != bSource.size()) {
-    if (bTokOff.empty() || bTokOff.back() < bSource.size())
-      bTokOff.push_back(bSource.size());
+  if (bTokOff_.empty() || bTokOff_.back() != bSource_.size()) {
+    if (bTokOff_.empty() || bTokOff_.back() < bSource_.size())
+      bTokOff_.push_back(bSource_.size());
   }
-  if (aTokOff.empty() || aTokOff.back() != aSource.size()) {
-    if (aTokOff.empty() || aTokOff.back() < aSource.size())
-      aTokOff.push_back(aSource.size());
+  if (aTokOff_.empty() || aTokOff_.back() != aSource_.size()) {
+    if (aTokOff_.empty() || aTokOff_.back() < aSource_.size())
+      aTokOff_.push_back(aSource_.size());
   }
 
   // 1) Generate token sequences and A->B anchor map.
-  auto aSeq = MapLexemes(aToks, aTokOff);
-  auto bSeq = MapLexemes(bToks, bTokOff);
+  auto aSeq = MapLexemes(aToks_, aTokOff_);
+  auto bSeq = MapLexemes(bToks_, bTokOff_);
   auto a2b = diffutils::lcsMapAB(aSeq, bSeq);
 
 #if 0
@@ -181,8 +175,8 @@ std::string RefoldEngine::Refold(const RefoldModel &model, StringRef aSource,
         100.0 * mapped / std::max<std::size_t>(1U, aSeq.size()));
 
   info("plan", "TU={0} includes={1} macroInvocations={2} tokmap={3}", tuPath,
-       model.GetIncludes().size(), model.GetMacroInvocations().size(),
-       model.GetTokmapByPP().size());
+       model_.GetIncludes().size(), model_.GetMacroInvocations().size(),
+       model_.GetTokmapByPP().size());
 
   // 2) Diff hunks (changed A-token intervals -> B-token intervals).
   auto hunks = diffutils::hunksFromMap(a2b, static_cast<int>(aSeq.size()),
@@ -200,12 +194,12 @@ std::string RefoldEngine::Refold(const RefoldModel &model, StringRef aSource,
 
     llvm::StringRef bfrag;
     if (h.bStart < h.bEnd) {
-      const std::size_t b0 = bTokOff[static_cast<std::size_t>(h.bStart)];
-      const std::size_t b1 = bTokOff[static_cast<std::size_t>(h.bEnd)];
+      const std::size_t b0 = bTokOff_[static_cast<std::size_t>(h.bStart)];
+      const std::size_t b1 = bTokOff_[static_cast<std::size_t>(h.bEnd)];
       // Defensive clamping (should already be valid if offsets have sentinel):
       const std::size_t lo = std::max<std::size_t>(0U, b0);
       const std::size_t hi = std::max<std::size_t>(lo, b1);
-      bfrag = bSource.substr(lo, hi - lo);
+      bfrag = bSource_.substr(lo, hi - lo);
     }
 
     // If your helpers take std::string, convert as needed:
@@ -226,21 +220,21 @@ std::string RefoldEngine::Refold(const RefoldModel &model, StringRef aSource,
     const auto &h = hunks[i];
 
     // a) Prefer include expansion if available.
-    if (auto *inc = SmallestCoveringInclude(model, h.aStart, h.aEnd)) {
+    if (auto *inc = SmallestCoveringInclude(h.aStart, h.aEnd)) {
       debug("classify",
             "#{0} -> INCLUDE id={1} path={2}  A[{3},{4})->B[{5},{6})", i,
             inc->id,
             (inc->resolvedPath ? *inc->resolvedPath
                                : StripHeaderToken(inc->target)),
             h.aStart, h.aEnd, h.bStart, h.bEnd);
-      auto patch = BuildIncludeInsertionPatch(*inc, h, bSource, bTokOff);
+      auto patch = BuildIncludeInsertionPatch(*inc, h);
       perInclude[inc->id].include = inc;
       perInclude[inc->id].patches.push_back(std::move(patch));
       continue;
     }
 
     // b) Macro call-site?
-    if (auto *m = SmallestCoveringMacro(model, h.aStart, h.aEnd)) {
+    if (auto *m = SmallestCoveringMacro(h.aStart, h.aEnd)) {
       if (m->getInvB() != -1 && m->getInvE() != -1) {
         debug("classify",
               "#{0} -> MACRO inv='{1}' owner={2} invFile={3} "
@@ -249,20 +243,19 @@ std::string RefoldEngine::Refold(const RefoldModel &model, StringRef aSource,
               m->ownerIncludeId ? *m->ownerIncludeId : -1,
               m->invFile ? *m->invFile : "null", h.aStart, h.aEnd, h.bStart,
               h.bEnd);
-        auto mp =
-            BuildMacroInvocationPatchWholeCover(*m, h, a2b, bSource, bTokOff);
+        auto mp = BuildMacroInvocationPatchWholeCover(*m, h, a2b);
         macroPatchesByOwner[m->ownerIncludeId].push_back(std::move(mp));
         continue;
       }
     }
 
     // c) TU edit?
-    if (HunkMapsToTU(model, h.aStart, h.aEnd, tuPath)) {
-      auto span = TUByteSpan(model, h.aStart, h.aEnd, tuPath); // [b,e)
+    if (HunkMapsToTU(h.aStart, h.aEnd, tuPath)) {
+      auto span = TUByteSpan(h.aStart, h.aEnd, tuPath); // [b,e)
       std::string repl;
       if (span[0] >= 0 && h.bStart < h.bEnd) {
-        std::size_t b0 = bTokOff[h.bStart], b1 = bTokOff[h.bEnd];
-        repl.assign(bSource.data() + b0, bSource.data() + b1);
+        std::size_t b0 = bTokOff_[h.bStart], b1 = bTokOff_[h.bEnd];
+        repl.assign(bSource_.data() + b0, bSource_.data() + b1);
       }
 
       if (span[0] >= 0) {
@@ -305,12 +298,12 @@ std::string RefoldEngine::Refold(const RefoldModel &model, StringRef aSource,
   }
 
   // Normalize/coalesce include-side insertions.
-  NormalizeIncludeInsertions(perInclude, bSource, bTokOff);
+  NormalizeIncludeInsertions(perInclude);
 
   // 4) Materialize include expansions bottom-up (nested first). Build child
   // lists by parent include id.
   std::map<int, std::vector<const RefoldModel::IncludeItem *>> children;
-  for (const auto &ii : model.GetIncludes()) {
+  for (const auto &ii : model_.GetIncludes()) {
     if (ii.parent)
       children[*ii.parent].push_back(&ii);
   }
@@ -348,17 +341,17 @@ std::string RefoldEngine::Refold(const RefoldModel &model, StringRef aSource,
 
   // (c) Pull in all ancestors up to the TU.
   for (int id : std::vector<int>(seeds.begin(), seeds.end())) {
-    const auto *cur = model.GetIncludeById(id);
+    const auto *cur = model_.GetIncludeById(id);
     while (cur && cur->parent) {
       seeds.insert(*cur->parent);
-      cur = model.GetIncludeById(*cur->parent);
+      cur = model_.GetIncludeById(*cur->parent);
     }
   }
 
   // (d) Realize each include once (memoization lives inside
   // MaterializeIncludeExpansion).
   for (int incId : seeds) {
-    MaterializeIncludeExpansion(model, incId, perInclude, macroPatchesByOwner,
+    MaterializeIncludeExpansion(incId, perInclude, macroPatchesByOwner,
                                 children, includeExpansion);
   }
 
@@ -377,7 +370,7 @@ std::string RefoldEngine::Refold(const RefoldModel &model, StringRef aSource,
   // 5b) TU include expansions: includes with parent == null and site in TU,
   // only if we realized an expansion.
   for (const auto &kv : includeExpansion) {
-    const auto *inc = model.GetIncludeById(kv.first);
+    const auto *inc = model_.GetIncludeById(kv.first);
     if (!inc)
       continue;
     if (!inc->parent && PathsEqual(inc->sitePath, tuPath)) {
@@ -541,11 +534,10 @@ int RefoldEngine::ShiftAnchorToLineIndentIfAtFuncName(StringRef text, int pos) {
 // ===================== Owner resolution & TU mapping ======================
 
 const RefoldModel::IncludeItem *
-RefoldEngine::SmallestCoveringInclude(const RefoldModel &model, int aLo,
-                                      int aHi) {
+RefoldEngine::SmallestCoveringInclude(int aLo, int aHi) const {
   const RefoldModel::IncludeItem *best = nullptr;
   int bestWidth = std::numeric_limits<int>::max();
-  for (const auto &inc : model.GetIncludes()) {
+  for (const auto &inc : model_.GetIncludes()) {
     if (inc.cover.begin < 0 || inc.cover.end < 0)
       continue;
     if (inc.cover.begin <= aLo && aHi <= inc.cover.end) {
@@ -560,10 +552,9 @@ RefoldEngine::SmallestCoveringInclude(const RefoldModel &model, int aLo,
 }
 
 const RefoldModel::MacroInvocation *
-RefoldEngine::SmallestCoveringMacro(const RefoldModel &model, int aStart,
-                                    int aEnd) {
+RefoldEngine::SmallestCoveringMacro(int aStart, int aEnd) const {
   const RefoldModel::MacroInvocation *best = nullptr;
-  for (const auto &m : model.GetMacroInvocations()) {
+  for (const auto &m : model_.GetMacroInvocations()) {
     int cb = m.cover.begin, ce = m.cover.end;
     if (cb < 0 || ce < 0)
       continue;
@@ -581,12 +572,12 @@ RefoldEngine::SmallestCoveringMacro(const RefoldModel &model, int aStart,
   return best;
 }
 
-bool RefoldEngine::HunkMapsToTU(const RefoldModel &model, int a0, int a1,
-                                StringRef tuPath) {
+bool RefoldEngine::HunkMapsToTU(int a0, int a1, StringRef tuPath) const {
   bool sawAnyTU = false;
+  const auto &tokmapByPP = model_.GetTokmapByPP();
   for (int pp = a0; pp < a1; ++pp) {
-    auto it = model.GetTokmapByPP().find(pp);
-    if (it == model.GetTokmapByPP().end())
+    auto it = tokmapByPP.find(pp);
+    if (it == tokmapByPP.end())
       continue; // ignore unmapped (spaces/tabs/newlines)
     const auto &t = it->second;
     if (!PathsEqual(t.file, tuPath))
@@ -598,15 +589,17 @@ bool RefoldEngine::HunkMapsToTU(const RefoldModel &model, int a0, int a1,
   return sawAnyTU || (a0 == a1);
 }
 
-std::array<int, 2> RefoldEngine::TUByteSpan(const RefoldModel &model, int a0,
-                                            int a1, StringRef tuPath) {
+std::array<int, 2> RefoldEngine::TUByteSpan(int a0, int a1,
+                                            StringRef tuPath) const {
   constexpr int MAX = std::numeric_limits<int>::max();
   int bMin = MAX, eMax = -1;
 
+  const auto &tokmapByPP = model_.GetTokmapByPP();
+
   // First pass: try to find mapped TU tokens inside [a0,a1)
   for (int pp = a0; pp < a1; ++pp) {
-    auto it = model.GetTokmapByPP().find(pp);
-    if (it == model.GetTokmapByPP().end())
+    auto it = tokmapByPP.find(pp);
+    if (it == tokmapByPP.end())
       continue; // ignore unmapped (whitespace)
     const auto &t = it->second;
     if (PathsEqual(t.file, tuPath)) {
@@ -632,15 +625,14 @@ std::array<int, 2> RefoldEngine::TUByteSpan(const RefoldModel &model, int a0,
   // Left boundary: end of the closest preceding TU-mapped token (or BOF).
   int leftE = -1;
   for (int p = a0 - 1; p >= 0; --p) {
-    int e = ByteEndForPPInFile(model, tuPath, p, /*fallbackToEOF*/ false,
+    int e = ByteEndForPPInFile(tuPath, p, /*fallbackToEOF*/ false,
                                static_cast<int>(fileLen));
     if (e >= 0) {
       leftE = e;
       break;
     }
-    auto it = model.GetTokmapByPP().find(p);
-    if (it != model.GetTokmapByPP().end() &&
-        !PathsEqual(it->second.file, tuPath))
+    auto it = tokmapByPP.find(p);
+    if (it != tokmapByPP.end() && !PathsEqual(it->second.file, tuPath))
       break; // crossed into non-TU region
   }
   if (leftE < 0)
@@ -648,17 +640,16 @@ std::array<int, 2> RefoldEngine::TUByteSpan(const RefoldModel &model, int a0,
 
   // Right boundary: begin of the closest following TU-mapped token (or EOF).
   int rightB = -1;
-  const int tokCount = static_cast<int>(model.GetTokmapByPP().size());
+  const int tokCount = static_cast<int>(tokmapByPP.size());
   for (int p = a1; p < tokCount; ++p) {
-    int b = ByteStartForPPInFile(model, tuPath, p, /*fallbackToEOF*/ false,
+    int b = ByteStartForPPInFile(tuPath, p, /*fallbackToEOF*/ false,
                                  static_cast<int>(fileLen));
     if (b >= 0) {
       rightB = b;
       break;
     }
-    auto it = model.GetTokmapByPP().find(p);
-    if (it != model.GetTokmapByPP().end() &&
-        !PathsEqual(it->second.file, tuPath))
+    auto it = tokmapByPP.find(p);
+    if (it != tokmapByPP.end() && !PathsEqual(it->second.file, tuPath))
       break; // crossed into non-TU region
   }
   if (rightB < 0)
@@ -669,24 +660,9 @@ std::array<int, 2> RefoldEngine::TUByteSpan(const RefoldModel &model, int a0,
 
 // ==================== Patch builders (include & macro) ====================
 
-RefoldEngine::IncludePatch RefoldEngine::BuildIncludeInsertionPatch(
-    const RefoldModel::IncludeItem &inc, const diffutils::Hunk &h,
-    StringRef bSource, const std::vector<std::size_t> &bTokOff) {
-  IncludePatch p;
-  p.include = &inc;
-  p.aStart = h.aStart;
-  p.aEnd = h.aEnd;
-  p.bStart = h.bStart;
-  p.bEnd = h.bEnd;
-  p.insertBytes.assign(bSource.data() + bTokOff[h.bStart],
-                       bSource.data() + bTokOff[h.bEnd]);
-  return p;
-}
-
 RefoldEngine::MacroPatch RefoldEngine::BuildMacroInvocationPatchWholeCover(
     const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h,
-    const std::vector<int> &a2b, StringRef bSource,
-    const std::vector<std::size_t> &bTokOff) {
+    const std::vector<int> &a2b) const {
   // Map the macro's A-cover [coverBegin, coverEnd) to a B-token interval via
   // LCS map.
   int bStartIdx = MapForwardToB(a2b, m.cover.begin);
@@ -702,15 +678,15 @@ RefoldEngine::MacroPatch RefoldEngine::BuildMacroInvocationPatchWholeCover(
     bEndIdxEx = h.bEnd - 1;
   }
 
-  // Final defensive clamp (should be redundant if bTokOff has sentinel)
-  std::size_t b0 = bTokOff[bStartIdx];
-  std::size_t b1 = bTokOff[bEndIdxEx + 1];
+  // Final defensive clamp (should be redundant if bTokOff_ has sentinel)
+  std::size_t b0 = bTokOff_[bStartIdx];
+  std::size_t b1 = bTokOff_[bEndIdxEx + 1];
   if (b1 < b0) {
     // ultra-defensive check: produce empty replacement instead of crashing
     return MacroPatch{m.getInvB(), m.getInvE(), ""};
   }
 
-  StringRef frag(bSource.data() + b0, static_cast<std::size_t>(b1 - b0));
+  StringRef frag(bSource_.data() + b0, static_cast<std::size_t>(b1 - b0));
   std::string repl = frag.ltrim(" \t").rtrim(" \t").str();
   return MacroPatch{m.getInvB(), m.getInvE(), std::move(repl)};
 }
@@ -718,8 +694,7 @@ RefoldEngine::MacroPatch RefoldEngine::BuildMacroInvocationPatchWholeCover(
 // =========== Include processing (normalize, materialize, apply) ===========
 
 void RefoldEngine::NormalizeIncludeInsertions(
-    std::map<int, IncludeEdits> &perInclude, StringRef bSource,
-    const std::vector<std::size_t> &bTokOff) {
+    std::map<int, IncludeEdits> &perInclude) const {
   for (auto &kv : perInclude) {
     auto &ie = kv.second;
     if (!ie.include || ie.patches.empty())
@@ -748,8 +723,8 @@ void RefoldEngine::NormalizeIncludeInsertions(
 
         // Walk left across whitespace tokens; track if we cross a newline.
         while (k >= 0) {
-          std::size_t ts = bTokOff[k], te = bTokOff[k + 1];
-          StringRef tok(bSource.data() + ts, te - ts);
+          std::size_t ts = bTokOff_[k], te = bTokOff_[k + 1];
+          StringRef tok(bSource_.data() + ts, te - ts);
 
           if (stringutils::isAsciiWhitespace(tok.str())) {
             if (tok.contains('\n') || tok.contains('\r')) {
@@ -777,8 +752,8 @@ void RefoldEngine::NormalizeIncludeInsertions(
         }
 
         // We'll build the text incrementally from left + gap + right...
-        std::string left(bSource.data() + bTokOff[bStartIdx],
-                         bSource.data() + bTokOff[bEndIdxEx]);
+        std::string left(bSource_.data() + bTokOff_[bStartIdx],
+                         bSource_.data() + bTokOff_[bEndIdxEx]);
 
         std::size_t j = i + 1;
         while (j < ie.patches.size()) {
@@ -789,10 +764,10 @@ void RefoldEngine::NormalizeIncludeInsertions(
             break; // keep it very local (same site)
 
           // Combine: include the matched B gap and the next insert bytes.
-          std::string gap(bSource.data() + bTokOff[bEndIdxEx],
-                          bSource.data() + bTokOff[q.bStart]);
-          std::string right(bSource.data() + bTokOff[q.bStart],
-                            bSource.data() + bTokOff[q.bEnd]);
+          std::string gap(bSource_.data() + bTokOff_[bEndIdxEx],
+                          bSource_.data() + bTokOff_[q.bStart]);
+          std::string right(bSource_.data() + bTokOff_[q.bStart],
+                            bSource_.data() + bTokOff_[q.bEnd]);
 
           // If identifiers touch across the gap, ensure a single space.
           if (!gap.empty() && !right.empty() &&
@@ -829,18 +804,17 @@ void RefoldEngine::NormalizeIncludeInsertions(
 }
 
 void RefoldEngine::MaterializeIncludeExpansion(
-    const RefoldModel &model, int includeId,
-    const std::map<int, IncludeEdits> &perInclude,
+    int includeId, const std::map<int, IncludeEdits> &perInclude,
     const std::map<std::optional<int>, std::vector<MacroPatch>>
         &macroPatchesByOwner,
     const std::map<int, std::vector<const RefoldModel::IncludeItem *>>
         &children,
-    std::map<int, std::string> &includeExpansion) {
+    std::map<int, std::string> &includeExpansion) const {
   // Already materialized?
   if (includeExpansion.count(includeId))
     return;
 
-  const auto *inc = model.GetIncludeById(includeId);
+  const auto *inc = model_.GetIncludeById(includeId);
   if (!inc) {
     fatal("include/mat", "unknown include id {0}", includeId);
   }
@@ -888,7 +862,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
   // 2) A/B include insert/delete/replace patches that belong to this include.
   if (auto it = perInclude.find(includeId); it != perInclude.end()) {
     if (!it->second.patches.empty())
-      bytes = ApplyIncludeInsertions(model, it->second, std::move(bytes));
+      bytes = ApplyIncludeInsertions(it->second, std::move(bytes));
   }
 
   auto hasDescendantWork = [&](auto &&self, int id) -> bool {
@@ -938,9 +912,8 @@ void RefoldEngine::MaterializeIncludeExpansion(
       }
 
       // Ensure the child is materialized first (depth-first).
-      MaterializeIncludeExpansion(model, child->id, perInclude,
-                                  macroPatchesByOwner, children,
-                                  includeExpansion);
+      MaterializeIncludeExpansion(child->id, perInclude, macroPatchesByOwner,
+                                  children, includeExpansion);
 
       // The child directive's site is recorded in the includer byte space.
       const auto &childText = includeExpansion[child->id];
@@ -987,9 +960,8 @@ void RefoldEngine::MaterializeIncludeExpansion(
   includeExpansion[includeId] = std::move(bytes);
 }
 
-std::string RefoldEngine::ApplyIncludeInsertions(const RefoldModel &model,
-                                                 const IncludeEdits &ie,
-                                                 std::string headerText) {
+std::string RefoldEngine::ApplyIncludeInsertions(const IncludeEdits &ie,
+                                                 std::string headerText) const {
   const std::string file =
       (ie.include->resolvedPath && !ie.include->resolvedPath->empty())
           ? *ie.include->resolvedPath
@@ -997,6 +969,8 @@ std::string RefoldEngine::ApplyIncludeInsertions(const RefoldModel &model,
 
   const int fileLen = static_cast<int>(headerText.size());
   std::vector<TextEdit> edits;
+
+  const auto &tokmapByPP = model_.GetTokmapByPP();
 
   for (const auto &p : ie.patches) {
     const bool isInsert = (p.aStart == p.aEnd) && (p.bStart < p.bEnd);
@@ -1010,7 +984,7 @@ std::string RefoldEngine::ApplyIncludeInsertions(const RefoldModel &model,
 
       if (!INSERT_AFTER_LEFT_TOKEN_EOL) {
         // Prefer right-neighbor (start of token at aStart) in this file.
-        insertAt = ByteStartForPPInFile(model, file, p.aStart,
+        insertAt = ByteStartForPPInFile(file, p.aStart,
                                         /*fallbackToEOF*/ false, fileLen);
         trace("include/anchor",
               "inc#{0} right-neighbor start: pp={1} -> byte={2}",
@@ -1021,7 +995,7 @@ std::string RefoldEngine::ApplyIncludeInsertions(const RefoldModel &model,
         if (insertAt < 0) {
           int leftPP = p.aStart - 1;
           if (leftPP >= ie.include->cover.begin) {
-            int leftEnd = ByteEndForPPInFile(model, file, leftPP,
+            int leftEnd = ByteEndForPPInFile(file, leftPP,
                                              /*fallbackToEOF*/ false, fileLen);
             if (leftEnd >= 0) {
               insertAt = HopPastOptionalNewline(headerText, leftEnd, fileLen);
@@ -1038,11 +1012,11 @@ std::string RefoldEngine::ApplyIncludeInsertions(const RefoldModel &model,
         // (start-of-line for the declaration). Else fall back to right token
         // start.
         int leftPP = std::max(ie.include->cover.begin, p.aStart - 1);
-        int leftEnd = ByteEndForPPInFile(model, file, leftPP,
+        int leftEnd = ByteEndForPPInFile(file, leftPP,
                                          /*fallbackToEOF*/ false, fileLen);
-        int leftStart = ByteStartForPPInFile(model, file, leftPP,
+        int leftStart = ByteStartForPPInFile(file, leftPP,
                                              /*fallbackToEOF*/ false, fileLen);
-        int rightStart = ByteStartForPPInFile(model, file, p.aStart,
+        int rightStart = ByteStartForPPInFile(file, p.aStart,
                                               /*fallbackToEOF*/ false, fileLen);
 
         if (leftEnd >= 0) {
@@ -1082,7 +1056,7 @@ std::string RefoldEngine::ApplyIncludeInsertions(const RefoldModel &model,
 
       // Last resort: first PP inside this header, else BOF=0
       if (insertAt < 0) {
-        int rn = ByteStartForPPInFile(model, file, p.aStart,
+        int rn = ByteStartForPPInFile(file, p.aStart,
                                       /*fallbackToEOF*/ false, fileLen);
         trace("include/anchor",
               "inc#{0} right-neighbor retry: pp={1} -> byte={2}",
@@ -1093,16 +1067,15 @@ std::string RefoldEngine::ApplyIncludeInsertions(const RefoldModel &model,
           int firstPP = -1;
           for (int pp = ie.include->cover.begin; pp < ie.include->cover.end;
                ++pp) {
-            auto it = model.GetTokmapByPP().find(pp);
-            if (it != model.GetTokmapByPP().end() &&
-                PathsEqual(it->second.file, file)) {
+            auto it = tokmapByPP.find(pp);
+            if (it != tokmapByPP.end() && PathsEqual(it->second.file, file)) {
               firstPP = pp;
               break;
             }
           }
           if (firstPP >= 0) {
             int firstByte = ByteStartForPPInFile(
-                model, file, firstPP, /*fallbackToEOF*/ false, fileLen);
+                file, firstPP, /*fallbackToEOF*/ false, fileLen);
             insertAt = (firstByte >= 0) ? firstByte : 0;
             trace("include/anchor",
                   "inc#{0} cover-firstPP start: pp={1} -> byte={2} (fallback)",
@@ -1134,17 +1107,15 @@ std::string RefoldEngine::ApplyIncludeInsertions(const RefoldModel &model,
       int s = -1, e = -1;
 
       for (int pp = p.aStart; pp < p.aEnd; ++pp) {
-        auto it = model.GetTokmapByPP().find(pp);
-        if (it != model.GetTokmapByPP().end() &&
-            PathsEqual(it->second.file, file)) {
+        auto it = tokmapByPP.find(pp);
+        if (it != tokmapByPP.end() && PathsEqual(it->second.file, file)) {
           s = pp;
           break;
         }
       }
       for (int pp = p.aEnd - 1; pp >= p.aStart; --pp) {
-        auto it = model.GetTokmapByPP().find(pp);
-        if (it != model.GetTokmapByPP().end() &&
-            PathsEqual(it->second.file, file)) {
+        auto it = tokmapByPP.find(pp);
+        if (it != tokmapByPP.end() && PathsEqual(it->second.file, file)) {
           e = pp;
           break;
         }
@@ -1152,10 +1123,9 @@ std::string RefoldEngine::ApplyIncludeInsertions(const RefoldModel &model,
 
       if (s == -1 || e == -1)
         continue; // nothing in this file
-      startByte = ByteStartForPPInFile(model, file, s, /*fallbackToEOF*/ false,
-                                       fileLen);
-      endByte =
-          ByteEndForPPInFile(model, file, e, /*fallbackToEOF*/ false, fileLen);
+      startByte =
+          ByteStartForPPInFile(file, s, /*fallbackToEOF*/ false, fileLen);
+      endByte = ByteEndForPPInFile(file, e, /*fallbackToEOF*/ false, fileLen);
     }
 
     // Replacement bytes for INSERT/REPLACE; or "" for DELETE.

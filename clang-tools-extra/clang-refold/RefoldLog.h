@@ -107,8 +107,6 @@ static inline StringRef logLevelToString(LogLevel level) {
 
 extern cl::opt<LogLevel> LogLevelOpt;
 
-namespace {
-
 inline llvm::raw_ostream::Colors levelColor(LogLevel level) {
   using color = raw_ostream::Colors;
   switch (level) {
@@ -166,8 +164,6 @@ inline bool inLogLevel(LogLevel level) {
   return static_cast<unsigned>(LogLevelOpt.getValue()) >=
          static_cast<unsigned>(level);
 }
-
-} // namespace
 
 namespace clang {
 namespace refold {
