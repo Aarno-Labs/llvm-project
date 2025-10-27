@@ -980,19 +980,18 @@ void RefoldModel::BuildIndicesAndSort() {
 std::vector<const RefoldModel::CondGroup *>
 RefoldModel::GetCondGroups(StringRef file,
                            const std::optional<int> &parentIncludeId) const {
-  std::vector<const CondGroup *> out;
   if (!parentIncludeId.has_value()) {
     auto it = condsByFile_.find(file.str());
     if (it != condsByFile_.end())
-      out = it->second;
-    return out;
+      return it->second;
+    return {};
   }
   auto fit = condsByFileByOwner_.find(file.str());
   if (fit == condsByFileByOwner_.end())
-    return out;
+    return {};
   auto oit = fit->second.find(*parentIncludeId);
   if (oit == fit->second.end())
-    return out;
+    return {};
   return oit->second;
 }
 
@@ -1045,9 +1044,9 @@ RefoldModel::FindSlots(const std::optional<std::string> &file,
 }
 
 std::vector<RefoldModel::TokMapEntry> RefoldModel::MapSpan(PPSpan span) const {
-  std::vector<TokMapEntry> out;
   if (span.begin < 0 || span.end < span.begin)
-    return out;
+    return {};
+  std::vector<TokMapEntry> out;
   out.reserve(static_cast<std::size_t>(std::max(0, span.end - span.begin)));
   for (int i = span.begin; i < span.end; ++i) {
     auto it = tokmapByPP_.find(i);

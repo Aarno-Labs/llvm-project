@@ -23,6 +23,9 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMODEL_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMODEL_H
 
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Errc.h"
 #include "llvm/Support/Error.h"
@@ -34,7 +37,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <map>
 #include <optional>
 #include <string>
 #include <utility>
@@ -324,26 +326,22 @@ public:
   static Expected<RefoldModel> FromJson(const json::Object &Root);
 
   // ======= Basic getters (match Java API) =======
-  const std::string &GetVersion() const { return version_; }
-  const std::string &GetSourcePath() const { return sourcePath_; }
+  StringRef GetVersion() const { return version_; }
+  StringRef GetSourcePath() const { return sourcePath_; }
   int GetTokensCountA() const { return tokensCountA_; }
 
-  const std::map<int, TokMapEntry> &GetTokmapByPP() const {
+  const DenseMap<int, TokMapEntry> &GetTokmapByPP() const {
     return tokmapByPP_;
   }
-  const std::vector<TokMapEntry> &GetTokmap() const { return tokmap_; }
+  ArrayRef<TokMapEntry> GetTokmap() const { return tokmap_; }
 
-  const std::vector<IncludeItem> &GetIncludes() const { return includes_; }
-  const std::vector<MacroInvocation> &GetMacroInvocations() const {
-    return macroInvs_;
-  }
-  const std::vector<MacroDirective> &GetMacroDirectives() const {
-    return macroDirs_;
-  }
-  const std::vector<PragmaDirective> &GetPragmas() const { return pragmas_; }
-  const std::vector<FileItem> &GetFileItems() const { return fileItems_; }
-  const std::vector<Slot> &GetSlots() const { return slots_; }
-  const std::vector<CondGroup> &GetConds() const { return conds_; }
+  ArrayRef<IncludeItem> GetIncludes() const { return includes_; }
+  ArrayRef<MacroInvocation> GetMacroInvocations() const { return macroInvs_; }
+  ArrayRef<MacroDirective> GetMacroDirectives() const { return macroDirs_; }
+  ArrayRef<PragmaDirective> GetPragmas() const { return pragmas_; }
+  ArrayRef<FileItem> GetFileItems() const { return fileItems_; }
+  ArrayRef<Slot> GetSlots() const { return slots_; }
+  ArrayRef<CondGroup> GetConds() const { return conds_; }
 
   const IncludeItem *GetIncludeById(int id) const {
     auto it = includeById_.find(id);
@@ -406,7 +404,7 @@ private:
   std::string sourcePath_;
   int tokensCountA_ = 0;
 
-  std::map<int, TokMapEntry> tokmapByPP_; // key = pp
+  DenseMap<int, TokMapEntry> tokmapByPP_; // key = pp
   std::vector<TokMapEntry> tokmap_;
 
   std::vector<IncludeItem> includes_;
@@ -418,14 +416,13 @@ private:
   std::vector<CondGroup> conds_;
 
   // ======= Derived indices =======
-  std::map<int, const IncludeItem *> includeById_;
+  DenseMap<int, const IncludeItem *> includeById_;
 
   // file -> groups (all owners)
-  std::map<std::string, std::vector<const CondGroup *>> condsByFile_;
+  StringMap<std::vector<const CondGroup *>> condsByFile_;
 
   // file -> ownerIncludeId -> groups
-  std::map<std::string, std::map<int, std::vector<const CondGroup *>>>
-      condsByFileByOwner_;
+  StringMap<DenseMap<int, std::vector<const CondGroup *>>> condsByFileByOwner_;
 
   // Internal helper to finalize indices and perform deterministic ordering.
   void BuildIndicesAndSort();

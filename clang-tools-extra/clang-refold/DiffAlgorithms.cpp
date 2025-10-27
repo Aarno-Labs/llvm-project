@@ -58,6 +58,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "DiffAlgorithms.h"
+#include "llvm/ADT/ArrayRef.h"
 
 #include <algorithm>
 #include <climits>
@@ -71,8 +72,7 @@ namespace diffutils {
 
 // ====================== LCS (DP with greedy fallback) =======================
 
-std::vector<int> lcsMapAB(const std::vector<std::string> &a,
-                          const std::vector<std::string> &b,
+std::vector<int> lcsMapAB(ArrayRef<std::string> a, ArrayRef<std::string> b,
                           unsigned long long maxCells) {
   const std::size_t n = a.size(), m = b.size();
 
@@ -167,7 +167,7 @@ std::vector<int> lcsMapAB(const std::vector<std::string> &a,
   return map;
 }
 
-std::vector<Hunk> hunksFromMap(const std::vector<int> &map, int nA, int nB) {
+std::vector<Hunk> hunksFromMap(ArrayRef<int> map, int nA, int nB) {
   std::vector<Hunk> hunks;
   int prevI = -1, prevJ = -1;
   for (int i = 0; i < nA; ++i) {
@@ -218,9 +218,9 @@ std::vector<Hunk> hunksFromMap(const std::vector<int> &map, int nA, int nB) {
 /// \param dAtEnd Minimal edit distance at the end of the forward pass.
 /// \param offset Offset used to index `V` by `k + offset`.
 /// \returns Forward-ordered list of `Step` edits.
-static std::vector<Step> backtrack(const std::vector<std::string> &a,
-                                   const std::vector<std::string> &b,
-                                   const std::vector<std::vector<int>> &trace,
+static std::vector<Step> backtrack(ArrayRef<std::string> a,
+                                   ArrayRef<std::string> b,
+                                   ArrayRef<std::vector<int>> trace,
                                    int x, int y, int dAtEnd, int offset) {
   std::vector<Step> out;
   for (int d = dAtEnd; d > 0; --d) {
@@ -273,8 +273,7 @@ static std::vector<Step> backtrack(const std::vector<std::string> &a,
   return out;
 }
 
-std::vector<Step> diff(const std::vector<std::string> &a,
-                       const std::vector<std::string> &b) {
+std::vector<Step> diff(ArrayRef<std::string> a, ArrayRef<std::string> b) {
   const int n = static_cast<int>(a.size());
   const int m = static_cast<int>(b.size());
   const int max = n + m;
@@ -323,7 +322,7 @@ std::vector<Step> diff(const std::vector<std::string> &a,
   llvm_unreachable("diff failed to reach end");
 }
 
-std::vector<Hunk> coalesce(const std::vector<Step> &steps) {
+std::vector<Hunk> coalesce(ArrayRef<Step> &steps) {
   std::vector<Hunk> hunks;
   std::size_t i = 0;
   const std::size_t n = steps.size();

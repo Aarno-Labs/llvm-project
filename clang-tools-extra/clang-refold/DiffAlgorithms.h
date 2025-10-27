@@ -60,6 +60,7 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_DIFFALGORITHMS_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_DIFFALGORITHMS_H
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/Support/FormatVariadic.h"
 
 #include <cstddef>
@@ -170,8 +171,7 @@ struct Hunk {
 /// \param a Left sequence.
 /// \param b Right sequence.
 /// \returns Ordered list of `Step` records: `EQUAL`, `INSERT`, and `DELETE`.
-std::vector<Step> diff(const std::vector<std::string> &a,
-                       const std::vector<std::string> &b);
+std::vector<Step> diff(ArrayRef<std::string> a, ArrayRef<std::string> b);
 
 /// \brief Coalesce contiguous non-EQUAL steps into larger Hunk regions.
 ///
@@ -186,7 +186,7 @@ std::vector<Step> diff(const std::vector<std::string> &a,
 ///
 /// \param steps SES steps from `diff(A, B)` in forward order.
 /// \returns List of `Hunk` objects covering each contiguous edit run.
-std::vector<Hunk> coalesce(const std::vector<Step> &steps);
+std::vector<Hunk> coalesce(ArrayRef<Step> steps);
 
 // ===== LCS alignment utilities =====
 
@@ -225,8 +225,7 @@ std::vector<Hunk> coalesce(const std::vector<Step> &steps);
 /// \param b Right sequence.
 /// \param maxCells Maximum number of cells before performing a greedy scan.
 /// \returns A vector mapping a-indices to b-indices (or -1 if unmatched).
-std::vector<int> lcsMapAB(const std::vector<std::string> &a,
-                          const std::vector<std::string> &b,
+std::vector<int> lcsMapAB(ArrayRef<std::string> a, ArrayRef<std::string> b,
                           unsigned long long maxCells = 20000000ULL);
 
 /// \brief Convert an A→B alignment map into a list of edit hunks.
@@ -261,7 +260,7 @@ std::vector<int> lcsMapAB(const std::vector<std::string> &a,
 /// \param nB  Size of sequence B.
 /// \returns   List of `Hunk` objects, one per contiguous edit region
 ///            between anchors.
-std::vector<Hunk> hunksFromMap(const std::vector<int> &map, int nA, int nB);
+std::vector<Hunk> hunksFromMap(ArrayRef<int> map, int nA, int nB);
 
 } // namespace diffutils
 } // namespace refold
