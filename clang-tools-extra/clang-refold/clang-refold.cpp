@@ -174,8 +174,8 @@ void lexPPTokens(const std::string &bytes, std::vector<PPTok> &out,
     addedNL = true;
   }
 
-  debug("lexer", "entered: bytes={{0}} (addedNL={1})", buf.size(),
-        addedNL ? "true" : "false");
+  debug("lexer", "entered: bytes={0} (addedNL={1})", buf.size(),
+        addedNL ? "YES" : "NO");
 
   using namespace clang;
 

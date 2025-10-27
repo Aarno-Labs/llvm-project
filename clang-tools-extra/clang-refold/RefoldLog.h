@@ -69,12 +69,28 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLDLOG_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLDLOG_H
 
+#include "DiffAlgorithms.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FormatAdapters.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/WithColor.h"
 #include "llvm/Support/raw_ostream.h"
+
+namespace llvm {
+template <typename T> struct format_provider<std::optional<T>> {
+  static void format(const std::optional<T> &opt, raw_ostream &os,
+                     StringRef style) {
+    if (!opt) {
+      // Default "none" text; adjust to taste ("" for empty, etc.)
+      os << "(none)";
+      return;
+    }
+    // Delegate formatting of the contained value, honoring any :Style
+    format_provider<T>::format(*opt, os, style);
+  }
+};
+} // namespace llvm
 
 using namespace llvm;
 

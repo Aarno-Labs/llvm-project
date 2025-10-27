@@ -61,7 +61,9 @@
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_DIFFALGORITHMS_H
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/Support/FormatAdapters.h"
 #include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <cstddef>
 #include <string>
@@ -105,7 +107,7 @@ struct Step {
   int aLo, aHi; // indices in A
   int bLo, bHi; // indices in B
 
-  std::string toString() {
+  std::string ToString() const {
     std::string opStr;
     switch (op) {
     case Op::Equal:
@@ -118,7 +120,7 @@ struct Step {
       opStr = "DELETE";
       break;
     }
-    return formatv("{0} A[{1},{2}) B[{3},{4})", opStr, aLo, aHi, bLo, bHi);
+    return formatv("{0} A[{1},{2}) -> B[{3},{4})", opStr, aLo, aHi, bLo, bHi);
   }
 };
 
@@ -147,8 +149,25 @@ struct Hunk {
   bool isReplace() const { return (aStart < aEnd) && (bStart < bEnd); }
   bool isEqual() const { return (aStart == aEnd) && (bStart == bEnd); }
 
-  std::string toString() {
-    return formatv("HUNK A[{0},{1}) B[{2},{3})", aStart, aEnd, bStart, bEnd);
+  template <bool kVerbose = false> std::string ToString() const {
+    if (kVerbose) {
+      std::string kind;
+      if (isInsertOnly()) {
+        kind.assign("INS");
+      } else if (isDeleteOnly()) {
+        kind.assign("DEL");
+      } else if (isReplace()) {
+        kind.assign("REP");
+      } else if (isEqual()) {
+        kind.assign("EQL");
+      }
+      assert(!kind.empty() && "invalid hunk");
+      return formatv("{0} HUNK A[{1},{2}) -> B[{3},{4})", kind, aStart, aEnd,
+                     bStart, bEnd);
+    } else {
+      return formatv("HUNK A[{0},{1}) -> B[{2},{3})", aStart, aEnd, bStart,
+                     bEnd);
+    }
   }
 };
 
@@ -265,5 +284,30 @@ std::vector<Hunk> hunksFromMap(ArrayRef<int> map, int nA, int nB);
 } // namespace diffutils
 } // namespace refold
 } // namespace clang
+
+// Format providers for both `Hunk` and `Step` structs.
+namespace llvm {
+template <> struct format_provider<clang::refold::diffutils::Hunk> {
+  static void format(const clang::refold::diffutils::Hunk &hunk,
+                     raw_ostream &os, StringRef style) {
+    std::string hunkStr;
+    if (style.equals_insensitive("v") || style.equals_insensitive("verbose")) {
+      // Eat the "style" and call the appropriate "to string" function.
+      hunkStr.assign(hunk.ToString</*kVerbose*/ true>());
+      style = "";
+    } else {
+      hunkStr.assign(hunk.ToString</*kVerbose*/ false>());
+    }
+    format_provider<StringRef>::format(hunkStr, os, style);
+  }
+};
+
+template <> struct format_provider<clang::refold::diffutils::Step> {
+  static void format(const clang::refold::diffutils::Step &step,
+                     raw_ostream &os, StringRef style) {
+    format_provider<StringRef>::format(step.ToString(), os, style);
+  }
+};
+} // namespace llvm
 
 #endif // LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_DIFFALGORITHMS_H
