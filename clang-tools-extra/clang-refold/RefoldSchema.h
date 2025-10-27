@@ -258,7 +258,7 @@ static constexpr const char *RefoldSchema = R"json(
           },
           "description": "Token spans in the preprocessed stream A that together represent this macro's expansion."
         },
-        "invocation_text": {
+        "inv_text": {
           "type": "string",
           "description": "Exact bytes at the macro call site in the source (e.g., 'FOO(1, 2)')."
         },

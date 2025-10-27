@@ -21,15 +21,28 @@
 //===----------------------------------------------------------------------===//
 
 #include "RefoldModel.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/Twine.h"
+#include "llvm/Support/Error.h"
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/JSON.h"
 
 #include <cassert>
 #include <functional>
 
 using namespace llvm;
 
-namespace {
-
 // ================ Local JSON helpers (no exceptions) =================
+
+namespace {
+Expected<const json::Value *> requireField(const json::Object &obj,
+                                           StringRef key, StringRef ctx) {
+  if (const json::Value *val = obj.get(key))
+    return val;
+  return createStringError(inconvertibleErrorCode(),
+                           "Missing required field '%s' at %s",
+                           key.str().c_str(), ctx.str().c_str());
+}
 
 Expected<const json::Object *> asObject(const json::Value &val, StringRef ctx) {
   if (auto *obj = val.getAsObject())
@@ -38,13 +51,11 @@ Expected<const json::Object *> asObject(const json::Value &val, StringRef ctx) {
                            ctx.str().c_str());
 }
 
-Expected<const json::Value *> requireField(const json::Object &obj,
-                                           StringRef key, StringRef ctx) {
-  if (const json::Value *val = obj.get(key))
-    return val;
-  return createStringError(inconvertibleErrorCode(),
-                           "Missing required field '%s' at %s",
-                           key.str().c_str(), ctx.str().c_str());
+Expected<const json::Array *> asArray(const json::Value &val, StringRef ctx) {
+  if (auto *arr = val.getAsArray())
+    return arr;
+  return createStringError(inconvertibleErrorCode(), "Expected array at %s",
+                           ctx.str().c_str());
 }
 
 Expected<std::string> asString(const json::Value &val, StringRef ctx) {
@@ -61,33 +72,79 @@ Expected<int> asInt(const json::Value &val, StringRef ctx) {
                            ctx.str().c_str());
 }
 
-[[maybe_unused]]
-std::optional<int> asOptInt(const json::Object &obj, StringRef key) {
+std::optional<const json::Array *> asOptArray(const json::Object &obj,
+                                              StringRef key) {
   if (const json::Value *val = obj.get(key)) {
-    if (auto n = val->getAsInteger())
-      return static_cast<int>(*n);
+    auto arr = val->getAsArray();
+    assert(
+        arr &&
+        formatv("invalid json value type on field '{0}': expected array value",
+                key)
+            .str()
+            .c_str());
+    return arr;
   }
   return std::nullopt;
 }
 
-[[maybe_unused]]
 std::optional<std::string> asOptString(const json::Object &obj, StringRef key) {
   if (const json::Value *val = obj.get(key)) {
-    if (auto str = val->getAsString())
-      return std::string(*str);
+    auto str = val->getAsString();
+    assert(
+        str &&
+        formatv("invalid json value type on field '{0}': expected string value",
+                key)
+            .str()
+            .c_str());
+    return std::string(*str);
   }
   return std::nullopt;
 }
 
-[[maybe_unused]]
+std::optional<int> asOptInt(const json::Object &obj, StringRef key) {
+  if (const json::Value *val = obj.get(key)) {
+    auto n = val->getAsInteger();
+    assert(n &&
+           formatv(
+               "invalid json value type on field '{0}': expected integer value",
+               key)
+               .str()
+               .c_str());
+    return static_cast<int>(*n);
+  }
+  return std::nullopt;
+}
+
 std::optional<bool> asOptBool(const json::Object &obj, StringRef key) {
   if (const json::Value *val = obj.get(key)) {
-    if (auto b = val->getAsBoolean())
-      return *b;
+    auto b = val->getAsBoolean();
+    assert(b &&
+           formatv(
+               "invalid json value type on field '{0}': expected boolean value",
+               key)
+               .str()
+               .c_str());
+    return static_cast<bool>(*b);
   }
   return std::nullopt;
 }
 
+template <typename Fn>
+auto applyToField(Fn &&fn, const json::Object &obj, llvm::StringRef key,
+                  llvm::StringRef ctx = "root")
+    -> decltype(std::forward<Fn>(fn)(std::declval<const json::Value &>(),
+                                     std::declval<llvm::StringRef>())) {
+  auto fieldOrErr = requireField(obj, key, ctx); // Expected<const json::Value*>
+  if (!fieldOrErr)
+    return fieldOrErr.takeError();
+  return std::forward<decltype(fn)>(fn)(**fieldOrErr, key);
+}
+
+Expected<const json::Object *> arrayObjElemAt(const json::Array &arr,
+                                              std::size_t idx, StringRef ctx) {
+  const json::Value &val = arr[idx];
+  return asObject(val, ctx);
+}
 } // namespace
 
 namespace clang {
@@ -97,31 +154,33 @@ namespace {
 Expected<std::vector<RefoldModel::PPSpan>> parsePPSpans(const json::Value &val,
                                                         StringRef ctx) {
   std::vector<RefoldModel::PPSpan> out;
-  const json::Array *arr = val.getAsArray();
-  if (!arr)
-    return createStringError(inconvertibleErrorCode(), "Expected array at %s",
-                             ctx.str().c_str());
+  auto arrOrErr = asArray(val, ctx);
+  if (!arrOrErr)
+    return arrOrErr.takeError();
+  const json::Array *arr = *arrOrErr;
+
   out.reserve(arr->size());
   for (std::size_t i = 0; i < arr->size(); ++i) {
-    const json::Value &elem = (*arr)[i];
-    auto *obj = elem.getAsObject();
-    if (!obj)
-      return createStringError(inconvertibleErrorCode(),
-                               "Expected object for spans[%zu] at %s", i,
-                               ctx.str().c_str());
-    auto *bVal = obj->get("begin");
-    auto *eVal = obj->get("end");
-    if (!bVal || !eVal)
-      return createStringError(inconvertibleErrorCode(),
-                               "Missing begin/end in spans[%zu] at %s", i,
-                               ctx.str().c_str());
-    auto b = bVal->getAsInteger();
-    auto e = eVal->getAsInteger();
-    if (!b || !e)
-      return createStringError(inconvertibleErrorCode(),
-                               "Non-integer begin/end in spans[%zu] at %s", i,
-                               ctx.str().c_str());
-    out.push_back({static_cast<int>(*b), static_cast<int>(*e)});
+    const std::string ctxItem =
+        (ctx + llvm::Twine("[") + llvm::Twine(i) + "]").str();
+
+    auto objOrErr = arrayObjElemAt(*arr, i, ctxItem);
+    if (!objOrErr)
+      return objOrErr.takeError();
+    const json::Object *obj = *objOrErr;
+
+    // required
+    auto bOrErr = applyToField(asInt, *obj, "begin", ctxItem);
+    if (!bOrErr)
+      return bOrErr.takeError();
+    int begin = *bOrErr;
+
+    auto eOrErr = applyToField(asInt, *obj, "end", ctxItem);
+    if (!eOrErr)
+      return eOrErr.takeError();
+    int end = *eOrErr;
+
+    out.push_back({begin, end});
   }
   return out;
 }
@@ -133,83 +192,68 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
   RefoldModel model;
 
   // version
-  {
-    auto ev = requireField(root, "version", "root");
-    if (!ev)
-      return ev.takeError();
-    auto str = asString(**ev, "version");
-    if (!str)
-      return str.takeError();
-    model.version_ = *str;
-  }
+  auto versOrErr = applyToField(asString, root, "version");
+  if (!versOrErr)
+    return versOrErr.takeError();
+  model.version_ = *versOrErr;
 
   // source
-  {
-    auto ev = requireField(root, "source", "root");
-    if (!ev)
-      return ev.takeError();
-    auto str = asString(**ev, "source");
-    if (!str)
-      return str.takeError();
-    model.sourcePath_ = *str;
-  }
+  auto srcPathOrErr = applyToField(asString, root, "source");
+  if (!srcPathOrErr)
+    return srcPathOrErr.takeError();
+  model.sourcePath_ = *srcPathOrErr;
 
   // tokens.count
-  {
-    auto tokVal = requireField(root, "tokens", "root");
-    if (!tokVal)
-      return tokVal.takeError();
-    auto tokObjE = asObject(**tokVal, "tokens");
-    if (!tokObjE)
-      return tokObjE.takeError();
-    const json::Object *tokObj = *tokObjE;
+  auto tokObjOrErr = applyToField(asObject, root, "tokens");
+  if (!tokObjOrErr)
+    return tokObjOrErr.takeError();
+  const json::Object &tokObj = **tokObjOrErr;
+  auto cntOrErr = applyToField(asInt, tokObj, "count", "tokens.count");
+  if (!cntOrErr)
+    return cntOrErr.takeError();
+  model.tokensCountA_ = *cntOrErr;
 
-    auto cntVal = requireField(*tokObj, "count", "tokens.count");
-    if (!cntVal)
-      return cntVal.takeError();
-    auto cnt = asInt(**cntVal, "tokens.count");
-    if (!cnt)
-      return cnt.takeError();
-    model.tokensCountA_ = *cnt;
-  }
-
-  // tokmap (file/b/e required; pp optional)
+  // tokmap
   {
-    auto ev = requireField(root, "tokmap", "root");
-    if (!ev)
-      return ev.takeError();
-    const json::Array *arr = (*ev)->getAsArray();
-    if (!arr)
-      return createStringError(inconvertibleErrorCode(),
-                               "tokmap must be an array");
+    auto arrOrErr = applyToField(asArray, root, "tokmap");
+    if (!arrOrErr)
+      return arrOrErr.takeError();
+    const json::Array *arr = *arrOrErr;
+
     int autoPP = 0;
     model.tokmap_.reserve(arr->size());
     for (std::size_t i = 0; i < arr->size(); ++i) {
-      const json::Value &val = (*arr)[i];
-      const json::Object *obj = nullptr;
-      if (auto eo = asObject(val, "tokmap[]"))
-        obj = *eo;
-      else
-        return eo.takeError();
+      const std::string ctxItem =
+          (llvm::Twine("tokmap[") + llvm::Twine(i) + "]").str();
 
-      auto fileVal = obj->get("file");
-      auto bVal = obj->get("b");
-      auto eVal = obj->get("e");
-      if (!fileVal || !bVal || !eVal)
-        return createStringError(inconvertibleErrorCode(),
-                                 "tokmap[%zu] missing file/b/e", i);
+      auto objOrErr = arrayObjElemAt(*arr, i, ctxItem);
+      if (!objOrErr)
+        return objOrErr.takeError();
+      const json::Object *obj = *objOrErr;
 
-      auto file = fileVal->getAsString();
-      auto bi = bVal->getAsInteger();
-      auto ei = eVal->getAsInteger();
-      if (!file || !bi || !ei)
-        return createStringError(inconvertibleErrorCode(),
-                                 "tokmap[%zu] has invalid types", i);
+      TokMapEntry entry;
 
-      int pp = autoPP;
+      // required
+      auto fileOrErr = applyToField(asString, *obj, "file", ctxItem);
+      if (!fileOrErr)
+        return fileOrErr.takeError();
+      entry.file = *fileOrErr;
+
+      auto bOrErr = applyToField(asInt, *obj, "b", ctxItem);
+      if (!bOrErr)
+        return bOrErr.takeError();
+      entry.b = *bOrErr;
+
+      auto eOrErr = applyToField(asInt, *obj, "e", ctxItem);
+      if (!eOrErr)
+        return eOrErr.takeError();
+      entry.e = *eOrErr;
+
+      // optional
+      entry.pp = autoPP;
       if (const json::Value *ppVal = obj->get("pp")) {
         if (auto ppi = ppVal->getAsInteger())
-          pp = static_cast<int>(*ppi);
+          entry.pp = static_cast<int>(*ppi);
         else
           return createStringError(inconvertibleErrorCode(),
                                    "tokmap[%zu].pp must be integer", i);
@@ -217,135 +261,85 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
         ++autoPP;
       }
 
-      TokMapEntry entry;
-      entry.pp = pp;
-      entry.file = std::string(*file);
-      entry.b = static_cast<int>(*bi);
-      entry.e = static_cast<int>(*ei);
-
       model.tokmap_.push_back(entry);
-      model.tokmapByPP_[pp] = entry;
+      model.tokmapByPP_[entry.pp] = entry;
     }
   }
 
   // items
   {
-    auto ev = requireField(root, "items", "root");
-    if (!ev)
-      return ev.takeError();
-    const json::Array *arr = (*ev)->getAsArray();
-    if (!arr)
-      return createStringError(inconvertibleErrorCode(),
-                               "'items' must be an array");
+    auto arrOrErr = applyToField(asArray, root, "items");
+    if (!arrOrErr)
+      return arrOrErr.takeError();
+    const json::Array *arr = *arrOrErr;
 
     for (std::size_t i = 0; i < arr->size(); ++i) {
-      const json::Value &val = (*arr)[i];
-      const json::Object *obj = nullptr;
-      if (auto eo = asObject(val, "items[]"))
-        obj = *eo;
-      else
-        return eo.takeError();
+      const std::string ctxItem =
+          (llvm::Twine("items[") + llvm::Twine(i) + "]").str();
+
+      auto objOrErr = arrayObjElemAt(*arr, i, ctxItem);
+      if (!objOrErr)
+        return objOrErr.takeError();
+      const json::Object *obj = *objOrErr;
 
       // kind
-      auto kind = obj->get("kind");
-      if (!kind)
-        return createStringError(inconvertibleErrorCode(),
-                                 "items[%zu] missing 'kind'", i);
-      auto kindStr = kind->getAsString();
-      if (!kindStr)
-        return createStringError(inconvertibleErrorCode(),
-                                 "items[%zu].kind must be string", i);
+      auto kindOrErr = applyToField(asString, *obj, "kind", ctxItem);
+      if (!kindOrErr)
+        return kindOrErr.takeError();
+      std::string kindStr = *kindOrErr;
 
-      if (*kindStr == "directive") {
+      if (kindStr == "directive") {
         // subkind
-        auto skVal = obj->get("subkind");
-        if (!skVal)
-          return createStringError(inconvertibleErrorCode(),
-                                   "directive items[%zu] missing 'subkind'", i);
-        auto skStr = skVal->getAsString();
-        if (!skStr)
-          return createStringError(inconvertibleErrorCode(),
-                                   "items[%zu].subkind must be string", i);
+        auto skOrErr = applyToField(asString, *obj, "subkind", ctxItem);
+        if (!skOrErr)
+          return skOrErr.takeError();
+        StringRef skStr = *skOrErr;
 
-        if (*skStr == "#include" || *skStr == "#include_next") {
-          // Required
-          int id = 0, siteB = 0, siteE = 0;
-          {
-            auto idVal = obj->get("id");
-            if (!idVal)
-              return createStringError(inconvertibleErrorCode(),
-                                       "include items[%zu] missing id", i);
-            auto idInt = idVal->getAsInteger();
-            if (!idInt)
-              return createStringError(inconvertibleErrorCode(),
-                                       "include id must be integer");
-            id = static_cast<int>(*idInt);
-          }
-          std::string sitePath;
-          {
-            auto spVal = obj->get("site_path");
-            if (!spVal)
-              return createStringError(inconvertibleErrorCode(),
-                                       "include items[%zu] missing site_path",
-                                       i);
-            auto spStr = spVal->getAsString();
-            if (!spStr)
-              return createStringError(inconvertibleErrorCode(),
-                                       "include site_path must be string");
-            sitePath = std::string(*spStr);
-          }
-          {
-            auto sbVal = obj->get("site_b");
-            if (!sbVal)
-              return createStringError(inconvertibleErrorCode(),
-                                       "include items[%zu] missing site_b", i);
-            auto sb = sbVal->getAsInteger();
-            if (!sb)
-              return createStringError(inconvertibleErrorCode(),
-                                       "include site_b must be integer");
-            siteB = static_cast<int>(*sb);
-          }
-          {
-            auto seVal = obj->get("site_e");
-            if (!seVal)
-              return createStringError(inconvertibleErrorCode(),
-                                       "include items[%zu] missing site_e", i);
-            auto se = seVal->getAsInteger();
-            if (!se)
-              return createStringError(inconvertibleErrorCode(),
-                                       "include site_e must be integer");
-            siteE = static_cast<int>(*se);
-          }
+        if (skStr == "#include" || skStr == "#include_next") {
+          const std::string ctxItem =
+              (llvm::Twine("include items[") + llvm::Twine(i) + "]").str();
 
-          // Optionals
-          std::string text, target;
-          std::optional<std::string> resolved;
+          // required
+          auto idOrErr = applyToField(asInt, *obj, "id", ctxItem);
+          if (!idOrErr)
+            return idOrErr.takeError();
+          int id = *idOrErr;
+
+          auto spOrErr = applyToField(asString, *obj, "site_path", ctxItem);
+          if (!spOrErr)
+            return spOrErr.takeError();
+          std::string sitePath = *spOrErr;
+
+          auto sbOrErr = applyToField(asInt, *obj, "site_b", ctxItem);
+          if (!sbOrErr)
+            return sbOrErr.takeError();
+          int siteB = *sbOrErr;
+
+          auto seOrErr = applyToField(asInt, *obj, "site_e", ctxItem);
+          if (!seOrErr)
+            return seOrErr.takeError();
+          int siteE = *seOrErr;
+
+          auto tgtOrErr = applyToField(asString, *obj, "target", ctxItem);
+          if (!tgtOrErr)
+            return tgtOrErr.takeError();
+          std::string target = *tgtOrErr;
+
+          // optional
+          std::string text;
+          if (const std::optional<std::string> textOpt =
+                  asOptString(*obj, "text")) {
+            text = *textOpt;
+          }
+          std::optional<std::string> resolved =
+              asOptString(*obj, "resolved_path");
           bool angled = false;
-          std::optional<int> parent;
+          if (const std::optional<bool> angledOpt = asOptBool(*obj, "angled")) {
+            angled = *angledOpt;
+          }
+          std::optional<int> parent = asOptInt(*obj, "parent");
 
-          if (const json::Value *textVal = obj->get("text")) {
-            if (auto textStr = textVal->getAsString())
-              text = std::string(*textStr);
-          }
-          if (const json::Value *tgtVal = obj->get("target")) {
-            if (auto tgtStr = tgtVal->getAsString())
-              target = std::string(*tgtStr);
-          }
-          if (const json::Value *rpVal = obj->get("resolved_path")) {
-            if (auto rpStr = rpVal->getAsString())
-              resolved = std::string(*rpStr);
-          }
-          if (const json::Value *aVal = obj->get("angled")) {
-            if (auto aBool = aVal->getAsBoolean())
-              angled = *aBool;
-          }
-          if (const json::Value *pVal = obj->get("parent")) {
-            if (auto pInt = pVal->getAsInteger())
-              parent = static_cast<int>(*pInt);
-          }
-
-          // Spans
-          std::vector<RefoldModel::PPSpan> spans;
+          std::vector<PPSpan> spans;
           if (const json::Value *spansVal = obj->get("spans")) {
             auto sp = parsePPSpans(*spansVal, "include.spans");
             if (!sp)
@@ -353,114 +347,75 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
             spans = std::move(*sp);
           }
 
-          // Optional pp_cover fields
           std::optional<int> coverBOpt, coverEOpt;
           if (const json::Value *ppcVal = obj->get("pp_cover")) {
-            auto ppc = asObject(*ppcVal, "include.pp_cover");
-            if (!ppc)
-              return ppc.takeError();
-            const json::Object *ppcObj = *ppc;
+            auto ppcOrErr = asObject(*ppcVal, "include.pp_cover");
+            if (!ppcOrErr)
+              return ppcOrErr.takeError();
+            const json::Object &ppcObj = **ppcOrErr;
 
-            auto begVal =
-                requireField(*ppcObj, "begin", "include.pp_cover.begin");
-            if (!begVal)
-              return begVal.takeError();
-            auto endVal = requireField(*ppcObj, "end", "include.pp_cover.end");
-            if (!endVal)
-              return endVal.takeError();
+            auto beginOrErr =
+                applyToField(asInt, ppcObj, "begin", "include.pp_cover.begin");
+            if (!beginOrErr)
+              return beginOrErr.takeError();
+            coverBOpt = *beginOrErr;
 
-            auto bi = asInt(**begVal, "include.pp_cover.begin");
-            if (!bi)
-              return bi.takeError();
-            auto ei = asInt(**endVal, "include.pp_cover.end");
-            if (!ei)
-              return ei.takeError();
-
-            coverBOpt = *bi;
-            coverEOpt = *ei;
+            auto endOrErr =
+                applyToField(asInt, ppcObj, "end", "include.pp_cover.end");
+            if (!endOrErr)
+              return endOrErr.takeError();
+            coverEOpt = *endOrErr;
           }
 
-          IncludeItem inc(/*Id*/ id,
-                          /*Subkind*/ std::string(*skStr),
-                          /*Text*/ std::move(text),
-                          /*SitePath*/ std::move(sitePath),
-                          /*SiteB*/ siteB,
-                          /*SiteE*/ siteE,
-                          /*Target*/ std::move(target),
-                          /*ResolvedPath*/ std::move(resolved),
-                          /*Angled*/ angled,
-                          /*Parent*/ std::move(parent),
-                          /*Spans*/ std::move(spans),
-                          /*CoverBeginOpt*/ coverBOpt,
-                          /*CoverEndOpt*/ coverEOpt);
+          IncludeItem inc(/*id*/ id,
+                          /*subkind*/ std::string(skStr),
+                          /*text*/ std::move(text),
+                          /*sitePath*/ std::move(sitePath),
+                          /*siteB*/ siteB,
+                          /*siteE*/ siteE,
+                          /*target*/ std::move(target),
+                          /*resolvedPath*/ std::move(resolved),
+                          /*angled*/ angled,
+                          /*parent*/ std::move(parent),
+                          /*spans*/ std::move(spans),
+                          /*coverBegin*/ coverBOpt,
+                          /*coverEnd*/ coverEOpt);
 
           model.includes_.push_back(std::move(inc));
-        } else if (*skStr == "#define" || *skStr == "#undef") {
+        } else if (skStr == "#define" || skStr == "#undef") {
           MacroDirective md;
-          // required
-          {
-            auto idVal = obj->get("id");
-            if (!idVal)
-              return createStringError(inconvertibleErrorCode(),
-                                       "macro directive missing id");
-            auto id = idVal->getAsInteger();
-            if (!id)
-              return createStringError(inconvertibleErrorCode(),
-                                       "macro directive id must be integer");
-            md.id = static_cast<int>(*id);
-          }
-          {
-            auto textVal = obj->get("text");
-            if (!textVal)
-              return createStringError(inconvertibleErrorCode(),
-                                       "macro directive missing text");
-            auto textStr = textVal->getAsString();
-            if (!textStr)
-              return createStringError(inconvertibleErrorCode(),
-                                       "macro directive text must be string");
-            md.text = std::string(*textStr);
-          }
-          {
-            auto spVal = obj->get("site_path");
-            if (!spVal)
-              return createStringError(inconvertibleErrorCode(),
-                                       "macro directive missing site_path");
-            auto spStr = spVal->getAsString();
-            if (!spStr)
-              return createStringError(
-                  inconvertibleErrorCode(),
-                  "macro directive site_path must be string");
-            md.sitePath = std::string(*spStr);
-          }
-          {
-            auto sbVal = obj->get("site_b");
-            if (!sbVal)
-              return createStringError(inconvertibleErrorCode(),
-                                       "macro directive missing site_b");
-            auto sb = sbVal->getAsInteger();
-            if (!sb)
-              return createStringError(
-                  inconvertibleErrorCode(),
-                  "macro directive site_b must be integer");
-            md.siteB = static_cast<int>(*sb);
-          }
-          {
-            auto seVal = obj->get("site_e");
-            if (!seVal)
-              return createStringError(inconvertibleErrorCode(),
-                                       "macro directive missing site_e");
-            auto se = seVal->getAsInteger();
-            if (!se)
-              return createStringError(
-                  inconvertibleErrorCode(),
-                  "macro directive site_e must be integer");
-            md.siteE = static_cast<int>(*se);
-          }
 
-          if (const json::Value *ownIncIdVal = obj->get("owner_include_id")) {
-            if (auto ownIncId = ownIncIdVal->getAsInteger())
-              md.ownerIncludeId = static_cast<int>(*ownIncId);
-          }
+          const std::string ctxItem =
+              (llvm::Twine("define/undef items[") + llvm::Twine(i) + "]").str();
+
+          // required
+          auto idOrErr = applyToField(asInt, *obj, "id", ctxItem);
+          if (!idOrErr)
+            return idOrErr.takeError();
+          md.id = *idOrErr;
+
+          auto textOrErr = applyToField(asString, *obj, "text", ctxItem);
+          if (!textOrErr)
+            return textOrErr.takeError();
+          md.text = *textOrErr;
+
+          auto spOrErr = applyToField(asString, *obj, "site_path", ctxItem);
+          if (!spOrErr)
+            return spOrErr.takeError();
+          md.sitePath = *spOrErr;
+
+          auto sbOrErr = applyToField(asInt, *obj, "site_b", ctxItem);
+          if (!sbOrErr)
+            return sbOrErr.takeError();
+          md.siteB = *sbOrErr;
+
+          auto seOrErr = applyToField(asInt, *obj, "site_e", ctxItem);
+          if (!seOrErr)
+            return seOrErr.takeError();
+          md.siteE = *seOrErr;
+
+          // optional
+          md.ownerIncludeId = asOptInt(*obj, "owner_include_id");
 
           if (const json::Value *spansVal = obj->get("spans")) {
             auto sp = parsePPSpans(*spansVal, "macro.directive.spans");
@@ -469,147 +424,75 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
             md.spans = std::move(*sp);
           }
 
-          md.subkind = std::string(*skStr);
+          md.subkind = skStr;
           model.macroDirs_.push_back(std::move(md));
-        } else if (*skStr == "#pragma") {
+        } else if (skStr == "#pragma") {
           PragmaDirective pd;
+
+          const std::string ctxItem =
+              (llvm::Twine("pragma items[") + llvm::Twine(i) + "]").str();
+
           // required
-          {
-            auto idVal = obj->get("id");
-            if (!idVal)
-              return createStringError(inconvertibleErrorCode(),
-                                       "pragma missing id");
-            auto id = idVal->getAsInteger();
-            if (!id)
-              return createStringError(inconvertibleErrorCode(),
-                                       "pragma id must be integer");
-            pd.id = static_cast<int>(*id);
-          }
-          {
-            auto textVal = obj->get("text");
-            if (!textVal)
-              return createStringError(inconvertibleErrorCode(),
-                                       "pragma missing text");
-            auto textStr = textVal->getAsString();
-            if (!textStr)
-              return createStringError(inconvertibleErrorCode(),
-                                       "pragma text must be string");
-            pd.text = std::string(*textStr);
-          }
-          {
-            auto spVal = obj->get("site_path");
-            if (!spVal)
-              return createStringError(inconvertibleErrorCode(),
-                                       "pragma missing site_path");
-            auto spStr = spVal->getAsString();
-            if (!spStr)
-              return createStringError(inconvertibleErrorCode(),
-                                       "pragma site_path must be string");
-            pd.sitePath = std::string(*spStr);
-          }
-          {
-            auto sbVal = obj->get("site_b");
-            if (!sbVal)
-              return createStringError(inconvertibleErrorCode(),
-                                       "pragma missing site_b");
-            auto sb = sbVal->getAsInteger();
-            if (!sb)
-              return createStringError(inconvertibleErrorCode(),
-                                       "pragma site_b must be integer");
-            pd.siteB = static_cast<int>(*sb);
-          }
-          {
-            auto seVal = obj->get("site_e");
-            if (!seVal)
-              return createStringError(inconvertibleErrorCode(),
-                                       "pragma missing site_e");
-            auto se = seVal->getAsInteger();
-            if (!se)
-              return createStringError(inconvertibleErrorCode(),
-                                       "pragma site_e must be integer");
-            pd.siteE = static_cast<int>(*se);
-          }
+          auto idOrErr = applyToField(asInt, *obj, "id", ctxItem);
+          if (!idOrErr)
+            return idOrErr.takeError();
+          pd.id = *idOrErr;
+
+          auto textOrErr = applyToField(asString, *obj, "text", ctxItem);
+          if (!textOrErr)
+            return textOrErr.takeError();
+          pd.text = *textOrErr;
+
+          auto spOrErr = applyToField(asString, *obj, "site_path", ctxItem);
+          if (!spOrErr)
+            return spOrErr.takeError();
+          pd.sitePath = *spOrErr;
+
+          auto sbOrErr = applyToField(asInt, *obj, "site_b", ctxItem);
+          if (!sbOrErr)
+            return sbOrErr.takeError();
+          pd.siteB = *sbOrErr;
+
+          auto seOrErr = applyToField(asInt, *obj, "site_e", ctxItem);
+          if (!seOrErr)
+            return seOrErr.takeError();
+          pd.siteE = *seOrErr;
+
           model.pragmas_.push_back(std::move(pd));
         } else {
           return createStringError(
               inconvertibleErrorCode(),
               "Unknown directive subkind '%s' at items[%zu]",
-              skStr->str().c_str(), i);
+              skStr.str().c_str(), i);
         }
-      } else if (*kindStr == "macro") {
-        // ===== Required fields =====
-        int id = 0;
-        {
-          auto idVal = obj->get("id");
-          if (!idVal)
-            return createStringError(inconvertibleErrorCode(),
-                                     "macro item missing id");
-          auto idInt = idVal->getAsInteger();
-          if (!idInt)
-            return createStringError(inconvertibleErrorCode(),
-                                     "macro.id must be integer");
-          id = static_cast<int>(*idInt);
-        }
+      } else if (kindStr == "macro") {
+        const std::string ctxItem =
+              (llvm::Twine("macro items[") + llvm::Twine(i) + "]").str();
 
-        std::string subkind;
-        {
-          auto skVal = obj->get("subkind");
-          if (!skVal)
-            return createStringError(inconvertibleErrorCode(),
-                                     "macro item missing subkind");
-          auto skStr = skVal->getAsString();
-          if (!skStr)
-            return createStringError(inconvertibleErrorCode(),
-                                     "macro.subkind must be string");
-          subkind = std::string(*skStr);
-        }
+        // required
+        auto idOrErr = applyToField(asInt, *obj, "id", ctxItem);
+        if (!idOrErr)
+          return idOrErr.takeError();
+        int id = *idOrErr;
 
-        std::string name;
-        {
-          auto nameVal = obj->get("name");
-          if (!nameVal)
-            return createStringError(inconvertibleErrorCode(),
-                                     "macro item missing name");
-          auto nameStr = nameVal->getAsString();
-          if (!nameStr)
-            return createStringError(inconvertibleErrorCode(),
-                                     "macro.name must be string");
-          name = std::string(*nameStr);
-        }
+        auto skOrErr = applyToField(asString, *obj, "subkind", ctxItem);
+        if (!skOrErr)
+          return skOrErr.takeError();
+        std::string subkind = *skOrErr;
 
-        // ===== Optionals =====
-        std::optional<std::string> invocationText;
-        if (const json::Value *itVal = obj->get("invocation_text")) {
-          if (auto itStr = itVal->getAsString())
-            invocationText = std::string(*itStr);
-        }
+        auto nameOrErr = applyToField(asString, *obj, "name", ctxItem);
+        if (!nameOrErr)
+          return nameOrErr.takeError();
+        std::string name = *nameOrErr;
 
-        std::optional<std::string> invFile;
-        if (const json::Value *ifVal = obj->get("inv_file")) {
-          if (auto ifStr = ifVal->getAsString())
-            invFile = std::string(*ifStr);
-        }
+        // optional
+        std::optional<std::string> invText = asOptString(*obj, "inv_text");
+        std::optional<std::string> invFile = asOptString(*obj, "inv_file");
+        std::optional<int> invB = asOptInt(*obj, "inv_b");
+        std::optional<int> invE = asOptInt(*obj, "inv_e");
+        std::optional<int> ownerIncludeId = asOptInt(*obj, "owner_include_id");
 
-        std::optional<int> invB;
-        if (const json::Value *ibVal = obj->get("inv_b")) {
-          if (auto ib = ibVal->getAsInteger())
-            invB = static_cast<int>(*ib);
-        }
-
-        std::optional<int> invE;
-        if (const json::Value *ieVal = obj->get("inv_e")) {
-          if (auto ie = ieVal->getAsInteger())
-            invE = static_cast<int>(*ie);
-        }
-
-        std::optional<int> ownerIncludeId;
-        if (const json::Value *ownIncIdVal = obj->get("owner_include_id")) {
-          if (auto ownIncId = ownIncIdVal->getAsInteger())
-            ownerIncludeId = static_cast<int>(*ownIncId);
-        }
-
-        // spans (optional array)
-        std::vector<RefoldModel::PPSpan> spans;
+        std::vector<PPSpan> spans;
         if (const json::Value *spansVal = obj->get("spans")) {
           auto sp = parsePPSpans(*spansVal, "macro.spans");
           if (!sp)
@@ -617,309 +500,202 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
           spans = std::move(*sp);
         }
 
-        // pp_cover (if present, require both begin and end to be ints)
         std::optional<int> coverBOpt, coverEOpt;
         if (const json::Value *ppcVal = obj->get("pp_cover")) {
-          auto ppc = asObject(*ppcVal, "macro.pp_cover");
-          if (!ppc)
-            return ppc.takeError();
-          const json::Object *ppcObj = *ppc;
+          auto ppcOrErr = asObject(*ppcVal, "macro.pp_cover");
+          if (!ppcOrErr)
+            return ppcOrErr.takeError();
+          const json::Object &ppcObj = **ppcOrErr;
 
-          auto bv = requireField(*ppcObj, "begin", "macro.pp_cover.begin");
-          if (!bv)
-            return bv.takeError();
-          auto ev = requireField(*ppcObj, "end", "macro.pp_cover.end");
-          if (!ev)
-            return ev.takeError();
+          auto beginOrErr =
+              applyToField(asInt, ppcObj, "begin", "macro.pp_cover.begin");
+          if (!beginOrErr)
+            return beginOrErr.takeError();
+          coverBOpt = *beginOrErr;
 
-          auto bi = asInt(**bv, "macro.pp_cover.begin");
-          if (!bi)
-            return bi.takeError();
-          auto ei = asInt(**ev, "macro.pp_cover.end");
-          if (!ei)
-            return ei.takeError();
-
-          coverBOpt = *bi;
-          coverEOpt = *ei;
+          auto endOrErr =
+              applyToField(asInt, ppcObj, "end", "macro.pp_cover.end");
+          if (!endOrErr)
+            return endOrErr.takeError();
+          coverEOpt = *endOrErr;
         }
 
-        MacroInvocation mi(/*Id*/ id,
-                           /*Subkind*/ std::move(subkind),
-                           /*Name*/ std::move(name),
-                           /*InvocationText*/ std::move(invocationText),
-                           /*InvFile*/ std::move(invFile),
-                           /*InvB*/ std::move(invB),
-                           /*InvE*/ std::move(invE),
-                           /*OwnerIncludeId*/ std::move(ownerIncludeId),
-                           /*Spans*/ std::move(spans),
-                           /*CoverBeginOpt*/ coverBOpt,
-                           /*CoverEndOpt*/ coverEOpt);
+        MacroInvocation mi(/*id*/ id,
+                           /*subkind*/ std::move(subkind),
+                           /*name*/ std::move(name),
+                           /*invText*/ std::move(invText),
+                           /*invFile*/ std::move(invFile),
+                           /*invB*/ std::move(invB),
+                           /*invE*/ std::move(invE),
+                           /*ownerIncludeId*/ std::move(ownerIncludeId),
+                           /*spans*/ std::move(spans),
+                           /*coverBegin*/ coverBOpt,
+                           /*coverEnd*/ coverEOpt);
 
         model.macroInvs_.push_back(std::move(mi));
-      } else if (*kindStr == "file") {
+      } else if (kindStr == "file") {
         FileItem fi;
-        {
-          auto idVal = obj->get("id");
-          if (!idVal)
-            return createStringError(inconvertibleErrorCode(),
-                                     "file item missing id");
-          auto id = idVal->getAsInteger();
-          if (!id)
-            return createStringError(inconvertibleErrorCode(),
-                                     "file.id must be integer");
-          fi.id = static_cast<int>(*id);
-        }
-        if (const json::Value *pathVal = obj->get("path")) {
-          if (auto pathStr = pathVal->getAsString())
-            fi.path = std::string(*pathStr);
-        }
+
+        const std::string ctxItem =
+              (llvm::Twine("file items[") + llvm::Twine(i) + "]").str();
+
+        // required
+        auto idOrErr = applyToField(asInt, *obj, "id", ctxItem);
+        if (!idOrErr)
+          return idOrErr.takeError();
+        fi.id = *idOrErr;
+
+        // optional
+        fi.path = asOptString(*obj, "path");
+
         if (const json::Value *spansVal = obj->get("spans")) {
           auto sp = parsePPSpans(*spansVal, "file.spans");
           if (!sp)
             return sp.takeError();
           fi.spans = std::move(*sp);
         }
+
         model.fileItems_.push_back(std::move(fi));
       } else {
         return createStringError(inconvertibleErrorCode(),
                                  "Unknown item.kind '%s' at items[%zu]",
-                                 kindStr->str().c_str(), i);
+                                 kindStr.c_str(), i);
       }
     }
   }
 
   // slots (optional)
-  if (const json::Value *slotsVal = root.get("slots")) {
-    const json::Array *arr = slotsVal->getAsArray();
-    if (!arr)
-      return createStringError(inconvertibleErrorCode(),
-                               "'slots' must be an array");
+  if (const auto slotsArr = asOptArray(root, "slots")) {
+    const json::Array *arr = *slotsArr;
     model.slots_.reserve(arr->size());
     for (std::size_t i = 0; i < arr->size(); ++i) {
-      const json::Value &val = (*arr)[i];
-      const json::Object *obj = nullptr;
-      if (auto eo = asObject(val, "slots[]"))
-        obj = *eo;
-      else
-        return eo.takeError();
+      const std::string ctxItem =
+          (llvm::Twine("slots[") + llvm::Twine(i) + "]").str();
 
-      RefoldModel::Slot slot;
+      auto objOrErr = arrayObjElemAt(*arr, i, ctxItem);
+      if (!objOrErr)
+        return objOrErr.takeError();
+      const json::Object *obj = *objOrErr;
+
+      Slot slot;
+
       // required
-      {
-        auto idVal = obj->get("id");
-        if (!idVal)
-          return createStringError(inconvertibleErrorCode(),
-                                   "slots[%zu] missing id", i);
-        auto id = idVal->getAsInteger();
-        if (!id)
-          return createStringError(inconvertibleErrorCode(),
-                                   "slots[%zu].id must be integer", i);
-        slot.id = static_cast<int>(*id);
-      }
-      {
-        auto fileVal = obj->get("file");
-        if (!fileVal)
-          return createStringError(inconvertibleErrorCode(),
-                                   "slots[%zu] missing file", i);
-        auto fileStr = fileVal->getAsString();
-        if (!fileStr)
-          return createStringError(inconvertibleErrorCode(),
-                                   "slots[%zu].file must be string", i);
-        slot.file = std::string(*fileStr);
-      }
-      {
-        auto kindVal = obj->get("kind");
-        if (!kindVal)
-          return createStringError(inconvertibleErrorCode(),
-                                   "slots[%zu] missing kind", i);
-        auto kindStr = kindVal->getAsString();
-        if (!kindStr)
-          return createStringError(inconvertibleErrorCode(),
-                                   "slots[%zu].kind must be string", i);
-        slot.kind = std::string(*kindStr);
-      }
-      {
-        auto bVal = obj->get("b");
-        if (!bVal)
-          return createStringError(inconvertibleErrorCode(),
-                                   "slots[%zu] missing b", i);
-        auto b = bVal->getAsInteger();
-        if (!b)
-          return createStringError(inconvertibleErrorCode(),
-                                   "slots[%zu].b must be integer", i);
-        slot.b = static_cast<int>(*b);
-      }
-      {
-        auto eVal = obj->get("e");
-        if (!eVal)
-          return createStringError(inconvertibleErrorCode(),
-                                   "slots[%zu] missing e", i);
-        auto e = eVal->getAsInteger();
-        if (!e)
-          return createStringError(inconvertibleErrorCode(),
-                                   "slots[%zu].e must be integer", i);
-        slot.e = static_cast<int>(*e);
-      }
+      auto idOrErr = applyToField(asInt, *obj, "id", ctxItem);
+      if (!idOrErr)
+        return idOrErr.takeError();
+      slot.id = *idOrErr;
+
+      auto fileOrErr = applyToField(asString, *obj, "file", ctxItem);
+      if (!fileOrErr)
+        return fileOrErr.takeError();
+      slot.file = *fileOrErr;
+
+      auto kindOrErr = applyToField(asString, *obj, "kind", ctxItem);
+      if (!kindOrErr)
+        return kindOrErr.takeError();
+      slot.kind = *kindOrErr;
+
+      auto bOrErr = applyToField(asInt, *obj, "b", ctxItem);
+      if (!bOrErr)
+        return bOrErr.takeError();
+      slot.b = *bOrErr;
+
+      auto eOrErr = applyToField(asInt, *obj, "e", ctxItem);
+      if (!eOrErr)
+        return eOrErr.takeError();
+      slot.e = *eOrErr;
 
       // optionals
-      if (const json::Value *refVal = obj->get("ref")) {
-        if (auto ref = refVal->getAsInteger())
-          slot.ref = static_cast<int>(*ref);
-      }
-      if (const json::Value *ownIncIdVal = obj->get("owner_include_id")) {
-        if (auto ownIncId = ownIncIdVal->getAsInteger())
-          slot.ownerIncludeId = static_cast<int>(*ownIncId);
-      }
-      if (const json::Value *ppVal = obj->get("pp")) {
-        if (auto pp = ppVal->getAsInteger())
-          slot.pp = static_cast<int>(*pp);
-      }
+      slot.ref = asOptInt(*obj, "ret");
+      slot.ownerIncludeId = asOptInt(*obj, "owner_include_id");
+      slot.pp = asOptInt(*obj, "pp");
 
       model.slots_.push_back(std::move(slot));
     }
   }
 
   // conds (optional)
-  if (const json::Value *condsVal = root.get("conds")) {
-    const json::Array *arr = condsVal->getAsArray();
-    if (!arr)
-      return createStringError(inconvertibleErrorCode(),
-                               "'conds' must be an array");
+  if (const auto condsArr = asOptArray(root, "conds")) {
+    const json::Array *arr = *condsArr;
     model.conds_.reserve(arr->size());
     for (std::size_t i = 0; i < arr->size(); ++i) {
-      const json::Value &val = (*arr)[i];
-      const json::Object *obj = nullptr;
-      if (auto eo = asObject(val, "conds[]"))
-        obj = *eo;
-      else
-        return eo.takeError();
+      const std::string ctxItem =
+          (llvm::Twine("conds[") + llvm::Twine(i) + "]").str();
+
+      auto objOrErr = arrayObjElemAt(*arr, i, ctxItem);
+      if (!objOrErr)
+        return objOrErr.takeError();
+      const json::Object *obj = *objOrErr;
 
       CondGroup group;
-      {
-        auto idVal = obj->get("id");
-        if (!idVal)
-          return createStringError(inconvertibleErrorCode(),
-                                   "conds[%zu] missing id", i);
-        auto id = idVal->getAsInteger();
-        if (!id)
-          return createStringError(inconvertibleErrorCode(),
-                                   "conds[%zu].id must be integer", i);
-        group.id = static_cast<int>(*id);
-      }
-      {
-        auto fileVal = obj->get("file");
-        if (!fileVal)
-          return createStringError(inconvertibleErrorCode(),
-                                   "conds[%zu] missing file", i);
-        auto fileStr = fileVal->getAsString();
-        if (!fileStr)
-          return createStringError(inconvertibleErrorCode(),
-                                   "conds[%zu].file must be string", i);
-        group.file = std::string(*fileStr);
-      }
-      if (const json::Value *pVal = obj->get("parent")) {
-        if (auto p = pVal->getAsInteger())
-          group.parent = static_cast<int>(*p);
-      }
-      {
-        auto gbVal = obj->get("group_b");
-        if (!gbVal)
-          return createStringError(inconvertibleErrorCode(),
-                                   "conds[%zu] missing group_b", i);
-        auto gb = gbVal->getAsInteger();
-        if (!gb)
-          return createStringError(inconvertibleErrorCode(),
-                                   "conds[%zu].group_b must be integer", i);
-        group.groupB = static_cast<int>(*gb);
-      }
-      {
-        auto geVal = obj->get("group_e");
-        if (!geVal)
-          return createStringError(inconvertibleErrorCode(),
-                                   "conds[%zu] missing group_e", i);
-        auto ge = geVal->getAsInteger();
-        if (!ge)
-          return createStringError(inconvertibleErrorCode(),
-                                   "conds[%zu].group_e must be integer", i);
-        group.groupE = static_cast<int>(*ge);
-      }
-      if (const json::Value *parIncIdVal = obj->get("parent_include_id")) {
-        if (auto parIncId = parIncIdVal->getAsInteger())
-          group.parentIncludeId = static_cast<int>(*parIncId);
-      }
+
+      // required
+      auto idOrErr = applyToField(asInt, *obj, "id", ctxItem);
+      if (!idOrErr)
+        return idOrErr.takeError();
+      group.id = *idOrErr;
+
+      auto fileOrErr = applyToField(asString, *obj, "file", ctxItem);
+      if (!fileOrErr)
+        return fileOrErr.takeError();
+      group.file = *fileOrErr;
+
+      auto gbOrErr = applyToField(asInt, *obj, "group_b", ctxItem);
+      if (!gbOrErr)
+        return gbOrErr.takeError();
+      group.groupB = *gbOrErr;
+
+      auto geOrErr = applyToField(asInt, *obj, "group_e", ctxItem);
+      if (!geOrErr)
+        return geOrErr.takeError();
+      group.groupE = *geOrErr;
+
+      // optional
+      group.parent = asOptInt(*obj, "parent");
+      group.parentIncludeId = asOptInt(*obj, "parent_include_id");
 
       // arms
-      auto armsVal = obj->get("arms");
-      if (!armsVal)
-        return createStringError(inconvertibleErrorCode(),
-                                 "conds[%zu] missing arms", i);
-      const json::Array *arms = armsVal->getAsArray();
-      if (!arms)
-        return createStringError(inconvertibleErrorCode(),
-                                 "conds[%zu].arms must be an array", i);
+      auto armsOrErr = applyToField(asArray, *obj, "arms", ctxItem);
+      if (!armsOrErr)
+        return armsOrErr.takeError();
+      const json::Array *arms = *armsOrErr;
 
       group.arms.reserve(arms->size());
       for (std::size_t ai = 0; ai < arms->size(); ++ai) {
-        const json::Value &armVal = (*arms)[ai];
-        const json::Object *armObj = nullptr;
-        if (auto eo = asObject(armVal, "arm"))
-          armObj = *eo;
-        else
-          return eo.takeError();
+        const std::string ctxItem =
+            (llvm::Twine("arm[") + llvm::Twine(ai) + "]").str();
+
+        auto objOrErr = arrayObjElemAt(*arms, ai, ctxItem);
+        if (!objOrErr)
+          return objOrErr.takeError();
+        const json::Object *armObj = *objOrErr;
 
         CondArm arm;
-        {
-          auto idVal = armObj->get("id");
-          if (!idVal)
-            return createStringError(inconvertibleErrorCode(),
-                                     "arm missing id");
-          auto id = idVal->getAsInteger();
-          if (!id)
-            return createStringError(inconvertibleErrorCode(),
-                                     "arm.id must be integer");
-          arm.id = static_cast<int>(*id);
-        }
-        {
-          auto tagVal = armObj->get("tag");
-          if (!tagVal)
-            return createStringError(inconvertibleErrorCode(),
-                                     "arm missing tag");
-          auto tagStr = tagVal->getAsString();
-          if (!tagStr)
-            return createStringError(inconvertibleErrorCode(),
-                                     "arm.tag must be string");
-          arm.tag = std::string(*tagStr);
-        }
-        if (const json::Value *condVal = armObj->get("cond")) {
-          if (auto condStr = condVal->getAsString())
-            arm.cond = std::string(*condStr);
-        }
-        {
-          auto bbVal = armObj->get("body_b");
-          if (!bbVal)
-            return createStringError(inconvertibleErrorCode(),
-                                     "arm missing body_b");
-          auto bb = bbVal->getAsInteger();
-          if (!bb)
-            return createStringError(inconvertibleErrorCode(),
-                                     "arm.body_b must be integer");
-          arm.bodyB = static_cast<int>(*bb);
-        }
-        {
-          auto beVal = armObj->get("body_e");
-          if (!beVal)
-            return createStringError(inconvertibleErrorCode(),
-                                     "arm missing body_e");
-          auto be = beVal->getAsInteger();
-          if (!be)
-            return createStringError(inconvertibleErrorCode(),
-                                     "arm.body_e must be integer");
-          arm.bodyE = static_cast<int>(*be);
-        }
-        if (const json::Value *selVal = armObj->get("selected")) {
-          if (auto sel = selVal->getAsBoolean())
-            arm.selected = *sel;
-        }
+
+        // required
+        auto idOrErr = applyToField(asInt, *armObj, "id", ctxItem);
+        if (!idOrErr)
+          return idOrErr.takeError();
+        arm.id = *idOrErr;
+
+        auto tagOrErr = applyToField(asString, *armObj, "tag", ctxItem);
+        if (!tagOrErr)
+          return tagOrErr.takeError();
+        arm.tag = *tagOrErr;
+
+        auto bbOrErr = applyToField(asInt, *armObj, "body_b", ctxItem);
+        if (!bbOrErr)
+          return bbOrErr.takeError();
+        arm.bodyB = *bbOrErr;
+
+        auto beOrErr = applyToField(asInt, *armObj, "body_e", ctxItem);
+        if (!beOrErr)
+          return beOrErr.takeError();
+        arm.bodyE = *beOrErr;
+
+        // optional
+        arm.cond = asOptString(*armObj, "cond");
+        arm.selected = asOptBool(*armObj, "selected");
 
         group.arms.push_back(std::move(arm));
       }

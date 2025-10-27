@@ -217,7 +217,7 @@ std::string RefoldEngine::Refold() {
       if (m->getInvB() != -1 && m->getInvE() != -1) {
         debug("classify",
               "#{0} -> MACRO invText={1} owner={2} invFile={3} {4})", i,
-              m->invocationText, m->ownerIncludeId, m->invFile, h);
+              m->invText, m->ownerIncludeId, m->invFile, h);
         auto mp = BuildMacroInvocationPatchWholeCover(*m, h, a2b);
         const int ownerKey =
             (m->ownerIncludeId ? *m->ownerIncludeId : kNoOwner);
