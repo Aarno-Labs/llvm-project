@@ -51,6 +51,7 @@
 #include "RefoldEngine.h"
 #include "RefoldLog.h"
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
@@ -70,16 +71,16 @@ namespace refold {
 
 namespace {
 constexpr bool INSERT_AFTER_LEFT_TOKEN_EOL = true;
+constexpr int kNoOwner = -1;
 } // namespace
 
 // ========================== Public entry points ==========================
 
 Expected<std::string>
 RefoldEngine::Refold(const json::Object &rootJson, StringRef aSource,
-                     const std::vector<PPTok> &aToks,
-                     const std::vector<std::size_t> &aTokOff, StringRef bSource,
-                     const std::vector<PPTok> &bToks,
-                     const std::vector<std::size_t> &bTokOff) {
+                     ArrayRef<PPTok> aToks, ArrayRef<std::size_t> aTokOff,
+                     StringRef bSource, ArrayRef<PPTok> bToks,
+                     ArrayRef<std::size_t> bTokOff) {
   // Build the refold model based on the parsed JSON object.
   auto mOrErr = RefoldModel::FromJson(rootJson);
   if (!mOrErr)
@@ -101,7 +102,7 @@ std::string RefoldEngine::Refold() {
         expectedCount, aToks_.size());
   }
 
-  const std::string tuPath = model_.GetSourcePath();
+  StringRef tuPath = model_.GetSourcePath();
 
   std::string tuBytes;
   {
@@ -116,16 +117,6 @@ std::string RefoldEngine::Refold() {
     // here).
     tuBytes.assign(bufOrErr.get()->getBufferStart(),
                    bufOrErr.get()->getBufferEnd());
-  }
-
-  // Append the sentinel to both source offsets.
-  if (bTokOff_.empty() || bTokOff_.back() != bSource_.size()) {
-    if (bTokOff_.empty() || bTokOff_.back() < bSource_.size())
-      bTokOff_.push_back(bSource_.size());
-  }
-  if (aTokOff_.empty() || aTokOff_.back() != aSource_.size()) {
-    if (aTokOff_.empty() || aTokOff_.back() < aSource_.size())
-      aTokOff_.push_back(aSource_.size());
   }
 
   // 1) Generate token sequences and A->B anchor map.
@@ -212,8 +203,8 @@ std::string RefoldEngine::Refold() {
 
   // 3) Classify hunks and collect per-target edits.
   std::vector<TextEdit> tuEdits;
-  std::map<int, IncludeEdits> perInclude; // includeId -> edits
-  std::map<std::optional<int>, std::vector<MacroPatch>> macroPatchesByOwner;
+  DenseMap<int, IncludeEdits> perInclude; // includeId -> edits
+  DenseMap<int, std::vector<MacroPatch>> macroPatchesByOwner;
 
   // -> macro patches
   for (std::size_t i = 0; i < hunks.size(); ++i) {
@@ -244,7 +235,9 @@ std::string RefoldEngine::Refold() {
               m->invFile ? *m->invFile : "null", h.aStart, h.aEnd, h.bStart,
               h.bEnd);
         auto mp = BuildMacroInvocationPatchWholeCover(*m, h, a2b);
-        macroPatchesByOwner[m->ownerIncludeId].push_back(std::move(mp));
+        const int ownerKey =
+            (m->ownerIncludeId ? *m->ownerIncludeId : kNoOwner);
+        macroPatchesByOwner[ownerKey].push_back(std::move(mp));
         continue;
       }
     }
@@ -302,7 +295,7 @@ std::string RefoldEngine::Refold() {
 
   // 4) Materialize include expansions bottom-up (nested first). Build child
   // lists by parent include id.
-  std::map<int, std::vector<const RefoldModel::IncludeItem *>> children;
+  DenseMap<int, std::vector<const RefoldModel::IncludeItem *>> children;
   for (const auto &ii : model_.GetIncludes()) {
     if (ii.parent)
       children[*ii.parent].push_back(&ii);
@@ -324,10 +317,10 @@ std::string RefoldEngine::Refold() {
   debug("include/tree", "END include children");
 
   // Cache for realized expansion text per include id.
-  std::map<int, std::string> includeExpansion;
+  DenseMap<int, std::string> includeExpansion;
 
   // Build the set of include-ids that must be realized.
-  std::set<int> seeds;
+  DenseSet<int> seeds;
 
   // (a) Direct include edits.
   for (auto &kv : perInclude)
@@ -335,8 +328,8 @@ std::string RefoldEngine::Refold() {
 
   // (b) Macro-owned work INSIDE headers (ownerIncludeId != null).
   for (auto &kv : macroPatchesByOwner) {
-    if (kv.first)
-      seeds.insert(*kv.first);
+    if (kv.first != kNoOwner)
+      seeds.insert(kv.first);
   }
 
   // (c) Pull in all ancestors up to the TU.
@@ -355,9 +348,9 @@ std::string RefoldEngine::Refold() {
                                 children, includeExpansion);
   }
 
-  // 5a) TU macro patches (ownerIncludeId == null) and include expansions at TU
-  // sites.
-  if (auto it = macroPatchesByOwner.find(std::nullopt);
+  // 5a) TU macro patches (ownerIncludeId == kNoOwner) and include expansions at
+  // TU sites.
+  if (auto it = macroPatchesByOwner.find(kNoOwner);
       it != macroPatchesByOwner.end()) {
     for (const auto &mp : it->second) {
       auto text =
@@ -395,9 +388,8 @@ std::string RefoldEngine::Refold() {
 
 // ================== A ↔ B token mapping & diff utilities ==================
 
-std::vector<std::string>
-RefoldEngine::MapLexemes(const std::vector<PPTok> &toks,
-                         const std::vector<std::size_t> &offs) {
+std::vector<std::string> RefoldEngine::MapLexemes(ArrayRef<PPTok> toks,
+                                                  ArrayRef<std::size_t> offs) {
   std::vector<std::string> out;
   out.reserve(toks.size());
   for (std::size_t i = 0; i < toks.size(); ++i) {
@@ -662,7 +654,7 @@ std::array<int, 2> RefoldEngine::TUByteSpan(int a0, int a1,
 
 RefoldEngine::MacroPatch RefoldEngine::BuildMacroInvocationPatchWholeCover(
     const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h,
-    const std::vector<int> &a2b) const {
+    ArrayRef<int> a2b) const {
   // Map the macro's A-cover [coverBegin, coverEnd) to a B-token interval via
   // LCS map.
   int bStartIdx = MapForwardToB(a2b, m.cover.begin);
@@ -694,7 +686,7 @@ RefoldEngine::MacroPatch RefoldEngine::BuildMacroInvocationPatchWholeCover(
 // =========== Include processing (normalize, materialize, apply) ===========
 
 void RefoldEngine::NormalizeIncludeInsertions(
-    std::map<int, IncludeEdits> &perInclude) const {
+    DenseMap<int, IncludeEdits> &perInclude) const {
   for (auto &kv : perInclude) {
     auto &ie = kv.second;
     if (!ie.include || ie.patches.empty())
@@ -804,12 +796,11 @@ void RefoldEngine::NormalizeIncludeInsertions(
 }
 
 void RefoldEngine::MaterializeIncludeExpansion(
-    int includeId, const std::map<int, IncludeEdits> &perInclude,
-    const std::map<std::optional<int>, std::vector<MacroPatch>>
-        &macroPatchesByOwner,
-    const std::map<int, std::vector<const RefoldModel::IncludeItem *>>
+    int includeId, const DenseMap<int, IncludeEdits> &perInclude,
+    const DenseMap<int, std::vector<MacroPatch>> &macroPatchesByOwner,
+    const DenseMap<int, std::vector<const RefoldModel::IncludeItem *>>
         &children,
-    std::map<int, std::string> &includeExpansion) const {
+    DenseMap<int, std::string> &includeExpansion) const {
   // Already materialized?
   if (includeExpansion.count(includeId))
     return;

@@ -54,14 +54,13 @@
 #include "DiffAlgorithms.h"
 #include "RefoldModel.h"
 #include "StringUtils.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/JSON.h"
 
 #include <functional>
-#include <map>
 #include <optional>
-#include <set>
 #include <string>
 #include <vector>
 
@@ -185,26 +184,22 @@ public:
   /// \param bTokOff  Byte offsets for B tokens (size = |B| + 1).
   /// \returns        The refolded, partially expanded C source.
   static Expected<std::string> Refold(const json::Object &rootJson,
-                                      StringRef aSource,
-                                      const std::vector<PPTok> &aToks,
-                                      const std::vector<std::size_t> &aTokOff,
-                                      StringRef bSource,
-                                      const std::vector<PPTok> &bToks,
-                                      const std::vector<std::size_t> &bTokOff);
+                                      StringRef aSource, ArrayRef<PPTok> aToks,
+                                      ArrayRef<std::size_t> aTokOff,
+                                      StringRef bSource, ArrayRef<PPTok> bToks,
+                                      ArrayRef<std::size_t> bTokOff);
 
 private:
   const RefoldModel model_;
   StringRef aSource_, bSource_;
-  const std::vector<PPTok> &aToks_, &bToks_;
-  std::vector<std::size_t> aTokOff_, bTokOff_; // Keep a copy
+  ArrayRef<PPTok> aToks_, bToks_;
+  ArrayRef<std::size_t> aTokOff_, bTokOff_;
 
   /// Construct an engine from concrete inputs. The instance method `Refold()`
   /// runs the full pipeline using these captured members.
-  RefoldEngine(RefoldModel model, StringRef aSource,
-               const std::vector<PPTok> &aToks,
-               const std::vector<std::size_t> &aTokOff, StringRef bSource,
-               const std::vector<PPTok> &bToks,
-               const std::vector<std::size_t> &bTokOff)
+  RefoldEngine(RefoldModel model, StringRef aSource, ArrayRef<PPTok> aToks,
+               ArrayRef<std::size_t> aTokOff, StringRef bSource,
+               ArrayRef<PPTok> bToks, ArrayRef<std::size_t> bTokOff)
       : model_(std::move(model)), aSource_(aSource), bSource_(bSource),
         aToks_(aToks), bToks_(bToks), aTokOff_(aTokOff), bTokOff_(bTokOff) {}
 
@@ -242,9 +237,8 @@ private:
   /// @param toks  Preprocessed tokens (with `.spelling`).
   /// @param offs  Byte start offsets parallel to `toks` (size ≥ toks.size()).
   /// @return A vector of lexeme strings used for A↔B alignment.
-  static std::vector<std::string>
-  MapLexemes(const std::vector<PPTok> &toks,
-             const std::vector<std::size_t> &offs);
+  static std::vector<std::string> MapLexemes(ArrayRef<PPTok> toks,
+                                             ArrayRef<std::size_t> offs);
 
   /// Return the first B-index at or after A-index `i` in a one-sided LCS map,
   /// or -1 if no forward-mapped element exists.
@@ -252,7 +246,7 @@ private:
   /// @param a2b  A→B map where `a2b[a] = b` or `-1` if unmatched.
   /// @param i    Starting A-index (negative values start from 0).
   /// @return B-index ≥ 0 on success, otherwise -1.
-  static int MapForwardToB(const std::vector<int> &a2b, int i) {
+  static int MapForwardToB(ArrayRef<int> a2b, int i) {
     const std::size_t start = (i < 0) ? 0u : static_cast<std::size_t>(i);
     for (std::size_t k = start; k < a2b.size(); ++k)
       if (a2b[k] >= 0)
@@ -266,7 +260,7 @@ private:
   /// @param a2b  A→B map where `a2b[a] = b` or `-1` if unmatched.
   /// @param i    Starting A-index (clamped to `size()-1`).
   /// @return B-index ≥ 0 on success, otherwise -1.
-  static int MapBackwardToB(const std::vector<int> &a2b, int i) {
+  static int MapBackwardToB(ArrayRef<int> a2b, int i) {
     for (int k = std::min(i, static_cast<int>(a2b.size()) - 1); k >= 0; --k)
       if (a2b[k] >= 0)
         return a2b[k];
@@ -569,7 +563,7 @@ private:
   MacroPatch
   BuildMacroInvocationPatchWholeCover(const RefoldModel::MacroInvocation &m,
                                       const diffutils::Hunk &h,
-                                      const std::vector<int> &a2b) const;
+                                      ArrayRef<int> a2b) const;
 
   /// \brief Normalize and coalesce *pure insertion* hunks per include site on
   ///        the B side.
@@ -594,7 +588,7 @@ private:
   /// \param perInclude Map from include ID → include-scoped edits to normalize
   ///                   (mutated in place).
   void
-  NormalizeIncludeInsertions(std::map<int, IncludeEdits> &perInclude) const;
+  NormalizeIncludeInsertions(DenseMap<int, IncludeEdits> &perInclude) const;
 
   /// \brief Fully materialize the bytes for a single `#include` instance and
   ///        cache the result.
@@ -639,12 +633,11 @@ private:
   ///                            header bytes; may be preseeded with raw header
   ///                            text.
   void MaterializeIncludeExpansion(
-      int includeId, const std::map<int, IncludeEdits> &perInclude,
-      const std::map<std::optional<int>, std::vector<MacroPatch>>
-          &macroPatchesByOwner,
-      const std::map<int, std::vector<const RefoldModel::IncludeItem *>>
+      int includeId, const DenseMap<int, IncludeEdits> &perInclude,
+      const DenseMap<int, std::vector<MacroPatch>> &macroPatchesByOwner,
+      const DenseMap<int, std::vector<const RefoldModel::IncludeItem *>>
           &children,
-      std::map<int, std::string> &includeExpansion) const;
+      DenseMap<int, std::string> &includeExpansion) const;
 
   /// \brief Apply include-scoped insertion and replacement edits to a single
   ///        header’s text.

@@ -60,9 +60,10 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_STRINGUTILS_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_STRINGUTILS_H
 
+#include "llvm/ADT/StringRef.h"
+
 #include <cstddef>
 #include <cstdint>
-#include <string_view>
 
 namespace clang {
 namespace refold {
@@ -99,7 +100,7 @@ inline constexpr bool isIdentChar(char c) noexcept {
 
 // ---------------------- String predicates (ASCII only) ----------------------
 
-inline bool isAsciiWhitespace(std::string_view s) noexcept {
+inline bool isAsciiWhitespace(StringRef s) noexcept {
   for (char c : s) {
     if (!isWs(c))
       return false;
@@ -108,7 +109,7 @@ inline bool isAsciiWhitespace(std::string_view s) noexcept {
 }
 
 /** True iff s is a non-empty ASCII identifier (first char not a digit). */
-inline bool isIdentifierOnly(std::string_view s) noexcept {
+inline bool isIdentifierOnly(StringRef s) noexcept {
   if (s.empty())
     return false;
   if (!isAsciiIdentStart(s.front()))
@@ -124,7 +125,7 @@ inline bool isIdentifierOnly(std::string_view s) noexcept {
  * Treat keywords as identifiers for our purposes; "*" is also considered
  * “type-ish” (pointer glue) to help prefix handling.
  */
-inline bool isTypeishToken(std::string_view s) noexcept {
+inline bool isTypeishToken(StringRef s) noexcept {
   if (s.empty())
     return false;
   if (s.size() == 1 && s[0] == '*')
@@ -134,7 +135,7 @@ inline bool isTypeishToken(std::string_view s) noexcept {
 
 // --------------------- Index scans (return -1 if none) ----------------------
 
-inline int firstNonWsIdx(std::string_view s) noexcept {
+inline int firstNonWsIdx(StringRef s) noexcept {
   for (std::size_t i = 0; i < s.size(); ++i) {
     if (!isWs(s[i]))
       return static_cast<int>(i);
@@ -142,7 +143,7 @@ inline int firstNonWsIdx(std::string_view s) noexcept {
   return -1;
 }
 
-inline int lastNonWsIdx(std::string_view s) noexcept {
+inline int lastNonWsIdx(StringRef s) noexcept {
   for (std::size_t i = s.size() - 1; i >= 0; --i) {
     if (!isWs(s[i]))
       return static_cast<int>(i);

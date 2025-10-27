@@ -485,6 +485,16 @@ int main(int argc, char **argv) {
   debug("lex", "{0} tokens={1} {2} tokens={3}", aPath, aToks.size(), bPath,
         bToks.size());
 
+  // Append the sentinel to both source offsets.
+  if (bTokByteOff.empty() || bTokByteOff.back() != bBytes.size()) {
+    if (bTokByteOff.empty() || bTokByteOff.back() < bBytes.size())
+      bTokByteOff.push_back(bBytes.size());
+  }
+  if (aTokByteOff.empty() || aTokByteOff.back() != aBytes.size()) {
+    if (aTokByteOff.empty() || aTokByteOff.back() < aBytes.size())
+      aTokByteOff.push_back(aBytes.size());
+  }
+
 #if 0
   // XXX: Write out debug files so that I can compare the preprocessed lexical
   // tokens with the clang/llvm implementation of `clang-refold`. This can go
