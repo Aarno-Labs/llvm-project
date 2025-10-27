@@ -376,8 +376,7 @@ private:
   /// \param text Entire file contents.
   /// \param pos  Character offset within `text`.
   /// \returns `{ bol, fnStart, eol }` where `[bol, eol)` are the line bounds
-  /// and
-  ///          `fnStart` is defined as above.
+  ///          and `fnStart` is defined as above.
   static std::array<int, 3> LineAndFuncNameStart(StringRef text, int pos);
 
   /// \brief Adjust an insertion anchor if it starts at a function name.
@@ -587,8 +586,7 @@ private:
   ///
   /// \param perInclude Map from include ID → include-scoped edits to normalize
   ///                   (mutated in place).
-  void
-  NormalizeIncludeInsertions(DenseMap<int, IncludeEdits> &perInclude) const;
+  void CoalesceIncludeInsertions(DenseMap<int, IncludeEdits> &perInclude) const;
 
   /// \brief Fully materialize the bytes for a single `#include` instance and
   ///        cache the result.
@@ -669,8 +667,8 @@ private:
   ///                   merged).
   /// \param headerText Entire text of the resolved include file to patch.
   /// \returns          The header text with all include-scoped edits applied.
-  std::string ApplyIncludeInsertions(const IncludeEdits &ie,
-                                     std::string headerText) const;
+  std::string ApplyIncludeEdits(const IncludeEdits &ie,
+                                std::string headerText) const;
 
   // ----------------------- low-level mapping & utils -----------------------
 

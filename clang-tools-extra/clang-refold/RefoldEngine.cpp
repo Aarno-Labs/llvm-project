@@ -104,6 +104,7 @@ std::string RefoldEngine::Refold() {
 
   StringRef tuPath = model_.GetSourcePath();
 
+  // Read in the translation unit file / C source.
   std::string tuBytes;
   {
     auto bufOrErr = MemoryBuffer::getFile(tuPath);
@@ -176,29 +177,20 @@ std::string RefoldEngine::Refold() {
   for (std::size_t i = 0; i < hunks.size(); ++i) {
     const auto &h = hunks[i];
 
-    const bool isIns = (h.aStart == h.aEnd) && (h.bStart < h.bEnd);
-    const bool isDel = (h.aStart < h.aEnd) && (h.bStart == h.bEnd);
-    const bool isRep = (h.aStart < h.aEnd) && (h.bStart < h.bEnd);
-
-    const char *kind =
-        isIns ? "INS" : (isDel ? "DEL" : (isRep ? "REP" : "UNK"));
-
     llvm::StringRef bfrag;
     if (h.bStart < h.bEnd) {
       const std::size_t b0 = bTokOff_[static_cast<std::size_t>(h.bStart)];
       const std::size_t b1 = bTokOff_[static_cast<std::size_t>(h.bEnd)];
-      // Defensive clamping (should already be valid if offsets have sentinel):
+      // Defensive clamping (should already be valid since offsets have
+      // sentinel):
       const std::size_t lo = std::max<std::size_t>(0U, b0);
       const std::size_t hi = std::max<std::size_t>(lo, b1);
       bfrag = bSource_.substr(lo, hi - lo);
     }
 
-    // If your helpers take std::string, convert as needed:
     std::string shown =
         stringutils::showWS(stringutils::clip(bfrag.str(), 160));
-
-    debug("hunks", "#{0} {1} A[{2},{3}) -> B[{4},{5})  B='{6}'", i, kind,
-          h.aStart, h.aEnd, h.bStart, h.bEnd, shown);
+    debug("hunks", "#{0} {1:verbose} B='{2}'", i, h, shown);
   }
 
   // 3) Classify hunks and collect per-target edits.
@@ -206,18 +198,14 @@ std::string RefoldEngine::Refold() {
   DenseMap<int, IncludeEdits> perInclude; // includeId -> edits
   DenseMap<int, std::vector<MacroPatch>> macroPatchesByOwner;
 
-  // -> macro patches
+  // Iterate over all hunks:
   for (std::size_t i = 0; i < hunks.size(); ++i) {
     const auto &h = hunks[i];
 
     // a) Prefer include expansion if available.
     if (auto *inc = SmallestCoveringInclude(h.aStart, h.aEnd)) {
-      debug("classify",
-            "#{0} -> INCLUDE id={1} path={2}  A[{3},{4})->B[{5},{6})", i,
-            inc->id,
-            (inc->resolvedPath ? *inc->resolvedPath
-                               : StripHeaderToken(inc->target)),
-            h.aStart, h.aEnd, h.bStart, h.bEnd);
+      debug("classify", "#{0} -> INCLUDE id={1} target={2} resolved={3} {4}", i,
+            inc->id, StripHeaderToken(inc->target), inc->resolvedPath, h);
       auto patch = BuildIncludeInsertionPatch(*inc, h);
       perInclude[inc->id].include = inc;
       perInclude[inc->id].patches.push_back(std::move(patch));
@@ -228,12 +216,8 @@ std::string RefoldEngine::Refold() {
     if (auto *m = SmallestCoveringMacro(h.aStart, h.aEnd)) {
       if (m->getInvB() != -1 && m->getInvE() != -1) {
         debug("classify",
-              "#{0} -> MACRO inv='{1}' owner={2} invFile={3} "
-              "A[{4},{5})->B[{6},{7})",
-              i, m->invocationText ? *m->invocationText : "null",
-              m->ownerIncludeId ? *m->ownerIncludeId : -1,
-              m->invFile ? *m->invFile : "null", h.aStart, h.aEnd, h.bStart,
-              h.bEnd);
+              "#{0} -> MACRO invText={1} owner={2} invFile={3} {4})", i,
+              m->invocationText, m->ownerIncludeId, m->invFile, h);
         auto mp = BuildMacroInvocationPatchWholeCover(*m, h, a2b);
         const int ownerKey =
             (m->ownerIncludeId ? *m->ownerIncludeId : kNoOwner);
@@ -269,9 +253,9 @@ std::string RefoldEngine::Refold() {
 
         // Final boundary padding:
         // - allowLeft only if we did NOT already preserve a gap (avoids
-        // double-space)
+        //   double-space)
         // - always allowRight (covers cases like “…0” + “: 1” at zero-width
-        // sites)
+        //   sites)
         repl = PadAtBoundaries(tuBytes, span[0], span[1], std::move(repl),
                                /*allowLeft*/ !replacingGap,
                                /*allowRight*/ true);
@@ -291,7 +275,7 @@ std::string RefoldEngine::Refold() {
   }
 
   // Normalize/coalesce include-side insertions.
-  NormalizeIncludeInsertions(perInclude);
+  CoalesceIncludeInsertions(perInclude);
 
   // 4) Materialize include expansions bottom-up (nested first). Build child
   // lists by parent include id.
@@ -308,8 +292,7 @@ std::string RefoldEngine::Refold() {
       debug("include/tree",
             "{0} -> #{1} target={2} resolved={3} sitePath={4} site=[{5},{6}) "
             "cover=[{7},{8})",
-            pName, child->id, child->target,
-            child->resolvedPath ? *child->resolvedPath : "null",
+            pName, child->id, child->target, child->resolvedPath,
             child->sitePath, child->siteB, child->siteE, child->cover.begin,
             child->cover.end);
     }
@@ -379,7 +362,8 @@ std::string RefoldEngine::Refold() {
   std::string out(tuBytes);
   for (const auto &e : tuEdits) {
     if (e.start < 0 || e.end < e.start || e.end > static_cast<int>(out.size()))
-      fatal("tu/edits", "bad TU edit bounds [{0},{1})", e.start, e.end);
+      fatal("tu/edits", "bad TU edit bounds [{0},{1}) size={2}", e.start, e.end,
+            out.size());
     out.replace(static_cast<std::size_t>(e.start),
                 static_cast<std::size_t>(e.end - e.start), e.text);
   }
@@ -685,7 +669,7 @@ RefoldEngine::MacroPatch RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
 // =========== Include processing (normalize, materialize, apply) ===========
 
-void RefoldEngine::NormalizeIncludeInsertions(
+void RefoldEngine::CoalesceIncludeInsertions(
     DenseMap<int, IncludeEdits> &perInclude) const {
   for (auto &kv : perInclude) {
     auto &ie = kv.second;
@@ -813,9 +797,8 @@ void RefoldEngine::MaterializeIncludeExpansion(
   debug("include/mat",
         "ENTER inc#{0} target={1} resolved={2} sitePath={3} site=[{4},{5}) "
         "cover=[{6},{7})",
-        inc->id, inc->target, inc->resolvedPath ? *inc->resolvedPath : "null",
-        inc->sitePath, inc->siteB, inc->siteE, inc->cover.begin,
-        inc->cover.end);
+        inc->id, inc->target, inc->resolvedPath, inc->sitePath, inc->siteB,
+        inc->siteE, inc->cover.begin, inc->cover.end);
 
   // Start from the raw header text that was preloaded into includeExpansion.
   // If it wasn’t preseeded for some reason, load deterministically by path.
@@ -853,7 +836,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
   // 2) A/B include insert/delete/replace patches that belong to this include.
   if (auto it = perInclude.find(includeId); it != perInclude.end()) {
     if (!it->second.patches.empty())
-      bytes = ApplyIncludeInsertions(it->second, std::move(bytes));
+      bytes = ApplyIncludeEdits(it->second, std::move(bytes));
   }
 
   auto hasDescendantWork = [&](auto &&self, int id) -> bool {
@@ -895,9 +878,8 @@ void RefoldEngine::MaterializeIncludeExpansion(
       debug("include/mat",
             "inc#{0} -> child#{1} target={2} resolved={3} site=[{4},{5}) "
             "expand={6}",
-            inc->id, child->id, child->target,
-            child->resolvedPath ? *child->resolvedPath : "null", child->siteB,
-            child->siteE, todo ? "YES" : "NO");
+            inc->id, child->id, child->target, child->resolvedPath,
+            child->siteB, child->siteE, todo ? "YES" : "NO");
       if (!todo) {
         continue; // leave untouched: keep the original directive as-is
       }
@@ -923,7 +905,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
             "TU replace site=[{0},{1}) with inc#{2} len={3} (target={4} "
             "resolved={5})",
             siteStart, siteEnd, child->id, childText.size(), child->target,
-            child->resolvedPath ? *child->resolvedPath : "null");
+            child->resolvedPath);
 
       if (siteStart < siteEnd) {
         edits.push_back(TextEdit{siteStart, siteEnd, childText});
@@ -951,8 +933,8 @@ void RefoldEngine::MaterializeIncludeExpansion(
   includeExpansion[includeId] = std::move(bytes);
 }
 
-std::string RefoldEngine::ApplyIncludeInsertions(const IncludeEdits &ie,
-                                                 std::string headerText) const {
+std::string RefoldEngine::ApplyIncludeEdits(const IncludeEdits &ie,
+                                            std::string headerText) const {
   const std::string file =
       (ie.include->resolvedPath && !ie.include->resolvedPath->empty())
           ? *ie.include->resolvedPath
@@ -1283,11 +1265,9 @@ std::string RefoldEngine::ApplyIncludeInsertions(const IncludeEdits &ie,
     if (bad) {
       fatal("include/apply",
             "invalid edit range: start={0} end={1} (len={2}) inc#{3} "
-            "file=\"{4}\"",
+            "target={4} resolved={5}",
             e.start, e.end, len, ie.include->id,
-            (ie.include->resolvedPath && !ie.include->resolvedPath->empty())
-                ? *ie.include->resolvedPath
-                : StripHeaderToken(ie.include->target));
+            StripHeaderToken(ie.include->target), ie.include->resolvedPath);
     }
     headerText.replace(static_cast<std::size_t>(e.start),
                        static_cast<std::size_t>(e.end - e.start), e.text);
