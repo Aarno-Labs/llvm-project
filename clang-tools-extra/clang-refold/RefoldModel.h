@@ -192,17 +192,17 @@ public:
     std::vector<PPSpan> spans;
     PPCover cover;
 
-    IncludeItem(int Id, std::string Subkind, std::string Text,
-                std::string SitePath, int SiteB, int SiteE, std::string Target,
-                std::optional<std::string> ResolvedPath, bool Angled,
-                std::optional<int> Parent, std::vector<PPSpan> Spans,
-                std::optional<int> CoverBeginOpt,
-                std::optional<int> CoverEndOpt) noexcept
-        : id(Id), subkind(std::move(Subkind)), text(std::move(Text)),
-          sitePath(std::move(SitePath)), siteB(SiteB), siteE(SiteE),
-          target(std::move(Target)), resolvedPath(std::move(ResolvedPath)),
-          angled(Angled), parent(std::move(Parent)), spans(std::move(Spans)) {
-      cover.init(CoverBeginOpt, CoverEndOpt, spans);
+    IncludeItem(int id, std::string subkind, std::string text,
+                std::string sitePath, int siteB, int siteE, std::string target,
+                std::optional<std::string> resolvedPath, bool angled,
+                std::optional<int> parent, std::vector<PPSpan> spans,
+                std::optional<int> coverBegin,
+                std::optional<int> coverEnd) noexcept
+        : id(id), subkind(std::move(subkind)), text(std::move(text)),
+          sitePath(std::move(sitePath)), siteB(siteB), siteE(siteE),
+          target(std::move(target)), resolvedPath(std::move(resolvedPath)),
+          angled(angled), parent(std::move(parent)), spans(std::move(spans)) {
+      cover.init(coverBegin, coverEnd, this->spans);
     }
 
     bool covers(int aStart, int aEnd) const {
@@ -215,24 +215,24 @@ public:
     std::string subkind; // "func" | "obj"
     std::string name;
     std::vector<PPSpan> spans; // expansion coverage (A tokens)
-    std::optional<std::string> invocationText;
+    std::optional<std::string> invText;
     std::optional<std::string> invFile;
     std::optional<int> invB;
     std::optional<int> invE;
     std::optional<int> ownerIncludeId;
     PPCover cover;
 
-    MacroInvocation(int Id, std::string Subkind, std::string Name,
-                    std::optional<std::string> InvocationText,
-                    std::optional<std::string> InvFile, std::optional<int> InvB,
-                    std::optional<int> InvE, std::optional<int> OwnerIncludeId,
-                    std::vector<PPSpan> Spans, std::optional<int> CoverBeginOpt,
-                    std::optional<int> CoverEndOpt) noexcept
-        : id(Id), subkind(std::move(Subkind)), name(std::move(Name)),
-          spans(std::move(Spans)), invocationText(std::move(InvocationText)),
-          invFile(std::move(InvFile)), invB(std::move(InvB)),
-          invE(std::move(InvE)), ownerIncludeId(std::move(OwnerIncludeId)) {
-      cover.init(CoverBeginOpt, CoverEndOpt, spans);
+    MacroInvocation(int id, std::string subkind, std::string name,
+                    std::optional<std::string> invText,
+                    std::optional<std::string> invFile, std::optional<int> invB,
+                    std::optional<int> invE, std::optional<int> ownerIncludeId,
+                    std::vector<PPSpan> spans, std::optional<int> coverBegin,
+                    std::optional<int> coverEnd) noexcept
+        : id(id), subkind(std::move(subkind)), name(std::move(name)),
+          spans(std::move(spans)), invText(std::move(invText)),
+          invFile(std::move(invFile)), invB(std::move(invB)),
+          invE(std::move(invE)), ownerIncludeId(std::move(ownerIncludeId)) {
+      cover.init(coverBegin, coverEnd, this->spans);
     }
 
     int getInvB() const { return invB.has_value() ? *invB : -1; }

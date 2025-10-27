@@ -32,6 +32,8 @@ add_clang_library(clangFrontend
   MultiplexConsumer.cpp
   PrecompiledPreamble.cpp
   PrintPreprocessedOutput.cpp
+  PPMacroPrinting.cpp
+  RefoldMapBuilder.cpp
   SARIFDiagnostic.cpp
   SARIFDiagnosticPrinter.cpp
   SerializedDiagnosticPrinter.cpp
