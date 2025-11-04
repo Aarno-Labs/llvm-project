@@ -1079,9 +1079,9 @@ void clang::DoPrintPreprocessedInput(Preprocessor &PP, raw_ostream *OS,
 
   // Optional recorder for writing out the refolding map data as a JSON file.
   std::string RefoldMapFile = PP.getPreprocessorOpts().RefoldMapFile;
-  std::unique_ptr<RefoldMapBuilder> RefoldRecorder;
+  std::shared_ptr<RefoldMapBuilder> RefoldRecorder;
   if (!RefoldMapFile.empty())
-    RefoldRecorder = std::make_unique<RefoldMapBuilder>(PP, RefoldMapFile);
+    RefoldRecorder = std::make_shared<RefoldMapBuilder>(PP, RefoldMapFile);
 
   PrintPPOutputPPCallbacks *Callbacks = new PrintPPOutputPPCallbacks(
       PP, OS, !Opts.ShowLineMarkers, Opts.ShowMacros,
@@ -1129,29 +1129,29 @@ void clang::DoPrintPreprocessedInput(Preprocessor &PP, raw_ostream *OS,
     struct Recorder : PPCallbacks {
       Preprocessor &PP;
       SourceManager &SM;
-      RefoldMapBuilder &R;
-      Recorder(Preprocessor &PP, RefoldMapBuilder &R)
-          : PP(PP), SM(PP.getSourceManager()), R(R) {}
+      std::shared_ptr<RefoldMapBuilder> R;
+      Recorder(Preprocessor &PP, std::shared_ptr<RefoldMapBuilder> R)
+          : PP(PP), SM(PP.getSourceManager()), R(std::move(R)) {}
       void InclusionDirective(SourceLocation HashLoc, const Token &IncludeTok,
                               StringRef FileName, bool IsAngled,
                               CharSourceRange FilenameRange,
                               OptionalFileEntryRef File, StringRef SearchPath,
                               StringRef RelativePath, const Module *Imported,
                               SrcMgr::CharacteristicKind FileType) override {
-        R.onIncludeDirective(HashLoc, IncludeTok, FileName, IsAngled,
+        R->onIncludeDirective(HashLoc, IncludeTok, FileName, IsAngled,
                              FilenameRange, File);
       }
       void MacroDefined(const Token &MacroNameTok,
                         const MacroDirective *MD) override {
-        R.onMacroDefined(MacroNameTok, MD);
+        R->onMacroDefined(MacroNameTok, MD);
       }
       void MacroUndefined(const Token &MacroNameTok, const MacroDefinition &MD,
                           const MacroDirective *Undef) override {
-        R.onMacroUndefined(MacroNameTok, MD, Undef);
+        R->onMacroUndefined(MacroNameTok, MD, Undef);
       }
       void MacroExpands(const Token &MacroNameTok, const MacroDefinition &MD,
                         SourceRange Range, const MacroArgs *Args) override {
-        R.onMacroExpands(MacroNameTok, MD, Range, Args);
+        R->onMacroExpands(MacroNameTok, MD, Range, Args);
       }
       void FileChanged(SourceLocation Loc, FileChangeReason Reason,
                        SrcMgr::CharacteristicKind, FileID) override {
@@ -1160,14 +1160,18 @@ void clang::DoPrintPreprocessedInput(Preprocessor &PP, raw_ostream *OS,
           FileID F = SM.getFileID(Loc);
           SourceLocation Inc = SM.getIncludeLoc(F); // invalid for main file
           Inc = SM.getFileLoc(Inc);
-          R.onEnterFile(Inc);
+          R->onEnterFile(Inc);
         } else if (Reason == PPCallbacks::ExitFile) {
-          R.onExitFile();
+          R->onExitFile();
         }
       }
-      void EndOfMainFile() override { R.onEndOfStream(); }
+      void EndOfMainFile() override {
+        // Finalize exactly once at end of processing.
+        R->onEndOfStream();
+        R->writeJSON();
+      }
     };
-    PP.addPPCallbacks(std::make_unique<Recorder>(PP, *RefoldRecorder));
+    PP.addPPCallbacks(std::make_unique<Recorder>(PP, RefoldRecorder));
   }
 
   // After we have configured the preprocessor, enter the main file.
@@ -1196,10 +1200,6 @@ void clang::DoPrintPreprocessedInput(Preprocessor &PP, raw_ostream *OS,
   // Read all the preprocessed tokens, printing them out to the stream.
   PrintPreprocessedTokens(PP, Tok, Callbacks, RefoldRecorder.get());
   *OS << '\n';
-  if (RefoldRecorder) {
-    RefoldRecorder->onEndOfStream();
-    RefoldRecorder->writeJSON();
-  }
 
   // Remove the handlers we just added to leave the preprocessor in a sane state
   // so that it can be reused (for example by a clang::Parser instance).
