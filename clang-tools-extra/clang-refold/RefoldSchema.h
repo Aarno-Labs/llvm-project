@@ -14,6 +14,12 @@
 //   * The schema ties A’s tokens back to source files/bytes and PP constructs:
 //       - macro invocations and their expansion covers
 //       - include directives and the byte spans they expanded into
+//       - explicit separation of macro-expansion tokens by origin:
+//         * arg_spans  : tokens sourced from actual macro arguments
+//         * body_spans : tokens sourced from the macro body (non-arguments)
+//         This enables deterministic handling of non-argument edits by
+//         replacing the invocation bytes with the edited expansion text
+//         whenever any edit falls in body_spans.
 //       - macro definition/undef directives and pragmas
 //       - conditional groups (#if/#elif/#else/#endif) with selected arms
 //       - token→file byte mapping for A (absolute/canonical paths)
@@ -257,6 +263,16 @@ static constexpr const char *RefoldSchema = R"json(
             "$ref": "#/$defs/PPSpan"
           },
           "description": "Token spans in the preprocessed stream A that together represent this macro's expansion."
+        },
+        "arg_spans": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/PPSpan" },
+          "description": "A-token spans within pp_cover that originate from any actual macro arguments."
+        },
+        "body_spans": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/PPSpan" },
+          "description": "A-token spans within pp_cover that originate from the macro body (non-argument tokens)."
         },
         "inv_text": {
           "type": "string",

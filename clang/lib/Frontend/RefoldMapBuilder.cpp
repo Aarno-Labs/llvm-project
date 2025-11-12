@@ -570,6 +570,8 @@ void RefoldMapBuilder::onToken(const Token &Tok) {
 
   int ItemIdx = -1;
   SourceLocation L = Tok.getLocation();
+
+  // Prefer a macro item when the token is inside a macro expansion.
   if (SM.isMacroArgExpansion(L) || SM.isMacroBodyExpansion(L)) {
     SourceLocation Caller = SM.getImmediateMacroCallerLoc(L);
     auto It = MacroKey2Item.find(keyForLoc(SM, Caller));
@@ -581,6 +583,8 @@ void RefoldMapBuilder::onToken(const Token &Tok) {
     if (It != MacroKey2Item.end())
       ItemIdx = It->second;
   }
+
+  // Otherwise attribute to the innermost active include; else to the file item.
   if (ItemIdx == -1) {
     if (!IncludeStack.empty() && IncludeStack.back() != -1) {
       ItemIdx = IncludeStack.back();
@@ -599,6 +603,20 @@ void RefoldMapBuilder::onToken(const Token &Tok) {
 
   // 1) Attribute the token to its primary item (macro, include, or file).
   touchSpanForItem(ItemIdx, TokIndex);
+
+  // 1a) If the primary item is a MACRO expansion, also record exact origin:
+  //     - ArgSpans for tokens from actual arguments
+  //     - BodySpans for tokens from the macro body
+  if (Items[ItemIdx].Kind == IK_Macro) {
+    if (SM.isMacroArgExpansion(L)) {
+      touchTokSpan(Items[ItemIdx].ArgSpans, TokIndex);
+    } else if (SM.isMacroBodyExpansion(L)) {
+      touchTokSpan(Items[ItemIdx].BodySpans, TokIndex);
+    }
+    // Tokens that are neither arg nor body (rare, e.g. builtins) remain covered
+    // by the primary Spans via touchSpanForItem above.
+  }
+
   // 2) Grow all active include items transitively so a parent include
   //    covers its entire subtree (nested includes/macros).
   for (int idx : IncludeStack) {
@@ -607,7 +625,7 @@ void RefoldMapBuilder::onToken(const Token &Tok) {
     touchSpanForItem(idx, TokIndex);
   }
 
-  // Capture byte range in the spelling file of this token (main or header).
+  // 3) Capture byte range in the spelling file of this token (main or header).
   {
     SourceLocation FL = SM.getFileLoc(L);
     if (FL.isValid()) {
@@ -646,7 +664,7 @@ void RefoldMapBuilder::writeJSON() {
   llvm::json::OStream JO(OS, /*Indent=*/2);
 
   JO.object([&] {
-    JO.attribute("version", "1.1");
+    JO.attribute("version", "1.2");
     JO.attribute("source", TUAbsPath);
 
     // tokens...
@@ -718,6 +736,30 @@ void RefoldMapBuilder::writeJSON() {
             } else if (It.Kind == IK_Directive &&
                        (It.Subkind == "#define" || It.Subkind == "#undef")) {
               JO.attribute("owner_include_id", It.OwnerIncludeId);
+            }
+          }
+
+          // NEW: macro-token origin spans
+          if (It.Kind == IK_Macro) {
+            if (!It.ArgSpans.empty()) {
+              JO.attributeArray("arg_spans", [&] {
+                for (const TokenSpan &S : It.ArgSpans) {
+                  JO.object([&] {
+                    JO.attribute("begin", S.Begin);
+                    JO.attribute("end",   S.End);
+                  });
+                }
+              });
+            }
+            if (!It.BodySpans.empty()) {
+              JO.attributeArray("body_spans", [&] {
+                for (const TokenSpan &S : It.BodySpans) {
+                  JO.object([&] {
+                    JO.attribute("begin", S.Begin);
+                    JO.attribute("end",   S.End);
+                  });
+                }
+              });
             }
           }
 
