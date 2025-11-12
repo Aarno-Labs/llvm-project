@@ -79,6 +79,8 @@ struct Item {
   std::string InvFile; // file containing the macro invocation
   SourceLocation Loc;  // primary location
   std::vector<TokenSpan> Spans;
+  std::vector<TokenSpan> ArgSpans;   // tokens from any actual arguments
+  std::vector<TokenSpan> BodySpans;  // tokens from the macro body
 
   // main-file byte range of the macro invocation (if applicable)
   long long InvBegin = -1;
@@ -95,6 +97,12 @@ struct Item {
   int OwnerIncludeId =
       -1; // include item id that opened the file containing this item
 };
+
+// Small utility to append/extend a half-open token span list.
+inline void touchTokSpan(std::vector<TokenSpan> &V, uint32_t TokIdx) {
+  if (V.empty() || V.back().End != TokIdx) V.push_back({TokIdx, TokIdx+1});
+  else V.back().End++;
+}
 
 /// Mapping from a printed PP token to its source file byte range.
 struct TokMapEntry {
