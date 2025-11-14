@@ -758,10 +758,113 @@ void RefoldEngine::CoalesceIncludeInsertions(
           ++j;
         }
 
-        // Keep the insertion line-local: trim anything after the first newline.
+        // DEBUG: show payload tail and next few B tokens at splice (only the
+        // last ~80 chars of the merged payload)
+        std::string tail =
+            (left.size() <= 80) ? left : left.substr(left.size() - 80);
+        debug("include/norm", "inc#{0} seed payload tail(len={1}): '{2}'",
+              ie.include->id, left.size(), stringutils::showWS(tail));
+
+        // show next 5 tokens starting at bEndIdxEx (skipping whitespace in the
+        // loop below anyway)
+        std::string tokWin;
+        int kDbg = bEndIdxEx, shown = 0;
+        while (kDbg < static_cast<int>(bTokOff_.size()) - 1 && shown < 5) {
+          StringRef t(bSource_.data() + bTokOff_[kDbg],
+                      bTokOff_[kDbg + 1] - bTokOff_[kDbg]);
+          tokWin.push_back('[');
+          tokWin += stringutils::showWS(t.str());
+          tokWin.push_back(']');
+          ++kDbg;
+          ++shown;
+        }
+        debug("include/norm", "inc#{0} next tokens @bEndIdxEx={1}: {2}",
+              ie.include->id, bEndIdxEx, tokWin);
+
+        // 1) If left contains a newline, check the last line of the payload:
+        //    if it redundantly starts with the *next* non-WS token in B at
+        //    the splice, drop that duplicate token from the payload's last
+        //    line.
+        auto lastNl = left.rfind('\n');
+        if (lastNl != std::string::npos && lastNl + 1 < left.size()) {
+          std::string afterNl = left.substr(lastNl + 1);
+
+          // Find the next non-WS token in B starting at current end anchor.
+          std::string nextTok;
+          int k = bEndIdxEx;
+          while (k < static_cast<int>(bTokOff_.size()) - 1) {
+            StringRef tok(bSource_.data() + bTokOff_[k],
+                          bTokOff_[k + 1] - bTokOff_[k]);
+            if (!stringutils::isAsciiWhitespace(tok.str())) {
+              nextTok = tok.str();
+              break;
+            }
+            ++k;
+          }
+
+          // Leading ws count after the newline in the payload.
+          std::size_t ws = 0;
+          while (ws < afterNl.size()) {
+            char c = afterNl[ws];
+            if (c == ' ' || c == '\t' || c == '\r')
+              ++ws;
+            else
+              break;
+          }
+
+          std::string afterNlPreview =
+              (afterNl.size() <= 60) ? afterNl : afterNl.substr(0, 60);
+          debug("include/norm/drop",
+                "inc#{0} lastNl={1} ws={2} nextTok='{3}' afterNl[0..60]='{4}'",
+                ie.include->id, lastNl, ws, stringutils::showWS(nextTok),
+                stringutils::showWS(afterNlPreview));
+
+          // If our payload already starts that next line with the same token
+          // the header naturally has at the splice point (e.g., "int "), drop
+          // that duplicate token from the payload (keep the newline so the
+          // next decl stays on its own line).
+          bool startsDup = !nextTok.empty() && ws < afterNl.size() &&
+                           afterNl.compare(ws, nextTok.size(), nextTok) == 0;
+          if (startsDup) {
+            std::size_t drop = ws + nextTok.size();
+            if (afterNl.size() > drop && afterNl[drop] == ' ')
+              ++drop;
+
+            debug("include/norm/drop",
+                  "inc#{0} DROP dup leading token: ws={1} tokLen={2} "
+                  "totalDrop={3}",
+                  ie.include->id, ws, nextTok.size(), drop - ws);
+
+            afterNl = afterNl.substr(drop);
+            left = left.substr(0, lastNl + 1) + afterNl;
+
+            // DEBUG: show new tail after drop
+            std::string newTail =
+                (left.size() <= 80) ? left : left.substr(left.size() - 80);
+            debug("include/norm/drop", "inc#{0} payload tail after drop: '{1}'",
+                  ie.include->id, stringutils::showWS(newTail));
+          } else {
+            debug("include/norm/drop", "inc#{0} NO drop: startsDup=false",
+                  ie.include->id);
+          }
+        }
+
+        // 2) Single-line legacy trim: if there is exactly one newline and
+        //    only newline chars after it, trim to that newline. Otherwise,
+        //    keep true multi-line payloads intact.
         auto nl = left.find('\n');
-        if (nl != std::string::npos)
-          left.resize(nl + 1);
+        if (nl != std::string::npos) {
+          bool onlyTrailingNewlines = true;
+          for (std::size_t t = nl + 1; t < left.size(); ++t) {
+            char c = left[t];
+            if (c != '\n' && c != '\r') {
+              onlyTrailingNewlines = false;
+              break;
+            }
+          }
+          if (onlyTrailingNewlines)
+            left.resize(nl + 1);
+        }
 
         // Anchor at the first patch's A-position (insertion), B span is the
         // merged (possibly widened) range.
@@ -1113,8 +1216,63 @@ std::string RefoldEngine::ApplyIncludeEdits(const IncludeEdits &ie,
           p.aStart, p.aEnd, p.bStart, p.bEnd, startByte, endByte,
           stringutils::showWS(stringutils::clip(replacement, 120)));
 
-    // Boundary hygiene (no identifier fusion), but NEVER add a space when
-    // replacement already ends with a newline.
+    // If the insertion payload’s *last line* redundantly starts with the
+    // *entire* type-ish prefix run that already occurs on the header line at
+    // the splice, drop that full run. (Do NOT drop just the first token; that
+    // causes "long " to be left behind for multi-token return types like
+    // "unsigned long".)
+    if (isInsert && !replacement.empty() && startByte >= 0) {
+      auto lastNl = replacement.rfind('\n');
+      if (lastNl != std::string::npos && lastNl + 1 < replacement.size()) {
+        // Compute the header’s full type-ish prefix on the target line.
+        auto [bol, fnStart, eol] = LineAndFuncNameStart(headerText, startByte);
+        int hi = bol;
+        while (hi < startByte) {
+          char c = headerText[static_cast<std::size_t>(hi)];
+          if (c == ' ' || c == '\t')
+            ++hi;
+          else
+            break;
+        }
+        std::string headerPrefix;
+        if (fnStart > hi) {
+          headerPrefix.assign(headerText.begin() + hi,
+                              headerText.begin() + fnStart);
+        }
+
+        std::string afterNl = replacement.substr(lastNl + 1);
+        std::size_t ws = 0;
+        while (ws < afterNl.size()) {
+          char c = afterNl[ws];
+          if (c == ' ' || c == '\t' || c == '\r')
+            ++ws;
+          else
+            break;
+        }
+
+        debug("include/anchor",
+              "insert de-dup probe: fullPrefix='{0}' ws={1} lastLineHead='{2}'",
+              stringutils::showWS(headerPrefix), ws,
+              stringutils::showWS(afterNl.substr(
+                  0, std::min<std::size_t>(afterNl.size(), 40))));
+
+        if (!headerPrefix.empty() &&
+            afterNl.compare(ws, headerPrefix.size(), headerPrefix) == 0) {
+          std::size_t drop = ws + headerPrefix.size();
+          if (afterNl.size() > drop && afterNl[drop] == ' ')
+            ++drop; // trim one space
+          std::string before = replacement.substr(0, lastNl + 1);
+          replacement = before + afterNl.substr(drop);
+          debug("include/anchor",
+                "insert de-dup: dropped full header prefix run len={0} at site "
+                "byte {1}",
+                headerPrefix.size(), startByte);
+        }
+      }
+    }
+
+    // Boundary hygiene (no token fusion), but NEVER add a space when replacement
+    // already ends with a newline.
     if (isInsert && !replacement.empty()) {
       auto endsWithNl = (replacement.back() == '\n');
 
@@ -1173,6 +1331,7 @@ std::string RefoldEngine::ApplyIncludeEdits(const IncludeEdits &ie,
       }
     }
 
+    // Carry the declaration's type/qualifier prefix when inserting a function decl at indent.
     if (isInsert && !replacement.empty()) {
       // Are we at line indent?
       auto [bol, fnStart, eol] = LineAndFuncNameStart(headerText, startByte);

@@ -207,8 +207,8 @@ void lexPPTokens(const std::string &bytes, std::vector<PPTok> &out,
 
   LangOptions lang; // raw lexing
   Lexer lex(sm.getLocForStartOfFile(fid), lang, b, b, e);
-  lex.SetKeepWhitespaceMode(
-      false); // (Java driver sometimes keeps WS; here we match -E -P)
+  lex.SetKeepWhitespaceMode(false);
+  lex.SetCommentRetentionState(true);
 
   // Tokenize
   for (;;) {
