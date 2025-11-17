@@ -731,13 +731,14 @@ RefoldEngine::MacroPatch RefoldEngine::BuildMacroInvocationPatchWholeCover(
   }
 
   // Candidate A = (cover ∩ envStrict) if intersects, else cover.
+  // We allow envStrict to tighten the *left* edge, but we keep the right edge
+  // at covHi so we don't drop trailing macro body tokens when BODY/ARG spans
+  // are slightly too short.
   int aLo = covLo, aHi = covHi;
   if (haveEnvStrict) {
     const int iLo = std::max(covLo, envStrictLo);
-    const int iHi = std::min(covHi, envStrictHi);
-    if (iLo < iHi) {
+    if (iLo < covHi) {
       aLo = iLo;
-      aHi = iHi;
     }
   }
 
@@ -799,7 +800,7 @@ RefoldEngine::MacroPatch RefoldEngine::BuildMacroInvocationPatchWholeCover(
   if (!aT.empty() && StringRef(bT).ends_with(aT)) {
     // Extra-left tokens we introduce by widening.
     const int extraLo = std::min(bLoTok, aLo);
-    const int extraHi = aLo;
+    const int extraHi = std::max(bLoTok, aLo);
 
     auto inBody = [&](int pp) -> bool {
       for (const auto &s : m.bodySpans) {
@@ -834,11 +835,12 @@ RefoldEngine::MacroPatch RefoldEngine::BuildMacroInvocationPatchWholeCover(
         // Skip trailing spaces/tabs/newlines before testing last non-ws char.
         while (endByte >= static_cast<int>(bBLo)) {
           char ch = bSource_[static_cast<std::size_t>(endByte)];
-          if (ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n') {
-            endsAtSemicolon = (ch == ';');
-            break;
+          if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') {
+            --endByte;
+            continue;
           }
-          --endByte;
+          endsAtSemicolon = (ch == ';');
+          break;
         }
       }
     }
