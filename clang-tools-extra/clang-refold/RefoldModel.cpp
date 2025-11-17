@@ -500,6 +500,22 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
           spans = std::move(*sp);
         }
 
+        std::vector<PPSpan> argSpans;
+        if (const json::Value *spansVal = obj->get("arg_spans")) {
+          auto sp = parsePPSpans(*spansVal, "macro.arg_spans");
+          if (!sp)
+            return sp.takeError();
+          argSpans = std::move(*sp);
+        }
+
+        std::vector<PPSpan> bodySpans;
+        if (const json::Value *spansVal = obj->get("body_spans")) {
+          auto sp = parsePPSpans(*spansVal, "macro.body_spans");
+          if (!sp)
+            return sp.takeError();
+          bodySpans = std::move(*sp);
+        }
+
         std::optional<int> coverBOpt, coverEOpt;
         if (const json::Value *ppcVal = obj->get("pp_cover")) {
           auto ppcOrErr = asObject(*ppcVal, "macro.pp_cover");
@@ -529,6 +545,8 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
                            /*invE*/ std::move(invE),
                            /*ownerIncludeId*/ std::move(ownerIncludeId),
                            /*spans*/ std::move(spans),
+                           /*argSpans*/ std::move(argSpans),
+                           /*bodySpans*/ std::move(bodySpans),
                            /*coverBegin*/ coverBOpt,
                            /*coverEnd*/ coverEOpt);
 

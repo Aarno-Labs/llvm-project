@@ -266,12 +266,16 @@ static constexpr const char *RefoldSchema = R"json(
         },
         "arg_spans": {
           "type": "array",
-          "items": { "$ref": "#/$defs/PPSpan" },
+          "items": {
+            "$ref": "#/$defs/PPSpan"
+          },
           "description": "A-token spans within pp_cover that originate from any actual macro arguments."
         },
         "body_spans": {
           "type": "array",
-          "items": { "$ref": "#/$defs/PPSpan" },
+          "items": {
+            "$ref": "#/$defs/PPSpan"
+          },
           "description": "A-token spans within pp_cover that originate from the macro body (non-argument tokens)."
         },
         "inv_text": {

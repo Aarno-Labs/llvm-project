@@ -636,35 +636,225 @@ std::array<int, 2> RefoldEngine::TUByteSpan(int a0, int a1,
 
 // ==================== Patch builders (include & macro) ====================
 
+bool RefoldEngine::MacroExpansionEnvelopeB(
+    const RefoldModel::MacroInvocation &m, bool onlyInvFile, int &begin,
+    int &end) const {
+  const auto &tokMapByPP = model_.GetTokmapByPP();
+  if (tokMapByPP.empty())
+    return false;
+
+  int lo = std::numeric_limits<int>::max();
+  int hi = std::numeric_limits<int>::min();
+  bool any = false;
+
+  auto addRange = [&](int lo, int hi) {
+    for (int pp = lo; pp < hi; ++pp) {
+      auto it = tokMapByPP.find(pp);
+      if (it == tokMapByPP.end())
+        continue;
+
+      const auto &t = it->second;
+
+      if (onlyInvFile) {
+        if (t.file.empty() || t.file != m.invFile)
+          continue;
+      }
+
+      if (pp < lo)
+        lo = pp;
+      if (pp + 1 > hi)
+        hi = pp + 1;
+      any = true;
+    }
+  };
+
+  // BODY spans
+  for (const auto &s : m.bodySpans) {
+    if (!s.isValid())
+      continue;
+    addRange(s.begin, s.end);
+  }
+
+  // ARG spans
+  for (const auto &s : m.argSpans) {
+    if (!s.isValid())
+      continue;
+    addRange(s.begin, s.end);
+  }
+
+  if (!any)
+    return false;
+
+  begin = lo;
+  end = hi;
+  return true;
+}
+
 RefoldEngine::MacroPatch RefoldEngine::BuildMacroInvocationPatchWholeCover(
     const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h,
     ArrayRef<int> a2b) const {
-  // Map the macro's A-cover [coverBegin, coverEnd) to a B-token interval via
-  // LCS map.
+  debug("macro/patch",
+        "BEGIN inv id={0} name={1} invFile={2} invB/E=[{3},{4}] "
+        "coverA=[{5},{6}) hunkB=[{7},{8})",
+        m.id, m.name, m.invFile, m.invB, m.invE, m.cover.begin, m.cover.end,
+        h.bStart, h.bEnd);
+
+  // Map A-cover → B using LCS A2B
   int bStartIdx = MapForwardToB(a2b, m.cover.begin);
   int bEndIdxEx = MapBackwardToB(a2b, m.cover.end - 1);
 
-  // Fallback if unmapped OR inverted
   if (bStartIdx < 0 || bEndIdxEx < 0 || bStartIdx > bEndIdxEx) {
-    // If B has no tokens in this hunk, the macro vanished → empty replacement
+    trace("macro/patch",
+          "cover unmapped/inverted ({0},{1})  hunkB=[{2},{3}){4}", bStartIdx,
+          bEndIdxEx, h.bStart, h.bEnd,
+          (h.bStart >= h.bEnd ? " → EMPTY" : " → use hunk"));
     if (h.bStart >= h.bEnd) {
-      return MacroPatch{m.getInvB(), m.getInvE(), ""};
+      return MacroPatch{m.getInvB(), m.getInvE(), std::string()};
     }
     bStartIdx = h.bStart;
     bEndIdxEx = h.bEnd - 1;
   }
 
-  // Final defensive clamp (should be redundant if bTokOff_ has sentinel)
-  std::size_t b0 = bTokOff_[bStartIdx];
-  std::size_t b1 = bTokOff_[bEndIdxEx + 1];
-  if (b1 < b0) {
-    // ultra-defensive check: produce empty replacement instead of crashing
-    return MacroPatch{m.getInvB(), m.getInvE(), ""};
+  // Clamp to BTokOff bounds
+  const int maxTok = static_cast<int>(bTokOff_.size()) - 1;
+  int covLo = std::max(0, std::min(bStartIdx, maxTok - 1));
+  int covHi = std::max(covLo, std::min(bEndIdxEx + 1, maxTok));
+
+  // Strict envelope: only tokens from the invocation file
+  int envStrictLo = 0, envStrictHi = 0;
+  bool haveEnvStrict = MacroExpansionEnvelopeB(m, /*OnlyInvFile=*/true,
+                                               envStrictLo, envStrictHi);
+  if (haveEnvStrict) {
+    trace("macro/patch", "envStrict=[{0},{1})", envStrictLo, envStrictHi);
+  } else {
+    trace("macro/patch", "envStrict=null");
   }
 
-  StringRef frag(bSource_.data() + b0, static_cast<std::size_t>(b1 - b0));
-  std::string repl = frag.ltrim(" \t").rtrim(" \t").str();
-  return MacroPatch{m.getInvB(), m.getInvE(), std::move(repl)};
+  // Candidate A = (cover ∩ envStrict) if intersects, else cover.
+  int aLo = covLo, aHi = covHi;
+  if (haveEnvStrict) {
+    const int iLo = std::max(covLo, envStrictLo);
+    const int iHi = std::min(covHi, envStrictHi);
+    if (iLo < iHi) {
+      aLo = iLo;
+      aHi = iHi;
+    }
+  }
+
+  aLo = std::max(0, std::min(aLo, maxTok - 1));
+  aHi = std::max(aLo, std::min(aHi, maxTok));
+
+  const std::size_t aBLo = bTokOff_[static_cast<std::size_t>(aLo)];
+  const std::size_t aBHi = bTokOff_[static_cast<std::size_t>(aHi)];
+  StringRef rawA =
+      (aBHi > aBLo) ? bSource_.substr(aBLo, aBHi - aBLo) : StringRef();
+  std::string candA = stringutils::trimEdgeSpaces(rawA);
+
+  trace("macro/patch",
+        "CandidateA sliceTok=[{0},{1}) bytes=[{2},{3}) len={4} prev='{5}'", aLo,
+        aHi, aBLo, aBHi, (aBHi - aBLo),
+        stringutils::showWS(stringutils::clip(candA, 120)));
+
+  // BODY ∪ ARGS across all files (captures edited type tokens in headers).
+  int envAllLo = 0, envAllHi = 0;
+  bool haveEnvAll =
+      MacroExpansionEnvelopeB(m, /*OnlyInvFile=*/false, envAllLo, envAllHi);
+  if (haveEnvAll) {
+    trace("macro/patch", "envAll=[{0},{1})", envAllLo, envAllHi);
+  } else {
+    trace("macro/patch", "envAll=null");
+  }
+
+  // Candidate B = union of CandidateA and envAll (when present)
+  int bLoTok = aLo;
+  int bHiTok = aHi;
+  if (haveEnvAll) {
+    bLoTok = std::min(aLo, envAllLo);
+    bHiTok = std::max(aHi, envAllHi);
+  }
+
+  bLoTok = std::max(0, std::min(bLoTok, maxTok - 1));
+  bHiTok = std::max(bLoTok, std::min(bHiTok, maxTok));
+
+  const std::size_t bBLo = bTokOff_[static_cast<std::size_t>(bLoTok)];
+  const std::size_t bBHi = bTokOff_[static_cast<std::size_t>(bHiTok)];
+  StringRef rawB =
+      (bBHi > bBLo) ? bSource_.substr(bBLo, bBHi - bBLo) : StringRef();
+  std::string candB = stringutils::trimEdgeSpaces(rawB);
+
+  trace("macro/patch",
+        "CandidateB (union) sliceTok=[{0},{1}) bytes=[{2},{3}) len={4} "
+        "prev='{5}'",
+        bLoTok, bHiTok, bBLo, bBHi, (bBHi - bBLo),
+        stringutils::showWS(stringutils::clip(candB, 120)));
+
+  // --- Decision: prefer B only when:
+  //     1) the widened extra-left PP tokens are ALL from BODY and NONE from
+  //     ARGS 2) the widened bytes end at a visible ';' (statement boundary we
+  //     can see)
+  const std::string aT = StringRef(candA).trim().str();
+  const std::string bT = StringRef(candB).trim().str();
+
+  bool chooseB = false;
+  if (!aT.empty() && StringRef(bT).ends_with(aT)) {
+    // Extra-left tokens we introduce by widening.
+    const int extraLo = std::min(bLoTok, aLo);
+    const int extraHi = aLo;
+
+    auto inBody = [&](int pp) -> bool {
+      for (const auto &s : m.bodySpans) {
+        if (s.isValid() && pp >= s.begin && pp < s.end)
+          return true;
+      }
+      return false;
+    };
+
+    auto inArg = [&](int pp) -> bool {
+      for (const auto &s : m.argSpans) {
+        if (s.isValid() && pp >= s.begin && pp < s.end)
+          return true;
+      }
+      return false;
+    };
+
+    bool allExtraFromBodyNotArgs = true;
+    for (int pp = extraLo; pp < extraHi; ++pp) {
+      if (!inBody(pp) || inArg(pp)) {
+        allExtraFromBodyNotArgs = false;
+        break;
+      }
+    }
+
+    // Ensure the widened slice ends exactly at a ';' (ignoring trailing
+    // whitespace).
+    bool endsAtSemicolon = false;
+    if (bBHi > bBLo) {
+      int endByte = static_cast<int>(bBHi) - 1;
+      if (endByte >= 0 && static_cast<std::size_t>(endByte) < bSource_.size()) {
+        // Skip trailing spaces/tabs/newlines before testing last non-ws char.
+        while (endByte >= static_cast<int>(bBLo)) {
+          char ch = bSource_[static_cast<std::size_t>(endByte)];
+          if (ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n') {
+            endsAtSemicolon = (ch == ';');
+            break;
+          }
+          --endByte;
+        }
+      }
+    }
+
+    chooseB = allExtraFromBodyNotArgs && endsAtSemicolon;
+  }
+
+  trace("macro/patch", "DECIDE provenance: chooseB={0}",
+        chooseB ? "true" : "false");
+
+  const std::string &chosen = chooseB ? candB : candA;
+
+  debug("macro/patch", "FINAL chosen='{0}'",
+        stringutils::showWS(stringutils::clip(chosen, 160)));
+
+  return MacroPatch{m.getInvB(), m.getInvE(), chosen};
 }
 
 // =========== Include processing (normalize, materialize, apply) ===========
