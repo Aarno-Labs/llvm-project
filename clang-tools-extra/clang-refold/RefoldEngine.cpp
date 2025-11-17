@@ -214,7 +214,7 @@ std::string RefoldEngine::Refold() {
 
     // b) Macro call-site?
     if (auto *m = SmallestCoveringMacro(h.aStart, h.aEnd)) {
-      if (m->getInvB() != -1 && m->getInvE() != -1) {
+      if (m->GetInvB() != -1 && m->GetInvE() != -1) {
         debug("classify",
               "#{0} -> MACRO invText={1} owner={2} invFile={3} {4})", i,
               m->invText, m->ownerIncludeId, m->invFile, h);
@@ -647,8 +647,8 @@ bool RefoldEngine::MacroExpansionEnvelopeB(
   int hi = std::numeric_limits<int>::min();
   bool any = false;
 
-  auto addRange = [&](int lo, int hi) {
-    for (int pp = lo; pp < hi; ++pp) {
+  auto addRange = [&](int l, int h) {
+    for (int pp = l; pp < h; ++pp) {
       auto it = tokMapByPP.find(pp);
       if (it == tokMapByPP.end())
         continue;
@@ -670,14 +670,14 @@ bool RefoldEngine::MacroExpansionEnvelopeB(
 
   // BODY spans
   for (const auto &s : m.bodySpans) {
-    if (!s.isValid())
+    if (!s.IsValid())
       continue;
     addRange(s.begin, s.end);
   }
 
   // ARG spans
   for (const auto &s : m.argSpans) {
-    if (!s.isValid())
+    if (!s.IsValid())
       continue;
     addRange(s.begin, s.end);
   }
@@ -696,8 +696,8 @@ RefoldEngine::MacroPatch RefoldEngine::BuildMacroInvocationPatchWholeCover(
   debug("macro/patch",
         "BEGIN inv id={0} name={1} invFile={2} invB/E=[{3},{4}] "
         "coverA=[{5},{6}) hunkB=[{7},{8})",
-        m.id, m.name, m.invFile, m.invB, m.invE, m.cover.begin, m.cover.end,
-        h.bStart, h.bEnd);
+        m.id, m.name, m.invFile, m.GetInvB(), m.GetInvE(), m.cover.begin,
+        m.cover.end, h.bStart, h.bEnd);
 
   // Map A-cover → B using LCS A2B
   int bStartIdx = MapForwardToB(a2b, m.cover.begin);
@@ -709,7 +709,7 @@ RefoldEngine::MacroPatch RefoldEngine::BuildMacroInvocationPatchWholeCover(
           bEndIdxEx, h.bStart, h.bEnd,
           (h.bStart >= h.bEnd ? " → EMPTY" : " → use hunk"));
     if (h.bStart >= h.bEnd) {
-      return MacroPatch{m.getInvB(), m.getInvE(), std::string()};
+      return MacroPatch{m.GetInvB(), m.GetInvE(), std::string()};
     }
     bStartIdx = h.bStart;
     bEndIdxEx = h.bEnd - 1;
@@ -803,7 +803,7 @@ RefoldEngine::MacroPatch RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
     auto inBody = [&](int pp) -> bool {
       for (const auto &s : m.bodySpans) {
-        if (s.isValid() && pp >= s.begin && pp < s.end)
+        if (s.IsValid() && pp >= s.begin && pp < s.end)
           return true;
       }
       return false;
@@ -811,7 +811,7 @@ RefoldEngine::MacroPatch RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
     auto inArg = [&](int pp) -> bool {
       for (const auto &s : m.argSpans) {
-        if (s.isValid() && pp >= s.begin && pp < s.end)
+        if (s.IsValid() && pp >= s.begin && pp < s.end)
           return true;
       }
       return false;
@@ -854,7 +854,7 @@ RefoldEngine::MacroPatch RefoldEngine::BuildMacroInvocationPatchWholeCover(
   debug("macro/patch", "FINAL chosen='{0}'",
         stringutils::showWS(stringutils::clip(chosen, 160)));
 
-  return MacroPatch{m.getInvB(), m.getInvE(), chosen};
+  return MacroPatch{m.GetInvB(), m.GetInvE(), chosen};
 }
 
 // =========== Include processing (normalize, materialize, apply) ===========
