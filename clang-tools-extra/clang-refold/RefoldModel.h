@@ -133,16 +133,16 @@ public:
     int begin; // inclusive A-token index
     int end;   // exclusive A-token index
 
-    std::string toString() { return formatv("[{0},{1})", begin, end); }
+    std::string ToString() const { return formatv("[{0},{1})", begin, end); }
 
-    bool isValid() const { return begin >= 0 && end >= 0 && end > begin; }
+    bool IsValid() const { return begin >= 0 && end >= 0 && end > begin; }
   };
 
   struct PPCover {
     int begin; // inclusive
     int end;   // exclusive
 
-    void init(std::optional<int> coverBeginOpt, std::optional<int> coverEndOpt,
+    void Init(std::optional<int> coverBeginOpt, std::optional<int> coverEndOpt,
               const std::vector<PPSpan> &spans) noexcept {
       int cb = -1, ce = -1;
       if (coverBeginOpt && coverEndOpt) {
@@ -167,7 +167,7 @@ public:
       end = ce;
     }
 
-    bool covers(int aStart, int aEnd) const noexcept {
+    bool Covers(int aStart, int aEnd) const noexcept {
       return begin >= 0 && end >= 0 && begin <= aStart && aEnd <= end;
     }
   };
@@ -204,11 +204,11 @@ public:
           sitePath(std::move(sitePath)), siteB(siteB), siteE(siteE),
           target(std::move(target)), resolvedPath(std::move(resolvedPath)),
           angled(angled), parent(std::move(parent)), spans(std::move(spans)) {
-      cover.init(coverBegin, coverEnd, this->spans);
+      cover.Init(coverBegin, coverEnd, this->spans);
     }
 
-    bool covers(int aStart, int aEnd) const {
-      return cover.covers(aStart, aEnd);
+    bool Covers(int aStart, int aEnd) const {
+      return cover.Covers(aStart, aEnd);
     }
   };
 
@@ -239,14 +239,14 @@ public:
           bodySpans(std::move(bodySpans)), invText(std::move(invText)),
           invFile(std::move(invFile)), invB(std::move(invB)),
           invE(std::move(invE)), ownerIncludeId(std::move(ownerIncludeId)) {
-      cover.init(coverBegin, coverEnd, this->spans);
+      cover.Init(coverBegin, coverEnd, this->spans);
     }
 
-    int getInvB() const { return invB.has_value() ? *invB : -1; }
-    int getInvE() const { return invE.has_value() ? *invE : -1; }
+    int GetInvB() const { return invB.has_value() ? *invB : -1; }
+    int GetInvE() const { return invE.has_value() ? *invE : -1; }
 
-    bool covers(int aStart, int aEnd) const {
-      return cover.covers(aStart, aEnd);
+    bool Covers(int aStart, int aEnd) const {
+      return cover.Covers(aStart, aEnd);
     }
   };
 
@@ -296,7 +296,7 @@ public:
     int bodyE;
     std::optional<bool> selected;
 
-    bool containsByte(int off) const { return bodyB <= off && off < bodyE; }
+    bool ContainsByte(int off) const { return bodyB <= off && off < bodyE; }
   };
 
   struct CondGroup {

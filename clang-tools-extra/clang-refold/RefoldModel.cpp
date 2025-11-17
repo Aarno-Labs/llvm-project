@@ -796,7 +796,7 @@ RefoldModel::FindArmRefForByte(StringRef file,
   for (const CondGroup *group : GetCondGroups(file, parentIncludeId)) {
     if (group->groupB <= byteOffset && byteOffset < group->groupE) {
       for (const CondArm &arm : group->arms) {
-        if (arm.containsByte(byteOffset))
+        if (arm.ContainsByte(byteOffset))
           return ArmRef{group, &arm};
       }
     }
