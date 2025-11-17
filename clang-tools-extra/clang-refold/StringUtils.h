@@ -190,6 +190,30 @@ inline std::string clip(StringRef s, int n) {
   return (s.substr(0, n) + "…(" + std::to_string(s.size()) + ")").str();
 }
 
+inline std::string trimEdgeSpaces(StringRef s) {
+  std::size_t lo = 0;
+  std::size_t hi = s.size();
+
+  while (lo < hi) {
+    char c = s[lo];
+    if (c != ' ' && c != '\t')
+      break;
+    ++lo;
+  }
+
+  while (hi > lo) {
+    char c = s[hi - 1];
+    if (c != ' ' && c != '\t')
+      break;
+    --hi;
+  }
+
+  if (lo == 0 && hi == s.size())
+    return s.str(); // no trimming needed; copy whole string
+
+  return s.substr(lo, hi - lo).str(); // copy trimmed portion
+}
+
 } // namespace stringutils
 } // namespace refold
 } // namespace clang

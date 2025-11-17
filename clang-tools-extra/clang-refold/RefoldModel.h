@@ -134,6 +134,8 @@ public:
     int end;   // exclusive A-token index
 
     std::string toString() { return formatv("[{0},{1})", begin, end); }
+
+    bool isValid() const { return begin >= 0 && end >= 0 && end > begin; }
   };
 
   struct PPCover {
@@ -215,6 +217,8 @@ public:
     std::string subkind; // "func" | "obj"
     std::string name;
     std::vector<PPSpan> spans; // expansion coverage (A tokens)
+    std::vector<PPSpan> argSpans;
+    std::vector<PPSpan> bodySpans;
     std::optional<std::string> invText;
     std::optional<std::string> invFile;
     std::optional<int> invB;
@@ -226,10 +230,13 @@ public:
                     std::optional<std::string> invText,
                     std::optional<std::string> invFile, std::optional<int> invB,
                     std::optional<int> invE, std::optional<int> ownerIncludeId,
-                    std::vector<PPSpan> spans, std::optional<int> coverBegin,
+                    std::vector<PPSpan> spans, std::vector<PPSpan> argSpans,
+                    std::vector<PPSpan> bodySpans,
+                    std::optional<int> coverBegin,
                     std::optional<int> coverEnd) noexcept
         : id(id), subkind(std::move(subkind)), name(std::move(name)),
-          spans(std::move(spans)), invText(std::move(invText)),
+          spans(std::move(spans)), argSpans(std::move(argSpans)),
+          bodySpans(std::move(bodySpans)), invText(std::move(invText)),
           invFile(std::move(invFile)), invB(std::move(invB)),
           invE(std::move(invE)), ownerIncludeId(std::move(ownerIncludeId)) {
       cover.init(coverBegin, coverEnd, this->spans);

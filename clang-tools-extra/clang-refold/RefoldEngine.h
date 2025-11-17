@@ -530,6 +530,36 @@ private:
     return p;
   }
 
+  /// Computes a B-side preprocessor token envelope `[begin, end)` for a macro
+  /// invocation.
+  ///
+  /// The envelope is the minimal half-open token range on the B-side covering
+  /// the union of the macro invocation's **BODY spans** and **ARGUMENT spans**.
+  /// When `onlyInvFile` is `true`, tokens are counted only if their
+  /// `TokMapEntry::File` equals `m.InvFile`; otherwise, tokens from *any* file
+  /// are eligible (useful when macro body tokens originate from headers).
+  ///
+  /// Implementation details:
+  ///   - Walks all BODY and ARG spans in `m`.
+  ///   - For each preprocessor token index `pp` in a span, looks up
+  ///     `M.tokmapByPP[pp]` and (optionally) filters by `InvFile`.
+  ///   - Tracks the minimal `begin` and maximal `end` (exclusive) token index
+  ///   seen.
+  ///
+  /// Returns `false` if no eligible tokens were found (e.g., spans are
+  /// empty/invalid, or all tokens were filtered out by `onlyInvFile`).
+  ///
+  /// @param m            The macro invocation whose BODY/ARG spans contribute
+  /// to the envelope.
+  /// @param onlyInvFile  If `true`, restrict tokens to those mapped to
+  /// `m.InvFile`;
+  ///                     if `false`, accept tokens regardless of file origin.
+  /// @param begin        (Output) Lowest qualifying B-token index.
+  /// @param end          (Output) Highest qualifying B-token index (exclusive).
+  /// @return `true` if an envelope was found, `false` otherwise.
+  bool MacroExpansionEnvelopeB(const RefoldModel::MacroInvocation &m,
+                               bool onlyInvFile, int &begin, int &end) const;
+
   /// \brief Build a macro replacement patch by splicing the macro’s B-side
   ///        expansion into the call site.
   ///
