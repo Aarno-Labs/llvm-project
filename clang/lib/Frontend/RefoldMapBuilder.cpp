@@ -236,10 +236,10 @@ scanTopLevelConds(llvm::StringRef Buf, llvm::StringRef FilePath) {
         CondArm A;
         A.Tag = Tag.str();
 
-        size_t condBeg = q +
-                         (Kind == DK_If ? 2
-                                        : (Kind == DK_Ifdef ? 5
-                                                             : 6)); // "if", "ifdef", "ifndef"
+        size_t condBeg =
+            q + (Kind == DK_If
+                     ? 2
+                     : (Kind == DK_Ifdef ? 5 : 6)); // "if", "ifdef", "ifndef"
         while (condBeg < eol && isSpace(Buf[condBeg]))
           ++condBeg;
         A.Cond = std::string(Buf.substr(condBeg, eol - condBeg));
@@ -607,6 +607,27 @@ void RefoldMapBuilder::onToken(const Token &Tok) {
   int ItemIdx = -1;
   SourceLocation L = Tok.getLocation();
 
+  // Precompute byte range in the spelling file of this token (main or header).
+  // We reuse this both for TokMap and for robust macro arg/body attribution.
+  std::string TokFile;
+  long long TokB = -1;
+  long long TokE = -1;
+  bool HasTokMap = false;
+  {
+    SourceLocation FL = SM.getFileLoc(L);
+    if (FL.isValid()) {
+      SourceLocation EndL =
+          Lexer::getLocForEndOfToken(FL, /*Offset=*/0, SM, Lang);
+      SourceLocation FEL = SM.getFileLoc(EndL);
+      if (FEL.isValid()) {
+        TokB = SM.getFileOffset(FL);
+        TokE = SM.getFileOffset(FEL);
+        TokFile = filePathForLocAbs(SM, FL, EmitAbsPaths); // e.g. "./e.h"
+        HasTokMap = true;
+      }
+    }
+  }
+
   // Prefer a macro item when the token is inside a macro expansion.
   if (SM.isMacroArgExpansion(L) || SM.isMacroBodyExpansion(L)) {
     SourceLocation Caller = SM.getImmediateMacroCallerLoc(L);
@@ -653,6 +674,36 @@ void RefoldMapBuilder::onToken(const Token &Tok) {
     // by the primary Spans via touchSpanForItem above.
   }
 
+  // 1b) Also attribute this token to any *enclosing* macro invocation in the
+  // same spelling file whose invocation byte range contains [TokB,TokE).
+  //
+  // This fixes cases where a function-like macro argument is itself a macro
+  // invocation (e.g., set_zero(..., BYTE4, ...)): the expanded token(s) are
+  // primarily attributed to the inner macro item, but still need to be recorded
+  // as argument tokens for the enclosing function-like macro.
+  if (HasTokMap && L.isMacroID()) {
+    for (size_t I = 0; I < Items.size(); ++I) {
+      if ((int)I == ItemIdx)
+        continue;
+      Item &MI = Items[I];
+      if (MI.Kind != IK_Macro)
+        continue;
+      if (MI.InvBegin < 0 || MI.InvEnd < 0)
+        continue;
+      if (MI.InvFile != TokFile)
+        continue;
+      if (MI.InvBegin <= TokB && TokE <= MI.InvEnd) {
+        long long NameEnd = MI.InvBegin + (long long)MI.Name.size();
+        // For function-like macros, anything after the name token is treated as
+        // originating from an argument spelling region. Otherwise, treat as body.
+        if (MI.Subkind == "func" && TokB >= NameEnd)
+          touchTokSpan(MI.ArgSpans, TokIndex);
+        else
+          touchTokSpan(MI.BodySpans, TokIndex);
+      }
+    }
+  }
+
   // 2) Grow all active include items transitively so a parent include
   //    covers its entire subtree (nested includes/macros).
   for (int idx : IncludeStack) {
@@ -661,24 +712,14 @@ void RefoldMapBuilder::onToken(const Token &Tok) {
     touchSpanForItem(idx, TokIndex);
   }
 
-  // 3) Capture byte range in the spelling file of this token (main or header).
-  {
-    SourceLocation FL = SM.getFileLoc(L);
-    if (FL.isValid()) {
-      SourceLocation EndL =
-          Lexer::getLocForEndOfToken(FL, /*Offset=*/0, SM, Lang);
-      SourceLocation FEL = SM.getFileLoc(EndL);
-      if (FEL.isValid()) {
-        long long B = SM.getFileOffset(FL);
-        long long E = SM.getFileOffset(FEL);
-        TokMapEntry M;
-        M.PPIndex = TokIndex;
-        M.SrcBegin = B;
-        M.SrcEnd = E;
-        M.File = filePathForLocAbs(SM, FL, EmitAbsPaths); // e.g. "./e.h"
-        TokMap.push_back(std::move(M));
-      }
-    }
+  // 3) Emit TokMap entry (reuse the precomputed spelling-file span).
+  if (HasTokMap) {
+    TokMapEntry M;
+    M.PPIndex = TokIndex;
+    M.SrcBegin = TokB;
+    M.SrcEnd = TokE;
+    M.File = TokFile;
+    TokMap.push_back(std::move(M));
   }
 
   ++TokIndex;
