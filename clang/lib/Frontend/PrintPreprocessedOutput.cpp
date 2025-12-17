@@ -1062,6 +1062,7 @@ void clang::DoPrintPreprocessedInput(Preprocessor &PP, raw_ostream *OS,
       void EndOfMainFile() override {
         // Finalize exactly once at end of processing.
         R->onEndOfStream();
+        R->finalizeIncludeDecls();
         R->writeJSON();
       }
     };
