@@ -63,6 +63,16 @@ struct TokenSpan {
   bool Open = false;
 };
 
+struct HeaderDecl {
+  std::string Kind;  // "function", "unknown", etc.
+  std::string Name;  // e.g. "first"
+  std::string File;  // header path for header_span.file
+  unsigned HeaderB = 0;
+  unsigned HeaderE = 0;
+  unsigned PPBegin = 0; // A-token index
+  unsigned PPEnd = 0;   // A-token index
+};
+
 /// Discriminates item category in the map: preprocessor directive, macro, or
 /// file pseudo-item (for TU-level token spans).
 enum ItemKind { IK_Directive, IK_Macro, IK_File };
@@ -81,6 +91,7 @@ struct Item {
   std::vector<TokenSpan> Spans;
   std::vector<TokenSpan> ArgSpans;   // tokens from any actual arguments
   std::vector<TokenSpan> BodySpans;  // tokens from the macro body
+  std::vector<HeaderDecl> Decls;
 
   // main-file byte range of the macro invocation (if applicable)
   long long InvBegin = -1;
@@ -206,6 +217,27 @@ class RefoldMapBuilder {
   /// \returns a path string appropriate for emission.
   static std::string filePathForLocAbs(clang::SourceManager &SM,
                                        clang::SourceLocation L, bool WantAbs);
+
+  void addHeaderDecl(Item &Inc, StringRef Kind, StringRef Name,
+                     StringRef HeaderFile, unsigned HeaderB,
+                     unsigned HeaderE, unsigned PPBegin, unsigned PPEnd) {
+    HeaderDecl D;
+    D.Kind = Kind.str();
+    D.Name = Name.str();
+    D.File = HeaderFile.str();
+    D.HeaderB = HeaderB;
+    D.HeaderE = HeaderE;
+    D.PPBegin = PPBegin;
+    D.PPEnd = PPEnd;
+    Inc.Decls.push_back(std::move(D));
+  }
+
+  void addHeaderDecl(Item &Inc, StringRef Name, StringRef HeaderFile,
+                     unsigned HeaderB, unsigned HeaderE, unsigned PPBegin,
+                     unsigned PPEnd) {
+    addHeaderDecl(Inc, "unknown", Name, HeaderFile, HeaderB, HeaderE,
+                  PPBegin, PPEnd);
+  }
 
 public:
   /// Construct a builder bound to a preprocessor and an output path.
@@ -338,6 +370,8 @@ public:
       for (auto &S : It.Spans)
         S.Open = false;
   }
+
+  void finalizeIncludeDecls();
 
   /// Serialize the accumulated map as JSON to `OutPath`.
   ///

@@ -127,11 +127,29 @@ std::pair<size_t, size_t> lineSpanOf(StringRef S, size_t p) {
 /// \note This routine deliberately avoids any heuristic guessing and is fully
 ///       deterministic: the same input buffer always produces the same groups.
 /// \sa CondGroup, CondArm
-std::vector<CondGroup> scanTopLevelConds(llvm::StringRef Buf,
-                                         llvm::StringRef FilePath) {
-  std::vector<CondGroup> out;
+static std::vector<CondGroup>
+scanTopLevelConds(llvm::StringRef Buf, llvm::StringRef FilePath) {
+  std::vector<CondGroup> Groups;
   const size_t N = Buf.size();
   size_t p = 0;
+
+  auto lineSpanOf = [&](llvm::StringRef B, size_t Off) -> std::pair<size_t, size_t> {
+    if (Off >= B.size())
+      return {B.size(), B.size()};
+    size_t bol = Off;
+    while (bol > 0 && B[bol - 1] != '\n')
+      --bol;
+    size_t eol = Off;
+    while (eol < B.size() && B[eol] != '\n')
+      ++eol;
+    if (eol < B.size())
+      ++eol; // include newline
+    return {bol, eol};
+  };
+
+  auto isSpace = [](char c) -> bool {
+    return c == ' ' || c == '\t' || c == '\r' || c == '\f' || c == '\v';
+  };
 
   auto kw_at = [&](size_t start, size_t eol, const char *s) -> bool {
     size_t t = start, k = 0;
@@ -149,153 +167,171 @@ std::vector<CondGroup> scanTopLevelConds(llvm::StringRef Buf,
     return true;
   };
 
+  // Helper to close the current arm body for a group up to 'endAt'.
+  auto setPrevBodyEnd = [&](int groupIndex, size_t endAt) {
+    if (groupIndex < 0 || groupIndex >= (int)Groups.size())
+      return;
+    auto &G = Groups[groupIndex];
+    if (!G.Arms.empty() && G.Arms.back().BodyE == G.Arms.back().BodyB)
+      G.Arms.back().BodyE = endAt;
+  };
+
+  struct Active {
+    int GroupIndex;
+  };
+  std::vector<Active> Stack;
+
   while (p < N) {
     auto span = lineSpanOf(Buf, p);
     size_t bol = span.first, eol = span.second;
     if (eol <= bol) {
-      ++p;
-      continue;
-    } // zero-length/degenerate line
+      p = std::min(N, eol + 1);
+      continue; // empty/degenerate line
+    }
 
     size_t s = bol;
     while (s < eol && isSpace(Buf[s]))
       ++s;
 
-    // Start of a conditional group?
     if (s < eol && Buf[s] == '#') {
       size_t q = s + 1;
       while (q < eol && isSpace(Buf[q]))
         ++q;
 
-      bool starts = false;
-      llvm::StringRef startTag;
+      enum DirKind { DK_None, DK_If, DK_Ifdef, DK_Ifndef, DK_Elif, DK_Else, DK_Endif };
+      DirKind Kind = DK_None;
+      llvm::StringRef Tag;
+
       if (kw_at(q, eol, "if")) {
-        starts = true;
-        startTag = "if";
+        Kind = DK_If;
+        Tag = "if";
       } else if (kw_at(q, eol, "ifdef")) {
-        starts = true;
-        startTag = "ifdef";
+        Kind = DK_Ifdef;
+        Tag = "ifdef";
       } else if (kw_at(q, eol, "ifndef")) {
-        starts = true;
-        startTag = "ifndef";
+        Kind = DK_Ifndef;
+        Tag = "ifndef";
+      } else if (kw_at(q, eol, "elif")) {
+        Kind = DK_Elif;
+        Tag = "elif";
+      } else if (kw_at(q, eol, "else")) {
+        Kind = DK_Else;
+        Tag = "else";
+      } else if (kw_at(q, eol, "endif")) {
+        Kind = DK_Endif;
+        Tag = "endif";
       }
 
-      if (starts) {
+      switch (Kind) {
+      case DK_If:
+      case DK_Ifdef:
+      case DK_Ifndef: {
+        // Starting a new conditional group (top-level or nested).
         CondGroup G;
         G.File = FilePath.str();
-        G.GroupB = bol;
+        G.GroupB = bol;       // from '#' of opener
+        G.GroupE = G.GroupB;  // will be filled at #endif
 
         // First arm (#if/ifdef/ifndef)
         CondArm A;
-        A.Tag = startTag.str();
-        size_t condBeg = q + (A.Tag == "if" ? 2 : A.Tag == "ifdef" ? 5 : 6);
+        A.Tag = Tag.str();
+
+        size_t condBeg = q +
+                         (Kind == DK_If ? 2
+                                        : (Kind == DK_Ifdef ? 5
+                                                             : 6)); // "if", "ifdef", "ifndef"
         while (condBeg < eol && isSpace(Buf[condBeg]))
           ++condBeg;
         A.Cond = std::string(Buf.substr(condBeg, eol - condBeg));
+        A.BodyB = std::min(N, eol); // body starts after this line
+        A.BodyE = A.BodyB;
+        G.Arms.push_back(std::move(A));
+
+        int idx = (int)Groups.size();
+        Groups.push_back(std::move(G));
+
+        // Any outer group should have its current arm body end before this '#if'.
+        if (!Stack.empty())
+          setPrevBodyEnd(Stack.back().GroupIndex, bol);
+
+        Stack.push_back(Active{idx});
+
+        p = std::min(N, eol);
+        continue;
+      }
+
+      case DK_Elif:
+      case DK_Else: {
+        if (Stack.empty()) {
+          p = std::min(N, eol);
+          continue; // stray elif/else
+        }
+
+        int idx = Stack.back().GroupIndex;
+        CondGroup &G = Groups[idx];
+
+        // Close previous arm at the start of this line.
+        setPrevBodyEnd(idx, bol);
+
+        CondArm A;
+        A.Tag = Tag.str();
+        if (Kind == DK_Elif) {
+          size_t condBeg = q + 4; // "elif"
+          while (condBeg < eol && isSpace(Buf[condBeg]))
+            ++condBeg;
+          A.Cond = std::string(Buf.substr(condBeg, eol - condBeg));
+        } else {
+          A.Cond.clear(); // "else" has no condition text
+        }
         A.BodyB = std::min(N, eol);
         A.BodyE = A.BodyB;
         G.Arms.push_back(std::move(A));
 
-        // Walk to the peer #endif, handling nesting.
-        size_t r = std::min(N, eol);
-        size_t last_r = ~size_t(0);
-        int depth = 0;
-        bool closed = false;
-
-        auto setPrevBodyEnd = [&](size_t endAt) {
-          if (!G.Arms.empty() && G.Arms.back().BodyE == G.Arms.back().BodyB)
-            G.Arms.back().BodyE = endAt;
-        };
-
-        while (r < N) {
-          auto span2 = lineSpanOf(Buf, r);
-          size_t bol2 = span2.first, eol2 = span2.second;
-          if (eol2 <= bol2) {
-            r = std::min(N, r + 1);
-            continue;
-          }
-
-          size_t s2 = bol2;
-          while (s2 < eol2 && isSpace(Buf[s2]))
-            ++s2;
-
-          if (s2 < eol2 && Buf[s2] == '#') {
-            size_t t = s2 + 1;
-            while (t < eol2 && isSpace(Buf[t]))
-              ++t;
-
-            // Nested open?
-            if (kw_at(t, eol2, "if") || kw_at(t, eol2, "ifdef") ||
-                kw_at(t, eol2, "ifndef")) {
-              ++depth;
-              r = std::min(N, eol2);
-            }
-            // Peer close?
-            else if (kw_at(t, eol2, "endif")) {
-              if (depth > 0) {
-                --depth;
-                r = std::min(N, eol2);
-              } else {
-                setPrevBodyEnd(bol2);
-                G.GroupE = std::min(N, eol2);
-                out.push_back(std::move(G));
-                r = std::min(N, eol2);
-                closed = true;
-                break;
-              }
-            }
-            // Peer elif/else at depth 0
-            else if (depth == 0 && kw_at(t, eol2, "elif")) {
-              setPrevBodyEnd(bol2);
-              CondArm B;
-              B.Tag = "elif";
-              size_t condS = t + 4;
-              while (condS < eol2 && isSpace(Buf[condS]))
-                ++condS;
-              B.Cond = std::string(Buf.substr(condS, eol2 - condS));
-              B.BodyB = std::min(N, eol2);
-              B.BodyE = B.BodyB;
-              G.Arms.push_back(std::move(B));
-              r = std::min(N, eol2);
-            } else if (depth == 0 && kw_at(t, eol2, "else")) {
-              setPrevBodyEnd(bol2);
-              CondArm B;
-              B.Tag = "else";
-              B.BodyB = std::min(N, eol2);
-              B.BodyE = B.BodyB;
-              G.Arms.push_back(std::move(B));
-              r = std::min(N, eol2);
-            } else {
-              r = std::min(N, eol2); // some other directive -> next line
-            }
-          } else {
-            r = std::min(N, eol2); // non-pp line -> next
-          }
-
-          // progress guard
-          if (r == last_r)
-            r = std::min(N, r + 1);
-          last_r = r;
-        }
-
-        // Unterminated group (missing #endif): close at EOF so we don't stall.
-        if (!closed) {
-          setPrevBodyEnd(N);
-          G.GroupE = N;
-          out.push_back(std::move(G));
-        }
-
-        // Continue outer scan after the group
-        p = std::min(N, r);
+        p = std::min(N, eol);
         continue;
+      }
+
+      case DK_Endif: {
+        if (Stack.empty()) {
+          p = std::min(N, eol);
+          continue; // stray endif
+        }
+
+        int idx = Stack.back().GroupIndex;
+        CondGroup &G = Groups[idx];
+
+        // Close the last arm at start of this '#endif' line.
+        setPrevBodyEnd(idx, bol);
+        // Group extends through the end of this line.
+        G.GroupE = std::min(N, eol);
+
+        Stack.pop_back();
+
+        p = std::min(N, eol);
+        continue;
+      }
+
+      case DK_None:
+        break;
       }
     }
 
-    // Not a group opener -> next line
+    // Non-directive line; just advance.
     p = std::min(N, eol);
   }
 
-  return out;
+  // If file ended without closing some groups, close them at EOF.
+  for (const auto &A : Stack) {
+    int idx = A.GroupIndex;
+    if (idx < 0 || idx >= (int)Groups.size())
+      continue;
+    CondGroup &G = Groups[idx];
+    setPrevBodyEnd(idx, N);
+    if (G.GroupE < G.GroupB || G.GroupE > N)
+      G.GroupE = N;
+  }
+
+  return Groups;
 }
 } // namespace
 
@@ -648,6 +684,190 @@ void RefoldMapBuilder::onToken(const Token &Tok) {
   ++TokIndex;
 }
 
+void RefoldMapBuilder::finalizeIncludeDecls() {
+  if (!enabled())
+    return;
+
+  // Cache header file buffers so we only hit the filesystem once per path.
+  llvm::StringMap<std::unique_ptr<llvm::MemoryBuffer>> FileBufCache;
+
+  auto getHeaderBuffer = [&](llvm::StringRef Path) -> llvm::StringRef {
+    auto It = FileBufCache.find(Path);
+    if (It != FileBufCache.end())
+      return It->second->getBuffer();
+
+    auto MBOrErr = llvm::MemoryBuffer::getFile(Path);
+    if (!MBOrErr)
+      return llvm::StringRef();
+
+    std::unique_ptr<llvm::MemoryBuffer> MB = std::move(*MBOrErr);
+    llvm::StringRef Buf = MB->getBuffer();
+    FileBufCache[Path] = std::move(MB);
+    return Buf;
+  };
+
+  auto isIdentLike = [](llvm::StringRef S) -> bool {
+    if (S.empty())
+      return false;
+    auto isLetter = [](char c) {
+      return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+    };
+    auto isDigit = [](char c) { return (c >= '0' && c <= '9'); };
+
+    char c0 = S.front();
+    if (!(isLetter(c0) || c0 == '_'))
+      return false;
+    for (char c : S.drop_front()) {
+      if (!(isLetter(c) || isDigit(c) || c == '_'))
+        return false;
+    }
+    return true;
+  };
+
+  for (Item &It : Items) {
+    // Only consider include directives that resolved to a real header.
+    if (It.Kind != IK_Directive)
+      continue;
+    if (It.Subkind != "#include" && It.Subkind != "#include_next")
+      continue;
+
+    // Already populated (e.g. if we re-run for some reason)?
+    if (!It.Decls.empty())
+      continue;
+
+    if (It.ResolvedPath.empty())
+      continue;
+
+    llvm::StringRef HeaderPath(It.ResolvedPath);
+
+    // Collect all PP token indices that:
+    //  - are in this include's spans, and
+    //  - originate from the resolved header file.
+    llvm::SmallVector<unsigned, 64> PPIdxs;
+    for (const TokenSpan &S : It.Spans) {
+      if (S.Open)
+        continue;
+      uint64_t B = S.Begin;
+      uint64_t E = S.End;
+      if (E > TokMap.size())
+        E = TokMap.size();
+
+      for (uint64_t PP = B; PP < E; ++PP) {
+        const TokMapEntry &TM = TokMap[PP];
+        if (TM.File == HeaderPath.str())
+          PPIdxs.push_back(static_cast<unsigned>(PP));
+      }
+    }
+
+    if (PPIdxs.empty())
+      continue;
+
+    // Sort and deduplicate in case spans overlap.
+    std::sort(PPIdxs.begin(), PPIdxs.end());
+    PPIdxs.erase(std::unique(PPIdxs.begin(), PPIdxs.end()), PPIdxs.end());
+
+    // Get the header file buffer.
+    llvm::StringRef HBuf = getHeaderBuffer(HeaderPath);
+    if (HBuf.empty())
+      continue;
+
+    // Emit one HeaderDecl for PPIdxs[StartIdx..EndIdx-1].
+    auto flushDecl = [&](unsigned StartIdx, unsigned EndIdx) {
+      if (StartIdx >= EndIdx || EndIdx > PPIdxs.size())
+        return;
+
+      unsigned PPBegin = PPIdxs[StartIdx];
+      unsigned PPEnd   = PPIdxs[EndIdx - 1] + 1; // half-open
+      if (PPBegin >= PPEnd || PPEnd > TokMap.size())
+        return;
+
+      const TokMapEntry &First = TokMap[PPBegin];
+      const TokMapEntry &Last  = TokMap[PPEnd - 1];
+
+      unsigned HeaderB = static_cast<unsigned>(First.SrcBegin);
+      unsigned HeaderE = static_cast<unsigned>(Last.SrcEnd);
+
+      // --- Determine "kind" and "name" deterministically. ---
+
+      llvm::StringRef Kind = "unknown";
+      llvm::StringRef Name;
+
+      llvm::StringRef LastIdentBeforeParen;
+      llvm::StringRef LastIdentBeforeSemi;
+      bool SawLParen = false;
+
+      for (unsigned I = StartIdx; I < EndIdx; ++I) {
+        unsigned PP = PPIdxs[I];
+        const TokMapEntry &TM = TokMap[PP];
+        if (TM.File != HeaderPath.str())
+          continue;
+
+        llvm::StringRef TokText =
+            HBuf.slice(static_cast<size_t>(TM.SrcBegin),
+                       static_cast<size_t>(TM.SrcEnd));
+        llvm::StringRef Trimmed = TokText.trim();
+        if (Trimmed.empty())
+          continue;
+
+        // Track identifiers as we go.
+        if (isIdentLike(Trimmed)) {
+          LastIdentBeforeSemi = Trimmed;
+          if (!SawLParen)
+            LastIdentBeforeParen = Trimmed;
+        }
+
+        // Opening paren: we are entering parameter / declarator list.
+        if (Trimmed.contains('(')) {
+          SawLParen = true;
+        }
+
+        // Semicolon ends the simple-declaration.
+        if (Trimmed.contains(';')) {
+          break;
+        }
+      }
+
+      if (SawLParen && !LastIdentBeforeParen.empty()) {
+        // Treat as a function-like declaration.
+        Kind = "function";
+        Name = LastIdentBeforeParen;
+      } else if (!LastIdentBeforeSemi.empty()) {
+        // Some other simple declaration; give it a best-effort name.
+        Kind = "unknown";
+        Name = LastIdentBeforeSemi;
+      } else {
+        // No useful identifier; give it a placeholder.
+        Kind = "unknown";
+        Name = "<decl>";
+      }
+
+      addHeaderDecl(It, Kind, Name, HeaderPath, HeaderB, HeaderE,
+                    PPBegin, PPEnd);
+    };
+
+    // Walk tokens from the header, splitting at ';' in header text.
+    unsigned Start = 0;
+    for (unsigned I = 0; I < PPIdxs.size(); ++I) {
+      unsigned PP = PPIdxs[I];
+      const TokMapEntry &TM = TokMap[PP];
+      if (TM.File != HeaderPath.str())
+        continue;
+
+      llvm::StringRef TokText =
+          HBuf.slice(static_cast<size_t>(TM.SrcBegin),
+                     static_cast<size_t>(TM.SrcEnd));
+
+      // Any token whose slice contains ';' terminates a decl.
+      if (TokText.contains(';')) {
+        flushDecl(Start, I + 1);
+        Start = I + 1;
+      }
+    }
+
+    // Any trailing tokens without a ';' are ignored for now.
+  }
+}
+
 void RefoldMapBuilder::writeJSON() {
   if (!enabled())
     return;
@@ -715,6 +935,28 @@ void RefoldMapBuilder::writeJSON() {
             }
             if (!Path.empty())
               JO.attribute("site_path", Path);
+
+            if (It.Subkind == "#include" || It.Subkind == "#include_next") {
+              if (!It.Decls.empty()) {
+                JO.attributeArray("decls", [&] {
+                  for (const auto &D : It.Decls) {
+                    JO.object([&] {
+                      JO.attribute("kind", D.Kind);
+                      JO.attribute("name", D.Name);
+                      JO.attributeObject("header_span", [&] {
+                        JO.attribute("file", D.File);
+                        JO.attribute("b", D.HeaderB);
+                        JO.attribute("e", D.HeaderE);
+                      });
+                      JO.attributeObject("pp_span", [&] {
+                        JO.attribute("begin", D.PPBegin);
+                        JO.attribute("end", D.PPEnd);
+                      });
+                    });
+                  }
+                });
+              }
+            }
           }
 
           // Include-site anchors and structure for partial refolding.
@@ -786,6 +1028,266 @@ void RefoldMapBuilder::writeJSON() {
         });
       }
     });
+
+    // Collect per-arm slot seeds so we can emit "arm_begin"/"arm_end" slots
+    // later.
+    struct ArmSlotSeed {
+      std::string File;
+      int ArmId;
+      long long BodyB;
+      long long BodyE;
+      int OwnerIncludeId; // -1 => no owning include (TU)
+    };
+
+    std::vector<ArmSlotSeed> ArmSlotSeeds;
+
+    int NextCondGroupId = 0;
+    int NextCondArmId = 0;
+
+// conds...
+JO.attributeArray("conds", [&] {
+  // Compute a PPSpan [PPBegin, PPEnd) for a byte range [BodyB, BodyE)
+  // within a given source file, using TokMap (which is in PP order).
+  //
+  // Return value:
+  //   - true  => at least one PP token from this file overlapped [BodyB,BodyE)
+  //             (we treat the arm as "selected" for this run).
+  //   - false => no such token; PPBegin/PPEnd will still be set to a
+  //             deterministic insertion point, but the arm is not selected.
+  auto computeArmPPSpan = [&](llvm::StringRef File,
+                              unsigned BodyB, unsigned BodyE,
+                              unsigned &PPBegin, unsigned &PPEnd) -> bool {
+    bool FoundAny = false;
+    unsigned Begin = 0;
+    unsigned End = 0;
+
+    // Normal case: collect all PP tokens whose source span overlaps [BodyB, BodyE).
+    for (const TokMapEntry &TM : TokMap) {
+      if (TM.File != File)
+        continue;
+
+      // No overlap if token ends at/before BodyB, or starts at/after BodyE.
+      if (TM.SrcEnd <= static_cast<long long>(BodyB) ||
+          TM.SrcBegin >= static_cast<long long>(BodyE))
+        continue;
+
+      unsigned PP = static_cast<unsigned>(TM.PPIndex);
+      if (!FoundAny) {
+        Begin = PP;
+        FoundAny = true;
+      }
+      // TokMap is in PP order, so this monotonically increases.
+      End = PP + 1;
+    }
+
+    if (!FoundAny) {
+      // Degenerate / empty body case: pick a deterministic insertion point.
+      //
+      // We choose the first PP index whose SrcBegin >= BodyE as the insertion
+      // point; if none, we fall back to "after the last token" for this file;
+      // if the file has no tokens at all, we use 0.
+      bool AnyForFile = false;
+      bool InsertSet = false;
+      unsigned Insert = 0;
+
+      for (const TokMapEntry &TM : TokMap) {
+        if (TM.File != File)
+          continue;
+        AnyForFile = true;
+
+        if (!InsertSet) {
+          if (TM.SrcBegin >= static_cast<long long>(BodyE)) {
+            Insert = static_cast<unsigned>(TM.PPIndex);
+            InsertSet = true;
+            break;
+          }
+
+          // Track "just after" the last token strictly before BodyB.
+          if (TM.SrcEnd <= static_cast<long long>(BodyB))
+            Insert = static_cast<unsigned>(TM.PPIndex + 1);
+        }
+      }
+
+      if (!AnyForFile) {
+        Insert = 0;
+      } else if (!InsertSet) {
+        // All tokens are before BodyE; Insert already holds "last + 1".
+      }
+
+      Begin = Insert;
+      End = Insert;
+    }
+
+    PPBegin = Begin;
+    PPEnd   = End;
+    return FoundAny;
+  };
+
+  // Helper: emit all conditional groups for a single file (TU or header),
+  // computing the enclosing *arm* parent (if any) and per-arm selected/pp_span.
+  auto emitGroups = [&](llvm::StringRef FilePath, int parentIncId,
+                        bool isTU) {
+    llvm::StringRef Buf;
+
+    // Prefer SourceManager buffers (handles VFS and remaps).
+    if (!FilePath.empty()) {
+      if (auto FER = SM.getFileManager().getOptionalFileRef(FilePath)) {
+        FileID FID = SM.translateFile(*FER); // FileID, not Optional
+        if (FID.isValid()) {
+          if (auto MB = SM.getBufferOrNone(FID))
+            Buf = MB->getBuffer(); // Optional<MemoryBufferRef> -> MB->getBuffer()
+        }
+      }
+    }
+
+    // Fallback to filesystem read.
+    if (Buf.empty() && !FilePath.empty()) {
+      if (auto MB = llvm::MemoryBuffer::getFile(FilePath))
+        Buf = (*MB)->getMemBufferRef().getBuffer();
+    }
+    if (Buf.empty())
+      return;
+
+    auto Groups = scanTopLevelConds(Buf, FilePath);
+    llvm::errs() << "[refold] conds: "
+                 << (isTU ? "TU " : "") << FilePath
+                 << " -> " << Groups.size() << " group(s)\n";
+
+    for (const auto &G : Groups) {
+      if (G.Arms.empty())
+        continue;
+
+      const long long GroupB = static_cast<long long>(G.GroupB);
+      const long long GroupE = static_cast<long long>(G.GroupE);
+
+      // Find the innermost arm (if any) that textually contains this group.
+      // We restrict to the same file + include-instance (parentIncId).
+      int ParentArmId = -1;
+      long long ParentArmBodyB = 0;
+      bool HaveParent = false;
+      for (const auto &Seed : ArmSlotSeeds) {
+        if (Seed.File != G.File)
+          continue;
+        if (Seed.OwnerIncludeId != parentIncId)
+          continue;
+
+        if (Seed.BodyB <= GroupB && GroupE <= Seed.BodyE) {
+          if (!HaveParent || Seed.BodyB >= ParentArmBodyB) {
+            HaveParent = true;
+            ParentArmBodyB = Seed.BodyB;
+            ParentArmId = Seed.ArmId;
+          }
+        }
+      }
+
+      int ThisGroupId = NextCondGroupId++;
+      JO.object([&] {
+        JO.attribute("id", ThisGroupId);
+        JO.attribute("file", G.File);
+
+        // parent = enclosing *arm* id, or null for top-level.
+        if (HaveParent)
+          JO.attribute("parent_arm_id", ParentArmId);
+        else
+          JO.attribute("parent_arm_id", nullptr);
+
+        JO.attribute("group_b",
+                     static_cast<uint64_t>(G.GroupB));
+        JO.attribute("group_e",
+                     static_cast<uint64_t>(G.GroupE));
+
+        if (parentIncId >= 0)
+          JO.attribute("parent_include_id",
+                       static_cast<int64_t>(parentIncId));
+        else
+          JO.attribute("parent_include_id", nullptr);
+
+        // *** NEW: single-arm groups get their arm body widened to the full group
+        // range, so nested groups + trailing text are counted as part of that arm.
+        const bool SingleArmGroup = (G.Arms.size() == 1);
+
+        JO.attributeArray("arms", [&] {
+          for (const auto &A : G.Arms) {
+            // Compute the effective body range we will use for:
+            //  - computing pp_span (which tokens belong to this arm), and
+            //  - parent lookup for nested groups (ArmSlotSeeds).
+            long long ArmBodyB = static_cast<long long>(A.BodyB);
+            long long ArmBodyE = static_cast<long long>(A.BodyE);
+
+            if (SingleArmGroup) {
+              // For #ifdef FOO ... #endif with no #else/#elif, the *entire*
+              // group body belongs to this single arm, including any nested
+              // conditionals and trailing lines before the closing #endif.
+              //
+              // We widen the body to [GroupB, GroupE) on the right, which:
+              //  - makes pp_span for the outer arm cover all PP tokens
+              //    produced under FOO, and
+              //  - ensures nested groups' [GroupB,GroupE) fall inside this
+              //    arm's [BodyB,BodyE) so they can correctly pick this as
+              //    their parent arm.
+              ArmBodyE = GroupE;
+            }
+
+            int ArmId = NextCondArmId++;
+
+            unsigned PPBegin = 0, PPEnd = 0;
+            bool IsSelected = computeArmPPSpan(
+                G.File,
+                static_cast<unsigned>(ArmBodyB),
+                static_cast<unsigned>(ArmBodyE),
+                PPBegin, PPEnd);
+
+            JO.object([&] {
+              JO.attribute("id", ArmId);
+              JO.attribute("tag", A.Tag);
+              if (!A.Cond.empty())
+                JO.attribute("cond", A.Cond);
+              JO.attribute("body_b",
+                           static_cast<uint64_t>(ArmBodyB));
+              JO.attribute("body_e",
+                           static_cast<uint64_t>(ArmBodyE));
+
+              // Mark whether this arm actually contributed any PP tokens
+              // in this preprocessing run.
+              JO.attribute("selected", IsSelected);
+
+              // Only emit pp_span for the taken arm; for untaken arms we
+              // leave it out entirely.
+              if (IsSelected) {
+                JO.attributeObject("pp_span", [&] {
+                  JO.attribute("begin", PPBegin);
+                  JO.attribute("end", PPEnd);
+                });
+              }
+            });
+
+            // Remember where this arm's body lives, so we can:
+            //  - resolve nested groups' parents deterministically, and
+            //  - emit arm_begin/arm_end slots later.
+            ArmSlotSeeds.push_back(
+                ArmSlotSeed{G.File,
+                            ArmId,
+                            ArmBodyB,
+                            ArmBodyE,
+                            parentIncId});
+          }
+        });
+      });
+    }
+  };
+
+  // 1) Main translation unit groups.
+  emitGroups(TUAbsPath, /*parentIncId=*/-1, /*isTU=*/true);
+
+  // 2) Each include/include_next instance (per-instance, no dedup).
+  for (const auto &It : Items) {
+    if (!(It.Subkind == "#include" || It.Subkind == "#include_next"))
+      continue;
+    if (It.ResolvedPath.empty())
+      continue;
+    emitGroups(It.ResolvedPath, It.ID, /*isTU=*/false);
+  }
+});
 
     // slots...
     JO.attributeArray("slots", [&] {
@@ -897,109 +1399,22 @@ void RefoldMapBuilder::writeJSON() {
           }
         }
       }
-    });
 
-    int NextCondGroupId = 0;
-    int NextCondArmId = 0;
+      // arm_begin / arm_end slots for each conditional arm body
+      for (const auto &AS : ArmSlotSeeds) {
+        // TU-local arms will have OwnerIncludeId == -1, so we omit
+        // owner_include_id.
+        int ownerId = AS.OwnerIncludeId; // -1 => no owner_include_id
 
-    // conds...
-    JO.attributeArray("conds", [&] {
-      auto emitGroups = [&](llvm::StringRef FilePath, int parentIncId) {
-        llvm::StringRef Buf;
+        // Begin of the arm body
+        emitPoint(AS.File, AS.BodyB, "arm_begin",
+                  /*ref=*/AS.ArmId,
+                  /*owner=*/ownerId);
 
-        // Prefer SourceManager buffers (handles VFS and remaps).
-        if (!FilePath.empty()) {
-          if (auto FER = SM.getFileManager().getOptionalFileRef(FilePath)) {
-            FileID FID = SM.translateFile(*FER); // FileID, not Optional
-            if (FID.isValid()) {
-              if (auto MB = SM.getBufferOrNone(FID))
-                Buf = MB->getBuffer(); // Optional<MemoryBufferRef> ->
-                                       // MB->getBuffer()
-            }
-          }
-        }
-
-        // Fallback to filesystem read.
-        if (Buf.empty() && !FilePath.empty()) {
-          if (auto MB = llvm::MemoryBuffer::getFile(FilePath))
-            Buf = (*MB)->getMemBufferRef().getBuffer();
-        }
-        if (Buf.empty())
-          return;
-
-        auto Groups = scanTopLevelConds(Buf, FilePath);
-        llvm::errs() << "[refold] conds: " << FilePath << " -> "
-                     << Groups.size() << " group(s)\n";
-
-        for (const auto &G : Groups) {
-          if (G.Arms.empty())
-            continue;
-          JO.object([&] {
-            JO.attribute("id", NextCondGroupId++);
-            JO.attribute("file", G.File);
-            JO.attribute("group_b", (uint64_t)G.GroupB);
-            JO.attribute("group_e", (uint64_t)G.GroupE);
-            if (parentIncId >= 0)
-              JO.attribute("parent_include_id", parentIncId);
-            JO.attributeArray("arms", [&] {
-              for (const auto &A : G.Arms) {
-                JO.object([&] {
-                  JO.attribute("id", NextCondArmId++);
-                  JO.attribute("tag", A.Tag);
-                  if (!A.Cond.empty())
-                    JO.attribute("cond", A.Cond);
-                  JO.attribute("body_b", (uint64_t)A.BodyB);
-                  JO.attribute("body_e", (uint64_t)A.BodyE);
-                });
-              }
-            });
-          });
-        }
-      };
-
-      // 1) Main translation unit
-      {
-        FileID MFID = SM.getMainFileID();
-        if (auto MB = SM.getBufferOrNone(MFID)) {
-          llvm::StringRef Buf = MB->getBuffer();
-          auto Groups = scanTopLevelConds(Buf, TUAbsPath);
-          llvm::errs() << "[refold] conds: TU " << TUAbsPath << " -> "
-                       << Groups.size() << " group(s)\n";
-          for (const auto &G : Groups) {
-            if (G.Arms.empty())
-              continue;
-            JO.object([&] {
-              JO.attribute("id", NextCondGroupId++);
-              JO.attribute("file", G.File);
-              JO.attribute("group_b", (uint64_t)G.GroupB);
-              JO.attribute("group_e", (uint64_t)G.GroupE);
-              JO.attributeArray("arms", [&] {
-                for (const auto &A : G.Arms) {
-                  JO.object([&] {
-                    JO.attribute("id", NextCondArmId++);
-                    JO.attribute("tag", A.Tag);
-                    if (!A.Cond.empty())
-                      JO.attribute("cond", A.Cond);
-                    JO.attribute("body_b", (uint64_t)A.BodyB);
-                    JO.attribute("body_e", (uint64_t)A.BodyE);
-                  });
-                }
-              });
-            });
-          }
-        } else {
-          llvm::errs() << "[refold] conds: TU buffer missing for " << TUAbsPath
-                       << "\n";
-        }
-      }
-
-      // 2) Each include/include_next instance (per-instance, no dedup)
-      for (const auto &It : Items) {
-        if (!(It.Subkind == "#include" || It.Subkind == "#include_next"))
-          continue;
-        if (It.ResolvedPath.empty())
-          continue;
-        emitGroups(It.ResolvedPath, It.ID);
+        // End of the arm body
+        emitPoint(AS.File, AS.BodyE, "arm_end",
+                  /*ref=*/AS.ArmId,
+                  /*owner=*/ownerId);
       }
     });
   });

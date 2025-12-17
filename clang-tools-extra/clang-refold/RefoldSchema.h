@@ -423,6 +423,13 @@ static constexpr const char *RefoldSchema = R"json(
             }
           },
           "description": "Minimal [begin,end) A-token interval covering all spans for this include."
+        },
+        "decls": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/HeaderDecl"
+          },
+          "description": "Logical header-level declarations for this include instance, in source order."
         }
       },
       "dependentRequired": {
@@ -802,6 +809,10 @@ static constexpr const char *RefoldSchema = R"json(
           "minimum": 0,
           "description": "Byte after the last byte belonging to this arms body (before next directive line)"
         },
+        "pp_span": {
+          "description": "A-token span [begin,end) in the preprocessed stream for this arm.",
+          "$ref": "#/$defs/PPSpan"
+        },
         "selected": {
           "type": "boolean",
           "description": "True iff this arm contributed tokens in the preprocessed output for this file instance"
@@ -826,12 +837,12 @@ static constexpr const char *RefoldSchema = R"json(
           "type": "string",
           "description": "Path of the source file"
         },
-        "parent": {
+        "parent_arm_id": {
           "type": [
             "integer",
             "null"
           ],
-          "description": "Enclosing conditional group id if nested (null for top-level)"
+          "description": "Enclosing conditional arm id if nested (null for top-level)"
         },
         "group_b": {
           "type": "integer",
@@ -856,6 +867,61 @@ static constexpr const char *RefoldSchema = R"json(
           "items": {
             "$ref": "#/$defs/Arm"
           }
+        }
+      }
+    },
+    "HeaderDecl": {
+      "type": "object",
+      "description": "Logical header-level declaration inside an include instance.",
+      "required": [
+        "kind",
+        "name",
+        "header_span",
+        "pp_span"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "description": "Coarse decl kind: function, variable, typedef, etc.",
+          "enum": [
+            "function",
+            "variable",
+            "typedef",
+            "enum",
+            "struct",
+            "union",
+            "unknown"
+          ]
+        },
+        "name": {
+          "type": "string",
+          "description": "Primary identifier for this declaration (e.g. function name)."
+        },
+        "header_span": {
+          "description": "Byte span [b,e) in the *header file* containing this decl.",
+          "type": "object",
+          "required": [
+            "file",
+            "b",
+            "e"
+          ],
+          "properties": {
+            "file": {
+              "type": "string"
+            },
+            "b": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "e": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "pp_span": {
+          "description": "A-token span [begin,end) in the preprocessed stream for this decl.",
+          "$ref": "#/$defs/PPSpan"
         }
       }
     }
