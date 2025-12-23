@@ -23,8 +23,6 @@
 //      checks)
 //      - isIdentifierOnly(StringRef) : non-empty, first not digit, all ident
 //      chars
-//  • “Type-ish” token check:
-//      - isTypeishToken(StringRef)   : "*" or identifier/keyword-like
 //  • Index scans:
 //      - firstNonWsIdx(StringRef)    : first non-WS index or -1
 //      - lastNonWsIdx(StringRef)     : last  non-WS index or -1
@@ -61,6 +59,7 @@
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_STRINGUTILS_H
 
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -121,18 +120,6 @@ inline bool isIdentifierOnly(StringRef s) noexcept {
   return true;
 }
 
-/**
- * Treat keywords as identifiers for our purposes; "*" is also considered
- * “type-ish” (pointer glue) to help prefix handling.
- */
-inline bool isTypeishToken(StringRef s) noexcept {
-  if (s.empty())
-    return false;
-  if (s.size() == 1 && s[0] == '*')
-    return true;
-  return isIdentifierOnly(s);
-}
-
 // --------------------- Index scans (return -1 if none) ----------------------
 
 inline int firstNonWsIdx(StringRef s) noexcept {
@@ -184,12 +171,28 @@ inline std::string showWS(StringRef s) {
   return out;
 }
 
-inline std::string clip(StringRef s, int n) {
-  if (static_cast<int>(s.size()) <= n)
+inline std::string clip(StringRef s, size_t n) {
+  if (s.size() <= n)
     return s.str();
   return (s.substr(0, n) + "…(" + std::to_string(s.size()) + ")").str();
 }
 
+inline std::string escape(StringRef s) {
+  std::string buffer;
+  llvm::raw_string_ostream os(buffer);
+
+  os.write_escaped(s);
+
+  return buffer;
+}
+
+/// \brief Like Java's String::trim(), but only trims ASCII space and tab.
+///
+/// This removes leading and trailing `' '` and `'\t'` characters and returns a
+/// view into the original string (no allocation).
+///
+/// \param S The input string.
+/// \returns A std::string with leading/trailing spaces and tabs removed.
 inline std::string trimEdgeSpaces(StringRef s) {
   std::size_t lo = 0;
   std::size_t hi = s.size();
@@ -212,6 +215,57 @@ inline std::string trimEdgeSpaces(StringRef s) {
     return s.str(); // no trimming needed; copy whole string
 
   return s.substr(lo, hi - lo).str(); // copy trimmed portion
+}
+
+/// Normalizes an \c #include target token by stripping the surrounding
+/// delimiter characters.
+///
+/// Clang token spellings for include targets often arrive in one of these
+/// forms:
+/// - Quoted user headers: \c "\"e.h\""
+/// - System headers: \c "<vector>"
+///
+/// This method trims leading/trailing whitespace and then:
+/// - If the token starts with '<' and ends with '>', returns the interior.
+/// - If the token starts with '"' and ends with '"', returns the interior.
+/// - Otherwise returns the trimmed token unchanged.
+///
+/// This is a shallow normalization only; it does not attempt to unescape
+/// quotes, interpret backslashes, or resolve paths.
+///
+/// \param token the raw include target token spelling (may be null)
+/// \return the include target with surrounding <> or "" removed when present;
+///         returns the empty string if \p token is null
+inline StringRef stripHeaderToken(llvm::StringRef token) {
+  token = token.trim();
+  if (token.empty())
+    return "";
+  if (token.starts_with("<") && token.ends_with(">"))
+    return token.drop_front(1).drop_back(1);
+  if (token.starts_with("\"") && token.ends_with("\""))
+    return token.drop_front(1).drop_back(1);
+  return token;
+}
+
+inline std::string zpadUnsigned(size_t v, unsigned width) {
+  std::string s = formatv("{0}", v).str();
+  if (s.size() < width)
+    s.insert(s.begin(), width - s.size(), '0');
+  return s;
+}
+
+template <typename T> std::string stringifyElement(const T &elem) {
+  if constexpr (std::is_same_v<T, std::string>) {
+    return elem;
+  } else if constexpr (std::is_same_v<T, llvm::StringRef>) {
+    return elem.str();
+  } else if constexpr (std::is_same_v<T, char>) {
+    return std::string(1, elem);
+  } else if constexpr (std::is_integral_v<T>) {
+    return formatv("{0}", elem).str();
+  } else {
+    static_assert(!sizeof(T), "Unsupported element type for logFormattedArray");
+  }
 }
 
 } // namespace stringutils

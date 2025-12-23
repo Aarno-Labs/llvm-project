@@ -21,14 +21,17 @@
 //===----------------------------------------------------------------------===//
 
 #include "RefoldModel.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/JSON.h"
 
+#include <algorithm>
 #include <cassert>
 #include <functional>
+#include <limits>
 
 using namespace llvm;
 
@@ -75,6 +78,8 @@ Expected<int> asInt(const json::Value &val, StringRef ctx) {
 std::optional<const json::Array *> asOptArray(const json::Object &obj,
                                               StringRef key) {
   if (const json::Value *val = obj.get(key)) {
+    if (val->getAsNull())
+      return std::nullopt;
     auto arr = val->getAsArray();
     assert(
         arr &&
@@ -89,6 +94,8 @@ std::optional<const json::Array *> asOptArray(const json::Object &obj,
 
 std::optional<std::string> asOptString(const json::Object &obj, StringRef key) {
   if (const json::Value *val = obj.get(key)) {
+    if (val->getAsNull())
+      return std::nullopt;
     auto str = val->getAsString();
     assert(
         str &&
@@ -103,6 +110,8 @@ std::optional<std::string> asOptString(const json::Object &obj, StringRef key) {
 
 std::optional<int> asOptInt(const json::Object &obj, StringRef key) {
   if (const json::Value *val = obj.get(key)) {
+    if (val->getAsNull())
+      return std::nullopt;
     auto n = val->getAsInteger();
     assert(n &&
            formatv(
@@ -117,6 +126,8 @@ std::optional<int> asOptInt(const json::Object &obj, StringRef key) {
 
 std::optional<bool> asOptBool(const json::Object &obj, StringRef key) {
   if (const json::Value *val = obj.get(key)) {
+    if (val->getAsNull())
+      return std::nullopt;
     auto b = val->getAsBoolean();
     assert(b &&
            formatv(
@@ -130,10 +141,10 @@ std::optional<bool> asOptBool(const json::Object &obj, StringRef key) {
 }
 
 template <typename Fn>
-auto applyToField(Fn &&fn, const json::Object &obj, llvm::StringRef key,
-                  llvm::StringRef ctx = "root")
+auto applyToField(Fn &&fn, const json::Object &obj, StringRef key,
+                  StringRef ctx = "root")
     -> decltype(std::forward<Fn>(fn)(std::declval<const json::Value &>(),
-                                     std::declval<llvm::StringRef>())) {
+                                     std::declval<StringRef>())) {
   auto fieldOrErr = requireField(obj, key, ctx); // Expected<const json::Value*>
   if (!fieldOrErr)
     return fieldOrErr.takeError();
@@ -161,8 +172,7 @@ Expected<std::vector<RefoldModel::PPSpan>> parsePPSpans(const json::Value &val,
 
   out.reserve(arr->size());
   for (std::size_t i = 0; i < arr->size(); ++i) {
-    const std::string ctxItem =
-        (ctx + llvm::Twine("[") + llvm::Twine(i) + "]").str();
+    const std::string ctxItem = (ctx + Twine("[") + Twine(i) + "]").str();
 
     auto objOrErr = arrayObjElemAt(*arr, i, ctxItem);
     if (!objOrErr)
@@ -223,8 +233,7 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
     int autoPP = 0;
     model.tokmap_.reserve(arr->size());
     for (std::size_t i = 0; i < arr->size(); ++i) {
-      const std::string ctxItem =
-          (llvm::Twine("tokmap[") + llvm::Twine(i) + "]").str();
+      const std::string ctxItem = (Twine("tokmap[") + Twine(i) + "]").str();
 
       auto objOrErr = arrayObjElemAt(*arr, i, ctxItem);
       if (!objOrErr)
@@ -274,8 +283,7 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
     const json::Array *arr = *arrOrErr;
 
     for (std::size_t i = 0; i < arr->size(); ++i) {
-      const std::string ctxItem =
-          (llvm::Twine("items[") + llvm::Twine(i) + "]").str();
+      const std::string ctxItem = (Twine("items[") + Twine(i) + "]").str();
 
       auto objOrErr = arrayObjElemAt(*arr, i, ctxItem);
       if (!objOrErr)
@@ -297,7 +305,7 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
 
         if (skStr == "#include" || skStr == "#include_next") {
           const std::string ctxItem =
-              (llvm::Twine("include items[") + llvm::Twine(i) + "]").str();
+              (Twine("include items[") + Twine(i) + "]").str();
 
           // required
           auto idOrErr = applyToField(asInt, *obj, "id", ctxItem);
@@ -367,6 +375,72 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
             coverEOpt = *endOrErr;
           }
 
+          std::vector<RefoldModel::HeaderDecl> decls;
+          if (const json::Value *declsVal = obj->get("decls")) {
+            if (!declsVal->getAsNull()) {
+              auto declArrOrErr = asArray(*declsVal, "include.decls");
+              if (!declArrOrErr)
+                return declArrOrErr.takeError();
+              const json::Array &declArr = **declArrOrErr;
+              decls.reserve(declArr.size());
+              for (std::size_t di = 0; di < declArr.size(); ++di) {
+                const std::string ctxDecl =
+                    (Twine("include.decls[") + Twine(di) + "]").str();
+                auto declObjOrErr = asObject(declArr[di], ctxDecl);
+                if (!declObjOrErr)
+                  return declObjOrErr.takeError();
+                const json::Object &declObj = **declObjOrErr;
+
+                auto kindOrErr = applyToField(asString, declObj, "kind", ctxDecl);
+                if (!kindOrErr)
+                  return kindOrErr.takeError();
+                auto nameOrErr = applyToField(asString, declObj, "name", ctxDecl);
+                if (!nameOrErr)
+                  return nameOrErr.takeError();
+
+                auto hsValOrErr = requireField(declObj, "header_span", ctxDecl);
+                if (!hsValOrErr)
+                  return hsValOrErr.takeError();
+                auto hsObjOrErr = asObject(**hsValOrErr, ctxDecl + ".header_span");
+                if (!hsObjOrErr)
+                  return hsObjOrErr.takeError();
+                const json::Object &hsObj = **hsObjOrErr;
+                auto hsFileOrErr = applyToField(asString, hsObj, "file", ctxDecl);
+                if (!hsFileOrErr)
+                  return hsFileOrErr.takeError();
+                auto hsBOrErr = applyToField(asInt, hsObj, "b", ctxDecl);
+                if (!hsBOrErr)
+                  return hsBOrErr.takeError();
+                auto hsEOrErr = applyToField(asInt, hsObj, "e", ctxDecl);
+                if (!hsEOrErr)
+                  return hsEOrErr.takeError();
+
+                auto psValOrErr = requireField(declObj, "pp_span", ctxDecl);
+                if (!psValOrErr)
+                  return psValOrErr.takeError();
+                auto psObjOrErr = asObject(**psValOrErr, ctxDecl + ".pp_span");
+                if (!psObjOrErr)
+                  return psObjOrErr.takeError();
+                const json::Object &psObj = **psObjOrErr;
+                auto psBOrErr = applyToField(asInt, psObj, "begin", ctxDecl);
+                if (!psBOrErr)
+                  return psBOrErr.takeError();
+                auto psEOrErr = applyToField(asInt, psObj, "end", ctxDecl);
+                if (!psEOrErr)
+                  return psEOrErr.takeError();
+
+                RefoldModel::HeaderDecl decl;
+                decl.kind = *kindOrErr;
+                decl.name = *nameOrErr;
+                decl.file = *hsFileOrErr;
+                decl.headerB = *hsBOrErr;
+                decl.headerE = *hsEOrErr;
+                decl.ppSpan = PPSpan{*psBOrErr, *psEOrErr};
+                decls.push_back(std::move(decl));
+              }
+            }
+          }
+
           IncludeItem inc(/*id*/ id,
                           /*subkind*/ std::string(skStr),
                           /*text*/ std::move(text),
@@ -379,14 +453,15 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
                           /*parent*/ std::move(parent),
                           /*spans*/ std::move(spans),
                           /*coverBegin*/ coverBOpt,
-                          /*coverEnd*/ coverEOpt);
+                          /*coverEnd*/ coverEOpt,
+                          /*decls*/ std::move(decls));
 
           model.includes_.push_back(std::move(inc));
         } else if (skStr == "#define" || skStr == "#undef") {
           MacroDirective md;
 
           const std::string ctxItem =
-              (llvm::Twine("define/undef items[") + llvm::Twine(i) + "]").str();
+              (Twine("define/undef items[") + Twine(i) + "]").str();
 
           // required
           auto idOrErr = applyToField(asInt, *obj, "id", ctxItem);
@@ -430,7 +505,7 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
           PragmaDirective pd;
 
           const std::string ctxItem =
-              (llvm::Twine("pragma items[") + llvm::Twine(i) + "]").str();
+              (Twine("pragma items[") + Twine(i) + "]").str();
 
           // required
           auto idOrErr = applyToField(asInt, *obj, "id", ctxItem);
@@ -467,7 +542,7 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
         }
       } else if (kindStr == "macro") {
         const std::string ctxItem =
-              (llvm::Twine("macro items[") + llvm::Twine(i) + "]").str();
+            (Twine("macro items[") + Twine(i) + "]").str();
 
         // required
         auto idOrErr = applyToField(asInt, *obj, "id", ctxItem);
@@ -555,7 +630,7 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
         FileItem fi;
 
         const std::string ctxItem =
-              (llvm::Twine("file items[") + llvm::Twine(i) + "]").str();
+            (Twine("file items[") + Twine(i) + "]").str();
 
         // required
         auto idOrErr = applyToField(asInt, *obj, "id", ctxItem);
@@ -587,8 +662,7 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
     const json::Array *arr = *slotsArr;
     model.slots_.reserve(arr->size());
     for (std::size_t i = 0; i < arr->size(); ++i) {
-      const std::string ctxItem =
-          (llvm::Twine("slots[") + llvm::Twine(i) + "]").str();
+      const std::string ctxItem = (Twine("slots[") + Twine(i) + "]").str();
 
       auto objOrErr = arrayObjElemAt(*arr, i, ctxItem);
       if (!objOrErr)
@@ -624,7 +698,7 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
       slot.e = *eOrErr;
 
       // optionals
-      slot.ref = asOptInt(*obj, "ret");
+      slot.ref = asOptInt(*obj, "ref");
       slot.ownerIncludeId = asOptInt(*obj, "owner_include_id");
       slot.pp = asOptInt(*obj, "pp");
 
@@ -637,8 +711,7 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
     const json::Array *arr = *condsArr;
     model.conds_.reserve(arr->size());
     for (std::size_t i = 0; i < arr->size(); ++i) {
-      const std::string ctxItem =
-          (llvm::Twine("conds[") + llvm::Twine(i) + "]").str();
+      const std::string ctxItem = (Twine("conds[") + Twine(i) + "]").str();
 
       auto objOrErr = arrayObjElemAt(*arr, i, ctxItem);
       if (!objOrErr)
@@ -669,7 +742,7 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
       group.groupE = *geOrErr;
 
       // optional
-      group.parent = asOptInt(*obj, "parent");
+      group.parentArmId = asOptInt(*obj, "parent_arm_id");
       group.parentIncludeId = asOptInt(*obj, "parent_include_id");
 
       // arms
@@ -680,8 +753,7 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
 
       group.arms.reserve(arms->size());
       for (std::size_t ai = 0; ai < arms->size(); ++ai) {
-        const std::string ctxItem =
-            (llvm::Twine("arm[") + llvm::Twine(ai) + "]").str();
+        const std::string ctxItem = (Twine("arm[") + Twine(ai) + "]").str();
 
         auto objOrErr = arrayObjElemAt(*arms, ai, ctxItem);
         if (!objOrErr)
@@ -689,6 +761,7 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
         const json::Object *armObj = *objOrErr;
 
         CondArm arm;
+        arm.groupId = group.id;
 
         // required
         auto idOrErr = applyToField(asInt, *armObj, "id", ctxItem);
@@ -715,6 +788,25 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
         arm.cond = asOptString(*armObj, "cond");
         arm.selected = asOptBool(*armObj, "selected");
 
+        if (const json::Value *ppSpanVal = armObj->get("pp_span")) {
+          if (!ppSpanVal->getAsNull()) {
+            auto ppSpanObjOrErr = asObject(*ppSpanVal, ctxItem + ".pp_span");
+            if (!ppSpanObjOrErr)
+              return ppSpanObjOrErr.takeError();
+            const json::Object &ppSpanObj = **ppSpanObjOrErr;
+
+            auto beginOrErr =
+                applyToField(asInt, ppSpanObj, "begin", ctxItem + ".pp_span");
+            if (!beginOrErr)
+              return beginOrErr.takeError();
+            auto endOrErr =
+                applyToField(asInt, ppSpanObj, "end", ctxItem + ".pp_span");
+            if (!endOrErr)
+              return endOrErr.takeError();
+            arm.ppSpan = PPSpan{*beginOrErr, *endOrErr};
+          }
+        }
+
         group.arms.push_back(std::move(arm));
       }
 
@@ -728,6 +820,14 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
 }
 
 void RefoldModel::BuildIndicesAndSort() {
+  // Invalidate caches/indices derived from the raw parsed vectors.
+  includeDepthCache_.clear();
+  condGroupDepthCache_.clear();
+
+  condGroupById_.clear();
+  armById_.clear();
+  segmentsByFile_.clear();
+
   // includes: sort by (sitePath, siteB)
   std::sort(includes_.begin(), includes_.end(),
             [](const IncludeItem &a, const IncludeItem &b) {
@@ -748,6 +848,10 @@ void RefoldModel::BuildIndicesAndSort() {
   condsByFileByOwner_.clear();
 
   for (const auto &group : conds_) {
+    condGroupById_[group.id] = &group;
+    for (const auto &arm : group.arms)
+      armById_[arm.id] = ArmRef{&group, &arm};
+
     condsByFile_[group.file].push_back(&group);
     if (group.parentIncludeId) {
       condsByFileByOwner_[group.file][*group.parentIncludeId].push_back(&group);
@@ -767,6 +871,17 @@ void RefoldModel::BuildIndicesAndSort() {
     for (auto &kv2 : kv.second)
       sortGroups(kv2.second);
   }
+
+  // segmentsByFile: build from slots (one segment list per file)
+  StringMap<std::vector<const Slot *>> slotsByFile;
+  for (const auto &slot : slots_)
+    slotsByFile[slot.file].push_back(&slot);
+  for (auto &kv : slotsByFile) {
+    auto segs = BuildSegmentsForFile(kv.getKey(), kv.getValue());
+    if (!segs.empty()) {
+      segmentsByFile_[kv.getKey()] = std::move(segs);
+    }
+  }
 }
 
 // ================== Query helpers (ported behavior) ==================
@@ -775,12 +890,12 @@ std::vector<const RefoldModel::CondGroup *>
 RefoldModel::GetCondGroups(StringRef file,
                            const std::optional<int> &parentIncludeId) const {
   if (!parentIncludeId.has_value()) {
-    auto it = condsByFile_.find(file.str());
+    auto it = condsByFile_.find(file);
     if (it != condsByFile_.end())
       return it->second;
     return {};
   }
-  auto fit = condsByFileByOwner_.find(file.str());
+  auto fit = condsByFileByOwner_.find(file);
   if (fit == condsByFileByOwner_.end())
     return {};
   auto oit = fit->second.find(*parentIncludeId);
@@ -793,15 +908,299 @@ std::optional<RefoldModel::ArmRef>
 RefoldModel::FindArmRefForByte(StringRef file,
                                const std::optional<int> &parentIncludeId,
                                int byteOffset) const {
+  std::optional<ArmRef> best;
+  int bestDepth = 0;
+
   for (const CondGroup *group : GetCondGroups(file, parentIncludeId)) {
-    if (group->groupB <= byteOffset && byteOffset < group->groupE) {
-      for (const CondArm &arm : group->arms) {
-        if (arm.ContainsByte(byteOffset))
-          return ArmRef{group, &arm};
+    if (!group || !group->ContainsByte(byteOffset))
+      continue;
+
+    for (const CondArm &arm : group->arms) {
+      // Skip non-selected arms when the producer emitted selection metadata.
+      if (arm.selected && !*arm.selected)
+        continue;
+      if (!arm.ContainsByte(byteOffset))
+        continue;
+
+      int depth = GetCondArmDepth(arm.id);
+      if (depth > bestDepth) {
+        bestDepth = depth;
+        best = ArmRef{group, &arm};
       }
     }
   }
+
+  return best;
+}
+
+std::optional<const RefoldModel::Slot *> RefoldModel::GetArmBeginSlot(int armId) const {
+  if (auto ref = GetArmRefById(armId)) {
+    auto slots = FindSlots(std::optional<std::string>(ref->group->file),
+                           std::optional<std::string>("arm_begin"),
+                           std::optional<int>(armId),
+                           ref->group->parentIncludeId);
+    if (!slots.empty())
+      return slots.front();
+    return std::nullopt;
+  }
+  auto slots = FindSlots(std::nullopt, std::optional<std::string>("arm_begin"),
+                         std::optional<int>(armId), std::nullopt);
+  if (!slots.empty())
+    return slots.front();
   return std::nullopt;
+}
+
+std::optional<const RefoldModel::Slot *> RefoldModel::GetArmEndSlot(int armId) const {
+  if (auto ref = GetArmRefById(armId)) {
+    auto slots = FindSlots(std::optional<std::string>(ref->group->file),
+                           std::optional<std::string>("arm_end"),
+                           std::optional<int>(armId),
+                           ref->group->parentIncludeId);
+    if (!slots.empty())
+      return slots.front();
+    return std::nullopt;
+  }
+  auto slots = FindSlots(std::nullopt, std::optional<std::string>("arm_end"),
+                         std::optional<int>(armId), std::nullopt);
+  if (!slots.empty())
+    return slots.front();
+  return std::nullopt;
+}
+
+std::vector<RefoldModel::Segment> RefoldModel::BuildSegmentsForFile(
+    StringRef file, const std::vector<const Slot *> &fileSlots) const {
+  std::vector<const Slot *> sorted = fileSlots;
+  std::sort(sorted.begin(), sorted.end(),
+            [](const Slot *first, const Slot *second) {
+              if (first->b != second->b)
+                return first->b < second->b;
+              if (first->e != second->e)
+                return first->e < second->e;
+
+              const int pp1 =
+                  first->pp ? *first->pp : std::numeric_limits<int>::max();
+              const int pp2 =
+                  second->pp ? *second->pp : std::numeric_limits<int>::max();
+              if (pp1 != pp2)
+                return pp1 < pp2;
+
+              return first->id < second->id;
+            });
+
+  std::vector<Segment> segs;
+  std::optional<int> currentIncludeId;
+  std::optional<int> currentArmId;
+
+  size_t i = 0;
+  while (i < sorted.size()) {
+    const int pos = sorted[i]->b;
+
+    // Apply all events at |pos|.
+    size_t j = i;
+    for (; j < sorted.size() && sorted[j]->b == pos; ++j) {
+      const Slot &s = *sorted[j];
+      if (s.kind == "file_begin") {
+        currentIncludeId = s.ownerIncludeId;
+        currentArmId = std::nullopt;
+      } else if (s.kind == "file_end") {
+        currentIncludeId = std::nullopt;
+        currentArmId = std::nullopt;
+      } else if (s.kind == "arm_begin") {
+        currentArmId = s.ref;
+      } else if (s.kind == "arm_end") {
+        currentArmId = std::nullopt;
+      }
+    }
+
+    if (j >= sorted.size())
+      break;
+    const int nextPos = sorted[j]->b;
+    if (pos < nextPos) {
+      Segment seg;
+      seg.file = std::string(file);
+      seg.b = pos;
+      seg.e = nextPos;
+      seg.ownerIncludeId = currentIncludeId;
+      seg.ownerCondArmId = currentArmId;
+      segs.push_back(std::move(seg));
+    }
+    i = j;
+  }
+
+  return segs;
+}
+
+unsigned
+RefoldModel::GetIncludeDepth(const std::optional<int> &includeId) const {
+  if (!includeId)
+    return 0;
+
+  auto it = includeDepthCache_.find(*includeId);
+  if (it != includeDepthCache_.end())
+    return it->second;
+
+  const IncludeItem *inc = GetIncludeById(*includeId);
+  int depth = 1;
+  if (inc && inc->parent)
+    depth = GetIncludeDepth(inc->parent) + 1;
+
+  includeDepthCache_[*includeId] = depth;
+  return depth;
+}
+
+std::optional<int> RefoldModel::InnermostIncludeAtPP(int ppIndex) const {
+  std::optional<int> bestId;
+  int bestDepth = 0;
+
+  for (const auto &inc : includes_) {
+    if (inc.cover.begin <= ppIndex && ppIndex < inc.cover.end) {
+      int depth = GetIncludeDepth(inc.id);
+      if (depth > bestDepth) {
+        bestDepth = depth;
+        bestId = inc.id;
+      }
+    }
+  }
+
+  return bestId;
+}
+
+std::optional<int>
+RefoldModel::LeastCommonAncestorInclude(std::optional<int> a,
+                                        std::optional<int> b) const {
+  if (a == b)
+    return a;
+  if (!a || !b)
+    return std::nullopt;
+
+  auto buildChainRootTo = [this](std::optional<int> id) {
+    std::vector<int> chain;
+    while (id) {
+      chain.push_back(*id);
+      const IncludeItem *inc = GetIncludeById(*id);
+      if (!inc || !inc->parent)
+        break;
+      id = inc->parent;
+    }
+    std::reverse(chain.begin(), chain.end());
+    return chain;
+  };
+
+  std::vector<int> chainA = buildChainRootTo(a);
+  std::vector<int> chainB = buildChainRootTo(b);
+
+  std::optional<int> lastCommon;
+  const size_t n = std::min(chainA.size(), chainB.size());
+  for (size_t i = 0; i < n; ++i) {
+    if (chainA[i] != chainB[i])
+      break;
+    lastCommon = chainA[i];
+  }
+  return lastCommon;
+}
+
+unsigned
+RefoldModel::GetCondGroupDepth(const std::optional<int> &groupId) const {
+  if (!groupId)
+    return 0;
+
+  auto it = condGroupDepthCache_.find(*groupId);
+  if (it != condGroupDepthCache_.end())
+    return it->second;
+
+  const CondGroup *group = GetCondGroupById(*groupId);
+  int depth = 1;
+  if (group && group->parentArmId) {
+    if (auto parentArm = GetArmRefById(*group->parentArmId))
+      depth = GetCondGroupDepth(parentArm->group->id) + 1;
+  }
+
+  condGroupDepthCache_[*groupId] = depth;
+  return depth;
+}
+
+std::optional<RefoldModel::ArmRef> RefoldModel::FindArmRefAtPP(int ppIndex) const {
+  auto ent = MapPP(ppIndex);
+  if (!ent)
+    return std::nullopt;
+
+  const TokMapEntry &t = *ent;
+  const std::optional<int> ownerIncId = InnermostIncludeAtPP(ppIndex);
+
+  if (auto direct = FindArmRefForByte(t.file, ownerIncId, t.b))
+    return direct;
+
+  // If the token is not inside a conditional arm in its own file, walk outward
+  // through include sites.
+  std::optional<int> cur = ownerIncId;
+  while (cur) {
+    const IncludeItem *inc = GetIncludeById(*cur);
+    if (!inc)
+      break;
+    if (auto atSite = FindArmRefForByte(inc->sitePath, inc->parent, inc->siteB))
+      return atSite;
+    cur = inc->parent;
+  }
+
+  return std::nullopt;
+}
+
+int RefoldModel::FirstConditionalArmStartA(const CondGroup &group) const {
+  if (group.arms.empty())
+    return -1;
+
+  DenseSet<int> armIds;
+  armIds.reserve(group.arms.size());
+  for (const auto &arm : group.arms)
+    armIds.insert(arm.id);
+
+  int best = std::numeric_limits<int>::max();
+  for (const auto &slot : slots_) {
+    if (slot.kind != "arm_begin")
+      continue;
+    if (slot.file != group.file)
+      continue;
+    if (slot.ownerIncludeId != group.parentIncludeId)
+      continue;
+    if (!slot.pp || !slot.ref)
+      continue;
+    if (!armIds.contains(*slot.ref))
+      continue;
+    best = std::min(best, *slot.pp);
+  }
+
+  return best == std::numeric_limits<int>::max() ? -1 : best;
+}
+
+RefoldModel::OwnerArrays
+RefoldModel::ComputeOwnerArraysForPP(int ppCount) const {
+  OwnerArrays out;
+  out.ownerDepth.assign(ppCount, 0);
+  out.ownerIncludeId.assign(ppCount, -1);
+
+  if (ppCount <= 0)
+    return out;
+
+  if (includes_.empty())
+    return out;
+
+  for (int pp = 0; pp < ppCount; ++pp) {
+    int bestDepth = 0;
+    int bestIncId = -1;
+    for (const auto &inc : includes_) {
+      if (inc.cover.begin <= pp && pp < inc.cover.end) {
+        int depth = GetIncludeDepth(inc.id);
+        if (depth > bestDepth) {
+          bestDepth = depth;
+          bestIncId = inc.id;
+        }
+      }
+    }
+    out.ownerDepth[pp] = bestDepth;
+    out.ownerIncludeId[pp] = bestIncId;
+  }
+
+  return out;
 }
 
 std::vector<const RefoldModel::Slot *>

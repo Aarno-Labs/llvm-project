@@ -70,8 +70,13 @@ namespace clang {
 namespace refold {
 
 namespace {
-constexpr bool INSERT_AFTER_LEFT_TOKEN_EOL = true;
 constexpr int kNoOwner = -1;
+
+inline std::string resolveHeaderPath(const RefoldModel::IncludeItem &inc) {
+  return (inc.resolvedPath && !inc.resolvedPath->empty())
+             ? *inc.resolvedPath
+             : stringutils::stripHeaderToken(inc.target).str();
+}
 } // namespace
 
 // ========================== Public entry points ==========================
@@ -104,6 +109,9 @@ std::string RefoldEngine::Refold() {
 
   StringRef tuPath = model_.GetSourcePath();
 
+  info("plan", "REFOLD START tuPath=%s aLen=%d bLen=%d aToks=%d bToks=%d",
+       tuPath, aSource_.size(), bSource_.size(), aToks_.size(), bToks_.size());
+
   // Read in the translation unit file / C source.
   std::string tuBytes;
   {
@@ -120,10 +128,45 @@ std::string RefoldEngine::Refold() {
                    bufOrErr.get()->getBufferEnd());
   }
 
+  constexpr size_t MAX_COLS = 80;
+  SmallString<MAX_COLS> sepBuf;
+  sepBuf.assign(MAX_COLS, '-');
+  StringRef sep = sepBuf;
+
   // 1) Generate token sequences and A->B anchor map.
   auto aSeq = MapLexemes(aToks_, aTokOff_);
+  trace("lcs/aSeq", "aSeq:");
+  trace("lcs/aSeq", "=====");
+  logFormattedArray<std::string>(aSeq, /* k */ MAX_COLS,
+                                 /* sameWidth */ false,
+                                 [](StringRef msg) { trace("lcs/aSeq", msg); });
+  trace("lcs/aSeq", sep);
+
   auto bSeq = MapLexemes(bToks_, bTokOff_);
-  auto a2b = diffutils::lcsMapAB(aSeq, bSeq);
+  trace("lcs/bSeq", "bSeq:");
+  trace("lcs/bSeq", "=====");
+  logFormattedArray<std::string>(bSeq, /* k */ MAX_COLS,
+                                 /* sameWidth */ false,
+                                 [](StringRef msg) { trace("lcs/bSeq", msg); });
+  trace("lcs/bSeq", sep);
+
+  // 1b) Compute per-gap ownership depth for A's PP tokens.
+  std::vector<unsigned> ownerDepthGap =
+      ComputeOwnerDepthGapsForPP(aTokOff_.size());
+  trace("lcs/ownerGap", "ownerDepthGap:");
+  trace("lcs/ownerGap", "==============");
+  logFormattedArray<unsigned>(
+      ownerDepthGap, /* k */ MAX_COLS, /* sameWidth */ true,
+      [](StringRef msg) { trace("lcs/ownerGap", msg); });
+  trace("lcs/bSeq", sep);
+
+  // 2) LCS over tokens (A → B) with owner-aware cost model.
+  auto a2b = diffutils::lcsMapAB(aSeq, bSeq, ownerDepthGap);
+  trace("lcs/a2b", "a2b:");
+  trace("lcs/a2b", "====");
+  logFormattedArray<int>(a2b, /* k */ MAX_COLS, /* sameWidth */ true,
+                         [](StringRef msg) { trace("lcs/a2b", msg); });
+  trace("lcs/a2b", sep);
 
 #if 0
   auto writeMap = [](StringRef filename, const std::vector<int> &a2b) {
@@ -170,7 +213,7 @@ std::string RefoldEngine::Refold() {
        model_.GetIncludes().size(), model_.GetMacroInvocations().size(),
        model_.GetTokmapByPP().size());
 
-  // 2) Diff hunks (changed A-token intervals -> B-token intervals).
+  // 3) Diff hunks (changed A-token intervals -> B-token intervals).
   auto hunks = diffutils::hunksFromMap(a2b, static_cast<int>(aSeq.size()),
                                        static_cast<int>(bSeq.size()));
 
@@ -193,7 +236,7 @@ std::string RefoldEngine::Refold() {
     debug("hunks", "#{0} {1:verbose} B='{2}'", i, h, shown);
   }
 
-  // 3) Classify hunks and collect per-target edits.
+  // 4) Classify hunks and collect per-target edits.
   std::vector<TextEdit> tuEdits;
   DenseMap<int, IncludeEdits> perInclude; // includeId -> edits
   DenseMap<int, std::vector<MacroPatch>> macroPatchesByOwner;
@@ -202,17 +245,22 @@ std::string RefoldEngine::Refold() {
   for (std::size_t i = 0; i < hunks.size(); ++i) {
     const auto &h = hunks[i];
 
-    // a) Prefer include expansion if available.
-    if (auto *inc = SmallestCoveringInclude(h.aStart, h.aEnd)) {
-      debug("classify", "#{0} -> INCLUDE id={1} target={2} resolved={3} {4}", i,
-            inc->id, StripHeaderToken(inc->target), inc->resolvedPath, h);
-      auto patch = BuildIncludeInsertionPatch(*inc, h);
-      perInclude[inc->id].include = inc;
-      perInclude[inc->id].patches.push_back(std::move(patch));
-      continue;
-    }
+    // Shape info (pure insert/delete/replace) – LOG ONLY
+    bool isIns = (h.aStart == h.aEnd) && (h.bStart < h.bEnd);
+    bool isDel = (h.aStart < h.aEnd) && (h.bStart == h.bEnd);
+    bool isRep = (h.aStart < h.aEnd) && (h.bStart < h.bEnd);
+    debug("classify", "#{0} shape: isIns={1} isDel={2} isRep={3} {4}", i, isIns,
+          isDel, isRep, h);
 
-    // b) Macro call-site?
+    // a) Segment-aware owner classification: this decides TU vs include vs “no segment”.
+    debug("classify", "#{0} -> calling classifyOwnerWithSegments {1}", i, h);
+    Owner owner = ClassifyOwnerWithSegments(tuPath, h);
+    debug(
+        "classify",
+        "#{0} ownerFromSegments kind={1} includeId={2} condArmId={3} {4}", i,
+        owner.kind, owner.includeId, owner.condArmId, h);
+
+    // b) Macro call-site still has priority over TU/include
     if (auto *m = SmallestCoveringMacro(h.aStart, h.aEnd)) {
       if (m->GetInvB() != -1 && m->GetInvE() != -1) {
         debug("classify",
@@ -226,22 +274,117 @@ std::string RefoldEngine::Refold() {
       }
     }
 
-    // c) TU edit?
-    if (HunkMapsToTU(h.aStart, h.aEnd, tuPath)) {
+    // c) Special case: pure insertions exactly at the boundary between sibling
+    // includes that share a common parent. In this case, per policy, the
+    // insertion should be attached to the *parent* include so that the
+    // refolded C places it between `#include` lines, not inside any child.
+    if (isIns) {
+      const RefoldModel::IncludeItem *parentBoundaryInc =
+          BoundaryParentIncludeForPureInsertion(h, tuPath);
+      if (parentBoundaryInc) {
+        auto [it, _] =
+            perInclude.try_emplace(parentBoundaryInc->id, parentBoundaryInc);
+        IncludePatch patch = BuildIncludeInsertionPatch(*parentBoundaryInc, h);
+        it->second.Add(std::move(patch));
+        debug("classify",
+              "#{0} -> INCLUDE(parent-boundary) inc={1} ({2}) patch={3}", i,
+              parentBoundaryInc->id, parentBoundaryInc->resolvedPath,
+              patch.ToString());
+        continue;
+      }
+
+      if (owner.kind == OwnerKind::Include && owner.includeId) {
+        int firstCond = model_.FirstConditionalArmStartA(*owner.includeId);
+        if (h.aStart <= firstCond) {
+          const RefoldModel::IncludeItem *inc =
+              model_.GetIncludeById(*owner.includeId);
+          // NOTE: `inc` cannot be null if owner has an `includeId`
+          auto [it, _] = perInclude.try_emplace(inc->id, inc);
+          IncludePatch patch = BuildIncludeInsertionPatch(*inc, h);
+          it->second.Add(std::move(patch));
+          debug("classify",
+                "#{0} → INCLUDE(before first cond) include={1} patch={2}", i,
+                inc->id, patch.ToString());
+          continue;
+        }
+      }
+    }
+
+    debug("classify",
+          "#{0} no macro/boundary owner, proceeding with owner.kind={1} "
+          "includeId={2}",
+          i, owner.kind, owner.includeId);
+
+    // d) Include-owned edit (segment policy already enforced in
+    // classifyOwnerWithSegments).
+    if (owner.kind == OwnerKind::Include && owner.includeId) {
+      const RefoldModel::IncludeItem *inc =
+          model_.GetIncludeById(*owner.includeId);
+      // NOTE: `inc` cannot be null if owner has an `includeId`
+      const std::string incPath = resolveHeaderPath(*inc);
+
+      debug("classify", "#{0} -> INCLUDE id={1} path={2}  {3} (via segments)",
+            i, inc->id, incPath, h);
+
+      auto [it, _] = perInclude.try_emplace(inc->id, inc);
+      IncludePatch patch = BuildIncludeInsertionPatch(*inc, h);
+      debug("include/patch", "#{0} INC {1} patch={2}", i, h, patch.ToString());
+      it->second.Add(std::move(patch));
+      continue;
+    }
+
+    // e) TU edit? (segments + existing TU mapping cooperate here).
+    // We rely on the token→file map as the source of truth for TU ownership.
+    // Segment classification is only used to detect include-owned edits; it
+    // should not force a hunk into the TU if any mapped token belongs to a
+    // header. So only treat it as TU when the hunk map says so.
+    bool mapsToTU = HunkMapsToTU(h.aStart, h.aEnd, tuPath);
+    debug("classify",
+          "#{0} hunkMapsToTU={1} {2} owner.kind={3} owner.includeId={4}", i,
+          mapsToTU, h, owner.kind, owner.includeId);
+
+    if (owner.kind == OwnerKind::TU) {
+      if (isIns) {
+        // For pure insertions, trust the segment classification.
+        // We already anchored the probe in TU byte space via tuByteSpan.
+        mapsToTU = true;
+      }
+
+      if (!mapsToTU) {
+        // Only demote for non-empty A-side hunks (real edits/deletes),
+        // where we *must* make sure we’re not accidentally editing header
+        // text and calling it “TU”.
+        owner = Owner::Unknown();
+      }
+    }
+
+    if (mapsToTU && owner.kind == OwnerKind::Include && owner.includeId) {
+      debug("classify",
+            "#{0} DIAGNOSTIC: tokmap says TU but segments say INCLUDE(id={1}); "
+            "will still treat as TU (tokmap wins).",
+            i, owner.includeId);
+    }
+
+    if (mapsToTU) {
       auto span = TUByteSpan(h.aStart, h.aEnd, tuPath); // [b,e)
+      debug("classify", "#{0} TU-byteSpan=[{1},{2}) for A[{3},{4})", i,
+            span.first, span.second, h.aStart, h.aEnd);
       std::string repl;
-      if (span[0] >= 0 && h.bStart < h.bEnd) {
+      if (span.first >= 0 && h.bStart < h.bEnd) {
         std::size_t b0 = bTokOff_[h.bStart], b1 = bTokOff_[h.bEnd];
         repl.assign(bSource_.data() + b0, bSource_.data() + b1);
       }
 
-      if (span[0] >= 0) {
+      if (span.first >= 0) {
         // Is this span replacing a TU "gap" (bytes that are all whitespace)?
         std::string original;
-        if (span[1] > span[0])
-          original.assign(tuBytes.data() + span[0], tuBytes.data() + span[1]);
-        else if (span[1] < span[0])
-          fatal("tu/span", "invalid TU byte span: [{0},{1})", span[0], span[1]);
+        if (span.second > span.first) {
+          original.assign(tuBytes.data() + span.first,
+                          tuBytes.data() + span.second);
+        } else if (span.second < span.first) {
+          fatal("tu/span", "invalid TU byte span: [{0},{1})", span.first,
+                span.second);
+        }
         bool replacingGap =
             !original.empty() && stringutils::isAsciiWhitespace(original);
 
@@ -256,16 +399,43 @@ std::string RefoldEngine::Refold() {
         //   double-space)
         // - always allowRight (covers cases like “…0” + “: 1” at zero-width
         //   sites)
-        repl = PadAtBoundaries(tuBytes, span[0], span[1], std::move(repl),
-                               /*allowLeft*/ !replacingGap,
-                               /*allowRight*/ true);
+        std::string padded =
+            PadAtBoundaries(tuBytes, span.first, span.second, std::move(repl),
+                            /*allowLeft*/ !replacingGap,
+                            /*allowRight*/ true);
 
-        debug("classify", "#{0} -> TU  bytes=[{1},{2}) repl='{3}'", i, span[0],
-              span[1], stringutils::showWS(stringutils::clip(repl, 160)));
+        debug("classify",
+              "#{0} -> TU  bytes=[{1},{2}) rawRepl='{3}' paddedRepl='{4}'", i,
+              span.first, span.second,
+              stringutils::showWS(stringutils::clip(repl, 160)),
+              stringutils::showWS(stringutils::clip(padded, 160)));
 
-        tuEdits.push_back(TextEdit{span[0], span[1], std::move(repl)});
+        tuEdits.push_back(TextEdit{span.first, span.second, std::move(padded)});
         continue;
+      } else {
+        debug("classify",
+              "#{0} TU mapping had span.first < 0; TU edit skipped (behavior "
+              "unchanged).",
+              i);
       }
+    }
+
+    // f) Fallback: if segments did not classify and it isn't TU/macro, we try
+    // the old smallestCoveringInclude as a last resort for backwards
+    // compatibility.
+    debug("classify",
+          "#%d entering fallback smallestCoveringInclude; owner.kind=%s "
+          "includeId=%s",
+          i, owner.kind, owner.includeId);
+    if (auto *inc = SmallestCoveringInclude(h.aStart, h.aEnd)) {
+      const std::string headerPath = resolveHeaderPath(*inc);
+      debug("classify",
+            "#{0} -> INCLUDE id={1} path={2}  {3}  (fallback "
+            "smallestCoveringInclude)",
+            i, inc->id, headerPath, h);
+      auto [it, _] = perInclude.try_emplace(inc->id, inc);
+      it->second.Add(BuildIncludeInsertionPatch(*inc, h));
+      continue;
     }
 
     fatal(
@@ -274,10 +444,13 @@ std::string RefoldEngine::Refold() {
         h.aStart, h.aEnd);
   }
 
-  // Normalize/coalesce include-side insertions.
-  CoalesceIncludeInsertions(perInclude);
+  debug("plan", "perInclude.size={0} macroOwners={1} tuEdits(initial)={2}",
+        perInclude.size(), macroPatchesByOwner.size(), tuEdits.size());
 
-  // 4) Materialize include expansions bottom-up (nested first). Build child
+  // Normalize/coalesce include-side insertions.
+  OrderIncludeInsertions(perInclude);
+
+  // 5) Materialize include expansions bottom-up (nested first). Build child
   // lists by parent include id.
   DenseMap<int, std::vector<const RefoldModel::IncludeItem *>> children;
   for (const auto &ii : model_.GetIncludes()) {
@@ -285,7 +458,7 @@ std::string RefoldEngine::Refold() {
       children[*ii.parent].push_back(&ii);
   }
 
-  debug("include/tree", "BEGIN include children");
+  trace("include/tree", "BEGIN include children");
   for (const auto &[parentId, items] : children) {
     std::string pName = "#" + std::to_string(parentId);
     for (const RefoldModel::IncludeItem *child : items) {
@@ -297,7 +470,7 @@ std::string RefoldEngine::Refold() {
             child->cover.end);
     }
   }
-  debug("include/tree", "END include children");
+  trace("include/tree", "END include children");
 
   // Cache for realized expansion text per include id.
   DenseMap<int, std::string> includeExpansion;
@@ -324,14 +497,23 @@ std::string RefoldEngine::Refold() {
     }
   }
 
+  std::vector<int> seedsVec(seeds.begin(), seeds.end());
+  trace("include/mat", "seeds:");
+  trace("include/mat", "======");
+  logFormattedArray<int>(seedsVec, /* k */ MAX_COLS,
+                         /* sameWidth */ false,
+                         [](StringRef msg) { trace("include/mat", msg); });
+  trace("include/mat", sep);
+
   // (d) Realize each include once (memoization lives inside
   // MaterializeIncludeExpansion).
   for (int incId : seeds) {
+    debug("include/mat", "materialize seed include #{0}", incId);
     MaterializeIncludeExpansion(incId, perInclude, macroPatchesByOwner,
                                 children, includeExpansion);
   }
 
-  // 5a) TU macro patches (ownerIncludeId == kNoOwner) and include expansions at
+  // 6a) TU macro patches (ownerIncludeId == kNoOwner) and include expansions at
   // TU sites.
   if (auto it = macroPatchesByOwner.find(kNoOwner);
       it != macroPatchesByOwner.end()) {
@@ -339,38 +521,51 @@ std::string RefoldEngine::Refold() {
       auto text =
           PadAtBoundaries(tuBytes, mp.invStart, mp.invEnd, mp.replacement,
                           /*allowLeft*/ false, /*allowRight*/ true);
+      debug("macro/tu", "TU macro patch inv=[{0},{1}) replLen={2}", mp.invStart,
+            mp.invEnd, text.size());
       tuEdits.push_back(TextEdit{mp.invStart, mp.invEnd, std::move(text)});
     }
   }
 
-  // 5b) TU include expansions: includes with parent == null and site in TU,
+  // 6b) TU include expansions: includes with parent == null and site in TU,
   // only if we realized an expansion.
   for (const auto &kv : includeExpansion) {
     const auto *inc = model_.GetIncludeById(kv.first);
     if (!inc)
       continue;
     if (!inc->parent && PathsEqual(inc->sitePath, tuPath)) {
+      debug("include/tu", "TU include expansion inc#{0} site=[{1},{2}) len={3}",
+            inc->id, inc->siteB, inc->siteE, kv.second.size());
       tuEdits.push_back(TextEdit{inc->siteB, inc->siteE, kv.second});
     }
   }
 
   // Apply TU edits in descending order of start offset.
-  std::sort(
-      tuEdits.begin(), tuEdits.end(),
-      [](const TextEdit &a, const TextEdit &b) { return a.start > b.start; });
+  std::sort(tuEdits.begin(), tuEdits.end(),
+            [](const TextEdit &a, const TextEdit &b) {
+              if (a.start != b.start)
+                return a.start > b.start;
+              return a.end > b.end;
+            });
+  debug("tu/apply", "applying {0} TU edits", tuEdits.size());
 
   std::string out(tuBytes);
   for (const auto &e : tuEdits) {
-    if (e.start < 0 || e.end < e.start || e.end > static_cast<int>(out.size()))
+    if (e.start < 0 || e.end < e.start ||
+        e.end > static_cast<int>(out.size())) {
       fatal("tu/edits", "bad TU edit bounds [{0},{1}) size={2}", e.start, e.end,
             out.size());
+    }
+    trace("tu/apply", "TU edit bytes=[{0},{1}) len(text)={2}", e.start, e.end,
+          e.text.size());
     out.replace(static_cast<std::size_t>(e.start),
                 static_cast<std::size_t>(e.end - e.start), e.text);
   }
+  debug("plan", "REFOLD DONE tuResultLen=%d", out.length());
   return out;
 }
 
-// ================== A ↔ B token mapping & diff utilities ==================
+// ================== A ↔ B token mapping & diff utilities ===================
 
 std::vector<std::string> RefoldEngine::MapLexemes(ArrayRef<PPTok> toks,
                                                   ArrayRef<std::size_t> offs) {
@@ -388,7 +583,53 @@ std::vector<std::string> RefoldEngine::MapLexemes(ArrayRef<PPTok> toks,
   return out;
 }
 
-// ============ Boundary helpers ============
+std::vector<unsigned>
+RefoldEngine::ComputeOwnerDepthGapsForPP(size_t numOfAOffs) {
+  // aTokOff.size() == (#tokens) + 1 (sentinel). LCS expects N == #tokens,
+  // and ownerDepthGap.length == N + 1.
+  const size_t N = numOfAOffs - 1;
+  std::vector<unsigned> ownerDepthGap(N + 1, 0);
+
+  for (size_t k = 0; k <= N; ++k) {
+    // --------------------------- Include depth ----------------------------
+    std::optional<int> leftInc;
+    std::optional<int> rightInc;
+
+    if (k > 0) {
+      leftInc = model_.InnermostIncludeAtPP(k - 1);
+    }
+    if (k < N) {
+      rightInc = model_.InnermostIncludeAtPP(k);
+    }
+
+    std::optional<int> lca =
+        model_.LeastCommonAncestorInclude(leftInc, rightInc);
+    unsigned incDepth = model_.GetIncludeDepth(lca);
+
+    // ------------------------- Conditional depth --------------------------
+    std::optional<RefoldModel::ArmRef> leftArmRef;
+    std::optional<RefoldModel::ArmRef> rightArmRef;
+
+    if (k > 0) {
+      leftArmRef = model_.FindArmRefAtPP(k - 1);
+    }
+    if (k < N) {
+      rightArmRef = model_.FindArmRefAtPP(k);
+    }
+
+    unsigned leftCondDepth =
+        leftArmRef ? model_.GetCondArmDepth(leftArmRef->arm->id) : 0;
+    unsigned rightCondDepth =
+        rightArmRef ? model_.GetCondArmDepth(rightArmRef->arm->id) : 0;
+    unsigned condDepth = std::min(leftCondDepth, rightCondDepth);
+
+    ownerDepthGap[k] = incDepth + condDepth;
+  }
+
+  return ownerDepthGap;
+}
+
+// ============================= Boundary helpers ==============================
 
 bool RefoldEngine::BoundaryGlues(char left, char right) {
   const bool leftId = stringutils::isIdentChar(left);
@@ -433,97 +674,223 @@ std::string RefoldEngine::PadAtBoundaries(StringRef base, int start, int end,
   return text;
 }
 
-bool RefoldEngine::IsAtLineIndent(StringRef s, int pos) {
-  int i = pos - 1;
-  while (i >= 0 && i < static_cast<int>(s.size()) &&
-         s[static_cast<std::size_t>(i)] != '\n' &&
-         s[static_cast<std::size_t>(i)] != '\r') {
-    char c = s[static_cast<std::size_t>(i)];
-    if (c != ' ' && c != '\t')
-      return false;
-    --i;
-  }
-  return true;
-}
-
-std::array<int, 3> RefoldEngine::LineAndFuncNameStart(StringRef text, int pos) {
-  const int n = static_cast<int>(text.size());
-  int bol = pos;
-  while (bol > 0) {
-    char c = text[static_cast<std::size_t>(bol - 1)];
-    if (c == '\n' || c == '\r')
-      break;
-    --bol;
-  }
-  int eol = bol;
-  while (eol < n) {
-    char c = text[static_cast<std::size_t>(eol)];
-    if (c == '\n' || c == '\r')
-      break;
-    ++eol;
-  }
-  // First '(' on the line
-  int lparen = -1;
-  for (int i = bol; i < eol; ++i) {
-    if (text[static_cast<std::size_t>(i)] == '(') {
-      lparen = i;
-      break;
-    }
-  }
-  int fnStart = bol; // default is none
-  if (lparen >= 0) {
-    int j = lparen - 1;
-    // Skip spaces between name and '('
-    while (j >= bol && (text[static_cast<std::size_t>(j)] == ' ' ||
-                        text[static_cast<std::size_t>(j)] == '\t'))
-      --j;
-    // Skip pointer stars immediately to the left of name
-    while (j >= bol && text[static_cast<std::size_t>(j)] == '*')
-      --j;
-    // Now back over identifier
-    while (j >= bol &&
-           stringutils::isIdentChar(text[static_cast<std::size_t>(j)]))
-      --j;
-    fnStart = std::max(bol, j + 1);
-  }
-  return {bol, fnStart, eol};
-}
-
-int RefoldEngine::ShiftAnchorToLineIndentIfAtFuncName(StringRef text, int pos) {
-  auto b = LineAndFuncNameStart(text, pos);
-  int bol = b[0], fnStart = b[1], eol = b[2];
-  if (pos == fnStart) {
-    int p = bol;
-    while (p < eol) {
-      char c = text[static_cast<std::size_t>(p)];
-      if (c == ' ' || c == '\t') {
-        ++p;
-        continue;
-      }
-      break;
-    }
-    return p;
-  }
-  return pos;
-}
-
 // ===================== Owner resolution & TU mapping ======================
+
+RefoldEngine::Owner
+RefoldEngine::ClassifyOwnerWithSegments(StringRef tuPath,
+                                        const diffutils::Hunk &h) {
+  int a0 = h.aStart;
+  int a1 = h.aEnd;
+
+  debug("segments",
+        "ENTER classifyOwnerWithSegments tuPath={0} A[{1},{2}) (isEmpty={3})",
+        tuPath, a0, a1, a0 == a1);
+
+  // First, get the TU byte span for this hunk. Even when the hunk ultimately
+  // belongs to a header, we still anchor via the TU span because segments for
+  // includes and conditional arms in that header are projected into the TU
+  // through slots.
+  auto span = TUByteSpan(a0, a1, tuPath); // [b, e)
+
+  // If there is no truthful TU anchor (no TU tokens in the range, and the
+  // insertion cannot be safely anchored in TU), classify purely in PP space.
+  if (span.first < 0 || span.second < 0) {
+    const bool isInsert = (a0 == a1);
+    const auto &tokmapByPP = model_.GetTokmapByPP();
+    const size_t n = tokmapByPP.size();
+
+    std::optional<int> leftInc;
+    std::optional<int> rightInc;
+
+    std::optional<RefoldModel::ArmRef> leftArmRef;
+    std::optional<RefoldModel::ArmRef> rightArmRef;
+
+    if (isInsert) {
+      if (a0 > 0) {
+        leftInc = model_.InnermostIncludeAtPP(a0 - 1);
+        leftArmRef = model_.FindArmRefAtPP(a0 - 1);
+        if (static_cast<size_t>(a0) < n) {
+          rightInc = model_.InnermostIncludeAtPP(a0);
+          rightArmRef = model_.FindArmRefAtPP(a0);
+        }
+      }
+    } else {
+      leftInc = model_.InnermostIncludeAtPP(a0);
+      rightInc = model_.InnermostIncludeAtPP(a1 - 1);
+      leftArmRef = model_.FindArmRefAtPP(a0);
+      rightArmRef = model_.FindArmRefAtPP(a1 - 1);
+    }
+
+    std::optional<int> lcaInc =
+        model_.LeastCommonAncestorInclude(leftInc, rightInc);
+
+    std::optional<int> condArmId;
+    if (leftArmRef && rightArmRef && leftArmRef->arm && rightArmRef->arm &&
+        leftArmRef->arm->id == rightArmRef->arm->id) {
+      condArmId = leftArmRef->arm->id;
+    }
+
+    if (lcaInc) {
+      trace("segments",
+            "  no TU anchor for hunk [{0},{1}); PP-only owner INCLUDE id={2} "
+            "(condArmId={3})",
+            a0, a1, lcaInc, condArmId);
+      return Owner::Include(*lcaInc, condArmId);
+    }
+
+    // If we cannot establish an include owner, fall back to TU (this should
+    // only happen at TU boundaries where slot anchoring is missing).
+    trace("segments",
+          "  no TU anchor for hunk [{0},{1}); PP-only owner TU (condArmId={2})",
+          a0, a1, condArmId);
+    return Owner::TU(condArmId);
+  }
+
+  int b = span.first, e = span.second;
+  if (b > e)
+    std::swap(b, e);
+
+  trace("segments", "  TU byte span for A[{0},{1}) in {2} = [{3},{4})", a0, a1,
+        tuPath, b, e);
+
+  // Build (or fetch) all segments projected into tuPath.
+  ArrayRef<RefoldModel::Segment> segs = model_.GetSegmentsForFile(tuPath);
+  if (segs.empty()) {
+    debug("segments", "  no segments for file=%s; owner UNKNOWN", tuPath);
+    return Owner::Unknown();
+  }
+
+  // Step 1: find all candidate segments.
+  //
+  // For non-empty hunks: any overlap with [b,e) is a candidate.
+  // For pure INSERTs: the span is typically zero-width; treat the anchor as a
+  // point and include segments that contain the probe, with a right-closed
+  // convention to enable parent selection at boundaries.
+  const bool isInsert = (a0 == a1);
+  const int probe = b;
+
+  std::vector<const RefoldModel::Segment*> hits;
+  for (const auto &s : segs) {
+    if (!isInsert) {
+      if (s.e <= b || e <= s.b)
+        continue; // no intersection
+      hits.push_back(&s);
+    } else {
+      if (s.b <= probe && probe <= s.e)
+        hits.push_back(&s);
+    }
+  }
+
+  if (hits.empty()) {
+    debug("segments",
+          "  no candidate segments for {0} span [{1},{2}) (probe={3}, "
+          "isInsert={4}); owner UNKNOWN",
+          tuPath, b, e, probe, isInsert);
+    return Owner::Unknown();
+  }
+
+  // Step 2: pick the smallest (most specific) segment among the hits.
+  const RefoldModel::Segment *selected = hits[0];
+  for (size_t i = 1; i < hits.size(); ++i) {
+    const auto *s = hits[i];
+    int sLen = s->e - s->b;
+    int selLen = selected->e - selected->b;
+
+    if (sLen < selLen) {
+      selected = s;
+    } else if (sLen == selLen) {
+      if (s->b < selected->b) {
+        selected = s;
+      } else if (s->b == selected->b && s->e < selected->e) {
+        selected = s;
+      }
+    }
+  }
+
+  if (!selected->ownerIncludeId) {
+    trace("segments",
+          "  selected segment [{0},{1}) (probe={2}) owner TU (condArmId={3}) "
+          "for hunk [{4},{5})",
+          selected->b, selected->e, probe, selected->ownerCondArmId, a0, a1);
+    return Owner::TU(selected->ownerCondArmId);
+  } else {
+    trace("segments",
+          "  selected segment [{0},{1}) (probe={2}) owner INCLUDE id={3} "
+          "(condArmId={4}) for hunk [{5},{6})",
+          selected->b, selected->e, probe, selected->ownerIncludeId,
+          selected->ownerCondArmId, a0, a1);
+    return Owner::Include(*selected->ownerIncludeId, selected->ownerCondArmId);
+  }
+}
 
 const RefoldModel::IncludeItem *
 RefoldEngine::SmallestCoveringInclude(int aLo, int aHi) const {
+  trace("include/select",
+        "ENTER smallestCoveringInclude(aLo={0}, aHi={1})  (isEmpty={2})", aLo,
+        aHi, (aLo >= aHi));
+
   const RefoldModel::IncludeItem *best = nullptr;
   int bestWidth = std::numeric_limits<int>::max();
+  const bool isEmpty = (aLo >= aHi);
+
   for (const auto &inc : model_.GetIncludes()) {
-    if (inc.cover.begin < 0 || inc.cover.end < 0)
+    debug("include/select",
+          "  Considering include id={0} target={1} cover=[{2},{3})", inc.id,
+          inc.target, inc.cover.begin, inc.cover.end);
+
+    if (inc.cover.begin < 0 || inc.cover.end < 0) {
+      debug("include/select", "    -> SKIP (invalid coverage)");
       continue;
-    if (inc.cover.begin <= aLo && aHi <= inc.cover.end) {
-      int width = inc.cover.end - inc.cover.begin;
-      if (width < bestWidth) {
-        best = &inc;
-        bestWidth = width;
-      }
+    }
+
+    bool covers;
+    if (isEmpty) {
+      // Zero-width insertion
+      //
+      // Treat both boundary gaps as belonging to the include:
+      //   - gap at coverBegin (before the first PP token),
+      //   - gap at coverEnd   (after the last PP token),
+      // so we use <= on the right side instead of <.
+      covers = (inc.cover.begin <= aLo) && (aLo <= inc.cover.end);
+      debug("include/select",
+            "    Zero-width check (inclusive end): ({0} <= {1}) && ({2} <= "
+            "{3}) => {4}",
+            inc.cover.begin, aLo, aLo, inc.cover.end, covers);
+    } else {
+      // Non-empty deletion/substitution range
+      covers = (inc.cover.begin <= aLo) && (aHi <= inc.cover.end);
+      debug("include/select",
+            "    Non-empty check: ({0} <= {1}) && ({2} <= {3}) => {4}",
+            inc.cover.begin, aLo, aHi, inc.cover.end, covers);
+    }
+
+    if (!covers) {
+      debug("include/select", "    -> DOES NOT COVER (reject)");
+      continue;
+    }
+
+    // Compute interval width
+    int width = inc.cover.end - inc.cover.begin;
+    debug("include/select", "    -> COVERS, width={0} (current bestWidth={1})",
+          width, bestWidth);
+
+    if (width < bestWidth) {
+      debug("include/select", "       -> NEW BEST include id={0} (width={1})",
+            inc.id, width);
+      best = &inc;
+      bestWidth = width;
     }
   }
+
+  if (!best) {
+    debug("include/select", "EXIT smallestCoveringInclude => NONE");
+  } else {
+    debug("include/select",
+          "EXIT smallestCoveringInclude => include id={0} target={1} "
+          "cover=[{2},{3})",
+          best->id, best->target, best->cover.begin, best->cover.end);
+  }
+
   return best;
 }
 
@@ -549,6 +916,8 @@ RefoldEngine::SmallestCoveringMacro(int aStart, int aEnd) const {
 }
 
 bool RefoldEngine::HunkMapsToTU(int a0, int a1, StringRef tuPath) const {
+  trace("tu/own", "hunkMapsToTU: check ownership for A[{0},{1}) tu={2}", a0, a1,
+        tuPath);
   bool sawAnyTU = false;
   const auto &tokmapByPP = model_.GetTokmapByPP();
   for (int pp = a0; pp < a1; ++pp) {
@@ -556,82 +925,380 @@ bool RefoldEngine::HunkMapsToTU(int a0, int a1, StringRef tuPath) const {
     if (it == tokmapByPP.end())
       continue; // ignore unmapped (spaces/tabs/newlines)
     const auto &t = it->second;
-    if (!PathsEqual(t.file, tuPath))
+    if (!PathsEqual(t.file, tuPath)) {
+      trace("tu/own",
+            "hunkMapsToTU: A[{0},{1}) hits non-TU mapping at pp={2} file={3} "
+            "(tu={4}) -> false",
+            a0, a1, pp, t.file, tuPath);
       return false; // spans a non-TU mapping
+    }
     sawAnyTU = true;
   }
-  // Treat insertions (a0==a1) and whitespace-only ranges as TU-owned; span
-  // computed by neighbors.
-  return sawAnyTU || (a0 == a1);
+
+  // Non-empty range: if we only saw TU mappings (or nothing but whitespace),
+  // then the hunk maps to the TU. Otherwise it mapped to some header above.
+  if (a0 != a1) {
+    if (!sawAnyTU) {
+      trace("tu/own",
+            "hunkMapsToTU: A[{0},{1}) has no TU-mapped tokens "
+            "(unmapped/whitespace-only) -> false",
+            a0, a1);
+    }
+    return sawAnyTU;
+  }
+
+  // Pure insertion (a0 == a1): decide based on the nearest mapped neighbors.
+  // If both neighbors live in the same non-TU file, treat this as header-owned
+  // so that we expand that include instead of forcing a TU edit at EOF.
+  const RefoldModel::TokMapEntry *left = nullptr;
+  for (int pp = a0 - 1; pp >= 0; --pp) {
+    auto it = tokmapByPP.find(pp);
+    if (it != tokmapByPP.end()) {
+      left = &it->second;
+      break;
+    }
+  }
+  const RefoldModel::TokMapEntry *right = nullptr;
+  // Ensure a0 is at least 0 before treating it as an unsigned index
+  size_t startPP = (a0 < 0) ? 0 : static_cast<size_t>(a0);
+  for (size_t pp = startPP; pp < tokmapByPP.size(); ++pp) {
+    auto it = tokmapByPP.find(static_cast<int>(pp));
+    if (it != tokmapByPP.end()) {
+      right = &it->second;
+      break;
+    }
+  }
+
+  if (left && right) {
+    // Both sides mapped. If they are the same non-TU file, it is header-owned.
+    if (!PathsEqual(left->file, tuPath) && PathsEqual(left->file, right->file)) {
+      trace("tu/own",
+            "hunkMapsToTU: INSERT at pp={0} bracketed by same non-TU file "
+            "left='{1}' right='{2}' (tu='{3}') -> header-owned",
+            a0, left->file, right->file, tuPath);
+      return false;
+    }
+  }
+
+  // Single-sided cases: if the only neighbor we can see is non-TU,
+  // conservatively treat this as non-TU so that the include/segment
+  // logic gets a chance to own it.
+  if (left && !PathsEqual(left->file, tuPath)) {
+    trace("tu/own",
+          "hunkMapsToTU: INSERT at pp={0} left neighbor is non-TU file='{1}' "
+          "(tu='{2}'); right='{3}' -> header-owned",
+          a0, left->file, tuPath, (right ? right->file : "<null>"));
+    return false;
+  }
+  if (right && !PathsEqual(right->file, tuPath)) {
+    trace("tu/own",
+          "hunkMapsToTU: INSERT at pp=%d right neighbor is non-TU file='%s' "
+          "(tu='%s'); left='%s' -> header-owned",
+          a0, right->file, tuPath, (left ? left->file : "<null>"));
+    return false;
+  }
+
+  // Otherwise, either both neighbors are TU, or there are no neighbors at all.
+  // In both situations we treat this as a TU-owned insertion and let tuByteSpan
+  // place it using the neighbor-based heuristics.
+  return true;
 }
 
-std::array<int, 2> RefoldEngine::TUByteSpan(int a0, int a1,
-                                            StringRef tuPath) const {
-  constexpr int MAX = std::numeric_limits<int>::max();
-  int bMin = MAX, eMax = -1;
+std::optional<int>
+RefoldEngine::AnchorToNearestSlotBoundaryFromPPGap(StringRef tuPath,
+                                                   int ppGap) const {
+  // Candidate record for potential anchor points
+  struct Cand {
+    int pp; // PP coordinate for the boundary
+    int b;  // TU byte coordinate (possibly adjusted)
+    const RefoldModel::Slot *slot;
 
+    Cand(int pp, int b, const RefoldModel::Slot *slot)
+        : pp(pp), b(b), slot(slot) {}
+  };
+
+  // Read TU text for newline-aware slot adjustment
+  auto bufOrErr = MemoryBuffer::getFile(tuPath);
+  if (!bufOrErr) {
+    fatal("slot/anchor", "Unable to read TU: {0}", tuPath);
+    // Should be unreachable!
+  }
+  StringRef tuText = bufOrErr.get()->getBuffer();
+
+  // Helper to adjust slots that terminate on directive newlines
+  auto adjustSlot = [&tuText](const RefoldModel::Slot *s) -> int {
+    int b = s->b;
+
+    bool needsAdjustment =
+        llvm::StringSwitch<bool>(s->kind)
+            .Cases("after_include", "after_last_include", "arm_end", true)
+            .Default(false);
+    if (needsAdjustment)
+      return b;
+
+    if (b < 0 || (size_t)b >= tuText.size())
+      return b;
+
+    char c = tuText[b];
+    if (c == '\n')
+      return b + 1;
+    if (c == '\r') {
+      if ((size_t)(b + 1) < tuText.size() && tuText[b + 1] == '\n')
+        return b + 2;
+      return b + 1;
+    }
+    return b;
+  };
+
+  std::vector<Cand> cands;
+
+  // 1) Explicit TU slots that already carry 'pp'
+  for (const auto &s : model_.FindSlots(tuPath.str(), std::nullopt,
+                                        std::nullopt, std::nullopt)) {
+    if (!s->pp)
+      continue;
+
+    bool isBoundary =
+        StringSwitch<bool>(s->kind)
+            .Cases("file_begin", "file_end", "before_include", "after_include",
+                   "after_last_include", "arm_begin", "arm_end", true)
+            .Default(false);
+    if (isBoundary) {
+      cands.emplace_back(*s->pp, adjustSlot(s), s);
+    }
+  }
+
+  // 2) Include directive boundaries
+  for (const auto &inc : model_.GetIncludes()) {
+    if (tuPath != inc.sitePath)
+      continue;
+
+    int incBeginPP = MinPPBegin(inc.spans);
+    int incEndPP = MaxPPEnd(inc.spans);
+
+    if (incBeginPP >= 0) {
+      if (auto s = model_.GetBeforeIncludeSlot(inc.id))
+        cands.emplace_back(incBeginPP, adjustSlot(*s), *s);
+    }
+    if (incEndPP >= 0) {
+      if (auto s = model_.GetAfterIncludeSlot(inc.id))
+        cands.emplace_back(incEndPP, adjustSlot(*s), *s);
+    }
+  }
+
+  // 3) Conditional arm boundaries
+  for (const auto &g : model_.GetConds()) {
+    if (tuPath != g.file)
+      continue;
+    for (const auto &a : g.arms) {
+      if (!a.ppSpan.has_value())
+        continue;
+
+      int armBeginPP = a.ppSpan->begin;
+      int armEndPP = a.ppSpan->end;
+
+      if (armBeginPP >= 0) {
+        if (auto s = model_.GetArmBeginSlot(a.id))
+          cands.emplace_back(armBeginPP, adjustSlot(*s), *s);
+      }
+      if (armEndPP >= 0) {
+        if (auto s = model_.GetArmEndSlot(a.id))
+          cands.emplace_back(armEndPP, adjustSlot(*s), *s);
+      }
+    }
+  }
+
+  if (cands.empty())
+    return std::nullopt;
+
+  // Filter for EXACT matches to the ppGap
+  std::vector<const Cand *> exact;
+  for (const auto &c : cands) {
+    if (c.pp == ppGap)
+      exact.push_back(&c);
+  }
+
+  if (exact.empty())
+    return std::nullopt;
+
+  // Priority tie-breaking logic
+  auto getPriority = [](StringRef kind) -> int {
+    if (kind == "before_include")
+      return 0;
+    if (kind == "after_include")
+      return 1;
+    if (kind == "after_last_include")
+      return 2;
+    if (kind == "arm_begin")
+      return 3;
+    if (kind == "arm_end")
+      return 4;
+    if (kind == "file_begin")
+      return 5;
+    if (kind == "file_end")
+      return 6;
+    return 100;
+  };
+
+  const Cand *best = nullptr;
+  for (const auto *c : exact) {
+    if (!best) {
+      best = c;
+      continue;
+    }
+    int pc = getPriority(c->slot->kind);
+    int pb = getPriority(best->slot->kind);
+
+    // Tie-break: Priority -> Byte Offset -> Slot ID
+    if (pc < pb || (pc == pb && c->b < best->b) ||
+        (pc == pb && c->b == best->b && c->slot->id < best->slot->id)) {
+      best = c;
+    }
+  }
+
+  return best ? std::optional<int>(best->b) : std::nullopt;
+}
+
+std::pair<int, int>
+RefoldEngine::TUByteSpan(int a0, int a1, StringRef tuPath) const {
+  if (a0 > a1)
+    std::swap(a0, a1);
+
+  const bool isEmpty = (a0 == a1);
   const auto &tokmapByPP = model_.GetTokmapByPP();
 
-  // First pass: try to find mapped TU tokens inside [a0,a1)
-  for (int pp = a0; pp < a1; ++pp) {
-    auto it = tokmapByPP.find(pp);
+  // For pure insertions, first prefer an explicit slot boundary (file_begin,
+  // before_include, after_include, arm_begin, arm_end, file_end, ...).
+  if (isEmpty) {
+    if (std::optional<int> slotAnchor =
+            AnchorToNearestSlotBoundaryFromPPGap(tuPath, a0)) {
+      return {*slotAnchor, *slotAnchor};
+    }
+  }
+
+  // Non-empty: compute min/max over TU-mapped subset only.
+  int minB = std::numeric_limits<int>::max();
+  int maxE = std::numeric_limits<int>::min();
+  bool foundTuToken = false;
+
+  for (int i = a0; i < a1; ++i) {
+    auto it = tokmapByPP.find(i);
     if (it == tokmapByPP.end())
-      continue; // ignore unmapped (whitespace)
-    const auto &t = it->second;
-    if (PathsEqual(t.file, tuPath)) {
-      if (t.b < bMin)
-        bMin = t.b;
-      if (t.e > eMax)
-        eMax = t.e;
+      continue;
+
+    const auto &ent = it->second;
+    if (ent.file.empty() || ent.file != tuPath)
+      continue;
+    if (ent.b < 0 || ent.e < 0)
+      continue;
+
+    if (ent.b < minB) minB = ent.b;
+    if (ent.e > maxE) maxE = ent.e;
+    foundTuToken = true;
+  }
+
+  if (foundTuToken) {
+    return {minB, maxE};
+  }
+
+  // Empty insertion with no slot anchor: only anchor to a TU neighbor token
+  // when the insertion is TU-owned. If either neighbor is in a header/include,
+  // we must NOT fabricate a TU interval (that causes include insertions to snap
+  // to TU boundaries).
+  if (isEmpty) {
+    // Find closest mapped neighbors.
+    const RefoldModel::TokMapEntry *left = nullptr;
+    for (int i = a0 - 1; i >= 0; --i) {
+      auto it = tokmapByPP.find(i);
+      if (it != tokmapByPP.end() && !it->second.file.empty() &&
+          it->second.b >= 0 && it->second.e >= 0) {
+        left = &it->second;
+        break;
+      }
+    }
+
+    const RefoldModel::TokMapEntry *right = nullptr;
+    const int ppCount = model_.GetTokensCountA();
+    for (int i = a0; i < ppCount; ++i) {
+      auto it = tokmapByPP.find(i);
+      if (it != tokmapByPP.end() && !it->second.file.empty() &&
+          it->second.b >= 0 && it->second.e >= 0) {
+        right = &it->second;
+        break;
+      }
+    }
+
+    // If both neighbors exist and are in the same non-TU file, this gap is
+    // clearly inside that header/include; return no TU span.
+    if (left && right && left->file != tuPath && left->file == right->file) {
+      return {-1, -1};
+    }
+
+    // If either neighbor is a non-TU file, treat as header/arm-owned.
+    if ((left && left->file != tuPath) || (right && right->file != tuPath)) {
+      return {-1, -1};
+    }
+
+    // Otherwise, anchor to the nearest TU neighbor.
+    if (right && right->file == tuPath) {
+      return {right->b, right->b};
+    }
+    if (left && left->file == tuPath) {
+      return {left->e, left->e};
     }
   }
-  if (bMin != MAX)
-    return {bMin, eMax};
 
-  uint64_t fileLen = 0;
-  if (auto ec = sys::fs::file_size(tuPath, fileLen)) {
-    fatal("tu/bytespan", "file_size() failed: {0} (value={1} category={2})",
-          ec.message(), ec.value(), ec.category().name());
-  }
-  if (fileLen > std::numeric_limits<int>::max()) {
-    fatal("tu/bytespan", "file '{0}' is too large to fit in int ({1} bytes)",
-          tuPath, fileLen);
+  // No TU tokens in [a0,a1) (and no safe TU insertion anchor).
+  return {-1, -1};
+}
+
+const RefoldModel::IncludeItem *
+RefoldEngine::BoundaryParentIncludeForPureInsertion(const diffutils::Hunk &h,
+                                                    StringRef tuPath) const {
+  // We only care about pure insertions: A is empty, B is non-empty.
+  if (h.aStart != h.aEnd || h.bStart >= h.bEnd) {
+    return nullptr;
   }
 
-  // Left boundary: end of the closest preceding TU-mapped token (or BOF).
-  int leftE = -1;
-  for (int p = a0 - 1; p >= 0; --p) {
-    int e = ByteEndForPPInFile(tuPath, p, /*fallbackToEOF*/ false,
-                               static_cast<int>(fileLen));
-    if (e >= 0) {
-      leftE = e;
-      break;
-    }
-    auto it = tokmapByPP.find(p);
-    if (it != tokmapByPP.end() && !PathsEqual(it->second.file, tuPath))
-      break; // crossed into non-TU region
-  }
-  if (leftE < 0)
-    leftE = 0; // BOF
+  const int aPos = h.aStart;
+  const int maxPP = model_.GetTokensCountA();
 
-  // Right boundary: begin of the closest following TU-mapped token (or EOF).
-  int rightB = -1;
-  const int tokCount = static_cast<int>(tokmapByPP.size());
-  for (int p = a1; p < tokCount; ++p) {
-    int b = ByteStartForPPInFile(tuPath, p, /*fallbackToEOF*/ false,
-                                 static_cast<int>(fileLen));
-    if (b >= 0) {
-      rightB = b;
-      break;
-    }
-    auto it = tokmapByPP.find(p);
-    if (it != tokmapByPP.end() && !PathsEqual(it->second.file, tuPath))
-      break; // crossed into non-TU region
-  }
-  if (rightB < 0)
-    rightB = static_cast<int>(fileLen); // EOF
+  // Find the nearest concrete tokens on the left / right in PP space.
+  const auto *leftEntry =
+      FindNearestTokmapEntry(std::min(aPos - 1, maxPP), -1, maxPP);
+  const auto *rightEntry =
+      FindNearestTokmapEntry(std::min(aPos, maxPP), 1, maxPP);
 
-  return {leftE, rightB};
+  std::optional<int> leftIncId =
+      leftEntry ? model_.InnermostIncludeAtPP(leftEntry->pp) : std::nullopt;
+  std::optional<int> rightIncId =
+      rightEntry ? model_.InnermostIncludeAtPP(rightEntry->pp) : std::nullopt;
+
+  // If both sides resolve to the same include (or both TU), this is not a
+  // boundary between siblings – let the normal owner logic handle it.
+  if (leftIncId == rightIncId) {
+    return nullptr;
+  }
+
+  // Otherwise, attach the insertion to the lowest common ancestor include.
+  // If either side is TU (nullopt) or they meet only at TU, LCA is nullopt
+  // and the TU owns the insertion (caller will treat as TU-level hunk).
+  std::optional<int> parentId =
+      model_.LeastCommonAncestorInclude(leftIncId, rightIncId);
+  if (!parentId) {
+    return nullptr; // TU-owned
+  }
+
+  const RefoldModel::IncludeItem *parent = model_.GetIncludeById(*parentId);
+  if (!parent) {
+    return nullptr;
+  }
+
+  debug("owner",
+        "pure-ins boundary at A[{0}]: leftInc={1} rightInc={2} parent={3}",
+        aPos, leftIncId, rightIncId, parentId);
+
+  return parent;
 }
 
 // ==================== Patch builders (include & macro) ====================
@@ -688,6 +1355,43 @@ bool RefoldEngine::MacroExpansionEnvelopeB(
   begin = lo;
   end = hi;
   return true;
+}
+
+RefoldEngine::IncludePatch
+RefoldEngine::BuildIncludeInsertionPatch(const RefoldModel::IncludeItem &inc,
+                                         const diffutils::Hunk &h) const {
+  // Extra debug: show the raw PP hunk slices.
+  DebugIncludePatch("pre", inc, h);
+
+  std::string insertBytes;
+
+  // Validate hunk bounds against B-token offsets
+  if (h.bStart >= 0 && static_cast<size_t>(h.bStart) < bTokOff_.size() &&
+      h.bEnd >= 0 && static_cast<size_t>(h.bEnd) <= bTokOff_.size() &&
+      h.bEnd >= h.bStart) {
+
+    int b0 = bTokOff_[h.bStart];
+    int b1 = bTokOff_[h.bEnd];
+
+    // Clamp byte offsets to the actual length of bSource_
+    const size_t sourceLen = bSource_.size();
+    b0 = std::max(0, std::min(b0, static_cast<int>(sourceLen)));
+    b1 = std::max(0, std::min(b1, static_cast<int>(sourceLen)));
+
+    if (b1 >= b0) {
+      insertBytes = bSource_.substr(b0, b1 - b0).str();
+    }
+  }
+
+  IncludePatch patch{&inc,  std::move(insertBytes), h.aStart, h.aEnd, h.bStart,
+                     h.bEnd};
+
+  trace("include/patch",
+        "built inc #{0} patch A[{1},{2})->B[{3},{4}) len(insertBytes)={5}",
+        inc.id, patch.aStart, patch.aEnd, patch.bStart, patch.bEnd,
+        patch.insertBytes.size());
+
+  return patch;
 }
 
 RefoldEngine::MacroPatch RefoldEngine::BuildMacroInvocationPatchWholeCover(
@@ -861,219 +1565,6 @@ RefoldEngine::MacroPatch RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
 // =========== Include processing (normalize, materialize, apply) ===========
 
-void RefoldEngine::CoalesceIncludeInsertions(
-    DenseMap<int, IncludeEdits> &perInclude) const {
-  for (auto &kv : perInclude) {
-    auto &ie = kv.second;
-    if (!ie.include || ie.patches.empty())
-      continue;
-
-    std::sort(ie.patches.begin(), ie.patches.end(),
-              [](const IncludePatch &x, const IncludePatch &y) {
-                if (x.aStart != y.aStart)
-                  return x.aStart < y.aStart;
-                return x.bStart < y.bStart;
-              });
-
-    std::vector<IncludePatch> merged;
-    for (std::size_t i = 0; i < ie.patches.size();) {
-      IncludePatch p = ie.patches[i];
-
-      // Only coalesce pure insertions (A[as,ae) empty).
-      if (p.aStart == p.aEnd) {
-        int bStartIdx = p.bStart;
-        int bEndIdxEx = p.bEnd;
-
-        // Widen B-start leftwards across a same-line run of type-ish tokens.
-        int k = bStartIdx - 1;
-        bool sawNl = false;
-        int earliestTypeTok = -1;
-
-        // Walk left across whitespace tokens; track if we cross a newline.
-        while (k >= 0) {
-          std::size_t ts = bTokOff_[k], te = bTokOff_[k + 1];
-          StringRef tok(bSource_.data() + ts, te - ts);
-
-          if (stringutils::isAsciiWhitespace(tok.str())) {
-            if (tok.contains('\n') || tok.contains('\r')) {
-              sawNl = true;
-              break;
-            }
-            --k;
-            continue;
-          }
-
-          // Non-whitespace token found
-          if (sawNl)
-            break;
-          if (!stringutils::isTypeishToken(tok.str()))
-            break;
-
-          // Remember it and try to extend further left.
-          earliestTypeTok = k;
-          --k;
-        }
-
-        if (earliestTypeTok >= 0) {
-          // include the entire type-ish prefix run (and trailing WS)
-          bStartIdx = earliestTypeTok;
-        }
-
-        // We'll build the text incrementally from left + gap + right...
-        std::string left(bSource_.data() + bTokOff_[bStartIdx],
-                         bSource_.data() + bTokOff_[bEndIdxEx]);
-
-        std::size_t j = i + 1;
-        while (j < ie.patches.size()) {
-          const auto &q = ie.patches[j];
-          if (q.aStart != q.aEnd)
-            break; // stop at non-insert
-          if (q.aStart > ie.patches[i].aStart + 1)
-            break; // keep it very local (same site)
-
-          // Combine: include the matched B gap and the next insert bytes.
-          std::string gap(bSource_.data() + bTokOff_[bEndIdxEx],
-                          bSource_.data() + bTokOff_[q.bStart]);
-          std::string right(bSource_.data() + bTokOff_[q.bStart],
-                            bSource_.data() + bTokOff_[q.bEnd]);
-
-          // If identifiers touch across the gap, ensure a single space.
-          if (!gap.empty() && !right.empty() &&
-              stringutils::isIdentChar(gap.back()) &&
-              stringutils::isIdentChar(right.front())) {
-            gap.push_back(' ');
-          }
-
-          left += gap;
-          left += right;
-          bEndIdxEx = q.bEnd;
-          ++j;
-        }
-
-        // DEBUG: show payload tail and next few B tokens at splice (only the
-        // last ~80 chars of the merged payload)
-        std::string tail =
-            (left.size() <= 80) ? left : left.substr(left.size() - 80);
-        debug("include/norm", "inc#{0} seed payload tail(len={1}): '{2}'",
-              ie.include->id, left.size(), stringutils::showWS(tail));
-
-        // show next 5 tokens starting at bEndIdxEx (skipping whitespace in the
-        // loop below anyway)
-        std::string tokWin;
-        int kDbg = bEndIdxEx, shown = 0;
-        while (kDbg < static_cast<int>(bTokOff_.size()) - 1 && shown < 5) {
-          StringRef t(bSource_.data() + bTokOff_[kDbg],
-                      bTokOff_[kDbg + 1] - bTokOff_[kDbg]);
-          tokWin.push_back('[');
-          tokWin += stringutils::showWS(t.str());
-          tokWin.push_back(']');
-          ++kDbg;
-          ++shown;
-        }
-        debug("include/norm", "inc#{0} next tokens @bEndIdxEx={1}: {2}",
-              ie.include->id, bEndIdxEx, tokWin);
-
-        // 1) If left contains a newline, check the last line of the payload:
-        //    if it redundantly starts with the *next* non-WS token in B at
-        //    the splice, drop that duplicate token from the payload's last
-        //    line.
-        auto lastNl = left.rfind('\n');
-        if (lastNl != std::string::npos && lastNl + 1 < left.size()) {
-          std::string afterNl = left.substr(lastNl + 1);
-
-          // Find the next non-WS token in B starting at current end anchor.
-          std::string nextTok;
-          int k = bEndIdxEx;
-          while (k < static_cast<int>(bTokOff_.size()) - 1) {
-            StringRef tok(bSource_.data() + bTokOff_[k],
-                          bTokOff_[k + 1] - bTokOff_[k]);
-            if (!stringutils::isAsciiWhitespace(tok.str())) {
-              nextTok = tok.str();
-              break;
-            }
-            ++k;
-          }
-
-          // Leading ws count after the newline in the payload.
-          std::size_t ws = 0;
-          while (ws < afterNl.size()) {
-            char c = afterNl[ws];
-            if (c == ' ' || c == '\t' || c == '\r')
-              ++ws;
-            else
-              break;
-          }
-
-          std::string afterNlPreview =
-              (afterNl.size() <= 60) ? afterNl : afterNl.substr(0, 60);
-          debug("include/norm/drop",
-                "inc#{0} lastNl={1} ws={2} nextTok='{3}' afterNl[0..60]='{4}'",
-                ie.include->id, lastNl, ws, stringutils::showWS(nextTok),
-                stringutils::showWS(afterNlPreview));
-
-          // If our payload already starts that next line with the same token
-          // the header naturally has at the splice point (e.g., "int "), drop
-          // that duplicate token from the payload (keep the newline so the
-          // next decl stays on its own line).
-          bool startsDup = !nextTok.empty() && ws < afterNl.size() &&
-                           afterNl.compare(ws, nextTok.size(), nextTok) == 0;
-          if (startsDup) {
-            std::size_t drop = ws + nextTok.size();
-            if (afterNl.size() > drop && afterNl[drop] == ' ')
-              ++drop;
-
-            debug("include/norm/drop",
-                  "inc#{0} DROP dup leading token: ws={1} tokLen={2} "
-                  "totalDrop={3}",
-                  ie.include->id, ws, nextTok.size(), drop - ws);
-
-            afterNl = afterNl.substr(drop);
-            left = left.substr(0, lastNl + 1) + afterNl;
-
-            // DEBUG: show new tail after drop
-            std::string newTail =
-                (left.size() <= 80) ? left : left.substr(left.size() - 80);
-            debug("include/norm/drop", "inc#{0} payload tail after drop: '{1}'",
-                  ie.include->id, stringutils::showWS(newTail));
-          } else {
-            debug("include/norm/drop", "inc#{0} NO drop: startsDup=false",
-                  ie.include->id);
-          }
-        }
-
-        // 2) Single-line legacy trim: if there is exactly one newline and
-        //    only newline chars after it, trim to that newline. Otherwise,
-        //    keep true multi-line payloads intact.
-        auto nl = left.find('\n');
-        if (nl != std::string::npos) {
-          bool onlyTrailingNewlines = true;
-          for (std::size_t t = nl + 1; t < left.size(); ++t) {
-            char c = left[t];
-            if (c != '\n' && c != '\r') {
-              onlyTrailingNewlines = false;
-              break;
-            }
-          }
-          if (onlyTrailingNewlines)
-            left.resize(nl + 1);
-        }
-
-        // Anchor at the first patch's A-position (insertion), B span is the
-        // merged (possibly widened) range.
-        merged.push_back(IncludePatch{ie.include, ie.patches[i].aStart,
-                                      ie.patches[i].aStart, bStartIdx,
-                                      bEndIdxEx, std::move(left)});
-        i = j;
-      } else {
-        merged.push_back(std::move(p));
-        ++i;
-      }
-    }
-
-    ie.patches.swap(merged);
-  }
-}
-
 void RefoldEngine::MaterializeIncludeExpansion(
     int includeId, const DenseMap<int, IncludeEdits> &perInclude,
     const DenseMap<int, std::vector<MacroPatch>> &macroPatchesByOwner,
@@ -1081,11 +1572,14 @@ void RefoldEngine::MaterializeIncludeExpansion(
         &children,
     DenseMap<int, std::string> &includeExpansion) const {
   // Already materialized?
-  if (includeExpansion.count(includeId))
+  if (includeExpansion.count(includeId)) {
+    debug("include/mat", "SKIP inc#{0} (already materialized)", includeId);
     return;
+  }
 
   const auto *inc = model_.GetIncludeById(includeId);
-  if (!inc) {
+  if (LLVM_UNLIKELY(!inc)) {
+    // This should not be possible, but it's always nice to be defensive.
     fatal("include/mat", "unknown include id {0}", includeId);
   }
 
@@ -1101,10 +1595,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
   if (auto it = includeExpansion.find(includeId); it != includeExpansion.end())
     bytes = it->second;
   if (bytes.empty()) {
-    const std::string headerPath =
-        (inc->resolvedPath && !inc->resolvedPath->empty())
-            ? *inc->resolvedPath
-            : StripHeaderToken(inc->target);
+    const std::string headerPath = resolveHeaderPath(*inc);
 
     auto bufOrErr = MemoryBuffer::getFile(headerPath);
     if (!bufOrErr) {
@@ -1115,7 +1606,21 @@ void RefoldEngine::MaterializeIncludeExpansion(
     // Treat as raw bytes; copy into std::string
     const MemoryBuffer &mb = **bufOrErr;
     bytes.assign(mb.getBufferStart(), mb.getBufferEnd());
+  } else {
+    debug("include/mat", "inc#{0} using preseeded bytes len={1}", inc->id,
+          bytes.size());
   }
+
+  auto editsIt = perInclude.find(includeId);
+  auto macroIt = macroPatchesByOwner.find(includeId);
+  auto childIt = children.find(includeId);
+
+  debug("include/mat",
+        "inc#{0} initialHeaderLen={1} patches={2} macroPatches={3} children={4}",
+        inc->id, bytes.size(),
+        (editsIt != perInclude.end()) ? editsIt->second.patches.size() : 0,
+        (macroIt != macroPatchesByOwner.end()) ? macroIt->second.size() : 0,
+        (childIt != children.end()) ? childIt->second.size() : 0);
 
   // Collect byte-level edits to apply within this header.
   std::vector<TextEdit> edits;
@@ -1124,14 +1629,25 @@ void RefoldEngine::MaterializeIncludeExpansion(
   // in the owner’s file space).
   if (auto it = macroPatchesByOwner.find(includeId);
       it != macroPatchesByOwner.end()) {
-    for (const auto &mp : it->second)
+    for (const auto &mp : it->second) {
+      debug("include/mat", "inc#{0} macroPatch inv=[{1},{2}) replLen={3}",
+            inc->id, mp.invStart, mp.invEnd, mp.replacement.size());
       edits.push_back(TextEdit{mp.invStart, mp.invEnd, mp.replacement});
+    }
   }
 
   // 2) A/B include insert/delete/replace patches that belong to this include.
   if (auto it = perInclude.find(includeId); it != perInclude.end()) {
-    if (!it->second.patches.empty())
+    if (!it->second.patches.empty()) {
+      debug("include/mat",
+            "inc#{0} applying {1} include patches via applyIncludeEdits",
+            inc->id, it->second.patches.size());
       bytes = ApplyIncludeEdits(it->second, std::move(bytes));
+    } else {
+      debug("include/mat", "inc#{0} has no include patches", inc->id);
+    }
+  } else {
+    debug("include/mat", "inc#{0} has no include patches", inc->id);
   }
 
   auto hasDescendantWork = [&](auto &&self, int id) -> bool {
@@ -1207,6 +1723,10 @@ void RefoldEngine::MaterializeIncludeExpansion(
       } else {
         // Defensive fallback: if site is somehow unmapped, skip replacing.
         // (This keeps behavior deterministic instead of crashing.)
+        debug("include/mat",
+              "inc#{0} child#{1} has degenerate site [start={2},end={3}]; "
+              "skipping TextEdit",
+              inc->id, child->id, siteStart, siteEnd);
       }
     }
   }
@@ -1215,432 +1735,409 @@ void RefoldEngine::MaterializeIncludeExpansion(
   std::sort(
       edits.begin(), edits.end(),
       [](const TextEdit &a, const TextEdit &b) { return a.start > b.start; });
+  debug("include/mat", "inc#{0} applying {1} header TextEdits", inc->id,
+        edits.size());
+
   for (const auto &e : edits) {
     if (e.start < 0 || e.end < e.start ||
-        e.end > static_cast<int>(bytes.size()))
+        e.end > static_cast<int>(bytes.size())) {
       fatal("inc/mat", "bad include edit [{0},{1})", e.start, e.end);
+    }
+    trace("include/mat",
+          "inc#{0} header TextEdit bytes=[{1},{2}) replLen={3}",
+          inc->id, e.start, e.end, e.text.size());
     bytes.replace(static_cast<std::size_t>(e.start),
                   static_cast<std::size_t>(e.end - e.start), e.text);
   }
 
-  debug("include/mat", "EXIT inc#{0} resultLen={1}", inc->id, bytes.size());
-
   includeExpansion[includeId] = std::move(bytes);
+
+  debug("include/mat", "EXIT inc#{0} resultLen={1}", inc->id, bytes.size());
+}
+
+const RefoldModel::HeaderDecl *
+RefoldEngine::FindHeaderDeclForPatch(const RefoldModel::IncludeItem &inc,
+                                     const IncludePatch &p) {
+  if (inc.decls.empty())
+    return nullptr;
+
+  const int aLo = p.aStart;
+  const int aHi = p.aEnd;
+
+  const RefoldModel::HeaderDecl *bestCover = nullptr;
+  const RefoldModel::HeaderDecl *bestOverlap = nullptr;
+
+  auto getSpanLen = [](const RefoldModel::HeaderDecl *d) {
+    return d->ppSpan.end - d->ppSpan.begin;
+  };
+
+  for (const auto &d : inc.decls) {
+    const int dLo = d.ppSpan.begin;
+    const int dHi = d.ppSpan.end;
+    const int curSpanLen = dHi - dLo;
+
+    // Pure insertion: treat as attached at aLo
+    if (aLo == aHi) {
+      // Special case: insertions at decl end are treated as inclusive
+      const bool inside = (aLo >= dLo && aLo <= dHi);
+      if (!inside)
+        continue;
+
+      if (!bestCover || curSpanLen < getSpanLen(bestCover))
+        bestCover = &d;
+      continue;
+    }
+
+    // Non-empty A-interval
+    const bool covers = (aLo >= dLo && aHi <= dHi);
+    const bool overlaps = (aLo < dHi && aHi > dLo);
+
+    if (covers) {
+      if (!bestCover || curSpanLen < getSpanLen(bestCover))
+        bestCover = &d;
+    } else if (overlaps) {
+      if (!bestOverlap || curSpanLen < getSpanLen(bestOverlap))
+        bestOverlap = &d;
+    }
+  }
+
+  return bestCover ? bestCover : bestOverlap;
 }
 
 std::string RefoldEngine::ApplyIncludeEdits(const IncludeEdits &ie,
                                             std::string headerText) const {
-  const std::string file =
-      (ie.include->resolvedPath && !ie.include->resolvedPath->empty())
-          ? *ie.include->resolvedPath
-          : StripHeaderToken(ie.include->target);
+  const std::string file = resolveHeaderPath(*ie.include);
 
   const int fileLen = static_cast<int>(headerText.size());
+
+  debug("include/apply",
+        "ENTER applyIncludeEdits file={0} len={1} patches={2} cover=[{3},{4})",
+        file, fileLen, ie.patches.size(), ie.include->cover.begin,
+        ie.include->cover.end);
+
+  // PP cover for this include inside the header; if not present, these will
+  // already have been derived from spans when building the model.
+  const int coverBegin = std::max(0, ie.include->cover.begin);
+  const int coverEnd = std::max(coverBegin, ie.include->cover.end);
+
+  // Single list of edits; we will apply them highest-offset-first so indices
+  // remain stable as we mutate the StringBuilder.
   std::vector<TextEdit> edits;
 
-  const auto &tokmapByPP = model_.GetTokmapByPP();
+  for (size_t idx = 0; idx < ie.patches.size(); ++idx) {
+    const IncludePatch &p = ie.patches[idx];
+    trace("include/patch", "applyIncludeEdits: patch={0}", p.ToString());
 
-  for (const auto &p : ie.patches) {
     const bool isInsert = (p.aStart == p.aEnd) && (p.bStart < p.bEnd);
     const bool isDelete = (p.aStart < p.aEnd) && (p.bStart == p.bEnd);
     const bool isReplace = (p.aStart < p.aEnd) && (p.bStart < p.bEnd);
 
-    int startByte = -1, endByte = -1;
+    debug("include/apply",
+          "file={0} patch[{1}] raw A=[{2},{3}) B=[{4},{5}) isInsert={6} "
+          "isDelete={7} isReplace={8}",
+          file, idx, p.aStart, p.aEnd, p.bStart, p.bEnd, isInsert, isDelete,
+          isReplace);
 
+    if (!isInsert && !isDelete && !isReplace) {
+      // Ignore empty or malformed patches defensively.
+      debug("include/apply",
+            "file={0} patch[{1}] ignored (no-op classification)", file, idx);
+      continue;
+    }
+
+    // Decide which logical header decl "owns" this patch, if any.
+    const auto *decl = FindHeaderDeclForPatch(*ie.include, p);
+
+    if (decl) {
+      debug("include/apply",
+            "file={0} patch[{1}] ownerDecl kind={2} name={3} header=[{4},{5}) "
+            "ppSpan=[{6},{7})",
+            file, idx, decl->kind, decl->name, decl->headerB, decl->headerE,
+            decl->ppSpan.begin, decl->ppSpan.end);
+    } else {
+      debug("include/apply", "file={0} patch[{1}] ownerDecl=<none>", file, idx);
+    }
+
+    // Effective PP coverage in this header we're allowed to touch.
+    // For INSERTs we deliberately work at include scope so that inserts that
+    // land exactly at a declaration boundary (for example, between
+    // `int yyy(...);` and `int zzz(...);`) can anchor to the first token
+    // of the following declaration rather than being forced back inside the
+    // previous one.  For DELETE / REPLACE we restrict to the owning decl.
+    int ppLo = coverBegin;
+    int ppHi = coverEnd;
+    if (!isInsert && decl) {
+      ppLo = std::max(ppLo, decl->ppSpan.begin);
+      ppHi = std::min(ppHi, decl->ppSpan.end);
+    }
+    ppHi = std::max(ppHi, ppLo);
+
+    trace("include/apply",
+          "file={0} patch[{1}] effectivePP=[{2},{3}) cover=[{4},{5})", file,
+          idx, ppLo, ppHi, coverBegin, coverEnd);
+
+    int startByte = -1;
+    int endByte = -1;
+
+    const auto &tokmapByPP = model_.GetTokmapByPP();
     if (isInsert) {
-      int insertAt = -1;
+      // INSERT: interpret A-position as "before the next token" in this header.
+      const int pos = p.aStart;
+      int anchorPP = -1;
 
-      if (!INSERT_AFTER_LEFT_TOKEN_EOL) {
-        // Prefer right-neighbor (start of token at aStart) in this file.
-        insertAt = ByteStartForPPInFile(file, p.aStart,
-                                        /*fallbackToEOF*/ false, fileLen);
-        trace("include/anchor",
-              "inc#{0} right-neighbor start: pp={1} -> byte={2}",
-              ie.include->id, p.aStart, insertAt);
+      // 1) Prefer the right neighbor: smallest pp >= pos in [ppLo, ppHi).
+      for (int pp = std::max(pos, ppLo); pp < ppHi; ++pp) {
+        auto it = tokmapByPP.find(pp);
+        if (it != tokmapByPP.end() && PathsEqual(it->second.file, file)) {
+          anchorPP = pp;
+          break;
+        }
+      }
 
-        // If that PP index doesn't belong to this header, try the left neighbor
-        // end.
-        if (insertAt < 0) {
-          int leftPP = p.aStart - 1;
-          if (leftPP >= ie.include->cover.begin) {
-            int leftEnd = ByteEndForPPInFile(file, leftPP,
-                                             /*fallbackToEOF*/ false, fileLen);
-            if (leftEnd >= 0) {
-              insertAt = HopPastOptionalNewline(headerText, leftEnd, fileLen);
-              trace("include/anchor",
-                    "inc#{0} left-neighbor end: leftPP={1} endByte={2} -> "
-                    "byte={3}",
-                    ie.include->id, leftPP, leftEnd, insertAt);
-            }
-          }
+      if (anchorPP >= 0) {
+        // Insert immediately before the right neighbor token.
+        startByte = ByteStartForPPInFile(file, anchorPP,
+                                         /* fallbackToEOF */ false, fileLen);
+        trace("include/apply",
+              "file={0} patch[{1}] INSERT: right-neighbor anchorPP={2} -> "
+              "startByte={3}",
+              file, idx, anchorPP, startByte);
+        if (startByte < 0) {
+          continue;
         }
       } else {
-        // If the left token ends at EOL, hop the newline. Otherwise, if the
-        // left token begins at line indent, insert at the START of that token
-        // (start-of-line for the declaration). Else fall back to right token
-        // start.
-        int leftPP = std::max(ie.include->cover.begin, p.aStart - 1);
-        int leftEnd = ByteEndForPPInFile(file, leftPP,
-                                         /*fallbackToEOF*/ false, fileLen);
-        int leftStart = ByteStartForPPInFile(file, leftPP,
-                                             /*fallbackToEOF*/ false, fileLen);
-        int rightStart = ByteStartForPPInFile(file, p.aStart,
-                                              /*fallbackToEOF*/ false, fileLen);
-
-        if (leftEnd >= 0) {
-          bool atEOL = (leftEnd >= fileLen) ||
-                       headerText[static_cast<std::size_t>(leftEnd)] == '\n' ||
-                       headerText[static_cast<std::size_t>(leftEnd)] == '\r';
-          if (atEOL) {
-            insertAt = HopPastOptionalNewline(headerText, leftEnd, fileLen);
-            trace(
-                "include/anchor",
-                "inc#{0} left-neighbor end: leftPP={1} endByte={2} -> byte={3}",
-                ie.include->id, leftPP, leftEnd, insertAt);
-          } else if (leftStart >= 0 && IsAtLineIndent(headerText, leftStart)) {
-            insertAt = leftStart;
-            trace("include/anchor",
-                  "inc#{0} same-line: using left-neighbor START at byte={1} "
-                  "(line indent)",
-                  ie.include->id, insertAt);
-          } else if (rightStart >= 0) {
-            insertAt = rightStart;
-            trace("include/anchor",
-                  "inc#{0} same-line: using right-neighbor START at byte={1}",
-                  ie.include->id, insertAt);
-          } else {
-            insertAt = leftEnd;
-            trace("include/anchor",
-                  "inc#{0} same-line fallback: left-neighbor END at byte={1}",
-                  ie.include->id, insertAt);
+        // 2) No right neighbor; fall back to the last left neighbor.
+        for (int pp = std::min(pos - 1, ppHi - 1); pp >= ppLo; --pp) {
+          auto it = tokmapByPP.find(pp);
+          if (it != tokmapByPP.end() && PathsEqual(it->second.file, file)) {
+            anchorPP = pp;
+            break;
           }
+        }
+
+        if (anchorPP >= 0) {
+          startByte = ByteEndForPPInFile(file, anchorPP, false, fileLen);
+          trace("include/apply",
+                "file={0} patch[{1}] INSERT: left-neighbor anchorPP={2} -> "
+                "startByte={3}",
+                file, idx, anchorPP, startByte);
+          if (startByte < 0) {
+            continue;
+          }
+        } else if (decl) {
+          // 3) No PP neighbor at all in this header, but we have an owning
+          // decl: anchor at the end of its header span.
+          startByte = std::clamp(decl->headerE, 0, fileLen);
+          trace(
+              "include/apply",
+              "file={0} patch[{1}] INSERT: no neighbors; anchor at declEnd={2}",
+              file, idx, startByte);
         } else {
-          insertAt = rightStart;
-          trace("include/anchor",
-                "inc#{0} right-neighbor start: pp={1} -> byte={2} (no leftEnd)",
-                ie.include->id, p.aStart, insertAt);
-        }
-      }
+          // 4) Fallback: use child '#include' sites inside this header as
+          // synthetic anchors.
+          const int insertByte = ComputeChildBoundaryInsertByte(p, file);
+          debug("include/apply.", "inserted byte {0}", insertByte);
+          if (insertByte >= 0 && insertByte <= fileLen) {
+            std::string text = PadAtBoundaries(
+                headerText, insertByte, insertByte, p.insertBytes,
+                /* allowLeft */ true, /* allowRight */ true);
+            edits.push_back({insertByte, insertByte, std::move(text)});
 
-      // Last resort: first PP inside this header, else BOF=0
-      if (insertAt < 0) {
-        int rn = ByteStartForPPInFile(file, p.aStart,
-                                      /*fallbackToEOF*/ false, fileLen);
-        trace("include/anchor",
-              "inc#{0} right-neighbor retry: pp={1} -> byte={2}",
-              ie.include->id, p.aStart, rn);
-        insertAt = rn;
-
-        if (insertAt < 0) {
-          int firstPP = -1;
-          for (int pp = ie.include->cover.begin; pp < ie.include->cover.end;
-               ++pp) {
-            auto it = tokmapByPP.find(pp);
-            if (it != tokmapByPP.end() && PathsEqual(it->second.file, file)) {
-              firstPP = pp;
-              break;
-            }
-          }
-          if (firstPP >= 0) {
-            int firstByte = ByteStartForPPInFile(
-                file, firstPP, /*fallbackToEOF*/ false, fileLen);
-            insertAt = (firstByte >= 0) ? firstByte : 0;
-            trace("include/anchor",
-                  "inc#{0} cover-firstPP start: pp={1} -> byte={2} (fallback)",
-                  ie.include->id, firstPP, insertAt);
+            debug("include/apply.",
+                  "file={0} patch[{1}] INSERT: anchored via child boundary at "
+                  "byte={2}",
+                  file, idx, insertByte);
           } else {
-            insertAt = 0;
-            trace("include/anchor", "inc#{0} BOF fallback -> byte=0",
-                  ie.include->id);
+            // Preserve old behavior if we still can't place it
+            // deterministically.
+            debug("include/apply.",
+                  "file={0} patch[{1}] INSERT: no neighbors, no decl, no child "
+                  "boundary; SKIP",
+                  file, idx);
           }
+          continue;
         }
       }
 
-      // If the anchor is at the function-name start on this line, shift it to
-      // the line indent so the type/qualifier/pointer prefix ("unsigned long ",
-      // etc.) stays with the next line instead of being consumed by the
-      // insertion.
-      int shifted = ShiftAnchorToLineIndentIfAtFuncName(headerText, insertAt);
-      if (shifted != insertAt) {
-        trace("include/anchor",
-              "inc#{0} shifted anchor to line indent before type prefix at "
-              "byte={1}",
-              ie.include->id, shifted);
-        insertAt = shifted;
-      }
-      startByte = endByte = insertAt;
+      endByte = startByte;
     } else {
-      // DELETE/REPLACE: map [aStart,aEnd) to a byte span within *this file*
-      // only.
-      int s = -1, e = -1;
+      // DELETE / REPLACE: map non-empty A-range to byte range within this
+      // header.
+      int aLo = std::max(p.aStart, ppLo);
+      int aHi = std::min(p.aEnd, ppHi);
+      if (aHi <= aLo) {
+        // Nothing of this patch lies in this header/declaration.
+        debug("include/apply",
+              "file={0} patch[{1}] DELETE/REPLACE: empty intersection; SKIP",
+              file, idx);
+        continue;
+      }
 
-      for (int pp = p.aStart; pp < p.aEnd; ++pp) {
+      int firstPP = -1, lastPP = -1;
+      for (int pp = aLo; pp < aHi; ++pp) {
         auto it = tokmapByPP.find(pp);
         if (it != tokmapByPP.end() && PathsEqual(it->second.file, file)) {
-          s = pp;
-          break;
-        }
-      }
-      for (int pp = p.aEnd - 1; pp >= p.aStart; --pp) {
-        auto it = tokmapByPP.find(pp);
-        if (it != tokmapByPP.end() && PathsEqual(it->second.file, file)) {
-          e = pp;
-          break;
+          if (firstPP < 0)
+            firstPP = pp;
+          lastPP = pp;
         }
       }
 
-      if (s == -1 || e == -1)
-        continue; // nothing in this file
-      startByte =
-          ByteStartForPPInFile(file, s, /*fallbackToEOF*/ false, fileLen);
-      endByte = ByteEndForPPInFile(file, e, /*fallbackToEOF*/ false, fileLen);
-    }
+      if (firstPP < 0 || lastPP < 0) {
+        // No tokens from this patch actually map into this header file.
+        debug("include/apply",
+              "file={0} patch[{1}] DELETE/REPLACE: no mapped PP tokens in "
+              "header; SKIP",
+              file, idx);
+        continue;
+      }
 
-    // Replacement bytes for INSERT/REPLACE; or "" for DELETE.
-    std::string replacement = isDelete ? std::string() : p.insertBytes;
-
-    debug("include/apply",
-          "inc#{0} file={1} kind={2} A=[{3},{4}) B=[{5},{6}) start={7} end={8} "
-          "repl='{9}'",
-          ie.include->id, file,
-          (isInsert ? "INSERT"
-                    : (isDelete ? "DELETE" : (isReplace ? "REPLACE" : "???"))),
-          p.aStart, p.aEnd, p.bStart, p.bEnd, startByte, endByte,
-          stringutils::showWS(stringutils::clip(replacement, 120)));
-
-    // If the insertion payload’s *last line* redundantly starts with the
-    // *entire* type-ish prefix run that already occurs on the header line at
-    // the splice, drop that full run. (Do NOT drop just the first token; that
-    // causes "long " to be left behind for multi-token return types like
-    // "unsigned long".)
-    if (isInsert && !replacement.empty() && startByte >= 0) {
-      auto lastNl = replacement.rfind('\n');
-      if (lastNl != std::string::npos && lastNl + 1 < replacement.size()) {
-        // Compute the header’s full type-ish prefix on the target line.
-        auto [bol, fnStart, eol] = LineAndFuncNameStart(headerText, startByte);
-        int hi = bol;
-        while (hi < startByte) {
-          char c = headerText[static_cast<std::size_t>(hi)];
-          if (c == ' ' || c == '\t')
-            ++hi;
-          else
-            break;
-        }
-        std::string headerPrefix;
-        if (fnStart > hi) {
-          headerPrefix.assign(headerText.begin() + hi,
-                              headerText.begin() + fnStart);
-        }
-
-        std::string afterNl = replacement.substr(lastNl + 1);
-        std::size_t ws = 0;
-        while (ws < afterNl.size()) {
-          char c = afterNl[ws];
-          if (c == ' ' || c == '\t' || c == '\r')
-            ++ws;
-          else
-            break;
-        }
-
-        debug("include/anchor",
-              "insert de-dup probe: fullPrefix='{0}' ws={1} lastLineHead='{2}'",
-              stringutils::showWS(headerPrefix), ws,
-              stringutils::showWS(afterNl.substr(
-                  0, std::min<std::size_t>(afterNl.size(), 40))));
-
-        if (!headerPrefix.empty() &&
-            afterNl.compare(ws, headerPrefix.size(), headerPrefix) == 0) {
-          std::size_t drop = ws + headerPrefix.size();
-          if (afterNl.size() > drop && afterNl[drop] == ' ')
-            ++drop; // trim one space
-          std::string before = replacement.substr(0, lastNl + 1);
-          replacement = before + afterNl.substr(drop);
-          debug("include/anchor",
-                "insert de-dup: dropped full header prefix run len={0} at site "
-                "byte {1}",
-                headerPrefix.size(), startByte);
-        }
+      startByte = ByteStartForPPInFile(file, firstPP, /* fallbackToEOF */ false,
+                                       fileLen);
+      endByte =
+          ByteEndForPPInFile(file, lastPP, /* fallbackToEOF */ false, fileLen);
+      trace("include/apply",
+            "file={0} patch[{1}] DELETE/REPLACE: firstPP={2} lastPP={3} -> "
+            "bytes=[{4},{5})",
+            file, idx, firstPP, lastPP, startByte, endByte);
+      if (startByte < 0 || endByte < 0) {
+        continue;
       }
     }
 
-    // Boundary hygiene (no token fusion), but NEVER add a space when replacement
-    // already ends with a newline.
-    if (isInsert && !replacement.empty()) {
-      auto endsWithNl = (replacement.back() == '\n');
-
-      int tail = static_cast<int>(replacement.size()) - 1;
-      if (endsWithNl)
-        --tail;
-      while (tail >= 0) {
-        char c = replacement[static_cast<std::size_t>(tail)];
-        if (c == ' ' || c == '\t' || c == '\r')
-          --tail;
-        else
-          break;
-      }
-
-      char lastIns =
-          (tail >= 0) ? replacement[static_cast<std::size_t>(tail)] : '\0';
-      char nextHdr = (startByte >= 0 &&
-                      static_cast<std::size_t>(startByte) < headerText.size())
-                         ? headerText[static_cast<std::size_t>(startByte)]
-                         : '\0';
-
-      // Right boundary: only add a space if NOT ending with newline.
-      if (!endsWithNl && stringutils::isIdentChar(lastIns) &&
-          stringutils::isIdentChar(nextHdr)) {
-        replacement.push_back(' ');
-        debug("include/anchor",
-              "insert boundary: added trailing space between '{0}' and '{1}' "
-              "at byte {2}",
-              lastIns, nextHdr, startByte);
-      }
-
-      // Left boundary: avoid adding a space if immediately after a newline.
-      char prevHdr = (startByte > 0)
-                         ? headerText[static_cast<std::size_t>(startByte - 1)]
-                         : '\0';
-
-      std::size_t head = 0;
-      while (head < replacement.size()) {
-        char c = replacement[head];
-        if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
-          ++head;
-        else
-          break;
-      }
-
-      char firstIns = (head < replacement.size()) ? replacement[head] : '\0';
-
-      if (prevHdr != '\n' && prevHdr != '\r' &&
-          stringutils::isIdentChar(prevHdr) &&
-          stringutils::isIdentChar(firstIns)) {
-        replacement.insert(replacement.begin(), ' ');
-        debug("include/anchor",
-              "insert boundary: added leading space between '{0}' and '{1}' at "
-              "byte {2}",
-              prevHdr, firstIns, startByte);
-      }
+    // Clamp to the declaration’s header_span, if any, so we never cross decl
+    // boundaries for DELETE/REPLACE.  For INSERTs we intentionally allow the
+    // anchor to sit on the boundary between two declarations so that a new
+    // declaration can be injected cleanly between them.
+    if (!isInsert && decl) {
+      startByte = std::clamp(startByte, decl->headerB, decl->headerE);
+      endByte = std::clamp(endByte, decl->headerB, decl->headerE);
     }
 
-    // Carry the declaration's type/qualifier prefix when inserting a function decl at indent.
-    if (isInsert && !replacement.empty()) {
-      // Are we at line indent?
-      auto [bol, fnStart, eol] = LineAndFuncNameStart(headerText, startByte);
-      bool atIndent = IsAtLineIndent(headerText, startByte);
+    // Sanity clamp to file bounds.
+    if (startByte < 0)
+      continue;
+    startByte = std::clamp(startByte, 0, fileLen);
+    endByte = std::clamp(endByte, startByte, fileLen);
 
-      // Does replacement look like "identifier(" after optional spaces?
-      std::size_t ri = 0;
-      while (ri < replacement.size()) {
-        char c = replacement[ri];
-        if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
-          ++ri;
-        else
-          break;
+    std::string replacement = isDelete ? "" : p.insertBytes;
+
+    if (inTraceMode()) {
+      StringRef opKind =
+          isInsert ? "INSERT" : (isDelete ? "DELETE" : "REPLACE");
+
+      // DEBUG: log the exact slice and replacement we are about to apply.
+      const std::string originalSlice =
+          headerText.substr(startByte, endByte - startByte);
+      std::string origDbg = originalSlice;
+      std::string replDbg = replacement;
+      constexpr int MAX_DBG = 120;
+      if (origDbg.size() > MAX_DBG) {
+        origDbg = origDbg.substr(0, MAX_DBG) + "…";
       }
-      std::size_t rj = ri;
-      while (rj < replacement.size() &&
-             stringutils::isIdentChar(replacement[rj]))
-        ++rj;
-      bool looksFuncDecl =
-          (rj > ri) && (rj < replacement.size()) && (replacement[rj] == '(');
-
-      if (atIndent && looksFuncDecl) {
-        // Compute full type-ish prefix on the target line.
-        int hi = bol;
-        while (hi < startByte) {
-          char c = headerText[static_cast<std::size_t>(hi)];
-          if (c == ' ' || c == '\t')
-            ++hi;
-          else
-            break;
-        }
-        std::string prefix;
-        if (fnStart > hi) {
-          prefix.assign(headerText.begin() + hi, headerText.begin() + fnStart);
-        }
-
-        if (!prefix.empty()) {
-          bool alreadyHas = ri <= replacement.size() &&
-                            replacement.compare(ri, prefix.size(), prefix) == 0;
-          if (!alreadyHas) {
-            replacement.insert(ri, prefix);
-            trace("include/apply",
-                  "inc#{0} carried full type prefix '{1}' at byte {2}",
-                  ie.include->id, stringutils::showWS(prefix), startByte);
-          }
-        }
+      if (replDbg.size() > MAX_DBG) {
+        replDbg = replDbg.substr(0, MAX_DBG) + "…";
       }
+
+      std::string declInfo = "<none>";
+      if (decl) {
+        declInfo =
+            formatv("kind={0} name={1} header=[{2},{3}) ppSpan=[{4},{5})",
+                    decl->kind, decl->name, decl->headerB, decl->headerE,
+                    decl->ppSpan.begin, decl->ppSpan.end).str();
+      }
+
+      trace("include/apply",
+            "file={0} patch[{1}] kind={2} A=[{3},{4}) B=[{5},{6}) pp=[{7},{8}) "
+            "bytes=[{9},{10}) decl={11} orig='{12}' repl='{13}'",
+            file, idx, opKind, p.aStart, p.aEnd, p.bStart, p.bEnd, ppLo, ppHi,
+            startByte, endByte, declInfo, stringutils::showWS(origDbg),
+            stringutils::showWS(replDbg));
     }
 
-    // If a REPLACE would delete ANY leading type/qualifier/pointer prefix on
-    // the next line, and our replacement ends with a newline at a line-indent
-    // anchor, treat it as a pure INSERT.
-    if (isReplace && !replacement.empty() && replacement.back() == '\n' &&
-        startByte >= 0 && endByte >= startByte &&
-        IsAtLineIndent(headerText, startByte)) {
-      auto [bol, fnStart, eol] = LineAndFuncNameStart(headerText, startByte);
-
-      // Find first non-space after bol (true start of the prefix run).
-      int p2 = bol;
-      while (p2 < eol) {
-        char c = headerText[static_cast<std::size_t>(p2)];
-        if (c == ' ' || c == '\t')
-          ++p2;
-        else
-          break;
-      }
-      // The deletable prefix region is [p2, fnStart).
-      int prefLo = p2, prefHi = std::max(p2, std::min(fnStart, eol));
-
-      // Consider deleting only if we're strictly within the prefix region and
-      // not crossing newline.
-      if (startByte >= prefLo && endByte <= prefHi) {
-        endByte = startByte; // REPLACE → zero-width INSERT
-        trace("include/apply",
-              "inc#{0} REPLACE→INSERT at byte {1} to preserve prefix [{2},{3})",
-              ie.include->id, startByte, prefLo, prefHi);
-      }
-    }
-
-    edits.push_back(TextEdit{startByte, endByte, std::move(replacement)});
+    edits.push_back({startByte, endByte, std::move(replacement)});
   }
 
-  // Apply edits inside this header, highest offset first.
-  std::sort(
-      edits.begin(), edits.end(),
-      [](const TextEdit &a, const TextEdit &b) { return a.start > b.start; });
+  // Apply all edits inside this header, highest offset first so earlier edits
+  // do not disturb the coordinates of later ones.
+  llvm::sort(edits, [](const TextEdit &lhs, const TextEdit &rhs) {
+    return lhs.start > rhs.start;
+  });
+
+  debug("include/apply", "file={0} applying {1} header TextEdits", file,
+        edits.size());
+
   for (const auto &e : edits) {
-    const int len = static_cast<int>(headerText.size());
-    const bool bad = (e.start < 0) || (e.end < e.start) || (e.end > len);
-    if (bad) {
-      fatal("include/apply",
-            "invalid edit range: start={0} end={1} (len={2}) inc#{3} "
-            "target={4} resolved={5}",
-            e.start, e.end, len, ie.include->id,
-            StripHeaderToken(ie.include->target), ie.include->resolvedPath);
-    }
-    headerText.replace(static_cast<std::size_t>(e.start),
-                       static_cast<std::size_t>(e.end - e.start), e.text);
+    trace("include/apply",
+          "file={0} header TextEdit bytes=[{1},{2}) replLen={3}", file, e.start,
+          e.end, e.text.size());
+    headerText.replace(e.start, e.end - e.start, e.text);
   }
   return headerText;
 }
 
-// =================== Low-level file & mapping utilities ===================
+int RefoldEngine::ComputeChildBoundaryInsertByte(const IncludePatch &p,
+                                                 StringRef file) const {
+  // Which include are we editing?
+  const RefoldModel::IncludeItem *owner = p.include;
+  if (!owner) {
+    return -1;
+  }
 
-int RefoldEngine::HopPastOptionalNewline(StringRef text, int pos, int len) {
-  if (pos < len) {
-    char c = text[static_cast<std::size_t>(pos)];
-    if (c == '\r') {
-      return (pos + 1 < len && text[static_cast<std::size_t>(pos + 1)] == '\n')
-                 ? pos + 2
-                 : pos + 1;
-    } else if (c == '\n') {
-      return pos + 1;
+  // We only care about children whose sitePath is this header file.
+  const RefoldModel::IncludeItem *left = nullptr;  // last child whose coverEnd <= pos
+  const RefoldModel::IncludeItem *right = nullptr; // first child whose coverBegin >= pos
+
+  int pos = p.aStart; // PP position of the INSERT gap
+
+  for (const auto &child: model_.GetIncludes()) {
+    // Only check direct children of the owner
+    if (!child.parent || *child.parent != owner->id) {
+      continue;
+    }
+
+    // Paths must match the file currently being processed
+    if (!PathsEqual(child.sitePath, file)) {
+      continue;
+    }
+
+    int cb = child.cover.begin;
+    int ce = child.cover.end;
+
+    // If the INSERT PP-index is *strictly inside* a child's cover, this
+    // fallback is the wrong mechanism (that should have been a child-owned
+    // patch). Gaps on the boundaries (pos == cb or pos == ce) are valid
+    // "between-children" positions and must *not* trigger this guard.
+    if (cb < pos && pos < ce) {
+      return -1;
+    }
+
+    if (ce <= pos) {
+      // Best "left" child is the one with the greatest coverEnd <= pos.
+      if (!left || ce > left->cover.end) {
+        left = &child;
+      }
+    } else if (cb >= pos) {
+      // Best "right" child is the one with the smallest coverBegin >= pos.
+      if (!right || cb < right->cover.begin) {
+        right = &child;
+      }
     }
   }
-  return pos;
+
+  if (right) {
+    // Insert *before* the right '#include'.
+    return right->siteB;
+  }
+  if (left) {
+    // Insert *after* the left '#include'.
+    return left->siteE;
+  }
+
+  return -1;
 }
+
+// ==================== Low-level file & mapping utilities =====================
 
 bool RefoldEngine::PathsEqual(StringRef a, StringRef b) {
   if (a.empty() || b.empty())
@@ -1660,6 +2157,42 @@ bool RefoldEngine::PathsEqual(StringRef a, StringRef b) {
   }
 
   return ca == cb;
+}
+
+// ====================== Diagnostics & Debug Utilities =======================
+
+void RefoldEngine::DebugIncludePatch(StringRef tag,
+                                     const RefoldModel::IncludeItem &inc,
+                                     const diffutils::Hunk &h) const {
+  int a0 = (h.aStart >= 0 && static_cast<size_t>(h.aStart) < aTokOff_.size())
+               ? aTokOff_[h.aStart]
+               : -1;
+  int a1 = (h.aEnd >= 0 && static_cast<size_t>(h.aEnd) < aTokOff_.size())
+               ? aTokOff_[h.aEnd]
+               : -1;
+
+  int b0 = (h.bStart >= 0 && static_cast<size_t>(h.bStart) < bTokOff_.size())
+               ? bTokOff_[h.bStart]
+               : -1;
+  int b1 = (h.bEnd >= 0 && static_cast<size_t>(h.bEnd) < bTokOff_.size())
+               ? bTokOff_[h.bEnd]
+               : -1;
+
+  StringRef aSlice = "";
+  if (a0 >= 0 && a1 >= a0 && static_cast<size_t>(a1) <= aSource_.size()) {
+    aSlice = aSource_.substr(a0, a1 - a0);
+  }
+  StringRef bSlice = "";
+  if (b0 >= 0 && b1 >= b0 && static_cast<size_t>(b1) <= bSource_.size()) {
+    bSlice = bSource_.substr(b0, b1 - b0);
+  }
+
+  trace("include/patch",
+        "{0} inc #{1} hunk A[{2},{3})->B[{4},{5}) Abytes=[{6},{7}) "
+        "Bbytes=[{8},{9}) Aslice='{10}' Bslice='{11}'",
+        tag, inc.id, h.aStart, h.aEnd, h.bStart, h.bEnd, a0, a1, b0, b1,
+        stringutils::showWS(stringutils::clip(aSlice, 120)),
+        stringutils::showWS(stringutils::clip(bSlice, 120)));
 }
 
 } // namespace refold

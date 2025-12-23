@@ -166,7 +166,7 @@ void lexPPTokens(const std::string &bytes, std::vector<PPTok> &out,
   out.clear();
   startOffs.clear();
 
-  // Ensure a trailing newline like the Java path does for clang driver.
+  // Ensure a trailing newline.
   std::string buf = bytes;
   bool addedNL = false;
   if (buf.empty() || buf.back() != '\n') {
@@ -242,7 +242,7 @@ void lexPPTokens(const std::string &bytes, std::vector<PPTok> &out,
     startOffs.push_back(off);
   }
 
-  // Sentinel: one-past-end, same convention as the Java path.
+  // Sentinel: one-past-end
   startOffs.push_back(buf.size());
   // Sanity: monotone offsets and size relationship.
   assert(startOffs.size() == out.size() + 1 && "need sentinel in startOffs");
@@ -308,9 +308,10 @@ Expected<json::Object> parseAndValidateJSON(StringRef jsonPath,
     return schemaParsed.takeError();
 
   const json::Object *schemaObj = schemaParsed->getAsObject();
-  if (!schemaObj)
+  if (!schemaObj) {
     return createStringError(inconvertibleErrorCode(),
                              "provided schema is not a valid JSON object");
+  }
 
   // Parse the JSON file to be validated
   Expected<json::Value> jsonParsed = parseJSONFromFile(jsonPath);

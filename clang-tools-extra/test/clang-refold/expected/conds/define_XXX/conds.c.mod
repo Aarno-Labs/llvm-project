@@ -5,8 +5,8 @@
 
 #ifdef XXX
 int first(int x);
-#define BAR(X) (X * 3)
 #define FOO(X) (X + X)
+#define BAR(X) (X * 3)
 int last(int x);
 #else
 float first(float x);

@@ -10,7 +10,8 @@ int first(int x);
 struct XjGlobals {
 };
 int last(int x);
-int main() { struct XjGlobals xjgv = {
+int main() {
+  struct XjGlobals xjgv = {
   };
   struct XjGlobals *xjg = &xjgv;
   *(g.pa) = 32;
