@@ -6,24 +6,45 @@ import subprocess
 import shlex
 import platform
 
-def run(cmd):
+def run(cmd, output_file=None):
   print('RUN:', cmd)
-  try:
-    r = subprocess.run(cmd, shell=True, check=True,
-                       text=True, capture_output=True)
-    # If you want to show stdout on success too, uncomment:
-    # if r.stdout:
-    #   print(r.stdout, end='')
-    return
-  except subprocess.CalledProcessError as e:
-    print(f'\nCOMMAND FAILED (exit {e.returncode}): {cmd}', file=sys.stderr)
-    if e.stdout:
-      print('\n--- stdout ---', file=sys.stderr)
-      print(e.stdout, end='', file=sys.stderr)
-    if e.stderr:
-      print('\n--- stderr ---', file=sys.stderr)
-      print(e.stderr, end='', file=sys.stderr)
-    sys.exit(e.returncode)
+
+  # Prepare the redirection arguments
+  kwargs = {
+    "shell": True,
+    "check": True,
+    "text": True,
+  }
+
+  if output_file:
+    # If output_file is set, open it and redirect both stdout and stderr
+    try:
+      with open(output_file, 'w') as f:
+        subprocess.run(cmd, stdout=f, stderr=f, **kwargs)
+        return
+    except (subprocess.CalledProcessError, IOError) as e:
+      # Note: with CalledProcessError, the output is in the file,
+      # not in the exception because we didn't use capture_output
+      print(
+        f'\nCOMMAND FAILED (exit {getattr(e, "returncode", "IOError")}): {cmd}',
+        file=sys.stderr
+      )
+      print(f'Check logs in: {output_file}', file=sys.stderr)
+      sys.exit(getattr(e, "returncode", 1))
+  else:
+    # Original behavior: capture output to memory for display on failure
+    try:
+      r = subprocess.run(cmd, capture_output=True, **kwargs)
+      return
+    except subprocess.CalledProcessError as e:
+      print(f'\nCOMMAND FAILED (exit {e.returncode}): {cmd}', file=sys.stderr)
+      if e.stdout:
+        print('\n--- stdout ---', file=sys.stderr)
+        print(e.stdout, end='', file=sys.stderr)
+      if e.stderr:
+        print('\n--- stderr ---', file=sys.stderr)
+        print(e.stderr, end='', file=sys.stderr)
+      sys.exit(e.returncode)
 
 
 def get_macos_sdk_flag():
@@ -81,6 +102,7 @@ def main():
   out_i = os.path.join(tmp_out, f'{testname}.c.i')
   out_json = os.path.join(tmp_out, f'{testname}.c.refold.json')
   out_mod = os.path.join(tmp_out, f'{testname}.c.mod')
+  out_out = os.path.join(tmp_out, f'{testname}.out')
 
   # Expected artifacts
   # exp_json = os.path.join(exp_base, f'{testname}.c.refold.json')
@@ -122,7 +144,7 @@ def main():
       f'--refold-map {shlex.quote(out_json)} '
       f'--out {shlex.quote(out_mod)}'
   )
-  run(clang_refold_cmd)
+  run(clang_refold_cmd, out_out)
 
   # 4) Compare final refolded output
   run(f'diff -u {shlex.quote(exp_mod)} {shlex.quote(out_mod)}')
