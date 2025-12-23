@@ -5,7 +5,7 @@
 // preprocessor. The model captures the logical mapping between preprocessor
 // constructs in the original source (A) and the corresponding constructs in the
 // edited preprocessed stream (B).
-//
+ //
 // The RefoldModel serves as a stable, deterministic schema layer over the
 // untyped JSON representation, providing strongly typed access to:
 //   - Include items (#include, #include_next directives)
@@ -17,7 +17,7 @@
 //
 // Author:
 //   jeikenberry
-//
+ //
 //===----------------------------------------------------------------------===//
 
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMODEL_H
@@ -128,12 +128,14 @@ namespace refold {
 /// \author jeikenberry
 class RefoldModel {
 public:
-  // ======= Coordinate primitives =======
+  // ========================== Coordinate primitives ==========================
   struct PPSpan {
     int begin; // inclusive A-token index
     int end;   // exclusive A-token index
 
-    std::string ToString() const { return formatv("[{0},{1})", begin, end); }
+    std::string ToString() const {
+      return formatv("[{0},{1})", begin, end).str();
+    }
 
     bool IsValid() const { return begin >= 0 && end >= 0 && end > begin; }
   };
@@ -179,7 +181,16 @@ public:
     int e;
   };
 
-  // ======= Items =======
+  // ================================== Items ==================================
+  struct HeaderDecl {
+    std::string kind;
+    std::string name;
+    std::string file;
+    int headerB;
+    int headerE;
+    PPSpan ppSpan;
+  };
+
   struct IncludeItem {
     int id;
     std::string subkind;  // "#include" | "#include_next"
@@ -193,17 +204,19 @@ public:
     std::optional<int> parent; // parent include id
     std::vector<PPSpan> spans;
     PPCover cover;
+    std::vector<HeaderDecl> decls; // header decls referenced by this include
 
     IncludeItem(int id, std::string subkind, std::string text,
                 std::string sitePath, int siteB, int siteE, std::string target,
                 std::optional<std::string> resolvedPath, bool angled,
                 std::optional<int> parent, std::vector<PPSpan> spans,
-                std::optional<int> coverBegin,
-                std::optional<int> coverEnd) noexcept
+                std::optional<int> coverBegin, std::optional<int> coverEnd,
+                std::vector<HeaderDecl> decls) noexcept
         : id(id), subkind(std::move(subkind)), text(std::move(text)),
           sitePath(std::move(sitePath)), siteB(siteB), siteE(siteE),
           target(std::move(target)), resolvedPath(std::move(resolvedPath)),
-          angled(angled), parent(std::move(parent)), spans(std::move(spans)) {
+          angled(angled), parent(std::move(parent)), spans(std::move(spans)),
+          decls(std::move(decls)) {
       cover.Init(coverBegin, coverEnd, this->spans);
     }
 
@@ -275,38 +288,61 @@ public:
     std::vector<PPSpan> spans;
   };
 
-  // ======= Slots =======
+  // ================================== Slots ==================================
   struct Slot {
     int id;
     std::string file;
-    std::string kind;       // enum per schema
+    std::string kind; // enum per schema
     std::optional<int> ref; // include id or cond-arm id
     int b;
     int e;
     std::optional<int> ownerIncludeId;
-    std::optional<int> pp; // tiebreak
+    std::optional<int> pp; // optional A-token index for tie-break
   };
 
-  // ======= Conditionals =======
+  // ================================ Segments =================================
+  struct Segment {
+    std::string file;
+    int b;
+    int e;
+    std::optional<int> ownerIncludeId; // current include ownership at [b,e)
+    std::optional<int> ownerCondArmId; // current conditional arm at [b,e)
+
+    std::string ToString() const {
+      return formatv("Segment{file='{0}', b={1}, e={2}, ownerIncludeId={3} "
+                     "ownerCondArgId={4}}",
+                     file, b, e, ownerIncludeId, ownerCondArmId);
+    }
+  };
+
+  // =============================== Conditionals ==============================
   struct CondArm {
     int id;
-    std::string tag; // "if" | "ifdef" | "ifndef" | "elif" | "else"
+    int groupId; // owning CondGroup id
+    std::string tag; // if/ifdef/ifndef/elif/else
     std::optional<std::string> cond;
     int bodyB;
     int bodyE;
+    std::optional<PPSpan> ppSpan; // optional A-token span for this arm
     std::optional<bool> selected;
 
-    bool ContainsByte(int off) const { return bodyB <= off && off < bodyE; }
+    bool ContainsByte(int byteOffset) const {
+      return bodyB <= byteOffset && byteOffset < bodyE;
+    }
   };
 
   struct CondGroup {
     int id;
     std::string file;
-    std::optional<int> parent; // nested group parent
+    std::optional<int> parentArmId;
     int groupB;
     int groupE;
     std::optional<int> parentIncludeId;
     std::vector<CondArm> arms;
+
+    bool ContainsByte(int byteOffset) const {
+      return groupB <= byteOffset && byteOffset < groupE;
+    }
   };
 
   struct ArmRef {
@@ -314,8 +350,11 @@ public:
     const CondArm *arm;
   };
 
-public:
-  // ======= Construction / Parsing =======
+  // ============================== Owner arrays ==============================
+  struct OwnerArrays {
+    std::vector<int> ownerDepth;     // 0=TU, >=1 in includes
+    std::vector<int> ownerIncludeId; // -1=TU, else include id
+  };
 
   /// \brief Constructs a RefoldModel instance from a parsed JSON object.
   ///
@@ -326,13 +365,13 @@ public:
   /// during the refolding process.
   ///
   /// \param Root The top-level JSON object parsed from the refold map file.
-  /// \return An `llvm::Expected<RefoldModel>` containing the constructed model
-  ///         on success, or an error if required fields are missing or invalid.
+  /// \return An `Expected<RefoldModel>` containing the constructed model on
+  ///         success, or an error if required fields are missing or invalid.
   ///
   /// \see RefoldSchema.h
   static Expected<RefoldModel> FromJson(const json::Object &Root);
 
-  // ======= Basic getters (match Java API) =======
+  // ============================== Basic getters ==============================
   StringRef GetVersion() const { return version_; }
   StringRef GetSourcePath() const { return sourcePath_; }
   int GetTokensCountA() const { return tokensCountA_; }
@@ -355,14 +394,52 @@ public:
     return it == includeById_.end() ? nullptr : it->second;
   }
 
-  // ======= Helpers for the engine (ported from Java) =======
-  // Conditional queries
+  const CondGroup *GetCondGroupById(int id) const {
+    auto it = condGroupById_.find(id);
+    return it == condGroupById_.end() ? nullptr : it->second;
+  }
+
+  std::optional<ArmRef> GetArmRefById(int armId) const {
+    auto it = armById_.find(armId);
+    if (it == armById_.end())
+      return std::nullopt;
+    return it->second;
+  }
+
+  // ========================= Helpers for the engine  =========================
+
+  // --- Segments ---
+  ArrayRef<Segment> GetSegmentsForFile(StringRef file) const {
+    auto it = segmentsByFile_.find(file);
+    if (it == segmentsByFile_.end())
+      return ArrayRef<Segment>();
+    return ArrayRef<Segment>(it->second);
+  }
+
+  // --- Include nesting ---
+  unsigned GetIncludeDepth(const std::optional<int> &includeId) const;
+  std::optional<int> InnermostIncludeAtPP(int ppIndex) const;
+  std::optional<int> LeastCommonAncestorInclude(std::optional<int> a,
+                                                std::optional<int> b) const;
+
+  // --- Conditional nesting ---
+  unsigned GetCondGroupDepth(const std::optional<int> &groupId) const;
+  unsigned GetCondArmDepth(const std::optional<int> &armId) const {
+    if (!armId)
+      return 0;
+    if (auto ref = GetArmRefById(*armId))
+      return GetCondGroupDepth(ref->group->id);
+    return 1;
+  }
+
   std::vector<const CondGroup *>
   GetCondGroups(StringRef file,
                 const std::optional<int> &parentIncludeId) const;
+
   std::optional<ArmRef>
   FindArmRefForByte(StringRef file, const std::optional<int> &parentIncludeId,
                     int byteOffset) const;
+
   std::optional<const CondArm *>
   FindArmForByte(StringRef file, const std::optional<int> &parentIncludeId,
                  int byteOffset) const {
@@ -371,12 +448,28 @@ public:
     return std::nullopt;
   }
 
-  // Slot queries
-  std::vector<const Slot *>
-  FindSlots(const std::optional<std::string> &file,
-            const std::optional<std::string> &kind,
-            const std::optional<int> &ref,
-            const std::optional<int> &ownerIncludeId) const;
+  std::optional<ArmRef> FindArmRefAtPP(int ppIndex) const;
+  std::optional<const CondArm *> FindArmForPP(int ppIndex) const {
+    auto ref = FindArmRefAtPP(ppIndex);
+    if (!ref)
+      return std::nullopt;
+    return ref->arm;
+  }
+
+  int FirstConditionalArmStartA(const CondGroup &group) const;
+  int FirstConditionalArmStartA(int groupId) const {
+    const CondGroup *group = GetCondGroupById(groupId);
+    if (!group)
+      return -1;
+    return FirstConditionalArmStartA(*group);
+  }
+
+  // --- Slot queries ---
+  std::vector<const Slot *> FindSlots(const std::optional<std::string> &file,
+                                      const std::optional<std::string> &kind,
+                                      const std::optional<int> &ref,
+                                      const std::optional<int> &ownerIncludeId) const;
+
   std::optional<const Slot *> GetBeforeIncludeSlot(int includeId) const {
     auto slots =
         FindSlots(std::nullopt, std::optional<std::string>("before_include"),
@@ -385,6 +478,7 @@ public:
       return std::nullopt;
     return slots.front();
   }
+
   std::optional<const Slot *> GetAfterIncludeSlot(int includeId) const {
     auto slots =
         FindSlots(std::nullopt, std::optional<std::string>("after_include"),
@@ -394,19 +488,26 @@ public:
     return slots.front();
   }
 
-  // Tokmap queries
+  std::optional<const Slot *> GetArmBeginSlot(int armId) const;
+  std::optional<const Slot *> GetArmEndSlot(int armId) const;
+
+  // --- Tokmap queries ---
   std::optional<TokMapEntry> MapPP(int pp) const {
     auto it = tokmapByPP_.find(pp);
     if (it == tokmapByPP_.end())
       return std::nullopt;
     return it->second;
   }
+
   std::vector<TokMapEntry> MapSpan(PPSpan span) const;
+
+  // --- Derived arrays ---
+  OwnerArrays ComputeOwnerArraysForPP(int ppCount) const;
 
 private:
   RefoldModel() = default;
 
-  // ======= Stored data =======
+  // =============================== Stored data ===============================
   std::string version_;
   std::string sourcePath_;
   int tokensCountA_ = 0;
@@ -422,8 +523,10 @@ private:
   std::vector<Slot> slots_;
   std::vector<CondGroup> conds_;
 
-  // ======= Derived indices =======
+  // ============================= Derived indices =============================
   DenseMap<int, const IncludeItem *> includeById_;
+  DenseMap<int, const CondGroup *> condGroupById_;
+  DenseMap<int, ArmRef> armById_;
 
   // file -> groups (all owners)
   StringMap<std::vector<const CondGroup *>> condsByFile_;
@@ -431,8 +534,20 @@ private:
   // file -> ownerIncludeId -> groups
   StringMap<DenseMap<int, std::vector<const CondGroup *>>> condsByFileByOwner_;
 
+  // file -> segments derived from slots
+  StringMap<std::vector<Segment>> segmentsByFile_;
+
+  // caches (computed on demand)
+  mutable DenseMap<int, unsigned> includeDepthCache_;
+  mutable DenseMap<int, unsigned> condGroupDepthCache_;
+
   // Internal helper to finalize indices and perform deterministic ordering.
   void BuildIndicesAndSort();
+
+  std::vector<Segment>
+  BuildSegmentsForFile(StringRef file,
+                       const std::vector<const Slot *> &fileSlots) const;
+
 };
 
 } // namespace refold

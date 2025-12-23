@@ -1,4 +1,4 @@
-// RUN: %clang-refold-tester basic
+// RUN: %clang-refold-tester basic1
 #include "a.h"
 #include "b.h"
 int foo(int x);

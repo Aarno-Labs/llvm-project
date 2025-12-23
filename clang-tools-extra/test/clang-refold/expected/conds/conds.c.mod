@@ -9,8 +9,8 @@ int first(int x);
 int last(int x);
 #else
 float first(float x);
-#define BAR(X) (X * 3)
 #define FOO(X) X
+#define BAR(X) (X * 3)
 float last(float x);
 #endif
 #include "c.h"

@@ -58,6 +58,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "DiffAlgorithms.h"
+#include "RefoldLog.h"
+#include "StringUtils.h"
 #include "llvm/ADT/ArrayRef.h"
 
 #include <algorithm>
@@ -70,8 +72,236 @@ namespace clang {
 namespace refold {
 namespace diffutils {
 
+constexpr std::size_t MAX =
+    static_cast<std::size_t>(std::numeric_limits<int>::max());
+
+namespace {
+bool shouldUseGreedyApproach(unsigned long long n, unsigned long long m,
+                             unsigned long long maxCells) {
+  if (n >= std::numeric_limits<unsigned long long>::max() - 1ULL ||
+      m >= std::numeric_limits<unsigned long long>::max() - 1ULL) {
+    warn("lcs/map",
+         "greedy fallback: (n+1) or (m+1) would overflow unsigned long long "
+         "(n={0}, m={1})",
+         n, m);
+    return true; // (n+1) or (m+1) would overflow ULL anyway
+  } else {
+    const unsigned long long n1 = n + 1ULL;
+    const unsigned long long m1 = m + 1ULL;
+
+    // Product check via division to avoid overflow: n1 * m1 > maxCells ?
+    const unsigned long long maxN1 = maxCells / m1; // m1 >= 1 always
+    if (n1 > maxN1) {
+      warn(
+          "lcs/map",
+          "greedy fallback: DP cell budget exceeded: (n+1)*(m+1) > maxCells "
+          "(n={0}, m={1}, n1={2}, m1={3}, maxCells={4}, maxAllowedN1ForM1={5})",
+          n, m, n1, m1, maxCells, maxN1);
+      return true;
+    } else {
+      // Safe to multiply here: n1 <= maxCells/m1 implies n1*m1 <= maxCells (no
+      // ULL overflow).
+      const unsigned long long cells = n1 * m1;
+
+      // Allocation guard: cells * sizeof(unsigned) must fit in std::size_t
+      const unsigned long long cellLimit = static_cast<unsigned long long>(
+          std::numeric_limits<std::size_t>::max() / sizeof(unsigned));
+
+      if (cells > cellLimit) {
+        warn("lcs/map",
+             "greedy fallback: DP allocation would overflow size_t for "
+             "unsigned table "
+             "(cells={0} > size_t/sizeof(unsigned)={1}; n={2}, m={3})",
+             cells, cellLimit, n, m);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+std::vector<int> lcsMapABGreedy(ArrayRef<std::string> a,
+                                ArrayRef<std::string> b) {
+  const size_t n = a.size(), m = b.size();
+
+  // Greedy order-preserving subsequence scan (linear-time).
+  // If m > MAX, only consider the first MAX elements of b so that
+  // the stored j indices always fit in 'int'.
+  const std::size_t jlimit = std::min(m, MAX);
+  std::vector<int> map(n, -1);
+  std::size_t j = 0;
+  for (std::size_t i = 0; i < n && j < jlimit; ++i) {
+    while (j < jlimit && a[i] != b[j])
+      ++j;
+    if (j < jlimit && a[i] == b[j]) {
+      map[i] = static_cast<int>(j);
+      ++j;
+    }
+  }
+  return map;
+}
+
+inline bool isBetter(unsigned candLen, std::uint64_t candCost, unsigned bestLen,
+                     std::uint64_t bestCost) {
+  return (candLen > bestLen) || (candLen == bestLen && candCost < bestCost);
+}
+} // namespace
+
+// ================== Weighted LCS (DP with greedy fallback) ===================
+
+std::vector<int> lcsMapAB(llvm::ArrayRef<std::string> a,
+                          llvm::ArrayRef<std::string> b,
+                          llvm::ArrayRef<unsigned> ownerDepthGap,
+                          unsigned long long maxCells) {
+  using namespace clang::refold;
+
+  const std::size_t n = a.size(), m = b.size();
+
+  // Early outs for empties
+  if (n == 0)
+    return {};
+  if (m == 0)
+    return std::vector<int>(n, -1);
+
+  // 1) If b is too large to store j in 'int' safely, prefer greedy.
+  bool useGreedy = (m > MAX);
+
+  // 2) Overflow-safe DP cell budget guard + allocation guards.
+  const unsigned long long nu = static_cast<unsigned long long>(n);
+  const unsigned long long mu = static_cast<unsigned long long>(m);
+  if (!useGreedy) {
+    useGreedy = shouldUseGreedyApproach(nu, mu, maxCells);
+  }
+
+  if (useGreedy) {
+    std::abort();
+    return lcsMapABGreedy(a, b);
+  }
+
+  // Validate ownerDepthGap shape
+  if (ownerDepthGap.size() != n + 1) {
+    fatal("lcs/map", "ownerDepthGap length must be A.size() + 1");
+  }
+
+  // ---------------- DP path: (n+1) x (m+1) tables, row-major -----------------
+  // dpLen(i,j)  = max LCS length for A[0..i) vs B[0..j)
+  // dpCost(i,j) = min accumulated gap cost among paths achieving dpLen(i,j)
+  //
+  // Transitions into (i,j):
+  //   match:     from (i-1,j-1), +1 length, +0 cost
+  //   delete A:  from (i-1,j),   +0 length, +ownerDepthGap[i]
+  //   insert B:  from (i,  j-1), +0 length, +ownerDepthGap[i]
+  const std::size_t stride = m + 1;
+  const std::size_t cells = (n + 1) * (m + 1);
+
+  std::vector<unsigned> dpLen(cells, 0);
+  std::vector<std::uint64_t> dpCost(cells, 0);
+
+  auto idx = [&](std::size_t i, std::size_t j) -> std::size_t {
+    return i * stride + j;
+  };
+  auto len = [&](std::size_t i, std::size_t j) -> unsigned & {
+    return dpLen[idx(i, j)];
+  };
+  auto cost = [&](std::size_t i, std::size_t j) -> std::uint64_t & {
+    return dpCost[idx(i, j)];
+  };
+
+  // Fill DP table forward
+  for (std::size_t i = 0; i <= n; ++i) {
+    for (std::size_t j = 0; j <= m; ++j) {
+      if (i == 0 && j == 0)
+        continue;
+
+      unsigned bestLen = 0;
+      std::uint64_t bestCost = std::numeric_limits<std::uint64_t>::max();
+
+      // 1) Match (diagonal)
+      if (i > 0 && j > 0 && a[i - 1] == b[j - 1]) {
+        bestLen = len(i - 1, j - 1) + 1U;
+        bestCost = cost(i - 1, j - 1);
+      }
+
+      // 2) Delete A (vertical move: i-1 -> i), pay ownerDepthGap[i]
+      if (i > 0) {
+        const unsigned candLen = len(i - 1, j);
+        const std::uint64_t candCost =
+            cost(i - 1, j) + static_cast<std::uint64_t>(ownerDepthGap[i]);
+
+        if (isBetter(candLen, candCost, bestLen, bestCost)) {
+          bestLen = candLen;
+          bestCost = candCost;
+        }
+      }
+
+      // 3) Insert B (horizontal move: j-1 -> j), pay ownerDepthGap[i]
+      if (j > 0) {
+        const unsigned candLen = len(i, j - 1);
+        const std::uint64_t candCost =
+            cost(i, j - 1) + static_cast<std::uint64_t>(ownerDepthGap[i]);
+
+        if (isBetter(candLen, candCost, bestLen, bestCost)) {
+          bestLen = candLen;
+          bestCost = candCost;
+        }
+      }
+
+      len(i, j) = bestLen;
+      cost(i, j) = bestCost;
+    }
+  }
+
+  // ------------------- Backtrack: diag, then up, then left -------------------
+  std::vector<int> map(n, -1);
+
+  std::size_t i = n;
+  std::size_t j = m;
+
+  while (i > 0 || j > 0) {
+    const unsigned curLen = len(i, j);
+    const std::uint64_t curCost = cost(i, j);
+
+    bool moved = false;
+
+    // Diagonal (match) first
+    if (i > 0 && j > 0 && a[i - 1] == b[j - 1]) {
+      if (len(i - 1, j - 1) == curLen - 1U &&
+          cost(i - 1, j - 1) == curCost) {
+        map[i - 1] = static_cast<int>(j - 1);
+        --i;
+        --j;
+        moved = true;
+      }
+    }
+
+    // Up (delete A): from (i-1, j) paying ownerDepthGap[i]
+    if (!moved && i > 0) {
+      if (len(i - 1, j) == curLen &&
+          cost(i - 1, j) + static_cast<std::uint64_t>(ownerDepthGap[i]) == curCost) {
+        --i;
+        moved = true;
+      }
+    }
+
+    // Left (insert B): from (i, j-1) paying ownerDepthGap[i]
+    if (!moved && j > 0) {
+      if (len(i, j - 1) == curLen &&
+          cost(i, j - 1) + static_cast<std::uint64_t>(ownerDepthGap[i]) == curCost) {
+        --j;
+        moved = true;
+      }
+    }
+
+    if (!moved)
+      break;
+  }
+
+  return map;
+}
+
 // ====================== LCS (DP with greedy fallback) =======================
 
+[[maybe_unused]]
 std::vector<int> lcsMapAB(ArrayRef<std::string> a, ArrayRef<std::string> b,
                           unsigned long long maxCells) {
   const std::size_t n = a.size(), m = b.size();
@@ -86,7 +316,6 @@ std::vector<int> lcsMapAB(ArrayRef<std::string> a, ArrayRef<std::string> b,
   bool useGreedy = false;
 
   // 1) If b is too large to store j in 'int' safely, prefer greedy.
-  constexpr std::size_t MAX = std::numeric_limits<int>::max();
   if (m > MAX)
     useGreedy = true;
 
@@ -95,42 +324,11 @@ std::vector<int> lcsMapAB(ArrayRef<std::string> a, ArrayRef<std::string> b,
   const unsigned long long mu = static_cast<unsigned long long>(m);
 
   if (!useGreedy) {
-    if (nu >= std::numeric_limits<unsigned long long>::max() - 1ULL ||
-        mu >= std::numeric_limits<unsigned long long>::max() - 1ULL) {
-      useGreedy = true; // (n+1) or (m+1) would overflow ULL anyway
-    } else {
-      const unsigned long long nu1 = nu + 1ULL;
-      const unsigned long long mu1 = mu + 1ULL;
-      // Product check via division to avoid overflow: nu1 * mu1 > maxCells ?
-      if (nu1 > maxCells / mu1) {
-        useGreedy = true;
-      } else {
-        // 3) Allocation guard: cells * sizeof(unsigned) must fit in std::size_t
-        const unsigned long long cells = nu1 * mu1;
-        const unsigned long long cellLimit = static_cast<unsigned long long>(
-            std::numeric_limits<std::size_t>::max() / sizeof(unsigned));
-        if (cells > cellLimit)
-          useGreedy = true;
-      }
-    }
+    useGreedy = shouldUseGreedyApproach(nu, mu, maxCells);
   }
 
   if (useGreedy) {
-    // Greedy order-preserving subsequence scan (linear-time).
-    // If m > MAX, only consider the first MAX elements of b so that
-    // the stored j indices always fit in 'int'.
-    const std::size_t jlimit = std::min(m, MAX);
-    std::vector<int> map(n, -1);
-    std::size_t j = 0;
-    for (std::size_t i = 0; i < n && j < jlimit; ++i) {
-      while (j < jlimit && a[i] != b[j])
-        ++j;
-      if (j < jlimit && a[i] == b[j]) {
-        map[i] = static_cast<int>(j);
-        ++j;
-      }
-    }
-    return map;
+    return lcsMapABGreedy(a, b);
   }
 
   // ----------------- DP path: (n+1) x (m+1) table, row-major -----------------

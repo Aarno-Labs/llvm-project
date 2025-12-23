@@ -207,7 +207,61 @@ std::vector<Step> diff(ArrayRef<std::string> a, ArrayRef<std::string> b);
 /// \returns List of `Hunk` objects covering each contiguous edit run.
 std::vector<Hunk> coalesce(ArrayRef<Step> steps);
 
-// ===== LCS alignment utilities =====
+// ========================== LCS alignment utilities ==========================
+
+/// \brief Compute an owner-aware LCS backmap from sequence A to B.
+///
+/// Computes a one-sided longest common subsequence (LCS) mapping from sequence
+/// `A` to `B` that respects the structural ownership of tokens. Unlike a
+/// standard greedy LCS, this algorithm penalizes or prohibits alignments
+/// between tokens that belong to different logical owners (e.g., different
+/// include files or macro expansions).
+///
+/// Returns an array `map` of length `A.size()` where `map[i] = j` if `A[i]`
+/// participates in a valid alignment with `B[j]`, or `-1` if `A[i]` is
+/// unmatched.
+///
+/// ### Structural Constraints (Owner-Awareness)
+///
+/// The `ownerDepthGap` parameter provides the hierarchical "cost" of aligning
+/// tokens at specific indices. The algorithm uses this to ensure that tokens
+/// stay within their respective boundaries, preventing the "drift" where a
+/// token in a header is mistakenly aligned with an identical-looking token
+/// in the main TU.
+///
+/// ### Tie-breaker and Stability
+///
+/// In the event of equal LCS scores, the algorithm prefers advancing in `A`
+/// (skipping `A[i]`) to maintain a stable, deterministic bias toward earlier
+/// indices in `B`. This ensures that edits are projected back to the most
+/// conservative possible locations in the original source.
+///
+/// ### Performance & Scaling
+///
+/// - **DP Path:** Used for small-to-medium sequences where the product of
+///   lengths is less than \p maxCells. Employs a cost-model-augmented
+///   Dynamic Programming approach.
+/// - **Greedy Fallback:** If \p maxCells is exceeded, the algorithm falls back
+///   to a linear-time scan that respects owner boundaries but may produce
+///   a non-maximal subsequence.
+///
+/// ### Complexity
+///
+/// * **Time:** O(N*M) for DP, O(N+M) for fallback.
+/// * **Space:** O(N*M) for the full DP table, O(N) for the result map.
+///
+/// \param a The original (Source A) sequence of tokens/strings.
+/// \param b The edited (Source B) sequence of tokens/strings.
+/// \param ownerDepthGap A parallel array to \p a indicating the ownership
+///        depth or boundary cost for each token.
+/// \param maxCells The threshold for the DP table size (N*M) before falling
+///        back to a linear greedy scan.
+/// \returns A vector mapping each index in \p a to its corresponding index
+///          in \p b, or -1 if the token was deleted or moved.
+std::vector<int> lcsMapAB(llvm::ArrayRef<std::string> a,
+                          llvm::ArrayRef<std::string> b,
+                          llvm::ArrayRef<unsigned> ownerDepthGap,
+                          unsigned long long maxCells = 20000000ULL);
 
 /// \brief Compute a one-sided LCS backmap from sequence A to B using DP.
 ///
@@ -219,6 +273,7 @@ std::vector<Hunk> coalesce(ArrayRef<Step> steps);
 /// or `-1` if `A[i]` is unmatched.
 ///
 /// ### Tie-breaker (determinism)
+///
 /// When backtracking the DP table at a mismatch and both candidate
 /// continuations have equal score, this implementation advances in `A`
 /// (prefers `(i+1, j)` over `(i, j+1)`). In other words, on ties it
@@ -229,6 +284,7 @@ std::vector<Hunk> coalesce(ArrayRef<Step> steps);
 /// LCS paths.
 ///
 /// ### Large-input guard
+///
 /// If the full DP table would exceed a fixed cell budget (~20M cells),
 /// the algorithm falls back to a greedy, order-preserving subsequence
 /// scan: it advances a pointer through `B` and records the first position
@@ -237,6 +293,7 @@ std::vector<Hunk> coalesce(ArrayRef<Step> steps);
 /// skipped.
 ///
 /// ### Complexity
+///
 /// * DP path: time *O(N×M)*, space *O(N×M)*
 /// * Greedy fallback: time *O(N+M)*, space *O(N)*
 ///

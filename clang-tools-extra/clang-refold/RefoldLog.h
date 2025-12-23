@@ -70,6 +70,8 @@
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLDLOG_H
 
 #include "DiffAlgorithms.h"
+#include "StringUtils.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FormatAdapters.h"
@@ -165,14 +167,141 @@ void logMsg(LogLevel level, StringRef tag, StringRef msg, Args &&...args) {
 
   // Colored prefix based on level (fatal is bold “bright red”)
   if (level == LogLevel::trace || !useColor) {
-    os << formatv("|refold::{0}|  ", fmt_align(tag, AlignStyle::Left, 21, '.'));
+    os << formatv("[{0,-5}][{1}]  ", logLevelToString(level),
+                  fmt_align(tag, AlignStyle::Left, 21, '.'));
     printMsg(os, msg, std::forward<Args>(args)...);
   } else {
     const bool bold = (level == LogLevel::fatal);
     llvm::WithColor _(os, levelColor(level), bold);
-    os << formatv("|refold::{0}|  ",
+    os << formatv("[{0,-5}][{1}]  ", logLevelToString,
                   fmt_align(tag, llvm::AlignStyle::Left, 21, '.'));
     printMsg(os, msg, std::forward<Args>(args)...);
+  }
+}
+
+/// Formats a vector into a column-aligned grid and sends each row to \p logger.
+///
+/// This is analogous to a “hexdump” style display, except it prints each
+/// element’s string form rather than bytes in hex.
+///
+/// \param array The input elements.
+/// \param k The maximum total character width per output line.
+/// \param sameWidth If true, all columns use the global maximum element width.
+///                  If false, columns are sized per-column (vertically aligned)
+///                  subject to \p k.
+/// \param logger Callback that receives each formatted line (without trailing
+/// spaces).
+template <typename T>
+void logFormattedArray(ArrayRef<T> array, size_t k, bool sameWidth,
+                       function_ref<void(StringRef)> logger) {
+  using namespace clang::refold;
+
+  const size_t length = array.size();
+  if (length == 0) {
+    logger("<empty>");
+    return;
+  }
+
+  // 1) Stringify and compute global max element width.
+  std::vector<std::string> stringified;
+  stringified.reserve(length);
+
+  size_t globalMaxWidth = 0;
+  for (const T &elem : array) {
+    std::string s = stringutils::stringifyElement(elem);
+    globalMaxWidth = std::max(globalMaxWidth, s.size());
+    stringified.emplace_back(std::move(s));
+  }
+
+  auto numDecimalDigits = [](size_t v) -> size_t {
+    size_t digits = 1;
+    while (v >= 10) {
+      v /= 10;
+      ++digits;
+    }
+    return digits;
+  };
+
+  // 2) Index prefix: "%0Dd-%0Dd: " where D = digits(len-1).
+  const size_t indexDigits = numDecimalDigits(length - 1);
+  const size_t indexPrefixWidth = (indexDigits * 2) + 3; // "DDD-DDD: "
+  const size_t gap = 2;
+
+  // Guard: if even a single element cannot fit, bail.
+  if (indexPrefixWidth + globalMaxWidth > k) {
+    std::string msg = formatv("<element exceeds max width (k={0})>", k).str();
+    logger(StringRef(msg));
+    return;
+  }
+
+  // 3) Determine column structure and widths.
+  size_t columnsPerRow;
+  std::vector<size_t> colWidths;
+
+  const size_t avail = k - indexPrefixWidth; // safe due to guard above
+
+  if (sameWidth) {
+    const size_t denom = globalMaxWidth + gap;
+    columnsPerRow = std::max<size_t>(1, avail / denom);
+    colWidths.assign(columnsPerRow, globalMaxWidth);
+  } else {
+    const size_t minColStride = 1 + gap;
+    const size_t maxPossibleCols = std::max<size_t>(1, avail / minColStride);
+
+    // Start at 1 column and grow while still fitting within k.
+    columnsPerRow = 1;
+    colWidths.assign(1, globalMaxWidth);
+
+    for (size_t testCols = 2; testCols <= maxPossibleCols; ++testCols) {
+      size_t totalWidth = indexPrefixWidth;
+      std::vector<size_t> testWidths(testCols, 0);
+
+      bool fits = true;
+      for (size_t c = 0; c < testCols; ++c) {
+        size_t maxW = 0;
+        for (size_t idx = c; idx < length; idx += testCols)
+          maxW = std::max(maxW, stringified[idx].size());
+
+        testWidths[c] = maxW;
+
+        const size_t add = maxW + gap;
+        if (add > k - totalWidth) { // safe: totalWidth <= k guaranteed below
+          fits = false;
+          break;
+        }
+        totalWidth += add;
+      }
+
+      if (!fits)
+        break;
+
+      columnsPerRow = testCols;
+      colWidths = std::move(testWidths);
+    }
+  }
+
+  // 4) Emit rows.
+  for (size_t i = 0; i < length; i += columnsPerRow) {
+    const size_t rowEnd = std::min(i + columnsPerRow - 1, length - 1);
+
+    std::string line;
+    line.reserve(k + 16);  // Add an extra cushion of space.
+
+    line += stringutils::zpadUnsigned(i, indexDigits);
+    line += "-";
+    line += stringutils::zpadUnsigned(rowEnd, indexDigits);
+    line += ": ";
+
+    for (size_t j = 0; j < columnsPerRow && (i + j) < length; ++j) {
+      const std::string &cell = stringified[i + j];
+      const size_t fieldWidth = colWidths[j] + gap;
+
+      line += cell;
+      if (cell.size() < fieldWidth)
+        line.append(fieldWidth - cell.size(), ' ');
+    }
+
+    logger(StringRef(line).rtrim());
   }
 }
 
@@ -197,6 +326,7 @@ inline bool inDebugMode() { return inLogLevel(LogLevel::debug); }
 inline bool inTraceMode() { return inLogLevel(LogLevel::trace); }
 
 template <typename... Args>
+[[noreturn]]
 static inline void fatal(StringRef tag, StringRef msg, Args &&...args) {
   logMsg(LogLevel::fatal, tag, msg, std::forward<Args>(args)...);
   std::abort();
