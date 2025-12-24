@@ -109,7 +109,7 @@ std::string RefoldEngine::Refold() {
 
   StringRef tuPath = model_.GetSourcePath();
 
-  info("plan", "REFOLD START tuPath=%s aLen=%d bLen=%d aToks=%d bToks=%d",
+  info("plan", "REFOLD START tuPath={0} aLen={1} bLen={2} aToks={3} bToks={4}",
        tuPath, aSource_.size(), bSource_.size(), aToks_.size(), bToks_.size());
 
   // Read in the translation unit file / C source.
@@ -424,8 +424,8 @@ std::string RefoldEngine::Refold() {
     // the old smallestCoveringInclude as a last resort for backwards
     // compatibility.
     debug("classify",
-          "#%d entering fallback smallestCoveringInclude; owner.kind=%s "
-          "includeId=%s",
+          "#{0} entering fallback smallestCoveringInclude; owner.kind={1} "
+          "includeId={2}",
           i, owner.kind, owner.includeId);
     if (auto *inc = SmallestCoveringInclude(h.aStart, h.aEnd)) {
       const std::string headerPath = resolveHeaderPath(*inc);
@@ -568,7 +568,7 @@ std::string RefoldEngine::Refold() {
     out.replace(static_cast<std::size_t>(e.start),
                 static_cast<std::size_t>(e.end - e.start), e.text);
   }
-  debug("plan", "REFOLD DONE tuResultLen=%d", out.length());
+  debug("plan", "REFOLD DONE tuResultLen={0}", out.length());
   return out;
 }
 
@@ -766,7 +766,7 @@ RefoldEngine::ClassifyOwnerWithSegments(StringRef tuPath,
   // Build (or fetch) all segments projected into tuPath.
   ArrayRef<RefoldModel::Segment> segs = model_.GetSegmentsForFile(tuPath);
   if (segs.empty()) {
-    debug("segments", "  no segments for file=%s; owner UNKNOWN", tuPath);
+    debug("segments", "  no segments for file={0}; owner UNKNOWN", tuPath);
     return Owner::Unknown();
   }
 
@@ -1002,8 +1002,8 @@ bool RefoldEngine::HunkMapsToTU(int a0, int a1, StringRef tuPath) const {
   }
   if (right && !PathsEqual(right->file, tuPath)) {
     trace("tu/own",
-          "hunkMapsToTU: INSERT at pp=%d right neighbor is non-TU file='%s' "
-          "(tu='%s'); left='%s' -> header-owned",
+          "hunkMapsToTU: INSERT at pp={0} right neighbor is non-TU file='{1}' "
+          "(tu='{2}'); left='{3}' -> header-owned",
           a0, right->file, tuPath, (left ? left->file : "<null>"));
     return false;
   }
