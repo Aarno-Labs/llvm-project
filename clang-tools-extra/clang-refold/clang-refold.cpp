@@ -58,8 +58,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "RefoldEngine.h"
 #include "RefoldLog.h"
+#include "RefoldEngine.h"
 #include "RefoldSchema.h"
 #include "StringUtils.h"
 
@@ -447,7 +447,7 @@ int main(int argc, char **argv) {
   cl::HideUnrelatedOptions(RefoldCategory);
   cl::ParseCommandLineOptions(argc, argv, Overview);
 
-  info("log", "log level set to {0}", logLevelToString(LogLevelOpt));
+  info("log", "log level set to {0}", LogLevelOpt);
 
   // We output a custom error message if the following flags appear more than
   // once and remove the cl::Required from the relevant cl::opt's. This is

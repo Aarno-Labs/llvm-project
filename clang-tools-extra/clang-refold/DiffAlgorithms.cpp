@@ -57,8 +57,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "DiffAlgorithms.h"
 #include "RefoldLog.h"
+#include "DiffAlgorithms.h"
 #include "StringUtils.h"
 #include "llvm/ADT/ArrayRef.h"
 
