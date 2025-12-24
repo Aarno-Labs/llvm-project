@@ -122,20 +122,14 @@ inline bool isIdentifierOnly(StringRef s) noexcept {
 
 // --------------------- Index scans (return -1 if none) ----------------------
 
-inline int firstNonWsIdx(StringRef s) noexcept {
-  for (std::size_t i = 0; i < s.size(); ++i) {
-    if (!isWs(s[i]))
-      return static_cast<int>(i);
-  }
-  return -1;
+inline std::optional<size_t> firstNonWsIdx(StringRef s) noexcept {
+  size_t idx = s.find_first_not_of(" \t\n\v\f\r");
+  return (idx == StringRef::npos) ? std::nullopt : std::make_optional(idx);
 }
 
-inline int lastNonWsIdx(StringRef s) noexcept {
-  for (std::size_t i = s.size() - 1; i >= 0; --i) {
-    if (!isWs(s[i]))
-      return static_cast<int>(i);
-  }
-  return -1;
+inline std::optional<size_t> lastNonWsIdx(StringRef s) noexcept {
+  size_t idx = s.find_last_not_of(" \t\n\v\f\r");
+  return (idx == StringRef::npos) ? std::nullopt : std::make_optional(idx);
 }
 
 // -------------------- Diagnostics helpers (pure string) ---------------------
@@ -183,6 +177,7 @@ inline std::string escape(StringRef s) {
 
   os.write_escaped(s);
 
+  os.flush();
   return buffer;
 }
 

@@ -374,7 +374,7 @@ std::string RefoldEngine::Refold() {
         repl.assign(bSource_.data() + b0, bSource_.data() + b1);
       }
 
-      if (span.first >= 0) {
+      if (span.first >= 0 && span.second >= 0) {
         // Is this span replacing a TU "gap" (bytes that are all whitespace)?
         std::string original;
         if (span.second > span.first) {
@@ -399,7 +399,8 @@ std::string RefoldEngine::Refold() {
         // - always allowRight (covers cases like “…0” + “: 1” at zero-width
         //   sites)
         std::string padded =
-            PadAtBoundaries(tuBytes, span.first, span.second, std::move(repl),
+            PadAtBoundaries(tuBytes, static_cast<size_t>(span.first),
+                            static_cast<size_t>(span.second), std::move(repl),
                             /*allowLeft*/ !replacingGap,
                             /*allowRight*/ true);
 
@@ -517,8 +518,15 @@ std::string RefoldEngine::Refold() {
   if (auto it = macroPatchesByOwner.find(kNoOwner);
       it != macroPatchesByOwner.end()) {
     for (const auto &mp : it->second) {
+      if (mp.invStart < 0 || mp.invEnd < 0) {
+        fatal("macro/tu",
+              "TU macro patch has either a negative invocation start or end "
+              "(invStart={0} invEnd={1})",
+              mp.invStart, mp.invEnd);
+      }
       auto text =
-          PadAtBoundaries(tuBytes, mp.invStart, mp.invEnd, mp.replacement,
+          PadAtBoundaries(tuBytes, static_cast<size_t>(mp.invStart),
+                          static_cast<size_t>(mp.invEnd), mp.replacement,
                           /*allowLeft*/ false, /*allowRight*/ true);
       debug("macro/tu", "TU macro patch inv=[{0},{1}) replLen={2}", mp.invStart,
             mp.invEnd, text.size());
@@ -645,31 +653,34 @@ bool RefoldEngine::BoundaryGlues(char left, char right) {
   return false;
 }
 
-std::string RefoldEngine::PadAtBoundaries(StringRef base, int start, int end,
-                                          std::string text, bool allowLeft,
-                                          bool allowRight) {
-  const int f = stringutils::firstNonWsIdx(text);
-  const int l = stringutils::lastNonWsIdx(text);
-  const char leftC = (start > 0 && start <= static_cast<int>(base.size()))
-                         ? base[start - 1]
-                         : '\0';
-  const char rightC = (end < static_cast<int>(base.size())) ? base[end] : '\0';
+std::string RefoldEngine::PadAtBoundaries(StringRef base, size_t start,
+                                          size_t end, std::string text,
+                                          bool allowLeft, bool allowRight) {
+  const auto f = stringutils::firstNonWsIdx(text);
+  const auto l = stringutils::lastNonWsIdx(text);
 
-  const bool hasLeadingWS = (f > 0);
-  const bool hasTrailingWS =
-      (l >= 0 && l + 1 < static_cast<int>(text.size()) &&
-       stringutils::isWs(text[static_cast<std::size_t>(l + 1)]));
+  // If text is empty or only whitespace, there's no content to "glue"
+  if (!f || !l)
+    return text;
 
-  if (allowLeft && !hasLeadingWS && f >= 0) {
-    if (BoundaryGlues(leftC, text[static_cast<std::size_t>(f)])) {
-      text.insert(text.begin(), ' ');
-    }
-  }
-  if (allowRight && !hasTrailingWS && l >= 0) {
-    if (BoundaryGlues(text[static_cast<std::size_t>(l)], rightC)) {
-      text.push_back(' ');
-    }
-  }
+  // Character in base immediately to the left/right of the replacement range
+  const char leftC = (start > 0 && start <= base.size()) ? base[start - 1] : '\0';
+  const char rightC = (end < base.size()) ? base[end] : '\0';
+
+  // Check for existing whitespace at the edges of the provided text
+  const bool hasLeadingWS = (*f > 0);
+  const bool hasTrailingWS = (*l + 1 < text.size());
+
+  // Determine if padding is needed BEFORE modifying the string to avoid index drift
+  bool addLeftSpace = allowLeft && !hasLeadingWS && BoundaryGlues(leftC, text[*f]);
+  bool addRightSpace = allowRight && !hasTrailingWS && BoundaryGlues(text[*l], rightC);
+
+  if (addLeftSpace)
+    text.insert(0, 1, ' ');
+
+  if (addRightSpace)
+    text.push_back(' ');
+
   return text;
 }
 
@@ -1937,9 +1948,10 @@ std::string RefoldEngine::ApplyIncludeEdits(const IncludeEdits &ie,
           const int insertByte = ComputeChildBoundaryInsertByte(p, file);
           debug("include/apply.", "inserted byte {0}", insertByte);
           if (insertByte >= 0 && insertByte <= fileLen) {
-            std::string text = PadAtBoundaries(
-                headerText, insertByte, insertByte, p.insertBytes,
-                /* allowLeft */ true, /* allowRight */ true);
+            std::string text =
+                PadAtBoundaries(headerText, static_cast<size_t>(insertByte),
+                                static_cast<size_t>(insertByte), p.insertBytes,
+                                /* allowLeft */ true, /* allowRight */ true);
             edits.push_back({insertByte, insertByte, std::move(text)});
 
             debug("include/apply.",
