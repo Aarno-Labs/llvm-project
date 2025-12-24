@@ -2069,22 +2069,50 @@ std::string RefoldEngine::ApplyIncludeEdits(const IncludeEdits &ie,
     edits.push_back({startByte, endByte, std::move(replacement)});
   }
 
-  // Apply all edits inside this header, highest offset first so earlier edits
-  // do not disturb the coordinates of later ones.
+  // Sort edits FORWARD by start position
   llvm::sort(edits, [](const TextEdit &lhs, const TextEdit &rhs) {
-    return lhs.start > rhs.start;
+    if (lhs.start != rhs.start)
+      return lhs.start < rhs.start;
+    return lhs.end < rhs.end;
   });
 
   debug("include/apply", "file={0} applying {1} header TextEdits", file,
         edits.size());
 
+  // Build the result in a single pass using raw_string_ostream
+  std::string result;
+  result.reserve(headerText.size() +
+                 1024); // Optimization: avoid small reallocs
+  raw_string_ostream os(result);
+
+  int lastOffset = 0;
   for (const auto &e : edits) {
-    trace("include/apply",
-          "file={0} header TextEdit bytes=[{1},{2}) replLen={3}", file, e.start,
-          e.end, e.text.size());
-    headerText.replace(e.start, e.end - e.start, e.text);
+    // Sanity check: ensure edits don't overlap (though classification should
+    // prevent this)
+    if (e.start < lastOffset) {
+      warn("include/apply", "file={0} skipping overlapping edit at {1}", file,
+           e.start);
+      continue;
+    }
+
+    // A) Write everything from the original text between the last edit and this
+    // one
+    os << StringRef(headerText).slice(lastOffset, e.start);
+
+    // B) Write the replacement text
+    os << e.text;
+
+    // C) Advance the cursor past the "consumed" original text
+    lastOffset = e.end;
   }
-  return headerText;
+
+  // D) Write the final trailing chunk of the original file
+  if (lastOffset < fileLen) {
+    os << StringRef(headerText).slice(lastOffset, fileLen);
+  }
+
+  os.flush();
+  return result;
 }
 
 int RefoldEngine::ComputeChildBoundaryInsertByte(const IncludePatch &p,
