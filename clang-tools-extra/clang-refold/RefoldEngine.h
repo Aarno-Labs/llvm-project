@@ -439,7 +439,7 @@ private:
   /// \param allowRight Whether a right-side pad is permitted.
   /// \returns `text`, possibly prefixed and/or suffixed with a single space to
   ///          avoid token gluing.
-  static std::string PadAtBoundaries(StringRef base, int start, int end,
+  static std::string PadAtBoundaries(StringRef base, size_t start, size_t end,
                                      std::string text, bool allowLeft,
                                      bool allowRight);
 
