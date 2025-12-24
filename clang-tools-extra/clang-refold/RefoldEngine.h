@@ -268,6 +268,18 @@ private:
 
   enum class OwnerKind { TU, Include, Unknown };
 
+  static inline StringRef toString(OwnerKind kind) {
+    switch (kind) {
+    case OwnerKind::TU:
+      return "TU";
+    case OwnerKind::Include:
+      return "Include";
+    case OwnerKind::Unknown:
+      return "Unknown";
+    }
+    llvm_unreachable("Invalid owner kind");
+  }
+
   // Grant access to the specific formatter specialization
   template <typename T, typename Enable> friend struct llvm::format_provider;
 

@@ -48,8 +48,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "RefoldEngine.h"
 #include "RefoldLog.h"
+#include "RefoldEngine.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallString.h"
@@ -288,8 +288,7 @@ std::string RefoldEngine::Refold() {
         it->second.Add(std::move(patch));
         debug("classify",
               "#{0} -> INCLUDE(parent-boundary) inc={1} ({2}) patch={3}", i,
-              parentBoundaryInc->id, parentBoundaryInc->resolvedPath,
-              patch.ToString());
+              parentBoundaryInc->id, parentBoundaryInc->resolvedPath, patch);
         continue;
       }
 
@@ -304,7 +303,7 @@ std::string RefoldEngine::Refold() {
           it->second.Add(std::move(patch));
           debug("classify",
                 "#{0} → INCLUDE(before first cond) include={1} patch={2}", i,
-                inc->id, patch.ToString());
+                inc->id, patch);
           continue;
         }
       }
@@ -328,7 +327,7 @@ std::string RefoldEngine::Refold() {
 
       auto [it, _] = perInclude.try_emplace(inc->id, inc);
       IncludePatch patch = BuildIncludeInsertionPatch(*inc, h);
-      debug("include/patch", "#{0} INC {1} patch={2}", i, h, patch.ToString());
+      debug("include/patch", "#{0} INC {1} patch={2}", i, h, patch);
       it->second.Add(std::move(patch));
       continue;
     }
@@ -1826,7 +1825,7 @@ std::string RefoldEngine::ApplyIncludeEdits(const IncludeEdits &ie,
 
   for (size_t idx = 0; idx < ie.patches.size(); ++idx) {
     const IncludePatch &p = ie.patches[idx];
-    trace("include/patch", "applyIncludeEdits: patch={0}", p.ToString());
+    trace("include/patch", "applyIncludeEdits: patch={0}", p);
 
     const bool isInsert = (p.aStart == p.aEnd) && (p.bStart < p.bEnd);
     const bool isDelete = (p.aStart < p.aEnd) && (p.bStart == p.bEnd);

@@ -79,6 +79,18 @@ namespace diffutils {
 
 enum class Op { Equal, Insert, Delete };
 
+static inline StringRef toString(Op op) {
+  switch (op) {
+  case Op::Equal:
+    return "Equal";
+  case Op::Insert:
+    return "Insert";
+  case Op::Delete:
+    return "Delete";
+  }
+  llvm_unreachable("Invalid op");
+}
+
 /// \brief Immutable atom in the shortest edit script (SES).
 ///
 /// Each `Step` represents one maximal run of a single edit operation over
@@ -356,13 +368,6 @@ template <> struct format_provider<clang::refold::diffutils::Hunk> {
       hunkStr.assign(hunk.ToString</*kVerbose*/ false>());
     }
     format_provider<StringRef>::format(hunkStr, os, style);
-  }
-};
-
-template <> struct format_provider<clang::refold::diffutils::Step> {
-  static void format(const clang::refold::diffutils::Step &step,
-                     raw_ostream &os, StringRef style) {
-    format_provider<StringRef>::format(step.ToString(), os, style);
   }
 };
 } // namespace llvm

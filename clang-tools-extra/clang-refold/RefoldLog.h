@@ -42,9 +42,6 @@
 // --------------------
 //   enum class LogLevel { trace, debug, info, warn, error, fatal };
 //
-//   // Global configuration
-//   const char* logLevelToString(LogLevel level);
-//
 //   // Convenience wrappers:
 //   void trace(llvm::StringRef Cat, llvm::StringRef Fmt, auto&&... Args);
 //   void debug(llvm::StringRef Cat, llvm::StringRef Fmt, auto&&... Args);
@@ -80,7 +77,8 @@
 #include "llvm/Support/raw_ostream.h"
 
 namespace llvm {
-template <typename T> struct format_provider<std::optional<T>> {
+// General provider for `std::optional<>`
+template <typename T> struct format_provider<std::optional<T>, void> {
   static void format(const std::optional<T> &opt, raw_ostream &os,
                      StringRef style) {
     if (!opt) {
@@ -90,6 +88,55 @@ template <typename T> struct format_provider<std::optional<T>> {
     }
     // Delegate formatting of the contained value, honoring any :Style
     format_provider<T>::format(*opt, os, style);
+  }
+};
+
+using namespace clang::refold::diffutils;
+
+// Detector for class/structs with a `ToString()` member function.
+template <typename T, typename = void>
+struct has_to_string : std::false_type {};
+
+template <typename T>
+struct has_to_string<T, std::void_t<decltype(std::declval<T>().ToString())>>
+    : std::is_same<decltype(std::declval<T>().ToString()), std::string> {};
+
+// General `ToString()` provider, excluding Hunk (we special case this)
+template <typename T>
+struct format_provider<
+    T, std::enable_if_t<has_to_string<T>::value && !std::is_same_v<T, Hunk>>> {
+  static void format(const T &val, raw_ostream &os, StringRef style) {
+    os << val.ToString();
+  }
+};
+
+// Detector for enums that have a 'toString' function available via ADL
+template <typename T, typename = void>
+struct has_enum_to_string : std::false_type {};
+
+template <typename T>
+struct has_enum_to_string<T, std::void_t<decltype(toString(std::declval<T>()))>>
+    : std::is_enum<T> {};
+
+// The General Enum Provider
+template <typename T>
+struct format_provider<T, std::enable_if_t<has_enum_to_string<T>::value>> {
+  static void format(const T &val, llvm::raw_ostream &os, StringRef style) {
+    // This calls the toString(T) function found via Argument Dependent Lookup
+    os << toString(val);
+  }
+};
+
+// This handles cl::opt wrapper specifically
+template <typename T>
+struct format_provider<
+    llvm::cl::opt<T>,
+    std::enable_if_t<!llvm::detail::use_string_formatter<llvm::cl::opt<T>>::value>> {
+  static void format(const llvm::cl::opt<T> &val, llvm::raw_ostream &os,
+                     StringRef style) {
+    // We delegate to the provider for the underlying type T
+    // Note: We use val.getValue() because operator* doesn't exist
+    format_provider<T>::format(val.getValue(), os, style);
   }
 };
 } // namespace llvm
@@ -105,7 +152,7 @@ enum class LogLevel : unsigned {
   trace = 5
 };
 
-static inline StringRef logLevelToString(LogLevel level) {
+static inline StringRef toString(LogLevel level) {
   switch (level) {
   case LogLevel::trace:
     return "trace";
@@ -125,7 +172,7 @@ static inline StringRef logLevelToString(LogLevel level) {
 
 extern cl::opt<LogLevel> LogLevelOpt;
 
-inline llvm::raw_ostream::Colors levelColor(LogLevel level) {
+inline raw_ostream::Colors levelColor(LogLevel level) {
   using color = raw_ostream::Colors;
   switch (level) {
   case LogLevel::fatal:
@@ -147,8 +194,9 @@ inline llvm::raw_ostream::Colors levelColor(LogLevel level) {
 template <typename... Args>
 void logMsg(LogLevel level, StringRef tag, StringRef msg, Args &&...args) {
   if (static_cast<unsigned>(level) >
-      static_cast<unsigned>(LogLevelOpt.getValue()))
+      static_cast<unsigned>(LogLevelOpt.getValue())) {
     return;
+  }
 
   auto &os = outs();
   const bool useColor = os.has_colors(); // false if redirected
@@ -161,20 +209,20 @@ void logMsg(LogLevel level, StringRef tag, StringRef msg, Args &&...args) {
       // Format with args using LLVM's {0}, {1}, ... syntax
       // Copy Msg so the underlying char* lives through formatting.
       std::string fmt = msg.str();
-      os << llvm::formatv(fmt.c_str(), std::forward<Args>(args)...) << '\n';
+      os << formatv(fmt.c_str(), std::forward<Args>(args)...) << '\n';
     }
   };
 
   // Colored prefix based on level (fatal is bold “bright red”)
   if (level == LogLevel::trace || !useColor) {
-    os << formatv("[{0,-5}][{1}]  ", logLevelToString(level),
+    os << formatv("[{0,-5}][{1}]  ", level,
                   fmt_align(tag, AlignStyle::Left, 21, '.'));
     printMsg(os, msg, std::forward<Args>(args)...);
   } else {
     const bool bold = (level == LogLevel::fatal);
-    llvm::WithColor _(os, levelColor(level), bold);
-    os << formatv("[{0,-5}][{1}]  ", logLevelToString,
-                  fmt_align(tag, llvm::AlignStyle::Left, 21, '.'));
+    WithColor _(os, levelColor(level), bold);
+    os << formatv("[{0,-5}][{1}]  ", level,
+                  fmt_align(tag, AlignStyle::Left, 21, '.'));
     printMsg(os, msg, std::forward<Args>(args)...);
   }
 }
