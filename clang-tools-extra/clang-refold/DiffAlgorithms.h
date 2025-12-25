@@ -75,6 +75,8 @@ namespace clang {
 namespace refold {
 namespace diffutils {
 
+constexpr unsigned long long DEFAULT_MAX_CELLS = 1ULL << 30;
+
 // ===== Myers shortest edit script (SES) =====
 
 enum class Op { Equal, Insert, Delete };
@@ -273,7 +275,7 @@ std::vector<Hunk> coalesce(ArrayRef<Step> steps);
 std::vector<int> lcsMapAB(llvm::ArrayRef<std::string> a,
                           llvm::ArrayRef<std::string> b,
                           llvm::ArrayRef<unsigned> ownerDepthGap,
-                          unsigned long long maxCells = 20000000ULL);
+                          unsigned long long maxCells = DEFAULT_MAX_CELLS);
 
 /// \brief Compute a one-sided LCS backmap from sequence A to B using DP.
 ///
@@ -314,7 +316,7 @@ std::vector<int> lcsMapAB(llvm::ArrayRef<std::string> a,
 /// \param maxCells Maximum number of cells before performing a greedy scan.
 /// \returns A vector mapping a-indices to b-indices (or -1 if unmatched).
 std::vector<int> lcsMapAB(ArrayRef<std::string> a, ArrayRef<std::string> b,
-                          unsigned long long maxCells = 20000000ULL);
+                          unsigned long long maxCells = DEFAULT_MAX_CELLS);
 
 /// \brief Convert an A→B alignment map into a list of edit hunks.
 ///

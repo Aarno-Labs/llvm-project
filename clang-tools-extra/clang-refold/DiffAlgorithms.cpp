@@ -174,7 +174,6 @@ std::vector<int> lcsMapAB(llvm::ArrayRef<std::string> a,
   }
 
   if (useGreedy) {
-    std::abort();
     return lcsMapABGreedy(a, b);
   }
 
