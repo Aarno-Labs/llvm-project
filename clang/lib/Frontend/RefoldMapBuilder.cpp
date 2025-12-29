@@ -63,6 +63,21 @@ std::string keyForLoc(const SourceManager &SM, SourceLocation Loc) {
   return std::to_string(SM.getFileLoc(Loc).getRawEncoding());
 }
 
+// Macro keys must NOT normalize through getFileLoc() or getSpellingLoc(): in
+// nested expansions those can collapse distinct invocation sites onto the same
+// key, causing MacroKey2Item collisions (e.g., __FILE__ overwriting PRINT_FILE).
+// As in th example:
+//
+//   #define PRINT_FILE(FMT) printf(FMT, __FILE__, __LINE__)
+//   PRINT_FILE("Error on file (%s) and line (%d)\n");
+//
+// Use the SourceLocation raw encoding directly (keeps MacroID locations distinct).
+std::string keyForMacroLoc(SourceLocation Loc) {
+  if (Loc.isInvalid())
+    return "0";
+  return std::to_string(Loc.getRawEncoding());
+}
+
 bool isSpace(char c) { return c == ' ' || c == '\t' || c == '\f' || c == '\v'; }
 
 // Returns [bol,eol+1) byte span of the line containing 'p'.
@@ -449,66 +464,107 @@ std::string RefoldMapBuilder::filePathForLocAbs(clang::SourceManager &SM,
   return std::string();
 }
 
-int RefoldMapBuilder::argIndexForSpellingLoc(const Item &MI, SourceLocation L,
-                                             SourceManager &SM,
+int RefoldMapBuilder::argIndexForSpellingLoc(const Item &MI, SourceLocation Loc,
+                                             SourceManager &Sm,
                                              const LangOptions &Lang,
                                              bool EmitAbsPaths) {
-  if (!L.isValid() || MI.InvFile.empty() || MI.InvArgRanges.empty())
+  // Goal:
+  //   Given a token location (typically the spelling loc for a token that came
+  //   out of a macro expansion), determine which *invocation-site argument slot*
+  //   of macro invocation item MI produced that token.
+  //
+  // How:
+  //   MI.InvFile names the physical file that contains the macro invocation text,
+  //   and MI.InvArgRanges stores byte ranges (in that file) for each argument as
+  //   written at the call site. We try to map the token's location back to a
+  //   physical file location in MI.InvFile and then find the first argument range
+  //   whose byte interval overlaps the token's byte interval.
+  //
+  // Return:
+  //   * index of the argument (0-based) if we can prove the token originated
+  //     from that argument at MI's call site
+  //   * -1 otherwise
+  if (Loc.isInvalid() || MI.InvFile.empty() || MI.InvArgRanges.empty())
     return -1;
 
-  auto tryLoc = [&](SourceLocation Base) -> int {
-    if (!Base.isValid())
-      return -1;
+  SourceLocation CurrentLoc = Loc;
+  SourceLocation LastLoc; // Track the previous location to detect cycles
 
-    SourceLocation FL = SM.getFileLoc(Base);
-    if (!FL.isValid())
-      return -1;
+  // We primarily terminate via:
+  //   (a) finding a matching invocation-file + overlapping byte range, or
+  //   (b) leaving macro locations / hitting invalid loc / detecting a cycle.
+  // The depth cap is just a safety net.
+  for (unsigned Depth = 0; Depth < 100; ++Depth) {
+    if (CurrentLoc.isInvalid() || CurrentLoc == LastLoc)
+      break;
 
-    // Ensure we’re comparing against the same canonicalized form as MI.InvFile.
-    std::string TokFile = filePathForLocAbs(SM, FL, EmitAbsPaths);
-    if (TokFile != MI.InvFile)
-      return -1;
+    LastLoc = CurrentLoc;
 
-    long long TokB = (long long)SM.getFileOffset(FL);
-    SourceLocation EndL = Lexer::getLocForEndOfToken(FL, 0, SM, Lang);
-    long long TokE = EndL.isValid() ? (long long)SM.getFileOffset(EndL) : TokB;
+    // Step 1: Try to interpret the current location as a *physical file location*
+    // and see if it is inside the macro invocation file (MI.InvFile). If so,
+    // compute the token's byte span and test it against the recorded invocation
+    // argument ranges.
+    //
+    // Note: if CurrentLoc is a MacroID, Sm.getFileLoc(CurrentLoc) collapses
+    // through macro layers to a file location; otherwise it is already a file
+    // location.
+    SourceLocation Fl = CurrentLoc.isMacroID() ? Sm.getFileLoc(CurrentLoc) : CurrentLoc;
 
-    if (TokB < 0 || TokE < 0)
-      return -1;
-    if (TokE < TokB)
-      TokE = TokB;
+    std::string TokFile = filePathForLocAbs(Sm, Fl, EmitAbsPaths);
+    if (TokFile == MI.InvFile) {
+      long long TokB = (long long)Sm.getFileOffset(Fl);
+      SourceLocation EndL = Lexer::getLocForEndOfToken(Fl, 0, Sm, Lang);
+      long long TokE = EndL.isValid() ? (long long)Sm.getFileOffset(EndL) : TokB;
+      if (TokE < TokB) TokE = TokB;
 
-    // InvArgRanges[ai] is [begin,end) for argument ai (invocation-site bytes).
-    for (size_t ai = 0; ai < MI.InvArgRanges.size(); ++ai) {
-      const auto &R = MI.InvArgRanges[ai];
-      if (R.first < 0 || R.second < 0)
-        continue;
-
-      // Any overlap between token byte span and arg byte span => belongs to arg ai.
-      if (TokB < R.second && TokE > R.first)
-        return (int)ai;
+      // The argument ranges are stored as byte intervals in the invocation file.
+      // If this token overlaps any argument interval, we attribute it to that
+      // argument slot.
+      for (size_t Ai = 0; Ai < MI.InvArgRanges.size(); ++Ai) {
+        const auto &R = MI.InvArgRanges[Ai];
+        if (R.first < 0 || R.second < 0) continue;
+        if (TokB < R.second && TokE > R.first)
+          return (int)Ai;
+      }
     }
 
-    return -1;
-  };
-
-  // 1) First try spelling location (works for most direct argument tokens).
-  int AI = tryLoc(SM.getSpellingLoc(L));
-  if (AI >= 0)
-    return AI;
-
-  // 2) Then try expansion location (works when the argument itself macro-expands).
-  AI = tryLoc(SM.getExpansionLoc(L));
-  if (AI >= 0)
-    return AI;
-
-  // 3) Finally, walk macro-caller chain (bounded) as a robust fallback.
-  SourceLocation Cur = L;
-  for (int depth = 0; depth < 8 && Cur.isMacroID(); ++depth) {
-    Cur = SM.getImmediateMacroCallerLoc(Cur);
-    AI = tryLoc(Cur);
-    if (AI >= 0)
-      return AI;
+    // Step 2: "Zoom out" through macro provenance.
+    //
+    // Meaning of "zoom out":
+    //   Move from the token's current macro-derived location toward *the call-
+    //   site text that caused it*, so that eventually Sm.getFileLoc(...) lands
+    //   in MI.InvFile and overlaps an MI.InvArgRanges interval.
+    //
+    // We do this by walking macro relationships outward:
+    //   - If we are in a macro *argument expansion*, jump to the source range
+    //     that was substituted at the call site (where the argument was passed).
+    //   - Otherwise, prefer the immediate spelling location (useful for token-
+    //     paste / copied-from situations) when it makes progress.
+    //   - Otherwise, climb to the immediate macro caller location (one level
+    //     outward in the expansion stack).
+    if (CurrentLoc.isMacroID()) {
+      if (Sm.isMacroArgExpansion(CurrentLoc)) {
+        // Token comes from an argument expansion: hop to where that argument
+        // was spelled at the call site (i.e., the expansion range begin in the
+        // caller).
+        CurrentLoc = Sm.getImmediateExpansionRange(CurrentLoc).getBegin();
+      } else {
+        SourceLocation SpellingLoc = Sm.getImmediateSpellingLoc(CurrentLoc);
+        if (SpellingLoc.isValid() && SpellingLoc != CurrentLoc) {
+          // Token's characters originate from a spelled token elsewhere (often
+          // via paste/copy). Follow the spelling provenance if it actually
+          // changes the location.
+          CurrentLoc = SpellingLoc;
+        } else {
+          // Default: move one level outward to the macro caller.
+          CurrentLoc = Sm.getImmediateMacroCallerLoc(CurrentLoc);
+        }
+      }
+    } else {
+      // We've reached a non-macro file location that is not in MI.InvFile (or
+      // didn't overlap any argument ranges). No more provenance to walk.
+      break;
+    }
   }
 
   return -1;
@@ -648,6 +704,7 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
       Lexer::getSourceText(
           CharSourceRange::getCharRange(Range.getBegin(), EndTok), SM, Lang)
           .str();
+  It.IsBuiltinMacro = (MI != nullptr && MI->isBuiltinMacro());
 
   // byte offsets within the invocation's own file
   SourceLocation FB = SM.getFileLoc(Range.getBegin());
@@ -665,7 +722,7 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
   Items.push_back(std::move(It));
   if (!IncludeStack.empty())
     Items.back().OwnerIncludeId = IncludeStack.back();
-  MacroKey2Item[keyForLoc(SM, MacroNameTok.getLocation())] =
+  MacroKey2Item[keyForMacroLoc(MacroNameTok.getLocation())] =
       (int)Items.size() - 1;
 }
 
@@ -744,15 +801,67 @@ void RefoldMapBuilder::onToken(const Token &Tok) {
 
   // Prefer a macro item when the token is inside a macro expansion.
   if (SM.isMacroArgExpansion(L) || SM.isMacroBodyExpansion(L)) {
+    auto LookupMacroItem = [&](SourceLocation Loc) -> int {
+      if (Loc.isInvalid())
+        return -1;
+      auto It = MacroKey2Item.find(keyForMacroLoc(Loc));
+      if (It != MacroKey2Item.end())
+        return It->second;
+      return -1;
+    };
+
+    // Innermost macro: immediate caller of this token location.
     SourceLocation Caller = SM.getImmediateMacroCallerLoc(L);
-    auto It = MacroKey2Item.find(keyForLoc(SM, Caller));
-    if (It == MacroKey2Item.end()) {
-      // Fallback: some paths prefer expansion loc
-      Caller = SM.getExpansionLoc(L);
-      It = MacroKey2Item.find(keyForLoc(SM, Caller));
+    int InnerIdx = LookupMacroItem(Caller);
+
+    // Enclosing macro: walk up the macro caller chain (keeps MacroID hops intact).
+    // Outer macro (if any): prefer ultimate expansion location. This is robust
+    // when the immediate caller loc is a file location inside an outer macro body
+    // (no MacroID chain to walk), which is exactly the nested builtin case we
+    // care about.
+    int OuterIdx = LookupMacroItem(SM.getExpansionLoc(L));
+    if (OuterIdx < 0) {
+      // Conservative fallback: walk up the caller chain when the caller is a MacroID.
+      SourceLocation Cur = Caller;
+      for (int Depth = 0; Depth < 16; ++Depth) {
+        if (Cur.isInvalid() || !Cur.isMacroID())
+          break;
+        Cur = SM.getImmediateMacroCallerLoc(Cur);
+        OuterIdx = LookupMacroItem(Cur);
+        if (OuterIdx >= 0)
+          break;
+      }
     }
-    if (It != MacroKey2Item.end())
-      ItemIdx = It->second;
+
+    // Fallback: some paths prefer expansion loc
+    if (InnerIdx < 0) {
+      Caller = SM.getExpansionLoc(L);
+      InnerIdx = LookupMacroItem(Caller);
+    }
+
+    if (InnerIdx >= 0) {
+      int Chosen = InnerIdx;
+
+      // Clang sometimes reports adjacent punctuation as being "inside" a builtin
+      // macro expansion. In those cases, prefer the enclosing macro item for
+      // non-expansion tokens.
+      if ((size_t)InnerIdx < Items.size() && OuterIdx >= 0) {
+        const Item &MI = Items[(size_t)InnerIdx];
+        if (MI.Kind == IK_Macro && MI.IsBuiltinMacro) {
+          // Builtin/predefined macros should contribute only their expansion
+          // token(s). If Clang attributes adjacent punctuation or other
+          // non-expansion tokens to the builtin macro location, prefer the
+          // enclosing macro item for those tokens.
+          bool Ok = Tok.isLiteral() || Tok.is(tok::numeric_constant);
+          if (!Ok)
+            Chosen = OuterIdx;
+        }
+      }
+
+      ItemIdx = Chosen;
+    } else if (OuterIdx >= 0) {
+      ItemIdx = OuterIdx;
+    }
   }
 
   // Otherwise attribute to the innermost active include; else to the file item.
@@ -818,6 +927,9 @@ void RefoldMapBuilder::onToken(const Token &Tok) {
       if (MI.InvFile != TokFile)
         continue;
       if (MI.InvBegin <= TokB && TokE <= MI.InvEnd) {
+        // Ensure the enclosing macro's primary token span covers nested expansions.
+        touchSpanForItem((int)I, TokIndex);
+
         // For function-like macros, anything after the name token is treated as
         // originating from an argument spelling region. Otherwise, treat as body.
         if (MI.Subkind == "func") {

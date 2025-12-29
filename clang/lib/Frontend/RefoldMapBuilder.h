@@ -93,6 +93,7 @@ struct Item {
   std::string Text;    // directive text
   std::string InvText; // macro call text
   std::string InvFile; // file containing the macro invocation
+  bool IsBuiltinMacro = false; // true for predefined/builtin macros (e.g. __FILE__)
   SourceLocation Loc;  // primary location
   std::vector<TokenSpan> Spans;
   std::vector<ArgTokenSpan> ArgSpans; // tokens from any actual arguments
@@ -248,7 +249,7 @@ class RefoldMapBuilder {
 
   // Maps a macro-expanded token’s spelling location back to the invocation-site
   // argument index (0..N-1). Returns -1 if unknown / not in invocation file.
-  static int argIndexForSpellingLoc(const Item &MI, SourceLocation L,
+  static int argIndexForSpellingLoc(const Item &MI, SourceLocation Loc,
                                     SourceManager &SM, const LangOptions &Lang,
                                     bool EmitAbsPaths);
 
