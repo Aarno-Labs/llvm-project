@@ -215,18 +215,31 @@ static constexpr const char *RefoldSchema = R"json(
           "minimum": 0
         }
       },
-      "allOf": [
-        {
-          "properties": {
-            "end": {
-              "minimum": 0
-            }
-          }
+      "description": "Half-open token index range in the preprocessed token stream A: [begin, end). 'end' MUST be >= 'begin'."
+    },
+    "PPArgSpan": {
+      "type": "object",
+      "required": [
+        "begin",
+        "end",
+        "arg_index"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "begin": {
+          "type": "integer",
+          "minimum": 0
         },
-        {
-          "description": "Half-open token index range in the preprocessed token stream A: [begin, end). 'end' MUST be >= 'begin'."
+        "end": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "arg_index": {
+          "type": "integer",
+          "minimum": 0
         }
-      ]
+      },
+      "description": "Inherits logic from PPSpan but manually flattened for validator compatibility."
     },
     "MacroItem": {
       "type": "object",
@@ -267,7 +280,7 @@ static constexpr const char *RefoldSchema = R"json(
         "arg_spans": {
           "type": "array",
           "items": {
-            "$ref": "#/$defs/PPSpan"
+            "$ref": "#/$defs/PPArgSpan"
           },
           "description": "A-token spans within pp_cover that originate from any actual macro arguments."
         },

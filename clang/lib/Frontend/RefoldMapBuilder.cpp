@@ -43,6 +43,7 @@
 #include "clang/Basic/FileEntry.h"
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/SourceManager.h"
+#include "clang/Lex/MacroArgs.h"
 #include "clang/Lex/Preprocessor.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/JSON.h"
@@ -127,7 +128,7 @@ std::pair<size_t, size_t> lineSpanOf(StringRef S, size_t p) {
 /// \note This routine deliberately avoids any heuristic guessing and is fully
 ///       deterministic: the same input buffer always produces the same groups.
 /// \sa CondGroup, CondArm
-static std::vector<CondGroup>
+std::vector<CondGroup>
 scanTopLevelConds(llvm::StringRef Buf, llvm::StringRef FilePath) {
   std::vector<CondGroup> Groups;
   const size_t N = Buf.size();
@@ -333,6 +334,52 @@ scanTopLevelConds(llvm::StringRef Buf, llvm::StringRef FilePath) {
 
   return Groups;
 }
+
+void computeInvArgRanges(const MacroArgs *Args, const MacroInfo *MI,
+                         const SourceManager &SM, const LangOptions &Lang,
+                         std::vector<std::pair<long long, long long>> &Out) {
+  Out.clear();
+  if (!Args || !MI || !MI->isFunctionLike())
+    return;
+
+  unsigned N = MI->getNumParams();
+  Out.reserve(N);
+
+  for (unsigned ai = 0; ai < N; ++ai) {
+    const Token *AT = Args->getUnexpArgument(ai);
+    if (!AT) {
+      Out.emplace_back(-1, -1);
+      continue;
+    }
+
+    bool Have = false;
+    SourceLocation First, Last;
+    for (const Token *T = AT; !T->is(tok::eof); ++T) {
+      SourceLocation TL = T->getLocation();
+      if (!TL.isValid())
+        continue;
+      if (!Have) {
+        First = TL;
+        Have = true;
+      }
+      Last = TL;
+    }
+
+    if (!Have) {
+      Out.emplace_back(-1, -1);
+      continue;
+    }
+
+    SourceLocation FL = SM.getFileLoc(First);
+    SourceLocation LL = SM.getFileLoc(Last);
+    SourceLocation EndL = Lexer::getLocForEndOfToken(LL, 0, SM, Lang);
+    SourceLocation EL = SM.getFileLoc(EndL);
+
+    long long B = FL.isValid() ? (long long)SM.getFileOffset(FL) : -1;
+    long long E = EL.isValid() ? (long long)SM.getFileOffset(EL) : -1;
+    Out.emplace_back(B, E);
+  }
+}
 } // namespace
 
 std::pair<long long, long long>
@@ -400,6 +447,71 @@ std::string RefoldMapBuilder::filePathForLocAbs(clang::SourceManager &SM,
     return WantAbs ? absolutePathFor(*FER) : std::string(FER->getName());
   }
   return std::string();
+}
+
+int RefoldMapBuilder::argIndexForSpellingLoc(const Item &MI, SourceLocation L,
+                                             SourceManager &SM,
+                                             const LangOptions &Lang,
+                                             bool EmitAbsPaths) {
+  if (!L.isValid() || MI.InvFile.empty() || MI.InvArgRanges.empty())
+    return -1;
+
+  auto tryLoc = [&](SourceLocation Base) -> int {
+    if (!Base.isValid())
+      return -1;
+
+    SourceLocation FL = SM.getFileLoc(Base);
+    if (!FL.isValid())
+      return -1;
+
+    // Ensure we’re comparing against the same canonicalized form as MI.InvFile.
+    std::string TokFile = filePathForLocAbs(SM, FL, EmitAbsPaths);
+    if (TokFile != MI.InvFile)
+      return -1;
+
+    long long TokB = (long long)SM.getFileOffset(FL);
+    SourceLocation EndL = Lexer::getLocForEndOfToken(FL, 0, SM, Lang);
+    long long TokE = EndL.isValid() ? (long long)SM.getFileOffset(EndL) : TokB;
+
+    if (TokB < 0 || TokE < 0)
+      return -1;
+    if (TokE < TokB)
+      TokE = TokB;
+
+    // InvArgRanges[ai] is [begin,end) for argument ai (invocation-site bytes).
+    for (size_t ai = 0; ai < MI.InvArgRanges.size(); ++ai) {
+      const auto &R = MI.InvArgRanges[ai];
+      if (R.first < 0 || R.second < 0)
+        continue;
+
+      // Any overlap between token byte span and arg byte span => belongs to arg ai.
+      if (TokB < R.second && TokE > R.first)
+        return (int)ai;
+    }
+
+    return -1;
+  };
+
+  // 1) First try spelling location (works for most direct argument tokens).
+  int AI = tryLoc(SM.getSpellingLoc(L));
+  if (AI >= 0)
+    return AI;
+
+  // 2) Then try expansion location (works when the argument itself macro-expands).
+  AI = tryLoc(SM.getExpansionLoc(L));
+  if (AI >= 0)
+    return AI;
+
+  // 3) Finally, walk macro-caller chain (bounded) as a robust fallback.
+  SourceLocation Cur = L;
+  for (int depth = 0; depth < 8 && Cur.isMacroID(); ++depth) {
+    Cur = SM.getImmediateMacroCallerLoc(Cur);
+    AI = tryLoc(Cur);
+    if (AI >= 0)
+      return AI;
+  }
+
+  return -1;
 }
 
 void RefoldMapBuilder::onIncludeDirective(SourceLocation HashLoc,
@@ -548,6 +660,8 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
     It.InvBegin = It.InvEnd = -1;
   }
 
+  computeInvArgRanges(Args, MI, SM, Lang, It.InvArgRanges);
+
   Items.push_back(std::move(It));
   if (!IncludeStack.empty())
     Items.back().OwnerIncludeId = IncludeStack.back();
@@ -662,13 +776,24 @@ void RefoldMapBuilder::onToken(const Token &Tok) {
   touchSpanForItem(ItemIdx, TokIndex);
 
   // 1a) If the primary item is a MACRO expansion, also record exact origin:
-  //     - ArgSpans for tokens from actual arguments
-  //     - BodySpans for tokens from the macro body
+  //     - ArgSpans for tokens from actual arguments (func-like only)
+  //     - BodySpans for tokens from the macro body (and for obj-like macros)
   if (Items[ItemIdx].Kind == IK_Macro) {
+    auto &It = Items[(size_t)ItemIdx];
+
     if (SM.isMacroArgExpansion(L)) {
-      touchTokSpan(Items[ItemIdx].ArgSpans, TokIndex);
+      if (It.Subkind == "func") {
+        int ArgIndex = argIndexForSpellingLoc(It, L, SM, Lang, EmitAbsPaths);
+        if (ArgIndex >= 0)
+          touchArgTokSpan(It.ArgSpans, TokIndex, ArgIndex);
+        else
+          touchTokSpan(It.BodySpans, TokIndex); // fallback: keep schema-valid
+      } else {
+        // Object-like macros have no arguments; treat as body-origin.
+        touchTokSpan(It.BodySpans, TokIndex);
+      }
     } else if (SM.isMacroBodyExpansion(L)) {
-      touchTokSpan(Items[ItemIdx].BodySpans, TokIndex);
+      touchTokSpan(It.BodySpans, TokIndex);
     }
     // Tokens that are neither arg nor body (rare, e.g. builtins) remain covered
     // by the primary Spans via touchSpanForItem above.
@@ -693,13 +818,17 @@ void RefoldMapBuilder::onToken(const Token &Tok) {
       if (MI.InvFile != TokFile)
         continue;
       if (MI.InvBegin <= TokB && TokE <= MI.InvEnd) {
-        long long NameEnd = MI.InvBegin + (long long)MI.Name.size();
         // For function-like macros, anything after the name token is treated as
         // originating from an argument spelling region. Otherwise, treat as body.
-        if (MI.Subkind == "func" && TokB >= NameEnd)
-          touchTokSpan(MI.ArgSpans, TokIndex);
-        else
+        if (MI.Subkind == "func") {
+          int ArgIndex = argIndexForSpellingLoc(MI, L, SM, Lang, EmitAbsPaths);
+          if (ArgIndex >= 0)
+            touchArgTokSpan(MI.ArgSpans, TokIndex, ArgIndex);
+          else
+            touchTokSpan(MI.BodySpans, TokIndex); // fallback: keep schema-valid
+        } else {
           touchTokSpan(MI.BodySpans, TokIndex);
+        }
       }
     }
   }
@@ -1022,14 +1151,16 @@ void RefoldMapBuilder::writeJSON() {
             }
           }
 
-          // NEW: macro-token origin spans
+          // Macro-token origin spans
           if (It.Kind == IK_Macro) {
             if (!It.ArgSpans.empty()) {
               JO.attributeArray("arg_spans", [&] {
-                for (const TokenSpan &S : It.ArgSpans) {
+                for (const ArgTokenSpan &S : It.ArgSpans) {
                   JO.object([&] {
                     JO.attribute("begin", S.Begin);
                     JO.attribute("end",   S.End);
+                    if (S.ArgIndex >= 0)
+                      JO.attribute("arg_index", (int64_t)S.ArgIndex);
                   });
                 }
               });
@@ -1085,250 +1216,244 @@ void RefoldMapBuilder::writeJSON() {
     int NextCondGroupId = 0;
     int NextCondArmId = 0;
 
-// conds...
-JO.attributeArray("conds", [&] {
-  // Compute a PPSpan [PPBegin, PPEnd) for a byte range [BodyB, BodyE)
-  // within a given source file, using TokMap (which is in PP order).
-  //
-  // Return value:
-  //   - true  => at least one PP token from this file overlapped [BodyB,BodyE)
-  //             (we treat the arm as "selected" for this run).
-  //   - false => no such token; PPBegin/PPEnd will still be set to a
-  //             deterministic insertion point, but the arm is not selected.
-  auto computeArmPPSpan = [&](llvm::StringRef File,
-                              unsigned BodyB, unsigned BodyE,
-                              unsigned &PPBegin, unsigned &PPEnd) -> bool {
-    bool FoundAny = false;
-    unsigned Begin = 0;
-    unsigned End = 0;
-
-    // Normal case: collect all PP tokens whose source span overlaps [BodyB, BodyE).
-    for (const TokMapEntry &TM : TokMap) {
-      if (TM.File != File)
-        continue;
-
-      // No overlap if token ends at/before BodyB, or starts at/after BodyE.
-      if (TM.SrcEnd <= static_cast<long long>(BodyB) ||
-          TM.SrcBegin >= static_cast<long long>(BodyE))
-        continue;
-
-      unsigned PP = static_cast<unsigned>(TM.PPIndex);
-      if (!FoundAny) {
-        Begin = PP;
-        FoundAny = true;
-      }
-      // TokMap is in PP order, so this monotonically increases.
-      End = PP + 1;
-    }
-
-    if (!FoundAny) {
-      // Degenerate / empty body case: pick a deterministic insertion point.
+    // conds...
+    JO.attributeArray("conds", [&] {
+      // Compute a PPSpan [PPBegin, PPEnd) for a byte range [BodyB, BodyE)
+      // within a given source file, using TokMap (which is in PP order).
       //
-      // We choose the first PP index whose SrcBegin >= BodyE as the insertion
-      // point; if none, we fall back to "after the last token" for this file;
-      // if the file has no tokens at all, we use 0.
-      bool AnyForFile = false;
-      bool InsertSet = false;
-      unsigned Insert = 0;
+      // Return value:
+      //   - true  => at least one PP token from this file overlapped
+      //   [BodyB,BodyE)
+      //             (we treat the arm as "selected" for this run).
+      //   - false => no such token; PPBegin/PPEnd will still be set to a
+      //             deterministic insertion point, but the arm is not selected.
+      auto computeArmPPSpan = [&](llvm::StringRef File, unsigned BodyB,
+                                  unsigned BodyE, unsigned &PPBegin,
+                                  unsigned &PPEnd) -> bool {
+        bool FoundAny = false;
+        unsigned Begin = 0;
+        unsigned End = 0;
 
-      for (const TokMapEntry &TM : TokMap) {
-        if (TM.File != File)
-          continue;
-        AnyForFile = true;
+        // Normal case: collect all PP tokens whose source span overlaps [BodyB,
+        // BodyE).
+        for (const TokMapEntry &TM : TokMap) {
+          if (TM.File != File)
+            continue;
 
-        if (!InsertSet) {
-          if (TM.SrcBegin >= static_cast<long long>(BodyE)) {
-            Insert = static_cast<unsigned>(TM.PPIndex);
-            InsertSet = true;
-            break;
+          // No overlap if token ends at/before BodyB, or starts at/after BodyE.
+          if (TM.SrcEnd <= static_cast<long long>(BodyB) ||
+              TM.SrcBegin >= static_cast<long long>(BodyE))
+            continue;
+
+          unsigned PP = static_cast<unsigned>(TM.PPIndex);
+          if (!FoundAny) {
+            Begin = PP;
+            FoundAny = true;
           }
-
-          // Track "just after" the last token strictly before BodyB.
-          if (TM.SrcEnd <= static_cast<long long>(BodyB))
-            Insert = static_cast<unsigned>(TM.PPIndex + 1);
+          // TokMap is in PP order, so this monotonically increases.
+          End = PP + 1;
         }
-      }
 
-      if (!AnyForFile) {
-        Insert = 0;
-      } else if (!InsertSet) {
-        // All tokens are before BodyE; Insert already holds "last + 1".
-      }
+        if (!FoundAny) {
+          // Degenerate / empty body case: pick a deterministic insertion point.
+          //
+          // We choose the first PP index whose SrcBegin >= BodyE as the
+          // insertion point; if none, we fall back to "after the last token"
+          // for this file; if the file has no tokens at all, we use 0.
+          bool AnyForFile = false;
+          bool InsertSet = false;
+          unsigned Insert = 0;
 
-      Begin = Insert;
-      End = Insert;
-    }
+          for (const TokMapEntry &TM : TokMap) {
+            if (TM.File != File)
+              continue;
+            AnyForFile = true;
 
-    PPBegin = Begin;
-    PPEnd   = End;
-    return FoundAny;
-  };
+            if (!InsertSet) {
+              if (TM.SrcBegin >= static_cast<long long>(BodyE)) {
+                Insert = static_cast<unsigned>(TM.PPIndex);
+                InsertSet = true;
+                break;
+              }
 
-  // Helper: emit all conditional groups for a single file (TU or header),
-  // computing the enclosing *arm* parent (if any) and per-arm selected/pp_span.
-  auto emitGroups = [&](llvm::StringRef FilePath, int parentIncId,
-                        bool isTU) {
-    llvm::StringRef Buf;
-
-    // Prefer SourceManager buffers (handles VFS and remaps).
-    if (!FilePath.empty()) {
-      if (auto FER = SM.getFileManager().getOptionalFileRef(FilePath)) {
-        FileID FID = SM.translateFile(*FER); // FileID, not Optional
-        if (FID.isValid()) {
-          if (auto MB = SM.getBufferOrNone(FID))
-            Buf = MB->getBuffer(); // Optional<MemoryBufferRef> -> MB->getBuffer()
-        }
-      }
-    }
-
-    // Fallback to filesystem read.
-    if (Buf.empty() && !FilePath.empty()) {
-      if (auto MB = llvm::MemoryBuffer::getFile(FilePath))
-        Buf = (*MB)->getMemBufferRef().getBuffer();
-    }
-    if (Buf.empty())
-      return;
-
-    auto Groups = scanTopLevelConds(Buf, FilePath);
-    llvm::errs() << "[refold] conds: "
-                 << (isTU ? "TU " : "") << FilePath
-                 << " -> " << Groups.size() << " group(s)\n";
-
-    for (const auto &G : Groups) {
-      if (G.Arms.empty())
-        continue;
-
-      const long long GroupB = static_cast<long long>(G.GroupB);
-      const long long GroupE = static_cast<long long>(G.GroupE);
-
-      // Find the innermost arm (if any) that textually contains this group.
-      // We restrict to the same file + include-instance (parentIncId).
-      int ParentArmId = -1;
-      long long ParentArmBodyB = 0;
-      bool HaveParent = false;
-      for (const auto &Seed : ArmSlotSeeds) {
-        if (Seed.File != G.File)
-          continue;
-        if (Seed.OwnerIncludeId != parentIncId)
-          continue;
-
-        if (Seed.BodyB <= GroupB && GroupE <= Seed.BodyE) {
-          if (!HaveParent || Seed.BodyB >= ParentArmBodyB) {
-            HaveParent = true;
-            ParentArmBodyB = Seed.BodyB;
-            ParentArmId = Seed.ArmId;
-          }
-        }
-      }
-
-      int ThisGroupId = NextCondGroupId++;
-      JO.object([&] {
-        JO.attribute("id", ThisGroupId);
-        JO.attribute("file", G.File);
-
-        // parent = enclosing *arm* id, or null for top-level.
-        if (HaveParent)
-          JO.attribute("parent_arm_id", ParentArmId);
-        else
-          JO.attribute("parent_arm_id", nullptr);
-
-        JO.attribute("group_b",
-                     static_cast<uint64_t>(G.GroupB));
-        JO.attribute("group_e",
-                     static_cast<uint64_t>(G.GroupE));
-
-        if (parentIncId >= 0)
-          JO.attribute("parent_include_id",
-                       static_cast<int64_t>(parentIncId));
-        else
-          JO.attribute("parent_include_id", nullptr);
-
-        // *** NEW: single-arm groups get their arm body widened to the full group
-        // range, so nested groups + trailing text are counted as part of that arm.
-        const bool SingleArmGroup = (G.Arms.size() == 1);
-
-        JO.attributeArray("arms", [&] {
-          for (const auto &A : G.Arms) {
-            // Compute the effective body range we will use for:
-            //  - computing pp_span (which tokens belong to this arm), and
-            //  - parent lookup for nested groups (ArmSlotSeeds).
-            long long ArmBodyB = static_cast<long long>(A.BodyB);
-            long long ArmBodyE = static_cast<long long>(A.BodyE);
-
-            if (SingleArmGroup) {
-              // For #ifdef FOO ... #endif with no #else/#elif, the *entire*
-              // group body belongs to this single arm, including any nested
-              // conditionals and trailing lines before the closing #endif.
-              //
-              // We widen the body to [GroupB, GroupE) on the right, which:
-              //  - makes pp_span for the outer arm cover all PP tokens
-              //    produced under FOO, and
-              //  - ensures nested groups' [GroupB,GroupE) fall inside this
-              //    arm's [BodyB,BodyE) so they can correctly pick this as
-              //    their parent arm.
-              ArmBodyE = GroupE;
+              // Track "just after" the last token strictly before BodyB.
+              if (TM.SrcEnd <= static_cast<long long>(BodyB))
+                Insert = static_cast<unsigned>(TM.PPIndex + 1);
             }
+          }
 
-            int ArmId = NextCondArmId++;
+          if (!AnyForFile) {
+            Insert = 0;
+          } else if (!InsertSet) {
+            // All tokens are before BodyE; Insert already holds "last + 1".
+          }
 
-            unsigned PPBegin = 0, PPEnd = 0;
-            bool IsSelected = computeArmPPSpan(
-                G.File,
-                static_cast<unsigned>(ArmBodyB),
-                static_cast<unsigned>(ArmBodyE),
-                PPBegin, PPEnd);
+          Begin = Insert;
+          End = Insert;
+        }
 
-            JO.object([&] {
-              JO.attribute("id", ArmId);
-              JO.attribute("tag", A.Tag);
-              if (!A.Cond.empty())
-                JO.attribute("cond", A.Cond);
-              JO.attribute("body_b",
-                           static_cast<uint64_t>(ArmBodyB));
-              JO.attribute("body_e",
-                           static_cast<uint64_t>(ArmBodyE));
+        PPBegin = Begin;
+        PPEnd = End;
+        return FoundAny;
+      };
 
-              // Mark whether this arm actually contributed any PP tokens
-              // in this preprocessing run.
-              JO.attribute("selected", IsSelected);
+      // Helper: emit all conditional groups for a single file (TU or header),
+      // computing the enclosing *arm* parent (if any) and per-arm
+      // selected/pp_span.
+      auto emitGroups = [&](llvm::StringRef FilePath, int parentIncId,
+                            bool isTU) {
+        llvm::StringRef Buf;
 
-              // Only emit pp_span for the taken arm; for untaken arms we
-              // leave it out entirely.
-              if (IsSelected) {
-                JO.attributeObject("pp_span", [&] {
-                  JO.attribute("begin", PPBegin);
-                  JO.attribute("end", PPEnd);
+        // Prefer SourceManager buffers (handles VFS and remaps).
+        if (!FilePath.empty()) {
+          if (auto FER = SM.getFileManager().getOptionalFileRef(FilePath)) {
+            FileID FID = SM.translateFile(*FER); // FileID, not Optional
+            if (FID.isValid()) {
+              if (auto MB = SM.getBufferOrNone(FID))
+                Buf = MB->getBuffer(); // Optional<MemoryBufferRef> ->
+                                       // MB->getBuffer()
+            }
+          }
+        }
+
+        // Fallback to filesystem read.
+        if (Buf.empty() && !FilePath.empty()) {
+          if (auto MB = llvm::MemoryBuffer::getFile(FilePath))
+            Buf = (*MB)->getMemBufferRef().getBuffer();
+        }
+        if (Buf.empty())
+          return;
+
+        auto Groups = scanTopLevelConds(Buf, FilePath);
+        llvm::errs() << "[refold] conds: " << (isTU ? "TU " : "") << FilePath
+                     << " -> " << Groups.size() << " group(s)\n";
+
+        for (const auto &G : Groups) {
+          if (G.Arms.empty())
+            continue;
+
+          const long long GroupB = static_cast<long long>(G.GroupB);
+          const long long GroupE = static_cast<long long>(G.GroupE);
+
+          // Find the innermost arm (if any) that textually contains this group.
+          // We restrict to the same file + include-instance (parentIncId).
+          int ParentArmId = -1;
+          long long ParentArmBodyB = 0;
+          bool HaveParent = false;
+          for (const auto &Seed : ArmSlotSeeds) {
+            if (Seed.File != G.File)
+              continue;
+            if (Seed.OwnerIncludeId != parentIncId)
+              continue;
+
+            if (Seed.BodyB <= GroupB && GroupE <= Seed.BodyE) {
+              if (!HaveParent || Seed.BodyB >= ParentArmBodyB) {
+                HaveParent = true;
+                ParentArmBodyB = Seed.BodyB;
+                ParentArmId = Seed.ArmId;
+              }
+            }
+          }
+
+          int ThisGroupId = NextCondGroupId++;
+          JO.object([&] {
+            JO.attribute("id", ThisGroupId);
+            JO.attribute("file", G.File);
+
+            // parent = enclosing *arm* id, or null for top-level.
+            if (HaveParent)
+              JO.attribute("parent_arm_id", ParentArmId);
+            else
+              JO.attribute("parent_arm_id", nullptr);
+
+            JO.attribute("group_b", static_cast<uint64_t>(G.GroupB));
+            JO.attribute("group_e", static_cast<uint64_t>(G.GroupE));
+
+            if (parentIncId >= 0)
+              JO.attribute("parent_include_id",
+                           static_cast<int64_t>(parentIncId));
+            else
+              JO.attribute("parent_include_id", nullptr);
+
+            // *** NEW: single-arm groups get their arm body widened to the full
+            // group range, so nested groups + trailing text are counted as part
+            // of that arm.
+            const bool SingleArmGroup = (G.Arms.size() == 1);
+
+            JO.attributeArray("arms", [&] {
+              for (const auto &A : G.Arms) {
+                // Compute the effective body range we will use for:
+                //  - computing pp_span (which tokens belong to this arm), and
+                //  - parent lookup for nested groups (ArmSlotSeeds).
+                long long ArmBodyB = static_cast<long long>(A.BodyB);
+                long long ArmBodyE = static_cast<long long>(A.BodyE);
+
+                if (SingleArmGroup) {
+                  // For #ifdef FOO ... #endif with no #else/#elif, the *entire*
+                  // group body belongs to this single arm, including any nested
+                  // conditionals and trailing lines before the closing #endif.
+                  //
+                  // We widen the body to [GroupB, GroupE) on the right, which:
+                  //  - makes pp_span for the outer arm cover all PP tokens
+                  //    produced under FOO, and
+                  //  - ensures nested groups' [GroupB,GroupE) fall inside this
+                  //    arm's [BodyB,BodyE) so they can correctly pick this as
+                  //    their parent arm.
+                  ArmBodyE = GroupE;
+                }
+
+                int ArmId = NextCondArmId++;
+
+                unsigned PPBegin = 0, PPEnd = 0;
+                bool IsSelected = computeArmPPSpan(
+                    G.File, static_cast<unsigned>(ArmBodyB),
+                    static_cast<unsigned>(ArmBodyE), PPBegin, PPEnd);
+
+                JO.object([&] {
+                  JO.attribute("id", ArmId);
+                  JO.attribute("tag", A.Tag);
+                  if (!A.Cond.empty())
+                    JO.attribute("cond", A.Cond);
+                  JO.attribute("body_b", static_cast<uint64_t>(ArmBodyB));
+                  JO.attribute("body_e", static_cast<uint64_t>(ArmBodyE));
+
+                  // Mark whether this arm actually contributed any PP tokens
+                  // in this preprocessing run.
+                  JO.attribute("selected", IsSelected);
+
+                  // Only emit pp_span for the taken arm; for untaken arms we
+                  // leave it out entirely.
+                  if (IsSelected) {
+                    JO.attributeObject("pp_span", [&] {
+                      JO.attribute("begin", PPBegin);
+                      JO.attribute("end", PPEnd);
+                    });
+                  }
                 });
+
+                // Remember where this arm's body lives, so we can:
+                //  - resolve nested groups' parents deterministically, and
+                //  - emit arm_begin/arm_end slots later.
+                ArmSlotSeeds.push_back(ArmSlotSeed{G.File, ArmId, ArmBodyB,
+                                                   ArmBodyE, parentIncId});
               }
             });
+          });
+        }
+      };
 
-            // Remember where this arm's body lives, so we can:
-            //  - resolve nested groups' parents deterministically, and
-            //  - emit arm_begin/arm_end slots later.
-            ArmSlotSeeds.push_back(
-                ArmSlotSeed{G.File,
-                            ArmId,
-                            ArmBodyB,
-                            ArmBodyE,
-                            parentIncId});
-          }
-        });
-      });
-    }
-  };
+      // 1) Main translation unit groups.
+      emitGroups(TUAbsPath, /*parentIncId=*/-1, /*isTU=*/true);
 
-  // 1) Main translation unit groups.
-  emitGroups(TUAbsPath, /*parentIncId=*/-1, /*isTU=*/true);
-
-  // 2) Each include/include_next instance (per-instance, no dedup).
-  for (const auto &It : Items) {
-    if (!(It.Subkind == "#include" || It.Subkind == "#include_next"))
-      continue;
-    if (It.ResolvedPath.empty())
-      continue;
-    emitGroups(It.ResolvedPath, It.ID, /*isTU=*/false);
-  }
-});
+      // 2) Each include/include_next instance (per-instance, no dedup).
+      for (const auto &It : Items) {
+        if (!(It.Subkind == "#include" || It.Subkind == "#include_next"))
+          continue;
+        if (It.ResolvedPath.empty())
+          continue;
+        emitGroups(It.ResolvedPath, It.ID, /*isTU=*/false);
+      }
+    });
 
     // slots...
     JO.attributeArray("slots", [&] {
