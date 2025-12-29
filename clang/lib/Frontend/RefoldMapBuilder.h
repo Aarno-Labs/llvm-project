@@ -63,6 +63,12 @@ struct TokenSpan {
   bool Open = false;
 };
 
+struct ArgTokenSpan {
+  uint64_t Begin = 0, End = 0;
+  int ArgIndex = -1;
+  bool Open = false;
+};
+
 struct HeaderDecl {
   std::string Kind;  // "function", "unknown", etc.
   std::string Name;  // e.g. "first"
@@ -89,8 +95,11 @@ struct Item {
   std::string InvFile; // file containing the macro invocation
   SourceLocation Loc;  // primary location
   std::vector<TokenSpan> Spans;
-  std::vector<TokenSpan> ArgSpans;   // tokens from any actual arguments
-  std::vector<TokenSpan> BodySpans;  // tokens from the macro body
+  std::vector<ArgTokenSpan> ArgSpans; // tokens from any actual arguments
+  std::vector<TokenSpan> BodySpans;   // tokens from the macro body
+  // Invocation-site byte ranges [begin,end) for each actual argument (index
+  // matches formal parameter order).
+  std::vector<std::pair<long long, long long>> InvArgRanges;
   std::vector<HeaderDecl> Decls;
 
   // main-file byte range of the macro invocation (if applicable)
@@ -113,6 +122,25 @@ struct Item {
 inline void touchTokSpan(std::vector<TokenSpan> &V, uint32_t TokIdx) {
   if (V.empty() || V.back().End != TokIdx) V.push_back({TokIdx, TokIdx+1});
   else V.back().End++;
+}
+
+// Small utility to append/extend a half-open token span list (args only).
+inline void touchArgTokSpan(std::vector<ArgTokenSpan> &V, uint32_t TokIdx, int ArgIndex) {
+  if (!V.empty() && V.back().Open && V.back().End == TokIdx &&
+      V.back().ArgIndex == ArgIndex) {
+    V.back().End = TokIdx + 1;
+    return;
+  }
+
+  if (!V.empty() && V.back().Open)
+    V.back().Open = false;
+
+  ArgTokenSpan S;
+  S.Begin = TokIdx;
+  S.End = TokIdx + 1;
+  S.ArgIndex = ArgIndex;
+  S.Open = true;
+  V.push_back(S);
 }
 
 /// Mapping from a printed PP token to its source file byte range.
@@ -217,6 +245,12 @@ class RefoldMapBuilder {
   /// \returns a path string appropriate for emission.
   static std::string filePathForLocAbs(clang::SourceManager &SM,
                                        clang::SourceLocation L, bool WantAbs);
+
+  // Maps a macro-expanded token’s spelling location back to the invocation-site
+  // argument index (0..N-1). Returns -1 if unknown / not in invocation file.
+  static int argIndexForSpellingLoc(const Item &MI, SourceLocation L,
+                                    SourceManager &SM, const LangOptions &Lang,
+                                    bool EmitAbsPaths);
 
   void addHeaderDecl(Item &Inc, StringRef Kind, StringRef Name,
                      StringRef HeaderFile, unsigned HeaderB,
