@@ -41,10 +41,12 @@
 #include "RefoldMapBuilder.h"
 #include "PPMacroPrinting.h"
 #include "clang/Basic/FileEntry.h"
+#include "clang/Basic/LangOptions.h"
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/SourceManager.h"
 #include "clang/Lex/MacroArgs.h"
 #include "clang/Lex/Preprocessor.h"
+#include "clang/Lex/PreprocessorOptions.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/JSON.h"
 
@@ -394,6 +396,27 @@ void computeInvArgRanges(const MacroArgs *Args, const MacroInfo *MI,
     long long E = EL.isValid() ? (long long)SM.getFileOffset(EL) : -1;
     Out.emplace_back(B, E);
   }
+}
+
+std::string computeLangStr(const clang::LangOptions &Lang) {
+  // Objective-C family
+  if (Lang.ObjC)
+    return Lang.CPlusPlus ? "objc++" : "objc";
+
+  // CUDA/HIP/OpenCL (optional, but harmless to keep)
+  if (Lang.CUDA)
+    return "cuda";
+  if (Lang.HIP)
+    return "hip";
+  if (Lang.OpenCL)
+    return "cl";
+
+  // C++
+  if (Lang.CPlusPlus)
+    return "c++";
+
+  // Default
+  return "c";
 }
 } // namespace
 
@@ -1166,7 +1189,26 @@ void RefoldMapBuilder::writeJSON() {
   llvm::json::OStream JO(OS, /*Indent=*/2);
 
   JO.object([&] {
-    JO.attribute("version", "1.2");
+    JO.attribute("version", "1.3");
+
+    const auto &PPO = PP.getPreprocessorOpts();
+    std::string LangStr = computeLangStr(PP.getLangOpts());
+
+    llvm::SmallString<256> CWD;
+    std::string CwdStr;
+    if (!llvm::sys::fs::current_path(CWD))
+      CwdStr = CWD.str().str();
+
+    // Serailize the PP context of this clang instance
+    JO.attributeObject("pp_ctx", [&] {
+      JO.attribute("cwd", CwdStr);
+      JO.attributeArray("argv", [&] {
+        for (const std::string &Tok : PPO.RefoldPPArgv)
+          JO.value(Tok);
+      });
+      JO.attribute("lang", LangStr);
+    });
+
     JO.attribute("source", TUAbsPath);
 
     // tokens...

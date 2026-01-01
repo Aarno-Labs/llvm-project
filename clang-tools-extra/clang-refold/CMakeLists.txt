@@ -10,4 +10,6 @@ add_clang_tool(clang-refold
 target_link_libraries(clang-refold PRIVATE
   clangBasic
   clangLex
+  clangFrontend
+  clangSerialization
 )
