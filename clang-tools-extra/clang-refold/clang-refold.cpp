@@ -68,13 +68,18 @@
 #include "clang/Basic/FileManager.h"
 #include "clang/Basic/SourceManager.h"
 #include "clang/Basic/TokenKinds.h"
+#include "clang/Frontend/CompilerInstance.h"
+#include "clang/Frontend/CompilerInvocation.h"
+#include "clang/Frontend/FrontendActions.h"
 #include "clang/Lex/Lexer.h"
 #include "clang/Lex/Token.h"
 
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/InitLLVM.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/JSONSchemaValidator.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -360,9 +365,218 @@ void readFile(StringRef path, std::string &out) {
 /// \param flag Spelling used in diagnostics (e.g. "--config").
 /// \param opt  Parsed option to check.
 void requireExactlyOnce(StringRef flag, const cl::Option &opt) {
-  if (opt.getNumOccurrences() == 0) {
-    fatal("cli", "option '{0}' must be specified only once", flag);
+  if (opt.getNumOccurrences() != 1)
+    fatal("cli", "option '{0}' must be specified exactly once", flag);
+}
+
+// ------------------------------ PP Context ----------------------------------
+
+struct PPCtx {
+  std::string cwd;
+  std::vector<std::string> argv;
+  std::string lang;
+};
+
+Expected<PPCtx> parsePPCtx(const json::Object &rootJson) {
+  const json::Object *ctxObj = rootJson.getObject("pp_ctx");
+  if (!ctxObj) {
+    return createStringError(inconvertibleErrorCode(),
+                             "missing required top-level key 'pp_ctx'");
   }
+
+  PPCtx ctx;
+
+  // cwd
+  if (auto cwd = ctxObj->getString("cwd")) {
+    ctx.cwd = cwd->str();
+  } else {
+    return createStringError(inconvertibleErrorCode(),
+                             "pp_ctx.cwd must be a string");
+  }
+
+  // lang
+  if (auto lang = ctxObj->getString("lang")) {
+    ctx.lang = lang->str();
+  } else {
+    return createStringError(inconvertibleErrorCode(),
+                             "pp_ctx.lang must be a string");
+  }
+
+  // argv
+  const json::Array *argvArr = ctxObj->getArray("argv");
+  if (!argvArr) {
+    return createStringError(inconvertibleErrorCode(),
+                             "pp_ctx.argv must be an array");
+  }
+
+  ctx.argv.reserve(argvArr->size());
+  for (const json::Value &v : *argvArr) {
+    auto s = v.getAsString();
+    if (!s) {
+      return createStringError(inconvertibleErrorCode(),
+                               "pp_ctx.argv must contain only strings");
+    }
+    ctx.argv.emplace_back(s->str());
+  }
+
+  return ctx;
+}
+
+class ScopedCwd {
+public:
+  static Expected<ScopedCwd> Create(StringRef newCwd) {
+    if (newCwd.empty())
+      return createStringError(inconvertibleErrorCode(), "pp_ctx.cwd is empty");
+
+    ScopedCwd scoped;
+    if (std::error_code ec = sys::fs::current_path(scoped.oldCwd_))
+      return createStringError(ec, "failed to read current working directory");
+
+    if (std::error_code ec = sys::fs::set_current_path(newCwd)) {
+      return createStringError(ec,
+                               Twine("failed to chdir to '") + newCwd + "'");
+    }
+
+    scoped.active_ = true;
+    return std::move(scoped);
+  }
+
+  ~ScopedCwd() {
+    if (active_)
+      (void)sys::fs::set_current_path(oldCwd_);
+  }
+
+  ScopedCwd(const ScopedCwd &) = delete;
+  ScopedCwd &operator=(const ScopedCwd &) = delete;
+
+  // Important: make it movable so it can live in llvm::Expected.
+  ScopedCwd(ScopedCwd &&other) noexcept
+      : active_(other.active_), oldCwd_(std::move(other.oldCwd_)) {
+    // Ensure the moved-from guard does not try to restore on destruction.
+    other.active_ = false;
+    other.oldCwd_.clear();
+  }
+
+  ScopedCwd &operator=(ScopedCwd &&other) noexcept {
+    if (this == &other)
+      return *this;
+
+    // If this guard is active, restore before taking over the new state.
+    if (active_)
+      (void)sys::fs::set_current_path(oldCwd_);
+
+    active_ = other.active_;
+    oldCwd_ = std::move(other.oldCwd_);
+
+    other.active_ = false;
+    other.oldCwd_.clear();
+    return *this;
+  }
+
+private:
+  ScopedCwd() : active_(false) {}
+
+  bool active_;
+  SmallString<256> oldCwd_;
+};
+
+Expected<std::string> preprocessToBytes(StringRef inputPath, const PPCtx &ctx) {
+  // Force an absolute input path so it remains valid after we chdir.
+  SmallString<256> absInput(inputPath);
+  if (std::error_code ec = sys::fs::make_absolute(absInput)) {
+    return createStringError(
+        ec, formatv("cannot resolve absolute path for '{0}'", inputPath));
+  }
+
+  // Create a temp file path for clang's preprocessor output.
+  SmallString<256> tmpPath;
+  if (std::error_code ec =
+          sys::fs::createTemporaryFile("clang-refold-check", "i", tmpPath)) {
+    return createStringError(ec, "failed to create temporary file");
+  }
+
+  auto cwdGuardOrErr = ScopedCwd::Create(ctx.cwd);
+  if (!cwdGuardOrErr)
+    return cwdGuardOrErr.takeError();
+  auto cwdGuard = std::move(*cwdGuardOrErr);
+  auto removeTmp = make_scope_exit([&]() { (void)sys::fs::remove(tmpPath); });
+
+  // Assemble a cc1-style argument list for in-process preprocessing.
+  std::vector<std::string> args;
+  args.reserve(ctx.argv.size() + 10);
+  args.push_back("-E");
+  args.push_back("-P");
+  for (size_t i = 0; i < ctx.argv.size(); ++i) {
+    StringRef a(ctx.argv[i]);
+    // The recorded invocation may include refold-map or output flags used when
+    // producing the refold map. Strip these so we can redirect output to our
+    // temp file.
+    if (a == "--refold-map") {
+      ++i; // skip value
+      continue;
+    }
+    if (a.starts_with("--refold-map="))
+      continue;
+    if (a == "-o") {
+      ++i; // skip value
+      continue;
+    }
+    args.push_back(ctx.argv[i]);
+  }
+
+  // Ensure language is specified (important for non-.c suffixes like '.mod').
+  bool hasX = false;
+  for (size_t i = 0; i < args.size(); ++i) {
+    if (args[i] == "-x") {
+      hasX = true;
+      break;
+    }
+  }
+  if (!hasX && !ctx.lang.empty()) {
+    args.push_back("-x");
+    args.push_back(ctx.lang);
+  }
+
+  // Force preprocess-only, suppress line markers, and set output.
+  args.push_back("-o");
+  args.push_back(tmpPath.str().str());
+  args.push_back(absInput.str().str());
+
+  std::vector<const char *> cargs;
+  cargs.reserve(args.size());
+  for (const std::string &s : args)
+    cargs.push_back(s.c_str());
+
+  // Build a compiler instance using the compiler args that were parsed from the
+  // refold map JSON file.
+  clang::CompilerInstance ci;
+  ci.createDiagnostics();
+  if (!ci.hasDiagnostics()) {
+    return createStringError(inconvertibleErrorCode(),
+                             "failed to create diagnostics engine");
+  }
+
+  auto invocation = std::make_shared<clang::CompilerInvocation>();
+  clang::CompilerInvocation::CreateFromArgs(
+      *invocation, ArrayRef<const char *>(cargs), ci.getDiagnostics());
+
+  // Be explicit: '-P' should suppress line markers.
+  invocation->getPreprocessorOutputOpts().ShowLineMarkers = false;
+
+  ci.setInvocation(invocation);
+
+  // Run clang's preprocessor.
+  clang::PrintPreprocessedAction action;
+  if (!ci.ExecuteAction(action)) {
+    return createStringError(inconvertibleErrorCode(),
+                             "clang preprocessing failed");
+  }
+
+  // Read back in the temporary preprocessed output file that was created by
+  // clang.
+  std::string out;
+  readFile(tmpPath, out);
+  return out;
 }
 
 } // end anonymous namespace
@@ -383,7 +597,7 @@ cl::opt<LogLevel> LogLevelOpt(
 
 static cl::opt<std::string>
     PPPath("pp", // long name: --pp
-           cl::desc("Path to preprocessed file (.c.i) [required]"),
+           cl::desc("Path to preprocessed file (.c.i) [required(1)]"),
            cl::value_desc("file"), cl::cat(RefoldCategory));
 
 // Short alias: -p (points to --pp)
@@ -392,7 +606,7 @@ static cl::alias PPPathShort("p", cl::desc("Alias for --pp"),
 
 static cl::opt<std::string> PPModPath(
     "pp-mod", // long name: --pp-mod
-    cl::desc("Path to modified preprocessed file (.c.i.mod) [required]"),
+    cl::desc("Path to modified preprocessed file (.c.i.mod) [required(1)(2)]"),
     cl::value_desc("file"), cl::cat(RefoldCategory));
 
 // Short alias: -P (points to --pp-mod)
@@ -402,7 +616,7 @@ static cl::alias PPModPathShort("P", cl::desc("Alias for --pp-mod"),
 
 static cl::opt<std::string> RefoldJSONPath(
     "refold-map", // long name: --refold-map
-    cl::desc("Path to refold JSON file (.c.refold.json) [required]"),
+    cl::desc("Path to refold JSON file (.c.refold.json) [required(1)(2)]"),
     cl::value_desc("file"), cl::cat(RefoldCategory));
 
 // Short alias: -r (points to --refold-map)
@@ -412,13 +626,24 @@ static cl::alias RefoldJSONPathShort("r", cl::desc("Alias for --refold-map"),
 
 static cl::opt<std::string> ModifiedSrcPath(
     "out", // long name: --out
-    cl::desc("Path to refolded C source file (.c.mod) [required]"),
+    cl::desc("Path to refolded C source file (.c.mod) [required(1)]"),
     cl::value_desc("file"), cl::cat(RefoldCategory));
 
 // Short alias: -o (points to --out)
 static cl::alias ModifiedSrcPathShort("o", cl::desc("Alias for --out"),
                                       cl::aliasopt(ModifiedSrcPath),
                                       cl::cat(RefoldCategory));
+
+static cl::opt<std::string> CheckSrcPath(
+    "check", // long name: --check
+    cl::desc("Verify a refolding by preprocessing this refolded C source and "
+             "comparing tokens to --pp-mod"),
+    cl::value_desc("file"), cl::cat(RefoldCategory));
+
+// Short alias: -c (points to --check)
+static cl::alias CheckSrcPathShort("c", cl::desc("Alias for --check"),
+                                   cl::aliasopt(CheckSrcPath),
+                                   cl::cat(RefoldCategory));
 
 static constexpr char Overview[] = R"(
   Deterministically reconstruct partially expanded C source from edited
@@ -434,9 +659,17 @@ static constexpr char Overview[] = R"(
   produce a stable, semantically equivalent C source that preserves the original
   preprocessing hierarchy.
 
-  Typical usage:
-    clang -E -P --refold-map=foo.c.refold.json foo.c -o foo.c.i
-    clang-refold -p foo.c.i -P foo.c.i.mod -r foo.c.refold.json -o foo.c.mod
+  Modes:
+    (1) Produce a refolding:
+          clang-refold --pp foo.c.i --pp-mod foo.c.i.mod \
+            --refold-map foo.c.refold.json --out foo.c.mod
+    (2) Verify a refolding (token check):
+          clang-refold --check foo.c.mod --refold-map foo.c.refold.json \
+            --pp-mod foo.c.i.mod
+
+       This mode re-preprocesses foo.c.mod using the captured pp_ctx (cwd/argv)
+       embedded in the refold map JSON, lexes both token streams, and compares
+       them while ignoring whitespace.
   )";
 
 // ----------------------------- Main Program ----------------------------------
@@ -450,16 +683,33 @@ int main(int argc, char **argv) {
   info("log", "log level set to {0}", LogLevelOpt);
 
   // We output a custom error message if the following flags appear more than
-  // once and remove the cl::Required from the relevant cl::opt's. This is
-  // because the error message would otherwise be misleading, stating that the
-  // option must be specified at least once, which is not the case here.
-  requireExactlyOnce("--out", ModifiedSrcPath);
+  // once and remove cl::Required from the relevant cl::opt's. This is because
+  // the error message would otherwise be misleading, stating that the option
+  // must be specified at least once, which is not the case here.
+  const bool onlyCheck = (CheckSrcPath.getNumOccurrences() != 0);
+
+  // Enforce exactly one supported invocation mode:
+  //   (1) Refold:
+  //       clang-refold --pp A.i --pp-mod B.i.mod --refold-map map.json --out \
+  //         out.c.mod
+  //   (2) Verify:
+  //       clang-refold --check out.c.mod --refold-map map.json --pp-mod B.i.mod
   requireExactlyOnce("--refold-map", RefoldJSONPath);
-  requireExactlyOnce("--pp", PPPath);
   requireExactlyOnce("--pp-mod", PPModPath);
 
-  // Let A refer to the unmodified pp code, and B refer to the modified pp code.
-  StringRef aPath = PPPath, bPath = PPModPath;
+  if (onlyCheck) {
+    requireExactlyOnce("--check", CheckSrcPath);
+    // Verify mode.
+    if (PPPath.getNumOccurrences() != 0 ||
+        ModifiedSrcPath.getNumOccurrences() != 0) {
+      fatal("cli", "invalid option combination: --check cannot be used with "
+                   "--pp or --out");
+    }
+  } else {
+    // Refold mode.
+    requireExactlyOnce("--pp", PPPath);
+    requireExactlyOnce("--out", ModifiedSrcPath);
+  }
 
   // Parse and validate the refold map JSON file.
   auto parsedObjOrErr = parseAndValidateJSON(RefoldJSONPath, RefoldSchema);
@@ -476,14 +726,33 @@ int main(int argc, char **argv) {
 
   // Read files and tokenize.
   std::string aBytes, bBytes;
-  readFile(aPath, aBytes);
-  readFile(bPath, bBytes);
+  if (onlyCheck) {
+    auto ctxOrErr = parsePPCtx(rootJson);
+    if (!ctxOrErr) {
+      handleAllErrors(ctxOrErr.takeError(), [&](const ErrorInfoBase &e) {
+        fatal("model", "failed to parse pp_ctx from refold map: {0}",
+              e.message());
+      });
+    }
+
+    auto ppOrErr = preprocessToBytes(CheckSrcPath, *ctxOrErr);
+    if (!ppOrErr) {
+      handleAllErrors(ppOrErr.takeError(), [&](const ErrorInfoBase &e) {
+        fatal("pp", "failed to preprocess --check input: {0}", e.message());
+      });
+    }
+    aBytes = std::move(*ppOrErr);
+  } else {
+    readFile(PPPath, aBytes);
+  }
+
+  readFile(PPModPath, bBytes);
 
   std::vector<PPTok> aToks, bToks;
   std::vector<std::size_t> aTokByteOff, bTokByteOff;
   lexPPTokens(aBytes, aToks, aTokByteOff);
   lexPPTokens(bBytes, bToks, bTokByteOff);
-  debug("lex", "{0} tokens={1} {2} tokens={3}", aPath, aToks.size(), bPath,
+  debug("lex", "{0} tokens={1} {2} tokens={3}", PPPath, aToks.size(), PPModPath,
         bToks.size());
 
   // Append the sentinel to both source offsets.
@@ -509,8 +778,21 @@ int main(int argc, char **argv) {
 #endif
 
   // Generate the refolded C source as a string.
-  Expected<std::string> refoldedOrErr = RefoldEngine::Refold(
-      rootJson, aBytes, aToks, aTokByteOff, bBytes, bToks, bTokByteOff);
+  Expected<std::string> refoldedOrErr =
+      RefoldEngine::Refold(rootJson, aBytes, aToks, aTokByteOff, bBytes, bToks,
+                           bTokByteOff, onlyCheck);
+  if (onlyCheck) {
+    // We are only verifying that a refolding is correct, so print the response
+    // and return an appropriate exit code.
+    if (!refoldedOrErr) {
+      std::string msg = toString(refoldedOrErr.takeError());
+      outs() << msg << "\n";
+      outs() << "FAILURE!\n";
+      return 1;
+    }
+    outs() << "SUCCESS!\n";
+    return 0;
+  }
   if (!refoldedOrErr) {
     handleAllErrors(refoldedOrErr.takeError(), [&](const ErrorInfoBase &e) {
       fatal("model", "failed to parse refold model: {0}", e.message());

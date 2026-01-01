@@ -4920,6 +4920,62 @@ static void GeneratePreprocessorArgs(const PreprocessorOptions &Opts,
   // generated elsewhere.
 }
 
+// Returns true if this cc1 arg should be recorded into pp_ctx.argv.
+static bool isRefoldPPReplayArg(const llvm::opt::Arg &A) {
+  using namespace clang::driver::options;
+
+  auto isSysrootSpelling = [](llvm::StringRef Sp) {
+    return Sp == "-isysroot" || Sp == "-sysroot" || Sp == "--sysroot" ||
+           Sp.starts_with("--sysroot=");
+  };
+
+  StringRef Sp = A.getSpelling();
+  if (isSysrootSpelling(Sp))
+    return true;
+
+  switch (A.getOption().getID()) {
+  // Macro defines/undefs
+  case OPT_D:
+  case OPT_U:
+  case OPT_undef: // if you care; affects builtin macros
+
+  // Include/search paths
+  case OPT_I:
+  case OPT_isystem:
+  case OPT_iquote:
+  case OPT_idirafter:
+  case OPT_F:
+  case OPT_iframework:
+
+  // Forced includes / macro includes
+  case OPT_include:
+  case OPT_imacros:
+
+  // Language/standard selection that changes preprocessing
+  case OPT_std_EQ:
+  case OPT_x:
+
+  // These affect builtin macros / header resolution in practice
+  case OPT_resource_dir:
+  case OPT_triple:
+  case OPT_target_cpu:
+  case OPT_target_feature:
+    return true;
+
+  default:
+    return false;
+  }
+}
+
+static void appendRendered(const llvm::opt::ArgList &Args,
+                           const llvm::opt::Arg &A,
+                           std::vector<std::string> &Out) {
+  llvm::opt::ArgStringList Rendered;
+  A.render(Args, Rendered); // NOTE: no const_cast needed; render() is const
+  for (const char *Tok : Rendered)
+    Out.emplace_back(Tok);
+}
+
 static bool ParsePreprocessorArgs(PreprocessorOptions &Opts, ArgList &Args,
                                   DiagnosticsEngine &Diags,
                                   frontend::ActionKind Action,
@@ -5043,6 +5099,19 @@ static bool ParsePreprocessorArgs(PreprocessorOptions &Opts, ArgList &Args,
   Opts.DefineTargetOSMacros =
       Args.hasFlag(OPT_fdefine_target_os_macros,
                    OPT_fno_define_target_os_macros, Opts.DefineTargetOSMacros);
+
+  /// Capture the current working directory.
+  Opts.RefoldWorkingDir = Args.getLastArgValue(OPT_working_directory);
+
+  /// If we are serializing a refold map JSON file, then we neept to
+  /// additionally capture PP arguments.
+  if (!Opts.RefoldMapFile.empty()) {
+    Opts.RefoldPPArgv.clear();
+    for (const llvm::opt::Arg *A : Args) {
+      if (isRefoldPPReplayArg(*A))
+        appendRendered(Args, *A, Opts.RefoldPPArgv);
+    }
+  }
 
   return Diags.getNumErrors() == NumErrorsBefore;
 }

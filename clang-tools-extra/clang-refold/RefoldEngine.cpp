@@ -77,6 +77,32 @@ inline std::string resolveHeaderPath(const RefoldModel::IncludeItem &inc) {
              ? *inc.resolvedPath
              : stringutils::stripHeaderToken(inc.target).str();
 }
+
+Error compareTokens(ArrayRef<PPTok> aToks, ArrayRef<PPTok> bToks) {
+  if (aToks.size() != bToks.size()) {
+    return createStringError(
+        inconvertibleErrorCode(),
+        formatv("token count mismatch: A={0} B={1}", aToks.size(), bToks.size())
+            .str());
+  }
+
+  const size_t n = aToks.size();
+  for (size_t i = 0; i < n; ++i) {
+    if (aToks[i].spelling == bToks[i].spelling)
+      continue;
+
+    const std::string aDbg = stringutils::showWS(
+        stringutils::clip(StringRef(aToks[i].spelling), 100));
+    const std::string bDbg = stringutils::showWS(
+        stringutils::clip(StringRef(bToks[i].spelling), 180));
+    return createStringError(
+        inconvertibleErrorCode(),
+        formatv("token mismatch at index {0}: A={1} B={2}", i, aDbg, bDbg)
+            .str());
+  }
+
+  return Error::success();
+}
 } // namespace
 
 // ========================== Public entry points ==========================
@@ -85,7 +111,13 @@ Expected<std::string>
 RefoldEngine::Refold(const json::Object &rootJson, StringRef aSource,
                      ArrayRef<PPTok> aToks, ArrayRef<std::size_t> aTokOff,
                      StringRef bSource, ArrayRef<PPTok> bToks,
-                     ArrayRef<std::size_t> bTokOff) {
+                     ArrayRef<std::size_t> bTokOff, bool onlyCheck) {
+  if (onlyCheck) {
+    if (Error err = compareTokens(aToks, bToks))
+      return std::move(err);
+    return std::string();
+  }
+
   // Build the refold model based on the parsed JSON object.
   auto mOrErr = RefoldModel::FromJson(rootJson);
   if (!mOrErr)
@@ -171,7 +203,7 @@ std::string RefoldEngine::Refold() {
 #if 0
   auto writeMap = [](StringRef filename, const std::vector<int> &a2b) {
     std::error_code ec;
-    llvm::raw_fd_ostream os(filename.str(), ec, llvm::sys::fs::OF_Text);
+    raw_fd_ostream os(filename.str(), ec, llvm::sys::fs::OF_Text);
     if (ec) {
       fatal("a2b/write", "open file '{0}' failed: {1}", filename, ec.message());
     }
@@ -220,7 +252,7 @@ std::string RefoldEngine::Refold() {
   for (std::size_t i = 0; i < hunks.size(); ++i) {
     const auto &h = hunks[i];
 
-    llvm::StringRef bfrag;
+    StringRef bfrag;
     if (h.bStart < h.bEnd) {
       const std::size_t b0 = bTokOff_[static_cast<std::size_t>(h.bStart)];
       const std::size_t b1 = bTokOff_[static_cast<std::size_t>(h.bEnd)];
@@ -1040,7 +1072,7 @@ RefoldEngine::AnchorToNearestSlotBoundaryFromPPGap(StringRef tuPath,
     int b = s->b;
 
     bool needsAdjustment =
-        llvm::StringSwitch<bool>(s->kind)
+        StringSwitch<bool>(s->kind)
             .Cases("after_include", "after_last_include", "arm_end", true)
             .Default(false);
     if (needsAdjustment)
@@ -2070,7 +2102,7 @@ std::string RefoldEngine::ApplyIncludeEdits(const IncludeEdits &ie,
   }
 
   // Sort edits FORWARD by start position
-  llvm::sort(edits, [](const TextEdit &lhs, const TextEdit &rhs) {
+  sort(edits, [](const TextEdit &lhs, const TextEdit &rhs) {
     if (lhs.start != rhs.start)
       return lhs.start < rhs.start;
     return lhs.end < rhs.end;

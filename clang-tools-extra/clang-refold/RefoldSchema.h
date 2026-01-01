@@ -139,6 +139,7 @@ static constexpr const char *RefoldSchema = R"json(
   "type": "object",
   "required": [
     "version",
+    "pp_ctx",
     "source",
     "tokens",
     "items",
@@ -150,6 +151,36 @@ static constexpr const char *RefoldSchema = R"json(
       "type": "string",
       "minLength": 1,
       "$comment": "File format version."
+    },
+    "pp_ctx": {
+      "type": "object",
+      "description": "Preprocessor invocation context used to produce the original preprocessed token stream (A). This is used by clang-refold --check to re-run preprocessing of the refolded source under the same flags and verify token alignment against the edited preprocessed output.",
+      "required": [
+        "cwd",
+        "argv",
+        "lang"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "cwd": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Working directory where the original clang invocation was run. Relative paths in argv (e.g. -I ./headers) are interpreted relative to this directory."
+        },
+        "argv": {
+          "type": "array",
+          "description": "Argument vector tokens that materially affect preprocessing and must be replayed for deterministic checking (e.g. -D/-U/-I/-isystem/-include/--sysroot/-isysroot/-resource-dir/-triple/-target-cpu/-std/-x). Stored exactly as tokens, in original order.",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "lang": {
+          "type": "string",
+          "minLength": 1,
+          "description": "High-level source language for the preprocessing invocation (e.g. 'c', 'c++', 'objc', 'objc++')."
+        }
+      }
     },
     "source": {
       "type": "string",

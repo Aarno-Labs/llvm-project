@@ -175,19 +175,20 @@ public:
   /// * Token boundary hygiene prevents “glued” tokens; spaces are inserted only
   ///   when required by maximal-munch rules.
   ///
-  /// \param root     Parsed refold map JSON (immutable model root).
-  /// \param aSource  Original preprocessed text A (e.g., `test.c.i`).
-  /// \param aToks    Tokens of A.
-  /// \param aTokOff  Byte offsets for A tokens (size = |A| + 1).
-  /// \param bSource  Edited preprocessed text B (e.g., `test.c.i.mod`).
-  /// \param bToks    Tokens of B.
-  /// \param bTokOff  Byte offsets for B tokens (size = |B| + 1).
-  /// \returns        The refolded, partially expanded C source.
-  static Expected<std::string> Refold(const json::Object &rootJson,
-                                      StringRef aSource, ArrayRef<PPTok> aToks,
-                                      ArrayRef<std::size_t> aTokOff,
-                                      StringRef bSource, ArrayRef<PPTok> bToks,
-                                      ArrayRef<std::size_t> bTokOff);
+  /// \param root       Parsed refold map JSON (immutable model root).
+  /// \param aSource    Original preprocessed text A (e.g., `test.c.i`).
+  /// \param aToks      Tokens of A.
+  /// \param aTokOff    Byte offsets for A tokens (size = |A| + 1).
+  /// \param bSource    Edited preprocessed text B (e.g., `test.c.i.mod`).
+  /// \param bToks      Tokens of B.
+  /// \param bTokOff    Byte offsets for B tokens (size = |B| + 1).
+  /// \param onlyCheck  If true, then we should only verify that \c aToks and
+  ///                   \c bToks align.
+  /// \returns          The refolded, partially expanded C source.
+  static Expected<std::string>
+  Refold(const json::Object &rootJson, StringRef aSource, ArrayRef<PPTok> aToks,
+         ArrayRef<std::size_t> aTokOff, StringRef bSource,
+         ArrayRef<PPTok> bToks, ArrayRef<std::size_t> bTokOff, bool onlyCheck);
 
 private:
   const RefoldModel model_;

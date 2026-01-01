@@ -202,6 +202,12 @@ public:
   /// If set, the UNIX timestamp specified by SOURCE_DATE_EPOCH.
   std::optional<uint64_t> SourceDateEpoch;
 
+  /// TENJIN: working director of this clang instance
+  std::string RefoldWorkingDir;
+
+  /// TENJIN: pp arguments that were passed to this clang instance
+  std::vector<std::string> RefoldPPArgv;
+
 public:
   PreprocessorOptions() : PrecompiledPreambleBytes(0, false) {}
 
