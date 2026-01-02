@@ -79,25 +79,28 @@ inline std::string resolveHeaderPath(const RefoldModel::IncludeItem &inc) {
 }
 
 Error compareTokens(ArrayRef<PPTok> aToks, ArrayRef<PPTok> bToks) {
-  if (aToks.size() != bToks.size()) {
-    return createStringError(
-        inconvertibleErrorCode(),
-        formatv("token count mismatch: A={0} B={1}", aToks.size(), bToks.size())
-            .str());
-  }
-
-  const size_t n = aToks.size();
+  // Let's first at least compare the tokens up to the min length to see if we
+  // at least have a match prefix. We can complain about the length mismatch
+  // later.
+  const size_t n = std::min(aToks.size(), bToks.size());
   for (size_t i = 0; i < n; ++i) {
-    if (aToks[i].spelling == bToks[i].spelling)
-      continue;
-
     const std::string aDbg = stringutils::showWS(
         stringutils::clip(StringRef(aToks[i].spelling), 100));
     const std::string bDbg = stringutils::showWS(
         stringutils::clip(StringRef(bToks[i].spelling), 180));
+    if (aToks[i].spelling != bToks[i].spelling) {
+      return createStringError(
+          inconvertibleErrorCode(),
+          formatv("token mismatch at index {0}: A='{1}' B='{2}'", i, aDbg, bDbg)
+              .str());
+    }
+   debug("compare", "token match at index {0}: A='{1}' B='{2}'", i, aDbg, bDbg);
+  }
+
+  if (aToks.size() != bToks.size()) {
     return createStringError(
         inconvertibleErrorCode(),
-        formatv("token mismatch at index {0}: A={1} B={2}", i, aDbg, bDbg)
+        formatv("token count mismatch: A={0} B={1}", aToks.size(), bToks.size())
             .str());
   }
 
@@ -173,6 +176,15 @@ std::string RefoldEngine::Refold() {
                                  /* sameWidth */ false,
                                  [](StringRef msg) { trace("lcs/aSeq", msg); });
   trace("lcs/aSeq", sep);
+
+  // Make sure that when we re-lex the A-stream tokens that it matches the token
+  // count as listed in the refold map JSON file.
+  if (static_cast<size_t>(model_.GetTokensCountA()) != aSeq.size()) {
+    fatal("lcs/aSeq",
+          "A-stream token count mismatch: model reported {0} tokens, but lexed "
+          "sequence (aSeq) has {1} tokens.",
+          model_.GetTokensCountA(), aSeq.size());
+  }
 
   auto bSeq = MapLexemes(bToks_, bTokOff_);
   trace("lcs/bSeq", "bSeq:");

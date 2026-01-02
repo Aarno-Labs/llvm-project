@@ -735,18 +735,31 @@ int main(int argc, char **argv) {
       });
     }
 
-    auto ppOrErr = preprocessToBytes(CheckSrcPath, *ctxOrErr);
-    if (!ppOrErr) {
-      handleAllErrors(ppOrErr.takeError(), [&](const ErrorInfoBase &e) {
-        fatal("pp", "failed to preprocess --check input: {0}", e.message());
-      });
+    // Preprocess the refolded C source:
+    {
+      auto ppOrErr = preprocessToBytes(CheckSrcPath, *ctxOrErr);
+      if (!ppOrErr) {
+        handleAllErrors(ppOrErr.takeError(), [&](const ErrorInfoBase &e) {
+          fatal("pp", "failed to preprocess --check input: {0}", e.message());
+        });
+      }
+      aBytes = std::move(*ppOrErr);
     }
-    aBytes = std::move(*ppOrErr);
+
+    // Preprocess the edited prerpocessed output file:
+    {
+      auto ppOrErr = preprocessToBytes(PPModPath, *ctxOrErr);
+      if (!ppOrErr) {
+        handleAllErrors(ppOrErr.takeError(), [&](const ErrorInfoBase &e) {
+          fatal("pp", "failed to preprocess --check input: {0}", e.message());
+        });
+      }
+      bBytes = std::move(*ppOrErr);
+    }
   } else {
     readFile(PPPath, aBytes);
+    readFile(PPModPath, bBytes);
   }
-
-  readFile(PPModPath, bBytes);
 
   std::vector<PPTok> aToks, bToks;
   std::vector<std::size_t> aTokByteOff, bTokByteOff;

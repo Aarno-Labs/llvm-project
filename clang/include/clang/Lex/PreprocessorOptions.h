@@ -104,9 +104,6 @@ public:
   /// The implicit PCH included at the start of the translation unit, or empty.
   std::string ImplicitPCHInclude;
 
-  /// Path to write the refolding JSON (".refold.json").
-  std::string RefoldMapFile;
-
   /// Headers that will be converted to chained PCHs in memory.
   std::vector<std::string> ChainedIncludes;
 
@@ -202,10 +199,13 @@ public:
   /// If set, the UNIX timestamp specified by SOURCE_DATE_EPOCH.
   std::optional<uint64_t> SourceDateEpoch;
 
-  /// TENJIN: working director of this clang instance
+  /// TENJIN: path to write the refolding JSON (".refold.json").
+  std::string RefoldMapFile;
+
+  /// TENJIN: working director of this clang instance.
   std::string RefoldWorkingDir;
 
-  /// TENJIN: pp arguments that were passed to this clang instance
+  /// TENJIN: captured list of all preprocessing arguments.
   std::vector<std::string> RefoldPPArgv;
 
 public:
