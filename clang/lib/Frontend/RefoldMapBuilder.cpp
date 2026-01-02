@@ -1203,8 +1203,8 @@ void RefoldMapBuilder::writeJSON() {
     JO.attributeObject("pp_ctx", [&] {
       JO.attribute("cwd", CwdStr);
       JO.attributeArray("argv", [&] {
-        for (const std::string &Tok : PPO.RefoldPPArgv)
-          JO.value(Tok);
+        for (const std::string &Arg : PPO.RefoldPPArgv)
+          JO.value(Arg);
       });
       JO.attribute("lang", LangStr);
     });
