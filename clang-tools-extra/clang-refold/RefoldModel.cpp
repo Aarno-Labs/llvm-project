@@ -162,9 +162,9 @@ namespace clang {
 namespace refold {
 
 namespace {
-Expected<std::vector<RefoldModel::PPSpan>> parsePPSpans(const json::Value &val,
-                                                        StringRef ctx) {
-  std::vector<RefoldModel::PPSpan> out;
+template <typename T = RefoldModel::PPSpan>
+Expected<std::vector<T>> parseSpans(const json::Value &val, StringRef ctx) {
+  std::vector<T> out;
   auto arrOrErr = asArray(val, ctx);
   if (!arrOrErr)
     return arrOrErr.takeError();
@@ -172,25 +172,36 @@ Expected<std::vector<RefoldModel::PPSpan>> parsePPSpans(const json::Value &val,
 
   out.reserve(arr->size());
   for (std::size_t i = 0; i < arr->size(); ++i) {
-    const std::string ctxItem = (ctx + Twine("[") + Twine(i) + "]").str();
+    const std::string ctxItem = (ctx + "[" + Twine(i) + "]").str();
 
     auto objOrErr = arrayObjElemAt(*arr, i, ctxItem);
     if (!objOrErr)
       return objOrErr.takeError();
     const json::Object *obj = *objOrErr;
 
-    // required
+    // 1. Parse common fields
     auto bOrErr = applyToField(asInt, *obj, "begin", ctxItem);
     if (!bOrErr)
       return bOrErr.takeError();
-    int begin = *bOrErr;
 
     auto eOrErr = applyToField(asInt, *obj, "end", ctxItem);
     if (!eOrErr)
       return eOrErr.takeError();
-    int end = *eOrErr;
 
-    out.push_back({begin, end});
+    T span;
+    span.begin = *bOrErr;
+    span.end = *eOrErr;
+
+    // 2. Handle arg_index if T is PPArgSpan
+    // Using 'if constexpr' ensures this code only exists for PPArgSpan
+    if constexpr (std::is_same_v<T, RefoldModel::PPArgSpan>) {
+      auto argOrErr = applyToField(asInt, *obj, "arg_index", ctxItem);
+      if (!argOrErr)
+        return argOrErr.takeError();
+      span.argIdx = *argOrErr;
+    }
+
+    out.push_back(std::move(span));
   }
   return out;
 }
@@ -349,7 +360,7 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
 
           std::vector<PPSpan> spans;
           if (const json::Value *spansVal = obj->get("spans")) {
-            auto sp = parsePPSpans(*spansVal, "include.spans");
+            auto sp = parseSpans(*spansVal, "include.spans");
             if (!sp)
               return sp.takeError();
             spans = std::move(*sp);
@@ -493,7 +504,7 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
           md.ownerIncludeId = asOptInt(*obj, "owner_include_id");
 
           if (const json::Value *spansVal = obj->get("spans")) {
-            auto sp = parsePPSpans(*spansVal, "macro.directive.spans");
+            auto sp = parseSpans(*spansVal, "macro.directive.spans");
             if (!sp)
               return sp.takeError();
             md.spans = std::move(*sp);
@@ -569,15 +580,15 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
 
         std::vector<PPSpan> spans;
         if (const json::Value *spansVal = obj->get("spans")) {
-          auto sp = parsePPSpans(*spansVal, "macro.spans");
+          auto sp = parseSpans(*spansVal, "macro.spans");
           if (!sp)
             return sp.takeError();
           spans = std::move(*sp);
         }
 
-        std::vector<PPSpan> argSpans;
+        std::vector<PPArgSpan> argSpans;
         if (const json::Value *spansVal = obj->get("arg_spans")) {
-          auto sp = parsePPSpans(*spansVal, "macro.arg_spans");
+          auto sp = parseSpans<PPArgSpan>(*spansVal, "macro.arg_spans");
           if (!sp)
             return sp.takeError();
           argSpans = std::move(*sp);
@@ -585,7 +596,7 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
 
         std::vector<PPSpan> bodySpans;
         if (const json::Value *spansVal = obj->get("body_spans")) {
-          auto sp = parsePPSpans(*spansVal, "macro.body_spans");
+          auto sp = parseSpans(*spansVal, "macro.body_spans");
           if (!sp)
             return sp.takeError();
           bodySpans = std::move(*sp);
@@ -642,7 +653,7 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
         fi.path = asOptString(*obj, "path");
 
         if (const json::Value *spansVal = obj->get("spans")) {
-          auto sp = parsePPSpans(*spansVal, "file.spans");
+          auto sp = parseSpans(*spansVal, "file.spans");
           if (!sp)
             return sp.takeError();
           fi.spans = std::move(*sp);
