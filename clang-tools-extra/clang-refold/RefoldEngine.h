@@ -808,39 +808,278 @@ private:
   bool MacroExpansionEnvelopeB(const RefoldModel::MacroInvocation &m,
                                bool onlyInvFile, int &begin, int &end) const;
 
-  /// \brief Build a macro replacement patch by splicing the macro’s B-side
-  ///        expansion into the call site.
+  /// Attempts to build a `MacroPatch` by reconciling edits specifically
+  /// within the arguments of a function-like macro invocation, rather than
+  /// replacing the entire macro call.
   ///
-  /// Constructs a `MacroPatch` that replaces a macro invocation with its fully
-  /// expanded bytes from **B**.
+  /// This method is a "surgical" alternative to whole-macro replacement. It is
+  /// preferred when the edits (hunks) are strictly contained within the
+  /// expansion of the macro's parameters. By identifying which macro parameter
+  /// the edit corresponds to, it can update the specific argument at the
+  /// call-site in the original source, preserving the macro name and any
+  /// unedited arguments.
   ///
-  /// ### Primary Path
-  /// * Map the macro’s A-cover `[coverBegin, coverEnd)` to a B-token interval
-  ///   using the A→B LCS map (`a2b`).
-  /// * Slice `bSource_` via `bTokOff_` to obtain the replacement bytes.
+  /// ### Strategy:
   ///
-  /// ### Fallbacks (deterministic)
-  /// * If the cover cannot be mapped (unmapped or inverted), and the hunk
-  ///   contributes no tokens in **B**, produce an empty replacement (macro
-  ///   vanished).
-  /// * Otherwise, use the exact **B** slice from the hunk (`[h.bStart,
-  /// h.bEnd)`).
+  /// - **Validation:** Ensures the macro is "func-like" and has valid
+  ///   invocation byte offsets.
+  /// - **Hole Identification:** Uses `body_spans` to find where
+  ///   parameters appear in the expansion (the "holes") and maps them to
+  ///   argument indices via `arg_spans`.
+  /// - **Containment Check:** Verifies that the provided `Hunk`
+  ///   resides entirely within the identified argument spans. If an edit
+  ///   overlaps the macro's boilerplate (body text that isn't a parameter),
+  ///   this method fails.
+  /// - **Mapping:** Projects the A-side (original preprocessed) argument
+  ///   tokens to the B-side (edited preprocessed) tokens to extract the new
+  ///   string representation from `bSource_`.
+  /// - **Reconstruction:** Parses the `baseInvocationText` to find
+  ///   the original argument byte ranges and performs a right-to-left
+  ///   replacement to build the final patched invocation string.
   ///
-  /// A final defensive clamp ensures byte indices are monotonic; if violated,
-  /// an empty replacement is emitted instead of failing. Leading and trailing
-  /// edge spaces are trimmed to prevent token gluing at boundaries.
+  /// \param m The macro invocation being patched.
+  /// \param h The hunk (edit) that triggered the patch attempt.
+  /// \param a2b The token mapping array from original preprocessed (A) to
+  ///            edited (B).
+  /// \param baseInvocationText The original text of the macro call in the
+  ///                           source file.
+  /// \return A `MacroPatch` containing the updated call-site text, or
+  ///         `std::nullopt` if the hunk is not strictly an argument edit or if
+  ///         mapping conflicts occur.
+  std::optional<MacroPatch> BuildMacroInvocationPatchArgsOnly(
+      const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h,
+      const ArrayRef<int> a2b, StringRef baseInvocationText) const;
+
+  /// Determines if a given edit hunk is entirely contained within a set of
+  /// macro argument spans.
   ///
-  /// \param m         Macro invocation metadata (includes call site byte range
-  ///                  and A-cover).
-  /// \param h         The diff hunk associated with this macro region.
-  /// \param a2b       Map from A-token index → matching B-token index (or -1)
-  ///                  as produced by the LCS.
-  /// \returns         A `MacroPatch` targeting the macro call site with the
-  ///                  computed replacement bytes.
-  MacroPatch
-  BuildMacroInvocationPatchWholeCover(const RefoldModel::MacroInvocation &m,
-                                      const diffutils::Hunk &h,
-                                      ArrayRef<int> a2b) const;
+  /// This method serves as a safety gate for "surgical" macro patching. It
+  /// ensures that an edit (the `Hunk`) only touches the tokens corresponding to
+  /// macro parameters and does not overlap with the macro's "boilerplate" body
+  /// text (e.g., operators, semicolons, or literal constants defined in the
+  /// macro body).
+  ///
+  /// The containment logic differs based on the type of edit:
+  ///
+  /// - **Insertions (aStart == aEnd):** Attributed to an argument if the
+  ///   insertion point `a0` falls within the *inclusive* range `[begin, end]`
+  ///   of an argument span. This allows for prepending or appending to an
+  ///   argument's content.
+  /// - **Replacements/Deletions (aStart < aEnd):** Every token index in the
+  ///   interval `[aStart, aEnd)` must be contained within at least one argument
+  ///   span. This ensures no part of the macro's structural body is modified.
+  ///
+  /// As a side effect, the `touched` array is updated to track which specific
+  /// argument indices (based on the provided `argSpans` list) are affected by
+  /// the hunk.
+  ///
+  /// \param h The hunk representing the edit in the original preprocessed (A)
+  ///          token stream.
+  /// \param argSpans A list of token spans representing the regions where macro
+  ///                 parameters appear in the expanded preprocessed output.
+  /// \param touched An output array of the same length as `argSpans`, where
+  ///                indices will be set to `true` if the hunk overlaps that
+  ///                specific argument.
+  /// \return `true` if the hunk is fully contained within the provided argument
+  ///         spans; `false` if any part of the hunk touches non-argument tokens
+  ///         or falls outside the known argument regions.
+  static bool
+  HunkFullyWithinArgSpans(const diffutils::Hunk &h,
+                          const std::vector<RefoldModel::PPArgSpan> &argSpans,
+                          llvm::MutableArrayRef<char> touched);
+
+  /// Reconstructs the token spans of macro arguments by identifying the "holes"
+  /// between consecutive macro body segments.
+  ///
+  /// In function-like macros, the preprocessor provides `body_spans` which
+  /// represent the literal parts of the macro definition. These spans alternate
+  /// with the positions where macro parameters are expanded. By calculating the
+  /// gap between `bodySpans[i].end` and `bodySpans[i+1].begin`, we identify an
+  /// expansion site.
+  ///
+  /// Because macros may use parameters multiple times, out of order, or not at
+  /// all, this method correlates each identified "hole" with the original
+  /// invocation argument index by checking for overlaps against the metadata in
+  /// `argSpans`.
+  ///
+  /// \param bodySpans The alternating list of literal spans in the macro
+  ///                  expansion.
+  /// \param argSpans Metadata used to map expansion regions back to specific
+  ///                 parameter indices.
+  /// \return A list of `PPArgSpan` objects representing the expansion sites and
+  ///         their associated argument indices; returns an empty list if no
+  ///         holes are found.
+  static std::vector<RefoldModel::PPArgSpan>
+  ComputeArgSpansFromBodySpansWithArgIdx(
+      const std::vector<RefoldModel::PPSpan> &bodySpans,
+      const std::vector<RefoldModel::PPArgSpan> &argSpans);
+
+  /// Determines if two preprocessor (PP) token spans overlap, with special
+  /// handling for zero-width insertion points.
+  ///
+  /// This method is used during macro argument patching to correlate edit
+  /// locations with parameter "holes" in the expanded body. Unlike standard
+  /// half-open interval overlap checks, this logic is designed to be inclusive
+  /// of boundary points when dealing with insertions.
+  ///
+  /// ### Overlap Rules:
+  ///
+  /// - **Point vs. Point:** Two empty spans (insertions) overlap only if they
+  ///   occur at the exact same token index.
+  /// - **Point vs. Range:** An empty span overlaps a non-empty range if the
+  ///   insertion point falls anywhere within the range, *including* the start
+  ///   and end boundaries (e.g., point 5 overlaps range [5, 10)).
+  /// - **Range vs. Range:** Two non-empty ranges overlap if they share at least
+  ///   one common token (standard half-open interval intersection).
+  ///
+  /// \param b0 The beginning index of the first span.
+  /// \param e0 The end index (exclusive) of the first span.
+  /// \param b1 The beginning index of the second span.
+  /// \param e1 The end index (exclusive) of the second span.
+  /// \return `true` if the spans overlap according to the rules above;
+  ///         `false` otherwise or if indices are logically invalid (begin >
+  ///         end).
+  static bool SpansOverlapForArgIdx(int b0, int e0, int b1, int e1) {
+    // Spans are PP token index ranges, generally half-open [begin, end).
+    // Treat empty spans as a single insertion point that can overlap a
+    // non-empty span at its edges.
+    if (b0 > e0 || b1 > e1)
+      return false;
+
+    if (b0 == e0 && b1 == e1)
+      return b0 == b1;
+
+    if (b0 == e0)
+      return b0 >= b1 && b0 <= e1;
+
+    if (b1 == e1)
+      return b1 >= b0 && b1 <= e0;
+
+    return std::max(b0, b1) < std::min(e0, e1);
+  }
+
+  /// Calculates the bounding "envelope" of tokens in the edited preprocessed
+  /// stream (B) that correspond to a specific range of tokens from the original
+  /// preprocessed stream (A).
+  ///
+  /// Because edits can reorder, delete, or duplicate tokens, a contiguous range
+  /// in A might map to a fragmented or shifted set of indices in B. This method
+  /// finds the minimum and maximum mapped indices to create a single half-open
+  /// interval `[min, max + 1)` in the B-domain that covers all "surviving"
+  /// tokens from the original A-range.
+  ///
+  /// This is primarily used to determine the expansion area of a macro or an
+  /// include argument after edits have been applied to the preprocessed source.
+  ///
+  /// \param a2b The mapping array where `a2b[a]` provides the index of token
+  /// `a`
+  ///            in the B-stream (or -1 if the token was deleted).
+  /// \param aBegin The starting token index in the A-domain (inclusive).
+  /// \param aEnd The ending token index in the A-domain (exclusive).
+  /// \return A pair representing the half-open interval `[bMin, bMaxExcl]` in
+  /// the
+  ///         B-domain, or `std::nullopt` if none of the tokens in the A-range
+  ///         exist in B.
+  static std::optional<std::pair<int, int>>
+  MapAToBTokenEnvelope(const std::vector<int> &a2b, int aBegin, int aEnd) {
+
+    int bMin = std::numeric_limits<int>::max();
+    int bMax = std::numeric_limits<int>::min();
+
+    for (int a = aBegin; a < aEnd; ++a) {
+      if (a < 0 || static_cast<size_t>(a) >= a2b.size())
+        continue;
+
+      int b = a2b[a];
+      if (b < 0)
+        continue;
+
+      bMin = std::min(bMin, b);
+      bMax = std::max(bMax, b);
+    }
+
+    if (bMin == std::numeric_limits<int>::max())
+      return std::nullopt;
+
+    return std::make_pair(bMin, bMax + 1);
+  }
+
+  /// Parses the raw text of a function-like macro invocation to identify the
+  /// byte ranges of its individual arguments.
+  ///
+  /// This method performs a shallow, brace-aware scan of the invocation text
+  /// starting from the opening parenthesis. It correctly handles nested
+  /// parentheses, brackets, and braces, ensuring that commas within nested
+  /// expressions (like function calls or initializer lists) do not prematurely
+  /// terminate an argument.
+  ///
+  /// The parser is also string- and character-literal aware; it skips over
+  /// escaped characters and delimiters within quotes to avoid misinterpreting
+  /// structural C characters as macro argument separators.
+  ///
+  /// \param invText The full source text of the macro invocation
+  ///                (e.g., "MY_MACRO(a, f(b, c))").
+  /// \return A list of `[start, end]` byte ranges for each argument, with
+  ///         leading and trailing whitespace trimmed; returns `std::nullopt` if
+  ///         the text is malformed or the closing parenthesis is missing.
+  static std::optional<std::vector<std::pair<int, int>>>
+  ParseMacroInvocationArgContentRanges(StringRef invText);
+
+  /// Adjusts the boundaries of a character range to exclude leading and
+  /// trailing whitespace.
+  ///
+  /// Given a string and a half-open interval `[b, e)`, this method increments
+  /// the start index and decrements the end index until they point to
+  /// non-whitespace characters or meet in the middle. This is useful for
+  /// normalizing macro arguments or code segments before performing comparisons
+  /// or replacements.
+  ///
+  /// \param s The source string containing the range to be trimmed.
+  /// \param b The initial starting index (inclusive).
+  /// \param e The initial ending index (exclusive).
+  /// \return A pair `{newB, newE}` representing the trimmed half-open interval.
+  ///         If the entire range consists of whitespace, `newB` will equal
+  ///         `newE`.
+  static std::pair<int, int> TrimWsRange(StringRef s, int b, int e) {
+    while (b < e && stringutils::isWs(s[b]))
+      b++;
+    while (e > b && stringutils::isWs(s[e - 1]))
+      e--;
+    return {b, e};
+  }
+
+  /// Builds a macro replacement patch by reconciling changes across nested
+  /// macro expansions, argument-specific edits, and whole-expansion byte
+  /// mapping.
+  ///
+  /// The reconciliation follows a multi-tier fallback strategy:
+  ///
+  /// 1. **Nested Patch Integration:** If the macro's arguments contain other
+  ///    macros that were already patched (available in `patchMap`), those
+  ///    patches are spliced into the base invocation text.
+  /// 2. **Surgical Argument Patching:** Attempts to apply edits strictly to
+  ///    macro parameters via `buildMacroInvocationPatchArgsOnly`. This is the
+  ///    most precise method as it preserves the original call site's
+  ///    formatting.
+  /// 3. **LCS Mapping (Fallback):** Maps the macro's A-cover to the edited
+  ///    B-token stream. It intelligently decides between a "strict" envelope
+  ///    and an "all" envelope (including adjacent structural body tokens like
+  ///    semicolons) based on whether the extra tokens originate from the macro
+  ///    body or from edited arguments.
+  ///
+  /// \param m Metadata for the macro invocation, including call site ranges and
+  ///          A-domain cover.
+  /// \param h The diff hunk associated with this macro's region.
+  /// \param a2b Token mapping array from original preprocessed (A) to edited
+  /// (B). \param baseInvText The original invocation text from the source file.
+  /// \param patchMap Registry of patches already computed (used to resolve
+  ///                 nested macros).
+  /// \return A `MacroPatch` targeting the call site with reconciled replacement
+  ///         text.
+  MacroPatch BuildMacroInvocationPatchWholeCover(
+      const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h,
+      ArrayRef<int> a2b, StringRef baseInvText,
+      const DenseMap<int, DenseMap<int, MacroPatch>> &patchMap) const;
 
   /// Applies a deterministic, stable ordering to include-scoped insertion
   /// patches.
@@ -1069,63 +1308,68 @@ private:
   std::string ApplyIncludeEdits(const IncludeEdits &ie,
                                 std::string headerText) const;
 
-  /// Computes a deterministic insertion byte offset for a header-scoped pure
-  /// INSERT when the normal token-based anchoring mechanisms provide no usable
+  /// Computes a deterministic insertion byte offset for a header-scoped *pure
+  /// INSERT* when the normal token-based anchoring mechanisms provide no usable
   /// neighbor.
   ///
   /// This is a fallback used only in degenerate header cases where:
-  /// - The patch is a pure insertion (p.aStart == p.aEnd)
-  /// - There are no mapped tokmap neighbors in file near p.aStart to anchor on
-  /// - There is no suitable HeaderDecl span to provide a declaration-based
+  /// - The patch is a pure insertion (`p.aStart == p.aEnd`)
+  /// - There are no mapped tokmap neighbors in `file` near `p.aStart` to anchor
+  ///   on
+  /// - There is no suitable `HeaderDecl` span to provide a declaration-based
   ///   anchor
   ///
-  /// In such cases, we attempt to anchor relative to the literal #include sites
-  /// that appear inside the same header file.
+  /// In such cases, we attempt to anchor relative to the literal `#include`
+  /// sites that appear inside the same header file.
   ///
-  /// \par Approach
+  /// ### Approach
   ///
-  /// Let \c owner be the include instance whose header text is being edited
-  /// (p.include). We scan the model's includes to find *direct children* of \c
-  /// owner whose IncludeItem::sitePath equals \p file. Each such child
+  /// Let `owner` be the include instance whose header text is being edited
+  /// (`p.include`). We scan the model’s includes to find *direct children* of
+  /// `owner` whose `IncludeItem::sitePath` equals `file`. Each such child
   /// represents an include directive that is physically written in this header
-  /// and has a PP cover window [kid.coverBegin, kid.coverEnd) and a site byte
-  /// range [kid.siteB, kid.siteE) in \p file.
+  /// and has a PP cover window `[kid.coverBegin, kid.coverEnd)` and a site byte
+  /// range `[kid.siteB, kid.siteE)` in `file`.
   ///
-  /// For the insertion PP position \c pos = \p p.aStart, we consider only
+  /// For the insertion PP position `pos = p.aStart`, we consider only
   /// "between-children" positions:
-  /// - If \c pos lies *strictly inside* a child's cover window
-  ///   (kid.coverBegin < pos && pos < kid.coverEnd), this fallback does not
-  ///   apply and returns -1 (the insertion should have been owned by that
+  /// - If `pos` lies *strictly inside* a child’s cover window
+  ///   (`kid.coverBegin < pos && pos < kid.coverEnd`), this fallback does not
+  ///   apply and returns `-1` (the insertion should have been owned by that
   ///   child include).
-  /// - Boundary positions are allowed (pos == kid.coverBegin or
-  ///   pos == kid.coverEnd) and are treated as being "between" children.
+  /// - Boundary positions are allowed (`pos == kid.coverBegin` or
+  ///   `pos == kid.coverEnd`) and are treated as being "between" children.
   ///
-  /// \par Anchor selection
+  /// ### Anchor selection
   ///
-  /// Among eligible children in \p file:
-  /// - \c left is the child with the greatest \c coverEnd such that
-  ///   \c coverEnd <= \c pos
-  /// - \c right is the child with the smallest \c coverBegin such that
-  ///   \c coverBegin >= \c pos
+  /// Among eligible children in `file`:
+  /// - `left` is the child with the greatest `coverEnd` such that
+  ///   `coverEnd <= pos`
+  /// - `right` is the child with the smallest `coverBegin` such that
+  ///   `coverBegin >= pos`
   ///
   /// The insertion anchor is then chosen deterministically:
-  /// 1. If \c right exists, insert *before* the right child's #include site by
-  ///    returning \c right.siteB.
-  /// 2. Else if \c left exists, insert *after* the left child's #include site
-  ///    by returning \c left.siteE.
-  /// 3. Otherwise return -1 to indicate that no sane anchor could be derived.
+  /// 1. If `right` exists, insert *before* the right child’s `#include` site
+  ///    by returning `right.siteB`.
+  /// 2. Else if `left` exists, insert *after* the left child’s `#include` site
+  ///    by returning `left.siteE`.
+  /// 3. Otherwise return `-1` to indicate that no sane anchor could be derived.
   ///
   /// This method does not validate that the returned site offsets are within
   /// the current header text bounds; callers should ensure the returned byte
   /// offset is usable in the current editing context.
   ///
-  /// \param p the include-scoped patch (expected to be a pure insertion) whose
-  ///        PP insertion position is \p p.aStart
-  /// \param file the header file path whose text is being edited; only child
-  ///        includes whose sitePath equals \p file are considered as anchors
-  /// \return a byte offset within \p file at which the insertion should be
-  ///         applied, or -1 if this fallback does not apply or no stable
-  ///         anchor can be found
+  /// \param M The refold model providing include hierarchy, PP cover windows,
+  ///          and include-site byte ranges.
+  /// \param p The include-scoped patch (expected to be a pure insertion) whose
+  ///          PP insertion position is `p.aStart`.
+  /// \param file The header file path whose text is being edited; only child
+  ///             includes whose `sitePath` equals `file` are considered as
+  ///             anchors.
+  /// \return A byte offset within `file` at which the insertion should be
+  /// applied,
+  ///         or `-1` if this fallback does not apply or no stable anchor can be
+  ///         found.
   int ComputeChildBoundaryInsertByte(const IncludePatch &p,
                                      StringRef file) const;
 

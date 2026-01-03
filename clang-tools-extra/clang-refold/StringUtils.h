@@ -187,8 +187,8 @@ inline std::string escape(StringRef s) {
 /// view into the original string (no allocation).
 ///
 /// \param S The input string.
-/// \returns A std::string with leading/trailing spaces and tabs removed.
-inline std::string trimEdgeSpaces(StringRef s) {
+/// \returns A StringRef with leading/trailing spaces and tabs removed.
+inline StringRef trimEdgeSpaces(StringRef s) {
   std::size_t lo = 0;
   std::size_t hi = s.size();
 
@@ -207,9 +207,9 @@ inline std::string trimEdgeSpaces(StringRef s) {
   }
 
   if (lo == 0 && hi == s.size())
-    return s.str(); // no trimming needed; copy whole string
+    return s; // no trimming needed; return the original string ref
 
-  return s.substr(lo, hi - lo).str(); // copy trimmed portion
+  return s.substr(lo, hi - lo); // return trimmed portion
 }
 
 /// Normalizes an \c #include target token by stripping the surrounding

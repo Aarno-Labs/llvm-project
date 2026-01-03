@@ -140,6 +140,18 @@ public:
     bool IsValid() const { return begin >= 0 && end >= 0 && end > begin; }
   };
 
+  struct PPArgSpan : public PPSpan {
+    int argIdx;
+
+    std::string ToString() const {
+      return formatv("Arg {0}: [{1}, {2})", argIdx, begin, end).str();
+    }
+
+    bool IsValid() const {
+      return PPSpan::IsValid() && argIdx >= 0;
+    }
+  };
+
   struct PPCover {
     int begin; // inclusive
     int end;   // exclusive
@@ -230,7 +242,7 @@ public:
     std::string subkind; // "func" | "obj"
     std::string name;
     std::vector<PPSpan> spans; // expansion coverage (A tokens)
-    std::vector<PPSpan> argSpans;
+    std::vector<PPArgSpan> argSpans;
     std::vector<PPSpan> bodySpans;
     std::optional<std::string> invText;
     std::optional<std::string> invFile;
@@ -243,7 +255,7 @@ public:
                     std::optional<std::string> invText,
                     std::optional<std::string> invFile, std::optional<int> invB,
                     std::optional<int> invE, std::optional<int> ownerIncludeId,
-                    std::vector<PPSpan> spans, std::vector<PPSpan> argSpans,
+                    std::vector<PPSpan> spans, std::vector<PPArgSpan> argSpans,
                     std::vector<PPSpan> bodySpans,
                     std::optional<int> coverBegin,
                     std::optional<int> coverEnd) noexcept

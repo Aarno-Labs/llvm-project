@@ -133,13 +133,13 @@ RefoldEngine::Refold(const json::Object &rootJson, StringRef aSource,
 }
 
 std::string RefoldEngine::Refold() {
-  const std::size_t expectedCount =
-      static_cast<std::size_t>(model_.GetTokensCountA());
-  if (aToks_.size() != expectedCount) {
-    fatal(
-        "tok",
-        "token count mismatch: JSON says {0} expected, but driver produced {1}",
-        expectedCount, aToks_.size());
+  // Make sure that when we re-lex the A-stream tokens that it matches the token
+  // count as listed in the refold map JSON file.
+  if (static_cast<size_t>(model_.GetTokensCountA()) != aToks_.size()) {
+    fatal("tok",
+          "A-stream token count mismatch: model reported {0} tokens, but lexed "
+          "sequence (aToks) has {1} tokens.",
+          model_.GetTokensCountA(), aToks_.size());
   }
 
   StringRef tuPath = model_.GetSourcePath();
@@ -176,15 +176,6 @@ std::string RefoldEngine::Refold() {
                                  /* sameWidth */ false,
                                  [](StringRef msg) { trace("lcs/aSeq", msg); });
   trace("lcs/aSeq", sep);
-
-  // Make sure that when we re-lex the A-stream tokens that it matches the token
-  // count as listed in the refold map JSON file.
-  if (static_cast<size_t>(model_.GetTokensCountA()) != aSeq.size()) {
-    fatal("lcs/aSeq",
-          "A-stream token count mismatch: model reported {0} tokens, but lexed "
-          "sequence (aSeq) has {1} tokens.",
-          model_.GetTokensCountA(), aSeq.size());
-  }
 
   auto bSeq = MapLexemes(bToks_, bTokOff_);
   trace("lcs/bSeq", "bSeq:");
@@ -285,6 +276,10 @@ std::string RefoldEngine::Refold() {
   DenseMap<int, IncludeEdits> perInclude; // includeId -> edits
   DenseMap<int, std::vector<MacroPatch>> macroPatchesByOwner;
 
+  // Merge macro patches by macro-invocation id so multiple arg hunks compose
+  // correctly.
+  DenseMap<int, DenseMap<int, MacroPatch>> macroPatchByOwnerByMacroId;
+
   // Iterate over all hunks:
   for (std::size_t i = 0; i < hunks.size(); ++i) {
     const auto &h = hunks[i];
@@ -310,10 +305,19 @@ std::string RefoldEngine::Refold() {
         debug("classify",
               "#{0} -> MACRO invText={1} owner={2} invFile={3} {4})", i,
               m->invText, m->ownerIncludeId, m->invFile, h);
-        auto mp = BuildMacroInvocationPatchWholeCover(*m, h, a2b);
-        const int ownerKey =
-            (m->ownerIncludeId ? *m->ownerIncludeId : kNoOwner);
-        macroPatchesByOwner[ownerKey].push_back(std::move(mp));
+        const auto macroOwner = m->ownerIncludeId;
+        auto &byMacroId =
+            macroPatchByOwnerByMacroId[macroOwner ? *macroOwner : kNoOwner];
+        auto existingIt = byMacroId.find(m->id);
+
+        // If found, use the existing replacement; otherwise, use the original
+        // text.
+        std::string currentInvText = (existingIt != byMacroId.end())
+                                         ? existingIt->second.replacement
+                                         : (m->invText ? *m->invText : "");
+        auto updated = BuildMacroInvocationPatchWholeCover(
+            *m, h, a2b, currentInvText, macroPatchByOwnerByMacroId);
+        byMacroId[m->id] = std::move(updated);
         continue;
       }
     }
@@ -488,6 +492,17 @@ std::string RefoldEngine::Refold() {
         h.aStart, h.aEnd);
   }
 
+  // Materialize merged macro patches into the list buckets expected by later
+  // phases.
+  for (auto &outerEntry : macroPatchByOwnerByMacroId) {
+    const int ownerId = outerEntry.first;
+    auto &patchesById = outerEntry.second; // This is the inner DenseMap
+    auto &finalPatches = macroPatchesByOwner[ownerId];
+    for (auto &innerEntry : patchesById) {
+      finalPatches.push_back(innerEntry.second);
+    }
+  }
+
   debug("plan", "perInclude.size={0} macroOwners={1} tuEdits(initial)={2}",
         perInclude.size(), macroPatchesByOwner.size(), tuEdits.size());
 
@@ -557,24 +572,50 @@ std::string RefoldEngine::Refold() {
                                 children, includeExpansion);
   }
 
-  // 6a) TU macro patches (ownerIncludeId == kNoOwner) and include expansions at
-  // TU sites.
+  // 6a) TU macro patches (ownerIncludeId == kNoOwner) and include expansions
+  // at TU sites.
   if (auto it = macroPatchesByOwner.find(kNoOwner);
-      it != macroPatchesByOwner.end()) {
-    for (const auto &mp : it->second) {
+      it != macroPatchesByOwner.end() && !it->second.empty()) {
+    // Create a local copy to sort
+    auto tuMacroPatches = it->second;
+
+    // 1. Sort patches by start offset, then by length (descending) to ensure we
+    // process the "outermost" (largest) macros first.
+    std::sort(tuMacroPatches.begin(), tuMacroPatches.end(),
+              [](const MacroPatch &p1, const MacroPatch &p2) {
+                if (p1.invStart != p2.invStart)
+                  return p1.invStart < p2.invStart;
+                return p1.invEnd > p2.invEnd;
+              });
+
+    SmallVector<MacroPatch, 16> accepted;
+    for (const auto &mp : tuMacroPatches) {
+      // TODO: Should we keep this??
       if (mp.invStart < 0 || mp.invEnd < 0) {
         fatal("macro/tu",
               "TU macro patch has either a negative invocation start or end "
               "(invStart={0} invEnd={1})",
               mp.invStart, mp.invEnd);
       }
-      auto text =
-          PadAtBoundaries(tuBytes, static_cast<size_t>(mp.invStart),
-                          static_cast<size_t>(mp.invEnd), mp.replacement,
-                          /*allowLeft*/ false, /*allowRight*/ true);
-      debug("macro/tu", "TU macro patch inv=[{0},{1}) replLen={2}", mp.invStart,
-            mp.invEnd, text.size());
-      tuEdits.push_back(TextEdit{mp.invStart, mp.invEnd, std::move(text)});
+
+      bool isShadowed = false;
+      for (const auto &acc : accepted) {
+        // If this patch is contained within one we already accepted, skip it.
+        if (mp.invStart >= acc.invStart && mp.invEnd <= acc.invEnd) {
+          isShadowed = true;
+          break;
+        }
+      }
+
+      if (!isShadowed) {
+        accepted.push_back(mp);
+        debug("macro/tu", "  TU macro patch accepted inv=[{0},{1}) replLen={2}",
+              mp.invStart, mp.invEnd, mp.replacement.size());
+        tuEdits.push_back(TextEdit{mp.invStart, mp.invEnd, mp.replacement});
+      } else {
+        trace("macro/tu", "  TU macro patch shadowed (skipped) inv=[{0},{1})",
+              mp.invStart, mp.invEnd);
+      }
     }
   }
 
@@ -593,7 +634,7 @@ std::string RefoldEngine::Refold() {
 
   // Apply TU edits in descending order of start offset.
   std::sort(tuEdits.begin(), tuEdits.end(),
-            [](const TextEdit &a, const TextEdit &b) {
+            [](const auto &a, const auto &b) {
               if (a.start != b.start)
                 return a.start > b.start;
               return a.end > b.end;
@@ -1411,6 +1452,274 @@ bool RefoldEngine::MacroExpansionEnvelopeB(
   return true;
 }
 
+std::optional<RefoldEngine::MacroPatch>
+RefoldEngine::BuildMacroInvocationPatchArgsOnly(
+    const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h,
+    ArrayRef<int> a2b, StringRef baseInvText) const {
+  if (m.subkind != "func")
+    return std::nullopt;
+
+  if (baseInvText.empty())
+    return std::nullopt;
+
+  if (m.invB < 0 || m.invE < 0 || m.invB > m.invE)
+    return std::nullopt;
+
+  // Prefer deriving argument "holes" from body_spans (robust even when
+  // arg_spans is incomplete), but use arg_index from arg_spans to map holes
+  // back to the correct invocation argument.
+  std::vector<RefoldModel::PPArgSpan> argHoles =
+      ComputeArgSpansFromBodySpansWithArgIdx(m.bodySpans, m.argSpans);
+  if (argHoles.empty())
+    return std::nullopt;
+
+  std::vector<char> touched(argHoles.size(), 0);
+  if (!HunkFullyWithinArgSpans(h, argHoles, touched))
+    return std::nullopt;
+
+  auto rangesOpt = ParseMacroInvocationArgContentRanges(baseInvText);
+  if (!rangesOpt)
+    return std::nullopt;
+  std::vector<std::pair<int, int>> invArgRanges = std::move(*rangesOpt);
+
+  // Build per-arg_index replacement strings.
+  // Use a map so multiple hunks and/or multiple occurrences of the same
+  // arg_index coalesce.
+  DenseMap<int, std::string> replByArgIdx;
+
+  for (size_t i = 0; i < argHoles.size(); ++i) {
+    if (!touched[i])
+      continue;
+
+    const RefoldModel::PPArgSpan &aHole = argHoles[i];
+    int argIdx = aHole.argIdx;
+    if (argIdx < 0 || static_cast<size_t>(argIdx) >= invArgRanges.size())
+      return std::nullopt;
+
+    std::optional<std::pair<int, int>> bEnv =
+        MapAToBTokenEnvelope(a2b, aHole.begin, aHole.end);
+    if (!bEnv) {
+      // If A-side arg is empty but we have a B-side hunk inside it,
+      // use the hunk span.
+      if (h.bStart < h.bEnd) {
+        bEnv = {h.bStart, h.bEnd};
+      } else {
+        return std::nullopt;
+      }
+    }
+
+    // Make sure we include inserted boundary tokens if the hunk expands
+    // beyond mapped tokens.
+    int bLo = bEnv->first;
+    int bHi = bEnv->second;
+    if (h.bStart < h.bEnd) {
+      bLo = std::min(bLo, h.bStart);
+      bHi = std::max(bHi, h.bEnd);
+    }
+
+    if (bLo < 0 || bHi < bLo || static_cast<size_t>(bHi) >= bTokOff_.size())
+      return std::nullopt;
+
+    int byteLo = bTokOff_[bLo];
+    int byteHi = bTokOff_[bHi];
+    if (byteLo < 0 || byteHi < byteLo ||
+        static_cast<size_t>(byteHi) > bSource_.size()) {
+      return std::nullopt;
+    }
+
+    StringRef newArg = bSource_.substr(byteLo, byteHi - byteLo);
+    newArg = stringutils::trimEdgeSpaces(newArg);
+
+    auto [it, inserted] = replByArgIdx.try_emplace(argIdx, newArg);
+    if (!inserted && it->second != newArg) {
+      // Conflicting replacements for the same invocation argument;
+      // fall back to whole-cover.
+      return std::nullopt;
+    }
+  }
+
+  if (replByArgIdx.empty())
+    return std::nullopt;
+
+  // IMPORTANT: apply right-to-left in invocation text so earlier
+  // replacements don't shift later ranges.
+  std::vector<int> argIdxs;
+  for (auto const &entry : replByArgIdx)
+    argIdxs.push_back(entry.first);
+
+  std::sort(argIdxs.begin(), argIdxs.end(), [&](int i, int j) {
+    return invArgRanges[i].first > invArgRanges[j].first;
+  });
+
+  std::string result = baseInvText.str();
+  for (int argIdx : argIdxs) {
+    auto &range = invArgRanges[argIdx];
+    result.replace(range.first, range.second - range.first,
+                   replByArgIdx[argIdx]);
+  }
+
+  return MacroPatch{m.GetInvB(), m.GetInvE(), std::move(result)};
+}
+
+bool RefoldEngine::HunkFullyWithinArgSpans(
+    const diffutils::Hunk &h,
+    const std::vector<RefoldModel::PPArgSpan> &argSpans,
+    MutableArrayRef<char> touched) {
+  int a0 = h.aStart;
+  int a1 = h.aEnd;
+
+  // Insertion: attribute it to the arg span whose [begin,end] contains the
+  // insertion point.
+  if (a0 == a1) {
+    trace("macro/debug", "Checking insertion at A={0}", a0);
+    for (size_t i = 0; i < argSpans.size(); ++i) {
+      const auto &s = argSpans[i];
+      trace("macro/debug", "  Arg {0} span: [{1}, {2}]", i, s.begin, s.end);
+      if (a0 >= s.begin && a0 <= s.end) {
+        touched[i] = 1;
+        return true;
+      }
+    }
+    trace("macro/debug", "  FAILED: Point {0} not in any span", a0);
+    return false;
+  }
+
+  // Replacement/deletion: every covered token must fall inside some arg span.
+  bool any = false;
+  for (int a = a0; a < a1; ++a) {
+    bool inSome = false;
+    for (size_t i = 0; i < argSpans.size(); ++i) {
+      const auto &s = argSpans[i];
+      if (a >= s.begin && a < s.end) {
+        touched[i] = 1;
+        inSome = true;
+        any = true;
+        break;
+      }
+    }
+    if (!inSome)
+      return false;
+  }
+  return any;
+}
+
+std::vector<RefoldModel::PPArgSpan>
+RefoldEngine::ComputeArgSpansFromBodySpansWithArgIdx(
+    const std::vector<RefoldModel::PPSpan> &bodySpans,
+    const std::vector<RefoldModel::PPArgSpan> &argSpans) {
+  if (bodySpans.size() < 2)
+    return {};
+
+  // For a function-like macro, body_spans alternates:
+  // [preArg0], [between0_1], [between1_2], ..., [postLast]
+  // so args are the "holes" between consecutive body spans.
+  //
+  // body_spans may omit "holes" for unused macro parameters. We therefore
+  // recover the invocation-argument index by matching the hole span against
+  // the recorded arg_spans, which include an explicit arg_index.
+  std::vector<RefoldModel::PPArgSpan> out;
+  for (size_t i = 0; i + 1 < bodySpans.size(); ++i) {
+    const RefoldModel::PPSpan &left = bodySpans[i];
+    const RefoldModel::PPSpan &right = bodySpans[i + 1];
+    int b = left.end;
+    int e = right.begin;
+
+    if (b > e)
+      continue;
+
+    int inferredArgIdx = -1;
+    if (!argSpans.empty()) {
+      std::optional<int> found;
+      for (const auto &a : argSpans) {
+        if (SpansOverlapForArgIdx(b, e, a.begin, a.end)) {
+          if (!found) {
+            found = a.argIdx;
+          } else if (*found != a.argIdx) {
+            // Ambiguous: multiple different arg_index values overlap this hole.
+            found = std::nullopt;
+            break;
+          }
+        }
+      }
+
+      if (found)
+        inferredArgIdx = *found;
+    }
+
+    out.push_back(RefoldModel::PPArgSpan{{b, e}, inferredArgIdx});
+  }
+
+  return out;
+}
+
+std::optional<std::vector<std::pair<int, int>>>
+RefoldEngine::ParseMacroInvocationArgContentRanges(StringRef invText) {
+  size_t open = invText.find('(');
+  if (open == StringRef::npos)
+    return std::nullopt;
+
+  std::vector<std::pair<int, int>> out;
+  size_t n = invText.size();
+
+  int depth = 0;
+  bool inS = false;
+  bool inD = false;
+
+  size_t argStart = open + 1;
+  for (size_t i = open + 1; i < n; i++) {
+    char c = invText[i];
+
+    if (inS) {
+      if (c == '\\' && i + 1 < n) {
+        i++;
+        continue;
+      }
+      if (c == '\'')
+        inS = false;
+      continue;
+    }
+    if (inD) {
+      if (c == '\\' && i + 1 < n) {
+        i++;
+        continue;
+      }
+      if (c == '"')
+        inD = false;
+      continue;
+    }
+
+    if (c == '\'') {
+      inS = true;
+      continue;
+    }
+    if (c == '"') {
+      inD = true;
+      continue;
+    }
+
+    if (c == '(' || c == '[' || c == '{') {
+      depth++;
+      continue;
+    }
+
+    if (c == ')') {
+      if (depth == 0) {
+        out.push_back(TrimWsRange(invText, argStart, i));
+        return out;
+      }
+      depth--;
+      continue;
+    }
+
+    if (c == ',' && depth == 0) {
+      out.push_back(TrimWsRange(invText, argStart, i));
+      argStart = i + 1;
+    }
+  }
+
+  return std::nullopt;
+}
+
 RefoldEngine::IncludePatch
 RefoldEngine::BuildIncludeInsertionPatch(const RefoldModel::IncludeItem &inc,
                                          const diffutils::Hunk &h) const {
@@ -1450,83 +1759,130 @@ RefoldEngine::BuildIncludeInsertionPatch(const RefoldModel::IncludeItem &inc,
 
 RefoldEngine::MacroPatch RefoldEngine::BuildMacroInvocationPatchWholeCover(
     const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h,
-    ArrayRef<int> a2b) const {
+    ArrayRef<int> a2b, StringRef baseInvText,
+    const DenseMap<int, DenseMap<int, MacroPatch>> &patchMap) const {
   debug("macro/patch",
         "BEGIN inv id={0} name={1} invFile={2} invB/E=[{3},{4}] "
         "coverA=[{5},{6}) hunkB=[{7},{8})",
         m.id, m.name, m.invFile, m.GetInvB(), m.GetInvE(), m.cover.begin,
         m.cover.end, h.bStart, h.bEnd);
 
-  // Map A-cover → B using LCS A2B
+  // 1. BAKE IN INNER MACRO EDITS
+  ///////////////////////////////
+  // If this macro's arguments contain other macros that have already been
+  // patched, we need to update our base invocation text to reflect those
+  // "inner" changes.
+  std::string updatedInvText = baseInvText.str();
+  if (m.invText && !m.argSpans.empty()) {
+    const int fileLen = static_cast<int>(bSource_.size());
+    for (const auto &arg : m.argSpans) {
+      // Find the smallest macro covering this specific argument's token range
+      const RefoldModel::MacroInvocation *innerM =
+          SmallestCoveringMacro(arg.begin, arg.end);
+
+      // If an inner macro exists and it's not the current one, look for its
+      // patch
+      if (innerM && innerM->id != m.id) {
+        auto ownerIt = patchMap.find(
+            innerM->ownerIncludeId ? *innerM->ownerIncludeId : kNoOwner);
+        if (ownerIt != patchMap.end()) {
+          auto patchIt = ownerIt->second.find(innerM->id);
+          if (patchIt != ownerIt->second.end()) {
+            const std::string &innerReplacement = patchIt->second.replacement;
+
+            // Map the preprocessed token indices to global file byte offsets
+            // TODO: Harden this...
+            int gStart =
+                ByteStartForPPInFile(m.invFile ? *m.invFile : "", arg.begin,
+                                     /* fallbackToEOF */ false, fileLen);
+            int gEnd =
+                ByteEndForPPInFile(m.invFile ? *m.invFile : "", arg.end - 1,
+                                   /* fallbackToEOF */ false, fileLen);
+
+            if (gStart != -1 && gEnd != -1) {
+              // Convert global offsets to local offsets relative to the macro
+              // invocation start
+              int localStart = gStart - m.GetInvB();
+              int localEnd = gEnd - m.GetInvB();
+
+              if (localStart >= 0 &&
+                  static_cast<size_t>(localEnd) <= m.invText->size()) {
+                StringRef originalArgText =
+                    StringRef(*m.invText)
+                        .substr(localStart, localEnd - localStart);
+
+                // Replace the original argument text with the already-computed
+                // patch
+                size_t pos = updatedInvText.find(originalArgText);
+                if (pos != std::string::npos) {
+                  updatedInvText.replace(pos, originalArgText.size(),
+                                         innerReplacement);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // 2. CHECK FOR ARGS-ONLY CHANGES
+  /////////////////////////////////
+  // Attempt a "surgical" patch where we only replace specific arguments. This
+  // is preferred over whole-cover replacement because it preserves the original
+  // call-site formatting.
+  std::optional<MacroPatch> argsOnly =
+      BuildMacroInvocationPatchArgsOnly(m, h, a2b, updatedInvText);
+  if (argsOnly)
+    return *argsOnly;
+
+  // 3. FALLBACK: MAP BYTE RANGES FROM B (The "Whole Cover" Approach)
+  ///////////////////////////////////////////////////////////////////
+  // If surgical patching fails, we try to project the entire macro expansion
+  // from the B-stream.
   int bStartIdx = MapForwardToB(a2b, m.cover.begin);
   int bEndIdxEx = MapBackwardToB(a2b, m.cover.end - 1);
 
+  // If mapping fails (e.g., token was deleted), check if the hunk itself
+  // suggests deletion.
   if (bStartIdx < 0 || bEndIdxEx < 0 || bStartIdx > bEndIdxEx) {
-    trace("macro/patch",
-          "cover unmapped/inverted ({0},{1})  hunkB=[{2},{3}){4}", bStartIdx,
-          bEndIdxEx, h.bStart, h.bEnd,
-          (h.bStart >= h.bEnd ? " → EMPTY" : " → use hunk"));
     if (h.bStart >= h.bEnd) {
-      return MacroPatch{m.GetInvB(), m.GetInvE(), std::string()};
+      return MacroPatch{m.GetInvB(), m.GetInvE(), ""};
     }
     bStartIdx = h.bStart;
     bEndIdxEx = h.bEnd - 1;
   }
 
-  // Clamp to BTokOff bounds
+  // Clamp indices to valid token offset ranges
   const int maxTok = static_cast<int>(bTokOff_.size()) - 1;
   int covLo = std::max(0, std::min(bStartIdx, maxTok - 1));
   int covHi = std::max(covLo, std::min(bEndIdxEx + 1, maxTok));
 
-  // Strict envelope: only tokens from the invocation file
+  // Determine a "Strict" envelope: tokens that are definitively part of the
+  // expansion.
   int envStrictLo = 0, envStrictHi = 0;
-  bool haveEnvStrict = MacroExpansionEnvelopeB(m, /*OnlyInvFile=*/true,
+  bool haveEnvStrict = MacroExpansionEnvelopeB(m, /* onlyInvFile */ true,
                                                envStrictLo, envStrictHi);
-  if (haveEnvStrict) {
-    trace("macro/patch", "envStrict=[{0},{1})", envStrictLo, envStrictHi);
-  } else {
-    trace("macro/patch", "envStrict=null");
-  }
-
-  // Candidate A = (cover ∩ envStrict) if intersects, else cover.
-  // We allow envStrict to tighten the *left* edge, but we keep the right edge
-  // at covHi so we don't drop trailing macro body tokens when BODY/ARG spans
-  // are slightly too short.
   int aLo = covLo, aHi = covHi;
   if (haveEnvStrict) {
     const int iLo = std::max(covLo, envStrictLo);
-    if (iLo < covHi) {
+    if (iLo < covHi)
       aLo = iLo;
-    }
   }
 
   aLo = std::max(0, std::min(aLo, maxTok - 1));
   aHi = std::max(aLo, std::min(aHi, maxTok));
+  size_t byteLoA = bTokOff_[aLo];
+  size_t byteHiA = bTokOff_[aHi];
+  StringRef candA = stringutils::trimEdgeSpaces(
+      (byteHiA > byteLoA) ? bSource_.substr(byteLoA, byteHiA - byteLoA) : "");
 
-  const std::size_t aBLo = bTokOff_[static_cast<std::size_t>(aLo)];
-  const std::size_t aBHi = bTokOff_[static_cast<std::size_t>(aHi)];
-  StringRef rawA =
-      (aBHi > aBLo) ? bSource_.substr(aBLo, aBHi - aBLo) : StringRef();
-  std::string candA = stringutils::trimEdgeSpaces(rawA);
-
-  trace("macro/patch",
-        "CandidateA sliceTok=[{0},{1}) bytes=[{2},{3}) len={4} prev='{5}'", aLo,
-        aHi, aBLo, aBHi, (aBHi - aBLo),
-        stringutils::showWS(stringutils::clip(candA, 120)));
-
-  // BODY ∪ ARGS across all files (captures edited type tokens in headers).
+  // Determine a "Union" envelope: includes adjacent tokens that might be
+  // structural (like ';').
   int envAllLo = 0, envAllHi = 0;
   bool haveEnvAll =
-      MacroExpansionEnvelopeB(m, /*OnlyInvFile=*/false, envAllLo, envAllHi);
-  if (haveEnvAll) {
-    trace("macro/patch", "envAll=[{0},{1})", envAllLo, envAllHi);
-  } else {
-    trace("macro/patch", "envAll=null");
-  }
-
-  // Candidate B = union of CandidateA and envAll (when present)
-  int bLoTok = aLo;
-  int bHiTok = aHi;
+      MacroExpansionEnvelopeB(m, /* onlyInvFile */ false, envAllLo, envAllHi);
+  int bLoTok = aLo, bHiTok = aHi;
   if (haveEnvAll) {
     bLoTok = std::min(aLo, envAllLo);
     bHiTok = std::max(aHi, envAllHi);
@@ -1534,87 +1890,64 @@ RefoldEngine::MacroPatch RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
   bLoTok = std::max(0, std::min(bLoTok, maxTok - 1));
   bHiTok = std::max(bLoTok, std::min(bHiTok, maxTok));
+  size_t byteLoB = bTokOff_[bLoTok];
+  size_t byteHiB = bTokOff_[bHiTok];
+  StringRef candB = stringutils::trimEdgeSpaces(
+      (byteHiB > byteLoB) ? bSource_.substr(byteLoB, byteHiB - byteLoB) : "");
 
-  const std::size_t bBLo = bTokOff_[static_cast<std::size_t>(bLoTok)];
-  const std::size_t bBHi = bTokOff_[static_cast<std::size_t>(bHiTok)];
-  StringRef rawB =
-      (bBHi > bBLo) ? bSource_.substr(bBLo, bBHi - bBLo) : StringRef();
-  std::string candB = stringutils::trimEdgeSpaces(rawB);
-
-  trace("macro/patch",
-        "CandidateB (union) sliceTok=[{0},{1}) bytes=[{2},{3}) len={4} "
-        "prev='{5}'",
-        bLoTok, bHiTok, bBLo, bBHi, (bBHi - bBLo),
-        stringutils::showWS(stringutils::clip(candB, 120)));
-
-  // --- Decision: prefer B only when:
-  //     1) the widened extra-left PP tokens are ALL from BODY and NONE from
-  //     ARGS 2) the widened bytes end at a visible ';' (statement boundary we
-  //     can see)
-  const std::string aT = StringRef(candA).trim().str();
-  const std::string bT = StringRef(candB).trim().str();
-
+  // RECONCILIATION LOGIC: Should we include the extra tokens from 'candB'? We
+  // only choose 'candB' if the extra tokens are part of the macro's body and
+  // the expansion ends with a semicolon (to prevent double-semicolons).
   bool chooseB = false;
-  if (!aT.empty() && StringRef(bT).ends_with(aT)) {
-    // Extra-left tokens we introduce by widening.
-    const int extraLo = std::min(bLoTok, aLo);
-    const int extraHi = std::max(bLoTok, aLo);
-
-    auto inBody = [&](int pp) -> bool {
-      for (const auto &s : m.bodySpans) {
+  StringRef aT = candA.trim();
+  StringRef bT = candB.trim();
+  if (!aT.empty() && bT.ends_with(aT)) {
+    auto inBody = [&](int pp) {
+      for (const auto &s : m.bodySpans)
         if (s.IsValid() && pp >= s.begin && pp < s.end)
           return true;
-      }
+      return false;
+    };
+    auto inArg = [&](int pp) {
+      for (const auto &s : m.argSpans)
+        if (s.IsValid() && pp >= s.begin && pp < s.end)
+          return true;
       return false;
     };
 
-    auto inArg = [&](int pp) -> bool {
-      for (const auto &s : m.argSpans) {
-        if (s.IsValid() && pp >= s.begin && pp < s.end)
-          return true;
-      }
-      return false;
-    };
-
+    // Ensure all extra tokens are from the macro body, not from arguments.
     bool allExtraFromBodyNotArgs = true;
-    for (int pp = extraLo; pp < extraHi; ++pp) {
+    for (int pp = std::min(bLoTok, aLo); pp < std::max(bLoTok, aLo); ++pp) {
       if (!inBody(pp) || inArg(pp)) {
         allExtraFromBodyNotArgs = false;
         break;
       }
     }
 
-    // Ensure the widened slice ends exactly at a ';' (ignoring trailing
-    // whitespace).
+    // Check for a trailing semicolon in the expansion text.
     bool endsAtSemicolon = false;
-    if (bBHi > bBLo) {
-      int endByte = static_cast<int>(bBHi) - 1;
-      if (endByte >= 0 && static_cast<std::size_t>(endByte) < bSource_.size()) {
-        // Skip trailing spaces/tabs/newlines before testing last non-ws char.
-        while (endByte >= static_cast<int>(bBLo)) {
-          char ch = bSource_[static_cast<std::size_t>(endByte)];
-          if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') {
-            --endByte;
-            continue;
-          }
-          endsAtSemicolon = (ch == ';');
-          break;
-        }
+    int endByte = static_cast<int>(byteHiB) - 1;
+    while (endByte >= static_cast<int>(byteLoB)) {
+      char ch = bSource_[endByte];
+      if (!stringutils::isWs(ch)) {
+        endsAtSemicolon = (ch == ';');
+        break;
       }
+      --endByte;
     }
-
     chooseB = allExtraFromBodyNotArgs && endsAtSemicolon;
   }
 
-  trace("macro/patch", "DECIDE provenance: chooseB={0}",
-        chooseB ? "true" : "false");
+  StringRef chosen = chooseB ? candB : candA;
 
-  const std::string &chosen = chooseB ? candB : candA;
+  // 4. FINAL MERGE
+  /////////////////
+  std::string finalResult = chosen.str();
+  if (chosen.contains(m.name) && chosen != updatedInvText) {
+    finalResult = updatedInvText;
+  }
 
-  debug("macro/patch", "FINAL chosen='{0}'",
-        stringutils::showWS(stringutils::clip(chosen, 160)));
-
-  return MacroPatch{m.GetInvB(), m.GetInvE(), chosen};
+  return MacroPatch{m.GetInvB(), m.GetInvE(), std::move(finalResult)};
 }
 
 // =========== Include processing (normalize, materialize, apply) ===========
