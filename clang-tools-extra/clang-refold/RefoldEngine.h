@@ -75,76 +75,80 @@ struct PPTok {
   std::string spelling;
 };
 
-/// \brief Deterministic refolder for edits made to raw preprocessed C (B)
-///        back onto the original, partially expanded C translation unit (TU).
+/// \brief Deterministic refolder that projects edits made to raw preprocessed
+/// C back onto the original translation unit (TU) without re-running the
+/// preprocessor.
 ///
-/// ### Inputs
-/// * **A** — Original raw preprocessed source (`.i`)
-/// * **B** — Edited raw preprocessed source (`.i.mod`)
-/// * **M** — Refold map JSON produced by a modified **clang** preprocessor
-///   (`-E -P --refold-map=...`).
-///   The map encodes byte/token provenance for includes, macros, and
-///   conditionals, using absolute canonicalized paths.
-/// * **tuPath** — Original TU path (from M)
+/// Inputs:
+///   - A: original raw preprocessed text (e.g., clang -E -P output).
+///   - B: edited raw preprocessed text.
+///   - M: refold map JSON produced by a modified Clang preprocessor
+///     (--refold-map=...). The map records provenance for includes,
+///     conditionals, and macro expansions in PP-token coordinates, plus TU
+///     file/byte ranges for patch sites.
 ///
-/// ### Goal
-/// Reconstruct a translation unit (`.mod`) that expands only those
-/// preprocessor constructs whose expanded bytes were edited in **B**.
-/// Edits are attributed to one of:
-/// * **Include** instances (`#include` / `#include_next`), including nested
-///   and conditional branches
-/// * **Macro call sites** (`#define` / `#undef`), replacing invocation spans
-///   with edited expansion bytes
-/// * **TU-owned bytes** — direct text present in the TU after preprocessing
+/// Goal:
 ///
-/// ### Pipeline (high level)
-/// 1. Validate and load **M**; canonicalize paths.
-/// 2. Lex **A** and **B** with Clang’s raw token dumper; map tokens to stable
-///    identities.
-/// 3. Compute LCS over token identities and build A→B token offset mapping.
-/// 4. Derive edit hunks (A-intervals with corresponding B-intervals).
-/// 5. **Classify** each hunk deterministically as Include / Macro call-site /
-/// TU edit;
-///    refuse if no covering provenance exists.
-/// 6. For Includes: collect per-include insertions, then **realize** includes
-///    bottom-up, applying owner macro patches and child realizations along
-///    the actually taken conditional branches recorded in **M**.
-/// 7. Apply TU-level edits (realized include text, TU macro patches, direct TU
-/// edits)
-///    in stable order to produce the output TU.
+/// Reconstruct a TU that preserves the original preprocessor structure as much
+/// as possible while still realizing the user's edits. Only constructs whose
+/// expanded bytes were edited in B are forced to materialize in the output; all
+/// others remain in their original form.
 ///
-/// ### Determinism & Formatting Policy
-/// * All iteration over work buckets is stable (sorted where needed);
-///   byte edits apply high→low to avoid offset drift.
-/// * Include insertion normalization coalesces adjacent insert hunks,
-///   preserves identifier boundaries, and trims after the first newline
-///   to avoid leaking the next line.
-/// * Macro call-site replacements use *boundary normalization*
-///   (trim leading/trailing spaces/tabs only) to prevent doubled spaces or
-///   token gluing; internal whitespace is preserved verbatim.
-/// * Paths are absolute/canonical everywhere except re-emitted include
-///   targets, which remain in source form.
+/// Policy and determinism:
+///   - Token alignment uses an owner-aware LCS. Each PP-token gap in A is
+///     assigned an ownerDepthGap derived from include depth and conditional
+///     depth; LCS tie-breaks prefer edits to land at shallower ownership
+///     boundaries (e.g., TU over deep includes).
+///   - All selection among multiple valid owners is stable: smallest-covering
+///     constructs win, ties break by id, and text edits apply right-to-left to
+///     avoid offset drift.
+///   - The engine fails fast when provenance is insufficient; it does not
+///     guess.
 ///
-/// ### Supported Preprocessor Constructs
-/// * `#include` / `#include_next` (arbitrary nesting)
-/// * `#define` / `#undef` (replacements at invocation sites)
-/// * `#if` / `#ifdef` / `#elif` / `#else` (branch recorded in M)
-/// * `#pragma` (treated opaquely)
+/// Macro handling:
 ///
-/// ### Non-goals
-/// * Re-running the preprocessor or fully parsing C; re-lexing anchors
-///   tokens and relies on **M**.
-/// * Heuristic recovery when **M** is incomplete; the engine fails fast so
-///   gaps can be fixed in the map producer.
+/// Macro edits are expressed as call-site patches:
+///   - Whole-cover patches: replace an invocation span with edited expansion
+///     bytes.
+///   - Argument patches: when an edit is confined to invocation arguments,
+///     rewrite the invocation text in-place (keeping the macro call in the
+///     output).
 ///
-/// ### Failure Mode
-/// If an edited region in **B** cannot be mapped to a deterministic
-/// Include/Macro/TU span in **M**, the engine terminates with a precise
-/// diagnostic rather than guessing.
+/// Some expansions (notably builtin/object-like macros such as __FILE__ or
+/// __LINE__) may appear inside another macro's replacement list and lack an
+/// invocation-site span in M. Such edits are attributed to the nearest
+/// enclosing patchable macro invocation (one with inv_b/inv_e/inv_text) so the
+/// outer call site becomes the unit of change.
 ///
-/// ### Public API
-/// * `refold(...)` — orchestrates the entire pipeline and writes the
-///   refolded translation unit.
+/// Stringification (#param):
+///
+/// Stringified arguments expand to string literal tokens in B and often do not
+/// produce arg_spans in M. The engine recovers a mapping by parsing the active
+/// #define preceding the invocation and locating #param occurrences in the
+/// replacement list. If a string-literal edit can be safely inverted to a
+/// single invocation argument (no commas/newlines; simple escape handling),
+/// the invocation is rewritten; otherwise the invocation is expanded via a
+/// whole-cover patch.
+///
+/// High-level pipeline:
+///  1. Load M and the TU source.
+///  2. Lex A and B into comparable PP-token sequences and build token-to-byte
+///     offset tables.
+///  3. Compute ownerDepthGap and an A->B token mapping via weighted LCS.
+///  4. Derive edit hunks from the A->B mapping.
+///  5. Classify each hunk deterministically as TU-owned, include-owned, or
+///     macro-owned and build per-owner patch plans (including nested macro
+///     patch baking).
+///  6. Realize includes bottom-up along the recorded conditional arms and
+///     apply patches to produce the final refolded TU.
+///
+/// Unsupported / out of scope:
+///
+/// The engine intentionally does not attempt to model complex preprocessor
+/// features that require semantic re-expansion (e.g., token-pasting, variadics,
+/// __COUNTER__, or aggressive escape normalization). In such cases it prefers
+/// deterministic expansion of the affected macro instance over speculative
+/// rewriting.
 ///
 /// \author jeikenberry
 class RefoldEngine {
@@ -226,7 +230,7 @@ private:
 
     std::string ToString() const {
       // 1. Determine the path (Using StringRef to avoid extra copies)
-      llvm::StringRef path;
+      StringRef path;
       if (include->resolvedPath && !include->resolvedPath->empty()) {
         path = *include->resolvedPath;
       } else {
@@ -234,7 +238,7 @@ private:
       }
 
       // 2. Handle the preview truncation
-      llvm::StringRef preview = insertBytes;
+      StringRef preview = insertBytes;
       bool truncated = false;
       if (preview.size() > 80) {
         preview = preview.take_front(80);
@@ -265,6 +269,22 @@ private:
     void Add(IncludePatch &&P) { patches.push_back(std::move(P)); }
   };
 
+  struct MacroDefineInfo {
+    int directiveId;
+    std::string name;
+
+    /// Formal parameter names in the order they appear in the #define.
+    std::vector<std::string> params;
+
+    /// The indices of parameters that are stringified (#), in the order
+    /// they appear in the macro replacement list.
+    std::vector<int> stringifyParamOrder;
+
+    /// A set of parameter indices that undergo stringification,
+    /// used for O(1) lookups.
+    DenseSet<int> stringifyParamSet;
+  };
+
   // ---------------------------- Ownership Helpers ----------------------------
 
   enum class OwnerKind { TU, Include, Unknown };
@@ -286,8 +306,9 @@ private:
 
   struct Owner {
     OwnerKind kind = OwnerKind::Unknown;
-    std::optional<int> includeId;
-    std::optional<int> condArmId;
+    std::optional<int> includeId; // non-nullopt only when kind == INCLUDE
+    std::optional<int> condArmId; // nullable; non-nullopt when segment is in a
+                                  // specific arm
 
     static Owner TU(std::optional<int> condArmId = std::nullopt) {
       Owner o;
@@ -512,6 +533,35 @@ private:
   ///          macro, unknown) the hunk logically belongs to.
   Owner ClassifyOwnerWithSegments(StringRef tuPath, const diffutils::Hunk &h);
 
+  /// Returns the innermost (smallest-width) patchable macro invocation that
+  /// fully covers a given A-span.
+  ///
+  /// This is identical in spirit to smallestCoveringMacro (choose the smallest
+  /// invocation whose preprocessed-token cover interval [coverBegin, coverEnd)
+  /// contains [aStart, aEnd)), but with an additional constraint: the selected
+  /// macro must have a valid invocation-site span in the original source (i.e.,
+  /// inv_b/inv_e and inv_text are present).
+  ///
+  /// Why this matters: many object-like expansions that appear inside other
+  /// macro bodies—especially predefined/builtin macros such as __FILE__ and
+  /// __LINE__— may not carry their own patchable invocation-site metadata in
+  /// the refold map. When an edit targets tokens produced by such an inner
+  /// expansion, the refolder must attribute the edit to the nearest enclosing
+  /// macro call that can be rewritten at its call site; this method performs
+  /// that "bubble up to a patchable call site" selection deterministically by
+  /// choosing the smallest enclosing patchable invocation.
+  ///
+  /// This is used during hunk classification to decide whether an edit should
+  /// be realized as a macro call-site patch (whole-cover or argument patch)
+  /// rather than as a TU/include byte patch.
+  ///
+  /// \param aStart  Inclusive start PP-token index in A.
+  /// \param aEnd    Exclusive end PP-token index in A.
+  /// \return        The smallest covering patchable macro invocation, or
+  ///                nullptr if none cover the span.
+  const RefoldModel::MacroInvocation *
+  SmallestCoveringPatchableMacro(int aStart, int aEnd) const;
+
   /// \brief Returns the smallest include whose PP coverage contains a
   /// zero-width patch position, or (for non-empty ranges) fully covers the span.
   ///
@@ -630,8 +680,8 @@ private:
     return (max == std::numeric_limits<int>::min()) ? -1 : max;
   }
 
-  /// Computes the TU (translation unit) byte span [b, e) corresponding to an
-  /// A-side PP-token interval [a0, a1).
+  /// \brief Computes the TU (translation unit) byte span [b, e) corresponding
+  /// to an A-side PP-token interval [a0, a1).
   ///
   /// This method is used to convert a diff hunk expressed in A-token indices
   /// into a concrete byte range in the TU source file. Its contract is
@@ -679,9 +729,9 @@ private:
   /// \return A pair representing the TU byte span [b, e), or{-1, -1}.
   std::pair<int, int> TUByteSpan(int a0, int a1, StringRef tuPath) const;
 
-  /// Detects whether a pure insertion hunk lies exactly on the boundary between
-  /// two sibling include regions, and if so, assigns ownership of the insertion
-  /// to their parent include.
+  /// \brief Detects whether a pure insertion hunk lies exactly on the boundary
+  /// between two sibling include regions, and if so, assigns ownership of the
+  /// insertion to their parent include.
   ///
   /// A "pure insertion" is a hunk where the A-side is empty and the B-side is
   /// non-empty (h.aStart == h.aEnd && h.bStart < h.bEnd). For such hunks, the
@@ -724,7 +774,7 @@ private:
   BoundaryParentIncludeForPureInsertion(const diffutils::Hunk &h,
                                         StringRef tuPath) const;
 
-  /// Finds the nearest TokMapEntry in PP space by linear probing from a
+  /// \brief Finds the nearest TokMapEntry in PP space by linear probing from a
   /// starting PP coordinate.
   ///
   /// This helper walks PP coordinates beginning at \p start and repeatedly adds
@@ -778,8 +828,8 @@ private:
   IncludePatch BuildIncludeInsertionPatch(const RefoldModel::IncludeItem &inc,
                                           const diffutils::Hunk &h) const;
 
-  /// Computes a B-side preprocessor token envelope `[begin, end)` for a macro
-  /// invocation.
+  /// \brief Computes a B-side preprocessor token envelope `[begin, end)` for a
+  /// macro invocation.
   ///
   /// The envelope is the minimal half-open token range on the B-side covering
   /// the union of the macro invocation's **BODY spans** and **ARGUMENT spans**.
@@ -808,50 +858,357 @@ private:
   bool MacroExpansionEnvelopeB(const RefoldModel::MacroInvocation &m,
                                bool onlyInvFile, int &begin, int &end) const;
 
-  /// Attempts to build a `MacroPatch` by reconciling edits specifically
+  /// \brief Checks whether a proposed invocation-site argument replacement is
+  /// consistent with the macro’s expanded text in B for every occurrence of
+  /// that argument.
+  ///
+  /// This is a safety gate for the “args-only” macro refolding policy: we may
+  /// rewrite the macro invocation text (e.g., FOO(3,5)) instead of forcing a
+  /// full expansion only when each occurrence of the targeted formal parameter
+  /// inside the macro expansion evaluates to the same token text in the edited
+  /// preprocessed output (B). If any occurrence differs, the edit cannot be
+  /// represented by a single invocation-site argument, so the caller must treat
+  /// the macro as requiring expansion.
+  ///
+  /// Occurrence identification uses the refold map’s argument usage metadata:
+  /// m.bodySpans and m.argSpans are combined into a list of “argument holes”
+  /// (PP-token spans) tagged with argIdx. For each occurrence, the method
+  /// derives the corresponding B-token envelope deterministically via the A→B
+  /// token map a2b:
+  ///   - Preferred: map the tokens adjacent to the occurrence in A and take the
+  ///     strict interior range in B.
+  ///   - Fallback: map any surviving tokens within the occurrence span itself.
+  ///
+  /// The extracted B slice is compared against newArg after edge-space
+  /// trimming. String literal occurrences are also supported: if the B slice
+  /// looks like a string literal, the method attempts to “unstringify” it
+  /// (invert stringification) and compares that result to newArg.
+  ///
+  /// Conservatism: when required metadata is missing (e.g., m.argSpans absent),
+  /// the method returns true (vacuously satisfied) rather than forcing
+  /// expansion. When an occurrence cannot be located in B or does not match, it
+  /// returns false.
+  ///
+  /// \param m macro invocation being patched (provides cover/body/arg span
+  ///        metadata).
+  /// \param argIdx zero-based formal parameter index to validate.
+  /// \param newArg candidate invocation-site argument text after refolding.
+  /// \param a2b token mapping from A indices to B indices (LCS-derived), with
+  ///        -1 for deletions.
+  /// \return true iff every occurrence of argIdx in the macro’s B expansion
+  ///         matches newArg (directly or via unstringification); false
+  ///         otherwise.
+  bool MacroArgReplacementMatchesAllOccurrencesInB(
+      const RefoldModel::MacroInvocation &m, int argIdx, StringRef newArg,
+      ArrayRef<int> a2b) const;
+
+  /// \brief Attempts to build a `MacroPatch` by reconciling edits strictly
   /// within the arguments of a function-like macro invocation, rather than
-  /// replacing the entire macro call.
+  /// replacing the entire macro expansion/call-site text.
   ///
-  /// This method is a "surgical" alternative to whole-macro replacement. It is
-  /// preferred when the edits (hunks) are strictly contained within the
-  /// expansion of the macro's parameters. By identifying which macro parameter
-  /// the edit corresponds to, it can update the specific argument at the
-  /// call-site in the original source, preserving the macro name and any
-  /// unedited arguments.
+  /// This is a “surgical” alternative to whole-macro replacement. It is
+  /// applicable only when the edit hunks are entirely attributable to
+  /// substitutions of one or more formal macro parameters (i.e., within
+  /// argument “holes” in the macro expansion). If the edit overlaps macro
+  /// boilerplate (tokens not originating from a parameter), or if the edit
+  /// cannot be represented by modifying invocation arguments without changing
+  /// other occurrences, the method returns `nullopt` (or equivalent) so the
+  /// caller can fall back to a whole-expansion patch.
   ///
-  /// ### Strategy:
+  /// ### Strategy
   ///
-  /// - **Validation:** Ensures the macro is "func-like" and has valid
-  ///   invocation byte offsets.
-  /// - **Hole Identification:** Uses `body_spans` to find where
-  ///   parameters appear in the expansion (the "holes") and maps them to
-  ///   argument indices via `arg_spans`.
-  /// - **Containment Check:** Verifies that the provided `Hunk`
-  ///   resides entirely within the identified argument spans. If an edit
-  ///   overlaps the macro's boilerplate (body text that isn't a parameter),
-  ///   this method fails.
-  /// - **Mapping:** Projects the A-side (original preprocessed) argument
-  ///   tokens to the B-side (edited preprocessed) tokens to extract the new
-  ///   string representation from `bSource_`.
-  /// - **Reconstruction:** Parses the `baseInvocationText` to find
-  ///   the original argument byte ranges and performs a right-to-left
-  ///   replacement to build the final patched invocation string.
+  /// - **Eligibility:** Requires `m.subkind == "func"`, a non-empty
+  ///   `baseInvocationText`, and sane invocation byte offsets `invB/invE`.
   ///
+  /// - **Hole identification:** Uses `body_spans` to identify where parameters
+  ///   appear in the expansion and maps those spans to call-site argument
+  ///   indices via `arg_spans` (producing `PPArgSpan` holes annotated with
+  ///   `arg_index`).
+  ///
+  /// - **Stringification fallback:** If argument holes are absent (common for
+  ///   stringified occurrences, `#param`, whose expansion token may not be
+  ///   tagged as a macro-arg expansion), attempts to synthesize an argument
+  ///   hole based on the active macro definition and the edited string literal
+  ///   in B.
+  ///
+  /// - **Containment check:** Verifies the triggering `Hunk` lies fully within
+  /// one
+  ///   or more argument holes. If any part overlaps non-parameter expansion
+  ///   text, the method fails.
+  ///
+  /// - **Mapping A→B:** For each touched argument hole, projects the A-side
+  /// token
+  ///   span to a B-side token envelope using `a2b`, widens to include inserted
+  ///   boundary tokens from the hunk when necessary, and extracts the
+  ///   replacement argument text from `bSource` using `bTokOff` (with
+  ///   edge-whitespace trimmed).
+  ///
+  /// - **Multi-occurrence consistency:** If a formal parameter appears multiple
+  ///   times in the expansion, the method requires that all corresponding
+  ///   occurrences in B agree with the same argument text. Otherwise, modifying
+  ///   the call-site argument would implicitly change other occurrences and
+  ///   diverge from the edited preprocessed output; in that case it returns
+  ///   `nullopt` (or equivalent) to force a whole-expansion patch.
+  ///
+  /// - **Unstringify:** For edits originating from a `#param` occurrence, if
+  /// the
+  ///   extracted replacement is a string-literal token, attempts to invert it
+  ///   back into argument text (failing safely if the literal cannot be
+  ///   unstringified).
+  ///
+  /// - **Reconstruction:** Parses `baseInvocationText` to locate per-argument
+  /// byte
+  ///   ranges in the original invocation, then applies replacements
+  ///   right-to-left. Multiple hunks (or multiple holes) that map to the same
+  ///   `arg_index` must resolve to an identical replacement string; conflicts
+  ///   cause failure.
+  ///
+  /// \param M The refold model (used for macro-definition/metadata lookups
+  ///          during hole synthesis and validation).
   /// \param m The macro invocation being patched.
   /// \param h The hunk (edit) that triggered the patch attempt.
   /// \param a2b The token mapping array from original preprocessed (A) to
   ///            edited (B).
-  /// \param baseInvocationText The original text of the macro call in the
-  ///                           source file.
-  /// \return A `MacroPatch` containing the updated call-site text, or
-  ///         `std::nullopt` if the hunk is not strictly an argument edit or if
-  ///         mapping conflicts occur.
+  /// \param bSource The full text of the edited preprocessed source.
+  /// \param bTokOff List of byte offsets for tokens in `bSource`.
+  /// \param baseInvocationText The original text of the macro call in the TU
+  ///            source.
+  /// \returns A `MacroPatch` containing updated call-site text, or `nullopt`
+  ///          (or equivalent) if the edit is not strictly representable as
+  ///          argument-only changes (or if mapping/consistency checks fail).
   std::optional<MacroPatch> BuildMacroInvocationPatchArgsOnly(
       const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h,
       const ArrayRef<int> a2b, StringRef baseInvocationText) const;
 
-  /// Determines if a given edit hunk is entirely contained within a set of
-  /// macro argument spans.
+  /// \brief Finds the `\#define` that is considered "in effect" for a given
+  /// macro invocation.
+  ///
+  /// This uses the refold-map event `id` as an ordering surrogate for source
+  /// order: only `\#define` directives with `d.id < inv.id` are eligible (i.e.,
+  /// they occur before the invocation in the preprocessor event stream).
+  ///
+  /// Each eligible directive is parsed via `parseMacroDefineInfo`. Directives
+  /// that cannot be parsed are ignored. Among parsed directives whose macro
+  /// name matches `inv.name`, the directive with the greatest `id` is selected
+  /// (the most recent definition prior to the invocation), yielding
+  /// deterministic behavior.
+  ///
+  /// Note: this routine only considers `\#define` directives. It does not model
+  /// `\#undef` or conditional visibility; callers should treat a `nullopt`
+  /// result (or a potentially stale result in the presence of `\#undef`) as a
+  /// signal to fall back to a more conservative strategy (e.g., whole-cover
+  /// expansion).
+  ///
+  /// \param inv Macro invocation whose active definition should be resolved.
+  /// \returns The most recent matching `\#define` prior to `inv`, or
+  /// `std::nullopt`
+  ///          if none can be determined.
+  std::optional<MacroDefineInfo> FindActiveMacroDefineForInvocation(
+      const RefoldModel::MacroInvocation &inv) const;
+
+  /// \brief Parses a `\#define` directive text into a compact definition summary
+  /// used by refolding.
+  ///
+  /// The directive text is expected to match the textual form recorded in the
+  /// refold map (e.g., `"#define FOO(X) ...\n"`). This parser is intentionally
+  /// lightweight: it recognizes the directive keyword, extracts the macro
+  /// identifier, and (if the macro is function-like) extracts the parameter
+  /// list by splitting on commas up to the first closing `')'`.
+  ///
+  /// For function-like macros, this method also scans the replacement list
+  /// (everything after the name/parameter list) for stringification operators
+  /// of the form `\#param`. Token pasting `\#\#` is explicitly ignored. Each
+  /// `\#param` occurrence contributes the corresponding parameter index to
+  /// `stringifyOrder` in left-to-right textual order, which is later used to
+  /// associate produced string literals with invocation arguments when
+  /// refolding edits to stringified expansions.
+  ///
+  /// ### Limitations (by design):
+  /// * This is not a full preprocessor parser. It does not model comments, line
+  ///   continuations, nested parentheses, or variadics robustly, and it assumes
+  ///   the parameter list is a simple comma-separated list ending at the first
+  ///   `')'`.
+  /// * The replacement scan is heuristic and may misclassify `\#` occurrences
+  ///   inside literals or comments if those are present in the recorded text.
+  ///
+  /// \param d Macro directive record (must be a `\#define`) whose text is
+  /// parsed.
+  /// \returns A `MacroDefineInfo` containing the directive id, macro name,
+  ///          parameter names, and stringification parameter indices in textual
+  ///          occurrence order; or `std::nullopt` if the text does not parse as
+  ///          a `\#define`.
+  static std::optional<MacroDefineInfo>
+  ParseMacroDefineInfo(const RefoldModel::MacroDirective &d);
+
+  /// \brief Normalizes and records a single parameter slot from a function-like
+  /// `\#define`.
+  ///
+  /// This helper takes the raw text accumulated for one parameter (as delimited
+  /// by commas and the closing `')'` in `parseMacroDefineInfo`) and appends the
+  /// parameter identifier to `params`, if one can be extracted.
+  ///
+  /// ### Normalization rules:
+  /// * Whitespace-only and empty slots are ignored.
+  /// * Variadic markers are ignored (`"..."`, and `"name..."` will naturally
+  ///   record `"name"` while the ellipsis is dropped by the identifier-prefix
+  ///   rule).
+  /// * Only the leading identifier prefix of the slot is kept; any trailing
+  ///   punctuation or annotations are discarded.
+  ///
+  /// This is used to build the parameter name table for stringify mapping;
+  /// parameters that cannot be reduced to an identifier are skipped to keep
+  /// downstream logic conservative and deterministic.
+  ///
+  /// \param params Output list to append the extracted parameter identifier to.
+  /// \param raw Raw parameter slot text (may include whitespace and trailing
+  ///            punctuation).
+  static void AddDefineParam(std::vector<std::string> &params, StringRef raw);
+
+  /// \brief Computes synthetic macro-argument "holes" for hunks that edit a
+  /// stringified macro parameter.
+  ///
+  /// Clang's token-origin tracking typically does not attribute the produced
+  /// string literal from `\#param` back to the corresponding invocation
+  /// argument (i.e., `arg_spans` may be missing for stringify output). This
+  /// method bridges that gap by mapping an edit hunk that targets a string
+  /// literal token in the preprocessed B stream back onto the appropriate
+  /// invocation argument index, returning a `PPArgSpan` that callers can treat
+  /// like a normal edited argument span.
+  ///
+  /// ### Eligibility and mapping rules:
+  /// * The macro definition must have at least one stringification occurrence
+  ///   recorded in `def.stringifyParamOrder`.
+  /// * The hunk must target a string literal token in B (checked at
+  /// `h.bStart`).
+  /// * If the macro body contains exactly one `\#param` occurrence, that
+  ///   parameter index is used directly.
+  /// * If the macro body contains multiple `\#param` occurrences, this method
+  ///   determines the B-token envelope covered by the macro expansion for this
+  ///   hunk, then counts string literal tokens within that envelope in
+  ///   left-to-right order. The string literal at `h.bStart` is treated as the
+  ///   `occ`-th stringification occurrence, which maps to the parameter index
+  ///   `def.stringifyParamOrder[occ]`.
+  ///
+  /// The returned `PPArgSpan` uses the hunk's A-span (`[h.aStart, h.aEnd)`) and
+  /// the resolved argument index. If any required information is missing or the
+  /// mapping is ambiguous, this method returns an empty vector so callers can
+  /// fall back to a conservative strategy (e.g., whole-cover expansion).
+  ///
+  /// \param def Parsed `\#define` summary for `m` (including stringify
+  ///            occurrence order).
+  /// \param m Macro invocation whose expansion contains the edited string
+  /// literal.
+  /// \param h Edit hunk being classified/mapped.
+  /// \param a2b A-to-B token mapping for the LCS alignment.
+  /// \param bSource Full B-side preprocessed source text.
+  /// \param bTokOff B token start offsets (token index -> byte offset).
+  /// \returns A singleton vector containing a synthetic `PPArgSpan` for the
+  ///          stringified argument, or an empty vector if the hunk is not a
+  ///          supported stringify edit.
+  std::vector<RefoldModel::PPArgSpan>
+  ComputeStringifyArgHolesForHunk(const std::optional<MacroDefineInfo> &def,
+                                  const RefoldModel::MacroInvocation &m,
+                                  const diffutils::Hunk &h,
+                                  ArrayRef<int> a2b) const;
+
+  /// \brief Slices the B-side source text by token indices.
+  ///
+  /// This helper converts a half-open B-token interval `[bStartTok, bEndTok)`
+  /// into a byte-offset range using `bTokOff` and returns the corresponding
+  /// substring of `bSource`.
+  ///
+  /// `bTokOff` is the B token-to-byte offset table and must be consistent with
+  /// the token stream used elsewhere in refolding:
+  /// * `bTokOff[i]` is the starting byte offset of B token `i`.
+  /// * The table is expected to have length `(numBTokens + 1)`, where the final
+  ///   entry `bTokOff[numBTokens]` equals `bSource.size()` (end sentinel).
+  ///
+  /// For robustness, this method clamps token indices into the valid table
+  /// range and clamps derived byte offsets into `[0, bSource.size()]`. If
+  /// inputs are empty, it returns the empty string.
+  ///
+  /// \param bTokOff Token start offsets for B (length `numBTokens + 1`).
+  /// \param bSource Full B-side preprocessed source text.
+  /// \param bStartTok Inclusive start token index.
+  /// \param bEndTok Exclusive end token index.
+  /// \returns The substring of `bSource` covered by tokens `[bStartTok,
+  /// bEndTok)`.
+  StringRef SliceBSource(int bStartTok, int bEndTok) const;
+
+  /// \brief Computes a conservative B-token envelope for the portion of `m`'s
+  /// expansion affected by a hunk.
+  ///
+  /// The refold map records macro coverage in A-token space via
+  /// `[m.coverBegin, m.coverEnd)`. This routine projects that interval into
+  /// B-token space using the A→B alignment (`a2b`), producing a half-open B
+  /// interval `[lo, hi)` that can be used to scan the macro's expanded tokens
+  /// in B (e.g., to locate string literals produced by `\#param`
+  /// stringification).
+  ///
+  /// Because the A→B mapping may be incomplete near edits, the computed
+  /// envelope is intentionally conservative:
+  /// * `lo` is derived from mapping `m.coverBegin` forward into B; if unmapped,
+  ///   it falls back to `h.bStart`.
+  /// * `hi` is derived from mapping the last covered A token (`m.coverEnd - 1`)
+  ///   backward into B and converting to exclusive-end form; if unmapped, it
+  ///   falls back to `(h.bEnd - 1) + 1`.
+  /// * The envelope is then widened to include the hunk's own B span
+  ///   `[h.bStart, h.bEnd)`.
+  ///
+  /// The returned interval is clamped to the valid token table range, where
+  /// `bTokOff.size()` is `numBTokens + 1`. If no valid envelope can be formed
+  /// (e.g., both endpoints are unmapped and the hunk has no B span), this
+  /// method returns `std::nullopt`.
+  ///
+  /// \param m Macro invocation providing A-token coverage (`coverBegin/End`).
+  /// \param h Edit hunk whose B span should be included in the envelope.
+  /// \param a2b A-to-B token mapping produced by the alignment.
+  /// \param bTokOff B token start offsets (length `numBTokens + 1`).
+  /// \returns A pair representing a half-open B-token interval `[lo, hi)`, or
+  ///          `std::nullopt` if no valid envelope can be determined.
+  std::optional<std::pair<int, int>>
+  MacroCoverTokenEnvelopeInB(const RefoldModel::MacroInvocation &m,
+                             const diffutils::Hunk &h, ArrayRef<int> a2b) const;
+
+  /// \brief Attempts to invert a string literal token that was produced by macro
+  /// stringification (`\#param`) back into a single invocation-site argument
+  /// spelling.
+  ///
+  /// In the preprocessor, `\#X` produces a string literal token (e.g.,
+  /// `"hello-world"`) even though the invocation argument text was
+  /// `hello-world`. During refolding, edits to that produced literal may be
+  /// projected back onto the invocation site by "unstringifying" the literal
+  /// and using the result as the replacement argument text.
+  ///
+  /// This routine is intentionally conservative and only supports ordinary and
+  /// prefixed string literals that look like one token:
+  /// * `"..."`
+  /// * `L"..."` (wide)
+  /// * `u"..."` / `U"..."` / `u8"..."` (Unicode)
+  ///
+  /// The body is extracted from the first double-quote through the final
+  /// double-quote and is minimally unescaped: `\\` and `\"` are reduced to `\`
+  /// and `"`, respectively. Other escape sequences are preserved verbatim (the
+  /// backslash and following character are kept) to avoid changing semantics.
+  ///
+  /// ### Safety checks:
+  /// The resulting argument text must be representable as a single macro
+  /// argument. If the unescaped body contains a comma, or contains a newline,
+  /// this method returns `std::nullopt` to force callers to take a conservative
+  /// path (e.g., expand the macro instance) rather than producing an ambiguous
+  /// or syntactically invalid invocation such as `FOO(a, b)` when the macro has
+  /// only one parameter.
+  ///
+  /// \param literalTok A token string that should represent a single C/C++
+  ///                   string literal.
+  /// \returns The corresponding invocation-site argument spelling, or
+  ///          `std::nullopt` if the literal is not recognized or cannot be
+  ///          safely mapped to a single argument.
+  static std::optional<std::string>
+  UnstringifyLiteralToArgText(StringRef literalTok);
+
+  /// \brief Determines if a given edit hunk is entirely contained within a set
+  /// of macro argument spans.
   ///
   /// This method serves as a safety gate for "surgical" macro patching. It
   /// ensures that an edit (the `Hunk`) only touches the tokens corresponding to
@@ -886,10 +1243,10 @@ private:
   static bool
   HunkFullyWithinArgSpans(const diffutils::Hunk &h,
                           const std::vector<RefoldModel::PPArgSpan> &argSpans,
-                          llvm::MutableArrayRef<char> touched);
+                          MutableArrayRef<char> touched);
 
-  /// Reconstructs the token spans of macro arguments by identifying the "holes"
-  /// between consecutive macro body segments.
+  /// \brief Reconstructs the token spans of macro arguments by identifying the
+  /// "holes" between consecutive macro body segments.
   ///
   /// In function-like macros, the preprocessor provides `body_spans` which
   /// represent the literal parts of the macro definition. These spans alternate
@@ -914,8 +1271,8 @@ private:
       const std::vector<RefoldModel::PPSpan> &bodySpans,
       const std::vector<RefoldModel::PPArgSpan> &argSpans);
 
-  /// Determines if two preprocessor (PP) token spans overlap, with special
-  /// handling for zero-width insertion points.
+  /// \brief Determines if two preprocessor (PP) token spans overlap, with
+  /// special handling for zero-width insertion points.
   ///
   /// This method is used during macro argument patching to correlate edit
   /// locations with parameter "holes" in the expanded body. Unlike standard
@@ -958,9 +1315,9 @@ private:
     return std::max(b0, b1) < std::min(e0, e1);
   }
 
-  /// Calculates the bounding "envelope" of tokens in the edited preprocessed
-  /// stream (B) that correspond to a specific range of tokens from the original
-  /// preprocessed stream (A).
+  /// \brief Calculates the bounding "envelope" of tokens in the edited
+  /// preprocessed stream (B) that correspond to a specific range of tokens from
+  /// the original preprocessed stream (A).
   ///
   /// Because edits can reorder, delete, or duplicate tokens, a contiguous range
   /// in A might map to a fragmented or shifted set of indices in B. This method
@@ -1004,8 +1361,8 @@ private:
     return std::make_pair(bMin, bMax + 1);
   }
 
-  /// Parses the raw text of a function-like macro invocation to identify the
-  /// byte ranges of its individual arguments.
+  /// \brief Parses the raw text of a function-like macro invocation to identify
+  /// the byte ranges of its individual arguments.
   ///
   /// This method performs a shallow, brace-aware scan of the invocation text
   /// starting from the opening parenthesis. It correctly handles nested
@@ -1025,7 +1382,7 @@ private:
   static std::optional<std::vector<std::pair<int, int>>>
   ParseMacroInvocationArgContentRanges(StringRef invText);
 
-  /// Adjusts the boundaries of a character range to exclude leading and
+  /// \brief Adjusts the boundaries of a character range to exclude leading and
   /// trailing whitespace.
   ///
   /// Given a string and a half-open interval `[b, e)`, this method increments
@@ -1048,8 +1405,8 @@ private:
     return {b, e};
   }
 
-  /// Builds a macro replacement patch by reconciling changes across nested
-  /// macro expansions, argument-specific edits, and whole-expansion byte
+  /// \brief Builds a macro replacement patch by reconciling changes across
+  /// nested macro expansions, argument-specific edits, and whole-expansion byte
   /// mapping.
   ///
   /// The reconciliation follows a multi-tier fallback strategy:
@@ -1081,8 +1438,8 @@ private:
       ArrayRef<int> a2b, StringRef baseInvText,
       const DenseMap<int, DenseMap<int, MacroPatch>> &patchMap) const;
 
-  /// Applies a deterministic, stable ordering to include-scoped insertion
-  /// patches.
+  /// \brief Applies a deterministic, stable ordering to include-scoped
+  /// insertion patches.
   ///
   /// During refolding, multiple insertions can be attributed to the same
   /// include instance. The refold pipeline may discover or enqueue these
@@ -1179,8 +1536,8 @@ private:
           &children,
       DenseMap<int, std::string> &includeExpansion) const;
 
-  /// Selects the most appropriate HeaderDecl within an IncludeItem to serve as
-  /// the declaration-level anchor for an include-scoped patch.
+  /// \brief Selects the most appropriate HeaderDecl within an IncludeItem to
+  /// serve as the declaration-level anchor for an include-scoped patch.
   ///
   /// Include edits are often more robust when anchored to a concrete
   /// declaration region rather than to the entire header. The refold model may
@@ -1231,8 +1588,8 @@ private:
   FindHeaderDeclForPatch(const RefoldModel::IncludeItem &inc,
                          const IncludePatch &p);
 
-  /// Applies the IncludeEdits for a single include instance to that header's
-  /// in-memory text.
+  /// \brief Applies the IncludeEdits for a single include instance to that
+  /// header's in-memory text.
   ///
   /// This method consumes a list of IncludePatches whose coordinates are
   /// expressed in the A-side token (PP) index space and projects them onto \p
@@ -1308,9 +1665,9 @@ private:
   std::string ApplyIncludeEdits(const IncludeEdits &ie,
                                 std::string headerText) const;
 
-  /// Computes a deterministic insertion byte offset for a header-scoped *pure
-  /// INSERT* when the normal token-based anchoring mechanisms provide no usable
-  /// neighbor.
+  /// \brief Computes a deterministic insertion byte offset for a header-scoped
+  /// *pure INSERT* when the normal token-based anchoring mechanisms provide no
+  /// usable neighbor.
   ///
   /// This is a fallback used only in degenerate header cases where:
   /// - The patch is a pure insertion (`p.aStart == p.aEnd`)
@@ -1375,8 +1732,8 @@ private:
 
   // ------------------------ Low-level Mapping & Utils ------------------------
 
-  /// Resolves the TU/file byte start offset corresponding to a PP coordinate
-  /// for a specific file.
+  /// \brief Resolves the TU/file byte start offset corresponding to a PP
+  /// coordinate for a specific file.
   ///
   /// The refold model maintains a PP->(file, byte-range) mapping (e.g.
   /// \c tokmapByPP) that allows code working in PP space to locate the
@@ -1409,8 +1766,8 @@ private:
     return fallbackToEOF ? fileLen : -1;
   }
 
-  /// Resolves the TU/file byte end offset corresponding to a PP coordinate for
-  /// a specific file.
+  /// \brief Resolves the TU/file byte end offset corresponding to a PP
+  /// coordinatefor a specific file.
   ///
   /// Analogous to ByteStartForPPInFile() but returns the mapped end byte offset
   /// (\c e). If \p pp maps to an entry whose \c file matches the requested \p
@@ -1447,8 +1804,8 @@ private:
 
   // ---------------------- Diagnostics & Debug Utilities ----------------------
 
-  /// Emits a detailed TRACE log line describing how a given hunk maps into an
-  /// include's token/byte space.
+  /// \brief Emits a detailed TRACE log line describing how a given hunk maps
+  /// into an include's token/byte space.
   ///
   /// This method is purely diagnostic. It computes:
   /// - A-side byte interval for the hunk using aTokOff (token start offsets in

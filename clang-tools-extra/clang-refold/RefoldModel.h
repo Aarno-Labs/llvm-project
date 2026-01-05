@@ -157,26 +157,60 @@ public:
     int end;   // exclusive
 
     void Init(std::optional<int> coverBeginOpt, std::optional<int> coverEndOpt,
-              const std::vector<PPSpan> &spans) noexcept {
+              const std::vector<PPSpan> &spans,
+              const std::vector<PPArgSpan> *argSpans = nullptr,
+              const std::vector<PPSpan> *bodySpans = nullptr) noexcept {
       int cb = -1, ce = -1;
       if (coverBeginOpt && coverEndOpt) {
         cb = *coverBeginOpt;
         ce = *coverEndOpt;
       }
 
-      if ((cb < 0 || ce < 0) && !spans.empty()) {
-        int mn = INT32_MAX, mx = INT32_MIN;
+      // If pp_cover is not present, approximate coverage from any recorded PP
+      // spans. This must include arg/body spans as well as the outer 'spans' so
+      // that edits to nested macro expansions inside a macro body can be
+      // attributed to the enclosing macro invocation.
+      if (cb < 0 || ce < 0) {
+        int mn = std::numeric_limits<int>::max();
+        int mx = std::numeric_limits<int>::min();
+
         for (const auto &s : spans) {
+          if (!s.IsValid())
+            continue;
           if (s.begin < mn)
             mn = s.begin;
           if (s.end > mx)
             mx = s.end;
         }
-        if (mn != INT32_MAX) {
+
+        if (argSpans) {
+          for (const auto &s : *argSpans) {
+            if (!s.IsValid())
+              continue;
+            if (s.begin < mn)
+              mn = s.begin;
+            if (s.end > mx)
+              mx = s.end;
+          }
+        }
+
+        if (bodySpans) {
+          for (const auto &s : *bodySpans) {
+            if (!s.IsValid())
+              continue;
+            if (s.begin < mn)
+              mn = s.begin;
+            if (s.end > mx)
+              mx = s.end;
+          }
+        }
+
+        if (mn != std::numeric_limits<int>::max()) {
           cb = mn;
           ce = std::max(mn, mx);
         }
       }
+
       begin = cb;
       end = ce;
     }
@@ -264,7 +298,7 @@ public:
           bodySpans(std::move(bodySpans)), invText(std::move(invText)),
           invFile(std::move(invFile)), invB(std::move(invB)),
           invE(std::move(invE)), ownerIncludeId(std::move(ownerIncludeId)) {
-      cover.Init(coverBegin, coverEnd, this->spans);
+      cover.Init(coverBegin, coverEnd, this->spans, &this->argSpans, &this->bodySpans);
     }
 
     int GetInvB() const { return invB.has_value() ? *invB : -1; }
@@ -360,12 +394,6 @@ public:
   struct ArmRef {
     const CondGroup *group;
     const CondArm *arm;
-  };
-
-  // ============================== Owner arrays ==============================
-  struct OwnerArrays {
-    std::vector<int> ownerDepth;     // 0=TU, >=1 in includes
-    std::vector<int> ownerIncludeId; // -1=TU, else include id
   };
 
   /// \brief Constructs a RefoldModel instance from a parsed JSON object.
@@ -512,9 +540,6 @@ public:
   }
 
   std::vector<TokMapEntry> MapSpan(PPSpan span) const;
-
-  // --- Derived arrays ---
-  OwnerArrays ComputeOwnerArraysForPP(int ppCount) const;
 
 private:
   RefoldModel() = default;
