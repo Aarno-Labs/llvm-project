@@ -1183,37 +1183,6 @@ int RefoldModel::FirstConditionalArmStartA(const CondGroup &group) const {
   return best == std::numeric_limits<int>::max() ? -1 : best;
 }
 
-RefoldModel::OwnerArrays
-RefoldModel::ComputeOwnerArraysForPP(int ppCount) const {
-  OwnerArrays out;
-  out.ownerDepth.assign(ppCount, 0);
-  out.ownerIncludeId.assign(ppCount, -1);
-
-  if (ppCount <= 0)
-    return out;
-
-  if (includes_.empty())
-    return out;
-
-  for (int pp = 0; pp < ppCount; ++pp) {
-    int bestDepth = 0;
-    int bestIncId = -1;
-    for (const auto &inc : includes_) {
-      if (inc.cover.begin <= pp && pp < inc.cover.end) {
-        int depth = GetIncludeDepth(inc.id);
-        if (depth > bestDepth) {
-          bestDepth = depth;
-          bestIncId = inc.id;
-        }
-      }
-    }
-    out.ownerDepth[pp] = bestDepth;
-    out.ownerIncludeId[pp] = bestIncId;
-  }
-
-  return out;
-}
-
 std::vector<const RefoldModel::Slot *>
 RefoldModel::FindSlots(const std::optional<std::string> &file,
                        const std::optional<std::string> &kind,

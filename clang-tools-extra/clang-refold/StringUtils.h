@@ -263,6 +263,37 @@ template <typename T> std::string stringifyElement(const T &elem) {
   }
 }
 
+/// \brief Heuristically determines if a preprocessed token spelling looks like
+/// a C/C++ string literal.
+///
+/// This performs a lightweight prefix check to identify standard double-quoted
+/// strings as well as C++11/C++20 prefixed literals (L, u8, u, U). It is
+/// intended for use in preprocessor-level heuristics (like stringify mapping)
+/// where full lexing of the token content is not required.
+///
+/// \param tok The raw token spelling to examine.
+/// \return True if the trimmed token starts with a valid string literal
+///         opening sequence; false otherwise.
+inline bool looksLikeStringLiteralToken(StringRef tok) {
+  // .trim() handles leading/trailing whitespace
+  StringRef s = tok.trim();
+
+  if (s.empty())
+    return false;
+
+  // Standard string literal
+  if (s.starts_with("\""))
+    return true;
+
+  // Prefixed string literals (L"", u8"", u"", U"")
+  if (s.starts_with("L\"") || s.starts_with("u\"") || s.starts_with("U\"") ||
+      s.starts_with("u8\"")) {
+    return true;
+  }
+
+  return false;
+}
+
 } // namespace stringutils
 } // namespace refold
 } // namespace clang
