@@ -52,8 +52,12 @@
 #include "RefoldEngine.h"
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -498,12 +502,9 @@ std::string RefoldEngine::Refold() {
   // Materialize merged macro patches into the list buckets expected by later
   // phases.
   for (auto &outerEntry : macroPatchByOwnerByMacroId) {
-    const int ownerId = outerEntry.first;
-    auto &patchesById = outerEntry.second; // This is the inner DenseMap
-    auto &finalPatches = macroPatchesByOwner[ownerId];
-    for (auto &innerEntry : patchesById) {
-      finalPatches.push_back(innerEntry.second);
-    }
+    auto &finalPatches = macroPatchesByOwner[outerEntry.first];
+    auto &patchesById = outerEntry.second;
+    append_range(finalPatches, make_second_range(patchesById));
   }
 
   debug("plan", "perInclude.size={0} macroOwners={1} tuEdits(initial)={2}",
@@ -541,8 +542,8 @@ std::string RefoldEngine::Refold() {
   DenseSet<int> seeds;
 
   // (a) Direct include edits.
-  for (auto &kv : perInclude)
-    seeds.insert(kv.first);
+  auto perIncludeKeys = make_first_range(perInclude);
+  seeds.insert(perIncludeKeys.begin(), perIncludeKeys.end());
 
   // (b) Macro-owned work INSIDE headers (ownerIncludeId != null).
   for (auto &kv : macroPatchesByOwner) {
@@ -596,7 +597,10 @@ std::string RefoldEngine::Refold() {
       // If the spans are exactly equal, require that the replacement be
       // identical as well (otherwise we'd be choosing one arbitrarily,
       // violating determinism).
-      // TODO: Should we keep this??
+      /*
+       * TODO: Should we keep this, or should this be possible (i.e. should we
+       * warn and continue instead)??
+       */
       if (mp.invStart < 0 || mp.invEnd < 0) {
         fatal("macro/tu",
               "TU macro patch has either a negative invocation start or end "
@@ -1493,7 +1497,7 @@ bool RefoldEngine::MacroExpansionEnvelopeB(
 
 bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInB(
     const RefoldModel::MacroInvocation &m, int argIdx, StringRef newArg,
-    ArrayRef<int> a2b) const {
+    ArrayRef<int> a2b, const DenseSet<int> &stringifyParams) const {
   if (m.argSpans.empty())
     return true;
 
@@ -1547,6 +1551,14 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInB(
     if (stringutils::looksLikeStringLiteralToken(tok)) {
       std::optional<std::string> un = UnstringifyLiteralToArgText(tok);
       if (un && *un == newArg)
+        continue;
+
+      // If this formal param is stringified somewhere in the macro body, the
+      // edited B stream may legitimately have the diagnostic string out-of-sync
+      // with the unstringified occurrence (e.g., assert). Prefer the unstringi-
+      // fied occurrence rather than rejecting argsOnly solely because the
+      // string literal differs.
+      if (stringifyParams.count(argIdx))
         continue;
     }
 
@@ -1704,25 +1716,34 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     newArg = stringutils::trimEdgeSpaces(newArg);
 
     // Safety check: replacement must match all occurrences in the expansion
-    if (!MacroArgReplacementMatchesAllOccurrencesInB(m, argIdx, newArg, a2b)) {
+    if (!MacroArgReplacementMatchesAllOccurrencesInB(m, argIdx, newArg, a2b,
+                                                     stringifyParams)) {
       debug("macro/args",
-            "argsOnly: inv id={0} argIdx={1} mismatch across occurrences", m.id,
-            argIdx);
+          "argsOnly: inv id={0} argIdx={1} replacement does not match all "
+          "occurrences; returning nullopt",
+          m.id, argIdx);
       return std::nullopt;
     }
 
     // Unstringify if the parameter was stringified (#)
     std::string newArgStr = newArg.str();
     if (!stringifyParams.empty() && stringifyParams.count(argIdx)) {
-      std::optional<std::string> s = UnstringifyLiteralToArgText(newArg);
-      if (!s) {
-        debug("macro/args",
-              "argsOnly: inv id={0} argIdx={1} unsafe to unstringify; "
-              "returning nullopt",
-              m.id, argIdx);
-        return std::nullopt;
+      // If this edit came from the *stringified* (#param) occurrence, newArg
+      // will be a string literal token and we must invert it back into the
+      // argument text. However, many macros also use the parameter in a normal,
+      // unstringified position (e.g., assert), in which case newArg is already
+      // argument text and should be left as-is.
+      if (stringutils::looksLikeStringLiteralToken(newArg)) {
+        std::optional<std::string> s = UnstringifyLiteralToArgText(newArg);
+        if (!s) {
+          debug("macro/args",
+                "argsOnly: inv id={0} argIdx={1} unsafe to unstringify; "
+                "returning nullopt",
+                m.id, argIdx);
+          return std::nullopt;
+        }
+        newArgStr = *s;
       }
-      newArgStr = *s;
     }
 
     auto [it, inserted] = replByArgIdx.try_emplace(argIdx, newArgStr);
@@ -2334,7 +2355,6 @@ RefoldEngine::MacroPatch RefoldEngine::BuildMacroInvocationPatchWholeCover(
             const std::string &innerReplacement = patchIt->second.replacement;
 
             // Map the preprocessed token indices to global file byte offsets
-            // TODO: Harden this...
             int gStart =
                 ByteStartForPPInFile(m.invFile ? *m.invFile : "", arg.begin,
                                      /* fallbackToEOF */ false, fileLen);
@@ -2342,6 +2362,7 @@ RefoldEngine::MacroPatch RefoldEngine::BuildMacroInvocationPatchWholeCover(
                 ByteEndForPPInFile(m.invFile ? *m.invFile : "", arg.end - 1,
                                    /* fallbackToEOF */ false, fileLen);
 
+            // TODO: Harden this... i.e., do we need to check if `m.GetInvB()` returns -1??
             if (gStart != -1 && gEnd != -1) {
               // Convert global offsets to local offsets relative to the macro
               // invocation start
@@ -2580,10 +2601,10 @@ void RefoldEngine::MaterializeIncludeExpansion(
   // 2) A/B include insert/delete/replace patches that belong to this include.
   if (auto it = perInclude.find(includeId); it != perInclude.end()) {
     if (!it->second.patches.empty()) {
-      debug("include/mat",
-            "inc#{0} applying {1} include patches via applyIncludeEdits",
+      debug("include/mat", "inc#{0} adding {1} include patches as TextEdits",
             inc->id, it->second.patches.size());
-      bytes = ApplyIncludeEdits(it->second, std::move(bytes));
+      auto moreEdits = ComputeIncludeTextEdits(it->second, bytes);
+      append_range(edits, moreEdits);
     } else {
       debug("include/mat", "inc#{0} has no include patches", inc->id);
     }
@@ -2749,14 +2770,16 @@ RefoldEngine::FindHeaderDeclForPatch(const RefoldModel::IncludeItem &inc,
   return bestCover ? bestCover : bestOverlap;
 }
 
-std::string RefoldEngine::ApplyIncludeEdits(const IncludeEdits &ie,
-                                            std::string headerText) const {
+std::vector<RefoldEngine::TextEdit>
+RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
+                                      std::string headerText) const {
   const std::string file = resolveHeaderPath(*ie.include);
 
   const int fileLen = static_cast<int>(headerText.size());
 
   debug("include/apply",
-        "ENTER applyIncludeEdits file={0} len={1} patches={2} cover=[{3},{4})",
+        "ENTER computeIncludeTextEdits file={0} len={1} patches={2} "
+        "cover=[{3},{4})",
         file, fileLen, ie.patches.size(), ie.include->cover.begin,
         ie.include->cover.end);
 
@@ -2771,7 +2794,7 @@ std::string RefoldEngine::ApplyIncludeEdits(const IncludeEdits &ie,
 
   for (size_t idx = 0; idx < ie.patches.size(); ++idx) {
     const IncludePatch &p = ie.patches[idx];
-    trace("include/patch", "applyIncludeEdits: patch={0}", p);
+    trace("include/patch", "computeIncludeTextEdits: patch={0}", p);
 
     const bool isInsert = (p.aStart == p.aEnd) && (p.bStart < p.bEnd);
     const bool isDelete = (p.aStart < p.aEnd) && (p.bStart == p.bEnd);
@@ -3004,50 +3027,30 @@ std::string RefoldEngine::ApplyIncludeEdits(const IncludeEdits &ie,
     edits.push_back({startByte, endByte, std::move(replacement)});
   }
 
-  // Sort edits FORWARD by start position
+  // Apply all edits inside this header, highest offset first so earlier edits
+  // do not disturb the coordinates of later ones.
   sort(edits, [](const TextEdit &lhs, const TextEdit &rhs) {
     if (lhs.start != rhs.start)
-      return lhs.start < rhs.start;
-    return lhs.end < rhs.end;
+      return lhs.start > rhs.start;
+    return lhs.end > rhs.end;
   });
 
-  debug("include/apply", "file={0} applying {1} header TextEdits", file,
+  debug("include/apply", "file={0} computed {1} header TextEdits", file,
         edits.size());
 
-  // Build the result in a single pass using raw_string_ostream
-  std::string result;
-  result.reserve(headerText.size() +
-                 1024); // Optimization: avoid small reallocs
-  raw_string_ostream os(result);
-
-  int lastOffset = 0;
   for (const auto &e : edits) {
-    // Sanity check: ensure edits don't overlap (though classification should
-    // prevent this)
-    if (e.start < lastOffset) {
-      warn("include/apply", "file={0} skipping overlapping edit at {1}", file,
-           e.start);
-      continue;
+    trace("include/apply",
+          "file={0} header TextEdit bytes=[{1},{2}) replLen={3}", file, e.start,
+          e.end, e.text.size());
+
+    if (e.start < 0 || e.end < e.start ||
+        e.end > static_cast<int>(headerText.size())) {
+      fatal("include/apply", "TextEdit out of bounds: bytes=[{0},{1}) size={2}",
+            e.start, e.end, headerText.size());
     }
-
-    // A) Write everything from the original text between the last edit and this
-    // one
-    os << StringRef(headerText).slice(lastOffset, e.start);
-
-    // B) Write the replacement text
-    os << e.text;
-
-    // C) Advance the cursor past the "consumed" original text
-    lastOffset = e.end;
   }
 
-  // D) Write the final trailing chunk of the original file
-  if (lastOffset < fileLen) {
-    os << StringRef(headerText).slice(lastOffset, fileLen);
-  }
-
-  os.flush();
-  return result;
+  return edits;
 }
 
 int RefoldEngine::ComputeChildBoundaryInsertByte(const IncludePatch &p,
