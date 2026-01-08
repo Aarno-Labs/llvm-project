@@ -55,6 +55,8 @@
 #include "RefoldModel.h"
 #include "StringUtils.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
@@ -858,49 +860,60 @@ private:
   bool MacroExpansionEnvelopeB(const RefoldModel::MacroInvocation &m,
                                bool onlyInvFile, int &begin, int &end) const;
 
-  /// \brief Checks whether a proposed invocation-site argument replacement is
-  /// consistent with the macro’s expanded text in B for every occurrence of
-  /// that argument.
+  /// \brief Validates that an "args-only" macro refolding is representable at
+  /// the invocation site.
   ///
-  /// This is a safety gate for the “args-only” macro refolding policy: we may
-  /// rewrite the macro invocation text (e.g., FOO(3,5)) instead of forcing a
-  /// full expansion only when each occurrence of the targeted formal parameter
-  /// inside the macro expansion evaluates to the same token text in the edited
-  /// preprocessed output (B). If any occurrence differs, the edit cannot be
-  /// represented by a single invocation-site argument, so the caller must treat
-  /// the macro as requiring expansion.
+  /// This is a safety gate used by the args-only policy: we prefer to rewrite
+  /// only the macro invocation argument text (e.g., `FOO(x)`) instead of
+  /// forcing a full expansion, but only when doing so is consistent with what
+  /// the edited preprocessed output (B) implies for every occurrence of that
+  /// formal parameter in the macro expansion.
   ///
-  /// Occurrence identification uses the refold map’s argument usage metadata:
-  /// m.bodySpans and m.argSpans are combined into a list of “argument holes”
-  /// (PP-token spans) tagged with argIdx. For each occurrence, the method
-  /// derives the corresponding B-token envelope deterministically via the A→B
-  /// token map a2b:
-  ///   - Preferred: map the tokens adjacent to the occurrence in A and take the
-  ///     strict interior range in B.
-  ///   - Fallback: map any surviving tokens within the occurrence span itself.
+  /// Occurrence identification is driven by refold-map metadata: `m.bodySpans`
+  /// and `m.argSpans` are combined into "argument holes" (PP-token spans)
+  /// tagged with an `argIdx`. Each hole corresponds to one use-site occurrence
+  /// of a formal parameter within the expansion.
   ///
-  /// The extracted B slice is compared against newArg after edge-space
-  /// trimming. String literal occurrences are also supported: if the B slice
-  /// looks like a string literal, the method attempts to “unstringify” it
-  /// (invert stringification) and compares that result to newArg.
+  /// For each occurrence, the method derives the corresponding B-token envelope
+  /// deterministically using the A→B alignment map `a2b` (LCS-derived):
+  /// - **Preferred:** map the A tokens adjacent to the occurrence and take the
+  ///   strict interior range in B.
+  /// - **Fallback:** map any surviving A tokens within the occurrence span
+  ///   itself and take the inclusive envelope.
   ///
-  /// Conservatism: when required metadata is missing (e.g., m.argSpans absent),
-  /// the method returns true (vacuously satisfied) rather than forcing
-  /// expansion. When an occurrence cannot be located in B or does not match, it
-  /// returns false.
+  /// The extracted B slice is compared against `newArg` after trimming edge
+  /// whitespace.
   ///
-  /// \param m macro invocation being patched (provides cover/body/arg span
-  ///        metadata).
-  /// \param argIdx zero-based formal parameter index to validate.
-  /// \param newArg candidate invocation-site argument text after refolding.
-  /// \param a2b token mapping from A indices to B indices (LCS-derived), with
-  ///        -1 for deletions.
-  /// \return true iff every occurrence of argIdx in the macro’s B expansion
-  ///         matches newArg (directly or via unstringification); false
-  ///         otherwise.
+  /// **Stringification handling:** if the B slice looks like a string literal,
+  /// the method attempts to invert stringification (unstringify) and compare
+  /// the resulting text against `newArg`. Additionally, if `argIdx` is listed
+  /// in `stringifyParams`, then a mismatching string-literal occurrence does
+  /// *not* automatically reject args-only: the B stream may contain a stale
+  /// diagnostic string (e.g., `assert`) that is intentionally not kept in sync
+  /// with the rewritten invocation argument. In that case, agreement on the
+  /// unstringified / non-literal occurrences is treated as sufficient.
+  ///
+  /// **Conservatism:** if required metadata is missing (e.g., `m.argSpans` not
+  /// present), the method returns `true` (vacuously satisfied) rather than
+  /// forcing expansion. If an occurrence cannot be located in B or a
+  /// non-stringified occurrence disagrees with `newArg`, it returns `false`.
+  ///
+  /// \param m Macro invocation being patched (provides cover/body/arg-span
+  ///          metadata).
+  /// \param argIdx Zero-based formal parameter index to validate.
+  /// \param newArg Candidate invocation-site argument text after refolding.
+  /// \param a2b Token mapping from A token indices to B token indices; -1
+  ///            indicates deletion in B.
+  /// \param stringifyParams Set of formal parameter indices that are
+  ///                        stringified somewhere in the macro body (may be
+  ///                        null and treated as empty).
+  /// \returns `true` iff every occurrence of `argIdx` in the macro's B
+  ///          expansion matches `newArg` (directly or via unstringification),
+  ///          allowing mismatching string-literal occurrences when `argIdx` is
+  ///          stringified; `false` otherwise.
   bool MacroArgReplacementMatchesAllOccurrencesInB(
       const RefoldModel::MacroInvocation &m, int argIdx, StringRef newArg,
-      ArrayRef<int> a2b) const;
+      ArrayRef<int> a2b, const DenseSet<int> &stringifyParams) const;
 
   /// \brief Attempts to build a `MacroPatch` by reconciling edits strictly
   /// within the arguments of a function-like macro invocation, rather than
@@ -1588,82 +1601,82 @@ private:
   FindHeaderDeclForPatch(const RefoldModel::IncludeItem &inc,
                          const IncludePatch &p);
 
-  /// \brief Applies the IncludeEdits for a single include instance to that
-  /// header's in-memory text.
+  /// \brief Computes (but does not apply) the header-local `TextEdit`s implied
+  /// by `ie`.
   ///
-  /// This method consumes a list of IncludePatches whose coordinates are
-  /// expressed in the A-side token (PP) index space and projects them onto \p
-  /// headerText using the refold map token->file/byte mappings in
-  /// RefoldModel::tokmapByPP.
+  /// `IncludePatch` coordinates are expressed in A-side preprocessed (PP) token
+  /// indices. This routine projects those token ranges onto `headerText` using
+  /// the refold map token→(file, byte-span) mapping in
+  /// `RefoldModel::tokmapByPP`.
   ///
-  /// \par Patch classification
+  /// The returned edits use byte offsets into `headerText` and are sorted in
+  /// descending `start` order so a caller can apply them without re-mapping
+  /// subsequent offsets.
   ///
-  /// - **INSERT**: \c aStart == \c aEnd and \c bStart < \c bEnd. The patch
-  ///   inserts IncludePatch::insertBytes at a deterministic byte anchor inside
-  ///   this header.
-  /// - **DELETE**: \c aStart < \c aEnd and \c bStart == \c bEnd. The patch
-  ///   deletes the mapped A-range (replacement is "").
-  /// - **REPLACE**: \c aStart < \c aEnd and \c bStart < \c bEnd. The patch
-  ///   replaces the mapped A-range with IncludePatch::insertBytes.
+  /// ### Patch classification
   ///
-  /// \par Scope and clamping rules
+  /// - **INSERT**: `aStart == aEnd` and `bStart < bEnd`. Inserts
+  ///   `IncludePatch::insertBytes` at a deterministic byte anchor inside this
+  ///   header.
+  /// - **DELETE**: `aStart < aEnd` and `bStart == bEnd`. Deletes the mapped
+  ///   A-range (replacement is `""`).
+  /// - **REPLACE**: `aStart < aEnd` and `bStart < bEnd`. Replaces the mapped
+  ///   A-range with `IncludePatch::insertBytes`.
   ///
-  /// - The include provides an overall PP "cover" window [coverBegin, coverEnd)
-  ///   describing the PP indices that belong to this header instance.
-  /// - Each patch is optionally associated with an owning HeaderDecl via
-  ///   findHeaderDeclForPatch().
+  /// ### Scope and clamping
+  ///
+  /// - The include instance contributes a PP “cover” window `[coverBegin,
+  ///   coverEnd)` describing which PP indices belong to this header instance.
+  /// - A patch may be associated with an owning `HeaderDecl` via
+  ///   `findHeaderDeclForPatch(...)`.
   /// - **DELETE/REPLACE** are restricted to the owning declaration when
-  ///   available: the effective PP window is intersected with \c decl.ppSpan,
-  ///   and the resulting byte range is clamped to [decl.headerB, decl.headerE)
-  ///   so the edit cannot cross declaration boundaries.
+  /// present:
+  ///   the patch’s effective PP window is intersected with `decl.ppSpan` and
+  ///   the resulting byte range is clamped to `[decl.headerB, decl.headerE)`.
   /// - **INSERT** intentionally operates at include scope (not decl scope) so
-  ///   that insertions that land exactly on a declaration boundary can anchor
-  ///   to the first token of the following declaration rather than being forced
-  ///   "back inside" the previous one.
+  ///   that an insertion on a declaration boundary can anchor to the first
+  ///   token of the following declaration instead of being forced “back inside”
+  ///   the previous one.
   ///
-  /// \par Deterministic anchoring for INSERT
+  /// ### Deterministic anchoring for INSERT
   ///
-  /// For an INSERT at A-position \c pos = \c aStart, the insertion byte offset
-  /// is chosen using the following priority order within the effective PP
-  /// window:
-  /// 1. **Right neighbor**: find the smallest \c pp >= \c pos mapping to this
-  ///    header's file and insert immediately *before* that token (use its byte-
-  ///    start).
-  /// 2. **Left neighbor**: otherwise find the greatest \c pp < \c pos mapping
-  ///    to this file and insert immediately *after* that token (use its byte-
-  ///    end).
-  /// 3. **Owning decl end**: otherwise, if an owning declaration exists, anchor
-  ///    at \c decl.headerE.
-  /// 4. **Child-include boundary fallback**: otherwise, attempt to synthesize a
-  ///    stable anchor using child \c #include sites within this header (via
-  ///    computeChildBoundaryInsertByte()), optionally padding with
-  ///    padAtBoundaries(). If no anchor can be found, the patch is skipped.
+  /// For an INSERT at A-position `pos = aStart`, the insertion byte offset is
+  /// chosen in the following priority order within the effective PP window:
+  /// 1. **Right neighbor**: smallest `pp >= pos` mapping to this header’s file;
+  ///    insert immediately *before* that token (use its byte-start).
+  /// 2. **Left neighbor**: greatest `pp < pos` mapping to this file; insert
+  ///    immediately *after* that token (use its byte-end).
+  /// 3. **Owning decl end**: if an owning decl exists, anchor at
+  ///    `decl.headerE`.
+  /// 4. **Child-include boundary fallback**: attempt to synthesize a stable
+  ///    anchor from child `#include` sites (via
+  ///    `computeChildBoundaryInsertByte(...)`). When this path is taken, the
+  ///    inserted text may be padded with `padAtBoundaries(...)`. If no anchor
+  ///    can be found, the patch is skipped.
   ///
-  /// \par Mapping for DELETE/REPLACE
+  /// ### Mapping for DELETE/REPLACE
   ///
-  /// For non-empty A-ranges, the method finds all PP indices in the patch's
+  /// For non-empty A-ranges, the method locates all PP indices in the patch’s
   /// (possibly intersected) effective window that map into this header file.
-  /// The resulting byte interval is computed as [byteStart(firstPP),
-  /// byteEnd(lastPP)). If no PP tokens map into this header, the patch is
-  /// skipped.
+  /// The resulting byte interval is `[byteStart(firstPP), byteEnd(lastPP))`. If
+  /// no PP tokens map into this header, the patch is skipped.
   ///
-  /// \par Application order and formatting policy
+  /// ### Formatting policy
   ///
-  /// - All projected header TextEdits are collected first and then applied in
-  ///   descending \c start order so earlier replacements do not invalidate
-  ///   later coordinates.
-  /// - Patch payload bytes are applied *literally*; this routine does not
-  ///   attempt any whitespace normalization, token reformatting, or
-  ///   "prefix surgery". The refold map's slices are treated as ground truth.
+  /// Replacement bytes are applied *literally*. This routine does not perform
+  /// whitespace normalization, token reformatting, or “prefix surgery”;
+  /// refold-map slices are treated as ground truth.
   ///
+  /// \param M Refold model providing PP token→(file, byte range) mappings and
+  ///          include/decl metadata.
   /// \param ie Per-include edits: the include instance plus a set of
-  ///           IncludePatches to apply.
-  /// \param headerText The current text of the header file corresponding to
-  ///                   \p ie.include.
-  /// \return The updated header text after applying all applicable include-
-  ///         scoped patches.
-  std::string ApplyIncludeEdits(const IncludeEdits &ie,
-                                std::string headerText) const;
+  ///           `IncludePatch`es.
+  /// \param headerText Current text of the header corresponding to
+  ///                   `ie.include`.
+  /// \returns Header-local `TextEdit`s (byte offsets into `headerText`), sorted
+  ///          by descending `start`.
+  std::vector<TextEdit> ComputeIncludeTextEdits(const IncludeEdits &ie,
+                                                std::string headerText) const;
 
   /// \brief Computes a deterministic insertion byte offset for a header-scoped
   /// *pure INSERT* when the normal token-based anchoring mechanisms provide no
