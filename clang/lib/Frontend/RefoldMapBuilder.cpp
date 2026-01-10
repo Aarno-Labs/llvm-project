@@ -47,8 +47,12 @@
 #include "clang/Lex/MacroArgs.h"
 #include "clang/Lex/Preprocessor.h"
 #include "clang/Lex/PreprocessorOptions.h"
+#include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/JSON.h"
+#include "llvm/Support/Path.h"
 
 #include <algorithm>
 #include <string>
@@ -418,7 +422,158 @@ std::string computeLangStr(const clang::LangOptions &Lang) {
   // Default
   return "c";
 }
+
+static void trimTrailingSeparators(llvm::SmallVectorImpl<char> &P) {
+  while (!P.empty() && llvm::sys::path::is_separator(P.back()))
+    P.pop_back();
+}
+
+std::string normalizePathKey(llvm::StringRef Path, llvm::StringRef Cwd,
+                             bool IsDir) {
+  if (Path.empty())
+    return std::string();
+
+  llvm::SmallString<256> P(Path);
+
+  // Make absolute using Cwd when provided; otherwise use process cwd.
+  if (llvm::sys::path::is_relative(P)) {
+    if (!Cwd.empty()) {
+      llvm::SmallString<256> Abs(Cwd);
+      llvm::sys::path::append(Abs, P);
+      P = Abs;
+    } else {
+      llvm::sys::fs::make_absolute(P);
+    }
+  }
+
+  // Normalize `.` / `..`
+  llvm::sys::path::remove_dots(P, /*remove_dot_dot=*/true);
+
+  // For directory keys, remove trailing separator to canonicalize.
+  if (IsDir)
+    trimTrailingSeparators(P);
+
+  // Prefer real_path when it exists (resolves symlinks); ignore errors.
+  llvm::SmallString<256> RP;
+  if (!llvm::sys::fs::real_path(P, RP)) {
+    if (IsDir)
+      trimTrailingSeparators(RP);
+    return RP.str().str();
+  }
+
+  return P.str().str();
+}
+
+std::string joinSpelled(llvm::StringRef DirSpelling,
+                               llvm::StringRef Rel) {
+  if (Rel.empty())
+    return std::string();
+
+  // If Rel is already absolute, keep it.
+  if (llvm::sys::path::is_absolute(Rel))
+    return Rel.str();
+
+  if (DirSpelling.empty())
+    return Rel.str();
+
+  std::string Out = DirSpelling.str();
+
+  // Preserve the include-dir spelling; just join with '/' if needed.
+  char last = Out.empty() ? '\0' : Out.back();
+  if (last != '/' && last != '\\')
+    Out.push_back('/');
+
+  Out.append(Rel.data(), Rel.size());
+  return Out;
+}
 } // namespace
+
+RefoldMapBuilder::RefoldMapBuilder(Preprocessor &PP, llvm::StringRef OutputPath)
+    : PP(PP), SM(PP.getSourceManager()), Lang(PP.getLangOpts()),
+      OutPath(OutputPath.str()) {
+  const auto &PPO = PP.getPreprocessorOpts();
+
+  // Prefer the driver-provided cwd spelling when available; fallback to process
+  // cwd.
+  Cwd = PPO.RefoldWorkingDir;
+  llvm::SmallString<256> WD;
+  if (!llvm::sys::fs::current_path(WD))
+    Cwd = WD.str().str();
+  else
+    Cwd = ".";
+
+  EmitAbsPaths = false; // Prefer spellings; the consumer can resolve via cwd.
+
+  // Parse include search spellings from the driver argv so we can reconstruct
+  // include paths relative to the *spelled* `-I` entries.
+  auto addIncludeDirSpelling = [&](llvm::StringRef DirSpelling) {
+    if (DirSpelling.empty())
+      return;
+
+    std::string AbsKey = normalizePathKey(DirSpelling, Cwd, /*IsDir=*/true);
+    if (!AbsKey.empty() &&
+        IncludeDirAbs2Spelling.find(AbsKey) == IncludeDirAbs2Spelling.end()) {
+      IncludeDirAbs2Spelling[AbsKey] = DirSpelling.str();
+    }
+  };
+
+  for (size_t i = 0; i < PPO.RefoldPPArgv.size(); ++i) {
+    llvm::StringRef A(PPO.RefoldPPArgv[i]);
+    if (A == "-I") {
+      if (i + 1 < PPO.RefoldPPArgv.size())
+        addIncludeDirSpelling(PPO.RefoldPPArgv[++i]);
+      continue;
+    }
+    if (A.starts_with("-I") && A.size() > 2) {
+      addIncludeDirSpelling(A.drop_front(2));
+      continue;
+    }
+  }
+
+  // Resolve the TU path spelling from the driver argv. We match by base name to
+  // avoid accidentally selecting an output file or other positional argument.
+  OptionalFileEntryRef MainFER = SM.getFileEntryRefForID(SM.getMainFileID());
+  std::string MainAbs;
+  llvm::StringRef MainBase;
+  if (MainFER) {
+    MainAbs = absolutePathFor(*MainFER);
+    MainBase = llvm::sys::path::filename(MainAbs);
+  }
+
+  // 1. Try to find the exact absolute path match in the arguments first.
+  // This ensures we get the full path if provided.
+  for (llvm::StringRef Arg : PPO.RefoldPPArgv) {
+    if (Arg == MainAbs) {
+      TUSourcePath = Arg.str();
+      break;
+    }
+  }
+
+  // 2. If no exact match, look for the argument that matches the filename.
+  if (TUSourcePath.empty()) {
+    for (llvm::StringRef Arg : PPO.RefoldPPArgv) {
+      if (Arg.empty() || Arg.starts_with("-"))
+        continue;
+
+      if (!MainBase.empty() && llvm::sys::path::filename(Arg) == MainBase) {
+        TUSourcePath = Arg.str();
+        break; // Stop at the first match
+      }
+    }
+  }
+
+  // 3. Fallback logic remains as a safety net...
+  if (TUSourcePath.empty()) {
+    TUSourcePath = !MainAbs.empty() ? MainAbs : MainBase.str();
+  }
+
+  // Seed the spelling map so token locations in the main file report the TU
+  // path spelling rather than an absolute canonical path.
+  if (!MainAbs.empty())
+    FileAbs2Spelling[MainAbs] = TUSourcePath;
+
+  IgnoreComments = true;
+}
 
 std::pair<long long, long long>
 RefoldMapBuilder::computeDirectiveLine(SourceLocation HashLoc) {
@@ -482,7 +637,15 @@ std::string RefoldMapBuilder::filePathForLocAbs(clang::SourceManager &SM,
 
   clang::FileID FID = SM.getFileID(L);
   if (auto FER = SM.getFileEntryRefForID(FID)) {
-    return WantAbs ? absolutePathFor(*FER) : std::string(FER->getName());
+    const std::string Abs = absolutePathFor(*FER);
+    if (WantAbs)
+      return Abs;
+
+    if (auto It = FileAbs2Spelling.find(Abs); It != FileAbs2Spelling.end())
+      return It->second;
+
+    // Fallback: use whatever name the file manager recorded.
+    return std::string(FER->getName());
   }
   return std::string();
 }
@@ -593,11 +756,10 @@ int RefoldMapBuilder::argIndexForSpellingLoc(const Item &MI, SourceLocation Loc,
   return -1;
 }
 
-void RefoldMapBuilder::onIncludeDirective(SourceLocation HashLoc,
-                                          const Token &IncludeTok,
-                                          StringRef FileName, bool IsAngled,
-                                          CharSourceRange FilenameRange,
-                                          OptionalFileEntryRef File) {
+void RefoldMapBuilder::onIncludeDirective(
+    SourceLocation HashLoc, const Token &IncludeTok, StringRef FileName,
+    bool IsAngled, CharSourceRange FilenameRange, OptionalFileEntryRef File,
+    StringRef SearchPath, StringRef RelativePath) {
   if (!enabled())
     return;
 
@@ -637,8 +799,31 @@ void RefoldMapBuilder::onIncludeDirective(SourceLocation HashLoc,
 
   // Resolved target path, when available
   if (File) {
-    It.ResolvedPath =
-        EmitAbsPaths ? absolutePathFor(*File) : std::string(File->getName());
+    const std::string Abs = absolutePathFor(*File);
+
+    std::string Spelled;
+    if (!RelativePath.empty()) {
+      const std::string SPKey =
+          normalizePathKey(SearchPath, Cwd, /*IsDir=*/true);
+      auto ItDir = IncludeDirAbs2Spelling.find(SPKey);
+
+      llvm::StringRef DirSpell = (ItDir != IncludeDirAbs2Spelling.end())
+                                     ? llvm::StringRef(ItDir->second)
+                                     : llvm::StringRef(SearchPath);
+
+      Spelled = joinSpelled(DirSpell, RelativePath);
+    } else {
+      // Fallback: Clang didn't provide a relative component; use whatever it
+      // recorded.
+      Spelled = std::string(File->getName());
+    }
+
+    // JSON should carry spellings by default; abs emission is optional.
+    It.ResolvedPath = EmitAbsPaths ? Abs : Spelled;
+
+    // Seed abs->spelling mapping for later __FILE__/__LINE__-style emission.
+    if (!Abs.empty() && !Spelled.empty())
+      FileAbs2Spelling[Abs] = Spelled;
   }
 
   Items.push_back(std::move(It));
@@ -1198,6 +1383,9 @@ void RefoldMapBuilder::writeJSON() {
     std::string CwdStr;
     if (!llvm::sys::fs::current_path(CWD))
       CwdStr = CWD.str().str();
+    llvm::SmallString<256> WD;
+    if (!llvm::sys::fs::current_path(WD))
+      CwdStr = WD.str().str();
 
     // Serailize the PP context of this clang instance
     JO.attributeObject("pp_ctx", [&] {
@@ -1209,7 +1397,7 @@ void RefoldMapBuilder::writeJSON() {
       JO.attribute("lang", LangStr);
     });
 
-    JO.attribute("source", TUAbsPath);
+    JO.attribute("source", TUSourcePath);
 
     // tokens...
     JO.attributeObject("tokens", [&] { JO.attribute("count", TokIndex); });
@@ -1240,7 +1428,7 @@ void RefoldMapBuilder::writeJSON() {
           }
 
           if (It.Kind == IK_File)
-            JO.attribute("path", TUAbsPath);
+            JO.attribute("path", TUSourcePath);
 
           // Emit site anchors for all directive kinds.
           if (It.Kind == IK_Directive) {
@@ -1597,7 +1785,7 @@ void RefoldMapBuilder::writeJSON() {
       };
 
       // 1) Main translation unit groups.
-      emitGroups(TUAbsPath, /*parentIncId=*/-1, /*isTU=*/true);
+      emitGroups(TUSourcePath, /*parentIncId=*/-1, /*isTU=*/true);
 
       // 2) Each include/include_next instance (per-instance, no dedup).
       for (const auto &It : Items) {
@@ -1683,13 +1871,13 @@ void RefoldMapBuilder::writeJSON() {
           unsigned ID = Diags.getCustomDiagID(
               clang::DiagnosticsEngine::Fatal,
               "[refold-map] TU buffer unavailable for '%0'");
-          Diags.Report(ID) << TUAbsPath;
+          Diags.Report(ID) << TUSourcePath;
         }
 
         long long after = computeAfterLastInclude(Buf);
-        emitPoint(TUAbsPath, 0, "file_begin");
-        emitPoint(TUAbsPath, (long long)size, "file_end");
-        emitPoint(TUAbsPath, after, "after_last_include");
+        emitPoint(TUSourcePath, 0, "file_begin");
+        emitPoint(TUSourcePath, (long long)size, "file_end");
+        emitPoint(TUSourcePath, after, "after_last_include");
       }
 
       // include before/after slots + file-level slots per included header

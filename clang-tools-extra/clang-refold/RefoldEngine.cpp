@@ -118,7 +118,8 @@ Expected<std::string>
 RefoldEngine::Refold(const json::Object &rootJson, StringRef aSource,
                      ArrayRef<PPTok> aToks, ArrayRef<std::size_t> aTokOff,
                      StringRef bSource, ArrayRef<PPTok> bToks,
-                     ArrayRef<std::size_t> bTokOff, bool onlyCheck) {
+                     ArrayRef<std::size_t> bTokOff, bool onlyCheck,
+                     bool noLines) {
   if (onlyCheck) {
     if (Error err = compareTokens(aToks, bToks))
       return std::move(err);
@@ -132,7 +133,7 @@ RefoldEngine::Refold(const json::Object &rootJson, StringRef aSource,
 
   // Construct an engine and run the instance pipeline.
   RefoldEngine engine(std::move(*mOrErr), aSource, aToks, aTokOff, bSource,
-                      bToks, bTokOff);
+                      bToks, bTokOff, noLines);
   return engine.Refold();
 }
 
@@ -154,10 +155,11 @@ std::string RefoldEngine::Refold() {
   // Read in the translation unit file / C source.
   std::string tuBytes;
   {
-    auto bufOrErr = MemoryBuffer::getFile(tuPath);
+    const auto fullTuPath = lineDirs_.ToAbsolutePath(tuPath);
+    auto bufOrErr = MemoryBuffer::getFile(fullTuPath);
     if (!bufOrErr) {
       // Fatal and stop: unreachable past this point.
-      fatal("src/load", "failed to read C source: {0} ({1})", tuPath,
+      fatal("src/load", "failed to read C source: {0} ({1})", fullTuPath,
             bufOrErr.getError().message());
     }
 
@@ -465,7 +467,10 @@ std::string RefoldEngine::Refold() {
               stringutils::showWS(stringutils::clip(repl, 160)),
               stringutils::showWS(stringutils::clip(padded, 160)));
 
-        tuEdits.push_back(TextEdit{span.first, span.second, std::move(padded)});
+        ResyncOutcome ro =
+            ApplyResyncOrPend(tuBytes, span.first, span.second, padded, tuPath);
+        tuEdits.push_back(TextEdit{span.first, span.second, std::move(ro.text),
+                                   std::move(ro.pending)});
         continue;
       } else {
         debug("classify",
@@ -629,7 +634,10 @@ std::string RefoldEngine::Refold() {
         accepted.push_back(mp);
         debug("macro/tu", "  TU macro patch accepted inv=[{0},{1}) replLen={2}",
               mp.invStart, mp.invEnd, mp.replacement.size());
-        tuEdits.push_back(TextEdit{mp.invStart, mp.invEnd, mp.replacement});
+        ResyncOutcome ro = ApplyResyncOrPend(tuBytes, mp.invStart, mp.invEnd,
+                                             mp.replacement, tuPath);
+        tuEdits.push_back(TextEdit{mp.invStart, mp.invEnd, std::move(ro.text),
+                                   std::move(ro.pending)});
       } else {
         trace("macro/tu", "  TU macro patch shadowed (skipped) inv=[{0},{1})",
               mp.invStart, mp.invEnd);
@@ -646,33 +654,20 @@ std::string RefoldEngine::Refold() {
     if (!inc->parent && PathsEqual(inc->sitePath, tuPath)) {
       debug("include/tu", "TU include expansion inc#{0} site=[{1},{2}) len={3}",
             inc->id, inc->siteB, inc->siteE, kv.second.size());
-      tuEdits.push_back(TextEdit{inc->siteB, inc->siteE, kv.second});
+      std::string headerPath = resolveHeaderPath(*inc);
+      std::string wrapped = lineDirs_.WrapIncludeExpansion(
+          headerPath, tuPath, stringutils::lineAtOffset(tuBytes, inc->siteE),
+          kv.second);
+      tuEdits.push_back(
+          TextEdit{inc->siteB, inc->siteE, std::move(wrapped), std::nullopt});
     }
   }
 
   // Apply TU edits in descending order of start offset.
-  std::sort(tuEdits.begin(), tuEdits.end(),
-            [](const auto &a, const auto &b) {
-              if (a.start != b.start)
-                return a.start > b.start;
-              return a.end > b.end;
-            });
   debug("tu/apply", "applying {0} TU edits", tuEdits.size());
-
-  std::string out(tuBytes);
-  for (const auto &e : tuEdits) {
-    if (e.start < 0 || e.end < e.start ||
-        e.end > static_cast<int>(out.size())) {
-      fatal("tu/edits", "bad TU edit bounds [{0},{1}) size={2}", e.start, e.end,
-            out.size());
-    }
-    trace("tu/apply", "TU edit bytes=[{0},{1}) len(text)={2}", e.start, e.end,
-          e.text.size());
-    out.replace(static_cast<std::size_t>(e.start),
-                static_cast<std::size_t>(e.end - e.start), e.text);
-  }
-  debug("plan", "REFOLD DONE tuResultLen={0}", out.length());
-  return out;
+  std::string tuResult = ApplyTextEditsWithPendingResync(tuBytes, tuEdits);
+  debug("plan", "REFOLD DONE tuResultLen={0}", tuResult.length());
+  return tuResult;
 }
 
 // ================== A ↔ B token mapping & diff utilities ===================
@@ -1156,7 +1151,7 @@ RefoldEngine::AnchorToNearestSlotBoundaryFromPPGap(StringRef tuPath,
   };
 
   // Read TU text for newline-aware slot adjustment
-  auto bufOrErr = MemoryBuffer::getFile(tuPath);
+  auto bufOrErr = MemoryBuffer::getFile(lineDirs_.ToAbsolutePath(tuPath));
   if (!bufOrErr) {
     fatal("slot/anchor", "unable to read TU: {0}", tuPath);
     // Should be unreachable!
@@ -2033,34 +2028,35 @@ std::optional<std::pair<int, int>>
 RefoldEngine::MacroCoverTokenEnvelopeInB(const RefoldModel::MacroInvocation &m,
                                          const diffutils::Hunk &h,
                                          ArrayRef<int> a2b) const {
-  // Map the macro's A-stream cover boundaries into the B-stream
   int bStartIdx = MapForwardToB(a2b, m.cover.begin);
-  int bEndIdxEx = MapBackwardToB(a2b, m.cover.end - 1);
+  int bEndIdxIn = MapBackwardToB(a2b, m.cover.end - 1);
 
-  // If mapping fails (e.g. tokens deleted), fallback to hunk boundaries
+  // Fallback to hunk boundaries when mapping fails (e.g., tokens deleted).
   if (bStartIdx < 0)
     bStartIdx = h.bStart;
-  if (bEndIdxEx < 0 && h.bEnd > 0)
-    bEndIdxEx = h.bEnd - 1;
+  if (bEndIdxIn < 0 && h.bEnd > 0)
+    bEndIdxIn = h.bEnd - 1;
 
-  // Validate the initial anchors
-  if (bStartIdx < 0 || bEndIdxEx < 0 || bStartIdx > bEndIdxEx)
+  // Validate initial anchors.
+  if (bStartIdx < 0 || bEndIdxIn < 0 || bStartIdx > bEndIdxIn)
     return std::nullopt;
 
   // Convert inclusive end index to exclusive boundary: [lo, hi)
   int lo = bStartIdx;
-  int hi = bEndIdxEx + 1;
+  int hi = bEndIdxIn + 1;
 
-  // Expand the envelope to include the hunk's own B-range
+  // Expand to include the hunk's own B-range (h.bEnd is already exclusive).
   if (h.bStart >= 0)
     lo = std::min(lo, h.bStart);
   if (h.bEnd >= 0)
     hi = std::max(hi, h.bEnd);
 
-  // Final safety clamping against token offset array boundaries.
   const int n = static_cast<int>(bTokOff_.size());
-  lo = std::clamp(lo, 0, std::max(0, n - 2));
-  hi = std::clamp(hi, lo, std::max(lo, n - 1));
+  if (n < 2)
+    return std::nullopt;
+
+  lo = std::clamp(lo, 0, n - 2);
+  hi = std::clamp(hi, lo, n - 1);
 
   return std::make_pair(lo, hi);
 }
@@ -2292,18 +2288,23 @@ RefoldEngine::BuildIncludeInsertionPatch(const RefoldModel::IncludeItem &inc,
 
   std::string insertBytes;
 
-  // Validate hunk bounds against B-token offsets
+  // Validate hunk bounds against B-token offsets.
   if (h.bStart >= 0 && static_cast<size_t>(h.bStart) < bTokOff_.size() &&
-      h.bEnd >= 0 && static_cast<size_t>(h.bEnd) <= bTokOff_.size() &&
+      h.bEnd >= 0 && static_cast<size_t>(h.bEnd) < bTokOff_.size() &&
       h.bEnd >= h.bStart) {
-
     int b0 = bTokOff_[h.bStart];
     int b1 = bTokOff_[h.bEnd];
 
-    // Clamp byte offsets to the actual length of bSource_
+    // Clamp byte offsets to the actual length of bSource_ (defensively handle
+    // huge sizes).
     const size_t sourceLen = bSource_.size();
-    b0 = std::max(0, std::min(b0, static_cast<int>(sourceLen)));
-    b1 = std::max(0, std::min(b1, static_cast<int>(sourceLen)));
+    const int maxLen =
+        (sourceLen > static_cast<size_t>(std::numeric_limits<int>::max()))
+            ? std::numeric_limits<int>::max()
+            : static_cast<int>(sourceLen);
+
+    b0 = std::clamp(b0, 0, maxLen);
+    b1 = std::clamp(b1, 0, maxLen);
 
     if (b1 >= b0) {
       insertBytes = bSource_.substr(b0, b1 - b0).str();
@@ -2421,17 +2422,17 @@ RefoldEngine::MacroPatch RefoldEngine::BuildMacroInvocationPatchWholeCover(
   int covLo = bStartIdx;
   int covHi = bEndIdxEx + 1;
 
-  // Ensure the B envelope includes the edited region, even when the A->B mapping
-  // drops mismatching tokens (e.g. edited stringified literals).
+  // Ensure the B envelope includes the edited region, even when the A->B
+  // mapping drops mismatching tokens (e.g. edited stringified literals).
   if (h.bStart >= 0 && h.bEnd >= h.bStart) {
     covLo = std::min(covLo, h.bStart);
     covHi = std::max(covHi, h.bEnd);
   }
 
   // Clamp indices to valid token offset ranges
-  const int maxTok = static_cast<int>(bTokOff_.size()) - 1;
-  covLo = std::max(0, std::min(covLo, maxTok - 1));
-  covHi = std::max(covLo, std::min(covHi, maxTok));
+  const int n = static_cast<int>(bTokOff_.size());
+  covLo = std::clamp(covLo, 0, std::max(0, n - 2));
+  covHi = std::clamp(covHi, covLo, std::max(covLo, n - 1));
 
   // Determine a "Strict" envelope: tokens that are definitively part of the
   // expansion.
@@ -2445,8 +2446,8 @@ RefoldEngine::MacroPatch RefoldEngine::BuildMacroInvocationPatchWholeCover(
       aLo = iLo;
   }
 
-  aLo = std::max(0, std::min(aLo, maxTok - 1));
-  aHi = std::max(aLo, std::min(aHi, maxTok));
+  aLo = std::clamp(aLo, 0, std::max(0, n - 2));
+  aHi = std::clamp(aHi, aLo, std::max(aLo, n - 1));
   size_t byteLoA = bTokOff_[aLo];
   size_t byteHiA = bTokOff_[aHi];
   StringRef candA = stringutils::trimEdgeSpaces(
@@ -2463,8 +2464,8 @@ RefoldEngine::MacroPatch RefoldEngine::BuildMacroInvocationPatchWholeCover(
     bHiTok = std::max(aHi, envAllHi);
   }
 
-  bLoTok = std::max(0, std::min(bLoTok, maxTok - 1));
-  bHiTok = std::max(bLoTok, std::min(bHiTok, maxTok));
+  bLoTok = std::clamp(bLoTok, 0, std::max(0, n - 2));
+  bHiTok = std::clamp(bHiTok, bLoTok, std::max(bLoTok, n - 1));
   size_t byteLoB = bTokOff_[bLoTok];
   size_t byteHiB = bTokOff_[bHiTok];
   StringRef candB = stringutils::trimEdgeSpaces(
@@ -2551,15 +2552,15 @@ void RefoldEngine::MaterializeIncludeExpansion(
         inc->id, inc->target, inc->resolvedPath, inc->sitePath, inc->siteB,
         inc->siteE, inc->cover.begin, inc->cover.end);
 
+  const std::string headerPath = resolveHeaderPath(*inc);
+
   // Start from the raw header text that was preloaded into includeExpansion.
   // If it wasn’t preseeded for some reason, load deterministically by path.
   std::string bytes;
   if (auto it = includeExpansion.find(includeId); it != includeExpansion.end())
     bytes = it->second;
   if (bytes.empty()) {
-    const std::string headerPath = resolveHeaderPath(*inc);
-
-    auto bufOrErr = MemoryBuffer::getFile(headerPath);
+    auto bufOrErr = MemoryBuffer::getFile(lineDirs_.ToAbsolutePath(headerPath));
     if (!bufOrErr) {
       fatal("include/mat", "failed to read header: {0} ({1})", headerPath,
             bufOrErr.getError().message());
@@ -2594,7 +2595,10 @@ void RefoldEngine::MaterializeIncludeExpansion(
     for (const auto &mp : it->second) {
       debug("include/mat", "inc#{0} macroPatch inv=[{1},{2}) replLen={3}",
             inc->id, mp.invStart, mp.invEnd, mp.replacement.size());
-      edits.push_back(TextEdit{mp.invStart, mp.invEnd, mp.replacement});
+      ResyncOutcome ro = ApplyResyncOrPend(bytes, mp.invStart, mp.invEnd,
+                                           mp.replacement, headerPath);
+      edits.push_back(TextEdit{mp.invStart, mp.invEnd, std::move(ro.text),
+                               std::move(ro.pending)});
     }
   }
 
@@ -2604,7 +2608,12 @@ void RefoldEngine::MaterializeIncludeExpansion(
       debug("include/mat", "inc#{0} adding {1} include patches as TextEdits",
             inc->id, it->second.patches.size());
       auto moreEdits = ComputeIncludeTextEdits(it->second, bytes);
-      append_range(edits, moreEdits);
+      for (auto &te : moreEdits) {
+        ResyncOutcome ro =
+            ApplyResyncOrPend(bytes, te.start, te.end, te.text, headerPath);
+        edits.push_back(TextEdit{te.start, te.end, std::move(ro.text),
+                                 std::move(ro.pending)});
+      }
     } else {
       debug("include/mat", "inc#{0} has no include patches", inc->id);
     }
@@ -2663,10 +2672,9 @@ void RefoldEngine::MaterializeIncludeExpansion(
 
       // The child directive's site is recorded in the includer byte space.
       const auto &childText = includeExpansion[child->id];
-      int siteStart =
-          std::max(0, std::min(static_cast<int>(bytes.size()), child->siteB));
-      int siteEnd = std::max(
-          siteStart, std::min(static_cast<int>(bytes.size()), child->siteE));
+      const int n = static_cast<int>(bytes.size());
+      const int siteStart = std::clamp(static_cast<int>(child->siteB), 0, n);
+      const int siteEnd = std::clamp(static_cast<int>(child->siteE), siteStart, n);
 
       debug("include/mat",
             "REPLACE in inc#{0}: site=[{1},{2}) len(parent)={3} with child#{4} "
@@ -2681,7 +2689,12 @@ void RefoldEngine::MaterializeIncludeExpansion(
             child->resolvedPath);
 
       if (siteStart < siteEnd) {
-        edits.push_back(TextEdit{siteStart, siteEnd, childText});
+        std::string childHeaderPath = resolveHeaderPath(*child);
+        std::string wrapped = lineDirs_.WrapIncludeExpansion(
+            childHeaderPath, headerPath,
+            stringutils::lineAtOffset(bytes, child->siteE), childText);
+        edits.push_back(
+            TextEdit{siteStart, siteEnd, std::move(wrapped), std::nullopt});
       } else {
         // Defensive fallback: if site is somehow unmapped, skip replacing.
         // (This keeps behavior deterministic instead of crashing.)
@@ -2693,32 +2706,12 @@ void RefoldEngine::MaterializeIncludeExpansion(
     }
   }
 
-  // Apply highest-offset-first.
-  std::sort(edits.begin(), edits.end(),
-            [](const TextEdit &a, const TextEdit &b) {
-              if (a.start != b.start) {
-                return a.start > b.start;
-              }
-              return a.end > b.end;
-            });
   debug("include/mat", "inc#{0} applying {1} header TextEdits", inc->id,
         edits.size());
-
-  for (const auto &e : edits) {
-    if (e.start < 0 || e.end < e.start ||
-        e.end > static_cast<int>(bytes.size())) {
-      fatal("inc/mat", "bad include edit [{0},{1})", e.start, e.end);
-    }
-    trace("include/mat",
-          "inc#{0} header TextEdit bytes=[{1},{2}) replLen={3}",
-          inc->id, e.start, e.end, e.text.size());
-    bytes.replace(static_cast<std::size_t>(e.start),
-                  static_cast<std::size_t>(e.end - e.start), e.text);
-  }
-
-  includeExpansion[includeId] = std::move(bytes);
-
-  debug("include/mat", "EXIT inc#{0} resultLen={1}", inc->id, bytes.size());
+  std::string applied = ApplyTextEditsWithPendingResync(bytes, edits);
+  includeExpansion[includeId] = std::move(applied);
+  debug("include/mat", "EXIT inc#{0} resultLen={1}", inc->id,
+        includeExpansion[includeId].size());
 }
 
 const RefoldModel::HeaderDecl *
@@ -2910,7 +2903,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                 PadAtBoundaries(headerText, static_cast<size_t>(insertByte),
                                 static_cast<size_t>(insertByte), p.insertBytes,
                                 /* allowLeft */ true, /* allowRight */ true);
-            edits.push_back({insertByte, insertByte, std::move(text)});
+            edits.push_back(MakeTextEditWithResyncOrPending(
+                headerText, insertByte, insertByte, text, file));
 
             debug("include/apply.",
                   "file={0} patch[{1}] INSERT: anchored via child boundary at "
@@ -3024,7 +3018,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
             stringutils::showWS(replDbg));
     }
 
-    edits.push_back({startByte, endByte, std::move(replacement)});
+    edits.push_back(MakeTextEditWithResyncOrPending(
+          headerText, startByte, endByte, replacement, file));
   }
 
   // Apply all edits inside this header, highest offset first so earlier edits
@@ -3112,6 +3107,190 @@ int RefoldEngine::ComputeChildBoundaryInsertByte(const IncludePatch &p,
   }
 
   return -1;
+}
+
+RefoldEngine::ResyncOutcome
+RefoldEngine::ApplyResyncOrPend(StringRef originalFileText, int start, int end,
+                                StringRef replacement,
+                                StringRef fileSpellingForDirective) const {
+  int origNl = stringutils::countNewlines(originalFileText, start, end);
+  int replNl = stringutils::countNewlines(replacement, 0,
+                                          static_cast<int>(replacement.size()));
+  if (origNl == replNl)
+    return ResyncOutcome(replacement.str(), std::nullopt);
+
+  // Drift detected: decide whether to inject a local `#line` or defer.
+  int resumeLine = stringutils::lineAtOffset(originalFileText, end);
+  trace("linedir/resync",
+        "drift: span=[{0},{1}) origNl={2} replNl={3} resumeLine={4} file={5} "
+        "replTail={6}",
+        start, end, origNl, replNl, resumeLine, fileSpellingForDirective,
+        stringutils::showWS(stringutils::clip(replacement, 100)));
+
+  // Attempt local injection first.
+  std::string injected = lineDirs_.MaybeAppendResyncAfterReplacement(
+      originalFileText, start, end, replacement, fileSpellingForDirective);
+
+  // If the returned string changed, injection succeeded.
+  if (injected != replacement) {
+    trace("linedir/resync", "local inject succeeded: resumeLine={0} file={1}",
+          resumeLine, fileSpellingForDirective);
+    return ResyncOutcome(std::move(injected), std::nullopt);
+  }
+
+  trace("linedir/resync",
+        "local inject failed -> PENDING: resumeLine={0} file={1}", resumeLine,
+        fileSpellingForDirective);
+
+  return ResyncOutcome{replacement.str(),
+                       PendingResync{fileSpellingForDirective}};
+}
+
+std::string
+RefoldEngine::ApplyTextEditsWithPendingResync(StringRef originalFileText,
+                                              ArrayRef<TextEdit> edits) const {
+  if (edits.empty())
+    return originalFileText.str();
+
+  DenseMap<std::pair<int, int>, const TextEdit *> bySpan;
+  for (const auto &e : edits) {
+    bySpan[{e.start, e.end}] = &e;
+  }
+
+  // Use SmallVector for the normalized list to stay on the stack if possible.
+  auto values = llvm::make_second_range(bySpan);
+  SmallVector<const TextEdit *, 32> norm(values.begin(), values.end());
+
+  sort(norm, [](const TextEdit *a, const TextEdit *b) {
+    if (a->start != b->start)
+      return a->start < b->start;
+    return a->end < b->end;
+  });
+
+  // Use SmallString for the output buffer to optimize small file edits.
+  SmallString<0> out;
+  out.reserve(originalFileText.size() + 128);
+  std::optional<PendingResync> pending = std::nullopt;
+
+  int cursor = 0;
+  int n = static_cast<int>(originalFileText.size());
+
+  for (const auto *e : norm) {
+    if (e->start < 0 || e->end < e->start || e->end > n) {
+      fatal("edits/apply", "bad edit bounds [{0},{1}) fileLen={2}", e->start,
+            e->end, n);
+    }
+    if (e->start < cursor) {
+      fatal("edits/apply", "overlapping edits: cursor={0} nextStart={1}",
+            cursor, e->start);
+    }
+
+    // Pass the SmallString to the appender.
+    pending = AppendOriginalSliceWithPending(out, originalFileText, cursor,
+                                             e->start, std::move(pending));
+
+    out.append(e->text);
+
+    if (e->pending) {
+      pending = e->pending;
+    }
+
+    cursor = e->end;
+  }
+
+  pending = AppendOriginalSliceWithPending(out, originalFileText, cursor, n,
+                                           std::move(pending));
+
+  return std::string(out.str());
+}
+
+std::optional<RefoldEngine::PendingResync>
+RefoldEngine::AppendOriginalSliceWithPending(
+    SmallVectorImpl<char> &out, llvm::StringRef original, int from, int to,
+    std::optional<RefoldEngine::PendingResync> pending) const {
+  if (!pending || !lineDirs_.Enabled()) {
+    auto slice = original.slice(from, to);
+    out.append(slice.begin(), slice.end());
+    return std::nullopt;
+  }
+
+  int i = from;
+
+  // Only flush immediately if BOTH:
+  // (1) output is at BOL, and
+  // (2) the next original slice begins at BOL in the original file
+  if (stringutils::outAtBOL(StringRef(out.data(), out.size())) &&
+      stringutils::isBOL(original, from)) {
+
+    int line = stringutils::lineAtOffset(original, from);
+    std::string directive =
+        lineDirs_.FormatLineDirective(line, pending->fileSpellingForDir);
+
+    // Create a view of the current buffer for the check
+    StringRef currentOut(out.data(), out.size());
+
+    if (LineDirectiveInserter::ShouldEmitLineDirective(
+            currentOut, pending->fileSpellingForDir, line, directive)) {
+      trace("line/pending",
+            "flush@slice-begin file={0} line={1} (pending) outTail={2}",
+            pending->fileSpellingForDir, line,
+            stringutils::dbgOutTail(currentOut));
+      out.append(directive.begin(), directive.end());
+    } else {
+      trace("line/pending",
+            "SKIP flush@slice-begin (no-op) file={0} line={1} outTail={2}",
+            pending->fileSpellingForDir, line,
+            stringutils::dbgOutTail(currentOut));
+    }
+
+    auto slice = original.slice(from, to);
+    out.append(slice.begin(), slice.end());
+    return std::nullopt;
+  }
+
+  // Otherwise, scan forward for the first safe newline boundary (not
+  // line-spliced).
+  while (i < to) {
+    size_t nl = original.find('\n', i);
+    if (nl == llvm::StringRef::npos || static_cast<int>(nl) >= to)
+      break;
+
+    int nlIdx = static_cast<int>(nl);
+    auto slice = original.slice(i, nlIdx + 1);
+    out.append(slice.begin(), slice.end());
+
+    // Update our view of the output after appending the newline
+    StringRef currentOut(out.data(), out.size());
+    i = nlIdx + 1;
+
+    if (!stringutils::isLineSplice(original, nlIdx)) {
+      int line = stringutils::lineAtOffset(original, i);
+      std::string directive =
+          lineDirs_.FormatLineDirective(line, pending->fileSpellingForDir);
+
+      if (LineDirectiveInserter::ShouldEmitLineDirective(
+              currentOut, pending->fileSpellingForDir, line, directive)) {
+        trace("line/pending",
+              "flush@safe-nl file={0} line={1} atOrig={2} outTail={3}",
+              pending->fileSpellingForDir, line, i,
+              stringutils::dbgOutTail(currentOut));
+        out.append(directive.begin(), directive.end());
+      } else {
+        trace("line/pending",
+              "SKIP flush@safe-nl (no-op) file={0} line={1} atOrig={2} "
+              "outTail={3}",
+              pending->fileSpellingForDir, line, i,
+              stringutils::dbgOutTail(currentOut));
+      }
+
+      pending = std::nullopt;
+      break;
+    }
+  }
+
+  auto remaining = original.slice(i, to);
+  out.append(remaining.begin(), remaining.end());
+  return pending;
 }
 
 // ==================== Low-level file & mapping utilities =====================

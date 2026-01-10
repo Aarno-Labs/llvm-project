@@ -138,7 +138,8 @@ def main():
 
   # 3) Run clang-refold
   clang_refold_cmd = (
-      f'{shlex.quote(args.refolder)} --log-level={shlex.quote(args.log)} '
+      f'{shlex.quote(args.refolder)} --no-lines '
+      f'--log-level={shlex.quote(args.log)} '
       f'--pp {shlex.quote(out_i)} '
       f'--pp-mod {shlex.quote(exp_i_mod)} '
       f'--refold-map {shlex.quote(out_json)} '

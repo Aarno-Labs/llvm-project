@@ -215,8 +215,15 @@ class RefoldMapBuilder {
   std::vector<TokMapEntry> TokMap;
 
   std::string OutPath;
-  std::string TUAbsPath; // Canonical absolute path of TU (for JSON 'source')
-  bool EmitAbsPaths = false; // Should we emit absolute paths?
+  std::string Cwd; // Captured working directory (for resolving relative spellings)
+
+  std::string TUSourcePath;   // TU path spelling (for JSON 'source')
+  bool EmitAbsPaths = false;  // If true, emit canonical absolute paths
+
+  /// Map resolved absolute include directories -> original `-I` spellings.
+  llvm::StringMap<std::string> IncludeDirAbs2Spelling;
+  /// Map resolved absolute file paths -> chosen spelling (TU/header).
+  llvm::StringMap<std::string> FileAbs2Spelling;
 
   /// Compute the byte interval for a directive’s *entire line*.
   ///
@@ -244,14 +251,14 @@ class RefoldMapBuilder {
   /// best-effort path as managed by the `SourceManager`.
   ///
   /// \returns a path string appropriate for emission.
-  static std::string filePathForLocAbs(clang::SourceManager &SM,
-                                       clang::SourceLocation L, bool WantAbs);
+  std::string filePathForLocAbs(clang::SourceManager &SM,
+                                clang::SourceLocation L, bool WantAbs);
 
   // Maps a macro-expanded token’s spelling location back to the invocation-site
   // argument index (0..N-1). Returns -1 if unknown / not in invocation file.
-  static int argIndexForSpellingLoc(const Item &MI, SourceLocation Loc,
-                                    SourceManager &SM, const LangOptions &Lang,
-                                    bool EmitAbsPaths);
+  int argIndexForSpellingLoc(const Item &MI, SourceLocation Loc,
+                             SourceManager &SM, const LangOptions &Lang,
+                             bool EmitAbsPaths);
 
   void addHeaderDecl(Item &Inc, StringRef Kind, StringRef Name,
                      StringRef HeaderFile, unsigned HeaderB,
@@ -277,27 +284,20 @@ class RefoldMapBuilder {
 public:
   /// Construct a builder bound to a preprocessor and an output path.
   ///
-  /// If the main file entry is available, the TU path is captured as a
-  /// canonical absolute path and `EmitAbsPaths` is enabled. If the TU entry is
-  /// missing, a fatal diagnostic is issued (the builder cannot operate).
+  /// This builder records *spelled* paths (verbatim spellings) rather than
+  /// canonicalized paths:
+  ///   - the TU path spelling is taken from the command line (argv) and written
+  ///     to JSON `source`,
+  ///   - include file spellings are derived from the include search directory
+  ///     spelling (e.g. `-I ./headers`) combined with Clang’s provided
+  ///     `RelativePath` (yielding e.g. `./headers/bob.h`).
+  ///
+  /// When a spelling is relative, it is interpreted relative to `pp_ctx.cwd`.
   ///
   /// \param PP      Preprocessor to observe (tokens, directives, nesting).
   /// \param OutPath Destination file path for JSON output; when empty,
   ///                the builder is effectively disabled (no-ops).
-  RefoldMapBuilder(Preprocessor &PP, std::string OutPath)
-      : PP(PP), SM(PP.getSourceManager()), Lang(PP.getLangOpts()),
-        IgnoreComments(!(PP.getCommentRetentionState())),
-        OutPath(std::move(OutPath)) {
-    if (auto FER = SM.getFileEntryRefForID(SM.getMainFileID())) {
-      EmitAbsPaths = true;
-      TUAbsPath = absolutePathFor(*FER);
-    } else {
-      auto &Diags = PP.getDiagnostics();
-      unsigned ID = Diags.getCustomDiagID(clang::DiagnosticsEngine::Fatal,
-                                          "[refold-map] no main TU file entry");
-      Diags.Report(ID);
-    }
-  }
+  RefoldMapBuilder(Preprocessor &PP, StringRef OutPath);
 
   /// Extend (or open) the current contiguous token span for an item.
   ///
@@ -341,7 +341,8 @@ public:
   void onIncludeDirective(SourceLocation HashLoc, const Token &IncludeTok,
                           StringRef FileName, bool IsAngled,
                           CharSourceRange FilenameRange,
-                          OptionalFileEntryRef File);
+                          OptionalFileEntryRef File, StringRef SearchPath,
+                          StringRef RelativePath);
 
   /// Callback for `#define`.
   ///

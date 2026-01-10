@@ -1032,9 +1032,10 @@ void clang::DoPrintPreprocessedInput(Preprocessor &PP, raw_ostream *OS,
                               OptionalFileEntryRef File, StringRef SearchPath,
                               StringRef RelativePath, const Module *Imported,
                               SrcMgr::CharacteristicKind FileType) override {
-        R->onIncludeDirective(HashLoc, IncludeTok, FileName, IsAngled,
-                             FilenameRange, File);
+          R->onIncludeDirective(HashLoc, IncludeTok, FileName, IsAngled,
+            FilenameRange, File, SearchPath, RelativePath);
       }
+
       void MacroDefined(const Token &MacroNameTok,
                         const MacroDirective *MD) override {
         R->onMacroDefined(MacroNameTok, MD);

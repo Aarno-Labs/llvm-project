@@ -52,6 +52,7 @@
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDENGINE_H
 
 #include "DiffAlgorithms.h"
+#include "LineDirectiveInserter.h"
 #include "RefoldModel.h"
 #include "StringUtils.h"
 #include "llvm/ADT/ArrayRef.h"
@@ -190,33 +191,56 @@ public:
   /// \param bTokOff    Byte offsets for B tokens (size = |B| + 1).
   /// \param onlyCheck  If true, then we should only verify that \c aToks and
   ///                   \c bToks align.
+  /// \param noLines    If true, then do not inject #line
   /// \returns          The refolded, partially expanded C source.
   static Expected<std::string>
   Refold(const json::Object &rootJson, StringRef aSource, ArrayRef<PPTok> aToks,
          ArrayRef<std::size_t> aTokOff, StringRef bSource,
-         ArrayRef<PPTok> bToks, ArrayRef<std::size_t> bTokOff, bool onlyCheck);
+         ArrayRef<PPTok> bToks, ArrayRef<std::size_t> bTokOff, bool onlyCheck,
+         bool noLines);
 
 private:
   const RefoldModel model_;
   StringRef aSource_, bSource_;
   ArrayRef<PPTok> aToks_, bToks_;
   ArrayRef<std::size_t> aTokOff_, bTokOff_;
+  LineDirectiveInserter lineDirs_;
 
   /// Construct an engine from concrete inputs. The instance method `Refold()`
   /// runs the full pipeline using these captured members.
   RefoldEngine(RefoldModel model, StringRef aSource, ArrayRef<PPTok> aToks,
                ArrayRef<std::size_t> aTokOff, StringRef bSource,
-               ArrayRef<PPTok> bToks, ArrayRef<std::size_t> bTokOff)
+               ArrayRef<PPTok> bToks, ArrayRef<std::size_t> bTokOff,
+               bool noLines)
       : model_(std::move(model)), aSource_(aSource), bSource_(bSource),
-        aToks_(aToks), bToks_(bToks), aTokOff_(aTokOff), bTokOff_(bTokOff) {}
+        aToks_(aToks), bToks_(bToks), aTokOff_(aTokOff), bTokOff_(bTokOff),
+        lineDirs_(!noLines, model_.GetPPCwd()) {}
 
   std::string Refold();
 
   // ---------------------------- Small Data Records ---------------------------
 
+  /// Represents a pending resync that must be flushed at the next safe BOL.
+  struct PendingResync {
+    std::string fileSpellingForDir;
+
+    explicit PendingResync(llvm::StringRef file)
+        : fileSpellingForDir(file.str()) {}
+  };
+
+  /// The final text and optional pending state for an edit.
+  struct ResyncOutcome {
+    std::string text;
+    std::optional<PendingResync> pending;
+
+    ResyncOutcome(std::string t, std::optional<PendingResync> p)
+        : text(std::move(t)), pending(std::move(p)) {}
+  };
+
   struct TextEdit {
     int start, end;
     std::string text;
+    std::optional<PendingResync> pending;
   };
 
   struct MacroPatch {
@@ -467,25 +491,44 @@ private:
                                      std::string text, bool allowLeft,
                                      bool allowRight);
 
-  /// \brief Compute the "owner depth gap" array used to bias the weighted LCS.
+  /// \brief Computes an "owner depth gap" array used to bias the weighted LCS
+  /// anchoring for insertions.
   ///
-  /// For each PP gap k (between PP tokens k-1 and k), we compute:
+  /// The refolder frequently chooses insertion positions by aligning PP token
+  /// sequences. For insertions (gaps between tokens), we want to prefer
+  /// positions that remain inside the correct *owner* region (nested includes
+  /// and nested #if/#else arms), rather than being attracted to shallower
+  /// boundaries. This method precomputes a depth-like metric per PP gap that
+  /// can be used as a weighting term in the LCS cost function.
   ///
-  ///   ownerDepthGap[k] = includeDepthLCA(leftInc, rightInc) + condDepthGap
+  /// **Definition:** for each PP gap `k` (between PP tokens `k-1` and `k`), we
+  /// compute:
+  ///
+  ///     ownerDepthGap[k] = includeDepthLCA(leftInc, rightInc) + condDepthGap
   ///
   /// where:
-  ///   - includeDepthLCA is the depth of the least-common-ancestor include
-  ///     instance for the two sides of the gap (0 for TU, 1 for direct TU
-  ///     children, etc.).
-  ///   - condDepthGap is derived from the conditional arms that own the two
-  ///     sides of the gap, taking nested conditionals into account.
+  /// * **leftInc/rightInc** are the innermost include instance ids owning the
+  ///   left and right side of the gap (TU is treated as depth 0).
+  /// * **includeDepthLCA** is the include-nesting depth of the least common
+  ///   ancestor include of the two sides (e.g. 0 for TU, 1 for direct TU
+  ///   children, etc.).
+  /// * **condDepthGap** is derived from the conditional-arm ownership of the
+  ///   two sides. It is computed as the minimum of the two arm depths so that
+  ///   a gap straddling a boundary does not receive an artificially deep score.
   ///
-  /// This makes deeper, nested regions (nested includes and nested #if groups)
-  /// "deeper" in the weighting, so insertions prefer to sit inside their
-  /// correct owner rather than being pulled out to shallower boundaries.
+  /// **Indexing:** `numOfAOffs` is (#tokens + 1) because it represents PP
+  /// offsets including the sentinel gap after the last token. This method
+  /// returns an array sized `N + 1` where `N = numOfAOffs - 1` is the number of
+  /// tokens, and indices `k in [0..N]` correspond to the `N+1` possible gaps.
   ///
-  /// \param numOfAOffs  The number of A-stream tokens (plus the sentinel).
-  /// \returns A sequence of owner depth gaps.
+  /// **Behavioral intent:** larger values indicate "deeper" nesting (more
+  /// specific ownership). When used as a bias, insertions are encouraged to
+  /// remain within the correct nested include/conditional region instead of
+  /// drifting outward to more global boundaries.
+  ///
+  /// \param numOfAOffs number of PP offsets for the A-stream (#tokens + 1
+  ///        including sentinel)
+  /// \return an array `ownerDepthGap` indexed by PP gap `k` in `[0..N]`
   std::vector<unsigned> ComputeOwnerDepthGapsForPP(size_t numOfAOffs);
 
   /// \brief Classifies the logical "owner" of a diff hunk using the precomputed
@@ -630,14 +673,57 @@ private:
   ///                `false` if any mapped token belongs to a non-TU file.
   bool HunkMapsToTU(int a0, int a1, StringRef tuPath) const;
 
-  /// \brief For a pure insertion at PP-gap \p ppGap, return the TU byte offset
-  /// of an EXACT canonical slot boundary (same PP coordinate).
+  /// \brief Attempts to anchor a *pure insertion* (a PP-gap insertion) to a
+  /// deterministic, canonical TU byte boundary that represents the *same*
+  /// preprocessed coordinate.
   ///
-  /// If \p ppGap is not on a boundary, returns std::nullopt so callers fall
-  /// back to the neighbor-based tuByteSpan logic.
+  /// A PP-gap `ppGap` is a boundary between two adjacent PP tokens (i.e. a
+  /// "gap" index). For an insertion that conceptually occurs at that PP
+  /// boundary, this method tries to return a TU byte offset that is an
+  /// **exact** structural boundary in the TU corresponding to that same PP
+  /// coordinate.
   ///
-  /// This intentionally avoids "nearest" snapping, which causes regressions by
-  /// re-anchoring insertions that are actually interior to an include/arm.
+  /// **Key property:** this method performs *no* "nearest" snapping. If the
+  /// insertion site does not correspond exactly to a known boundary PP
+  /// coordinate, it returns `std::nullopt` so callers can fall back to
+  /// neighbor-based span anchoring. This avoids regressions where an insertion
+  /// that belongs inside a nested owner (include/arm) is incorrectly pulled out
+  /// to a shallower boundary.
+  ///
+  /// **Boundary sources considered** (each producing a candidate `(pp,b)`
+  /// pair):
+  /// * **(A) Explicit TU slots** with an emitted `pp` coordinate and a
+  ///   conservative "boundary-like" `kind` (file/arm/include boundaries).
+  /// * **(B) Include directive boundaries** whose site is in `tuPath`:
+  ///   begin PP = `min(span.begin)`, end PP = `max(span.end)`; mapped to
+  ///   `before_include`/`after_include` slots.
+  /// * **(C) Conditional arm boundaries** in `tuPath` when `ppSpan` exists:
+  ///   begin PP = `arm.ppSpan.begin`, end PP = `arm.ppSpan.end`; mapped to
+  ///   `arm_begin`/`arm_end` slots.
+  ///
+  /// **Directive-line newline adjustment:** some recorded boundary slots may
+  /// point at the newline that terminates a preprocessor directive line (e.g.
+  /// after `#include`, `#else`, `#endif`). For *insertions* at those
+  /// boundaries, anchoring at the newline byte can cause directive
+  /// concatenation (e.g. `...;#else`). To preserve directive line integrity,
+  /// candidates for selected `kind`s are adjusted to anchor *after* the newline
+  /// (handling `\n` and `\r\n`).
+  ///
+  /// **Exact-match requirement:** candidates are filtered to those whose PP
+  /// coordinate equals `ppGap` exactly. If none match, returns `std::nullopt`.
+  ///
+  /// **Deterministic tie-breaking:** if multiple candidates share the same PP
+  /// coordinate, the chosen candidate is the one with the highest priority by
+  /// `kind`, then the smallest TU byte offset, then the smallest slot id. This
+  /// ensures stable output across runs.
+  ///
+  /// \param tuPath the TU path whose slots/owners are being consulted (must
+  ///        match model file keys)
+  /// \param ppGap the PP gap index (between PP tokens) representing the desired
+  ///        insertion coordinate
+  /// \return the TU byte offset of an exact canonical boundary matching
+  ///         `ppGap`, or `std::nullopt` if `ppGap` is not exactly on a known
+  ///         boundary (caller should fall back)
   std::optional<int> AnchorToNearestSlotBoundaryFromPPGap(StringRef tuPath,
                                                           int ppGap) const;
 
@@ -1742,6 +1828,139 @@ private:
   ///         found.
   int ComputeChildBoundaryInsertByte(const IncludePatch &p,
                                      StringRef file) const;
+
+  /// \brief Creates a TextEdit for [start,end) in original that preserves
+  /// __LINE__ transparency.
+  ///
+  /// If the replacement changes the newline count relative to the removed span,
+  /// this method will attempt to keep line accounting correct by either:
+  /// * injecting a local #line directive inside the replacement (when safe), or
+  /// * deferring the correction by attaching a PendingResync to the returned
+  ///   edit, to be flushed later by the file-emission layer.
+  ///
+  /// The returned edit always stores the original span boundaries unchanged,
+  /// and stores either:
+  /// * text = injectedReplacement, pending = nullopt on successful local
+  ///   injection, or
+  /// * text = replacement, pending = PendingResync(fileSpelling) when
+  ///   deferring.
+  ///
+  /// \param original The pre-edit file contents the edit coordinates refer to.
+  /// \param start Start offset (inclusive) in original.
+  /// \param end End offset (exclusive) in original.
+  /// \param replacement Replacement text to emit for [start,end).
+  /// \param fileSpelling The producer-provided spelled path to use in any
+  ///        emitted #line directive.
+  /// \return A TextEdit representing the change and (optionally) a pending
+  ///         resync to flush later.
+  TextEdit MakeTextEditWithResyncOrPending(StringRef original, int start,
+                                           int end, StringRef replacement,
+                                           StringRef fileSpelling) const {
+    ResyncOutcome o =
+        ApplyResyncOrPend(original, start, end, replacement, fileSpelling);
+    return TextEdit{start, end, std::move(o.text), std::move(o.pending)};
+  }
+
+  /// \brief Computes how to preserve __LINE__ after applying replacement to
+  /// [start,end) in originalFileText.
+  ///
+  /// This method detects "line drift" by comparing the newline count in the
+  /// original span versus the replacement text. If there is no drift, it returns
+  /// (replacement, nullopt).
+  ///
+  /// If drift is detected, the method:
+  /// 1. Computes the logical resume line for the first character at `end` in the
+  ///    original file,
+  /// 2. Attempts a local resync by calling
+  ///    LineDirectiveInserter::maybeAppendResyncAfterReplacement,
+  /// 3. If local injection succeeds, returns (injectedReplacement, nullopt),
+  /// 4. Otherwise, returns (replacement, PendingResync(fileSpelling)) so the
+  ///    emission layer can flush a #line directive at the next safe BOL.
+  ///
+  /// Safety note: local injection may fail when inserting a directive would
+  /// change token adjacency (e.g., when the replacement ends mid-line, or when
+  /// no safe BOL exists in/around the replacement).
+  ///
+  /// \param originalFileText Pre-edit file contents the offsets refer to.
+  /// \param start Start offset (inclusive) in originalFileText.
+  /// \param end End offset (exclusive) in originalFileText.
+  /// \param replacement Replacement text.
+  /// \param fileSpellingForDirective Path used in any injected #line.
+  /// \return A ResyncOutcome containing the emitted text and optional pending state.
+  ResyncOutcome ApplyResyncOrPend(StringRef originalFileText, int start,
+                                  int end, StringRef replacement,
+                                  StringRef fileSpellingForDirective) const;
+
+  /// \brief Applies a set of TextEdits to originalFileText, producing the final
+  /// refolded text for a single file (TU or header), while preserving __LINE__
+  /// transparency via "pending resync".
+  ///
+  /// ### Core responsibilities
+  /// * Normalizes edits by de-duplicating exact-span edits (same [start,end)):
+  ///   the last one wins.
+  /// * Orders edits by increasing start (then end) and enforces non-overlap.
+  /// * Streams output in order: original slices + replacement text.
+  /// * When an edit carries a PendingResync, defers the #line emission until
+  /// the
+  ///   next safe BOL in the subsequent unchanged original text, using
+  ///   AppendOriginalSliceWithPending.
+  ///
+  /// **Pending semantics:** if multiple edits produce pending drift and earlier
+  /// pending could not be flushed yet, the "last drift wins" policy applies
+  /// (the most recent PendingResync overwrites the previous one).
+  ///
+  /// **EOF behavior:** if a pending resync remains at end-of-file, it is
+  /// dropped as harmless because there is no subsequent original code whose
+  /// __LINE__ needs correction.
+  ///
+  /// \param originalFileText The pre-edit file contents the edits are expressed
+  ///        against.
+  /// \param edits Non-overlapping edits expressed in offsets of
+  ///        originalFileText.
+  /// \return The edited file text with any necessary #line directives emitted
+  ///         (locally or deferred).
+  std::string ApplyTextEditsWithPendingResync(StringRef originalFileText,
+                                              ArrayRef<TextEdit> edits) const;
+
+  /// \brief Appends an unchanged slice of the original file original[from:to)
+  /// into out, while attempting to flush a previously-deferred PendingResync at
+  /// the earliest safe point.
+  ///
+  /// A pending resync represents a required logical #line correction that could
+  /// not be emitted inside a prior replacement without risking token adjacency
+  /// changes. This method flushes that directive when it becomes safe to do so
+  /// while streaming unchanged original content.
+  ///
+  /// ### Flush rules
+  /// 1. **Immediate flush at slice begin:** if the output is currently at BOL
+  ///    and `from` is a BOL in `original`, emit the directive before appending
+  ///    the slice.
+  /// 2. **Otherwise:** scan forward in `original[from:to)` for the first
+  /// newline
+  ///    boundary that is safe (i.e., not a preprocessor line-splice such as
+  ///    `\\\n`). After copying through that newline, emit the directive at the
+  ///    following BOL.
+  /// 3. **No-op suppression:** even when a flush location is found, the
+  ///    directive is only appended if
+  ///    LineDirectiveInserter::shouldEmitLineDirective indicates it would
+  ///    change logical state (i.e., it is not already in the same file/line
+  ///    context).
+  ///
+  /// If no safe flush point exists within [from,to), the pending resync is
+  /// returned unchanged so it can be attempted again on the next original
+  /// slice.
+  ///
+  /// \param out Destination output buffer for the final file emission.
+  /// \param original The original file contents we are streaming from.
+  /// \param from Start offset (inclusive) of the unchanged slice.
+  /// \param to End offset (exclusive) of the unchanged slice.
+  /// \param pending A pending resync to flush.
+  /// \return std::nullopt if the pending resync was flushed; otherwise the
+  ///         still-pending resync.
+  std::optional<PendingResync>
+  AppendOriginalSliceWithPending(SmallVectorImpl<char> &out, StringRef original,
+                                 int from, int to,
+                                 std::optional<PendingResync> pending) const;
 
   // ------------------------ Low-level Mapping & Utils ------------------------
 
