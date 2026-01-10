@@ -422,64 +422,6 @@ Expected<PPCtx> parsePPCtx(const json::Object &rootJson) {
   return ctx;
 }
 
-class ScopedCwd {
-public:
-  static Expected<ScopedCwd> Create(StringRef newCwd) {
-    if (newCwd.empty())
-      return createStringError(inconvertibleErrorCode(), "pp_ctx.cwd is empty");
-
-    ScopedCwd scoped;
-    if (std::error_code ec = sys::fs::current_path(scoped.oldCwd_))
-      return createStringError(ec, "failed to read current working directory");
-
-    if (std::error_code ec = sys::fs::set_current_path(newCwd)) {
-      return createStringError(ec,
-                               Twine("failed to chdir to '") + newCwd + "'");
-    }
-
-    scoped.active_ = true;
-    return std::move(scoped);
-  }
-
-  ~ScopedCwd() {
-    if (active_)
-      (void)sys::fs::set_current_path(oldCwd_);
-  }
-
-  ScopedCwd(const ScopedCwd &) = delete;
-  ScopedCwd &operator=(const ScopedCwd &) = delete;
-
-  // Important: make it movable so it can live in llvm::Expected.
-  ScopedCwd(ScopedCwd &&other) noexcept
-      : active_(other.active_), oldCwd_(std::move(other.oldCwd_)) {
-    // Ensure the moved-from guard does not try to restore on destruction.
-    other.active_ = false;
-    other.oldCwd_.clear();
-  }
-
-  ScopedCwd &operator=(ScopedCwd &&other) noexcept {
-    if (this == &other)
-      return *this;
-
-    // If this guard is active, restore before taking over the new state.
-    if (active_)
-      (void)sys::fs::set_current_path(oldCwd_);
-
-    active_ = other.active_;
-    oldCwd_ = std::move(other.oldCwd_);
-
-    other.active_ = false;
-    other.oldCwd_.clear();
-    return *this;
-  }
-
-private:
-  ScopedCwd() : active_(false) {}
-
-  bool active_;
-  SmallString<256> oldCwd_;
-};
-
 Expected<std::string> preprocessToBytes(StringRef inputPath, const PPCtx &ctx) {
   // Force an absolute input path so it remains valid after we chdir.
   SmallString<256> absInput(inputPath);
@@ -495,10 +437,6 @@ Expected<std::string> preprocessToBytes(StringRef inputPath, const PPCtx &ctx) {
     return createStringError(ec, "failed to create temporary file");
   }
 
-  auto cwdGuardOrErr = ScopedCwd::Create(ctx.cwd);
-  if (!cwdGuardOrErr)
-    return cwdGuardOrErr.takeError();
-  auto cwdGuard = std::move(*cwdGuardOrErr);
   auto removeTmp = make_scope_exit([&]() { (void)sys::fs::remove(tmpPath); });
 
   // Assemble a cc1-style argument list for in-process preprocessing.
@@ -562,8 +500,10 @@ Expected<std::string> preprocessToBytes(StringRef inputPath, const PPCtx &ctx) {
 
   // Be explicit: '-P' should suppress line markers.
   invocation->getPreprocessorOutputOpts().ShowLineMarkers = false;
+  invocation->getFileSystemOpts().WorkingDir = ctx.cwd;
 
   ci.setInvocation(invocation);
+  ci.createFileManager();
 
   // Run clang's preprocessor.
   clang::PrintPreprocessedAction action;
@@ -644,6 +584,14 @@ static cl::opt<std::string> CheckSrcPath(
 static cl::alias CheckSrcPathShort("c", cl::desc("Alias for --check"),
                                    cl::aliasopt(CheckSrcPath),
                                    cl::cat(RefoldCategory));
+
+static cl::opt<bool>
+    NoLines("no-lines",
+            cl::desc("Don't include #line directives in refold source"),
+            cl::init(false), cl::cat(RefoldCategory));
+
+static cl::alias NoLinesShort("n", cl::desc("Alias for --no-lines"),
+                              cl::aliasopt(NoLines), cl::cat(RefoldCategory));
 
 static constexpr char Overview[] = R"(
   Deterministically reconstruct partially expanded C source from edited
@@ -793,7 +741,7 @@ int main(int argc, char **argv) {
   // Generate the refolded C source as a string.
   Expected<std::string> refoldedOrErr =
       RefoldEngine::Refold(rootJson, aBytes, aToks, aTokByteOff, bBytes, bToks,
-                           bTokByteOff, onlyCheck);
+                           bTokByteOff, onlyCheck, NoLines);
   if (onlyCheck) {
     // We are only verifying that a refolding is correct, so print the response
     // and return an appropriate exit code.

@@ -224,6 +224,16 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
     return srcPathOrErr.takeError();
   model.sourcePath_ = *srcPathOrErr;
 
+  // pp_ctx.cwd
+  auto ppCtxOrErr = applyToField(asObject, root, "pp_ctx");
+  if (!ppCtxOrErr)
+    return ppCtxOrErr.takeError();
+  const json::Object &ppCtxObj = **ppCtxOrErr;
+  auto cwdOrErr = applyToField(asString, ppCtxObj, "cwd", "pp_ctx.cwd");
+  if (!cwdOrErr)
+    return cwdOrErr.takeError();
+  model.ppCwd_ = *cwdOrErr;
+
   // tokens.count
   auto tokObjOrErr = applyToField(asObject, root, "tokens");
   if (!tokObjOrErr)

@@ -3,6 +3,7 @@ set(LLVM_LINK_COMPONENTS Support)
 add_clang_tool(clang-refold
   clang-refold.cpp
   DiffAlgorithms.cpp
+  LineDirectiveInserter.cpp
   RefoldEngine.cpp
   RefoldModel.cpp
 )

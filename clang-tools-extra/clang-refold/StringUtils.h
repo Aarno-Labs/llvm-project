@@ -59,10 +59,14 @@
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_STRINGUTILS_H
 
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/Twine.h"
+#include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <cstddef>
 #include <cstdint>
+
+using namespace llvm;
 
 namespace clang {
 namespace refold {
@@ -168,7 +172,7 @@ inline std::string showWS(StringRef s) {
 inline std::string clip(StringRef s, size_t n) {
   if (s.size() <= n)
     return s.str();
-  return (s.substr(0, n) + "…(" + std::to_string(s.size()) + ")").str();
+  return (Twine(s.substr(0, n)) + "…(" + Twine(s.size()) + ")").str();
 }
 
 inline std::string escape(StringRef s) {
@@ -231,7 +235,7 @@ inline StringRef trimEdgeSpaces(StringRef s) {
 /// \param token the raw include target token spelling (may be null)
 /// \return the include target with surrounding <> or "" removed when present;
 ///         returns the empty string if \p token is null
-inline StringRef stripHeaderToken(llvm::StringRef token) {
+inline StringRef stripHeaderToken(StringRef token) {
   token = token.trim();
   if (token.empty())
     return "";
@@ -252,7 +256,7 @@ inline std::string zpadUnsigned(size_t v, unsigned width) {
 template <typename T> std::string stringifyElement(const T &elem) {
   if constexpr (std::is_same_v<T, std::string>) {
     return elem;
-  } else if constexpr (std::is_same_v<T, llvm::StringRef>) {
+  } else if constexpr (std::is_same_v<T, StringRef>) {
     return elem.str();
   } else if constexpr (std::is_same_v<T, char>) {
     return std::string(1, elem);
@@ -292,6 +296,106 @@ inline bool looksLikeStringLiteralToken(StringRef tok) {
   }
 
   return false;
+}
+
+inline bool isLineSplice(StringRef s, int nlIdx) {
+  if (nlIdx <= 0)
+    return false;
+  char prev = s[nlIdx - 1];
+  if (prev == '\\')
+    return true;
+  // Windows form: "\\\r\n"
+  if (prev == '\r' && nlIdx >= 2 && s[nlIdx - 2] == '\\')
+    return true;
+  return false;
+}
+
+/** True iff s[from:to) contains only horizontal whitespace (and optional '\r').
+ */
+inline bool isIndentOnly(StringRef s, int from, int to) {
+  int n = static_cast<int>(s.size());
+  int start = std::clamp(from, 0, n);
+  int end = std::clamp(to, start, n);
+
+  // slice(start, end) creates a reference to the substring
+  return s.slice(start, end).find_first_not_of(" \t\r") == StringRef::npos;
+}
+
+inline std::string dbgOutTail(StringRef out) {
+  size_t tailStart = out.size() > 140 ? out.size() - 140 : 0;
+  StringRef tail = out.drop_front(tailStart);
+
+  std::string result = tail.str();
+  size_t pos = 0;
+  while ((pos = result.find('\n', pos)) != std::string::npos) {
+    result.replace(pos, 1, "\\n");
+    pos += 2;
+  }
+  return result;
+}
+
+/** True iff offset is a beginning-of-line in text. */
+inline bool isBOL(StringRef text, int offset) {
+  int o = std::clamp(offset, 0, static_cast<int>(text.size()));
+  return (o == 0) || (text[o - 1] == '\n');
+}
+
+// inline bool outEndsWith(StringRef out, StringRef suffix) {
+//   return out.endswith(suffix);
+// }
+
+inline bool outAtBOL(StringRef s) { return s.empty() || s.back() == '\n'; }
+
+inline bool endsWithLf(StringRef s) { return !s.empty() && s.back() == '\n'; }
+
+inline bool startsWith(StringRef s, int offset, StringRef lit) {
+  int n = static_cast<int>(s.size());
+  int m = static_cast<int>(lit.size());
+  if (offset < 0 || offset + m > n)
+    return false;
+  return s.substr(offset).starts_with(lit);
+}
+
+inline int lastIndexOfChar(StringRef s, char ch, int fromInclusive) {
+  if (s.empty())
+    return -1;
+  int limit = std::min(fromInclusive, static_cast<int>(s.size()) - 1);
+  if (limit < 0)
+    return -1;
+
+  size_t res = s.take_front(limit + 1).rfind(ch);
+  return (res == StringRef::npos) ? -1 : static_cast<int>(res);
+}
+
+/** 1-based line number at the given offset. */
+inline int lineAtOffset(StringRef text, int offset) {
+  int o = std::clamp(offset, 0, static_cast<int>(text.size()));
+  return 1 + static_cast<int>(text.take_front(o).count('\n'));
+}
+
+/** Count '\n' in an entire sequence. */
+inline int countNewlines(StringRef s) {
+  return static_cast<int>(s.count('\n'));
+}
+
+/** Count '\n' in text from range [start, end). */
+inline int countNewlines(StringRef text, int start, int end) {
+  int len = static_cast<int>(text.size());
+  int s = std::clamp(start, 0, len);
+  int e = std::clamp(end, s, len);
+  return static_cast<int>(text.slice(s, e).count('\n'));
+}
+
+inline int countNonSplicedNewlines(StringRef s, int from, int to) {
+  int n = static_cast<int>(s.size());
+  int a = std::clamp(from, 0, n);
+  int b = std::clamp(to, a, n);
+  int c = 0;
+  for (int i = a; i < b; i++) {
+    if (s[i] == '\n' && !isLineSplice(s, i))
+      c++;
+  }
+  return c;
 }
 
 } // namespace stringutils

@@ -414,6 +414,7 @@ public:
   // ============================== Basic getters ==============================
   StringRef GetVersion() const { return version_; }
   StringRef GetSourcePath() const { return sourcePath_; }
+  StringRef GetPPCwd() const { return ppCwd_; }
   int GetTokensCountA() const { return tokensCountA_; }
 
   const DenseMap<int, TokMapEntry> &GetTokmapByPP() const {
@@ -547,6 +548,7 @@ private:
   // =============================== Stored data ===============================
   std::string version_;
   std::string sourcePath_;
+  std::string ppCwd_;
   int tokensCountA_ = 0;
 
   DenseMap<int, TokMapEntry> tokmapByPP_; // key = pp
