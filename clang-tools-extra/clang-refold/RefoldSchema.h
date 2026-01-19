@@ -268,6 +268,14 @@ static constexpr const char *RefoldSchema = R"json(
         "arg_index": {
           "type": "integer",
           "minimum": 0
+        },
+        "byte_begin": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "byte_end": {
+          "type": "integer",
+          "minimum": 0
         }
       },
       "description": "Inherits logic from PPSpan but manually flattened for validator compatibility."
@@ -314,6 +322,20 @@ static constexpr const char *RefoldSchema = R"json(
             "$ref": "#/$defs/PPArgSpan"
           },
           "description": "A-token spans within pp_cover that originate from any actual macro arguments."
+        },
+        "stringify_spans": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PPArgSpan"
+          },
+          "description": "A-token spans within pp_cover that originate from macro-body stringification of an argument (e.g. '#X')."
+        },
+        "paste_spans": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PPArgSpan"
+          },
+          "description": "A-token spans within pp_cover that originate from macro-body token-paste involving an argument (e.g. 'X##Y'). Multiple spans may overlap when a single pasted token depends on multiple arguments."
         },
         "body_spans": {
           "type": "array",

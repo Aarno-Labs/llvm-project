@@ -931,6 +931,30 @@ RefoldEngine::ClassifyOwnerWithSegments(StringRef tuPath,
   }
 }
 
+bool RefoldEngine::IsInvocationInsideDefineDirective(
+    const RefoldModel::MacroInvocation &m) const {
+  if (!m.invFile || m.GetInvB() < 0 || m.GetInvE() < 0)
+    return false;
+
+  // RefoldModel exposes directives; MacroDirective.subkind is expected to be
+  // "define" based on your schema usage elsewhere.
+  for (const auto &d : model_.GetMacroDirectives()) {
+    if ("#define" != d.subkind)
+      continue;
+    if (d.sitePath.empty())
+      continue;
+    if (!m.invFile || *m.invFile != d.sitePath)
+      continue;
+
+    // If the invocation byte range lies within the #define's site range, treat
+    // it as non-patchable.
+    if (m.GetInvB() >= d.siteB && m.GetInvE() <= d.siteE)
+      return true;
+  }
+
+  return false;
+}
+
 const RefoldModel::MacroInvocation *
 RefoldEngine::SmallestCoveringPatchableMacro(int aStart, int aEnd) const {
   const RefoldModel::MacroInvocation *best = nullptr;
@@ -941,8 +965,13 @@ RefoldEngine::SmallestCoveringPatchableMacro(int aStart, int aEnd) const {
     if (!m.Covers(aStart, aEnd))
       continue;
 
-    // Check if the macro is "patchable" (has valid source invocation bounds)
+    // Must be patchable at a real call site.
     if (m.GetInvB() < 0 || m.GetInvE() < 0 || !m.invText)
+      continue;
+
+    // CRITICAL: never patch invocations that are spelled inside a #define
+    // directive.
+    if (IsInvocationInsideDefineDirective(m))
       continue;
 
     // Deterministic selection: smallest cover wins, ties broken by ID.
@@ -1999,7 +2028,9 @@ RefoldEngine::ComputeStringifyArgHolesForHunk(
   if (argIdx < 0)
     return {};
 
-  return {RefoldModel::PPArgSpan{{h.aStart, h.aEnd}, argIdx}};
+  using PPArgSpanKind = RefoldModel::PPArgSpanKind;
+  return {RefoldModel::PPArgSpan{
+      {h.aStart, h.aEnd}, PPArgSpanKind::Standard, argIdx, -1, -1}};
 }
 
 StringRef RefoldEngine::SliceBSource(int bStartTok, int bEndTok) const {
@@ -2206,7 +2237,9 @@ RefoldEngine::ComputeArgSpansFromBodySpansWithArgIdx(
         inferredArgIdx = *found;
     }
 
-    out.push_back(RefoldModel::PPArgSpan{{b, e}, inferredArgIdx});
+    using PPArgSpanKind = RefoldModel::PPArgSpanKind;
+    out.push_back(RefoldModel::PPArgSpan{
+        {b, e}, PPArgSpanKind::Standard, inferredArgIdx, -1, -1});
   }
 
   return out;

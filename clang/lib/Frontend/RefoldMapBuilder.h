@@ -48,10 +48,13 @@
 #include "clang/Basic/SourceManager.h"
 #include "clang/Lex/MacroInfo.h"
 #include "clang/Lex/Preprocessor.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 
 #include <string>
 #include <utility>
+
+using namespace llvm;
 
 namespace clang {
 namespace refold {
@@ -67,6 +70,23 @@ struct ArgTokenSpan {
   uint64_t Begin = 0, End = 0;
   int ArgIndex = -1;
   bool Open = false;
+
+  // For paste_spans only: byte range within the spelled output token
+  // [ByteBegin, ByteEnd). When HasByteRange is false, ByteBegin/ByteEnd are
+  // ignored.
+  uint32_t ByteBegin = 0, ByteEnd = 0;
+  bool HasByteRange = false;
+};
+
+struct PastePart {
+  // ArgIndex >= 0 is a macro argument index; -1 denotes a literal contribution.
+  int ArgIndex = -1;
+  uint32_t ByteBegin = 0, ByteEnd = 0;
+};
+
+struct PasteToken {
+  std::string Spelling;
+  SmallVector<PastePart, 4> Parts;
 };
 
 struct HeaderDecl {
@@ -97,7 +117,31 @@ struct Item {
   SourceLocation Loc;  // primary location
   std::vector<TokenSpan> Spans;
   std::vector<ArgTokenSpan> ArgSpans; // tokens from any actual arguments
+  std::vector<ArgTokenSpan> StringifySpans; // tokens produced by #param
+  std::vector<ArgTokenSpan> PasteSpans;     // tokens produced by ## involving param
   std::vector<TokenSpan> BodySpans;   // tokens from the macro body
+
+  // Macro-body tokens can be *derived* from invocation arguments via
+  // projections:
+  //   - stringification (#X) produces a string literal token
+  //   - token paste (X##Y) produces a synthesized token
+  //
+  // To make the consumer's macro policy deterministic, we precompute the
+  // *exact* spelled tokens these projections would produce for this specific
+  // invocation (using MacroArgs) and then match printed macro-body tokens
+  // against those spellings during onToken().
+  //
+  // These are not serialized; only StringifySpans/PasteSpans are.
+  StringMap<SmallVector<int, 2>> StringifySpell2ArgIndices;
+  StringMap<SmallVector<int, 2>> PasteSpell2ArgIndices;
+
+  // Precomputed token-paste projections for this macro invocation, in expansion order.
+  SmallVector<PasteToken, 4> PasteTokens;
+  size_t PasteTokenCursor = 0;
+
+  // Reverse index: pasted spelling -> indices into PasteTokens.
+  StringMap<SmallVector<unsigned, 2>> PasteSpell2TokenIndices;
+
   // Invocation-site byte ranges [begin,end) for each actual argument (index
   // matches formal parameter order).
   std::vector<std::pair<long long, long long>> InvArgRanges;

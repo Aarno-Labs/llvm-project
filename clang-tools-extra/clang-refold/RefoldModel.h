@@ -140,16 +140,44 @@ public:
     bool IsValid() const { return begin >= 0 && end >= 0 && end > begin; }
   };
 
+  enum class PPArgSpanKind { Standard, Stringify, Paste };
+
+#if 0
+  // Getter for the 'key' field
+  static constexpr StringRef GetKey(PPArgSpanKind kind) {
+    switch (kind) {
+    case PPArgSpanKind::Standard:
+      return "arg_spans";
+    case PPArgSpanKind::Stringify:
+      return "stringify_spans";
+    case PPArgSpanKind::Paste:
+      return "paste_spans";
+    }
+    llvm_unreachable("Invalid PPArgSpanKind");
+  }
+#endif
+
+  static constexpr bool HasByteRange(PPArgSpanKind kind) {
+    switch (kind) {
+    case PPArgSpanKind::Standard:
+    case PPArgSpanKind::Stringify:
+      return false;
+    case PPArgSpanKind::Paste:
+      return true;
+    }
+    llvm_unreachable("Invalid PPArgSpanKind");
+  }
+
   struct PPArgSpan : public PPSpan {
+    PPArgSpanKind kind;
     int argIdx;
+    int byteBegin = -1, byteEnd = -1;
 
     std::string ToString() const {
       return formatv("Arg {0}: [{1}, {2})", argIdx, begin, end).str();
     }
 
-    bool IsValid() const {
-      return PPSpan::IsValid() && argIdx >= 0;
-    }
+    bool IsValid() const { return PPSpan::IsValid() && argIdx >= 0; }
   };
 
   struct PPCover {
@@ -277,6 +305,8 @@ public:
     std::string name;
     std::vector<PPSpan> spans; // expansion coverage (A tokens)
     std::vector<PPArgSpan> argSpans;
+    std::vector<PPArgSpan> stringifySpans;
+    std::vector<PPArgSpan> pasteSpans;
     std::vector<PPSpan> bodySpans;
     std::optional<std::string> invText;
     std::optional<std::string> invFile;
@@ -290,15 +320,20 @@ public:
                     std::optional<std::string> invFile, std::optional<int> invB,
                     std::optional<int> invE, std::optional<int> ownerIncludeId,
                     std::vector<PPSpan> spans, std::vector<PPArgSpan> argSpans,
+                    std::vector<PPArgSpan> stringifySpans,
+                    std::vector<PPArgSpan> pasteSpans,
                     std::vector<PPSpan> bodySpans,
                     std::optional<int> coverBegin,
                     std::optional<int> coverEnd) noexcept
         : id(id), subkind(std::move(subkind)), name(std::move(name)),
           spans(std::move(spans)), argSpans(std::move(argSpans)),
-          bodySpans(std::move(bodySpans)), invText(std::move(invText)),
-          invFile(std::move(invFile)), invB(std::move(invB)),
-          invE(std::move(invE)), ownerIncludeId(std::move(ownerIncludeId)) {
-      cover.Init(coverBegin, coverEnd, this->spans, &this->argSpans, &this->bodySpans);
+          stringifySpans(std::move(stringifySpans)),
+          pasteSpans(std::move(pasteSpans)), bodySpans(std::move(bodySpans)),
+          invText(std::move(invText)), invFile(std::move(invFile)),
+          invB(std::move(invB)), invE(std::move(invE)),
+          ownerIncludeId(std::move(ownerIncludeId)) {
+      cover.Init(coverBegin, coverEnd, this->spans, &this->argSpans,
+                 &this->bodySpans);
     }
 
     int GetInvB() const { return invB.has_value() ? *invB : -1; }

@@ -486,6 +486,240 @@ std::string joinSpelled(llvm::StringRef DirSpelling,
   Out.append(Rel.data(), Rel.size());
   return Out;
 }
+
+void computeMacroProjectionSites(Item &It, Preprocessor &PP,
+                                 const Token &MacroNameTok,
+                                 const MacroInfo *MI,
+                                 const MacroArgs *Args,
+                                 const LangOptions &Lang) {
+  It.StringifySpell2ArgIndices.clear();
+  It.PasteTokens.clear();
+  It.PasteSpell2TokenIndices.clear();
+  It.PasteTokenCursor = 0;
+
+  if (!MI || !MI->isFunctionLike() || !Args)
+    return;
+
+  (void)MacroNameTok;
+  (void)Lang;
+
+  bool HasStringify = false;
+  bool HasHashHash = false;
+  {
+    const auto &RToks = MI->tokens();
+    for (unsigned i = 0, N = RToks.size(); i < N; ++i) {
+      if (RToks[i].is(tok::hashhash))
+        HasHashHash = true;
+      if (RToks[i].is(tok::hash) && i + 1 < N && RToks[i + 1].is(tok::identifier)) {
+        const IdentifierInfo *II = RToks[i + 1].getIdentifierInfo();
+        if (II && MI->getParameterNum(II) >= 0)
+          HasStringify = true;
+      }
+      if (HasStringify && HasHashHash)
+        break;
+    }
+  }
+
+  auto tokenIdentInfo = [&](const Token &Tok) -> const IdentifierInfo * {
+    if (!Tok.is(tok::identifier))
+      return nullptr;
+    return Tok.getIdentifierInfo();
+  };
+
+  auto tokenSpelling = [&](const Token &Tok) -> std::string {
+    return PP.getSpelling(Tok);
+  };
+
+  // -------------------------------------------------------------------------
+  // Stringification (#param)
+  // -------------------------------------------------------------------------
+  if (HasStringify) {
+    const Token *RToks = MI->tokens().data();
+    unsigned N = MI->tokens().size();
+
+    for (unsigned i = 0; i + 1 < N; ++i) {
+      if (!RToks[i].is(tok::hash))
+        continue;
+
+      const IdentifierInfo *II = tokenIdentInfo(RToks[i + 1]);
+      if (!II)
+        continue;
+
+      int PIdx = MI->getParameterNum(II);
+      if (PIdx < 0)
+        continue;
+
+      std::string ArgText;
+      {
+        const Token *AT = Args->getUnexpArgument((unsigned)PIdx);
+        bool First = true;
+        if (AT) {
+          for (; !AT->is(tok::eof); ++AT) {
+            if (!First && AT->hasLeadingSpace())
+              ArgText.push_back(' ');
+            std::string S = tokenSpelling(*AT);
+            ArgText.append(S.data(), S.size());
+            First = false;
+          }
+        }
+      }
+
+      // Best-effort: escape like a string literal.
+      std::string Quoted;
+      Quoted.reserve(ArgText.size() + 2);
+      Quoted.push_back('"');
+      for (char c : ArgText) {
+        switch (c) {
+        case '\\':
+        case '"':
+          Quoted.push_back('\\');
+          Quoted.push_back(c);
+          break;
+        case '\n':
+          Quoted.append("\\n");
+          break;
+        case '\t':
+          Quoted.append("\\t");
+          break;
+        case '\r':
+          Quoted.append("\\r");
+          break;
+        default:
+          Quoted.push_back(c);
+          break;
+        }
+      }
+      Quoted.push_back('"');
+
+      It.StringifySpell2ArgIndices[llvm::StringRef(Quoted)].push_back(PIdx);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Token pasting (##): simulate substitution + ## evaluation.
+  // -------------------------------------------------------------------------
+  if (!HasHashHash)
+    return;
+
+  struct SubstTok {
+    bool IsHashHash = false;
+    std::string Text;
+    SmallVector<PastePart, 4> Parts;
+    bool IsPasteResult = false;
+  };
+
+  SmallVector<SubstTok, 64> Seq;
+
+  auto pushLiteral = [&](std::string Text) {
+    SubstTok N;
+    N.Text = std::move(Text);
+    if (!N.Text.empty()) {
+      PastePart P;
+      P.ArgIndex = -1; // literal
+      P.ByteBegin = 0;
+      P.ByteEnd = (uint32_t)N.Text.size();
+      N.Parts.push_back(P);
+    }
+    Seq.push_back(std::move(N));
+  };
+
+  auto pushArgTok = [&](std::string Text, int ArgIndex) {
+    SubstTok N;
+    N.Text = std::move(Text);
+    if (!N.Text.empty()) {
+      PastePart P;
+      P.ArgIndex = ArgIndex;
+      P.ByteBegin = 0;
+      P.ByteEnd = (uint32_t)N.Text.size();
+      N.Parts.push_back(P);
+    }
+    Seq.push_back(std::move(N));
+  };
+
+  // Substitute parameters with unexpanded argument token sequences.
+  for (const Token &RTok : MI->tokens()) {
+    if (RTok.is(tok::hashhash)) {
+      SubstTok Op;
+      Op.IsHashHash = true;
+      Seq.push_back(std::move(Op));
+      continue;
+    }
+
+    if (const IdentifierInfo *II = tokenIdentInfo(RTok)) {
+      int PIdx = MI->getParameterNum(II);
+      if (PIdx >= 0) {
+        const Token *AT = Args->getUnexpArgument((unsigned)PIdx);
+        if (AT) {
+          for (; !AT->is(tok::eof); ++AT)
+            pushArgTok(tokenSpelling(*AT), PIdx);
+        }
+        continue;
+      }
+    }
+
+    pushLiteral(tokenSpelling(RTok));
+  }
+
+  // Evaluate ## left-to-right using adjacency in the substituted sequence.
+  for (unsigned i = 0; i < Seq.size();) {
+    if (!Seq[i].IsHashHash) {
+      ++i;
+      continue;
+    }
+
+    if (i == 0 || i + 1 >= Seq.size() || Seq[i - 1].IsHashHash || Seq[i + 1].IsHashHash) {
+      ++i;
+      continue;
+    }
+
+    SubstTok &L = Seq[i - 1];
+    SubstTok &R = Seq[i + 1];
+
+    SubstTok N;
+    N.IsPasteResult = true;
+    N.Text.reserve(L.Text.size() + R.Text.size());
+    N.Text.append(L.Text.data(), L.Text.size());
+    N.Text.append(R.Text.data(), R.Text.size());
+
+    // Preserve part boundaries; do not coalesce.
+    N.Parts = L.Parts;
+    uint32_t Shift = (uint32_t)L.Text.size();
+    for (PastePart P : R.Parts) {
+      P.ByteBegin += Shift;
+      P.ByteEnd += Shift;
+      N.Parts.push_back(P);
+    }
+
+    // Replace [i-1, i, i+1] with N.
+    Seq[i - 1] = std::move(N);
+    Seq.erase(Seq.begin() + i, Seq.begin() + i + 2);
+
+    if (i > 0)
+      --i;
+  }
+
+  // Record expected pasted tokens in expansion order.
+  for (const SubstTok &N : Seq) {
+    if (!N.IsPasteResult)
+      continue;
+
+    PasteToken PT;
+    PT.Spelling = N.Text;
+
+    for (const PastePart &P : N.Parts) {
+      if (P.ArgIndex < 0)
+        continue; // literal handled by uncovered-byte detection (consumer-side)
+      PT.Parts.push_back(P);
+    }
+
+    if (PT.Parts.empty())
+      continue;
+
+    unsigned Index = (unsigned)It.PasteTokens.size();
+    It.PasteTokens.push_back(std::move(PT));
+    It.PasteSpell2TokenIndices[It.PasteTokens.back().Spelling].push_back(Index);
+  }
+}
 } // namespace
 
 RefoldMapBuilder::RefoldMapBuilder(Preprocessor &PP, llvm::StringRef OutputPath)
@@ -906,30 +1140,62 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
     It.Name = II->getName().str();
   It.Loc = Range.getBegin();
 
-  SourceLocation EndTok =
-      Lexer::getLocForEndOfToken(Range.getEnd(), /*Offset=*/0, SM, Lang);
-  It.InvText =
-      Lexer::getSourceText(
-          CharSourceRange::getCharRange(Range.getBegin(), EndTok), SM, Lang)
-          .str();
   It.IsBuiltinMacro = (MI != nullptr && MI->isBuiltinMacro());
 
-  // byte offsets within the invocation's own file
-  SourceLocation FB = SM.getFileLoc(Range.getBegin());
-  SourceLocation FE = SM.getFileLoc(EndTok);
-  if (FB.isValid() && FE.isValid()) {
-    It.InvBegin = SM.getFileOffset(FB);
-    It.InvEnd = SM.getFileOffset(FE);
-    It.InvFile = filePathForLocAbs(SM, FB, EmitAbsPaths);
+  // -------------------------------------------------------------------------
+  // Invocation text + byte range.
+  //
+  // For nested expansions (macro expanded from within another macro’s replacement
+  // list), Range’s file-locs often collapse back to the outermost call site
+  // (e.g. HELLO(10)), which makes nested macros (FOO/BAR/...) look like duplicate
+  // HELLO invocations. For nested expansions, use spelling locations so inv_text
+  // identifies the call as written in the macro definition (e.g. "FOO(X##.0)").
+  // -------------------------------------------------------------------------
+  SourceLocation BeginTokLoc = Range.getBegin();
+  SourceLocation EndTokLoc =
+      Lexer::getLocForEndOfToken(Range.getEnd(), /*Offset=*/0, SM, Lang);
+
+  SourceLocation InvBeginLoc = BeginTokLoc;
+  SourceLocation InvEndLoc = EndTokLoc;
+
+  if (MacroNameTok.getLocation().isMacroID()) {
+    InvBeginLoc = SM.getSpellingLoc(BeginTokLoc);
+
+    SourceLocation SpEnd = SM.getSpellingLoc(Range.getEnd());
+    InvEndLoc = Lexer::getLocForEndOfToken(SpEnd, /*Offset=*/0, SM, Lang);
+  }
+
+  SourceLocation InvBeginFileLoc = SM.getFileLoc(InvBeginLoc);
+  SourceLocation InvEndFileLoc = SM.getFileLoc(InvEndLoc);
+
+  if (InvBeginFileLoc.isValid() && InvEndFileLoc.isValid()) {
+    It.InvBegin = SM.getFileOffset(InvBeginFileLoc);
+    It.InvEnd   = SM.getFileOffset(InvEndFileLoc);
+    It.InvFile  = filePathForLocAbs(SM, InvBeginFileLoc, EmitAbsPaths);
+
+    if (SM.isWrittenInSameFile(InvBeginFileLoc, InvEndFileLoc) &&
+        It.InvBegin >= 0 && It.InvEnd >= It.InvBegin) {
+      It.InvText =
+          Lexer::getSourceText(
+              CharSourceRange::getCharRange(InvBeginFileLoc, InvEndFileLoc),
+              SM, Lang)
+              .str();
+    } else {
+      // Fallback: avoid misleading duplication if we can't form a stable range.
+      It.InvText = It.Name;
+    }
   } else {
     It.InvBegin = It.InvEnd = -1;
+    It.InvText = It.Name;
   }
 
   computeInvArgRanges(Args, MI, SM, Lang, It.InvArgRanges);
+  computeMacroProjectionSites(It, PP, MacroNameTok, MI, Args, Lang);
 
   Items.push_back(std::move(It));
   if (!IncludeStack.empty())
     Items.back().OwnerIncludeId = IncludeStack.back();
+
   MacroKey2Item[keyForMacroLoc(MacroNameTok.getLocation())] =
       (int)Items.size() - 1;
 }
@@ -1112,6 +1378,123 @@ void RefoldMapBuilder::onToken(const Token &Tok) {
     } else if (SM.isMacroBodyExpansion(L)) {
       touchTokSpan(It.BodySpans, TokIndex);
     }
+
+    // Record projections for stringification ("#X") and token-pasting
+    // ("X##Y") for
+    // any macro invocation in the caller chain. We cannot reliably discover
+    // these using spelling/callee locations alone (especially across nested
+    // macro expansions), so we instead precompute the projection spellings
+    // per macro invocation and match by the emitted token spelling here.
+    if (L.isMacroID()) {
+      const std::string Sp = PP.getSpelling(Tok);
+
+      auto recordProjectionsForItem = [&](Item &MI) {
+        if (MI.Kind != IK_Macro)
+          return;
+
+        // Fast reject.
+        if (MI.StringifySpell2ArgIndices.empty() && MI.PasteTokens.empty())
+          return;
+
+        // === Stringification: emitted token is a quoted string literal
+        // corresponding to #Arg.
+        if (!MI.StringifySpell2ArgIndices.empty() &&
+            (Tok.is(tok::string_literal) || Tok.is(tok::wide_string_literal) ||
+             Tok.is(tok::utf8_string_literal) ||
+             Tok.is(tok::utf16_string_literal) ||
+             Tok.is(tok::utf32_string_literal))) {
+          auto ItS = MI.StringifySpell2ArgIndices.find(Sp);
+          if (ItS != MI.StringifySpell2ArgIndices.end()) {
+            for (int A : ItS->second)
+              touchArgTokSpan(MI.StringifySpans, TokIndex, A);
+          }
+        }
+
+        // === Token pasting: emitted token is the result of one or more "##"
+        // operations.
+        if (MI.PasteTokens.empty())
+          return;
+
+        auto ItP = MI.PasteSpell2TokenIndices.find(Sp);
+        if (ItP == MI.PasteSpell2TokenIndices.end())
+          return;
+
+        const auto &Candidates = ItP->second;
+        if (Candidates.empty())
+          return;
+
+        // Choose a candidate deterministically, respecting emission order.
+        size_t Chosen = Candidates.front();
+        const size_t Cursor = MI.PasteTokenCursor;
+
+        // Prefer the "next" paste token if it matches.
+        if (Cursor < MI.PasteTokens.size()) {
+          for (size_t C : Candidates) {
+            if (C == Cursor) {
+              Chosen = C;
+              break;
+            }
+          }
+        }
+        // Otherwise pick the first candidate at/after the cursor; else wrap
+        // to the first.
+        if (Chosen < Cursor) {
+          for (size_t C : Candidates) {
+            if (C >= Cursor) {
+              Chosen = C;
+              break;
+            }
+          }
+        }
+
+        // Advance cursor past the chosen index.
+        if (MI.PasteTokenCursor < Chosen + 1)
+          MI.PasteTokenCursor = Chosen + 1;
+
+        const PasteToken &PT = MI.PasteTokens[Chosen];
+
+        // Record one span per argument part (arg_index + byte range inside
+        // the pasted token).
+        auto appendPasteSpan = [&](int ArgIndex, unsigned ByteBegin,
+                                   unsigned ByteEnd) {
+          ArgTokenSpan S;
+          S.Begin = TokIndex;
+          S.End = TokIndex + 1;
+          S.ArgIndex = ArgIndex;
+          S.ByteBegin = ByteBegin;
+          S.ByteEnd = ByteEnd;
+          S.HasByteRange = true;
+          MI.PasteSpans.push_back(std::move(S));
+        };
+
+        for (const PastePart &P : PT.Parts) {
+          if (P.ArgIndex < 0)
+            continue;
+          appendPasteSpan(P.ArgIndex, P.ByteBegin, P.ByteEnd);
+        }
+      };
+
+      // Walk the immediate macro caller chain. Any macro invocation in the
+      // chain might be the one that performed the stringification/paste that
+      // produced this token (e.g., pasted in macro A, then passed through
+      // macro B).
+      SourceLocation Cur = L;
+      for (int Depth = 0; Depth < 32 && Cur.isMacroID(); ++Depth) {
+        const SourceLocation Caller = SM.getImmediateMacroCallerLoc(Cur);
+        if (Caller.isInvalid())
+          break;
+
+        auto ItM = MacroKey2Item.find(keyForMacroLoc(Caller));
+        if (ItM != MacroKey2Item.end()) {
+          const int I = ItM->second;
+          if (I >= 0 && static_cast<size_t>(I) < Items.size())
+            recordProjectionsForItem(Items[I]);
+        }
+
+        Cur = Caller;
+      }
+    }
+
     // Tokens that are neither arg nor body (rare, e.g. builtins) remain covered
     // by the primary Spans via touchSpanForItem above.
   }
@@ -1374,7 +1757,7 @@ void RefoldMapBuilder::writeJSON() {
   llvm::json::OStream JO(OS, /*Indent=*/2);
 
   JO.object([&] {
-    JO.attribute("version", "1.3");
+    JO.attribute("version", "1.4");
 
     const auto &PPO = PP.getPreprocessorOpts();
     std::string LangStr = computeLangStr(PP.getLangOpts());
@@ -1503,6 +1886,34 @@ void RefoldMapBuilder::writeJSON() {
                     JO.attribute("end",   S.End);
                     if (S.ArgIndex >= 0)
                       JO.attribute("arg_index", (int64_t)S.ArgIndex);
+                  });
+                }
+              });
+            }
+            if (!It.StringifySpans.empty()) {
+              JO.attributeArray("stringify_spans", [&] {
+                for (const ArgTokenSpan &S : It.StringifySpans) {
+                  JO.object([&] {
+                    JO.attribute("begin", S.Begin);
+                    JO.attribute("end",   S.End);
+                   if (S.ArgIndex >= 0)
+                      JO.attribute("arg_index", (int64_t)S.ArgIndex);
+                  });
+                }
+              });
+            }
+            if (!It.PasteSpans.empty()) {
+              JO.attributeArray("paste_spans", [&] {
+                for (const ArgTokenSpan &S : It.PasteSpans) {
+                  JO.object([&] {
+                    JO.attribute("begin", S.Begin);
+                    JO.attribute("end", S.End);
+                    if (S.ArgIndex >= 0)
+                      JO.attribute("arg_index", (int64_t)S.ArgIndex);
+                    if (S.HasByteRange) {
+                      JO.attribute("byte_begin", (int64_t)S.ByteBegin);
+                      JO.attribute("byte_end", (int64_t)S.ByteEnd);
+                    }
                   });
                 }
               });
