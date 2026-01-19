@@ -578,7 +578,34 @@ private:
   ///          macro, unknown) the hunk logically belongs to.
   Owner ClassifyOwnerWithSegments(StringRef tuPath, const diffutils::Hunk &h);
 
-  /// Returns the innermost (smallest-width) patchable macro invocation that
+  /// \brief Returns \c true if the given macro invocation is lexically contained
+  /// within a \c #define directive in the same source file.
+  ///
+  /// This is a safety/eligibility guard used by args-only macro patching. If an
+  /// invocation occurs inside the spelling of a macro definition (i.e., within
+  /// the byte range of a \c #define directive), treating it as a normal
+  /// call-site can produce incorrect or destabilizing rewrites (e.g.,
+  /// attempting to patch an invocation that is part of the macro's replacement
+  /// list, creating self-referential edits, or breaking idempotence under
+  /// re-preprocessing).
+  ///
+  /// The implementation relies on the producer-emitted directive list in the
+  /// \c RefoldModel. It scans \c MacroDirective entries with
+  /// \c subkind == "#define" in the same file as the invocation and checks
+  /// whether the invocation's byte range \c [m.invB, m.invE) lies fully within
+  /// the directive's site byte range \c [d.siteB, d.siteE).
+  ///
+  /// Note that this is a purely lexical containment test. It does not interpret
+  /// macro semantics or nested directive structure; it assumes directive site
+  /// ranges are accurate and non-overlapping for a given file.
+  ///
+  /// \param m Macro invocation metadata (file path and invocation byte range).
+  /// \returns \c true if the invocation is fully contained within a \c #define
+  ///          directive's site range in the same file; otherwise \c false.
+  bool IsInvocationInsideDefineDirective(
+      const RefoldModel::MacroInvocation &m) const;
+
+  /// \brief Returns the innermost (smallest-width) patchable macro invocation that
   /// fully covers a given A-span.
   ///
   /// This is identical in spirit to smallestCoveringMacro (choose the smallest

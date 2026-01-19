@@ -32,6 +32,7 @@
 #include <cassert>
 #include <functional>
 #include <limits>
+#include <optional>
 
 using namespace llvm;
 
@@ -163,7 +164,9 @@ namespace refold {
 
 namespace {
 template <typename T = RefoldModel::PPSpan>
-Expected<std::vector<T>> parseSpans(const json::Value &val, StringRef ctx) {
+Expected<std::vector<T>>
+parseSpans(const json::Value &val, StringRef ctx,
+           std::optional<RefoldModel::PPArgSpanKind> argKind = std::nullopt) {
   std::vector<T> out;
   auto arrOrErr = asArray(val, ctx);
   if (!arrOrErr)
@@ -199,6 +202,20 @@ Expected<std::vector<T>> parseSpans(const json::Value &val, StringRef ctx) {
       if (!argOrErr)
         return argOrErr.takeError();
       span.argIdx = *argOrErr;
+
+      assert(argKind && "missing 'argKind' when parsing a PPArgSpan type");
+      if (RefoldModel::HasByteRange(*argKind)) {
+        auto bbOrErr = applyToField(asInt, *obj, "byte_begin", ctxItem);
+        if (!bbOrErr)
+          return bbOrErr.takeError();
+        span.byteBegin = *bbOrErr;
+        auto beOrErr = applyToField(asInt, *obj, "byte_end", ctxItem);
+        if (!beOrErr)
+          return beOrErr.takeError();
+        span.byteEnd = *beOrErr;
+      }
+    } else {
+      assert(!argKind && "unexpected PPArgSpanKind on non-PPArgSpan type");
     }
 
     out.push_back(std::move(span));
@@ -598,10 +615,29 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
 
         std::vector<PPArgSpan> argSpans;
         if (const json::Value *spansVal = obj->get("arg_spans")) {
-          auto sp = parseSpans<PPArgSpan>(*spansVal, "macro.arg_spans");
+          auto sp = parseSpans<PPArgSpan>(*spansVal, "macro.arg_spans",
+                                          PPArgSpanKind::Standard);
           if (!sp)
             return sp.takeError();
           argSpans = std::move(*sp);
+        }
+
+        std::vector<PPArgSpan> stringifySpans;
+        if (const json::Value *spansVal = obj->get("stringify_spans")) {
+          auto sp = parseSpans<PPArgSpan>(*spansVal, "macro.stringify_spans",
+                                          PPArgSpanKind::Stringify);
+          if (!sp)
+            return sp.takeError();
+          stringifySpans = std::move(*sp);
+        }
+
+        std::vector<PPArgSpan> pasteSpans;
+        if (const json::Value *spansVal = obj->get("paste_spans")) {
+          auto sp = parseSpans<PPArgSpan>(*spansVal, "macro.paste_spans",
+                                          PPArgSpanKind::Paste);
+          if (!sp)
+            return sp.takeError();
+          pasteSpans = std::move(*sp);
         }
 
         std::vector<PPSpan> bodySpans;
@@ -642,6 +678,8 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
                            /*ownerIncludeId*/ std::move(ownerIncludeId),
                            /*spans*/ std::move(spans),
                            /*argSpans*/ std::move(argSpans),
+                           /*stringifySpans*/ std::move(stringifySpans),
+                           /*pasteSpans*/ std::move(pasteSpans),
                            /*bodySpans*/ std::move(bodySpans),
                            /*coverBegin*/ coverBOpt,
                            /*coverEnd*/ coverEOpt);

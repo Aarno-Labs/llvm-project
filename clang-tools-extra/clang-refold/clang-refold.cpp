@@ -699,7 +699,7 @@ int main(int argc, char **argv) {
       auto ppOrErr = preprocessToBytes(PPModPath, *ctxOrErr);
       if (!ppOrErr) {
         handleAllErrors(ppOrErr.takeError(), [&](const ErrorInfoBase &e) {
-          fatal("pp", "failed to preprocess --check input: {0}", e.message());
+          fatal("pp", "failed to preprocess --pp-mod input: {0}", e.message());
         });
       }
       bBytes = std::move(*ppOrErr);
