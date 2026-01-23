@@ -114,12 +114,10 @@ Error compareTokens(ArrayRef<PPTok> aToks, ArrayRef<PPTok> bToks) {
 
 // ========================== Public entry points ==========================
 
-Expected<std::string>
-RefoldEngine::Refold(const json::Object &rootJson, StringRef aSource,
-                     ArrayRef<PPTok> aToks, ArrayRef<std::size_t> aTokOff,
-                     StringRef bSource, ArrayRef<PPTok> bToks,
-                     ArrayRef<std::size_t> bTokOff, bool onlyCheck,
-                     bool noLines) {
+Expected<std::string> RefoldEngine::Refold(
+    const json::Object &rootJson, StringRef aSource, ArrayRef<PPTok> aToks,
+    ArrayRef<size_t> aTokOff, StringRef bSource, ArrayRef<PPTok> bToks,
+    ArrayRef<size_t> bTokOff, bool onlyCheck, bool noLines, bool strict) {
   if (onlyCheck) {
     if (Error err = compareTokens(aToks, bToks))
       return std::move(err);
@@ -133,7 +131,7 @@ RefoldEngine::Refold(const json::Object &rootJson, StringRef aSource,
 
   // Construct an engine and run the instance pipeline.
   RefoldEngine engine(std::move(*mOrErr), aSource, aToks, aTokOff, bSource,
-                      bToks, bTokOff, noLines);
+                      bToks, bTokOff, noLines, strict);
   return engine.Refold();
 }
 
@@ -251,7 +249,7 @@ std::string RefoldEngine::Refold() {
       mapped++;
   }
   debug("lcs", "mapped A->B = {0} ({1:F1}%)", mapped,
-        100.0 * mapped / std::max<std::size_t>(1U, aSeq.size()));
+        100.0 * mapped / std::max<size_t>(1U, aSeq.size()));
 
   info("plan", "TU={0} includes={1} macroInvocations={2} tokmap={3}", tuPath,
        model_.GetIncludes().size(), model_.GetMacroInvocations().size(),
@@ -261,22 +259,21 @@ std::string RefoldEngine::Refold() {
   auto hunks = diffutils::hunksFromMap(a2b, static_cast<int>(aSeq.size()),
                                        static_cast<int>(bSeq.size()));
 
-  for (std::size_t i = 0; i < hunks.size(); ++i) {
+  for (size_t i = 0; i < hunks.size(); ++i) {
     const auto &h = hunks[i];
 
     StringRef bfrag;
     if (h.bStart < h.bEnd) {
-      const std::size_t b0 = bTokOff_[static_cast<std::size_t>(h.bStart)];
-      const std::size_t b1 = bTokOff_[static_cast<std::size_t>(h.bEnd)];
+      const size_t b0 = bTokOff_[static_cast<size_t>(h.bStart)];
+      const size_t b1 = bTokOff_[static_cast<size_t>(h.bEnd)];
       // Defensive clamping (should already be valid since offsets have
       // sentinel):
-      const std::size_t lo = std::max<std::size_t>(0U, b0);
-      const std::size_t hi = std::max<std::size_t>(lo, b1);
+      const size_t lo = std::max<size_t>(0U, b0);
+      const size_t hi = std::max<size_t>(lo, b1);
       bfrag = bSource_.substr(lo, hi - lo);
     }
 
-    std::string shown =
-        stringutils::showWS(stringutils::clip(bfrag.str(), 160));
+    std::string shown = stringutils::showWSWithClip(bfrag.str(), 160);
     debug("hunks", "#{0} {1:verbose} B='{2}'", i, h, shown);
   }
 
@@ -290,7 +287,7 @@ std::string RefoldEngine::Refold() {
   DenseMap<int, DenseMap<int, MacroPatch>> macroPatchByOwnerByMacroId;
 
   // Iterate over all hunks:
-  for (std::size_t i = 0; i < hunks.size(); ++i) {
+  for (size_t i = 0; i < hunks.size(); ++i) {
     const auto &h = hunks[i];
 
     // Shape info (pure insert/delete/replace) – LOG ONLY
@@ -427,7 +424,7 @@ std::string RefoldEngine::Refold() {
             span.first, span.second, h.aStart, h.aEnd);
       std::string repl;
       if (span.first >= 0 && h.bStart < h.bEnd) {
-        std::size_t b0 = bTokOff_[h.bStart], b1 = bTokOff_[h.bEnd];
+        size_t b0 = bTokOff_[h.bStart], b1 = bTokOff_[h.bEnd];
         repl.assign(bSource_.data() + b0, bSource_.data() + b1);
       }
 
@@ -463,9 +460,8 @@ std::string RefoldEngine::Refold() {
 
         debug("classify",
               "#{0} -> TU  bytes=[{1},{2}) rawRepl='{3}' paddedRepl='{4}'", i,
-              span.first, span.second,
-              stringutils::showWS(stringutils::clip(repl, 160)),
-              stringutils::showWS(stringutils::clip(padded, 160)));
+              span.first, span.second, stringutils::showWSWithClip(repl, 160),
+              stringutils::showWSWithClip(padded, 160));
 
         ResyncOutcome ro =
             ApplyResyncOrPend(tuBytes, span.first, span.second, padded, tuPath);
@@ -666,14 +662,14 @@ std::string RefoldEngine::Refold() {
   // Apply TU edits in descending order of start offset.
   debug("tu/apply", "applying {0} TU edits", tuEdits.size());
   std::string tuResult = ApplyTextEditsWithPendingResync(tuBytes, tuEdits);
-  debug("plan", "REFOLD DONE tuResultLen={0}", tuResult.length());
+  debug("plan", "REFOLD DONE tuResultLen={0}", tuResult.size());
   return tuResult;
 }
 
 // ================== A ↔ B token mapping & diff utilities ===================
 
 std::vector<std::string> RefoldEngine::MapLexemes(ArrayRef<PPTok> toks,
-                                                  ArrayRef<std::size_t> offs) {
+                                                  ArrayRef<size_t> offs) {
   std::vector<std::string> out;
   out.reserve(toks.size());
   for (std::size_t i = 0; i < toks.size(); ++i) {
@@ -691,7 +687,7 @@ std::vector<std::string> RefoldEngine::MapLexemes(ArrayRef<PPTok> toks,
 std::vector<unsigned>
 RefoldEngine::ComputeOwnerDepthGapsForPP(size_t numOfAOffs) {
   // aTokOff.size() == (#tokens) + 1 (sentinel). LCS expects N == #tokens,
-  // and ownerDepthGap.length == N + 1.
+  // and ownerDepthGap.size() == N + 1.
   const size_t N = numOfAOffs - 1;
   std::vector<unsigned> ownerDepthGap(N + 1, 0);
 
@@ -1162,7 +1158,7 @@ bool RefoldEngine::HunkMapsToTU(int a0, int a1, StringRef tuPath) const {
 
   // Otherwise, either both neighbors are TU, or there are no neighbors at all.
   // In both situations we treat this as a TU-owned insertion and let tuByteSpan
-  // place it using the neighbor-based heuristics.
+  // place it using the deterministic neighbor-based insertion policy.
   return true;
 }
 
@@ -1519,577 +1515,1289 @@ bool RefoldEngine::MacroExpansionEnvelopeB(
   return true;
 }
 
-bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInB(
-    const RefoldModel::MacroInvocation &m, int argIdx, StringRef newArg,
-    ArrayRef<int> a2b, const DenseSet<int> &stringifyParams) const {
-  if (m.argSpans.empty())
+bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
+    const RefoldModel::MacroInvocation &m, int argIdx, StringRef baseArg,
+    StringRef newArg, ArrayRef<int> a2b, const diffutils::Hunk &hintHunk,
+    bool checkPasteSpans) const {
+  if (newArg.data() == nullptr)
+    return false;
+
+  // Conservatism: if we cannot locate any occurrence metadata for this arg,
+  // do not block args-only.
+  bool hasAny = false;
+  for (const auto &s : m.argSpans) {
+    if (s.argIdx == argIdx) {
+      hasAny = true;
+      break;
+    }
+  }
+
+  if (!hasAny) {
+    for (const auto &s : m.pasteSpans) {
+      if (s.argIdx == argIdx) {
+        hasAny = true;
+        break;
+      }
+    }
+  }
+
+  if (!hasAny)
     return true;
 
-  std::vector<RefoldModel::PPArgSpan> argHoles =
-      ComputeArgSpansFromBodySpansWithArgIdx(m.bodySpans, m.argSpans);
+  StringRef argTrim = newArg.trim();
+  StringRef baseTrim = baseArg.trim();
 
-  const size_t n = bTokOff_.size();
-  for (const auto &sp : argHoles) {
-    if (sp.argIdx != argIdx)
-      continue;
-
-    // Compute the B-side token envelope for this argument occurrence, even if
-    // the A-side argument tokens were edited (and therefore do not map through
-    // A->B).
-    int bStartTok = -1;
-    int bEndTok = -1; // exclusive
-
-    int bLeft = MapBackwardToB(a2b, sp.begin - 1);
-    int bRight = MapForwardToB(a2b, sp.end);
-
-    if (bLeft >= 0 && bRight >= 0 && bLeft < bRight) {
-      // Tokens strictly between the mapped neighbors correspond to this
-      // occurrence.
-      bStartTok = bLeft + 1;
-      bEndTok = bRight;
-    } else {
-      // Fallback: try to map any surviving tokens within the occurrence span
-      // itself.
-      int bS = MapForwardToB(a2b, sp.begin);
-      int bE = MapBackwardToB(a2b, sp.end - 1);
-      if (bS >= 0 && bE >= 0 && bS <= bE) {
-        bStartTok = bS;
-        bEndTok = bE + 1;
-      } else {
-        return false;
+  // If this arg is stringified anywhere, accept args-only without enforcing
+  // paste-span checks.
+  bool argIsStringified = false;
+  if (strict_) {
+    for (const auto &s : m.stringifySpans) {
+      if (s.argIdx == argIdx) {
+        argIsStringified = true;
+        break;
       }
     }
 
-    if (bStartTok < 0 || bEndTok < 0 || bStartTok > bEndTok ||
-        static_cast<size_t>(bEndTok) > n - 1)
-      return false;
+    // Check all STRINGIFY spans for this argument, but only in strict mode.
+    if (argIsStringified) {
+      for (const auto &s : m.stringifySpans) {
+        if (s.argIdx != argIdx)
+          continue;
 
-    StringRef tok =
-        stringutils::trimEdgeSpaces(SliceBSource(bStartTok, bEndTok));
-    if (tok == newArg)
+        auto bEnv =
+            MapAToBTokenEnvelopeStrictWithHint(a2b, s.begin, s.end, hintHunk);
+        if (!bEnv)
+          return false;
+
+        StringRef tok = SliceBSource(bEnv->first, bEnv->second).trim();
+        std::string expect = stringutils::quoteCString(argTrim);
+        if (tok != expect) {
+          trace("macro/consistency",
+                "STRINGIFY mismatch inv id={0} name={1} argIdx={2} tok={3} "
+                "expect={4}",
+                m.id, m.name, argIdx, tok, expect);
+          return false;
+        }
+      }
+    }
+  }
+
+  enum PasteType : unsigned {
+    Unknown,
+    Prefix,
+    Suffix,
+    Whole,
+    Ambiguous
+  };
+
+  // Determine whether token pasting consumes a prefix/suffix/whole segment of
+  // this argument: 0=none/unknown, 1=prefix, 2=suffix, 3=whole, 4=ambiguous
+  PasteType pasteConsume = PasteType::Unknown;
+  for (const auto &ps : m.pasteSpans) {
+    if (ps.argIdx != argIdx)
       continue;
 
-    // Stringification: the expansion contains a string literal whose
-    // unstringified contents correspond to the macro argument text at the
-    // invocation site.
-    if (stringutils::looksLikeStringLiteralToken(tok)) {
-      std::optional<std::string> un = UnstringifyLiteralToArgText(tok);
-      if (un && *un == newArg)
-        continue;
+    StringRef aTokText = SliceASource(ps.begin, ps.end).trim();
+    if (aTokText.empty())
+      continue;
 
-      // If this formal param is stringified somewhere in the macro body, the
-      // edited B stream may legitimately have the diagnostic string out-of-sync
-      // with the unstringified occurrence (e.g., assert). Prefer the unstringi-
-      // fied occurrence rather than rejecting argsOnly solely because the
-      // string literal differs.
-      if (stringifyParams.count(argIdx))
-        continue;
+    if (ps.byteBegin < 0 || ps.byteEnd < ps.byteBegin ||
+        static_cast<size_t>(ps.byteEnd) > aTokText.size())
+      continue;
+
+    StringRef segA = aTokText.substr(ps.byteBegin, ps.byteEnd - ps.byteBegin);
+    if (segA.empty())
+      continue;
+
+    bool starts = baseTrim.starts_with(segA);
+    bool ends = baseTrim.ends_with(segA);
+
+    PasteType dir;
+    if (baseTrim == segA)
+      dir = PasteType::Whole;
+    else if (starts && !ends)
+      dir = PasteType::Prefix;
+    else if (ends && !starts)
+      dir = PasteType::Suffix;
+    else if (starts && ends)
+      dir = PasteType::Ambiguous;
+    else
+      dir = PasteType::Unknown;
+
+    if (dir == PasteType::Unknown)
+      continue;
+
+    if (pasteConsume == PasteType::Unknown)
+      pasteConsume = dir;
+    else if (pasteConsume != dir)
+      pasteConsume = PasteType::Ambiguous;
+  }
+
+  // Verify all standard (non-paste) occurrences.
+  for (const auto &s : m.argSpans) {
+    if (s.argIdx != argIdx)
+      continue;
+
+    if (s.kind != RefoldModel::PPArgSpanKind::Standard)
+      continue;
+
+    // Best-effort envelope. For now this is equivalent to StrictWithHint;
+    // it exists as a semantic marker for call sites that want a best-effort
+    // mapping.
+    auto bEnv =
+        MapAToBTokenEnvelopeStrictWithHint(a2b, s.begin, s.end, hintHunk);
+    if (!bEnv || bEnv->first < 0 || bEnv->second <= bEnv->first)
+      return false;
+
+    StringRef tokText = SliceBSource(bEnv->first, bEnv->second).trim();
+    if (tokText.empty())
+      return false;
+
+    bool ok;
+    if (pasteConsume == PasteType::Suffix) {
+      // Suffix segment is consumed by pasting; standard expansion is the
+      // prefix.
+      ok = argTrim.starts_with(tokText);
+    } else if (pasteConsume == PasteType::Prefix) {
+      // Prefix segment is consumed by pasting; standard expansion is the
+      // suffix.
+      ok = argTrim.ends_with(tokText);
+    } else {
+      ok = (tokText == argTrim);
     }
 
-    return false;
+    if (!ok)
+      return false;
+  }
+
+  if (argIsStringified)
+    return true;
+
+  // Paste-span verification is optional for callers that validate paste-token
+  // correctness as a group (e.g., multi-span paste edits). When disabled, we
+  // only validate standard+stringify occurrences above.
+  if (!checkPasteSpans)
+    return true;
+
+  // If the current hunk does not touch any paste token, skip verifying paste
+  // spans to avoid false negatives when the A->B token mapping is incomplete
+  // away from the edit site.
+  if (!HunkTouchesAnyPasteToken(m, hintHunk))
+    return true;
+
+  // Verify all paste-span occurrences.
+  for (const auto &ps : m.pasteSpans) {
+    if (ps.argIdx != argIdx)
+      continue;
+
+    auto bEnv = MapAToBTokenEnvelopePasteStrictWithHint(a2b, ps.begin, ps.end,
+                                                        hintHunk);
+    if (!bEnv || bEnv->first < 0 || bEnv->second <= bEnv->first)
+      return false;
+
+    if (bEnv->second - bEnv->first != 1)
+      return false;
+
+    StringRef aTokText = SliceASource(ps.begin, ps.end).trim();
+    StringRef bTokText = SliceBSource(bEnv->first, bEnv->second).trim();
+
+    if (ps.byteBegin < 0 || ps.byteEnd < ps.byteBegin ||
+        static_cast<size_t>(ps.byteEnd) > aTokText.size())
+      return false;
+
+    StringRef oldSeg = aTokText.substr(ps.byteBegin, ps.byteEnd - ps.byteBegin);
+
+    int delta =
+        static_cast<int>(bTokText.size()) - static_cast<int>(aTokText.size());
+    int bbB = ps.byteBegin;
+    int beB = ps.byteEnd + delta;
+    if (bbB < 0 || beB < bbB || static_cast<size_t>(beB) > bTokText.size())
+      return false;
+
+    // NOTE: Do NOT require the token outside this segment to be identical
+    // between A and B. Multiple macro arguments can contribute to the same
+    // pasted token, and a single edit hunk may simultaneously modify multiple
+    // segments (e.g., a_b_c -> d_e_f). Full pasted-token consistency is
+    // validated separately via pasteArgReplacementsMatchAllPasteTokensInB(...).
+    StringRef segB = bTokText.substr(bbB, beB - bbB);
+
+    // Determine where this pasted segment comes from within the original
+    // argument spelling.
+    bool starts = baseTrim.starts_with(oldSeg);
+    bool ends = baseTrim.ends_with(oldSeg);
+
+    bool ok;
+    if (baseTrim == oldSeg) {
+      ok = (argTrim == segB);
+    } else if (starts && !ends) {
+      ok = argTrim.starts_with(segB);
+    } else if (ends && !starts) {
+      ok = argTrim.ends_with(segB);
+    } else {
+      // Ambiguous or unclassifiable: refuse args-only.
+      ok = false;
+    }
+
+    if (!ok)
+      return false;
   }
 
   return true;
+}
+
+bool RefoldEngine::HunkTouchesAnyPasteToken(
+    const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h) {
+  if (m.pasteSpans.empty())
+    return false;
+
+  const int a0 = h.aStart;
+  const int a1 = h.aEnd;
+
+  // Insertion hunk: treat as touching if the insertion point lies "on" a paste
+  // span boundary.
+  if (a0 == a1) {
+    for (const auto &s : m.pasteSpans) {
+      if (a0 >= s.begin && a0 <= s.end)
+        return true;
+    }
+    return false;
+  }
+
+  // Replacement/deletion hunk: interval intersection between [a0, a1) and
+  // [s.begin, s.end).
+  for (const auto &s : m.pasteSpans) {
+    if (a0 < s.end && a1 > s.begin)
+      return true;
+  }
+
+  return false;
+}
+
+std::optional<RefoldEngine::PasteArgEdit>
+RefoldEngine::DerivePasteArgEdit(const RefoldModel::MacroInvocation &m,
+                                 const diffutils::Hunk &h,
+                                 ArrayRef<int> a2b) const {
+  // This helper only applies when the producer reported paste spans.
+  if (m.pasteSpans.empty())
+    return std::nullopt;
+
+  // Collect all paste span occurrences that intersect the hunk in A-token
+  // space.
+  //
+  // Each PPArgSpan in pasteSpans corresponds to one argument's contribution to
+  // a single pasted token emitted in A_PP. Multiple arguments may contribute
+  // disjoint (or adjacent) byte segments inside the same pasted token, and the
+  // hunk may touch one of those segments.
+  std::vector<const RefoldModel::PPArgSpan *> cands;
+  for (const auto &ps : m.pasteSpans) {
+    if (ps.begin < h.aEnd && h.aStart < ps.end)
+      cands.push_back(&ps);
+  }
+
+  if (cands.empty())
+    return std::nullopt;
+
+  // All candidates must refer to the same pasted-token occurrence. In practice,
+  // each candidate has the same [begin,end) A-token envelope (the pasted
+  // token), but different argIdx and [byteBegin,byteEnd) describing which byte
+  // subrange of the pasted token came from that argument.
+  const auto *tokenSpan = cands[0];
+
+  // Map the pasted token envelope in A to its corresponding envelope in B. For
+  // paste edits we require a strict mapping: the A pasted token must map to
+  // exactly one B token that we will diff against.
+  auto bEnvOpt = MapAToBTokenEnvelopePasteStrictWithHint(a2b, tokenSpan->begin,
+                                                         tokenSpan->end, h);
+  if (!bEnvOpt || bEnvOpt->first < 0 || bEnvOpt->second <= bEnvOpt->first)
+    return std::nullopt;
+
+  // Paste-aware edits handled here must stay within a single B token. If the
+  // pasted token turned into multiple tokens in B, the edit is not a pure
+  // within-token paste segment rewrite, so bail out.
+  if (bEnvOpt->second - bEnvOpt->first != 1)
+    return std::nullopt;
+
+  // Grab the raw token spellings for the pasted token in A and B.
+  // tokenSpan.begin/end are A-token indices; bEnv[0]/bEnv[1] are B-token
+  // indices.
+  StringRef aTokRaw = SliceASource(tokenSpan->begin, tokenSpan->end);
+  StringRef bTokRaw = SliceBSource(bEnvOpt->first, bEnvOpt->second);
+
+  // Strip trailing newlines to stabilize within-token diffs.
+  auto stripTrailingNL = [](StringRef s) {
+    while (s.ends_with("\n"))
+      s = s.drop_back();
+    return s;
+  };
+
+  StringRef aTok = stripTrailingNL(aTokRaw);
+  StringRef bTok = stripTrailingNL(bTokRaw);
+
+  // Compute the minimal differing region between the two token spellings:
+  // aTok = [common prefix][DIFF_A][common suffix]
+  // bTok = [common prefix][DIFF_B][common suffix]
+  size_t pref = 0;
+  size_t minLen = std::min(aTok.size(), bTok.size());
+  while (pref < minLen && aTok[pref] == bTok[pref]) {
+    pref++;
+  }
+
+  size_t aLen = aTok.size();
+  size_t bLen = bTok.size();
+  size_t suff = 0;
+
+  // While we haven't reached the prefix on either side
+  // and the characters from the back match...
+  while (suff < (aLen - pref) && suff < (bLen - pref) &&
+         aTok[aLen - 1 - suff] == bTok[bLen - 1 - suff]) {
+    suff++;
+  }
+
+  int diffStart = static_cast<int>(pref);
+  int diffEndA = static_cast<int>(aLen - suff);
+
+  // If there is no difference at all, this hunk cannot be explained as a
+  // paste-segment rewrite.
+  if (diffStart >= diffEndA && aTok.size() == bTok.size())
+    return std::nullopt;
+
+  // Now choose exactly one candidate argument contribution whose
+  // [byteBegin,byteEnd) overlaps the differing region. The producer provided
+  // byteBegin/byteEnd in pasted-token text coordinates.
+  //
+  // We require the edit to be attributable to a single argument slice. If
+  // multiple slices overlap the diff region, we cannot express it as a
+  // single-arg args-only rewrite.
+  const RefoldModel::PPArgSpan *chosen = nullptr;
+  for (const auto *ps : cands) {
+    if (ps->byteBegin < 0 || ps->byteEnd < ps->byteBegin)
+      continue;
+
+    bool hit;
+    if (diffStart == diffEndA) {
+      // Pure insertion/deletion at a point (no width in A). Treat as
+      // overlapping if the point lies strictly inside the candidate slice.
+      hit = (ps->byteBegin <= diffStart) && (diffStart < ps->byteEnd);
+    } else {
+      // General overlap between [diffStart,diffEndA) and
+      // [ps.byteBegin,ps.byteEnd).
+      int lo = std::max(ps->byteBegin, diffStart);
+      int hi = std::min(ps->byteEnd, diffEndA);
+      hit = hi > lo;
+    }
+
+    if (hit) {
+      if (!chosen)
+        chosen = ps;
+      else
+        return std::nullopt; // Overlaps multiple args.
+    }
+  }
+
+  if (!chosen)
+    return std::nullopt;
+
+  // Extract the old contributed segment from the A pasted token.
+  int bb = chosen->byteBegin;
+  int be = chosen->byteEnd;
+
+  if (bb < 0 || be < bb || static_cast<size_t>(be) > aTok.size())
+    return std::nullopt;
+
+  // Compute the corresponding segment coordinates in the B pasted token.
+  //
+  // We assume the token-level edit does not permute the contribution
+  // boundaries; instead, the chosen segment grows/shrinks by the overall token
+  // length delta (bTokLen - aTokLen). This allows us to map [bb,be) in A to
+  // [bb,be+delta) in B.
+  int delta = static_cast<int>(bTok.size()) - static_cast<int>(aTok.size());
+  int bbB = bb;
+  int beB = be + delta;
+  if (bbB < 0 || beB < bbB || static_cast<size_t>(beB) > bTok.size())
+    return std::nullopt;
+
+  // Safety gate: ensure the only edits to the pasted token are within the
+  // chosen segment.
+  //
+  // This requires both:
+  // - the prefix before bb matches exactly
+  // - the suffix after be matches exactly (after shifting by delta in B)
+  if (aTok.substr(0, bb) != bTok.substr(0, bbB))
+    return std::nullopt;
+
+  if (aTok.substr(be) != bTok.substr(beB))
+    return std::nullopt;
+
+  std::string oldSeg = aTok.substr(bb, be - bb).str();
+  std::string newSeg = bTok.substr(bbB, beB - bbB).str();
+
+  return PasteArgEdit(chosen->argIdx, std::move(newSeg), std::move(oldSeg));
+}
+
+std::optional<std::vector<RefoldEngine::PasteArgEdit>>
+RefoldEngine::DerivePasteArgEdits(const RefoldModel::MacroInvocation &m,
+                                  const diffutils::Hunk &h,
+                                  ArrayRef<int> a2b) const {
+  if (m.pasteSpans.empty())
+    return std::nullopt;
+
+  // Gather all paste spans that intersect this hunk in the A-stream.
+  std::vector<const RefoldModel::PPArgSpan *> cands;
+  for (const auto &ps : m.pasteSpans) {
+    if (ps.begin < h.aEnd && h.aStart < ps.end)
+      cands.push_back(&ps);
+  }
+
+  if (cands.empty())
+    return std::nullopt;
+
+  // All candidates should reference the same pasted token range [begin, end) in A.
+  const auto *tokenSpan = cands[0];
+
+  auto bEnvOpt = MapAToBTokenEnvelopePasteStrictWithHint(a2b, tokenSpan->begin,
+                                                         tokenSpan->end, h);
+  if (!bEnvOpt || bEnvOpt->first < 0 || bEnvOpt->second <= bEnvOpt->first)
+    return std::nullopt;
+
+  // Paste edits are only representable as args-only when the A-span maps to
+  // exactly one B token.
+  if (bEnvOpt->second - bEnvOpt->first != 1)
+    return std::nullopt;
+
+  StringRef aTokRaw = SliceASource(tokenSpan->begin, tokenSpan->end);
+  StringRef bTokRaw = SliceBSource(bEnvOpt->first, bEnvOpt->second);
+
+  // Strip trailing newlines using StringRef for efficiency.
+  auto stripTrailingNL = [](StringRef s) {
+    while (s.ends_with("\n"))
+      s = s.drop_back();
+    return s;
+  };
+
+  StringRef aTok = stripTrailingNL(aTokRaw);
+  StringRef bTok = stripTrailingNL(bTokRaw);
+
+  // Multi-span paste edits may change the overall pasted token length (e.g.,
+  // a_b_c -> foo_bar_baz). This is still safe to refold *as long as* the
+  // non-arg "fixed" slices of the pasted token remain unchanged, and we can
+  // deterministically segment the B token into the per-arg regions.
+  //
+  // We derive the new per-arg segments by walking the A token left-to-right and
+  // using the fixed (non-span) substrings between paste spans as anchors. If
+  // spans are adjacent (no fixed anchor) and the total length changes,
+  // segmentation is ambiguous and we conservatively return null.
+  std::vector<const RefoldModel::PPArgSpan *> spans = cands;
+  std::sort(spans.begin(), spans.end(), [](const auto *p1, const auto *p2) {
+    return p1->byteBegin < p2->byteBegin;
+  });
+
+  std::optional<std::vector<std::string>> newSegs =
+      SegmentPastedTokenArgsByFixedSlices(aTok, bTok, spans);
+  if (!newSegs)
+    return std::nullopt;
+
+  std::vector<PasteArgEdit> edits;
+  DenseSet<int> seenArgIdx;
+
+  for (size_t i = 0; i < spans.size(); ++i) {
+    const auto *ps = spans[i];
+    if (ps->byteBegin < 0 || ps->byteEnd < ps->byteBegin)
+      return std::nullopt;
+
+    size_t bb = static_cast<size_t>(ps->byteBegin);
+    size_t be = static_cast<size_t>(ps->byteEnd);
+    if (be > aTok.size())
+      return std::nullopt;
+
+    StringRef oldSeg = aTok.substr(bb, be - bb);
+    const std::string &newSeg = (*newSegs)[i];
+
+    if (oldSeg == newSeg)
+      continue;
+
+    // If the same argument index appears twice in the same pasted token with
+    // different edits, it's ambiguous.
+    if (!seenArgIdx.insert(ps->argIdx).second)
+      return std::nullopt;
+
+    edits.emplace_back(ps->argIdx, newSeg, oldSeg.str());
+  }
+
+  if (edits.empty())
+    return std::nullopt;
+
+  return edits;
+}
+
+std::optional<std::vector<std::string>>
+RefoldEngine::SegmentPastedTokenArgsByFixedSlices(
+    StringRef aTok, StringRef bTok,
+    ArrayRef<const RefoldModel::PPArgSpan *> spansAsc) {
+  if (spansAsc.empty())
+    return std::nullopt;
+
+  // Basic span sanity.
+  for (const auto *ps : spansAsc) {
+    if (ps->byteBegin < 0 || ps->byteEnd < ps->byteBegin)
+      return std::nullopt;
+    if (static_cast<size_t>(ps->byteEnd) > aTok.size())
+      return std::nullopt;
+  }
+
+  // Initialize the output vector with empty strings.
+  std::vector<std::string> out(spansAsc.size());
+
+  // Call the recursive worker.
+  if (!SegmentPastedTokenArgsByFixedSlicesRec(aTok, bTok, spansAsc,
+                                              /*idx*/ 0, /*posA*/ 0,
+                                              /*posB*/ 0, out)) {
+    return std::nullopt;
+  }
+
+  return out;
+}
+
+bool RefoldEngine::SegmentPastedTokenArgsByFixedSlicesRec(
+    StringRef aTok, StringRef bTok,
+    ArrayRef<const RefoldModel::PPArgSpan *> spansAsc, int idx, int posA,
+    int posB, MutableArrayRef<std::string> out) {
+  if (static_cast<size_t>(idx) >= spansAsc.size()) {
+    // All spans emitted; remaining fixed tail must match exactly.
+    StringRef tail = aTok.substr(posA);
+    return bTok.substr(posB).starts_with(tail) &&
+           (posB + tail.size() == bTok.size());
+  }
+
+  const auto *ps = spansAsc[idx];
+  if (ps->byteBegin < posA)
+    return false;
+
+  // Match the fixed slice before this span.
+  StringRef fixedBefore = aTok.substr(posA, ps->byteBegin - posA);
+  if (!bTok.substr(posB).starts_with(fixedBefore))
+    return false;
+
+  int argStartB = posB + static_cast<int>(fixedBefore.size());
+  int nextPosA = ps->byteEnd;
+
+  // Determine the fixed slice after this span (up to the next span, or the
+  // tail).
+  StringRef fixedAfter;
+  if (static_cast<size_t>(idx + 1) < spansAsc.size()) {
+    const auto *next = spansAsc[idx + 1];
+    if (next->byteBegin < ps->byteEnd)
+      return false;
+    fixedAfter = aTok.substr(ps->byteEnd, next->byteBegin - ps->byteEnd);
+  } else {
+    fixedAfter = aTok.substr(ps->byteEnd);
+  }
+
+  // If there is no fixed anchor after this span and the total length changed,
+  // we cannot determine the B segment boundary for this arg.
+  if (fixedAfter.empty() && (static_cast<size_t>(idx + 1) < spansAsc.size()) &&
+      (aTok.size() != bTok.size()))
+    return false;
+
+  if (fixedAfter.empty()) {
+    // If this is the final arg span and there is no fixed tail, the arg's
+    // contribution may legally grow or shrink. In that case, consume the
+    // remainder of the B token.
+    //
+    // This is the common case for token-paste macros like:
+    //   CONCAT(X, Y, Z) -> X##_##Y##_##Z
+    // where the last argument is immediately followed by the end of the pasted
+    // token.
+    if (static_cast<size_t>(idx + 1) == spansAsc.size()) {
+      out[idx] = bTok.substr(argStartB).str();
+      return SegmentPastedTokenArgsByFixedSlicesRec(
+          aTok, bTok, spansAsc, idx + 1, nextPosA,
+          static_cast<int>(bTok.size()), out);
+    }
+
+    // Length-stable adjacent spans: use the A span length as the B span length.
+    int aLen = ps->byteEnd - ps->byteBegin;
+    int argEndB = argStartB + aLen;
+    if (static_cast<size_t>(argEndB) > bTok.size())
+      return false;
+
+    out[idx] = bTok.substr(argStartB, aLen).str();
+    return SegmentPastedTokenArgsByFixedSlicesRec(aTok, bTok, spansAsc, idx + 1,
+                                                  nextPosA, argEndB, out);
+  }
+
+  // Search for the fixedAfter anchor in B at/after argStartB. We may have
+  // multiple candidates if fixedAfter appears inside an arg; backtrack
+  // deterministically.
+  size_t k = bTok.find(fixedAfter, argStartB);
+  while (k != StringRef::npos) {
+    int currentK = static_cast<int>(k);
+    out[idx] = bTok.substr(argStartB, currentK - argStartB).str();
+    if (SegmentPastedTokenArgsByFixedSlicesRec(aTok, bTok, spansAsc, idx + 1,
+                                               nextPosA, currentK, out)) {
+      return true;
+    }
+
+    k = bTok.find(fixedAfter, k + 1);
+  }
+
+  return false;
+}
+
+StringRef RefoldEngine::DeriveNewPasteSegmentFromSpellingReplacement(
+    StringRef baseArg, StringRef newArg, StringRef oldSeg) {
+  // Trim all inputs.
+  baseArg = baseArg.trim();
+  newArg = newArg.trim();
+  oldSeg = oldSeg.trim();
+
+  // If the segment is the entire argument, the replacement is the entire new
+  // argument.
+  if (oldSeg == baseArg)
+    return newArg;
+
+  // Case 1: oldSeg is a prefix of baseArg.
+  // Example: base="foo_v1", oldSeg="foo_", new="bar_v1" -> returns "bar"
+  if (baseArg.starts_with(oldSeg)) {
+    StringRef suffix = baseArg.substr(oldSeg.size());
+    if (!newArg.ends_with(suffix))
+      return StringRef();
+
+    // Return the part of newArg that precedes the suffix.
+    return newArg.substr(0, newArg.size() - suffix.size());
+  }
+
+  // Case 2: oldSeg is a suffix of baseArg.
+  // Example: base="v1_foo", oldSeg="_foo", new="v1_bar" -> returns "bar"
+  if (baseArg.ends_with(oldSeg)) {
+    StringRef prefix = baseArg.substr(0, baseArg.size() - oldSeg.size());
+    if (!newArg.starts_with(prefix))
+      return StringRef();
+
+    // Return the part of newArg that follows the prefix.
+    return newArg.substr(prefix.size());
+  }
+
+  return StringRef();
+}
+
+bool RefoldEngine::PasteArgReplacementsMatchAllPasteTokensInB(
+    const RefoldModel::MacroInvocation &m, const diffutils::Hunk &hintHunk,
+    ArrayRef<int> a2b, StringRef baseInvocationText,
+    ArrayRef<std::pair<int, int>> invArgRanges,
+    const DenseMap<int, std::string> &replByArgIdx) const {
+  if (m.pasteSpans.empty())
+    return true;
+
+  // Precompute the original (base) spelling text for each argument we are
+  // proposing to replace. We need this to derive a stable mapping from
+  // "argument replacement" -> "paste segment update".
+  DenseMap<int, std::string> baseArgByIdx;
+  for (const auto &entry : replByArgIdx) {
+    int argIdx = entry.first;
+    if (argIdx < 0 || static_cast<size_t>(argIdx) >= invArgRanges.size())
+      return false;
+
+    auto range = invArgRanges[argIdx];
+    StringRef rawArg =
+        baseInvocationText.substr(range.first, range.second - range.first);
+    baseArgByIdx[argIdx] = rawArg.trim().str();
+  }
+
+  // Group paste spans by the specific pasted-token occurrence they contribute
+  // to. The grouping key is the A token interval [beginTok,endTok) of the
+  // pasted token. In practice, paste spans are expected to describe a single
+  // token, so (endTok - beginTok) should be 1.
+  std::vector<std::pair<int, int>> tokenOrder;
+  DenseMap<std::pair<int, int>, std::vector<RefoldModel::PPArgSpan>> spansByTok;
+  for (const auto &ps : m.pasteSpans) {
+    std::pair<int, int> key = {ps.begin, ps.end};
+    if (spansByTok.find(key) == spansByTok.end()) {
+      tokenOrder.push_back(key);
+    }
+    spansByTok[key].push_back(ps);
+  }
+
+  // For each pasted-token occurrence, simulate applying the per-arg
+  // replacements to its sub-token argument segments and compare against the
+  // edited B token spelling.
+  for (const auto &key : tokenOrder) {
+    int beginTok = key.first;
+    int endTok = key.second;
+
+    // We only support pasted-token occurrences that correspond to exactly one
+    // token in A.
+    if (endTok - beginTok != 1)
+      return false;
+
+    // Map the A pasted-token occurrence to a single B token envelope. This
+    // mapping is paste-aware because token-paste edits often cause the pasted
+    // token to be unmapped in a2b (-1).
+    auto bEnv = MapAToBTokenEnvelopePasteStrictWithHint(a2b, beginTok, endTok,
+                                                        hintHunk);
+    if (!bEnv || (bEnv->second - bEnv->first != 1))
+      return false;
+
+    auto stripNL = [](StringRef s) -> std::string {
+      std::string result = s.str(); // Copy StringRef to a mutable string
+      llvm::erase_if(result, [](char c) { return c == '\n'; });
+      return result;
+    };
+
+    // Extract the pasted token text as produced in A and B. We strip newlines
+    // defensively since slice helpers may include trailing '\n' depending on
+    // how token ranges were formed.
+    std::string aTok = stripNL(SliceASource(beginTok, endTok));
+    std::string bTok = stripNL(SliceBSource(bEnv->first, bEnv->second));
+
+    // Paste spans for this token reference character slices inside the pasted
+    // token spelling. Apply edits in descending byteBegin so earlier rewrites
+    // do not shift later offsets.
+    std::vector<RefoldModel::PPArgSpan> &spans = spansByTok[key];
+    std::sort(spans.begin(), spans.end(), [](const auto &p1, const auto &p2) {
+      return p1.byteBegin > p2.byteBegin;
+    });
+
+    // Start from the A token spelling and simulate the token-paste result after
+    // applying the candidate arg replacements.
+    std::string expected = aTok;
+    for (const auto &ps : spans) {
+      // Only apply span updates for arguments that we are actively replacing.
+      auto it = replByArgIdx.find(ps.argIdx);
+      if (it == replByArgIdx.end())
+        continue;
+      StringRef newArg = it->second;
+
+      // The segment derivation also needs the original spelling of the
+      // argument.
+      auto baseIt = baseArgByIdx.find(ps.argIdx);
+      if (baseIt == baseArgByIdx.end())
+        return false;
+      StringRef baseArg = baseIt->second;
+
+      // The paste span must define a valid character slice inside the A
+      // pasted-token spelling.
+      if (ps.byteBegin < 0 || ps.byteEnd < ps.byteBegin ||
+          static_cast<size_t>(ps.byteEnd) > aTok.size())
+        return false;
+
+      // Extract the original pasted-token segment contributed by this argument.
+      StringRef oldSeg =
+          StringRef(aTok).substr(ps.byteBegin, ps.byteEnd - ps.byteBegin);
+
+      // Derive the new pasted-token segment from the argument replacement. This
+      // is intentionally conservative and must be deterministic; if we cannot
+      // derive a segment safely, fail.
+      StringRef newSeg =
+          DeriveNewPasteSegmentFromSpellingReplacement(baseArg, newArg, oldSeg);
+      if (newSeg.data() == nullptr) // Check for "null" StringRef
+        return false;
+
+      // Rewrite only the identified segment region inside the synthetic pasted-
+      // token spelling.
+      expected =
+          stringutils::replaceRange(expected, ps.byteBegin, ps.byteEnd, newSeg);
+    }
+
+    if (expected != bTok)
+      return false;
+  }
+
+  return true;
+}
+
+std::string RefoldEngine::SplicePasteSegmentIntoSpellingArg(StringRef baseArg,
+                                                            StringRef oldSeg,
+                                                            StringRef newSeg) {
+  StringRef baseTrim = baseArg.trim();
+  StringRef oldTrim = oldSeg.trim();
+  StringRef newTrim = newSeg.trim();
+
+  if (oldTrim.empty())
+    return ""; // Return empty to signal failure/null
+
+  // Only allow unambiguous boundary splices: whole arg, prefix, or suffix.
+  if (baseTrim == oldTrim)
+    return newTrim.str();
+
+  bool starts = baseTrim.starts_with(oldTrim);
+  bool ends = baseTrim.ends_with(oldTrim);
+
+  // Ambiguous case: if it matches both as prefix and suffix, we can't safely
+  // determine which occurrence to replace.
+  if (starts && ends)
+    return "";
+
+  if (starts) {
+    // Return new replacement + remaining suffix of the original arg.
+    return (newTrim.str() + baseTrim.substr(oldTrim.size()).str());
+  }
+
+  if (ends) {
+    // Return original prefix + new replacement.
+    size_t prefixLen = baseTrim.size() - oldTrim.size();
+    return (baseTrim.substr(0, prefixLen).str() + newTrim.str());
+  }
+
+  return "";
 }
 
 std::optional<RefoldEngine::MacroPatch>
 RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h,
     ArrayRef<int> a2b, StringRef baseInvText) const {
-  debug("macro/args",
-        "argsOnly: BEGIN inv id={0} name={1} subkind={2} invB/E=[{3},{4}] "
-        "hA=[{5},{6}) hB=[{7},{8}) baseLen={9}",
-        m.id, m.name, m.subkind, m.GetInvB(), m.GetInvE(), h.aStart, h.aEnd,
-        h.bStart, h.bEnd, baseInvText.size());
-
-  if (m.subkind != "func") {
-    debug("macro/args", "argsOnly: reject inv id={0} (subkind={1} != func)",
-          m.id, m.subkind);
+  // We can only emit an invocation patch if the producer provided a concrete
+  // byte range.
+  if (m.GetInvB() < 0 || m.GetInvE() < 0)
     return std::nullopt;
-  }
 
-  if (baseInvText.empty()) {
-    debug("macro/args", "argsOnly: reject inv id={0} (baseInvText empty)",
-          m.id);
-    return std::nullopt;
-  }
+  trace("macro/args", "args-only? inv id={0} name={1} {2} baseInv={3}", m.id,
+        m.name, h, stringutils::showWSWithClip(baseInvText, 200));
 
-  if (m.GetInvB() < 0 || m.GetInvE() < 0 || m.GetInvB() > m.GetInvE()) {
-    debug("macro/args",
-          "argsOnly: reject inv id={0} (bad invB/E) invB={1} invE={2}", m.id,
-          m.GetInvB(), m.GetInvE());
-    return std::nullopt;
-  }
-
-  std::vector<RefoldModel::PPArgSpan> argHoles =
-      ComputeArgSpansFromBodySpansWithArgIdx(m.bodySpans, m.argSpans);
-
-  // Stringification (#param) produces a string literal token in the expansion
-  // whose SourceLocation is not a macro-arg expansion; the producer therefore
-  // may not emit arg_spans for it. In that case, try to synthesize an arg-hole
-  // for the edited string literal based on the active macro definition.
-  std::optional<MacroDefineInfo> def = FindActiveMacroDefineForInvocation(m);
-  const DenseSet<int> &stringifyParams =
-      def ? def->stringifyParamSet : DenseSet<int>();
-
-  if (argHoles.empty()) {
-    debug("macro/args",
-          "argsOnly: inv id={0} has no argHoles; attempting stringify "
-          "synthesis (def={1})",
-          m.id, (def ? std::to_string(def->directiveId) : "null"));
-
-    argHoles = ComputeStringifyArgHolesForHunk(def, m, h, a2b);
-
-    if (argHoles.empty()) {
-      debug("macro/args",
-            "argsOnly: inv id={0} stringify synthesis produced no argHoles; "
-            "returning nullopt",
-            m.id);
-      return std::nullopt;
-    }
-  }
-
-  std::vector<char> touched(argHoles.size(), 0);
-  if (!HunkFullyWithinArgSpans(h, argHoles, touched)) {
-    debug("macro/args",
-          "argsOnly: inv id={0} hunk not fully within arg spans; returning "
-          "nullopt",
-          m.id);
-    return std::nullopt;
-  }
-
-  // TODO: May need to add rangesOpt->empty() to the conditional
+  // Parse the byte ranges for each argument's "content" within the invocation
+  // spelling. These ranges are later used to splice per-arg replacements back
+  // into the invocation text.
   auto rangesOpt = ParseMacroInvocationArgContentRanges(baseInvText);
-  if (!rangesOpt) {
-    debug("macro/args",
-          "argsOnly: inv id={0} failed to parse arg ranges from base text; "
-          "returning nullopt",
-          m.id);
+  if (!rangesOpt)
     return std::nullopt;
-  }
   const auto &invArgRanges = *rangesOpt;
 
-  // Build per-arg_index replacement strings.
-  // Use a map so multiple hunks and/or multiple occurrences of the same
-  // arg_index coalesce.
-  DenseMap<int, std::string> replByArgIdx;
+  trace("macro/args", "  invArgRanges(%d)=%s", invArgRanges.size(),
+        stringutils::rangesToStringWithSlices(baseInvText, invArgRanges));
 
-  for (size_t i = 0; i < argHoles.size(); ++i) {
+  // Fast path for token-paste edits. A single pasted token can embed multiple
+  // argument contributions (e.g., X##_##Y##_##Z), so a single edit hunk may
+  // change multiple arg segments inside that token (e.g., a_b_c -> d_e_f). In
+  // that case we attempt to derive per-arg segment replacements and splice them
+  // into the invocation spelling.
+  if (HunkTouchesAnyPasteToken(m, h)) {
+    auto edits = DerivePasteArgEdits(m, h, a2b);
+    if (edits && !edits->empty()) {
+      DenseMap<int, std::string> replByArgIdx;
+      for (const auto &pae : *edits) {
+        int argIdx = pae.argIdx;
+        if (argIdx < 0 || static_cast<size_t>(argIdx) >= invArgRanges.size())
+          return std::nullopt;
+
+        // Reject multiple independent edits to the same arg index inside one
+        // pasted token (this can be generalized later, but keeping it strict
+        // avoids ambiguous splice order).
+        if (replByArgIdx.count(argIdx))
+          return std::nullopt;
+
+        auto range = invArgRanges[argIdx];
+        StringRef baseArgText =
+            baseInvText.substr(range.first, range.second - range.first);
+
+        // Splice the sub-token replacement into the spelling arg
+        // conservatively.
+        std::string newArg = SplicePasteSegmentIntoSpellingArg(
+            baseArgText, pae.oldSeg, pae.newSeg);
+        if (newArg.empty())
+          return std::nullopt;
+
+        // Per-arg safety gate: validate standard + stringify occurrences for
+        // this arg.
+        //
+        // NOTE: For multi-span paste edits where the pasted token length may
+        // change, per-arg paste-span validation cannot be done reliably in
+        // isolation. We validate paste tokens as a *group* below via
+        // pasteArgReplacementsMatchAllPasteTokensInB(...).
+        if (!MacroArgReplacementMatchesAllOccurrencesInBIgnorePaste(
+                m, argIdx, baseArgText, newArg, a2b, h)) {
+          return std::nullopt;
+        }
+
+        replByArgIdx[argIdx] = std::move(newArg);
+      }
+
+      if (!replByArgIdx.empty()) {
+        // Combined safety gate: applying all derived replacements must
+        // reconstruct every pasted token occurrence exactly as seen in B.
+        if (!PasteArgReplacementsMatchAllPasteTokensInB(
+                m, h, a2b, baseInvText, invArgRanges, replByArgIdx)) {
+          return std::nullopt;
+        }
+
+        // Apply all replacements to the invocation string (descending order).
+        std::string newInv = baseInvText.str();
+        auto keys = llvm::to_vector<8>(
+            llvm::map_range(replByArgIdx, [](auto &e) { return e.first; }));
+        std::sort(keys.begin(), keys.end(), [&](int a, int b) {
+          return invArgRanges[a].first > invArgRanges[b].first;
+        });
+
+        for (int argIdx : keys) {
+          auto r = invArgRanges[argIdx];
+          newInv = stringutils::replaceRange(newInv, r.first, r.second,
+                                             replByArgIdx[argIdx]);
+        }
+
+        trace("macro/args", "  args-only SUCCESS newInv='{0}'",
+              stringutils::showWSWithClip(newInv, 200));
+        return MacroPatch{m.GetInvB(), m.GetInvE(), std::move(newInv)};
+      }
+    }
+
+    // Single-segment paste edit (existing behavior)
+    //
+    // This handles the common case where only one pasted segment changes (e.g.
+    // X##_##Y, changing just X). The multi-span derivation above requires token
+    // lengths to remain stable; when they do not, we fall back to deriving a
+    // single segment edit from the token-level diff.
+    auto pae = DerivePasteArgEdit(m, h, a2b);
+    if (pae) {
+      int argIdx = pae->argIdx;
+
+      // HARD FAILURE: If we derived a paste edit but the index is invalid,
+      // we must exit, not fall through.
+      if (argIdx < 0 || static_cast<size_t>(argIdx) >= invArgRanges.size())
+        return std::nullopt;
+
+      auto r = invArgRanges[argIdx];
+      StringRef baseArgText = baseInvText.substr(r.first, r.second - r.first);
+      std::string newArg = SplicePasteSegmentIntoSpellingArg(
+          baseArgText, pae->oldSeg, pae->newSeg);
+      if (newArg.empty())
+        return std::nullopt;
+
+      // Safety gate: for single-segment paste edits we can directly validate
+      // all occurrences, including paste-span occurrences, against the B
+      // stream.
+      if (!MacroArgReplacementMatchesAllOccurrencesInB(m, argIdx, baseArgText,
+                                                       newArg, a2b, h))
+        return std::nullopt;
+
+      std::string newInv =
+          stringutils::replaceRange(baseInvText, r.first, r.second, newArg);
+      trace("macro/args", "  args-only SUCCESS newInv='{0}'",
+            stringutils::showWSWithClip(newInv, 200));
+      return MacroPatch{m.GetInvB(), m.GetInvE(), std::move(newInv)};
+    }
+
+    // If we touched paste but could not safely derive a paste splice patch,
+    // fall through to the standard (non-paste) args-only policy below.
+  }
+
+  // Standard (non-paste) args-only policy:
+  // Collect arg-span occurrences (and stringify occurrences) and require the
+  // entire hunk to be covered by those spans. Then derive per-arg replacements
+  // from the B slices.
+  std::vector<RefoldModel::PPArgSpan> occs;
+  append_range(occs, m.argSpans);
+  append_range(occs, m.stringifySpans);
+
+  std::vector<char> occIsStringify;
+  occIsStringify.resize(occs.size());
+  std::fill_n(occIsStringify.begin(), m.argSpans.size(), false);
+  std::fill_n(occIsStringify.begin() + m.argSpans.size(),
+              m.stringifySpans.size(), true);
+
+  trace("macro/args", "  occs={0}",
+        PPArgSpanListToString(occs, occIsStringify));
+  if (occs.empty())
+    return std::nullopt;
+
+  std::vector<char> touched(occs.size(), 0);
+  if (!HunkFullyWithinArgSpans(h, occs, touched)) {
+    trace("macro/args",
+          "  hunk not fully within any arg spans -> fail args-only");
+    return std::nullopt;
+  }
+
+  trace("macro/args", "  touched={0}", stringutils::boolArrayToString(touched));
+
+  // Compute argument replacements implied by each touched occurrence. Multiple
+  // occurrences of the same argIdx must imply the exact same replacement,
+  // otherwise the macro cannot be refolded args-only.
+  DenseMap<int, std::string> replByArgIdx;
+  for (size_t i = 0; i < occs.size(); ++i) {
     if (!touched[i])
       continue;
 
-    const RefoldModel::PPArgSpan &aHole = argHoles[i];
-    int argIdx = aHole.argIdx;
-    if (argIdx < 0 || static_cast<size_t>(argIdx) >= invArgRanges.size()) {
-      debug("macro/args",
-            "argsOnly: inv id={0} bad argIdx={2} (invArgRanges={3}) "
-            "hole=[{4},{5}); returning nullopt",
-            m.id, argIdx, invArgRanges.size(), aHole.begin, aHole.end);
+    const auto &sp = occs[i];
+    int argIdx = sp.argIdx;
+    if (argIdx < 0 || static_cast<size_t>(argIdx) >= invArgRanges.size())
       return std::nullopt;
-    }
 
-    std::optional<std::pair<int, int>> bEnv =
-        MapAToBTokenEnvelope(a2b, aHole.begin, aHole.end);
+    // Base spelling for this argument in the invocation text (used for splice
+    // and consistency).
+    auto r0 = invArgRanges[argIdx];
+    StringRef baseArgText = baseInvText.substr(r0.first, r0.second - r0.first);
+
+    // Map the A occurrence envelope to B using the alignment map. For
+    // paste-kind spans we use the paste-aware envelope mapping; otherwise the
+    // standard strict envelope mapping.
+    auto bEnv =
+        (sp.kind == RefoldModel::PPArgSpanKind::Paste)
+            ? MapAToBTokenEnvelopePasteStrictWithHint(a2b, sp.begin, sp.end, h)
+            : MapAToBTokenEnvelopeStrictWithHint(a2b, sp.begin, sp.end, h);
     if (!bEnv) {
-      // If A-side arg is empty but we have a B-side hunk inside it, use the
-      // hunk span.
-      if (h.bStart < h.bEnd) {
-        debug("macro/args",
-              "argsOnly: inv id={0} mapAToBTokenEnvelope null for "
-              "hole=[{1},{2}); using hunk B[{3},{4})",
-              m.id, aHole.begin, aHole.end, h.bStart, h.bEnd);
-        bEnv = {h.bStart, h.bEnd};
-      } else {
-        debug("macro/args",
-              "argsOnly: inv id={0} mapAToBTokenEnvelope null and empty hunk "
-              "span; returning nullopt",
-              m.id);
+      // Conservative fallback: use the hunk's B range if the span mapping
+      // fails. If the hunk doesn't have a valid B range either, we cannot
+      // safely derive an args-only replacement.
+      if (h.bStart < 0 || h.bEnd < 0 || h.bStart >= h.bEnd)
         return std::nullopt;
-      }
+      bEnv = {h.bStart, h.bEnd};
     }
 
-    // Make sure we include inserted boundary tokens if the hunk expands beyond
-    // mapped tokens.
-    int bLo = bEnv->first;
-    int bHi = bEnv->second;
-    if (h.bStart < h.bEnd) {
-      bLo = std::min(bLo, h.bStart);
-      bHi = std::max(bHi, h.bEnd);
+    // Slice the edited text from B corresponding to this occurrence and treat
+    // it as the candidate replacement for the argument (subject to stringify
+    // decoding and paste lifting below).
+    StringRef bSlice = SliceBSource(bEnv->first, bEnv->second).trim();
+    std::string newArg = bSlice.str();
+
+    // For stringify occurrences, the B slice is a string literal; decode it
+    // back into the argument text that would produce that literal via string-
+    // ification.
+    if (occIsStringify[i]) {
+      auto un = UnstringifyLiteralToArgText(bSlice);
+      if (!un)
+        return std::nullopt;
+      newArg = std::move(*un);
     }
 
-    if (bLo < 0 || bHi < bLo || static_cast<size_t>(bHi) >= bTokOff_.size()) {
-      debug("macro/args",
-            "argsOnly: inv id={0} bad B envelope bLo={1} bHi={2} "
-            "bTokOffSize={3}; returning nullopt",
-            m.id, bLo, bHi, bTokOff_.size());
-      return std::nullopt;
-    }
-
-    int byteLo = bTokOff_[bLo];
-    int byteHi = bTokOff_[bHi];
-    if (byteLo < 0 || byteHi < byteLo ||
-        static_cast<size_t>(byteHi) > bSource_.size()) {
-      debug("macro/args",
-            "argsOnly: inv id={0} bad byte envelope byteLo={1} byteHi={2} "
-            "bLen={3}; returning nullopt",
-            m.id, byteLo, byteHi, bSource_.size());
-      return std::nullopt;
-    }
-
-    StringRef newArg = bSource_.substr(byteLo, byteHi - byteLo);
-    newArg = stringutils::trimEdgeSpaces(newArg);
-
-    // Safety check: replacement must match all occurrences in the expansion
-    if (!MacroArgReplacementMatchesAllOccurrencesInB(m, argIdx, newArg, a2b,
-                                                     stringifyParams)) {
-      debug("macro/args",
-          "argsOnly: inv id={0} argIdx={1} replacement does not match all "
-          "occurrences; returning nullopt",
-          m.id, argIdx);
-      return std::nullopt;
-    }
-
-    // Unstringify if the parameter was stringified (#)
-    std::string newArgStr = newArg.str();
-    if (!stringifyParams.empty() && stringifyParams.count(argIdx)) {
-      // If this edit came from the *stringified* (#param) occurrence, newArg
-      // will be a string literal token and we must invert it back into the
-      // argument text. However, many macros also use the parameter in a normal,
-      // unstringified position (e.g., assert), in which case newArg is already
-      // argument text and should be left as-is.
-      if (stringutils::looksLikeStringLiteralToken(newArg)) {
-        std::optional<std::string> s = UnstringifyLiteralToArgText(newArg);
-        if (!s) {
-          debug("macro/args",
-                "argsOnly: inv id={0} argIdx={1} unsafe to unstringify; "
-                "returning nullopt",
-                m.id, argIdx);
-          return std::nullopt;
-        }
-        newArgStr = *s;
-      }
-    }
-
-    auto [it, inserted] = replByArgIdx.try_emplace(argIdx, newArgStr);
-    if (!inserted && it->second != newArgStr) {
-      debug("macro/args",
-            "argsOnly: inv id={0} conflicting repl for argIdx={1} prev={2} "
-            "new={3}; returning nullopt",
-            m.id, argIdx, it->second, newArgStr);
-      return std::nullopt;
-    }
-  }
-
-  if (replByArgIdx.empty()) {
-    debug("macro/args",
-          "argsOnly: inv id={0} touched no args; returning nullopt", m.id);
-    return std::nullopt;
-  }
-
-  // IMPORTANT: apply right-to-left in invocation text so earlier replacements
-  // don't shift later ranges.
-  std::vector<int> argIdxs;
-  for (auto const &entry : replByArgIdx)
-    argIdxs.push_back(entry.first);
-
-  std::sort(argIdxs.begin(), argIdxs.end(), [&](int i, int j) {
-    return invArgRanges[i].first > invArgRanges[j].first;
-  });
-
-  std::string result = baseInvText.str();
-  for (int argIdx : argIdxs) {
-    auto &range = invArgRanges[argIdx];
-    result.replace(range.first, range.second - range.first,
-                   replByArgIdx[argIdx]);
-  }
-
-  debug("macro/args", "argsOnly: SUCCESS inv id={0} replArgs={1} newInvLen={2}",
-        m.id, replByArgIdx.size(), result.size());
-  return MacroPatch{m.GetInvB(), m.GetInvE(), std::move(result)};
-}
-
-std::optional<RefoldEngine::MacroDefineInfo>
-RefoldEngine::FindActiveMacroDefineForInvocation(
-    const RefoldModel::MacroInvocation &inv) const {
-  std::optional<MacroDefineInfo> best;
-  for (const auto &d : model_.GetMacroDirectives()) {
-    // Only consider #define directives
-    if (d.subkind != "#define")
-      continue;
-
-    // Use the refold-map event ID as an ordering surrogate.
-    // The definition must occur before the invocation.
-    if (d.id >= inv.id)
-      continue;
-
-    // Parse the directive text into a summary
-    std::optional<MacroDefineInfo> info = ParseMacroDefineInfo(d);
-
-    // Skip if parsing failed or if the macro name doesn't match
-    if (!info || inv.name != info->name)
-      continue;
-
-    // Among matching definitions, pick the most recent one (highest
-    // directiveId) before the invocation.
-    if (!best || info->directiveId > best->directiveId) {
-      best = std::move(info);
-    }
-  }
-
-  return best;
-}
-
-std::optional<RefoldEngine::MacroDefineInfo>
-RefoldEngine::ParseMacroDefineInfo(const RefoldModel::MacroDirective &d) {
-  if (d.text.empty())
-    return std::nullopt;
-
-  StringRef s = d.text;
-  size_t i = 0;
-  const size_t n = s.size();
-
-  // Skip leading whitespace
-  while (i < n && stringutils::isWs(s[i]))
-    i++;
-
-  // Expect "#define"
-  if (i >= n || s[i] != '#')
-    return std::nullopt;
-
-  i++; // skip '#'
-  while (i < n && stringutils::isWs(s[i]))
-    i++;
-
-  if (!s.substr(i).starts_with("define"))
-    return std::nullopt;
-
-  i += 6; // length of "define"
-
-  if (i < n && stringutils::isIdentChar(s[i]))
-    return std::nullopt; // e.g. "#defineX"
-
-  while (i < n && stringutils::isWs(s[i]))
-    i++;
-
-  // Parse macro name
-  const size_t nameB = i;
-  while (i < n && stringutils::isIdentChar(s[i]))
-    i++;
-
-  if (i <= nameB)
-    return std::nullopt;
-
-  std::string name = s.substr(nameB, i - nameB).str();
-
-  // Parse function-like parameter list if present
-  std::vector<std::string> params;
-  if (i < n && s[i] == '(') {
-    i++; // skip '('
-    size_t start = i;
-    while (i < n) {
-      char c = s[i];
-      if (c == ')') {
-        AddDefineParam(params, s.substr(start, i - start));
-        i++; // skip ')'
-        break;
-      }
-      if (c == ',') {
-        AddDefineParam(params, s.substr(start, i - start));
-        i++;
-        start = i;
-        continue;
-      }
-      i++;
-    }
-  }
-
-  // Scan replacement list for "#param" occurrences (stringification)
-  std::vector<int> stringifyParamOrder;
-  // Also populate a Set if your MacroDefineInfo uses it for O(1) lookups
-  DenseSet<int> stringifyParamSet;
-
-  if (!params.empty()) {
-    StringRef repl = s.substr(i);
-    for (size_t k = 0; k < repl.size(); k++) {
-      if (repl[k] != '#')
-        continue;
-
-      // Check for token-paste "##"
-      if (k + 1 < repl.size() && repl[k + 1] == '#') {
-        k++; // token-paste, not stringification
-        continue;
-      }
-
-      // Skip whitespace after '#' (e.g., "#  param")
-      size_t j = k + 1;
-      while (j < repl.size() && stringutils::isWs(repl[j]))
-        j++;
-
-      const size_t idB = j;
-      while (j < repl.size() && stringutils::isIdentChar(repl[j]))
-        j++;
-
-      if (j <= idB)
-        continue;
-
-      StringRef ident = repl.substr(idB, j - idB);
-      for (int p = 0; p < static_cast<int>(params.size()); p++) {
-        if (params[p] == ident) {
-          stringifyParamOrder.push_back(p);
-          stringifyParamSet.insert(p);
+    // Optional lift/paste rewrite: when an argument participates in token
+    // pasting, the direct B slice might reflect only the pasted contribution
+    // rather than the full argument spelling. In that case, attempt to replace
+    // only the A occurrence slice within the base argument spelling.
+    if (!occIsStringify[i] && !m.pasteSpans.empty()) {
+      bool argHasPaste = false;
+      for (const auto &ps : m.pasteSpans) {
+        if (ps.argIdx == argIdx) {
+          argHasPaste = true;
           break;
         }
       }
-      k = j - 1;
-    }
-  }
 
-  // Return the populated struct
-  return MacroDefineInfo{d.id, std::move(name), std::move(params),
-                         std::move(stringifyParamOrder),
-                         std::move(stringifyParamSet)};
-}
-
-void RefoldEngine::AddDefineParam(std::vector<std::string> &params,
-                                  StringRef raw) {
-  // .trim() handles leading/trailing whitespace
-  StringRef p = raw.trim();
-
-  if (p.empty())
-    return;
-
-  // Handle variadics: "..." is ignored for stringify mapping.
-  if (p == "...")
-    return;
-
-  // Keep only the identifier prefix of the parameter slot.
-  size_t i = 0;
-  const size_t n = p.size();
-
-  while (i < n && stringutils::isWs(p[i]))
-    i++;
-
-  const size_t b = i;
-  while (i < n && stringutils::isIdentChar(p[i]))
-    i++;
-
-  if (i > b) {
-    params.push_back(p.substr(b, i - b).str());
-  }
-}
-
-std::vector<RefoldModel::PPArgSpan>
-RefoldEngine::ComputeStringifyArgHolesForHunk(
-    const std::optional<MacroDefineInfo> &def,
-    const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h,
-    ArrayRef<int> a2b) const {
-  if (!def || def->stringifyParamOrder.empty())
-    return {};
-  if (h.bStart < 0 || h.bEnd < 0)
-    return {};
-
-  // Only handle edits that target a string literal token in B.
-  const int mn1 = std::min(h.bStart + 1, static_cast<int>(bTokOff_.size()) - 1);
-  StringRef hTok = stringutils::trimEdgeSpaces(SliceBSource(h.bStart, mn1));
-  if (!stringutils::looksLikeStringLiteralToken(hTok))
-    return {};
-
-  int argIdx = -1;
-  if (def->stringifyParamOrder.size() == 1) {
-    argIdx = def->stringifyParamOrder[0];
-  } else {
-    // Determine the B-token envelope covered by the macro expansion
-    auto cov = MacroCoverTokenEnvelopeInB(m, h, a2b);
-    if (!cov)
-      return {};
-
-    int occ = -1;
-    int seen = 0;
-    // Iterate through the envelope and count string literal tokens
-    for (int t = cov->first; t < cov->second; ++t) {
-      const int mn2 = std::min(t + 1, static_cast<int>(bTokOff_.size()) - 1);
-      StringRef tok = stringutils::trimEdgeSpaces(SliceBSource(t, mn2));
-      if (!stringutils::looksLikeStringLiteralToken(tok))
-        continue;
-
-      if (t == h.bStart) {
-        occ = seen;
-        break;
+      if (argHasPaste) {
+        StringRef aSlice = SliceASource(sp.begin, sp.end).trim();
+        if (!aSlice.empty()) {
+          size_t pos = baseArgText.find(aSlice);
+          if (pos != StringRef::npos) {
+            std::string cand = baseArgText.substr(0, pos).str() + bSlice.str() +
+                               baseArgText.substr(pos + aSlice.size()).str();
+            newArg = StringRef(cand).trim().str();
+            trace("macro/args",
+                  "    lift/paste argIdx={0} baseArg={1} aSlice={2} bSlice={3} "
+                  "-> newArg={4}",
+                  argIdx, stringutils::showWSWithClip(baseArgText, 200),
+                  stringutils::showWSWithClip(aSlice, 200),
+                  stringutils::showWSWithClip(bSlice, 200),
+                  stringutils::showWSWithClip(newArg, 200));
+          } else {
+            trace("macro/args",
+                  "    lift/paste FAILED argIdx={0} baseArg={1} aSlice={2} "
+                  "bSlice={3}",
+                  argIdx, stringutils::showWS(baseArgText),
+                  stringutils::showWS(aSlice), stringutils::showWS(bSlice));
+          }
+        }
       }
-      seen++;
     }
 
-    if (occ < 0 || static_cast<size_t>(occ) >= def->stringifyParamOrder.size())
-      return {};
+    // If we've already derived a replacement for this argument index, it must
+    // match exactly.
+    if (replByArgIdx.count(argIdx) && replByArgIdx[argIdx] != newArg)
+      return std::nullopt;
 
-    argIdx = def->stringifyParamOrder[occ];
+    // Final safety gate for this argument: verify that the candidate replace-
+    // ment reproduces all occurrences for argIdx in B, respecting strict/non-
+    // strict stringify policy and paste behavior.
+    if (!MacroArgReplacementMatchesAllOccurrencesInB(m, argIdx, baseArgText,
+                                                     newArg, a2b, h)) {
+      trace(
+          "macro/args",
+          "    consistency check FAILED for argIdx={0} newArg='{1}' -> expand",
+          argIdx, stringutils::showWSWithClip(newArg, 200));
+      return std::nullopt;
+    }
+
+    trace("macro/args", "    consistency OK for argIdx={0}", argIdx);
+    replByArgIdx[argIdx] = std::move(newArg);
   }
 
-  if (argIdx < 0)
-    return {};
+  // If nothing required replacement, there is no meaningful args-only patch to
+  // emit.
+  if (replByArgIdx.empty()) {
+    trace("macro/args", "  replByArgIdx empty -> no-op args-only");
+    return std::nullopt;
+  }
 
-  using PPArgSpanKind = RefoldModel::PPArgSpanKind;
-  return {RefoldModel::PPArgSpan{
-      {h.aStart, h.aEnd}, PPArgSpanKind::Standard, argIdx, -1, -1}};
+  // Apply replacements to the invocation string. We apply in descending argIdx
+  // order so earlier replacements cannot shift the byte ranges of later ones in
+  // the same baseInvocationText.
+  std::string finalInv = baseInvText.str();
+  auto finalKeys = llvm::to_vector(
+      llvm::map_range(replByArgIdx, [](auto &e) { return e.first; }));
+  std::sort(finalKeys.begin(), finalKeys.end(), [&](int a, int b) {
+    return invArgRanges[a].first > invArgRanges[b].first;
+  });
+  for (int argIdx : finalKeys) {
+    auto r = invArgRanges[argIdx];
+    finalInv = stringutils::replaceRange(finalInv, r.first, r.second,
+                                         replByArgIdx[argIdx]);
+  }
+
+  return MacroPatch{m.GetInvB(), m.GetInvE(), std::move(finalInv)};
 }
 
-StringRef RefoldEngine::SliceBSource(int bStartTok, int bEndTok) const {
-  if (bTokOff_.empty() || bSource_.empty())
+StringRef RefoldEngine::SliceSource(ArrayRef<size_t> tokOff, StringRef source,
+                                    int startTok, int endTok) {
+  if (tokOff.empty() || source.empty())
     return "";
 
-  const int n = static_cast<int>(bTokOff_.size());
+  const int n = static_cast<int>(tokOff.size());
 
-  // Clamp token indices to [0, n-1]
-  int loTok = std::clamp(bStartTok, 0, n - 1);
-  int hiTok = std::clamp(bEndTok, loTok, n - 1);
+  // Clamp token indices to valid array bounds.
+  int loTok = std::clamp(startTok, 0, n - 1);
+  int hiTok = std::clamp(endTok, loTok, n - 1);
 
-  int lo = bTokOff_[loTok];
-  int hi = bTokOff_[hiTok];
+  int lo = tokOff[loTok];
+  int hi = tokOff[hiTok];
 
-  const int len = static_cast<int>(bSource_.size());
+  // Clamp byte offsets to the actual string length.
+  const int sourceLen = static_cast<int>(source.size());
+  lo = std::clamp(lo, 0, sourceLen);
+  hi = std::clamp(hi, lo, sourceLen);
 
-  // Clamp byte offsets to [0, len]
-  lo = std::clamp(lo, 0, len);
-  hi = std::clamp(hi, lo, len);
-
-  return bSource_.substr(lo, hi - lo);
+  return source.substr(lo, hi - lo);
 }
 
 std::optional<std::pair<int, int>>
-RefoldEngine::MacroCoverTokenEnvelopeInB(const RefoldModel::MacroInvocation &m,
-                                         const diffutils::Hunk &h,
-                                         ArrayRef<int> a2b) const {
-  int bStartIdx = MapForwardToB(a2b, m.cover.begin);
-  int bEndIdxIn = MapBackwardToB(a2b, m.cover.end - 1);
-
-  // Fallback to hunk boundaries when mapping fails (e.g., tokens deleted).
-  if (bStartIdx < 0)
-    bStartIdx = h.bStart;
-  if (bEndIdxIn < 0 && h.bEnd > 0)
-    bEndIdxIn = h.bEnd - 1;
-
-  // Validate initial anchors.
-  if (bStartIdx < 0 || bEndIdxIn < 0 || bStartIdx > bEndIdxIn)
+RefoldEngine::MapAToBTokenEnvelopeStrict(ArrayRef<int> a2b, int aBegin,
+                                         int aEnd) {
+  if (a2b.empty())
     return std::nullopt;
 
-  // Convert inclusive end index to exclusive boundary: [lo, hi)
-  int lo = bStartIdx;
-  int hi = bEndIdxIn + 1;
+  // Clamp and validate input range.
+  if (aBegin < 0)
+    aBegin = 0;
+  if (aEnd > static_cast<int>(a2b.size()))
+    aEnd = static_cast<int>(a2b.size());
 
-  // Expand to include the hunk's own B-range (h.bEnd is already exclusive).
-  if (h.bStart >= 0)
-    lo = std::min(lo, h.bStart);
-  if (h.bEnd >= 0)
-    hi = std::max(hi, h.bEnd);
-
-  const int n = static_cast<int>(bTokOff_.size());
-  if (n < 2)
+  if (aBegin >= aEnd)
     return std::nullopt;
 
-  lo = std::clamp(lo, 0, n - 2);
-  hi = std::clamp(hi, lo, n - 1);
+  // Case 1: nearest mapped neighbors bracket the span => exact envelope.
+  // mapBackwardToB and mapForwardToB should return -1 on failure.
+  int bLeft = MapBackwardToB(a2b, aBegin - 1);
+  int bRight = MapForwardToB(a2b, aEnd);
 
-  return std::make_pair(lo, hi);
+  if (bLeft >= 0 && bRight >= 0 && bLeft < bRight) {
+    return std::make_pair(bLeft + 1, bRight);
+  }
+
+  // Case 2: span contains mapped tokens => exact min/max envelope.
+  int minB = std::numeric_limits<int>::max();
+  int maxB = std::numeric_limits<int>::min();
+
+  for (int a = aBegin; a < aEnd; ++a) {
+    int b = a2b[a];
+    if (b >= 0) {
+      minB = std::min(minB, b);
+      maxB = std::max(maxB, b);
+    }
+  }
+
+  if (minB == std::numeric_limits<int>::max())
+    return std::nullopt;
+
+  return std::make_pair(minB, maxB + 1);
+}
+
+std::optional<std::pair<int, int>>
+RefoldEngine::MapAToBTokenEnvelopeStrictWithHint(
+    ArrayRef<int> a2b, int aBegin, int aEnd, const diffutils::Hunk &hintHunk) {
+  std::optional<std::pair<int, int>> env =
+      MapAToBTokenEnvelopeStrict(a2b, aBegin, aEnd);
+  if (!env) {
+    // No mapped tokens: only safe envelope is the hint hunk IF it overlaps the
+    // A-span.
+    if (hintHunk.bStart < 0 || hintHunk.bEnd <= hintHunk.bStart)
+      return std::nullopt;
+
+    if (hintHunk.aEnd <= aBegin || hintHunk.aStart >= aEnd)
+      return std::nullopt;
+
+    return std::make_pair(hintHunk.bStart, hintHunk.bEnd);
+  }
+
+  // If the hint hunk does not overlap the A-span, do not use it; return the
+  // strict mapping.
+  if (hintHunk.aEnd <= aBegin || hintHunk.aStart >= aEnd)
+    return env;
+
+  // Detect whether the A-span has unmapped tokens at the edges.
+  int firstMappedA = -1;
+  int lastMappedA = -1;
+
+  int a2bSize = static_cast<int>(a2b.size());
+  for (int a = std::max(0, aBegin); a < std::min(aEnd, a2bSize); ++a) {
+    if (a2b[a] >= 0) {
+      if (firstMappedA < 0)
+        firstMappedA = a;
+      lastMappedA = a;
+    }
+  }
+
+  if (firstMappedA < 0) {
+    // Should not happen if env is valid, but return strict mapping as fallback.
+    return env;
+  }
+
+  bool missingLeft = false;
+  bool missingRight = false;
+
+  for (int a = aBegin; a < firstMappedA; ++a) {
+    if (a >= 0 && a < a2bSize && a2b[a] < 0) {
+      missingLeft = true;
+      break;
+    }
+  }
+  for (int a = lastMappedA + 1; a < aEnd; ++a) {
+    if (a >= 0 && a < a2bSize && a2b[a] < 0) {
+      missingRight = true;
+      break;
+    }
+  }
+
+  int b0 = env->first;
+  int b1 = env->second;
+
+  // Extend ONLY on sides where unmapped tokens exist by merging with the hint.
+  if (missingLeft)
+    b0 = std::min(b0, hintHunk.bStart);
+  if (missingRight)
+    b1 = std::max(b1, hintHunk.bEnd);
+
+  // Ensure envelope is valid.
+  if (b0 < 0)
+    b0 = 0;
+  if (b1 < b0)
+    b1 = b0;
+
+  return std::make_pair(b0, b1);
+}
+
+std::optional<std::pair<int, int>>
+RefoldEngine::MapAToBTokenEnvelopePasteStrictWithHint(
+    ArrayRef<int> a2b, int aBegin, int aEnd, const diffutils::Hunk &hintHunk) {
+  // First try the strict token-mapping envelope (with an optional union with an
+  // overlapping hunk when there is partial mapping).
+  auto env = MapAToBTokenEnvelopeStrictWithHint(a2b, aBegin, aEnd, hintHunk);
+  if (env)
+    return env;
+
+  // No mapped tokens exist for this A span. The only sound B envelope is the
+  // hunk itself, but only if it overlaps the A range and provides a valid B
+  // range.
+  if (hintHunk.bStart < 0 || hintHunk.bEnd <= hintHunk.bStart)
+    return std::nullopt;
+  if (hintHunk.aEnd <= aBegin || hintHunk.aStart >= aEnd)
+    return std::nullopt;
+
+  // The only sound B envelope is the hunk itself.
+  return std::make_pair(hintHunk.bStart, hintHunk.bEnd);
 }
 
 std::optional<std::string>
@@ -2153,8 +2861,7 @@ RefoldEngine::UnstringifyLiteralToArgText(StringRef literalTok) {
 }
 
 bool RefoldEngine::HunkFullyWithinArgSpans(
-    const diffutils::Hunk &h,
-    const std::vector<RefoldModel::PPArgSpan> &argSpans,
+    const diffutils::Hunk &h, ArrayRef<RefoldModel::PPArgSpan> argSpans,
     MutableArrayRef<char> touched) {
   int a0 = h.aStart;
   int a1 = h.aEnd;
@@ -2192,57 +2899,6 @@ bool RefoldEngine::HunkFullyWithinArgSpans(
       return false;
   }
   return any;
-}
-
-std::vector<RefoldModel::PPArgSpan>
-RefoldEngine::ComputeArgSpansFromBodySpansWithArgIdx(
-    const std::vector<RefoldModel::PPSpan> &bodySpans,
-    const std::vector<RefoldModel::PPArgSpan> &argSpans) {
-  if (bodySpans.size() < 2)
-    return {};
-
-  // For a function-like macro, body_spans alternates:
-  // [preArg0], [between0_1], [between1_2], ..., [postLast]
-  // so args are the "holes" between consecutive body spans.
-  //
-  // body_spans may omit "holes" for unused macro parameters. We therefore
-  // recover the invocation-argument index by matching the hole span against
-  // the recorded arg_spans, which include an explicit arg_index.
-  std::vector<RefoldModel::PPArgSpan> out;
-  for (size_t i = 0; i + 1 < bodySpans.size(); ++i) {
-    const RefoldModel::PPSpan &left = bodySpans[i];
-    const RefoldModel::PPSpan &right = bodySpans[i + 1];
-    int b = left.end;
-    int e = right.begin;
-
-    if (b > e)
-      continue;
-
-    int inferredArgIdx = -1;
-    if (!argSpans.empty()) {
-      std::optional<int> found;
-      for (const auto &a : argSpans) {
-        if (SpansOverlapForArgIdx(b, e, a.begin, a.end)) {
-          if (!found) {
-            found = a.argIdx;
-          } else if (*found != a.argIdx) {
-            // Ambiguous: multiple different arg_index values overlap this hole.
-            found = std::nullopt;
-            break;
-          }
-        }
-      }
-
-      if (found)
-        inferredArgIdx = *found;
-    }
-
-    using PPArgSpanKind = RefoldModel::PPArgSpanKind;
-    out.push_back(RefoldModel::PPArgSpan{
-        {b, e}, PPArgSpanKind::Standard, inferredArgIdx, -1, -1});
-  }
-
-  return out;
 }
 
 std::optional<std::vector<std::pair<int, int>>>
@@ -2297,7 +2953,7 @@ RefoldEngine::ParseMacroInvocationArgContentRanges(StringRef invText) {
 
     if (c == ')') {
       if (depth == 0) {
-        out.push_back(TrimWsRange(invText, argStart, i));
+        out.push_back(stringutils::trimWsRange(invText, argStart, i));
         return out;
       }
       depth--;
@@ -2305,7 +2961,7 @@ RefoldEngine::ParseMacroInvocationArgContentRanges(StringRef invText) {
     }
 
     if (c == ',' && depth == 0) {
-      out.push_back(TrimWsRange(invText, argStart, i));
+      out.push_back(stringutils::trimWsRange(invText, argStart, i));
       argStart = i + 1;
     }
   }
@@ -2371,51 +3027,49 @@ RefoldEngine::MacroPatch RefoldEngine::BuildMacroInvocationPatchWholeCover(
   // patched, we need to update our base invocation text to reflect those
   // "inner" changes.
   std::string updatedInvText = baseInvText.str();
-  if (m.invText && !m.argSpans.empty()) {
-    const int fileLen = static_cast<int>(bSource_.size());
-    for (const auto &arg : m.argSpans) {
-      // Find the smallest macro covering this specific argument's token range
-      const RefoldModel::MacroInvocation *innerM =
-          SmallestCoveringMacro(arg.begin, arg.end);
+  const int fileLen = static_cast<int>(bSource_.size());
 
-      // If an inner macro exists and it's not the current one, look for its
-      // patch
-      if (innerM && innerM->id != m.id) {
-        auto ownerIt = patchMap.find(
-            innerM->ownerIncludeId ? *innerM->ownerIncludeId : kNoOwner);
-        if (ownerIt != patchMap.end()) {
-          auto patchIt = ownerIt->second.find(innerM->id);
-          if (patchIt != ownerIt->second.end()) {
-            const std::string &innerReplacement = patchIt->second.replacement;
+  for (const auto &arg : m.argSpans) {
+    // Find the smallest macro covering this specific argument's token range.
+    const RefoldModel::MacroInvocation *innerM =
+        SmallestCoveringMacro(arg.begin, arg.end);
 
-            // Map the preprocessed token indices to global file byte offsets
-            int gStart =
-                ByteStartForPPInFile(m.invFile ? *m.invFile : "", arg.begin,
-                                     /* fallbackToEOF */ false, fileLen);
-            int gEnd =
-                ByteEndForPPInFile(m.invFile ? *m.invFile : "", arg.end - 1,
-                                   /* fallbackToEOF */ false, fileLen);
+    // If an inner macro exists and it's not the current one, look for its
+    // patch.
+    if (innerM && innerM->id != m.id) {
+      auto ownerIt = patchMap.find(
+          innerM->ownerIncludeId ? *innerM->ownerIncludeId : kNoOwner);
+      if (ownerIt != patchMap.end()) {
+        auto patchIt = ownerIt->second.find(innerM->id);
+        if (patchIt != ownerIt->second.end()) {
+          const std::string &innerReplacement = patchIt->second.replacement;
 
-            // TODO: Harden this... i.e., do we need to check if `m.GetInvB()` returns -1??
-            if (gStart != -1 && gEnd != -1) {
-              // Convert global offsets to local offsets relative to the macro
-              // invocation start
-              int localStart = gStart - m.GetInvB();
-              int localEnd = gEnd - m.GetInvB();
+          // Map the preprocessed token indices to global file byte offsets.
+          int gStart =
+              ByteStartForPPInFile(m.invFile ? *m.invFile : "", arg.begin,
+                                   /*fallbackToEOF*/ false, fileLen);
+          int gEnd =
+              ByteEndForPPInFile(m.invFile ? *m.invFile : "", arg.end - 1,
+                                 /*fallbackToEOF*/ false, fileLen);
 
-              if (localStart >= 0 &&
-                  static_cast<size_t>(localEnd) <= m.invText->size()) {
-                StringRef originalArgText =
-                    StringRef(*m.invText)
-                        .substr(localStart, localEnd - localStart);
+          if (gStart != -1 && gEnd != -1) {
+            // Convert global offsets to local offsets relative to macro
+            // invocation start.
+            int localStart = gStart - m.GetInvB();
+            int localEnd = gEnd - m.GetInvB();
 
-                // Replace the original argument text with the already-computed
-                // patch
-                size_t pos = updatedInvText.find(originalArgText);
-                if (pos != std::string::npos) {
-                  updatedInvText.replace(pos, originalArgText.size(),
-                                         innerReplacement);
-                }
+            if (localStart >= 0 && m.invText &&
+                static_cast<size_t>(localEnd) <= m.invText->size()) {
+              StringRef originalArgText =
+                  StringRef(*m.invText)
+                      .substr(localStart, localEnd - localStart);
+
+              // Replace the original argument text with the already-computed
+              // patch.
+              size_t pos = updatedInvText.find(originalArgText);
+              if (pos != std::string::npos) {
+                updatedInvText.replace(pos, originalArgText.size(),
+                                       innerReplacement);
               }
             }
           }
@@ -2429,8 +3083,7 @@ RefoldEngine::MacroPatch RefoldEngine::BuildMacroInvocationPatchWholeCover(
   // Attempt a "surgical" patch where we only replace specific arguments. This
   // is preferred over whole-cover replacement because it preserves the original
   // call-site formatting.
-  std::optional<MacroPatch> argsOnly =
-      BuildMacroInvocationPatchArgsOnly(m, h, a2b, updatedInvText);
+  auto argsOnly = BuildMacroInvocationPatchArgsOnly(m, h, a2b, updatedInvText);
   if (argsOnly)
     return *argsOnly;
 
@@ -2447,11 +3100,12 @@ RefoldEngine::MacroPatch RefoldEngine::BuildMacroInvocationPatchWholeCover(
     if (h.bStart >= h.bEnd) {
       return MacroPatch{m.GetInvB(), m.GetInvE(), ""};
     }
+    // Use hunk coordinates as a last resort.
     bStartIdx = h.bStart;
     bEndIdxEx = h.bEnd - 1;
   }
 
-  // Clamp indices to valid token offset ranges
+  // Clamp indices to valid token offset ranges.
   int covLo = bStartIdx;
   int covHi = bEndIdxEx + 1;
 
@@ -2462,7 +3116,7 @@ RefoldEngine::MacroPatch RefoldEngine::BuildMacroInvocationPatchWholeCover(
     covHi = std::max(covHi, h.bEnd);
   }
 
-  // Clamp indices to valid token offset ranges
+  // Clamp indices to valid token offset ranges.
   const int n = static_cast<int>(bTokOff_.size());
   covLo = std::clamp(covLo, 0, std::max(0, n - 2));
   covHi = std::clamp(covHi, covLo, std::max(covLo, n - 1));
@@ -2470,8 +3124,8 @@ RefoldEngine::MacroPatch RefoldEngine::BuildMacroInvocationPatchWholeCover(
   // Determine a "Strict" envelope: tokens that are definitively part of the
   // expansion.
   int envStrictLo = 0, envStrictHi = 0;
-  bool haveEnvStrict = MacroExpansionEnvelopeB(m, /* onlyInvFile */ true,
-                                               envStrictLo, envStrictHi);
+  bool haveEnvStrict =
+      MacroExpansionEnvelopeB(m, true, envStrictLo, envStrictHi);
   int aLo = covLo, aHi = covHi;
   if (haveEnvStrict) {
     const int iLo = std::max(covLo, envStrictLo);
@@ -2481,16 +3135,18 @@ RefoldEngine::MacroPatch RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
   aLo = std::clamp(aLo, 0, std::max(0, n - 2));
   aHi = std::clamp(aHi, aLo, std::max(aLo, n - 1));
-  size_t byteLoA = bTokOff_[aLo];
-  size_t byteHiA = bTokOff_[aHi];
-  StringRef candA = stringutils::trimEdgeSpaces(
-      (byteHiA > byteLoA) ? bSource_.substr(byteLoA, byteHiA - byteLoA) : "");
+  StringRef candA;
+  if (bTokOff_[aHi] > bTokOff_[aLo]) {
+    candA = stringutils::trimEdgeSpaces(
+        bSource_.substr(bTokOff_[aLo], bTokOff_[aHi] - bTokOff_[aLo]));
+  } else {
+    candA = "";
+  }
 
   // Determine a "Union" envelope: includes adjacent tokens that might be
   // structural (like ';').
   int envAllLo = 0, envAllHi = 0;
-  bool haveEnvAll =
-      MacroExpansionEnvelopeB(m, /* onlyInvFile */ false, envAllLo, envAllHi);
+  bool haveEnvAll = MacroExpansionEnvelopeB(m, false, envAllLo, envAllHi);
   int bLoTok = aLo, bHiTok = aHi;
   if (haveEnvAll) {
     bLoTok = std::min(aLo, envAllLo);
@@ -2499,10 +3155,13 @@ RefoldEngine::MacroPatch RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
   bLoTok = std::clamp(bLoTok, 0, std::max(0, n - 2));
   bHiTok = std::clamp(bHiTok, bLoTok, std::max(bLoTok, n - 1));
-  size_t byteLoB = bTokOff_[bLoTok];
-  size_t byteHiB = bTokOff_[bHiTok];
-  StringRef candB = stringutils::trimEdgeSpaces(
-      (byteHiB > byteLoB) ? bSource_.substr(byteLoB, byteHiB - byteLoB) : "");
+  StringRef candB;
+  if (bTokOff_[bHiTok] > bTokOff_[bLoTok]) {
+    candB = stringutils::trimEdgeSpaces(
+        bSource_.substr(bTokOff_[bLoTok], bTokOff_[bHiTok] - bTokOff_[bLoTok]));
+  } else {
+    candB = "";
+  }
 
   // RECONCILIATION LOGIC: Should we include the extra tokens from 'candB'? We
   // only choose 'candB' if the extra tokens are part of the macro's body and
@@ -2535,8 +3194,9 @@ RefoldEngine::MacroPatch RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
     // Check for a trailing semicolon in the expansion text.
     bool endsAtSemicolon = false;
-    int endByte = static_cast<int>(byteHiB) - 1;
-    while (endByte >= static_cast<int>(byteLoB)) {
+    const int startByte = bTokOff_[bLoTok];
+    int endByte = bTokOff_[bHiTok] - 1;
+    while (endByte >= startByte) {
       char ch = bSource_[endByte];
       if (!stringutils::isWs(ch)) {
         endsAtSemicolon = (ch == ';');
@@ -2551,12 +3211,53 @@ RefoldEngine::MacroPatch RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
   // 4. FINAL MERGE
   /////////////////
+  // If the 'chosen' text looks like a standard call-site (contains the macro
+  // name) but lacks the inner macro patches we calculated in Step 1, prefer
+  // 'updatedInvText'.
   std::string finalResult = chosen.str();
-  if (chosen.contains(m.name) && chosen != updatedInvText) {
+  if (LooksLikeCallsiteText(chosen, m) && chosen != updatedInvText) {
     finalResult = updatedInvText;
   }
 
   return MacroPatch{m.GetInvB(), m.GetInvE(), std::move(finalResult)};
+}
+
+bool RefoldEngine::LooksLikeCallsiteText(
+    StringRef text, const RefoldModel::MacroInvocation &m) {
+  if (m.name.empty())
+    return false;
+
+  StringRef name = m.name;
+  const bool funcLike = (m.subkind == "func");
+
+  int textLen = static_cast<int>(text.size());
+  int nameLen = static_cast<int>(name.size());
+  int from = 0;
+
+  while (from <= textLen - nameLen) {
+    size_t i = text.find(name, from);
+    if (i == StringRef::npos)
+      break;
+
+    int matchIdx = static_cast<int>(i);
+
+    // Ensure identifier boundaries, so we do not match substrings inside other
+    // identifiers.
+    if (stringutils::isIdentBoundary(text, matchIdx - 1) &&
+        stringutils::isIdentBoundary(text, matchIdx + nameLen)) {
+      if (!funcLike)
+        return true;
+
+      int j = matchIdx + nameLen;
+      while (j < textLen && stringutils::isWs(text[j]))
+        j++;
+      if (j < textLen && text[j] == '(')
+        return true;
+    }
+
+    from = matchIdx + nameLen;
+  }
+  return false;
 }
 
 // =========== Include processing (normalize, materialize, apply) ===========
@@ -2611,12 +3312,13 @@ void RefoldEngine::MaterializeIncludeExpansion(
   auto macroIt = macroPatchesByOwner.find(includeId);
   auto childIt = children.find(includeId);
 
-  debug("include/mat",
-        "inc#{0} initialHeaderLen={1} patches={2} macroPatches={3} children={4}",
-        inc->id, bytes.size(),
-        (editsIt != perInclude.end()) ? editsIt->second.patches.size() : 0,
-        (macroIt != macroPatchesByOwner.end()) ? macroIt->second.size() : 0,
-        (childIt != children.end()) ? childIt->second.size() : 0);
+  debug(
+      "include/mat",
+      "inc#{0} initialHeaderLen={1} patches={2} macroPatches={3} children={4}",
+      inc->id, bytes.size(),
+      (editsIt != perInclude.end()) ? editsIt->second.patches.size() : 0,
+      (macroIt != macroPatchesByOwner.end()) ? macroIt->second.size() : 0,
+      (childIt != children.end()) ? childIt->second.size() : 0);
 
   // Collect byte-level edits to apply within this header.
   std::vector<TextEdit> edits;
@@ -2707,7 +3409,8 @@ void RefoldEngine::MaterializeIncludeExpansion(
       const auto &childText = includeExpansion[child->id];
       const int n = static_cast<int>(bytes.size());
       const int siteStart = std::clamp(static_cast<int>(child->siteB), 0, n);
-      const int siteEnd = std::clamp(static_cast<int>(child->siteE), siteStart, n);
+      const int siteEnd =
+          std::clamp(static_cast<int>(child->siteE), siteStart, n);
 
       debug("include/mat",
             "REPLACE in inc#{0}: site=[{1},{2}) len(parent)={3} with child#{4} "
@@ -3040,7 +3743,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         declInfo =
             formatv("kind={0} name={1} header=[{2},{3}) ppSpan=[{4},{5})",
                     decl->kind, decl->name, decl->headerB, decl->headerE,
-                    decl->ppSpan.begin, decl->ppSpan.end).str();
+                    decl->ppSpan.begin, decl->ppSpan.end)
+                .str();
       }
 
       trace("include/apply",
@@ -3052,7 +3756,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     }
 
     edits.push_back(MakeTextEditWithResyncOrPending(
-          headerText, startByte, endByte, replacement, file));
+        headerText, startByte, endByte, replacement, file));
   }
 
   // Apply all edits inside this header, highest offset first so earlier edits
@@ -3090,12 +3794,14 @@ int RefoldEngine::ComputeChildBoundaryInsertByte(const IncludePatch &p,
   }
 
   // We only care about children whose sitePath is this header file.
-  const RefoldModel::IncludeItem *left = nullptr;  // last child whose coverEnd <= pos
-  const RefoldModel::IncludeItem *right = nullptr; // first child whose coverBegin >= pos
+  const RefoldModel::IncludeItem *left =
+      nullptr; // last child whose coverEnd <= pos
+  const RefoldModel::IncludeItem *right =
+      nullptr; // first child whose coverBegin >= pos
 
   int pos = p.aStart; // PP position of the INSERT gap
 
-  for (const auto &child: model_.GetIncludes()) {
+  for (const auto &child : model_.GetIncludes()) {
     // Only check direct children of the owner
     if (!child.parent || *child.parent != owner->id) {
       continue;
@@ -3158,7 +3864,7 @@ RefoldEngine::ApplyResyncOrPend(StringRef originalFileText, int start, int end,
         "drift: span=[{0},{1}) origNl={2} replNl={3} resumeLine={4} file={5} "
         "replTail={6}",
         start, end, origNl, replNl, resumeLine, fileSpellingForDirective,
-        stringutils::showWS(stringutils::clip(replacement, 100)));
+        stringutils::showWSWithClip(replacement, 100));
 
   // Attempt local injection first.
   std::string injected = lineDirs_.MaybeAppendResyncAfterReplacement(
@@ -3380,8 +4086,47 @@ void RefoldEngine::DebugIncludePatch(StringRef tag,
         "{0} inc #{1} hunk A[{2},{3})->B[{4},{5}) Abytes=[{6},{7}) "
         "Bbytes=[{8},{9}) Aslice='{10}' Bslice='{11}'",
         tag, inc.id, h.aStart, h.aEnd, h.bStart, h.bEnd, a0, a1, b0, b1,
-        stringutils::showWS(stringutils::clip(aSlice, 120)),
-        stringutils::showWS(stringutils::clip(bSlice, 120)));
+        stringutils::showWSWithClip(aSlice, 120),
+        stringutils::showWSWithClip(bSlice, 120));
+}
+
+std::string RefoldEngine::PPArgSpanToString(const RefoldModel::PPArgSpan &sp,
+                                            bool isStringifyOcc) {
+  std::string storage;
+  llvm::raw_string_ostream os(storage);
+
+  os << "{kind=" << static_cast<int>(sp.kind) << ", A=[" << sp.begin << ','
+     << sp.end << ')' << ", argIdx=" << sp.argIdx;
+
+  if (isStringifyOcc) {
+    os << ", occ=STRINGIFY";
+  }
+
+  if (sp.kind == RefoldModel::PPArgSpanKind::Paste) {
+    os << ", byte=[" << sp.byteBegin << ',' << sp.byteEnd << ')';
+  }
+
+  os << '}';
+  return os.str();
+}
+
+std::string
+RefoldEngine::PPArgSpanListToString(ArrayRef<RefoldModel::PPArgSpan> spans,
+                                    ArrayRef<char> isStringify) {
+  std::string storage;
+  llvm::raw_string_ostream os(storage);
+
+  os << '[';
+  for (size_t i = 0; i < spans.size(); ++i) {
+    if (i > 0)
+      os << ", ";
+
+    bool isStr = (i < isStringify.size() && isStringify[i]);
+    os << PPArgSpanToString(spans[i], isStr);
+  }
+  os << ']';
+
+  return os.str();
 }
 
 } // namespace refold
