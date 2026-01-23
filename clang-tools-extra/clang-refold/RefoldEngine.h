@@ -191,30 +191,31 @@ public:
   /// \param bTokOff    Byte offsets for B tokens (size = |B| + 1).
   /// \param onlyCheck  If true, then we should only verify that \c aToks and
   ///                   \c bToks align.
-  /// \param noLines    If true, then do not inject #line
+  /// \param noLines    If true, then do not inject #line.
+  /// \param strict     If true, then make stringified args significant.
   /// \returns          The refolded, partially expanded C source.
   static Expected<std::string>
   Refold(const json::Object &rootJson, StringRef aSource, ArrayRef<PPTok> aToks,
-         ArrayRef<std::size_t> aTokOff, StringRef bSource,
-         ArrayRef<PPTok> bToks, ArrayRef<std::size_t> bTokOff, bool onlyCheck,
-         bool noLines);
+         ArrayRef<size_t> aTokOff, StringRef bSource, ArrayRef<PPTok> bToks,
+         ArrayRef<size_t> bTokOff, bool onlyCheck, bool noLines, bool strict);
 
 private:
   const RefoldModel model_;
   StringRef aSource_, bSource_;
   ArrayRef<PPTok> aToks_, bToks_;
-  ArrayRef<std::size_t> aTokOff_, bTokOff_;
+  ArrayRef<size_t> aTokOff_, bTokOff_;
   LineDirectiveInserter lineDirs_;
+  bool strict_;
 
   /// Construct an engine from concrete inputs. The instance method `Refold()`
   /// runs the full pipeline using these captured members.
   RefoldEngine(RefoldModel model, StringRef aSource, ArrayRef<PPTok> aToks,
-               ArrayRef<std::size_t> aTokOff, StringRef bSource,
-               ArrayRef<PPTok> bToks, ArrayRef<std::size_t> bTokOff,
-               bool noLines)
+               ArrayRef<size_t> aTokOff, StringRef bSource,
+               ArrayRef<PPTok> bToks, ArrayRef<size_t> bTokOff, bool noLines,
+               bool strict)
       : model_(std::move(model)), aSource_(aSource), bSource_(bSource),
         aToks_(aToks), bToks_(bToks), aTokOff_(aTokOff), bTokOff_(bTokOff),
-        lineDirs_(!noLines, model_.GetPPCwd()) {}
+        lineDirs_(!noLines, model_.GetPPCwd()), strict_(strict) {}
 
   std::string Refold();
 
@@ -241,6 +242,15 @@ private:
     int start, end;
     std::string text;
     std::optional<PendingResync> pending;
+  };
+
+  struct PasteArgEdit {
+    int argIdx;
+    std::string newSeg;
+    std::string oldSeg;
+
+    PasteArgEdit(int Idx, std::string New, std::string Old)
+        : argIdx(Idx), newSeg(std::move(New)), oldSeg(std::move(Old)) {}
   };
 
   struct MacroPatch {
@@ -378,7 +388,7 @@ private:
   /// \returns A list of lexeme strings of size Toks.size(), containing either
   ///          the original token spelling or a position-tied whitespace sentinel.
   static std::vector<std::string> MapLexemes(ArrayRef<PPTok> toks,
-                                             ArrayRef<std::size_t> offs);
+                                             ArrayRef<size_t> offs);
 
   /// \brief Finds the nearest mapped B-side token index at or after an A-side
   /// position.
@@ -399,8 +409,8 @@ private:
   /// \returns The first `a2b[k]` with `k >= i` and `a2b[k] >= 0`, or -1 if no
   ///          such mapping exists.
   static int MapForwardToB(ArrayRef<int> a2b, int i) {
-    const std::size_t start = (i < 0) ? 0u : static_cast<std::size_t>(i);
-    for (std::size_t k = start; k < a2b.size(); ++k)
+    const size_t start = (i < 0) ? 0u : static_cast<size_t>(i);
+    for (size_t k = start; k < a2b.size(); ++k)
       if (a2b[k] >= 0)
         return a2b[k];
     return -1;
@@ -565,9 +575,10 @@ private:
   ///        based on ownerIncludeId and ownerCondArmId.
   /// 5. If no segment intersects the TU span, or the hunk falls into a
   ///    macro-expansion / slot boundary that cannot be cleanly attributed to a
-  ///    single segment, the owner is returned as Owner::Kind::UNKNOWN and
-  ///    callers are expected to fall back to other heuristics (e.g.
-  ///    hunkMapsToTU or smallestCoveringInclude).
+  ///    single segment, the owner is returned as Owner::Kind::UNKNOWN. Callers
+  ///    must then either (a) expand to a larger structural edit (e.g. realize
+  ///    an include/conditional arm) or (b) reject the hunk as not safely
+  ///    attributable.
   ///
   /// \param tuPath  absolute path of the TU file currently being refolded.
   /// \param h       the hunk to classify (in A-side token coordinates).
@@ -854,7 +865,7 @@ private:
   /// one of the adjacent child headers, even when the intended location is
   /// between #include directives at the parent level.
   ///
-  /// \par Heuristic
+  /// \par Deterministic policy
   /// This method probes PP-space neighbors around the insertion point:
   /// - Find the nearest mapped PP token to the left of \p aPos and to the right
   ///   of \p aPos using FindNearestTokmapEntry().
@@ -881,10 +892,11 @@ private:
   /// in the decision.
   ///
   /// \param h the diff hunk; only pure insertion hunks are considered.
-  /// \param tuPath the TU path for the refold (currently unused by this
-  ///        heuristic but kept for signature consistency).
+  /// \param tuPath the TU path for the refold (currently unused by this policy
+  ///        but kept for signature consistency with other ownership helpers).
   /// \return the parent IncludeItem that should own the insertion if it is
-  ///         between sibling includes; otherwise nullptr.
+  ///         between sibling includes; otherwise nullptr. (meaning the policy
+  ///         does not apply)
   const RefoldModel::IncludeItem *
   BoundaryParentIncludeForPureInsertion(const diffutils::Hunk &h,
                                         StringRef tuPath) const;
@@ -973,334 +985,589 @@ private:
   bool MacroExpansionEnvelopeB(const RefoldModel::MacroInvocation &m,
                                bool onlyInvFile, int &begin, int &end) const;
 
-  /// \brief Validates that an "args-only" macro refolding is representable at
-  /// the invocation site.
+  /// \brief Checks whether an args-only rewrite of a single macro parameter is
+  /// consistent with all **observable** occurrences of that parameter in the
+  /// edited preprocessed stream (B), for the given `MacroInvocation`.
   ///
-  /// This is a safety gate used by the args-only policy: we prefer to rewrite
-  /// only the macro invocation argument text (e.g., `FOO(x)`) instead of
-  /// forcing a full expansion, but only when doing so is consistent with what
-  /// the edited preprocessed output (B) implies for every occurrence of that
-  /// formal parameter in the macro expansion.
+  /// This is the primary safety gate used by args-only macro refolding. It
+  /// validates the proposed replacement against:
+  /// * STANDARD argument occurrences (non-paste expansions) in B
+  /// * STRINGIFY occurrences in B (only when `strict` mode is enabled)
+  /// * PASTE occurrences in B when they can be mapped soundly near the edit site
   ///
-  /// Occurrence identification is driven by refold-map metadata: `m.bodySpans`
-  /// and `m.argSpans` are combined into "argument holes" (PP-token spans)
-  /// tagged with an `argIdx`. Each hole corresponds to one use-site occurrence
-  /// of a formal parameter within the expansion.
+  /// Paste-span validation can be sensitive to local A→B mapping quality, so it
+  /// is intentionally conservative: if paste verification cannot be performed
+  /// safely, the method prefers to return `true` (do not block args-only) unless
+  /// an actual contradiction is detected.
   ///
-  /// For each occurrence, the method derives the corresponding B-token envelope
-  /// deterministically using the A→B alignment map `a2b` (LCS-derived):
-  /// - **Preferred:** map the A tokens adjacent to the occurrence and take the
-  ///   strict interior range in B.
-  /// - **Fallback:** map any surviving A tokens within the occurrence span
-  ///   itself and take the inclusive envelope.
+  /// This wrapper enables paste-span validation (when applicable). For callers
+  /// that validate paste-token correctness as a group (e.g., multi-span paste
+  /// edits), see `MacroArgReplacementMatchesAllOccurrencesInBIgnorePaste`.
   ///
-  /// The extracted B slice is compared against `newArg` after trimming edge
-  /// whitespace.
-  ///
-  /// **Stringification handling:** if the B slice looks like a string literal,
-  /// the method attempts to invert stringification (unstringify) and compare
-  /// the resulting text against `newArg`. Additionally, if `argIdx` is listed
-  /// in `stringifyParams`, then a mismatching string-literal occurrence does
-  /// *not* automatically reject args-only: the B stream may contain a stale
-  /// diagnostic string (e.g., `assert`) that is intentionally not kept in sync
-  /// with the rewritten invocation argument. In that case, agreement on the
-  /// unstringified / non-literal occurrences is treated as sufficient.
-  ///
-  /// **Conservatism:** if required metadata is missing (e.g., `m.argSpans` not
-  /// present), the method returns `true` (vacuously satisfied) rather than
-  /// forcing expansion. If an occurrence cannot be located in B or a
-  /// non-stringified occurrence disagrees with `newArg`, it returns `false`.
-  ///
-  /// \param m Macro invocation being patched (provides cover/body/arg-span
-  ///          metadata).
-  /// \param argIdx Zero-based formal parameter index to validate.
-  /// \param newArg Candidate invocation-site argument text after refolding.
-  /// \param a2b Token mapping from A token indices to B token indices; -1
-  ///            indicates deletion in B.
-  /// \param stringifyParams Set of formal parameter indices that are
-  ///                        stringified somewhere in the macro body (may be
-  ///                        null and treated as empty).
-  /// \returns `true` iff every occurrence of `argIdx` in the macro's B
-  ///          expansion matches `newArg` (directly or via unstringification),
-  ///          allowing mismatching string-literal occurrences when `argIdx` is
-  ///          stringified; `false` otherwise.
+  /// \param m macro invocation being patched
+  /// \param argIdx zero-based macro parameter index being rewritten
+  /// \param baseArg original argument spelling in the invocation (used to
+  ///                classify paste behavior)
+  /// \param newArg proposed new argument spelling for `argIdx`
+  /// \param a2b A→B token index mapping for the current file
+  /// \param hintHunk edit hunk near the change site used to improve mapping
+  ///                 robustness (optional)
+  /// \returns `true` if all verifiable occurrences of `argIdx` in B are
+  ///          consistent with the rewrite; `false` if any required occurrence
+  ///          contradicts the rewrite.
   bool MacroArgReplacementMatchesAllOccurrencesInB(
-      const RefoldModel::MacroInvocation &m, int argIdx, StringRef newArg,
-      ArrayRef<int> a2b, const DenseSet<int> &stringifyParams) const;
+      const RefoldModel::MacroInvocation &m, int argIdx, StringRef baseArg,
+      StringRef newArg, ArrayRef<int> a2b,
+      const diffutils::Hunk &hintHunk) const {
+    return MacroArgReplacementMatchesAllOccurrencesInBImpl(
+        m, argIdx, baseArg, newArg, a2b, hintHunk, /*checkPasteSpans*/ true);
+  }
 
-  /// \brief Attempts to build a `MacroPatch` by reconciling edits strictly
-  /// within the arguments of a function-like macro invocation, rather than
-  /// replacing the entire macro expansion/call-site text.
+  /// \brief Variant of `MacroArgReplacementMatchesAllOccurrencesInB` that
+  /// **intentionally skips** per-span paste validation.
   ///
-  /// This is a “surgical” alternative to whole-macro replacement. It is
-  /// applicable only when the edit hunks are entirely attributable to
-  /// substitutions of one or more formal macro parameters (i.e., within
-  /// argument “holes” in the macro expansion). If the edit overlaps macro
-  /// boilerplate (tokens not originating from a parameter), or if the edit
-  /// cannot be represented by modifying invocation arguments without changing
-  /// other occurrences, the method returns `nullopt` (or equivalent) so the
-  /// caller can fall back to a whole-expansion patch.
+  /// This is used when the caller performs pasted-token validation at a higher
+  /// level (e.g., validating that a set of arg replacements reconstructs the
+  /// entire pasted token exactly via `PasteArgReplacementsMatchAllPasteTokensInB`).
+  /// In that situation, re-validating each paste span in isolation can cause
+  /// false negatives, because:
+  /// * Multiple arguments may contribute to a single pasted token.
+  /// * One edit hunk may modify multiple pasted segments simultaneously.
+  /// * Local A->B mapping can be partial away from the edit site.
   ///
-  /// ### Strategy
+  /// STANDARD occurrences and (in `strict` mode) STRINGIFY occurrences are
+  /// still enforced.
   ///
-  /// - **Eligibility:** Requires `m.subkind == "func"`, a non-empty
-  ///   `baseInvocationText`, and sane invocation byte offsets `invB/invE`.
+  /// \param m macro invocation being patched
+  /// \param argIdx zero-based macro parameter index being rewritten
+  /// \param baseArg original argument spelling in the invocation (used to
+  ///                classify paste behavior)
+  /// \param newArg proposed new argument spelling for `argIdx`
+  /// \param a2b A->B token index mapping for the current file
+  /// \param hintHunk edit hunk near the change site used to improve mapping
+  ///                 robustness (optional)
+  /// \returns `true` if all verifiable non-paste occurrences of `argIdx` in B
+  ///          are consistent with the rewrite; `false` if any required
+  ///          occurrence contradicts it.
+  bool MacroArgReplacementMatchesAllOccurrencesInBIgnorePaste(
+      const RefoldModel::MacroInvocation &m, int argIdx, StringRef baseArg,
+      StringRef newArg, ArrayRef<int> a2b,
+      const diffutils::Hunk &hintHunk) const {
+    return MacroArgReplacementMatchesAllOccurrencesInBImpl(
+        m, argIdx, baseArg, newArg, a2b, hintHunk, /*checkPasteSpans*/ false);
+  }
+
+  /// \brief Core implementation for validating whether a proposed args-only
+  /// rewrite of a macro parameter is consistent with the edited preprocessed
+  /// stream (B).
   ///
-  /// - **Hole identification:** Uses `body_spans` to identify where parameters
-  ///   appear in the expansion and maps those spans to call-site argument
-  ///   indices via `arg_spans` (producing `PPArgSpan` holes annotated with
-  ///   `arg_index`).
+  /// **Goal:** ensure that rewriting parameter `argIdx` from `baseArg` to
+  /// `newArg` at the invocation site will not contradict what is observed in B
+  /// for the same `MacroInvocation`.
   ///
-  /// - **Stringification fallback:** If argument holes are absent (common for
-  ///   stringified occurrences, `#param`, whose expansion token may not be
-  ///   tagged as a macro-arg expansion), attempts to synthesize an argument
-  ///   hole based on the active macro definition and the edited string literal
-  ///   in B.
+  /// ### Evidence sources
+  /// * **STANDARD spans** (`m.argSpans` with kind `STANDARD`): represent direct
+  ///   (non-paste) argument expansions visible in the A stream and alignable
+  ///   into B.
+  /// * **STRINGIFY spans** (`m.stringifySpans`): represent occurrences produced
+  ///   by `#` stringification; checked only when `strict` is enabled.
+  /// * **PASTE spans** (`m.pasteSpans`): represent subranges of a pasted token
+  ///   (via `##`) attributable to `argIdx`. These are optionally verified.
   ///
-  /// - **Containment check:** Verifies the triggering `Hunk` lies fully within
-  /// one
-  ///   or more argument holes. If any part overlaps non-parameter expansion
-  ///   text, the method fails.
+  /// ### Conservatism and missing metadata
+  /// If the invocation provides **no occurrence metadata** for `argIdx` (no
+  /// STANDARD and no PASTE spans), this method returns `true` and does not
+  /// block args-only refolding. This avoids penalizing incomplete producer
+  /// metadata.
   ///
-  /// - **Mapping A→B:** For each touched argument hole, projects the A-side
-  /// token
-  ///   span to a B-side token envelope using `a2b`, widens to include inserted
-  ///   boundary tokens from the hunk when necessary, and extracts the
-  ///   replacement argument text from `bSource` using `bTokOff` (with
-  ///   edge-whitespace trimmed).
+  /// ### Stringify rule (strict mode)
+  /// When `strict` is enabled and `argIdx` is stringified at least once, every
+  /// stringify occurrence must exactly equal `QuoteCString(trimEdgeWS(newArg))`.
+  /// If any stringify occurrence disagrees, the method returns `false`.
   ///
-  /// - **Multi-occurrence consistency:** If a formal parameter appears multiple
-  ///   times in the expansion, the method requires that all corresponding
-  ///   occurrences in B agree with the same argument text. Otherwise, modifying
-  ///   the call-site argument would implicitly change other occurrences and
-  ///   diverge from the edited preprocessed output; in that case it returns
-  ///   `nullopt` (or equivalent) to force a whole-expansion patch.
+  /// ### Paste consumption model for STANDARD spans
+  /// When an argument participates in token pasting, STANDARD occurrences may
+  /// only expose a prefix/suffix of the argument spelling (the remainder is
+  /// consumed into the pasted token). This method infers a coarse consumption
+  /// direction using `baseArg` and the A-side pasted subrange, then validates
+  /// STANDARD occurrences using equality or prefix/suffix checks as appropriate.
   ///
-  /// - **Unstringify:** For edits originating from a `#param` occurrence, if
-  /// the
-  ///   extracted replacement is a string-literal token, attempts to invert it
-  ///   back into argument text (failing safely if the literal cannot be
-  ///   unstringified).
+  /// ### Optional paste-span validation
+  /// If `checkPasteSpans` is disabled, paste spans are not validated here
+  /// (intended for callers that validate pasted-token correctness holistically).
+  /// If enabled, paste spans are only validated when the provided `hintHunk`
+  /// appears to touch a paste token, to avoid false negatives caused by
+  /// incomplete A->B alignment away from the edit site.
   ///
-  /// - **Reconstruction:** Parses `baseInvocationText` to locate per-argument
-  /// byte
-  ///   ranges in the original invocation, then applies replacements
-  ///   right-to-left. Multiple hunks (or multiple holes) that map to the same
-  ///   `arg_index` must resolve to an identical replacement string; conflicts
-  ///   cause failure.
+  /// Paste-span checks validate the *segment* of the pasted token attributable
+  /// to `argIdx`, but they explicitly do **not** require the rest of the token
+  /// to match between A and B, because multiple arguments may contribute to the
+  /// same pasted token and can be edited together.
   ///
-  /// \param M The refold model (used for macro-definition/metadata lookups
-  ///          during hole synthesis and validation).
-  /// \param m The macro invocation being patched.
-  /// \param h The hunk (edit) that triggered the patch attempt.
-  /// \param a2b The token mapping array from original preprocessed (A) to
-  ///            edited (B).
-  /// \param bSource The full text of the edited preprocessed source.
-  /// \param bTokOff List of byte offsets for tokens in `bSource`.
-  /// \param baseInvocationText The original text of the macro call in the TU
-  ///            source.
-  /// \returns A `MacroPatch` containing updated call-site text, or `nullopt`
-  ///          (or equivalent) if the edit is not strictly representable as
-  ///          argument-only changes (or if mapping/consistency checks fail).
+  /// \param m macro invocation being patched
+  /// \param argIdx zero-based macro parameter index being rewritten
+  /// \param baseArg original argument spelling in the invocation (optional)
+  /// \param newArg proposed new argument spelling for `argIdx`
+  /// \param a2b A->B token index mapping for the current file
+  /// \param hintHunk edit hunk near the change site used to improve mapping
+  ///                 robustness (optional)
+  /// \param checkPasteSpans whether to attempt per-span paste verification
+  /// \returns `true` if all verifiable occurrences of `argIdx` in B are
+  ///          consistent with applying the args-only rewrite; `false` on any
+  ///          proven contradiction.
+  bool MacroArgReplacementMatchesAllOccurrencesInBImpl(
+      const RefoldModel::MacroInvocation &m, int argIdx, StringRef baseArg,
+      StringRef newArg, ArrayRef<int> a2b, const diffutils::Hunk &hintHunk,
+      bool checkPasteSpans) const;
+
+  /// \brief Returns `true` if the given hunk touches any token-paste occurrence
+  /// recorded for the macro invocation.
+  ///
+  /// This is used to decide whether a macro edit must be handled by
+  /// paste-aware logic (e.g., mapping sub-token edits back into a contributing
+  /// argument) rather than treating the edit as a normal argument-splice or
+  /// forcing macro realization.
+  ///
+  /// ### Span conventions
+  /// * Replacement/deletion hunks use the half-open interval `[aStart, aEnd)`
+  ///   in A-token space.
+  /// * Paste spans are treated as half-open intervals `[begin, end)` in
+  ///   A-token space.
+  ///
+  /// Insertion hunks have `aStart == aEnd`. For insertions, we conservatively
+  /// treat the hunk as touching a paste span if the insertion point lies on or
+  /// within the paste span boundary (`begin <= aStart <= end`). This ensures
+  /// that edits inserted exactly at a paste boundary are routed through
+  /// paste-aware handling.
+  ///
+  /// \param m macro invocation metadata (optional)
+  /// \param h edit hunk in A-token coordinates (optional)
+  /// \returns `true` if the hunk intersects any paste span; otherwise `false`.
+  static bool HunkTouchesAnyPasteToken(const RefoldModel::MacroInvocation &m,
+                                       const diffutils::Hunk &h);
+
+  /// \brief Attempts to derive a single-argument "paste edit" for a token-pasting
+  /// (`##`) macro invocation.
+  ///
+  /// This is the fast-path used when a hunk touches a `pasteSpans` occurrence.
+  /// In this case, the edited region in the preprocessed output may lie
+  /// *inside* a single pasted token (e.g., changing `a_b_c` to `a_d_c`), which
+  /// cannot be recovered by standard token-to-token argument span matching.
+  /// Instead, the refolder tries to attribute the change to exactly one
+  /// contributing argument by using the producer-provided `[byteBegin, byteEnd)`
+  /// subrange describing each argument's slice within the pasted token.
+  ///
+  /// ### High-level algorithm
+  /// 1. Collect all `pasteSpans` that intersect the hunk in A-token space.
+  /// 2. Map the pasted token envelope from A to B and require that it
+  ///    corresponds to exactly one B token (the pasted token).
+  /// 3. Compute the minimal differing range between the A pasted token text and
+  ///    the B pasted token text. If the token texts are identical, the hunk
+  ///    cannot be attributed to paste behavior.
+  /// 4. Select exactly one candidate paste span whose `[byteBegin, byteEnd)`
+  ///    overlaps the differing region. If multiple argument slices overlap, the
+  ///    edit is not representable as a single-argument args-only patch.
+  /// 5. Verify that all changes are confined to that chosen byte slice (prefix/
+  ///    suffix of the pasted token must match exactly), then return the derived
+  ///    `PasteArgEdit`.
+  ///
+  /// Failure is conservative: this method returns `std::nullopt` unless it can
+  /// prove that a single argument slice accounts for *all* changes to the
+  /// pasted token. Callers should then fall back to normal occurrence-based arg
+  /// patching or macro realization.
+  ///
+  /// Note: this method compares token *text* slices and strips trailing
+  /// newlines from the raw token strings before diffing. It assumes that
+  /// `byteBegin`/`byteEnd` are offsets into the pasted token spelling (not the
+  /// overall PP stream).
+  ///
+  /// \param m macro invocation metadata containing `pasteSpans`
+  /// \param h edit hunk in A-token coordinates
+  /// \param a2b A-token to B-token mapping array (produced by alignment/LCS)
+  /// \returns a `PasteArgEdit` describing a single-argument replacement for the
+  ///          pasted token, or `std::nullopt` if no safe single-arg derivation
+  ///          exists.
+  std::optional<PasteArgEdit>
+  DerivePasteArgEdit(const RefoldModel::MacroInvocation &m,
+                     const diffutils::Hunk &h, ArrayRef<int> a2b) const;
+
+  /// \brief Derives one or more *token-paste* argument edits for a single macro
+  /// invocation hunk.
+  ///
+  /// This helper is used by the args-only macro patching path when the edit
+  /// touches a pasted token (i.e., a token produced via `##`). In that
+  /// situation, the edited surface text in the preprocessed stream may be a
+  /// single identifier that is composed of multiple argument contributions
+  /// (e.g., `a_b_c`), and the refolder must attribute the change back to one or
+  /// more specific macro arguments.
+  ///
+  /// The method operates on the **A-stream** (unmodified preprocessed output
+  /// produced by Clang) and the edited **B-stream** (user-modified preprocessed
+  /// output), using `a2b` token alignment. It is intentionally conservative: it
+  /// returns `std::nullopt` when it cannot produce a deterministic, unambiguous
+  /// decomposition.
+  ///
+  /// ### High-level algorithm
+  /// 1. Collect all `PPArgSpan` entries in `m.pasteSpans` that intersect the
+  ///    hunk's A-token interval `[h.aStart, h.aEnd)`.
+  /// 2. Project the pasted token's A-token interval `[begin, end)` to a B-token
+  ///    envelope using `MapAToBTokenEnvelopePasteStrictWithHint`.
+  /// 3. Require that the pasted A-span maps to **exactly one** B token. If the
+  ///    edit spans multiple B tokens, args-only refolding is not representable
+  ///    and the method returns `std::nullopt`.
+  /// 4. Slice the raw pasted token text from A and B, normalize by stripping
+  ///    trailing newlines, and then deterministically segment the B token into
+  ///    per-argument regions.
+  ///
+  /// Segmentation is performed by anchoring on the *fixed* (non-span) substrings
+  /// between paste spans in the A token. This supports edits that change the
+  /// overall pasted token length (e.g., `a_b_c -> foo_bar_baz`) as long as the
+  /// fixed slices remain unchanged. If two spans are adjacent (no fixed anchor)
+  /// and the total length changes, segmentation becomes ambiguous and the
+  /// method returns `std::nullopt`.
+  ///
+  /// ### Return value
+  /// On success, returns a list of `PasteArgEdit` objects, one per affected
+  /// argument, where each entry captures:
+  /// * `argIdx`: the macro argument index that contributed to the pasted token.
+  /// * `oldSeg`: the original A-token segment contributed by that argument.
+  /// * `newSeg`: the corresponding replacement segment inferred from the edited
+  ///   B token.
+  ///
+  /// If no argument contributions actually change (i.e., the pasted token text
+  /// is identical), or if multiple spans map to the same `argIdx` (ambiguous
+  /// representation for args-only), this method returns `std::nullopt`.
+  ///
+  /// \param m Macro invocation metadata containing paste span information.
+  /// \param h Diff hunk in A/B token space being considered for args-only
+  ///          refolding.
+  /// \param a2b Token alignment map from A-token indices to B-token indices
+  ///            (-1 for unmapped).
+  /// \returns A list of per-argument paste edits, or `std::nullopt` if the edit
+  ///          cannot be represented deterministically as args-only.
+  std::optional<std::vector<PasteArgEdit>>
+  DerivePasteArgEdits(const RefoldModel::MacroInvocation &m,
+                      const diffutils::Hunk &h, ArrayRef<int> a2b) const;
+
+  /// \brief Segments the edited pasted-token spelling (`bTok`) into per-argument
+  /// substrings by using the original pasted-token spelling (`aTok`) as an
+  /// anchor template.
+  ///
+  /// The input `spansAsc` identifies the argument-contributed regions inside
+  /// `aTok`: each `PPArgSpan` provides `[byteBegin, byteEnd)` offsets that
+  /// delimit the portion of `aTok` produced by one argument during token
+  /// pasting. The remaining characters in `aTok` (the gaps between spans, and
+  /// the tail after the final span) are treated as *fixed* slices that must
+  /// appear unchanged and in order in `bTok`.
+  ///
+  /// This method returns a list of segments where `segs[i]` is the substring of
+  /// `bTok` corresponding to `spansAsc[i]`. It succeeds only when the
+  /// segmentation is lexically deterministic:
+  /// * All fixed slices from `aTok` match `bTok` in-order.
+  /// * Each span's boundary in `bTok` can be determined by locating the next
+  ///   fixed slice that follows it (or by consuming the remaining suffix for
+  ///   the final span).
+  ///
+  /// Length-changing edits are supported (e.g. `a_b_c -> foo_bar_baz`) as long
+  /// as fixed slices exist to separate spans, or the growth/shrink is confined
+  /// to the final span. If two adjacent spans have no fixed delimiter between
+  /// them and the overall token length changes, the boundary between those
+  /// spans becomes ambiguous; in that case this method returns `std::nullopt`.
+  ///
+  /// ### Implementation notes
+  /// * `spansAsc` must be non-overlapping, sorted by `byteBegin` ascending, and
+  ///   within `[0, aTok.length()]`; otherwise `std::nullopt` is returned.
+  /// * The search for fixed anchors in `bTok` may have multiple candidates;
+  ///   the helper performs bounded backtracking to find a consistent global
+  ///   segmentation.
+  ///
+  /// \param aTok The original pasted-token spelling from the unedited
+  ///             preprocessed stream (A).
+  /// \param bTok The edited pasted-token spelling from the edited preprocessed
+  ///             stream (B).
+  /// \param spansAsc Argument-contributed spans inside `aTok`, sorted by
+  ///                 `byteBegin`.
+  /// \returns A list of per-arg segment strings from `bTok` aligned to
+  ///          `spansAsc`, or `std::nullopt` if segmentation is not provably
+  ///          deterministic.
+  static std::optional<std::vector<std::string>>
+  SegmentPastedTokenArgsByFixedSlices(
+      StringRef aTok, StringRef bTok,
+      ArrayRef<const RefoldModel::PPArgSpan *> spansAsc);
+
+  /// \brief Recursive worker for `segmentPastedTokenArgsByFixedSlices` that
+  /// performs a deterministic, backtracking match of fixed-slice anchors to
+  /// derive per-span B token segments.
+  ///
+  /// The recursion advances span-by-span. At each step `idx` it:
+  /// 1. Verifies that the fixed slice in `aTok` from `posA` to the current
+  ///    span's `byteBegin` matches exactly in `bTok` at `posB`.
+  /// 2. Computes the argument segment start in `bTok` immediately after that
+  ///    fixed slice.
+  /// 3. Determines the next fixed anchor slice (between the current span end
+  ///    and the next span begin, or the tail after the final span).
+  /// 4. Finds all occurrences of that anchor in `bTok` at/after the argument
+  ///    segment start and tries each as the boundary for this span,
+  ///    recursively validating the remainder.
+  ///
+  /// ### Special cases
+  /// * If the fixed anchor after the current span is empty and this is the
+  ///   final span, the current span consumes the remainder of `bTok` (allowing
+  ///   growth/shrink of the last argument contribution).
+  /// * If the fixed anchor after the current span is empty and there is a next
+  ///   span, segmentation is only allowed when `aTok.length() == bTok.length()`,
+  ///   in which case the B segment length is forced to the original A segment
+  ///   length.
+  ///
+  /// On success, `out[idx]` is assigned the derived `bTok` substring for that
+  /// span. The `out` list is mutated in-place across recursive frames.
+  ///
+  /// \param aTok Original pasted token spelling from the A-stream.
+  /// \param bTok Edited pasted token spelling from the B-stream.
+  /// \param spansAsc Argument spans within `aTok`, sorted by `byteBegin`
+  ///                 ascending.
+  /// \param idx Index of the span currently being segmented.
+  /// \param posA Current cursor in `aTok` (start of the next fixed slice to
+  ///             match).
+  /// \param posB Current cursor in `bTok` (start position where `aTok[posA..]`
+  ///             must match via fixed anchors).
+  /// \param out Output list aligned to `spansAsc`; populated with per-span B
+  ///            substrings.
+  /// \returns `true` if a complete, unambiguous segmentation consistent with
+  ///          all fixed slices exists; otherwise `false`.
+  static bool SegmentPastedTokenArgsByFixedSlicesRec(
+      StringRef aTok, StringRef bTok,
+      ArrayRef<const RefoldModel::PPArgSpan *> spansAsc, int idx, int posA,
+      int posB, MutableArrayRef<std::string> out);
+
+  /// \brief Derives the replacement text for a pasted-token sub-segment
+  /// (`oldSeg`) implied by an args-only rewrite from `baseArg` to `newArg`.
+  ///
+  /// In token-paste macros (`##`), an argument may contribute only a prefix or
+  /// suffix of its spelling to the final pasted token. A paste-span records the
+  /// exact subrange of the pasted token that originated from the argument under
+  /// the *original* invocation spelling. When the invocation argument is
+  /// rewritten, we need to compute the corresponding sub-segment that should
+  /// appear in the pasted token after the rewrite.
+  ///
+  /// This helper implements a simple, deterministic model:
+  /// * If `oldSeg` equals the full trimmed `baseArg`, the entire argument was
+  ///   pasted, so the new segment is the full trimmed `newArg`.
+  /// * If `baseArg` starts with `oldSeg`, then `oldSeg` is a pasted prefix.
+  ///   The suffix remainder of `baseArg` must still appear as a suffix of
+  ///   `newArg`, and the returned segment is `newArg` with that suffix removed.
+  /// * If `baseArg` ends with `oldSeg`, then `oldSeg` is a pasted suffix.
+  ///   The prefix remainder of `baseArg` must still appear as a prefix of
+  ///   `newArg`, and the returned segment is `newArg` with that prefix removed.
+  ///
+  /// If `oldSeg` cannot be classified as the full argument, a prefix, or a
+  /// suffix of `baseArg`, or if `newArg` is not structurally compatible with
+  /// the inferred classification, this returns `std::nullopt`.
+  ///
+  /// \param baseArg original argument spelling (as written at the invocation
+  ///                site)
+  /// \param newArg proposed new argument spelling
+  /// \param oldSeg sub-segment from the pasted token that originated from
+  ///               `baseArg`
+  /// \returns the pasted-token replacement segment implied by
+  ///          `baseArg -> newArg`, or `std::nullopt` if the segment cannot be
+  ///          derived soundly.
+  static StringRef DeriveNewPasteSegmentFromSpellingReplacement(
+      StringRef baseArg, StringRef newArg, StringRef oldSeg);
+
+  /// \brief Validates that a set of candidate argument replacements
+  /// (`replByArgIdx`) reproduces the edited spelling of every token produced
+  /// via `##` token-pasting for a macro invocation.
+  ///
+  /// This is a strict safety gate used by args-only macro patching when the
+  /// macro body contains token-paste operations. In token-pasting macros, the
+  /// preprocessed output often contains *composite* identifiers (or other
+  /// tokens) built from multiple argument contributions. When we attempt to
+  /// refold by modifying only the invocation spelling (instead of realizing the
+  /// macro body), we must ensure that the resulting pasted-token text in the
+  /// edited preprocessed stream is exactly reproduced.
+  ///
+  /// The producer emits `PPArgSpan` entries for paste contributions. Each
+  /// `PPArgSpan` in `m.pasteSpans` describes:
+  /// * Which invocation argument contributed (`argIdx`).
+  /// * The pasted-token occurrence in the A-stream via `[begin, end)` token
+  ///   indices.
+  /// * The sub-token character slice inside the pasted token via
+  ///   `[byteBegin, byteEnd)`.
+  ///
+  /// This method groups paste spans by pasted-token occurrence, maps each A
+  /// occurrence to the corresponding B token using `a2b` (with `hintHunk` as a
+  /// fallback), then simulates rewriting the A pasted token by applying
+  /// per-span segment updates derived from invocation argument replacements.
+  /// The simulation must match the edited B pasted token exactly.
+  ///
+  /// ### Key invariants / constraints
+  /// * Each pasted-token occurrence must map to exactly one token in B.
+  /// * Segment rewrites are applied right-to-left by `byteBegin` to keep
+  ///   offsets stable.
+  /// * If any rewritten pasted token does not equal the B token spelling, this
+  ///   returns `false` and the caller must fall back to macro realization
+  ///   (expansion).
+  ///
+  /// \param m Macro invocation metadata (must contain `pasteSpans`).
+  /// \param hintHunk Overlapping edit hunk used as a conservative envelope
+  ///                 fallback when strict mapping yields no token envelope.
+  /// \param a2b Alignment map from A token index to B token index (-1 for
+  ///            unmapped).
+  /// \param baseInvocationText Invocation spelling text (e.g., "CONCAT(a,b,c)").
+  /// \param invArgRanges Argument content ranges within `baseInvocationText`.
+  /// \param replByArgIdx Candidate replacements per argument index.
+  /// \returns `true` if the replacements reproduce every pasted token
+  ///          occurrence in B.
+  bool PasteArgReplacementsMatchAllPasteTokensInB(
+      const RefoldModel::MacroInvocation &m, const diffutils::Hunk &hintHunk,
+      ArrayRef<int> a2b, StringRef baseInvocationText,
+      ArrayRef<std::pair<int, int>> invArgRanges,
+      const DenseMap<int, std::string> &replByArgIdx) const;
+
+  /// \brief Splices a derived paste-segment edit into a macro argument's
+  /// spelling text.
+  ///
+  /// This helper is used after `derivePasteArgEdit` determines that an edit
+  /// inside a token-pasted (`##`) output token can be attributed to a single
+  /// argument slice. The goal is to rewrite the corresponding invocation
+  /// argument so that re-preprocessing reproduces the edited pasted token in
+  /// B_PP, without realizing (expanding) the macro.
+  ///
+  /// The splice is intentionally conservative: it only applies when `oldSeg`
+  /// matches an unambiguous boundary region of the argument spelling (after
+  /// trimming edge whitespace):
+  /// * Whole-argument replacement: `baseTrim == oldTrim`
+  /// * Prefix splice: `baseTrim` starts with `oldTrim`
+  /// * Suffix splice: `baseTrim` ends with `oldTrim`
+  ///
+  /// If `oldTrim` matches both the prefix and suffix (e.g., repeated text) or
+  /// matches neither, the splice is rejected and `std::nullopt` is returned.
+  /// This avoids ambiguous rewrites that could change the meaning of the macro
+  /// invocation or fail idempotence under re-preprocessing.
+  ///
+  /// Whitespace handling: all comparisons are performed on edge-trimmed forms,
+  /// and the returned value is constructed from the trimmed base text. Callers
+  /// are responsible for re-integrating any desired formatting or argument
+  /// quoting policy around the returned string.
+  ///
+  /// \param baseArg the original invocation argument spelling
+  /// \param oldSeg the segment text contributed by the argument in the pasted
+  ///               token (A stream)
+  /// \param newSeg the replacement segment text observed in the edited pasted
+  ///               token (B stream)
+  /// \returns the rewritten argument spelling if a safe boundary splice is
+  ///          possible; otherwise `std::nullopt`.
+  static std::string SplicePasteSegmentIntoSpellingArg(StringRef baseArg,
+                                                       StringRef oldSeg,
+                                                       StringRef newSeg);
+
+  /// \brief Attempts to build an *args-only* macro invocation patch for a hunk
+  /// attributed to a macro invocation.
+  ///
+  /// An args-only patch rewrites only the invocation argument text (e.g.,
+  /// `MACRO(x,y)`), leaving the macro definition unchanged, such that
+  /// re-preprocessing the refolded TU reproduces the edited preprocessed
+  /// stream `B_PP`. This is preferred over forcing macro realization because
+  /// it preserves the original source structure and avoids pulling expanded
+  /// tokens into the TU.
+  ///
+  /// This method enforces a strict safety contract:
+  /// * The hunk must be fully contained within one or more argument-occurrence
+  ///   spans recorded by the producer for this invocation.
+  /// * For each touched argument, the derived replacement must be consistent
+  ///   with *all* of its occurrences in `B_PP` (standard, paste, and
+  ///   optionally stringify).
+  /// * If any touched occurrence implies conflicting replacements for the same
+  ///   `argIdx`, the patch is rejected.
+  ///
+  /// ### Paste-aware fast path
+  /// If the hunk touches any `pasteSpans` occurrence, the edit may be a
+  /// sub-token change inside a single pasted token (e.g., `a_b_c -> a_d_c`).
+  /// In that case, the method delegates to `derivePasteArgEdit` and then
+  /// splices the changed segment into the corresponding invocation argument
+  /// via `splicePasteSegmentIntoSpellingArg`. The patch is accepted only if the
+  /// resulting argument replacement passes the full occurrence-consistency check.
+  ///
+  /// ### Standard path
+  /// Otherwise, the method derives candidate argument replacements by mapping
+  /// each touched argument-occurrence span from A to B (using the alignment
+  /// map `a2b`), slicing the corresponding B tokens, and interpreting the
+  /// slice as either:
+  /// * Raw token text for standard occurrences, or
+  /// * Unstringified argument text for stringify occurrences.
+  ///
+  /// ### Stringify handling
+  /// Stringify spans are included in the touched-occurrence set even in
+  /// non-strict mode. In strict mode, stringify occurrences must match the
+  /// quoted form of the derived argument; in non-strict mode, stringify
+  /// occurrences contribute replacements only when they are themselves edited,
+  /// enabling consistent edits to both standard and stringified forms without
+  /// forcing realization.
+  ///
+  /// When an argument participates in token pasting, the method may attempt a
+  /// "lift/paste" rewrite: it searches for the original occurrence slice inside
+  /// the invocation argument spelling and replaces just that slice with the
+  /// edited B slice.
+  ///
+  /// On success, returns a `MacroPatch` replacing `[m.invB, m.invE)` in the TU
+  /// byte stream with a newly constructed invocation string. On failure,
+  /// returns `std::nullopt`, signaling that the caller should fall back to
+  /// macro realization/expansion.
+  ///
+  /// \param m macro invocation metadata (argument spans, stringify spans,
+  ///          paste spans, and TU byte range)
+  /// \param h edit hunk attributed to this macro invocation (A/B token
+  ///          coordinates)
+  /// \param a2b A-token to B-token mapping array (produced by alignment/LCS)
+  /// \param baseInvocationText the original invocation source text to be
+  ///                           rewritten (e.g., `MACRO(...)`)
+  /// \returns a `MacroPatch` for args-only invocation rewriting, or
+  ///          `std::nullopt` if not provably safe.
   std::optional<MacroPatch> BuildMacroInvocationPatchArgsOnly(
       const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h,
       const ArrayRef<int> a2b, StringRef baseInvocationText) const;
 
-  /// \brief Finds the `\#define` that is considered "in effect" for a given
-  /// macro invocation.
+  /// \brief Slices a source text by token indices using a token-to-byte offset
+  /// table.
   ///
-  /// This uses the refold-map event `id` as an ordering surrogate for source
-  /// order: only `\#define` directives with `d.id < inv.id` are eligible (i.e.,
-  /// they occur before the invocation in the preprocessor event stream).
+  /// This helper converts a half-open token interval `[startTok, endTok)` into a
+  /// byte-offset range using `tokOff` and returns the corresponding `StringRef`
+  /// of `source`.
   ///
-  /// Each eligible directive is parsed via `parseMacroDefineInfo`. Directives
-  /// that cannot be parsed are ignored. Among parsed directives whose macro
-  /// name matches `inv.name`, the directive with the greatest `id` is selected
-  /// (the most recent definition prior to the invocation), yielding
-  /// deterministic behavior.
+  /// `tokOff` is the token-to-byte offset table:
+  /// * `tokOff[i]` is the starting byte offset of token `i`.
+  /// * The table is expected to have length `(numTokens + 1)`, where the final
+  ///   entry `tokOff[numTokens]` equals `source.size()` (end sentinel).
   ///
-  /// Note: this routine only considers `\#define` directives. It does not model
-  /// `\#undef` or conditional visibility; callers should treat a `nullopt`
-  /// result (or a potentially stale result in the presence of `\#undef`) as a
-  /// signal to fall back to a more conservative strategy (e.g., whole-cover
-  /// expansion).
+  /// For robustness, this method clamps token indices into the valid table range
+  /// and clamps derived byte offsets into `[0, source.size()]`.
   ///
-  /// \param inv Macro invocation whose active definition should be resolved.
-  /// \returns The most recent matching `\#define` prior to `inv`, or
-  /// `std::nullopt`
-  ///          if none can be determined.
-  std::optional<MacroDefineInfo> FindActiveMacroDefineForInvocation(
-      const RefoldModel::MacroInvocation &inv) const;
+  /// \param tokOff   Token-to-byte offset table.
+  /// \param source   The source text to slice.
+  /// \param startTok Inclusive start token index.
+  /// \param endTok   Exclusive end token index.
+  /// \returns A `StringRef` of the source covered by tokens `[startTok, endTok)`.
+  static StringRef SliceSource(ArrayRef<size_t> tokOff, StringRef source,
+                               int startTok, int endTok);
 
-  /// \brief Parses a `\#define` directive text into a compact definition summary
-  /// used by refolding.
-  ///
-  /// The directive text is expected to match the textual form recorded in the
-  /// refold map (e.g., `"#define FOO(X) ...\n"`). This parser is intentionally
-  /// lightweight: it recognizes the directive keyword, extracts the macro
-  /// identifier, and (if the macro is function-like) extracts the parameter
-  /// list by splitting on commas up to the first closing `')'`.
-  ///
-  /// For function-like macros, this method also scans the replacement list
-  /// (everything after the name/parameter list) for stringification operators
-  /// of the form `\#param`. Token pasting `\#\#` is explicitly ignored. Each
-  /// `\#param` occurrence contributes the corresponding parameter index to
-  /// `stringifyOrder` in left-to-right textual order, which is later used to
-  /// associate produced string literals with invocation arguments when
-  /// refolding edits to stringified expansions.
-  ///
-  /// ### Limitations (by design):
-  /// * This is not a full preprocessor parser. It does not model comments, line
-  ///   continuations, nested parentheses, or variadics robustly, and it assumes
-  ///   the parameter list is a simple comma-separated list ending at the first
-  ///   `')'`.
-  /// * The replacement scan is heuristic and may misclassify `\#` occurrences
-  ///   inside literals or comments if those are present in the recorded text.
-  ///
-  /// \param d Macro directive record (must be a `\#define`) whose text is
-  /// parsed.
-  /// \returns A `MacroDefineInfo` containing the directive id, macro name,
-  ///          parameter names, and stringification parameter indices in textual
-  ///          occurrence order; or `std::nullopt` if the text does not parse as
-  ///          a `\#define`.
-  static std::optional<MacroDefineInfo>
-  ParseMacroDefineInfo(const RefoldModel::MacroDirective &d);
+  /// Slices the A-side source text by token indices.
+  /// \see SliceSource
+  StringRef SliceASource(int aStartTok, int aEndTok) const {
+    return SliceSource(aTokOff_, aSource_, aStartTok, aEndTok);
+  }
 
-  /// \brief Normalizes and records a single parameter slot from a function-like
-  /// `\#define`.
-  ///
-  /// This helper takes the raw text accumulated for one parameter (as delimited
-  /// by commas and the closing `')'` in `parseMacroDefineInfo`) and appends the
-  /// parameter identifier to `params`, if one can be extracted.
-  ///
-  /// ### Normalization rules:
-  /// * Whitespace-only and empty slots are ignored.
-  /// * Variadic markers are ignored (`"..."`, and `"name..."` will naturally
-  ///   record `"name"` while the ellipsis is dropped by the identifier-prefix
-  ///   rule).
-  /// * Only the leading identifier prefix of the slot is kept; any trailing
-  ///   punctuation or annotations are discarded.
-  ///
-  /// This is used to build the parameter name table for stringify mapping;
-  /// parameters that cannot be reduced to an identifier are skipped to keep
-  /// downstream logic conservative and deterministic.
-  ///
-  /// \param params Output list to append the extracted parameter identifier to.
-  /// \param raw Raw parameter slot text (may include whitespace and trailing
-  ///            punctuation).
-  static void AddDefineParam(std::vector<std::string> &params, StringRef raw);
+  /// Slices the B-side source text by token indices.
+  /// \see SliceSource
+  StringRef SliceBSource(int bStartTok, int bEndTok) const {
+    return SliceSource(bTokOff_, bSource_, bStartTok, bEndTok);
+  }
 
-  /// \brief Computes synthetic macro-argument "holes" for hunks that edit a
-  /// stringified macro parameter.
+  /// \brief Attempts to invert a string literal token that was produced by
+  /// macro stringification (`#param`) back into a single invocation-site
+  /// argument spelling.
   ///
-  /// Clang's token-origin tracking typically does not attribute the produced
-  /// string literal from `\#param` back to the corresponding invocation
-  /// argument (i.e., `arg_spans` may be missing for stringify output). This
-  /// method bridges that gap by mapping an edit hunk that targets a string
-  /// literal token in the preprocessed B stream back onto the appropriate
-  /// invocation argument index, returning a `PPArgSpan` that callers can treat
-  /// like a normal edited argument span.
-  ///
-  /// ### Eligibility and mapping rules:
-  /// * The macro definition must have at least one stringification occurrence
-  ///   recorded in `def.stringifyParamOrder`.
-  /// * The hunk must target a string literal token in B (checked at
-  /// `h.bStart`).
-  /// * If the macro body contains exactly one `\#param` occurrence, that
-  ///   parameter index is used directly.
-  /// * If the macro body contains multiple `\#param` occurrences, this method
-  ///   determines the B-token envelope covered by the macro expansion for this
-  ///   hunk, then counts string literal tokens within that envelope in
-  ///   left-to-right order. The string literal at `h.bStart` is treated as the
-  ///   `occ`-th stringification occurrence, which maps to the parameter index
-  ///   `def.stringifyParamOrder[occ]`.
-  ///
-  /// The returned `PPArgSpan` uses the hunk's A-span (`[h.aStart, h.aEnd)`) and
-  /// the resolved argument index. If any required information is missing or the
-  /// mapping is ambiguous, this method returns an empty vector so callers can
-  /// fall back to a conservative strategy (e.g., whole-cover expansion).
-  ///
-  /// \param def Parsed `\#define` summary for `m` (including stringify
-  ///            occurrence order).
-  /// \param m Macro invocation whose expansion contains the edited string
-  /// literal.
-  /// \param h Edit hunk being classified/mapped.
-  /// \param a2b A-to-B token mapping for the LCS alignment.
-  /// \param bSource Full B-side preprocessed source text.
-  /// \param bTokOff B token start offsets (token index -> byte offset).
-  /// \returns A singleton vector containing a synthetic `PPArgSpan` for the
-  ///          stringified argument, or an empty vector if the hunk is not a
-  ///          supported stringify edit.
-  std::vector<RefoldModel::PPArgSpan>
-  ComputeStringifyArgHolesForHunk(const std::optional<MacroDefineInfo> &def,
-                                  const RefoldModel::MacroInvocation &m,
-                                  const diffutils::Hunk &h,
-                                  ArrayRef<int> a2b) const;
-
-  /// \brief Slices the B-side source text by token indices.
-  ///
-  /// This helper converts a half-open B-token interval `[bStartTok, bEndTok)`
-  /// into a byte-offset range using `bTokOff` and returns the corresponding
-  /// substring of `bSource`.
-  ///
-  /// `bTokOff` is the B token-to-byte offset table and must be consistent with
-  /// the token stream used elsewhere in refolding:
-  /// * `bTokOff[i]` is the starting byte offset of B token `i`.
-  /// * The table is expected to have length `(numBTokens + 1)`, where the final
-  ///   entry `bTokOff[numBTokens]` equals `bSource.size()` (end sentinel).
-  ///
-  /// For robustness, this method clamps token indices into the valid table
-  /// range and clamps derived byte offsets into `[0, bSource.size()]`. If
-  /// inputs are empty, it returns the empty string.
-  ///
-  /// \param bTokOff Token start offsets for B (length `numBTokens + 1`).
-  /// \param bSource Full B-side preprocessed source text.
-  /// \param bStartTok Inclusive start token index.
-  /// \param bEndTok Exclusive end token index.
-  /// \returns The substring of `bSource` covered by tokens `[bStartTok,
-  /// bEndTok)`.
-  StringRef SliceBSource(int bStartTok, int bEndTok) const;
-
-  /// \brief Computes a conservative B-token envelope for the portion of `m`'s
-  /// expansion affected by a hunk.
-  ///
-  /// The refold map records macro coverage in A-token space via
-  /// `[m.coverBegin, m.coverEnd)`. This routine projects that interval into
-  /// B-token space using the A→B alignment (`a2b`), producing a half-open B
-  /// interval `[lo, hi)` that can be used to scan the macro's expanded tokens
-  /// in B (e.g., to locate string literals produced by `\#param`
-  /// stringification).
-  ///
-  /// Because the A→B mapping may be incomplete near edits, the computed
-  /// envelope is intentionally conservative:
-  /// * `lo` is derived from mapping `m.coverBegin` forward into B; if unmapped,
-  ///   it falls back to `h.bStart`.
-  /// * `hi` is derived from mapping the last covered A token (`m.coverEnd - 1`)
-  ///   backward into B and converting to exclusive-end form; if unmapped, it
-  ///   falls back to `(h.bEnd - 1) + 1`.
-  /// * The envelope is then widened to include the hunk's own B span
-  ///   `[h.bStart, h.bEnd)`.
-  ///
-  /// The returned interval is clamped to the valid token table range, where
-  /// `bTokOff.size()` is `numBTokens + 1`. If no valid envelope can be formed
-  /// (e.g., both endpoints are unmapped and the hunk has no B span), this
-  /// method returns `std::nullopt`.
-  ///
-  /// \param m Macro invocation providing A-token coverage (`coverBegin/End`).
-  /// \param h Edit hunk whose B span should be included in the envelope.
-  /// \param a2b A-to-B token mapping produced by the alignment.
-  /// \param bTokOff B token start offsets (length `numBTokens + 1`).
-  /// \returns A pair representing a half-open B-token interval `[lo, hi)`, or
-  ///          `std::nullopt` if no valid envelope can be determined.
-  std::optional<std::pair<int, int>>
-  MacroCoverTokenEnvelopeInB(const RefoldModel::MacroInvocation &m,
-                             const diffutils::Hunk &h, ArrayRef<int> a2b) const;
-
-  /// \brief Attempts to invert a string literal token that was produced by macro
-  /// stringification (`\#param`) back into a single invocation-site argument
-  /// spelling.
-  ///
-  /// In the preprocessor, `\#X` produces a string literal token (e.g.,
+  /// In the preprocessor, `#X` produces a string literal token (e.g.,
   /// `"hello-world"`) even though the invocation argument text was
   /// `hello-world`. During refolding, edits to that produced literal may be
   /// projected back onto the invocation site by "unstringifying" the literal
@@ -1308,16 +1575,17 @@ private:
   ///
   /// This routine is intentionally conservative and only supports ordinary and
   /// prefixed string literals that look like one token:
-  /// * `"..."`
-  /// * `L"..."` (wide)
-  /// * `u"..."` / `U"..."` / `u8"..."` (Unicode)
+  /// * ` "..." `
+  /// * ` L"..." ` (wide)
+  /// * ` u"..." ` / ` U"..." ` / ` u8"..." ` (Unicode)
   ///
   /// The body is extracted from the first double-quote through the final
-  /// double-quote and is minimally unescaped: `\\` and `\"` are reduced to `\`
-  /// and `"`, respectively. Other escape sequences are preserved verbatim (the
-  /// backslash and following character are kept) to avoid changing semantics.
+  /// double-quote and is minimally unescaped: `\\` and `\"` are reduced to
+  /// `\` and `"`, respectively. Other escape sequences are preserved verbatim
+  /// (the backslash and following character are kept) to avoid changing
+  /// semantics.
   ///
-  /// ### Safety checks:
+  /// ### Safety checks
   /// The resulting argument text must be representable as a single macro
   /// argument. If the unescaped body contains a comma, or contains a newline,
   /// this method returns `std::nullopt` to force callers to take a conservative
@@ -1366,126 +1634,106 @@ private:
   /// \return `true` if the hunk is fully contained within the provided argument
   ///         spans; `false` if any part of the hunk touches non-argument tokens
   ///         or falls outside the known argument regions.
-  static bool
-  HunkFullyWithinArgSpans(const diffutils::Hunk &h,
-                          const std::vector<RefoldModel::PPArgSpan> &argSpans,
-                          MutableArrayRef<char> touched);
+  static bool HunkFullyWithinArgSpans(const diffutils::Hunk &h,
+                                      ArrayRef<RefoldModel::PPArgSpan> argSpans,
+                                      MutableArrayRef<char> touched);
 
-  /// \brief Reconstructs the token spans of macro arguments by identifying the
-  /// "holes" between consecutive macro body segments.
+  /// \brief Computes the minimal B-token envelope corresponding to an A-token
+  /// span under a strict A->B mapping.
   ///
-  /// In function-like macros, the preprocessor provides `body_spans` which
-  /// represent the literal parts of the macro definition. These spans alternate
-  /// with the positions where macro parameters are expanded. By calculating the
-  /// gap between `bodySpans[i].end` and `bodySpans[i+1].begin`, we identify an
-  /// expansion site.
+  /// This method projects a half-open A-token interval `[aBegin, aEnd)` into
+  /// B-token space using the alignment map `a2b`. The projection is *strict* in
+  /// the sense that it uses only mapped tokens and/or immediately adjacent
+  /// mapped neighbors; it does not consult edit hunks or apply heuristic
+  /// expansion.
   ///
-  /// Because macros may use parameters multiple times, out of order, or not at
-  /// all, this method correlates each identified "hole" with the original
-  /// invocation argument index by checking for overlaps against the metadata in
-  /// `argSpans`.
+  /// The method supports two exact derivation modes:
+  /// 1. **Neighbor bracketing:** If the nearest mapped token to the left of
+  ///    `aBegin` and the nearest mapped token at/after `aEnd` are both found
+  ///    and strictly ordered in B, the span maps to `(bLeft, bRight)` which
+  ///    corresponds to `[bLeft + 1, bRight)`.
+  /// 2. **Contained mappings:** Otherwise, if any token inside `[aBegin, aEnd)`
+  ///    is mapped, the envelope is `[minMappedB, maxMappedB + 1)` over those
+  ///    mapped tokens.
   ///
-  /// \param bodySpans The alternating list of literal spans in the macro
-  ///                  expansion.
-  /// \param argSpans Metadata used to map expansion regions back to specific
-  ///                 parameter indices.
-  /// \return A list of `PPArgSpan` objects representing the expansion sites and
-  ///         their associated argument indices; returns an empty list if no
-  ///         holes are found.
-  static std::vector<RefoldModel::PPArgSpan>
-  ComputeArgSpansFromBodySpansWithArgIdx(
-      const std::vector<RefoldModel::PPSpan> &bodySpans,
-      const std::vector<RefoldModel::PPArgSpan> &argSpans);
-
-  /// \brief Determines if two preprocessor (PP) token spans overlap, with
-  /// special handling for zero-width insertion points.
+  /// If no mapped tokens are available and neighbors do not bracket the span,
+  /// the method returns `std::nullopt`.
   ///
-  /// This method is used during macro argument patching to correlate edit
-  /// locations with parameter "holes" in the expanded body. Unlike standard
-  /// half-open interval overlap checks, this logic is designed to be inclusive
-  /// of boundary points when dealing with insertions.
-  ///
-  /// ### Overlap Rules:
-  ///
-  /// - **Point vs. Point:** Two empty spans (insertions) overlap only if they
-  ///   occur at the exact same token index.
-  /// - **Point vs. Range:** An empty span overlaps a non-empty range if the
-  ///   insertion point falls anywhere within the range, *including* the start
-  ///   and end boundaries (e.g., point 5 overlaps range [5, 10)).
-  /// - **Range vs. Range:** Two non-empty ranges overlap if they share at least
-  ///   one common token (standard half-open interval intersection).
-  ///
-  /// \param b0 The beginning index of the first span.
-  /// \param e0 The end index (exclusive) of the first span.
-  /// \param b1 The beginning index of the second span.
-  /// \param e1 The end index (exclusive) of the second span.
-  /// \return `true` if the spans overlap according to the rules above;
-  ///         `false` otherwise or if indices are logically invalid (begin >
-  ///         end).
-  static bool SpansOverlapForArgIdx(int b0, int e0, int b1, int e1) {
-    // Spans are PP token index ranges, generally half-open [begin, end).
-    // Treat empty spans as a single insertion point that can overlap a
-    // non-empty span at its edges.
-    if (b0 > e0 || b1 > e1)
-      return false;
-
-    if (b0 == e0 && b1 == e1)
-      return b0 == b1;
-
-    if (b0 == e0)
-      return b0 >= b1 && b0 <= e1;
-
-    if (b1 == e1)
-      return b1 >= b0 && b1 <= e0;
-
-    return std::max(b0, b1) < std::min(e0, e1);
-  }
-
-  /// \brief Calculates the bounding "envelope" of tokens in the edited
-  /// preprocessed stream (B) that correspond to a specific range of tokens from
-  /// the original preprocessed stream (A).
-  ///
-  /// Because edits can reorder, delete, or duplicate tokens, a contiguous range
-  /// in A might map to a fragmented or shifted set of indices in B. This method
-  /// finds the minimum and maximum mapped indices to create a single half-open
-  /// interval `[min, max + 1)` in the B-domain that covers all "surviving"
-  /// tokens from the original A-range.
-  ///
-  /// This is primarily used to determine the expansion area of a macro or an
-  /// include argument after edits have been applied to the preprocessed source.
-  ///
-  /// \param a2b The mapping array where `a2b[a]` provides the index of token
-  /// `a`
-  ///            in the B-stream (or -1 if the token was deleted).
-  /// \param aBegin The starting token index in the A-domain (inclusive).
-  /// \param aEnd The ending token index in the A-domain (exclusive).
-  /// \return A pair representing the half-open interval `[bMin, bMaxExcl]` in
-  /// the
-  ///         B-domain, or `std::nullopt` if none of the tokens in the A-range
-  ///         exist in B.
+  /// \param a2b A-token to B-token mapping array; `-1` indicates an unmapped
+  ///            A token.
+  /// \param aBegin Inclusive start token index in A.
+  /// \param aEnd Exclusive end token index in A.
+  /// \returns B-token envelope `[b0, b1)` implied by strict mapping, or
+  ///          `std::nullopt` if none exists.
   static std::optional<std::pair<int, int>>
-  MapAToBTokenEnvelope(const std::vector<int> &a2b, int aBegin, int aEnd) {
+  MapAToBTokenEnvelopeStrict(ArrayRef<int> a2b, int aBegin, int aEnd);
 
-    int bMin = std::numeric_limits<int>::max();
-    int bMax = std::numeric_limits<int>::min();
+  /// \brief Computes a strict B-token envelope for an A-token span, optionally
+  /// extending it using an overlapping edit hunk when partial mapping exists.
+  ///
+  /// This method is the primary "sound but minimal" projection used by
+  /// args-only macro patching to slice the edited B stream without
+  /// over-approximating. It first attempts a strict mapping via
+  /// `mapAToBTokenEnvelopeStrict`. If no mapping can be derived, it can fall
+  /// back to the provided `hintHunk` *only* when the hunk overlaps the A span
+  /// and has a valid B range.
+  ///
+  /// When a strict mapping exists, the method can optionally union the result
+  /// with the hint hunk, but only on sides where the A span contains
+  /// *unmapped* tokens. This handles common cases where:
+  /// * The interior of the span is mapped, but the span begins or ends inside
+  ///   an edited region.
+  /// * Those edited edge tokens are unmapped (`a2b == -1`).
+  ///
+  /// Importantly, the envelope is never expanded unless unmapped tokens are
+  /// detected on that side of the A span, preserving minimality and avoiding
+  /// heuristic growth.
+  ///
+  /// \param a2b A-token to B-token mapping array; `-1` indicates an unmapped
+  ///            A token.
+  /// \param aBegin Inclusive start token index in A.
+  /// \param aEnd Exclusive end token index in A.
+  /// \param hintHunk An edit hunk that overlaps `[aBegin, aEnd)` and provides a
+  ///                 valid B range; may be `nullptr`.
+  /// \returns B-token envelope `[b0, b1)` for the A span, or `std::nullopt` if
+  ///          no sound envelope exists.
+  static std::optional<std::pair<int, int>>
+  MapAToBTokenEnvelopeStrictWithHint(ArrayRef<int> a2b, int aBegin, int aEnd,
+                                     const diffutils::Hunk &hintHunk);
 
-    for (int a = aBegin; a < aEnd; ++a) {
-      if (a < 0 || static_cast<size_t>(a) >= a2b.size())
-        continue;
-
-      int b = a2b[a];
-      if (b < 0)
-        continue;
-
-      bMin = std::min(bMin, b);
-      bMax = std::max(bMax, b);
-    }
-
-    if (bMin == std::numeric_limits<int>::max())
-      return std::nullopt;
-
-    return std::make_pair(bMin, bMax + 1);
-  }
+  /// \brief Projects an A-token span that represents a token-paste (`##`)
+  /// occurrence into a B-token envelope, using a strict mapping policy and an
+  /// overlapping edit hunk as a fallback.
+  ///
+  /// PASTE spans are special because the pasted token often becomes *unmapped*
+  /// in the A->B alignment when the token text is edited in `B_PP`. In those
+  /// cases, `a2b[a] == -1` for the pasted token, meaning a pure mapping-based
+  /// envelope cannot be derived.
+  ///
+  /// This method therefore applies a conservative two-phase strategy:
+  /// 1. Attempt to derive an envelope using `mapAToBTokenEnvelopeStrictWithHint`,
+  ///    which can succeed when the span contains mapped tokens or when mapped
+  ///    neighbors bracket the span.
+  /// 2. If that fails, require an overlapping `hintHunk` and return the hunk's
+  ///    B range as the only sound envelope for the edited paste token.
+  ///
+  /// The returned envelope is always half-open `[b0, b1)` in B-token indices and
+  /// is never expanded beyond what is justified by mapped tokens and/or the
+  /// hint hunk. If no sound envelope can be proven, this method returns
+  /// `std::nullopt` and callers must fall back to macro realization.
+  ///
+  /// \param a2b A-token to B-token mapping array; `-1` indicates an unmapped
+  ///            A token.
+  /// \param aBegin Inclusive start token index in A.
+  /// \param aEnd Exclusive end token index in A.
+  /// \param hintHunk An edit hunk expected to overlap `[aBegin, aEnd)` when the
+  ///                 pasted token is unmapped; may be `nullptr`.
+  /// \returns B-token envelope `[b0, b1)` for the A span, or `std::nullopt` if
+  ///          no sound projection exists.
+  static std::optional<std::pair<int, int>>
+  MapAToBTokenEnvelopePasteStrictWithHint(ArrayRef<int> a2b, int aBegin,
+                                          int aEnd,
+                                          const diffutils::Hunk &hintHunk);
 
   /// \brief Parses the raw text of a function-like macro invocation to identify
   /// the byte ranges of its individual arguments.
@@ -1507,29 +1755,6 @@ private:
   ///         the text is malformed or the closing parenthesis is missing.
   static std::optional<std::vector<std::pair<int, int>>>
   ParseMacroInvocationArgContentRanges(StringRef invText);
-
-  /// \brief Adjusts the boundaries of a character range to exclude leading and
-  /// trailing whitespace.
-  ///
-  /// Given a string and a half-open interval `[b, e)`, this method increments
-  /// the start index and decrements the end index until they point to
-  /// non-whitespace characters or meet in the middle. This is useful for
-  /// normalizing macro arguments or code segments before performing comparisons
-  /// or replacements.
-  ///
-  /// \param s The source string containing the range to be trimmed.
-  /// \param b The initial starting index (inclusive).
-  /// \param e The initial ending index (exclusive).
-  /// \return A pair `{newB, newE}` representing the trimmed half-open interval.
-  ///         If the entire range consists of whitespace, `newB` will equal
-  ///         `newE`.
-  static std::pair<int, int> TrimWsRange(StringRef s, int b, int e) {
-    while (b < e && stringutils::isWs(s[b]))
-      b++;
-    while (e > b && stringutils::isWs(s[e - 1]))
-      e--;
-    return {b, e};
-  }
 
   /// \brief Builds a macro replacement patch by reconciling changes across
   /// nested macro expansions, argument-specific edits, and whole-expansion byte
@@ -1563,6 +1788,38 @@ private:
       const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h,
       ArrayRef<int> a2b, StringRef baseInvText,
       const DenseMap<int, DenseMap<int, MacroPatch>> &patchMap) const;
+
+  /// \brief Heuristically detects whether a text slice still contains the
+  /// original macro *call-site* spelling for the given invocation, rather than
+  /// being a realized/expanded replacement.
+  ///
+  /// This check is intentionally token-aware: it searches for the macro name as
+  /// a standalone C identifier, rejecting substring matches that occur inside
+  /// other identifiers (e.g., matching `assert` inside `__assert_rtn` must not
+  /// count).
+  ///
+  /// ### Matching rules
+  /// * **Object-like macros** (`m.subkind != "func"`): An identifier-boundary
+  ///   match on the macro name is sufficient.
+  /// * **Function-like macros** (`m.subkind == "func"`): An identifier-boundary
+  ///   match on the macro name must be followed by optional whitespace and then
+  ///   `(`. This reduces false positives when the macro name appears in
+  ///   unrelated contexts.
+  ///
+  /// This method does not attempt full C parsing; it is a lightweight guard
+  /// used during refolding to decide whether the current TU text still appears
+  /// to contain the invocation form that can be rewritten args-only. A return
+  /// value of `false` should be treated as "do not assume call-site spelling is
+  /// present" (i.e., prefer realization/expansion or other safe fallbacks).
+  ///
+  /// \param text A candidate TU slice that may contain the macro call-site
+  ///             spelling.
+  /// \param m Macro invocation metadata (name and subkind).
+  /// \returns `true` if `text` contains a token-delimited occurrence of the
+  ///          macro name, and for function-like macros it is immediately
+  ///          followed by `(` after optional whitespace.
+  static bool LooksLikeCallsiteText(StringRef text,
+                                    const RefoldModel::MacroInvocation &m);
 
   /// \brief Applies a deterministic, stable ordering to include-scoped
   /// insertion patches.
@@ -2085,6 +2342,30 @@ private:
   /// \param h the diff hunk being examined (A token range and B token range)
   void DebugIncludePatch(StringRef tag, const RefoldModel::IncludeItem &inc,
                          const diffutils::Hunk &h) const;
+
+  /// \brief Serializes a single macro argument span into a diagnostic string
+  /// format.
+  ///
+  /// The output string follows the pattern:
+  /// `{kind=K, A=[begin,end), argIdx=I, [occ=STRINGIFY], [byte=[bBegin,bEnd)]}`.
+  ///
+  /// \param sp The span metadata to serialize.
+  /// \param isStringifyOcc Whether this occurrence was produced by a `#`
+  ///                       operator.
+  /// \returns A formatted string representation of the span.
+  static std::string PPArgSpanToString(const RefoldModel::PPArgSpan &sp,
+                                       bool isStringifyOcc);
+
+  /// \brief Serializes a list of macro argument spans into a comma-separated
+  /// bracketed list.
+  ///
+  /// \param spans The list of spans to serialize.
+  /// \param isStringify A parallel array indicating which spans are
+  ///                    stringification occurrences.
+  /// \returns A formatted string representation such as `[{...}, {...}]`.
+  static std::string
+  PPArgSpanListToString(ArrayRef<RefoldModel::PPArgSpan> spans,
+                        ArrayRef<char> isStringify);
 };
 
 } // namespace refold

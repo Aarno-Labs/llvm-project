@@ -177,7 +177,11 @@ public:
       return formatv("Arg {0}: [{1}, {2})", argIdx, begin, end).str();
     }
 
-    bool IsValid() const { return PPSpan::IsValid() && argIdx >= 0; }
+    bool IsValid() const {
+      return PPSpan::IsValid() && argIdx >= 0 &&
+             (kind != PPArgSpanKind::Paste ||
+              (byteBegin > 0 && byteEnd > byteBegin));
+    }
   };
 
   struct PPCover {

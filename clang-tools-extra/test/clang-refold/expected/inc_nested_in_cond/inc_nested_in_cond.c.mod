@@ -14,7 +14,7 @@ int bar(int x, int y);
 int main() {
   int y = 102;
   int z = FOO(3);
-  char q = 'a';
+  char q = FOO('a');
 
   return q == '?' : y + z : 0;
 }

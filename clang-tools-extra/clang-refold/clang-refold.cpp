@@ -585,13 +585,25 @@ static cl::alias CheckSrcPathShort("c", cl::desc("Alias for --check"),
                                    cl::aliasopt(CheckSrcPath),
                                    cl::cat(RefoldCategory));
 
-static cl::opt<bool>
-    NoLines("no-lines",
-            cl::desc("Don't include #line directives in refold source"),
-            cl::init(false), cl::cat(RefoldCategory));
+static cl::opt<bool> NoLines(
+    "no-lines",
+    cl::desc(
+        "Don't include #line directives in refold source (off by default)"),
+    cl::init(false), cl::cat(RefoldCategory));
 
+// Short alias: -n (points to --no-lines)
 static cl::alias NoLinesShort("n", cl::desc("Alias for --no-lines"),
                               cl::aliasopt(NoLines), cl::cat(RefoldCategory));
+
+static cl::opt<bool> StrictMode(
+    "strict",
+    cl::desc("Treat stringified arguments to be significant (off by default)"),
+    cl::init(false), cl::cat(RefoldCategory));
+
+// Short alias: -s (points to --strict)
+static cl::alias StrictModeShort("s", cl::desc("Alias for --strict"),
+                                 cl::aliasopt(StrictMode),
+                                 cl::cat(RefoldCategory));
 
 static constexpr char Overview[] = R"(
   Deterministically reconstruct partially expanded C source from edited
@@ -741,7 +753,7 @@ int main(int argc, char **argv) {
   // Generate the refolded C source as a string.
   Expected<std::string> refoldedOrErr =
       RefoldEngine::Refold(rootJson, aBytes, aToks, aTokByteOff, bBytes, bToks,
-                           bTokByteOff, onlyCheck, NoLines);
+                           bTokByteOff, onlyCheck, NoLines, StrictMode);
   if (onlyCheck) {
     // We are only verifying that a refolding is correct, so print the response
     // and return an appropriate exit code.

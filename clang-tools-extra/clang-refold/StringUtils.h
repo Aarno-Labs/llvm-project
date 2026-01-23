@@ -111,19 +111,6 @@ inline bool isAsciiWhitespace(StringRef s) noexcept {
   return true;
 }
 
-/** True iff s is a non-empty ASCII identifier (first char not a digit). */
-inline bool isIdentifierOnly(StringRef s) noexcept {
-  if (s.empty())
-    return false;
-  if (!isAsciiIdentStart(s.front()))
-    return false;
-  for (std::size_t i = 1; i < s.size(); ++i) {
-    if (!isAsciiIdentChar(s[i]))
-      return false;
-  }
-  return true;
-}
-
 // --------------------- Index scans (return -1 if none) ----------------------
 
 inline std::optional<size_t> firstNonWsIdx(StringRef s) noexcept {
@@ -175,6 +162,10 @@ inline std::string clip(StringRef s, size_t n) {
   return (Twine(s.substr(0, n)) + "…(" + Twine(s.size()) + ")").str();
 }
 
+inline std::string showWSWithClip(StringRef s, int n) {
+  return showWS(clip(s, n));
+}
+
 inline std::string escape(StringRef s) {
   std::string buffer;
   llvm::raw_string_ostream os(buffer);
@@ -183,6 +174,29 @@ inline std::string escape(StringRef s) {
 
   os.flush();
   return buffer;
+}
+
+/// \brief Adjusts the boundaries of a character range to exclude leading and
+/// trailing whitespace.
+///
+/// Given a string and a half-open interval `[b, e)`, this method increments
+/// the start index and decrements the end index until they point to
+/// non-whitespace characters or meet in the middle. This is useful for
+/// normalizing macro arguments or code segments before performing comparisons
+/// or replacements.
+///
+/// \param s The source string containing the range to be trimmed.
+/// \param b The initial starting index (inclusive).
+/// \param e The initial ending index (exclusive).
+/// \return A pair `{newB, newE}` representing the trimmed half-open interval.
+///         If the entire range consists of whitespace, `newB` will equal
+///         `newE`.
+inline std::pair<int, int> trimWsRange(StringRef s, int b, int e) {
+  while (b < e && isWs(s[b]))
+    b++;
+  while (e > b && isWs(s[e - 1]))
+    e--;
+  return {b, e};
 }
 
 /// \brief Like Java's String::trim(), but only trims ASCII space and tab.
@@ -214,6 +228,83 @@ inline StringRef trimEdgeSpaces(StringRef s) {
     return s; // no trimming needed; return the original string ref
 
   return s.substr(lo, hi - lo); // return trimmed portion
+}
+
+inline bool isIdentBoundary(StringRef s, int idx) {
+  if (idx < 0 || idx >= static_cast<int>(s.size()))
+    return true;
+  return !isAsciiIdentChar(s[idx]);
+}
+
+inline bool isLineSplice(StringRef s, int nlIdx) {
+  if (nlIdx <= 0)
+    return false;
+  char prev = s[nlIdx - 1];
+  if (prev == '\\')
+    return true;
+  // Windows form: "\\\r\n"
+  if (prev == '\r' && nlIdx >= 2 && s[nlIdx - 2] == '\\')
+    return true;
+  return false;
+}
+
+/// True iff s[from:to) contains only horizontal whitespace (and optional '\r').
+inline bool isIndentOnly(StringRef s, int from, int to) {
+  int n = static_cast<int>(s.size());
+  int start = std::clamp(from, 0, n);
+  int end = std::clamp(to, start, n);
+
+  // slice(start, end) creates a reference to the substring
+  return s.slice(start, end).find_first_not_of(" \t\r") == StringRef::npos;
+}
+
+inline std::string quoteCString(StringRef s) {
+  std::string res = "\"";
+  for (char c : s) {
+    switch (c) {
+    case '\\':
+      res += "\\\\";
+      break;
+    case '"':
+      res += "\\\"";
+      break;
+    case '\n':
+      res += "\\n";
+      break;
+    case '\r':
+      res += "\\r";
+      break;
+    case '\t':
+      res += "\\t";
+      break;
+    case '\b':
+      res += "\\b";
+      break;
+    case '\f':
+      res += "\\f";
+      break;
+    default:
+      if (static_cast<unsigned char>(c) < 0x20 ||
+          static_cast<unsigned char>(c) == 0x7F) {
+        char buf[10];
+        snprintf(buf, sizeof(buf), "\\x%02X", static_cast<unsigned char>(c));
+        res += buf;
+      } else {
+        res += c;
+      }
+      break;
+    }
+  }
+  res += "\"";
+  return res;
+}
+
+/// Replace the substring in \p s spanning [begin, end) with \p repl.
+inline std::string replaceRange(StringRef s, int begin, int end,
+                                StringRef repl) {
+  size_t uBegin = static_cast<size_t>(begin);
+  size_t uEnd = static_cast<size_t>(end);
+  return (s.substr(0, uBegin).str() + repl.str() + s.substr(uEnd).str());
 }
 
 /// Normalizes an \c #include target token by stripping the surrounding
@@ -298,29 +389,6 @@ inline bool looksLikeStringLiteralToken(StringRef tok) {
   return false;
 }
 
-inline bool isLineSplice(StringRef s, int nlIdx) {
-  if (nlIdx <= 0)
-    return false;
-  char prev = s[nlIdx - 1];
-  if (prev == '\\')
-    return true;
-  // Windows form: "\\\r\n"
-  if (prev == '\r' && nlIdx >= 2 && s[nlIdx - 2] == '\\')
-    return true;
-  return false;
-}
-
-/** True iff s[from:to) contains only horizontal whitespace (and optional '\r').
- */
-inline bool isIndentOnly(StringRef s, int from, int to) {
-  int n = static_cast<int>(s.size());
-  int start = std::clamp(from, 0, n);
-  int end = std::clamp(to, start, n);
-
-  // slice(start, end) creates a reference to the substring
-  return s.slice(start, end).find_first_not_of(" \t\r") == StringRef::npos;
-}
-
 inline std::string dbgOutTail(StringRef out) {
   size_t tailStart = out.size() > 140 ? out.size() - 140 : 0;
   StringRef tail = out.drop_front(tailStart);
@@ -396,6 +464,34 @@ inline int countNonSplicedNewlines(StringRef s, int from, int to) {
       c++;
   }
   return c;
+}
+
+inline std::string boolArrayToString(const std::vector<char> &touched) {
+  std::string res;
+  res.reserve(touched.size());
+  for (char b : touched)
+    res += (b ? '1' : '0');
+  return res;
+}
+
+inline std::string
+rangesToStringWithSlices(StringRef invText,
+                         const std::vector<std::pair<int, int>> &ranges) {
+  std::string sb = "[";
+  for (size_t i = 0; i < ranges.size(); ++i) {
+    if (i > 0)
+      sb += ", ";
+    const auto &r = ranges[i];
+    sb += "[" + std::to_string(r.first) + "," + std::to_string(r.second) + ")";
+    if (!invText.empty() && r.first >= 0 && r.second >= r.first &&
+        static_cast<size_t>(r.second) <= invText.size()) {
+      sb += "='" +
+            showWSWithClip(invText.substr(r.first, r.second - r.first), 200) +
+            "'";
+    }
+  }
+  sb += "]";
+  return sb;
 }
 
 } // namespace stringutils
