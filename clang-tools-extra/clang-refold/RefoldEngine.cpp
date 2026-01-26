@@ -400,19 +400,12 @@ std::string RefoldEngine::Refold() {
           "#{0} hunkMapsToTU={1} {2} owner.kind={3} owner.includeId={4}", i,
           mapsToTU, h, owner.kind, owner.includeId);
 
-    if (owner.kind == OwnerKind::TU) {
-      if (isIns) {
-        // For pure insertions, trust the segment classification.
-        // We already anchored the probe in TU byte space via tuByteSpan.
-        mapsToTU = true;
-      }
-
-      if (!mapsToTU) {
-        // Only demote for non-empty A-side hunks (real edits/deletes),
-        // where we *must* make sure we’re not accidentally editing header
-        // text and calling it “TU”.
-        owner = Owner::Unknown();
-      }
+    if (owner.kind == OwnerKind::TU && !mapsToTU) {
+      // Deterministic rule: TU ownership must be supported by provenance. If
+      // tokmap-based evidence does not indicate TU ownership, do not force TU
+      // edits (even for insertions). Leave owner unresolved so strict mode can
+      // surface the deficiency.
+      owner = Owner::Unknown();
     }
 
     if (mapsToTU && owner.kind == OwnerKind::Include && owner.includeId) {
@@ -1076,7 +1069,20 @@ bool RefoldEngine::HunkMapsToTU(int a0, int a1, StringRef tuPath) const {
     return sawAnyTU;
   }
 
-  // Pure insertion (a0 == a1): decide based on the nearest mapped neighbors.
+  // Deterministic include-boundary anchoring: if this PP gap sits exactly on
+  // the boundary of an include expansion (per directive PP spans), treat it as
+  // TU-owned even though the adjacent tokmap entry may originate from a header.
+  // This avoids owner conflicts when include guessing is disabled.
+  for (const RefoldModel::IncludeItem &inc : model_.GetIncludes()) {
+    if (a0 == inc.cover.begin || a0 == inc.cover.end) {
+      trace("tu/own",
+            "hunkMapsToTU: INSERT at pp={0} on include boundary includeId={1} -> "
+            "true",
+            a0, inc.id);
+      return true;
+    }
+  }
+
   // If both neighbors live in the same non-TU file, treat this as header-owned
   // so that we expand that include instead of forcing a TU edit at EOF.
   const RefoldModel::TokMapEntry *left = nullptr;
