@@ -401,57 +401,6 @@ private:
   static std::vector<std::string> MapLexemes(ArrayRef<PPTok> toks,
                                              ArrayRef<size_t> offs);
 
-  /// \brief Finds the nearest mapped B-side token index at or after an A-side
-  /// position.
-  ///
-  /// The \p a2b array is an A→B alignment map where `a2b[k] >= 0` indicates
-  /// that A token `k` is aligned to B token `a2b[k]`, and `a2b[k] == -1`
-  /// indicates deletion (no aligned B token). This helper scans forward from \p
-  /// I to locate the first aligned token.
-  ///
-  /// This is commonly used when anchoring a boundary insertion or determining
-  /// the "next" B-side anchor for an edit whose natural A-side anchor has been
-  /// deleted.
-  ///
-  /// \param a2b An A→B alignment array; entries are B indices or -1 for
-  ///            unmapped/deleted A tokens.
-  /// \param i   The starting A index to search from; values outside the range
-  ///            [0, a2b.size()) are clamped to the nearest valid search start.
-  /// \returns The first `a2b[k]` with `k >= i` and `a2b[k] >= 0`, or -1 if no
-  ///          such mapping exists.
-  static int MapForwardToB(ArrayRef<int> a2b, int i) {
-    const size_t start = (i < 0) ? 0u : static_cast<size_t>(i);
-    for (size_t k = start; k < a2b.size(); ++k)
-      if (a2b[k] >= 0)
-        return a2b[k];
-    return -1;
-  }
-
-  /// \brief Finds the nearest mapped B-side token index at or before an A-side
-  /// position.
-  ///
-  /// The \p a2b array is an A→B alignment map where `a2b[k] >= 0` indicates
-  /// that A token `k` is aligned to B token `a2b[k]`, and `a2b[k] == -1`
-  /// indicates deletion (no aligned B token). This helper scans backward from
-  /// \p I to locate the last aligned token.
-  ///
-  /// This is commonly used when anchoring a boundary insertion or determining
-  /// the "previous" B-side anchor for an edit whose natural A-side anchor has
-  /// been deleted.
-  ///
-  /// \param a2b An A→B alignment array; entries are B indices or -1 for
-  ///            unmapped/deleted A tokens.
-  /// \param i   The starting A index to search from; values outside the range
-  ///            [0, a2b.size()) are clamped to the nearest valid search start.
-  /// \returns The first `a2b[k]` with `k <= i` and `a2b[k] >= 0`, or -1 if no
-  ///          such mapping exists.
-  static int MapBackwardToB(ArrayRef<int> a2b, int i) {
-    for (int k = std::min(i, static_cast<int>(a2b.size()) - 1); k >= 0; --k)
-      if (a2b[k] >= 0)
-        return a2b[k];
-    return -1;
-  }
-
   /// \brief Determine if two adjacent characters would “glue” tokens under C’s
   ///        maximal-munch rules.
   ///
@@ -676,27 +625,6 @@ private:
   ///          span.
   const RefoldModel::IncludeItem *SmallestCoveringInclude(int aLo,
                                                           int aHi) const;
-
-  /// \brief Return the innermost (smallest-width) macro invocation that fully
-  ///        covers a given A-span.
-  ///
-  /// Determines which macro invocation in the refold model fully covers the
-  /// specified token span `[aStart, aEnd)` in A-token units. The coverage test
-  /// uses each macro’s preprocessed-token interval `[coverBegin, coverEnd)`.
-  /// Among all invocations that contain the queried span, the one with the
-  /// minimal width is selected. Ties are broken by macro ID (ascending) to
-  /// ensure deterministic results. Macro items without valid cover information
-  /// are ignored.
-  ///
-  /// Used during hunk classification to select the most local macro call site
-  /// that owns an edit.
-  ///
-  /// \param aStart  Inclusive start preprocessed-token index in A.
-  /// \param aEnd    Exclusive end preprocessed-token index in A.
-  /// \returns       The smallest covering macro invocation, or `nullptr` if
-  ///                none cover the span.
-  const RefoldModel::MacroInvocation *SmallestCoveringMacro(int aStart,
-                                                            int aEnd) const;
 
   /// \brief Determine whether an A-token interval is owned by the translation
   ///        unit (TU).
@@ -1761,35 +1689,54 @@ private:
   static std::optional<std::vector<std::pair<int, int>>>
   ParseMacroInvocationArgContentRanges(StringRef invText);
 
-  /// \brief Builds a macro replacement patch by reconciling changes across
-  /// nested macro expansions, argument-specific edits, and whole-expansion byte
-  /// mapping.
+  /// \brief Build a macro callsite patch for an invocation using only
+  /// span-driven evidence.
   ///
-  /// The reconciliation follows a multi-tier fallback strategy:
+  /// This routine produces the replacement text for a macro invocation at its
+  /// callsite byte span \c [m.GetInvB(), m.GetInvE()) in the owning file. The
+  /// strategy is intentionally deterministic and avoids heuristic “best-looking
+  /// slice” selection.
   ///
-  /// 1. **Nested Patch Integration:** If the macro's arguments contain other
-  ///    macros that were already patched (available in `patchMap`), those
-  ///    patches are spliced into the base invocation text.
-  /// 2. **Surgical Argument Patching:** Attempts to apply edits strictly to
-  ///    macro parameters via `buildMacroInvocationPatchArgsOnly`. This is the
-  ///    most precise method as it preserves the original call site's
-  ///    formatting.
-  /// 3. **LCS Mapping (Fallback):** Maps the macro's A-cover to the edited
-  ///    B-token stream. It intelligently decides between a "strict" envelope
-  ///    and an "all" envelope (including adjacent structural body tokens like
-  ///    semicolons) based on whether the extra tokens originate from the macro
-  ///    body or from edited arguments.
+  /// The patching strategy is:
   ///
-  /// \param m Metadata for the macro invocation, including call site ranges and
-  ///          A-domain cover.
+  /// 1. **Do-not-downgrade guard:** If an existing patch for this invocation
+  ///    already exists in \p patchMap and its replacement no longer resembles a
+  ///    callsite invocation (i.e. the macro has effectively been realized/
+  ///    expanded), preserve and return that patch unchanged.
+  ///
+  /// 2. **Args-only rewrite (preferred when safe):** If the diff hunk \p h is
+  ///    fully contained within the invocation's argument-like spans (normal
+  ///    arguments, stringify spans, and paste spans), attempt a surgical patch
+  ///    using \c BuildMacroInvocationPatchArgsOnly. This preserves the original
+  ///    callsite formatting and whitespace. Args-only rewriting is only
+  ///    attempted when the provided invocation text still matches the expected
+  ///    callsite prefix for \p m.
+  ///
+  /// 3. **Whole-cover fallback:** If args-only patching is not applicable or
+  ///    fails, replace the entire invocation by mapping the A-domain macro cover
+  ///    interval \c [coverBegin, coverEnd) to a B-domain token envelope via \c
+  ///    MapATokRangeAToBTokenEnvelope and slicing the corresponding region from
+  ///    the edited preprocessed output. The B-envelope is then tightened when
+  ///    possible by re-aligning the first/last token to the exact A-boundary
+  ///    tokens (only if the expected token exists as an immediately adjacent
+  ///    neighbor in B). This corrects common alignment drops of low-information
+  ///    punctuation (e.g. leading '(') without scanning or heuristics.
+  ///
+  /// \param m Metadata for the macro invocation, including callsite byte span
+  ///          and A-domain cover.
   /// \param h The diff hunk associated with this macro's region.
-  /// \param a2b Token mapping array from original preprocessed (A) to edited
-  /// (B). \param baseInvText The original invocation text from the source file.
-  /// \param patchMap Registry of patches already computed (used to resolve
-  ///                 nested macros).
-  /// \return A `MacroPatch` targeting the call site with reconciled replacement
-  ///         text.
-  MacroPatch BuildMacroInvocationPatchWholeCover(
+  /// \param a2b Alignment map from A-side PP tokens to B-side PP tokens
+  ///            (\c -1 indicates deletion).
+  /// \param baseInvText The original callsite invocation text from the source
+  ///                    file.
+  /// \param patchMap Previously computed macro patches indexed by owner id then
+  ///                 macro id; used only to preserve existing non-callsite
+  ///                 replacements for this invocation.
+  /// \returns A \c MacroPatch for the callsite span if a deterministic
+  ///          replacement can be built; otherwise \c std::nullopt (e.g. invalid
+  ///          invocation span, invalid cover, or failure to compute a valid
+  ///          B-token envelope).
+  std::optional<MacroPatch> BuildMacroInvocationPatchWholeCover(
       const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h,
       ArrayRef<int> a2b, StringRef baseInvText,
       const DenseMap<int, DenseMap<int, MacroPatch>> &patchMap) const;
