@@ -2,7 +2,6 @@
 #include "h.h"
 long foo;
 
-
 int main() {
   return 0;
 }

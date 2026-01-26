@@ -325,7 +325,9 @@ std::string RefoldEngine::Refold() {
                                          : (m->invText ? *m->invText : "");
         auto updated = BuildMacroInvocationPatchWholeCover(
             *m, h, a2b, currentInvText, macroPatchByOwnerByMacroId);
-        byMacroId[m->id] = std::move(updated);
+        if (updated) {
+          byMacroId[m->id] = std::move(*updated);
+        }
         continue;
       }
     }
@@ -1052,27 +1054,6 @@ RefoldEngine::SmallestCoveringInclude(int aLo, int aHi) const {
           best->id, best->target, best->cover.begin, best->cover.end);
   }
 
-  return best;
-}
-
-const RefoldModel::MacroInvocation *
-RefoldEngine::SmallestCoveringMacro(int aStart, int aEnd) const {
-  const RefoldModel::MacroInvocation *best = nullptr;
-  for (const auto &m : model_.GetMacroInvocations()) {
-    int cb = m.cover.begin, ce = m.cover.end;
-    if (cb < 0 || ce < 0)
-      continue;
-    if (cb <= aStart && aEnd <= ce) { // covers [aStart, aEnd)
-      if (!best) {
-        best = &m;
-      } else {
-        int len = ce - cb;
-        int blen = best->cover.end - best->cover.begin;
-        if (len < blen || (len == blen && m.id < best->id))
-          best = &m;
-      }
-    }
-  }
   return best;
 }
 
@@ -3168,216 +3149,110 @@ RefoldEngine::BuildIncludeInsertionPatch(const RefoldModel::IncludeItem &inc,
   return patch;
 }
 
-RefoldEngine::MacroPatch RefoldEngine::BuildMacroInvocationPatchWholeCover(
+std::optional<RefoldEngine::MacroPatch>
+RefoldEngine::BuildMacroInvocationPatchWholeCover(
     const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h,
     ArrayRef<int> a2b, StringRef baseInvText,
     const DenseMap<int, DenseMap<int, MacroPatch>> &patchMap) const {
-  debug("macro/patch",
-        "BEGIN inv id={0} name={1} invFile={2} invB/E=[{3},{4}] "
-        "coverA=[{5},{6}) hunkB=[{7},{8})",
-        m.id, m.name, m.invFile, m.GetInvB(), m.GetInvE(), m.cover.begin,
-        m.cover.end, h.bStart, h.bEnd);
+  // The invocation byte span in the owning file must be known.
+  const int invStart = m.GetInvB();
+  const int invEnd = m.GetInvE();
+  if (invStart < 0 || invEnd < invStart)
+    return std::nullopt;
 
-  // 1. BAKE IN INNER MACRO EDITS
-  ///////////////////////////////
-  // If this macro's arguments contain other macros that have already been
-  // patched, we need to update our base invocation text to reflect those
-  // "inner" changes.
-  std::string updatedInvText = baseInvText.str();
-  const int fileLen = static_cast<int>(bSource_.size());
+  // Do not downgrade: if we already have a patch for this invocation and it
+  // does not look like a callsite invocation anymore (i.e. we already
+  // realized/expanded it), keep it.
+  const int ownerId = m.ownerIncludeId ? *m.ownerIncludeId : kNoOwner;
+  auto ownerIt = patchMap.find(ownerId);
+  if (ownerIt != patchMap.end()) {
+    auto patchIt = ownerIt->second.find(m.id);
+    if (patchIt != ownerIt->second.end()) {
+      if (!InvocationSpanMatchesCallsitePrefix(patchIt->second.replacement, m))
+        return patchIt->second;
+    }
+  }
 
-  for (const auto &arg : m.argSpans) {
-    // Find the smallest macro covering this specific argument's token range.
-    const RefoldModel::MacroInvocation *innerM =
-        SmallestCoveringMacro(arg.begin, arg.end);
+  // 1) Prefer args-only patching when safe and fully validated.
+  //    Treat normal arg spans, stringify spans, and paste spans as
+  //    "argument-like" occurrences.
+  SmallVector<RefoldModel::PPArgSpan, 16> argLikeSpans;
+  argLikeSpans.append(m.argSpans.begin(), m.argSpans.end());
+  argLikeSpans.append(m.stringifySpans.begin(), m.stringifySpans.end());
+  argLikeSpans.append(m.pasteSpans.begin(), m.pasteSpans.end());
 
-    // If an inner macro exists and it's not the current one, look for its
-    // patch.
-    if (innerM && innerM->id != m.id) {
-      auto ownerIt = patchMap.find(
-          innerM->ownerIncludeId ? *innerM->ownerIncludeId : kNoOwner);
-      if (ownerIt != patchMap.end()) {
-        auto patchIt = ownerIt->second.find(innerM->id);
-        if (patchIt != ownerIt->second.end()) {
-          const std::string &innerReplacement = patchIt->second.replacement;
+  SmallVector<char, 16> argTouched(argLikeSpans.size(), 0);
+  if (!argLikeSpans.empty() &&
+      HunkFullyWithinArgSpans(h, argLikeSpans, argTouched)) {
+    // invB/invE are offsets in the invocation file, not in the A-stream source;
+    // do not slice aSource here (it can be shorter and/or refer to a different
+    // logical file).
+    StringRef invSpanText =
+        !baseInvText.empty()
+            ? baseInvText
+            : (m.invText ? StringRef(*m.invText) : StringRef(""));
+    if (InvocationSpanMatchesCallsitePrefix(invSpanText, m)) {
+      auto argsOnly = BuildMacroInvocationPatchArgsOnly(m, h, a2b, baseInvText);
+      if (argsOnly)
+        return *argsOnly;
+    }
+  }
 
-          // Map the preprocessed token indices to global file byte offsets.
-          int gStart =
-              ByteStartForPPInFile(m.invFile ? *m.invFile : "", arg.begin,
-                                   /*fallbackToEOF*/ false, fileLen);
-          int gEnd =
-              ByteEndForPPInFile(m.invFile ? *m.invFile : "", arg.end - 1,
-                                 /*fallbackToEOF*/ false, fileLen);
+  // 2) Whole-cover fallback: replace invocation with the entire expansion cover
+  // slice from B. cover.begin/cover.end are PP-token indices in A; map them
+  // into a B-token envelope.
+  const int covLoA = m.cover.begin;
+  const int covHiA = m.cover.end;
 
-          if (gStart != -1 && gEnd != -1) {
-            // Convert global offsets to local offsets relative to macro
-            // invocation start.
-            int localStart = gStart - m.GetInvB();
-            int localEnd = gEnd - m.GetInvB();
+  if (covLoA < 0 || covHiA < 0 || covLoA >= covHiA)
+    return std::nullopt;
 
-            if (localStart >= 0 && m.invText &&
-                static_cast<size_t>(localEnd) <= m.invText->size()) {
-              StringRef originalArgText =
-                  StringRef(*m.invText)
-                      .substr(localStart, localEnd - localStart);
+  auto bEnv = MapATokRangeAToBTokenEnvelope(covLoA, covHiA);
+  if (!bEnv)
+    return std::nullopt;
 
-              // Replace the original argument text with the already-computed
-              // patch.
-              size_t pos = updatedInvText.find(originalArgText);
-              if (pos != std::string::npos) {
-                updatedInvText.replace(pos, originalArgText.size(),
-                                       innerReplacement);
-              }
-            }
-          }
-        }
+  int bTokStart = bEnv->first;
+  int bTokEnd = bEnv->second;
+  if (bTokStart < 0 || bTokEnd <= bTokStart)
+    return std::nullopt;
+
+  // Tighten the B-side envelope to the exact A-side cover boundary tokens when
+  // possible.
+  //
+  // The A→B alignment/byte-envelope mapping can legitimately drop or shift
+  // punctuation tokens (e.g. the leading '(' in an assert() expansion) because
+  // they are extremely common and thus low-information in the diff alignment.
+  // When that happens, whole-cover replacement can produce syntactically wrong
+  // output (missing parens) or double tokens (e.g. ';;').
+  //
+  // We can correct this deterministically by re-aligning the first/last B
+  // tokens to the first/last A tokens of the macro cover, but only when the
+  // expected token exists as an immediately-adjacent neighbor in B. This avoids
+  // any heuristic scanning.
+  if (covLoA >= 0 && covLoA < static_cast<int>(aToks_.size()) &&
+      bTokStart >= 0 && bTokStart < static_cast<int>(bToks_.size())) {
+    StringRef want = aToks_[covLoA].spelling;
+    if (!want.empty()) {
+      if (StringRef(bToks_[bTokStart].spelling) != want && bTokStart > 0 &&
+          StringRef(bToks_[bTokStart - 1].spelling) == want) {
+        bTokStart--;
       }
     }
   }
 
-  // 2. CHECK FOR ARGS-ONLY CHANGES
-  /////////////////////////////////
-  // Attempt a "surgical" patch where we only replace specific arguments. This
-  // is preferred over whole-cover replacement because it preserves the original
-  // call-site formatting.
-  auto argsOnly = BuildMacroInvocationPatchArgsOnly(m, h, a2b, updatedInvText);
-  if (argsOnly)
-    return *argsOnly;
-
-  // 3. FALLBACK: MAP BYTE RANGES FROM B (The "Whole Cover" Approach)
-  ///////////////////////////////////////////////////////////////////
-  // If surgical patching fails, we try to project the entire macro expansion
-  // from the B-stream.
-  int bStartIdx = MapForwardToB(a2b, m.cover.begin);
-  int bEndIdxEx = MapBackwardToB(a2b, m.cover.end - 1);
-
-  // If mapping fails (e.g., token was deleted), check if the hunk itself
-  // suggests deletion.
-  if (bStartIdx < 0 || bEndIdxEx < 0 || bStartIdx > bEndIdxEx) {
-    if (h.bStart >= h.bEnd) {
-      return MacroPatch{m.GetInvB(), m.GetInvE(), ""};
-    }
-    // Use hunk coordinates as a last resort.
-    bStartIdx = h.bStart;
-    bEndIdxEx = h.bEnd - 1;
-  }
-
-  // Clamp indices to valid token offset ranges.
-  int covLo = bStartIdx;
-  int covHi = bEndIdxEx + 1;
-
-  // Ensure the B envelope includes the edited region, even when the A->B
-  // mapping drops mismatching tokens (e.g. edited stringified literals).
-  if (h.bStart >= 0 && h.bEnd >= h.bStart) {
-    covLo = std::min(covLo, h.bStart);
-    covHi = std::max(covHi, h.bEnd);
-  }
-
-  // Clamp indices to valid token offset ranges.
-  const int n = static_cast<int>(bTokOff_.size());
-  covLo = std::clamp(covLo, 0, std::max(0, n - 2));
-  covHi = std::clamp(covHi, covLo, std::max(covLo, n - 1));
-
-  // Determine a "Strict" envelope: tokens that are definitively part of the
-  // expansion.
-  int envStrictLo = 0, envStrictHi = 0;
-  bool haveEnvStrict =
-      MacroExpansionEnvelopeB(m, true, envStrictLo, envStrictHi);
-  int aLo = covLo, aHi = covHi;
-  if (haveEnvStrict) {
-    const int iLo = std::max(covLo, envStrictLo);
-    if (iLo < covHi)
-      aLo = iLo;
-  }
-
-  aLo = std::clamp(aLo, 0, std::max(0, n - 2));
-  aHi = std::clamp(aHi, aLo, std::max(aLo, n - 1));
-  StringRef candA;
-  if (bTokOff_[aHi] > bTokOff_[aLo]) {
-    candA = stringutils::trimEdgeSpaces(
-        bSource_.substr(bTokOff_[aLo], bTokOff_[aHi] - bTokOff_[aLo]));
-  } else {
-    candA = "";
-  }
-
-  // Determine a "Union" envelope: includes adjacent tokens that might be
-  // structural (like ';').
-  int envAllLo = 0, envAllHi = 0;
-  bool haveEnvAll = MacroExpansionEnvelopeB(m, false, envAllLo, envAllHi);
-  int bLoTok = aLo, bHiTok = aHi;
-  if (haveEnvAll) {
-    bLoTok = std::min(aLo, envAllLo);
-    bHiTok = std::max(aHi, envAllHi);
-  }
-
-  bLoTok = std::clamp(bLoTok, 0, std::max(0, n - 2));
-  bHiTok = std::clamp(bHiTok, bLoTok, std::max(bLoTok, n - 1));
-  StringRef candB;
-  if (bTokOff_[bHiTok] > bTokOff_[bLoTok]) {
-    candB = stringutils::trimEdgeSpaces(
-        bSource_.substr(bTokOff_[bLoTok], bTokOff_[bHiTok] - bTokOff_[bLoTok]));
-  } else {
-    candB = "";
-  }
-
-  // RECONCILIATION LOGIC: Should we include the extra tokens from 'candB'? We
-  // only choose 'candB' if the extra tokens are part of the macro's body and
-  // the expansion ends with a semicolon (to prevent double-semicolons).
-  bool chooseB = false;
-  StringRef aT = candA.trim();
-  StringRef bT = candB.trim();
-  if (!aT.empty() && bT.ends_with(aT)) {
-    auto inBody = [&](int pp) {
-      for (const auto &s : m.bodySpans)
-        if (s.IsValid() && pp >= s.begin && pp < s.end)
-          return true;
-      return false;
-    };
-    auto inArg = [&](int pp) {
-      for (const auto &s : m.argSpans)
-        if (s.IsValid() && pp >= s.begin && pp < s.end)
-          return true;
-      return false;
-    };
-
-    // Ensure all extra tokens are from the macro body, not from arguments.
-    bool allExtraFromBodyNotArgs = true;
-    for (int pp = std::min(bLoTok, aLo); pp < std::max(bLoTok, aLo); ++pp) {
-      if (!inBody(pp) || inArg(pp)) {
-        allExtraFromBodyNotArgs = false;
-        break;
+  if (covHiA - 1 >= 0 && covHiA - 1 < static_cast<int>(aToks_.size()) &&
+      bTokEnd > 0 && (bTokEnd - 1) < static_cast<int>(bToks_.size())) {
+    StringRef want = aToks_[covHiA - 1].spelling;
+    if (!want.empty()) {
+      if (StringRef(bToks_[bTokEnd - 1].spelling) != want && bTokEnd - 2 >= 0 &&
+          StringRef(bToks_[bTokEnd - 2].spelling) == want) {
+        bTokEnd--;
       }
     }
-
-    // Check for a trailing semicolon in the expansion text.
-    bool endsAtSemicolon = false;
-    const int startByte = bTokOff_[bLoTok];
-    int endByte = bTokOff_[bHiTok] - 1;
-    while (endByte >= startByte) {
-      char ch = bSource_[endByte];
-      if (!stringutils::isWs(ch)) {
-        endsAtSemicolon = (ch == ';');
-        break;
-      }
-      --endByte;
-    }
-    chooseB = allExtraFromBodyNotArgs && endsAtSemicolon;
   }
 
-  StringRef chosen = chooseB ? candB : candA;
-
-  // 4. FINAL MERGE
-  /////////////////
-  // If the 'chosen' text looks like a standard call-site (contains the macro
-  // name) but lacks the inner macro patches we calculated in Step 1, prefer
-  // 'updatedInvText'.
-  std::string finalResult = chosen.str();
-  if (InvocationSpanMatchesCallsitePrefix(chosen, m) &&
-      chosen != updatedInvText) {
-    finalResult = updatedInvText;
-  }
-
-  return MacroPatch{m.GetInvB(), m.GetInvE(), std::move(finalResult)};
+  StringRef replacement = SliceBSource(bTokStart, bTokEnd).trim();
+  return MacroPatch{invStart, invEnd, replacement.str()};
 }
 
 bool RefoldEngine::InvocationSpanMatchesCallsitePrefix(
