@@ -338,7 +338,7 @@ std::string RefoldEngine::Refold() {
     // refolded C places it between `#include` lines, not inside any child.
     if (isIns) {
       const RefoldModel::IncludeItem *parentBoundaryInc =
-          BoundaryParentIncludeForPureInsertion(h, tuPath);
+          BoundaryParentIncludeForPureInsertion(h);
       if (parentBoundaryInc) {
         auto [it, _] =
             perInclude.try_emplace(parentBoundaryInc->id, parentBoundaryInc);
@@ -1383,49 +1383,66 @@ RefoldEngine::TUByteSpan(int a0, int a1, StringRef tuPath) const {
 }
 
 const RefoldModel::IncludeItem *
-RefoldEngine::BoundaryParentIncludeForPureInsertion(const diffutils::Hunk &h,
-                                                    StringRef tuPath) const {
-  // We only care about pure insertions: A is empty, B is non-empty.
+RefoldEngine::BoundaryParentIncludeForPureInsertion(
+    const diffutils::Hunk &h) const {
+  // Only applicable for insertions (empty A-span). Defensive guard: ignore
+  // empty B-span.
   if (h.aStart != h.aEnd || h.bStart >= h.bEnd) {
     return nullptr;
   }
 
   const int aPos = h.aStart;
-  const int maxPP = model_.GetTokensCountA();
 
-  // Find the nearest concrete tokens on the left / right in PP space.
-  const auto *leftEntry =
-      FindNearestTokmapEntry(std::min(aPos - 1, maxPP), -1, maxPP);
-  const auto *rightEntry =
-      FindNearestTokmapEntry(std::min(aPos, maxPP), 1, maxPP);
+  // Hardened policy (#4): do NOT probe/snap to "nearest" tokmap entries.
+  // We only infer an include owner when the insertion lands exactly on an
+  // include PP boundary.
+  const RefoldModel::IncludeItem *leftBest = nullptr;
+  int leftWidth = std::numeric_limits<int>::max();
 
-  std::optional<int> leftIncId =
-      leftEntry ? model_.InnermostIncludeAtPP(leftEntry->pp) : std::nullopt;
-  std::optional<int> rightIncId =
-      rightEntry ? model_.InnermostIncludeAtPP(rightEntry->pp) : std::nullopt;
+  const RefoldModel::IncludeItem *rightBest = nullptr;
+  int rightWidth = std::numeric_limits<int>::max();
 
-  // If both sides resolve to the same include (or both TU), this is not a
-  // boundary between siblings – let the normal owner logic handle it.
-  if (leftIncId == rightIncId) {
-    return nullptr;
+  for (const auto &inc : model_.GetIncludes()) {
+    if (inc.cover.begin < 0 || inc.cover.end < 0)
+      continue;
+
+    const int width = inc.cover.end - inc.cover.begin;
+
+    // Include immediately to the left: ends exactly at aPos.
+    if (inc.cover.end == aPos) {
+      if (width < leftWidth) {
+        leftBest = &inc;
+        leftWidth = width;
+      }
+    }
+
+    // Include immediately to the right: begins exactly at aPos.
+    if (inc.cover.begin == aPos) {
+      if (width < rightWidth) {
+        rightBest = &inc;
+        rightWidth = width;
+      }
+    }
   }
 
-  // Otherwise, attach the insertion to the lowest common ancestor include.
-  // If either side is TU (nullopt) or they meet only at TU, LCA is nullopt
-  // and the TU owns the insertion (caller will treat as TU-level hunk).
-  std::optional<int> parentId =
+  const std::optional<int> leftIncId =
+      leftBest ? std::optional<int>(leftBest->id) : std::nullopt;
+  const std::optional<int> rightIncId =
+      rightBest ? std::optional<int>(rightBest->id) : std::nullopt;
+
+  if (!leftIncId && !rightIncId)
+    return nullptr; // not at a known include boundary
+
+  const std::optional<int> parentId =
       model_.LeastCommonAncestorInclude(leftIncId, rightIncId);
-  if (!parentId) {
-    return nullptr; // TU-owned
-  }
+  if (!parentId)
+    return nullptr;
 
   const RefoldModel::IncludeItem *parent = model_.GetIncludeById(*parentId);
-  if (!parent) {
-    return nullptr;
-  }
 
-  debug("owner",
-        "pure-ins boundary at A[{0}]: leftInc={1} rightInc={2} parent={3}",
+  trace("include/boundary",
+        "BoundaryParentIncludeForPureInsertion: aPos={0} leftInc={1} "
+        "rightInc={2} parent={3}",
         aPos, leftIncId, rightIncId, parentId);
 
   return parent;

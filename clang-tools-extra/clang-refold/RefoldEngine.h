@@ -773,89 +773,53 @@ private:
   /// \return A pair representing the TU byte span [b, e), or{-1, -1}.
   std::pair<int, int> TUByteSpan(int a0, int a1, StringRef tuPath) const;
 
-  /// \brief Detects whether a pure insertion hunk lies exactly on the boundary
-  /// between two sibling include regions, and if so, assigns ownership of the
-  /// insertion to their parent include.
+  /// \brief Determines whether an insertion hunk lands exactly on an include PP
+  /// boundary and, if so, returns the include that should own the boundary
+  /// insertion.
   ///
-  /// A "pure insertion" is a hunk where the A-side is empty and the B-side is
-  /// non-empty (h.aStart == h.aEnd && h.bStart < h.bEnd). For such hunks, the
-  /// usual "innermost owner" logic can incorrectly attribute the insertion to
-  /// one of the adjacent child headers, even when the intended location is
-  /// between #include directives at the parent level.
+  /// This helper is used to conservatively assign ownership for edits that
+  /// occur at an insertion point in the A-side PP token stream. The intent is
+  /// to detect insertions that are *exactly* between sibling include regions
+  /// and to attribute the insertion to their parent include, rather than
+  /// incorrectly placing it inside one of the adjacent children.
   ///
-  /// \par Deterministic policy
-  /// This method probes PP-space neighbors around the insertion point:
-  /// - Find the nearest mapped PP token to the left of \p aPos and to the right
-  ///   of \p aPos using FindNearestTokmapEntry().
-  /// - Resolve each neighbor to its innermost include id via
-  ///   M.InnermostIncludeAtPP(pp). TU-owned regions are represented as nullopt.
-  /// - If the two innermost include ids differ, compute their least common
-  ///   ancestor include id via M.LeastCommonAncestorInclude(leftIncId,
-  ///   rightIncId).
+  /// \par Applicability
+  /// This policy is only applicable when the hunk has an empty A-span (\c
+  /// h.aStart == h.aEnd). (Some diff producers may also guarantee \c h.bStart <
+  /// h.bEnd for insertions; this function intentionally does not rely on that
+  /// invariant.)
+  ///
+  /// \par Deterministic boundary-only policy
+  /// To avoid heuristic ownership mistakes, this routine does \b not probe for
+  /// “nearest” tokmap entries and does \b not snap to nearby PP tokens.
+  /// Instead, it only considers includes whose A-domain PP cover interval \c
+  /// [coverBegin, coverEnd) touches the insertion position exactly:
+  ///
+  /// - An include is considered immediately to the left if \c coverEnd == aPos.
+  /// - An include is considered immediately to the right if \c coverBegin ==
+  ///   aPos.
+  /// - If multiple includes touch the boundary, the smallest-width include
+  ///   (most-nested) is chosen independently on each side.
+  ///
+  /// The selected left/right include ids (or TU if absent) are then used to
+  /// compute the least common ancestor via \c
+  /// RefoldModel::LeastCommonAncestorInclude(leftId, rightId).
   ///
   /// \par Outcome
-  /// - If the least common ancestor is a valid include id, return that
-  ///   IncludeItem. This causes the insertion to be emitted at the parent
-  ///   include level (i.e., between sibling #include lines) rather than inside
-  ///   either child header.
-  /// - If the least common ancestor is nullopt, the boundary meets only at the
-  ///   TU, so this method returns nullptr to indicate "TU-owned" and allow the
-  ///   caller's normal TU-level handling to proceed.
-  /// - If the hunk is not a pure insertion, if neighbors cannot be resolved, or
-  ///   if both sides map to the same include id, return nullptr and let the
-  ///   standard ownership logic handle it.
+  /// - If both sides are TU (no exact boundary touch), return nullptr (policy
+  ///   does not apply).
+  /// - If the least common ancestor is absent, return nullptr (boundary meets
+  ///   at TU).
+  /// - Otherwise, return the ancestor \c IncludeItem, causing the caller to
+  ///   treat the insertion as owned by that include level (i.e., between
+  ///   sibling includes at the parent scope).
   ///
-  /// Note: \p ownerDepthGap is used only to establish \p maxPP (the PP
-  /// coordinate range) for bounded probing; it does not otherwise participate
-  /// in the decision.
-  ///
-  /// \param h the diff hunk; only pure insertion hunks are considered.
-  /// \param tuPath the TU path for the refold (currently unused by this policy
-  ///        but kept for signature consistency with other ownership helpers).
-  /// \return the parent IncludeItem that should own the insertion if it is
-  ///         between sibling includes; otherwise nullptr. (meaning the policy
-  ///         does not apply)
+  /// \param h The diff hunk; only hunks with \c h.aStart == h.aEnd are
+  ///          considered.
+  /// \return The include that should own the boundary insertion, or nullptr
+  ///         if the boundary policy does not apply.
   const RefoldModel::IncludeItem *
-  BoundaryParentIncludeForPureInsertion(const diffutils::Hunk &h,
-                                        StringRef tuPath) const;
-
-  /// \brief Finds the nearest TokMapEntry in PP space by linear probing from a
-  /// starting PP coordinate.
-  ///
-  /// This helper walks PP coordinates beginning at \p start and repeatedly adds
-  /// \p step until it either finds a non-null TokMapEntry in the model's
-  /// tokmapByPP or the probe index exits the inclusive bounds [0, \p maxPP].
-  /// It performs an exact-key lookup at each PP coordinate; it does not
-  /// interpolate or choose the "closest" by distance beyond the first hit
-  /// encountered in the chosen direction.
-  ///
-  /// Typical use cases include locating the nearest mapped PP token to the
-  /// left/right of a PP gap when anchoring insertions or deciding ownership
-  /// (TU vs include/header) in boundary cases.
-  ///
-  /// \param start The PP coordinate at which to begin probing.
-  /// \param step The probe direction and stride; use -1 to search left and +1
-  /// to
-  ///             search right.
-  /// \param maxPP The maximum PP coordinate to consider (inclusive); probing
-  ///              stops when p < 0 or p > maxPP.
-  /// \return The first TokMapEntry encountered while probing in the requested
-  ///         direction, or nullptr if none exists within [0, maxPP].
-  const RefoldModel::TokMapEntry *FindNearestTokmapEntry(int start, int step,
-                                                         int maxPP) const {
-    const auto &tokmapByPP = model_.GetTokmapByPP();
-    int p = start;
-
-    while (p >= 0 && p <= maxPP) {
-      auto it = tokmapByPP.find(p);
-      if (it != tokmapByPP.end()) {
-        return &it->second;
-      }
-      p += step;
-    }
-
-    return nullptr;
-  }
+  BoundaryParentIncludeForPureInsertion(const diffutils::Hunk &h) const;
 
   /// \brief Build a fully specified IncludePatch for a pure INSERT hunk,
   ///        carrying the exact bytes from B.
