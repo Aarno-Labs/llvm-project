@@ -481,28 +481,86 @@ std::string RefoldEngine::Refold() {
       }
     }
 
-    // f) Fallback: if segments did not classify and it isn't TU/macro, we try
-    // the old smallestCoveringInclude as a last resort for backwards
-    // compatibility.
+    // f) Ownership resolution failed.
+    //
+    // Deterministic behavior:
+    //   * strict mode: fatal (schema deficiency or segment-construction bug)
+    //   * non-strict: do not realize includes; attempt TU-only edit if a TU
+    //     byte span exists
+    if (strict_) {
+      fatal("hunks",
+            "owner unresolved for changed A-interval [{0},{1}) (segments did "
+            "not classify; include guessing disabled)",
+            h.aStart, h.aEnd);
+    }
+
     debug("classify",
-          "#{0} entering fallback smallestCoveringInclude; owner.kind={1} "
-          "includeId={2}",
-          i, owner.kind, owner.includeId);
-    if (auto *inc = SmallestCoveringInclude(h.aStart, h.aEnd)) {
-      const std::string headerPath = resolveHeaderPath(*inc);
+          "#{0} owner unresolved (not TU/macro/segment). Conservative TU-only "
+          "attempt (no include realization).",
+          i);
+
+    auto span = TUByteSpan(h.aStart, h.aEnd, tuPath); // [b, e)
+    if (span.first >= 0 && span.second >= 0) {
+      std::string repl;
+      if (isDel) {
+        repl = "";
+      } else {
+        const int b0 = bTokOff_[h.bStart];
+        const int b1 = bTokOff_[h.bEnd];
+        repl.assign(bSource_.data() + b0, bSource_.data() + b1);
+      }
+
+      // If we are replacing whitespace-only text in the TU, we prefer to
+      // preserve the existing TU gap whitespace rather than introducing new
+      // whitespace from B.
+      bool replacingGap = false;
+      if (span.first < span.second) {
+        std::string original(tuBytes.data() + span.first,
+                             tuBytes.data() + span.second);
+        replacingGap = !original.empty() && stringutils::isWhitespace(original);
+        if (replacingGap) {
+          // Preserve exactly the gap as the replacement.
+          repl = std::move(original);
+        }
+      } else if (span.second < span.first) {
+        fatal("tu/span", "invalid TU byte span: [{0},{1})", span.first,
+              span.second);
+      }
+
+      // If we're replacing a non-empty TU gap and the inserted text doesn't
+      // start with WS, prefix EXACTLY ONE space from the gap to preserve
+      // “return injected” (no double spaces).
+      if (replacingGap && !repl.empty() && !stringutils::isWs(repl.front()))
+        repl.insert(repl.begin(), ' ');
+
+      // Keep a copy for logging; PadAtBoundaries consumes via move.
+      std::string rawRepl = repl;
+
+      std::string padded =
+          PadAtBoundaries(tuBytes, static_cast<size_t>(span.first),
+                          static_cast<size_t>(span.second), std::move(repl),
+                          /*allowLeft*/ !replacingGap,
+                          /*allowRight*/ true);
+
       debug("classify",
-            "#{0} -> INCLUDE id={1} path={2}  {3}  (fallback "
-            "smallestCoveringInclude)",
-            i, inc->id, headerPath, h);
-      auto [it, _] = perInclude.try_emplace(inc->id, inc);
-      it->second.Add(BuildIncludeInsertionPatch(*inc, h));
+            "#{0} -> TU (conservative) bytes=[{1},{2}) rawRepl='{3}' "
+            "paddedRepl='{4}'",
+            i, span.first, span.second,
+            stringutils::showWSWithClip(rawRepl, 160),
+            stringutils::showWSWithClip(padded, 160));
+
+      ResyncOutcome ro =
+          ApplyResyncOrPend(tuBytes, span.first, span.second, padded, tuPath);
+      tuEdits.push_back(TextEdit{span.first, span.second, std::move(ro.text),
+                                 std::move(ro.pending)});
       continue;
     }
 
-    fatal(
-        "hunks",
-        "no covering item (macro/include/TU) for changed A-interval [{0},{1})",
-        h.aStart, h.aEnd);
+    debug("classify",
+          "#{0} dropping edit {1}: owner unresolved and no TU byte span "
+          "available (no include guessing).",
+          i, h);
+    continue;
   }
 
   // Materialize merged macro patches into the list buckets expected by later
@@ -981,77 +1039,6 @@ RefoldEngine::SmallestCoveringPatchableMacro(int aStart, int aEnd) const {
       best = &m;
       bestLen = len;
     }
-  }
-
-  return best;
-}
-
-const RefoldModel::IncludeItem *
-RefoldEngine::SmallestCoveringInclude(int aLo, int aHi) const {
-  trace("include/select",
-        "ENTER smallestCoveringInclude(aLo={0}, aHi={1})  (isEmpty={2})", aLo,
-        aHi, (aLo >= aHi));
-
-  const RefoldModel::IncludeItem *best = nullptr;
-  int bestWidth = std::numeric_limits<int>::max();
-  const bool isEmpty = (aLo >= aHi);
-
-  for (const auto &inc : model_.GetIncludes()) {
-    debug("include/select",
-          "  Considering include id={0} target={1} cover=[{2},{3})", inc.id,
-          inc.target, inc.cover.begin, inc.cover.end);
-
-    if (inc.cover.begin < 0 || inc.cover.end < 0) {
-      debug("include/select", "    -> SKIP (invalid coverage)");
-      continue;
-    }
-
-    bool covers;
-    if (isEmpty) {
-      // Zero-width insertion
-      //
-      // Treat both boundary gaps as belonging to the include:
-      //   - gap at coverBegin (before the first PP token),
-      //   - gap at coverEnd   (after the last PP token),
-      // so we use <= on the right side instead of <.
-      covers = (inc.cover.begin <= aLo) && (aLo <= inc.cover.end);
-      debug("include/select",
-            "    Zero-width check (inclusive end): ({0} <= {1}) && ({2} <= "
-            "{3}) => {4}",
-            inc.cover.begin, aLo, aLo, inc.cover.end, covers);
-    } else {
-      // Non-empty deletion/substitution range
-      covers = (inc.cover.begin <= aLo) && (aHi <= inc.cover.end);
-      debug("include/select",
-            "    Non-empty check: ({0} <= {1}) && ({2} <= {3}) => {4}",
-            inc.cover.begin, aLo, aHi, inc.cover.end, covers);
-    }
-
-    if (!covers) {
-      debug("include/select", "    -> DOES NOT COVER (reject)");
-      continue;
-    }
-
-    // Compute interval width
-    int width = inc.cover.end - inc.cover.begin;
-    debug("include/select", "    -> COVERS, width={0} (current bestWidth={1})",
-          width, bestWidth);
-
-    if (width < bestWidth) {
-      debug("include/select", "       -> NEW BEST include id={0} (width={1})",
-            inc.id, width);
-      best = &inc;
-      bestWidth = width;
-    }
-  }
-
-  if (!best) {
-    debug("include/select", "EXIT smallestCoveringInclude => NONE");
-  } else {
-    debug("include/select",
-          "EXIT smallestCoveringInclude => include id={0} target={1} "
-          "cover=[{2},{3})",
-          best->id, best->target, best->cover.begin, best->cover.end);
   }
 
   return best;
