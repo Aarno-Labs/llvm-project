@@ -259,6 +259,8 @@ std::string RefoldEngine::Refold() {
   auto hunks = diffutils::hunksFromMap(a2b, static_cast<int>(aSeq.size()),
                                        static_cast<int>(bSeq.size()));
 
+  abByteHunks_ = BuildByteHunksFromTokenHunks(hunks);
+
   for (size_t i = 0; i < hunks.size(); ++i) {
     const auto &h = hunks[i];
 
@@ -438,8 +440,9 @@ std::string RefoldEngine::Refold() {
           fatal("tu/span", "invalid TU byte span: [{0},{1})", span.first,
                 span.second);
         }
+
         bool replacingGap =
-            !original.empty() && stringutils::isAsciiWhitespace(original);
+            !original.empty() && stringutils::isWhitespace(original);
 
         // If we’re replacing a non-empty TU gap and the inserted text doesn’t
         // start with WS, prefix EXACTLY ONE space from the gap to preserve
@@ -674,7 +677,7 @@ std::vector<std::string> RefoldEngine::MapLexemes(ArrayRef<PPTok> toks,
   out.reserve(toks.size());
   for (std::size_t i = 0; i < toks.size(); ++i) {
     const auto &s = toks[i].spelling;
-    if (stringutils::isAsciiWhitespace(s)) {
+    if (stringutils::isWhitespace(s)) {
       // position-tied, cannot anchor elsewhere
       out.emplace_back("WS@" + std::to_string(offs[i]));
     } else {
@@ -733,8 +736,8 @@ RefoldEngine::ComputeOwnerDepthGapsForPP(size_t numOfAOffs) {
 // ============================= Boundary helpers ==============================
 
 bool RefoldEngine::BoundaryGlues(char left, char right) {
-  const bool leftId = stringutils::isIdentChar(left);
-  const bool rightId = stringutils::isIdentChar(right);
+  const bool leftId = stringutils::isIdentPart(left);
+  const bool rightId = stringutils::isIdentPart(right);
   if (leftId && rightId)
     return true; // e.g., return + injected → returninjected
   if (leftId && right == '(')
@@ -1119,7 +1122,8 @@ bool RefoldEngine::HunkMapsToTU(int a0, int a1, StringRef tuPath) const {
   const RefoldModel::TokMapEntry *right = nullptr;
   // Ensure a0 is at least 0 before treating it as an unsigned index
   size_t startPP = (a0 < 0) ? 0 : static_cast<size_t>(a0);
-  for (size_t pp = startPP; pp < tokmapByPP.size(); ++pp) {
+  const size_t maxPP = aToks_.size();
+  for (size_t pp = startPP; pp < maxPP; ++pp) {
     auto it = tokmapByPP.find(static_cast<int>(pp));
     if (it != tokmapByPP.end()) {
       right = &it->second;
@@ -1517,7 +1521,7 @@ bool RefoldEngine::MacroExpansionEnvelopeB(
 
 bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
     const RefoldModel::MacroInvocation &m, int argIdx, StringRef baseArg,
-    StringRef newArg, ArrayRef<int> a2b, const diffutils::Hunk &hintHunk,
+    StringRef newArg, ArrayRef<diffutils::Hunk> tokenHunks,
     bool checkPasteSpans) const {
   if (newArg.data() == nullptr)
     return false;
@@ -1544,6 +1548,7 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
   if (!hasAny)
     return true;
 
+  const int maxTok = std::max(0, static_cast<int>(bTokOff_.size()) - 1);
   StringRef argTrim = newArg.trim();
   StringRef baseTrim = baseArg.trim();
 
@@ -1564,12 +1569,37 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
         if (s.argIdx != argIdx)
           continue;
 
-        auto bEnv =
-            MapAToBTokenEnvelopeStrictWithHint(a2b, s.begin, s.end, hintHunk);
+        auto bEnv = MapAToBTokenEnvelopeByPPArgSpan(s);
         if (!bEnv)
           return false;
 
+        // Extend the B-envelope to account for hunks that touch this
+        // occurrence. This is required for insertions at the argument boundary
+        // (e.g. appending tokens).
+        if (!tokenHunks.empty()) {
+          int lo = bEnv->first;
+          int hi = bEnv->second;
+          for (const auto &h : tokenHunks) {
+            bool touches;
+            if (h.aStart == h.aEnd) {
+              touches = (h.aStart >= s.begin && h.aStart <= s.end);
+            } else {
+              touches = (h.aStart < s.end && h.aEnd > s.begin);
+            }
+            if (touches) {
+              lo = std::min(lo, h.bStart);
+              hi = std::max(hi, h.bEnd);
+            }
+          }
+          lo = std::clamp(lo, 0, maxTok);
+          hi = std::clamp(hi, lo, maxTok);
+          bEnv = {lo, hi};
+        }
+
         StringRef tok = SliceBSource(bEnv->first, bEnv->second).trim();
+        if (tok.empty())
+          return false;
+
         std::string expect = stringutils::quoteCString(argTrim);
         if (tok != expect) {
           trace("macro/consistency",
@@ -1582,26 +1612,16 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
     }
   }
 
-  enum PasteType : unsigned {
-    Unknown,
-    Prefix,
-    Suffix,
-    Whole,
-    Ambiguous
-  };
-
   // Determine whether token pasting consumes a prefix/suffix/whole segment of
-  // this argument: 0=none/unknown, 1=prefix, 2=suffix, 3=whole, 4=ambiguous
-  PasteType pasteConsume = PasteType::Unknown;
+  // this argument. 0=none/unknown, 1=prefix, 2=suffix, 3=whole, 4=ambiguous
+  enum PasteType : unsigned { Unknown, Prefix, Suffix, Whole, Ambiguous };
+  PasteType pasteConsume = Unknown;
   for (const auto &ps : m.pasteSpans) {
     if (ps.argIdx != argIdx)
       continue;
 
     StringRef aTokText = SliceASource(ps.begin, ps.end).trim();
-    if (aTokText.empty())
-      continue;
-
-    if (ps.byteBegin < 0 || ps.byteEnd < ps.byteBegin ||
+    if (aTokText.empty() || ps.byteBegin < 0 || ps.byteEnd < ps.byteBegin ||
         static_cast<size_t>(ps.byteEnd) > aTokText.size())
       continue;
 
@@ -1612,53 +1632,66 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
     bool starts = baseTrim.starts_with(segA);
     bool ends = baseTrim.ends_with(segA);
 
-    PasteType dir;
+    PasteType dir = Unknown;
     if (baseTrim == segA)
-      dir = PasteType::Whole;
+      dir = Whole;
     else if (starts && !ends)
-      dir = PasteType::Prefix;
+      dir = Prefix;
     else if (ends && !starts)
-      dir = PasteType::Suffix;
+      dir = Suffix;
     else if (starts && ends)
-      dir = PasteType::Ambiguous;
+      dir = Ambiguous;
     else
-      dir = PasteType::Unknown;
-
-    if (dir == PasteType::Unknown)
       continue;
 
-    if (pasteConsume == PasteType::Unknown)
+    if (pasteConsume == Unknown)
       pasteConsume = dir;
     else if (pasteConsume != dir)
-      pasteConsume = PasteType::Ambiguous;
+      pasteConsume = Ambiguous;
   }
 
   // Verify all standard (non-paste) occurrences.
   for (const auto &s : m.argSpans) {
-    if (s.argIdx != argIdx)
+    if (s.argIdx != argIdx || s.kind != RefoldModel::PPArgSpanKind::Standard)
       continue;
 
-    if (s.kind != RefoldModel::PPArgSpanKind::Standard)
-      continue;
-
-    // Best-effort envelope. For now this is equivalent to StrictWithHint;
-    // it exists as a semantic marker for call sites that want a best-effort
-    // mapping.
-    auto bEnv =
-        MapAToBTokenEnvelopeStrictWithHint(a2b, s.begin, s.end, hintHunk);
+    auto bEnv = MapAToBTokenEnvelopeByPPArgSpan(s);
     if (!bEnv || bEnv->first < 0 || bEnv->second <= bEnv->first)
       return false;
+
+    // Extend the B-envelope to account for hunks that touch this occurrence.
+    // This is required for insertions at the argument boundary (e.g. appending
+    // tokens).
+    if (!tokenHunks.empty()) {
+      int lo = bEnv->first;
+      int hi = bEnv->second;
+      for (const auto &h : tokenHunks) {
+        bool touches;
+        if (h.aStart == h.aEnd) {
+          touches = (h.aStart >= s.begin && h.aStart <= s.end);
+        } else {
+          touches = (h.aStart < s.end && h.aEnd > s.begin);
+        }
+        if (touches) {
+          lo = std::min(lo, h.bStart);
+          hi = std::max(hi, h.bEnd);
+        }
+      }
+      lo = std::clamp(lo, 0, maxTok);
+      hi = std::clamp(hi, lo, maxTok);
+      bEnv = {lo, hi};
+    }
 
     StringRef tokText = SliceBSource(bEnv->first, bEnv->second).trim();
     if (tokText.empty())
       return false;
 
     bool ok;
-    if (pasteConsume == PasteType::Suffix) {
+    if (pasteConsume == Suffix) {
       // Suffix segment is consumed by pasting; standard expansion is the
       // prefix.
       ok = argTrim.starts_with(tokText);
-    } else if (pasteConsume == PasteType::Prefix) {
+    } else if (pasteConsume == Prefix) {
       // Prefix segment is consumed by pasting; standard expansion is the
       // suffix.
       ok = argTrim.ends_with(tokText);
@@ -1670,19 +1703,10 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
       return false;
   }
 
-  if (argIsStringified)
-    return true;
-
   // Paste-span verification is optional for callers that validate paste-token
   // correctness as a group (e.g., multi-span paste edits). When disabled, we
   // only validate standard+stringify occurrences above.
-  if (!checkPasteSpans)
-    return true;
-
-  // If the current hunk does not touch any paste token, skip verifying paste
-  // spans to avoid false negatives when the A->B token mapping is incomplete
-  // away from the edit site.
-  if (!HunkTouchesAnyPasteToken(m, hintHunk))
+  if (argIsStringified || !checkPasteSpans)
     return true;
 
   // Verify all paste-span occurrences.
@@ -1690,16 +1714,17 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
     if (ps.argIdx != argIdx)
       continue;
 
-    auto bEnv = MapAToBTokenEnvelopePasteStrictWithHint(a2b, ps.begin, ps.end,
-                                                        hintHunk);
-    if (!bEnv || bEnv->first < 0 || bEnv->second <= bEnv->first)
-      return false;
-
-    if (bEnv->second - bEnv->first != 1)
+    auto bEnv = MapAToBTokenEnvelopeByPPArgSpan(ps);
+    if (!bEnv || bEnv->first < 0 || bEnv->second <= bEnv->first ||
+        (bEnv->second - bEnv->first) != 1)
       return false;
 
     StringRef aTokText = SliceASource(ps.begin, ps.end).trim();
+    if (aTokText.empty())
+      return false;
     StringRef bTokText = SliceBSource(bEnv->first, bEnv->second).trim();
+    if (bTokText.empty())
+      return false;
 
     if (ps.byteBegin < 0 || ps.byteEnd < ps.byteBegin ||
         static_cast<size_t>(ps.byteEnd) > aTokText.size())
@@ -1719,6 +1744,7 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
     // pasted token, and a single edit hunk may simultaneously modify multiple
     // segments (e.g., a_b_c -> d_e_f). Full pasted-token consistency is
     // validated separately via pasteArgReplacementsMatchAllPasteTokensInB(...).
+
     StringRef segB = bTokText.substr(bbB, beB - bbB);
 
     // Determine where this pasted segment comes from within the original
@@ -1726,18 +1752,15 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
     bool starts = baseTrim.starts_with(oldSeg);
     bool ends = baseTrim.ends_with(oldSeg);
 
-    bool ok;
-    if (baseTrim == oldSeg) {
+    bool ok = false;
+    if (baseTrim == oldSeg)
       ok = (argTrim == segB);
-    } else if (starts && !ends) {
+    else if (starts && !ends)
       ok = argTrim.starts_with(segB);
-    } else if (ends && !starts) {
+    else if (ends && !starts)
       ok = argTrim.ends_with(segB);
-    } else {
-      // Ambiguous or unclassifiable: refuse args-only.
-      ok = false;
-    }
 
+    // Check to see if it's ambiguous or unclassified.
     if (!ok)
       return false;
   }
@@ -1806,8 +1829,7 @@ RefoldEngine::DerivePasteArgEdit(const RefoldModel::MacroInvocation &m,
   // Map the pasted token envelope in A to its corresponding envelope in B. For
   // paste edits we require a strict mapping: the A pasted token must map to
   // exactly one B token that we will diff against.
-  auto bEnvOpt = MapAToBTokenEnvelopePasteStrictWithHint(a2b, tokenSpan->begin,
-                                                         tokenSpan->end, h);
+  auto bEnvOpt = MapAToBTokenEnvelopeByPPArgSpan(*tokenSpan);
   if (!bEnvOpt || bEnvOpt->first < 0 || bEnvOpt->second <= bEnvOpt->first)
     return std::nullopt;
 
@@ -1954,8 +1976,7 @@ RefoldEngine::DerivePasteArgEdits(const RefoldModel::MacroInvocation &m,
   // All candidates should reference the same pasted token range [begin, end) in A.
   const auto *tokenSpan = cands[0];
 
-  auto bEnvOpt = MapAToBTokenEnvelopePasteStrictWithHint(a2b, tokenSpan->begin,
-                                                         tokenSpan->end, h);
+  auto bEnvOpt = MapAToBTokenEnvelopeByPPArgSpan(*tokenSpan);
   if (!bEnvOpt || bEnvOpt->first < 0 || bEnvOpt->second <= bEnvOpt->first)
     return std::nullopt;
 
@@ -2181,8 +2202,8 @@ StringRef RefoldEngine::DeriveNewPasteSegmentFromSpellingReplacement(
 }
 
 bool RefoldEngine::PasteArgReplacementsMatchAllPasteTokensInB(
-    const RefoldModel::MacroInvocation &m, const diffutils::Hunk &hintHunk,
-    ArrayRef<int> a2b, StringRef baseInvocationText,
+    const RefoldModel::MacroInvocation &m,
+    StringRef baseInvText,
     ArrayRef<std::pair<int, int>> invArgRanges,
     const DenseMap<int, std::string> &replByArgIdx) const {
   if (m.pasteSpans.empty())
@@ -2199,7 +2220,7 @@ bool RefoldEngine::PasteArgReplacementsMatchAllPasteTokensInB(
 
     auto range = invArgRanges[argIdx];
     StringRef rawArg =
-        baseInvocationText.substr(range.first, range.second - range.first);
+        baseInvText.substr(range.first, range.second - range.first);
     baseArgByIdx[argIdx] = rawArg.trim().str();
   }
 
@@ -2232,8 +2253,7 @@ bool RefoldEngine::PasteArgReplacementsMatchAllPasteTokensInB(
     // Map the A pasted-token occurrence to a single B token envelope. This
     // mapping is paste-aware because token-paste edits often cause the pasted
     // token to be unmapped in a2b (-1).
-    auto bEnv = MapAToBTokenEnvelopePasteStrictWithHint(a2b, beginTok, endTok,
-                                                        hintHunk);
+    auto bEnv = MapATokRangeAToBTokenEnvelope(beginTok, endTok);
     if (!bEnv || (bEnv->second - bEnv->first != 1))
       return false;
 
@@ -2350,6 +2370,11 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
   if (m.GetInvB() < 0 || m.GetInvE() < 0)
     return std::nullopt;
 
+  // tokenHunks are used by macroArgReplacementMatchesAllOccurrencesInB() to
+  // validate cross-occurrence consistency. In this args-only path we only need
+  // visibility into the current hunk, so treat it as the only token-level edit.
+  const diffutils::Hunk tokenHunks[] = {h};
+
   trace("macro/args", "args-only? inv id={0} name={1} {2} baseInv={3}", m.id,
         m.name, h, stringutils::showWSWithClip(baseInvText, 200));
 
@@ -2403,7 +2428,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         // isolation. We validate paste tokens as a *group* below via
         // pasteArgReplacementsMatchAllPasteTokensInB(...).
         if (!MacroArgReplacementMatchesAllOccurrencesInBIgnorePaste(
-                m, argIdx, baseArgText, newArg, a2b, h)) {
+                m, argIdx, baseArgText, newArg, tokenHunks)) {
           return std::nullopt;
         }
 
@@ -2414,7 +2439,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         // Combined safety gate: applying all derived replacements must
         // reconstruct every pasted token occurrence exactly as seen in B.
         if (!PasteArgReplacementsMatchAllPasteTokensInB(
-                m, h, a2b, baseInvText, invArgRanges, replByArgIdx)) {
+                m, baseInvText, invArgRanges, replByArgIdx)) {
           return std::nullopt;
         }
 
@@ -2464,8 +2489,9 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       // all occurrences, including paste-span occurrences, against the B
       // stream.
       if (!MacroArgReplacementMatchesAllOccurrencesInB(m, argIdx, baseArgText,
-                                                       newArg, a2b, h))
+                                                       newArg, tokenHunks)) {
         return std::nullopt;
+      }
 
       std::string newInv =
           stringutils::replaceRange(baseInvText, r.first, r.second, newArg);
@@ -2524,13 +2550,11 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     auto r0 = invArgRanges[argIdx];
     StringRef baseArgText = baseInvText.substr(r0.first, r0.second - r0.first);
 
-    // Map the A occurrence envelope to B using the alignment map. For
-    // paste-kind spans we use the paste-aware envelope mapping; otherwise the
-    // standard strict envelope mapping.
-    auto bEnv =
-        (sp.kind == RefoldModel::PPArgSpanKind::Paste)
-            ? MapAToBTokenEnvelopePasteStrictWithHint(a2b, sp.begin, sp.end, h)
-            : MapAToBTokenEnvelopeStrictWithHint(a2b, sp.begin, sp.end, h);
+    // Map the A occurrence envelope to B using byte-level hunks derived from
+    // the global alignment. This leverages producer-provided pp_byte_begin/
+    // pp_byte_end when present and falls back to
+    // consumer token offsets otherwise.
+    auto bEnv = MapAToBTokenEnvelopeByPPArgSpan(sp);
     if (!bEnv) {
       // Conservative fallback: use the hunk's B range if the span mapping
       // fails. If the hunk doesn't have a valid B range either, we cannot
@@ -2538,6 +2562,29 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       if (h.bStart < 0 || h.bEnd < 0 || h.bStart >= h.bEnd)
         return std::nullopt;
       bEnv = {h.bStart, h.bEnd};
+    }
+
+    // Force-include the hunk's B-side tokens into the derived envelope for this
+    // occurrence. This is critical for insertions that happen exactly at the
+    // PPArgSpan boundary (e.g. adding '* 2' after the last token of the
+    // argument occurrence), where the byte-based envelope mapping can resolve
+    // the end boundary to a position *between* inserted tokens.
+    if (h.bStart >= 0 && h.bEnd >= 0 && h.bStart < h.bEnd) {
+      bool touches;
+      if (h.aStart == h.aEnd) {
+        touches = (h.aStart >= sp.begin && h.aStart <= sp.end);
+      } else {
+        touches = (h.aStart < sp.end && h.aEnd > sp.begin);
+      }
+
+      if (touches) {
+        int lo = std::min(bEnv->first, h.bStart);
+        int hi = std::max(bEnv->second, h.bEnd);
+        int maxTok = std::max(0, static_cast<int>(bTokOff_.size()) - 1);
+        lo = std::clamp(lo, 0, maxTok);
+        hi = std::clamp(hi, lo, maxTok);
+        bEnv = {lo, hi};
+      }
     }
 
     // Slice the edited text from B corresponding to this occurrence and treat
@@ -2604,7 +2651,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     // ment reproduces all occurrences for argIdx in B, respecting strict/non-
     // strict stringify policy and paste behavior.
     if (!MacroArgReplacementMatchesAllOccurrencesInB(m, argIdx, baseArgText,
-                                                     newArg, a2b, h)) {
+                                                     newArg, tokenHunks)) {
       trace(
           "macro/args",
           "    consistency check FAILED for argIdx={0} newArg='{1}' -> expand",
@@ -2625,7 +2672,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
 
   // Apply replacements to the invocation string. We apply in descending argIdx
   // order so earlier replacements cannot shift the byte ranges of later ones in
-  // the same baseInvocationText.
+  // the same baseInvText.
   std::string finalInv = baseInvText.str();
   auto finalKeys = llvm::to_vector(
       llvm::map_range(replByArgIdx, [](auto &e) { return e.first; }));
@@ -2661,143 +2708,6 @@ StringRef RefoldEngine::SliceSource(ArrayRef<size_t> tokOff, StringRef source,
   hi = std::clamp(hi, lo, sourceLen);
 
   return source.substr(lo, hi - lo);
-}
-
-std::optional<std::pair<int, int>>
-RefoldEngine::MapAToBTokenEnvelopeStrict(ArrayRef<int> a2b, int aBegin,
-                                         int aEnd) {
-  if (a2b.empty())
-    return std::nullopt;
-
-  // Clamp and validate input range.
-  if (aBegin < 0)
-    aBegin = 0;
-  if (aEnd > static_cast<int>(a2b.size()))
-    aEnd = static_cast<int>(a2b.size());
-
-  if (aBegin >= aEnd)
-    return std::nullopt;
-
-  // Case 1: nearest mapped neighbors bracket the span => exact envelope.
-  // mapBackwardToB and mapForwardToB should return -1 on failure.
-  int bLeft = MapBackwardToB(a2b, aBegin - 1);
-  int bRight = MapForwardToB(a2b, aEnd);
-
-  if (bLeft >= 0 && bRight >= 0 && bLeft < bRight) {
-    return std::make_pair(bLeft + 1, bRight);
-  }
-
-  // Case 2: span contains mapped tokens => exact min/max envelope.
-  int minB = std::numeric_limits<int>::max();
-  int maxB = std::numeric_limits<int>::min();
-
-  for (int a = aBegin; a < aEnd; ++a) {
-    int b = a2b[a];
-    if (b >= 0) {
-      minB = std::min(minB, b);
-      maxB = std::max(maxB, b);
-    }
-  }
-
-  if (minB == std::numeric_limits<int>::max())
-    return std::nullopt;
-
-  return std::make_pair(minB, maxB + 1);
-}
-
-std::optional<std::pair<int, int>>
-RefoldEngine::MapAToBTokenEnvelopeStrictWithHint(
-    ArrayRef<int> a2b, int aBegin, int aEnd, const diffutils::Hunk &hintHunk) {
-  std::optional<std::pair<int, int>> env =
-      MapAToBTokenEnvelopeStrict(a2b, aBegin, aEnd);
-  if (!env) {
-    // No mapped tokens: only safe envelope is the hint hunk IF it overlaps the
-    // A-span.
-    if (hintHunk.bStart < 0 || hintHunk.bEnd <= hintHunk.bStart)
-      return std::nullopt;
-
-    if (hintHunk.aEnd <= aBegin || hintHunk.aStart >= aEnd)
-      return std::nullopt;
-
-    return std::make_pair(hintHunk.bStart, hintHunk.bEnd);
-  }
-
-  // If the hint hunk does not overlap the A-span, do not use it; return the
-  // strict mapping.
-  if (hintHunk.aEnd <= aBegin || hintHunk.aStart >= aEnd)
-    return env;
-
-  // Detect whether the A-span has unmapped tokens at the edges.
-  int firstMappedA = -1;
-  int lastMappedA = -1;
-
-  int a2bSize = static_cast<int>(a2b.size());
-  for (int a = std::max(0, aBegin); a < std::min(aEnd, a2bSize); ++a) {
-    if (a2b[a] >= 0) {
-      if (firstMappedA < 0)
-        firstMappedA = a;
-      lastMappedA = a;
-    }
-  }
-
-  if (firstMappedA < 0) {
-    // Should not happen if env is valid, but return strict mapping as fallback.
-    return env;
-  }
-
-  bool missingLeft = false;
-  bool missingRight = false;
-
-  for (int a = aBegin; a < firstMappedA; ++a) {
-    if (a >= 0 && a < a2bSize && a2b[a] < 0) {
-      missingLeft = true;
-      break;
-    }
-  }
-  for (int a = lastMappedA + 1; a < aEnd; ++a) {
-    if (a >= 0 && a < a2bSize && a2b[a] < 0) {
-      missingRight = true;
-      break;
-    }
-  }
-
-  int b0 = env->first;
-  int b1 = env->second;
-
-  // Extend ONLY on sides where unmapped tokens exist by merging with the hint.
-  if (missingLeft)
-    b0 = std::min(b0, hintHunk.bStart);
-  if (missingRight)
-    b1 = std::max(b1, hintHunk.bEnd);
-
-  // Ensure envelope is valid.
-  if (b0 < 0)
-    b0 = 0;
-  if (b1 < b0)
-    b1 = b0;
-
-  return std::make_pair(b0, b1);
-}
-
-std::optional<std::pair<int, int>>
-RefoldEngine::MapAToBTokenEnvelopePasteStrictWithHint(
-    ArrayRef<int> a2b, int aBegin, int aEnd, const diffutils::Hunk &hintHunk) {
-  // First try the strict token-mapping envelope (with an optional union with an
-  // overlapping hunk when there is partial mapping).
-  auto env = MapAToBTokenEnvelopeStrictWithHint(a2b, aBegin, aEnd, hintHunk);
-  if (env)
-    return env;
-
-  // No mapped tokens exist for this A span. The only sound B envelope is the
-  // hunk itself, but only if it overlaps the A range and provides a valid B
-  // range.
-  if (hintHunk.bStart < 0 || hintHunk.bEnd <= hintHunk.bStart)
-    return std::nullopt;
-  if (hintHunk.aEnd <= aBegin || hintHunk.aStart >= aEnd)
-    return std::nullopt;
-
-  // The only sound B envelope is the hunk itself.
-  return std::make_pair(hintHunk.bStart, hintHunk.bEnd);
 }
 
 std::optional<std::string>
@@ -2901,8 +2811,245 @@ bool RefoldEngine::HunkFullyWithinArgSpans(
   return any;
 }
 
+std::vector<RefoldEngine::ByteHunk> RefoldEngine::BuildByteHunksFromTokenHunks(
+    ArrayRef<diffutils::Hunk> tokenHunks) const {
+  std::vector<RefoldEngine::ByteHunk> out;
+  out.reserve(tokenHunks.size());
+
+  // aTokOff_ and bTokOff_ contain (N + 1) offsets, where index N  is the
+  // sentinel end offset.
+  const int maxATok = static_cast<int>(aToks_.size());
+  const int maxBTok = static_cast<int>(bToks_.size());
+
+  for (const auto &h : tokenHunks) {
+    // Clamp token indices to [0, toks.size()] to allow accessing the sentinel.
+    int a0Idx = std::clamp(h.aStart, 0, maxATok);
+    int a1Idx = std::clamp(h.aEnd, 0, maxATok);
+    int b0Idx = std::clamp(h.bStart, 0, maxBTok);
+    int b1Idx = std::clamp(h.bEnd, 0, maxBTok);
+
+    size_t a0 = aTokOff_[a0Idx];
+    size_t a1 = aTokOff_[a1Idx];
+    size_t b0 = bTokOff_[b0Idx];
+    size_t b1 = bTokOff_[b1Idx];
+
+    out.emplace_back(a0, a1, b0, b1);
+  }
+
+  return out;
+}
+
+size_t RefoldEngine::MapAByteToBByteLowerBound(size_t aByte) const {
+  // If no hunks exist, the streams are identical.
+  if (!abByteHunks_ || abByteHunks_->empty())
+    return aByte;
+
+  int64_t delta = 0;
+  for (const auto &h : *abByteHunks_) {
+    // If the byte is before the current hunk, we've found our final delta.
+    if (aByte < static_cast<size_t>(h.aBegin))
+      break;
+
+    // If the byte falls inside the hunk (an edit/deletion), snap to the start
+    // of the B-side replacement.
+    if (aByte < static_cast<size_t>(h.aEnd))
+      return h.bBegin;
+
+    // Otherwise, the byte is after this hunk; update the cumulative delta.
+    // delta = (new_len - old_len)
+    delta += (static_cast<int64_t>(h.bEnd) - h.bBegin) -
+             (static_cast<int64_t>(h.aEnd) - h.aBegin);
+  }
+
+  return static_cast<size_t>(static_cast<int64_t>(aByte) + delta);
+}
+
+size_t RefoldEngine::MapAByteToBByteUpperBound(size_t aByte) const {
+  if (!abByteHunks_ || abByteHunks_->empty())
+    return aByte;
+
+  int64_t delta = 0;
+  for (const auto &h : *abByteHunks_) {
+    // If the byte is before the start of the current hunk, we apply
+    // the current cumulative delta and finish.
+    if (aByte < static_cast<size_t>(h.aBegin))
+      break;
+
+    // If the queried position is exactly at the start of this hunk:
+    if (aByte == static_cast<size_t>(h.aBegin)) {
+      if (h.aBegin == h.aEnd) {
+        // Pure insertion: Include the inserted bytes in the delta.
+        delta += (static_cast<int64_t>(h.bEnd) - h.bBegin);
+      }
+      // For upper-bound semantics, we stop here so that an A-span ending
+      // at aBegin will include any insertion starting at bBegin.
+      break;
+    }
+
+    // If the byte falls inside the hunk (replaced/deleted range),
+    // snap to the end of the B-side replacement.
+    if (aByte < static_cast<size_t>(h.aEnd))
+      return h.bEnd;
+
+    // Otherwise, the byte is after this hunk; update cumulative delta.
+    delta += (static_cast<int64_t>(h.bEnd) - h.bBegin) -
+             (static_cast<int64_t>(h.aEnd) - h.aBegin);
+  }
+
+  return static_cast<size_t>(static_cast<int64_t>(aByte) + delta);
+}
+
+int RefoldEngine::BTokIndexFloor(int bByte) const {
+  const int n = static_cast<int>(bTokOff_.size()) - 1;
+
+  // Boundary cases: empty or single-offset stream.
+  if (n <= 0)
+    return 0;
+
+  // If the byte is at or before the start of the first token.
+  if (static_cast<size_t>(bByte) <= bTokOff_[0])
+    return 0;
+
+  // If the byte is at or after the end of the last token (the sentinel).
+  if (static_cast<size_t>(bByte) >= bTokOff_[n])
+    return n;
+
+  int lo = 0;
+  int hi = n;
+
+  // Standard floor binary search.
+  while (lo < hi) {
+    int mid = lo + (hi - lo + 1) / 2;
+    int off = bTokOff_[mid];
+
+    if (off <= bByte)
+      lo = mid;
+    else
+      hi = mid - 1;
+  }
+
+  return lo;
+}
+
+int RefoldEngine::BTokIndexCeil(int bByte) const {
+  const int n = static_cast<int>(bTokOff_.size()) - 1;
+
+  // Boundary cases: empty or single-offset stream.
+  if (n <= 0)
+    return 0;
+
+  // If the byte is at or before the start of the first token.
+  if (static_cast<size_t>(bByte) <= bTokOff_[0])
+    return 0;
+
+  // If the byte is at or after the end of the last token (the sentinel).
+  if (static_cast<size_t>(bByte) >= bTokOff_[n])
+    return n;
+
+  int lo = 0;
+  int hi = n;
+
+  // Standard ceiling binary search.
+  while (lo < hi) {
+    int mid = lo + (hi - lo) / 2;
+    int off = bTokOff_[mid];
+
+    if (off < bByte)
+      lo = mid + 1;
+    else
+      hi = mid;
+  }
+
+  return lo;
+}
+
+std::pair<int, int>
+RefoldEngine::MapAByteRangeToBTokenEnvelope(size_t aByteBegin,
+                                            size_t aByteEnd) const {
+  // Sanitize input range.
+  if (aByteEnd < aByteBegin)
+    aByteEnd = aByteBegin;
+
+  // Project byte coordinates from A to B.
+  size_t bByteBegin = MapAByteToBByteLowerBound(aByteBegin);
+  size_t bByteEnd = MapAByteToBByteUpperBound(aByteEnd);
+
+  // Sanitize B-space byte coordinates.
+  if (bByteEnd < bByteBegin)
+    bByteEnd = bByteBegin;
+  if (bByteEnd > bSource_.size())
+    bByteEnd = bSource_.size();
+
+  // Convert byte offsets to token indices.
+  int bTokBegin = BTokIndexFloor(static_cast<int>(bByteBegin));
+  int bTokEnd = BTokIndexCeil(static_cast<int>(bByteEnd));
+
+  // Final token range safety checks.
+  if (bTokBegin < 0)
+    bTokBegin = 0;
+  if (bTokEnd < bTokBegin)
+    bTokEnd = bTokBegin;
+
+  return {bTokBegin, bTokEnd};
+}
+
+std::optional<std::pair<int, int>>
+RefoldEngine::MapAToBTokenEnvelopeByPPArgSpan(
+    const RefoldModel::PPArgSpan &sp) const {
+  // Use high-precision preprocessor offsets if available.
+  if (sp.ppByteBegin && sp.ppByteEnd) {
+    int64_t pp0 = *sp.ppByteBegin;
+    int64_t pp1 = *sp.ppByteEnd;
+    if (pp0 >= 0 && pp1 >= pp0) {
+      return MapAByteRangeToBTokenEnvelope(static_cast<size_t>(pp0),
+                                           static_cast<size_t>(pp1));
+    }
+  }
+
+  // Fallback: use consumer token offsets.
+  const int maxATok = static_cast<int>(aToks_.size());
+  int a0Idx = std::clamp(sp.begin, 0, maxATok);
+  int a1Idx = std::clamp(sp.end, 0, maxATok);
+
+  size_t a0 = aTokOff_[a0Idx];
+  size_t a1 = aTokOff_[a1Idx];
+
+  return MapAByteRangeToBTokenEnvelope(a0, a1);
+}
+
+std::optional<std::pair<int, int>>
+RefoldEngine::MapATokRangeAToBTokenEnvelope(int beginTok, int endTok) const {
+  // If we don't have token data, we can't perform the mapping.
+  if (aToks_.empty() || aTokOff_.empty())
+    return std::nullopt;
+
+  const int nA = static_cast<int>(aToks_.size());
+
+  // Standardize the token indices.
+  beginTok = std::clamp(beginTok, 0, nA);
+  endTok = std::clamp(endTok, 0, nA);
+
+  // If the range is empty or inverted, return null.
+  if (endTok <= beginTok)
+    return std::nullopt;
+
+  // Safety check: ensure indices are within the offset array bounds.
+  // aTokOff_ is size N+1, so index 'nA' (the sentinel) is valid.
+  if (beginTok < 0 || static_cast<size_t>(beginTok) >= aTokOff_.size())
+    return std::nullopt;
+  if (endTok < 0 || static_cast<size_t>(endTok) >= aTokOff_.size())
+    return std::nullopt;
+
+  const size_t aByteBegin = aTokOff_[beginTok];
+  const size_t aByteEnd = aTokOff_[endTok];
+
+  // Delegate to the byte-to-token-envelope logic.
+  return MapAByteRangeToBTokenEnvelope(aByteBegin, aByteEnd);
+}
+
 std::optional<std::vector<std::pair<int, int>>>
 RefoldEngine::ParseMacroInvocationArgContentRanges(StringRef invText) {
+  // Locate the start of the argument list.
   size_t open = invText.find('(');
   if (open == StringRef::npos)
     return std::nullopt;
@@ -2910,26 +3057,29 @@ RefoldEngine::ParseMacroInvocationArgContentRanges(StringRef invText) {
   std::vector<std::pair<int, int>> out;
   size_t n = invText.size();
 
-  int depth = 0;
-  bool inS = false;
-  bool inD = false;
+  int depth = 0;    // Track nested parentheses, brackets, or braces.
+  bool inS = false; // Inside a single-quoted character literal.
+  bool inD = false; // Inside a double-quoted string literal.
 
   size_t argStart = open + 1;
   for (size_t i = open + 1; i < n; i++) {
     char c = invText[i];
 
+    // Handle escaping and termination inside character literals.
     if (inS) {
       if (c == '\\' && i + 1 < n) {
-        i++;
+        i++; // Skip escaped characters.
         continue;
       }
       if (c == '\'')
         inS = false;
       continue;
     }
+
+    // Handle escaping and termination inside string literals.
     if (inD) {
       if (c == '\\' && i + 1 < n) {
-        i++;
+        i++; // Skip escaped characters.
         continue;
       }
       if (c == '"')
@@ -2937,6 +3087,7 @@ RefoldEngine::ParseMacroInvocationArgContentRanges(StringRef invText) {
       continue;
     }
 
+    // Enter literal state if a quote is encountered.
     if (c == '\'') {
       inS = true;
       continue;
@@ -2946,13 +3097,17 @@ RefoldEngine::ParseMacroInvocationArgContentRanges(StringRef invText) {
       continue;
     }
 
+    // Increment depth for nested groups; commas inside these do not
+    // separate macro arguments.
     if (c == '(' || c == '[' || c == '{') {
       depth++;
       continue;
     }
 
+    // Handle the closing of a group or the entire argument list.
     if (c == ')') {
       if (depth == 0) {
+        // Final argument reached at the closing parenthesis of the call.
         out.push_back(stringutils::trimWsRange(invText, argStart, i));
         return out;
       }
@@ -2960,12 +3115,14 @@ RefoldEngine::ParseMacroInvocationArgContentRanges(StringRef invText) {
       continue;
     }
 
+    // A comma at depth 0 signifies the end of one macro argument.
     if (c == ',' && depth == 0) {
       out.push_back(stringutils::trimWsRange(invText, argStart, i));
       argStart = i + 1;
     }
   }
 
+  // If the loop finishes without hitting the final ')', the syntax is invalid.
   return std::nullopt;
 }
 
@@ -3215,49 +3372,53 @@ RefoldEngine::MacroPatch RefoldEngine::BuildMacroInvocationPatchWholeCover(
   // name) but lacks the inner macro patches we calculated in Step 1, prefer
   // 'updatedInvText'.
   std::string finalResult = chosen.str();
-  if (LooksLikeCallsiteText(chosen, m) && chosen != updatedInvText) {
+  if (InvocationSpanMatchesCallsitePrefix(chosen, m) &&
+      chosen != updatedInvText) {
     finalResult = updatedInvText;
   }
 
   return MacroPatch{m.GetInvB(), m.GetInvE(), std::move(finalResult)};
 }
 
-bool RefoldEngine::LooksLikeCallsiteText(
-    StringRef text, const RefoldModel::MacroInvocation &m) {
-  if (m.name.empty())
+bool RefoldEngine::InvocationSpanMatchesCallsitePrefix(
+    StringRef invSpanText, const RefoldModel::MacroInvocation &m) const {
+  if (invSpanText.empty() || m.name.empty())
     return false;
 
-  StringRef name = m.name;
-  const bool funcLike = (m.subkind == "func");
+  const size_t n = invSpanText.size();
+  size_t i = 0;
 
-  int textLen = static_cast<int>(text.size());
-  int nameLen = static_cast<int>(name.size());
-  int from = 0;
+  // Skip leading whitespace.
+  while (i < n && stringutils::isWs(invSpanText[i]))
+    i++;
 
-  while (from <= textLen - nameLen) {
-    size_t i = text.find(name, from);
-    if (i == StringRef::npos)
-      break;
+  if (i >= n)
+    return false;
 
-    int matchIdx = static_cast<int>(i);
+  // Verify identifier start.
+  const char c0 = invSpanText[i];
+  if (!stringutils::isIdentStart(c0))
+    return false;
 
-    // Ensure identifier boundaries, so we do not match substrings inside other
-    // identifiers.
-    if (stringutils::isIdentBoundary(text, matchIdx - 1) &&
-        stringutils::isIdentBoundary(text, matchIdx + nameLen)) {
-      if (!funcLike)
-        return true;
+  // Find end of identifier.
+  size_t j = i + 1;
+  while (j < n && stringutils::isIdentPart(invSpanText[j]))
+    j++;
 
-      int j = matchIdx + nameLen;
-      while (j < textLen && stringutils::isWs(text[j]))
-        j++;
-      if (j < textLen && text[j] == '(')
-        return true;
-    }
+  // Check if the identifier matches the macro name.
+  StringRef ident = invSpanText.slice(i, j);
+  if (ident != m.name)
+    return false;
 
-    from = matchIdx + nameLen;
-  }
-  return false;
+  // Object-like macro: identifier match at span start is sufficient.
+  if (m.subkind != "func")
+    return true;
+
+  // Function-like macro: must be followed by '(' (allowing whitespace).
+  while (j < n && stringutils::isWs(invSpanText[j]))
+    j++;
+
+  return (j < n && invSpanText[j] == '(');
 }
 
 // =========== Include processing (normalize, materialize, apply) ===========

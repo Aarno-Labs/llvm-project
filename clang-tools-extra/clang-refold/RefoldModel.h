@@ -172,16 +172,14 @@ public:
     PPArgSpanKind kind;
     int argIdx;
     int byteBegin = -1, byteEnd = -1;
+    std::optional<int> ppByteBegin;
+    std::optional<int> ppByteEnd;
 
     std::string ToString() const {
       return formatv("Arg {0}: [{1}, {2})", argIdx, begin, end).str();
     }
 
-    bool IsValid() const {
-      return PPSpan::IsValid() && argIdx >= 0 &&
-             (kind != PPArgSpanKind::Paste ||
-              (byteBegin > 0 && byteEnd > byteBegin));
-    }
+    bool IsValid() const;
   };
 
   struct PPCover {
@@ -313,16 +311,17 @@ public:
     std::vector<PPArgSpan> pasteSpans;
     std::vector<PPSpan> bodySpans;
     std::optional<std::string> invText;
-    std::optional<std::string> invFile;
-    std::optional<int> invB;
-    std::optional<int> invE;
+    std::optional<std::string> invFile; // file containing invocation
+    std::optional<int> invB, invE; // byte offsets within invFile
+    std::optional<int> invPPByteBegin, invPPByteEnd; // A-stream byte envelope
     std::optional<int> ownerIncludeId;
     PPCover cover;
 
     MacroInvocation(int id, std::string subkind, std::string name,
                     std::optional<std::string> invText,
                     std::optional<std::string> invFile, std::optional<int> invB,
-                    std::optional<int> invE, std::optional<int> ownerIncludeId,
+                    std::optional<int> invE, std::optional<int> invPPByteBegin,
+                    std::optional<int> invPPByteEnd, std::optional<int> ownerIncludeId,
                     std::vector<PPSpan> spans, std::vector<PPArgSpan> argSpans,
                     std::vector<PPArgSpan> stringifySpans,
                     std::vector<PPArgSpan> pasteSpans,
@@ -335,6 +334,8 @@ public:
           pasteSpans(std::move(pasteSpans)), bodySpans(std::move(bodySpans)),
           invText(std::move(invText)), invFile(std::move(invFile)),
           invB(std::move(invB)), invE(std::move(invE)),
+          invPPByteBegin(std::move(invPPByteBegin)),
+          invPPByteEnd(std::move(invPPByteEnd)),
           ownerIncludeId(std::move(ownerIncludeId)) {
       cover.Init(coverBegin, coverEnd, this->spans, &this->argSpans,
                  &this->bodySpans);
@@ -589,6 +590,10 @@ private:
   std::string sourcePath_;
   std::string ppCwd_;
   int tokensCountA_ = 0;
+
+  /// Optional per-token byte offsets in the preprocessed output (A stream).
+  std::optional<std::vector<int64_t>> tokPPByteBeginA_;
+  std::optional<std::vector<int64_t>> tokPPByteEndA_;
 
   DenseMap<int, TokMapEntry> tokmapByPP_; // key = pp
   std::vector<TokMapEntry> tokmap_;

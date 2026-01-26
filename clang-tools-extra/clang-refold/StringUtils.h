@@ -58,6 +58,8 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_STRINGUTILS_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_STRINGUTILS_H
 
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/FormatVariadic.h"
@@ -80,35 +82,19 @@ inline constexpr bool isWs(char c) noexcept {
          c == '\r';
 }
 
-inline constexpr bool isAsciiAlpha(char c) noexcept {
-  return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+inline constexpr bool isIdentStart(char c) noexcept {
+  return c == '_' || isAlpha(c);
 }
 
-inline constexpr bool isAsciiDigit(char c) noexcept {
-  return (c >= '0' && c <= '9');
-}
-
-inline constexpr bool isAsciiIdentStart(char c) noexcept {
-  return c == '_' || isAsciiAlpha(c);
-}
-
-inline constexpr bool isAsciiIdentChar(char c) noexcept {
-  return isAsciiIdentStart(c) || isAsciiDigit(c);
-}
-
-/** Broad “identifier-ish” (includes digits) for boundary-glue heuristics. */
-inline constexpr bool isIdentChar(char c) noexcept {
-  return isAsciiIdentChar(c);
+inline constexpr bool isIdentPart(char c) noexcept {
+  return isIdentStart(c) || isDigit(c);
 }
 
 // ---------------------- String predicates (ASCII only) ----------------------
 
-inline bool isAsciiWhitespace(StringRef s) noexcept {
-  for (char c : s) {
-    if (!isWs(c))
-      return false;
-  }
-  return true;
+
+inline bool isWhitespace(StringRef s) noexcept {
+  return all_of(s, [](char c) { return isWs(c); });
 }
 
 // --------------------- Index scans (return -1 if none) ----------------------
@@ -228,12 +214,6 @@ inline StringRef trimEdgeSpaces(StringRef s) {
     return s; // no trimming needed; return the original string ref
 
   return s.substr(lo, hi - lo); // return trimmed portion
-}
-
-inline bool isIdentBoundary(StringRef s, int idx) {
-  if (idx < 0 || idx >= static_cast<int>(s.size()))
-    return true;
-  return !isAsciiIdentChar(s[idx]);
 }
 
 inline bool isLineSplice(StringRef s, int nlIdx) {

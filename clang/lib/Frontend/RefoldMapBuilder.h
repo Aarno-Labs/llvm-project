@@ -249,6 +249,8 @@ class RefoldMapBuilder {
   const LangOptions &Lang;
   bool IgnoreComments = true;
   uint64_t TokIndex = 0;
+  std::vector<uint64_t> TokPPByteBegin;
+  std::vector<uint64_t> TokPPByteEnd;
 
   std::vector<Item> Items;
   llvm::StringMap<int> MacroKey2Item;
@@ -437,7 +439,7 @@ public:
   ///
   /// Advances token index and attributes the token to the currently active
   /// items (file/include/macro) by extending their open spans.
-  void onToken(const Token &Tok);
+  void onToken(const Token &Tok, uint64_t PPByteBegin, uint64_t PPByteEnd);
 
   /// End-of-stream notification.
   ///

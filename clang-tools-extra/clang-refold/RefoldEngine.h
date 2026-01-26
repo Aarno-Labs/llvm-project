@@ -155,6 +155,7 @@ struct PPTok {
 ///
 /// \author jeikenberry
 class RefoldEngine {
+struct ByteHunk;
 public:
   /// \brief Perform the end-to-end refolding process for a translation unit.
   ///
@@ -206,6 +207,8 @@ private:
   ArrayRef<size_t> aTokOff_, bTokOff_;
   LineDirectiveInserter lineDirs_;
   bool strict_;
+
+  std::optional<std::vector<ByteHunk>> abByteHunks_;
 
   /// Construct an engine from concrete inputs. The instance method `Refold()`
   /// runs the full pipeline using these captured members.
@@ -319,6 +322,14 @@ private:
     /// A set of parameter indices that undergo stringification,
     /// used for O(1) lookups.
     DenseSet<int> stringifyParamSet;
+  };
+
+  struct ByteHunk {
+    int aBegin, aEnd;
+    int bBegin, bEnd;
+
+    ByteHunk(int a0, int a1, int b0, int b1)
+      : aBegin(a0), aEnd(a1), bBegin(b0), bEnd(b1) {}
   };
 
   // ---------------------------- Ownership Helpers ----------------------------
@@ -1009,18 +1020,16 @@ private:
   /// \param baseArg original argument spelling in the invocation (used to
   ///                classify paste behavior)
   /// \param newArg proposed new argument spelling for `argIdx`
-  /// \param a2b A→B token index mapping for the current file
-  /// \param hintHunk edit hunk near the change site used to improve mapping
-  ///                 robustness (optional)
+  /// \param tokenHunks token-level edit hunks on the current file (used to
+  ///                   widen B-envelopes at insertion boundaries)
   /// \returns `true` if all verifiable occurrences of `argIdx` in B are
   ///          consistent with the rewrite; `false` if any required occurrence
   ///          contradicts the rewrite.
   bool MacroArgReplacementMatchesAllOccurrencesInB(
       const RefoldModel::MacroInvocation &m, int argIdx, StringRef baseArg,
-      StringRef newArg, ArrayRef<int> a2b,
-      const diffutils::Hunk &hintHunk) const {
+      StringRef newArg, ArrayRef<diffutils::Hunk> tokenHunks) const {
     return MacroArgReplacementMatchesAllOccurrencesInBImpl(
-        m, argIdx, baseArg, newArg, a2b, hintHunk, /*checkPasteSpans*/ true);
+        m, argIdx, baseArg, newArg, tokenHunks, /*checkPasteSpans*/ true);
   }
 
   /// \brief Variant of `MacroArgReplacementMatchesAllOccurrencesInB` that
@@ -1043,18 +1052,16 @@ private:
   /// \param baseArg original argument spelling in the invocation (used to
   ///                classify paste behavior)
   /// \param newArg proposed new argument spelling for `argIdx`
-  /// \param a2b A->B token index mapping for the current file
-  /// \param hintHunk edit hunk near the change site used to improve mapping
-  ///                 robustness (optional)
+  /// \param tokenHunks token-level edit hunks on the current file (used to
+  ///                   widen B-envelopes at insertion boundaries)
   /// \returns `true` if all verifiable non-paste occurrences of `argIdx` in B
   ///          are consistent with the rewrite; `false` if any required
   ///          occurrence contradicts it.
   bool MacroArgReplacementMatchesAllOccurrencesInBIgnorePaste(
       const RefoldModel::MacroInvocation &m, int argIdx, StringRef baseArg,
-      StringRef newArg, ArrayRef<int> a2b,
-      const diffutils::Hunk &hintHunk) const {
+      StringRef newArg, ArrayRef<diffutils::Hunk> tokenHunks) const {
     return MacroArgReplacementMatchesAllOccurrencesInBImpl(
-        m, argIdx, baseArg, newArg, a2b, hintHunk, /*checkPasteSpans*/ false);
+        m, argIdx, baseArg, newArg, tokenHunks, /*checkPasteSpans*/ false);
   }
 
   /// \brief Core implementation for validating whether a proposed args-only
@@ -1108,16 +1115,15 @@ private:
   /// \param argIdx zero-based macro parameter index being rewritten
   /// \param baseArg original argument spelling in the invocation (optional)
   /// \param newArg proposed new argument spelling for `argIdx`
-  /// \param a2b A->B token index mapping for the current file
-  /// \param hintHunk edit hunk near the change site used to improve mapping
-  ///                 robustness (optional)
+  /// \param tokenHunks edit hunks on the B token stream (used to widen
+  ///                   B-envelopes at insertion boundaries)
   /// \param checkPasteSpans whether to attempt per-span paste verification
   /// \returns `true` if all verifiable occurrences of `argIdx` in B are
   ///          consistent with applying the args-only rewrite; `false` on any
   ///          proven contradiction.
   bool MacroArgReplacementMatchesAllOccurrencesInBImpl(
       const RefoldModel::MacroInvocation &m, int argIdx, StringRef baseArg,
-      StringRef newArg, ArrayRef<int> a2b, const diffutils::Hunk &hintHunk,
+      StringRef newArg, ArrayRef<diffutils::Hunk> tokenHunks,
       bool checkPasteSpans) const;
 
   /// \brief Returns `true` if the given hunk touches any token-paste occurrence
@@ -1410,18 +1416,14 @@ private:
   ///   (expansion).
   ///
   /// \param m Macro invocation metadata (must contain `pasteSpans`).
-  /// \param hintHunk Overlapping edit hunk used as a conservative envelope
-  ///                 fallback when strict mapping yields no token envelope.
-  /// \param a2b Alignment map from A token index to B token index (-1 for
-  ///            unmapped).
-  /// \param baseInvocationText Invocation spelling text (e.g., "CONCAT(a,b,c)").
+  /// \param baseInvText Invocation spelling text (e.g., "CONCAT(a,b,c)").
   /// \param invArgRanges Argument content ranges within `baseInvocationText`.
   /// \param replByArgIdx Candidate replacements per argument index.
   /// \returns `true` if the replacements reproduce every pasted token
   ///          occurrence in B.
   bool PasteArgReplacementsMatchAllPasteTokensInB(
-      const RefoldModel::MacroInvocation &m, const diffutils::Hunk &hintHunk,
-      ArrayRef<int> a2b, StringRef baseInvocationText,
+      const RefoldModel::MacroInvocation &m,
+      StringRef baseInvText,
       ArrayRef<std::pair<int, int>> invArgRanges,
       const DenseMap<int, std::string> &replByArgIdx) const;
 
@@ -1638,102 +1640,105 @@ private:
                                       ArrayRef<RefoldModel::PPArgSpan> argSpans,
                                       MutableArrayRef<char> touched);
 
-  /// \brief Computes the minimal B-token envelope corresponding to an A-token
-  /// span under a strict A->B mapping.
+  /// \brief Converts a list of token-based edit hunks into byte-based hunks.
   ///
-  /// This method projects a half-open A-token interval `[aBegin, aEnd)` into
-  /// B-token space using the alignment map `a2b`. The projection is *strict* in
-  /// the sense that it uses only mapped tokens and/or immediately adjacent
-  /// mapped neighbors; it does not consult edit hunks or apply heuristic
-  /// expansion.
+  /// This routine projects the token indices in \p tokenHunks back onto the raw
+  /// source byte streams (A and B) using the pre-computed token offset arrays.
   ///
-  /// The method supports two exact derivation modes:
-  /// 1. **Neighbor bracketing:** If the nearest mapped token to the left of
-  ///    `aBegin` and the nearest mapped token at/after `aEnd` are both found
-  ///    and strictly ordered in B, the span maps to `(bLeft, bRight)` which
-  ///    corresponds to `[bLeft + 1, bRight)`.
-  /// 2. **Contained mappings:** Otherwise, if any token inside `[aBegin, aEnd)`
-  ///    is mapped, the envelope is `[minMappedB, maxMappedB + 1)` over those
-  ///    mapped tokens.
+  /// The transformation accounts for the sentinel offsets at the end of each
+  /// token stream, allowing hunks that point to the end of the file to be
+  /// resolved correctly. Input indices are clamped to valid token ranges to
+  /// ensure safety against alignment anomalies.
   ///
-  /// If no mapped tokens are available and neighbors do not bracket the span,
-  /// the method returns `std::nullopt`.
-  ///
-  /// \param a2b A-token to B-token mapping array; `-1` indicates an unmapped
-  ///            A token.
-  /// \param aBegin Inclusive start token index in A.
-  /// \param aEnd Exclusive end token index in A.
-  /// \returns B-token envelope `[b0, b1)` implied by strict mapping, or
-  ///          `std::nullopt` if none exists.
-  static std::optional<std::pair<int, int>>
-  MapAToBTokenEnvelopeStrict(ArrayRef<int> a2b, int aBegin, int aEnd);
+  /// \param tokenHunks A list of hunks where \c aStart, \c aEnd, etc., refer to
+  ///                   indices in the preprocessed token streams.
+  /// \returns A vector of \c ByteHunk objects containing the corresponding
+  ///          [begin, end) byte offsets in the A and B source buffers.
+  std::vector<ByteHunk>
+  BuildByteHunksFromTokenHunks(ArrayRef<diffutils::Hunk> tokenHunks) const;
 
-  /// \brief Computes a strict B-token envelope for an A-token span, optionally
-  /// extending it using an overlapping edit hunk when partial mapping exists.
+  /// \brief Projects a byte offset from source A to source B using
+  /// lower-bound semantics.
   ///
-  /// This method is the primary "sound but minimal" projection used by
-  /// args-only macro patching to slice the edited B stream without
-  /// over-approximating. It first attempts a strict mapping via
-  /// `mapAToBTokenEnvelopeStrict`. If no mapping can be derived, it can fall
-  /// back to the provided `hintHunk` *only* when the hunk overlaps the A span
-  /// and has a valid B range.
+  /// This mapping resolves where a specific coordinate in the original
+  /// preprocessed stream (A) lands in the edited stream (B). If the
+  /// coordinate falls within a range that was deleted or replaced, it
+  /// snaps to the beginning of the replacement in B.
   ///
-  /// When a strict mapping exists, the method can optionally union the result
-  /// with the hint hunk, but only on sides where the A span contains
-  /// *unmapped* tokens. This handles common cases where:
-  /// * The interior of the span is mapped, but the span begins or ends inside
-  ///   an edited region.
-  /// * Those edited edge tokens are unmapped (`a2b == -1`).
-  ///
-  /// Importantly, the envelope is never expanded unless unmapped tokens are
-  /// detected on that side of the A span, preserving minimality and avoiding
-  /// heuristic growth.
-  ///
-  /// \param a2b A-token to B-token mapping array; `-1` indicates an unmapped
-  ///            A token.
-  /// \param aBegin Inclusive start token index in A.
-  /// \param aEnd Exclusive end token index in A.
-  /// \param hintHunk An edit hunk that overlaps `[aBegin, aEnd)` and provides a
-  ///                 valid B range; may be `nullptr`.
-  /// \returns B-token envelope `[b0, b1)` for the A span, or `std::nullopt` if
-  ///          no sound envelope exists.
-  static std::optional<std::pair<int, int>>
-  MapAToBTokenEnvelopeStrictWithHint(ArrayRef<int> a2b, int aBegin, int aEnd,
-                                     const diffutils::Hunk &hintHunk);
+  /// \param aByte The byte offset in the original preprocessed stream A.
+  /// \returns The corresponding byte offset in the edited stream B.
+  size_t MapAByteToBByteLowerBound(size_t aByte) const;
 
-  /// \brief Projects an A-token span that represents a token-paste (`##`)
-  /// occurrence into a B-token envelope, using a strict mapping policy and an
-  /// overlapping edit hunk as a fallback.
+  /// \brief Projects a byte offset from source A to source B using
+  /// upper-bound semantics.
   ///
-  /// PASTE spans are special because the pasted token often becomes *unmapped*
-  /// in the A->B alignment when the token text is edited in `B_PP`. In those
-  /// cases, `a2b[a] == -1` for the pasted token, meaning a pure mapping-based
-  /// envelope cannot be derived.
+  /// Similar to the lower-bound mapping, this projects coordinates from A
+  /// to B, but treats boundaries differently to ensure inclusive ranges.
+  /// If aByte falls exactly at the start of an insertion, the mapping
+  /// includes that insertion in the resulting B offset. If it falls inside
+  /// a replaced range, it snaps to the end of the replacement in B.
   ///
-  /// This method therefore applies a conservative two-phase strategy:
-  /// 1. Attempt to derive an envelope using `mapAToBTokenEnvelopeStrictWithHint`,
-  ///    which can succeed when the span contains mapped tokens or when mapped
-  ///    neighbors bracket the span.
-  /// 2. If that fails, require an overlapping `hintHunk` and return the hunk's
-  ///    B range as the only sound envelope for the edited paste token.
+  /// \param aByte The byte offset in the original preprocessed stream A.
+  /// \returns The corresponding byte offset in the edited stream B.
+  size_t MapAByteToBByteUpperBound(size_t aByte) const;
+
+  /// \brief Finds the largest token index `i` such that `bTokOff_[i] <= bByte`.
   ///
-  /// The returned envelope is always half-open `[b0, b1)` in B-token indices and
-  /// is never expanded beyond what is justified by mapped tokens and/or the
-  /// hint hunk. If no sound envelope can be proven, this method returns
-  /// `std::nullopt` and callers must fall back to macro realization.
+  /// This performs a floor-based binary search on the B-stream token offsets.
+  /// It identifies the token that contains the given byte offset or the most
+  /// recent token starting before it.
   ///
-  /// \param a2b A-token to B-token mapping array; `-1` indicates an unmapped
-  ///            A token.
-  /// \param aBegin Inclusive start token index in A.
-  /// \param aEnd Exclusive end token index in A.
-  /// \param hintHunk An edit hunk expected to overlap `[aBegin, aEnd)` when the
-  ///                 pasted token is unmapped; may be `nullptr`.
-  /// \returns B-token envelope `[b0, b1)` for the A span, or `std::nullopt` if
-  ///          no sound projection exists.
-  static std::optional<std::pair<int, int>>
-  MapAToBTokenEnvelopePasteStrictWithHint(ArrayRef<int> a2b, int aBegin,
-                                          int aEnd,
-                                          const diffutils::Hunk &hintHunk);
+  /// \param bByte The byte offset in the edited preprocessed stream B.
+  /// \returns The index of the token corresponding to the floor of \p bByte.
+  int BTokIndexFloor(int bByte) const;
+
+  /// \brief Finds the smallest token index `i` such that `bTokOff_[i] >= bByte`.
+  ///
+  /// This performs a ceiling-based binary search on the B-stream token offsets.
+  /// It is typically used to find the exclusive end-boundary of a token range
+  /// corresponding to a byte-level span.
+  ///
+  /// \param bByte The byte offset in the edited preprocessed stream B.
+  /// \returns The index of the token corresponding to the ceiling of \p bByte.
+  int BTokIndexCeil(int bByte) const;
+
+  /// \brief Maps a byte range in source A to a token envelope in source B.
+  ///
+  /// This is the core mapping routine that projects a character-level span
+  /// from the original preprocessed stream onto a discrete range of tokens
+  /// in the edited stream. It accounts for edit hunks to find the correct
+  /// B-space byte offsets before performing a binary search to find the
+  /// containing tokens.
+  ///
+  /// \param aByteBegin The starting byte offset in source A.
+  /// \param aByteEnd The ending byte offset (exclusive) in source A.
+  /// \returns A pair representing the [begin, end) token indices in source B.
+  std::pair<int, int> MapAByteRangeToBTokenEnvelope(size_t aByteBegin,
+                                                    size_t aByteEnd) const;
+
+  /// \brief Maps a macro argument span to its corresponding B-token envelope.
+  ///
+  /// This function prioritizes high-precision preprocessor byte offsets stored
+  /// in the \p PPArgSpan. If those offsets are missing or invalid, it falls
+  /// back to using the token-index-based offsets from the consumer stream.
+  ///
+  /// \param sp The macro argument span metadata from the RefoldModel.
+  /// \returns The B-token range if mapping is successful, std::nullopt otherwise.
+  std::optional<std::pair<int, int>>
+  MapAToBTokenEnvelopeByPPArgSpan(const RefoldModel::PPArgSpan &sp) const;
+
+  /// \brief Maps a token range in source A to a token envelope in source B.
+  ///
+  /// Converts a token-index-based range from the original stream into a
+  /// byte-offset range, then projects that range into the edited stream's
+  /// token space. This is used when identifying the B-side impact of edits
+  /// defined by A-side token boundaries.
+  ///
+  /// \param beginTok The starting token index in source A.
+  /// \param endTok The ending token index (exclusive) in source A.
+  /// \returns The B-token range if the input is valid, std::nullopt otherwise.
+  std::optional<std::pair<int, int>>
+  MapATokRangeAToBTokenEnvelope(int beginTok, int endTok) const;
 
   /// \brief Parses the raw text of a function-like macro invocation to identify
   /// the byte ranges of its individual arguments.
@@ -1789,37 +1794,22 @@ private:
       ArrayRef<int> a2b, StringRef baseInvText,
       const DenseMap<int, DenseMap<int, MacroPatch>> &patchMap) const;
 
-  /// \brief Heuristically detects whether a text slice still contains the
-  /// original macro *call-site* spelling for the given invocation, rather than
-  /// being a realized/expanded replacement.
+  /// \brief Validates that a raw source span contains a valid macro callsite
+  /// prefix matching the invocation metadata.
   ///
-  /// This check is intentionally token-aware: it searches for the macro name as
-  /// a standalone C identifier, rejecting substring matches that occur inside
-  /// other identifiers (e.g., matching `assert` inside `__assert_rtn` must not
-  /// count).
+  /// This check ensures that the text at the projected invocation coordinate
+  /// starts with the correct macro name and, for function-like macros, is
+  /// immediately followed by an opening parenthesis. This provides a safety
+  /// proof that the refold mapping correctly aligned with the actual source
+  /// code callsite before attempting an args-only rewrite.
   ///
-  /// ### Matching rules
-  /// * **Object-like macros** (`m.subkind != "func"`): An identifier-boundary
-  ///   match on the macro name is sufficient.
-  /// * **Function-like macros** (`m.subkind == "func"`): An identifier-boundary
-  ///   match on the macro name must be followed by optional whitespace and then
-  ///   `(`. This reduces false positives when the macro name appears in
-  ///   unrelated contexts.
-  ///
-  /// This method does not attempt full C parsing; it is a lightweight guard
-  /// used during refolding to decide whether the current TU text still appears
-  /// to contain the invocation form that can be rewritten args-only. A return
-  /// value of `false` should be treated as "do not assume call-site spelling is
-  /// present" (i.e., prefer realization/expansion or other safe fallbacks).
-  ///
-  /// \param text A candidate TU slice that may contain the macro call-site
-  ///             spelling.
-  /// \param m Macro invocation metadata (name and subkind).
-  /// \returns `true` if `text` contains a token-delimited occurrence of the
-  ///          macro name, and for function-like macros it is immediately
-  ///          followed by `(` after optional whitespace.
-  static bool LooksLikeCallsiteText(StringRef text,
-                                    const RefoldModel::MacroInvocation &m);
+  /// \param invSpanText The raw text extracted from the source file at the
+  ///                    projected invocation span.
+  /// \param m The macro invocation metadata containing the expected name
+  ///          and subkind (object-like vs function-like).
+  /// \returns True if the text contains a valid prefix for the macro call.
+  bool InvocationSpanMatchesCallsitePrefix(
+      StringRef invSpanText, const RefoldModel::MacroInvocation &m) const;
 
   /// \brief Applies a deterministic, stable ordering to include-scoped
   /// insertion patches.

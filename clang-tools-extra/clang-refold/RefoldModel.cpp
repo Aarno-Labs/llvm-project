@@ -157,6 +157,22 @@ Expected<const json::Object *> arrayObjElemAt(const json::Array &arr,
   const json::Value &val = arr[idx];
   return asObject(val, ctx);
 }
+
+static std::optional<std::vector<int64_t>>
+readLongArray(const json::Object &parent, StringRef field) {
+  const json::Array *arr = parent.getArray(field);
+  if (!arr)
+    return std::nullopt; // Matches Java 'return null'
+
+  std::vector<int64_t> out;
+  out.reserve(arr->size());
+  for (const auto &v : *arr) {
+    // Java: (n == null || n.isNull()) ? -1L : n.asLong()
+    auto n = v.getAsInteger();
+    out.push_back(n ? *n : -1);
+  }
+  return out;
+}
 } // namespace
 
 namespace clang {
@@ -203,6 +219,7 @@ parseSpans(const json::Value &val, StringRef ctx,
         return argOrErr.takeError();
       span.argIdx = *argOrErr;
 
+      // If this PPArgSpan has a byte range, then parse byte_begin/byte_end.
       assert(argKind && "missing 'argKind' when parsing a PPArgSpan type");
       if (RefoldModel::HasByteRange(*argKind)) {
         auto bbOrErr = applyToField(asInt, *obj, "byte_begin", ctxItem);
@@ -214,6 +231,15 @@ parseSpans(const json::Value &val, StringRef ctx,
           return beOrErr.takeError();
         span.byteEnd = *beOrErr;
       }
+
+      // Check if there are pp_byte_begin/pp_byte_end pairs.
+      span.ppByteBegin = asOptInt(*obj, "pp_byte_begin");
+      if (span.ppByteBegin) {
+        auto pbeOrErr = applyToField(asInt, *obj, "pp_byte_end", ctxItem);
+        if (!pbeOrErr)
+          return pbeOrErr.takeError();
+        span.ppByteEnd = *pbeOrErr;
+      }
     } else {
       assert(!argKind && "unexpected PPArgSpanKind on non-PPArgSpan type");
     }
@@ -223,6 +249,19 @@ parseSpans(const json::Value &val, StringRef ctx,
   return out;
 }
 } // namespace
+
+bool RefoldModel::PPArgSpan::IsValid() const {
+  if (!PPSpan::IsValid() || argIdx < 0)
+    return false;
+
+  bool okPaste = (kind != PPArgSpanKind::Paste) ||
+                 (byteBegin >= 0 && byteEnd > byteBegin);
+
+  bool okPP = (!ppByteBegin && !ppByteEnd) ||
+              (ppByteBegin && ppByteEnd);
+
+  return okPaste && okPP;
+}
 
 // ================== RefoldModel construction =====================
 
@@ -260,6 +299,31 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
   if (!cntOrErr)
     return cntOrErr.takeError();
   model.tokensCountA_ = *cntOrErr;
+
+  // tokens.pp_byte_begin / tokens.pp_byte_end (optional)
+  auto pbbOrErr = readLongArray(tokObj, "pp_byte_begin");
+  if (pbbOrErr)
+    model.tokPPByteBeginA_ = std::move(*pbbOrErr);
+  auto pbeOrErr = readLongArray(tokObj, "pp_byte_end");
+  if (pbeOrErr)
+    model.tokPPByteEndA_ = std::move(*pbeOrErr);
+
+  // Make sure we have both tokPPByteBeginA_ and tokPPByteEndA_.
+  if (model.tokPPByteBeginA_) {
+    if (!model.tokPPByteEndA_)
+      model.tokPPByteBeginA_ = std::nullopt;
+  } else if (model.tokPPByteEndA_) {
+    model.tokPPByteEndA_ = std::nullopt;
+  }
+
+  // Make sure the token count matches the size of each tokPPByteBeginA_ and
+  // tokPPByteEndA_ vector.
+  if (model.tokPPByteBeginA_ &&
+      (model.tokPPByteBeginA_->size() != model.tokPPByteEndA_->size() ||
+       model.tokPPByteBeginA_->size() != (size_t)model.tokensCountA_)) {
+    model.tokPPByteBeginA_ = std::nullopt;
+    model.tokPPByteEndA_ = std::nullopt;
+  }
 
   // tokmap
   {
@@ -603,6 +667,8 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
         std::optional<std::string> invFile = asOptString(*obj, "inv_file");
         std::optional<int> invB = asOptInt(*obj, "inv_b");
         std::optional<int> invE = asOptInt(*obj, "inv_e");
+        std::optional<int> invPPByteBegin = asOptInt(*obj, "inv_pp_byte_begin");
+        std::optional<int> invPPByteEnd = asOptInt(*obj, "inv_pp_byte_end");
         std::optional<int> ownerIncludeId = asOptInt(*obj, "owner_include_id");
 
         std::vector<PPSpan> spans;
@@ -675,6 +741,8 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
                            /*invFile*/ std::move(invFile),
                            /*invB*/ std::move(invB),
                            /*invE*/ std::move(invE),
+                           /*invPPByteBegin*/ std::move(invPPByteBegin),
+                           /*invPPByteEnd*/ std::move(invPPByteEnd),
                            /*ownerIncludeId*/ std::move(ownerIncludeId),
                            /*spans*/ std::move(spans),
                            /*argSpans*/ std::move(argSpans),
