@@ -605,27 +605,6 @@ private:
   const RefoldModel::MacroInvocation *
   SmallestCoveringPatchableMacro(int aStart, int aEnd) const;
 
-  /// \brief Returns the smallest include whose PP coverage contains a
-  /// zero-width patch position, or (for non-empty ranges) fully covers the span.
-  ///
-  /// Policy: for pure insertions (\p ALo == \p AHi) we treat positions that
-  /// land exactly on an include's PP start boundary (coverBegin) as inside that
-  /// include, and positions at or beyond coverEnd as outside. In interval terms
-  /// we treat the include's PP coverage as [coverBegin, coverEnd) and require
-  /// coverBegin <= \p ALo < coverEnd.
-  ///
-  /// For non-empty ranges (\p ALo < \p AHi) we keep the original semantics: any
-  /// include whose coverage interval [coverBegin, coverEnd) fully contains
-  /// [\p ALo, \p AHi) is a candidate, and we pick the one with the smallest
-  /// width.
-  ///
-  /// \param aLo  Inclusive start PP-token index in A.
-  /// \param aHi  Exclusive end PP-token index in A.
-  /// \returns The smallest covering include item, or nullptr if none cover the
-  ///          span.
-  const RefoldModel::IncludeItem *SmallestCoveringInclude(int aLo,
-                                                          int aHi) const;
-
   /// \brief Determine whether an A-token interval is owned by the translation
   ///        unit (TU).
   ///
