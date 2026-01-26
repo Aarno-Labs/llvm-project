@@ -198,8 +198,33 @@ static constexpr const char *RefoldSchema = R"json(
           "type": "integer",
           "minimum": 0,
           "description": "Number of tokens in the preprocessed stream A."
+        },
+        "pp_byte_begin": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": -1
+          },
+          "description": "Per-token begin byte offsets in the preprocessed output (A stream). Index i corresponds to A token i."
+        },
+        "pp_byte_end": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": -1
+          },
+          "description": "Per-token end byte offsets (exclusive) in the preprocessed output (A stream). Index i corresponds to A token i."
         }
-      }
+      },
+      "dependentRequired": {
+        "pp_byte_begin": [
+          "pp_byte_end"
+        ],
+        "pp_byte_end": [
+          "pp_byte_begin"
+        ]
+      },
+      "description": "Token metadata for the preprocessed stream A."
     },
     "items": {
       "type": "array",
@@ -271,14 +296,32 @@ static constexpr const char *RefoldSchema = R"json(
         },
         "byte_begin": {
           "type": "integer",
-          "minimum": 0
+          "minimum": -1
         },
         "byte_end": {
           "type": "integer",
-          "minimum": 0
+          "minimum": -1
+        },
+        "pp_byte_begin": {
+          "type": "integer",
+          "minimum": -1,
+          "description": "Byte offset in the preprocessed output (A stream) where this span begins. A value of -1 indicates the producer could not compute the byte range."
+        },
+        "pp_byte_end": {
+          "type": "integer",
+          "minimum": -1,
+          "description": "Byte offset in the preprocessed output (A stream) where this span ends (exclusive). A value of -1 indicates the producer could not compute the byte range."
         }
       },
-      "description": "Inherits logic from PPSpan but manually flattened for validator compatibility."
+      "description": "Inherits logic from PPSpan but manually flattened for validator compatibility.",
+      "dependentRequired": {
+        "pp_byte_begin": [
+          "pp_byte_end"
+        ],
+        "pp_byte_end": [
+          "pp_byte_begin"
+        ]
+      }
     },
     "MacroItem": {
       "type": "object",
@@ -386,6 +429,16 @@ static constexpr const char *RefoldSchema = R"json(
             "null"
           ],
           "description": "Include item id that opened inv_file (when it's an included header instance)"
+        },
+        "inv_pp_byte_begin": {
+          "type": "integer",
+          "minimum": -1,
+          "description": "Byte offset in the preprocessed output (A stream) for the start of the expansion associated with this invocation, or -1 if unknown/unavailable."
+        },
+        "inv_pp_byte_end": {
+          "type": "integer",
+          "minimum": -1,
+          "description": "Byte offset in the preprocessed output (A stream) for the end (exclusive) of the expansion associated with this invocation, or -1 if unknown/unavailable."
         }
       },
       "dependentRequired": {
@@ -394,6 +447,12 @@ static constexpr const char *RefoldSchema = R"json(
         ],
         "inv_e": [
           "inv_b"
+        ],
+        "inv_pp_byte_begin": [
+          "inv_pp_byte_end"
+        ],
+        "inv_pp_byte_end": [
+          "inv_pp_byte_begin"
         ]
       },
       "$comment": "inv_b/inv_e are BYTES in the main source, not token indices."

@@ -41,6 +41,36 @@ using namespace clang::refold;
 
 namespace {
 
+
+/// A raw_ostream wrapper that counts the exact number of bytes written.
+///
+/// This is used by the refold-map producer to assign deterministic byte
+/// offsets (pp_byte_begin/pp_byte_end) to printed tokens.
+///
+/// This stream is set to unbuffered mode so that the counter advances on every
+/// write (not just on buffer flush). This is acceptable here because refold-map
+/// production is not on the compiler's performance-critical path.
+class RefoldCountingRawOstream final : public llvm::raw_ostream {
+public:
+  explicit RefoldCountingRawOstream(llvm::raw_ostream &Out) : Out(Out) {
+    // Ensure each write updates the counter immediately.
+    SetUnbuffered();
+  }
+
+  uint64_t bytesWritten() const { return Bytes; }
+
+private:
+  void write_impl(const char *Ptr, size_t Size) override {
+    Out.write(Ptr, Size);
+    Bytes += Size;
+  }
+
+  uint64_t current_pos() const override { return Bytes; }
+
+  llvm::raw_ostream &Out;
+  uint64_t Bytes = 0;
+};
+
 class PrintPPOutputPPCallbacks : public PPCallbacks {
   Preprocessor &PP;
   SourceManager &SM;
@@ -797,7 +827,8 @@ struct UnknownPragmaHandler : public PragmaHandler {
 
 static void PrintPreprocessedTokens(Preprocessor &PP, Token &Tok,
                                     PrintPPOutputPPCallbacks *Callbacks,
-                                    RefoldMapBuilder *RefoldRecorder) {
+                                    RefoldMapBuilder *RefoldRecorder,
+                                    RefoldCountingRawOstream *CountOS) {
   bool DropComments = PP.getLangOpts().TraditionalCPP &&
                       !PP.getCommentRetentionState();
 
@@ -815,6 +846,10 @@ static void PrintPreprocessedTokens(Preprocessor &PP, Token &Tok,
 
     Callbacks->HandleWhitespaceBeforeTok(Tok, /*RequireSpace=*/false,
                                          /*RequireSameLine=*/!IsStartOfLine);
+
+    uint64_t TokPPBegin = 0;
+    if (CountOS != nullptr)
+      TokPPBegin = CountOS->bytesWritten();
 
     if (DropComments && Tok.is(tok::comment)) {
       // Skip comments. Normally the preprocessor does not generate
@@ -912,8 +947,12 @@ static void PrintPreprocessedTokens(Preprocessor &PP, Token &Tok,
     Callbacks->setEmittedTokensOnThisLine();
     IsStartOfLine = false;
 
-    if (RefoldRecorder)
-      RefoldRecorder->onToken(Tok);
+    if (RefoldRecorder) {
+      uint64_t TokPPEnd = TokPPBegin;
+      if (CountOS != nullptr)
+        TokPPEnd = CountOS->bytesWritten();
+      RefoldRecorder->onToken(Tok, TokPPBegin, TokPPEnd);
+    }
 
     if (Tok.is(tok::eof)) break;
 
@@ -978,8 +1017,15 @@ void clang::DoPrintPreprocessedInput(Preprocessor &PP, raw_ostream *OS,
   if (!RefoldMapFile.empty())
     RefoldRecorder = std::make_shared<RefoldMapBuilder>(PP, RefoldMapFile);
 
+  raw_ostream *OutOS = OS;
+  std::unique_ptr<RefoldCountingRawOstream> CountingOS;
+  if (RefoldRecorder) {
+    CountingOS = std::make_unique<RefoldCountingRawOstream>(*OS);
+    OutOS = CountingOS.get();
+  }
+
   PrintPPOutputPPCallbacks *Callbacks = new PrintPPOutputPPCallbacks(
-      PP, OS, !Opts.ShowLineMarkers, Opts.ShowMacros,
+      PP, OutOS, !Opts.ShowLineMarkers, Opts.ShowMacros,
       Opts.ShowIncludeDirectives, Opts.UseLineDirectives,
       Opts.MinimizeWhitespace, Opts.DirectivesOnly, Opts.KeepSystemIncludes);
 
@@ -1094,8 +1140,8 @@ void clang::DoPrintPreprocessedInput(Preprocessor &PP, raw_ostream *OS,
   } while (true);
 
   // Read all the preprocessed tokens, printing them out to the stream.
-  PrintPreprocessedTokens(PP, Tok, Callbacks, RefoldRecorder.get());
-  *OS << '\n';
+  PrintPreprocessedTokens(PP, Tok, Callbacks, RefoldRecorder.get(), CountingOS.get());
+  *OutOS << '\n';
 
   // Remove the handlers we just added to leave the preprocessor in a sane state
   // so that it can be reused (for example by a clang::Parser instance).

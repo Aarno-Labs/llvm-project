@@ -1241,7 +1241,8 @@ void RefoldMapBuilder::onEnterFile(SourceLocation IncludeLoc) {
   IncludeStack.push_back(Idx);
 }
 
-void RefoldMapBuilder::onToken(const Token &Tok) {
+void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
+                           uint64_t PPByteEnd) {
   if (!enabled())
     return;
   if (Tok.is(tok::eof))
@@ -1554,6 +1555,8 @@ void RefoldMapBuilder::onToken(const Token &Tok) {
     TokMap.push_back(std::move(M));
   }
 
+  TokPPByteBegin.push_back(PPByteBegin);
+  TokPPByteEnd.push_back(PPByteEnd);
   ++TokIndex;
 }
 
@@ -1757,7 +1760,7 @@ void RefoldMapBuilder::writeJSON() {
   llvm::json::OStream JO(OS, /*Indent=*/2);
 
   JO.object([&] {
-    JO.attribute("version", "1.4");
+    JO.attribute("version", "1.5");
 
     const auto &PPO = PP.getPreprocessorOpts();
     std::string LangStr = computeLangStr(PP.getLangOpts());
@@ -1783,7 +1786,19 @@ void RefoldMapBuilder::writeJSON() {
     JO.attribute("source", TUSourcePath);
 
     // tokens...
-    JO.attributeObject("tokens", [&] { JO.attribute("count", TokIndex); });
+    JO.attributeObject("tokens", [&] {
+      JO.attribute("count", TokIndex);
+      // TODO: We should probably allow for disabling pp_byte_begin/pp_byte_end
+      // by passing a CLI flag to clang.
+      JO.attributeArray("pp_byte_begin", [&] {
+        for (uint64_t B : TokPPByteBegin)
+          JO.value(B);
+      });
+      JO.attributeArray("pp_byte_end", [&] {
+        for (uint64_t E : TokPPByteEnd)
+          JO.value(E);
+      });
+    });
 
     // items...
     JO.attributeArray("items", [&] {
@@ -1801,13 +1816,54 @@ void RefoldMapBuilder::writeJSON() {
             JO.attribute("name", It.Name);
           if (!It.Text.empty())
             JO.attribute("text", It.Text);
-          if (!It.InvText.empty())
-            JO.attribute("inv_text", It.InvText);
-          if (It.InvBegin >= 0 && It.InvEnd >= 0) {
-            JO.attribute("inv_b", It.InvBegin);
-            JO.attribute("inv_e", It.InvEnd);
+
+          // Invocation metadata only applies to macro items per the JSON schema.
+          if (It.Kind == IK_Macro) {
+            if (!It.InvText.empty())
+              JO.attribute("inv_text", It.InvText);
+
             if (!It.InvFile.empty())
               JO.attribute("inv_file", It.InvFile);
+
+            // inv_b / inv_e are byte offsets within inv_file and must be non-negative.
+            // If the invocation range is unknown, we omit both fields.
+            if (It.InvBegin >= 0 && It.InvEnd >= 0 && It.InvEnd >= It.InvBegin) {
+              JO.attribute("inv_b", It.InvBegin);
+              JO.attribute("inv_e", It.InvEnd);
+            }
+
+            // Derive inv_pp_byte_begin / inv_pp_byte_end from this macro's PP-token envelope.
+            //
+            // We compute the A-token interval [minBeginTok, maxEndTok) over all TokenSpan
+            // entries for this macro expansion, then map the first/last token to PP-byte offsets.
+            bool HaveTokEnv = false;
+            uint64_t BTok = 0;
+            uint64_t ETok = 0;
+
+            for (const TokenSpan &S : It.Spans) {
+              if (!HaveTokEnv) {
+                BTok = S.Begin;
+                ETok = S.End;
+                HaveTokEnv = true;
+              } else {
+                BTok = std::min<uint64_t>(BTok, S.Begin);
+                ETok = std::max<uint64_t>(ETok, S.End);
+              }
+            }
+
+            if (HaveTokEnv && ETok > BTok) {
+              const uint64_t LastTok = ETok - 1;
+              if (BTok < TokPPByteBegin.size() && LastTok < TokPPByteEnd.size()) {
+                JO.attribute("inv_pp_byte_begin", TokPPByteBegin[(size_t)BTok]);
+                JO.attribute("inv_pp_byte_end", TokPPByteEnd[(size_t)LastTok]);
+              } else {
+                JO.attribute("inv_pp_byte_begin", -1);
+                JO.attribute("inv_pp_byte_end", -1);
+              }
+            } else {
+              JO.attribute("inv_pp_byte_begin", -1);
+              JO.attribute("inv_pp_byte_end", -1);
+            }
           }
 
           if (It.Kind == IK_File)
@@ -1884,6 +1940,15 @@ void RefoldMapBuilder::writeJSON() {
                   JO.object([&] {
                     JO.attribute("begin", S.Begin);
                     JO.attribute("end",   S.End);
+                    int64_t PPByteBegin = -1;
+                    int64_t PPByteEnd = -1;
+                    if (S.Begin >= 0 && S.End > S.Begin &&
+                        (uint64_t)S.End <= TokPPByteBegin.size()) {
+                      PPByteBegin = (int64_t)TokPPByteBegin[(uint64_t)S.Begin];
+                      PPByteEnd = (int64_t)TokPPByteEnd[(uint64_t)S.End - 1];
+                    }
+                    JO.attribute("pp_byte_begin", PPByteBegin);
+                    JO.attribute("pp_byte_end", PPByteEnd);
                     if (S.ArgIndex >= 0)
                       JO.attribute("arg_index", (int64_t)S.ArgIndex);
                   });
@@ -1896,7 +1961,16 @@ void RefoldMapBuilder::writeJSON() {
                   JO.object([&] {
                     JO.attribute("begin", S.Begin);
                     JO.attribute("end",   S.End);
-                   if (S.ArgIndex >= 0)
+                    int64_t PPByteBegin = -1;
+                    int64_t PPByteEnd = -1;
+                    if (S.Begin >= 0 && S.End > S.Begin &&
+                        (uint64_t)S.End <= TokPPByteBegin.size()) {
+                      PPByteBegin = (int64_t)TokPPByteBegin[(uint64_t)S.Begin];
+                      PPByteEnd = (int64_t)TokPPByteEnd[(uint64_t)S.End - 1];
+                    }
+                    JO.attribute("pp_byte_begin", PPByteBegin);
+                    JO.attribute("pp_byte_end", PPByteEnd);
+                    if (S.ArgIndex >= 0)
                       JO.attribute("arg_index", (int64_t)S.ArgIndex);
                   });
                 }
@@ -1908,6 +1982,15 @@ void RefoldMapBuilder::writeJSON() {
                   JO.object([&] {
                     JO.attribute("begin", S.Begin);
                     JO.attribute("end", S.End);
+                    int64_t PPByteBegin = -1;
+                    int64_t PPByteEnd = -1;
+                    if (S.Begin >= 0 && S.End > S.Begin &&
+                        (uint64_t)S.End <= TokPPByteBegin.size()) {
+                      PPByteBegin = (int64_t)TokPPByteBegin[(uint64_t)S.Begin];
+                      PPByteEnd = (int64_t)TokPPByteEnd[(uint64_t)S.End - 1];
+                    }
+                    JO.attribute("pp_byte_begin", PPByteBegin);
+                    JO.attribute("pp_byte_end", PPByteEnd);
                     if (S.ArgIndex >= 0)
                       JO.attribute("arg_index", (int64_t)S.ArgIndex);
                     if (S.HasByteRange) {
