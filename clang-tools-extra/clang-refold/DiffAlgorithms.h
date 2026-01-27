@@ -61,6 +61,7 @@
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_DIFFALGORITHMS_H
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/Support/FormatAdapters.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/raw_ostream.h"
@@ -204,7 +205,7 @@ struct Hunk {
 /// \param a Left sequence.
 /// \param b Right sequence.
 /// \returns Ordered list of `Step` records: `EQUAL`, `INSERT`, and `DELETE`.
-std::vector<Step> diff(ArrayRef<std::string> a, ArrayRef<std::string> b);
+std::vector<Step> diff(ArrayRef<StringRef> a, ArrayRef<StringRef> b);
 
 /// \brief Coalesce contiguous non-EQUAL steps into larger Hunk regions.
 ///

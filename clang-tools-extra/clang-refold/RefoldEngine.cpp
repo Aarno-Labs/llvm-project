@@ -259,7 +259,12 @@ std::string RefoldEngine::Refold() {
   auto hunks = diffutils::hunksFromMap(a2b, static_cast<int>(aSeq.size()),
                                        static_cast<int>(bSeq.size()));
 
-  abByteHunks_ = BuildByteHunksFromTokenHunks(hunks);
+  // Build *raw-text* byte hunks once; this enables deterministic mapping of PP byte spans
+  // from A->B, without inheriting any ambiguity from token-level alignment.
+  //
+  // This is critical for "insert-only" edits, where token-only LCS diffing can place the
+  // insertion at an arbitrary stable point, corrupting subsequent A->B byte span mapping.
+  abByteHunks_ = BuildByteHunksFromRawText();
 
   for (size_t i = 0; i < hunks.size(); ++i) {
     const auto &h = hunks[i];
@@ -1711,7 +1716,7 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
 
   // Verify all standard (non-paste) occurrences.
   for (const auto &s : m.argSpans) {
-    if (s.argIdx != argIdx || s.kind != RefoldModel::PPArgSpanKind::Standard)
+    if (s.argIdx != argIdx || s.kind != PPArgSpanKind::Standard)
       continue;
 
     auto bEnv = MapAToBTokenEnvelopeByPPArgSpan(s);
@@ -2623,29 +2628,6 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       bEnv = {h.bStart, h.bEnd};
     }
 
-    // Force-include the hunk's B-side tokens into the derived envelope for this
-    // occurrence. This is critical for insertions that happen exactly at the
-    // PPArgSpan boundary (e.g. adding '* 2' after the last token of the
-    // argument occurrence), where the byte-based envelope mapping can resolve
-    // the end boundary to a position *between* inserted tokens.
-    if (h.bStart >= 0 && h.bEnd >= 0 && h.bStart < h.bEnd) {
-      bool touches;
-      if (h.aStart == h.aEnd) {
-        touches = (h.aStart >= sp.begin && h.aStart <= sp.end);
-      } else {
-        touches = (h.aStart < sp.end && h.aEnd > sp.begin);
-      }
-
-      if (touches) {
-        int lo = std::min(bEnv->first, h.bStart);
-        int hi = std::max(bEnv->second, h.bEnd);
-        int maxTok = std::max(0, static_cast<int>(bTokOff_.size()) - 1);
-        lo = std::clamp(lo, 0, maxTok);
-        hi = std::clamp(hi, lo, maxTok);
-        bEnv = {lo, hi};
-      }
-    }
-
     // Slice the edited text from B corresponding to this occurrence and treat
     // it as the candidate replacement for the argument (subject to stringify
     // decoding and paste lifting below).
@@ -2870,31 +2852,35 @@ bool RefoldEngine::HunkFullyWithinArgSpans(
   return any;
 }
 
-std::vector<RefoldEngine::ByteHunk> RefoldEngine::BuildByteHunksFromTokenHunks(
-    ArrayRef<diffutils::Hunk> tokenHunks) const {
-  std::vector<RefoldEngine::ByteHunk> out;
-  out.reserve(tokenHunks.size());
+std::vector<RefoldEngine::ByteHunk>
+RefoldEngine::BuildByteHunksFromRawText() const {
+  // We still need a physical array of "elements" for ArrayRef.
+  // But now, each element is just 16 bytes (pointer + length)
+  // instead of a 32-byte heap-allocating std::string.
 
-  // aTokOff_ and bTokOff_ contain (N + 1) offsets, where index N  is the
-  // sentinel end offset.
-  const int maxATok = static_cast<int>(aToks_.size());
-  const int maxBTok = static_cast<int>(bToks_.size());
+  auto ToRefVec = [](StringRef s) {
+    std::vector<StringRef> v;
+    v.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+      // Point to a 1-character substring within the existing aText/bText.
+      // This is O(1) and performs NO heap allocation for the character.
+      v.push_back(s.substr(i, 1));
+    }
+    return v;
+  };
 
-  for (const auto &h : tokenHunks) {
-    // Clamp token indices to [0, toks.size()] to allow accessing the sentinel.
-    int a0Idx = std::clamp(h.aStart, 0, maxATok);
-    int a1Idx = std::clamp(h.aEnd, 0, maxATok);
-    int b0Idx = std::clamp(h.bStart, 0, maxBTok);
-    int b1Idx = std::clamp(h.bEnd, 0, maxBTok);
+  std::vector<StringRef> aRefs = ToRefVec(aSource_);
+  std::vector<StringRef> bRefs = ToRefVec(bSource_);
 
-    size_t a0 = aTokOff_[a0Idx];
-    size_t a1 = aTokOff_[a1Idx];
-    size_t b0 = bTokOff_[b0Idx];
-    size_t b1 = bTokOff_[b1Idx];
+  // diff now takes ArrayRef<StringRef>
+  auto steps = diffutils::diff(aRefs, bRefs);
+  auto hunks = diffutils::coalesce(steps);
 
-    out.emplace_back(a0, a1, b0, b1);
+  std::vector<ByteHunk> out;
+  out.reserve(hunks.size());
+  for (const auto &h : hunks) {
+    out.emplace_back(h.aStart, h.aEnd, h.bStart, h.bEnd);
   }
-
   return out;
 }
 
@@ -3025,25 +3011,25 @@ int RefoldEngine::BTokIndexCeil(int bByte) const {
 std::pair<int, int>
 RefoldEngine::MapAByteRangeToBTokenEnvelope(size_t aByteBegin,
                                             size_t aByteEnd) const {
-  // Sanitize input range.
+  // Sanitize A-byte input range
   if (aByteEnd < aByteBegin)
     aByteEnd = aByteBegin;
 
-  // Project byte coordinates from A to B.
+  // Convert A-byte span to B-byte span using A→B mapping
   size_t bByteBegin = MapAByteToBByteLowerBound(aByteBegin);
   size_t bByteEnd = MapAByteToBByteUpperBound(aByteEnd);
 
-  // Sanitize B-space byte coordinates.
+  // Clamp B-byte bounds to legal range
   if (bByteEnd < bByteBegin)
     bByteEnd = bByteBegin;
   if (bByteEnd > bSource_.size())
     bByteEnd = bSource_.size();
 
-  // Convert byte offsets to token indices.
-  int bTokBegin = BTokIndexFloor(static_cast<int>(bByteBegin));
-  int bTokEnd = BTokIndexCeil(static_cast<int>(bByteEnd));
+  // Convert B-byte bounds to B-token index span
+  int bTokBegin = BTokIndexFloor(static_cast<int>(bByteBegin)); // inclusive
+  int bTokEnd = BTokIndexCeil(static_cast<int>(bByteEnd)); // exclusive
 
-  // Final token range safety checks.
+  // Clamp B-token bounds
   if (bTokBegin < 0)
     bTokBegin = 0;
   if (bTokEnd < bTokBegin)
@@ -3060,9 +3046,23 @@ RefoldEngine::MapAToBTokenEnvelopeByPPArgSpan(
     int64_t pp0 = *sp.ppByteBegin;
     int64_t pp1 = *sp.ppByteEnd;
     if (pp0 >= 0 && pp1 >= pp0) {
-      return MapAByteRangeToBTokenEnvelope(static_cast<size_t>(pp0),
-                                           static_cast<size_t>(pp1));
+      auto env = MapAByteRangeToBTokenEnvelope(static_cast<size_t>(pp0),
+                                               static_cast<size_t>(pp1));
+      trace("byte/env",
+            "PPArgSpan['{0}' arg={1} Aidx={2} PPbytes=[{3},{4})] -> "
+            "Btok=[{5},{6})",
+            sp.kind, sp.argIdx, sp.begin, pp0, pp1, env.first, env.second);
+      return env;
     }
+  }
+
+  // Don't resort to "fallback" if in strict mode.
+  if (strict_) {
+    fatal("macro/pparg/span",
+          "PPArgSpan missing producer ppByte span (kind='{0}' argIdx={1} "
+          "A=[{2},{3}) ppByte=[4},{5}]) - cannot map without snapping",
+          sp.kind, sp.argIdx, sp.begin, sp.end, sp.ppByteBegin, sp.ppByteEnd);
+    return std::nullopt;
   }
 
   // Fallback: use consumer token offsets.
@@ -4216,7 +4216,7 @@ std::string RefoldEngine::PPArgSpanToString(const RefoldModel::PPArgSpan &sp,
     os << ", occ=STRINGIFY";
   }
 
-  if (sp.kind == RefoldModel::PPArgSpanKind::Paste) {
+  if (sp.kind == PPArgSpanKind::Paste) {
     os << ", byte=[" << sp.byteBegin << ',' << sp.byteEnd << ')';
   }
 

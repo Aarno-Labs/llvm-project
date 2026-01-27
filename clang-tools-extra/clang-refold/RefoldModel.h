@@ -47,6 +47,20 @@ using namespace llvm;
 namespace clang {
 namespace refold {
 
+enum class PPArgSpanKind { Standard, Stringify, Paste };
+
+static inline StringRef toString(PPArgSpanKind kind) {
+  switch (kind) {
+  case PPArgSpanKind::Standard:
+    return "Standard";
+  case PPArgSpanKind::Stringify:
+    return "Stringify";
+  case PPArgSpanKind::Paste:
+    return "Paste";
+  }
+  llvm_unreachable("Invalid owner kind");
+}
+
 /// \brief Strongly-typed view over the clang-refold map JSON produced by the
 ///        modified Clang preprocessor.
 ///
@@ -139,8 +153,6 @@ public:
 
     bool IsValid() const { return begin >= 0 && end >= 0 && end > begin; }
   };
-
-  enum class PPArgSpanKind { Standard, Stringify, Paste };
 
 #if 0
   // Getter for the 'key' field

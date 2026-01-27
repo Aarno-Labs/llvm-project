@@ -75,6 +75,10 @@ namespace clang {
 namespace refold {
 
 struct PPTok {
+  // Clang token kind (e.g. "identifier", "numeric_constant", "string_literal",
+  // "l_paren"). This is sourced from the token dump and is intentionally a
+  // simple string.
+  std::string kind;
   std::string spelling;
 };
 
@@ -328,8 +332,8 @@ private:
     int aBegin, aEnd;
     int bBegin, bEnd;
 
-    ByteHunk(int a0, int a1, int b0, int b1)
-      : aBegin(a0), aEnd(a1), bBegin(b0), bEnd(b1) {}
+    ByteHunk(int aBegin, int aEnd, int bBegin, int bEnd)
+      : aBegin(aBegin), aEnd(aEnd), bBegin(bBegin), bEnd(bEnd) {}
   };
 
   // ---------------------------- Ownership Helpers ----------------------------
@@ -1553,12 +1557,9 @@ private:
   /// resolved correctly. Input indices are clamped to valid token ranges to
   /// ensure safety against alignment anomalies.
   ///
-  /// \param tokenHunks A list of hunks where \c aStart, \c aEnd, etc., refer to
-  ///                   indices in the preprocessed token streams.
   /// \returns A vector of \c ByteHunk objects containing the corresponding
   ///          [begin, end) byte offsets in the A and B source buffers.
-  std::vector<ByteHunk>
-  BuildByteHunksFromTokenHunks(ArrayRef<diffutils::Hunk> tokenHunks) const;
+  std::vector<ByteHunk> BuildByteHunksFromRawText() const;
 
   /// \brief Projects a byte offset from source A to source B using
   /// lower-bound semantics.
