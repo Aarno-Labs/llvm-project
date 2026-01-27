@@ -66,6 +66,7 @@
 #include <climits>
 #include <cstring>
 #include <limits>
+#include <string>
 #include <vector>
 
 namespace clang {
@@ -415,8 +416,8 @@ std::vector<Hunk> hunksFromMap(ArrayRef<int> map, int nA, int nB) {
 /// \param dAtEnd Minimal edit distance at the end of the forward pass.
 /// \param offset Offset used to index `V` by `k + offset`.
 /// \returns Forward-ordered list of `Step` edits.
-static std::vector<Step> backtrack(ArrayRef<std::string> a,
-                                   ArrayRef<std::string> b,
+static std::vector<Step> backtrack(ArrayRef<StringRef> a,
+                                   ArrayRef<StringRef> b,
                                    ArrayRef<std::vector<int>> trace,
                                    int x, int y, int dAtEnd, int offset) {
   std::vector<Step> out;
@@ -470,56 +471,64 @@ static std::vector<Step> backtrack(ArrayRef<std::string> a,
   return out;
 }
 
-std::vector<Step> diff(ArrayRef<std::string> a, ArrayRef<std::string> b) {
+std::vector<Step> diff(ArrayRef<StringRef> a, ArrayRef<StringRef> b) {
   const int n = static_cast<int>(a.size());
   const int m = static_cast<int>(b.size());
   const int max = n + m;
   const int offset = max;
 
-  // Trace of v snapshots for each d (we store vectors for simplicity).
+  // Initial V array: range [-max, max] offset to [0, 2*max]
+  std::vector<int> v(2 * max + 1, -1);
+
+  // Base case: for d=0 and k=0 we take x=0 from v[offset+1].
+  v[offset + 1] = 0;
+
   std::vector<std::vector<int>> trace;
-  trace.reserve(static_cast<std::size_t>(max + 1));
+  trace.reserve(max + 1);
 
-  std::vector<int> v(static_cast<std::size_t>(2 * max + 1), 0);
-
-  // Forward pass
   for (int d = 0; d <= max; ++d) {
-    trace.push_back(v); // snapshot BEFORE processing layer d
+    // Copy current v to vNew to represent this edit distance layer.
+    std::vector<int> vNew = v;
 
     for (int k = -d; k <= d; k += 2) {
       const int kIndex = k + offset;
 
       int x;
-      if (k == -d || (k != d && v[static_cast<std::size_t>(kIndex - 1)] <
-                                    v[static_cast<std::size_t>(kIndex + 1)])) {
-        // down: insert in a (advance in b)
-        x = v[static_cast<std::size_t>(kIndex + 1)];
+      if (k == -d || (k != d && v[kIndex - 1] < v[kIndex + 1])) {
+        // Down move: insertion
+        x = v[kIndex + 1];
       } else {
-        // right: delete from A (advance in A)
-        x = v[static_cast<std::size_t>(kIndex - 1)] + 1;
+        // Right move: deletion
+        x = v[kIndex - 1] + 1;
       }
+
       int y = x - k;
 
-      // Follow diagonal (snake)
-      while (x < n && y < m &&
-             a[static_cast<std::size_t>(x)] == b[static_cast<std::size_t>(y)]) {
-        ++x;
-        ++y;
+      // Follow diagonal while items are equal.
+      while (x < n && y < m && a[x] == b[y]) {
+        x++;
+        y++;
       }
-      v[static_cast<std::size_t>(kIndex)] = x;
+
+      vNew[kIndex] = x;
 
       if (x >= n && y >= m) {
-        // Reached end; backtrack to produce SES.
+        // Found the end!
+        trace.push_back(std::move(vNew));
         return backtrack(a, b, trace, x, y, d, offset);
       }
     }
+
+    // Move vNew into trace to avoid a deep copy, then update v for the next
+    // iteration.
+    trace.push_back(std::move(vNew));
+    v = trace.back();
   }
 
-  // Should be unreachable for finite inputs.
-  llvm_unreachable("diff failed to reach end");
+  return backtrack(a, b, trace, n, m, max, offset);
 }
 
-std::vector<Hunk> coalesce(ArrayRef<Step> &steps) {
+std::vector<Hunk> coalesce(ArrayRef<Step> steps) {
   std::vector<Hunk> hunks;
   std::size_t i = 0;
   const std::size_t n = steps.size();

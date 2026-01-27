@@ -182,7 +182,7 @@ namespace {
 template <typename T = RefoldModel::PPSpan>
 Expected<std::vector<T>>
 parseSpans(const json::Value &val, StringRef ctx,
-           std::optional<RefoldModel::PPArgSpanKind> argKind = std::nullopt) {
+           std::optional<PPArgSpanKind> argKind = std::nullopt) {
   std::vector<T> out;
   auto arrOrErr = asArray(val, ctx);
   if (!arrOrErr)
