@@ -846,6 +846,35 @@ RefoldEngine::ClassifyOwnerWithSegments(StringRef tuPath,
         "ENTER classifyOwnerWithSegments tuPath={0} A[{1},{2}) (isEmpty={3})",
         tuPath, a0, a1, a0 == a1);
 
+  const auto &tokmapByPP = model_.GetTokmapByPP();
+
+  // Insertion ownership:
+  //
+  // If the PP gap aligns with a stable TU slot boundary (include boundary or
+  // conditional-arm boundary), defer to the segment-based classification (using
+  // TU byte anchoring).
+  //
+  // Otherwise, if both sides of the gap are unambiguously within the same
+  // include's PP coverage, treat the insertion as include-owned.
+  if (a0 == a1) {
+    if (auto slotAnchor = AnchorToNearestSlotBoundaryFromPPGap(tuPath, a0)) {
+      std::optional<int> leftInc =
+          (a0 > 0) ? model_.InnermostIncludeAtPP(a0 - 1) : std::nullopt;
+      const size_t maxPP = model_.GetTokensCountA();
+      std::optional<int> rightInc = (a0 >= 0 && static_cast<size_t>(a0) < maxPP)
+                                        ? model_.InnermostIncludeAtPP(a0)
+                                        : std::nullopt;
+
+      if (leftInc && rightInc && *leftInc == *rightInc) {
+        trace("segments",
+              "    insertion gap PP={0} classified as INCLUDE id={1} (left={2} "
+              "right={3})",
+              a0, rightInc, leftInc, rightInc);
+        return Owner::Include(*rightInc);
+      }
+    }
+  }
+
   // First, get the TU byte span for this hunk. Even when the hunk ultimately
   // belongs to a header, we still anchor via the TU span because segments for
   // includes and conditional arms in that header are projected into the TU
@@ -856,7 +885,6 @@ RefoldEngine::ClassifyOwnerWithSegments(StringRef tuPath,
   // insertion cannot be safely anchored in TU), classify purely in PP space.
   if (span.first < 0 || span.second < 0) {
     const bool isInsert = (a0 == a1);
-    const auto &tokmapByPP = model_.GetTokmapByPP();
     const size_t n = tokmapByPP.size();
 
     std::optional<int> leftInc;
@@ -1069,74 +1097,79 @@ bool RefoldEngine::HunkMapsToTU(int a0, int a1, StringRef tuPath) const {
     return sawAnyTU;
   }
 
-  // Deterministic include-boundary anchoring: if this PP gap sits exactly on
-  // the boundary of an include expansion (per directive PP spans), treat it as
-  // TU-owned even though the adjacent tokmap entry may originate from a header.
-  // This avoids owner conflicts when include guessing is disabled.
-  for (const RefoldModel::IncludeItem &inc : model_.GetIncludes()) {
-    if (a0 == inc.cover.begin || a0 == inc.cover.end) {
-      trace("tu/own",
-            "hunkMapsToTU: INSERT at pp={0} on include boundary includeId={1} -> "
-            "true",
-            a0, inc.id);
-      return true;
-    }
+  // INSERTION (A gap): determine TU ownership without "nearest-neighbor
+  // snapping". In strict mode, consult only immediate neighbors (pp-1, pp). If
+  // the PP gap is covered by an include expansion, treat it as header-owned.
+  int pp = a0;
+
+  if (auto slotAnchor = AnchorToNearestSlotBoundaryFromPPGap(tuPath, pp)) {
+    trace("hunk",
+          "    insertion gap PP={0} mapsToTU via slot boundary TU byte {1}", pp,
+          slotAnchor);
+    return true;
   }
 
-  // If both neighbors live in the same non-TU file, treat this as header-owned
-  // so that we expand that include instead of forcing a TU edit at EOF.
+  if (strict_) {
+    // Any PP gap inside an include expansion cannot be a TU insertion.
+    if (IncludeIdCoveringPPIndex(pp)) {
+      return false;
+    }
+
+    if (pp >= 0 && static_cast<size_t>(pp) < tokmapByPP.size()) {
+      auto rightIt = tokmapByPP.find(pp);
+      if (rightIt != tokmapByPP.end() && !rightIt->second.file.empty()) {
+        return PathsEqual(tuPath, rightIt->second.file);
+      }
+    }
+
+    if (pp > 0 && static_cast<size_t>(pp - 1) < tokmapByPP.size()) {
+      auto leftIt = tokmapByPP.find(pp - 1);
+      if (leftIt != tokmapByPP.end() && !leftIt->second.file.empty()) {
+        return PathsEqual(tuPath, leftIt->second.file);
+      }
+    }
+
+    // No immediate neighbor evidence -> not TU (caller may fatal in strict
+    // mode).
+    return false;
+  }
+
+  // Non-strict: preserve prior best-effort behavior by snapping to the nearest
+  // mapped token on either side of the PP gap.
   const RefoldModel::TokMapEntry *left = nullptr;
-  for (int pp = a0 - 1; pp >= 0; --pp) {
-    auto it = tokmapByPP.find(pp);
+  for (int ppL = pp - 1; ppL >= 0; --ppL) {
+    auto it = tokmapByPP.find(ppL);
     if (it != tokmapByPP.end()) {
       left = &it->second;
       break;
     }
   }
+
   const RefoldModel::TokMapEntry *right = nullptr;
-  // Ensure a0 is at least 0 before treating it as an unsigned index
-  size_t startPP = (a0 < 0) ? 0 : static_cast<size_t>(a0);
-  const size_t maxPP = aToks_.size();
-  for (size_t pp = startPP; pp < maxPP; ++pp) {
-    auto it = tokmapByPP.find(static_cast<int>(pp));
+  const size_t maxPP = model_.GetTokensCountA();
+  for (int ppR = pp; ppR >= 0 && static_cast<size_t>(ppR) < maxPP; ++ppR) {
+    auto it = tokmapByPP.find(ppR);
     if (it != tokmapByPP.end()) {
       right = &it->second;
       break;
     }
   }
 
-  if (left && right) {
-    // Both sides mapped. If they are the same non-TU file, it is header-owned.
-    if (!PathsEqual(left->file, tuPath) && PathsEqual(left->file, right->file)) {
-      trace("tu/own",
-            "hunkMapsToTU: INSERT at pp={0} bracketed by same non-TU file "
-            "left='{1}' right='{2}' (tu='{3}') -> header-owned",
-            a0, left->file, right->file, tuPath);
-      return false;
-    }
+  if (left && !left->file.empty() && PathsEqual(tuPath, left->file)) {
+    return true;
+  }
+  if (right && !right->file.empty() && PathsEqual(tuPath, right->file)) {
+    return true;
   }
 
-  // Single-sided cases: if the only neighbor we can see is non-TU,
-  // conservatively treat this as non-TU so that the include/segment
-  // logic gets a chance to own it.
-  if (left && !PathsEqual(left->file, tuPath)) {
-    trace("tu/own",
-          "hunkMapsToTU: INSERT at pp={0} left neighbor is non-TU file='{1}' "
-          "(tu='{2}'); right='{3}' -> header-owned",
-          a0, left->file, tuPath, (right ? right->file : "<null>"));
+  if (left && !left->file.empty()) {
     return false;
   }
-  if (right && !PathsEqual(right->file, tuPath)) {
-    trace("tu/own",
-          "hunkMapsToTU: INSERT at pp={0} right neighbor is non-TU file='{1}' "
-          "(tu='{2}'); left='{3}' -> header-owned",
-          a0, right->file, tuPath, (left ? left->file : "<null>"));
+  if (right && !right->file.empty()) {
     return false;
   }
 
-  // Otherwise, either both neighbors are TU, or there are no neighbors at all.
-  // In both situations we treat this as a TU-owned insertion and let tuByteSpan
-  // place it using the deterministic neighbor-based insertion policy.
+  // Completely unmapped gap: default to TU in non-strict mode (best effort).
   return true;
 }
 
@@ -1342,7 +1375,43 @@ RefoldEngine::TUByteSpan(int a0, int a1, StringRef tuPath) const {
   // we must NOT fabricate a TU interval (that causes include insertions to snap
   // to TU boundaries).
   if (isEmpty) {
-    // Find closest mapped neighbors.
+    // INSERTION (A gap): in strict mode, do not "snap" to distant mapped
+    // tokens. Consult only immediate neighbors (pp-1, pp). If the PP gap is
+    // covered by an include expansion, treat it as header-owned (no TU span).
+    int pp = a0;
+
+    const auto &tokmapByPP = model_.GetTokmapByPP();
+    if (strict_) {
+      if (IncludeIdCoveringPPIndex(pp)) {
+        return {-1, -1};
+      }
+
+      if (pp >= 0 && static_cast<size_t>(pp) < tokmapByPP.size()) {
+        auto rightIt = tokmapByPP.find(pp);
+        if (rightIt != tokmapByPP.end()) {
+          const auto &right = rightIt->second;
+          if (!right.file.empty() && PathsEqual(tuPath, right.file) &&
+              right.b >= 0) {
+            return {right.b, right.b};
+          }
+        }
+      }
+
+      if (pp > 0 && static_cast<size_t>(pp - 1) < tokmapByPP.size()) {
+        auto leftIt = tokmapByPP.find(pp - 1);
+        if (leftIt != tokmapByPP.end()) {
+          const auto &left = leftIt->second;
+          if (!left.file.empty() && PathsEqual(tuPath, left.file) &&
+              left.e >= 0) {
+            return {left.e, left.e};
+          }
+        }
+      }
+
+      return {-1, -1};
+    }
+
+    // Non-strict: prior best-effort behavior (closest mapped neighbor scan).
     const RefoldModel::TokMapEntry *left = nullptr;
     for (int i = a0 - 1; i >= 0; --i) {
       auto it = tokmapByPP.find(i);
@@ -1364,24 +1433,23 @@ RefoldEngine::TUByteSpan(int a0, int a1, StringRef tuPath) const {
       }
     }
 
-    // If both neighbors exist and are in the same non-TU file, this gap is
-    // clearly inside that header/include; return no TU span.
-    if (left && right && left->file != tuPath && left->file == right->file) {
+    // If either neighbor points into a header/include, we must NOT fabricate a
+    // TU span.
+    if (left && !left->file.empty() && !PathsEqual(tuPath, left->file)) {
+      return {-1, -1};
+    }
+    if (right && !right->file.empty() && !PathsEqual(tuPath, right->file)) {
       return {-1, -1};
     }
 
-    // If either neighbor is a non-TU file, treat as header/arm-owned.
-    if ((left && left->file != tuPath) || (right && right->file != tuPath)) {
-      return {-1, -1};
-    }
-
-    // Otherwise, anchor to the nearest TU neighbor.
-    if (right && right->file == tuPath) {
+    if (right && !right->file.empty()) {
       return {right->b, right->b};
     }
-    if (left && left->file == tuPath) {
+    if (left && !left->file.empty()) {
       return {left->e, left->e};
     }
+
+    return {-1, -1};
   }
 
   // No TU tokens in [a0,a1) (and no safe TU insertion anchor).

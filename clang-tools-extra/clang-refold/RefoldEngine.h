@@ -683,6 +683,38 @@ private:
   std::optional<int> AnchorToNearestSlotBoundaryFromPPGap(StringRef tuPath,
                                                           int ppGap) const;
 
+  /// \brief Finds the ID of the narrowest include range that covers a given PP
+  /// index.
+  ///
+  /// Iterates through all include items in the provided model to find the one
+  /// whose range [begin, end) contains the specified preprocessor index \p pp.
+  /// If multiple includes cover the index, the one with the smallest span
+  /// (shortest length) is selected to ensure the most specific match.
+  ///
+  /// \param pp  The preprocessor index to search for within the covers.
+  ///
+  /// \returns The ID of the most specific include item if a match is found;
+  ///          otherwise, std::nullopt.
+  std::optional<int> IncludeIdCoveringPPIndex(int pp) const {
+    std::optional<int> bestId;
+    int bestLen = std::numeric_limits<int>::max();
+
+    for (const RefoldModel::IncludeItem &inc : model_.GetIncludes()) {
+      if (inc.cover.begin < 0 || inc.cover.end < 0) {
+        continue;
+      }
+      if (pp >= inc.cover.begin && pp < inc.cover.end) {
+        int len = inc.cover.end - inc.cover.begin;
+        if (len < bestLen) {
+          bestLen = len;
+          bestId = inc.id;
+        }
+      }
+    }
+
+    return bestId;
+  }
+
   /// \brief Computes the minimum PPSpan::begin value across a collection of
   /// preprocessor spans.
   ///
