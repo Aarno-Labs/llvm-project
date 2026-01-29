@@ -83,7 +83,7 @@
 //
 // * Cond / Arm
 //     Conditional groups with absolute byte bounds [group_b, group_e) in a
-//     file, plus ordered arms. Each arm records its tag
+//     file, plus ordered arms. Each arm records its kind
 //     (if/ifdef/ifndef/elif/else), body byte range [body_b, body_e), optional
 //     textual condition, and a boolean “selected” indicating that the arm
 //     contributed tokens in A.
@@ -902,7 +902,7 @@ static constexpr const char *RefoldSchema = R"json(
       "type": "object",
       "required": [
         "id",
-        "tag",
+        "kind",
         "body_b",
         "body_e"
       ],
@@ -911,7 +911,7 @@ static constexpr const char *RefoldSchema = R"json(
           "type": "integer",
           "description": "Unique arm id"
         },
-        "tag": {
+        "kind": {
           "enum": [
             "if",
             "ifdef",

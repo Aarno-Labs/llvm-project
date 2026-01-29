@@ -896,10 +896,10 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
           return idOrErr.takeError();
         arm.id = *idOrErr;
 
-        auto tagOrErr = applyToField(asString, *armObj, "tag", ctxItem);
-        if (!tagOrErr)
-          return tagOrErr.takeError();
-        arm.tag = *tagOrErr;
+        auto kindOrErr = applyToField(asString, *armObj, "kind", ctxItem);
+        if (!kindOrErr)
+          return kindOrErr.takeError();
+        arm.kind = *kindOrErr;
 
         auto bbOrErr = applyToField(asInt, *armObj, "body_b", ctxItem);
         if (!bbOrErr)
