@@ -273,8 +273,8 @@ std::vector<Hunk> coalesce(ArrayRef<Step> steps);
 ///        back to a linear greedy scan.
 /// \returns A vector mapping each index in \p a to its corresponding index
 ///          in \p b, or -1 if the token was deleted or moved.
-std::vector<int> lcsMapAB(llvm::ArrayRef<std::string> a,
-                          llvm::ArrayRef<std::string> b,
+std::vector<int> lcsMapAB(llvm::ArrayRef<StringRef> a,
+                          llvm::ArrayRef<StringRef> b,
                           llvm::ArrayRef<unsigned> ownerDepthGap,
                           unsigned long long maxCells = DEFAULT_MAX_CELLS);
 
@@ -316,7 +316,7 @@ std::vector<int> lcsMapAB(llvm::ArrayRef<std::string> a,
 /// \param b Right sequence.
 /// \param maxCells Maximum number of cells before performing a greedy scan.
 /// \returns A vector mapping a-indices to b-indices (or -1 if unmatched).
-std::vector<int> lcsMapAB(ArrayRef<std::string> a, ArrayRef<std::string> b,
+std::vector<int> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
                           unsigned long long maxCells = DEFAULT_MAX_CELLS);
 
 /// \brief Convert an A→B alignment map into a list of edit hunks.

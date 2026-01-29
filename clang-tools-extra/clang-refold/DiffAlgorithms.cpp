@@ -121,8 +121,8 @@ bool shouldUseGreedyApproach(unsigned long long n, unsigned long long m,
   return false;
 }
 
-std::vector<int> lcsMapABGreedy(ArrayRef<std::string> a,
-                                ArrayRef<std::string> b) {
+std::vector<int> lcsMapABGreedy(ArrayRef<StringRef> a,
+                                ArrayRef<StringRef> b) {
   const size_t n = a.size(), m = b.size();
 
   // Greedy order-preserving subsequence scan (linear-time).
@@ -150,8 +150,8 @@ inline bool isBetter(unsigned candLen, std::uint64_t candCost, unsigned bestLen,
 
 // ================== Weighted LCS (DP with greedy fallback) ===================
 
-std::vector<int> lcsMapAB(llvm::ArrayRef<std::string> a,
-                          llvm::ArrayRef<std::string> b,
+std::vector<int> lcsMapAB(llvm::ArrayRef<StringRef> a,
+                          llvm::ArrayRef<StringRef> b,
                           llvm::ArrayRef<unsigned> ownerDepthGap,
                           unsigned long long maxCells) {
   using namespace clang::refold;
@@ -302,7 +302,7 @@ std::vector<int> lcsMapAB(llvm::ArrayRef<std::string> a,
 // ====================== LCS (DP with greedy fallback) =======================
 
 [[maybe_unused]]
-std::vector<int> lcsMapAB(ArrayRef<std::string> a, ArrayRef<std::string> b,
+std::vector<int> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
                           unsigned long long maxCells) {
   const std::size_t n = a.size(), m = b.size();
 
