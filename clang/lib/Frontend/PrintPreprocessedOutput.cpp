@@ -1013,9 +1013,12 @@ void clang::DoPrintPreprocessedInput(Preprocessor &PP, raw_ostream *OS,
 
   // Optional recorder for writing out the refolding map data as a JSON file.
   std::string RefoldMapFile = PP.getPreprocessorOpts().RefoldMapFile;
+  bool EnableByteSpans = PP.getPreprocessorOpts().EnableByteSpans;
   std::shared_ptr<RefoldMapBuilder> RefoldRecorder;
-  if (!RefoldMapFile.empty())
-    RefoldRecorder = std::make_shared<RefoldMapBuilder>(PP, RefoldMapFile);
+  if (!RefoldMapFile.empty()) {
+    RefoldRecorder = std::make_shared<RefoldMapBuilder>(PP, RefoldMapFile,
+      EnableByteSpans);
+  }
 
   raw_ostream *OutOS = OS;
   std::unique_ptr<RefoldCountingRawOstream> CountingOS;

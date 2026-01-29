@@ -8524,3 +8524,8 @@ def refold_map : Joined<["--"], "refold-map=">,
   Group<Preprocessor_Group>, Visibility<[ClangOption, CC1Option]>,
   MetaVarName<"<file>">, HelpText<"Write macro-refolding JSON data to <file>">,
   MarshallingInfoString<PreprocessorOpts<"RefoldMapFile">>;
+def enable_byte_spans : Flag<["--"], "enable-byte-spans">,
+  Group<Preprocessor_Group>, Visibility<[ClangOption, CC1Option]>,
+  HelpText<"When writing a refold map, serialize per-token "
+           "pp_byte_begin/pp_byte_end byte span arrays">,
+  MarshallingInfoFlag<PreprocessorOpts<"EnableByteSpans">>;

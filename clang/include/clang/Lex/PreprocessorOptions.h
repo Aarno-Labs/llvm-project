@@ -240,6 +240,9 @@ public:
   /// TENJIN: captured list of all preprocessing arguments.
   std::vector<std::string> RefoldPPArgv;
 
+  /// TENJIN: if true, then serialize PP byte spans for every token.
+  bool EnableByteSpans;
+
 public:
   PreprocessorOptions() : PrecompiledPreambleBytes(0, false) {}
 
