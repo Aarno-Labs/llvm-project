@@ -722,9 +722,10 @@ void computeMacroProjectionSites(Item &It, Preprocessor &PP,
 }
 } // namespace
 
-RefoldMapBuilder::RefoldMapBuilder(Preprocessor &PP, llvm::StringRef OutputPath)
+RefoldMapBuilder::RefoldMapBuilder(Preprocessor &PP, llvm::StringRef OutputPath,
+                                   bool EnableByteSpans)
     : PP(PP), SM(PP.getSourceManager()), Lang(PP.getLangOpts()),
-      OutPath(OutputPath.str()) {
+      OutPath(OutputPath.str()), EnableByteSpans(EnableByteSpans) {
   const auto &PPO = PP.getPreprocessorOpts();
 
   // Prefer the driver-provided cwd spelling when available; fallback to process
@@ -1788,16 +1789,16 @@ void RefoldMapBuilder::writeJSON() {
     // tokens...
     JO.attributeObject("tokens", [&] {
       JO.attribute("count", TokIndex);
-      // TODO: We should probably allow for disabling pp_byte_begin/pp_byte_end
-      // by passing a CLI flag to clang.
-      JO.attributeArray("pp_byte_begin", [&] {
-        for (uint64_t B : TokPPByteBegin)
-          JO.value(B);
-      });
-      JO.attributeArray("pp_byte_end", [&] {
-        for (uint64_t E : TokPPByteEnd)
-          JO.value(E);
-      });
+      if (EnableByteSpans) {
+        JO.attributeArray("pp_byte_begin", [&] {
+          for (uint64_t B : TokPPByteBegin)
+            JO.value(B);
+        });
+        JO.attributeArray("pp_byte_end", [&] {
+          for (uint64_t E : TokPPByteEnd)
+            JO.value(E);
+        });
+      }
     });
 
     // items...

@@ -1063,7 +1063,7 @@ void Clang::AddPreprocessingOptions(Compilation &C, const JobAction &JA,
                   {options::OPT_D, options::OPT_U, options::OPT_I_Group,
                    options::OPT_F, options::OPT_embed_dir_EQ,
                    options::OPT_block_macros_file, options::OPT_block_macro,
-                   options::OPT_refold_map});
+                   options::OPT_refold_map, options::OPT_enable_byte_spans});
 
   // Add -Wp, and -Xpreprocessor if using the preprocessor.
 

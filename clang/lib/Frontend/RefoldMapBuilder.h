@@ -265,6 +265,7 @@ class RefoldMapBuilder {
 
   std::string TUSourcePath;   // TU path spelling (for JSON 'source')
   bool EmitAbsPaths = false;  // If true, emit canonical absolute paths
+  bool EnableByteSpans;       // If true, then serialize the per-token byte spans
 
   /// Map resolved absolute include directories -> original `-I` spellings.
   llvm::StringMap<std::string> IncludeDirAbs2Spelling;
@@ -343,7 +344,8 @@ public:
   /// \param PP      Preprocessor to observe (tokens, directives, nesting).
   /// \param OutPath Destination file path for JSON output; when empty,
   ///                the builder is effectively disabled (no-ops).
-  RefoldMapBuilder(Preprocessor &PP, StringRef OutPath);
+  /// \param EnableByteSpans If true, then include the per-token byte spans.
+  RefoldMapBuilder(Preprocessor &PP, StringRef OutPath, bool EnableByteSpans);
 
   /// Extend (or open) the current contiguous token span for an item.
   ///
