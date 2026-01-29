@@ -402,8 +402,8 @@ private:
   ///             index-aligned.
   /// \returns A list of lexeme strings of size Toks.size(), containing either
   ///          the original token spelling or a position-tied whitespace sentinel.
-  static std::vector<std::string> MapLexemes(ArrayRef<PPTok> toks,
-                                             ArrayRef<size_t> offs);
+  static std::vector<StringRef> MapLexemes(ArrayRef<PPTok> toks,
+                                           ArrayRef<size_t> offs);
 
   /// \brief Determine if two adjacent characters would “glue” tokens under C’s
   ///        maximal-munch rules.

@@ -67,6 +67,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <limits>
+#include <memory>
 
 using namespace llvm;
 
@@ -151,7 +152,7 @@ std::string RefoldEngine::Refold() {
        tuPath, aSource_.size(), bSource_.size(), aToks_.size(), bToks_.size());
 
   // Read in the translation unit file / C source.
-  std::string tuBytes;
+  std::unique_ptr<llvm::MemoryBuffer> tuBuffer;
   {
     const auto fullTuPath = lineDirs_.ToAbsolutePath(tuPath);
     auto bufOrErr = MemoryBuffer::getFile(fullTuPath);
@@ -161,11 +162,10 @@ std::string RefoldEngine::Refold() {
             bufOrErr.getError().message());
     }
 
-    // Copy the file bytes into a std::string (UTF-8 is treated as raw bytes
-    // here).
-    tuBytes.assign(bufOrErr.get()->getBufferStart(),
-                   bufOrErr.get()->getBufferEnd());
+    // Don't need a copy of the bytes here due to lifetime reasoning.
+    tuBuffer = std::move(*bufOrErr);
   }
+  StringRef tuBytes = tuBuffer->getBuffer();
 
   constexpr size_t MAX_COLS = 80;
   SmallString<MAX_COLS> sepBuf;
@@ -176,7 +176,7 @@ std::string RefoldEngine::Refold() {
   auto aSeq = MapLexemes(aToks_, aTokOff_);
   trace("lcs/aSeq", "aSeq:");
   trace("lcs/aSeq", "=====");
-  logFormattedArray<std::string>(aSeq, /* k */ MAX_COLS,
+  logFormattedArray<StringRef>(aSeq, /* k */ MAX_COLS,
                                  /* sameWidth */ false,
                                  [](StringRef msg) { trace("lcs/aSeq", msg); });
   trace("lcs/aSeq", sep);
@@ -184,7 +184,7 @@ std::string RefoldEngine::Refold() {
   auto bSeq = MapLexemes(bToks_, bTokOff_);
   trace("lcs/bSeq", "bSeq:");
   trace("lcs/bSeq", "=====");
-  logFormattedArray<std::string>(bSeq, /* k */ MAX_COLS,
+  logFormattedArray<StringRef>(bSeq, /* k */ MAX_COLS,
                                  /* sameWidth */ false,
                                  [](StringRef msg) { trace("lcs/bSeq", msg); });
   trace("lcs/bSeq", sep);
@@ -197,7 +197,7 @@ std::string RefoldEngine::Refold() {
   logFormattedArray<unsigned>(
       ownerDepthGap, /* k */ MAX_COLS, /* sameWidth */ true,
       [](StringRef msg) { trace("lcs/ownerGap", msg); });
-  trace("lcs/bSeq", sep);
+  trace("lcs/ownerGap", sep);
 
   // 2) LCS over tokens (A → B) with owner-aware cost model.
   auto a2b = diffutils::lcsMapAB(aSeq, bSeq, ownerDepthGap);
@@ -729,17 +729,17 @@ std::string RefoldEngine::Refold() {
 
 // ================== A ↔ B token mapping & diff utilities ===================
 
-std::vector<std::string> RefoldEngine::MapLexemes(ArrayRef<PPTok> toks,
-                                                  ArrayRef<size_t> offs) {
-  std::vector<std::string> out;
+std::vector<StringRef> RefoldEngine::MapLexemes(ArrayRef<PPTok> toks,
+                                                ArrayRef<size_t> offs) {
+  std::vector<StringRef> out;
   out.reserve(toks.size());
   for (std::size_t i = 0; i < toks.size(); ++i) {
     const auto &s = toks[i].spelling;
     if (stringutils::isWhitespace(s)) {
-      // position-tied, cannot anchor elsewhere
-      out.emplace_back("WS@" + std::to_string(offs[i]));
+      // We should never encounter a whitespace token
+      fatal("map/lexemes", "token at index {0} is whitespace", i);
     } else {
-      out.emplace_back(s);
+      out.emplace_back(StringRef(s));
     }
   }
   return out;
