@@ -417,7 +417,7 @@ public:
   struct CondArm {
     int id;
     int groupId; // owning CondGroup id
-    std::string tag; // if/ifdef/ifndef/elif/else
+    std::string kind; // if/ifdef/ifndef/elif/else
     std::optional<std::string> cond;
     int bodyB;
     int bodyE;

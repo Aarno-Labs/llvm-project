@@ -196,10 +196,10 @@ struct TokMapEntry {
   long long SrcEnd = -1;
 };
 
-/// One arm of a conditional group (#if/#elif/#else), with tag, condition text,
+/// One arm of a conditional group (#if/#elif/#else), with kind, condition text,
 /// and body byte range (exclusive of directive lines).
 struct CondArm {
-  std::string Tag;  // "if","ifdef","ifndef","elif","else"
+  std::string Kind;  // "if","ifdef","ifndef","elif","else"
   std::string Cond; // optional (if/elif expr, or macro for ifdef/ifndef)
   uint64_t BodyB = 0, BodyE = 0;
 };

@@ -111,7 +111,7 @@ std::pair<size_t, size_t> lineSpanOf(StringRef S, size_t p) {
 ///    the initial \c #if / \c #ifdef / \c #ifndef arm, any number of
 ///    \c #elif arms, and an optional \c #else arm.
 ///    Each arm carries:
-///      * \c Tag  — the directive kind ("if", "ifdef", "ifndef", "elif",
+///      * \c Kind — the directive kind ("if", "ifdef", "ifndef", "elif",
 ///      "else"),
 ///      * \c Cond — the as-written condition text for
 ///      "if"/"elif"/"ifdef"/"ifndef"
@@ -256,7 +256,7 @@ scanTopLevelConds(llvm::StringRef Buf, llvm::StringRef FilePath) {
 
         // First arm (#if/ifdef/ifndef)
         CondArm A;
-        A.Tag = Tag.str();
+        A.Kind = Tag.str();
 
         size_t condBeg =
             q + (Kind == DK_If
@@ -296,7 +296,7 @@ scanTopLevelConds(llvm::StringRef Buf, llvm::StringRef FilePath) {
         setPrevBodyEnd(idx, bol);
 
         CondArm A;
-        A.Tag = Tag.str();
+        A.Kind = Tag.str();
         if (Kind == DK_Elif) {
           size_t condBeg = q + 4; // "elif"
           while (condBeg < eol && isSpace(Buf[condBeg]))
@@ -2247,7 +2247,7 @@ void RefoldMapBuilder::writeJSON() {
 
                 JO.object([&] {
                   JO.attribute("id", ArmId);
-                  JO.attribute("tag", A.Tag);
+                  JO.attribute("kind", A.Kind);
                   if (!A.Cond.empty())
                     JO.attribute("cond", A.Cond);
                   JO.attribute("body_b", static_cast<uint64_t>(ArmBodyB));
