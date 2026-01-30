@@ -55,6 +55,7 @@
 #include "llvm/Support/Path.h"
 
 #include <algorithm>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -2046,6 +2047,11 @@ void RefoldMapBuilder::writeJSON() {
       long long BodyB;
       long long BodyE;
       int OwnerIncludeId; // -1 => no owning include (TU)
+
+      // Optional PP anchors for this arm's body in the A-side (preprocessed)
+      // token stream. Only populated for the selected arm in this run.
+      std::optional<long long> PPBegin;
+      std::optional<long long> PPEnd;
     };
 
     std::vector<ArmSlotSeed> ArmSlotSeeds;
@@ -2271,8 +2277,16 @@ void RefoldMapBuilder::writeJSON() {
                 // Remember where this arm's body lives, so we can:
                 //  - resolve nested groups' parents deterministically, and
                 //  - emit arm_begin/arm_end slots later.
-                ArmSlotSeeds.push_back(ArmSlotSeed{G.File, ArmId, ArmBodyB,
-                                                   ArmBodyE, parentIncId});
+                std::optional<long long> ArmPPBegin = std::nullopt;
+                std::optional<long long> ArmPPEnd = std::nullopt;
+                if (IsSelected) {
+                  ArmPPBegin = static_cast<long long>(PPBegin);
+                  ArmPPEnd = static_cast<long long>(PPEnd);
+                }
+
+                ArmSlotSeeds.push_back(
+                    ArmSlotSeed{G.File, ArmId, ArmBodyB, ArmBodyE, parentIncId,
+                                ArmPPBegin, ArmPPEnd});
               }
             });
           });
@@ -2297,7 +2311,8 @@ void RefoldMapBuilder::writeJSON() {
       int SlotId = 0;
       auto emitPoint =
           [&](llvm::StringRef FilePath, long long off, const char *kind,
-              std::optional<int> ref = std::nullopt, int owner = -1) {
+              std::optional<int> ref = std::nullopt, int owner = -1,
+              std::optional<long long> pp = std::nullopt) {
             // const long long o = off < 0 ? 0 : off;  // clamp once here
             const long long o = off;
             JO.object([&] {
@@ -2306,12 +2321,75 @@ void RefoldMapBuilder::writeJSON() {
               JO.attribute("kind", kind);
               JO.attribute("b", o);
               JO.attribute("e", o);
-              if (ref.has_value())
+              if (ref)
                 JO.attribute("ref", *ref);
               if (owner >= 0)
                 JO.attribute("owner_include_id", owner);
+              if (pp)
+                JO.attribute("pp", *pp);
             });
           };
+
+      // Map a (file, byte offset) to a deterministic PP insertion gap index.
+      //
+      // Semantics:
+      //   - returns the PP index of the first PP token whose source span either
+      //     contains Off or begins at/after Off.
+      //   - if no such token exists but the file contributed at least one PP
+      //     token, returns (last PP index in file + 1), i.e. the gap after the
+      //     file's final token.
+      //   - if the file contributed no PP tokens (e.g. not included / not taken),
+      //     returns nullopt (slot will omit "pp").
+      auto ppIndexForFileOffset =
+          [&](llvm::StringRef FilePath,
+              long long Off) -> std::optional<long long> {
+        if (Off < 0)
+          return std::nullopt;
+
+        bool Any = false;
+        long long Best = -1;
+        long long Last = -1;
+        long long MinBegin = std::numeric_limits<long long>::max();
+
+        for (const auto &TM : TokMap) {
+          if (TM.File != FilePath)
+            continue;
+          Any = true;
+
+          long long Idx = static_cast<long long>(TM.PPIndex);
+          if (Idx > Last)
+            Last = Idx;
+
+          if (TM.SrcBegin >= 0 && TM.SrcBegin < MinBegin)
+            MinBegin = TM.SrcBegin;
+
+          // Prefer the earliest token that contains Off; otherwise the
+          // earliest token that begins at/after Off.
+          if (TM.SrcBegin >= 0 && TM.SrcEnd >= 0) {
+            if ((TM.SrcBegin <= Off && Off < TM.SrcEnd) ||
+                (TM.SrcBegin >= Off)) {
+              if (Best < 0 || Idx < Best)
+                Best = Idx;
+            }
+          } else if (TM.SrcBegin >= 0 && TM.SrcBegin >= Off) {
+            if (Best < 0 || Idx < Best)
+              Best = Idx;
+          }
+        }
+
+        if (!Any)
+          return std::nullopt;
+
+        // If Off lies *before* the first byte that contributes any printed
+        // PP tokens for this file, then there is no sensible PP anchor for
+        // Off (e.g. directive-only preambles like #include lines).
+        if (MinBegin != std::numeric_limits<long long>::max() && Off < MinBegin)
+          return std::nullopt;
+
+        if (Best >= 0)
+          return Best;
+        return Last + 1;
+      };
 
       auto computeAfterLastInclude = [&](llvm::StringRef Buf) -> long long {
         if (Buf.empty())
@@ -2370,9 +2448,39 @@ void RefoldMapBuilder::writeJSON() {
         }
 
         long long after = computeAfterLastInclude(Buf);
-        emitPoint(TUSourcePath, 0, "file_begin");
-        emitPoint(TUSourcePath, (long long)size, "file_end");
-        emitPoint(TUSourcePath, after, "after_last_include");
+
+        // Compute the PP-token boundary after the last include *output* in the TU.
+        // Note: the bytes that contain the #include directive itself do not appear
+        // in the printed PP stream, so tokmap cannot anchor these offsets.
+        std::optional<long long> afterLastIncludePP = std::nullopt;
+        {
+          bool Have = false;
+          uint64_t MaxE = 0;
+          for (const auto &It : Items) {
+            if (!(It.Subkind == "#include" || It.Subkind == "#include_next"))
+              continue;
+            if (It.SitePath != TUSourcePath)
+              continue;
+
+            for (const auto &S : It.Spans) {
+              if (S.End > MaxE)
+                MaxE = S.End;
+              Have = true;
+            }
+          }
+          if (Have)
+            afterLastIncludePP = static_cast<long long>(MaxE);
+          else
+            afterLastIncludePP = ppIndexForFileOffset(TUSourcePath, after);
+        }
+
+        emitPoint(TUSourcePath, 0, "file_begin", std::nullopt, /*owner=*/-1,
+                  ppIndexForFileOffset(TUSourcePath, 0));
+        emitPoint(TUSourcePath, (long long)size, "file_end", std::nullopt,
+                  /*owner=*/-1,
+                  ppIndexForFileOffset(TUSourcePath, (long long)size));
+        emitPoint(TUSourcePath, after, "after_last_include", std::nullopt,
+                  /*owner=*/-1, afterLastIncludePP);
       }
 
       // include before/after slots + file-level slots per included header
@@ -2380,10 +2488,29 @@ void RefoldMapBuilder::writeJSON() {
       for (const auto &It : Items) {
         if (It.Subkind == "#include" || It.Subkind == "#include_next") {
           if (!It.SitePath.empty()) {
+            std::optional<long long> ppB = std::nullopt;
+            std::optional<long long> ppE = std::nullopt;
+            if (!It.Spans.empty()) {
+              uint64_t MinB = std::numeric_limits<uint64_t>::max();
+              uint64_t MaxE = 0;
+              for (const auto &S : It.Spans) {
+                if (S.Begin < MinB)
+                  MinB = S.Begin;
+                if (S.End > MaxE)
+                  MaxE = S.End;
+              }
+              if (MinB != std::numeric_limits<uint64_t>::max()) {
+                ppB = static_cast<long long>(MinB);
+                ppE = static_cast<long long>(MaxE);
+              }
+            }
+
             if (It.SiteBegin >= 0)
-              emitPoint(It.SitePath, It.SiteBegin, "before_include", It.ID);
+              emitPoint(It.SitePath, It.SiteBegin, "before_include", It.ID,
+                        /*owner=*/-1, ppB);
             if (It.SiteEnd >= 0)
-              emitPoint(It.SitePath, It.SiteEnd, "after_include", It.ID);
+              emitPoint(It.SitePath, It.SiteEnd, "after_include", It.ID,
+                        /*owner=*/-1, ppE);
           }
           if (!It.ResolvedPath.empty()) {
             auto MB = llvm::MemoryBuffer::getFile(It.ResolvedPath);
@@ -2394,11 +2521,14 @@ void RefoldMapBuilder::writeJSON() {
               HSize = HBuf.size();
             }
             long long after = computeAfterLastInclude(HBuf);
-            emitPoint(It.ResolvedPath, 0, "file_begin", std::nullopt, It.ID);
+            emitPoint(It.ResolvedPath, 0, "file_begin", std::nullopt, It.ID,
+                      ppIndexForFileOffset(It.ResolvedPath, 0));
             emitPoint(It.ResolvedPath, (long long)HSize, "file_end",
-                      std::nullopt, It.ID);
+                      std::nullopt, It.ID,
+                      ppIndexForFileOffset(It.ResolvedPath, (long long)HSize));
             emitPoint(It.ResolvedPath, after, "after_last_include",
-                      std::nullopt, It.ID);
+                      std::nullopt, It.ID,
+                      ppIndexForFileOffset(It.ResolvedPath, after));
           }
         }
       }
@@ -2412,12 +2542,14 @@ void RefoldMapBuilder::writeJSON() {
         // Begin of the arm body
         emitPoint(AS.File, AS.BodyB, "arm_begin",
                   /*ref=*/AS.ArmId,
-                  /*owner=*/ownerId);
+                  /*owner=*/ownerId,
+                  /*pp=*/AS.PPBegin);
 
         // End of the arm body
         emitPoint(AS.File, AS.BodyE, "arm_end",
                   /*ref=*/AS.ArmId,
-                  /*owner=*/ownerId);
+                  /*owner=*/ownerId,
+                  /*pp=*/AS.PPEnd);
       }
     });
   });
