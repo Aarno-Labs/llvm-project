@@ -315,6 +315,43 @@ static llvm::Error validateStringFormat(llvm::StringRef S, llvm::StringRef Forma
 }
 
 
+
+// Walks an in-memory schema tree to find the first object-valued node whose
+// string field `Key` equals `Wanted`. This is used for same-document $id/$anchor
+// resolution without any remote fetch.
+static const Value *findFirstObjectWithStringField(const Value &V, StringRef Key,
+                                                   StringRef Wanted) {
+  if (const Object *O = V.getAsObject()) {
+    if (auto S = O->getString(Key))
+      if (*S == Wanted)
+        return &V;
+
+    for (auto &KV : *O)
+      if (const Value *R =
+              findFirstObjectWithStringField(KV.second, Key, Wanted))
+        return R;
+
+    return nullptr;
+  }
+
+  if (const Array *A = V.getAsArray()) {
+    for (const Value &E : *A)
+      if (const Value *R = findFirstObjectWithStringField(E, Key, Wanted))
+        return R;
+  }
+
+  return nullptr;
+}
+
+static const Value *findFirstObjectWithStringFieldInRoot(const Object &Root,
+                                                         StringRef Key,
+                                                         StringRef Wanted) {
+  for (auto &KV : Root)
+    if (const Value *R = findFirstObjectWithStringField(KV.second, Key, Wanted))
+      return R;
+  return nullptr;
+}
+
 } // namespace
 
 Error JSONSchemaValidator::validate(const Value &V) const {
@@ -345,90 +382,225 @@ Error JSONSchemaValidator::validateValue(const Value &V, const Object &Schema,
   };
 
   if (auto RefStr = getStringField(Schema, "$ref")) {
-    // Draft 2020-12: $ref may point to *any* subschema (object or boolean).
-    auto It = RefCache.find(*RefStr);
-    if (It != RefCache.end()) {
-      if (auto Err = validateValue(V, *It->second, Path))
+    // $ref in draft 2020-12 is an applicator; sibling keywords are still
+    // evaluated. So we validate the referenced schema first, then continue.
+    do {
+    // Same-document $ref only: JSON Pointer (#/...) and anchors (#<name>), plus
+    // $id-based references to subschemas in this same document. No remote fetch.
+    auto ItCached = RefCache.find(*RefStr);
+    if (ItCached != RefCache.end()) {
+      if (auto Err = validateValue(V, *ItCached->second, Path))
         return Err;
-      // Continue validating sibling keywords in this schema (draft 2020-12).
-    } else {
-      if (!RefStr->starts_with("#/")) {
-        return createStringError(inconvertibleErrorCode(),
-                                 "Unsupported $ref format: " + *RefStr);
-      }
+      break;
+    }
 
-      auto decodePointerToken = [](StringRef Tok) {
-        std::string Out;
-        Out.reserve(Tok.size());
-        for (size_t Idx = 0; Idx < Tok.size(); ++Idx) {
-          if (Tok[Idx] == '~' && Idx + 1 < Tok.size()) {
-            char Char = Tok[Idx + 1];
-            if (Char == '1') {
-              Out.push_back('/');
-              ++Idx;
-              continue;
-            }
-            if (Char == '0') {
-              Out.push_back('~');
-              ++Idx;
-              continue;
-            }
+    auto decodePointerToken = [](StringRef Tok) -> std::string {
+      std::string Out;
+      Out.reserve(Tok.size());
+      for (size_t I = 0; I < Tok.size(); ++I) {
+        if (Tok[I] == '~' && I + 1 < Tok.size()) {
+          if (Tok[I + 1] == '0') {
+            Out.push_back('~');
+            ++I;
+            continue;
           }
-          Out.push_back(Tok[Idx]);
+          if (Tok[I + 1] == '1') {
+            Out.push_back('/');
+            ++I;
+            continue;
+          }
         }
-        return Out; // std::string
-      };
+        Out.push_back(Tok[I]);
+      }
+      return Out;
+    };
 
-      SmallVector<StringRef, 8> Parts;
-      StringRef RefPath = RefStr->drop_front(2); // drop "#/"
-      if (!RefPath.empty()) {
-        Parts.reserve(RefPath.count('/') + 1);
-        RefPath.split(Parts, '/');
+    auto resolvePointer = [&](const Object &StartObj, StringRef PtrNoLeadingSlash,
+                              const Value *&OutVal) -> llvm::Error {
+      OutVal = nullptr;
+      SmallVector<StringRef, 16> Parts;
+      PtrNoLeadingSlash.split(Parts, '/', -1, false);
+
+      const Object *CurObj = &StartObj;
+      const Value *CurVal = nullptr;
+
+      for (size_t I = 0; I < Parts.size(); ++I) {
+        std::string Decoded = decodePointerToken(Parts[I]);
+        auto It = CurObj->find(Decoded);
+        if (It == CurObj->end()) {
+          auto Msg = llvm::formatv("Invalid $ref pointer {0}: token \"{1}\" not found",
+                                   elideForMsg(*RefStr), Decoded)
+                         .str();
+          return llvm::createStringError(llvm::inconvertibleErrorCode(), Msg);
+        }
+
+        CurVal = &It->second;
+        if (const Object *NextObj = It->second.getAsObject()) {
+          CurObj = NextObj;
+          continue;
+        }
+
+        // Non-object target is only allowed at the terminal segment.
+        if (I + 1 != Parts.size()) {
+          auto Msg = llvm::formatv("Invalid $ref pointer {0}: non-object at \"{1}\"",
+                                   elideForMsg(*RefStr), Decoded)
+                         .str();
+          return llvm::createStringError(llvm::inconvertibleErrorCode(), Msg);
+        }
       }
 
-      // Resolve the subschema by traversing the parts in the local pointer.
-      const Object *CurrentObj = &RootSchema;
-      const Value *CurrentVal = nullptr;
+      OutVal = CurVal;
+      return llvm::Error::success();
+    };
 
-      if (Parts.empty()) {
-        // "#/" (empty pointer) - treat as root schema.
+    auto validateTarget = [&](bool IsRoot, const Value *SchemaVal) -> llvm::Error {
+      if (IsRoot) {
         RefCache[*RefStr] = &RootSchema;
         if (auto Err = validateValue(V, RootSchema, Path))
           return Err;
-      } else {
-        for (size_t I = 0; I < Parts.size(); ++I) {
-          std::string Decoded = decodePointerToken(Parts[I]);
-          auto It2 = CurrentObj->find(Decoded);
-          if (It2 == CurrentObj->end()) {
-            return createStringError(inconvertibleErrorCode(),
-                                     "$ref path component not found: " +
-                                         Decoded);
-          }
-          CurrentVal = &It2->second;
+        return llvm::Error::success();
+      }
 
-          if (I + 1 < Parts.size()) {
-            const Object *NextObj = CurrentVal->getAsObject();
-            if (!NextObj) {
-              return createStringError(
-                  inconvertibleErrorCode(),
-                  "$ref traversal reached a non-object at: " + Decoded);
-            }
-            CurrentObj = NextObj;
-          }
+      if (!SchemaVal) {
+        auto Msg = llvm::formatv("Unsupported $ref {0}: not found", elideForMsg(*RefStr)).str();
+        return llvm::createStringError(llvm::inconvertibleErrorCode(), Msg);
+      }
+
+      if (const Object *O = SchemaVal->getAsObject())
+        RefCache[*RefStr] = O;
+
+      if (auto Err = validateSubschema(V, *SchemaVal, Path))
+        return Err;
+      return llvm::Error::success();
+    };
+
+    StringRef Ref = *RefStr;
+
+    // 1) Fragment-only forms: "#", "#/...", "#<anchor>".
+    if (Ref.starts_with("#")) {
+      StringRef Frag = Ref.drop_front(); // after '#'
+      if (Frag.empty()) {
+        if (auto Err = validateTarget(/*IsRoot*/ true, nullptr))
+          return Err;
+        break;
+      }
+
+      if (Frag.starts_with("/")) {
+        // Preserve prior behavior: treat "#/" as the root schema.
+        StringRef Ptr = Frag.drop_front(); // remove leading '/'
+        if (Ptr.empty()) {
+          if (auto Err = validateTarget(/*IsRoot*/ true, nullptr))
+            return Err;
+          break;
         }
 
-        // Target may be an object schema or a boolean schema.
-        if (auto TargetObj = CurrentVal->getAsObject()) {
-          RefCache[*RefStr] = TargetObj;
-          if (auto Err = validateValue(V, *TargetObj, Path))
+        const Value *Val = nullptr;
+        if (auto Err = resolvePointer(RootSchema, Ptr, Val))
+          return Err;
+
+        // Pointer can target object or boolean schema.
+        if (auto Err = validateTarget(/*IsRoot*/ false, Val))
+          return Err;
+        break;
+      }
+
+      // "#<anchor>".
+      if (auto A = RootSchema.getString("$anchor")) {
+        if (*A == Frag) {
+          if (auto Err = validateTarget(/*IsRoot*/ true, nullptr))
             return Err;
-        } else {
-          if (auto Err = validateSubschema(V, *CurrentVal, Path))
-            return Err;
+          break;
         }
       }
-      // Continue validating sibling keywords in this schema (draft 2020-12).
+
+      const Value *Found =
+          findFirstObjectWithStringFieldInRoot(RootSchema, "$anchor", Frag);
+      if (auto Err = validateTarget(/*IsRoot*/ false, Found))
+        return Err;
+      break;
     }
+
+    // 2) $id-based forms: "<id>", "<id>#/...", "<id>#<anchor>".
+    size_t Hash = Ref.find('#');
+    StringRef Base = (Hash == StringRef::npos) ? Ref : Ref.take_front(Hash);
+    StringRef Frag = (Hash == StringRef::npos) ? StringRef() : Ref.drop_front(Hash + 1);
+
+    const Object *BaseObj = nullptr;
+    const Value *BaseNode = nullptr;
+
+    if (auto I = RootSchema.getString("$id"))
+      if (*I == Base)
+        BaseObj = &RootSchema;
+
+    if (!BaseObj)
+      BaseNode = findFirstObjectWithStringFieldInRoot(RootSchema, "$id", Base);
+
+    if (!BaseObj && BaseNode)
+      BaseObj = BaseNode->getAsObject();
+
+    if (!BaseObj) {
+      auto Msg = llvm::formatv("Unsupported $ref {0}: unknown $id \"{1}\"",
+                               elideForMsg(*RefStr), elideForMsg(Base))
+                     .str();
+      return llvm::createStringError(llvm::inconvertibleErrorCode(), Msg);
+    }
+
+    // Empty fragment selects the base schema itself.
+    if (Frag.empty()) {
+      if (auto Err = validateTarget(BaseObj == &RootSchema, BaseNode))
+        return Err;
+      break;
+    }
+
+    if (Frag.starts_with("/")) {
+      // Preserve prior behavior: treat "<id>#/" as the base schema itself.
+      StringRef Ptr = Frag;
+      Ptr.consume_front("/");
+      if (Ptr.empty()) {
+        if (auto Err = validateTarget(BaseObj == &RootSchema, BaseNode))
+          return Err;
+        break;
+      }
+
+      const Value *Val = nullptr;
+      if (auto Err = resolvePointer(*BaseObj, Ptr, Val))
+        return Err;
+
+      if (auto Err = validateTarget(/*IsRoot*/ false, Val))
+        return Err;
+      break;
+    }
+
+    // "<id>#<anchor>".
+    if (BaseObj == &RootSchema) {
+      if (auto A = RootSchema.getString("$anchor")) {
+        if (*A == Frag) {
+          if (auto Err = validateTarget(/*IsRoot*/ true, nullptr))
+            return Err;
+          break;
+        }
+      }
+      const Value *Found =
+          findFirstObjectWithStringFieldInRoot(RootSchema, "$anchor", Frag);
+      if (auto Err = validateTarget(/*IsRoot*/ false, Found))
+        return Err;
+      break;
+    }
+
+    if (auto A = BaseObj->getString("$anchor")) {
+      if (*A == Frag) {
+        if (auto Err = validateTarget(/*IsRoot*/ false, BaseNode))
+          return Err;
+        break;
+      }
+    }
+
+    const Value *Found = findFirstObjectWithStringField(*BaseNode, "$anchor", Frag);
+    if (auto Err = validateTarget(/*IsRoot*/ false, Found))
+      return Err;
+    break;
+    } while (false);
+    // Continue validating sibling keywords in this schema (draft 2020-12).
   }
 
   // Enforce "const": value must equal the literal in the schema.
