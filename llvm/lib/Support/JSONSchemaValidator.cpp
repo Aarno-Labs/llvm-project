@@ -946,34 +946,44 @@ Error JSONSchemaValidator::validateArray(const Array &Arr, const Object &Schema,
     }
   }
 
-  // items: schema applied to array items. Draft 2020-12 treats "items" as a
-  // single subschema; we also support the tuple (array) form for convenience.
+  // prefixItems: array of schemas for the first N elements (draft-2020-12).
+  bool HasPrefixItems = false;
+  size_t PrefixN = 0;
+  if (auto Pfx = getArrayField(Schema, "prefixItems")) {
+    HasPrefixItems = true;
+    PrefixN = (**Pfx).size();
+    for (size_t Idx = 0; Idx < Arr.size() && Idx < PrefixN; ++Idx) {
+      std::string ElemPath = indexPath(Idx);
+      if (auto Err = validateSubschema(Arr[Idx], (**Pfx)[Idx], ElemPath))
+        return Err;
+    }
+  }
+
+  // items: draft-2020-12 treats "items" as a single subschema that applies to
+  // all *remaining* items after prefixItems. If prefixItems is absent, it
+  // applies to all items.
+  //
+  // We also support the legacy tuple form "items": [ ... ] (pre-2020-12), but
+  // only when prefixItems is not present (to avoid double-applying constraints).
   if (auto ItItems = Schema.find("items"); ItItems != Schema.end()) {
     if (const Array *ItemsArr = ItItems->second.getAsArray()) {
-      size_t N = ItemsArr->size();
-      for (size_t Idx = 0; Idx < Arr.size() && Idx < N; ++Idx) {
-        std::string ElemPath = indexPath(Idx);
-        if (auto Err = validateSubschema(Arr[Idx], (*ItemsArr)[Idx], ElemPath))
-          return Err;
+      if (!HasPrefixItems) {
+        size_t N = ItemsArr->size();
+        for (size_t Idx = 0; Idx < Arr.size() && Idx < N; ++Idx) {
+          std::string ElemPath = indexPath(Idx);
+          if (auto Err = validateSubschema(Arr[Idx], (*ItemsArr)[Idx], ElemPath))
+            return Err;
+        }
+        // Extra items beyond tuple size: allowed. We leave them unconstrained
+        // unless other keywords ("contains", etc.) restrict them.
       }
-      // Extra items beyond tuple size: allowed. We leave them unconstrained
-      // unless other keywords ("contains", etc.) restrict them.
     } else {
-      for (size_t Idx = 0; Idx < Arr.size(); ++Idx) {
+      const size_t Start = HasPrefixItems ? PrefixN : 0;
+      for (size_t Idx = Start; Idx < Arr.size(); ++Idx) {
         std::string ElemPath = indexPath(Idx);
         if (auto Err = validateSubschema(Arr[Idx], ItItems->second, ElemPath))
           return Err;
       }
-    }
-  }
-
-  // prefixItems: array of schemas for the first N elements (draft-2020-12).
-  if (auto Pfx = getArrayField(Schema, "prefixItems")) {
-    size_t N = (**Pfx).size();
-    for (size_t Idx = 0; Idx < Arr.size() && Idx < N; ++Idx) {
-      std::string ElemPath = indexPath(Idx);
-      if (auto Err = validateSubschema(Arr[Idx], (**Pfx)[Idx], ElemPath))
-        return Err;
     }
   }
 
