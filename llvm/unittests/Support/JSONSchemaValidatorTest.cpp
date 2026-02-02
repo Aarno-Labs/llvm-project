@@ -329,17 +329,17 @@ TEST(JSONSchemaValidatorTest, Combinators) {
   S = Object{{"anyOf", Array{Object{{"const", 1}}, Object{{"const", 2}}}}};
   ExpectValid(S, 1);
   ExpectValid(S, 2);
-  ExpectInvalid(S, 3, "Value did not match any 'anyOf' subschema at $");
+  ExpectInvalid(S, 3, "anyOf failed at $: no alternative matched");
 
   // oneOf
   S = Object{{"oneOf", Array{Object{{"const", 1}}, Object{{"const", 2}}}}};
   ExpectValid(S, 1);
-  ExpectInvalid(S, 3, "Value did not match any 'oneOf' subschema at $");
+  ExpectInvalid(S, 3, "oneOf failed at $: expected exactly 1 match, got 0");
 
   // not
   S = Object{{"not", Object{{"type", "number"}}}};
   ExpectValid(S, "str");
-  ExpectInvalid(S, 1, "Value must NOT validate 'not' subschema at $");
+  ExpectInvalid(S, 1, "not failed at $: instance unexpectedly matched");
 
   // if/then/else
   S = Object{
@@ -495,6 +495,91 @@ TEST(JSONSchemaValidatorTest, RefPointerUnescape) {
   Object S = Object{{"$defs", Object{{"a~1b", Object{{"const", 1}}}}},
                     {"$ref", "#/$defs/a~01b"}};
   ExpectValid(S, 1);
+}
+
+
+TEST(JSONSchemaValidatorTest, BooleanSubschemasInCombinatorsAndConditionals) {
+  // allOf with a boolean 'false' subschema must fail.
+  Object AllOfFalse = Object{{"allOf", Array{true, false}}};
+  ExpectInvalid(AllOfFalse, 1, "Schema 'false' rejects instance at $");
+
+  // anyOf: one 'true' subschema is sufficient.
+  Object AnyOfTF = Object{{"anyOf", Array{false, true}}};
+  ExpectValid(AnyOfTF, 1);
+
+  // oneOf: boolean subschemas participate like normal subschemas.
+  Object OneOfOK = Object{{"oneOf", Array{true, false}}};
+  ExpectValid(OneOfOK, 1);
+
+  Object OneOfTooMany = Object{{"oneOf", Array{true, true}}};
+  ExpectInvalid(OneOfTooMany, 1);
+
+  // not: boolean subschemas invert as expected.
+  Object NotTrue = Object{{"not", true}};
+  ExpectInvalid(NotTrue, 1);
+
+  Object NotFalse = Object{{"not", false}};
+  ExpectValid(NotFalse, 1);
+
+  // if/then/else: boolean subschemas in branches are honored.
+  Object IfTrueThenFalse = Object{{"if", true}, {"then", false}};
+  ExpectInvalid(IfTrueThenFalse, 1, "Schema 'false' rejects instance at $");
+
+  Object IfFalseElseFalse = Object{{"if", false}, {"else", false}};
+  ExpectInvalid(IfFalseElseFalse, 1, "Schema 'false' rejects instance at $");
+
+  Object IfFalseElseTrue = Object{{"if", false}, {"else", true}};
+  ExpectValid(IfFalseElseTrue, 1);
+}
+
+TEST(JSONSchemaValidatorTest, BooleanSubschemasInObjectAndArrayApplicators) {
+  // properties: boolean 'false' rejects the property value when present.
+  Object PropsFalse =
+      Object{{"type", "object"}, {"properties", Object{{"a", false}}}};
+  ExpectValid(PropsFalse, Object{});
+  ExpectValid(PropsFalse, Object{{"b", 1}});
+  ExpectInvalid(PropsFalse, Object{{"a", 1}},
+               "Schema 'false' rejects instance at $.a");
+
+  // patternProperties: boolean 'false' rejects matching property values.
+  Object PatFalse =
+      Object{{"type", "object"}, {"patternProperties", Object{{"^a", false}}}};
+  ExpectInvalid(PatFalse, Object{{"abc", 1}},
+               "Schema 'false' rejects instance at $.abc");
+
+  // propertyNames: boolean 'false' rejects any non-empty object
+  // (vacuously ok for {}).
+  // {}).
+  Object NamesFalse = Object{{"type", "object"}, {"propertyNames", false}};
+  ExpectValid(NamesFalse, Object{});
+  ExpectInvalid(NamesFalse, Object{{"a", 1}});
+
+  // dependentSchemas: boolean subschema is applied when the triggering property
+  // exists.
+  Object DepFalse =
+      Object{{"type", "object"}, {"dependentSchemas", Object{{"a", false}}}};
+  ExpectValid(DepFalse, Object{{"b", 1}});
+  ExpectInvalid(DepFalse, Object{{"a", 1}});
+
+  // items: boolean 'false' rejects any element.
+  Object ItemsFalse = Object{{"type", "array"}, {"items", false}};
+  ExpectValid(ItemsFalse, Array{});
+  ExpectInvalid(ItemsFalse, Array{1},
+               "Schema 'false' rejects instance at $[0]");
+
+  // prefixItems: boolean 'false' rejects that tuple position.
+  Object PrefixFalse =
+      Object{{"type", "array"}, {"prefixItems", Array{false}}, {"items", true}};
+  ExpectValid(PrefixFalse, Array{});
+  ExpectInvalid(PrefixFalse, Array{1},
+               "Schema 'false' rejects instance at $[0]");
+
+  // contains: boolean subschemas are evaluated for each array element.
+  Object ContainsFalse = Object{{"type", "array"}, {"contains", false}};
+  ExpectInvalid(ContainsFalse, Array{1});
+
+  Object ContainsTrue = Object{{"type", "array"}, {"contains", true}};
+  ExpectValid(ContainsTrue, Array{1});
 }
 
 } // namespace

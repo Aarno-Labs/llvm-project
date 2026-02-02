@@ -67,15 +67,34 @@ Error JSONSchemaValidator::validate(const Value &V) const {
 
 Error JSONSchemaValidator::validateValue(const Value &V, const Object &Schema,
                                          std::string Path) const {
-  if (auto RefStr = getStringField(Schema, "$ref")) {
-    auto It = RefCache.find(*RefStr);
-    const Object *Resolved = nullptr;
+  auto validateSubschema = [&](const Value &Instance, const Value &SubSchema,
+                               std::string SubPath) -> Error {
+    // Draft 2020-12: a schema is either an object or a boolean.
+    if (auto B = SubSchema.getAsBoolean()) {
+      if (*B)
+        return Error::success();
+      return createStringError(
+          inconvertibleErrorCode(),
+          formatv("Schema 'false' rejects instance at {0}", prettyPath(SubPath))
+              .str());
+    }
+    if (auto O = SubSchema.getAsObject())
+      return validateValue(Instance, *O, std::move(SubPath));
+    return createStringError(
+        inconvertibleErrorCode(),
+        formatv("Schema error: subschema must be an object or boolean at {0}",
+                prettyPath(SubPath))
+            .str());
+  };
 
-    // First check the ref cache to see if there was a prior enrtry.
+  if (auto RefStr = getStringField(Schema, "$ref")) {
+    // Draft 2020-12: $ref may point to *any* subschema (object or boolean).
+    auto It = RefCache.find(*RefStr);
     if (It != RefCache.end()) {
-      Resolved = It->second;
+      if (auto Err = validateValue(V, *It->second, Path))
+        return Err;
+      // Continue validating sibling keywords in this schema (draft 2020-12).
     } else {
-      // Ok, so no entry, which means we must create a new one.
       if (!RefStr->starts_with("#/")) {
         return createStringError(inconvertibleErrorCode(),
                                  "Unsupported $ref format: " + *RefStr);
@@ -104,32 +123,55 @@ Error JSONSchemaValidator::validateValue(const Value &V, const Object &Schema,
       };
 
       SmallVector<StringRef, 8> Parts;
-      StringRef RefPath = RefStr->drop_front(2);
-      Parts.reserve(RefPath.count('/') + 1);
-      RefPath.split(Parts, '/');
-
-      // Resolve the object being reference by traversing the parts in the
-      // reference path.
-      const Object *Current = &RootSchema;
-      for (StringRef Part : Parts) {
-        std::string Decoded = decodePointerToken(Part);
-        auto It = Current->find(Decoded);
-        if (It != Current->end() && It->second.getAsObject()) {
-          Current = It->second.getAsObject();
-        } else {
-          return createStringError(inconvertibleErrorCode(),
-                                   "$ref path component not found: " + Decoded);
-        }
+      StringRef RefPath = RefStr->drop_front(2); // drop "#/"
+      if (!RefPath.empty()) {
+        Parts.reserve(RefPath.count('/') + 1);
+        RefPath.split(Parts, '/');
       }
 
-      // Current must be non-null if we get here.
-      Resolved = Current;
-      RefCache[*RefStr] = Resolved;
-    }
+      // Resolve the subschema by traversing the parts in the local pointer.
+      const Object *CurrentObj = &RootSchema;
+      const Value *CurrentVal = nullptr;
 
-    if (auto Err = validateValue(V, *Resolved, Path))
-      return Err;
-    // Continue validating sibling keywords in this schema (draft 2020-12).
+      if (Parts.empty()) {
+        // "#/" (empty pointer) - treat as root schema.
+        RefCache[*RefStr] = &RootSchema;
+        if (auto Err = validateValue(V, RootSchema, Path))
+          return Err;
+      } else {
+        for (size_t I = 0; I < Parts.size(); ++I) {
+          std::string Decoded = decodePointerToken(Parts[I]);
+          auto It2 = CurrentObj->find(Decoded);
+          if (It2 == CurrentObj->end()) {
+            return createStringError(inconvertibleErrorCode(),
+                                     "$ref path component not found: " +
+                                         Decoded);
+          }
+          CurrentVal = &It2->second;
+
+          if (I + 1 < Parts.size()) {
+            const Object *NextObj = CurrentVal->getAsObject();
+            if (!NextObj) {
+              return createStringError(
+                  inconvertibleErrorCode(),
+                  "$ref traversal reached a non-object at: " + Decoded);
+            }
+            CurrentObj = NextObj;
+          }
+        }
+
+        // Target may be an object schema or a boolean schema.
+        if (auto TargetObj = CurrentVal->getAsObject()) {
+          RefCache[*RefStr] = TargetObj;
+          if (auto Err = validateValue(V, *TargetObj, Path))
+            return Err;
+        } else {
+          if (auto Err = validateSubschema(V, *CurrentVal, Path))
+            return Err;
+        }
+      }
+      // Continue validating sibling keywords in this schema (draft 2020-12).
+    }
   }
 
   // Enforce "const": value must equal the literal in the schema.
@@ -151,27 +193,21 @@ Error JSONSchemaValidator::validateValue(const Value &V, const Object &Schema,
   if (auto OneOf = getArrayField(Schema, "oneOf")) {
     size_t Matches = 0;
     for (const auto &Alt : **OneOf) {
-      if (const Object *Sub = Alt.getAsObject()) {
-        // Probe this alternative; if it fails, discard the error.
-        if (auto Err = validateValue(V, *Sub, Path)) {
-          consumeError(std::move(Err));
-        } else {
-          ++Matches;
-          if (Matches > 1)
-            break; // already invalid; no need to keep probing
-        }
+      if (auto Err = validateSubschema(V, Alt, Path)) {
+        consumeError(std::move(Err)); // alternative didn't match
+      } else {
+        ++Matches;
+        if (Matches > 1)
+          break;
       }
     }
-    if (Matches == 1) {
-      // Exactly one matched; continue evaluating sibling keywords.
-    } else if (Matches == 0) {
-      return createStringError(inconvertibleErrorCode(),
-                               "Value did not match any 'oneOf' subschema at " +
-                                   prettyPath(Path));
-    } else {
-      return createStringError(inconvertibleErrorCode(),
-                               "Value matched multiple 'oneOf' subschemas at " +
-                                   prettyPath(Path));
+
+    if (Matches != 1) {
+      auto Msg =
+          formatv("oneOf failed at {0}: expected exactly 1 match, got {1}",
+                  prettyPath(Path), Matches)
+              .str();
+      return createStringError(inconvertibleErrorCode(), Msg);
     }
   }
 
@@ -179,59 +215,60 @@ Error JSONSchemaValidator::validateValue(const Value &V, const Object &Schema,
   if (auto AnyOf = getArrayField(Schema, "anyOf")) {
     bool Matched = false;
     for (const auto &Alt : **AnyOf) {
-      if (const Object *Sub = Alt.getAsObject()) {
-        if (auto Err = validateValue(V, *Sub, Path)) {
-          consumeError(std::move(Err)); // probe failed; ignore
-        } else {
-          Matched = true;
-          break;
-        }
+      if (auto Err = validateSubschema(V, Alt, Path)) {
+        consumeError(std::move(Err)); // alternative didn't match
+      } else {
+        Matched = true;
+        break;
       }
     }
-    if (!Matched)
-      return createStringError(inconvertibleErrorCode(),
-                               "Value did not match any 'anyOf' subschema at " +
-                                   prettyPath(Path));
+    if (!Matched) {
+      auto Msg = formatv("anyOf failed at {0}: no alternative matched",
+                         prettyPath(Path))
+                     .str();
+      return createStringError(inconvertibleErrorCode(), Msg);
+    }
   }
 
   // Enforce "allOf": all subschemas must validate.
   if (auto AllOf = getArrayField(Schema, "allOf")) {
     for (const auto &Alt : **AllOf) {
-      if (const Object *Sub = Alt.getAsObject()) {
-        if (auto Err = validateValue(V, *Sub, Path))
-          return Err;
-      }
+      if (auto Err = validateSubschema(V, Alt, Path))
+        return Err;
     }
   }
 
   // Enforce "not": must fail to validate the subschema.
-  if (auto Not = getObjectField(Schema, "not")) {
-    if (auto Err = validateValue(V, **Not, Path)) {
-      consumeError(std::move(Err)); // 'not' passes because subschema failed
+  if (auto ItNot = Schema.find("not"); ItNot != Schema.end()) {
+    // Succeeds if the instance does NOT validate against the subschema.
+    if (auto Err = validateSubschema(V, ItNot->second, Path)) {
+      consumeError(std::move(Err)); // subschema failed => "not" passes
     } else {
-      return createStringError(inconvertibleErrorCode(),
-                               "Value must NOT validate 'not' subschema at " +
-                                   prettyPath(Path));
+      auto Msg = formatv("not failed at {0}: instance unexpectedly matched",
+                         prettyPath(Path))
+                     .str();
+      return createStringError(inconvertibleErrorCode(), Msg);
     }
   }
 
   // Conditional: if/then/else
-  if (auto If = getObjectField(Schema, "if")) {
+  if (auto ItIf = Schema.find("if"); ItIf != Schema.end()) {
     bool IfPasses = false;
-    if (auto Err = validateValue(V, **If, Path)) {
+    if (auto Err = validateSubschema(V, ItIf->second, Path)) {
       consumeError(std::move(Err)); // 'if' failed
       IfPasses = false;
     } else {
       IfPasses = true;
     }
+
     if (IfPasses) {
-      if (auto Then = getObjectField(Schema, "then")) {
-        if (auto Err = validateValue(V, **Then, Path))
+      if (auto ItThen = Schema.find("then"); ItThen != Schema.end()) {
+        if (auto Err = validateSubschema(V, ItThen->second, Path))
           return Err;
       }
     } else {
-      if (auto Else = getObjectField(Schema, "else")) {
-        if (auto Err = validateValue(V, **Else, Path))
+      if (auto ItElse = Schema.find("else"); ItElse != Schema.end()) {
+        if (auto Err = validateSubschema(V, ItElse->second, Path))
           return Err;
       }
     }
@@ -622,6 +659,26 @@ Error JSONSchemaValidator::validateObject(const Object &Obj,
     return Value(std::move(Copy)); // move into a Value
   };
 
+  auto validateSubschema = [&](const Value &Instance, const Value &SubSchema,
+                               std::string SubPath) -> Error {
+    // Draft 2020-12: a schema is either an object or a boolean.
+    if (auto B = SubSchema.getAsBoolean()) {
+      if (*B)
+        return Error::success();
+      return createStringError(
+          inconvertibleErrorCode(),
+          formatv("Schema 'false' rejects instance at {0}", prettyPath(SubPath))
+              .str());
+    }
+    if (auto O = SubSchema.getAsObject())
+      return validateValue(Instance, *O, std::move(SubPath));
+    return createStringError(
+        inconvertibleErrorCode(),
+        formatv("Schema error: subschema must be an object or boolean at {0}",
+                prettyPath(SubPath))
+            .str());
+  };
+
   if (auto MP = Schema.getInteger("minProperties")) {
     if (*MP < 0) {
       return createStringError(inconvertibleErrorCode(),
@@ -679,11 +736,9 @@ Error JSONSchemaValidator::validateObject(const Object &Obj,
   if (auto DepSch = getObjectField(Schema, "dependentSchemas")) {
     for (const auto &[K, SubVal] : **DepSch) {
       if (Obj.find(K) != Obj.end()) {
-        if (const Object *Sub = SubVal.getAsObject()) {
-          // Validate the WHOLE object against the subschema.
-          if (auto Err = validateValue(asValueCopy(Obj), *Sub, Path))
-            return Err;
-        }
+        // Validate the WHOLE object against the subschema.
+        if (auto Err = validateSubschema(asValueCopy(Obj), SubVal, Path))
+          return Err;
       }
     }
   }
@@ -708,43 +763,48 @@ Error JSONSchemaValidator::validateObject(const Object &Obj,
     for (const auto &[Key, SubSchemaVal] : **Props) {
       auto It = Obj.find(Key);
       if (It != Obj.end()) {
-        if (auto SubSchemaObj = SubSchemaVal.getAsObject()) {
-          std::string ChildPath = withPath(Key);
-          if (auto Err = validateValue(It->second, *SubSchemaObj, ChildPath))
-            return Err;
-        }
+        std::string ChildPath = withPath(Key);
+        if (auto Err = validateSubschema(It->second, SubSchemaVal, ChildPath))
+          return Err;
       }
     }
   }
 
   // patternProperties: apply schemas to keys matching regex.
-  DenseMap<StringRef, const Object *> PatternSchemas;
+  DenseMap<StringRef, const Value *> PatternSchemas;
   if (auto PatProps = getObjectField(Schema, "patternProperties")) {
-    for (const auto &[Pat, SubVal] : **PatProps)
-      if (const Object *Sub = SubVal.getAsObject())
-        PatternSchemas[Pat] = Sub;
+    // Ensure all patterns are valid regexes.
+    for (const auto &[Pat, SubVal] : **PatProps) {
+      Regex R(Pat);
+      std::string ErrMsg;
+      if (!R.isValid(ErrMsg)) {
+        return createStringError(
+            inconvertibleErrorCode(),
+            formatv("Invalid regex patternProperties[{0}] at {1}: {2}", Pat,
+                    prettyPath(Path), ErrMsg)
+                .str());
+      }
+      PatternSchemas[Pat] = &SubVal;
+    }
+
     for (const auto &[Key, Val] : Obj) {
+      std::string ChildPath = withPath(Key);
       for (const auto &[Pat, Sub] : PatternSchemas) {
         Regex R(Pat);
-        std::string E;
-        if (!R.isValid(E))
-          return createStringError(inconvertibleErrorCode(),
-                                   "Invalid regex in patternProperties at " +
-                                       prettyPath(Path) + ": " + Pat.str());
         if (R.match(Key)) {
-          std::string ChildPath = withPath(Key);
-          if (auto Err = validateValue(Val, *Sub, ChildPath))
+          if (auto Err = validateSubschema(Val, *Sub, ChildPath))
             return Err;
         }
       }
     }
   }
 
-  // propertyNames: validate each key as a string instance.
-  if (auto PropNames = getObjectField(Schema, "propertyNames")) {
+  // propertyNames: schema applied to each property name (instance is a string).
+  if (auto ItPropNames = Schema.find("propertyNames");
+      ItPropNames != Schema.end()) {
     for (const auto &[Key, _] : Obj) {
-      if (auto Err = validateValue(Value(Key), **PropNames,
-                                   withPath("<propertyName>")))
+      if (auto Err = validateSubschema(Value(Key), ItPropNames->second,
+                                       withPath("<propertyName>")))
         return Err;
     }
   }
@@ -819,6 +879,26 @@ Error JSONSchemaValidator::validateArray(const Array &Arr, const Object &Schema,
                         : formatv("{0}[{1}]", Path, Idx).str();
   };
 
+  auto validateSubschema = [&](const Value &Instance, const Value &SubSchema,
+                               std::string SubPath) -> Error {
+    // Draft 2020-12: a schema is either an object or a boolean.
+    if (auto B = SubSchema.getAsBoolean()) {
+      if (*B)
+        return Error::success();
+      return createStringError(
+          inconvertibleErrorCode(),
+          formatv("Schema 'false' rejects instance at {0}", prettyPath(SubPath))
+              .str());
+    }
+    if (auto O = SubSchema.getAsObject())
+      return validateValue(Instance, *O, std::move(SubPath));
+    return createStringError(
+        inconvertibleErrorCode(),
+        formatv("Schema error: subschema must be an object or boolean at {0}",
+                prettyPath(SubPath))
+            .str());
+  };
+
   if (auto MinItemsVal = Schema.getInteger("minItems")) {
     if (*MinItemsVal < 0)
       return createStringError(inconvertibleErrorCode(),
@@ -866,46 +946,44 @@ Error JSONSchemaValidator::validateArray(const Array &Arr, const Object &Schema,
     }
   }
 
-  // "items" can be an object (single schema for all items) OR an array (tuple
-  // form).
-  if (auto Items = getObjectField(Schema, "items")) {
-    for (size_t Idx = 0; Idx < Arr.size(); ++Idx) {
-      std::string ElemPath = indexPath(Idx);
-      if (auto Err = validateValue(Arr[Idx], **Items, ElemPath))
-        return Err;
-    }
-  } else if (auto ItemsArr = getArrayField(Schema, "items")) {
-    size_t N = (*ItemsArr)->size();
-    for (size_t Idx = 0; Idx < Arr.size() && Idx < N; ++Idx) {
-      if (const Object *Sub = (**ItemsArr)[Idx].getAsObject()) {
+  // items: schema applied to array items. Draft 2020-12 treats "items" as a
+  // single subschema; we also support the tuple (array) form for convenience.
+  if (auto ItItems = Schema.find("items"); ItItems != Schema.end()) {
+    if (const Array *ItemsArr = ItItems->second.getAsArray()) {
+      size_t N = ItemsArr->size();
+      for (size_t Idx = 0; Idx < Arr.size() && Idx < N; ++Idx) {
         std::string ElemPath = indexPath(Idx);
-        if (auto Err = validateValue(Arr[Idx], *Sub, ElemPath))
+        if (auto Err = validateSubschema(Arr[Idx], (*ItemsArr)[Idx], ElemPath))
+          return Err;
+      }
+      // Extra items beyond tuple size: allowed. We leave them unconstrained
+      // unless other keywords ("contains", etc.) restrict them.
+    } else {
+      for (size_t Idx = 0; Idx < Arr.size(); ++Idx) {
+        std::string ElemPath = indexPath(Idx);
+        if (auto Err = validateSubschema(Arr[Idx], ItItems->second, ElemPath))
           return Err;
       }
     }
-    // Extra items beyond tuple size: allowed (draft-2020-12 recommends
-    // prefixItems/items), we leave them unconstrained unless "items" (single
-    // schema) or "contains" says otherwise.
   }
 
   // prefixItems: array of schemas for the first N elements (draft-2020-12).
   if (auto Pfx = getArrayField(Schema, "prefixItems")) {
     size_t N = (**Pfx).size();
     for (size_t Idx = 0; Idx < Arr.size() && Idx < N; ++Idx) {
-      if (const Object *Sub = (**Pfx)[Idx].getAsObject()) {
-        std::string ElemPath = indexPath(Idx);
-        if (auto Err = validateValue(Arr[Idx], *Sub, ElemPath))
-          return Err;
-      }
+      std::string ElemPath = indexPath(Idx);
+      if (auto Err = validateSubschema(Arr[Idx], (**Pfx)[Idx], ElemPath))
+        return Err;
     }
   }
 
   // contains: at least one item must match the subschema.
-  if (auto Contains = getObjectField(Schema, "contains")) {
+  if (auto ItContains = Schema.find("contains"); ItContains != Schema.end()) {
     size_t Matches = 0;
     for (size_t Idx = 0; Idx < Arr.size(); ++Idx) {
       std::string ElemPath = indexPath(Idx);
-      if (auto Err = validateValue(Arr[Idx], **Contains, ElemPath)) {
+      if (auto Err =
+              validateSubschema(Arr[Idx], ItContains->second, ElemPath)) {
         consumeError(std::move(Err)); // element doesn't match; ignore
       } else {
         ++Matches;
