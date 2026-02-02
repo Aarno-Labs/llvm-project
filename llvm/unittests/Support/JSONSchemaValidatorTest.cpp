@@ -407,6 +407,29 @@ TEST(JSONSchemaValidatorTest, Arrays_Items_Prefix_Contains_Unique_Min) {
                 "Array at $: requires >= 1 matches for 'contains' (got 0)");
 }
 
+
+TEST(JSONSchemaValidatorTest, Arrays_UniqueItems_StructuralEquality) {
+  Object Schema = Object{{"type", "array"}, {"uniqueItems", true}};
+
+  // Numbers compare by numeric value, not by textual representation.
+  // In particular, -0 and 0 are equal and must be rejected as duplicates.
+  ExpectInvalid(Schema, Array{0.0, -0.0});
+
+  // Objects compare structurally; key order must not matter.
+  ExpectInvalid(Schema, Array{Object{{"a", 1}, {"b", 2}},
+                             Object{{"b", 2}, {"a", 1}}});
+
+  // Nested arrays/objects also compare structurally.
+  ExpectInvalid(Schema, Array{Object{{"x", Object{{"a", 1}, {"b", 2}}}},
+                             Object{{"x", Object{{"b", 2}, {"a", 1}}}}});
+
+  // Arrays are ordered, so these are distinct.
+  ExpectValid(Schema, Array{Array{1, 2}, Array{2, 1}});
+
+  // Distinct objects are allowed.
+  ExpectValid(Schema, Array{Object{{"a", 1}}, Object{{"a", 2}}});
+}
+
 TEST(JSONSchemaValidatorTest, RefAndDefs_Local) {
   Object Schema = Object{
       {"$defs",

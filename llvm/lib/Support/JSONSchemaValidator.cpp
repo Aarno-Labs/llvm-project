@@ -929,20 +929,62 @@ Error JSONSchemaValidator::validateArray(const Array &Arr, const Object &Schema,
 
   if (auto Unique = Schema.getBoolean("uniqueItems"); Unique && *Unique) {
     // Make sure there are no duplicate items in the array.
-    StringMap<size_t> Seen;
-    for (size_t Idx = 0; Idx < Arr.size(); ++Idx) {
-      std::string Repr = formatv("{0}", Arr[Idx]).str();
-      auto It = Seen.find(Repr);
-      if (It != Seen.end()) {
-        std::string DupPath = indexPath(Idx);
-        return createStringError(
-            inconvertibleErrorCode(),
-            formatv(
-                "Duplicate array item at {0}: {1} (already seen at index {2})",
-                prettyPath(DupPath), Repr, std::to_string(It->second))
-                .str());
+    auto valuesEqual = [&](const Value &A, const Value &B, auto &&Self) -> bool {
+      if (isJsonNull(A) || isJsonNull(B))
+        return isJsonNull(A) && isJsonNull(B);
+
+      if (auto AO = A.getAsObject()) {
+        auto BO = B.getAsObject();
+        if (!BO || AO->size() != BO->size())
+          return false;
+        for (const auto &KV : *AO) {
+          auto It = BO->find(KV.first);
+          if (It == BO->end() || !Self(KV.second, It->second, Self))
+            return false;
+        }
+        return true;
       }
-      Seen[Repr] = Idx;
+
+      if (auto AA = A.getAsArray()) {
+        auto BA = B.getAsArray();
+        if (!BA || AA->size() != BA->size())
+          return false;
+        for (size_t I = 0; I < AA->size(); ++I)
+          if (!Self((*AA)[I], (*BA)[I], Self))
+            return false;
+        return true;
+      }
+
+      if (auto AS = A.getAsString()) {
+        auto BS = B.getAsString();
+        return BS && *AS == *BS;
+      }
+
+      if (auto AN = A.getAsNumber()) {
+        auto BN = B.getAsNumber();
+        return BN && *AN == *BN;
+      }
+
+      if (auto AB = A.getAsBoolean()) {
+        auto BB = B.getAsBoolean();
+        return BB && *AB == *BB;
+      }
+
+      return false;
+    };
+
+    for (size_t Idx = 0; Idx < Arr.size(); ++Idx) {
+      for (size_t Prev = 0; Prev < Idx; ++Prev) {
+        if (valuesEqual(Arr[Idx], Arr[Prev], valuesEqual)) {
+          std::string DupPath = indexPath(Idx);
+          std::string Repr = formatv("{0}", Arr[Idx]).str();
+          return createStringError(
+              inconvertibleErrorCode(),
+              formatv("Duplicate array item at {0}: {1} (already seen at index {2})",
+                      prettyPath(DupPath), Repr, std::to_string(Prev))
+                  .str());
+        }
+      }
     }
   }
 
