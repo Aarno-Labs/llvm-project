@@ -379,6 +379,26 @@ TEST(JSONSchemaValidatorTest, Arrays_Items_Prefix_Contains_Unique_Min) {
   ExpectValid(S, Array{"ok", 2.0, true, nullptr});
   ExpectInvalid(S, Array{3, 2.0}, "Expected string at $[0]");
 
+  // prefixItems + items (draft-2020-12): "items" applies only *after* the
+  // prefix tuple, not to the prefix elements themselves.
+  S = Object{{"type", "array"},
+             {"prefixItems", Array{Object{{"type", "string"}}}},
+             {"items", Object{{"type", "number"}}}};
+  ExpectValid(S, Array{"s"});
+  ExpectValid(S, Array{"s", 1.0, 2.0});
+  ExpectInvalid(S, Array{"s", "t"}, "Expected number at $[1]");
+  ExpectInvalid(S, Array{1.0, 2.0}, "Expected string at $[0]");
+
+  // prefixItems + legacy tuple-form items array: when prefixItems is present,
+  // do not interpret items:[...] (to avoid double-applying tuple constraints).
+  S = Object{{"type", "array"},
+             {"prefixItems", Array{Object{{"type", "string"}}}},
+             {"items", Array{Object{{"type", "number"}}}}};
+  ExpectValid(S, Array{"s"});
+  ExpectValid(S, Array{"s", "t"});
+  ExpectValid(S, Array{"s", 1.0});
+  ExpectInvalid(S, Array{1.0}, "Expected string at $[0]");
+
   // contains: at least one element is > 10
   S = Object{{"type", "array"},
              {"contains", Object{{"type", "number"}, {"minimum", 11.0}}}};
