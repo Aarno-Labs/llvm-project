@@ -540,6 +540,76 @@ TEST(JSONSchemaValidatorTest, RefPointerUnescape) {
   ExpectValid(S, 1);
 }
 
+TEST(JSONSchemaValidatorTest, RefIdAndAnchorSameDocument) {
+  // Root-level $anchor: "#<anchor>" may resolve to the document root schema.
+  {
+    Object S =
+        Object{{"$anchor", "RootA"},
+               {"minimum", 0},
+               {"properties", Object{{"x", Object{{"$ref", "#RootA"}}}}}};
+    ExpectValid(S, Object{{"x", 1}});
+    ExpectInvalid(S, Object{{"x", -1}});
+  }
+
+  // #<anchor> via $anchor (same-document).
+  {
+    Object S =
+        Object{{"$defs", Object{{"T", Object{{"$anchor", "A"}, {"const", 1}}}}},
+               {"$ref", "#A"}};
+    ExpectValid(S, 1);
+    ExpectInvalid(S, 2);
+  }
+
+  // $id base selection (<id>).
+  {
+    Object S = Object{{"$defs", Object{{"Base", Object{{"$id", "urn:ex:base"},
+                                                       {"type", "integer"},
+                                                       {"minimum", 10}}}}},
+                      {"$ref", "urn:ex:base"}};
+    ExpectValid(S, 10);
+    ExpectInvalid(S, 9);
+  }
+
+  // $id + JSON Pointer fragment (<id>#/...)
+  {
+    Object S = Object{
+        {"$defs",
+         Object{
+             {"Base", Object{{"$id", "urn:ex:base"},
+                             {"$defs", Object{{"T", Object{{"const", 5}}}}}}}}},
+        {"$ref", "urn:ex:base#/$defs/T"}};
+    ExpectValid(S, 5);
+    ExpectInvalid(S, 6);
+  }
+
+  // $id + anchor fragment (<id>#<anchor>).
+  {
+    Object S = Object{
+        {"$defs",
+         Object{
+             {"Base", Object{{"$id", "urn:ex:base"},
+                             {"$defs", Object{{"T", Object{{"$anchor", "Z"},
+                                                           {"const", 7}}}}}}}}},
+        {"$ref", "urn:ex:base#Z"}};
+    ExpectValid(S, 7);
+    ExpectInvalid(S, 8);
+  }
+
+  // Unknown $id should fail (no remote fetch).
+  {
+    Object S = Object{{"$ref", "urn:ex:unknown#/$defs/T"}};
+    ExpectInvalid(S, 1);
+  }
+
+  // Invalid pointer within a known $id should fail.
+  {
+    Object S =
+        Object{{"$defs",
+                Object{{"Base", Object{{"$id", "urn:ex:base"}, {"const", 1}}}}},
+               {"$ref", "urn:ex:base#/no_such_token"}};
+    ExpectInvalid(S, 1);
+  }
+}
 
 TEST(JSONSchemaValidatorTest, BooleanSubschemasInCombinatorsAndConditionals) {
   // allOf with a boolean 'false' subschema must fail.
