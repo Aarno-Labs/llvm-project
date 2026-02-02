@@ -33,7 +33,7 @@ std::string LineDirectiveInserter::ToAbsolutePath(StringRef spelledPath) const {
 
 std::string LineDirectiveInserter::WrapIncludeExpansion(
     StringRef childFileSpelling, StringRef parentFileSpelling,
-    int parentResumeLineNo, StringRef childBody) const {
+    size_t parentResumeLineNo, StringRef childBody) const {
   if (!enabled_)
     return childBody.str();
 
@@ -52,13 +52,13 @@ std::string LineDirectiveInserter::WrapIncludeExpansion(
 }
 
 std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
-    StringRef originalFileText, int s, int e, StringRef replacement,
+    StringRef originalFileText, uint64_t s, uint64_t e, StringRef replacement,
     StringRef fileSpellingForDirective) const {
   if (!enabled_)
     return replacement.str();
 
-  int origNl = stringutils::countNewlines(originalFileText, s, e);
-  int replNl = stringutils::countNewlines(replacement);
+  size_t origNl = stringutils::countNewlines(originalFileText, s, e);
+  size_t replNl = stringutils::countNewlines(replacement);
 
   if (origNl == replNl) {
     trace("linedir/local",
@@ -67,7 +67,7 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
     return replacement.str();
   }
 
-  int resumeLine = stringutils::lineAtOffset(originalFileText, e);
+  size_t resumeLine = stringutils::lineAtOffset(originalFileText, e);
   std::string directive =
       FormatLineDirective(resumeLine, fileSpellingForDirective);
 
@@ -94,9 +94,8 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
 
   size_t lastNl = replacement.rfind('\n');
   if (lastNl != StringRef::npos) {
-    int bol = static_cast<int>(lastNl + 1);
-    if (stringutils::isIndentOnly(replacement, bol,
-                                  static_cast<int>(replacement.size()))) {
+    size_t bol = lastNl + 1;
+    if (stringutils::isIndentOnly(replacement, bol, replacement.size())) {
       trace("linedir/local",
             "inject (between last NL and indent-only suffix): resumeLine={0} "
             "file={1} lastNl={2} bol={3}",
@@ -120,7 +119,7 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
 
     if (inTraceMode()) {
       const size_t start =
-          static_cast<size_t>(std::clamp(bol, 0, (int)replacement.size()));
+          static_cast<size_t>(std::clamp(bol, size_t(0), replacement.size()));
       StringRef replFromBol = replacement.substr(start);
       trace("linedir/local",
             "cannot inject at tail (non-indent suffix): resumeLine={0} "
@@ -144,17 +143,19 @@ LineDirectiveInserter::FindLastLineDirectiveState(StringRef src) {
   if (src.empty())
     return std::nullopt;
 
-  const int lookback = 16384;
-  int end = static_cast<int>(src.size());
-  int min = std::max(0, end - lookback);
+  const size_t lookback = 16384;
+  const size_t end = src.size();
+  const size_t min = (end > lookback) ? (end - lookback) : 0;
 
-  int scanEnd = end;
+  // Skip trailing newlines at the end of the buffer/range.
+  size_t scanEnd = end;
   while (scanEnd > min && src[scanEnd - 1] == '\n')
     scanEnd--;
 
   while (scanEnd > min) {
-    int prevNl = stringutils::lastIndexOfChar(src, '\n', scanEnd - 1);
-    int lineStart = prevNl + 1;
+    // Search backward from the character before the current scanEnd.
+    size_t prevNl = stringutils::lastIndexOfChar(src, '\n', scanEnd - 1);
+    size_t lineStart = (prevNl == StringRef::npos) ? 0 : prevNl + 1;
 
     if (stringutils::startsWith(src, lineStart, "#line")) {
       auto st = ParseLineDirective(src, lineStart, scanEnd);
@@ -162,8 +163,10 @@ LineDirectiveInserter::FindLastLineDirectiveState(StringRef src) {
         return st;
     }
 
-    if (prevNl < 0)
+    if (prevNl == StringRef::npos)
       break;
+
+    // Move to newline and skip consecutive newlines
     scanEnd = prevNl;
     while (scanEnd > min && src[scanEnd - 1] == '\n')
       scanEnd--;
@@ -172,13 +175,13 @@ LineDirectiveInserter::FindLastLineDirectiveState(StringRef src) {
 }
 
 std::optional<LineDirectiveState>
-LineDirectiveInserter::ParseLineDirective(StringRef src, int from, int to) {
+LineDirectiveInserter::ParseLineDirective(StringRef src, size_t from,
+                                          size_t to) {
   // 1. Initial Prefix Check
-  if (from < 0 || from + 5 > static_cast<int>(src.size()) ||
-      !stringutils::startsWith(src, from, "#line"))
+  if (from + 5 > src.size() || !stringutils::startsWith(src, from, "#line"))
     return std::nullopt;
 
-  int p = from + 5;
+  size_t p = from + 5;
 
   // 2. Strict Whitespace Check (Enforce at least one whitespace char after
   // #line)
@@ -190,14 +193,14 @@ LineDirectiveInserter::ParseLineDirective(StringRef src, int from, int to) {
     p++;
 
   // 3. Parse Line Number
-  int lineStart = p;
+  size_t lineStart = p;
   while (p < to && isdigit(src[p]))
     p++;
 
   if (p == lineStart)
     return std::nullopt;
 
-  int lineAfter;
+  size_t lineAfter;
   if (src.slice(lineStart, p).getAsInteger(10, lineAfter))
     return std::nullopt;
 
@@ -206,8 +209,7 @@ LineDirectiveInserter::ParseLineDirective(StringRef src, int from, int to) {
     p++;
 
   // 5. Parse Quoted File Spelling with Escaping
-  llvm::SmallString<64>
-      fileSpelling; // 64 is often a safer "sweet spot" for paths
+  llvm::SmallString<64> fileSpelling;
   if (p < to && src[p] == '"') {
     p++; // consume opening quote
     while (p < to) {
@@ -223,8 +225,8 @@ LineDirectiveInserter::ParseLineDirective(StringRef src, int from, int to) {
   }
 
   // 6. Calculate afterDirectiveIdx (Global context)
-  int afterDirectiveIdx = to;
-  if (to < static_cast<int>(src.size()) && src[to] == '\n') {
+  size_t afterDirectiveIdx = to;
+  if (to < src.size() && src[to] == '\n') {
     afterDirectiveIdx = to + 1;
   }
 

@@ -21,10 +21,10 @@ namespace refold {
 /// is where newline accumulation for subsequent output begins.
 struct LineDirectiveState {
   std::string fileSpelling;
-  int lineAfterDir;
-  int afterDirIdx;
+  size_t lineAfterDir;
+  size_t afterDirIdx;
 
-  LineDirectiveState(StringRef file, int line, int idx)
+  LineDirectiveState(StringRef file, size_t line, size_t idx)
       : fileSpelling(file.str()), lineAfterDir(line), afterDirIdx(idx) {}
 };
 
@@ -104,8 +104,8 @@ public:
   /// \param spelledFile file spelling to embed in the directive
   ///        (producer-owned)
   /// \return a complete #line ... line including trailing newline
-  static std::string FormatLineDirective(int lineNo, StringRef spelledFile) {
-    if (lineNo < 1)
+  static std::string FormatLineDirective(size_t lineNo, StringRef spelledFile) {
+    if (lineNo == 0)
       return "";
 
     std::string result = "#line ";
@@ -143,7 +143,7 @@ public:
   /// \return wrapped include body, or childBody unchanged if disabled
   std::string WrapIncludeExpansion(StringRef childFileSpelling,
                                    StringRef parentFileSpelling,
-                                   int parentResumeLine1Based,
+                                   size_t parentResumeLineNo,
                                    StringRef childBody) const;
 
   /// \brief Attempts a *local* resynchronization by injecting a #line directive
@@ -187,8 +187,8 @@ public:
   /// \return either replacement unchanged, or replacement with a
   ///         locally-inserted directive
   std::string
-  MaybeAppendResyncAfterReplacement(StringRef originalFileText, int s, int e,
-                                    StringRef replacement,
+  MaybeAppendResyncAfterReplacement(StringRef originalFileText, uint64_t s,
+                                    uint64_t e, StringRef replacement,
                                     StringRef fileSpellingForDirective) const;
 
   /// \brief Determines whether a #line directive should be emitted at the
@@ -217,7 +217,7 @@ public:
   ///         redundant/no-op
   static bool ShouldEmitLineDirective(StringRef src,
                                       StringRef fileSpellingForDir,
-                                      int targetLine, StringRef directive) {
+                                      size_t targetLine, StringRef directive) {
     // If we literally just emitted the exact same directive, don't duplicate
     // it.
     if (src.ends_with(directive))
@@ -277,7 +277,7 @@ private:
   /// \return parsed directive state or null if the line does not match the
   ///         expected form
   static std::optional<LineDirectiveState> ParseLineDirective(StringRef src,
-                                                              int from, int to);
+                                                              size_t from, size_t to);
 
   /// \brief Computes whether emitting `#line targetLine "fileSpellingForDir"` at
   /// the current output position would have no effect on the logical location.
@@ -296,13 +296,13 @@ private:
   /// "unknown" so callers should emit conservatively).
   static bool LineDirectiveWouldBeNoOp(StringRef src,
                                        StringRef fileSpellingForDir,
-                                       int targetLine) {
+                                       size_t targetLine) {
     auto st = FindLastLineDirectiveState(src);
     if (!st || st->fileSpelling != fileSpellingForDir)
       return false;
 
-    int delta = stringutils::countNonSplicedNewlines(
-        src, st->afterDirIdx, static_cast<int>(src.size()));
+    size_t delta = stringutils::countNonSplicedNewlines(
+        src, st->afterDirIdx, src.size());
     return (st->lineAfterDir + delta) == targetLine;
   }
 };

@@ -73,8 +73,8 @@ namespace clang {
 namespace refold {
 namespace diffutils {
 
-constexpr std::size_t MAX =
-    static_cast<std::size_t>(std::numeric_limits<int>::max());
+constexpr size_t MAX =
+    static_cast<size_t>(std::numeric_limits<int64_t>::max());
 
 namespace {
 bool shouldUseGreedyApproach(unsigned long long n, unsigned long long m,
@@ -104,9 +104,9 @@ bool shouldUseGreedyApproach(unsigned long long n, unsigned long long m,
       // ULL overflow).
       const unsigned long long cells = n1 * m1;
 
-      // Allocation guard: cells * sizeof(unsigned) must fit in std::size_t
+      // Allocation guard: cells * sizeof(unsigned) must fit in size_t
       const unsigned long long cellLimit = static_cast<unsigned long long>(
-          std::numeric_limits<std::size_t>::max() / sizeof(unsigned));
+          std::numeric_limits<size_t>::max() / sizeof(unsigned));
 
       if (cells > cellLimit) {
         warn("lcs/map",
@@ -121,21 +121,21 @@ bool shouldUseGreedyApproach(unsigned long long n, unsigned long long m,
   return false;
 }
 
-std::vector<int> lcsMapABGreedy(ArrayRef<StringRef> a,
+std::vector<int64_t> lcsMapABGreedy(ArrayRef<StringRef> a,
                                 ArrayRef<StringRef> b) {
   const size_t n = a.size(), m = b.size();
 
   // Greedy order-preserving subsequence scan (linear-time).
   // If m > MAX, only consider the first MAX elements of b so that
   // the stored j indices always fit in 'int'.
-  const std::size_t jlimit = std::min(m, MAX);
-  std::vector<int> map(n, -1);
-  std::size_t j = 0;
-  for (std::size_t i = 0; i < n && j < jlimit; ++i) {
+  const size_t jlimit = std::min(m, MAX);
+  std::vector<int64_t> map(n, -1);
+  size_t j = 0;
+  for (size_t i = 0; i < n && j < jlimit; ++i) {
     while (j < jlimit && a[i] != b[j])
       ++j;
     if (j < jlimit && a[i] == b[j]) {
-      map[i] = static_cast<int>(j);
+      map[i] = static_cast<int64_t>(j);
       ++j;
     }
   }
@@ -150,19 +150,19 @@ inline bool isBetter(unsigned candLen, std::uint64_t candCost, unsigned bestLen,
 
 // ================== Weighted LCS (DP with greedy fallback) ===================
 
-std::vector<int> lcsMapAB(llvm::ArrayRef<StringRef> a,
-                          llvm::ArrayRef<StringRef> b,
-                          llvm::ArrayRef<unsigned> ownerDepthGap,
+std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a,
+                          ArrayRef<StringRef> b,
+                          ArrayRef<uint32_t> ownerDepthGap,
                           unsigned long long maxCells) {
   using namespace clang::refold;
 
-  const std::size_t n = a.size(), m = b.size();
+  const size_t n = a.size(), m = b.size();
 
   // Early outs for empties
   if (n == 0)
     return {};
   if (m == 0)
-    return std::vector<int>(n, -1);
+    return std::vector<int64_t>(n, -1);
 
   // 1) If b is too large to store j in 'int' safely, prefer greedy.
   bool useGreedy = (m > MAX);
@@ -191,30 +191,31 @@ std::vector<int> lcsMapAB(llvm::ArrayRef<StringRef> a,
   //   match:     from (i-1,j-1), +1 length, +0 cost
   //   delete A:  from (i-1,j),   +0 length, +ownerDepthGap[i]
   //   insert B:  from (i,  j-1), +0 length, +ownerDepthGap[i]
-  const std::size_t stride = m + 1;
-  const std::size_t cells = (n + 1) * (m + 1);
+  const size_t stride = m + 1;
+  const size_t cells = (n + 1) * (m + 1);
 
-  std::vector<unsigned> dpLen(cells, 0);
-  std::vector<std::uint64_t> dpCost(cells, 0);
+  std::vector<uint32_t> dpLen(cells, 0);
+  // Using uint64_t for cost to prevent overflow during accumulation
+  std::vector<uint64_t> dpCost(cells, 0);
 
-  auto idx = [&](std::size_t i, std::size_t j) -> std::size_t {
+  auto idx = [&](size_t i, size_t j) -> size_t {
     return i * stride + j;
   };
-  auto len = [&](std::size_t i, std::size_t j) -> unsigned & {
+  auto len = [&](size_t i, size_t j) -> uint32_t & {
     return dpLen[idx(i, j)];
   };
-  auto cost = [&](std::size_t i, std::size_t j) -> std::uint64_t & {
+  auto cost = [&](size_t i, size_t j) -> uint64_t & {
     return dpCost[idx(i, j)];
   };
 
   // Fill DP table forward
-  for (std::size_t i = 0; i <= n; ++i) {
-    for (std::size_t j = 0; j <= m; ++j) {
+  for (size_t i = 0; i <= n; ++i) {
+    for (size_t j = 0; j <= m; ++j) {
       if (i == 0 && j == 0)
         continue;
 
-      unsigned bestLen = 0;
-      std::uint64_t bestCost = std::numeric_limits<std::uint64_t>::max();
+      uint32_t bestLen = 0;
+      uint64_t bestCost = std::numeric_limits<uint64_t>::max();
 
       // 1) Match (diagonal)
       if (i > 0 && j > 0 && a[i - 1] == b[j - 1]) {
@@ -224,9 +225,9 @@ std::vector<int> lcsMapAB(llvm::ArrayRef<StringRef> a,
 
       // 2) Delete A (vertical move: i-1 -> i), pay ownerDepthGap[i]
       if (i > 0) {
-        const unsigned candLen = len(i - 1, j);
-        const std::uint64_t candCost =
-            cost(i - 1, j) + static_cast<std::uint64_t>(ownerDepthGap[i]);
+        const uint32_t candLen = len(i - 1, j);
+        const uint64_t candCost =
+            cost(i - 1, j) + static_cast<uint64_t>(ownerDepthGap[i]);
 
         if (isBetter(candLen, candCost, bestLen, bestCost)) {
           bestLen = candLen;
@@ -236,9 +237,9 @@ std::vector<int> lcsMapAB(llvm::ArrayRef<StringRef> a,
 
       // 3) Insert B (horizontal move: j-1 -> j), pay ownerDepthGap[i]
       if (j > 0) {
-        const unsigned candLen = len(i, j - 1);
-        const std::uint64_t candCost =
-            cost(i, j - 1) + static_cast<std::uint64_t>(ownerDepthGap[i]);
+        const uint32_t candLen = len(i, j - 1);
+        const uint64_t candCost =
+            cost(i, j - 1) + static_cast<uint64_t>(ownerDepthGap[i]);
 
         if (isBetter(candLen, candCost, bestLen, bestCost)) {
           bestLen = candLen;
@@ -252,14 +253,13 @@ std::vector<int> lcsMapAB(llvm::ArrayRef<StringRef> a,
   }
 
   // ------------------- Backtrack: diag, then up, then left -------------------
-  std::vector<int> map(n, -1);
+  std::vector<int64_t> map(n, -1);
 
-  std::size_t i = n;
-  std::size_t j = m;
-
+  size_t i = n;
+  size_t j = m;
   while (i > 0 || j > 0) {
-    const unsigned curLen = len(i, j);
-    const std::uint64_t curCost = cost(i, j);
+    const uint32_t curLen = len(i, j);
+    const uint64_t curCost = cost(i, j);
 
     bool moved = false;
 
@@ -267,7 +267,7 @@ std::vector<int> lcsMapAB(llvm::ArrayRef<StringRef> a,
     if (i > 0 && j > 0 && a[i - 1] == b[j - 1]) {
       if (len(i - 1, j - 1) == curLen - 1U &&
           cost(i - 1, j - 1) == curCost) {
-        map[i - 1] = static_cast<int>(j - 1);
+        map[i - 1] = static_cast<int64_t>(j - 1);
         --i;
         --j;
         moved = true;
@@ -277,7 +277,7 @@ std::vector<int> lcsMapAB(llvm::ArrayRef<StringRef> a,
     // Up (delete A): from (i-1, j) paying ownerDepthGap[i]
     if (!moved && i > 0) {
       if (len(i - 1, j) == curLen &&
-          cost(i - 1, j) + static_cast<std::uint64_t>(ownerDepthGap[i]) == curCost) {
+          cost(i - 1, j) + static_cast<uint64_t>(ownerDepthGap[i]) == curCost) {
         --i;
         moved = true;
       }
@@ -286,7 +286,7 @@ std::vector<int> lcsMapAB(llvm::ArrayRef<StringRef> a,
     // Left (insert B): from (i, j-1) paying ownerDepthGap[i]
     if (!moved && j > 0) {
       if (len(i, j - 1) == curLen &&
-          cost(i, j - 1) + static_cast<std::uint64_t>(ownerDepthGap[i]) == curCost) {
+          cost(i, j - 1) + static_cast<uint64_t>(ownerDepthGap[i]) == curCost) {
         --j;
         moved = true;
       }
@@ -302,15 +302,15 @@ std::vector<int> lcsMapAB(llvm::ArrayRef<StringRef> a,
 // ====================== LCS (DP with greedy fallback) =======================
 
 [[maybe_unused]]
-std::vector<int> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
+std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
                           unsigned long long maxCells) {
-  const std::size_t n = a.size(), m = b.size();
+  const size_t n = a.size(), m = b.size();
 
   // Early outs for empties
   if (n == 0)
     return {};
   if (m == 0)
-    return std::vector<int>(n, -1);
+    return std::vector<int64_t>(n, -1);
 
   // Decide whether to use the greedy subsequence fallback.
   bool useGreedy = false;
@@ -332,28 +332,28 @@ std::vector<int> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
   }
 
   // ----------------- DP path: (n+1) x (m+1) table, row-major -----------------
-  const std::size_t stride = m + 1;
-  const std::size_t cells = (n + 1) * (m + 1);
+  const size_t stride = m + 1;
+  const size_t cells = (n + 1) * (m + 1);
   std::vector<unsigned> dp(cells, 0);
 
-  auto DP = [&](std::size_t i, std::size_t j) -> unsigned & {
+  auto DP = [&](size_t i, size_t j) -> unsigned & {
     return dp[i * stride + j];
   };
 
   // DP(i,j) = LCS length of a[i:] vs b[j:]
-  for (std::size_t i = n; i-- > 0;) {
-    for (std::size_t j = m; j-- > 0;) {
+  for (size_t i = n; i-- > 0;) {
+    for (size_t j = m; j-- > 0;) {
       DP(i, j) = (a[i] == b[j]) ? static_cast<unsigned>(DP(i + 1, j + 1) + 1U)
                                 : std::max(DP(i + 1, j), DP(i, j + 1));
     }
   }
 
   // Reconstruct a->b map with deterministic tie-breaker (>= → skip a)
-  std::vector<int> map(n, -1);
-  std::size_t i = 0, j = 0;
+  std::vector<int64_t> map(n, -1);
+  size_t i = 0, j = 0;
   while (i < n && j < m) {
     if (a[i] == b[j]) {
-      map[i] = static_cast<int>(j);
+      map[i] = static_cast<int64_t>(j);
       ++i;
       ++j;
     } else if (DP(i + 1, j) >= DP(i, j + 1)) {
@@ -365,25 +365,37 @@ std::vector<int> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
   return map;
 }
 
-std::vector<Hunk> hunksFromMap(ArrayRef<int> map, int nA, int nB) {
+std::vector<Hunk> hunksFromMap(ArrayRef<int64_t> map, size_t nA, size_t nB) {
   std::vector<Hunk> hunks;
-  int prevI = -1, prevJ = -1;
-  for (int i = 0; i < nA; ++i) {
-    const int j = (i < static_cast<int>(map.size()) ? map[i] : -1);
-    if (j < 0)
-      continue; // unmatched
-    const int aStart = prevI + 1, aEnd = i;
-    const int bStart = prevJ + 1, bEnd = j;
-    if (aStart < aEnd || bStart < bEnd)
-      hunks.push_back(Hunk{aStart, aEnd, bStart, bEnd});
-    prevI = i;
-    prevJ = j;
+
+  const uint64_t limitA = static_cast<uint64_t>(nA);
+  const uint64_t limitB = static_cast<uint64_t>(nB);
+
+  // Track the 'next expected' index to identify gaps.
+  uint64_t nextA = 0;
+  uint64_t nextB = 0;
+  for (uint64_t i = 0; i < nA; ++i) {
+    const int64_t matchedJ = (i < map.size() ? map[i] : -1);
+    if (matchedJ < 0)
+      continue; // Skip unmatched tokens
+
+    const uint64_t j = static_cast<uint64_t>(matchedJ);
+
+    // If there's a gap in A or B since the last match, we have a Hunk
+    if (i > nextA || j > nextB) {
+      hunks.push_back(Hunk{nextA, i, nextB, j});
+    }
+
+    // After a match, the next possible Hunk starts at i+1, j+1
+    nextA = i + 1;
+    nextB = j + 1;
   }
-  // tail region after last match
-  const int aStart = prevI + 1, aEnd = nA;
-  const int bStart = prevJ + 1, bEnd = nB;
-  if (aStart < aEnd || bStart < bEnd)
-    hunks.push_back(Hunk{aStart, aEnd, bStart, bEnd});
+
+  // Handle the tail region
+  if (nextA < limitA || nextB < limitB) {
+    hunks.push_back(Hunk{nextA, limitA, nextB, limitB});
+  }
+
   return hunks;
 }
 
@@ -416,55 +428,61 @@ std::vector<Hunk> hunksFromMap(ArrayRef<int> map, int nA, int nB) {
 /// \param dAtEnd Minimal edit distance at the end of the forward pass.
 /// \param offset Offset used to index `V` by `k + offset`.
 /// \returns Forward-ordered list of `Step` edits.
-static std::vector<Step> backtrack(ArrayRef<StringRef> a,
-                                   ArrayRef<StringRef> b,
-                                   ArrayRef<std::vector<int>> trace,
-                                   int x, int y, int dAtEnd, int offset) {
+static std::vector<Step> backtrack(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
+                                   ArrayRef<std::vector<int64_t>> trace,
+                                   int64_t x, int64_t y, int64_t dAtEnd,
+                                   int64_t offset) {
   std::vector<Step> out;
-  for (int d = dAtEnd; d > 0; --d) {
-    const std::vector<int> &v =
-        trace[static_cast<std::size_t>(d - 1)]; // snapshot before layer d
-    const int k = x - y;
-    const int kIndex = k + offset;
+  for (int64_t d = dAtEnd; d > 0; --d) {
+    // trace contains snapshots of V arrays at each distance d
+    const std::vector<int64_t> &v = trace[static_cast<size_t>(d - 1)];
+    const int64_t k = x - y;
+    const size_t kIndex = static_cast<size_t>(k + offset);
 
     // Choose predecessor diagonal
-    int prevK;
-    if (k == -d || (k != d && v[static_cast<std::size_t>(kIndex - 1)] <
-                                  v[static_cast<std::size_t>(kIndex + 1)])) {
-      prevK = k + 1; // came from "down" (insert in b)
+    int64_t prevK;
+    // k == -d means we must have come from above (k+1)
+    // Otherwise, we check if moving from k+1 or k-1 resulted in a further X
+    if (k == -d || (k != d && v[kIndex - 1] < v[kIndex + 1])) {
+      prevK = k + 1; // Vertical move (Insert)
     } else {
-      prevK = k - 1; // came from "right" (delete from a)
+      prevK = k - 1; // Horizontal move (Delete)
     }
 
-    const int xStart = v[static_cast<std::size_t>(prevK + offset)];
-    const int yStart = xStart - prevK;
+    const int64_t xStart = v[static_cast<size_t>(prevK + offset)];
+    const int64_t yStart = xStart - prevK;
 
-    // Diagonal snake (equals)
+    // Diagonal snake: backtrack through equals
     while (x > xStart && y > yStart) {
       --x;
       --y;
-      out.push_back(Step{Op::Equal, x, x + 1, y, y + 1});
+      out.push_back(Step{Op::Equal, static_cast<uint64_t>(x),
+                         static_cast<uint64_t>(x + 1), static_cast<uint64_t>(y),
+                         static_cast<uint64_t>(y + 1)});
     }
 
-    // Single edit step
+    // Edit step: the move that increased distance d-1 to d
     if (xStart < x) {
       --x;
-      out.push_back(Step{Op::Delete, x, x + 1, y, y});
+      out.push_back(Step{Op::Delete, static_cast<uint64_t>(x),
+                         static_cast<uint64_t>(x + 1), static_cast<uint64_t>(y),
+                         static_cast<uint64_t>(y)});
     } else if (yStart < y) {
       --y;
-      out.push_back(Step{Op::Insert, x, x, y, y + 1});
-    } else {
-      // no-op
+      out.push_back(Step{Op::Insert, static_cast<uint64_t>(x),
+                         static_cast<uint64_t>(x), static_cast<uint64_t>(y),
+                         static_cast<uint64_t>(y + 1)});
     }
   }
 
-  // Any leading equals before d=0
+  // Leading equals before the first edit
   while (x > 0 && y > 0 &&
-         a[static_cast<std::size_t>(x - 1)] ==
-             b[static_cast<std::size_t>(y - 1)]) {
+         a[static_cast<size_t>(x - 1)] == b[static_cast<size_t>(y - 1)]) {
     --x;
     --y;
-    out.push_back(Step{Op::Equal, x, x + 1, y, y + 1});
+    out.push_back(Step{Op::Equal, static_cast<uint64_t>(x),
+                       static_cast<uint64_t>(x + 1), static_cast<uint64_t>(y),
+                       static_cast<uint64_t>(y + 1)});
   }
 
   std::reverse(out.begin(), out.end());
@@ -472,55 +490,53 @@ static std::vector<Step> backtrack(ArrayRef<StringRef> a,
 }
 
 std::vector<Step> diff(ArrayRef<StringRef> a, ArrayRef<StringRef> b) {
-  const int n = static_cast<int>(a.size());
-  const int m = static_cast<int>(b.size());
-  const int max = n + m;
-  const int offset = max;
+  const int64_t n = static_cast<int64_t>(a.size());
+  const int64_t m = static_cast<int64_t>(b.size());
+  const int64_t max = n + m;
+  const int64_t offset = max;
 
-  // Initial V array: range [-max, max] offset to [0, 2*max]
-  std::vector<int> v(2 * max + 1, -1);
+  // V array tracks the furthest x reached on each diagonal k
+  // Range is [-max, max], so size is 2*max + 1
+  std::vector<int64_t> v(static_cast<size_t>(2 * max + 1), -1);
 
-  // Base case: for d=0 and k=0 we take x=0 from v[offset+1].
-  v[offset + 1] = 0;
+  // Base case: starting point (0,0) on diagonal 0
+  v[static_cast<size_t>(offset + 1)] = 0;
 
-  std::vector<std::vector<int>> trace;
-  trace.reserve(max + 1);
+  std::vector<std::vector<int64_t>> trace;
+  // Reserve based on expected distance;
+  // for very large diffs, this is the main memory consumer.
+  trace.reserve(static_cast<size_t>(max + 1));
 
-  for (int d = 0; d <= max; ++d) {
-    // Copy current v to vNew to represent this edit distance layer.
-    std::vector<int> vNew = v;
+  for (int64_t d = 0; d <= max; ++d) {
+    std::vector<int64_t> vNew = v;
 
-    for (int k = -d; k <= d; k += 2) {
-      const int kIndex = k + offset;
+    for (int64_t k = -d; k <= d; k += 2) {
+      const size_t kIdx = static_cast<size_t>(k + offset);
 
-      int x;
-      if (k == -d || (k != d && v[kIndex - 1] < v[kIndex + 1])) {
-        // Down move: insertion
-        x = v[kIndex + 1];
+      int64_t x;
+      if (k == -d || (k != d && v[kIdx - 1] < v[kIdx + 1])) {
+        x = v[kIdx + 1]; // Move down from k+1 (Insertion)
       } else {
-        // Right move: deletion
-        x = v[kIndex - 1] + 1;
+        x = v[kIdx - 1] + 1; // Move right from k-1 (Deletion)
       }
 
-      int y = x - k;
+      int64_t y = x - k;
 
-      // Follow diagonal while items are equal.
-      while (x < n && y < m && a[x] == b[y]) {
+      // Greedy snake (Diagongal)
+      while (x < n && y < m &&
+             a[static_cast<size_t>(x)] == b[static_cast<size_t>(y)]) {
         x++;
         y++;
       }
 
-      vNew[kIndex] = x;
+      vNew[kIdx] = x;
 
       if (x >= n && y >= m) {
-        // Found the end!
         trace.push_back(std::move(vNew));
         return backtrack(a, b, trace, x, y, d, offset);
       }
     }
 
-    // Move vNew into trace to avoid a deep copy, then update v for the next
-    // iteration.
     trace.push_back(std::move(vNew));
     v = trace.back();
   }
@@ -530,29 +546,39 @@ std::vector<Step> diff(ArrayRef<StringRef> a, ArrayRef<StringRef> b) {
 
 std::vector<Hunk> coalesce(ArrayRef<Step> steps) {
   std::vector<Hunk> hunks;
-  std::size_t i = 0;
-  const std::size_t n = steps.size();
+  size_t i = 0;
+  const size_t n = steps.size();
 
   while (i < n) {
-    // Skip equals
-    while (i < n && steps[i].op == Op::Equal)
+    // 1. Skip over EQUAL steps.
+    // These are the regions where A and B match perfectly.
+    while (i < n && steps[i].op == Op::Equal) {
       ++i;
+    }
+
     if (i >= n)
       break;
 
-    // Begin an edit run
-    int aStart = steps[i].aLo;
-    int bStart = steps[i].bLo;
-    int aEnd = aStart, bEnd = bStart;
+    // 2. Start of an edit region (a Hunk).
+    // We capture the starting bounds from the first non-equal step.
+    const uint64_t aStart = steps[i].aLo;
+    const uint64_t bStart = steps[i].bLo;
 
-    // Consume consecutive non-EQUAL steps
+    uint64_t aEnd = steps[i].aHi;
+    uint64_t bEnd = steps[i].bHi;
+
+    // 3. Consume all consecutive non-EQUAL steps.
+    // This merges contiguous Inserts and Deletes into one Hunk.
     while (i < n && steps[i].op != Op::Equal) {
       aEnd = steps[i].aHi;
       bEnd = steps[i].bHi;
       ++i;
     }
+
+    // 4. Create the Hunk.
     hunks.push_back(Hunk{aStart, aEnd, bStart, bEnd});
   }
+
   return hunks;
 }
 

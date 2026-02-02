@@ -3,23 +3,22 @@
 // This header embeds (as a string literal) the JSON Schema that describes the
 // on-disk “refold map” produced by the modified Clang preprocessor and consumed
 // by the clang-refold tool. The map records how the unmodified preprocessed
-// token stream A (pp-tokens) was derived from source constructs so that edits
-// made to a retransformed/edited preprocessed stream B can be deterministically
-// projected back into partially expanded C/C++ source.
+// token stream A was derived from source constructs so that edits made to a
+// later, edited preprocessed stream B can be deterministically projected back
+// into partially expanded C/C++ source.
 //
 // High-level model
 // ----------------
 //   * A: the original, unedited preprocessed token stream (indices 0..N-1).
 //   * B: a later, edited preprocessed token stream (not stored in the map).
 //   * The schema ties A’s tokens back to source files/bytes and PP constructs:
-//       - macro invocations and their expansion covers
-//       - include directives and the byte spans they expanded into
-//       - explicit separation of macro-expansion tokens by origin:
-//         * arg_spans  : tokens sourced from actual macro arguments
-//         * body_spans : tokens sourced from the macro body (non-arguments)
-//         This enables deterministic handling of non-argument edits by
-//         replacing the invocation bytes with the edited expansion text
-//         whenever any edit falls in body_spans.
+//       - macro invocations and their expansion spans
+//       - include directives and the spans they expanded into
+//       - explicit origin partitioning within macro expansions:
+//         * arg_spans       : expansion slices sourced from actual arguments
+//         * stringify_spans : slices sourced from argument stringification (#X)
+//         * paste_spans     : slices sourced from argument token-paste (X##Y)
+//         * body_spans      : slices sourced from macro body (non-arguments)
 //       - macro definition/undef directives and pragmas
 //       - conditional groups (#if/#elif/#else/#endif) with selected arms
 //       - token→file byte mapping for A (absolute/canonical paths)
@@ -29,79 +28,105 @@
 // ----------------
 // {
 //   "version": "<opaque format version string>",
-//   "source":  "<absolute path of the TU we refold back into>",
-//   "tokens":  { "count": <N> },       // # of pp-tokens in A
-//   "items":   [ Item, ... ],          // macros/includes/defs/pragmas/files
-//   "tokmap":  [ TokMapEntry, ... ],   // A-token → (file,[b,e)) mapping
-//   "slots":   [ Slot, ... ],          // explicit insertion anchors (optional)
-//   "conds":   [ Cond, ... ]           // conditional groups (optional)
+//   "pp_ctx": {
+//     "cwd":  "<working directory for the preprocessing invocation>",
+//     "argv": ["<clang arg token>", ...],   // replayed for deterministic --check
+//     "lang": "<high-level language>"       // e.g. "c", "c++", "objc"
+//   },
+//   "source": "<path of the TU we refold back into>",
+//   "tokens": {
+//     "count": <N>,
+//     "pp_byte_begin": [ ... ],             // optional; per-token A byte begin
+//     "pp_byte_end":   [ ... ]              // optional; per-token A byte end
+//   },
+//   "tokmap": [ TokMapEntry, ... ],         // A-token -> (file,[b,e)) mapping
+//   "slots":  [ Slot, ... ],                // explicit insertion anchors
+//   "conds":  [ Cond, ... ],                // conditional groups
+//   "items":  [ Item, ... ]                 // macros/includes/defs/pragmas/files
 // }
 //
 // Core definitions (selected)
 // ---------------------------
 // * PPSpan
-//     Half-open A-token interval [begin, end). Every Item that contributes
-//     preprocessed tokens reports one or more spans; “pp_cover” is the minimal
-//     interval covering all of an item’s spans.
+//     Half-open A-token interval [begin, end). Every construct that contributes
+//     preprocessed tokens reports one or more spans.
+//
+// * PPArgSpan
+//     Like PPSpan, but additionally records:
+//       - arg_index: the 0-based argument index this span originates from
+//       - optional byte envelopes for that occurrence:
+//         * byte_begin/byte_end      : bytes in the original source (when known)
+//         * pp_byte_begin/pp_byte_end: bytes in the A preprocessed output
 //
 // * MacroItem
 //     A macro expansion in A, with:
-//       - name, kind (func/obj), spans[], pp_cover
-//       - invocation site bytes: inv_file, [inv_b, inv_e)  (BYTES in that file)
-//       - owner_include_id: include instance that opened inv_file (nullable)
+//       - name, subkind (func/obj), spans[]
+//       - optional origin partitioning within the expansion:
+//         arg_spans / stringify_spans / paste_spans / body_spans
+//       - invocation call-site bytes: inv_file, [inv_b, inv_e) (BYTES in file)
+//       - optional invocation envelope in A output bytes:
+//         inv_pp_byte_begin / inv_pp_byte_end
+//       - owner_include_id: include instance that opened inv_file (when nested)
 //
 // * DirectiveIncludeItem
 //     A single #include/#include_next instance, with:
-//       - site_path, [site_b, site_e)  (BYTES of the directive line)
-//       - target (as written), resolved_path, angled, parent (logical parent
-//       id)
-//       - spans[] (A-token spans produced by this include), pp_cover
+//       - site_path and directive byte range [site_b, site_e) in that file
+//         (site_b/site_e are present but may be null if unavailable)
+//       - target (as written), optional resolved_path, angled, optional parent
+//       - spans[]: A-token spans produced by this include instance
+//       - optional decls[]: logical header-level declarations (requires
+//         resolved_path)
 //
 // * DirectiveMacroItem
-//     A #define/#undef directive line (definition), with optional pp_cover and
-//     owner_include_id (to disambiguate repeated header instances).
+//     A #define/#undef directive line (definition), with:
+//       - site_path and directive byte range [site_b, site_e) (nullable bounds)
+//       - spans[]: A-token spans this directive contributed to (may be empty)
+//       - optional owner_include_id to disambiguate repeated header instances
 //
 // * DirectivePragmaItem
-//     A #pragma line with exact bytes and location (site_path, [site_b,
-//     site_e)).
+//     A #pragma line with exact text and location (site_path, [site_b, site_e))
+//     (nullable bounds when unavailable).
 //
 // * FileItem
 //     Represents tokens emitted while the main TU (top-level) was active;
-//     spans[] and optional pp_cover.
+//     includes a path label and spans[].
 //
 // * TokMapEntry
-//     A-token → source mapping: file (absolute/canonical), [b,e) BYTES in that
-//     file. The array is ordered so that tokmap[i] corresponds to A-token i.
-//     (An optional “pp” field, when present, MUST equal that index.)
+//     A-token → source mapping entry:
+//       - pp: token index in A
+//       - file: absolute/canonical path
+//       - [b,e): byte range in that file corresponding to token pp
+//     Consumers should key by pp; producers typically emit one entry per A token.
 //
 // * Slot
-//     Explicit insertion anchors in original source bytes. Kinds include
-//     { file_begin, file_end, after_last_include, before_include,
-//     after_include, arm_begin, arm_end }. For include/arm slots, “ref” points
-//     at the owning include/arm id. Slots may also carry a stabilizing “pp”
-//     token index when multiple slots share identical byte offsets.
+//     Explicit insertion anchors in original source bytes. Kinds include:
+//     { file_begin, file_end, after_last_include, before_include, after_include,
+//       arm_begin, arm_end }.
+//       - file, [b,e): byte range in file (point slots have b == e)
+//       - ref: required for include/arm kinds; identifies include item id or
+//         conditional arm id (per-kind)
+//       - pp: optional stabilizer for ordering when multiple slots share b/e
+//       - owner_include_id: include instance that opened file (when nested)
 //
 // * Cond / Arm
-//     Conditional groups with absolute byte bounds [group_b, group_e) in a
-//     file, plus ordered arms. Each arm records its kind
-//     (if/ifdef/ifndef/elif/else), body byte range [body_b, body_e), optional
-//     textual condition, and a boolean “selected” indicating that the arm
-//     contributed tokens in A.
+//     Conditional groups with absolute byte bounds [group_b, group_e) in a file,
+//     plus ordered arms. Each Arm records:
+//       - kind: if/ifdef/ifndef/elif/else
+//       - cond: textual condition / macro name (required except for else)
+//       - body byte range [body_b, body_e)
+//       - selected: true iff this arm contributed tokens to A
+//       - pp_span: present iff selected is true
 //
 // Invariants & conventions
 // ------------------------
-// * All token intervals are half-open A-token ranges [begin, end) with end ≥
-// begin.
-// * All byte intervals are half-open file byte ranges [b, e) with e ≥ b.
-// * Paths are absolute/canonical wherever applicable; include “target”
-// preserves
-//   the as-written form (e.g., "e.h" or <vector>).
-// * Items’ ids are unique within the file. Relationships (e.g.,
-// owner_include_id)
-//   use those ids to bind expansions and include instances deterministically.
-// * “additionalProperties” is disabled across the schema to keep the format
-//   closed and fully specified. Producers should populate all required fields;
-//   consumers should treat missing required data as a hard error.
+// * All token intervals are half-open A-token ranges [begin, end) with end >= begin.
+// * All byte intervals are half-open file byte ranges [b, e) with e >= b.
+// * Some location fields are nullable when the producer cannot compute bytes;
+//   optional fields may be omitted entirely as allowed by the schema.
+// * Item ids are unique within the file. Relationships (e.g. owner_include_id,
+//   Slot.ref) use those ids to bind constructs deterministically.
+// * "additionalProperties" is disabled across the schema to keep the format
+//   closed and fully specified.
 // * The schema uses JSON Schema draft 2020-12.
 //
 // Typical workflow
@@ -114,11 +139,11 @@
 //
 // Rationale
 // ---------
-// The map is intentionally sufficient for a deterministic refolder: it avoids
-// heuristic source recovery by recording the exact A-token covers, explicit
-// byte locations for directives and invocation sites, and the
-// conditional/include structure that was in effect when each token in A was
-// produced.
+// The map is intentionally sufficient for a deterministic refolder: it records
+// A-token spans for PP constructs, byte locations for directive/invocation sites
+// when available, and the conditional/include structure governing token
+// production, plus explicit insertion anchors (slots) to avoid heuristic
+// placement.
 //
 // Author:
 //   jeikenberry
@@ -142,19 +167,21 @@ static constexpr const char *RefoldSchema = R"json(
     "pp_ctx",
     "source",
     "tokens",
-    "items",
-    "tokmap"
+    "tokmap",
+    "slots",
+    "conds",
+    "items"
   ],
   "additionalProperties": false,
   "properties": {
     "version": {
       "type": "string",
       "minLength": 1,
-      "$comment": "File format version."
+      "description": "File format version."
     },
     "pp_ctx": {
       "type": "object",
-      "description": "Preprocessor invocation context used to produce the original preprocessed token stream (A). This is used by clang-refold --check to re-run preprocessing of the refolded source under the same flags and verify token alignment against the edited preprocessed output.",
+      "description": "Preprocessor invocation context used to produce stream A; used by clang-refold --check to re-run preprocessing and validate alignment against edited stream B.",
       "required": [
         "cwd",
         "argv",
@@ -169,7 +196,7 @@ static constexpr const char *RefoldSchema = R"json(
         },
         "argv": {
           "type": "array",
-          "description": "Argument vector tokens that materially affect preprocessing and must be replayed for deterministic checking (e.g. -D/-U/-I/-isystem/-include/--sysroot/-isysroot/-resource-dir/-triple/-target-cpu/-std/-x). Stored exactly as tokens, in original order.",
+          "description": "Argument vector tokens that materially affect preprocessing and must be replayed for deterministic checking (e.g. -D/-U/-I/-isystem/-include/--sysroot/-resource-dir/-triple/-target-cpu/-std/-x). Stored as tokens in original order.",
           "items": {
             "type": "string",
             "minLength": 1
@@ -203,7 +230,7 @@ static constexpr const char *RefoldSchema = R"json(
           "type": "array",
           "items": {
             "type": "integer",
-            "minimum": -1
+            "minimum": 0
           },
           "description": "Per-token begin byte offsets in the preprocessed output (A stream). Index i corresponds to A token i."
         },
@@ -211,7 +238,7 @@ static constexpr const char *RefoldSchema = R"json(
           "type": "array",
           "items": {
             "type": "integer",
-            "minimum": -1
+            "minimum": 0
           },
           "description": "Per-token end byte offsets (exclusive) in the preprocessed output (A stream). Index i corresponds to A token i."
         }
@@ -226,31 +253,33 @@ static constexpr const char *RefoldSchema = R"json(
       },
       "description": "Token metadata for the preprocessed stream A."
     },
-    "items": {
-      "type": "array",
-      "items": {
-        "$ref": "#/$defs/Item"
-      }
-    },
     "tokmap": {
       "type": "array",
       "items": {
         "$ref": "#/$defs/TokMapEntry"
-      }
+      },
+      "description": "Per-token mapping from preprocessed tokens (A) to original source byte spans."
     },
     "slots": {
       "type": "array",
-      "description": "Explicit insertion anchors in the ORIGINAL source (bytes) that the refolder can attach new B-only code to without heuristics.",
       "items": {
         "$ref": "#/$defs/Slot"
-      }
+      },
+      "description": "Explicit insertion anchors in the ORIGINAL source (bytes) that the refolder can attach new B-only code to without heuristics."
     },
     "conds": {
       "type": "array",
-      "description": "Conditional groups (#if/#elif/#else/#endif) discovered in source files; used to deterministically place edits into the correct arm.",
       "items": {
         "$ref": "#/$defs/Cond"
-      }
+      },
+      "description": "Conditional groups (#if/#elif/#else/#endif) discovered in source files; used to deterministically place edits into the correct arm."
+    },
+    "items": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Item"
+      },
+      "description": "Preprocessor constructs (macros, directives, file segments) associated with tokens in stream A."
     }
   },
   "$defs": {
@@ -264,11 +293,13 @@ static constexpr const char *RefoldSchema = R"json(
       "properties": {
         "begin": {
           "type": "integer",
-          "minimum": 0
+          "minimum": 0,
+          "description": "Begin A-token index (inclusive)."
         },
         "end": {
           "type": "integer",
-          "minimum": 0
+          "minimum": 0,
+          "description": "End A-token index (exclusive)."
         }
       },
       "description": "Half-open token index range in the preprocessed token stream A: [begin, end). 'end' MUST be >= 'begin'."
@@ -284,488 +315,61 @@ static constexpr const char *RefoldSchema = R"json(
       "properties": {
         "begin": {
           "type": "integer",
-          "minimum": 0
+          "minimum": 0,
+          "description": "Begin A-token index (inclusive) for this argument-origin span."
         },
         "end": {
           "type": "integer",
-          "minimum": 0
+          "minimum": 0,
+          "description": "End A-token index (exclusive) for this argument-origin span."
         },
         "arg_index": {
           "type": "integer",
-          "minimum": 0
+          "minimum": 0,
+          "description": "Zero-based macro parameter index that produced this span."
         },
         "byte_begin": {
           "type": "integer",
-          "minimum": -1
+          "minimum": 0,
+          "description": "For paste_spans: begin byte offset (inclusive) within the spelled output token."
         },
         "byte_end": {
           "type": "integer",
-          "minimum": -1
+          "minimum": 0,
+          "description": "For paste_spans: end byte offset (exclusive) within the spelled output token."
         },
         "pp_byte_begin": {
           "type": "integer",
-          "minimum": -1,
-          "description": "Byte offset in the preprocessed output (A stream) where this span begins. A value of -1 indicates the producer could not compute the byte range."
+          "minimum": 0,
+          "description": "Byte offset in the preprocessed output (A stream) where this span begins (elided if unavailable)."
         },
         "pp_byte_end": {
           "type": "integer",
-          "minimum": -1,
-          "description": "Byte offset in the preprocessed output (A stream) where this span ends (exclusive). A value of -1 indicates the producer could not compute the byte range."
+          "minimum": 0,
+          "description": "Byte offset in the preprocessed output (A stream) where this span ends (exclusive) (elided if unavailable)."
         }
       },
-      "description": "Inherits logic from PPSpan but manually flattened for validator compatibility.",
       "dependentRequired": {
+        "byte_begin": [
+          "byte_end"
+        ],
+        "byte_end": [
+          "byte_begin"
+        ],
         "pp_byte_begin": [
           "pp_byte_end"
         ],
         "pp_byte_end": [
           "pp_byte_begin"
         ]
-      }
-    },
-    "MacroItem": {
-      "type": "object",
-      "required": [
-        "id",
-        "kind",
-        "subkind",
-        "name",
-        "spans"
-      ],
-      "additionalProperties": false,
-      "properties": {
-        "id": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "kind": {
-          "const": "macro"
-        },
-        "subkind": {
-          "enum": [
-            "func",
-            "obj"
-          ]
-        },
-        "name": {
-          "type": "string",
-          "minLength": 1,
-          "description": "Macro identifier."
-        },
-        "spans": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/PPSpan"
-          },
-          "description": "Token spans in the preprocessed stream A that together represent this macro's expansion."
-        },
-        "arg_spans": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/PPArgSpan"
-          },
-          "description": "A-token spans within pp_cover that originate from any actual macro arguments."
-        },
-        "stringify_spans": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/PPArgSpan"
-          },
-          "description": "A-token spans within pp_cover that originate from macro-body stringification of an argument (e.g. '#X')."
-        },
-        "paste_spans": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/PPArgSpan"
-          },
-          "description": "A-token spans within pp_cover that originate from macro-body token-paste involving an argument (e.g. 'X##Y'). Multiple spans may overlap when a single pasted token depends on multiple arguments."
-        },
-        "body_spans": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/PPSpan"
-          },
-          "description": "A-token spans within pp_cover that originate from the macro body (non-argument tokens)."
-        },
-        "inv_text": {
-          "type": "string",
-          "description": "Exact bytes at the macro call site in the source (e.g., 'FOO(1, 2)')."
-        },
-        "inv_file": {
-          "type": "string",
-          "description": "File containing the macro invocation"
-        },
-        "inv_b": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "Begin byte offset of the invocation within 'inv_file'"
-        },
-        "inv_e": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "End byte offset (exclusive) of the invocation within 'inv_file'"
-        },
-        "pp_cover": {
-          "type": "object",
-          "required": [
-            "begin",
-            "end"
-          ],
-          "properties": {
-            "begin": {
-              "type": "integer",
-              "minimum": 0
-            },
-            "end": {
-              "type": "integer",
-              "minimum": 0
-            }
-          },
-          "description": "Minimal [begin,end) A-token interval covering all spans for this item."
-        },
-        "owner_include_id": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "description": "Include item id that opened inv_file (when it's an included header instance)"
-        },
-        "inv_pp_byte_begin": {
-          "type": "integer",
-          "minimum": -1,
-          "description": "Byte offset in the preprocessed output (A stream) for the start of the expansion associated with this invocation, or -1 if unknown/unavailable."
-        },
-        "inv_pp_byte_end": {
-          "type": "integer",
-          "minimum": -1,
-          "description": "Byte offset in the preprocessed output (A stream) for the end (exclusive) of the expansion associated with this invocation, or -1 if unknown/unavailable."
-        }
       },
-      "dependentRequired": {
-        "inv_b": [
-          "inv_e"
-        ],
-        "inv_e": [
-          "inv_b"
-        ],
-        "inv_pp_byte_begin": [
-          "inv_pp_byte_end"
-        ],
-        "inv_pp_byte_end": [
-          "inv_pp_byte_begin"
-        ]
-      },
-      "$comment": "inv_b/inv_e are BYTES in the main source, not token indices."
-    },
-    "DirectiveIncludeItem": {
-      "type": "object",
-      "required": [
-        "id",
-        "kind",
-        "subkind",
-        "target",
-        "site_path",
-        "site_b",
-        "site_e"
-      ],
-      "additionalProperties": false,
-      "properties": {
-        "id": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "kind": {
-          "const": "directive"
-        },
-        "subkind": {
-          "type": "string",
-          "enum": [
-            "#include",
-            "#include_next"
-          ],
-          "description": "Preprocessor include directive kind."
-        },
-        "text": {
-          "type": "string",
-          "minLength": 1,
-          "description": "Exact directive text as written (e.g., '#include <...>')."
-        },
-        "site_path": {
-          "type": "string",
-          "minLength": 1,
-          "description": "File containing this #include/#include_next directive"
-        },
-        "target": {
-          "type": "string",
-          "minLength": 1,
-          "description": "As-written header string from the directive (e.g., \"e.h\" or <vector>)"
-        },
-        "resolved_path": {
-          "type": "string",
-          "minLength": 1,
-          "description": "Filesystem path actually opened for this include as resolved by the preprocessor."
-        },
-        "angled": {
-          "type": "boolean",
-          "default": false,
-          "description": "True if angle brackets (<...>) were used."
-        },
-        "parent": {
-          "type": "integer",
-          "description": "Optional item id of a logical parent include."
-        },
-        "site_b": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "Begin byte offset of the include directive within 'site_path'"
-        },
-        "site_e": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "End byte offset (exclusive) of the include directive within 'site_path'"
-        },
-        "spans": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/PPSpan"
-          },
-          "description": "Token spans in A corresponding to the expansion of the included file."
-        },
-        "pp_cover": {
-          "type": "object",
-          "required": [
-            "begin",
-            "end"
-          ],
-          "properties": {
-            "begin": {
-              "type": "integer",
-              "minimum": 0
-            },
-            "end": {
-              "type": "integer",
-              "minimum": 0
-            }
-          },
-          "description": "Minimal [begin,end) A-token interval covering all spans for this include."
-        },
-        "decls": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/HeaderDecl"
-          },
-          "description": "Logical header-level declarations for this include instance, in source order."
-        }
-      },
-      "dependentRequired": {
-        "site_b": [
-          "site_e"
-        ],
-        "site_e": [
-          "site_b"
-        ]
-      }
-    },
-    "DirectiveMacroItem": {
-      "type": "object",
-      "required": [
-        "id",
-        "kind",
-        "subkind",
-        "text",
-        "spans",
-        "site_path",
-        "site_b",
-        "site_e"
-      ],
-      "additionalProperties": false,
-      "properties": {
-        "id": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "kind": {
-          "const": "directive"
-        },
-        "subkind": {
-          "enum": [
-            "#define",
-            "#undef"
-          ]
-        },
-        "text": {
-          "type": "string",
-          "minLength": 1,
-          "description": "Exact directive text (e.g., '#define FOO ...')."
-        },
-        "spans": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/PPSpan"
-          },
-          "description": "Token spans in A that this directive's expansion contributed to. May be empty."
-        },
-        "site_path": {
-          "type": "string",
-          "description": "File containing this #define/#undef directive"
-        },
-        "site_b": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "Begin byte offset of the directive within 'site_path'"
-        },
-        "site_e": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "End byte offset (exclusive) of the directive within 'site_path'"
-        },
-        "pp_cover": {
-          "type": "object",
-          "required": [
-            "begin",
-            "end"
-          ],
-          "properties": {
-            "begin": {
-              "type": "integer",
-              "minimum": 0
-            },
-            "end": {
-              "type": "integer",
-              "minimum": 0
-            }
-          },
-          "description": "Minimal [begin,end) A-token interval covering all spans (optional)."
-        },
-        "owner_include_id": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "description": "Include item id that opened this file instance (disambiguates repeated includes)"
-        }
-      },
-      "$comment": "Represents #define/#undef lines (definitions), not invocation sites."
-    },
-    "DirectivePragmaItem": {
-      "type": "object",
-      "required": [
-        "id",
-        "kind",
-        "subkind",
-        "site_path",
-        "text",
-        "site_b",
-        "site_e"
-      ],
-      "additionalProperties": false,
-      "properties": {
-        "id": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "kind": {
-          "const": "directive"
-        },
-        "subkind": {
-          "const": "#pragma"
-        },
-        "text": {
-          "type": "string",
-          "minLength": 1,
-          "description": "Exact directive text as written (e.g., '#pragma once')."
-        },
-        "site_path": {
-          "type": "string",
-          "minLength": 1,
-          "description": "Path of the FILE containing this #pragma."
-        },
-        "site_b": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "Begin byte offset of the #pragma line in site_path."
-        },
-        "site_e": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "End byte offset (exclusive) of the #pragma line in site_path."
-        }
-      }
-    },
-    "FileItem": {
-      "type": "object",
-      "required": [
-        "id",
-        "kind",
-        "subkind",
-        "spans"
-      ],
-      "additionalProperties": false,
-      "properties": {
-        "id": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "kind": {
-          "const": "file"
-        },
-        "subkind": {
-          "const": "file"
-        },
-        "path": {
-          "type": "string",
-          "description": "Optional file path this item refers to."
-        },
-        "spans": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/PPSpan"
-          },
-          "description": "A-token spans emitted while the current TU (top-level) was active."
-        },
-        "pp_cover": {
-          "type": "object",
-          "required": [
-            "begin",
-            "end"
-          ],
-          "properties": {
-            "begin": {
-              "type": "integer",
-              "minimum": 0
-            },
-            "end": {
-              "type": "integer",
-              "minimum": 0
-            }
-          },
-          "description": "Minimal [begin,end) A-token interval covering all spans (optional)."
-        }
-      }
-    },
-    "Item": {
-      "oneOf": [
-        {
-          "$ref": "#/$defs/MacroItem"
-        },
-        {
-          "$ref": "#/$defs/DirectiveIncludeItem"
-        },
-        {
-          "$ref": "#/$defs/DirectiveMacroItem"
-        },
-        {
-          "$ref": "#/$defs/DirectivePragmaItem"
-        },
-        {
-          "$ref": "#/$defs/FileItem"
-        }
-      ]
+      "description": "Inherits logic from PPSpan but manually flattened for validator compatibility."
     },
     "TokMapEntry": {
       "type": "object",
       "required": [
         "file",
+        "pp",
         "b",
         "e"
       ],
@@ -773,6 +377,7 @@ static constexpr const char *RefoldSchema = R"json(
       "properties": {
         "file": {
           "type": "string",
+          "minLength": 1,
           "description": "Absolute or canonicalized file path this token range maps to"
         },
         "pp": {
@@ -796,8 +401,8 @@ static constexpr const char *RefoldSchema = R"json(
       "type": "object",
       "required": [
         "id",
-        "file",
         "kind",
+        "file",
         "b",
         "e"
       ],
@@ -807,10 +412,6 @@ static constexpr const char *RefoldSchema = R"json(
           "type": "integer",
           "minimum": 0,
           "description": "Stable slot id"
-        },
-        "file": {
-          "type": "string",
-          "description": "Path of the file whose offsets b/e apply to"
         },
         "kind": {
           "type": "string",
@@ -825,34 +426,35 @@ static constexpr const char *RefoldSchema = R"json(
           ],
           "description": "Semantic insertion anchor"
         },
+        "file": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Path of the file whose offsets b/e apply to"
+        },
         "ref": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": "integer",
+          "minimum": 0,
           "description": "For include/arm slots: include item id or cond-arm id"
-        },
-        "b": {
-          "type": "integer",
-          "minimum": -1,
-          "description": "Start byte offset in 'file'"
-        },
-        "e": {
-          "type": "integer",
-          "minimum": -1,
-          "description": "End byte offset in 'file' (b == e for point slots)"
-        },
-        "owner_include_id": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "description": "If this slot belongs to a specific included-file instance, the include item id that opened it"
         },
         "pp": {
           "type": "integer",
           "minimum": 0,
           "description": "Optional A-token index for stable ordering when b/e are identical"
+        },
+        "b": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Start byte offset in 'file'"
+        },
+        "e": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "End byte offset in 'file' (b == e for point slots)"
+        },
+        "owner_include_id": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "If this slot belongs to a specific included-file instance, the include item id that opened it"
         }
       },
       "allOf": [
@@ -904,24 +506,30 @@ static constexpr const char *RefoldSchema = R"json(
         "id",
         "kind",
         "body_b",
-        "body_e"
+        "body_e",
+        "selected"
       ],
+      "additionalProperties": false,
       "properties": {
         "id": {
           "type": "integer",
+          "minimum": 0,
           "description": "Unique arm id"
         },
         "kind": {
+          "type": "string",
           "enum": [
             "if",
             "ifdef",
             "ifndef",
             "elif",
             "else"
-          ]
+          ],
+          "description": "Arm directive kind (#if/#ifdef/#ifndef/#elif/#else)."
         },
         "cond": {
           "type": "string",
+          "minLength": 1,
           "description": "As written after #if/#elif, or the macro name for ifdef/ifndef (optional)"
         },
         "body_b": {
@@ -942,7 +550,52 @@ static constexpr const char *RefoldSchema = R"json(
           "type": "boolean",
           "description": "True iff this arm contributed tokens in the preprocessed output for this file instance"
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "selected": {
+                "const": true
+              }
+            },
+            "required": [
+              "selected"
+            ]
+          },
+          "then": {
+            "required": [
+              "pp_span"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "pp_span"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "not": {
+                  "const": "else"
+                }
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "cond"
+            ]
+          }
+        }
+      ]
     },
     "Cond": {
       "type": "object",
@@ -953,21 +606,27 @@ static constexpr const char *RefoldSchema = R"json(
         "group_e",
         "arms"
       ],
+      "additionalProperties": false,
       "properties": {
         "id": {
           "type": "integer",
+          "minimum": 0,
           "description": "Unique per map id"
         },
         "file": {
           "type": "string",
+          "minLength": 1,
           "description": "Path of the source file"
         },
         "parent_arm_id": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "description": "Enclosing conditional arm id if nested (null for top-level)"
+          "type": "integer",
+          "minimum": 0,
+          "description": "Enclosing conditional arm id if nested (elided for top-level)."
+        },
+        "parent_include_id": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Include item id that opened this file instance (elided in the main TU)."
         },
         "group_b": {
           "type": "integer",
@@ -979,19 +638,13 @@ static constexpr const char *RefoldSchema = R"json(
           "minimum": 0,
           "description": "Byte AFTER the newline ending the #endif line"
         },
-        "parent_include_id": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "minimum": 0,
-          "description": "Include item id that opened this file instance; null in the main TU"
-        },
         "arms": {
           "type": "array",
+          "minItems": 1,
           "items": {
             "$ref": "#/$defs/Arm"
-          }
+          },
+          "description": "Conditional arms in source order."
         }
       }
     },
@@ -1004,10 +657,10 @@ static constexpr const char *RefoldSchema = R"json(
         "header_span",
         "pp_span"
       ],
+      "additionalProperties": false,
       "properties": {
         "kind": {
           "type": "string",
-          "description": "Coarse decl kind: function, variable, typedef, etc.",
           "enum": [
             "function",
             "variable",
@@ -1016,10 +669,12 @@ static constexpr const char *RefoldSchema = R"json(
             "struct",
             "union",
             "unknown"
-          ]
+          ],
+          "description": "Coarse decl kind: function, variable, typedef, etc."
         },
         "name": {
           "type": "string",
+          "minLength": 1,
           "description": "Primary identifier for this declaration (e.g. function name)."
         },
         "header_span": {
@@ -1030,17 +685,22 @@ static constexpr const char *RefoldSchema = R"json(
             "b",
             "e"
           ],
+          "additionalProperties": false,
           "properties": {
             "file": {
-              "type": "string"
+              "type": "string",
+              "minLength": 1,
+              "description": "Header file path containing this declaration."
             },
             "b": {
               "type": "integer",
-              "minimum": 0
+              "minimum": 0,
+              "description": "Begin byte offset (inclusive) within the header file."
             },
             "e": {
               "type": "integer",
-              "minimum": 0
+              "minimum": 0,
+              "description": "End byte offset (exclusive) within the header file."
             }
           }
         },
@@ -1049,6 +709,417 @@ static constexpr const char *RefoldSchema = R"json(
           "$ref": "#/$defs/PPSpan"
         }
       }
+    },
+    "MacroItem": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "subkind",
+        "name",
+        "spans",
+        "inv_text"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Unique item id."
+        },
+        "kind": {
+          "const": "macro",
+          "description": "Item kind discriminator (always 'macro')."
+        },
+        "subkind": {
+          "type": "string",
+          "enum": [
+            "func",
+            "obj"
+          ],
+          "description": "Macro form: function-like ('func') or object-like ('obj')."
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Macro identifier."
+        },
+        "spans": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/PPSpan"
+          },
+          "description": "Token spans in the preprocessed stream A that together represent this macro's expansion."
+        },
+        "arg_spans": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/PPArgSpan"
+          },
+          "description": "A-token spans within pp_cover that originate from any actual macro arguments."
+        },
+        "stringify_spans": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/PPArgSpan"
+          },
+          "description": "A-token spans within pp_cover that originate from macro-body stringification of an argument (e.g. '#X')."
+        },
+        "paste_spans": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/PPArgSpan"
+          },
+          "description": "A-token spans within pp_cover that originate from macro-body token-paste involving an argument (e.g. 'X##Y'). Multiple spans may overlap when a single pasted token depends on multiple arguments."
+        },
+        "body_spans": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/PPSpan"
+          },
+          "description": "A-token spans within pp_cover that originate from the macro body (non-argument tokens)."
+        },
+        "inv_text": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Exact bytes at the macro call site in the source (e.g., 'FOO(1, 2)')."
+        },
+        "inv_file": {
+          "type": "string",
+          "minLength": 1,
+          "description": "File containing the macro invocation (elided if unknown)."
+        },
+        "inv_b": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Begin byte offset of the invocation within 'inv_file' (elided if unknown)."
+        },
+        "inv_e": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "End byte offset (exclusive) of the invocation within 'inv_file' (elided if unknown)."
+        },
+        "inv_pp_byte_begin": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Byte offset in the preprocessed output (A stream) for the start of the expansion associated with this invocation (elided if unknown/unavailable)."
+        },
+        "inv_pp_byte_end": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Byte offset in the preprocessed output (A stream) for the end (exclusive) of the expansion associated with this invocation (elided if unknown/unavailable)."
+        },
+        "owner_include_id": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Include item id that opened inv_file (when it's an included header instance)"
+        }
+      },
+      "dependentRequired": {
+        "inv_pp_byte_begin": [
+          "inv_pp_byte_end"
+        ],
+        "inv_pp_byte_end": [
+          "inv_pp_byte_begin"
+        ],
+        "inv_b": [
+          "inv_e",
+          "inv_file"
+        ],
+        "inv_e": [
+          "inv_b",
+          "inv_file"
+        ]
+      },
+      "description": "inv_b/inv_e are BYTES in the main source, not token indices."
+    },
+    "DirectiveIncludeItem": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "subkind",
+        "text",
+        "site_path",
+        "target",
+        "angled",
+        "site_b",
+        "site_e",
+        "spans"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Unique item id."
+        },
+        "kind": {
+          "const": "directive",
+          "description": "Item kind discriminator (always 'directive')."
+        },
+        "subkind": {
+          "type": "string",
+          "enum": [
+            "#include",
+            "#include_next"
+          ],
+          "description": "Preprocessor include directive kind."
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Exact directive text as written (e.g., '#include <...>')."
+        },
+        "site_path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "File containing this #include/#include_next directive"
+        },
+        "target": {
+          "type": "string",
+          "minLength": 1,
+          "description": "As-written header string from the directive (e.g., \"e.h\" or <vector>)"
+        },
+        "resolved_path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Filesystem path actually opened for this include as resolved by the preprocessor."
+        },
+        "angled": {
+          "type": "boolean",
+          "description": "True if angle brackets (<...>) were used."
+        },
+        "parent": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Optional item id of a logical parent include."
+        },
+        "site_b": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "Begin byte offset of the include directive within 'site_path'"
+        },
+        "site_e": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "End byte offset (exclusive) of the include directive within 'site_path'"
+        },
+        "spans": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PPSpan"
+          },
+          "description": "Token spans in A corresponding to the expansion of the included file."
+        },
+        "decls": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/HeaderDecl"
+          },
+          "description": "Logical header-level declarations for this include instance, in source order."
+        }
+      },
+      "dependentRequired": {
+        "decls": [
+          "resolved_path"
+        ]
+      }
+    },
+    "DirectiveMacroItem": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "subkind",
+        "text",
+        "spans",
+        "site_path",
+        "site_b",
+        "site_e"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Unique item id."
+        },
+        "kind": {
+          "const": "directive",
+          "description": "Item kind discriminator (always 'directive')."
+        },
+        "subkind": {
+          "type": "string",
+          "enum": [
+            "#define",
+            "#undef"
+          ],
+          "description": "Directive kind (#define or #undef)."
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Exact directive text (e.g., '#define FOO ...')."
+        },
+        "spans": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PPSpan"
+          },
+          "description": "Token spans in A that this directive's expansion contributed to. May be empty."
+        },
+        "site_path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "File containing this #define/#undef directive"
+        },
+        "site_b": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "Begin byte offset of the directive within 'site_path'"
+        },
+        "site_e": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "End byte offset (exclusive) of the directive within 'site_path'"
+        },
+        "owner_include_id": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Include item id that opened this file instance (disambiguates repeated includes)"
+        }
+      },
+      "description": "Represents #define/#undef lines (definitions), not invocation sites."
+    },
+    "DirectivePragmaItem": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "subkind",
+        "text",
+        "site_path",
+        "site_b",
+        "site_e"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Unique item id."
+        },
+        "kind": {
+          "const": "directive",
+          "description": "Item kind discriminator (always 'directive')."
+        },
+        "subkind": {
+          "const": "#pragma",
+          "description": "Directive kind (always '#pragma')."
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Exact directive text as written (e.g., '#pragma once')."
+        },
+        "site_path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Path of the FILE containing this #pragma."
+        },
+        "site_b": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "Begin byte offset of the #pragma line in 'site_path'."
+        },
+        "site_e": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "End byte offset (exclusive) of the #pragma line in 'site_path'."
+        }
+      }
+    },
+    "FileItem": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "subkind",
+        "path",
+        "spans"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Unique item id."
+        },
+        "kind": {
+          "const": "file",
+          "description": "Item kind discriminator (always 'file')."
+        },
+        "subkind": {
+          "const": "file",
+          "description": "Subkind discriminator (always 'file')."
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Optional file path this item refers to."
+        },
+        "spans": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PPSpan"
+          },
+          "description": "A-token spans emitted while the current TU (top-level) was active."
+        }
+      }
+    },
+    "Item": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/MacroItem"
+        },
+        {
+          "$ref": "#/$defs/DirectiveIncludeItem"
+        },
+        {
+          "$ref": "#/$defs/DirectiveMacroItem"
+        },
+        {
+          "$ref": "#/$defs/DirectivePragmaItem"
+        },
+        {
+          "$ref": "#/$defs/FileItem"
+        }
+      ]
     }
   }
 }

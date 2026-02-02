@@ -60,6 +60,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
@@ -68,6 +69,7 @@
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <tuple>
 
 using namespace llvm;
 
@@ -75,11 +77,9 @@ namespace clang {
 namespace refold {
 
 namespace {
-constexpr int kNoOwner = -1;
-
 inline std::string resolveHeaderPath(const RefoldModel::IncludeItem &inc) {
   return (inc.resolvedPath && !inc.resolvedPath->empty())
-             ? *inc.resolvedPath
+             ? inc.resolvedPath->str()
              : stringutils::stripHeaderToken(inc.target).str();
 }
 
@@ -190,8 +190,7 @@ std::string RefoldEngine::Refold() {
   trace("lcs/bSeq", sep);
 
   // 1b) Compute per-gap ownership depth for A's PP tokens.
-  std::vector<unsigned> ownerDepthGap =
-      ComputeOwnerDepthGapsForPP(aTokOff_.size());
+  std::vector<uint32_t> ownerDepthGap = ComputeOwnerDepthGapsForPP();
   trace("lcs/ownerGap", "ownerDepthGap:");
   trace("lcs/ownerGap", "==============");
   logFormattedArray<unsigned>(
@@ -203,19 +202,19 @@ std::string RefoldEngine::Refold() {
   auto a2b = diffutils::lcsMapAB(aSeq, bSeq, ownerDepthGap);
   trace("lcs/a2b", "a2b:");
   trace("lcs/a2b", "====");
-  logFormattedArray<int>(a2b, /* k */ MAX_COLS, /* sameWidth */ true,
+  logFormattedArray<int64_t>(a2b, /* k */ MAX_COLS, /* sameWidth */ true,
                          [](StringRef msg) { trace("lcs/a2b", msg); });
   trace("lcs/a2b", sep);
 
 #if 0
-  auto writeMap = [](StringRef filename, const std::vector<int> &a2b) {
+  auto writeMap = [](StringRef filename, ArrayRef<int64_t> a2b) {
     std::error_code ec;
     raw_fd_ostream os(filename.str(), ec, llvm::sys::fs::OF_Text);
     if (ec) {
       fatal("a2b/write", "open file '{0}' failed: {1}", filename, ec.message());
     }
 
-    for (int v : a2b)
+    for (int64_t v : a2b)
       os << v << '\n';
 
     os.flush();
@@ -231,9 +230,9 @@ std::string RefoldEngine::Refold() {
 #endif
 
   // Sanity check: map must have a strict ordering.
-  int last = -1;
+  int64_t last = -1;
   for (size_t i = 0; i < a2b.size(); ++i) {
-    int j = a2b[i];
+    int64_t j = a2b[i];
     if (j < 0)
       continue;
     if (j < last) {
@@ -243,8 +242,8 @@ std::string RefoldEngine::Refold() {
   }
 
   debug("lcs", "A={0} toks, B={1} toks", aSeq.size(), bSeq.size());
-  int mapped = 0;
-  for (int v : a2b) {
+  size_t mapped = 0;
+  for (int64_t v : a2b) {
     if (v >= 0)
       mapped++;
   }
@@ -256,42 +255,77 @@ std::string RefoldEngine::Refold() {
        model_.GetTokmapByPP().size());
 
   // 3) Diff hunks (changed A-token intervals -> B-token intervals).
-  auto hunks = diffutils::hunksFromMap(a2b, static_cast<int>(aSeq.size()),
-                                       static_cast<int>(bSeq.size()));
+  auto hunks = diffutils::hunksFromMap(a2b, aSeq.size(), bSeq.size());
 
-  // Build *raw-text* byte hunks once; this enables deterministic mapping of PP byte spans
-  // from A->B, without inheriting any ambiguity from token-level alignment.
+  // Build *raw-text* byte hunks once; this enables deterministic mapping of PP
+  // byte spans from A->B, without inheriting any ambiguity from token-level
+  // alignment.
   //
-  // This is critical for "insert-only" edits, where token-only LCS diffing can place the
-  // insertion at an arbitrary stable point, corrupting subsequent A->B byte span mapping.
+  // This is critical for "insert-only" edits, where token-only LCS diffing can
+  // place the insertion at an arbitrary stable point, corrupting subsequent
+  // A->B byte span mapping.
   abByteHunks_ = BuildByteHunksFromRawText();
 
+  // DIAGNOSTICS: Output each hunk, when in debug mode, and also perform some
+  // input sanitization.
   for (size_t i = 0; i < hunks.size(); ++i) {
     const auto &h = hunks[i];
 
-    StringRef bfrag;
-    if (h.bStart < h.bEnd) {
-      const size_t b0 = bTokOff_[static_cast<size_t>(h.bStart)];
-      const size_t b1 = bTokOff_[static_cast<size_t>(h.bEnd)];
-      // Defensive clamping (should already be valid since offsets have
-      // sentinel):
-      const size_t lo = std::max<size_t>(0U, b0);
-      const size_t hi = std::max<size_t>(lo, b1);
-      bfrag = bSource_.substr(lo, hi - lo);
+    // Case A: The hunk is logically empty (e.g., a pure deletion)
+    if (h.bStart >= h.bEnd) {
+      debug("hunks", "#{0} {1:verbose} B=<empty/deleted>", i, h);
+      continue;
     }
 
-    std::string shown = stringutils::showWSWithClip(bfrag.str(), 160);
+    // Case B: Hunk indices are out of bounds for the token-to-byte map
+    if (h.bEnd >= bTokOff_.size()) {
+      fatal("hunks",
+            "#{0} {1:verbose} B=OUT-OF-BOUNDS: h.bEnd={2} map.size={3}", i, h,
+            h.bEnd, bTokOff_.size());
+      continue;
+    }
+
+    const size_t b0 = bTokOff_[static_cast<size_t>(h.bStart)];
+    const size_t b1 = bTokOff_[static_cast<size_t>(h.bEnd)];
+
+    // Case C: The token-to-byte map contains sentinels (virtual/synthetic
+    // tokens)
+    if (b0 == StringRef::npos || b1 == StringRef::npos) {
+      fatal("hunks", "#{0} {1:verbose} B=SENTINEL: b0={2} b1={3}", i, h,
+            (b0 == StringRef::npos ? "npos" : "valid"),
+            (b1 == StringRef::npos ? "npos" : "valid"));
+      continue;
+    }
+
+    // Case D: Byte offsets are inverted (corrupt map or out-of-order tokens)
+    if (b1 < b0) {
+      fatal("hunks", "#{0} {1:verbose} B=INVERTED-OFFSETS: b0={2} b1={3}", i, h,
+            b0, b1);
+      continue;
+    }
+
+    // Final physical safety clamp (prevents crashes if map is stale relative to
+    // source)
+    const size_t lo = std::min(b0, bSource_.size());
+    const size_t hi = std::min(b1, bSource_.size());
+
+    StringRef bfrag = bSource_.substr(lo, hi - lo);
+
+    // Happy Path: Log the successfully extracted fragment
+    std::string shown = stringutils::showWSWithClip(bfrag, 160);
     debug("hunks", "#{0} {1:verbose} B='{2}'", i, h, shown);
   }
 
   // 4) Classify hunks and collect per-target edits.
   std::vector<TextEdit> tuEdits;
-  DenseMap<int, IncludeEdits> perInclude; // includeId -> edits
-  DenseMap<int, std::vector<MacroPatch>> macroPatchesByOwner;
+  DenseMap<uint64_t, IncludeEdits> perInclude; // includeId -> edits
+  DenseMap<std::optional<uint64_t>, std::vector<MacroPatch>>
+      macroPatchesByOwner;
 
   // Merge macro patches by macro-invocation id so multiple arg hunks compose
   // correctly.
-  DenseMap<int, DenseMap<int, MacroPatch>> macroPatchByOwnerByMacroId;
+  DenseMap<std::optional<uint64_t>, DenseMap<uint64_t, MacroPatch>>
+      macroPatchByOwnerByMacroId;
 
   // Iterate over all hunks:
   for (size_t i = 0; i < hunks.size(); ++i) {
@@ -304,30 +338,29 @@ std::string RefoldEngine::Refold() {
     debug("classify", "#{0} shape: isIns={1} isDel={2} isRep={3} {4}", i, isIns,
           isDel, isRep, h);
 
-    // a) Segment-aware owner classification: this decides TU vs include vs “no segment”.
+    // a) Segment-aware owner classification: this decides TU vs include vs “no
+    // segment”.
     debug("classify", "#{0} -> calling classifyOwnerWithSegments {1}", i, h);
     Owner owner = ClassifyOwnerWithSegments(tuPath, h);
-    debug(
-        "classify",
-        "#{0} ownerFromSegments kind={1} includeId={2} condArmId={3} {4}", i,
-        owner.kind, owner.includeId, owner.condArmId, h);
+    debug("classify",
+          "#{0} ownerFromSegments kind={1} includeId={2} condArmId={3} {4}", i,
+          owner.kind, owner.includeId, owner.condArmId, h);
 
     // b) Macro call-site still has priority over TU/include
     if (auto *m = SmallestCoveringPatchableMacro(h.aStart, h.aEnd)) {
-      if (m->GetInvB() != -1 && m->GetInvE() != -1) {
+      if (m->invB && m->invE) {
         debug("classify",
               "#{0} -> MACRO invText={1} owner={2} invFile={3} {4})", i,
               m->invText, m->ownerIncludeId, m->invFile, h);
-        const auto macroOwner = m->ownerIncludeId;
-        auto &byMacroId =
-            macroPatchByOwnerByMacroId[macroOwner ? *macroOwner : kNoOwner];
+        auto &byMacroId = macroPatchByOwnerByMacroId[m->ownerIncludeId];
         auto existingIt = byMacroId.find(m->id);
 
         // If found, use the existing replacement; otherwise, use the original
         // text.
-        std::string currentInvText = (existingIt != byMacroId.end())
-                                         ? existingIt->second.replacement
-                                         : (m->invText ? *m->invText : "");
+        std::string currentInvText =
+            (existingIt != byMacroId.end())
+                ? existingIt->second.replacement
+                : (m->invText ? m->invText->str() : "");
         auto updated = BuildMacroInvocationPatchWholeCover(
             *m, h, a2b, currentInvText, macroPatchByOwnerByMacroId);
         if (updated) {
@@ -356,8 +389,9 @@ std::string RefoldEngine::Refold() {
       }
 
       if (owner.kind == OwnerKind::Include && owner.includeId) {
-        int firstCond = model_.FirstConditionalArmStartA(*owner.includeId);
-        if (h.aStart <= firstCond) {
+        std::optional<uint64_t> firstCond =
+            model_.FirstConditionalArmStartA(*owner.includeId);
+        if (firstCond && h.aStart <= *firstCond) {
           const RefoldModel::IncludeItem *inc =
               model_.GetIncludeById(*owner.includeId);
           // NOTE: `inc` cannot be null if owner has an `includeId`
@@ -413,32 +447,33 @@ std::string RefoldEngine::Refold() {
       owner = Owner::Unknown();
     }
 
-    if (mapsToTU && owner.kind == OwnerKind::Include && owner.includeId) {
-      debug("classify",
+    if (mapsToTU) {
+      if (owner.kind == OwnerKind::Include && owner.includeId) {
+        debug(
+            "classify",
             "#{0} DIAGNOSTIC: tokmap says TU but segments say INCLUDE(id={1}); "
             "will still treat as TU (tokmap wins).",
             i, owner.includeId);
-    }
-
-    if (mapsToTU) {
+      }
       auto span = TUByteSpan(h.aStart, h.aEnd, tuPath); // [b,e)
       debug("classify", "#{0} TU-byteSpan=[{1},{2}) for A[{3},{4})", i,
-            span.first, span.second, h.aStart, h.aEnd);
-      std::string repl;
-      if (span.first >= 0 && h.bStart < h.bEnd) {
-        size_t b0 = bTokOff_[h.bStart], b1 = bTokOff_[h.bEnd];
-        repl.assign(bSource_.data() + b0, bSource_.data() + b1);
-      }
+            span->first, span->second, h.aStart, h.aEnd);
 
-      if (span.first >= 0 && span.second >= 0) {
+      std::string repl;
+      if (span) {
+        if (h.bStart < h.bEnd) {
+          size_t b0 = bTokOff_[h.bStart], b1 = bTokOff_[h.bEnd];
+          repl.assign(bSource_.data() + b0, bSource_.data() + b1);
+        }
+
         // Is this span replacing a TU "gap" (bytes that are all whitespace)?
         std::string original;
-        if (span.second > span.first) {
-          original.assign(tuBytes.data() + span.first,
-                          tuBytes.data() + span.second);
-        } else if (span.second < span.first) {
-          fatal("tu/span", "invalid TU byte span: [{0},{1})", span.first,
-                span.second);
+        if (span->second > span->first) {
+          original.assign(tuBytes.data() + span->first,
+                          tuBytes.data() + span->second);
+        } else if (span->second < span->first) {
+          fatal("tu/span", "invalid TU byte span: [{0},{1})", span->first,
+                span->second);
         }
 
         bool replacingGap =
@@ -456,24 +491,24 @@ std::string RefoldEngine::Refold() {
         // - always allowRight (covers cases like “…0” + “: 1” at zero-width
         //   sites)
         std::string padded =
-            PadAtBoundaries(tuBytes, static_cast<size_t>(span.first),
-                            static_cast<size_t>(span.second), std::move(repl),
+            PadAtBoundaries(tuBytes, static_cast<size_t>(span->first),
+                            static_cast<size_t>(span->second), std::move(repl),
                             /*allowLeft*/ !replacingGap,
                             /*allowRight*/ true);
 
         debug("classify",
               "#{0} -> TU  bytes=[{1},{2}) rawRepl='{3}' paddedRepl='{4}'", i,
-              span.first, span.second, stringutils::showWSWithClip(repl, 160),
+              span->first, span->second, stringutils::showWSWithClip(repl, 160),
               stringutils::showWSWithClip(padded, 160));
 
-        ResyncOutcome ro =
-            ApplyResyncOrPend(tuBytes, span.first, span.second, padded, tuPath);
-        tuEdits.push_back(TextEdit{span.first, span.second, std::move(ro.text),
-                                   std::move(ro.pending)});
+        ResyncOutcome ro = ApplyResyncOrPend(tuBytes, span->first, span->second,
+                                             padded, tuPath);
+        tuEdits.push_back(TextEdit{span->first, span->second,
+                                   std::move(ro.text), std::move(ro.pending)});
         continue;
       } else {
         debug("classify",
-              "#{0} TU mapping had span.first < 0; TU edit skipped (behavior "
+              "#{0} TU mapping had nullopt for span; TU edit skipped (behavior "
               "unchanged).",
               i);
       }
@@ -497,14 +532,13 @@ std::string RefoldEngine::Refold() {
           "attempt (no include realization).",
           i);
 
-    auto span = TUByteSpan(h.aStart, h.aEnd, tuPath); // [b, e)
-    if (span.first >= 0 && span.second >= 0) {
+    if (auto span = TUByteSpan(h.aStart, h.aEnd, tuPath)) { // [b, e)
       std::string repl;
       if (isDel) {
         repl = "";
       } else {
-        const int b0 = bTokOff_[h.bStart];
-        const int b1 = bTokOff_[h.bEnd];
+        const size_t b0 = bTokOff_[static_cast<size_t>(h.bStart)];
+        const size_t b1 = bTokOff_[static_cast<size_t>(h.bEnd)];
         repl.assign(bSource_.data() + b0, bSource_.data() + b1);
       }
 
@@ -512,17 +546,17 @@ std::string RefoldEngine::Refold() {
       // preserve the existing TU gap whitespace rather than introducing new
       // whitespace from B.
       bool replacingGap = false;
-      if (span.first < span.second) {
-        std::string original(tuBytes.data() + span.first,
-                             tuBytes.data() + span.second);
+      if (span->first < span->second) {
+        std::string original(tuBytes.data() + span->first,
+                             tuBytes.data() + span->second);
         replacingGap = !original.empty() && stringutils::isWhitespace(original);
         if (replacingGap) {
           // Preserve exactly the gap as the replacement.
           repl = std::move(original);
         }
-      } else if (span.second < span.first) {
-        fatal("tu/span", "invalid TU byte span: [{0},{1})", span.first,
-              span.second);
+      } else if (span->second < span->first) {
+        fatal("tu/span", "invalid TU byte span: [{0},{1})", span->first,
+              span->second);
       }
 
       // If we're replacing a non-empty TU gap and the inserted text doesn't
@@ -535,21 +569,21 @@ std::string RefoldEngine::Refold() {
       std::string rawRepl = repl;
 
       std::string padded =
-          PadAtBoundaries(tuBytes, static_cast<size_t>(span.first),
-                          static_cast<size_t>(span.second), std::move(repl),
+          PadAtBoundaries(tuBytes, static_cast<size_t>(span->first),
+                          static_cast<size_t>(span->second), std::move(repl),
                           /*allowLeft*/ !replacingGap,
                           /*allowRight*/ true);
 
       debug("classify",
             "#{0} -> TU (conservative) bytes=[{1},{2}) rawRepl='{3}' "
             "paddedRepl='{4}'",
-            i, span.first, span.second,
+            i, span->first, span->second,
             stringutils::showWSWithClip(rawRepl, 160),
             stringutils::showWSWithClip(padded, 160));
 
       ResyncOutcome ro =
-          ApplyResyncOrPend(tuBytes, span.first, span.second, padded, tuPath);
-      tuEdits.push_back(TextEdit{span.first, span.second, std::move(ro.text),
+          ApplyResyncOrPend(tuBytes, span->first, span->second, padded, tuPath);
+      tuEdits.push_back(TextEdit{span->first, span->second, std::move(ro.text),
                                  std::move(ro.pending)});
       continue;
     }
@@ -577,7 +611,7 @@ std::string RefoldEngine::Refold() {
 
   // 5) Materialize include expansions bottom-up (nested first). Build child
   // lists by parent include id.
-  DenseMap<int, std::vector<const RefoldModel::IncludeItem *>> children;
+  DenseMap<uint64_t, std::vector<const RefoldModel::IncludeItem *>> children;
   for (const auto &ii : model_.GetIncludes()) {
     if (ii.parent)
       children[*ii.parent].push_back(&ii);
@@ -598,10 +632,10 @@ std::string RefoldEngine::Refold() {
   trace("include/tree", "END include children");
 
   // Cache for realized expansion text per include id.
-  DenseMap<int, std::string> includeExpansion;
+  DenseMap<uint64_t, std::string> includeExpansion;
 
   // Build the set of include-ids that must be realized.
-  DenseSet<int> seeds;
+  DenseSet<uint64_t> seeds;
 
   // (a) Direct include edits.
   auto perIncludeKeys = make_first_range(perInclude);
@@ -609,12 +643,13 @@ std::string RefoldEngine::Refold() {
 
   // (b) Macro-owned work INSIDE headers (ownerIncludeId != null).
   for (auto &kv : macroPatchesByOwner) {
-    if (kv.first != kNoOwner)
-      seeds.insert(kv.first);
+    if (kv.first)
+      seeds.insert(*kv.first);
   }
 
   // (c) Pull in all ancestors up to the TU.
-  for (int id : std::vector<int>(seeds.begin(), seeds.end())) {
+  // TODO: is there a more efficient way to do this?
+  for (uint64_t id : std::vector<uint64_t>(seeds.begin(), seeds.end())) {
     const auto *cur = model_.GetIncludeById(id);
     while (cur && cur->parent) {
       seeds.insert(*cur->parent);
@@ -622,25 +657,25 @@ std::string RefoldEngine::Refold() {
     }
   }
 
-  std::vector<int> seedsVec(seeds.begin(), seeds.end());
+  std::vector<uint64_t> seedsVec(seeds.begin(), seeds.end());
   trace("include/mat", "seeds:");
   trace("include/mat", "======");
-  logFormattedArray<int>(seedsVec, /* k */ MAX_COLS,
-                         /* sameWidth */ false,
-                         [](StringRef msg) { trace("include/mat", msg); });
+  logFormattedArray<uint64_t>(seedsVec, /* k */ MAX_COLS,
+                              /* sameWidth */ false,
+                              [](StringRef msg) { trace("include/mat", msg); });
   trace("include/mat", sep);
 
   // (d) Realize each include once (memoization lives inside
   // MaterializeIncludeExpansion).
-  for (int incId : seeds) {
+  for (uint64_t incId : seeds) {
     debug("include/mat", "materialize seed include #{0}", incId);
     MaterializeIncludeExpansion(incId, perInclude, macroPatchesByOwner,
                                 children, includeExpansion);
   }
 
-  // 6a) TU macro patches (ownerIncludeId == kNoOwner) and include expansions
-  // at TU sites.
-  if (auto it = macroPatchesByOwner.find(kNoOwner);
+  // 6a) TU macro patches (ownerIncludeId == std::nullopt) and include
+  // expansions at TU sites.
+  if (auto it = macroPatchesByOwner.find(std::nullopt);
       it != macroPatchesByOwner.end() && !it->second.empty()) {
     // Create a local copy to sort
     auto tuMacroPatches = it->second;
@@ -656,20 +691,6 @@ std::string RefoldEngine::Refold() {
 
     SmallVector<MacroPatch, 16> accepted;
     for (const auto &mp : tuMacroPatches) {
-      // If the spans are exactly equal, require that the replacement be
-      // identical as well (otherwise we'd be choosing one arbitrarily,
-      // violating determinism).
-      /*
-       * TODO: Should we keep this, or should this be possible (i.e. should we
-       * warn and continue instead)??
-       */
-      if (mp.invStart < 0 || mp.invEnd < 0) {
-        fatal("macro/tu",
-              "TU macro patch has either a negative invocation start or end "
-              "(invStart={0} invEnd={1})",
-              mp.invStart, mp.invEnd);
-      }
-
       bool isShadowed = false;
       for (const auto &acc : accepted) {
         // If this patch is contained within one we already accepted, skip it.
@@ -682,8 +703,9 @@ std::string RefoldEngine::Refold() {
         // either disjoint or nested). If they do, fail fast rather than
         // producing order-dependent behavior.
         if (mp.invStart < acc.invEnd && acc.invStart < mp.invEnd) {
-          fatal("macro/tu", "overlapping TU macro patches: mp=[{0},{1}) acc=[{2},{3})",
-              mp.invStart, mp.invEnd, acc.invStart, acc.invEnd);
+          fatal("macro/tu",
+                "overlapping TU macro patches: mp=[{0},{1}) acc=[{2},{3})",
+                mp.invStart, mp.invEnd, acc.invStart, acc.invEnd);
         }
       }
 
@@ -745,17 +767,16 @@ std::vector<StringRef> RefoldEngine::MapLexemes(ArrayRef<PPTok> toks,
   return out;
 }
 
-std::vector<unsigned>
-RefoldEngine::ComputeOwnerDepthGapsForPP(size_t numOfAOffs) {
+std::vector<uint32_t> RefoldEngine::ComputeOwnerDepthGapsForPP() {
   // aTokOff.size() == (#tokens) + 1 (sentinel). LCS expects N == #tokens,
   // and ownerDepthGap.size() == N + 1.
-  const size_t N = numOfAOffs - 1;
-  std::vector<unsigned> ownerDepthGap(N + 1, 0);
+  const size_t N = aTokOff_.size() - 1;
+  std::vector<uint32_t> ownerDepthGap(N + 1, 0);
 
   for (size_t k = 0; k <= N; ++k) {
     // --------------------------- Include depth ----------------------------
-    std::optional<int> leftInc;
-    std::optional<int> rightInc;
+    std::optional<uint64_t> leftInc;
+    std::optional<uint64_t> rightInc;
 
     if (k > 0) {
       leftInc = model_.InnermostIncludeAtPP(k - 1);
@@ -764,9 +785,9 @@ RefoldEngine::ComputeOwnerDepthGapsForPP(size_t numOfAOffs) {
       rightInc = model_.InnermostIncludeAtPP(k);
     }
 
-    std::optional<int> lca =
+    std::optional<uint64_t> lca =
         model_.LeastCommonAncestorInclude(leftInc, rightInc);
-    unsigned incDepth = model_.GetIncludeDepth(lca);
+    uint32_t incDepth = model_.GetIncludeDepth(lca);
 
     // ------------------------- Conditional depth --------------------------
     std::optional<RefoldModel::ArmRef> leftArmRef;
@@ -779,11 +800,11 @@ RefoldEngine::ComputeOwnerDepthGapsForPP(size_t numOfAOffs) {
       rightArmRef = model_.FindArmRefAtPP(k);
     }
 
-    unsigned leftCondDepth =
+    uint32_t leftCondDepth =
         leftArmRef ? model_.GetCondArmDepth(leftArmRef->arm->id) : 0;
-    unsigned rightCondDepth =
+    uint32_t rightCondDepth =
         rightArmRef ? model_.GetCondArmDepth(rightArmRef->arm->id) : 0;
-    unsigned condDepth = std::min(leftCondDepth, rightCondDepth);
+    uint32_t condDepth = std::min(leftCondDepth, rightCondDepth);
 
     ownerDepthGap[k] = incDepth + condDepth;
   }
@@ -819,16 +840,20 @@ std::string RefoldEngine::PadAtBoundaries(StringRef base, size_t start,
     return text;
 
   // Character in base immediately to the left/right of the replacement range
-  const char leftC = (start > 0 && start <= base.size()) ? base[start - 1] : '\0';
-  const char rightC = (end < base.size()) ? base[end] : '\0';
+  const char leftC =
+      (start > 0 && start <= base.size()) ? base[start - 1] : '\0';
+  const char rightC = end < base.size() ? base[end] : '\0';
 
   // Check for existing whitespace at the edges of the provided text
   const bool hasLeadingWS = (*f > 0);
   const bool hasTrailingWS = (*l + 1 < text.size());
 
-  // Determine if padding is needed BEFORE modifying the string to avoid index drift
-  bool addLeftSpace = allowLeft && !hasLeadingWS && BoundaryGlues(leftC, text[*f]);
-  bool addRightSpace = allowRight && !hasTrailingWS && BoundaryGlues(text[*l], rightC);
+  // Determine if padding is needed BEFORE modifying the string to avoid index
+  // drift
+  bool addLeftSpace =
+      allowLeft && !hasLeadingWS && BoundaryGlues(leftC, text[*f]);
+  bool addRightSpace =
+      allowRight && !hasTrailingWS && BoundaryGlues(text[*l], rightC);
 
   if (addLeftSpace)
     text.insert(0, 1, ' ');
@@ -844,8 +869,8 @@ std::string RefoldEngine::PadAtBoundaries(StringRef base, size_t start,
 RefoldEngine::Owner
 RefoldEngine::ClassifyOwnerWithSegments(StringRef tuPath,
                                         const diffutils::Hunk &h) {
-  int a0 = h.aStart;
-  int a1 = h.aEnd;
+  uint64_t a0 = h.aStart;
+  uint64_t a1 = h.aEnd;
 
   debug("segments",
         "ENTER classifyOwnerWithSegments tuPath={0} A[{1},{2}) (isEmpty={3})",
@@ -863,12 +888,12 @@ RefoldEngine::ClassifyOwnerWithSegments(StringRef tuPath,
   // include's PP coverage, treat the insertion as include-owned.
   if (a0 == a1) {
     if (auto slotAnchor = AnchorToNearestSlotBoundaryFromPPGap(tuPath, a0)) {
-      std::optional<int> leftInc =
+      std::optional<uint64_t> leftInc =
           (a0 > 0) ? model_.InnermostIncludeAtPP(a0 - 1) : std::nullopt;
-      const size_t maxPP = model_.GetTokensCountA();
-      std::optional<int> rightInc = (a0 >= 0 && static_cast<size_t>(a0) < maxPP)
-                                        ? model_.InnermostIncludeAtPP(a0)
-                                        : std::nullopt;
+      const uint64_t maxPP = model_.GetTokensCountA();
+      std::optional<uint64_t> rightInc = (a0 >= 0 && a0 < maxPP)
+                                             ? model_.InnermostIncludeAtPP(a0)
+                                             : std::nullopt;
 
       if (leftInc && rightInc && *leftInc == *rightInc) {
         trace("segments",
@@ -888,12 +913,12 @@ RefoldEngine::ClassifyOwnerWithSegments(StringRef tuPath,
 
   // If there is no truthful TU anchor (no TU tokens in the range, and the
   // insertion cannot be safely anchored in TU), classify purely in PP space.
-  if (span.first < 0 || span.second < 0) {
+  if (!span) {
     const bool isInsert = (a0 == a1);
     const size_t n = tokmapByPP.size();
 
-    std::optional<int> leftInc;
-    std::optional<int> rightInc;
+    std::optional<uint64_t> leftInc;
+    std::optional<uint64_t> rightInc;
 
     std::optional<RefoldModel::ArmRef> leftArmRef;
     std::optional<RefoldModel::ArmRef> rightArmRef;
@@ -914,10 +939,10 @@ RefoldEngine::ClassifyOwnerWithSegments(StringRef tuPath,
       rightArmRef = model_.FindArmRefAtPP(a1 - 1);
     }
 
-    std::optional<int> lcaInc =
+    std::optional<uint64_t> lcaInc =
         model_.LeastCommonAncestorInclude(leftInc, rightInc);
 
-    std::optional<int> condArmId;
+    std::optional<uint64_t> condArmId;
     if (leftArmRef && rightArmRef && leftArmRef->arm && rightArmRef->arm &&
         leftArmRef->arm->id == rightArmRef->arm->id) {
       condArmId = leftArmRef->arm->id;
@@ -939,7 +964,7 @@ RefoldEngine::ClassifyOwnerWithSegments(StringRef tuPath,
     return Owner::TU(condArmId);
   }
 
-  int b = span.first, e = span.second;
+  uint64_t b = span->first, e = span->second;
   if (b > e)
     std::swap(b, e);
 
@@ -960,9 +985,9 @@ RefoldEngine::ClassifyOwnerWithSegments(StringRef tuPath,
   // point and include segments that contain the probe, with a right-closed
   // convention to enable parent selection at boundaries.
   const bool isInsert = (a0 == a1);
-  const int probe = b;
+  const uint64_t probe = b;
 
-  std::vector<const RefoldModel::Segment*> hits;
+  std::vector<const RefoldModel::Segment *> hits;
   for (const auto &s : segs) {
     if (!isInsert) {
       if (s.e <= b || e <= s.b)
@@ -986,8 +1011,8 @@ RefoldEngine::ClassifyOwnerWithSegments(StringRef tuPath,
   const RefoldModel::Segment *selected = hits[0];
   for (size_t i = 1; i < hits.size(); ++i) {
     const auto *s = hits[i];
-    int sLen = s->e - s->b;
-    int selLen = selected->e - selected->b;
+    uint64_t sLen = s->e - s->b;
+    uint64_t selLen = selected->e - selected->b;
 
     if (sLen < selLen) {
       selected = s;
@@ -1018,7 +1043,7 @@ RefoldEngine::ClassifyOwnerWithSegments(StringRef tuPath,
 
 bool RefoldEngine::IsInvocationInsideDefineDirective(
     const RefoldModel::MacroInvocation &m) const {
-  if (!m.invFile || m.GetInvB() < 0 || m.GetInvE() < 0)
+  if (!m.invFile || !m.invB || !m.invE)
     return false;
 
   // RefoldModel exposes directives; MacroDirective.subkind is expected to be
@@ -1028,12 +1053,12 @@ bool RefoldEngine::IsInvocationInsideDefineDirective(
       continue;
     if (d.sitePath.empty())
       continue;
-    if (!m.invFile || *m.invFile != d.sitePath)
+    if (!m.invFile || !PathsEqual(*m.invFile, d.sitePath))
       continue;
 
     // If the invocation byte range lies within the #define's site range, treat
     // it as non-patchable.
-    if (m.GetInvB() >= d.siteB && m.GetInvE() <= d.siteE)
+    if (*m.invB >= d.siteB && *m.invE <= d.siteE)
       return true;
   }
 
@@ -1041,9 +1066,10 @@ bool RefoldEngine::IsInvocationInsideDefineDirective(
 }
 
 const RefoldModel::MacroInvocation *
-RefoldEngine::SmallestCoveringPatchableMacro(int aStart, int aEnd) const {
+RefoldEngine::SmallestCoveringPatchableMacro(uint64_t aStart,
+                                             uint64_t aEnd) const {
   const RefoldModel::MacroInvocation *best = nullptr;
-  int bestLen = std::numeric_limits<int>::max();
+  uint64_t bestLen = std::numeric_limits<uint64_t>::max();
 
   for (const auto &m : model_.GetMacroInvocations()) {
     // Check if this macro covers the token range [aStart, aEnd)
@@ -1051,7 +1077,7 @@ RefoldEngine::SmallestCoveringPatchableMacro(int aStart, int aEnd) const {
       continue;
 
     // Must be patchable at a real call site.
-    if (m.GetInvB() < 0 || m.GetInvE() < 0 || !m.invText)
+    if (!m.invB || !m.invE || !m.invText)
       continue;
 
     // CRITICAL: never patch invocations that are spelled inside a #define
@@ -1060,7 +1086,7 @@ RefoldEngine::SmallestCoveringPatchableMacro(int aStart, int aEnd) const {
       continue;
 
     // Deterministic selection: smallest cover wins, ties broken by ID.
-    int len = m.cover.end - m.cover.begin;
+    uint64_t len = m.cover.end - m.cover.begin;
     if (!best || len < bestLen || (len == bestLen && m.id < best->id)) {
       best = &m;
       bestLen = len;
@@ -1070,12 +1096,13 @@ RefoldEngine::SmallestCoveringPatchableMacro(int aStart, int aEnd) const {
   return best;
 }
 
-bool RefoldEngine::HunkMapsToTU(int a0, int a1, StringRef tuPath) const {
+bool RefoldEngine::HunkMapsToTU(uint64_t a0, uint64_t a1,
+                                StringRef tuPath) const {
   trace("tu/own", "hunkMapsToTU: check ownership for A[{0},{1}) tu={2}", a0, a1,
         tuPath);
   bool sawAnyTU = false;
   const auto &tokmapByPP = model_.GetTokmapByPP();
-  for (int pp = a0; pp < a1; ++pp) {
+  for (uint64_t pp = a0; pp < a1; ++pp) {
     auto it = tokmapByPP.find(pp);
     if (it == tokmapByPP.end())
       continue; // ignore unmapped (spaces/tabs/newlines)
@@ -1105,7 +1132,7 @@ bool RefoldEngine::HunkMapsToTU(int a0, int a1, StringRef tuPath) const {
   // INSERTION (A gap): determine TU ownership without "nearest-neighbor
   // snapping". In strict mode, consult only immediate neighbors (pp-1, pp). If
   // the PP gap is covered by an include expansion, treat it as header-owned.
-  int pp = a0;
+  uint64_t pp = a0;
 
   if (auto slotAnchor = AnchorToNearestSlotBoundaryFromPPGap(tuPath, pp)) {
     trace("hunk",
@@ -1120,16 +1147,16 @@ bool RefoldEngine::HunkMapsToTU(int a0, int a1, StringRef tuPath) const {
       return false;
     }
 
-    if (pp >= 0 && static_cast<size_t>(pp) < tokmapByPP.size()) {
+    if (pp < tokmapByPP.size()) {
       auto rightIt = tokmapByPP.find(pp);
-      if (rightIt != tokmapByPP.end() && !rightIt->second.file.empty()) {
+      if (rightIt != tokmapByPP.end()) {
         return PathsEqual(tuPath, rightIt->second.file);
       }
     }
 
-    if (pp > 0 && static_cast<size_t>(pp - 1) < tokmapByPP.size()) {
+    if (pp > 0 && pp - 1 < tokmapByPP.size()) {
       auto leftIt = tokmapByPP.find(pp - 1);
-      if (leftIt != tokmapByPP.end() && !leftIt->second.file.empty()) {
+      if (leftIt != tokmapByPP.end()) {
         return PathsEqual(tuPath, leftIt->second.file);
       }
     }
@@ -1142,7 +1169,7 @@ bool RefoldEngine::HunkMapsToTU(int a0, int a1, StringRef tuPath) const {
   // Non-strict: preserve prior best-effort behavior by snapping to the nearest
   // mapped token on either side of the PP gap.
   const RefoldModel::TokMapEntry *left = nullptr;
-  for (int ppL = pp - 1; ppL >= 0; --ppL) {
+  for (uint64_t ppL = pp; ppL-- > 0;) {
     auto it = tokmapByPP.find(ppL);
     if (it != tokmapByPP.end()) {
       left = &it->second;
@@ -1152,7 +1179,7 @@ bool RefoldEngine::HunkMapsToTU(int a0, int a1, StringRef tuPath) const {
 
   const RefoldModel::TokMapEntry *right = nullptr;
   const size_t maxPP = model_.GetTokensCountA();
-  for (int ppR = pp; ppR >= 0 && static_cast<size_t>(ppR) < maxPP; ++ppR) {
+  for (uint64_t ppR = pp; ppR < maxPP; ++ppR) {
     auto it = tokmapByPP.find(ppR);
     if (it != tokmapByPP.end()) {
       right = &it->second;
@@ -1160,17 +1187,14 @@ bool RefoldEngine::HunkMapsToTU(int a0, int a1, StringRef tuPath) const {
     }
   }
 
-  if (left && !left->file.empty() && PathsEqual(tuPath, left->file)) {
-    return true;
-  }
-  if (right && !right->file.empty() && PathsEqual(tuPath, right->file)) {
-    return true;
-  }
-
-  if (left && !left->file.empty()) {
+  if (left) {
+    if (PathsEqual(tuPath, left->file))
+      return true;
     return false;
   }
-  if (right && !right->file.empty()) {
+  if (right) {
+    if (PathsEqual(tuPath, right->file))
+      return true;
     return false;
   }
 
@@ -1178,16 +1202,16 @@ bool RefoldEngine::HunkMapsToTU(int a0, int a1, StringRef tuPath) const {
   return true;
 }
 
-std::optional<int>
+std::optional<uint64_t>
 RefoldEngine::AnchorToNearestSlotBoundaryFromPPGap(StringRef tuPath,
-                                                   int ppGap) const {
+                                                   uint64_t ppGap) const {
   // Candidate record for potential anchor points
   struct Cand {
-    int pp; // PP coordinate for the boundary
-    int b;  // TU byte coordinate (possibly adjusted)
+    uint64_t pp; // PP coordinate for the boundary
+    uint64_t b;  // TU byte coordinate (possibly adjusted)
     const RefoldModel::Slot *slot;
 
-    Cand(int pp, int b, const RefoldModel::Slot *slot)
+    Cand(uint64_t pp, uint64_t b, const RefoldModel::Slot *slot)
         : pp(pp), b(b), slot(slot) {}
   };
 
@@ -1200,8 +1224,8 @@ RefoldEngine::AnchorToNearestSlotBoundaryFromPPGap(StringRef tuPath,
   StringRef tuText = bufOrErr.get()->getBuffer();
 
   // Helper to adjust slots that terminate on directive newlines
-  auto adjustSlot = [&tuText](const RefoldModel::Slot *s) -> int {
-    int b = s->b;
+  auto adjustSlot = [&tuText](const RefoldModel::Slot *s) -> uint64_t {
+    uint64_t b = s->b;
 
     bool needsAdjustment =
         StringSwitch<bool>(s->kind)
@@ -1210,7 +1234,7 @@ RefoldEngine::AnchorToNearestSlotBoundaryFromPPGap(StringRef tuPath,
     if (needsAdjustment)
       return b;
 
-    if (b < 0 || (size_t)b >= tuText.size())
+    if (b >= tuText.size())
       return b;
 
     char c = tuText[b];
@@ -1227,8 +1251,8 @@ RefoldEngine::AnchorToNearestSlotBoundaryFromPPGap(StringRef tuPath,
   std::vector<Cand> cands;
 
   // 1) Explicit TU slots that already carry 'pp'
-  for (const auto &s : model_.FindSlots(tuPath.str(), std::nullopt,
-                                        std::nullopt, std::nullopt)) {
+  for (const auto &s :
+       model_.FindSlots(tuPath, std::nullopt, std::nullopt, std::nullopt)) {
     if (!s->pp)
       continue;
 
@@ -1244,41 +1268,37 @@ RefoldEngine::AnchorToNearestSlotBoundaryFromPPGap(StringRef tuPath,
 
   // 2) Include directive boundaries
   for (const auto &inc : model_.GetIncludes()) {
-    if (tuPath != inc.sitePath)
+    if (!PathsEqual(tuPath, inc.sitePath))
       continue;
 
-    int incBeginPP = MinPPBegin(inc.spans);
-    int incEndPP = MaxPPEnd(inc.spans);
+    auto incBeginPP = MinPPBegin(inc.spans);
+    auto incEndPP = MaxPPEnd(inc.spans);
 
-    if (incBeginPP >= 0) {
+    if (incBeginPP) {
       if (auto s = model_.GetBeforeIncludeSlot(inc.id))
-        cands.emplace_back(incBeginPP, adjustSlot(*s), *s);
+        cands.emplace_back(*incBeginPP, adjustSlot(*s), *s);
     }
-    if (incEndPP >= 0) {
+    if (incEndPP) {
       if (auto s = model_.GetAfterIncludeSlot(inc.id))
-        cands.emplace_back(incEndPP, adjustSlot(*s), *s);
+        cands.emplace_back(*incEndPP, adjustSlot(*s), *s);
     }
   }
 
   // 3) Conditional arm boundaries
   for (const auto &g : model_.GetConds()) {
-    if (tuPath != g.file)
+    if (!PathsEqual(tuPath, g.file))
       continue;
     for (const auto &a : g.arms) {
-      if (!a.ppSpan.has_value())
+      if (!a.span.has_value())
         continue;
 
-      int armBeginPP = a.ppSpan->begin;
-      int armEndPP = a.ppSpan->end;
+      uint64_t armBeginPP = a.span->begin;
+      uint64_t armEndPP = a.span->end;
 
-      if (armBeginPP >= 0) {
-        if (auto s = model_.GetArmBeginSlot(a.id))
-          cands.emplace_back(armBeginPP, adjustSlot(*s), *s);
-      }
-      if (armEndPP >= 0) {
-        if (auto s = model_.GetArmEndSlot(a.id))
-          cands.emplace_back(armEndPP, adjustSlot(*s), *s);
-      }
+      if (auto s = model_.GetArmBeginSlot(a.id))
+        cands.emplace_back(armBeginPP, adjustSlot(*s), *s);
+      if (auto s = model_.GetArmEndSlot(a.id))
+        cands.emplace_back(armEndPP, adjustSlot(*s), *s);
     }
   }
 
@@ -1296,7 +1316,7 @@ RefoldEngine::AnchorToNearestSlotBoundaryFromPPGap(StringRef tuPath,
     return std::nullopt;
 
   // Priority tie-breaking logic
-  auto getPriority = [](StringRef kind) -> int {
+  auto getPriority = [](StringRef kind) -> unsigned {
     if (kind == "before_include")
       return 0;
     if (kind == "after_include")
@@ -1320,21 +1340,21 @@ RefoldEngine::AnchorToNearestSlotBoundaryFromPPGap(StringRef tuPath,
       best = c;
       continue;
     }
-    int pc = getPriority(c->slot->kind);
-    int pb = getPriority(best->slot->kind);
+    unsigned pc = getPriority(c->slot->kind);
+    unsigned pb = getPriority(best->slot->kind);
 
     // Tie-break: Priority -> Byte Offset -> Slot ID
-    if (pc < pb || (pc == pb && c->b < best->b) ||
-        (pc == pb && c->b == best->b && c->slot->id < best->slot->id)) {
+    if (std::tie(pc, c->b, c->slot->id) <
+        std::tie(pb, best->b, best->slot->id)) {
       best = c;
     }
   }
 
-  return best ? std::optional<int>(best->b) : std::nullopt;
+  return best ? std::optional<uint64_t>(best->b) : std::nullopt;
 }
 
-std::pair<int, int>
-RefoldEngine::TUByteSpan(int a0, int a1, StringRef tuPath) const {
+std::optional<std::pair<uint64_t, uint64_t>>
+RefoldEngine::TUByteSpan(uint64_t a0, uint64_t a1, StringRef tuPath) const {
   if (a0 > a1)
     std::swap(a0, a1);
 
@@ -1344,35 +1364,34 @@ RefoldEngine::TUByteSpan(int a0, int a1, StringRef tuPath) const {
   // For pure insertions, first prefer an explicit slot boundary (file_begin,
   // before_include, after_include, arm_begin, arm_end, file_end, ...).
   if (isEmpty) {
-    if (std::optional<int> slotAnchor =
-            AnchorToNearestSlotBoundaryFromPPGap(tuPath, a0)) {
-      return {*slotAnchor, *slotAnchor};
+    if (auto slotAnchor = AnchorToNearestSlotBoundaryFromPPGap(tuPath, a0)) {
+      return {{*slotAnchor, *slotAnchor}};
     }
   }
 
   // Non-empty: compute min/max over TU-mapped subset only.
-  int minB = std::numeric_limits<int>::max();
-  int maxE = std::numeric_limits<int>::min();
+  uint64_t minB = std::numeric_limits<uint64_t>::max();
+  uint64_t maxE = 0;
   bool foundTuToken = false;
 
-  for (int i = a0; i < a1; ++i) {
+  for (uint64_t i = a0; i < a1; ++i) {
     auto it = tokmapByPP.find(i);
     if (it == tokmapByPP.end())
       continue;
 
     const auto &ent = it->second;
-    if (ent.file.empty() || ent.file != tuPath)
-      continue;
-    if (ent.b < 0 || ent.e < 0)
+    if (!PathsEqual(ent.file, tuPath))
       continue;
 
-    if (ent.b < minB) minB = ent.b;
-    if (ent.e > maxE) maxE = ent.e;
+    if (ent.b < minB)
+      minB = ent.b;
+    if (ent.e > maxE)
+      maxE = ent.e;
     foundTuToken = true;
   }
 
   if (foundTuToken) {
-    return {minB, maxE};
+    return {{minB, maxE}};
   }
 
   // Empty insertion with no slot anchor: only anchor to a TU neighbor token
@@ -1383,21 +1402,20 @@ RefoldEngine::TUByteSpan(int a0, int a1, StringRef tuPath) const {
     // INSERTION (A gap): in strict mode, do not "snap" to distant mapped
     // tokens. Consult only immediate neighbors (pp-1, pp). If the PP gap is
     // covered by an include expansion, treat it as header-owned (no TU span).
-    int pp = a0;
+    uint64_t pp = a0;
 
     const auto &tokmapByPP = model_.GetTokmapByPP();
     if (strict_) {
       if (IncludeIdCoveringPPIndex(pp)) {
-        return {-1, -1};
+        return std::nullopt;
       }
 
-      if (pp >= 0 && static_cast<size_t>(pp) < tokmapByPP.size()) {
+      if (static_cast<size_t>(pp) < tokmapByPP.size()) {
         auto rightIt = tokmapByPP.find(pp);
         if (rightIt != tokmapByPP.end()) {
           const auto &right = rightIt->second;
-          if (!right.file.empty() && PathsEqual(tuPath, right.file) &&
-              right.b >= 0) {
-            return {right.b, right.b};
+          if (PathsEqual(tuPath, right.file)) {
+            return {{right.b, right.b}};
           }
         }
       }
@@ -1406,33 +1424,30 @@ RefoldEngine::TUByteSpan(int a0, int a1, StringRef tuPath) const {
         auto leftIt = tokmapByPP.find(pp - 1);
         if (leftIt != tokmapByPP.end()) {
           const auto &left = leftIt->second;
-          if (!left.file.empty() && PathsEqual(tuPath, left.file) &&
-              left.e >= 0) {
-            return {left.e, left.e};
+          if (PathsEqual(tuPath, left.file)) {
+            return {{left.e, left.e}};
           }
         }
       }
 
-      return {-1, -1};
+      return std::nullopt;
     }
 
     // Non-strict: prior best-effort behavior (closest mapped neighbor scan).
     const RefoldModel::TokMapEntry *left = nullptr;
-    for (int i = a0 - 1; i >= 0; --i) {
+    for (uint64_t i = a0; i-- > 0;) {
       auto it = tokmapByPP.find(i);
-      if (it != tokmapByPP.end() && !it->second.file.empty() &&
-          it->second.b >= 0 && it->second.e >= 0) {
+      if (it != tokmapByPP.end()) {
         left = &it->second;
         break;
       }
     }
 
     const RefoldModel::TokMapEntry *right = nullptr;
-    const int ppCount = model_.GetTokensCountA();
-    for (int i = a0; i < ppCount; ++i) {
+    const uint64_t ppCount = model_.GetTokensCountA();
+    for (uint64_t i = a0; i < ppCount; ++i) {
       auto it = tokmapByPP.find(i);
-      if (it != tokmapByPP.end() && !it->second.file.empty() &&
-          it->second.b >= 0 && it->second.e >= 0) {
+      if (it != tokmapByPP.end()) {
         right = &it->second;
         break;
       }
@@ -1440,25 +1455,22 @@ RefoldEngine::TUByteSpan(int a0, int a1, StringRef tuPath) const {
 
     // If either neighbor points into a header/include, we must NOT fabricate a
     // TU span.
-    if (left && !left->file.empty() && !PathsEqual(tuPath, left->file)) {
-      return {-1, -1};
+    if (left) {
+      if (!PathsEqual(tuPath, left->file))
+        return std::nullopt;
+      return {{left->e, left->e}};
     }
-    if (right && !right->file.empty() && !PathsEqual(tuPath, right->file)) {
-      return {-1, -1};
-    }
-
-    if (right && !right->file.empty()) {
-      return {right->b, right->b};
-    }
-    if (left && !left->file.empty()) {
-      return {left->e, left->e};
+    if (right) {
+      if (!PathsEqual(tuPath, right->file))
+        return std::nullopt;
+      return {{right->b, right->b}};
     }
 
-    return {-1, -1};
+    return std::nullopt;
   }
 
   // No TU tokens in [a0,a1) (and no safe TU insertion anchor).
-  return {-1, -1};
+  return std::nullopt;
 }
 
 const RefoldModel::IncludeItem *
@@ -1470,22 +1482,22 @@ RefoldEngine::BoundaryParentIncludeForPureInsertion(
     return nullptr;
   }
 
-  const int aPos = h.aStart;
+  const uint64_t aPos = h.aStart;
 
   // Hardened policy (#4): do NOT probe/snap to "nearest" tokmap entries.
   // We only infer an include owner when the insertion lands exactly on an
   // include PP boundary.
   const RefoldModel::IncludeItem *leftBest = nullptr;
-  int leftWidth = std::numeric_limits<int>::max();
+  uint64_t leftWidth = std::numeric_limits<uint64_t>::max();
 
   const RefoldModel::IncludeItem *rightBest = nullptr;
-  int rightWidth = std::numeric_limits<int>::max();
+  uint64_t rightWidth = std::numeric_limits<uint64_t>::max();
 
   for (const auto &inc : model_.GetIncludes()) {
-    if (inc.cover.begin < 0 || inc.cover.end < 0)
+    if (!inc.cover.IsValid())
       continue;
 
-    const int width = inc.cover.end - inc.cover.begin;
+    const uint64_t width = inc.cover.end - inc.cover.begin;
 
     // Include immediately to the left: ends exactly at aPos.
     if (inc.cover.end == aPos) {
@@ -1504,15 +1516,15 @@ RefoldEngine::BoundaryParentIncludeForPureInsertion(
     }
   }
 
-  const std::optional<int> leftIncId =
-      leftBest ? std::optional<int>(leftBest->id) : std::nullopt;
-  const std::optional<int> rightIncId =
-      rightBest ? std::optional<int>(rightBest->id) : std::nullopt;
+  const std::optional<uint64_t> leftIncId =
+      leftBest ? std::optional<uint64_t>(leftBest->id) : std::nullopt;
+  const std::optional<uint64_t> rightIncId =
+      rightBest ? std::optional<uint64_t>(rightBest->id) : std::nullopt;
 
   if (!leftIncId && !rightIncId)
     return nullptr; // not at a known include boundary
 
-  const std::optional<int> parentId =
+  const std::optional<uint64_t> parentId =
       model_.LeastCommonAncestorInclude(leftIncId, rightIncId);
   if (!parentId)
     return nullptr;
@@ -1530,18 +1542,18 @@ RefoldEngine::BoundaryParentIncludeForPureInsertion(
 // ==================== Patch builders (include & macro) ====================
 
 bool RefoldEngine::MacroExpansionEnvelopeB(
-    const RefoldModel::MacroInvocation &m, bool onlyInvFile, int &begin,
-    int &end) const {
+    const RefoldModel::MacroInvocation &m, bool onlyInvFile, uint64_t &begin,
+    uint64_t &end) const {
   const auto &tokMapByPP = model_.GetTokmapByPP();
   if (tokMapByPP.empty())
     return false;
 
-  int lo = std::numeric_limits<int>::max();
-  int hi = std::numeric_limits<int>::min();
+  uint64_t lo = std::numeric_limits<uint64_t>::max();
+  uint64_t hi = 0;
   bool any = false;
 
-  auto addRange = [&](int l, int h) {
-    for (int pp = l; pp < h; ++pp) {
+  auto addRange = [&](uint64_t l, uint64_t h) {
+    for (uint64_t pp = l; pp < h; ++pp) {
       auto it = tokMapByPP.find(pp);
       if (it == tokMapByPP.end())
         continue;
@@ -1549,7 +1561,7 @@ bool RefoldEngine::MacroExpansionEnvelopeB(
       const auto &t = it->second;
 
       if (onlyInvFile) {
-        if (t.file.empty() || t.file != m.invFile)
+        if (!m.invFile || !PathsEqual(t.file, *m.invFile))
           continue;
       }
 
@@ -1584,7 +1596,7 @@ bool RefoldEngine::MacroExpansionEnvelopeB(
 }
 
 bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
-    const RefoldModel::MacroInvocation &m, int argIdx, StringRef baseArg,
+    const RefoldModel::MacroInvocation &m, uint32_t argIdx, StringRef baseArg,
     StringRef newArg, ArrayRef<diffutils::Hunk> tokenHunks,
     bool checkPasteSpans) const {
   if (newArg.data() == nullptr)
@@ -1612,7 +1624,8 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
   if (!hasAny)
     return true;
 
-  const int maxTok = std::max(0, static_cast<int>(bTokOff_.size()) - 1);
+  const uint64_t maxTok =
+      bTokOff_.empty() ? 0ULL : static_cast<uint64_t>(bTokOff_.size() - 1);
   StringRef argTrim = newArg.trim();
   StringRef baseTrim = baseArg.trim();
 
@@ -1641,8 +1654,8 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
         // occurrence. This is required for insertions at the argument boundary
         // (e.g. appending tokens).
         if (!tokenHunks.empty()) {
-          int lo = bEnv->first;
-          int hi = bEnv->second;
+          size_t lo = bEnv->first;
+          size_t hi = bEnv->second;
           for (const auto &h : tokenHunks) {
             bool touches;
             if (h.aStart == h.aEnd) {
@@ -1651,12 +1664,12 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
               touches = (h.aStart < s.end && h.aEnd > s.begin);
             }
             if (touches) {
-              lo = std::min(lo, h.bStart);
-              hi = std::max(hi, h.bEnd);
+              lo = static_cast<size_t>(std::min<uint64_t>(lo, h.bStart));
+              hi = static_cast<size_t>(std::max<uint64_t>(hi, h.bEnd));
             }
           }
-          lo = std::clamp(lo, 0, maxTok);
-          hi = std::clamp(hi, lo, maxTok);
+          lo = static_cast<size_t>(std::clamp<uint64_t>(lo, 0ULL, maxTok));
+          hi = static_cast<size_t>(std::clamp<uint64_t>(hi, lo, maxTok));
           bEnv = {lo, hi};
         }
 
@@ -1685,11 +1698,12 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
       continue;
 
     StringRef aTokText = SliceASource(ps.begin, ps.end).trim();
-    if (aTokText.empty() || ps.byteBegin < 0 || ps.byteEnd < ps.byteBegin ||
-        static_cast<size_t>(ps.byteEnd) > aTokText.size())
+    if (aTokText.empty() || !ps.byteBegin || *ps.byteEnd < *ps.byteBegin ||
+        static_cast<size_t>(*ps.byteEnd) > aTokText.size())
       continue;
 
-    StringRef segA = aTokText.substr(ps.byteBegin, ps.byteEnd - ps.byteBegin);
+    StringRef segA =
+        aTokText.substr(*ps.byteBegin, *ps.byteEnd - *ps.byteBegin);
     if (segA.empty())
       continue;
 
@@ -1720,15 +1734,15 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
       continue;
 
     auto bEnv = MapAToBTokenEnvelopeByPPArgSpan(s);
-    if (!bEnv || bEnv->first < 0 || bEnv->second <= bEnv->first)
+    if (!bEnv || bEnv->second <= bEnv->first)
       return false;
 
     // Extend the B-envelope to account for hunks that touch this occurrence.
     // This is required for insertions at the argument boundary (e.g. appending
     // tokens).
     if (!tokenHunks.empty()) {
-      int lo = bEnv->first;
-      int hi = bEnv->second;
+      size_t lo = bEnv->first;
+      size_t hi = bEnv->second;
       for (const auto &h : tokenHunks) {
         bool touches;
         if (h.aStart == h.aEnd) {
@@ -1737,12 +1751,12 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
           touches = (h.aStart < s.end && h.aEnd > s.begin);
         }
         if (touches) {
-          lo = std::min(lo, h.bStart);
-          hi = std::max(hi, h.bEnd);
+          lo = static_cast<size_t>(std::min<uint64_t>(lo, h.bStart));
+          hi = static_cast<size_t>(std::max<uint64_t>(hi, h.bEnd));
         }
       }
-      lo = std::clamp(lo, 0, maxTok);
-      hi = std::clamp(hi, lo, maxTok);
+      lo = static_cast<size_t>(std::clamp<uint64_t>(lo, 0, maxTok));
+      hi = static_cast<size_t>(std::clamp<uint64_t>(hi, lo, maxTok));
       bEnv = {lo, hi};
     }
 
@@ -1779,7 +1793,7 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
       continue;
 
     auto bEnv = MapAToBTokenEnvelopeByPPArgSpan(ps);
-    if (!bEnv || bEnv->first < 0 || bEnv->second <= bEnv->first ||
+    if (!bEnv || bEnv->second <= bEnv->first ||
         (bEnv->second - bEnv->first) != 1)
       return false;
 
@@ -1790,18 +1804,28 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
     if (bTokText.empty())
       return false;
 
-    if (ps.byteBegin < 0 || ps.byteEnd < ps.byteBegin ||
-        static_cast<size_t>(ps.byteEnd) > aTokText.size())
+    if (!ps.byteBegin || *ps.byteEnd < *ps.byteBegin ||
+        static_cast<size_t>(*ps.byteEnd) > aTokText.size())
       return false;
 
-    StringRef oldSeg = aTokText.substr(ps.byteBegin, ps.byteEnd - ps.byteBegin);
+    StringRef oldSeg =
+        aTokText.substr(*ps.byteBegin, *ps.byteEnd - *ps.byteBegin);
 
-    int delta =
-        static_cast<int>(bTokText.size()) - static_cast<int>(aTokText.size());
-    int bbB = ps.byteBegin;
-    int beB = ps.byteEnd + delta;
-    if (bbB < 0 || beB < bbB || static_cast<size_t>(beB) > bTokText.size())
+    auto toSigned = [](std::optional<uint32_t> opt) -> int64_t {
+      return static_cast<int64_t>(opt.value_or(0));
+    };
+
+    int64_t delta = static_cast<int64_t>(bTokText.size()) -
+                    static_cast<int64_t>(aTokText.size());
+
+    int64_t bb = toSigned(ps.byteBegin);
+    int64_t be = toSigned(ps.byteEnd) + delta;
+
+    if (bb < 0 || be < bb || static_cast<uint64_t>(be) > bTokText.size())
       return false;
+
+    uint64_t bbB = static_cast<uint64_t>(bb);
+    uint64_t beB = static_cast<uint64_t>(be);
 
     // NOTE: Do NOT require the token outside this segment to be identical
     // between A and B. Multiple macro arguments can contribute to the same
@@ -1837,8 +1861,8 @@ bool RefoldEngine::HunkTouchesAnyPasteToken(
   if (m.pasteSpans.empty())
     return false;
 
-  const int a0 = h.aStart;
-  const int a1 = h.aEnd;
+  const uint64_t a0 = h.aStart;
+  const uint64_t a1 = h.aEnd;
 
   // Insertion hunk: treat as touching if the insertion point lies "on" a paste
   // span boundary.
@@ -1863,7 +1887,7 @@ bool RefoldEngine::HunkTouchesAnyPasteToken(
 std::optional<RefoldEngine::PasteArgEdit>
 RefoldEngine::DerivePasteArgEdit(const RefoldModel::MacroInvocation &m,
                                  const diffutils::Hunk &h,
-                                 ArrayRef<int> a2b) const {
+                                 ArrayRef<int64_t> a2b) const {
   // This helper only applies when the producer reported paste spans.
   if (m.pasteSpans.empty())
     return std::nullopt;
@@ -1894,7 +1918,7 @@ RefoldEngine::DerivePasteArgEdit(const RefoldModel::MacroInvocation &m,
   // paste edits we require a strict mapping: the A pasted token must map to
   // exactly one B token that we will diff against.
   auto bEnvOpt = MapAToBTokenEnvelopeByPPArgSpan(*tokenSpan);
-  if (!bEnvOpt || bEnvOpt->first < 0 || bEnvOpt->second <= bEnvOpt->first)
+  if (!bEnvOpt || bEnvOpt->second <= bEnvOpt->first)
     return std::nullopt;
 
   // Paste-aware edits handled here must stay within a single B token. If the
@@ -1939,8 +1963,8 @@ RefoldEngine::DerivePasteArgEdit(const RefoldModel::MacroInvocation &m,
     suff++;
   }
 
-  int diffStart = static_cast<int>(pref);
-  int diffEndA = static_cast<int>(aLen - suff);
+  const size_t diffStart = pref;
+  const size_t diffEndA = aLen - suff;
 
   // If there is no difference at all, this hunk cannot be explained as a
   // paste-segment rewrite.
@@ -1956,20 +1980,23 @@ RefoldEngine::DerivePasteArgEdit(const RefoldModel::MacroInvocation &m,
   // single-arg args-only rewrite.
   const RefoldModel::PPArgSpan *chosen = nullptr;
   for (const auto *ps : cands) {
-    if (ps->byteBegin < 0 || ps->byteEnd < ps->byteBegin)
+    if (!ps->byteBegin || !ps->byteEnd || *ps->byteEnd < *ps->byteBegin)
       continue;
 
-    bool hit;
+    const size_t bBegin = *ps->byteBegin;
+    const size_t bEnd = *ps->byteEnd;
+
+    bool hit = false;
     if (diffStart == diffEndA) {
       // Pure insertion/deletion at a point (no width in A). Treat as
       // overlapping if the point lies strictly inside the candidate slice.
-      hit = (ps->byteBegin <= diffStart) && (diffStart < ps->byteEnd);
+      hit = (bBegin <= diffStart) && (diffStart < bEnd);
     } else {
       // General overlap between [diffStart,diffEndA) and
       // [ps.byteBegin,ps.byteEnd).
-      int lo = std::max(ps->byteBegin, diffStart);
-      int hi = std::min(ps->byteEnd, diffEndA);
-      hit = hi > lo;
+      const size_t lo = std::max(bBegin, diffStart);
+      const size_t hi = std::min(bEnd, diffEndA);
+      hit = (hi > lo);
     }
 
     if (hit) {
@@ -1984,10 +2011,10 @@ RefoldEngine::DerivePasteArgEdit(const RefoldModel::MacroInvocation &m,
     return std::nullopt;
 
   // Extract the old contributed segment from the A pasted token.
-  int bb = chosen->byteBegin;
-  int be = chosen->byteEnd;
+  const int64_t bbA = static_cast<int64_t>(*chosen->byteBegin);
+  const int64_t beA = static_cast<int64_t>(*chosen->byteEnd);
 
-  if (bb < 0 || be < bb || static_cast<size_t>(be) > aTok.size())
+  if (bbA < 0 || beA < bbA || static_cast<uint64_t>(beA) > aTok.size())
     return std::nullopt;
 
   // Compute the corresponding segment coordinates in the B pasted token.
@@ -1996,11 +2023,18 @@ RefoldEngine::DerivePasteArgEdit(const RefoldModel::MacroInvocation &m,
   // boundaries; instead, the chosen segment grows/shrinks by the overall token
   // length delta (bTokLen - aTokLen). This allows us to map [bb,be) in A to
   // [bb,be+delta) in B.
-  int delta = static_cast<int>(bTok.size()) - static_cast<int>(aTok.size());
-  int bbB = bb;
-  int beB = be + delta;
-  if (bbB < 0 || beB < bbB || static_cast<size_t>(beB) > bTok.size())
+  const int64_t delta =
+      static_cast<int64_t>(bTok.size()) - static_cast<int64_t>(aTok.size());
+  const int64_t bbB_signed = bbA; // Assumption: prefix is stable
+  const int64_t beB_signed = beA + delta;
+  if (bbB_signed < 0 || beB_signed < bbB_signed ||
+      static_cast<uint64_t>(beB_signed) > bTok.size())
     return std::nullopt;
+
+  const size_t bb = static_cast<size_t>(bbA);
+  const size_t be = static_cast<size_t>(beA);
+  const size_t bbB = static_cast<size_t>(bbB_signed);
+  const size_t beB = static_cast<size_t>(beB_signed);
 
   // Safety gate: ensure the only edits to the pasted token are within the
   // chosen segment.
@@ -2023,7 +2057,7 @@ RefoldEngine::DerivePasteArgEdit(const RefoldModel::MacroInvocation &m,
 std::optional<std::vector<RefoldEngine::PasteArgEdit>>
 RefoldEngine::DerivePasteArgEdits(const RefoldModel::MacroInvocation &m,
                                   const diffutils::Hunk &h,
-                                  ArrayRef<int> a2b) const {
+                                  ArrayRef<int64_t> a2b) const {
   if (m.pasteSpans.empty())
     return std::nullopt;
 
@@ -2037,11 +2071,12 @@ RefoldEngine::DerivePasteArgEdits(const RefoldModel::MacroInvocation &m,
   if (cands.empty())
     return std::nullopt;
 
-  // All candidates should reference the same pasted token range [begin, end) in A.
+  // All candidates should reference the same pasted token range [begin, end) in
+  // A.
   const auto *tokenSpan = cands[0];
 
   auto bEnvOpt = MapAToBTokenEnvelopeByPPArgSpan(*tokenSpan);
-  if (!bEnvOpt || bEnvOpt->first < 0 || bEnvOpt->second <= bEnvOpt->first)
+  if (!bEnvOpt || bEnvOpt->second <= bEnvOpt->first)
     return std::nullopt;
 
   // Paste edits are only representable as args-only when the A-span maps to
@@ -2073,7 +2108,21 @@ RefoldEngine::DerivePasteArgEdits(const RefoldModel::MacroInvocation &m,
   // segmentation is ambiguous and we conservatively return null.
   std::vector<const RefoldModel::PPArgSpan *> spans = cands;
   std::sort(spans.begin(), spans.end(), [](const auto *p1, const auto *p2) {
-    return p1->byteBegin < p2->byteBegin;
+    // If p1 has no value, it's "greater" than anything with a value (moves to
+    // end)
+    if (!p1->byteBegin)
+      return false;
+    if (!p2->byteBegin)
+      return true;
+
+    // If both have values, compare them
+    if (*p1->byteBegin != *p2->byteBegin)
+      return *p1->byteBegin < *p2->byteBegin;
+
+    // Stable tie-breaker: sort by end position if starts are equal
+    uint32_t end1 = p1->byteEnd.value_or(0);
+    uint32_t end2 = p2->byteEnd.value_or(0);
+    return end1 < end2;
   });
 
   std::optional<std::vector<std::string>> newSegs =
@@ -2082,15 +2131,15 @@ RefoldEngine::DerivePasteArgEdits(const RefoldModel::MacroInvocation &m,
     return std::nullopt;
 
   std::vector<PasteArgEdit> edits;
-  DenseSet<int> seenArgIdx;
+  DenseSet<uint32_t> seenArgIdx;
 
   for (size_t i = 0; i < spans.size(); ++i) {
     const auto *ps = spans[i];
-    if (ps->byteBegin < 0 || ps->byteEnd < ps->byteBegin)
+    if (!ps->byteBegin || *ps->byteEnd < *ps->byteBegin)
       return std::nullopt;
 
-    size_t bb = static_cast<size_t>(ps->byteBegin);
-    size_t be = static_cast<size_t>(ps->byteEnd);
+    size_t bb = static_cast<size_t>(*ps->byteBegin);
+    size_t be = static_cast<size_t>(*ps->byteEnd);
     if (be > aTok.size())
       return std::nullopt;
 
@@ -2123,9 +2172,9 @@ RefoldEngine::SegmentPastedTokenArgsByFixedSlices(
 
   // Basic span sanity.
   for (const auto *ps : spansAsc) {
-    if (ps->byteBegin < 0 || ps->byteEnd < ps->byteBegin)
+    if (!ps->byteBegin || *ps->byteEnd < *ps->byteBegin)
       return std::nullopt;
-    if (static_cast<size_t>(ps->byteEnd) > aTok.size())
+    if (static_cast<size_t>(*ps->byteEnd) > aTok.size())
       return std::nullopt;
   }
 
@@ -2144,46 +2193,55 @@ RefoldEngine::SegmentPastedTokenArgsByFixedSlices(
 
 bool RefoldEngine::SegmentPastedTokenArgsByFixedSlicesRec(
     StringRef aTok, StringRef bTok,
-    ArrayRef<const RefoldModel::PPArgSpan *> spansAsc, int idx, int posA,
-    int posB, MutableArrayRef<std::string> out) {
-  if (static_cast<size_t>(idx) >= spansAsc.size()) {
+    ArrayRef<const RefoldModel::PPArgSpan *> spansAsc, size_t idx, size_t posA,
+    size_t posB, MutableArrayRef<std::string> out) {
+  // 1. Base Case: All spans processed
+  if (idx >= spansAsc.size()) {
     // All spans emitted; remaining fixed tail must match exactly.
     StringRef tail = aTok.substr(posA);
-    return bTok.substr(posB).starts_with(tail) &&
-           (posB + tail.size() == bTok.size());
+    return bTok.substr(posB) == tail;
   }
 
   const auto *ps = spansAsc[idx];
-  if (ps->byteBegin < posA)
+
+  // 2. Validate Optionals and Range Consistency
+  if (!ps->byteBegin || !ps->byteEnd || *ps->byteEnd < *ps->byteBegin)
     return false;
 
-  // Match the fixed slice before this span.
-  StringRef fixedBefore = aTok.substr(posA, ps->byteBegin - posA);
+  const size_t bA = static_cast<size_t>(*ps->byteBegin);
+  const size_t eA = static_cast<size_t>(*ps->byteEnd);
+
+  // Ensure current span doesn't overlap backwards into previously processed A
+  // text
+  if (bA < posA)
+    return false;
+
+  // 3. Match the "Fixed" anchor text appearing before this argument in A
+  StringRef fixedBefore = aTok.substr(posA, bA - posA);
   if (!bTok.substr(posB).starts_with(fixedBefore))
     return false;
 
-  int argStartB = posB + static_cast<int>(fixedBefore.size());
-  int nextPosA = ps->byteEnd;
+  const size_t argStartB = posB + fixedBefore.size();
+  const size_t nextPosA = eA;
 
-  // Determine the fixed slice after this span (up to the next span, or the
-  // tail).
+  // 4. Determine the "Fixed" anchor text appearing after this argument
   StringRef fixedAfter;
-  if (static_cast<size_t>(idx + 1) < spansAsc.size()) {
+  if (idx + 1 < spansAsc.size()) {
     const auto *next = spansAsc[idx + 1];
-    if (next->byteBegin < ps->byteEnd)
+    if (!next->byteBegin || *next->byteBegin < eA)
       return false;
-    fixedAfter = aTok.substr(ps->byteEnd, next->byteBegin - ps->byteEnd);
+    fixedAfter = aTok.substr(eA, static_cast<size_t>(*next->byteBegin) - eA);
   } else {
-    fixedAfter = aTok.substr(ps->byteEnd);
+    fixedAfter = aTok.substr(eA);
   }
 
-  // If there is no fixed anchor after this span and the total length changed,
-  // we cannot determine the B segment boundary for this arg.
-  if (fixedAfter.empty() && (static_cast<size_t>(idx + 1) < spansAsc.size()) &&
-      (aTok.size() != bTok.size()))
-    return false;
-
+  // 5. Handling Argument Boundaries
   if (fixedAfter.empty()) {
+    // If there is no fixed anchor after this span and the total length changed,
+    // we cannot determine the B segment boundary for this arg.
+    if (idx + 1 < spansAsc.size() && aTok.size() != bTok.size())
+      return false;
+
     // If this is the final arg span and there is no fixed tail, the arg's
     // contribution may legally grow or shrink. In that case, consume the
     // remainder of the B token.
@@ -2192,17 +2250,17 @@ bool RefoldEngine::SegmentPastedTokenArgsByFixedSlicesRec(
     //   CONCAT(X, Y, Z) -> X##_##Y##_##Z
     // where the last argument is immediately followed by the end of the pasted
     // token.
-    if (static_cast<size_t>(idx + 1) == spansAsc.size()) {
+    if (idx + 1 == spansAsc.size()) {
       out[idx] = bTok.substr(argStartB).str();
       return SegmentPastedTokenArgsByFixedSlicesRec(
-          aTok, bTok, spansAsc, idx + 1, nextPosA,
-          static_cast<int>(bTok.size()), out);
+          aTok, bTok, spansAsc, idx + 1, nextPosA, bTok.size(), out);
     }
 
     // Length-stable adjacent spans: use the A span length as the B span length.
-    int aLen = ps->byteEnd - ps->byteBegin;
-    int argEndB = argStartB + aLen;
-    if (static_cast<size_t>(argEndB) > bTok.size())
+    const size_t aLen = eA - bA;
+    const size_t argEndB = argStartB + aLen;
+
+    if (argEndB > bTok.size())
       return false;
 
     out[idx] = bTok.substr(argStartB, aLen).str();
@@ -2210,18 +2268,20 @@ bool RefoldEngine::SegmentPastedTokenArgsByFixedSlicesRec(
                                                   nextPosA, argEndB, out);
   }
 
-  // Search for the fixedAfter anchor in B at/after argStartB. We may have
-  // multiple candidates if fixedAfter appears inside an arg; backtrack
-  // deterministically.
+  // 6. Anchor Search: Find where the fixedAfter text appears in B
+  // We search starting at argStartB.
   size_t k = bTok.find(fixedAfter, argStartB);
   while (k != StringRef::npos) {
-    int currentK = static_cast<int>(k);
-    out[idx] = bTok.substr(argStartB, currentK - argStartB).str();
+    // Current candidate for the argument content in B
+    out[idx] = bTok.substr(argStartB, k - argStartB).str();
+
+    // Recurse to see if this candidate allows the rest of the string to match
     if (SegmentPastedTokenArgsByFixedSlicesRec(aTok, bTok, spansAsc, idx + 1,
-                                               nextPosA, currentK, out)) {
+                                               nextPosA, k, out)) {
       return true;
     }
 
+    // Backtrack: Find the next occurrence of the anchor
     k = bTok.find(fixedAfter, k + 1);
   }
 
@@ -2266,20 +2326,19 @@ StringRef RefoldEngine::DeriveNewPasteSegmentFromSpellingReplacement(
 }
 
 bool RefoldEngine::PasteArgReplacementsMatchAllPasteTokensInB(
-    const RefoldModel::MacroInvocation &m,
-    StringRef baseInvText,
-    ArrayRef<std::pair<int, int>> invArgRanges,
-    const DenseMap<int, std::string> &replByArgIdx) const {
+    const RefoldModel::MacroInvocation &m, StringRef baseInvText,
+    ArrayRef<std::pair<size_t, size_t>> invArgRanges,
+    const DenseMap<uint32_t, std::string> &replByArgIdx) const {
   if (m.pasteSpans.empty())
     return true;
 
   // Precompute the original (base) spelling text for each argument we are
   // proposing to replace. We need this to derive a stable mapping from
   // "argument replacement" -> "paste segment update".
-  DenseMap<int, std::string> baseArgByIdx;
+  DenseMap<uint32_t, std::string> baseArgByIdx;
   for (const auto &entry : replByArgIdx) {
-    int argIdx = entry.first;
-    if (argIdx < 0 || static_cast<size_t>(argIdx) >= invArgRanges.size())
+    uint32_t argIdx = entry.first;
+    if (static_cast<size_t>(argIdx) >= invArgRanges.size())
       return false;
 
     auto range = invArgRanges[argIdx];
@@ -2292,10 +2351,11 @@ bool RefoldEngine::PasteArgReplacementsMatchAllPasteTokensInB(
   // to. The grouping key is the A token interval [beginTok,endTok) of the
   // pasted token. In practice, paste spans are expected to describe a single
   // token, so (endTok - beginTok) should be 1.
-  std::vector<std::pair<int, int>> tokenOrder;
-  DenseMap<std::pair<int, int>, std::vector<RefoldModel::PPArgSpan>> spansByTok;
+  std::vector<std::pair<uint64_t, uint64_t>> tokenOrder;
+  DenseMap<std::pair<uint64_t, uint64_t>, std::vector<RefoldModel::PPArgSpan>>
+      spansByTok;
   for (const auto &ps : m.pasteSpans) {
-    std::pair<int, int> key = {ps.begin, ps.end};
+    std::pair<uint64_t, uint64_t> key = {ps.begin, ps.end};
     if (spansByTok.find(key) == spansByTok.end()) {
       tokenOrder.push_back(key);
     }
@@ -2306,19 +2366,19 @@ bool RefoldEngine::PasteArgReplacementsMatchAllPasteTokensInB(
   // replacements to its sub-token argument segments and compare against the
   // edited B token spelling.
   for (const auto &key : tokenOrder) {
-    int beginTok = key.first;
-    int endTok = key.second;
+    uint64_t beginTok = key.first;
+    uint64_t endTok = key.second;
 
     // We only support pasted-token occurrences that correspond to exactly one
     // token in A.
-    if (endTok - beginTok != 1)
+    if (endTok != beginTok + 1)
       return false;
 
     // Map the A pasted-token occurrence to a single B token envelope. This
     // mapping is paste-aware because token-paste edits often cause the pasted
     // token to be unmapped in a2b (-1).
     auto bEnv = MapATokRangeAToBTokenEnvelope(beginTok, endTok);
-    if (!bEnv || (bEnv->second - bEnv->first != 1))
+    if (!bEnv || bEnv->second != bEnv->first + 1)
       return false;
 
     auto stripNL = [](StringRef s) -> std::string {
@@ -2337,8 +2397,24 @@ bool RefoldEngine::PasteArgReplacementsMatchAllPasteTokensInB(
     // token spelling. Apply edits in descending byteBegin so earlier rewrites
     // do not shift later offsets.
     std::vector<RefoldModel::PPArgSpan> &spans = spansByTok[key];
+
+    // Apply in descending byteBegin so replacements cannot shift the offsets
+    // of later spans.
     std::sort(spans.begin(), spans.end(), [](const auto &p1, const auto &p2) {
-      return p1.byteBegin > p2.byteBegin;
+      // Spans without byteBegin are treated as "last".
+      if (!p1.byteBegin)
+        return false;
+      if (!p2.byteBegin)
+        return true;
+
+      // Primary key: descending start.
+      if (*p1.byteBegin != *p2.byteBegin)
+        return *p1.byteBegin > *p2.byteBegin;
+
+      // Tie-breaker: descending end.
+      uint32_t end1 = p1.byteEnd.value_or(0);
+      uint32_t end2 = p2.byteEnd.value_or(0);
+      return end1 > end2;
     });
 
     // Start from the A token spelling and simulate the token-paste result after
@@ -2358,15 +2434,19 @@ bool RefoldEngine::PasteArgReplacementsMatchAllPasteTokensInB(
         return false;
       StringRef baseArg = baseIt->second;
 
+      if (!ps.byteBegin || !ps.byteEnd)
+        return false;
+
+      size_t b = static_cast<size_t>(*ps.byteBegin);
+      size_t e = static_cast<size_t>(*ps.byteEnd);
+
       // The paste span must define a valid character slice inside the A
       // pasted-token spelling.
-      if (ps.byteBegin < 0 || ps.byteEnd < ps.byteBegin ||
-          static_cast<size_t>(ps.byteEnd) > aTok.size())
+      if (e < b || e > aTok.size())
         return false;
 
       // Extract the original pasted-token segment contributed by this argument.
-      StringRef oldSeg =
-          StringRef(aTok).substr(ps.byteBegin, ps.byteEnd - ps.byteBegin);
+      StringRef oldSeg = StringRef(aTok).substr(b, e - b);
 
       // Derive the new pasted-token segment from the argument replacement. This
       // is intentionally conservative and must be deterministic; if we cannot
@@ -2378,8 +2458,7 @@ bool RefoldEngine::PasteArgReplacementsMatchAllPasteTokensInB(
 
       // Rewrite only the identified segment region inside the synthetic pasted-
       // token spelling.
-      expected =
-          stringutils::replaceRange(expected, ps.byteBegin, ps.byteEnd, newSeg);
+      expected = stringutils::replaceRange(expected, b, e, newSeg);
     }
 
     if (expected != bTok)
@@ -2428,10 +2507,10 @@ std::string RefoldEngine::SplicePasteSegmentIntoSpellingArg(StringRef baseArg,
 std::optional<RefoldEngine::MacroPatch>
 RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h,
-    ArrayRef<int> a2b, StringRef baseInvText) const {
+    ArrayRef<int64_t> a2b, StringRef baseInvText) const {
   // We can only emit an invocation patch if the producer provided a concrete
   // byte range.
-  if (m.GetInvB() < 0 || m.GetInvE() < 0)
+  if (!m.invB || !m.invE)
     return std::nullopt;
 
   // tokenHunks are used by macroArgReplacementMatchesAllOccurrencesInB() to
@@ -2461,10 +2540,10 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
   if (HunkTouchesAnyPasteToken(m, h)) {
     auto edits = DerivePasteArgEdits(m, h, a2b);
     if (edits && !edits->empty()) {
-      DenseMap<int, std::string> replByArgIdx;
+      DenseMap<uint32_t, std::string> replByArgIdx;
       for (const auto &pae : *edits) {
-        int argIdx = pae.argIdx;
-        if (argIdx < 0 || static_cast<size_t>(argIdx) >= invArgRanges.size())
+        uint32_t argIdx = pae.argIdx;
+        if (static_cast<size_t>(argIdx) >= invArgRanges.size())
           return std::nullopt;
 
         // Reject multiple independent edits to the same arg index inside one
@@ -2511,11 +2590,11 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         std::string newInv = baseInvText.str();
         auto keys = llvm::to_vector<8>(
             llvm::map_range(replByArgIdx, [](auto &e) { return e.first; }));
-        std::sort(keys.begin(), keys.end(), [&](int a, int b) {
+        std::sort(keys.begin(), keys.end(), [&](uint32_t a, uint32_t b) {
           return invArgRanges[a].first > invArgRanges[b].first;
         });
 
-        for (int argIdx : keys) {
+        for (uint32_t argIdx : keys) {
           auto r = invArgRanges[argIdx];
           newInv = stringutils::replaceRange(newInv, r.first, r.second,
                                              replByArgIdx[argIdx]);
@@ -2523,7 +2602,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
 
         trace("macro/args", "  args-only SUCCESS newInv='{0}'",
               stringutils::showWSWithClip(newInv, 200));
-        return MacroPatch{m.GetInvB(), m.GetInvE(), std::move(newInv)};
+        return MacroPatch{*m.invB, *m.invE, std::move(newInv)};
       }
     }
 
@@ -2535,11 +2614,11 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     // single segment edit from the token-level diff.
     auto pae = DerivePasteArgEdit(m, h, a2b);
     if (pae) {
-      int argIdx = pae->argIdx;
+      uint32_t argIdx = pae->argIdx;
 
       // HARD FAILURE: If we derived a paste edit but the index is invalid,
       // we must exit, not fall through.
-      if (argIdx < 0 || static_cast<size_t>(argIdx) >= invArgRanges.size())
+      if (static_cast<size_t>(argIdx) >= invArgRanges.size())
         return std::nullopt;
 
       auto r = invArgRanges[argIdx];
@@ -2561,7 +2640,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
           stringutils::replaceRange(baseInvText, r.first, r.second, newArg);
       trace("macro/args", "  args-only SUCCESS newInv='{0}'",
             stringutils::showWSWithClip(newInv, 200));
-      return MacroPatch{m.GetInvB(), m.GetInvE(), std::move(newInv)};
+      return MacroPatch{*m.invB, *m.invE, std::move(newInv)};
     }
 
     // If we touched paste but could not safely derive a paste splice patch,
@@ -2599,14 +2678,14 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
   // Compute argument replacements implied by each touched occurrence. Multiple
   // occurrences of the same argIdx must imply the exact same replacement,
   // otherwise the macro cannot be refolded args-only.
-  DenseMap<int, std::string> replByArgIdx;
+  DenseMap<uint32_t, std::string> replByArgIdx;
   for (size_t i = 0; i < occs.size(); ++i) {
     if (!touched[i])
       continue;
 
     const auto &sp = occs[i];
-    int argIdx = sp.argIdx;
-    if (argIdx < 0 || static_cast<size_t>(argIdx) >= invArgRanges.size())
+    uint32_t argIdx = sp.argIdx;
+    if (static_cast<size_t>(argIdx) >= invArgRanges.size())
       return std::nullopt;
 
     // Base spelling for this argument in the invocation text (used for splice
@@ -2616,16 +2695,16 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
 
     // Map the A occurrence envelope to B using byte-level hunks derived from
     // the global alignment. This leverages producer-provided pp_byte_begin/
-    // pp_byte_end when present and falls back to
-    // consumer token offsets otherwise.
+    // pp_byte_end when present and falls back to consumer token offsets
+    // otherwise.
     auto bEnv = MapAToBTokenEnvelopeByPPArgSpan(sp);
     if (!bEnv) {
       // Conservative fallback: use the hunk's B range if the span mapping
       // fails. If the hunk doesn't have a valid B range either, we cannot
       // safely derive an args-only replacement.
-      if (h.bStart < 0 || h.bEnd < 0 || h.bStart >= h.bEnd)
+      if (h.bStart >= h.bEnd)
         return std::nullopt;
-      bEnv = {h.bStart, h.bEnd};
+      bEnv = {static_cast<size_t>(h.bStart), static_cast<size_t>(h.bEnd)};
     }
 
     // Slice the edited text from B corresponding to this occurrence and treat
@@ -2717,35 +2796,36 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
   std::string finalInv = baseInvText.str();
   auto finalKeys = llvm::to_vector(
       llvm::map_range(replByArgIdx, [](auto &e) { return e.first; }));
-  std::sort(finalKeys.begin(), finalKeys.end(), [&](int a, int b) {
+  std::sort(finalKeys.begin(), finalKeys.end(), [&](uint32_t a, uint32_t b) {
     return invArgRanges[a].first > invArgRanges[b].first;
   });
-  for (int argIdx : finalKeys) {
+  for (uint32_t argIdx : finalKeys) {
     auto r = invArgRanges[argIdx];
     finalInv = stringutils::replaceRange(finalInv, r.first, r.second,
                                          replByArgIdx[argIdx]);
   }
 
-  return MacroPatch{m.GetInvB(), m.GetInvE(), std::move(finalInv)};
+  return MacroPatch{*m.invB, *m.invE, std::move(finalInv)};
 }
 
 StringRef RefoldEngine::SliceSource(ArrayRef<size_t> tokOff, StringRef source,
-                                    int startTok, int endTok) {
+                                    uint64_t startTok, uint64_t endTok) {
   if (tokOff.empty() || source.empty())
     return "";
 
-  const int n = static_cast<int>(tokOff.size());
+  const size_t n = tokOff.size();
+  const uint64_t maxTokIdx = static_cast<uint64_t>(n) - 1;
 
   // Clamp token indices to valid array bounds.
-  int loTok = std::clamp(startTok, 0, n - 1);
-  int hiTok = std::clamp(endTok, loTok, n - 1);
+  uint64_t loTok = std::clamp(startTok, 0ULL, maxTokIdx);
+  uint64_t hiTok = std::clamp(endTok, loTok, maxTokIdx);
 
-  int lo = tokOff[loTok];
-  int hi = tokOff[hiTok];
+  size_t lo = tokOff[static_cast<size_t>(loTok)];
+  size_t hi = tokOff[static_cast<size_t>(hiTok)];
 
   // Clamp byte offsets to the actual string length.
-  const int sourceLen = static_cast<int>(source.size());
-  lo = std::clamp(lo, 0, sourceLen);
+  const size_t sourceLen = source.size();
+  lo = std::clamp(lo, size_t(0), sourceLen);
   hi = std::clamp(hi, lo, sourceLen);
 
   return source.substr(lo, hi - lo);
@@ -2814,8 +2894,8 @@ RefoldEngine::UnstringifyLiteralToArgText(StringRef literalTok) {
 bool RefoldEngine::HunkFullyWithinArgSpans(
     const diffutils::Hunk &h, ArrayRef<RefoldModel::PPArgSpan> argSpans,
     MutableArrayRef<char> touched) {
-  int a0 = h.aStart;
-  int a1 = h.aEnd;
+  uint64_t a0 = h.aStart;
+  uint64_t a1 = h.aEnd;
 
   // Insertion: attribute it to the arg span whose [begin,end] contains the
   // insertion point.
@@ -2835,7 +2915,7 @@ bool RefoldEngine::HunkFullyWithinArgSpans(
 
   // Replacement/deletion: every covered token must fall inside some arg span.
   bool any = false;
-  for (int a = a0; a < a1; ++a) {
+  for (uint64_t a = a0; a < a1; ++a) {
     bool inSome = false;
     for (size_t i = 0; i < argSpans.size(); ++i) {
       const auto &s = argSpans[i];
@@ -2857,7 +2937,6 @@ RefoldEngine::BuildByteHunksFromRawText() const {
   // We still need a physical array of "elements" for ArrayRef.
   // But now, each element is just 16 bytes (pointer + length)
   // instead of a 32-byte heap-allocating std::string.
-
   auto ToRefVec = [](StringRef s) {
     std::vector<StringRef> v;
     v.reserve(s.size());
@@ -2885,88 +2964,99 @@ RefoldEngine::BuildByteHunksFromRawText() const {
 }
 
 size_t RefoldEngine::MapAByteToBByteLowerBound(size_t aByte) const {
-  // If no hunks exist, the streams are identical.
   if (!abByteHunks_ || abByteHunks_->empty())
     return aByte;
 
-  int64_t delta = 0;
-  for (const auto &h : *abByteHunks_) {
-    // If the byte is before the current hunk, we've found our final delta.
-    if (aByte < static_cast<size_t>(h.aBegin))
-      break;
+  const uint64_t searchVal = static_cast<uint64_t>(aByte);
 
-    // If the byte falls inside the hunk (an edit/deletion), snap to the start
-    // of the B-side replacement.
-    if (aByte < static_cast<size_t>(h.aEnd))
-      return h.bBegin;
+  // 1. Find the first hunk where h.aStart >= aByte
+  auto it = std::lower_bound(
+      abByteHunks_->begin(), abByteHunks_->end(), searchVal,
+      [](const ByteHunk &h, uint64_t val) { return h.aStart < val; });
 
-    // Otherwise, the byte is after this hunk; update the cumulative delta.
-    // delta = (new_len - old_len)
-    delta += (static_cast<int64_t>(h.bEnd) - h.bBegin) -
-             (static_cast<int64_t>(h.aEnd) - h.aBegin);
+  // 2. We need to look at the hunk PRIOR to 'it' to see if aByte falls inside
+  // it, or if we are in the gap after it.
+  if (it != abByteHunks_->begin()) {
+    auto prev = std::prev(it);
+
+    // If the byte is within the previous hunk's range [aStart, aEnd)
+    if (searchVal < prev->aEnd) {
+      // It's inside an edit/deletion; map to the start of the B-side
+      // equivalent.
+      return static_cast<size_t>(prev->bStart);
+    }
   }
 
-  return static_cast<size_t>(static_cast<int64_t>(aByte) + delta);
+  // 3. Handle the Cumulative Delta.
+  int64_t delta = 0;
+  for (auto current = abByteHunks_->begin(); current != it; ++current) {
+    delta += (static_cast<int64_t>(current->bEnd - current->bStart) -
+              static_cast<int64_t>(current->aEnd - current->aStart));
+  }
+
+  int64_t result = static_cast<int64_t>(aByte) + delta;
+  return static_cast<size_t>(std::max<int64_t>(0, result));
 }
 
 size_t RefoldEngine::MapAByteToBByteUpperBound(size_t aByte) const {
   if (!abByteHunks_ || abByteHunks_->empty())
     return aByte;
 
+  const uint64_t searchVal = static_cast<uint64_t>(aByte);
+
+  // 1. Binary search finds the first hunk where h.aStart >= aByte
+  auto it = std::lower_bound(
+      abByteHunks_->begin(), abByteHunks_->end(), searchVal,
+      [](const ByteHunk &h, uint64_t val) { return h.aStart < val; });
+
+  // 3. Accumulate delta from all hunks preceding 'it'
   int64_t delta = 0;
-  for (const auto &h : *abByteHunks_) {
-    // If the byte is before the start of the current hunk, we apply
-    // the current cumulative delta and finish.
-    if (aByte < static_cast<size_t>(h.aBegin))
-      break;
-
-    // If the queried position is exactly at the start of this hunk:
-    if (aByte == static_cast<size_t>(h.aBegin)) {
-      if (h.aBegin == h.aEnd) {
-        // Pure insertion: Include the inserted bytes in the delta.
-        delta += (static_cast<int64_t>(h.bEnd) - h.bBegin);
-      }
-      // For upper-bound semantics, we stop here so that an A-span ending
-      // at aBegin will include any insertion starting at bBegin.
-      break;
-    }
-
-    // If the byte falls inside the hunk (replaced/deleted range),
-    // snap to the end of the B-side replacement.
-    if (aByte < static_cast<size_t>(h.aEnd))
-      return h.bEnd;
-
-    // Otherwise, the byte is after this hunk; update cumulative delta.
-    delta += (static_cast<int64_t>(h.bEnd) - h.bBegin) -
-             (static_cast<int64_t>(h.aEnd) - h.aBegin);
+  for (auto current = abByteHunks_->begin(); current != it; ++current) {
+    delta += (static_cast<int64_t>(current->bEnd - current->bStart) -
+              static_cast<int64_t>(current->aEnd - current->aStart));
   }
 
-  return static_cast<size_t>(static_cast<int64_t>(aByte) + delta);
+  // 4. Handle boundary conditions at the 'it' position
+  if (it != abByteHunks_->end()) {
+    // If we land exactly on the start of this hunk
+    if (searchVal == it->aStart) {
+      if (it->aStart == it->aEnd) {
+        // Pure insertion at the boundary: Include its shift in the delta.
+        delta += static_cast<int64_t>(it->bEnd - it->bStart);
+      }
+      // Note: We don't snap here because we are at the start of a range.
+    } else if (searchVal > it->aStart && searchVal < it->aEnd) {
+      // Byte is inside a deletion/replacement hunk: snap to the end.
+      return static_cast<size_t>(it->bEnd);
+    }
+  }
+
+  // 5. Final translation with bounds safety
+  int64_t result = static_cast<int64_t>(aByte) + delta;
+  return static_cast<size_t>(std::max<int64_t>(0, result));
 }
 
-int RefoldEngine::BTokIndexFloor(int bByte) const {
-  const int n = static_cast<int>(bTokOff_.size()) - 1;
-
-  // Boundary cases: empty or single-offset stream.
-  if (n <= 0)
+size_t RefoldEngine::BTokIndexFloor(size_t bByte) const {
+  if (bTokOff_.size() < 2)
     return 0;
 
+  const int n = bTokOff_.size() - 1;
+
   // If the byte is at or before the start of the first token.
-  if (static_cast<size_t>(bByte) <= bTokOff_[0])
+  if (bByte <= bTokOff_[0])
     return 0;
 
   // If the byte is at or after the end of the last token (the sentinel).
-  if (static_cast<size_t>(bByte) >= bTokOff_[n])
+  if (bByte >= bTokOff_[n])
     return n;
 
-  int lo = 0;
-  int hi = n;
+  size_t lo = 0;
+  size_t hi = n;
 
   // Standard floor binary search.
   while (lo < hi) {
-    int mid = lo + (hi - lo + 1) / 2;
-    int off = bTokOff_[mid];
-
+    size_t mid = lo + (hi - lo + 1) / 2;
+    size_t off = bTokOff_[mid];
     if (off <= bByte)
       lo = mid;
     else
@@ -2976,29 +3066,27 @@ int RefoldEngine::BTokIndexFloor(int bByte) const {
   return lo;
 }
 
-int RefoldEngine::BTokIndexCeil(int bByte) const {
-  const int n = static_cast<int>(bTokOff_.size()) - 1;
-
-  // Boundary cases: empty or single-offset stream.
-  if (n <= 0)
+size_t RefoldEngine::BTokIndexCeil(size_t bByte) const {
+  if (bTokOff_.size() < 2)
     return 0;
 
+  const int n = bTokOff_.size() - 1;
+
   // If the byte is at or before the start of the first token.
-  if (static_cast<size_t>(bByte) <= bTokOff_[0])
+  if (bByte <= bTokOff_[0])
     return 0;
 
   // If the byte is at or after the end of the last token (the sentinel).
-  if (static_cast<size_t>(bByte) >= bTokOff_[n])
+  if (bByte >= bTokOff_[n])
     return n;
 
-  int lo = 0;
-  int hi = n;
+  size_t lo = 0;
+  size_t hi = n;
 
   // Standard ceiling binary search.
   while (lo < hi) {
-    int mid = lo + (hi - lo) / 2;
-    int off = bTokOff_[mid];
-
+    size_t mid = lo + (hi - lo) / 2;
+    size_t off = bTokOff_[mid];
     if (off < bByte)
       lo = mid + 1;
     else
@@ -3008,7 +3096,7 @@ int RefoldEngine::BTokIndexCeil(int bByte) const {
   return lo;
 }
 
-std::pair<int, int>
+std::pair<size_t, size_t>
 RefoldEngine::MapAByteRangeToBTokenEnvelope(size_t aByteBegin,
                                             size_t aByteEnd) const {
   // Sanitize A-byte input range
@@ -3026,37 +3114,32 @@ RefoldEngine::MapAByteRangeToBTokenEnvelope(size_t aByteBegin,
     bByteEnd = bSource_.size();
 
   // Convert B-byte bounds to B-token index span
-  int bTokBegin = BTokIndexFloor(static_cast<int>(bByteBegin)); // inclusive
-  int bTokEnd = BTokIndexCeil(static_cast<int>(bByteEnd)); // exclusive
+  size_t bTokBegin = BTokIndexFloor(bByteBegin); // inclusive
+  size_t bTokEnd = BTokIndexCeil(bByteEnd);      // exclusive
 
   // Clamp B-token bounds
-  if (bTokBegin < 0)
-    bTokBegin = 0;
   if (bTokEnd < bTokBegin)
     bTokEnd = bTokBegin;
 
   return {bTokBegin, bTokEnd};
 }
 
-std::optional<std::pair<int, int>>
+std::optional<std::pair<size_t, size_t>>
 RefoldEngine::MapAToBTokenEnvelopeByPPArgSpan(
     const RefoldModel::PPArgSpan &sp) const {
-  // Use high-precision preprocessor offsets if available.
+  // 1. Primary path: Mapping via Preprocessor Byte Spans
   if (sp.ppByteBegin && sp.ppByteEnd) {
-    int64_t pp0 = *sp.ppByteBegin;
-    int64_t pp1 = *sp.ppByteEnd;
-    if (pp0 >= 0 && pp1 >= pp0) {
-      auto env = MapAByteRangeToBTokenEnvelope(static_cast<size_t>(pp0),
-                                               static_cast<size_t>(pp1));
-      trace("byte/env",
-            "PPArgSpan['{0}' arg={1} Aidx={2} PPbytes=[{3},{4})] -> "
-            "Btok=[{5},{6})",
-            sp.kind, sp.argIdx, sp.begin, pp0, pp1, env.first, env.second);
-      return env;
-    }
+    size_t pp0 = static_cast<size_t>(*sp.ppByteBegin);
+    size_t pp1 = static_cast<size_t>(*sp.ppByteEnd);
+    auto env = MapAByteRangeToBTokenEnvelope(pp0, pp1);
+    trace("byte/env",
+          "PPArgSpan['{0}' arg={1} Aidx={2} PPbytes=[{3},{4})] -> "
+          "Btok=[{5},{6})",
+          sp.kind, sp.argIdx, sp.begin, pp0, pp1, env.first, env.second);
+    return env;
   }
 
-  // Don't resort to "fallback" if in strict mode.
+  // 2. Don't resort to "fallback" if in strict mode.
   if (strict_) {
     fatal("macro/pparg/span",
           "PPArgSpan missing producer ppByte span (kind='{0}' argIdx={1} "
@@ -3065,63 +3148,65 @@ RefoldEngine::MapAToBTokenEnvelopeByPPArgSpan(
     return std::nullopt;
   }
 
-  // Fallback: use consumer token offsets.
-  const int maxATok = static_cast<int>(aToks_.size());
-  int a0Idx = std::clamp(sp.begin, 0, maxATok);
-  int a1Idx = std::clamp(sp.end, 0, maxATok);
+  // 3. Fallback: use consumer token offsets.
+  const uint64_t maxATok = static_cast<uint64_t>(aToks_.size());
+  uint64_t a0Idx = std::clamp(sp.begin, 0ULL, maxATok);
+  uint64_t a1Idx = std::clamp(sp.end, a0Idx, maxATok);
 
-  size_t a0 = aTokOff_[a0Idx];
-  size_t a1 = aTokOff_[a1Idx];
+  size_t a0 = aTokOff_[static_cast<size_t>(a0Idx)];
+  size_t a1 = aTokOff_[static_cast<size_t>(a1Idx)];
 
   return MapAByteRangeToBTokenEnvelope(a0, a1);
 }
 
-std::optional<std::pair<int, int>>
-RefoldEngine::MapATokRangeAToBTokenEnvelope(int beginTok, int endTok) const {
+std::optional<std::pair<size_t, size_t>>
+RefoldEngine::MapATokRangeAToBTokenEnvelope(uint64_t beginTok,
+                                            uint64_t endTok) const {
+  const uint64_t nA = static_cast<uint64_t>(aToks_.size());
+
   // If we don't have token data, we can't perform the mapping.
-  if (aToks_.empty() || aTokOff_.empty())
+  if (nA == 0 || aTokOff_.empty())
     return std::nullopt;
 
-  const int nA = static_cast<int>(aToks_.size());
-
   // Standardize the token indices.
-  beginTok = std::clamp(beginTok, 0, nA);
-  endTok = std::clamp(endTok, 0, nA);
+  beginTok = std::clamp(beginTok, 0ULL, nA);
+  endTok = std::clamp(endTok, beginTok, nA);
 
-  // If the range is empty or inverted, return null.
+  // If the range is empty or inverted, return nullopt.
   if (endTok <= beginTok)
     return std::nullopt;
 
-  // Safety check: ensure indices are within the offset array bounds.
-  // aTokOff_ is size N+1, so index 'nA' (the sentinel) is valid.
-  if (beginTok < 0 || static_cast<size_t>(beginTok) >= aTokOff_.size())
+  // Ensure we don't walk off the end of the offset array.
+  size_t idxEnd = static_cast<size_t>(endTok);
+  if (idxEnd >= aTokOff_.size()) {
+    // If we are missing the sentinel, we can't safely determine the end of the
+    // last token.
     return std::nullopt;
-  if (endTok < 0 || static_cast<size_t>(endTok) >= aTokOff_.size())
-    return std::nullopt;
+  }
 
-  const size_t aByteBegin = aTokOff_[beginTok];
-  const size_t aByteEnd = aTokOff_[endTok];
+  const size_t aByteBegin = aTokOff_[static_cast<size_t>(beginTok)];
+  const size_t aByteEnd = aTokOff_[idxEnd];
 
   // Delegate to the byte-to-token-envelope logic.
   return MapAByteRangeToBTokenEnvelope(aByteBegin, aByteEnd);
 }
 
-std::optional<std::vector<std::pair<int, int>>>
+std::optional<std::vector<std::pair<size_t, size_t>>>
 RefoldEngine::ParseMacroInvocationArgContentRanges(StringRef invText) {
   // Locate the start of the argument list.
   size_t open = invText.find('(');
   if (open == StringRef::npos)
     return std::nullopt;
 
-  std::vector<std::pair<int, int>> out;
+  std::vector<std::pair<size_t, size_t>> out;
   size_t n = invText.size();
 
-  int depth = 0;    // Track nested parentheses, brackets, or braces.
-  bool inS = false; // Inside a single-quoted character literal.
-  bool inD = false; // Inside a double-quoted string literal.
+  uint32_t depth = 0; // Track nested parentheses, brackets, or braces.
+  bool inS = false;   // Inside a single-quoted character literal.
+  bool inD = false;   // Inside a double-quoted string literal.
 
   size_t argStart = open + 1;
-  for (size_t i = open + 1; i < n; i++) {
+  for (size_t i = argStart; i < n; i++) {
     char c = invText[i];
 
     // Handle escaping and termination inside character literals.
@@ -3192,28 +3277,31 @@ RefoldEngine::BuildIncludeInsertionPatch(const RefoldModel::IncludeItem &inc,
   DebugIncludePatch("pre", inc, h);
 
   std::string insertBytes;
+  const size_t numOffsets = bTokOff_.size();
+  const size_t sourceLen = bSource_.size();
+
+  const size_t uBStart = static_cast<size_t>(h.bStart);
+  const size_t uBEnd = static_cast<size_t>(h.bEnd);
 
   // Validate hunk bounds against B-token offsets.
-  if (h.bStart >= 0 && static_cast<size_t>(h.bStart) < bTokOff_.size() &&
-      h.bEnd >= 0 && static_cast<size_t>(h.bEnd) < bTokOff_.size() &&
-      h.bEnd >= h.bStart) {
-    int b0 = bTokOff_[h.bStart];
-    int b1 = bTokOff_[h.bEnd];
+  if (uBStart < numOffsets && uBEnd < numOffsets && uBEnd >= uBStart) {
+    size_t b0 = bTokOff_[uBStart];
+    size_t b1 = bTokOff_[uBEnd];
 
     // Clamp byte offsets to the actual length of bSource_ (defensively handle
     // huge sizes).
-    const size_t sourceLen = bSource_.size();
-    const int maxLen =
-        (sourceLen > static_cast<size_t>(std::numeric_limits<int>::max()))
-            ? std::numeric_limits<int>::max()
-            : static_cast<int>(sourceLen);
-
-    b0 = std::clamp(b0, 0, maxLen);
-    b1 = std::clamp(b1, 0, maxLen);
-
-    if (b1 >= b0) {
+    b0 = std::min(b0, sourceLen);
+    b1 = std::clamp(b1, b0, sourceLen);
+    if (b1 > b0) {
       insertBytes = bSource_.substr(b0, b1 - b0).str();
     }
+  } else {
+    // Hardening: Log an error or assert if we get a hunk that points
+    // outside our known token universe.
+    fatal("include/patch",
+          "hunk bounds exceed token offset table for inc #{0}: "
+          "B[{1},{2}) requested, but bTokOff only has {3} entries",
+          inc.id, uBStart, uBEnd, numOffsets);
   }
 
   IncludePatch patch{&inc,  std::move(insertBytes), h.aStart, h.aEnd, h.bStart,
@@ -3230,19 +3318,19 @@ RefoldEngine::BuildIncludeInsertionPatch(const RefoldModel::IncludeItem &inc,
 std::optional<RefoldEngine::MacroPatch>
 RefoldEngine::BuildMacroInvocationPatchWholeCover(
     const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h,
-    ArrayRef<int> a2b, StringRef baseInvText,
-    const DenseMap<int, DenseMap<int, MacroPatch>> &patchMap) const {
+    ArrayRef<int64_t> a2b, StringRef baseInvText,
+    const DenseMap<std::optional<uint64_t>, DenseMap<uint64_t, MacroPatch>>
+        &patchMap) const {
   // The invocation byte span in the owning file must be known.
-  const int invStart = m.GetInvB();
-  const int invEnd = m.GetInvE();
-  if (invStart < 0 || invEnd < invStart)
+  const auto invStart = m.invB;
+  const auto invEnd = m.invE;
+  if (!invStart || *invEnd < *invStart)
     return std::nullopt;
 
   // Do not downgrade: if we already have a patch for this invocation and it
   // does not look like a callsite invocation anymore (i.e. we already
   // realized/expanded it), keep it.
-  const int ownerId = m.ownerIncludeId ? *m.ownerIncludeId : kNoOwner;
-  auto ownerIt = patchMap.find(ownerId);
+  auto ownerIt = patchMap.find(m.ownerIncludeId);
   if (ownerIt != patchMap.end()) {
     auto patchIt = ownerIt->second.find(m.id);
     if (patchIt != ownerIt->second.end()) {
@@ -3279,19 +3367,19 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   // 2) Whole-cover fallback: replace invocation with the entire expansion cover
   // slice from B. cover.begin/cover.end are PP-token indices in A; map them
   // into a B-token envelope.
-  const int covLoA = m.cover.begin;
-  const int covHiA = m.cover.end;
+  const uint64_t covLoA = m.cover.begin;
+  const uint64_t covHiA = m.cover.end;
 
-  if (covLoA < 0 || covHiA < 0 || covLoA >= covHiA)
+  if (covLoA >= covHiA)
     return std::nullopt;
 
   auto bEnv = MapATokRangeAToBTokenEnvelope(covLoA, covHiA);
   if (!bEnv)
     return std::nullopt;
 
-  int bTokStart = bEnv->first;
-  int bTokEnd = bEnv->second;
-  if (bTokStart < 0 || bTokEnd <= bTokStart)
+  size_t bTokStart = bEnv->first;
+  size_t bTokEnd = bEnv->second;
+  if (bTokEnd <= bTokStart)
     return std::nullopt;
 
   // Tighten the B-side envelope to the exact A-side cover boundary tokens when
@@ -3307,30 +3395,33 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   // tokens to the first/last A tokens of the macro cover, but only when the
   // expected token exists as an immediately-adjacent neighbor in B. This avoids
   // any heuristic scanning.
-  if (covLoA >= 0 && covLoA < static_cast<int>(aToks_.size()) &&
-      bTokStart >= 0 && bTokStart < static_cast<int>(bToks_.size())) {
-    StringRef want = aToks_[covLoA].spelling;
+  if (covLoA < aToks_.size() && bTokStart < bToks_.size()) {
+    StringRef want = aToks_[static_cast<size_t>(covLoA)].spelling;
     if (!want.empty()) {
-      if (StringRef(bToks_[bTokStart].spelling) != want && bTokStart > 0 &&
-          StringRef(bToks_[bTokStart - 1].spelling) == want) {
+      if (bToks_[bTokStart].spelling != want && bTokStart > 0 &&
+          bToks_[bTokStart - 1].spelling == want) {
         bTokStart--;
       }
     }
   }
 
-  if (covHiA - 1 >= 0 && covHiA - 1 < static_cast<int>(aToks_.size()) &&
-      bTokEnd > 0 && (bTokEnd - 1) < static_cast<int>(bToks_.size())) {
-    StringRef want = aToks_[covHiA - 1].spelling;
+  if (covHiA > 0 && (covHiA - 1) < aToks_.size() && bTokEnd > 0 &&
+      (bTokEnd - 1) < bToks_.size()) {
+    StringRef want = aToks_[static_cast<size_t>(covHiA - 1)].spelling;
     if (!want.empty()) {
-      if (StringRef(bToks_[bTokEnd - 1].spelling) != want && bTokEnd - 2 >= 0 &&
-          StringRef(bToks_[bTokEnd - 2].spelling) == want) {
+      if (bToks_[bTokEnd - 1].spelling != want && bTokEnd >= 2 &&
+          bToks_[bTokEnd - 2].spelling == want) {
         bTokEnd--;
       }
     }
   }
 
+  // Final check to ensure realignment didn't invert or empty the range.
+  if (bTokEnd <= bTokStart)
+    return std::nullopt;
+
   StringRef replacement = SliceBSource(bTokStart, bTokEnd).trim();
-  return MacroPatch{invStart, invEnd, replacement.str()};
+  return MacroPatch{*invStart, *invEnd, replacement.str()};
 }
 
 bool RefoldEngine::InvocationSpanMatchesCallsitePrefix(
@@ -3377,11 +3468,12 @@ bool RefoldEngine::InvocationSpanMatchesCallsitePrefix(
 // =========== Include processing (normalize, materialize, apply) ===========
 
 void RefoldEngine::MaterializeIncludeExpansion(
-    int includeId, const DenseMap<int, IncludeEdits> &perInclude,
-    const DenseMap<int, std::vector<MacroPatch>> &macroPatchesByOwner,
-    const DenseMap<int, std::vector<const RefoldModel::IncludeItem *>>
+    uint64_t includeId, const DenseMap<uint64_t, IncludeEdits> &perInclude,
+    const DenseMap<std::optional<uint64_t>, std::vector<MacroPatch>>
+        &macroPatchesByOwner,
+    const DenseMap<uint64_t, std::vector<const RefoldModel::IncludeItem *>>
         &children,
-    DenseMap<int, std::string> &includeExpansion) const {
+    DenseMap<uint64_t, std::string> &includeExpansion) const {
   // Already materialized?
   if (includeExpansion.count(includeId)) {
     debug("include/mat", "SKIP inc#{0} (already materialized)", includeId);
@@ -3470,7 +3562,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
     debug("include/mat", "inc#{0} has no include patches", inc->id);
   }
 
-  auto hasDescendantWork = [&](auto &&self, int id) -> bool {
+  auto hasDescendantWork = [&](auto &&self, uint64_t id) -> bool {
     // Direct work at this node?
     bool selfWork = false;
     if (auto it = perInclude.find(id); it != perInclude.end())
@@ -3521,10 +3613,9 @@ void RefoldEngine::MaterializeIncludeExpansion(
 
       // The child directive's site is recorded in the includer byte space.
       const auto &childText = includeExpansion[child->id];
-      const int n = static_cast<int>(bytes.size());
-      const int siteStart = std::clamp(static_cast<int>(child->siteB), 0, n);
-      const int siteEnd =
-          std::clamp(static_cast<int>(child->siteE), siteStart, n);
+      const size_t n = bytes.size();
+      const uint64_t siteStart = std::clamp<uint64_t>(child->siteB, 0ULL, n);
+      const uint64_t siteEnd = std::clamp<uint64_t>(child->siteE, siteStart, n);
 
       debug("include/mat",
             "REPLACE in inc#{0}: site=[{1},{2}) len(parent)={3} with child#{4} "
@@ -3570,30 +3661,33 @@ RefoldEngine::FindHeaderDeclForPatch(const RefoldModel::IncludeItem &inc,
   if (inc.decls.empty())
     return nullptr;
 
-  const int aLo = p.aStart;
-  const int aHi = p.aEnd;
+  const uint64_t aLo = p.aStart;
+  const uint64_t aHi = p.aEnd;
 
   const RefoldModel::HeaderDecl *bestCover = nullptr;
   const RefoldModel::HeaderDecl *bestOverlap = nullptr;
 
-  auto getSpanLen = [](const RefoldModel::HeaderDecl *d) {
-    return d->ppSpan.end - d->ppSpan.begin;
+  auto getSpanLen = [](const RefoldModel::HeaderDecl *d) -> uint64_t {
+    // Standardize: ensure we don't underflow if a span is somehow malformed.
+    if (d->span.end <= d->span.begin)
+      return 0;
+    return d->span.end - d->span.begin;
   };
 
   for (const auto &d : inc.decls) {
-    const int dLo = d.ppSpan.begin;
-    const int dHi = d.ppSpan.end;
-    const int curSpanLen = dHi - dLo;
+    const uint64_t dLo = d.span.begin;
+    const uint64_t dHi = d.span.end;
+    const uint64_t curSpanLen = dHi - dLo;
 
     // Pure insertion: treat as attached at aLo
     if (aLo == aHi) {
       // Special case: insertions at decl end are treated as inclusive
-      const bool inside = (aLo >= dLo && aLo <= dHi);
-      if (!inside)
-        continue;
-
-      if (!bestCover || curSpanLen < getSpanLen(bestCover))
-        bestCover = &d;
+      if (aLo >= dLo && aLo <= dHi) {
+        // Tie-breaker: prefer the "tightest" (smallest) declaration that covers
+        // this point.
+        if (!bestCover || curSpanLen < getSpanLen(bestCover))
+          bestCover = &d;
+      }
       continue;
     }
 
@@ -3602,9 +3696,13 @@ RefoldEngine::FindHeaderDeclForPatch(const RefoldModel::IncludeItem &inc,
     const bool overlaps = (aLo < dHi && aHi > dLo);
 
     if (covers) {
+      // Prioritize "Cover": we want the smallest decl that completely contains
+      // the patch.
       if (!bestCover || curSpanLen < getSpanLen(bestCover))
         bestCover = &d;
     } else if (overlaps) {
+      // Fallback to "Overlap": if no decl covers it, find the smallest one that
+      // touches it.
       if (!bestOverlap || curSpanLen < getSpanLen(bestOverlap))
         bestOverlap = &d;
     }
@@ -3618,7 +3716,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                                       std::string headerText) const {
   const std::string file = resolveHeaderPath(*ie.include);
 
-  const int fileLen = static_cast<int>(headerText.size());
+  const size_t fileLen = headerText.size();
 
   debug("include/apply",
         "ENTER computeIncludeTextEdits file={0} len={1} patches={2} "
@@ -3628,8 +3726,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
 
   // PP cover for this include inside the header; if not present, these will
   // already have been derived from spans when building the model.
-  const int coverBegin = std::max(0, ie.include->cover.begin);
-  const int coverEnd = std::max(coverBegin, ie.include->cover.end);
+  const uint64_t coverBegin = std::max(0ULL, ie.include->cover.begin);
+  const uint64_t coverEnd = std::max(coverBegin, ie.include->cover.end);
 
   // Single list of edits; we will apply them highest-offset-first so indices
   // remain stable as we mutate the StringBuilder.
@@ -3662,9 +3760,9 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     if (decl) {
       debug("include/apply",
             "file={0} patch[{1}] ownerDecl kind={2} name={3} header=[{4},{5}) "
-            "ppSpan=[{6},{7})",
+            "pp-span=[{6},{7})",
             file, idx, decl->kind, decl->name, decl->headerB, decl->headerE,
-            decl->ppSpan.begin, decl->ppSpan.end);
+            decl->span.begin, decl->span.end);
     } else {
       debug("include/apply", "file={0} patch[{1}] ownerDecl=<none>", file, idx);
     }
@@ -3675,11 +3773,11 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     // `int yyy(...);` and `int zzz(...);`) can anchor to the first token
     // of the following declaration rather than being forced back inside the
     // previous one.  For DELETE / REPLACE we restrict to the owning decl.
-    int ppLo = coverBegin;
-    int ppHi = coverEnd;
+    uint64_t ppLo = coverBegin;
+    uint64_t ppHi = coverEnd;
     if (!isInsert && decl) {
-      ppLo = std::max(ppLo, decl->ppSpan.begin);
-      ppHi = std::min(ppHi, decl->ppSpan.end);
+      ppLo = std::max(ppLo, decl->span.begin);
+      ppHi = std::min(ppHi, decl->span.end);
     }
     ppHi = std::max(ppHi, ppLo);
 
@@ -3687,17 +3785,17 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
           "file={0} patch[{1}] effectivePP=[{2},{3}) cover=[{4},{5})", file,
           idx, ppLo, ppHi, coverBegin, coverEnd);
 
-    int startByte = -1;
-    int endByte = -1;
+    std::optional<uint64_t> startByte;
+    std::optional<uint64_t> endByte;
 
     const auto &tokmapByPP = model_.GetTokmapByPP();
     if (isInsert) {
       // INSERT: interpret A-position as "before the next token" in this header.
-      const int pos = p.aStart;
-      int anchorPP = -1;
+      const uint64_t pos = p.aStart;
+      std::optional<uint64_t> anchorPP;
 
       // 1) Prefer the right neighbor: smallest pp >= pos in [ppLo, ppHi).
-      for (int pp = std::max(pos, ppLo); pp < ppHi; ++pp) {
+      for (uint64_t pp = std::max(pos, ppLo); pp < ppHi; ++pp) {
         auto it = tokmapByPP.find(pp);
         if (it != tokmapByPP.end() && PathsEqual(it->second.file, file)) {
           anchorPP = pp;
@@ -3705,40 +3803,44 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         }
       }
 
-      if (anchorPP >= 0) {
+      if (anchorPP) {
         // Insert immediately before the right neighbor token.
-        startByte = ByteStartForPPInFile(file, anchorPP,
+        startByte = ByteStartForPPInFile(file, *anchorPP,
                                          /* fallbackToEOF */ false, fileLen);
         trace("include/apply",
               "file={0} patch[{1}] INSERT: right-neighbor anchorPP={2} -> "
               "startByte={3}",
               file, idx, anchorPP, startByte);
-        if (startByte < 0) {
+        if (!startByte) {
           continue;
         }
       } else {
         // 2) No right neighbor; fall back to the last left neighbor.
-        for (int pp = std::min(pos - 1, ppHi - 1); pp >= ppLo; --pp) {
-          auto it = tokmapByPP.find(pp);
-          if (it != tokmapByPP.end() && PathsEqual(it->second.file, file)) {
-            anchorPP = pp;
-            break;
+        if (pos > ppLo && ppHi > ppLo) {
+          for (uint64_t pp = std::min(pos - 1, ppHi - 1);; --pp) {
+            auto it = tokmapByPP.find(pp);
+            if (it != tokmapByPP.end() && PathsEqual(it->second.file, file)) {
+              anchorPP = pp;
+              break;
+            }
+            if (pp == ppLo)
+              break;
           }
         }
 
-        if (anchorPP >= 0) {
-          startByte = ByteEndForPPInFile(file, anchorPP, false, fileLen);
+        if (anchorPP) {
+          startByte = ByteEndForPPInFile(file, *anchorPP, false, fileLen);
           trace("include/apply",
                 "file={0} patch[{1}] INSERT: left-neighbor anchorPP={2} -> "
                 "startByte={3}",
                 file, idx, anchorPP, startByte);
-          if (startByte < 0) {
+          if (!startByte) {
             continue;
           }
         } else if (decl) {
           // 3) No PP neighbor at all in this header, but we have an owning
           // decl: anchor at the end of its header span.
-          startByte = std::clamp(decl->headerE, 0, fileLen);
+          startByte = std::clamp<uint64_t>(decl->headerE, 0ULL, fileLen);
           trace(
               "include/apply",
               "file={0} patch[{1}] INSERT: no neighbors; anchor at declEnd={2}",
@@ -3746,15 +3848,16 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         } else {
           // 4) Fallback: use child '#include' sites inside this header as
           // synthetic anchors.
-          const int insertByte = ComputeChildBoundaryInsertByte(p, file);
+          const std::optional<uint64_t> insertByte =
+              ComputeChildBoundaryInsertByte(p, file);
           debug("include/apply.", "inserted byte {0}", insertByte);
-          if (insertByte >= 0 && insertByte <= fileLen) {
+          if (insertByte && *insertByte <= fileLen) {
             std::string text =
-                PadAtBoundaries(headerText, static_cast<size_t>(insertByte),
-                                static_cast<size_t>(insertByte), p.insertBytes,
+                PadAtBoundaries(headerText, static_cast<size_t>(*insertByte),
+                                static_cast<size_t>(*insertByte), p.insertBytes,
                                 /* allowLeft */ true, /* allowRight */ true);
             edits.push_back(MakeTextEditWithResyncOrPending(
-                headerText, insertByte, insertByte, text, file));
+                headerText, *insertByte, *insertByte, text, file));
 
             debug("include/apply.",
                   "file={0} patch[{1}] INSERT: anchored via child boundary at "
@@ -3776,8 +3879,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     } else {
       // DELETE / REPLACE: map non-empty A-range to byte range within this
       // header.
-      int aLo = std::max(p.aStart, ppLo);
-      int aHi = std::min(p.aEnd, ppHi);
+      uint64_t aLo = std::max(p.aStart, ppLo);
+      uint64_t aHi = std::min(p.aEnd, ppHi);
       if (aHi <= aLo) {
         // Nothing of this patch lies in this header/declaration.
         debug("include/apply",
@@ -3786,17 +3889,17 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         continue;
       }
 
-      int firstPP = -1, lastPP = -1;
-      for (int pp = aLo; pp < aHi; ++pp) {
+      std::optional<uint64_t> firstPP, lastPP;
+      for (uint64_t pp = aLo; pp < aHi; ++pp) {
         auto it = tokmapByPP.find(pp);
         if (it != tokmapByPP.end() && PathsEqual(it->second.file, file)) {
-          if (firstPP < 0)
+          if (!firstPP)
             firstPP = pp;
           lastPP = pp;
         }
       }
 
-      if (firstPP < 0 || lastPP < 0) {
+      if (!firstPP || !lastPP) {
         // No tokens from this patch actually map into this header file.
         debug("include/apply",
               "file={0} patch[{1}] DELETE/REPLACE: no mapped PP tokens in "
@@ -3805,15 +3908,15 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         continue;
       }
 
-      startByte = ByteStartForPPInFile(file, firstPP, /* fallbackToEOF */ false,
-                                       fileLen);
+      startByte = ByteStartForPPInFile(file, *firstPP,
+                                       /* fallbackToEOF */ false, fileLen);
       endByte =
-          ByteEndForPPInFile(file, lastPP, /* fallbackToEOF */ false, fileLen);
+          ByteEndForPPInFile(file, *lastPP, /* fallbackToEOF */ false, fileLen);
       trace("include/apply",
             "file={0} patch[{1}] DELETE/REPLACE: firstPP={2} lastPP={3} -> "
             "bytes=[{4},{5})",
             file, idx, firstPP, lastPP, startByte, endByte);
-      if (startByte < 0 || endByte < 0) {
+      if (!startByte || !endByte) {
         continue;
       }
     }
@@ -3823,15 +3926,17 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     // anchor to sit on the boundary between two declarations so that a new
     // declaration can be injected cleanly between them.
     if (!isInsert && decl) {
-      startByte = std::clamp(startByte, decl->headerB, decl->headerE);
-      endByte = std::clamp(endByte, decl->headerB, decl->headerE);
+      startByte = std::clamp(*startByte, decl->headerB, decl->headerE);
+      endByte = std::clamp(*endByte, decl->headerB, decl->headerE);
     }
 
     // Sanity clamp to file bounds.
-    if (startByte < 0)
+    if (!startByte)
       continue;
-    startByte = std::clamp(startByte, 0, fileLen);
-    endByte = std::clamp(endByte, startByte, fileLen);
+
+    const uint64_t fLen = static_cast<uint64_t>(fileLen);
+    startByte = std::clamp(*startByte, uint64_t(0), fLen);
+    endByte = std::clamp(*endByte, *startByte, fLen);
 
     std::string replacement = isDelete ? "" : p.insertBytes;
 
@@ -3841,7 +3946,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
 
       // DEBUG: log the exact slice and replacement we are about to apply.
       const std::string originalSlice =
-          headerText.substr(startByte, endByte - startByte);
+          headerText.substr(*startByte, *endByte - *startByte);
       std::string origDbg = originalSlice;
       std::string replDbg = replacement;
       constexpr int MAX_DBG = 120;
@@ -3855,9 +3960,9 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       std::string declInfo = "<none>";
       if (decl) {
         declInfo =
-            formatv("kind={0} name={1} header=[{2},{3}) ppSpan=[{4},{5})",
+            formatv("kind={0} name={1} header=[{2},{3}) pp-span=[{4},{5})",
                     decl->kind, decl->name, decl->headerB, decl->headerE,
-                    decl->ppSpan.begin, decl->ppSpan.end)
+                    decl->span.begin, decl->span.end)
                 .str();
       }
 
@@ -3870,7 +3975,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     }
 
     edits.push_back(MakeTextEditWithResyncOrPending(
-        headerText, startByte, endByte, replacement, file));
+        headerText, *startByte, *endByte, replacement, file));
   }
 
   // Apply all edits inside this header, highest offset first so earlier edits
@@ -3889,8 +3994,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
           "file={0} header TextEdit bytes=[{1},{2}) replLen={3}", file, e.start,
           e.end, e.text.size());
 
-    if (e.start < 0 || e.end < e.start ||
-        e.end > static_cast<int>(headerText.size())) {
+    if (e.end < e.start || e.end > static_cast<uint64_t>(headerText.size())) {
       fatal("include/apply", "TextEdit out of bounds: bytes=[{0},{1}) size={2}",
             e.start, e.end, headerText.size());
     }
@@ -3899,12 +4003,13 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
   return edits;
 }
 
-int RefoldEngine::ComputeChildBoundaryInsertByte(const IncludePatch &p,
-                                                 StringRef file) const {
+std::optional<uint64_t>
+RefoldEngine::ComputeChildBoundaryInsertByte(const IncludePatch &p,
+                                             StringRef file) const {
   // Which include are we editing?
   const RefoldModel::IncludeItem *owner = p.include;
   if (!owner) {
-    return -1;
+    return std::nullopt;
   }
 
   // We only care about children whose sitePath is this header file.
@@ -3913,7 +4018,7 @@ int RefoldEngine::ComputeChildBoundaryInsertByte(const IncludePatch &p,
   const RefoldModel::IncludeItem *right =
       nullptr; // first child whose coverBegin >= pos
 
-  int pos = p.aStart; // PP position of the INSERT gap
+  uint64_t pos = p.aStart; // PP position of the INSERT gap
 
   for (const auto &child : model_.GetIncludes()) {
     // Only check direct children of the owner
@@ -3926,15 +4031,15 @@ int RefoldEngine::ComputeChildBoundaryInsertByte(const IncludePatch &p,
       continue;
     }
 
-    int cb = child.cover.begin;
-    int ce = child.cover.end;
+    uint64_t cb = child.cover.begin;
+    uint64_t ce = child.cover.end;
 
     // If the INSERT PP-index is *strictly inside* a child's cover, this
     // fallback is the wrong mechanism (that should have been a child-owned
     // patch). Gaps on the boundaries (pos == cb or pos == ce) are valid
     // "between-children" positions and must *not* trigger this guard.
     if (cb < pos && pos < ce) {
-      return -1;
+      return std::nullopt;
     }
 
     if (ce <= pos) {
@@ -3959,21 +4064,21 @@ int RefoldEngine::ComputeChildBoundaryInsertByte(const IncludePatch &p,
     return left->siteE;
   }
 
-  return -1;
+  return std::nullopt;
 }
 
 RefoldEngine::ResyncOutcome
-RefoldEngine::ApplyResyncOrPend(StringRef originalFileText, int start, int end,
-                                StringRef replacement,
+RefoldEngine::ApplyResyncOrPend(StringRef originalFileText, uint64_t start,
+                                uint64_t end, StringRef replacement,
                                 StringRef fileSpellingForDirective) const {
-  int origNl = stringutils::countNewlines(originalFileText, start, end);
-  int replNl = stringutils::countNewlines(replacement, 0,
-                                          static_cast<int>(replacement.size()));
+  size_t origNl = stringutils::countNewlines(originalFileText, start, end);
+  size_t replNl =
+      stringutils::countNewlines(replacement, 0, replacement.size());
   if (origNl == replNl)
     return ResyncOutcome(replacement.str(), std::nullopt);
 
   // Drift detected: decide whether to inject a local `#line` or defer.
-  int resumeLine = stringutils::lineAtOffset(originalFileText, end);
+  size_t resumeLine = stringutils::lineAtOffset(originalFileText, end);
   trace("linedir/resync",
         "drift: span=[{0},{1}) origNl={2} replNl={3} resumeLine={4} file={5} "
         "replTail={6}",
@@ -4005,7 +4110,7 @@ RefoldEngine::ApplyTextEditsWithPendingResync(StringRef originalFileText,
   if (edits.empty())
     return originalFileText.str();
 
-  DenseMap<std::pair<int, int>, const TextEdit *> bySpan;
+  DenseMap<std::pair<uint64_t, uint64_t>, const TextEdit *> bySpan;
   for (const auto &e : edits) {
     bySpan[{e.start, e.end}] = &e;
   }
@@ -4025,11 +4130,11 @@ RefoldEngine::ApplyTextEditsWithPendingResync(StringRef originalFileText,
   out.reserve(originalFileText.size() + 128);
   std::optional<PendingResync> pending = std::nullopt;
 
-  int cursor = 0;
-  int n = static_cast<int>(originalFileText.size());
+  uint64_t cursor = 0;
+  size_t n = originalFileText.size();
 
   for (const auto *e : norm) {
-    if (e->start < 0 || e->end < e->start || e->end > n) {
+    if (e->end < e->start || e->end > n) {
       fatal("edits/apply", "bad edit bounds [{0},{1}) fileLen={2}", e->start,
             e->end, n);
     }
@@ -4059,23 +4164,22 @@ RefoldEngine::ApplyTextEditsWithPendingResync(StringRef originalFileText,
 
 std::optional<RefoldEngine::PendingResync>
 RefoldEngine::AppendOriginalSliceWithPending(
-    SmallVectorImpl<char> &out, llvm::StringRef original, int from, int to,
-    std::optional<RefoldEngine::PendingResync> pending) const {
+    SmallVectorImpl<char> &out, llvm::StringRef original, uint64_t from,
+    uint64_t to, std::optional<RefoldEngine::PendingResync> pending) const {
   if (!pending || !lineDirs_.Enabled()) {
     auto slice = original.slice(from, to);
     out.append(slice.begin(), slice.end());
     return std::nullopt;
   }
 
-  int i = from;
+  uint64_t i = from;
 
   // Only flush immediately if BOTH:
   // (1) output is at BOL, and
   // (2) the next original slice begins at BOL in the original file
   if (stringutils::outAtBOL(StringRef(out.data(), out.size())) &&
-      stringutils::isBOL(original, from)) {
-
-    int line = stringutils::lineAtOffset(original, from);
+      stringutils::isBOL(original, static_cast<size_t>(from))) {
+    size_t line = stringutils::lineAtOffset(original, from);
     std::string directive =
         lineDirs_.FormatLineDirective(line, pending->fileSpellingForDir);
 
@@ -4096,7 +4200,8 @@ RefoldEngine::AppendOriginalSliceWithPending(
             stringutils::dbgOutTail(currentOut));
     }
 
-    auto slice = original.slice(from, to);
+    auto slice =
+        original.slice(static_cast<size_t>(from), static_cast<size_t>(to));
     out.append(slice.begin(), slice.end());
     return std::nullopt;
   }
@@ -4105,22 +4210,21 @@ RefoldEngine::AppendOriginalSliceWithPending(
   // line-spliced).
   while (i < to) {
     size_t nl = original.find('\n', i);
-    if (nl == llvm::StringRef::npos || static_cast<int>(nl) >= to)
+    if (nl == llvm::StringRef::npos || nl >= static_cast<size_t>(to))
       break;
 
-    int nlIdx = static_cast<int>(nl);
-    auto slice = original.slice(i, nlIdx + 1);
+    auto slice = original.slice(static_cast<size_t>(i), nl + 1);
     out.append(slice.begin(), slice.end());
 
-    // Update our view of the output after appending the newline
-    StringRef currentOut(out.data(), out.size());
-    i = nlIdx + 1;
+    i = nl + 1;
 
-    if (!stringutils::isLineSplice(original, nlIdx)) {
-      int line = stringutils::lineAtOffset(original, i);
+    if (!stringutils::isLineSplice(original, nl)) {
+      size_t line = stringutils::lineAtOffset(original, static_cast<size_t>(i));
       std::string directive =
           lineDirs_.FormatLineDirective(line, pending->fileSpellingForDir);
 
+      // Update our view of the output after appending the newline
+      StringRef currentOut(out.data(), out.size());
       if (LineDirectiveInserter::ShouldEmitLineDirective(
               currentOut, pending->fileSpellingForDir, line, directive)) {
         trace("line/pending",
@@ -4141,8 +4245,12 @@ RefoldEngine::AppendOriginalSliceWithPending(
     }
   }
 
-  auto remaining = original.slice(i, to);
-  out.append(remaining.begin(), remaining.end());
+  // Clean up remaining bytes
+  if (i < to) {
+    auto remaining =
+        original.slice(static_cast<size_t>(i), static_cast<size_t>(to));
+    out.append(remaining.begin(), remaining.end());
+  }
   return pending;
 }
 
@@ -4173,27 +4281,28 @@ bool RefoldEngine::PathsEqual(StringRef a, StringRef b) {
 void RefoldEngine::DebugIncludePatch(StringRef tag,
                                      const RefoldModel::IncludeItem &inc,
                                      const diffutils::Hunk &h) const {
-  int a0 = (h.aStart >= 0 && static_cast<size_t>(h.aStart) < aTokOff_.size())
-               ? aTokOff_[h.aStart]
-               : -1;
-  int a1 = (h.aEnd >= 0 && static_cast<size_t>(h.aEnd) < aTokOff_.size())
-               ? aTokOff_[h.aEnd]
-               : -1;
+  auto getByteOff = [](uint64_t tokenIdx,
+                       ArrayRef<size_t> offsets) -> std::optional<uint64_t> {
+    if (tokenIdx < offsets.size()) {
+      return static_cast<uint64_t>(offsets[static_cast<size_t>(tokenIdx)]);
+    }
+    return std::nullopt;
+  };
 
-  int b0 = (h.bStart >= 0 && static_cast<size_t>(h.bStart) < bTokOff_.size())
-               ? bTokOff_[h.bStart]
-               : -1;
-  int b1 = (h.bEnd >= 0 && static_cast<size_t>(h.bEnd) < bTokOff_.size())
-               ? bTokOff_[h.bEnd]
-               : -1;
+  const std::optional<uint64_t> a0 = getByteOff(h.aStart, aTokOff_);
+  const std::optional<uint64_t> a1 = getByteOff(h.aEnd, aTokOff_);
+  const std::optional<uint64_t> b0 = getByteOff(h.bStart, bTokOff_);
+  const std::optional<uint64_t> b1 = getByteOff(h.bEnd, bTokOff_);
 
   StringRef aSlice = "";
-  if (a0 >= 0 && a1 >= a0 && static_cast<size_t>(a1) <= aSource_.size()) {
-    aSlice = aSource_.substr(a0, a1 - a0);
+  if (a0 && a1 && *a1 >= *a0 && *a1 <= aSource_.size()) {
+    aSlice = aSource_.substr(static_cast<size_t>(*a0),
+                             static_cast<size_t>(*a1 - *a0));
   }
   StringRef bSlice = "";
-  if (b0 >= 0 && b1 >= b0 && static_cast<size_t>(b1) <= bSource_.size()) {
-    bSlice = bSource_.substr(b0, b1 - b0);
+  if (b0 && b1 && *b1 >= *b0 && *b1 <= bSource_.size()) {
+    bSlice = bSource_.substr(static_cast<size_t>(*b0),
+                             static_cast<size_t>(*b1 - *b0));
   }
 
   trace("include/patch",
@@ -4209,15 +4318,15 @@ std::string RefoldEngine::PPArgSpanToString(const RefoldModel::PPArgSpan &sp,
   std::string storage;
   llvm::raw_string_ostream os(storage);
 
-  os << "{kind=" << static_cast<int>(sp.kind) << ", A=[" << sp.begin << ','
-     << sp.end << ')' << ", argIdx=" << sp.argIdx;
+  os << formatv("{kind='{0}', A=[{1},{2}), argIdx={3}", sp.kind, sp.begin,
+                sp.end, sp.argIdx);
 
   if (isStringifyOcc) {
     os << ", occ=STRINGIFY";
   }
 
   if (sp.kind == PPArgSpanKind::Paste) {
-    os << ", byte=[" << sp.byteBegin << ',' << sp.byteEnd << ')';
+    os << formatv(", byte=[{0},{1})", sp.byteBegin, sp.byteEnd);
   }
 
   os << '}';

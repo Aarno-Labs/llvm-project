@@ -51,6 +51,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 
+#include <cstdint>
 #include <string>
 #include <utility>
 
@@ -68,7 +69,7 @@ struct TokenSpan {
 
 struct ArgTokenSpan {
   uint64_t Begin = 0, End = 0;
-  int ArgIndex = -1;
+  std::optional<uint32_t> ArgIndex;
   bool Open = false;
 
   // For paste_spans only: byte range within the spelled output token
@@ -79,9 +80,14 @@ struct ArgTokenSpan {
 };
 
 struct PastePart {
-  // ArgIndex >= 0 is a macro argument index; -1 denotes a literal contribution.
-  int ArgIndex = -1;
-  uint32_t ByteBegin = 0, ByteEnd = 0;
+  // ArgIndex >= 0 is a macro argument index; nullopt denotes a literal
+  // contribution.
+  std::optional<uint32_t> ArgIndex = std::nullopt;
+  uint32_t ByteBegin = 0;
+  uint32_t ByteEnd = 0;
+  
+  // Add an explicit constructor to ensure no garbage bytes
+  PastePart() : ArgIndex(std::nullopt), ByteBegin(0), ByteEnd(0) {}
 };
 
 struct PasteToken {
@@ -93,10 +99,10 @@ struct HeaderDecl {
   std::string Kind;  // "function", "unknown", etc.
   std::string Name;  // e.g. "first"
   std::string File;  // header path for header_span.file
-  unsigned HeaderB = 0;
-  unsigned HeaderE = 0;
-  unsigned PPBegin = 0; // A-token index
-  unsigned PPEnd = 0;   // A-token index
+  uint64_t HeaderB = 0;
+  uint64_t HeaderE = 0;
+  uint64_t PPBegin = 0; // A-token index
+  uint64_t PPEnd = 0;   // A-token index
 };
 
 /// Discriminates item category in the map: preprocessor directive, macro, or
@@ -106,20 +112,21 @@ enum ItemKind { IK_Directive, IK_Macro, IK_File };
 /// A recorded unit in the map: include/macro/directive/file, with text,
 /// anchors, and contiguous token spans over the printed stream.
 struct Item {
-  int ID = -1;
+  uint64_t ID = 0;
   ItemKind Kind = IK_File;
   std::string Subkind; // "#include", "#define", ...
   std::string Name;    // macro name
   std::string Text;    // directive text
   std::string InvText; // macro call text
   std::string InvFile; // file containing the macro invocation
-  bool IsBuiltinMacro = false; // true for predefined/builtin macros (e.g. __FILE__)
-  SourceLocation Loc;  // primary location
+  bool IsBuiltinMacro =
+      false;          // true for predefined/builtin macros (e.g. __FILE__)
+  SourceLocation Loc; // primary location
   std::vector<TokenSpan> Spans;
-  std::vector<ArgTokenSpan> ArgSpans; // tokens from any actual arguments
+  std::vector<ArgTokenSpan> ArgSpans;       // tokens from any actual arguments
   std::vector<ArgTokenSpan> StringifySpans; // tokens produced by #param
-  std::vector<ArgTokenSpan> PasteSpans;     // tokens produced by ## involving param
-  std::vector<TokenSpan> BodySpans;   // tokens from the macro body
+  std::vector<ArgTokenSpan> PasteSpans; // tokens produced by ## involving param
+  std::vector<TokenSpan> BodySpans;     // tokens from the macro body
 
   // Macro-body tokens can be *derived* from invocation arguments via
   // projections:
@@ -132,45 +139,50 @@ struct Item {
   // against those spellings during onToken().
   //
   // These are not serialized; only StringifySpans/PasteSpans are.
-  StringMap<SmallVector<int, 2>> StringifySpell2ArgIndices;
-  StringMap<SmallVector<int, 2>> PasteSpell2ArgIndices;
+  StringMap<SmallVector<uint32_t, 2>> StringifySpell2ArgIndices;
 
-  // Precomputed token-paste projections for this macro invocation, in expansion order.
+  // Precomputed token-paste projections for this macro invocation, in expansion
+  // order.
   SmallVector<PasteToken, 4> PasteTokens;
   size_t PasteTokenCursor = 0;
 
   // Reverse index: pasted spelling -> indices into PasteTokens.
-  StringMap<SmallVector<unsigned, 2>> PasteSpell2TokenIndices;
+  StringMap<SmallVector<size_t, 2>> PasteSpell2TokenIndices;
 
   // Invocation-site byte ranges [begin,end) for each actual argument (index
   // matches formal parameter order).
-  std::vector<std::pair<long long, long long>> InvArgRanges;
+  std::vector<std::pair<std::optional<uint64_t>, std::optional<uint64_t>>>
+      InvArgRanges;
   std::vector<HeaderDecl> Decls;
 
   // main-file byte range of the macro invocation (if applicable)
-  long long InvBegin = -1;
-  long long InvEnd = -1;
+  std::optional<uint64_t> InvBegin;
+  std::optional<uint64_t> InvEnd;
 
   // --- New: include-site anchors and structure ---
-  long long SiteBegin = -1;    // byte offset of '#' in the directive's file
-  long long SiteEnd = -1;      // one-past-end of the directive line (incl. EOL)
+  std::optional<uint64_t>
+      SiteBegin; // byte offset of '#' in the directive's file
+  std::optional<uint64_t>
+      SiteEnd;                 // one-past-end of the directive line (incl. EOL)
   std::string SitePath;        // file path that contains the directive
   std::string TargetAsWritten; // as-written header token ("e.h" or <vector>)
   std::string ResolvedPath;    // filesystem path actually opened for include
   bool IsAngled = false;       // <...> vs "..."
-  int Parent = -1;             // parent include item id, or -1 if top-level
-  int OwnerIncludeId =
-      -1; // include item id that opened the file containing this item
+  std::optional<uint64_t>
+      Parent; // parent include item id, or nullopt if top-level
+  std::optional<uint64_t> OwnerIncludeId; // include item id that opened the
+                                          // file containing this item
 };
 
 // Small utility to append/extend a half-open token span list.
-inline void touchTokSpan(std::vector<TokenSpan> &V, uint32_t TokIdx) {
+inline void touchTokSpan(std::vector<TokenSpan> &V, uint64_t TokIdx) {
   if (V.empty() || V.back().End != TokIdx) V.push_back({TokIdx, TokIdx+1});
   else V.back().End++;
 }
 
 // Small utility to append/extend a half-open token span list (args only).
-inline void touchArgTokSpan(std::vector<ArgTokenSpan> &V, uint32_t TokIdx, int ArgIndex) {
+inline void touchArgTokSpan(std::vector<ArgTokenSpan> &V, uint64_t TokIdx,
+                            uint32_t ArgIndex) {
   if (!V.empty() && V.back().Open && V.back().End == TokIdx &&
       V.back().ArgIndex == ArgIndex) {
     V.back().End = TokIdx + 1;
@@ -192,8 +204,8 @@ inline void touchArgTokSpan(std::vector<ArgTokenSpan> &V, uint32_t TokIdx, int A
 struct TokMapEntry {
   std::string File; // path of the source file containing [SrcBegin,SrcEnd)
   uint64_t PPIndex = 0;
-  long long SrcBegin = -1;
-  long long SrcEnd = -1;
+  uint64_t SrcBegin = 0;
+  uint64_t SrcEnd = 0;
 };
 
 /// One arm of a conditional group (#if/#elif/#else), with kind, condition text,
@@ -253,10 +265,11 @@ class RefoldMapBuilder {
   std::vector<uint64_t> TokPPByteEnd;
 
   std::vector<Item> Items;
-  llvm::StringMap<int> MacroKey2Item;
-  llvm::StringMap<int> IncludeKey2Item;
-  std::vector<int> IncludeStack; // item indices (include items), -1 for none
-  int CurrentFileItem = -1;
+  llvm::StringMap<size_t> MacroKey2Item;
+  llvm::StringMap<size_t> IncludeKey2Item;
+  std::vector<std::optional<size_t>> IncludeStack; // item indices (include items),
+                                                   // nullopt for none
+  std::optional<size_t> CurrentFileItem;
 
   std::vector<TokMapEntry> TokMap;
 
@@ -279,8 +292,10 @@ class RefoldMapBuilder {
   /// end-of-file if the line is unterminated). Used to anchor directive sites
   /// in the source file.
   ///
-  /// \returns (begin, end) in the directive’s source file.
-  std::pair<long long, long long> computeDirectiveLine(SourceLocation HashLoc);
+  /// \returns (begin, end) in the directive’s source file (or nullopt if not
+  ///          valid)
+  std::optional<std::pair<uint64_t, uint64_t>>
+  computeDirectiveLine(SourceLocation HashLoc);
 
   /// Canonical absolute path for a file entry (when possible).
   ///
@@ -303,13 +318,13 @@ class RefoldMapBuilder {
 
   // Maps a macro-expanded token’s spelling location back to the invocation-site
   // argument index (0..N-1). Returns -1 if unknown / not in invocation file.
-  int argIndexForSpellingLoc(const Item &MI, SourceLocation Loc,
-                             SourceManager &SM, const LangOptions &Lang,
-                             bool EmitAbsPaths);
+  std::optional<uint32_t>
+  argIndexForSpellingLoc(const Item &MI, SourceLocation Loc, SourceManager &SM,
+                         const LangOptions &Lang, bool EmitAbsPaths);
 
   void addHeaderDecl(Item &Inc, StringRef Kind, StringRef Name,
-                     StringRef HeaderFile, unsigned HeaderB,
-                     unsigned HeaderE, unsigned PPBegin, unsigned PPEnd) {
+                     StringRef HeaderFile, uint64_t HeaderB, uint64_t HeaderE,
+                     uint64_t PPBegin, uint64_t PPEnd) {
     HeaderDecl D;
     D.Kind = Kind.str();
     D.Name = Name.str();
@@ -322,10 +337,10 @@ class RefoldMapBuilder {
   }
 
   void addHeaderDecl(Item &Inc, StringRef Name, StringRef HeaderFile,
-                     unsigned HeaderB, unsigned HeaderE, unsigned PPBegin,
-                     unsigned PPEnd) {
-    addHeaderDecl(Inc, "unknown", Name, HeaderFile, HeaderB, HeaderE,
-                  PPBegin, PPEnd);
+                     uint64_t HeaderB, uint64_t HeaderE, uint64_t PPBegin,
+                     uint64_t PPEnd) {
+    addHeaderDecl(Inc, "unknown", Name, HeaderFile, HeaderB, HeaderE, PPBegin,
+                  PPEnd);
   }
 
 public:
@@ -354,13 +369,13 @@ public:
   /// currently open, this advances its End to `CurTokIndex + 1`; otherwise, a
   /// new open span starting at `CurTokIndex` is created.
   ///
-  /// \param ItemIdx  Index into the internal `Items` vector; negative is
+  /// \param ItemIdx  Index into the internal `Items` vector; nullopt is
   ///                 ignored.
   /// \param CurTokIndex Zero-based index of the just-emitted printed token.
-  void touchSpanForItem(int ItemIdx, uint64_t CurTokIndex) {
-    if (ItemIdx < 0)
+  void touchSpanForItem(std::optional<size_t> ItemIdx, uint64_t CurTokIndex) {
+    if (!ItemIdx)
       return;
-    auto &V = Items[(size_t)ItemIdx].Spans;
+    auto &V = Items[*ItemIdx].Spans;
     if (!V.empty() && V.back().Open) {
       V.back().End = CurTokIndex + 1; // extend to one-past-current
     } else {
