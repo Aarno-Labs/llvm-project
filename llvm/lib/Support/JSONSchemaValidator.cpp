@@ -127,7 +127,9 @@ Error JSONSchemaValidator::validateValue(const Value &V, const Object &Schema,
       RefCache[*RefStr] = Resolved;
     }
 
-    return validateValue(V, *Resolved, Path);
+    if (auto Err = validateValue(V, *Resolved, Path))
+      return Err;
+    // Continue validating sibling keywords in this schema (draft 2020-12).
   }
 
   // Enforce "const": value must equal the literal in the schema.
@@ -142,27 +144,35 @@ Error JSONSchemaValidator::validateValue(const Value &V, const Object &Schema,
   }
 
   // Enforce "oneOf": exactly one subschema must validate.
+  //
+  // Per draft 2020-12, sibling keywords are still evaluated even when "oneOf"
+  // is present. So we validate each alternative, enforce the cardinality rule,
+  // and then continue with the rest of this schema.
   if (auto OneOf = getArrayField(Schema, "oneOf")) {
     size_t Matches = 0;
     for (const auto &Alt : **OneOf) {
       if (const Object *Sub = Alt.getAsObject()) {
-        // Try validating against this alternative; if it fails, discard error.
+        // Probe this alternative; if it fails, discard the error.
         if (auto Err = validateValue(V, *Sub, Path)) {
           consumeError(std::move(Err));
         } else {
           ++Matches;
+          if (Matches > 1)
+            break; // already invalid; no need to keep probing
         }
       }
     }
-    if (Matches == 1)
-      return Error::success();
-    if (Matches == 0)
+    if (Matches == 1) {
+      // Exactly one matched; continue evaluating sibling keywords.
+    } else if (Matches == 0) {
       return createStringError(inconvertibleErrorCode(),
                                "Value did not match any 'oneOf' subschema at " +
                                    prettyPath(Path));
-    return createStringError(inconvertibleErrorCode(),
-                             "Value matched multiple 'oneOf' subschemas at " +
-                                 prettyPath(Path));
+    } else {
+      return createStringError(inconvertibleErrorCode(),
+                               "Value matched multiple 'oneOf' subschemas at " +
+                                   prettyPath(Path));
+    }
   }
 
   // Enforce "anyOf": at least one subschema must validate.
@@ -538,14 +548,26 @@ Error JSONSchemaValidator::validateValue(const Value &V, const Object &Schema,
         return Err;
     }
   } else {
-    // No "type": best-effort apply generic constraints when the runtime type
-    // matches.
-    if (auto N = V.getAsNumber()) {
-      if (auto Err = validateNumberConstraints(*N))
+    // No explicit "type": in JSON Schema, type-applicable keywords still apply
+    // based on the instance's runtime type.
+    if (auto O = V.getAsObject()) {
+      if (auto Err = validateObject(*O, Schema, Path))
+        return Err;
+    }
+    if (auto A = V.getAsArray()) {
+      if (auto Err = validateArray(*A, Schema, Path))
         return Err;
     }
     if (auto S = V.getAsString()) {
       if (auto Err = validateStringConstraints(*S))
+        return Err;
+    }
+    if (auto N = V.getAsNumber()) {
+      if (!std::isfinite(*N))
+        return createStringError(inconvertibleErrorCode(),
+                                 "Expected finite number at " +
+                                     prettyPath(Path));
+      if (auto Err = validateNumberConstraints(*N))
         return Err;
     }
   }
