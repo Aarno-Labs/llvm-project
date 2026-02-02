@@ -625,4 +625,26 @@ TEST(JSONSchemaValidatorTest, BooleanSubschemasInObjectAndArrayApplicators) {
   ExpectValid(ContainsTrue, Array{1});
 }
 
+
+TEST(JSONSchemaValidatorTest, StringLengthCountsUnicodeCodePoints) {
+  // U+00E9 ('é') is 2 bytes in UTF-8; U+1F60A ('😊') is 4 bytes.
+  // Total: 2 code points, 6 bytes.
+  const std::string TwoCodePoints = "\xC3\xA9\xF0\x9F\x98\x8A";
+
+  // maxLength must be enforced in code points (so this is valid at maxLength=2).
+  Object Max2 = Object{{"type", "string"}, {"maxLength", 2}};
+  ExpectValid(Max2, Value(TwoCodePoints));
+
+  // maxLength violation reports code point length.
+  Object Max1 = Object{{"type", "string"}, {"maxLength", 1}};
+  ExpectInvalid(Max1, Value(TwoCodePoints),
+                "String at $: length 2 > maxLength 1 (value: \"\xC3\xA9\xF0\x9F\x98\x8A\")");
+
+  // minLength violation also reports code point length.
+  Object Min3 = Object{{"type", "string"}, {"minLength", 3}};
+  ExpectInvalid(Min3, Value(TwoCodePoints),
+                "String at $: length 2 < minLength 3 (value: \"\xC3\xA9\xF0\x9F\x98\x8A\")");
+
+}
+
 } // namespace

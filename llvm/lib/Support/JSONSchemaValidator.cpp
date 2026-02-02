@@ -25,6 +25,7 @@
 #include "llvm/Support/Format.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/Regex.h"
+#include "llvm/Support/ConvertUTF.h"
 #include "llvm/Support/raw_os_ostream.h"
 #include <cmath>
 #include <optional>
@@ -58,6 +59,27 @@ std::string elideForMsg(llvm::StringRef S, size_t MaxLen = 100) {
   Out += "...";
   return Out;
 }
+
+static llvm::Expected<size_t> utf8CodePointLength(llvm::StringRef S) {
+  using namespace llvm;
+
+  const UTF8 *P = reinterpret_cast<const UTF8 *>(S.begin());
+  const UTF8 *End = reinterpret_cast<const UTF8 *>(S.end());
+
+  // Validate UTF-8 (also catches overlongs, invalid continuations, etc.)
+  const UTF8 *Tmp = P;
+  if (!isLegalUTF8String(&Tmp, End))
+    return createStringError(inconvertibleErrorCode(), "Invalid UTF-8 string");
+
+  // Count code points: count bytes that are NOT UTF-8 continuation bytes (10xxxxxx).
+  size_t Count = 0;
+  for (unsigned char C : S)
+    if ((C & 0xC0) != 0x80)
+      ++Count;
+
+  return Count;
+}
+
 } // namespace
 
 Error JSONSchemaValidator::validate(const Value &V) const {
@@ -386,6 +408,17 @@ Error JSONSchemaValidator::validateValue(const Value &V, const Object &Schema,
   };
 
   auto validateStringConstraints = [&](StringRef S) -> Error {
+    std::optional<size_t> CodePointLen;
+    auto getLen = [&]() -> Expected<size_t> {
+      if (CodePointLen)
+        return *CodePointLen;
+      auto L = utf8CodePointLength(S);
+      if (!L)
+        return L.takeError();
+      CodePointLen = *L;
+      return *CodePointLen;
+    };
+
     // minLength
     if (auto ML = Schema.getInteger("minLength")) {
       if (*ML < 0) {
@@ -396,11 +429,16 @@ Error JSONSchemaValidator::validateValue(const Value &V, const Object &Schema,
         return createStringError(inconvertibleErrorCode(), Msg);
       }
       size_t MinLen = static_cast<size_t>(*ML);
-      if (S.size() < MinLen) {
+      auto Len = getLen();
+      if (!Len)
+        return createStringError(
+            inconvertibleErrorCode(),
+            formatv("String at {0}: invalid UTF-8", prettyPath(Path)).str());
+      if (*Len < MinLen) {
         auto Msg =
             formatv(
                 "String at {0}: length {1} < minLength {2} (value: \"{3}\")",
-                prettyPath(Path), S.size(), MinLen, elideForMsg(S))
+                prettyPath(Path), *Len, MinLen, elideForMsg(S))
                 .str();
         return createStringError(inconvertibleErrorCode(), Msg);
       }
@@ -416,11 +454,16 @@ Error JSONSchemaValidator::validateValue(const Value &V, const Object &Schema,
         return createStringError(inconvertibleErrorCode(), Msg);
       }
       size_t MaxLen = static_cast<size_t>(*ML);
-      if (S.size() > MaxLen) {
+      auto Len = getLen();
+      if (!Len)
+        return createStringError(
+            inconvertibleErrorCode(),
+            formatv("String at {0}: invalid UTF-8", prettyPath(Path)).str());
+      if (*Len > MaxLen) {
         auto Msg =
             formatv(
                 "String at {0}: length {1} > maxLength {2} (value: \"{3}\")",
-                prettyPath(Path), S.size(), MaxLen, elideForMsg(S))
+                prettyPath(Path), *Len, MaxLen, elideForMsg(S))
                 .str();
         return createStringError(inconvertibleErrorCode(), Msg);
       }
