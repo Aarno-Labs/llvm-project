@@ -39,7 +39,7 @@
 //   • std::vector<int> lcsMapAB(...):
 //       A[i] -> B[j] (j >= 0) or -1; deterministic tie-break.
 //   • std::vector<Hunk> hunksFromMap(const std::vector<int>& map,
-//                                    int nA, int nB):
+//                                    size_t nA, size_t nB):
 //       contiguous edit regions between anchors, half-open indices.
 //   • std::vector<Step> myersDiff(const Seq& A, const Seq& B):
 //       shortest edit script (EQUAL/INSERT/DELETE).
@@ -119,8 +119,8 @@ static inline StringRef toString(Op op) {
 ///   coalesced into a single `Step`.
 struct Step {
   Op op;
-  int aLo, aHi; // indices in A
-  int bLo, bHi; // indices in B
+  uint64_t aLo, aHi; // indices in A
+  uint64_t bLo, bHi; // indices in B
 
   std::string ToString() const {
     std::string opStr;
@@ -156,8 +156,8 @@ struct Step {
 /// input sequences (not byte offsets).
 /// Instances are immutable and safe to reuse across passes.
 struct Hunk {
-  int aStart, aEnd;
-  int bStart, bEnd;
+  uint64_t aStart, aEnd;
+  uint64_t bStart, bEnd;
 
   bool isInsertOnly() const { return (aStart == aEnd) && (bStart < bEnd); }
   bool isDeleteOnly() const { return (aStart < aEnd) && (bStart == bEnd); }
@@ -273,9 +273,9 @@ std::vector<Hunk> coalesce(ArrayRef<Step> steps);
 ///        back to a linear greedy scan.
 /// \returns A vector mapping each index in \p a to its corresponding index
 ///          in \p b, or -1 if the token was deleted or moved.
-std::vector<int> lcsMapAB(llvm::ArrayRef<StringRef> a,
-                          llvm::ArrayRef<StringRef> b,
-                          llvm::ArrayRef<unsigned> ownerDepthGap,
+std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a,
+                          ArrayRef<StringRef> b,
+                          ArrayRef<uint32_t> ownerDepthGap,
                           unsigned long long maxCells = DEFAULT_MAX_CELLS);
 
 /// \brief Compute a one-sided LCS backmap from sequence A to B using DP.
@@ -316,7 +316,7 @@ std::vector<int> lcsMapAB(llvm::ArrayRef<StringRef> a,
 /// \param b Right sequence.
 /// \param maxCells Maximum number of cells before performing a greedy scan.
 /// \returns A vector mapping a-indices to b-indices (or -1 if unmatched).
-std::vector<int> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
+std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
                           unsigned long long maxCells = DEFAULT_MAX_CELLS);
 
 /// \brief Convert an A→B alignment map into a list of edit hunks.
@@ -351,7 +351,7 @@ std::vector<int> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
 /// \param nB  Size of sequence B.
 /// \returns   List of `Hunk` objects, one per contiguous edit region
 ///            between anchors.
-std::vector<Hunk> hunksFromMap(ArrayRef<int> map, int nA, int nB);
+std::vector<Hunk> hunksFromMap(ArrayRef<int64_t> map, size_t nA, size_t nB);
 
 } // namespace diffutils
 } // namespace refold

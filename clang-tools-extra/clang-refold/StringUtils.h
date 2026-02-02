@@ -92,7 +92,6 @@ inline constexpr bool isIdentPart(char c) noexcept {
 
 // ---------------------- String predicates (ASCII only) ----------------------
 
-
 inline bool isWhitespace(StringRef s) noexcept {
   return all_of(s, [](char c) { return isWs(c); });
 }
@@ -148,7 +147,7 @@ inline std::string clip(StringRef s, size_t n) {
   return (Twine(s.substr(0, n)) + "…(" + Twine(s.size()) + ")").str();
 }
 
-inline std::string showWSWithClip(StringRef s, int n) {
+inline std::string showWSWithClip(StringRef s, size_t n) {
   return showWS(clip(s, n));
 }
 
@@ -177,7 +176,7 @@ inline std::string escape(StringRef s) {
 /// \return A pair `{newB, newE}` representing the trimmed half-open interval.
 ///         If the entire range consists of whitespace, `newB` will equal
 ///         `newE`.
-inline std::pair<int, int> trimWsRange(StringRef s, int b, int e) {
+inline std::pair<size_t, size_t> trimWsRange(StringRef s, size_t b, size_t e) {
   while (b < e && isWs(s[b]))
     b++;
   while (e > b && isWs(s[e - 1]))
@@ -193,8 +192,8 @@ inline std::pair<int, int> trimWsRange(StringRef s, int b, int e) {
 /// \param S The input string.
 /// \returns A StringRef with leading/trailing spaces and tabs removed.
 inline StringRef trimEdgeSpaces(StringRef s) {
-  std::size_t lo = 0;
-  std::size_t hi = s.size();
+  size_t lo = 0;
+  size_t hi = s.size();
 
   while (lo < hi) {
     char c = s[lo];
@@ -216,8 +215,8 @@ inline StringRef trimEdgeSpaces(StringRef s) {
   return s.substr(lo, hi - lo); // return trimmed portion
 }
 
-inline bool isLineSplice(StringRef s, int nlIdx) {
-  if (nlIdx <= 0)
+inline bool isLineSplice(StringRef s, size_t nlIdx) {
+  if (nlIdx == 0 || nlIdx > s.size())
     return false;
   char prev = s[nlIdx - 1];
   if (prev == '\\')
@@ -229,10 +228,10 @@ inline bool isLineSplice(StringRef s, int nlIdx) {
 }
 
 /// True iff s[from:to) contains only horizontal whitespace (and optional '\r').
-inline bool isIndentOnly(StringRef s, int from, int to) {
-  int n = static_cast<int>(s.size());
-  int start = std::clamp(from, 0, n);
-  int end = std::clamp(to, start, n);
+inline bool isIndentOnly(StringRef s, size_t from, size_t to) {
+  const size_t n = s.size();
+  const size_t start = std::clamp(from, size_t(0), n);
+  const size_t end = std::clamp(to, start, n);
 
   // slice(start, end) creates a reference to the substring
   return s.slice(start, end).find_first_not_of(" \t\r") == StringRef::npos;
@@ -280,11 +279,9 @@ inline std::string quoteCString(StringRef s) {
 }
 
 /// Replace the substring in \p s spanning [begin, end) with \p repl.
-inline std::string replaceRange(StringRef s, int begin, int end,
+inline std::string replaceRange(StringRef s, size_t begin, size_t end,
                                 StringRef repl) {
-  size_t uBegin = static_cast<size_t>(begin);
-  size_t uEnd = static_cast<size_t>(end);
-  return (s.substr(0, uBegin).str() + repl.str() + s.substr(uEnd).str());
+  return (s.substr(0, begin).str() + repl.str() + s.substr(end).str());
 }
 
 /// Normalizes an \c #include target token by stripping the surrounding
@@ -383,8 +380,8 @@ inline std::string dbgOutTail(StringRef out) {
 }
 
 /** True iff offset is a beginning-of-line in text. */
-inline bool isBOL(StringRef text, int offset) {
-  int o = std::clamp(offset, 0, static_cast<int>(text.size()));
+inline bool isBOL(StringRef text, size_t offset) {
+  size_t o = std::clamp(offset, size_t(0), text.size());
   return (o == 0) || (text[o - 1] == '\n');
 }
 
@@ -396,57 +393,80 @@ inline bool outAtBOL(StringRef s) { return s.empty() || s.back() == '\n'; }
 
 inline bool endsWithLf(StringRef s) { return !s.empty() && s.back() == '\n'; }
 
-inline bool startsWith(StringRef s, int offset, StringRef lit) {
-  int n = static_cast<int>(s.size());
-  int m = static_cast<int>(lit.size());
-  if (offset < 0 || offset + m > n)
+inline bool startsWith(StringRef s, size_t offset, StringRef lit) {
+  const size_t n = s.size();
+  const size_t m = lit.size();
+  if (offset + m > n)
     return false;
   return s.substr(offset).starts_with(lit);
 }
 
-inline int lastIndexOfChar(StringRef s, char ch, int fromInclusive) {
+inline size_t lastIndexOfChar(StringRef s, char ch, size_t fromInclusive) {
   if (s.empty())
-    return -1;
-  int limit = std::min(fromInclusive, static_cast<int>(s.size()) - 1);
-  if (limit < 0)
-    return -1;
+    return StringRef::npos;
 
-  size_t res = s.take_front(limit + 1).rfind(ch);
-  return (res == StringRef::npos) ? -1 : static_cast<int>(res);
+  const size_t len = s.size();
+  const size_t limit = std::min(fromInclusive, len - 1);
+
+  return s.take_front(limit + 1).rfind(ch);
 }
 
 /** 1-based line number at the given offset. */
-inline int lineAtOffset(StringRef text, int offset) {
-  int o = std::clamp(offset, 0, static_cast<int>(text.size()));
-  return 1 + static_cast<int>(text.take_front(o).count('\n'));
+inline size_t lineAtOffset(StringRef text, uint64_t offset) {
+  const size_t o = (offset >= static_cast<uint64_t>(text.size()))
+                       ? text.size()
+                       : static_cast<size_t>(offset);
+  return 1 + text.take_front(o).count('\n');
 }
 
 /** Count '\n' in an entire sequence. */
-inline int countNewlines(StringRef s) {
-  return static_cast<int>(s.count('\n'));
-}
+inline size_t countNewlines(StringRef s) { return s.count('\n'); }
 
 /** Count '\n' in text from range [start, end). */
-inline int countNewlines(StringRef text, int start, int end) {
-  int len = static_cast<int>(text.size());
-  int s = std::clamp(start, 0, len);
-  int e = std::clamp(end, s, len);
-  return static_cast<int>(text.slice(s, e).count('\n'));
-}
+inline size_t countNewlines(StringRef text, uint64_t start, uint64_t end) {
+  const size_t len = text.size();
 
-inline int countNonSplicedNewlines(StringRef s, int from, int to) {
-  int n = static_cast<int>(s.size());
-  int a = std::clamp(from, 0, n);
-  int b = std::clamp(to, a, n);
-  int c = 0;
-  for (int i = a; i < b; i++) {
-    if (s[i] == '\n' && !isLineSplice(s, i))
-      c++;
+  // 1. Clamp start to [0, len].
+  const size_t s =
+      (start >= static_cast<uint64_t>(len)) ? len : static_cast<size_t>(start);
+
+  // 2. Clamp end to [s, len].
+  // This ensures the slice range is always valid (non-negative length).
+  size_t e;
+  if (end >= static_cast<uint64_t>(len)) {
+    e = len;
+  } else if (end <= static_cast<uint64_t>(s)) {
+    e = s;
+  } else {
+    e = static_cast<size_t>(end);
   }
-  return c;
+
+  return text.slice(s, e).count('\n');
 }
 
-inline std::string boolArrayToString(const std::vector<char> &touched) {
+inline size_t countNonSplicedNewlines(StringRef s, size_t from, size_t to) {
+  const size_t n = s.size();
+
+  // 1. Clamp 'from' to [0, n]
+  const size_t a = (from > n) ? n : from;
+
+  // 2. Clamp 'to' to [a, n] to ensure we never have a negative range
+  const size_t b = (to < a) ? a : (to > n ? n : to);
+
+  size_t count = 0;
+  for (size_t i = a; i < b; ++i) {
+    // 3. We know i is valid because it's < b and b <= s.size()
+    if (s[i] == '\n') {
+      // 4. Pass the index to the splice checker.
+      if (!isLineSplice(s, i)) {
+        count++;
+      }
+    }
+  }
+  return count;
+}
+
+inline std::string boolArrayToString(ArrayRef<char> touched) {
   std::string res;
   res.reserve(touched.size());
   for (char b : touched)
@@ -456,7 +476,7 @@ inline std::string boolArrayToString(const std::vector<char> &touched) {
 
 inline std::string
 rangesToStringWithSlices(StringRef invText,
-                         const std::vector<std::pair<int, int>> &ranges) {
+                         ArrayRef<std::pair<size_t, size_t>> ranges) {
   std::string sb = "[";
   for (size_t i = 0; i < ranges.size(); ++i) {
     if (i > 0)

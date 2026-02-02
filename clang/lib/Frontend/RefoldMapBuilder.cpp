@@ -52,6 +52,7 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/JSON.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/Path.h"
 
 #include <algorithm>
@@ -191,8 +192,8 @@ scanTopLevelConds(llvm::StringRef Buf, llvm::StringRef FilePath) {
   };
 
   // Helper to close the current arm body for a group up to 'endAt'.
-  auto setPrevBodyEnd = [&](int groupIndex, size_t endAt) {
-    if (groupIndex < 0 || groupIndex >= (int)Groups.size())
+  auto setPrevBodyEnd = [&](size_t groupIndex, size_t endAt) {
+    if (groupIndex >= Groups.size())
       return;
     auto &G = Groups[groupIndex];
     if (!G.Arms.empty() && G.Arms.back().BodyE == G.Arms.back().BodyB)
@@ -200,7 +201,7 @@ scanTopLevelConds(llvm::StringRef Buf, llvm::StringRef FilePath) {
   };
 
   struct Active {
-    int GroupIndex;
+    size_t GroupIndex;
   };
   std::vector<Active> Stack;
 
@@ -270,7 +271,7 @@ scanTopLevelConds(llvm::StringRef Buf, llvm::StringRef FilePath) {
         A.BodyE = A.BodyB;
         G.Arms.push_back(std::move(A));
 
-        int idx = (int)Groups.size();
+        size_t idx = Groups.size();
         Groups.push_back(std::move(G));
 
         // Any outer group should have its current arm body end before this '#if'.
@@ -290,7 +291,7 @@ scanTopLevelConds(llvm::StringRef Buf, llvm::StringRef FilePath) {
           continue; // stray elif/else
         }
 
-        int idx = Stack.back().GroupIndex;
+        size_t idx = Stack.back().GroupIndex;
         CondGroup &G = Groups[idx];
 
         // Close previous arm at the start of this line.
@@ -320,7 +321,7 @@ scanTopLevelConds(llvm::StringRef Buf, llvm::StringRef FilePath) {
           continue; // stray endif
         }
 
-        int idx = Stack.back().GroupIndex;
+        size_t idx = Stack.back().GroupIndex;
         CondGroup &G = Groups[idx];
 
         // Close the last arm at start of this '#endif' line.
@@ -345,8 +346,8 @@ scanTopLevelConds(llvm::StringRef Buf, llvm::StringRef FilePath) {
 
   // If file ended without closing some groups, close them at EOF.
   for (const auto &A : Stack) {
-    int idx = A.GroupIndex;
-    if (idx < 0 || idx >= (int)Groups.size())
+    size_t idx = A.GroupIndex;
+    if (idx >= Groups.size())
       continue;
     CondGroup &G = Groups[idx];
     setPrevBodyEnd(idx, N);
@@ -357,9 +358,11 @@ scanTopLevelConds(llvm::StringRef Buf, llvm::StringRef FilePath) {
   return Groups;
 }
 
-void computeInvArgRanges(const MacroArgs *Args, const MacroInfo *MI,
-                         const SourceManager &SM, const LangOptions &Lang,
-                         std::vector<std::pair<long long, long long>> &Out) {
+void computeInvArgRanges(
+    const MacroArgs *Args, const MacroInfo *MI, const SourceManager &SM,
+    const LangOptions &Lang,
+    std::vector<std::pair<std::optional<uint64_t>, std::optional<uint64_t>>>
+        &Out) {
   Out.clear();
   if (!Args || !MI || !MI->isFunctionLike())
     return;
@@ -370,7 +373,7 @@ void computeInvArgRanges(const MacroArgs *Args, const MacroInfo *MI,
   for (unsigned ai = 0; ai < N; ++ai) {
     const Token *AT = Args->getUnexpArgument(ai);
     if (!AT) {
-      Out.emplace_back(-1, -1);
+      Out.emplace_back(std::nullopt, std::nullopt);
       continue;
     }
 
@@ -388,7 +391,7 @@ void computeInvArgRanges(const MacroArgs *Args, const MacroInfo *MI,
     }
 
     if (!Have) {
-      Out.emplace_back(-1, -1);
+      Out.emplace_back(std::nullopt, std::nullopt);
       continue;
     }
 
@@ -397,8 +400,10 @@ void computeInvArgRanges(const MacroArgs *Args, const MacroInfo *MI,
     SourceLocation EndL = Lexer::getLocForEndOfToken(LL, 0, SM, Lang);
     SourceLocation EL = SM.getFileLoc(EndL);
 
-    long long B = FL.isValid() ? (long long)SM.getFileOffset(FL) : -1;
-    long long E = EL.isValid() ? (long long)SM.getFileOffset(EL) : -1;
+    auto B = FL.isValid() ? std::optional<unsigned>(SM.getFileOffset(FL))
+                          : std::nullopt;
+    auto E = EL.isValid() ? std::optional<unsigned>(SM.getFileOffset(EL))
+                          : std::nullopt;
     Out.emplace_back(B, E);
   }
 }
@@ -508,7 +513,7 @@ void computeMacroProjectionSites(Item &It, Preprocessor &PP,
   bool HasHashHash = false;
   {
     const auto &RToks = MI->tokens();
-    for (unsigned i = 0, N = RToks.size(); i < N; ++i) {
+    for (size_t i = 0, N = RToks.size(); i < N; ++i) {
       if (RToks[i].is(tok::hashhash))
         HasHashHash = true;
       if (RToks[i].is(tok::hash) && i + 1 < N && RToks[i + 1].is(tok::identifier)) {
@@ -536,9 +541,9 @@ void computeMacroProjectionSites(Item &It, Preprocessor &PP,
   // -------------------------------------------------------------------------
   if (HasStringify) {
     const Token *RToks = MI->tokens().data();
-    unsigned N = MI->tokens().size();
+    size_t N = MI->tokens().size();
 
-    for (unsigned i = 0; i + 1 < N; ++i) {
+    for (size_t i = 0; i + 1 < N; ++i) {
       if (!RToks[i].is(tok::hash))
         continue;
 
@@ -552,7 +557,7 @@ void computeMacroProjectionSites(Item &It, Preprocessor &PP,
 
       std::string ArgText;
       {
-        const Token *AT = Args->getUnexpArgument((unsigned)PIdx);
+        const Token *AT = Args->getUnexpArgument(static_cast<unsigned>(PIdx));
         bool First = true;
         if (AT) {
           for (; !AT->is(tok::eof); ++AT) {
@@ -592,7 +597,8 @@ void computeMacroProjectionSites(Item &It, Preprocessor &PP,
       }
       Quoted.push_back('"');
 
-      It.StringifySpell2ArgIndices[llvm::StringRef(Quoted)].push_back(PIdx);
+      It.StringifySpell2ArgIndices[llvm::StringRef(Quoted)].push_back(
+          static_cast<unsigned>(PIdx));
     }
   }
 
@@ -615,23 +621,23 @@ void computeMacroProjectionSites(Item &It, Preprocessor &PP,
     SubstTok N;
     N.Text = std::move(Text);
     if (!N.Text.empty()) {
-      PastePart P;
-      P.ArgIndex = -1; // literal
+      PastePart P; // literal
+      P.ArgIndex = std::nullopt;
       P.ByteBegin = 0;
-      P.ByteEnd = (uint32_t)N.Text.size();
+      P.ByteEnd = N.Text.size();
       N.Parts.push_back(P);
     }
     Seq.push_back(std::move(N));
   };
 
-  auto pushArgTok = [&](std::string Text, int ArgIndex) {
+  auto pushArgTok = [&](std::string Text, unsigned ArgIndex) {
     SubstTok N;
     N.Text = std::move(Text);
     if (!N.Text.empty()) {
       PastePart P;
       P.ArgIndex = ArgIndex;
       P.ByteBegin = 0;
-      P.ByteEnd = (uint32_t)N.Text.size();
+      P.ByteEnd = N.Text.size();
       N.Parts.push_back(P);
     }
     Seq.push_back(std::move(N));
@@ -649,10 +655,10 @@ void computeMacroProjectionSites(Item &It, Preprocessor &PP,
     if (const IdentifierInfo *II = tokenIdentInfo(RTok)) {
       int PIdx = MI->getParameterNum(II);
       if (PIdx >= 0) {
-        const Token *AT = Args->getUnexpArgument((unsigned)PIdx);
+        const Token *AT = Args->getUnexpArgument(static_cast<unsigned>(PIdx));
         if (AT) {
           for (; !AT->is(tok::eof); ++AT)
-            pushArgTok(tokenSpelling(*AT), PIdx);
+            pushArgTok(tokenSpelling(*AT), static_cast<unsigned>(PIdx));
         }
         continue;
       }
@@ -684,7 +690,7 @@ void computeMacroProjectionSites(Item &It, Preprocessor &PP,
 
     // Preserve part boundaries; do not coalesce.
     N.Parts = L.Parts;
-    uint32_t Shift = (uint32_t)L.Text.size();
+    uint64_t Shift = L.Text.size();
     for (PastePart P : R.Parts) {
       P.ByteBegin += Shift;
       P.ByteEnd += Shift;
@@ -708,7 +714,7 @@ void computeMacroProjectionSites(Item &It, Preprocessor &PP,
     PT.Spelling = N.Text;
 
     for (const PastePart &P : N.Parts) {
-      if (P.ArgIndex < 0)
+      if (!P.ArgIndex)
         continue; // literal handled by uncovered-byte detection (consumer-side)
       PT.Parts.push_back(P);
     }
@@ -716,7 +722,7 @@ void computeMacroProjectionSites(Item &It, Preprocessor &PP,
     if (PT.Parts.empty())
       continue;
 
-    unsigned Index = (unsigned)It.PasteTokens.size();
+    size_t Index = It.PasteTokens.size();
     It.PasteTokens.push_back(std::move(PT));
     It.PasteSpell2TokenIndices[It.PasteTokens.back().Spelling].push_back(Index);
   }
@@ -803,6 +809,10 @@ RefoldMapBuilder::RefoldMapBuilder(Preprocessor &PP, llvm::StringRef OutputPath,
     TUSourcePath = !MainAbs.empty() ? MainAbs : MainBase.str();
   }
 
+  if (TUSourcePath.empty()) {
+    llvm::report_fatal_error("Critical Error: TU source path is empty.");
+  }
+
   // Seed the spelling map so token locations in the main file report the TU
   // path spelling rather than an absolute canonical path.
   if (!MainAbs.empty())
@@ -811,17 +821,17 @@ RefoldMapBuilder::RefoldMapBuilder(Preprocessor &PP, llvm::StringRef OutputPath,
   IgnoreComments = true;
 }
 
-std::pair<long long, long long>
+std::optional<std::pair<uint64_t, uint64_t>>
 RefoldMapBuilder::computeDirectiveLine(SourceLocation HashLoc) {
   SourceLocation H = SM.getFileLoc(HashLoc);
   if (!H.isValid())
-    return {-1, -1};
+    return std::nullopt;
   FileID FID = SM.getFileID(H);
   bool Invalid = false;
   StringRef Buf = SM.getBufferData(FID, &Invalid);
   if (Invalid)
-    return {-1, -1};
-  unsigned B = SM.getFileOffset(H);
+    return std::nullopt;
+  auto B = SM.getFileOffset(H);
   size_t N = Buf.size();
   size_t P = B;
   // Scan to end-of-line
@@ -835,7 +845,7 @@ RefoldMapBuilder::computeDirectiveLine(SourceLocation HashLoc) {
     else
       E = P + 1;
   }
-  return {(long long)B, (long long)E};
+  return {{B, E}};
 }
 
 std::string RefoldMapBuilder::absolutePathFor(const clang::FileEntryRef &FER) {
@@ -886,28 +896,27 @@ std::string RefoldMapBuilder::filePathForLocAbs(clang::SourceManager &SM,
   return std::string();
 }
 
-int RefoldMapBuilder::argIndexForSpellingLoc(const Item &MI, SourceLocation Loc,
-                                             SourceManager &Sm,
-                                             const LangOptions &Lang,
-                                             bool EmitAbsPaths) {
+std::optional<uint32_t> RefoldMapBuilder::argIndexForSpellingLoc(
+    const Item &MI, SourceLocation Loc, SourceManager &Sm,
+    const LangOptions &Lang, bool EmitAbsPaths) {
   // Goal:
   //   Given a token location (typically the spelling loc for a token that came
-  //   out of a macro expansion), determine which *invocation-site argument slot*
-  //   of macro invocation item MI produced that token.
+  //   out of a macro expansion), determine which *invocation-site argument
+  //   slot* of macro invocation item MI produced that token.
   //
   // How:
-  //   MI.InvFile names the physical file that contains the macro invocation text,
-  //   and MI.InvArgRanges stores byte ranges (in that file) for each argument as
-  //   written at the call site. We try to map the token's location back to a
-  //   physical file location in MI.InvFile and then find the first argument range
-  //   whose byte interval overlaps the token's byte interval.
+  //   MI.InvFile names the physical file that contains the macro invocation
+  //   text, and MI.InvArgRanges stores byte ranges (in that file) for each
+  //   argument as written at the call site. We try to map the token's location
+  //   back to a physical file location in MI.InvFile and then find the first
+  //   argument range whose byte interval overlaps the token's byte interval.
   //
   // Return:
   //   * index of the argument (0-based) if we can prove the token originated
   //     from that argument at MI's call site
   //   * -1 otherwise
   if (Loc.isInvalid() || MI.InvFile.empty() || MI.InvArgRanges.empty())
-    return -1;
+    return std::nullopt;
 
   SourceLocation CurrentLoc = Loc;
   SourceLocation LastLoc; // Track the previous location to detect cycles
@@ -934,9 +943,9 @@ int RefoldMapBuilder::argIndexForSpellingLoc(const Item &MI, SourceLocation Loc,
 
     std::string TokFile = filePathForLocAbs(Sm, Fl, EmitAbsPaths);
     if (TokFile == MI.InvFile) {
-      long long TokB = (long long)Sm.getFileOffset(Fl);
+      auto TokB = Sm.getFileOffset(Fl);
       SourceLocation EndL = Lexer::getLocForEndOfToken(Fl, 0, Sm, Lang);
-      long long TokE = EndL.isValid() ? (long long)Sm.getFileOffset(EndL) : TokB;
+      auto TokE = EndL.isValid() ? Sm.getFileOffset(EndL) : TokB;
       if (TokE < TokB) TokE = TokB;
 
       // The argument ranges are stored as byte intervals in the invocation file.
@@ -944,9 +953,12 @@ int RefoldMapBuilder::argIndexForSpellingLoc(const Item &MI, SourceLocation Loc,
       // argument slot.
       for (size_t Ai = 0; Ai < MI.InvArgRanges.size(); ++Ai) {
         const auto &R = MI.InvArgRanges[Ai];
-        if (R.first < 0 || R.second < 0) continue;
-        if (TokB < R.second && TokE > R.first)
-          return (int)Ai;
+        if (!R.first || !R.second) continue;
+        if (TokB < *R.second && TokE > *R.first) {
+          if (Ai > std::numeric_limits<uint32_t>::max())
+            return std::nullopt;
+          return static_cast<uint32_t>(Ai);
+        }
       }
     }
 
@@ -989,7 +1001,7 @@ int RefoldMapBuilder::argIndexForSpellingLoc(const Item &MI, SourceLocation Loc,
     }
   }
 
-  return -1;
+  return std::nullopt;
 }
 
 void RefoldMapBuilder::onIncludeDirective(
@@ -1011,7 +1023,7 @@ void RefoldMapBuilder::onIncludeDirective(
          "include directive must be one of: #include or #include_next");
 
   Item It;
-  It.ID = (int)Items.size();
+  It.ID = Items.size();
   It.Kind = IK_Directive;
   It.Subkind = IsIncludeNext ? "#include_next" : "#include";
   It.Loc = HashLoc;
@@ -1028,9 +1040,11 @@ void RefoldMapBuilder::onIncludeDirective(
                                             : ("\"" + FileName.str() + "\""));
 
   // Include-site anchors (definition site)
-  auto [B, E] = computeDirectiveLine(HashLoc);
-  It.SiteBegin = B;
-  It.SiteEnd = E;
+  auto Line = computeDirectiveLine(HashLoc);
+  if (Line) {
+    It.SiteBegin = Line->first;
+    It.SiteEnd = Line->second;
+  }
   It.SitePath = filePathForLocAbs(SM, HashLoc, EmitAbsPaths);
 
   // Resolved target path, when available
@@ -1063,9 +1077,9 @@ void RefoldMapBuilder::onIncludeDirective(
   }
 
   Items.push_back(std::move(It));
-  if (!IncludeStack.empty())
-    Items.back().OwnerIncludeId = IncludeStack.back();
-  int ThisIdx = (int)Items.size() - 1;
+  if (!IncludeStack.empty() && IncludeStack.back())
+    Items.back().OwnerIncludeId = static_cast<uint64_t>(*IncludeStack.back());
+  size_t ThisIdx = Items.size() - 1;
 
   // Remember multiple anchors for robustness.
   IncludeKey2Item[keyForLoc(SM, HashLoc)] = ThisIdx;
@@ -1082,7 +1096,7 @@ void RefoldMapBuilder::onMacroDefined(const Token &MacroNameTok,
     return;
 
   Item It;
-  It.ID = (int)Items.size();
+  It.ID = Items.size();
   It.Kind = IK_Directive;
   It.Subkind = "#define";
   It.Loc = MI->getDefinitionLoc();
@@ -1091,14 +1105,16 @@ void RefoldMapBuilder::onMacroDefined(const Token &MacroNameTok,
   PrintMacroDefinition(*MacroNameTok.getIdentifierInfo(), *MI, PP, &OS);
   OS << "\n";
   It.Text = OS.str();
-  auto BE = computeDirectiveLine(MI->getDefinitionLoc());
-  It.SiteBegin = BE.first;
-  It.SiteEnd = BE.second;
+  auto Line = computeDirectiveLine(MI->getDefinitionLoc());
+  if (Line) {
+    It.SiteBegin = Line->first;
+    It.SiteEnd = Line->second;
+  }
   It.SitePath = filePathForLocAbs(SM, MI->getDefinitionLoc(), EmitAbsPaths);
 
   Items.push_back(std::move(It));
-  if (!IncludeStack.empty())
-    Items.back().OwnerIncludeId = IncludeStack.back();
+  if (!IncludeStack.empty() && IncludeStack.back())
+    Items.back().OwnerIncludeId = static_cast<uint64_t>(*IncludeStack.back());
 }
 
 void RefoldMapBuilder::onMacroUndefined(const Token &MacroNameTok,
@@ -1108,7 +1124,7 @@ void RefoldMapBuilder::onMacroUndefined(const Token &MacroNameTok,
     return;
 
   Item It;
-  It.ID = (int)Items.size();
+  It.ID = Items.size();
   It.Kind = IK_Directive;
   It.Subkind = "#undef";
   It.Loc = MacroNameTok.getLocation();
@@ -1116,14 +1132,16 @@ void RefoldMapBuilder::onMacroUndefined(const Token &MacroNameTok,
   S += MacroNameTok.getIdentifierInfo()->getName().str();
   S += "\n";
   It.Text = std::move(S);
-  auto BE = computeDirectiveLine(MacroNameTok.getLocation());
-  It.SiteBegin = BE.first;
-  It.SiteEnd = BE.second;
+  auto Line = computeDirectiveLine(MacroNameTok.getLocation());
+  if (Line) {
+    It.SiteBegin = Line->first;
+    It.SiteEnd = Line->second;
+  }
   It.SitePath = filePathForLocAbs(SM, MacroNameTok.getLocation(), EmitAbsPaths);
 
   Items.push_back(std::move(It));
-  if (!IncludeStack.empty())
-    Items.back().OwnerIncludeId = IncludeStack.back();
+  if (!IncludeStack.empty() && IncludeStack.back())
+    Items.back().OwnerIncludeId = static_cast<uint64_t>(*IncludeStack.back());
 }
 
 void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
@@ -1134,37 +1152,33 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
     return;
 
   const MacroInfo *MI = MD.getMacroInfo();
+
+  // 1. Initialize a local Item.
+  // We do this on the stack first to avoid any issues with vector reallocations
+  // while we are still computing sub-fields.
   Item It;
-  It.ID = (int)Items.size();
+  It.ID = static_cast<uint64_t>(Items.size());
   It.Kind = IK_Macro;
   It.Subkind = (MI && MI->isFunctionLike()) ? "func" : "obj";
+
   if (auto *II = MacroNameTok.getIdentifierInfo())
     It.Name = II->getName().str();
-  It.Loc = Range.getBegin();
 
+  It.Loc = Range.getBegin();
   It.IsBuiltinMacro = (MI != nullptr && MI->isBuiltinMacro());
 
-  // -------------------------------------------------------------------------
-  // Invocation text + byte range.
-  //
-  // For nested expansions (macro expanded from within another macro’s replacement
-  // list), Range’s file-locs often collapse back to the outermost call site
-  // (e.g. HELLO(10)), which makes nested macros (FOO/BAR/...) look like duplicate
-  // HELLO invocations. For nested expansions, use spelling locations so inv_text
-  // identifies the call as written in the macro definition (e.g. "FOO(X##.0)").
-  // -------------------------------------------------------------------------
+  // --- Invocation text + byte range logic ---
   SourceLocation BeginTokLoc = Range.getBegin();
   SourceLocation EndTokLoc =
-      Lexer::getLocForEndOfToken(Range.getEnd(), /*Offset=*/0, SM, Lang);
+      Lexer::getLocForEndOfToken(Range.getEnd(), 0, SM, Lang);
 
   SourceLocation InvBeginLoc = BeginTokLoc;
   SourceLocation InvEndLoc = EndTokLoc;
 
   if (MacroNameTok.getLocation().isMacroID()) {
     InvBeginLoc = SM.getSpellingLoc(BeginTokLoc);
-
     SourceLocation SpEnd = SM.getSpellingLoc(Range.getEnd());
-    InvEndLoc = Lexer::getLocForEndOfToken(SpEnd, /*Offset=*/0, SM, Lang);
+    InvEndLoc = Lexer::getLocForEndOfToken(SpEnd, 0, SM, Lang);
   }
 
   SourceLocation InvBeginFileLoc = SM.getFileLoc(InvBeginLoc);
@@ -1172,34 +1186,65 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
 
   if (InvBeginFileLoc.isValid() && InvEndFileLoc.isValid()) {
     It.InvBegin = SM.getFileOffset(InvBeginFileLoc);
-    It.InvEnd   = SM.getFileOffset(InvEndFileLoc);
-    It.InvFile  = filePathForLocAbs(SM, InvBeginFileLoc, EmitAbsPaths);
+    It.InvEnd = SM.getFileOffset(InvEndFileLoc);
+    It.InvFile = filePathForLocAbs(SM, InvBeginFileLoc, EmitAbsPaths);
 
     if (SM.isWrittenInSameFile(InvBeginFileLoc, InvEndFileLoc) &&
-        It.InvBegin >= 0 && It.InvEnd >= It.InvBegin) {
-      It.InvText =
-          Lexer::getSourceText(
-              CharSourceRange::getCharRange(InvBeginFileLoc, InvEndFileLoc),
-              SM, Lang)
-              .str();
+        *It.InvEnd >= *It.InvBegin) {
+      It.InvText = Lexer::getSourceText(CharSourceRange::getCharRange(
+                                            InvBeginFileLoc, InvEndFileLoc),
+                                        SM, Lang)
+                       .str();
     } else {
-      // Fallback: avoid misleading duplication if we can't form a stable range.
       It.InvText = It.Name;
     }
   } else {
-    It.InvBegin = It.InvEnd = -1;
     It.InvText = It.Name;
   }
 
+  if (It.InvText.empty()) {
+    auto &Diags = PP.getDiagnostics();
+    unsigned DiagID = Diags.getCustomDiagID(DiagnosticsEngine::Error,
+                                            "macro invocation text is empty");
+    Diags.Report(MacroNameTok.getLocation(), DiagID);
+    It.InvText = It.Name; // Emergency fallback to keep schema happy
+  }
+
+  // 2. Perform projections and arg ranges on the local 'It'
   computeInvArgRanges(Args, MI, SM, Lang, It.InvArgRanges);
   computeMacroProjectionSites(It, PP, MacroNameTok, MI, Args, Lang);
 
-  Items.push_back(std::move(It));
-  if (!IncludeStack.empty())
-    Items.back().OwnerIncludeId = IncludeStack.back();
+  // 3. Capture Owner ID from the stack before we lose the context
+  if (!IncludeStack.empty() && IncludeStack.back())
+    It.OwnerIncludeId = static_cast<uint64_t>(*IncludeStack.back());
 
-  MacroKey2Item[keyForMacroLoc(MacroNameTok.getLocation())] =
-      (int)Items.size() - 1;
+  // 4. ATOMIC MOVE INTO COLLECTION
+  // We determine the index before pushing.
+  size_t NewIdx = Items.size();
+  Items.push_back(std::move(It));
+
+  // 5. Update the mapping for lookup during token attribution
+  MacroKey2Item[keyForMacroLoc(MacroNameTok.getLocation())] = NewIdx;
+
+  // 6. THE SCHEMA FIX:
+  // Seed the item with an *empty* open span at the current PP token index.
+  //
+  // Rationale:
+  //   - Function-like macros can expand to nothing, or only to comment tokens
+  //     (which we may skip), leaving the item with no observed printed tokens.
+  //   - We still want a deterministic, schema-valid 'spans' array (minItems=1)
+  //     without incorrectly claiming ownership of an unrelated printed token.
+  //
+  // Using an empty half-open range [TokIndex, TokIndex) satisfies the schema
+  // and will be extended to include the first printed token if/when one is
+  // attributed to this macro expansion.
+  if (Items[NewIdx].Spans.empty()) {
+    TokenSpan S;
+    S.Begin = TokIndex;
+    S.End = TokIndex; // empty/gap anchor
+    S.Open = true;
+    Items[NewIdx].Spans.push_back(S);
+  }
 }
 
 void RefoldMapBuilder::onPragma(SourceLocation HashLoc, StringRef FullText) {
@@ -1207,27 +1252,29 @@ void RefoldMapBuilder::onPragma(SourceLocation HashLoc, StringRef FullText) {
     return;
 
   Item It;
-  It.ID = (int)Items.size();
+  It.ID = Items.size();
   It.Kind = IK_Directive;
   It.Subkind = "#pragma";
   It.Loc = HashLoc;
   It.Text = FullText.str();
   // Site info (line byte span and file path).
-  auto BE = computeDirectiveLine(HashLoc);
-  It.SiteBegin = BE.first;
-  It.SiteEnd = BE.second;
+  auto Line = computeDirectiveLine(HashLoc);
+  if (Line) {
+    It.SiteBegin = Line->first;
+    It.SiteEnd = Line->second;
+  }
   It.SitePath = filePathForLocAbs(SM, HashLoc, EmitAbsPaths);
 
   Items.push_back(std::move(It));
-  if (!IncludeStack.empty())
-    Items.back().OwnerIncludeId = IncludeStack.back();
+  if (!IncludeStack.empty() && IncludeStack.back())
+    Items.back().OwnerIncludeId = static_cast<uint64_t>(*IncludeStack.back());
 }
 
 void RefoldMapBuilder::onEnterFile(SourceLocation IncludeLoc) {
   if (!enabled())
     return;
 
-  int Idx = -1;
+  std::optional<size_t> Idx;
   if (IncludeLoc.isValid()) {
     auto It = IncludeKey2Item.find(keyForLoc(SM, IncludeLoc));
     if (It != IncludeKey2Item.end())
@@ -1236,10 +1283,8 @@ void RefoldMapBuilder::onEnterFile(SourceLocation IncludeLoc) {
 
   // Set parent relationship: the include we are about to enter is
   // conceptually a child of the current top of the stack (if any).
-  if (Idx >= 0 && !IncludeStack.empty() && IncludeStack.back() >= 0) {
-    Items[(size_t)Idx].Parent = IncludeStack.back();
-  }
-
+  if (Idx && !IncludeStack.empty() && IncludeStack.back())
+    Items[*Idx].Parent = static_cast<uint64_t>(*IncludeStack.back());
   IncludeStack.push_back(Idx);
 }
 
@@ -1252,14 +1297,14 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
   if (IgnoreComments && Tok.is(tok::comment))
     return;
 
-  int ItemIdx = -1;
+  std::optional<size_t> ItemIdx;
   SourceLocation L = Tok.getLocation();
 
   // Precompute byte range in the spelling file of this token (main or header).
   // We reuse this both for TokMap and for robust macro arg/body attribution.
   std::string TokFile;
-  long long TokB = -1;
-  long long TokE = -1;
+  std::optional<uint64_t> TokB;
+  std::optional<uint64_t> TokE;
   bool HasTokMap = false;
   {
     SourceLocation FL = SM.getFileLoc(L);
@@ -1271,59 +1316,59 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
         TokB = SM.getFileOffset(FL);
         TokE = SM.getFileOffset(FEL);
         TokFile = filePathForLocAbs(SM, FL, EmitAbsPaths); // e.g. "./e.h"
-        HasTokMap = true;
+        HasTokMap = !TokFile.empty();
       }
     }
   }
 
   // Prefer a macro item when the token is inside a macro expansion.
   if (SM.isMacroArgExpansion(L) || SM.isMacroBodyExpansion(L)) {
-    auto LookupMacroItem = [&](SourceLocation Loc) -> int {
+    auto LookupMacroItem = [&](SourceLocation Loc) -> std::optional<size_t> {
       if (Loc.isInvalid())
-        return -1;
+        return std::nullopt;
       auto It = MacroKey2Item.find(keyForMacroLoc(Loc));
       if (It != MacroKey2Item.end())
         return It->second;
-      return -1;
+      return std::nullopt;
     };
 
     // Innermost macro: immediate caller of this token location.
     SourceLocation Caller = SM.getImmediateMacroCallerLoc(L);
-    int InnerIdx = LookupMacroItem(Caller);
+    auto InnerIdx = LookupMacroItem(Caller);
 
     // Enclosing macro: walk up the macro caller chain (keeps MacroID hops intact).
     // Outer macro (if any): prefer ultimate expansion location. This is robust
     // when the immediate caller loc is a file location inside an outer macro body
     // (no MacroID chain to walk), which is exactly the nested builtin case we
     // care about.
-    int OuterIdx = LookupMacroItem(SM.getExpansionLoc(L));
-    if (OuterIdx < 0) {
+    auto OuterIdx = LookupMacroItem(SM.getExpansionLoc(L));
+    if (!OuterIdx) {
       // Conservative fallback: walk up the caller chain when the caller is a MacroID.
       SourceLocation Cur = Caller;
-      for (int Depth = 0; Depth < 16; ++Depth) {
+      for (size_t Depth = 0; Depth < 16; ++Depth) {
         if (Cur.isInvalid() || !Cur.isMacroID())
           break;
         Cur = SM.getImmediateMacroCallerLoc(Cur);
         OuterIdx = LookupMacroItem(Cur);
-        if (OuterIdx >= 0)
+        if (OuterIdx)
           break;
       }
     }
 
     // Fallback: some paths prefer expansion loc
-    if (InnerIdx < 0) {
+    if (!InnerIdx) {
       Caller = SM.getExpansionLoc(L);
       InnerIdx = LookupMacroItem(Caller);
     }
 
-    if (InnerIdx >= 0) {
-      int Chosen = InnerIdx;
+    if (InnerIdx) {
+      size_t Chosen = *InnerIdx;
 
       // Clang sometimes reports adjacent punctuation as being "inside" a builtin
       // macro expansion. In those cases, prefer the enclosing macro item for
       // non-expansion tokens.
-      if ((size_t)InnerIdx < Items.size() && OuterIdx >= 0) {
-        const Item &MI = Items[(size_t)InnerIdx];
+      if (*InnerIdx < Items.size() && OuterIdx) {
+        const Item &MI = Items[*InnerIdx];
         if (MI.Kind == IK_Macro && MI.IsBuiltinMacro) {
           // Builtin/predefined macros should contribute only their expansion
           // token(s). If Clang attributes adjacent punctuation or other
@@ -1331,28 +1376,28 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
           // enclosing macro item for those tokens.
           bool Ok = Tok.isLiteral() || Tok.is(tok::numeric_constant);
           if (!Ok)
-            Chosen = OuterIdx;
+            Chosen = *OuterIdx;
         }
       }
 
       ItemIdx = Chosen;
-    } else if (OuterIdx >= 0) {
+    } else if (OuterIdx) {
       ItemIdx = OuterIdx;
     }
   }
 
   // Otherwise attribute to the innermost active include; else to the file item.
-  if (ItemIdx == -1) {
-    if (!IncludeStack.empty() && IncludeStack.back() != -1) {
+  if (!ItemIdx) {
+    if (!IncludeStack.empty() && IncludeStack.back()) {
       ItemIdx = IncludeStack.back();
     } else {
-      if (CurrentFileItem == -1) {
+      if (!CurrentFileItem) {
         Item F;
-        F.ID = (int)Items.size();
+        F.ID = Items.size();
         F.Kind = IK_File;
         F.Subkind = "file";
         Items.push_back(std::move(F));
-        CurrentFileItem = (int)Items.size() - 1;
+        CurrentFileItem = Items.size() - 1;
       }
       ItemIdx = CurrentFileItem;
     }
@@ -1364,14 +1409,14 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
   // 1a) If the primary item is a MACRO expansion, also record exact origin:
   //     - ArgSpans for tokens from actual arguments (func-like only)
   //     - BodySpans for tokens from the macro body (and for obj-like macros)
-  if (Items[ItemIdx].Kind == IK_Macro) {
-    auto &It = Items[(size_t)ItemIdx];
+  if (ItemIdx && Items[*ItemIdx].Kind == IK_Macro) {
+    auto &It = Items[*ItemIdx];
 
     if (SM.isMacroArgExpansion(L)) {
       if (It.Subkind == "func") {
-        int ArgIndex = argIndexForSpellingLoc(It, L, SM, Lang, EmitAbsPaths);
-        if (ArgIndex >= 0)
-          touchArgTokSpan(It.ArgSpans, TokIndex, ArgIndex);
+        auto ArgIndex = argIndexForSpellingLoc(It, L, SM, Lang, EmitAbsPaths);
+        if (ArgIndex)
+          touchArgTokSpan(It.ArgSpans, TokIndex, *ArgIndex);
         else
           touchTokSpan(It.BodySpans, TokIndex); // fallback: keep schema-valid
       } else {
@@ -1408,7 +1453,7 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
              Tok.is(tok::utf32_string_literal))) {
           auto ItS = MI.StringifySpell2ArgIndices.find(Sp);
           if (ItS != MI.StringifySpell2ArgIndices.end()) {
-            for (int A : ItS->second)
+            for (unsigned A : ItS->second)
               touchArgTokSpan(MI.StringifySpans, TokIndex, A);
           }
         }
@@ -1458,7 +1503,7 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
 
         // Record one span per argument part (arg_index + byte range inside
         // the pasted token).
-        auto appendPasteSpan = [&](int ArgIndex, unsigned ByteBegin,
+        auto appendPasteSpan = [&](std::optional<unsigned> ArgIndex, unsigned ByteBegin,
                                    unsigned ByteEnd) {
           ArgTokenSpan S;
           S.Begin = TokIndex;
@@ -1471,7 +1516,7 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
         };
 
         for (const PastePart &P : PT.Parts) {
-          if (P.ArgIndex < 0)
+          if (!P.ArgIndex)
             continue;
           appendPasteSpan(P.ArgIndex, P.ByteBegin, P.ByteEnd);
         }
@@ -1482,15 +1527,15 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
       // produced this token (e.g., pasted in macro A, then passed through
       // macro B).
       SourceLocation Cur = L;
-      for (int Depth = 0; Depth < 32 && Cur.isMacroID(); ++Depth) {
+      for (unsigned Depth = 0; Depth < 32 && Cur.isMacroID(); ++Depth) {
         const SourceLocation Caller = SM.getImmediateMacroCallerLoc(Cur);
         if (Caller.isInvalid())
           break;
 
         auto ItM = MacroKey2Item.find(keyForMacroLoc(Caller));
         if (ItM != MacroKey2Item.end()) {
-          const int I = ItM->second;
-          if (I >= 0 && static_cast<size_t>(I) < Items.size())
+          const size_t I = ItM->second;
+          if (I < Items.size())
             recordProjectionsForItem(Items[I]);
         }
 
@@ -1509,27 +1554,27 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
   // invocation (e.g., set_zero(..., BYTE4, ...)): the expanded token(s) are
   // primarily attributed to the inner macro item, but still need to be recorded
   // as argument tokens for the enclosing function-like macro.
-  if (HasTokMap && L.isMacroID()) {
+  if (ItemIdx && HasTokMap && L.isMacroID()) {
     for (size_t I = 0; I < Items.size(); ++I) {
-      if ((int)I == ItemIdx)
+      if (I == *ItemIdx)
         continue;
       Item &MI = Items[I];
       if (MI.Kind != IK_Macro)
         continue;
-      if (MI.InvBegin < 0 || MI.InvEnd < 0)
+      if (!MI.InvBegin || !MI.InvEnd || !TokB || !TokE)
         continue;
       if (MI.InvFile != TokFile)
         continue;
-      if (MI.InvBegin <= TokB && TokE <= MI.InvEnd) {
+      if (*MI.InvBegin <= *TokB && *TokE <= *MI.InvEnd) {
         // Ensure the enclosing macro's primary token span covers nested expansions.
-        touchSpanForItem((int)I, TokIndex);
+        touchSpanForItem(I, TokIndex);
 
         // For function-like macros, anything after the name token is treated as
         // originating from an argument spelling region. Otherwise, treat as body.
         if (MI.Subkind == "func") {
-          int ArgIndex = argIndexForSpellingLoc(MI, L, SM, Lang, EmitAbsPaths);
-          if (ArgIndex >= 0)
-            touchArgTokSpan(MI.ArgSpans, TokIndex, ArgIndex);
+          auto ArgIndex = argIndexForSpellingLoc(MI, L, SM, Lang, EmitAbsPaths);
+          if (ArgIndex)
+            touchArgTokSpan(MI.ArgSpans, TokIndex, *ArgIndex);
           else
             touchTokSpan(MI.BodySpans, TokIndex); // fallback: keep schema-valid
         } else {
@@ -1541,8 +1586,8 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
 
   // 2) Grow all active include items transitively so a parent include
   //    covers its entire subtree (nested includes/macros).
-  for (int idx : IncludeStack) {
-    if (idx < 0 || idx == ItemIdx)
+  for (auto idx : IncludeStack) {
+    if (!idx || idx == ItemIdx)
       continue;
     touchSpanForItem(idx, TokIndex);
   }
@@ -1551,8 +1596,8 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
   if (HasTokMap) {
     TokMapEntry M;
     M.PPIndex = TokIndex;
-    M.SrcBegin = TokB;
-    M.SrcEnd = TokE;
+    M.SrcBegin = *TokB;
+    M.SrcEnd = *TokE;
     M.File = TokFile;
     TokMap.push_back(std::move(M));
   }
@@ -1621,7 +1666,7 @@ void RefoldMapBuilder::finalizeIncludeDecls() {
     // Collect all PP token indices that:
     //  - are in this include's spans, and
     //  - originate from the resolved header file.
-    llvm::SmallVector<unsigned, 64> PPIdxs;
+    llvm::SmallVector<uint64_t, 64> PPIdxs;
     for (const TokenSpan &S : It.Spans) {
       if (S.Open)
         continue;
@@ -1633,7 +1678,7 @@ void RefoldMapBuilder::finalizeIncludeDecls() {
       for (uint64_t PP = B; PP < E; ++PP) {
         const TokMapEntry &TM = TokMap[PP];
         if (TM.File == HeaderPath.str())
-          PPIdxs.push_back(static_cast<unsigned>(PP));
+          PPIdxs.push_back(PP);
       }
     }
 
@@ -1654,16 +1699,16 @@ void RefoldMapBuilder::finalizeIncludeDecls() {
       if (StartIdx >= EndIdx || EndIdx > PPIdxs.size())
         return;
 
-      unsigned PPBegin = PPIdxs[StartIdx];
-      unsigned PPEnd   = PPIdxs[EndIdx - 1] + 1; // half-open
+      uint64_t PPBegin = PPIdxs[StartIdx];
+      uint64_t PPEnd   = PPIdxs[EndIdx - 1] + 1; // half-open
       if (PPBegin >= PPEnd || PPEnd > TokMap.size())
         return;
 
       const TokMapEntry &First = TokMap[PPBegin];
       const TokMapEntry &Last  = TokMap[PPEnd - 1];
 
-      unsigned HeaderB = static_cast<unsigned>(First.SrcBegin);
-      unsigned HeaderE = static_cast<unsigned>(Last.SrcEnd);
+      uint64_t HeaderB = First.SrcBegin;
+      uint64_t HeaderE = Last.SrcEnd;
 
       // --- Determine "kind" and "name" deterministically. ---
 
@@ -1762,7 +1807,7 @@ void RefoldMapBuilder::writeJSON() {
   llvm::json::OStream JO(OS, /*Indent=*/2);
 
   JO.object([&] {
-    JO.attribute("version", "1.5");
+    JO.attribute("version", "2.0");
 
     const auto &PPO = PP.getPreprocessorOpts();
     std::string LangStr = computeLangStr(PP.getLangOpts());
@@ -1821,23 +1866,27 @@ void RefoldMapBuilder::writeJSON() {
 
           // Invocation metadata only applies to macro items per the JSON schema.
           if (It.Kind == IK_Macro) {
-            if (!It.InvText.empty())
-              JO.attribute("inv_text", It.InvText);
+            // InvText can't be empty at this point
+            JO.attribute("inv_text", It.InvText);
 
             if (!It.InvFile.empty())
               JO.attribute("inv_file", It.InvFile);
 
-            // inv_b / inv_e are byte offsets within inv_file and must be non-negative.
-            // If the invocation range is unknown, we omit both fields.
-            if (It.InvBegin >= 0 && It.InvEnd >= 0 && It.InvEnd >= It.InvBegin) {
-              JO.attribute("inv_b", It.InvBegin);
-              JO.attribute("inv_e", It.InvEnd);
+            // inv_b / inv_e are byte offsets within inv_file and must be
+            // non-negative. If the invocation range is unknown, we omit both
+            // fields.
+            if (!It.InvFile.empty() && It.InvBegin && It.InvEnd &&
+                *It.InvEnd >= *It.InvBegin) {
+              JO.attribute("inv_b", *It.InvBegin);
+              JO.attribute("inv_e", *It.InvEnd);
             }
 
-            // Derive inv_pp_byte_begin / inv_pp_byte_end from this macro's PP-token envelope.
+            // Derive inv_pp_byte_begin / inv_pp_byte_end from this macro's
+            // PP-token envelope.
             //
-            // We compute the A-token interval [minBeginTok, maxEndTok) over all TokenSpan
-            // entries for this macro expansion, then map the first/last token to PP-byte offsets.
+            // We compute the A-token interval [minBeginTok, maxEndTok) over all
+            // TokenSpan entries for this macro expansion, then map the
+            // first/last token to PP-byte offsets.
             bool HaveTokEnv = false;
             uint64_t BTok = 0;
             uint64_t ETok = 0;
@@ -1848,23 +1897,18 @@ void RefoldMapBuilder::writeJSON() {
                 ETok = S.End;
                 HaveTokEnv = true;
               } else {
-                BTok = std::min<uint64_t>(BTok, S.Begin);
-                ETok = std::max<uint64_t>(ETok, S.End);
+                BTok = std::min(BTok, S.Begin);
+                ETok = std::max(ETok, S.End);
               }
             }
 
             if (HaveTokEnv && ETok > BTok) {
               const uint64_t LastTok = ETok - 1;
-              if (BTok < TokPPByteBegin.size() && LastTok < TokPPByteEnd.size()) {
+              if (BTok < TokPPByteBegin.size() &&
+                  LastTok < TokPPByteEnd.size()) {
                 JO.attribute("inv_pp_byte_begin", TokPPByteBegin[(size_t)BTok]);
                 JO.attribute("inv_pp_byte_end", TokPPByteEnd[(size_t)LastTok]);
-              } else {
-                JO.attribute("inv_pp_byte_begin", -1);
-                JO.attribute("inv_pp_byte_end", -1);
               }
-            } else {
-              JO.attribute("inv_pp_byte_begin", -1);
-              JO.attribute("inv_pp_byte_end", -1);
             }
           }
 
@@ -1873,9 +1917,12 @@ void RefoldMapBuilder::writeJSON() {
 
           // Emit site anchors for all directive kinds.
           if (It.Kind == IK_Directive) {
-            if (It.SiteBegin >= 0 && It.SiteEnd >= 0) {
-              JO.attribute("site_b", It.SiteBegin);
-              JO.attribute("site_e", It.SiteEnd);
+            if (It.SiteBegin && It.SiteEnd) {
+              JO.attribute("site_b", *It.SiteBegin);
+              JO.attribute("site_e", *It.SiteEnd);
+            } else {
+              JO.attribute("site_b", nullptr);
+              JO.attribute("site_e", nullptr);
             }
             // Always write site_path; provide deterministic fallback for
             // virtual buffers.
@@ -1888,6 +1935,8 @@ void RefoldMapBuilder::writeJSON() {
             }
             if (!Path.empty())
               JO.attribute("site_path", Path);
+            else
+              JO.attribute("site_path", "<unknown>");
 
             if (It.Subkind == "#include" || It.Subkind == "#include_next") {
               if (!It.Decls.empty()) {
@@ -1897,7 +1946,7 @@ void RefoldMapBuilder::writeJSON() {
                       JO.attribute("kind", D.Kind);
                       JO.attribute("name", D.Name);
                       JO.attributeObject("header_span", [&] {
-                        JO.attribute("file", D.File);
+                        JO.attribute("file", D.File); // can't be empty
                         JO.attribute("b", D.HeaderB);
                         JO.attribute("e", D.HeaderE);
                       });
@@ -1914,23 +1963,22 @@ void RefoldMapBuilder::writeJSON() {
 
           // Include-site anchors and structure for partial refolding.
           if (It.Subkind == "#include" || It.Subkind == "#include_next") {
-            if (!It.TargetAsWritten.empty())
-              JO.attribute("target", It.TargetAsWritten);
+            JO.attribute("target", It.TargetAsWritten); // can't be empty
             if (!It.ResolvedPath.empty())
               JO.attribute("resolved_path", It.ResolvedPath);
             JO.attribute("angled", It.IsAngled);
-            if (It.Parent >= 0)
-              JO.attribute("parent", It.Parent);
+            if (It.Parent)
+              JO.attribute("parent", *It.Parent);
           }
 
           // owner_include_id only for MACRO items and #define/#undef
           // directives
-          if (It.OwnerIncludeId >= 0) {
+          if (It.OwnerIncludeId) {
             if (It.Kind == IK_Macro) {
-              JO.attribute("owner_include_id", It.OwnerIncludeId);
+              JO.attribute("owner_include_id", *It.OwnerIncludeId);
             } else if (It.Kind == IK_Directive &&
                        (It.Subkind == "#define" || It.Subkind == "#undef")) {
-              JO.attribute("owner_include_id", It.OwnerIncludeId);
+              JO.attribute("owner_include_id", *It.OwnerIncludeId);
             }
           }
 
@@ -1941,18 +1989,13 @@ void RefoldMapBuilder::writeJSON() {
                 for (const ArgTokenSpan &S : It.ArgSpans) {
                   JO.object([&] {
                     JO.attribute("begin", S.Begin);
-                    JO.attribute("end",   S.End);
-                    int64_t PPByteBegin = -1;
-                    int64_t PPByteEnd = -1;
-                    if (S.Begin >= 0 && S.End > S.Begin &&
-                        (uint64_t)S.End <= TokPPByteBegin.size()) {
-                      PPByteBegin = (int64_t)TokPPByteBegin[(uint64_t)S.Begin];
-                      PPByteEnd = (int64_t)TokPPByteEnd[(uint64_t)S.End - 1];
+                    JO.attribute("end", S.End);
+                    if (S.ArgIndex)
+                      JO.attribute("arg_index", *S.ArgIndex);
+                    if (S.End > S.Begin && S.End <= TokPPByteBegin.size()) {
+                      JO.attribute("pp_byte_begin", TokPPByteBegin[S.Begin]);
+                      JO.attribute("pp_byte_end", TokPPByteEnd[S.End - 1]);
                     }
-                    JO.attribute("pp_byte_begin", PPByteBegin);
-                    JO.attribute("pp_byte_end", PPByteEnd);
-                    if (S.ArgIndex >= 0)
-                      JO.attribute("arg_index", (int64_t)S.ArgIndex);
                   });
                 }
               });
@@ -1962,18 +2005,13 @@ void RefoldMapBuilder::writeJSON() {
                 for (const ArgTokenSpan &S : It.StringifySpans) {
                   JO.object([&] {
                     JO.attribute("begin", S.Begin);
-                    JO.attribute("end",   S.End);
-                    int64_t PPByteBegin = -1;
-                    int64_t PPByteEnd = -1;
-                    if (S.Begin >= 0 && S.End > S.Begin &&
-                        (uint64_t)S.End <= TokPPByteBegin.size()) {
-                      PPByteBegin = (int64_t)TokPPByteBegin[(uint64_t)S.Begin];
-                      PPByteEnd = (int64_t)TokPPByteEnd[(uint64_t)S.End - 1];
+                    JO.attribute("end", S.End);
+                    if (S.ArgIndex)
+                      JO.attribute("arg_index", *S.ArgIndex);
+                    if (S.End > S.Begin && S.End <= TokPPByteBegin.size()) {
+                      JO.attribute("pp_byte_begin", TokPPByteBegin[S.Begin]);
+                      JO.attribute("pp_byte_end", TokPPByteEnd[S.End - 1]);
                     }
-                    JO.attribute("pp_byte_begin", PPByteBegin);
-                    JO.attribute("pp_byte_end", PPByteEnd);
-                    if (S.ArgIndex >= 0)
-                      JO.attribute("arg_index", (int64_t)S.ArgIndex);
                   });
                 }
               });
@@ -1984,20 +2022,15 @@ void RefoldMapBuilder::writeJSON() {
                   JO.object([&] {
                     JO.attribute("begin", S.Begin);
                     JO.attribute("end", S.End);
-                    int64_t PPByteBegin = -1;
-                    int64_t PPByteEnd = -1;
-                    if (S.Begin >= 0 && S.End > S.Begin &&
-                        (uint64_t)S.End <= TokPPByteBegin.size()) {
-                      PPByteBegin = (int64_t)TokPPByteBegin[(uint64_t)S.Begin];
-                      PPByteEnd = (int64_t)TokPPByteEnd[(uint64_t)S.End - 1];
-                    }
-                    JO.attribute("pp_byte_begin", PPByteBegin);
-                    JO.attribute("pp_byte_end", PPByteEnd);
-                    if (S.ArgIndex >= 0)
-                      JO.attribute("arg_index", (int64_t)S.ArgIndex);
+                    if (S.ArgIndex)
+                      JO.attribute("arg_index", *S.ArgIndex);
                     if (S.HasByteRange) {
-                      JO.attribute("byte_begin", (int64_t)S.ByteBegin);
-                      JO.attribute("byte_end", (int64_t)S.ByteEnd);
+                      JO.attribute("byte_begin", S.ByteBegin);
+                      JO.attribute("byte_end", S.ByteEnd);
+                    }
+                    if (S.End > S.Begin && S.End <= TokPPByteBegin.size()) {
+                      JO.attribute("pp_byte_begin", TokPPByteBegin[S.Begin]);
+                      JO.attribute("pp_byte_end", TokPPByteEnd[S.End - 1]);
                     }
                   });
                 }
@@ -2008,7 +2041,7 @@ void RefoldMapBuilder::writeJSON() {
                 for (const TokenSpan &S : It.BodySpans) {
                   JO.object([&] {
                     JO.attribute("begin", S.Begin);
-                    JO.attribute("end",   S.End);
+                    JO.attribute("end", S.End);
                   });
                 }
               });
@@ -2043,21 +2076,21 @@ void RefoldMapBuilder::writeJSON() {
     // later.
     struct ArmSlotSeed {
       std::string File;
-      int ArmId;
-      long long BodyB;
-      long long BodyE;
-      int OwnerIncludeId; // -1 => no owning include (TU)
+      uint64_t ArmId;
+      uint64_t BodyB;
+      uint64_t  BodyE;
+      std::optional<uint64_t> OwnerIncludeId; // nullopt => no owning include (TU)
 
       // Optional PP anchors for this arm's body in the A-side (preprocessed)
       // token stream. Only populated for the selected arm in this run.
-      std::optional<long long> PPBegin;
-      std::optional<long long> PPEnd;
+      std::optional<uint64_t> PPBegin;
+      std::optional<uint64_t> PPEnd;
     };
 
     std::vector<ArmSlotSeed> ArmSlotSeeds;
 
-    int NextCondGroupId = 0;
-    int NextCondArmId = 0;
+    uint64_t NextCondGroupId = 0;
+    uint64_t NextCondArmId = 0;
 
     // conds...
     JO.attributeArray("conds", [&] {
@@ -2070,12 +2103,12 @@ void RefoldMapBuilder::writeJSON() {
       //             (we treat the arm as "selected" for this run).
       //   - false => no such token; PPBegin/PPEnd will still be set to a
       //             deterministic insertion point, but the arm is not selected.
-      auto computeArmPPSpan = [&](llvm::StringRef File, unsigned BodyB,
-                                  unsigned BodyE, unsigned &PPBegin,
-                                  unsigned &PPEnd) -> bool {
+      auto computeArmPPSpan = [&](llvm::StringRef File, uint64_t BodyB,
+                                  uint64_t BodyE, uint64_t &PPBegin,
+                                  uint64_t &PPEnd) -> bool {
         bool FoundAny = false;
-        unsigned Begin = 0;
-        unsigned End = 0;
+        uint64_t Begin = 0;
+        uint64_t End = 0;
 
         // Normal case: collect all PP tokens whose source span overlaps [BodyB,
         // BodyE).
@@ -2084,11 +2117,10 @@ void RefoldMapBuilder::writeJSON() {
             continue;
 
           // No overlap if token ends at/before BodyB, or starts at/after BodyE.
-          if (TM.SrcEnd <= static_cast<long long>(BodyB) ||
-              TM.SrcBegin >= static_cast<long long>(BodyE))
+          if (TM.SrcEnd <= BodyB || TM.SrcBegin >= BodyE)
             continue;
 
-          unsigned PP = static_cast<unsigned>(TM.PPIndex);
+          uint64_t PP = TM.PPIndex;
           if (!FoundAny) {
             Begin = PP;
             FoundAny = true;
@@ -2105,7 +2137,7 @@ void RefoldMapBuilder::writeJSON() {
           // for this file; if the file has no tokens at all, we use 0.
           bool AnyForFile = false;
           bool InsertSet = false;
-          unsigned Insert = 0;
+          uint64_t Insert = 0;
 
           for (const TokMapEntry &TM : TokMap) {
             if (TM.File != File)
@@ -2113,15 +2145,15 @@ void RefoldMapBuilder::writeJSON() {
             AnyForFile = true;
 
             if (!InsertSet) {
-              if (TM.SrcBegin >= static_cast<long long>(BodyE)) {
-                Insert = static_cast<unsigned>(TM.PPIndex);
+              if (TM.SrcBegin >= BodyE) {
+                Insert = TM.PPIndex;
                 InsertSet = true;
                 break;
               }
 
               // Track "just after" the last token strictly before BodyB.
-              if (TM.SrcEnd <= static_cast<long long>(BodyB))
-                Insert = static_cast<unsigned>(TM.PPIndex + 1);
+              if (TM.SrcEnd <= BodyB)
+                Insert = TM.PPIndex + 1;
             }
           }
 
@@ -2142,25 +2174,23 @@ void RefoldMapBuilder::writeJSON() {
 
       // Helper: emit all conditional groups for a single file (TU or header),
       // computing the enclosing *arm* parent (if any) and per-arm
-      // selected/pp_span.
-      auto emitGroups = [&](llvm::StringRef FilePath, int parentIncId,
-                            bool isTU) {
+      // selected/pp_span. NOTE: FilePath must be non-empty
+      auto emitGroups = [&](llvm::StringRef FilePath,
+                            std::optional<uint64_t> parentIncId, bool isTU) {
         llvm::StringRef Buf;
 
         // Prefer SourceManager buffers (handles VFS and remaps).
-        if (!FilePath.empty()) {
-          if (auto FER = SM.getFileManager().getOptionalFileRef(FilePath)) {
-            FileID FID = SM.translateFile(*FER); // FileID, not Optional
-            if (FID.isValid()) {
-              if (auto MB = SM.getBufferOrNone(FID))
-                Buf = MB->getBuffer(); // Optional<MemoryBufferRef> ->
-                                       // MB->getBuffer()
-            }
+        if (auto FER = SM.getFileManager().getOptionalFileRef(FilePath)) {
+          FileID FID = SM.translateFile(*FER); // FileID, not Optional
+          if (FID.isValid()) {
+            if (auto MB = SM.getBufferOrNone(FID))
+              Buf = MB->getBuffer(); // Optional<MemoryBufferRef> ->
+                                     // MB->getBuffer()
           }
         }
 
         // Fallback to filesystem read.
-        if (Buf.empty() && !FilePath.empty()) {
+        if (Buf.empty()) {
           if (auto MB = llvm::MemoryBuffer::getFile(FilePath))
             Buf = (*MB)->getMemBufferRef().getBuffer();
         }
@@ -2175,13 +2205,13 @@ void RefoldMapBuilder::writeJSON() {
           if (G.Arms.empty())
             continue;
 
-          const long long GroupB = static_cast<long long>(G.GroupB);
-          const long long GroupE = static_cast<long long>(G.GroupE);
+          const uint64_t GroupB = G.GroupB;
+          const uint64_t GroupE = G.GroupE;
 
           // Find the innermost arm (if any) that textually contains this group.
           // We restrict to the same file + include-instance (parentIncId).
-          int ParentArmId = -1;
-          long long ParentArmBodyB = 0;
+          std::optional<uint64_t> ParentArmId;
+          uint64_t ParentArmBodyB = 0;
           bool HaveParent = false;
           for (const auto &Seed : ArmSlotSeeds) {
             if (Seed.File != G.File)
@@ -2198,29 +2228,24 @@ void RefoldMapBuilder::writeJSON() {
             }
           }
 
-          int ThisGroupId = NextCondGroupId++;
+          uint64_t ThisGroupId = NextCondGroupId++;
           JO.object([&] {
             JO.attribute("id", ThisGroupId);
             JO.attribute("file", G.File);
 
-            // parent = enclosing *arm* id, or null for top-level.
+            // parent = enclosing *arm* id, or elide if no parent
             if (HaveParent)
-              JO.attribute("parent_arm_id", ParentArmId);
-            else
-              JO.attribute("parent_arm_id", nullptr);
+              JO.attribute("parent_arm_id", *ParentArmId);
 
-            JO.attribute("group_b", static_cast<uint64_t>(G.GroupB));
-            JO.attribute("group_e", static_cast<uint64_t>(G.GroupE));
+            JO.attribute("group_b", G.GroupB);
+            JO.attribute("group_e", G.GroupE);
 
-            if (parentIncId >= 0)
-              JO.attribute("parent_include_id",
-                           static_cast<int64_t>(parentIncId));
-            else
-              JO.attribute("parent_include_id", nullptr);
+            if (parentIncId)
+              JO.attribute("parent_include_id", *parentIncId);
 
-            // *** NEW: single-arm groups get their arm body widened to the full
-            // group range, so nested groups + trailing text are counted as part
-            // of that arm.
+            // Single-arm groups get their arm body widened to the full group
+            // range, so nested groups + trailing text are counted as part of
+            // that arm.
             const bool SingleArmGroup = (G.Arms.size() == 1);
 
             JO.attributeArray("arms", [&] {
@@ -2228,8 +2253,8 @@ void RefoldMapBuilder::writeJSON() {
                 // Compute the effective body range we will use for:
                 //  - computing pp_span (which tokens belong to this arm), and
                 //  - parent lookup for nested groups (ArmSlotSeeds).
-                long long ArmBodyB = static_cast<long long>(A.BodyB);
-                long long ArmBodyE = static_cast<long long>(A.BodyE);
+                uint64_t ArmBodyB = A.BodyB;
+                uint64_t ArmBodyE = A.BodyE;
 
                 if (SingleArmGroup) {
                   // For #ifdef FOO ... #endif with no #else/#elif, the *entire*
@@ -2245,20 +2270,19 @@ void RefoldMapBuilder::writeJSON() {
                   ArmBodyE = GroupE;
                 }
 
-                int ArmId = NextCondArmId++;
+                uint64_t ArmId = NextCondArmId++;
 
-                unsigned PPBegin = 0, PPEnd = 0;
+                uint64_t PPBegin = 0, PPEnd = 0;
                 bool IsSelected = computeArmPPSpan(
-                    G.File, static_cast<unsigned>(ArmBodyB),
-                    static_cast<unsigned>(ArmBodyE), PPBegin, PPEnd);
+                    G.File, ArmBodyB, ArmBodyE, PPBegin, PPEnd);
 
                 JO.object([&] {
                   JO.attribute("id", ArmId);
                   JO.attribute("kind", A.Kind);
                   if (!A.Cond.empty())
                     JO.attribute("cond", A.Cond);
-                  JO.attribute("body_b", static_cast<uint64_t>(ArmBodyB));
-                  JO.attribute("body_e", static_cast<uint64_t>(ArmBodyE));
+                  JO.attribute("body_b", ArmBodyB);
+                  JO.attribute("body_e", ArmBodyE);
 
                   // Mark whether this arm actually contributed any PP tokens
                   // in this preprocessing run.
@@ -2277,11 +2301,11 @@ void RefoldMapBuilder::writeJSON() {
                 // Remember where this arm's body lives, so we can:
                 //  - resolve nested groups' parents deterministically, and
                 //  - emit arm_begin/arm_end slots later.
-                std::optional<long long> ArmPPBegin = std::nullopt;
-                std::optional<long long> ArmPPEnd = std::nullopt;
+                std::optional<uint64_t> ArmPPBegin;
+                std::optional<uint64_t> ArmPPEnd;
                 if (IsSelected) {
-                  ArmPPBegin = static_cast<long long>(PPBegin);
-                  ArmPPEnd = static_cast<long long>(PPEnd);
+                  ArmPPBegin = PPBegin;
+                  ArmPPEnd = PPEnd;
                 }
 
                 ArmSlotSeeds.push_back(
@@ -2294,7 +2318,7 @@ void RefoldMapBuilder::writeJSON() {
       };
 
       // 1) Main translation unit groups.
-      emitGroups(TUSourcePath, /*parentIncId=*/-1, /*isTU=*/true);
+      emitGroups(TUSourcePath, /*parentIncId=*/std::nullopt, /*isTU=*/true);
 
       // 2) Each include/include_next instance (per-instance, no dedup).
       for (const auto &It : Items) {
@@ -2308,27 +2332,26 @@ void RefoldMapBuilder::writeJSON() {
 
     // slots...
     JO.attributeArray("slots", [&] {
-      int SlotId = 0;
-      auto emitPoint =
-          [&](llvm::StringRef FilePath, long long off, const char *kind,
-              std::optional<int> ref = std::nullopt, int owner = -1,
-              std::optional<long long> pp = std::nullopt) {
-            // const long long o = off < 0 ? 0 : off;  // clamp once here
-            const long long o = off;
-            JO.object([&] {
-              JO.attribute("id", SlotId++);
-              JO.attribute("file", FilePath.str());
-              JO.attribute("kind", kind);
-              JO.attribute("b", o);
-              JO.attribute("e", o);
-              if (ref)
-                JO.attribute("ref", *ref);
-              if (owner >= 0)
-                JO.attribute("owner_include_id", owner);
-              if (pp)
-                JO.attribute("pp", *pp);
-            });
-          };
+      uint64_t SlotId = 0;
+      auto emitPoint = [&](llvm::StringRef FilePath, uint64_t off,
+                           const char *kind,
+                           std::optional<uint64_t> ref = std::nullopt,
+                           std::optional<uint64_t> owner = std::nullopt,
+                           std::optional<uint64_t> pp = std::nullopt) {
+        JO.object([&] {
+          JO.attribute("id", SlotId++);
+          JO.attribute("file", FilePath.str());
+          JO.attribute("kind", kind);
+          JO.attribute("b", off);
+          JO.attribute("e", off);
+          if (ref)
+            JO.attribute("ref", *ref);
+          if (owner)
+            JO.attribute("owner_include_id", *owner);
+          if (pp)
+            JO.attribute("pp", *pp);
+        });
+      };
 
       // Map a (file, byte offset) to a deterministic PP insertion gap index.
       //
@@ -2342,22 +2365,19 @@ void RefoldMapBuilder::writeJSON() {
       //     returns nullopt (slot will omit "pp").
       auto ppIndexForFileOffset =
           [&](llvm::StringRef FilePath,
-              long long Off) -> std::optional<long long> {
-        if (Off < 0)
-          return std::nullopt;
-
+              uint64_t Off) -> std::optional<uint64_t> {
         bool Any = false;
-        long long Best = -1;
-        long long Last = -1;
-        long long MinBegin = std::numeric_limits<long long>::max();
+        std::optional<uint64_t> Best;
+        std::optional<uint64_t> Last;
+        uint64_t MinBegin = std::numeric_limits<uint64_t>::max();
 
         for (const auto &TM : TokMap) {
           if (TM.File != FilePath)
             continue;
           Any = true;
 
-          long long Idx = static_cast<long long>(TM.PPIndex);
-          if (Idx > Last)
+          uint64_t Idx = TM.PPIndex;
+          if (!Last || Idx > *Last)
             Last = Idx;
 
           if (TM.SrcBegin >= 0 && TM.SrcBegin < MinBegin)
@@ -2368,11 +2388,11 @@ void RefoldMapBuilder::writeJSON() {
           if (TM.SrcBegin >= 0 && TM.SrcEnd >= 0) {
             if ((TM.SrcBegin <= Off && Off < TM.SrcEnd) ||
                 (TM.SrcBegin >= Off)) {
-              if (Best < 0 || Idx < Best)
+              if (!Best || Idx < *Best)
                 Best = Idx;
             }
           } else if (TM.SrcBegin >= 0 && TM.SrcBegin >= Off) {
-            if (Best < 0 || Idx < Best)
+            if (!Best || Idx < *Best)
               Best = Idx;
           }
         }
@@ -2383,21 +2403,21 @@ void RefoldMapBuilder::writeJSON() {
         // If Off lies *before* the first byte that contributes any printed
         // PP tokens for this file, then there is no sensible PP anchor for
         // Off (e.g. directive-only preambles like #include lines).
-        if (MinBegin != std::numeric_limits<long long>::max() && Off < MinBegin)
+        if (MinBegin != std::numeric_limits<uint64_t>::max() && Off < MinBegin)
           return std::nullopt;
 
-        if (Best >= 0)
+        if (Best)
           return Best;
-        return Last + 1;
+        return Last ? *Last + 1 : 0;
       };
 
-      auto computeAfterLastInclude = [&](llvm::StringRef Buf) -> long long {
+      auto computeAfterLastInclude = [&](llvm::StringRef Buf) -> size_t {
         if (Buf.empty())
           return 0;
         size_t N = Buf.size();
         size_t p = 0;
-        int depth = 0;
-        long long lastEnd = -1;
+        unsigned depth = 0;
+        size_t lastEnd = 0;
         while (p < N) {
           auto span = lineSpanOf(Buf, p);
           size_t bol = span.first, eol = span.second;
@@ -2423,12 +2443,12 @@ void RefoldMapBuilder::writeJSON() {
               if (depth > 0)
                 depth--;
             } else if (depth == 0 && (kw("include") || kw("include_next"))) {
-              lastEnd = (long long)eol;
+              lastEnd = eol;
             }
           }
           p = eol;
         }
-        return lastEnd >= 0 ? lastEnd : 0;
+        return lastEnd;
       };
 
       // file-level slots for TU
@@ -2447,12 +2467,12 @@ void RefoldMapBuilder::writeJSON() {
           Diags.Report(ID) << TUSourcePath;
         }
 
-        long long after = computeAfterLastInclude(Buf);
+        size_t after = computeAfterLastInclude(Buf);
 
         // Compute the PP-token boundary after the last include *output* in the TU.
         // Note: the bytes that contain the #include directive itself do not appear
         // in the printed PP stream, so tokmap cannot anchor these offsets.
-        std::optional<long long> afterLastIncludePP = std::nullopt;
+        std::optional<uint64_t> afterLastIncludePP = std::nullopt;
         {
           bool Have = false;
           uint64_t MaxE = 0;
@@ -2469,18 +2489,18 @@ void RefoldMapBuilder::writeJSON() {
             }
           }
           if (Have)
-            afterLastIncludePP = static_cast<long long>(MaxE);
+            afterLastIncludePP = MaxE;
           else
             afterLastIncludePP = ppIndexForFileOffset(TUSourcePath, after);
         }
 
-        emitPoint(TUSourcePath, 0, "file_begin", std::nullopt, /*owner=*/-1,
-                  ppIndexForFileOffset(TUSourcePath, 0));
-        emitPoint(TUSourcePath, (long long)size, "file_end", std::nullopt,
-                  /*owner=*/-1,
-                  ppIndexForFileOffset(TUSourcePath, (long long)size));
-        emitPoint(TUSourcePath, after, "after_last_include", std::nullopt,
-                  /*owner=*/-1, afterLastIncludePP);
+        emitPoint(TUSourcePath, 0, "file_begin", /*ref=*/std::nullopt,
+                  /*owner=*/std::nullopt, ppIndexForFileOffset(TUSourcePath, 0));
+        emitPoint(TUSourcePath, size, "file_end", /*ref=*/std::nullopt,
+                  /*owner=*/std::nullopt,
+                  ppIndexForFileOffset(TUSourcePath, size));
+        emitPoint(TUSourcePath, after, "after_last_include", /*ref*/std::nullopt,
+                  /*owner=*/std::nullopt, afterLastIncludePP);
       }
 
       // include before/after slots + file-level slots per included header
@@ -2488,8 +2508,8 @@ void RefoldMapBuilder::writeJSON() {
       for (const auto &It : Items) {
         if (It.Subkind == "#include" || It.Subkind == "#include_next") {
           if (!It.SitePath.empty()) {
-            std::optional<long long> ppB = std::nullopt;
-            std::optional<long long> ppE = std::nullopt;
+            std::optional<uint64_t> ppB;
+            std::optional<uint64_t> ppE;
             if (!It.Spans.empty()) {
               uint64_t MinB = std::numeric_limits<uint64_t>::max();
               uint64_t MaxE = 0;
@@ -2500,17 +2520,18 @@ void RefoldMapBuilder::writeJSON() {
                   MaxE = S.End;
               }
               if (MinB != std::numeric_limits<uint64_t>::max()) {
-                ppB = static_cast<long long>(MinB);
-                ppE = static_cast<long long>(MaxE);
+                ppB = MinB;
+                ppE = MaxE;
               }
             }
-
-            if (It.SiteBegin >= 0)
-              emitPoint(It.SitePath, It.SiteBegin, "before_include", It.ID,
-                        /*owner=*/-1, ppB);
-            if (It.SiteEnd >= 0)
-              emitPoint(It.SitePath, It.SiteEnd, "after_include", It.ID,
-                        /*owner=*/-1, ppE);
+            if (It.SiteBegin) {
+              emitPoint(It.SitePath, *It.SiteBegin, "before_include", It.ID,
+                        /*owner=*/std::nullopt, ppB);
+            }
+            if (It.SiteEnd) {
+              emitPoint(It.SitePath, *It.SiteEnd, "after_include", It.ID,
+                        /*owner=*/std::nullopt, ppE);
+            }
           }
           if (!It.ResolvedPath.empty()) {
             auto MB = llvm::MemoryBuffer::getFile(It.ResolvedPath);
@@ -2520,12 +2541,12 @@ void RefoldMapBuilder::writeJSON() {
               HBuf = (*MB)->getMemBufferRef().getBuffer();
               HSize = HBuf.size();
             }
-            long long after = computeAfterLastInclude(HBuf);
+            size_t after = computeAfterLastInclude(HBuf);
             emitPoint(It.ResolvedPath, 0, "file_begin", std::nullopt, It.ID,
                       ppIndexForFileOffset(It.ResolvedPath, 0));
-            emitPoint(It.ResolvedPath, (long long)HSize, "file_end",
+            emitPoint(It.ResolvedPath, HSize, "file_end",
                       std::nullopt, It.ID,
-                      ppIndexForFileOffset(It.ResolvedPath, (long long)HSize));
+                      ppIndexForFileOffset(It.ResolvedPath, HSize));
             emitPoint(It.ResolvedPath, after, "after_last_include",
                       std::nullopt, It.ID,
                       ppIndexForFileOffset(It.ResolvedPath, after));
@@ -2537,7 +2558,7 @@ void RefoldMapBuilder::writeJSON() {
       for (const auto &AS : ArmSlotSeeds) {
         // TU-local arms will have OwnerIncludeId == -1, so we omit
         // owner_include_id.
-        int ownerId = AS.OwnerIncludeId; // -1 => no owner_include_id
+        auto ownerId = AS.OwnerIncludeId; // nullopt => no owner_include_id
 
         // Begin of the arm body
         emitPoint(AS.File, AS.BodyB, "arm_begin",

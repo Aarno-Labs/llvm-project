@@ -144,8 +144,8 @@ class RefoldModel {
 public:
   // ========================== Coordinate primitives ==========================
   struct PPSpan {
-    int begin; // inclusive A-token index
-    int end;   // exclusive A-token index
+    uint64_t begin; // inclusive A-token index
+    uint64_t end;   // exclusive A-token index
 
     std::string ToString() const {
       return formatv("[{0},{1})", begin, end).str();
@@ -182,10 +182,11 @@ public:
 
   struct PPArgSpan : public PPSpan {
     PPArgSpanKind kind;
-    int argIdx;
-    int byteBegin = -1, byteEnd = -1;
-    std::optional<int> ppByteBegin;
-    std::optional<int> ppByteEnd;
+    uint32_t argIdx;
+    std::optional<uint32_t> byteBegin;
+    std::optional<uint32_t> byteEnd;
+    std::optional<uint64_t> ppByteBegin;
+    std::optional<uint64_t> ppByteEnd;
 
     std::string ToString() const {
       return formatv("Arg {0}: [{1}, {2})", argIdx, begin, end).str();
@@ -195,216 +196,192 @@ public:
   };
 
   struct PPCover {
-    int begin; // inclusive
-    int end;   // exclusive
+    uint64_t begin = 0;
+    uint64_t end = 0;
 
-    void Init(std::optional<int> coverBeginOpt, std::optional<int> coverEndOpt,
-              const std::vector<PPSpan> &spans,
+    void Init(const std::vector<PPSpan> &spans,
               const std::vector<PPArgSpan> *argSpans = nullptr,
               const std::vector<PPSpan> *bodySpans = nullptr) noexcept {
-      int cb = -1, ce = -1;
-      if (coverBeginOpt && coverEndOpt) {
-        cb = *coverBeginOpt;
-        ce = *coverEndOpt;
-      }
+      uint64_t mn = std::numeric_limits<uint64_t>::max();
+      uint64_t mx = 0;
+      bool found = false;
 
-      // If pp_cover is not present, approximate coverage from any recorded PP
-      // spans. This must include arg/body spans as well as the outer 'spans' so
-      // that edits to nested macro expansions inside a macro body can be
-      // attributed to the enclosing macro invocation.
-      if (cb < 0 || ce < 0) {
-        int mn = std::numeric_limits<int>::max();
-        int mx = std::numeric_limits<int>::min();
-
-        for (const auto &s : spans) {
-          if (!s.IsValid())
-            continue;
-          if (s.begin < mn)
-            mn = s.begin;
-          if (s.end > mx)
-            mx = s.end;
-        }
-
-        if (argSpans) {
-          for (const auto &s : *argSpans) {
-            if (!s.IsValid())
-              continue;
+      // Unified processor for anything that acts like a PPSpan
+      auto update = [&](const auto &range) {
+        for (const auto &s : range) {
+          if (s.IsValid()) {
             if (s.begin < mn)
               mn = s.begin;
             if (s.end > mx)
               mx = s.end;
+            found = true;
           }
         }
+      };
 
-        if (bodySpans) {
-          for (const auto &s : *bodySpans) {
-            if (!s.IsValid())
-              continue;
-            if (s.begin < mn)
-              mn = s.begin;
-            if (s.end > mx)
-              mx = s.end;
-          }
-        }
+      update(spans);
+      if (argSpans)
+        update(*argSpans);
+      if (bodySpans)
+        update(*bodySpans);
 
-        if (mn != std::numeric_limits<int>::max()) {
-          cb = mn;
-          ce = std::max(mn, mx);
-        }
+      if (found) {
+        begin = mn;
+        end = mx;
+      } else {
+        begin = 0;
+        end = 0;
       }
-
-      begin = cb;
-      end = ce;
     }
 
-    bool Covers(int aStart, int aEnd) const noexcept {
-      return begin >= 0 && end >= 0 && begin <= aStart && aEnd <= end;
+    bool IsValid() const noexcept { return end > begin; }
+
+    bool Covers(uint64_t aStart, uint64_t aEnd) const noexcept {
+      return IsValid() && begin <= aStart && aEnd <= end;
     }
   };
 
   struct TokMapEntry {
-    int pp;
     std::string file;
-    int b;
-    int e;
+    uint64_t pp;
+    uint64_t b;
+    uint64_t e;
   };
 
   // ================================== Items ==================================
+
   struct HeaderDecl {
-    std::string kind;
-    std::string name;
-    std::string file;
-    int headerB;
-    int headerE;
-    PPSpan ppSpan;
+    StringRef kind;
+    StringRef name;
+    StringRef file;
+    uint64_t headerB;
+    uint64_t headerE;
+    PPSpan span;
   };
 
   struct IncludeItem {
-    int id;
-    std::string subkind;  // "#include" | "#include_next"
-    std::string text;     // directive line (optional)
-    std::string sitePath; // includer path
-    int siteB;
-    int siteE;
-    std::string target; // as-written (e.g. "\"e.h\"" or "<vector>")
-    std::optional<std::string> resolvedPath;
+    uint64_t id;
+    StringRef subkind;  // "#include" | "#include_next"
+    StringRef text;     // directive line (optional)
+    StringRef sitePath; // includer path
+    uint64_t siteB;
+    uint64_t siteE;
+    StringRef target; // as-written (e.g. "\"e.h\"" or "<vector>")
+    std::optional<StringRef> resolvedPath;
     bool angled;
-    std::optional<int> parent; // parent include id
+    std::optional<uint64_t> parent; // parent include id
     std::vector<PPSpan> spans;
-    PPCover cover;
     std::vector<HeaderDecl> decls; // header decls referenced by this include
+    PPCover cover;
 
-    IncludeItem(int id, std::string subkind, std::string text,
-                std::string sitePath, int siteB, int siteE, std::string target,
-                std::optional<std::string> resolvedPath, bool angled,
-                std::optional<int> parent, std::vector<PPSpan> spans,
-                std::optional<int> coverBegin, std::optional<int> coverEnd,
+    IncludeItem(uint64_t id, StringRef subkind, StringRef text,
+                StringRef sitePath, uint64_t siteB, uint64_t siteE,
+                StringRef target, std::optional<StringRef> resolvedPath,
+                bool angled, std::optional<uint64_t> parent,
+                std::vector<PPSpan> spans,
                 std::vector<HeaderDecl> decls) noexcept
-        : id(id), subkind(std::move(subkind)), text(std::move(text)),
-          sitePath(std::move(sitePath)), siteB(siteB), siteE(siteE),
-          target(std::move(target)), resolvedPath(std::move(resolvedPath)),
-          angled(angled), parent(std::move(parent)), spans(std::move(spans)),
-          decls(std::move(decls)) {
-      cover.Init(coverBegin, coverEnd, this->spans);
+        : id(id), subkind(subkind), text(text), sitePath(sitePath),
+          siteB(siteB), siteE(siteE), target(target),
+          resolvedPath(resolvedPath), angled(angled), parent(parent),
+          spans(std::move(spans)), decls(std::move(decls)) {
+      cover.Init(this->spans);
     }
 
-    bool Covers(int aStart, int aEnd) const {
+    bool Covers(uint64_t aStart, uint64_t aEnd) const {
       return cover.Covers(aStart, aEnd);
     }
   };
 
   struct MacroInvocation {
-    int id;
-    std::string subkind; // "func" | "obj"
-    std::string name;
+    uint64_t id;
+    StringRef subkind; // "func" | "obj"
+    StringRef name;
     std::vector<PPSpan> spans; // expansion coverage (A tokens)
     std::vector<PPArgSpan> argSpans;
     std::vector<PPArgSpan> stringifySpans;
     std::vector<PPArgSpan> pasteSpans;
     std::vector<PPSpan> bodySpans;
-    std::optional<std::string> invText;
-    std::optional<std::string> invFile; // file containing invocation
-    std::optional<int> invB, invE; // byte offsets within invFile
-    std::optional<int> invPPByteBegin, invPPByteEnd; // A-stream byte envelope
-    std::optional<int> ownerIncludeId;
+    std::optional<StringRef> invText;
+    std::optional<StringRef> invFile;   // file containing invocation
+    std::optional<uint64_t> invB, invE; // byte offsets within invFile
+    std::optional<uint64_t> invPPByteBegin,
+        invPPByteEnd; // A-stream byte envelope
+    std::optional<uint64_t> ownerIncludeId;
     PPCover cover;
 
-    MacroInvocation(int id, std::string subkind, std::string name,
-                    std::optional<std::string> invText,
-                    std::optional<std::string> invFile, std::optional<int> invB,
-                    std::optional<int> invE, std::optional<int> invPPByteBegin,
-                    std::optional<int> invPPByteEnd, std::optional<int> ownerIncludeId,
+    MacroInvocation(uint64_t id, StringRef subkind, StringRef name,
+                    std::optional<StringRef> invText,
+                    std::optional<StringRef> invFile,
+                    std::optional<uint64_t> invB, std::optional<uint64_t> invE,
+                    std::optional<uint64_t> invPPByteBegin,
+                    std::optional<uint64_t> invPPByteEnd,
+                    std::optional<uint64_t> ownerIncludeId,
                     std::vector<PPSpan> spans, std::vector<PPArgSpan> argSpans,
                     std::vector<PPArgSpan> stringifySpans,
                     std::vector<PPArgSpan> pasteSpans,
-                    std::vector<PPSpan> bodySpans,
-                    std::optional<int> coverBegin,
-                    std::optional<int> coverEnd) noexcept
-        : id(id), subkind(std::move(subkind)), name(std::move(name)),
-          spans(std::move(spans)), argSpans(std::move(argSpans)),
+                    std::vector<PPSpan> bodySpans) noexcept
+        : id(id), subkind(subkind), name(name), spans(std::move(spans)),
+          argSpans(std::move(argSpans)),
           stringifySpans(std::move(stringifySpans)),
           pasteSpans(std::move(pasteSpans)), bodySpans(std::move(bodySpans)),
-          invText(std::move(invText)), invFile(std::move(invFile)),
-          invB(std::move(invB)), invE(std::move(invE)),
-          invPPByteBegin(std::move(invPPByteBegin)),
-          invPPByteEnd(std::move(invPPByteEnd)),
-          ownerIncludeId(std::move(ownerIncludeId)) {
-      cover.Init(coverBegin, coverEnd, this->spans, &this->argSpans,
-                 &this->bodySpans);
+          invText(invText), invFile(invFile), invB(invB), invE(invE),
+          invPPByteBegin(invPPByteBegin), invPPByteEnd(invPPByteEnd),
+          ownerIncludeId(ownerIncludeId) {
+      cover.Init(this->spans, &this->argSpans, &this->bodySpans);
     }
 
-    int GetInvB() const { return invB.has_value() ? *invB : -1; }
-    int GetInvE() const { return invE.has_value() ? *invE : -1; }
-
-    bool Covers(int aStart, int aEnd) const {
+    bool Covers(uint64_t aStart, uint64_t aEnd) const {
       return cover.Covers(aStart, aEnd);
     }
   };
 
   struct MacroDirective {
-    int id;
-    std::string subkind; // "#define" | "#undef"
-    std::string text;
-    std::string sitePath;
-    int siteB;
-    int siteE;
-    std::optional<int> ownerIncludeId;
+    uint64_t id;
+    StringRef subkind; // "#define" | "#undef"
+    StringRef text;
+    StringRef sitePath;
+    uint64_t siteB;
+    uint64_t siteE;
+    std::optional<uint64_t> ownerIncludeId;
     std::vector<PPSpan> spans;
   };
 
   struct PragmaDirective {
-    int id;
-    std::string text;
-    std::string sitePath;
-    int siteB;
-    int siteE;
+    uint64_t id;
+    StringRef text;
+    StringRef sitePath;
+    uint64_t siteB;
+    uint64_t siteE;
   };
 
   struct FileItem {
-    int id;
-    std::optional<std::string> path;
+    uint64_t id;
+    StringRef path;
     std::vector<PPSpan> spans;
   };
 
   // ================================== Slots ==================================
+
   struct Slot {
-    int id;
-    std::string file;
-    std::string kind; // enum per schema
-    std::optional<int> ref; // include id or cond-arm id
-    int b;
-    int e;
-    std::optional<int> ownerIncludeId;
-    std::optional<int> pp; // optional A-token index for tie-break
+    uint64_t id;
+    StringRef file;
+    StringRef kind;              // enum per schema
+    std::optional<uint64_t> ref; // include id or cond-arm id
+    std::optional<uint64_t> pp;
+    uint64_t b;
+    uint64_t e;
+    std::optional<uint64_t> ownerIncludeId;
   };
 
   // ================================ Segments =================================
+
   struct Segment {
-    std::string file;
-    int b;
-    int e;
-    std::optional<int> ownerIncludeId; // current include ownership at [b,e)
-    std::optional<int> ownerCondArmId; // current conditional arm at [b,e)
+    StringRef file;
+    uint64_t b;
+    uint64_t e;
+    std::optional<uint64_t>
+        ownerIncludeId; // current include ownership at [b,e)
+    std::optional<uint64_t> ownerCondArmId; // current conditional arm at [b,e)
 
     std::string ToString() const {
       return formatv("Segment{file='{0}', b={1}, e={2}, ownerIncludeId={3} "
@@ -415,30 +392,30 @@ public:
 
   // =============================== Conditionals ==============================
   struct CondArm {
-    int id;
-    int groupId; // owning CondGroup id
-    std::string kind; // if/ifdef/ifndef/elif/else
-    std::optional<std::string> cond;
-    int bodyB;
-    int bodyE;
-    std::optional<PPSpan> ppSpan; // optional A-token span for this arm
-    std::optional<bool> selected;
+    uint64_t id;
+    uint64_t groupId; // owning CondGroup id
+    StringRef kind;   // if/ifdef/ifndef/elif/else
+    std::optional<StringRef> cond;
+    uint64_t bodyB;
+    uint64_t bodyE;
+    std::optional<PPSpan> span; // optional A-token span for this arm
+    bool selected;
 
-    bool ContainsByte(int byteOffset) const {
+    bool ContainsByte(uint64_t byteOffset) const {
       return bodyB <= byteOffset && byteOffset < bodyE;
     }
   };
 
   struct CondGroup {
-    int id;
-    std::string file;
-    std::optional<int> parentArmId;
-    int groupB;
-    int groupE;
-    std::optional<int> parentIncludeId;
+    uint64_t id;
+    StringRef file;
+    std::optional<uint64_t> parentArmId;
+    std::optional<uint64_t> parentIncludeId;
+    uint64_t groupB;
+    uint64_t groupE;
     std::vector<CondArm> arms;
 
-    bool ContainsByte(int byteOffset) const {
+    bool ContainsByte(uint64_t byteOffset) const {
       return groupB <= byteOffset && byteOffset < groupE;
     }
   };
@@ -464,12 +441,13 @@ public:
   static Expected<RefoldModel> FromJson(const json::Object &Root);
 
   // ============================== Basic getters ==============================
+
   StringRef GetVersion() const { return version_; }
   StringRef GetSourcePath() const { return sourcePath_; }
   StringRef GetPPCwd() const { return ppCwd_; }
-  int GetTokensCountA() const { return tokensCountA_; }
+  uint64_t GetTokensCountA() const { return tokensCountA_; }
 
-  const DenseMap<int, TokMapEntry> &GetTokmapByPP() const {
+  const DenseMap<uint64_t, TokMapEntry> &GetTokmapByPP() const {
     return tokmapByPP_;
   }
   ArrayRef<TokMapEntry> GetTokmap() const { return tokmap_; }
@@ -482,17 +460,17 @@ public:
   ArrayRef<Slot> GetSlots() const { return slots_; }
   ArrayRef<CondGroup> GetConds() const { return conds_; }
 
-  const IncludeItem *GetIncludeById(int id) const {
+  const IncludeItem *GetIncludeById(uint64_t id) const {
     auto it = includeById_.find(id);
     return it == includeById_.end() ? nullptr : it->second;
   }
 
-  const CondGroup *GetCondGroupById(int id) const {
+  const CondGroup *GetCondGroupById(uint64_t id) const {
     auto it = condGroupById_.find(id);
     return it == condGroupById_.end() ? nullptr : it->second;
   }
 
-  std::optional<ArmRef> GetArmRefById(int armId) const {
+  std::optional<ArmRef> GetArmRefById(uint64_t armId) const {
     auto it = armById_.find(armId);
     if (it == armById_.end())
       return std::nullopt;
@@ -510,104 +488,104 @@ public:
   }
 
   // --- Include nesting ---
-  unsigned GetIncludeDepth(const std::optional<int> &includeId) const;
-  std::optional<int> InnermostIncludeAtPP(int ppIndex) const;
-  std::optional<int> LeastCommonAncestorInclude(std::optional<int> a,
-                                                std::optional<int> b) const;
+  uint32_t GetIncludeDepth(std::optional<uint64_t> includeId) const;
+  std::optional<uint64_t> InnermostIncludeAtPP(uint64_t ppIndex) const;
+  std::optional<uint64_t>
+  LeastCommonAncestorInclude(std::optional<uint64_t> a,
+                             std::optional<uint64_t> b) const;
 
   // --- Conditional nesting ---
-  unsigned GetCondGroupDepth(const std::optional<int> &groupId) const;
-  unsigned GetCondArmDepth(const std::optional<int> &armId) const {
-    if (!armId)
-      return 0;
-    if (auto ref = GetArmRefById(*armId))
+  uint32_t GetCondGroupDepth(uint64_t groupId) const;
+  uint32_t GetCondArmDepth(uint64_t armId) const {
+    if (auto ref = GetArmRefById(armId))
       return GetCondGroupDepth(ref->group->id);
-    return 1;
+    return 0;
   }
 
   std::vector<const CondGroup *>
-  GetCondGroups(StringRef file,
-                const std::optional<int> &parentIncludeId) const;
+  GetCondGroups(StringRef file, std::optional<uint64_t> parentIncludeId) const;
 
   std::optional<ArmRef>
-  FindArmRefForByte(StringRef file, const std::optional<int> &parentIncludeId,
-                    int byteOffset) const;
+  FindArmRefForByte(StringRef file, std::optional<uint64_t> parentIncludeId,
+                    uint64_t byteOffset) const;
 
   std::optional<const CondArm *>
-  FindArmForByte(StringRef file, const std::optional<int> &parentIncludeId,
-                 int byteOffset) const {
+  FindArmForByte(StringRef file, std::optional<uint64_t> parentIncludeId,
+                 uint64_t byteOffset) const {
     if (auto armRef = FindArmRefForByte(file, parentIncludeId, byteOffset))
       return (*armRef).arm;
     return std::nullopt;
   }
 
-  std::optional<ArmRef> FindArmRefAtPP(int ppIndex) const;
-  std::optional<const CondArm *> FindArmForPP(int ppIndex) const {
+  std::optional<ArmRef> FindArmRefAtPP(uint64_t ppIndex) const;
+  std::optional<const CondArm *> FindArmForPP(uint64_t ppIndex) const {
     auto ref = FindArmRefAtPP(ppIndex);
     if (!ref)
       return std::nullopt;
     return ref->arm;
   }
 
-  int FirstConditionalArmStartA(const CondGroup &group) const;
-  int FirstConditionalArmStartA(int groupId) const {
+  std::optional<uint64_t>
+  FirstConditionalArmStartA(const CondGroup &group) const;
+  std::optional<uint64_t> FirstConditionalArmStartA(uint64_t groupId) const {
     const CondGroup *group = GetCondGroupById(groupId);
     if (!group)
-      return -1;
+      return std::nullopt;
     return FirstConditionalArmStartA(*group);
   }
 
   // --- Slot queries ---
-  std::vector<const Slot *> FindSlots(const std::optional<std::string> &file,
-                                      const std::optional<std::string> &kind,
-                                      const std::optional<int> &ref,
-                                      const std::optional<int> &ownerIncludeId) const;
+  std::vector<const Slot *>
+  FindSlots(std::optional<StringRef> file, std::optional<StringRef> kind,
+            std::optional<uint64_t> ref,
+            std::optional<uint64_t> ownerIncludeId) const;
 
-  std::optional<const Slot *> GetBeforeIncludeSlot(int includeId) const {
+  std::optional<const Slot *> GetBeforeIncludeSlot(uint64_t includeId) const {
     auto slots =
-        FindSlots(std::nullopt, std::optional<std::string>("before_include"),
-                  std::optional<int>(includeId), std::nullopt);
+        FindSlots(std::nullopt, "before_include", includeId, std::nullopt);
     if (slots.empty())
       return std::nullopt;
     return slots.front();
   }
 
-  std::optional<const Slot *> GetAfterIncludeSlot(int includeId) const {
+  std::optional<const Slot *> GetAfterIncludeSlot(uint64_t includeId) const {
     auto slots =
-        FindSlots(std::nullopt, std::optional<std::string>("after_include"),
-                  std::optional<int>(includeId), std::nullopt);
+        FindSlots(std::nullopt, "after_include", includeId, std::nullopt);
     if (slots.empty())
       return std::nullopt;
     return slots.front();
   }
 
-  std::optional<const Slot *> GetArmBeginSlot(int armId) const;
-  std::optional<const Slot *> GetArmEndSlot(int armId) const;
+  std::optional<const Slot *> GetArmBeginSlot(uint64_t armId) const;
+  std::optional<const Slot *> GetArmEndSlot(uint64_t armId) const;
 
   // --- Tokmap queries ---
-  std::optional<TokMapEntry> MapPP(int pp) const {
+  std::optional<TokMapEntry> MapPP(uint64_t pp) const {
     auto it = tokmapByPP_.find(pp);
     if (it == tokmapByPP_.end())
       return std::nullopt;
     return it->second;
   }
 
-  std::vector<TokMapEntry> MapSpan(PPSpan span) const;
+  std::vector<TokMapEntry> MapSpan(const PPSpan &span) const;
 
 private:
   RefoldModel() = default;
 
+  const json::Object *root_;
+
   // =============================== Stored data ===============================
-  std::string version_;
-  std::string sourcePath_;
-  std::string ppCwd_;
-  int tokensCountA_ = 0;
+
+  StringRef version_;
+  StringRef sourcePath_;
+  StringRef ppCwd_;
+  uint64_t tokensCountA_ = 0;
 
   /// Optional per-token byte offsets in the preprocessed output (A stream).
-  std::optional<std::vector<int64_t>> tokPPByteBeginA_;
-  std::optional<std::vector<int64_t>> tokPPByteEndA_;
+  std::optional<std::vector<uint64_t>> tokPPByteBeginA_;
+  std::optional<std::vector<uint64_t>> tokPPByteEndA_;
 
-  DenseMap<int, TokMapEntry> tokmapByPP_; // key = pp
+  DenseMap<uint64_t, TokMapEntry> tokmapByPP_; // key = pp
   std::vector<TokMapEntry> tokmap_;
 
   std::vector<IncludeItem> includes_;
@@ -619,30 +597,30 @@ private:
   std::vector<CondGroup> conds_;
 
   // ============================= Derived indices =============================
-  DenseMap<int, const IncludeItem *> includeById_;
-  DenseMap<int, const CondGroup *> condGroupById_;
-  DenseMap<int, ArmRef> armById_;
+
+  DenseMap<uint64_t, const IncludeItem *> includeById_;
+  DenseMap<uint64_t, const CondGroup *> condGroupById_;
+  DenseMap<uint64_t, ArmRef> armById_;
 
   // file -> groups (all owners)
   StringMap<std::vector<const CondGroup *>> condsByFile_;
 
   // file -> ownerIncludeId -> groups
-  StringMap<DenseMap<int, std::vector<const CondGroup *>>> condsByFileByOwner_;
+  StringMap<DenseMap<uint64_t, std::vector<const CondGroup *>>>
+      condsByFileByOwner_;
 
   // file -> segments derived from slots
   StringMap<std::vector<Segment>> segmentsByFile_;
 
   // caches (computed on demand)
-  mutable DenseMap<int, unsigned> includeDepthCache_;
-  mutable DenseMap<int, unsigned> condGroupDepthCache_;
+  mutable DenseMap<uint64_t, uint32_t> includeDepthCache_;
+  mutable DenseMap<uint64_t, uint32_t> condGroupDepthCache_;
 
   // Internal helper to finalize indices and perform deterministic ordering.
   void BuildIndicesAndSort();
 
   std::vector<Segment>
-  BuildSegmentsForFile(StringRef file,
-                       const std::vector<const Slot *> &fileSlots) const;
-
+  BuildSegmentsForFile(StringRef file, ArrayRef<const Slot *> fileSlots) const;
 };
 
 } // namespace refold

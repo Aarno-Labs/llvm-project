@@ -246,30 +246,30 @@ private:
   };
 
   struct TextEdit {
-    int start, end;
+    uint64_t start, end;
     std::string text;
     std::optional<PendingResync> pending;
   };
 
   struct PasteArgEdit {
-    int argIdx;
+    uint32_t argIdx;
     std::string newSeg;
     std::string oldSeg;
 
-    PasteArgEdit(int Idx, std::string New, std::string Old)
+    PasteArgEdit(uint32_t Idx, std::string New, std::string Old)
         : argIdx(Idx), newSeg(std::move(New)), oldSeg(std::move(Old)) {}
   };
 
   struct MacroPatch {
-    int invStart, invEnd;
+    uint64_t invStart, invEnd;
     std::string replacement;
   };
 
   struct IncludePatch {
     const RefoldModel::IncludeItem *include;
     std::string insertBytes; // exact B bytes
-    int aStart, aEnd;        // A-token interval inside include expansion
-    int bStart, bEnd;        // B-token interval
+    uint64_t aStart, aEnd;   // A-token interval inside include expansion
+    uint64_t bStart, bEnd;   // B-token interval
 
     std::string ToString() const {
       // 1. Determine the path (Using StringRef to avoid extra copies)
@@ -291,8 +291,6 @@ private:
       // 3. Escape whitespace
       std::string escapedPreview = stringutils::escape(preview);
 
-      // 4. Format everything using formatv
-      // {0} = id, {1} = path, {2} = aStart, etc.
       return formatv(
                  "IncludePatch{{incId={0}, path={1}, A=[{2},{3}), B=[{4},{5}), "
                  "insert='{6}{7}'}",
@@ -312,28 +310,12 @@ private:
     void Add(IncludePatch &&P) { patches.push_back(std::move(P)); }
   };
 
-  struct MacroDefineInfo {
-    int directiveId;
-    std::string name;
-
-    /// Formal parameter names in the order they appear in the #define.
-    std::vector<std::string> params;
-
-    /// The indices of parameters that are stringified (#), in the order
-    /// they appear in the macro replacement list.
-    std::vector<int> stringifyParamOrder;
-
-    /// A set of parameter indices that undergo stringification,
-    /// used for O(1) lookups.
-    DenseSet<int> stringifyParamSet;
-  };
-
   struct ByteHunk {
-    int aBegin, aEnd;
-    int bBegin, bEnd;
+    uint64_t aStart, aEnd;
+    uint64_t bStart, bEnd;
 
-    ByteHunk(int aBegin, int aEnd, int bBegin, int bEnd)
-      : aBegin(aBegin), aEnd(aEnd), bBegin(bBegin), bEnd(bEnd) {}
+    ByteHunk(uint64_t aStart, uint64_t aEnd, uint64_t bStart, uint64_t bEnd)
+      : aStart(aStart), aEnd(aEnd), bStart(bStart), bEnd(bEnd) {}
   };
 
   // ---------------------------- Ownership Helpers ----------------------------
@@ -357,18 +339,18 @@ private:
 
   struct Owner {
     OwnerKind kind = OwnerKind::Unknown;
-    std::optional<int> includeId; // non-nullopt only when kind == INCLUDE
-    std::optional<int> condArmId; // nullable; non-nullopt when segment is in a
-                                  // specific arm
+    std::optional<uint64_t> includeId; // non-nullopt only when kind == INCLUDE
+    std::optional<uint64_t> condArmId; // nullable; non-nullopt when segment is
+                                       // in a specific arm
 
-    static Owner TU(std::optional<int> condArmId = std::nullopt) {
+    static Owner TU(std::optional<uint64_t> condArmId = std::nullopt) {
       Owner o;
       o.kind = OwnerKind::TU;
       o.condArmId = condArmId;
       return o;
     }
-    static Owner Include(int includeId,
-                         std::optional<int> condArmId = std::nullopt) {
+    static Owner Include(uint64_t includeId,
+                         std::optional<uint64_t> condArmId = std::nullopt) {
       Owner o;
       o.kind = OwnerKind::Include;
       o.includeId = includeId;
@@ -503,7 +485,7 @@ private:
   /// \param numOfAOffs number of PP offsets for the A-stream (#tokens + 1
   ///        including sentinel)
   /// \return an array `ownerDepthGap` indexed by PP gap `k` in `[0..N]`
-  std::vector<unsigned> ComputeOwnerDepthGapsForPP(size_t numOfAOffs);
+  std::vector<uint32_t> ComputeOwnerDepthGapsForPP();
 
   /// \brief Classifies the logical "owner" of a diff hunk using the precomputed
   /// segment map for the translation unit.
@@ -607,7 +589,7 @@ private:
   /// \return        The smallest covering patchable macro invocation, or
   ///                nullptr if none cover the span.
   const RefoldModel::MacroInvocation *
-  SmallestCoveringPatchableMacro(int aStart, int aEnd) const;
+  SmallestCoveringPatchableMacro(uint64_t aStart, uint64_t aEnd) const;
 
   /// \brief Determine whether an A-token interval is owned by the translation
   ///        unit (TU).
@@ -631,7 +613,7 @@ private:
   /// \returns       `true` if the interval is TU-owned (only TU mappings or
   ///                unmapped/empty);
   ///                `false` if any mapped token belongs to a non-TU file.
-  bool HunkMapsToTU(int a0, int a1, StringRef tuPath) const;
+  bool HunkMapsToTU(uint64_t a0, uint64_t a1, StringRef tuPath) const;
 
   /// \brief Attempts to anchor a *pure insertion* (a PP-gap insertion) to a
   /// deterministic, canonical TU byte boundary that represents the *same*
@@ -684,8 +666,8 @@ private:
   /// \return the TU byte offset of an exact canonical boundary matching
   ///         `ppGap`, or `std::nullopt` if `ppGap` is not exactly on a known
   ///         boundary (caller should fall back)
-  std::optional<int> AnchorToNearestSlotBoundaryFromPPGap(StringRef tuPath,
-                                                          int ppGap) const;
+  std::optional<uint64_t>
+  AnchorToNearestSlotBoundaryFromPPGap(StringRef tuPath, uint64_t ppGap) const;
 
   /// \brief Finds the ID of the narrowest include range that covers a given PP
   /// index.
@@ -699,16 +681,13 @@ private:
   ///
   /// \returns The ID of the most specific include item if a match is found;
   ///          otherwise, std::nullopt.
-  std::optional<int> IncludeIdCoveringPPIndex(int pp) const {
-    std::optional<int> bestId;
-    int bestLen = std::numeric_limits<int>::max();
+  std::optional<uint64_t> IncludeIdCoveringPPIndex(uint64_t pp) const {
+    std::optional<uint64_t> bestId;
+    uint64_t bestLen = std::numeric_limits<uint64_t>::max();
 
     for (const RefoldModel::IncludeItem &inc : model_.GetIncludes()) {
-      if (inc.cover.begin < 0 || inc.cover.end < 0) {
-        continue;
-      }
       if (pp >= inc.cover.begin && pp < inc.cover.end) {
-        int len = inc.cover.end - inc.cover.begin;
+        uint64_t len = inc.cover.end - inc.cover.begin;
         if (len < bestLen) {
           bestLen = len;
           bestId = inc.id;
@@ -729,15 +708,19 @@ private:
   /// \param Spans A list of PP spans.
   /// \returns The minimum begin value across all spans, or -1 if Spans is
   /// empty.
-  static int MinPPBegin(ArrayRef<RefoldModel::PPSpan> spans) {
+  static std::optional<uint64_t>
+  MinPPBegin(ArrayRef<RefoldModel::PPSpan> spans) {
     if (spans.empty())
-      return -1;
+      return std::nullopt;
 
-    int min = std::numeric_limits<int>::max();
-    for (const auto &s : spans)
+    bool hasMin = false;
+    uint64_t min = std::numeric_limits<uint64_t>::max();
+    for (const auto &s : spans) {
       min = std::min(min, s.begin);
+      hasMin = true;
+    }
 
-    return (min == std::numeric_limits<int>::max()) ? -1 : min;
+    return hasMin ? std::optional<uint64_t>(min) : std::nullopt;
   }
 
   /// \brief Computes the maximum PPSpan::end value across a collection of
@@ -749,15 +732,18 @@ private:
   ///
   /// \param Spans A list of PP spans.
   /// \returns The maximum end value across all spans, or -1 if Spans is empty.
-  static int MaxPPEnd(ArrayRef<RefoldModel::PPSpan> spans) {
+  static std::optional<uint64_t> MaxPPEnd(ArrayRef<RefoldModel::PPSpan> spans) {
     if (spans.empty())
-      return -1;
+      return std::nullopt;
 
-    int max = std::numeric_limits<int>::min();
-    for (const auto &s : spans)
+    bool hasMax = false;
+    uint64_t max = 0;
+    for (const auto &s : spans) {
       max = std::max(max, s.end);
+      hasMax = true;
+    }
 
-    return (max == std::numeric_limits<int>::min()) ? -1 : max;
+    return hasMax ? std::optional<uint64_t>(max) : std::nullopt;
   }
 
   /// \brief Computes the TU (translation unit) byte span [b, e) corresponding
@@ -806,8 +792,9 @@ private:
   /// \param a1 exclusive end A-side PP-token index.
   /// \param tuPath absolute/canonical TU path that must match
   /// TokMapEntry::file.
-  /// \return A pair representing the TU byte span [b, e), or{-1, -1}.
-  std::pair<int, int> TUByteSpan(int a0, int a1, StringRef tuPath) const;
+  /// \return A pair representing the TU byte span [b, e), or nullopt
+  std::optional<std::pair<uint64_t, uint64_t>>
+  TUByteSpan(uint64_t a0, uint64_t a1, StringRef tuPath) const;
 
   /// \brief Determines whether an insertion hunk lands exactly on an include PP
   /// boundary and, if so, returns the include that should own the boundary
@@ -901,7 +888,8 @@ private:
   /// @param end          (Output) Highest qualifying B-token index (exclusive).
   /// @return `true` if an envelope was found, `false` otherwise.
   bool MacroExpansionEnvelopeB(const RefoldModel::MacroInvocation &m,
-                               bool onlyInvFile, int &begin, int &end) const;
+                               bool onlyInvFile, uint64_t &begin,
+                               uint64_t &end) const;
 
   /// \brief Checks whether an args-only rewrite of a single macro parameter is
   /// consistent with all **observable** occurrences of that parameter in the
@@ -933,7 +921,7 @@ private:
   ///          consistent with the rewrite; `false` if any required occurrence
   ///          contradicts the rewrite.
   bool MacroArgReplacementMatchesAllOccurrencesInB(
-      const RefoldModel::MacroInvocation &m, int argIdx, StringRef baseArg,
+      const RefoldModel::MacroInvocation &m, uint32_t argIdx, StringRef baseArg,
       StringRef newArg, ArrayRef<diffutils::Hunk> tokenHunks) const {
     return MacroArgReplacementMatchesAllOccurrencesInBImpl(
         m, argIdx, baseArg, newArg, tokenHunks, /*checkPasteSpans*/ true);
@@ -965,7 +953,7 @@ private:
   ///          are consistent with the rewrite; `false` if any required
   ///          occurrence contradicts it.
   bool MacroArgReplacementMatchesAllOccurrencesInBIgnorePaste(
-      const RefoldModel::MacroInvocation &m, int argIdx, StringRef baseArg,
+      const RefoldModel::MacroInvocation &m, uint32_t argIdx, StringRef baseArg,
       StringRef newArg, ArrayRef<diffutils::Hunk> tokenHunks) const {
     return MacroArgReplacementMatchesAllOccurrencesInBImpl(
         m, argIdx, baseArg, newArg, tokenHunks, /*checkPasteSpans*/ false);
@@ -1029,7 +1017,7 @@ private:
   ///          consistent with applying the args-only rewrite; `false` on any
   ///          proven contradiction.
   bool MacroArgReplacementMatchesAllOccurrencesInBImpl(
-      const RefoldModel::MacroInvocation &m, int argIdx, StringRef baseArg,
+      const RefoldModel::MacroInvocation &m, uint32_t argIdx, StringRef baseArg,
       StringRef newArg, ArrayRef<diffutils::Hunk> tokenHunks,
       bool checkPasteSpans) const;
 
@@ -1102,7 +1090,7 @@ private:
   ///          exists.
   std::optional<PasteArgEdit>
   DerivePasteArgEdit(const RefoldModel::MacroInvocation &m,
-                     const diffutils::Hunk &h, ArrayRef<int> a2b) const;
+                     const diffutils::Hunk &h, ArrayRef<int64_t> a2b) const;
 
   /// \brief Derives one or more *token-paste* argument edits for a single macro
   /// invocation hunk.
@@ -1160,7 +1148,7 @@ private:
   ///          cannot be represented deterministically as args-only.
   std::optional<std::vector<PasteArgEdit>>
   DerivePasteArgEdits(const RefoldModel::MacroInvocation &m,
-                      const diffutils::Hunk &h, ArrayRef<int> a2b) const;
+                      const diffutils::Hunk &h, ArrayRef<int64_t> a2b) const;
 
   /// \brief Segments the edited pasted-token spelling (`bTok`) into per-argument
   /// substrings by using the original pasted-token spelling (`aTok`) as an
@@ -1250,8 +1238,8 @@ private:
   ///          all fixed slices exists; otherwise `false`.
   static bool SegmentPastedTokenArgsByFixedSlicesRec(
       StringRef aTok, StringRef bTok,
-      ArrayRef<const RefoldModel::PPArgSpan *> spansAsc, int idx, int posA,
-      int posB, MutableArrayRef<std::string> out);
+      ArrayRef<const RefoldModel::PPArgSpan *> spansAsc, size_t idx,
+      size_t posA, size_t posB, MutableArrayRef<std::string> out);
 
   /// \brief Derives the replacement text for a pasted-token sub-segment
   /// (`oldSeg`) implied by an args-only rewrite from `baseArg` to `newArg`.
@@ -1329,10 +1317,9 @@ private:
   /// \returns `true` if the replacements reproduce every pasted token
   ///          occurrence in B.
   bool PasteArgReplacementsMatchAllPasteTokensInB(
-      const RefoldModel::MacroInvocation &m,
-      StringRef baseInvText,
-      ArrayRef<std::pair<int, int>> invArgRanges,
-      const DenseMap<int, std::string> &replByArgIdx) const;
+      const RefoldModel::MacroInvocation &m, StringRef baseInvText,
+      ArrayRef<std::pair<size_t, size_t>> invArgRanges,
+      const DenseMap<uint32_t, std::string> &replByArgIdx) const;
 
   /// \brief Splices a derived paste-segment edit into a macro argument's
   /// spelling text.
@@ -1435,7 +1422,7 @@ private:
   ///          `std::nullopt` if not provably safe.
   std::optional<MacroPatch> BuildMacroInvocationPatchArgsOnly(
       const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h,
-      const ArrayRef<int> a2b, StringRef baseInvocationText) const;
+      const ArrayRef<int64_t> a2b, StringRef baseInvocationText) const;
 
   /// \brief Slices a source text by token indices using a token-to-byte offset
   /// table.
@@ -1458,17 +1445,17 @@ private:
   /// \param endTok   Exclusive end token index.
   /// \returns A `StringRef` of the source covered by tokens `[startTok, endTok)`.
   static StringRef SliceSource(ArrayRef<size_t> tokOff, StringRef source,
-                               int startTok, int endTok);
+                               uint64_t startTok, uint64_t endTok);
 
   /// Slices the A-side source text by token indices.
   /// \see SliceSource
-  StringRef SliceASource(int aStartTok, int aEndTok) const {
+  StringRef SliceASource(uint64_t aStartTok, uint64_t aEndTok) const {
     return SliceSource(aTokOff_, aSource_, aStartTok, aEndTok);
   }
 
   /// Slices the B-side source text by token indices.
   /// \see SliceSource
-  StringRef SliceBSource(int bStartTok, int bEndTok) const {
+  StringRef SliceBSource(uint64_t bStartTok, uint64_t bEndTok) const {
     return SliceSource(bTokOff_, bSource_, bStartTok, bEndTok);
   }
 
@@ -1594,7 +1581,7 @@ private:
   ///
   /// \param bByte The byte offset in the edited preprocessed stream B.
   /// \returns The index of the token corresponding to the floor of \p bByte.
-  int BTokIndexFloor(int bByte) const;
+  size_t BTokIndexFloor(size_t bByte) const;
 
   /// \brief Finds the smallest token index `i` such that `bTokOff_[i] >= bByte`.
   ///
@@ -1604,7 +1591,7 @@ private:
   ///
   /// \param bByte The byte offset in the edited preprocessed stream B.
   /// \returns The index of the token corresponding to the ceiling of \p bByte.
-  int BTokIndexCeil(int bByte) const;
+  size_t BTokIndexCeil(size_t bByte) const;
 
   /// \brief Maps a byte range in source A to a token envelope in source B.
   ///
@@ -1617,8 +1604,8 @@ private:
   /// \param aByteBegin The starting byte offset in source A.
   /// \param aByteEnd The ending byte offset (exclusive) in source A.
   /// \returns A pair representing the [begin, end) token indices in source B.
-  std::pair<int, int> MapAByteRangeToBTokenEnvelope(size_t aByteBegin,
-                                                    size_t aByteEnd) const;
+  std::pair<size_t, size_t>
+  MapAByteRangeToBTokenEnvelope(size_t aByteBegin, size_t aByteEnd) const;
 
   /// \brief Maps a macro argument span to its corresponding B-token envelope.
   ///
@@ -1628,7 +1615,7 @@ private:
   ///
   /// \param sp The macro argument span metadata from the RefoldModel.
   /// \returns The B-token range if mapping is successful, std::nullopt otherwise.
-  std::optional<std::pair<int, int>>
+  std::optional<std::pair<size_t, size_t>>
   MapAToBTokenEnvelopeByPPArgSpan(const RefoldModel::PPArgSpan &sp) const;
 
   /// \brief Maps a token range in source A to a token envelope in source B.
@@ -1641,8 +1628,8 @@ private:
   /// \param beginTok The starting token index in source A.
   /// \param endTok The ending token index (exclusive) in source A.
   /// \returns The B-token range if the input is valid, std::nullopt otherwise.
-  std::optional<std::pair<int, int>>
-  MapATokRangeAToBTokenEnvelope(int beginTok, int endTok) const;
+  std::optional<std::pair<size_t, size_t>>
+  MapATokRangeAToBTokenEnvelope(uint64_t beginTok, uint64_t endTok) const;
 
   /// \brief Parses the raw text of a function-like macro invocation to identify
   /// the byte ranges of its individual arguments.
@@ -1662,16 +1649,16 @@ private:
   /// \return A list of `[start, end]` byte ranges for each argument, with
   ///         leading and trailing whitespace trimmed; returns `std::nullopt` if
   ///         the text is malformed or the closing parenthesis is missing.
-  static std::optional<std::vector<std::pair<int, int>>>
+  static std::optional<std::vector<std::pair<size_t, size_t>>>
   ParseMacroInvocationArgContentRanges(StringRef invText);
 
   /// \brief Build a macro callsite patch for an invocation using only
   /// span-driven evidence.
   ///
   /// This routine produces the replacement text for a macro invocation at its
-  /// callsite byte span \c [m.GetInvB(), m.GetInvE()) in the owning file. The
-  /// strategy is intentionally deterministic and avoids heuristic “best-looking
-  /// slice” selection.
+  /// callsite byte span \c [m.invB, m.invE) in the owning file. The strategy
+  /// is intentionally deterministic and avoids heuristic “best-looking slice"
+  /// selection.
   ///
   /// The patching strategy is:
   ///
@@ -1714,8 +1701,9 @@ private:
   ///          B-token envelope).
   std::optional<MacroPatch> BuildMacroInvocationPatchWholeCover(
       const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h,
-      ArrayRef<int> a2b, StringRef baseInvText,
-      const DenseMap<int, DenseMap<int, MacroPatch>> &patchMap) const;
+      ArrayRef<int64_t> a2b, StringRef baseInvText,
+      const DenseMap<std::optional<uint64_t>, DenseMap<uint64_t, MacroPatch>>
+          &patchMap) const;
 
   /// \brief Validates that a raw source span contains a valid macro callsite
   /// prefix matching the invocation metadata.
@@ -1766,7 +1754,8 @@ private:
   /// \param perInclude Mapping from include id to accumulated edits/patches for
   ///                   that include; each non-empty patch list is sorted in
   ///                   place.
-  void OrderIncludeInsertions(DenseMap<int, IncludeEdits> &perInclude) const {
+  void
+  OrderIncludeInsertions(DenseMap<uint64_t, IncludeEdits> &perInclude) const {
     for (auto &it : perInclude) {
       IncludeEdits &ie = it.second;
       if (ie.patches.empty())
@@ -1826,11 +1815,12 @@ private:
   ///                            header bytes; may be preseeded with raw header
   ///                            text.
   void MaterializeIncludeExpansion(
-      int includeId, const DenseMap<int, IncludeEdits> &perInclude,
-      const DenseMap<int, std::vector<MacroPatch>> &macroPatchesByOwner,
-      const DenseMap<int, std::vector<const RefoldModel::IncludeItem *>>
+      uint64_t includeId, const DenseMap<uint64_t, IncludeEdits> &perInclude,
+      const DenseMap<std::optional<uint64_t>, std::vector<MacroPatch>>
+          &macroPatchesByOwner,
+      const DenseMap<uint64_t, std::vector<const RefoldModel::IncludeItem *>>
           &children,
-      DenseMap<int, std::string> &includeExpansion) const;
+      DenseMap<uint64_t, std::string> &includeExpansion) const;
 
   /// \brief Selects the most appropriate HeaderDecl within an IncludeItem to
   /// serve as the declaration-level anchor for an include-scoped patch.
@@ -2023,8 +2013,8 @@ private:
   /// applied,
   ///         or `-1` if this fallback does not apply or no stable anchor can be
   ///         found.
-  int ComputeChildBoundaryInsertByte(const IncludePatch &p,
-                                     StringRef file) const;
+  std::optional<uint64_t> ComputeChildBoundaryInsertByte(const IncludePatch &p,
+                                                         StringRef file) const;
 
   /// \brief Creates a TextEdit for [start,end) in original that preserves
   /// __LINE__ transparency.
@@ -2050,8 +2040,8 @@ private:
   ///        emitted #line directive.
   /// \return A TextEdit representing the change and (optionally) a pending
   ///         resync to flush later.
-  TextEdit MakeTextEditWithResyncOrPending(StringRef original, int start,
-                                           int end, StringRef replacement,
+  TextEdit MakeTextEditWithResyncOrPending(StringRef original, uint64_t start,
+                                           uint64_t end, StringRef replacement,
                                            StringRef fileSpelling) const {
     ResyncOutcome o =
         ApplyResyncOrPend(original, start, end, replacement, fileSpelling);
@@ -2084,8 +2074,8 @@ private:
   /// \param replacement Replacement text.
   /// \param fileSpellingForDirective Path used in any injected #line.
   /// \return A ResyncOutcome containing the emitted text and optional pending state.
-  ResyncOutcome ApplyResyncOrPend(StringRef originalFileText, int start,
-                                  int end, StringRef replacement,
+  ResyncOutcome ApplyResyncOrPend(StringRef originalFileText, uint64_t start,
+                                  uint64_t end, StringRef replacement,
                                   StringRef fileSpellingForDirective) const;
 
   /// \brief Applies a set of TextEdits to originalFileText, producing the final
@@ -2156,7 +2146,7 @@ private:
   ///         still-pending resync.
   std::optional<PendingResync>
   AppendOriginalSliceWithPending(SmallVectorImpl<char> &out, StringRef original,
-                                 int from, int to,
+                                 uint64_t from, uint64_t to,
                                  std::optional<PendingResync> pending) const;
 
   // ------------------------ Low-level Mapping & Utils ------------------------
@@ -2187,12 +2177,13 @@ private:
   ///        \p fallbackToEOF is true)
   /// \return the mapped start byte offset in \p file, or \p fileLen when
   ///         falling back to EOF, or -1 if unmapped and fallback is disabled
-  int ByteStartForPPInFile(StringRef file, int pp, bool fallbackToEOF,
-                           int fileLen) const {
+  std::optional<uint64_t> ByteStartForPPInFile(StringRef file, uint64_t pp,
+                                               bool fallbackToEOF,
+                                               size_t fileLen) const {
     auto it = model_.GetTokmapByPP().find(pp);
     if (it != model_.GetTokmapByPP().end() && PathsEqual(it->second.file, file))
       return it->second.b;
-    return fallbackToEOF ? fileLen : -1;
+    return fallbackToEOF ? std::optional<uint64_t>(fileLen) : std::nullopt;
   }
 
   /// \brief Resolves the TU/file byte end offset corresponding to a PP
@@ -2212,12 +2203,13 @@ private:
   ///        \p fallbackToEOF is true)
   /// \return the mapped end byte offset in \p file, or \p fileLen when falling
   ///         back to EOF, or -1 if unmapped and fallback is disabled
-  int ByteEndForPPInFile(StringRef file, int pp, bool fallbackToEOF,
-                         int fileLen) const {
+  std::optional<uint64_t> ByteEndForPPInFile(StringRef file, uint64_t pp,
+                                             bool fallbackToEOF,
+                                             size_t fileLen) const {
     auto it = model_.GetTokmapByPP().find(pp);
     if (it != model_.GetTokmapByPP().end() && PathsEqual(it->second.file, file))
       return it->second.e;
-    return fallbackToEOF ? fileLen : -1;
+    return fallbackToEOF ? std::optional<uint64_t>(fileLen) : std::nullopt;
   }
 
   /// \brief Compare two paths for equality after weak canonicalization.
@@ -2302,6 +2294,24 @@ template <> struct format_provider<RefoldEngine::OwnerKind> {
       os << "Unknown";
       break;
     }
+  }
+};
+
+template <> struct DenseMapInfo<std::optional<uint64_t>> {
+  static inline std::optional<uint64_t> getEmptyKey() {
+    return std::optional<uint64_t>(~0ULL);
+  }
+  static inline std::optional<uint64_t> getTombstoneKey() {
+    return std::optional<uint64_t>(~1ULL);
+  }
+  static unsigned getHashValue(const std::optional<uint64_t> &val) {
+    // If val has a value, hash it and cast to unsigned.
+    // If not (std::nullopt), return a constant (like 0).
+    return val ? static_cast<unsigned>(llvm::hash_value(*val)) : 0u;
+  }
+  static bool isEqual(const std::optional<uint64_t> &lhs,
+                      const std::optional<uint64_t> &rhs) {
+    return lhs == rhs;
   }
 };
 } // namespace llvm

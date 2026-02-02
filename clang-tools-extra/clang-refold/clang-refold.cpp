@@ -237,8 +237,14 @@ void lexPPTokens(const std::string &bytes, std::vector<PPTok> &out,
     const char *kindName = tok::getTokenName(tkn.getKind());
     ppt.kind = kindName;
     PresumedLoc pl = sm.getPresumedLoc(tkn.getLocation());
-    int line = pl.isValid() ? static_cast<int>(pl.getLine()) : -1;
-    int col = pl.isValid() ? static_cast<int>(pl.getColumn()) : -1;
+
+    std::optional<unsigned> line;
+    std::optional<unsigned> col;
+    if (pl.isValid()) {
+      line = pl.getLine();
+      col = pl.getColumn();
+    }
+
     trace("lexer/parsed", "kind={0} spelled={1} off={2} len={3} li={4} co={5}",
           kindName,
           stringutils::showWS(stringutils::clip(StringRef(ppt.spelling), 80)),
