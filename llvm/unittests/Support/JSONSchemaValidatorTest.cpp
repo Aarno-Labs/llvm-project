@@ -647,4 +647,59 @@ TEST(JSONSchemaValidatorTest, StringLengthCountsUnicodeCodePoints) {
 
 }
 
+
+TEST(JSONSchemaValidatorTest, StringFormats) {
+  // uuid
+  ExpectValid(Object{{"type", "string"}, {"format", "uuid"}},
+              "123e4567-e89b-12d3-a456-426614174000");
+  ExpectInvalid(
+      Object{{"type", "string"}, {"format", "uuid"}},
+      "123e4567e89b12d3a456426614174000",
+      "String at $: value \"123e4567e89b12d3a456426614174000\" does not match "
+      "format \"uuid\"");
+
+  // email
+  ExpectValid(Object{{"type", "string"}, {"format", "email"}}, "a@b.com");
+  ExpectInvalid(Object{{"type", "string"}, {"format", "email"}}, "a@b",
+                "String at $: value \"a@b\" does not match format \"email\"");
+
+  // uri
+  ExpectValid(Object{{"type", "string"}, {"format", "uri"}},
+              "https://example.com/path");
+  ExpectInvalid(Object{{"type", "string"}, {"format", "uri"}}, "example.com",
+                "String at $: value \"example.com\" does not match format \"uri\"");
+
+  // hostname
+  ExpectValid(Object{{"type", "string"}, {"format", "hostname"}}, "example.com");
+  ExpectInvalid(
+      Object{{"type", "string"}, {"format", "hostname"}}, "exa_mple.com",
+      "String at $: value \"exa_mple.com\" does not match format \"hostname\"");
+
+  // date
+  ExpectValid(Object{{"type", "string"}, {"format", "date"}}, "2024-02-29");
+  ExpectInvalid(Object{{"type", "string"}, {"format", "date"}}, "2023-02-29",
+                "String at $: value \"2023-02-29\" does not match format \"date\"");
+
+  // time
+  ExpectValid(Object{{"type", "string"}, {"format", "time"}}, "23:59:59Z");
+  ExpectValid(Object{{"type", "string"}, {"format", "time"}},
+              "12:34:56.789+01:00");
+  ExpectInvalid(Object{{"type", "string"}, {"format", "time"}}, "23:59:59",
+                "String at $: value \"23:59:59\" does not match format \"time\"");
+
+  // date-time
+  ExpectValid(Object{{"type", "string"}, {"format", "date-time"}},
+              "2024-02-29T23:59:59Z");
+  ExpectInvalid(
+      Object{{"type", "string"}, {"format", "date-time"}}, "2024-02-29T23:59:59",
+      "String at $: value \"2024-02-29T23:59:59\" does not match format "
+      "\"date-time\"");
+
+  // Unknown formats are ignored (no-op).
+  ExpectValid(Object{{"type", "string"}, {"format", "does-not-exist"}}, "anything");
+
+  // "format" is only enforced for string instances.
+  ExpectValid(Object{{"format", "uuid"}}, 42);
+}
+
 } // namespace
