@@ -420,6 +420,64 @@ TEST(JSONSchemaValidatorTest, ObjectMinMaxProperties) {
                 "Object at $: requires <= 3 properties (got 4)");
 }
 
+
+
+TEST(JSONSchemaValidatorTest, RefHonorsSiblingKeywords) {
+  Object S = Object{
+      {"$defs", Object{{"Base", Object{{"type", "number"}, {"minimum", 0.0}}}}},
+      {"$ref", "#/$defs/Base"},
+      {"maximum", 10.0},
+  };
+
+  ExpectValid(S, 5.0);
+  ExpectInvalid(S, 11.0, "Number at $: got 11.00, requires <= 10.00 (maximum)");
+  ExpectInvalid(S, -1.0, "Number at $: got -1.00, requires >= 0.00 (minimum)");
+}
+
+TEST(JSONSchemaValidatorTest, OneOfHonorsSiblingKeywords) {
+  Object S = Object{
+      {"oneOf", Array{
+                   Object{{"type", "number"}},
+                   Object{{"type", "string"}},
+               }},
+      {"type", "number"},
+      {"minimum", 5.0},
+  };
+
+  // Exactly one alternative matches, then sibling keywords are still enforced.
+  ExpectValid(S, 6.0);
+  ExpectInvalid(S, 4.0, "Number at $: got 4.00, requires >= 5.00 (minimum)");
+  ExpectInvalid(S, "x", "Expected number at $");
+}
+
+TEST(JSONSchemaValidatorTest, TypelessSubschemaAppliesRuntimeConstraints) {
+  // No explicit "type": object keywords must still apply when the instance is
+  // an object.
+  Object ObjSchema = Object{
+      {"properties", Object{{"a", Object{{"type", "integer"}}}}},
+      {"required", Array{"a"}},
+  };
+
+  ExpectValid(ObjSchema, Object{{"a", 1}});
+  ExpectInvalid(ObjSchema, Object{}, "Missing required field: $.a");
+  ExpectInvalid(ObjSchema, Object{{"a", "x"}}, "Expected integer at $.a");
+
+  // Object-only keywords do not apply to non-objects.
+  ExpectValid(ObjSchema, "not-an-object");
+
+  // No explicit "type": array keywords must still apply when the instance is
+  // an array.
+  Object ArrSchema = Object{
+      {"minItems", 2},
+      {"items", Object{{"type", "string"}}},
+  };
+
+  ExpectValid(ArrSchema, Array{"a", "b"});
+  ExpectInvalid(ArrSchema, Array{"a"},
+                "Array at $: requires >= 2 items (got 1)");
+  ExpectInvalid(ArrSchema, Array{1, 2}, "Expected string at $[0]");
+}
+
 TEST(JSONSchemaValidatorTest, ArrayMaxItemsAndMinMaxContains) {
   Object S = Object{{"type", "array"},
                     {"contains", Object{{"type", "integer"}}},
