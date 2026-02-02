@@ -80,6 +80,241 @@ static llvm::Expected<size_t> utf8CodePointLength(llvm::StringRef S) {
   return Count;
 }
 
+
+static bool parseUIntStrict(llvm::StringRef S, unsigned &Out) {
+  // Reject empty strings and any leading '+' / '-' to keep these parsers strict.
+  if (S.empty())
+    return false;
+  if (S.front() == '+' || S.front() == '-')
+    return false;
+  return !S.getAsInteger(10, Out);
+}
+
+static bool isLeapYear(unsigned Y) {
+  return (Y % 4 == 0 && Y % 100 != 0) || (Y % 400 == 0);
+}
+
+static unsigned daysInMonth(unsigned Y, unsigned M) {
+  switch (M) {
+  case 1:
+  case 3:
+  case 5:
+  case 7:
+  case 8:
+  case 10:
+  case 12:
+    return 31;
+  case 4:
+  case 6:
+  case 9:
+  case 11:
+    return 30;
+  case 2:
+    return isLeapYear(Y) ? 29 : 28;
+  default:
+    return 0;
+  }
+}
+
+static bool isValidDate(unsigned Y, unsigned M, unsigned D) {
+  if (M < 1 || M > 12)
+    return false;
+  unsigned Dim = daysInMonth(Y, M);
+  return D >= 1 && D <= Dim;
+}
+
+static bool isValidTime(unsigned H, unsigned Min, unsigned Sec) {
+  if (H > 23)
+    return false;
+  if (Min > 59)
+    return false;
+  if (Sec > 59)
+    return false;
+  return true;
+}
+
+static bool isUUID(llvm::StringRef S) {
+  if (S.size() != 36)
+    return false;
+  auto isDashPos = [](size_t I) {
+    return I == 8 || I == 13 || I == 18 || I == 23;
+  };
+  for (size_t I = 0; I < S.size(); ++I) {
+    char C = S[I];
+    if (isDashPos(I)) {
+      if (C != '-')
+        return false;
+    } else {
+      if (!llvm::isHexDigit(C))
+        return false;
+    }
+  }
+  return true;
+}
+
+static bool isEmail(llvm::StringRef S) {
+  // Minimal practical check (many schemas rely on a looser interpretation than RFC 5322).
+  if (S.empty())
+    return false;
+  if (S.find_first_of(" \t\r\n") != llvm::StringRef::npos)
+    return false;
+
+  size_t At = S.find('@');
+  if (At == llvm::StringRef::npos || At == 0 || At + 1 >= S.size())
+    return false;
+  if (S.find('@', At + 1) != llvm::StringRef::npos)
+    return false;
+
+  llvm::StringRef Domain = S.drop_front(At + 1);
+  if (!Domain.contains('.'))
+    return false;
+  if (Domain.front() == '.' || Domain.back() == '.')
+    return false;
+  if (Domain.contains(".."))
+    return false;
+
+  return true;
+}
+
+static bool isURI(llvm::StringRef S) {
+  // "uri" in JSON Schema is an absolute URI (RFC 3986). We use a simple, scheme-based check.
+  static llvm::Regex R("^[A-Za-z][A-Za-z0-9+.-]*:.*$");
+  return R.match(S);
+}
+
+static bool isHostname(llvm::StringRef S) {
+  // RFC 1123-ish: labels are 1-63 chars, [A-Za-z0-9-], no leading/trailing '-'.
+  if (S.empty() || S.size() > 253)
+    return false;
+
+  llvm::SmallVector<llvm::StringRef, 16> Labels;
+  S.split(Labels, '.');
+
+  for (llvm::StringRef L : Labels) {
+    if (L.empty() || L.size() > 63)
+      return false;
+    if (L.front() == '-' || L.back() == '-')
+      return false;
+    for (char C : L) {
+      if (!(llvm::isAlnum(C) || C == '-'))
+        return false;
+    }
+  }
+  return true;
+}
+
+static bool isRFC3339Date(llvm::StringRef S) {
+  static llvm::Regex R("^([0-9]{4})-([0-9]{2})-([0-9]{2})$");
+  llvm::SmallVector<llvm::StringRef, 4> M;
+  if (!R.match(S, &M))
+    return false;
+
+  unsigned Y = 0, Mo = 0, D = 0;
+  if (!parseUIntStrict(M[1], Y) || !parseUIntStrict(M[2], Mo) ||
+      !parseUIntStrict(M[3], D))
+    return false;
+
+  return isValidDate(Y, Mo, D);
+}
+
+static bool isRFC3339Time(llvm::StringRef S) {
+  // full-time requires a timezone.
+  static llvm::Regex R("^([0-9]{2}):([0-9]{2}):([0-9]{2})(\\.[0-9]+)?"
+                       "(Z|[+-][0-9]{2}:[0-9]{2})$");
+  llvm::SmallVector<llvm::StringRef, 6> M;
+  if (!R.match(S, &M))
+    return false;
+
+  unsigned H = 0, Min = 0, Sec = 0;
+  if (!parseUIntStrict(M[1], H) || !parseUIntStrict(M[2], Min) ||
+      !parseUIntStrict(M[3], Sec))
+    return false;
+  if (!isValidTime(H, Min, Sec))
+    return false;
+
+  llvm::StringRef TZ = M[5];
+  if (TZ != "Z") {
+    // "+HH:MM" or "-HH:MM"
+    if (TZ.size() != 6 || (TZ[0] != '+' && TZ[0] != '-') || TZ[3] != ':')
+      return false;
+    unsigned TH = 0, TM = 0;
+    if (!parseUIntStrict(TZ.substr(1, 2), TH) ||
+        !parseUIntStrict(TZ.substr(4, 2), TM))
+      return false;
+    if (TH > 23 || TM > 59)
+      return false;
+  }
+
+  return true;
+}
+
+static bool isRFC3339DateTime(llvm::StringRef S) {
+  static llvm::Regex R("^([0-9]{4})-([0-9]{2})-([0-9]{2})T"
+                       "([0-9]{2}):([0-9]{2}):([0-9]{2})(\\.[0-9]+)?"
+                       "(Z|[+-][0-9]{2}:[0-9]{2})$");
+  llvm::SmallVector<llvm::StringRef, 9> M;
+  if (!R.match(S, &M))
+    return false;
+
+  unsigned Y = 0, Mo = 0, D = 0;
+  unsigned H = 0, Min = 0, Sec = 0;
+  if (!parseUIntStrict(M[1], Y) || !parseUIntStrict(M[2], Mo) ||
+      !parseUIntStrict(M[3], D) || !parseUIntStrict(M[4], H) ||
+      !parseUIntStrict(M[5], Min) || !parseUIntStrict(M[6], Sec))
+    return false;
+
+  if (!isValidDate(Y, Mo, D) || !isValidTime(H, Min, Sec))
+    return false;
+
+  llvm::StringRef TZ = M[8];
+  if (TZ != "Z") {
+    if (TZ.size() != 6 || (TZ[0] != '+' && TZ[0] != '-') || TZ[3] != ':')
+      return false;
+    unsigned TH = 0, TM = 0;
+    if (!parseUIntStrict(TZ.substr(1, 2), TH) ||
+        !parseUIntStrict(TZ.substr(4, 2), TM))
+      return false;
+    if (TH > 23 || TM > 59)
+      return false;
+  }
+
+  return true;
+}
+
+static llvm::Error validateStringFormat(llvm::StringRef S, llvm::StringRef Format,
+                                       llvm::StringRef Path) {
+  // Draft-2020-12: "format" is an annotation keyword, but many schemas rely on it
+  // as an assertion. We validate a small, common set of formats and ignore unknown
+  // ones for forward compatibility.
+  bool Ok = true;
+
+  if (Format == "uuid")
+    Ok = isUUID(S);
+  else if (Format == "email")
+    Ok = isEmail(S);
+  else if (Format == "uri")
+    Ok = isURI(S);
+  else if (Format == "hostname")
+    Ok = isHostname(S);
+  else if (Format == "date")
+    Ok = isRFC3339Date(S);
+  else if (Format == "time")
+    Ok = isRFC3339Time(S);
+  else if (Format == "date-time")
+    Ok = isRFC3339DateTime(S);
+  else
+    return llvm::Error::success();
+
+  if (Ok)
+    return llvm::Error::success();
+
+  auto Msg = llvm::formatv("String at {0}: value \"{1}\" does not match format \"{2}\"",
+                           prettyPath(Path), elideForMsg(S), Format)
+                 .str();
+  return llvm::createStringError(llvm::inconvertibleErrorCode(), Msg);
+}
+
+
 } // namespace
 
 Error JSONSchemaValidator::validate(const Value &V) const {
@@ -489,6 +724,18 @@ Error JSONSchemaValidator::validateValue(const Value &V, const Object &Schema,
                 .str();
         return createStringError(inconvertibleErrorCode(), Msg);
       }
+    }
+    // format
+    if (auto Fmt = getStringField(Schema, "format")) {
+      // Ensure valid UTF-8 when validating string formats.
+      auto Len = getLen();
+      if (!Len)
+        return createStringError(
+            inconvertibleErrorCode(),
+            formatv("String at {0}: invalid UTF-8", prettyPath(Path)).str());
+
+      if (auto Err = validateStringFormat(S, *Fmt, Path))
+        return Err;
     }
 
     return Error::success();
