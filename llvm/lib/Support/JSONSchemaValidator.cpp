@@ -1172,9 +1172,11 @@ Error JSONSchemaValidator::validateObject(const Object &Obj,
 
   if (auto MP = Schema.getInteger("minProperties")) {
     if (*MP < 0) {
-      return createStringError(inconvertibleErrorCode(),
-                               "minProperties must be >= 0 at " +
-                                   prettyPath(Path));
+      return createStringError(
+          inconvertibleErrorCode(),
+          formatv("Schema error at {0}: minProperties must be >= 0 (got {1})",
+                  prettyPath(Path), *MP)
+              .str());
     }
     size_t MinProps = static_cast<size_t>(*MP);
     if (Obj.size() < MinProps) {
@@ -1188,9 +1190,11 @@ Error JSONSchemaValidator::validateObject(const Object &Obj,
 
   if (auto MP = Schema.getInteger("maxProperties")) {
     if (*MP < 0) {
-      return createStringError(inconvertibleErrorCode(),
-                               "maxProperties must be >= 0 at " +
-                                   prettyPath(Path));
+      return createStringError(
+          inconvertibleErrorCode(),
+          formatv("Schema error at {0}: maxProperties must be >= 0 (got {1})",
+                  prettyPath(Path), *MP)
+              .str());
     }
     size_t MaxProps = static_cast<size_t>(*MP);
     if (Obj.size() > MaxProps) {
@@ -1436,8 +1440,11 @@ Error JSONSchemaValidator::validateArray(const Array &Arr, const Object &Schema,
 
   if (auto MinItemsVal = Schema.getInteger("minItems")) {
     if (*MinItemsVal < 0)
-      return createStringError(inconvertibleErrorCode(),
-                               "minItems must be >= 0 at " + prettyPath(Path));
+      return createStringError(
+          inconvertibleErrorCode(),
+          formatv("Schema error at {0}: minItems must be >= 0 (got {1})",
+                  prettyPath(Path), *MinItemsVal)
+              .str());
     size_t MinItems = static_cast<size_t>(*MinItemsVal);
     if (Arr.size() < MinItems) {
       return createStringError(
@@ -1450,8 +1457,11 @@ Error JSONSchemaValidator::validateArray(const Array &Arr, const Object &Schema,
 
   if (auto MaxItemsVal = Schema.getInteger("maxItems")) {
     if (*MaxItemsVal < 0)
-      return createStringError(inconvertibleErrorCode(),
-                               "maxItems must be >= 0 at " + prettyPath(Path));
+      return createStringError(
+          inconvertibleErrorCode(),
+          formatv("Schema error at {0}: maxItems must be >= 0 (got {1})",
+                  prettyPath(Path), *MaxItemsVal)
+              .str());
     size_t MaxItems = static_cast<size_t>(*MaxItemsVal);
     if (Arr.size() > MaxItems) {
       return createStringError(
@@ -1589,9 +1599,12 @@ Error JSONSchemaValidator::validateArray(const Array &Arr, const Object &Schema,
     size_t MinContains = 1;
     if (auto MC = Schema.getInteger("minContains")) {
       if (*MC < 0) {
-        return createStringError(inconvertibleErrorCode(),
-                                 "minContains must be >= 0 at " +
-                                     prettyPath(Path));
+        return createStringError(
+            inconvertibleErrorCode(),
+            formatv(
+                "Schema error at {0}: minContains must be >= 0 (got {1})",
+                prettyPath(Path), *MC)
+                .str());
       }
       MinContains = static_cast<size_t>(*MC);
     }
@@ -1607,11 +1620,23 @@ Error JSONSchemaValidator::validateArray(const Array &Arr, const Object &Schema,
 
     if (auto MC = Schema.getInteger("maxContains")) {
       if (*MC < 0) {
-        return createStringError(inconvertibleErrorCode(),
-                                 "maxContains must be >= 0 at " +
-                                     prettyPath(Path));
+        return createStringError(
+            inconvertibleErrorCode(),
+            formatv(
+                "Schema error at {0}: maxContains must be >= 0 (got {1})",
+                prettyPath(Path), *MC)
+                .str());
       }
       size_t MaxContains = static_cast<size_t>(*MC);
+      if (MinContains > MaxContains) {
+        return createStringError(
+            inconvertibleErrorCode(),
+            formatv(
+                "Schema error at {2}: minContains ({0}) > maxContains ({1})",
+                MinContains, MaxContains, prettyPath(Path))
+                .str());
+      }
+
       if (Matches > MaxContains) {
         return createStringError(inconvertibleErrorCode(),
                                  formatv("Array at {0}: requires <= {1} "
@@ -1620,13 +1645,6 @@ Error JSONSchemaValidator::validateArray(const Array &Arr, const Object &Schema,
                                      .str());
       }
 
-      if (MinContains > MaxContains) {
-        return createStringError(
-            inconvertibleErrorCode(),
-            formatv("minContains ({0}) > maxContains ({1}) at {2}", MinContains,
-                    MaxContains, prettyPath(Path))
-                .str());
-      }
     }
   }
 
