@@ -772,4 +772,120 @@ TEST(JSONSchemaValidatorTest, StringFormats) {
   ExpectValid(Object{{"format", "uuid"}}, 42);
 }
 
+
+
+TEST(JSONSchemaValidatorTest, UnevaluatedProperties_LocalOnly) {
+  // Local-only semantics: properties/patternProperties/additionalProperties
+  // mark evaluated properties; unevaluatedProperties applies to the remainder.
+
+  Object S1 = Object{
+      {"type", "object"},
+      {"properties", Object{{"a", Object{{"type", "number"}}}}},
+      {"unevaluatedProperties", false},
+  };
+  ExpectValid(S1, Object{{"a", 1.0}});
+  ExpectInvalid(S1, Object{{"a", 1.0}, {"b", 2.0}},
+                "Schema 'false' rejects instance at $.b");
+
+  Object S1b = Object{
+      {"type", "object"},
+      {"properties", Object{{"a", Object{{"type", "number"}}}}},
+      {"unevaluatedProperties", Object{{"type", "number"}}},
+  };
+  ExpectValid(S1b, Object{{"a", 1.0}, {"b", 2.0}});
+  ExpectInvalid(S1b, Object{{"a", 1.0}, {"b", "x"}}, "Expected number at $.b");
+
+  Object S2 = Object{
+      {"type", "object"},
+      {"patternProperties", Object{{"^x", Object{{"type", "number"}}}}},
+      {"unevaluatedProperties", false},
+  };
+  ExpectValid(S2, Object{{"x1", 1.0}});
+  ExpectInvalid(S2, Object{{"x1", 1.0}, {"y", 2.0}},
+                "Schema 'false' rejects instance at $.y");
+
+  Object S3 = Object{
+      {"type", "object"},
+      {"properties", Object{{"a", Object{{"type", "number"}}}}},
+      {"additionalProperties", Object{{"type", "number"}}},
+      {"unevaluatedProperties", false},
+  };
+  // "b" is evaluated by additionalProperties, so unevaluatedProperties does not
+  // apply to it.
+  ExpectValid(S3, Object{{"a", 1.0}, {"b", 2.0}});
+
+  Object S4 = Object{
+      {"type", "object"},
+      {"allOf", Array{Object{{"type", "object"}}}},
+      {"unevaluatedProperties", false},
+  };
+  // Reject schemas that would require cross-subschema annotation propagation.
+  ExpectInvalid(
+      S4, Object{},
+      "Schema error at <root>: unevaluatedProperties requires cross-subschema "
+      "evaluation tracking (not implemented)");
+}
+
+TEST(JSONSchemaValidatorTest, UnevaluatedItems_LocalOnly) {
+  // Local-only semantics: prefixItems/items/contains mark evaluated indices;
+  // unevaluatedItems applies to the remainder.
+
+  Object S1 = Object{
+      {"type", "array"},
+      {"prefixItems",
+       Array{Object{{"type", "number"}}, Object{{"type", "string"}}}},
+      {"items", Object{{"type", "boolean"}}},
+      {"unevaluatedItems", false},
+  };
+  // All indices are evaluated by prefixItems/items, so unevaluatedItems does
+  // not apply.
+  ExpectValid(S1, Array{1.0, "x", true, false});
+
+  Object S2 = Object{
+      {"type", "array"},
+      {"prefixItems", Array{Object{{"type", "number"}}}},
+      {"unevaluatedItems", false},
+  };
+  // Index 1 is not evaluated by prefixItems or items, so unevaluatedItems
+  // applies.
+  ExpectInvalid(S2, Array{1.0, 2.0}, "Schema 'false' rejects instance at $[1]");
+
+  Object S2b = Object{
+      {"type", "array"},
+      {"prefixItems", Array{Object{{"type", "number"}}}},
+      {"unevaluatedItems", Object{{"type", "number"}}},
+  };
+  ExpectValid(S2b, Array{1.0, 2.0});
+  ExpectInvalid(S2b, Array{1.0, "x"}, "Expected number at $[1]");
+
+  Object S3 = Object{
+      {"type", "array"},
+      // Legacy tuple items (array form) when prefixItems is absent.
+      {"items", Array{Object{{"type", "number"}}}},
+      {"unevaluatedItems", false},
+  };
+  ExpectValid(S3, Array{1.0});
+  ExpectInvalid(S3, Array{1.0, "x"}, "Schema 'false' rejects instance at $[1]");
+
+  Object S4 = Object{
+      {"type", "array"},
+      {"contains", Object{{"const", 1.0}}},
+      {"unevaluatedItems", false},
+  };
+  // "contains" only evaluates matching indices; index 1 remains unevaluated.
+  ExpectValid(S4, Array{1.0});
+  ExpectInvalid(S4, Array{1.0, 2.0}, "Schema 'false' rejects instance at $[1]");
+
+  Object S5 = Object{
+      {"type", "array"},
+      {"if", Object{}},
+      {"then", Object{}},
+      {"unevaluatedItems", false},
+  };
+  ExpectInvalid(
+      S5, Array{},
+      "Schema error at <root>: unevaluatedItems requires cross-subschema "
+      "evaluation tracking (not implemented)");
+}
+
 } // namespace
