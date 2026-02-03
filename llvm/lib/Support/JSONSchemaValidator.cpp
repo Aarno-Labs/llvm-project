@@ -50,6 +50,43 @@ std::string prettyPath(StringRef Path) {
   return "$." + Path.str();  // normal: "$.a.b[0]"
 }
 
+static StringRef jsonValueRuntimeTypeName(const Value &V) {
+  // For error messages, classify instance values using the JSON Schema type names.
+  if (V.getAsNull())
+    return "null";
+  if (V.getAsBoolean())
+    return "boolean";
+  if (V.getAsInteger())
+    return "integer";
+  if (V.getAsNumber())
+    return "number";
+  if (V.getAsString())
+    return "string";
+  if (V.getAsObject())
+    return "object";
+  if (V.getAsArray())
+    return "array";
+  return "unknown";
+}
+
+static std::string renderJsonForMsg(const Value &V) {
+  std::string S;
+  raw_string_ostream OS(S);
+  OS << V;
+  return OS.str();
+}
+
+static Error createTypeMismatchError(StringRef Path, const Value &V,
+                                     StringRef AllowedTypesCsv) {
+  std::string Msg =
+      formatv("Type mismatch at {0}: schema 'type' allows only [{1}], but runtime "
+              "type is \"{2}\" (value {3})",
+              prettyPath(Path), AllowedTypesCsv, jsonValueRuntimeTypeName(V),
+              renderJsonForMsg(V))
+          .str();
+  return createStringError(inconvertibleErrorCode(), Msg);
+}
+
 std::string elideForMsg(llvm::StringRef S, size_t MaxLen = 100) {
   if (S.size() <= MaxLen)
     return S.str();
@@ -316,8 +353,6 @@ static llvm::Error validateStringFormat(llvm::StringRef S, llvm::StringRef Forma
   return llvm::createStringError(llvm::inconvertibleErrorCode(), Msg);
 }
 
-
-
 // Walks an in-memory schema tree to find the first object-valued node whose
 // string field `Key` equals `Wanted`. This is used for same-document $id/$anchor
 // resolution without any remote fetch.
@@ -353,7 +388,6 @@ static const Value *findFirstObjectWithStringFieldInRoot(const Object &Root,
       return R;
   return nullptr;
 }
-
 } // namespace
 
 Error JSONSchemaValidator::validate(const Value &V) const {
@@ -920,20 +954,17 @@ Error JSONSchemaValidator::validateValue(const Value &V, const Object &Schema,
     StringRef T = *Type;
     if (T == "object") {
       if (!V.getAsObject())
-        return createStringError(inconvertibleErrorCode(),
-                                 "Expected object at " + prettyPath(Path));
+        return createTypeMismatchError(Path, V, "object");
       if (auto Err = validateObject(*V.getAsObject(), Schema, Path))
         return Err;
     } else if (T == "array") {
       if (!V.getAsArray())
-        return createStringError(inconvertibleErrorCode(),
-                                 "Expected array at " + prettyPath(Path));
+        return createTypeMismatchError(Path, V, "array");
       if (auto Err = validateArray(*V.getAsArray(), Schema, Path))
         return Err;
     } else if (T == "string") {
       if (!V.getAsString())
-        return createStringError(inconvertibleErrorCode(),
-                                 "Expected string at " + prettyPath(Path));
+        return createTypeMismatchError(Path, V, "string");
       if (auto Err = validateStringConstraints(*V.getAsString()))
         return Err;
     } else if (T == "number") {
@@ -945,28 +976,23 @@ Error JSONSchemaValidator::validateValue(const Value &V, const Object &Schema,
         if (auto Err = validateNumberConstraints(*N))
           return Err;
       } else {
-        return createStringError(inconvertibleErrorCode(),
-                                 "Expected number at " + prettyPath(Path));
+        return createTypeMismatchError(Path, V, "number");
       }
     } else if (T == "integer") {
       if (auto N = V.getAsNumber()) {
         if (std::floor(*N) != *N)
-          return createStringError(inconvertibleErrorCode(),
-                                   "Expected integer at " + prettyPath(Path));
+          return createTypeMismatchError(Path, V, "integer");
         if (auto Err = validateNumberConstraints(*N))
           return Err;
       } else {
-        return createStringError(inconvertibleErrorCode(),
-                                 "Expected integer at " + prettyPath(Path));
+        return createTypeMismatchError(Path, V, "integer");
       }
     } else if (T == "boolean") {
       if (!V.getAsBoolean())
-        return createStringError(inconvertibleErrorCode(),
-                                 "Expected boolean at " + prettyPath(Path));
+        return createTypeMismatchError(Path, V, "boolean");
     } else if (T == "null") {
       if (!isJsonNull(V))
-        return createStringError(inconvertibleErrorCode(),
-                                 "Expected null at " + prettyPath(Path));
+        return createTypeMismatchError(Path, V, "null");
     } else {
       // Unknown/unsupported type string in schema
       return createStringError(inconvertibleErrorCode(),
@@ -981,22 +1007,6 @@ Error JSONSchemaValidator::validateValue(const Value &V, const Object &Schema,
       if (auto Ts = TVal.getAsString())
         Allowed.push_back(*Ts);
     }
-
-    auto runtimeType = [&](const Value &IV) -> const char * {
-      if (IV.getAsObject())
-        return "object";
-      if (IV.getAsArray())
-        return "array";
-      if (IV.getAsString())
-        return "string";
-      if (auto N = IV.getAsNumber())
-        return (std::floor(*N) == *N) ? "integer" : "number";
-      if (IV.getAsBoolean())
-        return "boolean";
-      if (isJsonNull(IV))
-        return "null";
-      return "unknown";
-    };
 
     auto isAllowed = [&](const Value &IV) -> bool {
       if (IV.getAsObject())
@@ -1016,19 +1026,8 @@ Error JSONSchemaValidator::validateValue(const Value &V, const Object &Schema,
     };
 
     if (!isAllowed(V)) {
-      // Render the instance value as JSON.
-      std::string ValueStr;
-      {
-        raw_string_ostream os(ValueStr);
-        os << V;
-      }
       std::string AllowedCsv = join(Allowed, ", ");
-      auto Msg =
-          formatv("Type mismatch at {0}: value {1} has runtime type \"{2}\", "
-                  "but schema 'type' allows only [{3}]",
-                  prettyPath(Path), ValueStr, runtimeType(V), AllowedCsv)
-              .str();
-      return createStringError(inconvertibleErrorCode(), Msg);
+      return createTypeMismatchError(Path, V, AllowedCsv);
     }
 
     // Apply type-specific constraints based on the instance's runtime type.
@@ -1164,9 +1163,10 @@ Error JSONSchemaValidator::validateObject(const Object &Obj,
         Schema.find("dependentSchemas") != Schema.end()) {
       return createStringError(
           inconvertibleErrorCode(),
-          "Schema error at %s: unevaluatedProperties requires cross-subschema "
-          "evaluation tracking (not implemented)",
-          Path.empty() ? "<root>" : Path.c_str());
+          formatv("Schema error at {0}: unevaluatedProperties requires "
+                  "cross-subschema evaluation tracking (not implemented)",
+                  Path.empty() ? "<root>" : Path)
+              .str());
     }
   }
 
@@ -1426,9 +1426,10 @@ Error JSONSchemaValidator::validateArray(const Array &Arr, const Object &Schema,
         Schema.find("not") != Schema.end()) {
       return createStringError(
           inconvertibleErrorCode(),
-          "Schema error at %s: unevaluatedItems requires cross-subschema "
-          "evaluation tracking (not implemented)",
-          Path.empty() ? "<root>" : Path.c_str());
+          formatv("Schema error at {0}: unevaluatedItems requires "
+                  "cross-subschema evaluation tracking (not implemented)",
+                  Path.empty() ? "<root>" : Path)
+              .str());
     }
     EvaluatedItems.resize(Arr.size());
   }

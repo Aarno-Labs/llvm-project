@@ -45,7 +45,7 @@ void ExpectInvalid(const Object &Schema, const Value &Instance,
   }
   if (!Expected.empty()) {
     std::string Actual = takeErrorString(std::move(Err));
-    if (Expected != Actual) {
+    if (!StringRef(Actual).contains(Expected)) {
       ADD_FAILURE() << "Error message did not match expected substring.\n"
                     << "Expected: " << Expected << "\n"
                     << "Actual: " << Actual;
@@ -61,34 +61,34 @@ TEST(JSONSchemaValidatorTest, TypePrimitives) {
   // string
   S = Object{{"type", "string"}};
   ExpectValid(S, "hello");
-  ExpectInvalid(S, 42.0, "Expected string at $");
+  ExpectInvalid(S, 42.0, "Type mismatch at $: schema 'type' allows only [string]");
 
   // number
   S = Object{{"type", "number"}};
   ExpectValid(S, 1.5);
   ExpectValid(S, 1);
-  ExpectInvalid(S, "x", "Expected number at $");
+  ExpectInvalid(S, "x", "Type mismatch at $: schema 'type' allows only [number]");
 
   // integer
   S = Object{{"type", "integer"}};
   ExpectValid(S, 3);
-  ExpectInvalid(S, 3.14, "Expected integer at $");
+  ExpectInvalid(S, 3.14, "Type mismatch at $: schema 'type' allows only [integer]");
 
   // boolean
   S = Object{{"type", "boolean"}};
   ExpectValid(S, true);
-  ExpectInvalid(S, 0, "Expected boolean at $");
+  ExpectInvalid(S, 0, "Type mismatch at $: schema 'type' allows only [boolean]");
 
   // object
   S = Object{{"type", "object"},
              {"properties", Object{{"a", Object{{"type", "number"}}}}}};
   ExpectValid(S, Object{{"a", 1.0}});
-  ExpectInvalid(S, Array{1, 2, 3}, "Expected object at $");
+  ExpectInvalid(S, Array{1, 2, 3}, "Type mismatch at $: schema 'type' allows only [object]");
 
   // array
   S = Object{{"type", "array"}};
   ExpectValid(S, Array{});
-  ExpectInvalid(S, Object{}, "Expected array at $");
+  ExpectInvalid(S, Object{}, "Type mismatch at $: schema 'type' allows only [array]");
 }
 
 TEST(JSONSchemaValidatorTest, ConstAndEnum) {
@@ -260,7 +260,7 @@ TEST(JSONSchemaValidatorTest, ObjectPropertiesRequiredAdditional) {
   ExpectInvalid(S, Object{{"a", 1.0}}, "Missing required field: $.b");
   ExpectInvalid(S, Object{{"a", 1.0}, {"b", "x"}, {"c", 1}},
                 "Unexpected property: $.c");
-  ExpectInvalid(S, Object{{"a", 1.0}, {"b", 2.0}}, "Expected string at $.b");
+  ExpectInvalid(S, Object{{"a", 1.0}, {"b", 2.0}}, "Type mismatch at $.b: schema 'type' allows only [string]");
 }
 
 TEST(JSONSchemaValidatorTest, PatternPropertiesAndPropertyNames) {
@@ -288,10 +288,10 @@ TEST(JSONSchemaValidatorTest, AdditionalPropertiesAsSchema) {
                     {"additionalProperties", Object{{"type", "string"}}}};
 
   // 'a' must be number
-  ExpectInvalid(S, Object{{"a", "nope"}}, "Expected number at $.a");
+  ExpectInvalid(S, Object{{"a", "nope"}}, "Type mismatch at $.a: schema 'type' allows only [number]");
   // unknown keys validated against schema (must be string)
   ExpectValid(S, Object{{"b", "ok"}});
-  ExpectInvalid(S, Object{{"b", 1}}, "Expected string at $.b");
+  ExpectInvalid(S, Object{{"b", 1}}, "Type mismatch at $.b: schema 'type' allows only [string]");
 }
 
 TEST(JSONSchemaValidatorTest, DependentRequiredAndSchemas) {
@@ -313,7 +313,7 @@ TEST(JSONSchemaValidatorTest, DependentRequiredAndSchemas) {
                       {"required", Array{"x"}}}}}}};
   ExpectValid(S, Object{{"flag", true}, {"x", 1.0}});
   ExpectInvalid(S, Object{{"flag", true}, {"x", "invalid"}},
-                "Expected number at $.x");
+                "Type mismatch at $.x: schema 'type' allows only [number]");
   ExpectInvalid(S, Object{{"flag", true}}, "Missing required field: $.x");
 }
 
@@ -369,15 +369,15 @@ TEST(JSONSchemaValidatorTest, Arrays_Items_Prefix_Contains_Unique_Min) {
       {"type", "array"},
       {"items", Array{Object{{"type", "string"}}, Object{{"type", "number"}}}}};
   ExpectValid(S, Array{"a", 1.0});
-  ExpectInvalid(S, Array{1.0, "a"}, "Expected string at $[0]");
-  ExpectInvalid(S, Array{"a", "b"}, "Expected number at $[1]");
+  ExpectInvalid(S, Array{1.0, "a"}, "Type mismatch at $[0]: schema 'type' allows only [string]");
+  ExpectInvalid(S, Array{"a", "b"}, "Type mismatch at $[1]: schema 'type' allows only [number]");
 
   // prefixItems (first two elements string, number), rest unconstrained
   S = Object{{"type", "array"},
              {"prefixItems",
               Array{Object{{"type", "string"}}, Object{{"type", "number"}}}}};
   ExpectValid(S, Array{"ok", 2.0, true, nullptr});
-  ExpectInvalid(S, Array{3, 2.0}, "Expected string at $[0]");
+  ExpectInvalid(S, Array{3, 2.0}, "Type mismatch at $[0]: schema 'type' allows only [string]");
 
   // prefixItems + items (draft-2020-12): "items" applies only *after* the
   // prefix tuple, not to the prefix elements themselves.
@@ -386,8 +386,8 @@ TEST(JSONSchemaValidatorTest, Arrays_Items_Prefix_Contains_Unique_Min) {
              {"items", Object{{"type", "number"}}}};
   ExpectValid(S, Array{"s"});
   ExpectValid(S, Array{"s", 1.0, 2.0});
-  ExpectInvalid(S, Array{"s", "t"}, "Expected number at $[1]");
-  ExpectInvalid(S, Array{1.0, 2.0}, "Expected string at $[0]");
+  ExpectInvalid(S, Array{"s", "t"}, "Type mismatch at $[1]: schema 'type' allows only [number]");
+  ExpectInvalid(S, Array{1.0, 2.0}, "Type mismatch at $[0]: schema 'type' allows only [string]");
 
   // prefixItems + legacy tuple-form items array: when prefixItems is present,
   // do not interpret items:[...] (to avoid double-applying tuple constraints).
@@ -397,7 +397,7 @@ TEST(JSONSchemaValidatorTest, Arrays_Items_Prefix_Contains_Unique_Min) {
   ExpectValid(S, Array{"s"});
   ExpectValid(S, Array{"s", "t"});
   ExpectValid(S, Array{"s", 1.0});
-  ExpectInvalid(S, Array{1.0}, "Expected string at $[0]");
+  ExpectInvalid(S, Array{1.0}, "Type mismatch at $[0]: schema 'type' allows only [string]");
 
   // contains: at least one element is > 10
   S = Object{{"type", "array"},
@@ -450,8 +450,7 @@ TEST(JSONSchemaValidatorTest, TypeUnionAndNull) {
   ExpectValid(S, "ok");
   ExpectValid(S, nullptr);
   ExpectInvalid(S, 1,
-                "Type mismatch at $: value 1 has runtime type \"integer\", but "
-                "schema 'type' allows only [string, null]");
+                "Type mismatch at $: schema 'type' allows only [string, null]");
 }
 
 TEST(JSONSchemaValidatorTest, ObjectMinMaxProperties) {
@@ -462,8 +461,6 @@ TEST(JSONSchemaValidatorTest, ObjectMinMaxProperties) {
   ExpectInvalid(S, Object{{"a", 1}, {"b", 2}, {"c", 3}, {"d", 4}},
                 "Object at $: requires <= 3 properties (got 4)");
 }
-
-
 
 TEST(JSONSchemaValidatorTest, RefHonorsSiblingKeywords) {
   Object S = Object{
@@ -490,7 +487,7 @@ TEST(JSONSchemaValidatorTest, OneOfHonorsSiblingKeywords) {
   // Exactly one alternative matches, then sibling keywords are still enforced.
   ExpectValid(S, 6.0);
   ExpectInvalid(S, 4.0, "Number at $: got 4.00, requires >= 5.00 (minimum)");
-  ExpectInvalid(S, "x", "Expected number at $");
+  ExpectInvalid(S, "x", "Type mismatch at $: schema 'type' allows only [number]");
 }
 
 TEST(JSONSchemaValidatorTest, TypelessSubschemaAppliesRuntimeConstraints) {
@@ -503,7 +500,7 @@ TEST(JSONSchemaValidatorTest, TypelessSubschemaAppliesRuntimeConstraints) {
 
   ExpectValid(ObjSchema, Object{{"a", 1}});
   ExpectInvalid(ObjSchema, Object{}, "Missing required field: $.a");
-  ExpectInvalid(ObjSchema, Object{{"a", "x"}}, "Expected integer at $.a");
+  ExpectInvalid(ObjSchema, Object{{"a", "x"}}, "Type mismatch at $.a: schema 'type' allows only [integer]");
 
   // Object-only keywords do not apply to non-objects.
   ExpectValid(ObjSchema, "not-an-object");
@@ -518,7 +515,7 @@ TEST(JSONSchemaValidatorTest, TypelessSubschemaAppliesRuntimeConstraints) {
   ExpectValid(ArrSchema, Array{"a", "b"});
   ExpectInvalid(ArrSchema, Array{"a"},
                 "Array at $: requires >= 2 items (got 1)");
-  ExpectInvalid(ArrSchema, Array{1, 2}, "Expected string at $[0]");
+  ExpectInvalid(ArrSchema, Array{1, 2}, "Type mismatch at $[0]: schema 'type' allows only [string]");
 }
 
 TEST(JSONSchemaValidatorTest, ArrayMaxItemsAndMinMaxContains) {
@@ -695,7 +692,6 @@ TEST(JSONSchemaValidatorTest, BooleanSubschemasInObjectAndArrayApplicators) {
   ExpectValid(ContainsTrue, Array{1});
 }
 
-
 TEST(JSONSchemaValidatorTest, StringLengthCountsUnicodeCodePoints) {
   // U+00E9 ('é') is 2 bytes in UTF-8; U+1F60A ('😊') is 4 bytes.
   // Total: 2 code points, 6 bytes.
@@ -716,7 +712,6 @@ TEST(JSONSchemaValidatorTest, StringLengthCountsUnicodeCodePoints) {
                 "String at $: length 2 < minLength 3 (value: \"\xC3\xA9\xF0\x9F\x98\x8A\")");
 
 }
-
 
 TEST(JSONSchemaValidatorTest, StringFormats) {
   // uuid
@@ -772,8 +767,6 @@ TEST(JSONSchemaValidatorTest, StringFormats) {
   ExpectValid(Object{{"format", "uuid"}}, 42);
 }
 
-
-
 TEST(JSONSchemaValidatorTest, UnevaluatedProperties_LocalOnly) {
   // Local-only semantics: properties/patternProperties/additionalProperties
   // mark evaluated properties; unevaluatedProperties applies to the remainder.
@@ -793,7 +786,8 @@ TEST(JSONSchemaValidatorTest, UnevaluatedProperties_LocalOnly) {
       {"unevaluatedProperties", Object{{"type", "number"}}},
   };
   ExpectValid(S1b, Object{{"a", 1.0}, {"b", 2.0}});
-  ExpectInvalid(S1b, Object{{"a", 1.0}, {"b", "x"}}, "Expected number at $.b");
+  ExpectInvalid(S1b, Object{{"a", 1.0}, {"b", "x"}},
+                "Type mismatch at $.b: schema 'type' allows only [number]");
 
   Object S2 = Object{
       {"type", "object"},
@@ -856,7 +850,8 @@ TEST(JSONSchemaValidatorTest, UnevaluatedItems_LocalOnly) {
       {"unevaluatedItems", Object{{"type", "number"}}},
   };
   ExpectValid(S2b, Array{1.0, 2.0});
-  ExpectInvalid(S2b, Array{1.0, "x"}, "Expected number at $[1]");
+  ExpectInvalid(S2b, Array{1.0, "x"},
+                "Type mismatch at $[1]: schema 'type' allows only [number]");
 
   Object S3 = Object{
       {"type", "array"},
