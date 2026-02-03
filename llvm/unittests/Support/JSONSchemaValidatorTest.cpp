@@ -214,7 +214,7 @@ TEST(JSONSchemaValidatorTest, StringConstraints) {
 
   // minLength: 0 allows empty string
   S = Object{{"type", "string"}, {"minLength", 0}};
-  ExpectValid(S, "Schema error at $: minLength must be >= 0 (got -1)");
+  ExpectValid(S, "");
 
   // Negative minLength / maxLength => schema errors
   S = Object{{"type", "string"}, {"minLength", -1}};
@@ -595,7 +595,7 @@ TEST(JSONSchemaValidatorTest, RefIdAndAnchorSameDocument) {
   // Unknown $id should fail (no remote fetch).
   {
     Object S = Object{{"$ref", "urn:ex:unknown#/$defs/T"}};
-    ExpectInvalid(S, 1);
+    ExpectInvalid(S, 1, "Unsupported $ref urn:ex:unknown#/$defs/T: unknown $id \"urn:ex:unknown\"");
   }
 
   // Invalid pointer within a known $id should fail.
@@ -604,7 +604,7 @@ TEST(JSONSchemaValidatorTest, RefIdAndAnchorSameDocument) {
         Object{{"$defs",
                 Object{{"Base", Object{{"$id", "urn:ex:base"}, {"const", 1}}}}},
                {"$ref", "urn:ex:base#/no_such_token"}};
-    ExpectInvalid(S, 1);
+    ExpectInvalid(S, 1, "Invalid $ref pointer urn:ex:base#/no_such_token: token \"no_such_token\" not found");
   }
 }
 
@@ -881,6 +881,74 @@ TEST(JSONSchemaValidatorTest, UnevaluatedItems_LocalOnly) {
       S5, Array{},
       "Schema error at <root>: unevaluatedItems requires cross-subschema "
       "evaluation tracking (not implemented)");
+}
+
+TEST(JSONSchemaValidatorTest, NegativeSchemaTests_MissingCoverage) {
+  // Object: negative min/maxProperties are schema errors.
+  Object ObjBadMin = Object{{"type", "object"}, {"minProperties", -1}};
+  ExpectInvalid(ObjBadMin, Object{},
+                "Schema error at $: minProperties must be >= 0 (got -1)");
+
+  Object ObjBadMax = Object{{"type", "object"}, {"maxProperties", -2}};
+  ExpectInvalid(ObjBadMax, Object{},
+                "Schema error at $: maxProperties must be >= 0 (got -2)");
+
+  // Array: negative min/maxItems are schema errors.
+  Object ArrBadMin = Object{{"type", "array"}, {"minItems", -1}};
+  ExpectInvalid(ArrBadMin, Array{},
+                "Schema error at $: minItems must be >= 0 (got -1)");
+
+  Object ArrBadMax = Object{{"type", "array"}, {"maxItems", -5}};
+  ExpectInvalid(ArrBadMax, Array{},
+                "Schema error at $: maxItems must be >= 0 (got -5)");
+
+  // Array: negative min/maxContains are schema errors.
+  Object ArrBadMinContains = Object{
+      {"type", "array"},
+      {"contains", Object{{"type", "number"}}},
+      {"minContains", -1},
+  };
+  ExpectInvalid(ArrBadMinContains, Array{1.0},
+                "Schema error at $: minContains must be >= 0 (got -1)");
+
+  Object ArrBadMaxContains = Object{
+      {"type", "array"},
+      {"contains", Object{{"type", "number"}}},
+      {"maxContains", -1},
+  };
+  ExpectInvalid(ArrBadMaxContains, Array{1.0},
+                "Schema error at $: maxContains must be >= 0 (got -1)");
+
+  // Array: minContains > maxContains is a schema error (sanity check).
+  Object ArrBadMinGtMaxContains = Object{
+      {"type", "array"},
+      {"contains", Object{{"type", "number"}}},
+      {"minContains", 2},
+      {"maxContains", 1},
+  };
+  ExpectInvalid(ArrBadMinGtMaxContains, Array{1.0, 2.0},
+                "Schema error at $: minContains (2) > maxContains (1)");
+
+  // Subschema type check: properties entries must be object or boolean schemas.
+  Object BadSubschema = Object{
+      {"type", "object"},
+      {"properties", Object{{"a", 0}}},
+  };
+  ExpectInvalid(BadSubschema, Object{{"a", 1.0}},
+                "Schema error: subschema must be an object or boolean at $.a");
+
+  // $ref error surfaces: non-existent anchor and non-object intermediate segment.
+  Object AnchorNotFound = Object{
+      {"$ref", "#NoSuchAnchor"},
+  };
+  ExpectInvalid(AnchorNotFound, 1.0, "Unsupported $ref #NoSuchAnchor: not found");
+
+  Object NonObjectIntermediate = Object{
+      {"$defs", Object{{"x", Object{{"y", true}}}}},
+      {"$ref", "#/$defs/x/y/z"},
+  };
+  ExpectInvalid(NonObjectIntermediate, 1.0,
+                "Invalid $ref pointer #/$defs/x/y/z: non-object at \"y\"");
 }
 
 } // namespace
