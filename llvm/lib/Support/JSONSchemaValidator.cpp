@@ -16,8 +16,10 @@
 //       supported.
 //===----------------------------------------------------------------------===//
 #include "llvm/Support/JSONSchemaValidator.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
@@ -1141,6 +1143,33 @@ Error JSONSchemaValidator::validateObject(const Object &Obj,
             .str());
   };
 
+  auto ItUnevaluatedProperties = Schema.find("unevaluatedProperties");
+  const bool HasUnevaluatedProperties =
+      (ItUnevaluatedProperties != Schema.end());
+  SmallDenseSet<StringRef, 32> EvaluatedProperties;
+  if (HasUnevaluatedProperties) {
+    // Full draft-2020-12 unevaluatedProperties semantics require tracking
+    // evaluation annotations across applicators ($ref, allOf/anyOf/oneOf,
+    // if/then/else, not). This validator currently only supports the local
+    // case where evaluation is driven by properties/patternProperties/
+    // additionalProperties within this object schema.
+    if (Schema.find("$ref") != Schema.end() ||
+        Schema.find("allOf") != Schema.end() ||
+        Schema.find("anyOf") != Schema.end() ||
+        Schema.find("oneOf") != Schema.end() ||
+        Schema.find("if") != Schema.end() ||
+        Schema.find("then") != Schema.end() ||
+        Schema.find("else") != Schema.end() ||
+        Schema.find("not") != Schema.end() ||
+        Schema.find("dependentSchemas") != Schema.end()) {
+      return createStringError(
+          inconvertibleErrorCode(),
+          "Schema error at %s: unevaluatedProperties requires cross-subschema "
+          "evaluation tracking (not implemented)",
+          Path.empty() ? "<root>" : Path.c_str());
+    }
+  }
+
   if (auto MP = Schema.getInteger("minProperties")) {
     if (*MP < 0) {
       return createStringError(inconvertibleErrorCode(),
@@ -1228,6 +1257,8 @@ Error JSONSchemaValidator::validateObject(const Object &Obj,
         std::string ChildPath = withPath(Key);
         if (auto Err = validateSubschema(It->second, SubSchemaVal, ChildPath))
           return Err;
+        if (HasUnevaluatedProperties)
+          EvaluatedProperties.insert(Key);
       }
     }
   }
@@ -1256,6 +1287,8 @@ Error JSONSchemaValidator::validateObject(const Object &Obj,
         if (R.match(Key)) {
           if (auto Err = validateSubschema(Val, *Sub, ChildPath))
             return Err;
+          if (HasUnevaluatedProperties)
+            EvaluatedProperties.insert(Key);
         }
       }
     }
@@ -1325,7 +1358,20 @@ Error JSONSchemaValidator::validateObject(const Object &Obj,
       if (!Known && !PatternOK) {
         if (auto Err = validateValue(Val, Aps, withPath(Key)))
           return Err;
+        if (HasUnevaluatedProperties)
+          EvaluatedProperties.insert(Key);
       }
+    }
+  }
+
+  if (HasUnevaluatedProperties) {
+    for (const auto &KV : Obj) {
+      StringRef Key = KV.first;
+      if (EvaluatedProperties.count(Key))
+        continue;
+      if (auto Err = validateSubschema(KV.second, ItUnevaluatedProperties->second,
+                                      withPath(Key)))
+        return Err;
     }
   }
 
@@ -1360,6 +1406,32 @@ Error JSONSchemaValidator::validateArray(const Array &Arr, const Object &Schema,
                 prettyPath(SubPath))
             .str());
   };
+
+  auto ItUnevaluatedItems = Schema.find("unevaluatedItems");
+  const bool HasUnevaluatedItems = (ItUnevaluatedItems != Schema.end());
+  SmallBitVector EvaluatedItems;
+  if (HasUnevaluatedItems) {
+    // Full draft-2020-12 unevaluatedItems semantics require tracking
+    // evaluation annotations across applicators ($ref, allOf/anyOf/oneOf,
+    // if/then/else, not). This validator currently only supports the local
+    // case where evaluation is driven by prefixItems/items/contains within
+    // this array schema.
+    if (Schema.find("$ref") != Schema.end() ||
+        Schema.find("allOf") != Schema.end() ||
+        Schema.find("anyOf") != Schema.end() ||
+        Schema.find("oneOf") != Schema.end() ||
+        Schema.find("if") != Schema.end() ||
+        Schema.find("then") != Schema.end() ||
+        Schema.find("else") != Schema.end() ||
+        Schema.find("not") != Schema.end()) {
+      return createStringError(
+          inconvertibleErrorCode(),
+          "Schema error at %s: unevaluatedItems requires cross-subschema "
+          "evaluation tracking (not implemented)",
+          Path.empty() ? "<root>" : Path.c_str());
+    }
+    EvaluatedItems.resize(Arr.size());
+  }
 
   if (auto MinItemsVal = Schema.getInteger("minItems")) {
     if (*MinItemsVal < 0)
@@ -1460,6 +1532,8 @@ Error JSONSchemaValidator::validateArray(const Array &Arr, const Object &Schema,
       std::string ElemPath = indexPath(Idx);
       if (auto Err = validateSubschema(Arr[Idx], (**Pfx)[Idx], ElemPath))
         return Err;
+      if (HasUnevaluatedItems)
+        EvaluatedItems.set(Idx);
     }
   }
 
@@ -1477,6 +1551,8 @@ Error JSONSchemaValidator::validateArray(const Array &Arr, const Object &Schema,
           std::string ElemPath = indexPath(Idx);
           if (auto Err = validateSubschema(Arr[Idx], (*ItemsArr)[Idx], ElemPath))
             return Err;
+          if (HasUnevaluatedItems)
+            EvaluatedItems.set(Idx);
         }
         // Extra items beyond tuple size: allowed. We leave them unconstrained
         // unless other keywords ("contains", etc.) restrict them.
@@ -1487,6 +1563,8 @@ Error JSONSchemaValidator::validateArray(const Array &Arr, const Object &Schema,
         std::string ElemPath = indexPath(Idx);
         if (auto Err = validateSubschema(Arr[Idx], ItItems->second, ElemPath))
           return Err;
+        if (HasUnevaluatedItems)
+          EvaluatedItems.set(Idx);
       }
     }
   }
@@ -1501,6 +1579,8 @@ Error JSONSchemaValidator::validateArray(const Array &Arr, const Object &Schema,
         consumeError(std::move(Err)); // element doesn't match; ignore
       } else {
         ++Matches;
+        if (HasUnevaluatedItems)
+          EvaluatedItems.set(Idx);
       }
     }
 
@@ -1546,6 +1626,17 @@ Error JSONSchemaValidator::validateArray(const Array &Arr, const Object &Schema,
                     MaxContains, prettyPath(Path))
                 .str());
       }
+    }
+  }
+
+  if (HasUnevaluatedItems) {
+    for (size_t Idx = 0; Idx < Arr.size(); ++Idx) {
+      if (EvaluatedItems.test(Idx))
+        continue;
+      std::string ElemPath = indexPath(Idx);
+      if (auto Err = validateSubschema(Arr[Idx], ItUnevaluatedItems->second,
+                                      ElemPath))
+        return Err;
     }
   }
 
