@@ -58,7 +58,7 @@ static inline StringRef toString(PPArgSpanKind kind) {
   case PPArgSpanKind::Paste:
     return "Paste";
   }
-  llvm_unreachable("Invalid owner kind");
+  llvm_unreachable("Invalid PPArgSpanKind");
 }
 
 /// \brief Strongly-typed view over the clang-refold map JSON produced by the
@@ -181,7 +181,7 @@ public:
   }
 
   struct PPArgSpan : public PPSpan {
-    PPArgSpanKind kind;
+    PPArgSpanKind kind = PPArgSpanKind::Standard;
     uint32_t argIdx;
     std::optional<uint32_t> byteBegin;
     std::optional<uint32_t> byteEnd;

@@ -251,13 +251,17 @@ parseSpans(const json::Value &val, StringRef ctx,
     // 2. Handle arg_index if T is PPArgSpan
     // Using 'if constexpr' ensures this code only exists for PPArgSpan
     if constexpr (std::is_same_v<T, RefoldModel::PPArgSpan>) {
+      // Record which PPArgSpan kind array we are parsing (arg_spans,
+      // stringify_spans, paste_spans).
+      assert(argKind && "missing 'argKind' when parsing a PPArgSpan type");
+      span.kind = *argKind;
+
       auto argOrErr = applyToField(asUInt32, *obj, "arg_index", ctxItem);
       if (!argOrErr)
         return argOrErr.takeError();
       span.argIdx = *argOrErr;
 
       // If this PPArgSpan has a byte range, then parse byte_begin/byte_end.
-      assert(argKind && "missing 'argKind' when parsing a PPArgSpan type");
       if (RefoldModel::HasByteRange(*argKind)) {
         auto bbOrErr = applyToField(asUInt32, *obj, "byte_begin", ctxItem);
         if (!bbOrErr)
