@@ -2817,7 +2817,7 @@ StringRef RefoldEngine::SliceSource(ArrayRef<size_t> tokOff, StringRef source,
   const uint64_t maxTokIdx = static_cast<uint64_t>(n) - 1;
 
   // Clamp token indices to valid array bounds.
-  uint64_t loTok = std::clamp(startTok, 0ULL, maxTokIdx);
+  uint64_t loTok = std::clamp(startTok, static_cast<uint64_t>(0), maxTokIdx);
   uint64_t hiTok = std::clamp(endTok, loTok, maxTokIdx);
 
   size_t lo = tokOff[static_cast<size_t>(loTok)];
@@ -3150,7 +3150,7 @@ RefoldEngine::MapAToBTokenEnvelopeByPPArgSpan(
 
   // 3. Fallback: use consumer token offsets.
   const uint64_t maxATok = static_cast<uint64_t>(aToks_.size());
-  uint64_t a0Idx = std::clamp(sp.begin, 0ULL, maxATok);
+  uint64_t a0Idx = std::clamp(sp.begin, static_cast<uint64_t>(0), maxATok);
   uint64_t a1Idx = std::clamp(sp.end, a0Idx, maxATok);
 
   size_t a0 = aTokOff_[static_cast<size_t>(a0Idx)];
@@ -3169,7 +3169,7 @@ RefoldEngine::MapATokRangeAToBTokenEnvelope(uint64_t beginTok,
     return std::nullopt;
 
   // Standardize the token indices.
-  beginTok = std::clamp(beginTok, 0ULL, nA);
+  beginTok = std::clamp(beginTok, static_cast<uint64_t>(0), nA);
   endTok = std::clamp(endTok, beginTok, nA);
 
   // If the range is empty or inverted, return nullopt.
@@ -3726,7 +3726,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
 
   // PP cover for this include inside the header; if not present, these will
   // already have been derived from spans when building the model.
-  const uint64_t coverBegin = std::max(0ULL, ie.include->cover.begin);
+  const uint64_t coverBegin =
+      std::max(static_cast<uint64_t>(0), ie.include->cover.begin);
   const uint64_t coverEnd = std::max(coverBegin, ie.include->cover.end);
 
   // Single list of edits; we will apply them highest-offset-first so indices
