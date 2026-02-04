@@ -66,6 +66,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <filesystem>
 #include <limits>
 #include <memory>
@@ -190,16 +191,16 @@ std::string RefoldEngine::Refold() {
   trace("lcs/bSeq", sep);
 
   // 1b) Compute per-gap ownership depth for A's PP tokens.
-  std::vector<uint32_t> ownerDepthGap = ComputeOwnerDepthGapsForPP();
+  ownerDepthGap_ = ComputeOwnerDepthGapsForPP();
   trace("lcs/ownerGap", "ownerDepthGap:");
   trace("lcs/ownerGap", "==============");
   logFormattedArray<unsigned>(
-      ownerDepthGap, /* k */ MAX_COLS, /* sameWidth */ true,
+      ownerDepthGap_, /* k */ MAX_COLS, /* sameWidth */ true,
       [](StringRef msg) { trace("lcs/ownerGap", msg); });
   trace("lcs/ownerGap", sep);
 
   // 2) LCS over tokens (A → B) with owner-aware cost model.
-  auto a2b = diffutils::lcsMapAB(aSeq, bSeq, ownerDepthGap);
+  auto a2b = diffutils::lcsMapAB(aSeq, bSeq, ownerDepthGap_);
   trace("lcs/a2b", "a2b:");
   trace("lcs/a2b", "====");
   logFormattedArray<int64_t>(a2b, /* k */ MAX_COLS, /* sameWidth */ true,
@@ -362,7 +363,7 @@ std::string RefoldEngine::Refold() {
                 ? existingIt->second.replacement
                 : (m->invText ? m->invText->str() : "");
         auto updated = BuildMacroInvocationPatchWholeCover(
-            *m, h, a2b, currentInvText, macroPatchByOwnerByMacroId);
+            *m, h, currentInvText, macroPatchByOwnerByMacroId);
         if (updated) {
           byMacroId[m->id] = std::move(*updated);
         }
@@ -1164,20 +1165,64 @@ bool RefoldEngine::HunkMapsToTU(uint64_t a0, uint64_t a1,
     return false;
   }
 
-  // Non-strict: preserve prior best-effort behavior by snapping to the nearest
-  // mapped token on either side of the PP gap.
-  const RefoldModel::TokMapEntry *left = nullptr;
-  for (uint64_t ppL = pp; ppL-- > 0;) {
-    auto it = tokmapByPP.find(ppL);
+  // Non-strict: bounded best-effort behavior.
+  //
+  // Historically we scanned arbitrarily far to find the nearest mapped token
+  // and inferred TU ownership from that token. With clang now emitting author-
+  // itative slot.pp for boundary-like slots, we can be much more conservative
+  // here: never snap across an include expansion, and only probe a small bound-
+  // ed window when immediate neighbors are unmapped whitespace.
+  if (IncludeIdCoveringPPIndex(pp)) {
+    return false;
+  }
+
+  // Prefer immediate neighbors first.
+  if (pp < model_.GetTokensCountA()) {
+    auto rightIt = tokmapByPP.find(pp);
+    if (rightIt != tokmapByPP.end()) {
+      return PathsEqual(tuPath, rightIt->second.file);
+    }
+  }
+
+  if (pp > 0 && pp - 1 < tokmapByPP.size()) {
+    auto leftIt = tokmapByPP.find(pp - 1);
+    if (leftIt != tokmapByPP.end()) {
+      return PathsEqual(tuPath, leftIt->second.file);
+    }
+  }
+
+  // Stop scanning once ownership changes (ownerDepthGap) and cap the scan as a failsafe.
+  static constexpr uint64_t MAX_SNAP_DISTANCE = 64;
+
+  const bool haveOwnerGaps =
+      (ownerDepthGap_.size() == model_.GetTokensCountA() + 1);
+  const uint32_t wantOwner =
+      (haveOwnerGaps && pp < ownerDepthGap_.size()) ? ownerDepthGap_[pp] : 0;
+
+  const RefoldModel::TokMapEntry* left = nullptr;
+  for (uint64_t d = 2; d <= MAX_SNAP_DISTANCE; ++d) {
+    if (pp < d) // Prevent unsigned underflow
+      break;
+    if (haveOwnerGaps) {
+      const uint64_t gap = pp - (d - 1);
+      if (gap < ownerDepthGap_.size() && ownerDepthGap_[gap] != wantOwner)
+        break;
+    }
+    auto it = tokmapByPP.find(pp - d);
     if (it != tokmapByPP.end()) {
       left = &it->second;
       break;
     }
   }
 
-  const RefoldModel::TokMapEntry *right = nullptr;
-  const size_t maxPP = model_.GetTokensCountA();
-  for (uint64_t ppR = pp; ppR < maxPP; ++ppR) {
+  const RefoldModel::TokMapEntry* right = nullptr;
+  const uint64_t maxPP = model_.GetTokensCountA();
+  for (uint64_t d = 1; d <= MAX_SNAP_DISTANCE; ++d) {
+    uint64_t ppR = pp + d;
+    if (ppR >= maxPP)
+      break;
+    if (haveOwnerGaps && ppR < ownerDepthGap_.size() && ownerDepthGap_[ppR] != wantOwner)
+      break;
     auto it = tokmapByPP.find(ppR);
     if (it != tokmapByPP.end()) {
       right = &it->second;
@@ -1403,38 +1448,93 @@ RefoldEngine::TUByteSpan(uint64_t a0, uint64_t a1, StringRef tuPath) const {
       return std::nullopt;
     }
 
-    // Non-strict: prior best-effort behavior (closest mapped neighbor scan).
+    // Non-strict: bounded best-effort behavior (avoid long-range snapping).
+    //
+    // With slot.pp covering include/arm/file boundaries, the remaining use case for snapping is a
+    // pure insertion inside the TU where immediate neighbors are unmapped whitespace. Bound the
+    // probe window so we do not accidentally "jump" across regions and mis-own the insertion.
+
+    // Any PP gap inside an include expansion is header-owned (no TU span).
+    if (IncludeIdCoveringPPIndex(pp)) {
+      return std::nullopt;
+    }
+
+    if (pp < model_.GetTokensCountA()) {
+      auto rightIt = tokmapByPP.find(pp);
+      if (rightIt != tokmapByPP.end()) {
+        const auto &right = rightIt->second;
+        if (PathsEqual(tuPath, right.file)) {
+          return {{right.b, right.b}};
+        }
+      }
+    }
+
+    if (pp > 0 && static_cast<size_t>(pp - 1) < tokmapByPP.size()) {
+      auto leftIt = tokmapByPP.find(pp - 1);
+      if (leftIt != tokmapByPP.end()) {
+        const auto &left = leftIt->second;
+        if (PathsEqual(tuPath, left.file)) {
+          return {{left.e, left.e}};
+        }
+      }
+    }
+
+    // Stop scanning once ownership changes (ownerDepthGap) and cap the scan as a failsafe.
+    constexpr uint64_t MAX_SNAP_DISTANCE = 64;
+
+    const bool haveOwnerGaps =
+        (ownerDepthGap_.size() == model_.GetTokensCountA() + 1);
+    const uint32_t wantOwner =
+        (haveOwnerGaps && pp < ownerDepthGap_.size()) ? ownerDepthGap_[pp] : 0;
+
     const RefoldModel::TokMapEntry *left = nullptr;
-    for (uint64_t i = a0; i-- > 0;) {
-      auto it = tokmapByPP.find(i);
+    uint64_t dLeft = std::numeric_limits<uint64_t>::max();
+    for (uint64_t d = 2; d <= MAX_SNAP_DISTANCE; ++d) {
+      if (pp < d)
+        break;
+      if (haveOwnerGaps) {
+        const uint64_t gap = pp - (d - 1);
+        if (gap < ownerDepthGap_.size() && ownerDepthGap_[gap] != wantOwner)
+          break;
+      }
+      auto it = tokmapByPP.find(pp - d);
       if (it != tokmapByPP.end()) {
-        left = &it->second;
+        const auto& ent = it->second;
+        left = &ent;
+        dLeft = d;
         break;
       }
     }
 
     const RefoldModel::TokMapEntry *right = nullptr;
+    uint64_t dRight = std::numeric_limits<uint64_t>::max();
     const uint64_t ppCount = model_.GetTokensCountA();
-    for (uint64_t i = a0; i < ppCount; ++i) {
+    for (uint64_t d = 1; d <= MAX_SNAP_DISTANCE; ++d) {
+      uint64_t i = pp + d;
+      if (i >= ppCount)
+        break;
+      if (haveOwnerGaps && i < ownerDepthGap_.size() && ownerDepthGap_[i] != wantOwner)
+        break;
       auto it = tokmapByPP.find(i);
       if (it != tokmapByPP.end()) {
-        right = &it->second;
+        const auto& ent = it->second;
+        right = &ent;
+        dRight = d;
         break;
       }
     }
 
-    // If either neighbor points into a header/include, we must NOT fabricate a
-    // TU span.
-    if (left) {
-      if (!PathsEqual(tuPath, left->file))
-        return std::nullopt;
-      return {{left->e, left->e}};
-    }
-    if (right) {
-      if (!PathsEqual(tuPath, right->file))
-        return std::nullopt;
+    // If either neighbor points into a header/include, we must NOT fabricate a TU span.
+    if (left && !PathsEqual(tuPath, left->file))
+      return std::nullopt;
+    if (right && !PathsEqual(tuPath, right->file))
+      return std::nullopt;
+
+    // Prefer the closest side (tie-break to right).
+    if (right && (!left || dRight <= dLeft))
       return {{right->b, right->b}};
-    }
+    if (left)
+      return {{left->e, left->e}};
 
     return std::nullopt;
   }
@@ -1856,8 +1956,7 @@ bool RefoldEngine::HunkTouchesAnyPasteToken(
 
 std::optional<RefoldEngine::PasteArgEdit>
 RefoldEngine::DerivePasteArgEdit(const RefoldModel::MacroInvocation &m,
-                                 const diffutils::Hunk &h,
-                                 ArrayRef<int64_t> a2b) const {
+                                 const diffutils::Hunk &h) const {
   // This helper only applies when the producer reported paste spans.
   if (m.pasteSpans.empty())
     return std::nullopt;
@@ -2026,8 +2125,7 @@ RefoldEngine::DerivePasteArgEdit(const RefoldModel::MacroInvocation &m,
 
 std::optional<std::vector<RefoldEngine::PasteArgEdit>>
 RefoldEngine::DerivePasteArgEdits(const RefoldModel::MacroInvocation &m,
-                                  const diffutils::Hunk &h,
-                                  ArrayRef<int64_t> a2b) const {
+                                  const diffutils::Hunk &h) const {
   if (m.pasteSpans.empty())
     return std::nullopt;
 
@@ -2344,9 +2442,7 @@ bool RefoldEngine::PasteArgReplacementsMatchAllPasteTokensInB(
     if (endTok != beginTok + 1)
       return false;
 
-    // Map the A pasted-token occurrence to a single B token envelope. This
-    // mapping is paste-aware because token-paste edits often cause the pasted
-    // token to be unmapped in a2b (-1).
+    // Map the A pasted-token occurrence to a single B token envelope.
     auto bEnv = MapATokRangeAToBTokenEnvelope(beginTok, endTok);
     if (!bEnv || bEnv->second != bEnv->first + 1)
       return false;
@@ -2477,7 +2573,7 @@ std::string RefoldEngine::SplicePasteSegmentIntoSpellingArg(StringRef baseArg,
 std::optional<RefoldEngine::MacroPatch>
 RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h,
-    ArrayRef<int64_t> a2b, StringRef baseInvText) const {
+    StringRef baseInvText) const {
   // We can only emit an invocation patch if the producer provided a concrete
   // byte range.
   if (!m.invB || !m.invE)
@@ -2508,7 +2604,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
   // that case we attempt to derive per-arg segment replacements and splice them
   // into the invocation spelling.
   if (HunkTouchesAnyPasteToken(m, h)) {
-    auto edits = DerivePasteArgEdits(m, h, a2b);
+    auto edits = DerivePasteArgEdits(m, h);
     if (edits && !edits->empty()) {
       DenseMap<uint32_t, std::string> replByArgIdx;
       for (const auto &pae : *edits) {
@@ -2582,7 +2678,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     // X##_##Y, changing just X). The multi-span derivation above requires token
     // lengths to remain stable; when they do not, we fall back to deriving a
     // single segment edit from the token-level diff.
-    auto pae = DerivePasteArgEdit(m, h, a2b);
+    auto pae = DerivePasteArgEdit(m, h);
     if (pae) {
       uint32_t argIdx = pae->argIdx;
 
@@ -3288,7 +3384,7 @@ RefoldEngine::BuildIncludeInsertionPatch(const RefoldModel::IncludeItem &inc,
 std::optional<RefoldEngine::MacroPatch>
 RefoldEngine::BuildMacroInvocationPatchWholeCover(
     const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h,
-    ArrayRef<int64_t> a2b, StringRef baseInvText,
+    StringRef baseInvText,
     const DenseMap<std::optional<uint64_t>, DenseMap<uint64_t, MacroPatch>>
         &patchMap) const {
   // The invocation byte span in the owning file must be known.
@@ -3328,7 +3424,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             ? baseInvText
             : (m.invText ? StringRef(*m.invText) : StringRef(""));
     if (InvocationSpanMatchesCallsitePrefix(invSpanText, m)) {
-      auto argsOnly = BuildMacroInvocationPatchArgsOnly(m, h, a2b, baseInvText);
+      auto argsOnly = BuildMacroInvocationPatchArgsOnly(m, h, baseInvText);
       if (argsOnly)
         return *argsOnly;
     }
