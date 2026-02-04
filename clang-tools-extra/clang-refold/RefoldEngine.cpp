@@ -2199,7 +2199,6 @@ RefoldEngine::DerivePasteArgEdits(const RefoldModel::MacroInvocation &m,
     return std::nullopt;
 
   std::vector<PasteArgEdit> edits;
-  DenseSet<uint32_t> seenArgIdx;
 
   for (size_t i = 0; i < spans.size(); ++i) {
     const auto *ps = spans[i];
@@ -2217,11 +2216,9 @@ RefoldEngine::DerivePasteArgEdits(const RefoldModel::MacroInvocation &m,
     if (oldSeg == newSeg)
       continue;
 
-    // If the same argument index appears twice in the same pasted token with
-    // different edits, it's ambiguous.
-    if (!seenArgIdx.insert(ps->argIdx).second)
-      return std::nullopt;
-
+    // Note: the same argument may contribute multiple segments to the same
+    // pasted token (e.g. X##_..._##X). We allow repeated argIdx here and let
+    // the caller merge implied argument replacements conservatively.
     edits.emplace_back(ps->argIdx, newSeg, oldSeg.str());
   }
 
@@ -2612,12 +2609,9 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         if (static_cast<size_t>(argIdx) >= invArgRanges.size())
           return std::nullopt;
 
-        // Reject multiple independent edits to the same arg index inside one
-        // pasted token (this can be generalized later, but keeping it strict
-        // avoids ambiguous splice order).
-        if (replByArgIdx.count(argIdx))
-          return std::nullopt;
-
+        // A single argument may contribute multiple segments to the same
+        // pasted token (e.g. X##_..._##X). We merge repeated argIdx
+        // conservatively after deriving the candidate replacement below.
         auto range = invArgRanges[argIdx];
         StringRef baseArgText =
             baseInvText.substr(range.first, range.second - range.first);
@@ -2628,6 +2622,13 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
             baseArgText, pae.oldSeg, pae.newSeg);
         if (newArg.empty())
           return std::nullopt;
+
+        auto existing = replByArgIdx.find(argIdx);
+        if (existing != replByArgIdx.end()) {
+          if (existing->second != newArg)
+            return std::nullopt;
+          continue;
+        }
 
         // Per-arg safety gate: validate standard + stringify occurrences for
         // this arg.
