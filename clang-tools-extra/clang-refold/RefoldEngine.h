@@ -212,6 +212,10 @@ private:
   LineDirectiveInserter lineDirs_;
   bool strict_;
 
+  /// Per-gap ownership depth for insertion before PP token k (k in [0..N]).
+  /// Computed once per refold run and reused to bound best-effort snapping.
+  std::vector<uint32_t> ownerDepthGap_;
+
   std::optional<std::vector<ByteHunk>> abByteHunks_;
 
   /// Construct an engine from concrete inputs. The instance method `Refold()`
@@ -1027,13 +1031,12 @@ private:
   ///
   /// \param m macro invocation metadata containing `pasteSpans`
   /// \param h edit hunk in A-token coordinates
-  /// \param a2b A-token to B-token mapping array (produced by alignment/LCS)
   /// \returns a `PasteArgEdit` describing a single-argument replacement for the
   ///          pasted token, or `std::nullopt` if no safe single-arg derivation
   ///          exists.
   std::optional<PasteArgEdit>
   DerivePasteArgEdit(const RefoldModel::MacroInvocation &m,
-                     const diffutils::Hunk &h, ArrayRef<int64_t> a2b) const;
+                     const diffutils::Hunk &h) const;
 
   /// \brief Derives one or more *token-paste* argument edits for a single macro
   /// invocation hunk.
@@ -1047,21 +1050,23 @@ private:
   ///
   /// The method operates on the **A-stream** (unmodified preprocessed output
   /// produced by Clang) and the edited **B-stream** (user-modified preprocessed
-  /// output), using `a2b` token alignment. It is intentionally conservative: it
+  /// output) by mapping the pasted-token A occurrence to a B token envelope via
+  /// `MapAToBTokenEnvelopeByPPArgSpan`. It is intentionally conservative: it
   /// returns `std::nullopt` when it cannot produce a deterministic, unambiguous
   /// decomposition.
   ///
   /// ### High-level algorithm
   /// 1. Collect all `PPArgSpan` entries in `m.pasteSpans` that intersect the
   ///    hunk's A-token interval `[h.aStart, h.aEnd)`.
-  /// 2. Project the pasted token's A-token interval `[begin, end)` to a B-token
-  ///    envelope using `MapAToBTokenEnvelopePasteStrictWithHint`.
+  /// 2. Use the pasted token's A-token interval `[begin, end)` (from the first
+  ///    candidate span) and map it to a B token envelope using
+  ///    `MapAToBTokenEnvelopeByPPArgSpan`.
   /// 3. Require that the pasted A-span maps to **exactly one** B token. If the
   ///    edit spans multiple B tokens, args-only refolding is not representable
   ///    and the method returns `std::nullopt`.
-  /// 4. Slice the raw pasted token text from A and B, normalize by stripping
-  ///    trailing newlines, and then deterministically segment the B token into
-  ///    per-argument regions.
+  /// 4. Slice the raw pasted token text from A and B and normalize by stripping
+  ///    trailing newlines.
+  /// 5. Deterministically segment the B token into per-argument regions.
   ///
   /// Segmentation is performed by anchoring on the *fixed* (non-span) substrings
   /// between paste spans in the A token. This supports edits that change the
@@ -1079,19 +1084,18 @@ private:
   ///   B token.
   ///
   /// If no argument contributions actually change (i.e., the pasted token text
-  /// is identical), or if multiple spans map to the same `argIdx` (ambiguous
-  /// representation for args-only), this method returns `std::nullopt`.
+  /// is identical), or if multiple spans imply edits for the same `argIdx`
+  /// within one pasted token (ambiguous args-only representation), this method
+  /// returns `std::nullopt`.
   ///
   /// \param m Macro invocation metadata containing paste span information.
   /// \param h Diff hunk in A/B token space being considered for args-only
   ///          refolding.
-  /// \param a2b Token alignment map from A-token indices to B-token indices
-  ///            (-1 for unmapped).
   /// \returns A list of per-argument paste edits, or `std::nullopt` if the edit
   ///          cannot be represented deterministically as args-only.
   std::optional<std::vector<PasteArgEdit>>
   DerivePasteArgEdits(const RefoldModel::MacroInvocation &m,
-                      const diffutils::Hunk &h, ArrayRef<int64_t> a2b) const;
+                      const diffutils::Hunk &h) const;
 
   /// \brief Segments the edited pasted-token spelling (`bTok`) into per-argument
   /// substrings by using the original pasted-token spelling (`aTok`) as an
@@ -1239,23 +1243,27 @@ private:
   /// * The sub-token character slice inside the pasted token via
   ///   `[byteBegin, byteEnd)`.
   ///
-  /// This method groups paste spans by pasted-token occurrence, maps each A
-  /// occurrence to the corresponding B token using `a2b` (with `hintHunk` as a
-  /// fallback), then simulates rewriting the A pasted token by applying
-  /// per-span segment updates derived from invocation argument replacements.
-  /// The simulation must match the edited B pasted token exactly.
+  /// This method groups paste spans by pasted-token occurrence, maps each
+  /// A occurrence to a corresponding single-token envelope in B using
+  /// `MapATokRangeAToBTokenEnvelope`, then simulates rewriting the A pasted
+  /// token by applying per-span segment updates derived from invocation
+  /// argument replacements. The simulation must match the edited B pasted
+  /// token exactly.
   ///
   /// ### Key invariants / constraints
-  /// * Each pasted-token occurrence must map to exactly one token in B.
+  /// * Each pasted-token occurrence must map to exactly one token in A and B.
   /// * Segment rewrites are applied right-to-left by `byteBegin` to keep
   ///   offsets stable.
+  /// * Segment updates are derived deterministically from:
+  ///   `baseInvText` + `invArgRanges` (original arg spelling), the candidate
+  ///   replacement spelling, and the original pasted-token slice (`oldSeg`).
   /// * If any rewritten pasted token does not equal the B token spelling, this
   ///   returns `false` and the caller must fall back to macro realization
   ///   (expansion).
   ///
   /// \param m Macro invocation metadata (must contain `pasteSpans`).
   /// \param baseInvText Invocation spelling text (e.g., "CONCAT(a,b,c)").
-  /// \param invArgRanges Argument content ranges within `baseInvocationText`.
+  /// \param invArgRanges Argument content ranges within `baseInvText`.
   /// \param replByArgIdx Candidate replacements per argument index.
   /// \returns `true` if the replacements reproduce every pasted token
   ///          occurrence in B.
@@ -1312,60 +1320,67 @@ private:
   /// tokens into the TU.
   ///
   /// This method enforces a strict safety contract:
-  /// * The hunk must be fully contained within one or more argument-occurrence
-  ///   spans recorded by the producer for this invocation.
+  /// * The invocation must have a concrete TU byte range (`m.invB`/`m.invE`).
+  /// * The hunk must be fully contained within one or more producer-recorded
+  ///   argument-occurrence spans for this invocation (standard args and
+  ///   stringify args).
   /// * For each touched argument, the derived replacement must be consistent
-  ///   with *all* of its occurrences in `B_PP` (standard, paste, and
-  ///   optionally stringify).
+  ///   with *all* of its occurrences in `B_PP` (standard, paste, and stringify,
+  ///   subject to strict/non-strict policy).
   /// * If any touched occurrence implies conflicting replacements for the same
   ///   `argIdx`, the patch is rejected.
   ///
   /// ### Paste-aware fast path
   /// If the hunk touches any `pasteSpans` occurrence, the edit may be a
   /// sub-token change inside a single pasted token (e.g., `a_b_c -> a_d_c`).
-  /// In that case, the method delegates to `derivePasteArgEdit` and then
-  /// splices the changed segment into the corresponding invocation argument
-  /// via `splicePasteSegmentIntoSpellingArg`. The patch is accepted only if the
-  /// resulting argument replacement passes the full occurrence-consistency check.
+  /// In that case, the method attempts to derive per-arg segment edits and
+  /// splice them into the corresponding invocation arguments via
+  /// `SplicePasteSegmentIntoSpellingArg`.
   ///
-  /// ### Standard path
-  /// Otherwise, the method derives candidate argument replacements by mapping
-  /// each touched argument-occurrence span from A to B (using the alignment
-  /// map `a2b`), slicing the corresponding B tokens, and interpreting the
-  /// slice as either:
+  /// For multi-span paste edits, per-arg paste-span consistency cannot be
+  /// validated in isolation when token lengths may change. Instead, the method
+  /// first validates standard + stringify occurrences for each touched argument
+  /// (ignoring paste spans), then applies a combined safety gate:
+  /// `PasteArgReplacementsMatchAllPasteTokensInB(...)` must reconstruct every
+  /// pasted token occurrence exactly as observed in B.
+  ///
+  /// For single-segment paste edits, the method may validate all occurrences
+  /// (including paste spans) directly via
+  /// `MacroArgReplacementMatchesAllOccurrencesInB(...)`.
+  ///
+  /// If paste derivation fails, the method falls through to the standard
+  /// (non-paste) policy below.
+  ///
+  /// ### Standard (non-paste) path
+  /// The method collects standard arg spans and stringify spans, requires the
+  /// hunk to be covered by those spans, then derives candidate argument
+  /// replacements by mapping each touched occurrence to a B token envelope via
+  /// `MapAToBTokenEnvelopeByPPArgSpan`. It slices the corresponding edited B
+  /// text and interprets it as either:
   /// * Raw token text for standard occurrences, or
   /// * Unstringified argument text for stringify occurrences.
   ///
-  /// ### Stringify handling
-  /// Stringify spans are included in the touched-occurrence set even in
-  /// non-strict mode. In strict mode, stringify occurrences must match the
-  /// quoted form of the derived argument; in non-strict mode, stringify
-  /// occurrences contribute replacements only when they are themselves edited,
-  /// enabling consistent edits to both standard and stringified forms without
-  /// forcing realization.
-  ///
   /// When an argument participates in token pasting, the method may attempt a
-  /// "lift/paste" rewrite: it searches for the original occurrence slice inside
-  /// the invocation argument spelling and replaces just that slice with the
-  /// edited B slice.
+  /// "lift/paste" rewrite: it searches for the A occurrence slice inside the
+  /// base argument spelling and replaces only that slice with the edited B
+  /// slice.
   ///
   /// On success, returns a `MacroPatch` replacing `[m.invB, m.invE)` in the TU
   /// byte stream with a newly constructed invocation string. On failure,
   /// returns `std::nullopt`, signaling that the caller should fall back to
   /// macro realization/expansion.
   ///
-  /// \param m macro invocation metadata (argument spans, stringify spans,
-  ///          paste spans, and TU byte range)
-  /// \param h edit hunk attributed to this macro invocation (A/B token
-  ///          coordinates)
-  /// \param a2b A-token to B-token mapping array (produced by alignment/LCS)
-  /// \param baseInvocationText the original invocation source text to be
-  ///                           rewritten (e.g., `MACRO(...)`)
-  /// \returns a `MacroPatch` for args-only invocation rewriting, or
+  /// \param m Macro invocation metadata (argument spans, stringify spans,
+  ///          paste spans, and TU byte range).
+  /// \param h Edit hunk attributed to this macro invocation (A/B token
+  ///          coordinates).
+  /// \param baseInvocationText The original invocation source text to be
+  ///                           rewritten (e.g., `MACRO(...)`).
+  /// \returns A `MacroPatch` for args-only invocation rewriting, or
   ///          `std::nullopt` if not provably safe.
   std::optional<MacroPatch> BuildMacroInvocationPatchArgsOnly(
       const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h,
-      const ArrayRef<int64_t> a2b, StringRef baseInvocationText) const;
+      StringRef baseInvocationText) const;
 
   /// \brief Slices a source text by token indices using a token-to-byte offset
   /// table.
@@ -1631,8 +1646,6 @@ private:
   /// \param m Metadata for the macro invocation, including callsite byte span
   ///          and A-domain cover.
   /// \param h The diff hunk associated with this macro's region.
-  /// \param a2b Alignment map from A-side PP tokens to B-side PP tokens
-  ///            (\c -1 indicates deletion).
   /// \param baseInvText The original callsite invocation text from the source
   ///                    file.
   /// \param patchMap Previously computed macro patches indexed by owner id then
@@ -1644,7 +1657,7 @@ private:
   ///          B-token envelope).
   std::optional<MacroPatch> BuildMacroInvocationPatchWholeCover(
       const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h,
-      ArrayRef<int64_t> a2b, StringRef baseInvText,
+      StringRef baseInvText,
       const DenseMap<std::optional<uint64_t>, DenseMap<uint64_t, MacroPatch>>
           &patchMap) const;
 
