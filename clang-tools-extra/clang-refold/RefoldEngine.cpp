@@ -876,8 +876,6 @@ RefoldEngine::ClassifyOwnerWithSegments(StringRef tuPath,
         "ENTER classifyOwnerWithSegments tuPath={0} A[{1},{2}) (isEmpty={3})",
         tuPath, a0, a1, a0 == a1);
 
-  const auto &tokmapByPP = model_.GetTokmapByPP();
-
   // Insertion ownership:
   //
   // If the PP gap aligns with a stable TU slot boundary (include boundary or
@@ -887,7 +885,7 @@ RefoldEngine::ClassifyOwnerWithSegments(StringRef tuPath,
   // Otherwise, if both sides of the gap are unambiguously within the same
   // include's PP coverage, treat the insertion as include-owned.
   if (a0 == a1) {
-    if (auto slotAnchor = AnchorToNearestSlotBoundaryFromPPGap(tuPath, a0)) {
+    if (auto slotAnchor = AnchorToExactSlotBoundaryFromPPGap(tuPath, a0)) {
       std::optional<uint64_t> leftInc =
           (a0 > 0) ? model_.InnermostIncludeAtPP(a0 - 1) : std::nullopt;
       const uint64_t maxPP = model_.GetTokensCountA();
@@ -915,7 +913,7 @@ RefoldEngine::ClassifyOwnerWithSegments(StringRef tuPath,
   // insertion cannot be safely anchored in TU), classify purely in PP space.
   if (!span) {
     const bool isInsert = (a0 == a1);
-    const size_t n = tokmapByPP.size();
+    const size_t n = model_.GetTokensCountA();
 
     std::optional<uint64_t> leftInc;
     std::optional<uint64_t> rightInc;
@@ -1134,7 +1132,7 @@ bool RefoldEngine::HunkMapsToTU(uint64_t a0, uint64_t a1,
   // the PP gap is covered by an include expansion, treat it as header-owned.
   uint64_t pp = a0;
 
-  if (auto slotAnchor = AnchorToNearestSlotBoundaryFromPPGap(tuPath, pp)) {
+  if (auto slotAnchor = AnchorToExactSlotBoundaryFromPPGap(tuPath, pp)) {
     trace("hunk",
           "    insertion gap PP={0} mapsToTU via slot boundary TU byte {1}", pp,
           slotAnchor);
@@ -1147,7 +1145,7 @@ bool RefoldEngine::HunkMapsToTU(uint64_t a0, uint64_t a1,
       return false;
     }
 
-    if (pp < tokmapByPP.size()) {
+    if (pp < model_.GetTokensCountA()) {
       auto rightIt = tokmapByPP.find(pp);
       if (rightIt != tokmapByPP.end()) {
         return PathsEqual(tuPath, rightIt->second.file);
@@ -1203,7 +1201,7 @@ bool RefoldEngine::HunkMapsToTU(uint64_t a0, uint64_t a1,
 }
 
 std::optional<uint64_t>
-RefoldEngine::AnchorToNearestSlotBoundaryFromPPGap(StringRef tuPath,
+RefoldEngine::AnchorToExactSlotBoundaryFromPPGap(StringRef tuPath,
                                                    uint64_t ppGap) const {
   // Candidate record for potential anchor points
   struct Cand {
@@ -1266,41 +1264,13 @@ RefoldEngine::AnchorToNearestSlotBoundaryFromPPGap(StringRef tuPath,
     }
   }
 
-  // 2) Include directive boundaries
-  for (const auto &inc : model_.GetIncludes()) {
-    if (!PathsEqual(tuPath, inc.sitePath))
-      continue;
-
-    auto incBeginPP = MinPPBegin(inc.spans);
-    auto incEndPP = MaxPPEnd(inc.spans);
-
-    if (incBeginPP) {
-      if (auto s = model_.GetBeforeIncludeSlot(inc.id))
-        cands.emplace_back(*incBeginPP, adjustSlot(*s), *s);
-    }
-    if (incEndPP) {
-      if (auto s = model_.GetAfterIncludeSlot(inc.id))
-        cands.emplace_back(*incEndPP, adjustSlot(*s), *s);
-    }
-  }
-
-  // 3) Conditional arm boundaries
-  for (const auto &g : model_.GetConds()) {
-    if (!PathsEqual(tuPath, g.file))
-      continue;
-    for (const auto &a : g.arms) {
-      if (!a.span.has_value())
-        continue;
-
-      uint64_t armBeginPP = a.span->begin;
-      uint64_t armEndPP = a.span->end;
-
-      if (auto s = model_.GetArmBeginSlot(a.id))
-        cands.emplace_back(armBeginPP, adjustSlot(*s), *s);
-      if (auto s = model_.GetArmEndSlot(a.id))
-        cands.emplace_back(armEndPP, adjustSlot(*s), *s);
-    }
-  }
+  // ---------------------------------------------------------------------------
+  // NOTE: Slot.pp is now produced by clang for boundary-like slots (includes,
+  // arms, file boundaries). We therefore intentionally do NOT reconstruct PP
+  // coordinates from include/conditional metadata on the consumer side, since
+  // that can diverge from the producer's authoritative view in edge cases
+  // (nested includes, re-entrant conditionals, etc.).
+  // ---------------------------------------------------------------------------
 
   if (cands.empty())
     return std::nullopt;
@@ -1364,7 +1334,7 @@ RefoldEngine::TUByteSpan(uint64_t a0, uint64_t a1, StringRef tuPath) const {
   // For pure insertions, first prefer an explicit slot boundary (file_begin,
   // before_include, after_include, arm_begin, arm_end, file_end, ...).
   if (isEmpty) {
-    if (auto slotAnchor = AnchorToNearestSlotBoundaryFromPPGap(tuPath, a0)) {
+    if (auto slotAnchor = AnchorToExactSlotBoundaryFromPPGap(tuPath, a0)) {
       return {{*slotAnchor, *slotAnchor}};
     }
   }
@@ -1410,7 +1380,7 @@ RefoldEngine::TUByteSpan(uint64_t a0, uint64_t a1, StringRef tuPath) const {
         return std::nullopt;
       }
 
-      if (static_cast<size_t>(pp) < tokmapByPP.size()) {
+      if (pp < model_.GetTokensCountA()) {
         auto rightIt = tokmapByPP.find(pp);
         if (rightIt != tokmapByPP.end()) {
           const auto &right = rightIt->second;

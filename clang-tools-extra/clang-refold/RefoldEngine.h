@@ -615,44 +615,35 @@ private:
   ///                `false` if any mapped token belongs to a non-TU file.
   bool HunkMapsToTU(uint64_t a0, uint64_t a1, StringRef tuPath) const;
 
-  /// \brief Attempts to anchor a *pure insertion* (a PP-gap insertion) to a
-  /// deterministic, canonical TU byte boundary that represents the *same*
-  /// preprocessed coordinate.
+  /// Anchors a *pure insertion* (a PP-gap insertion) to a deterministic,
+  /// canonical TU byte boundary representing the *same* preprocessed coordinate,
+  /// when possible.
   ///
-  /// A PP-gap `ppGap` is a boundary between two adjacent PP tokens (i.e. a
-  /// "gap" index). For an insertion that conceptually occurs at that PP
-  /// boundary, this method tries to return a TU byte offset that is an
-  /// **exact** structural boundary in the TU corresponding to that same PP
-  /// coordinate.
+  /// A PP-gap `ppGap` is a boundary between two adjacent PP tokens (i.e. a "gap"
+  /// index). For an insertion that conceptually occurs at that PP boundary, this
+  /// method returns the TU byte offset of an **exact** structural boundary
+  /// corresponding to that same PP coordinate.
   ///
-  /// **Key property:** this method performs *no* "nearest" snapping. If the
-  /// insertion site does not correspond exactly to a known boundary PP
-  /// coordinate, it returns `std::nullopt` so callers can fall back to
-  /// neighbor-based span anchoring. This avoids regressions where an insertion
-  /// that belongs inside a nested owner (include/arm) is incorrectly pulled out
-  /// to a shallower boundary.
+  /// **Key property:** this method performs *no* "nearest" snapping. If `ppGap`
+  /// does not exactly match a known boundary PP coordinate, it returns `null` so
+  /// callers can fall back to neighbor-based span anchoring. This avoids
+  /// regressions where an insertion belonging inside a nested owner (include/arm)
+  /// is incorrectly pulled out to a shallower boundary.
   ///
-  /// **Boundary sources considered** (each producing a candidate `(pp,b)`
-  /// pair):
-  /// * **(A) Explicit TU slots** with an emitted `pp` coordinate and a
-  ///   conservative "boundary-like" `kind` (file/arm/include boundaries).
-  /// * **(B) Include directive boundaries** whose site is in `tuPath`:
-  ///   begin PP = `min(span.begin)`, end PP = `max(span.end)`; mapped to
-  ///   `before_include`/`after_include` slots.
-  /// * **(C) Conditional arm boundaries** in `tuPath` when `ppSpan` exists:
-  ///   begin PP = `arm.ppSpan.begin`, end PP = `arm.ppSpan.end`; mapped to
-  ///   `arm_begin`/`arm_end` slots.
+  /// **Boundary sources considered** (each producing a candidate `(pp,b)` pair):
+  /// * **Explicit TU slots** with an emitted `pp` coordinate and a conservative
+  ///   "boundary-like" `kind` (file/arm/include boundaries).
   ///
   /// **Directive-line newline adjustment:** some recorded boundary slots may
   /// point at the newline that terminates a preprocessor directive line (e.g.
-  /// after `#include`, `#else`, `#endif`). For *insertions* at those
-  /// boundaries, anchoring at the newline byte can cause directive
-  /// concatenation (e.g. `...;#else`). To preserve directive line integrity,
-  /// candidates for selected `kind`s are adjusted to anchor *after* the newline
-  /// (handling `\n` and `\r\n`).
+  /// after `#include`, `#else`, `#endif`). For *insertions* at those boundaries,
+  /// anchoring at the newline byte can cause directive concatenation (e.g.
+  /// `...;#else`). To preserve directive line integrity, candidates for selected
+  /// `kind`s are adjusted to anchor *after* the newline (handling `\n` and
+  /// `\r\n`).
   ///
   /// **Exact-match requirement:** candidates are filtered to those whose PP
-  /// coordinate equals `ppGap` exactly. If none match, returns `std::nullopt`.
+  /// coordinate equals `ppGap` exactly. If none match, returns `null`.
   ///
   /// **Deterministic tie-breaking:** if multiple candidates share the same PP
   /// coordinate, the chosen candidate is the one with the highest priority by
@@ -660,14 +651,14 @@ private:
   /// ensures stable output across runs.
   ///
   /// \param tuPath the TU path whose slots/owners are being consulted (must
-  ///        match model file keys)
-  /// \param ppGap the PP gap index (between PP tokens) representing the desired
-  ///        insertion coordinate
-  /// \return the TU byte offset of an exact canonical boundary matching
-  ///         `ppGap`, or `std::nullopt` if `ppGap` is not exactly on a known
-  ///         boundary (caller should fall back)
+  ///               match model file keys)
+  /// \param ppGap  the PP gap index (between PP tokens) representing the desired
+  ///               insertion coordinate
+  /// \returns the TU byte offset of an exact canonical boundary matching
+  ///          `ppGap`, or `null` if `ppGap` is not exactly on a known boundary
+  ///          (caller should fall back)
   std::optional<uint64_t>
-  AnchorToNearestSlotBoundaryFromPPGap(StringRef tuPath, uint64_t ppGap) const;
+  AnchorToExactSlotBoundaryFromPPGap(StringRef tuPath, uint64_t ppGap) const;
 
   /// \brief Finds the ID of the narrowest include range that covers a given PP
   /// index.
@@ -698,54 +689,6 @@ private:
     return bestId;
   }
 
-  /// \brief Computes the minimum PPSpan::begin value across a collection of
-  /// preprocessor spans.
-  ///
-  /// This helper is used to summarize a set of PP spans into a single "earliest
-  /// begin" coordinate in PP space. If the input is empty, -1 is returned as
-  /// a sentinel.
-  ///
-  /// \param Spans A list of PP spans.
-  /// \returns The minimum begin value across all spans, or -1 if Spans is
-  /// empty.
-  static std::optional<uint64_t>
-  MinPPBegin(ArrayRef<RefoldModel::PPSpan> spans) {
-    if (spans.empty())
-      return std::nullopt;
-
-    bool hasMin = false;
-    uint64_t min = std::numeric_limits<uint64_t>::max();
-    for (const auto &s : spans) {
-      min = std::min(min, s.begin);
-      hasMin = true;
-    }
-
-    return hasMin ? std::optional<uint64_t>(min) : std::nullopt;
-  }
-
-  /// \brief Computes the maximum PPSpan::end value across a collection of
-  /// preprocessor spans.
-  ///
-  /// This helper is used to summarize a set of PP spans into a single "latest
-  /// end" coordinate in PP space. If the input is empty, -1 is returned as
-  /// a sentinel.
-  ///
-  /// \param Spans A list of PP spans.
-  /// \returns The maximum end value across all spans, or -1 if Spans is empty.
-  static std::optional<uint64_t> MaxPPEnd(ArrayRef<RefoldModel::PPSpan> spans) {
-    if (spans.empty())
-      return std::nullopt;
-
-    bool hasMax = false;
-    uint64_t max = 0;
-    for (const auto &s : spans) {
-      max = std::max(max, s.end);
-      hasMax = true;
-    }
-
-    return hasMax ? std::optional<uint64_t>(max) : std::nullopt;
-  }
-
   /// \brief Computes the TU (translation unit) byte span [b, e) corresponding
   /// to an A-side PP-token interval [a0, a1).
   ///
@@ -771,7 +714,7 @@ private:
   ///    - If \p a0 == \p a1 (pure insertion at a PP gap):
   ///      1. First, attempt to anchor on an *exact* canonical slot boundary
   ///         recorded for the TU at the same PP coordinate via
-  ///         AnchorToNearestSlotBoundaryFromPPGap(). If present, return {b, b}
+  ///         AnchorToExactSlotBoundaryFromPPGap(). If present, return {b, b}
   ///         using that slot's TU byte offset.
   ///      2. If no slot boundary exists at that PP coordinate, inspect the
   ///         nearest mapped neighbors (left of \p a0 and right of \p a0):
