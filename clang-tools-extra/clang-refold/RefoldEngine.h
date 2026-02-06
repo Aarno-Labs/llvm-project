@@ -1309,6 +1309,45 @@ private:
                                                        StringRef oldSeg,
                                                        StringRef newSeg);
 
+  /// \brief Return per-formal argument content ranges for a function-like macro
+  /// invocation.
+  ///
+  /// The returned vector is indexed by **formal parameter index** (not by the
+  /// number of "actual" comma-separated arguments in the invocation text). Each
+  /// entry is a half-open byte range **`[begin, end)`** into `invText` that
+  /// selects the *content* of the corresponding argument (excluding surrounding
+  /// whitespace and outer delimiters as produced by the parser).
+  ///
+  /// ## Preferred source: producer-provided ranges
+  ///
+  /// If the refold-map contains `m.invArgRanges`, those byte ranges are treated
+  /// as authoritative. They are recorded in the **B-domain** (absolute file
+  /// offsets), so they are first validated and rebased relative to `m.invB` to
+  /// produce indices into `invText`.
+  ///
+  /// This path is **required for variadic macros**, because multiple "actual"
+  /// arguments may correspond to a single formal (e.g. `__VA_ARGS__` or a GNU
+  /// named variadic like `args...`). In that case the *last formal* range spans
+  /// the entire variadic tail, including separating commas.
+  ///
+  /// ## Recovery: conservative textual parse
+  ///
+  /// If some producer-provided ranges are missing/invalid, this routine attempts
+  /// to fill them using a conservative parse of the invocation spelling. When
+  /// the parsed arity differs from the formal arity:
+  ///
+  /// * **`actualN == formalN`**: fill missing entries 1:1.
+  /// * **`actualN > formalN`**: treat as variadic and merge the remaining tail
+  ///   into the last formal range.
+  /// * **`actualN < formalN`**: treat trailing formals as empty (e.g. empty
+  ///   `__VA_ARGS__`) by producing an empty range at the close-paren.
+  ///
+  /// Returns `std::nullopt` if the invocation cannot be parsed or if required
+  /// anchoring information (e.g. `m.invB`) is unavailable.
+  static std::optional<std::vector<std::pair<size_t, size_t>>>
+  GetMacroInvocationFormalArgContentRanges(const RefoldModel::MacroInvocation &m,
+                                        StringRef invText);
+
   /// \brief Attempts to build an *args-only* macro invocation patch for a hunk
   /// attributed to a macro invocation.
   ///
@@ -1488,9 +1527,9 @@ private:
   /// \return `true` if the hunk is fully contained within the provided argument
   ///         spans; `false` if any part of the hunk touches non-argument tokens
   ///         or falls outside the known argument regions.
-  static bool HunkFullyWithinArgSpans(const diffutils::Hunk &h,
-                                      ArrayRef<RefoldModel::PPArgSpan> argSpans,
-                                      MutableArrayRef<char> touched);
+  bool HunkFullyWithinArgSpans(const diffutils::Hunk &h,
+                               ArrayRef<RefoldModel::PPArgSpan> argSpans,
+                               MutableArrayRef<char> touched) const;
 
   /// \brief Converts a list of token-based edit hunks into byte-based hunks.
   ///

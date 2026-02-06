@@ -1881,6 +1881,19 @@ void RefoldMapBuilder::writeJSON() {
               JO.attribute("inv_e", *It.InvEnd);
             }
 
+            if (!It.InvArgRanges.empty()) {
+              JO.attributeArray("inv_arg_ranges", [&] {
+                for (const auto &R : It.InvArgRanges) {
+                  JO.object([&] {
+                    JO.attribute("b", R.first ? llvm::json::Value(*R.first)
+                                             : llvm::json::Value(nullptr));
+                    JO.attribute("e", R.second ? llvm::json::Value(*R.second)
+                                              : llvm::json::Value(nullptr));
+                  });
+                }
+              });
+            }
+
             // Derive inv_pp_byte_begin / inv_pp_byte_end from this macro's
             // PP-token envelope.
             //

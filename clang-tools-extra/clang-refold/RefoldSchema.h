@@ -818,6 +818,13 @@ static constexpr const char *RefoldSchema = R"json(
           "type": "integer",
           "minimum": 0,
           "description": "Include item id that opened inv_file (when it's an included header instance)"
+        },
+        "inv_arg_ranges": {
+          "type": "array",
+          "description": "Per-formal-parameter source byte ranges for the macro invocation arguments. Entry i corresponds to formal parameter index i. For variadic macros, the variadic parameter entry spans the entire variadic tail (including commas). Endpoints may be null if the range cannot be recovered.",
+          "items": {
+            "$ref": "#/$defs/OptByteRange"
+          }
         }
       },
       "dependentRequired": {
@@ -1120,6 +1127,41 @@ static constexpr const char *RefoldSchema = R"json(
           "$ref": "#/$defs/FileItem"
         }
       ]
+    },
+    "OptByteRange": {
+      "type": "object",
+      "description": "A byte range where endpoints may be unknown (null).",
+      "additionalProperties": false,
+      "required": [
+        "b",
+        "e"
+      ],
+      "properties": {
+        "b": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Inclusive byte offset from the start of the file, or null if unknown."
+        },
+        "e": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Exclusive byte offset from the start of the file, or null if unknown."
+        }
+      }
     }
   }
 }
