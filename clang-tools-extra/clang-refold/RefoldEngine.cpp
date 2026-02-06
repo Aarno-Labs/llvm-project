@@ -2798,8 +2798,13 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         // conservatively.
         std::string newArg = SplicePasteSegmentIntoSpellingArg(
             baseArgText, pae.oldSeg, pae.newSeg);
-        if (newArg.empty())
-          return std::nullopt;
+        if (newArg.empty()) {
+          // Deleting an entire argument (making it empty) is legal. Accept this only
+          // when the paste-span covered the whole argument spelling.
+          if (!(StringRef(pae.newSeg).trim().empty() &&
+                baseArgText.trim() == StringRef(pae.oldSeg).trim()))
+            return std::nullopt;
+        }
 
         auto existing = replByArgIdx.find(argIdx);
         if (existing != replByArgIdx.end()) {
@@ -2870,8 +2875,13 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       StringRef baseArgText = baseInvText.substr(r.first, r.second - r.first);
       std::string newArg = SplicePasteSegmentIntoSpellingArg(
           baseArgText, pae->oldSeg, pae->newSeg);
-      if (newArg.empty())
-        return std::nullopt;
+      if (newArg.empty()) {
+        // Deleting an entire argument (making it empty) is legal. Accept this only
+        // when the paste-span covered the whole argument spelling.
+        if (!(StringRef(pae->newSeg).trim().empty() &&
+              baseArgText.trim() == StringRef(pae->oldSeg).trim()))
+          return std::nullopt;
+      }
 
       // Safety gate: for single-segment paste edits we can directly validate
       // all occurrences, including paste-span occurrences, against the B
