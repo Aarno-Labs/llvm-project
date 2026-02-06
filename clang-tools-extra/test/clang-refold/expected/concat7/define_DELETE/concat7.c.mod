@@ -6,4 +6,4 @@
 // RUN: %clang-refold-tester concat7 DELETE
 #define CONCAT(X, Y, Z) X##_##Y##_##Z
 int _b_c  = 5;
-int x = _b_c;
+int x = CONCAT(, b, c);
