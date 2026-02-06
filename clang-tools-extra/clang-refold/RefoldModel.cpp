@@ -687,6 +687,34 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
         std::optional<uint64_t> ownerIncludeId =
             asOptUInt64(*obj, "owner_include_id");
 
+        std::vector<MacroInvocation::OptByteRange> invArgRanges;
+        if (auto invArgRangesArr = asOptArray(*obj, "inv_arg_ranges",
+                                              /*canBeNull=*/true)) {
+          for (const auto &elem : **invArgRangesArr) {
+            auto *rObj = elem.getAsObject();
+            if (!rObj) {
+              fatal("model",
+                    "invalid json value type on field 'inv_arg_ranges': expected object value");
+            }
+
+            const json::Value *bVal = rObj->get("b");
+            const json::Value *eVal = rObj->get("e");
+            if (!bVal || !eVal) {
+              fatal("model",
+                    "missing required fields on 'inv_arg_ranges' element: expected {b,e}");
+            }
+
+            std::optional<uint64_t> b;
+            std::optional<uint64_t> e;
+            if (!bVal->getAsNull())
+              b = bVal->getAsUINT64();
+            if (!eVal->getAsNull())
+              e = eVal->getAsUINT64();
+
+            invArgRanges.emplace_back(b, e);
+          }
+        }
+
         std::vector<PPArgSpan> argSpans;
         if (const json::Value *spansVal = obj->get("arg_spans")) {
           auto sp = parseSpans<PPArgSpan>(*spansVal, "macro.arg_spans",
@@ -732,6 +760,7 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
                            /*invPPByteBegin*/ invPPByteBegin,
                            /*invPPByteEnd*/ invPPByteEnd,
                            /*ownerIncludeId*/ ownerIncludeId,
+                           /*invArgRanges*/ std::move(invArgRanges),
                            /*spans*/ std::move(*spans),
                            /*argSpans*/ std::move(argSpans),
                            /*stringifySpans*/ std::move(stringifySpans),

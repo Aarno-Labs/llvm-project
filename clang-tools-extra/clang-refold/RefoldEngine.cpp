@@ -1733,7 +1733,7 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
             } else {
               touches = (h.aStart < s.end && h.aEnd > s.begin);
             }
-            if (touches) {
+            if (touches && h.bStart < h.bEnd) {
               lo = static_cast<size_t>(std::min<uint64_t>(lo, h.bStart));
               hi = static_cast<size_t>(std::max<uint64_t>(hi, h.bEnd));
             }
@@ -1804,7 +1804,13 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
       continue;
 
     auto bEnv = MapAToBTokenEnvelopeByPPArgSpan(s);
-    if (!bEnv || bEnv->second <= bEnv->first)
+    if (!bEnv)
+      return false;
+
+    // If the argument was deleted entirely in B, the mapped envelope may be
+    // empty. Accept this only when the replacement is also empty after
+    // trimming.
+    if (bEnv->second < bEnv->first)
       return false;
 
     // Extend the B-envelope to account for hunks that touch this occurrence.
@@ -1820,7 +1826,7 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
         } else {
           touches = (h.aStart < s.end && h.aEnd > s.begin);
         }
-        if (touches) {
+        if (touches && h.bStart < h.bEnd) {
           lo = static_cast<size_t>(std::min<uint64_t>(lo, h.bStart));
           hi = static_cast<size_t>(std::max<uint64_t>(hi, h.bEnd));
         }
@@ -1831,8 +1837,11 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
     }
 
     StringRef tokText = SliceBSource(bEnv->first, bEnv->second).trim();
-    if (tokText.empty())
+    if (tokText.empty()) {
+      if (argTrim.empty())
+        continue;
       return false;
+    }
 
     bool ok;
     if (pasteConsume == Suffix) {
@@ -2567,6 +2576,153 @@ std::string RefoldEngine::SplicePasteSegmentIntoSpellingArg(StringRef baseArg,
   return "";
 }
 
+std::optional<std::vector<std::pair<size_t, size_t>>>
+RefoldEngine::GetMacroInvocationFormalArgContentRanges(
+    const RefoldModel::MacroInvocation &m, StringRef invText) {
+  // Prefer the producer-provided per-formal invocation-argument ranges when
+  // available. This is required for variadic macros where multiple "actual"
+  // arguments correspond to a single formal (e.g. __VA_ARGS__).
+  if (!m.invArgRanges.empty()) {
+    // The producer-provided ranges are absolute byte offsets in the invocation
+    // file, captured from the *original* invocation spelling. If we've already
+    // applied an earlier args-only patch to this invocation (so invText differs
+    // from m.invText), those absolute endpoints no longer line up. Re-parse
+    // current invocation spelling and then re-map to the producer's formal
+    // arity (including the variadic tail) to keep subsequent hunks stable.
+    if (m.invText && invText != *m.invText) {
+      auto parsedOpt =
+          RefoldEngine::ParseMacroInvocationArgContentRanges(invText);
+      if (!parsedOpt)
+        return std::nullopt;
+
+      const auto &parsed = *parsedOpt;
+      const size_t formalN = m.invArgRanges.size();
+      const size_t actualN = parsed.size();
+
+      // Helper to return a safe "empty" range at the close-paren location.
+      auto emptyAtCloseParen = [&]() -> std::pair<size_t, size_t> {
+        size_t closeIdx = invText.rfind(')');
+        if (closeIdx == StringRef::npos)
+          closeIdx = invText.size();
+        return {closeIdx, closeIdx};
+      };
+
+      if (actualN == formalN)
+        return parsed;
+
+      std::vector<std::pair<size_t, size_t>> out;
+      out.reserve(formalN);
+
+      if (actualN > formalN && formalN > 0) {
+        // Variadic call: map the prefix 1:1, and let the last formal span the
+        // entire remaining "tail" (including commas/whitespace between args).
+        out.insert(out.end(), parsed.begin(), parsed.begin() + (formalN - 1));
+        out.push_back({parsed[formalN - 1].first, parsed.back().second});
+        return out;
+      }
+
+      // actualN < formalN: missing trailing actuals (e.g. empty __VA_ARGS__).
+      out.insert(out.end(), parsed.begin(), parsed.end());
+      for (size_t i = actualN; i < formalN; ++i)
+        out.push_back(emptyAtCloseParen());
+      return out;
+    }
+
+    if (!m.invB)
+      return std::nullopt;
+
+    const uint64_t invB = *m.invB;
+
+    std::vector<std::pair<size_t, size_t>> out;
+    out.reserve(m.invArgRanges.size());
+
+    bool anyInvalid = false;
+    for (const auto &R : m.invArgRanges) {
+      if (!R.first || !R.second) {
+        anyInvalid = true;
+        out.emplace_back(static_cast<size_t>(-1), static_cast<size_t>(-1));
+        continue;
+      }
+
+      if (*R.first < invB || *R.second < *R.first) {
+        anyInvalid = true;
+        out.emplace_back(static_cast<size_t>(-1), static_cast<size_t>(-1));
+        continue;
+      }
+
+      const uint64_t relB64 = *R.first - invB;
+      const uint64_t relE64 = *R.second - invB;
+
+      if (relE64 > invText.size() || relB64 > relE64) {
+        anyInvalid = true;
+        out.emplace_back(static_cast<size_t>(-1), static_cast<size_t>(-1));
+        continue;
+      }
+
+      out.emplace_back(static_cast<size_t>(relB64), static_cast<size_t>(relE64));
+    }
+
+    if (!anyInvalid)
+      return out;
+
+    // Try to fill any invalid entries using a conservative textual parse of the
+    // invocation spelling, preserving the formal-parameter indexing when the
+    // parsed arity differs (variadics / missing variadic tail).
+    auto parsedOpt = RefoldEngine::ParseMacroInvocationArgContentRanges(invText);
+    if (!parsedOpt)
+      return std::nullopt;
+
+    const auto &parsed = *parsedOpt;
+    const size_t formalN = out.size();
+    const size_t actualN = parsed.size();
+
+    // Helper to return a safe "empty" range at the close-paren location.
+    auto emptyAtCloseParen = [&]() -> std::pair<size_t, size_t> {
+      size_t closeIdx = invText.rfind(')');
+      if (closeIdx == StringRef::npos)
+        closeIdx = invText.size();
+      return {closeIdx, closeIdx};
+    };
+
+    if (actualN == formalN) {
+      for (size_t i = 0; i < formalN; ++i) {
+        if (out[i].first == static_cast<size_t>(-1))
+          out[i] = parsed[i];
+      }
+      return out;
+    }
+
+    if (actualN > formalN && formalN > 0) {
+      // Variadic call: map the prefix 1:1, and let the last formal span the
+      // entire remaining "tail" (including commas/whitespace between args).
+      for (size_t i = 0; i + 1 < formalN; ++i) {
+        if (out[i].first == static_cast<size_t>(-1))
+          out[i] = parsed[i];
+      }
+
+      if (out[formalN - 1].first == static_cast<size_t>(-1)) {
+        out[formalN - 1] = {parsed[formalN - 1].first, parsed.back().second};
+      }
+      return out;
+    }
+
+    // actualN < formalN: missing trailing actuals (e.g. empty __VA_ARGS__).
+    for (size_t i = 0; i < std::min(formalN, actualN); ++i) {
+      if (out[i].first == static_cast<size_t>(-1))
+        out[i] = parsed[i];
+    }
+    for (size_t i = actualN; i < formalN; ++i) {
+      if (out[i].first == static_cast<size_t>(-1))
+        out[i] = emptyAtCloseParen();
+    }
+    return out;
+  }
+
+  // Fallback: derive ranges from the invocation spelling. This path assumes a
+  // 1:1 mapping between argument index and "actual" arguments.
+  return RefoldEngine::ParseMacroInvocationArgContentRanges(invText);
+}
+
 std::optional<RefoldEngine::MacroPatch>
 RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h,
@@ -2579,7 +2735,29 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
   // tokenHunks are used by macroArgReplacementMatchesAllOccurrencesInB() to
   // validate cross-occurrence consistency. In this args-only path we only need
   // visibility into the current hunk, so treat it as the only token-level edit.
-  const diffutils::Hunk tokenHunks[] = {h};
+  diffutils::Hunk hArgs = h;
+
+  // Normalize “comma drift” in comma-separated lists (notably for prepending
+  // into variadic tails). Token diff can treat the first separator comma as
+  // inserted and match a later comma, shifting the insertion left. Rotate the
+  // comma back into the match so the insertion is attributed to the next arg.
+  if (hArgs.aStart == hArgs.aEnd && hArgs.bStart < hArgs.bEnd &&
+      hArgs.aStart < aToks_.size() &&
+      hArgs.bStart < bToks_.size() &&
+      hArgs.bEnd < bToks_.size() &&
+      aToks_[static_cast<size_t>(hArgs.aStart)].spelling == "," &&
+      bToks_[static_cast<size_t>(hArgs.bStart)].spelling == "," &&
+      bToks_[static_cast<size_t>(hArgs.bEnd)].spelling == "," &&
+      hArgs.aStart + 1 <= aToks_.size() &&
+      hArgs.bStart + 1 <= bToks_.size() &&
+      hArgs.bEnd + 1 <= bToks_.size()) {
+    ++hArgs.aStart;
+    ++hArgs.aEnd;
+    ++hArgs.bStart;
+    ++hArgs.bEnd;
+  }
+
+  const diffutils::Hunk tokenHunks[] = {hArgs};
 
   trace("macro/args", "args-only? inv id={0} name={1} {2} baseInv={3}", m.id,
         m.name, h, stringutils::showWSWithClip(baseInvText, 200));
@@ -2587,7 +2765,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
   // Parse the byte ranges for each argument's "content" within the invocation
   // spelling. These ranges are later used to splice per-arg replacements back
   // into the invocation text.
-  auto rangesOpt = ParseMacroInvocationArgContentRanges(baseInvText);
+  auto rangesOpt = GetMacroInvocationFormalArgContentRanges(m, baseInvText);
   if (!rangesOpt)
     return std::nullopt;
   const auto &invArgRanges = *rangesOpt;
@@ -2734,7 +2912,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     return std::nullopt;
 
   std::vector<char> touched(occs.size(), 0);
-  if (!HunkFullyWithinArgSpans(h, occs, touched)) {
+  if (!HunkFullyWithinArgSpans(hArgs, occs, touched)) {
     trace("macro/args",
           "  hunk not fully within any arg spans -> fail args-only");
     return std::nullopt;
@@ -2960,30 +3138,82 @@ RefoldEngine::UnstringifyLiteralToArgText(StringRef literalTok) {
 
 bool RefoldEngine::HunkFullyWithinArgSpans(
     const diffutils::Hunk &h, ArrayRef<RefoldModel::PPArgSpan> argSpans,
-    MutableArrayRef<char> touched) {
+    MutableArrayRef<char> touched) const {
   uint64_t a0 = h.aStart;
   uint64_t a1 = h.aEnd;
 
-  // Insertion: attribute it to the arg span whose [begin,end] contains the
-  // insertion point.
+  auto isCommaTok = [&](uint64_t a) -> bool {
+    return a < aToks_.size() &&
+           aToks_[static_cast<size_t>(a)].spelling == ",";
+  };
+
+  // Insertion: attribute it to the arg span that contains the insertion point.
+  // If the insertion lands on a separator comma between two arguments, treat it
+  // as belonging to the *right* argument (so prepending into the next argument
+  // doesn't spuriously touch the previous one). Otherwise, if the insertion is
+  // exactly at an arg-span end (e.g. right before ')'), treat it as belonging to
+  // the *left* argument.
   if (a0 == a1) {
     trace("macro/debug", "Checking insertion at A={0}", a0);
+
+    // Prefer strict half-open containment [begin,end).
     for (size_t i = 0; i < argSpans.size(); ++i) {
       const auto &s = argSpans[i];
-      trace("macro/debug", "  Arg {0} span: [{1}, {2}]", i, s.begin, s.end);
-      if (a0 >= s.begin && a0 <= s.end) {
+      trace("macro/debug", "  Arg {0} span: [{1}, {2})", i, s.begin, s.end);
+      if (a0 >= s.begin && a0 < s.end) {
         touched[i] = 1;
         return true;
       }
     }
+
+    // If the insertion is at a comma token, attribute it to the next arg span
+    // that begins immediately after the comma (or, failing that, the nearest
+    // span to the right).
+    if (isCommaTok(a0)) {
+      for (size_t i = 0; i < argSpans.size(); ++i) {
+        const auto &s = argSpans[i];
+        if (s.begin == a0 + 1) {
+          touched[i] = 1;
+          return true;
+        }
+      }
+      uint64_t bestBegin = UINT64_MAX;
+      size_t bestI = static_cast<size_t>(-1);
+      for (size_t i = 0; i < argSpans.size(); ++i) {
+        const auto &s = argSpans[i];
+        if (s.begin > a0 && s.begin < bestBegin) {
+          bestBegin = s.begin;
+          bestI = i;
+        }
+      }
+      if (bestI != static_cast<size_t>(-1)) {
+        touched[bestI] = 1;
+        return true;
+      }
+    }
+
+    // Otherwise, treat a boundary insertion as belonging to the left argument
+    // whose span ends at the insertion point.
+    for (size_t i = 0; i < argSpans.size(); ++i) {
+      const auto &s = argSpans[i];
+      if (a0 == s.end) {
+        touched[i] = 1;
+        return true;
+      }
+    }
+
     trace("macro/debug", "  FAILED: Point {0} not in any span", a0);
     return false;
   }
 
   // Replacement/deletion: every covered token must fall inside some arg span.
+  // Additionally, allow a separator comma that immediately precedes an arg span
+  // (common when deleting the entire variadic tail, which removes the comma
+  // after the last fixed formal) to be attributed to that right-hand span.
   bool any = false;
   for (uint64_t a = a0; a < a1; ++a) {
     bool inSome = false;
+
     for (size_t i = 0; i < argSpans.size(); ++i) {
       const auto &s = argSpans[i];
       if (a >= s.begin && a < s.end) {
@@ -2993,6 +3223,19 @@ bool RefoldEngine::HunkFullyWithinArgSpans(
         break;
       }
     }
+
+    if (!inSome && isCommaTok(a)) {
+      for (size_t i = 0; i < argSpans.size(); ++i) {
+        const auto &s = argSpans[i];
+        if (s.begin == a + 1) {
+          touched[i] = 1;
+          inSome = true;
+          any = true;
+          break;
+        }
+      }
+    }
+
     if (!inSome)
       return false;
   }

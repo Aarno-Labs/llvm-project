@@ -300,6 +300,8 @@ public:
     std::vector<PPArgSpan> argSpans;
     std::vector<PPArgSpan> stringifySpans;
     std::vector<PPArgSpan> pasteSpans;
+    using OptByteRange = std::pair<std::optional<uint64_t>, std::optional<uint64_t>>;
+    std::vector<OptByteRange> invArgRanges; // per-formal invocation-argument byte ranges
     std::vector<PPSpan> bodySpans;
     std::optional<StringRef> invText;
     std::optional<StringRef> invFile;   // file containing invocation
@@ -316,6 +318,7 @@ public:
                     std::optional<uint64_t> invPPByteBegin,
                     std::optional<uint64_t> invPPByteEnd,
                     std::optional<uint64_t> ownerIncludeId,
+                    std::vector<OptByteRange> invArgRanges,
                     std::vector<PPSpan> spans, std::vector<PPArgSpan> argSpans,
                     std::vector<PPArgSpan> stringifySpans,
                     std::vector<PPArgSpan> pasteSpans,
@@ -323,7 +326,9 @@ public:
         : id(id), subkind(subkind), name(name), spans(std::move(spans)),
           argSpans(std::move(argSpans)),
           stringifySpans(std::move(stringifySpans)),
-          pasteSpans(std::move(pasteSpans)), bodySpans(std::move(bodySpans)),
+          pasteSpans(std::move(pasteSpans)),
+          invArgRanges(std::move(invArgRanges)),
+          bodySpans(std::move(bodySpans)),
           invText(invText), invFile(invFile), invB(invB), invE(invE),
           invPPByteBegin(invPPByteBegin), invPPByteEnd(invPPByteEnd),
           ownerIncludeId(ownerIncludeId) {
