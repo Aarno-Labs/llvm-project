@@ -336,7 +336,16 @@ public:
     }
 
     bool Covers(uint64_t aStart, uint64_t aEnd) const {
-      return cover.Covers(aStart, aEnd);
+      if (!cover.IsValid())
+        return false;
+
+      // For insertions (empty ranges), exclude the macro's boundary. This keeps
+      // boundary edits outside the macro invocation and avoids forcing
+      // expansion when the change can be represented at the call site.
+      if (aStart == aEnd)
+        return cover.begin < aStart && aStart < cover.end;
+
+      return cover.begin <= aStart && aEnd <= cover.end;
     }
   };
 

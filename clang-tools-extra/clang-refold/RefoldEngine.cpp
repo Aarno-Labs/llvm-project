@@ -465,6 +465,31 @@ std::string RefoldEngine::Refold() {
         if (h.bStart < h.bEnd) {
           size_t b0 = bTokOff_[h.bStart], b1 = bTokOff_[h.bEnd];
           repl.assign(bSource_.data() + b0, bSource_.data() + b1);
+
+          // Token envelopes start at the first token, so they exclude any
+          // intra-line whitespace that precedes that token in B. For a pure
+          // insertion at a zero-width TU site, preserve this leading trivia so
+          // edits like appending " + 7" after a macro call don't lose the
+          // space.
+          if (span->first == span->second && h.bStart > 0) {
+            size_t p = b0;
+            while (p > 0) {
+              char c = bSource_[p - 1];
+              if (c == ' ' || c == '\t') {
+                --p;
+                continue;
+              }
+              break;
+            }
+            if (p < b0) {
+              bool hasSpaceLeft =
+                  (span->first > 0 &&
+                   (tuBytes[span->first - 1] == ' ' ||
+                    tuBytes[span->first - 1] == '\t'));
+              if (!hasSpaceLeft)
+                repl.insert(0, std::string(bSource_.data() + p, b0 - p));
+            }
+          }
         }
 
         // Is this span replacing a TU "gap" (bytes that are all whitespace)?
@@ -541,6 +566,33 @@ std::string RefoldEngine::Refold() {
         const size_t b0 = bTokOff_[static_cast<size_t>(h.bStart)];
         const size_t b1 = bTokOff_[static_cast<size_t>(h.bEnd)];
         repl.assign(bSource_.data() + b0, bSource_.data() + b1);
+      }
+
+      // Token envelopes start at the first token, so they exclude any
+      // intra-line whitespace that precedes that token in B. For a pure
+      // insertion (empty TU span), preserve that leading trivia so statement-
+      // local formatting (e.g. "FOO(...) + 7") isn't collapsed to
+      // "FOO(...)+ 7".
+      if (!isDel && span->first == span->second && h.bStart < h.bEnd &&
+          h.bStart > 0) {
+        const size_t bTokStart = static_cast<size_t>(h.bStart);
+        const size_t b0 = bTokOff_[bTokStart];
+        size_t p = b0;
+        while (p > 0) {
+          char c = bSource_[p - 1];
+          if (c == ' ' || c == '\t') {
+            --p;
+            continue;
+          }
+          break;
+        }
+        if (p < b0) {
+          const bool tuHasSpaceLeft =
+              span->first > 0 &&
+              (tuBytes[span->first - 1] == ' ' || tuBytes[span->first - 1] == '\t');
+          if (!tuHasSpaceLeft)
+            repl.insert(0, std::string(bSource_.data() + p, b0 - p));
+        }
       }
 
       // If we are replacing whitespace-only text in the TU, we prefer to
