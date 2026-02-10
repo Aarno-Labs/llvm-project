@@ -151,7 +151,7 @@ public:
       return formatv("[{0},{1})", begin, end).str();
     }
 
-    bool IsValid() const { return begin >= 0 && end >= 0 && end > begin; }
+    bool IsValid() const { return end > begin; }
   };
 
 #if 0

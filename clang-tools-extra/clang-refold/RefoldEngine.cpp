@@ -942,9 +942,8 @@ RefoldEngine::ClassifyOwnerWithSegments(StringRef tuPath,
       std::optional<uint64_t> leftInc =
           (a0 > 0) ? model_.InnermostIncludeAtPP(a0 - 1) : std::nullopt;
       const uint64_t maxPP = model_.GetTokensCountA();
-      std::optional<uint64_t> rightInc = (a0 >= 0 && a0 < maxPP)
-                                             ? model_.InnermostIncludeAtPP(a0)
-                                             : std::nullopt;
+      std::optional<uint64_t> rightInc =
+          a0 < maxPP ? model_.InnermostIncludeAtPP(a0) : std::nullopt;
 
       if (leftInc && rightInc && *leftInc == *rightInc) {
         trace("segments",
