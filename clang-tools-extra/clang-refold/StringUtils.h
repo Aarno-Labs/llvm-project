@@ -483,7 +483,7 @@ rangesToStringWithSlices(StringRef invText,
       sb += ", ";
     const auto &r = ranges[i];
     sb += "[" + std::to_string(r.first) + "," + std::to_string(r.second) + ")";
-    if (!invText.empty() && r.first >= 0 && r.second >= r.first &&
+    if (!invText.empty() && r.second >= r.first &&
         static_cast<size_t>(r.second) <= invText.size()) {
       sb += "='" +
             showWSWithClip(invText.substr(r.first, r.second - r.first), 200) +

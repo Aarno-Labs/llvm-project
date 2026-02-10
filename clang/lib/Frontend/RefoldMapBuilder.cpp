@@ -2393,18 +2393,12 @@ void RefoldMapBuilder::writeJSON() {
           if (!Last || Idx > *Last)
             Last = Idx;
 
-          if (TM.SrcBegin >= 0 && TM.SrcBegin < MinBegin)
+          if (TM.SrcBegin < MinBegin)
             MinBegin = TM.SrcBegin;
 
           // Prefer the earliest token that contains Off; otherwise the
           // earliest token that begins at/after Off.
-          if (TM.SrcBegin >= 0 && TM.SrcEnd >= 0) {
-            if ((TM.SrcBegin <= Off && Off < TM.SrcEnd) ||
-                (TM.SrcBegin >= Off)) {
-              if (!Best || Idx < *Best)
-                Best = Idx;
-            }
-          } else if (TM.SrcBegin >= 0 && TM.SrcBegin >= Off) {
+          if ((TM.SrcBegin <= Off && Off < TM.SrcEnd) || (TM.SrcBegin >= Off)) {
             if (!Best || Idx < *Best)
               Best = Idx;
           }

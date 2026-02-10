@@ -20,8 +20,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "RefoldModel.h"
 #include "RefoldLog.h"
+#include "RefoldModel.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringRef.h"
