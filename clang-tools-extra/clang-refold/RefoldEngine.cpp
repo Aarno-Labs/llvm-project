@@ -2457,6 +2457,43 @@ bool RefoldEngine::PasteArgReplacementsMatchAllPasteTokensInB(
   if (m.pasteSpans.empty())
     return true;
 
+  // Prefer producer-provided argument byte ranges for the raw invocation text,
+  // but fall back to syntactic parsing when those ranges are absent. This is
+  // required for idempotent args-only refolds where the *current* base
+  // invocation already reflects earlier hunks (e.g. "int" -> "float").
+  // In that case we still need a stable "original arg spelling" to recognize
+  // that a paste-segment edit is equivalent to a whole-argument replacement.
+  std::optional<std::vector<std::pair<size_t, size_t>>> parsedOrigArgRanges;
+  if (m.invText)
+    parsedOrigArgRanges = ParseMacroInvocationArgContentRanges(*m.invText);
+
+  auto getOrigArgTrim = [&](uint32_t argIdx) -> StringRef {
+    if (!m.invText)
+      return StringRef();
+
+    StringRef invText = *m.invText;
+
+    // Producer-provided ranges (if present).
+    if (argIdx < m.invArgRanges.size()) {
+      const RefoldModel::MacroInvocation::OptByteRange &r = m.invArgRanges[argIdx];
+      if (r.first && r.second) {
+        uint64_t b = *r.first;
+        uint64_t e = *r.second;
+        if (b <= e && e <= invText.size())
+          return invText.slice(b, e).trim();
+      }
+    }
+
+    // Syntactic fallback (independent of the producer).
+    if (!parsedOrigArgRanges || argIdx >= parsedOrigArgRanges->size())
+      return StringRef();
+    size_t b = (*parsedOrigArgRanges)[argIdx].first;
+    size_t e = (*parsedOrigArgRanges)[argIdx].second;
+    if (b > e || e > invText.size())
+      return StringRef();
+    return invText.slice(b, e).trim();
+  };
+
   // Precompute the original (base) spelling text for each argument we are
   // proposing to replace. We need this to derive a stable mapping from
   // "argument replacement" -> "paste segment update".
@@ -2576,8 +2613,32 @@ bool RefoldEngine::PasteArgReplacementsMatchAllPasteTokensInB(
       // derive a segment safely, fail.
       StringRef newSeg =
           DeriveNewPasteSegmentFromSpellingReplacement(baseArg, newArg, oldSeg);
-      if (newSeg.data() == nullptr) // Check for "null" StringRef
-        return false;
+      if (newSeg.data() == nullptr) { // Check for "null" StringRef
+        // Idempotence: later hunks may be checking a pasted-token that is
+        // already consistent with an earlier spelling edit. In this common
+        // case, the argument text in the current invocation equals the new
+        // argument text, and the original arg text equals the old pasted
+        // segment. When that holds, we can treat the paste segment as the
+        // entire argument.
+        uint32_t argIdx = ps.argIdx;
+        StringRef origTrim = getOrigArgTrim(argIdx);
+        StringRef oldTrim = oldSeg.trim();
+        StringRef newTrim = newArg.trim();
+        StringRef baseTrim = baseArg.trim();
+        if (!origTrim.empty() && origTrim == oldTrim && baseTrim == newTrim) {
+          newSeg = newTrim;
+          trace("macro/paste",
+                " paste newSeg fallback (whole-arg) argIdx={0} oldSeg='{1}' "
+                "newSeg='{2}'",
+                argIdx, oldTrim, newTrim);
+        } else {
+          trace("macro/paste",
+                " paste newSeg derivation FAILED argIdx={0} oldSeg='{1}' "
+                "baseArg='{2}' newArg='{3}'",
+                argIdx, oldTrim, baseTrim, newTrim);
+          return false;
+        }
+      }
 
       // Rewrite only the identified segment region inside the synthetic pasted-
       // token spelling.
@@ -2597,6 +2658,17 @@ std::string RefoldEngine::SplicePasteSegmentIntoSpellingArg(StringRef baseArg,
   StringRef baseTrim = baseArg.trim();
   StringRef oldTrim = oldSeg.trim();
   StringRef newTrim = newSeg.trim();
+
+  // Idempotence: later hunks may refer to the same token-paste occurrence
+  // after we've already applied a previous arg edit (e.g., a standard arg
+  // occurrence). In that case, 'baseTrim' already equals the target segment
+  // and we should treat this splice as a no-op rather than a failure.
+  if (baseTrim == newTrim) {
+    trace("macro/paste",
+          " splice(no-op): baseArg='{0}' oldSeg='{1}' newSeg='{2}'", baseTrim,
+          oldTrim, newTrim);
+    return baseTrim.str();
+  }
 
   if (oldTrim.empty())
     return ""; // Return empty to signal failure/null
