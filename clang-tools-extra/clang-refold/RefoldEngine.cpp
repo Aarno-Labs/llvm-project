@@ -355,6 +355,13 @@ std::string RefoldEngine::Refold() {
               m->invText, m->ownerIncludeId, m->invFile, h);
         auto &byMacroId = macroPatchByOwnerByMacroId[m->ownerIncludeId];
         auto existingIt = byMacroId.find(m->id);
+        const bool hadExistingCallsitePatch =
+            (existingIt != byMacroId.end()) &&
+            InvocationSpanMatchesCallsitePrefix(
+                StringRef(existingIt->second.replacement), *m);
+        const std::string prevCallsiteReplacement =
+            (existingIt != byMacroId.end()) ? existingIt->second.replacement
+                                            : std::string();
 
         // If found, use the existing replacement; otherwise, use the original
         // text.
@@ -365,6 +372,12 @@ std::string RefoldEngine::Refold() {
         auto updated = BuildMacroInvocationPatchWholeCover(
             *m, h, currentInvText, macroPatchByOwnerByMacroId);
         if (updated) {
+          if (hadExistingCallsitePatch) {
+            if (prevCallsiteReplacement == updated->replacement)
+              trace("macro", "callsite patch reused inv id={0}", m->id);
+            else
+              trace("macro", "callsite patch overwritten inv id={0}", m->id);
+          }
           byMacroId[m->id] = std::move(*updated);
         }
         continue;
@@ -3772,15 +3785,48 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
   // Do not downgrade: if we already have a patch for this invocation and it
   // does not look like a callsite invocation anymore (i.e. we already
-  // realized/expanded it), keep it.
+  // realized/expanded it), keep it. If it is still a callsite patch, we may
+  // refine it across additional hunks.
+  const MacroPatch *existingPatch = nullptr;
+  bool existingIsCallsite = false;
   auto ownerIt = patchMap.find(m.ownerIncludeId);
   if (ownerIt != patchMap.end()) {
     auto patchIt = ownerIt->second.find(m.id);
     if (patchIt != ownerIt->second.end()) {
-      if (!InvocationSpanMatchesCallsitePrefix(patchIt->second.replacement, m))
-        return patchIt->second;
+      existingPatch = &patchIt->second;
+      existingIsCallsite =
+          InvocationSpanMatchesCallsitePrefix(existingPatch->replacement, m);
+      if (!existingIsCallsite)
+        return *existingPatch;
     }
   }
+
+  // Trim equal A/B token edges so args-only can run even if the diff hunk spans
+  // unchanged punctuation/whitespace around the actual argument-produced change.
+  auto trimCommonEdgeTokens = [&](diffutils::Hunk hh) {
+    while (hh.aStart < hh.aEnd && hh.bStart < hh.bEnd) {
+      size_t aIdx = static_cast<size_t>(hh.aStart);
+      size_t bIdx = static_cast<size_t>(hh.bStart);
+      if (aIdx >= aToks_.size() || bIdx >= bToks_.size())
+        break;
+      if (aToks_[aIdx].spelling != bToks_[bIdx].spelling)
+        break;
+      ++hh.aStart;
+      ++hh.bStart;
+    }
+    while (hh.aEnd > hh.aStart && hh.bEnd > hh.bStart) {
+      size_t aIdx = static_cast<size_t>(hh.aEnd - 1);
+      size_t bIdx = static_cast<size_t>(hh.bEnd - 1);
+      if (aIdx >= aToks_.size() || bIdx >= bToks_.size())
+        break;
+      if (aToks_[aIdx].spelling != bToks_[bIdx].spelling)
+        break;
+      --hh.aEnd;
+      --hh.bEnd;
+    }
+    return hh;
+  };
+  const diffutils::Hunk hEff = trimCommonEdgeTokens(h);
 
   // 1) Prefer args-only patching when safe and fully validated.
   //    Treat normal arg spans, stringify spans, and paste spans as
@@ -3792,7 +3838,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
   SmallVector<char, 16> argTouched(argLikeSpans.size(), 0);
   if (!argLikeSpans.empty() &&
-      HunkFullyWithinArgSpans(h, argLikeSpans, argTouched)) {
+      HunkFullyWithinArgSpans(hEff, argLikeSpans, argTouched)) {
     // invB/invE are offsets in the invocation file, not in the A-stream source;
     // do not slice aSource here (it can be shorter and/or refer to a different
     // logical file).
@@ -3801,10 +3847,26 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             ? baseInvText
             : (m.invText ? StringRef(*m.invText) : StringRef(""));
     if (InvocationSpanMatchesCallsitePrefix(invSpanText, m)) {
-      auto argsOnly = BuildMacroInvocationPatchArgsOnly(m, h, baseInvText);
+      auto argsOnly = BuildMacroInvocationPatchArgsOnly(m, hEff, baseInvText);
       if (argsOnly)
         return *argsOnly;
+      // If we already have a callsite patch and args-only yields no replacement
+      // for the trimmed hunk, then the edit is already satisfied by the current
+      // callsite text. Do not fall back to whole-cover expansion.
+      if (existingPatch && existingIsCallsite && !baseInvText.empty()) {
+        trace("macro", "callsite patch reused (args-only no-op) inv id={0}",
+              m.id);
+        return *existingPatch;
+      }
     }
+  }
+
+  if (existingPatch && existingIsCallsite && !baseInvText.empty() &&
+      InvocationSpanMatchesCallsitePrefix(baseInvText, m)) {
+    trace("macro",
+          "callsite patch reused (skip whole-cover expansion) inv id={0}",
+          m.id);
+    return *existingPatch;
   }
 
   // 2) Whole-cover fallback: replace invocation with the entire expansion cover

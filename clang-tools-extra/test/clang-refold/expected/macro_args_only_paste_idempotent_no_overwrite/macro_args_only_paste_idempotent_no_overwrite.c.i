@@ -1,0 +1,1 @@
+typedef struct { int *data; size_t size; size_t capacity; } array_int_t; array_int_t* array_int_create(size_t initial_capacity); void array_int_destroy(array_int_t *arr); int array_int_push(array_int_t *arr, int value); int array_int_get(array_int_t *arr, size_t index); size_t array_int_size(array_int_t *arr); void array_int_clear(array_int_t *arr);
