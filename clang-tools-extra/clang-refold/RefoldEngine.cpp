@@ -112,6 +112,32 @@ Error compareTokens(ArrayRef<PPTok> aToks, ArrayRef<PPTok> bToks) {
 
   return Error::success();
 }
+
+uint64_t extendChainedCallEnd(StringRef fileText, uint64_t invEnd,
+                              StringRef replacement) {
+  if (invEnd > fileText.size())
+    return invEnd;
+
+  // If we are replacing with a bare identifier, preserve any following "(...)"
+  // (common for refolding a macro name/function name change).
+  if (stringutils::isIdentifierOnly(replacement))
+    return invEnd;
+
+  size_t pos =
+      stringutils::skipWSAndComments(fileText, static_cast<size_t>(invEnd));
+  if (pos >= fileText.size() || fileText[pos] != '(')
+    return invEnd;
+
+  uint64_t end = invEnd;
+  while (pos < fileText.size() && fileText[pos] == '(') {
+    size_t r = stringutils::findMatchingRParen(fileText, pos);
+    if (r == StringRef::npos)
+      break;
+    end = static_cast<uint64_t>(r + 1);
+    pos = stringutils::skipWSAndComments(fileText, static_cast<size_t>(end));
+  }
+  return end;
+}
 } // namespace
 
 // ========================== Public entry points ==========================
@@ -755,12 +781,20 @@ std::string RefoldEngine::Refold() {
                 return p1.invEnd > p2.invEnd;
               });
 
-    SmallVector<MacroPatch, 16> accepted;
+    SmallVector<std::pair<uint64_t, uint64_t>, 16> accepted;
     for (const auto &mp : tuMacroPatches) {
+      uint64_t mpEnd =
+          extendChainedCallEnd(StringRef(tuBytes), mp.invEnd, mp.replacement);
+      if (mpEnd != mp.invEnd) {
+        debug("macro/chain",
+              "TU extend chained callsite [{0},{1}) -> [{0},{2})", mp.invStart,
+              mp.invEnd, mpEnd);
+      }
+
       bool isShadowed = false;
       for (const auto &acc : accepted) {
         // If this patch is contained within one we already accepted, skip it.
-        if (mp.invStart >= acc.invStart && mp.invEnd <= acc.invEnd) {
+        if (mp.invStart >= acc.first && mpEnd <= acc.second) {
           isShadowed = true;
           break;
         }
@@ -768,24 +802,24 @@ std::string RefoldEngine::Refold() {
         // Partial overlaps should never occur (macro invocation sites are
         // either disjoint or nested). If they do, fail fast rather than
         // producing order-dependent behavior.
-        if (mp.invStart < acc.invEnd && acc.invStart < mp.invEnd) {
+        if (mp.invStart < acc.second && acc.first < mpEnd) {
           fatal("macro/tu",
                 "overlapping TU macro patches: mp=[{0},{1}) acc=[{2},{3})",
-                mp.invStart, mp.invEnd, acc.invStart, acc.invEnd);
+                mp.invStart, mpEnd, acc.first, acc.second);
         }
       }
 
       if (!isShadowed) {
-        accepted.push_back(mp);
+        accepted.push_back({mp.invStart, mpEnd});
         debug("macro/tu", "  TU macro patch accepted inv=[{0},{1}) replLen={2}",
-              mp.invStart, mp.invEnd, mp.replacement.size());
-        ResyncOutcome ro = ApplyResyncOrPend(tuBytes, mp.invStart, mp.invEnd,
+              mp.invStart, mpEnd, mp.replacement.size());
+        ResyncOutcome ro = ApplyResyncOrPend(tuBytes, mp.invStart, mpEnd,
                                              mp.replacement, tuPath);
-        tuEdits.push_back(TextEdit{mp.invStart, mp.invEnd, std::move(ro.text),
+        tuEdits.push_back(TextEdit{mp.invStart, mpEnd, std::move(ro.text),
                                    std::move(ro.pending)});
       } else {
         trace("macro/tu", "  TU macro patch shadowed (skipped) inv=[{0},{1})",
-              mp.invStart, mp.invEnd);
+              mp.invStart, mpEnd);
       }
     }
   }
@@ -4039,11 +4073,18 @@ void RefoldEngine::MaterializeIncludeExpansion(
   if (auto it = macroPatchesByOwner.find(includeId);
       it != macroPatchesByOwner.end()) {
     for (const auto &mp : it->second) {
+      uint64_t mpEnd =
+          extendChainedCallEnd(StringRef(bytes), mp.invEnd, mp.replacement);
+      if (mpEnd != mp.invEnd) {
+        debug("macro/chain",
+              "inc#{0} extend chained callsite [{1},{2}) -> [{1},{3})", inc->id,
+              mp.invStart, mp.invEnd, mpEnd);
+      }
       debug("include/mat", "inc#{0} macroPatch inv=[{1},{2}) replLen={3}",
-            inc->id, mp.invStart, mp.invEnd, mp.replacement.size());
-      ResyncOutcome ro = ApplyResyncOrPend(bytes, mp.invStart, mp.invEnd,
+            inc->id, mp.invStart, mpEnd, mp.replacement.size());
+      ResyncOutcome ro = ApplyResyncOrPend(bytes, mp.invStart, mpEnd,
                                            mp.replacement, headerPath);
-      edits.push_back(TextEdit{mp.invStart, mp.invEnd, std::move(ro.text),
+      edits.push_back(TextEdit{mp.invStart, mpEnd, std::move(ro.text),
                                std::move(ro.pending)});
     }
   }
