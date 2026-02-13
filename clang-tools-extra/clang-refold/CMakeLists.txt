@@ -6,6 +6,7 @@ add_clang_tool(clang-refold
   LineDirectiveInserter.cpp
   RefoldEngine.cpp
   RefoldModel.cpp
+  StringUtils.cpp
 )
 
 target_link_libraries(clang-refold PRIVATE

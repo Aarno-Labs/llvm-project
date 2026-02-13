@@ -92,6 +92,16 @@ inline constexpr bool isIdentPart(char c) noexcept {
 
 // ---------------------- String predicates (ASCII only) ----------------------
 
+// If a macro invocation is immediately followed by one or more parenthesized
+// argument lists in the *source file*, it may be a chain of function-like
+// macros evaluating to another function-like macro (e.g. INC3()()()(10)).
+//
+// In that case, a callsite patch that replaces only the first invocation text
+// (INC3()) would leave a dangling "(…)" suffix, yielding invalid code.
+// When the replacement is not a bare identifier, conservatively consume any
+// immediately following "(...)" groups.
+bool isIdentifierOnly(StringRef s);
+
 inline bool isWhitespace(StringRef s) noexcept {
   return all_of(s, [](char c) { return isWs(c); });
 }
@@ -107,6 +117,10 @@ inline std::optional<size_t> lastNonWsIdx(StringRef s) noexcept {
   size_t idx = s.find_last_not_of(" \t\n\v\f\r");
   return (idx == StringRef::npos) ? std::nullopt : std::make_optional(idx);
 }
+
+size_t skipWSAndComments(StringRef s, size_t i);
+
+size_t findMatchingRParen(StringRef s, size_t lParenIdx);
 
 // -------------------- Diagnostics helpers (pure string) ---------------------
 
@@ -191,29 +205,7 @@ inline std::pair<size_t, size_t> trimWsRange(StringRef s, size_t b, size_t e) {
 ///
 /// \param S The input string.
 /// \returns A StringRef with leading/trailing spaces and tabs removed.
-inline StringRef trimEdgeSpaces(StringRef s) {
-  size_t lo = 0;
-  size_t hi = s.size();
-
-  while (lo < hi) {
-    char c = s[lo];
-    if (c != ' ' && c != '\t')
-      break;
-    ++lo;
-  }
-
-  while (hi > lo) {
-    char c = s[hi - 1];
-    if (c != ' ' && c != '\t')
-      break;
-    --hi;
-  }
-
-  if (lo == 0 && hi == s.size())
-    return s; // no trimming needed; return the original string ref
-
-  return s.substr(lo, hi - lo); // return trimmed portion
-}
+StringRef trimEdgeSpaces(StringRef s);
 
 inline bool isLineSplice(StringRef s, size_t nlIdx) {
   if (nlIdx == 0 || nlIdx > s.size())
@@ -237,46 +229,7 @@ inline bool isIndentOnly(StringRef s, size_t from, size_t to) {
   return s.slice(start, end).find_first_not_of(" \t\r") == StringRef::npos;
 }
 
-inline std::string quoteCString(StringRef s) {
-  std::string res = "\"";
-  for (char c : s) {
-    switch (c) {
-    case '\\':
-      res += "\\\\";
-      break;
-    case '"':
-      res += "\\\"";
-      break;
-    case '\n':
-      res += "\\n";
-      break;
-    case '\r':
-      res += "\\r";
-      break;
-    case '\t':
-      res += "\\t";
-      break;
-    case '\b':
-      res += "\\b";
-      break;
-    case '\f':
-      res += "\\f";
-      break;
-    default:
-      if (static_cast<unsigned char>(c) < 0x20 ||
-          static_cast<unsigned char>(c) == 0x7F) {
-        char buf[10];
-        snprintf(buf, sizeof(buf), "\\x%02X", static_cast<unsigned char>(c));
-        res += buf;
-      } else {
-        res += c;
-      }
-      break;
-    }
-  }
-  res += "\"";
-  return res;
-}
+std::string quoteCString(StringRef s);
 
 /// Replace the substring in \p s spanning [begin, end) with \p repl.
 inline std::string replaceRange(StringRef s, size_t begin, size_t end,
