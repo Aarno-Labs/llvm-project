@@ -118,9 +118,12 @@ uint64_t extendChainedCallEnd(StringRef fileText, uint64_t invEnd,
   if (invEnd > fileText.size())
     return invEnd;
 
-  // If we are replacing with a bare identifier, preserve any following "(...)"
-  // (common for refolding a macro name/function name change).
-  if (stringutils::isIdentifierOnly(replacement))
+  // Preserve chained call parens for replacements that still look callable:
+  //   * IDENT
+  //   * IDENT(...)
+  // In these cases, any trailing "(...)" sequences are likely function-call
+  // suffixes that must remain.
+  if (stringutils::isIdentifierOrSimpleCallExpr(replacement))
     return invEnd;
 
   size_t pos =
@@ -531,6 +534,20 @@ std::string RefoldEngine::Refold() {
           }
         }
 
+        // If our TU span stops at an identifier and is immediately followed by
+        // a "(...)" chain, decide whether to consume it or preserve it based on
+        // the replacement.
+        if (span->first < span->second) {
+          const uint64_t oldEnd = span->second;
+          const uint64_t extEnd = extendChainedCallEnd(tuBytes, oldEnd, repl);
+          if (extEnd != oldEnd) {
+            debug("edit/tu",
+                  "TU extend trailing call/arg chain [{0},{1}) -> [{0},{2})",
+                  span->first, oldEnd, extEnd);
+            span->second = extEnd;
+          }
+        }
+
         // Is this span replacing a TU "gap" (bytes that are all whitespace)?
         std::string original;
         if (span->second > span->first) {
@@ -631,6 +648,20 @@ std::string RefoldEngine::Refold() {
               (tuBytes[span->first - 1] == ' ' || tuBytes[span->first - 1] == '\t');
           if (!tuHasSpaceLeft)
             repl.insert(0, std::string(bSource_.data() + p, b0 - p));
+        }
+      }
+
+      // If our TU span stops at an identifier and is immediately followed by a
+      // "(...)" chain, decide whether to consume it or preserve it based on the
+      // replacement.
+      if (span->first < span->second) {
+        const uint64_t oldEnd = span->second;
+        const uint64_t extEnd = extendChainedCallEnd(tuBytes, oldEnd, repl);
+        if (extEnd != oldEnd) {
+          debug("edit/tu",
+                "TU extend trailing call/arg chain [{0},{1}) -> [{0},{2})",
+                span->first, oldEnd, extEnd);
+          span->second = extEnd;
         }
       }
 

@@ -85,6 +85,35 @@ bool isIdentifierOnly(StringRef s) {
   return true;
 }
 
+bool isIdentifierOrSimpleCallExpr(StringRef replacement) {
+  StringRef s = replacement.trim();
+  if (s.empty())
+    return false;
+
+  if (stringutils::isIdentifierOnly(stringutils::trimEdgeSpaces(s)))
+    return true;
+
+  // Accept the common "IDENT(...)" shape (with balanced parens and only
+  // trailing whitespace).
+  size_t i = 0;
+  if (!stringutils::isIdentStart(s[i]))
+    return false;
+  ++i;
+  while (i < s.size() && stringutils::isIdentPart(s[i]))
+    ++i;
+
+  i = stringutils::skipWSAndComments(s, i);
+  if (i >= s.size() || s[i] != '(')
+    return false;
+
+  size_t rparen = stringutils::findMatchingRParen(s, i);
+  if (rparen == StringRef::npos)
+    return false;
+
+  i = stringutils::skipWSAndComments(s, rparen + 1);
+  return i == s.size();
+}
+
 size_t skipWSAndComments(StringRef s, size_t i) {
   const size_t n = s.size();
   while (i < n) {

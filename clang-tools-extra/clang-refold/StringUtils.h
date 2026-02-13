@@ -102,6 +102,8 @@ inline constexpr bool isIdentPart(char c) noexcept {
 // immediately following "(...)" groups.
 bool isIdentifierOnly(StringRef s);
 
+bool isIdentifierOrSimpleCallExpr(StringRef replacement);
+
 inline bool isWhitespace(StringRef s) noexcept {
   return all_of(s, [](char c) { return isWs(c); });
 }
