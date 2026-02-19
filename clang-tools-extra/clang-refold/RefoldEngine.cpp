@@ -2553,7 +2553,8 @@ bool RefoldEngine::PasteArgReplacementsMatchAllPasteTokensInB(
 
     // Producer-provided ranges (if present).
     if (argIdx < m.invArgRanges.size()) {
-      const RefoldModel::MacroInvocation::OptByteRange &r = m.invArgRanges[argIdx];
+      const RefoldModel::MacroInvocation::OptByteRange &r =
+          m.invArgRanges[argIdx];
       if (r.first && r.second) {
         uint64_t b = *r.first;
         uint64_t e = *r.second;
@@ -3288,7 +3289,8 @@ StringRef RefoldEngine::SliceSource(ArrayRef<size_t> tokOff, StringRef source,
 }
 
 std::optional<std::string>
-RefoldEngine::UnstringifyLiteralToArgText(StringRef literalTok) {
+RefoldEngine::UnstringifyLiteralToArgText(StringRef literalTok,
+                                          bool allowTopLevelComma) {
   StringRef s = literalTok.trim();
   if (s.empty())
     return std::nullopt;
@@ -3334,9 +3336,10 @@ RefoldEngine::UnstringifyLiteralToArgText(StringRef literalTok) {
     out.push_back(c);
   }
 
-  // Safety check: if the unstringified text contains a comma, it would be
-  // interpreted as multiple arguments in a macro invocation.
-  if (out.find(',') != std::string::npos)
+  // Safety check: a top-level comma would be interpreted as multiple arguments
+  // in a macro invocation. Allow callers that are only normalizing for
+  // comparison (not re-synthesizing invocation text) to opt out.
+  if (!allowTopLevelComma && out.find(',') != std::string::npos)
     return std::nullopt;
 
   // Macros cannot have raw newlines in arguments unless escaped/continued
@@ -3425,13 +3428,16 @@ bool RefoldEngine::HunkFullyWithinArgSpans(
   for (uint64_t a = a0; a < a1; ++a) {
     bool inSome = false;
 
+    // Note: multiple arg-like spans may overlap the same token range (e.g.
+    // paste spans that partition a single PP token by byte subranges). In that
+    // case, mark *all* containing spans as touched so later logic can pick the
+    // one(s) that actually changed.
     for (size_t i = 0; i < argSpans.size(); ++i) {
       const auto &s = argSpans[i];
       if (a >= s.begin && a < s.end) {
         touched[i] = 1;
         inSome = true;
         any = true;
-        break;
       }
     }
 
@@ -3842,11 +3848,26 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     StringRef baseInvText,
     const DenseMap<std::optional<uint64_t>, DenseMap<uint64_t, MacroPatch>>
         &patchMap) const {
+  // Strategy (in priority order):
+  //   1) Prefer an args-only rewrite of the invocation spelling when the edit
+  //      is fully contained within argument-like spans.
+  //   2) For function-like macros, attempt conservative DAG-chained args-only
+  //      lifting from a nested callee invocation back to this callsite.
+  //   3) Fall back to whole-cover expansion: replace the invocation with its
+  //      B-side expansion cover.
+
   // The invocation byte span in the owning file must be known.
   const auto invStart = m.invB;
   const auto invEnd = m.invE;
-  if (!invStart || *invEnd < *invStart)
+  if (!invStart || !invEnd || *invEnd < *invStart)
     return std::nullopt;
+
+  trace("macro/whole",
+        "whole-cover build inv id={0} name={1} ownerIncludeId={2} hasOwner={3} "
+        "inv=[{4},{5}) baseInvLen={6} hunk A[{7},{8})->B[{9},{10})",
+        m.id, m.name, m.ownerIncludeId.value_or(0), (bool)m.ownerIncludeId,
+        *invStart, *invEnd, baseInvText.size(), h.aStart, h.aEnd, h.bStart,
+        h.bEnd);
 
   // Do not downgrade: if we already have a patch for this invocation and it
   // does not look like a callsite invocation anymore (i.e. we already
@@ -3867,7 +3888,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   }
 
   // Trim equal A/B token edges so args-only can run even if the diff hunk spans
-  // unchanged punctuation/whitespace around the actual argument-produced change.
+  // unchanged punctuation/whitespace around the actual argument-produced
+  // change.
   auto trimCommonEdgeTokens = [&](diffutils::Hunk hh) {
     while (hh.aStart < hh.aEnd && hh.bStart < hh.bEnd) {
       size_t aIdx = static_cast<size_t>(hh.aStart);
@@ -3924,6 +3946,836 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         return *existingPatch;
       }
     }
+  }
+
+  // 1b) Conservative DAG chaining: if the edited A-span lies within this
+  //     invocation's cover but not within one of its direct argument-like
+  //     spans, attempt to lift the edit from a nested callee invocation back
+  //     to this callsite's arguments.
+  //
+  // Policy:
+  //   * Only lift through single-dependency edges (callee arg depends on
+  //     exactly one caller formal) until the final hop.
+  //   * Allow a multi-parent dependency only at the final hop, and only when
+  //     it depends on exactly two caller formals.
+  //   * Split the replacement text between the two caller formals only when
+  //     it matches the concatenation of the *current* caller argument texts
+  //     (by byte length).
+  if (m.subkind == "func") {
+    auto tryDAGChainedArgsOnly = [&]() -> std::optional<MacroPatch> {
+      // --- Phase 0: Preconditions / root invocation parsing ------------------
+      //
+      // We can only "lift" edits back into the current root invocation (m) if
+      // we can reliably parse *its current spelling* into formal argument byte
+      // ranges. This must be the callsite text (not some expanded body text).
+      StringRef invSpanText =
+          !baseInvText.empty()
+              ? baseInvText
+              : (m.invText ? StringRef(*m.invText) : StringRef(""));
+      if (!InvocationSpanMatchesCallsitePrefix(invSpanText, m))
+        return std::nullopt;
+
+      // Parse the byte ranges of each *formal argument* within invSpanText.
+      // This is the target surface we will rewrite if lifting succeeds.
+      auto invArgRangesOpt =
+          GetMacroInvocationFormalArgContentRanges(m, invSpanText);
+      if (!invArgRangesOpt)
+        return std::nullopt;
+      const auto &invArgRanges = *invArgRangesOpt;
+      const size_t numArgs = invArgRanges.size();
+      if (numArgs == 0)
+        return std::nullopt;
+
+      // --- Phase 1: Build lookup structures for DAG traversal ----------------
+      //
+      // We lift edits along caller/callee edges between MacroInvocation items.
+      // Build a fast lookup map from invocation id -> invocation* so we can
+      // climb parent pointers without repeated O(N) scans.
+      DenseMap<uint64_t, const RefoldModel::MacroInvocation *> invById;
+      invById.reserve(model_.GetMacroInvocations().size());
+      for (const auto &mi : model_.GetMacroInvocations())
+        invById[mi.id] = &mi;
+
+      // Compute the number of hops from candidate invocation "cand" up to the
+      // root invocation "m". Returns:
+      //   * d = 1..N when cand is a descendant of m
+      //   * nullopt when cand is not in m's subtree (or ancestry is broken)
+      auto depthToRoot = [&](const RefoldModel::MacroInvocation &cand)
+          -> std::optional<unsigned> {
+        unsigned d = 0;
+        std::optional<uint64_t> p = cand.callerMacroId;
+        while (p) {
+          ++d;
+          if (*p == m.id)
+            return d;
+          auto it = invById.find(*p);
+          if (it == invById.end())
+            break;
+          p = it->second->callerMacroId;
+        }
+        return std::nullopt;
+      };
+
+      // Collect all "argument-like" spans for an invocation:
+      //   * standard argument spans
+      //   * stringify-derived spans
+      //   * paste sub-spans
+      //
+      // These are the only spans we are willing to treat as "editable
+      // arguments" when detecting a leaf edit.
+      auto gatherArgLike = [&](const RefoldModel::MacroInvocation &mi,
+                               SmallVectorImpl<RefoldModel::PPArgSpan> &out) {
+        out.clear();
+        out.append(mi.argSpans.begin(), mi.argSpans.end());
+        out.append(mi.stringifySpans.begin(), mi.stringifySpans.end());
+        out.append(mi.pasteSpans.begin(), mi.pasteSpans.end());
+      };
+
+      // SpanText is the extracted argument text for a span, plus a reliability
+      // bit. Reliability is important for paste spans when the edited B token
+      // changes length; we may have to fall back to clamped slicing which is
+      // ambiguous.
+      struct SpanText {
+        std::string text;
+        bool reliable; // true iff derived without ambiguous fallback logic
+      };
+
+      // Extract the argument text corresponding to a PPArgSpan, either from A
+      // (fromB=false) or from B (fromB=true).
+      //
+      // Special handling:
+      //   * Paste spans may refer to a token-internal [byteBegin, byteEnd)
+      //   range.
+      //     For B-side paste spans, that range may no longer align if the
+      //     pasted token changed. We attempt to re-derive the segment using
+      //     A-side prefix/suffix preservation; otherwise we clamp and mark
+      //     unreliable.
+      auto extractSpanText = [&](const RefoldModel::PPArgSpan &sp,
+                                 bool fromB) -> std::optional<SpanText> {
+        if (sp.end <= sp.begin)
+          return std::nullopt;
+
+        // --- A-side extraction: exact bytes from the original pp token stream.
+        if (!fromB) {
+          StringRef a = SliceASource(static_cast<size_t>(sp.begin),
+                                     static_cast<size_t>(sp.end));
+          if (sp.kind == PPArgSpanKind::Paste) {
+            // Paste spans can identify a subrange within a single pasted token.
+            if (!sp.byteBegin || !sp.byteEnd)
+              return std::nullopt;
+            if ((sp.end - sp.begin) != 1)
+              return std::nullopt;
+            const uint64_t bb = *sp.byteBegin;
+            const uint64_t be = *sp.byteEnd;
+            if (be < bb || be > static_cast<uint64_t>(a.size()))
+              return std::nullopt;
+            a = a.slice(static_cast<size_t>(bb), static_cast<size_t>(be));
+          }
+          return SpanText{a.trim().str(), /*reliable=*/true};
+        }
+
+        // --- B-side extraction: map the A-span to its B envelope and slice B.
+        auto bEnv = MapAToBTokenEnvelopeByPPArgSpan(sp);
+        if (!bEnv)
+          return std::nullopt;
+        if (bEnv->second <= bEnv->first)
+          return std::nullopt;
+        StringRef b = SliceBSource(bEnv->first, bEnv->second);
+        bool reliable = true;
+
+        if (sp.kind == PPArgSpanKind::Paste) {
+          if (!sp.byteBegin || !sp.byteEnd)
+            return std::nullopt;
+          if ((bEnv->second - bEnv->first) != 1)
+            return std::nullopt;
+          const uint64_t bb = *sp.byteBegin;
+          const uint64_t be = *sp.byteEnd;
+
+          // Token-internal byte ranges are computed from the A-side token
+          // spelling. If the B-side pasted token changes length (e.g.
+          // L\"hello\" -> L\"goodbye\"), using the raw [bb,be) slice can
+          // truncate the changed segment. When possible, re-derive the B-side
+          // segment by preserving the A-side prefix/suffix around the segment.
+          StringRef aTok = SliceASource(static_cast<size_t>(sp.begin),
+                                        static_cast<size_t>(sp.end));
+          if (be < bb || be > static_cast<uint64_t>(aTok.size()))
+            return std::nullopt;
+          StringRef aPref = aTok.take_front(static_cast<size_t>(bb));
+          StringRef aSuff = aTok.drop_front(static_cast<size_t>(be));
+          if (b.starts_with(aPref) && b.ends_with(aSuff) &&
+              b.size() >= aPref.size() + aSuff.size()) {
+            // Best case: we can "peel" the unchanged prefix/suffix and get
+            // the true edited middle segment.
+            b = b.slice(aPref.size(), b.size() - aSuff.size());
+          } else {
+            // Fallback: clamp to the recorded offsets. This may be ambiguous,
+            // so mark unreliable; later we only accept such edits if we can
+            // uniquely split the token at the token level.
+            reliable = false;
+            const uint64_t bbC = std::min<uint64_t>(bb, b.size());
+            const uint64_t beC = std::min<uint64_t>(be, b.size());
+            if (beC < bbC)
+              return std::nullopt;
+            b = b.slice(static_cast<size_t>(bbC), static_cast<size_t>(beC));
+          }
+        }
+        return SpanText{b.trim().str(), reliable};
+      };
+
+      // Normalize text to a canonical "argument text" for comparison/lifting.
+      //
+      // - Stringify spans: compare unescaped payload (so escaping/quoting
+      //   choices don't create spurious diffs).
+      // - Paste spans: usually raw token text; however if a stringify
+      // participates
+      //   in paste (e.g. L## #x), the pasted token includes quotes even though
+      //   the callsite argument does not. Only then do we unstringify.
+      auto normalizeLiftText =
+          [&](const RefoldModel::MacroInvocation *inv,
+              const RefoldModel::PPArgSpan &sp, StringRef raw0,
+              bool allowTopLevelComma) -> std::optional<std::string> {
+        StringRef raw = raw0.trim();
+
+        // For stringify spans, compare against the de-escaped payload so that
+        // quote/escape choices do not create false diffs.
+        if (sp.kind == PPArgSpanKind::Stringify) {
+          auto un = UnstringifyLiteralToArgText(raw, allowTopLevelComma);
+          if (!un)
+            return std::nullopt;
+          return *un;
+        }
+
+        // Paste spans are normally token text (identifiers, numbers, string
+        // literals, etc.). However, when a stringified argument participates in
+        // token pasting (e.g. L## #x), the pasted token will contain quotes
+        // even though the invocation argument does not. Only in that case
+        // should we unstringify.
+        if (sp.kind == PPArgSpanKind::Paste && sp.byteBegin && sp.byteEnd &&
+            raw.find('"') != StringRef::npos) {
+          bool invArgHasQuote = false;
+          if (inv && inv->invText && sp.argIdx < inv->invArgRanges.size()) {
+            const auto &rng = inv->invArgRanges[sp.argIdx];
+            if (rng.first && rng.second && *rng.first <= *rng.second &&
+                *rng.second <= inv->invText->size()) {
+              StringRef invArg =
+                  StringRef(*inv->invText).slice(*rng.first, *rng.second);
+              invArgHasQuote = invArg.find('"') != StringRef::npos;
+            }
+          }
+          if (!invArgHasQuote) {
+            auto un = UnstringifyLiteralToArgText(raw);
+            if (!un)
+              return std::nullopt;
+            return *un;
+          }
+        }
+
+        return raw.str();
+      };
+
+      // --- Phase 2: Find leaf candidates touched by this hunk ----------------
+      //
+      // We search for descendant invocations whose *argument-like spans* are
+      // fully covered by the hunk and exhibit an A->B text difference.
+      //
+      // We prefer deeper leaves (closest to the actual edited text), because
+      // lifting from a deeper leaf tends to be more local and less ambiguous.
+      struct LeafCandidate {
+        const RefoldModel::MacroInvocation *inv;
+        unsigned depth;             // distance from leaf to root (m): 1..N
+        uint64_t smallestSpanBytes; // tie-breaker: prefer more local spans
+        SmallVector<RefoldModel::PPArgSpan, 8> argLike;
+        SmallVector<char, 8> touched;
+      };
+
+      auto spanBytes = [](const RefoldModel::PPArgSpan &s) -> uint64_t {
+        // Prefer spans that are more local in the PP output (smaller ppByte
+        // extent).
+        if (s.ppByteBegin && s.ppByteEnd && *s.ppByteEnd > *s.ppByteBegin)
+          return uint64_t(*s.ppByteEnd - *s.ppByteBegin);
+        // Fall back to token-range width.
+        if (s.end > s.begin)
+          return uint64_t(s.end - s.begin);
+        return ~uint64_t(0);
+      };
+
+      SmallVector<LeafCandidate, 8> leafCands;
+      for (const auto &cand : model_.GetMacroInvocations()) {
+        // Only consider invocations that are descendants of the root m.
+        auto d = depthToRoot(cand);
+        if (!d || *d == 0)
+          continue;
+
+        // Candidate must have argument-like spans; otherwise there's nothing
+        // concrete to map an edit to.
+        SmallVector<RefoldModel::PPArgSpan, 8> candArgLike;
+        gatherArgLike(cand, candArgLike);
+        if (candArgLike.empty())
+          continue;
+
+        // Determine how many formals this invocation "effectively" has, because
+        // spans might reference argIdx beyond invArgRanges size.
+        unsigned candFormalCount = (unsigned)cand.invArgRanges.size();
+        for (const auto &sp : candArgLike)
+          candFormalCount = std::max(candFormalCount, (unsigned)sp.argIdx + 1);
+
+        // Mark which formals are touched by the hunk, and require the hunk to
+        // be fully contained within the union of arg-like spans (conservative).
+        SmallVector<char, 8> candTouched(candFormalCount, 0);
+        if (!HunkFullyWithinArgSpans(h, candArgLike, candTouched))
+          continue;
+
+        bool anyTouched = false;
+        for (char t : candTouched)
+          if (t) {
+            anyTouched = true;
+            break;
+          }
+        if (!anyTouched)
+          continue;
+
+        // Now verify there's an actual A->B difference within at least one
+        // touched arg-like span (otherwise lifting would be a no-op).
+        bool anyDiff = false;
+        uint64_t bestSpan = ~uint64_t(0);
+        for (const auto &sp : candArgLike) {
+          if (sp.argIdx >= candTouched.size() || !candTouched[sp.argIdx])
+            continue;
+          bestSpan = std::min(bestSpan, spanBytes(sp));
+
+          auto aTxt = extractSpanText(sp, /*fromB=*/false);
+          auto bTxt = extractSpanText(sp, /*fromB=*/true);
+          if (!aTxt || !bTxt)
+            continue;
+
+          if (bTxt->reliable) {
+            // Compare normalized old/new argument text. For variadic formals,
+            // allow top-level commas when unstringifying.
+            auto aLift = normalizeLiftText(&cand, sp, aTxt->text,
+                                           /*allowTopLevelComma=*/true);
+            auto bLift = normalizeLiftText(&cand, sp, bTxt->text,
+                                           /*allowTopLevelComma=*/false);
+            if (aLift && bLift && *aLift != *bLift)
+              anyDiff = true;
+          } else if (sp.kind == PPArgSpanKind::Paste && sp.byteBegin &&
+                     sp.byteEnd) {
+            // Paste-subrange extraction may be unreliable after edits (token
+            // has changed). We still treat this as a potential edit; later we
+            // only accept it if token-level splitting is uniquely determined.
+            anyDiff = true;
+          }
+        }
+
+        if (!anyDiff)
+          continue;
+
+        // Candidate leaf accepted: store its arg-like spans and which formals
+        // are touched, plus depth and a locality tie-breaker.
+        leafCands.push_back(LeafCandidate{&cand, *d, bestSpan,
+                                          std::move(candArgLike),
+                                          std::move(candTouched)});
+      }
+
+      // Order leaves from most promising to least:
+      //   (1) deepest first (closest to the actual edit)
+      //   (2) smaller span first (more local pp coverage)
+      llvm::sort(leafCands, [](const LeafCandidate &a, const LeafCandidate &b) {
+        if (a.depth != b.depth)
+          return a.depth > b.depth; // deepest first
+        return a.smallestSpanBytes < b.smallestSpanBytes;
+      });
+
+      // Diagnostic: if DAG chaining is considered, report the number of
+      // leaf candidates that could potentially be lifted back to this root.
+      debug("macro/dag",
+            "DAG args-only: root inv id={0} name={1} leafCandidates={2}", m.id,
+            m.name, leafCands.size());
+
+      // Cache the root invocation's *current* argument texts (trimmed). These
+      // are used for final-hop two-parent splitting and for validation.
+      DenseMap<uint32_t, StringRef> rootArgText;
+      for (uint32_t i = 0; i < numArgs; ++i) {
+        rootArgText[i] =
+            invSpanText.slice(invArgRanges[i].first, invArgRanges[i].second)
+                .trim();
+      }
+
+      // Count substring occurrences. Used to make "split by midBody" robust
+      // when the middle delimiter repeats in the old arguments.
+      auto countSubstr = [](StringRef s, StringRef pat) -> uint64_t {
+        if (pat.empty())
+          return 0;
+        uint64_t cnt = 0;
+        for (size_t pos = 0; (pos = s.find(pat, pos)) != StringRef::npos;
+             pos += pat.size())
+          ++cnt;
+        return cnt;
+      };
+
+      // --- Phase 3: Lift a leaf edit to the root invocation ------------------
+      //
+      // Given a leaf invocation + formal index + (old->new) text at that leaf,
+      // walk up the caller chain using argDeps, translating "which formal is
+      // affected" at each level until we reach the root m.
+      //
+      // Supports:
+      //   * Single-parent dependencies at intermediate hops.
+      //   * Exactly-two-parent dependency at the final hop to the root, where
+      //     we split the new text between two root formals if (and only if)
+      //     the split is uniquely determined.
+      auto liftToRoot = [&](const RefoldModel::MacroInvocation &leaf,
+                            uint32_t leafArgIdx, StringRef leafOld,
+                            StringRef leafNew)
+          -> std::optional<DenseMap<uint32_t, std::string>> {
+        const RefoldModel::MacroInvocation *cur = &leaf;
+        uint32_t curFormal = leafArgIdx;
+        StringRef curOld = leafOld.trim();
+        StringRef curNew = leafNew.trim();
+
+        while (cur->id != m.id) {
+          // Step to parent.
+          if (!cur->callerMacroId)
+            return std::nullopt;
+          auto parentIt = invById.find(*cur->callerMacroId);
+          if (parentIt == invById.end())
+            return std::nullopt;
+          const RefoldModel::MacroInvocation *parent = parentIt->second;
+
+          // Use argDeps to map the current formal to its parent formal(s).
+          if (curFormal >= cur->argDeps.size())
+            return std::nullopt;
+          ArrayRef<uint32_t> deps = cur->argDeps[curFormal];
+          if (deps.empty())
+            return std::nullopt;
+
+          if (deps.size() == 1) {
+            // Simple case: the leaf formal depends on exactly one parent
+            // formal. Keep walking.
+            curFormal = deps[0];
+            cur = parent;
+            continue;
+          }
+
+          if (deps.size() != 2)
+            return std::nullopt;
+
+          // Two-parent splits are only supported on the final hop to the root.
+          if (parent->id != m.id)
+            return std::nullopt;
+
+          uint32_t a = deps[0];
+          uint32_t b = deps[1];
+          auto aIt = rootArgText.find(a);
+          auto bIt = rootArgText.find(b);
+          if (aIt == rootArgText.end() || bIt == rootArgText.end())
+            return std::nullopt;
+
+          // curOld must be exactly oldA + mid + oldB (where mid is the stable
+          // delimiter coming from the macro body / token paste).
+          StringRef oldA = aIt->second;
+          StringRef oldB = bIt->second;
+          if (!curOld.starts_with(oldA) || !curOld.ends_with(oldB))
+            return std::nullopt;
+
+          StringRef mid =
+              curOld.slice(oldA.size(), curOld.size() - oldB.size());
+          if (mid.empty())
+            return std::nullopt;
+
+          // Preserve robustness when mid repeats: we require the new split
+          // to keep at least as many mid occurrences in each side as the old.
+          const uint64_t needA = countSubstr(oldA, mid);
+          const uint64_t needB = countSubstr(oldB, mid);
+
+          // Enumerate all candidate split points in curNew at occurrences of
+          // mid.
+          SmallVector<std::pair<StringRef, StringRef>, 4> splits;
+          for (size_t pos = 0; (pos = curNew.find(mid, pos)) != StringRef::npos;
+               ++pos) {
+            StringRef newA = curNew.slice(0, pos);
+            StringRef newB = curNew.drop_front(pos + mid.size());
+            if (countSubstr(newA, mid) < needA ||
+                countSubstr(newB, mid) < needB)
+              continue;
+            splits.push_back({newA, newB});
+          }
+
+          // Only accept a unique split; otherwise lifting is ambiguous.
+          if (splits.size() != 1)
+            return std::nullopt;
+
+          DenseMap<uint32_t, std::string> out;
+          out[a] = splits[0].first.trim().str();
+          out[b] = splits[0].second.trim().str();
+          return out;
+        }
+
+        // Root reached: lifted edit applies to a single root formal.
+        DenseMap<uint32_t, std::string> out;
+        out[curFormal] = curNew.str();
+        return out;
+      };
+
+      // Small utility structs for accumulating per-formal old/new and then
+      // converting them into root-level byte edits in invSpanText.
+      struct OldNewText {
+        std::string oldText;
+        std::string newText;
+      };
+
+      struct ArgEdit {
+        uint64_t begin;
+        uint64_t end;
+        std::string repl;
+      };
+
+      // --- Phase 4: Try leaves, lift, validate, and ensure uniqueness --------
+      //
+      // We scan leaf candidates (deepest-first) and attempt to produce a root
+      // invocation patch. We accept only if:
+      //   * all lifted edits validate against B (occurrence matching), and
+      //   * the resulting root patch is unique (no second distinct patch).
+      std::optional<MacroPatch> uniquePatch;
+      unsigned leavesExamined = 0;
+      unsigned distinctRootPatches = 0;
+
+      for (const LeafCandidate &cand : leafCands) {
+        ++leavesExamined;
+        const RefoldModel::MacroInvocation &leaf = *cand.inv;
+
+        DenseMap<uint32_t, OldNewText> leafEdits;
+        DenseMap<uint64_t, SmallVector<const RefoldModel::PPArgSpan *, 4>>
+            unreliPaste;
+        bool invalid = false;
+
+        // --- Pass 1: collect reliable per-formal edits -----------------------
+        //
+        // For each touched arg-like span:
+        //   * extract A and B text
+        //   * normalize it (stringify/paste rules)
+        //   * record old/new per formal
+        //
+        // If B extraction for a paste subrange is unreliable, defer it to
+        // pass 2.
+        for (const RefoldModel::PPArgSpan &sp : cand.argLike) {
+          if (sp.argIdx >= cand.touched.size() || !cand.touched[sp.argIdx])
+            continue;
+
+          auto aTxt = extractSpanText(sp, /*fromB=*/false);
+          auto bTxt = extractSpanText(sp, /*fromB=*/true);
+          if (!aTxt || !bTxt)
+            continue;
+
+          if (sp.kind == PPArgSpanKind::Paste && sp.byteBegin && sp.byteEnd &&
+              !bTxt->reliable) {
+            uint64_t key = (uint64_t(sp.begin) << 32) | uint64_t(sp.end);
+            unreliPaste[key].push_back(&sp);
+            continue;
+          }
+
+          if (!bTxt->reliable) {
+            invalid = true;
+            break;
+          }
+
+          auto oldLift = normalizeLiftText(cand.inv, sp, aTxt->text,
+                                           /*allowTopLevelComma=*/true);
+          auto newLift = normalizeLiftText(cand.inv, sp, bTxt->text,
+                                           /*allowTopLevelComma=*/false);
+          if (!oldLift || !newLift) {
+            invalid = true;
+            break;
+          }
+
+          if (*oldLift == *newLift)
+            continue;
+
+          // If multiple spans map to the same formal, they must agree on the
+          // derived new text; otherwise the leaf edit itself is inconsistent.
+          auto it = leafEdits.find(sp.argIdx);
+          if (it != leafEdits.end() && it->second.newText != *newLift) {
+            invalid = true;
+            break;
+          }
+          leafEdits[sp.argIdx] = OldNewText{*oldLift, *newLift};
+        }
+
+        if (invalid)
+          continue;
+
+        // --- Pass 2: resolve unreliable paste subranges ----------------------
+        //
+        // When paste subrange extraction is unreliable on B (token length
+        // changed), try to split the edited token using the unchanged "midBody"
+        // delimiter that lies between the two subranges in the A token. Accept
+        // only if the split is unique.
+        for (auto &kv : unreliPaste) {
+          auto &group = kv.second;
+          if (group.size() != 2) {
+            invalid = true;
+            break;
+          }
+
+          const RefoldModel::PPArgSpan *s0 = group[0];
+          const RefoldModel::PPArgSpan *s1 = group[1];
+          if (!s0->byteBegin || !s0->byteEnd || !s1->byteBegin ||
+              !s1->byteEnd) {
+            invalid = true;
+            break;
+          }
+
+          if (*s1->byteBegin < *s0->byteBegin) {
+            std::swap(s0, s1);
+          }
+
+          // Extract full token texts in A and B for this token envelope.
+          RefoldModel::PPArgSpan whole = *s0;
+          whole.kind = PPArgSpanKind::Standard;
+          whole.argIdx = 0;
+          whole.byteBegin = std::nullopt;
+          whole.byteEnd = std::nullopt;
+
+          auto aTok = extractSpanText(whole, /*fromB=*/false);
+          auto bTok = extractSpanText(whole, /*fromB=*/true);
+          if (!aTok || !bTok || !bTok->reliable) {
+            invalid = true;
+            break;
+          }
+
+          StringRef oldTok = aTok->text;
+          StringRef newTok = bTok->text;
+
+          const uint64_t oldLen = oldTok.size();
+          if (*s0->byteEnd > oldLen || *s1->byteEnd > oldLen ||
+              *s0->byteBegin > *s0->byteEnd || *s1->byteBegin > *s1->byteEnd ||
+              *s0->byteEnd > *s1->byteBegin) {
+            invalid = true;
+            break;
+          }
+
+          // Compute (leading)(seg0)(midBody)(seg1)(trailing) in the old token.
+          StringRef leading = oldTok.take_front(*s0->byteBegin);
+          StringRef midBody = oldTok.slice(*s0->byteEnd, *s1->byteBegin);
+          StringRef trailing = oldTok.drop_front(*s1->byteEnd);
+          if (midBody.empty()) {
+            invalid = true;
+            break;
+          }
+
+          // Require the unchanged outer parts to still match in the new token.
+          if (!newTok.starts_with(leading) || !newTok.ends_with(trailing)) {
+            invalid = true;
+            break;
+          }
+
+          // The "core" is where the edited segments live.
+          StringRef core =
+              newTok.slice(leading.size(), newTok.size() - trailing.size());
+          StringRef oldSeg0 = oldTok.slice(*s0->byteBegin, *s0->byteEnd);
+          StringRef oldSeg1 = oldTok.slice(*s1->byteBegin, *s1->byteEnd);
+
+          // Enforce repeat-safety for midBody splitting.
+          const uint64_t need0 = countSubstr(oldSeg0, midBody);
+          const uint64_t need1 = countSubstr(oldSeg1, midBody);
+
+          // Enumerate possible splits around occurrences of midBody.
+          SmallVector<std::pair<StringRef, StringRef>, 4> splits;
+          for (size_t pos = 0;
+               (pos = core.find(midBody, pos)) != StringRef::npos; ++pos) {
+            StringRef newSeg0 = core.slice(0, pos);
+            StringRef newSeg1 = core.drop_front(pos + midBody.size());
+            if (countSubstr(newSeg0, midBody) < need0 ||
+                countSubstr(newSeg1, midBody) < need1)
+              continue;
+            splits.push_back({newSeg0, newSeg1});
+          }
+
+          // Split must be unique.
+          if (splits.size() != 1) {
+            invalid = true;
+            break;
+          }
+
+          // Normalize the split segments and record them as per-formal edits.
+          auto old0 = normalizeLiftText(&leaf, *s0, oldSeg0,
+                                        /*allowTopLevelComma=*/true);
+          auto neu0 = normalizeLiftText(&leaf, *s0, splits[0].first,
+                                        /*allowTopLevelComma=*/false);
+          auto old1 = normalizeLiftText(&leaf, *s1, oldSeg1,
+                                        /*allowTopLevelComma=*/true);
+          auto neu1 = normalizeLiftText(&leaf, *s1, splits[0].second,
+                                        /*allowTopLevelComma=*/false);
+          if (!old0 || !neu0 || !old1 || !neu1) {
+            invalid = true;
+            break;
+          }
+
+          if (*old0 != *neu0)
+            leafEdits[s0->argIdx] = OldNewText{*old0, *neu0};
+          if (*old1 != *neu1)
+            leafEdits[s1->argIdx] = OldNewText{*old1, *neu1};
+        }
+
+        if (invalid)
+          continue;
+        if (leafEdits.empty())
+          continue;
+
+        // --- Lift leaf edits to root formals ---------------------------------
+        //
+        // Each leaf formal edit is lifted via argDeps. The result is a map:
+        //   rootFormalIdx -> newArgText
+        DenseMap<uint32_t, std::string> rootRepl;
+        for (auto &kv : leafEdits) {
+          auto lifted =
+              liftToRoot(leaf, kv.first, kv.second.oldText, kv.second.newText);
+          if (!lifted) {
+            invalid = true;
+            break;
+          }
+          for (auto &rk : *lifted) {
+            auto it = rootRepl.find(rk.first);
+            if (it != rootRepl.end() && it->second != rk.second) {
+              // Two different lifted paths disagree on the same root formal.
+              invalid = true;
+              break;
+            }
+            rootRepl[rk.first] = rk.second;
+          }
+          if (invalid)
+            break;
+        }
+
+        if (invalid)
+          continue;
+
+        // --- Build and validate root arg edits against B ---------------------
+        //
+        // For each lifted root formal:
+        //   * compute byte [begin,end) in invSpanText
+        //   * require that substituting baseArgText -> newArgText matches all
+        //     occurrences in B (macro policy / determinism gate)
+        SmallVector<diffutils::Hunk, 1> tokenHunksForCheck;
+        tokenHunksForCheck.push_back(h);
+        ArrayRef<diffutils::Hunk> tokenHunksAR(tokenHunksForCheck);
+
+        std::vector<ArgEdit> edits;
+        edits.reserve(rootRepl.size());
+
+        for (auto &kv : rootRepl) {
+          uint32_t argIdx = kv.first;
+          if (argIdx >= invArgRanges.size()) {
+            invalid = true;
+            break;
+          }
+
+          const uint64_t begin = (uint64_t)invArgRanges[argIdx].first;
+          const uint64_t end = (uint64_t)invArgRanges[argIdx].second;
+          if (begin > end || end > invSpanText.size()) {
+            invalid = true;
+            break;
+          }
+
+          StringRef baseArgText =
+              invSpanText.slice((size_t)begin, (size_t)end).trim();
+          StringRef newArgText = StringRef(kv.second).trim();
+
+          if (baseArgText == newArgText)
+            continue;
+
+          // Policy gate: the replacement must be consistent with B everywhere
+          // this argument's expansion occurs (ignoring paste-specific
+          // ambiguity).
+          if (!MacroArgReplacementMatchesAllOccurrencesInBIgnorePaste(
+                  m, argIdx, baseArgText, newArgText, tokenHunksAR)) {
+            invalid = true;
+            break;
+          }
+
+          edits.push_back(ArgEdit{begin, end, newArgText.str()});
+        }
+
+        if (invalid || edits.empty())
+          continue;
+
+        // Apply edits in source order.
+        llvm::sort(edits, [](const ArgEdit &a, const ArgEdit &b) {
+          return a.begin < b.begin;
+        });
+
+        // Reject overlaps/out-of-bounds; otherwise, produce a replacement
+        // invocation text.
+        uint64_t cur = 0;
+        for (const auto &e : edits) {
+          if (e.begin < cur || e.end < e.begin ||
+              e.end > (uint64_t)invSpanText.size()) {
+            invalid = true;
+            break;
+          }
+          cur = e.end;
+        }
+
+        if (invalid)
+          continue;
+
+        // Construct the rewritten invocation spelling by splicing in each new
+        // argument text at its formal range.
+        std::string replText;
+        replText.reserve(invSpanText.size());
+
+        cur = 0;
+        for (const auto &e : edits) {
+          auto mid = invSpanText.slice((size_t)cur, (size_t)e.begin);
+          replText.append(mid.begin(), mid.end());
+          replText.append(e.repl);
+          cur = e.end;
+        }
+        auto tail = invSpanText.drop_front((size_t)cur);
+        replText.append(tail.begin(), tail.end());
+
+        trace("macro/dag",
+              "DAG candidate root patch computed: root inv id={0} leaf inv "
+              "id={1} depth={2} edits={3} replLen={4}",
+              m.id, leaf.id, cand.depth, edits.size(), replText.size());
+
+        // --- Uniqueness enforcement ------------------------------------------
+        //
+        // We accept the first valid root patch; if a second *distinct* root
+        // patch is found, the lift is ambiguous => decline and leave macro
+        // expanded.
+        if (!uniquePatch) {
+          uniquePatch = MacroPatch{*invStart, *invEnd, std::move(replText)};
+          distinctRootPatches = 1;
+        } else if (uniquePatch->invStart != *invStart ||
+                   uniquePatch->invEnd != *invEnd ||
+                   uniquePatch->replacement != replText) {
+          debug("macro/dag",
+                "DAG args-only ambiguous: multiple distinct root patches (root "
+                "inv id={0} name={1} leafCandidates={2} leavesExamined={3} "
+                "distinctRootPatches={4})",
+                m.id, m.name, leafCands.size(), leavesExamined,
+                distinctRootPatches + 1);
+          return std::nullopt;
+        }
+        continue;
+      }
+
+      // Summary diagnostics: how many leaves we considered, how many distinct
+      // root patches survived validation, and whether we produced a unique
+      // patch.
+      debug(
+          "macro/dag",
+          "DAG args-only summary: root inv id={0} name={1} leafCandidates={2} "
+          "leavesExamined={3} distinctRootPatches={4} result={5}",
+          m.id, m.name, leafCands.size(), leavesExamined, distinctRootPatches,
+          uniquePatch.has_value());
+
+      return uniquePatch;
+    };
+
+    // Only if DAG chaining yields a unique, validated patch do we apply it.
+    if (auto dag = tryDAGChainedArgsOnly())
+      return *dag;
   }
 
   if (existingPatch && existingIsCallsite && !baseInvText.empty() &&
