@@ -67,6 +67,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <filesystem>
 #include <limits>
@@ -127,20 +128,71 @@ uint64_t extendChainedCallEnd(StringRef fileText, uint64_t invEnd,
   if (stringutils::isIdentifierOrSimpleCallExpr(replacement))
     return invEnd;
 
+  // Special-case: "curried" macro bodies that begin with a leading paren-arg
+  // head such as:
+  //   (y) ((x) + (y))
+  // When we whole-cover replace a call chain like:
+  //   GET_MATH(ADD)(10)(20)
+  // the first suffix group ("(10)") is part of invoking the macro name
+  // produced by GET_MATH, but the last group ("(20)") is *not* part of the
+  // macro call chain (it applies to the curried expansion result). In this
+  // scenario, we must consume all but the last suffix group.
+  auto looksLikeCurriedHead = [](StringRef repl) -> bool {
+    auto skipWS = [](StringRef s, size_t i) -> size_t {
+      while (i < s.size() && isspace(static_cast<unsigned char>(s[i])))
+        ++i;
+      return i;
+    };
+    auto isIdent = [](StringRef s) -> bool {
+      if (s.empty())
+        return false;
+      const unsigned char c0 = static_cast<unsigned char>(s.front());
+      if (!(isalpha(c0) || s.front() == '_'))
+        return false;
+      for (char c : s.drop_front()) {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        if (!(isalnum(uc) || c == '_'))
+          return false;
+      }
+      return true;
+    };
+
+    size_t p = skipWS(repl, 0);
+    if (p >= repl.size() || repl[p] != '(')
+      return false;
+    const size_t r = stringutils::findMatchingRParen(repl, p);
+    if (r == StringRef::npos)
+      return false;
+    StringRef inside = repl.slice(p + 1, r).trim();
+    if (!isIdent(inside))
+      return false;
+    size_t after = skipWS(repl, r + 1);
+    if (after >= repl.size() || repl[after] != '(')
+      return false;
+    return true;
+  };
+
   size_t pos =
       stringutils::skipWSAndComments(fileText, static_cast<size_t>(invEnd));
   if (pos >= fileText.size() || fileText[pos] != '(')
     return invEnd;
 
-  uint64_t end = invEnd;
+  SmallVector<uint64_t, 4> groupEnds;
   while (pos < fileText.size() && fileText[pos] == '(') {
-    size_t r = stringutils::findMatchingRParen(fileText, pos);
+    const size_t r = stringutils::findMatchingRParen(fileText, pos);
     if (r == StringRef::npos)
       break;
-    end = static_cast<uint64_t>(r + 1);
-    pos = stringutils::skipWSAndComments(fileText, static_cast<size_t>(end));
+    groupEnds.push_back(static_cast<uint64_t>(r + 1));
+    pos = stringutils::skipWSAndComments(fileText, r + 1);
   }
-  return end;
+
+  if (groupEnds.empty())
+    return invEnd;
+
+  size_t consume = groupEnds.size();
+  if (looksLikeCurriedHead(replacement) && consume > 0)
+    consume -= 1;
+  return (consume == 0) ? invEnd : groupEnds[consume - 1];
 }
 } // namespace
 
@@ -3939,6 +3991,15 @@ RefoldEngine::ParseMacroInvocationArgContentRanges(StringRef invText) {
   std::vector<std::pair<size_t, size_t>> out;
   size_t n = invText.size();
 
+  // Special-case: empty argument list "()" (or only whitespace/comments inside)
+  // means *zero* arguments. The previous logic treated this as a single empty
+  // argument, which is incorrect for C/C++ macro calls and breaks args-only
+  // lifting for zero-arg call chains like "PICK1()(10)".
+  const size_t afterOpen = open + 1;
+  const size_t firstTok = stringutils::skipWSAndComments(invText, afterOpen);
+  if (firstTok < n && invText[firstTok] == ')')
+    return out;
+
   uint32_t depth = 0; // Track nested parentheses, brackets, or braces.
   bool inS = false;   // Inside a single-quoted character literal.
   bool inD = false;   // Inside a double-quoted string literal.
@@ -4917,6 +4978,129 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         if (leafEdits.empty())
           continue;
 
+        // --- Special-case: chained call suffix arguments --------------------
+        //
+        // If the root invocation expands to an identifier that is immediately
+        // called (e.g. PICK1()(10)), the callee's arguments are spelled in the
+        // source as a chained call suffix following the root invocation. In
+        // this situation, the leaf edit cannot be lifted to the root via
+        // argDeps because the root has no formal parameters. Preserve the call
+        // chain by patching the chained suffix argument ranges directly in the
+        // invocation file text.
+        if (numArgs == 0 && leaf.callerMacroId && *leaf.callerMacroId == m.id &&
+            m.invFile && leaf.invFile && *leaf.invFile == *m.invFile) {
+          const std::string absPath = lineDirs_.ToAbsolutePath(*m.invFile);
+          auto bufOrErr = llvm::MemoryBuffer::getFile(absPath);
+          if (bufOrErr) {
+            StringRef fileText = bufOrErr.get()->getBuffer();
+
+            // Compute the chained call end in the same way as the application
+            // phase: consume any trailing "(...)" groups after the root
+            // invocation.
+            const uint64_t chainEnd =
+                extendChainedCallEnd(fileText, *invEnd, "((x)+1)");
+            if (chainEnd > *invEnd && chainEnd <= (uint64_t)fileText.size()) {
+              struct LocalEdit {
+                uint64_t begin; // relative to invStart
+                uint64_t end;   // relative to invStart
+                std::string repl;
+              };
+
+              SmallVector<LocalEdit, 4> localEdits;
+              bool ok = true;
+
+              for (auto &kv : leafEdits) {
+                const uint32_t argIdx = kv.first;
+                if (argIdx >= leaf.invArgRanges.size()) {
+                  ok = false;
+                  break;
+                }
+
+                const auto &rng = leaf.invArgRanges[argIdx];
+                if (!rng.first || !rng.second) {
+                  ok = false;
+                  break;
+                }
+
+                const uint64_t bAbs = *rng.first;
+                const uint64_t eAbs = *rng.second;
+                if (bAbs > eAbs || eAbs > (uint64_t)fileText.size() ||
+                    bAbs < *invStart || eAbs > chainEnd) {
+                  ok = false;
+                  break;
+                }
+
+                // Ensure the "old" text actually matches the invocation file at
+                // the recorded byte range, so we don't patch unrelated text.
+                StringRef oldInFile =
+                    fileText.slice((size_t)bAbs, (size_t)eAbs).trim();
+                if (oldInFile != StringRef(kv.second.oldText).trim()) {
+                  ok = false;
+                  break;
+                }
+
+                localEdits.push_back(LocalEdit{
+                    bAbs - *invStart,
+                    eAbs - *invStart,
+                    StringRef(kv.second.newText).trim().str(),
+                });
+              }
+
+              if (ok && !localEdits.empty()) {
+                llvm::sort(localEdits,
+                           [](const LocalEdit &a, const LocalEdit &b) {
+                             return a.begin < b.begin;
+                           });
+
+                uint64_t curB = 0;
+                for (const auto &e : localEdits) {
+                  if (e.begin < curB || e.end < e.begin) {
+                    ok = false;
+                    break;
+                  }
+                  curB = e.end;
+                }
+              }
+
+              if (ok && !localEdits.empty()) {
+                std::string replText =
+                    fileText.slice((size_t)*invStart, (size_t)chainEnd).str();
+
+                // Apply edits back-to-front to keep byte indices stable.
+                for (auto it = localEdits.rbegin(); it != localEdits.rend();
+                     ++it) {
+                  replText.replace((size_t)it->begin,
+                                   (size_t)(it->end - it->begin), it->repl);
+                }
+
+                trace("macro/dag",
+                      "DAG chained-call suffix patch: root id={0} leaf id={1} "
+                      "inv=[{2},{3}) chainEnd={4} edits={5} replLen={6}",
+                      m.id, leaf.id, *invStart, *invEnd, chainEnd,
+                      localEdits.size(), replText.size());
+
+                MacroPatch candPatch{*invStart, chainEnd, replText};
+
+                if (!uniquePatch) {
+                  uniquePatch = std::move(candPatch);
+                  distinctRootPatches = 1;
+                } else if (uniquePatch->invStart != candPatch.invStart ||
+                           uniquePatch->invEnd != candPatch.invEnd ||
+                           uniquePatch->replacement != candPatch.replacement) {
+                  debug("macro/dag",
+                        "DAG args-only ambiguous: multiple distinct root "
+                        "patches (root inv id={0} name={1} leafCandidates={2} "
+                        "leavesExamined={3} distinctRootPatches={4})",
+                        m.id, m.name, leafCands.size(), leavesExamined,
+                        distinctRootPatches + 1);
+                  return std::nullopt;
+                }
+                continue;
+              }
+            }
+          }
+        }
+
         // --- Lift leaf edits to root formals ---------------------------------
         //
         // Each leaf formal edit is lifted via argDeps. The result is a map:
@@ -5068,6 +5252,100 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
       return uniquePatch;
     };
+
+    // Call-chain suffix patch: if this hunk's A-side PP tokens map to source bytes
+    // in the chained-call suffix immediately following this invocation (e.g.
+    // currying-style chains like GET_MATH(ADD)(10)(20)), patch those bytes
+    // directly. This preserves the call chain and avoids whole-cover expansion.
+    if (m.invFile && m.invB && m.invE) {
+      std::string invAbs = lineDirs_.ToAbsolutePath(*m.invFile);
+      auto bufOrErr = MemoryBuffer::getFile(invAbs);
+      if (bufOrErr) {
+        std::unique_ptr<MemoryBuffer> buf = std::move(*bufOrErr);
+        StringRef invFileText = buf->getBuffer();
+        const uint64_t n = invFileText.size();
+        const uint64_t invEndAbs = *m.invE;
+        if (invEndAbs <= n) {
+          const uint64_t chainEndAbs =
+              extendChainedCallEnd(invFileText, invEndAbs, StringRef());
+          if (chainEndAbs > invEndAbs) {
+            const uint64_t aLen = h.aEnd - h.aStart;
+            const uint64_t bLen = h.bEnd - h.bStart;
+            if (aLen == bLen && aLen > 0) {
+              struct TokEdit {
+                uint64_t bAbs;
+                uint64_t eAbs;
+                std::string repl;
+              };
+              SmallVector<TokEdit, 8> tokEdits;
+              tokEdits.reserve(aLen);
+              uint64_t minB = std::numeric_limits<uint64_t>::max();
+              uint64_t maxE = 0;
+              bool ok = true;
+
+              const auto &tokmapByPP = model_.GetTokmapByPP();
+              for (uint64_t i = 0; i < aLen; ++i) {
+                const uint64_t ppIdx = h.aStart + i;
+                const uint64_t bTok = h.bStart + i;
+                auto it = tokmapByPP.find(ppIdx);
+                if (it == tokmapByPP.end()) {
+                  ok = false;
+                  break;
+                }
+                const RefoldModel::TokMapEntry &tm = it->second;
+                if (lineDirs_.ToAbsolutePath(tm.file) != invAbs) {
+                  ok = false;
+                  break;
+                }
+                if (tm.b < invEndAbs || tm.e > chainEndAbs) {
+                  ok = false;
+                  break;
+                }
+                if (tm.b > tm.e || tm.e > n) {
+                  ok = false;
+                  break;
+                }
+                StringRef repl = SliceBSource(bTok, bTok + 1);
+                tokEdits.push_back(TokEdit{tm.b, tm.e, repl.str()});
+                minB = std::min(minB, tm.b);
+                maxE = std::max(maxE, tm.e);
+              }
+
+              if (ok && minB < maxE && maxE <= n) {
+                std::string covered = invFileText.slice(minB, maxE).str();
+
+                SmallVector<TextEdit, 8> edits;
+                edits.reserve(tokEdits.size());
+                for (const auto &te : tokEdits)
+                  edits.push_back(TextEdit{te.bAbs - minB, te.eAbs - minB,
+                                           te.repl, std::nullopt});
+                llvm::sort(edits, [](const TextEdit &a, const TextEdit &b) {
+                  return a.start < b.start;
+                });
+
+                // Apply edits (no line-directive resync needed inside this local slice).
+                std::string out;
+                out.reserve(covered.size());
+                uint64_t cur = 0;
+                for (const TextEdit &e : edits) {
+                  if (e.start < cur || e.end > covered.size()) {
+                    ok = false;
+                    break;
+                  }
+                  out.append(covered, cur, e.start - cur);
+                  out.append(e.text);
+                  cur = e.end;
+                }
+                if (ok) {
+                  out.append(covered, cur, covered.size() - cur);
+                  return MacroPatch{minB, maxE, std::move(out)};
+                }
+              }
+            }
+          }
+        }
+      }
+    }
 
     // Only if DAG chaining yields a unique, validated patch do we apply it.
     auto dag = tryDAGChainedArgsOnly();
