@@ -7,7 +7,7 @@
 #define DEC(x) ((x)-1)
 
 int main(void) {
-  int a = ((11)+1); // INC(10)
+  int a = PICK1()(11); // INC(10)
   int b = PICK2()(10); // DEC(10)
   return (a == 12  && b == 9) ? 0 : 1;
 }
