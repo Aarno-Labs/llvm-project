@@ -687,6 +687,32 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
         std::optional<uint64_t> ownerIncludeId =
             asOptUInt64(*obj, "owner_include_id");
 
+        std::vector<MacroDefParam> defParams;
+        if (auto ParamsArr = asOptArray(*obj, "def_params", /*allowNull=*/true)) {
+          for (const json::Value &Elem : **ParamsArr) {
+            auto ObjOrErr = asObject(Elem, ctxItem + ": def_params[]");
+            if (!ObjOrErr)
+              fatal("model", "{0}: def_params element is not an object", ctxItem);
+            const json::Object &ParamObj = **ObjOrErr;
+
+            const json::Value *NameVal = ParamObj.get("name");
+            if (!NameVal)
+              fatal("model", "{0}: def_params element missing name", ctxItem);
+            auto NameOrErr = asString(*NameVal, ctxItem + ": def_params.name");
+            if (!NameOrErr)
+              fatal("model", "{0}: def_params.name is not a string", ctxItem);
+
+            const json::Value *VarVal = ParamObj.get("variadic");
+            if (!VarVal)
+              fatal("model", "{0}: def_params element missing variadic", ctxItem);
+            auto VarOrErr = asBool(*VarVal, ctxItem + ": def_params.variadic");
+            if (!VarOrErr)
+              fatal("model", "{0}: def_params.variadic is not a bool", ctxItem);
+
+            defParams.emplace_back(*NameOrErr, *VarOrErr);
+          }
+        }
+
         std::vector<MacroInvocation::OptByteRange> invArgRanges;
         if (auto invArgRangesArr = asOptArray(*obj, "inv_arg_ranges",
                                               /*canBeNull=*/true)) {
@@ -841,6 +867,7 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
                            /*invPPByteBegin*/ invPPByteBegin,
                            /*invPPByteEnd*/ invPPByteEnd,
                            /*ownerIncludeId*/ ownerIncludeId,
+                           /*defParams*/ std::move(defParams),
                            /*invArgRanges*/ std::move(invArgRanges),
                            /*spans*/ std::move(*spans),
                            /*argSpans*/ std::move(argSpans),

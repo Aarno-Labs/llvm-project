@@ -56,6 +56,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Error.h"
@@ -383,7 +384,19 @@ std::string RefoldEngine::Refold() {
               "#{0} -> MACRO invText={1} owner={2} invFile={3} {4})", i,
               m->invText, m->ownerIncludeId, m->invFile, h);
         auto &byMacroId = macroPatchByOwnerByMacroId[m->ownerIncludeId];
-        auto existingIt = byMacroId.find(m->id);
+
+        // FIX A: Coalesce callsite patches by physical callsite span
+        // (inv_file/inv_b/inv_e), not by macro invocation item id.
+        std::optional<uint64_t> existingKey;
+        for (const auto &kv : byMacroId) {
+          const MacroPatch &p = kv.second;
+          if (p.invStart == *m->invB && p.invEnd == *m->invE) {
+            existingKey = kv.first;
+            break;
+          }
+        }
+        const uint64_t patchKey = existingKey.value_or(m->id);
+        auto existingIt = byMacroId.find(patchKey);
         const bool hadExistingCallsitePatch =
             (existingIt != byMacroId.end()) &&
             InvocationSpanMatchesCallsitePrefix(
@@ -407,7 +420,7 @@ std::string RefoldEngine::Refold() {
             else
               trace("macro", "callsite patch overwritten inv id={0}", m->id);
           }
-          byMacroId[m->id] = std::move(*updated);
+          byMacroId[patchKey] = std::move(*updated);
         }
         continue;
       }
@@ -1174,6 +1187,17 @@ bool RefoldEngine::IsInvocationInsideDefineDirective(
   if (!m.invFile || !m.invB || !m.invE)
     return false;
 
+  // NOTE: MacroDirective.siteB/siteE typically covers only the first physical
+  // line of the #define directive. For multi-line macro definitions ("\\\n"
+  // line splices), invocations spelled in the macro body may appear after
+  // siteE. We therefore compute the actual directive extent by scanning the
+  // source text until we reach a newline that is NOT line-spliced.
+
+  // Cache file text by absolute path to avoid repeated disk reads.
+  static llvm::StringMap<std::string> fileTextCache;
+  // Cache computed end offsets per directive id.
+  static llvm::DenseMap<uint64_t, uint64_t> defineEndCache;
+
   // RefoldModel exposes directives; MacroDirective.subkind is expected to be
   // "define" based on your schema usage elsewhere.
   for (const auto &d : model_.GetMacroDirectives()) {
@@ -1184,9 +1208,54 @@ bool RefoldEngine::IsInvocationInsideDefineDirective(
     if (!m.invFile || !PathsEqual(*m.invFile, d.sitePath))
       continue;
 
-    // If the invocation byte range lies within the #define's site range, treat
-    // it as non-patchable.
-    if (*m.invB >= d.siteB && *m.invE <= d.siteE)
+    // Compute (or fetch) the true end of the #define directive in the same
+    // source file, including any "\\\n" line-spliced continuation lines.
+    uint64_t defineEnd = d.siteE;
+    auto itEnd = defineEndCache.find(d.id);
+    if (itEnd != defineEndCache.end()) {
+      defineEnd = itEnd->second;
+    } else {
+      // Load file bytes.
+      std::string absPath = lineDirs_.ToAbsolutePath(d.sitePath);
+      auto itTxt = fileTextCache.find(absPath);
+      if (itTxt == fileTextCache.end()) {
+        auto bufOrErr = llvm::MemoryBuffer::getFile(absPath);
+        if (!bufOrErr) {
+          // Best-effort: fall back to the producer-provided site range.
+          defineEndCache[d.id] = d.siteE;
+          defineEnd = d.siteE;
+        } else {
+          fileTextCache[absPath] = (**bufOrErr).getBuffer().str();
+          itTxt = fileTextCache.find(absPath);
+        }
+      }
+
+      if (itTxt != fileTextCache.end()) {
+        StringRef bytes(itTxt->second);
+        uint64_t i = d.siteB;
+        if (i > bytes.size())
+          i = bytes.size();
+
+        while (i < bytes.size()) {
+          size_t nl = bytes.find('\n', static_cast<size_t>(i));
+          if (nl == StringRef::npos) {
+            i = bytes.size();
+            break;
+          }
+          // Advance past the newline.
+          i = static_cast<uint64_t>(nl + 1);
+          if (!stringutils::isLineSplice(bytes, nl))
+            break;
+        }
+
+        defineEnd = i;
+        defineEndCache[d.id] = defineEnd;
+      }
+    }
+
+    // If the invocation byte range lies within the #define directive extent,
+    // treat it as non-patchable.
+    if (*m.invB >= d.siteB && *m.invE <= defineEnd)
       return true;
   }
 
@@ -1199,26 +1268,57 @@ RefoldEngine::SmallestCoveringPatchableMacro(uint64_t aStart,
   const RefoldModel::MacroInvocation *best = nullptr;
   uint64_t bestLen = std::numeric_limits<uint64_t>::max();
 
+  trace("macro/select",
+        "select smallest covering patchable macro for A=[{0},{1})", aStart, aEnd);
+
   for (const auto &m : model_.GetMacroInvocations()) {
     // Check if this macro covers the token range [aStart, aEnd)
     if (!m.Covers(aStart, aEnd))
       continue;
 
+    uint64_t len = m.cover.end - m.cover.begin;
+
     // Must be patchable at a real call site.
-    if (!m.invB || !m.invE || !m.invText)
+    if (!m.invB || !m.invE || !m.invText) {
+      trace("macro/select",
+            "skip macro id={0} name='{1}' covers A=[{2},{3}) coverLen={4}: "
+            "missing invocation span/text",
+            m.id, m.name, m.cover.begin, m.cover.end, len);
       continue;
+    }
 
     // CRITICAL: never patch invocations that are spelled inside a #define
     // directive.
-    if (IsInvocationInsideDefineDirective(m))
+    if (IsInvocationInsideDefineDirective(m)) {
+      trace("macro/select",
+            "skip macro id={0} name='{1}' covers A=[{2},{3}) coverLen={4}: "
+            "invocation spelled inside #define (invFile='{5}' inv=[{6},{7}))",
+            m.id, m.name, m.cover.begin, m.cover.end, len,
+            (m.invFile ? StringRef(*m.invFile) : StringRef("")),
+            *m.invB, *m.invE);
       continue;
+    }
+
+    trace("macro/select",
+          "candidate macro id={0} name='{1}' coverLen={2} invFile='{3}' inv=[{4},{5})",
+          m.id, m.name, len, (m.invFile ? StringRef(*m.invFile) : StringRef("")),
+          *m.invB, *m.invE);
 
     // Deterministic selection: smallest cover wins, ties broken by ID.
-    uint64_t len = m.cover.end - m.cover.begin;
     if (!best || len < bestLen || (len == bestLen && m.id < best->id)) {
       best = &m;
       bestLen = len;
     }
+  }
+
+  if (best) {
+    trace("macro/select",
+          "selected macro id={0} name='{1}' coverLen={2} invFile='{3}' inv=[{4},{5})",
+          best->id, best->name, bestLen,
+          (best->invFile ? StringRef(*best->invFile) : StringRef("")),
+          *best->invB, *best->invE);
+  } else {
+    trace("macro/select", "selected macro: <none>");
   }
 
   return best;
@@ -2972,6 +3072,102 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     return std::nullopt;
   const auto &invArgRanges = *rangesOpt;
 
+  auto isVariadicFormal = [&](uint32_t idx) -> bool {
+    return idx < m.defParams.size() && m.defParams[idx].variadic;
+  };
+
+  auto hasTopLevelComma = [&](StringRef s) -> bool {
+    int paren = 0, bracket = 0, brace = 0;
+    bool inStr = false, inChr = false, esc = false;
+    for (size_t i = 0; i < s.size(); ++i) {
+      char c = s[i];
+
+      if (inStr) {
+        if (esc) {
+          esc = false;
+          continue;
+        }
+        if (c == '\\') {
+          esc = true;
+          continue;
+        }
+        if (c == '"')
+          inStr = false;
+        continue;
+      }
+      if (inChr) {
+        if (esc) {
+          esc = false;
+          continue;
+        }
+        if (c == '\\') {
+          esc = true;
+          continue;
+        }
+        if (c == '\'')
+          inChr = false;
+        continue;
+      }
+
+      // Skip comments (treated as whitespace by the preprocessor).
+      if (c == '/' && i + 1 < s.size()) {
+        if (s[i + 1] == '/') {
+          i += 2;
+          while (i < s.size() && s[i] != '\n')
+            ++i;
+          continue;
+        }
+        if (s[i + 1] == '*') {
+          i += 2;
+          while (i + 1 < s.size() && !(s[i] == '*' && s[i + 1] == '/'))
+            ++i;
+          if (i + 1 < s.size())
+            ++i; // land on '/'
+          continue;
+        }
+      }
+
+      if (c == '"') {
+        inStr = true;
+        continue;
+      }
+      if (c == '\'') {
+        inChr = true;
+        continue;
+      }
+      switch (c) {
+      case '(':
+        ++paren;
+        break;
+      case ')':
+        if (paren > 0)
+          --paren;
+        break;
+      case '[':
+        ++bracket;
+        break;
+      case ']':
+        if (bracket > 0)
+          --bracket;
+        break;
+      case '{':
+        ++brace;
+        break;
+      case '}':
+        if (brace > 0)
+          --brace;
+        break;
+      case ',':
+        if (paren == 0 && bracket == 0 && brace == 0)
+          return true;
+        break;
+      default:
+        break;
+      }
+    }
+    return false;
+  };
+
   trace("macro/args", "  invArgRanges(%d)=%s", invArgRanges.size(),
         stringutils::rangesToStringWithSlices(baseInvText, invArgRanges));
 
@@ -3007,6 +3203,12 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
                 baseArgText.trim() == StringRef(pae.oldSeg).trim()))
             return std::nullopt;
         }
+
+        // If the argument is not the variadic formal, replacing it with a
+        // text that introduces a top-level comma would change the macro
+        // invocation's argument list.
+        if (!isVariadicFormal(argIdx) && hasTopLevelComma(newArg))
+          return std::nullopt;
 
         auto existing = replByArgIdx.find(argIdx);
         if (existing != replByArgIdx.end()) {
@@ -3084,6 +3286,9 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
               baseArgText.trim() == StringRef(pae->oldSeg).trim()))
           return std::nullopt;
       }
+
+      if (!isVariadicFormal(argIdx) && hasTopLevelComma(newArg))
+        return std::nullopt;
 
       // Safety gate: for single-segment paste edits we can directly validate
       // all occurrences, including paste-span occurrences, against the B
@@ -3174,7 +3379,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     // back into the argument text that would produce that literal via string-
     // ification.
     if (occIsStringify[i]) {
-      auto un = UnstringifyLiteralToArgText(bSlice);
+      auto un = UnstringifyLiteralToArgText(bSlice, isVariadicFormal(argIdx));
       if (!un)
         return std::nullopt;
       newArg = std::move(*un);
@@ -3218,6 +3423,12 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         }
       }
     }
+
+    // For non-variadic formals, reject replacements that would introduce
+    // additional top-level commas in the invocation spelling (which would
+    // change the invocation's arity).
+    if (!isVariadicFormal(argIdx) && hasTopLevelComma(newArg))
+      return std::nullopt;
 
     // If we've already derived a replacement for this argument index, it must
     // match exactly.
@@ -3877,13 +4088,18 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   bool existingIsCallsite = false;
   auto ownerIt = patchMap.find(m.ownerIncludeId);
   if (ownerIt != patchMap.end()) {
-    auto patchIt = ownerIt->second.find(m.id);
-    if (patchIt != ownerIt->second.end()) {
-      existingPatch = &patchIt->second;
-      existingIsCallsite =
-          InvocationSpanMatchesCallsitePrefix(existingPatch->replacement, m);
-      if (!existingIsCallsite)
-        return *existingPatch;
+    for (const auto &kv : ownerIt->second) {
+      const MacroPatch &p = kv.second;
+      if (!p.invStart || !p.invEnd)
+        continue;
+      if (p.invStart == *invStart && p.invEnd == *invEnd) {
+        existingPatch = &p;
+        existingIsCallsite =
+            InvocationSpanMatchesCallsitePrefix(existingPatch->replacement, m);
+        if (!existingIsCallsite)
+          return *existingPatch;
+        break;
+      }
     }
   }
 
@@ -3972,19 +4188,52 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           !baseInvText.empty()
               ? baseInvText
               : (m.invText ? StringRef(*m.invText) : StringRef(""));
-      if (!InvocationSpanMatchesCallsitePrefix(invSpanText, m))
+
+      trace("macro/dag",
+            "DAG args-only: enter root id={0} name='{1}' A=[{2},{3}) invFile='{4}' "
+            "inv=[{5},{6}) invSpanLen={7} baseInvLen={8}",
+            m.id, m.name, hEff.aStart, hEff.aEnd,
+            (m.invFile ? StringRef(*m.invFile) : StringRef("")),
+            (m.invB ? *m.invB : 0ULL), (m.invE ? *m.invE : 0ULL),
+            invSpanText.size(), baseInvText.size());
+
+      if (!InvocationSpanMatchesCallsitePrefix(invSpanText, m)) {
+        trace("macro/dag",
+              "DAG args-only: root invocation span does not match callsite prefix; "
+              "invSpanText prefix='{0}'",
+              invSpanText.take_front(48));
         return std::nullopt;
+      }
 
       // Parse the byte ranges of each *formal argument* within invSpanText.
       // This is the target surface we will rewrite if lifting succeeds.
       auto invArgRangesOpt =
           GetMacroInvocationFormalArgContentRanges(m, invSpanText);
-      if (!invArgRangesOpt)
+      if (!invArgRangesOpt) {
+        trace("macro/dag",
+              "DAG args-only: failed to parse formal arg ranges for root id={0} name='{1}' "
+              "invSpanText prefix='{2}'",
+              m.id, m.name, invSpanText.take_front(48));
         return std::nullopt;
+      }
       const auto &invArgRanges = *invArgRangesOpt;
       const size_t numArgs = invArgRanges.size();
-      if (numArgs == 0)
-        return std::nullopt;
+      if (numArgs == 0) {
+        unsigned directCallees = 0;
+        unsigned directCalleesWithInvArgRanges = 0;
+        for (const RefoldModel::MacroInvocation &cand : model_.GetMacroInvocations()) {
+          if (!cand.callerMacroId || *cand.callerMacroId != m.id)
+            continue;
+          ++directCallees;
+          if (!cand.invArgRanges.empty())
+            ++directCalleesWithInvArgRanges;
+        }
+        trace("macro/dag",
+              "DAG args-only: root has zero formal args; will compute leaf arg edits for diagnostics "
+              "but cannot emit a root args-only patch. directCallees={0} "
+              "directCalleesWithInvArgRanges={1}",
+              directCallees, directCalleesWithInvArgRanges);
+      }
 
       // --- Phase 1: Build lookup structures for DAG traversal ----------------
       //
@@ -4253,8 +4502,10 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             // allow top-level commas when unstringifying.
             auto aLift = normalizeLiftText(&cand, sp, aTxt->text,
                                            /*allowTopLevelComma=*/true);
+            bool allowComma = sp.argIdx < cand.defParams.size() &&
+                              cand.defParams[sp.argIdx].variadic;
             auto bLift = normalizeLiftText(&cand, sp, bTxt->text,
-                                           /*allowTopLevelComma=*/false);
+                                           /*allowTopLevelComma=*/allowComma);
             if (aLift && bLift && *aLift != *bLift)
               anyDiff = true;
           } else if (sp.kind == PPArgSpanKind::Paste && sp.byteBegin &&
@@ -4290,6 +4541,49 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
       debug("macro/dag",
             "DAG args-only: root inv id={0} name={1} leafCandidates={2}", m.id,
             m.name, leafCands.size());
+
+      auto ppArgSpanKindToString = [](PPArgSpanKind k) -> StringRef {
+        switch (k) {
+        case PPArgSpanKind::Standard:
+          return "standard";
+        case PPArgSpanKind::Stringify:
+          return "stringify";
+        case PPArgSpanKind::Paste:
+          return "paste";
+        }
+        return "unknown";
+      };
+
+      for (const LeafCandidate &lc : leafCands) {
+        const RefoldModel::MacroInvocation &leaf = *lc.inv;
+
+        unsigned touchedN = 0;
+        for (char t : lc.touched)
+          if (t)
+            ++touchedN;
+
+        debug("macro/dag",
+              "DAG leaf: leafId={0} name='{1}' caller={2} depth={3} "
+              "argLikeN={4} touchedN={5} invArgRangesN={6} argDepsN={7}",
+              leaf.id, leaf.name,
+              (leaf.callerMacroId ? *leaf.callerMacroId : 0ULL), lc.depth,
+              lc.argLike.size(), touchedN, leaf.invArgRanges.size(),
+              leaf.argDeps.size());
+
+        const unsigned kMaxDump = 4;
+        for (unsigned i = 0; i < lc.argLike.size() && i < kMaxDump; ++i) {
+          const auto &sp = lc.argLike[i];
+          std::string ppBB =
+              sp.ppByteBegin ? std::to_string(*sp.ppByteBegin) : "null";
+          std::string ppBE =
+              sp.ppByteEnd ? std::to_string(*sp.ppByteEnd) : "null";
+          debug("macro/dag",
+                "  leafSpan[{0}]: kind={1} argIdx={2} ppTok=[{3},{4}) "
+                "ppByte=[{5},{6}]",
+                i, ppArgSpanKindToString(sp.kind), sp.argIdx, sp.begin, sp.end,
+                ppBB, ppBE);
+        }
+      }
 
       // Cache the root invocation's *current* argument texts (trimmed). These
       // are used for final-hop two-parent splitting and for validation.
@@ -4480,8 +4774,10 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
           auto oldLift = normalizeLiftText(cand.inv, sp, aTxt->text,
                                            /*allowTopLevelComma=*/true);
+          bool allowComma = sp.argIdx < cand.inv->defParams.size() &&
+                            cand.inv->defParams[sp.argIdx].variadic;
           auto newLift = normalizeLiftText(cand.inv, sp, bTxt->text,
-                                           /*allowTopLevelComma=*/false);
+                                           /*allowTopLevelComma=*/allowComma);
           if (!oldLift || !newLift) {
             invalid = true;
             break;
@@ -4774,8 +5070,14 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     };
 
     // Only if DAG chaining yields a unique, validated patch do we apply it.
-    if (auto dag = tryDAGChainedArgsOnly())
+    auto dag = tryDAGChainedArgsOnly();
+    if (dag)
       return *dag;
+
+    trace("macro/dag",
+          "DAG args-only: no patch produced for root id={0} name='{1}'; "
+          "will fall back to whole-cover replacement if needed",
+          m.id, m.name);
   }
 
   if (existingPatch && existingIsCallsite && !baseInvText.empty() &&

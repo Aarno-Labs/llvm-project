@@ -298,6 +298,13 @@ public:
     uint32_t byteEnd;
   };
 
+  struct MacroDefParam {
+    StringRef name;
+    bool variadic;
+
+    MacroDefParam(StringRef Name, bool Variadic) : name(Name), variadic(Variadic) {}
+  };
+
   struct MacroInvocation {
     uint64_t id;
     StringRef subkind; // "func" | "obj"
@@ -306,6 +313,7 @@ public:
     std::vector<PPArgSpan> argSpans;
     std::vector<PPArgSpan> stringifySpans;
     std::vector<PPArgSpan> pasteSpans;
+    std::vector<MacroDefParam> defParams; // formal parameters from macro definition
     using OptByteRange = std::pair<std::optional<uint64_t>, std::optional<uint64_t>>;
     std::vector<OptByteRange> invArgRanges; // per-formal invocation-argument byte ranges
     std::vector<PPSpan> bodySpans;
@@ -327,6 +335,7 @@ public:
                     std::optional<uint64_t> invPPByteBegin,
                     std::optional<uint64_t> invPPByteEnd,
                     std::optional<uint64_t> ownerIncludeId,
+                    std::vector<MacroDefParam> defParams,
                     std::vector<OptByteRange> invArgRanges,
                     std::vector<PPSpan> spans, std::vector<PPArgSpan> argSpans,
                     std::vector<PPArgSpan> stringifySpans,
@@ -339,6 +348,7 @@ public:
           argSpans(std::move(argSpans)),
           stringifySpans(std::move(stringifySpans)),
           pasteSpans(std::move(pasteSpans)),
+          defParams(std::move(defParams)),
           invArgRanges(std::move(invArgRanges)),
           bodySpans(std::move(bodySpans)),
           invText(invText), invFile(invFile), invB(invB), invE(invE),
