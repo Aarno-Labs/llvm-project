@@ -693,15 +693,15 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
           for (const auto &elem : **invArgRangesArr) {
             auto *rObj = elem.getAsObject();
             if (!rObj) {
-              fatal("model",
-                    "invalid json value type on field 'inv_arg_ranges': expected object value");
+              fatal("model", "invalid json value type on field "
+                             "'inv_arg_ranges': expected object value");
             }
 
             const json::Value *bVal = rObj->get("b");
             const json::Value *eVal = rObj->get("e");
             if (!bVal || !eVal) {
-              fatal("model",
-                    "missing required fields on 'inv_arg_ranges' element: expected {b,e}");
+              fatal("model", "missing required fields on 'inv_arg_ranges' "
+                             "element: expected {b,e}");
             }
 
             std::optional<uint64_t> b;
@@ -750,6 +750,87 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
           bodySpans = std::move(*sp);
         }
 
+        std::optional<uint64_t> callerMacroId =
+            asOptUInt64(*obj, "caller_macro_id", /*canBeNull=*/true);
+
+        std::vector<std::vector<uint32_t>> argDeps;
+        if (auto DepsArr = asOptArray(*obj, "arg_deps", /*allowNull=*/true)) {
+          for (const json::Value &Entry : **DepsArr) {
+            auto AOrErr = asArray(Entry, ctxItem);
+            if (!AOrErr)
+              fatal("model", "{0}: arg_deps entry is not an array", ctxItem);
+            const json::Array &A = **AOrErr;
+
+            std::vector<uint32_t> Deps;
+            Deps.reserve(A.size());
+            for (const json::Value &Elem : A) {
+              auto UOrErr = asUInt32(Elem, ctxItem);
+              if (!UOrErr)
+                fatal("model", "{0}: arg_deps element is not a uint32",
+                      ctxItem);
+              Deps.push_back(*UOrErr);
+            }
+            argDeps.push_back(std::move(Deps));
+          }
+        }
+
+        std::vector<std::vector<RefoldModel::InvArgRef>> argRefs;
+        if (auto RefsArr = asOptArray(*obj, "arg_refs", /*allowNull=*/true)) {
+          for (const json::Value &Entry : **RefsArr) {
+            auto AOrErr = asArray(Entry, ctxItem);
+            if (!AOrErr)
+              fatal("model", "{0}: arg_refs entry is not an array", ctxItem);
+            const json::Array &A = **AOrErr;
+
+            std::vector<RefoldModel::InvArgRef> Refs;
+            Refs.reserve(A.size());
+            for (const json::Value &Elem : A) {
+              auto ObjOrErr = asObject(Elem, ctxItem);
+              if (!ObjOrErr)
+                fatal("model", "{0}: arg_refs element is not an object",
+                      ctxItem);
+              const json::Object &RefObj = **ObjOrErr;
+
+              const json::Value *CallerIdxVal =
+                  RefObj.get("caller_param_index");
+              if (!CallerIdxVal)
+                fatal("model",
+                      "{0}: arg_refs element missing caller_param_index",
+                      ctxItem);
+              auto CallerIdxOrErr = asUInt32(
+                  *CallerIdxVal, ctxItem + ": arg_refs.caller_param_index");
+              if (!CallerIdxOrErr)
+                fatal("model",
+                      "{0}: arg_refs.caller_param_index is not a uint32",
+                      ctxItem);
+
+              const json::Value *ByteBVal = RefObj.get("byte_begin");
+              if (!ByteBVal)
+                fatal("model", "{0}: arg_refs element missing byte_begin",
+                      ctxItem);
+              auto ByteBOrErr =
+                  asUInt32(*ByteBVal, ctxItem + ": arg_refs.byte_begin");
+              if (!ByteBOrErr)
+                fatal("model", "{0}: arg_refs.byte_begin is not a uint32",
+                      ctxItem);
+
+              const json::Value *ByteEVal = RefObj.get("byte_end");
+              if (!ByteEVal)
+                fatal("model", "{0}: arg_refs element missing byte_end",
+                      ctxItem);
+              auto ByteEOrErr =
+                  asUInt32(*ByteEVal, ctxItem + ": arg_refs.byte_end");
+              if (!ByteEOrErr)
+                fatal("model", "{0}: arg_refs.byte_end is not a uint32",
+                      ctxItem);
+
+              Refs.push_back(RefoldModel::InvArgRef{*CallerIdxOrErr,
+                                                    *ByteBOrErr, *ByteEOrErr});
+            }
+            argRefs.push_back(std::move(Refs));
+          }
+        }
+
         MacroInvocation mi(/*id*/ id,
                            /*subkind*/ subkind,
                            /*name*/ name,
@@ -765,7 +846,10 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
                            /*argSpans*/ std::move(argSpans),
                            /*stringifySpans*/ std::move(stringifySpans),
                            /*pasteSpans*/ std::move(pasteSpans),
-                           /*bodySpans*/ std::move(bodySpans));
+                           /*bodySpans*/ std::move(bodySpans),
+                           /*callerMacroId*/ callerMacroId,
+                           /*argDeps*/ std::move(argDeps),
+                           /*argRefs*/ std::move(argRefs));
 
         model.macroInvs_.push_back(std::move(mi));
       } else if (kindStr == "file") {

@@ -4,4 +4,4 @@
 #define XSTR(...) STR(__VA_ARGS__)      // Passes all args to STR
 
 // Result: "int a , int b"
-const char* s = "int x ; int y";
+const char* s = XSTR(int x ; int y);

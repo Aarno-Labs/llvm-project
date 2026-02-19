@@ -292,6 +292,12 @@ public:
     }
   };
 
+  struct InvArgRef {
+    uint32_t callerParamIndex;
+    uint32_t byteBegin;
+    uint32_t byteEnd;
+  };
+
   struct MacroInvocation {
     uint64_t id;
     StringRef subkind; // "func" | "obj"
@@ -309,6 +315,9 @@ public:
     std::optional<uint64_t> invPPByteBegin,
         invPPByteEnd; // A-stream byte envelope
     std::optional<uint64_t> ownerIncludeId;
+    std::optional<uint64_t> callerMacroId;
+    std::vector<std::vector<uint32_t>> argDeps;
+    std::vector<std::vector<InvArgRef>> argRefs;
     PPCover cover;
 
     MacroInvocation(uint64_t id, StringRef subkind, StringRef name,
@@ -322,7 +331,10 @@ public:
                     std::vector<PPSpan> spans, std::vector<PPArgSpan> argSpans,
                     std::vector<PPArgSpan> stringifySpans,
                     std::vector<PPArgSpan> pasteSpans,
-                    std::vector<PPSpan> bodySpans) noexcept
+                    std::vector<PPSpan> bodySpans,
+                    std::optional<uint64_t> callerMacroId,
+                    std::vector<std::vector<uint32_t>> argDeps,
+                    std::vector<std::vector<InvArgRef>> argRefs) noexcept
         : id(id), subkind(subkind), name(name), spans(std::move(spans)),
           argSpans(std::move(argSpans)),
           stringifySpans(std::move(stringifySpans)),
@@ -331,7 +343,8 @@ public:
           bodySpans(std::move(bodySpans)),
           invText(invText), invFile(invFile), invB(invB), invE(invE),
           invPPByteBegin(invPPByteBegin), invPPByteEnd(invPPByteEnd),
-          ownerIncludeId(ownerIncludeId) {
+          ownerIncludeId(ownerIncludeId), callerMacroId(callerMacroId),
+          argDeps(std::move(argDeps)), argRefs(std::move(argRefs)) {
       cover.Init(this->spans, &this->argSpans, &this->bodySpans);
     }
 

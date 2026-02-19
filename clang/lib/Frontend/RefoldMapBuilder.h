@@ -53,12 +53,19 @@
 
 #include <cstdint>
 #include <string>
+#include <optional>
 #include <utility>
 
 using namespace llvm;
 
 namespace clang {
 namespace refold {
+
+template <bool kWithCR = false>
+static inline bool isSpace(char c) {
+  return c == ' ' || c == '\t' || c == '\f' || c == '\v' ||
+         (kWithCR && c == '\r');
+}
 
 /// Half-open token range over the printed stream: [Begin, End). `Open == true`
 /// while we are still extending the contiguous run for the owning item.
@@ -77,6 +84,11 @@ struct ArgTokenSpan {
   // ignored.
   uint32_t ByteBegin = 0, ByteEnd = 0;
   bool HasByteRange = false;
+};
+
+struct MacroParam {
+  std::string Name;
+  bool Variadic = false;
 };
 
 struct PastePart {
@@ -149,10 +161,34 @@ struct Item {
   // Reverse index: pasted spelling -> indices into PasteTokens.
   StringMap<SmallVector<size_t, 2>> PasteSpell2TokenIndices;
 
+  // Definition-time macro formal parameters.
+  std::vector<MacroParam> DefParams;
+
   // Invocation-site byte ranges [begin,end) for each actual argument (index
   // matches formal parameter order).
   std::vector<std::pair<std::optional<uint64_t>, std::optional<uint64_t>>>
       InvArgRanges;
+
+  // Macro nesting DAG + deterministic dependency edges for nested expansions:
+  //
+  // If this invocation occurs while expanding another macro, CallerMacroId
+  // identifies the immediately enclosing caller invocation (its Item::ID).
+  // InvArgDeps records, for each invocation argument, which caller formal(s)
+  // the raw argument text references (by index in the caller's DefParams).
+  std::optional<uint64_t> CallerMacroId;
+  std::vector<std::vector<uint32_t>> InvArgDeps;
+
+  struct InvArgRef {
+    uint32_t CallerParamIndex = 0;
+    uint32_t ByteBegin = 0;
+    uint32_t ByteEnd = 0;
+  };
+
+  // For each invocation argument, record the precise byte ranges in inv_text
+  // that reference caller formals (indexed by CallerParamIndex). This is a
+  // refinement of InvArgDeps that allows the consumer to lift edits through
+  // nested macro expansions without re-expanding.
+  std::vector<std::vector<InvArgRef>> InvArgRefs;
   std::vector<HeaderDecl> Decls;
 
   // main-file byte range of the macro invocation (if applicable)
@@ -266,6 +302,11 @@ class RefoldMapBuilder {
 
   std::vector<Item> Items;
   llvm::StringMap<size_t> MacroKey2Item;
+  /// Global index of paste-produced token spellings -> macro invocation items
+  /// that can produce that spelling. Used for paste-through-stringify
+  /// projection when a pasted token is later embedded inside a string literal
+  /// emitted by '#'.
+  llvm::StringMap<llvm::SmallVector<size_t, 2>> PasteSpell2MacroItems;
   llvm::StringMap<size_t> IncludeKey2Item;
   std::vector<std::optional<size_t>> IncludeStack; // item indices (include items),
                                                    // nullopt for none

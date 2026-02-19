@@ -46,9 +46,11 @@
 #include "clang/Basic/SourceManager.h"
 #include "clang/Lex/MacroArgs.h"
 #include "clang/Lex/Preprocessor.h"
+#include "clang/Lex/Lexer.h"
 #include "clang/Lex/PreprocessorOptions.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/JSON.h"
@@ -56,6 +58,9 @@
 #include "llvm/Support/Path.h"
 
 #include <algorithm>
+#include <iterator>
+#include <type_traits>
+#include <cctype>
 #include <limits>
 #include <string>
 #include <utility>
@@ -65,31 +70,76 @@ namespace clang {
 namespace refold {
 
 namespace {
+
+// Helper to access macro parameter identifiers across Clang versions.
+//
+// Clang has changed MacroInfo's parameter accessor APIs over time:
+//   * Some versions expose `MacroInfo::getParam(I)`.
+//   * Some versions expose a raw `IdentifierInfo **` via `getParameterList()`.
+//   * Some versions only provide iterators (`param_begin()` / `param_end()`).
+//
+// Instead of version-ifdefs or overload "tag dispatch", we use the C++17
+// detection idiom and `if constexpr` to select the best available API at
+// compile time.
+template <typename T, typename = void> struct HasGetParam : std::false_type {};
+template <typename T>
+struct HasGetParam<T, std::void_t<decltype(std::declval<const T *>()->getParam(0U))>>
+    : std::true_type {};
+
+template <typename T, typename = void>
+struct HasGetParameterList : std::false_type {};
+template <typename T>
+struct HasGetParameterList<
+    T, std::void_t<decltype(std::declval<const T *>()->getParameterList())>>
+    : std::true_type {};
+
+template <typename MI>
+static const IdentifierInfo *getMacroParamIdentifier(const MI *M, unsigned I) {
+  if (!M)
+    return nullptr;
+
+  // Note: this must be a function template (rather than hard-coding MacroInfo)
+  // so that the unused branches of the `if constexpr` remain in a dependent
+  // context and do not require the selected Clang version to declare every
+  // historical accessor API.
+  if constexpr (HasGetParam<MI>::value) {
+    return M->getParam(I);
+  } else if constexpr (HasGetParameterList<MI>::value) {
+    return M->getParameterList()[I];
+  } else {
+    auto It = M->param_begin();
+    for (unsigned N = 0; N < I; ++N)
+      ++It;
+    return *It;
+  }
+}
+
 // Normalize keys to file locations so InclusionDirective(HashLoc)
 // and EnterFile(IncludeLoc) agree.
-std::string keyForLoc(const SourceManager &SM, SourceLocation Loc) {
+static std::string keyForLoc(const SourceManager &SM, SourceLocation Loc) {
   return std::to_string(SM.getFileLoc(Loc).getRawEncoding());
 }
 
 // Macro keys must NOT normalize through getFileLoc() or getSpellingLoc(): in
 // nested expansions those can collapse distinct invocation sites onto the same
 // key, causing MacroKey2Item collisions (e.g., __FILE__ overwriting PRINT_FILE).
-// As in th example:
+// As in the example:
 //
 //   #define PRINT_FILE(FMT) printf(FMT, __FILE__, __LINE__)
 //   PRINT_FILE("Error on file (%s) and line (%d)\n");
 //
 // Use the SourceLocation raw encoding directly (keeps MacroID locations distinct).
-std::string keyForMacroLoc(SourceLocation Loc) {
+static std::string keyForMacroLoc(SourceLocation Loc) {
   if (Loc.isInvalid())
     return "0";
   return std::to_string(Loc.getRawEncoding());
 }
 
-bool isSpace(char c) { return c == ' ' || c == '\t' || c == '\f' || c == '\v'; }
-
 // Returns [bol,eol+1) byte span of the line containing 'p'.
-std::pair<size_t, size_t> lineSpanOf(StringRef S, size_t p) {
+static std::pair<size_t, size_t> lineSpanOf(StringRef S, size_t p) {
+  if (p >= S.size())
+    return {S.size(), S.size()};
+
   size_t L = p, R = p;
   while (L > 0 && S[L - 1] != '\n')
     --L;
@@ -151,30 +201,32 @@ std::pair<size_t, size_t> lineSpanOf(StringRef S, size_t p) {
 /// \note This routine deliberately avoids any heuristic guessing and is fully
 ///       deterministic: the same input buffer always produces the same groups.
 /// \sa CondGroup, CondArm
-std::vector<CondGroup>
-scanTopLevelConds(llvm::StringRef Buf, llvm::StringRef FilePath) {
+static std::vector<CondGroup> scanTopLevelConds(llvm::StringRef Buf,
+                                                llvm::StringRef FilePath) {
+  // Scans the raw source buffer for preprocessor conditional directive groups:
+  //
+  //   #if / #ifdef / #ifndef
+  //     ... arm body ...
+  //   #elif <cond>
+  //     ... arm body ...
+  //   #else
+  //     ... arm body ...
+  //   #endif
+  //
+  // For each group, we record:
+  //   - the byte span covering the whole group (GroupB..GroupE),
+  //   - and each arm’s directive kind, condition text, and body byte span.
+  //
+  // This is a lightweight, purely textual scan. It does *not* attempt to
+  // preprocess/evaluate conditions, and it does not parse tokens; it only
+  // recognizes directive keywords at the start of lines (after optional
+  // whitespace) and tracks nesting with a stack.
   std::vector<CondGroup> Groups;
   const size_t N = Buf.size();
   size_t p = 0;
 
-  auto lineSpanOf = [&](llvm::StringRef B, size_t Off) -> std::pair<size_t, size_t> {
-    if (Off >= B.size())
-      return {B.size(), B.size()};
-    size_t bol = Off;
-    while (bol > 0 && B[bol - 1] != '\n')
-      --bol;
-    size_t eol = Off;
-    while (eol < B.size() && B[eol] != '\n')
-      ++eol;
-    if (eol < B.size())
-      ++eol; // include newline
-    return {bol, eol};
-  };
-
-  auto isSpace = [](char c) -> bool {
-    return c == ' ' || c == '\t' || c == '\r' || c == '\f' || c == '\v';
-  };
-
+  // Check whether keyword `s` appears at Buf[start..eol) with a word boundary.
+  // This prevents matching "#ifdefX" as "#ifdef", etc.
   auto kw_at = [&](size_t start, size_t eol, const char *s) -> bool {
     size_t t = start, k = 0;
     while (t < eol && s[k] && Buf[t] == s[k]) {
@@ -185,13 +237,20 @@ scanTopLevelConds(llvm::StringRef Buf, llvm::StringRef FilePath) {
       return false; // didn't consume full keyword
     if (t < eol) {
       unsigned char c = static_cast<unsigned char>(Buf[t]);
-      if (::isalnum(c) || c == '_')
-        return false; // word boundary
+      if (llvm::isAlnum(static_cast<char>(c)) || c == '_') {
+        return false; // word boundary: keyword must not be followed by ident
+                      // char
+      }
     }
     return true;
   };
 
-  // Helper to close the current arm body for a group up to 'endAt'.
+  // Close the current (most recent) arm body for a group up to 'endAt'.
+  //
+  // We treat BodyB..BodyE as a half-open byte range in the file buffer,
+  // where BodyB is set to the end-of-line of the arm's directive and BodyE is
+  // extended when the next directive in the same group begins
+  // (elif/else/endif).
   auto setPrevBodyEnd = [&](size_t groupIndex, size_t endAt) {
     if (groupIndex >= Groups.size())
       return;
@@ -200,32 +259,51 @@ scanTopLevelConds(llvm::StringRef Buf, llvm::StringRef FilePath) {
       G.Arms.back().BodyE = endAt;
   };
 
+  // Active conditional groups (nesting stack). Each stack entry refers to an
+  // index in `Groups`. The top of the stack is the innermost active group.
   struct Active {
     size_t GroupIndex;
   };
   std::vector<Active> Stack;
 
   while (p < N) {
+    // Determine the [bol, eol) byte span for the current line containing `p`.
+    // lineSpanOf() returns the bounds *excluding* the newline.
     auto span = lineSpanOf(Buf, p);
     size_t bol = span.first, eol = span.second;
     if (eol <= bol) {
+      // Degenerate or empty line; move past it safely.
       p = std::min(N, eol + 1);
-      continue; // empty/degenerate line
+      continue;
     }
 
+    // Skip leading horizontal whitespace to detect directives that begin
+    // anywhere after indentation.
     size_t s = bol;
-    while (s < eol && isSpace(Buf[s]))
+    while (s < eol && isSpace</*kWithCR=*/true>(Buf[s]))
       ++s;
 
+    // Recognize directives only when we see '#" after optional indentation.
     if (s < eol && Buf[s] == '#') {
+      // Skip whitespace after '#'.
       size_t q = s + 1;
-      while (q < eol && isSpace(Buf[q]))
+      while (q < eol && isSpace</*kWithCR=*/true>(Buf[q]))
         ++q;
 
-      enum DirKind { DK_None, DK_If, DK_Ifdef, DK_Ifndef, DK_Elif, DK_Else, DK_Endif };
+      // The directive "kind" we recognize on this line.
+      enum DirKind {
+        DK_None,
+        DK_If,
+        DK_Ifdef,
+        DK_Ifndef,
+        DK_Elif,
+        DK_Else,
+        DK_Endif
+      };
       DirKind Kind = DK_None;
       llvm::StringRef Tag;
 
+      // Identify which directive keyword appears after '#'.
       if (kw_at(q, eol, "if")) {
         Kind = DK_If;
         Tag = "if";
@@ -250,63 +328,83 @@ scanTopLevelConds(llvm::StringRef Buf, llvm::StringRef FilePath) {
       case DK_If:
       case DK_Ifdef:
       case DK_Ifndef: {
-        // Starting a new conditional group (top-level or nested).
+        // Start a new conditional group. This may be top-level or nested
+        // inside another active group (tracked by `Stack`).
         CondGroup G;
         G.File = FilePath.str();
-        G.GroupB = bol;       // from '#' of opener
-        G.GroupE = G.GroupB;  // will be filled at #endif
+        G.GroupB = bol;      // group begins at the opener line
+        G.GroupE = G.GroupB; // filled when we see matching #endif
 
-        // First arm (#if/ifdef/ifndef)
+        // Create the first arm for this group (#if/#ifdef/#ifndef).
         CondArm A;
         A.Kind = Tag.str();
 
+        // Extract the condition text for #if/#ifdef/#ifndef.
+        // For #ifdef/#ifndef this is just an identifier expression; we keep
+        // the raw remainder of the line verbatim (minus leading spaces).
         size_t condBeg =
-            q + (Kind == DK_If
-                     ? 2
-                     : (Kind == DK_Ifdef ? 5 : 6)); // "if", "ifdef", "ifndef"
-        while (condBeg < eol && isSpace(Buf[condBeg]))
+            q + (Kind == DK_If ? 2
+                               : (Kind == DK_Ifdef
+                                      ? 5
+                                      : 6)); // lengths: "if", "ifdef", "ifndef"
+        while (condBeg < eol && isSpace</*kWithCR=*/true>(Buf[condBeg]))
           ++condBeg;
         A.Cond = std::string(Buf.substr(condBeg, eol - condBeg));
-        A.BodyB = std::min(N, eol); // body starts after this line
+
+        // The arm body begins immediately after this directive line.
+        // We use `eol` (not `eol+1`) so that the newline remains part of the
+        // body depending on downstream reconstruction policy.
+        A.BodyB = std::min(N, eol);
         A.BodyE = A.BodyB;
         G.Arms.push_back(std::move(A));
 
+        // Record the group and push it onto the nesting stack.
         size_t idx = Groups.size();
         Groups.push_back(std::move(G));
 
-        // Any outer group should have its current arm body end before this '#if'.
+        // If we were already inside an outer group, then the outer group's
+        // current arm body must end before this nested opener starts.
         if (!Stack.empty())
           setPrevBodyEnd(Stack.back().GroupIndex, bol);
 
         Stack.push_back(Active{idx});
 
+        // Advance to the end of this line.
         p = std::min(N, eol);
         continue;
       }
 
       case DK_Elif:
       case DK_Else: {
+        // Transition to a new arm of the current innermost group.
+        // If there is no active group, this is a stray directive and we ignore
+        // it.
         if (Stack.empty()) {
           p = std::min(N, eol);
-          continue; // stray elif/else
+          continue;
         }
 
         size_t idx = Stack.back().GroupIndex;
         CondGroup &G = Groups[idx];
 
-        // Close previous arm at the start of this line.
+        // Close previous arm at the start of this directive line.
         setPrevBodyEnd(idx, bol);
 
+        // Start the new arm.
         CondArm A;
         A.Kind = Tag.str();
         if (Kind == DK_Elif) {
+          // Capture the raw condition expression following "elif".
           size_t condBeg = q + 4; // "elif"
-          while (condBeg < eol && isSpace(Buf[condBeg]))
+          while (condBeg < eol && isSpace</*kWithCR=*/true>(Buf[condBeg]))
             ++condBeg;
           A.Cond = std::string(Buf.substr(condBeg, eol - condBeg));
         } else {
-          A.Cond.clear(); // "else" has no condition text
+          // "else" has no condition text.
+          A.Cond.clear();
         }
+
+        // Arm body begins immediately after this directive line.
         A.BodyB = std::min(N, eol);
         A.BodyE = A.BodyB;
         G.Arms.push_back(std::move(A));
@@ -316,6 +414,7 @@ scanTopLevelConds(llvm::StringRef Buf, llvm::StringRef FilePath) {
       }
 
       case DK_Endif: {
+        // Close the current innermost group.
         if (Stack.empty()) {
           p = std::min(N, eol);
           continue; // stray endif
@@ -324,9 +423,12 @@ scanTopLevelConds(llvm::StringRef Buf, llvm::StringRef FilePath) {
         size_t idx = Stack.back().GroupIndex;
         CondGroup &G = Groups[idx];
 
-        // Close the last arm at start of this '#endif' line.
+        // Close the final arm at the start of this '#endif' line.
         setPrevBodyEnd(idx, bol);
-        // Group extends through the end of this line.
+
+        // Group extent: we record through the end of the '#endif' line.
+        // This allows downstream logic to treat the group as spanning the
+        // directives themselves, not just the arm bodies.
         G.GroupE = std::min(N, eol);
 
         Stack.pop_back();
@@ -336,15 +438,19 @@ scanTopLevelConds(llvm::StringRef Buf, llvm::StringRef FilePath) {
       }
 
       case DK_None:
+        // Not a conditional directive we care about; treat it like a normal
+        // line.
         break;
       }
     }
 
-    // Non-directive line; just advance.
+    // Not a recognized directive line; advance to end-of-line.
     p = std::min(N, eol);
   }
 
-  // If file ended without closing some groups, close them at EOF.
+  // If the file ends without closing some groups, conservatively close them at
+  // EOF. This preserves best-effort structural information even for malformed
+  // files.
   for (const auto &A : Stack) {
     size_t idx = A.GroupIndex;
     if (idx >= Groups.size())
@@ -358,7 +464,27 @@ scanTopLevelConds(llvm::StringRef Buf, llvm::StringRef FilePath) {
   return Groups;
 }
 
-void computeInvArgRanges(
+// Compute, for each *formal* parameter of a function-like macro invocation,
+// the byte offset range in the *spelled* source file that corresponds to the
+// *unexpanded* argument tokens at the call site.
+//
+// Output format:
+//   Out[i] = {begin, end} where:
+//     - begin is the file offset (in bytes) of the first token of argument i
+//     - end   is the file offset (in bytes) immediately after the last token
+//             of argument i (i.e., a half-open range [begin, end))
+//
+// We use optional offsets because:
+//   * some arguments may be empty / missing / not representable as file offsets,
+//   * some tokens may have invalid locations (e.g., synthesized tokens),
+//   * some invocations may involve macro expansions where a "file offset" is
+//     not meaningful without first mapping through SourceManager.
+//
+// Important: this routine deliberately uses Args->getUnexpArgument(ai), i.e.
+// the argument token sequence as *spelled* at the invocation site, not the
+// post-expansion stream. This is the form needed to refold edits back into
+// the original source call text.
+static void computeInvArgRanges(
     const MacroArgs *Args, const MacroInfo *MI, const SourceManager &SM,
     const LangOptions &Lang,
     std::vector<std::pair<std::optional<uint64_t>, std::optional<uint64_t>>>
@@ -367,16 +493,24 @@ void computeInvArgRanges(
   if (!Args || !MI || !MI->isFunctionLike())
     return;
 
+  // Only consider formal parameters. (Varargs beyond getNumParams() are not
+  // represented here unless your producer has an explicit varargs model.)
   unsigned N = MI->getNumParams();
   Out.reserve(N);
 
   for (unsigned ai = 0; ai < N; ++ai) {
+    // Clang stores each argument as a token array terminated by tok::eof.
+    // getUnexpArgument() returns a pointer to that sentinel-terminated array.
     const Token *AT = Args->getUnexpArgument(ai);
     if (!AT) {
+      // No token sequence available for this parameter.
       Out.emplace_back(std::nullopt, std::nullopt);
       continue;
     }
 
+    // Identify the first and last *validly located* tokens of this argument.
+    // Some tokens may lack locations; we skip those and only use located tokens
+    // to form the span.
     bool Have = false;
     SourceLocation First, Last;
     for (const Token *T = AT; !T->is(tok::eof); ++T) {
@@ -391,15 +525,27 @@ void computeInvArgRanges(
     }
 
     if (!Have) {
+      // Argument tokens exist, but none had a valid source location.
       Out.emplace_back(std::nullopt, std::nullopt);
       continue;
     }
 
+    // Normalize both endpoints to file locations. This strips macro expansion
+    // indirection and yields locations that can be converted to file offsets.
     SourceLocation FL = SM.getFileLoc(First);
     SourceLocation LL = SM.getFileLoc(Last);
+
+    // Compute the end location *after* the last token (exclusive).
+    // We use Lexer helper so that end covers the full token spelling, not just
+    // its beginning.
     SourceLocation EndL = Lexer::getLocForEndOfToken(LL, 0, SM, Lang);
     SourceLocation EL = SM.getFileLoc(EndL);
 
+    // Convert to byte offsets within the containing file buffer. These offsets
+    // are used later to slice the original file text for refolding.
+    //
+    // Note: getFileOffset() returns an unsigned; we store as uint64_t via the
+    // optional type in the output vector.
     auto B = FL.isValid() ? std::optional<unsigned>(SM.getFileOffset(FL))
                           : std::nullopt;
     auto E = EL.isValid() ? std::optional<unsigned>(SM.getFileOffset(EL))
@@ -408,7 +554,7 @@ void computeInvArgRanges(
   }
 }
 
-std::string computeLangStr(const clang::LangOptions &Lang) {
+static std::string computeLangStr(const clang::LangOptions &Lang) {
   // Objective-C family
   if (Lang.ObjC)
     return Lang.CPlusPlus ? "objc++" : "objc";
@@ -434,8 +580,8 @@ static void trimTrailingSeparators(llvm::SmallVectorImpl<char> &P) {
     P.pop_back();
 }
 
-std::string normalizePathKey(llvm::StringRef Path, llvm::StringRef Cwd,
-                             bool IsDir) {
+static std::string normalizePathKey(llvm::StringRef Path, llvm::StringRef Cwd,
+                                    bool IsDir) {
   if (Path.empty())
     return std::string();
 
@@ -470,8 +616,7 @@ std::string normalizePathKey(llvm::StringRef Path, llvm::StringRef Cwd,
   return P.str().str();
 }
 
-std::string joinSpelled(llvm::StringRef DirSpelling,
-                               llvm::StringRef Rel) {
+std::string joinSpelled(llvm::StringRef DirSpelling, llvm::StringRef Rel) {
   if (Rel.empty())
     return std::string();
 
@@ -493,11 +638,434 @@ std::string joinSpelled(llvm::StringRef DirSpelling,
   return Out;
 }
 
+// Sanity-check helper: ensure any recorded invocation-argument byte ranges
+// lie within the enclosing invocation span [InvBegin, InvEnd).
+//
+// This is a defensive validation step for producer-side metadata: it catches
+// cases where argument offsets are missing, inverted, or escape the invocation
+// region due to location mapping quirks (macro expansion, CRLF, etc.).
+static bool invArgRangesWithinInvocation(const Item &It) {
+  // If the invocation span itself is unknown, we can't validate containment.
+  if (!It.InvBegin || !It.InvEnd)
+    return false;
+
+  const uint64_t InvBegin = *It.InvBegin;
+  const uint64_t InvEnd = *It.InvEnd;
+
+  for (const auto &R : It.InvArgRanges) {
+    // Individual args may legitimately be absent/unknown; skip those.
+    if (!R.first || !R.second)
+      continue;
+
+    const uint64_t B = *R.first;
+    const uint64_t E = *R.second;
+
+    // Reject inverted spans (B > E) and any span that escapes the invocation.
+    if (B < InvBegin || E > InvEnd || B > E)
+      return false;
+  }
+  return true;
+}
+
+// Parse a macro invocation's spelled text and compute byte-offset ranges for
+// each argument within that invocation.
+//
+// Inputs:
+//   - InvText:   The full spelled invocation text (e.g. "FOO(a, b+1)").
+//               This is assumed to include the opening '(' and the matching
+//               ')'.
+//   - InvBegin:  Absolute byte offset in the file where InvText begins.
+//               We add relative offsets within InvText to produce absolute
+//               ranges.
+//   - ExpectedArgs: The number of arguments we expect to find (usually the
+//   number
+//               of formal parameters for the macro).
+//
+// Output:
+//   - Out[i] = {begin, end} absolute byte offsets into the file for argument i,
+//     using half-open ranges [begin, end). Missing/unknown args remain nullopt.
+//
+// Return value:
+//   - true if we find a plausible top-level argument list that ends at a
+//   matching ')'
+//     for the first '(' in InvText; false otherwise.
+static bool computeInvArgRangesFromText(
+    llvm::StringRef InvText, uint64_t InvBegin, size_t ExpectedArgs,
+    const LangOptions &Lang,
+    std::vector<std::pair<std::optional<uint64_t>, std::optional<uint64_t>>> &Out) {
+  // Preserve the caller's current Out state on failure. (Callers may have
+  // pre-sized Out and rely on it retaining its shape when parsing fails.)
+  std::vector<std::pair<std::optional<uint64_t>, std::optional<uint64_t>>> Args;
+  Args.reserve(ExpectedArgs);
+
+  // Tokenize the *raw* invocation text with Clang's lexer. This ensures we treat
+  // comments as whitespace and do not accidentally split on commas/parens that
+  // appear inside comments, string/char literals, raw strings, etc.
+  //
+  // Offsets remain relative to InvText; we add InvBegin to form byte offsets
+  // within the original file (inv_text semantics).
+  const SourceLocation BaseLoc = SourceLocation::getFromRawEncoding(1);
+  std::string LexBuf = InvText.str();
+  LexBuf.push_back('\0');
+  const char *BufStart = LexBuf.data();
+  const char *BufEnd = BufStart + InvText.size();
+  Lexer Lex(BaseLoc, Lang, BufStart, BufStart, BufEnd);
+
+  auto tokOff = [&](const Token &Tok) -> size_t {
+    return static_cast<size_t>(Tok.getLocation().getRawEncoding() -
+                               BaseLoc.getRawEncoding());
+  };
+
+  auto recordArg = [&](size_t A0, size_t A1) {
+    while (A0 < A1 &&
+           std::isspace(static_cast<unsigned char>(InvText[A0]))) {
+      ++A0;
+    }
+    while (A1 > A0 &&
+           std::isspace(static_cast<unsigned char>(InvText[A1 - 1]))) {
+      --A1;
+    }
+    Args.push_back({InvBegin + A0, InvBegin + A1});
+  };
+
+  Token Tok;
+  bool SawLParen = false;
+  size_t ArgStart = 0;
+
+  unsigned ParenDepth = 0;
+  unsigned BracketDepth = 0;
+  unsigned BraceDepth = 0;
+
+  // For 0-parameter function-like macros, accept invocations that have no
+  // tokens between '(' and ')'. (Comments are lexed as whitespace unless
+  // explicitly retained, so FOO(/*c*/) behaves like FOO().)
+  bool SawAnyTokenBetweenParens = false;
+
+  while (true) {
+    Lex.LexFromRawLexer(Tok);
+    if (Tok.is(tok::eof))
+      break;
+
+    if (!SawLParen) {
+      if (Tok.is(tok::l_paren)) {
+        SawLParen = true;
+        ArgStart = tokOff(Tok) + Tok.getLength();
+      }
+      continue;
+    }
+
+    if (Tok.is(tok::comment))
+      continue;
+
+    const size_t Off = tokOff(Tok);
+
+    if (Tok.is(tok::l_paren)) {
+      ++ParenDepth;
+      SawAnyTokenBetweenParens = true;
+      continue;
+    }
+    if (Tok.is(tok::r_paren)) {
+      if (ParenDepth == 0 && BracketDepth == 0 && BraceDepth == 0) {
+        if (ExpectedArgs == 0) {
+          if (!SawAnyTokenBetweenParens) {
+            Out = std::move(Args);
+            return true;
+          }
+          return false;
+        }
+        recordArg(ArgStart, Off);
+        // Best-effort: if the parsed argument count does not match the macro's
+        // formal parameter count, keep what we could parse and leave remaining
+        // formals as null. This preserves the historical behavior for macro
+        // dispatcher patterns like: (A,B,C,0)(__VA_ARGS__).
+        std::vector<std::pair<std::optional<uint64_t>, std::optional<uint64_t>>> OutTmp;
+        OutTmp.resize(ExpectedArgs, {std::nullopt, std::nullopt});
+
+        const size_t Fill = std::min(Args.size(), ExpectedArgs);
+        for (size_t I = 0; I < Fill; ++I)
+          OutTmp[I] = Args[I];
+
+        if (Args.size() > ExpectedArgs && ExpectedArgs > 0) {
+          OutTmp[ExpectedArgs - 1] = {Args[ExpectedArgs - 1].first, Args.back().second};
+        }
+
+        Out = std::move(OutTmp);
+        return true;
+      }
+      if (ParenDepth > 0)
+        --ParenDepth;
+      SawAnyTokenBetweenParens = true;
+      continue;
+    }
+
+    if (Tok.is(tok::l_square)) {
+      ++BracketDepth;
+      SawAnyTokenBetweenParens = true;
+      continue;
+    }
+    if (Tok.is(tok::r_square)) {
+      if (BracketDepth > 0)
+        --BracketDepth;
+      SawAnyTokenBetweenParens = true;
+      continue;
+    }
+
+    if (Tok.is(tok::l_brace)) {
+      ++BraceDepth;
+      SawAnyTokenBetweenParens = true;
+      continue;
+    }
+    if (Tok.is(tok::r_brace)) {
+      if (BraceDepth > 0)
+        --BraceDepth;
+      SawAnyTokenBetweenParens = true;
+      continue;
+    }
+
+    if (Tok.is(tok::comma) && ParenDepth == 0 && BracketDepth == 0 &&
+        BraceDepth == 0) {
+      recordArg(ArgStart, Off);
+      ArgStart = Off + Tok.getLength();
+      continue;
+    }
+
+    SawAnyTokenBetweenParens = true;
+  }
+
+  return false;
+}
+
+struct DecodedPayloadMap {
+  std::string Decoded;
+  llvm::SmallVector<std::pair<uint32_t, uint32_t>, 64> PayloadToSpelling;
+  bool Valid = false;
+};
+
+static inline void appendUtf8(uint32_t CP, std::string &Out) {
+  // Encode a Unicode scalar value as UTF-8. Invalid scalars are encoded
+  // as U+FFFD.
+  if (CP > 0x10FFFFu || (CP >= 0xD800u && CP <= 0xDFFFu))
+    CP = 0xFFFDu;
+
+  if (CP <= 0x7Fu) {
+    Out.push_back((char)CP);
+    return;
+  }
+  if (CP <= 0x7FFu) {
+    Out.push_back((char)(0xC0u | ((CP >> 6) & 0x1Fu)));
+    Out.push_back((char)(0x80u | (CP & 0x3Fu)));
+    return;
+  }
+  if (CP <= 0xFFFFu) {
+    Out.push_back((char)(0xE0u | ((CP >> 12) & 0x0Fu)));
+    Out.push_back((char)(0x80u | ((CP >> 6) & 0x3Fu)));
+    Out.push_back((char)(0x80u | (CP & 0x3Fu)));
+    return;
+  }
+  Out.push_back((char)(0xF0u | ((CP >> 18) & 0x07u)));
+  Out.push_back((char)(0x80u | ((CP >> 12) & 0x3Fu)));
+  Out.push_back((char)(0x80u | ((CP >> 6) & 0x3Fu)));
+  Out.push_back((char)(0x80u | (CP & 0x3Fu)));
+}
+
+static inline bool isIdentByte(unsigned char C) {
+  return (C == '_') || llvm::isAlnum(static_cast<char>(C));
+}
+
+// Decode the payload of a *single* string literal token spelling into a byte
+// sequence, while also recording a mapping from each decoded byte back to the
+// corresponding byte range in the original token spelling.
+//
+// This is intended for producer-side "paste-through-stringify" projection:
+// mapping pasted-token spellings embedded inside a string literal (emitted by
+// '#') back to the paste-producer macro invocation(s).
+static DecodedPayloadMap decodeStringLiteralPayload(llvm::StringRef Spelling) {
+  DecodedPayloadMap R;
+
+  auto pushMappedByte = [&](char B, uint32_t SpellBegin, uint32_t SpellEnd) {
+    R.Decoded.push_back(B);
+    R.PayloadToSpelling.emplace_back(SpellBegin, SpellEnd);
+  };
+
+  auto pushMappedUtf8 = [&](uint32_t CP, uint32_t SpellBegin,
+                            uint32_t SpellEnd) {
+    size_t before = R.Decoded.size();
+    appendUtf8(CP, R.Decoded);
+    size_t after = R.Decoded.size();
+    for (size_t i = before; i < after; ++i)
+      R.PayloadToSpelling.emplace_back(SpellBegin, SpellEnd);
+  };
+
+  const size_t N = Spelling.size();
+  if (N < 2)
+    return R;
+
+  size_t I = 0;
+
+  // Optional prefix: u8, u, U, L.
+  if (Spelling.starts_with("u8")) {
+    I = 2;
+  } else if (Spelling.starts_with("u") || Spelling.starts_with("U") ||
+             Spelling.starts_with("L")) {
+    I = 1;
+  }
+
+  // Raw string literal: (prefix)? R"delim(... )delim"
+  if (I + 2 < N && Spelling[I] == 'R' && Spelling[I + 1] == '"') {
+    size_t DelimBegin = I + 2;
+    size_t OpenParen = Spelling.find("(", DelimBegin);
+    if (OpenParen == llvm::StringRef::npos)
+      return R;
+    llvm::StringRef Delim = Spelling.slice(DelimBegin, OpenParen);
+    llvm::SmallString<32> Closing;
+    Closing.append(")");
+    Closing.append(Delim);
+    Closing.append("\"");
+    size_t ClosePos = Spelling.find(Closing, OpenParen + 1);
+    if (ClosePos == llvm::StringRef::npos)
+      return R;
+
+    size_t ContentBegin = OpenParen + 1;
+    size_t ContentEnd = ClosePos;
+
+    for (size_t P = ContentBegin; P < ContentEnd; ++P)
+      pushMappedByte(Spelling[P], (uint32_t)P, (uint32_t)(P + 1));
+
+    R.Valid = true;
+    return R;
+  }
+
+  if (I >= N || Spelling[I] != '"')
+    return R;
+
+  ++I; // consume opening quote
+
+  for (;;) {
+    if (I >= N)
+      return R;
+    if (Spelling[I] == '"') {
+      R.Valid = true;
+      return R;
+    }
+
+    if (Spelling[I] != '\\') {
+      pushMappedByte(Spelling[I], (uint32_t)I, (uint32_t)(I + 1));
+      ++I;
+      continue;
+    }
+
+    size_t EscBegin = I;
+    ++I;
+    if (I >= N)
+      return R;
+
+    // Line splice: "\\\n" or "\\\r\n" (no output byte).
+    if (Spelling[I] == '\n') {
+      ++I;
+      continue;
+    }
+    if (Spelling[I] == '\r' && I + 1 < N && Spelling[I + 1] == '\n') {
+      I += 2;
+      continue;
+    }
+
+    char C = Spelling[I];
+
+    // Hex escape: \x[0-9A-Fa-f]+
+    if (C == 'x') {
+      ++I;
+      if (I >= N || !llvm::isHexDigit(Spelling[I]))
+        return R;
+
+      uint32_t V = 0;
+      while (I < N && llvm::isHexDigit(Spelling[I])) {
+        V = (V << 4) + llvm::hexDigitValue(Spelling[I]);
+        ++I;
+      }
+
+      pushMappedByte((char)(V & 0xFFu), (uint32_t)EscBegin, (uint32_t)I);
+      continue;
+    }
+
+    // Octal escape: \[0-7]{1,3}
+    if (C >= '0' && C <= '7') {
+      uint32_t V = 0;
+      size_t Digits = 0;
+      while (I < N && Digits < 3 &&
+             (Spelling[I] >= '0' && Spelling[I] <= '7')) {
+        V = (V << 3) + (uint32_t)(Spelling[I] - '0');
+        ++I;
+        ++Digits;
+      }
+      pushMappedByte((char)(V & 0xFFu), (uint32_t)EscBegin, (uint32_t)I);
+      continue;
+    }
+
+    // Universal character name: \uXXXX or \UXXXXXXXX.
+    if (C == 'u' || C == 'U') {
+      const size_t Needed = (C == 'u') ? 4 : 8;
+      size_t StartDigits = I + 1;
+      size_t EndDigits = StartDigits + Needed;
+      if (EndDigits > N)
+        return R;
+
+      uint32_t CP = 0;
+      for (size_t J = StartDigits; J < EndDigits; ++J) {
+        if (!llvm::isHexDigit(Spelling[J]))
+          return R;
+        CP = (CP << 4) + llvm::hexDigitValue(Spelling[J]);
+      }
+      I = EndDigits;
+      pushMappedUtf8(CP, (uint32_t)EscBegin, (uint32_t)I);
+      continue;
+    }
+
+    // Simple escapes (after we've consumed the backslash, and C = Spelling[I]).
+    const uint32_t SB = static_cast<uint32_t>(EscBegin);
+    const uint32_t SE = static_cast<uint32_t>(I + 1);
+
+    char Out = C;
+    switch (C) {
+    case 'n':
+      Out = '\n';
+      break;
+    case 'r':
+      Out = '\r';
+      break;
+    case 't':
+      Out = '\t';
+      break;
+    case 'v':
+      Out = '\v';
+      break;
+    case 'b':
+      Out = '\b';
+      break;
+    case 'f':
+      Out = '\f';
+      break;
+    case 'a':
+      Out = '\a';
+      break;
+    default:
+      // Includes: \\ \" \' \? and any unknown escape → treat as the escaped
+      // character verbatim (i.e., output 'C').
+      break;
+    }
+
+    pushMappedByte(Out, SB, SE);
+
+    ++I;
+  }
+}
+
 void computeMacroProjectionSites(Item &It, Preprocessor &PP,
-                                 const Token &MacroNameTok,
-                                 const MacroInfo *MI,
+                                 const Token &MacroNameTok, const MacroInfo *MI,
                                  const MacroArgs *Args,
                                  const LangOptions &Lang) {
+  // Producer-side metadata for consumer projection through:
+  //   - stringification sites:  #param
+  //   - token pasting sites:    a ## b
   It.StringifySpell2ArgIndices.clear();
   It.PasteTokens.clear();
   It.PasteSpell2TokenIndices.clear();
@@ -506,144 +1074,89 @@ void computeMacroProjectionSites(Item &It, Preprocessor &PP,
   if (!MI || !MI->isFunctionLike() || !Args)
     return;
 
-  (void)MacroNameTok;
   (void)Lang;
 
-  bool HasStringify = false;
-  bool HasHashHash = false;
+  bool HasStringify = false, HasHashHash = false;
   {
     const auto &RToks = MI->tokens();
     for (size_t i = 0, N = RToks.size(); i < N; ++i) {
-      if (RToks[i].is(tok::hashhash))
-        HasHashHash = true;
-      if (RToks[i].is(tok::hash) && i + 1 < N && RToks[i + 1].is(tok::identifier)) {
+      HasHashHash |= RToks[i].is(tok::hashhash);
+      if (!HasStringify && RToks[i].is(tok::hash) && i + 1 < N &&
+          RToks[i + 1].is(tok::identifier)) {
         const IdentifierInfo *II = RToks[i + 1].getIdentifierInfo();
-        if (II && MI->getParameterNum(II) >= 0)
-          HasStringify = true;
+        HasStringify = (II && MI->getParameterNum(II) >= 0);
       }
       if (HasStringify && HasHashHash)
         break;
     }
   }
 
-  auto tokenIdentInfo = [&](const Token &Tok) -> const IdentifierInfo * {
-    if (!Tok.is(tok::identifier))
-      return nullptr;
-    return Tok.getIdentifierInfo();
+  auto paramIndex = [&](const Token &T) -> int {
+    if (!T.is(tok::identifier))
+      return -1;
+    if (const IdentifierInfo *II = T.getIdentifierInfo())
+      return MI->getParameterNum(II);
+    return -1;
   };
 
-  auto tokenSpelling = [&](const Token &Tok) -> std::string {
-    return PP.getSpelling(Tok);
-  };
-
-  // -------------------------------------------------------------------------
-  // Stringification (#param)
-  // -------------------------------------------------------------------------
+  // -----------------------------
+  // Stringification: #param
+  // -----------------------------
   if (HasStringify) {
-    const Token *RToks = MI->tokens().data();
-    size_t N = MI->tokens().size();
-
-    for (size_t i = 0; i + 1 < N; ++i) {
-      if (!RToks[i].is(tok::hash))
+    const SourceLocation Loc = MacroNameTok.getLocation();
+    const auto &RT = MI->tokens();
+    for (size_t i = 0, N = RT.size(); i + 1 < N; ++i) {
+      if (!RT[i].is(tok::hash))
         continue;
-
-      const IdentifierInfo *II = tokenIdentInfo(RToks[i + 1]);
-      if (!II)
-        continue;
-
-      int PIdx = MI->getParameterNum(II);
+      int PIdx = paramIndex(RT[i + 1]);
       if (PIdx < 0)
         continue;
 
-      std::string ArgText;
-      {
-        const Token *AT = Args->getUnexpArgument(static_cast<unsigned>(PIdx));
-        bool First = true;
-        if (AT) {
-          for (; !AT->is(tok::eof); ++AT) {
-            if (!First && AT->hasLeadingSpace())
-              ArgText.push_back(' ');
-            std::string S = tokenSpelling(*AT);
-            ArgText.append(S.data(), S.size());
-            First = false;
-          }
-        }
+      // Robust: rely on Clang's own macro stringification so the spelled token
+      // matches the preprocessor output byte-for-byte.
+      std::string Quoted = "\"\"";
+      if (const Token *AT =
+              Args->getUnexpArgument(static_cast<unsigned>(PIdx))) {
+        Token StrTok = MacroArgs::StringifyArgument(AT, PP, /*Charify=*/false,
+                                                    /*ExpansionLocStart=*/Loc,
+                                                    /*ExpansionLocEnd=*/Loc);
+        Quoted = PP.getSpelling(StrTok);
       }
-
-      // Best-effort: escape like a string literal.
-      std::string Quoted;
-      Quoted.reserve(ArgText.size() + 2);
-      Quoted.push_back('"');
-      for (char c : ArgText) {
-        switch (c) {
-        case '\\':
-        case '"':
-          Quoted.push_back('\\');
-          Quoted.push_back(c);
-          break;
-        case '\n':
-          Quoted.append("\\n");
-          break;
-        case '\t':
-          Quoted.append("\\t");
-          break;
-        case '\r':
-          Quoted.append("\\r");
-          break;
-        default:
-          Quoted.push_back(c);
-          break;
-        }
-      }
-      Quoted.push_back('"');
 
       It.StringifySpell2ArgIndices[llvm::StringRef(Quoted)].push_back(
           static_cast<unsigned>(PIdx));
     }
   }
 
-  // -------------------------------------------------------------------------
-  // Token pasting (##): simulate substitution + ## evaluation.
-  // -------------------------------------------------------------------------
+  // -----------------------------
+  // Token pasting: a ## b
+  // -----------------------------
   if (!HasHashHash)
     return;
 
   struct SubstTok {
     bool IsHashHash = false;
-    std::string Text;
-    SmallVector<PastePart, 4> Parts;
     bool IsPasteResult = false;
+    std::string Text;
+    SmallVector<PastePart, 4> Parts; // only arg-sourced parts are tracked
   };
 
   SmallVector<SubstTok, 64> Seq;
 
-  auto pushLiteral = [&](std::string Text) {
-    SubstTok N;
-    N.Text = std::move(Text);
-    if (!N.Text.empty()) {
-      PastePart P; // literal
-      P.ArgIndex = std::nullopt;
-      P.ByteBegin = 0;
-      P.ByteEnd = N.Text.size();
-      N.Parts.push_back(P);
-    }
-    Seq.push_back(std::move(N));
-  };
-
-  auto pushArgTok = [&](std::string Text, unsigned ArgIndex) {
-    SubstTok N;
-    N.Text = std::move(Text);
-    if (!N.Text.empty()) {
+  auto pushTok = [&](std::string Text, std::optional<unsigned> ArgIdx) {
+    SubstTok S;
+    S.Text = std::move(Text);
+    if (ArgIdx && !S.Text.empty()) {
       PastePart P;
-      P.ArgIndex = ArgIndex;
+      P.ArgIndex = static_cast<uint32_t>(*ArgIdx);
       P.ByteBegin = 0;
-      P.ByteEnd = N.Text.size();
-      N.Parts.push_back(P);
+      P.ByteEnd = static_cast<uint32_t>(S.Text.size());
+      S.Parts.push_back(P);
     }
-    Seq.push_back(std::move(N));
+    Seq.push_back(std::move(S));
   };
 
-  // Substitute parameters with unexpanded argument token sequences.
+  // Substitute params with unexpanded argument token spellings.
   for (const Token &RTok : MI->tokens()) {
     if (RTok.is(tok::hashhash)) {
       SubstTok Op;
@@ -652,29 +1165,28 @@ void computeMacroProjectionSites(Item &It, Preprocessor &PP,
       continue;
     }
 
-    if (const IdentifierInfo *II = tokenIdentInfo(RTok)) {
-      int PIdx = MI->getParameterNum(II);
-      if (PIdx >= 0) {
-        const Token *AT = Args->getUnexpArgument(static_cast<unsigned>(PIdx));
-        if (AT) {
-          for (; !AT->is(tok::eof); ++AT)
-            pushArgTok(tokenSpelling(*AT), static_cast<unsigned>(PIdx));
-        }
-        continue;
+    int PIdx = paramIndex(RTok);
+    if (PIdx >= 0) {
+      if (const Token *AT =
+              Args->getUnexpArgument(static_cast<unsigned>(PIdx))) {
+        for (; !AT->is(tok::eof); ++AT)
+          pushTok(PP.getSpelling(*AT), static_cast<unsigned>(PIdx));
       }
+      continue;
     }
 
-    pushLiteral(tokenSpelling(RTok));
+    pushTok(PP.getSpelling(RTok), std::nullopt);
   }
 
-  // Evaluate ## left-to-right using adjacency in the substituted sequence.
+  // Evaluate ## left-to-right.
   for (unsigned i = 0; i < Seq.size();) {
     if (!Seq[i].IsHashHash) {
       ++i;
       continue;
     }
 
-    if (i == 0 || i + 1 >= Seq.size() || Seq[i - 1].IsHashHash || Seq[i + 1].IsHashHash) {
+    if (i == 0 || i + 1 >= Seq.size() || Seq[i - 1].IsHashHash ||
+        Seq[i + 1].IsHashHash) {
       ++i;
       continue;
     }
@@ -682,47 +1194,36 @@ void computeMacroProjectionSites(Item &It, Preprocessor &PP,
     SubstTok &L = Seq[i - 1];
     SubstTok &R = Seq[i + 1];
 
-    SubstTok N;
-    N.IsPasteResult = true;
-    N.Text.reserve(L.Text.size() + R.Text.size());
-    N.Text.append(L.Text.data(), L.Text.size());
-    N.Text.append(R.Text.data(), R.Text.size());
+    SubstTok M;
+    M.IsPasteResult = true;
+    M.Text.reserve(L.Text.size() + R.Text.size());
+    M.Text.append(L.Text.data(), L.Text.size());
+    M.Text.append(R.Text.data(), R.Text.size());
 
-    // Preserve part boundaries; do not coalesce.
-    N.Parts = L.Parts;
-    uint64_t Shift = L.Text.size();
+    M.Parts = L.Parts;
+    const uint32_t Shift = static_cast<uint32_t>(L.Text.size());
     for (PastePart P : R.Parts) {
       P.ByteBegin += Shift;
       P.ByteEnd += Shift;
-      N.Parts.push_back(P);
+      M.Parts.push_back(P);
     }
 
-    // Replace [i-1, i, i+1] with N.
-    Seq[i - 1] = std::move(N);
+    Seq[i - 1] = std::move(M);
     Seq.erase(Seq.begin() + i, Seq.begin() + i + 2);
-
     if (i > 0)
       --i;
   }
 
-  // Record expected pasted tokens in expansion order.
-  for (const SubstTok &N : Seq) {
-    if (!N.IsPasteResult)
+  // Record paste results with arg provenance.
+  for (const SubstTok &S : Seq) {
+    if (!S.IsPasteResult || S.Parts.empty())
       continue;
 
     PasteToken PT;
-    PT.Spelling = N.Text;
+    PT.Spelling = S.Text;
+    PT.Parts = S.Parts;
 
-    for (const PastePart &P : N.Parts) {
-      if (!P.ArgIndex)
-        continue; // literal handled by uncovered-byte detection (consumer-side)
-      PT.Parts.push_back(P);
-    }
-
-    if (PT.Parts.empty())
-      continue;
-
-    size_t Index = It.PasteTokens.size();
+    const size_t Index = It.PasteTokens.size();
     It.PasteTokens.push_back(std::move(PT));
     It.PasteSpell2TokenIndices[It.PasteTokens.back().Spelling].push_back(Index);
   }
@@ -739,10 +1240,11 @@ RefoldMapBuilder::RefoldMapBuilder(Preprocessor &PP, llvm::StringRef OutputPath,
   // cwd.
   Cwd = PPO.RefoldWorkingDir;
   llvm::SmallString<256> WD;
-  if (!llvm::sys::fs::current_path(WD))
+  if (!llvm::sys::fs::current_path(WD)) {
     Cwd = WD.str().str();
-  else
+  } else {
     Cwd = ".";
+  }
 
   EmitAbsPaths = false; // Prefer spellings; the consumer can resolve via cwd.
 
@@ -821,30 +1323,55 @@ RefoldMapBuilder::RefoldMapBuilder(Preprocessor &PP, llvm::StringRef OutputPath,
   IgnoreComments = true;
 }
 
+// Return the byte span [begin,end) in the *file buffer* that covers the entire
+// physical source line containing `HashLoc` (typically the '#' of a directive),
+// including the line-ending bytes (LF or CRLF) when present.
+//
+// Notes:
+//  - We normalize to a file location (`getFileLoc`) so macro expansions map back
+//    to a concrete FileID + offset.
+//  - Offsets are *byte offsets* into the underlying file buffer returned by
+//    SourceManager, which is exactly what the refold map schema wants for
+//    site_begin/site_end.
 std::optional<std::pair<uint64_t, uint64_t>>
 RefoldMapBuilder::computeDirectiveLine(SourceLocation HashLoc) {
+  // Convert to a file spelling location (not a macro expansion location).
   SourceLocation H = SM.getFileLoc(HashLoc);
   if (!H.isValid())
     return std::nullopt;
+
   FileID FID = SM.getFileID(H);
+
+  // Fetch the entire file buffer for this FileID. If SourceManager can’t
+  // provide it (e.g. invalid buffer), bail.
   bool Invalid = false;
   StringRef Buf = SM.getBufferData(FID, &Invalid);
   if (Invalid)
     return std::nullopt;
-  auto B = SM.getFileOffset(H);
-  size_t N = Buf.size();
+
+  // `B` is the byte offset of the directive hash within the file buffer.
+  const size_t B = SM.getFileOffset(H);
+  const size_t N = Buf.size();
+
+  // Scan forward to find the end-of-line for the physical line containing `B`.
+  // We stop at either '\n' or '\r' so we can handle both LF and CRLF.
   size_t P = B;
-  // Scan to end-of-line
   while (P < N && Buf[P] != '\n' && Buf[P] != '\r')
     ++P;
+
+  // Default end is the byte position of the line break (or EOF if none).
   size_t E = P;
+
+  // If we stopped on a line break, include it in the returned span so the caller
+  // can slice the whole directive line including its terminator.
   if (P < N) {
-    // include EOL
+    // Windows-style CRLF: include both bytes.
     if (Buf[P] == '\r' && P + 1 < N && Buf[P + 1] == '\n')
       E = P + 2;
     else
-      E = P + 1;
+      E = P + 1; // LF or bare CR
   }
+
   return {{B, E}};
 }
 
@@ -939,7 +1466,8 @@ std::optional<uint32_t> RefoldMapBuilder::argIndexForSpellingLoc(
     // Note: if CurrentLoc is a MacroID, Sm.getFileLoc(CurrentLoc) collapses
     // through macro layers to a file location; otherwise it is already a file
     // location.
-    SourceLocation Fl = CurrentLoc.isMacroID() ? Sm.getFileLoc(CurrentLoc) : CurrentLoc;
+    SourceLocation Fl =
+        CurrentLoc.isMacroID() ? Sm.getFileLoc(CurrentLoc) : CurrentLoc;
 
     std::string TokFile = filePathForLocAbs(Sm, Fl, EmitAbsPaths);
     if (TokFile == MI.InvFile) {
@@ -1091,28 +1619,49 @@ void RefoldMapBuilder::onMacroDefined(const Token &MacroNameTok,
                                       const MacroDirective *MD) {
   if (!enabled())
     return;
+
   const MacroInfo *MI = MD->getMacroInfo();
+
+  // Skip Clang’s built-in/predefined macros (e.g. __LINE__, __FILE__, etc.).
+  // These don’t have a meaningful user-authored #define site we can project
+  // edits back onto in the original source.
   if (MI->isBuiltinMacro())
     return;
 
+  // Record a directive "Item" describing this concrete #define in the source.
   Item It;
   It.ID = Items.size();
   It.Kind = IK_Directive;
   It.Subkind = "#define";
+
+  // Use the macro definition location (not the expansion site) so the consumer
+  // can map this item back to the defining file/line reliably.
   It.Loc = MI->getDefinitionLoc();
+
+  // Materialize the directive text exactly as Clang would print it.
+  // This keeps the producer’s directive spelling stable and avoids ad-hoc
+  // reconstruction logic (function-like vs object-like, whitespace, etc.).
   std::string S;
   llvm::raw_string_ostream OS(S);
   PrintMacroDefinition(*MacroNameTok.getIdentifierInfo(), *MI, PP, &OS);
-  OS << "\n";
+  OS << "\n"; // preserve directive line termination for refolding/diffing
   It.Text = OS.str();
+
+  // Site info: capture the byte span of the whole directive line in its file,
+  // so the consumer can do precise byte-based edits against the original source.
   auto Line = computeDirectiveLine(MI->getDefinitionLoc());
   if (Line) {
     It.SiteBegin = Line->first;
     It.SiteEnd = Line->second;
   }
+
+  // Absolute (or configured) path of the file containing the #define.
   It.SitePath = filePathForLocAbs(SM, MI->getDefinitionLoc(), EmitAbsPaths);
 
   Items.push_back(std::move(It));
+
+  // If we are currently inside an included file, attach ownership so the
+  // consumer can attribute this directive to the include that brought it in.
   if (!IncludeStack.empty() && IncludeStack.back())
     Items.back().OwnerIncludeId = static_cast<uint64_t>(*IncludeStack.back());
 }
@@ -1123,23 +1672,37 @@ void RefoldMapBuilder::onMacroUndefined(const Token &MacroNameTok,
   if (!enabled())
     return;
 
+  // Record this as a directive “Item” so the consumer can reconstruct / project
+  // edits involving macro lifecycle directives (here: #undef).
   Item It;
   It.ID = Items.size();
   It.Kind = IK_Directive;
   It.Subkind = "#undef";
   It.Loc = MacroNameTok.getLocation();
+
+  // Materialize the directive text exactly as it should appear in the refolded
+  // source (including newline terminator).
   std::string S = "#undef ";
   S += MacroNameTok.getIdentifierInfo()->getName().str();
   S += "\n";
   It.Text = std::move(S);
+
+  // Compute the byte-span of the full directive line in the source buffer so
+  // the consumer can map this directive to an exact site range.
   auto Line = computeDirectiveLine(MacroNameTok.getLocation());
   if (Line) {
     It.SiteBegin = Line->first;
     It.SiteEnd = Line->second;
   }
+
+  // Capture file provenance for the directive site (abs/rel controlled by
+  // policy).
   It.SitePath = filePathForLocAbs(SM, MacroNameTok.getLocation(), EmitAbsPaths);
 
   Items.push_back(std::move(It));
+
+  // If we're currently inside an #include, tag this directive with its owning
+  // include item so the consumer can attribute it to the include context.
   if (!IncludeStack.empty() && IncludeStack.back())
     Items.back().OwnerIncludeId = static_cast<uint64_t>(*IncludeStack.back());
 }
@@ -1163,6 +1726,21 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
 
   if (auto *II = MacroNameTok.getIdentifierInfo())
     It.Name = II->getName().str();
+
+  // Record the macro's formal parameter list (as defined), so consumers can build
+  // provenance edges across nested invocations without re-expanding macros.
+  if (MI && MI->isFunctionLike()) {
+    It.DefParams.clear();
+    It.DefParams.reserve(MI->getNumParams());
+    const unsigned NumParams = MI->getNumParams();
+    for (unsigned I = 0; I != NumParams; ++I) {
+      MacroParam P;
+      if (const IdentifierInfo *PI = getMacroParamIdentifier(MI, I))
+        P.Name = PI->getName().str();
+      P.Variadic = (MI->isVariadic() && I + 1 == NumParams);
+      It.DefParams.push_back(std::move(P));
+    }
+  }
 
   It.Loc = Range.getBegin();
   It.IsBuiltinMacro = (MI != nullptr && MI->isBuiltinMacro());
@@ -1212,6 +1790,22 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
 
   // 2. Perform projections and arg ranges on the local 'It'
   computeInvArgRanges(Args, MI, SM, Lang, It.InvArgRanges);
+
+  // For nested macro expansions, argument tokens often point back to the
+  // ultimate expansion site (caller arguments), which can put the recorded
+  // ranges outside of this invocation's spelling text. When that happens,
+  // recompute argument ranges by parsing the recorded invocation text so
+  // that InvText and InvArgRanges are consistent.
+  if (!invArgRangesWithinInvocation(It)) {
+    const bool ParsedOK =
+       It.InvBegin && computeInvArgRangesFromText(It.InvText, *It.InvBegin, It.InvArgRanges.size(),
+                               PP.getLangOpts(), It.InvArgRanges);
+    if (!ParsedOK) {
+      for (auto &R : It.InvArgRanges)
+        R = {std::nullopt, std::nullopt};
+    }
+  }
+
   computeMacroProjectionSites(It, PP, MacroNameTok, MI, Args, Lang);
 
   // 3. Capture Owner ID from the stack before we lose the context
@@ -1225,6 +1819,53 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
 
   // 5. Update the mapping for lookup during token attribution
   MacroKey2Item[keyForMacroLoc(MacroNameTok.getLocation())] = NewIdx;
+
+  // Register paste-produced spellings for paste-through-stringify projection.
+  for (const auto &E : Items[NewIdx].PasteSpell2TokenIndices) {
+    auto &Vec = PasteSpell2MacroItems[E.getKey()];
+    if (std::find(Vec.begin(), Vec.end(), NewIdx) == Vec.end())
+      Vec.push_back(NewIdx);
+  }
+
+  // Helper: map a macro invocation location to the corresponding Item index.
+  // (Used to form deterministic caller relationships for nested macros.)
+  auto LookupMacroItem = [&](SourceLocation Loc) -> std::optional<size_t> {
+    if (Loc.isInvalid())
+      return std::nullopt;
+    auto It = MacroKey2Item.find(keyForMacroLoc(Loc));
+    if (It != MacroKey2Item.end())
+      return It->second;
+    return std::nullopt;
+  };
+
+  // If this macro invocation occurred while expanding another macro, record the
+  // immediately enclosing (caller) macro invocation's item id.
+  {
+    Item &CurIt = Items[NewIdx];
+    SourceLocation NameLoc = MacroNameTok.getLocation();
+    if (!NameLoc.isMacroID() && Range.getBegin().isMacroID())
+      NameLoc = Range.getBegin();
+
+    if (!CurIt.CallerMacroId && NameLoc.isMacroID()) {
+      SourceLocation L = NameLoc;
+      for (unsigned Depth = 0; Depth != 16 && L.isMacroID(); ++Depth) {
+        CharSourceRange ER = SM.getImmediateExpansionRange(L);
+        SourceLocation CallerLoc = ER.getBegin();
+        if (CallerLoc.isValid()) {
+          if (auto CallerIdx = LookupMacroItem(CallerLoc)) {
+            if (*CallerIdx != NewIdx)
+              CurIt.CallerMacroId = Items[*CallerIdx].ID;
+            break;
+          }
+        }
+
+        SourceLocation Next = SM.getImmediateMacroCallerLoc(L);
+        if (!Next.isValid() || Next == L)
+          break;
+        L = Next;
+      }
+    }
+  }
 
   // 6. THE SCHEMA FIX:
   // Seed the item with an *empty* open span at the current PP token index.
@@ -1251,12 +1892,18 @@ void RefoldMapBuilder::onPragma(SourceLocation HashLoc, StringRef FullText) {
   if (!enabled())
     return;
 
+  // Model a preprocessor pragma as a directive Item so the consumer can keep
+  // it anchored to its original file/byte span when projecting edits.
   Item It;
   It.ID = Items.size();
   It.Kind = IK_Directive;
   It.Subkind = "#pragma";
   It.Loc = HashLoc;
+
+  // Capture the directive's original text verbatim (as emitted/observed by the
+  // preprocessor), including any trailing newline already present in FullText.
   It.Text = FullText.str();
+
   // Site info (line byte span and file path).
   auto Line = computeDirectiveLine(HashLoc);
   if (Line) {
@@ -1266,6 +1913,9 @@ void RefoldMapBuilder::onPragma(SourceLocation HashLoc, StringRef FullText) {
   It.SitePath = filePathForLocAbs(SM, HashLoc, EmitAbsPaths);
 
   Items.push_back(std::move(It));
+
+  // If this pragma occurred while processing an included file, attach the
+  // owning include Item id so the consumer can reconstruct include provenance.
   if (!IncludeStack.empty() && IncludeStack.back())
     Items.back().OwnerIncludeId = static_cast<uint64_t>(*IncludeStack.back());
 }
@@ -1333,7 +1983,16 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
     };
 
     // Innermost macro: immediate caller of this token location.
-    SourceLocation Caller = SM.getImmediateMacroCallerLoc(L);
+    //
+    // For nested expansions, SourceManager::getImmediateMacroCallerLoc() can “skip” past the
+    // immediate invocation (e.g. when the call site itself is synthesized from an outer macro
+    // expansion). Prefer the begin of the immediate expansion range, which corresponds to the
+    // macro-name token location for the invocation that produced this token.
+    SourceLocation Caller;
+    if (auto R = SM.getImmediateExpansionRange(L); R.isValid())
+      Caller = R.getBegin();
+    if (!Caller.isValid())
+      Caller = SM.getImmediateMacroCallerLoc(L);
     auto InnerIdx = LookupMacroItem(Caller);
 
     // Enclosing macro: walk up the macro caller chain (keeps MacroID hops intact).
@@ -1435,7 +2094,9 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
     // per macro invocation and match by the emitted token spelling here.
     if (L.isMacroID()) {
       const std::string Sp = PP.getSpelling(Tok);
+      StringRef Spelling = Sp;
 
+      // Record projections for stringification (#X) and token-pasting (X##Y).
       auto recordProjectionsForItem = [&](Item &MI) {
         if (MI.Kind != IK_Macro)
           return;
@@ -1462,7 +2123,6 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
         // operations.
         if (MI.PasteTokens.empty())
           return;
-
         auto ItP = MI.PasteSpell2TokenIndices.find(Sp);
         if (ItP == MI.PasteSpell2TokenIndices.end())
           return;
@@ -1503,8 +2163,8 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
 
         // Record one span per argument part (arg_index + byte range inside
         // the pasted token).
-        auto appendPasteSpan = [&](std::optional<unsigned> ArgIndex, unsigned ByteBegin,
-                                   unsigned ByteEnd) {
+        auto appendPasteSpan = [&](std::optional<unsigned> ArgIndex,
+                                   unsigned ByteBegin, unsigned ByteEnd) {
           ArgTokenSpan S;
           S.Begin = TokIndex;
           S.End = TokIndex + 1;
@@ -1518,7 +2178,11 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
         for (const PastePart &P : PT.Parts) {
           if (!P.ArgIndex)
             continue;
-          appendPasteSpan(P.ArgIndex, P.ByteBegin, P.ByteEnd);
+
+          unsigned ByteBegin = P.ByteBegin;
+          unsigned ByteEnd = P.ByteEnd;
+
+          appendPasteSpan(P.ArgIndex, ByteBegin, ByteEnd);
         }
       };
 
@@ -1540,6 +2204,289 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
         }
 
         Cur = Caller;
+      }
+    }
+
+    // Paste-through-stringify projection:
+    //
+    // Goal: if the *emitted* token is a string literal that itself came from a
+    // stringify site (`#arg`), then edits inside that string literal may need
+    // to be attributed back to earlier token-paste (`##`) results that
+    // contributed substrings to the argument being stringified.
+    //
+    // This is specifically for cases where the `##`-producing macro is *not*
+    // present on the immediate macro caller chain at the emission site (because
+    // the paste happened earlier while building the argument text).
+    if (L.isMacroID() &&
+        Tok.isOneOf(tok::string_literal, tok::wide_string_literal,
+                    tok::utf8_string_literal, tok::utf16_string_literal,
+                    tok::utf32_string_literal) &&
+        !PasteSpell2MacroItems.empty()) {
+
+      // Sp = exact spelled bytes of the emitted string-literal token as the
+      // preprocessor outputs it. This is what we key against in
+      // StringifySpell2ArgIndices to identify the stringify owner.
+      const std::string SpStr = PP.getSpelling(Tok);
+      const llvm::StringRef Sp = SpStr;
+
+      // Identify which macro invocation item "owns" this spelled string literal
+      // as a result of a `#param` in its replacement list.
+      std::optional<size_t> StringifyOwnerIdx;
+
+      // Try to attribute this spelled string token to a specific item index I
+      // by checking whether item I recorded a stringify-site mapping for Sp.
+      auto trySetOwner = [&](size_t I) {
+        if (StringifyOwnerIdx)
+          return;
+        auto It = Items[I].StringifySpell2ArgIndices.find(Sp);
+        if (It != Items[I].StringifySpell2ArgIndices.end())
+          StringifyOwnerIdx = I;
+      };
+
+      // First attempt: if the current emission is already associated with a
+      // macro item (ItemIdx), prefer that.
+      if (ItemIdx)
+        trySetOwner(*ItemIdx);
+
+      // Otherwise, walk up the macro caller chain (bounded) and see if any
+      // enclosing macro invocation item performed the stringification that
+      // produced this spelled string token.
+      SourceLocation Cur2 = L;
+      for (unsigned Depth = 0;
+           Depth < 32 && Cur2.isMacroID() && !StringifyOwnerIdx; ++Depth) {
+        SourceLocation Caller = SM.getImmediateMacroCallerLoc(Cur2);
+        if (Caller.isInvalid())
+          break;
+        auto ItM = MacroKey2Item.find(keyForMacroLoc(Caller));
+        if (ItM != MacroKey2Item.end())
+          trySetOwner(ItM->second);
+        Cur2 = Caller;
+      }
+
+      if (StringifyOwnerIdx) {
+        // Decode the string literal into its "payload" (decoded characters) and
+        // a mapping from decoded-payload indices back to (begin,end) spans in
+        // the *spelled* token string. We only proceed if that mapping is a
+        // per-byte/per-char 1:1 correspondence with Decoded.
+        const auto Dec = decodeStringLiteralPayload(Sp);
+        if (Dec.Valid && Dec.PayloadToSpelling.size() == Dec.Decoded.size()) {
+
+          // rootOf(I):
+          // Collapse an item index I up through CallerMacroId links until we
+          // hit the root invocation in that call chain. This gives a stable
+          // "macro family" identifier so we can avoid cross-chain ambiguity.
+          auto rootOf = [&](size_t I) -> uint64_t {
+            size_t Cur = I;
+            for (unsigned Depth = 0; Depth < 128; ++Depth) {
+              if (Cur >= Items.size())
+                break;
+              if (!Items[Cur].CallerMacroId)
+                break;
+              uint64_t CallerId = *Items[Cur].CallerMacroId;
+              if (CallerId >= Items.size())
+                break;
+              Cur = (size_t)CallerId;
+            }
+            return Items[Cur].ID;
+          };
+
+          // RootId = root macro invocation for the stringify owner chain.
+          // We only attribute paste matches to paste-items whose root matches
+          // this RootId, to prevent accidental matches across unrelated macro
+          // expansions that happen to share a spelling substring.
+          const uint64_t RootId = rootOf(*StringifyOwnerIdx);
+
+          // recordPastePart:
+          // Append one ArgTokenSpan describing that bytes [SpellBegin,SpellEnd)
+          // within the *spelled* string-literal token originate from argument
+          // ArgIndex of the paste-producing macro item PMI, at output token
+          // TokIndex.
+          auto recordPastePart = [&](Item &PMI, uint64_t TokIndex,
+                                     uint32_t ArgIndex, uint32_t SpellBegin,
+                                     uint32_t SpellEnd) {
+            ArgTokenSpan AS;
+            AS.Begin = TokIndex;
+            AS.End = TokIndex + 1;
+            AS.ArgIndex = ArgIndex;
+            AS.Open = false;
+            AS.HasByteRange = true;
+            AS.ByteBegin = SpellBegin;
+            AS.ByteEnd = SpellEnd;
+            PMI.PasteSpans.push_back(AS);
+          };
+
+          // Work over the decoded payload (not the spelled token) so that
+          // escape sequences don't interfere with substring search. We'll map
+          // back to spelled offsets using PayloadToSpelling.
+          const llvm::StringRef D(Dec.Decoded);
+
+          // Scan through the decoded payload, but only consider identifier-like
+          // runs; pasting most commonly creates identifiers / identifier
+          // chunks, and limiting to these runs reduces false positives
+          // substantially.
+          for (size_t P = 0; P < D.size();) {
+            unsigned char C = (unsigned char)D[P];
+            if (!isIdentByte(C)) {
+              ++P;
+              continue;
+            }
+
+            // [RunBegin,RunEnd) = one maximal identifier-ish run.
+            size_t RunBegin = P;
+            while (P < D.size() && isIdentByte((unsigned char)D[P]))
+              ++P;
+            size_t RunEnd = P;
+
+            llvm::StringRef Word = D.substr(RunBegin, RunEnd - RunBegin);
+
+            // A match is "paste spelling Key found at offset Off inside this
+            // run".
+            struct Match {
+              llvm::StringRef Spell;
+              size_t Offset; // offset within this identifier run
+            };
+
+            llvm::SmallVector<Match, 8> Matches;
+            auto addMatch = [&](llvm::StringRef Spell, size_t Off) {
+              // Deduplicate identical matches within the run to avoid doing the
+              // same attribution work multiple times.
+              for (const auto &M : Matches) {
+                if (M.Spell == Spell && M.Offset == Off)
+                  return;
+              }
+              Matches.push_back({Spell, Off});
+            };
+
+            // Find all paste-result spellings that occur as substrings within
+            // this identifier run. PasteSpell2MacroItems maps:
+            //   spelled_paste_token -> [candidate macro item indices that can
+            //   produce it]
+            for (const auto &KV : PasteSpell2MacroItems) {
+              llvm::StringRef Key = KV.getKey();
+              if (Key.empty() || Key.size() > Word.size())
+                continue;
+
+              // Collect all occurrences of Key within this run (including
+              // overlaps).
+              size_t Off = Word.find(Key);
+              while (Off != llvm::StringRef::npos) {
+                addMatch(Key, Off);
+                Off = Word.find(Key, Off + 1);
+              }
+            }
+
+            auto handleMatch = [&](llvm::StringRef MatchSpell,
+                                   size_t MatchOff) {
+              // Identify which paste macro item(s) could have produced
+              // MatchSpell.
+              auto GI = PasteSpell2MacroItems.find(MatchSpell);
+              if (GI == PasteSpell2MacroItems.end())
+                return;
+
+              // Filter candidates to those in the same macro-root chain as the
+              // stringify owner, to enforce locality/uniqueness.
+              llvm::SmallVector<size_t, 4> Cands;
+              for (size_t Cand : GI->second) {
+                if (Cand >= Items.size())
+                  continue;
+                if (rootOf(Cand) != RootId)
+                  continue;
+                Cands.push_back(Cand);
+              }
+
+              // If ambiguous (0 or >1), bail: we can't safely attribute this
+              // substring to exactly one paste macro invocation.
+              if (Cands.size() != 1)
+                return;
+
+              const size_t PasteItemIdx = Cands[0];
+              Item &PMI = Items[PasteItemIdx];
+
+              // PMI.PasteSpell2TokenIndices maps:
+              //   paste_spelling -> [indices in PMI.PasteTokens vector]
+              // (because the same spelling can be produced multiple times per
+              // item).
+              auto SI = PMI.PasteSpell2TokenIndices.find(MatchSpell);
+              if (SI == PMI.PasteSpell2TokenIndices.end())
+                return;
+
+              const auto &TokenIndices = SI->second;
+              if (TokenIndices.empty())
+                return;
+
+              // Choose a paste-token occurrence deterministically using the
+              // per-item cursor:
+              //   - prefer the token whose index equals the cursor
+              //   - else prefer the first token >= cursor
+              //   - else fall back to the first recorded token
+              size_t Selected = TokenIndices.front();
+              const size_t Cursor = PMI.PasteTokenCursor;
+
+              if (Cursor < PMI.PasteTokens.size()) {
+                for (size_t C : TokenIndices) {
+                  if (C == Cursor) {
+                    Selected = C;
+                    break;
+                  }
+                }
+              }
+              if (Selected < Cursor) {
+                for (size_t C : TokenIndices) {
+                  if (C >= Cursor) {
+                    Selected = C;
+                    break;
+                  }
+                }
+              }
+              if (PMI.PasteTokenCursor < Selected + 1)
+                PMI.PasteTokenCursor = Selected + 1;
+
+              if (Selected >= PMI.PasteTokens.size())
+                return;
+
+              const auto &PT = PMI.PasteTokens[Selected];
+              bool AnyRecorded = false;
+
+              // Base = decoded-payload index where the matched paste spelling
+              // begins.
+              const size_t Base = RunBegin + MatchOff;
+
+              // For each argument-derived part of the paste token, translate
+              // its [ByteBegin,ByteEnd) within the paste spelling (decoded
+              // space) into [SB,SE) within the *spelled* string literal token
+              // using the payload-to-spelling map.
+              for (const auto &Part : PT.Parts) {
+                if (!Part.ArgIndex)
+                  continue;
+
+                const size_t PB = Base + Part.ByteBegin;
+                const size_t PE = Base + Part.ByteEnd;
+                if (PE <= PB || PE > Dec.PayloadToSpelling.size())
+                  continue;
+
+                // PayloadToSpelling[k] = {spell_begin, spell_end} for decoded
+                // index k. We map [PB,PE) by taking begin at PB and end at
+                // PE-1's end.
+                const uint32_t SB = Dec.PayloadToSpelling[PB].first;
+                const uint32_t SE = Dec.PayloadToSpelling[PE - 1].second;
+
+                recordPastePart(PMI, TokIndex, (uint32_t)*Part.ArgIndex, SB,
+                                SE);
+                AnyRecorded = true;
+              }
+
+              // If we recorded any paste spans for this item, mark it as
+              // “touched” at this output token index so later stages know this
+              // item participates in projection at TokIndex.
+              if (AnyRecorded)
+                touchSpanForItem(PasteItemIdx, TokIndex);
+            };
+
+            // Process each unique match found in this identifier run.
+            for (const auto &M : Matches)
+              handleMatch(M.Spell, M.Offset);
+          }
+        }
       }
     }
 
@@ -1566,11 +2513,13 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
       if (MI.InvFile != TokFile)
         continue;
       if (*MI.InvBegin <= *TokB && *TokE <= *MI.InvEnd) {
-        // Ensure the enclosing macro's primary token span covers nested expansions.
+        // Ensure the enclosing macro's primary token span covers nested
+        // expansions.
         touchSpanForItem(I, TokIndex);
 
         // For function-like macros, anything after the name token is treated as
-        // originating from an argument spelling region. Otherwise, treat as body.
+        // originating from an argument spelling region. Otherwise, treat as
+        // body.
         if (MI.Subkind == "func") {
           auto ArgIndex = argIndexForSpellingLoc(MI, L, SM, Lang, EmitAbsPaths);
           if (ArgIndex)
@@ -1629,22 +2578,23 @@ void RefoldMapBuilder::finalizeIncludeDecls() {
     return Buf;
   };
 
+  // Returns true iff `S` looks like a plain ASCII identifier token:
+  //   [_A-Za-z][_A-Za-z0-9]*
+  // This is a *lexical heuristic* (not a full lexer): it's used to cheaply
+  // recognize "identifier-like" substrings when scanning decoded text.
   auto isIdentLike = [](llvm::StringRef S) -> bool {
     if (S.empty())
       return false;
-    auto isLetter = [](char c) {
-      return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
-    };
-    auto isDigit = [](char c) { return (c >= '0' && c <= '9'); };
 
-    char c0 = S.front();
-    if (!(isLetter(c0) || c0 == '_'))
+    const unsigned char C0 = static_cast<unsigned char>(S.front());
+    if (!(llvm::isAlpha(C0) || C0 == '_'))
       return false;
-    for (char c : S.drop_front()) {
-      if (!(isLetter(c) || isDigit(c) || c == '_'))
-        return false;
-    }
-    return true;
+
+    return std::all_of(S.drop_front().begin(), S.drop_front().end(),
+                       [](char c) {
+                         const unsigned char U = static_cast<unsigned char>(c);
+                         return llvm::isAlnum(U) || U == '_';
+                       });
   };
 
   for (Item &It : Items) {
@@ -1812,15 +2762,17 @@ void RefoldMapBuilder::writeJSON() {
     const auto &PPO = PP.getPreprocessorOpts();
     std::string LangStr = computeLangStr(PP.getLangOpts());
 
+    // Capture a stable CWD string for provenance. Historically we attempted
+    // this twice to tolerate rare transient failures.
     llvm::SmallString<256> CWD;
     std::string CwdStr;
-    if (!llvm::sys::fs::current_path(CWD))
-      CwdStr = CWD.str().str();
-    llvm::SmallString<256> WD;
-    if (!llvm::sys::fs::current_path(WD))
-      CwdStr = WD.str().str();
+    for (int Attempt = 0; Attempt < 2 && CwdStr.empty(); ++Attempt) {
+      CWD.clear();
+      if (!llvm::sys::fs::current_path(CWD))
+        CwdStr = CWD.str().str();
+    }
 
-    // Serailize the PP context of this clang instance
+    // Serialize the PP context of this clang instance
     JO.attributeObject("pp_ctx", [&] {
       JO.attribute("cwd", CwdStr);
       JO.attributeArray("argv", [&] {
@@ -1847,6 +2799,444 @@ void RefoldMapBuilder::writeJSON() {
       }
     });
 
+    // -------------------------------------------------------------------------
+    // Macro provenance DAG helpers.
+    //
+    // We derive an immediate caller relation between macro invocations by
+    // containment of their emitted token envelopes in the preprocessed output
+    // (A-domain). We also compute (for nested invocations) per-argument
+    // dependency sets on the caller's formals by scanning the raw argument text
+    // for occurrences of caller parameter names. This is deliberately syntactic
+    // and conservative: it records "could depend on" edges without
+    // re-expanding.
+    // -------------------------------------------------------------------------
+
+    struct MacroEnv {
+      uint64_t ID = 0;
+      uint64_t BTok = 0;
+      uint64_t ETok = 0;
+    };
+
+    llvm::DenseMap<uint64_t, const Item *> ItemByID;
+    ItemByID.reserve(Items.size());
+    for (const Item &It : Items)
+      ItemByID.try_emplace(It.ID, &It);
+
+    auto computeTokEnvelope = [](const Item &It, uint64_t &BTok,
+                                 uint64_t &ETok) -> bool {
+      uint64_t B = std::numeric_limits<uint64_t>::max();
+      uint64_t E = 0;
+      for (const TokenSpan &S : It.Spans) {
+        B = std::min(B, S.Begin);
+        E = std::max(E, S.End);
+      }
+      if (B == std::numeric_limits<uint64_t>::max() || E <= B)
+        return false;
+      BTok = B;
+      ETok = E;
+      return true;
+    };
+
+    llvm::SmallVector<MacroEnv, 128> MacroEnvs;
+    for (const Item &It : Items) {
+      if (It.Kind != IK_Macro)
+        continue;
+      uint64_t B = 0, E = 0;
+      if (computeTokEnvelope(It, B, E))
+        MacroEnvs.push_back({It.ID, B, E});
+    }
+
+    std::sort(MacroEnvs.begin(), MacroEnvs.end(),
+              [](const MacroEnv &A, const MacroEnv &B) {
+                if (A.BTok != B.BTok)
+                  return A.BTok < B.BTok;
+                // Longer (outer) first when equal begin.
+                return A.ETok > B.ETok;
+              });
+
+    llvm::DenseMap<uint64_t, uint64_t> CallerMacroByID;
+    llvm::SmallVector<MacroEnv, 32> MacroStack;
+    for (const MacroEnv &Env : MacroEnvs) {
+      while (!MacroStack.empty() && Env.BTok >= MacroStack.back().ETok)
+        MacroStack.pop_back();
+      if (!MacroStack.empty() && Env.ETok <= MacroStack.back().ETok)
+        CallerMacroByID.try_emplace(Env.ID, MacroStack.back().ID);
+      MacroStack.push_back(Env);
+    }
+    const LangOptions &Lang = PP.getLangOpts();
+
+    // Scan raw invocation text for occurrences of the caller macro's *formal
+    // parameter* identifiers. This is used to record which caller parameters
+    // are referenced by the callee's (decoded) replacement text.
+    //
+    // We use Clang's raw lexer so that:
+    //   * comments are treated as whitespace (not scanned for identifiers),
+    //   * literals are tokenized as single tokens (so internal punctuation
+    //     doesn't affect scanning), and
+    //   * identifier rules match the language mode (C/C++).
+    auto collectCallerFormalDeps =
+        [&Lang](llvm::StringRef Text, const llvm::StringMap<uint32_t> &NameToIdx)
+        -> std::vector<uint32_t> {
+      llvm::SmallVector<uint32_t, 8> Deps;
+
+      auto addDep = [&](uint32_t I) {
+        for (uint32_t E : Deps)
+          if (E == I)
+            return;
+        Deps.push_back(I);
+      };
+
+      if (Text.empty())
+        return {};
+
+      const SourceLocation BaseLoc = SourceLocation::getFromRawEncoding(1);
+      std::string LexBuf = Text.str();
+      LexBuf.push_back('\0');
+      const char *BufStart = LexBuf.data();
+      const char *BufEnd = BufStart + Text.size();
+      Lexer Lex(BaseLoc, Lang, BufStart, BufStart, BufEnd);
+      Token Tok;
+
+      while (true) {
+        Lex.LexFromRawLexer(Tok);
+        if (Tok.is(tok::eof))
+          break;
+
+        if (!(Tok.is(tok::identifier) || Tok.is(tok::raw_identifier)))
+          continue;
+
+        const unsigned Off =
+            Tok.getLocation().getRawEncoding() - BaseLoc.getRawEncoding();
+        llvm::StringRef Ident(Text.data() + Off, Tok.getLength());
+
+        auto It = NameToIdx.find(Ident);
+        if (It != NameToIdx.end())
+          addDep(It->getValue());
+      }
+
+      std::sort(Deps.begin(), Deps.end());
+      return std::vector<uint32_t>(Deps.begin(), Deps.end());
+    };
+
+    // Like collectCallerFormalDeps(), but records each identifier occurrence's
+    // byte span within inv_text (absolute file bytes via BaseOff + token offset).
+    auto collectCallerFormalRefs =
+        [&Lang](llvm::StringRef Text, uint64_t BaseOff,
+                const llvm::StringMap<uint32_t> &NameToIdx)
+        -> std::vector<Item::InvArgRef> {
+      std::vector<Item::InvArgRef> Refs;
+
+      if (Text.empty())
+        return Refs;
+
+      const SourceLocation BaseLoc = SourceLocation::getFromRawEncoding(1);
+      std::string LexBuf = Text.str();
+      LexBuf.push_back('\0');
+      const char *BufStart = LexBuf.data();
+      const char *BufEnd = BufStart + Text.size();
+      Lexer Lex(BaseLoc, Lang, BufStart, BufStart, BufEnd);
+      Token Tok;
+
+      while (true) {
+        Lex.LexFromRawLexer(Tok);
+        if (Tok.is(tok::eof))
+          break;
+
+        if (!(Tok.is(tok::identifier) || Tok.is(tok::raw_identifier)))
+          continue;
+
+        const unsigned Off =
+            Tok.getLocation().getRawEncoding() - BaseLoc.getRawEncoding();
+        llvm::StringRef Ident(Text.data() + Off, Tok.getLength());
+
+        auto It = NameToIdx.find(Ident);
+        if (It != NameToIdx.end()) {
+          Item::InvArgRef R;
+          R.CallerParamIndex = It->second;
+          R.ByteBegin = static_cast<uint32_t>(BaseOff + Off);
+          R.ByteEnd = static_cast<uint32_t>(BaseOff + Off + Tok.getLength());
+          Refs.push_back(R);
+        }
+      }
+
+      return Refs;
+    };
+
+    // Per-macro-invocation computed data:
+    //   - ArgDepsByID[macro_item_id][arg_i] = sorted unique list of
+    //   caller-formal
+    //     parameter indices referenced (by name) inside invocation argument i.
+    //   - ArgRefsByID[macro_item_id][arg_i] = concrete byte ranges (in
+    //   inv_text)
+    //     where those caller-formal names occur, for later projection/rewrites.
+    //
+    // We compute these for each macro invocation Item that has:
+    //   * a known caller macro (CallerMacroId), and
+    //   * caller definition parameter names (DefParams), and
+    //   * invocation argument byte ranges (InvArgRanges) + inv_text.
+    llvm::DenseMap<uint64_t, std::vector<std::vector<uint32_t>>> ArgDepsByID;
+    llvm::DenseMap<uint64_t, std::vector<std::vector<Item::InvArgRef>>>
+        ArgRefsByID;
+
+    for (const Item &It : Items) {
+      // Only macro invocation items participate in caller-arg dependency/ref
+      // scanning.
+      if (It.Kind != IK_Macro)
+        continue;
+
+      // Resolve the caller macro item ID:
+      // Prefer the direct field, but fall back to the side-table if needed
+      // (some items may have been produced before CallerMacroId was wired).
+      std::optional<uint64_t> CallerID = It.CallerMacroId;
+      if (!CallerID) {
+        auto CallerIt = CallerMacroByID.find(It.ID);
+        if (CallerIt != CallerMacroByID.end())
+          CallerID = CallerIt->second;
+      }
+      if (!CallerID)
+        continue; // no caller => cannot interpret “caller formal” references
+
+      // Look up the caller Item (the macro invocation that produced *this*
+      // one). We need its formal parameter list to build name→index mapping.
+      const Item *Caller = ItemByID.lookup(*CallerID);
+      if (!Caller || Caller->DefParams.empty() || It.InvArgRanges.empty())
+        continue;
+
+      // Build a map from caller formal parameter name -> parameter index.
+      // Empty names are ignored (defensive: should not happen for normal
+      // params).
+      llvm::StringMap<uint32_t> NameToIdx;
+      for (uint32_t I = 0; I < Caller->DefParams.size(); ++I) {
+        llvm::StringRef Nm(Caller->DefParams[I].Name);
+        if (!Nm.empty())
+          NameToIdx.try_emplace(Nm, I);
+      }
+      if (NameToIdx.empty())
+        continue;
+
+      // Deps/Refs are indexed by invocation argument index (parallel to
+      // InvArgRanges).
+      std::vector<std::vector<uint32_t>> Deps;
+      std::vector<std::vector<Item::InvArgRef>> Refs;
+      Deps.reserve(It.InvArgRanges.size());
+      Refs.reserve(It.InvArgRanges.size());
+
+      // For each argument range in the invocation, slice the corresponding text
+      // out of inv_text and scan it for occurrences of caller formal names.
+      for (const auto &R : It.InvArgRanges) {
+        // Validate all required spans:
+        //  - argument begin/end must exist
+        //  - invocation begin/end must exist
+        //  - arg range must lie within invocation range
+        //  - arg end must be >= arg begin
+        //
+        // If anything is off, record empty results for this arg and keep going.
+        if (!R.first || !R.second || !It.InvBegin || !It.InvEnd ||
+            *It.InvBegin > *R.first || *R.second > *It.InvEnd ||
+            !(*R.second >= *R.first)) {
+          Deps.push_back({});
+          Refs.push_back({});
+          continue;
+        }
+
+        // Convert absolute byte offsets in inv_file -> relative byte offsets in
+        // inv_text. inv_text corresponds to [InvBegin, InvEnd) in the original
+        // invocation file buffer.
+        const uint64_t B = *R.first - *It.InvBegin;
+        const uint64_t E = *R.second - *It.InvBegin;
+
+        llvm::StringRef ArgText = It.InvText;
+
+        // Defensive bounds: if begin is past inv_text, treat as missing.
+        if (B >= ArgText.size()) {
+          Deps.push_back({});
+          Refs.push_back({});
+          continue;
+        }
+
+        // Clamp the end to inv_text size to avoid out-of-bounds slices.
+        const uint64_t EClamped = std::min(E, (uint64_t)ArgText.size());
+        llvm::StringRef Slice = ArgText.slice(B, EClamped);
+
+        // collectCallerFormalDeps:
+        //   returns stable (sorted) unique caller-formal indices referenced in
+        //   Slice.
+        Deps.push_back(collectCallerFormalDeps(Slice, NameToIdx));
+
+        // collectCallerFormalRefs:
+        //   returns byte ranges in inv_text (BaseOff + local offsets) where
+        //   each caller-formal name occurs, used for precise projection later.
+        Refs.push_back(collectCallerFormalRefs(Slice, B, NameToIdx));
+      }
+
+      // Store per-item results keyed by macro invocation item ID.
+      ArgDepsByID.try_emplace(It.ID, std::move(Deps));
+      ArgRefsByID.try_emplace(It.ID, std::move(Refs));
+    }
+
+    // Materialize the macro nesting DAG and dependency edges onto the
+    // corresponding macro items so downstream consumers can rely on the data
+    // without recomputing it.
+    for (Item &It : Items) {
+      if (It.Kind != IK_Macro)
+        continue;
+
+      // Preserve producer-recorded caller macro id; fall back to span-inferred
+      // nesting only when a caller was not determined during preprocessing.
+      if (!It.CallerMacroId) {
+        auto CIt = CallerMacroByID.find(It.ID);
+        if (CIt != CallerMacroByID.end())
+          It.CallerMacroId = CIt->second;
+      }
+
+      It.InvArgDeps.clear();
+      auto DIt = ArgDepsByID.find(It.ID);
+      if (DIt != ArgDepsByID.end())
+        It.InvArgDeps = DIt->second;
+
+      auto RIt = ArgRefsByID.find(It.ID);
+      if (RIt != ArgRefsByID.end())
+        It.InvArgRefs = RIt->second;
+    }
+
+    // Propagate paste_spans upward through the macro nesting DAG when an
+    // invocation argument is a direct pass-through of a single caller formal.
+    //
+    // This lets the consumer attribute paste-derived substrings (including
+    // nested pastes that later become part of a stringified token) to the
+    // outermost macro invocation without needing a DAG-walk at consume time.
+    llvm::DenseMap<uint64_t, Item *> ItemByIDMut;
+    ItemByIDMut.reserve(Items.size());
+    for (Item &It : Items)
+      ItemByIDMut[It.ID] = &It;
+
+    auto isDirectCallerFormalRef =
+        [&](const Item &Callee, uint32_t CalleeArgIdx, const Item &Caller,
+            uint32_t &OutCallerParamIdx) -> bool {
+      if (!Callee.CallerMacroId)
+        return false;
+      if (!Callee.InvBegin || Callee.InvText.empty())
+        return false;
+      if (CalleeArgIdx >= Callee.InvArgRefs.size())
+        return false;
+      const auto &Refs = Callee.InvArgRefs[CalleeArgIdx];
+      if (Refs.size() != 1)
+        return false;
+
+      const uint32_t CallerParam = Refs[0].CallerParamIndex;
+      if (CallerParam >= Caller.DefParams.size())
+        return false;
+
+      if (CalleeArgIdx >= Callee.InvArgRanges.size())
+        return false;
+      const auto &Range = Callee.InvArgRanges[CalleeArgIdx];
+      if (!Range.first || !Range.second)
+        return false;
+
+      // InvArgRanges are absolute offsets in the invocation site file; convert
+      // them to indices within inv_text.
+      if (*Range.first < *Callee.InvBegin || *Range.second < *Range.first)
+        return false;
+      uint64_t RelB = *Range.first - *Callee.InvBegin;
+      uint64_t RelE = *Range.second - *Callee.InvBegin;
+      if (RelB > Callee.InvText.size() || RelE > Callee.InvText.size() ||
+          RelE < RelB)
+        return false;
+
+      llvm::StringRef ArgText =
+          llvm::StringRef(Callee.InvText).substr(RelB, RelE - RelB).trim();
+      llvm::StringRef ParamName =
+          llvm::StringRef(Caller.DefParams[CallerParam].Name);
+
+      // Allow trivial parenthesis wrapping: "(a)", "((a))", etc.
+      for (;;) {
+        llvm::StringRef T = ArgText.trim();
+        if (T.size() < 2 || T.front() != '(' || T.back() != ')')
+          break;
+
+        int Depth = 0;
+        bool Balanced = true;
+        for (char C : T) {
+          if (C == '(')
+            ++Depth;
+          else if (C == ')') {
+            --Depth;
+            if (Depth < 0) {
+              Balanced = false;
+              break;
+            }
+          }
+        }
+        if (!Balanced || Depth != 0)
+          break;
+
+        ArgText = T.drop_front().drop_back().trim();
+      }
+
+      if (ArgText != ParamName)
+        return false;
+
+      OutCallerParamIdx = CallerParam;
+      return true;
+    };
+
+    auto containsPasteSpan = [](const Item &It, const ArgTokenSpan &S) -> bool {
+      for (const ArgTokenSpan &E : It.PasteSpans) {
+        if (E.Begin != S.Begin || E.End != S.End)
+          continue;
+        if (E.ArgIndex != S.ArgIndex || E.Open != S.Open ||
+            E.HasByteRange != S.HasByteRange)
+          continue;
+        if (S.HasByteRange &&
+            (E.ByteBegin != S.ByteBegin || E.ByteEnd != S.ByteEnd))
+          continue;
+        return true;
+      }
+      return false;
+    };
+
+    for (Item &It : Items) {
+      if (It.Kind != IK_Macro || It.PasteSpans.empty())
+        continue;
+
+      // Iterate over a snapshot to avoid interacting with spans we may add to
+      // this invocation as a propagation target.
+      llvm::SmallVector<ArgTokenSpan, 8> BaseSpans;
+      BaseSpans.append(It.PasteSpans.begin(), It.PasteSpans.end());
+
+      for (const ArgTokenSpan &S0 : BaseSpans) {
+        if (!S0.ArgIndex)
+          continue;
+
+        uint64_t CurID = It.ID;
+        uint32_t CurArg = *S0.ArgIndex;
+        ArgTokenSpan CurSpan = S0;
+
+        // Walk outward through caller_macro_id links as long as the argument is
+        // a direct reference to a single caller formal.
+        for (unsigned Depth = 0; Depth < 128; ++Depth) {
+          Item *CurIt = ItemByIDMut.lookup(CurID);
+          if (!CurIt || !CurIt->CallerMacroId)
+            break;
+
+          Item *Caller = ItemByIDMut.lookup(*CurIt->CallerMacroId);
+          if (!Caller)
+            break;
+
+          uint32_t CallerParamIdx = 0;
+          if (!isDirectCallerFormalRef(*CurIt, CurArg, *Caller, CallerParamIdx))
+            break;
+
+          CurSpan.ArgIndex = CallerParamIdx;
+          if (!containsPasteSpan(*Caller, CurSpan))
+            Caller->PasteSpans.push_back(CurSpan);
+
+          CurID = Caller->ID;
+          CurArg = CallerParamIdx;
+        }
+      }
+    }
+
     // items...
     JO.attributeArray("items", [&] {
       for (const Item &It : Items) {
@@ -1864,7 +3254,8 @@ void RefoldMapBuilder::writeJSON() {
           if (!It.Text.empty())
             JO.attribute("text", It.Text);
 
-          // Invocation metadata only applies to macro items per the JSON schema.
+          // Invocation metadata only applies to macro items per the JSON
+          // schema.
           if (It.Kind == IK_Macro) {
             // InvText can't be empty at this point
             JO.attribute("inv_text", It.InvText);
@@ -1886,9 +3277,9 @@ void RefoldMapBuilder::writeJSON() {
                 for (const auto &R : It.InvArgRanges) {
                   JO.object([&] {
                     JO.attribute("b", R.first ? llvm::json::Value(*R.first)
-                                             : llvm::json::Value(nullptr));
-                    JO.attribute("e", R.second ? llvm::json::Value(*R.second)
                                               : llvm::json::Value(nullptr));
+                    JO.attribute("e", R.second ? llvm::json::Value(*R.second)
+                                               : llvm::json::Value(nullptr));
                   });
                 }
               });
@@ -2049,6 +3440,49 @@ void RefoldMapBuilder::writeJSON() {
                 }
               });
             }
+
+            // Macro provenance DAG fields.
+            if (!It.DefParams.empty()) {
+              JO.attributeArray("def_params", [&] {
+                for (const MacroParam &P : It.DefParams) {
+                  JO.object([&] {
+                    JO.attribute("name", P.Name);
+                    JO.attribute("variadic", P.Variadic);
+                  });
+                }
+              });
+            }
+
+            if (It.CallerMacroId)
+              JO.attribute("caller_macro_id", *It.CallerMacroId);
+
+            if (!It.InvArgDeps.empty()) {
+              JO.attributeArray("arg_deps", [&] {
+                for (const auto &ArgDeps : It.InvArgDeps) {
+                  JO.array([&] {
+                    for (uint32_t Dep : ArgDeps)
+                      JO.value(Dep);
+                  });
+                }
+              });
+            }
+
+            if (!It.InvArgRefs.empty()) {
+              JO.attributeArray("arg_refs", [&] {
+                for (const auto &ArgRefs : It.InvArgRefs) {
+                  JO.array([&] {
+                    for (const auto &Ref : ArgRefs) {
+                      JO.object([&] {
+                        JO.attribute("caller_param_index",
+                                     Ref.CallerParamIndex);
+                        JO.attribute("byte_begin", Ref.ByteBegin);
+                        JO.attribute("byte_end", Ref.ByteEnd);
+                      });
+                    }
+                  });
+                }
+              });
+            }
             if (!It.BodySpans.empty()) {
               JO.attributeArray("body_spans", [&] {
                 for (const TokenSpan &S : It.BodySpans) {
@@ -2091,8 +3525,9 @@ void RefoldMapBuilder::writeJSON() {
       std::string File;
       uint64_t ArmId;
       uint64_t BodyB;
-      uint64_t  BodyE;
-      std::optional<uint64_t> OwnerIncludeId; // nullopt => no owning include (TU)
+      uint64_t BodyE;
+      std::optional<uint64_t>
+          OwnerIncludeId; // nullopt => no owning include (TU)
 
       // Optional PP anchors for this arm's body in the A-side (preprocessed)
       // token stream. Only populated for the selected arm in this run.
@@ -2286,8 +3721,8 @@ void RefoldMapBuilder::writeJSON() {
                 uint64_t ArmId = NextCondArmId++;
 
                 uint64_t PPBegin = 0, PPEnd = 0;
-                bool IsSelected = computeArmPPSpan(
-                    G.File, ArmBodyB, ArmBodyE, PPBegin, PPEnd);
+                bool IsSelected = computeArmPPSpan(G.File, ArmBodyB, ArmBodyE,
+                                                   PPBegin, PPEnd);
 
                 JO.object([&] {
                   JO.attribute("id", ArmId);
@@ -2321,9 +3756,9 @@ void RefoldMapBuilder::writeJSON() {
                   ArmPPEnd = PPEnd;
                 }
 
-                ArmSlotSeeds.push_back(
-                    ArmSlotSeed{G.File, ArmId, ArmBodyB, ArmBodyE, parentIncId,
-                                ArmPPBegin, ArmPPEnd});
+                ArmSlotSeeds.push_back(ArmSlotSeed{G.File, ArmId, ArmBodyB,
+                                                   ArmBodyE, parentIncId,
+                                                   ArmPPBegin, ArmPPEnd});
               }
             });
           });
@@ -2374,11 +3809,11 @@ void RefoldMapBuilder::writeJSON() {
       //   - if no such token exists but the file contributed at least one PP
       //     token, returns (last PP index in file + 1), i.e. the gap after the
       //     file's final token.
-      //   - if the file contributed no PP tokens (e.g. not included / not taken),
+      //   - if the file contributed no PP tokens (e.g. not included / not
+      //   taken),
       //     returns nullopt (slot will omit "pp").
-      auto ppIndexForFileOffset =
-          [&](llvm::StringRef FilePath,
-              uint64_t Off) -> std::optional<uint64_t> {
+      auto ppIndexForFileOffset = [&](llvm::StringRef FilePath,
+                                      uint64_t Off) -> std::optional<uint64_t> {
         bool Any = false;
         std::optional<uint64_t> Best;
         std::optional<uint64_t> Last;
@@ -2418,6 +3853,9 @@ void RefoldMapBuilder::writeJSON() {
         return Last ? *Last + 1 : 0;
       };
 
+      // Find the byte offset immediately after the last top-level #include/#include_next
+      // directive (ignoring directives nested under #if blocks). This provides a
+      // stable anchor when we need to inject synthetic include-like material.
       auto computeAfterLastInclude = [&](llvm::StringRef Buf) -> size_t {
         if (Buf.empty())
           return 0;
@@ -2476,9 +3914,10 @@ void RefoldMapBuilder::writeJSON() {
 
         size_t after = computeAfterLastInclude(Buf);
 
-        // Compute the PP-token boundary after the last include *output* in the TU.
-        // Note: the bytes that contain the #include directive itself do not appear
-        // in the printed PP stream, so tokmap cannot anchor these offsets.
+        // Compute the PP-token boundary after the last include *output* in the
+        // TU. Note: the bytes that contain the #include directive itself do not
+        // appear in the printed PP stream, so tokmap cannot anchor these
+        // offsets.
         std::optional<uint64_t> afterLastIncludePP = std::nullopt;
         {
           bool Have = false;
@@ -2502,11 +3941,13 @@ void RefoldMapBuilder::writeJSON() {
         }
 
         emitPoint(TUSourcePath, 0, "file_begin", /*ref=*/std::nullopt,
-                  /*owner=*/std::nullopt, ppIndexForFileOffset(TUSourcePath, 0));
+                  /*owner=*/std::nullopt,
+                  ppIndexForFileOffset(TUSourcePath, 0));
         emitPoint(TUSourcePath, size, "file_end", /*ref=*/std::nullopt,
                   /*owner=*/std::nullopt,
                   ppIndexForFileOffset(TUSourcePath, size));
-        emitPoint(TUSourcePath, after, "after_last_include", /*ref*/std::nullopt,
+        emitPoint(TUSourcePath, after, "after_last_include",
+                  /*ref*/ std::nullopt,
                   /*owner=*/std::nullopt, afterLastIncludePP);
       }
 
@@ -2551,8 +3992,7 @@ void RefoldMapBuilder::writeJSON() {
             size_t after = computeAfterLastInclude(HBuf);
             emitPoint(It.ResolvedPath, 0, "file_begin", std::nullopt, It.ID,
                       ppIndexForFileOffset(It.ResolvedPath, 0));
-            emitPoint(It.ResolvedPath, HSize, "file_end",
-                      std::nullopt, It.ID,
+            emitPoint(It.ResolvedPath, HSize, "file_end", std::nullopt, It.ID,
                       ppIndexForFileOffset(It.ResolvedPath, HSize));
             emitPoint(It.ResolvedPath, after, "after_last_include",
                       std::nullopt, It.ID,

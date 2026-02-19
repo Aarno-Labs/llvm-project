@@ -5,8 +5,8 @@
 #define TYPE(T) XCAT(T,t)
 #define FN(T) XCAT(make,TYPE(T))
 
-typedef int long_t;
-long_t global114 = 2;
+typedef int TYPE(long);
+TYPE(long) global114 = 2;
 
 int make_long_t(void) { return global114; }
 

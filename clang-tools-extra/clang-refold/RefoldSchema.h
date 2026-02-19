@@ -774,7 +774,7 @@ static constexpr const char *RefoldSchema = R"json(
           "items": {
             "$ref": "#/$defs/PPArgSpan"
           },
-          "description": "A-token spans within pp_cover that originate from macro-body token-paste involving an argument (e.g. 'X##Y'). Multiple spans may overlap when a single pasted token depends on multiple arguments."
+          "description": "A-token spans within pp_cover that originate from macro-body token-paste involving an argument (e.g. 'X##Y'). Multiple spans may overlap when a single pasted token depends on multiple arguments. For pasted tokens, byte_begin/byte_end refer to the substring within the emitted token spelling."
         },
         "body_spans": {
           "type": "array",
@@ -821,10 +821,51 @@ static constexpr const char *RefoldSchema = R"json(
         },
         "inv_arg_ranges": {
           "type": "array",
-          "description": "Per-formal-parameter source byte ranges for the macro invocation arguments. Entry i corresponds to formal parameter index i. For variadic macros, the variadic parameter entry spans the entire variadic tail (including commas). Endpoints may be null if the range cannot be recovered.",
+          "description": "Per-formal-parameter source byte ranges for the macro invocation arguments. Entry i corresponds to formal parameter index i. For variadic macros, the variadic parameter entry spans the entire variadic tail (including commas). Ranges use the same coordinate space as inv_b/inv_e (byte offsets within inv_file); to index into inv_text, subtract inv_b. Endpoints may be null if the range cannot be recovered.",
           "items": {
             "$ref": "#/$defs/OptByteRange"
           }
+        },
+        "caller_macro_id": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "If this macro invocation occurred while expanding another macro, this is the item id of the immediately enclosing (caller) macro invocation. The producer emits this to form a deterministic macro nesting DAG for nested-expansion remapping (no heuristic re-expansion required)."
+        },
+        "def_params": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MacroParam"
+          },
+          "description": "Formal parameter list from the macro definition for this invocation (object-like macros omit this field)."
+        },
+        "arg_deps": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "uniqueItems": true
+          },
+          "description": "For each argument in this invocation (in invocation order), the set of caller formal indices referenced in the raw argument text. Only meaningful when caller_macro_id is present."
+        },
+        "arg_refs": {
+          "type": ["array", "null"],
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["caller_param_index", "byte_begin", "byte_end"],
+              "additionalProperties": false,
+              "properties": {
+                "caller_param_index": { "type": "integer", "minimum": 0 },
+                "byte_begin": { "type": "integer", "minimum": 0 },
+                "byte_end": { "type": "integer", "minimum": 0 }
+              }
+            }
+          },
+          "description": "Per-callee-parameter mapping back to slices of caller formal arguments. For parameter i, arg_refs[i] is an ordered sequence of (caller_param_index, byte_begin, byte_end) triples describing which caller argument slices were substituted into this callee parameter's raw argument text. Only meaningful when caller_macro_id is present."
         }
       },
       "dependentRequired": {
@@ -1162,6 +1203,26 @@ static constexpr const char *RefoldSchema = R"json(
           "description": "Exclusive byte offset from the start of the file, or null if unknown."
         }
       }
+    },
+    "MacroParam": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "variadic"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Formal parameter name as written in the macro definition."
+        },
+        "variadic": {
+          "type": "boolean",
+          "description": "True iff this parameter is the variadic parameter (C99 '...' or GNU named varargs)."
+        }
+      },
+      "description": "A single formal macro parameter from the macro definition corresponding to a recorded invocation."
     }
   }
 }

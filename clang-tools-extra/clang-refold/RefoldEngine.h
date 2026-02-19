@@ -1492,7 +1492,8 @@ private:
   ///          `std::nullopt` if the literal is not recognized or cannot be
   ///          safely mapped to a single argument.
   static std::optional<std::string>
-  UnstringifyLiteralToArgText(StringRef literalTok);
+  UnstringifyLiteralToArgText(StringRef literalTok,
+                              bool allowTopLevelComma = false);
 
   /// \brief Determines if a given edit hunk is entirely contained within a set
   /// of macro argument spans.
