@@ -2361,19 +2361,36 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
             // this identifier run. PasteSpell2MacroItems maps:
             //   spelled_paste_token -> [candidate macro item indices that can
             //   produce it]
-            for (const auto &KV : PasteSpell2MacroItems) {
-              llvm::StringRef Key = KV.getKey();
+            //
+            // Determinism: PasteSpell2MacroItems is a map (DenseMap/StringMap),
+            // so iteration order is not stable. Sort the keys before scanning so
+            // Match collection (and subsequent cursor advancement) is stable.
+            llvm::SmallVector<llvm::StringRef, 64> PasteKeys;
+            PasteKeys.reserve(PasteSpell2MacroItems.size());
+            for (const auto &KV : PasteSpell2MacroItems)
+              PasteKeys.push_back(KV.getKey());
+            llvm::sort(PasteKeys);
+
+            for (llvm::StringRef Key : PasteKeys) {
               if (Key.empty() || Key.size() > Word.size())
                 continue;
 
-              // Collect all occurrences of Key within this run (including
-              // overlaps).
+              // Collect all occurrences of Key within this identifier run.
               size_t Off = Word.find(Key);
               while (Off != llvm::StringRef::npos) {
                 addMatch(Key, Off);
                 Off = Word.find(Key, Off + 1);
               }
             }
+
+            // Determinism: handle overlaps in a stable order.
+            llvm::sort(Matches, [](const Match &A, const Match &B) {
+              if (A.Offset != B.Offset)
+                return A.Offset < B.Offset;
+              if (A.Spell.size() != B.Spell.size())
+                return A.Spell.size() > B.Spell.size();
+              return A.Spell < B.Spell;
+            });
 
             auto handleMatch = [&](llvm::StringRef MatchSpell,
                                    size_t MatchOff) {
