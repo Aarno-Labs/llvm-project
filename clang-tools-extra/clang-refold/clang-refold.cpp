@@ -83,6 +83,7 @@
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/JSONSchemaValidator.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/Signals.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
@@ -643,6 +644,8 @@ static constexpr char Overview[] = R"(
 
 int main(int argc, char **argv) {
   InitLLVM X(argc, argv);
+
+  sys::PrintStackTraceOnErrorSignal(argv[0], true);
 
   cl::HideUnrelatedOptions(RefoldCategory);
   cl::ParseCommandLineOptions(argc, argv, Overview);

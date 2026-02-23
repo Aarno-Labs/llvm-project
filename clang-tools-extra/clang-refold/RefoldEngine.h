@@ -153,7 +153,7 @@ struct PPTok {
 ///
 /// The engine intentionally does not attempt to model complex preprocessor
 /// features that require semantic re-expansion (e.g., token-pasting, variadics,
-/// __COUNTER__, or aggressive escape normalization). In such cases it prefers
+/// or aggressive escape normalization). In such cases it prefers
 /// deterministic expansion of the affected macro instance over speculative
 /// rewriting.
 ///
@@ -550,7 +550,7 @@ private:
   ///                refinements of segment selection.
   /// \returns An Owner describing which entity (TU, include, conditional arm,
   ///          macro, unknown) the hunk logically belongs to.
-  Owner ClassifyOwnerWithSegments(StringRef tuPath, const diffutils::Hunk &h);
+  Owner ClassifyOwnerWithSegments(StringRef tuPath, const diffutils::Hunk &h) const;
 
   /// \brief Returns \c true if the given macro invocation is lexically contained
   /// within a \c #define directive in the same source file.
@@ -606,7 +606,8 @@ private:
   /// \return        The smallest covering patchable macro invocation, or
   ///                nullptr if none cover the span.
   const RefoldModel::MacroInvocation *
-  SmallestCoveringPatchableMacro(uint64_t aStart, uint64_t aEnd) const;
+  SmallestCoveringPatchableMacro(uint64_t aStart, uint64_t aEnd,
+                              std::optional<uint64_t> ownerIncludeId = std::nullopt) const;
 
   /// \brief Determine whether an A-token interval is owned by the translation
   ///        unit (TU).
@@ -1708,6 +1709,80 @@ private:
   ///          replacement can be built; otherwise \c std::nullopt (e.g. invalid
   ///          invocation span, invalid cover, or failure to compute a valid
   ///          B-token envelope).
+
+
+// ------------------------- __COUNTER__ stabilization ------------------------
+
+/// \brief Determine which macro invocations must be forced to remain expanded
+/// in order to stabilize edited __COUNTER__ semantics.
+///
+/// Policy:
+///   If any expanded __COUNTER__ occurrence is edited in B (relative to its
+///   A-side expansion token(s)), then that occurrence and every subsequent
+///   __COUNTER__ occurrence in PP-token order must be emitted as a literal
+///   expansion (whole-cover), even if unchanged. This preserves the edited
+///   preprocessed semantics because replacing a __COUNTER__ site with a
+///   literal stops the counter from incrementing, which would otherwise shift
+///   all later __COUNTER__ values.
+///
+/// The producer emits a MacroInvocation item for each __COUNTER__ expansion
+/// with A-token coverage (cover.begin/cover.end). We use the A→B alignment map
+/// \p a2b to detect the first edited occurrence.
+///
+/// Important: a __COUNTER__ occurrence may be spelled inside a macro
+/// definition's replacement list (e.g. "#define PRINT(...) __COUNTER__"). In
+/// that case, patching the __COUNTER__ invocation span would illegally mutate
+/// the macro definition. Instead, we must force expansion of the *smallest
+/// patchable macro callsite* that covers the __COUNTER__ expansion token(s)
+/// (e.g. the PRINT(...) call), and then force all later occurrences similarly.
+///
+/// This function therefore returns the set of covering, patchable macro
+/// invocations that should be whole-cover expanded.
+struct ForcedMacroPatchRequest {
+  const RefoldModel::MacroInvocation *macro;
+  uint64_t aStart;
+  uint64_t aEnd;
+};
+
+/// \\brief Compute forced expansion patches needed to stabilize __COUNTER__
+/// semantics.
+///
+/// If any expanded __COUNTER__ occurrence is edited in B, then that occurrence
+/// and every subsequent __COUNTER__ occurrence (in PP-token order) must be
+/// emitted as a literal expansion, even if unchanged. This preserves the edited
+/// preprocessed semantics because replacing a __COUNTER__ site with a literal
+/// stops the counter from incrementing, which would otherwise shift all later
+/// __COUNTER__ values.
+///
+/// Important: a __COUNTER__ occurrence may be spelled inside a macro
+/// definition's replacement list (e.g. "#define PRINT(...) __COUNTER__"). In
+/// that case, patching the __COUNTER__ invocation span would illegally mutate
+/// the macro definition. Instead, we force expansion of the smallest patchable
+/// macro callsite that covers the __COUNTER__ expansion token(s) (e.g. the
+/// PRINT(...) callsite), and then force all later occurrences similarly.
+///
+/// The producer may record multiple body occurrences for a single invocation
+/// spelling (e.g. when a header is included multiple times). We therefore treat
+/// each body-span occurrence separately and filter by the true PP-owner include.
+SmallVector<ForcedMacroPatchRequest, 32>
+ComputeForcedCounterPatches(StringRef tuPath, ArrayRef<int64_t> a2b) const;
+
+/// \\brief Inject forced __COUNTER__ stabilization patches after normal hunk
+/// attribution.
+///
+/// This runs after normal hunk classification. It injects additional
+/// MacroPatches into \\p macroPatchByOwnerByMacroId for each forced occurrence,
+/// even when no diff hunk touched that invocation.
+void AddForcedCounterPatches(
+    ArrayRef<ForcedMacroPatchRequest> forced,
+    DenseMap<std::optional<uint64_t>, DenseMap<uint64_t, MacroPatch>>
+        &macroPatchByOwnerByMacroId) const;
+
+/// \brief Compute the whole-cover replacement text for a macro invocation by
+/// mapping its A-domain PP-token cover to the corresponding B-token envelope.
+std::optional<std::string>
+BuildWholeCoverReplacementText(const RefoldModel::MacroInvocation &m) const;
+
   std::optional<MacroPatch> BuildMacroInvocationPatchWholeCover(
       const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h,
       StringRef baseInvText,
