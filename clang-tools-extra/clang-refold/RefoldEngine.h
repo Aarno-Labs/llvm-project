@@ -216,6 +216,19 @@ private:
   /// Computed once per refold run and reused to bound best-effort snapping.
   std::vector<uint32_t> ownerDepthGap_;
 
+  struct GapCtxKey {
+    int64_t incL = -1;
+    int64_t incR = -1;
+    int64_t armL = -1;
+    int64_t armR = -1;
+
+    bool equals(const GapCtxKey &o) const {
+      return incL == o.incL && incR == o.incR && armL == o.armL && armR == o.armR;
+    }
+  };
+
+  GapCtxKey GetGapCtxKey(uint64_t gap, uint64_t aSize) const;
+
   std::optional<std::vector<ByteHunk>> abByteHunks_;
 
   /// Construct an engine from concrete inputs. The instance method `Refold()`
