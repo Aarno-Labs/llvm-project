@@ -289,29 +289,6 @@ std::string RefoldEngine::Refold() {
                          [](StringRef msg) { trace("lcs/a2b", msg); });
   trace("lcs/a2b", sep);
 
-#if 0
-  auto writeMap = [](StringRef filename, ArrayRef<int64_t> a2b) {
-    std::error_code ec;
-    raw_fd_ostream os(filename.str(), ec, llvm::sys::fs::OF_Text);
-    if (ec) {
-      fatal("a2b/write", "open file '{0}' failed: {1}", filename, ec.message());
-    }
-
-    for (int64_t v : a2b)
-      os << v << '\n';
-
-    os.flush();
-    if (os.has_error()) {
-      os.clear_error();
-      fatal("a2b/write", "write on file '{0}' failed", filename);
-    }
-  };
-
-  SmallString<256> lcsMapFile;
-  sys::fs::expand_tilde("~/lcsmap.cpp.txt", lcsMapFile);
-  writeMap(lcsMapFile, a2b);
-#endif
-
   // Sanity check: map must have a strict ordering.
   int64_t last = -1;
   for (size_t i = 0; i < a2b.size(); ++i) {
@@ -440,7 +417,8 @@ std::string RefoldEngine::Refold() {
         break;
       const uint64_t bMatch = static_cast<uint64_t>(matchedJ);
 
-      // Require that A[aPos] is matched exactly at the end boundary (exclusive).
+      // Require that A[aPos] is matched exactly at the end boundary
+      // (exclusive).
       if (bMatch != h.bEnd)
         break;
       if (h.bStart >= bSeq.size() || bMatch >= bSeq.size())
@@ -450,13 +428,14 @@ std::string RefoldEngine::Refold() {
       if (tok.empty())
         break;
 
-      // Only apply boundary-steal repair when the right-context boundary token is
-      // a stable delimiter/closing token. Avoid identifier/keyword tokens, for
-      // which shifting the anchor can change meaning.
+      // Only apply boundary-steal repair when the right-context boundary token
+      // is a stable delimiter/closing token. Avoid identifier/keyword tokens,
+      // for which shifting the anchor can change meaning.
       if (!isSafeBoundaryTok(tok))
         break;
 
-      // The inserted slice begins with a token equal to the right boundary token.
+      // The inserted slice begins with a token equal to the right boundary
+      // token.
       if (bSeq[static_cast<size_t>(h.bStart)] != tok)
         break;
       // The boundary token exists immediately at bMatch (the matched one).
@@ -479,8 +458,8 @@ std::string RefoldEngine::Refold() {
       if (h.bEnd <= h.bStart + 1)
         break;
 
-      // Bounds: shift A by +1, drop B leading token by +1, include boundary token
-      // by extending bEnd to bMatch+1.
+      // Bounds: shift A by +1, drop B leading token by +1, include boundary
+      // token by extending bEnd to bMatch+1.
       if (aPos + 1 > static_cast<uint64_t>(aSeq.size()))
         break;
       if (bMatch + 1 > static_cast<uint64_t>(bSeq.size()))
@@ -488,8 +467,11 @@ std::string RefoldEngine::Refold() {
 
       GapCtxKey curCtx = GetGapCtxKey(aPos, aSeq.size());
       GapCtxKey nxtCtx = GetGapCtxKey(aPos + 1, aSeq.size());
-      int curDepth = (aPos < ownerDepthGap_.size() ? (int)ownerDepthGap_[aPos] : -1);
-      int nxtDepth = (aPos + 1 < ownerDepthGap_.size() ? (int)ownerDepthGap_[aPos + 1] : -1);
+      int curDepth =
+          (aPos < ownerDepthGap_.size() ? (int)ownerDepthGap_[aPos] : -1);
+      int nxtDepth =
+          (aPos + 1 < ownerDepthGap_.size() ? (int)ownerDepthGap_[aPos + 1]
+                                            : -1);
 
       // Guard against drifting across *conditional arm* boundaries.
       //
@@ -506,26 +488,29 @@ std::string RefoldEngine::Refold() {
                                (curCtx.armR == nxtCtx.armR);
       if (!leftStable || !rightStable) {
         trace("hunks/norm",
-              "stolen-boundary: shift#{0} blocked by boundary/arm change gap {1}->{2} "
-              "leftStable={3} rightStable={4} cur(incL={5},incR={6},armL={7},armR={8}) "
+              "stolen-boundary: shift#{0} blocked by boundary/arm change gap "
+              "{1}->{2} leftStable={3} rightStable={4} "
+              "cur(incL={5},incR={6},armL={7},armR={8}) "
               "nxt(incL={9},incR={10},armL={11},armR={12})",
-              shiftCount, aPos, aPos + 1, leftStable, rightStable,
-              curCtx.incL, curCtx.incR, curCtx.armL, curCtx.armR,
-              nxtCtx.incL, nxtCtx.incR, nxtCtx.armL, nxtCtx.armR);
+              shiftCount, aPos, aPos + 1, leftStable, rightStable, curCtx.incL,
+              curCtx.incR, curCtx.armL, curCtx.armR, nxtCtx.incL, nxtCtx.incR,
+              nxtCtx.armL, nxtCtx.armR);
         break;
       }
 
       // Never shift from a shallower gap into a deeper gap.
       if (curDepth >= 0 && nxtDepth >= 0 && nxtDepth > curDepth) {
         trace("hunks/norm",
-              "stolen-boundary: shift#{0} blocked by depth increase gap {1}->{2} depth {3}->{4}",
+              "stolen-boundary: shift#{0} blocked by depth increase gap "
+              "{1}->{2} depth {3}->{4}",
               shiftCount, aPos, aPos + 1, curDepth, nxtDepth);
         break;
       }
 
       trace("hunks/norm",
             "stolen-boundary: shift#{0} gap {1}->{2} tok='{3}' depth {4}->{5} "
-            "cur(incL={6},incR={7},armL={8},armR={9}) nxt(incL={10},incR={11},armL={12},armR={13})",
+            "cur(incL={6},incR={7},armL={8},armR={9}) "
+            "nxt(incL={10},incR={11},armL={12},armR={13})",
             shiftCount, aPos, aPos + 1, tok, curDepth, nxtDepth, curCtx.incL,
             curCtx.incR, curCtx.armL, curCtx.armR, nxtCtx.incL, nxtCtx.incR,
             nxtCtx.armL, nxtCtx.armR);
@@ -539,7 +524,8 @@ std::string RefoldEngine::Refold() {
       ++shiftCount;
       ++repairedBoundarySteal;
       trace("hunks/norm",
-            "repaired stolen-boundary insertion shift={0} token='{1}' : {2:verbose} -> {3:verbose}",
+            "repaired stolen-boundary insertion shift={0} token='{1}' : "
+            "{2:verbose} -> {3:verbose}",
             shiftCount, tok, beforeH, h);
     }
   }
@@ -565,8 +551,8 @@ std::string RefoldEngine::Refold() {
         diffutils::Hunk &prev = merged.back();
         const bool prevIns =
             (prev.aStart == prev.aEnd) && (prev.bStart < prev.bEnd);
-        if (isIns && prevIns && prev.aStart == h.aStart && prev.aEnd == h.aEnd &&
-            prev.bEnd == h.bStart) {
+        if (isIns && prevIns && prev.aStart == h.aStart &&
+            prev.aEnd == h.aEnd && prev.bEnd == h.bStart) {
           prev.bEnd = h.bEnd;
           continue;
         }
@@ -671,7 +657,8 @@ std::string RefoldEngine::Refold() {
           owner.kind, owner.includeId, owner.condArmId, h);
 
     // b) Macro call-site still has priority over TU/include
-    if (auto *m = SmallestCoveringPatchableMacro(h.aStart, h.aEnd, owner.includeId)) {
+    if (auto *m =
+            SmallestCoveringPatchableMacro(h.aStart, h.aEnd, owner.includeId)) {
       if (m->invB && m->invE) {
         debug("classify",
               "#{0} -> MACRO invText={1} owner={2} invFile={3} {4})", i,
@@ -952,8 +939,8 @@ std::string RefoldEngine::Refold() {
         }
         if (p < b0) {
           const bool tuHasSpaceLeft =
-              span->first > 0 &&
-              (tuBytes[span->first - 1] == ' ' || tuBytes[span->first - 1] == '\t');
+              span->first > 0 && (tuBytes[span->first - 1] == ' ' ||
+                                  tuBytes[span->first - 1] == '\t');
           if (!tuHasSpaceLeft)
             repl.insert(0, std::string(bSource_.data() + p, b0 - p));
         }
@@ -1036,7 +1023,8 @@ std::string RefoldEngine::Refold() {
   // phases.
   //
   // Determinism: macroPatchByOwnerByMacroId and its inner maps are DenseMaps,
-  // so iteration order is not stable across runs. Sort owner keys and macro ids.
+  // so iteration order is not stable across runs. Sort owner keys and macro
+  // ids.
   llvm::SmallVector<std::optional<uint64_t>, 16> OwnerKeys;
   OwnerKeys.reserve(macroPatchByOwnerByMacroId.size());
   for (const auto &outerEntry : macroPatchByOwnerByMacroId)
@@ -1294,8 +1282,9 @@ std::string RefoldEngine::Refold() {
       if (!m.invFile)
         continue;
 
-      // Compare absolute normalized paths to avoid relative-spelling mismatches.
-      // Producer spelling (tuPath) is preserved in the emitted directive.
+      // Compare absolute normalized paths to avoid relative-spelling
+      // mismatches. Producer spelling (tuPath) is preserved in the emitted
+      // directive.
       if (lineDirs_.ToAbsolutePath(*m.invFile) !=
           lineDirs_.ToAbsolutePath(tuPath))
         continue;
@@ -1886,12 +1875,15 @@ RefoldEngine::SmallestCoveringPatchableMacro(
     }
 
     trace("macro/select",
-          "candidate macro id={0} name='{1}' rank={2} len={3} cover=[{4},{5}) ownerInc={6} invFile='{7}' inv=[{8},{9})",
-          m.id, m.name, rank, len, m.cover.begin, m.cover.end,
-          m.ownerIncludeId, (m.invFile ? StringRef(*m.invFile) : StringRef("")),
-          *m.invB, *m.invE);
+          "candidate macro id={0} name='{1}' rank={2} len={3} cover=[{4},{5}) "
+          "ownerInc={6} invFile='{7}' inv=[{8},{9})",
+          m.id, m.name, rank, len, m.cover.begin, m.cover.end, m.ownerIncludeId,
+          (m.invFile ? StringRef(*m.invFile) : StringRef("")), *m.invB,
+          *m.invE);
 
-    if (!best || rank < bestRank || (rank == bestRank && (len < bestLen || (len == bestLen && m.id < best->id)))) {
+    if (!best || rank < bestRank ||
+        (rank == bestRank &&
+         (len < bestLen || (len == bestLen && m.id < best->id)))) {
       best = &m;
       bestRank = rank;
       bestLen = len;
@@ -1900,9 +1892,10 @@ RefoldEngine::SmallestCoveringPatchableMacro(
 
   if (best) {
     trace("macro/select",
-          "selected macro id={0} name='{1}' rank={2} len={3} cover=[{4},{5}) ownerInc={6} invFile='{7}' inv=[{8},{9})",
-          best->id, best->name, bestRank, bestLen, best->cover.begin, best->cover.end,
-          best->ownerIncludeId,
+          "selected macro id={0} name='{1}' rank={2} len={3} cover=[{4},{5}) "
+          "ownerInc={6} invFile='{7}' inv=[{8},{9})",
+          best->id, best->name, bestRank, bestLen, best->cover.begin,
+          best->cover.end, best->ownerIncludeId,
           (best->invFile ? StringRef(*best->invFile) : StringRef("")),
           *best->invB, *best->invE);
   } else {
@@ -2008,7 +2001,8 @@ bool RefoldEngine::HunkMapsToTU(uint64_t a0, uint64_t a1,
     }
   }
 
-  // Stop scanning once ownership changes (ownerDepthGap) and cap the scan as a failsafe.
+  // Stop scanning once ownership changes (ownerDepthGap) and cap the scan as a
+  // failsafe.
   static constexpr uint64_t MAX_SNAP_DISTANCE = 64;
 
   const bool haveOwnerGaps =
@@ -2032,13 +2026,14 @@ bool RefoldEngine::HunkMapsToTU(uint64_t a0, uint64_t a1,
     }
   }
 
-  const RefoldModel::TokMapEntry* right = nullptr;
+  const RefoldModel::TokMapEntry *right = nullptr;
   const uint64_t maxPP = model_.GetTokensCountA();
   for (uint64_t d = 1; d <= MAX_SNAP_DISTANCE; ++d) {
     uint64_t ppR = pp + d;
     if (ppR >= maxPP)
       break;
-    if (haveOwnerGaps && ppR < ownerDepthGap_.size() && ownerDepthGap_[ppR] != wantOwner)
+    if (haveOwnerGaps && ppR < ownerDepthGap_.size() &&
+        ownerDepthGap_[ppR] != wantOwner)
       break;
     auto it = tokmapByPP.find(ppR);
     if (it != tokmapByPP.end()) {
@@ -2084,7 +2079,8 @@ RefoldEngine::AnchorToExactSlotBoundaryFromPPGap(StringRef tuPath,
   StringRef tuText = bufOrErr.get()->getBuffer();
 
   // Helper to adjust slots that terminate on directive newlines
-  auto adjustSlot = [&tuText, &tuPath, this](const RefoldModel::Slot *s) -> uint64_t {
+  auto adjustSlot = [&tuText, &tuPath,
+                     this](const RefoldModel::Slot *s) -> uint64_t {
     uint64_t b = s->b;
 
     // Special case: the producer anchors the selected arm_end at the first
@@ -2205,10 +2201,12 @@ RefoldEngine::AnchorToExactSlotBoundaryFromPPGap(StringRef tuPath,
 
   if (best) {
     trace("slots/anchor",
-          "AnchorToExactSlotBoundaryFromPPGap: ppGap={0} -> slotId={1} kind={2} tuByte={3}",
+          "AnchorToExactSlotBoundaryFromPPGap: ppGap={0} -> slotId={1} "
+          "kind={2} tuByte={3}",
           ppGap, best->slot->id, best->slot->kind, best->b);
   } else {
-    trace("slots/anchor", "AnchorToExactSlotBoundaryFromPPGap: ppGap={0} -> <none>", ppGap);
+    trace("slots/anchor",
+          "AnchorToExactSlotBoundaryFromPPGap: ppGap={0} -> <none>", ppGap);
   }
   return best ? std::optional<uint64_t>(best->b) : std::nullopt;
 }
@@ -2295,9 +2293,10 @@ RefoldEngine::TUByteSpan(uint64_t a0, uint64_t a1, StringRef tuPath) const {
 
     // Non-strict: bounded best-effort behavior (avoid long-range snapping).
     //
-    // With slot.pp covering include/arm/file boundaries, the remaining use case for snapping is a
-    // pure insertion inside the TU where immediate neighbors are unmapped whitespace. Bound the
-    // probe window so we do not accidentally "jump" across regions and mis-own the insertion.
+    // With slot.pp covering include/arm/file boundaries, the remaining use case
+    // for snapping is a pure insertion inside the TU where immediate neighbors
+    // are unmapped whitespace. Bound the probe window so we do not accidentally
+    // "jump" across regions and mis-own the insertion.
 
     // Any PP gap inside an include expansion is header-owned (no TU span).
     if (IncludeIdCoveringPPIndex(pp)) {
@@ -2324,7 +2323,8 @@ RefoldEngine::TUByteSpan(uint64_t a0, uint64_t a1, StringRef tuPath) const {
       }
     }
 
-    // Stop scanning once ownership changes (ownerDepthGap) and cap the scan as a failsafe.
+    // Stop scanning once ownership changes (ownerDepthGap) and cap the scan as
+    // a failsafe.
     constexpr uint64_t MAX_SNAP_DISTANCE = 64;
 
     const bool haveOwnerGaps =
@@ -2344,7 +2344,7 @@ RefoldEngine::TUByteSpan(uint64_t a0, uint64_t a1, StringRef tuPath) const {
       }
       auto it = tokmapByPP.find(pp - d);
       if (it != tokmapByPP.end()) {
-        const auto& ent = it->second;
+        const auto &ent = it->second;
         left = &ent;
         dLeft = d;
         break;
@@ -2358,18 +2358,20 @@ RefoldEngine::TUByteSpan(uint64_t a0, uint64_t a1, StringRef tuPath) const {
       uint64_t i = pp + d;
       if (i >= ppCount)
         break;
-      if (haveOwnerGaps && i < ownerDepthGap_.size() && ownerDepthGap_[i] != wantOwner)
+      if (haveOwnerGaps && i < ownerDepthGap_.size() &&
+          ownerDepthGap_[i] != wantOwner)
         break;
       auto it = tokmapByPP.find(i);
       if (it != tokmapByPP.end()) {
-        const auto& ent = it->second;
+        const auto &ent = it->second;
         right = &ent;
         dRight = d;
         break;
       }
     }
 
-    // If either neighbor points into a header/include, we must NOT fabricate a TU span.
+    // If either neighbor points into a header/include, we must NOT fabricate a
+    // TU span.
     if (left && !PathsEqual(tuPath, left->file))
       return std::nullopt;
     if (right && !PathsEqual(tuPath, right->file))
@@ -3577,7 +3579,8 @@ RefoldEngine::GetMacroInvocationFormalArgContentRanges(
         continue;
       }
 
-      out.emplace_back(static_cast<size_t>(relB64), static_cast<size_t>(relE64));
+      out.emplace_back(static_cast<size_t>(relB64),
+                       static_cast<size_t>(relE64));
     }
 
     if (!anyInvalid)
@@ -3586,7 +3589,8 @@ RefoldEngine::GetMacroInvocationFormalArgContentRanges(
     // Try to fill any invalid entries using a conservative textual parse of the
     // invocation spelling, preserving the formal-parameter indexing when the
     // parsed arity differs (variadics / missing variadic tail).
-    auto parsedOpt = RefoldEngine::ParseMacroInvocationArgContentRanges(invText);
+    auto parsedOpt =
+        RefoldEngine::ParseMacroInvocationArgContentRanges(invText);
     if (!parsedOpt)
       return std::nullopt;
 
@@ -3813,8 +3817,8 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         std::string newArg = SplicePasteSegmentIntoSpellingArg(
             baseArgText, pae.oldSeg, pae.newSeg);
         if (newArg.empty()) {
-          // Deleting an entire argument (making it empty) is legal. Accept this only
-          // when the paste-span covered the whole argument spelling.
+          // Deleting an entire argument (making it empty) is legal. Accept this
+          // only when the paste-span covered the whole argument spelling.
           if (!(StringRef(pae.newSeg).trim().empty() &&
                 baseArgText.trim() == StringRef(pae.oldSeg).trim()))
             return std::nullopt;
@@ -3896,8 +3900,8 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       std::string newArg = SplicePasteSegmentIntoSpellingArg(
           baseArgText, pae->oldSeg, pae->newSeg);
       if (newArg.empty()) {
-        // Deleting an entire argument (making it empty) is legal. Accept this only
-        // when the paste-span covered the whole argument spelling.
+        // Deleting an entire argument (making it empty) is legal. Accept this
+        // only when the paste-span covered the whole argument spelling.
         if (!(StringRef(pae->newSeg).trim().empty() &&
               baseArgText.trim() == StringRef(pae->oldSeg).trim()))
           return std::nullopt;
@@ -4192,8 +4196,8 @@ bool RefoldEngine::HunkFullyWithinArgSpans(
   // If the insertion lands on a separator comma between two arguments, treat it
   // as belonging to the *right* argument (so prepending into the next argument
   // doesn't spuriously touch the previous one). Otherwise, if the insertion is
-  // exactly at an arg-span end (e.g. right before ')'), treat it as belonging to
-  // the *left* argument.
+  // exactly at an arg-span end (e.g. right before ')'), treat it as belonging
+  // to the *left* argument.
   if (a0 == a1) {
     trace("macro/debug", "Checking insertion at A={0}", a0);
 
@@ -4288,15 +4292,15 @@ bool RefoldEngine::HunkFullyWithinArgSpans(
 
 std::vector<RefoldEngine::ByteHunk>
 RefoldEngine::BuildByteHunksFromRawText() const {
-  // We still need a physical array of "elements" for ArrayRef.
-  // But now, each element is just 16 bytes (pointer + length)
-  // instead of a 32-byte heap-allocating std::string.
+  // We still need a physical array of "elements" for ArrayRef, but now, each
+  // element is just 16 bytes (pointer + length) instead of a 32-byte
+  // heap-allocating std::string.
   auto ToRefVec = [](StringRef s) {
     std::vector<StringRef> v;
     v.reserve(s.size());
     for (size_t i = 0; i < s.size(); ++i) {
-      // Point to a 1-character substring within the existing aText/bText.
-      // This is O(1) and performs NO heap allocation for the character.
+      // Point to a 1-character substring within the existing aText/bText. This
+      // is O(1) and performs NO heap allocation for the character.
       v.push_back(s.substr(i, 1));
     }
     return v;
@@ -4809,8 +4813,7 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
     for (const auto &mi : model_.GetMacroInvocations())
       invById[mi.id] = &mi;
 
-    auto findPatchableCaller =
-        [&](const RefoldModel::MacroInvocation &mi)
+    auto findPatchableCaller = [&](const RefoldModel::MacroInvocation &mi)
         -> const RefoldModel::MacroInvocation * {
       const RefoldModel::MacroInvocation *cur = &mi;
       while (cur) {
@@ -4826,8 +4829,7 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
       return nullptr;
     };
 
-    auto computeOccRange =
-        [&](const RefoldModel::MacroInvocation &m)
+    auto computeOccRange = [&](const RefoldModel::MacroInvocation &m)
         -> std::optional<std::pair<uint64_t, uint64_t>> {
       // Prefer the precise body slice when available.
       if (!m.bodySpans.empty()) {
@@ -4901,7 +4903,8 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
 
       if (idx >= 0) {
         trace("counter",
-              "__COUNTER__: lifted edit detection found firstEditedIdx={0} at A=[{1},{2}) root='{3}'",
+              "__COUNTER__: lifted edit detection found firstEditedIdx={0} at "
+              "A=[{1},{2}) root='{3}'",
               idx, lifted[static_cast<size_t>(idx)].aStart,
               lifted[static_cast<size_t>(idx)].aEnd,
               lifted[static_cast<size_t>(idx)].m->name);
@@ -4919,14 +4922,16 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
   SmallVector<ForcedMacroPatchRequest, 32> forced;
   llvm::DenseSet<uint64_t> seen;
 
-  auto hashKey = [](std::optional<uint64_t> owner, uint64_t invB, uint64_t invE) {
+  auto hashKey = [](std::optional<uint64_t> owner, uint64_t invB,
+                    uint64_t invE) {
     uint64_t h = owner ? (*owner + 1) : 0;
     h = h * 1315423911u + invB;
     h = h * 1315423911u + invE;
     return h;
   };
 
-  for (size_t i = static_cast<size_t>(firstEditedIdx); i < filtered.size(); ++i) {
+  for (size_t i = static_cast<size_t>(firstEditedIdx); i < filtered.size();
+       ++i) {
     const Occ &o = filtered[i];
     const RefoldModel::MacroInvocation *root =
         SmallestCoveringPatchableMacro(o.aStart, o.aEnd, o.ownerInc);
@@ -4949,13 +4954,15 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
     forced.push_back(ForcedMacroPatchRequest{root, o.aStart, o.aEnd});
 
     trace("counter",
-          "__COUNTER__: force root id={0} name='{1}' ownerInc={2} inv=[{3},{4}) for occ A=[{5},{6})",
+          "__COUNTER__: force root id={0} name='{1}' ownerInc={2} "
+          "inv=[{3},{4}) for occ A=[{5},{6})",
           root->id, root->name, root->ownerIncludeId, *invStart, *invEnd,
           o.aStart, o.aEnd);
   }
 
   debug("counter",
-        "__COUNTER__: occurrences={0} firstEditedIdx={1} forced={2} firstOccA=[{3},{4})",
+        "__COUNTER__: occurrences={0} firstEditedIdx={1} forced={2} "
+        "firstOccA=[{3},{4})",
         filtered.size(), firstEditedIdx, forced.size(),
         filtered[static_cast<size_t>(firstEditedIdx)].aStart,
         filtered[static_cast<size_t>(firstEditedIdx)].aEnd);
@@ -5092,7 +5099,8 @@ void RefoldEngine::AddForcedCounterPatches(
     }
 
     trace("counter",
-          "__COUNTER__: force patch id={0} name='{1}' ownerInc={2} inv=[{3},{4}) repl='{5}' Aocc=[{6},{7})",
+          "__COUNTER__: force patch id={0} name='{1}' ownerInc={2} "
+          "inv=[{3},{4}) repl='{5}' Aocc=[{6},{7})",
           m.id, m.name, m.ownerIncludeId, *invStart, *invEnd,
           stringutils::showWSWithClip(*replOpt, 64), req.aStart, req.aEnd);
 
@@ -5120,27 +5128,28 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   if (!invStart || !invEnd || *invEnd < *invStart)
     return std::nullopt;
 
-
-// Special-case: __COUNTER__.
-//
-// The only robust representation of an edited (or forced) __COUNTER__
-// expansion is to replace the invocation spelling with the B-side literal
-// token(s) for this specific occurrence. Do NOT whole-cover expand using the
-// macro cover, which may span multiple occurrences when a header is included
-// multiple times.
-if (m.name == "__COUNTER__") {
-  std::optional<std::string> repl;
-  if (h.bEnd > h.bStart) {
-    repl = SliceBSource(static_cast<size_t>(h.bStart),
-                        static_cast<size_t>(h.bEnd)).trim().str();
-  } else {
-    auto bEnv = MapATokRangeAToBTokenEnvelope(h.aStart, h.aEnd);
-    if (bEnv && bEnv->second > bEnv->first)
-      repl = SliceBSource(bEnv->first, bEnv->second).trim().str();
+  // Special-case: __COUNTER__.
+  //
+  // The only robust representation of an edited (or forced) __COUNTER__
+  // expansion is to replace the invocation spelling with the B-side literal
+  // token(s) for this specific occurrence. Do NOT whole-cover expand using the
+  // macro cover, which may span multiple occurrences when a header is included
+  // multiple times.
+  if (m.name == "__COUNTER__") {
+    std::optional<std::string> repl;
+    if (h.bEnd > h.bStart) {
+      repl = SliceBSource(static_cast<size_t>(h.bStart),
+                          static_cast<size_t>(h.bEnd))
+                 .trim()
+                 .str();
+    } else {
+      auto bEnv = MapATokRangeAToBTokenEnvelope(h.aStart, h.aEnd);
+      if (bEnv && bEnv->second > bEnv->first)
+        repl = SliceBSource(bEnv->first, bEnv->second).trim().str();
+    }
+    if (repl)
+      return MacroPatch{*invStart, *invEnd, std::move(*repl)};
   }
-  if (repl)
-    return MacroPatch{*invStart, *invEnd, std::move(*repl)};
-}
 
   trace("macro/whole",
         "whole-cover build inv id={0} name={1} ownerIncludeId={2} hasOwner={3} "
@@ -5167,10 +5176,6 @@ if (m.name == "__COUNTER__") {
     for (const auto &kv : ownerIt->second) {
       const uint64_t id = kv.first;
       const MacroPatch &p = kv.second;
-#if 0
-      if (!p.invStart || !p.invEnd)
-        continue;
-#endif
       if (p.invStart != *invStart || p.invEnd != *invEnd)
         continue;
 
@@ -5228,9 +5233,9 @@ if (m.name == "__COUNTER__") {
   };
   const diffutils::Hunk hEff = trimCommonEdgeTokens(h);
 
-  // 1) Prefer args-only patching when safe and fully validated.
-  //    Treat normal arg spans, stringify spans, and paste spans as
-  //    "argument-like" occurrences.
+  // 1) Prefer args-only patching when safe and fully validated. Treat normal
+  //    arg spans, stringify spans, and paste spans as "argument-like"
+  //    occurrences.
   SmallVector<RefoldModel::PPArgSpan, 16> argLikeSpans;
   argLikeSpans.append(m.argSpans.begin(), m.argSpans.end());
   argLikeSpans.append(m.stringifySpans.begin(), m.stringifySpans.end());
@@ -5287,8 +5292,8 @@ if (m.name == "__COUNTER__") {
               : (m.invText ? StringRef(*m.invText) : StringRef(""));
 
       trace("macro/dag",
-            "DAG args-only: enter root id={0} name='{1}' A=[{2},{3}) invFile='{4}' "
-            "inv=[{5},{6}) invSpanLen={7} baseInvLen={8}",
+            "DAG args-only: enter root id={0} name='{1}' A=[{2},{3}) "
+            "invFile='{4}' inv=[{5},{6}) invSpanLen={7} baseInvLen={8}",
             m.id, m.name, hEff.aStart, hEff.aEnd,
             (m.invFile ? StringRef(*m.invFile) : StringRef("")),
             (m.invB ? *m.invB : 0ULL), (m.invE ? *m.invE : 0ULL),
@@ -5296,8 +5301,8 @@ if (m.name == "__COUNTER__") {
 
       if (!InvocationSpanMatchesCallsitePrefix(invSpanText, m)) {
         trace("macro/dag",
-              "DAG args-only: root invocation span does not match callsite prefix; "
-              "invSpanText prefix='{0}'",
+              "DAG args-only: root invocation span does not match callsite "
+              "prefix; invSpanText prefix='{0}'",
               invSpanText.take_front(48));
         return std::nullopt;
       }
@@ -5308,8 +5313,8 @@ if (m.name == "__COUNTER__") {
           GetMacroInvocationFormalArgContentRanges(m, invSpanText);
       if (!invArgRangesOpt) {
         trace("macro/dag",
-              "DAG args-only: failed to parse formal arg ranges for root id={0} name='{1}' "
-              "invSpanText prefix='{2}'",
+              "DAG args-only: failed to parse formal arg ranges for root "
+              "id={0} name='{1}' invSpanText prefix='{2}'",
               m.id, m.name, invSpanText.take_front(48));
         return std::nullopt;
       }
@@ -5318,7 +5323,8 @@ if (m.name == "__COUNTER__") {
       if (numArgs == 0) {
         unsigned directCallees = 0;
         unsigned directCalleesWithInvArgRanges = 0;
-        for (const RefoldModel::MacroInvocation &cand : model_.GetMacroInvocations()) {
+        for (const RefoldModel::MacroInvocation &cand :
+             model_.GetMacroInvocations()) {
           if (!cand.callerMacroId || *cand.callerMacroId != m.id)
             continue;
           ++directCallees;
@@ -5326,8 +5332,9 @@ if (m.name == "__COUNTER__") {
             ++directCalleesWithInvArgRanges;
         }
         trace("macro/dag",
-              "DAG args-only: root has zero formal args; will compute leaf arg edits for diagnostics "
-              "but cannot emit a root args-only patch. directCallees={0} "
+              "DAG args-only: root has zero formal args; will compute leaf arg "
+              "edits for diagnostics but cannot emit a root args-only patch. "
+              "directCallees={0} "
               "directCalleesWithInvArgRanges={1}",
               directCallees, directCalleesWithInvArgRanges);
       }
@@ -6289,10 +6296,11 @@ if (m.name == "__COUNTER__") {
       return uniquePatch;
     };
 
-    // Call-chain suffix patch: if this hunk's A-side PP tokens map to source bytes
-    // in the chained-call suffix immediately following this invocation (e.g.
-    // currying-style chains like GET_MATH(ADD)(10)(20)), patch those bytes
-    // directly. This preserves the call chain and avoids whole-cover expansion.
+    // Call-chain suffix patch: if this hunk's A-side PP tokens map to source
+    // bytes in the chained-call suffix immediately following this invocation
+    // (e.g. currying-style chains like GET_MATH(ADD)(10)(20)), patch those
+    // bytes directly. This preserves the call chain and avoids whole-cover
+    // expansion.
     if (m.invFile && m.invB && m.invE) {
       std::string invAbs = lineDirs_.ToAbsolutePath(*m.invFile);
       auto bufOrErr = MemoryBuffer::getFile(invAbs);
@@ -6359,7 +6367,8 @@ if (m.name == "__COUNTER__") {
                   return a.start < b.start;
                 });
 
-                // Apply edits (no line-directive resync needed inside this local slice).
+                // Apply edits (no line-directive resync needed inside this
+                // local slice).
                 std::string out;
                 out.reserve(covered.size());
                 uint64_t cur = 0;
@@ -7212,11 +7221,11 @@ RefoldEngine::ApplyTextEditsWithPendingResync(StringRef originalFileText,
   // comments tokenize separately), and both map to the same insertion point.
   //
   // We now:
-  //  * Preserve and concatenate multiple INSERT edits with identical zero-length
-  //    spans ([x,x)) in their original order.
-  //  * For non-zero spans, keep the last edit (as the prior map effectively did)
-  //    but retain any pending-resync from earlier edits, and emit a trace if the
-  //    payloads disagree.
+  //  * Preserve and concatenate multiple INSERT edits with identical
+  //    zero-length spans ([x,x)) in their original order.
+  //  * For non-zero spans, keep the last edit (as the prior map effectively
+  //    did) but retain any pending-resync from earlier edits, and emit a trace
+  //    if the payloads disagree.
 
   struct EditRef {
     const TextEdit *e;
@@ -7272,8 +7281,9 @@ RefoldEngine::ApplyTextEditsWithPendingResync(StringRef originalFileText,
           merged.pending = ordered[k].e->pending;
       }
 
-      trace("edits/apply", "merged {0} insertion edits at [{1},{2}) into len={3}",
-            j - i, s, t, merged.text.size());
+      trace("edits/apply",
+            "merged {0} insertion edits at [{1},{2}) into len={3}", j - i, s, t,
+            merged.text.size());
 
       norm.push_back(std::move(merged));
       i = j;
@@ -7300,8 +7310,8 @@ RefoldEngine::ApplyTextEditsWithPendingResync(StringRef originalFileText,
       }
       if (disagree) {
         trace("edits/apply",
-              "multiple edits share span [{0},{1}); keeping last (idx={2})", s, t,
-              ordered[j - 1].idx);
+              "multiple edits share span [{0},{1}); keeping last (idx={2})", s,
+              t, ordered[j - 1].idx);
       }
     }
 

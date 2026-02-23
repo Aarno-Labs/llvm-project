@@ -216,15 +216,33 @@ private:
   /// Computed once per refold run and reused to bound best-effort snapping.
   std::vector<uint32_t> ownerDepthGap_;
 
+  // Key that identifies the "structural context" at a particular PP
+  // gap/boundary.
+  //
+  // We use this as a cache/lookup key when computing gap-dependent anchoring
+  // decisions (e.g. boundary-policy placement). Two gaps are considered
+  // equivalent for anchoring purposes if they lie in the same
+  // include/conditional envelope in the refold map:
+  //   - incL/incR: the include-instance bounds (left/right) that enclose the
+  //     gap
+  //   - armL/armR: the conditional-arm bounds (left/right) that enclose the gap
+  //
+  // The L/R pairs are stored as indices/ids (or -1 if not present) rather than
+  // a single id because the policy cares about *which span* of an include/arm
+  // contains the gap (especially for repeated includes, no-guard headers, and
+  // complex conditional layouts).
   struct GapCtxKey {
     int64_t incL = -1;
     int64_t incR = -1;
     int64_t armL = -1;
     int64_t armR = -1;
 
-    bool equals(const GapCtxKey &o) const {
-      return incL == o.incL && incR == o.incR && armL == o.armL && armR == o.armR;
+    bool operator==(const GapCtxKey &o) const {
+      return incL == o.incL && incR == o.incR && armL == o.armL &&
+             armR == o.armR;
     }
+
+    bool operator!=(const GapCtxKey &o) const { return !(*this == o); }
   };
 
   GapCtxKey GetGapCtxKey(uint64_t gap, uint64_t aSize) const;
@@ -550,7 +568,8 @@ private:
   ///                refinements of segment selection.
   /// \returns An Owner describing which entity (TU, include, conditional arm,
   ///          macro, unknown) the hunk logically belongs to.
-  Owner ClassifyOwnerWithSegments(StringRef tuPath, const diffutils::Hunk &h) const;
+  Owner ClassifyOwnerWithSegments(StringRef tuPath,
+                                  const diffutils::Hunk &h) const;
 
   /// \brief Returns \c true if the given macro invocation is lexically contained
   /// within a \c #define directive in the same source file.
@@ -579,8 +598,8 @@ private:
   bool IsInvocationInsideDefineDirective(
       const RefoldModel::MacroInvocation &m) const;
 
-  /// \brief Returns the innermost (smallest-width) patchable macro invocation that
-  /// fully covers a given A-span.
+  /// \brief Returns the innermost (smallest-width) patchable macro invocation
+  /// that fully covers a given A-span.
   ///
   /// This is identical in spirit to smallestCoveringMacro (choose the smallest
   /// invocation whose preprocessed-token cover interval [coverBegin, coverEnd)
@@ -605,9 +624,9 @@ private:
   /// \param aEnd    Exclusive end PP-token index in A.
   /// \return        The smallest covering patchable macro invocation, or
   ///                nullptr if none cover the span.
-  const RefoldModel::MacroInvocation *
-  SmallestCoveringPatchableMacro(uint64_t aStart, uint64_t aEnd,
-                              std::optional<uint64_t> ownerIncludeId = std::nullopt) const;
+  const RefoldModel::MacroInvocation *SmallestCoveringPatchableMacro(
+      uint64_t aStart, uint64_t aEnd,
+      std::optional<uint64_t> ownerIncludeId = std::nullopt) const;
 
   /// \brief Determine whether an A-token interval is owned by the translation
   ///        unit (TU).
@@ -634,31 +653,32 @@ private:
   bool HunkMapsToTU(uint64_t a0, uint64_t a1, StringRef tuPath) const;
 
   /// Anchors a *pure insertion* (a PP-gap insertion) to a deterministic,
-  /// canonical TU byte boundary representing the *same* preprocessed coordinate,
-  /// when possible.
+  /// canonical TU byte boundary representing the *same* preprocessed
+  /// coordinate, when possible.
   ///
-  /// A PP-gap `ppGap` is a boundary between two adjacent PP tokens (i.e. a "gap"
-  /// index). For an insertion that conceptually occurs at that PP boundary, this
-  /// method returns the TU byte offset of an **exact** structural boundary
-  /// corresponding to that same PP coordinate.
+  /// A PP-gap `ppGap` is a boundary between two adjacent PP tokens (i.e. a
+  /// "gap" index). For an insertion that conceptually occurs at that PP
+  /// boundary, this method returns the TU byte offset of an **exact**
+  /// structural boundary corresponding to that same PP coordinate.
   ///
   /// **Key property:** this method performs *no* "nearest" snapping. If `ppGap`
-  /// does not exactly match a known boundary PP coordinate, it returns `null` so
-  /// callers can fall back to neighbor-based span anchoring. This avoids
-  /// regressions where an insertion belonging inside a nested owner (include/arm)
-  /// is incorrectly pulled out to a shallower boundary.
+  /// does not exactly match a known boundary PP coordinate, it returns `null`
+  /// so callers can fall back to neighbor-based span anchoring. This avoids
+  /// regressions where an insertion belonging inside a nested owner
+  /// (include/arm) is incorrectly pulled out to a shallower boundary.
   ///
-  /// **Boundary sources considered** (each producing a candidate `(pp,b)` pair):
+  /// **Boundary sources considered** (each producing a candidate `(pp,b)`
+  /// pair):
   /// * **Explicit TU slots** with an emitted `pp` coordinate and a conservative
   ///   "boundary-like" `kind` (file/arm/include boundaries).
   ///
   /// **Directive-line newline adjustment:** some recorded boundary slots may
   /// point at the newline that terminates a preprocessor directive line (e.g.
-  /// after `#include`, `#else`, `#endif`). For *insertions* at those boundaries,
-  /// anchoring at the newline byte can cause directive concatenation (e.g.
-  /// `...;#else`). To preserve directive line integrity, candidates for selected
-  /// `kind`s are adjusted to anchor *after* the newline (handling `\n` and
-  /// `\r\n`).
+  /// after `#include`, `#else`, `#endif`). For *insertions* at those
+  /// boundaries, anchoring at the newline byte can cause directive
+  /// concatenation (e.g. `...;#else`). To preserve directive line integrity,
+  /// candidates for selected `kind`s are adjusted to anchor *after* the newline
+  /// (handling `\n` and `\r\n`).
   ///
   /// **Exact-match requirement:** candidates are filtered to those whose PP
   /// coordinate equals `ppGap` exactly. If none match, returns `null`.
@@ -670,8 +690,8 @@ private:
   ///
   /// \param tuPath the TU path whose slots/owners are being consulted (must
   ///               match model file keys)
-  /// \param ppGap  the PP gap index (between PP tokens) representing the desired
-  ///               insertion coordinate
+  /// \param ppGap  the PP gap index (between PP tokens) representing the
+  ///               desired insertion coordinate
   /// \returns the TU byte offset of an exact canonical boundary matching
   ///          `ppGap`, or `null` if `ppGap` is not exactly on a known boundary
   ///          (caller should fall back)
@@ -1359,8 +1379,8 @@ private:
   /// Returns `std::nullopt` if the invocation cannot be parsed or if required
   /// anchoring information (e.g. `m.invB`) is unavailable.
   static std::optional<std::vector<std::pair<size_t, size_t>>>
-  GetMacroInvocationFormalArgContentRanges(const RefoldModel::MacroInvocation &m,
-                                        StringRef invText);
+  GetMacroInvocationFormalArgContentRanges(
+      const RefoldModel::MacroInvocation &m, StringRef invText);
 
   /// \brief Attempts to build an *args-only* macro invocation patch for a hunk
   /// attributed to a macro invocation.
@@ -1438,8 +1458,8 @@ private:
   /// \brief Slices a source text by token indices using a token-to-byte offset
   /// table.
   ///
-  /// This helper converts a half-open token interval `[startTok, endTok)` into a
-  /// byte-offset range using `tokOff` and returns the corresponding `StringRef`
+  /// This helper converts a half-open token interval `[startTok, endTok)` into
+  /// a byte-offset range using `tokOff` and returns the corresponding `StringRef`
   /// of `source`.
   ///
   /// `tokOff` is the token-to-byte offset table:
@@ -1664,6 +1684,82 @@ private:
   static std::optional<std::vector<std::pair<size_t, size_t>>>
   ParseMacroInvocationArgContentRanges(StringRef invText);
 
+  // ------------------------- __COUNTER__ stabilization -----------------------
+
+  /// \brief Determine which macro invocations must be forced to remain expanded
+  /// in order to stabilize edited __COUNTER__ semantics.
+  ///
+  /// Policy:
+  ///   If any expanded __COUNTER__ occurrence is edited in B (relative to its
+  ///   A-side expansion token(s)), then that occurrence and every subsequent
+  ///   __COUNTER__ occurrence in PP-token order must be emitted as a literal
+  ///   expansion (whole-cover), even if unchanged. This preserves the edited
+  ///   preprocessed semantics because replacing a __COUNTER__ site with a
+  ///   literal stops the counter from incrementing, which would otherwise shift
+  ///   all later __COUNTER__ values.
+  ///
+  /// The producer emits a MacroInvocation item for each __COUNTER__ expansion
+  /// with A-token coverage (cover.begin/cover.end). We use the A→B alignment
+  /// map \p a2b to detect the first edited occurrence.
+  ///
+  /// Important: a __COUNTER__ occurrence may be spelled inside a macro
+  /// definition's replacement list (e.g. "#define PRINT(...) __COUNTER__"). In
+  /// that case, patching the __COUNTER__ invocation span would illegally mutate
+  /// the macro definition. Instead, we must force expansion of the *smallest
+  /// patchable macro callsite* that covers the __COUNTER__ expansion token(s)
+  /// (e.g. the PRINT(...) call), and then force all later occurrences
+  /// similarly.
+  ///
+  /// This function therefore returns the set of covering, patchable macro
+  /// invocations that should be whole-cover expanded.
+  struct ForcedMacroPatchRequest {
+    const RefoldModel::MacroInvocation *macro;
+    uint64_t aStart;
+    uint64_t aEnd;
+  };
+
+  /// \brief Compute forced expansion patches needed to stabilize __COUNTER__
+  /// semantics.
+  ///
+  /// If any expanded __COUNTER__ occurrence is edited in B, then that
+  /// occurrence and every subsequent __COUNTER__ occurrence (in PP-token order)
+  /// must be emitted as a literal expansion, even if unchanged. This preserves
+  /// the edited preprocessed semantics because replacing a __COUNTER__ site
+  /// with a literal stops the counter from incrementing, which would otherwise
+  /// shift all later
+  /// __COUNTER__ values.
+  ///
+  /// Important: a __COUNTER__ occurrence may be spelled inside a macro
+  /// definition's replacement list (e.g. "#define PRINT(...) __COUNTER__"). In
+  /// that case, patching the __COUNTER__ invocation span would illegally mutate
+  /// the macro definition. Instead, we force expansion of the smallest
+  /// patchable macro callsite that covers the __COUNTER__ expansion token(s)
+  /// (e.g. the PRINT(...) callsite), and then force all later occurrences
+  /// similarly.
+  ///
+  /// The producer may record multiple body occurrences for a single invocation
+  /// spelling (e.g. when a header is included multiple times). We therefore
+  /// treat each body-span occurrence separately and filter by the true PP-owner
+  /// include.
+  SmallVector<ForcedMacroPatchRequest, 32>
+  ComputeForcedCounterPatches(StringRef tuPath, ArrayRef<int64_t> a2b) const;
+
+  /// \brief Inject forced __COUNTER__ stabilization patches after normal hunk
+  /// attribution.
+  ///
+  /// This runs after normal hunk classification. It injects additional
+  /// MacroPatches into \\p macroPatchByOwnerByMacroId for each forced
+  /// occurrence, even when no diff hunk touched that invocation.
+  void AddForcedCounterPatches(
+      ArrayRef<ForcedMacroPatchRequest> forced,
+      DenseMap<std::optional<uint64_t>, DenseMap<uint64_t, MacroPatch>>
+          &macroPatchByOwnerByMacroId) const;
+
+  /// \brief Compute the whole-cover replacement text for a macro invocation by
+  /// mapping its A-domain PP-token cover to the corresponding B-token envelope.
+  std::optional<std::string>
+  BuildWholeCoverReplacementText(const RefoldModel::MacroInvocation &m) const;
+
   /// \brief Build a macro callsite patch for an invocation using only
   /// span-driven evidence.
   ///
@@ -1709,80 +1805,6 @@ private:
   ///          replacement can be built; otherwise \c std::nullopt (e.g. invalid
   ///          invocation span, invalid cover, or failure to compute a valid
   ///          B-token envelope).
-
-
-// ------------------------- __COUNTER__ stabilization ------------------------
-
-/// \brief Determine which macro invocations must be forced to remain expanded
-/// in order to stabilize edited __COUNTER__ semantics.
-///
-/// Policy:
-///   If any expanded __COUNTER__ occurrence is edited in B (relative to its
-///   A-side expansion token(s)), then that occurrence and every subsequent
-///   __COUNTER__ occurrence in PP-token order must be emitted as a literal
-///   expansion (whole-cover), even if unchanged. This preserves the edited
-///   preprocessed semantics because replacing a __COUNTER__ site with a
-///   literal stops the counter from incrementing, which would otherwise shift
-///   all later __COUNTER__ values.
-///
-/// The producer emits a MacroInvocation item for each __COUNTER__ expansion
-/// with A-token coverage (cover.begin/cover.end). We use the A→B alignment map
-/// \p a2b to detect the first edited occurrence.
-///
-/// Important: a __COUNTER__ occurrence may be spelled inside a macro
-/// definition's replacement list (e.g. "#define PRINT(...) __COUNTER__"). In
-/// that case, patching the __COUNTER__ invocation span would illegally mutate
-/// the macro definition. Instead, we must force expansion of the *smallest
-/// patchable macro callsite* that covers the __COUNTER__ expansion token(s)
-/// (e.g. the PRINT(...) call), and then force all later occurrences similarly.
-///
-/// This function therefore returns the set of covering, patchable macro
-/// invocations that should be whole-cover expanded.
-struct ForcedMacroPatchRequest {
-  const RefoldModel::MacroInvocation *macro;
-  uint64_t aStart;
-  uint64_t aEnd;
-};
-
-/// \\brief Compute forced expansion patches needed to stabilize __COUNTER__
-/// semantics.
-///
-/// If any expanded __COUNTER__ occurrence is edited in B, then that occurrence
-/// and every subsequent __COUNTER__ occurrence (in PP-token order) must be
-/// emitted as a literal expansion, even if unchanged. This preserves the edited
-/// preprocessed semantics because replacing a __COUNTER__ site with a literal
-/// stops the counter from incrementing, which would otherwise shift all later
-/// __COUNTER__ values.
-///
-/// Important: a __COUNTER__ occurrence may be spelled inside a macro
-/// definition's replacement list (e.g. "#define PRINT(...) __COUNTER__"). In
-/// that case, patching the __COUNTER__ invocation span would illegally mutate
-/// the macro definition. Instead, we force expansion of the smallest patchable
-/// macro callsite that covers the __COUNTER__ expansion token(s) (e.g. the
-/// PRINT(...) callsite), and then force all later occurrences similarly.
-///
-/// The producer may record multiple body occurrences for a single invocation
-/// spelling (e.g. when a header is included multiple times). We therefore treat
-/// each body-span occurrence separately and filter by the true PP-owner include.
-SmallVector<ForcedMacroPatchRequest, 32>
-ComputeForcedCounterPatches(StringRef tuPath, ArrayRef<int64_t> a2b) const;
-
-/// \\brief Inject forced __COUNTER__ stabilization patches after normal hunk
-/// attribution.
-///
-/// This runs after normal hunk classification. It injects additional
-/// MacroPatches into \\p macroPatchByOwnerByMacroId for each forced occurrence,
-/// even when no diff hunk touched that invocation.
-void AddForcedCounterPatches(
-    ArrayRef<ForcedMacroPatchRequest> forced,
-    DenseMap<std::optional<uint64_t>, DenseMap<uint64_t, MacroPatch>>
-        &macroPatchByOwnerByMacroId) const;
-
-/// \brief Compute the whole-cover replacement text for a macro invocation by
-/// mapping its A-domain PP-token cover to the corresponding B-token envelope.
-std::optional<std::string>
-BuildWholeCoverReplacementText(const RefoldModel::MacroInvocation &m) const;
-
   std::optional<MacroPatch> BuildMacroInvocationPatchWholeCover(
       const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h,
       StringRef baseInvText,
@@ -2136,12 +2158,12 @@ BuildWholeCoverReplacementText(const RefoldModel::MacroInvocation &m) const;
   /// [start,end) in originalFileText.
   ///
   /// This method detects "line drift" by comparing the newline count in the
-  /// original span versus the replacement text. If there is no drift, it returns
-  /// (replacement, nullopt).
+  /// original span versus the replacement text. If there is no drift, it
+  /// returns (replacement, nullopt).
   ///
   /// If drift is detected, the method:
-  /// 1. Computes the logical resume line for the first character at `end` in the
-  ///    original file,
+  /// 1. Computes the logical resume line for the first character at `end` in
+  ///    the original file,
   /// 2. Attempts a local resync by calling
   ///    LineDirectiveInserter::maybeAppendResyncAfterReplacement,
   /// 3. If local injection succeeds, returns (injectedReplacement, nullopt),
@@ -2157,7 +2179,8 @@ BuildWholeCoverReplacementText(const RefoldModel::MacroInvocation &m) const;
   /// \param end End offset (exclusive) in originalFileText.
   /// \param replacement Replacement text.
   /// \param fileSpellingForDirective Path used in any injected #line.
-  /// \return A ResyncOutcome containing the emitted text and optional pending state.
+  /// \return A ResyncOutcome containing the emitted text and optional pending
+  ///         state.
   ResyncOutcome ApplyResyncOrPend(StringRef originalFileText, uint64_t start,
                                   uint64_t end, StringRef replacement,
                                   StringRef fileSpellingForDirective) const;
@@ -2336,7 +2359,7 @@ BuildWholeCoverReplacementText(const RefoldModel::MacroInvocation &m) const;
   /// format.
   ///
   /// The output string follows the pattern:
-  /// `{kind=K, A=[begin,end), argIdx=I, [occ=STRINGIFY], [byte=[bBegin,bEnd)]}`.
+  /// `{kind=K, A=[begin,end), argIdx=I, [occ=STRINGIFY], [byte=[bBegin,bEnd)]}`
   ///
   /// \param sp The span metadata to serialize.
   /// \param isStringifyOcc Whether this occurrence was produced by a `#`

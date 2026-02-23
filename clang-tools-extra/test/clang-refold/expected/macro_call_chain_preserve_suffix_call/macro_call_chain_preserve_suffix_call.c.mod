@@ -10,5 +10,5 @@
 int goodbye_world (void) { return 21; }
 
 int main(void) {
-  return EVAL2(goodbye_world)() == 21 ? 0 : 1;
+  return EVAL2(MAKE_NAME(goodbye,world))() == 21 ? 0 : 1;
 }
