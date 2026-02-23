@@ -4670,21 +4670,46 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
 
   SmallVector<Occ, 32> occs;
 
-  // Collect all body-span occurrences of __COUNTER__.
+  // Collect __COUNTER__ occurrences in PP-token space.
+  //
+  // Note: when __COUNTER__ is consumed by token paste or stringification, the
+  // producer may record a zero-length span (begin==end) anchored at the output
+  // token index affected by the counter. Treat such anchors as a single-token
+  // occurrence so edits to pasted/stringified counter materialize and trigger
+  // suffix stabilization.
+  auto addOcc = [&](const RefoldModel::MacroInvocation &mi, uint64_t b,
+                    uint64_t e) {
+    if (e > b) {
+      occs.push_back(Occ{&mi, b, e, std::nullopt});
+      return;
+    }
+    if (e == b && b < aToks_.size()) {
+      occs.push_back(Occ{&mi, b, b + 1, std::nullopt});
+      return;
+    }
+  };
+
   for (const auto &mi : model_.GetMacroInvocations()) {
     if (mi.name != "__COUNTER__")
       continue;
     if (!mi.invB || !mi.invE || !mi.invText)
       continue;
-    if (mi.bodySpans.empty()) {
-      if (mi.cover.IsValid() && mi.cover.end > mi.cover.begin)
-        occs.push_back(Occ{&mi, mi.cover.begin, mi.cover.end, std::nullopt});
+
+    if (!mi.bodySpans.empty()) {
+      for (const auto &bs : mi.bodySpans)
+        addOcc(mi, bs.begin, bs.end);
       continue;
     }
-    for (const auto &bs : mi.bodySpans) {
-      if (bs.end > bs.begin)
-        occs.push_back(Occ{&mi, bs.begin, bs.end, std::nullopt});
+
+    // Prefer explicit spans when present, including zero-length anchors.
+    if (!mi.spans.empty()) {
+      for (const auto &s : mi.spans)
+        addOcc(mi, s.begin, s.end);
+      continue;
     }
+
+    if (mi.cover.IsValid() && mi.cover.end > mi.cover.begin)
+      occs.push_back(Occ{&mi, mi.cover.begin, mi.cover.end, std::nullopt});
   }
 
   if (occs.empty())
@@ -4806,8 +4831,27 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
 std::optional<std::string>
 RefoldEngine::BuildWholeCoverReplacementText(
     const RefoldModel::MacroInvocation &m) const {
-  const uint64_t covLoA = m.cover.begin;
-  const uint64_t covHiA = m.cover.end;
+  uint64_t covLoA = m.cover.begin;
+  uint64_t covHiA = m.cover.end;
+
+  // For function-like macros with no formal parameters, the producer may
+  // conservatively widen the macro cover to include surrounding context (e.g.
+  // when the invocation occurs in a nested macro argument). In these cases,
+  // bodySpans is the precise expansion slice we want to whole-cover replace.
+  if (m.subkind == "func" && m.defParams.empty() && !m.bodySpans.empty()) {
+    uint64_t lo = std::numeric_limits<uint64_t>::max();
+    uint64_t hi = 0;
+    for (const auto &s : m.bodySpans) {
+      if (s.begin < s.end) {
+        lo = std::min(lo, s.begin);
+        hi = std::max(hi, s.end);
+      }
+    }
+    if (lo != std::numeric_limits<uint64_t>::max() && lo < hi) {
+      covLoA = lo;
+      covHiA = hi;
+    }
+  }
 
   if (covLoA >= covHiA)
     return std::nullopt;
@@ -6226,8 +6270,25 @@ if (m.name == "__COUNTER__") {
   // 2) Whole-cover fallback: replace invocation with the entire expansion cover
   // slice from B. cover.begin/cover.end are PP-token indices in A; map them
   // into a B-token envelope.
-  const uint64_t covLoA = m.cover.begin;
-  const uint64_t covHiA = m.cover.end;
+  uint64_t covLoA = m.cover.begin;
+  uint64_t covHiA = m.cover.end;
+
+  // Same rationale as BuildWholeCoverReplacementText: for no-arg function-like
+  // macros, prefer the precise bodySpans envelope over the conservative cover.
+  if (m.subkind == "func" && m.defParams.empty() && !m.bodySpans.empty()) {
+    uint64_t lo = std::numeric_limits<uint64_t>::max();
+    uint64_t hi = 0;
+    for (const auto &s : m.bodySpans) {
+      if (s.begin < s.end) {
+        lo = std::min(lo, s.begin);
+        hi = std::max(hi, s.end);
+      }
+    }
+    if (lo != std::numeric_limits<uint64_t>::max() && lo < hi) {
+      covLoA = lo;
+      covHiA = hi;
+    }
+  }
 
   if (covLoA >= covHiA)
     return std::nullopt;
