@@ -340,6 +340,241 @@ std::string RefoldEngine::Refold() {
   // 3) Diff hunks (changed A-token intervals -> B-token intervals).
   auto hunks = diffutils::hunksFromMap(a2b, aSeq.size(), bSeq.size());
 
+  // Normalize token-LCS ambiguities for pure insertions.
+  //
+  // Deterministic LCS alignment can "steal" a low-information boundary token
+  // (e.g. ';', ')', ',', etc.) from the unchanged right context into the
+  // insertion payload, while simultaneously matching an identical token later
+  // in B against the original boundary token in A. This yields an insertion
+  // hunk whose B slice begins with a context token and whose insertion anchor
+  // lands on a potentially macro-owned A token, which can cause the insertion
+  // to be mis-attributed and dropped.
+  //
+  // We repair a very specific local shape (delimiter token):
+  //   * h is an insert-only hunk at A position aPos
+  //   * A[aPos] is matched exactly at the end boundary: a2b[aPos] == h.bEnd
+  //   * the inserted B slice begins with a token equal to A[aPos]
+  //   * the B token at index h.bEnd is also equal to A[aPos]
+  //   * the leading B token is UNMATCHED (so it truly floated into the insert)
+  //
+  // Then we shift the insertion anchor after A[aPos], drop the leading stolen
+  // token in B, and extend the insertion slice to include the matched token at
+  // h.bEnd.
+  //
+  // In addition, we trim any *matched* tokens that accidentally appear at the
+  // edges of an insert-only hunk, which can happen under ambiguous LCS tie
+  // breaks.
+
+  // Build inverse map B->A for quick matched/unmatched checks.
+  std::vector<int64_t> b2a(bSeq.size(), -1);
+  for (size_t ai = 0; ai < a2b.size(); ++ai) {
+    const int64_t bj = a2b[ai];
+    if (bj >= 0 && static_cast<size_t>(bj) < b2a.size())
+      b2a[static_cast<size_t>(bj)] = static_cast<int64_t>(ai);
+  }
+
+  auto isSafeBoundaryTok = [](StringRef t) -> bool {
+    if (t.size() != 1)
+      return false;
+    switch (t[0]) {
+    case ';':
+    case ')':
+    case ']':
+    case '}':
+    case ',':
+      return true;
+    default:
+      return false;
+    }
+  };
+
+  size_t trimmedEdgeMatched = 0;
+  size_t repairedBoundarySteal = 0;
+  for (auto &h : hunks) {
+    const bool isIns = (h.aStart == h.aEnd) && (h.bStart < h.bEnd);
+    if (!isIns)
+      continue;
+
+    // Step 0: Trim matched tokens that accidentally appear on the edges.
+    while (h.bStart < h.bEnd && static_cast<size_t>(h.bStart) < b2a.size() &&
+           b2a[static_cast<size_t>(h.bStart)] >= 0) {
+      ++h.bStart;
+      ++trimmedEdgeMatched;
+    }
+    while (h.bStart < h.bEnd && static_cast<size_t>(h.bEnd - 1) < b2a.size() &&
+           b2a[static_cast<size_t>(h.bEnd - 1)] >= 0) {
+      --h.bEnd;
+      ++trimmedEdgeMatched;
+    }
+    if (h.bStart >= h.bEnd)
+      continue;
+
+    // Step 1: Repair a "stolen boundary token" at the insertion point.
+    //
+    // This shape can repeat (e.g. ");" or "}),"), so apply the same local
+    // seam repair repeatedly until it no longer matches.
+    unsigned shiftCount = 0;
+    while (true) {
+      const uint64_t aPos = h.aStart;
+      if (aPos >= aSeq.size() || static_cast<size_t>(aPos) >= a2b.size())
+        break;
+
+      // Do not shift the insertion anchor into a *deeper* ownership gap.
+      // The weighted SES/LCS already chose the lowest-cost (shallowest)
+      // split points via ownerDepthGap_. Allowing this seam repair to walk
+      // forward into a deeper gap can violate the boundary policy (notably
+      // around conditional/include seams). Only permit shifts that keep the
+      // gap cost the same or move to a shallower gap.
+      if (aPos + 1 < ownerDepthGap_.size() &&
+          ownerDepthGap_[aPos + 1] > ownerDepthGap_[aPos])
+        break;
+
+      const int64_t matchedJ = a2b[static_cast<size_t>(aPos)];
+      if (matchedJ < 0)
+        break;
+      const uint64_t bMatch = static_cast<uint64_t>(matchedJ);
+
+      // Require that A[aPos] is matched exactly at the end boundary (exclusive).
+      if (bMatch != h.bEnd)
+        break;
+      if (h.bStart >= bSeq.size() || bMatch >= bSeq.size())
+        break;
+
+      const StringRef tok = aSeq[static_cast<size_t>(aPos)];
+      if (tok.empty())
+        break;
+
+      // Only apply boundary-steal repair when the right-context boundary token is
+      // a stable delimiter/closing token. Avoid identifier/keyword tokens, for
+      // which shifting the anchor can change meaning.
+      if (!isSafeBoundaryTok(tok))
+        break;
+
+      // The inserted slice begins with a token equal to the right boundary token.
+      if (bSeq[static_cast<size_t>(h.bStart)] != tok)
+        break;
+      // The boundary token exists immediately at bMatch (the matched one).
+      if (bSeq[static_cast<size_t>(bMatch)] != tok)
+        break;
+
+      // Leading B token must be unmatched; otherwise we would be moving a real
+      // matched token out of the alignment.
+      if (static_cast<size_t>(h.bStart) < b2a.size() &&
+          b2a[static_cast<size_t>(h.bStart)] >= 0)
+        break;
+
+      // Optional consistency check: ensure that the token at bMatch is matched
+      // back to this exact A boundary token.
+      if (static_cast<size_t>(bMatch) < b2a.size() &&
+          b2a[static_cast<size_t>(bMatch)] != static_cast<int64_t>(aPos))
+        break;
+
+      // Require that the insertion contains more than just the stolen token.
+      if (h.bEnd <= h.bStart + 1)
+        break;
+
+      // Bounds: shift A by +1, drop B leading token by +1, include boundary token
+      // by extending bEnd to bMatch+1.
+      if (aPos + 1 > static_cast<uint64_t>(aSeq.size()))
+        break;
+      if (bMatch + 1 > static_cast<uint64_t>(bSeq.size()))
+        break;
+
+      GapCtxKey curCtx = GetGapCtxKey(aPos, aSeq.size());
+      GapCtxKey nxtCtx = GetGapCtxKey(aPos + 1, aSeq.size());
+      int curDepth = (aPos < ownerDepthGap_.size() ? (int)ownerDepthGap_[aPos] : -1);
+      int nxtDepth = (aPos + 1 < ownerDepthGap_.size() ? (int)ownerDepthGap_[aPos + 1] : -1);
+
+      // Guard against drifting across *conditional arm* boundaries.
+      //
+      // We intentionally allow the RIGHT include context (incR) to change when
+      // shifting, because a stolen-token seam can legitimately be repaired by
+      // moving the anchor onto an include boundary (parent -> child include).
+      //
+      // What we must not allow is drifting an insertion from one conditional
+      // arm to another *within the same include*, which breaks the pure
+      // insertion boundary policy for conditionals.
+      const bool leftStable = (curCtx.incL == nxtCtx.incL) &&
+                              (curCtx.armL == nxtCtx.armL);
+      const bool rightStable = (curCtx.incR != nxtCtx.incR) ||
+                               (curCtx.armR == nxtCtx.armR);
+      if (!leftStable || !rightStable) {
+        trace("hunks/norm",
+              "stolen-boundary: shift#{0} blocked by boundary/arm change gap {1}->{2} "
+              "leftStable={3} rightStable={4} cur(incL={5},incR={6},armL={7},armR={8}) "
+              "nxt(incL={9},incR={10},armL={11},armR={12})",
+              shiftCount, aPos, aPos + 1, leftStable, rightStable,
+              curCtx.incL, curCtx.incR, curCtx.armL, curCtx.armR,
+              nxtCtx.incL, nxtCtx.incR, nxtCtx.armL, nxtCtx.armR);
+        break;
+      }
+
+      // Never shift from a shallower gap into a deeper gap.
+      if (curDepth >= 0 && nxtDepth >= 0 && nxtDepth > curDepth) {
+        trace("hunks/norm",
+              "stolen-boundary: shift#{0} blocked by depth increase gap {1}->{2} depth {3}->{4}",
+              shiftCount, aPos, aPos + 1, curDepth, nxtDepth);
+        break;
+      }
+
+      trace("hunks/norm",
+            "stolen-boundary: shift#{0} gap {1}->{2} tok='{3}' depth {4}->{5} "
+            "cur(incL={6},incR={7},armL={8},armR={9}) nxt(incL={10},incR={11},armL={12},armR={13})",
+            shiftCount, aPos, aPos + 1, tok, curDepth, nxtDepth, curCtx.incL,
+            curCtx.incR, curCtx.armL, curCtx.armR, nxtCtx.incL, nxtCtx.incR,
+            nxtCtx.armL, nxtCtx.armR);
+
+      const diffutils::Hunk beforeH = h;
+      h.aStart = aPos + 1;
+      h.aEnd = aPos + 1;
+      h.bStart = h.bStart + 1;
+      h.bEnd = bMatch + 1;
+
+      ++shiftCount;
+      ++repairedBoundarySteal;
+      trace("hunks/norm",
+            "repaired stolen-boundary insertion shift={0} token='{1}' : {2:verbose} -> {3:verbose}",
+            shiftCount, tok, beforeH, h);
+    }
+  }
+
+  if (trimmedEdgeMatched) {
+    trace("hunks/norm", "trimmed {0} matched edge tokens from insert-only hunks",
+          trimmedEdgeMatched);
+  }
+  if (repairedBoundarySteal) {
+    trace("hunks/norm", "repaired {0} stolen-boundary insert-only hunks",
+          repairedBoundarySteal);
+  }
+
+  // Coalesce adjacent insert-only hunks that now share the same A insertion
+  // position and have contiguous B spans. This commonly happens when comment
+  // tokens are split into a separate insertion hunk.
+  if (hunks.size() > 1) {
+    std::vector<diffutils::Hunk> merged;
+    merged.reserve(hunks.size());
+    for (const auto &h : hunks) {
+      const bool isIns = (h.aStart == h.aEnd) && (h.bStart < h.bEnd);
+      if (!merged.empty()) {
+        diffutils::Hunk &prev = merged.back();
+        const bool prevIns =
+            (prev.aStart == prev.aEnd) && (prev.bStart < prev.bEnd);
+        if (isIns && prevIns && prev.aStart == h.aStart && prev.aEnd == h.aEnd &&
+            prev.bEnd == h.bStart) {
+          prev.bEnd = h.bEnd;
+          continue;
+        }
+      }
+      merged.push_back(h);
+    }
+    if (merged.size() != hunks.size()) {
+      trace("hunks/norm",
+            "coalesced insert-only hunks: before={0} after={1}", hunks.size(),
+            merged.size());
+      hunks = std::move(merged);
+    }
+  }
+
   // Build *raw-text* byte hunks once; this enables deterministic mapping of PP
   // byte spans from A->B, without inheriting any ambiguity from token-level
   // alignment.
@@ -1008,6 +1243,29 @@ std::vector<uint32_t> RefoldEngine::ComputeOwnerDepthGapsForPP() {
   return ownerDepthGap;
 }
 
+RefoldEngine::GapCtxKey RefoldEngine::GetGapCtxKey(uint64_t gap,
+                                                   uint64_t aSize) const {
+  GapCtxKey key;
+
+  // Left context is the token immediately before the gap.
+  if (gap > 0) {
+    if (auto inc = model_.InnermostIncludeAtPP(gap - 1))
+      key.incL = static_cast<int64_t>(*inc);
+    if (auto arm = model_.FindArmRefAtPP(gap - 1))
+      key.armL = static_cast<int64_t>(arm->arm->id);
+  }
+
+  // Right context is the token immediately after the gap.
+  if (gap < aSize) {
+    if (auto inc = model_.InnermostIncludeAtPP(gap))
+      key.incR = static_cast<int64_t>(*inc);
+    if (auto arm = model_.FindArmRefAtPP(gap))
+      key.armR = static_cast<int64_t>(arm->arm->id);
+  }
+
+  return key;
+}
+
 // ============================= Boundary helpers ==============================
 
 bool RefoldEngine::BoundaryGlues(char left, char right) {
@@ -1082,11 +1340,30 @@ RefoldEngine::ClassifyOwnerWithSegments(StringRef tuPath,
   // include's PP coverage, treat the insertion as include-owned.
   if (a0 == a1) {
     if (auto slotAnchor = AnchorToExactSlotBoundaryFromPPGap(tuPath, a0)) {
+      trace("slots/anchor", "INS slotAnchor present: gapPP={0} tuByte={1}", a0,
+            (std::uint64_t)*slotAnchor);
       std::optional<uint64_t> leftInc =
           (a0 > 0) ? model_.InnermostIncludeAtPP(a0 - 1) : std::nullopt;
       const uint64_t maxPP = model_.GetTokensCountA();
       std::optional<uint64_t> rightInc =
           a0 < maxPP ? model_.InnermostIncludeAtPP(a0) : std::nullopt;
+
+      std::int64_t leftArm = -1, rightArm = -1;
+      if (a0 > 0) {
+        if (auto armRef = model_.FindArmRefAtPP(a0 - 1))
+          leftArm = (std::int64_t)armRef->arm->id;
+      }
+      if (a0 < maxPP) {
+        if (auto armRef = model_.FindArmRefAtPP(a0))
+          rightArm = (std::int64_t)armRef->arm->id;
+      }
+
+      trace("segments/insert",
+            "ClassifyOwnerWithSegments: INS gapPP={0} slotTU={1} leftInc={2} "
+            "rightInc={3} leftArm={4} rightArm={5} depthGap={6}",
+            a0, (std::uint64_t)*slotAnchor, leftInc, rightInc, leftArm,
+            rightArm,
+            (a0 < ownerDepthGap_.size() ? (int)ownerDepthGap_[a0] : -1));
 
       if (leftInc && rightInc && *leftInc == *rightInc) {
         trace("segments",
@@ -1646,6 +1923,13 @@ RefoldEngine::AnchorToExactSlotBoundaryFromPPGap(StringRef tuPath,
     }
   }
 
+  if (best) {
+    trace("slots/anchor",
+          "AnchorToExactSlotBoundaryFromPPGap: ppGap={0} -> slotId={1} kind={2} tuByte={3}",
+          ppGap, best->slot->id, best->slot->kind, best->b);
+  } else {
+    trace("slots/anchor", "AnchorToExactSlotBoundaryFromPPGap: ppGap={0} -> <none>", ppGap);
+  }
   return best ? std::optional<uint64_t>(best->b) : std::nullopt;
 }
 
@@ -5804,6 +6088,30 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       const uint64_t pos = p.aStart;
       std::optional<uint64_t> anchorPP;
 
+      // First, if this INSERT PP gap lies on a boundary between this header
+      // and one of its direct child includes, prefer anchoring at the child's
+      // include-site byte position. This avoids placing boundary insertions at
+      // the next mapped PP token in the header, which is often *after* the
+      // child include directive (since tokens from the included file do not map
+      // back to this header).
+      if (const std::optional<uint64_t> insertByte =
+              ComputeChildBoundaryInsertByte(p, file)) {
+        if (*insertByte <= fileLen) {
+          std::string text =
+              PadAtBoundaries(headerText, static_cast<size_t>(*insertByte),
+                              static_cast<size_t>(*insertByte), p.insertBytes,
+                              /* allowLeft */ true, /* allowRight */ true);
+          edits.push_back(MakeTextEditWithResyncOrPending(
+              headerText, *insertByte, *insertByte, text, file));
+
+          trace("include/apply",
+                "file={0} patch[{1}] INSERT: anchored via child boundary at "
+                "byte={2}",
+                file, idx, insertByte);
+          continue;
+        }
+      }
+
       // 1) Prefer the right neighbor: smallest pp >= pos in [ppLo, ppHi).
       for (uint64_t pp = std::max(pos, ppLo); pp < ppHi; ++pp) {
         auto it = tokmapByPP.find(pp);
@@ -6065,11 +6373,18 @@ RefoldEngine::ComputeChildBoundaryInsertByte(const IncludePatch &p,
     }
   }
 
-  if (right) {
+  // Only treat this as an "include-boundary" insertion when the PP-gap is
+  // *exactly* on a child cover boundary.
+  //
+  // Otherwise, the nearest-child heuristic can incorrectly anchor unrelated
+  // insertions (e.g. insertions in the prefix text before any child include)
+  // onto the first '#include' directive in the file, which causes multiple
+  // insertions to collide and garble the header.
+  if (right && right->cover.begin == pos) {
     // Insert *before* the right '#include'.
     return right->siteB;
   }
-  if (left) {
+  if (left && left->cover.end == pos) {
     // Insert *after* the left '#include'.
     return left->siteE;
   }
@@ -6120,20 +6435,110 @@ RefoldEngine::ApplyTextEditsWithPendingResync(StringRef originalFileText,
   if (edits.empty())
     return originalFileText.str();
 
-  DenseMap<std::pair<uint64_t, uint64_t>, const TextEdit *> bySpan;
-  for (const auto &e : edits) {
-    bySpan[{e.start, e.end}] = &e;
-  }
+  // Normalize edits by span.
+  //
+  // Historically we deduped by (start,end) using a map, which accidentally
+  // dropped legitimate *multiple insertions* at the same byte offset.
+  // This happens when the diff produces adjacent insert-only hunks (e.g. when
+  // comments tokenize separately), and both map to the same insertion point.
+  //
+  // We now:
+  //  * Preserve and concatenate multiple INSERT edits with identical zero-length
+  //    spans ([x,x)) in their original order.
+  //  * For non-zero spans, keep the last edit (as the prior map effectively did)
+  //    but retain any pending-resync from earlier edits, and emit a trace if the
+  //    payloads disagree.
 
-  // Use SmallVector for the normalized list to stay on the stack if possible.
-  auto values = llvm::make_second_range(bySpan);
-  SmallVector<const TextEdit *, 32> norm(values.begin(), values.end());
+  struct EditRef {
+    const TextEdit *e;
+    size_t idx;
+  };
 
-  sort(norm, [](const TextEdit *a, const TextEdit *b) {
-    if (a->start != b->start)
-      return a->start < b->start;
-    return a->end < b->end;
+  SmallVector<EditRef, 32> ordered;
+  ordered.reserve(edits.size());
+  for (size_t i = 0; i < edits.size(); ++i)
+    ordered.push_back(EditRef{&edits[i], i});
+
+  sort(ordered, [](const EditRef &a, const EditRef &b) {
+    if (a.e->start != b.e->start)
+      return a.e->start < b.e->start;
+    if (a.e->end != b.e->end)
+      return a.e->end < b.e->end;
+    return a.idx < b.idx;
   });
+
+  SmallVector<TextEdit, 32> norm;
+  norm.reserve(ordered.size());
+
+  for (size_t i = 0; i < ordered.size();) {
+    const uint64_t s = ordered[i].e->start;
+    const uint64_t t = ordered[i].e->end;
+
+    size_t j = i + 1;
+    while (j < ordered.size() && ordered[j].e->start == s &&
+           ordered[j].e->end == t)
+      ++j;
+
+    if (j - i == 1) {
+      norm.push_back(*ordered[i].e);
+      i = j;
+      continue;
+    }
+
+    // Multiple edits share the same byte span.
+    if (s == t) {
+      // INSERT at identical position: concatenate in order.
+      TextEdit merged;
+      merged.start = s;
+      merged.end = t;
+
+      size_t totalLen = 0;
+      for (size_t k = i; k < j; ++k)
+        totalLen += ordered[k].e->text.size();
+      merged.text.reserve(totalLen);
+
+      for (size_t k = i; k < j; ++k) {
+        merged.text.append(ordered[k].e->text);
+        if (ordered[k].e->pending)
+          merged.pending = ordered[k].e->pending;
+      }
+
+      trace("edits/apply", "merged {0} insertion edits at [{1},{2}) into len={3}",
+            j - i, s, t, merged.text.size());
+
+      norm.push_back(std::move(merged));
+      i = j;
+      continue;
+    }
+
+    // Non-zero span duplicates: keep the last edit by order, but preserve any
+    // pending resync request.
+    const TextEdit *last = ordered[j - 1].e;
+    TextEdit chosen = *last;
+
+    for (size_t k = i; k < j; ++k) {
+      if (ordered[k].e->pending)
+        chosen.pending = ordered[k].e->pending;
+    }
+
+    if (inTraceMode()) {
+      bool disagree = false;
+      for (size_t k = i; k + 1 < j; ++k) {
+        if (ordered[k].e->text != last->text) {
+          disagree = true;
+          break;
+        }
+      }
+      if (disagree) {
+        trace("edits/apply",
+              "multiple edits share span [{0},{1}); keeping last (idx={2})", s, t,
+              ordered[j - 1].idx);
+      }
+    }
+
+    norm.push_back(std::move(chosen));
+    i = j;
+  }
 
   // Use SmallString for the output buffer to optimize small file edits.
   SmallString<0> out;
@@ -6143,27 +6548,27 @@ RefoldEngine::ApplyTextEditsWithPendingResync(StringRef originalFileText,
   uint64_t cursor = 0;
   size_t n = originalFileText.size();
 
-  for (const auto *e : norm) {
-    if (e->end < e->start || e->end > n) {
-      fatal("edits/apply", "bad edit bounds [{0},{1}) fileLen={2}", e->start,
-            e->end, n);
+  for (const auto &e : norm) {
+    if (e.end < e.start || e.end > n) {
+      fatal("edits/apply", "bad edit bounds [{0},{1}) fileLen={2}", e.start,
+            e.end, n);
     }
-    if (e->start < cursor) {
+    if (e.start < cursor) {
       fatal("edits/apply", "overlapping edits: cursor={0} nextStart={1}",
-            cursor, e->start);
+            cursor, e.start);
     }
 
     // Pass the SmallString to the appender.
     pending = AppendOriginalSliceWithPending(out, originalFileText, cursor,
-                                             e->start, std::move(pending));
+                                             e.start, std::move(pending));
 
-    out.append(e->text);
+    out.append(e.text);
 
-    if (e->pending) {
-      pending = e->pending;
+    if (e.pending) {
+      pending = e.pending;
     }
 
-    cursor = e->end;
+    cursor = e.end;
   }
 
   pending = AppendOriginalSliceWithPending(out, originalFileText, cursor, n,
