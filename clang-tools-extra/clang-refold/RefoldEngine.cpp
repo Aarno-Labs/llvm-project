@@ -2084,14 +2084,35 @@ RefoldEngine::AnchorToExactSlotBoundaryFromPPGap(StringRef tuPath,
   StringRef tuText = bufOrErr.get()->getBuffer();
 
   // Helper to adjust slots that terminate on directive newlines
-  auto adjustSlot = [&tuText](const RefoldModel::Slot *s) -> uint64_t {
+  auto adjustSlot = [&tuText, &tuPath, this](const RefoldModel::Slot *s) -> uint64_t {
     uint64_t b = s->b;
 
-    bool needsAdjustment =
+    // Special case: the producer anchors the selected arm_end at the first
+    // directive following the arm body (often "#else" or "#endif"). However,
+    // the corresponding PP gap is observed *after* the entire conditional group
+    // when replay-preprocessing. To keep pure-insertion anchoring consistent
+    // with the boundary policy (outside the conditional group), re-anchor the
+    // arm_end boundary to the end of the group's "#endif" line.
+    if (s->kind == "arm_end" && s->pp) {
+      const uint64_t pp = *s->pp;
+      if (pp > 0) {
+        if (auto armRef = model_.FindArmRefAtPP(pp - 1)) {
+          if (armRef->group && PathsEqual(armRef->group->file, tuPath)) {
+            const uint64_t ge = armRef->group->groupE;
+            if (ge <= tuText.size())
+              return ge;
+          }
+        }
+      }
+      // Fall back to the raw slot byte if we cannot resolve the group.
+      return b;
+    }
+
+    bool needsNoNewlineAdjustment =
         StringSwitch<bool>(s->kind)
-            .Cases("after_include", "after_last_include", "arm_end", true)
+            .Cases("after_include", "after_last_include", true)
             .Default(false);
-    if (needsAdjustment)
+    if (needsNoNewlineAdjustment)
       return b;
 
     if (b >= tuText.size())
