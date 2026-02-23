@@ -1264,6 +1264,52 @@ std::string RefoldEngine::Refold() {
   // Apply TU edits in descending order of start offset.
   debug("tu/apply", "applying {0} TU edits", tuEdits.size());
   std::string tuResult = ApplyTextEditsWithPendingResync(tuBytes, tuEdits);
+
+  // If the TU contains built-in macros whose expansion depends on the
+  // preprocessor logical file (notably __FILE__/__FILE_NAME__),
+  // establish the TU's original spelled file at the start of the refolded
+  // output. Otherwise, replay preprocessing will treat the refolded output
+  // filename (e.g. "foo.c.mod") as __FILE__.
+  //
+  // Keep this narrowly scoped: only insert the prologue when such a builtin is
+  // invoked in the TU and the output does not already start with a #line.
+  if (lineDirs_.Enabled() && !tuResult.empty()) {
+    auto startsWithLine = [](StringRef s) -> bool {
+      size_t i = 0;
+      while (i < s.size()) {
+        char c = s[i];
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+          ++i;
+          continue;
+        }
+        break;
+      }
+      return s.drop_front(i).starts_with("#line");
+    };
+
+    bool needsTUPrologue = false;
+    for (const auto &m : model_.GetMacroInvocations()) {
+      if (m.name != "__FILE__" && m.name != "__FILE_NAME__")
+        continue;
+      if (!m.invFile)
+        continue;
+
+      // Compare absolute normalized paths to avoid relative-spelling mismatches.
+      // Producer spelling (tuPath) is preserved in the emitted directive.
+      if (lineDirs_.ToAbsolutePath(*m.invFile) !=
+          lineDirs_.ToAbsolutePath(tuPath))
+        continue;
+
+      needsTUPrologue = true;
+      break;
+    }
+
+    if (needsTUPrologue && !startsWithLine(StringRef(tuResult))) {
+      std::string dir = lineDirs_.FormatLineDirective(1, tuPath);
+      if (!dir.empty())
+        tuResult.insert(0, dir);
+    }
+  }
   debug("plan", "REFOLD DONE tuResultLen={0}", tuResult.size());
   return tuResult;
 }
