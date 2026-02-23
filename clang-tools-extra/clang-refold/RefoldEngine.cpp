@@ -4776,6 +4776,120 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
     }
   }
 
+  // Fallback: some nested-macro scenarios record __COUNTER__ with a zero-length
+  // PP span anchored at a caller site that is *not* the edited output token
+  // itself. In those cases, the direct __COUNTER__ occurrence comparison above
+  // can miss the edit. Recover by lifting each __COUNTER__ occurrence to a
+  // patchable caller macro whose bodySpans/cover correspond to the actual
+  // expanded token slice, then redo edit detection.
+  if (firstEditedIdx < 0) {
+    DenseMap<uint64_t, const RefoldModel::MacroInvocation *> invById;
+    invById.reserve(model_.GetMacroInvocations().size());
+    for (const auto &mi : model_.GetMacroInvocations())
+      invById[mi.id] = &mi;
+
+    auto findPatchableCaller =
+        [&](const RefoldModel::MacroInvocation &mi)
+        -> const RefoldModel::MacroInvocation * {
+      const RefoldModel::MacroInvocation *cur = &mi;
+      while (cur) {
+        if (!IsInvocationInsideDefineDirective(*cur))
+          return cur;
+        if (!cur->callerMacroId)
+          break;
+        auto it = invById.find(*cur->callerMacroId);
+        if (it == invById.end())
+          break;
+        cur = it->second;
+      }
+      return nullptr;
+    };
+
+    auto computeOccRange =
+        [&](const RefoldModel::MacroInvocation &m)
+        -> std::optional<std::pair<uint64_t, uint64_t>> {
+      // Prefer the precise body slice when available.
+      if (!m.bodySpans.empty()) {
+        uint64_t lo = std::numeric_limits<uint64_t>::max();
+        uint64_t hi = 0;
+        for (const auto &s : m.bodySpans) {
+          if (s.begin < s.end) {
+            lo = std::min(lo, s.begin);
+            hi = std::max(hi, s.end);
+          }
+        }
+        if (lo != std::numeric_limits<uint64_t>::max() && lo < hi)
+          return std::make_pair(lo, hi);
+      }
+
+      // Next: explicit spans (including 0-length anchors).
+      if (!m.spans.empty()) {
+        uint64_t lo = std::numeric_limits<uint64_t>::max();
+        uint64_t hi = 0;
+        for (const auto &s : m.spans) {
+          if (s.begin < s.end) {
+            lo = std::min(lo, s.begin);
+            hi = std::max(hi, s.end);
+          } else if (s.begin == s.end && s.begin < aToks_.size()) {
+            lo = std::min(lo, s.begin);
+            hi = std::max(hi, s.begin + 1);
+          }
+        }
+        if (lo != std::numeric_limits<uint64_t>::max() && lo < hi)
+          return std::make_pair(lo, hi);
+      }
+
+      if (m.cover.IsValid() && m.cover.end > m.cover.begin)
+        return std::make_pair(m.cover.begin, m.cover.end);
+
+      return std::nullopt;
+    };
+
+    SmallVector<Occ, 32> lifted;
+    lifted.reserve(filtered.size());
+    for (const auto &o : filtered) {
+      const RefoldModel::MacroInvocation *root = findPatchableCaller(*o.m);
+      if (!root)
+        continue;
+
+      auto r = computeOccRange(*root);
+      if (!r)
+        continue;
+
+      lifted.push_back(Occ{root, r->first, r->second, root->ownerIncludeId});
+    }
+
+    if (!lifted.empty()) {
+      llvm::sort(lifted, [](const Occ &A, const Occ &B) {
+        if (A.aStart != B.aStart)
+          return A.aStart < B.aStart;
+        if (A.aEnd != B.aEnd)
+          return A.aEnd < B.aEnd;
+        if (A.ownerInc != B.ownerInc)
+          return A.ownerInc < B.ownerInc;
+        return A.m->id < B.m->id;
+      });
+
+      int idx = -1;
+      for (size_t i = 0; i < lifted.size(); ++i) {
+        if (isEditedOcc(lifted[i])) {
+          idx = static_cast<int>(i);
+          break;
+        }
+      }
+
+      if (idx >= 0) {
+        trace("counter",
+              "__COUNTER__: lifted edit detection found firstEditedIdx={0} at A=[{1},{2}) root='{3}'",
+              idx, lifted[static_cast<size_t>(idx)].aStart,
+              lifted[static_cast<size_t>(idx)].aEnd,
+              lifted[static_cast<size_t>(idx)].m->name);
+        filtered.swap(lifted);
+        firstEditedIdx = idx;
+      }
+    }
+  }
+
   if (firstEditedIdx < 0) {
     trace("counter", "__COUNTER__: no edited occurrences; no forced expansion");
     return {};
