@@ -83,7 +83,8 @@ namespace {
 // compile time.
 template <typename T, typename = void> struct HasGetParam : std::false_type {};
 template <typename T>
-struct HasGetParam<T, std::void_t<decltype(std::declval<const T *>()->getParam(0U))>>
+struct HasGetParam<
+    T, std::void_t<decltype(std::declval<const T *>()->getParam(0U))>>
     : std::true_type {};
 
 template <typename T, typename = void>
@@ -692,15 +693,16 @@ static bool invArgRangesWithinInvocation(const Item &It) {
 static bool computeInvArgRangesFromText(
     llvm::StringRef InvText, uint64_t InvBegin, size_t ExpectedArgs,
     const LangOptions &Lang,
-    std::vector<std::pair<std::optional<uint64_t>, std::optional<uint64_t>>> &Out) {
+    std::vector<std::pair<std::optional<uint64_t>, std::optional<uint64_t>>>
+        &Out) {
   // Preserve the caller's current Out state on failure. (Callers may have
   // pre-sized Out and rely on it retaining its shape when parsing fails.)
   std::vector<std::pair<std::optional<uint64_t>, std::optional<uint64_t>>> Args;
   Args.reserve(ExpectedArgs);
 
-  // Tokenize the *raw* invocation text with Clang's lexer. This ensures we treat
-  // comments as whitespace and do not accidentally split on commas/parens that
-  // appear inside comments, string/char literals, raw strings, etc.
+  // Tokenize the *raw* invocation text with Clang's lexer. This ensures we
+  // treat comments as whitespace and do not accidentally split on commas/parens
+  // that appear inside comments, string/char literals, raw strings, etc.
   //
   // Offsets remain relative to InvText; we add InvBegin to form byte offsets
   // within the original file (inv_text semantics).
@@ -774,11 +776,13 @@ static bool computeInvArgRangesFromText(
           return false;
         }
         recordArg(ArgStart, Off);
+
         // Best-effort: if the parsed argument count does not match the macro's
         // formal parameter count, keep what we could parse and leave remaining
         // formals as null. This preserves the historical behavior for macro
         // dispatcher patterns like: (A,B,C,0)(__VA_ARGS__).
-        std::vector<std::pair<std::optional<uint64_t>, std::optional<uint64_t>>> OutTmp;
+        std::vector<std::pair<std::optional<uint64_t>, std::optional<uint64_t>>>
+            OutTmp;
         OutTmp.resize(ExpectedArgs, {std::nullopt, std::nullopt});
 
         const size_t Fill = std::min(Args.size(), ExpectedArgs);
@@ -786,7 +790,8 @@ static bool computeInvArgRangesFromText(
           OutTmp[I] = Args[I];
 
         if (Args.size() > ExpectedArgs && ExpectedArgs > 0) {
-          OutTmp[ExpectedArgs - 1] = {Args[ExpectedArgs - 1].first, Args.back().second};
+          OutTmp[ExpectedArgs - 1] = {Args[ExpectedArgs - 1].first,
+                                      Args.back().second};
         }
 
         Out = std::move(OutTmp);
@@ -1328,8 +1333,8 @@ RefoldMapBuilder::RefoldMapBuilder(Preprocessor &PP, llvm::StringRef OutputPath,
 // including the line-ending bytes (LF or CRLF) when present.
 //
 // Notes:
-//  - We normalize to a file location (`getFileLoc`) so macro expansions map back
-//    to a concrete FileID + offset.
+//  - We normalize to a file location (`getFileLoc`) so macro expansions map
+//    back to a concrete FileID + offset.
 //  - Offsets are *byte offsets* into the underlying file buffer returned by
 //    SourceManager, which is exactly what the refold map schema wants for
 //    site_begin/site_end.
@@ -1362,8 +1367,8 @@ RefoldMapBuilder::computeDirectiveLine(SourceLocation HashLoc) {
   // Default end is the byte position of the line break (or EOF if none).
   size_t E = P;
 
-  // If we stopped on a line break, include it in the returned span so the caller
-  // can slice the whole directive line including its terminator.
+  // If we stopped on a line break, include it in the returned span so the
+  // caller can slice the whole directive line including its terminator.
   if (P < N) {
     // Windows-style CRLF: include both bytes.
     if (Buf[P] == '\r' && P + 1 < N && Buf[P + 1] == '\n')
@@ -1458,10 +1463,10 @@ std::optional<uint32_t> RefoldMapBuilder::argIndexForSpellingLoc(
 
     LastLoc = CurrentLoc;
 
-    // Step 1: Try to interpret the current location as a *physical file location*
-    // and see if it is inside the macro invocation file (MI.InvFile). If so,
-    // compute the token's byte span and test it against the recorded invocation
-    // argument ranges.
+    // Step 1: Try to interpret the current location as a *physical file
+    // location* and see if it is inside the macro invocation file (MI.InvFile).
+    // If so, compute the token's byte span and test it against the recorded
+    // invocation argument ranges.
     //
     // Note: if CurrentLoc is a MacroID, Sm.getFileLoc(CurrentLoc) collapses
     // through macro layers to a file location; otherwise it is already a file
@@ -1476,12 +1481,13 @@ std::optional<uint32_t> RefoldMapBuilder::argIndexForSpellingLoc(
       auto TokE = EndL.isValid() ? Sm.getFileOffset(EndL) : TokB;
       if (TokE < TokB) TokE = TokB;
 
-      // The argument ranges are stored as byte intervals in the invocation file.
-      // If this token overlaps any argument interval, we attribute it to that
-      // argument slot.
+      // The argument ranges are stored as byte intervals in the invocation
+      // file. If this token overlaps any argument interval, we attribute it to
+      // that argument slot.
       for (size_t Ai = 0; Ai < MI.InvArgRanges.size(); ++Ai) {
         const auto &R = MI.InvArgRanges[Ai];
-        if (!R.first || !R.second) continue;
+        if (!R.first || !R.second)
+          continue;
         if (TokB < *R.second && TokE > *R.first) {
           if (Ai > std::numeric_limits<uint32_t>::max())
             return std::nullopt;
@@ -1727,8 +1733,9 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
   if (auto *II = MacroNameTok.getIdentifierInfo())
     It.Name = II->getName().str();
 
-  // Record the macro's formal parameter list (as defined), so consumers can build
-  // provenance edges across nested invocations without re-expanding macros.
+  // Record the macro's formal parameter list (as defined), so consumers can
+  // build provenance edges across nested invocations without re-expanding
+  // macros.
   if (MI && MI->isFunctionLike()) {
     It.DefParams.clear();
     It.DefParams.reserve(MI->getNumParams());
@@ -1798,8 +1805,9 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
   // that InvText and InvArgRanges are consistent.
   if (!invArgRangesWithinInvocation(It)) {
     const bool ParsedOK =
-       It.InvBegin && computeInvArgRangesFromText(It.InvText, *It.InvBegin, It.InvArgRanges.size(),
-                               PP.getLangOpts(), It.InvArgRanges);
+        It.InvBegin && computeInvArgRangesFromText(
+                           It.InvText, *It.InvBegin, It.InvArgRanges.size(),
+                           PP.getLangOpts(), It.InvArgRanges);
     if (!ParsedOK) {
       for (auto &R : It.InvArgRanges)
         R = {std::nullopt, std::nullopt};
@@ -1984,10 +1992,11 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
 
     // Innermost macro: immediate caller of this token location.
     //
-    // For nested expansions, SourceManager::getImmediateMacroCallerLoc() can “skip” past the
-    // immediate invocation (e.g. when the call site itself is synthesized from an outer macro
-    // expansion). Prefer the begin of the immediate expansion range, which corresponds to the
-    // macro-name token location for the invocation that produced this token.
+    // For nested expansions, SourceManager::getImmediateMacroCallerLoc() can
+    // “skip” past the immediate invocation (e.g. when the call site itself is
+    // synthesized from an outer macro expansion). Prefer the begin of the
+    // immediate expansion range, which corresponds to the macro-name token
+    // location for the invocation that produced this token.
     SourceLocation Caller;
     if (auto R = SM.getImmediateExpansionRange(L); R.isValid())
       Caller = R.getBegin();
@@ -1995,14 +2004,15 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
       Caller = SM.getImmediateMacroCallerLoc(L);
     auto InnerIdx = LookupMacroItem(Caller);
 
-    // Enclosing macro: walk up the macro caller chain (keeps MacroID hops intact).
-    // Outer macro (if any): prefer ultimate expansion location. This is robust
-    // when the immediate caller loc is a file location inside an outer macro body
-    // (no MacroID chain to walk), which is exactly the nested builtin case we
-    // care about.
+    // Enclosing macro: walk up the macro caller chain (keeps MacroID hops
+    // intact). Outer macro (if any): prefer ultimate expansion location. This
+    // is robust when the immediate caller loc is a file location inside an
+    // outer macro body (no MacroID chain to walk), which is exactly the nested
+    // builtin case we care about.
     auto OuterIdx = LookupMacroItem(SM.getExpansionLoc(L));
     if (!OuterIdx) {
-      // Conservative fallback: walk up the caller chain when the caller is a MacroID.
+      // Conservative fallback: walk up the caller chain when the caller is a
+      // MacroID.
       SourceLocation Cur = Caller;
       for (size_t Depth = 0; Depth < 16; ++Depth) {
         if (Cur.isInvalid() || !Cur.isMacroID())
@@ -2023,9 +2033,9 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
     if (InnerIdx) {
       size_t Chosen = *InnerIdx;
 
-      // Clang sometimes reports adjacent punctuation as being "inside" a builtin
-      // macro expansion. In those cases, prefer the enclosing macro item for
-      // non-expansion tokens.
+      // Clang sometimes reports adjacent punctuation as being "inside" a
+      // builtin macro expansion. In those cases, prefer the enclosing macro
+      // item for non-expansion tokens.
       if (*InnerIdx < Items.size() && OuterIdx) {
         const Item &MI = Items[*InnerIdx];
         if (MI.Kind == IK_Macro && MI.IsBuiltinMacro) {
@@ -2087,11 +2097,11 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
     }
 
     // Record projections for stringification ("#X") and token-pasting
-    // ("X##Y") for
-    // any macro invocation in the caller chain. We cannot reliably discover
-    // these using spelling/callee locations alone (especially across nested
-    // macro expansions), so we instead precompute the projection spellings
-    // per macro invocation and match by the emitted token spelling here.
+    // ("X##Y") for any macro invocation in the caller chain. We cannot reliably
+    // discover these using spelling/callee locations alone (especially across
+    // nested macro expansions), so we instead precompute the projection
+    // spellings per macro invocation and match by the emitted token spelling
+    // here.
     if (L.isMacroID()) {
       const std::string Sp = PP.getSpelling(Tok);
       StringRef Spelling = Sp;
@@ -2105,7 +2115,7 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
         if (MI.StringifySpell2ArgIndices.empty() && MI.PasteTokens.empty())
           return;
 
-        // === Stringification: emitted token is a quoted string literal
+        // Stringification: emitted token is a quoted string literal
         // corresponding to #Arg.
         if (!MI.StringifySpell2ArgIndices.empty() &&
             (Tok.is(tok::string_literal) || Tok.is(tok::wide_string_literal) ||
@@ -2119,7 +2129,7 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
           }
         }
 
-        // === Token pasting: emitted token is the result of one or more "##"
+        // Token pasting: emitted token is the result of one or more "##"
         // operations.
         if (MI.PasteTokens.empty())
           return;
@@ -2363,8 +2373,8 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
             //   produce it]
             //
             // Determinism: PasteSpell2MacroItems is a map (DenseMap/StringMap),
-            // so iteration order is not stable. Sort the keys before scanning so
-            // Match collection (and subsequent cursor advancement) is stable.
+            // so iteration order is not stable. Sort the keys before scanning
+            // so Match collection (and subsequent cursor advancement) is stable.
             llvm::SmallVector<llvm::StringRef, 64> PasteKeys;
             PasteKeys.reserve(PasteSpell2MacroItems.size());
             for (const auto &KV : PasteSpell2MacroItems)
@@ -2550,8 +2560,8 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
     }
   }
 
-  // 2) Grow all active include items transitively so a parent include
-  //    covers its entire subtree (nested includes/macros).
+  // 2) Grow all active include items transitively so a parent include covers
+  //    its entire subtree (nested includes/macros).
   for (auto idx : IncludeStack) {
     if (!idx || idx == ItemIdx)
       continue;
@@ -2892,7 +2902,8 @@ void RefoldMapBuilder::writeJSON() {
     //     doesn't affect scanning), and
     //   * identifier rules match the language mode (C/C++).
     auto collectCallerFormalDeps =
-        [&Lang](llvm::StringRef Text, const llvm::StringMap<uint32_t> &NameToIdx)
+        [&Lang](llvm::StringRef Text,
+                const llvm::StringMap<uint32_t> &NameToIdx)
         -> std::vector<uint32_t> {
       llvm::SmallVector<uint32_t, 8> Deps;
 
@@ -2936,7 +2947,8 @@ void RefoldMapBuilder::writeJSON() {
     };
 
     // Like collectCallerFormalDeps(), but records each identifier occurrence's
-    // byte span within inv_text (absolute file bytes via BaseOff + token offset).
+    // byte span within inv_text (absolute file bytes via BaseOff + token
+    // offset).
     auto collectCallerFormalRefs =
         [&Lang](llvm::StringRef Text, uint64_t BaseOff,
                 const llvm::StringMap<uint32_t> &NameToIdx)
@@ -3870,9 +3882,10 @@ void RefoldMapBuilder::writeJSON() {
         return Last ? *Last + 1 : 0;
       };
 
-      // Find the byte offset immediately after the last top-level #include/#include_next
-      // directive (ignoring directives nested under #if blocks). This provides a
-      // stable anchor when we need to inject synthetic include-like material.
+      // Find the byte offset immediately after the last top-level
+      // #include/#include_next directive (ignoring directives nested under #if
+      // blocks). This provides a stable anchor when we need to inject synthetic
+      // include-like material.
       auto computeAfterLastInclude = [&](llvm::StringRef Buf) -> size_t {
         if (Buf.empty())
           return 0;

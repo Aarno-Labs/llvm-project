@@ -100,37 +100,6 @@ namespace {
 
 // --------------------------- Tokenization ---------------------------------
 
-#if 0
-inline void writeTokensCSV(const std::vector<PPTok> &ppToks,
-                           const std::vector<std::size_t> &startOffs,
-                           raw_ostream &os) {
-  if (ppToks.size() + 1 != startOffs.size()) {
-    fatal("csv/write",
-          "PP token count plus sentinel ({0}) does not equal the number of "
-          "start offsets ({1})",
-          ppToks.size() + 1, startOffs.size());
-  }
-  std::size_t i = 0;
-  for (; i < ppToks.size(); ++i) {
-    os << ppToks[i].spelling << ',' << startOffs[i] << '\n';
-  }
-  os << startOffs[i] << "\n";
-  os.flush();
-}
-
-// Writes to ~/tokens.txt by default.
-inline void writeTokensCSVToFile(const std::vector<PPTok> &ppToks,
-                                 const std::vector<std::size_t> &startOffs,
-                                 const std::string &path) {
-  std::error_code ec;
-  raw_fd_ostream os(path, ec, sys::fs::OF_Text);
-  if (ec) {
-    fatal("csv/open", "failed to open file '{0}': {1}", path, ec.message());
-  }
-  writeTokensCSV(ppToks, startOffs, os);
-}
-#endif
-
 /// \brief Lex a preprocessed byte buffer into Clang-style tokens.
 ///
 /// Tokenizes the given preprocessed text using Clang's raw lexer so token
@@ -747,18 +716,6 @@ int main(int argc, char **argv) {
     if (aTokByteOff.empty() || aTokByteOff.back() < aBytes.size())
       aTokByteOff.push_back(aBytes.size());
   }
-
-#if 0
-  // XXX: Write out debug files so that I can compare the preprocessed lexical
-  // tokens with the clang/llvm implementation of `clang-refold`. This can go
-  // away once we have a stable working version of clang.
-  SmallString<256> tokensAFile;
-  sys::fs::expand_tilde("~/tokens.a-cpp.txt", tokensAFile);
-  writeTokensCSVToFile(aToks, aTokByteOff, tokensAFile.str().str());
-  SmallString<256> tokensBFile;
-  sys::fs::expand_tilde("~/tokens.b-cpp.txt", tokensBFile);
-  writeTokensCSVToFile(bToks, bTokByteOff, tokensBFile.str().str());
-#endif
 
   // Generate the refolded C source as a string.
   Expected<std::string> refoldedOrErr =
