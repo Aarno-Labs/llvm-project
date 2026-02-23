@@ -675,11 +675,13 @@ std::string RefoldEngine::Refold() {
         // FIX A: Coalesce callsite patches by physical callsite span
         // (inv_file/inv_b/inv_e), not by macro invocation item id.
         std::optional<uint64_t> existingKey;
+        // Determinism: byMacroId is a DenseMap; if multiple entries share the
+        // same invocation span, pick the smallest key.
         for (const auto &kv : byMacroId) {
           const MacroPatch &p = kv.second;
           if (p.invStart == *m->invB && p.invEnd == *m->invE) {
-            existingKey = kv.first;
-            break;
+            if (!existingKey || kv.first < *existingKey)
+              existingKey = kv.first;
           }
         }
         const uint64_t patchKey = existingKey.value_or(m->id);
@@ -1020,10 +1022,44 @@ std::string RefoldEngine::Refold() {
 
   // Materialize merged macro patches into the list buckets expected by later
   // phases.
-  for (auto &outerEntry : macroPatchByOwnerByMacroId) {
-    auto &finalPatches = macroPatchesByOwner[outerEntry.first];
-    auto &patchesById = outerEntry.second;
-    append_range(finalPatches, make_second_range(patchesById));
+  //
+  // Determinism: macroPatchByOwnerByMacroId and its inner maps are DenseMaps,
+  // so iteration order is not stable across runs. Sort owner keys and macro ids.
+  llvm::SmallVector<std::optional<uint64_t>, 16> OwnerKeys;
+  OwnerKeys.reserve(macroPatchByOwnerByMacroId.size());
+  for (const auto &outerEntry : macroPatchByOwnerByMacroId)
+    OwnerKeys.push_back(outerEntry.first);
+
+  llvm::sort(OwnerKeys, [](const std::optional<uint64_t> &A,
+                           const std::optional<uint64_t> &B) {
+    if (!A && B)
+      return true;
+    if (A && !B)
+      return false;
+    if (!A && !B)
+      return false;
+    return *A < *B;
+  });
+
+  for (const auto &owner : OwnerKeys) {
+    auto outerIt = macroPatchByOwnerByMacroId.find(owner);
+    if (outerIt == macroPatchByOwnerByMacroId.end())
+      continue;
+
+    auto &patchesById = outerIt->second;
+    auto &finalPatches = macroPatchesByOwner[owner];
+
+    llvm::SmallVector<uint64_t, 32> MacroIds;
+    MacroIds.reserve(patchesById.size());
+    for (const auto &kv : patchesById)
+      MacroIds.push_back(kv.first);
+    llvm::sort(MacroIds);
+
+    for (uint64_t id : MacroIds) {
+      auto it = patchesById.find(id);
+      if (it != patchesById.end())
+        finalPatches.push_back(std::move(it->second));
+    }
   }
 
   debug("plan", "perInclude.size={0} macroOwners={1} tuEdits(initial)={2}",
@@ -1157,17 +1193,30 @@ std::string RefoldEngine::Refold() {
 
   // 6b) TU include expansions: includes with parent == null and site in TU,
   // only if we realized an expansion.
-  for (const auto &kv : includeExpansion) {
-    const auto *inc = model_.GetIncludeById(kv.first);
+  //
+  // Determinism: includeExpansion is a DenseMap, so iterate by sorted id.
+  llvm::SmallVector<uint64_t, 32> IncludeIds;
+  IncludeIds.reserve(includeExpansion.size());
+  for (const auto &kv : includeExpansion)
+    IncludeIds.push_back(kv.first);
+  llvm::sort(IncludeIds);
+
+  for (uint64_t incId : IncludeIds) {
+    auto itExp = includeExpansion.find(incId);
+    if (itExp == includeExpansion.end())
+      continue;
+
+    const auto *inc = model_.GetIncludeById(incId);
     if (!inc)
       continue;
     if (!inc->parent && PathsEqual(inc->sitePath, tuPath)) {
+      const auto &expText = itExp->second;
       debug("include/tu", "TU include expansion inc#{0} site=[{1},{2}) len={3}",
-            inc->id, inc->siteB, inc->siteE, kv.second.size());
+            inc->id, inc->siteB, inc->siteE, expText.size());
       std::string headerPath = resolveHeaderPath(*inc);
       std::string wrapped = lineDirs_.WrapIncludeExpansion(
           headerPath, tuPath, stringutils::lineAtOffset(tuBytes, inc->siteE),
-          kv.second);
+          expText);
       tuEdits.push_back(
           TextEdit{inc->siteB, inc->siteE, std::move(wrapped), std::nullopt});
     }
@@ -4431,19 +4480,47 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   // refine it across additional hunks.
   const MacroPatch *existingPatch = nullptr;
   bool existingIsCallsite = false;
+
+  // Determinism: ownerIt->second is a DenseMap, so iteration order is unstable.
+  // If multiple patches share this invocation span, choose a stable
+  // representative (smallest macro id), preferring non-callsite patches.
   auto ownerIt = patchMap.find(m.ownerIncludeId);
   if (ownerIt != patchMap.end()) {
+    std::optional<uint64_t> bestNonCallsiteId;
+    std::optional<uint64_t> bestCallsiteId;
+
     for (const auto &kv : ownerIt->second) {
+      const uint64_t id = kv.first;
       const MacroPatch &p = kv.second;
+#if 0
       if (!p.invStart || !p.invEnd)
         continue;
-      if (p.invStart == *invStart && p.invEnd == *invEnd) {
-        existingPatch = &p;
-        existingIsCallsite =
-            InvocationSpanMatchesCallsitePrefix(existingPatch->replacement, m);
-        if (!existingIsCallsite)
-          return *existingPatch;
-        break;
+#endif
+      if (p.invStart != *invStart || p.invEnd != *invEnd)
+        continue;
+
+      const bool isCallsite =
+          InvocationSpanMatchesCallsitePrefix(p.replacement, m);
+      if (!isCallsite) {
+        if (!bestNonCallsiteId || id < *bestNonCallsiteId)
+          bestNonCallsiteId = id;
+      } else {
+        if (!bestCallsiteId || id < *bestCallsiteId)
+          bestCallsiteId = id;
+      }
+    }
+
+    if (bestNonCallsiteId) {
+      auto it = ownerIt->second.find(*bestNonCallsiteId);
+      if (it != ownerIt->second.end())
+        return it->second;
+    }
+
+    if (bestCallsiteId) {
+      auto it = ownerIt->second.find(*bestCallsiteId);
+      if (it != ownerIt->second.end()) {
+        existingPatch = &it->second;
+        existingIsCallsite = true;
       }
     }
   }
