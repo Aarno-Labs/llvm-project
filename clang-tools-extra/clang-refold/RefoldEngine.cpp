@@ -337,6 +337,12 @@ std::string RefoldEngine::Refold() {
        model_.GetIncludes().size(), model_.GetMacroInvocations().size(),
        model_.GetTokmapByPP().size());
 
+  // __COUNTER__ stabilization:
+  // If any expanded __COUNTER__ occurrence is edited in B, then that occurrence
+  // and every subsequent __COUNTER__ occurrence in PP-token order must be
+  // emitted as a literal expansion (whole-cover), even if unchanged.
+  auto forcedCounters = ComputeForcedCounterPatches(tuPath, a2b);
+
   // 3) Diff hunks (changed A-token intervals -> B-token intervals).
   auto hunks = diffutils::hunksFromMap(a2b, aSeq.size(), bSeq.size());
 
@@ -665,7 +671,7 @@ std::string RefoldEngine::Refold() {
           owner.kind, owner.includeId, owner.condArmId, h);
 
     // b) Macro call-site still has priority over TU/include
-    if (auto *m = SmallestCoveringPatchableMacro(h.aStart, h.aEnd)) {
+    if (auto *m = SmallestCoveringPatchableMacro(h.aStart, h.aEnd, owner.includeId)) {
       if (m->invB && m->invE) {
         debug("classify",
               "#{0} -> MACRO invText={1} owner={2} invFile={3} {4})", i,
@@ -1020,6 +1026,12 @@ std::string RefoldEngine::Refold() {
     continue;
   }
 
+  // Inject forced __COUNTER__ patches after normal hunk attribution.
+  // This may create macro patches even when no diff hunk touched the invocation
+  // (required to prevent later __COUNTER__ values from shifting after an edit).
+  if (!forcedCounters.empty())
+    AddForcedCounterPatches(forcedCounters, macroPatchByOwnerByMacroId);
+
   // Materialize merged macro patches into the list buckets expected by later
   // phases.
   //
@@ -1211,14 +1223,41 @@ std::string RefoldEngine::Refold() {
       continue;
     if (!inc->parent && PathsEqual(inc->sitePath, tuPath)) {
       const auto &expText = itExp->second;
+      // Producer-reported site spans are intended to cover the entire
+      // `#include` directive in the TU, but can be truncated in the presence of
+      // leading line splices (e.g., a standalone "\\\n" before the directive).
+      // If we don't cover the full physical directive, we can leave behind a
+      // live `#include`, causing the refolded TU to re-include a header in the
+      // checker replay (notably for headers without include guards).
+      const StringRef tuRef(tuBytes);
+      uint64_t siteB = inc->siteB;
+      uint64_t siteE = inc->siteE;
+      if (siteB < tuRef.size()) {
+        size_t i = static_cast<size_t>(siteB);
+        while (true) {
+          size_t nl = tuRef.find('\n', i);
+          if (nl == StringRef::npos) {
+            siteE = tuRef.size();
+            break;
+          }
+          i = nl + 1;
+          if (!stringutils::isLineSplice(tuRef, nl)) {
+            uint64_t extended = static_cast<uint64_t>(i);
+            if (extended > siteE)
+              siteE = extended;
+            break;
+          }
+        }
+      }
+
       debug("include/tu", "TU include expansion inc#{0} site=[{1},{2}) len={3}",
-            inc->id, inc->siteB, inc->siteE, expText.size());
+            inc->id, siteB, siteE, expText.size());
       std::string headerPath = resolveHeaderPath(*inc);
       std::string wrapped = lineDirs_.WrapIncludeExpansion(
-          headerPath, tuPath, stringutils::lineAtOffset(tuBytes, inc->siteE),
+          headerPath, tuPath, stringutils::lineAtOffset(tuBytes, siteE),
           expText);
       tuEdits.push_back(
-          TextEdit{inc->siteB, inc->siteE, std::move(wrapped), std::nullopt});
+          TextEdit{siteB, siteE, std::move(wrapped), std::nullopt});
     }
   }
 
@@ -1371,7 +1410,7 @@ std::string RefoldEngine::PadAtBoundaries(StringRef base, size_t start,
 
 RefoldEngine::Owner
 RefoldEngine::ClassifyOwnerWithSegments(StringRef tuPath,
-                                        const diffutils::Hunk &h) {
+                                        const diffutils::Hunk &h) const {
   uint64_t a0 = h.aStart;
   uint64_t a1 = h.aEnd;
 
@@ -1571,69 +1610,129 @@ bool RefoldEngine::IsInvocationInsideDefineDirective(
   // siteE. We therefore compute the actual directive extent by scanning the
   // source text until we reach a newline that is NOT line-spliced.
 
+  // NOTE: This predicate may be queried extremely frequently during macro
+  // selection. Avoid O(Ninvocations*Ndirectives) behavior by indexing all
+  // #define directive extents once per process, keyed by absolute file path.
+  //
+  // IMPORTANT: intentionally avoid RefoldEngine::PathsEqual() here. The
+  // canonicalization it performs can be expensive in tight loops and can
+  // dominate runtime for large preprocessed streams.
+
+  struct DefineExtent {
+    uint64_t b;
+    uint64_t e;
+  };
+
   // Cache file text by absolute path to avoid repeated disk reads.
   static llvm::StringMap<std::string> fileTextCache;
   // Cache computed end offsets per directive id.
   static llvm::DenseMap<uint64_t, uint64_t> defineEndCache;
+  // Index define extents per absolute path (built lazily).
+  static llvm::StringMap<std::vector<DefineExtent>> definesByAbsPath;
+  static bool definesIndexBuilt = false;
 
-  // RefoldModel exposes directives; MacroDirective.subkind is expected to be
-  // "define" based on your schema usage elsewhere.
-  for (const auto &d : model_.GetMacroDirectives()) {
-    if ("#define" != d.subkind)
-      continue;
-    if (d.sitePath.empty())
-      continue;
-    if (!m.invFile || !PathsEqual(*m.invFile, d.sitePath))
-      continue;
+  if (!definesIndexBuilt) {
+    definesIndexBuilt = true;
 
-    // Compute (or fetch) the true end of the #define directive in the same
-    // source file, including any "\\\n" line-spliced continuation lines.
-    uint64_t defineEnd = d.siteE;
-    auto itEnd = defineEndCache.find(d.id);
-    if (itEnd != defineEndCache.end()) {
-      defineEnd = itEnd->second;
-    } else {
-      // Load file bytes.
-      std::string absPath = lineDirs_.ToAbsolutePath(d.sitePath);
-      auto itTxt = fileTextCache.find(absPath);
-      if (itTxt == fileTextCache.end()) {
-        auto bufOrErr = llvm::MemoryBuffer::getFile(absPath);
-        if (!bufOrErr) {
-          // Best-effort: fall back to the producer-provided site range.
-          defineEndCache[d.id] = d.siteE;
-          defineEnd = d.siteE;
-        } else {
-          fileTextCache[absPath] = (**bufOrErr).getBuffer().str();
-          itTxt = fileTextCache.find(absPath);
-        }
-      }
+    for (const auto &d : model_.GetMacroDirectives()) {
+      if ("#define" != d.subkind)
+        continue;
+      if (d.sitePath.empty())
+        continue;
 
-      if (itTxt != fileTextCache.end()) {
-        StringRef bytes(itTxt->second);
-        uint64_t i = d.siteB;
-        if (i > bytes.size())
-          i = bytes.size();
-
-        while (i < bytes.size()) {
-          size_t nl = bytes.find('\n', static_cast<size_t>(i));
-          if (nl == StringRef::npos) {
-            i = bytes.size();
-            break;
+      // Compute (or fetch) the true end of the #define directive in its source
+      // file, including any "\\\n" line-spliced continuation lines.
+      uint64_t defineEnd = d.siteE;
+      auto itEnd = defineEndCache.find(d.id);
+      if (itEnd != defineEndCache.end()) {
+        defineEnd = itEnd->second;
+      } else {
+        std::string absPath = lineDirs_.ToAbsolutePath(d.sitePath);
+        auto itTxt = fileTextCache.find(absPath);
+        if (itTxt == fileTextCache.end()) {
+          auto bufOrErr = llvm::MemoryBuffer::getFile(absPath);
+          if (!bufOrErr) {
+            // Best-effort: fall back to the producer-provided site range.
+            defineEndCache[d.id] = d.siteE;
+            defineEnd = d.siteE;
+          } else {
+            fileTextCache[absPath] = (**bufOrErr).getBuffer().str();
+            itTxt = fileTextCache.find(absPath);
           }
-          // Advance past the newline.
-          i = static_cast<uint64_t>(nl + 1);
-          if (!stringutils::isLineSplice(bytes, nl))
-            break;
         }
 
-        defineEnd = i;
-        defineEndCache[d.id] = defineEnd;
+        if (itTxt != fileTextCache.end()) {
+          StringRef bytes(itTxt->second);
+          uint64_t i = d.siteB;
+          if (i > bytes.size())
+            i = bytes.size();
+
+          while (i < bytes.size()) {
+            size_t nl = bytes.find('\n', static_cast<size_t>(i));
+            if (nl == StringRef::npos) {
+              i = bytes.size();
+              break;
+            }
+            // Advance past the newline.
+            i = static_cast<uint64_t>(nl + 1);
+            if (!stringutils::isLineSplice(bytes, nl))
+              break;
+          }
+
+          defineEnd = i;
+          defineEndCache[d.id] = defineEnd;
+        }
       }
+
+      const std::string absPath = lineDirs_.ToAbsolutePath(d.sitePath);
+      definesByAbsPath[absPath].push_back(DefineExtent{d.siteB, defineEnd});
     }
 
-    // If the invocation byte range lies within the #define directive extent,
-    // treat it as non-patchable.
-    if (*m.invB >= d.siteB && *m.invE <= defineEnd)
+    // Sort extents by begin offset for binary-search probing.
+    for (auto &kv : definesByAbsPath) {
+      auto &vec = kv.getValue();
+      llvm::sort(vec, [](const DefineExtent &x, const DefineExtent &y) {
+        if (x.b != y.b)
+          return x.b < y.b;
+        return x.e < y.e;
+      });
+    }
+  }
+
+  const std::string invAbs = lineDirs_.ToAbsolutePath(*m.invFile);
+  auto it = definesByAbsPath.find(invAbs);
+  if (it == definesByAbsPath.end())
+    return false;
+
+  const uint64_t x = *m.invB;
+  const auto &vec = it->second;
+  if (vec.empty())
+    return false;
+
+  // Find the last extent with b <= x.
+  size_t lo = 0, hi = vec.size();
+  while (lo < hi) {
+    size_t mid = lo + (hi - lo) / 2;
+    if (vec[mid].b <= x)
+      lo = mid + 1;
+    else
+      hi = mid;
+  }
+  if (lo == 0)
+    return false;
+
+  const DefineExtent cand = vec[lo - 1];
+  if (x >= cand.b && x < cand.e)
+    return true;
+
+  // Conservative fallback: in unusual cases where extents overlap, linearly
+  // scan a handful of adjacent ranges.
+  for (size_t i = lo; i < vec.size() && i < lo + 4; ++i) {
+    if (x >= vec[i].b && x < vec[i].e)
+      return true;
+  }
+  for (size_t i = lo; i > 0 && i + 4 > lo; --i) {
+    if (x >= vec[i - 1].b && x < vec[i - 1].e)
       return true;
   }
 
@@ -1641,58 +1740,123 @@ bool RefoldEngine::IsInvocationInsideDefineDirective(
 }
 
 const RefoldModel::MacroInvocation *
-RefoldEngine::SmallestCoveringPatchableMacro(uint64_t aStart,
-                                             uint64_t aEnd) const {
+RefoldEngine::SmallestCoveringPatchableMacro(
+    uint64_t aStart, uint64_t aEnd,
+    std::optional<uint64_t> ownerIncludeId) const {
   const RefoldModel::MacroInvocation *best = nullptr;
+  int bestRank = 3;
   uint64_t bestLen = std::numeric_limits<uint64_t>::max();
 
   trace("macro/select",
-        "select smallest covering patchable macro for A=[{0},{1})", aStart, aEnd);
+        "select smallest covering patchable macro for A=[{0},{1}) ownerInc={2}",
+        aStart, aEnd, ownerIncludeId);
+
+  const bool isInsert = (aStart == aEnd);
+
+  auto spanCovers = [&](uint64_t b, uint64_t e) -> bool {
+    if (e <= b)
+      return false;
+    if (isInsert)
+      return (b < aStart) && (aStart < e);
+    return (b <= aStart) && (aEnd <= e);
+  };
+
+  auto minCoverLenIn = [&](auto &&spans) -> std::optional<uint64_t> {
+    std::optional<uint64_t> out;
+    for (const auto &sp : spans) {
+      if (spanCovers(sp.begin, sp.end)) {
+        const uint64_t len = sp.end - sp.begin;
+        if (!out || len < *out)
+          out = len;
+      }
+    }
+    return out;
+  };
+
+  auto minCoverLenInArgs = [&](const RefoldModel::MacroInvocation &m)
+      -> std::optional<uint64_t> {
+    std::optional<uint64_t> out;
+    for (const auto &sp : m.argSpans) {
+      if (spanCovers(sp.begin, sp.end)) {
+        const uint64_t len = sp.end - sp.begin;
+        if (!out || len < *out)
+          out = len;
+      }
+    }
+    for (const auto &sp : m.stringifySpans) {
+      if (spanCovers(sp.begin, sp.end)) {
+        const uint64_t len = sp.end - sp.begin;
+        if (!out || len < *out)
+          out = len;
+      }
+    }
+    for (const auto &sp : m.pasteSpans) {
+      if (spanCovers(sp.begin, sp.end)) {
+        const uint64_t len = sp.end - sp.begin;
+        if (!out || len < *out)
+          out = len;
+      }
+    }
+    return out;
+  };
 
   for (const auto &m : model_.GetMacroInvocations()) {
-    // Check if this macro covers the token range [aStart, aEnd)
-    if (!m.Covers(aStart, aEnd))
-      continue;
-
-    uint64_t len = m.cover.end - m.cover.begin;
-
-    // Must be patchable at a real call site.
-    if (!m.invB || !m.invE || !m.invText) {
-      trace("macro/select",
-            "skip macro id={0} name='{1}' covers A=[{2},{3}) coverLen={4}: "
-            "missing invocation span/text",
-            m.id, m.name, m.cover.begin, m.cover.end, len);
-      continue;
+    // Owner filter (when known): avoids selecting a macro record that belongs
+    // to a different include instance.
+    if (ownerIncludeId) {
+      if (!m.ownerIncludeId || *m.ownerIncludeId != *ownerIncludeId)
+        continue;
     }
 
-    // CRITICAL: never patch invocations that are spelled inside a #define
-    // directive.
-    if (IsInvocationInsideDefineDirective(m)) {
-      trace("macro/select",
-            "skip macro id={0} name='{1}' covers A=[{2},{3}) coverLen={4}: "
-            "invocation spelled inside #define (invFile='{5}' inv=[{6},{7}))",
-            m.id, m.name, m.cover.begin, m.cover.end, len,
-            (m.invFile ? StringRef(*m.invFile) : StringRef("")),
-            *m.invB, *m.invE);
+    if (!m.cover.IsValid() || m.cover.end <= m.cover.begin)
       continue;
+
+    // Must be patchable at a real call site.
+    if (!m.invB || !m.invE || !m.invText)
+      continue;
+
+    // CRITICAL: never patch invocations that are spelled inside a #define.
+    if (IsInvocationInsideDefineDirective(m))
+      continue;
+
+    // Rank candidates by how directly their spans cover the requested range.
+    //   rank 0: body span covers the range (direct expansion token)
+    //   rank 1: argument-like span covers the range (arg/stringify/paste)
+    //   rank 2: only the broad cover covers the range (fallback)
+    int rank = 2;
+    uint64_t len = m.cover.end - m.cover.begin;
+
+    if (auto bodyLen = minCoverLenIn(m.bodySpans)) {
+      rank = 0;
+      len = *bodyLen;
+    } else if (auto argLen = minCoverLenInArgs(m)) {
+      rank = 1;
+      len = *argLen;
+    } else {
+      if (!m.Covers(aStart, aEnd))
+        continue;
+      rank = 2;
+      len = m.cover.end - m.cover.begin;
     }
 
     trace("macro/select",
-          "candidate macro id={0} name='{1}' coverLen={2} invFile='{3}' inv=[{4},{5})",
-          m.id, m.name, len, (m.invFile ? StringRef(*m.invFile) : StringRef("")),
+          "candidate macro id={0} name='{1}' rank={2} len={3} cover=[{4},{5}) ownerInc={6} invFile='{7}' inv=[{8},{9})",
+          m.id, m.name, rank, len, m.cover.begin, m.cover.end,
+          m.ownerIncludeId, (m.invFile ? StringRef(*m.invFile) : StringRef("")),
           *m.invB, *m.invE);
 
-    // Deterministic selection: smallest cover wins, ties broken by ID.
-    if (!best || len < bestLen || (len == bestLen && m.id < best->id)) {
+    if (!best || rank < bestRank || (rank == bestRank && (len < bestLen || (len == bestLen && m.id < best->id)))) {
       best = &m;
+      bestRank = rank;
       bestLen = len;
     }
   }
 
   if (best) {
     trace("macro/select",
-          "selected macro id={0} name='{1}' coverLen={2} invFile='{3}' inv=[{4},{5})",
-          best->id, best->name, bestLen,
+          "selected macro id={0} name='{1}' rank={2} len={3} cover=[{4},{5}) ownerInc={6} invFile='{7}' inv=[{8},{9})",
+          best->id, best->name, bestRank, bestLen, best->cover.begin, best->cover.end,
+          best->ownerIncludeId,
           (best->invFile ? StringRef(*best->invFile) : StringRef("")),
           *best->invB, *best->invE);
   } else {
@@ -4447,6 +4611,270 @@ RefoldEngine::BuildIncludeInsertionPatch(const RefoldModel::IncludeItem &inc,
   return patch;
 }
 
+
+SmallVector<RefoldEngine::ForcedMacroPatchRequest, 32>
+RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
+                                          ArrayRef<int64_t> a2b) const {
+  struct Occ {
+    const RefoldModel::MacroInvocation *m;
+    uint64_t aStart;
+    uint64_t aEnd;
+    std::optional<uint64_t> ownerInc;
+  };
+
+  SmallVector<Occ, 32> occs;
+
+  // Collect all body-span occurrences of __COUNTER__.
+  for (const auto &mi : model_.GetMacroInvocations()) {
+    if (mi.name != "__COUNTER__")
+      continue;
+    if (!mi.invB || !mi.invE || !mi.invText)
+      continue;
+    if (mi.bodySpans.empty()) {
+      if (mi.cover.IsValid() && mi.cover.end > mi.cover.begin)
+        occs.push_back(Occ{&mi, mi.cover.begin, mi.cover.end, std::nullopt});
+      continue;
+    }
+    for (const auto &bs : mi.bodySpans) {
+      if (bs.end > bs.begin)
+        occs.push_back(Occ{&mi, bs.begin, bs.end, std::nullopt});
+    }
+  }
+
+  if (occs.empty())
+    return {};
+
+  // Determine the true PP-owner include for each occurrence and drop any
+  // producer-merged duplicates whose ownerIncludeId does not match.
+  SmallVector<Occ, 32> filtered;
+  filtered.reserve(occs.size());
+  for (const auto &o : occs) {
+    diffutils::Hunk dummy;
+    dummy.aStart = o.aStart;
+    dummy.aEnd = o.aEnd;
+    dummy.bStart = 0;
+    dummy.bEnd = 0;
+
+    Owner owner = ClassifyOwnerWithSegments(tuPath, dummy);
+    std::optional<uint64_t> ownerInc;
+    if (owner.kind == OwnerKind::Include)
+      ownerInc = owner.includeId;
+
+    // If the producer says this macro belongs to an include instance, require
+    // the occurrence to actually be owned by that include.
+    if (o.m->ownerIncludeId && ownerInc && *o.m->ownerIncludeId != *ownerInc)
+      continue;
+
+    filtered.push_back(Occ{o.m, o.aStart, o.aEnd, ownerInc});
+  }
+
+  if (filtered.empty())
+    return {};
+
+  // Sort by PP-token order.
+  llvm::sort(filtered, [](const Occ &A, const Occ &B) {
+    if (A.aStart != B.aStart)
+      return A.aStart < B.aStart;
+    if (A.aEnd != B.aEnd)
+      return A.aEnd < B.aEnd;
+    if (A.ownerInc != B.ownerInc)
+      return A.ownerInc < B.ownerInc;
+    return A.m->id < B.m->id;
+  });
+
+  auto isEditedOcc = [&](const Occ &o) -> bool {
+    for (uint64_t ai = o.aStart; ai < o.aEnd; ++ai) {
+      if (static_cast<size_t>(ai) >= a2b.size() ||
+          static_cast<size_t>(ai) >= aToks_.size())
+        return true;
+      const int64_t bj = a2b[static_cast<size_t>(ai)];
+      if (bj < 0 || static_cast<size_t>(bj) >= bToks_.size())
+        return true;
+      if (aToks_[static_cast<size_t>(ai)].spelling !=
+          bToks_[static_cast<size_t>(bj)].spelling)
+        return true;
+    }
+    return false;
+  };
+
+  int firstEditedIdx = -1;
+  for (size_t i = 0; i < filtered.size(); ++i) {
+    if (isEditedOcc(filtered[i])) {
+      firstEditedIdx = static_cast<int>(i);
+      break;
+    }
+  }
+
+  if (firstEditedIdx < 0) {
+    trace("counter", "__COUNTER__: no edited occurrences; no forced expansion");
+    return {};
+  }
+
+  SmallVector<ForcedMacroPatchRequest, 32> forced;
+  llvm::DenseSet<uint64_t> seen;
+
+  auto hashKey = [](std::optional<uint64_t> owner, uint64_t invB, uint64_t invE) {
+    uint64_t h = owner ? (*owner + 1) : 0;
+    h = h * 1315423911u + invB;
+    h = h * 1315423911u + invE;
+    return h;
+  };
+
+  for (size_t i = static_cast<size_t>(firstEditedIdx); i < filtered.size(); ++i) {
+    const Occ &o = filtered[i];
+    const RefoldModel::MacroInvocation *root =
+        SmallestCoveringPatchableMacro(o.aStart, o.aEnd, o.ownerInc);
+    if (!root)
+      continue;
+
+    // Safety: never patch macro definitions.
+    if (IsInvocationInsideDefineDirective(*root))
+      continue;
+
+    const auto invStart = root->invB;
+    const auto invEnd = root->invE;
+    if (!invStart || !invEnd)
+      continue;
+
+    const uint64_t key = hashKey(root->ownerIncludeId, *invStart, *invEnd);
+    if (!seen.insert(key).second)
+      continue;
+
+    forced.push_back(ForcedMacroPatchRequest{root, o.aStart, o.aEnd});
+
+    trace("counter",
+          "__COUNTER__: force root id={0} name='{1}' ownerInc={2} inv=[{3},{4}) for occ A=[{5},{6})",
+          root->id, root->name, root->ownerIncludeId, *invStart, *invEnd,
+          o.aStart, o.aEnd);
+  }
+
+  debug("counter",
+        "__COUNTER__: occurrences={0} firstEditedIdx={1} forced={2} firstOccA=[{3},{4})",
+        filtered.size(), firstEditedIdx, forced.size(),
+        filtered[static_cast<size_t>(firstEditedIdx)].aStart,
+        filtered[static_cast<size_t>(firstEditedIdx)].aEnd);
+
+  return forced;
+}
+
+std::optional<std::string>
+RefoldEngine::BuildWholeCoverReplacementText(
+    const RefoldModel::MacroInvocation &m) const {
+  const uint64_t covLoA = m.cover.begin;
+  const uint64_t covHiA = m.cover.end;
+
+  if (covLoA >= covHiA)
+    return std::nullopt;
+
+  auto bEnv = MapATokRangeAToBTokenEnvelope(covLoA, covHiA);
+  if (!bEnv)
+    return std::nullopt;
+
+  size_t bTokStart = bEnv->first;
+  size_t bTokEnd = bEnv->second;
+  if (bTokEnd <= bTokStart)
+    return std::nullopt;
+
+  // Tighten the B-side envelope to the exact A-side boundary tokens when
+  // possible. This mirrors the non-heuristic correction used by
+  // BuildMacroInvocationPatchWholeCover's whole-cover fallback.
+  if (covLoA < aToks_.size() && bTokStart < bToks_.size()) {
+    StringRef want = aToks_[static_cast<size_t>(covLoA)].spelling;
+    if (!want.empty()) {
+      if (bToks_[bTokStart].spelling != want && bTokStart > 0 &&
+          bToks_[bTokStart - 1].spelling == want) {
+        bTokStart--;
+      }
+    }
+  }
+
+  if (covHiA > 0 && (covHiA - 1) < aToks_.size() && bTokEnd > 0 &&
+      (bTokEnd - 1) < bToks_.size()) {
+    StringRef want = aToks_[static_cast<size_t>(covHiA - 1)].spelling;
+    if (!want.empty()) {
+      if (bToks_[bTokEnd - 1].spelling != want && bTokEnd >= 2 &&
+          bToks_[bTokEnd - 2].spelling == want) {
+        bTokEnd--;
+      }
+    }
+  }
+
+  if (bTokEnd <= bTokStart)
+    return std::nullopt;
+
+  return SliceBSource(bTokStart, bTokEnd).trim().str();
+}
+
+void RefoldEngine::AddForcedCounterPatches(
+    ArrayRef<ForcedMacroPatchRequest> forced,
+    DenseMap<std::optional<uint64_t>, DenseMap<uint64_t, MacroPatch>>
+        &macroPatchByOwnerByMacroId) const {
+  auto buildOccReplacement = [&](uint64_t aStart, uint64_t aEnd)
+      -> std::optional<std::string> {
+    auto bEnv = MapATokRangeAToBTokenEnvelope(aStart, aEnd);
+    if (!bEnv)
+      return std::nullopt;
+    if (bEnv->second <= bEnv->first)
+      return std::nullopt;
+    return SliceBSource(bEnv->first, bEnv->second).trim().str();
+  };
+
+  for (const auto &req : forced) {
+    const RefoldModel::MacroInvocation *pm = req.macro;
+    if (!pm)
+      continue;
+    const RefoldModel::MacroInvocation &m = *pm;
+
+    // Safety: do not patch macro definitions.
+    if (IsInvocationInsideDefineDirective(m))
+      continue;
+
+    const auto invStart = m.invB;
+    const auto invEnd = m.invE;
+    if (!invStart || !invEnd || *invEnd < *invStart)
+      continue;
+
+    std::optional<std::string> replOpt;
+    if (m.name == "__COUNTER__") {
+      replOpt = buildOccReplacement(req.aStart, req.aEnd);
+    } else {
+      replOpt = BuildWholeCoverReplacementText(m);
+    }
+    if (!replOpt)
+      continue;
+
+    auto &byMacroId = macroPatchByOwnerByMacroId[m.ownerIncludeId];
+
+    // Coalesce by physical invocation span (inv_b/inv_e), matching the hunk
+    // coalescing logic used during normal classification.
+    std::optional<uint64_t> existingKey;
+    for (const auto &kv : byMacroId) {
+      const MacroPatch &p = kv.second;
+      if (p.invStart == *invStart && p.invEnd == *invEnd) {
+        if (!existingKey || kv.first < *existingKey)
+          existingKey = kv.first;
+      }
+    }
+    const uint64_t patchKey = existingKey.value_or(m.id);
+
+    // Preserve an existing non-callsite (already-expanded) replacement.
+    auto it = byMacroId.find(patchKey);
+    if (it != byMacroId.end()) {
+      const bool isCallsite =
+          InvocationSpanMatchesCallsitePrefix(it->second.replacement, m);
+      if (!isCallsite)
+        continue;
+    }
+
+    trace("counter",
+          "__COUNTER__: force patch id={0} name='{1}' ownerInc={2} inv=[{3},{4}) repl='{5}' Aocc=[{6},{7})",
+          m.id, m.name, m.ownerIncludeId, *invStart, *invEnd,
+          stringutils::showWSWithClip(*replOpt, 64), req.aStart, req.aEnd);
+
+    byMacroId[patchKey] = MacroPatch{*invStart, *invEnd, std::move(*replOpt)};
+  }
+}
+
 std::optional<RefoldEngine::MacroPatch>
 RefoldEngine::BuildMacroInvocationPatchWholeCover(
     const RefoldModel::MacroInvocation &m, const diffutils::Hunk &h,
@@ -4466,6 +4894,28 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   const auto invEnd = m.invE;
   if (!invStart || !invEnd || *invEnd < *invStart)
     return std::nullopt;
+
+
+// Special-case: __COUNTER__.
+//
+// The only robust representation of an edited (or forced) __COUNTER__
+// expansion is to replace the invocation spelling with the B-side literal
+// token(s) for this specific occurrence. Do NOT whole-cover expand using the
+// macro cover, which may span multiple occurrences when a header is included
+// multiple times.
+if (m.name == "__COUNTER__") {
+  std::optional<std::string> repl;
+  if (h.bEnd > h.bStart) {
+    repl = SliceBSource(static_cast<size_t>(h.bStart),
+                        static_cast<size_t>(h.bEnd)).trim().str();
+  } else {
+    auto bEnv = MapATokRangeAToBTokenEnvelope(h.aStart, h.aEnd);
+    if (bEnv && bEnv->second > bEnv->first)
+      repl = SliceBSource(bEnv->first, bEnv->second).trim().str();
+  }
+  if (repl)
+    return MacroPatch{*invStart, *invEnd, std::move(*repl)};
+}
 
   trace("macro/whole",
         "whole-cover build inv id={0} name={1} ownerIncludeId={2} hasOwner={3} "
