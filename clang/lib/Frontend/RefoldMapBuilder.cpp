@@ -2104,7 +2104,6 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
     // here.
     if (L.isMacroID()) {
       const std::string Sp = PP.getSpelling(Tok);
-      StringRef Spelling = Sp;
 
       // Record projections for stringification (#X) and token-pasting (X##Y).
       auto recordProjectionsForItem = [&](Item &MI) {

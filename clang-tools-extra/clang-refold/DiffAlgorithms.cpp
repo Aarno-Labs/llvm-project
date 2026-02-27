@@ -61,6 +61,7 @@
 #include "DiffAlgorithms.h"
 #include "StringUtils.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
 
 #include <algorithm>
 #include <climits>
@@ -142,9 +143,53 @@ std::vector<int64_t> lcsMapABGreedy(ArrayRef<StringRef> a,
   return map;
 }
 
-inline bool isBetter(unsigned candLen, std::uint64_t candCost, unsigned bestLen,
-                     std::uint64_t bestCost) {
-  return (candLen > bestLen) || (candLen == bestLen && candCost < bestCost);
+inline bool isBetter(unsigned candLen, std::uint64_t candCost, std::uint32_t candTie,
+                     unsigned bestLen, std::uint64_t bestCost, std::uint32_t bestTie) {
+  if (candLen != bestLen)
+    return candLen > bestLen;
+  if (candCost != bestCost)
+    return candCost < bestCost;
+  return candTie < bestTie;
+}
+
+// Small tie-break penalty for ambiguous matches.
+//
+// The weighted-LCS objective is (1) maximize LCS length, then (2) minimize
+// ownerDepthGap cost. Those objectives implement the boundary policy.
+//
+// In many real-world streams, there can still be multiple optimal solutions
+// with identical (len,cost), especially around highly repetitive tokens
+// (punctuation, keywords, small literals). A naive backtrack that prefers the
+// diagonal match can then "steal" from adjacent insertions by matching a token
+// to the wrong repeated occurrence.
+//
+// We resolve this by introducing a tertiary objective dpTie that is only used
+// when (len,cost) are equal. dpTie prefers matches whose immediate neighbors
+// (prev/next) also match, biasing toward locally consistent alignments without
+// changing optimality under (len,cost).
+inline std::uint32_t matchTiePenalty(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
+                                    size_t ai, size_t bj,
+                                    const llvm::DenseMap<StringRef, unsigned> &freqA,
+                                    const llvm::DenseMap<StringRef, unsigned> &freqB) {
+  const StringRef tok = a[ai];
+  auto itA = freqA.find(tok);
+  auto itB = freqB.find(tok);
+  const unsigned cntA = (itA == freqA.end() ? 0U : itA->second);
+  const unsigned cntB = (itB == freqB.end() ? 0U : itB->second);
+
+  // If the token is unique on at least one side, it anchors well; don't
+  // penalize.
+  if (cntA <= 1U || cntB <= 1U)
+    return 0;
+
+  std::uint32_t p = 0;
+  // Previous token agreement (bigram coherence).
+  if (ai > 0 && bj > 0)
+    p += (a[ai - 1] == b[bj - 1]) ? 0U : 1U;
+  // Next token agreement (lookahead coherence).
+  if (ai + 1 < a.size() && bj + 1 < b.size())
+    p += (a[ai + 1] == b[bj + 1]) ? 0U : 1U;
+  return p;
 }
 } // namespace
 
@@ -186,6 +231,7 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a,
   // ---------------- DP path: (n+1) x (m+1) tables, row-major -----------------
   // dpLen(i,j)  = max LCS length for A[0..i) vs B[0..j)
   // dpCost(i,j) = min accumulated gap cost among paths achieving dpLen(i,j)
+  // dpTie(i,j)  = min tie-break penalty among paths achieving (dpLen, dpCost)
   //
   // Transitions into (i,j):
   //   match:     from (i-1,j-1), +1 length, +0 cost
@@ -197,6 +243,17 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a,
   std::vector<uint32_t> dpLen(cells, 0);
   // Using uint64_t for cost to prevent overflow during accumulation
   std::vector<uint64_t> dpCost(cells, 0);
+  std::vector<uint32_t> dpTie(cells, 0);
+
+  // Build frequency maps once per call for ambiguity detection.
+  llvm::DenseMap<StringRef, unsigned> freqA;
+  llvm::DenseMap<StringRef, unsigned> freqB;
+  freqA.reserve(a.size());
+  freqB.reserve(b.size());
+  for (StringRef t : a)
+    ++freqA[t];
+  for (StringRef t : b)
+    ++freqB[t];
 
   auto idx = [&](size_t i, size_t j) -> size_t {
     return i * stride + j;
@@ -207,6 +264,9 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a,
   auto cost = [&](size_t i, size_t j) -> uint64_t & {
     return dpCost[idx(i, j)];
   };
+  auto tie = [&](size_t i, size_t j) -> uint32_t & {
+    return dpTie[idx(i, j)];
+  };
 
   // Fill DP table forward
   for (size_t i = 0; i <= n; ++i) {
@@ -216,11 +276,14 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a,
 
       uint32_t bestLen = 0;
       uint64_t bestCost = std::numeric_limits<uint64_t>::max();
+      uint32_t bestTie = std::numeric_limits<uint32_t>::max();
 
       // 1) Match (diagonal)
       if (i > 0 && j > 0 && a[i - 1] == b[j - 1]) {
         bestLen = len(i - 1, j - 1) + 1U;
         bestCost = cost(i - 1, j - 1);
+        bestTie = tie(i - 1, j - 1) +
+                  matchTiePenalty(a, b, i - 1, j - 1, freqA, freqB);
       }
 
       // 2) Delete A (vertical move: i-1 -> i), pay ownerDepthGap[i]
@@ -228,10 +291,12 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a,
         const uint32_t candLen = len(i - 1, j);
         const uint64_t candCost =
             cost(i - 1, j) + static_cast<uint64_t>(ownerDepthGap[i]);
+        const uint32_t candTie = tie(i - 1, j);
 
-        if (isBetter(candLen, candCost, bestLen, bestCost)) {
+        if (isBetter(candLen, candCost, candTie, bestLen, bestCost, bestTie)) {
           bestLen = candLen;
           bestCost = candCost;
+          bestTie = candTie;
         }
       }
 
@@ -240,15 +305,18 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a,
         const uint32_t candLen = len(i, j - 1);
         const uint64_t candCost =
             cost(i, j - 1) + static_cast<uint64_t>(ownerDepthGap[i]);
+        const uint32_t candTie = tie(i, j - 1);
 
-        if (isBetter(candLen, candCost, bestLen, bestCost)) {
+        if (isBetter(candLen, candCost, candTie, bestLen, bestCost, bestTie)) {
           bestLen = candLen;
           bestCost = candCost;
+          bestTie = candTie;
         }
       }
 
       len(i, j) = bestLen;
       cost(i, j) = bestCost;
+      tie(i, j) = (bestTie == std::numeric_limits<uint32_t>::max()) ? 0U : bestTie;
     }
   }
 
@@ -260,13 +328,16 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a,
   while (i > 0 || j > 0) {
     const uint32_t curLen = len(i, j);
     const uint64_t curCost = cost(i, j);
+    const uint32_t curTie = tie(i, j);
 
     bool moved = false;
 
-    // Diagonal (match) first
+    // Diagonal (match)
     if (i > 0 && j > 0 && a[i - 1] == b[j - 1]) {
+      const uint32_t pen = matchTiePenalty(a, b, i - 1, j - 1, freqA, freqB);
       if (len(i - 1, j - 1) == curLen - 1U &&
-          cost(i - 1, j - 1) == curCost) {
+          cost(i - 1, j - 1) == curCost &&
+          tie(i - 1, j - 1) + pen == curTie) {
         map[i - 1] = static_cast<int64_t>(j - 1);
         --i;
         --j;
@@ -277,7 +348,8 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a,
     // Up (delete A): from (i-1, j) paying ownerDepthGap[i]
     if (!moved && i > 0) {
       if (len(i - 1, j) == curLen &&
-          cost(i - 1, j) + static_cast<uint64_t>(ownerDepthGap[i]) == curCost) {
+          cost(i - 1, j) + static_cast<uint64_t>(ownerDepthGap[i]) == curCost &&
+          tie(i - 1, j) == curTie) {
         --i;
         moved = true;
       }
@@ -286,7 +358,8 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a,
     // Left (insert B): from (i, j-1) paying ownerDepthGap[i]
     if (!moved && j > 0) {
       if (len(i, j - 1) == curLen &&
-          cost(i, j - 1) + static_cast<uint64_t>(ownerDepthGap[i]) == curCost) {
+          cost(i, j - 1) + static_cast<uint64_t>(ownerDepthGap[i]) == curCost &&
+          tie(i, j - 1) == curTie) {
         --j;
         moved = true;
       }

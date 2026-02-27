@@ -86,6 +86,14 @@ inline std::string resolveHeaderPath(const RefoldModel::IncludeItem &inc) {
              : stringutils::stripHeaderToken(inc.target).str();
 }
 
+inline bool containsRefoldIns(llvm::StringRef s) {
+  return s.contains("__refold_ins__");
+}
+
+inline std::string traceClip(llvm::StringRef s, size_t maxBytes = 220) {
+  return stringutils::showWS(stringutils::clip(s, maxBytes));
+}
+
 Error compareTokens(ArrayRef<PPTok> aToks, ArrayRef<PPTok> bToks) {
   // Let's first at least compare the tokens up to the min length to see if we
   // at least have a match prefix. We can complain about the length mismatch
@@ -233,6 +241,8 @@ std::string RefoldEngine::Refold() {
 
   info("plan", "REFOLD START tuPath={0} aLen={1} bLen={2} aToks={3} bToks={4}",
        tuPath, aSource_.size(), bSource_.size(), aToks_.size(), bToks_.size());
+
+  abTokHunks_.clear();
 
   // Read in the translation unit file / C source.
   std::unique_ptr<llvm::MemoryBuffer> tuBuffer;
@@ -567,6 +577,10 @@ std::string RefoldEngine::Refold() {
     }
   }
 
+
+  // Cache the token-level hunks for boundary-aware envelope mapping.
+  abTokHunks_ = hunks;
+
   // Build *raw-text* byte hunks once; this enables deterministic mapping of PP
   // byte spans from A->B, without inheriting any ambiguity from token-level
   // alignment.
@@ -637,6 +651,78 @@ std::string RefoldEngine::Refold() {
   DenseMap<std::optional<uint64_t>, DenseMap<uint64_t, MacroPatch>>
       macroPatchByOwnerByMacroId;
 
+
+  // Instrumentation helpers for diagnosing duplicated hunk material:
+  // Compare B-envelope selection derived from byte hunks vs token-level a2b.
+  auto TokEnvFromA2B =
+      [&](uint64_t a0, uint64_t a1)
+          -> std::optional<std::pair<size_t, size_t>> {
+    if (a1 < a0)
+      a1 = a0;
+    const uint64_t aMax = static_cast<uint64_t>(a2b.size());
+    a0 = std::min(a0, aMax);
+    a1 = std::min(a1, aMax);
+
+    size_t bMin = std::numeric_limits<size_t>::max();
+    size_t bMax = 0;
+    bool any = false;
+    for (uint64_t ai = a0; ai < a1; ++ai) {
+      int64_t bj = a2b[static_cast<size_t>(ai)];
+      if (bj >= 0) {
+        any = true;
+        size_t b = static_cast<size_t>(bj);
+        bMin = std::min(bMin, b);
+        bMax = std::max(bMax, b);
+      }
+    }
+    if (any)
+      return std::make_pair(bMin, bMax + 1);
+
+    // No matched tokens inside the interval: approximate using nearest mapped
+    // neighbors (useful for diagnosing envelope drift, not for semantics).
+    std::optional<size_t> left, right;
+    for (uint64_t ai = a0; ai > 0; --ai) {
+      int64_t bj = a2b[static_cast<size_t>(ai - 1)];
+      if (bj >= 0) {
+        left = static_cast<size_t>(bj) + 1;
+        break;
+      }
+    }
+    for (uint64_t ai = a1; ai < aMax; ++ai) {
+      int64_t bj = a2b[static_cast<size_t>(ai)];
+      if (bj >= 0) {
+        right = static_cast<size_t>(bj);
+        break;
+      }
+    }
+    if (left && right)
+      return std::make_pair(*left, *right);
+    if (left)
+      return std::make_pair(*left, *left);
+    if (right)
+      return std::make_pair(*right, *right);
+    return std::nullopt;
+  };
+
+  auto TraceBEnv = [&](StringRef tag, StringRef label,
+                       std::optional<std::pair<size_t, size_t>> env) {
+    if (!inTraceMode())
+      return;
+    if (!env) {
+      trace(tag, "{0}: Btok=<none>", label);
+      return;
+    }
+    size_t b0 = env->first;
+    size_t b1 = env->second;
+    const size_t bMax = bToks_.size();
+    b0 = std::min(b0, bMax);
+    b1 = std::min(b1, bMax);
+    StringRef lead = SliceBSource(b0, std::min(b0 + 24, b1));
+    trace(tag, "{0}: Btok=[{1},{2}) lead='{3}'", label, b0, b1,
+          traceClip(lead));
+  };
+
+
   // Iterate over all hunks:
   for (size_t i = 0; i < hunks.size(); ++i) {
     const auto &h = hunks[i];
@@ -693,6 +779,30 @@ std::string RefoldEngine::Refold() {
             (existingIt != byMacroId.end())
                 ? existingIt->second.replacement
                 : (m->invText ? m->invText->str() : "");
+
+        if (inTraceMode()) {
+          // Envelope diagnostics: compare byte-hunk-derived envelopes vs token-level
+          // a2b-derived envelopes for both the macro cover and the current hunk.
+          // Disagreements or envelopes that start on boundary insertions are a common
+          // root cause for duplicated insertion material in whole-cover fallback.
+          trace("instr/macro",
+                "macro id={0} name='{1}' coverA=[{2},{3}) hunkA=[{4},{5}) hunkB=[{6},{7})",
+                m->id, m->name, m->cover.begin, m->cover.end, h.aStart, h.aEnd,
+                h.bStart, h.bEnd);
+          TraceBEnv("instr/macro", "cover byte",
+                    MapATokRangeAToBTokenEnvelope(m->cover.begin,
+                                                  m->cover.end));
+          TraceBEnv("instr/macro", "cover a2b",
+                    TokEnvFromA2B(m->cover.begin, m->cover.end));
+          TraceBEnv("instr/macro", "hunk byte",
+                    MapATokRangeAToBTokenEnvelope(h.aStart, h.aEnd));
+          TraceBEnv("instr/macro", "hunk a2b",
+                    TokEnvFromA2B(h.aStart, h.aEnd));
+          TraceBEnv(
+              "instr/macro", "hunk diff",
+              std::make_optional(std::make_pair(
+                  static_cast<size_t>(h.bStart), static_cast<size_t>(h.bEnd))));
+        }
         auto updated = BuildMacroInvocationPatchWholeCover(
             *m, h, currentInvText, macroPatchByOwnerByMacroId);
         if (updated) {
@@ -3989,6 +4099,33 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       bEnv = {static_cast<size_t>(h.bStart), static_cast<size_t>(h.bEnd)};
     }
 
+    // If the edit is a pure insertion and the inserted B-token range is
+    // adjacent to the mapped occurrence envelope, extend the envelope to
+    // include the insertion. This avoids losing boundary insertions when
+    // producer spans end exactly at the insertion point (common for varargs
+    // and expression edits like 'x + y' -> 'x + y * 2').
+    if (bEnv && hArgs.aStart == hArgs.aEnd && hArgs.bStart < hArgs.bEnd) {
+      const size_t insB0 = static_cast<size_t>(hArgs.bStart);
+      const size_t insB1 = static_cast<size_t>(hArgs.bEnd);
+      size_t e0 = bEnv->first;
+      size_t e1 = bEnv->second;
+
+      // Extend only when the insertion is directly adjacent to this occurrence
+      // in B; this keeps multi-occurrence args deterministic.
+      if (e1 == insB0)
+        e1 = std::max(e1, insB1);
+      else if (e0 == insB1)
+        e0 = std::min(e0, insB0);
+
+      if (e0 != bEnv->first || e1 != bEnv->second) {
+        trace("macro/args",
+              "  extend env with adjacent insertion: argIdx={0} env=[{1},{2}) ins=[{3},{4}) -> [{5},{6})",
+              static_cast<size_t>(argIdx), bEnv->first, bEnv->second, insB0,
+              insB1, e0, e1);
+        bEnv = std::make_pair(e0, e1);
+      }
+    }
+
     // Slice the edited text from B corresponding to this occurrence and treat
     // it as the candidate replacement for the argument (subject to stringify
     // decoding and paste lifting below).
@@ -4461,9 +4598,114 @@ RefoldEngine::MapAByteRangeToBTokenEnvelope(size_t aByteBegin,
   if (aByteEnd < aByteBegin)
     aByteEnd = aByteBegin;
 
+  // Instrumentation: for non-empty ranges, detect pure insertions anchored
+  // exactly at the begin/end A-byte boundaries. These can make the lower-bound
+  // mapping choose a B position *before* the insertion, which in turn can
+  // cause B-token envelopes to include boundary insertions (a common root cause
+  // of duplicated insertion material when a later macro whole-cover patch also
+  // slices B).
+  const bool nonEmpty = (aByteEnd > aByteBegin);
+  auto tracePureInsAt = [&](size_t aByte, llvm::StringRef which) {
+    if (!nonEmpty || !abByteHunks_ || abByteHunks_->empty())
+      return;
+
+    const uint64_t val = static_cast<uint64_t>(aByte);
+    auto it = std::lower_bound(
+        abByteHunks_->begin(), abByteHunks_->end(), val,
+        [](const ByteHunk &h, uint64_t v) { return h.aStart < v; });
+
+    unsigned shown = 0;
+    for (auto cur = it; cur != abByteHunks_->end() && cur->aStart == val &&
+                       cur->aEnd == val;
+         ++cur) {
+      // Pure insertion (A-length 0, B-length >0).
+      if (cur->bEnd > cur->bStart) {
+        trace("byte/env",
+              "A{0} boundary has pure-insertion ByteHunk: A@{1} -> Bbytes=[{2},{3}) (len={4})",
+              which, aByte, static_cast<size_t>(cur->bStart),
+              static_cast<size_t>(cur->bEnd),
+              static_cast<size_t>(cur->bEnd - cur->bStart));
+        if (++shown >= 3)
+          break;
+      }
+    }
+  };
+
+  tracePureInsAt(aByteBegin, "Begin");
+  tracePureInsAt(aByteEnd, "End");
+
   // Convert A-byte span to B-byte span using A→B mapping
   size_t bByteBegin = MapAByteToBByteLowerBound(aByteBegin);
   size_t bByteEnd = MapAByteToBByteUpperBound(aByteEnd);
+
+  // For non-empty A spans, exclude any *pure insertion* ByteHunks that are
+  // anchored exactly at the begin/end A-byte boundaries.
+  //
+  // Rationale:
+  //   * A pure insertion has A-length 0, so it is not part of the image of a
+  //     non-empty A-byte interval under the A→B mapping.
+  //   * If we include these boundary insertions in the envelope, callers that
+  //     also materialize the insertion as its own edit can end up duplicating
+  //     the inserted bytes (notably in macro whole-cover fallback).
+  //
+  // We only trim boundary insertions for non-empty spans; for empty spans the
+  // insertion itself is the whole point.
+  if (nonEmpty && abByteHunks_ && !abByteHunks_->empty()) {
+    auto trimBegin = [&]() {
+      const uint64_t key = static_cast<uint64_t>(aByteBegin);
+      auto it = std::lower_bound(
+          abByteHunks_->begin(), abByteHunks_->end(), key,
+          [](const ByteHunk &h, uint64_t v) { return h.aStart < v; });
+      for (auto cur = it;
+           cur != abByteHunks_->end() && cur->aStart == key && cur->aEnd == key;
+           ++cur) {
+        if (cur->bEnd > cur->bStart) {
+          const size_t be = static_cast<size_t>(cur->bEnd);
+          if (be > bByteBegin) {
+            const size_t oldBegin = bByteBegin;
+            bByteBegin = be;
+            if (inTraceMode() && bByteBegin > oldBegin) {
+              StringRef trimmed =
+                  bSource_.slice(oldBegin, std::min(oldBegin + 200, bByteBegin));
+              trace("byte/env",
+                    "trimBegin: Abytes=[{0},{1}) hunkBbytes=[{2},{3}) Btrim=[{4},{5}) text='{6}'",
+                    aByteBegin, aByteEnd, cur->bStart, cur->bEnd, oldBegin,
+                    bByteBegin, traceClip(trimmed));
+            }
+          }
+        }
+      }
+    };
+
+    auto trimEnd = [&]() {
+      const uint64_t key = static_cast<uint64_t>(aByteEnd);
+      auto it = std::lower_bound(
+          abByteHunks_->begin(), abByteHunks_->end(), key,
+          [](const ByteHunk &h, uint64_t v) { return h.aStart < v; });
+      for (auto cur = it;
+           cur != abByteHunks_->end() && cur->aStart == key && cur->aEnd == key;
+           ++cur) {
+        if (cur->bEnd > cur->bStart) {
+          const size_t bs = static_cast<size_t>(cur->bStart);
+          if (bs < bByteEnd) {
+            const size_t oldEnd = bByteEnd;
+            bByteEnd = bs;
+            if (inTraceMode() && oldEnd > bByteEnd) {
+              StringRef trimmed =
+                  bSource_.slice(bByteEnd, std::min(bByteEnd + 200, oldEnd));
+              trace("byte/env",
+                    "trimEnd: Abytes=[{0},{1}) hunkBbytes=[{2},{3}) Btrim=[{4},{5}) text='{6}'",
+                    aByteBegin, aByteEnd, cur->bStart, cur->bEnd, bByteEnd,
+                    oldEnd, traceClip(trimmed));
+            }
+          }
+        }
+      }
+    };
+
+    trimBegin();
+    trimEnd();
+  }
 
   // Clamp B-byte bounds to legal range
   if (bByteEnd < bByteBegin)
@@ -4474,6 +4716,19 @@ RefoldEngine::MapAByteRangeToBTokenEnvelope(size_t aByteBegin,
   // Convert B-byte bounds to B-token index span
   size_t bTokBegin = BTokIndexFloor(bByteBegin); // inclusive
   size_t bTokEnd = BTokIndexCeil(bByteEnd);      // exclusive
+
+  // Instrumentation: if the computed B-token envelope begins at a boundary
+  // where B contains a refold insertion marker, log the leading slice so we
+  // can correlate envelope selection with duplicated hunk material.
+  if (nonEmpty && bTokBegin < bTokEnd && bTokBegin < bToks_.size()) {
+    StringRef lead = SliceBSource(bTokBegin, std::min(bTokBegin + 24, bTokEnd));
+    if (containsRefoldIns(lead)) {
+      trace("byte/env",
+            "B-token envelope begins with __refold_ins__: Abytes=[{0},{1}) -> Bbytes=[{2},{3}) Btok=[{4},{5}) lead='{6}'",
+            aByteBegin, aByteEnd, bByteBegin, bByteEnd, bTokBegin, bTokEnd,
+            traceClip(lead));
+    }
+  }
 
   // Clamp B-token bounds
   if (bTokEnd < bTokBegin)
@@ -4545,9 +4800,82 @@ RefoldEngine::MapATokRangeAToBTokenEnvelope(uint64_t beginTok,
   const size_t aByteBegin = aTokOff_[static_cast<size_t>(beginTok)];
   const size_t aByteEnd = aTokOff_[idxEnd];
 
-  // Delegate to the byte-to-token-envelope logic.
-  return MapAByteRangeToBTokenEnvelope(aByteBegin, aByteEnd);
+  // Primary mapping path.
+  auto env = MapAByteRangeToBTokenEnvelope(aByteBegin, aByteEnd);
+
+  // Robust boundary fix: The raw-text byte hunks can legally coalesce a
+  // boundary-adjacent pure insertion (e.g. a '__refold_ins__' marker inserted at
+  // an A-token boundary) with an immediately adjacent replacement hunk. When we
+  // then lift a whole-cover replacement for a macro invocation, that boundary
+  // insertion can become duplicated: once as its own insertion edit, and again
+  // inside the whole-cover replacement slice.
+  //
+  // To avoid this, we trim *only* synthetic refold insertions that are encoded
+  // as token-level pure-insertion hunks anchored exactly at the start/end token
+  // boundary of the requested A-token span.
+  // MapAByteRangeToBTokenEnvelope() always returns a concrete B-token envelope.
+  // (This routine returns std::optional only to represent "no mapping" for
+  // invalid/empty A-token ranges handled above.)
+  if (endTok > beginTok && !abTokHunks_.empty() && !bTokOff_.empty()) {
+    size_t bBegin = env.first;
+    size_t bEnd = env.second;
+
+    auto sliceBForHunk = [&](const diffutils::Hunk &h) -> std::optional<StringRef> {
+      const uint64_t b0 = h.bStart;
+      const uint64_t b1 = h.bEnd;
+      if (b1 <= b0)
+        return std::nullopt;
+      if (b1 > static_cast<uint64_t>(bTokOff_.size()))
+        return std::nullopt;
+      const size_t bb0 = bTokOff_[static_cast<size_t>(b0)];
+      const size_t bb1 = bTokOff_[static_cast<size_t>(b1)];
+      if (bb1 <= bb0 || bb1 > bSource_.size())
+        return std::nullopt;
+      return bSource_.slice(bb0, bb1);
+    };
+
+    auto trimAt = [&](uint64_t aPos, bool isBegin) {
+      for (const auto &h : abTokHunks_) {
+        if (h.aStart != aPos || h.aEnd != aPos)
+          continue; // not a pure insertion at this A boundary
+        if (h.bEnd <= h.bStart)
+          continue;
+
+        auto bSliceOpt = sliceBForHunk(h);
+        if (!bSliceOpt)
+          continue;
+        if (!containsRefoldIns(*bSliceOpt))
+          continue; // only trim synthetic refold insertions
+
+        const size_t hb0 = static_cast<size_t>(h.bStart);
+        const size_t hb1 = static_cast<size_t>(h.bEnd);
+
+        if (isBegin) {
+          // If the computed envelope begins inside (or before) the synthetic
+          // insertion, bump the begin past it.
+          if (bBegin <= hb0 || (bBegin > hb0 && bBegin < hb1))
+            bBegin = std::max(bBegin, hb1);
+        } else {
+          // If the computed envelope ends inside (or after) the synthetic
+          // insertion, pull the end back before it.
+          if (bEnd >= hb1 || (bEnd > hb0 && bEnd < hb1))
+            bEnd = std::min(bEnd, hb0);
+        }
+      }
+    };
+
+    trimAt(beginTok, /*isBegin=*/true);
+    trimAt(endTok, /*isBegin=*/false);
+
+    if (bBegin > bEnd)
+      bBegin = bEnd;
+
+    env = std::make_pair(bBegin, bEnd);
+  }
+
+  return env;
 }
+
 
 std::optional<std::vector<std::pair<size_t, size_t>>>
 RefoldEngine::ParseMacroInvocationArgContentRanges(StringRef invText) {
@@ -4678,6 +5006,13 @@ RefoldEngine::BuildIncludeInsertionPatch(const RefoldModel::IncludeItem &inc,
         "built inc #{0} patch A[{1},{2})->B[{3},{4}) len(insertBytes)={5}",
         inc.id, patch.aStart, patch.aEnd, patch.bStart, patch.bEnd,
         patch.insertBytes.size());
+
+  if (containsRefoldIns(StringRef(patch.insertBytes))) {
+    trace("include/patch",
+          "inc #{0} patch contains __refold_ins__: A[{1},{2}) Btok=[{3},{4}) clip='{5}'",
+          inc.id, patch.aStart, patch.aEnd, static_cast<uint64_t>(patch.bStart),
+          static_cast<uint64_t>(patch.bEnd), traceClip(StringRef(patch.insertBytes)));
+  }
 
   return patch;
 }
@@ -5034,7 +5369,15 @@ RefoldEngine::BuildWholeCoverReplacementText(
   if (bTokEnd <= bTokStart)
     return std::nullopt;
 
-  return SliceBSource(bTokStart, bTokEnd).trim().str();
+  StringRef replacement = SliceBSource(bTokStart, bTokEnd).trim();
+  if (containsRefoldIns(replacement)) {
+    StringRef lead = SliceBSource(bTokStart, std::min(bTokStart + 24, bTokEnd));
+    trace("macro/whole",
+          "BuildWholeCoverReplacementText includes __refold_ins__: inv id={0} name='{1}' covA=[{2},{3}) Btok=[{4},{5}) lead='{6}'",
+          m.id, m.name, covLoA, covHiA, bTokStart, bTokEnd, traceClip(lead));
+  }
+
+  return replacement.str();
 }
 
 void RefoldEngine::AddForcedCounterPatches(
@@ -5252,9 +5595,14 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             ? baseInvText
             : (m.invText ? StringRef(*m.invText) : StringRef(""));
     if (InvocationSpanMatchesCallsitePrefix(invSpanText, m)) {
+      // First try to patch arguments in-place. If that can't satisfy the
+      // edit, we may fall back to whole-cover replacement below.
       auto argsOnly = BuildMacroInvocationPatchArgsOnly(m, hEff, baseInvText);
       if (argsOnly)
         return *argsOnly;
+      trace("instr/macro",
+            "args-only: FAIL macro id={0} name='{1}' hunkA=[{2},{3}) hunkB=[{4},{5}) (see [trace][macro/args])",
+            m.id, m.name, hEff.aStart, hEff.aEnd, hEff.bStart, hEff.bEnd);
       // If we already have a callsite patch and args-only yields no replacement
       // for the trimmed hunk, then the edit is already satisfied by the current
       // callsite text. Do not fall back to whole-cover expansion.
@@ -6411,6 +6759,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     return *existingPatch;
   }
 
+
   // 2) Whole-cover fallback: replace invocation with the entire expansion cover
   // slice from B. cover.begin/cover.end are PP-token indices in A; map them
   // into a B-token envelope.
@@ -6485,6 +6834,17 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     return std::nullopt;
 
   StringRef replacement = SliceBSource(bTokStart, bTokEnd).trim();
+
+  // Instrumentation: duplicated insertion failures frequently occur when the
+  // whole-cover replacement slice begins at a boundary pure-insertion in B.
+  // Log these cases with enough context to diagnose the exact envelope.
+  if (containsRefoldIns(replacement)) {
+    StringRef lead = SliceBSource(bTokStart, std::min(bTokStart + 24, bTokEnd));
+    trace("macro/whole",
+          "whole-cover replacement includes __refold_ins__: inv id={0} name='{1}' covA=[{2},{3}) Btok=[{4},{5}) lead='{6}'",
+          m.id, m.name, covLoA, covHiA, bTokStart, bTokEnd, traceClip(lead));
+  }
+
   return MacroPatch{*invStart, *invEnd, replacement.str()};
 }
 
