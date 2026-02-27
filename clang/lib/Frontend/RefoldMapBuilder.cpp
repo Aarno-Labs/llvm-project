@@ -1064,6 +1064,37 @@ static DecodedPayloadMap decodeStringLiteralPayload(llvm::StringRef Spelling) {
   }
 }
 
+static bool isCurriedHeadMacro(const MacroInfo *MI) {
+  if (!MI)
+    return false;
+
+  // Determine whether the *replacement list* begins with a
+  // curried-head pattern:
+  //   ( ident ) (
+  // This is used as a structural hint for call-chain suffix
+  // handling during refolding.
+  const auto &RToks = MI->tokens();
+  size_t i = 0;
+  auto nextNonComment = [&]() -> const Token * {
+    while (i < RToks.size() && RToks[i].is(tok::comment))
+      ++i;
+    if (i >= RToks.size())
+      return nullptr;
+    return &RToks[i++];
+  };
+
+  const Token *T0 = nextNonComment();
+  const Token *T1 = nextNonComment();
+  const Token *T2 = nextNonComment();
+  const Token *T3 = nextNonComment();
+  if (!T0 || !T1 || !T2 || !T3)
+    return false;
+  if (!T0->is(tok::l_paren) || !T1->is(tok::identifier) ||
+      !T2->is(tok::r_paren) || !T3->is(tok::l_paren))
+    return false;
+  return true;
+}
+
 void computeMacroProjectionSites(Item &It, Preprocessor &PP,
                                  const Token &MacroNameTok, const MacroInfo *MI,
                                  const MacroArgs *Args,
@@ -1751,6 +1782,8 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
 
   It.Loc = Range.getBegin();
   It.IsBuiltinMacro = (MI != nullptr && MI->isBuiltinMacro());
+
+  It.CurriedHead = isCurriedHeadMacro(MI);
 
   // --- Invocation text + byte range logic ---
   SourceLocation BeginTokLoc = Range.getBegin();
@@ -3287,6 +3320,9 @@ void RefoldMapBuilder::writeJSON() {
           if (It.Kind == IK_Macro) {
             // InvText can't be empty at this point
             JO.attribute("inv_text", It.InvText);
+
+            if (It.CurriedHead)
+              JO.attribute("curried_head", true);
 
             if (!It.InvFile.empty())
               JO.attribute("inv_file", It.InvFile);
