@@ -24,13 +24,13 @@
 // Determinism & Policy
 // --------------------
 //   • All algorithms break ties consistently for stable output across runs.
-//   • Large-input guard: LCS may fall back to a greedy, order-preserving
-//     subsequence when the DP table would exceed a configured cell budget.
+//   • Large-input guard: LCS switches to Hirschberg recursion (exact) when
+//     the full DP table would exceed a configured cell budget.
 //   • Utilities are side-effect free and operate on caller-owned sequences.
 //
 // Complexity
 // ----------
-//   • LCS DP:   time O(N*M), space O(N*M); greedy fallback O(N+M).
+//   • LCS:      time O(N*M); DP uses O(N*M) space, Hirschberg uses O(N+M).
 //   • Myers:    expected time O((N+M)*D), space O(N+M) per frontier snapshot.
 //   • Hunking:  O(N) over the alignment/map.
 //
@@ -76,7 +76,8 @@ namespace clang {
 namespace refold {
 namespace diffutils {
 
-constexpr unsigned long long DEFAULT_MAX_CELLS = 1ULL << 30;
+// Default to ~4GB budget.
+constexpr unsigned long long DEFAULT_MAX_CELLS = 1ULL << 28;
 
 // ===== Myers shortest edit script (SES) =====
 
@@ -256,21 +257,20 @@ std::vector<Hunk> coalesce(ArrayRef<Step> steps);
 /// - **DP Path:** Used for small-to-medium sequences where the product of
 ///   lengths is less than \p maxCells. Employs a cost-model-augmented
 ///   Dynamic Programming approach.
-/// - **Greedy Fallback:** If \p maxCells is exceeded, the algorithm falls back
-///   to a linear-time scan that respects owner boundaries but may produce
-///   a non-maximal subsequence.
+/// - **Hirschberg Fallback:** If \p maxCells is exceeded, the algorithm switches
+///   to Hirschberg recursion (exact) using O(N+M) space.
 ///
 /// ### Complexity
 ///
-/// * **Time:** O(N*M) for DP, O(N+M) for fallback.
-/// * **Space:** O(N*M) for the full DP table, O(N) for the result map.
+/// * **Time:** O(N*M) (DP or Hirschberg; both exact).
+/// * **Space:** O(N*M) for the full DP table, O(N+M) for Hirschberg, O(N) for the map.
 ///
 /// \param a The original (Source A) sequence of tokens/strings.
 /// \param b The edited (Source B) sequence of tokens/strings.
 /// \param ownerDepthGap A parallel array to \p a indicating the ownership
 ///        depth or boundary cost for each token.
-/// \param maxCells The threshold for the DP table size (N*M) before falling
-///        back to a linear greedy scan.
+/// \param maxCells The threshold for the DP table size (N*M) before switching
+///        to Hirschberg recursion.
 /// \returns A vector mapping each index in \p a to its corresponding index
 ///          in \p b, or -1 if the token was deleted or moved.
 std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a,
@@ -300,21 +300,17 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a,
 ///
 /// ### Large-input guard
 ///
-/// If the full DP table would exceed a fixed cell budget (~20M cells),
-/// the algorithm falls back to a greedy, order-preserving subsequence
-/// scan: it advances a pointer through `B` and records the first position
-/// where each `A[i]` equals `B[j]`. This fallback runs in linear time and
-/// is deterministic, but may produce a non-maximal subsequence when DP is
-/// skipped.
+/// If the full DP table would exceed the configured cell budget,
+/// the algorithm switches to Hirschberg recursion (exact) using O(N+M) space.
 ///
 /// ### Complexity
 ///
 /// * DP path: time *O(N×M)*, space *O(N×M)*
-/// * Greedy fallback: time *O(N+M)*, space *O(N)*
+/// * Hirschberg fallback: time *O(N×M)*, space *O(N+M)*
 ///
 /// \param a Left sequence.
 /// \param b Right sequence.
-/// \param maxCells Maximum number of cells before performing a greedy scan.
+/// \param maxCells Maximum number of DP cells before switching to Hirschberg recursion.
 /// \returns A vector mapping a-indices to b-indices (or -1 if unmatched).
 std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
                           unsigned long long maxCells = DEFAULT_MAX_CELLS);
