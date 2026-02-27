@@ -247,9 +247,12 @@ private:
 
   GapCtxKey GetGapCtxKey(uint64_t gap, uint64_t aSize) const;
 
-  /// Cached token-level hunks for the current refold invocation. This is used
-  /// to disambiguate A->B token-envelope mapping at boundaries in the presence
-  /// of synthetic refold insertions (e.g. '__refold_ins__' markers).
+  /// Cached token-level hunks for the current refold invocation.
+  ///
+  /// These hunks are used to deterministically disambiguate A→B token
+  /// envelope mapping at *span boundaries* when there are adjacent
+  /// pure-insertion hunks (A-span is empty) that should not be absorbed
+  /// into a larger mapped envelope (e.g., macro whole-cover replacement).
   std::vector<diffutils::Hunk> abTokHunks_;
 
   std::optional<std::vector<ByteHunk>> abByteHunks_;
@@ -1667,6 +1670,28 @@ private:
   /// \returns The B-token range if the input is valid, std::nullopt otherwise.
   std::optional<std::pair<size_t, size_t>>
   MapATokRangeAToBTokenEnvelope(uint64_t beginTok, uint64_t endTok) const;
+
+  /// \brief Variant of `MapATokRangeAToBTokenEnvelope` that trims *edge* pure
+  /// insertion hunks from the resulting B-token envelope.
+  ///
+  /// Rationale:
+  ///   Byte-level envelope mapping can legally absorb a pure-insertion hunk
+  ///   anchored exactly at `beginTok` or `endTok` into the mapped B envelope for
+  ///   the interior A span. For whole-cover macro replacement, those edge
+  ///   insertions are outside the macro cover and are applied separately; if
+  ///   they are also included in the whole-cover slice, the insertion material
+  ///   is duplicated. This method enforces a deterministic "no absorption of
+  ///   edge insertions" rule by trimming any token-level pure-insertion hunks
+  ///   anchored at the requested A-span boundaries.
+  ///
+  /// This method is intended for *whole-cover* mapping where the A-span is a
+  /// coverage interval (e.g. a macro cover). It should not be used for mapping
+  /// argument-content spans where an insertion at the span boundary may be
+  /// semantically part of the argument.
+  std::optional<std::pair<size_t, size_t>>
+  MapATokRangeAToBTokenEnvelopeTrimEdgeInsertions(uint64_t beginTok,
+                                                  uint64_t endTok) const;
+
 
   /// \brief Parses the raw text of a function-like macro invocation to identify
   /// the byte ranges of its individual arguments.
