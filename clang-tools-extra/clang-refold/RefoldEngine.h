@@ -247,6 +247,11 @@ private:
 
   GapCtxKey GetGapCtxKey(uint64_t gap, uint64_t aSize) const;
 
+  /// Cached token-level hunks for the current refold invocation. This is used
+  /// to disambiguate A->B token-envelope mapping at boundaries in the presence
+  /// of synthetic refold insertions (e.g. '__refold_ins__' markers).
+  std::vector<diffutils::Hunk> abTokHunks_;
+
   std::optional<std::vector<ByteHunk>> abByteHunks_;
 
   /// Construct an engine from concrete inputs. The instance method `Refold()`
