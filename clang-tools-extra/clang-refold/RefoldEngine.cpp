@@ -7455,63 +7455,77 @@ RefoldEngine::ComputeChildBoundaryInsertByte(const IncludePatch &p,
     return std::nullopt;
   }
 
-  // We only care about children whose sitePath is this header file.
-  const RefoldModel::IncludeItem *left =
-      nullptr; // last child whose coverEnd <= pos
-  const RefoldModel::IncludeItem *right =
-      nullptr; // first child whose coverBegin >= pos
+  // Structural boundary selection:
+  //   * If the INSERT PP-gap is strictly inside a child include's PP cover,
+  //     this is not a boundary insertion in the parent (it should have been a
+  //     child-owned patch).
+  //   * If the gap is exactly on a child cover boundary, we can anchor at that
+  //     child's include-site byte span.
+  //
+  // Contract: boundary anchors must be unambiguous. If multiple children claim
+  // the same boundary PP position, we must fail rather than guess.
 
   uint64_t pos = p.aStart; // PP position of the INSERT gap
 
+  SmallVector<const RefoldModel::IncludeItem *, 4> beginMatches;
+  SmallVector<const RefoldModel::IncludeItem *, 4> endMatches;
+
   for (const auto &child : model_.GetIncludes()) {
-    // Only check direct children of the owner
-    if (!child.parent || *child.parent != owner->id) {
+    // Only check direct children of the owner.
+    if (!child.parent || *child.parent != owner->id)
       continue;
-    }
 
-    // Paths must match the file currently being processed
-    if (!PathsEqual(child.sitePath, file)) {
+    // Paths must match the file currently being processed.
+    if (!PathsEqual(child.sitePath, file))
       continue;
-    }
 
-    uint64_t cb = child.cover.begin;
-    uint64_t ce = child.cover.end;
+    const uint64_t cb = child.cover.begin;
+    const uint64_t ce = child.cover.end;
 
-    // If the INSERT PP-index is *strictly inside* a child's cover, this
-    // fallback is the wrong mechanism (that should have been a child-owned
-    // patch). Gaps on the boundaries (pos == cb or pos == ce) are valid
-    // "between-children" positions and must *not* trigger this guard.
-    if (cb < pos && pos < ce) {
+    // If the gap is strictly inside, this is the wrong mechanism.
+    if (cb < pos && pos < ce)
       return std::nullopt;
-    }
 
-    if (ce <= pos) {
-      // Best "left" child is the one with the greatest coverEnd <= pos.
-      if (!left || ce > left->cover.end) {
-        left = &child;
-      }
-    } else if (cb >= pos) {
-      // Best "right" child is the one with the smallest coverBegin >= pos.
-      if (!right || cb < right->cover.begin) {
-        right = &child;
-      }
-    }
+    if (cb == pos)
+      beginMatches.push_back(&child);
+    if (ce == pos)
+      endMatches.push_back(&child);
   }
 
-  // Only treat this as an "include-boundary" insertion when the PP-gap is
-  // *exactly* on a child cover boundary.
-  //
-  // Otherwise, the nearest-child heuristic can incorrectly anchor unrelated
-  // insertions (e.g. insertions in the prefix text before any child include)
-  // onto the first '#include' directive in the file, which causes multiple
-  // insertions to collide and garble the header.
-  if (right && right->cover.begin == pos) {
-    // Insert *before* the right '#include'.
-    return right->siteB;
+  auto dump = [](ArrayRef<const RefoldModel::IncludeItem *> v) -> std::string {
+    std::string out;
+    bool first = true;
+    for (const auto *c : v) {
+      if (!first)
+        out += "; ";
+      first = false;
+      out +=
+          formatv("child#{0} cover=[{1},{2}) site=[{3},{4}) target={5}", c->id,
+                  c->cover.begin, c->cover.end, c->siteB, c->siteE, c->target)
+              .str();
+    }
+    return out;
+  };
+
+  // Prefer anchoring before a child whose cover begins at this gap.
+  if (!beginMatches.empty()) {
+    if (beginMatches.size() != 1) {
+      fatal("include/boundary",
+            "ambiguous child include boundary: {0} children have cover.begin "
+            "== {1} in file={2}; candidates: {3}",
+            beginMatches.size(), pos, file, dump(beginMatches));
+    }
+    return beginMatches[0]->siteB;
   }
-  if (left && left->cover.end == pos) {
-    // Insert *after* the left '#include'.
-    return left->siteE;
+
+  if (!endMatches.empty()) {
+    if (endMatches.size() != 1) {
+      fatal("include/boundary",
+            "ambiguous child include boundary: {0} children have cover.end == "
+            "{1} in file={2}; candidates: {3}",
+            endMatches.size(), pos, file, dump(endMatches));
+    }
+    return endMatches[0]->siteE;
   }
 
   return std::nullopt;
