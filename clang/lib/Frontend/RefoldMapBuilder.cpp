@@ -2637,23 +2637,26 @@ void RefoldMapBuilder::finalizeIncludeDecls() {
     return Buf;
   };
 
-  // Returns true iff `S` looks like a plain ASCII identifier token:
-  //   [_A-Za-z][_A-Za-z0-9]*
-  // This is a *lexical heuristic* (not a full lexer): it's used to cheaply
-  // recognize "identifier-like" substrings when scanning decoded text.
-  auto isIdentLike = [](llvm::StringRef S) -> bool {
+  // Classify a single token slice using Clang's raw lexer.
+  //
+  // This replaces the prior character-class "identifier-like" heuristic.
+  // We intentionally avoid assuming ASCII or hand-rolling identifier rules;
+  // the lexer handles language mode, UCNs, trigraphs, etc.
+  auto lexSingleKind = [&](llvm::StringRef S) -> tok::TokenKind {
+    S = S.trim();
     if (S.empty())
-      return false;
+      return tok::unknown;
 
-    const unsigned char C0 = static_cast<unsigned char>(S.front());
-    if (!(llvm::isAlpha(C0) || C0 == '_'))
-      return false;
+    const SourceLocation BaseLoc = SourceLocation::getFromRawEncoding(1);
+    std::string LexBuf = S.str();
+    LexBuf.push_back('\0');
+    const char *BufStart = LexBuf.data();
+    const char *BufEnd = BufStart + S.size();
 
-    return std::all_of(S.drop_front().begin(), S.drop_front().end(),
-                       [](char c) {
-                         const unsigned char U = static_cast<unsigned char>(c);
-                         return llvm::isAlnum(U) || U == '_';
-                       });
+    Lexer Lex(BaseLoc, Lang, BufStart, BufStart, BufEnd);
+    Token Tok;
+    Lex.LexFromRawLexer(Tok);
+    return Tok.getKind();
   };
 
   for (Item &It : Items) {
@@ -2741,22 +2744,22 @@ void RefoldMapBuilder::finalizeIncludeDecls() {
         if (Trimmed.empty())
           continue;
 
+        const tok::TokenKind K = lexSingleKind(Trimmed);
+
         // Track identifiers as we go.
-        if (isIdentLike(Trimmed)) {
+        if (K == tok::identifier) {
           LastIdentBeforeSemi = Trimmed;
           if (!SawLParen)
             LastIdentBeforeParen = Trimmed;
         }
 
         // Opening paren: we are entering parameter / declarator list.
-        if (Trimmed.contains('(')) {
+        if (K == tok::l_paren)
           SawLParen = true;
-        }
 
         // Semicolon ends the simple-declaration.
-        if (Trimmed.contains(';')) {
+        if (K == tok::semi)
           break;
-        }
       }
 
       if (SawLParen && !LastIdentBeforeParen.empty()) {
@@ -2789,8 +2792,8 @@ void RefoldMapBuilder::finalizeIncludeDecls() {
           HBuf.slice(static_cast<size_t>(TM.SrcBegin),
                      static_cast<size_t>(TM.SrcEnd));
 
-      // Any token whose slice contains ';' terminates a decl.
-      if (TokText.contains(';')) {
+      // A semicolon token terminates a decl.
+      if (lexSingleKind(TokText) == tok::semi) {
         flushDecl(Start, I + 1);
         Start = I + 1;
       }
@@ -3414,7 +3417,8 @@ void RefoldMapBuilder::writeJSON() {
                       JO.attribute("kind", D.Kind);
                       JO.attribute("name", D.Name);
                       JO.attributeObject("header_span", [&] {
-                        JO.attribute("file", D.File); // can't be empty
+                        // Header file path is implied by the include's resolved_path.
+                        // Omitting it here significantly reduces map size for large headers.
                         JO.attribute("b", D.HeaderB);
                         JO.attribute("e", D.HeaderE);
                       });

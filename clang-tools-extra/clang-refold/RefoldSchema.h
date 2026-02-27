@@ -681,7 +681,6 @@ static constexpr const char *RefoldSchema = R"json(
           "description": "Byte span [b,e) in the *header file* containing this decl.",
           "type": "object",
           "required": [
-            "file",
             "b",
             "e"
           ],
@@ -690,7 +689,7 @@ static constexpr const char *RefoldSchema = R"json(
             "file": {
               "type": "string",
               "minLength": 1,
-              "description": "Header file path containing this declaration."
+              "description": "Header file path containing this declaration. If omitted, it is implied by the enclosing include's resolved_path."
             },
             "b": {
               "type": "integer",
