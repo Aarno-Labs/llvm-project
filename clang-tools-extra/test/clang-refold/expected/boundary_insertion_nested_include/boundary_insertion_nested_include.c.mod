@@ -1,0 +1,8 @@
+// RUN: %clang-refold-tester-with-lines boundary_insertion_nested_include
+
+// test81: nested include boundary insertion.
+#include "h81a.h"
+int INS81_BOUNDARY = hdr81a_val + hdr81b_val;
+#line 5 "boundary_insertion_nested_include.c"
+int TU81_START = 81;
+int main(){ return hdr81b_val + hdr81a_val + TU81_START; }

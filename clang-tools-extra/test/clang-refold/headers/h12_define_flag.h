@@ -1,0 +1,4 @@
+#ifndef RF_H12_DEFINE_FLAG_H
+#define RF_H12_DEFINE_FLAG_H
+#define RF_FLAG_FROM_HEADER 1
+#endif

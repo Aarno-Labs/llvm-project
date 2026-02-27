@@ -1,0 +1,11 @@
+#ifndef RF_H10_LEAF_COND_H
+#define RF_H10_LEAF_COND_H
+#include "common.h"
+/*BOUNDARY:H10:IF-GROUP:BEGIN*/
+#if 1
+  /*BOUNDARY:H10:IF-ARM:BEGIN*/
+  RF_PAYLOAD(h10_if)
+  /*BOUNDARY:H10:IF-ARM:END*/
+#endif
+/*BOUNDARY:H10:IF-GROUP:END*/
+#endif

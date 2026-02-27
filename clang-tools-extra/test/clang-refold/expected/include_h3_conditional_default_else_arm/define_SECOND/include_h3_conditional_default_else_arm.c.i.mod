@@ -1,0 +1,9 @@
+int h3_else_begin_marker = 19;
+int h3_else_a = 1; int h3_else_b = 2;
+
+int t05_after_marker = 11;
+
+int __refold_ins__t05_after = 0; /* pure insertion at after boundary for t05_after_marker */
+int main(void) {
+  return 0;
+}

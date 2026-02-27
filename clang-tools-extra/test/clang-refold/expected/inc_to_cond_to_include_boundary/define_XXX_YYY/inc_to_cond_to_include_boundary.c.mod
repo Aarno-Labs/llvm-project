@@ -6,8 +6,8 @@ char blah(int y);
 int some_prefix_func(char* c);
 #ifdef XXX
 int first(int x);
-int haha(double x);
 #define BAR(X) (X * 3)
+int haha(double x);
 #include "a.h"
 void cry(int x, int y);
 #define FOO(X) (X + X)
