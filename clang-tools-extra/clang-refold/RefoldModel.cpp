@@ -520,10 +520,23 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
               if (!hsObjOrErr)
                 return hsObjOrErr.takeError();
               const json::Object &hsObj = **hsObjOrErr;
-              auto hsFileOrErr =
-                  applyToField(asString, hsObj, "file", headerCtxDecl);
-              if (!hsFileOrErr)
-                return hsFileOrErr.takeError();
+
+              // header_span.file is optional; when omitted, the header file is
+              // implied by the enclosing include's resolved_path. This avoids
+              // repeating the same (often long) path string for every decl and
+              // significantly reduces refold map size for large headers.
+              std::optional<StringRef> hsFileOpt = asOptString(hsObj, "file");
+              StringRef hsFile;
+              if (hsFileOpt) {
+                hsFile = *hsFileOpt;
+              } else if (resolved) {
+                hsFile = *resolved;
+              } else {
+                return createStringError(inconvertibleErrorCode(),
+                                         "Missing required field 'header_span.file' at %s (and include has no resolved_path)",
+                                         headerCtxDecl.c_str());
+              }
+
               auto hsBOrErr = applyToField(asUInt64, hsObj, "b", headerCtxDecl);
               if (!hsBOrErr)
                 return hsBOrErr.takeError();
@@ -548,7 +561,7 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
               RefoldModel::HeaderDecl decl;
               decl.kind = *kindOrErr;
               decl.name = *nameOrErr;
-              decl.file = *hsFileOrErr;
+              decl.file = hsFile;
               decl.headerB = *hsBOrErr;
               decl.headerE = *hsEOrErr;
               decl.span = PPSpan{*psBOrErr, *psEOrErr};
