@@ -1,0 +1,22 @@
+#ifndef RF_H4_COND_INC_H
+#define RF_H4_COND_INC_H
+
+#include "common.h"
+
+/*BOUNDARY:H4:BEGIN*/
+RF_MARK(h4_begin)
+
+#if RF_ENABLE_EXTRA
+  /*BOUNDARY:H4:IF-ARM:INCLUDE-H1:BEGIN*/
+  #include "h1.h"
+  /*BOUNDARY:H4:IF-ARM:INCLUDE-H1:END*/
+#else
+  /*BOUNDARY:H4:ELSE-ARM:PAYLOAD:BEGIN*/
+  RF_PAYLOAD(h4_else_payload)
+  /*BOUNDARY:H4:ELSE-ARM:PAYLOAD:END*/
+#endif
+
+RF_MARK(h4_end)
+/*BOUNDARY:H4:END*/
+
+#endif

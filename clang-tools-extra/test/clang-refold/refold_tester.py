@@ -5,6 +5,7 @@ import sys
 import subprocess
 import shlex
 import platform
+from pathlib import Path
 
 def run(cmd, output_file=None):
   print('RUN:', cmd)
@@ -70,6 +71,7 @@ def get_macos_sdk_flag():
 
 def main():
   ap = argparse.ArgumentParser()
+  ap.add_argument('--with-lines', action='store_true', required=False)
   ap.add_argument('--clang', required=True)
   ap.add_argument('--refolder', required=True)
   ap.add_argument('--headers', required=True)
@@ -85,6 +87,7 @@ def main():
 
   testname = args.testname
   src = args.src
+  src_dirname, src_basename = os.path.split(src)
   tmp_out = os.path.join(args.tmp, 'outputs')
   os.makedirs(tmp_out, exist_ok=True)
 
@@ -103,6 +106,7 @@ def main():
   out_json = os.path.join(tmp_out, f'{testname}.c.refold.json')
   out_mod = os.path.join(tmp_out, f'{testname}.c.mod')
   out_out = os.path.join(tmp_out, f'{testname}.out')
+  verify_out = os.path.join(tmp_out, f'{testname}.verify-out')
 
   # Expected artifacts
   # exp_json = os.path.join(exp_base, f'{testname}.c.refold.json')
@@ -113,6 +117,10 @@ def main():
   # Build -D flags verbatim from macro specs
   dflags = ' '.join(f'-D{m}' for m in args.macros)
 
+  header_path = Path(args.headers)
+  src_dirname_path = Path(src_dirname)
+  header_rel_path = header_path.relative_to(src_dirname)
+
   # 1) Preprocess to .c.i and produce refold map JSON
   clang_cmd = ''
   if platform.system() == 'Darwin':
@@ -120,16 +128,18 @@ def main():
     if isysroot:
       clang_cmd = (
           f'{shlex.quote(args.clang)} -E -P {isysroot} '
-          f'-I {shlex.quote(args.headers)} {dflags} '
+          f'-I {shlex.quote(str(header_rel_path))} {dflags} '
           f'--refold-map={shlex.quote(out_json)} '
-          f'{shlex.quote(src)} -o {shlex.quote(out_i)}'
+          f'{shlex.quote(src_basename)} -o {shlex.quote(out_i)}'
       )
   if not clang_cmd:
     clang_cmd = (
-        f'{shlex.quote(args.clang)} -E -P -I {shlex.quote(args.headers)} '
+        f'{shlex.quote(args.clang)} -E -P '
+        f'-I {shlex.quote(str(header_rel_path))} '
         f'{dflags} --refold-map={shlex.quote(out_json)} '
-        f'{shlex.quote(src)} -o {shlex.quote(out_i)}'
+        f'{shlex.quote(src_basename)} -o {shlex.quote(out_i)}'
     )
+  os.chdir(src_dirname)
   run(clang_cmd)
 
   # 2) Compare producer artifacts
@@ -137,8 +147,9 @@ def main():
   run(f'diff -u {shlex.quote(exp_i)}  {shlex.quote(out_i)}')
 
   # 3) Run clang-refold
+  line_flag = '' if args.with_lines else '--no-lines'
   clang_refold_cmd = (
-      f'{shlex.quote(args.refolder)} --no-lines --strict '
+      f'{shlex.quote(args.refolder)} {line_flag} --strict '
       f'--log-level={shlex.quote(args.log)} '
       f'--pp {shlex.quote(out_i)} '
       f'--pp-mod {shlex.quote(exp_i_mod)} '
@@ -149,6 +160,19 @@ def main():
 
   # 4) Compare final refolded output
   run(f'diff -u {shlex.quote(exp_mod)} {shlex.quote(out_mod)}')
+
+  # 5) Run the checker only if --with-lines was provided
+  if args.with_lines:
+    verify_out = os.path.join(tmp_out, f'{testname}.verify.out')
+
+    clang_refold_checker_cmd = (
+        f'{shlex.quote(args.refolder)} '
+        f'--log-level={shlex.quote(args.log)} '
+        f'--check {shlex.quote(out_mod)} '
+        f'--pp-mod {shlex.quote(exp_i_mod)} '
+        f'--refold-map {shlex.quote(out_json)}'
+    )
+    run(clang_refold_checker_cmd, verify_out)
 
 
 if __name__ == '__main__':
