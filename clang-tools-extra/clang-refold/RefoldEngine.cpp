@@ -86,9 +86,6 @@ inline std::string resolveHeaderPath(const RefoldModel::IncludeItem &inc) {
              : stringutils::stripHeaderToken(inc.target).str();
 }
 
-inline bool containsRefoldIns(llvm::StringRef s) {
-  return s.contains("__refold_ins__");
-}
 
 inline std::string traceClip(llvm::StringRef s, size_t maxBytes = 220) {
   return stringutils::showWS(stringutils::clip(s, maxBytes));
@@ -4717,19 +4714,6 @@ RefoldEngine::MapAByteRangeToBTokenEnvelope(size_t aByteBegin,
   size_t bTokBegin = BTokIndexFloor(bByteBegin); // inclusive
   size_t bTokEnd = BTokIndexCeil(bByteEnd);      // exclusive
 
-  // Instrumentation: if the computed B-token envelope begins at a boundary
-  // where B contains a refold insertion marker, log the leading slice so we
-  // can correlate envelope selection with duplicated hunk material.
-  if (nonEmpty && bTokBegin < bTokEnd && bTokBegin < bToks_.size()) {
-    StringRef lead = SliceBSource(bTokBegin, std::min(bTokBegin + 24, bTokEnd));
-    if (containsRefoldIns(lead)) {
-      trace("byte/env",
-            "B-token envelope begins with __refold_ins__: Abytes=[{0},{1}) -> Bbytes=[{2},{3}) Btok=[{4},{5}) lead='{6}'",
-            aByteBegin, aByteEnd, bByteBegin, bByteEnd, bTokBegin, bTokEnd,
-            traceClip(lead));
-    }
-  }
-
   // Clamp B-token bounds
   if (bTokEnd < bTokBegin)
     bTokEnd = bTokBegin;
@@ -4803,77 +4787,62 @@ RefoldEngine::MapATokRangeAToBTokenEnvelope(uint64_t beginTok,
   // Primary mapping path.
   auto env = MapAByteRangeToBTokenEnvelope(aByteBegin, aByteEnd);
 
-  // Robust boundary fix: The raw-text byte hunks can legally coalesce a
-  // boundary-adjacent pure insertion (e.g. a '__refold_ins__' marker inserted at
-  // an A-token boundary) with an immediately adjacent replacement hunk. When we
-  // then lift a whole-cover replacement for a macro invocation, that boundary
-  // insertion can become duplicated: once as its own insertion edit, and again
-  // inside the whole-cover replacement slice.
-  //
-  // To avoid this, we trim *only* synthetic refold insertions that are encoded
-  // as token-level pure-insertion hunks anchored exactly at the start/end token
-  // boundary of the requested A-token span.
-  // MapAByteRangeToBTokenEnvelope() always returns a concrete B-token envelope.
-  // (This routine returns std::optional only to represent "no mapping" for
-  // invalid/empty A-token ranges handled above.)
-  if (endTok > beginTok && !abTokHunks_.empty() && !bTokOff_.empty()) {
-    size_t bBegin = env.first;
-    size_t bEnd = env.second;
-
-    auto sliceBForHunk = [&](const diffutils::Hunk &h) -> std::optional<StringRef> {
-      const uint64_t b0 = h.bStart;
-      const uint64_t b1 = h.bEnd;
-      if (b1 <= b0)
-        return std::nullopt;
-      if (b1 > static_cast<uint64_t>(bTokOff_.size()))
-        return std::nullopt;
-      const size_t bb0 = bTokOff_[static_cast<size_t>(b0)];
-      const size_t bb1 = bTokOff_[static_cast<size_t>(b1)];
-      if (bb1 <= bb0 || bb1 > bSource_.size())
-        return std::nullopt;
-      return bSource_.slice(bb0, bb1);
-    };
-
-    auto trimAt = [&](uint64_t aPos, bool isBegin) {
-      for (const auto &h : abTokHunks_) {
-        if (h.aStart != aPos || h.aEnd != aPos)
-          continue; // not a pure insertion at this A boundary
-        if (h.bEnd <= h.bStart)
-          continue;
-
-        auto bSliceOpt = sliceBForHunk(h);
-        if (!bSliceOpt)
-          continue;
-        if (!containsRefoldIns(*bSliceOpt))
-          continue; // only trim synthetic refold insertions
-
-        const size_t hb0 = static_cast<size_t>(h.bStart);
-        const size_t hb1 = static_cast<size_t>(h.bEnd);
-
-        if (isBegin) {
-          // If the computed envelope begins inside (or before) the synthetic
-          // insertion, bump the begin past it.
-          if (bBegin <= hb0 || (bBegin > hb0 && bBegin < hb1))
-            bBegin = std::max(bBegin, hb1);
-        } else {
-          // If the computed envelope ends inside (or after) the synthetic
-          // insertion, pull the end back before it.
-          if (bEnd >= hb1 || (bEnd > hb0 && bEnd < hb1))
-            bEnd = std::min(bEnd, hb0);
-        }
-      }
-    };
-
-    trimAt(beginTok, /*isBegin=*/true);
-    trimAt(endTok, /*isBegin=*/false);
-
-    if (bBegin > bEnd)
-      bBegin = bEnd;
-
-    env = std::make_pair(bBegin, bEnd);
-  }
-
   return env;
+}
+
+
+std::optional<std::pair<size_t, size_t>>
+RefoldEngine::MapATokRangeAToBTokenEnvelopeTrimEdgeInsertions(
+    uint64_t beginTok, uint64_t endTok) const {
+  const uint64_t nA = static_cast<uint64_t>(aToks_.size());
+
+  // Mirror the clamping performed by MapATokRangeAToBTokenEnvelope so the edge
+  // positions we trim are the exact A-token boundaries used for the mapping.
+  beginTok = std::clamp(beginTok, static_cast<uint64_t>(0), nA);
+  endTok = std::clamp(endTok, beginTok, nA);
+
+  auto envOpt = MapATokRangeAToBTokenEnvelope(beginTok, endTok);
+  if (!envOpt)
+    return std::nullopt;
+
+  if (abTokHunks_.empty())
+    return envOpt;
+
+  size_t bBegin = envOpt->first;
+  size_t bEnd = envOpt->second;
+
+  auto trimAt = [&](uint64_t aPos, bool isBegin) {
+    for (const auto &h : abTokHunks_) {
+      // Only consider token-level pure insertions anchored at this exact A-gap.
+      if (h.aStart != aPos || h.aEnd != aPos)
+        continue;
+      if (h.bEnd <= h.bStart)
+        continue;
+
+      const size_t hb0 = static_cast<size_t>(h.bStart);
+      const size_t hb1 = static_cast<size_t>(h.bEnd);
+
+      // Only trim if the computed envelope overlaps the insertion payload.
+      if (!(bBegin < hb1 && bEnd > hb0))
+        continue;
+
+      if (isBegin) {
+        // Drop any insertion payload that lies *before* the first A token.
+        bBegin = std::max(bBegin, hb1);
+      } else {
+        // Drop any insertion payload that lies *after* the last A token.
+        bEnd = std::min(bEnd, hb0);
+      }
+    }
+  };
+
+  trimAt(beginTok, /*isBegin=*/true);
+  trimAt(endTok, /*isBegin=*/false);
+
+  if (bBegin > bEnd)
+    bBegin = bEnd;
+
+  return std::make_pair(bBegin, bEnd);
 }
 
 
@@ -5006,13 +4975,6 @@ RefoldEngine::BuildIncludeInsertionPatch(const RefoldModel::IncludeItem &inc,
         "built inc #{0} patch A[{1},{2})->B[{3},{4}) len(insertBytes)={5}",
         inc.id, patch.aStart, patch.aEnd, patch.bStart, patch.bEnd,
         patch.insertBytes.size());
-
-  if (containsRefoldIns(StringRef(patch.insertBytes))) {
-    trace("include/patch",
-          "inc #{0} patch contains __refold_ins__: A[{1},{2}) Btok=[{3},{4}) clip='{5}'",
-          inc.id, patch.aStart, patch.aEnd, static_cast<uint64_t>(patch.bStart),
-          static_cast<uint64_t>(patch.bEnd), traceClip(StringRef(patch.insertBytes)));
-  }
 
   return patch;
 }
@@ -5333,7 +5295,7 @@ RefoldEngine::BuildWholeCoverReplacementText(
   if (covLoA >= covHiA)
     return std::nullopt;
 
-  auto bEnv = MapATokRangeAToBTokenEnvelope(covLoA, covHiA);
+  auto bEnv = MapATokRangeAToBTokenEnvelopeTrimEdgeInsertions(covLoA, covHiA);
   if (!bEnv)
     return std::nullopt;
 
@@ -5368,15 +5330,7 @@ RefoldEngine::BuildWholeCoverReplacementText(
 
   if (bTokEnd <= bTokStart)
     return std::nullopt;
-
   StringRef replacement = SliceBSource(bTokStart, bTokEnd).trim();
-  if (containsRefoldIns(replacement)) {
-    StringRef lead = SliceBSource(bTokStart, std::min(bTokStart + 24, bTokEnd));
-    trace("macro/whole",
-          "BuildWholeCoverReplacementText includes __refold_ins__: inv id={0} name='{1}' covA=[{2},{3}) Btok=[{4},{5}) lead='{6}'",
-          m.id, m.name, covLoA, covHiA, bTokStart, bTokEnd, traceClip(lead));
-  }
-
   return replacement.str();
 }
 
@@ -6786,7 +6740,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   if (covLoA >= covHiA)
     return std::nullopt;
 
-  auto bEnv = MapATokRangeAToBTokenEnvelope(covLoA, covHiA);
+  auto bEnv = MapATokRangeAToBTokenEnvelopeTrimEdgeInsertions(covLoA, covHiA);
   if (!bEnv)
     return std::nullopt;
 
@@ -6832,19 +6786,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   // Final check to ensure realignment didn't invert or empty the range.
   if (bTokEnd <= bTokStart)
     return std::nullopt;
-
   StringRef replacement = SliceBSource(bTokStart, bTokEnd).trim();
-
-  // Instrumentation: duplicated insertion failures frequently occur when the
-  // whole-cover replacement slice begins at a boundary pure-insertion in B.
-  // Log these cases with enough context to diagnose the exact envelope.
-  if (containsRefoldIns(replacement)) {
-    StringRef lead = SliceBSource(bTokStart, std::min(bTokStart + 24, bTokEnd));
-    trace("macro/whole",
-          "whole-cover replacement includes __refold_ins__: inv id={0} name='{1}' covA=[{2},{3}) Btok=[{4},{5}) lead='{6}'",
-          m.id, m.name, covLoA, covHiA, bTokStart, bTokEnd, traceClip(lead));
-  }
-
   return MacroPatch{*invStart, *invEnd, replacement.str()};
 }
 
