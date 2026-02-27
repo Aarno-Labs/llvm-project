@@ -485,75 +485,6 @@ static std::vector<CondGroup> scanTopLevelConds(llvm::StringRef Buf,
 // the argument token sequence as *spelled* at the invocation site, not the
 // post-expansion stream. This is the form needed to refold edits back into
 // the original source call text.
-static void computeInvArgRanges(
-    const MacroArgs *Args, const MacroInfo *MI, const SourceManager &SM,
-    const LangOptions &Lang,
-    std::vector<std::pair<std::optional<uint64_t>, std::optional<uint64_t>>>
-        &Out) {
-  Out.clear();
-  if (!Args || !MI || !MI->isFunctionLike())
-    return;
-
-  // Only consider formal parameters. (Varargs beyond getNumParams() are not
-  // represented here unless your producer has an explicit varargs model.)
-  unsigned N = MI->getNumParams();
-  Out.reserve(N);
-
-  for (unsigned ai = 0; ai < N; ++ai) {
-    // Clang stores each argument as a token array terminated by tok::eof.
-    // getUnexpArgument() returns a pointer to that sentinel-terminated array.
-    const Token *AT = Args->getUnexpArgument(ai);
-    if (!AT) {
-      // No token sequence available for this parameter.
-      Out.emplace_back(std::nullopt, std::nullopt);
-      continue;
-    }
-
-    // Identify the first and last *validly located* tokens of this argument.
-    // Some tokens may lack locations; we skip those and only use located tokens
-    // to form the span.
-    bool Have = false;
-    SourceLocation First, Last;
-    for (const Token *T = AT; !T->is(tok::eof); ++T) {
-      SourceLocation TL = T->getLocation();
-      if (!TL.isValid())
-        continue;
-      if (!Have) {
-        First = TL;
-        Have = true;
-      }
-      Last = TL;
-    }
-
-    if (!Have) {
-      // Argument tokens exist, but none had a valid source location.
-      Out.emplace_back(std::nullopt, std::nullopt);
-      continue;
-    }
-
-    // Normalize both endpoints to file locations. This strips macro expansion
-    // indirection and yields locations that can be converted to file offsets.
-    SourceLocation FL = SM.getFileLoc(First);
-    SourceLocation LL = SM.getFileLoc(Last);
-
-    // Compute the end location *after* the last token (exclusive).
-    // We use Lexer helper so that end covers the full token spelling, not just
-    // its beginning.
-    SourceLocation EndL = Lexer::getLocForEndOfToken(LL, 0, SM, Lang);
-    SourceLocation EL = SM.getFileLoc(EndL);
-
-    // Convert to byte offsets within the containing file buffer. These offsets
-    // are used later to slice the original file text for refolding.
-    //
-    // Note: getFileOffset() returns an unsigned; we store as uint64_t via the
-    // optional type in the output vector.
-    auto B = FL.isValid() ? std::optional<unsigned>(SM.getFileOffset(FL))
-                          : std::nullopt;
-    auto E = EL.isValid() ? std::optional<unsigned>(SM.getFileOffset(EL))
-                          : std::nullopt;
-    Out.emplace_back(B, E);
-  }
-}
 
 static std::string computeLangStr(const clang::LangOptions &Lang) {
   // Objective-C family
@@ -645,28 +576,6 @@ std::string joinSpelled(llvm::StringRef DirSpelling, llvm::StringRef Rel) {
 // This is a defensive validation step for producer-side metadata: it catches
 // cases where argument offsets are missing, inverted, or escape the invocation
 // region due to location mapping quirks (macro expansion, CRLF, etc.).
-static bool invArgRangesWithinInvocation(const Item &It) {
-  // If the invocation span itself is unknown, we can't validate containment.
-  if (!It.InvBegin || !It.InvEnd)
-    return false;
-
-  const uint64_t InvBegin = *It.InvBegin;
-  const uint64_t InvEnd = *It.InvEnd;
-
-  for (const auto &R : It.InvArgRanges) {
-    // Individual args may legitimately be absent/unknown; skip those.
-    if (!R.first || !R.second)
-      continue;
-
-    const uint64_t B = *R.first;
-    const uint64_t E = *R.second;
-
-    // Reject inverted spans (B > E) and any span that escapes the invocation.
-    if (B < InvBegin || E > InvEnd || B > E)
-      return false;
-  }
-  return true;
-}
 
 // Parse a macro invocation's spelled text and compute byte-offset ranges for
 // each argument within that invocation.
@@ -1828,22 +1737,24 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
     It.InvText = It.Name; // Emergency fallback to keep schema happy
   }
 
-  // 2. Perform projections and arg ranges on the local 'It'
-  computeInvArgRanges(Args, MI, SM, Lang, It.InvArgRanges);
+  // 2. Compute invocation argument byte ranges (inv_arg_ranges).
+  //
+  // Coordinate system: absolute byte offsets within inv_file (same space as
+  // inv_b/inv_e). To index into inv_text, subtract inv_b (inv_begin).
+  //
+  // We derive argument ranges by lexing the spelled invocation text (inv_text)
+  // with Clang's raw lexer so that commas/parens inside comments, string/char
+  // literals, raw strings, etc. are handled correctly. This yields ranges that
+  // are consistent with inv_text and do not depend on SourceLocation mapping
+  // through nested macro expansions.
+  It.InvArgRanges.clear();
+  if (MI && MI->isFunctionLike()) {
+    const size_t NFormals = MI->getNumParams();
+    It.InvArgRanges.resize(NFormals, {std::nullopt, std::nullopt});
 
-  // For nested macro expansions, argument tokens often point back to the
-  // ultimate expansion site (caller arguments), which can put the recorded
-  // ranges outside of this invocation's spelling text. When that happens,
-  // recompute argument ranges by parsing the recorded invocation text so
-  // that InvText and InvArgRanges are consistent.
-  if (!invArgRangesWithinInvocation(It)) {
-    const bool ParsedOK =
-        It.InvBegin && computeInvArgRangesFromText(
-                           It.InvText, *It.InvBegin, It.InvArgRanges.size(),
-                           PP.getLangOpts(), It.InvArgRanges);
-    if (!ParsedOK) {
-      for (auto &R : It.InvArgRanges)
-        R = {std::nullopt, std::nullopt};
+    if (It.InvBegin) {
+      (void)computeInvArgRangesFromText(It.InvText, *It.InvBegin, NFormals,
+                                       PP.getLangOpts(), It.InvArgRanges);
     }
   }
 
@@ -2819,7 +2730,7 @@ void RefoldMapBuilder::writeJSON() {
   llvm::json::OStream JO(OS, /*Indent=*/2);
 
   JO.object([&] {
-    JO.attribute("version", "2.0");
+    JO.attribute("version", "2.1");
 
     const auto &PPO = PP.getPreprocessorOpts();
     std::string LangStr = computeLangStr(PP.getLangOpts());
