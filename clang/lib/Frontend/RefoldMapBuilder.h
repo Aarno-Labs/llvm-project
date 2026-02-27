@@ -131,6 +131,13 @@ struct Item {
   std::string Text;    // directive text
   std::string InvText; // macro call text
   std::string InvFile; // file containing the macro invocation
+
+  // Call-chain hint: true if this macro's replacement list begins with a
+  // curried head pattern '(ident) (...)'. The consumer uses this to preserve
+  // the final '(...)' suffix group when extending chained call spans without
+  // inspecting replacement text.
+  bool CurriedHead = false;
+
   bool IsBuiltinMacro =
       false;          // true for predefined/builtin macros (e.g. __FILE__)
   SourceLocation Loc; // primary location

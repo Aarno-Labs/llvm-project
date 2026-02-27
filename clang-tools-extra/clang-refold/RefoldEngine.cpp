@@ -121,61 +121,24 @@ Error compareTokens(ArrayRef<PPTok> aToks, ArrayRef<PPTok> bToks) {
 }
 
 uint64_t extendChainedCallEnd(StringRef fileText, uint64_t invEnd,
-                              StringRef replacement) {
+                              StringRef replacement,
+                              bool preserveFinalSuffixGroup) {
   if (invEnd > fileText.size())
     return invEnd;
 
-  // Preserve chained call parens for replacements that still look callable:
+  // Preserve chained call parens for replacements that still look
+  // callable:
   //   * IDENT
   //   * IDENT(...)
-  // In these cases, any trailing "(...)" sequences are likely function-call
-  // suffixes that must remain.
+  // In these cases, any trailing '(...)' sequences are likely
+  // function-call suffixes that must remain.
   if (stringutils::isIdentifierOrSimpleCallExpr(replacement))
     return invEnd;
 
-  // Special-case: "curried" macro bodies that begin with a leading paren-arg
-  // head such as:
-  //   (y) ((x) + (y))
-  // When we whole-cover replace a call chain like:
-  //   GET_MATH(ADD)(10)(20)
-  // the first suffix group ("(10)") is part of invoking the macro name
-  // produced by GET_MATH, but the last group ("(20)") is *not* part of the
-  // macro call chain (it applies to the curried expansion result). In this
-  // scenario, we must consume all but the last suffix group.
-  auto looksLikeCurriedHead = [](StringRef repl) -> bool {
-    auto skipWS = [](StringRef s, size_t i) -> size_t {
-      while (i < s.size() && isspace(static_cast<unsigned char>(s[i])))
-        ++i;
-      return i;
-    };
-    auto isIdent = [](StringRef s) -> bool {
-      if (s.empty())
-        return false;
-      const unsigned char c0 = static_cast<unsigned char>(s.front());
-      if (!(isalpha(c0) || s.front() == '_'))
-        return false;
-      for (char c : s.drop_front()) {
-        const unsigned char uc = static_cast<unsigned char>(c);
-        if (!(isalnum(uc) || c == '_'))
-          return false;
-      }
-      return true;
-    };
-
-    size_t p = skipWS(repl, 0);
-    if (p >= repl.size() || repl[p] != '(')
-      return false;
-    const size_t r = stringutils::findMatchingRParen(repl, p);
-    if (r == StringRef::npos)
-      return false;
-    StringRef inside = repl.slice(p + 1, r).trim();
-    if (!isIdent(inside))
-      return false;
-    size_t after = skipWS(repl, r + 1);
-    if (after >= repl.size() || repl[after] != '(')
-      return false;
-    return true;
-  };
+  // Call-chain suffix consumption is determined structurally. The
+  // producer may provide a hint that the expansion result is
+  // curried/returns-invocable, in which case the final suffix group
+  // is preserved (consumed groups = n-1).
 
   size_t pos =
       stringutils::skipWSAndComments(fileText, static_cast<size_t>(invEnd));
@@ -195,11 +158,83 @@ uint64_t extendChainedCallEnd(StringRef fileText, uint64_t invEnd,
     return invEnd;
 
   size_t consume = groupEnds.size();
-  if (looksLikeCurriedHead(replacement) && consume > 0)
+  if (preserveFinalSuffixGroup && consume > 0)
     consume -= 1;
   return (consume == 0) ? invEnd : groupEnds[consume - 1];
 }
+
 } // namespace
+
+static bool spansAreEmpty(ArrayRef<RefoldModel::PPSpan> spans) {
+  if (spans.empty())
+    return true;
+  for (const auto &sp : spans) {
+    if (sp.begin != sp.end)
+      return false;
+  }
+  return true;
+}
+
+static bool spansEqual(ArrayRef<RefoldModel::PPSpan> a,
+                       ArrayRef<RefoldModel::PPSpan> b) {
+  if (a.size() != b.size())
+    return false;
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (a[i].begin != b[i].begin || a[i].end != b[i].end)
+      return false;
+  }
+  return true;
+}
+
+bool RefoldEngine::EffectiveCurriedHead(
+    const RefoldModel::MacroInvocation &m) const {
+  if (m.curriedHead)
+    return true;
+
+  // If we have no macro graph (should not happen), be conservative.
+  if (macroChildrenById_.empty())
+    return false;
+
+  // Wrapper macros in call chains may have empty spans. We treat those as
+  // transparent while searching for a descendant that actually emits the same
+  // PP-span as the outer invocation.
+  ArrayRef<RefoldModel::PPSpan> rootSpans = m.spans;
+
+  SmallVector<const RefoldModel::MacroInvocation *, 16> stack;
+  DenseSet<uint64_t> visited;
+  visited.insert(m.id);
+
+  auto itRoot = macroChildrenById_.find(m.id);
+  if (itRoot != macroChildrenById_.end()) {
+    for (const auto *child : itRoot->second)
+      stack.push_back(child);
+  }
+
+  while (!stack.empty()) {
+    const RefoldModel::MacroInvocation *cur = stack.pop_back_val();
+    if (!cur)
+      continue;
+    if (!visited.insert(cur->id).second)
+      continue;
+
+    const bool same = spansEqual(cur->spans, rootSpans);
+    if (same && cur->curriedHead)
+      return true;
+
+    // Continue through nodes that are either transparent wrappers (empty span)
+    // or that forward the same emitted span.
+    if (same || spansAreEmpty(cur->spans)) {
+      auto itChild = macroChildrenById_.find(cur->id);
+      if (itChild != macroChildrenById_.end()) {
+        for (const auto *gc : itChild->second)
+          stack.push_back(gc);
+      }
+    }
+  }
+
+  return false;
+}
+
 
 // ========================== Public entry points ==========================
 
@@ -941,7 +976,7 @@ std::string RefoldEngine::Refold() {
         // the replacement.
         if (span->first < span->second) {
           const uint64_t oldEnd = span->second;
-          const uint64_t extEnd = extendChainedCallEnd(tuBytes, oldEnd, repl);
+          const uint64_t extEnd = extendChainedCallEnd(tuBytes, oldEnd, repl, /*preserveFinalSuffixGroup*/ false);
           if (extEnd != oldEnd) {
             debug("edit/tu",
                   "TU extend trailing call/arg chain [{0},{1}) -> [{0},{2})",
@@ -1058,7 +1093,7 @@ std::string RefoldEngine::Refold() {
       // replacement.
       if (span->first < span->second) {
         const uint64_t oldEnd = span->second;
-        const uint64_t extEnd = extendChainedCallEnd(tuBytes, oldEnd, repl);
+        const uint64_t extEnd = extendChainedCallEnd(tuBytes, oldEnd, repl, /*preserveFinalSuffixGroup*/ false);
         if (extEnd != oldEnd) {
           debug("edit/tu",
                 "TU extend trailing call/arg chain [{0},{1}) -> [{0},{2})",
@@ -1258,7 +1293,8 @@ std::string RefoldEngine::Refold() {
     SmallVector<std::pair<uint64_t, uint64_t>, 16> accepted;
     for (const auto &mp : tuMacroPatches) {
       uint64_t mpEnd =
-          extendChainedCallEnd(StringRef(tuBytes), mp.invEnd, mp.replacement);
+          extendChainedCallEnd(StringRef(tuBytes), mp.invEnd, mp.replacement,
+                              mp.preserveFinalSuffixGroup);
       if (mpEnd != mp.invEnd) {
         debug("macro/chain",
               "TU extend chained callsite [{0},{1}) -> [{0},{2})", mp.invStart,
@@ -3983,7 +4019,8 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
 
         trace("macro/args", "  args-only SUCCESS newInv='{0}'",
               stringutils::showWSWithClip(newInv, 200));
-        return MacroPatch{*m.invB, *m.invE, std::move(newInv)};
+        return MacroPatch{*m.invB, *m.invE, std::move(newInv),
+                         EffectiveCurriedHead(m)};
       }
     }
 
@@ -4029,7 +4066,8 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
           stringutils::replaceRange(baseInvText, r.first, r.second, newArg);
       trace("macro/args", "  args-only SUCCESS newInv='{0}'",
             stringutils::showWSWithClip(newInv, 200));
-      return MacroPatch{*m.invB, *m.invE, std::move(newInv)};
+      return MacroPatch{*m.invB, *m.invE, std::move(newInv),
+                       EffectiveCurriedHead(m)};
     }
 
     // If we touched paste but could not safely derive a paste splice patch,
@@ -4227,7 +4265,8 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
                                          replByArgIdx[argIdx]);
   }
 
-  return MacroPatch{*m.invB, *m.invE, std::move(finalInv)};
+  return MacroPatch{*m.invB, *m.invE, std::move(finalInv),
+                   EffectiveCurriedHead(m)};
 }
 
 StringRef RefoldEngine::SliceSource(ArrayRef<size_t> tokOff, StringRef source,
@@ -5401,7 +5440,9 @@ void RefoldEngine::AddForcedCounterPatches(
           m.id, m.name, m.ownerIncludeId, *invStart, *invEnd,
           stringutils::showWSWithClip(*replOpt, 64), req.aStart, req.aEnd);
 
-    byMacroId[patchKey] = MacroPatch{*invStart, *invEnd, std::move(*replOpt)};
+    byMacroId[patchKey] =
+        MacroPatch{*invStart, *invEnd, std::move(*replOpt),
+                  EffectiveCurriedHead(m)};
   }
 }
 
@@ -5445,7 +5486,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         repl = SliceBSource(bEnv->first, bEnv->second).trim().str();
     }
     if (repl)
-      return MacroPatch{*invStart, *invEnd, std::move(*repl)};
+      return MacroPatch{*invStart, *invEnd, std::move(*repl),
+                       EffectiveCurriedHead(m)};
   }
 
   trace("macro/whole",
@@ -6343,7 +6385,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             // phase: consume any trailing "(...)" groups after the root
             // invocation.
             const uint64_t chainEnd =
-                extendChainedCallEnd(fileText, *invEnd, "((x)+1)");
+                extendChainedCallEnd(fileText, *invEnd, "((x)+1)", /*preserveFinalSuffixGroup*/ false);
             if (chainEnd > *invEnd && chainEnd <= (uint64_t)fileText.size()) {
               struct LocalEdit {
                 uint64_t begin; // relative to invStart
@@ -6569,7 +6611,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         // patch is found, the lift is ambiguous => decline and leave macro
         // expanded.
         if (!uniquePatch) {
-          uniquePatch = MacroPatch{*invStart, *invEnd, std::move(replText)};
+          uniquePatch = MacroPatch{*invStart, *invEnd, std::move(replText),
+                                 EffectiveCurriedHead(m)};
           distinctRootPatches = 1;
         } else if (uniquePatch->invStart != *invStart ||
                    uniquePatch->invEnd != *invEnd ||
@@ -6613,7 +6656,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         const uint64_t invEndAbs = *m.invE;
         if (invEndAbs <= n) {
           const uint64_t chainEndAbs =
-              extendChainedCallEnd(invFileText, invEndAbs, StringRef());
+              extendChainedCallEnd(invFileText, invEndAbs, StringRef(), /*preserveFinalSuffixGroup*/ false);
           if (chainEndAbs > invEndAbs) {
             const uint64_t aLen = h.aEnd - h.aStart;
             const uint64_t bLen = h.bEnd - h.bStart;
@@ -6787,7 +6830,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   if (bTokEnd <= bTokStart)
     return std::nullopt;
   StringRef replacement = SliceBSource(bTokStart, bTokEnd).trim();
-  return MacroPatch{*invStart, *invEnd, replacement.str()};
+  return MacroPatch{*invStart, *invEnd, replacement.str(),
+                   EffectiveCurriedHead(m)};
 }
 
 bool RefoldEngine::InvocationSpanMatchesCallsitePrefix(
@@ -6901,7 +6945,8 @@ void RefoldEngine::MaterializeIncludeExpansion(
       it != macroPatchesByOwner.end()) {
     for (const auto &mp : it->second) {
       uint64_t mpEnd =
-          extendChainedCallEnd(StringRef(bytes), mp.invEnd, mp.replacement);
+          extendChainedCallEnd(StringRef(bytes), mp.invEnd, mp.replacement,
+                              mp.preserveFinalSuffixGroup);
       if (mpEnd != mp.invEnd) {
         debug("macro/chain",
               "inc#{0} extend chained callsite [{1},{2}) -> [{1},{3})", inc->id,
