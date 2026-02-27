@@ -147,20 +147,17 @@ inline bool isBetter(unsigned candLen, std::uint64_t candCost, std::uint32_t can
 // when (len,cost) are equal. dpTie prefers matches whose immediate neighbors
 // (prev/next) also match, biasing toward locally consistent alignments without
 // changing optimality under (len,cost).
-inline std::uint32_t matchTiePenalty(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
-                                    size_t ai, size_t bj,
-                                    const llvm::DenseMap<StringRef, unsigned> &freqA,
-                                    const llvm::DenseMap<StringRef, unsigned> &freqB) {
-  const StringRef tok = a[ai];
-  auto itA = freqA.find(tok);
-  auto itB = freqB.find(tok);
-  const unsigned cntA = (itA == freqA.end() ? 0U : itA->second);
-  const unsigned cntB = (itB == freqB.end() ? 0U : itB->second);
-
-  // If the token is unique on at least one side, it anchors well; don't
-  // penalize.
-  if (cntA <= 1U || cntB <= 1U)
-    return 0;
+inline std::uint32_t matchTiePenalty(
+    ArrayRef<StringRef> a, ArrayRef<StringRef> b, size_t ai, size_t bj,
+    const llvm::DenseMap<StringRef, unsigned> & /*freqA*/,
+    const llvm::DenseMap<StringRef, unsigned> & /*freqB*/) {
+  // Deterministic tertiary objective for tie-breaking among solutions with
+  // identical (len,cost): prefer locally coherent alignments.
+  //
+  // Penalize a candidate match when its immediate neighbors disagree. This
+  // biases toward choosing the occurrence that is consistent with surrounding
+  // context, preventing optimal-but-pathological anchors that can absorb
+  // nearby insertions.
 
   std::uint32_t p = 0;
   // Previous token agreement (bigram coherence).
