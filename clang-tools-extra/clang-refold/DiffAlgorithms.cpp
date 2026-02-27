@@ -24,13 +24,13 @@
 // Determinism & Policy
 // --------------------
 //   • All algorithms break ties consistently for stable output across runs.
-//   • Large-input guard: LCS may fall back to a greedy, order-preserving
-//     subsequence when the DP table would exceed a configured cell budget.
+//   • Large-input guard: LCS switches to Hirschberg recursion (exact) when
+//     the full DP table would exceed a configured cell budget.
 //   • Utilities are side-effect free and operate on caller-owned sequences.
 //
 // Complexity
 // ----------
-//   • LCS DP:   time O(N*M), space O(N*M); greedy fallback O(N+M).
+//   • LCS:      time O(N*M); DP uses O(N*M) space, Hirschberg uses O(N+M).
 //   • Myers:    expected time O((N+M)*D), space O(N+M) per frontier snapshot.
 //   • Hunking:  O(N) over the alignment/map.
 //
@@ -83,7 +83,7 @@ bool shouldUseGreedyApproach(unsigned long long n, unsigned long long m,
   if (n >= std::numeric_limits<unsigned long long>::max() - 1ULL ||
       m >= std::numeric_limits<unsigned long long>::max() - 1ULL) {
     warn("lcs/map",
-         "greedy fallback: (n+1) or (m+1) would overflow unsigned long long "
+         "hirschberg fallback: (n+1) or (m+1) would overflow unsigned long long "
          "(n={0}, m={1})",
          n, m);
     return true; // (n+1) or (m+1) would overflow ULL anyway
@@ -96,7 +96,7 @@ bool shouldUseGreedyApproach(unsigned long long n, unsigned long long m,
     if (n1 > maxN1) {
       warn(
           "lcs/map",
-          "greedy fallback: DP cell budget exceeded: (n+1)*(m+1) > maxCells "
+          "hirschberg fallback: DP cell budget exceeded: (n+1)*(m+1) > maxCells "
           "(n={0}, m={1}, n1={2}, m1={3}, maxCells={4}, maxAllowedN1ForM1={5})",
           n, m, n1, m1, maxCells, maxN1);
       return true;
@@ -111,7 +111,7 @@ bool shouldUseGreedyApproach(unsigned long long n, unsigned long long m,
 
       if (cells > cellLimit) {
         warn("lcs/map",
-             "greedy fallback: DP allocation would overflow size_t for "
+             "hirschberg fallback: DP allocation would overflow size_t for "
              "unsigned table "
              "(cells={0} > size_t/sizeof(unsigned)={1}; n={2}, m={3})",
              cells, cellLimit, n, m);
@@ -122,26 +122,6 @@ bool shouldUseGreedyApproach(unsigned long long n, unsigned long long m,
   return false;
 }
 
-std::vector<int64_t> lcsMapABGreedy(ArrayRef<StringRef> a,
-                                ArrayRef<StringRef> b) {
-  const size_t n = a.size(), m = b.size();
-
-  // Greedy order-preserving subsequence scan (linear-time).
-  // If m > MAX, only consider the first MAX elements of b so that
-  // the stored j indices always fit in 'int'.
-  const size_t jlimit = std::min(m, MAX);
-  std::vector<int64_t> map(n, -1);
-  size_t j = 0;
-  for (size_t i = 0; i < n && j < jlimit; ++i) {
-    while (j < jlimit && a[i] != b[j])
-      ++j;
-    if (j < jlimit && a[i] == b[j]) {
-      map[i] = static_cast<int64_t>(j);
-      ++j;
-    }
-  }
-  return map;
-}
 
 inline bool isBetter(unsigned candLen, std::uint64_t candCost, std::uint32_t candTie,
                      unsigned bestLen, std::uint64_t bestCost, std::uint32_t bestTie) {
@@ -191,9 +171,420 @@ inline std::uint32_t matchTiePenalty(ArrayRef<StringRef> a, ArrayRef<StringRef> 
     p += (a[ai + 1] == b[bj + 1]) ? 0U : 1U;
   return p;
 }
+
+// ===================== Hirschberg (exact, linear space) ======================
+
+struct Score {
+  uint32_t len = 0;
+  uint64_t cost = 0;
+  uint32_t tie = 0;
+};
+
+inline Score addScore(const Score &a, const Score &b) {
+  Score out;
+  out.len = a.len + b.len;
+  out.cost = a.cost + b.cost;
+  out.tie = a.tie + b.tie;
+  return out;
+}
+
+inline bool scoreEq(const Score &a, const Score &b) {
+  return a.len == b.len && a.cost == b.cost && a.tie == b.tie;
+}
+
+struct SpanView {
+  ArrayRef<StringRef> base;
+  size_t off = 0;
+  size_t len = 0;
+  bool rev = false;
+
+  size_t size() const { return len; }
+  StringRef at(size_t i) const {
+    return rev ? base[off + (len - 1 - i)] : base[off + i];
+  }
+  size_t absIndex(size_t i) const {
+    return rev ? (off + (len - 1 - i)) : (off + i);
+  }
+};
+
+struct GapView {
+  ArrayRef<uint32_t> base;
+  size_t off = 0;
+  size_t len = 0; // boundaries, so len == A.len + 1 for the corresponding span
+  bool rev = false;
+
+  size_t size() const { return len; }
+  uint32_t at(size_t i) const {
+    return rev ? base[off + (len - 1 - i)] : base[off + i];
+  }
+};
+
+static std::vector<Score>
+computeRowWeighted(const SpanView &aV, const SpanView &bV, const GapView &gapV,
+                   ArrayRef<StringRef> aFull, ArrayRef<StringRef> bFull,
+                   const llvm::DenseMap<StringRef, unsigned> &freqA,
+                   const llvm::DenseMap<StringRef, unsigned> &freqB) {
+  const size_t n = aV.size();
+  const size_t m = bV.size();
+  if (gapV.size() != n + 1)
+    fatal("lcs/map", "internal: gap view length must be A.len+1");
+
+  std::vector<Score> dp(m + 1);
+  std::vector<Score> ndp(m + 1);
+
+  dp[0] = Score{0, 0, 0};
+  // Row 0: only insertions, charged at boundary 0.
+  for (size_t j = 1; j <= m; ++j) {
+    dp[j] = dp[j - 1];
+    dp[j].cost += static_cast<uint64_t>(gapV.at(0));
+  }
+
+  for (size_t i = 1; i <= n; ++i) {
+    // Col 0: only deletions, charged at boundary i.
+    ndp[0] = dp[0];
+    ndp[0].cost += static_cast<uint64_t>(gapV.at(i));
+
+    Score diagPrev = dp[0];
+    for (size_t j = 1; j <= m; ++j) {
+      Score best;
+      best.len = 0;
+      best.cost = std::numeric_limits<uint64_t>::max();
+      best.tie = std::numeric_limits<uint32_t>::max();
+
+      // 1) Match (diag)
+      if (aV.at(i - 1) == bV.at(j - 1)) {
+        Score cand = diagPrev;
+        cand.len += 1U;
+        cand.tie += matchTiePenalty(aFull, bFull, aV.absIndex(i - 1),
+                                    bV.absIndex(j - 1), freqA, freqB);
+        best = cand;
+      }
+
+      // 2) Delete A (from dp[j])
+      {
+        Score cand = dp[j];
+        cand.cost += static_cast<uint64_t>(gapV.at(i));
+        if (isBetter(cand.len, cand.cost, cand.tie, best.len, best.cost,
+                     best.tie)) {
+          best = cand;
+        }
+      }
+
+      // 3) Insert B (from ndp[j-1])
+      {
+        Score cand = ndp[j - 1];
+        cand.cost += static_cast<uint64_t>(gapV.at(i));
+        if (isBetter(cand.len, cand.cost, cand.tie, best.len, best.cost,
+                     best.tie)) {
+          best = cand;
+        }
+      }
+
+      diagPrev = dp[j];
+      ndp[j] = best;
+    }
+
+    dp.swap(ndp);
+  }
+
+  return dp;
+}
+
+static void solveSmallWeightedDP(
+    const SpanView &aV, const SpanView &bV, const GapView &gapV,
+    ArrayRef<StringRef> aFull, ArrayRef<StringRef> bFull,
+    const llvm::DenseMap<StringRef, unsigned> &freqA,
+    const llvm::DenseMap<StringRef, unsigned> &freqB,
+    std::vector<int64_t> &outMap) {
+  const size_t n = aV.size();
+  const size_t m = bV.size();
+  if (gapV.size() != n + 1)
+    fatal("lcs/map", "internal: gap view length must be A.len+1");
+
+  const size_t stride = m + 1;
+  const size_t cells = (n + 1) * (m + 1);
+
+  std::vector<uint32_t> dpLen(cells, 0);
+  std::vector<uint64_t> dpCost(cells, 0);
+  std::vector<uint32_t> dpTie(cells, 0);
+
+  auto idx = [&](size_t i, size_t j) -> size_t { return i * stride + j; };
+  auto len = [&](size_t i, size_t j) -> uint32_t & { return dpLen[idx(i, j)]; };
+  auto cost = [&](size_t i, size_t j) -> uint64_t & { return dpCost[idx(i, j)]; };
+  auto tie = [&](size_t i, size_t j) -> uint32_t & { return dpTie[idx(i, j)]; };
+
+  for (size_t i = 0; i <= n; ++i) {
+    for (size_t j = 0; j <= m; ++j) {
+      if (i == 0 && j == 0)
+        continue;
+
+      uint32_t bestLen = 0;
+      uint64_t bestCost = std::numeric_limits<uint64_t>::max();
+      uint32_t bestTie = std::numeric_limits<uint32_t>::max();
+
+      // Match
+      if (i > 0 && j > 0 && aV.at(i - 1) == bV.at(j - 1)) {
+        bestLen = len(i - 1, j - 1) + 1U;
+        bestCost = cost(i - 1, j - 1);
+        bestTie = tie(i - 1, j - 1) +
+                  matchTiePenalty(aFull, bFull, aV.absIndex(i - 1),
+                                  bV.absIndex(j - 1), freqA, freqB);
+      }
+
+      // Delete A (pay at boundary i)
+      if (i > 0) {
+        const uint32_t candLen = len(i - 1, j);
+        const uint64_t candCost = cost(i - 1, j) + static_cast<uint64_t>(gapV.at(i));
+        const uint32_t candTie = tie(i - 1, j);
+        if (isBetter(candLen, candCost, candTie, bestLen, bestCost, bestTie)) {
+          bestLen = candLen;
+          bestCost = candCost;
+          bestTie = candTie;
+        }
+      }
+
+      // Insert B (pay at boundary i)
+      if (j > 0) {
+        const uint32_t candLen = len(i, j - 1);
+        const uint64_t candCost = cost(i, j - 1) + static_cast<uint64_t>(gapV.at(i));
+        const uint32_t candTie = tie(i, j - 1);
+        if (isBetter(candLen, candCost, candTie, bestLen, bestCost, bestTie)) {
+          bestLen = candLen;
+          bestCost = candCost;
+          bestTie = candTie;
+        }
+      }
+
+      len(i, j) = bestLen;
+      cost(i, j) = bestCost;
+      tie(i, j) = (bestTie == std::numeric_limits<uint32_t>::max()) ? 0U : bestTie;
+    }
+  }
+
+  // Backtrack (diag, then up, then left)
+  size_t i = n;
+  size_t j = m;
+  while (i > 0 || j > 0) {
+    const uint32_t curLen = len(i, j);
+    const uint64_t curCost = cost(i, j);
+    const uint32_t curTie = tie(i, j);
+
+    bool moved = false;
+
+    // Diagonal match
+    if (i > 0 && j > 0 && aV.at(i - 1) == bV.at(j - 1)) {
+      const uint32_t pen = matchTiePenalty(aFull, bFull, aV.absIndex(i - 1),
+                                           bV.absIndex(j - 1), freqA, freqB);
+      if (len(i - 1, j - 1) == curLen - 1U && cost(i - 1, j - 1) == curCost &&
+          tie(i - 1, j - 1) + pen == curTie) {
+        outMap[aV.absIndex(i - 1)] = static_cast<int64_t>(bV.absIndex(j - 1));
+        --i;
+        --j;
+        moved = true;
+      }
+    }
+
+    // Up (delete A)
+    if (!moved && i > 0) {
+      if (len(i - 1, j) == curLen &&
+          cost(i - 1, j) + static_cast<uint64_t>(gapV.at(i)) == curCost &&
+          tie(i - 1, j) == curTie) {
+        --i;
+        moved = true;
+      }
+    }
+
+    // Left (insert B)
+    if (!moved && j > 0) {
+      if (len(i, j - 1) == curLen &&
+          cost(i, j - 1) + static_cast<uint64_t>(gapV.at(i)) == curCost &&
+          tie(i, j - 1) == curTie) {
+        --j;
+        moved = true;
+      }
+    }
+
+    if (!moved)
+      break;
+  }
+}
+
+static void hirschbergWeightedRec(
+    const SpanView &aV, const SpanView &bV, const GapView &gapV,
+    ArrayRef<StringRef> aFull, ArrayRef<StringRef> bFull,
+    const llvm::DenseMap<StringRef, unsigned> &freqA,
+    const llvm::DenseMap<StringRef, unsigned> &freqB,
+    std::vector<int64_t> &outMap) {
+  const size_t n = aV.size();
+  const size_t m = bV.size();
+  if (n == 0 || m == 0)
+    return;
+
+  // Small exact DP base case.
+  const unsigned long long cells =
+      static_cast<unsigned long long>(n + 1ULL) * static_cast<unsigned long long>(m + 1ULL);
+  if (cells <= (1ULL << 20)) {
+    solveSmallWeightedDP(aV, bV, gapV, aFull, bFull, freqA, freqB, outMap);
+    return;
+  }
+
+  const size_t mid = n / 2;
+
+  const SpanView aLeft{aV.base, aV.off, mid, aV.rev};
+  const GapView gapLeft{gapV.base, gapV.off, mid + 1, gapV.rev};
+
+  const SpanView aRight{aV.base, aV.off + mid, n - mid, aV.rev};
+  const GapView gapRight{gapV.base, gapV.off + mid, (n - mid) + 1, gapV.rev};
+
+  const std::vector<Score> leftRow =
+      computeRowWeighted(aLeft, bV, gapLeft, aFull, bFull, freqA, freqB);
+
+  const SpanView aRightRev{aV.base, aV.off + mid, n - mid, true};
+  const GapView gapRightRev{gapV.base, gapV.off + mid, (n - mid) + 1, true};
+  const SpanView bRev{bV.base, bV.off, m, true};
+
+  const std::vector<Score> rightRowRev =
+      computeRowWeighted(aRightRev, bRev, gapRightRev, aFull, bFull, freqA, freqB);
+
+  // Choose split j maximizing combined (len, cost, tie). On exact equality,
+  // prefer the smallest j for determinism.
+  size_t bestJ = 0;
+  Score best = addScore(leftRow[0], rightRowRev[m]);
+  for (size_t j = 1; j <= m; ++j) {
+    Score cand = addScore(leftRow[j], rightRowRev[m - j]);
+    if (isBetter(cand.len, cand.cost, cand.tie, best.len, best.cost, best.tie) ||
+        (scoreEq(cand, best) && j < bestJ)) {
+      bestJ = j;
+      best = cand;
+    }
+  }
+
+  const SpanView bLeft{bV.base, bV.off, bestJ, bV.rev};
+  const SpanView bRight{bV.base, bV.off + bestJ, m - bestJ, bV.rev};
+
+  hirschbergWeightedRec(aLeft, bLeft, gapLeft, aFull, bFull, freqA, freqB, outMap);
+  hirschbergWeightedRec(aRight, bRight, gapRight, aFull, bFull, freqA, freqB, outMap);
+}
+
+static std::vector<int64_t>
+lcsMapABHirschbergWeighted(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
+                           ArrayRef<uint32_t> ownerDepthGap,
+                           const llvm::DenseMap<StringRef, unsigned> &freqA,
+                           const llvm::DenseMap<StringRef, unsigned> &freqB) {
+  std::vector<int64_t> out(a.size(), -1);
+  const SpanView aV{a, 0, a.size(), false};
+  const SpanView bV{b, 0, b.size(), false};
+  const GapView gV{ownerDepthGap, 0, ownerDepthGap.size(), false};
+  hirschbergWeightedRec(aV, bV, gV, a, b, freqA, freqB, out);
+  return out;
+}
+
+// Unweighted Hirschberg (length-only) used for the non-policy overload.
+static std::vector<unsigned> computeRowLen(const SpanView &aV, const SpanView &bV) {
+  const size_t n = aV.size();
+  const size_t m = bV.size();
+  std::vector<unsigned> dp(m + 1, 0);
+  std::vector<unsigned> ndp(m + 1, 0);
+  for (size_t i = 1; i <= n; ++i) {
+    ndp[0] = 0;
+    unsigned diagPrev = 0;
+    for (size_t j = 1; j <= m; ++j) {
+      const unsigned up = dp[j];
+      const unsigned left = ndp[j - 1];
+      const unsigned diag = diagPrev;
+      diagPrev = dp[j];
+      if (aV.at(i - 1) == bV.at(j - 1))
+        ndp[j] = diag + 1U;
+      else
+        ndp[j] = (up >= left) ? up : left;
+    }
+    dp.swap(ndp);
+  }
+  return dp;
+}
+
+static void solveSmallUnweightedDP(const SpanView &aV, const SpanView &bV,
+                                  std::vector<int64_t> &outMap) {
+  const size_t n = aV.size();
+  const size_t m = bV.size();
+  const size_t stride = m + 1;
+  const size_t cells = (n + 1) * (m + 1);
+  std::vector<unsigned> dp(cells, 0);
+  auto DP = [&](size_t i, size_t j) -> unsigned & { return dp[i * stride + j]; };
+
+  for (size_t i = n; i-- > 0;) {
+    for (size_t j = m; j-- > 0;) {
+      DP(i, j) = (aV.at(i) == bV.at(j)) ? DP(i + 1, j + 1) + 1U
+                                        : std::max(DP(i + 1, j), DP(i, j + 1));
+    }
+  }
+
+  size_t i = 0, j = 0;
+  while (i < n && j < m) {
+    if (aV.at(i) == bV.at(j)) {
+      outMap[aV.absIndex(i)] = static_cast<int64_t>(bV.absIndex(j));
+      ++i;
+      ++j;
+    } else if (DP(i + 1, j) >= DP(i, j + 1)) {
+      ++i;
+    } else {
+      ++j;
+    }
+  }
+}
+
+static void hirschbergUnweightedRec(const SpanView &aV, const SpanView &bV,
+                                   std::vector<int64_t> &outMap) {
+  const size_t n = aV.size();
+  const size_t m = bV.size();
+  if (n == 0 || m == 0)
+    return;
+
+  const unsigned long long cells =
+      static_cast<unsigned long long>(n + 1ULL) * static_cast<unsigned long long>(m + 1ULL);
+  if (cells <= (1ULL << 20)) {
+    solveSmallUnweightedDP(aV, bV, outMap);
+    return;
+  }
+
+  const size_t mid = n / 2;
+  const SpanView aLeft{aV.base, aV.off, mid, aV.rev};
+  const SpanView aRight{aV.base, aV.off + mid, n - mid, aV.rev};
+
+  const std::vector<unsigned> leftRow = computeRowLen(aLeft, bV);
+  const SpanView aRightRev{aV.base, aV.off + mid, n - mid, true};
+  const SpanView bRev{bV.base, bV.off, m, true};
+  const std::vector<unsigned> rightRowRev = computeRowLen(aRightRev, bRev);
+
+  size_t bestJ = 0;
+  unsigned bestLen = leftRow[0] + rightRowRev[m];
+  for (size_t j = 1; j <= m; ++j) {
+    const unsigned candLen = leftRow[j] + rightRowRev[m - j];
+    if (candLen > bestLen || (candLen == bestLen && j < bestJ)) {
+      bestLen = candLen;
+      bestJ = j;
+    }
+  }
+
+  const SpanView bLeft{bV.base, bV.off, bestJ, bV.rev};
+  const SpanView bRight{bV.base, bV.off + bestJ, m - bestJ, bV.rev};
+
+  hirschbergUnweightedRec(aLeft, bLeft, outMap);
+  hirschbergUnweightedRec(aRight, bRight, outMap);
+}
+
+static std::vector<int64_t> lcsMapABHirschberg(ArrayRef<StringRef> a,
+                                              ArrayRef<StringRef> b) {
+  std::vector<int64_t> out(a.size(), -1);
+  const SpanView aV{a, 0, a.size(), false};
+  const SpanView bV{b, 0, b.size(), false};
+  hirschbergUnweightedRec(aV, bV, out);
+  return out;
+}
+
 } // namespace
 
-// ================== Weighted LCS (DP with greedy fallback) ===================
+// ================ Weighted LCS (DP with Hirschberg fallback) =================
 
 std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a,
                           ArrayRef<StringRef> b,
@@ -209,24 +600,32 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a,
   if (m == 0)
     return std::vector<int64_t>(n, -1);
 
-  // 1) If b is too large to store j in 'int' safely, prefer greedy.
-  bool useGreedy = (m > MAX);
-
-  // 2) Overflow-safe DP cell budget guard + allocation guards.
-  const unsigned long long nu = static_cast<unsigned long long>(n);
-  const unsigned long long mu = static_cast<unsigned long long>(m);
-  if (!useGreedy) {
-    useGreedy = shouldUseGreedyApproach(nu, mu, maxCells);
-  }
-
-  if (useGreedy) {
-    return lcsMapABGreedy(a, b);
-  }
-
   // Validate ownerDepthGap shape
   if (ownerDepthGap.size() != n + 1) {
     fatal("lcs/map", "ownerDepthGap length must be A.size() + 1");
   }
+
+  // Indices are stored in int64_t; extremely large B streams are not representable.
+  if (m > MAX)
+    fatal("lcs/map", "B.size() exceeds int64_t index range");
+
+  // Build frequency maps once per call for ambiguity detection (also used by Hirschberg).
+  llvm::DenseMap<StringRef, unsigned> freqA;
+  llvm::DenseMap<StringRef, unsigned> freqB;
+  freqA.reserve(a.size());
+  freqB.reserve(b.size());
+  for (StringRef t : a)
+    ++freqA[t];
+  for (StringRef t : b)
+    ++freqB[t];
+
+  // DP table guard: if the full (n+1)*(m+1) table is too large, use Hirschberg
+  // to remain exact while using only O(n+m) memory.
+  const unsigned long long nu = static_cast<unsigned long long>(n);
+  const unsigned long long mu = static_cast<unsigned long long>(m);
+  const bool useHirschberg = shouldUseGreedyApproach(nu, mu, maxCells);
+  if (useHirschberg)
+    return lcsMapABHirschbergWeighted(a, b, ownerDepthGap, freqA, freqB);
 
   // ---------------- DP path: (n+1) x (m+1) tables, row-major -----------------
   // dpLen(i,j)  = max LCS length for A[0..i) vs B[0..j)
@@ -244,16 +643,6 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a,
   // Using uint64_t for cost to prevent overflow during accumulation
   std::vector<uint64_t> dpCost(cells, 0);
   std::vector<uint32_t> dpTie(cells, 0);
-
-  // Build frequency maps once per call for ambiguity detection.
-  llvm::DenseMap<StringRef, unsigned> freqA;
-  llvm::DenseMap<StringRef, unsigned> freqB;
-  freqA.reserve(a.size());
-  freqB.reserve(b.size());
-  for (StringRef t : a)
-    ++freqA[t];
-  for (StringRef t : b)
-    ++freqB[t];
 
   auto idx = [&](size_t i, size_t j) -> size_t {
     return i * stride + j;
@@ -372,7 +761,7 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a,
   return map;
 }
 
-// ====================== LCS (DP with greedy fallback) =======================
+// ==================== LCS (DP with Hirschberg fallback) ======================
 
 [[maybe_unused]]
 std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
@@ -385,33 +774,23 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
   if (m == 0)
     return std::vector<int64_t>(n, -1);
 
-  // Decide whether to use the greedy subsequence fallback.
-  bool useGreedy = false;
-
-  // 1) If b is too large to store j in 'int' safely, prefer greedy.
+  // Indices are stored in int64_t; extremely large B streams are not representable.
   if (m > MAX)
-    useGreedy = true;
+    fatal("lcs/map", "B.size() exceeds int64_t index range");
 
-  // 2) Overflow-safe DP cell budget guard.
+  // DP table guard: if the full table is too large, use Hirschberg (exact, linear space).
   const unsigned long long nu = static_cast<unsigned long long>(n);
   const unsigned long long mu = static_cast<unsigned long long>(m);
-
-  if (!useGreedy) {
-    useGreedy = shouldUseGreedyApproach(nu, mu, maxCells);
-  }
-
-  if (useGreedy) {
-    return lcsMapABGreedy(a, b);
-  }
+  const bool useHirschberg = shouldUseGreedyApproach(nu, mu, maxCells);
+  if (useHirschberg)
+    return lcsMapABHirschberg(a, b);
 
   // ----------------- DP path: (n+1) x (m+1) table, row-major -----------------
   const size_t stride = m + 1;
   const size_t cells = (n + 1) * (m + 1);
   std::vector<unsigned> dp(cells, 0);
 
-  auto DP = [&](size_t i, size_t j) -> unsigned & {
-    return dp[i * stride + j];
-  };
+  auto DP = [&](size_t i, size_t j) -> unsigned & { return dp[i * stride + j]; };
 
   // DP(i,j) = LCS length of a[i:] vs b[j:]
   for (size_t i = n; i-- > 0;) {
