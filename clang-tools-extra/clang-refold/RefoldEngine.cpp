@@ -270,6 +270,147 @@ void RefoldEngine::RequestEscalation(StringRef phase, StringRef detail) const {
   debug("escalate", "REQUEST escalation: {0}: {1}", phase, detail);
 }
 
+void RefoldEngine::BuildBInsertionProvenance(ArrayRef<diffutils::Hunk> hunks) {
+  bInsertions_.clear();
+  bTokToInsertionId_.assign(bToks_.size(), -1);
+  hunkToInsertionId_.assign(hunks.size(), -1);
+
+  for (size_t hi = 0; hi < hunks.size(); ++hi) {
+    const auto &h = hunks[hi];
+    const bool isIns = (h.aStart == h.aEnd) && (h.bStart < h.bEnd);
+    if (!isIns)
+      continue;
+
+    const size_t b0 = static_cast<size_t>(h.bStart);
+    const size_t b1 = static_cast<size_t>(h.bEnd);
+    if (b1 > bToks_.size()) {
+      fatal("prov/ins", "insertion hunk out of B bounds: hunk#{0} b=[{1},{2}) bToks={3}",
+            hi, b0, b1, bToks_.size());
+    }
+
+    const size_t insId = bInsertions_.size();
+    BInsertionProv ins;
+    ins.aGap = h.aStart;
+    ins.hunkIndex = hi;
+    ins.b0 = b0;
+    ins.b1 = b1;
+    bInsertions_.push_back(ins);
+    hunkToInsertionId_[hi] = static_cast<int32_t>(insId);
+
+    for (size_t bj = b0; bj < b1; ++bj) {
+      if (bTokToInsertionId_[bj] != -1) {
+        fatal("prov/ins",
+              "overlapping insertion hunks at B tok {0}: existingIns={1} newIns={2}",
+              bj, bTokToInsertionId_[bj], static_cast<int32_t>(insId));
+      }
+      bTokToInsertionId_[bj] = static_cast<int32_t>(insId);
+    }
+  }
+}
+
+void RefoldEngine::ClaimBInsertion(size_t insId, BInsertionClaim c,
+                                  llvm::StringRef why) {
+  if (insId >= bInsertions_.size())
+    return;
+  BInsertionProv &ins = bInsertions_[insId];
+  if (ins.claim == BInsertionClaim::Unclaimed) {
+    ins.claim = c;
+    trace("prov/claim", "claim ins#{0} hunk#{1} AGap={2} B=[{3},{4}) kind={5} why={6}",
+          insId, ins.hunkIndex, ins.aGap, ins.b0, ins.b1,
+          static_cast<unsigned>(c), why);
+    return;
+  }
+  if (ins.claim != c) {
+    fatal("prov/claim",
+          "double-claim insertion ins#{0} hunk#{1} AGap={2} B=[{3},{4}) existing={5} new={6} why={7}",
+          insId, ins.hunkIndex, ins.aGap, ins.b0, ins.b1,
+          static_cast<unsigned>(ins.claim), static_cast<unsigned>(c), why);
+  }
+}
+
+void RefoldEngine::PreclaimStandaloneInsertions(StringRef tuPath,
+                                                ArrayRef<diffutils::Hunk> hunks) {
+  if (bInsertions_.empty())
+    return;
+
+  for (size_t hi = 0; hi < hunks.size(); ++hi) {
+    int32_t insIdI32 = (hi < hunkToInsertionId_.size()) ? hunkToInsertionId_[hi]
+                                                       : -1;
+    if (insIdI32 < 0)
+      continue;
+
+    const auto &h = hunks[hi];
+
+    // Macro call-sites have priority; if this insertion lies within a patchable
+    // macro's cover, leave it unclaimed so the macro patch may absorb it.
+    Owner owner = ClassifyOwnerWithSegments(tuPath, h);
+    if (auto *m =
+            SmallestCoveringPatchableMacro(h.aStart, h.aEnd, owner.includeId)) {
+      if (m->invB && m->invE)
+        continue;
+    }
+
+    ClaimBInsertion(static_cast<size_t>(insIdI32), BInsertionClaim::Standalone,
+                   llvm::formatv("preclaim hunk#{0}", hi).str());
+  }
+}
+
+llvm::SmallVector<std::pair<size_t, size_t>, 4>
+RefoldEngine::ClipBTokenRangeAgainstClaims(size_t bTokStart,
+                                          size_t bTokEnd) const {
+  llvm::SmallVector<std::pair<size_t, size_t>, 4> segs;
+  if (bTokEnd <= bTokStart)
+    return segs;
+
+  const size_t bMax = bToks_.size();
+  bTokStart = std::min(bTokStart, bMax);
+  bTokEnd = std::min(bTokEnd, bMax);
+
+  size_t i = bTokStart;
+  while (i < bTokEnd) {
+    int32_t insIdI32 = (i < bTokToInsertionId_.size()) ? bTokToInsertionId_[i]
+                                                      : -1;
+    if (insIdI32 >= 0) {
+      const BInsertionProv &ins = bInsertions_[static_cast<size_t>(insIdI32)];
+      if (ins.claim == BInsertionClaim::Standalone) {
+        i = std::min(bTokEnd, ins.b1);
+        continue;
+      }
+    }
+
+    const size_t segStart = i;
+    ++i;
+    while (i < bTokEnd) {
+      int32_t nextId = (i < bTokToInsertionId_.size()) ? bTokToInsertionId_[i]
+                                                      : -1;
+      if (nextId >= 0) {
+        const BInsertionProv &ins = bInsertions_[static_cast<size_t>(nextId)];
+        if (ins.claim == BInsertionClaim::Standalone)
+          break;
+      }
+      ++i;
+    }
+    if (segStart < i)
+      segs.push_back({segStart, i});
+  }
+
+  return segs;
+}
+
+std::string RefoldEngine::SliceBSourceClippedAgainstClaims(size_t bTokStart,
+                                                          size_t bTokEnd) const {
+  auto segs = ClipBTokenRangeAgainstClaims(bTokStart, bTokEnd);
+  if (segs.empty())
+    return std::string();
+
+  std::string out;
+  for (const auto &s : segs) {
+    StringRef frag = SliceBSource(s.first, s.second);
+    out.append(frag.begin(), frag.end());
+  }
+  return out;
+}
+
 std::string RefoldEngine::Refold() {
   // Multi-tier escalation ladder: retry refolding under increasingly
   // conservative (more-expanded) policies before falling back to emitting B.
@@ -660,6 +801,13 @@ std::string RefoldEngine::RefoldOnce() {
 
   // Cache the token-level hunks for boundary-aware envelope mapping.
   abTokHunks_ = hunks;
+
+  // Build provenance for token-level pure insertions (B-only hunks) and
+  // pre-claim standalone insertions before macro patching so whole-cover
+  // replacements can deterministically avoid double-emitting insertion
+  // payloads.
+  BuildBInsertionProvenance(hunks);
+  PreclaimStandaloneInsertions(tuPath, hunks);
 
   // Build *raw-text* byte hunks once; this enables deterministic mapping of PP
   // byte spans from A->B, without inheriting any ambiguity from token-level
@@ -5385,7 +5533,7 @@ RefoldEngine::BuildWholeCoverReplacementText(
   if (covLoA >= covHiA)
     return std::nullopt;
 
-  auto bEnv = MapATokRangeAToBTokenEnvelopeTrimEdgeInsertions(covLoA, covHiA);
+  auto bEnv = MapATokRangeAToBTokenEnvelope(covLoA, covHiA);
   if (!bEnv)
     return std::nullopt;
 
@@ -5420,8 +5568,8 @@ RefoldEngine::BuildWholeCoverReplacementText(
 
   if (bTokEnd <= bTokStart)
     return std::nullopt;
-  StringRef replacement = SliceBSource(bTokStart, bTokEnd).trim();
-  return replacement.str();
+  std::string clipped = SliceBSourceClippedAgainstClaims(bTokStart, bTokEnd);
+  return StringRef(clipped).trim().str();
 }
 
 void RefoldEngine::AddForcedCounterPatches(
@@ -6834,7 +6982,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   if (covLoA >= covHiA)
     return std::nullopt;
 
-  auto bEnv = MapATokRangeAToBTokenEnvelopeTrimEdgeInsertions(covLoA, covHiA);
+  auto bEnv = MapATokRangeAToBTokenEnvelope(covLoA, covHiA);
   if (!bEnv)
     return std::nullopt;
 
@@ -6880,8 +7028,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   // Final check to ensure realignment didn't invert or empty the range.
   if (bTokEnd <= bTokStart)
     return std::nullopt;
-  StringRef replacement = SliceBSource(bTokStart, bTokEnd).trim();
-  return MacroPatch{*invStart, *invEnd, replacement.str(),
+  std::string clipped = SliceBSourceClippedAgainstClaims(bTokStart, bTokEnd);
+  return MacroPatch{*invStart, *invEnd, StringRef(clipped).trim().str(),
                    EffectiveCurriedHead(m)};
 }
 
