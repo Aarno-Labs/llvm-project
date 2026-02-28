@@ -62,6 +62,7 @@
 #include "RefoldEngine.h"
 #include "RefoldSchema.h"
 #include "StringUtils.h"
+#include "DiffAlgorithms.h"
 
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/DiagnosticOptions.h"
@@ -496,6 +497,173 @@ Expected<std::string> preprocessToBytes(StringRef inputPath, const PPCtx &ctx) {
   return out;
 }
 
+static bool isLineDirectiveSensitiveBuiltin(StringRef name) {
+  return name == "__LINE__" || name == "__FILE__" ||
+         name == "__FILE_NAME__" || name == "__BASE_FILE__";
+}
+
+static bool canIgnoreNoLinesMismatch(const PPTok &aTok, const PPTok &bTok) {
+  if (aTok.kind != bTok.kind)
+    return false;
+  return aTok.kind == "numeric_constant" || aTok.kind == "string_literal" ||
+         aTok.kind == "header_name";
+}
+
+static Expected<std::string> parseSourcePath(const json::Object &rootJson) {
+  auto s = rootJson.getString("source");
+  if (!s || s->empty())
+    return createStringError(inconvertibleErrorCode(),
+                             "refold map missing required 'source' path");
+  return s->str();
+}
+
+// In --check + --no-lines mode, allow token mismatches for *unmodified* tokens
+// that originate from line-directive-sensitive predefined macros such as
+// __LINE__/__FILE__/__FILE_NAME__/__BASE_FILE__.
+//
+// We identify these tokens structurally:
+//   1) Preprocess the original TU from refold-map 'source' under pp_ctx.
+//   2) Mark A-token indices covered by macro items whose name is one of the
+//      sensitive builtins above.
+//   3) Diff original A tokens to edited B tokens and mark the corresponding B
+//      indices only for those tokens that remain unchanged (EQUAL steps).
+static Expected<std::vector<uint8_t>>
+buildNoLinesIgnoreMask(const json::Object &rootJson, const PPCtx &ctx,
+                       ArrayRef<PPTok> bPPToks) {
+  auto sourceOrErr = parseSourcePath(rootJson);
+  if (!sourceOrErr)
+    return sourceOrErr.takeError();
+
+  auto ppOrErr = preprocessToBytes(*sourceOrErr, ctx);
+  if (!ppOrErr)
+    return ppOrErr.takeError();
+  std::string a0Bytes = std::move(*ppOrErr);
+
+  std::vector<PPTok> a0Toks;
+  std::vector<std::size_t> a0Off;
+  lexPPTokens(a0Bytes, a0Toks, a0Off);
+
+  std::vector<uint8_t> a0Sensitive(a0Toks.size(), 0);
+  if (auto items = rootJson.getArray("items")) {
+    for (const auto &it : *items) {
+      const auto *obj = it.getAsObject();
+      if (!obj)
+        continue;
+      auto kind = obj->getString("kind");
+      if (!kind || *kind != "macro")
+        continue;
+      auto name = obj->getString("name");
+      if (!name || !isLineDirectiveSensitiveBuiltin(*name))
+        continue;
+      auto *spansVal = obj->get("spans");
+      if (!spansVal)
+        continue;
+      auto spansOrErr = parsePPSpans(*spansVal, "no-lines.items.macro.spans");
+      if (!spansOrErr)
+        return spansOrErr.takeError();
+      for (const auto &sp : *spansOrErr) {
+        uint64_t bb = sp.begin;
+        uint64_t ee = sp.end;
+        if (ee < bb)
+          continue;
+        if (bb > a0Sensitive.size())
+          continue;
+        ee = std::min<uint64_t>(ee, a0Sensitive.size());
+        for (uint64_t i = bb; i < ee; ++i)
+          a0Sensitive[static_cast<size_t>(i)] = 1;
+      }
+    }
+  }
+
+  SmallVector<StringRef, 0> aSeq;
+  SmallVector<StringRef, 0> bSeq;
+  aSeq.reserve(a0Toks.size());
+  bSeq.reserve(bPPToks.size());
+  for (const auto &t : a0Toks)
+    aSeq.push_back(StringRef(t.spelling));
+  for (const auto &t : bPPToks)
+    bSeq.push_back(StringRef(t.spelling));
+
+  std::vector<uint8_t> ignore(bPPToks.size(), 0);
+  auto steps = diffutils::diff(aSeq, bSeq);
+  for (const auto &st : steps) {
+    if (st.op != diffutils::Op::Equal)
+      continue;
+    const uint64_t len = st.aHi - st.aLo;
+    for (uint64_t k = 0; k < len; ++k) {
+      const uint64_t ai = st.aLo + k;
+      const uint64_t bi = st.bLo + k;
+      if (ai < a0Sensitive.size() && bi < ignore.size() && a0Sensitive[ai])
+        ignore[bi] = 1;
+    }
+  }
+  return ignore;
+}
+
+static Error compareTokens(ArrayRef<PPTok> aToks, ArrayRef<PPTok> bToks) {
+  // Compare token spellings up to the min length first.
+  const size_t n = std::min(aToks.size(), bToks.size());
+  for (size_t i = 0; i < n; ++i) {
+    const std::string aDbg = stringutils::showWS(
+        stringutils::clip(StringRef(aToks[i].spelling), 100));
+    const std::string bDbg = stringutils::showWS(
+        stringutils::clip(StringRef(bToks[i].spelling), 180));
+    if (aToks[i].spelling != bToks[i].spelling) {
+      return createStringError(
+          inconvertibleErrorCode(),
+          formatv("token mismatch at index {0}: A='{1}' B='{2}'", i, aDbg, bDbg)
+              .str());
+    }
+    debug("compare", "token match at index {0}: A='{1}' B='{2}'", i, aDbg,
+          bDbg);
+  }
+
+  if (aToks.size() != bToks.size()) {
+    return createStringError(
+        inconvertibleErrorCode(),
+        formatv("token count mismatch: A={0} B={1}", aToks.size(), bToks.size())
+            .str());
+  }
+  return Error::success();
+}
+
+static Error compareTokensNoLinesAware(ArrayRef<PPTok> aToks,
+                                      ArrayRef<PPTok> bToks,
+                                      ArrayRef<uint8_t> ignoreMask) {
+  const size_t n = std::min(aToks.size(), bToks.size());
+  for (size_t i = 0; i < n; ++i) {
+    if (aToks[i].spelling == bToks[i].spelling)
+      continue;
+    const bool ign = (i < ignoreMask.size()) && ignoreMask[i] &&
+                     canIgnoreNoLinesMismatch(aToks[i], bToks[i]);
+    if (ign) {
+      debug("compare",
+            "--no-lines: ignoring builtin loc macro mismatch at index {0}: A='{1}' B='{2}'",
+            i,
+            stringutils::showWS(
+                stringutils::clip(StringRef(aToks[i].spelling), 100)),
+            stringutils::showWS(
+                stringutils::clip(StringRef(bToks[i].spelling), 180)));
+      continue;
+    }
+    const std::string aDbg = stringutils::showWS(
+        stringutils::clip(StringRef(aToks[i].spelling), 100));
+    const std::string bDbg = stringutils::showWS(
+        stringutils::clip(StringRef(bToks[i].spelling), 180));
+    return createStringError(
+        inconvertibleErrorCode(),
+        formatv("token mismatch at index {0}: A='{1}' B='{2}'", i, aDbg, bDbg)
+            .str());
+  }
+  if (aToks.size() != bToks.size()) {
+    return createStringError(
+        inconvertibleErrorCode(),
+        formatv("token count mismatch: A={0} B={1}", aToks.size(), bToks.size())
+            .str());
+  }
+  return Error::success();
+}
+
 } // end anonymous namespace
 
 // ------------------------- Command-Line Options ------------------------------
@@ -676,6 +844,7 @@ int main(int argc, char **argv) {
 
   // Read files and tokenize.
   std::string aBytes, bBytes;
+  std::optional<PPCtx> checkCtx;
   if (onlyCheck) {
     auto ctxOrErr = parsePPCtx(rootJson);
     if (!ctxOrErr) {
@@ -684,6 +853,7 @@ int main(int argc, char **argv) {
               e.message());
       });
     }
+    checkCtx = *ctxOrErr;
 
     // Preprocess the refolded C source:
     {
@@ -728,6 +898,27 @@ int main(int argc, char **argv) {
       aTokByteOff.push_back(aBytes.size());
   }
 
+  if (onlyCheck && NoLines) {
+    // Relax token comparison for location-sensitive predefined macros when
+    // verifying a refolding produced with --no-lines.
+    if (!checkCtx)
+      fatal("cli", "internal error: missing pp_ctx in --check mode");
+    auto maskOrErr = buildNoLinesIgnoreMask(rootJson, *checkCtx, bToks);
+    if (!maskOrErr) {
+      handleAllErrors(maskOrErr.takeError(), [&](const ErrorInfoBase &e) {
+        fatal("check", "failed to build --no-lines ignore mask: {0}",
+              e.message());
+      });
+    }
+    if (Error err = compareTokensNoLinesAware(aToks, bToks, *maskOrErr)) {
+      outs() << toString(std::move(err)) << "\n";
+      outs() << "FAILURE!\n";
+      return 1;
+    }
+    outs() << "SUCCESS!\n";
+    return 0;
+  }
+
   if (!onlyCheck && Harden) {
     // Harden mode:
     //   refold -> preprocess/compare -> (retry at higher tiers) -> success
@@ -758,6 +949,18 @@ int main(int argc, char **argv) {
     if (bPPTokOff.empty() || bPPTokOff.back() != bPPBytes.size()) {
       if (bPPTokOff.empty() || bPPTokOff.back() < bPPBytes.size())
         bPPTokOff.push_back(bPPBytes.size());
+    }
+
+    std::vector<uint8_t> noLinesIgnoreMask;
+    if (NoLines) {
+      auto maskOrErr = buildNoLinesIgnoreMask(rootJson, *ctxOrErr, bPPToks);
+      if (!maskOrErr) {
+        handleAllErrors(maskOrErr.takeError(), [&](const ErrorInfoBase &e) {
+          fatal("harden", "failed to build --no-lines ignore mask: {0}",
+                e.message());
+        });
+      }
+      noLinesIgnoreMask = std::move(*maskOrErr);
     }
 
     auto writeTextFile = [&](StringRef path, StringRef text) {
@@ -795,14 +998,11 @@ int main(int argc, char **argv) {
       }
 
       // Use the shared compareTokens implementation via RefoldEngine's
-      // onlyCheck path.
-      auto chkOrErr = RefoldEngine::Refold(
-          rootJson, outPP, outPPToks, outPPOff, bPPBytes, bPPToks, bPPTokOff,
-          /*onlyCheck=*/true, /*noLines=*/NoLines, /*strict=*/StrictMode,
-          /*startEscalationTier=*/0);
-      if (!chkOrErr)
-        return chkOrErr.takeError();
-      return Error::success();
+      // verification logic.
+      if (NoLines) {
+        return compareTokensNoLinesAware(outPPToks, bPPToks, noLinesIgnoreMask);
+      }
+      return compareTokens(outPPToks, bPPToks);
     };
 
     // Try increasingly conservative refold tiers.
@@ -812,7 +1012,7 @@ int main(int argc, char **argv) {
       info("harden", "attempt tier={0}", startTier);
       auto refoldedOrErr = RefoldEngine::Refold(
           rootJson, aBytes, aToks, aTokByteOff, bBytes, bToks, bTokByteOff,
-          /*onlyCheck=*/false, /*noLines=*/NoLines, /*strict=*/StrictMode,
+          /*noLines=*/NoLines, /*strict=*/StrictMode,
           /*startEscalationTier=*/startTier);
       if (!refoldedOrErr) {
         handleAllErrors(refoldedOrErr.takeError(), [&](const ErrorInfoBase &e) {
@@ -848,22 +1048,22 @@ int main(int argc, char **argv) {
     return 0;
   }
 
-  // Default behavior: single refold (or token check in --check mode).
-  auto refoldedOrErr = RefoldEngine::Refold(
-      rootJson, aBytes, aToks, aTokByteOff, bBytes, bToks, bTokByteOff,
-      onlyCheck, NoLines, StrictMode, /*startEscalationTier=*/0);
   if (onlyCheck) {
-    // We are only verifying that a refolding is correct, so print the response
-    // and return an appropriate exit code.
-    if (!refoldedOrErr) {
-      std::string msg = toString(refoldedOrErr.takeError());
-      outs() << msg << "\n";
+    // Verification mode (normal comparison): compare preprocessed token
+    // streams directly. The --no-lines special-case is handled above.
+    if (Error err = compareTokens(aToks, bToks)) {
+      outs() << toString(std::move(err)) << "\n";
       outs() << "FAILURE!\n";
       return 1;
     }
     outs() << "SUCCESS!\n";
     return 0;
   }
+
+  // Default behavior: single refold.
+  auto refoldedOrErr = RefoldEngine::Refold(
+      rootJson, aBytes, aToks, aTokByteOff, bBytes, bToks, bTokByteOff,
+      NoLines, StrictMode, /*startEscalationTier=*/0);
   if (!refoldedOrErr) {
     handleAllErrors(refoldedOrErr.takeError(), [&](const ErrorInfoBase &e) {
       fatal("model", "failed to parse refold model: {0}", e.message());

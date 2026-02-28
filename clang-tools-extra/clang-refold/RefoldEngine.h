@@ -82,6 +82,7 @@ struct PPTok {
   std::string spelling;
 };
 
+
 /// \brief Deterministic refolder that projects edits made to raw preprocessed
 /// C back onto the original translation unit (TU) without re-running the
 /// preprocessor.
@@ -194,15 +195,13 @@ public:
   /// \param bSource    Edited preprocessed text B (e.g., `test.c.i.mod`).
   /// \param bToks      Tokens of B.
   /// \param bTokOff    Byte offsets for B tokens (size = |B| + 1).
-  /// \param onlyCheck  If true, then we should only verify that \c aToks and
-  ///                   \c bToks align.
   /// \param noLines    If true, then do not inject #line.
   /// \param strict     If true, then make stringified args significant.
   /// \returns          The refolded, partially expanded C source.
   static Expected<std::string>
   Refold(const json::Object &rootJson, StringRef aSource, ArrayRef<PPTok> aToks,
          ArrayRef<size_t> aTokOff, StringRef bSource, ArrayRef<PPTok> bToks,
-         ArrayRef<size_t> bTokOff, bool onlyCheck, bool noLines, bool strict,
+         ArrayRef<size_t> bTokOff, bool noLines, bool strict,
          unsigned startEscalationTier = 0);
 
 private:

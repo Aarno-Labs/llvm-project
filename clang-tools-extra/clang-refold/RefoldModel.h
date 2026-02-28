@@ -662,6 +662,14 @@ private:
   BuildSegmentsForFile(StringRef file, ArrayRef<const Slot *> fileSlots) const;
 };
 
+
+// Parse an array of PPSpan objects from JSON. This is a small public wrapper
+// over RefoldModel's internal span parsing logic, used by the driver for
+// ancillary checks (e.g., --check + --no-lines ignore masks).
+llvm::Expected<std::vector<RefoldModel::PPSpan>>
+parsePPSpans(const llvm::json::Value &val, llvm::StringRef ctx);
+
+
 } // namespace refold
 } // namespace clang
 

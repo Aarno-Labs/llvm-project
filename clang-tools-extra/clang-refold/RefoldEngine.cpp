@@ -91,34 +91,6 @@ inline std::string traceClip(llvm::StringRef s, size_t maxBytes = 220) {
   return stringutils::showWS(stringutils::clip(s, maxBytes));
 }
 
-Error compareTokens(ArrayRef<PPTok> aToks, ArrayRef<PPTok> bToks) {
-  // Let's first at least compare the tokens up to the min length to see if we
-  // at least have a match prefix. We can complain about the length mismatch
-  // later.
-  const size_t n = std::min(aToks.size(), bToks.size());
-  for (size_t i = 0; i < n; ++i) {
-    const std::string aDbg = stringutils::showWS(
-        stringutils::clip(StringRef(aToks[i].spelling), 100));
-    const std::string bDbg = stringutils::showWS(
-        stringutils::clip(StringRef(bToks[i].spelling), 180));
-    if (aToks[i].spelling != bToks[i].spelling) {
-      return createStringError(
-          inconvertibleErrorCode(),
-          formatv("token mismatch at index {0}: A='{1}' B='{2}'", i, aDbg, bDbg)
-              .str());
-    }
-   debug("compare", "token match at index {0}: A='{1}' B='{2}'", i, aDbg, bDbg);
-  }
-
-  if (aToks.size() != bToks.size()) {
-    return createStringError(
-        inconvertibleErrorCode(),
-        formatv("token count mismatch: A={0} B={1}", aToks.size(), bToks.size())
-            .str());
-  }
-
-  return Error::success();
-}
 
 uint64_t extendChainedCallEnd(StringRef fileText, uint64_t invEnd,
                               StringRef replacement,
@@ -241,14 +213,8 @@ bool RefoldEngine::EffectiveCurriedHead(
 Expected<std::string> RefoldEngine::Refold(
     const json::Object &rootJson, StringRef aSource, ArrayRef<PPTok> aToks,
     ArrayRef<size_t> aTokOff, StringRef bSource, ArrayRef<PPTok> bToks,
-    ArrayRef<size_t> bTokOff, bool onlyCheck, bool noLines, bool strict,
+    ArrayRef<size_t> bTokOff, bool noLines, bool strict,
     unsigned startEscalationTier) {
-  if (onlyCheck) {
-    if (Error err = compareTokens(aToks, bToks))
-      return std::move(err);
-    return std::string();
-  }
-
   // Build the refold model based on the parsed JSON object.
   auto mOrErr = RefoldModel::FromJson(rootJson);
   if (!mOrErr)
