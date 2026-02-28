@@ -269,6 +269,43 @@ void RefoldEngine::RequestEscalation(StringRef phase, StringRef detail) const {
 }
 
 std::string RefoldEngine::Refold() {
+  // Multi-tier escalation ladder: retry refolding under increasingly
+  // conservative (more-expanded) policies before falling back to emitting B.
+  //
+  //   tier 0: normal structural refold
+  //   tier 1: force whole-cover macro replacement
+  //   tier 2: force inlining touched includes from B slices
+  //
+  // If escalation is still requested after tier 2, emit the fully expanded
+  // edited preprocessed stream (B).
+  constexpr unsigned kMaxTier = 2;
+  for (unsigned tier = 0; tier <= kMaxTier; ++tier) {
+    escalationTier_ = tier;
+    ResetEscalationState();
+
+    if (tier != 0)
+      debug("escalate", "ESCALATION tier={0}: retrying refold", tier);
+
+    std::string out = RefoldOnce();
+    if (!escalationRequested_)
+      return out;
+
+    debug("escalate",
+          "ESCALATION tier={0}: requested; advancing. reasons={1}",
+          tier, escalationReasons_.size());
+    for (const auto &r : escalationReasons_)
+      debug("escalate", "  {0}", r);
+  }
+
+  debug("escalate",
+        "ESCALATION terminal: emitting fully expanded edited preprocessed stream (B). reasons={0}",
+        escalationReasons_.size());
+  for (const auto &r : escalationReasons_)
+    debug("escalate", "  {0}", r);
+  return bSource_.str();
+}
+
+std::string RefoldEngine::RefoldOnce() {
   // Make sure that when we re-lex the A-stream tokens that it matches the token
   // count as listed in the refold map JSON file.
   if (static_cast<size_t>(model_.GetTokensCountA()) != aToks_.size()) {
@@ -1452,14 +1489,7 @@ std::string RefoldEngine::Refold() {
         tuResult.insert(0, dir);
     }
   }
-  if (escalationRequested_) {
-    debug("escalate",
-          "ESCALATION engaged: emitting fully expanded edited preprocessed stream (B). reasons={0}",
-          escalationReasons_.size());
-    for (const auto &r : escalationReasons_)
-      debug("escalate", "  {0}", r);
-    return bSource_.str();
-  }
+  // Note: escalation handling is performed by the outer ladder in Refold().
 
   debug("plan", "REFOLD DONE tuResultLen={0}", tuResult.size());
   return tuResult;
@@ -5600,7 +5630,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   argLikeSpans.append(m.pasteSpans.begin(), m.pasteSpans.end());
 
   SmallVector<char, 16> argTouched(argLikeSpans.size(), 0);
-  if (!argLikeSpans.empty() &&
+  if (!ForceWholeCoverMacros() && !argLikeSpans.empty() &&
       HunkFullyWithinArgSpans(hEff, argLikeSpans, argTouched)) {
     // invB/invE are offsets in the invocation file, not in the A-stream source;
     // do not slice aSource here (it can be shorter and/or refer to a different
@@ -5642,7 +5672,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   //   * Split the replacement text between the two caller formals only when
   //     it matches the concatenation of the *current* caller argument texts
   //     (by byte length).
-  if (m.subkind == "func") {
+  if (!ForceWholeCoverMacros() && m.subkind == "func") {
     auto tryDAGChainedArgsOnly = [&]() -> std::optional<MacroPatch> {
       // --- Phase 0: Preconditions / root invocation parsing ------------------
       //
@@ -6909,10 +6939,31 @@ void RefoldEngine::MaterializeIncludeExpansion(
     return;
   }
 
-  const auto *inc = model_.GetIncludeById(includeId);
-  if (LLVM_UNLIKELY(!inc)) {
-    // This should not be possible, but it's always nice to be defensive.
-    fatal("include/mat", "unknown include id {0}", includeId);
+  const RefoldModel::IncludeItem *inc = model_.GetIncludeById(includeId);
+  if (!inc)
+    fatal("include/mat", "unknown includeId {0}", includeId);
+
+  if (ForceInlineTouchedIncludesFromB()) {
+    // Tier-2 escalation: bypass include text patching and inline the include's
+    // fully expanded B-side slice for the include cover. This preserves edits
+    // inside the include subtree, at the cost of expansion.
+    auto bEnvOpt =
+        MapATokRangeAToBTokenEnvelope(inc->cover.begin, inc->cover.end);
+    if (!bEnvOpt) {
+      RequestEscalation(
+          "include/mat",
+          llvm::formatv("tier2 inline-from-B: failed to map A cover [{0},{1}) for inc#{2}",
+                        inc->cover.begin, inc->cover.end, includeId)
+              .str());
+      includeExpansion[includeId] = std::string();
+      return;
+    }
+    includeExpansion[includeId] =
+        SliceBSource(bEnvOpt->first, bEnvOpt->second).str();
+    debug("include/mat",
+          "FORCE inline from B tier={0} inc#{1} bTok=[{2},{3})",
+          escalationTier_, inc->id, bEnvOpt->first, bEnvOpt->second);
+    return;
   }
 
   debug("include/mat",
@@ -7274,7 +7325,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
               "startByte={3}",
               file, idx, anchorPP, startByte);
         if (!startByte) {
-          RequestEscalation("include/apply", llvm::formatv("INSERT: failed to map anchorPP={0} in file {1}", anchorPP ? *anchorPP : 0ULL, file).str());
+          if (!ForceInlineTouchedIncludesFromB()) RequestEscalation("include/apply", llvm::formatv("INSERT: failed to map anchorPP={0} in file {1}", anchorPP ? *anchorPP : 0ULL, file).str());
           continue;
         }
       } else {
@@ -7333,7 +7384,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                   "file={0} patch[{1}] INSERT: no neighbors, no decl, no child "
                   "boundary; SKIP",
                   file, idx);
-            RequestEscalation("include/apply", llvm::formatv("INSERT: cannot anchor include patch in file {0} (no neighbors/decl/child boundary)", file).str());
+            if (!ForceInlineTouchedIncludesFromB()) RequestEscalation("include/apply", llvm::formatv("INSERT: cannot anchor include patch in file {0} (no neighbors/decl/child boundary)", file).str());
           }
           continue;
         }
@@ -7369,7 +7420,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
               "file={0} patch[{1}] DELETE/REPLACE: no mapped PP tokens in "
               "header; SKIP",
               file, idx);
-        RequestEscalation("include/apply", llvm::formatv("DELETE/REPLACE: no mapped PP tokens for patch[{0}] in header file {1}", idx, file).str());
+        if (!ForceInlineTouchedIncludesFromB()) RequestEscalation("include/apply", llvm::formatv("DELETE/REPLACE: no mapped PP tokens for patch[{0}] in header file {1}", idx, file).str());
         continue;
       }
 
@@ -7382,7 +7433,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
             "bytes=[{4},{5})",
             file, idx, firstPP, lastPP, startByte, endByte);
       if (!startByte || !endByte) {
-        RequestEscalation("include/apply", llvm::formatv("DELETE/REPLACE: failed to map first/last PP tokens to bytes in file {0}", file).str());
+        if (!ForceInlineTouchedIncludesFromB()) RequestEscalation("include/apply", llvm::formatv("DELETE/REPLACE: failed to map first/last PP tokens to bytes in file {0}", file).str());
         continue;
       }
     }

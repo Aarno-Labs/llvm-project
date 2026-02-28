@@ -225,6 +225,27 @@ private:
 
   void RequestEscalation(llvm::StringRef phase, llvm::StringRef detail) const;
 
+  // Escalation ladder tiers (increasingly conservative projections):
+  //   0: normal structural refold
+  //   1: force whole-cover macro replacement (skip args-only + DAG-lift)
+  //   2: force inlining touched includes from B slices
+  // Final fallback (handled by Refold()): emit fully expanded edited preprocessed
+  // stream (B).
+  unsigned escalationTier_ = 0;
+
+  bool ForceWholeCoverMacros() const { return escalationTier_ >= 1; }
+  bool ForceInlineTouchedIncludesFromB() const { return escalationTier_ >= 2; }
+
+  void ResetEscalationState() const {
+    escalationRequested_ = false;
+    escalationReasons_.clear();
+  }
+
+  // Run a single refold attempt under the current escalation tier. The outer
+  // Refold() method is responsible for reacting to RequestEscalation() and
+  // potentially retrying under a higher tier.
+  std::string RefoldOnce();
+
   /// Per-gap ownership depth for insertion before PP token k (k in [0..N]).
   /// Computed once per refold run and reused to bound best-effort snapping.
   std::vector<uint32_t> ownerDepthGap_;
