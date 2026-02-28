@@ -291,6 +291,15 @@ parseSpans(const json::Value &val, StringRef ctx,
 }
 } // namespace
 
+
+// Public wrapper for parsing PPSpan arrays from JSON. This is used by the
+// clang-refold driver for ancillary checks (e.g., --check + --no-lines ignore
+// masks) without duplicating parsing logic.
+Expected<std::vector<RefoldModel::PPSpan>>
+parsePPSpans(const json::Value &val, StringRef ctx) {
+  return parseSpans<RefoldModel::PPSpan>(val, ctx);
+}
+
 bool RefoldModel::PPArgSpan::IsValid() const {
   if (!PPSpan::IsValid())
     return false;
