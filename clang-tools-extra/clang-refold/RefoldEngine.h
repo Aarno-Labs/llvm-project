@@ -295,6 +295,47 @@ private:
 
   std::optional<std::vector<ByteHunk>> abByteHunks_;
 
+  // -------------------------------------------------------------------------
+  // B token provenance / ownership for pure insertions
+  // -------------------------------------------------------------------------
+  //
+  // Goal: enforce a global invariant that no B-only insertion segment is
+  // emitted twice (e.g., once as a standalone boundary insertion patch and
+  // again as part of a macro whole-cover replacement slice).
+  //
+  // We track token-level pure-insertion hunks (A length 0, B length > 0) and
+  // allow exactly one emission site to claim each insertion.
+
+  enum class BInsertionClaim : uint8_t {
+    Unclaimed = 0,
+    Standalone = 1, // emitted as a TU/include/arm insertion patch
+    MacroAbsorb = 2 // reserved for future (macro patch intentionally absorbs)
+  };
+
+  struct BInsertionProv {
+    uint64_t aGap = 0;      // insertion position in A (pp token gap)
+    uint64_t hunkIndex = 0; // index in abTokHunks_
+    size_t b0 = 0;          // [b0,b1) in B token space
+    size_t b1 = 0;
+    BInsertionClaim claim = BInsertionClaim::Unclaimed;
+  };
+
+  std::vector<BInsertionProv> bInsertions_;
+  std::vector<int32_t> bTokToInsertionId_; // size bToks_, -1 if not insertion
+  std::vector<int32_t> hunkToInsertionId_; // size abTokHunks_, -1 if not insertion
+
+  void BuildBInsertionProvenance(ArrayRef<diffutils::Hunk> hunks);
+  void PreclaimStandaloneInsertions(StringRef tuPath,
+                                   ArrayRef<diffutils::Hunk> hunks);
+  void ClaimBInsertion(size_t insId, BInsertionClaim c,
+                       llvm::StringRef why);
+
+  llvm::SmallVector<std::pair<size_t, size_t>, 4>
+  ClipBTokenRangeAgainstClaims(size_t bTokStart, size_t bTokEnd) const;
+
+  std::string SliceBSourceClippedAgainstClaims(size_t bTokStart,
+                                               size_t bTokEnd) const;
+
   // Macro invocation graph (derived from RefoldModel) used for structural
   // queries such as determining whether a patchable macro callsite ultimately
   // yields a curried-head expansion through wrapper macros.
