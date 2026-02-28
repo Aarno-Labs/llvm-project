@@ -212,6 +212,19 @@ private:
   LineDirectiveInserter lineDirs_;
   bool strict_;
 
+  // Escalation scaffold: if any edit/patch cannot be applied deterministically
+  // under the structural policy, record the failure and fall back to emitting
+  // the fully expanded edited preprocessed stream (B). This guarantees that we
+  // never silently drop edits (at the cost of additional expansion).
+  //
+  // Note: escalation is requested from several helper routines that are
+  // logically "const" (e.g. include materialization). Treat the escalation
+  // state as diagnostic/side-channel state via `mutable`.
+  mutable bool escalationRequested_ = false;
+  mutable std::vector<std::string> escalationReasons_;
+
+  void RequestEscalation(llvm::StringRef phase, llvm::StringRef detail) const;
+
   /// Per-gap ownership depth for insertion before PP token k (k in [0..N]).
   /// Computed once per refold run and reused to bound best-effort snapping.
   std::vector<uint32_t> ownerDepthGap_;
