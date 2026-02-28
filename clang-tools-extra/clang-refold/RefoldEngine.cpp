@@ -259,6 +259,15 @@ Expected<std::string> RefoldEngine::Refold(
   return engine.Refold();
 }
 
+void RefoldEngine::RequestEscalation(StringRef phase, StringRef detail) const {
+  escalationRequested_ = true;
+  if (escalationReasons_.size() < 64) {
+    escalationReasons_.push_back(
+        llvm::formatv("{0}: {1}", phase, detail).str());
+  }
+  debug("escalate", "REQUEST escalation: {0}: {1}", phase, detail);
+}
+
 std::string RefoldEngine::Refold() {
   // Make sure that when we re-lex the A-stream tokens that it matches the token
   // count as listed in the refold map JSON file.
@@ -1152,6 +1161,7 @@ std::string RefoldEngine::Refold() {
           "#{0} dropping edit {1}: owner unresolved and no TU byte span "
           "available (no include guessing).",
           i, h);
+    RequestEscalation("classify", llvm::formatv("dropped edit #{0} (owner unresolved, no TU byte span)", i).str());
     continue;
   }
 
@@ -1442,6 +1452,15 @@ std::string RefoldEngine::Refold() {
         tuResult.insert(0, dir);
     }
   }
+  if (escalationRequested_) {
+    debug("escalate",
+          "ESCALATION engaged: emitting fully expanded edited preprocessed stream (B). reasons={0}",
+          escalationReasons_.size());
+    for (const auto &r : escalationReasons_)
+      debug("escalate", "  {0}", r);
+    return bSource_.str();
+  }
+
   debug("plan", "REFOLD DONE tuResultLen={0}", tuResult.size());
   return tuResult;
 }
@@ -7255,6 +7274,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
               "startByte={3}",
               file, idx, anchorPP, startByte);
         if (!startByte) {
+          RequestEscalation("include/apply", llvm::formatv("INSERT: failed to map anchorPP={0} in file {1}", anchorPP ? *anchorPP : 0ULL, file).str());
           continue;
         }
       } else {
@@ -7313,6 +7333,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                   "file={0} patch[{1}] INSERT: no neighbors, no decl, no child "
                   "boundary; SKIP",
                   file, idx);
+            RequestEscalation("include/apply", llvm::formatv("INSERT: cannot anchor include patch in file {0} (no neighbors/decl/child boundary)", file).str());
           }
           continue;
         }
@@ -7348,6 +7369,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
               "file={0} patch[{1}] DELETE/REPLACE: no mapped PP tokens in "
               "header; SKIP",
               file, idx);
+        RequestEscalation("include/apply", llvm::formatv("DELETE/REPLACE: no mapped PP tokens for patch[{0}] in header file {1}", idx, file).str());
         continue;
       }
 
@@ -7360,6 +7382,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
             "bytes=[{4},{5})",
             file, idx, firstPP, lastPP, startByte, endByte);
       if (!startByte || !endByte) {
+        RequestEscalation("include/apply", llvm::formatv("DELETE/REPLACE: failed to map first/last PP tokens to bytes in file {0}", file).str());
         continue;
       }
     }
