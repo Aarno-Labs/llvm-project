@@ -202,7 +202,8 @@ public:
   static Expected<std::string>
   Refold(const json::Object &rootJson, StringRef aSource, ArrayRef<PPTok> aToks,
          ArrayRef<size_t> aTokOff, StringRef bSource, ArrayRef<PPTok> bToks,
-         ArrayRef<size_t> bTokOff, bool onlyCheck, bool noLines, bool strict);
+         ArrayRef<size_t> bTokOff, bool onlyCheck, bool noLines, bool strict,
+         unsigned startEscalationTier = 0);
 
 private:
   const RefoldModel model_;
@@ -232,6 +233,9 @@ private:
   // Final fallback (handled by Refold()): emit fully expanded edited preprocessed
   // stream (B).
   unsigned escalationTier_ = 0;
+
+  // When non-zero, start the escalation ladder at the given tier.
+  unsigned startEscalationTier_ = 0;
 
   bool ForceWholeCoverMacros() const { return escalationTier_ >= 1; }
   bool ForceInlineTouchedIncludesFromB() const { return escalationTier_ >= 2; }
