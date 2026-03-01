@@ -263,7 +263,8 @@ std::vector<Hunk> coalesce(ArrayRef<Step> steps);
 /// ### Complexity
 ///
 /// * **Time:** O(N*M) (DP or Hirschberg; both exact).
-/// * **Space:** O(N*M) for the full DP table, O(N+M) for Hirschberg, O(N) for the map.
+/// * **Space:** O(N*M) for the full DP table, O(N+M) for Hirschberg, O(N) for
+///   the map.
 ///
 /// \param a The original (Source A) sequence of tokens/strings.
 /// \param b The edited (Source B) sequence of tokens/strings.
@@ -310,10 +311,11 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a,
 ///
 /// \param a Left sequence.
 /// \param b Right sequence.
-/// \param maxCells Maximum number of DP cells before switching to Hirschberg recursion.
-/// \returns A vector mapping a-indices to b-indices (or -1 if unmatched).
+/// \param maxCells Maximum number of DP cells before switching to Hirschberg
+/// recursion. \returns A vector mapping a-indices to b-indices (or -1 if
+/// unmatched).
 std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
-                          unsigned long long maxCells = DEFAULT_MAX_CELLS);
+                              unsigned long long maxCells = DEFAULT_MAX_CELLS);
 
 /// \brief Convert an A→B alignment map into a list of edit hunks.
 ///

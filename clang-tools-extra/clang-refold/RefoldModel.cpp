@@ -38,7 +38,7 @@
 
 using namespace llvm;
 
-// ================ Local JSON helpers (no exceptions) =================
+// ==================== Local JSON helpers (no exceptions) =====================
 
 namespace {
 using namespace clang::refold;
@@ -312,7 +312,7 @@ bool RefoldModel::PPArgSpan::IsValid() const {
   return okPaste && okPP;
 }
 
-// ================== RefoldModel construction =====================
+// ========================== RefoldModel construction =========================
 
 Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
   RefoldModel model;
@@ -541,9 +541,11 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
               } else if (resolved) {
                 hsFile = *resolved;
               } else {
-                return createStringError(inconvertibleErrorCode(),
-                                         "Missing required field 'header_span.file' at %s (and include has no resolved_path)",
-                                         headerCtxDecl.c_str());
+                return createStringError(
+                    inconvertibleErrorCode(),
+                    "Missing required field 'header_span.file' at %s (and "
+                    "include has no resolved_path)",
+                    headerCtxDecl.c_str());
               }
 
               auto hsBOrErr = applyToField(asUInt64, hsObj, "b", headerCtxDecl);
@@ -712,13 +714,14 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
         if (auto CH = asOptBool(*obj, "curried_head"))
           curriedHead = *CH;
 
-
         std::vector<MacroDefParam> defParams;
-        if (auto ParamsArr = asOptArray(*obj, "def_params", /*allowNull=*/true)) {
+        if (auto ParamsArr =
+                asOptArray(*obj, "def_params", /*allowNull=*/true)) {
           for (const json::Value &Elem : **ParamsArr) {
             auto ObjOrErr = asObject(Elem, ctxItem + ": def_params[]");
             if (!ObjOrErr)
-              fatal("model", "{0}: def_params element is not an object", ctxItem);
+              fatal("model", "{0}: def_params element is not an object",
+                    ctxItem);
             const json::Object &ParamObj = **ObjOrErr;
 
             const json::Value *NameVal = ParamObj.get("name");
@@ -730,7 +733,8 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
 
             const json::Value *VarVal = ParamObj.get("variadic");
             if (!VarVal)
-              fatal("model", "{0}: def_params element missing variadic", ctxItem);
+              fatal("model", "{0}: def_params element missing variadic",
+                    ctxItem);
             auto VarOrErr = asBool(*VarVal, ctxItem + ": def_params.variadic");
             if (!VarOrErr)
               fatal("model", "{0}: def_params.variadic is not a bool", ctxItem);
@@ -1179,7 +1183,7 @@ void RefoldModel::BuildIndicesAndSort() {
   }
 }
 
-// ================== Query helpers (ported behavior) ==================
+// ====================== Query helpers (ported behavior) ======================
 
 std::vector<const RefoldModel::CondGroup *>
 RefoldModel::GetCondGroups(StringRef file,

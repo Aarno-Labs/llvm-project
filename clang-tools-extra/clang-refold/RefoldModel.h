@@ -154,21 +154,6 @@ public:
     bool IsValid() const { return end > begin; }
   };
 
-#if 0
-  // Getter for the 'key' field
-  static constexpr StringRef GetKey(PPArgSpanKind kind) {
-    switch (kind) {
-    case PPArgSpanKind::Standard:
-      return "arg_spans";
-    case PPArgSpanKind::Stringify:
-      return "stringify_spans";
-    case PPArgSpanKind::Paste:
-      return "paste_spans";
-    }
-    llvm_unreachable("Invalid PPArgSpanKind");
-  }
-#endif
-
   static constexpr bool HasByteRange(PPArgSpanKind kind) {
     switch (kind) {
     case PPArgSpanKind::Standard:
@@ -330,8 +315,7 @@ public:
     PPCover cover;
 
     MacroInvocation(uint64_t id, StringRef subkind, StringRef name,
-                    bool CurriedHead,
-                    std::optional<StringRef> invText,
+                    bool CurriedHead, std::optional<StringRef> invText,
                     std::optional<StringRef> invFile,
                     std::optional<uint64_t> invB, std::optional<uint64_t> invE,
                     std::optional<uint64_t> invPPByteBegin,
@@ -346,17 +330,16 @@ public:
                     std::optional<uint64_t> callerMacroId,
                     std::vector<std::vector<uint32_t>> argDeps,
                     std::vector<std::vector<InvArgRef>> argRefs) noexcept
-        : id(id), subkind(subkind), name(name), curriedHead(CurriedHead), spans(std::move(spans)),
-          argSpans(std::move(argSpans)),
+        : id(id), subkind(subkind), name(name), curriedHead(CurriedHead),
+          spans(std::move(spans)), argSpans(std::move(argSpans)),
           stringifySpans(std::move(stringifySpans)),
-          pasteSpans(std::move(pasteSpans)),
-          defParams(std::move(defParams)),
+          pasteSpans(std::move(pasteSpans)), defParams(std::move(defParams)),
           invArgRanges(std::move(invArgRanges)),
-          bodySpans(std::move(bodySpans)),
-          invText(invText), invFile(invFile), invB(invB), invE(invE),
-          invPPByteBegin(invPPByteBegin), invPPByteEnd(invPPByteEnd),
-          ownerIncludeId(ownerIncludeId), callerMacroId(callerMacroId),
-          argDeps(std::move(argDeps)), argRefs(std::move(argRefs)) {
+          bodySpans(std::move(bodySpans)), invText(invText), invFile(invFile),
+          invB(invB), invE(invE), invPPByteBegin(invPPByteBegin),
+          invPPByteEnd(invPPByteEnd), ownerIncludeId(ownerIncludeId),
+          callerMacroId(callerMacroId), argDeps(std::move(argDeps)),
+          argRefs(std::move(argRefs)) {
       cover.Init(this->spans, &this->argSpans, &this->bodySpans);
     }
 
@@ -668,7 +651,6 @@ private:
 // ancillary checks (e.g., --check + --no-lines ignore masks).
 llvm::Expected<std::vector<RefoldModel::PPSpan>>
 parsePPSpans(const llvm::json::Value &val, llvm::StringRef ctx);
-
 
 } // namespace refold
 } // namespace clang

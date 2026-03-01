@@ -223,31 +223,44 @@ private:
   mutable bool escalationRequested_ = false;
   mutable std::vector<std::string> escalationReasons_;
 
+  /// \brief Record that the current refold attempt must escalate.
+  ///
+  /// Called when an edit or include-owned patch cannot be applied
+  /// deterministically under the current structural policy/tier. The outer
+  /// escalation driver (\c Refold()) will log reasons and retry at a more
+  /// conservative tier, or fall back to emitting B.
   void RequestEscalation(llvm::StringRef phase, llvm::StringRef detail) const;
 
   // Escalation ladder tiers (increasingly conservative projections):
   //   0: normal structural refold
   //   1: force whole-cover macro replacement (skip args-only + DAG-lift)
   //   2: force inlining touched includes from B slices
-  // Final fallback (handled by Refold()): emit fully expanded edited preprocessed
-  // stream (B).
+  // Final fallback (handled by Refold()): emit fully expanded edited
+  // preprocessed stream (B).
   unsigned escalationTier_ = 0;
 
   // When non-zero, start the escalation ladder at the given tier.
   unsigned startEscalationTier_ = 0;
 
+  /// \brief True iff this tier forces whole-cover macro replacement.
+  ///
+  /// At tier >= 1, the engine disables args-only/DAG macro lifting and prefers
+  /// replacing the full invocation cover to reduce ambiguity.
   bool ForceWholeCoverMacros() const { return escalationTier_ >= 1; }
+
+  /// \brief True iff this tier forces inlining of touched includes from B.
+  ///
+  /// At tier >= 2, include realization may inline include expansion bytes
+  /// directly from B-domain slices instead of applying anchored header edits.
   bool ForceInlineTouchedIncludesFromB() const { return escalationTier_ >= 2; }
 
+  /// \brief Clear per-attempt escalation state.
+  ///
+  /// This is invoked once per tier attempt before running \c RefoldOnce().
   void ResetEscalationState() const {
     escalationRequested_ = false;
     escalationReasons_.clear();
   }
-
-  // Run a single refold attempt under the current escalation tier. The outer
-  // Refold() method is responsible for reacting to RequestEscalation() and
-  // potentially retrying under a higher tier.
-  std::string RefoldOnce();
 
   /// Per-gap ownership depth for insertion before PP token k (k in [0..N]).
   /// Computed once per refold run and reused to bound best-effort snapping.
@@ -282,6 +295,16 @@ private:
     bool operator!=(const GapCtxKey &o) const { return !(*this == o); }
   };
 
+  /// \brief Compute the structural context key for an A-domain PP-token gap.
+  ///
+  /// \p gap is a PP-token *gap* index in [0, \p aSize], representing the
+  /// insertion point before A token \p gap (or after the last token when
+  /// \p gap == \p aSize). The returned key records the nearest enclosing
+  /// include-instance and conditional-arm bounds that contain the gap, using
+  /// left/right ids (or -1 when not present).
+  ///
+  /// This is used to cache and compare gap-dependent anchoring decisions
+  /// deterministically without inspecting token text.
   GapCtxKey GetGapCtxKey(uint64_t gap, uint64_t aSize) const;
 
   /// Cached token-level hunks for the current refold invocation.
@@ -294,9 +317,9 @@ private:
 
   std::optional<std::vector<ByteHunk>> abByteHunks_;
 
-  // -------------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
   // B token provenance / ownership for pure insertions
-  // -------------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
   //
   // Goal: enforce a global invariant that no B-only insertion segment is
   // emitted twice (e.g., once as a standalone boundary insertion patch and
@@ -321,17 +344,56 @@ private:
 
   std::vector<BInsertionProv> bInsertions_;
   std::vector<int32_t> bTokToInsertionId_; // size bToks_, -1 if not insertion
-  std::vector<int32_t> hunkToInsertionId_; // size abTokHunks_, -1 if not insertion
+  std::vector<int32_t>
+      hunkToInsertionId_; // size abTokHunks_, -1 if not insertion
 
+  /// \brief Build provenance indices for token-level pure insertion hunks.
+  ///
+  /// Scans \p hunks for token-level pure insertions (A-span empty, B-span
+  /// non-empty) and populates:
+  ///   - \c bInsertions_           : insertion records in B token space
+  ///   - \c bTokToInsertionId_     : per-B-token map to insertion id (or -1)
+  ///   - \c hunkToInsertionId_     : per-hunk map to insertion id (or -1)
+  ///
+  /// The resulting structures allow later phases to enforce a global “emit each
+  /// B-only segment exactly once” invariant (no double-emission).
   void BuildBInsertionProvenance(ArrayRef<diffutils::Hunk> hunks);
-  void PreclaimStandaloneInsertions(StringRef tuPath,
-                                   ArrayRef<diffutils::Hunk> hunks);
-  void ClaimBInsertion(size_t insId, BInsertionClaim c,
-                       llvm::StringRef why);
 
+  /// \brief Pre-claim insertions that must be emitted as standalone boundary
+  /// patches.
+  ///
+  /// Runs as an early planning pass (before macro patch construction) so that
+  /// later B-slicing codepaths (e.g. macro whole-cover replacement) can clip
+  /// away B-only segments that are already committed to standalone emission.
+  ///
+  /// Macro call-sites take priority: if an insertion lies within a patchable
+  /// macro cover, it is left unclaimed so the macro patch may absorb it.
+  void PreclaimStandaloneInsertions(StringRef tuPath,
+                                    ArrayRef<diffutils::Hunk> hunks);
+
+  /// \brief Claim a pure insertion hunk for a specific emission site.
+  ///
+  /// Claims are used to prevent double-emission. Attempting to claim an already
+  /// claimed insertion with a different claim kind is a hard error.
+  ///
+  /// \param insId Insertion id in \c bInsertions_.
+  /// \param c     Claim kind to record.
+  /// \param why   Debug string describing the claimant (for diagnostics).
+  void ClaimBInsertion(size_t insId, BInsertionClaim c, llvm::StringRef why);
+
+  /// \brief Partition a B-token interval into segments that are safe to emit.
+  ///
+  /// Returns a small list of sub-ranges of \c [bTokStart,bTokEnd) with any
+  /// B-only insertion hunks claimed as \c Standalone removed. The returned
+  /// sub-ranges are ordered and non-overlapping.
   llvm::SmallVector<std::pair<size_t, size_t>, 4>
   ClipBTokenRangeAgainstClaims(size_t bTokStart, size_t bTokEnd) const;
 
+  /// \brief Slice \c [bTokStart,bTokEnd) from B while omitting claimed
+  /// insertion segments.
+  ///
+  /// This concatenates the segments returned by \c ClipBTokenRangeAgainstClaims
+  /// and returns the resulting byte sequence.
   std::string SliceBSourceClippedAgainstClaims(size_t bTokStart,
                                                size_t bTokEnd) const;
 
@@ -377,7 +439,21 @@ private:
   /// descendant whose emitted PP-span matches the outer invocation.
   bool EffectiveCurriedHead(const RefoldModel::MacroInvocation &m) const;
 
+  /// \brief Run the full refolding pipeline for the current inputs.
+  ///
+  /// This is the main instance entry point. It classifies token hunks, plans
+  /// TU/include/macro edits under the structural policy, materializes the
+  /// refolded translation unit, and applies any escalation-tier retries (via
+  /// \c RefoldOnce()) when \c RequestEscalation() is raised.
+  ///
+  /// \returns The refolded C/C++ source text for the translation unit.
   std::string Refold();
+
+  /// \brief Run a single refold attempt under the current escalation tier.
+  ///
+  /// The outer \c Refold() method is responsible for reacting to
+  /// \c RequestEscalation() and potentially retrying under a higher tier.
+  std::string RefoldOnce();
 
   // ---------------------------- Small Data Records ---------------------------
 
@@ -694,8 +770,8 @@ private:
   Owner ClassifyOwnerWithSegments(StringRef tuPath,
                                   const diffutils::Hunk &h) const;
 
-  /// \brief Returns \c true if the given macro invocation is lexically contained
-  /// within a \c #define directive in the same source file.
+  /// \brief Returns \c true if the given macro invocation is lexically
+  /// contained within a \c #define directive in the same source file.
   ///
   /// This is a safety/eligibility guard used by args-only macro patching. If an
   /// invocation occurs inside the spelling of a macro definition (i.e., within
@@ -1003,12 +1079,13 @@ private:
   /// validates the proposed replacement against:
   /// * STANDARD argument occurrences (non-paste expansions) in B
   /// * STRINGIFY occurrences in B (only when `strict` mode is enabled)
-  /// * PASTE occurrences in B when they can be mapped soundly near the edit site
+  /// * PASTE occurrences in B when they can be mapped soundly near the edit
+  ///   site
   ///
   /// Paste-span validation can be sensitive to local A→B mapping quality, so it
   /// is intentionally conservative: if paste verification cannot be performed
-  /// safely, the method prefers to return `true` (do not block args-only) unless
-  /// an actual contradiction is detected.
+  /// safely, the method prefers to return `true` (do not block args-only)
+  /// unless an actual contradiction is detected.
   ///
   /// This wrapper enables paste-span validation (when applicable). For callers
   /// that validate paste-token correctness as a group (e.g., multi-span paste
@@ -1769,7 +1846,8 @@ private:
   /// back to using the token-index-based offsets from the consumer stream.
   ///
   /// \param sp The macro argument span metadata from the RefoldModel.
-  /// \returns The B-token range if mapping is successful, std::nullopt otherwise.
+  /// \returns The B-token range if mapping is successful, std::nullopt
+  /// otherwise.
   std::optional<std::pair<size_t, size_t>>
   MapAToBTokenEnvelopeByPPArgSpan(const RefoldModel::PPArgSpan &sp) const;
 
@@ -1892,16 +1970,23 @@ private:
   /// \brief Inject forced __COUNTER__ stabilization patches after normal hunk
   /// attribution.
   ///
-  /// This runs after normal hunk classification. It injects additional
-  /// MacroPatches into \\p macroPatchByOwnerByMacroId for each forced
-  /// occurrence, even when no diff hunk touched that invocation.
+  /// __COUNTER__ expansions are time-dependent and can shift when unrelated
+  /// edits add/remove counter uses earlier in the stream. After the main hunk
+  /// attribution pass, this routine injects additional whole-cover MacroPatches
+  /// for each forced occurrence so that all __COUNTER__ sites match the edited
+  /// preprocessed stream, even if no diff hunk directly touched the invocation.
   void AddForcedCounterPatches(
       ArrayRef<ForcedMacroPatchRequest> forced,
       DenseMap<std::optional<uint64_t>, DenseMap<uint64_t, MacroPatch>>
           &macroPatchByOwnerByMacroId) const;
 
-  /// \brief Compute the whole-cover replacement text for a macro invocation by
-  /// mapping its A-domain PP-token cover to the corresponding B-token envelope.
+  /// \brief Compute whole-cover replacement text for a macro invocation.
+  ///
+  /// Maps the invocation's A-domain PP-token cover interval to the
+  /// corresponding B-domain token envelope and returns the B bytes that should
+  /// replace the callsite. The mapping is structural and claim-aware (B-only
+  /// insertion segments that are committed to standalone emission are clipped
+  /// out so they are not double-emitted).
   std::optional<std::string>
   BuildWholeCoverReplacementText(const RefoldModel::MacroInvocation &m) const;
 
