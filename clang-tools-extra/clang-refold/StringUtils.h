@@ -90,7 +90,7 @@ inline constexpr bool isIdentPart(char c) noexcept {
   return isIdentStart(c) || isDigit(c);
 }
 
-// ---------------------- String predicates (ASCII only) ----------------------
+// ----------------------- String predicates (ASCII only) ----------------------
 
 // If a macro invocation is immediately followed by one or more parenthesized
 // argument lists in the *source file*, it may be a chain of function-like
@@ -108,7 +108,7 @@ inline bool isWhitespace(StringRef s) noexcept {
   return all_of(s, [](char c) { return isWs(c); });
 }
 
-// --------------------- Index scans (return -1 if none) ----------------------
+// ---------------------- Index scans (return -1 if none) ----------------------
 
 inline std::optional<size_t> firstNonWsIdx(StringRef s) noexcept {
   size_t idx = s.find_first_not_of(" \t\n\v\f\r");
@@ -124,7 +124,7 @@ size_t skipWSAndComments(StringRef s, size_t i);
 
 size_t findMatchingRParen(StringRef s, size_t lParenIdx);
 
-// -------------------- Diagnostics helpers (pure string) ---------------------
+// --------------------- Diagnostics helpers (pure string) ---------------------
 
 inline std::string showWS(StringRef s) {
   std::string out;
@@ -208,6 +208,20 @@ inline std::pair<size_t, size_t> trimWsRange(StringRef s, size_t b, size_t e) {
 /// \param S The input string.
 /// \returns A StringRef with leading/trailing spaces and tabs removed.
 StringRef trimEdgeSpaces(StringRef s);
+
+/// \brief Return a view of \p s with any trailing '\n' characters removed.
+///
+/// Clang's token dump spellings and some macro expansions may include one or
+/// more trailing newlines. For certain within-token comparisons (e.g. paste
+/// segment rewrites), we want a stable spelling that ignores these trailing
+/// line breaks while preserving all other bytes.
+///
+/// This is ASCII-only and allocation-free.
+inline StringRef stripTrailingNewlines(StringRef s) noexcept {
+  while (s.ends_with("\n"))
+    s = s.drop_back();
+  return s;
+}
 
 inline bool isLineSplice(StringRef s, size_t nlIdx) {
   if (nlIdx == 0 || nlIdx > s.size())

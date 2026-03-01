@@ -628,8 +628,8 @@ static Error compareTokens(ArrayRef<PPTok> aToks, ArrayRef<PPTok> bToks) {
 }
 
 static Error compareTokensNoLinesAware(ArrayRef<PPTok> aToks,
-                                      ArrayRef<PPTok> bToks,
-                                      ArrayRef<uint8_t> ignoreMask) {
+                                       ArrayRef<PPTok> bToks,
+                                       ArrayRef<uint8_t> ignoreMask) {
   const size_t n = std::min(aToks.size(), bToks.size());
   for (size_t i = 0; i < n; ++i) {
     if (aToks[i].spelling == bToks[i].spelling)
@@ -638,7 +638,8 @@ static Error compareTokensNoLinesAware(ArrayRef<PPTok> aToks,
                      canIgnoreNoLinesMismatch(aToks[i], bToks[i]);
     if (ign) {
       debug("compare",
-            "--no-lines: ignoring builtin loc macro mismatch at index {0}: A='{1}' B='{2}'",
+            "--no-lines: ignoring builtin loc macro mismatch at index {0}: "
+            "A='{1}' B='{2}'",
             i,
             stringutils::showWS(
                 stringutils::clip(StringRef(aToks[i].spelling), 100)),

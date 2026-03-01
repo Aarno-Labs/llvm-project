@@ -122,9 +122,9 @@ bool shouldUseGreedyApproach(unsigned long long n, unsigned long long m,
   return false;
 }
 
-
-inline bool isBetter(unsigned candLen, std::uint64_t candCost, std::uint32_t candTie,
-                     unsigned bestLen, std::uint64_t bestCost, std::uint32_t bestTie) {
+inline bool isBetter(unsigned candLen, std::uint64_t candCost,
+                     std::uint32_t candTie, unsigned bestLen,
+                     std::uint64_t bestCost, std::uint32_t bestTie) {
   if (candLen != bestLen)
     return candLen > bestLen;
   if (candCost != bestCost)
@@ -147,10 +147,11 @@ inline bool isBetter(unsigned candLen, std::uint64_t candCost, std::uint32_t can
 // when (len,cost) are equal. dpTie prefers matches whose immediate neighbors
 // (prev/next) also match, biasing toward locally consistent alignments without
 // changing optimality under (len,cost).
-inline std::uint32_t matchTiePenalty(
-    ArrayRef<StringRef> a, ArrayRef<StringRef> b, size_t ai, size_t bj,
-    const llvm::DenseMap<StringRef, unsigned> & /*freqA*/,
-    const llvm::DenseMap<StringRef, unsigned> & /*freqB*/) {
+inline std::uint32_t
+matchTiePenalty(ArrayRef<StringRef> a, ArrayRef<StringRef> b, size_t ai,
+                size_t bj,
+                const llvm::DenseMap<StringRef, unsigned> & /*freqA*/,
+                const llvm::DenseMap<StringRef, unsigned> & /*freqB*/) {
   // Deterministic tertiary objective for tie-breaking among solutions with
   // identical (len,cost): prefer locally coherent alignments.
   //
@@ -287,12 +288,13 @@ computeRowWeighted(const SpanView &aV, const SpanView &bV, const GapView &gapV,
   return dp;
 }
 
-static void solveSmallWeightedDP(
-    const SpanView &aV, const SpanView &bV, const GapView &gapV,
-    ArrayRef<StringRef> aFull, ArrayRef<StringRef> bFull,
-    const llvm::DenseMap<StringRef, unsigned> &freqA,
-    const llvm::DenseMap<StringRef, unsigned> &freqB,
-    std::vector<int64_t> &outMap) {
+static void
+solveSmallWeightedDP(const SpanView &aV, const SpanView &bV,
+                     const GapView &gapV, ArrayRef<StringRef> aFull,
+                     ArrayRef<StringRef> bFull,
+                     const llvm::DenseMap<StringRef, unsigned> &freqA,
+                     const llvm::DenseMap<StringRef, unsigned> &freqB,
+                     std::vector<int64_t> &outMap) {
   const size_t n = aV.size();
   const size_t m = bV.size();
   if (gapV.size() != n + 1)
@@ -307,7 +309,9 @@ static void solveSmallWeightedDP(
 
   auto idx = [&](size_t i, size_t j) -> size_t { return i * stride + j; };
   auto len = [&](size_t i, size_t j) -> uint32_t & { return dpLen[idx(i, j)]; };
-  auto cost = [&](size_t i, size_t j) -> uint64_t & { return dpCost[idx(i, j)]; };
+  auto cost = [&](size_t i, size_t j) -> uint64_t & {
+    return dpCost[idx(i, j)];
+  };
   auto tie = [&](size_t i, size_t j) -> uint32_t & { return dpTie[idx(i, j)]; };
 
   for (size_t i = 0; i <= n; ++i) {
@@ -331,7 +335,8 @@ static void solveSmallWeightedDP(
       // Delete A (pay at boundary i)
       if (i > 0) {
         const uint32_t candLen = len(i - 1, j);
-        const uint64_t candCost = cost(i - 1, j) + static_cast<uint64_t>(gapV.at(i));
+        const uint64_t candCost =
+            cost(i - 1, j) + static_cast<uint64_t>(gapV.at(i));
         const uint32_t candTie = tie(i - 1, j);
         if (isBetter(candLen, candCost, candTie, bestLen, bestCost, bestTie)) {
           bestLen = candLen;
@@ -343,7 +348,8 @@ static void solveSmallWeightedDP(
       // Insert B (pay at boundary i)
       if (j > 0) {
         const uint32_t candLen = len(i, j - 1);
-        const uint64_t candCost = cost(i, j - 1) + static_cast<uint64_t>(gapV.at(i));
+        const uint64_t candCost =
+            cost(i, j - 1) + static_cast<uint64_t>(gapV.at(i));
         const uint32_t candTie = tie(i, j - 1);
         if (isBetter(candLen, candCost, candTie, bestLen, bestCost, bestTie)) {
           bestLen = candLen;
@@ -354,7 +360,8 @@ static void solveSmallWeightedDP(
 
       len(i, j) = bestLen;
       cost(i, j) = bestCost;
-      tie(i, j) = (bestTie == std::numeric_limits<uint32_t>::max()) ? 0U : bestTie;
+      tie(i, j) =
+          (bestTie == std::numeric_limits<uint32_t>::max()) ? 0U : bestTie;
     }
   }
 
@@ -406,20 +413,21 @@ static void solveSmallWeightedDP(
   }
 }
 
-static void hirschbergWeightedRec(
-    const SpanView &aV, const SpanView &bV, const GapView &gapV,
-    ArrayRef<StringRef> aFull, ArrayRef<StringRef> bFull,
-    const llvm::DenseMap<StringRef, unsigned> &freqA,
-    const llvm::DenseMap<StringRef, unsigned> &freqB,
-    std::vector<int64_t> &outMap) {
+static void
+hirschbergWeightedRec(const SpanView &aV, const SpanView &bV,
+                      const GapView &gapV, ArrayRef<StringRef> aFull,
+                      ArrayRef<StringRef> bFull,
+                      const llvm::DenseMap<StringRef, unsigned> &freqA,
+                      const llvm::DenseMap<StringRef, unsigned> &freqB,
+                      std::vector<int64_t> &outMap) {
   const size_t n = aV.size();
   const size_t m = bV.size();
   if (n == 0 || m == 0)
     return;
 
   // Small exact DP base case.
-  const unsigned long long cells =
-      static_cast<unsigned long long>(n + 1ULL) * static_cast<unsigned long long>(m + 1ULL);
+  const unsigned long long cells = static_cast<unsigned long long>(n + 1ULL) *
+                                   static_cast<unsigned long long>(m + 1ULL);
   if (cells <= (1ULL << 20)) {
     solveSmallWeightedDP(aV, bV, gapV, aFull, bFull, freqA, freqB, outMap);
     return;
@@ -440,8 +448,8 @@ static void hirschbergWeightedRec(
   const GapView gapRightRev{gapV.base, gapV.off + mid, (n - mid) + 1, true};
   const SpanView bRev{bV.base, bV.off, m, true};
 
-  const std::vector<Score> rightRowRev =
-      computeRowWeighted(aRightRev, bRev, gapRightRev, aFull, bFull, freqA, freqB);
+  const std::vector<Score> rightRowRev = computeRowWeighted(
+      aRightRev, bRev, gapRightRev, aFull, bFull, freqA, freqB);
 
   // Choose split j maximizing combined (len, cost, tie). On exact equality,
   // prefer the smallest j for determinism.
@@ -449,7 +457,8 @@ static void hirschbergWeightedRec(
   Score best = addScore(leftRow[0], rightRowRev[m]);
   for (size_t j = 1; j <= m; ++j) {
     Score cand = addScore(leftRow[j], rightRowRev[m - j]);
-    if (isBetter(cand.len, cand.cost, cand.tie, best.len, best.cost, best.tie) ||
+    if (isBetter(cand.len, cand.cost, cand.tie, best.len, best.cost,
+                 best.tie) ||
         (scoreEq(cand, best) && j < bestJ)) {
       bestJ = j;
       best = cand;
@@ -459,8 +468,10 @@ static void hirschbergWeightedRec(
   const SpanView bLeft{bV.base, bV.off, bestJ, bV.rev};
   const SpanView bRight{bV.base, bV.off + bestJ, m - bestJ, bV.rev};
 
-  hirschbergWeightedRec(aLeft, bLeft, gapLeft, aFull, bFull, freqA, freqB, outMap);
-  hirschbergWeightedRec(aRight, bRight, gapRight, aFull, bFull, freqA, freqB, outMap);
+  hirschbergWeightedRec(aLeft, bLeft, gapLeft, aFull, bFull, freqA, freqB,
+                        outMap);
+  hirschbergWeightedRec(aRight, bRight, gapRight, aFull, bFull, freqA, freqB,
+                        outMap);
 }
 
 static std::vector<int64_t>
@@ -477,7 +488,8 @@ lcsMapABHirschbergWeighted(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
 }
 
 // Unweighted Hirschberg (length-only) used for the non-policy overload.
-static std::vector<unsigned> computeRowLen(const SpanView &aV, const SpanView &bV) {
+static std::vector<unsigned> computeRowLen(const SpanView &aV,
+                                           const SpanView &bV) {
   const size_t n = aV.size();
   const size_t m = bV.size();
   std::vector<unsigned> dp(m + 1, 0);
@@ -501,13 +513,15 @@ static std::vector<unsigned> computeRowLen(const SpanView &aV, const SpanView &b
 }
 
 static void solveSmallUnweightedDP(const SpanView &aV, const SpanView &bV,
-                                  std::vector<int64_t> &outMap) {
+                                   std::vector<int64_t> &outMap) {
   const size_t n = aV.size();
   const size_t m = bV.size();
   const size_t stride = m + 1;
   const size_t cells = (n + 1) * (m + 1);
   std::vector<unsigned> dp(cells, 0);
-  auto DP = [&](size_t i, size_t j) -> unsigned & { return dp[i * stride + j]; };
+  auto DP = [&](size_t i, size_t j) -> unsigned & {
+    return dp[i * stride + j];
+  };
 
   for (size_t i = n; i-- > 0;) {
     for (size_t j = m; j-- > 0;) {
@@ -531,14 +545,14 @@ static void solveSmallUnweightedDP(const SpanView &aV, const SpanView &bV,
 }
 
 static void hirschbergUnweightedRec(const SpanView &aV, const SpanView &bV,
-                                   std::vector<int64_t> &outMap) {
+                                    std::vector<int64_t> &outMap) {
   const size_t n = aV.size();
   const size_t m = bV.size();
   if (n == 0 || m == 0)
     return;
 
-  const unsigned long long cells =
-      static_cast<unsigned long long>(n + 1ULL) * static_cast<unsigned long long>(m + 1ULL);
+  const unsigned long long cells = static_cast<unsigned long long>(n + 1ULL) *
+                                   static_cast<unsigned long long>(m + 1ULL);
   if (cells <= (1ULL << 20)) {
     solveSmallUnweightedDP(aV, bV, outMap);
     return;
@@ -571,14 +585,13 @@ static void hirschbergUnweightedRec(const SpanView &aV, const SpanView &bV,
 }
 
 static std::vector<int64_t> lcsMapABHirschberg(ArrayRef<StringRef> a,
-                                              ArrayRef<StringRef> b) {
+                                               ArrayRef<StringRef> b) {
   std::vector<int64_t> out(a.size(), -1);
   const SpanView aV{a, 0, a.size(), false};
   const SpanView bV{b, 0, b.size(), false};
   hirschbergUnweightedRec(aV, bV, out);
   return out;
 }
-
 } // namespace
 
 // ================ Weighted LCS (DP with Hirschberg fallback) =================
@@ -602,11 +615,13 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a,
     fatal("lcs/map", "ownerDepthGap length must be A.size() + 1");
   }
 
-  // Indices are stored in int64_t; extremely large B streams are not representable.
+  // Indices are stored in int64_t; extremely large B streams are not
+  // representable.
   if (m > MAX)
     fatal("lcs/map", "B.size() exceeds int64_t index range");
 
-  // Build frequency maps once per call for ambiguity detection (also used by Hirschberg).
+  // Build frequency maps once per call for ambiguity detection (also used by
+  // Hirschberg).
   llvm::DenseMap<StringRef, unsigned> freqA;
   llvm::DenseMap<StringRef, unsigned> freqB;
   freqA.reserve(a.size());
@@ -702,7 +717,8 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a,
 
       len(i, j) = bestLen;
       cost(i, j) = bestCost;
-      tie(i, j) = (bestTie == std::numeric_limits<uint32_t>::max()) ? 0U : bestTie;
+      tie(i, j) =
+          (bestTie == std::numeric_limits<uint32_t>::max()) ? 0U : bestTie;
     }
   }
 
@@ -721,8 +737,7 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a,
     // Diagonal (match)
     if (i > 0 && j > 0 && a[i - 1] == b[j - 1]) {
       const uint32_t pen = matchTiePenalty(a, b, i - 1, j - 1, freqA, freqB);
-      if (len(i - 1, j - 1) == curLen - 1U &&
-          cost(i - 1, j - 1) == curCost &&
+      if (len(i - 1, j - 1) == curLen - 1U && cost(i - 1, j - 1) == curCost &&
           tie(i - 1, j - 1) + pen == curTie) {
         map[i - 1] = static_cast<int64_t>(j - 1);
         --i;
@@ -771,11 +786,13 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
   if (m == 0)
     return std::vector<int64_t>(n, -1);
 
-  // Indices are stored in int64_t; extremely large B streams are not representable.
+  // Indices are stored in int64_t; extremely large B streams are not
+  // representable.
   if (m > MAX)
     fatal("lcs/map", "B.size() exceeds int64_t index range");
 
-  // DP table guard: if the full table is too large, use Hirschberg (exact, linear space).
+  // DP table guard: if the full table is too large, use Hirschberg (exact,
+  // linear space).
   const unsigned long long nu = static_cast<unsigned long long>(n);
   const unsigned long long mu = static_cast<unsigned long long>(m);
   const bool useHirschberg = shouldUseGreedyApproach(nu, mu, maxCells);
@@ -787,7 +804,9 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
   const size_t cells = (n + 1) * (m + 1);
   std::vector<unsigned> dp(cells, 0);
 
-  auto DP = [&](size_t i, size_t j) -> unsigned & { return dp[i * stride + j]; };
+  auto DP = [&](size_t i, size_t j) -> unsigned & {
+    return dp[i * stride + j];
+  };
 
   // DP(i,j) = LCS length of a[i:] vs b[j:]
   for (size_t i = n; i-- > 0;) {

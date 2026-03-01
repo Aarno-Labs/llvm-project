@@ -54,6 +54,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
@@ -86,15 +87,9 @@ inline std::string resolveHeaderPath(const RefoldModel::IncludeItem &inc) {
              : stringutils::stripHeaderToken(inc.target).str();
 }
 
-
-inline std::string traceClip(llvm::StringRef s, size_t maxBytes = 220) {
-  return stringutils::showWS(stringutils::clip(s, maxBytes));
-}
-
-
-uint64_t extendChainedCallEnd(StringRef fileText, uint64_t invEnd,
-                              StringRef replacement,
-                              bool preserveFinalSuffixGroup) {
+static uint64_t extendChainedCallEnd(StringRef fileText, uint64_t invEnd,
+                                     StringRef replacement,
+                                     bool preserveFinalSuffixGroup) {
   if (invEnd > fileText.size())
     return invEnd;
 
@@ -135,8 +130,6 @@ uint64_t extendChainedCallEnd(StringRef fileText, uint64_t invEnd,
   return (consume == 0) ? invEnd : groupEnds[consume - 1];
 }
 
-} // namespace
-
 static bool spansAreEmpty(ArrayRef<RefoldModel::PPSpan> spans) {
   if (spans.empty())
     return true;
@@ -157,6 +150,7 @@ static bool spansEqual(ArrayRef<RefoldModel::PPSpan> a,
   }
   return true;
 }
+} // namespace
 
 bool RefoldEngine::EffectiveCurriedHead(
     const RefoldModel::MacroInvocation &m) const {
@@ -237,6 +231,22 @@ void RefoldEngine::RequestEscalation(StringRef phase, StringRef detail) const {
 }
 
 void RefoldEngine::BuildBInsertionProvenance(ArrayRef<diffutils::Hunk> hunks) {
+  // Build a structural provenance map for *token-level pure insertions*.
+  //
+  // A pure insertion hunk is one where no A tokens are deleted and the edit
+  // consists entirely of B tokens:
+  //   h.aStart == h.aEnd && h.bStart < h.bEnd
+  //
+  // We record:
+  //   * a compact table of insertion segments (bInsertions_)
+  //   * a per-B-token reverse index (bTokToInsertionId_) mapping each B token
+  //     to the insertion segment that owns it (or -1 if not in an insertion)
+  //   * a per-hunk index (hunkToInsertionId_) so later passes can quickly
+  //     determine whether a diff hunk corresponds to a tracked insertion.
+  //
+  // Invariants enforced here:
+  //   * insertion segments are within [0, bToks_.size())
+  //   * insertion segments do not overlap in B-token space
   bInsertions_.clear();
   bTokToInsertionId_.assign(bToks_.size(), -1);
   hunkToInsertionId_.assign(hunks.size(), -1);
@@ -250,7 +260,10 @@ void RefoldEngine::BuildBInsertionProvenance(ArrayRef<diffutils::Hunk> hunks) {
     const size_t b0 = static_cast<size_t>(h.bStart);
     const size_t b1 = static_cast<size_t>(h.bEnd);
     if (b1 > bToks_.size()) {
-      fatal("prov/ins", "insertion hunk out of B bounds: hunk#{0} b=[{1},{2}) bToks={3}",
+      // A refold map / token diff invariant violation: a hunk must never refer
+      // to B token indices outside the lexed B stream.
+      fatal("prov/ins",
+            "insertion hunk out of B bounds: hunk#{0} b=[{1},{2}) bToks={3}",
             hi, b0, b1, bToks_.size());
     }
 
@@ -265,8 +278,11 @@ void RefoldEngine::BuildBInsertionProvenance(ArrayRef<diffutils::Hunk> hunks) {
 
     for (size_t bj = b0; bj < b1; ++bj) {
       if (bTokToInsertionId_[bj] != -1) {
+        // Pure insertion hunks must form a disjoint partition of B-token
+        // subranges. Any overlap indicates a diff/instrumentation bug.
         fatal("prov/ins",
-              "overlapping insertion hunks at B tok {0}: existingIns={1} newIns={2}",
+              "overlapping insertion hunks at B tok {0}: existingIns={1} "
+              "newIns={2}",
               bj, bTokToInsertionId_[bj], static_cast<int32_t>(insId));
       }
       bTokToInsertionId_[bj] = static_cast<int32_t>(insId);
@@ -275,33 +291,46 @@ void RefoldEngine::BuildBInsertionProvenance(ArrayRef<diffutils::Hunk> hunks) {
 }
 
 void RefoldEngine::ClaimBInsertion(size_t insId, BInsertionClaim c,
-                                  llvm::StringRef why) {
+                                   llvm::StringRef why) {
+  // Mark a pure-insertion segment as "claimed" by a particular emission path.
+  //
+  // The global invariant is: any B-only insertion segment is emitted exactly
+  // once. The claim table enforces that by requiring a single, consistent
+  // claim for each insertion segment.
+  //
+  // "Standalone" means the segment must be emitted as part of boundary
+  // insertion logic (TU/include/arm). Other claim kinds may be added in the
+  // future (e.g. explicitly absorbed by a macro whole-cover patch).
   if (insId >= bInsertions_.size())
     return;
   BInsertionProv &ins = bInsertions_[insId];
   if (ins.claim == BInsertionClaim::Unclaimed) {
+    // First claim wins.
     ins.claim = c;
-    trace("prov/claim", "claim ins#{0} hunk#{1} AGap={2} B=[{3},{4}) kind={5} why={6}",
-          insId, ins.hunkIndex, ins.aGap, ins.b0, ins.b1,
-          static_cast<unsigned>(c), why);
+    trace("prov/claim",
+          "claim ins#{0} hunk#{1} AGap={2} B=[{3},{4}) kind={5} why={6}", insId,
+          ins.hunkIndex, ins.aGap, ins.b0, ins.b1, static_cast<unsigned>(c),
+          why);
     return;
   }
   if (ins.claim != c) {
+    // Conflicting claims indicate a logic error (double-emission risk).
     fatal("prov/claim",
-          "double-claim insertion ins#{0} hunk#{1} AGap={2} B=[{3},{4}) existing={5} new={6} why={7}",
+          "double-claim insertion ins#{0} hunk#{1} AGap={2} B=[{3},{4}) "
+          "existing={5} new={6} why={7}",
           insId, ins.hunkIndex, ins.aGap, ins.b0, ins.b1,
           static_cast<unsigned>(ins.claim), static_cast<unsigned>(c), why);
   }
 }
 
-void RefoldEngine::PreclaimStandaloneInsertions(StringRef tuPath,
-                                                ArrayRef<diffutils::Hunk> hunks) {
+void RefoldEngine::PreclaimStandaloneInsertions(
+    StringRef tuPath, ArrayRef<diffutils::Hunk> hunks) {
   if (bInsertions_.empty())
     return;
 
   for (size_t hi = 0; hi < hunks.size(); ++hi) {
-    int32_t insIdI32 = (hi < hunkToInsertionId_.size()) ? hunkToInsertionId_[hi]
-                                                       : -1;
+    int32_t insIdI32 =
+        (hi < hunkToInsertionId_.size()) ? hunkToInsertionId_[hi] : -1;
     if (insIdI32 < 0)
       continue;
 
@@ -317,13 +346,22 @@ void RefoldEngine::PreclaimStandaloneInsertions(StringRef tuPath,
     }
 
     ClaimBInsertion(static_cast<size_t>(insIdI32), BInsertionClaim::Standalone,
-                   llvm::formatv("preclaim hunk#{0}", hi).str());
+                    llvm::formatv("preclaim hunk#{0}", hi).str());
   }
 }
 
 llvm::SmallVector<std::pair<size_t, size_t>, 4>
 RefoldEngine::ClipBTokenRangeAgainstClaims(size_t bTokStart,
-                                          size_t bTokEnd) const {
+                                           size_t bTokEnd) const {
+  // Given a B-token range [bTokStart, bTokEnd), return a list of subranges
+  // that are safe to emit for replacement text.
+  //
+  // We clip out tokens belonging to insertion segments that have been claimed
+  // as Standalone. Those segments will be emitted via boundary insertion
+  // patches and must not be re-emitted in macro whole-cover replacement text.
+  //
+  // The returned segments preserve order and collectively represent
+  // [bTokStart,bTokEnd) with Standalone-claimed insertion subranges removed.
   llvm::SmallVector<std::pair<size_t, size_t>, 4> segs;
   if (bTokEnd <= bTokStart)
     return segs;
@@ -334,8 +372,10 @@ RefoldEngine::ClipBTokenRangeAgainstClaims(size_t bTokStart,
 
   size_t i = bTokStart;
   while (i < bTokEnd) {
-    int32_t insIdI32 = (i < bTokToInsertionId_.size()) ? bTokToInsertionId_[i]
-                                                      : -1;
+    // If we are currently inside a Standalone-claimed insertion segment,
+    // skip that entire insertion run.
+    int32_t insIdI32 =
+        (i < bTokToInsertionId_.size()) ? bTokToInsertionId_[i] : -1;
     if (insIdI32 >= 0) {
       const BInsertionProv &ins = bInsertions_[static_cast<size_t>(insIdI32)];
       if (ins.claim == BInsertionClaim::Standalone) {
@@ -344,11 +384,13 @@ RefoldEngine::ClipBTokenRangeAgainstClaims(size_t bTokStart,
       }
     }
 
+    // Otherwise, begin a kept segment at i and extend until we reach either
+    // the end of the input range or the start of a Standalone insertion.
     const size_t segStart = i;
     ++i;
     while (i < bTokEnd) {
-      int32_t nextId = (i < bTokToInsertionId_.size()) ? bTokToInsertionId_[i]
-                                                      : -1;
+      int32_t nextId =
+          (i < bTokToInsertionId_.size()) ? bTokToInsertionId_[i] : -1;
       if (nextId >= 0) {
         const BInsertionProv &ins = bInsertions_[static_cast<size_t>(nextId)];
         if (ins.claim == BInsertionClaim::Standalone)
@@ -363,8 +405,14 @@ RefoldEngine::ClipBTokenRangeAgainstClaims(size_t bTokStart,
   return segs;
 }
 
-std::string RefoldEngine::SliceBSourceClippedAgainstClaims(size_t bTokStart,
-                                                          size_t bTokEnd) const {
+std::string
+RefoldEngine::SliceBSourceClippedAgainstClaims(size_t bTokStart,
+                                               size_t bTokEnd) const {
+  // Materialize a B-token range into bytes, excluding any Standalone-claimed
+  // insertion segments.
+  //
+  // This is used by macro whole-cover replacement text and similar paths to
+  // enforce the global "no double-emission" invariant for B-only segments.
   auto segs = ClipBTokenRangeAgainstClaims(bTokStart, bTokEnd);
   if (segs.empty())
     return std::string();
@@ -399,15 +447,15 @@ std::string RefoldEngine::Refold() {
     if (!escalationRequested_)
       return out;
 
-    debug("escalate",
-          "ESCALATION tier={0}: requested; advancing. reasons={1}",
+    debug("escalate", "ESCALATION tier={0}: requested; advancing. reasons={1}",
           tier, escalationReasons_.size());
     for (const auto &r : escalationReasons_)
       debug("escalate", "  {0}", r);
   }
 
   debug("escalate",
-        "ESCALATION terminal: emitting fully expanded edited preprocessed stream (B). reasons={0}",
+        "ESCALATION terminal: emitting fully expanded edited preprocessed "
+        "stream (B). reasons={0}",
         escalationReasons_.size());
   for (const auto &r : escalationReasons_)
     debug("escalate", "  {0}", r);
@@ -457,16 +505,16 @@ std::string RefoldEngine::RefoldOnce() {
   trace("lcs/aSeq", "aSeq:");
   trace("lcs/aSeq", "=====");
   logFormattedArray<StringRef>(aSeq, /* k */ MAX_COLS,
-                                 /* sameWidth */ false,
-                                 [](StringRef msg) { trace("lcs/aSeq", msg); });
+                               /* sameWidth */ false,
+                               [](StringRef msg) { trace("lcs/aSeq", msg); });
   trace("lcs/aSeq", sep);
 
   auto bSeq = MapLexemes(bToks_, bTokOff_);
   trace("lcs/bSeq", "bSeq:");
   trace("lcs/bSeq", "=====");
   logFormattedArray<StringRef>(bSeq, /* k */ MAX_COLS,
-                                 /* sameWidth */ false,
-                                 [](StringRef msg) { trace("lcs/bSeq", msg); });
+                               /* sameWidth */ false,
+                               [](StringRef msg) { trace("lcs/bSeq", msg); });
   trace("lcs/bSeq", sep);
 
   // 1b) Compute per-gap ownership depth for A's PP tokens.
@@ -483,7 +531,7 @@ std::string RefoldEngine::RefoldOnce() {
   trace("lcs/a2b", "a2b:");
   trace("lcs/a2b", "====");
   logFormattedArray<int64_t>(a2b, /* k */ MAX_COLS, /* sameWidth */ true,
-                         [](StringRef msg) { trace("lcs/a2b", msg); });
+                             [](StringRef msg) { trace("lcs/a2b", msg); });
   trace("lcs/a2b", sep);
 
   // Sanity check: map must have a strict ordering.
@@ -728,7 +776,8 @@ std::string RefoldEngine::RefoldOnce() {
   }
 
   if (trimmedEdgeMatched) {
-    trace("hunks/norm", "trimmed {0} matched edge tokens from insert-only hunks",
+    trace("hunks/norm",
+          "trimmed {0} matched edge tokens from insert-only hunks",
           trimmedEdgeMatched);
   }
   if (repairedBoundarySteal) {
@@ -913,7 +962,7 @@ std::string RefoldEngine::RefoldOnce() {
     b1 = std::min(b1, bMax);
     StringRef lead = SliceBSource(b0, std::min(b0 + 24, b1));
     trace(tag, "{0}: Btok=[{1},{2}) lead='{3}'", label, b0, b1,
-          traceClip(lead));
+          stringutils::showWSWithClip(lead, 220));
   };
 
 
@@ -1138,7 +1187,8 @@ std::string RefoldEngine::RefoldOnce() {
         // the replacement.
         if (span->first < span->second) {
           const uint64_t oldEnd = span->second;
-          const uint64_t extEnd = extendChainedCallEnd(tuBytes, oldEnd, repl, /*preserveFinalSuffixGroup*/ false);
+          const uint64_t extEnd = extendChainedCallEnd(
+              tuBytes, oldEnd, repl, /*preserveFinalSuffixGroup*/ false);
           if (extEnd != oldEnd) {
             debug("edit/tu",
                   "TU extend trailing call/arg chain [{0},{1}) -> [{0},{2})",
@@ -1255,7 +1305,8 @@ std::string RefoldEngine::RefoldOnce() {
       // replacement.
       if (span->first < span->second) {
         const uint64_t oldEnd = span->second;
-        const uint64_t extEnd = extendChainedCallEnd(tuBytes, oldEnd, repl, /*preserveFinalSuffixGroup*/ false);
+        const uint64_t extEnd = extendChainedCallEnd(
+            tuBytes, oldEnd, repl, /*preserveFinalSuffixGroup*/ false);
         if (extEnd != oldEnd) {
           debug("edit/tu",
                 "TU extend trailing call/arg chain [{0},{1}) -> [{0},{2})",
@@ -1314,7 +1365,11 @@ std::string RefoldEngine::RefoldOnce() {
           "#{0} dropping edit {1}: owner unresolved and no TU byte span "
           "available (no include guessing).",
           i, h);
-    RequestEscalation("classify", llvm::formatv("dropped edit #{0} (owner unresolved, no TU byte span)", i).str());
+    RequestEscalation(
+        "classify",
+        llvm::formatv("dropped edit #{0} (owner unresolved, no TU byte span)",
+                      i)
+            .str());
     continue;
   }
 
@@ -1749,7 +1804,7 @@ std::string RefoldEngine::PadAtBoundaries(StringRef base, size_t start,
   return text;
 }
 
-// ===================== Owner resolution & TU mapping ======================
+// ====================== Owner resolution & TU mapping ========================
 
 RefoldEngine::Owner
 RefoldEngine::ClassifyOwnerWithSegments(StringRef tuPath,
@@ -2764,7 +2819,7 @@ RefoldEngine::BoundaryParentIncludeForPureInsertion(
   return parent;
 }
 
-// ==================== Patch builders (include & macro) ====================
+// ===================== Patch builders (include & macro) ======================
 
 bool RefoldEngine::MacroExpansionEnvelopeB(
     const RefoldModel::MacroInvocation &m, bool onlyInvFile, uint64_t &begin,
@@ -3167,14 +3222,8 @@ RefoldEngine::DerivePasteArgEdit(const RefoldModel::MacroInvocation &m,
   StringRef bTokRaw = SliceBSource(bEnvOpt->first, bEnvOpt->second);
 
   // Strip trailing newlines to stabilize within-token diffs.
-  auto stripTrailingNL = [](StringRef s) {
-    while (s.ends_with("\n"))
-      s = s.drop_back();
-    return s;
-  };
-
-  StringRef aTok = stripTrailingNL(aTokRaw);
-  StringRef bTok = stripTrailingNL(bTokRaw);
+  StringRef aTok = stringutils::stripTrailingNewlines(aTokRaw);
+  StringRef bTok = stringutils::stripTrailingNewlines(bTokRaw);
 
   // Compute the minimal differing region between the two token spellings:
   // aTok = [common prefix][DIFF_A][common suffix]
@@ -3319,15 +3368,9 @@ RefoldEngine::DerivePasteArgEdits(const RefoldModel::MacroInvocation &m,
   StringRef aTokRaw = SliceASource(tokenSpan->begin, tokenSpan->end);
   StringRef bTokRaw = SliceBSource(bEnvOpt->first, bEnvOpt->second);
 
-  // Strip trailing newlines using StringRef for efficiency.
-  auto stripTrailingNL = [](StringRef s) {
-    while (s.ends_with("\n"))
-      s = s.drop_back();
-    return s;
-  };
-
-  StringRef aTok = stripTrailingNL(aTokRaw);
-  StringRef bTok = stripTrailingNL(bTokRaw);
+  // Strip trailing newlines to stabilize within-token diffs.
+  StringRef aTok = stringutils::stripTrailingNewlines(aTokRaw);
+  StringRef bTok = stringutils::stripTrailingNewlines(bTokRaw);
 
   // Multi-span paste edits may change the overall pasted token length (e.g.,
   // a_b_c -> foo_bar_baz). This is still safe to refold *as long as* the
@@ -4004,6 +4047,12 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     return idx < m.defParams.size() && m.defParams[idx].variadic;
   };
 
+  // Detect a top-level comma in an argument replacement.
+  //
+  // This is a small, self-contained lexer that tracks delimiter depth and
+  // skips over strings/chars/comments. If this grows further, it could be
+  // replaced with a token-based implementation using Clang's lexer (ClangLex)
+  // to avoid duplicating low-level lexing rules.
   auto hasTopLevelComma = [&](StringRef s) -> bool {
     int paren = 0, bracket = 0, brace = 0;
     bool inStr = false, inChr = false, esc = false;
@@ -4319,7 +4368,8 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
 
       if (e0 != bEnv->first || e1 != bEnv->second) {
         trace("macro/args",
-              "  extend env with adjacent insertion: argIdx={0} env=[{1},{2}) ins=[{3},{4}) -> [{5},{6})",
+              "  extend env with adjacent insertion: argIdx={0} env=[{1},{2}) "
+              "ins=[{3},{4}) -> [{5},{6})",
               static_cast<size_t>(argIdx), bEnv->first, bEnv->second, insB0,
               insB1, e0, e1);
         bEnv = std::make_pair(e0, e1);
@@ -4822,7 +4872,8 @@ RefoldEngine::MapAByteRangeToBTokenEnvelope(size_t aByteBegin,
       // Pure insertion (A-length 0, B-length >0).
       if (cur->bEnd > cur->bStart) {
         trace("byte/env",
-              "A{0} boundary has pure-insertion ByteHunk: A@{1} -> Bbytes=[{2},{3}) (len={4})",
+              "A{0} boundary has pure-insertion ByteHunk: A@{1} -> "
+              "Bbytes=[{2},{3}) (len={4})",
               which, aByte, static_cast<size_t>(cur->bStart),
               static_cast<size_t>(cur->bEnd),
               static_cast<size_t>(cur->bEnd - cur->bStart));
@@ -4866,12 +4917,13 @@ RefoldEngine::MapAByteRangeToBTokenEnvelope(size_t aByteBegin,
             const size_t oldBegin = bByteBegin;
             bByteBegin = be;
             if (inTraceMode() && bByteBegin > oldBegin) {
-              StringRef trimmed =
-                  bSource_.slice(oldBegin, std::min(oldBegin + 200, bByteBegin));
+              StringRef trimmed = bSource_.slice(
+                  oldBegin, std::min(oldBegin + 200, bByteBegin));
               trace("byte/env",
-                    "trimBegin: Abytes=[{0},{1}) hunkBbytes=[{2},{3}) Btrim=[{4},{5}) text='{6}'",
+                    "trimBegin: Abytes=[{0},{1}) hunkBbytes=[{2},{3}) "
+                    "Btrim=[{4},{5}) text='{6}'",
                     aByteBegin, aByteEnd, cur->bStart, cur->bEnd, oldBegin,
-                    bByteBegin, traceClip(trimmed));
+                    bByteBegin, stringutils::showWSWithClip(trimmed, 220));
             }
           }
         }
@@ -4895,9 +4947,10 @@ RefoldEngine::MapAByteRangeToBTokenEnvelope(size_t aByteBegin,
               StringRef trimmed =
                   bSource_.slice(bByteEnd, std::min(bByteEnd + 200, oldEnd));
               trace("byte/env",
-                    "trimEnd: Abytes=[{0},{1}) hunkBbytes=[{2},{3}) Btrim=[{4},{5}) text='{6}'",
+                    "trimEnd: Abytes=[{0},{1}) hunkBbytes=[{2},{3}) "
+                    "Btrim=[{4},{5}) text='{6}'",
                     aByteBegin, aByteEnd, cur->bStart, cur->bEnd, bByteEnd,
-                    oldEnd, traceClip(trimmed));
+                    oldEnd, stringutils::showWSWithClip(trimmed, 220));
             }
           }
         }
@@ -5420,27 +5473,22 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
     return {};
   }
 
-  SmallVector<ForcedMacroPatchRequest, 32> forced;
-  llvm::DenseSet<uint64_t> seen;
-
-  auto hashKey = [](std::optional<uint64_t> owner, uint64_t invB,
-                    uint64_t invE) {
-    uint64_t h = owner ? (*owner + 1) : 0;
-    h = h * 1315423911u + invB;
-    h = h * 1315423911u + invE;
-    return h;
+  // Define a unique key structure for our DenseSet
+  struct MacroKey {
+    std::optional<uint64_t> ownerId;
+    uint64_t start;
+    uint64_t end;
   };
 
-  for (size_t i = static_cast<size_t>(firstEditedIdx); i < filtered.size();
-       ++i) {
-    const Occ &o = filtered[i];
-    const RefoldModel::MacroInvocation *root =
+  SmallVector<ForcedMacroPatchRequest, 32> forced;
+  llvm::DenseSet<llvm::hash_code> seen;
+
+  for (const Occ &o : llvm::drop_begin(filtered, firstEditedIdx)) {
+    const auto *root =
         SmallestCoveringPatchableMacro(o.aStart, o.aEnd, o.ownerInc);
-    if (!root)
-      continue;
 
     // Safety: never patch macro definitions.
-    if (IsInvocationInsideDefineDirective(*root))
+    if (!root || IsInvocationInsideDefineDirective(*root))
       continue;
 
     const auto invStart = root->invB;
@@ -5448,11 +5496,12 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
     if (!invStart || !invEnd)
       continue;
 
-    const uint64_t key = hashKey(root->ownerIncludeId, *invStart, *invEnd);
+    auto key = llvm::hash_combine(root->ownerIncludeId.value_or(0), *invStart,
+                                  *invEnd);
     if (!seen.insert(key).second)
       continue;
 
-    forced.push_back(ForcedMacroPatchRequest{root, o.aStart, o.aEnd});
+    forced.push_back({root, o.aStart, o.aEnd});
 
     trace("counter",
           "__COUNTER__: force root id={0} name='{1}' ownerInc={2} "
@@ -5762,7 +5811,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
       if (argsOnly)
         return *argsOnly;
       trace("instr/macro",
-            "args-only: FAIL macro id={0} name='{1}' hunkA=[{2},{3}) hunkB=[{4},{5}) (see [trace][macro/args])",
+            "args-only: FAIL macro id={0} name='{1}' hunkA=[{2},{3}) "
+            "hunkB=[{4},{5}) (see [trace][macro/args])",
             m.id, m.name, hEff.aStart, hEff.aEnd, hEff.bStart, hEff.bEnd);
       // If we already have a callsite patch and args-only yields no replacement
       // for the trimmed hunk, then the edit is already satisfied by the current
@@ -6550,7 +6600,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             // phase: consume any trailing "(...)" groups after the root
             // invocation.
             const uint64_t chainEnd =
-                extendChainedCallEnd(fileText, *invEnd, "((x)+1)", /*preserveFinalSuffixGroup*/ false);
+                extendChainedCallEnd(fileText, *invEnd, "((x)+1)",
+                                     /*preserveFinalSuffixGroup*/ false);
             if (chainEnd > *invEnd && chainEnd <= (uint64_t)fileText.size()) {
               struct LocalEdit {
                 uint64_t begin; // relative to invStart
@@ -6821,7 +6872,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         const uint64_t invEndAbs = *m.invE;
         if (invEndAbs <= n) {
           const uint64_t chainEndAbs =
-              extendChainedCallEnd(invFileText, invEndAbs, StringRef(), /*preserveFinalSuffixGroup*/ false);
+              extendChainedCallEnd(invFileText, invEndAbs, StringRef(),
+                                   /*preserveFinalSuffixGroup*/ false);
           if (chainEndAbs > invEndAbs) {
             const uint64_t aLen = h.aEnd - h.aStart;
             const uint64_t bLen = h.bEnd - h.bStart;
@@ -7040,7 +7092,7 @@ bool RefoldEngine::InvocationSpanMatchesCallsitePrefix(
   return (j < n && invSpanText[j] == '(');
 }
 
-// =========== Include processing (normalize, materialize, apply) ===========
+// ============ Include processing (normalize, materialize, apply) =============
 
 void RefoldEngine::MaterializeIncludeExpansion(
     uint64_t includeId, const DenseMap<uint64_t, IncludeEdits> &perInclude,
@@ -7066,11 +7118,12 @@ void RefoldEngine::MaterializeIncludeExpansion(
     auto bEnvOpt =
         MapATokRangeAToBTokenEnvelope(inc->cover.begin, inc->cover.end);
     if (!bEnvOpt) {
-      RequestEscalation(
-          "include/mat",
-          llvm::formatv("tier2 inline-from-B: failed to map A cover [{0},{1}) for inc#{2}",
-                        inc->cover.begin, inc->cover.end, includeId)
-              .str());
+      RequestEscalation("include/mat",
+                        llvm::formatv("tier2 inline-from-B: failed to map A "
+                                      "cover [{0},{1}) for inc#{2}",
+                                      inc->cover.begin, inc->cover.end,
+                                      includeId)
+                            .str());
       includeExpansion[includeId] = std::string();
       return;
     }
@@ -7441,7 +7494,12 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
               "startByte={3}",
               file, idx, anchorPP, startByte);
         if (!startByte) {
-          if (!ForceInlineTouchedIncludesFromB()) RequestEscalation("include/apply", llvm::formatv("INSERT: failed to map anchorPP={0} in file {1}", anchorPP ? *anchorPP : 0ULL, file).str());
+          if (!ForceInlineTouchedIncludesFromB())
+            RequestEscalation(
+                "include/apply",
+                llvm::formatv("INSERT: failed to map anchorPP={0} in file {1}",
+                              anchorPP ? *anchorPP : 0ULL, file)
+                    .str());
           continue;
         }
       } else {
@@ -7500,7 +7558,13 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                   "file={0} patch[{1}] INSERT: no neighbors, no decl, no child "
                   "boundary; SKIP",
                   file, idx);
-            if (!ForceInlineTouchedIncludesFromB()) RequestEscalation("include/apply", llvm::formatv("INSERT: cannot anchor include patch in file {0} (no neighbors/decl/child boundary)", file).str());
+            if (!ForceInlineTouchedIncludesFromB())
+              RequestEscalation(
+                  "include/apply",
+                  llvm::formatv("INSERT: cannot anchor include patch in file "
+                                "{0} (no neighbors/decl/child boundary)",
+                                file)
+                      .str());
           }
           continue;
         }
@@ -7536,7 +7600,12 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
               "file={0} patch[{1}] DELETE/REPLACE: no mapped PP tokens in "
               "header; SKIP",
               file, idx);
-        if (!ForceInlineTouchedIncludesFromB()) RequestEscalation("include/apply", llvm::formatv("DELETE/REPLACE: no mapped PP tokens for patch[{0}] in header file {1}", idx, file).str());
+        if (!ForceInlineTouchedIncludesFromB())
+          RequestEscalation("include/apply",
+                            llvm::formatv("DELETE/REPLACE: no mapped PP tokens "
+                                          "for patch[{0}] in header file {1}",
+                                          idx, file)
+                                .str());
         continue;
       }
 
@@ -7549,7 +7618,13 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
             "bytes=[{4},{5})",
             file, idx, firstPP, lastPP, startByte, endByte);
       if (!startByte || !endByte) {
-        if (!ForceInlineTouchedIncludesFromB()) RequestEscalation("include/apply", llvm::formatv("DELETE/REPLACE: failed to map first/last PP tokens to bytes in file {0}", file).str());
+        if (!ForceInlineTouchedIncludesFromB())
+          RequestEscalation(
+              "include/apply",
+              llvm::formatv("DELETE/REPLACE: failed to map first/last PP "
+                            "tokens to bytes in file {0}",
+                            file)
+                  .str());
         continue;
       }
     }
@@ -8021,7 +8096,7 @@ bool RefoldEngine::PathsEqual(StringRef a, StringRef b) {
   return ca == cb;
 }
 
-// ====================== Diagnostics & Debug Utilities =======================
+// ======================= Diagnostics & Debug Utilities =======================
 
 void RefoldEngine::DebugIncludePatch(StringRef tag,
                                      const RefoldModel::IncludeItem &inc,
