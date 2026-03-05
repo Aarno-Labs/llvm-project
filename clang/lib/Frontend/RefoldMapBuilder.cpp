@@ -178,9 +178,9 @@ static std::pair<size_t, size_t> lineSpanOf(StringRef S, size_t p) {
 ///    whitespace, it starts with \c '#'.
 ///  - A helper checks for a keyword match with an identifier boundary
 ///    (so \c "#ifdefx" does not match).
-///  - Nested conditionals are tracked with a simple depth counter; nested
-///    groups are **skipped over**, and only the outermost (depth 0) group is
-///    recorded.
+///  - Nested conditionals are tracked with a stack; nested groups are recorded
+///    as their own CondGroup entries, while arm body ranges for outer groups
+///    naturally include the text of any nested groups.
 ///
 /// Error tolerance and edge cases:
 ///  - If a group is unterminated (missing \c #endif), the function closes it at
@@ -362,12 +362,6 @@ static std::vector<CondGroup> scanTopLevelConds(llvm::StringRef Buf,
         // Record the group and push it onto the nesting stack.
         size_t idx = Groups.size();
         Groups.push_back(std::move(G));
-
-        // If we were already inside an outer group, then the outer group's
-        // current arm body must end before this nested opener starts.
-        if (!Stack.empty())
-          setPrevBodyEnd(Stack.back().GroupIndex, bol);
-
         Stack.push_back(Active{idx});
 
         // Advance to the end of this line.
