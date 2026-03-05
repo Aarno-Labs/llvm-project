@@ -861,7 +861,7 @@ private:
   /// structural boundary corresponding to that same PP coordinate.
   ///
   /// **Key property:** this method performs *no* "nearest" snapping. If `ppGap`
-  /// does not exactly match a known boundary PP coordinate, it returns `null`
+  /// does not exactly match a known boundary PP coordinate, it returns `std::nullopt`
   /// so callers can fall back to neighbor-based span anchoring. This avoids
   /// regressions where an insertion belonging inside a nested owner
   /// (include/arm) is incorrectly pulled out to a shallower boundary.
@@ -880,7 +880,7 @@ private:
   /// (handling `\n` and `\r\n`).
   ///
   /// **Exact-match requirement:** candidates are filtered to those whose PP
-  /// coordinate equals `ppGap` exactly. If none match, returns `null`.
+  /// coordinate equals `ppGap` exactly. If none match, returns `std::nullopt`.
   ///
   /// **Deterministic tie-breaking:** if multiple candidates share the same PP
   /// coordinate, the chosen candidate is the one with the highest priority by
@@ -892,7 +892,7 @@ private:
   /// \param ppGap  the PP gap index (between PP tokens) representing the
   ///               desired insertion coordinate
   /// \returns the TU byte offset of an exact canonical boundary matching
-  ///          `ppGap`, or `null` if `ppGap` is not exactly on a known boundary
+  ///          `ppGap`, or `std::nullopt` if `ppGap` is not exactly on a known boundary
   ///          (caller should fall back)
   std::optional<uint64_t>
   AnchorToExactSlotBoundaryFromPPGap(StringRef tuPath, uint64_t ppGap) const;
@@ -926,53 +926,48 @@ private:
     return bestId;
   }
 
-  /// \brief Computes the TU (translation unit) byte span [b, e) corresponding
-  /// to an A-side PP-token interval [a0, a1).
+  /// \brief Compute the TU (translation unit) byte span \c [b,e) that corresponds
+  /// to an A-side PP-token interval \c [a0,a1).
   ///
-  /// This method is used to convert a diff hunk expressed in A-token indices
-  /// into a concrete byte range in the TU source file. Its contract is
-  /// intentionally conservative: if the A-token interval does not touch the TU,
-  /// the method returns {-1, -1} rather than "snapping" to an arbitrary
-  /// TU neighbor, because snapping causes header/arm insertions to be
-  /// mis-owned as TU edits.
+  /// This routine converts a diff hunk expressed in A-token indices into a concrete
+  /// byte range in the TU source file. The contract is intentionally conservative:
+  /// if the interval cannot be proven to touch the TU (or cannot be safely anchored
+  /// into the TU for a pure insertion), the method returns \c std::nullopt rather
+  /// than "snapping" across ownership boundaries.
   ///
-  /// \par Contract
+  /// \par Behavior
+  /// 1. **Normalize indices:** if \p a0 > \p a1 the bounds are swapped.
+  /// 2. **Pure insertion fast-path:** if \p a0 == \p a1, first try to anchor on an
+  ///    *exact* canonical TU slot boundary recorded at the same PP gap via
+  ///    AnchorToExactSlotBoundaryFromPPGap(). If present, returns \c {b,b}.
+  /// 3. **Direct TU coverage:** for non-empty intervals, scan PP indices in
+  ///    \c [a0,a1) and consider only tokmap entries whose \c TokMapEntry::file equals
+  ///    \p tuPath. If any exist, returns the minimal enclosing TU byte span
+  ///    \c [min(ent.b), max(ent.e)).
+  /// 4. **No TU-mapped tokens:**
+  ///    - If \p a0 != \p a1 (non-empty interval) and no TU tokens were found,
+  ///      returns \c std::nullopt.
+  ///    - If \p a0 == \p a1 (pure insertion at PP gap \c pp = a0):
+  ///      * If the PP gap lies inside any include expansion (as determined by
+  ///        IncludeIdCoveringPPIndex(pp)), returns \c std::nullopt (header-owned).
+  ///      * In \c strict_ mode, consult only the immediate neighbors \c pp and
+  ///        \c pp-1: if either maps to the TU, anchor at \c right.b or \c left.e
+  ///        respectively (returning \c {b,b}); otherwise return \c std::nullopt.
+  ///      * In non-strict mode, the same immediate-neighbor check is performed
+  ///        first. If still unmapped, a bounded search (capped at 64 tokens) is
+  ///        performed left/right for the nearest mapped tokmap entry, stopping
+  ///        early if \c ownerDepthGap changes (when available). If any candidate
+  ///        neighbor maps to a non-TU file, returns \c std::nullopt. Otherwise
+  ///        anchors to the closest TU neighbor (tie-break to the right) and
+  ///        returns \c {b,b}.
   ///
-  /// 1. **Normalize indices:** if \p a0 > \p a1, the bounds are swapped so the
-  ///    interval is well-formed.
-  /// 2. **Direct TU coverage:** scan PP tokens in [\p a0, \p a1) and consider
-  /// only
-  ///    tokens whose \c TokMapEntry::file equals \p tuPath. If at least one
-  ///    such token exists, return the minimal enclosing TU byte range over
-  ///    those TU-mapped tokens: [min(ent.b), max(ent.e)).
-  /// 3. **No TU tokens in the interval:**
-  ///    - If \p a0 != \p a1 (non-empty interval) and no TU-mapped tokens were
-  ///      found, return {-1, -1}. This indicates "not TU-owned / no TU span".
-  ///    - If \p a0 == \p a1 (pure insertion at a PP gap):
-  ///      1. First, attempt to anchor on an *exact* canonical slot boundary
-  ///         recorded for the TU at the same PP coordinate via
-  ///         AnchorToExactSlotBoundaryFromPPGap(). If present, return {b, b}
-  ///         using that slot's TU byte offset.
-  ///      2. If no slot boundary exists at that PP coordinate, inspect the
-  ///         nearest mapped neighbors (left of \p a0 and right of \p a0):
-  ///         - If the insertion is bracketed by the same non-TU file (both
-  ///           neighbors map to the same header/include), return {-1, -1}.
-  ///         - If either neighbor maps to a non-TU file, return {-1, -1}.
-  ///         - Otherwise, anchor to the nearest TU neighbor:
-  ///           - If the right neighbor is TU-mapped, return {right.b, right.b}.
-  ///           - Else if the left neighbor is TU-mapped, return {left.e,
-  ///           left.e}.
-  ///           - Else return {-1, -1}.
+  /// A returned span \c {b,b} denotes a concrete insertion anchor point in the TU.
   ///
-  /// All intervals are half-open. The sentinel {-1, -1} means "no TU span /
-  /// not TU-owned". A zero-length span {b, b} denotes a concrete insertion
-  /// anchor point in the TU.
-  ///
-  /// \param a0 inclusive start A-side PP-token index.
-  /// \param a1 exclusive end A-side PP-token index.
-  /// \param tuPath absolute/canonical TU path that must match
-  /// TokMapEntry::file.
-  /// \return A pair representing the TU byte span [b, e), or nullopt
+  /// \param a0 Inclusive start A-side PP-token index.
+  /// \param a1 Exclusive end A-side PP-token index.
+  /// \param tuPath Absolute/canonical TU path (must match \c TokMapEntry::file).
+  /// \returns A TU byte span \c [b,e) (or \c {b,b} for a pure insertion anchor),
+  ///          or \c std::nullopt if no TU span/anchor can be derived safely.
   std::optional<std::pair<uint64_t, uint64_t>>
   TUByteSpan(uint64_t a0, uint64_t a1, StringRef tuPath) const;
 
@@ -1444,7 +1439,7 @@ private:
   ///
   /// If `oldSeg` cannot be classified as the full argument, a prefix, or a
   /// suffix of `baseArg`, or if `newArg` is not structurally compatible with
-  /// the inferred classification, this returns `std::nullopt`.
+  /// the inferred classification, this returns an empty `StringRef()`.
   ///
   /// \param baseArg original argument spelling (as written at the invocation
   ///                site)
@@ -1452,7 +1447,7 @@ private:
   /// \param oldSeg sub-segment from the pasted token that originated from
   ///               `baseArg`
   /// \returns the pasted-token replacement segment implied by
-  ///          `baseArg -> newArg`, or `std::nullopt` if the segment cannot be
+  ///          `baseArg -> newArg`, or an empty `StringRef()` if the segment cannot be
   ///          derived soundly.
   static StringRef DeriveNewPasteSegmentFromSpellingReplacement(
       StringRef baseArg, StringRef newArg, StringRef oldSeg);
@@ -1523,7 +1518,7 @@ private:
   /// * Suffix splice: `baseTrim` ends with `oldTrim`
   ///
   /// If `oldTrim` matches both the prefix and suffix (e.g., repeated text) or
-  /// matches neither, the splice is rejected and `std::nullopt` is returned.
+  /// matches neither, the splice is rejected and an empty string is returned.
   /// This avoids ambiguous rewrites that could change the meaning of the macro
   /// invocation or fail idempotence under re-preprocessing.
   ///
@@ -1538,7 +1533,7 @@ private:
   /// \param newSeg the replacement segment text observed in the edited pasted
   ///               token (B stream)
   /// \returns the rewritten argument spelling if a safe boundary splice is
-  ///          possible; otherwise `std::nullopt`.
+  ///          possible; otherwise an empty string.
   static std::string SplicePasteSegmentIntoSpellingArg(StringRef baseArg,
                                                        StringRef oldSeg,
                                                        StringRef newSeg);
@@ -2314,7 +2309,7 @@ private:
   /// "between-children" positions:
   /// - If `pos` lies *strictly inside* a child’s cover window
   ///   (`kid.coverBegin < pos && pos < kid.coverEnd`), this fallback does not
-  ///   apply and returns `-1` (the insertion should have been owned by that
+  ///   apply and returns `std::nullopt` (the insertion should have been owned by that
   ///   child include).
   /// - Boundary positions are allowed (`pos == kid.coverBegin` or
   ///   `pos == kid.coverEnd`) and are treated as being "between" children.
@@ -2332,7 +2327,7 @@ private:
   ///    by returning `right.siteB`.
   /// 2. Else if `left` exists, insert *after* the left child’s `#include` site
   ///    by returning `left.siteE`.
-  /// 3. Otherwise return `-1` to indicate that no sane anchor could be derived.
+  /// 3. Otherwise return `std::nullopt` to indicate that no sane anchor could be derived.
   ///
   /// This method does not validate that the returned site offsets are within
   /// the current header text bounds; callers should ensure the returned byte
@@ -2347,7 +2342,7 @@ private:
   ///             anchors.
   /// \return A byte offset within `file` at which the insertion should be
   /// applied,
-  ///         or `-1` if this fallback does not apply or no stable anchor can be
+  ///         or `std::nullopt` if this fallback does not apply or no stable anchor can be
   ///         found.
   std::optional<uint64_t> ComputeChildBoundaryInsertByte(const IncludePatch &p,
                                                          StringRef file) const;
@@ -2497,7 +2492,7 @@ private:
   ///
   /// If \p pp maps to an entry whose \c file matches the requested \p file,
   /// this returns the mapped begin byte offset (\c b). Otherwise, this returns
-  /// \p fileLen when \p fallbackToEOF is enabled, or -1 when fallback is
+  /// \p fileLen when \p fallbackToEOF is enabled, or `std::nullopt` when fallback is
   /// disabled.
   ///
   /// The \p fallbackToEOF behavior is intended for boundary cases where we want
@@ -2507,13 +2502,13 @@ private:
   ///
   /// \param file the file path whose mapping is being queried (TU or included
   ///        header)
-  /// \param pp the PP coordinate (typically a PP byte offset) to resolve
+  /// \param pp the PP token index in the A-side preprocessed token stream to resolve
   /// \param fallbackToEOF if true, return \p fileLen when \p pp does not map
   ///        into \p file
   /// \param fileLen the length of \p file in bytes (used only when
   ///        \p fallbackToEOF is true)
   /// \return the mapped start byte offset in \p file, or \p fileLen when
-  ///         falling back to EOF, or -1 if unmapped and fallback is disabled
+  ///         falling back to EOF, or `std::nullopt` if unmapped and fallback is disabled
   std::optional<uint64_t> ByteStartForPPInFile(StringRef file, uint64_t pp,
                                                bool fallbackToEOF,
                                                size_t fileLen) const {
@@ -2524,22 +2519,22 @@ private:
   }
 
   /// \brief Resolves the TU/file byte end offset corresponding to a PP
-  /// coordinatefor a specific file.
+  /// coordinate for a specific file.
   ///
   /// Analogous to ByteStartForPPInFile() but returns the mapped end byte offset
   /// (\c e). If \p pp maps to an entry whose \c file matches the requested \p
   /// file, this returns \c e. Otherwise, this returns \p fileLen when \p
-  /// fallbackToEOF is enabled, or -1 when fallback is disabled.
+  /// fallbackToEOF is enabled, or `std::nullopt` when fallback is disabled.
   ///
   /// \param file the file path whose mapping is being queried (TU or included
   ///        header)
-  /// \param pp the PP coordinate (typically a PP byte offset) to resolve
+  /// \param pp the PP token index in the A-side preprocessed token stream to resolve
   /// \param fallbackToEOF if true, return \p fileLen when \p pp does not map
   ///        into \p file
   /// \param fileLen the length of \p file in bytes (used only when
   ///        \p fallbackToEOF is true)
   /// \return the mapped end byte offset in \p file, or \p fileLen when falling
-  ///         back to EOF, or -1 if unmapped and fallback is disabled
+  ///         back to EOF, or `std::nullopt` if unmapped and fallback is disabled
   std::optional<uint64_t> ByteEndForPPInFile(StringRef file, uint64_t pp,
                                              bool fallbackToEOF,
                                              size_t fileLen) const {
