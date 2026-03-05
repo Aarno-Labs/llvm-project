@@ -897,7 +897,7 @@ std::string RefoldEngine::RefoldOnce() {
 
   // Instrumentation helpers for diagnosing duplicated hunk material:
   // Compare B-envelope selection derived from byte hunks vs token-level a2b.
-  auto TokEnvFromA2B =
+  auto tokEnvFromA2B =
       [&](uint64_t a0, uint64_t a1)
           -> std::optional<std::pair<size_t, size_t>> {
     if (a1 < a0)
@@ -947,7 +947,7 @@ std::string RefoldEngine::RefoldOnce() {
     return std::nullopt;
   };
 
-  auto TraceBEnv = [&](StringRef tag, StringRef label,
+  auto traceBEnv = [&](StringRef tag, StringRef label,
                        std::optional<std::pair<size_t, size_t>> env) {
     if (!inTraceMode())
       return;
@@ -964,7 +964,6 @@ std::string RefoldEngine::RefoldOnce() {
     trace(tag, "{0}: Btok=[{1},{2}) lead='{3}'", label, b0, b1,
           stringutils::showWSWithClip(lead, 220));
   };
-
 
   // Iterate over all hunks:
   for (size_t i = 0; i < hunks.size(); ++i) {
@@ -1032,16 +1031,16 @@ std::string RefoldEngine::RefoldOnce() {
                 "macro id={0} name='{1}' coverA=[{2},{3}) hunkA=[{4},{5}) hunkB=[{6},{7})",
                 m->id, m->name, m->cover.begin, m->cover.end, h.aStart, h.aEnd,
                 h.bStart, h.bEnd);
-          TraceBEnv("instr/macro", "cover byte",
+          traceBEnv("instr/macro", "cover byte",
                     MapATokRangeAToBTokenEnvelope(m->cover.begin,
                                                   m->cover.end));
-          TraceBEnv("instr/macro", "cover a2b",
-                    TokEnvFromA2B(m->cover.begin, m->cover.end));
-          TraceBEnv("instr/macro", "hunk byte",
+          traceBEnv("instr/macro", "cover a2b",
+                    tokEnvFromA2B(m->cover.begin, m->cover.end));
+          traceBEnv("instr/macro", "hunk byte",
                     MapATokRangeAToBTokenEnvelope(h.aStart, h.aEnd));
-          TraceBEnv("instr/macro", "hunk a2b",
-                    TokEnvFromA2B(h.aStart, h.aEnd));
-          TraceBEnv(
+          traceBEnv("instr/macro", "hunk a2b",
+                    tokEnvFromA2B(h.aStart, h.aEnd));
+          traceBEnv(
               "instr/macro", "hunk diff",
               std::make_optional(std::make_pair(
                   static_cast<size_t>(h.bStart), static_cast<size_t>(h.bEnd))));
@@ -6205,18 +6204,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             "DAG args-only: root inv id={0} name={1} leafCandidates={2}", m.id,
             m.name, leafCands.size());
 
-      auto ppArgSpanKindToString = [](PPArgSpanKind k) -> StringRef {
-        switch (k) {
-        case PPArgSpanKind::Standard:
-          return "standard";
-        case PPArgSpanKind::Stringify:
-          return "stringify";
-        case PPArgSpanKind::Paste:
-          return "paste";
-        }
-        return "unknown";
-      };
-
       for (const LeafCandidate &lc : leafCands) {
         const RefoldModel::MacroInvocation &leaf = *lc.inv;
 
@@ -6243,8 +6230,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           debug("macro/dag",
                 "  leafSpan[{0}]: kind={1} argIdx={2} ppTok=[{3},{4}) "
                 "ppByte=[{5},{6}]",
-                i, ppArgSpanKindToString(sp.kind), sp.argIdx, sp.begin, sp.end,
-                ppBB, ppBE);
+                i, sp.kind, sp.argIdx, sp.begin, sp.end, ppBB, ppBE);
         }
       }
 
