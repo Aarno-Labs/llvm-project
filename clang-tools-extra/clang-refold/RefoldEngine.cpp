@@ -439,13 +439,16 @@ std::string RefoldEngine::Refold() {
   for (unsigned tier = startEscalationTier_; tier <= kMaxTier; ++tier) {
     escalationTier_ = tier;
     ResetEscalationState();
+    ResetAttemptStats();
 
     if (tier != 0)
       debug("escalate", "ESCALATION tier={0}: retrying refold", tier);
 
     std::string out = RefoldOnce();
-    if (!escalationRequested_)
+    if (!escalationRequested_) {
+      EmitRefoldStats();
       return out;
+    }
 
     debug("escalate", "ESCALATION tier={0}: requested; advancing. reasons={1}",
           tier, escalationReasons_.size());
@@ -459,6 +462,17 @@ std::string RefoldEngine::Refold() {
         escalationReasons_.size());
   for (const auto &r : escalationReasons_)
     debug("escalate", "  {0}", r);
+  lastStats_ = RefoldStats{};
+  lastStats_.totalIncludes = model_.GetIncludes().size();
+  lastStats_.expandedIncludes = lastStats_.totalIncludes;
+  for (const auto &mi : model_.GetMacroInvocations()) {
+    if (!mi.callerMacroId)
+      ++lastStats_.totalMacros;
+  }
+  lastStats_.expandedMacros = lastStats_.totalMacros;
+  lastStats_.tier = kMaxTier + 1;
+  lastStats_.terminalFallbackToB = true;
+  EmitRefoldStats();
   return bSource_.str();
 }
 
@@ -885,6 +899,12 @@ std::string RefoldEngine::RefoldOnce() {
 
   // 4) Classify hunks and collect per-target edits.
   std::vector<TextEdit> tuEdits;
+
+  // Collect the set of root macro invocation ids that remain expanded in the
+  // final chosen refold result. This is populated only by edits that survive
+  // into the final applied text so the reported stats reflect the emitted
+  // result rather than intermediate patch candidates.
+  DenseSet<uint64_t> appliedExpandedMacroRootIds;
   DenseMap<uint64_t, IncludeEdits> perInclude; // includeId -> edits
   DenseMap<std::optional<uint64_t>, std::vector<MacroPatch>>
       macroPatchesByOwner;
@@ -1054,6 +1074,7 @@ std::string RefoldEngine::RefoldOnce() {
             else
               trace("macro", "callsite patch overwritten inv id={0}", m->id);
           }
+          updated->macroId = patchKey;
           byMacroId[patchKey] = std::move(*updated);
         }
         continue;
@@ -1488,8 +1509,31 @@ std::string RefoldEngine::RefoldOnce() {
   for (uint64_t incId : seeds) {
     debug("include/mat", "materialize seed include #{0}", incId);
     MaterializeIncludeExpansion(incId, perInclude, macroPatchesByOwner,
-                                children, includeExpansion);
+                                children, includeExpansion,
+                                &appliedExpandedMacroRootIds);
   }
+
+
+  DenseSet<uint64_t> expandedIncludeIds;
+  if (ForceInlineTouchedIncludesFromB()) {
+    SmallVector<uint64_t, 32> stack;
+    for (const auto &kv : includeExpansion)
+      stack.push_back(kv.first);
+    while (!stack.empty()) {
+      const uint64_t id = stack.pop_back_val();
+      if (!expandedIncludeIds.insert(id).second)
+        continue;
+      auto childIt = children.find(id);
+      if (childIt == children.end())
+        continue;
+      for (const RefoldModel::IncludeItem *child : childIt->second)
+        stack.push_back(child->id);
+    }
+  } else {
+    for (const auto &kv : includeExpansion)
+      expandedIncludeIds.insert(kv.first);
+  }
+  lastStats_.expandedIncludes = expandedIncludeIds.size();
 
   // 6a) TU macro patches (ownerIncludeId == std::nullopt) and include
   // expansions at TU sites.
@@ -1543,7 +1587,10 @@ std::string RefoldEngine::RefoldOnce() {
         ResyncOutcome ro = ApplyResyncOrPend(tuBytes, mp.invStart, mpEnd,
                                              mp.replacement, tuPath);
         tuEdits.push_back(TextEdit{mp.invStart, mpEnd, std::move(ro.text),
-                                   std::move(ro.pending)});
+                                   std::move(ro.pending),
+                                   MacroPatchRemainsExpanded(mp)
+                                       ? std::make_optional(GetRootMacroId(mp.macroId))
+                                       : std::nullopt});
       } else {
         trace("macro/tu", "  TU macro patch shadowed (skipped) inv=[{0},{1})",
               mp.invStart, mpEnd);
@@ -1611,7 +1658,8 @@ std::string RefoldEngine::RefoldOnce() {
 
   // Apply TU edits in descending order of start offset.
   debug("tu/apply", "applying {0} TU edits", tuEdits.size());
-  std::string tuResult = ApplyTextEditsWithPendingResync(tuBytes, tuEdits);
+  std::string tuResult = ApplyTextEditsWithPendingResync(
+      tuBytes, tuEdits, &appliedExpandedMacroRootIds);
 
   // If the TU contains built-in macros whose expansion depends on the
   // preprocessor logical file (notably __FILE__/__FILE_NAME__),
@@ -1660,6 +1708,15 @@ std::string RefoldEngine::RefoldOnce() {
     }
   }
   // Note: escalation handling is performed by the outer ladder in Refold().
+
+  if (ForceInlineTouchedIncludesFromB()) {
+    for (const auto &mi : model_.GetMacroInvocations()) {
+      if (mi.ownerIncludeId &&
+          expandedIncludeIds.find(*mi.ownerIncludeId) != expandedIncludeIds.end())
+        appliedExpandedMacroRootIds.insert(GetRootMacroId(mi.id));
+    }
+  }
+  lastStats_.expandedMacros = appliedExpandedMacroRootIds.size();
 
   debug("plan", "REFOLD DONE tuResultLen={0}", tuResult.size());
   return tuResult;
@@ -4232,7 +4289,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
 
         trace("macro/args", "  args-only SUCCESS newInv='{0}'",
               stringutils::showWSWithClip(newInv, 200));
-        return MacroPatch{*m.invB, *m.invE, std::move(newInv),
+        return MacroPatch{*m.invB, *m.invE, std::move(newInv), 0,
                          EffectiveCurriedHead(m)};
       }
     }
@@ -4279,7 +4336,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
           stringutils::replaceRange(baseInvText, r.first, r.second, newArg);
       trace("macro/args", "  args-only SUCCESS newInv='{0}'",
             stringutils::showWSWithClip(newInv, 200));
-      return MacroPatch{*m.invB, *m.invE, std::move(newInv),
+      return MacroPatch{*m.invB, *m.invE, std::move(newInv), 0,
                        EffectiveCurriedHead(m)};
     }
 
@@ -4479,7 +4536,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
                                          replByArgIdx[argIdx]);
   }
 
-  return MacroPatch{*m.invB, *m.invE, std::move(finalInv),
+  return MacroPatch{*m.invB, *m.invE, std::move(finalInv), 0,
                    EffectiveCurriedHead(m)};
 }
 
@@ -5653,9 +5710,10 @@ void RefoldEngine::AddForcedCounterPatches(
           m.id, m.name, m.ownerIncludeId, *invStart, *invEnd,
           stringutils::showWSWithClip(*replOpt, 64), req.aStart, req.aEnd);
 
-    byMacroId[patchKey] =
-        MacroPatch{*invStart, *invEnd, std::move(*replOpt),
-                  EffectiveCurriedHead(m)};
+    MacroPatch patch{*invStart, *invEnd, std::move(*replOpt)};
+    patch.macroId = patchKey;
+    patch.preserveFinalSuffixGroup = EffectiveCurriedHead(m);
+    byMacroId[patchKey] = std::move(patch);
   }
 }
 
@@ -5699,7 +5757,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         repl = SliceBSource(bEnv->first, bEnv->second).trim().str();
     }
     if (repl)
-      return MacroPatch{*invStart, *invEnd, std::move(*repl),
+      return MacroPatch{*invStart, *invEnd, std::move(*repl), 0,
                        EffectiveCurriedHead(m)};
   }
 
@@ -7033,7 +7091,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   if (bTokEnd <= bTokStart)
     return std::nullopt;
   std::string clipped = SliceBSourceClippedAgainstClaims(bTokStart, bTokEnd);
-  return MacroPatch{*invStart, *invEnd, StringRef(clipped).trim().str(),
+  return MacroPatch{*invStart, *invEnd, StringRef(clipped).trim().str(), 0,
                    EffectiveCurriedHead(m)};
 }
 
@@ -7078,6 +7136,21 @@ bool RefoldEngine::InvocationSpanMatchesCallsitePrefix(
   return (j < n && invSpanText[j] == '(');
 }
 
+uint64_t RefoldEngine::GetRootMacroId(uint64_t macroId) const {
+  const RefoldModel::MacroInvocation *cur = FindMacroInvocationById(macroId);
+  if (!cur)
+    return macroId;
+
+  while (cur->callerMacroId) {
+    const RefoldModel::MacroInvocation *parent =
+        FindMacroInvocationById(*cur->callerMacroId);
+    if (!parent)
+      break;
+    cur = parent;
+  }
+  return cur->id;
+}
+
 // ============ Include processing (normalize, materialize, apply) =============
 
 void RefoldEngine::MaterializeIncludeExpansion(
@@ -7086,7 +7159,8 @@ void RefoldEngine::MaterializeIncludeExpansion(
         &macroPatchesByOwner,
     const DenseMap<uint64_t, std::vector<const RefoldModel::IncludeItem *>>
         &children,
-    DenseMap<uint64_t, std::string> &includeExpansion) const {
+    DenseMap<uint64_t, std::string> &includeExpansion,
+    DenseSet<uint64_t> *appliedExpandedMacroRootIds) const {
   // Already materialized?
   if (includeExpansion.count(includeId)) {
     debug("include/mat", "SKIP inc#{0} (already materialized)", includeId);
@@ -7182,7 +7256,10 @@ void RefoldEngine::MaterializeIncludeExpansion(
       ResyncOutcome ro = ApplyResyncOrPend(bytes, mp.invStart, mpEnd,
                                            mp.replacement, headerPath);
       edits.push_back(TextEdit{mp.invStart, mpEnd, std::move(ro.text),
-                               std::move(ro.pending)});
+                               std::move(ro.pending),
+                               MacroPatchRemainsExpanded(mp)
+                                   ? std::make_optional(GetRootMacroId(mp.macroId))
+                                   : std::nullopt});
     }
   }
 
@@ -7252,7 +7329,8 @@ void RefoldEngine::MaterializeIncludeExpansion(
 
       // Ensure the child is materialized first (depth-first).
       MaterializeIncludeExpansion(child->id, perInclude, macroPatchesByOwner,
-                                  children, includeExpansion);
+                                  children, includeExpansion,
+                                  appliedExpandedMacroRootIds);
 
       // The child directive's site is recorded in the includer byte space.
       const auto &childText = includeExpansion[child->id];
@@ -7292,7 +7370,8 @@ void RefoldEngine::MaterializeIncludeExpansion(
 
   debug("include/mat", "inc#{0} applying {1} header TextEdits", inc->id,
         edits.size());
-  std::string applied = ApplyTextEditsWithPendingResync(bytes, edits);
+  std::string applied = ApplyTextEditsWithPendingResync(
+      bytes, edits, appliedExpandedMacroRootIds);
   includeExpansion[includeId] = std::move(applied);
   debug("include/mat", "EXIT inc#{0} resultLen={1}", inc->id,
         includeExpansion[includeId].size());
@@ -7820,8 +7899,9 @@ RefoldEngine::ApplyResyncOrPend(StringRef originalFileText, uint64_t start,
 }
 
 std::string
-RefoldEngine::ApplyTextEditsWithPendingResync(StringRef originalFileText,
-                                              ArrayRef<TextEdit> edits) const {
+RefoldEngine::ApplyTextEditsWithPendingResync(
+    StringRef originalFileText, ArrayRef<TextEdit> edits,
+    DenseSet<uint64_t> *appliedExpandedMacroRootIds) const {
   if (edits.empty())
     return originalFileText.str();
 
@@ -7952,6 +8032,9 @@ RefoldEngine::ApplyTextEditsWithPendingResync(StringRef originalFileText,
     // Pass the SmallString to the appender.
     pending = AppendOriginalSliceWithPending(out, originalFileText, cursor,
                                              e.start, std::move(pending));
+
+    if (appliedExpandedMacroRootIds && e.expandedMacroRootId)
+      appliedExpandedMacroRootIds->insert(*e.expandedMacroRootId);
 
     out.append(e.text);
 

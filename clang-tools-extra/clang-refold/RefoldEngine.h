@@ -212,6 +212,17 @@ private:
   LineDirectiveInserter lineDirs_;
   bool strict_;
 
+  struct RefoldStats {
+    uint64_t totalIncludes = 0;
+    uint64_t expandedIncludes = 0;
+    uint64_t totalMacros = 0;
+    uint64_t expandedMacros = 0;
+    unsigned tier = 0;
+    bool terminalFallbackToB = false;
+  };
+
+  RefoldStats lastStats_;
+
   // Escalation scaffold: if any edit/patch cannot be applied deterministically
   // under the structural policy, record the failure and fall back to emitting
   // the fully expanded edited preprocessed stream (B). This guarantees that we
@@ -260,6 +271,42 @@ private:
   void ResetEscalationState() const {
     escalationRequested_ = false;
     escalationReasons_.clear();
+  }
+
+  /// Reset the per-attempt refold statistics to a clean baseline.
+  ///
+  /// This clears the counters accumulated for the current refolding attempt and
+  /// reinitializes the invariant totals from the loaded refold model. The
+  /// include total is the size of the recorded include tree. The macro total is
+  /// the number of top-level macro invocation roots recorded during
+  /// preprocessing, excluding nested expansion nodes that are attributable to an
+  /// outer caller via \c callerMacroId. The current escalation tier is also
+  /// snapshotted so that the emitted statistics reflect the tier under which
+  /// the attempt ran.
+  void ResetAttemptStats() {
+    lastStats_ = RefoldStats{};
+    lastStats_.totalIncludes = model_.GetIncludes().size();
+    for (const auto &mi : model_.GetMacroInvocations()) {
+      if (!mi.callerMacroId)
+        ++lastStats_.totalMacros;
+    }
+    lastStats_.tier = escalationTier_;
+  }
+
+  /// Emit a one-line summary of the final refolding statistics.
+  ///
+  /// The summary reports how many includes and top-level macro invocations
+  /// remained expanded in the chosen refold result, relative to the total
+  /// number of includes and root macro invocations recorded in the model. The
+  /// output also includes the escalation tier used for the winning attempt and
+  /// annotates the line when refolding terminated by falling back to the fully
+  /// expanded B-side text.
+  void EmitRefoldStats() const {
+    info("stats",
+         "includes-expanded={0}/{1} macros-expanded={2}/{3} tier={4}{5}",
+         lastStats_.expandedIncludes, lastStats_.totalIncludes,
+         lastStats_.expandedMacros, lastStats_.totalMacros, lastStats_.tier,
+         lastStats_.terminalFallbackToB ? " terminal-fallback=B" : "");
   }
 
   /// Per-gap ownership depth for insertion before PP token k (k in [0..N]).
@@ -478,6 +525,10 @@ private:
     uint64_t start, end;
     std::string text;
     std::optional<PendingResync> pending;
+
+    // Root macro invocation id to charge as expanded if this edit survives
+    // normalization and is applied in the final chosen refold result.
+    std::optional<uint64_t> expandedMacroRootId = std::nullopt;
   };
 
   struct PasteArgEdit {
@@ -492,6 +543,11 @@ private:
   struct MacroPatch {
     uint64_t invStart, invEnd;
     std::string replacement;
+
+    // Canonical macro invocation id for this physical callsite patch. This is
+    // used only for statistics attribution; the patch itself is still keyed by
+    // byte span and owner.
+    uint64_t macroId = 0;
 
     // When true, preserve the final '(...)' suffix group immediately following
     // the invocation site when extending chained call spans. This is driven by
@@ -2053,6 +2109,58 @@ private:
   bool InvocationSpanMatchesCallsitePrefix(
       StringRef invSpanText, const RefoldModel::MacroInvocation &m) const;
 
+  /// \brief Look up a macro invocation record by its stable refold-model id.
+  ///
+  /// The refold metadata stores each macro invocation with a unique id and may
+  /// reference that id from nested invocations, patches, and statistics logic.
+  /// This helper performs a linear scan over the recorded invocation list and
+  /// returns the matching metadata node when present.
+  ///
+  /// \param macroId Model-assigned macro invocation id to resolve.
+  /// \returns The matching \c MacroInvocation, or \c nullptr if the id is not
+  ///          present in the loaded model.
+  const RefoldModel::MacroInvocation *
+  FindMacroInvocationById(uint64_t macroId) const {
+    for (const auto &mi : model_.GetMacroInvocations()) {
+      if (mi.id == macroId)
+        return &mi;
+    }
+    return nullptr;
+  }
+
+  /// \brief Return the top-level macro invocation that owns \p macroId.
+  ///
+  /// Macro invocations in the refold model may form a caller chain via
+  /// \c callerMacroId when one macro expansion is nested within another. This
+  /// helper follows that chain to the unique root invocation representing the
+  /// user-visible callsite in source.
+  ///
+  /// \param macroId Model-assigned macro invocation id whose root should be
+  ///        computed.
+  /// \returns The id of the outermost invocation in the caller chain. If
+  ///          \p macroId is unknown, returns \p macroId unchanged.
+  uint64_t GetRootMacroId(uint64_t macroId) const;
+
+  /// \brief Return whether a macro patch leaves its owning root callsite
+  ///        expanded in the final refolded source.
+  ///
+  /// A patch is considered to remain expanded when its replacement text does
+  /// not reconstruct the original macro call spelling at the root callsite.
+  /// This predicate is used only for statistics attribution: nested/internal
+  /// macro work is charged back to the root user-visible invocation exactly
+  /// once.
+  ///
+  /// \param patch Macro patch candidate to classify.
+  /// \returns True if the patch should count as an expanded macro in the final
+  ///          statistics, false if it preserves/reconstructs the macro callsite.
+  bool MacroPatchRemainsExpanded(const MacroPatch &patch) const {
+    const RefoldModel::MacroInvocation *mi =
+        FindMacroInvocationById(patch.macroId);
+    if (!mi)
+      return true;
+    return !InvocationSpanMatchesCallsitePrefix(patch.replacement, *mi);
+  }
+
   /// \brief Applies a deterministic, stable ordering to include-scoped
   /// insertion patches.
   ///
@@ -2137,21 +2245,28 @@ private:
   /// \param includeId           Unique ID of the include to materialize.
   /// \param perInclude          Map of include ID → include-level A/B edits
   ///                            (insert/delete/replace).
-  /// \param macroPatchesByOwner Map of include ID → macro patches whose
-  ///                            invocation ranges are in that include’s byte
-  ///                            space.
+  /// \param macroPatchesByOwner Map of owner ID → macro patches whose
+  ///                            invocation ranges are expressed in that owner’s
+  ///                            byte space. Include-owned patches are applied
+  ///                            directly here; TU-owned patches are handled by
+  ///                            the TU materialization path.
   /// \param children            Map of parent include ID → direct child include
   ///                            items (with `siteB` / `siteE` in the parent).
   /// \param includeExpansion    Cache/output: include ID → fully materialized
   ///                            header bytes; may be preseeded with raw header
   ///                            text.
+  /// \param appliedExpandedMacroRootIds Optional output set that, when non-null,
+  ///                            records root macro invocation ids for macro
+  ///                            patches that remain expanded after being applied
+  ///                            while materializing this include subtree.
   void MaterializeIncludeExpansion(
       uint64_t includeId, const DenseMap<uint64_t, IncludeEdits> &perInclude,
       const DenseMap<std::optional<uint64_t>, std::vector<MacroPatch>>
           &macroPatchesByOwner,
       const DenseMap<uint64_t, std::vector<const RefoldModel::IncludeItem *>>
           &children,
-      DenseMap<uint64_t, std::string> &includeExpansion) const;
+      DenseMap<uint64_t, std::string> &includeExpansion,
+      DenseSet<uint64_t> *appliedExpandedMacroRootIds = nullptr) const;
 
   /// \brief Selects the most appropriate HeaderDecl within an IncludeItem to
   /// serve as the declaration-level anchor for an include-scoped patch.
@@ -2436,10 +2551,15 @@ private:
   ///        against.
   /// \param edits Non-overlapping edits expressed in offsets of
   ///        originalFileText.
+  /// \param appliedExpandedMacroRootIds Optional output set that, when non-null,
+  ///        records root macro invocation ids for edits whose final applied
+  ///        replacement leaves the corresponding macro expanded in the emitted
+  ///        text.
   /// \return The edited file text with any necessary #line directives emitted
   ///         (locally or deferred).
-  std::string ApplyTextEditsWithPendingResync(StringRef originalFileText,
-                                              ArrayRef<TextEdit> edits) const;
+  std::string ApplyTextEditsWithPendingResync(
+      StringRef originalFileText, ArrayRef<TextEdit> edits,
+      DenseSet<uint64_t> *appliedExpandedMacroRootIds = nullptr) const;
 
   /// \brief Appends an unchanged slice of the original file original[from:to)
   /// into out, while attempting to flush a previously-deferred PendingResync at
