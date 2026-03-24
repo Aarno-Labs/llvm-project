@@ -751,13 +751,6 @@ static cl::alias StrictModeShort("s", cl::desc("Alias for --strict"),
                                  cl::aliasopt(StrictMode),
                                  cl::cat(RefoldCategory));
 
-static cl::opt<bool> Harden(
-    "harden",
-    cl::desc(
-        "Iteratively refold and verify; retry with more conservative policies "
-        "until token check passes (off by default)"),
-    cl::init(false), cl::cat(RefoldCategory));
-
 static constexpr char Overview[] = R"(
   Deterministically reconstruct partially expanded C source from edited
   preprocessed output.
@@ -802,10 +795,6 @@ int main(int argc, char **argv) {
   // the error message would otherwise be misleading, stating that the option
   // must be specified at least once, which is not the case here.
   const bool onlyCheck = (CheckSrcPath.getNumOccurrences() != 0);
-  if (Harden && onlyCheck) {
-    fatal("cli",
-          "invalid option combination: --harden cannot be used with --check");
-  }
 
   // Enforce exactly one supported invocation mode:
   //   (1) Refold:
@@ -920,135 +909,6 @@ int main(int argc, char **argv) {
     return 0;
   }
 
-  if (!onlyCheck && Harden) {
-    // Harden mode:
-    //   refold -> preprocess/compare -> (retry at higher tiers) -> success
-    // This uses the same preprocessing/token check as --check.
-    auto ctxOrErr = parsePPCtx(rootJson);
-    if (!ctxOrErr) {
-      handleAllErrors(ctxOrErr.takeError(), [&](const ErrorInfoBase &e) {
-        fatal("model", "failed to parse pp_ctx from refold map: {0}",
-              e.message());
-      });
-    }
-
-    // Preprocess the edited preprocessed file B once.
-    std::string bPPBytes;
-    {
-      auto ppOrErr = preprocessToBytes(PPModPath, *ctxOrErr);
-      if (!ppOrErr) {
-        handleAllErrors(ppOrErr.takeError(), [&](const ErrorInfoBase &e) {
-          fatal("pp", "failed to preprocess --pp-mod input: {0}", e.message());
-        });
-      }
-      bPPBytes = std::move(*ppOrErr);
-    }
-
-    std::vector<PPTok> bPPToks;
-    std::vector<std::size_t> bPPTokOff;
-    lexPPTokens(bPPBytes, bPPToks, bPPTokOff);
-    if (bPPTokOff.empty() || bPPTokOff.back() != bPPBytes.size()) {
-      if (bPPTokOff.empty() || bPPTokOff.back() < bPPBytes.size())
-        bPPTokOff.push_back(bPPBytes.size());
-    }
-
-    std::vector<uint8_t> noLinesIgnoreMask;
-    if (NoLines) {
-      auto maskOrErr = buildNoLinesIgnoreMask(rootJson, *ctxOrErr, bPPToks);
-      if (!maskOrErr) {
-        handleAllErrors(maskOrErr.takeError(), [&](const ErrorInfoBase &e) {
-          fatal("harden", "failed to build --no-lines ignore mask: {0}",
-                e.message());
-        });
-      }
-      noLinesIgnoreMask = std::move(*maskOrErr);
-    }
-
-    auto writeTextFile = [&](StringRef path, StringRef text) {
-      std::error_code ec;
-      raw_fd_ostream os(path, ec, sys::fs::OF_Text);
-      if (ec)
-        fatal("src/write", "cannot write {0}: {1}", path, ec.message());
-      os << text;
-      os.close();
-    };
-
-    auto preprocessPath = [&](StringRef path) -> std::string {
-      auto ppOrErr = preprocessToBytes(path, *ctxOrErr);
-      if (!ppOrErr) {
-        handleAllErrors(ppOrErr.takeError(), [&](const ErrorInfoBase &e) {
-          fatal("pp", "failed to preprocess input '{0}': {1}", path,
-                e.message());
-        });
-      }
-      return std::move(*ppOrErr);
-    };
-
-    auto verifyOutput = [&](StringRef outText) -> Error {
-      // Write the candidate output to the final output path so preprocessing
-      // observes the same file identity as the user will consume.
-      writeTextFile(ModifiedSrcPath, outText);
-      std::string outPP = preprocessPath(ModifiedSrcPath);
-
-      std::vector<PPTok> outPPToks;
-      std::vector<std::size_t> outPPOff;
-      lexPPTokens(outPP, outPPToks, outPPOff);
-      if (outPPOff.empty() || outPPOff.back() != outPP.size()) {
-        if (outPPOff.empty() || outPPOff.back() < outPP.size())
-          outPPOff.push_back(outPP.size());
-      }
-
-      // Use the shared compareTokens implementation via RefoldEngine's
-      // verification logic.
-      if (NoLines) {
-        return compareTokensNoLinesAware(outPPToks, bPPToks, noLinesIgnoreMask);
-      }
-      return compareTokens(outPPToks, bPPToks);
-    };
-
-    // Try increasingly conservative refold tiers.
-    constexpr unsigned kMaxTier = 2;
-    bool ok = false;
-    for (unsigned startTier = 0; startTier <= kMaxTier; ++startTier) {
-      info("harden", "attempt tier={0}", startTier);
-      auto refoldedOrErr = RefoldEngine::Refold(
-          rootJson, aBytes, aToks, aTokByteOff, bBytes, bToks, bTokByteOff,
-          /*noLines=*/NoLines, /*strict=*/StrictMode,
-          /*startEscalationTier=*/startTier);
-      if (!refoldedOrErr) {
-        handleAllErrors(refoldedOrErr.takeError(), [&](const ErrorInfoBase &e) {
-          fatal("refold", "refold failed at tier {0}: {1}", startTier,
-                e.message());
-        });
-      }
-
-      if (Error err = verifyOutput(*refoldedOrErr)) {
-        debug("harden", "tier {0} verification failed: {1}", startTier,
-              toString(std::move(err)));
-        continue;
-      }
-      ok = true;
-      break;
-    }
-
-    if (!ok) {
-      // Terminal, guaranteed-pass attempt: emit B verbatim, then verify.
-      info("harden", "terminal fallback: emitting B verbatim");
-      if (Error err = verifyOutput(bBytes)) {
-        // If even the terminal fallback cannot satisfy the token check, then
-        // convergence is not guaranteed under this preprocessing context.
-        fatal("harden",
-              "--harden cannot converge: terminal fallback (emit B) still "
-              "fails token check: {0}",
-              toString(std::move(err)));
-      }
-    }
-
-    info("finished", "wrote refolded C source (hardened): {0}",
-         ModifiedSrcPath);
-    return 0;
-  }
-
   if (onlyCheck) {
     // Verification mode (normal comparison): compare preprocessed token
     // streams directly. The --no-lines special-case is handled above.
@@ -1064,7 +924,7 @@ int main(int argc, char **argv) {
   // Default behavior: single refold.
   auto refoldedOrErr = RefoldEngine::Refold(
       rootJson, aBytes, aToks, aTokByteOff, bBytes, bToks, bTokByteOff,
-      NoLines, StrictMode, /*startEscalationTier=*/0);
+      NoLines, StrictMode);
   if (!refoldedOrErr) {
     handleAllErrors(refoldedOrErr.takeError(), [&](const ErrorInfoBase &e) {
       fatal("model", "failed to parse refold model: {0}", e.message());
