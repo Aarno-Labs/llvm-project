@@ -207,8 +207,7 @@ bool RefoldEngine::EffectiveCurriedHead(
 Expected<std::string> RefoldEngine::Refold(
     const json::Object &rootJson, StringRef aSource, ArrayRef<PPTok> aToks,
     ArrayRef<size_t> aTokOff, StringRef bSource, ArrayRef<PPTok> bToks,
-    ArrayRef<size_t> bTokOff, bool noLines, bool strict,
-    unsigned startEscalationTier) {
+    ArrayRef<size_t> bTokOff, bool noLines, bool strict) {
   // Build the refold model based on the parsed JSON object.
   auto mOrErr = RefoldModel::FromJson(rootJson);
   if (!mOrErr)
@@ -217,7 +216,6 @@ Expected<std::string> RefoldEngine::Refold(
   // Construct an engine and run the instance pipeline.
   RefoldEngine engine(std::move(*mOrErr), aSource, aToks, aTokOff, bSource,
                       bToks, bTokOff, noLines, strict);
-  engine.startEscalationTier_ = startEscalationTier;
   return engine.Refold();
 }
 
@@ -436,7 +434,7 @@ std::string RefoldEngine::Refold() {
   // If escalation is still requested after tier 2, emit the fully expanded
   // edited preprocessed stream (B).
   constexpr unsigned kMaxTier = 2;
-  for (unsigned tier = startEscalationTier_; tier <= kMaxTier; ++tier) {
+  for (unsigned tier = 0; tier <= kMaxTier; ++tier) {
     escalationTier_ = tier;
     ResetEscalationState();
     ResetAttemptStats();
