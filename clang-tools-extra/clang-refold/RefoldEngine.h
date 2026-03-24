@@ -1915,6 +1915,18 @@ private:
   std::optional<std::pair<size_t, size_t>>
   MapATokRangeAToBTokenEnvelope(uint64_t beginTok, uint64_t endTok) const;
 
+  /// \brief Map an A-token range to its B-token envelope for whole-cover
+  /// replacement.
+  ///
+  /// Unlike \c MapATokRangeAToBTokenEnvelope, this preserves pure-insertion
+  /// payloads anchored exactly at the A-range boundaries. Whole-cover macro
+  /// replacement wants the full B-side image of the cover, and later claim
+  /// clipping is responsible for preventing duplicate emission of standalone
+  /// boundary insertions.
+  std::optional<std::pair<size_t, size_t>>
+  MapATokRangeAToBTokenEnvelopeWholeCover(uint64_t beginTok,
+                                          uint64_t endTok) const;
+
   /// \brief Variant of `MapATokRangeAToBTokenEnvelope` that trims *edge* pure
   /// insertion hunks from the resulting B-token envelope.
   ///
@@ -2018,6 +2030,14 @@ private:
   SmallVector<ForcedMacroPatchRequest, 32>
   ComputeForcedCounterPatches(StringRef tuPath, ArrayRef<int64_t> a2b) const;
 
+  /// \brief Compute additional forced patches when an earlier counter-
+  ///        consuming macro remains expanded after normal attribution.
+  SmallVector<ForcedMacroPatchRequest, 32>
+  ComputeForcedCounterPatchesFromExpandedMacros(
+      StringRef tuPath,
+      const DenseMap<std::optional<uint64_t>, DenseMap<uint64_t, MacroPatch>>
+          &macroPatchByOwnerByMacroId) const;
+
   /// \brief Inject forced __COUNTER__ stabilization patches after normal hunk
   /// attribution.
   ///
@@ -2091,6 +2111,22 @@ private:
       StringRef baseInvText,
       const DenseMap<std::optional<uint64_t>, DenseMap<uint64_t, MacroPatch>>
           &patchMap) const;
+
+  /// \brief Return whether a nested macro may use whole-cover fallback at its
+  ///        own callsite.
+  ///
+  /// Whole-cover replacement of a nested child macro is only safe when the
+  /// child's cover interval is entirely accounted for by tokens owned by that
+  /// child (or its descendants). If the cover includes caller-owned tokens,
+  /// replacing just the child invocation with the child cover would splice a
+  /// partial expanded surface into the parent callsite.
+  ///
+  /// Top-level macros are always eligible. Nested macros are eligible only when
+  /// every token in \c m.cover is covered by authoritative subtree-owned spans
+  /// (body/arg/stringify/paste, with a spans fallback only for nodes that lack
+  /// detailed span metadata).
+  bool NestedWholeCoverIsSelfContained(
+      const RefoldModel::MacroInvocation &m) const;
 
   /// \brief Validates that a raw source span contains a valid macro callsite
   /// prefix matching the invocation metadata.
