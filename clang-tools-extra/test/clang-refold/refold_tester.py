@@ -4,6 +4,7 @@ import os
 import sys
 import subprocess
 import shlex
+import shutil
 import platform
 from pathlib import Path
 
@@ -107,6 +108,8 @@ def main():
   out_mod = os.path.join(tmp_out, f'{testname}.c.mod')
   out_out = os.path.join(tmp_out, f'{testname}.out')
   verify_out = os.path.join(tmp_out, f'{testname}.verify-out')
+  src_out = os.path.join(tmp_out, src_basename)
+  out_i_mod = os.path.join(tmp_out, f'{testname}.c.i.mod')
 
   # Expected artifacts
   # exp_json = os.path.join(exp_base, f'{testname}.c.refold.json')
@@ -157,6 +160,8 @@ def main():
       f'--out {shlex.quote(out_mod)}'
   )
   run(clang_refold_cmd, out_out)
+  shutil.copy2(src, src_out)
+  shutil.copy2(exp_i_mod, out_i_mod)
 
   # 4) Compare final refolded output
   run(f'diff -u {shlex.quote(exp_mod)} {shlex.quote(out_mod)}')

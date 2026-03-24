@@ -573,12 +573,6 @@ std::string RefoldEngine::RefoldOnce() {
        model_.GetIncludes().size(), model_.GetMacroInvocations().size(),
        model_.GetTokmapByPP().size());
 
-  // __COUNTER__ stabilization:
-  // If any expanded __COUNTER__ occurrence is edited in B, then that occurrence
-  // and every subsequent __COUNTER__ occurrence in PP-token order must be
-  // emitted as a literal expansion (whole-cover), even if unchanged.
-  auto forcedCounters = ComputeForcedCounterPatches(tuPath, a2b);
-
   // 3) Diff hunks (changed A-token intervals -> B-token intervals).
   auto hunks = diffutils::hunksFromMap(a2b, aSeq.size(), bSeq.size());
 
@@ -1011,73 +1005,94 @@ std::string RefoldEngine::RefoldOnce() {
         debug("classify",
               "#{0} -> MACRO invText={1} owner={2} invFile={3} {4})", i,
               m->invText, m->ownerIncludeId, m->invFile, h);
-        auto &byMacroId = macroPatchByOwnerByMacroId[m->ownerIncludeId];
+        bool appliedMacroPatch = false;
+        for (const RefoldModel::MacroInvocation *target = m; target != nullptr;) {
+          auto &byMacroId = macroPatchByOwnerByMacroId[target->ownerIncludeId];
 
-        // FIX A: Coalesce callsite patches by physical callsite span
-        // (inv_file/inv_b/inv_e), not by macro invocation item id.
-        std::optional<uint64_t> existingKey;
-        // Determinism: byMacroId is a DenseMap; if multiple entries share the
-        // same invocation span, pick the smallest key.
-        for (const auto &kv : byMacroId) {
-          const MacroPatch &p = kv.second;
-          if (p.invStart == *m->invB && p.invEnd == *m->invE) {
-            if (!existingKey || kv.first < *existingKey)
-              existingKey = kv.first;
+          // Coalesce callsite patches by physical callsite span
+          // (inv_file/inv_b/inv_e), not by macro invocation item id.
+          std::optional<uint64_t> existingKey;
+          // Determinism: byMacroId is a DenseMap; if multiple entries share the
+          // same invocation span, pick the smallest key.
+          for (const auto &kv : byMacroId) {
+            const MacroPatch &p = kv.second;
+            if (p.invStart == *target->invB && p.invEnd == *target->invE) {
+              if (!existingKey || kv.first < *existingKey)
+                existingKey = kv.first;
+            }
           }
-        }
-        const uint64_t patchKey = existingKey.value_or(m->id);
-        auto existingIt = byMacroId.find(patchKey);
-        const bool hadExistingCallsitePatch =
-            (existingIt != byMacroId.end()) &&
-            InvocationSpanMatchesCallsitePrefix(
-                StringRef(existingIt->second.replacement), *m);
-        const std::string prevCallsiteReplacement =
-            (existingIt != byMacroId.end()) ? existingIt->second.replacement
-                                            : std::string();
+          const uint64_t patchKey = existingKey.value_or(target->id);
+          auto existingIt = byMacroId.find(patchKey);
+          const bool hadExistingCallsitePatch =
+              (existingIt != byMacroId.end()) &&
+              InvocationSpanMatchesCallsitePrefix(
+                  StringRef(existingIt->second.replacement), *target);
+          const std::string prevCallsiteReplacement =
+              (existingIt != byMacroId.end()) ? existingIt->second.replacement
+                                              : std::string();
 
-        // If found, use the existing replacement; otherwise, use the original
-        // text.
-        std::string currentInvText =
-            (existingIt != byMacroId.end())
-                ? existingIt->second.replacement
-                : (m->invText ? m->invText->str() : "");
+          // If found, use the existing replacement; otherwise, use the original
+          // text.
+          std::string currentInvText =
+              (existingIt != byMacroId.end())
+                  ? existingIt->second.replacement
+                  : (target->invText ? target->invText->str() : "");
 
-        if (inTraceMode()) {
-          // Envelope diagnostics: compare byte-hunk-derived envelopes vs token-level
-          // a2b-derived envelopes for both the macro cover and the current hunk.
-          // Disagreements or envelopes that start on boundary insertions are a common
-          // root cause for duplicated insertion material in whole-cover fallback.
-          trace("instr/macro",
-                "macro id={0} name='{1}' coverA=[{2},{3}) hunkA=[{4},{5}) hunkB=[{6},{7})",
-                m->id, m->name, m->cover.begin, m->cover.end, h.aStart, h.aEnd,
-                h.bStart, h.bEnd);
-          traceBEnv("instr/macro", "cover byte",
-                    MapATokRangeAToBTokenEnvelope(m->cover.begin,
-                                                  m->cover.end));
-          traceBEnv("instr/macro", "cover a2b",
-                    tokEnvFromA2B(m->cover.begin, m->cover.end));
-          traceBEnv("instr/macro", "hunk byte",
-                    MapATokRangeAToBTokenEnvelope(h.aStart, h.aEnd));
-          traceBEnv("instr/macro", "hunk a2b",
-                    tokEnvFromA2B(h.aStart, h.aEnd));
-          traceBEnv(
-              "instr/macro", "hunk diff",
-              std::make_optional(std::make_pair(
-                  static_cast<size_t>(h.bStart), static_cast<size_t>(h.bEnd))));
-        }
-        auto updated = BuildMacroInvocationPatchWholeCover(
-            *m, h, currentInvText, macroPatchByOwnerByMacroId);
-        if (updated) {
-          if (hadExistingCallsitePatch) {
-            if (prevCallsiteReplacement == updated->replacement)
-              trace("macro", "callsite patch reused inv id={0}", m->id);
-            else
-              trace("macro", "callsite patch overwritten inv id={0}", m->id);
+          if (inTraceMode()) {
+            // Envelope diagnostics: compare byte-hunk-derived envelopes vs token-level
+            // a2b-derived envelopes for both the macro cover and the current hunk.
+            // Disagreements or envelopes that start on boundary insertions are a common
+            // root cause for duplicated insertion material in whole-cover fallback.
+            trace("instr/macro",
+                  "macro id={0} name='{1}' coverA=[{2},{3}) hunkA=[{4},{5}) hunkB=[{6},{7})",
+                  target->id, target->name, target->cover.begin,
+                  target->cover.end, h.aStart, h.aEnd, h.bStart, h.bEnd);
+            traceBEnv("instr/macro", "cover byte",
+                      MapATokRangeAToBTokenEnvelope(target->cover.begin,
+                                                    target->cover.end));
+            traceBEnv("instr/macro", "cover a2b",
+                      tokEnvFromA2B(target->cover.begin, target->cover.end));
+            traceBEnv("instr/macro", "hunk byte",
+                      MapATokRangeAToBTokenEnvelope(h.aStart, h.aEnd));
+            traceBEnv("instr/macro", "hunk a2b",
+                      tokEnvFromA2B(h.aStart, h.aEnd));
+            traceBEnv(
+                "instr/macro", "hunk diff",
+                std::make_optional(std::make_pair(
+                    static_cast<size_t>(h.bStart), static_cast<size_t>(h.bEnd))));
           }
-          updated->macroId = patchKey;
-          byMacroId[patchKey] = std::move(*updated);
+
+          auto updated = BuildMacroInvocationPatchWholeCover(
+              *target, h, currentInvText, macroPatchByOwnerByMacroId);
+          if (updated) {
+            if (hadExistingCallsitePatch) {
+              if (prevCallsiteReplacement == updated->replacement)
+                trace("macro", "callsite patch reused inv id={0}", target->id);
+              else
+                trace("macro", "callsite patch overwritten inv id={0}",
+                      target->id);
+            }
+            updated->macroId = patchKey;
+            byMacroId[patchKey] = std::move(*updated);
+            appliedMacroPatch = true;
+            break;
+          }
+
+          if (!target->callerMacroId)
+            break;
+          const RefoldModel::MacroInvocation *parent =
+              FindMacroInvocationById(*target->callerMacroId);
+          if (!parent)
+            break;
+          trace("macro/select",
+                "retry ancestor macro id={0} name='{1}' after child id={2} "
+                "name='{3}' produced no deterministic patch",
+                parent->id, parent->name, target->id, target->name);
+          target = parent;
         }
-        continue;
+
+        if (appliedMacroPatch)
+          continue;
       }
     }
 
@@ -1396,6 +1411,11 @@ std::string RefoldEngine::RefoldOnce() {
   // Inject forced __COUNTER__ patches after normal hunk attribution.
   // This may create macro patches even when no diff hunk touched the invocation
   // (required to prevent later __COUNTER__ values from shifting after an edit).
+  auto forcedCounters = ComputeForcedCounterPatches(tuPath, a2b);
+  auto forcedByExpanded =
+      ComputeForcedCounterPatchesFromExpandedMacros(tuPath,
+                                                    macroPatchByOwnerByMacroId);
+  forcedCounters.append(forcedByExpanded.begin(), forcedByExpanded.end());
   if (!forcedCounters.empty())
     AddForcedCounterPatches(forcedCounters, macroPatchByOwnerByMacroId);
 
@@ -2644,6 +2664,95 @@ RefoldEngine::TUByteSpan(uint64_t a0, uint64_t a1, StringRef tuPath) const {
     if (auto slotAnchor = AnchorToExactSlotBoundaryFromPPGap(tuPath, a0)) {
       return {{*slotAnchor, *slotAnchor}};
     }
+
+    // Deferred/wrapper macro chains can expose an inserted token at the exact
+    // beginning of an outer invocation's argument-produced surface, while the
+    // immediate right neighbor token maps to an inner nested invocation. If we
+    // fall back to neighbor snapping here, the insertion lands on the inner
+    // callsite (e.g. MAKE_NAME) instead of the outer wrapper (e.g. EVAL2).
+    //
+    // For pure insertions only, after exact slot-boundary anchoring but before
+    // generic neighbor snapping, anchor a PP gap that is exactly the *begin*
+    // of one or more arg-like spans (standard/stringify/paste) to the
+    // outermost such invocation's callsite start.
+    auto exactArgLikeBeginAnchor = [&]() -> std::optional<uint64_t> {
+      SmallVector<const RefoldModel::MacroInvocation *, 8> cands;
+      DenseMap<uint64_t, const RefoldModel::MacroInvocation *> invById;
+      invById.reserve(model_.GetMacroInvocations().size());
+      for (const auto &mi : model_.GetMacroInvocations())
+        invById[mi.id] = &mi;
+
+      auto appendIfExactBegin = [&](const RefoldModel::MacroInvocation &m,
+                                    auto &&spans) {
+        for (const auto &sp : spans) {
+          if (sp.begin == a0) {
+            cands.push_back(&m);
+            break;
+          }
+        }
+      };
+
+      for (const auto &m : model_.GetMacroInvocations()) {
+        if (!m.invFile || !m.invB || !m.invE || !m.invText)
+          continue;
+        if (!PathsEqual(*m.invFile, tuPath))
+          continue;
+        if (IsInvocationInsideDefineDirective(m))
+          continue;
+
+        appendIfExactBegin(m, m.argSpans);
+        if (!cands.empty() && cands.back() == &m)
+          continue;
+        appendIfExactBegin(m, m.stringifySpans);
+        if (!cands.empty() && cands.back() == &m)
+          continue;
+        appendIfExactBegin(m, m.pasteSpans);
+      }
+
+      if (cands.empty())
+        return std::nullopt;
+
+      SmallDenseSet<uint64_t, 8> candIds;
+      for (const auto *m : cands)
+        candIds.insert(m->id);
+
+      auto rootmostCand = [&](const RefoldModel::MacroInvocation *m) {
+        const RefoldModel::MacroInvocation *cur = m;
+        while (cur && cur->callerMacroId) {
+          auto idIt = candIds.find(*cur->callerMacroId);
+          if (idIt == candIds.end())
+            break;
+          auto parentIt = invById.find(*cur->callerMacroId);
+          if (parentIt == invById.end())
+            break;
+          cur = parentIt->second;
+        }
+        return cur;
+      };
+
+      const RefoldModel::MacroInvocation *best = nullptr;
+      for (const auto *m : cands) {
+        const auto *root = rootmostCand(m);
+        if (!root || !root->invB)
+          continue;
+        if (!best || std::tie(*root->invB, root->id) <
+                         std::tie(*best->invB, best->id)) {
+          best = root;
+        }
+      }
+
+      if (!best)
+        return std::nullopt;
+
+      trace("tu/anchor",
+            "pure insertion arg-like begin anchor: ppGap={0} -> macro id={1} "
+            "name='{2}' invB={3}",
+            a0, best->id, best->name, *best->invB);
+      return *best->invB;
+    };
+
+    if (auto argAnchor = exactArgLikeBeginAnchor())
+      return {{*argAnchor, *argAnchor}};
   }
 
   // Non-empty: compute min/max over TU-mapped subset only.
@@ -5103,6 +5212,41 @@ RefoldEngine::MapATokRangeAToBTokenEnvelope(uint64_t beginTok,
   return env;
 }
 
+std::optional<std::pair<size_t, size_t>>
+RefoldEngine::MapATokRangeAToBTokenEnvelopeWholeCover(uint64_t beginTok,
+                                                      uint64_t endTok) const {
+  const uint64_t nA = static_cast<uint64_t>(aToks_.size());
+
+  if (nA == 0 || aTokOff_.empty())
+    return std::nullopt;
+
+  beginTok = std::clamp(beginTok, static_cast<uint64_t>(0), nA);
+  endTok = std::clamp(endTok, beginTok, nA);
+  if (endTok <= beginTok)
+    return std::nullopt;
+
+  const size_t idxEnd = static_cast<size_t>(endTok);
+  if (idxEnd >= aTokOff_.size())
+    return std::nullopt;
+
+  const size_t aByteBegin = aTokOff_[static_cast<size_t>(beginTok)];
+  const size_t aByteEnd = aTokOff_[idxEnd];
+
+  size_t bByteBegin = MapAByteToBByteLowerBound(aByteBegin);
+  size_t bByteEnd = MapAByteToBByteUpperBound(aByteEnd);
+
+  if (bByteEnd < bByteBegin)
+    bByteEnd = bByteBegin;
+  if (bByteEnd > bSource_.size())
+    bByteEnd = bSource_.size();
+
+  size_t bTokBegin = BTokIndexFloor(bByteBegin);
+  size_t bTokEnd = BTokIndexCeil(bByteEnd);
+  if (bTokEnd < bTokBegin)
+    bTokEnd = bTokBegin;
+
+  return std::make_pair(bTokBegin, bTokEnd);
+}
 
 std::optional<std::pair<size_t, size_t>>
 RefoldEngine::MapATokRangeAToBTokenEnvelopeTrimEdgeInsertions(
@@ -5576,6 +5720,158 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
   return forced;
 }
 
+SmallVector<RefoldEngine::ForcedMacroPatchRequest, 32>
+RefoldEngine::ComputeForcedCounterPatchesFromExpandedMacros(
+    StringRef tuPath,
+    const DenseMap<std::optional<uint64_t>, DenseMap<uint64_t, MacroPatch>>
+        &macroPatchByOwnerByMacroId) const {
+  struct Occ {
+    const RefoldModel::MacroInvocation *m;
+    uint64_t aStart;
+    uint64_t aEnd;
+    std::optional<uint64_t> ownerInc;
+  };
+
+  SmallVector<Occ, 32> occs;
+
+  auto addOcc = [&](const RefoldModel::MacroInvocation &mi, uint64_t b,
+                    uint64_t e) {
+    if (e > b) {
+      occs.push_back(Occ{&mi, b, e, std::nullopt});
+      return;
+    }
+    if (e == b && b < aToks_.size()) {
+      occs.push_back(Occ{&mi, b, b + 1, std::nullopt});
+      return;
+    }
+  };
+
+  for (const auto &mi : model_.GetMacroInvocations()) {
+    if (mi.name != "__COUNTER__")
+      continue;
+    if (!mi.invB || !mi.invE || !mi.invText)
+      continue;
+
+    if (!mi.bodySpans.empty()) {
+      for (const auto &bs : mi.bodySpans)
+        addOcc(mi, bs.begin, bs.end);
+      continue;
+    }
+
+    if (!mi.spans.empty()) {
+      for (const auto &s : mi.spans)
+        addOcc(mi, s.begin, s.end);
+      continue;
+    }
+
+    if (mi.cover.IsValid() && mi.cover.end > mi.cover.begin)
+      occs.push_back(Occ{&mi, mi.cover.begin, mi.cover.end, std::nullopt});
+  }
+
+  if (occs.empty())
+    return {};
+
+  SmallVector<Occ, 32> filtered;
+  filtered.reserve(occs.size());
+  for (const auto &o : occs) {
+    diffutils::Hunk dummy;
+    dummy.aStart = o.aStart;
+    dummy.aEnd = o.aEnd;
+    dummy.bStart = 0;
+    dummy.bEnd = 0;
+
+    Owner owner = ClassifyOwnerWithSegments(tuPath, dummy);
+    std::optional<uint64_t> ownerInc;
+    if (owner.kind == OwnerKind::Include)
+      ownerInc = owner.includeId;
+
+    if (o.m->ownerIncludeId && ownerInc && *o.m->ownerIncludeId != *ownerInc)
+      continue;
+
+    filtered.push_back(Occ{o.m, o.aStart, o.aEnd, ownerInc});
+  }
+
+  if (filtered.empty())
+    return {};
+
+  llvm::sort(filtered, [](const Occ &A, const Occ &B) {
+    if (A.aStart != B.aStart)
+      return A.aStart < B.aStart;
+    if (A.aEnd != B.aEnd)
+      return A.aEnd < B.aEnd;
+    if (A.ownerInc != B.ownerInc)
+      return A.ownerInc < B.ownerInc;
+    return A.m->id < B.m->id;
+  });
+
+  auto hasExpandedPatchForRoot = [&](const RefoldModel::MacroInvocation &root)
+      -> bool {
+    if (!root.invB || !root.invE)
+      return false;
+    auto outerIt = macroPatchByOwnerByMacroId.find(root.ownerIncludeId);
+    if (outerIt == macroPatchByOwnerByMacroId.end())
+      return false;
+    for (const auto &kv : outerIt->second) {
+      const MacroPatch &p = kv.second;
+      if (p.invStart != *root.invB || p.invEnd != *root.invE)
+        continue;
+      if (!InvocationSpanMatchesCallsitePrefix(p.replacement, root))
+        return true;
+    }
+    return false;
+  };
+
+  int firstExpandedIdx = -1;
+  for (size_t i = 0; i < filtered.size(); ++i) {
+    const auto *root =
+        SmallestCoveringPatchableMacro(filtered[i].aStart, filtered[i].aEnd,
+                                       filtered[i].ownerInc);
+    if (!root || IsInvocationInsideDefineDirective(*root))
+      continue;
+    if (hasExpandedPatchForRoot(*root)) {
+      firstExpandedIdx = static_cast<int>(i);
+      trace("counter",
+            "__COUNTER__: expanded-root detection found firstExpandedIdx={0} "
+            "at A=[{1},{2}) root='{3}'",
+            firstExpandedIdx, filtered[i].aStart, filtered[i].aEnd,
+            root->name);
+      break;
+    }
+  }
+
+  if (firstExpandedIdx < 0)
+    return {};
+
+  SmallVector<ForcedMacroPatchRequest, 32> forced;
+  llvm::DenseSet<llvm::hash_code> seen;
+
+  for (const Occ &o : llvm::drop_begin(filtered, firstExpandedIdx)) {
+    const auto *root =
+        SmallestCoveringPatchableMacro(o.aStart, o.aEnd, o.ownerInc);
+    if (!root || IsInvocationInsideDefineDirective(*root))
+      continue;
+    const auto invStart = root->invB;
+    const auto invEnd = root->invE;
+    if (!invStart || !invEnd)
+      continue;
+
+    auto key = llvm::hash_combine(root->ownerIncludeId.value_or(0), *invStart,
+                                  *invEnd);
+    if (!seen.insert(key).second)
+      continue;
+
+    forced.push_back({root, o.aStart, o.aEnd});
+
+    trace("counter",
+          "__COUNTER__: force-from-expanded root id={0} name='{1}' "
+          "ownerInc={2} inv=[{3},{4}) for occ A=[{5},{6})",
+          root->id, root->name, root->ownerIncludeId, *invStart, *invEnd,
+          o.aStart, o.aEnd);
+  }
+
+  return forced;
+}
+
 std::optional<std::string>
 RefoldEngine::BuildWholeCoverReplacementText(
     const RefoldModel::MacroInvocation &m) const {
@@ -5604,7 +5900,7 @@ RefoldEngine::BuildWholeCoverReplacementText(
   if (covLoA >= covHiA)
     return std::nullopt;
 
-  auto bEnv = MapATokRangeAToBTokenEnvelope(covLoA, covHiA);
+  auto bEnv = MapATokRangeAToBTokenEnvelopeWholeCover(covLoA, covHiA);
   if (!bEnv)
     return std::nullopt;
 
@@ -5715,6 +6011,62 @@ void RefoldEngine::AddForcedCounterPatches(
     patch.preserveFinalSuffixGroup = EffectiveCurriedHead(m);
     byMacroId[patchKey] = std::move(patch);
   }
+}
+
+bool RefoldEngine::NestedWholeCoverIsSelfContained(
+    const RefoldModel::MacroInvocation &m) const {
+  if (!m.callerMacroId)
+    return true;
+  if (!m.cover.IsValid() || m.cover.end <= m.cover.begin)
+    return false;
+
+  SmallVector<char, 64> covered(m.cover.end - m.cover.begin, 0);
+  DenseSet<uint64_t> visited;
+  SmallVector<const RefoldModel::MacroInvocation *, 16> stack;
+  stack.push_back(&m);
+
+  auto markSpan = [&](const RefoldModel::PPSpan &sp) {
+    if (!sp.IsValid() || sp.end <= sp.begin)
+      return;
+    const uint64_t lo = std::max<uint64_t>(sp.begin, m.cover.begin);
+    const uint64_t hi = std::min<uint64_t>(sp.end, m.cover.end);
+    for (uint64_t pp = lo; pp < hi; ++pp)
+      covered[pp - m.cover.begin] = 1;
+  };
+
+  while (!stack.empty()) {
+    const RefoldModel::MacroInvocation *cur = stack.pop_back_val();
+    if (!cur || !visited.insert(cur->id).second)
+      continue;
+
+    bool sawDetailed = false;
+    auto markDetailed = [&](auto &&spans) {
+      for (const auto &sp : spans) {
+        if (!sp.IsValid() || sp.end <= sp.begin)
+          continue;
+        sawDetailed = true;
+        markSpan(sp);
+      }
+    };
+
+    markDetailed(cur->bodySpans);
+    markDetailed(cur->argSpans);
+    markDetailed(cur->stringifySpans);
+    markDetailed(cur->pasteSpans);
+
+    if (!sawDetailed) {
+      for (const auto &sp : cur->spans)
+        markSpan(sp);
+    }
+
+    auto it = macroChildrenById_.find(cur->id);
+    if (it != macroChildrenById_.end()) {
+      for (const auto *child : it->second)
+        stack.push_back(child);
+    }
+  }
+
+  return llvm::all_of(covered, [](char c) { return c != 0; });
 }
 
 std::optional<RefoldEngine::MacroPatch>
@@ -6188,11 +6540,22 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         for (const auto &sp : candArgLike)
           candFormalCount = std::max(candFormalCount, (unsigned)sp.argIdx + 1);
 
-        // Mark which formals are touched by the hunk, and require the hunk to
-        // be fully contained within the union of arg-like spans (conservative).
-        SmallVector<char, 8> candTouched(candFormalCount, 0);
-        if (!HunkFullyWithinArgSpans(h, candArgLike, candTouched))
+        // Mark which concrete arg-like span occurrences are touched by the
+        // hunk, then compress that to a per-formal touched set. The helper
+        // expects one flag per span occurrence, while the later DAG logic
+        // reasons per formal arg index.
+        SmallVector<char, 8> candTouchedBySpan(candArgLike.size(), 0);
+        if (!HunkFullyWithinArgSpans(h, candArgLike, candTouchedBySpan))
           continue;
+
+        SmallVector<char, 8> candTouched(candFormalCount, 0);
+        for (size_t si = 0; si < candArgLike.size(); ++si) {
+          if (!candTouchedBySpan[si])
+            continue;
+          const auto &sp = candArgLike[si];
+          if (sp.argIdx < candTouched.size())
+            candTouched[sp.argIdx] = 1;
+        }
 
         bool anyTouched = false;
         for (char t : candTouched)
@@ -7021,6 +7384,18 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   // 2) Whole-cover fallback: replace invocation with the entire expansion cover
   // slice from B. cover.begin/cover.end are PP-token indices in A; map them
   // into a B-token envelope.
+  //
+  // Nested child macros are only eligible for whole-cover replacement when
+  // their cover is self-contained at the child callsite. Otherwise, the child
+  // cover includes caller-owned tokens and we must retry an ancestor instead of
+  // splicing a partial expanded surface into the parent invocation.
+  if (!NestedWholeCoverIsSelfContained(m)) {
+    trace("macro/whole",
+          "whole-cover disallowed for nested child id={0} name='{1}': cover "
+          "is not self-contained at this callsite",
+          m.id, m.name);
+    return std::nullopt;
+  }
   uint64_t covLoA = m.cover.begin;
   uint64_t covHiA = m.cover.end;
 
@@ -7044,7 +7419,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   if (covLoA >= covHiA)
     return std::nullopt;
 
-  auto bEnv = MapATokRangeAToBTokenEnvelope(covLoA, covHiA);
+  auto bEnv = MapATokRangeAToBTokenEnvelopeWholeCover(covLoA, covHiA);
   if (!bEnv)
     return std::nullopt;
 
