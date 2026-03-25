@@ -479,7 +479,6 @@ static std::vector<CondGroup> scanTopLevelConds(llvm::StringRef Buf,
 // the argument token sequence as *spelled* at the invocation site, not the
 // post-expansion stream. This is the form needed to refold edits back into
 // the original source call text.
-
 static std::string computeLangStr(const clang::LangOptions &Lang) {
   // Objective-C family
   if (Lang.ObjC)
@@ -570,20 +569,19 @@ std::string joinSpelled(llvm::StringRef DirSpelling, llvm::StringRef Rel) {
 // This is a defensive validation step for producer-side metadata: it catches
 // cases where argument offsets are missing, inverted, or escape the invocation
 // region due to location mapping quirks (macro expansion, CRLF, etc.).
-
+//
 // Parse a macro invocation's spelled text and compute byte-offset ranges for
 // each argument within that invocation.
 //
 // Inputs:
-//   - InvText:   The full spelled invocation text (e.g. "FOO(a, b+1)").
-//               This is assumed to include the opening '(' and the matching
-//               ')'.
-//   - InvBegin:  Absolute byte offset in the file where InvText begins.
-//               We add relative offsets within InvText to produce absolute
-//               ranges.
+//   - InvText:      The full spelled invocation text (e.g. "FOO(a, b+1)").
+//                   This is assumed to include the opening '(' and the matching
+//                   ')'.
+//   - InvBegin:     Absolute byte offset in the file where InvText begins.
+//                   We add relative offsets within InvText to produce absolute
+//                   ranges.
 //   - ExpectedArgs: The number of arguments we expect to find (usually the
-//   number
-//               of formal parameters for the macro).
+//                   number of formal parameters for the macro).
 //
 // Output:
 //   - Out[i] = {begin, end} absolute byte offsets into the file for argument i,
@@ -591,8 +589,7 @@ std::string joinSpelled(llvm::StringRef DirSpelling, llvm::StringRef Rel) {
 //
 // Return value:
 //   - true if we find a plausible top-level argument list that ends at a
-//   matching ')'
-//     for the first '(' in InvText; false otherwise.
+//     matching ')' for the first '(' in InvText; false otherwise.
 static bool computeInvArgRangesFromText(
     llvm::StringRef InvText, uint64_t InvBegin, size_t ExpectedArgs,
     const LangOptions &Lang,
@@ -867,7 +864,8 @@ static DecodedPayloadMap decodeStringLiteralPayload(llvm::StringRef Spelling) {
     if (I >= N)
       return R;
 
-    // Line splice: "\\\n" or "\\\r\n" (no output byte).
+    // Source-level line splice: backslash followed by a physical newline
+    // (LF or CRLF). This contributes no decoded payload byte.
     if (Spelling[I] == '\n') {
       ++I;
       continue;
@@ -965,37 +963,6 @@ static DecodedPayloadMap decodeStringLiteralPayload(llvm::StringRef Spelling) {
 
     ++I;
   }
-}
-
-static bool isCurriedHeadMacro(const MacroInfo *MI) {
-  if (!MI)
-    return false;
-
-  // Determine whether the *replacement list* begins with a
-  // curried-head pattern:
-  //   ( ident ) (
-  // This is used as a structural hint for call-chain suffix
-  // handling during refolding.
-  const auto &RToks = MI->tokens();
-  size_t i = 0;
-  auto nextNonComment = [&]() -> const Token * {
-    while (i < RToks.size() && RToks[i].is(tok::comment))
-      ++i;
-    if (i >= RToks.size())
-      return nullptr;
-    return &RToks[i++];
-  };
-
-  const Token *T0 = nextNonComment();
-  const Token *T1 = nextNonComment();
-  const Token *T2 = nextNonComment();
-  const Token *T3 = nextNonComment();
-  if (!T0 || !T1 || !T2 || !T3)
-    return false;
-  if (!T0->is(tok::l_paren) || !T1->is(tok::identifier) ||
-      !T2->is(tok::r_paren) || !T3->is(tok::l_paren))
-    return false;
-  return true;
 }
 
 void computeMacroProjectionSites(Item &It, Preprocessor &PP,
@@ -1685,8 +1652,6 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
 
   It.Loc = Range.getBegin();
   It.IsBuiltinMacro = (MI != nullptr && MI->isBuiltinMacro());
-
-  It.CurriedHead = isCurriedHeadMacro(MI);
 
   // --- Invocation text + byte range logic ---
   SourceLocation BeginTokLoc = Range.getBegin();
@@ -3228,9 +3193,6 @@ void RefoldMapBuilder::writeJSON() {
           if (It.Kind == IK_Macro) {
             // InvText can't be empty at this point
             JO.attribute("inv_text", It.InvText);
-
-            if (It.CurriedHead)
-              JO.attribute("curried_head", true);
 
             if (!It.InvFile.empty())
               JO.attribute("inv_file", It.InvFile);

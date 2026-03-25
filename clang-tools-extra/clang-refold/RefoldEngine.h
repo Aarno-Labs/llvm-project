@@ -400,8 +400,7 @@ private:
                                                size_t bTokEnd) const;
 
   // Macro invocation graph (derived from RefoldModel) used for structural
-  // queries such as determining whether a patchable macro callsite ultimately
-  // yields a curried-head expansion through wrapper macros.
+  // queries over recorded callerMacroId relationships.
   DenseMap<uint64_t, SmallVector<const RefoldModel::MacroInvocation *, 4>>
       macroChildrenById_;
 
@@ -428,18 +427,6 @@ private:
     }
   }
 
-  /// \brief Return the effective "curried head" property for a patchable macro.
-  ///
-  /// Some call chains are expressed via wrapper macros that expand to another
-  /// function-like macro name (often via token pasting). In these cases the
-  /// patchable outer invocation (e.g. GET_MATH(ADD)) does not itself have a
-  /// curried-head replacement list, but the *effective expansion* is produced
-  /// by a descendant macro (e.g. ADD_STAGE2) that does.
-  ///
-  /// This helper is purely structural: it walks the recorded caller graph and
-  /// treats zero-span wrapper invocations as transparent while searching for a
-  /// descendant whose emitted PP-span matches the outer invocation.
-  bool EffectiveCurriedHead(const RefoldModel::MacroInvocation &m) const;
 
   /// \brief Run the full refolding pipeline for the current inputs.
   ///
@@ -504,10 +491,6 @@ private:
     // byte span and owner.
     uint64_t macroId = 0;
 
-    // When true, preserve the final '(...)' suffix group immediately following
-    // the invocation site when extending chained call spans. This is driven by
-    // producer metadata (no consumer text heuristics).
-    bool preserveFinalSuffixGroup = false;
   };
 
   struct IncludePatch {

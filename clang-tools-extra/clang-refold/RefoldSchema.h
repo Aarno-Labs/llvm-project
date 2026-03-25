@@ -813,10 +813,6 @@ static constexpr const char *RefoldSchema = R"json(
           "minimum": 0,
           "description": "Byte offset in the preprocessed output (A stream) for the end (exclusive) of the expansion associated with this invocation (elided if unknown/unavailable)."
         },
-        "curried_head": {
-          "type": "boolean",
-          "description": "Call-chain hint: true if this macro's replacement list begins with a curried head pattern '(ident) (...)'. When applying whole-cover callsite patches, the consumer preserves the final '(...)' suffix group (if present) instead of consuming it into the replaced span."
-        },
         "owner_include_id": {
           "type": "integer",
           "minimum": 0,
