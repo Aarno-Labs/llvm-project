@@ -294,7 +294,6 @@ public:
     uint64_t id;
     StringRef subkind; // "func" | "obj"
     StringRef name;
-    bool curriedHead = false;
     std::vector<PPSpan> spans; // expansion coverage (A tokens)
     std::vector<PPArgSpan> argSpans;
     std::vector<PPArgSpan> stringifySpans;
@@ -315,7 +314,7 @@ public:
     PPCover cover;
 
     MacroInvocation(uint64_t id, StringRef subkind, StringRef name,
-                    bool CurriedHead, std::optional<StringRef> invText,
+                    std::optional<StringRef> invText,
                     std::optional<StringRef> invFile,
                     std::optional<uint64_t> invB, std::optional<uint64_t> invE,
                     std::optional<uint64_t> invPPByteBegin,
@@ -330,7 +329,7 @@ public:
                     std::optional<uint64_t> callerMacroId,
                     std::vector<std::vector<uint32_t>> argDeps,
                     std::vector<std::vector<InvArgRef>> argRefs) noexcept
-        : id(id), subkind(subkind), name(name), curriedHead(CurriedHead),
+        : id(id), subkind(subkind), name(name),
           spans(std::move(spans)), argSpans(std::move(argSpans)),
           stringifySpans(std::move(stringifySpans)),
           pasteSpans(std::move(pasteSpans)), defParams(std::move(defParams)),

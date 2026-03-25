@@ -710,10 +710,6 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
             asOptUInt64(*obj, "inv_pp_byte_end");
         std::optional<uint64_t> ownerIncludeId =
             asOptUInt64(*obj, "owner_include_id");
-        bool curriedHead = false;
-        if (auto CH = asOptBool(*obj, "curried_head"))
-          curriedHead = *CH;
-
         std::vector<MacroDefParam> defParams;
         if (auto ParamsArr =
                 asOptArray(*obj, "def_params", /*allowNull=*/true)) {
@@ -890,7 +886,6 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
         MacroInvocation mi(/*id*/ id,
                            /*subkind*/ subkind,
                            /*name*/ name,
-                           /*CurriedHead*/ curriedHead,
                            /*invText*/ invText,
                            /*invFile*/ invFile,
                            /*invB*/ invB,
