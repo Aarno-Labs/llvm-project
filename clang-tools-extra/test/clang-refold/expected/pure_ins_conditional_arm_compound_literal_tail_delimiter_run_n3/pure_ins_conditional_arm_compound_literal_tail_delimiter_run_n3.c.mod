@@ -1,4 +1,4 @@
-// RUN: %clang-refold-tester-with-lines stolen_boundary_multishift_n3_conditional_arm_compound_literal_tail
+// RUN: %clang-refold-tester-with-lines pure_ins_conditional_arm_compound_literal_tail_delimiter_run_n3
 
 // test32.c: stolen-boundary-token seam-repair guard (multi-step n=3)
 //
@@ -39,7 +39,7 @@ static void sink_ptr(const int *p) { (void)p; }
   { sink_ptr((int[]){2}); }
 #endif
 sink_ptr((int[]){1});
-#line 41 "stolen_boundary_multishift_n3_conditional_arm_compound_literal_tail.c"
+#line 41 "pure_ins_conditional_arm_compound_literal_tail_delimiter_run_n3.c"
 
 RF_MARK(t32_after)
 

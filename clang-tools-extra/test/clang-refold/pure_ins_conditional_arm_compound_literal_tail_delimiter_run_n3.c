@@ -1,4 +1,4 @@
-// RUN: %clang-refold-tester-with-lines stolen_boundary_multishift_n3_conditional_arm_compound_literal_tail
+// RUN: %clang-refold-tester-with-lines pure_ins_conditional_arm_compound_literal_tail_delimiter_run_n3
 
 // test32.c: stolen-boundary-token seam-repair guard (multi-step n=3)
 //
