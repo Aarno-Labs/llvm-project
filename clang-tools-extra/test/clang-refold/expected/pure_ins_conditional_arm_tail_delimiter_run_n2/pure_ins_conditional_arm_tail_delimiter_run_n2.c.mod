@@ -1,4 +1,4 @@
-// RUN: %clang-refold-tester-with-lines stolen_boundary_multishift_n2_conditional_arm_tail
+// RUN: %clang-refold-tester-with-lines pure_ins_conditional_arm_tail_delimiter_run_n2
 
 // test31.c: stolen-boundary-token seam-repair guard (multi-step n=2)
 //
@@ -37,6 +37,8 @@ static void sink_int(int x) { (void)x; }
 #else
   { sink_int(1); }
 #endif
+sink_int(0);
+#line 40 "pure_ins_conditional_arm_tail_delimiter_run_n2.c"
 
 RF_MARK(t31_after)
 

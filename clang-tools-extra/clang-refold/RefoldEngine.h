@@ -309,47 +309,6 @@ private:
   /// Computed once per refold run and reused to bound best-effort snapping.
   std::vector<uint32_t> ownerDepthGap_;
 
-  // Key that identifies the "structural context" at a particular PP
-  // gap/boundary.
-  //
-  // We use this as a cache/lookup key when computing gap-dependent anchoring
-  // decisions (e.g. boundary-policy placement). Two gaps are considered
-  // equivalent for anchoring purposes if they lie in the same
-  // include/conditional envelope in the refold map:
-  //   - incL/incR: the include-instance bounds (left/right) that enclose the
-  //     gap
-  //   - armL/armR: the conditional-arm bounds (left/right) that enclose the gap
-  //
-  // The L/R pairs are stored as indices/ids (or -1 if not present) rather than
-  // a single id because the policy cares about *which span* of an include/arm
-  // contains the gap (especially for repeated includes, no-guard headers, and
-  // complex conditional layouts).
-  struct GapCtxKey {
-    int64_t incL = -1;
-    int64_t incR = -1;
-    int64_t armL = -1;
-    int64_t armR = -1;
-
-    bool operator==(const GapCtxKey &o) const {
-      return incL == o.incL && incR == o.incR && armL == o.armL &&
-             armR == o.armR;
-    }
-
-    bool operator!=(const GapCtxKey &o) const { return !(*this == o); }
-  };
-
-  /// \brief Compute the structural context key for an A-domain PP-token gap.
-  ///
-  /// \p gap is a PP-token *gap* index in [0, \p aSize], representing the
-  /// insertion point before A token \p gap (or after the last token when
-  /// \p gap == \p aSize). The returned key records the nearest enclosing
-  /// include-instance and conditional-arm bounds that contain the gap, using
-  /// left/right ids (or -1 when not present).
-  ///
-  /// This is used to cache and compare gap-dependent anchoring decisions
-  /// deterministically without inspecting token text.
-  GapCtxKey GetGapCtxKey(uint64_t gap, uint64_t aSize) const;
-
   /// Cached token-level hunks for the current refold invocation.
   ///
   /// These hunks are used to deterministically disambiguate A→B token
