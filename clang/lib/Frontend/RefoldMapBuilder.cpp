@@ -2816,6 +2816,9 @@ void RefoldMapBuilder::writeJSON() {
     for (const Item &It : Items)
       ItemByID.try_emplace(It.ID, &It);
 
+    // Compute the half-open token envelope [BTok, ETok) covered by an item's
+    // emitted token spans. This gives a simple nesting interval for later
+    // caller-macro recovery.
     auto computeTokEnvelope = [](const Item &It, uint64_t &BTok,
                                  uint64_t &ETok) -> bool {
       uint64_t B = std::numeric_limits<uint64_t>::max();
@@ -2850,6 +2853,13 @@ void RefoldMapBuilder::writeJSON() {
 
     llvm::DenseMap<uint64_t, uint64_t> CallerMacroByID;
     llvm::SmallVector<MacroEnv, 32> MacroStack;
+
+    // Recover a token-interval-based caller relation among macro items.
+    // After sorting by begin token (and outer-before-inner on ties), maintain
+    // a stack of currently open macro envelopes. The top of the stack is the
+    // innermost enclosing macro, so if the current envelope is fully contained
+    // within it, that stack top is this macro's caller/parent in the nesting
+    // chain.
     for (const MacroEnv &Env : MacroEnvs) {
       while (!MacroStack.empty() && Env.BTok >= MacroStack.back().ETok)
         MacroStack.pop_back();
@@ -2857,6 +2867,7 @@ void RefoldMapBuilder::writeJSON() {
         CallerMacroByID.try_emplace(Env.ID, MacroStack.back().ID);
       MacroStack.push_back(Env);
     }
+
     const LangOptions &Lang = PP.getLangOpts();
 
     // Scan raw invocation text for occurrences of the caller macro's *formal
@@ -2874,6 +2885,7 @@ void RefoldMapBuilder::writeJSON() {
         -> std::vector<uint32_t> {
       llvm::SmallVector<uint32_t, 8> Deps;
 
+      // Record each referenced formal at most once.
       auto addDep = [&](uint32_t I) {
         for (uint32_t E : Deps)
           if (E == I)
@@ -2884,6 +2896,8 @@ void RefoldMapBuilder::writeJSON() {
       if (Text.empty())
         return {};
 
+      // Lex the snippet as raw source text so we can find identifier-like
+      // mentions of caller formal names without needing AST structure.
       const SourceLocation BaseLoc = SourceLocation::getFromRawEncoding(1);
       std::string LexBuf = Text.str();
       LexBuf.push_back('\0');
@@ -2897,9 +2911,12 @@ void RefoldMapBuilder::writeJSON() {
         if (Tok.is(tok::eof))
           break;
 
+        // Only identifiers can name caller formals.
         if (!(Tok.is(tok::identifier) || Tok.is(tok::raw_identifier)))
           continue;
 
+        // Recover the identifier spelling directly from the original text using
+        // the raw-lexer byte offset, then map it to a caller formal index.
         const unsigned Off =
             Tok.getLocation().getRawEncoding() - BaseLoc.getRawEncoding();
         llvm::StringRef Ident(Text.data() + Off, Tok.getLength());
@@ -2909,6 +2926,7 @@ void RefoldMapBuilder::writeJSON() {
           addDep(It->getValue());
       }
 
+      // Return a stable sorted dependency list.
       std::sort(Deps.begin(), Deps.end());
       return std::vector<uint32_t>(Deps.begin(), Deps.end());
     };
@@ -2925,6 +2943,8 @@ void RefoldMapBuilder::writeJSON() {
       if (Text.empty())
         return Refs;
 
+      // Raw-lex the invocation text so we can find identifier occurrences and
+      // recover their byte offsets directly from the original source snippet.
       const SourceLocation BaseLoc = SourceLocation::getFromRawEncoding(1);
       std::string LexBuf = Text.str();
       LexBuf.push_back('\0');
@@ -2938,9 +2958,12 @@ void RefoldMapBuilder::writeJSON() {
         if (Tok.is(tok::eof))
           break;
 
+        // Only identifiers can refer to caller formals.
         if (!(Tok.is(tok::identifier) || Tok.is(tok::raw_identifier)))
           continue;
 
+        // Recover the matched identifier spelling from the original text using
+        // the raw-lexer byte offset, then map it to a caller formal index.
         const unsigned Off =
             Tok.getLocation().getRawEncoding() - BaseLoc.getRawEncoding();
         llvm::StringRef Ident(Text.data() + Off, Tok.getLength());
@@ -2949,6 +2972,8 @@ void RefoldMapBuilder::writeJSON() {
         if (It != NameToIdx.end()) {
           Item::InvArgRef R;
           R.CallerParamIndex = It->second;
+          // Store the identifier's absolute byte span within the invocation
+          // file, not just its offset within Text.v
           R.ByteBegin = static_cast<uint32_t>(BaseOff + Off);
           R.ByteEnd = static_cast<uint32_t>(BaseOff + Off + Tok.getLength());
           Refs.push_back(R);
@@ -2960,11 +2985,11 @@ void RefoldMapBuilder::writeJSON() {
 
     // Per-macro-invocation computed data:
     //   - ArgDepsByID[macro_item_id][arg_i] = sorted unique list of
-    //   caller-formal
-    //     parameter indices referenced (by name) inside invocation argument i.
+    //     caller-formal parameter indices referenced (by name) inside
+    //     invocation argument i.
     //   - ArgRefsByID[macro_item_id][arg_i] = concrete byte ranges (in
-    //   inv_text)
-    //     where those caller-formal names occur, for later projection/rewrites.
+    //     inv_text) where those caller-formal names occur, for later
+    //     projection/rewrites.
     //
     // We compute these for each macro invocation Item that has:
     //   * a known caller macro (CallerMacroId), and
@@ -3106,6 +3131,9 @@ void RefoldMapBuilder::writeJSON() {
     for (Item &It : Items)
       ItemByIDMut[It.ID] = &It;
 
+    // Return true iff callee argument CalleeArgIdx is a direct pass-through of
+    // exactly one caller formal parameter (allowing only trivial outer parens),
+    // and report that caller parameter index via OutCallerParamIdx.
     auto isDirectCallerFormalRef =
         [&](const Item &Callee, uint32_t CalleeArgIdx, const Item &Caller,
             uint32_t &OutCallerParamIdx) -> bool {
@@ -3807,8 +3835,7 @@ void RefoldMapBuilder::writeJSON() {
       //     token, returns (last PP index in file + 1), i.e. the gap after the
       //     file's final token.
       //   - if the file contributed no PP tokens (e.g. not included / not
-      //   taken),
-      //     returns nullopt (slot will omit "pp").
+      //     taken), returns nullopt (slot will omit "pp").
       auto ppIndexForFileOffset = [&](llvm::StringRef FilePath,
                                       uint64_t Off) -> std::optional<uint64_t> {
         bool Any = false;
