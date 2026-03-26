@@ -965,6 +965,51 @@ static DecodedPayloadMap decodeStringLiteralPayload(llvm::StringRef Spelling) {
   }
 }
 
+/// \brief Precompute invocation-specific projection metadata for `#` and `##`.
+///
+/// For one concrete function-like macro invocation, this routine computes the
+/// producer-side lookup tables needed to attribute later-emitted macro-body
+/// tokens back to invocation arguments when those tokens are *projected*
+/// through:
+///
+///   - stringification: `#param`
+///   - token pasting:   `a ## b`
+///
+/// The result is stored on \p It in transient, non-serialized fields that are
+/// consumed by `onToken()`:
+///
+///   - `StringifySpell2ArgIndices` maps the exact emitted string-literal
+///     spelling produced by `#param` to the formal argument index or indices
+///     that could have produced it for this invocation.
+///   - `PasteTokens` records each token synthesized by `##`, together with the
+///     byte subranges within the pasted spelling that came from argument-sourced
+///     input tokens.
+///   - `PasteSpell2TokenIndices` is a reverse index from pasted token spelling
+///     to entries in `PasteTokens`, used to match emitted tokens
+///     deterministically in expansion order.
+///
+/// The computation is invocation-specific:
+///
+///   - formal parameters in the replacement list are substituted with the
+///     *unexpanded* actual argument token spellings from \p Args,
+///   - stringification uses Clang's own `MacroArgs::StringifyArgument()` so the
+///     stored spelling matches preprocessor output byte-for-byte,
+///   - `##` is evaluated left-to-right over the substituted token sequence, and
+///     provenance from argument-derived pieces is merged into the synthesized
+///     token.
+///
+/// Non-function-like macros, null `MacroInfo`, or missing `MacroArgs` produce
+/// no projection metadata.
+///
+/// \param It           Destination item for the current macro invocation.
+/// \param PP           Preprocessor used to obtain exact token spellings and
+///                     Clang-consistent stringification results.
+/// \param MacroNameTok Invocation-site macro name token; its location is used
+///                     when forming Clang's stringification token.
+/// \param MI           Definition-time `MacroInfo` for the invoked macro.
+/// \param Args         Invocation-specific actual arguments in unexpanded form.
+/// \param Lang         Language options (currently unused here; kept for API
+///                     symmetry with nearby helpers).
 void computeMacroProjectionSites(Item &It, Preprocessor &PP,
                                  const Token &MacroNameTok, const MacroInfo *MI,
                                  const MacroArgs *Args,
@@ -1169,29 +1214,32 @@ RefoldMapBuilder::RefoldMapBuilder(Preprocessor &PP, llvm::StringRef OutputPath,
 
   for (size_t i = 0; i < PPO.RefoldPPArgv.size(); ++i) {
     llvm::StringRef A(PPO.RefoldPPArgv[i]);
+
+    // Separate include-dir form: `-I <dir>`. Consume the following argv element
+    // as the spelled directory and record only that directory text.
     if (A == "-I") {
       if (i + 1 < PPO.RefoldPPArgv.size())
         addIncludeDirSpelling(PPO.RefoldPPArgv[++i]);
       continue;
     }
+
+    // Joined include-dir form: `-I<dir>`. Strip the `-I` prefix and record the
+    // remaining spelling as the include-search directory text.
     if (A.starts_with("-I") && A.size() > 2) {
       addIncludeDirSpelling(A.drop_front(2));
       continue;
     }
   }
 
-  // Resolve the TU path spelling from the driver argv. We match by base name to
-  // avoid accidentally selecting an output file or other positional argument.
+  // Resolve the TU path spelling from the driver argv. Prefer the exact argv
+  // spelling when it is already absolute; otherwise recover a non-absolute argv
+  // spelling only when it canonically resolves to the main file path.
   OptionalFileEntryRef MainFER = SM.getFileEntryRefForID(SM.getMainFileID());
   std::string MainAbs;
-  llvm::StringRef MainBase;
-  if (MainFER) {
+  if (MainFER)
     MainAbs = absolutePathFor(*MainFER);
-    MainBase = llvm::sys::path::filename(MainAbs);
-  }
 
-  // 1. Try to find the exact absolute path match in the arguments first.
-  // This ensures we get the full path if provided.
+  // 1. Try to find the exact absolute-path spelling in argv first.
   for (llvm::StringRef Arg : PPO.RefoldPPArgv) {
     if (Arg == MainAbs) {
       TUSourcePath = Arg.str();
@@ -1199,23 +1247,37 @@ RefoldMapBuilder::RefoldMapBuilder(Preprocessor &PP, llvm::StringRef OutputPath,
     }
   }
 
-  // 2. If no exact match, look for the argument that matches the filename.
-  if (TUSourcePath.empty()) {
+  // 2. If there was no exact absolute-path match, accept a spelled argv path
+  // only when it canonically resolves to the same main-file path. Require a
+  // unique match here; otherwise fail closed to MainAbs instead of guessing.
+  if (TUSourcePath.empty() && !MainAbs.empty()) {
+    std::optional<llvm::StringRef> CanonicalMatch;
+    bool Ambiguous = false;
     for (llvm::StringRef Arg : PPO.RefoldPPArgv) {
       if (Arg.empty() || Arg.starts_with("-"))
         continue;
 
-      if (!MainBase.empty() && llvm::sys::path::filename(Arg) == MainBase) {
-        TUSourcePath = Arg.str();
-        break; // Stop at the first match
+      if (normalizePathKey(Arg, Cwd, /*IsDir=*/false) != MainAbs)
+        continue;
+
+      if (!CanonicalMatch) {
+        CanonicalMatch = Arg;
+        continue;
+      }
+
+      if (*CanonicalMatch != Arg) {
+        Ambiguous = true;
+        break;
       }
     }
+
+    if (CanonicalMatch && !Ambiguous)
+      TUSourcePath = CanonicalMatch->str();
   }
 
-  // 3. Fallback logic remains as a safety net...
-  if (TUSourcePath.empty()) {
-    TUSourcePath = !MainAbs.empty() ? MainAbs : MainBase.str();
-  }
+  // 3. Final safety net: use the canonical absolute main-file path.
+  if (TUSourcePath.empty())
+    TUSourcePath = MainAbs;
 
   if (TUSourcePath.empty()) {
     llvm::report_fatal_error("Critical Error: TU source path is empty.");
