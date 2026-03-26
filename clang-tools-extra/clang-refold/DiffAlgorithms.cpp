@@ -176,19 +176,19 @@ struct Score {
   uint32_t len = 0;
   uint64_t cost = 0;
   uint32_t tie = 0;
+
+  Score operator+(const Score &other) const {
+    Score out;
+    out.len = len + other.len;
+    out.cost = cost + other.cost;
+    out.tie = tie + other.tie;
+    return out;
+  }
+
+  bool operator==(const Score &other) const {
+    return len == other.len && cost == other.cost && tie == other.tie;
+  }
 };
-
-inline Score addScore(const Score &a, const Score &b) {
-  Score out;
-  out.len = a.len + b.len;
-  out.cost = a.cost + b.cost;
-  out.tie = a.tie + b.tie;
-  return out;
-}
-
-inline bool scoreEq(const Score &a, const Score &b) {
-  return a.len == b.len && a.cost == b.cost && a.tie == b.tie;
-}
 
 struct SpanView {
   ArrayRef<StringRef> base;
@@ -454,12 +454,11 @@ hirschbergWeightedRec(const SpanView &aV, const SpanView &bV,
   // Choose split j maximizing combined (len, cost, tie). On exact equality,
   // prefer the smallest j for determinism.
   size_t bestJ = 0;
-  Score best = addScore(leftRow[0], rightRowRev[m]);
+  Score best = leftRow[0] + rightRowRev[m];
   for (size_t j = 1; j <= m; ++j) {
-    Score cand = addScore(leftRow[j], rightRowRev[m - j]);
+    Score cand = leftRow[j] + rightRowRev[m - j];
     if (isBetter(cand.len, cand.cost, cand.tie, best.len, best.cost,
-                 best.tie) ||
-        (scoreEq(cand, best) && j < bestJ)) {
+                 best.tie) || (cand == best && j < bestJ)) {
       bestJ = j;
       best = cand;
     }
