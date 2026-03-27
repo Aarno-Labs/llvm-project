@@ -809,26 +809,50 @@ private:
   /// \brief Determine whether an A-token interval is owned by the translation
   ///        unit (TU).
   ///
-  /// Determines ownership purely from the refold map’s token→file mapping:
+  /// Non-empty ranges are TU-owned only when every mapped PP entry in
+  /// ` [a0, a1) ` resolves to `tuPath`. Pure insertions (`a0 == a1`) are
+  /// TU-owned only when the engine can derive a truthful TU insertion anchor at
+  /// that exact PP gap via FindProvableTUInsertionAnchor().
   ///
-  /// * If the interval contains any mapped preprocessed (PP) tokens whose
-  ///   mapped file is *not* `tuPath`, the hunk is **not** TU-owned (returns
-  ///   `false`).
-  /// * Whitespace-only regions (unmapped tokens) are ignored for ownership.
-  /// * Pure insertions (`a0 == a1`) and whitespace-only ranges are treated as
-  ///   TU-owned; their final byte span is derived later from neighboring edits.
-  ///
-  /// This function is intentionally strict: any concrete mapping to a non-TU
-  /// file disqualifies the hunk. This keeps refolding deterministic and
-  /// prevents edits from being applied to the wrong file.
+  /// This function is intentionally fail-closed: any concrete mapping to a
+  /// non-TU file, or any empty gap without a provable TU anchor, is treated as
+  /// non-TU. This prevents header/include edits from being realized as TU byte
+  /// edits.
   ///
   /// \param a0      Inclusive start preprocessed-token index in A.
   /// \param a1      Exclusive end preprocessed-token index in A.
   /// \param tuPath  Absolute canonical path of the TU’s source file.
-  /// \returns       `true` if the interval is TU-owned (only TU mappings or
-  ///                unmapped/empty);
-  ///                `false` if any mapped token belongs to a non-TU file.
+  /// \returns       `true` if the interval is TU-owned; `false` otherwise.
   bool HunkMapsToTU(uint64_t a0, uint64_t a1, StringRef tuPath) const;
+
+  /// \brief Return a conservative TU byte anchor for a pure insertion at PP
+  ///        gap \p pp.
+  ///
+  /// Determines whether the empty A-side hunk at preprocessing-output gap
+  /// \p pp has a \em provable insertion point in the translation unit identified
+  /// by \p tuPath. This proof is used for two purposes: deciding whether the
+  /// pure insertion is truthfully TU-owned, and materializing the corresponding
+  /// zero-width TU span in byte space.
+  ///
+  /// The check is intentionally fail-closed. It accepts only:
+  ///   - exact structural slot anchors recorded by the producer,
+  ///   - exact TU-side macro "arg-like begin" anchors for wrapper/deferred
+  ///     expansion shapes,
+  ///   - immediate mapped TU neighbors when the gap is outside include
+  ///     coverage, or
+  ///   - in non-strict mode, a bounded whitespace probe whose nearest mapped
+  ///     neighbors on both sides agree on TU ownership without crossing an
+  ///     owner-depth boundary.
+  ///
+  /// \param pp The PP-gap index in A-space for the pure insertion being
+  ///        classified or materialized.
+  /// \param tuPath The canonical path of the translation unit whose byte space
+  ///        is being queried for a truthful insertion anchor.
+  ///
+  /// \returns The TU byte offset of the zero-width insertion anchor when a
+  ///          truthful TU proof succeeds; otherwise \c std::nullopt.
+  std::optional<uint64_t> FindProvableTUInsertionAnchor(uint64_t pp,
+                                                        StringRef tuPath) const;
 
   /// Anchors a *pure insertion* (a PP-gap insertion) to a deterministic,
   /// canonical TU byte boundary representing the *same* preprocessed
@@ -926,19 +950,9 @@ private:
   /// 4. **No TU-mapped tokens:**
   ///    - If \p a0 != \p a1 (non-empty interval) and no TU tokens were found,
   ///      returns \c std::nullopt.
-  ///    - If \p a0 == \p a1 (pure insertion at PP gap \c pp = a0):
-  ///      * If the PP gap lies inside any include expansion (as determined by
-  ///        IncludeIdCoveringPPIndex(pp)), returns \c std::nullopt (header-owned).
-  ///      * In \c strict_ mode, consult only the immediate neighbors \c pp and
-  ///        \c pp-1: if either maps to the TU, anchor at \c right.b or \c left.e
-  ///        respectively (returning \c {b,b}); otherwise return \c std::nullopt.
-  ///      * In non-strict mode, the same immediate-neighbor check is performed
-  ///        first. If still unmapped, a bounded search (capped at 64 tokens) is
-  ///        performed left/right for the nearest mapped tokmap entry, stopping
-  ///        early if \c ownerDepthGap changes (when available). If any candidate
-  ///        neighbor maps to a non-TU file, returns \c std::nullopt. Otherwise
-  ///        anchors to the closest TU neighbor (tie-break to the right) and
-  ///        returns \c {b,b}.
+  ///    - If \p a0 == \p a1 (pure insertion at PP gap \c pp = a0), defer to
+  ///      FindProvableTUInsertionAnchor(). If it succeeds, return \c {b,b};
+  ///      otherwise return \c std::nullopt.
   ///
   /// A returned span \c {b,b} denotes a concrete insertion anchor point in the TU.
   ///
