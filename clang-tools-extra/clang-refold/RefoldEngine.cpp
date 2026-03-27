@@ -87,6 +87,15 @@ inline std::string resolveHeaderPath(const RefoldModel::IncludeItem &inc) {
              : stringutils::stripHeaderToken(inc.target).str();
 }
 
+/// Return true iff \p replacement has the exact chained-call shape
+///   (<non-empty head>)(...)...
+/// i.e. a balanced parenthesized callable head followed by one or more
+/// balanced call-suffix groups, with only whitespace/comments between
+/// groups and nothing trailing afterward.
+///
+/// This is used by chained-call patch extension to detect replacements
+/// such as `(f)(x)` or `((f))(x)(y)`, where the final trailing source
+/// call group should remain outside the replacement.
 static bool shouldPreserveFinalCallSuffixGroup(StringRef replacement) {
   StringRef s = replacement.trim();
   if (s.empty())
@@ -104,6 +113,7 @@ static bool shouldPreserveFinalCallSuffixGroup(StringRef replacement) {
   if (firstInside >= headEnd)
     return false;
 
+  // Require one or more trailing call groups.
   pos = stringutils::skipWSAndComments(s, headEnd + 1);
   bool sawCallGroup = false;
   while (pos < s.size() && s[pos] == '(') {
@@ -117,6 +127,24 @@ static bool shouldPreserveFinalCallSuffixGroup(StringRef replacement) {
   return sawCallGroup && pos == s.size();
 }
 
+/// Extend a macro invocation's replacement end across trailing chained-call
+/// suffix groups in the original source, when those groups should be absorbed
+/// into the replacement.
+///
+/// Starting at \p invEnd, this scans forward through any immediately following
+/// balanced `(...)` groups (skipping whitespace/comments between groups) and
+/// returns the byte offset after the last group that should be consumed.
+///
+/// Consumption policy:
+///   - If \p replacement still looks directly callable (for example `IDENT` or
+///     `IDENT(...)`), do not consume any trailing source call groups.
+///   - Otherwise, consume trailing source `(...)` groups as part of the patch.
+///   - Exception: if \p replacement is itself a full parenthesized chained-call
+///     surface such as `(f)(x)` or `((f))(x)(y)`, preserve the final trailing
+///     source call group so the outermost call remains outside the replacement.
+///
+/// Returns \p invEnd unchanged if no trailing call-suffix groups should be
+/// consumed or if no balanced group begins at/after \p invEnd.
 static uint64_t extendChainedCallEnd(StringRef fileText, uint64_t invEnd,
                                      StringRef replacement) {
   if (invEnd > fileText.size())
@@ -144,6 +172,8 @@ static uint64_t extendChainedCallEnd(StringRef fileText, uint64_t invEnd,
   if (pos >= fileText.size() || fileText[pos] != '(')
     return invEnd;
 
+  // Collect the end offsets of each consecutive balanced trailing `(...)`
+  // suffix group after the invocation, skipping intervening whitespace/comments.
   SmallVector<uint64_t, 4> groupEnds;
   while (pos < fileText.size() && fileText[pos] == '(') {
     const size_t r = stringutils::findMatchingRParen(fileText, pos);
@@ -213,8 +243,7 @@ void RefoldEngine::BuildBInsertionProvenance(ArrayRef<diffutils::Hunk> hunks) {
 
   for (size_t hi = 0; hi < hunks.size(); ++hi) {
     const auto &h = hunks[hi];
-    const bool isIns = (h.aStart == h.aEnd) && (h.bStart < h.bEnd);
-    if (!isIns)
+    if (!h.isInsertOnly())
       continue;
 
     const size_t b0 = static_cast<size_t>(h.bStart);
@@ -418,8 +447,7 @@ std::string RefoldEngine::Refold() {
 
   debug("escalate",
         "ESCALATION terminal: emitting fully expanded edited preprocessed "
-        "stream (B). reasons={0}",
-        escalationReasons_.size());
+        "stream (B). reasons={0}", escalationReasons_.size());
   for (const auto &r : escalationReasons_)
     debug("escalate", "  {0}", r);
   lastStats_ = RefoldStats{};
@@ -474,7 +502,7 @@ std::string RefoldEngine::RefoldOnce() {
   sepBuf.assign(MAX_COLS, '-');
   StringRef sep = sepBuf;
 
-  // 1) Generate token sequences and A->B anchor map.
+  // 1) Generate both A and B token sequences.
   auto aSeq = MapLexemes(aToks_, aTokOff_);
   trace("lcs/aSeq", "aSeq:");
   trace("lcs/aSeq", "=====");
@@ -500,7 +528,8 @@ std::string RefoldEngine::RefoldOnce() {
       [](StringRef msg) { trace("lcs/ownerGap", msg); });
   trace("lcs/ownerGap", sep);
 
-  // 2) LCS over tokens (A → B) with owner-aware cost model.
+  // 2) LCS over tokens (A → B) with owner-aware cost model. and dump A → B
+  // map.
   auto a2b = diffutils::lcsMapAB(aSeq, bSeq, ownerDepthGap_);
   trace("lcs/a2b", "a2b:");
   trace("lcs/a2b", "====");
@@ -549,15 +578,20 @@ std::string RefoldEngine::RefoldOnce() {
 
   size_t trimmedEdgeMatched = 0;
   for (auto &h : hunks) {
-    const bool isIns = (h.aStart == h.aEnd) && (h.bStart < h.bEnd);
-    if (!isIns)
+    if (!h.isInsertOnly())
       continue;
 
+    // Insert-only hunks should contain only unmatched B tokens. Under ambiguous
+    // token-LCS tie-breaks, a matched context token can end up stranded on the
+    // front edge of such a hunk; trim those away.
     while (h.bStart < h.bEnd && static_cast<size_t>(h.bStart) < b2a.size() &&
            b2a[static_cast<size_t>(h.bStart)] >= 0) {
       ++h.bStart;
       ++trimmedEdgeMatched;
     }
+
+    // Likewise trim any matched context tokens that leaked onto the back edge
+    // of an insert-only hunk, leaving only the true inserted B-token interval.
     while (h.bStart < h.bEnd && static_cast<size_t>(h.bEnd - 1) < b2a.size() &&
            b2a[static_cast<size_t>(h.bEnd - 1)] >= 0) {
       --h.bEnd;
@@ -578,11 +612,10 @@ std::string RefoldEngine::RefoldOnce() {
     std::vector<diffutils::Hunk> merged;
     merged.reserve(hunks.size());
     for (const auto &h : hunks) {
-      const bool isIns = (h.aStart == h.aEnd) && (h.bStart < h.bEnd);
+      const bool isIns = h.isInsertOnly();
       if (!merged.empty()) {
         diffutils::Hunk &prev = merged.back();
-        const bool prevIns =
-            (prev.aStart == prev.aEnd) && (prev.bStart < prev.bEnd);
+        const bool prevIns = prev.isInsertOnly();
         if (isIns && prevIns && prev.aStart == h.aStart &&
             prev.aEnd == h.aEnd && prev.bEnd == h.bStart) {
           prev.bEnd = h.bEnd;
@@ -686,7 +719,6 @@ std::string RefoldEngine::RefoldOnce() {
   DenseMap<std::optional<uint64_t>, DenseMap<uint64_t, MacroPatch>>
       macroPatchByOwnerByMacroId;
 
-
   // Instrumentation helpers for diagnosing duplicated hunk material:
   // Compare B-envelope selection derived from byte hunks vs token-level a2b.
   auto tokEnvFromA2B =
@@ -762,9 +794,9 @@ std::string RefoldEngine::RefoldOnce() {
     const auto &h = hunks[i];
 
     // Shape info (pure insert/delete/replace) – LOG ONLY
-    bool isIns = (h.aStart == h.aEnd) && (h.bStart < h.bEnd);
-    bool isDel = (h.aStart < h.aEnd) && (h.bStart == h.bEnd);
-    bool isRep = (h.aStart < h.aEnd) && (h.bStart < h.bEnd);
+    bool isIns = h.isInsertOnly();
+    bool isDel = h.isDeleteOnly();
+    bool isRep = h.isReplace();
     debug("classify", "#{0} shape: isIns={1} isDel={2} isRep={3} {4}", i, isIns,
           isDel, isRep, h);
 
@@ -817,12 +849,14 @@ std::string RefoldEngine::RefoldOnce() {
                   : (target->invText ? target->invText->str() : "");
 
           if (inTraceMode()) {
-            // Envelope diagnostics: compare byte-hunk-derived envelopes vs token-level
-            // a2b-derived envelopes for both the macro cover and the current hunk.
-            // Disagreements or envelopes that start on boundary insertions are a common
-            // root cause for duplicated insertion material in whole-cover fallback.
+            // Envelope diagnostics: compare byte-hunk-derived envelopes vs
+            // token-level a2b-derived envelopes for both the macro cover and
+            // the current hunk. Disagreements or envelopes that start on
+            // boundary insertions are a common root cause for duplicated
+            // insertion material in whole-cover fallback.
             trace("instr/macro",
-                  "macro id={0} name='{1}' coverA=[{2},{3}) hunkA=[{4},{5}) hunkB=[{6},{7})",
+                  "macro id={0} name='{1}' coverA=[{2},{3}) hunkA=[{4},{5}) "
+                  "hunkB=[{6},{7})",
                   target->id, target->name, target->cover.begin,
                   target->cover.end, h.aStart, h.aEnd, h.bStart, h.bEnd);
             traceBEnv("instr/macro", "cover byte",
@@ -834,12 +868,15 @@ std::string RefoldEngine::RefoldOnce() {
                       MapATokRangeAToBTokenEnvelope(h.aStart, h.aEnd));
             traceBEnv("instr/macro", "hunk a2b",
                       tokEnvFromA2B(h.aStart, h.aEnd));
-            traceBEnv(
-                "instr/macro", "hunk diff",
-                std::make_optional(std::make_pair(
-                    static_cast<size_t>(h.bStart), static_cast<size_t>(h.bEnd))));
+            traceBEnv("instr/macro", "hunk diff",
+                      std::make_optional(
+                          std::make_pair(static_cast<size_t>(h.bStart),
+                                         static_cast<size_t>(h.bEnd))));
           }
 
+          // Try to build a whole-cover replacement at the current target
+          // invocation. If successful, install/replace the callsite patch for
+          // this macro id and stop climbing the caller chain.
           auto updated = BuildMacroInvocationPatchWholeCover(
               *target, h, currentInvText, macroPatchByOwnerByMacroId);
           if (updated) {
@@ -856,6 +893,10 @@ std::string RefoldEngine::RefoldOnce() {
             break;
           }
 
+          // No deterministic whole-cover patch at this child invocation.
+          // Climb to the immediate caller macro and retry at that enclosing
+          // callsite, so the edit can be represented at a higher macro layer
+          // if needed.
           if (!target->callerMacroId)
             break;
           const RefoldModel::MacroInvocation *parent =
@@ -969,11 +1010,12 @@ std::string RefoldEngine::RefoldOnce() {
           size_t b0 = bTokOff_[h.bStart], b1 = bTokOff_[h.bEnd];
           repl.assign(bSource_.data() + b0, bSource_.data() + b1);
 
-          // Token envelopes start at the first token, so they exclude any
-          // intra-line whitespace that precedes that token in B. For a pure
-          // insertion at a zero-width TU site, preserve this leading trivia so
-          // edits like appending " + 7" after a macro call don't lose the
-          // space.
+          // Token-envelope byte ranges begin at the first inserted token, so
+          // they do not include any spaces or tabs that appear immediately
+          // before that token in B on the same line. For a zero-width TU
+          // insertion, preserve those preceding spaces or tabs when forming
+          // the inserted text, unless equivalent spacing is already present
+          // immediately to the left of the insertion point in the TU.
           if (span->first == span->second && h.bStart > 0) {
             size_t p = b0;
             while (p > 0) {
@@ -1028,11 +1070,12 @@ std::string RefoldEngine::RefoldOnce() {
         if (replacingGap && !repl.empty() && !stringutils::isWs(repl.front()))
           repl.insert(repl.begin(), ' ');
 
-        // Final boundary padding:
-        // - allowLeft only if we did NOT already preserve a gap (avoids
-        //   double-space)
-        // - always allowRight (covers cases like “…0” + “: 1” at zero-width
-        //   sites)
+        // Final boundary spacing fixup:
+        // - On the left, only let PadAtBoundaries add a space if we did not
+        //   already preserve whitespace from a replaced TU gap; otherwise we
+        //   could duplicate spacing.
+        // - On the right, always allow padding if the replacement would
+        //   otherwise glue to the following TU text.
         std::string padded =
             PadAtBoundaries(tuBytes, static_cast<size_t>(span->first),
                             static_cast<size_t>(span->second), std::move(repl),
@@ -1085,11 +1128,13 @@ std::string RefoldEngine::RefoldOnce() {
         repl.assign(bSource_.data() + b0, bSource_.data() + b1);
       }
 
-      // Token envelopes start at the first token, so they exclude any
-      // intra-line whitespace that precedes that token in B. For a pure
-      // insertion (empty TU span), preserve that leading trivia so statement-
-      // local formatting (e.g. "FOO(...) + 7") isn't collapsed to
-      // "FOO(...)+ 7".
+      // This patch inserts B text at a zero-width TU site: the TU span is empty,
+      // but the hunk contributes one or more B tokens. Token-envelope byte ranges
+      // begin at the first inserted token, so they do not include any spaces or
+      // tabs that appear immediately before that token in B on the same line.
+      // Preserve those preceding spaces/tabs when forming the inserted text,
+      // unless equivalent spacing is already present immediately to the left of
+      // the insertion point in the TU.
       if (!isDel && span->first == span->second && h.bStart < h.bEnd &&
           h.bStart > 0) {
         const size_t bTokStart = static_cast<size_t>(h.bStart);
@@ -1143,9 +1188,10 @@ std::string RefoldEngine::RefoldOnce() {
               span->second);
       }
 
-      // If we're replacing a non-empty TU gap and the inserted text doesn't
-      // start with WS, prefix EXACTLY ONE space from the gap to preserve
-      // “return injected” (no double spaces).
+      // If this patch replaces a non-empty whitespace gap in the TU, and the
+      // replacement text does not already begin with whitespace, prefix a
+      // single space so adjacent tokens remain separated. Add only one space,
+      // even if the original gap was wider, to avoid duplicating spacing.
       if (replacingGap && !repl.empty() && !stringutils::isWs(repl.front()))
         repl.insert(repl.begin(), ' ');
 
@@ -1206,17 +1252,21 @@ std::string RefoldEngine::RefoldOnce() {
   for (const auto &outerEntry : macroPatchByOwnerByMacroId)
     OwnerKeys.push_back(outerEntry.first);
 
-  llvm::sort(OwnerKeys, [](const std::optional<uint64_t> &A,
-                           const std::optional<uint64_t> &B) {
-    if (!A && B)
+  llvm::sort(OwnerKeys, [](const std::optional<uint64_t> &a,
+                           const std::optional<uint64_t> &b) {
+    if (!a && b)
       return true;
-    if (A && !B)
+    if (a && !b)
       return false;
-    if (!A && !B)
+    if (!a && !b)
       return false;
-    return *A < *B;
+    return *a < *b;
   });
 
+  // Finalize per-owner macro patch lists in a deterministic order.
+  // Patches were accumulated in a nested map keyed by owner and then macro id;
+  // here we flatten them into each owner's output vector, sorting by macro id
+  // first so patch emission does not depend on map iteration order.
   for (const auto &owner : OwnerKeys) {
     auto outerIt = macroPatchByOwnerByMacroId.find(owner);
     if (outerIt == macroPatchByOwnerByMacroId.end())
@@ -1283,12 +1333,16 @@ std::string RefoldEngine::RefoldOnce() {
   }
 
   // (c) Pull in all ancestors up to the TU.
-  // TODO: is there a more efficient way to do this?
-  for (uint64_t id : std::vector<uint64_t>(seeds.begin(), seeds.end())) {
-    const auto *cur = model_.GetIncludeById(id);
+  llvm::SmallVector<uint64_t, 32> worklist(seeds.begin(), seeds.end());
+  for (size_t i = 0; i < worklist.size(); ++i) {
+    const auto *cur = model_.GetIncludeById(worklist[i]);
     while (cur && cur->parent) {
-      seeds.insert(*cur->parent);
-      cur = model_.GetIncludeById(*cur->parent);
+      uint64_t parentId = *cur->parent;
+      auto [it, inserted] = seeds.insert(parentId);
+      if (!inserted)
+        break;
+      worklist.push_back(parentId);
+      cur = model_.GetIncludeById(parentId);
     }
   }
 
@@ -1309,7 +1363,12 @@ std::string RefoldEngine::RefoldOnce() {
                                 &appliedExpandedMacroRootIds);
   }
 
-
+  // Determine which include ids should count as "expanded" for this refold.
+  // If forced inlining of touched includes from B is enabled, start from the
+  // includes that have explicit expansion materialization and close that set
+  // downward through the include tree so all nested children are marked
+  // expanded too. Otherwise, count only the includes that appear directly in
+  // includeExpansion. Record the final expanded-include count in stats.
   DenseSet<uint64_t> expandedIncludeIds;
   if (ForceInlineTouchedIncludesFromB()) {
     SmallVector<uint64_t, 32> stack;
@@ -1347,6 +1406,12 @@ std::string RefoldEngine::RefoldOnce() {
                 return p1.invEnd > p2.invEnd;
               });
 
+    // Apply TU-owned macro patches in deterministic outermost-first order.
+    // Each patch may first be extended over trailing chained call-suffix
+    // groups. Keep only the outermost patch for any nested TU callsite region:
+    // if a later patch is fully contained in an already accepted interval, it
+    // is shadowed and skipped. Partial overlaps are invalid for macro callsites
+    // here, so fail fast rather than producing order-dependent edits.
     SmallVector<std::pair<uint64_t, uint64_t>, 16> accepted;
     for (const auto &mp : tuMacroPatches) {
       uint64_t mpEnd =
@@ -1381,11 +1446,11 @@ std::string RefoldEngine::RefoldOnce() {
               mp.invStart, mpEnd, mp.replacement.size());
         ResyncOutcome ro = ApplyResyncOrPend(tuBytes, mp.invStart, mpEnd,
                                              mp.replacement, tuPath);
-        tuEdits.push_back(TextEdit{mp.invStart, mpEnd, std::move(ro.text),
-                                   std::move(ro.pending),
-                                   MacroPatchRemainsExpanded(mp)
-                                       ? std::make_optional(GetRootMacroId(mp.macroId))
-                                       : std::nullopt});
+        tuEdits.push_back(TextEdit{
+            mp.invStart, mpEnd, std::move(ro.text), std::move(ro.pending),
+            MacroPatchRemainsExpanded(mp)
+                ? std::make_optional(GetRootMacroId(mp.macroId))
+                : std::nullopt});
       } else {
         trace("macro/tu", "  TU macro patch shadowed (skipped) inv=[{0},{1})",
               mp.invStart, mpEnd);
@@ -1403,6 +1468,13 @@ std::string RefoldEngine::RefoldOnce() {
     IncludeIds.push_back(kv.first);
   llvm::sort(IncludeIds);
 
+  // Apply TU-level include expansions by replacing the original `#include`
+  // directive with the realized expansion text. For includes whose site is in
+  // the TU itself (no parent include, and sitePath == tuPath), use the
+  // materialized expansion from includeExpansion, defensively extend the
+  // producer-reported site range to cover the full physical directive when line
+  // splices are involved, then wrap the expansion with the appropriate line-
+  // directive context and emit it as a TU text edit.
   for (uint64_t incId : IncludeIds) {
     auto itExp = includeExpansion.find(incId);
     if (itExp == includeExpansion.end())
@@ -1413,12 +1485,12 @@ std::string RefoldEngine::RefoldOnce() {
       continue;
     if (!inc->parent && PathsEqual(inc->sitePath, tuPath)) {
       const auto &expText = itExp->second;
-      // Producer-reported site spans are intended to cover the entire
-      // `#include` directive in the TU, but can be truncated in the presence of
-      // leading line splices (e.g., a standalone "\\\n" before the directive).
-      // If we don't cover the full physical directive, we can leave behind a
-      // live `#include`, causing the refolded TU to re-include a header in the
-      // checker replay (notably for headers without include guards).
+      // The producer's [siteB, siteE) range is supposed to cover the entire
+      // physical `#include` directive in the TU. In some cases involving
+      // leading line splices just before the directive, that recorded end can
+      // stop too early. If we replace only the truncated range, part of the
+      // original `#include` can remain in the TU, and checker replay may
+      // include the header again.
       const StringRef tuRef(tuBytes);
       uint64_t siteB = inc->siteB;
       uint64_t siteE = inc->siteE;
@@ -1456,14 +1528,17 @@ std::string RefoldEngine::RefoldOnce() {
   std::string tuResult = ApplyTextEditsWithPendingResync(
       tuBytes, tuEdits, &appliedExpandedMacroRootIds);
 
-  // If the TU contains built-in macros whose expansion depends on the
-  // preprocessor logical file (notably __FILE__/__FILE_NAME__),
-  // establish the TU's original spelled file at the start of the refolded
-  // output. Otherwise, replay preprocessing will treat the refolded output
-  // filename (e.g. "foo.c.mod") as __FILE__.
+  // Preserve TU-local __FILE__ / __FILE_NAME__ semantics in checker replay.
   //
-  // Keep this narrowly scoped: only insert the prologue when such a builtin is
-  // invoked in the TU and the output does not already start with a #line.
+  // If the TU contains an invocation of __FILE__ or __FILE_NAME__, replaying
+  // the refolded output without an initial line directive would make those
+  // builtins see the refolded output path (for example "foo.c.mod") instead of
+  // the TU's original spelled path. To avoid that, prepend a TU-level line
+  // directive that resets the logical file to the original TU path.
+  //
+  // Keep this narrowly scoped: do this only when such a builtin is actually
+  // invoked in the TU, line directives are enabled, and the output does not
+  // already begin with a #line directive.
   if (lineDirs_.Enabled() && !tuResult.empty()) {
     auto startsWithLine = [](StringRef s) -> bool {
       size_t i = 0;
@@ -1502,8 +1577,8 @@ std::string RefoldEngine::RefoldOnce() {
         tuResult.insert(0, dir);
     }
   }
-  // Note: escalation handling is performed by the outer ladder in Refold().
 
+  // Note: escalation handling is performed by the outer ladder in Refold().
   if (ForceInlineTouchedIncludesFromB()) {
     for (const auto &mi : model_.GetMacroInvocations()) {
       if (mi.ownerIncludeId &&
@@ -1585,15 +1660,23 @@ std::vector<uint32_t> RefoldEngine::ComputeOwnerDepthGapsForPP() {
 bool RefoldEngine::BoundaryGlues(char left, char right) {
   const bool leftId = stringutils::isIdentPart(left);
   const bool rightId = stringutils::isIdentPart(right);
+
+  // Identifier-like text on both sides would merge into a larger identifier-
+  // like token if no space is inserted.
   if (leftId && rightId)
-    return true; // e.g., return + injected → returninjected
+    return true;
+
+  // An identifier-like token immediately followed by '(' reads as a call-like
+  // boundary, so keep them separated when padding is needed.
   if (leftId && right == '(')
-    return true; // e.g., foo(…)
-  // Operator-like punctuation right after an identifier/number benefits from a
-  // space
+    return true;
+
+  // An identifier-like token immediately followed by operator-like punctuation
+  // usually benefits from a separating space.
   static constexpr char OPS[] = ":?+-*/%&|^<>=!";
   if (leftId && std::char_traits<char>::find(OPS, sizeof(OPS) - 1, right))
-    return true; // e.g., 0: → 0 :
+    return true;
+
   return false;
 }
 

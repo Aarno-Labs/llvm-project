@@ -330,12 +330,15 @@ private:
   // We track token-level pure-insertion hunks (A length 0, B length > 0) and
   // allow exactly one emission site to claim each insertion.
 
+  // Emission ownership for a pure B-only insertion segment.
   enum class BInsertionClaim : uint8_t {
     Unclaimed = 0,
     Standalone = 1, // emitted as a TU/include/arm insertion patch
     MacroAbsorb = 2 // reserved for future (macro patch intentionally absorbs)
   };
 
+  // Provenance record for one token-level pure insertion hunk:
+  // inserted at A-gap aGap, produced by hunkIndex, spanning B tokens [b0,b1).
   struct BInsertionProv {
     uint64_t aGap = 0;      // insertion position in A (pp token gap)
     uint64_t hunkIndex = 0; // index in abTokHunks_
@@ -344,10 +347,16 @@ private:
     BInsertionClaim claim = BInsertionClaim::Unclaimed;
   };
 
+  // Master table of all tracked pure insertion segments.
   std::vector<BInsertionProv> bInsertions_;
-  std::vector<int32_t> bTokToInsertionId_; // size bToks_, -1 if not insertion
-  std::vector<int32_t>
-      hunkToInsertionId_; // size abTokHunks_, -1 if not insertion
+
+  // Reverse map: B token index -> insertion id in bInsertions_, or -1 if this
+  // B token is not part of a tracked pure insertion.
+  std::vector<int32_t> bTokToInsertionId_;
+
+  // Reverse map: token diff hunk index -> insertion id in bInsertions_, or -1
+  // if the hunk is not a pure insertion.
+  std::vector<int32_t> hunkToInsertionId_;
 
   /// \brief Build provenance indices for token-level pure insertion hunks.
   ///
