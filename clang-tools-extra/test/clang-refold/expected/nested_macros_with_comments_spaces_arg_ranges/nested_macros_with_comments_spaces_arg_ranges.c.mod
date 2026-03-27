@@ -8,5 +8,5 @@
 
 int main(void) {
   int v = WRAP3((1 + 3));
-  return v == 4  ? 0 : 1;
+  return v == 4 ? 0 : 1;
 }

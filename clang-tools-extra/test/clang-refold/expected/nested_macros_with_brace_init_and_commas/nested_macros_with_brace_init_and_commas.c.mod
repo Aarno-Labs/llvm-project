@@ -7,5 +7,5 @@
 
 int main(void) {
   int *p = ARR2(3, 5);
-  return SUM2(p) == 8  ? 0 : 1;
+  return SUM2(p) == 8 ? 0 : 1;
 }

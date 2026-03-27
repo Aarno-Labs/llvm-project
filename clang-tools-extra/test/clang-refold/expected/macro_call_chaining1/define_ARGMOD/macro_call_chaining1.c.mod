@@ -9,5 +9,5 @@
 int main(void) {
   int a = PICK1()(11); // INC(10)
   int b = PICK2()(10); // DEC(10)
-  return (a == 12  && b == 9) ? 0 : 1;
+  return (a == 12 && b == 9) ? 0 : 1;
 }

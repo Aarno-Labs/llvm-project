@@ -196,6 +196,54 @@ static uint64_t extendChainedCallEnd(StringRef fileText, uint64_t invEnd,
   return (consume == 0) ? invEnd : groupEnds[consume - 1];
 }
 
+// Slice the exact byte coverage of tokens [startTok,endTok): from the first
+// token's start to the last token's end, excluding any inter-token whitespace
+// that follows the final token and belongs to later untouched text.
+static StringRef sliceExactTokenCoverage(ArrayRef<size_t> tokOff,
+                                         ArrayRef<PPTok> toks, StringRef source,
+                                         uint64_t startTok, uint64_t endTok) {
+  if (tokOff.empty() || toks.empty() || source.empty() || endTok <= startTok)
+    return "";
+
+  const uint64_t tokCount = static_cast<uint64_t>(toks.size());
+  uint64_t loTok = std::clamp(startTok, static_cast<uint64_t>(0), tokCount);
+  uint64_t hiTok = std::clamp(endTok, loTok, tokCount);
+  if (hiTok <= loTok || loTok >= tokCount)
+    return "";
+
+  size_t lo = tokOff[static_cast<size_t>(loTok)];
+  const size_t lastTok = static_cast<size_t>(hiTok - 1);
+  size_t hi = tokOff[lastTok] + toks[lastTok].spelling.size();
+
+  const size_t sourceLen = source.size();
+  lo = std::clamp(lo, size_t(0), sourceLen);
+  hi = std::clamp(hi, lo, sourceLen);
+  return source.substr(lo, hi - lo);
+}
+
+// Slice the full byte envelope of tokens [startTok,endTok): from the first
+// token's start up to the next token boundary (or source end). Unlike
+// sliceExactTokenCoverage(), this preserves any trailing whitespace or
+// newlines that are part of the inserted B-side payload.
+static StringRef sliceTokenEnvelope(ArrayRef<size_t> tokOff, StringRef source,
+                                    uint64_t startTok, uint64_t endTok) {
+  if (tokOff.empty() || source.empty() || endTok <= startTok)
+    return "";
+
+  const uint64_t tokCount = static_cast<uint64_t>(tokOff.size());
+  uint64_t loTok = std::clamp(startTok, static_cast<uint64_t>(0), tokCount);
+  uint64_t hiTok = std::clamp(endTok, loTok, tokCount);
+  if (hiTok <= loTok || loTok >= tokCount)
+    return "";
+
+  const size_t sourceLen = source.size();
+  size_t lo =
+      std::clamp(tokOff[static_cast<size_t>(loTok)], size_t(0), sourceLen);
+  size_t hi = sourceLen;
+  if (hiTok < tokCount)
+    hi = std::clamp(tokOff[static_cast<size_t>(hiTok)], lo, sourceLen);
+  return source.substr(lo, hi - lo);
+}
 } // namespace
 
 // ========================== Public entry points ==========================
@@ -1011,8 +1059,13 @@ std::string RefoldEngine::RefoldOnce() {
 
         std::string repl;
         if (h.bStart < h.bEnd) {
-          size_t b0 = bTokOff_[h.bStart], b1 = bTokOff_[h.bEnd];
-          repl.assign(bSource_.data() + b0, bSource_.data() + b1);
+          StringRef bSlice =
+              h.isInsertOnly()
+                  ? sliceTokenEnvelope(bTokOff_, bSource_, h.bStart, h.bEnd)
+                  : sliceExactTokenCoverage(bTokOff_, bToks_, bSource_,
+                                            h.bStart, h.bEnd);
+          repl.assign(bSlice.data(), bSlice.data() + bSlice.size());
+          const size_t b0 = bTokOff_[static_cast<size_t>(h.bStart)];
 
           // Token-envelope byte ranges begin at the first inserted token, so
           // they do not include any spaces or tabs that appear immediately
@@ -1127,9 +1180,12 @@ std::string RefoldEngine::RefoldOnce() {
       if (isDel) {
         repl = "";
       } else {
-        const size_t b0 = bTokOff_[static_cast<size_t>(h.bStart)];
-        const size_t b1 = bTokOff_[static_cast<size_t>(h.bEnd)];
-        repl.assign(bSource_.data() + b0, bSource_.data() + b1);
+        StringRef bSlice =
+            h.isInsertOnly()
+                ? sliceTokenEnvelope(bTokOff_, bSource_, h.bStart, h.bEnd)
+                : sliceExactTokenCoverage(bTokOff_, bToks_, bSource_, h.bStart,
+                                          h.bEnd);
+        repl.assign(bSlice.data(), bSlice.data() + bSlice.size());
       }
 
       // This patch inserts B text at a zero-width TU site: the TU span is empty,
