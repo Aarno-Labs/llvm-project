@@ -6,5 +6,5 @@
 // RUN: %clang-refold-tester concat_multi INMISMATCH
 // RUN: %clang-refold-tester concat_multi OUTMISMATCH
 #define CONCAT(X, Y, Z) X##_##Y##_##Z##_##Y##_##X
-int a_bar_c_b_a  = 5;
+int a_bar_c_b_a = 5;
 int x = a_bar_c_b_a;

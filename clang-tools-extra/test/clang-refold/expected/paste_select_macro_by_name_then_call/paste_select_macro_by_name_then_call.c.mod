@@ -11,5 +11,5 @@
 int main(void) {
   int x = ((2)-(3));
   int y = APPLY(mul, 2, 3);
-  return (x == -1  && y == 6) ? 0 : 1;
+  return (x == -1 && y == 6) ? 0 : 1;
 }

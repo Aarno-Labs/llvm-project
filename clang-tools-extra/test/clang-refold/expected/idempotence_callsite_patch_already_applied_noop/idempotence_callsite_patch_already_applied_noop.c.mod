@@ -4,4 +4,4 @@
 #define Q(T) int q_##T = 1;
 Q(float)
 Q(short)
-int main(){ return q_float  + q_short; }
+int main(){ return q_float + q_short; }
