@@ -9,7 +9,7 @@
 
 #define PASTE3_I(pre,x,post) pre##x##post
 #define PASTE3(pre,x,post)   PASTE3_I(pre, x, post)
-int pre_outer_post (void) { return 5; }
+int pre_outer_post(void) { return 5; }
 
 int main(void) {
   return pre_outer_post() == 5 ? 0 : 1;

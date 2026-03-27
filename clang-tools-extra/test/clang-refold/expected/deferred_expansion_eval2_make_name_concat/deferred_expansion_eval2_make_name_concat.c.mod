@@ -9,7 +9,7 @@
 #define XCAT(a,b) CAT(a,b)
 
 #define MAKE_NAME(a,b) XCAT(a,b)
-int hello_planet (void) { return 21; }
+int hello_planet(void) { return 21; }
 
 int main(void) {
   return EVAL2(MAKE_NAME(hello_,planet))() == 21 ? 0 : 1;

@@ -51,6 +51,10 @@
 #include "RefoldLog.h"
 #include "RefoldEngine.h"
 
+#include "clang/Basic/SourceLocation.h"
+#include "clang/Basic/TokenKinds.h"
+#include "clang/Lex/Lexer.h"
+
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -1657,28 +1661,79 @@ std::vector<uint32_t> RefoldEngine::ComputeOwnerDepthGapsForPP() {
 
 // ============================= Boundary helpers ==============================
 
-bool RefoldEngine::BoundaryGlues(char left, char right) {
-  const bool leftId = stringutils::isIdentPart(left);
-  const bool rightId = stringutils::isIdentPart(right);
+namespace {
+struct LexBoundaryToken {
+  tok::TokenKind Kind = tok::unknown;
+  std::string Spelling;
+};
 
-  // Identifier-like text on both sides would merge into a larger identifier-
-  // like token if no space is inserted.
-  if (leftId && rightId)
+static void lexBoundaryTokens(StringRef Text,
+                              SmallVectorImpl<LexBoundaryToken> &Out) {
+  Out.clear();
+  if (Text.empty())
+    return;
+
+  const SourceLocation BaseLoc = SourceLocation::getFromRawEncoding(1);
+  std::string LexBuf = Text.str();
+  LexBuf.push_back('\0');
+  const char *BufStart = LexBuf.data();
+  const char *BufEnd = BufStart + Text.size();
+  Lexer Lex(BaseLoc, LangOptions(), BufStart, BufStart, BufEnd);
+  Token Tok;
+
+  while (true) {
+    Lex.LexFromRawLexer(Tok);
+    if (Tok.is(tok::eof))
+      break;
+    if (Tok.is(tok::comment))
+      continue;
+
+    const unsigned Off =
+        Tok.getLocation().getRawEncoding() - BaseLoc.getRawEncoding();
+    Out.push_back(
+        {Tok.getKind(), std::string(Text.substr(Off, Tok.getLength()))});
+  }
+}
+
+static std::optional<LexBoundaryToken> firstLexToken(StringRef Text) {
+  SmallVector<LexBoundaryToken, 8> Toks;
+  lexBoundaryTokens(Text, Toks);
+  if (Toks.empty())
+    return std::nullopt;
+  return Toks.front();
+}
+
+static std::optional<LexBoundaryToken> lastLexToken(StringRef Text) {
+  SmallVector<LexBoundaryToken, 16> Toks;
+  lexBoundaryTokens(Text, Toks);
+  if (Toks.empty())
+    return std::nullopt;
+  return Toks.back();
+}
+
+/// Return true iff placing Left and Right adjacent with no separating
+/// whitespace would change lexical tokenization compared to placing a space
+/// between them.
+static bool needsLexicalSeparator(const LexBoundaryToken &Left,
+                                  const LexBoundaryToken &Right) {
+  const std::string NoSpace = Left.Spelling + Right.Spelling;
+  const std::string WithSpace = Left.Spelling + " " + Right.Spelling;
+
+  SmallVector<LexBoundaryToken, 8> NoSpaceToks;
+  SmallVector<LexBoundaryToken, 8> WithSpaceToks;
+  lexBoundaryTokens(NoSpace, NoSpaceToks);
+  lexBoundaryTokens(WithSpace, WithSpaceToks);
+
+  if (NoSpaceToks.size() != WithSpaceToks.size())
     return true;
-
-  // An identifier-like token immediately followed by '(' reads as a call-like
-  // boundary, so keep them separated when padding is needed.
-  if (leftId && right == '(')
-    return true;
-
-  // An identifier-like token immediately followed by operator-like punctuation
-  // usually benefits from a separating space.
-  static constexpr char OPS[] = ":?+-*/%&|^<>=!";
-  if (leftId && std::char_traits<char>::find(OPS, sizeof(OPS) - 1, right))
-    return true;
-
+  for (size_t I = 0; I < NoSpaceToks.size(); ++I) {
+    if (NoSpaceToks[I].Kind != WithSpaceToks[I].Kind ||
+        NoSpaceToks[I].Spelling != WithSpaceToks[I].Spelling)
+      return true;
+  }
   return false;
 }
+} // namespace
 
 std::string RefoldEngine::PadAtBoundaries(StringRef base, size_t start,
                                           size_t end, std::string text,
@@ -1686,25 +1741,56 @@ std::string RefoldEngine::PadAtBoundaries(StringRef base, size_t start,
   const auto f = stringutils::firstNonWsIdx(text);
   const auto l = stringutils::lastNonWsIdx(text);
 
-  // If text is empty or only whitespace, there's no content to "glue"
+  // If text is empty or only whitespace, there is no token content whose
+  // boundaries need separation.
   if (!f || !l)
     return text;
 
-  // Character in base immediately to the left/right of the replacement range
-  const char leftC =
-      (start > 0 && start <= base.size()) ? base[start - 1] : '\0';
-  const char rightC = end < base.size() ? base[end] : '\0';
-
-  // Check for existing whitespace at the edges of the provided text
+  // If the replacement already has whitespace at an edge, treat that side as
+  // already separated and never add another padding space there.
   const bool hasLeadingWS = (*f > 0);
   const bool hasTrailingWS = (*l + 1 < text.size());
 
-  // Determine if padding is needed BEFORE modifying the string to avoid index
-  // drift
-  bool addLeftSpace =
-      allowLeft && !hasLeadingWS && BoundaryGlues(leftC, text[*f]);
-  bool addRightSpace =
-      allowRight && !hasTrailingWS && BoundaryGlues(text[*l], rightC);
+  std::optional<LexBoundaryToken> textFirstTok = firstLexToken(StringRef(text));
+  std::optional<LexBoundaryToken> textLastTok = lastLexToken(StringRef(text));
+
+  const std::optional<char> leftChar =
+      (start > 0 && start <= base.size()) ? std::optional<char>(base[start - 1])
+                                          : std::nullopt;
+  const std::optional<char> rightChar =
+      (end < base.size()) ? std::optional<char>(base[end]) : std::nullopt;
+
+  bool addLeftSpace = false;
+  // Add a leading space only when:
+  //   - left padding is allowed,
+  //   - the replacement does not already begin with whitespace,
+  //   - the base text is not already separated from the replacement by
+  //     immediate boundary whitespace, and
+  //   - juxtaposing the left boundary token and the replacement's first token
+  //     would change lexical tokenization.
+  if (allowLeft && !hasLeadingWS && start > 0 && start <= base.size() &&
+      textFirstTok && (!leftChar || !stringutils::isWs(*leftChar))) {
+    if (std::optional<LexBoundaryToken> leftTok =
+            lastLexToken(base.take_front(start))) {
+      addLeftSpace = needsLexicalSeparator(*leftTok, *textFirstTok);
+    }
+  }
+
+  bool addRightSpace = false;
+  // Likewise on the right boundary: add a trailing space only when:
+  //   - right padding is allowed,
+  //   - the replacement does not already end with whitespace,
+  //   - the base text is not already separated from the replacement by
+  //     immediate boundary whitespace, and
+  //   - juxtaposing the replacement's last token and the right boundary token
+  //     would change lexical tokenization.
+  if (allowRight && !hasTrailingWS && end < base.size() && textLastTok &&
+      (!rightChar || !stringutils::isWs(*rightChar))) {
+    if (std::optional<LexBoundaryToken> rightTok =
+            firstLexToken(base.drop_front(end))) {
+      addRightSpace = needsLexicalSeparator(*textLastTok, *rightTok);
+    }
+  }
 
   if (addLeftSpace)
     text.insert(0, 1, ' ');

@@ -2,7 +2,7 @@
 // RUN: %clang-refold-tester macro_api_generation2 NOREFOLD1
 // RUN: %clang-refold-tester macro_api_generation2 NOREFOLD2
 // RUN: %clang-refold-tester macro_api_generation2 BODYMOD
-void OPEN (void) { printf("Opening file...\n"); }
+void OPEN(void) { printf("Opening file...\n"); }
 void close(void) { printf("Closing file...\n"); }
 
 typedef struct {
@@ -24,7 +24,7 @@ REGISTER_COMMAND(OPEN)
 REGISTER_COMMAND(close)
 
 int main() {
-  run_OPEN ();
+  run_OPEN();
   printf("Struct info: %s is at address %p\n", OPEN_struct.name,
          (void *)OPEN_struct.func);
   return 0;
