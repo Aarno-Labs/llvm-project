@@ -1005,11 +1005,11 @@ std::string RefoldEngine::RefoldOnce() {
             i, owner.includeId);
       }
       auto span = TUByteSpan(h.aStart, h.aEnd, tuPath); // [b,e)
-      debug("classify", "#{0} TU-byteSpan=[{1},{2}) for A[{3},{4})", i,
-            span->first, span->second, h.aStart, h.aEnd);
-
-      std::string repl;
       if (span) {
+        debug("classify", "#{0} TU-byteSpan=[{1},{2}) for A[{3},{4})", i,
+              span->first, span->second, h.aStart, h.aEnd);
+
+        std::string repl;
         if (h.bStart < h.bEnd) {
           size_t b0 = bTokOff_[h.bStart], b1 = bTokOff_[h.bEnd];
           repl.assign(bSource_.data() + b0, bSource_.data() + b1);
@@ -1864,8 +1864,19 @@ RefoldEngine::ClassifyOwnerWithSegments(StringRef tuPath,
   // through slots.
   auto span = TUByteSpan(a0, a1, tuPath); // [b, e)
 
-  // If there is no truthful TU anchor (no TU tokens in the range, and the
-  // insertion cannot be safely anchored in TU), classify purely in PP space.
+  // No truthful TU byte anchor exists for this PP segment, so choose its owner
+  // using only preprocessed-token structure. This happens when the segment has
+  // no TU-backed tokens in range, and a pure insertion cannot be safely tied to
+  // a concrete TU byte position. In that case, recover ownership from the
+  // include / conditional context at the PP boundaries:
+  //   - for insertions, inspect the PP token immediately to the left and right
+  //     of the insertion gap
+  //   - for non-insertions, inspect the PP endpoints covered by the segment
+  // If both sides live under a common include, assign the segment to that
+  // least-common-ancestor include, and preserve a same-arm conditional owner
+  // when both sides are in the same selected arm. If no include owner can be
+  // established, fall back to TU ownership; this should be rare and typically
+  // indicates a TU-boundary case without a stronger slot anchor.
   if (!span) {
     const bool isInsert = (a0 == a1);
     const size_t n = model_.GetTokensCountA();
@@ -1877,6 +1888,8 @@ RefoldEngine::ClassifyOwnerWithSegments(StringRef tuPath,
     std::optional<RefoldModel::ArmRef> rightArmRef;
 
     if (isInsert) {
+      // Pure insertion: classify the gap from the PP token just before and just
+      // after the insertion site, when those neighbors exist.
       if (a0 > 0) {
         leftInc = model_.InnermostIncludeAtPP(a0 - 1);
         leftArmRef = model_.FindArmRefAtPP(a0 - 1);
@@ -1886,15 +1899,21 @@ RefoldEngine::ClassifyOwnerWithSegments(StringRef tuPath,
         rightArmRef = model_.FindArmRefAtPP(a0);
       }
     } else {
+      // Non-insertion: classify from the PP endpoints actually covered by the
+      // segment.
       leftInc = model_.InnermostIncludeAtPP(a0);
       rightInc = model_.InnermostIncludeAtPP(a1 - 1);
       leftArmRef = model_.FindArmRefAtPP(a0);
       rightArmRef = model_.FindArmRefAtPP(a1 - 1);
     }
 
+    // Use the least common ancestor include of the left/right PP contexts as
+    // the structural include owner, if one exists.
     std::optional<uint64_t> lcaInc =
         model_.LeastCommonAncestorInclude(leftInc, rightInc);
 
+    // Preserve a conditional-arm owner only when both PP sides are in the same
+    // selected arm.
     std::optional<uint64_t> condArmId;
     if (leftArmRef && rightArmRef && leftArmRef->arm && rightArmRef->arm &&
         leftArmRef->arm->id == rightArmRef->arm->id) {
@@ -1909,8 +1928,7 @@ RefoldEngine::ClassifyOwnerWithSegments(StringRef tuPath,
       return Owner::Include(*lcaInc, condArmId);
     }
 
-    // If we cannot establish an include owner, fall back to TU (this should
-    // only happen at TU boundaries where slot anchoring is missing).
+    // No include owner could be recovered from PP structure; fall back to TU.
     trace("segments",
           "  no TU anchor for hunk [{0},{1}); PP-only owner TU (condArmId={2})",
           a0, a1, condArmId);
@@ -1931,22 +1949,29 @@ RefoldEngine::ClassifyOwnerWithSegments(StringRef tuPath,
     return Owner::Unknown();
   }
 
-  // Step 1: find all candidate segments.
+  // Step 1: collect all segment candidates that could own this hunk at the
+  // current TU path.
   //
-  // For non-empty hunks: any overlap with [b,e) is a candidate.
-  // For pure INSERTs: the span is typically zero-width; treat the anchor as a
-  // point and include segments that contain the probe, with a right-closed
-  // convention to enable parent selection at boundaries.
+  // Non-insertions own real byte coverage, so any segment that intersects the
+  // hunk byte range [b,e) is a candidate.
+  //
+  // Pure insertions usually have no byte width in TU space. For those, treat
+  // the insertion site as a single probe point at `b` and collect every
+  // segment that contains that point. The comparison is right-closed
+  // (`s.b <= probe && probe <= s.e`) so an insertion that lands exactly on a
+  // segment boundary can still be claimed by an enclosing/parent segment.
   const bool isInsert = (a0 == a1);
   const uint64_t probe = b;
 
   std::vector<const RefoldModel::Segment *> hits;
   for (const auto &s : segs) {
     if (!isInsert) {
+      // Standard half-open interval intersection test for [b,e) vs [s.b,s.e).
       if (s.e <= b || e <= s.b)
-        continue; // no intersection
+        continue;
       hits.push_back(&s);
     } else {
+      // Zero-width insertion: classify by containment of the insertion probe.
       if (s.b <= probe && probe <= s.e)
         hits.push_back(&s);
     }
@@ -1960,7 +1985,10 @@ RefoldEngine::ClassifyOwnerWithSegments(StringRef tuPath,
     return Owner::Unknown();
   }
 
-  // Step 2: pick the smallest (most specific) segment among the hits.
+  // Step 2: choose the most specific candidate segment.
+  //
+  // Prefer the smallest byte span first. If multiple hits have the same size,
+  // break ties deterministically by earlier start, then earlier end.
   const RefoldModel::Segment *selected = hits[0];
   for (size_t i = 1; i < hits.size(); ++i) {
     const auto *s = hits[i];
@@ -1978,6 +2006,9 @@ RefoldEngine::ClassifyOwnerWithSegments(StringRef tuPath,
     }
   }
 
+  // Step 3: convert the selected segment's stored ownership into a concrete
+  // TU/include owner result, preserving any conditional-arm owner attached to
+  // that segment.
   if (!selected->ownerIncludeId) {
     trace("segments",
           "  selected segment [{0},{1}) (probe={2}) owner TU (condArmId={3}) "
@@ -2004,7 +2035,7 @@ bool RefoldEngine::IsInvocationInsideDefineDirective(
   // line splices), invocations spelled in the macro body may appear after
   // siteE. We therefore compute the actual directive extent by scanning the
   // source text until we reach a newline that is NOT line-spliced.
-
+  //
   // NOTE: This predicate may be queried extremely frequently during macro
   // selection. Avoid O(Ninvocations*Ndirectives) behavior by indexing all
   // #define directive extents once per process, keyed by absolute file path.
@@ -2029,6 +2060,19 @@ bool RefoldEngine::IsInvocationInsideDefineDirective(
   if (!definesIndexBuilt) {
     definesIndexBuilt = true;
 
+    // Build a lexical containment index for `#define` directives, keyed by the
+    // directive's absolute source path. For each producer-reported `#define`,
+    // widen its recorded end to the true physical end of the directive by
+    // following any `\\\n` line-spliced continuation lines, then record the
+    // resulting byte range `[siteB, defineEnd)` in `definesByAbsPath`.
+    //
+    // This is used by IsInvocationInsideDefineDirective(): a macro invocation
+    // is considered "inside a define" if its spelled byte range falls within
+    // one of these per-file define extents.
+    //
+    // To keep repeated queries cheap, we cache:
+    //   - the loaded source text for each file (`fileTextCache`)
+    //   - the computed widened end for each directive (`defineEndCache`)
     for (const auto &d : model_.GetMacroDirectives()) {
       if ("#define" != d.subkind)
         continue;
@@ -2094,17 +2138,22 @@ bool RefoldEngine::IsInvocationInsideDefineDirective(
     }
   }
 
+  // Normalize the invocation file spelling the same way we keyed the define
+  // index, then look up all #define extents recorded for that file.
   const std::string invAbs = lineDirs_.ToAbsolutePath(*m.invFile);
   auto it = definesByAbsPath.find(invAbs);
   if (it == definesByAbsPath.end())
     return false;
 
+  // Use the invocation's start byte as the lexical containment probe.
   const uint64_t x = *m.invB;
   const auto &vec = it->second;
   if (vec.empty())
     return false;
 
-  // Find the last extent with b <= x.
+  // Binary-search for the last define extent whose begin offset is <= x.
+  // The extents are sorted by begin offset, so this gives the only candidate
+  // that can still contain the probe byte.
   size_t lo = 0, hi = vec.size();
   while (lo < hi) {
     size_t mid = lo + (hi - lo) / 2;
@@ -2116,6 +2165,9 @@ bool RefoldEngine::IsInvocationInsideDefineDirective(
   if (lo == 0)
     return false;
 
+  // Containment is half-open: [b,e). If the invocation start byte falls inside
+  // the candidate define extent, treat the invocation as lexically inside that
+  // #define directive.
   const DefineExtent cand = vec[lo - 1];
   if (x >= cand.b && x < cand.e)
     return true;
@@ -2134,12 +2186,33 @@ bool RefoldEngine::IsInvocationInsideDefineDirective(
   return false;
 }
 
+enum class MacroCoverRank : uint8_t {
+  Body = 0,
+  ArgLike = 1,
+  Cover = 2,
+  None = 3,
+};
+
+static inline StringRef toString(MacroCoverRank rank) {
+  switch (rank) {
+  case MacroCoverRank::Body:
+    return "Body";
+  case MacroCoverRank::ArgLike:
+    return "ArgLike";
+  case MacroCoverRank::Cover:
+    return "Cover";
+  case MacroCoverRank::None:
+    return "None";
+  }
+  llvm_unreachable("Invalid MacroCoverRank");
+}
+
 const RefoldModel::MacroInvocation *
 RefoldEngine::SmallestCoveringPatchableMacro(
     uint64_t aStart, uint64_t aEnd,
     std::optional<uint64_t> ownerIncludeId) const {
   const RefoldModel::MacroInvocation *best = nullptr;
-  int bestRank = 3;
+  MacroCoverRank bestRank = MacroCoverRank::None;
   uint64_t bestLen = std::numeric_limits<uint64_t>::max();
 
   trace("macro/select",
@@ -2148,6 +2221,10 @@ RefoldEngine::SmallestCoveringPatchableMacro(
 
   const bool isInsert = (aStart == aEnd);
 
+  // Return true iff the candidate half-open span [b,e) covers the current A
+  // target. For insertions, require the insertion point to lie strictly inside
+  // the span (not exactly on its boundary). For non-insertions, require full
+  // coverage of [aStart,aEnd).
   auto spanCovers = [&](uint64_t b, uint64_t e) -> bool {
     if (e <= b)
       return false;
@@ -2156,6 +2233,8 @@ RefoldEngine::SmallestCoveringPatchableMacro(
     return (b <= aStart) && (aEnd <= e);
   };
 
+  // Among an arbitrary span collection, return the smallest covering span
+  // length, or std::nullopt if none of the spans cover the target.
   auto minCoverLenIn = [&](auto &&spans) -> std::optional<uint64_t> {
     std::optional<uint64_t> out;
     for (const auto &sp : spans) {
@@ -2168,6 +2247,9 @@ RefoldEngine::SmallestCoveringPatchableMacro(
     return out;
   };
 
+  // Return the smallest covering span length among this invocation's argument-
+  // derived projections: ordinary argument spans, stringify spans, and paste
+  // spans. Used to prefer the tightest argument-local cover inside the macro.
   auto minCoverLenInArgs = [&](const RefoldModel::MacroInvocation &m)
       -> std::optional<uint64_t> {
     std::optional<uint64_t> out;
@@ -2195,6 +2277,13 @@ RefoldEngine::SmallestCoveringPatchableMacro(
     return out;
   };
 
+  // Scan all macro invocations and choose the smallest patchable macro that
+  // truthfully covers the requested A-range in the current owner context.
+  // Only real callsites are eligible (never invocations spelled inside a
+  // #define), and candidates are ranked by how directly they cover the target:
+  // body-span cover first, then argument-derived cover, then broad cover as a
+  // fallback. Ties are broken by smaller covering span, then lower macro id,
+  // for deterministic selection.
   for (const auto &m : model_.GetMacroInvocations()) {
     // Owner filter (when known): avoids selecting a macro record that belongs
     // to a different include instance.
@@ -2215,33 +2304,34 @@ RefoldEngine::SmallestCoveringPatchableMacro(
       continue;
 
     // Rank candidates by how directly their spans cover the requested range.
-    //   rank 0: body span covers the range (direct expansion token)
-    //   rank 1: argument-like span covers the range (arg/stringify/paste)
-    //   rank 2: only the broad cover covers the range (fallback)
-    int rank = 2;
+    //   Body:    body span covers the range (direct expansion token)
+    //   ArgLike: argument-like span covers the range (arg/stringify/paste)
+    //   Cover:   only the broad cover covers the range (fallback)
+    MacroCoverRank rank = MacroCoverRank::Cover;
     uint64_t len = m.cover.end - m.cover.begin;
 
     if (auto bodyLen = minCoverLenIn(m.bodySpans)) {
-      rank = 0;
+      rank = MacroCoverRank::Body;
       len = *bodyLen;
     } else if (auto argLen = minCoverLenInArgs(m)) {
-      rank = 1;
+      rank = MacroCoverRank::ArgLike;
       len = *argLen;
     } else {
       if (!m.Covers(aStart, aEnd))
         continue;
-      rank = 2;
+      rank = MacroCoverRank::Cover;
       len = m.cover.end - m.cover.begin;
     }
 
     trace("macro/select",
           "candidate macro id={0} name='{1}' rank={2} len={3} cover=[{4},{5}) "
           "ownerInc={6} invFile='{7}' inv=[{8},{9})",
-          m.id, m.name, rank, len, m.cover.begin, m.cover.end, m.ownerIncludeId,
+          m.id, m.name, rank, len, m.cover.begin, m.cover.end,
+          m.ownerIncludeId,
           (m.invFile ? StringRef(*m.invFile) : StringRef("")), *m.invB,
           *m.invE);
 
-    if (!best || rank < bestRank ||
+    if (!best || static_cast<unsigned>(rank) < static_cast<unsigned>(bestRank) ||
         (rank == bestRank &&
          (len < bestLen || (len == bestLen && m.id < best->id)))) {
       best = &m;
@@ -2265,12 +2355,227 @@ RefoldEngine::SmallestCoveringPatchableMacro(
   return best;
 }
 
+std::optional<uint64_t>
+RefoldEngine::FindProvableTUInsertionAnchor(uint64_t pp,
+                                            StringRef tuPath) const {
+  // First prefer an exact structural slot anchor recorded by the producer.
+  // These anchors are the strongest evidence because they identify a specific
+  // TU byte boundary corresponding to this PP gap.
+  if (auto slotAnchor = AnchorToExactSlotBoundaryFromPPGap(tuPath, pp)) {
+    trace("hunk",
+          "    insertion gap PP={0} mapsToTU via slot boundary TU byte {1}", pp,
+          slotAnchor);
+    return slotAnchor;
+  }
+
+  // A PP gap that lies inside an include expansion cannot be materialized as a
+  // TU insertion. Fail closed before considering weaker local evidence.
+  if (IncludeIdCoveringPPIndex(pp))
+    return std::nullopt;
+
+  // Look for an exact TU-side macro-projection begin at this PP gap and, when
+  // one exists, lift it to the outermost matching caller so the returned anchor
+  // is the stable callsite-begin byte for wrapper/deferred-expansion shapes.
+  auto exactArgLikeBeginAnchor = [&]() -> std::optional<uint64_t> {
+    SmallVector<const RefoldModel::MacroInvocation *, 8> cands;
+    DenseMap<uint64_t, const RefoldModel::MacroInvocation *> invById;
+    invById.reserve(model_.GetMacroInvocations().size());
+    for (const auto &mi : model_.GetMacroInvocations())
+      invById[mi.id] = &mi;
+
+    auto appendIfExactBegin = [&](const RefoldModel::MacroInvocation &m,
+                                  auto &&spans) {
+      for (const auto &sp : spans) {
+        if (sp.begin == pp) {
+          cands.push_back(&m);
+          break;
+        }
+      }
+    };
+
+    for (const auto &m : model_.GetMacroInvocations()) {
+      // Only consider real TU-side invocations with stable byte-space
+      // provenance. Ignore invocations inside macro definitions, since those do
+      // not denote a concrete callsite insertion point in TU source.
+      if (!m.invFile || !m.invB || !m.invE || !m.invText)
+        continue;
+      if (!PathsEqual(*m.invFile, tuPath))
+        continue;
+      if (IsInvocationInsideDefineDirective(m))
+        continue;
+
+      // Treat argument, stringify, and paste projection starts as "arg-like"
+      // begins. If the PP gap lands exactly on one of these begins, the outer
+      // callsite begin can serve as a truthful TU insertion anchor.
+      appendIfExactBegin(m, m.argSpans);
+      if (!cands.empty() && cands.back() == &m)
+        continue;
+      appendIfExactBegin(m, m.stringifySpans);
+      if (!cands.empty() && cands.back() == &m)
+        continue;
+      appendIfExactBegin(m, m.pasteSpans);
+    }
+
+    if (cands.empty())
+      return std::nullopt;
+
+    SmallDenseSet<uint64_t, 8> candIds;
+    for (const auto *m : cands)
+      candIds.insert(m->id);
+
+    auto rootmostCand = [&](const RefoldModel::MacroInvocation *m) {
+      const RefoldModel::MacroInvocation *cur = m;
+      while (cur && cur->callerMacroId) {
+        auto idIt = candIds.find(*cur->callerMacroId);
+        if (idIt == candIds.end())
+          break;
+        auto parentIt = invById.find(*cur->callerMacroId);
+        if (parentIt == invById.end())
+          break;
+        cur = parentIt->second;
+      }
+      return cur;
+    };
+
+    const RefoldModel::MacroInvocation *best = nullptr;
+    for (const auto *m : cands) {
+      const auto *root = rootmostCand(m);
+      if (!root || !root->invB)
+        continue;
+
+      // Prefer the outermost candidate among the matching nested invocations,
+      // then break ties by earliest callsite begin. This yields the most stable
+      // TU anchor for wrapper/deferred-expansion patterns.
+      if (!best || std::tie(*root->invB, root->id) <
+                       std::tie(*best->invB, best->id)) {
+        best = root;
+      }
+    }
+
+    if (!best)
+      return std::nullopt;
+
+    trace("tu/anchor",
+          "pure insertion arg-like begin anchor: ppGap={0} -> macro id={1} "
+          "name='{2}' invB={3}",
+          pp, best->id, best->name, *best->invB);
+    return *best->invB;
+  };
+
+  // Next try the exact "arg-like begin" rule used for outer wrapper callsites.
+  // This handles empty-gap edits that are semantically attached to the start of
+  // a TU macro invocation rather than to an immediately mapped PP token.
+  if (auto argAnchor = exactArgLikeBeginAnchor())
+    return argAnchor;
+
+  const auto &tokmapByPP = model_.GetTokmapByPP();
+
+  // In strict mode, immediate mapped neighbors are the only remaining admissible
+  // local proof. If the token at the right edge belongs to the TU, anchor at
+  // that token's begin byte; if it belongs elsewhere, fail closed.
+  if (pp < model_.GetTokensCountA()) {
+    auto rightIt = tokmapByPP.find(pp);
+    if (rightIt != tokmapByPP.end()) {
+      const auto &right = rightIt->second;
+      if (PathsEqual(tuPath, right.file))
+        return right.b;
+      return std::nullopt;
+    }
+  }
+
+  // Otherwise try the mapped token immediately to the left. If it belongs to
+  // the TU, anchor at that token's end byte; if it belongs elsewhere, fail
+  // closed.
+  if (pp > 0) {
+    auto leftIt = tokmapByPP.find(pp - 1);
+    if (leftIt != tokmapByPP.end()) {
+      const auto &left = leftIt->second;
+      if (PathsEqual(tuPath, left.file))
+        return left.e;
+      return std::nullopt;
+    }
+  }
+
+  // In strict mode we stop here: without an exact structural anchor, an exact
+  // arg-like anchor, or an immediate TU neighbor, the gap is not provably TU.
+  if (strict_)
+    return std::nullopt;
+
+  static constexpr uint64_t MAX_SNAP_DISTANCE = 64;
+  const bool haveOwnerGaps =
+      (ownerDepthGap_.size() == model_.GetTokensCountA() + 1);
+  const uint32_t wantOwner =
+      (haveOwnerGaps && pp < ownerDepthGap_.size()) ? ownerDepthGap_[pp] : 0;
+
+  const RefoldModel::TokMapEntry *left = nullptr;
+  uint64_t dLeft = std::numeric_limits<uint64_t>::max();
+
+  // Non-strict fallback: walk leftward through nearby unmapped whitespace, but
+  // stop as soon as the owner-depth context changes. This prevents the probe
+  // from drifting across a structural ownership seam.
+  for (uint64_t d = 2; d <= MAX_SNAP_DISTANCE; ++d) {
+    if (pp < d)
+      break;
+    if (haveOwnerGaps) {
+      const uint64_t gap = pp - (d - 1);
+      if (gap < ownerDepthGap_.size() && ownerDepthGap_[gap] != wantOwner)
+        break;
+    }
+    auto it = tokmapByPP.find(pp - d);
+    if (it != tokmapByPP.end()) {
+      left = &it->second;
+      dLeft = d;
+      break;
+    }
+  }
+
+  const RefoldModel::TokMapEntry *right = nullptr;
+  uint64_t dRight = std::numeric_limits<uint64_t>::max();
+  const uint64_t maxPP = model_.GetTokensCountA();
+
+  // Mirror the same bounded whitespace probe to the right, with the same
+  // owner-depth guard.
+  for (uint64_t d = 1; d <= MAX_SNAP_DISTANCE; ++d) {
+    uint64_t ppR = pp + d;
+    if (ppR >= maxPP)
+      break;
+    if (haveOwnerGaps && ppR < ownerDepthGap_.size() &&
+        ownerDepthGap_[ppR] != wantOwner)
+      break;
+    auto it = tokmapByPP.find(ppR);
+    if (it != tokmapByPP.end()) {
+      right = &it->second;
+      dRight = d;
+      break;
+    }
+  }
+
+  // Accept the non-strict probe only when both corroborating neighbors exist
+  // and both resolve to the TU. A one-sided or mixed-file result is not strong
+  // enough to prove TU ownership.
+  if (!left || !right)
+    return std::nullopt;
+  if (!PathsEqual(tuPath, left->file) || !PathsEqual(tuPath, right->file))
+    return std::nullopt;
+
+  // Use the nearer corroborating TU boundary as the concrete zero-width anchor,
+  // preferring the right side on an equal-distance tie.
+  if (dRight <= dLeft)
+    return right->b;
+  return left->e;
+}
+
 bool RefoldEngine::HunkMapsToTU(uint64_t a0, uint64_t a1,
                                 StringRef tuPath) const {
   trace("tu/own", "hunkMapsToTU: check ownership for A[{0},{1}) tu={2}", a0, a1,
         tuPath);
   bool sawAnyTU = false;
   const auto &tokmapByPP = model_.GetTokmapByPP();
+
+  // Walk the A-side PP byte range and require every mapped byte to belong to
+  // the translation unit itself. Unmapped bytes (whitespace/separators) are
+  // ignored; the hunk ceases to be TU-owned as soon as any mapped byte resolves
+  // to a different file.
   for (uint64_t pp = a0; pp < a1; ++pp) {
     auto it = tokmapByPP.find(pp);
     if (it == tokmapByPP.end())
@@ -2298,123 +2603,9 @@ bool RefoldEngine::HunkMapsToTU(uint64_t a0, uint64_t a1,
     return sawAnyTU;
   }
 
-  // INSERTION (A gap): determine TU ownership without "nearest-neighbor
-  // snapping". In strict mode, consult only immediate neighbors (pp-1, pp). If
-  // the PP gap is covered by an include expansion, treat it as header-owned.
-  uint64_t pp = a0;
-
-  if (auto slotAnchor = AnchorToExactSlotBoundaryFromPPGap(tuPath, pp)) {
-    trace("hunk",
-          "    insertion gap PP={0} mapsToTU via slot boundary TU byte {1}", pp,
-          slotAnchor);
-    return true;
-  }
-
-  if (strict_) {
-    // Any PP gap inside an include expansion cannot be a TU insertion.
-    if (IncludeIdCoveringPPIndex(pp)) {
-      return false;
-    }
-
-    if (pp < model_.GetTokensCountA()) {
-      auto rightIt = tokmapByPP.find(pp);
-      if (rightIt != tokmapByPP.end()) {
-        return PathsEqual(tuPath, rightIt->second.file);
-      }
-    }
-
-    if (pp > 0 && pp - 1 < tokmapByPP.size()) {
-      auto leftIt = tokmapByPP.find(pp - 1);
-      if (leftIt != tokmapByPP.end()) {
-        return PathsEqual(tuPath, leftIt->second.file);
-      }
-    }
-
-    // No immediate neighbor evidence -> not TU (caller may fatal in strict
-    // mode).
-    return false;
-  }
-
-  // Non-strict: bounded best-effort behavior.
-  //
-  // Historically we scanned arbitrarily far to find the nearest mapped token
-  // and inferred TU ownership from that token. With clang now emitting author-
-  // itative slot.pp for boundary-like slots, we can be much more conservative
-  // here: never snap across an include expansion, and only probe a small bound-
-  // ed window when immediate neighbors are unmapped whitespace.
-  if (IncludeIdCoveringPPIndex(pp)) {
-    return false;
-  }
-
-  // Prefer immediate neighbors first.
-  if (pp < model_.GetTokensCountA()) {
-    auto rightIt = tokmapByPP.find(pp);
-    if (rightIt != tokmapByPP.end()) {
-      return PathsEqual(tuPath, rightIt->second.file);
-    }
-  }
-
-  if (pp > 0 && pp - 1 < tokmapByPP.size()) {
-    auto leftIt = tokmapByPP.find(pp - 1);
-    if (leftIt != tokmapByPP.end()) {
-      return PathsEqual(tuPath, leftIt->second.file);
-    }
-  }
-
-  // Stop scanning once ownership changes (ownerDepthGap) and cap the scan as a
-  // failsafe.
-  static constexpr uint64_t MAX_SNAP_DISTANCE = 64;
-
-  const bool haveOwnerGaps =
-      (ownerDepthGap_.size() == model_.GetTokensCountA() + 1);
-  const uint32_t wantOwner =
-      (haveOwnerGaps && pp < ownerDepthGap_.size()) ? ownerDepthGap_[pp] : 0;
-
-  const RefoldModel::TokMapEntry* left = nullptr;
-  for (uint64_t d = 2; d <= MAX_SNAP_DISTANCE; ++d) {
-    if (pp < d) // Prevent unsigned underflow
-      break;
-    if (haveOwnerGaps) {
-      const uint64_t gap = pp - (d - 1);
-      if (gap < ownerDepthGap_.size() && ownerDepthGap_[gap] != wantOwner)
-        break;
-    }
-    auto it = tokmapByPP.find(pp - d);
-    if (it != tokmapByPP.end()) {
-      left = &it->second;
-      break;
-    }
-  }
-
-  const RefoldModel::TokMapEntry *right = nullptr;
-  const uint64_t maxPP = model_.GetTokensCountA();
-  for (uint64_t d = 1; d <= MAX_SNAP_DISTANCE; ++d) {
-    uint64_t ppR = pp + d;
-    if (ppR >= maxPP)
-      break;
-    if (haveOwnerGaps && ppR < ownerDepthGap_.size() &&
-        ownerDepthGap_[ppR] != wantOwner)
-      break;
-    auto it = tokmapByPP.find(ppR);
-    if (it != tokmapByPP.end()) {
-      right = &it->second;
-      break;
-    }
-  }
-
-  if (left) {
-    if (PathsEqual(tuPath, left->file))
-      return true;
-    return false;
-  }
-  if (right) {
-    if (PathsEqual(tuPath, right->file))
-      return true;
-    return false;
-  }
-
-  // Completely unmapped gap: default to TU in non-strict mode (best effort).
-  return true;
+  // INSERTION (A gap): classify TU ownership only when we can derive a
+  // truthful TU insertion anchor at that exact PP gap.
+  return FindProvableTUInsertionAnchor(a0, tuPath).has_value();
 }
 
 std::optional<uint64_t>
@@ -2579,101 +2770,11 @@ RefoldEngine::TUByteSpan(uint64_t a0, uint64_t a1, StringRef tuPath) const {
   const bool isEmpty = (a0 == a1);
   const auto &tokmapByPP = model_.GetTokmapByPP();
 
-  // For pure insertions, first prefer an explicit slot boundary (file_begin,
-  // before_include, after_include, arm_begin, arm_end, file_end, ...).
+  // For pure insertions, use the same conservative TU-anchor proof used by
+  // HunkMapsToTU so classification and concrete TU realization cannot diverge.
   if (isEmpty) {
-    if (auto slotAnchor = AnchorToExactSlotBoundaryFromPPGap(tuPath, a0)) {
-      return {{*slotAnchor, *slotAnchor}};
-    }
-
-    // Deferred/wrapper macro chains can expose an inserted token at the exact
-    // beginning of an outer invocation's argument-produced surface, while the
-    // immediate right neighbor token maps to an inner nested invocation. If we
-    // fall back to neighbor snapping here, the insertion lands on the inner
-    // callsite (e.g. MAKE_NAME) instead of the outer wrapper (e.g. EVAL2).
-    //
-    // For pure insertions only, after exact slot-boundary anchoring but before
-    // generic neighbor snapping, anchor a PP gap that is exactly the *begin*
-    // of one or more arg-like spans (standard/stringify/paste) to the
-    // outermost such invocation's callsite start.
-    auto exactArgLikeBeginAnchor = [&]() -> std::optional<uint64_t> {
-      SmallVector<const RefoldModel::MacroInvocation *, 8> cands;
-      DenseMap<uint64_t, const RefoldModel::MacroInvocation *> invById;
-      invById.reserve(model_.GetMacroInvocations().size());
-      for (const auto &mi : model_.GetMacroInvocations())
-        invById[mi.id] = &mi;
-
-      auto appendIfExactBegin = [&](const RefoldModel::MacroInvocation &m,
-                                    auto &&spans) {
-        for (const auto &sp : spans) {
-          if (sp.begin == a0) {
-            cands.push_back(&m);
-            break;
-          }
-        }
-      };
-
-      for (const auto &m : model_.GetMacroInvocations()) {
-        if (!m.invFile || !m.invB || !m.invE || !m.invText)
-          continue;
-        if (!PathsEqual(*m.invFile, tuPath))
-          continue;
-        if (IsInvocationInsideDefineDirective(m))
-          continue;
-
-        appendIfExactBegin(m, m.argSpans);
-        if (!cands.empty() && cands.back() == &m)
-          continue;
-        appendIfExactBegin(m, m.stringifySpans);
-        if (!cands.empty() && cands.back() == &m)
-          continue;
-        appendIfExactBegin(m, m.pasteSpans);
-      }
-
-      if (cands.empty())
-        return std::nullopt;
-
-      SmallDenseSet<uint64_t, 8> candIds;
-      for (const auto *m : cands)
-        candIds.insert(m->id);
-
-      auto rootmostCand = [&](const RefoldModel::MacroInvocation *m) {
-        const RefoldModel::MacroInvocation *cur = m;
-        while (cur && cur->callerMacroId) {
-          auto idIt = candIds.find(*cur->callerMacroId);
-          if (idIt == candIds.end())
-            break;
-          auto parentIt = invById.find(*cur->callerMacroId);
-          if (parentIt == invById.end())
-            break;
-          cur = parentIt->second;
-        }
-        return cur;
-      };
-
-      const RefoldModel::MacroInvocation *best = nullptr;
-      for (const auto *m : cands) {
-        const auto *root = rootmostCand(m);
-        if (!root || !root->invB)
-          continue;
-        if (!best || std::tie(*root->invB, root->id) <
-                         std::tie(*best->invB, best->id)) {
-          best = root;
-        }
-      }
-
-      if (!best)
-        return std::nullopt;
-
-      trace("tu/anchor",
-            "pure insertion arg-like begin anchor: ppGap={0} -> macro id={1} "
-            "name='{2}' invB={3}",
-            a0, best->id, best->name, *best->invB);
-      return *best->invB;
-    };
-
-    if (auto argAnchor = exactArgLikeBeginAnchor())
-      return {{*argAnchor, *argAnchor}};
+    if (auto anchor = FindProvableTUInsertionAnchor(a0, tuPath))
+      return {{*anchor, *anchor}};
   }
 
   // Non-empty: compute min/max over TU-mapped subset only.
@@ -2701,139 +2802,8 @@ RefoldEngine::TUByteSpan(uint64_t a0, uint64_t a1, StringRef tuPath) const {
     return {{minB, maxE}};
   }
 
-  // Empty insertion with no slot anchor: only anchor to a TU neighbor token
-  // when the insertion is TU-owned. If either neighbor is in a header/include,
-  // we must NOT fabricate a TU interval (that causes include insertions to snap
-  // to TU boundaries).
-  if (isEmpty) {
-    // INSERTION (A gap): in strict mode, do not "snap" to distant mapped
-    // tokens. Consult only immediate neighbors (pp-1, pp). If the PP gap is
-    // covered by an include expansion, treat it as header-owned (no TU span).
-    uint64_t pp = a0;
-
-    const auto &tokmapByPP = model_.GetTokmapByPP();
-    if (strict_) {
-      if (IncludeIdCoveringPPIndex(pp)) {
-        return std::nullopt;
-      }
-
-      if (pp < model_.GetTokensCountA()) {
-        auto rightIt = tokmapByPP.find(pp);
-        if (rightIt != tokmapByPP.end()) {
-          const auto &right = rightIt->second;
-          if (PathsEqual(tuPath, right.file)) {
-            return {{right.b, right.b}};
-          }
-        }
-      }
-
-      if (pp > 0 && static_cast<size_t>(pp - 1) < tokmapByPP.size()) {
-        auto leftIt = tokmapByPP.find(pp - 1);
-        if (leftIt != tokmapByPP.end()) {
-          const auto &left = leftIt->second;
-          if (PathsEqual(tuPath, left.file)) {
-            return {{left.e, left.e}};
-          }
-        }
-      }
-
-      return std::nullopt;
-    }
-
-    // Non-strict: bounded best-effort behavior (avoid long-range snapping).
-    //
-    // With slot.pp covering include/arm/file boundaries, the remaining use case
-    // for snapping is a pure insertion inside the TU where immediate neighbors
-    // are unmapped whitespace. Bound the probe window so we do not accidentally
-    // "jump" across regions and mis-own the insertion.
-
-    // Any PP gap inside an include expansion is header-owned (no TU span).
-    if (IncludeIdCoveringPPIndex(pp)) {
-      return std::nullopt;
-    }
-
-    if (pp < model_.GetTokensCountA()) {
-      auto rightIt = tokmapByPP.find(pp);
-      if (rightIt != tokmapByPP.end()) {
-        const auto &right = rightIt->second;
-        if (PathsEqual(tuPath, right.file)) {
-          return {{right.b, right.b}};
-        }
-      }
-    }
-
-    if (pp > 0 && static_cast<size_t>(pp - 1) < tokmapByPP.size()) {
-      auto leftIt = tokmapByPP.find(pp - 1);
-      if (leftIt != tokmapByPP.end()) {
-        const auto &left = leftIt->second;
-        if (PathsEqual(tuPath, left.file)) {
-          return {{left.e, left.e}};
-        }
-      }
-    }
-
-    // Stop scanning once ownership changes (ownerDepthGap) and cap the scan as
-    // a failsafe.
-    constexpr uint64_t MAX_SNAP_DISTANCE = 64;
-
-    const bool haveOwnerGaps =
-        (ownerDepthGap_.size() == model_.GetTokensCountA() + 1);
-    const uint32_t wantOwner =
-        (haveOwnerGaps && pp < ownerDepthGap_.size()) ? ownerDepthGap_[pp] : 0;
-
-    const RefoldModel::TokMapEntry *left = nullptr;
-    uint64_t dLeft = std::numeric_limits<uint64_t>::max();
-    for (uint64_t d = 2; d <= MAX_SNAP_DISTANCE; ++d) {
-      if (pp < d)
-        break;
-      if (haveOwnerGaps) {
-        const uint64_t gap = pp - (d - 1);
-        if (gap < ownerDepthGap_.size() && ownerDepthGap_[gap] != wantOwner)
-          break;
-      }
-      auto it = tokmapByPP.find(pp - d);
-      if (it != tokmapByPP.end()) {
-        const auto &ent = it->second;
-        left = &ent;
-        dLeft = d;
-        break;
-      }
-    }
-
-    const RefoldModel::TokMapEntry *right = nullptr;
-    uint64_t dRight = std::numeric_limits<uint64_t>::max();
-    const uint64_t ppCount = model_.GetTokensCountA();
-    for (uint64_t d = 1; d <= MAX_SNAP_DISTANCE; ++d) {
-      uint64_t i = pp + d;
-      if (i >= ppCount)
-        break;
-      if (haveOwnerGaps && i < ownerDepthGap_.size() &&
-          ownerDepthGap_[i] != wantOwner)
-        break;
-      auto it = tokmapByPP.find(i);
-      if (it != tokmapByPP.end()) {
-        const auto &ent = it->second;
-        right = &ent;
-        dRight = d;
-        break;
-      }
-    }
-
-    // If either neighbor points into a header/include, we must NOT fabricate a
-    // TU span.
-    if (left && !PathsEqual(tuPath, left->file))
-      return std::nullopt;
-    if (right && !PathsEqual(tuPath, right->file))
-      return std::nullopt;
-
-    // Prefer the closest side (tie-break to right).
-    if (right && (!left || dRight <= dLeft))
-      return {{right->b, right->b}};
-    if (left)
-      return {{left->e, left->e}};
-
+  if (isEmpty)
     return std::nullopt;
-  }
 
   // No TU tokens in [a0,a1) (and no safe TU insertion anchor).
   return std::nullopt;
