@@ -8,5 +8,5 @@
 DECL_FN(float)
 
 int main(void) {
-  return make_float () == 3 ? 0 : 1;
+  return make_float() == 3 ? 0 : 1;
 }

@@ -10,5 +10,5 @@
 USE(XCAT(pre_,long))
 
 int main(void) {
-  return call_pre_long () == 31 ? 0 : 1;
+  return call_pre_long() == 31 ? 0 : 1;
 }

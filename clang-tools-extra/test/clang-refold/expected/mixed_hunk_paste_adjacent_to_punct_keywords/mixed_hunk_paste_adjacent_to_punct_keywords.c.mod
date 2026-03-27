@@ -3,4 +3,4 @@
 // test86: Mixed hunk: pasted token adjacent to punctuation/keywords.
 #define P(T) int fn_##T(void){return 0;}
 P(float)
-int main(){ return fn_float (); }
+int main(){ return fn_float(); }

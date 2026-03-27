@@ -624,62 +624,38 @@ private:
   static std::vector<StringRef> MapLexemes(ArrayRef<PPTok> toks,
                                            ArrayRef<size_t> offs);
 
-  /// \brief Determine if two adjacent characters would “glue” tokens under C’s
-  ///        maximal-munch rules.
-  ///
-  /// Returns `true` if concatenating `left` and `right` without a space would
-  /// likely glue tokens under C’s maximal-munch rules, and therefore should be
-  /// separated by a single space.
-  ///
-  /// #### Conservative rules (not a full lexer)
-  /// * identifier + identifier → glues
-  ///   (e.g., `return` + `injected` → `returninjected`)
-  /// * identifier + `(` → glues
-  ///   (looks like a call, e.g., `foo(...)`)
-  /// * identifier + operator-like punctuation
-  ///   (one of `: ? + - * / % & | ^ < > = !`) → prefer separating space
-  ///   (e.g., `0:` becomes `0 :`)
-  ///
-  /// The check is intentionally conservative and line-local; it avoids changing
-  /// tokenization without performing full lexical analysis.
-  ///
-  /// \param left  Character immediately to the left of a boundary (or `'\0'` if
-  /// none).
-  /// \param right Character immediately to the right of a boundary (or `'\0'`
-  /// if none).
-  /// \returns `true` if a space should be inserted to prevent token gluing;
-  ///          otherwise `false`.
-  static bool BoundaryGlues(char left, char right);
-
-  /// \brief Add padding spaces around a replacement snippet to prevent token
-  /// gluing.
+  /// \brief Add boundary padding spaces only when needed to preserve lexical
+  /// tokenization.
   ///
   /// Adds at most one space on the left and/or right edge of `text` so that,
-  /// when `text` replaces `base[start,end)` (half-open), tokens do not “glue”
-  /// across the boundaries. If `text` already contains leading or trailing
-  /// whitespace, no additional space is added on that side. Callers can
-  /// suppress padding on either side via `allowLeft` / `allowRight` (useful
+  /// when `text` replaces `base[start,end)` (half-open), tokens do not glue
+  /// across the replacement boundary. Existing whitespace at either edge of
+  /// `text`, or immediate boundary whitespace already present in `base`, counts
+  /// as already-separated and suppresses padding on that side. Callers can also
+  /// suppress padding explicitly via `allowLeft` / `allowRight` (for example,
   /// when preserving an existing gap).
   ///
   /// #### Behavior
-  /// * Find the first and last non-whitespace character inside `text`.
-  /// * If allowed and needed (per `boundaryGlues(char, char)`), prepend or
-  /// append
-  ///   a single space.
+  /// * Find the first and last non-whitespace token in `text`.
+  /// * On each allowed side, first check whether the immediate boundary is
+  ///   already separated by whitespace in `text` or `base`.
+  /// * If not already separated, compare Clang raw-lexing with and without an
+  ///   inserted boundary space; add a single space only when omitting it would
+  ///   change tokenization across that boundary.
   /// * Never inserts more than one space per side and never modifies `base`.
   ///
-  /// Deterministic and local — decisions are made only from the immediate
-  /// boundary characters and the first/last non-whitespace character in `text`.
+  /// Deterministic and local — decisions are based on the actual lexical
+  /// boundary, not on broader formatting preferences.
   ///
   /// \param base       The original target string being patched.
   /// \param start      Start index (inclusive) of the slice in `base` to
-  /// replace.
+  ///                   replace.
   /// \param end        End index (exclusive) of the slice in `base` to replace.
   /// \param text       The replacement snippet to be inserted.
   /// \param allowLeft  Whether a left-side pad is permitted.
   /// \param allowRight Whether a right-side pad is permitted.
   /// \returns `text`, possibly prefixed and/or suffixed with a single space to
-  ///          avoid token gluing.
+  ///          preserve lexical separation across the replacement boundary.
   static std::string PadAtBoundaries(StringRef base, size_t start, size_t end,
                                      std::string text, bool allowLeft,
                                      bool allowRight);
