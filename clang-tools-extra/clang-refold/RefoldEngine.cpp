@@ -2242,6 +2242,8 @@ bool RefoldEngine::IsInvocationInsideDefineDirective(
   return false;
 }
 
+/// Describes how strongly a PP range is covered by a macro invocation, from
+/// most specific (`Body`) to no meaningful cover (`None`).
 enum class MacroCoverRank : uint8_t {
   Body = 0,
   ArgLike = 1,
@@ -2526,9 +2528,10 @@ RefoldEngine::FindProvableTUInsertionAnchor(uint64_t pp,
 
   const auto &tokmapByPP = model_.GetTokmapByPP();
 
-  // In strict mode, immediate mapped neighbors are the only remaining admissible
-  // local proof. If the token at the right edge belongs to the TU, anchor at
-  // that token's begin byte; if it belongs elsewhere, fail closed.
+  // First try the mapped token immediately to the right of the PP gap. If it
+  // belongs to the TU, anchor at that token's begin byte; if it is mapped to a
+  // different file, fail closed rather than probing past contradictory local
+  // evidence.
   if (pp < model_.GetTokensCountA()) {
     auto rightIt = tokmapByPP.find(pp);
     if (rightIt != tokmapByPP.end()) {
@@ -2790,6 +2793,8 @@ RefoldEngine::AnchorToExactSlotBoundaryFromPPGap(StringRef tuPath,
     return 100;
   };
 
+  // Choose the strongest exact slot match, preferring higher-priority slot
+  // kinds first, then earlier TU byte offsets, then smaller slot IDs.
   const Cand *best = nullptr;
   for (const auto *c : exact) {
     if (!best) {
@@ -2838,6 +2843,8 @@ RefoldEngine::TUByteSpan(uint64_t a0, uint64_t a1, StringRef tuPath) const {
   uint64_t maxE = 0;
   bool foundTuToken = false;
 
+  // Compute the minimal TU byte envelope covered by the mapped A-side tokens in
+  // this hunk, ignoring unmapped PP bytes and tokens that belong to other files.
   for (uint64_t i = a0; i < a1; ++i) {
     auto it = tokmapByPP.find(i);
     if (it == tokmapByPP.end())
@@ -2854,31 +2861,33 @@ RefoldEngine::TUByteSpan(uint64_t a0, uint64_t a1, StringRef tuPath) const {
     foundTuToken = true;
   }
 
-  if (foundTuToken) {
+  if (foundTuToken)
     return {{minB, maxE}};
-  }
 
-  if (isEmpty)
-    return std::nullopt;
-
-  // No TU tokens in [a0,a1) (and no safe TU insertion anchor).
+  // No TU byte span: either this is an empty hunk with no safe TU insertion
+  // anchor, or a non-empty hunk with no TU-owned mapped tokens.
   return std::nullopt;
 }
 
 const RefoldModel::IncludeItem *
 RefoldEngine::BoundaryParentIncludeForPureInsertion(
     const diffutils::Hunk &h) const {
-  // Only applicable for insertions (empty A-span). Defensive guard: ignore
-  // empty B-span.
-  if (h.aStart != h.aEnd || h.bStart >= h.bEnd) {
+  // This helper only applies to a pure insertion: the hunk must consume no
+  // A-side tokens, but it must insert at least one B-side token.
+  if (!h.isInsertOnly()) {
     return nullptr;
   }
 
   const uint64_t aPos = h.aStart;
 
-  // Hardened policy (#4): do NOT probe/snap to "nearest" tokmap entries.
-  // We only infer an include owner when the insertion lands exactly on an
-  // include PP boundary.
+  // We deliberately avoid "nearest token" probing here. A pure insertion is
+  // attributed to an include only when the PP gap lands exactly on a recorded
+  // include boundary.
+  //
+  // Collect the narrowest include ending at this gap (immediately on the left)
+  // and the narrowest include beginning at this gap (immediately on the right).
+  // Preferring the narrowest match lets an exact nested boundary beat any
+  // enclosing include that shares the same endpoint.
   const RefoldModel::IncludeItem *leftBest = nullptr;
   uint64_t leftWidth = std::numeric_limits<uint64_t>::max();
 
@@ -2891,7 +2900,7 @@ RefoldEngine::BoundaryParentIncludeForPureInsertion(
 
     const uint64_t width = inc.cover.end - inc.cover.begin;
 
-    // Include immediately to the left: ends exactly at aPos.
+    // Include immediately to the left of the insertion gap.
     if (inc.cover.end == aPos) {
       if (width < leftWidth) {
         leftBest = &inc;
@@ -2899,7 +2908,7 @@ RefoldEngine::BoundaryParentIncludeForPureInsertion(
       }
     }
 
-    // Include immediately to the right: begins exactly at aPos.
+    // Include immediately to the right of the insertion gap.
     if (inc.cover.begin == aPos) {
       if (width < rightWidth) {
         rightBest = &inc;
@@ -2913,9 +2922,14 @@ RefoldEngine::BoundaryParentIncludeForPureInsertion(
   const std::optional<uint64_t> rightIncId =
       rightBest ? std::optional<uint64_t>(rightBest->id) : std::nullopt;
 
+  // If neither side hits an exact include boundary, this insertion cannot be
+  // attributed to an include via boundary ownership.
   if (!leftIncId && !rightIncId)
-    return nullptr; // not at a known include boundary
+    return nullptr;
 
+  // When the gap sits between two include boundaries, attribute it to the
+  // structural parent shared by the left and right side. This handles both
+  // "between siblings" and "at one side only" cases uniformly.
   const std::optional<uint64_t> parentId =
       model_.LeastCommonAncestorInclude(leftIncId, rightIncId);
   if (!parentId)
@@ -2944,6 +2958,8 @@ bool RefoldEngine::MacroExpansionEnvelopeB(
   uint64_t hi = 0;
   bool any = false;
 
+  // Expand the PP envelope with mapped tokens from [l,h), optionally restricted
+  // to tokens that resolve to the invocation's source file.
   auto addRange = [&](uint64_t l, uint64_t h) {
     for (uint64_t pp = l; pp < h; ++pp) {
       auto it = tokMapByPP.find(pp);
@@ -3193,11 +3209,14 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
     if (ps.argIdx != argIdx)
       continue;
 
+    // This projected occurrence must still correspond to exactly one token in B.
     auto bEnv = MapAToBTokenEnvelopeByPPArgSpan(ps);
     if (!bEnv || bEnv->second <= bEnv->first ||
         (bEnv->second - bEnv->first) != 1)
       return false;
 
+    // Fetch the trimmed token text for this projected occurrence on both sides;
+    // later checks will compare the corresponding projected subranges.
     StringRef aTokText = SliceASource(ps.begin, ps.end).trim();
     if (aTokText.empty())
       return false;
@@ -3205,10 +3224,12 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
     if (bTokText.empty())
       return false;
 
+    // The projection's byte subrange must be valid within the A-side token.
     if (!ps.byteBegin || *ps.byteEnd < *ps.byteBegin ||
         static_cast<size_t>(*ps.byteEnd) > aTokText.size())
       return false;
 
+    // Extract the original projected segment from the A-side token text.
     StringRef oldSeg =
         aTokText.substr(*ps.byteBegin, *ps.byteEnd - *ps.byteBegin);
 
@@ -3216,12 +3237,14 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
       return static_cast<int64_t>(opt.value_or(0));
     };
 
+    // Shift the projected byte range into B by the whole-token size delta.
     int64_t delta = static_cast<int64_t>(bTokText.size()) -
                     static_cast<int64_t>(aTokText.size());
 
     int64_t bb = toSigned(ps.byteBegin);
     int64_t be = toSigned(ps.byteEnd) + delta;
 
+    // The translated byte range must remain valid within the B-side token.
     if (bb < 0 || be < bb || static_cast<uint64_t>(be) > bTokText.size())
       return false;
 
@@ -3241,6 +3264,8 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
     bool starts = baseTrim.starts_with(oldSeg);
     bool ends = baseTrim.ends_with(oldSeg);
 
+    // Accept either an exact projected replacement or the corresponding
+    // prefix/suffix match when this segment represents a trimmed edge.
     bool ok = false;
     if (baseTrim == oldSeg)
       ok = (argTrim == segB);
@@ -3492,7 +3517,7 @@ RefoldEngine::DerivePasteArgEdits(const RefoldModel::MacroInvocation &m,
   // We derive the new per-arg segments by walking the A token left-to-right and
   // using the fixed (non-span) substrings between paste spans as anchors. If
   // spans are adjacent (no fixed anchor) and the total length changes,
-  // segmentation is ambiguous and we conservatively return null.
+  // segmentation is ambiguous and we conservatively return std::nullopt.
   std::vector<const RefoldModel::PPArgSpan *> spans = cands;
   std::sort(spans.begin(), spans.end(), [](const auto *p1, const auto *p2) {
     // If p1 has no value, it's "greater" than anything with a value (moves to
@@ -3519,6 +3544,9 @@ RefoldEngine::DerivePasteArgEdits(const RefoldModel::MacroInvocation &m,
 
   std::vector<PasteArgEdit> edits;
 
+  // Compare each projected argument segment that contributed to the pasted A
+  // token against its derived replacement segment in B, and record only the
+  // argument-local edits whose projected text actually changed.
   for (size_t i = 0; i < spans.size(); ++i) {
     const auto *ps = spans[i];
     if (!ps->byteBegin || *ps->byteEnd < *ps->byteBegin)
@@ -3554,7 +3582,7 @@ RefoldEngine::SegmentPastedTokenArgsByFixedSlices(
   if (spansAsc.empty())
     return std::nullopt;
 
-  // Basic span sanity.
+  // Basic span sanity
   for (const auto *ps : spansAsc) {
     if (!ps->byteBegin || *ps->byteEnd < *ps->byteBegin)
       return std::nullopt;
@@ -3685,7 +3713,7 @@ StringRef RefoldEngine::DeriveNewPasteSegmentFromSpellingReplacement(
     return newArg;
 
   // Case 1: oldSeg is a prefix of baseArg.
-  // Example: base="foo_v1", oldSeg="foo_", new="bar_v1" -> returns "bar"
+  // Example: base="foo_v1", oldSeg="foo_", new="bar_v1" -> returns "bar_"
   if (baseArg.starts_with(oldSeg)) {
     StringRef suffix = baseArg.substr(oldSeg.size());
     if (!newArg.ends_with(suffix))
@@ -3696,7 +3724,7 @@ StringRef RefoldEngine::DeriveNewPasteSegmentFromSpellingReplacement(
   }
 
   // Case 2: oldSeg is a suffix of baseArg.
-  // Example: base="v1_foo", oldSeg="_foo", new="v1_bar" -> returns "bar"
+  // Example: base="v1_foo", oldSeg="_foo", new="v1_bar" -> returns "_bar"
   if (baseArg.ends_with(oldSeg)) {
     StringRef prefix = baseArg.substr(0, baseArg.size() - oldSeg.size());
     if (!newArg.starts_with(prefix))
@@ -3997,14 +4025,20 @@ RefoldEngine::GetMacroInvocationFormalArgContentRanges(
       out.reserve(formalN);
 
       if (actualN > formalN && formalN > 0) {
-        // Variadic call: map the prefix 1:1, and let the last formal span the
-        // entire remaining "tail" (including commas/whitespace between args).
+        // More actual argument ranges were parsed than there are formal
+        // parameters. Treat this as a variadic-style tail: keep the first
+        // (formalN - 1) actuals aligned 1:1 with the corresponding formals,
+        // then make the last formal cover one contiguous source range from the
+        // start of the next actual through the end of the final actual.
         out.insert(out.end(), parsed.begin(), parsed.begin() + (formalN - 1));
         out.push_back({parsed[formalN - 1].first, parsed.back().second});
         return out;
       }
 
-      // actualN < formalN: missing trailing actuals (e.g. empty __VA_ARGS__).
+      // Fewer actual ranges were parsed than there are formals. Preserve the
+      // actuals that do exist, then pad the remaining trailing formals with
+      // empty ranges anchored at the call's closing ')', so the result still
+      // contains one range per formal parameter.
       out.insert(out.end(), parsed.begin(), parsed.end());
       for (size_t i = actualN; i < formalN; ++i)
         out.push_back(emptyAtCloseParen());
@@ -4021,12 +4055,17 @@ RefoldEngine::GetMacroInvocationFormalArgContentRanges(
 
     bool anyInvalid = false;
     for (const auto &R : m.invArgRanges) {
+      // Each recorded invocation-argument range is stored in absolute TU byte
+      // space. Convert it into a half-open byte range relative to invText so
+      // later parsing can index directly into the invocation spelling.
       if (!R.first || !R.second) {
         anyInvalid = true;
         out.emplace_back(static_cast<size_t>(-1), static_cast<size_t>(-1));
         continue;
       }
 
+      // Reject malformed absolute ranges that start before the invocation or
+      // whose end precedes the begin.
       if (*R.first < invB || *R.second < *R.first) {
         anyInvalid = true;
         out.emplace_back(static_cast<size_t>(-1), static_cast<size_t>(-1));
@@ -4036,6 +4075,7 @@ RefoldEngine::GetMacroInvocationFormalArgContentRanges(
       const uint64_t relB64 = *R.first - invB;
       const uint64_t relE64 = *R.second - invB;
 
+      // The relative slice must remain within the invocation text.
       if (relE64 > invText.size() || relB64 > relE64) {
         anyInvalid = true;
         out.emplace_back(static_cast<size_t>(-1), static_cast<size_t>(-1));
@@ -4070,6 +4110,9 @@ RefoldEngine::GetMacroInvocationFormalArgContentRanges(
     };
 
     if (actualN == formalN) {
+      // Parsed actuals already line up 1:1 with the formal parameter list.
+      // Only fill entries that were not already supplied by the recorded
+      // invocation ranges above.
       for (size_t i = 0; i < formalN; ++i) {
         if (out[i].first == static_cast<size_t>(-1))
           out[i] = parsed[i];
@@ -4078,20 +4121,27 @@ RefoldEngine::GetMacroInvocationFormalArgContentRanges(
     }
 
     if (actualN > formalN && formalN > 0) {
-      // Variadic call: map the prefix 1:1, and let the last formal span the
-      // entire remaining "tail" (including commas/whitespace between args).
+      // More actual argument ranges were parsed than there are formals. Treat
+      // this as a variadic-style tail: keep the leading formals aligned 1:1 to
+      // the corresponding parsed actuals, and let the final formal absorb one
+      // contiguous range from the start of the next actual through the end of
+      // the last actual.
       for (size_t i = 0; i + 1 < formalN; ++i) {
         if (out[i].first == static_cast<size_t>(-1))
           out[i] = parsed[i];
       }
 
+      // If the last formal did not already have a valid recorded range, make it
+      // span the entire remaining tail of the callsite argument text.
       if (out[formalN - 1].first == static_cast<size_t>(-1)) {
         out[formalN - 1] = {parsed[formalN - 1].first, parsed.back().second};
       }
       return out;
     }
 
-    // actualN < formalN: missing trailing actuals (e.g. empty __VA_ARGS__).
+    // Fewer actual ranges were parsed than there are formals. Copy over the
+    // actuals that exist, then synthesize empty trailing ranges at the closing
+    // ')' so the result still has one entry per formal parameter.
     for (size_t i = 0; i < std::min(formalN, actualN); ++i) {
       if (out[i].first == static_cast<size_t>(-1))
         out[i] = parsed[i];
@@ -4100,6 +4150,7 @@ RefoldEngine::GetMacroInvocationFormalArgContentRanges(
       if (out[i].first == static_cast<size_t>(-1))
         out[i] = emptyAtCloseParen();
     }
+
     return out;
   }
 
