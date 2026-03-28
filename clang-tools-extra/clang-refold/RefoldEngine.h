@@ -1190,6 +1190,52 @@ private:
       StringRef newArg, ArrayRef<diffutils::Hunk> tokenHunks,
       bool checkPasteSpans) const;
 
+  /// \brief Return the exact A-side occurrence that owns the pure-insertion gap
+  ///        at \p aPos.
+  ///
+  /// Classifies an empty A-side hunk using only exact occurrence structure in
+  /// the invocation's PP-token space. A gap may be owned by an occurrence when
+  /// it lies strictly inside that occurrence, when it sits on the separator
+  /// token immediately before a right-hand occurrence, or when it matches an
+  /// occurrence end and no right-hand separator owner takes precedence.
+  ///
+  /// \param aPos The A-side PP-token gap index of the pure insertion.
+  /// \param argSpans The invocation occurrences to test, expressed as half-open
+  ///        A-side PP-token spans.
+  ///
+  /// \returns The index of the uniquely owning occurrence in \p argSpans when
+  ///          an exact owner exists; otherwise \c std::nullopt.
+  std::optional<size_t> FindExactOwningArgSpanForPureInsertion(
+      uint64_t aPos, ArrayRef<RefoldModel::PPArgSpan> argSpans) const;
+
+  /// \brief Return the B-side token range owned by \p span for the pure
+  ///        insertion hunk \p h.
+  ///
+  /// Converts a pure insertion from the raw hunk-local B token range into the
+  /// effective occurrence-owned B range used for argument derivation and
+  /// cross-occurrence verification. For ordinary interior/begin/end ownership,
+  /// the owned range is the raw inserted B range. For the exact
+  /// separator-before-right-occurrence case, the owned range is shifted so that
+  /// it excludes the shared leading separator and includes the separator that
+  /// now precedes the original occurrence in B.
+  ///
+  /// \param span The occurrence that is being tested as the owner of the pure
+  ///        insertion.
+  /// \param argSpans All occurrence spans for the same argument, used to
+  ///        determine exact separator-before-right-occurrence ownership.
+  /// \param mappedEnv The existing mapped B-side token envelope for \p span
+  ///        before any pure-insertion extension.
+  /// \param h The pure insertion hunk whose owned B range is being computed.
+  ///
+  /// \returns The half-open B token range owned by \p span when the pure
+  ///          insertion is exactly attributable to that occurrence; otherwise
+  ///          \c std::nullopt.
+  std::optional<std::pair<size_t, size_t>> GetOwnedPureInsertionBRangeForArgSpan(
+      const RefoldModel::PPArgSpan &span,
+      ArrayRef<RefoldModel::PPArgSpan> argSpans,
+      std::pair<size_t, size_t> mappedEnv,
+      const diffutils::Hunk &h) const;
+
   /// \brief Returns `true` if the given hunk touches any token-paste occurrence
   /// recorded for the macro invocation.
   ///

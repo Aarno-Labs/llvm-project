@@ -3003,6 +3003,110 @@ bool RefoldEngine::MacroExpansionEnvelopeB(
   return true;
 }
 
+std::optional<size_t> RefoldEngine::FindExactOwningArgSpanForPureInsertion(
+    uint64_t aPos, ArrayRef<RefoldModel::PPArgSpan> argSpans) const {
+  auto isCommaTok = [&](uint64_t a) -> bool {
+    return a < aToks_.size() &&
+           aToks_[static_cast<size_t>(a)].spelling == ",";
+  };
+
+  // First prefer the simple containment case: if the pure-insertion gap lies
+  // within an occurrence's half-open A-side span, that occurrence owns it.
+  for (size_t i = 0; i < argSpans.size(); ++i) {
+    const auto &s = argSpans[i];
+    if (aPos >= s.begin && aPos < s.end)
+      return i;
+  }
+
+  // Next handle the exact separator-before-right-occurrence case. When the gap
+  // sits on a comma token, attribute it to an occurrence that begins
+  // immediately after that comma.
+  if (isCommaTok(aPos)) {
+    for (size_t i = 0; i < argSpans.size(); ++i) {
+      const auto &s = argSpans[i];
+      if (s.begin == aPos + 1)
+        return i;
+    }
+  }
+
+  // Finally allow an exact span-end owner when no containing occurrence or
+  // right-hand separator owner claimed the insertion first.
+  for (size_t i = 0; i < argSpans.size(); ++i) {
+    const auto &s = argSpans[i];
+    if (aPos == s.end)
+      return i;
+  }
+
+  // No exact structural owner exists for this pure insertion.
+  return std::nullopt;
+}
+
+std::optional<std::pair<size_t, size_t>>
+RefoldEngine::GetOwnedPureInsertionBRangeForArgSpan(
+    const RefoldModel::PPArgSpan &span,
+    ArrayRef<RefoldModel::PPArgSpan> argSpans,
+    std::pair<size_t, size_t> mappedEnv,
+    const diffutils::Hunk &h) const {
+  // This helper only applies to pure insertions with a non-empty B-side token
+  // range.
+  if (h.aStart != h.aEnd || h.bStart >= h.bEnd)
+    return std::nullopt;
+
+  const uint64_t aPos = h.aStart;
+  const size_t insB0 = static_cast<size_t>(h.bStart);
+  const size_t insB1 = static_cast<size_t>(h.bEnd);
+  const size_t envB0 = mappedEnv.first;
+
+  // If the gap lies inside the occurrence itself, the owned B range is just the
+  // raw inserted token range.
+  if (aPos >= span.begin && aPos < span.end)
+    return std::make_pair(insB0, insB1);
+
+  const bool isCommaSeparator =
+      aPos < aToks_.size() && aToks_[static_cast<size_t>(aPos)].spelling == ",";
+
+  // Exact separator-before-right-occurrence case:
+  //
+  //   A:  ... , <span> ...
+  //          ^
+  //        aPos
+  //
+  // The raw inserted B range includes the shared leading separator. To make the
+  // insertion occurrence-owned by the right-hand span, shift the owned B range
+  // right by one token so that:
+  //   - the shared leading comma is excluded, and
+  //   - the comma that now precedes the original occurrence in B is included.
+  //
+  // The mapped envelope for the occurrence must begin exactly one token after
+  // the raw inserted range; otherwise this structural ownership transform does
+  // not hold.
+  if (isCommaSeparator && span.begin == aPos + 1) {
+    if (envB0 == insB1 + 1)
+      return std::make_pair(insB0 + 1, insB1 + 1);
+    return std::nullopt;
+  }
+
+  // Exact span-end ownership:
+  //
+  // If the gap is exactly at this occurrence's end, the raw inserted B range is
+  // owned by this occurrence, unless the same A-side position is also the comma
+  // separator immediately before some right-hand occurrence. In that case the
+  // right-hand separator owner takes precedence and this span must not claim the
+  // insertion.
+  if (aPos == span.end) {
+    if (isCommaSeparator) {
+      for (const auto &s : argSpans) {
+        if (s.begin == aPos + 1)
+          return std::nullopt;
+      }
+    }
+    return std::make_pair(insB0, insB1);
+  }
+
+  // This occurrence does not exactly own the pure insertion.
+  return std::nullopt;
+}
+
 bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
     const RefoldModel::MacroInvocation &m, uint32_t argIdx, StringRef baseArg,
     StringRef newArg, ArrayRef<diffutils::Hunk> tokenHunks,
@@ -3065,9 +3169,17 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
           size_t lo = bEnv->first;
           size_t hi = bEnv->second;
           for (const auto &h : tokenHunks) {
+            if (auto owned =
+                    GetOwnedPureInsertionBRangeForArgSpan(s, m.stringifySpans,
+                                                          *bEnv, h)) {
+              lo = std::min(lo, owned->first);
+              hi = std::max(hi, owned->second);
+              continue;
+            }
+
             bool touches;
             if (h.aStart == h.aEnd) {
-              touches = (h.aStart >= s.begin && h.aStart <= s.end);
+              touches = false;
             } else {
               touches = (h.aStart < s.end && h.aEnd > s.begin);
             }
@@ -3158,9 +3270,17 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
       size_t lo = bEnv->first;
       size_t hi = bEnv->second;
       for (const auto &h : tokenHunks) {
+        if (auto owned =
+                GetOwnedPureInsertionBRangeForArgSpan(s, m.argSpans, *bEnv,
+                                                      h)) {
+          lo = std::min(lo, owned->first);
+          hi = std::max(hi, owned->second);
+          continue;
+        }
+
         bool touches;
         if (h.aStart == h.aEnd) {
-          touches = (h.aStart >= s.begin && h.aStart <= s.end);
+          touches = false;
         } else {
           touches = (h.aStart < s.end && h.aEnd > s.begin);
         }
@@ -4173,25 +4293,8 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
   // visibility into the current hunk, so treat it as the only token-level edit.
   diffutils::Hunk hArgs = h;
 
-  // Normalize “comma drift” in comma-separated lists (notably for prepending
-  // into variadic tails). Token diff can treat the first separator comma as
-  // inserted and match a later comma, shifting the insertion left. Rotate the
-  // comma back into the match so the insertion is attributed to the next arg.
-  if (hArgs.aStart == hArgs.aEnd && hArgs.bStart < hArgs.bEnd &&
-      hArgs.aStart < aToks_.size() &&
-      hArgs.bStart < bToks_.size() &&
-      hArgs.bEnd < bToks_.size() &&
-      aToks_[static_cast<size_t>(hArgs.aStart)].spelling == "," &&
-      bToks_[static_cast<size_t>(hArgs.bStart)].spelling == "," &&
-      bToks_[static_cast<size_t>(hArgs.bEnd)].spelling == "," &&
-      hArgs.aStart + 1 <= aToks_.size() &&
-      hArgs.bStart + 1 <= bToks_.size() &&
-      hArgs.bEnd + 1 <= bToks_.size()) {
-    ++hArgs.aStart;
-    ++hArgs.aEnd;
-    ++hArgs.bStart;
-    ++hArgs.bEnd;
-  }
+  // Keep the raw hunk unchanged. Pure-insertion ownership is derived later
+  // from exact occurrence boundaries and exact mapped B-envelope adjacency.
 
   const diffutils::Hunk tokenHunks[] = {hArgs};
 
@@ -4509,31 +4612,30 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       bEnv = {static_cast<size_t>(h.bStart), static_cast<size_t>(h.bEnd)};
     }
 
-    // If the edit is a pure insertion and the inserted B-token range is
-    // adjacent to the mapped occurrence envelope, extend the envelope to
-    // include the insertion. This avoids losing boundary insertions when
-    // producer spans end exactly at the insertion point (common for varargs
-    // and expression edits like 'x + y' -> 'x + y * 2').
-    if (bEnv && hArgs.aStart == hArgs.aEnd && hArgs.bStart < hArgs.bEnd) {
-      const size_t insB0 = static_cast<size_t>(hArgs.bStart);
-      const size_t insB1 = static_cast<size_t>(hArgs.bEnd);
-      size_t e0 = bEnv->first;
-      size_t e1 = bEnv->second;
+    // If this occurrence exactly owns a pure insertion, extend the mapped
+    // B envelope by that owned range. This uses only exact A-side occurrence
+    // structure and exact mapped B-envelope adjacency.
+    if (bEnv) {
+      if (auto owned =
+              GetOwnedPureInsertionBRangeForArgSpan(sp, occs, *bEnv, hArgs)) {
+        const size_t insB0 = owned->first;
+        const size_t insB1 = owned->second;
+        size_t e0 = bEnv->first;
+        size_t e1 = bEnv->second;
 
-      // Extend only when the insertion is directly adjacent to this occurrence
-      // in B; this keeps multi-occurrence args deterministic.
-      if (e1 == insB0)
-        e1 = std::max(e1, insB1);
-      else if (e0 == insB1)
-        e0 = std::min(e0, insB0);
+        if (!(insB1 < e0 || e1 < insB0)) {
+          e0 = std::min(e0, insB0);
+          e1 = std::max(e1, insB1);
+        }
 
-      if (e0 != bEnv->first || e1 != bEnv->second) {
-        trace("macro/args",
-              "  extend env with adjacent insertion: argIdx={0} env=[{1},{2}) "
-              "ins=[{3},{4}) -> [{5},{6})",
-              static_cast<size_t>(argIdx), bEnv->first, bEnv->second, insB0,
-              insB1, e0, e1);
-        bEnv = std::make_pair(e0, e1);
+        if (e0 != bEnv->first || e1 != bEnv->second) {
+          trace("macro/args",
+                "  extend env with owned insertion: argIdx={0} env=[{1},{2}) "
+                "ins=[{3},{4}) -> [{5},{6})",
+                static_cast<size_t>(argIdx), bEnv->first, bEnv->second, insB0,
+                insB1, e0, e1);
+          bEnv = std::make_pair(e0, e1);
+        }
       }
     }
 
@@ -4740,62 +4842,12 @@ bool RefoldEngine::HunkFullyWithinArgSpans(
            aToks_[static_cast<size_t>(a)].spelling == ",";
   };
 
-  // Insertion: attribute it to the arg span that contains the insertion point.
-  // If the insertion lands on a separator comma between two arguments, treat it
-  // as belonging to the *right* argument (so prepending into the next argument
-  // doesn't spuriously touch the previous one). Otherwise, if the insertion is
-  // exactly at an arg-span end (e.g. right before ')'), treat it as belonging
-  // to the *left* argument.
+  // Pure insertions are attributed only from exact occurrence structure.
   if (a0 == a1) {
-    trace("macro/debug", "Checking insertion at A={0}", a0);
-
-    // Prefer strict half-open containment [begin,end).
-    for (size_t i = 0; i < argSpans.size(); ++i) {
-      const auto &s = argSpans[i];
-      trace("macro/debug", "  Arg {0} span: [{1}, {2})", i, s.begin, s.end);
-      if (a0 >= s.begin && a0 < s.end) {
-        touched[i] = 1;
-        return true;
-      }
+    if (auto owner = FindExactOwningArgSpanForPureInsertion(a0, argSpans)) {
+      touched[*owner] = 1;
+      return true;
     }
-
-    // If the insertion is at a comma token, attribute it to the next arg span
-    // that begins immediately after the comma (or, failing that, the nearest
-    // span to the right).
-    if (isCommaTok(a0)) {
-      for (size_t i = 0; i < argSpans.size(); ++i) {
-        const auto &s = argSpans[i];
-        if (s.begin == a0 + 1) {
-          touched[i] = 1;
-          return true;
-        }
-      }
-      uint64_t bestBegin = UINT64_MAX;
-      size_t bestI = static_cast<size_t>(-1);
-      for (size_t i = 0; i < argSpans.size(); ++i) {
-        const auto &s = argSpans[i];
-        if (s.begin > a0 && s.begin < bestBegin) {
-          bestBegin = s.begin;
-          bestI = i;
-        }
-      }
-      if (bestI != static_cast<size_t>(-1)) {
-        touched[bestI] = 1;
-        return true;
-      }
-    }
-
-    // Otherwise, treat a boundary insertion as belonging to the left argument
-    // whose span ends at the insertion point.
-    for (size_t i = 0; i < argSpans.size(); ++i) {
-      const auto &s = argSpans[i];
-      if (a0 == s.end) {
-        touched[i] = 1;
-        return true;
-      }
-    }
-
-    trace("macro/debug", "  FAILED: Point {0} not in any span", a0);
     return false;
   }
 
