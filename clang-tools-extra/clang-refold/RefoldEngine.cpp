@@ -4295,7 +4295,6 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
 
   // Keep the raw hunk unchanged. Pure-insertion ownership is derived later
   // from exact occurrence boundaries and exact mapped B-envelope adjacency.
-
   const diffutils::Hunk tokenHunks[] = {hArgs};
 
   trace("macro/args", "args-only? inv id={0} name={1} {2} baseInv={3}", m.id,
@@ -4313,102 +4312,58 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     return idx < m.defParams.size() && m.defParams[idx].variadic;
   };
 
-  // Detect a top-level comma in an argument replacement.
-  //
-  // This is a small, self-contained lexer that tracks delimiter depth and
-  // skips over strings/chars/comments. If this grows further, it could be
-  // replaced with a token-based implementation using Clang's lexer (ClangLex)
-  // to avoid duplicating low-level lexing rules.
+  // Detect a top-level comma in an argument replacement by lexing the
+  // replacement text with Clang's raw lexer and tracking only delimiter depth.
   auto hasTopLevelComma = [&](StringRef s) -> bool {
-    int paren = 0, bracket = 0, brace = 0;
-    bool inStr = false, inChr = false, esc = false;
-    for (size_t i = 0; i < s.size(); ++i) {
-      char c = s[i];
+    const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
+    std::string lexBuf = s.str();
+    lexBuf.push_back('\0');
+    const char *bufStart = lexBuf.data();
+    const char *bufEnd = bufStart + s.size();
+    Lexer lex(baseLoc, LangOptions(), bufStart, bufStart, bufEnd);
 
-      if (inStr) {
-        if (esc) {
-          esc = false;
-          continue;
-        }
-        if (c == '\\') {
-          esc = true;
-          continue;
-        }
-        if (c == '"')
-          inStr = false;
-        continue;
-      }
-      if (inChr) {
-        if (esc) {
-          esc = false;
-          continue;
-        }
-        if (c == '\\') {
-          esc = true;
-          continue;
-        }
-        if (c == '\'')
-          inChr = false;
-        continue;
-      }
+    int parenDepth = 0;
+    int bracketDepth = 0;
+    int braceDepth = 0;
+    Token tok;
 
-      // Skip comments (treated as whitespace by the preprocessor).
-      if (c == '/' && i + 1 < s.size()) {
-        if (s[i + 1] == '/') {
-          i += 2;
-          while (i < s.size() && s[i] != '\n')
-            ++i;
-          continue;
-        }
-        if (s[i + 1] == '*') {
-          i += 2;
-          while (i + 1 < s.size() && !(s[i] == '*' && s[i + 1] == '/'))
-            ++i;
-          if (i + 1 < s.size())
-            ++i; // land on '/'
-          continue;
-        }
-      }
+    while (true) {
+      lex.LexFromRawLexer(tok);
+      if (tok.is(tok::eof))
+        return false;
+      if (tok.is(tok::comment))
+        continue;
 
-      if (c == '"') {
-        inStr = true;
-        continue;
-      }
-      if (c == '\'') {
-        inChr = true;
-        continue;
-      }
-      switch (c) {
-      case '(':
-        ++paren;
+      switch (tok.getKind()) {
+      case tok::l_paren:
+        ++parenDepth;
         break;
-      case ')':
-        if (paren > 0)
-          --paren;
+      case tok::r_paren:
+        if (parenDepth > 0)
+          --parenDepth;
         break;
-      case '[':
-        ++bracket;
+      case tok::l_square:
+        ++bracketDepth;
         break;
-      case ']':
-        if (bracket > 0)
-          --bracket;
+      case tok::r_square:
+        if (bracketDepth > 0)
+          --bracketDepth;
         break;
-      case '{':
-        ++brace;
+      case tok::l_brace:
+        ++braceDepth;
         break;
-      case '}':
-        if (brace > 0)
-          --brace;
+      case tok::r_brace:
+        if (braceDepth > 0)
+          --braceDepth;
         break;
-      case ',':
-        if (paren == 0 && bracket == 0 && brace == 0)
+      case tok::comma:
+        if (parenDepth == 0 && bracketDepth == 0 && braceDepth == 0)
           return true;
         break;
       default:
         break;
       }
     }
-    return false;
   };
 
   trace("macro/args", "  invArgRanges(%d)=%s", invArgRanges.size(),
