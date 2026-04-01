@@ -11415,6 +11415,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         SmallVector<uint32_t, 8> deferOccurrenceArgIdxs;
         DenseMap<uint32_t, FormalTextPair> expectedRootFormals;
         bool hasExpectedRootFormals = false;
+        bool usesLexicalBridge = false;
+        bool hasBridgeSensitiveStructuredSemantics = false;
+        bool hasMixedSemanticInteractions = false;
       };
 
       // --- Phase 4: Try leaves, lift, validate, and ensure uniqueness --------
@@ -11524,6 +11527,14 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               const DagCandidateValidationMetadata &rhs)
           -> std::optional<DagCandidateValidationMetadata> {
         DagCandidateValidationMetadata merged;
+        merged.usesLexicalBridge =
+            lhs.usesLexicalBridge || rhs.usesLexicalBridge;
+        merged.hasBridgeSensitiveStructuredSemantics =
+            lhs.hasBridgeSensitiveStructuredSemantics ||
+            rhs.hasBridgeSensitiveStructuredSemantics;
+        merged.hasMixedSemanticInteractions =
+            lhs.hasMixedSemanticInteractions ||
+            rhs.hasMixedSemanticInteractions;
 
         auto addDeferredArgIdxs = [&](ArrayRef<uint32_t> argIdxs) {
           for (uint32_t argIdx : argIdxs) {
@@ -11636,6 +11647,28 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         return true;
       };
 
+      auto validateDagCandidateSemanticMetadata =
+          [&](const DagCandidateValidationMetadata &validation,
+              StringRef traceStage) -> bool {
+        if (validation.hasMixedSemanticInteractions) {
+          trace("macro/dag",
+                "{0}: DAG candidate patch rejected root id={1} name={2} "
+                "merged semantic metadata contains mixed interactions",
+                traceStage, m.id, m.name);
+          return false;
+        }
+        if (validation.usesLexicalBridge &&
+            validation.hasBridgeSensitiveStructuredSemantics) {
+          trace("macro/dag",
+                "{0}: DAG candidate patch rejected root id={1} name={2} "
+                "merged semantic metadata combines lexical bridge with "
+                "bridge-sensitive structured semantics",
+                traceStage, m.id, m.name);
+          return false;
+        }
+        return true;
+      };
+
       auto acceptOrMergeDAGCandidatePatch =
           [&](MacroPatch candPatch, StringRef baseText,
               StringRef traceStage,
@@ -11647,6 +11680,17 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           candidateValidation = *candValidation;
 
         if (!uniquePatch) {
+          if (!validateDagCandidateSemanticMetadata(candidateValidation,
+                                                   traceStage)) {
+            cert.failure =
+                DagCandidateAcceptanceFailure::MergedRootValidationFailed;
+            cert.detail = formatv(
+                              "{0}: DAG candidate patch rejected root id={1} "
+                              "name={2} semantic validation metadata failed",
+                              traceStage, m.id, m.name)
+                              .str();
+            return cert;
+          }
           uniquePatch = std::move(candPatch);
           uniquePatchBaseText = baseText.str();
           uniquePatchValidation = std::move(candidateValidation);
@@ -11690,7 +11734,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             return cert;
           }
 
-          if (!validateMergedRootCallsiteReplacement(
+          if (!validateDagCandidateSemanticMetadata(*mergedValidation,
+                                                   traceStage) ||
+              !validateMergedRootCallsiteReplacement(
                   *uniquePatchBaseText, uniquePatch->replacement,
                   mergedValidation->deferOccurrenceArgIdxs,
                   mergedValidation->hasExpectedRootFormals
@@ -11758,7 +11804,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           return cert;
         }
 
-        if (!validateMergedRootCallsiteReplacement(
+        if (!validateDagCandidateSemanticMetadata(*mergedValidation,
+                                                 traceStage) ||
+            !validateMergedRootCallsiteReplacement(
                 *uniquePatchBaseText, StringRef(*merged),
                 mergedValidation->deferOccurrenceArgIdxs,
                 mergedValidation->hasExpectedRootFormals
@@ -12429,6 +12477,12 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
         DagCandidateValidationMetadata subtreeValidation;
         subtreeValidation.hasExpectedRootFormals = true;
+        subtreeValidation.usesLexicalBridge =
+            subtreeCert.semantic.usesLexicalBridge;
+        subtreeValidation.hasBridgeSensitiveStructuredSemantics =
+            subtreeCert.semantic.hasBridgeSensitiveStructuredSemantics;
+        subtreeValidation.hasMixedSemanticInteractions =
+            subtreeCert.semantic.interactionSummary.hasMixedInteractions;
         for (const auto &KV : subtreeCert.rootFormals)
           subtreeValidation.expectedRootFormals[KV.first] = KV.second;
         subtreeValidation.deferOccurrenceArgIdxs.assign(
