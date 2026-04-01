@@ -66,6 +66,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FileSystem.h"
@@ -10133,6 +10134,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         const RefoldModel::MacroInvocation *nextInv = nullptr;
         DenseMap<uint32_t, FormalTextPair> nextFormals;
         DenseMap<uint32_t, SmallVector<uint32_t, 2>> parentFormalSources;
+        DenseSet<uint32_t> bridgedNextFormals;
         InvocationRewriteCertificate currentCert;
         SmallVector<ParentConstraintDerivationCertificate, 4> derivations;
         SmallVector<FormalRewriteCertificate, 4> parentFormalCertificates;
@@ -10535,6 +10537,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               }
             }
 
+            cert.steps.back().bridgedNextFormals = nextBridgedCurFormals;
             cur = step.nextInv;
             curFormals = std::move(step.nextFormals);
             bridgedCurFormals = std::move(nextBridgedCurFormals);
@@ -10591,6 +10594,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           bridgedCurFormals.clear();
           for (const auto &KV : curFormals)
             bridgedCurFormals.insert(KV.first);
+          cert.steps.back().bridgedNextFormals = bridgedCurFormals;
         }
 
         for (const auto &KV : curFormals) {
@@ -10744,6 +10748,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         bool hasPreferredChildSyntax = false;
         bool hasRawInvocationPreservation = false;
         bool hasPassthroughFlatten = false;
+        bool hasBridgeSensitiveStructuredSemantics = false;
         SmallVector<InvocationRewriteCertificate, 8> invocationCertificates;
         SmallVector<FormalRewriteCertificate, 16> formalCertificates;
         SmallVector<ArgSemanticRewriteCertificate, 16> argCertificates;
@@ -10758,6 +10763,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         SmallVector<StructuredLiftCertificate, 8> structuredLiftCertificates;
         SmallVector<LiftChainCertificate, 4> liftChains;
         SmallVector<RootFormalMergeCertificate, 4> rootMergeCertificates;
+        StringSet<> bridgedFormalKeys;
+        StringSet<> bridgedInteractionKeys;
         SubtreeInteractionSummaryCertificate interactionSummary;
         SubtreeInteractionConsistencyCertificate interactionConsistency;
         SubtreeSemanticAdmissibilityCertificate admissibility;
@@ -10968,11 +10975,16 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
         cert.detail = formatv(
                           "subtree semantic admissibility: lexicalBridge={0} "
-                          "mixed={1} structuredSemantics={2}",
+                          "mixed={1} structuredSemantics={2} "
+                          "bridgeSensitiveStructuredSemantics={3} "
+                          "bridgedFormals={4} bridgedInteractions={5}",
                           semantic.usesLexicalBridge ? 1 : 0,
                           semantic.interactionSummary.hasMixedInteractions ? 1
                                                                        : 0,
-                          hasStructuredSemantics ? 1 : 0)
+                          hasStructuredSemantics ? 1 : 0,
+                          semantic.hasBridgeSensitiveStructuredSemantics ? 1 : 0,
+                          semantic.bridgedFormalKeys.size(),
+                          semantic.bridgedInteractionKeys.size())
                           .str();
         return cert;
       };
@@ -10984,6 +10996,11 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               const InvocationRewriteCertificate &rootCert)
           -> SubtreeSemanticCertificate {
         SubtreeSemanticCertificate cert;
+
+        auto makeFormalKey = [&](const RefoldModel::MacroInvocation *inv,
+                                 uint32_t argIdx) -> std::string {
+          return formatv("{0}#{1}", inv ? inv->id : 0, argIdx).str();
+        };
 
         auto recordSlotCertificate =
             [&](const SlotSemanticRewriteCertificate &slotCert) {
@@ -11023,17 +11040,33 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             };
 
         auto recordFormalCertificate =
-            [&](const FormalRewriteCertificate &formalCert) {
+            [&](const FormalRewriteCertificate &formalCert,
+                bool bridgeSensitive) {
               cert.formalCertificates.push_back(formalCert);
               cert.formalInteractionConsistencies.push_back(
                   formalCert.interactionConsistency);
+              if (bridgeSensitive)
+                cert.bridgedFormalKeys.insert(
+                    makeFormalKey(formalCert.inv, formalCert.argIdx));
               if (formalCert.validation.valid ||
                   formalCert.validation.failure !=
                       RawFormalValidationFailure::None)
                 cert.rawFormalValidations.push_back(formalCert.validation);
               for (const auto &interactionCert :
-                   formalCert.interactionCertificates)
+                   formalCert.interactionCertificates) {
                 cert.interactionCertificates.push_back(interactionCert);
+                if (bridgeSensitive) {
+                  cert.bridgedInteractionKeys.insert(
+                      makeFormalKey(interactionCert.inv, interactionCert.argIdx));
+                  const auto &sig = formalCert.interactionConsistency.signature;
+                  if (sig.touchesPaste || sig.usesPreferredChildSyntax ||
+                      sig.usesRawInvocationPreservation ||
+                      sig.usesPassthroughFlatten || sig.usesStringify ||
+                      sig.usesWideStringify ||
+                      sig.usesRawChildInvocationLogicalInput)
+                    cert.hasBridgeSensitiveStructuredSemantics = true;
+                }
+              }
               for (const auto &argCert : formalCert.argRewriteCertificates)
                 recordArgCertificate(argCert);
             };
@@ -11060,7 +11093,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             for (const auto &derivation : step.derivations)
               cert.parentDerivations.push_back(derivation);
             for (const auto &formalCert : step.parentFormalCertificates)
-              recordFormalCertificate(formalCert);
+              recordFormalCertificate(
+                  formalCert,
+                  step.bridgedNextFormals.contains(formalCert.argIdx));
             if (step.parentCert.kind !=
                 InvocationRewriteCertificateKind::Invalid)
               recordInvocationCertificate(step.parentCert);
@@ -11092,7 +11127,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                           "argCerts={2} slotCerts={3} interactions={4} "
                           "formalConsistency={5} derivations={6} liftSteps={7} "
                           "rootMerges={8} lexicalBridge={9} paste={10} "
-                          "wrappers={11} admissible={12}",
+                          "wrappers={11} admissible={12} "
+                          "bridgedFormals={13} bridgedInteractions={14} "
+                          "bridgeSensitiveStructuredSemantics={15}",
                           cert.invocationCertificates.size(),
                           cert.formalCertificates.size(),
                           cert.argCertificates.size(),
@@ -11105,7 +11142,10 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                           cert.usesLexicalBridge ? 1 : 0,
                           cert.touchesPaste ? 1 : 0,
                           cert.hasWrapperSemantics ? 1 : 0,
-                          cert.admissibility.valid ? 1 : 0)
+                          cert.admissibility.valid ? 1 : 0,
+                          cert.bridgedFormalKeys.size(),
+                          cert.bridgedInteractionKeys.size(),
+                          cert.hasBridgeSensitiveStructuredSemantics ? 1 : 0)
                           .str();
         return cert;
       };
