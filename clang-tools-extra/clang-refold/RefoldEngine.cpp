@@ -10699,6 +10699,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         const RefoldModel::MacroInvocation *root = nullptr;
         DenseMap<uint32_t, FormalTextPair> leafFormals;
         DenseMap<uint32_t, FormalTextPair> rootFormals;
+        SmallVector<uint32_t, 8> deferRootOccurrenceArgIdxs;
         InvocationRewriteCertificate leafCert;
         InvocationRewriteCertificate rootCert;
         SmallVector<LiftChainCertificate, 4> liftCertificates;
@@ -11109,6 +11110,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         }
 
         DenseMap<uint32_t, SmallVector<FormalTextPair, 2>> rootRewrites;
+        DenseSet<uint32_t> deferredRootOccurrenceArgIdxSet;
         for (const auto &rewrite : cert.leafCert.rewrites) {
           auto liftCert = buildLiftChainCertificate(
               leaf, rewrite.argIdx, rewrite.oldText, rewrite.newText);
@@ -11137,6 +11139,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             }
             if (!seen)
               rewrites.push_back(RK.second);
+            if (liftCert.usedLexicalBridge)
+              deferredRootOccurrenceArgIdxSet.insert(RK.first);
           }
         }
 
@@ -11170,14 +11174,17 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               FormalTextPair{mergeCert.baseArgText, mergeCert.mergedArgText};
         }
 
-        SmallVector<uint32_t, 8> deferRootOccurrenceArgIdxs;
-        deferRootOccurrenceArgIdxs.reserve(pendingRootFormals.size());
-        for (const auto &KV : pendingRootFormals)
-          deferRootOccurrenceArgIdxs.push_back(KV.first);
+        cert.deferRootOccurrenceArgIdxs.clear();
+        cert.deferRootOccurrenceArgIdxs.reserve(pendingRootFormals.size());
+        for (const auto &KV : pendingRootFormals) {
+          if (deferredRootOccurrenceArgIdxSet.contains(KV.first))
+            cert.deferRootOccurrenceArgIdxs.push_back(KV.first);
+        }
+        llvm::sort(cert.deferRootOccurrenceArgIdxs);
 
         cert.rootCert = buildInvocationRewriteCertificate(
             m, pendingRootFormals, "DAG subtree root", invSpanText,
-            invArgRanges, deferRootOccurrenceArgIdxs);
+            invArgRanges, cert.deferRootOccurrenceArgIdxs);
         if (cert.rootCert.kind == InvocationRewriteCertificateKind::Invalid) {
           cert.detail = cert.rootCert.detail;
           return cert;
@@ -12290,15 +12297,13 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         // Before accepting the preserved root patch, replay the final root
         // callsite replacement through the ordinary root-level occurrence and
         // paste validators so only root rewrites that still reproduce the
-        // required B-side behavior are accepted.
-        SmallVector<uint32_t, 8> deferReplayOccurrenceArgIdxs;
-        deferReplayOccurrenceArgIdxs.reserve(subtreeCert.rootCert.rewrites.size());
-        for (const auto &rewrite : subtreeCert.rootCert.rewrites)
-          deferReplayOccurrenceArgIdxs.push_back(rewrite.argIdx);
-
+        // required B-side behavior are accepted. Only root arguments whose
+        // subtree proof actually required lexical bridging keep deferred
+        // occurrence consistency at replay time.
         if (!validateMergedRootCallsiteReplacement(
                 invSpanText, StringRef(rootPatchCert.patch->replacement),
-                deferReplayOccurrenceArgIdxs, &subtreeCert.rootFormals)) {
+                subtreeCert.deferRootOccurrenceArgIdxs,
+                &subtreeCert.rootFormals)) {
           trace("macro/dag",
                 "DAG subtree root replay validation failed: rejecting root "
                 "id={0} name={1} leaf id={2} name={3} repl='{4}'",
@@ -12313,8 +12318,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         for (const auto &KV : subtreeCert.rootFormals)
           subtreeValidation.expectedRootFormals[KV.first] = KV.second;
         subtreeValidation.deferOccurrenceArgIdxs.assign(
-            deferReplayOccurrenceArgIdxs.begin(),
-            deferReplayOccurrenceArgIdxs.end());
+            subtreeCert.deferRootOccurrenceArgIdxs.begin(),
+            subtreeCert.deferRootOccurrenceArgIdxs.end());
 
         auto acceptCert = acceptOrMergeDAGCandidatePatch(
             std::move(*rootPatchCert.patch), invSpanText,
