@@ -10934,14 +10934,19 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             semantic.hasWrapperSemantics || semantic.hasPreferredChildSyntax ||
             semantic.hasRawInvocationPreservation ||
             hasInteractionScopedPasteSemantics;
-        if (semantic.usesLexicalBridge && hasStructuredSemantics) {
+        const bool hasBridgeSensitiveStructuredSemantics =
+            semantic.hasBridgeSensitiveStructuredSemantics;
+        if (semantic.usesLexicalBridge &&
+            hasBridgeSensitiveStructuredSemantics) {
           trace("macro/dag",
                 "subtree admissibility reject(lexical bridge): "
-                "lexicalBridge={0} structuredSemantics={1} subtreePaste={2} "
-                "interactionPaste={3} wrappers={4} preferredChildSyntax={5} "
-                "rawInvocation={6} summary={7}",
+                "lexicalBridge={0} structuredSemantics={1} "
+                "bridgeSensitiveStructuredSemantics={2} subtreePaste={3} "
+                "interactionPaste={4} wrappers={5} preferredChildSyntax={6} "
+                "rawInvocation={7} summary={8}",
                 semantic.usesLexicalBridge ? 1 : 0,
                 hasStructuredSemantics ? 1 : 0,
+                hasBridgeSensitiveStructuredSemantics ? 1 : 0,
                 semantic.touchesPaste ? 1 : 0,
                 hasInteractionScopedPasteSemantics ? 1 : 0,
                 semantic.hasWrapperSemantics ? 1 : 0,
@@ -10968,7 +10973,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               LexicalBridgeWithStructuredSemantics;
           cert.detail =
               "subtree semantic admissibility failed: lexical bridging cannot "
-              "certify wrapper/raw-invocation/paste-sensitive subtree "
+              "certify bridge-sensitive wrapper/raw-invocation/paste subtree "
               "semantics";
           return cert;
         }
