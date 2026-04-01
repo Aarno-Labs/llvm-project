@@ -809,6 +809,53 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
         std::optional<uint64_t> callerMacroId =
             asOptUInt64(*obj, "caller_macro_id", /*canBeNull=*/true);
 
+        RefoldModel::MacroCalleeOrigin calleeOrigin;
+        if (const json::Value *OriginVal = obj->get("callee_origin")) {
+          auto OriginObjOrErr = asObject(*OriginVal, ctxItem);
+          if (!OriginObjOrErr)
+            fatal("model", "{0}: callee_origin is not an object", ctxItem);
+          const json::Object &OriginObj = **OriginObjOrErr;
+
+          auto KindOrErr = applyToField(asString, OriginObj, "kind",
+                                        ctxItem + ": callee_origin");
+          if (!KindOrErr)
+            return KindOrErr.takeError();
+
+          if (*KindOrErr == "literal_macro_name") {
+            calleeOrigin.kind =
+                MacroCalleeOriginKind::LiteralMacroName;
+          } else if (*KindOrErr == "caller_param") {
+            calleeOrigin.kind = MacroCalleeOriginKind::CallerParam;
+          } else if (*KindOrErr == "paste") {
+            calleeOrigin.kind = MacroCalleeOriginKind::Paste;
+          } else if (*KindOrErr == "opaque") {
+            calleeOrigin.kind = MacroCalleeOriginKind::Opaque;
+          } else {
+            fatal("model", "{0}: invalid callee_origin.kind '{1}'", ctxItem,
+                  *KindOrErr);
+          }
+
+          if (auto IdxsArr =
+                  asOptArray(OriginObj, "caller_param_indices",
+                             /*allowNull=*/true)) {
+            for (const json::Value &Elem : **IdxsArr) {
+              auto UOrErr =
+                  asUInt32(Elem, ctxItem + ": callee_origin.caller_param_indices");
+              if (!UOrErr)
+                fatal("model",
+                      "{0}: callee_origin.caller_param_indices element is not "
+                      "a uint32",
+                      ctxItem);
+              calleeOrigin.callerParamIndices.push_back(*UOrErr);
+            }
+          }
+        } else if (callerMacroId) {
+          calleeOrigin.kind = MacroCalleeOriginKind::Opaque;
+        } else {
+          calleeOrigin.kind =
+              MacroCalleeOriginKind::LiteralMacroName;
+        }
+
         std::vector<std::vector<uint32_t>> argDeps;
         if (auto DepsArr = asOptArray(*obj, "arg_deps", /*allowNull=*/true)) {
           for (const json::Value &Entry : **DepsArr) {
@@ -905,6 +952,7 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
                            /*pasteSpans*/ std::move(pasteSpans),
                            /*bodySpans*/ std::move(bodySpans),
                            /*callerMacroId*/ callerMacroId,
+                           /*calleeOrigin*/ std::move(calleeOrigin),
                            /*argDeps*/ std::move(argDeps),
                            /*argRefs*/ std::move(argRefs));
 

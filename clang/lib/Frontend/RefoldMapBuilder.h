@@ -91,6 +91,18 @@ struct MacroParam {
   bool Variadic = false;
 };
 
+enum MacroCalleeOriginKind {
+  MCO_LiteralMacroName,
+  MCO_CallerParam,
+  MCO_Paste,
+  MCO_Opaque
+};
+
+struct MacroCalleeOrigin {
+  MacroCalleeOriginKind Kind = MCO_LiteralMacroName;
+  std::vector<uint32_t> CallerParamIndices;
+};
+
 struct PastePart {
   // ArgIndex >= 0 is a macro argument index; nullopt denotes a literal
   // contribution.
@@ -177,6 +189,7 @@ struct Item {
   // InvArgDeps records, for each invocation argument, which caller formal(s)
   // the raw argument text references (by index in the caller's DefParams).
   std::optional<uint64_t> CallerMacroId;
+  MacroCalleeOrigin CalleeOrigin;
   std::vector<std::vector<uint32_t>> InvArgDeps;
 
   struct InvArgRef {
@@ -187,8 +200,10 @@ struct Item {
 
   // For each invocation argument, record the precise byte ranges in inv_text
   // that reference caller formals (indexed by CallerParamIndex). This is a
-  // refinement of InvArgDeps that allows the consumer to lift edits through
-  // nested macro expansions without re-expanding.
+  // refinement of InvArgDeps that allows the consumer to invert nested macro
+  // argument templates hop-by-hop without re-expanding. The consumer treats
+  // these slices as proof material for generalized DAG lifting; producer-side
+  // upward propagation remains only a best-effort optimization.
   std::vector<std::vector<InvArgRef>> InvArgRefs;
   std::vector<HeaderDecl> Decls;
 

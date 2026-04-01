@@ -62,6 +62,7 @@
 #include <iterator>
 #include <type_traits>
 #include <cctype>
+#include <cstdlib>
 #include <limits>
 #include <string>
 #include <utility>
@@ -1791,8 +1792,20 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
   size_t NewIdx = Items.size();
   Items.push_back(std::move(It));
 
-  // 5. Update the mapping for lookup during token attribution
-  MacroKey2Item[keyForMacroLoc(MacroNameTok.getLocation())] = NewIdx;
+  // 5. Update the mapping for lookup during token attribution.
+  //
+  // Nested / higher-order expansions can later be observed through either the
+  // macro name token location *or* the expansion range begin used by
+  // SourceManager when walking immediate expansion hops. Register both, but do
+  // so conservatively to avoid clobbering an existing more-specific mapping.
+  auto RegisterMacroKey = [&](SourceLocation KLoc) {
+    if (KLoc.isInvalid())
+      return;
+    MacroKey2Item[keyForMacroLoc(KLoc)] = NewIdx;
+  };
+
+  RegisterMacroKey(MacroNameTok.getLocation());
+  RegisterMacroKey(Range.getBegin());
 
   // Register paste-produced spellings for paste-through-stringify projection.
   for (const auto &E : Items[NewIdx].PasteSpell2TokenIndices) {
@@ -1801,19 +1814,50 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
       Vec.push_back(NewIdx);
   }
 
-  // Helper: map a macro invocation location to the corresponding Item index.
-  // (Used to form deterministic caller relationships for nested macros.)
-  auto LookupMacroItem = [&](SourceLocation Loc) -> std::optional<size_t> {
+  // Helper: map a macro-related location to the corresponding Item index.
+  //
+  // Nested higher-order expansions often surface the *formal occurrence* inside
+  // the caller body (for example the `X` token in `FOO(X, 10)`) rather than the
+  // caller invocation's name/range-begin location. When the direct key lookup
+  // misses, fall back to the most-recent earlier macro invocation whose
+  // invocation-site argument ranges can prove that this location originated
+  // from one of its actual arguments. Cache the resolved alias so subsequent
+  // lookups for the same raw MacroID location are O(1).
+  auto LookupMacroItem = [&](SourceLocation Loc,
+                             size_t SearchLimit = std::numeric_limits<size_t>::max())
+      -> std::optional<size_t> {
     if (Loc.isInvalid())
       return std::nullopt;
-    auto It = MacroKey2Item.find(keyForMacroLoc(Loc));
+
+    const std::string Key = keyForMacroLoc(Loc);
+    auto It = MacroKey2Item.find(Key);
     if (It != MacroKey2Item.end())
       return It->second;
+
+    if (!Loc.isMacroID())
+      return std::nullopt;
+
+    const size_t Limit = std::min(SearchLimit, Items.size());
+    for (size_t I = Limit; I != 0; --I) {
+      const size_t CandIdx = I - 1;
+      const Item &Cand = Items[CandIdx];
+      if (Cand.Kind != IK_Macro)
+        continue;
+      if (!argIndexForSpellingLoc(Cand, Loc, SM, Lang, EmitAbsPaths))
+        continue;
+
+      MacroKey2Item[Key] = CandIdx;
+      return CandIdx;
+    }
+
     return std::nullopt;
   };
 
   // If this macro invocation occurred while expanding another macro, record the
-  // immediately enclosing (caller) macro invocation's item id.
+  // immediately enclosing (caller) macro invocation's item id and the origin of
+  // the callee token itself. The consumer only performs generalized nested
+  // args-only lifting through invocations whose callee token is proven literal;
+  // higher-order or opaque callee origins are conservatively expanded.
   {
     Item &CurIt = Items[NewIdx];
     SourceLocation NameLoc = MacroNameTok.getLocation();
@@ -1826,7 +1870,7 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
         CharSourceRange ER = SM.getImmediateExpansionRange(L);
         SourceLocation CallerLoc = ER.getBegin();
         if (CallerLoc.isValid()) {
-          if (auto CallerIdx = LookupMacroItem(CallerLoc)) {
+          if (auto CallerIdx = LookupMacroItem(CallerLoc, NewIdx)) {
             if (*CallerIdx != NewIdx)
               CurIt.CallerMacroId = Items[*CallerIdx].ID;
             break;
@@ -1837,6 +1881,29 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
         if (!Next.isValid() || Next == L)
           break;
         L = Next;
+      }
+    }
+
+    CurIt.CalleeOrigin.Kind = MCO_LiteralMacroName;
+    if (CurIt.CallerMacroId) {
+      const Item *CallerIt = nullptr;
+      for (const Item &Cand : Items) {
+        if (Cand.ID == *CurIt.CallerMacroId) {
+          CallerIt = &Cand;
+          break;
+        }
+      }
+
+      if (CallerIt) {
+        if (auto ArgIdx = argIndexForSpellingLoc(*CallerIt, NameLoc, SM, Lang,
+                                                 EmitAbsPaths)) {
+          CurIt.CalleeOrigin.Kind = MCO_CallerParam;
+          CurIt.CalleeOrigin.CallerParamIndices.push_back(*ArgIdx);
+        } else if (NameLoc.isMacroID() && SM.isMacroArgExpansion(NameLoc)) {
+          CurIt.CalleeOrigin.Kind = MCO_Opaque;
+        }
+      } else if (NameLoc.isMacroID()) {
+        CurIt.CalleeOrigin.Kind = MCO_Opaque;
       }
     }
   }
@@ -1950,9 +2017,27 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
     auto LookupMacroItem = [&](SourceLocation Loc) -> std::optional<size_t> {
       if (Loc.isInvalid())
         return std::nullopt;
-      auto It = MacroKey2Item.find(keyForMacroLoc(Loc));
+
+      const std::string Key = keyForMacroLoc(Loc);
+      auto It = MacroKey2Item.find(Key);
       if (It != MacroKey2Item.end())
         return It->second;
+
+      if (!Loc.isMacroID())
+        return std::nullopt;
+
+      for (size_t I = Items.size(); I != 0; --I) {
+        const size_t CandIdx = I - 1;
+        const Item &Cand = Items[CandIdx];
+        if (Cand.Kind != IK_Macro)
+          continue;
+        if (!argIndexForSpellingLoc(Cand, Loc, SM, Lang, EmitAbsPaths))
+          continue;
+
+        MacroKey2Item[Key] = CandIdx;
+        return CandIdx;
+      }
+
       return std::nullopt;
     };
 
@@ -3170,12 +3255,81 @@ void RefoldMapBuilder::writeJSON() {
         It.InvArgRefs = RIt->second;
     }
 
-    // Propagate paste_spans upward through the macro nesting DAG when an
-    // invocation argument is a direct pass-through of a single caller formal.
+    auto hasRealTokenEnvelope = [](const Item &It) -> bool {
+      for (const TokenSpan &S : It.Spans)
+        if (S.End > S.Begin)
+          return true;
+      return false;
+    };
+
+    auto appendMergedTokenSpan = [](std::vector<TokenSpan> &Dst,
+                                    const TokenSpan &S) {
+      if (S.End <= S.Begin)
+        return;
+      if (!Dst.empty() && Dst.back().End >= S.Begin) {
+        Dst.back().End = std::max(Dst.back().End, S.End);
+        return;
+      }
+      TokenSpan T = S;
+      T.Open = false;
+      Dst.push_back(T);
+    };
+
+    // Some higher-order intermediate invocations (e.g. BAR(FUNC) -> FOO(X,10)
+    // -> FUNC(...)) can legitimately produce no directly-attributed tokens: all
+    // printed output is owned by nested child expansions. Once caller links are
+    // known, synthesize a stable token envelope for such zero-width placeholder
+    // items from their *direct* children only. This avoids broad ancestor
+    // attribution while still preserving the intermediate nesting the consumer
+    // needs.
+    bool SynthChanged = false;
+    for (unsigned Pass = 0; Pass < 8; ++Pass) {
+      SynthChanged = false;
+      for (Item &Parent : Items) {
+        if (Parent.Kind != IK_Macro || hasRealTokenEnvelope(Parent))
+          continue;
+
+        llvm::SmallVector<TokenSpan, 8> ChildSpans;
+        for (const Item &Child : Items) {
+          if (Child.Kind != IK_Macro || !Child.CallerMacroId ||
+              *Child.CallerMacroId != Parent.ID || !hasRealTokenEnvelope(Child))
+            continue;
+          for (const TokenSpan &S : Child.Spans)
+            if (S.End > S.Begin)
+              ChildSpans.push_back(S);
+        }
+
+        if (ChildSpans.empty())
+          continue;
+
+        llvm::sort(ChildSpans, [](const TokenSpan &A, const TokenSpan &B) {
+          if (A.Begin != B.Begin)
+            return A.Begin < B.Begin;
+          return A.End < B.End;
+        });
+
+        Parent.Spans.clear();
+        Parent.BodySpans.clear();
+        for (const TokenSpan &S : ChildSpans) {
+          appendMergedTokenSpan(Parent.Spans, S);
+          appendMergedTokenSpan(Parent.BodySpans, S);
+        }
+
+        if (!Parent.Spans.empty())
+          SynthChanged = true;
+      }
+      if (!SynthChanged)
+        break;
+    }
+
+    // Propagate paste_spans upward through the macro nesting DAG only for a
+    // narrow whole-argument direct-pass-through case.
     //
-    // This lets the consumer attribute paste-derived substrings (including
-    // nested pastes that later become part of a stringified token) to the
-    // outermost macro invocation without needing a DAG-walk at consume time.
+    // This is a producer-side optimization for paste bookkeeping only. The
+    // generalized nested-macro refolding policy is implemented in the consumer
+    // by inverting arg_refs/template slices hop-by-hop; it does not rely on
+    // this upward propagation succeeding for wrapped or otherwise structured
+    // arguments.
     llvm::DenseMap<uint64_t, Item *> ItemByIDMut;
     ItemByIDMut.reserve(Items.size());
     for (Item &It : Items)
@@ -3286,8 +3440,10 @@ void RefoldMapBuilder::writeJSON() {
         uint32_t CurArg = *S0.ArgIndex;
         ArgTokenSpan CurSpan = S0;
 
-        // Walk outward through caller_macro_id links as long as the argument is
-        // a direct reference to a single caller formal.
+        // Walk outward through caller_macro_id links only while the entire
+        // invocation argument is a direct reference to a single caller formal.
+        // More general wrapped/template-structured arguments are handled later
+        // by the consumer using arg_refs.
         for (unsigned Depth = 0; Depth < 128; ++Depth) {
           Item *CurIt = ItemByIDMut.lookup(CurID);
           if (!CurIt || !CurIt->CallerMacroId)
@@ -3309,6 +3465,83 @@ void RefoldMapBuilder::writeJSON() {
           CurArg = CallerParamIdx;
         }
       }
+    }
+
+    auto sameArgTokenSpan = [](const ArgTokenSpan &A,
+                               const ArgTokenSpan &B) -> bool {
+      if (A.Begin != B.Begin || A.End != B.End)
+        return false;
+      if (A.ArgIndex != B.ArgIndex || A.Open != B.Open ||
+          A.HasByteRange != B.HasByteRange)
+        return false;
+      if (A.HasByteRange &&
+          (A.ByteBegin != B.ByteBegin || A.ByteEnd != B.ByteEnd))
+        return false;
+      return true;
+    };
+
+    auto containsArgTokenSpan = [&](const std::vector<ArgTokenSpan> &V,
+                                    const ArgTokenSpan &S) -> bool {
+      for (const ArgTokenSpan &E : V)
+        if (sameArgTokenSpan(E, S))
+          return true;
+      return false;
+    };
+
+    // Propagate descendant arg-like provenance upward through lexical source
+    // nesting inside invocation arguments. If a parent macro is invoked with an
+    // argument that itself contains a macro invocation in source text, then any
+    // arg/stringify/paste output produced by that nested child is also
+    // descendant provenance for the enclosing parent formal.
+    //
+    // This is a producer-side convenience for the consumer's generalized DAG
+    // lifting: the consumer can still recover the same structure by inspecting
+    // source ranges directly, but serializing the upward-propagated spans makes
+    // parent-level candidate discovery deterministic and local.
+    bool Changed = false;
+    for (unsigned Pass = 0; Pass < 8; ++Pass) {
+      Changed = false;
+      for (Item &Parent : Items) {
+        if (Parent.Kind != IK_Macro || !Parent.InvBegin || !Parent.InvEnd ||
+            Parent.InvText.empty() || Parent.InvArgRanges.empty() ||
+            Parent.InvFile.empty())
+          continue;
+
+        for (uint32_t ArgIdx = 0; ArgIdx < Parent.InvArgRanges.size(); ++ArgIdx) {
+          const auto &R = Parent.InvArgRanges[ArgIdx];
+          if (!R.first || !R.second || *R.second < *R.first)
+            continue;
+
+          for (const Item &Child : Items) {
+            if (Child.Kind != IK_Macro || Child.ID == Parent.ID ||
+                !Child.InvBegin || !Child.InvEnd || Child.InvFile.empty())
+              continue;
+            if (Child.InvFile != Parent.InvFile)
+              continue;
+            if (*Child.InvBegin < *R.first || *Child.InvEnd > *R.second ||
+                *Child.InvEnd <= *Child.InvBegin)
+              continue;
+
+            auto copySpans = [&](const std::vector<ArgTokenSpan> &Src,
+                                 std::vector<ArgTokenSpan> &Dst) {
+              for (const ArgTokenSpan &S : Src) {
+                ArgTokenSpan T = S;
+                T.ArgIndex = ArgIdx;
+                if (!containsArgTokenSpan(Dst, T)) {
+                  Dst.push_back(T);
+                  Changed = true;
+                }
+              }
+            };
+
+            copySpans(Child.ArgSpans, Parent.ArgSpans);
+            copySpans(Child.StringifySpans, Parent.StringifySpans);
+            copySpans(Child.PasteSpans, Parent.PasteSpans);
+          }
+        }
+      }
+      if (!Changed)
+        break;
     }
 
     // items...
@@ -3530,6 +3763,29 @@ void RefoldMapBuilder::writeJSON() {
 
             if (It.CallerMacroId)
               JO.attribute("caller_macro_id", *It.CallerMacroId);
+
+            JO.attributeObject("callee_origin", [&] {
+              switch (It.CalleeOrigin.Kind) {
+              case MCO_LiteralMacroName:
+                JO.attribute("kind", "literal_macro_name");
+                break;
+              case MCO_CallerParam:
+                JO.attribute("kind", "caller_param");
+                break;
+              case MCO_Paste:
+                JO.attribute("kind", "paste");
+                break;
+              case MCO_Opaque:
+                JO.attribute("kind", "opaque");
+                break;
+              }
+              if (!It.CalleeOrigin.CallerParamIndices.empty()) {
+                JO.attributeArray("caller_param_indices", [&] {
+                  for (uint32_t Idx : It.CalleeOrigin.CallerParamIndices)
+                    JO.value(Idx);
+                });
+              }
+            });
 
             if (!It.InvArgDeps.empty()) {
               JO.attributeArray("arg_deps", [&] {

@@ -75,9 +75,11 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <tuple>
@@ -92,6 +94,271 @@ inline std::string resolveHeaderPath(const RefoldModel::IncludeItem &inc) {
   return (inc.resolvedPath && !inc.resolvedPath->empty())
              ? inc.resolvedPath->str()
              : stringutils::stripHeaderToken(inc.target).str();
+}
+
+inline bool HasLiteralMacroCalleeOrigin(
+    const RefoldModel::MacroInvocation &M) {
+  return M.calleeOrigin.kind == MacroCalleeOriginKind::LiteralMacroName;
+}
+
+static std::string FormatUInt32List(ArrayRef<uint32_t> values) {
+  std::string out;
+  raw_string_ostream os(out);
+  os << "[";
+  for (size_t i = 0; i < values.size(); ++i) {
+    if (i)
+      os << ", ";
+    os << values[i];
+  }
+  os << "]";
+  return os.str();
+}
+
+static std::string
+FormatInvArgRefList(ArrayRef<RefoldModel::InvArgRef> refs) {
+  std::string out;
+  raw_string_ostream os(out);
+  os << "[";
+  for (size_t i = 0; i < refs.size(); ++i) {
+    if (i)
+      os << ", ";
+    os << "{caller=" << refs[i].callerParamIndex << ", bytes=["
+       << refs[i].byteBegin << "," << refs[i].byteEnd << ")}";
+  }
+  os << "]";
+  return os.str();
+}
+
+static std::string
+FormatInvocationArgRange(const RefoldModel::MacroInvocation::OptByteRange &R) {
+  std::string out;
+  raw_string_ostream os(out);
+  os << "[";
+  if (R.first)
+    os << *R.first;
+  else
+    os << "?";
+  os << ",";
+  if (R.second)
+    os << *R.second;
+  else
+    os << "?";
+  os << ")";
+  return os.str();
+}
+
+/// 
+/// Stringification (`#arg`) is not a free inverse: comments disappear and
+/// arbitrary runs of PP whitespace collapse to single spaces in the resulting
+/// string literal. To avoid inventing a non-unique source spelling when we map
+/// an edited string literal back into raw argument syntax, we only accept
+/// payloads that are already in a simple canonical source form:
+///   * leading/trailing PP whitespace removed,
+///   * every inter-token whitespace run collapsed to a single ASCII space,
+///   * no comments outside literals,
+///   * balanced string/char literals.
+///
+/// If the trimmed payload is not already equal to that canonical form, the
+/// inverse is ambiguous and we conservatively reject it.
+static std::optional<std::string>
+CanonicalizeStringifyInversePayload(StringRef raw0) {
+  StringRef raw = raw0.trim();
+
+  enum class LexState { Normal, String, Char };
+  LexState state = LexState::Normal;
+
+  std::string out;
+  out.reserve(raw.size());
+
+  bool pendingSpace = false;
+  auto flushPendingSpace = [&]() {
+    if (pendingSpace && !out.empty())
+      out.push_back(' ');
+    pendingSpace = false;
+  };
+
+  for (size_t i = 0; i < raw.size(); ++i) {
+    const char c = raw[i];
+
+    switch (state) {
+    case LexState::Normal:
+      if (stringutils::isWs(c)) {
+        pendingSpace = !out.empty();
+        continue;
+      }
+
+      if (c == '/' && i + 1 < raw.size()) {
+        const char n = raw[i + 1];
+        if (n == '/' || n == '*')
+          return std::nullopt;
+      }
+
+      flushPendingSpace();
+      out.push_back(c);
+      if (c == '"')
+        state = LexState::String;
+      else if (c == '\'')
+        state = LexState::Char;
+      continue;
+
+    case LexState::String:
+      out.push_back(c);
+      if (c == '\\') {
+        if (i + 1 >= raw.size())
+          return std::nullopt;
+        out.push_back(raw[++i]);
+        continue;
+      }
+      if (c == '"')
+        state = LexState::Normal;
+      continue;
+
+    case LexState::Char:
+      out.push_back(c);
+      if (c == '\\') {
+        if (i + 1 >= raw.size())
+          return std::nullopt;
+        out.push_back(raw[++i]);
+        continue;
+      }
+      if (c == '\'')
+        state = LexState::Normal;
+      continue;
+    }
+  }
+
+  if (state != LexState::Normal)
+    return std::nullopt;
+
+  return out;
+}
+
+
+enum class PasteRunInvertibilityKind {
+  Unique,
+  NoMatch,
+  Ambiguous,
+  Unsupported,
+};
+
+struct PasteRunInvertibilityCertificate {
+  PasteRunInvertibilityKind kind = PasteRunInvertibilityKind::Unsupported;
+  std::vector<std::string> derivedSegs;
+};
+
+static PasteRunInvertibilityCertificate
+buildAdjacentPasteRunInvertibilityCertificate(
+    StringRef aTok, StringRef bRun,
+    ArrayRef<const RefoldModel::PPArgSpan *> runSpans) {
+  PasteRunInvertibilityCertificate cert;
+  if (runSpans.empty())
+    return cert;
+
+  std::vector<std::string> oldSegs;
+  oldSegs.reserve(runSpans.size());
+  std::string oldRun;
+  oldRun.reserve(aTok.size());
+
+  std::optional<uint32_t> prevEnd;
+  for (const auto *ps : runSpans) {
+    if (!ps || !ps->byteBegin || !ps->byteEnd || *ps->byteEnd < *ps->byteBegin)
+      return cert;
+    if (static_cast<size_t>(*ps->byteEnd) > aTok.size())
+      return cert;
+    if (prevEnd && *prevEnd != *ps->byteBegin)
+      return cert;
+
+    StringRef oldSeg =
+        aTok.substr(static_cast<size_t>(*ps->byteBegin),
+                    static_cast<size_t>(*ps->byteEnd - *ps->byteBegin));
+    oldSegs.push_back(oldSeg.str());
+    oldRun += oldSeg;
+    prevEnd = *ps->byteEnd;
+  }
+
+  SmallVector<std::vector<std::string>, 4> candidates;
+  auto addCandidate = [&](std::vector<std::string> segs) {
+    for (const auto &existing : candidates)
+      if (existing == segs)
+        return;
+    candidates.push_back(std::move(segs));
+  };
+
+  // A contiguous ## run is invertible when its edited B spelling can be split
+  // into per-segment spellings such that every changed segment is isolated by
+  // unchanged neighbors (or a run edge). Adjacent edited segments in the same
+  // undelimited run are treated as ambiguous because no internal anchor pins
+  // their boundary.
+  SmallVector<std::string, 8> curSegs(oldSegs.begin(), oldSegs.end());
+  auto solveRun = [&](auto &&self, size_t idx, size_t pos,
+                      bool prevChanged) -> void {
+    if (candidates.size() > 1 || pos > bRun.size())
+      return;
+
+    if (idx == oldSegs.size()) {
+      if (pos == bRun.size())
+        addCandidate(std::vector<std::string>(curSegs.begin(), curSegs.end()));
+      return;
+    }
+
+    StringRef oldSeg = oldSegs[idx];
+
+    auto tryUnchanged = [&]() {
+      if (!bRun.drop_front(pos).starts_with(oldSeg))
+        return;
+      curSegs[idx] = oldSeg;
+      self(self, idx + 1, pos + oldSeg.size(), /*prevChanged=*/false);
+    };
+
+    if (prevChanged) {
+      tryUnchanged();
+      return;
+    }
+
+    tryUnchanged();
+
+    // Current segment edited. The next segment, if any, must remain unchanged
+    // and therefore acts as the first available anchor for the edited piece.
+    if (idx + 1 == oldSegs.size()) {
+      curSegs[idx] = bRun.drop_front(pos).str();
+      self(self, idx + 1, bRun.size(), /*prevChanged=*/true);
+      return;
+    }
+
+    StringRef nextAnchor = oldSegs[idx + 1];
+    if (nextAnchor.empty()) {
+      cert.kind = PasteRunInvertibilityKind::Unsupported;
+      return;
+    }
+
+    StringRef rest = bRun.drop_front(pos);
+    for (size_t searchPos = 0;; ++searchPos) {
+      size_t found = rest.find(nextAnchor, searchPos);
+      if (found == StringRef::npos)
+        break;
+      curSegs[idx] = rest.take_front(found).str();
+      self(self, idx + 1, pos + found, /*prevChanged=*/true);
+      if (candidates.size() > 1)
+        return;
+    }
+  };
+
+  solveRun(solveRun, 0, 0, /*prevChanged=*/false);
+
+  if (cert.kind == PasteRunInvertibilityKind::Unsupported)
+    return cert;
+  if (candidates.empty()) {
+    cert.kind = PasteRunInvertibilityKind::NoMatch;
+    return cert;
+  }
+  if (candidates.size() > 1) {
+    cert.kind = PasteRunInvertibilityKind::Ambiguous;
+    return cert;
+  }
+
+  cert.kind = PasteRunInvertibilityKind::Unique;
+  cert.derivedSegs = std::move(candidates.front());
+  return cert;
 }
 
 /// Return true iff \p replacement has the exact chained-call shape
@@ -1311,10 +1578,12 @@ std::string RefoldEngine::RefoldOnce() {
   // This may create macro patches even when no diff hunk touched the invocation
   // (required to prevent later __COUNTER__ values from shifting after an edit).
   auto forcedCounters = ComputeForcedCounterPatches(tuPath, a2b);
-  auto forcedByExpanded =
+  auto forcedCountersFromExpanded =
       ComputeForcedCounterPatchesFromExpandedMacros(tuPath,
                                                     macroPatchByOwnerByMacroId);
-  forcedCounters.append(forcedByExpanded.begin(), forcedByExpanded.end());
+  if (!forcedCountersFromExpanded.empty())
+    forcedCounters.append(forcedCountersFromExpanded.begin(),
+                          forcedCountersFromExpanded.end());
   if (!forcedCounters.empty())
     AddForcedCounterPatches(forcedCounters, macroPatchByOwnerByMacroId);
 
@@ -2383,7 +2652,6 @@ RefoldEngine::SmallestCoveringPatchableMacro(
     // CRITICAL: never patch invocations that are spelled inside a #define.
     if (IsInvocationInsideDefineDirective(m))
       continue;
-
     // Rank candidates by how directly their spans cover the requested range.
     //   Body:    body span covers the range (direct expansion token)
     //   ArgLike: argument-like span covers the range (arg/stringify/paste)
@@ -3177,6 +3445,10 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
 
     // Check all STRINGIFY spans for this argument, but only in strict mode.
     if (argIsStringified) {
+      auto canonArg = CanonicalizeStringifyInversePayload(argTrim);
+      if (!canonArg || StringRef(*canonArg).trim() != argTrim)
+        return false;
+
       for (const auto &s : m.stringifySpans) {
         if (s.argIdx != argIdx)
           continue;
@@ -3771,72 +4043,86 @@ bool RefoldEngine::SegmentPastedTokenArgsByFixedSlicesRec(
   if (bA < posA)
     return false;
 
-  // 3. Match the "Fixed" anchor text appearing before this argument in A
+  // 3. Match the fixed text that appears before this pasted-argument run.
   StringRef fixedBefore = aTok.substr(posA, bA - posA);
   if (!bTok.substr(posB).starts_with(fixedBefore))
     return false;
 
-  const size_t argStartB = posB + fixedBefore.size();
-  const size_t nextPosA = eA;
+  const size_t runStartB = posB + fixedBefore.size();
 
-  // 4. Determine the "Fixed" anchor text appearing after this argument
+  // 4. Determine the maximal adjacent-span run beginning at idx. Internal
+  // empty gaps correspond to touching pasted contributions; they remain
+  // invertible only while unchanged neighboring segments still pin the
+  // boundaries.
+  size_t runEnd = idx;
+  size_t nextPosA = eA;
   StringRef fixedAfter;
-  if (idx + 1 < spansAsc.size()) {
-    const auto *next = spansAsc[idx + 1];
-    if (!next->byteBegin || *next->byteBegin < eA)
-      return false;
-    fixedAfter = aTok.substr(eA, static_cast<size_t>(*next->byteBegin) - eA);
-  } else {
-    fixedAfter = aTok.substr(eA);
-  }
-
-  // 5. Handling Argument Boundaries
-  if (fixedAfter.empty()) {
-    // If there is no fixed anchor after this span and the total length changed,
-    // we cannot determine the B segment boundary for this arg.
-    if (idx + 1 < spansAsc.size() && aTok.size() != bTok.size())
-      return false;
-
-    // If this is the final arg span and there is no fixed tail, the arg's
-    // contribution may legally grow or shrink. In that case, consume the
-    // remainder of the B token.
-    //
-    // This is the common case for token-paste macros like:
-    //   CONCAT(X, Y, Z) -> X##_##Y##_##Z
-    // where the last argument is immediately followed by the end of the pasted
-    // token.
-    if (idx + 1 == spansAsc.size()) {
-      out[idx] = bTok.substr(argStartB).str();
-      return SegmentPastedTokenArgsByFixedSlicesRec(
-          aTok, bTok, spansAsc, idx + 1, nextPosA, bTok.size(), out);
+  while (true) {
+    if (runEnd + 1 >= spansAsc.size()) {
+      fixedAfter = aTok.substr(nextPosA);
+      break;
     }
 
-    // Length-stable adjacent spans: use the A span length as the B span length.
-    const size_t aLen = eA - bA;
-    const size_t argEndB = argStartB + aLen;
-
-    if (argEndB > bTok.size())
+    const auto *cur = spansAsc[runEnd];
+    const auto *next = spansAsc[runEnd + 1];
+    if (!cur->byteEnd || !next->byteBegin || *next->byteBegin < *cur->byteEnd)
       return false;
 
-    out[idx] = bTok.substr(argStartB, aLen).str();
-    return SegmentPastedTokenArgsByFixedSlicesRec(aTok, bTok, spansAsc, idx + 1,
-                                                  nextPosA, argEndB, out);
+    StringRef gap =
+        aTok.substr(static_cast<size_t>(*cur->byteEnd),
+                    static_cast<size_t>(*next->byteBegin - *cur->byteEnd));
+    if (!gap.empty()) {
+      fixedAfter = gap;
+      break;
+    }
+
+    ++runEnd;
+    if (!spansAsc[runEnd]->byteEnd)
+      return false;
+    nextPosA = static_cast<size_t>(*spansAsc[runEnd]->byteEnd);
   }
 
-  // 6. Anchor Search: Find where the fixedAfter text appears in B
-  // We search starting at argStartB.
-  size_t k = bTok.find(fixedAfter, argStartB);
+  auto tryRun = [&](size_t runEndB) -> bool {
+    if (runEndB < runStartB || runEndB > bTok.size())
+      return false;
+
+    auto cert = buildAdjacentPasteRunInvertibilityCertificate(
+        aTok, bTok.substr(runStartB, runEndB - runStartB),
+        spansAsc.slice(idx, runEnd - idx + 1));
+    if (cert.kind == PasteRunInvertibilityKind::Unique &&
+        cert.derivedSegs.size() == runEnd - idx + 1) {
+      for (size_t i = 0; i < cert.derivedSegs.size(); ++i)
+        out[idx + i] = cert.derivedSegs[i];
+
+      return SegmentPastedTokenArgsByFixedSlicesRec(aTok, bTok, spansAsc,
+                                                    runEnd + 1, nextPosA,
+                                                    runEndB, out);
+    }
+
+    // Legacy single-span fallback: when the current run contains only one
+    // argument contribution, the fixed slices on either side already pin the
+    // segment boundary. The newer adjacent-run certificate is stricter, but
+    // some pure-paste cases (e.g. CONCAT-style token assembly) are still
+    // structurally invertible via this simpler anchor-based split.
+    if (runEnd == idx) {
+      out[idx] = bTok.substr(runStartB, runEndB - runStartB).str();
+      return SegmentPastedTokenArgsByFixedSlicesRec(aTok, bTok, spansAsc,
+                                                    idx + 1, nextPosA,
+                                                    runEndB, out);
+    }
+
+    return false;
+  };
+
+  // 5. Match the fixed anchor after the whole touching run. With no tail, the
+  // run consumes the remainder of the B token.
+  if (fixedAfter.empty())
+    return tryRun(bTok.size());
+
+  size_t k = bTok.find(fixedAfter, runStartB);
   while (k != StringRef::npos) {
-    // Current candidate for the argument content in B
-    out[idx] = bTok.substr(argStartB, k - argStartB).str();
-
-    // Recurse to see if this candidate allows the rest of the string to match
-    if (SegmentPastedTokenArgsByFixedSlicesRec(aTok, bTok, spansAsc, idx + 1,
-                                               nextPosA, k, out)) {
+    if (tryRun(k))
       return true;
-    }
-
-    // Backtrack: Find the next occurrence of the anchor
     k = bTok.find(fixedAfter, k + 1);
   }
 
@@ -3859,22 +4145,62 @@ StringRef RefoldEngine::DeriveNewPasteSegmentFromSpellingReplacement(
   // Example: base="foo_v1", oldSeg="foo_", new="bar_v1" -> returns "bar_"
   if (baseArg.starts_with(oldSeg)) {
     StringRef suffix = baseArg.substr(oldSeg.size());
-    if (!newArg.ends_with(suffix))
+    if (!newArg.ends_with(suffix)) {
+      // Special case: when the pasted segment is the macro-name token of a raw
+      // invocation argument used under ##, edits to the *invocation arguments*
+      // do not change the contributed pasted segment. For example:
+      //   baseArg = XCAT(pre_,int)
+      //   newArg  = XCAT(pre_,long)
+      //   oldSeg  = XCAT
+      // In that situation the spelled segment participating in ## remains the
+      // raw callee token "XCAT". Preserve the old segment rather than trying
+      // to derive it from the full invocation text.
+      size_t oldLParen = baseArg.find('(');
+      size_t newLParen = newArg.find('(');
+      if (oldLParen != StringRef::npos && newLParen != StringRef::npos &&
+          oldSeg == baseArg.substr(0, oldLParen) &&
+          oldSeg == newArg.substr(0, newLParen)) {
+        trace("macro/paste",
+              " derive newSeg special-case(raw callee token): baseArg='{0}' "
+              "newArg='{1}' oldSeg='{2}' -> '{3}'",
+              baseArg, newArg, oldSeg, oldSeg);
+        return oldSeg;
+      }
+      trace("macro/paste",
+            " derive newSeg prefix-case FAILED: baseArg='{0}' newArg='{1}' "
+            "oldSeg='{2}' suffix='{3}'",
+            baseArg, newArg, oldSeg, suffix);
       return StringRef();
+    }
 
     // Return the part of newArg that precedes the suffix.
-    return newArg.substr(0, newArg.size() - suffix.size());
+    StringRef result = newArg.substr(0, newArg.size() - suffix.size());
+    trace("macro/paste",
+          " derive newSeg prefix-case: baseArg='{0}' newArg='{1}' oldSeg='{2}' "
+          "suffix='{3}' -> '{4}'",
+          baseArg, newArg, oldSeg, suffix, result);
+    return result;
   }
 
   // Case 2: oldSeg is a suffix of baseArg.
   // Example: base="v1_foo", oldSeg="_foo", new="v1_bar" -> returns "_bar"
   if (baseArg.ends_with(oldSeg)) {
     StringRef prefix = baseArg.substr(0, baseArg.size() - oldSeg.size());
-    if (!newArg.starts_with(prefix))
+    if (!newArg.starts_with(prefix)) {
+      trace("macro/paste",
+            " derive newSeg suffix-case FAILED: baseArg='{0}' newArg='{1}' "
+            "oldSeg='{2}' prefix='{3}'",
+            baseArg, newArg, oldSeg, prefix);
       return StringRef();
+    }
 
     // Return the part of newArg that follows the prefix.
-    return newArg.substr(prefix.size());
+    StringRef result = newArg.substr(prefix.size());
+    trace("macro/paste",
+          " derive newSeg suffix-case: baseArg='{0}' newArg='{1}' oldSeg='{2}' "
+          "prefix='{3}' -> '{4}'",
+          baseArg, newArg, oldSeg, prefix, result);
+    return result;
   }
 
   return StringRef();
@@ -3940,6 +4266,23 @@ bool RefoldEngine::PasteArgReplacementsMatchAllPasteTokensInB(
     baseArgByIdx[argIdx] = rawArg.trim().str();
   }
 
+  // Build a per-arg set of PP-byte envelopes for *standard* occurrences of the
+  // current macro's formals. A paste span whose PP-byte envelope exactly
+  // matches one of these ranges is not a direct paste contribution of the
+  // current macro; it is a propagated nested-child paste inside a standard
+  // occurrence of this formal and must be validated at the child level rather
+  // than against the parent's raw arg replacement text.
+  DenseMap<uint32_t, SmallVector<std::pair<uint64_t, uint64_t>, 4>>
+      standardOccByteRangesByArg;
+  for (const auto &occ : m.argSpans) {
+    if (occ.kind != PPArgSpanKind::Standard || !occ.ppByteBegin ||
+        !occ.ppByteEnd)
+      continue;
+    standardOccByteRangesByArg[occ.argIdx].push_back(
+        {static_cast<uint64_t>(*occ.ppByteBegin),
+         static_cast<uint64_t>(*occ.ppByteEnd)});
+  }
+
   // Group paste spans by the specific pasted-token occurrence they contribute
   // to. The grouping key is the A token interval [beginTok,endTok) of the
   // pasted token. In practice, paste spans are expected to describe a single
@@ -3984,6 +4327,42 @@ bool RefoldEngine::PasteArgReplacementsMatchAllPasteTokensInB(
     std::string aTok = stripNL(SliceASource(beginTok, endTok));
     std::string bTok = stripNL(SliceBSource(bEnv->first, bEnv->second));
 
+    auto formatReplacementMap = [&]() -> std::string {
+      std::string out;
+      raw_string_ostream os(out);
+      os << "{";
+      bool first = true;
+      for (const auto &KV : replByArgIdx) {
+        if (!first)
+          os << ", ";
+        first = false;
+        os << KV.first << ":'" << KV.second << "'";
+      }
+      os << "}";
+      return os.str();
+    };
+
+    auto formatBaseArgMap = [&]() -> std::string {
+      std::string out;
+      raw_string_ostream os(out);
+      os << "{";
+      bool first = true;
+      for (const auto &KV : baseArgByIdx) {
+        if (!first)
+          os << ", ";
+        first = false;
+        os << KV.first << ":'" << KV.second << "'";
+      }
+      os << "}";
+      return os.str();
+    };
+
+    trace("macro/paste",
+          " validate pasted token: inv id={0} name={1} tokRange=[{2},{3}) "
+          "aTok='{4}' bTok='{5}' repls={6} baseArgs={7}",
+          m.id, m.name, beginTok, endTok, aTok, bTok,
+          formatReplacementMap(), formatBaseArgMap());
+
     // Paste spans for this token reference character slices inside the pasted
     // token spelling. Apply edits in descending byteBegin so earlier rewrites
     // do not shift later offsets.
@@ -4011,11 +4390,70 @@ bool RefoldEngine::PasteArgReplacementsMatchAllPasteTokensInB(
     // Start from the A token spelling and simulate the token-paste result after
     // applying the candidate arg replacements.
     std::string expected = aTok;
+    bool sawCurrentLevelDirectSpan = false;
     for (const auto &ps : spans) {
       // Only apply span updates for arguments that we are actively replacing.
       auto it = replByArgIdx.find(ps.argIdx);
       if (it == replByArgIdx.end())
         continue;
+
+      // If this paste span's PP-byte envelope exactly matches a *standard*
+      // occurrence of the same formal in the current macro expansion, this
+      // span is a propagated nested-child paste contributor rather than a
+      // direct paste contribution of the current macro itself. Validate those
+      // at the child level, not against the parent's raw arg replacement.
+      if (ps.ppByteBegin && ps.ppByteEnd) {
+        auto stdIt = standardOccByteRangesByArg.find(ps.argIdx);
+        if (stdIt != standardOccByteRangesByArg.end()) {
+          std::pair<uint64_t, uint64_t> spanBytes = {
+              static_cast<uint64_t>(*ps.ppByteBegin),
+              static_cast<uint64_t>(*ps.ppByteEnd)};
+          bool matchesStandardOcc = false;
+          for (const auto &r : stdIt->second) {
+            if (r == spanBytes) {
+              matchesStandardOcc = true;
+              break;
+            }
+          }
+          if (matchesStandardOcc) {
+            trace("macro/paste",
+                  " skip propagated child paste span at parent level: inv id={0} "
+                  "name={1} argIdx={2} tokRange=[{3},{4}) ppBytes=[{5},{6})",
+                  m.id, m.name, ps.argIdx, ps.begin, ps.end,
+                  static_cast<uint64_t>(*ps.ppByteBegin),
+                  static_cast<uint64_t>(*ps.ppByteEnd));
+            continue;
+          }
+          sawCurrentLevelDirectSpan = true;
+          trace("macro/paste",
+                " parent-level paste span NOT skipped: inv id={0} name={1} "
+                "argIdx={2} tokRange=[{3},{4}) ppBytes=[{5},{6}) stdOccCount={7}",
+                m.id, m.name, ps.argIdx, ps.begin, ps.end,
+                static_cast<uint64_t>(*ps.ppByteBegin),
+                static_cast<uint64_t>(*ps.ppByteEnd),
+                static_cast<unsigned>(stdIt->second.size()));
+          for (const auto &r : stdIt->second) {
+            trace("macro/paste",
+                  "  standard occurrence bytes for argIdx={0}: [{1},{2})",
+                  ps.argIdx, r.first, r.second);
+          }
+        } else {
+          sawCurrentLevelDirectSpan = true;
+          trace("macro/paste",
+                " parent-level paste span has no standard occurrence bytes: inv id={0} "
+                "name={1} argIdx={2} tokRange=[{3},{4}) ppBytes=[{5},{6})",
+                m.id, m.name, ps.argIdx, ps.begin, ps.end,
+                static_cast<uint64_t>(*ps.ppByteBegin),
+                static_cast<uint64_t>(*ps.ppByteEnd));
+        }
+      } else {
+        sawCurrentLevelDirectSpan = true;
+        trace("macro/paste",
+              " parent-level paste span missing pp-byte envelope: inv id={0} "
+              "name={1} argIdx={2} tokRange=[{3},{4})",
+              m.id, m.name, ps.argIdx, ps.begin, ps.end);
+      }
+
       StringRef newArg = it->second;
 
       // The segment derivation also needs the original spelling of the
@@ -4065,8 +4503,10 @@ bool RefoldEngine::PasteArgReplacementsMatchAllPasteTokensInB(
         } else {
           trace("macro/paste",
                 " paste newSeg derivation FAILED argIdx={0} oldSeg='{1}' "
-                "baseArg='{2}' newArg='{3}'",
-                argIdx, oldTrim, baseTrim, newTrim);
+                "baseArg='{2}' newArg='{3}' ppTokRange=[{4},{5}) spanBytes=[{6},{7})",
+                argIdx, oldTrim, baseTrim, newTrim, ps.begin, ps.end,
+                ps.ppByteBegin ? static_cast<uint64_t>(*ps.ppByteBegin) : 0ULL,
+                ps.ppByteEnd ? static_cast<uint64_t>(*ps.ppByteEnd) : 0ULL);
           return false;
         }
       }
@@ -4076,8 +4516,40 @@ bool RefoldEngine::PasteArgReplacementsMatchAllPasteTokensInB(
       expected = stringutils::replaceRange(expected, b, e, newSeg);
     }
 
-    if (expected != bTok)
+    // If every span for this token was filtered out as a propagated child
+    // contribution, then this token has no direct current-macro paste work to
+    // validate at this level. The child invocation is responsible for it.
+    if (!sawCurrentLevelDirectSpan) {
+      trace("macro/paste",
+            " pasted token fully delegated to child level: inv id={0} name={1} "
+            "tokRange=[{2},{3}) expected='{4}' actual='{5}'",
+            m.id, m.name, beginTok, endTok, expected, bTok);
+      continue;
+    }
+
+    if (expected != bTok) {
+      trace("macro/paste",
+            " pasted-token mismatch: inv id={0} name={1} tokRange=[{2},{3}) "
+            "expected='{4}' actual='{5}' rewrittenArgCount={6}",
+            m.id, m.name, beginTok, endTok, expected, bTok,
+            static_cast<unsigned>(replByArgIdx.size()));
+      for (const auto &ps : spans) {
+        trace("macro/paste",
+              "  mismatch span detail: argIdx={0} tokRange=[{1},{2}) byteRange=[{3},{4}) ppBytes=[{5},{6}) kind={7}",
+              ps.argIdx, ps.begin, ps.end,
+              ps.byteBegin ? static_cast<uint32_t>(*ps.byteBegin) : 0U,
+              ps.byteEnd ? static_cast<uint32_t>(*ps.byteEnd) : 0U,
+              ps.ppByteBegin ? static_cast<uint64_t>(*ps.ppByteBegin) : 0ULL,
+              ps.ppByteEnd ? static_cast<uint64_t>(*ps.ppByteEnd) : 0ULL,
+              static_cast<unsigned>(ps.kind));
+      }
       return false;
+    }
+
+    trace("macro/paste",
+          " pasted-token match: inv id={0} name={1} tokRange=[{2},{3}) "
+          "expected='{4}' actual='{5}'",
+          m.id, m.name, beginTok, endTok, expected, bTok);
   }
 
   return true;
@@ -4320,6 +4792,14 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
   // from exact occurrence boundaries and exact mapped B-envelope adjacency.
   const diffutils::Hunk tokenHunks[] = {hArgs};
 
+  if (!HasLiteralMacroCalleeOrigin(m)) {
+    trace("macro/args",
+          "args-only disabled: non-literal callee origin kind={0} inv id={1} "
+          "name={2}",
+          ::clang::refold::toString(m.calleeOrigin.kind), m.id, m.name);
+    return std::nullopt;
+  }
+
   trace("macro/args", "args-only? inv id={0} name={1} {2} baseInv={3}", m.id,
         m.name, h, stringutils::showWSWithClip(baseInvText, 200));
 
@@ -4546,16 +5026,133 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
 
   trace("macro/args", "  occs={0}",
         PPArgSpanListToString(occs, occIsStringify));
+
+  // Pure paste-only invocations have no STANDARD or STRINGIFY evidence, so the
+  // normal args-only path bottoms out at occs.empty(). They are still
+  // invertible when the touched pasted token can be segmented back into unique
+  // per-argument replacements and those replacements reconstruct every pasted
+  // token occurrence in B.
+  if (occs.empty() && !m.pasteSpans.empty()) {
+    trace("macro/args",
+          "  pure-paste-only fallback: inv id={0} name={1} pasteSpans={2}",
+          m.id, m.name, m.pasteSpans.size());
+
+    auto edits = DerivePasteArgEdits(m, hArgs);
+    if (!edits || edits->empty()) {
+      trace("macro/args",
+            "    pure-paste-only: no derivable paste edits for current hunk");
+      return std::nullopt;
+    }
+
+    DenseMap<uint32_t, std::string> replByArgIdx;
+    for (const auto &pae : *edits) {
+      const uint32_t argIdx = pae.argIdx;
+      if (static_cast<size_t>(argIdx) >= invArgRanges.size()) {
+        trace("macro/args",
+              "    pure-paste-only: argIdx {0} out of range ({1})", argIdx,
+              invArgRanges.size());
+        return std::nullopt;
+      }
+
+      auto range = invArgRanges[argIdx];
+      StringRef baseArgText =
+          baseInvText.substr(range.first, range.second - range.first);
+      std::string newArg = SplicePasteSegmentIntoSpellingArg(
+          baseArgText, pae.oldSeg, pae.newSeg);
+      if (newArg.empty()) {
+        if (!(StringRef(pae.newSeg).trim().empty() &&
+              baseArgText.trim() == StringRef(pae.oldSeg).trim())) {
+          trace("macro/args",
+                "    pure-paste-only: splice failed argIdx={0} baseArg='{1}' "
+                "oldSeg='{2}' newSeg='{3}'",
+                argIdx, stringutils::showWSWithClip(baseArgText, 120),
+                stringutils::showWSWithClip(pae.oldSeg, 120),
+                stringutils::showWSWithClip(pae.newSeg, 120));
+          return std::nullopt;
+        }
+      }
+
+      if (!isVariadicFormal(argIdx) && hasTopLevelComma(newArg)) {
+        trace("macro/args",
+              "    pure-paste-only: argIdx={0} replacement introduces "
+              "top-level comma: '{1}'",
+              argIdx, stringutils::showWSWithClip(newArg, 120));
+        return std::nullopt;
+      }
+
+      auto existing = replByArgIdx.find(argIdx);
+      if (existing != replByArgIdx.end()) {
+        if (existing->second != newArg) {
+          trace("macro/args",
+                "    pure-paste-only: conflicting replacements for argIdx={0} "
+                "'{1}' vs '{2}'",
+                argIdx, stringutils::showWSWithClip(existing->second, 120),
+                stringutils::showWSWithClip(newArg, 120));
+          return std::nullopt;
+        }
+        continue;
+      }
+
+      replByArgIdx[argIdx] = std::move(newArg);
+    }
+
+    if (replByArgIdx.empty()) {
+      trace("macro/args",
+            "    pure-paste-only: derived edits were all no-ops after merge");
+      return std::nullopt;
+    }
+
+    if (!PasteArgReplacementsMatchAllPasteTokensInB(
+            m, baseInvText, invArgRanges, replByArgIdx)) {
+      trace("macro/args",
+            "    pure-paste-only: combined paste-token validation failed");
+      return std::nullopt;
+    }
+
+    std::string newInv = baseInvText.str();
+    auto keys = llvm::to_vector<8>(
+        llvm::map_range(replByArgIdx, [](auto &e) { return e.first; }));
+    std::sort(keys.begin(), keys.end(), [&](uint32_t a, uint32_t b) {
+      return invArgRanges[a].first > invArgRanges[b].first;
+    });
+
+    for (uint32_t argIdx : keys) {
+      auto r = invArgRanges[argIdx];
+      newInv = stringutils::replaceRange(newInv, r.first, r.second,
+                                         replByArgIdx[argIdx]);
+    }
+
+    trace("macro/args", "    pure-paste-only SUCCESS newInv='{0}'",
+          stringutils::showWSWithClip(newInv, 200));
+    return MacroPatch{*m.invB, *m.invE, std::move(newInv), 0};
+  }
+
   if (occs.empty())
     return std::nullopt;
 
-  std::vector<char> touched(occs.size(), 0);
-  if (!HunkFullyWithinArgSpans(hArgs, occs, touched)) {
+  std::vector<char> touchedOcc(occs.size(), 0);
+  if (!HunkFullyWithinArgSpans(hArgs, occs, touchedOcc)) {
     trace("macro/args",
           "  hunk not fully within any arg spans -> fail args-only");
     return std::nullopt;
   }
 
+  unsigned occFormalCount = static_cast<unsigned>(invArgRanges.size());
+  for (const auto &sp : occs)
+    occFormalCount = std::max(occFormalCount, (unsigned)sp.argIdx + 1);
+
+  std::vector<char> touched(occFormalCount, 0);
+  for (size_t i = 0; i < occs.size(); ++i) {
+    if (!touchedOcc[i])
+      continue;
+    const auto &sp = occs[i];
+    if (sp.argIdx >= touched.size())
+      return std::nullopt;
+    touched[sp.argIdx] = 1;
+  }
+
+  trace("macro/args", "  touchedOcc={0}",
+        stringutils::boolArrayToString(touchedOcc));
   trace("macro/args", "  touched={0}", stringutils::boolArrayToString(touched));
 
   // Compute argument replacements implied by each touched occurrence. Multiple
@@ -4563,11 +5160,11 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
   // otherwise the macro cannot be refolded args-only.
   DenseMap<uint32_t, std::string> replByArgIdx;
   for (size_t i = 0; i < occs.size(); ++i) {
-    if (!touched[i])
-      continue;
-
     const auto &sp = occs[i];
     uint32_t argIdx = sp.argIdx;
+    if (argIdx >= touched.size() || !touched[argIdx])
+      continue;
+
     if (static_cast<size_t>(argIdx) >= invArgRanges.size())
       return std::nullopt;
 
@@ -4630,7 +5227,21 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       auto un = UnstringifyLiteralToArgText(bSlice, isVariadicFormal(argIdx));
       if (!un)
         return std::nullopt;
-      newArg = std::move(*un);
+
+      auto canon = CanonicalizeStringifyInversePayload(*un);
+      if (!canon || StringRef(*canon).trim() != StringRef(*un).trim()) {
+        trace("macro/args",
+              "    stringify inverse ambiguous for argIdx={0} payload='{1}'",
+              argIdx, stringutils::showWSWithClip(*un, 200));
+        return std::nullopt;
+      }
+
+      // The decoded payload itself still has to be canonical, but the source
+      // spelling of the original argument does not. This preserves valid
+      // refolds such as S(a /*c*/ + b) -> S(a - b), where comments/spacing in
+      // the original raw argument should not block reconstruction from a
+      // canonical stringified payload.
+      newArg = std::move(*canon);
     }
 
     // Optional lift/paste rewrite: when an argument participates in token
@@ -4823,6 +5434,8 @@ bool RefoldEngine::HunkFullyWithinArgSpans(
   // Pure insertions are attributed only from exact occurrence structure.
   if (a0 == a1) {
     if (auto owner = FindExactOwningArgSpanForPureInsertion(a0, argSpans)) {
+      if (*owner >= touched.size())
+        return false;
       touched[*owner] = 1;
       return true;
     }
@@ -4844,7 +5457,8 @@ bool RefoldEngine::HunkFullyWithinArgSpans(
     for (size_t i = 0; i < argSpans.size(); ++i) {
       const auto &s = argSpans[i];
       if (a >= s.begin && a < s.end) {
-        touched[i] = 1;
+        if (i < touched.size())
+          touched[i] = 1;
         inSome = true;
         any = true;
       }
@@ -4854,7 +5468,8 @@ bool RefoldEngine::HunkFullyWithinArgSpans(
       for (size_t i = 0; i < argSpans.size(); ++i) {
         const auto &s = argSpans[i];
         if (s.begin == a + 1) {
-          touched[i] = 1;
+          if (i < touched.size())
+            touched[i] = 1;
           inSome = true;
           any = true;
           break;
@@ -5166,6 +5781,50 @@ RefoldEngine::MapAByteRangeToBTokenEnvelope(size_t aByteBegin,
     bTokEnd = bTokBegin;
 
   return {bTokBegin, bTokEnd};
+}
+
+std::pair<size_t, size_t>
+RefoldEngine::MapAByteRangeToBTokenEnvelopePreserveBoundaryInsertions(
+    size_t aByteBegin, size_t aByteEnd) const {
+  if (aByteEnd < aByteBegin)
+    aByteEnd = aByteBegin;
+
+  size_t bByteBegin = MapAByteToBByteLowerBound(aByteBegin);
+  size_t bByteEnd = MapAByteToBByteUpperBound(aByteEnd);
+
+  if (bByteEnd < bByteBegin)
+    bByteEnd = bByteBegin;
+  if (bByteEnd > bSource_.size())
+    bByteEnd = bSource_.size();
+
+  size_t bTokBegin = BTokIndexFloor(bByteBegin);
+  size_t bTokEnd = BTokIndexCeil(bByteEnd);
+  if (bTokEnd < bTokBegin)
+    bTokEnd = bTokBegin;
+
+  return {bTokBegin, bTokEnd};
+}
+
+std::optional<std::pair<size_t, size_t>>
+RefoldEngine::MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
+    uint64_t beginTok, uint64_t endTok) const {
+  const uint64_t nA = static_cast<uint64_t>(aToks_.size());
+  if (nA == 0 || aTokOff_.empty())
+    return std::nullopt;
+
+  beginTok = std::clamp(beginTok, static_cast<uint64_t>(0), nA);
+  endTok = std::clamp(endTok, beginTok, nA);
+  if (endTok <= beginTok)
+    return std::nullopt;
+
+  size_t idxEnd = static_cast<size_t>(endTok);
+  if (idxEnd >= aTokOff_.size())
+    return std::nullopt;
+
+  const size_t aByteBegin = aTokOff_[static_cast<size_t>(beginTok)];
+  const size_t aByteEnd = aTokOff_[idxEnd];
+  return MapAByteRangeToBTokenEnvelopePreserveBoundaryInsertions(aByteBegin,
+                                                                 aByteEnd);
 }
 
 std::optional<std::pair<size_t, size_t>>
@@ -5572,6 +6231,57 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
     return false;
   };
 
+  auto isEditedInvocationOutput =
+      [&](const RefoldModel::MacroInvocation &m) -> bool {
+    auto spanEdited = [&](uint64_t lo, uint64_t hi) -> bool {
+      for (uint64_t ai = lo; ai < hi; ++ai) {
+        if (static_cast<size_t>(ai) >= a2b.size() ||
+            static_cast<size_t>(ai) >= aToks_.size())
+          return true;
+        const int64_t bj = a2b[static_cast<size_t>(ai)];
+        if (bj < 0 || static_cast<size_t>(bj) >= bToks_.size())
+          return true;
+        if (aToks_[static_cast<size_t>(ai)].spelling !=
+            bToks_[static_cast<size_t>(bj)].spelling)
+          return true;
+      }
+      return false;
+    };
+
+    // Compare the emitted output segments directly when the producer recorded
+    // them. Do not collapse discontiguous bodySpans into one merged envelope:
+    // the holes between body spans are caller-formal substitution sites, and
+    // edits to those sites must not be misclassified as edits to an embedded
+    // __COUNTER__ occurrence.
+    if (!m.bodySpans.empty()) {
+      for (const auto &s : m.bodySpans) {
+        if (s.begin < s.end && spanEdited(s.begin, s.end))
+          return true;
+      }
+      return false;
+    }
+
+    if (!m.spans.empty()) {
+      for (const auto &s : m.spans) {
+        if (s.begin < s.end) {
+          if (spanEdited(s.begin, s.end))
+            return true;
+          continue;
+        }
+        if (s.begin == s.end && s.begin < aToks_.size()) {
+          if (spanEdited(s.begin, s.begin + 1))
+            return true;
+        }
+      }
+      return false;
+    }
+
+    if (m.cover.IsValid() && m.cover.end > m.cover.begin)
+      return spanEdited(m.cover.begin, m.cover.end);
+
+    return false;
+  };
+
   int firstEditedIdx = -1;
   for (size_t i = 0; i < filtered.size(); ++i) {
     if (isEditedOcc(filtered[i])) {
@@ -5674,7 +6384,7 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
 
       int idx = -1;
       for (size_t i = 0; i < lifted.size(); ++i) {
-        if (isEditedOcc(lifted[i])) {
+        if (isEditedInvocationOutput(*lifted[i].m)) {
           idx = static_cast<int>(i);
           break;
         }
@@ -5829,18 +6539,22 @@ RefoldEngine::ComputeForcedCounterPatchesFromExpandedMacros(
     return A.m->id < B.m->id;
   });
 
-  auto hasExpandedPatchForRoot = [&](const RefoldModel::MacroInvocation &root)
+  auto hasExpandedPatchFor = [&](const RefoldModel::MacroInvocation &root)
       -> bool {
-    if (!root.invB || !root.invE)
+    const auto oit = macroPatchByOwnerByMacroId.find(root.ownerIncludeId);
+    if (oit == macroPatchByOwnerByMacroId.end())
       return false;
-    auto outerIt = macroPatchByOwnerByMacroId.find(root.ownerIncludeId);
-    if (outerIt == macroPatchByOwnerByMacroId.end())
+
+    const auto invStart = root.invB;
+    const auto invEnd = root.invE;
+    if (!invStart || !invEnd)
       return false;
-    for (const auto &kv : outerIt->second) {
+
+    for (const auto &kv : oit->second) {
       const MacroPatch &p = kv.second;
-      if (p.invStart != *root.invB || p.invEnd != *root.invE)
+      if (p.invStart != *invStart || p.invEnd != *invEnd)
         continue;
-      if (!InvocationSpanMatchesCallsitePrefix(p.replacement, root))
+      if (MacroPatchRemainsExpanded(p))
         return true;
     }
     return false;
@@ -5853,13 +6567,8 @@ RefoldEngine::ComputeForcedCounterPatchesFromExpandedMacros(
                                        filtered[i].ownerInc);
     if (!root || IsInvocationInsideDefineDirective(*root))
       continue;
-    if (hasExpandedPatchForRoot(*root)) {
+    if (hasExpandedPatchFor(*root)) {
       firstExpandedIdx = static_cast<int>(i);
-      trace("counter",
-            "__COUNTER__: expanded-root detection found firstExpandedIdx={0} "
-            "at A=[{1},{2}) root='{3}'",
-            firstExpandedIdx, filtered[i].aStart, filtered[i].aEnd,
-            root->name);
       break;
     }
   }
@@ -5869,7 +6578,6 @@ RefoldEngine::ComputeForcedCounterPatchesFromExpandedMacros(
 
   SmallVector<ForcedMacroPatchRequest, 32> forced;
   llvm::DenseSet<llvm::hash_code> seen;
-
   for (const Occ &o : llvm::drop_begin(filtered, firstExpandedIdx)) {
     const auto *root =
         SmallestCoveringPatchableMacro(o.aStart, o.aEnd, o.ownerInc);
@@ -5886,19 +6594,20 @@ RefoldEngine::ComputeForcedCounterPatchesFromExpandedMacros(
       continue;
 
     forced.push_back({root, o.aStart, o.aEnd});
-
     trace("counter",
-          "__COUNTER__: force-from-expanded root id={0} name='{1}' "
-          "ownerInc={2} inv=[{3},{4}) for occ A=[{5},{6})",
-          root->id, root->name, root->ownerIncludeId, *invStart, *invEnd,
-          o.aStart, o.aEnd);
+          "__COUNTER__: expanded-macro stabilization firstExpandedIdx={0} "
+          "force root id={1} name='{2}' ownerInc={3} inv=[{4},{5}) for occ "
+          "A=[{6},{7})",
+          firstExpandedIdx, root->id, root->name, root->ownerIncludeId,
+          *invStart, *invEnd, o.aStart, o.aEnd);
   }
 
   return forced;
 }
 
-std::optional<std::string>
-RefoldEngine::BuildWholeCoverReplacementText(
+
+std::optional<std::pair<uint64_t, uint64_t>>
+RefoldEngine::GetWholeCoverATokRange(
     const RefoldModel::MacroInvocation &m) const {
   uint64_t covLoA = m.cover.begin;
   uint64_t covHiA = m.cover.end;
@@ -5924,8 +6633,72 @@ RefoldEngine::BuildWholeCoverReplacementText(
 
   if (covLoA >= covHiA)
     return std::nullopt;
+  return std::make_pair(covLoA, covHiA);
+}
 
-  auto bEnv = MapATokRangeAToBTokenEnvelopeWholeCover(covLoA, covHiA);
+bool RefoldEngine::MacroWholeCoverIsSelfContained(
+    const RefoldModel::MacroInvocation &m) const {
+  auto range = GetWholeCoverATokRange(m);
+  if (!range)
+    return false;
+  const uint64_t covLoA = range->first;
+  const uint64_t covHiA = range->second;
+
+  SmallVector<std::pair<uint64_t, uint64_t>, 16> spans;
+  auto appendIntersecting = [&](auto &&src) {
+    for (const auto &sp : src) {
+      uint64_t b = std::max<uint64_t>(covLoA, sp.begin);
+      uint64_t e = std::min<uint64_t>(covHiA, sp.end);
+      if (b < e)
+        spans.emplace_back(b, e);
+    }
+  };
+
+  appendIntersecting(m.bodySpans);
+  appendIntersecting(m.argSpans);
+  appendIntersecting(m.stringifySpans);
+  appendIntersecting(m.pasteSpans);
+
+  if (spans.empty())
+    return false;
+
+  llvm::sort(spans, [](const auto &a, const auto &b) {
+    if (a.first != b.first)
+      return a.first < b.first;
+    return a.second < b.second;
+  });
+
+  uint64_t cur = covLoA;
+  for (const auto &sp : spans) {
+    if (sp.second <= cur)
+      continue;
+    if (sp.first > cur)
+      return false;
+    cur = std::max(cur, sp.second);
+    if (cur >= covHiA)
+      return true;
+  }
+  return cur >= covHiA;
+}
+
+std::optional<std::string>
+RefoldEngine::BuildWholeCoverReplacementText(
+    const RefoldModel::MacroInvocation &m) const {
+  auto range = GetWholeCoverATokRange(m);
+  if (!range)
+    return std::nullopt;
+  uint64_t covLoA = range->first;
+  uint64_t covHiA = range->second;
+
+  if (!MacroWholeCoverIsSelfContained(m)) {
+    trace("macro/whole",
+          "whole-cover rejected inv id={0} name='{1}': non-self-contained cover=[{2},{3})",
+          m.id, m.name, covLoA, covHiA);
+    return std::nullopt;
+  }
+
+  auto bEnv = MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
+      covLoA, covHiA);
   if (!bEnv)
     return std::nullopt;
 
@@ -6221,6 +6994,111 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   // 1) Prefer args-only patching when safe and fully validated. Treat normal
   //    arg spans, stringify spans, and paste spans as "argument-like"
   //    occurrences.
+
+  auto isVariadicFormalInInvocation =
+      [&](const RefoldModel::MacroInvocation &inv, uint32_t idx) -> bool {
+    return idx < inv.defParams.size() && inv.defParams[idx].variadic;
+  };
+
+  auto hasTopLevelCommaInRefoldText = [&](StringRef s) -> bool {
+    int paren = 0, bracket = 0, brace = 0;
+    bool inStr = false, inChr = false, esc = false;
+    for (size_t i = 0; i < s.size(); ++i) {
+      char c = s[i];
+
+      if (inStr) {
+        if (esc) {
+          esc = false;
+          continue;
+        }
+        if (c == '\\') {
+          esc = true;
+          continue;
+        }
+        if (c == '"')
+          inStr = false;
+        continue;
+      }
+      if (inChr) {
+        if (esc) {
+          esc = false;
+          continue;
+        }
+        if (c == '\\') {
+          esc = true;
+          continue;
+        }
+        if (c == '\'')
+          inChr = false;
+        continue;
+      }
+
+      if (c == '/' && i + 1 < s.size()) {
+        if (s[i + 1] == '/') {
+          i += 2;
+          while (i < s.size() && s[i] != '\n')
+            ++i;
+          continue;
+        }
+        if (s[i + 1] == '*') {
+          i += 2;
+          while (i + 1 < s.size() && !(s[i] == '*' && s[i + 1] == '/'))
+            ++i;
+          if (i + 1 < s.size())
+            ++i;
+          continue;
+        }
+      }
+
+      if (c == '"') {
+        inStr = true;
+        continue;
+      }
+      if (c == '\'') {
+        inChr = true;
+        continue;
+      }
+      switch (c) {
+      case '(':
+        ++paren;
+        break;
+      case ')':
+        if (paren > 0)
+          --paren;
+        break;
+      case '[':
+        ++bracket;
+        break;
+      case ']':
+        if (bracket > 0)
+          --bracket;
+        break;
+      case '{':
+        ++brace;
+        break;
+      case '}':
+        if (brace > 0)
+          --brace;
+        break;
+      case ',':
+        if (paren == 0 && bracket == 0 && brace == 0)
+          return true;
+        break;
+      default:
+        break;
+      }
+    }
+    return false;
+  };
+
+  // Important arbitration rule: a direct root args-only patch is not returned
+  // immediately. We let the DAG-chained certificate path run afterwards and
+  // prefer it when it can produce a unique validated callsite rewrite, because
+  // that path can preserve deeper nested macro structure that a direct root
+  // argument rewrite would flatten.
+  std::optional<MacroPatch> argsOnlyCandidate;
+  bool reuseExistingCallsitePatch = false;
+
   SmallVector<RefoldModel::PPArgSpan, 16> argLikeSpans;
   argLikeSpans.append(m.argSpans.begin(), m.argSpans.end());
   argLikeSpans.append(m.stringifySpans.begin(), m.stringifySpans.end());
@@ -6238,21 +7116,20 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             : (m.invText ? StringRef(*m.invText) : StringRef(""));
     if (InvocationSpanMatchesCallsitePrefix(invSpanText, m)) {
       // First try to patch arguments in-place. If that can't satisfy the
-      // edit, we may fall back to whole-cover replacement below.
-      auto argsOnly = BuildMacroInvocationPatchArgsOnly(m, hEff, baseInvText);
-      if (argsOnly)
-        return *argsOnly;
-      trace("instr/macro",
-            "args-only: FAIL macro id={0} name='{1}' hunkA=[{2},{3}) "
-            "hunkB=[{4},{5}) (see [trace][macro/args])",
-            m.id, m.name, hEff.aStart, hEff.aEnd, hEff.bStart, hEff.bEnd);
-      // If we already have a callsite patch and args-only yields no replacement
-      // for the trimmed hunk, then the edit is already satisfied by the current
-      // callsite text. Do not fall back to whole-cover expansion.
-      if (existingPatch && existingIsCallsite && !baseInvText.empty()) {
-        trace("macro", "callsite patch reused (args-only no-op) inv id={0}",
-              m.id);
-        return *existingPatch;
+      // edit, we may still be able to preserve more structure via DAG lifting
+      // below, so keep the candidate around instead of returning immediately.
+      argsOnlyCandidate = BuildMacroInvocationPatchArgsOnly(m, hEff, baseInvText);
+      if (!argsOnlyCandidate) {
+        trace("instr/macro",
+              "args-only: FAIL macro id={0} name='{1}' hunkA=[{2},{3}) "
+              "hunkB=[{4},{5}) (see [trace][macro/args])",
+              m.id, m.name, hEff.aStart, hEff.aEnd, hEff.bStart, hEff.bEnd);
+        // If we already have a callsite patch and args-only yields no
+        // replacement for the trimmed hunk, then the edit is already satisfied
+        // by the current callsite text. Defer reusing it until after DAG
+        // chaining has had a chance to preserve deeper structure.
+        reuseExistingCallsitePatch =
+            existingPatch && existingIsCallsite && !baseInvText.empty();
       }
     }
   }
@@ -6263,14 +7140,15 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   //     to this callsite's arguments.
   //
   // Policy:
-  //   * Only lift through single-dependency edges (callee arg depends on
-  //     exactly one caller formal) until the final hop.
-  //   * Allow a multi-parent dependency only at the final hop, and only when
-  //     it depends on exactly two caller formals.
-  //   * Split the replacement text between the two caller formals only when
-  //     it matches the concatenation of the *current* caller argument texts
-  //     (by byte length).
-  if (!ForceWholeCoverMacros() && m.subkind == "func") {
+  //   * Every intermediate hop must be proven by arg_refs/template inversion.
+  //   * A hop is allowed whenever the child argument text admits a unique
+  //     inverse through arg_refs back to the contributing caller formals.
+  //   * If the inverse is ambiguous, unsupported, or does not match the
+  //     observed text, lifting fails and we conservatively keep the subtree
+  //     expanded.
+  if (!ForceWholeCoverMacros() && m.subkind == "func" &&
+      HasLiteralMacroCalleeOrigin(m)) {
+    bool directRootPreservationInadmissible = false;
     auto tryDAGChainedArgsOnly = [&]() -> std::optional<MacroPatch> {
       // --- Phase 0: Preconditions / root invocation parsing ------------------
       //
@@ -6358,6 +7236,23 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           p = it->second->callerMacroId;
         }
         return std::nullopt;
+      };
+
+      auto pathHasOnlyLiteralCallees =
+          [&](const RefoldModel::MacroInvocation &cand) -> bool {
+        const RefoldModel::MacroInvocation *cur = &cand;
+        for (;;) {
+          if (!HasLiteralMacroCalleeOrigin(*cur))
+            return false;
+          if (cur->id == m.id)
+            return true;
+          if (!cur->callerMacroId)
+            return false;
+          auto it = invById.find(*cur->callerMacroId);
+          if (it == invById.end())
+            return false;
+          cur = it->second;
+        }
       };
 
       // Collect all "argument-like" spans for an invocation:
@@ -6497,13 +7392,18 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         if (sp.kind == PPArgSpanKind::Paste && sp.byteBegin && sp.byteEnd &&
             raw.find('"') != StringRef::npos) {
           bool invArgHasQuote = false;
-          if (inv && inv->invText && sp.argIdx < inv->invArgRanges.size()) {
+          if (inv && inv->invText && inv->invB &&
+              sp.argIdx < inv->invArgRanges.size()) {
             const auto &rng = inv->invArgRanges[sp.argIdx];
             if (rng.first && rng.second && *rng.first <= *rng.second &&
-                *rng.second <= inv->invText->size()) {
-              StringRef invArg =
-                  StringRef(*inv->invText).slice(*rng.first, *rng.second);
-              invArgHasQuote = invArg.find('"') != StringRef::npos;
+                *rng.first >= *inv->invB) {
+              const uint64_t relB = *rng.first - *inv->invB;
+              const uint64_t relE = *rng.second - *inv->invB;
+              if (relE >= relB && relE <= inv->invText->size()) {
+                StringRef invArg =
+                    StringRef(*inv->invText).slice(relB, relE);
+                invArgHasQuote = invArg.find('"') != StringRef::npos;
+              }
             }
           }
           if (!invArgHasQuote) {
@@ -6544,18 +7444,58 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
       };
 
       SmallVector<LeafCandidate, 8> leafCands;
+      directRootPreservationInadmissible = false;
       for (const auto &cand : model_.GetMacroInvocations()) {
         // Only consider invocations that are descendants of the root m.
         auto d = depthToRoot(cand);
         if (!d || *d == 0)
           continue;
+        const bool hunkWithinCandCover =
+            cand.cover.begin <= h.aStart && h.aEnd <= cand.cover.end &&
+            cand.cover.begin < cand.cover.end;
+        if (!pathHasOnlyLiteralCallees(cand)) {
+          trace("macro/dag",
+                "skip leaf id={0} name='{1}': non-literal callee origin on "
+                "path to root id={2}",
+                cand.id, cand.name, m.id);
+          if (hunkWithinCandCover)
+            directRootPreservationInadmissible = true;
+          continue;
+        }
 
         // Candidate must have argument-like spans; otherwise there's nothing
         // concrete to map an edit to.
         SmallVector<RefoldModel::PPArgSpan, 8> candArgLike;
         gatherArgLike(cand, candArgLike);
-        if (candArgLike.empty())
+        // Filter out argument-like spans that are structurally invalid. A
+        // PPArgSpan is considered invalid if its token-range is empty or
+        // inverted, or if its begin/end values fall outside the range of
+        // available A-side tokens. Such spans can arise from producer
+        // propagation bugs or when a nested invocation was elided; using
+        // them would lead to bogus touched indices or out-of-bounds
+        // access. Skip them here to avoid crashes downstream (see
+        // similar_expansion_paths_ambiguity_path1_path2 regression).
+        SmallVector<RefoldModel::PPArgSpan, 8> validArgLike;
+        validArgLike.reserve(candArgLike.size());
+        const uint64_t maxATokCount = static_cast<uint64_t>(aToks_.size());
+        for (const auto &sp : candArgLike) {
+          if (sp.end <= sp.begin)
+            continue;
+          // ensure begin/end are within A-token bounds
+          if (sp.begin >= maxATokCount || sp.end > maxATokCount)
+            continue;
+          validArgLike.push_back(sp);
+        }
+        candArgLike.swap(validArgLike);
+        if (candArgLike.empty()) {
+          if (hunkWithinCandCover) {
+            trace("macro/dag",
+                  "skip leaf id={0} name='{1}': no argument-like spans for "
+                  "touched descendant under root id={2}",
+                  cand.id, cand.name, m.id);
+          }
           continue;
+        }
 
         // Determine how many formals this invocation "effectively" has, because
         // spans might reference argIdx beyond invArgRanges size.
@@ -6701,18 +7641,3524 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
       // --- Phase 3: Lift a leaf edit to the root invocation ------------------
       //
-      // Given a leaf invocation + formal index + (old->new) text at that leaf,
-      // walk up the caller chain using argDeps, translating "which formal is
-      // affected" at each level until we reach the root m.
+      // Generalized single-parent lifting uses the recorded arg_refs slices to
+      // invert a nested callee argument back to the caller's raw invocation
+      // argument text. In other words, we do not merely ask "which caller
+      // formal does this depend on?"; we reconstruct the child argument's
+      // template, substitute abstract caller-formal variables into that
+      // template, and require the observed old/new texts to match that
+      // template uniquely.
       //
-      // Supports:
-      //   * Single-parent dependencies at intermediate hops.
-      //   * Exactly-two-parent dependency at the final hop to the root, where
-      //     we split the new text between two root formals if (and only if)
-      //     the split is uniquely determined.
-      auto liftToRoot = [&](const RefoldModel::MacroInvocation &leaf,
-                            uint32_t leafArgIdx, StringRef leafOld,
-                            StringRef leafNew)
+      // This is strictly more general than the earlier direct-pass-through
+      // check. It accepts wrapper forms such as "((x), 10)" whenever the edit
+      // changes only the caller-derived part, but it still rejects any hop that
+      // cannot be proven by arg_refs (mixed body-owned edits, ambiguous
+      // repeated-variable splits, missing provenance, etc.).
+      //
+      // The template inverse is now expressed as an explicit invertibility
+      // certificate:
+      //   * Unique       -> each contributing caller formal has exactly one
+      //                     derived replacement string.
+      //   * NoMatch      -> the observed text does not fit the original
+      //                     arg_refs/literal template at all.
+      //   * Ambiguous    -> multiple distinct inverses exist.
+      //   * Unsupported  -> the template shape is outside the conservative
+      //                     solver bounds.
+      struct LocalArgRef {
+        uint32_t callerParamIndex;
+        uint32_t begin;
+        uint32_t end;
+      };
+
+      struct ArgRefTemplate {
+        std::string argText;
+        SmallVector<LocalArgRef, 4> refs;
+        SmallVector<uint32_t, 2> distinctCallerParams;
+      };
+
+      auto getInvocationArgText =
+          [&](const RefoldModel::MacroInvocation &inv,
+              uint32_t argIdx) -> std::optional<StringRef> {
+        if (!inv.invText || !inv.invB)
+          return std::nullopt;
+        if (argIdx >= inv.invArgRanges.size())
+          return std::nullopt;
+        const auto &rng = inv.invArgRanges[argIdx];
+        if (!rng.first || !rng.second || *rng.second < *rng.first ||
+            *rng.first < *inv.invB)
+          return std::nullopt;
+        const uint64_t relB = *rng.first - *inv.invB;
+        const uint64_t relE = *rng.second - *inv.invB;
+        if (relE < relB || relE > inv.invText->size())
+          return std::nullopt;
+        return StringRef(*inv.invText).slice((size_t)relB, (size_t)relE).trim();
+      };
+
+      auto buildArgRefTemplate =
+          [&](const RefoldModel::MacroInvocation &inv,
+              uint32_t argIdx) -> std::optional<ArgRefTemplate> {
+        if (!inv.invText || !inv.invB)
+          return std::nullopt;
+        if (argIdx >= inv.invArgRanges.size() || argIdx >= inv.argRefs.size())
+          return std::nullopt;
+
+        const auto &rng = inv.invArgRanges[argIdx];
+        if (!rng.first || !rng.second || *rng.second < *rng.first ||
+            *rng.first < *inv.invB)
+          return std::nullopt;
+
+        const uint64_t relB = *rng.first - *inv.invB;
+        const uint64_t relE = *rng.second - *inv.invB;
+        if (relE < relB || relE > inv.invText->size())
+          return std::nullopt;
+
+        StringRef rawArg =
+            StringRef(*inv.invText).slice((size_t)relB, (size_t)relE);
+
+        size_t trimLead = 0;
+        while (trimLead < rawArg.size() &&
+               std::isspace((unsigned char)rawArg[trimLead]))
+          ++trimLead;
+        size_t trimEnd = rawArg.size();
+        while (trimEnd > trimLead &&
+               std::isspace((unsigned char)rawArg[trimEnd - 1]))
+          --trimEnd;
+
+        ArgRefTemplate out;
+        out.argText = rawArg.slice(trimLead, trimEnd).str();
+
+        SmallVector<LocalArgRef, 4> refs;
+        refs.reserve(inv.argRefs[argIdx].size());
+        for (const auto &ref : inv.argRefs[argIdx]) {
+          if (ref.byteEnd < ref.byteBegin)
+            return std::nullopt;
+          if (ref.byteBegin < relB || ref.byteEnd > relE)
+            return std::nullopt;
+          const uint64_t localBAbs = ref.byteBegin - relB;
+          const uint64_t localEAbs = ref.byteEnd - relB;
+          if (localEAbs < localBAbs || localEAbs > rawArg.size())
+            return std::nullopt;
+          if (localBAbs < trimLead || localEAbs > trimEnd)
+            return std::nullopt;
+
+          refs.push_back(LocalArgRef{ref.callerParamIndex,
+                                     (uint32_t)(localBAbs - trimLead),
+                                     (uint32_t)(localEAbs - trimLead)});
+        }
+
+        llvm::sort(refs, [](const LocalArgRef &a, const LocalArgRef &b) {
+          if (a.begin != b.begin)
+            return a.begin < b.begin;
+          if (a.end != b.end)
+            return a.end < b.end;
+          return a.callerParamIndex < b.callerParamIndex;
+        });
+
+        uint32_t prevEnd = 0;
+        bool first = true;
+        for (const auto &ref : refs) {
+          if (ref.end < ref.begin || ref.end > out.argText.size())
+            return std::nullopt;
+          if (!first && ref.begin < prevEnd)
+            return std::nullopt;
+          prevEnd = ref.end;
+          first = false;
+          if (llvm::find(out.distinctCallerParams, ref.callerParamIndex) ==
+              out.distinctCallerParams.end())
+            out.distinctCallerParams.push_back(ref.callerParamIndex);
+        }
+
+        out.refs = std::move(refs);
+        return out;
+      };
+
+      auto sameIndexSet = [&](ArrayRef<uint32_t> a,
+                              ArrayRef<uint32_t> b) -> bool {
+        SmallVector<uint32_t, 4> sa(a.begin(), a.end());
+        SmallVector<uint32_t, 4> sb(b.begin(), b.end());
+        llvm::sort(sa);
+        llvm::sort(sb);
+        sa.erase(std::unique(sa.begin(), sa.end()), sa.end());
+        sb.erase(std::unique(sb.begin(), sb.end()), sb.end());
+        return sa == sb;
+      };
+
+      enum class ArgRefInvertibilityKind {
+        Unique,
+        NoMatch,
+        Ambiguous,
+        Unsupported,
+      };
+
+      struct ArgRefInvertibilityCertificate {
+        ArgRefInvertibilityKind kind = ArgRefInvertibilityKind::Unsupported;
+        DenseMap<uint32_t, std::string> derivedTextByCallerParam;
+      };
+
+      auto buildArgRefInvertibilityCertificate =
+          [&](const ArgRefTemplate &tpl,
+              StringRef observed) -> ArgRefInvertibilityCertificate {
+        ArgRefInvertibilityCertificate cert;
+
+        constexpr size_t MaxDistinctCallerParams = 8;
+        if (tpl.refs.empty() || tpl.distinctCallerParams.empty() ||
+            tpl.distinctCallerParams.size() > MaxDistinctCallerParams)
+          return cert;
+
+        SmallVector<StringRef, 8> literals;
+        SmallVector<unsigned, 8> varOrdinals;
+        literals.reserve(tpl.refs.size() + 1);
+        varOrdinals.reserve(tpl.refs.size());
+
+        size_t curPos = 0;
+        for (const auto &ref : tpl.refs) {
+          if (ref.begin < curPos || ref.end < ref.begin ||
+              ref.end > tpl.argText.size()) {
+            cert.kind = ArgRefInvertibilityKind::NoMatch;
+            return cert;
+          }
+          literals.push_back(StringRef(tpl.argText).slice(curPos, ref.begin));
+          auto it = llvm::find(tpl.distinctCallerParams, ref.callerParamIndex);
+          if (it == tpl.distinctCallerParams.end()) {
+            cert.kind = ArgRefInvertibilityKind::NoMatch;
+            return cert;
+          }
+          varOrdinals.push_back((unsigned)std::distance(
+              tpl.distinctCallerParams.begin(), it));
+          curPos = ref.end;
+        }
+        literals.push_back(StringRef(tpl.argText).drop_front(curPos));
+
+        StringRef obs = observed.trim();
+        SmallVector<std::optional<StringRef>, MaxDistinctCallerParams> assigns(
+            tpl.distinctCallerParams.size());
+        SmallVector<SmallVector<std::string, MaxDistinctCallerParams>, 2>
+            solutions;
+
+        auto addSolution = [&](ArrayRef<std::optional<StringRef>> A) {
+          SmallVector<std::string, MaxDistinctCallerParams> S;
+          S.reserve(tpl.distinctCallerParams.size());
+          for (size_t i = 0; i < tpl.distinctCallerParams.size(); ++i)
+            S.push_back(A[i] ? A[i]->str() : std::string());
+          for (const auto &Existing : solutions)
+            if (Existing == S)
+              return;
+          solutions.push_back(std::move(S));
+        };
+
+        auto dfs = [&](auto &&self, size_t refIdx, size_t obsPos) -> void {
+          if (solutions.size() > 1)
+            return;
+
+          const StringRef lit = literals[refIdx];
+          if (obsPos > obs.size() || !obs.drop_front(obsPos).starts_with(lit))
+            return;
+          obsPos += lit.size();
+
+          if (refIdx == varOrdinals.size()) {
+            if (obsPos == obs.size())
+              addSolution(assigns);
+            return;
+          }
+
+          const unsigned varOrd = varOrdinals[refIdx];
+          if (varOrd >= assigns.size())
+            return;
+
+          if (assigns[varOrd]) {
+            const StringRef val = *assigns[varOrd];
+            if (obsPos <= obs.size() && obs.drop_front(obsPos).starts_with(val))
+              self(self, refIdx + 1, obsPos + val.size());
+            return;
+          }
+
+          size_t minRemain = 0;
+          for (size_t j = refIdx + 1; j < literals.size(); ++j)
+            minRemain += literals[j].size();
+          for (size_t j = refIdx + 1; j < varOrdinals.size(); ++j) {
+            const unsigned laterOrd = varOrdinals[j];
+            if (laterOrd < assigns.size() && assigns[laterOrd])
+              minRemain += assigns[laterOrd]->size();
+          }
+          if (obsPos + minRemain > obs.size())
+            return;
+
+          const size_t maxLen = obs.size() - obsPos - minRemain;
+          const StringRef rest = obs.drop_front(obsPos);
+          const StringRef nextLit = literals[refIdx + 1];
+
+          auto tryLen = [&](size_t len) {
+            assigns[varOrd] = rest.take_front(len);
+            self(self, refIdx + 1, obsPos + len);
+            assigns[varOrd] = std::nullopt;
+          };
+
+          if (!nextLit.empty()) {
+            for (size_t searchPos = 0;; ++searchPos) {
+              const size_t pos = rest.find(nextLit, searchPos);
+              if (pos == StringRef::npos || pos > maxLen)
+                break;
+              tryLen(pos);
+              if (solutions.size() > 1)
+                return;
+            }
+          } else {
+            for (size_t len = 0; len <= maxLen; ++len) {
+              tryLen(len);
+              if (solutions.size() > 1)
+                return;
+            }
+          }
+        };
+
+        dfs(dfs, 0, 0);
+        if (solutions.empty()) {
+          cert.kind = ArgRefInvertibilityKind::NoMatch;
+          return cert;
+        }
+        if (solutions.size() > 1) {
+          cert.kind = ArgRefInvertibilityKind::Ambiguous;
+          return cert;
+        }
+
+        cert.kind = ArgRefInvertibilityKind::Unique;
+        for (unsigned i = 0; i < tpl.distinctCallerParams.size(); ++i)
+          cert.derivedTextByCallerParam[tpl.distinctCallerParams[i]] =
+              solutions[0][i];
+        return cert;
+      };
+
+      struct TrimmedArgInfo {
+        std::string text;
+        uint64_t absTrimBegin = 0;
+        uint64_t absTrimEnd = 0;
+      };
+
+      auto getTrimmedInvocationArgInfo =
+          [&](const RefoldModel::MacroInvocation &inv,
+              uint32_t argIdx) -> std::optional<TrimmedArgInfo> {
+        if (!inv.invText || !inv.invB)
+          return std::nullopt;
+        if (argIdx >= inv.invArgRanges.size())
+          return std::nullopt;
+        const auto &rng = inv.invArgRanges[argIdx];
+        if (!rng.first || !rng.second || *rng.second < *rng.first ||
+            *rng.first < *inv.invB)
+          return std::nullopt;
+
+        const uint64_t relB = *rng.first - *inv.invB;
+        const uint64_t relE = *rng.second - *inv.invB;
+        if (relE < relB || relE > inv.invText->size())
+          return std::nullopt;
+
+        StringRef raw = StringRef(*inv.invText).slice((size_t)relB, (size_t)relE);
+        size_t trimLead = 0;
+        while (trimLead < raw.size() &&
+               std::isspace((unsigned char)raw[trimLead]))
+          ++trimLead;
+        size_t trimEnd = raw.size();
+        while (trimEnd > trimLead &&
+               std::isspace((unsigned char)raw[trimEnd - 1]))
+          --trimEnd;
+
+        TrimmedArgInfo out;
+        out.text = raw.slice(trimLead, trimEnd).str();
+        out.absTrimBegin = *rng.first + trimLead;
+        out.absTrimEnd = *rng.first + trimEnd;
+        return out;
+      };
+
+      auto getInvocationCoverAText =
+          [&](const RefoldModel::MacroInvocation &inv) -> std::optional<std::string> {
+        uint64_t covLoA = inv.cover.begin;
+        uint64_t covHiA = inv.cover.end;
+        if (inv.subkind == "func" && inv.defParams.empty() && !inv.bodySpans.empty()) {
+          uint64_t lo = std::numeric_limits<uint64_t>::max();
+          uint64_t hi = 0;
+          for (const auto &s : inv.bodySpans) {
+            if (s.begin < s.end) {
+              lo = std::min(lo, s.begin);
+              hi = std::max(hi, s.end);
+            }
+          }
+          if (lo != std::numeric_limits<uint64_t>::max() && lo < hi) {
+            covLoA = lo;
+            covHiA = hi;
+          }
+        }
+        if (covLoA >= covHiA)
+          return std::nullopt;
+        return SliceASource(covLoA, covHiA).trim().str();
+      };
+
+      auto hasTopLevelCommaInRefoldText = [&](StringRef s) -> bool {
+        int paren = 0, bracket = 0, brace = 0;
+        bool inStr = false, inChr = false, esc = false;
+        for (size_t i = 0; i < s.size(); ++i) {
+          char c = s[i];
+
+          if (inStr) {
+            if (esc) {
+              esc = false;
+              continue;
+            }
+            if (c == '\\') {
+              esc = true;
+              continue;
+            }
+            if (c == '"')
+              inStr = false;
+            continue;
+          }
+          if (inChr) {
+            if (esc) {
+              esc = false;
+              continue;
+            }
+            if (c == '\\') {
+              esc = true;
+              continue;
+            }
+            if (c == '\'')
+              inChr = false;
+            continue;
+          }
+
+          if (c == '/' && i + 1 < s.size()) {
+            if (s[i + 1] == '/') {
+              i += 2;
+              while (i < s.size() && s[i] != '\n')
+                ++i;
+              continue;
+            }
+            if (s[i + 1] == '*') {
+              i += 2;
+              while (i + 1 < s.size() && !(s[i] == '*' && s[i + 1] == '/'))
+                ++i;
+              if (i + 1 < s.size())
+                ++i;
+              continue;
+            }
+          }
+
+          if (c == '"') {
+            inStr = true;
+            continue;
+          }
+          if (c == '\'') {
+            inChr = true;
+            continue;
+          }
+          switch (c) {
+          case '(':
+            ++paren;
+            break;
+          case ')':
+            if (paren > 0)
+              --paren;
+            break;
+          case '[':
+            ++bracket;
+            break;
+          case ']':
+            if (bracket > 0)
+              --bracket;
+            break;
+          case '{':
+            ++brace;
+            break;
+          case '}':
+            if (brace > 0)
+              --brace;
+            break;
+          case ',':
+            if (paren == 0 && bracket == 0 && brace == 0)
+              return true;
+            break;
+          default:
+            break;
+          }
+        }
+        return false;
+      };
+
+      auto isLikelyTokenBoundaryInRefoldText = [&](StringRef s,
+                                                  size_t pos) -> bool {
+        if (pos == 0 || pos >= s.size())
+          return true;
+        auto isIdentBody = [](char c) {
+          unsigned char uc = static_cast<unsigned char>(c);
+          return std::isalnum(uc) || c == '_';
+        };
+        return !(isIdentBody(s[pos - 1]) && isIdentBody(s[pos]));
+      };
+
+      auto enumerateTopLevelBalancedCutPoints =
+          [&](StringRef s, auto &&emitCut) {
+        int paren = 0, bracket = 0, brace = 0;
+        bool inStr = false, inChr = false, esc = false;
+        bool inLineComment = false, inBlockComment = false;
+
+        emitCut(0u);
+        for (size_t i = 0; i < s.size(); ++i) {
+          const char c = s[i];
+
+          if (inLineComment) {
+            if (c == '\n')
+              inLineComment = false;
+          } else if (inBlockComment) {
+            if (c == '*' && i + 1 < s.size() && s[i + 1] == '/') {
+              inBlockComment = false;
+              ++i;
+            }
+          } else if (inStr) {
+            if (esc) {
+              esc = false;
+            } else if (c == '\\') {
+              esc = true;
+            } else if (c == '"') {
+              inStr = false;
+            }
+          } else if (inChr) {
+            if (esc) {
+              esc = false;
+            } else if (c == '\\') {
+              esc = true;
+            } else if (c == '\'') {
+              inChr = false;
+            }
+          } else {
+            if (c == '/' && i + 1 < s.size()) {
+              if (s[i + 1] == '/') {
+                inLineComment = true;
+                ++i;
+                continue;
+              }
+              if (s[i + 1] == '*') {
+                inBlockComment = true;
+                ++i;
+                continue;
+              }
+            }
+
+            if (c == '"') {
+              inStr = true;
+            } else if (c == '\'') {
+              inChr = true;
+            } else {
+              switch (c) {
+              case '(':
+                ++paren;
+                break;
+              case ')':
+                if (paren > 0)
+                  --paren;
+                break;
+              case '[':
+                ++bracket;
+                break;
+              case ']':
+                if (bracket > 0)
+                  --bracket;
+                break;
+              case '{':
+                ++brace;
+                break;
+              case '}':
+                if (brace > 0)
+                  --brace;
+                break;
+              default:
+                break;
+              }
+            }
+          }
+
+          if (!inStr && !inChr && !esc && !inLineComment && !inBlockComment &&
+              paren == 0 && bracket == 0 && brace == 0) {
+            emitCut(static_cast<unsigned>(i + 1));
+          }
+        }
+      };
+
+      auto isBalancedRefoldFragment = [&](StringRef s) -> bool {
+        bool balancedAtEnd = false;
+        enumerateTopLevelBalancedCutPoints(s, [&](unsigned cut) {
+          if (cut == s.size())
+            balancedAtEnd = true;
+        });
+        return balancedAtEnd;
+      };
+
+      auto enumerateTopLevelLiteralMatchesInRefoldText =
+          [&](StringRef haystack, StringRef needle, size_t maxPos,
+              auto &&emitMatch) {
+        if (needle.empty())
+          return;
+        enumerateTopLevelBalancedCutPoints(haystack, [&](unsigned cut) {
+          const size_t pos = static_cast<size_t>(cut);
+          if (pos > maxPos)
+            return;
+          if (!isLikelyTokenBoundaryInRefoldText(haystack, pos))
+            return;
+          if (haystack.drop_front(pos).starts_with(needle))
+            emitMatch(pos);
+        });
+      };
+
+      auto buildRewrittenInvocationSyntax =
+          [&](const RefoldModel::MacroInvocation &inv,
+              const DenseMap<uint32_t, std::string> &replByFormal)
+          -> std::optional<std::string> {
+        if (!inv.invText || !inv.invB)
+          return std::nullopt;
+
+        struct LocalEdit {
+          uint64_t begin = 0;
+          uint64_t end = 0;
+          std::string repl;
+        };
+
+        SmallVector<LocalEdit, 8> edits;
+        edits.reserve(replByFormal.size());
+        for (const auto &KV : replByFormal) {
+          const uint32_t argIdx = KV.first;
+          if (argIdx >= inv.invArgRanges.size())
+            return std::nullopt;
+          const auto &rng = inv.invArgRanges[argIdx];
+          if (!rng.first || !rng.second || *rng.second < *rng.first ||
+              *rng.first < *inv.invB)
+            return std::nullopt;
+
+          const uint64_t relB = *rng.first - *inv.invB;
+          const uint64_t relE = *rng.second - *inv.invB;
+          if (relE < relB || relE > inv.invText->size())
+            return std::nullopt;
+
+          StringRef newArg = StringRef(KV.second).trim();
+          const bool allowComma =
+              argIdx < inv.defParams.size() && inv.defParams[argIdx].variadic;
+          if (!allowComma && hasTopLevelCommaInRefoldText(newArg))
+            return std::nullopt;
+
+          edits.push_back(LocalEdit{relB, relE, newArg.str()});
+        }
+
+        llvm::sort(edits, [](const LocalEdit &a, const LocalEdit &b) {
+          return a.begin > b.begin;
+        });
+
+        std::string rewritten = inv.invText->str();
+        for (const auto &edit : edits)
+          rewritten = stringutils::replaceRange(rewritten, edit.begin, edit.end,
+                                                edit.repl);
+        return StringRef(rewritten).trim().str();
+      };
+
+      auto expansionTextCandidates =
+          [&](const RefoldModel::MacroInvocation &inv,
+              bool fromB) -> SmallVector<std::string, 4> {
+        SmallVector<std::string, 4> out;
+        std::optional<std::string> base =
+            fromB ? BuildWholeCoverReplacementText(inv)
+                  : getInvocationCoverAText(inv);
+        if (!base)
+          return out;
+
+        auto addUnique = [&](StringRef s) {
+          std::string cand = s.trim().str();
+          if (cand.empty())
+            return;
+          if (llvm::find(out, cand) == out.end())
+            out.push_back(std::move(cand));
+        };
+
+        auto tryAddUnstringified = [&](StringRef raw) {
+          auto un =
+              UnstringifyLiteralToArgText(raw, /*allowTopLevelComma=*/true);
+          if (!un)
+            return;
+          addUnique(*un);
+        };
+
+        auto tryAddWideLiteral = [&](StringRef raw) {
+          StringRef t = raw.trim();
+          if (!stringutils::looksLikeStringLiteralToken(t))
+            return;
+
+          // Preserve existing wide/prefixed string literals as-is; only add a
+          // widened form when the observed literal is an ordinary string.
+          if (t.starts_with("L\"") || t.starts_with("u\"") ||
+              t.starts_with("U\"") || t.starts_with("u8\""))
+            return;
+
+          addUnique((Twine("L") + t).str());
+        };
+
+        addUnique(*base);
+        tryAddUnstringified(*base);
+        tryAddWideLiteral(*base);
+        return out;
+      };
+
+      auto quoteCStringLiteral = [&](StringRef raw) -> std::string {
+        std::string out;
+        out.reserve(raw.size() + 2);
+        out.push_back('"');
+        for (char c : raw) {
+          if (c == '\\' || c == '"')
+            out.push_back('\\');
+          out.push_back(c);
+        }
+        out.push_back('"');
+        return out;
+      };
+
+      enum class WrapperChainKind {
+        Exact,
+        StringLiteral,
+        WideStringLiteral,
+      };
+
+      enum class WrapperObservedSource {
+        ChildExpansion,
+        ChildRawInvocation,
+      };
+
+      struct WrapperChainCertificate {
+        WrapperChainKind kind = WrapperChainKind::Exact;
+        WrapperObservedSource source = WrapperObservedSource::ChildExpansion;
+        std::string observedOldText;
+        std::string logicalInputText;
+      };
+
+      struct LexicalChildPlaceholder {
+        uint64_t relBegin = 0;
+        uint64_t relEnd = 0;
+        const RefoldModel::MacroInvocation *child = nullptr;
+        SmallVector<WrapperChainCertificate, 4> observedForms;
+        SmallVector<std::string, 4> newExpansionCandidates;
+        std::string rawInvocationText;
+      };
+
+      auto getTopLevelLexicalChildrenInArg =
+          [&](const RefoldModel::MacroInvocation &parent,
+              uint32_t parentFormal) -> SmallVector<LexicalChildPlaceholder, 4> {
+        SmallVector<LexicalChildPlaceholder, 8> cands;
+        auto argInfo = getTrimmedInvocationArgInfo(parent, parentFormal);
+        if (!argInfo || !parent.invFile)
+          return SmallVector<LexicalChildPlaceholder, 4>{};
+
+        for (const auto &cand : model_.GetMacroInvocations()) {
+          if (cand.id == parent.id || !cand.invFile || !cand.invB || !cand.invE)
+            continue;
+          if (*cand.invFile != *parent.invFile)
+            continue;
+          if (*cand.invB < argInfo->absTrimBegin || *cand.invE > argInfo->absTrimEnd ||
+              *cand.invE <= *cand.invB)
+            continue;
+
+          auto olds = expansionTextCandidates(cand, /*fromB=*/false);
+          auto news = expansionTextCandidates(cand, /*fromB=*/true);
+
+          SmallVector<WrapperChainCertificate, 4> forms;
+          auto addObservedForm = [&](WrapperChainKind kind,
+                                     WrapperObservedSource source,
+                                     StringRef text,
+                                     StringRef logicalInput) {
+            std::string observed = text.trim().str();
+            std::string logical = logicalInput.trim().str();
+            if (observed.empty() || logical.empty())
+              return;
+
+            if (kind == WrapperChainKind::StringLiteral ||
+                kind == WrapperChainKind::WideStringLiteral) {
+              auto canon = CanonicalizeStringifyInversePayload(logical);
+              if (!canon || StringRef(*canon).trim() != StringRef(logical).trim())
+                return;
+              logical = std::move(*canon);
+            }
+
+            for (const auto &existing : forms) {
+              if (existing.kind == kind &&
+                  existing.observedOldText == observed &&
+                  existing.logicalInputText == logical)
+                return;
+            }
+
+            forms.push_back(WrapperChainCertificate{kind, source,
+                                                    std::move(observed),
+                                                    std::move(logical)});
+          };
+
+          for (StringRef oldText : olds) {
+            StringRef trimmed = oldText.trim();
+            addObservedForm(WrapperChainKind::Exact,
+                            WrapperObservedSource::ChildExpansion, trimmed,
+                            trimmed);
+            addObservedForm(WrapperChainKind::StringLiteral,
+                            WrapperObservedSource::ChildExpansion,
+                            quoteCStringLiteral(trimmed), trimmed);
+            addObservedForm(WrapperChainKind::WideStringLiteral,
+                            WrapperObservedSource::ChildExpansion,
+                            (Twine("L") + quoteCStringLiteral(trimmed)).str(),
+                            trimmed);
+          }
+          if (cand.invText) {
+            const std::string rawInvocation =
+                StringRef(*cand.invText).trim().str();
+            if (!rawInvocation.empty()) {
+              addObservedForm(WrapperChainKind::StringLiteral,
+                              WrapperObservedSource::ChildRawInvocation,
+                              quoteCStringLiteral(rawInvocation),
+                              rawInvocation);
+              addObservedForm(WrapperChainKind::WideStringLiteral,
+                              WrapperObservedSource::ChildRawInvocation,
+                              (Twine("L") + quoteCStringLiteral(rawInvocation))
+                                  .str(),
+                              rawInvocation);
+            }
+          }
+          if (forms.empty())
+            continue;
+
+          LexicalChildPlaceholder ph;
+          ph.relBegin = *cand.invB - argInfo->absTrimBegin;
+          ph.relEnd = *cand.invE - argInfo->absTrimBegin;
+          ph.child = &cand;
+          ph.observedForms = std::move(forms);
+          ph.newExpansionCandidates = std::move(news);
+          if (cand.invText)
+            ph.rawInvocationText = StringRef(*cand.invText).trim().str();
+          cands.push_back(std::move(ph));
+        }
+
+        llvm::sort(cands, [](const LexicalChildPlaceholder &a,
+                             const LexicalChildPlaceholder &b) {
+          if (a.relBegin != b.relBegin)
+            return a.relBegin < b.relBegin;
+          return a.relEnd > b.relEnd;
+        });
+
+        SmallVector<LexicalChildPlaceholder, 4> top;
+        for (const auto &cand : cands) {
+          bool contained = false;
+          for (const auto &sel : top) {
+            if (cand.relBegin >= sel.relBegin && cand.relEnd <= sel.relEnd) {
+              contained = true;
+              break;
+            }
+            if (!(cand.relEnd <= sel.relBegin || cand.relBegin >= sel.relEnd)) {
+              contained = true;
+              break;
+            }
+          }
+          if (!contained)
+            top.push_back(cand);
+        }
+        return top;
+      };
+
+      enum class ArgInvertibilityKind {
+        LiteralOnly,
+        TemplateWithChildren,
+      };
+
+      struct ArgInvertibilityCertificate {
+        ArgInvertibilityKind kind = ArgInvertibilityKind::LiteralOnly;
+        std::string rawArgText;
+        SmallVector<std::string, 8> literals;
+        SmallVector<LexicalChildPlaceholder, 4> slots;
+        SmallVector<unsigned, 4> chosenObservedFormIdx;
+      };
+
+      auto buildArgInvertibilityCertificate =
+          [&](const RefoldModel::MacroInvocation &parent, uint32_t parentFormal,
+              StringRef observedOld0) -> std::optional<ArgInvertibilityCertificate> {
+        auto argInfo = getTrimmedInvocationArgInfo(parent, parentFormal);
+        if (!argInfo)
+          return std::nullopt;
+
+        StringRef rawArg = StringRef(argInfo->text).trim();
+        StringRef observedOld = observedOld0.trim();
+
+        ArgInvertibilityCertificate cert;
+        cert.rawArgText = rawArg.str();
+        auto placeholders = getTopLevelLexicalChildrenInArg(parent, parentFormal);
+        if (placeholders.empty()) {
+          if (observedOld != rawArg)
+            return std::nullopt;
+          cert.kind = ArgInvertibilityKind::LiteralOnly;
+          cert.literals.push_back(rawArg.str());
+          return cert;
+        }
+
+        cert.kind = ArgInvertibilityKind::TemplateWithChildren;
+        cert.slots = placeholders;
+
+        uint64_t curPos = 0;
+        for (const auto &ph : placeholders) {
+          if (ph.relBegin < curPos || ph.relEnd < ph.relBegin ||
+              ph.relEnd > rawArg.size())
+            return std::nullopt;
+          cert.literals.push_back(rawArg.slice((size_t)curPos, (size_t)ph.relBegin).str());
+          curPos = ph.relEnd;
+        }
+        cert.literals.push_back(rawArg.drop_front((size_t)curPos).str());
+
+        SmallVector<unsigned, 4> chosenOld;
+        SmallVector<SmallVector<unsigned, 4>, 2> oldSolutions;
+        auto matchOld = [&](auto &&self, size_t idx, size_t pos) -> void {
+          if (oldSolutions.size() > 1)
+            return;
+          const StringRef lit = cert.literals[idx];
+          if (pos > observedOld.size() ||
+              !observedOld.drop_front(pos).starts_with(lit))
+            return;
+          pos += lit.size();
+          if (idx == cert.slots.size()) {
+            if (pos == observedOld.size())
+              oldSolutions.push_back(chosenOld);
+            return;
+          }
+          for (unsigned choice = 0; choice < cert.slots[idx].observedForms.size();
+               ++choice) {
+            StringRef phOld = cert.slots[idx].observedForms[choice].observedOldText;
+            if (observedOld.drop_front(pos).starts_with(phOld)) {
+              chosenOld.push_back(choice);
+              self(self, idx + 1, pos + phOld.size());
+              chosenOld.pop_back();
+            }
+          }
+        };
+        matchOld(matchOld, 0, 0);
+        if (oldSolutions.empty())
+          return std::nullopt;
+
+        auto semanticallyEquivalentOldSolutions =
+            [&](const SmallVectorImpl<unsigned> &a,
+                const SmallVectorImpl<unsigned> &b) -> bool {
+          if (a.size() != b.size())
+            return false;
+          for (size_t i = 0; i < a.size(); ++i) {
+            if (i >= cert.slots.size() || a[i] >= cert.slots[i].observedForms.size() ||
+                b[i] >= cert.slots[i].observedForms.size())
+              return false;
+            const auto &fa = cert.slots[i].observedForms[a[i]];
+            const auto &fb = cert.slots[i].observedForms[b[i]];
+            if (fa.kind != fb.kind || fa.source != fb.source ||
+                StringRef(fa.logicalInputText).trim() !=
+                    StringRef(fb.logicalInputText).trim())
+              return false;
+          }
+          return true;
+        };
+
+        for (size_t i = 1; i < oldSolutions.size(); ++i)
+          if (!semanticallyEquivalentOldSolutions(oldSolutions[0],
+                                                 oldSolutions[i]))
+            return std::nullopt;
+
+        cert.chosenObservedFormIdx = oldSolutions[0];
+
+        return cert;
+      };
+
+      enum class SlotRewriteDecisionKind {
+        PreferredChildSyntax,
+        PreserveRawInvocation,
+        PassthroughFlatten,
+      };
+
+      struct SlotRewriteDecision {
+        SlotRewriteDecisionKind kind = SlotRewriteDecisionKind::PassthroughFlatten;
+        std::string observedText;
+        std::string rebuiltText;
+
+        bool operator==(const SlotRewriteDecision &other) const {
+          return kind == other.kind && observedText == other.observedText &&
+                 rebuiltText == other.rebuiltText;
+        }
+      };
+
+      enum class SlotSemanticRewriteCertificateKind {
+        Unique,
+        Invalid,
+      };
+
+      struct SlotSemanticRewriteCertificate {
+        SlotSemanticRewriteCertificateKind kind =
+            SlotSemanticRewriteCertificateKind::Invalid;
+        SlotRewriteDecision decision;
+        WrapperChainKind wrapperKind = WrapperChainKind::Exact;
+        WrapperObservedSource wrapperSource =
+            WrapperObservedSource::ChildExpansion;
+        std::string logicalInputText;
+
+        bool operator==(const SlotSemanticRewriteCertificate &other) const {
+          return kind == other.kind && decision == other.decision &&
+                 wrapperKind == other.wrapperKind &&
+                 wrapperSource == other.wrapperSource &&
+                 logicalInputText == other.logicalInputText;
+        }
+      };
+
+      enum class ArgSemanticRewriteCertificateKind {
+        NoChange,
+        Unique,
+        Invalid,
+      };
+
+      struct ArgSemanticRewriteCertificate {
+        ArgSemanticRewriteCertificateKind kind =
+            ArgSemanticRewriteCertificateKind::Invalid;
+        std::string observedNewText;
+        std::string rawArgOldText;
+        std::string rawArgNewText;
+        SmallVector<SlotRewriteDecision, 8> slotDecisions;
+        SmallVector<SlotSemanticRewriteCertificate, 8> slotCertificates;
+        std::string detail;
+      };
+
+      enum class SemanticInteractionKind {
+        Plain,
+        ChildSyntax,
+        RawInvocation,
+        Stringify,
+        WideStringify,
+        Paste,
+        ChildSyntaxPaste,
+        RawInvocationPaste,
+        StringifyPaste,
+        WideStringifyPaste,
+        Mixed,
+      };
+
+      enum class SemanticInteractionFailure {
+        None,
+        NonCanonicalLogicalInput,
+      };
+
+      struct SemanticInteractionCertificate {
+        bool valid = true;
+        SemanticInteractionKind kind = SemanticInteractionKind::Plain;
+        SemanticInteractionFailure failure = SemanticInteractionFailure::None;
+        const RefoldModel::MacroInvocation *inv = nullptr;
+        uint32_t argIdx = 0;
+        bool touchesPaste = false;
+        bool usesPreferredChildSyntax = false;
+        bool usesRawInvocationPreservation = false;
+        bool usesPassthroughFlatten = false;
+        bool usesStringify = false;
+        bool usesWideStringify = false;
+        bool usesRawChildInvocationLogicalInput = false;
+        SmallVector<SlotSemanticRewriteCertificate, 8> slotCertificates;
+        SmallVector<std::string, 8> canonicalLogicalInputs;
+        std::string detail;
+      };
+
+      struct SemanticInteractionSignature {
+        bool touchesPaste = false;
+        bool usesPreferredChildSyntax = false;
+        bool usesRawInvocationPreservation = false;
+        bool usesPassthroughFlatten = false;
+        bool usesStringify = false;
+        bool usesWideStringify = false;
+        bool usesRawChildInvocationLogicalInput = false;
+        SmallVector<std::string, 8> canonicalLogicalInputs;
+
+        bool operator==(const SemanticInteractionSignature &other) const {
+          return touchesPaste == other.touchesPaste &&
+                 usesPreferredChildSyntax == other.usesPreferredChildSyntax &&
+                 usesRawInvocationPreservation ==
+                     other.usesRawInvocationPreservation &&
+                 usesPassthroughFlatten == other.usesPassthroughFlatten &&
+                 usesStringify == other.usesStringify &&
+                 usesWideStringify == other.usesWideStringify &&
+                 usesRawChildInvocationLogicalInput ==
+                     other.usesRawChildInvocationLogicalInput &&
+                 canonicalLogicalInputs == other.canonicalLogicalInputs;
+        }
+      };
+
+      enum class FormalInteractionConsistencyFailure {
+        None,
+        DivergentSemanticEvidence,
+      };
+
+      struct FormalInteractionConsistencyCertificate {
+        bool valid = true;
+        FormalInteractionConsistencyFailure failure =
+            FormalInteractionConsistencyFailure::None;
+        const RefoldModel::MacroInvocation *inv = nullptr;
+        uint32_t argIdx = 0;
+        SemanticInteractionSignature signature;
+        SmallVector<SemanticInteractionCertificate, 2> interactions;
+        std::string detail;
+      };
+
+      enum class SubtreeInteractionConsistencyFailure {
+        None,
+        DivergentFormalSemantics,
+      };
+
+      struct SubtreeInteractionConsistencyCertificate {
+        bool valid = true;
+        SubtreeInteractionConsistencyFailure failure =
+            SubtreeInteractionConsistencyFailure::None;
+        SmallVector<FormalInteractionConsistencyCertificate, 16>
+            formalConsistencies;
+        std::string detail;
+      };
+
+      auto buildArgSemanticRewriteCertificate =
+          [&](const ArgInvertibilityCertificate &cert, StringRef observedNew0,
+              const DenseMap<uint64_t, std::string> *preferredChildSyntax)
+          -> ArgSemanticRewriteCertificate {
+        ArgSemanticRewriteCertificate argCert;
+        StringRef observedNew = observedNew0.trim();
+        argCert.observedNewText = observedNew.str();
+        argCert.rawArgOldText = StringRef(cert.rawArgText).trim().str();
+        if (cert.kind == ArgInvertibilityKind::LiteralOnly) {
+          argCert.rawArgNewText = observedNew.str();
+          argCert.kind = (StringRef(argCert.rawArgNewText).trim() ==
+                          StringRef(argCert.rawArgOldText).trim())
+                             ? ArgSemanticRewriteCertificateKind::NoChange
+                             : ArgSemanticRewriteCertificateKind::Unique;
+          return argCert;
+        }
+
+        SmallVector<SlotRewriteDecision, 8> newParts;
+        SmallVector<SlotSemanticRewriteCertificate, 8> newPartCertificates;
+        SmallVector<SmallVector<SlotRewriteDecision, 8>, 2> newSolutions;
+        SmallVector<SmallVector<SlotSemanticRewriteCertificate, 8>, 2>
+            newSolutionCertificates;
+
+        auto pieceMatchesWrapperCertificate =
+            [&](const WrapperChainCertificate &wrapper,
+                StringRef piece0) -> bool {
+          StringRef piece = piece0.trim();
+          switch (wrapper.kind) {
+          case WrapperChainKind::Exact:
+            return true;
+          case WrapperChainKind::StringLiteral:
+            return stringutils::looksLikeStringLiteralToken(piece);
+          case WrapperChainKind::WideStringLiteral:
+            return piece.starts_with("L\"") ||
+                   (piece.starts_with("L") &&
+                    stringutils::looksLikeStringLiteralToken(
+                        piece.drop_front(1)));
+          }
+          llvm_unreachable("invalid WrapperChainKind");
+        };
+
+        auto literalDecodesToCanonicalLogicalInput =
+            [&](StringRef piece0, StringRef expected0) -> bool {
+          auto decoded =
+              UnstringifyLiteralToArgText(piece0, /*allowTopLevelComma=*/true);
+          if (!decoded)
+            return false;
+
+          auto canonDecoded = CanonicalizeStringifyInversePayload(*decoded);
+          auto canonExpected = CanonicalizeStringifyInversePayload(expected0);
+          if (!canonDecoded || !canonExpected)
+            return false;
+
+          return StringRef(*canonDecoded).trim() == StringRef(*decoded).trim() &&
+                 StringRef(*canonExpected).trim() == expected0.trim() &&
+                 *canonDecoded == *canonExpected;
+        };
+
+        auto pieceMatchesWrapperLogicalInput =
+            [&](const WrapperChainCertificate &wrapper,
+                StringRef piece0) -> bool {
+          if (!pieceMatchesWrapperCertificate(wrapper, piece0))
+            return false;
+
+          const StringRef logical = StringRef(wrapper.logicalInputText).trim();
+          switch (wrapper.kind) {
+          case WrapperChainKind::Exact:
+            return piece0.trim() == logical;
+          case WrapperChainKind::StringLiteral:
+          case WrapperChainKind::WideStringLiteral:
+            return literalDecodesToCanonicalLogicalInput(piece0, logical);
+          }
+          llvm_unreachable("invalid WrapperChainKind");
+        };
+
+        auto pieceMatchesAnyTrimmedCandidate =
+            [&](StringRef piece0,
+                const SmallVectorImpl<std::string> &candidates) -> bool {
+          StringRef piece = piece0.trim();
+          for (const auto &cand : candidates)
+            if (piece == StringRef(cand).trim())
+              return true;
+          return false;
+        };
+
+        auto collectSlotSemanticRewriteCertificates =
+            [&](const LexicalChildPlaceholder &slot,
+                const WrapperChainCertificate &wrapper, StringRef piece0)
+            -> SmallVector<SlotSemanticRewriteCertificate, 4> {
+          SmallVector<SlotSemanticRewriteCertificate, 4> out;
+          const StringRef piece = piece0.trim();
+
+          auto addUnique = [&](SlotRewriteDecisionKind kind,
+                               StringRef rebuilt0) {
+            SlotSemanticRewriteCertificate cert;
+            cert.kind = SlotSemanticRewriteCertificateKind::Unique;
+            cert.decision.kind = kind;
+            cert.decision.observedText = piece.str();
+            cert.decision.rebuiltText = rebuilt0.str();
+            cert.wrapperKind = wrapper.kind;
+            cert.wrapperSource = wrapper.source;
+            cert.logicalInputText = wrapper.logicalInputText;
+            for (const auto &existing : out)
+              if (existing == cert)
+                return;
+            out.push_back(std::move(cert));
+          };
+
+          if (preferredChildSyntax && slot.child) {
+            auto it = preferredChildSyntax->find(slot.child->id);
+            if (it != preferredChildSyntax->end() &&
+                pieceMatchesWrapperCertificate(wrapper, piece)) {
+              bool compatible = false;
+              const StringRef preferredSyntax = StringRef(it->second).trim();
+              switch (wrapper.source) {
+              case WrapperObservedSource::ChildRawInvocation:
+                switch (wrapper.kind) {
+                case WrapperChainKind::Exact:
+                  compatible = piece == preferredSyntax;
+                  break;
+                case WrapperChainKind::StringLiteral:
+                case WrapperChainKind::WideStringLiteral:
+                  compatible = literalDecodesToCanonicalLogicalInput(
+                      piece, preferredSyntax);
+                  break;
+                }
+                break;
+
+              case WrapperObservedSource::ChildExpansion:
+                switch (wrapper.kind) {
+                case WrapperChainKind::Exact:
+                  compatible = pieceMatchesAnyTrimmedCandidate(
+                      piece, slot.newExpansionCandidates);
+                  break;
+                case WrapperChainKind::StringLiteral:
+                case WrapperChainKind::WideStringLiteral:
+                  compatible = llvm::any_of(
+                      slot.newExpansionCandidates, [&](const std::string &cand) {
+                        return literalDecodesToCanonicalLogicalInput(piece,
+                                                                     cand);
+                      });
+                  break;
+                }
+                break;
+              }
+
+              if (compatible)
+                addUnique(SlotRewriteDecisionKind::PreferredChildSyntax,
+                          preferredSyntax);
+            }
+          }
+
+          if (!slot.rawInvocationText.empty() && !slot.observedForms.empty()) {
+            for (const auto &form : slot.observedForms) {
+              if (!pieceMatchesWrapperLogicalInput(form, piece))
+                continue;
+              addUnique(SlotRewriteDecisionKind::PreserveRawInvocation,
+                        slot.rawInvocationText);
+            }
+          }
+
+          return out;
+        };
+
+        auto addNewSolution =
+            [&](const SmallVectorImpl<SlotRewriteDecision> &parts,
+                const SmallVectorImpl<SlotSemanticRewriteCertificate>
+                    &slotCertificates) {
+              SmallVector<SlotRewriteDecision, 8> copy(parts.begin(),
+                                                       parts.end());
+              for (const auto &existing : newSolutions)
+                if (existing == copy)
+                  return;
+              newSolutions.push_back(std::move(copy));
+              newSolutionCertificates.emplace_back(slotCertificates.begin(),
+                                                   slotCertificates.end());
+            };
+
+        auto rebuildFromSolution =
+            [&](const SmallVectorImpl<SlotRewriteDecision> &sol) -> std::string {
+          std::string rebuilt;
+          for (size_t i = 0; i < cert.slots.size(); ++i) {
+            rebuilt += cert.literals[i];
+            rebuilt += sol[i].rebuiltText;
+          }
+          rebuilt += cert.literals.back();
+          return rebuilt;
+        };
+
+        auto solutionsCollapseToSameRebuilt = [&]() -> bool {
+          if (newSolutions.empty())
+            return false;
+          std::string rebuilt = rebuildFromSolution(newSolutions[0]);
+          for (size_t i = 1; i < newSolutions.size(); ++i)
+            if (rebuildFromSolution(newSolutions[i]) != rebuilt)
+              return false;
+          return true;
+        };
+
+        auto solveNew = [&](auto &&self, size_t idx, size_t pos) -> void {
+          if (newSolutions.size() > 1)
+            return;
+          const StringRef lit = cert.literals[idx];
+          if (pos > observedNew.size() ||
+              !observedNew.drop_front(pos).starts_with(lit))
+            return;
+          pos += lit.size();
+          if (idx == cert.slots.size()) {
+            if (pos == observedNew.size())
+              addNewSolution(newParts, newPartCertificates);
+            return;
+          }
+
+          const auto &slot = cert.slots[idx];
+          const WrapperChainCertificate wrapper =
+              (idx < cert.chosenObservedFormIdx.size() &&
+               cert.chosenObservedFormIdx[idx] < slot.observedForms.size())
+                  ? slot.observedForms[cert.chosenObservedFormIdx[idx]]
+                  : WrapperChainCertificate{};
+          size_t minRemain = 0;
+          for (size_t j = idx + 1; j < cert.literals.size(); ++j)
+            minRemain += cert.literals[j].size();
+          if (pos + minRemain > observedNew.size())
+            return;
+          const size_t maxLen = observedNew.size() - pos - minRemain;
+          const StringRef rest = observedNew.drop_front(pos);
+          const StringRef nextLit = cert.literals[idx + 1];
+
+          auto enumerateSlotPieces = [&](auto &&emitPiece) {
+            if (!nextLit.empty()) {
+              enumerateTopLevelLiteralMatchesInRefoldText(
+                  rest, nextLit, maxLen, [&](size_t found) {
+                    StringRef piece = rest.take_front(found);
+                    if (!isBalancedRefoldFragment(piece))
+                      return;
+                    emitPiece(piece);
+                    if (newSolutions.size() > 1)
+                      return;
+                  });
+            } else {
+              enumerateTopLevelBalancedCutPoints(rest, [&](unsigned cut) {
+                const size_t len = static_cast<size_t>(cut);
+                if (len > maxLen)
+                  return;
+                if (!isLikelyTokenBoundaryInRefoldText(rest, len) ||
+                    !isBalancedRefoldFragment(rest.take_front(len)))
+                  return;
+                emitPiece(rest.take_front(len));
+                if (newSolutions.size() > 1)
+                  return;
+              });
+            }
+          };
+
+          bool triedSemanticPreserve = false;
+          enumerateSlotPieces([&](StringRef piece) {
+            auto semanticCerts =
+                collectSlotSemanticRewriteCertificates(slot, wrapper, piece);
+            if (semanticCerts.empty())
+              return;
+            triedSemanticPreserve = true;
+            for (const auto &semanticCert : semanticCerts) {
+              newParts.push_back(semanticCert.decision);
+              newPartCertificates.push_back(semanticCert);
+              self(self, idx + 1, pos + piece.size());
+              newPartCertificates.pop_back();
+              newParts.pop_back();
+              if (newSolutions.size() > 1)
+                return;
+            }
+          });
+          if (triedSemanticPreserve && solutionsCollapseToSameRebuilt())
+            return;
+
+          enumerateSlotPieces([&](StringRef piece) {
+            SlotSemanticRewriteCertificate fallbackCert;
+            fallbackCert.kind = SlotSemanticRewriteCertificateKind::Unique;
+            fallbackCert.decision = SlotRewriteDecision{
+                SlotRewriteDecisionKind::PassthroughFlatten, piece.str(),
+                piece.str()};
+            fallbackCert.wrapperKind = wrapper.kind;
+            fallbackCert.wrapperSource = wrapper.source;
+            fallbackCert.logicalInputText = wrapper.logicalInputText;
+            newParts.push_back(fallbackCert.decision);
+            newPartCertificates.push_back(fallbackCert);
+            self(self, idx + 1, pos + piece.size());
+            newPartCertificates.pop_back();
+            newParts.pop_back();
+          });
+        };
+        solveNew(solveNew, 0, 0);
+        if (newSolutions.empty()) {
+          argCert.detail =
+              "new arg did not admit any structurally valid slot reconstruction";
+          return argCert;
+        }
+
+        std::string rebuilt = rebuildFromSolution(newSolutions[0]);
+        for (size_t i = 1; i < newSolutions.size(); ++i)
+          if (rebuildFromSolution(newSolutions[i]) != rebuilt) {
+            argCert.detail =
+                "new arg admitted multiple non-equivalent structural reconstructions";
+            return argCert;
+          }
+
+        argCert.slotDecisions.assign(newSolutions[0].begin(),
+                                     newSolutions[0].end());
+        if (!newSolutionCertificates.empty())
+          argCert.slotCertificates.assign(newSolutionCertificates[0].begin(),
+                                          newSolutionCertificates[0].end());
+        argCert.rawArgNewText = rebuilt;
+        argCert.kind = (StringRef(argCert.rawArgNewText).trim() ==
+                        StringRef(argCert.rawArgOldText).trim())
+                           ? ArgSemanticRewriteCertificateKind::NoChange
+                           : ArgSemanticRewriteCertificateKind::Unique;
+        return argCert;
+      };
+
+      auto buildObservedArgRewriteCertificate =
+          [&](const RefoldModel::MacroInvocation &parent, uint32_t parentFormal,
+              StringRef observedOld0, StringRef observedNew0,
+              const DenseMap<uint64_t, std::string> *preferredChildSyntax)
+          -> ArgSemanticRewriteCertificate {
+        auto invertibilityCert =
+            buildArgInvertibilityCertificate(parent, parentFormal, observedOld0);
+        if (!invertibilityCert) {
+          ArgSemanticRewriteCertificate argCert;
+          argCert.detail =
+              "observed old arg text did not match a unique structural template";
+          return argCert;
+        }
+        return buildArgSemanticRewriteCertificate(*invertibilityCert,
+                                                  observedNew0,
+                                                  preferredChildSyntax);
+      };
+
+      struct FormalTextPair {
+        std::string oldText;
+        std::string newText;
+      };
+
+      struct ObservedFormalConstraint {
+        std::string oldText;
+        std::string newText;
+      };
+
+      enum class FormalRewriteCertificateKind {
+        NoChange,
+        Unique,
+        Invalid,
+      };
+
+      enum class FormalRewriteFailure {
+        None,
+        MissingArgumentText,
+        RawRewriteNotCertifiable,
+        MergeConflict,
+        ArityChange,
+        OccurrenceMismatch,
+        InteractionConflict,
+      };
+
+      enum class RawFormalValidationFailure {
+        None,
+        ArityChange,
+        OccurrenceMismatch,
+      };
+
+      struct RawFormalValidationCertificate {
+        bool valid = false;
+        RawFormalValidationFailure failure = RawFormalValidationFailure::None;
+        const RefoldModel::MacroInvocation *inv = nullptr;
+        uint32_t argIdx = 0;
+        std::string oldText;
+        std::string newText;
+        std::string detail;
+      };
+
+      enum class PasteRewriteValidationFailure {
+        None,
+        MissingInvocationText,
+        MissingArgumentRanges,
+        PasteMismatch,
+      };
+
+      struct PasteRewriteValidationCertificate {
+        bool required = false;
+        bool valid = true;
+        const RefoldModel::MacroInvocation *inv = nullptr;
+        DenseMap<uint32_t, std::string> replacementByArgIdx;
+        PasteRewriteValidationFailure failure =
+            PasteRewriteValidationFailure::None;
+        std::string detail;
+      };
+
+      struct FormalRewriteCertificate {
+        FormalRewriteCertificateKind kind =
+            FormalRewriteCertificateKind::Invalid;
+        FormalRewriteFailure failure = FormalRewriteFailure::None;
+        const RefoldModel::MacroInvocation *inv = nullptr;
+        uint32_t argIdx = 0;
+        std::string oldText;
+        std::string newText;
+        SmallVector<FormalTextPair, 2> candidateRewrites;
+        SmallVector<ArgSemanticRewriteCertificate, 2> argRewriteCertificates;
+        SmallVector<SemanticInteractionCertificate, 2> interactionCertificates;
+        FormalInteractionConsistencyCertificate interactionConsistency;
+        RawFormalValidationCertificate validation;
+        std::string detail;
+      };
+
+      SmallVector<diffutils::Hunk, 1> tokenHunksForCheck;
+      tokenHunksForCheck.push_back(h);
+      ArrayRef<diffutils::Hunk> tokenHunksAR(tokenHunksForCheck);
+
+      std::function<std::optional<std::string>(StringRef,
+                                               ArrayRef<FormalTextPair>)>
+          mergeCompatibleFormalRewrites;
+
+      auto buildRawFormalValidationCertificate =
+          [&](const RefoldModel::MacroInvocation &inv, uint32_t argIdx,
+              StringRef oldText0, StringRef newText0,
+              StringRef traceStage,
+              bool skipOccurrenceConsistency = false)
+          -> RawFormalValidationCertificate {
+        RawFormalValidationCertificate cert;
+        cert.inv = &inv;
+        cert.argIdx = argIdx;
+        cert.oldText = oldText0.trim().str();
+        cert.newText = newText0.trim().str();
+
+        const StringRef oldText = StringRef(cert.oldText).trim();
+        const StringRef newText = StringRef(cert.newText).trim();
+        if (oldText == newText) {
+          cert.valid = true;
+          return cert;
+        }
+
+        if (!isVariadicFormalInInvocation(inv, argIdx) &&
+            hasTopLevelCommaInRefoldText(newText)) {
+          cert.failure = RawFormalValidationFailure::ArityChange;
+          cert.detail = formatv(
+                            "{0}: inv id={1} name={2} argIdx={3} arity "
+                            "safety failed",
+                            traceStage, inv.id, inv.name, argIdx)
+                            .str();
+          return cert;
+        }
+
+        if (skipOccurrenceConsistency) {
+          cert.valid = true;
+          cert.detail = formatv(
+                            "{0}: inv id={1} name={2} argIdx={3} occurrence "
+                            "consistency deferred to semantic certificate "
+                            "pipeline",
+                            traceStage, inv.id, inv.name, argIdx)
+                            .str();
+          return cert;
+        }
+
+        if (!MacroArgReplacementMatchesAllOccurrencesInBIgnorePaste(
+                inv, argIdx, oldText, newText, tokenHunksAR)) {
+          cert.failure = RawFormalValidationFailure::OccurrenceMismatch;
+          cert.detail =
+              formatv("{0}: inv id={1} name={2} argIdx={3} occurrence "
+                      "consistency failed",
+                      traceStage, inv.id, inv.name, argIdx)
+                  .str();
+          return cert;
+        }
+
+        cert.valid = true;
+        return cert;
+      };
+
+      auto buildPasteRewriteValidationCertificate =
+          [&](const RefoldModel::MacroInvocation &inv,
+              const DenseMap<uint32_t, std::string> &replacementByArgIdx,
+              StringRef traceStage,
+              std::optional<StringRef> callsiteTextOverride = std::nullopt,
+              ArrayRef<std::pair<size_t, size_t>>
+                  callsiteArgRangesOverride =
+                      ArrayRef<std::pair<size_t, size_t>>())
+          -> PasteRewriteValidationCertificate {
+        PasteRewriteValidationCertificate cert;
+        cert.inv = &inv;
+        cert.replacementByArgIdx = replacementByArgIdx;
+
+        for (const auto &KV : replacementByArgIdx) {
+          const uint32_t argIdx = KV.first;
+          for (const auto &ps : inv.pasteSpans) {
+            if (ps.argIdx == argIdx) {
+              cert.required = true;
+              break;
+            }
+          }
+          if (cert.required)
+            break;
+        }
+
+        if (!cert.required)
+          return cert;
+
+        StringRef callsiteText;
+        ArrayRef<std::pair<size_t, size_t>> callsiteArgRanges;
+        std::optional<SmallVector<std::pair<size_t, size_t>, 8>>
+            ownedArgRanges;
+
+        if (callsiteTextOverride) {
+          callsiteText = *callsiteTextOverride;
+          if (callsiteArgRangesOverride.empty()) {
+            cert.valid = false;
+            cert.failure = PasteRewriteValidationFailure::MissingArgumentRanges;
+            cert.detail =
+                formatv("{0}: paste consistency unavailable: inv id={1} "
+                        "name={2} arg ranges unavailable",
+                        traceStage, inv.id, inv.name)
+                    .str();
+            return cert;
+          }
+          callsiteArgRanges = callsiteArgRangesOverride;
+        } else {
+          if (!inv.invText) {
+            cert.valid = false;
+            cert.failure = PasteRewriteValidationFailure::MissingInvocationText;
+            cert.detail =
+                formatv("{0}: paste consistency unavailable: inv id={1} "
+                        "name={2} hasInvText=0",
+                        traceStage, inv.id, inv.name)
+                    .str();
+            return cert;
+          }
+          callsiteText = StringRef(*inv.invText);
+          auto invArgRangesOpt =
+              GetMacroInvocationFormalArgContentRanges(inv, callsiteText);
+          if (!invArgRangesOpt) {
+            cert.valid = false;
+            cert.failure = PasteRewriteValidationFailure::MissingArgumentRanges;
+            cert.detail =
+                formatv("{0}: paste consistency unavailable: inv id={1} "
+                        "name={2} arg ranges unavailable",
+                        traceStage, inv.id, inv.name)
+                    .str();
+            return cert;
+          }
+          ownedArgRanges.emplace(invArgRangesOpt->begin(),
+                                 invArgRangesOpt->end());
+          callsiteArgRanges = *ownedArgRanges;
+        }
+
+        if (!PasteArgReplacementsMatchAllPasteTokensInB(
+                inv, callsiteText, callsiteArgRanges,
+                cert.replacementByArgIdx)) {
+          cert.valid = false;
+          cert.failure = PasteRewriteValidationFailure::PasteMismatch;
+          cert.detail =
+              formatv("{0}: paste-token consistency failed: inv id={1} "
+                      "name={2} touchedArgs={3}",
+                      traceStage, inv.id, inv.name,
+                      cert.replacementByArgIdx.size())
+                  .str();
+          return cert;
+        }
+
+        return cert;
+      };
+
+      auto buildSemanticInteractionCertificate =
+          [&](const RefoldModel::MacroInvocation &inv, uint32_t argIdx,
+              const ArgSemanticRewriteCertificate &argCert,
+              StringRef traceStage) -> SemanticInteractionCertificate {
+        SemanticInteractionCertificate cert;
+        cert.inv = &inv;
+        cert.argIdx = argIdx;
+        cert.slotCertificates.assign(argCert.slotCertificates.begin(),
+                                     argCert.slotCertificates.end());
+
+        auto addLogicalInput = [&](StringRef logical0) {
+          const std::string normalized = logical0.trim().str();
+          if (normalized.empty())
+            return;
+          for (const auto &existing : cert.canonicalLogicalInputs)
+            if (existing == normalized)
+              return;
+          cert.canonicalLogicalInputs.push_back(normalized);
+        };
+
+        for (const auto &ps : inv.pasteSpans) {
+          if (ps.argIdx == argIdx) {
+            cert.touchesPaste = true;
+            break;
+          }
+        }
+
+        for (const auto &slotCert : argCert.slotCertificates) {
+          switch (slotCert.decision.kind) {
+          case SlotRewriteDecisionKind::PreferredChildSyntax:
+            cert.usesPreferredChildSyntax = true;
+            break;
+          case SlotRewriteDecisionKind::PreserveRawInvocation:
+            cert.usesRawInvocationPreservation = true;
+            break;
+          case SlotRewriteDecisionKind::PassthroughFlatten:
+            cert.usesPassthroughFlatten = true;
+            break;
+          }
+
+          if (slotCert.wrapperSource ==
+              WrapperObservedSource::ChildRawInvocation)
+            cert.usesRawChildInvocationLogicalInput = true;
+
+          switch (slotCert.wrapperKind) {
+          case WrapperChainKind::Exact:
+            addLogicalInput(slotCert.logicalInputText);
+            break;
+          case WrapperChainKind::StringLiteral:
+          case WrapperChainKind::WideStringLiteral: {
+            cert.usesStringify = true;
+            if (slotCert.wrapperKind == WrapperChainKind::WideStringLiteral)
+              cert.usesWideStringify = true;
+            auto canon =
+                CanonicalizeStringifyInversePayload(slotCert.logicalInputText);
+            if (!canon || StringRef(*canon).trim() !=
+                              StringRef(slotCert.logicalInputText).trim()) {
+              cert.valid = false;
+              cert.failure =
+                  SemanticInteractionFailure::NonCanonicalLogicalInput;
+              cert.detail = formatv(
+                                "{0}: inv id={1} name={2} argIdx={3} "
+                                "interaction canonical logical payload "
+                                "failed",
+                                traceStage, inv.id, inv.name, argIdx)
+                                .str();
+              return cert;
+            }
+            addLogicalInput(*canon);
+            break;
+          }
+          }
+        }
+
+        const bool hasChildSyntax = cert.usesPreferredChildSyntax ||
+                                    cert.usesRawInvocationPreservation;
+        const bool hasStringify = cert.usesStringify;
+        const bool hasPaste = cert.touchesPaste;
+
+        if (hasPaste && hasStringify && cert.usesWideStringify) {
+          cert.kind = SemanticInteractionKind::WideStringifyPaste;
+        } else if (hasPaste && hasStringify) {
+          cert.kind = SemanticInteractionKind::StringifyPaste;
+        } else if (hasPaste && cert.usesRawInvocationPreservation) {
+          cert.kind = SemanticInteractionKind::RawInvocationPaste;
+        } else if (hasPaste && cert.usesPreferredChildSyntax) {
+          cert.kind = SemanticInteractionKind::ChildSyntaxPaste;
+        } else if (hasPaste) {
+          cert.kind = SemanticInteractionKind::Paste;
+        } else if (hasStringify && cert.usesWideStringify) {
+          cert.kind = SemanticInteractionKind::WideStringify;
+        } else if (hasStringify) {
+          cert.kind = SemanticInteractionKind::Stringify;
+        } else if (cert.usesRawInvocationPreservation) {
+          cert.kind = SemanticInteractionKind::RawInvocation;
+        } else if (cert.usesPreferredChildSyntax) {
+          cert.kind = SemanticInteractionKind::ChildSyntax;
+        } else {
+          cert.kind = SemanticInteractionKind::Plain;
+        }
+
+        if (hasChildSyntax && hasStringify && hasPaste)
+          cert.kind = SemanticInteractionKind::Mixed;
+
+        cert.detail = formatv(
+                          "semantic interaction: inv id={0} name={1} argIdx={2} "
+                          "kind={3} slots={4} logicalInputs={5} paste={6} "
+                          "rawChildInput={7}",
+                          inv.id, inv.name, argIdx,
+                          static_cast<unsigned>(cert.kind),
+                          cert.slotCertificates.size(),
+                          cert.canonicalLogicalInputs.size(),
+                          cert.touchesPaste ? 1 : 0,
+                          cert.usesRawChildInvocationLogicalInput ? 1 : 0)
+                          .str();
+        return cert;
+      };
+
+      auto buildSemanticInteractionSignature =
+          [&](const SemanticInteractionCertificate &interaction)
+          -> SemanticInteractionSignature {
+        SemanticInteractionSignature sig;
+        sig.touchesPaste = interaction.touchesPaste;
+        sig.usesPreferredChildSyntax = interaction.usesPreferredChildSyntax;
+        sig.usesRawInvocationPreservation =
+            interaction.usesRawInvocationPreservation;
+        sig.usesPassthroughFlatten = interaction.usesPassthroughFlatten;
+        sig.usesStringify = interaction.usesStringify;
+        sig.usesWideStringify = interaction.usesWideStringify;
+        sig.usesRawChildInvocationLogicalInput =
+            interaction.usesRawChildInvocationLogicalInput;
+        sig.canonicalLogicalInputs.assign(
+            interaction.canonicalLogicalInputs.begin(),
+            interaction.canonicalLogicalInputs.end());
+        llvm::sort(sig.canonicalLogicalInputs);
+        sig.canonicalLogicalInputs.erase(
+            std::unique(sig.canonicalLogicalInputs.begin(),
+                        sig.canonicalLogicalInputs.end()),
+            sig.canonicalLogicalInputs.end());
+        return sig;
+      };
+
+      auto buildFormalInteractionConsistencyCertificate =
+          [&](const RefoldModel::MacroInvocation &inv, uint32_t argIdx,
+              ArrayRef<SemanticInteractionCertificate> interactions,
+              StringRef traceStage) -> FormalInteractionConsistencyCertificate {
+        FormalInteractionConsistencyCertificate cert;
+        cert.inv = &inv;
+        cert.argIdx = argIdx;
+        cert.interactions.assign(interactions.begin(), interactions.end());
+
+        if (interactions.empty()) {
+          cert.detail = formatv(
+                            "{0}: inv id={1} name={2} argIdx={3} semantic "
+                            "interaction convergence vacuously satisfied",
+                            traceStage, inv.id, inv.name, argIdx)
+                            .str();
+          return cert;
+        }
+
+        cert.signature = buildSemanticInteractionSignature(interactions.front());
+        for (size_t i = 1; i < interactions.size(); ++i) {
+          auto sig = buildSemanticInteractionSignature(interactions[i]);
+          if (!(sig == cert.signature)) {
+            cert.valid = false;
+            cert.failure =
+                FormalInteractionConsistencyFailure::DivergentSemanticEvidence;
+            cert.detail = formatv(
+                              "{0}: inv id={1} name={2} argIdx={3} semantic "
+                              "interaction evidence diverged across "
+                              "observations",
+                              traceStage, inv.id, inv.name, argIdx)
+                              .str();
+            return cert;
+          }
+        }
+
+        cert.detail = formatv(
+                          "{0}: inv id={1} name={2} argIdx={3} semantic "
+                          "interaction convergence satisfied "
+                          "logicalInputs={4} paste={5} stringify={6} wide={7} "
+                          "rawInvocation={8} childSyntax={9} passthrough={10}",
+                          traceStage, inv.id, inv.name, argIdx,
+                          cert.signature.canonicalLogicalInputs.size(),
+                          cert.signature.touchesPaste ? 1 : 0,
+                          cert.signature.usesStringify ? 1 : 0,
+                          cert.signature.usesWideStringify ? 1 : 0,
+                          cert.signature.usesRawInvocationPreservation ? 1 : 0,
+                          cert.signature.usesPreferredChildSyntax ? 1 : 0,
+                          cert.signature.usesPassthroughFlatten ? 1 : 0)
+                          .str();
+        return cert;
+      };
+
+      auto buildObservedFormalRewriteCertificate =
+          [&](const RefoldModel::MacroInvocation &inv, uint32_t argIdx,
+              ArrayRef<ObservedFormalConstraint> observedConstraints,
+              const DenseMap<uint64_t, std::string> *preferredChildSyntax,
+              StringRef traceStage) -> FormalRewriteCertificate {
+        FormalRewriteCertificate cert;
+        cert.inv = &inv;
+        cert.argIdx = argIdx;
+
+        auto argText = getInvocationArgText(inv, argIdx);
+        if (!argText) {
+          cert.failure = FormalRewriteFailure::MissingArgumentText;
+          cert.detail =
+              formatv("{0}: inv id={1} name={2} argIdx={3} text unavailable",
+                      traceStage, inv.id, inv.name, argIdx)
+                  .str();
+          return cert;
+        }
+
+        const StringRef oldTrim = argText->trim();
+        for (const auto &constraint : observedConstraints) {
+          auto argRewriteCert = buildObservedArgRewriteCertificate(
+              inv, argIdx, constraint.oldText, constraint.newText,
+              preferredChildSyntax);
+          if (argRewriteCert.kind ==
+              ArgSemanticRewriteCertificateKind::Invalid) {
+            cert.failure = FormalRewriteFailure::RawRewriteNotCertifiable;
+            cert.detail = formatv(
+                              "{0}: inv id={1} name={2} argIdx={3} raw "
+                              "rewrite not certifiable ({4})",
+                              traceStage, inv.id, inv.name, argIdx,
+                              argRewriteCert.detail)
+                              .str();
+            return cert;
+          }
+
+          auto interactionCert = buildSemanticInteractionCertificate(
+              inv, argIdx, argRewriteCert, traceStage);
+          if (!interactionCert.valid) {
+            cert.failure = FormalRewriteFailure::RawRewriteNotCertifiable;
+            cert.detail = interactionCert.detail;
+            return cert;
+          }
+
+          cert.argRewriteCertificates.push_back(argRewriteCert);
+          cert.interactionCertificates.push_back(interactionCert);
+          cert.candidateRewrites.push_back(FormalTextPair{
+              oldTrim.str(), StringRef(argRewriteCert.rawArgNewText).trim().str()});
+        }
+
+        cert.interactionConsistency =
+            buildFormalInteractionConsistencyCertificate(
+                inv, argIdx, cert.interactionCertificates, traceStage);
+        if (!cert.interactionConsistency.valid) {
+          cert.failure = FormalRewriteFailure::InteractionConflict;
+          cert.detail = cert.interactionConsistency.detail;
+          return cert;
+        }
+
+        auto merged =
+            mergeCompatibleFormalRewrites(oldTrim, cert.candidateRewrites);
+        if (!merged) {
+          cert.failure = FormalRewriteFailure::MergeConflict;
+          cert.detail =
+              formatv("{0}: inv id={1} name={2} argIdx={3} rewrite merge "
+                      "conflicted",
+                      traceStage, inv.id, inv.name, argIdx)
+                  .str();
+          return cert;
+        }
+
+        const StringRef mergedTrim = StringRef(*merged).trim();
+        cert.oldText = oldTrim.str();
+        cert.newText = mergedTrim.str();
+        if (mergedTrim == oldTrim) {
+          cert.kind = FormalRewriteCertificateKind::NoChange;
+          cert.detail = formatv(
+                            "{0}: inv id={1} name={2} argIdx={3} certified "
+                            "rewrite collapsed to no-change old='{4}' new='{5}' "
+                            "argRewriteCerts={6} interactionCerts={7}",
+                            traceStage, inv.id, inv.name, argIdx, oldTrim,
+                            mergedTrim,
+                            cert.argRewriteCertificates.size(),
+                            cert.interactionCertificates.size())
+                            .str();
+          return cert;
+        }
+
+        const bool deferOccurrenceConsistency =
+            cert.interactionConsistency.signature.usesPreferredChildSyntax ||
+            cert.interactionConsistency.signature
+                .usesRawInvocationPreservation ||
+            cert.interactionConsistency.signature.usesStringify ||
+            cert.interactionConsistency.signature.usesWideStringify ||
+            cert.interactionConsistency.signature.touchesPaste;
+
+        cert.validation = buildRawFormalValidationCertificate(
+            inv, argIdx, oldTrim, mergedTrim, traceStage,
+            deferOccurrenceConsistency);
+        if (!cert.validation.valid) {
+          switch (cert.validation.failure) {
+          case RawFormalValidationFailure::ArityChange:
+            cert.failure = FormalRewriteFailure::ArityChange;
+            break;
+          case RawFormalValidationFailure::OccurrenceMismatch:
+            cert.failure = FormalRewriteFailure::OccurrenceMismatch;
+            break;
+          case RawFormalValidationFailure::None:
+            cert.failure = FormalRewriteFailure::None;
+            break;
+          }
+          cert.detail = cert.validation.detail;
+          return cert;
+        }
+
+        cert.kind = FormalRewriteCertificateKind::Unique;
+        return cert;
+      };
+
+      auto tryLexicalChildBridge =
+          [&](const RefoldModel::MacroInvocation &parent,
+              const RefoldModel::MacroInvocation &child,
+              const std::string &rewrittenChildSyntax)
+          -> std::optional<DenseMap<uint32_t, FormalTextPair>> {
+        DenseMap<uint32_t, FormalTextPair> out;
+        if (rewrittenChildSyntax.empty())
+          return std::nullopt;
+
+        std::optional<uint32_t> matchedFormal;
+        std::optional<LexicalChildPlaceholder> matchedSlot;
+        for (uint32_t parentFormal = 0; parentFormal < parent.invArgRanges.size();
+             ++parentFormal) {
+          auto argInfo = getTrimmedInvocationArgInfo(parent, parentFormal);
+          if (!argInfo)
+            continue;
+          auto slots = getTopLevelLexicalChildrenInArg(parent, parentFormal);
+          for (const auto &slot : slots) {
+            if (!slot.child || slot.child->id != child.id)
+              continue;
+            if (matchedFormal)
+              return std::nullopt;
+            matchedFormal = parentFormal;
+            matchedSlot = slot;
+          }
+        }
+
+        if (!matchedFormal || !matchedSlot)
+          return std::nullopt;
+
+        auto argInfo = getTrimmedInvocationArgInfo(parent, *matchedFormal);
+        if (!argInfo)
+          return std::nullopt;
+
+        if (matchedSlot->relEnd < matchedSlot->relBegin ||
+            matchedSlot->relEnd > argInfo->text.size())
+          return std::nullopt;
+
+        std::string rewrittenArg = stringutils::replaceRange(
+            argInfo->text, matchedSlot->relBegin, matchedSlot->relEnd,
+            rewrittenChildSyntax);
+        out[*matchedFormal] =
+            FormalTextPair{StringRef(argInfo->text).trim().str(),
+                           StringRef(rewrittenArg).trim().str()};
+        return out;
+      };
+
+      auto toSingleCharRefs = [&](StringRef s) {
+        std::vector<StringRef> refs;
+        refs.reserve(s.size());
+        for (size_t i = 0; i < s.size(); ++i)
+          refs.push_back(s.substr(i, 1));
+        return refs;
+      };
+
+      struct FormalRewriteHunk {
+        uint64_t oldBegin;
+        uint64_t oldEnd;
+        std::string repl;
+      };
+
+      mergeCompatibleFormalRewrites =
+          [&](StringRef baseOld0, ArrayRef<FormalTextPair> rewrites)
+          -> std::optional<std::string> {
+        const StringRef baseOld = baseOld0.trim();
+        std::vector<FormalRewriteHunk> merged;
+
+        for (const auto &rewrite : rewrites) {
+          if (StringRef(rewrite.oldText).trim() != baseOld)
+            return std::nullopt;
+
+          const StringRef newText = StringRef(rewrite.newText).trim();
+          if (newText == baseOld)
+            continue;
+
+          std::vector<StringRef> aRefs = toSingleCharRefs(baseOld);
+          std::vector<StringRef> bRefs = toSingleCharRefs(newText);
+          auto steps = diffutils::diff(aRefs, bRefs);
+          auto hunks = diffutils::coalesce(steps);
+
+          for (const auto &hunk : hunks) {
+            FormalRewriteHunk piece{hunk.aStart, hunk.aEnd,
+                                    newText.slice((size_t)hunk.bStart,
+                                                  (size_t)hunk.bEnd)
+                                        .str()};
+
+            auto sameHunk = [&](const FormalRewriteHunk &a,
+                                const FormalRewriteHunk &b) {
+              return a.oldBegin == b.oldBegin && a.oldEnd == b.oldEnd &&
+                     a.repl == b.repl;
+            };
+
+            auto overlaps = [&](const FormalRewriteHunk &a,
+                                const FormalRewriteHunk &b) {
+              return a.oldBegin < b.oldEnd && b.oldBegin < a.oldEnd;
+            };
+
+            auto it = std::lower_bound(
+                merged.begin(), merged.end(), piece.oldBegin,
+                [](const FormalRewriteHunk &h, uint64_t pos) {
+                  return h.oldBegin < pos;
+                });
+
+            if (it != merged.begin()) {
+              const auto &prev = *std::prev(it);
+              if (sameHunk(prev, piece))
+                continue;
+              if (overlaps(prev, piece))
+                return std::nullopt;
+            }
+            if (it != merged.end()) {
+              if (sameHunk(*it, piece))
+                continue;
+              if (overlaps(*it, piece))
+                return std::nullopt;
+            }
+
+            merged.insert(it, std::move(piece));
+          }
+        }
+
+        std::string out = baseOld.str();
+        for (auto it = merged.rbegin(); it != merged.rend(); ++it)
+          out.replace((size_t)it->oldBegin,
+                      (size_t)(it->oldEnd - it->oldBegin), it->repl);
+        return out;
+      };
+
+
+      auto mergeCompatibleCallsitePatchReplacements =
+          [&](StringRef baseOld, ArrayRef<StringRef> replacements)
+          -> std::optional<std::string> {
+        std::vector<FormalRewriteHunk> merged;
+
+        for (StringRef replText : replacements) {
+          if (replText == baseOld)
+            continue;
+
+          std::vector<StringRef> aRefs = toSingleCharRefs(baseOld);
+          std::vector<StringRef> bRefs = toSingleCharRefs(replText);
+          auto steps = diffutils::diff(aRefs, bRefs);
+          auto hunks = diffutils::coalesce(steps);
+
+          for (const auto &hunk : hunks) {
+            FormalRewriteHunk piece{hunk.aStart, hunk.aEnd,
+                                    replText.slice((size_t)hunk.bStart,
+                                                   (size_t)hunk.bEnd)
+                                        .str()};
+
+            auto sameHunk = [&](const FormalRewriteHunk &a,
+                                const FormalRewriteHunk &b) {
+              return a.oldBegin == b.oldBegin && a.oldEnd == b.oldEnd &&
+                     a.repl == b.repl;
+            };
+
+            auto overlaps = [&](const FormalRewriteHunk &a,
+                                const FormalRewriteHunk &b) {
+              return a.oldBegin < b.oldEnd && b.oldBegin < a.oldEnd;
+            };
+
+            auto it = std::lower_bound(
+                merged.begin(), merged.end(), piece.oldBegin,
+                [](const FormalRewriteHunk &h, uint64_t pos) {
+                  return h.oldBegin < pos;
+                });
+
+            if (it != merged.begin()) {
+              const auto &prev = *std::prev(it);
+              if (sameHunk(prev, piece))
+                continue;
+              if (overlaps(prev, piece))
+                return std::nullopt;
+            }
+            if (it != merged.end()) {
+              if (sameHunk(*it, piece))
+                continue;
+              if (overlaps(*it, piece))
+                return std::nullopt;
+            }
+
+            merged.insert(it, std::move(piece));
+          }
+        }
+
+        std::string out = baseOld.str();
+        for (auto it = merged.rbegin(); it != merged.rend(); ++it)
+          out.replace((size_t)it->oldBegin,
+                      (size_t)(it->oldEnd - it->oldBegin), it->repl);
+        return out;
+      };
+
+      enum class InvocationRewriteCertificateKind {
+        NoChange,
+        Unique,
+        Invalid,
+      };
+
+      enum class InvocationRewriteFailure {
+        None,
+        ArityChange,
+        OccurrenceMismatch,
+        MissingInvocationText,
+        MissingArgumentRanges,
+        PasteMismatch,
+      };
+
+      struct CertifiedFormalRewrite {
+        uint32_t argIdx = 0;
+        std::string oldText;
+        std::string newText;
+      };
+
+      struct InvocationRewriteCertificate {
+        InvocationRewriteCertificateKind kind =
+            InvocationRewriteCertificateKind::Invalid;
+        InvocationRewriteFailure failure = InvocationRewriteFailure::None;
+        const RefoldModel::MacroInvocation *inv = nullptr;
+        SmallVector<CertifiedFormalRewrite, 4> rewrites;
+        DenseMap<uint32_t, std::string> replacementByArgIdx;
+        SmallVector<RawFormalValidationCertificate, 4> formalValidations;
+        PasteRewriteValidationCertificate pasteValidation;
+        bool touchesPaste = false;
+        std::string detail;
+      };
+
+      auto buildInvocationRewriteCertificate =
+          [&](const RefoldModel::MacroInvocation &inv,
+              const DenseMap<uint32_t, FormalTextPair> &formals,
+              StringRef traceStage,
+              std::optional<StringRef> callsiteTextOverride = std::nullopt,
+              ArrayRef<std::pair<size_t, size_t>>
+                  callsiteArgRangesOverride =
+                      ArrayRef<std::pair<size_t, size_t>>(),
+              ArrayRef<uint32_t> deferOccurrenceArgIdxs = ArrayRef<uint32_t>())
+          -> InvocationRewriteCertificate {
+        InvocationRewriteCertificate cert;
+        cert.inv = &inv;
+
+        SmallVector<uint32_t, 8> argOrder;
+        argOrder.reserve(formals.size());
+        for (const auto &KV : formals)
+          argOrder.push_back(KV.first);
+        llvm::sort(argOrder);
+
+        for (uint32_t argIdx : argOrder) {
+          auto it = formals.find(argIdx);
+          if (it == formals.end())
+            continue;
+
+          StringRef oldText = StringRef(it->second.oldText).trim();
+          StringRef newText = StringRef(it->second.newText).trim();
+          if (oldText == newText)
+            continue;
+
+          const bool deferOccurrenceConsistency =
+              llvm::is_contained(deferOccurrenceArgIdxs, argIdx);
+          auto validation = buildRawFormalValidationCertificate(
+              inv, argIdx, oldText, newText, traceStage,
+              deferOccurrenceConsistency);
+          cert.formalValidations.push_back(validation);
+          if (!validation.valid) {
+            switch (validation.failure) {
+            case RawFormalValidationFailure::ArityChange:
+              cert.failure = InvocationRewriteFailure::ArityChange;
+              break;
+            case RawFormalValidationFailure::OccurrenceMismatch:
+              cert.failure = InvocationRewriteFailure::OccurrenceMismatch;
+              break;
+            case RawFormalValidationFailure::None:
+              cert.failure = InvocationRewriteFailure::None;
+              break;
+            }
+            cert.detail = validation.detail;
+            return cert;
+          }
+
+          cert.rewrites.push_back(
+              CertifiedFormalRewrite{argIdx, oldText.str(), newText.str()});
+          cert.replacementByArgIdx[argIdx] = newText.str();
+          if (!cert.touchesPaste) {
+            for (const auto &ps : inv.pasteSpans) {
+              if (ps.argIdx == argIdx) {
+                cert.touchesPaste = true;
+                break;
+              }
+            }
+          }
+        }
+
+        if (cert.rewrites.empty()) {
+          cert.kind = InvocationRewriteCertificateKind::NoChange;
+          return cert;
+        }
+
+        cert.pasteValidation = buildPasteRewriteValidationCertificate(
+            inv, cert.replacementByArgIdx, traceStage, callsiteTextOverride,
+            callsiteArgRangesOverride);
+        cert.touchesPaste = cert.pasteValidation.required;
+        if (!cert.pasteValidation.valid) {
+          switch (cert.pasteValidation.failure) {
+          case PasteRewriteValidationFailure::MissingInvocationText:
+            cert.failure = InvocationRewriteFailure::MissingInvocationText;
+            break;
+          case PasteRewriteValidationFailure::MissingArgumentRanges:
+            cert.failure = InvocationRewriteFailure::MissingArgumentRanges;
+            break;
+          case PasteRewriteValidationFailure::PasteMismatch:
+            cert.failure = InvocationRewriteFailure::PasteMismatch;
+            break;
+          case PasteRewriteValidationFailure::None:
+            cert.failure = InvocationRewriteFailure::None;
+            break;
+          }
+          cert.detail = cert.pasteValidation.detail;
+          return cert;
+        }
+
+        cert.kind = InvocationRewriteCertificateKind::Unique;
+        return cert;
+      };
+
+      auto buildRootFormalRewriteMapFromCallsiteReplacement =
+          [&](StringRef baseText, StringRef newText)
+          -> std::optional<DenseMap<uint32_t, FormalTextPair>> {
+        auto newRangesOpt = GetMacroInvocationFormalArgContentRanges(m, newText);
+        if (!newRangesOpt || newRangesOpt->size() != invArgRanges.size())
+          return std::nullopt;
+
+        DenseMap<uint32_t, FormalTextPair> formals;
+        for (uint32_t argIdx = 0; argIdx < invArgRanges.size(); ++argIdx) {
+          const auto &oldR = invArgRanges[argIdx];
+          const auto &newR = (*newRangesOpt)[argIdx];
+          if (oldR.first > oldR.second || oldR.second > baseText.size() ||
+              newR.first > newR.second || newR.second > newText.size())
+            return std::nullopt;
+
+          StringRef oldArg =
+              baseText.slice((size_t)oldR.first, (size_t)oldR.second).trim();
+          StringRef newArg =
+              newText.slice((size_t)newR.first, (size_t)newR.second).trim();
+          if (oldArg == newArg)
+            continue;
+
+          formals[argIdx] = FormalTextPair{oldArg.str(), newArg.str()};
+        }
+
+        return formals;
+      };
+
+      enum class ParentConstraintDerivationFailure {
+        None,
+        MissingArgDeps,
+        EmptyArgDeps,
+        MissingArgRefs,
+        TemplateNotCertifiable,
+        InversionNotUnique,
+        IncompleteDerivation,
+      };
+
+      struct ParentConstraintDerivationCertificate {
+        bool valid = false;
+        uint32_t childFormal = 0;
+        ParentConstraintDerivationFailure failure =
+            ParentConstraintDerivationFailure::None;
+        SmallVector<std::pair<uint32_t, ObservedFormalConstraint>, 4>
+            derivedConstraints;
+        std::string detail;
+      };
+
+      auto buildParentConstraintDerivationCertificate =
+          [&](const RefoldModel::MacroInvocation &cur, uint32_t curFormal,
+              StringRef curOld, StringRef curNew,
+              StringRef traceStage) -> ParentConstraintDerivationCertificate {
+        ParentConstraintDerivationCertificate cert;
+        cert.childFormal = curFormal;
+
+        auto formatCurFormalContext = [&]() -> std::string {
+          std::string out;
+          raw_string_ostream os(out);
+          os << "child id=" << cur.id << " name=" << cur.name
+             << " argIdx=" << curFormal << " old='" << curOld.trim()
+             << "' new='" << curNew.trim() << "' invText='";
+          if (cur.invText)
+            os << *cur.invText;
+          else
+            os << "<none>";
+          os << "' invArgRange=";
+          if (curFormal < cur.invArgRanges.size())
+            os << FormatInvocationArgRange(cur.invArgRanges[curFormal]);
+          else
+            os << "<missing>";
+          os << " argDeps=";
+          if (curFormal < cur.argDeps.size())
+            os << FormatUInt32List(cur.argDeps[curFormal]);
+          else
+            os << "<missing>";
+          os << " argRefs=";
+          if (curFormal < cur.argRefs.size())
+            os << FormatInvArgRefList(cur.argRefs[curFormal]);
+          else
+            os << "<missing>";
+          return os.str();
+        };
+
+        if (curFormal >= cur.argDeps.size()) {
+          cert.failure = ParentConstraintDerivationFailure::MissingArgDeps;
+          trace("macro/dag", "{0}: derivation failure context: {1}",
+                traceStage, formatCurFormalContext());
+          cert.detail = formatv(
+                            "{0}: child id={1} name={2} argIdx={3} missing "
+                            "argDeps entry; lexical bridge required",
+                            traceStage, cur.id, cur.name, curFormal)
+                            .str();
+          return cert;
+        }
+        ArrayRef<uint32_t> deps = cur.argDeps[curFormal];
+        if (deps.empty()) {
+          cert.failure = ParentConstraintDerivationFailure::EmptyArgDeps;
+          trace("macro/dag", "{0}: derivation failure context: {1}",
+                traceStage, formatCurFormalContext());
+          cert.detail = formatv(
+                            "{0}: child id={1} name={2} argIdx={3} has "
+                            "empty argDeps; lexical bridge required",
+                            traceStage, cur.id, cur.name, curFormal)
+                            .str();
+          return cert;
+        }
+
+        if (curFormal >= cur.argRefs.size()) {
+          cert.failure = ParentConstraintDerivationFailure::MissingArgRefs;
+          trace("macro/dag", "{0}: derivation failure context: {1}",
+                traceStage, formatCurFormalContext());
+          cert.detail = formatv(
+                            "{0}: child id={1} name={2} argIdx={3} missing "
+                            "argRefs entry; lexical bridge required",
+                            traceStage, cur.id, cur.name, curFormal)
+                            .str();
+          return cert;
+        }
+
+        auto tpl = buildArgRefTemplate(cur, curFormal);
+        if (!tpl || tpl->refs.empty() ||
+            !sameIndexSet(deps, tpl->distinctCallerParams)) {
+          cert.failure =
+              ParentConstraintDerivationFailure::TemplateNotCertifiable;
+          trace("macro/dag", "{0}: derivation failure context: {1}",
+                traceStage, formatCurFormalContext());
+          cert.detail = formatv(
+                            "{0}: child id={1} name={2} argIdx={3} arg-ref "
+                            "template not certifiable; lexical bridge "
+                            "required",
+                            traceStage, cur.id, cur.name, curFormal)
+                            .str();
+          return cert;
+        }
+
+        auto oldCert = buildArgRefInvertibilityCertificate(*tpl, curOld);
+        auto newCert = buildArgRefInvertibilityCertificate(*tpl, curNew);
+        if (oldCert.kind != ArgRefInvertibilityKind::Unique ||
+            newCert.kind != ArgRefInvertibilityKind::Unique) {
+          cert.failure = ParentConstraintDerivationFailure::InversionNotUnique;
+          trace("macro/dag", "{0}: derivation failure context: {1}",
+                traceStage, formatCurFormalContext());
+          cert.detail = formatv(
+                            "{0}: child id={1} name={2} argIdx={3} arg-ref "
+                            "inversion not unique; lexical bridge required",
+                            traceStage, cur.id, cur.name, curFormal)
+                            .str();
+          return cert;
+        }
+
+        for (uint32_t parentFormal : tpl->distinctCallerParams) {
+          auto oldIt = oldCert.derivedTextByCallerParam.find(parentFormal);
+          auto newIt = newCert.derivedTextByCallerParam.find(parentFormal);
+          if (oldIt == oldCert.derivedTextByCallerParam.end() ||
+              newIt == newCert.derivedTextByCallerParam.end()) {
+            cert.failure =
+                ParentConstraintDerivationFailure::IncompleteDerivation;
+            trace("macro/dag", "{0}: derivation failure context: {1}",
+                traceStage, formatCurFormalContext());
+          cert.detail = formatv(
+                              "{0}: child id={1} name={2} argIdx={3} "
+                              "parent formal derivation incomplete; lexical "
+                              "bridge required",
+                              traceStage, cur.id, cur.name, curFormal)
+                              .str();
+            cert.derivedConstraints.clear();
+            return cert;
+          }
+          cert.derivedConstraints.push_back(
+              {parentFormal,
+               ObservedFormalConstraint{oldIt->second, newIt->second}});
+        }
+
+        cert.valid = true;
+        return cert;
+      };
+
+      enum class StructuredLiftCertificateKind {
+        Unique,
+        NeedsLexicalBridge,
+        Invalid,
+      };
+
+      struct StructuredLiftCertificate {
+        StructuredLiftCertificateKind kind =
+            StructuredLiftCertificateKind::Invalid;
+        const RefoldModel::MacroInvocation *nextInv = nullptr;
+        DenseMap<uint32_t, FormalTextPair> nextFormals;
+        InvocationRewriteCertificate currentCert;
+        SmallVector<ParentConstraintDerivationCertificate, 4> derivations;
+        SmallVector<FormalRewriteCertificate, 4> parentFormalCertificates;
+        InvocationRewriteCertificate parentCert;
+        std::string rewrittenChildSyntax;
+        std::string detail;
+      };
+
+      auto buildStructuredLiftCertificate =
+          [&](const RefoldModel::MacroInvocation &cur,
+              const DenseMap<uint32_t, FormalTextPair> &curFormals)
+          -> StructuredLiftCertificate {
+        StructuredLiftCertificate cert;
+
+        auto formatFormalTextPairs =
+            [&](const DenseMap<uint32_t, FormalTextPair> &formals)
+            -> std::string {
+          std::vector<std::pair<uint32_t, const FormalTextPair *>> ordered;
+          ordered.reserve(formals.size());
+          for (const auto &KV : formals)
+            ordered.push_back({KV.first, &KV.second});
+          llvm::sort(ordered, [](const auto &L, const auto &R) {
+            return L.first < R.first;
+          });
+          std::string out;
+          raw_string_ostream os(out);
+          os << "{";
+          for (size_t i = 0; i < ordered.size(); ++i) {
+            if (i)
+              os << ", ";
+            os << ordered[i].first << ":'" << ordered[i].second->oldText
+               << "'->'" << ordered[i].second->newText << "'";
+          }
+          os << "}";
+          return os.str();
+        };
+
+        auto formatObservedConstraintsMap =
+            [&](const DenseMap<uint32_t,
+                               SmallVector<ObservedFormalConstraint, 2>>
+                    &observed) -> std::string {
+          std::vector<uint32_t> keys;
+          keys.reserve(observed.size());
+          for (const auto &KV : observed)
+            keys.push_back(KV.first);
+          llvm::sort(keys);
+          std::string out;
+          raw_string_ostream os(out);
+          os << "{";
+          for (size_t i = 0; i < keys.size(); ++i) {
+            if (i)
+              os << ", ";
+            os << keys[i] << ":[";
+            auto found = observed.find(keys[i]);
+            if (found != observed.end()) {
+              const auto &constraints = found->second;
+              for (size_t j = 0; j < constraints.size(); ++j) {
+                if (j)
+                  os << ", ";
+                os << "'" << constraints[j].oldText << "'->'"
+                   << constraints[j].newText << "'";
+              }
+            }
+            os << "]";
+          }
+          os << "}";
+          return os.str();
+        };
+
+        trace("macro/dag",
+              "DAG per-hop enter: child id={0} name={1} curFormals={2}",
+              cur.id, cur.name, formatFormalTextPairs(curFormals));
+
+        auto curCert =
+            buildInvocationRewriteCertificate(cur, curFormals, "DAG per-hop");
+        cert.currentCert = curCert;
+        if (curCert.kind == InvocationRewriteCertificateKind::Invalid) {
+          cert.detail = curCert.detail;
+          return cert;
+        }
+
+        DenseMap<uint32_t, std::string> curFormalSyntax;
+        for (const auto &KV : curFormals)
+          curFormalSyntax[KV.first] = KV.second.newText;
+        if (auto curSyntax = buildRewrittenInvocationSyntax(cur, curFormalSyntax))
+          cert.rewrittenChildSyntax = std::move(*curSyntax);
+        trace("macro/dag",
+              "DAG per-hop child syntax: child id={0} name={1} syntax='{2}' "
+              "currentCertKind={3} detail={4}",
+              cur.id, cur.name, cert.rewrittenChildSyntax,
+              static_cast<unsigned>(curCert.kind), curCert.detail);
+
+        const RefoldModel::MacroInvocation *parent = nullptr;
+        if (cur.callerMacroId) {
+          auto parentIt = invById.find(*cur.callerMacroId);
+          if (parentIt == invById.end()) {
+            cert.detail =
+                formatv("DAG per-hop: missing caller invocation: child id={0} "
+                        "name={1} callerId={2}",
+                        cur.id, cur.name, *cur.callerMacroId)
+                    .str();
+            return cert;
+          }
+          parent = parentIt->second;
+        } else {
+          trace("macro/dag",
+                "DAG per-hop: child id={0} name={1} has no callerMacroId; "
+                "forcing lexical bridge to root with syntax='{2}'",
+                cur.id, cur.name, cert.rewrittenChildSyntax);
+          cert.kind = StructuredLiftCertificateKind::NeedsLexicalBridge;
+          cert.nextInv = &m;
+          cert.detail = formatv(
+                            "DAG per-hop: child id={0} name={1} requires "
+                            "lexical bridge to root",
+                            cur.id, cur.name)
+                            .str();
+          return cert;
+        }
+
+        DenseMap<uint32_t, SmallVector<ObservedFormalConstraint, 2>>
+            parentObserved;
+        bool needLexicalBridge = false;
+        for (const auto &KV : curFormals) {
+          const uint32_t curFormal = KV.first;
+          StringRef curOld = KV.second.oldText;
+          StringRef curNew = KV.second.newText;
+
+          auto derivationCert = buildParentConstraintDerivationCertificate(
+              cur, curFormal, curOld, curNew, "DAG per-hop");
+          cert.derivations.push_back(derivationCert);
+          if (!derivationCert.valid) {
+            cert.detail = derivationCert.detail;
+            needLexicalBridge = true;
+            break;
+          }
+
+          for (const auto &derived : derivationCert.derivedConstraints) {
+            const uint32_t parentFormal = derived.first;
+            const ObservedFormalConstraint &constraint = derived.second;
+            auto &constraints = parentObserved[parentFormal];
+            bool seen = false;
+            for (const auto &existing : constraints) {
+              if (existing.oldText == constraint.oldText &&
+                  existing.newText == constraint.newText) {
+                seen = true;
+                break;
+              }
+            }
+            if (!seen)
+              constraints.push_back(constraint);
+          }
+        }
+
+        if (needLexicalBridge) {
+          trace("macro/dag",
+                "DAG per-hop forcing lexical bridge: child id={0} name={1} "
+                "parent id={2} name={3} childSyntax='{4}' curFormals={5} "
+                "reason={6}",
+                cur.id, cur.name, parent ? parent->id : 0,
+                parent ? parent->name : StringRef("<none>"),
+                cert.rewrittenChildSyntax, formatFormalTextPairs(curFormals),
+                cert.detail);
+          cert.kind = StructuredLiftCertificateKind::NeedsLexicalBridge;
+          cert.nextInv = parent;
+          return cert;
+        }
+
+        DenseMap<uint64_t, std::string> preferredChildSyntax;
+        if (!cert.rewrittenChildSyntax.empty())
+          preferredChildSyntax[cur.id] = cert.rewrittenChildSyntax;
+
+        trace("macro/dag",
+              "DAG per-hop derived parent observations: child id={0} name={1} "
+              "parent id={2} name={3} observed={4} preferredChildSyntax='{5}'",
+              cur.id, cur.name, parent->id, parent->name,
+              formatObservedConstraintsMap(parentObserved),
+              cert.rewrittenChildSyntax);
+
+        DenseMap<uint32_t, FormalTextPair> parentFormals;
+        for (const auto &KV : parentObserved) {
+          const uint32_t parentFormal = KV.first;
+          auto formalCert = buildObservedFormalRewriteCertificate(
+              *parent, parentFormal, KV.second,
+              preferredChildSyntax.empty() ? nullptr : &preferredChildSyntax,
+              "DAG per-hop");
+          cert.parentFormalCertificates.push_back(formalCert);
+          if (formalCert.kind == FormalRewriteCertificateKind::Invalid) {
+            trace("macro/dag",
+                  "DAG per-hop parent formal invalid: child id={0} name={1} "
+                  "parent id={2} name={3} parentFormal={4} observed={5} "
+                  "preferredChildSyntax='{6}' detail={7}",
+                  cur.id, cur.name, parent->id, parent->name, parentFormal,
+                  formatObservedConstraintsMap(parentObserved),
+                  cert.rewrittenChildSyntax, formalCert.detail);
+            cert.detail = formatv(
+                              "{0}; lexical bridge required",
+                              formalCert.detail)
+                              .str();
+            cert.kind = StructuredLiftCertificateKind::NeedsLexicalBridge;
+            cert.nextInv = parent;
+            return cert;
+          }
+          if (formalCert.kind == FormalRewriteCertificateKind::NoChange)
+            continue;
+
+          parentFormals[parentFormal] =
+              FormalTextPair{formalCert.oldText, formalCert.newText};
+        }
+
+        auto parentCert =
+            buildInvocationRewriteCertificate(*parent, parentFormals,
+                                             "DAG per-hop");
+        cert.parentCert = parentCert;
+        if (parentCert.kind == InvocationRewriteCertificateKind::Invalid) {
+          trace("macro/dag",
+                "DAG per-hop parent invocation invalid: child id={0} name={1} "
+                "parent id={2} name={3} parentFormals={4} detail={5}",
+                cur.id, cur.name, parent->id, parent->name,
+                formatFormalTextPairs(parentFormals), parentCert.detail);
+          cert.detail = parentCert.detail;
+          cert.kind = StructuredLiftCertificateKind::NeedsLexicalBridge;
+          cert.nextInv = parent;
+          return cert;
+        }
+        if (parentCert.kind == InvocationRewriteCertificateKind::NoChange) {
+          cert.detail = formatv(
+                            "DAG per-hop: parent invocation no-change child "
+                            "id={0} name={1} parent id={2} name={3} "
+                            "parentFormals={4}",
+                            cur.id, cur.name, parent->id, parent->name,
+                            parentFormals.size())
+                            .str();
+        } else {
+          cert.detail = formatv(
+                            "DAG per-hop: structured hop child id={0} name={1} "
+                            "parent id={2} name={3} parentFormals={4}",
+                            cur.id, cur.name, parent->id, parent->name,
+                            parentFormals.size())
+                            .str();
+        }
+
+        trace("macro/dag",
+              "DAG per-hop UNIQUE: child id={0} name={1} parent id={2} "
+              "name={3} nextFormals={4} detail={5}",
+              cur.id, cur.name, parent->id, parent->name,
+              formatFormalTextPairs(parentFormals), cert.detail);
+        cert.kind = StructuredLiftCertificateKind::Unique;
+        cert.nextInv = parent;
+        cert.nextFormals = std::move(parentFormals);
+        return cert;
+      };
+
+      enum class LiftChainCertificateKind {
+        Unique,
+        Invalid,
+      };
+
+      struct LiftChainCertificate {
+        LiftChainCertificateKind kind = LiftChainCertificateKind::Invalid;
+        const RefoldModel::MacroInvocation *leaf = nullptr;
+        uint32_t leafArgIdx = 0;
+        std::string leafOldText;
+        std::string leafNewText;
+        SmallVector<StructuredLiftCertificate, 4> steps;
+        bool usedLexicalBridge = false;
+        DenseMap<uint32_t, FormalTextPair> rootFormals;
+        std::string detail;
+      };
+
+      auto buildLiftChainCertificate =
+          [&](const RefoldModel::MacroInvocation &leaf, uint32_t leafArgIdx,
+              StringRef leafOld, StringRef leafNew) -> LiftChainCertificate {
+        LiftChainCertificate cert;
+        cert.leaf = &leaf;
+        cert.leafArgIdx = leafArgIdx;
+        cert.leafOldText = leafOld.trim().str();
+        cert.leafNewText = leafNew.trim().str();
+
+        const RefoldModel::MacroInvocation *cur = &leaf;
+        DenseMap<uint32_t, FormalTextPair> curFormals;
+        curFormals[leafArgIdx] =
+            FormalTextPair{leafOld.trim().str(), leafNew.trim().str()};
+
+        while (cur->id != m.id) {
+          auto step = buildStructuredLiftCertificate(*cur, curFormals);
+          cert.steps.push_back(step);
+          trace("macro/dag",
+                "DAG lift-chain step: current id={0} name={1} stepKind={2} "
+                "detail={3}",
+                cur->id, cur->name, static_cast<unsigned>(step.kind),
+                step.detail);
+          if (step.kind == StructuredLiftCertificateKind::Invalid) {
+            cert.detail = step.detail;
+            return cert;
+          }
+
+          if (step.kind == StructuredLiftCertificateKind::Unique) {
+            if (!step.nextInv) {
+              cert.detail = formatv(
+                                "DAG lift chain: missing next invocation "
+                                "after structured hop child id={0} name={1}",
+                                cur->id, cur->name)
+                                .str();
+              return cert;
+            }
+            cur = step.nextInv;
+            curFormals = std::move(step.nextFormals);
+            continue;
+          }
+
+          if (!step.nextInv || step.rewrittenChildSyntax.empty()) {
+            cert.detail = formatv(
+                              "DAG lift chain: lexical bridge unavailable "
+                              "child id={0} name={1}",
+                              cur->id, cur->name)
+                              .str();
+            return cert;
+          }
+
+          trace("macro/dag",
+                "DAG lift-chain lexical bridge attempt: parent id={0} "
+                "name={1} child id={2} name={3} rewrittenChildSyntax='{4}'",
+                step.nextInv->id, step.nextInv->name, cur->id, cur->name,
+                step.rewrittenChildSyntax);
+          auto bridged = tryLexicalChildBridge(*step.nextInv, *cur,
+                                               step.rewrittenChildSyntax);
+          if (!bridged) {
+            cert.detail = formatv(
+                              "DAG lift chain: lexical bridge failed "
+                              "parent id={0} name={1} child id={2} name={3}",
+                              step.nextInv->id, step.nextInv->name, cur->id,
+                              cur->name)
+                              .str();
+            return cert;
+          }
+
+          {
+            std::string bridgedDesc;
+            raw_string_ostream os(bridgedDesc);
+            os << "{";
+            bool first = true;
+            for (const auto &KV : *bridged) {
+              if (!first)
+                os << ", ";
+              first = false;
+              os << KV.first << ":'" << KV.second.oldText << "'->'"
+                 << KV.second.newText << "'";
+            }
+            os << "}";
+            trace("macro/dag",
+                  "DAG lift-chain lexical bridge success: parent id={0} "
+                  "name={1} bridgedFormals={2}",
+                  step.nextInv->id, step.nextInv->name, os.str());
+          }
+          cert.usedLexicalBridge = true;
+          cur = step.nextInv;
+          curFormals = std::move(*bridged);
+        }
+
+        for (const auto &KV : curFormals)
+          cert.rootFormals[KV.first] = KV.second;
+        cert.kind = LiftChainCertificateKind::Unique;
+        cert.detail = formatv(
+                          "DAG lift chain: leaf id={0} name={1} argIdx={2} "
+                          "steps={3} lexicalBridge={4} rootFormals={5}",
+                          leaf.id, leaf.name, leafArgIdx, cert.steps.size(),
+                          cert.usedLexicalBridge ? 1 : 0,
+                          cert.rootFormals.size())
+                          .str();
+        return cert;
+      };
+
+      auto mergeCompatibleRootFormalRewrites =
+          [&](StringRef baseOld0, ArrayRef<FormalTextPair> rewrites)
+          -> std::optional<std::string> {
+        return mergeCompatibleFormalRewrites(baseOld0, rewrites);
+      };
+
+      enum class RootFormalMergeCertificateKind {
+        NoChange,
+        Unique,
+        Invalid,
+      };
+
+      enum class RootFormalMergeFailure {
+        None,
+        ArgIndexOutOfBounds,
+        InvalidArgRange,
+        MergeConflict,
+      };
+
+      struct RootFormalMergeCertificate {
+        RootFormalMergeCertificateKind kind =
+            RootFormalMergeCertificateKind::Invalid;
+        RootFormalMergeFailure failure = RootFormalMergeFailure::None;
+        uint32_t argIdx = 0;
+        SmallVector<FormalTextPair, 2> observedRewrites;
+        std::string baseArgText;
+        std::string mergedArgText;
+        std::string detail;
+      };
+
+      auto buildRootFormalMergeCertificate =
+          [&](uint32_t argIdx, ArrayRef<FormalTextPair> rewrites,
+              StringRef traceStage) -> RootFormalMergeCertificate {
+        RootFormalMergeCertificate cert;
+        cert.argIdx = argIdx;
+        cert.observedRewrites.assign(rewrites.begin(), rewrites.end());
+
+        if (argIdx >= invArgRanges.size()) {
+          cert.failure = RootFormalMergeFailure::ArgIndexOutOfBounds;
+          cert.detail = formatv(
+                            "{0}: root arg index out of bounds root id={1} "
+                            "name={2} argIdx={3} numArgs={4}",
+                            traceStage, m.id, m.name, argIdx,
+                            invArgRanges.size())
+                            .str();
+          return cert;
+        }
+
+        const size_t begin = invArgRanges[argIdx].first;
+        const size_t end = invArgRanges[argIdx].second;
+        if (begin > end || end > invSpanText.size()) {
+          cert.failure = RootFormalMergeFailure::InvalidArgRange;
+          cert.detail =
+              formatv("{0}: root arg range invalid root id={1} name={2} "
+                      "argIdx={3} range=[{4},{5}) spanLen={6}",
+                      traceStage, m.id, m.name, argIdx, begin, end,
+                      invSpanText.size())
+                  .str();
+          return cert;
+        }
+
+        const StringRef baseArgText = invSpanText.slice(begin, end).trim();
+        cert.baseArgText = baseArgText.str();
+
+        auto mergedNewArg =
+            mergeCompatibleRootFormalRewrites(baseArgText, rewrites);
+        if (!mergedNewArg) {
+          cert.failure = RootFormalMergeFailure::MergeConflict;
+          cert.detail = formatv(
+                            "{0}: root rewrite merge conflicted root id={1} "
+                            "name={2} argIdx={3}",
+                            traceStage, m.id, m.name, argIdx)
+                            .str();
+          return cert;
+        }
+
+        cert.mergedArgText = StringRef(*mergedNewArg).trim().str();
+        cert.kind = cert.baseArgText == cert.mergedArgText
+                        ? RootFormalMergeCertificateKind::NoChange
+                        : RootFormalMergeCertificateKind::Unique;
+        return cert;
+      };
+
+      // Small utility structs for accumulating per-formal old/new and then
+      // converting them into root-level byte edits in invSpanText.
+      struct OldNewText {
+        std::string oldText;
+        std::string newText;
+      };
+
+      enum class SubtreeRewriteCertificateKind {
+        NoChange,
+        Unique,
+        Invalid,
+      };
+
+      struct SubtreeInteractionSummaryCertificate {
+        bool valid = true;
+        bool hasPaste = false;
+        bool hasStringify = false;
+        bool hasWideStringify = false;
+        bool hasRawInvocation = false;
+        bool hasPreferredChildSyntax = false;
+        bool hasMixedInteractions = false;
+        bool hasStringifyPaste = false;
+        bool hasWideStringifyPaste = false;
+        bool hasRawInvocationPaste = false;
+        bool hasChildSyntaxPaste = false;
+        SmallVector<SemanticInteractionCertificate, 16> interactions;
+        std::string detail;
+      };
+
+      enum class SubtreeSemanticAdmissibilityFailure {
+        None,
+        MixedSemanticInteractions,
+        LexicalBridgeWithStructuredSemantics,
+      };
+
+      struct SubtreeSemanticAdmissibilityCertificate {
+        bool valid = true;
+        SubtreeSemanticAdmissibilityFailure failure =
+            SubtreeSemanticAdmissibilityFailure::None;
+        std::string detail;
+      };
+
+      struct SubtreeSemanticCertificate {
+        bool valid = false;
+        bool usesLexicalBridge = false;
+        bool touchesPaste = false;
+        bool hasWrapperSemantics = false;
+        bool hasStringifySemantics = false;
+        bool hasWideStringifySemantics = false;
+        bool hasPreferredChildSyntax = false;
+        bool hasRawInvocationPreservation = false;
+        bool hasPassthroughFlatten = false;
+        SmallVector<InvocationRewriteCertificate, 8> invocationCertificates;
+        SmallVector<FormalRewriteCertificate, 16> formalCertificates;
+        SmallVector<ArgSemanticRewriteCertificate, 16> argCertificates;
+        SmallVector<SlotSemanticRewriteCertificate, 32> slotCertificates;
+        SmallVector<SemanticInteractionCertificate, 32> interactionCertificates;
+        SmallVector<FormalInteractionConsistencyCertificate, 16>
+            formalInteractionConsistencies;
+        SmallVector<RawFormalValidationCertificate, 16> rawFormalValidations;
+        SmallVector<PasteRewriteValidationCertificate, 8> pasteValidations;
+        SmallVector<ParentConstraintDerivationCertificate, 16>
+            parentDerivations;
+        SmallVector<StructuredLiftCertificate, 8> structuredLiftCertificates;
+        SmallVector<LiftChainCertificate, 4> liftChains;
+        SmallVector<RootFormalMergeCertificate, 4> rootMergeCertificates;
+        SubtreeInteractionSummaryCertificate interactionSummary;
+        SubtreeInteractionConsistencyCertificate interactionConsistency;
+        SubtreeSemanticAdmissibilityCertificate admissibility;
+        std::string detail;
+      };
+
+      struct SubtreeRewriteCertificate {
+        SubtreeRewriteCertificateKind kind =
+            SubtreeRewriteCertificateKind::Invalid;
+        const RefoldModel::MacroInvocation *leaf = nullptr;
+        const RefoldModel::MacroInvocation *root = nullptr;
+        DenseMap<uint32_t, FormalTextPair> leafFormals;
+        DenseMap<uint32_t, FormalTextPair> rootFormals;
+        InvocationRewriteCertificate leafCert;
+        InvocationRewriteCertificate rootCert;
+        SmallVector<LiftChainCertificate, 4> liftCertificates;
+        SmallVector<RootFormalMergeCertificate, 4> rootMergeCertificates;
+        SubtreeSemanticCertificate semantic;
+        std::string detail;
+      };
+
+      auto buildSubtreeInteractionSummaryCertificate =
+          [&](ArrayRef<SemanticInteractionCertificate> interactions)
+          -> SubtreeInteractionSummaryCertificate {
+        SubtreeInteractionSummaryCertificate cert;
+        cert.interactions.assign(interactions.begin(), interactions.end());
+
+        for (const auto &interaction : interactions) {
+          cert.hasPaste |= interaction.touchesPaste;
+          cert.hasStringify |= interaction.usesStringify;
+          cert.hasWideStringify |= interaction.usesWideStringify;
+          cert.hasRawInvocation |= interaction.usesRawInvocationPreservation;
+          cert.hasPreferredChildSyntax |= interaction.usesPreferredChildSyntax;
+          switch (interaction.kind) {
+          case SemanticInteractionKind::Plain:
+          case SemanticInteractionKind::ChildSyntax:
+          case SemanticInteractionKind::RawInvocation:
+          case SemanticInteractionKind::Stringify:
+          case SemanticInteractionKind::WideStringify:
+          case SemanticInteractionKind::Paste:
+            break;
+          case SemanticInteractionKind::ChildSyntaxPaste:
+            cert.hasChildSyntaxPaste = true;
+            break;
+          case SemanticInteractionKind::RawInvocationPaste:
+            cert.hasRawInvocationPaste = true;
+            break;
+          case SemanticInteractionKind::StringifyPaste:
+            cert.hasStringifyPaste = true;
+            break;
+          case SemanticInteractionKind::WideStringifyPaste:
+            cert.hasStringifyPaste = true;
+            cert.hasWideStringifyPaste = true;
+            break;
+          case SemanticInteractionKind::Mixed:
+            cert.hasMixedInteractions = true;
+            break;
+          }
+        }
+
+        cert.detail = formatv(
+                          "subtree interaction summary: interactions={0} "
+                          "paste={1} stringify={2} wide={3} rawInvocation={4} "
+                          "childSyntax={5} stringifyPaste={6} "
+                          "wideStringifyPaste={7} rawInvocationPaste={8} "
+                          "childSyntaxPaste={9} mixed={10}",
+                          cert.interactions.size(), cert.hasPaste ? 1 : 0,
+                          cert.hasStringify ? 1 : 0,
+                          cert.hasWideStringify ? 1 : 0,
+                          cert.hasRawInvocation ? 1 : 0,
+                          cert.hasPreferredChildSyntax ? 1 : 0,
+                          cert.hasStringifyPaste ? 1 : 0,
+                          cert.hasWideStringifyPaste ? 1 : 0,
+                          cert.hasRawInvocationPaste ? 1 : 0,
+                          cert.hasChildSyntaxPaste ? 1 : 0,
+                          cert.hasMixedInteractions ? 1 : 0)
+                          .str();
+        return cert;
+      };
+
+      auto buildSubtreeInteractionConsistencyCertificate =
+          [&](ArrayRef<FormalRewriteCertificate> formalCertificates)
+          -> SubtreeInteractionConsistencyCertificate {
+        SubtreeInteractionConsistencyCertificate cert;
+        StringMap<size_t> keyToIndex;
+
+        auto makeKey = [&](const RefoldModel::MacroInvocation *inv,
+                           uint32_t argIdx) -> std::string {
+          return formatv("{0}#{1}", inv ? inv->id : 0, argIdx).str();
+        };
+
+        for (const auto &formalCert : formalCertificates) {
+          cert.formalConsistencies.push_back(formalCert.interactionConsistency);
+          const auto &consistency = cert.formalConsistencies.back();
+          if (!consistency.valid) {
+            cert.valid = false;
+            cert.failure =
+                SubtreeInteractionConsistencyFailure::DivergentFormalSemantics;
+            cert.detail = consistency.detail;
+            return cert;
+          }
+
+          std::string key = makeKey(consistency.inv, consistency.argIdx);
+          auto it = keyToIndex.find(key);
+          if (it == keyToIndex.end()) {
+            keyToIndex[key] = cert.formalConsistencies.size() - 1;
+            continue;
+          }
+
+          const auto &existing = cert.formalConsistencies[it->second];
+          if (!(existing.signature == consistency.signature)) {
+            cert.valid = false;
+            cert.failure =
+                SubtreeInteractionConsistencyFailure::DivergentFormalSemantics;
+            cert.detail = formatv(
+                              "subtree semantic interaction consistency "
+                              "failed: inv id={0} argIdx={1} formal semantic "
+                              "evidence diverged across lift/root paths",
+                              consistency.inv ? consistency.inv->id : 0,
+                              consistency.argIdx)
+                              .str();
+            return cert;
+          }
+        }
+
+        cert.detail = formatv(
+                          "subtree interaction consistency: formals={0} "
+                          "uniqueFormals={1}",
+                          cert.formalConsistencies.size(), keyToIndex.size())
+                          .str();
+        return cert;
+      };
+
+      auto buildSubtreeSemanticAdmissibilityCertificate =
+          [&](const SubtreeSemanticCertificate &semantic)
+          -> SubtreeSemanticAdmissibilityCertificate {
+        SubtreeSemanticAdmissibilityCertificate cert;
+
+        if (semantic.interactionSummary.hasMixedInteractions) {
+          trace("macro/dag",
+                "subtree admissibility reject(mixed): lexicalBridge={0} "
+                "paste={1} wrappers={2} preferredChildSyntax={3} "
+                "rawInvocation={4} summary={5}",
+                semantic.usesLexicalBridge ? 1 : 0,
+                semantic.touchesPaste ? 1 : 0,
+                semantic.hasWrapperSemantics ? 1 : 0,
+                semantic.hasPreferredChildSyntax ? 1 : 0,
+                semantic.hasRawInvocationPreservation ? 1 : 0,
+                semantic.interactionSummary.detail);
+          cert.valid = false;
+          cert.failure =
+              SubtreeSemanticAdmissibilityFailure::MixedSemanticInteractions;
+          cert.detail =
+              "subtree semantic admissibility failed: mixed wrapper/"
+              "stringify/paste interactions are not structurally admissible";
+          return cert;
+        }
+
+        const bool hasInteractionScopedPasteSemantics =
+            semantic.interactionSummary.hasPaste ||
+            semantic.interactionSummary.hasStringifyPaste ||
+            semantic.interactionSummary.hasWideStringifyPaste ||
+            semantic.interactionSummary.hasRawInvocationPaste ||
+            semantic.interactionSummary.hasChildSyntaxPaste;
+        const bool hasStructuredSemantics =
+            semantic.hasWrapperSemantics || semantic.hasPreferredChildSyntax ||
+            semantic.hasRawInvocationPreservation ||
+            hasInteractionScopedPasteSemantics;
+        if (semantic.usesLexicalBridge && hasStructuredSemantics) {
+          trace("macro/dag",
+                "subtree admissibility reject(lexical bridge): "
+                "lexicalBridge={0} structuredSemantics={1} subtreePaste={2} "
+                "interactionPaste={3} wrappers={4} preferredChildSyntax={5} "
+                "rawInvocation={6} summary={7}",
+                semantic.usesLexicalBridge ? 1 : 0,
+                hasStructuredSemantics ? 1 : 0,
+                semantic.touchesPaste ? 1 : 0,
+                hasInteractionScopedPasteSemantics ? 1 : 0,
+                semantic.hasWrapperSemantics ? 1 : 0,
+                semantic.hasPreferredChildSyntax ? 1 : 0,
+                semantic.hasRawInvocationPreservation ? 1 : 0,
+                semantic.interactionSummary.detail);
+          for (const auto &lift : semantic.liftChains)
+            trace("macro/dag",
+                  "  lift chain detail: leaf id={0} name={1} argIdx={2} "
+                  "usedLexicalBridge={3} detail={4}",
+                  lift.leaf ? lift.leaf->id : 0,
+                  lift.leaf ? lift.leaf->name : StringRef("<none>"),
+                  lift.leafArgIdx, lift.usedLexicalBridge ? 1 : 0,
+                  lift.detail);
+          for (const auto &step : semantic.structuredLiftCertificates)
+            trace("macro/dag",
+                  "  structured step detail: nextInv={0} kind={1} detail={2} "
+                  "rewrittenChildSyntax='{3}'",
+                  step.nextInv ? step.nextInv->id : 0,
+                  static_cast<unsigned>(step.kind), step.detail,
+                  step.rewrittenChildSyntax);
+          cert.valid = false;
+          cert.failure = SubtreeSemanticAdmissibilityFailure::
+              LexicalBridgeWithStructuredSemantics;
+          cert.detail =
+              "subtree semantic admissibility failed: lexical bridging cannot "
+              "certify wrapper/raw-invocation/paste-sensitive subtree "
+              "semantics";
+          return cert;
+        }
+
+        cert.detail = formatv(
+                          "subtree semantic admissibility: lexicalBridge={0} "
+                          "mixed={1} structuredSemantics={2}",
+                          semantic.usesLexicalBridge ? 1 : 0,
+                          semantic.interactionSummary.hasMixedInteractions ? 1
+                                                                       : 0,
+                          hasStructuredSemantics ? 1 : 0)
+                          .str();
+        return cert;
+      };
+
+      auto buildSubtreeSemanticCertificate =
+          [&](const InvocationRewriteCertificate &leafCert,
+              ArrayRef<LiftChainCertificate> liftCertificates,
+              ArrayRef<RootFormalMergeCertificate> rootMergeCertificates,
+              const InvocationRewriteCertificate &rootCert)
+          -> SubtreeSemanticCertificate {
+        SubtreeSemanticCertificate cert;
+
+        auto recordSlotCertificate =
+            [&](const SlotSemanticRewriteCertificate &slotCert) {
+              cert.slotCertificates.push_back(slotCert);
+              switch (slotCert.decision.kind) {
+              case SlotRewriteDecisionKind::PreferredChildSyntax:
+                cert.hasPreferredChildSyntax = true;
+                break;
+              case SlotRewriteDecisionKind::PreserveRawInvocation:
+                cert.hasRawInvocationPreservation = true;
+                break;
+              case SlotRewriteDecisionKind::PassthroughFlatten:
+                cert.hasPassthroughFlatten = true;
+                break;
+              }
+
+              switch (slotCert.wrapperKind) {
+              case WrapperChainKind::Exact:
+                break;
+              case WrapperChainKind::StringLiteral:
+                cert.hasWrapperSemantics = true;
+                cert.hasStringifySemantics = true;
+                break;
+              case WrapperChainKind::WideStringLiteral:
+                cert.hasWrapperSemantics = true;
+                cert.hasStringifySemantics = true;
+                cert.hasWideStringifySemantics = true;
+                break;
+              }
+            };
+
+        auto recordArgCertificate =
+            [&](const ArgSemanticRewriteCertificate &argCert) {
+              cert.argCertificates.push_back(argCert);
+              for (const auto &slotCert : argCert.slotCertificates)
+                recordSlotCertificate(slotCert);
+            };
+
+        auto recordFormalCertificate =
+            [&](const FormalRewriteCertificate &formalCert) {
+              cert.formalCertificates.push_back(formalCert);
+              cert.formalInteractionConsistencies.push_back(
+                  formalCert.interactionConsistency);
+              if (formalCert.validation.valid ||
+                  formalCert.validation.failure !=
+                      RawFormalValidationFailure::None)
+                cert.rawFormalValidations.push_back(formalCert.validation);
+              for (const auto &interactionCert :
+                   formalCert.interactionCertificates)
+                cert.interactionCertificates.push_back(interactionCert);
+              for (const auto &argCert : formalCert.argRewriteCertificates)
+                recordArgCertificate(argCert);
+            };
+
+        auto recordInvocationCertificate =
+            [&](const InvocationRewriteCertificate &invCert) {
+              cert.invocationCertificates.push_back(invCert);
+              for (const auto &validation : invCert.formalValidations)
+                cert.rawFormalValidations.push_back(validation);
+              if (invCert.pasteValidation.required ||
+                  !invCert.pasteValidation.valid) {
+                cert.pasteValidations.push_back(invCert.pasteValidation);
+                cert.touchesPaste = true;
+              }
+            };
+
+        recordInvocationCertificate(leafCert);
+        for (const auto &liftCert : liftCertificates) {
+          cert.liftChains.push_back(liftCert);
+          cert.usesLexicalBridge |= liftCert.usedLexicalBridge;
+          for (const auto &step : liftCert.steps) {
+            cert.structuredLiftCertificates.push_back(step);
+            recordInvocationCertificate(step.currentCert);
+            for (const auto &derivation : step.derivations)
+              cert.parentDerivations.push_back(derivation);
+            for (const auto &formalCert : step.parentFormalCertificates)
+              recordFormalCertificate(formalCert);
+            if (step.parentCert.kind !=
+                InvocationRewriteCertificateKind::Invalid)
+              recordInvocationCertificate(step.parentCert);
+          }
+        }
+
+        for (const auto &mergeCert : rootMergeCertificates)
+          cert.rootMergeCertificates.push_back(mergeCert);
+
+        recordInvocationCertificate(rootCert);
+        cert.interactionSummary =
+            buildSubtreeInteractionSummaryCertificate(cert.interactionCertificates);
+        cert.interactionConsistency =
+            buildSubtreeInteractionConsistencyCertificate(cert.formalCertificates);
+        if (!cert.interactionConsistency.valid) {
+          cert.valid = false;
+          cert.detail = cert.interactionConsistency.detail;
+          return cert;
+        }
+        cert.admissibility = buildSubtreeSemanticAdmissibilityCertificate(cert);
+        if (!cert.admissibility.valid) {
+          cert.valid = false;
+          cert.detail = cert.admissibility.detail;
+          return cert;
+        }
+        cert.valid = true;
+        cert.detail = formatv(
+                          "subtree semantic bundle: invCerts={0} formalCerts={1} "
+                          "argCerts={2} slotCerts={3} interactions={4} "
+                          "formalConsistency={5} derivations={6} liftSteps={7} "
+                          "rootMerges={8} lexicalBridge={9} paste={10} "
+                          "wrappers={11} admissible={12}",
+                          cert.invocationCertificates.size(),
+                          cert.formalCertificates.size(),
+                          cert.argCertificates.size(),
+                          cert.slotCertificates.size(),
+                          cert.interactionCertificates.size(),
+                          cert.formalInteractionConsistencies.size(),
+                          cert.parentDerivations.size(),
+                          cert.structuredLiftCertificates.size(),
+                          cert.rootMergeCertificates.size(),
+                          cert.usesLexicalBridge ? 1 : 0,
+                          cert.touchesPaste ? 1 : 0,
+                          cert.hasWrapperSemantics ? 1 : 0,
+                          cert.admissibility.valid ? 1 : 0)
+                          .str();
+        return cert;
+      };
+
+      auto buildSubtreeRewriteCertificate =
+          [&](const RefoldModel::MacroInvocation &leaf,
+              const DenseMap<uint32_t, OldNewText> &leafEdits)
+          -> SubtreeRewriteCertificate {
+        SubtreeRewriteCertificate cert;
+        cert.leaf = &leaf;
+        cert.root = &m;
+
+        DenseMap<uint32_t, FormalTextPair> pendingLeafFormals;
+        for (const auto &KV : leafEdits) {
+          StringRef oldText = StringRef(KV.second.oldText).trim();
+          StringRef newText = StringRef(KV.second.newText).trim();
+          if (oldText == newText)
+            continue;
+          pendingLeafFormals[KV.first] =
+              FormalTextPair{oldText.str(), newText.str()};
+        }
+
+        if (pendingLeafFormals.empty()) {
+          cert.kind = SubtreeRewriteCertificateKind::NoChange;
+          cert.detail = formatv(
+                            "DAG subtree: leaf id={0} name={1} pending leaf "
+                            "formals empty",
+                            leaf.id, leaf.name)
+                            .str();
+          return cert;
+        }
+
+        cert.leafCert =
+            buildInvocationRewriteCertificate(leaf, pendingLeafFormals,
+                                             "DAG subtree leaf");
+        if (cert.leafCert.kind == InvocationRewriteCertificateKind::Invalid) {
+          cert.detail = cert.leafCert.detail;
+          return cert;
+        }
+        if (cert.leafCert.kind == InvocationRewriteCertificateKind::NoChange) {
+          cert.kind = SubtreeRewriteCertificateKind::NoChange;
+          cert.detail = formatv(
+                            "DAG subtree: leaf invocation no-change leaf "
+                            "id={0} name={1} pendingLeafFormals={2} detail={3}",
+                            leaf.id, leaf.name, pendingLeafFormals.size(),
+                            cert.leafCert.detail)
+                            .str();
+          return cert;
+        }
+
+        cert.leafFormals.clear();
+        for (const auto &rewrite : cert.leafCert.rewrites) {
+          cert.leafFormals[rewrite.argIdx] =
+              FormalTextPair{rewrite.oldText, rewrite.newText};
+        }
+
+        DenseMap<uint32_t, SmallVector<FormalTextPair, 2>> rootRewrites;
+        for (const auto &rewrite : cert.leafCert.rewrites) {
+          auto liftCert = buildLiftChainCertificate(
+              leaf, rewrite.argIdx, rewrite.oldText, rewrite.newText);
+          cert.liftCertificates.push_back(liftCert);
+          if (liftCert.kind == LiftChainCertificateKind::Invalid) {
+            cert.detail = !liftCert.detail.empty()
+                              ? liftCert.detail
+                              : formatv("DAG subtree: lift failed root id={0} "
+                                        "name={1} leaf id={2} name={3} "
+                                        "argIdx={4}",
+                                        m.id, m.name, leaf.id, leaf.name,
+                                        rewrite.argIdx)
+                                    .str();
+            return cert;
+          }
+
+          for (const auto &RK : liftCert.rootFormals) {
+            auto &rewrites = rootRewrites[RK.first];
+            bool seen = false;
+            for (const auto &existing : rewrites) {
+              if (existing.oldText == RK.second.oldText &&
+                  existing.newText == RK.second.newText) {
+                seen = true;
+                break;
+              }
+            }
+            if (!seen)
+              rewrites.push_back(RK.second);
+          }
+        }
+
+        if (rootRewrites.empty()) {
+          cert.kind = SubtreeRewriteCertificateKind::NoChange;
+          cert.detail = formatv(
+                            "DAG subtree: no lifted root formals root id={0} "
+                            "name={1} leaf id={2} name={3} leafCertRewrites={4} "
+                            "liftCertificates={5}",
+                            m.id, m.name, leaf.id, leaf.name,
+                            cert.leafCert.rewrites.size(),
+                            cert.liftCertificates.size())
+                            .str();
+          return cert;
+        }
+
+        DenseMap<uint32_t, FormalTextPair> pendingRootFormals;
+        for (const auto &KV : rootRewrites) {
+          const uint32_t argIdx = KV.first;
+          auto mergeCert = buildRootFormalMergeCertificate(
+              argIdx, KV.second, "DAG subtree root merge");
+          cert.rootMergeCertificates.push_back(mergeCert);
+          if (mergeCert.kind == RootFormalMergeCertificateKind::Invalid) {
+            cert.detail = mergeCert.detail;
+            return cert;
+          }
+          if (mergeCert.kind == RootFormalMergeCertificateKind::NoChange)
+            continue;
+
+          pendingRootFormals[argIdx] =
+              FormalTextPair{mergeCert.baseArgText, mergeCert.mergedArgText};
+        }
+
+        SmallVector<uint32_t, 8> deferRootOccurrenceArgIdxs;
+        deferRootOccurrenceArgIdxs.reserve(pendingRootFormals.size());
+        for (const auto &KV : pendingRootFormals)
+          deferRootOccurrenceArgIdxs.push_back(KV.first);
+
+        cert.rootCert = buildInvocationRewriteCertificate(
+            m, pendingRootFormals, "DAG subtree root", invSpanText,
+            invArgRanges, deferRootOccurrenceArgIdxs);
+        if (cert.rootCert.kind == InvocationRewriteCertificateKind::Invalid) {
+          cert.detail = cert.rootCert.detail;
+          return cert;
+        }
+        if (cert.rootCert.kind == InvocationRewriteCertificateKind::NoChange) {
+          cert.kind = SubtreeRewriteCertificateKind::NoChange;
+          cert.detail = formatv(
+                            "DAG subtree: root invocation no-change root "
+                            "id={0} name={1} pendingRootFormals={2} detail={3}",
+                            m.id, m.name, pendingRootFormals.size(),
+                            cert.rootCert.detail)
+                            .str();
+          return cert;
+        }
+
+        cert.rootFormals.clear();
+        for (const auto &rewrite : cert.rootCert.rewrites) {
+          cert.rootFormals[rewrite.argIdx] =
+              FormalTextPair{rewrite.oldText, rewrite.newText};
+        }
+
+        cert.semantic = buildSubtreeSemanticCertificate(
+            cert.leafCert, cert.liftCertificates, cert.rootMergeCertificates,
+            cert.rootCert);
+        if (!cert.semantic.valid) {
+          trace("macro/dag",
+                "DAG subtree semantic INVALID: root id={0} name={1} leaf id={2} "
+                "name={3} detail={4}",
+                m.id, m.name, leaf.id, leaf.name, cert.semantic.detail);
+          cert.detail = cert.semantic.detail;
+          return cert;
+        }
+        cert.kind = SubtreeRewriteCertificateKind::Unique;
+        return cert;
+      };
+
+      struct ArgEdit {
+        uint64_t begin;
+        uint64_t end;
+        std::string repl;
+      };
+
+      auto tryBuildLegacyLeafFormalEdit =
+          [&](ArrayRef<ObservedFormalConstraint> constraints)
+          -> std::optional<OldNewText> {
+        if (constraints.empty())
+          return std::nullopt;
+
+        const StringRef oldTrim = StringRef(constraints[0].oldText).trim();
+        const StringRef newTrim = StringRef(constraints[0].newText).trim();
+        for (const auto &constraint : constraints) {
+          if (StringRef(constraint.oldText).trim() != oldTrim ||
+              StringRef(constraint.newText).trim() != newTrim)
+            return std::nullopt;
+        }
+
+        if (oldTrim == newTrim)
+          return std::nullopt;
+
+        return OldNewText{oldTrim.str(), newTrim.str()};
+      };
+
+      auto tryLegacyLiftToRoot =
+          [&](const RefoldModel::MacroInvocation &leaf, uint32_t leafArgIdx,
+              StringRef leafOld, StringRef leafNew)
           -> std::optional<DenseMap<uint32_t, std::string>> {
         const RefoldModel::MacroInvocation *cur = &leaf;
         uint32_t curFormal = leafArgIdx;
@@ -6720,7 +11166,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         StringRef curNew = leafNew.trim();
 
         while (cur->id != m.id) {
-          // Step to parent.
           if (!cur->callerMacroId)
             return std::nullopt;
           auto parentIt = invById.find(*cur->callerMacroId);
@@ -6728,7 +11173,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             return std::nullopt;
           const RefoldModel::MacroInvocation *parent = parentIt->second;
 
-          // Use argDeps to map the current formal to its parent formal(s).
           if (curFormal >= cur->argDeps.size())
             return std::nullopt;
           ArrayRef<uint32_t> deps = cur->argDeps[curFormal];
@@ -6736,8 +11180,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             return std::nullopt;
 
           if (deps.size() == 1) {
-            // Simple case: the leaf formal depends on exactly one parent
-            // formal. Keep walking.
             curFormal = deps[0];
             cur = parent;
             continue;
@@ -6745,8 +11187,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
           if (deps.size() != 2)
             return std::nullopt;
-
-          // Two-parent splits are only supported on the final hop to the root.
           if (parent->id != m.id)
             return std::nullopt;
 
@@ -6757,8 +11197,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           if (aIt == rootArgText.end() || bIt == rootArgText.end())
             return std::nullopt;
 
-          // curOld must be exactly oldA + mid + oldB (where mid is the stable
-          // delimiter coming from the macro body / token paste).
           StringRef oldA = aIt->second;
           StringRef oldB = bIt->second;
           if (!curOld.starts_with(oldA) || !curOld.ends_with(oldB))
@@ -6769,13 +11207,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           if (mid.empty())
             return std::nullopt;
 
-          // Preserve robustness when mid repeats: we require the new split
-          // to keep at least as many mid occurrences in each side as the old.
           const uint64_t needA = countSubstr(oldA, mid);
           const uint64_t needB = countSubstr(oldB, mid);
 
-          // Enumerate all candidate split points in curNew at occurrences of
-          // mid.
           SmallVector<std::pair<StringRef, StringRef>, 4> splits;
           for (size_t pos = 0; (pos = curNew.find(mid, pos)) != StringRef::npos;
                ++pos) {
@@ -6787,7 +11221,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             splits.push_back({newA, newB});
           }
 
-          // Only accept a unique split; otherwise lifting is ambiguous.
           if (splits.size() != 1)
             return std::nullopt;
 
@@ -6797,23 +11230,134 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           return out;
         }
 
-        // Root reached: lifted edit applies to a single root formal.
         DenseMap<uint32_t, std::string> out;
         out[curFormal] = curNew.str();
         return out;
       };
 
-      // Small utility structs for accumulating per-formal old/new and then
-      // converting them into root-level byte edits in invSpanText.
-      struct OldNewText {
-        std::string oldText;
-        std::string newText;
+      auto tryLegacySubtreeRootPatch =
+          [&](const RefoldModel::MacroInvocation &leaf,
+              const DenseMap<uint32_t, OldNewText> &leafEdits,
+              StringRef traceStage) -> std::optional<MacroPatch> {
+        DenseMap<uint32_t, std::string> rootRepl;
+        for (const auto &KV : leafEdits) {
+          auto lifted = tryLegacyLiftToRoot(leaf, KV.first, KV.second.oldText,
+                                            KV.second.newText);
+          if (!lifted)
+            return std::nullopt;
+          for (const auto &RK : *lifted) {
+            auto it = rootRepl.find(RK.first);
+            if (it != rootRepl.end() && it->second != RK.second)
+              return std::nullopt;
+            rootRepl[RK.first] = RK.second;
+          }
+        }
+
+        std::vector<ArgEdit> edits;
+        edits.reserve(rootRepl.size());
+        for (const auto &KV : rootRepl) {
+          const uint32_t argIdx = KV.first;
+          if (argIdx >= invArgRanges.size())
+            return std::nullopt;
+
+          const uint64_t begin = static_cast<uint64_t>(invArgRanges[argIdx].first);
+          const uint64_t end = static_cast<uint64_t>(invArgRanges[argIdx].second);
+          if (begin > end || end > invSpanText.size())
+            return std::nullopt;
+
+          StringRef baseArgText =
+              invSpanText.slice(static_cast<size_t>(begin),
+                                static_cast<size_t>(end))
+                  .trim();
+          StringRef newArgText = StringRef(KV.second).trim();
+          if (baseArgText == newArgText)
+            continue;
+
+          if (!MacroArgReplacementMatchesAllOccurrencesInBIgnorePaste(
+                  m, argIdx, baseArgText, newArgText, tokenHunksAR)) {
+            trace("macro/dag",
+                  "{0}: legacy DAG root patch occurrence mismatch root id={1} "
+                  "name={2} argIdx={3} old='{4}' new='{5}'",
+                  traceStage, m.id, m.name, argIdx, baseArgText, newArgText);
+            return std::nullopt;
+          }
+
+          edits.push_back(ArgEdit{begin, end, newArgText.str()});
+        }
+
+        if (edits.empty())
+          return std::nullopt;
+
+        llvm::sort(edits, [](const ArgEdit &a, const ArgEdit &b) {
+          return a.begin < b.begin;
+        });
+
+        uint64_t cur = 0;
+        for (const auto &e : edits) {
+          if (e.begin < cur || e.end < e.begin ||
+              e.end > static_cast<uint64_t>(invSpanText.size()))
+            return std::nullopt;
+          cur = e.end;
+        }
+
+        std::string replText;
+        replText.reserve(invSpanText.size());
+        cur = 0;
+        for (const auto &e : edits) {
+          auto mid = invSpanText.slice(static_cast<size_t>(cur),
+                                       static_cast<size_t>(e.begin));
+          replText.append(mid.begin(), mid.end());
+          replText.append(e.repl);
+          cur = e.end;
+        }
+        auto tail = invSpanText.drop_front(static_cast<size_t>(cur));
+        replText.append(tail.begin(), tail.end());
+
+        trace("macro/dag",
+              "{0}: legacy DAG root patch computed root id={1} leaf id={2} "
+              "edits={3} replLen={4}",
+              traceStage, m.id, leaf.id, edits.size(), replText.size());
+        return MacroPatch{*invStart, *invEnd, std::move(replText), 0};
       };
 
-      struct ArgEdit {
-        uint64_t begin;
-        uint64_t end;
-        std::string repl;
+
+      enum class RootPatchConstructionCertificateKind {
+        NoChange,
+        Unique,
+        Invalid,
+      };
+
+      enum class RootPatchConstructionFailure {
+        None,
+        ArgIndexOutOfBounds,
+        InvalidArgRange,
+        OverlappingEdits,
+      };
+
+      struct RootPatchConstructionCertificate {
+        RootPatchConstructionCertificateKind kind =
+            RootPatchConstructionCertificateKind::Invalid;
+        RootPatchConstructionFailure failure =
+            RootPatchConstructionFailure::None;
+        SmallVector<ArgEdit, 8> edits;
+        std::optional<MacroPatch> patch;
+        std::string detail;
+      };
+
+      enum class DagCandidateAcceptanceFailure {
+        None,
+        DifferentSpan,
+        DifferentBaseText,
+        MergeConflict,
+        MergedRootValidationFailed,
+      };
+
+      struct DagCandidateAcceptanceCertificate {
+        bool accepted = false;
+        bool merged = false;
+        DagCandidateAcceptanceFailure failure =
+            DagCandidateAcceptanceFailure::None;
+        std::string detail;
       };
 
       // --- Phase 4: Try leaves, lift, validate, and ensure uniqueness --------
@@ -6823,17 +11367,246 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
       //   * all lifted edits validate against B (occurrence matching), and
       //   * the resulting root patch is unique (no second distinct patch).
       std::optional<MacroPatch> uniquePatch;
+      std::optional<std::string> uniquePatchBaseText;
       unsigned leavesExamined = 0;
       unsigned distinctRootPatches = 0;
+
+      auto buildRootPatchConstructionCertificate =
+          [&](const InvocationRewriteCertificate &rootCert,
+              StringRef traceStage)
+          -> RootPatchConstructionCertificate {
+        RootPatchConstructionCertificate cert;
+        if (rootCert.kind == InvocationRewriteCertificateKind::NoChange ||
+            rootCert.rewrites.empty()) {
+          cert.kind = RootPatchConstructionCertificateKind::NoChange;
+          cert.detail = formatv(
+                            "{0}: root patch construction no-op root id={1} "
+                            "name={2}",
+                            traceStage, m.id, m.name)
+                            .str();
+          return cert;
+        }
+
+        cert.edits.reserve(rootCert.rewrites.size());
+        for (const auto &rewrite : rootCert.rewrites) {
+          const uint32_t argIdx = rewrite.argIdx;
+          if (argIdx >= invArgRanges.size()) {
+            cert.failure = RootPatchConstructionFailure::ArgIndexOutOfBounds;
+            cert.detail = formatv(
+                              "{0}: root patch construction failed root id={1} "
+                              "name={2} argIdx={3} out of bounds argCount={4}",
+                              traceStage, m.id, m.name, argIdx,
+                              invArgRanges.size())
+                              .str();
+            return cert;
+          }
+
+          const uint64_t begin = (uint64_t)invArgRanges[argIdx].first;
+          const uint64_t end = (uint64_t)invArgRanges[argIdx].second;
+          if (begin > end || end > (uint64_t)invSpanText.size()) {
+            cert.failure = RootPatchConstructionFailure::InvalidArgRange;
+            cert.detail = formatv(
+                              "{0}: root patch construction failed root id={1} "
+                              "name={2} argIdx={3} invalid range=[{4},{5}) "
+                              "spanLen={6}",
+                              traceStage, m.id, m.name, argIdx, begin, end,
+                              invSpanText.size())
+                              .str();
+            return cert;
+          }
+
+          cert.edits.push_back(ArgEdit{begin, end, rewrite.newText});
+        }
+
+        llvm::sort(cert.edits, [](const ArgEdit &a, const ArgEdit &b) {
+          return a.begin < b.begin;
+        });
+
+        uint64_t cur = 0;
+        for (const auto &e : cert.edits) {
+          if (e.begin < cur || e.end < e.begin) {
+            cert.failure = RootPatchConstructionFailure::OverlappingEdits;
+            cert.detail = formatv(
+                              "{0}: root patch construction failed root id={1} "
+                              "name={2} overlapping edits range=[{3},{4}) "
+                              "prevEnd={5}",
+                              traceStage, m.id, m.name, e.begin, e.end, cur)
+                              .str();
+            return cert;
+          }
+          cur = e.end;
+        }
+
+        std::string replText;
+        replText.reserve(invSpanText.size());
+        cur = 0;
+        for (const auto &e : cert.edits) {
+          auto mid = invSpanText.slice((size_t)cur, (size_t)e.begin);
+          replText.append(mid.begin(), mid.end());
+          replText.append(e.repl);
+          cur = e.end;
+        }
+        auto tail = invSpanText.drop_front((size_t)cur);
+        replText.append(tail.begin(), tail.end());
+
+        MacroPatch patch{*invStart, *invEnd, std::move(replText), 0};
+        cert.patch = std::move(patch);
+        cert.kind = RootPatchConstructionCertificateKind::Unique;
+        cert.detail = formatv(
+                          "{0}: root patch construction succeeded root id={1} "
+                          "name={2} edits={3} replLen={4}",
+                          traceStage, m.id, m.name, cert.edits.size(),
+                          cert.patch ? cert.patch->replacement.size() : 0)
+                          .str();
+        return cert;
+      };
+
+      auto validateMergedRootCallsiteReplacement =
+          [&](StringRef baseText, StringRef newText) -> bool {
+        if (baseText == newText)
+          return true;
+
+        auto rootFormals =
+            buildRootFormalRewriteMapFromCallsiteReplacement(baseText, newText);
+        if (!rootFormals) {
+          trace("macro/dag",
+                "DAG merged root patch rejected: could not derive formal "
+                "rewrite map root id={0} name='{1}' baseLen={2} newLen={3}",
+                m.id, m.name, baseText.size(), newText.size());
+          return false;
+        }
+
+        auto cert = buildInvocationRewriteCertificate(
+            m, *rootFormals, "DAG merged root patch", baseText, invArgRanges);
+        if (cert.kind == InvocationRewriteCertificateKind::Invalid) {
+          trace("macro/dag", "{0}", cert.detail);
+          return false;
+        }
+        return true;
+      };
+
+      auto acceptOrMergeDAGCandidatePatch =
+          [&](MacroPatch candPatch, StringRef baseText,
+              StringRef traceStage) -> DagCandidateAcceptanceCertificate {
+        DagCandidateAcceptanceCertificate cert;
+        if (!uniquePatch) {
+          uniquePatch = std::move(candPatch);
+          uniquePatchBaseText = baseText.str();
+          distinctRootPatches = 1;
+          cert.accepted = true;
+          cert.detail = formatv(
+                            "{0}: accepted first DAG candidate root patch "
+                            "root id={1} name={2} span=[{3},{4}) replLen={5}",
+                            traceStage, m.id, m.name, uniquePatch->invStart,
+                            uniquePatch->invEnd,
+                            uniquePatch->replacement.size())
+                            .str();
+          return cert;
+        }
+
+        if (uniquePatch->invStart != candPatch.invStart ||
+            uniquePatch->invEnd != candPatch.invEnd) {
+          cert.failure = DagCandidateAcceptanceFailure::DifferentSpan;
+          cert.detail = formatv(
+                            "{0}: DAG candidate patch rejected root id={1} "
+                            "name={2} span mismatch existing=[{3},{4}) "
+                            "candidate=[{5},{6})",
+                            traceStage, m.id, m.name, uniquePatch->invStart,
+                            uniquePatch->invEnd, candPatch.invStart,
+                            candPatch.invEnd)
+                            .str();
+          return cert;
+        }
+
+        if (uniquePatch->replacement == candPatch.replacement) {
+          cert.accepted = true;
+          cert.detail = formatv(
+                            "{0}: DAG candidate patch equivalent to existing "
+                            "root patch root id={1} name={2} span=[{3},{4})",
+                            traceStage, m.id, m.name, uniquePatch->invStart,
+                            uniquePatch->invEnd)
+                            .str();
+          return cert;
+        }
+
+        if (!uniquePatchBaseText || *uniquePatchBaseText != baseText) {
+          cert.failure = DagCandidateAcceptanceFailure::DifferentBaseText;
+          cert.detail = formatv(
+                            "{0}: DAG candidate patch rejected root id={1} "
+                            "name={2} base text mismatch baseLenExisting={3} "
+                            "baseLenCandidate={4}",
+                            traceStage, m.id, m.name,
+                            uniquePatchBaseText ? uniquePatchBaseText->size() : 0,
+                            baseText.size())
+                            .str();
+          return cert;
+        }
+
+        SmallVector<StringRef, 2> repls;
+        repls.push_back(StringRef(uniquePatch->replacement));
+        repls.push_back(StringRef(candPatch.replacement));
+        auto merged = mergeCompatibleCallsitePatchReplacements(
+            *uniquePatchBaseText, ArrayRef<StringRef>(repls));
+        if (!merged) {
+          cert.failure = DagCandidateAcceptanceFailure::MergeConflict;
+          cert.detail = formatv(
+                            "{0}: DAG candidate patch rejected root id={1} "
+                            "name={2} incompatible replacement hunks",
+                            traceStage, m.id, m.name)
+                            .str();
+          return cert;
+        }
+
+        if (!validateMergedRootCallsiteReplacement(*uniquePatchBaseText,
+                                                   StringRef(*merged))) {
+          cert.failure =
+              DagCandidateAcceptanceFailure::MergedRootValidationFailed;
+          cert.detail = formatv(
+                            "{0}: DAG candidate patch rejected root id={1} "
+                            "name={2} merged replacement failed root "
+                            "validation",
+                            traceStage, m.id, m.name)
+                            .str();
+          return cert;
+        }
+
+        uniquePatch->replacement = std::move(*merged);
+        if (!uniquePatch->macroId)
+          uniquePatch->macroId = candPatch.macroId;
+        ++distinctRootPatches;
+        cert.accepted = true;
+        cert.merged = true;
+        cert.detail = formatv(
+                          "{0}: merged DAG candidate root patch root id={1} "
+                          "name={2} distinctRootPatches={3} replLen={4}",
+                          traceStage, m.id, m.name, distinctRootPatches,
+                          uniquePatch->replacement.size())
+                          .str();
+        return cert;
+      };
 
       for (const LeafCandidate &cand : leafCands) {
         ++leavesExamined;
         const RefoldModel::MacroInvocation &leaf = *cand.inv;
 
+        DenseMap<uint32_t, SmallVector<ObservedFormalConstraint, 2>>
+            leafObserved;
         DenseMap<uint32_t, OldNewText> leafEdits;
         DenseMap<uint64_t, SmallVector<const RefoldModel::PPArgSpan *, 4>>
             unreliPaste;
         bool invalid = false;
+
+        auto recordLeafObserved = [&](uint32_t argIdx, StringRef oldText,
+                                      StringRef newText) -> bool {
+          auto &constraints = leafObserved[argIdx];
+          for (const auto &existing : constraints) {
+            if (existing.oldText == oldText && existing.newText == newText)
+              return true;
+          }
+          constraints.push_back(
+              ObservedFormalConstraint{oldText.str(), newText.str()});
+          return true;
+        };
 
         // --- Pass 1: collect reliable per-formal edits -----------------------
         //
@@ -6879,14 +11652,10 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           if (*oldLift == *newLift)
             continue;
 
-          // If multiple spans map to the same formal, they must agree on the
-          // derived new text; otherwise the leaf edit itself is inconsistent.
-          auto it = leafEdits.find(sp.argIdx);
-          if (it != leafEdits.end() && it->second.newText != *newLift) {
+          if (!recordLeafObserved(sp.argIdx, *oldLift, *newLift)) {
             invalid = true;
             break;
           }
-          leafEdits[sp.argIdx] = OldNewText{*oldLift, *newLift};
         }
 
         if (invalid)
@@ -6900,25 +11669,38 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         // only if the split is unique.
         for (auto &kv : unreliPaste) {
           auto &group = kv.second;
-          if (group.size() != 2) {
+          if (group.size() < 2) {
             invalid = true;
             break;
           }
 
-          const RefoldModel::PPArgSpan *s0 = group[0];
-          const RefoldModel::PPArgSpan *s1 = group[1];
-          if (!s0->byteBegin || !s0->byteEnd || !s1->byteBegin ||
-              !s1->byteEnd) {
+          llvm::sort(group, [](const RefoldModel::PPArgSpan *a,
+                               const RefoldModel::PPArgSpan *b) {
+            if (!a->byteBegin || !b->byteBegin)
+              return a < b;
+            if (*a->byteBegin != *b->byteBegin)
+              return *a->byteBegin < *b->byteBegin;
+            if (!a->byteEnd || !b->byteEnd)
+              return a < b;
+            if (*a->byteEnd != *b->byteEnd)
+              return *a->byteEnd < *b->byteEnd;
+            return a->argIdx < b->argIdx;
+          });
+
+          bool groupOk = true;
+          for (const RefoldModel::PPArgSpan *sp : group) {
+            if (!sp->byteBegin || !sp->byteEnd) {
+              groupOk = false;
+              break;
+            }
+          }
+          if (!groupOk) {
             invalid = true;
             break;
-          }
-
-          if (*s1->byteBegin < *s0->byteBegin) {
-            std::swap(s0, s1);
           }
 
           // Extract full token texts in A and B for this token envelope.
-          RefoldModel::PPArgSpan whole = *s0;
+          RefoldModel::PPArgSpan whole = *group.front();
           whole.kind = PPArgSpanKind::Standard;
           whole.argIdx = 0;
           whole.byteBegin = std::nullopt;
@@ -6933,81 +11715,274 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
           StringRef oldTok = aTok->text;
           StringRef newTok = bTok->text;
-
           const uint64_t oldLen = oldTok.size();
-          if (*s0->byteEnd > oldLen || *s1->byteEnd > oldLen ||
-              *s0->byteBegin > *s0->byteEnd || *s1->byteBegin > *s1->byteEnd ||
-              *s0->byteEnd > *s1->byteBegin) {
+
+          for (size_t i = 0; i < group.size(); ++i) {
+            const auto *sp = group[i];
+            if (*sp->byteBegin > *sp->byteEnd || *sp->byteEnd > oldLen) {
+              groupOk = false;
+              break;
+            }
+            if (i > 0 && *group[i - 1]->byteEnd > *sp->byteBegin) {
+              groupOk = false;
+              break;
+            }
+          }
+          if (!groupOk) {
             invalid = true;
             break;
           }
 
-          // Compute (leading)(seg0)(midBody)(seg1)(trailing) in the old token.
-          StringRef leading = oldTok.take_front(*s0->byteBegin);
-          StringRef midBody = oldTok.slice(*s0->byteEnd, *s1->byteBegin);
-          StringRef trailing = oldTok.drop_front(*s1->byteEnd);
-          if (midBody.empty()) {
-            invalid = true;
-            break;
-          }
-
-          // Require the unchanged outer parts to still match in the new token.
+          StringRef leading = oldTok.take_front(*group.front()->byteBegin);
+          StringRef trailing = oldTok.drop_front(*group.back()->byteEnd);
           if (!newTok.starts_with(leading) || !newTok.ends_with(trailing)) {
             invalid = true;
             break;
           }
 
-          // The "core" is where the edited segments live.
+          SmallVector<StringRef, 4> oldSegs;
+          SmallVector<StringRef, 4> midBodies;
+          oldSegs.reserve(group.size());
+          midBodies.reserve(group.size() - 1);
+          for (size_t i = 0; i < group.size(); ++i) {
+            const auto *sp = group[i];
+            oldSegs.push_back(oldTok.slice(*sp->byteBegin, *sp->byteEnd));
+            if (i + 1 < group.size()) {
+              StringRef mid = oldTok.slice(*sp->byteEnd, *group[i + 1]->byteBegin);
+              if (mid.empty()) {
+                groupOk = false;
+                break;
+              }
+              midBodies.push_back(mid);
+            }
+          }
+          if (!groupOk) {
+            invalid = true;
+            break;
+          }
+
           StringRef core =
               newTok.slice(leading.size(), newTok.size() - trailing.size());
-          StringRef oldSeg0 = oldTok.slice(*s0->byteBegin, *s0->byteEnd);
-          StringRef oldSeg1 = oldTok.slice(*s1->byteBegin, *s1->byteEnd);
 
-          // Enforce repeat-safety for midBody splitting.
-          const uint64_t need0 = countSubstr(oldSeg0, midBody);
-          const uint64_t need1 = countSubstr(oldSeg1, midBody);
+          auto suffixDelimiterNeed = [&](size_t delimIdx) -> uint64_t {
+            const StringRef delim = midBodies[delimIdx];
+            uint64_t need = 0;
+            for (size_t segIdx = delimIdx + 1; segIdx < oldSegs.size(); ++segIdx)
+              need += countSubstr(oldSegs[segIdx], delim);
+            for (size_t later = delimIdx + 1; later < midBodies.size(); ++later)
+              if (midBodies[later] == delim)
+                ++need;
+            return need;
+          };
 
-          // Enumerate possible splits around occurrences of midBody.
-          SmallVector<std::pair<StringRef, StringRef>, 4> splits;
-          for (size_t pos = 0;
-               (pos = core.find(midBody, pos)) != StringRef::npos; ++pos) {
-            StringRef newSeg0 = core.slice(0, pos);
-            StringRef newSeg1 = core.drop_front(pos + midBody.size());
-            if (countSubstr(newSeg0, midBody) < need0 ||
-                countSubstr(newSeg1, midBody) < need1)
+          SmallVector<StringRef, 4> curSegs;
+          SmallVector<SmallVector<StringRef, 4>, 2> splitSolutions;
+          auto addSplitSolution = [&](const SmallVectorImpl<StringRef> &parts) {
+            SmallVector<StringRef, 4> copy(parts.begin(), parts.end());
+            for (const auto &existing : splitSolutions)
+              if (existing == copy)
+                return;
+            splitSolutions.push_back(std::move(copy));
+          };
+
+          auto splitCore = [&](auto &&self, size_t delimIdx, StringRef rest) -> void {
+            if (splitSolutions.size() > 1)
+              return;
+            if (delimIdx == midBodies.size()) {
+              curSegs.push_back(rest);
+              addSplitSolution(curSegs);
+              curSegs.pop_back();
+              return;
+            }
+
+            const StringRef delim = midBodies[delimIdx];
+            const uint64_t needLeft = countSubstr(oldSegs[delimIdx], delim);
+            const uint64_t needRight = suffixDelimiterNeed(delimIdx);
+
+            for (size_t pos = 0;
+                 (pos = rest.find(delim, pos)) != StringRef::npos; ++pos) {
+              StringRef left = rest.slice(0, pos);
+              StringRef tail = rest.drop_front(pos + delim.size());
+              if (countSubstr(left, delim) < needLeft)
+                continue;
+              if (countSubstr(tail, delim) < needRight)
+                continue;
+              curSegs.push_back(left);
+              self(self, delimIdx + 1, tail);
+              curSegs.pop_back();
+            }
+          };
+          splitCore(splitCore, 0, core);
+
+          if (splitSolutions.size() != 1 ||
+              splitSolutions[0].size() != group.size()) {
+            invalid = true;
+            break;
+          }
+
+          auto recordLeafEdit = [&](uint32_t argIdx, StringRef oldText,
+                                    StringRef newText) -> bool {
+            return recordLeafObserved(argIdx, oldText, newText);
+          };
+
+          // Normalize each recovered segment and record it as a per-formal edit.
+          for (size_t i = 0; i < group.size(); ++i) {
+            const auto *sp = group[i];
+            auto oldSeg = normalizeLiftText(&leaf, *sp, oldSegs[i],
+                                            /*allowTopLevelComma=*/true);
+            auto newSeg = normalizeLiftText(&leaf, *sp, splitSolutions[0][i],
+                                            /*allowTopLevelComma=*/false);
+            if (!oldSeg || !newSeg) {
+              groupOk = false;
+              break;
+            }
+            if (*oldSeg == *newSeg)
               continue;
-            splits.push_back({newSeg0, newSeg1});
+            if (!recordLeafEdit(sp->argIdx, *oldSeg, *newSeg)) {
+              groupOk = false;
+              break;
+            }
           }
-
-          // Split must be unique.
-          if (splits.size() != 1) {
+          if (!groupOk) {
             invalid = true;
             break;
           }
-
-          // Normalize the split segments and record them as per-formal edits.
-          auto old0 = normalizeLiftText(&leaf, *s0, oldSeg0,
-                                        /*allowTopLevelComma=*/true);
-          auto neu0 = normalizeLiftText(&leaf, *s0, splits[0].first,
-                                        /*allowTopLevelComma=*/false);
-          auto old1 = normalizeLiftText(&leaf, *s1, oldSeg1,
-                                        /*allowTopLevelComma=*/true);
-          auto neu1 = normalizeLiftText(&leaf, *s1, splits[0].second,
-                                        /*allowTopLevelComma=*/false);
-          if (!old0 || !neu0 || !old1 || !neu1) {
-            invalid = true;
-            break;
-          }
-
-          if (*old0 != *neu0)
-            leafEdits[s0->argIdx] = OldNewText{*old0, *neu0};
-          if (*old1 != *neu1)
-            leafEdits[s1->argIdx] = OldNewText{*old1, *neu1};
         }
 
         if (invalid)
           continue;
-        if (leafEdits.empty())
+
+        // Convert each touched leaf formal's observed old/new expansion text
+        // into a certified raw leaf-argument rewrite before lifting it toward
+        // the root. This now uses the same explicit formal-rewrite
+        // certificate step used during parent-hop lifting.
+        DenseSet<uint32_t> legacyLeafFallbackArgIdxs;
+        for (const auto &KV : leafObserved) {
+          const uint32_t argIdx = KV.first;
+          auto formalCert = buildObservedFormalRewriteCertificate(
+              leaf, argIdx, KV.second, /*preferredChildSyntax=*/nullptr,
+              "DAG subtree leaf formal");
+          if (formalCert.kind == FormalRewriteCertificateKind::Invalid) {
+            const bool templateMismatchFallback =
+                formalCert.failure ==
+                    FormalRewriteFailure::RawRewriteNotCertifiable &&
+                formalCert.detail.find(
+                    "observed old arg text did not match a unique structural "
+                    "template") != std::string::npos;
+            if (templateMismatchFallback) {
+              auto legacyLeafEdit = tryBuildLegacyLeafFormalEdit(KV.second);
+              if (legacyLeafEdit) {
+                trace("macro/dag",
+                      "DAG subtree leaf formal: inv id={0} name={1} argIdx={2} "
+                      "legacy leaf fallback old='{3}' new='{4}'",
+                      leaf.id, leaf.name, argIdx, legacyLeafEdit->oldText,
+                      legacyLeafEdit->newText);
+                legacyLeafFallbackArgIdxs.insert(argIdx);
+                leafEdits[argIdx] = std::move(*legacyLeafEdit);
+                continue;
+              }
+            }
+            if (!formalCert.detail.empty())
+              trace("macro/dag",
+                    "DAG subtree leaf formal: inv id={0} name={1} argIdx={2} "
+                    "INVALID detail={3}",
+                    leaf.id, leaf.name, argIdx, formalCert.detail);
+            invalid = true;
+            break;
+          }
+          if (formalCert.kind == FormalRewriteCertificateKind::NoChange) {
+            if (!formalCert.detail.empty())
+              trace("macro/dag",
+                    "DAG subtree leaf formal: inv id={0} name={1} argIdx={2} "
+                    "NOCHANGE detail={3}",
+                    leaf.id, leaf.name, argIdx, formalCert.detail);
+            continue;
+          }
+
+          leafEdits[argIdx] = OldNewText{std::move(formalCert.oldText),
+                                         std::move(formalCert.newText)};
+        }
+
+        if (invalid)
+          continue;
+        if (leafEdits.empty()) {
+          trace("macro/dag",
+                "DAG subtree leaf: no certifiable leaf edits root id={0} "
+                "name={1} leaf id={2} name={3} observedLeafFormals={4}",
+                m.id, m.name, leaf.id, leaf.name, leafObserved.size());
+          continue;
+        }
+
+        // Paste-aware leaf certificate: when multiple leaf-formal rewrites
+        // participate in the same pasted token, validate them as a group
+        // against the B-side pasted-token spellings before attempting to lift
+        // them up the caller chain.
+        if (!leaf.pasteSpans.empty()) {
+          DenseMap<uint32_t, std::string> leafReplByArgIdx;
+          bool leafTouchesPaste = false;
+          for (const auto &KV : leafEdits) {
+            leafReplByArgIdx[KV.first] = KV.second.newText;
+            if (!leafTouchesPaste) {
+              for (const auto &ps : leaf.pasteSpans) {
+                if (ps.argIdx == KV.first) {
+                  leafTouchesPaste = true;
+                  break;
+                }
+              }
+            }
+          }
+
+          if (leafTouchesPaste) {
+            bool allTouchedPasteArgsFromLegacyLeafFallback = true;
+            for (const auto &KV : leafEdits) {
+              bool argTouchesPaste = false;
+              for (const auto &ps : leaf.pasteSpans) {
+                if (ps.argIdx == KV.first) {
+                  argTouchesPaste = true;
+                  break;
+                }
+              }
+              if (argTouchesPaste &&
+                  !legacyLeafFallbackArgIdxs.count(KV.first)) {
+                allTouchedPasteArgsFromLegacyLeafFallback = false;
+                break;
+              }
+            }
+
+            if (allTouchedPasteArgsFromLegacyLeafFallback) {
+              trace("macro/dag",
+                    "DAG subtree leaf paste validation: inv id={0} name={1} "
+                    "deferred all touched paste args use legacy leaf fallback",
+                    leaf.id, leaf.name);
+            } else if (!leaf.invText) {
+              trace("macro/dag",
+                    "DAG subtree leaf paste validation: inv id={0} name={1} "
+                    "FAILED missing invocation text",
+                    leaf.id, leaf.name);
+              invalid = true;
+            } else {
+              auto leafRangesOpt = GetMacroInvocationFormalArgContentRanges(
+                  leaf, StringRef(*leaf.invText));
+              if (!leafRangesOpt) {
+                trace("macro/dag",
+                      "DAG subtree leaf paste validation: inv id={0} name={1} "
+                      "FAILED missing argument ranges",
+                      leaf.id, leaf.name);
+                invalid = true;
+              } else if (!PasteArgReplacementsMatchAllPasteTokensInB(
+                             leaf, StringRef(*leaf.invText), *leafRangesOpt,
+                             leafReplByArgIdx)) {
+                trace("macro/dag",
+                      "DAG subtree leaf paste validation: inv id={0} name={1} "
+                      "FAILED pasted-token mismatch replacements={2}",
+                      leaf.id, leaf.name, leafReplByArgIdx.size());
+                invalid = true;
+              }
+            }
+          }
+        }
+
+        if (invalid)
           continue;
 
         // --- Special-case: chained call suffix arguments --------------------
@@ -7113,16 +12088,18 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
                 MacroPatch candPatch{*invStart, chainEnd, replText};
 
-                if (!uniquePatch) {
-                  uniquePatch = std::move(candPatch);
-                  distinctRootPatches = 1;
-                } else if (uniquePatch->invStart != candPatch.invStart ||
-                           uniquePatch->invEnd != candPatch.invEnd ||
-                           uniquePatch->replacement != candPatch.replacement) {
+                auto acceptCert = acceptOrMergeDAGCandidatePatch(
+                    std::move(candPatch),
+                    fileText.slice((size_t)*invStart, (size_t)chainEnd),
+                    "DAG chained-call suffix patch");
+                if (!acceptCert.detail.empty())
+                  trace("macro/dag", "{0}", acceptCert.detail);
+                if (!acceptCert.accepted) {
                   debug("macro/dag",
-                        "DAG args-only ambiguous: multiple distinct root "
-                        "patches (root inv id={0} name={1} leafCandidates={2} "
-                        "leavesExamined={3} distinctRootPatches={4})",
+                        "DAG args-only ambiguous: incompatible root patch "
+                        "candidates (root inv id={0} name={1} "
+                        "leafCandidates={2} leavesExamined={3} "
+                        "distinctRootPatches={4})",
                         m.id, m.name, leafCands.size(), leavesExamined,
                         distinctRootPatches + 1);
                   return std::nullopt;
@@ -7133,136 +12110,120 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           }
         }
 
-        // --- Lift leaf edits to root formals ---------------------------------
+        // --- Build one explicit subtree certificate --------------------------
         //
-        // Each leaf formal edit is lifted via argDeps. The result is a map:
-        //   rootFormalIdx -> newArgText
-        DenseMap<uint32_t, std::string> rootRepl;
-        for (auto &kv : leafEdits) {
-          auto lifted =
-              liftToRoot(leaf, kv.first, kv.second.oldText, kv.second.newText);
-          if (!lifted) {
-            invalid = true;
-            break;
+        // The leaf rewrite, caller-chain lifting, root-formal merge, and final
+        // root validation are now treated as one bottom-up subtree certificate
+        // instead of several ad hoc stages.
+        auto subtreeCert = buildSubtreeRewriteCertificate(leaf, leafEdits);
+        if (subtreeCert.kind == SubtreeRewriteCertificateKind::Invalid ||
+            subtreeCert.kind == SubtreeRewriteCertificateKind::NoChange) {
+          if (!subtreeCert.detail.empty())
+            trace("macro/dag", "{0}", subtreeCert.detail);
+          auto legacyPatch = tryLegacySubtreeRootPatch(
+              leaf, leafEdits, "DAG legacy subtree fallback");
+          if (!legacyPatch) {
+            trace("macro/dag",
+                  "DAG legacy subtree fallback: no patch root id={0} name={1} "
+                  "leaf id={2} name={3} leafEdits={4}",
+                  m.id, m.name, leaf.id, leaf.name, leafEdits.size());
           }
-          for (auto &rk : *lifted) {
-            auto it = rootRepl.find(rk.first);
-            if (it != rootRepl.end() && it->second != rk.second) {
-              // Two different lifted paths disagree on the same root formal.
-              invalid = true;
-              break;
-            }
-            rootRepl[rk.first] = rk.second;
-          }
-          if (invalid)
-            break;
-        }
-
-        if (invalid)
-          continue;
-
-        // --- Build and validate root arg edits against B ---------------------
-        //
-        // For each lifted root formal:
-        //   * compute byte [begin,end) in invSpanText
-        //   * require that substituting baseArgText -> newArgText matches all
-        //     occurrences in B (macro policy / determinism gate)
-        SmallVector<diffutils::Hunk, 1> tokenHunksForCheck;
-        tokenHunksForCheck.push_back(h);
-        ArrayRef<diffutils::Hunk> tokenHunksAR(tokenHunksForCheck);
-
-        std::vector<ArgEdit> edits;
-        edits.reserve(rootRepl.size());
-
-        for (auto &kv : rootRepl) {
-          uint32_t argIdx = kv.first;
-          if (argIdx >= invArgRanges.size()) {
-            invalid = true;
-            break;
-          }
-
-          const uint64_t begin = (uint64_t)invArgRanges[argIdx].first;
-          const uint64_t end = (uint64_t)invArgRanges[argIdx].second;
-          if (begin > end || end > invSpanText.size()) {
-            invalid = true;
-            break;
-          }
-
-          StringRef baseArgText =
-              invSpanText.slice((size_t)begin, (size_t)end).trim();
-          StringRef newArgText = StringRef(kv.second).trim();
-
-          if (baseArgText == newArgText)
+          if (!legacyPatch)
             continue;
-
-          // Policy gate: the replacement must be consistent with B everywhere
-          // this argument's expansion occurs (ignoring paste-specific
-          // ambiguity).
-          if (!MacroArgReplacementMatchesAllOccurrencesInBIgnorePaste(
-                  m, argIdx, baseArgText, newArgText, tokenHunksAR)) {
-            invalid = true;
-            break;
+          auto acceptCert = acceptOrMergeDAGCandidatePatch(
+              std::move(*legacyPatch), invSpanText,
+              "DAG legacy subtree fallback");
+          if (!acceptCert.detail.empty())
+            trace("macro/dag", "{0}", acceptCert.detail);
+          if (!acceptCert.accepted) {
+            debug("macro/dag",
+                  "DAG args-only ambiguous: incompatible root patches (root "
+                  "inv id={0} name={1} leafCandidates={2} leavesExamined={3} "
+                  "distinctRootPatches={4})",
+                  m.id, m.name, leafCands.size(), leavesExamined,
+                  distinctRootPatches + 1);
+            return std::nullopt;
           }
-
-          edits.push_back(ArgEdit{begin, end, newArgText.str()});
-        }
-
-        if (invalid || edits.empty())
           continue;
-
-        // Apply edits in source order.
-        llvm::sort(edits, [](const ArgEdit &a, const ArgEdit &b) {
-          return a.begin < b.begin;
-        });
-
-        // Reject overlaps/out-of-bounds; otherwise, produce a replacement
-        // invocation text.
-        uint64_t cur = 0;
-        for (const auto &e : edits) {
-          if (e.begin < cur || e.end < e.begin ||
-              e.end > (uint64_t)invSpanText.size()) {
-            invalid = true;
-            break;
-          }
-          cur = e.end;
         }
-
-        if (invalid)
-          continue;
-
-        // Construct the rewritten invocation spelling by splicing in each new
-        // argument text at its formal range.
-        std::string replText;
-        replText.reserve(invSpanText.size());
-
-        cur = 0;
-        for (const auto &e : edits) {
-          auto mid = invSpanText.slice((size_t)cur, (size_t)e.begin);
-          replText.append(mid.begin(), mid.end());
-          replText.append(e.repl);
-          cur = e.end;
-        }
-        auto tail = invSpanText.drop_front((size_t)cur);
-        replText.append(tail.begin(), tail.end());
 
         trace("macro/dag",
-              "DAG candidate root patch computed: root inv id={0} leaf inv "
-              "id={1} depth={2} edits={3} replLen={4}",
-              m.id, leaf.id, cand.depth, edits.size(), replText.size());
+              "DAG subtree semantic summary: root id={0} name={1} leaf id={2} "
+              "name={3} invCerts={4} formalCerts={5} argCerts={6} "
+              "slotCerts={7} interactions={8} formalConsistency={9} "
+              "derivations={10} liftSteps={11} rootMerges={12} "
+              "lexicalBridge={13} paste={14} wrappers={15} mixed={16} "
+              "admissible={17}",
+              m.id, m.name, leaf.id, leaf.name,
+              subtreeCert.semantic.invocationCertificates.size(),
+              subtreeCert.semantic.formalCertificates.size(),
+              subtreeCert.semantic.argCertificates.size(),
+              subtreeCert.semantic.slotCertificates.size(),
+              subtreeCert.semantic.interactionCertificates.size(),
+              subtreeCert.semantic.formalInteractionConsistencies.size(),
+              subtreeCert.semantic.parentDerivations.size(),
+              subtreeCert.semantic.structuredLiftCertificates.size(),
+              subtreeCert.semantic.rootMergeCertificates.size(),
+              subtreeCert.semantic.usesLexicalBridge ? 1 : 0,
+              subtreeCert.semantic.touchesPaste ? 1 : 0,
+              subtreeCert.semantic.hasWrapperSemantics ? 1 : 0,
+              subtreeCert.semantic.interactionSummary.hasMixedInteractions ? 1 : 0,
+              subtreeCert.semantic.admissibility.valid ? 1 : 0);
 
-        // --- Uniqueness enforcement ------------------------------------------
-        //
-        // We accept the first valid root patch; if a second *distinct* root
-        // patch is found, the lift is ambiguous => decline and leave macro
-        // expanded.
-        if (!uniquePatch) {
-          uniquePatch = MacroPatch{*invStart, *invEnd, std::move(replText)};
-          distinctRootPatches = 1;
-        } else if (uniquePatch->invStart != *invStart ||
-                   uniquePatch->invEnd != *invEnd ||
-                   uniquePatch->replacement != replText) {
+        if (!subtreeCert.semantic.interactionSummary.detail.empty())
+          trace("macro/dag", "{0}",
+                subtreeCert.semantic.interactionSummary.detail);
+        if (!subtreeCert.semantic.interactionConsistency.detail.empty())
+          trace("macro/dag", "{0}",
+                subtreeCert.semantic.interactionConsistency.detail);
+        if (!subtreeCert.semantic.admissibility.detail.empty())
+          trace("macro/dag", "{0}", subtreeCert.semantic.admissibility.detail);
+
+        auto rootPatchCert = buildRootPatchConstructionCertificate(
+            subtreeCert.rootCert, "DAG subtree root patch");
+        if (rootPatchCert.kind == RootPatchConstructionCertificateKind::Invalid ||
+            rootPatchCert.kind == RootPatchConstructionCertificateKind::NoChange) {
+          if (!rootPatchCert.detail.empty())
+            trace("macro/dag", "{0}", rootPatchCert.detail);
+          auto legacyPatch = tryLegacySubtreeRootPatch(
+              leaf, leafEdits, "DAG legacy subtree fallback");
+          if (!legacyPatch) {
+            trace("macro/dag",
+                  "DAG legacy subtree fallback after root patch failure: no "
+                  "patch root id={0} name={1} leaf id={2} name={3} "
+                  "rootPatchKind={4}",
+                  m.id, m.name, leaf.id, leaf.name,
+                  static_cast<unsigned>(rootPatchCert.kind));
+          }
+          if (!legacyPatch)
+            continue;
+          auto acceptCert = acceptOrMergeDAGCandidatePatch(
+              std::move(*legacyPatch), invSpanText,
+              "DAG legacy subtree fallback");
+          if (!acceptCert.detail.empty())
+            trace("macro/dag", "{0}", acceptCert.detail);
+          if (!acceptCert.accepted) {
+            debug("macro/dag",
+                  "DAG args-only ambiguous: incompatible root patches (root "
+                  "inv id={0} name={1} leafCandidates={2} leavesExamined={3} "
+                  "distinctRootPatches={4})",
+                  m.id, m.name, leafCands.size(), leavesExamined,
+                  distinctRootPatches + 1);
+            return std::nullopt;
+          }
+          continue;
+        }
+
+        trace("macro/dag", "{0}", rootPatchCert.detail);
+
+        auto acceptCert = acceptOrMergeDAGCandidatePatch(
+            std::move(*rootPatchCert.patch), invSpanText,
+            "DAG subtree root patch");
+        if (!acceptCert.detail.empty())
+          trace("macro/dag", "{0}", acceptCert.detail);
+        if (!acceptCert.accepted) {
           debug("macro/dag",
-                "DAG args-only ambiguous: multiple distinct root patches (root "
+                "DAG args-only ambiguous: incompatible root patches (root "
                 "inv id={0} name={1} leafCandidates={2} leavesExamined={3} "
                 "distinctRootPatches={4})",
                 m.id, m.name, leafCands.size(), leavesExamined,
@@ -7278,10 +12239,18 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
       debug(
           "macro/dag",
           "DAG args-only summary: root inv id={0} name={1} leafCandidates={2} "
-          "leavesExamined={3} distinctRootPatches={4} result={5}",
+          "leavesExamined={3} distinctRootPatches={4} result={5} "
+          "directRootInadmissible={6}",
           m.id, m.name, leafCands.size(), leavesExamined, distinctRootPatches,
-          uniquePatch.has_value());
+          uniquePatch.has_value(), directRootPreservationInadmissible);
 
+      if (!uniquePatch && directRootPreservationInadmissible) {
+        trace("macro/dag",
+              "DAG args-only: direct root preservation inadmissible for root "
+              "id={0} name='{1}' because the touched hunk lies in an "
+              "unsupported descendant subtree",
+              m.id, m.name);
+      }
       return uniquePatch;
     };
 
@@ -7290,7 +12259,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     // (e.g. currying-style chains like GET_MATH(ADD)(10)(20)), patch those
     // bytes directly. This preserves the call chain and avoids whole-cover
     // expansion.
-    if (m.invFile && m.invB && m.invE) {
+    if (HasLiteralMacroCalleeOrigin(m) && m.invFile && m.invB && m.invE) {
       std::string invAbs = lineDirs_.ToAbsolutePath(*m.invFile);
       auto bufOrErr = MemoryBuffer::getFile(invAbs);
       if (bufOrErr) {
@@ -7381,15 +12350,251 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
       }
     }
 
-    // Only if DAG chaining yields a unique, validated patch do we apply it.
+    // Prefer the DAG result over a direct root args-only rewrite when both are
+    // available: the DAG path has already proved a structure-preserving nested
+    // inverse, while the direct root patch only proves expansion equality at
+    // this callsite.
+    auto mergeCompatibleRootCallsiteReplacements =
+        [&](StringRef baseOld, ArrayRef<StringRef> replacements)
+        -> std::optional<std::string> {
+      struct RootCallsiteRewriteHunk {
+        uint64_t oldBegin;
+        uint64_t oldEnd;
+        std::string repl;
+      };
+
+      auto toSingleCharRefsLocal = [&](StringRef S) {
+        std::vector<StringRef> refs;
+        refs.reserve(S.size());
+        for (size_t i = 0; i < S.size(); ++i)
+          refs.push_back(S.slice(i, i + 1));
+        return refs;
+      };
+
+      std::vector<RootCallsiteRewriteHunk> merged;
+      for (StringRef replText : replacements) {
+        if (replText == baseOld)
+          continue;
+
+        std::vector<StringRef> aRefs = toSingleCharRefsLocal(baseOld);
+        std::vector<StringRef> bRefs = toSingleCharRefsLocal(replText);
+        auto steps = diffutils::diff(aRefs, bRefs);
+        auto hunks = diffutils::coalesce(steps);
+
+        for (const auto &hunk : hunks) {
+          RootCallsiteRewriteHunk piece{
+              hunk.aStart, hunk.aEnd,
+              replText.slice((size_t)hunk.bStart, (size_t)hunk.bEnd).str()};
+
+          auto sameHunk = [&](const RootCallsiteRewriteHunk &a,
+                              const RootCallsiteRewriteHunk &b) {
+            return a.oldBegin == b.oldBegin && a.oldEnd == b.oldEnd &&
+                   a.repl == b.repl;
+          };
+
+          auto overlaps = [&](const RootCallsiteRewriteHunk &a,
+                              const RootCallsiteRewriteHunk &b) {
+            return a.oldBegin < b.oldEnd && b.oldBegin < a.oldEnd;
+          };
+
+          auto it = std::lower_bound(
+              merged.begin(), merged.end(), piece.oldBegin,
+              [](const RootCallsiteRewriteHunk &h, uint64_t pos) {
+                return h.oldBegin < pos;
+              });
+
+          if (it != merged.begin()) {
+            const auto &prev = *std::prev(it);
+            if (sameHunk(prev, piece))
+              continue;
+            if (overlaps(prev, piece))
+              return std::nullopt;
+          }
+          if (it != merged.end()) {
+            if (sameHunk(*it, piece))
+              continue;
+            if (overlaps(*it, piece))
+              return std::nullopt;
+          }
+
+          merged.insert(it, std::move(piece));
+        }
+      }
+
+      std::string out = baseOld.str();
+      for (auto it = merged.rbegin(); it != merged.rend(); ++it)
+        out.replace((size_t)it->oldBegin,
+                    (size_t)(it->oldEnd - it->oldBegin), it->repl);
+      return out;
+    };
+
+    auto validateMergedDirectAndDagRootReplacement =
+        [&](StringRef baseText, StringRef newText) -> bool {
+      if (baseText == newText)
+        return true;
+
+      auto invArgRangesOpt = GetMacroInvocationFormalArgContentRanges(m, baseText);
+      auto newRangesOpt = GetMacroInvocationFormalArgContentRanges(m, newText);
+      if (!invArgRangesOpt || !newRangesOpt ||
+          newRangesOpt->size() != invArgRangesOpt->size())
+        return false;
+
+      const auto &invArgRanges = *invArgRangesOpt;
+
+      SmallVector<diffutils::Hunk, 1> tokenHunksForCheck;
+      tokenHunksForCheck.push_back(h);
+      ArrayRef<diffutils::Hunk> tokenHunksAR(tokenHunksForCheck);
+
+      DenseMap<uint32_t, std::string> replByArgIdx;
+      bool touchesPaste = false;
+      for (uint32_t argIdx = 0; argIdx < invArgRanges.size(); ++argIdx) {
+        const auto &oldR = invArgRanges[argIdx];
+        const auto &newR = (*newRangesOpt)[argIdx];
+        if (oldR.first > oldR.second || oldR.second > baseText.size() ||
+            newR.first > newR.second || newR.second > newText.size())
+          return false;
+
+        StringRef oldArg =
+            baseText.slice((size_t)oldR.first, (size_t)oldR.second).trim();
+        StringRef newArg =
+            newText.slice((size_t)newR.first, (size_t)newR.second).trim();
+        if (oldArg == newArg)
+          continue;
+
+        if (!isVariadicFormalInInvocation(m, argIdx) &&
+            hasTopLevelCommaInRefoldText(newArg))
+          return false;
+
+        if (!MacroArgReplacementMatchesAllOccurrencesInBIgnorePaste(
+                m, argIdx, oldArg, newArg, tokenHunksAR))
+          return false;
+
+        replByArgIdx[argIdx] = newArg.str();
+        if (!touchesPaste) {
+          for (const auto &ps : m.pasteSpans) {
+            if (ps.argIdx == argIdx) {
+              touchesPaste = true;
+              break;
+            }
+          }
+        }
+      }
+
+      if (touchesPaste && !replByArgIdx.empty() &&
+          !PasteArgReplacementsMatchAllPasteTokensInB(
+              m, baseText, invArgRanges, replByArgIdx))
+        return false;
+
+      return true;
+    };
+
+
+    auto mergeCurrentRootWithExistingCallsitePatch =
+        [&](MacroPatch &candidate, StringRef label) -> void {
+      if (!existingPatch || !existingIsCallsite || baseInvText.empty())
+        return;
+      if (candidate.invStart != existingPatch->invStart ||
+          candidate.invEnd != existingPatch->invEnd)
+        return;
+      if (candidate.replacement == existingPatch->replacement)
+        return;
+
+      SmallVector<StringRef, 2> repls;
+      repls.push_back(StringRef(candidate.replacement));
+      repls.push_back(StringRef(existingPatch->replacement));
+      auto merged = mergeCompatibleRootCallsiteReplacements(
+          baseInvText, ArrayRef<StringRef>(repls));
+      if (!merged || !validateMergedDirectAndDagRootReplacement(
+                         baseInvText, StringRef(*merged))) {
+        trace("macro/dag",
+              "existing callsite patch not merged with {0}: inv id={1} "
+              "name='{2}' existing='{3}' current='{4}'",
+              label, m.id, m.name,
+              stringutils::showWSWithClip(existingPatch->replacement, 160),
+              stringutils::showWSWithClip(candidate.replacement, 160));
+        return;
+      }
+
+      trace("macro/dag",
+            "existing callsite patch merged with {0}: inv id={1} name='{2}' "
+            "existing='{3}' current='{4}' merged='{5}'",
+            label, m.id, m.name,
+            stringutils::showWSWithClip(existingPatch->replacement, 160),
+            stringutils::showWSWithClip(candidate.replacement, 160),
+            stringutils::showWSWithClip(*merged, 160));
+      candidate.replacement = std::move(*merged);
+      if (!candidate.macroId)
+        candidate.macroId = existingPatch->macroId;
+    };
+
     auto dag = tryDAGChainedArgsOnly();
-    if (dag)
+    if (dag) {
+      if (argsOnlyCandidate && dag->invStart == argsOnlyCandidate->invStart &&
+          dag->invEnd == argsOnlyCandidate->invEnd &&
+          dag->replacement != argsOnlyCandidate->replacement &&
+          !baseInvText.empty()) {
+        SmallVector<StringRef, 2> repls;
+        repls.push_back(StringRef(dag->replacement));
+        repls.push_back(StringRef(argsOnlyCandidate->replacement));
+        auto merged = mergeCompatibleRootCallsiteReplacements(
+            baseInvText, ArrayRef<StringRef>(repls));
+        if (merged && validateMergedDirectAndDagRootReplacement(
+                          baseInvText, StringRef(*merged))) {
+          trace("macro/dag",
+                "DAG/direct root patches merged: root id={0} name='{1}' "
+                "direct='{2}' dag='{3}' merged='{4}'",
+                m.id, m.name,
+                stringutils::showWSWithClip(argsOnlyCandidate->replacement, 160),
+                stringutils::showWSWithClip(dag->replacement, 160),
+                stringutils::showWSWithClip(*merged, 160));
+          dag->replacement = std::move(*merged);
+          if (!dag->macroId)
+            dag->macroId = argsOnlyCandidate->macroId;
+        } else {
+          trace("macro/dag",
+                "DAG args-only preferred over direct args-only: root id={0} "
+                "name='{1}' direct='{2}' dag='{3}'",
+                m.id, m.name,
+                stringutils::showWSWithClip(argsOnlyCandidate->replacement, 160),
+                stringutils::showWSWithClip(dag->replacement, 160));
+        }
+      } else if (argsOnlyCandidate &&
+                 dag->replacement != argsOnlyCandidate->replacement) {
+        trace("macro/dag",
+              "DAG args-only preferred over direct args-only: root id={0} "
+              "name='{1}' direct='{2}' dag='{3}'",
+              m.id, m.name,
+              stringutils::showWSWithClip(argsOnlyCandidate->replacement, 160),
+              stringutils::showWSWithClip(dag->replacement, 160));
+      }
+      mergeCurrentRootWithExistingCallsitePatch(*dag, "dag/direct root rewrite");
       return *dag;
+    }
 
     trace("macro/dag",
           "DAG args-only: no patch produced for root id={0} name='{1}'; "
-          "will fall back to whole-cover replacement if needed",
+          "will fall back to direct args-only / existing callsite / "
+          "whole-cover replacement as needed",
           m.id, m.name);
+    if (directRootPreservationInadmissible) {
+      trace("macro/dag",
+            "direct args-only/callsite preservation suppressed for root "
+            "id={0} name='{1}': touched hunk lies in unsupported descendant "
+            "subtree",
+            m.id, m.name);
+      argsOnlyCandidate.reset();
+      reuseExistingCallsitePatch = false;
+    }
+  }
+
+  if (argsOnlyCandidate) {
+    return *argsOnlyCandidate;
+  }
+
+  if (reuseExistingCallsitePatch) {
+    trace("macro", "callsite patch reused (args-only no-op) inv id={0}",
+          m.id);
+    return *existingPatch;
   }
 
   if (existingPatch && existingIsCallsite && !baseInvText.empty() &&
@@ -7405,15 +12610,15 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   // slice from B. cover.begin/cover.end are PP-token indices in A; map them
   // into a B-token envelope.
   //
-  // Nested child macros are only eligible for whole-cover replacement when
-  // their cover is self-contained at the child callsite. Otherwise, the child
-  // cover includes caller-owned tokens and we must retry an ancestor instead of
-  // splicing a partial expanded surface into the parent invocation.
-  if (!NestedWholeCoverIsSelfContained(m)) {
+  // This fallback is only valid when the invocation's replacement surface is
+  // self-contained at its own callsite. Nested child macros whose emitted
+  // tokens are interleaved with parent-owned syntax may still admit certified
+  // args-only / DAG lifting, but they must never whole-cover expand directly
+  // at the child callsite.
+  if (!MacroWholeCoverIsSelfContained(m)) {
     trace("macro/whole",
-          "whole-cover disallowed for nested child id={0} name='{1}': cover "
-          "is not self-contained at this callsite",
-          m.id, m.name);
+          "whole-cover rejected inv id={0} name='{1}': non-self-contained cover=[{2},{3})",
+          m.id, m.name, m.cover.begin, m.cover.end);
     return std::nullopt;
   }
   uint64_t covLoA = m.cover.begin;
@@ -7439,7 +12644,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   if (covLoA >= covHiA)
     return std::nullopt;
 
-  auto bEnv = MapATokRangeAToBTokenEnvelopeWholeCover(covLoA, covHiA);
+  auto bEnv = MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
+      covLoA, covHiA);
   if (!bEnv)
     return std::nullopt;
 
