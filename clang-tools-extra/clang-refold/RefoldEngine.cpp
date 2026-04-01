@@ -10219,8 +10219,41 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           return cert;
         }
 
+        auto tryBuildDirectPassthroughParentFormalRewrite =
+            [&](uint32_t curFormal, uint32_t parentFormal,
+                StringRef curNewText)
+            -> std::optional<FormalTextPair> {
+          if (curFormal >= cur.argDeps.size())
+            return std::nullopt;
+          ArrayRef<uint32_t> deps = cur.argDeps[curFormal];
+          if (deps.size() != 1 || deps[0] != parentFormal)
+            return std::nullopt;
+
+          auto tpl = buildArgRefTemplate(cur, curFormal);
+          if (!tpl || tpl->refs.size() != 1 ||
+              tpl->distinctCallerParams.size() != 1)
+            return std::nullopt;
+
+          const auto &ref = tpl->refs[0];
+          if (ref.callerParamIndex != parentFormal || ref.begin != 0 ||
+              ref.end != StringRef(tpl->argText).trim().size())
+            return std::nullopt;
+
+          auto parentArgText = getInvocationArgText(*parent, parentFormal);
+          if (!parentArgText)
+            return std::nullopt;
+
+          StringRef oldTrim = parentArgText->trim();
+          StringRef newTrim = curNewText.trim();
+          if (newTrim.empty() || oldTrim == newTrim)
+            return std::nullopt;
+
+          return FormalTextPair{oldTrim.str(), newTrim.str()};
+        };
+
         DenseMap<uint32_t, SmallVector<ObservedFormalConstraint, 2>>
             parentObserved;
+        DenseMap<uint32_t, SmallVector<uint32_t, 2>> parentObservedSources;
         bool needLexicalBridge = false;
         for (const auto &KV : curFormals) {
           const uint32_t curFormal = KV.first;
@@ -10250,6 +10283,10 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             }
             if (!seen)
               constraints.push_back(constraint);
+
+            auto &sources = parentObservedSources[parentFormal];
+            if (llvm::find(sources, curFormal) == sources.end())
+              sources.push_back(curFormal);
           }
         }
 
@@ -10287,6 +10324,34 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               "DAG per-hop");
           cert.parentFormalCertificates.push_back(formalCert);
           if (formalCert.kind == FormalRewriteCertificateKind::Invalid) {
+            const bool templateMismatch =
+                formalCert.failure ==
+                    FormalRewriteFailure::RawRewriteNotCertifiable &&
+                formalCert.detail.find(
+                    "observed old arg text did not match a unique structural "
+                    "template") != std::string::npos;
+            auto srcIt = parentObservedSources.find(parentFormal);
+            if (templateMismatch && srcIt != parentObservedSources.end() &&
+                srcIt->second.size() == 1) {
+              const uint32_t sourceCurFormal = srcIt->second.front();
+              auto curIt = curFormals.find(sourceCurFormal);
+              if (curIt != curFormals.end()) {
+                if (auto flatten = tryBuildDirectPassthroughParentFormalRewrite(
+                        sourceCurFormal, parentFormal,
+                        curIt->second.newText)) {
+                  trace("macro/dag",
+                        "DAG per-hop parent formal passthrough flatten: child "
+                        "id={0} name={1} parent id={2} name={3} "
+                        "sourceCurFormal={4} parentFormal={5} old='{6}' "
+                        "new='{7}'",
+                        cur.id, cur.name, parent->id, parent->name,
+                        sourceCurFormal, parentFormal, flatten->oldText,
+                        flatten->newText);
+                  parentFormals[parentFormal] = std::move(*flatten);
+                  continue;
+                }
+              }
+            }
             trace("macro/dag",
                   "DAG per-hop parent formal invalid: child id={0} name={1} "
                   "parent id={2} name={3} parentFormal={4} observed={5} "
@@ -10974,7 +11039,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
       auto buildSubtreeRewriteCertificate =
           [&](const RefoldModel::MacroInvocation &leaf,
-              const DenseMap<uint32_t, OldNewText> &leafEdits)
+              const DenseMap<uint32_t, OldNewText> &leafEdits,
+              bool deferLeafPasteValidation)
           -> SubtreeRewriteCertificate {
         SubtreeRewriteCertificate cert;
         cert.leaf = &leaf;
@@ -11003,6 +11069,24 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         cert.leafCert =
             buildInvocationRewriteCertificate(leaf, pendingLeafFormals,
                                              "DAG subtree leaf");
+        if (cert.leafCert.kind == InvocationRewriteCertificateKind::Invalid &&
+            deferLeafPasteValidation &&
+            cert.leafCert.failure == InvocationRewriteFailure::PasteMismatch) {
+          trace("macro/dag",
+                "DAG subtree leaf certificate: deferring placeholder-space "
+                "paste validation leaf id={0} name={1} touchedArgs={2}",
+                leaf.id, leaf.name, cert.leafCert.rewrites.size());
+          cert.leafCert.kind = InvocationRewriteCertificateKind::Unique;
+          cert.leafCert.failure = InvocationRewriteFailure::None;
+          cert.leafCert.detail = formatv(
+                                    "DAG subtree leaf: placeholder-space paste "
+                                    "validation deferred: inv id={0} name={1} "
+                                    "touchedArgs={2}",
+                                    leaf.id, leaf.name,
+                                    cert.leafCert.rewrites.size())
+                                    .str();
+          cert.leafCert.pasteValidation.valid = true;
+        }
         if (cert.leafCert.kind == InvocationRewriteCertificateKind::Invalid) {
           cert.detail = cert.leafCert.detail;
           return cert;
@@ -11136,7 +11220,15 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         std::string repl;
       };
 
-      auto tryBuildLegacyLeafFormalEdit =
+      // Nested leaf invocations are recorded in macro-body space, so their
+      // invocation text is often placeholder syntax such as STR1(x) or CAT(a,b)
+      // rather than source-spelled actual arguments. When all observed leaf
+      // constraints for one formal collapse to the same normalized old/new text,
+      // use that uniform observed rewrite as the leaf seed and continue through
+      // the structured lift/root-certificate pipeline. This does not accept a
+      // root patch by itself; it only supplies the leaf-side semantic rewrite
+      // when direct raw leaf-formal certification is unavailable.
+      auto tryBuildUniformObservedLeafFormalEdit =
           [&](ArrayRef<ObservedFormalConstraint> constraints)
           -> std::optional<OldNewText> {
         if (constraints.empty())
@@ -11155,171 +11247,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
         return OldNewText{oldTrim.str(), newTrim.str()};
       };
-
-      auto tryLegacyLiftToRoot =
-          [&](const RefoldModel::MacroInvocation &leaf, uint32_t leafArgIdx,
-              StringRef leafOld, StringRef leafNew)
-          -> std::optional<DenseMap<uint32_t, std::string>> {
-        const RefoldModel::MacroInvocation *cur = &leaf;
-        uint32_t curFormal = leafArgIdx;
-        StringRef curOld = leafOld.trim();
-        StringRef curNew = leafNew.trim();
-
-        while (cur->id != m.id) {
-          if (!cur->callerMacroId)
-            return std::nullopt;
-          auto parentIt = invById.find(*cur->callerMacroId);
-          if (parentIt == invById.end())
-            return std::nullopt;
-          const RefoldModel::MacroInvocation *parent = parentIt->second;
-
-          if (curFormal >= cur->argDeps.size())
-            return std::nullopt;
-          ArrayRef<uint32_t> deps = cur->argDeps[curFormal];
-          if (deps.empty())
-            return std::nullopt;
-
-          if (deps.size() == 1) {
-            curFormal = deps[0];
-            cur = parent;
-            continue;
-          }
-
-          if (deps.size() != 2)
-            return std::nullopt;
-          if (parent->id != m.id)
-            return std::nullopt;
-
-          uint32_t a = deps[0];
-          uint32_t b = deps[1];
-          auto aIt = rootArgText.find(a);
-          auto bIt = rootArgText.find(b);
-          if (aIt == rootArgText.end() || bIt == rootArgText.end())
-            return std::nullopt;
-
-          StringRef oldA = aIt->second;
-          StringRef oldB = bIt->second;
-          if (!curOld.starts_with(oldA) || !curOld.ends_with(oldB))
-            return std::nullopt;
-
-          StringRef mid =
-              curOld.slice(oldA.size(), curOld.size() - oldB.size());
-          if (mid.empty())
-            return std::nullopt;
-
-          const uint64_t needA = countSubstr(oldA, mid);
-          const uint64_t needB = countSubstr(oldB, mid);
-
-          SmallVector<std::pair<StringRef, StringRef>, 4> splits;
-          for (size_t pos = 0; (pos = curNew.find(mid, pos)) != StringRef::npos;
-               ++pos) {
-            StringRef newA = curNew.slice(0, pos);
-            StringRef newB = curNew.drop_front(pos + mid.size());
-            if (countSubstr(newA, mid) < needA ||
-                countSubstr(newB, mid) < needB)
-              continue;
-            splits.push_back({newA, newB});
-          }
-
-          if (splits.size() != 1)
-            return std::nullopt;
-
-          DenseMap<uint32_t, std::string> out;
-          out[a] = splits[0].first.trim().str();
-          out[b] = splits[0].second.trim().str();
-          return out;
-        }
-
-        DenseMap<uint32_t, std::string> out;
-        out[curFormal] = curNew.str();
-        return out;
-      };
-
-      auto tryLegacySubtreeRootPatch =
-          [&](const RefoldModel::MacroInvocation &leaf,
-              const DenseMap<uint32_t, OldNewText> &leafEdits,
-              StringRef traceStage) -> std::optional<MacroPatch> {
-        DenseMap<uint32_t, std::string> rootRepl;
-        for (const auto &KV : leafEdits) {
-          auto lifted = tryLegacyLiftToRoot(leaf, KV.first, KV.second.oldText,
-                                            KV.second.newText);
-          if (!lifted)
-            return std::nullopt;
-          for (const auto &RK : *lifted) {
-            auto it = rootRepl.find(RK.first);
-            if (it != rootRepl.end() && it->second != RK.second)
-              return std::nullopt;
-            rootRepl[RK.first] = RK.second;
-          }
-        }
-
-        std::vector<ArgEdit> edits;
-        edits.reserve(rootRepl.size());
-        for (const auto &KV : rootRepl) {
-          const uint32_t argIdx = KV.first;
-          if (argIdx >= invArgRanges.size())
-            return std::nullopt;
-
-          const uint64_t begin = static_cast<uint64_t>(invArgRanges[argIdx].first);
-          const uint64_t end = static_cast<uint64_t>(invArgRanges[argIdx].second);
-          if (begin > end || end > invSpanText.size())
-            return std::nullopt;
-
-          StringRef baseArgText =
-              invSpanText.slice(static_cast<size_t>(begin),
-                                static_cast<size_t>(end))
-                  .trim();
-          StringRef newArgText = StringRef(KV.second).trim();
-          if (baseArgText == newArgText)
-            continue;
-
-          if (!MacroArgReplacementMatchesAllOccurrencesInBIgnorePaste(
-                  m, argIdx, baseArgText, newArgText, tokenHunksAR)) {
-            trace("macro/dag",
-                  "{0}: legacy DAG root patch occurrence mismatch root id={1} "
-                  "name={2} argIdx={3} old='{4}' new='{5}'",
-                  traceStage, m.id, m.name, argIdx, baseArgText, newArgText);
-            return std::nullopt;
-          }
-
-          edits.push_back(ArgEdit{begin, end, newArgText.str()});
-        }
-
-        if (edits.empty())
-          return std::nullopt;
-
-        llvm::sort(edits, [](const ArgEdit &a, const ArgEdit &b) {
-          return a.begin < b.begin;
-        });
-
-        uint64_t cur = 0;
-        for (const auto &e : edits) {
-          if (e.begin < cur || e.end < e.begin ||
-              e.end > static_cast<uint64_t>(invSpanText.size()))
-            return std::nullopt;
-          cur = e.end;
-        }
-
-        std::string replText;
-        replText.reserve(invSpanText.size());
-        cur = 0;
-        for (const auto &e : edits) {
-          auto mid = invSpanText.slice(static_cast<size_t>(cur),
-                                       static_cast<size_t>(e.begin));
-          replText.append(mid.begin(), mid.end());
-          replText.append(e.repl);
-          cur = e.end;
-        }
-        auto tail = invSpanText.drop_front(static_cast<size_t>(cur));
-        replText.append(tail.begin(), tail.end());
-
-        trace("macro/dag",
-              "{0}: legacy DAG root patch computed root id={1} leaf id={2} "
-              "edits={3} replLen={4}",
-              traceStage, m.id, leaf.id, edits.size(), replText.size());
-        return MacroPatch{*invStart, *invEnd, std::move(replText), 0};
-      };
-
 
       enum class RootPatchConstructionCertificateKind {
         NoChange,
@@ -11853,32 +11780,36 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           continue;
 
         // Convert each touched leaf formal's observed old/new expansion text
-        // into a certified raw leaf-argument rewrite before lifting it toward
-        // the root. This now uses the same explicit formal-rewrite
-        // certificate step used during parent-hop lifting.
-        DenseSet<uint32_t> legacyLeafFallbackArgIdxs;
+        // into a certified leaf rewrite before lifting it toward the root.
+        // Prefer the normal formal-rewrite certificate. If that fails solely
+        // because the leaf lives in macro-body space and its observed text does
+        // not match a unique raw structural template, allow one narrower seed:
+        // all observed constraints for that formal must collapse to the same
+        // normalized old/new text. That seed still must pass the structured
+        // lift/root pipeline below.
+        DenseSet<uint32_t> observedLeafSeedArgIdxs;
         for (const auto &KV : leafObserved) {
           const uint32_t argIdx = KV.first;
           auto formalCert = buildObservedFormalRewriteCertificate(
               leaf, argIdx, KV.second, /*preferredChildSyntax=*/nullptr,
               "DAG subtree leaf formal");
           if (formalCert.kind == FormalRewriteCertificateKind::Invalid) {
-            const bool templateMismatchFallback =
+            const bool uniformObservedSeedAllowed =
                 formalCert.failure ==
                     FormalRewriteFailure::RawRewriteNotCertifiable &&
                 formalCert.detail.find(
                     "observed old arg text did not match a unique structural "
                     "template") != std::string::npos;
-            if (templateMismatchFallback) {
-              auto legacyLeafEdit = tryBuildLegacyLeafFormalEdit(KV.second);
-              if (legacyLeafEdit) {
+            if (uniformObservedSeedAllowed) {
+              auto observedSeed = tryBuildUniformObservedLeafFormalEdit(KV.second);
+              if (observedSeed) {
                 trace("macro/dag",
                       "DAG subtree leaf formal: inv id={0} name={1} argIdx={2} "
-                      "legacy leaf fallback old='{3}' new='{4}'",
-                      leaf.id, leaf.name, argIdx, legacyLeafEdit->oldText,
-                      legacyLeafEdit->newText);
-                legacyLeafFallbackArgIdxs.insert(argIdx);
-                leafEdits[argIdx] = std::move(*legacyLeafEdit);
+                      "uniform observed leaf seed old='{3}' new='{4}'",
+                      leaf.id, leaf.name, argIdx, observedSeed->oldText,
+                      observedSeed->newText);
+                observedLeafSeedArgIdxs.insert(argIdx);
+                leafEdits[argIdx] = std::move(*observedSeed);
                 continue;
               }
             }
@@ -11933,7 +11864,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           }
 
           if (leafTouchesPaste) {
-            bool allTouchedPasteArgsFromLegacyLeafFallback = true;
+            bool allTouchedPasteArgsFromObservedLeafSeed = true;
             for (const auto &KV : leafEdits) {
               bool argTouchesPaste = false;
               for (const auto &ps : leaf.pasteSpans) {
@@ -11942,17 +11873,17 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                   break;
                 }
               }
-              if (argTouchesPaste &&
-                  !legacyLeafFallbackArgIdxs.count(KV.first)) {
-                allTouchedPasteArgsFromLegacyLeafFallback = false;
+              if (argTouchesPaste && !observedLeafSeedArgIdxs.count(KV.first)) {
+                allTouchedPasteArgsFromObservedLeafSeed = false;
                 break;
               }
             }
 
-            if (allTouchedPasteArgsFromLegacyLeafFallback) {
+            if (allTouchedPasteArgsFromObservedLeafSeed) {
               trace("macro/dag",
                     "DAG subtree leaf paste validation: inv id={0} name={1} "
-                    "deferred all touched paste args use legacy leaf fallback",
+                    "deferred all touched paste args use uniform observed leaf "
+                    "seed",
                     leaf.id, leaf.name);
             } else if (!leaf.invText) {
               trace("macro/dag",
@@ -11984,6 +11915,28 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
         if (invalid)
           continue;
+
+        bool deferLeafPasteValidation = false;
+        if (!leaf.pasteSpans.empty()) {
+          bool leafTouchesPaste = false;
+          bool allTouchedPasteArgsFromObservedLeafSeed = true;
+          for (const auto &KV : leafEdits) {
+            bool argTouchesPaste = false;
+            for (const auto &ps : leaf.pasteSpans) {
+              if (ps.argIdx == KV.first) {
+                argTouchesPaste = true;
+                leafTouchesPaste = true;
+                break;
+              }
+            }
+            if (argTouchesPaste && !observedLeafSeedArgIdxs.count(KV.first)) {
+              allTouchedPasteArgsFromObservedLeafSeed = false;
+              break;
+            }
+          }
+          deferLeafPasteValidation =
+              leafTouchesPaste && allTouchedPasteArgsFromObservedLeafSeed;
+        }
 
         // --- Special-case: chained call suffix arguments --------------------
         //
@@ -12115,35 +12068,17 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         // The leaf rewrite, caller-chain lifting, root-formal merge, and final
         // root validation are now treated as one bottom-up subtree certificate
         // instead of several ad hoc stages.
-        auto subtreeCert = buildSubtreeRewriteCertificate(leaf, leafEdits);
+        auto subtreeCert = buildSubtreeRewriteCertificate(
+            leaf, leafEdits, deferLeafPasteValidation);
         if (subtreeCert.kind == SubtreeRewriteCertificateKind::Invalid ||
             subtreeCert.kind == SubtreeRewriteCertificateKind::NoChange) {
           if (!subtreeCert.detail.empty())
             trace("macro/dag", "{0}", subtreeCert.detail);
-          auto legacyPatch = tryLegacySubtreeRootPatch(
-              leaf, leafEdits, "DAG legacy subtree fallback");
-          if (!legacyPatch) {
-            trace("macro/dag",
-                  "DAG legacy subtree fallback: no patch root id={0} name={1} "
-                  "leaf id={2} name={3} leafEdits={4}",
-                  m.id, m.name, leaf.id, leaf.name, leafEdits.size());
-          }
-          if (!legacyPatch)
-            continue;
-          auto acceptCert = acceptOrMergeDAGCandidatePatch(
-              std::move(*legacyPatch), invSpanText,
-              "DAG legacy subtree fallback");
-          if (!acceptCert.detail.empty())
-            trace("macro/dag", "{0}", acceptCert.detail);
-          if (!acceptCert.accepted) {
-            debug("macro/dag",
-                  "DAG args-only ambiguous: incompatible root patches (root "
-                  "inv id={0} name={1} leafCandidates={2} leavesExamined={3} "
-                  "distinctRootPatches={4})",
-                  m.id, m.name, leafCands.size(), leavesExamined,
-                  distinctRootPatches + 1);
-            return std::nullopt;
-          }
+          trace("macro/dag",
+                "DAG subtree rewrite not certifiable: expanding root id={0} "
+                "name={1} leaf id={2} name={3} kind={4} leafEdits={5}",
+                m.id, m.name, leaf.id, leaf.name,
+                static_cast<unsigned>(subtreeCert.kind), leafEdits.size());
           continue;
         }
 
@@ -12185,32 +12120,11 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             rootPatchCert.kind == RootPatchConstructionCertificateKind::NoChange) {
           if (!rootPatchCert.detail.empty())
             trace("macro/dag", "{0}", rootPatchCert.detail);
-          auto legacyPatch = tryLegacySubtreeRootPatch(
-              leaf, leafEdits, "DAG legacy subtree fallback");
-          if (!legacyPatch) {
-            trace("macro/dag",
-                  "DAG legacy subtree fallback after root patch failure: no "
-                  "patch root id={0} name={1} leaf id={2} name={3} "
-                  "rootPatchKind={4}",
-                  m.id, m.name, leaf.id, leaf.name,
-                  static_cast<unsigned>(rootPatchCert.kind));
-          }
-          if (!legacyPatch)
-            continue;
-          auto acceptCert = acceptOrMergeDAGCandidatePatch(
-              std::move(*legacyPatch), invSpanText,
-              "DAG legacy subtree fallback");
-          if (!acceptCert.detail.empty())
-            trace("macro/dag", "{0}", acceptCert.detail);
-          if (!acceptCert.accepted) {
-            debug("macro/dag",
-                  "DAG args-only ambiguous: incompatible root patches (root "
-                  "inv id={0} name={1} leafCandidates={2} leavesExamined={3} "
-                  "distinctRootPatches={4})",
-                  m.id, m.name, leafCands.size(), leavesExamined,
-                  distinctRootPatches + 1);
-            return std::nullopt;
-          }
+          trace("macro/dag",
+                "DAG subtree root patch not constructible: expanding root id={0} "
+                "name={1} leaf id={2} name={3} rootPatchKind={4}",
+                m.id, m.name, leaf.id, leaf.name,
+                static_cast<unsigned>(rootPatchCert.kind));
           continue;
         }
 
