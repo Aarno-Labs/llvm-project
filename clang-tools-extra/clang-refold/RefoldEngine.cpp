@@ -11389,7 +11389,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
       };
 
       auto validateMergedRootCallsiteReplacement =
-          [&](StringRef baseText, StringRef newText) -> bool {
+          [&](StringRef baseText, StringRef newText,
+              ArrayRef<uint32_t> deferOccurrenceArgIdxs =
+                  ArrayRef<uint32_t>()) -> bool {
         if (baseText == newText)
           return true;
 
@@ -11404,7 +11406,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         }
 
         auto cert = buildInvocationRewriteCertificate(
-            m, *rootFormals, "DAG merged root patch", baseText, invArgRanges);
+            m, *rootFormals, "DAG merged root patch", baseText, invArgRanges,
+            deferOccurrenceArgIdxs);
         if (cert.kind == InvocationRewriteCertificateKind::Invalid) {
           trace("macro/dag", "{0}", cert.detail);
           return false;
@@ -12129,6 +12132,29 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         }
 
         trace("macro/dag", "{0}", rootPatchCert.detail);
+
+        // Final root replay validation: subtree lifting may defer local
+        // occurrence checks while it constructs a structured certificate.
+        // Before accepting the preserved root patch, replay the final root
+        // callsite replacement through the ordinary root-level occurrence and
+        // paste validators so only root rewrites that still reproduce the
+        // required B-side behavior are accepted.
+        SmallVector<uint32_t, 8> deferReplayOccurrenceArgIdxs;
+        deferReplayOccurrenceArgIdxs.reserve(subtreeCert.rootCert.rewrites.size());
+        for (const auto &rewrite : subtreeCert.rootCert.rewrites)
+          deferReplayOccurrenceArgIdxs.push_back(rewrite.argIdx);
+
+        if (!validateMergedRootCallsiteReplacement(
+                invSpanText, StringRef(rootPatchCert.patch->replacement),
+                deferReplayOccurrenceArgIdxs)) {
+          trace("macro/dag",
+                "DAG subtree root replay validation failed: rejecting root "
+                "id={0} name={1} leaf id={2} name={3} repl='{4}'",
+                m.id, m.name, leaf.id, leaf.name,
+                stringutils::showWSWithClip(rootPatchCert.patch->replacement,
+                                            160));
+          continue;
+        }
 
         auto acceptCert = acceptOrMergeDAGCandidatePatch(
             std::move(*rootPatchCert.patch), invSpanText,
