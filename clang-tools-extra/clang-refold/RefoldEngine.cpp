@@ -7222,9 +7222,269 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   argLikeSpans.append(m.stringifySpans.begin(), m.stringifySpans.end());
   argLikeSpans.append(m.pasteSpans.begin(), m.pasteSpans.end());
 
+  auto tryPairedPureInsertionRootArgsOnly = [&]() -> std::optional<MacroPatch> {
+    if (ForceWholeCoverMacros())
+      return std::nullopt;
+    if (hEff.aStart != hEff.aEnd || hEff.bStart >= hEff.bEnd)
+      return std::nullopt;
+    if (argLikeSpans.empty())
+      return std::nullopt;
+    if (!m.pasteSpans.empty())
+      return std::nullopt;
+
+    SmallVector<char, 16> curTouched(argLikeSpans.size(), 0);
+    if (HunkFullyWithinArgSpans(hEff, argLikeSpans, curTouched))
+      return std::nullopt;
+
+    StringRef invSpanText =
+        !baseInvText.empty()
+            ? baseInvText
+            : (m.invText ? StringRef(*m.invText) : StringRef(""));
+    if (!InvocationSpanMatchesCallsitePrefix(invSpanText, m))
+      return std::nullopt;
+
+    auto invArgRangesOpt = GetMacroInvocationFormalArgContentRanges(m, invSpanText);
+    if (!invArgRangesOpt)
+      return std::nullopt;
+    const auto &invArgRanges = *invArgRangesOpt;
+
+    std::vector<RefoldModel::PPArgSpan> occs;
+    append_range(occs, m.argSpans);
+    append_range(occs, m.stringifySpans);
+    if (occs.empty())
+      return std::nullopt;
+
+    std::vector<char> occIsStringify;
+    occIsStringify.resize(occs.size());
+    std::fill_n(occIsStringify.begin(), m.argSpans.size(), false);
+    std::fill_n(occIsStringify.begin() + m.argSpans.size(),
+                m.stringifySpans.size(), true);
+
+    auto buildCombinedInsertionEnvelope =
+        [&](const diffutils::Hunk &left, const diffutils::Hunk &right)
+        -> diffutils::Hunk {
+      diffutils::Hunk env;
+      env.aStart = std::min(left.aStart, right.aStart);
+      env.aEnd = std::max(left.aStart, right.aStart);
+      env.bStart = std::min(left.bStart, right.bStart);
+      env.bEnd = std::max(left.bEnd, right.bEnd);
+      return env;
+    };
+
+    for (const auto &partner : abTokHunks_) {
+      if (partner.aStart != partner.aEnd || partner.bStart >= partner.bEnd)
+        continue;
+      if (partner.aStart == hEff.aStart && partner.bStart == hEff.bStart &&
+          partner.bEnd == hEff.bEnd)
+        continue;
+      if (!(m.cover.begin <= partner.aStart && partner.aEnd <= m.cover.end))
+        continue;
+
+      auto isCanonicalLeader = [&](const diffutils::Hunk &lhs,
+                                   const diffutils::Hunk &rhs) {
+        if (lhs.aStart != rhs.aStart)
+          return lhs.aStart < rhs.aStart;
+        if (lhs.bStart != rhs.bStart)
+          return lhs.bStart < rhs.bStart;
+        return lhs.bEnd < rhs.bEnd;
+      };
+      if (!isCanonicalLeader(hEff, partner))
+        continue;
+
+      const diffutils::Hunk env = buildCombinedInsertionEnvelope(hEff, partner);
+      const diffutils::Hunk envTrim = trimCommonEdgeTokens(env);
+
+      std::vector<char> touchedOcc(occs.size(), 0);
+      if (!HunkFullyWithinArgSpans(envTrim, occs, touchedOcc))
+        continue;
+
+      SmallVector<uint32_t, 4> touchedArgs;
+      for (size_t i = 0; i < occs.size(); ++i) {
+        if (!touchedOcc[i])
+          continue;
+        if (!llvm::is_contained(touchedArgs, occs[i].argIdx))
+          touchedArgs.push_back(occs[i].argIdx);
+      }
+      if (touchedArgs.size() != 1)
+        continue;
+
+      const uint32_t argIdx = touchedArgs.front();
+      if (static_cast<size_t>(argIdx) >= invArgRanges.size())
+        continue;
+
+      auto r0 = invArgRanges[argIdx];
+      StringRef baseArgText = invSpanText.substr(r0.first, r0.second - r0.first);
+      SmallVector<diffutils::Hunk, 2> pairHunks{hEff, partner};
+      SmallVector<diffutils::Hunk, 2> consistencyHunks{envTrim, partner};
+      trace("macro/args",
+            "paired pure-insertion args-only candidate inv id={0} name={1} "
+            "argIdx={2} cur={3} partner={4} envTrim={5} baseArg='{6}' "
+            "consistencyHunks=[{7}, {8}]",
+            m.id, m.name, argIdx, hEff, partner, envTrim,
+            stringutils::showWSWithClip(baseArgText.trim(), 200), envTrim, partner);
+      std::optional<std::string> uniqueNewArg;
+      bool ok = true;
+
+      for (size_t i = 0; i < occs.size(); ++i) {
+        const auto &sp = occs[i];
+        if (sp.argIdx != argIdx)
+          continue;
+
+        auto bEnv = MapAToBTokenEnvelopeByPPArgSpan(sp);
+        if (!bEnv) {
+          trace("macro/args",
+                "paired pure-insertion args-only occurrence missing B envelope "
+                "inv id={0} name={1} argIdx={2} occIndex={3} spanTok=[{4},{5})",
+                m.id, m.name, argIdx, i, sp.begin, sp.end);
+          ok = false;
+          break;
+        }
+
+        size_t lo = bEnv->first;
+        size_t hi = bEnv->second;
+        trace("macro/args",
+              "paired pure-insertion args-only occurrence base envelope inv "
+              "id={0} name={1} argIdx={2} occIndex={3} stringify={4} "
+              "touchedOcc={5} spanTok=[{6},{7}) bEnv=[{8},{9}) baseBSlice='{10}'",
+              m.id, m.name, argIdx, i, occIsStringify[i] ? 1 : 0,
+              touchedOcc[i] ? 1 : 0, sp.begin, sp.end, lo, hi,
+              stringutils::showWSWithClip(SliceBSource(lo, hi).trim(), 200));
+        if (touchedOcc[i]) {
+          const size_t oldLo = lo;
+          const size_t oldHi = hi;
+          lo = std::min(lo, static_cast<size_t>(envTrim.bStart));
+          hi = std::max(hi, static_cast<size_t>(envTrim.bEnd));
+          trace("macro/args",
+                "paired pure-insertion args-only occurrence envTrim widen inv "
+                "id={0} name={1} argIdx={2} occIndex={3} envTrimB=[{4},{5}) "
+                "oldRange=[{6},{7}) newRange=[{8},{9}) slice='{10}'",
+                m.id, m.name, argIdx, i, envTrim.bStart, envTrim.bEnd, oldLo,
+                oldHi, lo, hi,
+                stringutils::showWSWithClip(SliceBSource(lo, hi).trim(), 200));
+        }
+        for (const auto &pairH : pairHunks) {
+          if (auto owned = GetOwnedPureInsertionBRangeForArgSpan(sp, occs, *bEnv,
+                                                                 pairH)) {
+            const size_t oldLo = lo;
+            const size_t oldHi = hi;
+            lo = std::min(lo, owned->first);
+            hi = std::max(hi, owned->second);
+            trace("macro/args",
+                  "paired pure-insertion args-only owned insertion widen inv "
+                  "id={0} name={1} argIdx={2} occIndex={3} pairH={4} "
+                  "owned=[{5},{6}) ownedSlice='{7}' oldRange=[{8},{9}) "
+                  "newRange=[{10},{11}) slice='{12}'",
+                  m.id, m.name, argIdx, i, pairH, owned->first, owned->second,
+                  stringutils::showWSWithClip(
+                      SliceBSource(owned->first, owned->second).trim(), 200),
+                  oldLo, oldHi, lo, hi,
+                  stringutils::showWSWithClip(SliceBSource(lo, hi).trim(), 200));
+          } else {
+            trace("macro/args",
+                  "paired pure-insertion args-only owned insertion miss inv "
+                  "id={0} name={1} argIdx={2} occIndex={3} pairH={4} "
+                  "bEnv=[{5},{6})",
+                  m.id, m.name, argIdx, i, pairH, bEnv->first, bEnv->second);
+          }
+        }
+
+        StringRef bSlice = SliceBSource(lo, hi).trim();
+        std::string newArg = bSlice.str();
+        trace("macro/args",
+              "paired pure-insertion args-only final slice inv id={0} name={1} "
+              "argIdx={2} occIndex={3} finalRange=[{4},{5}) bSlice='{6}'",
+              m.id, m.name, argIdx, i, lo, hi,
+              stringutils::showWSWithClip(bSlice, 200));
+        if (occIsStringify[i]) {
+          auto un = UnstringifyLiteralToArgText(
+              bSlice, isVariadicFormalInInvocation(m, argIdx));
+          if (!un) {
+            trace("macro/args",
+                  "paired pure-insertion args-only unstringify failed inv "
+                  "id={0} name={1} argIdx={2} occIndex={3} slice='{4}'",
+                  m.id, m.name, argIdx, i,
+                  stringutils::showWSWithClip(bSlice, 200));
+            ok = false;
+            break;
+          }
+          auto canon = CanonicalizeStringifyInversePayload(*un);
+          if (!canon || StringRef(*canon).trim() != StringRef(*un).trim()) {
+            trace("macro/args",
+                  "paired pure-insertion args-only stringify canonicalization "
+                  "failed inv id={0} name={1} argIdx={2} occIndex={3} "
+                  "un='{4}' canon='{5}'",
+                  m.id, m.name, argIdx, i,
+                  stringutils::showWSWithClip(*un, 200),
+                  canon ? stringutils::showWSWithClip(*canon, 200)
+                        : std::string("<none>"));
+            ok = false;
+            break;
+          }
+          newArg = std::move(*canon);
+        }
+
+        if (!isVariadicFormalInInvocation(m, argIdx) &&
+            hasTopLevelCommaInRefoldText(newArg)) {
+          trace("macro/args",
+                "paired pure-insertion args-only rejected top-level comma inv "
+                "id={0} name={1} argIdx={2} occIndex={3} newArg='{4}'",
+                m.id, m.name, argIdx, i,
+                stringutils::showWSWithClip(newArg, 200));
+          ok = false;
+          break;
+        }
+
+        const bool occsMatch =
+            MacroArgReplacementMatchesAllOccurrencesInB(
+                m, argIdx, baseArgText, newArg, consistencyHunks);
+        trace("macro/args",
+              "paired pure-insertion args-only occurrence consistency inv "
+              "id={0} name={1} argIdx={2} occIndex={3} baseArg='{4}' "
+              "newArg='{5}' consistencyHunks=[{6}, {7}] rawPair=[{8}, {9}] "
+              "match={10}",
+              m.id, m.name, argIdx, i,
+              stringutils::showWSWithClip(baseArgText.trim(), 200),
+              stringutils::showWSWithClip(newArg, 200), envTrim, partner, hEff,
+              partner, occsMatch ? 1 : 0);
+        if (!occsMatch) {
+          ok = false;
+          break;
+        }
+
+        if (uniqueNewArg && *uniqueNewArg != newArg) {
+          trace("macro/args",
+                "paired pure-insertion args-only conflicting newArg inv "
+                "id={0} name={1} argIdx={2} occIndex={3} first='{4}' "
+                "second='{5}'",
+                m.id, m.name, argIdx, i,
+                stringutils::showWSWithClip(*uniqueNewArg, 200),
+                stringutils::showWSWithClip(newArg, 200));
+          ok = false;
+          break;
+        }
+        uniqueNewArg = std::move(newArg);
+      }
+
+      if (!ok || !uniqueNewArg)
+        continue;
+      if (StringRef(*uniqueNewArg).trim() == baseArgText.trim())
+        continue;
+
+      std::string newInv = stringutils::replaceRange(invSpanText, r0.first,
+                                                     r0.second, *uniqueNewArg);
+      trace("macro/args",
+            "paired pure-insertion args-only SUCCESS inv id={0} name={1} "
+            "argIdx={2} cur={3} partner={4} newInv='{5}'",
+            m.id, m.name, argIdx, hEff, partner,
+            stringutils::showWSWithClip(newInv, 200));
+      return MacroPatch{*m.invB, *m.invE, std::move(newInv), 0};
+    }
+
+    return std::nullopt;
+  };
+
   SmallVector<char, 16> argTouched(argLikeSpans.size(), 0);
-  if (!ForceWholeCoverMacros() && !argLikeSpans.empty() &&
-      HunkFullyWithinArgSpans(hEff, argLikeSpans, argTouched)) {
+  if (!ForceWholeCoverMacros() && !argLikeSpans.empty()) {
     // invB/invE are offsets in the invocation file, not in the A-stream source;
     // do not slice aSource here (it can be shorter and/or refer to a different
     // logical file).
@@ -7232,7 +7492,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         !baseInvText.empty()
             ? baseInvText
             : (m.invText ? StringRef(*m.invText) : StringRef(""));
-    if (InvocationSpanMatchesCallsitePrefix(invSpanText, m)) {
+    if (HunkFullyWithinArgSpans(hEff, argLikeSpans, argTouched) &&
+        InvocationSpanMatchesCallsitePrefix(invSpanText, m)) {
       // First try to patch arguments in-place. If that can't satisfy the
       // edit, we may still be able to preserve more structure via DAG lifting
       // below, so keep the candidate around instead of returning immediately.
@@ -7249,6 +7510,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         reuseExistingCallsitePatch =
             existingPatch && existingIsCallsite && !baseInvText.empty();
       }
+    } else if (InvocationSpanMatchesCallsitePrefix(invSpanText, m)) {
+      argsOnlyCandidate = tryPairedPureInsertionRootArgsOnly();
     }
   }
 
@@ -7535,6 +7798,75 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         return raw.str();
       };
 
+      auto sanitizeArgLikeSpans =
+          [&](SmallVectorImpl<RefoldModel::PPArgSpan> &spans) {
+            SmallVector<RefoldModel::PPArgSpan, 8> valid;
+            valid.reserve(spans.size());
+            const uint64_t maxATokCount = static_cast<uint64_t>(aToks_.size());
+            for (const auto &sp : spans) {
+              if (sp.end <= sp.begin)
+                continue;
+              if (sp.begin >= maxATokCount || sp.end > maxATokCount)
+                continue;
+              valid.push_back(sp);
+            }
+            spans.assign(valid.begin(), valid.end());
+          };
+
+      auto hunkWithinBodySpans =
+          [&](const diffutils::Hunk &hh,
+              ArrayRef<RefoldModel::PPSpan> bodySpans,
+              SmallVectorImpl<uint32_t> &touchedBodyIdxs) -> bool {
+            touchedBodyIdxs.clear();
+            const uint64_t a0 = hh.aStart;
+            const uint64_t a1 = hh.aEnd;
+            if (a0 == a1) {
+              for (size_t i = 0; i < bodySpans.size(); ++i) {
+                const auto &s = bodySpans[i];
+                if (a0 == s.begin || a0 == s.end) {
+                  touchedBodyIdxs.push_back(static_cast<uint32_t>(i));
+                  return true;
+                }
+              }
+              return false;
+            }
+
+            bool any = false;
+            for (uint64_t a = a0; a < a1; ++a) {
+              bool inSome = false;
+              for (size_t i = 0; i < bodySpans.size(); ++i) {
+                const auto &s = bodySpans[i];
+                if (a >= s.begin && a < s.end) {
+                  if (!llvm::is_contained(touchedBodyIdxs,
+                                          static_cast<uint32_t>(i)))
+                    touchedBodyIdxs.push_back(static_cast<uint32_t>(i));
+                  inSome = true;
+                  any = true;
+                }
+              }
+              if (!inSome)
+                return false;
+            }
+            return any;
+          };
+
+      auto formatTokHunk = [&](const diffutils::Hunk &hh) {
+        return formatv("A=[{0},{1}) B=[{2},{3})", hh.aStart, hh.aEnd,
+                       hh.bStart, hh.bEnd)
+            .str();
+      };
+
+      auto buildCombinedInsertionEnvelope =
+          [&](const diffutils::Hunk &left, const diffutils::Hunk &right)
+          -> diffutils::Hunk {
+            diffutils::Hunk env;
+            env.aStart = std::min(left.aStart, right.aStart);
+            env.aEnd = std::max(left.aStart, right.aStart);
+            env.bStart = std::min(left.bStart, right.bStart);
+            env.bEnd = std::max(left.bEnd, right.bEnd);
+            return env;
+          };
+
       // --- Phase 2: Find leaf candidates touched by this hunk ----------------
       //
       // We search for descendant invocations whose *argument-like spans* are
@@ -7560,6 +7892,125 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           return uint64_t(s.end - s.begin);
         return ~uint64_t(0);
       };
+
+      if (hEff.aStart == hEff.aEnd && !abTokHunks_.empty()) {
+        SmallVector<char, 16> curRootTouched(argLikeSpans.size(), 0);
+        const bool curRootWithinArgLike =
+            !argLikeSpans.empty() &&
+            HunkFullyWithinArgSpans(hEff, argLikeSpans, curRootTouched);
+        SmallVector<diffutils::Hunk, 8> partnerInsertions;
+        for (const auto &hh : abTokHunks_) {
+          if (hh.aStart != hh.aEnd)
+            continue;
+          if (hh.aStart < m.cover.begin || hh.aEnd > m.cover.end)
+            continue;
+          if (hh.aStart == hEff.aStart && hh.bStart == hEff.bStart &&
+              hh.bEnd == hEff.bEnd)
+            continue;
+          partnerInsertions.push_back(hh);
+        }
+
+        trace("macro/dag",
+              "split insertion probe: root id={0} name='{1}' cur={2} "
+              "rootCover=[{3},{4}) curRootWithinArgLike={5} "
+              "curRootTouchedN={6} partnerInsertions={7}",
+              m.id, m.name, formatTokHunk(hEff), m.cover.begin, m.cover.end,
+              curRootWithinArgLike ? 1 : 0,
+              static_cast<uint64_t>(std::count(curRootTouched.begin(),
+                                               curRootTouched.end(), 1)),
+              static_cast<uint64_t>(partnerInsertions.size()));
+
+        for (const auto &partner : partnerInsertions) {
+          const diffutils::Hunk env = buildCombinedInsertionEnvelope(hEff, partner);
+          const diffutils::Hunk envTrim = trimCommonEdgeTokens(env);
+          SmallVector<char, 16> envRootTouched(argLikeSpans.size(), 0);
+          SmallVector<char, 16> envTrimRootTouched(argLikeSpans.size(), 0);
+          const bool envRootWithinArgLike =
+              !argLikeSpans.empty() &&
+              HunkFullyWithinArgSpans(env, argLikeSpans, envRootTouched);
+          const bool envTrimRootWithinArgLike =
+              !argLikeSpans.empty() &&
+              HunkFullyWithinArgSpans(envTrim, argLikeSpans, envTrimRootTouched);
+
+          std::optional<MacroPatch> pairRootPatch;
+          if (!argLikeSpans.empty() && envTrimRootWithinArgLike &&
+              InvocationSpanMatchesCallsitePrefix(invSpanText, m)) {
+            pairRootPatch =
+                BuildMacroInvocationPatchArgsOnly(m, envTrim, baseInvText);
+          }
+
+          trace("macro/dag",
+                "split insertion pair probe: root id={0} name='{1}' cur={2} "
+                "partner={3} env={4} envTrim={5} envRootWithinArgLike={6} "
+                "envTrimRootWithinArgLike={7} pairRootPatch={8} pairRootNewInv='{9}'",
+                m.id, m.name, formatTokHunk(hEff), formatTokHunk(partner),
+                formatTokHunk(env), formatTokHunk(envTrim),
+                envRootWithinArgLike ? 1 : 0,
+                envTrimRootWithinArgLike ? 1 : 0,
+                pairRootPatch ? 1 : 0,
+                pairRootPatch ? StringRef(pairRootPatch->replacement) : StringRef(""));
+
+          for (const auto &cand : model_.GetMacroInvocations()) {
+            auto d = depthToRoot(cand);
+            if (!d || *d == 0)
+              continue;
+            if (!(cand.cover.begin <= env.aStart && env.aEnd <= cand.cover.end))
+              continue;
+
+            SmallVector<RefoldModel::PPArgSpan, 8> candArgLikeProbe;
+            gatherArgLike(cand, candArgLikeProbe);
+            sanitizeArgLikeSpans(candArgLikeProbe);
+
+            SmallVector<char, 8> candCurTouchedBySpan(candArgLikeProbe.size(), 0);
+            SmallVector<char, 8> candEnvTouchedBySpan(candArgLikeProbe.size(), 0);
+            SmallVector<char, 8> candEnvTrimTouchedBySpan(candArgLikeProbe.size(), 0);
+            const bool candCurWithinArgLike =
+                !candArgLikeProbe.empty() &&
+                HunkFullyWithinArgSpans(hEff, candArgLikeProbe,
+                                        candCurTouchedBySpan);
+            const bool candEnvWithinArgLike =
+                !candArgLikeProbe.empty() &&
+                HunkFullyWithinArgSpans(env, candArgLikeProbe,
+                                        candEnvTouchedBySpan);
+            const bool candEnvTrimWithinArgLike =
+                !candArgLikeProbe.empty() &&
+                HunkFullyWithinArgSpans(envTrim, candArgLikeProbe,
+                                        candEnvTrimTouchedBySpan);
+
+            SmallVector<uint32_t, 8> curBodyTouched;
+            SmallVector<uint32_t, 8> envBodyTouched;
+            SmallVector<uint32_t, 8> envTrimBodyTouched;
+            const bool candCurWithinBody =
+                hunkWithinBodySpans(hEff, cand.bodySpans, curBodyTouched);
+            const bool candEnvWithinBody =
+                hunkWithinBodySpans(env, cand.bodySpans, envBodyTouched);
+            const bool candEnvTrimWithinBody =
+                hunkWithinBodySpans(envTrim, cand.bodySpans, envTrimBodyTouched);
+
+            trace("macro/dag",
+                  "split insertion descendant probe: root id={0} name='{1}' "
+                  "cand id={2} name='{3}' depth={4} cur={5} partner={6} env={7} "
+                  "candCover=[{8},{9}) curWithinArgLike={10} envWithinArgLike={11} "
+                  "envTrimWithinArgLike={12} curWithinBody={13} curBodyTouched={14} "
+                  "envWithinBody={15} envBodyTouched={16} envTrimWithinBody={17} "
+                  "envTrimBodyTouched={18} argLikeN={19} argRefN={20} invText='{21}'",
+                  m.id, m.name, cand.id, cand.name, *d, formatTokHunk(hEff),
+                  formatTokHunk(partner), formatTokHunk(env), cand.cover.begin,
+                  cand.cover.end, candCurWithinArgLike ? 1 : 0,
+                  candEnvWithinArgLike ? 1 : 0,
+                  candEnvTrimWithinArgLike ? 1 : 0,
+                  candCurWithinBody ? 1 : 0,
+                  FormatUInt32List(curBodyTouched),
+                  candEnvWithinBody ? 1 : 0,
+                  FormatUInt32List(envBodyTouched),
+                  candEnvTrimWithinBody ? 1 : 0,
+                  FormatUInt32List(envTrimBodyTouched),
+                  static_cast<uint64_t>(candArgLikeProbe.size()),
+                  static_cast<uint64_t>(cand.argRefs.size()),
+                  cand.invText ? StringRef(*cand.invText).trim() : StringRef("<none>"));
+          }
+        }
+      }
 
       SmallVector<LeafCandidate, 8> leafCands;
       directRootPreservationInadmissible = false;
@@ -7593,18 +8044,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         // them would lead to bogus touched indices or out-of-bounds
         // access. Skip them here to avoid crashes downstream (see
         // similar_expansion_paths_ambiguity_path1_path2 regression).
-        SmallVector<RefoldModel::PPArgSpan, 8> validArgLike;
-        validArgLike.reserve(candArgLike.size());
-        const uint64_t maxATokCount = static_cast<uint64_t>(aToks_.size());
-        for (const auto &sp : candArgLike) {
-          if (sp.end <= sp.begin)
-            continue;
-          // ensure begin/end are within A-token bounds
-          if (sp.begin >= maxATokCount || sp.end > maxATokCount)
-            continue;
-          validArgLike.push_back(sp);
-        }
-        candArgLike.swap(validArgLike);
+        sanitizeArgLikeSpans(candArgLike);
         if (candArgLike.empty()) {
           if (hunkWithinCandCover) {
             trace("macro/dag",
@@ -14413,6 +14853,47 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             m.id, m.name);
       argsOnlyCandidate.reset();
       reuseExistingCallsitePatch = false;
+    }
+
+    if (argsOnlyCandidate && existingPatch && existingIsCallsite &&
+        !baseInvText.empty() && argsOnlyCandidate->invStart == existingPatch->invStart &&
+        argsOnlyCandidate->invEnd == existingPatch->invEnd &&
+        argsOnlyCandidate->replacement != existingPatch->replacement) {
+      SmallVector<StringRef, 2> repls;
+      repls.push_back(StringRef(argsOnlyCandidate->replacement));
+      repls.push_back(StringRef(existingPatch->replacement));
+      auto merged = mergeCompatibleRootCallsiteReplacements(
+          baseInvText, ArrayRef<StringRef>(repls));
+      if (merged &&
+          validateMergedDirectAndDagRootReplacement(baseInvText, StringRef(*merged))) {
+        trace("macro/dag",
+              "existing callsite patch merged with direct root args-only rewrite: inv id={0} name='{1}' existing='{2}' current='{3}' merged='{4}'",
+              m.id, m.name,
+              stringutils::showWSWithClip(existingPatch->replacement, 160),
+              stringutils::showWSWithClip(argsOnlyCandidate->replacement, 160),
+              stringutils::showWSWithClip(*merged, 160));
+        argsOnlyCandidate->replacement = std::move(*merged);
+        if (!argsOnlyCandidate->macroId)
+          argsOnlyCandidate->macroId = existingPatch->macroId;
+      } else {
+        const bool directValid = validateMergedDirectAndDagRootReplacement(
+            baseInvText, StringRef(argsOnlyCandidate->replacement));
+        trace("macro/dag",
+              "existing callsite patch not merged with direct root args-only rewrite: inv id={0} name='{1}' existing='{2}' current='{3}' directValid={4}",
+              m.id, m.name,
+              stringutils::showWSWithClip(existingPatch->replacement, 160),
+              stringutils::showWSWithClip(argsOnlyCandidate->replacement, 160),
+              directValid ? 1 : 0);
+        if (!directValid) {
+          trace("macro/dag",
+                "discarding invalid direct root args-only rewrite in favor of existing callsite patch: inv id={0} name='{1}' existing='{2}' current='{3}'",
+                m.id, m.name,
+                stringutils::showWSWithClip(existingPatch->replacement, 160),
+                stringutils::showWSWithClip(argsOnlyCandidate->replacement, 160));
+          argsOnlyCandidate.reset();
+          reuseExistingCallsitePatch = true;
+        }
+      }
     }
   }
 
