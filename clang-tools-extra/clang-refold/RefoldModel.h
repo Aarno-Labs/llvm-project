@@ -49,6 +49,13 @@ namespace refold {
 
 enum class PPArgSpanKind { Standard, Stringify, Paste };
 
+enum class MacroCalleeOriginKind {
+  LiteralMacroName,
+  CallerParam,
+  Paste,
+  Opaque
+};
+
 static inline StringRef toString(PPArgSpanKind kind) {
   switch (kind) {
   case PPArgSpanKind::Standard:
@@ -59,6 +66,20 @@ static inline StringRef toString(PPArgSpanKind kind) {
     return "Paste";
   }
   llvm_unreachable("Invalid PPArgSpanKind");
+}
+
+static inline StringRef toString(MacroCalleeOriginKind kind) {
+  switch (kind) {
+  case MacroCalleeOriginKind::LiteralMacroName:
+    return "literal_macro_name";
+  case MacroCalleeOriginKind::CallerParam:
+    return "caller_param";
+  case MacroCalleeOriginKind::Paste:
+    return "paste";
+  case MacroCalleeOriginKind::Opaque:
+    return "opaque";
+  }
+  llvm_unreachable("Invalid MacroCalleeOriginKind");
 }
 
 /// \brief Strongly-typed view over the clang-refold map JSON produced by the
@@ -283,6 +304,11 @@ public:
     uint32_t byteEnd;
   };
 
+  struct MacroCalleeOrigin {
+    MacroCalleeOriginKind kind = MacroCalleeOriginKind::LiteralMacroName;
+    std::vector<uint32_t> callerParamIndices;
+  };
+
   struct MacroDefParam {
     StringRef name;
     bool variadic;
@@ -309,6 +335,7 @@ public:
         invPPByteEnd; // A-stream byte envelope
     std::optional<uint64_t> ownerIncludeId;
     std::optional<uint64_t> callerMacroId;
+    MacroCalleeOrigin calleeOrigin;
     std::vector<std::vector<uint32_t>> argDeps;
     std::vector<std::vector<InvArgRef>> argRefs;
     PPCover cover;
@@ -327,6 +354,7 @@ public:
                     std::vector<PPArgSpan> pasteSpans,
                     std::vector<PPSpan> bodySpans,
                     std::optional<uint64_t> callerMacroId,
+                    MacroCalleeOrigin calleeOrigin,
                     std::vector<std::vector<uint32_t>> argDeps,
                     std::vector<std::vector<InvArgRef>> argRefs) noexcept
         : id(id), subkind(subkind), name(name),
@@ -337,8 +365,8 @@ public:
           bodySpans(std::move(bodySpans)), invText(invText), invFile(invFile),
           invB(invB), invE(invE), invPPByteBegin(invPPByteBegin),
           invPPByteEnd(invPPByteEnd), ownerIncludeId(ownerIncludeId),
-          callerMacroId(callerMacroId), argDeps(std::move(argDeps)),
-          argRefs(std::move(argRefs)) {
+          callerMacroId(callerMacroId), calleeOrigin(std::move(calleeOrigin)),
+          argDeps(std::move(argDeps)), argRefs(std::move(argRefs)) {
       cover.Init(this->spans, &this->argSpans, &this->bodySpans);
     }
 

@@ -828,7 +828,11 @@ static constexpr const char *RefoldSchema = R"json(
         "caller_macro_id": {
           "type": "integer",
           "minimum": 0,
-          "description": "If this macro invocation occurred while expanding another macro, this is the item id of the immediately enclosing (caller) macro invocation. The producer emits this to form a deterministic macro nesting DAG for nested-expansion remapping (no heuristic re-expansion required)."
+          "description": "If this macro invocation occurred while expanding another macro, this is the item id of the immediately enclosing (caller) macro invocation. This encodes the structural nesting DAG only; argument flow is described separately by arg_deps/arg_refs and callee_origin."
+        },
+        "callee_origin": {
+          "$ref": "#/$defs/CalleeOrigin",
+          "description": "Origin of the callee token for this invocation. A literal callee name is safe for generalized nested args-only refolding; caller-param, paste, or opaque origins must be conservatively expanded."
         },
         "def_params": {
           "type": "array",
@@ -847,24 +851,40 @@ static constexpr const char *RefoldSchema = R"json(
             },
             "uniqueItems": true
           },
-          "description": "For each argument in this invocation (in invocation order), the set of caller formal indices referenced in the raw argument text. Only meaningful when caller_macro_id is present."
+          "description": "For each argument in this invocation (in invocation order), the set of caller formal indices referenced in the raw argument text. This captures argument-text dependencies only; it does not describe higher-order callee-token provenance, which is recorded separately in callee_origin."
         },
         "arg_refs": {
-          "type": ["array", "null"],
+          "type": [
+            "array",
+            "null"
+          ],
           "items": {
             "type": "array",
             "items": {
               "type": "object",
-              "required": ["caller_param_index", "byte_begin", "byte_end"],
+              "required": [
+                "caller_param_index",
+                "byte_begin",
+                "byte_end"
+              ],
               "additionalProperties": false,
               "properties": {
-                "caller_param_index": { "type": "integer", "minimum": 0 },
-                "byte_begin": { "type": "integer", "minimum": 0 },
-                "byte_end": { "type": "integer", "minimum": 0 }
+                "caller_param_index": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "byte_begin": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "byte_end": {
+                  "type": "integer",
+                  "minimum": 0
+                }
               }
             }
           },
-          "description": "Per-callee-parameter mapping back to slices of caller formal arguments. For parameter i, arg_refs[i] is an ordered sequence of (caller_param_index, byte_begin, byte_end) triples describing which caller argument slices were substituted into this callee parameter's raw argument text. Only meaningful when caller_macro_id is present."
+          "description": "Per-callee-parameter mapping back to slices of caller formal arguments. For parameter i, arg_refs[i] is an ordered sequence of (caller_param_index, byte_begin, byte_end) triples describing which caller argument slices were substituted into this callee parameter's raw argument text. This refines arg_deps for argument-text lifting only and does not encode callee-token provenance."
         }
       },
       "dependentRequired": {
@@ -1222,6 +1242,35 @@ static constexpr const char *RefoldSchema = R"json(
         }
       },
       "description": "A single formal macro parameter from the macro definition corresponding to a recorded invocation."
+    },
+    "CalleeOrigin": {
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "literal_macro_name",
+            "caller_param",
+            "paste",
+            "opaque"
+          ],
+          "description": "Provenance class for the macro callee token at this invocation site. literal_macro_name means the callee identifier came from a literal macro name spelled in the replacement list/body. caller_param means the callee token came from a caller formal parameter (higher-order/x-macro style). paste means the callee token was synthesized by token pasting. opaque means the producer could not prove a more specific origin."
+        },
+        "caller_param_indices": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "uniqueItems": true,
+          "description": "When kind is caller_param, the caller formal parameter indices that directly contributed the callee token spelling at this invocation site. Empty or omitted for literal_macro_name, paste, or opaque."
+        }
+      },
+      "description": "Structural provenance for the invoked macro name itself. The consumer uses this to conservatively disable args-only and DAG-lift refolding for higher-order or otherwise non-literal callee origins."
     }
   }
 }

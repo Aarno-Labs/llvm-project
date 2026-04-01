@@ -442,7 +442,6 @@ private:
     }
   }
 
-
   /// \brief Run the full refolding pipeline for the current inputs.
   ///
   /// This is the main instance entry point. It classifies token hunks, plans
@@ -1343,11 +1342,13 @@ private:
   /// 5. Deterministically segment the B token into per-argument regions.
   ///
   /// Segmentation is performed by anchoring on the *fixed* (non-span) substrings
-  /// between paste spans in the A token. This supports edits that change the
-  /// overall pasted token length (e.g., `a_b_c -> foo_bar_baz`) as long as the
-  /// fixed slices remain unchanged. If two spans are adjacent (no fixed anchor)
-  /// and the total length changes, segmentation becomes ambiguous and the
-  /// method returns `std::nullopt`.
+  /// between paste spans in the A token. For a contiguous run of adjacent spans
+  /// (no fixed internal anchor), the inversion now computes an explicit
+  /// certificate: the run is invertible when unchanged neighboring segments pin
+  /// the boundary, and conservatively ambiguous once more than one touching
+  /// span in the same run would need to change. This supports edits such as
+  /// `a##b##c -> foo##b##c` while still rejecting underdetermined rewrites like
+  /// `a##b##c -> foo##bar##c`.
   ///
   /// ### Return value
   /// On success, returns a list of `PasteArgEdit` objects, one per affected
@@ -1391,10 +1392,11 @@ private:
   ///   the final span).
   ///
   /// Length-changing edits are supported (e.g. `a_b_c -> foo_bar_baz`) as long
-  /// as fixed slices exist to separate spans, or the growth/shrink is confined
-  /// to the final span. If two adjacent spans have no fixed delimiter between
-  /// them and the overall token length changes, the boundary between those
-  /// spans becomes ambiguous; in that case this method returns `std::nullopt`.
+  /// as fixed slices, or unchanged neighboring span spellings, uniquely pin the
+  /// segment boundaries. For a touching run with no fixed internal delimiter,
+  /// the inversion accepts at most one edited span in that run; once two
+  /// neighboring span contributions both need to move, the boundary becomes
+  /// underdetermined and this method returns `std::nullopt`.
   ///
   /// ### Implementation notes
   /// * `spansAsc` must be non-overlapping, sorted by `byteBegin` ascending, and
@@ -1455,8 +1457,11 @@ private:
   ///             must match via fixed anchors).
   /// \param out Output list aligned to `spansAsc`; populated with per-span B
   ///            substrings.
-  /// \returns `true` if a complete, unambiguous segmentation consistent with
-  ///          all fixed slices exists; otherwise `false`.
+  /// \returns `true` if a complete, unambiguous segmentation exists. For a
+  ///          contiguous `##` run, multiple edited segments are allowed only
+  ///          when each edited segment is isolated by unchanged neighboring
+  ///          segments (or a run edge); adjacent edited segments in the same
+  ///          undelimited run are rejected as ambiguous.
   static bool SegmentPastedTokenArgsByFixedSlicesRec(
       StringRef aTok, StringRef bTok,
       ArrayRef<const RefoldModel::PPArgSpan *> spansAsc, size_t idx,
@@ -1789,8 +1794,9 @@ private:
   ///   span. This ensures no part of the macro's structural body is modified.
   ///
   /// As a side effect, the `touched` array is updated to track which specific
-  /// argument indices (based on the provided `argSpans` list) are affected by
-  /// the hunk.
+  /// span occurrences from the provided `argSpans` list are affected by the
+  /// hunk. Callers that need per-formal state must compress these occurrence
+  /// touches using each span's `argIdx`.
   ///
   /// \param h The hunk representing the edit in the original preprocessed (A)
   ///          token stream.
@@ -1878,6 +1884,9 @@ private:
   /// \returns A pair representing the [begin, end) token indices in source B.
   std::pair<size_t, size_t>
   MapAByteRangeToBTokenEnvelope(size_t aByteBegin, size_t aByteEnd) const;
+  std::pair<size_t, size_t>
+  MapAByteRangeToBTokenEnvelopePreserveBoundaryInsertions(size_t aByteBegin,
+                                                          size_t aByteEnd) const;
 
   /// \brief Maps a macro argument span to its corresponding B-token envelope.
   ///
@@ -1903,6 +1912,9 @@ private:
   /// \returns The B-token range if the input is valid, std::nullopt otherwise.
   std::optional<std::pair<size_t, size_t>>
   MapATokRangeAToBTokenEnvelope(uint64_t beginTok, uint64_t endTok) const;
+  std::optional<std::pair<size_t, size_t>>
+  MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(uint64_t beginTok,
+                                                          uint64_t endTok) const;
 
   /// \brief Map an A-token range to its B-token envelope for whole-cover
   /// replacement.
@@ -2019,8 +2031,14 @@ private:
   SmallVector<ForcedMacroPatchRequest, 32>
   ComputeForcedCounterPatches(StringRef tuPath, ArrayRef<int64_t> a2b) const;
 
-  /// \brief Compute additional forced patches when an earlier counter-
-  ///        consuming macro remains expanded after normal attribution.
+  /// \brief Compute additional forced __COUNTER__ stabilization patches caused
+  ///        by macro callsites that already remain expanded after normal hunk
+  ///        attribution.
+  ///
+  /// If a normal macro patch expands a callsite whose expansion contains a
+  /// __COUNTER__ occurrence, recompiling the refolded source would stop that
+  /// callsite from incrementing the counter. Every later occurrence in PP-token
+  /// order must then be forced to remain expanded as well.
   SmallVector<ForcedMacroPatchRequest, 32>
   ComputeForcedCounterPatchesFromExpandedMacros(
       StringRef tuPath,
@@ -2039,6 +2057,27 @@ private:
       ArrayRef<ForcedMacroPatchRequest> forced,
       DenseMap<std::optional<uint64_t>, DenseMap<uint64_t, MacroPatch>>
           &macroPatchByOwnerByMacroId) const;
+
+  /// \brief Compute the A-token interval used for whole-cover replacement of
+  ///        a macro invocation.
+  ///
+  /// This usually matches \c m.cover, but some zero-parameter function-like
+  /// macros are conservatively widened by the producer when nested in parent
+  /// arguments. In those cases, the precise replacement slice is derived from
+  /// the bounding box of \c bodySpans.
+  std::optional<std::pair<uint64_t, uint64_t>>
+  GetWholeCoverATokRange(const RefoldModel::MacroInvocation &m) const;
+
+  /// \brief Return true when the invocation's whole-cover replacement surface
+  ///        is self-contained at the callsite.
+  ///
+  /// Whole-cover replacement is only valid when every A token in the chosen
+  /// cover interval is claimed by this invocation through its own body, arg,
+  /// stringify, or paste spans. Nested child invocations whose emitted tokens
+  /// are interleaved with parent-owned syntax are not self-contained and must
+  /// be lifted through an ancestor rather than replaced at the child callsite.
+  bool MacroWholeCoverIsSelfContained(
+      const RefoldModel::MacroInvocation &m) const;
 
   /// \brief Compute whole-cover replacement text for a macro invocation.
   ///
