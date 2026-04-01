@@ -11287,6 +11287,12 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         std::string detail;
       };
 
+      struct DagCandidateValidationMetadata {
+        SmallVector<uint32_t, 8> deferOccurrenceArgIdxs;
+        DenseMap<uint32_t, FormalTextPair> expectedRootFormals;
+        bool hasExpectedRootFormals = false;
+      };
+
       // --- Phase 4: Try leaves, lift, validate, and ensure uniqueness --------
       //
       // We scan leaf candidates (deepest-first) and attempt to produce a root
@@ -11295,6 +11301,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
       //   * the resulting root patch is unique (no second distinct patch).
       std::optional<MacroPatch> uniquePatch;
       std::optional<std::string> uniquePatchBaseText;
+      DagCandidateValidationMetadata uniquePatchValidation;
       unsigned leavesExamined = 0;
       unsigned distinctRootPatches = 0;
 
@@ -11388,6 +11395,62 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         return cert;
       };
 
+      auto mergeDagCandidateValidationMetadata =
+          [&](const DagCandidateValidationMetadata &lhs,
+              const DagCandidateValidationMetadata &rhs)
+          -> std::optional<DagCandidateValidationMetadata> {
+        DagCandidateValidationMetadata merged;
+
+        auto addDeferredArgIdxs = [&](ArrayRef<uint32_t> argIdxs) {
+          for (uint32_t argIdx : argIdxs) {
+            if (!llvm::is_contained(merged.deferOccurrenceArgIdxs, argIdx))
+              merged.deferOccurrenceArgIdxs.push_back(argIdx);
+          }
+        };
+        addDeferredArgIdxs(lhs.deferOccurrenceArgIdxs);
+        addDeferredArgIdxs(rhs.deferOccurrenceArgIdxs);
+        llvm::sort(merged.deferOccurrenceArgIdxs);
+
+        if (!lhs.hasExpectedRootFormals && !rhs.hasExpectedRootFormals)
+          return merged;
+
+        DenseMap<uint32_t, SmallVector<FormalTextPair, 2>> rewritesByArg;
+        auto collect = [&](const DagCandidateValidationMetadata &meta) {
+          if (!meta.hasExpectedRootFormals)
+            return;
+          for (const auto &KV : meta.expectedRootFormals)
+            rewritesByArg[KV.first].push_back(KV.second);
+        };
+        collect(lhs);
+        collect(rhs);
+
+        for (const auto &KV : rewritesByArg) {
+          const uint32_t argIdx = KV.first;
+          if (argIdx >= invArgRanges.size())
+            return std::nullopt;
+
+          const size_t begin = invArgRanges[argIdx].first;
+          const size_t end = invArgRanges[argIdx].second;
+          if (begin > end || end > invSpanText.size())
+            return std::nullopt;
+
+          const StringRef baseArgText = invSpanText.slice(begin, end).trim();
+          auto mergedArgText =
+              mergeCompatibleFormalRewrites(baseArgText, KV.second);
+          if (!mergedArgText)
+            return std::nullopt;
+          if (StringRef(*mergedArgText).trim() == baseArgText)
+            continue;
+
+          merged.expectedRootFormals[argIdx] =
+              FormalTextPair{baseArgText.str(),
+                             StringRef(*mergedArgText).trim().str()};
+        }
+
+        merged.hasExpectedRootFormals = true;
+        return merged;
+      };
+
       auto validateMergedRootCallsiteReplacement =
           [&](StringRef baseText, StringRef newText,
               ArrayRef<uint32_t> deferOccurrenceArgIdxs =
@@ -11451,11 +11514,18 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
       auto acceptOrMergeDAGCandidatePatch =
           [&](MacroPatch candPatch, StringRef baseText,
-              StringRef traceStage) -> DagCandidateAcceptanceCertificate {
+              StringRef traceStage,
+              const DagCandidateValidationMetadata *candValidation = nullptr)
+          -> DagCandidateAcceptanceCertificate {
         DagCandidateAcceptanceCertificate cert;
+        DagCandidateValidationMetadata candidateValidation;
+        if (candValidation)
+          candidateValidation = *candValidation;
+
         if (!uniquePatch) {
           uniquePatch = std::move(candPatch);
           uniquePatchBaseText = baseText.str();
+          uniquePatchValidation = std::move(candidateValidation);
           distinctRootPatches = 1;
           cert.accepted = true;
           cert.detail = formatv(
@@ -11483,6 +11553,36 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         }
 
         if (uniquePatch->replacement == candPatch.replacement) {
+          auto mergedValidation = mergeDagCandidateValidationMetadata(
+              uniquePatchValidation, candidateValidation);
+          if (!mergedValidation) {
+            cert.failure = DagCandidateAcceptanceFailure::MergedRootValidationFailed;
+            cert.detail = formatv(
+                              "{0}: DAG candidate patch rejected root id={1} "
+                              "name={2} equivalent replacement produced "
+                              "incompatible root-formal validation metadata",
+                              traceStage, m.id, m.name)
+                              .str();
+            return cert;
+          }
+
+          if (!validateMergedRootCallsiteReplacement(
+                  *uniquePatchBaseText, uniquePatch->replacement,
+                  mergedValidation->deferOccurrenceArgIdxs,
+                  mergedValidation->hasExpectedRootFormals
+                      ? &mergedValidation->expectedRootFormals
+                      : nullptr)) {
+            cert.failure = DagCandidateAcceptanceFailure::MergedRootValidationFailed;
+            cert.detail = formatv(
+                              "{0}: DAG candidate patch rejected root id={1} "
+                              "name={2} equivalent replacement failed merged "
+                              "root validation",
+                              traceStage, m.id, m.name)
+                              .str();
+            return cert;
+          }
+
+          uniquePatchValidation = std::move(*mergedValidation);
           cert.accepted = true;
           cert.detail = formatv(
                             "{0}: DAG candidate patch equivalent to existing "
@@ -11521,8 +11621,25 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           return cert;
         }
 
-        if (!validateMergedRootCallsiteReplacement(*uniquePatchBaseText,
-                                                   StringRef(*merged))) {
+        auto mergedValidation = mergeDagCandidateValidationMetadata(
+            uniquePatchValidation, candidateValidation);
+        if (!mergedValidation) {
+          cert.failure = DagCandidateAcceptanceFailure::MergedRootValidationFailed;
+          cert.detail = formatv(
+                            "{0}: DAG candidate patch rejected root id={1} "
+                            "name={2} merged replacement produced "
+                            "incompatible root-formal validation metadata",
+                            traceStage, m.id, m.name)
+                            .str();
+          return cert;
+        }
+
+        if (!validateMergedRootCallsiteReplacement(
+                *uniquePatchBaseText, StringRef(*merged),
+                mergedValidation->deferOccurrenceArgIdxs,
+                mergedValidation->hasExpectedRootFormals
+                    ? &mergedValidation->expectedRootFormals
+                    : nullptr)) {
           cert.failure =
               DagCandidateAcceptanceFailure::MergedRootValidationFailed;
           cert.detail = formatv(
@@ -11535,6 +11652,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         }
 
         uniquePatch->replacement = std::move(*merged);
+        uniquePatchValidation = std::move(*mergedValidation);
         if (!uniquePatch->macroId)
           uniquePatch->macroId = candPatch.macroId;
         ++distinctRootPatches;
@@ -12190,9 +12308,17 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           continue;
         }
 
+        DagCandidateValidationMetadata subtreeValidation;
+        subtreeValidation.hasExpectedRootFormals = true;
+        for (const auto &KV : subtreeCert.rootFormals)
+          subtreeValidation.expectedRootFormals[KV.first] = KV.second;
+        subtreeValidation.deferOccurrenceArgIdxs.assign(
+            deferReplayOccurrenceArgIdxs.begin(),
+            deferReplayOccurrenceArgIdxs.end());
+
         auto acceptCert = acceptOrMergeDAGCandidatePatch(
             std::move(*rootPatchCert.patch), invSpanText,
-            "DAG subtree root patch");
+            "DAG subtree root patch", &subtreeValidation);
         if (!acceptCert.detail.empty())
           trace("macro/dag", "{0}", acceptCert.detail);
         if (!acceptCert.accepted) {
