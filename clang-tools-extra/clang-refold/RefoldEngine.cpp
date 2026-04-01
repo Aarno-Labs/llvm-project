@@ -10132,6 +10132,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             InvocationRewriteFailure::None;
         const RefoldModel::MacroInvocation *nextInv = nullptr;
         DenseMap<uint32_t, FormalTextPair> nextFormals;
+        DenseMap<uint32_t, SmallVector<uint32_t, 2>> parentFormalSources;
         InvocationRewriteCertificate currentCert;
         SmallVector<ParentConstraintDerivationCertificate, 4> derivations;
         SmallVector<FormalRewriteCertificate, 4> parentFormalCertificates;
@@ -10459,6 +10460,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         cert.kind = StructuredLiftCertificateKind::Unique;
         cert.nextInv = parent;
         cert.nextFormals = std::move(parentFormals);
+        cert.parentFormalSources = std::move(parentObservedSources);
         return cert;
       };
 
@@ -10491,6 +10493,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
         const RefoldModel::MacroInvocation *cur = &leaf;
         DenseMap<uint32_t, FormalTextPair> curFormals;
+        DenseSet<uint32_t> bridgedCurFormals;
         curFormals[leafArgIdx] =
             FormalTextPair{leafOld.trim().str(), leafNew.trim().str()};
 
@@ -10516,8 +10519,25 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                                 .str();
               return cert;
             }
+
+            DenseSet<uint32_t> nextBridgedCurFormals;
+            if (!bridgedCurFormals.empty()) {
+              for (const auto &KV : step.nextFormals) {
+                auto srcIt = step.parentFormalSources.find(KV.first);
+                if (srcIt == step.parentFormalSources.end())
+                  continue;
+                for (uint32_t sourceCurFormal : srcIt->second) {
+                  if (bridgedCurFormals.contains(sourceCurFormal)) {
+                    nextBridgedCurFormals.insert(KV.first);
+                    break;
+                  }
+                }
+              }
+            }
+
             cur = step.nextInv;
             curFormals = std::move(step.nextFormals);
+            bridgedCurFormals = std::move(nextBridgedCurFormals);
             continue;
           }
 
@@ -10568,11 +10588,14 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           cert.usedLexicalBridge = true;
           cur = step.nextInv;
           curFormals = std::move(*bridged);
+          bridgedCurFormals.clear();
+          for (const auto &KV : curFormals)
+            bridgedCurFormals.insert(KV.first);
         }
 
         for (const auto &KV : curFormals) {
           cert.rootFormals[KV.first] = KV.second;
-          if (cert.usedLexicalBridge)
+          if (bridgedCurFormals.contains(KV.first))
             cert.bridgedRootArgIdxs.insert(KV.first);
         }
         cert.kind = LiftChainCertificateKind::Unique;
