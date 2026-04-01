@@ -66,6 +66,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FileSystem.h"
@@ -10935,10 +10936,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             hasInteractionScopedPasteSemantics;
         const bool hasBridgeSensitiveStructuredSemantics =
             semantic.hasBridgeSensitiveStructuredSemantics;
-        if (semantic.usesLexicalBridge &&
-            hasBridgeSensitiveStructuredSemantics) {
+        if (hasBridgeSensitiveStructuredSemantics) {
           trace("macro/dag",
-                "subtree admissibility reject(lexical bridge): "
+                "subtree admissibility reject(bridge-sensitive semantics): "
                 "lexicalBridge={0} structuredSemantics={1} "
                 "bridgeSensitiveStructuredSemantics={2} subtreePaste={3} "
                 "interactionPaste={4} wrappers={5} preferredChildSyntax={6} "
@@ -10971,9 +10971,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           cert.failure = SubtreeSemanticAdmissibilityFailure::
               LexicalBridgeWithStructuredSemantics;
           cert.detail =
-              "subtree semantic admissibility failed: lexical bridging cannot "
-              "certify bridge-sensitive wrapper/raw-invocation/paste subtree "
-              "semantics";
+              "subtree semantic admissibility failed: bridge-sensitive "
+              "wrapper/raw-invocation/paste subtree semantics remain "
+              "inadmissible";
           return cert;
         }
 
@@ -11415,7 +11415,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         DenseMap<uint32_t, FormalTextPair> expectedRootFormals;
         StringMap<SemanticInteractionSignature> bridgeSensitiveFormalSignatures;
         bool hasExpectedRootFormals = false;
-        bool usesLexicalBridge = false;
         bool hasBridgeSensitiveStructuredSemantics = false;
         bool hasMixedSemanticInteractions = false;
       };
@@ -11527,8 +11526,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               const DagCandidateValidationMetadata &rhs)
           -> std::optional<DagCandidateValidationMetadata> {
         DagCandidateValidationMetadata merged;
-        merged.usesLexicalBridge =
-            lhs.usesLexicalBridge || rhs.usesLexicalBridge;
         merged.hasBridgeSensitiveStructuredSemantics =
             lhs.hasBridgeSensitiveStructuredSemantics ||
             rhs.hasBridgeSensitiveStructuredSemantics;
@@ -11669,12 +11666,11 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                 traceStage, m.id, m.name);
           return false;
         }
-        if (validation.usesLexicalBridge &&
-            validation.hasBridgeSensitiveStructuredSemantics) {
+        if (validation.hasBridgeSensitiveStructuredSemantics) {
           trace("macro/dag",
                 "{0}: DAG candidate patch rejected root id={1} name={2} "
-                "merged semantic metadata combines lexical bridge with "
-                "bridge-sensitive structured semantics formals={3}",
+                "merged semantic metadata contains bridge-sensitive "
+                "structured semantics formals={3}",
                 traceStage, m.id, m.name,
                 validation.bridgeSensitiveFormalSignatures.size());
           return false;
@@ -12490,8 +12486,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
         DagCandidateValidationMetadata subtreeValidation;
         subtreeValidation.hasExpectedRootFormals = true;
-        subtreeValidation.usesLexicalBridge =
-            subtreeCert.semantic.usesLexicalBridge;
         subtreeValidation.hasBridgeSensitiveStructuredSemantics =
             subtreeCert.semantic.hasBridgeSensitiveStructuredSemantics;
         subtreeValidation.hasMixedSemanticInteractions =
