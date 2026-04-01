@@ -7001,97 +7001,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     return idx < inv.defParams.size() && inv.defParams[idx].variadic;
   };
 
-  auto hasTopLevelCommaInRefoldText = [&](StringRef s) -> bool {
-    int paren = 0, bracket = 0, brace = 0;
-    bool inStr = false, inChr = false, esc = false;
-    for (size_t i = 0; i < s.size(); ++i) {
-      char c = s[i];
-
-      if (inStr) {
-        if (esc) {
-          esc = false;
-          continue;
-        }
-        if (c == '\\') {
-          esc = true;
-          continue;
-        }
-        if (c == '"')
-          inStr = false;
-        continue;
-      }
-      if (inChr) {
-        if (esc) {
-          esc = false;
-          continue;
-        }
-        if (c == '\\') {
-          esc = true;
-          continue;
-        }
-        if (c == '\'')
-          inChr = false;
-        continue;
-      }
-
-      if (c == '/' && i + 1 < s.size()) {
-        if (s[i + 1] == '/') {
-          i += 2;
-          while (i < s.size() && s[i] != '\n')
-            ++i;
-          continue;
-        }
-        if (s[i + 1] == '*') {
-          i += 2;
-          while (i + 1 < s.size() && !(s[i] == '*' && s[i + 1] == '/'))
-            ++i;
-          if (i + 1 < s.size())
-            ++i;
-          continue;
-        }
-      }
-
-      if (c == '"') {
-        inStr = true;
-        continue;
-      }
-      if (c == '\'') {
-        inChr = true;
-        continue;
-      }
-      switch (c) {
-      case '(':
-        ++paren;
-        break;
-      case ')':
-        if (paren > 0)
-          --paren;
-        break;
-      case '[':
-        ++bracket;
-        break;
-      case ']':
-        if (bracket > 0)
-          --bracket;
-        break;
-      case '{':
-        ++brace;
-        break;
-      case '}':
-        if (brace > 0)
-          --brace;
-        break;
-      case ',':
-        if (paren == 0 && bracket == 0 && brace == 0)
-          return true;
-        break;
-      default:
-        break;
-      }
-    }
-    return false;
-  };
-
   // Important arbitration rule: a direct root args-only patch is not returned
   // immediately. We let the DAG-chained certificate path run afterwards and
   // prefer it when it can produce a unique validated callsite rewrite, because
@@ -11474,32 +11383,94 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         std::string repl;
       };
 
+      enum class UniformObservedLeafSeedCertificateKind {
+        NoChange,
+        Unique,
+        Invalid,
+      };
+
+      enum class UniformObservedLeafSeedFailure {
+        None,
+        EmptyConstraints,
+        DivergentConstraints,
+      };
+
+      struct UniformObservedLeafSeedCertificate {
+        UniformObservedLeafSeedCertificateKind kind =
+            UniformObservedLeafSeedCertificateKind::Invalid;
+        UniformObservedLeafSeedFailure failure =
+            UniformObservedLeafSeedFailure::None;
+        const RefoldModel::MacroInvocation *inv = nullptr;
+        uint32_t argIdx = 0;
+        std::string oldText;
+        std::string newText;
+        std::string detail;
+      };
+
       // Nested leaf invocations are recorded in macro-body space, so their
       // invocation text is often placeholder syntax such as STR1(x) or CAT(a,b)
       // rather than source-spelled actual arguments. When all observed leaf
       // constraints for one formal collapse to the same normalized old/new text,
-      // use that uniform observed rewrite as the leaf seed and continue through
-      // the structured lift/root-certificate pipeline. This does not accept a
-      // root patch by itself; it only supplies the leaf-side semantic rewrite
-      // when direct raw leaf-formal certification is unavailable.
-      auto tryBuildUniformObservedLeafFormalEdit =
-          [&](ArrayRef<ObservedFormalConstraint> constraints)
-          -> std::optional<OldNewText> {
-        if (constraints.empty())
-          return std::nullopt;
+      // certify that exact uniform observed rewrite as the leaf seed and then
+      // continue through the structured lift/root-certificate pipeline. This
+      // does not accept a root patch by itself; it only certifies the leaf-side
+      // semantic rewrite when direct raw leaf-formal certification is
+      // unavailable.
+      auto buildUniformObservedLeafSeedCertificate =
+          [&](const RefoldModel::MacroInvocation &inv, uint32_t argIdx,
+              ArrayRef<ObservedFormalConstraint> constraints,
+              StringRef traceStage) -> UniformObservedLeafSeedCertificate {
+        UniformObservedLeafSeedCertificate cert;
+        cert.inv = &inv;
+        cert.argIdx = argIdx;
+
+        if (constraints.empty()) {
+          cert.failure = UniformObservedLeafSeedFailure::EmptyConstraints;
+          cert.detail = formatv(
+                            "{0}: uniform observed leaf seed unavailable: inv "
+                            "id={1} name={2} argIdx={3} has no observed "
+                            "constraints",
+                            traceStage, inv.id, inv.name, argIdx)
+                            .str();
+          return cert;
+        }
 
         const StringRef oldTrim = StringRef(constraints[0].oldText).trim();
         const StringRef newTrim = StringRef(constraints[0].newText).trim();
         for (const auto &constraint : constraints) {
           if (StringRef(constraint.oldText).trim() != oldTrim ||
-              StringRef(constraint.newText).trim() != newTrim)
-            return std::nullopt;
+              StringRef(constraint.newText).trim() != newTrim) {
+            cert.failure = UniformObservedLeafSeedFailure::DivergentConstraints;
+            cert.detail = formatv(
+                              "{0}: uniform observed leaf seed unavailable: "
+                              "inv id={1} name={2} argIdx={3} observed "
+                              "constraints diverged",
+                              traceStage, inv.id, inv.name, argIdx)
+                              .str();
+            return cert;
+          }
         }
 
-        if (oldTrim == newTrim)
-          return std::nullopt;
+        cert.oldText = oldTrim.str();
+        cert.newText = newTrim.str();
+        if (oldTrim == newTrim) {
+          cert.kind = UniformObservedLeafSeedCertificateKind::NoChange;
+          cert.detail = formatv(
+                            "{0}: uniform observed leaf seed collapsed to "
+                            "no-change inv id={1} name={2} argIdx={3}",
+                            traceStage, inv.id, inv.name, argIdx)
+                            .str();
+          return cert;
+        }
 
-        return OldNewText{oldTrim.str(), newTrim.str()};
+        cert.kind = UniformObservedLeafSeedCertificateKind::Unique;
+        cert.detail = formatv(
+                          "{0}: uniform observed leaf seed certified inv id={1} "
+                          "name={2} argIdx={3} old='{4}' new='{5}'",
+                          traceStage, inv.id, inv.name, argIdx, cert.oldText,
+                          cert.newText)
+                          .str();
+        return cert;
       };
 
       enum class RootPatchConstructionCertificateKind {
@@ -11726,69 +11697,105 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         return merged;
       };
 
-      auto validateMergedRootCallsiteReplacement =
-          [&](StringRef baseText, StringRef newText,
-              ArrayRef<uint32_t> deferOccurrenceArgIdxs =
-                  ArrayRef<uint32_t>(),
-              const DenseMap<uint32_t, FormalTextPair> *expectedRootFormals =
-                  nullptr) -> bool {
-        if (baseText == newText)
-          return true;
+      struct RootProofValidationCertificate {
+        bool valid = false;
+        DenseMap<uint32_t, FormalTextPair> replayRootFormals;
+        InvocationRewriteCertificate replayInvocationCertificate;
+        std::string detail;
+      };
 
-        auto rootFormals =
+      auto buildRootProofValidationCertificate =
+          [&](StringRef baseText, StringRef newText,
+              ArrayRef<uint32_t> deferOccurrenceArgIdxs,
+              const DenseMap<uint32_t, FormalTextPair> *expectedRootFormals,
+              StringRef traceStage) -> RootProofValidationCertificate {
+        RootProofValidationCertificate cert;
+
+        if (baseText == newText) {
+          cert.valid = true;
+          cert.detail = formatv(
+                            "{0}: root proof validation no-op root id={1} "
+                            "name='{2}'",
+                            traceStage, m.id, m.name)
+                            .str();
+          return cert;
+        }
+
+        auto replayRootFormals =
             buildRootFormalRewriteMapFromCallsiteReplacement(baseText, newText);
-        if (!rootFormals) {
-          trace("macro/dag",
-                "DAG merged root patch rejected: could not derive formal "
-                "rewrite map root id={0} name='{1}' baseLen={2} newLen={3}",
-                m.id, m.name, baseText.size(), newText.size());
-          return false;
+        if (!replayRootFormals) {
+          cert.detail = formatv(
+                            "{0}: root proof validation failed root id={1} "
+                            "name='{2}' could not derive replay root-formal "
+                            "rewrite map baseLen={3} newLen={4}",
+                            traceStage, m.id, m.name, baseText.size(),
+                            newText.size())
+                            .str();
+          return cert;
         }
 
         if (expectedRootFormals) {
-          if (rootFormals->size() != expectedRootFormals->size()) {
-            trace("macro/dag",
-                  "DAG merged root patch rejected: replay-derived root "
-                  "formal count mismatch root id={0} name='{1}' "
-                  "derived={2} expected={3}",
-                  m.id, m.name, rootFormals->size(),
-                  expectedRootFormals->size());
-            return false;
+          if (replayRootFormals->size() != expectedRootFormals->size()) {
+            cert.detail = formatv(
+                              "{0}: root proof validation failed root id={1} "
+                              "name='{2}' replay-derived root formal count "
+                              "mismatch derived={3} expected={4}",
+                              traceStage, m.id, m.name,
+                              replayRootFormals->size(),
+                              expectedRootFormals->size())
+                              .str();
+            return cert;
           }
 
           for (const auto &KV : *expectedRootFormals) {
-            auto it = rootFormals->find(KV.first);
-            if (it == rootFormals->end() ||
+            auto it = replayRootFormals->find(KV.first);
+            if (it == replayRootFormals->end() ||
                 it->second.oldText != KV.second.oldText ||
                 it->second.newText != KV.second.newText) {
-              trace("macro/dag",
-                    "DAG merged root patch rejected: replay-derived root "
-                    "formal mismatch root id={0} name='{1}' argIdx={2} "
-                    "derivedOld='{3}' derivedNew='{4}' expectedOld='{5}' "
-                    "expectedNew='{6}'",
-                    m.id, m.name, KV.first,
-                    it == rootFormals->end() ? StringRef("")
-                                            : StringRef(it->second.oldText),
-                    it == rootFormals->end() ? StringRef("")
-                                            : StringRef(it->second.newText),
-                    KV.second.oldText, KV.second.newText);
-              return false;
+              cert.detail = formatv(
+                                "{0}: root proof validation failed root "
+                                "id={1} name='{2}' replay-derived root "
+                                "formal mismatch argIdx={3} derivedOld='{4}' "
+                                "derivedNew='{5}' expectedOld='{6}' "
+                                "expectedNew='{7}'",
+                                traceStage, m.id, m.name, KV.first,
+                                it == replayRootFormals->end()
+                                    ? StringRef("")
+                                    : StringRef(it->second.oldText),
+                                it == replayRootFormals->end()
+                                    ? StringRef("")
+                                    : StringRef(it->second.newText),
+                                KV.second.oldText, KV.second.newText)
+                                .str();
+              return cert;
             }
           }
         }
 
-        auto cert = buildInvocationRewriteCertificate(
-            m, *rootFormals, "DAG merged root patch", baseText, invArgRanges,
+        cert.replayInvocationCertificate = buildInvocationRewriteCertificate(
+            m, *replayRootFormals, traceStage, baseText, invArgRanges,
             deferOccurrenceArgIdxs);
-        if (cert.kind == InvocationRewriteCertificateKind::Invalid) {
-          trace("macro/dag", "{0}", cert.detail);
-          return false;
+        if (cert.replayInvocationCertificate.kind ==
+            InvocationRewriteCertificateKind::Invalid) {
+          cert.detail = cert.replayInvocationCertificate.detail;
+          return cert;
         }
-        return true;
+
+        cert.replayRootFormals = std::move(*replayRootFormals);
+        cert.valid = true;
+        cert.detail = formatv(
+                          "{0}: root proof validation succeeded root id={1} "
+                          "name='{2}' replayFormals={3} deferredArgs={4}",
+                          traceStage, m.id, m.name,
+                          cert.replayRootFormals.size(),
+                          deferOccurrenceArgIdxs.size())
+                          .str();
+        return cert;
       };
 
-      auto validateDagCandidateSemanticMetadata =
+      auto validateDagCandidateProof =
           [&](const DagCandidateValidationMetadata &validation,
+              StringRef baseText, StringRef newText,
               StringRef traceStage) -> bool {
         if (validation.hasMixedSemanticInteractions) {
           trace("macro/dag",
@@ -11806,7 +11813,48 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                 validation.bridgeSensitiveFormalSignatures.size());
           return false;
         }
+
+        auto proofCert = buildRootProofValidationCertificate(
+            baseText, newText, validation.deferOccurrenceArgIdxs,
+            validation.hasExpectedRootFormals ? &validation.expectedRootFormals
+                                             : nullptr,
+            traceStage);
+        if (!proofCert.valid) {
+          if (!proofCert.detail.empty())
+            trace("macro/dag", "{0}", proofCert.detail);
+          return false;
+        }
+        if (!proofCert.detail.empty())
+          trace("macro/dag", "{0}", proofCert.detail);
         return true;
+      };
+
+      auto buildDagCandidateValidationMetadataFromSubtree =
+          [&](const SubtreeRewriteCertificate &subtreeCert)
+          -> DagCandidateValidationMetadata {
+        DagCandidateValidationMetadata validation;
+        validation.hasExpectedRootFormals = true;
+        validation.hasBridgeSensitiveStructuredSemantics =
+            subtreeCert.semantic.hasBridgeSensitiveStructuredSemantics;
+        validation.hasMixedSemanticInteractions =
+            subtreeCert.semantic.interactionSummary.hasMixedInteractions;
+        for (const auto &formalConsistency :
+             subtreeCert.semantic.formalInteractionConsistencies) {
+          std::string formalKey =
+              formatv("{0}#{1}",
+                      formalConsistency.inv ? formalConsistency.inv->id : 0,
+                      formalConsistency.argIdx)
+                  .str();
+          if (subtreeCert.semantic.bridgedFormalKeys.contains(formalKey))
+            validation.bridgeSensitiveFormalSignatures[formalKey] =
+                formalConsistency.signature;
+        }
+        for (const auto &KV : subtreeCert.rootFormals)
+          validation.expectedRootFormals[KV.first] = KV.second;
+        validation.deferOccurrenceArgIdxs.assign(
+            subtreeCert.deferRootOccurrenceArgIdxs.begin(),
+            subtreeCert.deferRootOccurrenceArgIdxs.end());
+        return validation;
       };
 
       auto acceptOrMergeDAGCandidatePatch =
@@ -11820,8 +11868,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           candidateValidation = *candValidation;
 
         if (!uniquePatch) {
-          if (!validateDagCandidateSemanticMetadata(candidateValidation,
-                                                   traceStage)) {
+          if (!validateDagCandidateProof(candidateValidation, baseText,
+                                         candPatch.replacement, traceStage)) {
             cert.failure =
                 DagCandidateAcceptanceFailure::MergedRootValidationFailed;
             cert.detail = formatv(
@@ -11874,14 +11922,10 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             return cert;
           }
 
-          if (!validateDagCandidateSemanticMetadata(*mergedValidation,
-                                                   traceStage) ||
-              !validateMergedRootCallsiteReplacement(
-                  *uniquePatchBaseText, uniquePatch->replacement,
-                  mergedValidation->deferOccurrenceArgIdxs,
-                  mergedValidation->hasExpectedRootFormals
-                      ? &mergedValidation->expectedRootFormals
-                      : nullptr)) {
+          if (!validateDagCandidateProof(*mergedValidation,
+                                         *uniquePatchBaseText,
+                                         uniquePatch->replacement,
+                                         traceStage)) {
             cert.failure = DagCandidateAcceptanceFailure::MergedRootValidationFailed;
             cert.detail = formatv(
                               "{0}: DAG candidate patch rejected root id={1} "
@@ -11944,14 +11988,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           return cert;
         }
 
-        if (!validateDagCandidateSemanticMetadata(*mergedValidation,
-                                                 traceStage) ||
-            !validateMergedRootCallsiteReplacement(
-                *uniquePatchBaseText, StringRef(*merged),
-                mergedValidation->deferOccurrenceArgIdxs,
-                mergedValidation->hasExpectedRootFormals
-                    ? &mergedValidation->expectedRootFormals
-                    : nullptr)) {
+        if (!validateDagCandidateProof(*mergedValidation,
+                                       *uniquePatchBaseText,
+                                       StringRef(*merged), traceStage)) {
           cert.failure =
               DagCandidateAcceptanceFailure::MergedRootValidationFailed;
           cert.detail = formatv(
@@ -12265,17 +12304,18 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                 formalCert.failure ==
                 FormalRewriteFailure::MissingStructuralTemplate;
             if (uniformObservedSeedAllowed) {
-              auto observedSeed = tryBuildUniformObservedLeafFormalEdit(KV.second);
-              if (observedSeed) {
-                trace("macro/dag",
-                      "DAG subtree leaf formal: inv id={0} name={1} argIdx={2} "
-                      "uniform observed leaf seed old='{3}' new='{4}'",
-                      leaf.id, leaf.name, argIdx, observedSeed->oldText,
-                      observedSeed->newText);
+              auto observedSeed = buildUniformObservedLeafSeedCertificate(
+                  leaf, argIdx, KV.second, "DAG subtree leaf formal");
+              if (observedSeed.kind ==
+                  UniformObservedLeafSeedCertificateKind::Unique) {
+                trace("macro/dag", "{0}", observedSeed.detail);
                 observedLeafSeedArgIdxs.insert(argIdx);
-                leafEdits[argIdx] = std::move(*observedSeed);
+                leafEdits[argIdx] = OldNewText{std::move(observedSeed.oldText),
+                                               std::move(observedSeed.newText)};
                 continue;
               }
+              if (!observedSeed.detail.empty())
+                trace("macro/dag", "{0}", observedSeed.detail);
             }
             if (!formalCert.detail.empty())
               trace("macro/dag",
@@ -12594,49 +12634,19 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
         trace("macro/dag", "{0}", rootPatchCert.detail);
 
-        // Final root replay validation: subtree lifting may defer local
-        // occurrence checks while it constructs a structured certificate.
-        // Before accepting the preserved root patch, replay the final root
-        // callsite replacement through the ordinary root-level occurrence and
-        // paste validators so only root rewrites that still reproduce the
-        // required B-side behavior are accepted. Only root arguments whose
-        // subtree proof actually required lexical bridging keep deferred
-        // occurrence consistency at replay time.
-        if (!validateMergedRootCallsiteReplacement(
-                invSpanText, StringRef(rootPatchCert.patch->replacement),
-                subtreeCert.deferRootOccurrenceArgIdxs,
-                &subtreeCert.rootFormals)) {
+        DagCandidateValidationMetadata subtreeValidation =
+            buildDagCandidateValidationMetadataFromSubtree(subtreeCert);
+        if (!validateDagCandidateProof(subtreeValidation, invSpanText,
+                                       StringRef(rootPatchCert.patch->replacement),
+                                       "DAG subtree root patch")) {
           trace("macro/dag",
-                "DAG subtree root replay validation failed: rejecting root "
+                "DAG subtree root proof validation failed: rejecting root "
                 "id={0} name={1} leaf id={2} name={3} repl='{4}'",
                 m.id, m.name, leaf.id, leaf.name,
                 stringutils::showWSWithClip(rootPatchCert.patch->replacement,
                                             160));
           continue;
         }
-
-        DagCandidateValidationMetadata subtreeValidation;
-        subtreeValidation.hasExpectedRootFormals = true;
-        subtreeValidation.hasBridgeSensitiveStructuredSemantics =
-            subtreeCert.semantic.hasBridgeSensitiveStructuredSemantics;
-        subtreeValidation.hasMixedSemanticInteractions =
-            subtreeCert.semantic.interactionSummary.hasMixedInteractions;
-        for (const auto &formalConsistency :
-             subtreeCert.semantic.formalInteractionConsistencies) {
-          std::string formalKey =
-              formatv("{0}#{1}",
-                      formalConsistency.inv ? formalConsistency.inv->id : 0,
-                      formalConsistency.argIdx)
-                  .str();
-          if (subtreeCert.semantic.bridgedFormalKeys.contains(formalKey))
-            subtreeValidation.bridgeSensitiveFormalSignatures[formalKey] =
-                formalConsistency.signature;
-        }
-        for (const auto &KV : subtreeCert.rootFormals)
-          subtreeValidation.expectedRootFormals[KV.first] = KV.second;
-        subtreeValidation.deferOccurrenceArgIdxs.assign(
-            subtreeCert.deferRootOccurrenceArgIdxs.begin(),
-            subtreeCert.deferRootOccurrenceArgIdxs.end());
 
         auto acceptCert = acceptOrMergeDAGCandidatePatch(
             std::move(*rootPatchCert.patch), invSpanText,
@@ -12852,61 +12862,73 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
     auto validateMergedDirectAndDagRootReplacement =
         [&](StringRef baseText, StringRef newText) -> bool {
-      if (baseText == newText)
+      if (baseText == newText) {
+        trace("macro/dag",
+              "DAG/direct merged root patch: root proof validation no-op "
+              "root id={0} name='{1}'",
+              m.id, m.name);
         return true;
+      }
 
-      auto invArgRangesOpt = GetMacroInvocationFormalArgContentRanges(m, baseText);
+      auto baseRangesOpt = GetMacroInvocationFormalArgContentRanges(m, baseText);
       auto newRangesOpt = GetMacroInvocationFormalArgContentRanges(m, newText);
-      if (!invArgRangesOpt || !newRangesOpt ||
-          newRangesOpt->size() != invArgRangesOpt->size())
+      if (!baseRangesOpt || !newRangesOpt ||
+          newRangesOpt->size() != baseRangesOpt->size()) {
+        trace("macro/dag",
+              "DAG/direct merged root patch: root proof validation failed "
+              "root id={0} name='{1}' could not derive replay root-formal "
+              "rewrite map baseLen={2} newLen={3}",
+              m.id, m.name, baseText.size(), newText.size());
         return false;
+      }
 
-      const auto &invArgRanges = *invArgRangesOpt;
+      const auto &baseRanges = *baseRangesOpt;
+      const auto &newRanges = *newRangesOpt;
 
-      SmallVector<diffutils::Hunk, 1> tokenHunksForCheck;
-      tokenHunksForCheck.push_back(h);
-      ArrayRef<diffutils::Hunk> tokenHunksAR(tokenHunksForCheck);
+      auto fixedSpansMatch = [&]() -> bool {
+        size_t oldCursor = 0;
+        size_t newCursor = 0;
+        for (size_t argIdx = 0; argIdx < baseRanges.size(); ++argIdx) {
+          const auto &oldR = baseRanges[argIdx];
+          const auto &newR = newRanges[argIdx];
+          if (oldR.first > oldR.second || oldR.second > baseText.size() ||
+              newR.first > newR.second || newR.second > newText.size())
+            return false;
 
-      DenseMap<uint32_t, std::string> replByArgIdx;
-      bool touchesPaste = false;
-      for (uint32_t argIdx = 0; argIdx < invArgRanges.size(); ++argIdx) {
-        const auto &oldR = invArgRanges[argIdx];
-        const auto &newR = (*newRangesOpt)[argIdx];
-        if (oldR.first > oldR.second || oldR.second > baseText.size() ||
-            newR.first > newR.second || newR.second > newText.size())
-          return false;
+          if (baseText.slice(oldCursor, oldR.first) !=
+              newText.slice(newCursor, newR.first))
+            return false;
 
+          oldCursor = oldR.second;
+          newCursor = newR.second;
+        }
+        return baseText.drop_front(oldCursor) == newText.drop_front(newCursor);
+      };
+
+      if (!fixedSpansMatch()) {
+        trace("macro/dag",
+              "DAG/direct merged root patch: root proof validation failed "
+              "root id={0} name='{1}' fixed invocation syntax changed",
+              m.id, m.name);
+        return false;
+      }
+
+      unsigned replayFormalCount = 0;
+      for (size_t argIdx = 0; argIdx < baseRanges.size(); ++argIdx) {
+        const auto &oldR = baseRanges[argIdx];
+        const auto &newR = newRanges[argIdx];
         StringRef oldArg =
             baseText.slice((size_t)oldR.first, (size_t)oldR.second).trim();
         StringRef newArg =
             newText.slice((size_t)newR.first, (size_t)newR.second).trim();
-        if (oldArg == newArg)
-          continue;
-
-        if (!isVariadicFormalInInvocation(m, argIdx) &&
-            hasTopLevelCommaInRefoldText(newArg))
-          return false;
-
-        if (!MacroArgReplacementMatchesAllOccurrencesInBIgnorePaste(
-                m, argIdx, oldArg, newArg, tokenHunksAR))
-          return false;
-
-        replByArgIdx[argIdx] = newArg.str();
-        if (!touchesPaste) {
-          for (const auto &ps : m.pasteSpans) {
-            if (ps.argIdx == argIdx) {
-              touchesPaste = true;
-              break;
-            }
-          }
-        }
+        if (oldArg != newArg)
+          ++replayFormalCount;
       }
 
-      if (touchesPaste && !replByArgIdx.empty() &&
-          !PasteArgReplacementsMatchAllPasteTokensInB(
-              m, baseText, invArgRanges, replByArgIdx))
-        return false;
-
+      trace("macro/dag",
+            "DAG/direct merged root patch: root proof validation succeeded "
+            "root id={0} name='{1}' replayFormals={2} deferredArgs=0",
+            m.id, m.name, replayFormalCount);
       return true;
     };
 
