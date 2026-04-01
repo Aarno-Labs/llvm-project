@@ -10108,9 +10108,28 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         Invalid,
       };
 
+      enum class StructuredLiftFailureReason {
+        None,
+        CurrentInvocationInvalid,
+        MissingCallerInvocation,
+        RootLexicalBridgeRequired,
+        ParentConstraintDerivationFailed,
+        ParentFormalInvalid,
+        ParentInvocationInvalid,
+      };
+
       struct StructuredLiftCertificate {
         StructuredLiftCertificateKind kind =
             StructuredLiftCertificateKind::Invalid;
+        StructuredLiftFailureReason failureReason =
+            StructuredLiftFailureReason::None;
+        ParentConstraintDerivationFailure derivationFailure =
+            ParentConstraintDerivationFailure::None;
+        FormalRewriteFailure parentFormalFailure = FormalRewriteFailure::None;
+        InvocationRewriteFailure currentInvocationFailure =
+            InvocationRewriteFailure::None;
+        InvocationRewriteFailure parentInvocationFailure =
+            InvocationRewriteFailure::None;
         const RefoldModel::MacroInvocation *nextInv = nullptr;
         DenseMap<uint32_t, FormalTextPair> nextFormals;
         InvocationRewriteCertificate currentCert;
@@ -10190,6 +10209,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             buildInvocationRewriteCertificate(cur, curFormals, "DAG per-hop");
         cert.currentCert = curCert;
         if (curCert.kind == InvocationRewriteCertificateKind::Invalid) {
+          cert.failureReason =
+              StructuredLiftFailureReason::CurrentInvocationInvalid;
+          cert.currentInvocationFailure = curCert.failure;
           cert.detail = curCert.detail;
           return cert;
         }
@@ -10209,6 +10231,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         if (cur.callerMacroId) {
           auto parentIt = invById.find(*cur.callerMacroId);
           if (parentIt == invById.end()) {
+            cert.failureReason =
+                StructuredLiftFailureReason::MissingCallerInvocation;
             cert.detail =
                 formatv("DAG per-hop: missing caller invocation: child id={0} "
                         "name={1} callerId={2}",
@@ -10223,6 +10247,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                 "forcing lexical bridge to root with syntax='{2}'",
                 cur.id, cur.name, cert.rewrittenChildSyntax);
           cert.kind = StructuredLiftCertificateKind::NeedsLexicalBridge;
+          cert.failureReason =
+              StructuredLiftFailureReason::RootLexicalBridgeRequired;
           cert.nextInv = &m;
           cert.detail = formatv(
                             "DAG per-hop: child id={0} name={1} requires "
@@ -10277,6 +10303,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               cur, curFormal, curOld, curNew, "DAG per-hop");
           cert.derivations.push_back(derivationCert);
           if (!derivationCert.valid) {
+            cert.failureReason =
+                StructuredLiftFailureReason::ParentConstraintDerivationFailed;
+            cert.derivationFailure = derivationCert.failure;
             cert.detail = derivationCert.detail;
             needLexicalBridge = true;
             break;
@@ -10369,6 +10398,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                   cur.id, cur.name, parent->id, parent->name, parentFormal,
                   formatObservedConstraintsMap(parentObserved),
                   cert.rewrittenChildSyntax, formalCert.detail);
+            cert.failureReason =
+                StructuredLiftFailureReason::ParentFormalInvalid;
+            cert.parentFormalFailure = formalCert.failure;
             cert.detail = formatv(
                               "{0}; lexical bridge required",
                               formalCert.detail)
@@ -10394,6 +10426,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                 "parent id={2} name={3} parentFormals={4} detail={5}",
                 cur.id, cur.name, parent->id, parent->name,
                 formatFormalTextPairs(parentFormals), parentCert.detail);
+          cert.failureReason =
+              StructuredLiftFailureReason::ParentInvocationInvalid;
+          cert.parentInvocationFailure = parentCert.failure;
           cert.detail = parentCert.detail;
           cert.kind = StructuredLiftCertificateKind::NeedsLexicalBridge;
           cert.nextInv = parent;
@@ -10440,6 +10475,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         std::string leafNewText;
         SmallVector<StructuredLiftCertificate, 4> steps;
         bool usedLexicalBridge = false;
+        DenseSet<uint32_t> bridgedRootArgIdxs;
         DenseMap<uint32_t, FormalTextPair> rootFormals;
         std::string detail;
       };
@@ -10534,8 +10570,11 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           curFormals = std::move(*bridged);
         }
 
-        for (const auto &KV : curFormals)
+        for (const auto &KV : curFormals) {
           cert.rootFormals[KV.first] = KV.second;
+          if (cert.usedLexicalBridge)
+            cert.bridgedRootArgIdxs.insert(KV.first);
+        }
         cert.kind = LiftChainCertificateKind::Unique;
         cert.detail = formatv(
                           "DAG lift chain: leaf id={0} name={1} argIdx={2} "
@@ -11149,9 +11188,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             }
             if (!seen)
               rewrites.push_back(RK.second);
-            if (liftCert.usedLexicalBridge)
-              deferredRootOccurrenceArgIdxSet.insert(RK.first);
           }
+          for (uint32_t rootArgIdx : liftCert.bridgedRootArgIdxs)
+            deferredRootOccurrenceArgIdxSet.insert(rootArgIdx);
         }
 
         if (rootRewrites.empty()) {
