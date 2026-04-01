@@ -8609,9 +8609,15 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         Invalid,
       };
 
+      enum class ArgSemanticRewriteFailure {
+        None,
+        MissingStructuralTemplate,
+      };
+
       struct ArgSemanticRewriteCertificate {
         ArgSemanticRewriteCertificateKind kind =
             ArgSemanticRewriteCertificateKind::Invalid;
+        ArgSemanticRewriteFailure failure = ArgSemanticRewriteFailure::None;
         std::string observedNewText;
         std::string rawArgOldText;
         std::string rawArgNewText;
@@ -9038,6 +9044,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             buildArgInvertibilityCertificate(parent, parentFormal, observedOld0);
         if (!invertibilityCert) {
           ArgSemanticRewriteCertificate argCert;
+          argCert.failure =
+              ArgSemanticRewriteFailure::MissingStructuralTemplate;
           argCert.detail =
               "observed old arg text did not match a unique structural template";
           return argCert;
@@ -9066,6 +9074,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
       enum class FormalRewriteFailure {
         None,
         MissingArgumentText,
+        MissingStructuralTemplate,
         RawRewriteNotCertifiable,
         MergeConflict,
         ArityChange,
@@ -9498,7 +9507,11 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               preferredChildSyntax);
           if (argRewriteCert.kind ==
               ArgSemanticRewriteCertificateKind::Invalid) {
-            cert.failure = FormalRewriteFailure::RawRewriteNotCertifiable;
+            cert.failure =
+                argRewriteCert.failure ==
+                        ArgSemanticRewriteFailure::MissingStructuralTemplate
+                    ? FormalRewriteFailure::MissingStructuralTemplate
+                    : FormalRewriteFailure::RawRewriteNotCertifiable;
             cert.detail = formatv(
                               "{0}: inv id={1} name={2} argIdx={3} raw "
                               "rewrite not certifiable ({4})",
@@ -10326,10 +10339,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           if (formalCert.kind == FormalRewriteCertificateKind::Invalid) {
             const bool templateMismatch =
                 formalCert.failure ==
-                    FormalRewriteFailure::RawRewriteNotCertifiable &&
-                formalCert.detail.find(
-                    "observed old arg text did not match a unique structural "
-                    "template") != std::string::npos;
+                FormalRewriteFailure::MissingStructuralTemplate;
             auto srcIt = parentObservedSources.find(parentFormal);
             if (templateMismatch && srcIt != parentObservedSources.end() &&
                 srcIt->second.size() == 1) {
@@ -11958,10 +11968,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           if (formalCert.kind == FormalRewriteCertificateKind::Invalid) {
             const bool uniformObservedSeedAllowed =
                 formalCert.failure ==
-                    FormalRewriteFailure::RawRewriteNotCertifiable &&
-                formalCert.detail.find(
-                    "observed old arg text did not match a unique structural "
-                    "template") != std::string::npos;
+                FormalRewriteFailure::MissingStructuralTemplate;
             if (uniformObservedSeedAllowed) {
               auto observedSeed = tryBuildUniformObservedLeafFormalEdit(KV.second);
               if (observedSeed) {
