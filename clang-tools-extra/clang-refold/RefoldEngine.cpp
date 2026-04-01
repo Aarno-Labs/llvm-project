@@ -11391,7 +11391,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
       auto validateMergedRootCallsiteReplacement =
           [&](StringRef baseText, StringRef newText,
               ArrayRef<uint32_t> deferOccurrenceArgIdxs =
-                  ArrayRef<uint32_t>()) -> bool {
+                  ArrayRef<uint32_t>(),
+              const DenseMap<uint32_t, FormalTextPair> *expectedRootFormals =
+                  nullptr) -> bool {
         if (baseText == newText)
           return true;
 
@@ -11403,6 +11405,38 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                 "rewrite map root id={0} name='{1}' baseLen={2} newLen={3}",
                 m.id, m.name, baseText.size(), newText.size());
           return false;
+        }
+
+        if (expectedRootFormals) {
+          if (rootFormals->size() != expectedRootFormals->size()) {
+            trace("macro/dag",
+                  "DAG merged root patch rejected: replay-derived root "
+                  "formal count mismatch root id={0} name='{1}' "
+                  "derived={2} expected={3}",
+                  m.id, m.name, rootFormals->size(),
+                  expectedRootFormals->size());
+            return false;
+          }
+
+          for (const auto &KV : *expectedRootFormals) {
+            auto it = rootFormals->find(KV.first);
+            if (it == rootFormals->end() ||
+                it->second.oldText != KV.second.oldText ||
+                it->second.newText != KV.second.newText) {
+              trace("macro/dag",
+                    "DAG merged root patch rejected: replay-derived root "
+                    "formal mismatch root id={0} name='{1}' argIdx={2} "
+                    "derivedOld='{3}' derivedNew='{4}' expectedOld='{5}' "
+                    "expectedNew='{6}'",
+                    m.id, m.name, KV.first,
+                    it == rootFormals->end() ? StringRef("")
+                                            : StringRef(it->second.oldText),
+                    it == rootFormals->end() ? StringRef("")
+                                            : StringRef(it->second.newText),
+                    KV.second.oldText, KV.second.newText);
+              return false;
+            }
+          }
         }
 
         auto cert = buildInvocationRewriteCertificate(
@@ -12146,7 +12180,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
         if (!validateMergedRootCallsiteReplacement(
                 invSpanText, StringRef(rootPatchCert.patch->replacement),
-                deferReplayOccurrenceArgIdxs)) {
+                deferReplayOccurrenceArgIdxs, &subtreeCert.rootFormals)) {
           trace("macro/dag",
                 "DAG subtree root replay validation failed: rejecting root "
                 "id={0} name={1} leaf id={2} name={3} repl='{4}'",
