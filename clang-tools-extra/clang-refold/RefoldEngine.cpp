@@ -66,7 +66,6 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
-#include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FileSystem.h"
@@ -11414,6 +11413,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
       struct DagCandidateValidationMetadata {
         SmallVector<uint32_t, 8> deferOccurrenceArgIdxs;
         DenseMap<uint32_t, FormalTextPair> expectedRootFormals;
+        StringMap<SemanticInteractionSignature> bridgeSensitiveFormalSignatures;
         bool hasExpectedRootFormals = false;
         bool usesLexicalBridge = false;
         bool hasBridgeSensitiveStructuredSemantics = false;
@@ -11535,6 +11535,18 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         merged.hasMixedSemanticInteractions =
             lhs.hasMixedSemanticInteractions ||
             rhs.hasMixedSemanticInteractions;
+
+        for (const auto &KV : lhs.bridgeSensitiveFormalSignatures)
+          merged.bridgeSensitiveFormalSignatures[KV.getKey()] = KV.getValue();
+        for (const auto &KV : rhs.bridgeSensitiveFormalSignatures) {
+          auto it = merged.bridgeSensitiveFormalSignatures.find(KV.getKey());
+          if (it == merged.bridgeSensitiveFormalSignatures.end()) {
+            merged.bridgeSensitiveFormalSignatures[KV.getKey()] = KV.getValue();
+            continue;
+          }
+          if (!(it->second == KV.getValue()))
+            return std::nullopt;
+        }
 
         auto addDeferredArgIdxs = [&](ArrayRef<uint32_t> argIdxs) {
           for (uint32_t argIdx : argIdxs) {
@@ -11662,8 +11674,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           trace("macro/dag",
                 "{0}: DAG candidate patch rejected root id={1} name={2} "
                 "merged semantic metadata combines lexical bridge with "
-                "bridge-sensitive structured semantics",
-                traceStage, m.id, m.name);
+                "bridge-sensitive structured semantics formals={3}",
+                traceStage, m.id, m.name,
+                validation.bridgeSensitiveFormalSignatures.size());
           return false;
         }
         return true;
@@ -12483,6 +12496,17 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             subtreeCert.semantic.hasBridgeSensitiveStructuredSemantics;
         subtreeValidation.hasMixedSemanticInteractions =
             subtreeCert.semantic.interactionSummary.hasMixedInteractions;
+        for (const auto &formalConsistency :
+             subtreeCert.semantic.formalInteractionConsistencies) {
+          std::string formalKey =
+              formatv("{0}#{1}",
+                      formalConsistency.inv ? formalConsistency.inv->id : 0,
+                      formalConsistency.argIdx)
+                  .str();
+          if (subtreeCert.semantic.bridgedFormalKeys.contains(formalKey))
+            subtreeValidation.bridgeSensitiveFormalSignatures[formalKey] =
+                formalConsistency.signature;
+        }
         for (const auto &KV : subtreeCert.rootFormals)
           subtreeValidation.expectedRootFormals[KV.first] = KV.second;
         subtreeValidation.deferOccurrenceArgIdxs.assign(
