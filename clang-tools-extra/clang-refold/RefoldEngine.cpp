@@ -1179,10 +1179,12 @@ std::string RefoldEngine::RefoldOnce() {
               (existingIt != byMacroId.end()) ? existingIt->second.replacement
                                               : std::string();
 
-          // If found, use the existing replacement; otherwise, use the original
-          // text.
+          // If found, use the existing callsite replacement. For an existing
+          // non-callsite (expanded) patch, keep the original invocation text as
+          // the preservation base so later hunks can still attempt args-only /
+          // DAG reconstruction back to the callsite.
           std::string currentInvText =
-              (existingIt != byMacroId.end())
+              ((existingIt != byMacroId.end()) && hadExistingCallsitePatch)
                   ? existingIt->second.replacement
                   : (target->invText ? target->invText->str() : "");
 
@@ -4902,13 +4904,14 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     return std::nullopt;
 
   // tokenHunks are used by macroArgReplacementMatchesAllOccurrencesInB() to
-  // validate cross-occurrence consistency. In this args-only path we only need
-  // visibility into the current hunk, so treat it as the only token-level edit.
+  // validate cross-occurrence consistency. Start with the current hunk only;
+  // the standard repeated-formal path may later widen this to include every
+  // hunk that touches the same formal occurrences inside this invocation.
   diffutils::Hunk hArgs = h;
 
   // Keep the raw hunk unchanged. Pure-insertion ownership is derived later
   // from exact occurrence boundaries and exact mapped B-envelope adjacency.
-  const diffutils::Hunk tokenHunks[] = {hArgs};
+  const diffutils::Hunk tokenHunksCurrent[] = {hArgs};
 
   if (!HasLiteralMacroCalleeOrigin(m)) {
     trace("macro/args",
@@ -5044,7 +5047,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         // isolation. We validate paste tokens as a *group* below via
         // pasteArgReplacementsMatchAllPasteTokensInB(...).
         if (!MacroArgReplacementMatchesAllOccurrencesInBIgnorePaste(
-                m, argIdx, baseArgText, newArg, tokenHunks)) {
+                m, argIdx, baseArgText, newArg, tokenHunksCurrent)) {
           return std::nullopt;
         }
 
@@ -5113,7 +5116,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       // all occurrences, including paste-span occurrences, against the B
       // stream.
       if (!MacroArgReplacementMatchesAllOccurrencesInB(m, argIdx, baseArgText,
-                                                       newArg, tokenHunks)) {
+                                                       newArg, tokenHunksCurrent)) {
         return std::nullopt;
       }
 
@@ -5273,6 +5276,76 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         stringutils::boolArrayToString(touchedOcc));
   trace("macro/args", "  touched={0}", stringutils::boolArrayToString(touched));
 
+  auto hunkTouchesTouchedFormal =
+      [&](const diffutils::Hunk &cand) -> bool {
+    for (size_t occIdx = 0; occIdx < occs.size(); ++occIdx) {
+      const auto &sp = occs[occIdx];
+      if (sp.argIdx >= touched.size() || !touched[sp.argIdx])
+        continue;
+
+      if (cand.aStart == cand.aEnd) {
+        auto bEnv = MapAToBTokenEnvelopeByPPArgSpan(sp);
+        if (!bEnv)
+          continue;
+        if (GetOwnedPureInsertionBRangeForArgSpan(sp, occs, *bEnv, cand))
+          return true;
+        continue;
+      }
+
+      if (cand.aStart < sp.end && cand.aEnd > sp.begin)
+        return true;
+    }
+    return false;
+  };
+
+  SmallVector<diffutils::Hunk, 8> tokenHunksForTouchedFormals;
+  tokenHunksForTouchedFormals.push_back(hArgs);
+  for (const auto &cand : abTokHunks_) {
+    if (cand.aStart == hArgs.aStart && cand.aEnd == hArgs.aEnd &&
+        cand.bStart == hArgs.bStart && cand.bEnd == hArgs.bEnd)
+      continue;
+    if (!hunkTouchesTouchedFormal(cand))
+      continue;
+    tokenHunksForTouchedFormals.push_back(cand);
+  }
+  auto hunkLess = [](const diffutils::Hunk &lhs, const diffutils::Hunk &rhs) {
+    if (lhs.aStart != rhs.aStart)
+      return lhs.aStart < rhs.aStart;
+    if (lhs.aEnd != rhs.aEnd)
+      return lhs.aEnd < rhs.aEnd;
+    if (lhs.bStart != rhs.bStart)
+      return lhs.bStart < rhs.bStart;
+    return lhs.bEnd < rhs.bEnd;
+  };
+  auto formatHunkList = [](ArrayRef<diffutils::Hunk> hunks) {
+    std::string out;
+    raw_string_ostream os(out);
+    os << "[";
+    for (size_t i = 0; i < hunks.size(); ++i) {
+      if (i)
+        os << ", ";
+      const auto &h = hunks[i];
+      os << "A[" << h.aStart << "," << h.aEnd << ")"
+         << "->B[" << h.bStart << "," << h.bEnd << ")";
+    }
+    os << "]";
+    return os.str();
+  };
+  llvm::sort(tokenHunksForTouchedFormals, hunkLess);
+  tokenHunksForTouchedFormals.erase(
+      std::unique(tokenHunksForTouchedFormals.begin(),
+                  tokenHunksForTouchedFormals.end(),
+                  [](const diffutils::Hunk &lhs, const diffutils::Hunk &rhs) {
+                    return lhs.aStart == rhs.aStart && lhs.aEnd == rhs.aEnd &&
+                           lhs.bStart == rhs.bStart && lhs.bEnd == rhs.bEnd;
+                  }),
+      tokenHunksForTouchedFormals.end());
+  ArrayRef<diffutils::Hunk> tokenHunks(tokenHunksForTouchedFormals);
+
+  trace("macro/args", "  tokenHunksForTouchedFormals({0})={1}",
+        tokenHunks.size(),
+        formatHunkList(tokenHunksForTouchedFormals));
+
   // Compute argument replacements implied by each touched occurrence. Multiple
   // occurrences of the same argIdx must imply the exact same replacement,
   // otherwise the macro cannot be refolded args-only.
@@ -5305,30 +5378,39 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       bEnv = {static_cast<size_t>(h.bStart), static_cast<size_t>(h.bEnd)};
     }
 
-    // If this occurrence exactly owns a pure insertion, extend the mapped
-    // B envelope by that owned range. This uses only exact A-side occurrence
-    // structure and exact mapped B-envelope adjacency.
+    // Extend the mapped B envelope using every hunk that touches this touched
+    // formal, not just the current hunk. This is required for repeated
+    // occurrences where one logical replacement is split across multiple
+    // hunks (for example, a leading insertion plus a token replacement).
     if (bEnv) {
-      if (auto owned =
-              GetOwnedPureInsertionBRangeForArgSpan(sp, occs, *bEnv, hArgs)) {
-        const size_t insB0 = owned->first;
-        const size_t insB1 = owned->second;
-        size_t e0 = bEnv->first;
-        size_t e1 = bEnv->second;
-
-        if (!(insB1 < e0 || e1 < insB0)) {
-          e0 = std::min(e0, insB0);
-          e1 = std::max(e1, insB1);
+      size_t e0 = bEnv->first;
+      size_t e1 = bEnv->second;
+      for (const auto &candH : tokenHunks) {
+        if (auto owned =
+                GetOwnedPureInsertionBRangeForArgSpan(sp, occs, *bEnv, candH)) {
+          const size_t insB0 = owned->first;
+          const size_t insB1 = owned->second;
+          if (!(insB1 < e0 || e1 < insB0)) {
+            e0 = std::min(e0, insB0);
+            e1 = std::max(e1, insB1);
+          }
+          continue;
         }
 
-        if (e0 != bEnv->first || e1 != bEnv->second) {
-          trace("macro/args",
-                "  extend env with owned insertion: argIdx={0} env=[{1},{2}) "
-                "ins=[{3},{4}) -> [{5},{6})",
-                static_cast<size_t>(argIdx), bEnv->first, bEnv->second, insB0,
-                insB1, e0, e1);
-          bEnv = std::make_pair(e0, e1);
+        if (candH.aStart == candH.aEnd)
+          continue;
+        if (candH.aStart < sp.end && candH.aEnd > sp.begin &&
+            candH.bStart < candH.bEnd) {
+          e0 = std::min(e0, static_cast<size_t>(candH.bStart));
+          e1 = std::max(e1, static_cast<size_t>(candH.bEnd));
         }
+      }
+
+      if (e0 != bEnv->first || e1 != bEnv->second) {
+        trace("macro/args",
+              "  extend env with touched-formal hunks: argIdx={0} env=[{1},{2}) -> [{3},{4})",
+              static_cast<size_t>(argIdx), bEnv->first, bEnv->second, e0, e1);
+        bEnv = std::make_pair(e0, e1);
       }
     }
 
@@ -7039,6 +7121,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   // realized/expanded it), keep it. If it is still a callsite patch, we may
   // refine it across additional hunks.
   const MacroPatch *existingPatch = nullptr;
+  const MacroPatch *existingExpandedPatch = nullptr;
   bool existingIsCallsite = false;
 
   // Determinism: ownerIt->second is a DenseMap, so iteration order is unstable.
@@ -7069,7 +7152,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     if (bestNonCallsiteId) {
       auto it = ownerIt->second.find(*bestNonCallsiteId);
       if (it != ownerIt->second.end())
-        return it->second;
+        existingExpandedPatch = &it->second;
     }
 
     if (bestCallsiteId) {
@@ -14915,6 +14998,12 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     return *existingPatch;
   }
 
+  if (existingExpandedPatch) {
+    trace("macro",
+          "expanded patch reused after preservation attempts failed inv id={0}",
+          m.id);
+    return *existingExpandedPatch;
+  }
 
   // 2) Whole-cover fallback: replace invocation with the entire expansion cover
   // slice from B. cover.begin/cover.end are PP-token indices in A; map them
