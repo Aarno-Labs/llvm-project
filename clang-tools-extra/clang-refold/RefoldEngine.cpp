@@ -10474,9 +10474,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
       struct LiftChainCertificate {
         LiftChainCertificateKind kind = LiftChainCertificateKind::Invalid;
         const RefoldModel::MacroInvocation *leaf = nullptr;
-        uint32_t leafArgIdx = 0;
-        std::string leafOldText;
-        std::string leafNewText;
+        SmallVector<uint32_t, 4> leafArgIdxs;
+        DenseMap<uint32_t, FormalTextPair> leafFormals;
         SmallVector<StructuredLiftCertificate, 4> steps;
         bool usedLexicalBridge = false;
         DenseSet<uint32_t> bridgedRootArgIdxs;
@@ -10485,19 +10484,36 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
       };
 
       auto buildLiftChainCertificate =
-          [&](const RefoldModel::MacroInvocation &leaf, uint32_t leafArgIdx,
-              StringRef leafOld, StringRef leafNew) -> LiftChainCertificate {
+          [&](const RefoldModel::MacroInvocation &leaf,
+              const DenseMap<uint32_t, FormalTextPair> &leafFormals)
+          -> LiftChainCertificate {
         LiftChainCertificate cert;
         cert.leaf = &leaf;
-        cert.leafArgIdx = leafArgIdx;
-        cert.leafOldText = leafOld.trim().str();
-        cert.leafNewText = leafNew.trim().str();
+
+        for (const auto &KV : leafFormals) {
+          StringRef oldText = StringRef(KV.second.oldText).trim();
+          StringRef newText = StringRef(KV.second.newText).trim();
+          if (oldText == newText)
+            continue;
+          cert.leafArgIdxs.push_back(KV.first);
+          cert.leafFormals[KV.first] =
+              FormalTextPair{oldText.str(), newText.str()};
+        }
+        llvm::sort(cert.leafArgIdxs);
+
+        if (cert.leafFormals.empty()) {
+          cert.detail = formatv(
+                            "DAG lift chain: leaf id={0} name={1} has no "
+                            "distinct leaf formals to lift",
+                            leaf.id, leaf.name)
+                            .str();
+          return cert;
+        }
 
         const RefoldModel::MacroInvocation *cur = &leaf;
         DenseMap<uint32_t, FormalTextPair> curFormals;
         DenseSet<uint32_t> bridgedCurFormals;
-        curFormals[leafArgIdx] =
-            FormalTextPair{leafOld.trim().str(), leafNew.trim().str()};
+        curFormals = cert.leafFormals;
 
         while (cur->id != m.id) {
           auto step = buildStructuredLiftCertificate(*cur, curFormals);
@@ -10604,9 +10620,10 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         }
         cert.kind = LiftChainCertificateKind::Unique;
         cert.detail = formatv(
-                          "DAG lift chain: leaf id={0} name={1} argIdx={2} "
+                          "DAG lift chain: leaf id={0} name={1} leafArgs={2} "
                           "steps={3} lexicalBridge={4} rootFormals={5}",
-                          leaf.id, leaf.name, leafArgIdx, cert.steps.size(),
+                          leaf.id, leaf.name,
+                          FormatUInt32List(cert.leafArgIdxs), cert.steps.size(),
                           cert.usedLexicalBridge ? 1 : 0,
                           cert.rootFormals.size())
                           .str();
@@ -10954,11 +10971,12 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                 semantic.interactionSummary.detail);
           for (const auto &lift : semantic.liftChains)
             trace("macro/dag",
-                  "  lift chain detail: leaf id={0} name={1} argIdx={2} "
+                  "  lift chain detail: leaf id={0} name={1} leafArgs={2} "
                   "usedLexicalBridge={3} detail={4}",
                   lift.leaf ? lift.leaf->id : 0,
                   lift.leaf ? lift.leaf->name : StringRef("<none>"),
-                  lift.leafArgIdx, lift.usedLexicalBridge ? 1 : 0,
+                  FormatUInt32List(lift.leafArgIdxs),
+                  lift.usedLexicalBridge ? 1 : 0,
                   lift.detail);
           for (const auto &step : semantic.structuredLiftCertificates)
             trace("macro/dag",
@@ -11154,6 +11172,81 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         return cert;
       };
 
+      auto buildLeafFormalLiftGroups =
+          [&](const RefoldModel::MacroInvocation &leaf,
+              const DenseMap<uint32_t, FormalTextPair> &leafFormals)
+          -> SmallVector<DenseMap<uint32_t, FormalTextPair>, 4> {
+        SmallVector<DenseMap<uint32_t, FormalTextPair>, 4> groups;
+        if (leafFormals.empty())
+          return groups;
+
+        SmallVector<uint32_t, 8> argOrder;
+        argOrder.reserve(leafFormals.size());
+        for (const auto &KV : leafFormals)
+          argOrder.push_back(KV.first);
+        llvm::sort(argOrder);
+
+        DenseMap<uint32_t, SmallVector<uint32_t, 4>> adjacency;
+        for (uint32_t argIdx : argOrder)
+          adjacency[argIdx];
+
+        StringMap<SmallVector<uint32_t, 4>> tokenArgs;
+        for (const auto &ps : leaf.pasteSpans) {
+          auto it = leafFormals.find(ps.argIdx);
+          if (it == leafFormals.end())
+            continue;
+
+          std::string key = formatv("{0}:{1}", ps.begin, ps.end).str();
+          auto &args = tokenArgs[key];
+          if (llvm::find(args, ps.argIdx) == args.end())
+            args.push_back(ps.argIdx);
+        }
+
+        for (const auto &KV : tokenArgs) {
+          ArrayRef<uint32_t> args = KV.second;
+          if (args.size() < 2)
+            continue;
+          for (size_t i = 0; i < args.size(); ++i) {
+            for (size_t j = i + 1; j < args.size(); ++j) {
+              if (llvm::find(adjacency[args[i]], args[j]) ==
+                  adjacency[args[i]].end())
+                adjacency[args[i]].push_back(args[j]);
+              if (llvm::find(adjacency[args[j]], args[i]) ==
+                  adjacency[args[j]].end())
+                adjacency[args[j]].push_back(args[i]);
+            }
+          }
+        }
+
+        DenseSet<uint32_t> visited;
+        for (uint32_t rootArgIdx : argOrder) {
+          if (!visited.insert(rootArgIdx).second)
+            continue;
+
+          SmallVector<uint32_t, 8> stack{rootArgIdx};
+          DenseMap<uint32_t, FormalTextPair> groupFormals;
+          while (!stack.empty()) {
+            uint32_t argIdx = stack.pop_back_val();
+            auto it = leafFormals.find(argIdx);
+            if (it != leafFormals.end())
+              groupFormals[argIdx] = it->second;
+
+            auto adjIt = adjacency.find(argIdx);
+            if (adjIt == adjacency.end())
+              continue;
+            for (uint32_t nextArgIdx : adjIt->second) {
+              if (visited.insert(nextArgIdx).second)
+                stack.push_back(nextArgIdx);
+            }
+          }
+
+          if (!groupFormals.empty())
+            groups.push_back(std::move(groupFormals));
+        }
+
+        return groups;
+      };
+
       auto buildSubtreeRewriteCertificate =
           [&](const RefoldModel::MacroInvocation &leaf,
               const DenseMap<uint32_t, OldNewText> &leafEdits,
@@ -11227,18 +11320,19 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
         DenseMap<uint32_t, SmallVector<FormalTextPair, 2>> rootRewrites;
         DenseSet<uint32_t> deferredRootOccurrenceArgIdxSet;
-        for (const auto &rewrite : cert.leafCert.rewrites) {
-          auto liftCert = buildLiftChainCertificate(
-              leaf, rewrite.argIdx, rewrite.oldText, rewrite.newText);
+        auto liftGroups = buildLeafFormalLiftGroups(leaf, cert.leafFormals);
+        for (const auto &groupLeafFormals : liftGroups) {
+          auto liftCert = buildLiftChainCertificate(leaf, groupLeafFormals);
           cert.liftCertificates.push_back(liftCert);
           if (liftCert.kind == LiftChainCertificateKind::Invalid) {
             cert.detail = !liftCert.detail.empty()
                               ? liftCert.detail
                               : formatv("DAG subtree: lift failed root id={0} "
                                         "name={1} leaf id={2} name={3} "
-                                        "argIdx={4}",
+                                        "groupArgs={4}",
                                         m.id, m.name, leaf.id, leaf.name,
-                                        rewrite.argIdx)
+                                        FormatUInt32List(
+                                            liftCert.leafArgIdxs))
                                     .str();
             return cert;
           }
