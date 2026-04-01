@@ -5308,6 +5308,104 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       continue;
     tokenHunksForTouchedFormals.push_back(cand);
   }
+
+  auto buildCombinedInsertionEnvelope = [&](const diffutils::Hunk &left,
+                                           const diffutils::Hunk &right) {
+    diffutils::Hunk env;
+    env.aStart = std::min(left.aStart, right.aStart);
+    env.aEnd = std::max(left.aStart, right.aStart);
+    env.bStart = std::min(left.bStart, right.bStart);
+    env.bEnd = std::max(left.bEnd, right.bEnd);
+    return env;
+  };
+
+  auto trimCommonEdgeTokensLocal = [&](diffutils::Hunk hh) {
+    while (hh.aStart < hh.aEnd && hh.bStart < hh.bEnd) {
+      size_t aIdx = static_cast<size_t>(hh.aStart);
+      size_t bIdx = static_cast<size_t>(hh.bStart);
+      if (aIdx >= aToks_.size() || bIdx >= bToks_.size())
+        break;
+      if (aToks_[aIdx].spelling != bToks_[bIdx].spelling)
+        break;
+      ++hh.aStart;
+      ++hh.bStart;
+    }
+    while (hh.aEnd > hh.aStart && hh.bEnd > hh.bStart) {
+      size_t aIdx = static_cast<size_t>(hh.aEnd - 1);
+      size_t bIdx = static_cast<size_t>(hh.bEnd - 1);
+      if (aIdx >= aToks_.size() || bIdx >= bToks_.size())
+        break;
+      if (aToks_[aIdx].spelling != bToks_[bIdx].spelling)
+        break;
+      --hh.aEnd;
+      --hh.bEnd;
+    }
+    return hh;
+  };
+
+  auto sameTokHunk = [](const diffutils::Hunk &lhs, const diffutils::Hunk &rhs) {
+    return lhs.aStart == rhs.aStart && lhs.aEnd == rhs.aEnd &&
+           lhs.bStart == rhs.bStart && lhs.bEnd == rhs.bEnd;
+  };
+
+  auto maybeAddSyntheticTouchedFormalEnvelope =
+      [&](const RefoldModel::PPArgSpan &sp, const diffutils::Hunk &anchor) {
+        if (anchor.aStart != anchor.aEnd)
+          return;
+        if (anchor.aStart < m.cover.begin || anchor.aEnd > m.cover.end)
+          return;
+
+        for (const auto &partner : abTokHunks_) {
+          if (sameTokHunk(anchor, partner))
+            continue;
+          if (partner.aStart != partner.aEnd)
+            continue;
+          if (partner.aStart < m.cover.begin || partner.aEnd > m.cover.end)
+            continue;
+
+          const diffutils::Hunk env =
+              buildCombinedInsertionEnvelope(anchor, partner);
+          const diffutils::Hunk envTrim = trimCommonEdgeTokensLocal(env);
+
+          if (envTrim.aStart >= envTrim.aEnd)
+            continue;
+          if (!(sp.begin <= envTrim.aStart && envTrim.aEnd <= sp.end))
+            continue;
+
+          SmallVector<char, 8> envTouched(occs.size(), 0);
+          if (!HunkFullyWithinArgSpans(envTrim, occs, envTouched))
+            continue;
+
+          bool touchesThisExactOccurrence = false;
+          for (size_t occIdx = 0; occIdx < occs.size(); ++occIdx) {
+            if (!envTouched[occIdx])
+              continue;
+            if (occs[occIdx].argIdx != sp.argIdx)
+              return;
+            if (occs[occIdx].begin != sp.begin || occs[occIdx].end != sp.end)
+              return;
+            touchesThisExactOccurrence = true;
+          }
+          if (!touchesThisExactOccurrence)
+            continue;
+
+          tokenHunksForTouchedFormals.push_back(envTrim);
+        }
+      };
+
+  SmallVector<diffutils::Hunk, 8> seedTokenHunks(tokenHunksForTouchedFormals.begin(),
+                                               tokenHunksForTouchedFormals.end());
+  for (size_t occIdx = 0; occIdx < occs.size(); ++occIdx) {
+    const auto &sp = occs[occIdx];
+    if (sp.argIdx >= touched.size() || !touched[sp.argIdx])
+      continue;
+    for (const auto &cand : seedTokenHunks) {
+      if (cand.aStart != cand.aEnd)
+        continue;
+      maybeAddSyntheticTouchedFormalEnvelope(sp, cand);
+    }
+  }
+
   auto hunkLess = [](const diffutils::Hunk &lhs, const diffutils::Hunk &rhs) {
     if (lhs.aStart != rhs.aStart)
       return lhs.aStart < rhs.aStart;
@@ -5334,11 +5432,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
   llvm::sort(tokenHunksForTouchedFormals, hunkLess);
   tokenHunksForTouchedFormals.erase(
       std::unique(tokenHunksForTouchedFormals.begin(),
-                  tokenHunksForTouchedFormals.end(),
-                  [](const diffutils::Hunk &lhs, const diffutils::Hunk &rhs) {
-                    return lhs.aStart == rhs.aStart && lhs.aEnd == rhs.aEnd &&
-                           lhs.bStart == rhs.bStart && lhs.bEnd == rhs.bEnd;
-                  }),
+                  tokenHunksForTouchedFormals.end(), sameTokHunk),
       tokenHunksForTouchedFormals.end());
   ArrayRef<diffutils::Hunk> tokenHunks(tokenHunksForTouchedFormals);
 
