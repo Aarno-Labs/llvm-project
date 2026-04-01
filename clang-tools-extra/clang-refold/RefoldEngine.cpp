@@ -8409,6 +8409,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             const std::string rawInvocation =
                 StringRef(*cand.invText).trim().str();
             if (!rawInvocation.empty()) {
+              addObservedForm(WrapperChainKind::Exact,
+                              WrapperObservedSource::ChildRawInvocation,
+                              rawInvocation, rawInvocation);
               addObservedForm(WrapperChainKind::StringLiteral,
                               WrapperObservedSource::ChildRawInvocation,
                               quoteCStringLiteral(rawInvocation),
@@ -9109,6 +9112,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
       struct PasteRewriteValidationCertificate {
         bool required = false;
         bool valid = true;
+        bool deferred = false;
         const RefoldModel::MacroInvocation *inv = nullptr;
         DenseMap<uint32_t, std::string> replacementByArgIdx;
         PasteRewriteValidationFailure failure =
@@ -9827,6 +9831,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         SmallVector<RawFormalValidationCertificate, 4> formalValidations;
         PasteRewriteValidationCertificate pasteValidation;
         bool touchesPaste = false;
+        std::string rewrittenInvocationSyntax;
         std::string detail;
       };
 
@@ -9923,6 +9928,46 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         }
 
         cert.kind = InvocationRewriteCertificateKind::Unique;
+        return cert;
+      };
+
+      auto buildWrapperPlaceholderHopInvocationCertificate =
+          [&](const RefoldModel::MacroInvocation &inv,
+              const DenseMap<uint32_t, FormalTextPair> &formals,
+              StringRef traceStage)
+          -> InvocationRewriteCertificate {
+        auto cert = buildInvocationRewriteCertificate(inv, formals, traceStage);
+
+        DenseMap<uint32_t, std::string> replByFormal;
+        for (const auto &KV : formals) {
+          StringRef oldText = StringRef(KV.second.oldText).trim();
+          StringRef newText = StringRef(KV.second.newText).trim();
+          if (oldText == newText)
+            continue;
+          replByFormal[KV.first] = newText.str();
+        }
+
+        if (!replByFormal.empty()) {
+          if (auto rewritten = buildRewrittenInvocationSyntax(inv, replByFormal))
+            cert.rewrittenInvocationSyntax = std::move(*rewritten);
+        }
+
+        if (cert.kind != InvocationRewriteCertificateKind::Invalid ||
+            cert.failure != InvocationRewriteFailure::PasteMismatch ||
+            cert.rewrittenInvocationSyntax.empty())
+          return cert;
+
+        cert.kind = InvocationRewriteCertificateKind::Unique;
+        cert.failure = InvocationRewriteFailure::None;
+        cert.pasteValidation.valid = true;
+        cert.pasteValidation.deferred = true;
+        cert.pasteValidation.failure = PasteRewriteValidationFailure::None;
+        cert.detail = formatv(
+                          "{0}: wrapper placeholder-hop paste validation "
+                          "deferred: inv id={1} name={2} touchedArgs={3}",
+                          traceStage, inv.id, inv.name, cert.rewrites.size())
+                          .str();
+        cert.pasteValidation.detail = cert.detail;
         return cert;
       };
 
@@ -10208,8 +10253,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               "DAG per-hop enter: child id={0} name={1} curFormals={2}",
               cur.id, cur.name, formatFormalTextPairs(curFormals));
 
-        auto curCert =
-            buildInvocationRewriteCertificate(cur, curFormals, "DAG per-hop");
+        auto curCert = buildWrapperPlaceholderHopInvocationCertificate(
+            cur, curFormals, "DAG per-hop");
         cert.currentCert = curCert;
         if (curCert.kind == InvocationRewriteCertificateKind::Invalid) {
           cert.failureReason =
@@ -10222,8 +10267,12 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         DenseMap<uint32_t, std::string> curFormalSyntax;
         for (const auto &KV : curFormals)
           curFormalSyntax[KV.first] = KV.second.newText;
-        if (auto curSyntax = buildRewrittenInvocationSyntax(cur, curFormalSyntax))
+        if (!curCert.rewrittenInvocationSyntax.empty()) {
+          cert.rewrittenChildSyntax = curCert.rewrittenInvocationSyntax;
+        } else if (auto curSyntax = buildRewrittenInvocationSyntax(
+                       cur, curFormalSyntax)) {
           cert.rewrittenChildSyntax = std::move(*curSyntax);
+        }
         trace("macro/dag",
               "DAG per-hop child syntax: child id={0} name={1} syntax='{2}' "
               "currentCertKind={3} detail={4}",
@@ -10419,9 +10468,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               FormalTextPair{formalCert.oldText, formalCert.newText};
         }
 
-        auto parentCert =
-            buildInvocationRewriteCertificate(*parent, parentFormals,
-                                             "DAG per-hop");
+        auto parentCert = buildWrapperPlaceholderHopInvocationCertificate(
+            *parent, parentFormals, "DAG per-hop");
         cert.parentCert = parentCert;
         if (parentCert.kind == InvocationRewriteCertificateKind::Invalid) {
           trace("macro/dag",
@@ -11277,25 +11325,14 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         }
 
         cert.leafCert =
-            buildInvocationRewriteCertificate(leaf, pendingLeafFormals,
-                                             "DAG subtree leaf");
-        if (cert.leafCert.kind == InvocationRewriteCertificateKind::Invalid &&
-            deferLeafPasteValidation &&
-            cert.leafCert.failure == InvocationRewriteFailure::PasteMismatch) {
+            buildWrapperPlaceholderHopInvocationCertificate(
+                leaf, pendingLeafFormals, "DAG subtree leaf");
+        if (cert.leafCert.pasteValidation.deferred && deferLeafPasteValidation) {
           trace("macro/dag",
-                "DAG subtree leaf certificate: deferring placeholder-space "
-                "paste validation leaf id={0} name={1} touchedArgs={2}",
+                "DAG subtree leaf certificate: wrapper placeholder-hop "
+                "paste validation deferred leaf id={0} name={1} "
+                "touchedArgs={2}",
                 leaf.id, leaf.name, cert.leafCert.rewrites.size());
-          cert.leafCert.kind = InvocationRewriteCertificateKind::Unique;
-          cert.leafCert.failure = InvocationRewriteFailure::None;
-          cert.leafCert.detail = formatv(
-                                    "DAG subtree leaf: placeholder-space paste "
-                                    "validation deferred: inv id={0} name={1} "
-                                    "touchedArgs={2}",
-                                    leaf.id, leaf.name,
-                                    cert.leafCert.rewrites.size())
-                                    .str();
-          cert.leafCert.pasteValidation.valid = true;
         }
         if (cert.leafCert.kind == InvocationRewriteCertificateKind::Invalid) {
           cert.detail = cert.leafCert.detail;
