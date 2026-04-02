@@ -742,6 +742,185 @@ static bool computeInvArgRangesFromText(
   return false;
 }
 
+// Parse a parenthesized tuple/signature text such as "(1, (4 + 1))" into
+// per-element byte ranges relative to the provided text. The returned ranges
+// exclude the outer parentheses and trim surrounding whitespace on each
+// element. Nested parentheses/brackets/braces, string literals, and comments
+// are handled by the raw lexer in the same way as computeInvArgRangesFromText.
+static bool computeTupleElementRangesFromText(
+    llvm::StringRef Text, const LangOptions &Lang,
+    std::vector<std::pair<std::optional<uint32_t>, std::optional<uint32_t>>>
+        &Out) {
+  Out.clear();
+
+  const SourceLocation BaseLoc = SourceLocation::getFromRawEncoding(1);
+  std::string LexBuf = Text.str();
+  LexBuf.push_back('\0');
+  const char *BufStart = LexBuf.data();
+  const char *BufEnd = BufStart + Text.size();
+  Lexer Lex(BaseLoc, Lang, BufStart, BufStart, BufEnd);
+
+  auto tokOff = [&](const Token &Tok) -> size_t {
+    return static_cast<size_t>(Tok.getLocation().getRawEncoding() -
+                               BaseLoc.getRawEncoding());
+  };
+
+  auto recordElem = [&](size_t B, size_t E) {
+    while (B < E && std::isspace(static_cast<unsigned char>(Text[B])))
+      ++B;
+    while (E > B && std::isspace(static_cast<unsigned char>(Text[E - 1])))
+      --E;
+    Out.push_back({static_cast<uint32_t>(B), static_cast<uint32_t>(E)});
+  };
+
+  Token Tok;
+  bool SawLParen = false;
+  size_t ElemStart = 0;
+  unsigned ParenDepth = 0;
+  unsigned BracketDepth = 0;
+  unsigned BraceDepth = 0;
+  bool SawAnyTokenBetweenParens = false;
+
+  while (true) {
+    Lex.LexFromRawLexer(Tok);
+    if (Tok.is(tok::eof))
+      break;
+
+    if (!SawLParen) {
+      if (Tok.is(tok::l_paren)) {
+        SawLParen = true;
+        ElemStart = tokOff(Tok) + Tok.getLength();
+      } else if (Tok.isNot(tok::comment)) {
+        return false;
+      }
+      continue;
+    }
+
+    if (Tok.is(tok::comment))
+      continue;
+
+    const size_t Off = tokOff(Tok);
+
+    if (Tok.is(tok::l_paren)) {
+      ++ParenDepth;
+      SawAnyTokenBetweenParens = true;
+      continue;
+    }
+    if (Tok.is(tok::r_paren)) {
+      if (ParenDepth == 0 && BracketDepth == 0 && BraceDepth == 0) {
+        if (!SawAnyTokenBetweenParens) {
+          Out.clear();
+          return true;
+        }
+        recordElem(ElemStart, Off);
+        return true;
+      }
+      if (ParenDepth > 0)
+        --ParenDepth;
+      SawAnyTokenBetweenParens = true;
+      continue;
+    }
+
+    if (Tok.is(tok::l_square)) {
+      ++BracketDepth;
+      SawAnyTokenBetweenParens = true;
+      continue;
+    }
+    if (Tok.is(tok::r_square)) {
+      if (BracketDepth > 0)
+        --BracketDepth;
+      SawAnyTokenBetweenParens = true;
+      continue;
+    }
+
+    if (Tok.is(tok::l_brace)) {
+      ++BraceDepth;
+      SawAnyTokenBetweenParens = true;
+      continue;
+    }
+    if (Tok.is(tok::r_brace)) {
+      if (BraceDepth > 0)
+        --BraceDepth;
+      SawAnyTokenBetweenParens = true;
+      continue;
+    }
+
+    if (Tok.is(tok::comma) && ParenDepth == 0 && BracketDepth == 0 &&
+        BraceDepth == 0) {
+      recordElem(ElemStart, Off);
+      ElemStart = Off + Tok.getLength();
+      continue;
+    }
+
+    SawAnyTokenBetweenParens = true;
+  }
+
+  return false;
+}
+
+static std::optional<llvm::StringRef>
+getItemInvocationArgText(const Item &It, uint32_t ArgIdx) {
+  if (ArgIdx >= It.InvArgRanges.size() || !It.InvBegin)
+    return std::nullopt;
+  const auto &Rng = It.InvArgRanges[ArgIdx];
+  if (!Rng.first || !Rng.second || *Rng.second < *Rng.first ||
+      *Rng.first < *It.InvBegin)
+    return std::nullopt;
+  const uint64_t RelB = *Rng.first - *It.InvBegin;
+  const uint64_t RelE = *Rng.second - *It.InvBegin;
+  if (RelE < RelB || RelE > It.InvText.size())
+    return std::nullopt;
+  return llvm::StringRef(It.InvText).slice(static_cast<size_t>(RelB),
+                                           static_cast<size_t>(RelE)).trim();
+}
+
+static std::optional<std::string>
+getUnexpandedMacroArgText(const MacroArgs *Args, unsigned ArgIndex,
+                          const SourceManager &SM, const LangOptions &Lang) {
+  if (!Args)
+    return std::nullopt;
+  const Token *AT = Args->getUnexpArgument(ArgIndex);
+  if (!AT)
+    return std::nullopt;
+  if (AT->is(tok::eof))
+    return std::string();
+
+  const Token *First = AT;
+  const Token *Last = AT;
+  for (const Token *T = AT; !T->is(tok::eof); ++T)
+    Last = T;
+
+  SourceLocation B = SM.getFileLoc(SM.getSpellingLoc(First->getLocation()));
+  SourceLocation ESp = SM.getSpellingLoc(Last->getLocation());
+  SourceLocation E = Lexer::getLocForEndOfToken(ESp, 0, SM, Lang);
+  if (!B.isValid() || !E.isValid() || !SM.isWrittenInSameFile(B, E))
+    return std::nullopt;
+
+  return Lexer::getSourceText(CharSourceRange::getCharRange(B, E), SM, Lang)
+      .str();
+}
+
+static void buildSyntheticFunctionLikeInvocationText(
+    llvm::StringRef Name, llvm::ArrayRef<llvm::StringRef> ArgTexts,
+    std::string &Out,
+    std::vector<std::pair<std::optional<uint32_t>, std::optional<uint32_t>>>
+        &ArgRanges) {
+  Out.clear();
+  ArgRanges.clear();
+
+  Out.append(Name.data(), Name.size());
+  Out.push_back('(');
+  for (size_t I = 0; I < ArgTexts.size(); ++I) {
+    if (I)
+      Out.append(", ");
+    const uint32_t B = static_cast<uint32_t>(Out.size());
+    Out.append(ArgTexts[I].data(), ArgTexts[I].size());
+    const uint32_t E = static_cast<uint32_t>(Out.size());
+    ArgRanges.push_back({B, E});
+  }
+  Out.push_back(')');
+}
+
 struct DecodedPayloadMap {
   std::string Decoded;
   llvm::SmallVector<std::pair<uint32_t, uint32_t>, 64> PayloadToSpelling;
@@ -1906,6 +2085,105 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
         CurIt.CalleeOrigin.Kind = MCO_Opaque;
       }
     }
+
+    // Higher-order signature forwarding: detect function-like nested calls
+    // whose callee is literal but whose arguments are structurally unpacked
+    // from a single caller formal, such as `(G z)` where `z` expands to a
+    // parenthesized tuple. The current source-based invocation text/ranges can
+    // be malformed for such cases, so record a normalized synthetic invocation
+    // text and precise tuple-slice provenance for each callee argument.
+    if (MI && MI->isFunctionLike() && Args && CurIt.CallerMacroId &&
+        CurIt.CalleeOrigin.Kind == MCO_LiteralMacroName) {
+      const Item *CallerIt = nullptr;
+      for (const Item &Cand : Items) {
+        if (Cand.ID == *CurIt.CallerMacroId) {
+          CallerIt = &Cand;
+          break;
+        }
+      }
+
+      if (CallerIt) {
+        SmallVector<std::string, 8> CalleeArgTexts;
+        CalleeArgTexts.reserve(MI->getNumParams());
+        bool MissingArgText = false;
+        for (unsigned ArgIdx = 0; ArgIdx < MI->getNumParams(); ++ArgIdx) {
+          auto ArgText =
+              getUnexpandedMacroArgText(Args, ArgIdx, SM, PP.getLangOpts());
+          if (!ArgText) {
+            MissingArgText = true;
+            break;
+          }
+          CalleeArgTexts.push_back(std::move(*ArgText));
+        }
+
+        if (!MissingArgText && !CalleeArgTexts.empty()) {
+          std::optional<uint32_t> UniqueCallerFormal;
+          std::vector<std::vector<InvArgTupleRef>> TupleRefs;
+          std::string NormalizedInvText;
+          std::vector<std::pair<std::optional<uint32_t>, std::optional<uint32_t>>>
+              NormalizedRanges;
+
+          for (uint32_t CallerFormal = 0;
+               CallerFormal < CallerIt->InvArgRanges.size(); ++CallerFormal) {
+            auto CallerArgText = getItemInvocationArgText(*CallerIt, CallerFormal);
+            if (!CallerArgText)
+              continue;
+
+            std::vector<std::pair<std::optional<uint32_t>, std::optional<uint32_t>>>
+                TupleRanges;
+            if (!computeTupleElementRangesFromText(*CallerArgText, PP.getLangOpts(),
+                                                   TupleRanges))
+              continue;
+            if (TupleRanges.size() != CalleeArgTexts.size())
+              continue;
+
+            bool Match = true;
+            SmallVector<llvm::StringRef, 8> TupleArgTexts;
+            std::vector<std::vector<InvArgTupleRef>> CandidateRefs;
+            CandidateRefs.resize(TupleRanges.size());
+            for (size_t I = 0; I < TupleRanges.size(); ++I) {
+              const auto &TR = TupleRanges[I];
+              if (!TR.first || !TR.second || *TR.second < *TR.first ||
+                  *TR.second > CallerArgText->size()) {
+                Match = false;
+                break;
+              }
+              llvm::StringRef Slice =
+                  CallerArgText->slice(*TR.first, *TR.second).trim();
+              if (Slice != llvm::StringRef(CalleeArgTexts[I]).trim()) {
+                Match = false;
+                break;
+              }
+              TupleArgTexts.push_back(Slice);
+              CandidateRefs[I].push_back(
+                  InvArgTupleRef{CallerFormal, *TR.first, *TR.second});
+            }
+            if (!Match)
+              continue;
+
+            if (UniqueCallerFormal) {
+              UniqueCallerFormal = std::nullopt;
+              TupleRefs.clear();
+              NormalizedInvText.clear();
+              NormalizedRanges.clear();
+              break;
+            }
+
+            UniqueCallerFormal = CallerFormal;
+            TupleRefs = std::move(CandidateRefs);
+            buildSyntheticFunctionLikeInvocationText(
+                CurIt.Name, llvm::ArrayRef<llvm::StringRef>(TupleArgTexts),
+                NormalizedInvText, NormalizedRanges);
+          }
+
+          if (UniqueCallerFormal && !NormalizedInvText.empty()) {
+            CurIt.InvArgTupleRefs = std::move(TupleRefs);
+            CurIt.NormalizedInvText = std::move(NormalizedInvText);
+            CurIt.NormalizedInvArgTextRanges = std::move(NormalizedRanges);
+          }
+        }
+      }
+    }
   }
 
   // 6. THE SCHEMA FIX:
@@ -2837,7 +3115,7 @@ void RefoldMapBuilder::writeJSON() {
   llvm::json::OStream JO(OS, /*Indent=*/2);
 
   JO.object([&] {
-    JO.attribute("version", "2.1");
+    JO.attribute("version", "2.2");
 
     const auto &PPO = PP.getPreprocessorOpts();
     std::string LangStr = computeLangStr(PP.getLangOpts());
@@ -3567,6 +3845,9 @@ void RefoldMapBuilder::writeJSON() {
             // InvText can't be empty at this point
             JO.attribute("inv_text", It.InvText);
 
+            if (It.NormalizedInvText)
+              JO.attribute("normalized_inv_text", *It.NormalizedInvText);
+
             if (!It.InvFile.empty())
               JO.attribute("inv_file", It.InvFile);
 
@@ -3582,6 +3863,19 @@ void RefoldMapBuilder::writeJSON() {
             if (!It.InvArgRanges.empty()) {
               JO.attributeArray("inv_arg_ranges", [&] {
                 for (const auto &R : It.InvArgRanges) {
+                  JO.object([&] {
+                    JO.attribute("b", R.first ? llvm::json::Value(*R.first)
+                                              : llvm::json::Value(nullptr));
+                    JO.attribute("e", R.second ? llvm::json::Value(*R.second)
+                                               : llvm::json::Value(nullptr));
+                  });
+                }
+              });
+            }
+
+            if (!It.NormalizedInvArgTextRanges.empty()) {
+              JO.attributeArray("normalized_inv_arg_text_ranges", [&] {
+                for (const auto &R : It.NormalizedInvArgTextRanges) {
                   JO.object([&] {
                     JO.attribute("b", R.first ? llvm::json::Value(*R.first)
                                               : llvm::json::Value(nullptr));
@@ -3808,6 +4102,23 @@ void RefoldMapBuilder::writeJSON() {
                                      Ref.CallerParamIndex);
                         JO.attribute("byte_begin", Ref.ByteBegin);
                         JO.attribute("byte_end", Ref.ByteEnd);
+                      });
+                    }
+                  });
+                }
+              });
+            }
+
+            if (!It.InvArgTupleRefs.empty()) {
+              JO.attributeArray("arg_tuple_refs", [&] {
+                for (const auto &ArgRefs : It.InvArgTupleRefs) {
+                  JO.array([&] {
+                    for (const auto &Ref : ArgRefs) {
+                      JO.object([&] {
+                        JO.attribute("caller_param_index",
+                                     Ref.CallerParamIndex);
+                        JO.attribute("caller_byte_begin", Ref.CallerByteBegin);
+                        JO.attribute("caller_byte_end", Ref.CallerByteEnd);
                       });
                     }
                   });

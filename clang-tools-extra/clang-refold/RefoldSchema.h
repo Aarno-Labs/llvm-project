@@ -788,6 +788,11 @@ static constexpr const char *RefoldSchema = R"json(
           "minLength": 1,
           "description": "Exact bytes at the macro call site in the source (e.g., 'FOO(1, 2)')."
         },
+        "normalized_inv_text": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Canonicalized function-like invocation text synthesized from actual callee arguments when the source spelling is not a normal NAME(...) form (for example, higher-order tuple forwarding such as '(G z)')."
+        },
         "inv_file": {
           "type": "string",
           "minLength": 1,
@@ -821,6 +826,13 @@ static constexpr const char *RefoldSchema = R"json(
         "inv_arg_ranges": {
           "type": "array",
           "description": "Per-formal-parameter source byte ranges for the macro invocation arguments. Entry i corresponds to formal parameter index i. For variadic macros, the variadic parameter entry spans the entire variadic tail (including commas). Ranges use the same coordinate space as inv_b/inv_e (byte offsets within inv_file); to index into inv_text, subtract inv_b. Endpoints may be null if the range cannot be recovered.",
+          "items": {
+            "$ref": "#/$defs/OptByteRange"
+          }
+        },
+        "normalized_inv_arg_text_ranges": {
+          "type": "array",
+          "description": "Per-formal-parameter byte ranges within normalized_inv_text. Entry i corresponds to formal parameter index i. These ranges are relative to the synthesized normalized_inv_text string rather than inv_file source bytes.",
           "items": {
             "$ref": "#/$defs/OptByteRange"
           }
@@ -885,6 +897,19 @@ static constexpr const char *RefoldSchema = R"json(
             }
           },
           "description": "Per-callee-parameter mapping back to slices of caller formal arguments. For parameter i, arg_refs[i] is an ordered sequence of (caller_param_index, byte_begin, byte_end) triples describing which caller argument slices were substituted into this callee parameter's raw argument text. This refines arg_deps for argument-text lifting only and does not encode callee-token provenance."
+        },
+        "arg_tuple_refs": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/TupleArgRef"
+            }
+          },
+          "description": "Per-callee-parameter structural forwarding from a caller formal tuple/signature. For parameter i, arg_tuple_refs[i] is an ordered sequence of slices within the trimmed caller-formal text that produce this callee argument. This is used for higher-order forms such as '(G z)' where callee arguments are unpacked from a single caller formal rather than referenced by name."
         }
       },
       "dependentRequired": {
@@ -1242,6 +1267,32 @@ static constexpr const char *RefoldSchema = R"json(
         }
       },
       "description": "A single formal macro parameter from the macro definition corresponding to a recorded invocation."
+    },
+    "TupleArgRef": {
+      "type": "object",
+      "required": [
+        "caller_param_index",
+        "caller_byte_begin",
+        "caller_byte_end"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "caller_param_index": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Zero-based index of the caller formal that owns the tuple/signature text."
+        },
+        "caller_byte_begin": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Begin byte offset (inclusive) of the forwarded slice within the trimmed caller-formal text."
+        },
+        "caller_byte_end": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "End byte offset (exclusive) of the forwarded slice within the trimmed caller-formal text."
+        }
+      }
     },
     "CalleeOrigin": {
       "type": "object",

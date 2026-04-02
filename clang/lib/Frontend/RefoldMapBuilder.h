@@ -103,6 +103,20 @@ struct MacroCalleeOrigin {
   std::vector<uint32_t> CallerParamIndices;
 };
 
+/// Structural forwarding metadata for a callee argument derived from a slice
+/// of a caller formal argument, rather than by textual identifier reference.
+/// This captures higher-order patterns such as:
+///
+///   #define H(z) (G z)
+///
+/// where the caller formal `z` is a parenthesized signature tuple whose
+/// elements become the callee arguments of `G` after substitution.
+struct InvArgTupleRef {
+  uint32_t CallerParamIndex = 0;
+  uint32_t CallerByteBegin = 0;
+  uint32_t CallerByteEnd = 0;
+};
+
 struct PastePart {
   // ArgIndex >= 0 is a macro argument index; nullopt denotes a literal
   // contribution.
@@ -205,6 +219,21 @@ struct Item {
   // these slices as proof material for generalized DAG lifting; producer-side
   // upward propagation remains only a best-effort optimization.
   std::vector<std::vector<InvArgRef>> InvArgRefs;
+
+  // Structural slice forwarding for higher-order tuple signatures. For each
+  // invocation argument, record the slice(s) of the caller formal text that
+  // produce that callee argument. Byte ranges are relative to the *trimmed*
+  // caller-argument text returned by getInvocationArgText-style consumers.
+  std::vector<std::vector<InvArgTupleRef>> InvArgTupleRefs;
+
+  // Canonicalized invocation text for higher-order function-like invocations
+  // whose source spelling is not a normal NAME(...) form. When present, this
+  // string is synthesized deterministically from the callee name and actual
+  // callee arguments, and NormalizedInvArgTextRanges are byte ranges within
+  // this string.
+  std::optional<std::string> NormalizedInvText;
+  std::vector<std::pair<std::optional<uint32_t>, std::optional<uint32_t>>>
+      NormalizedInvArgTextRanges;
   std::vector<HeaderDecl> Decls;
 
   // main-file byte range of the macro invocation (if applicable)
