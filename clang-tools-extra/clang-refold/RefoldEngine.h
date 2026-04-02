@@ -1401,9 +1401,9 @@ private:
   /// ### Implementation notes
   /// * `spansAsc` must be non-overlapping, sorted by `byteBegin` ascending, and
   ///   within `[0, aTok.length()]`; otherwise `std::nullopt` is returned.
-  /// * The search for fixed anchors in `bTok` may have multiple candidates;
-  ///   the helper performs bounded backtracking to find a consistent global
-  ///   segmentation.
+  /// * The search for fixed anchors in `bTok` is memoized by `(idx, posB)` so
+  ///   repeated suffix states are solved once while preserving the existing
+  ///   left-to-right acceptance order.
   ///
   /// \param aTok The original pasted-token spelling from the unedited
   ///             preprocessed stream (A).
@@ -1418,54 +1418,6 @@ private:
   SegmentPastedTokenArgsByFixedSlices(
       StringRef aTok, StringRef bTok,
       ArrayRef<const RefoldModel::PPArgSpan *> spansAsc);
-
-  /// \brief Recursive worker for `segmentPastedTokenArgsByFixedSlices` that
-  /// performs a deterministic, backtracking match of fixed-slice anchors to
-  /// derive per-span B token segments.
-  ///
-  /// The recursion advances span-by-span. At each step `idx` it:
-  /// 1. Verifies that the fixed slice in `aTok` from `posA` to the current
-  ///    span's `byteBegin` matches exactly in `bTok` at `posB`.
-  /// 2. Computes the argument segment start in `bTok` immediately after that
-  ///    fixed slice.
-  /// 3. Determines the next fixed anchor slice (between the current span end
-  ///    and the next span begin, or the tail after the final span).
-  /// 4. Finds all occurrences of that anchor in `bTok` at/after the argument
-  ///    segment start and tries each as the boundary for this span,
-  ///    recursively validating the remainder.
-  ///
-  /// ### Special cases
-  /// * If the fixed anchor after the current span is empty and this is the
-  ///   final span, the current span consumes the remainder of `bTok` (allowing
-  ///   growth/shrink of the last argument contribution).
-  /// * If the fixed anchor after the current span is empty and there is a next
-  ///   span, segmentation is only allowed when `aTok.length() == bTok.length()`,
-  ///   in which case the B segment length is forced to the original A segment
-  ///   length.
-  ///
-  /// On success, `out[idx]` is assigned the derived `bTok` substring for that
-  /// span. The `out` list is mutated in-place across recursive frames.
-  ///
-  /// \param aTok Original pasted token spelling from the A-stream.
-  /// \param bTok Edited pasted token spelling from the B-stream.
-  /// \param spansAsc Argument spans within `aTok`, sorted by `byteBegin`
-  ///                 ascending.
-  /// \param idx Index of the span currently being segmented.
-  /// \param posA Current cursor in `aTok` (start of the next fixed slice to
-  ///             match).
-  /// \param posB Current cursor in `bTok` (start position where `aTok[posA..]`
-  ///             must match via fixed anchors).
-  /// \param out Output list aligned to `spansAsc`; populated with per-span B
-  ///            substrings.
-  /// \returns `true` if a complete, unambiguous segmentation exists. For a
-  ///          contiguous `##` run, multiple edited segments are allowed only
-  ///          when each edited segment is isolated by unchanged neighboring
-  ///          segments (or a run edge); adjacent edited segments in the same
-  ///          undelimited run are rejected as ambiguous.
-  static bool SegmentPastedTokenArgsByFixedSlicesRec(
-      StringRef aTok, StringRef bTok,
-      ArrayRef<const RefoldModel::PPArgSpan *> spansAsc, size_t idx,
-      size_t posA, size_t posB, MutableArrayRef<std::string> out);
 
   /// \brief Derives the replacement text for a pasted-token sub-segment
   /// (`oldSeg`) implied by an args-only rewrite from `baseArg` to `newArg`.
