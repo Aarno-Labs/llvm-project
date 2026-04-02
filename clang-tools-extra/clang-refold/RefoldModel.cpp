@@ -339,6 +339,10 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
   if (!cwdOrErr)
     return cwdOrErr.takeError();
   model.ppCwd_ = *cwdOrErr;
+  auto langOrErr = applyToField(asString, ppCtxObj, "lang", "pp_ctx.lang");
+  if (!langOrErr)
+    return langOrErr.takeError();
+  model.ppLang_ = *langOrErr;
 
   // tokens.count
   auto tokObjOrErr = applyToField(asObject, root, "tokens");
