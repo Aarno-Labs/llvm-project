@@ -57,6 +57,21 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
   if (!enabled_)
     return replacement.str();
 
+  auto rejoinsUntouchedTailSafelyAtBOL = [&](uint64_t editEnd) -> bool {
+    const size_t n = originalFileText.size();
+    const size_t pos =
+        (editEnd >= static_cast<uint64_t>(n)) ? n : static_cast<size_t>(editEnd);
+
+    if (pos == n || stringutils::isBOL(originalFileText, pos))
+      return true;
+
+    size_t nl = originalFileText.find('\n', pos);
+    if (nl == StringRef::npos)
+      nl = n;
+
+    return stringutils::isIndentOnly(originalFileText, pos, nl);
+  };
+
   size_t origNl = stringutils::countNewlines(originalFileText, s, e);
   size_t replNl = stringutils::countNewlines(replacement);
 
@@ -71,8 +86,20 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
   std::string directive =
       FormatLineDirective(resumeLine, fileSpellingForDirective);
 
-  // Ensure directive begins at BOL in the emitted output.
+  // Ensure directive begins at BOL in the emitted output. Also require that
+  // the replacement rejoins untouched original bytes only at a line boundary
+  // (or before indentation-only tail bytes), so the directive cannot end up
+  // stranded before untouched code that continues on the same physical line.
   if (replacement.empty()) {
+    if (!stringutils::isBOL(originalFileText, static_cast<size_t>(s)) ||
+        !rejoinsUntouchedTailSafelyAtBOL(e)) {
+      trace("linedir/local",
+            "cannot inject (empty replacement rejoins mid-line original): "
+            "resumeLine={0} file={1} start={2} end={3}",
+            resumeLine, fileSpellingForDirective, s, e);
+      return replacement.str();
+    }
+
     trace("linedir/local",
           "inject (empty replacement): resumeLine={0} file={1}", resumeLine,
           fileSpellingForDirective);
@@ -80,6 +107,13 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
   }
 
   if (replacement.back() == '\n') {
+    if (!rejoinsUntouchedTailSafelyAtBOL(e)) {
+      trace("linedir/local",
+            "cannot inject at end (replacement rejoins mid-line original): "
+            "resumeLine={0} file={1} end={2}",
+            resumeLine, fileSpellingForDirective, e);
+      return replacement.str();
+    }
     // Idempotence: avoid appending the same directive twice.
     if (replacement.ends_with(directive)) {
       trace("linedir/local",
@@ -96,6 +130,14 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
   if (lastNl != StringRef::npos) {
     size_t bol = lastNl + 1;
     if (stringutils::isIndentOnly(replacement, bol, replacement.size())) {
+      if (!rejoinsUntouchedTailSafelyAtBOL(e)) {
+        trace("linedir/local",
+              "cannot inject before indent-only suffix (replacement rejoins "
+              "mid-line original): resumeLine={0} file={1} end={2}",
+              resumeLine, fileSpellingForDirective, e);
+        return replacement.str();
+      }
+
       trace("linedir/local",
             "inject (between last NL and indent-only suffix): resumeLine={0} "
             "file={1} lastNl={2} bol={3}",
