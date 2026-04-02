@@ -696,6 +696,8 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
         if (!invTextOrErr)
           return invTextOrErr.takeError();
         StringRef invText = *invTextOrErr;
+        std::optional<StringRef> normalizedInvText =
+            asOptString(*obj, "normalized_inv_text", /*canBeNull=*/true);
 
         auto spansOrErr = requireField(*obj, "spans", ctxItem);
         if (!spansOrErr)
@@ -743,33 +745,41 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
           }
         }
 
-        std::vector<MacroInvocation::OptByteRange> invArgRanges;
-        if (auto invArgRangesArr = asOptArray(*obj, "inv_arg_ranges",
-                                              /*canBeNull=*/true)) {
-          for (const auto &elem : **invArgRangesArr) {
-            auto *rObj = elem.getAsObject();
-            if (!rObj) {
-              fatal("model", "invalid json value type on field "
-                             "'inv_arg_ranges': expected object value");
+        auto parseOptByteRanges = [&](StringRef fieldName,
+                                      std::vector<MacroInvocation::OptByteRange> &out) {
+          if (auto arr = asOptArray(*obj, fieldName, /*canBeNull=*/true)) {
+            for (const auto &elem : **arr) {
+              auto *rObj = elem.getAsObject();
+              if (!rObj) {
+                fatal("model", "invalid json value type on field '%s': expected object value",
+                      fieldName.str().c_str());
+              }
+
+              const json::Value *bVal = rObj->get("b");
+              const json::Value *eVal = rObj->get("e");
+              if (!bVal || !eVal) {
+                fatal("model", "missing required fields on '%s' element: expected {b,e}",
+                      fieldName.str().c_str());
+              }
+
+              std::optional<uint64_t> b;
+              std::optional<uint64_t> e;
+              if (!bVal->getAsNull())
+                b = bVal->getAsUINT64();
+              if (!eVal->getAsNull())
+                e = eVal->getAsUINT64();
+
+              out.emplace_back(b, e);
             }
-
-            const json::Value *bVal = rObj->get("b");
-            const json::Value *eVal = rObj->get("e");
-            if (!bVal || !eVal) {
-              fatal("model", "missing required fields on 'inv_arg_ranges' "
-                             "element: expected {b,e}");
-            }
-
-            std::optional<uint64_t> b;
-            std::optional<uint64_t> e;
-            if (!bVal->getAsNull())
-              b = bVal->getAsUINT64();
-            if (!eVal->getAsNull())
-              e = eVal->getAsUINT64();
-
-            invArgRanges.emplace_back(b, e);
           }
-        }
+        };
+
+        std::vector<MacroInvocation::OptByteRange> invArgRanges;
+        parseOptByteRanges("inv_arg_ranges", invArgRanges);
+
+        std::vector<MacroInvocation::OptByteRange> normalizedInvArgTextRanges;
+        parseOptByteRanges("normalized_inv_arg_text_ranges",
+                           normalizedInvArgTextRanges);
 
         std::vector<PPArgSpan> argSpans;
         if (const json::Value *spansVal = obj->get("arg_spans")) {
@@ -934,10 +944,59 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
           }
         }
 
+        std::vector<std::vector<RefoldModel::TupleArgRef>> argTupleRefs;
+        if (auto RefsArr = asOptArray(*obj, "arg_tuple_refs", /*allowNull=*/true)) {
+          for (const json::Value &Entry : **RefsArr) {
+            auto AOrErr = asArray(Entry, ctxItem);
+            if (!AOrErr)
+              fatal("model", "{0}: arg_tuple_refs entry is not an array", ctxItem);
+            const json::Array &A = **AOrErr;
+
+            std::vector<RefoldModel::TupleArgRef> Refs;
+            Refs.reserve(A.size());
+            for (const json::Value &Elem : A) {
+              auto ObjOrErr = asObject(Elem, ctxItem);
+              if (!ObjOrErr)
+                fatal("model", "{0}: arg_tuple_refs element is not an object",
+                      ctxItem);
+              const json::Object &RefObj = **ObjOrErr;
+
+              const json::Value *CallerIdxVal = RefObj.get("caller_param_index");
+              if (!CallerIdxVal)
+                fatal("model", "{0}: arg_tuple_refs element missing caller_param_index", ctxItem);
+              auto CallerIdxOrErr = asUInt32(*CallerIdxVal,
+                  ctxItem + ": arg_tuple_refs.caller_param_index");
+              if (!CallerIdxOrErr)
+                fatal("model", "{0}: arg_tuple_refs.caller_param_index is not a uint32", ctxItem);
+
+              const json::Value *ByteBVal = RefObj.get("caller_byte_begin");
+              if (!ByteBVal)
+                fatal("model", "{0}: arg_tuple_refs element missing caller_byte_begin", ctxItem);
+              auto ByteBOrErr = asUInt32(*ByteBVal,
+                  ctxItem + ": arg_tuple_refs.caller_byte_begin");
+              if (!ByteBOrErr)
+                fatal("model", "{0}: arg_tuple_refs.caller_byte_begin is not a uint32", ctxItem);
+
+              const json::Value *ByteEVal = RefObj.get("caller_byte_end");
+              if (!ByteEVal)
+                fatal("model", "{0}: arg_tuple_refs element missing caller_byte_end", ctxItem);
+              auto ByteEOrErr = asUInt32(*ByteEVal,
+                  ctxItem + ": arg_tuple_refs.caller_byte_end");
+              if (!ByteEOrErr)
+                fatal("model", "{0}: arg_tuple_refs.caller_byte_end is not a uint32", ctxItem);
+
+              Refs.push_back(RefoldModel::TupleArgRef{*CallerIdxOrErr,
+                                                      *ByteBOrErr, *ByteEOrErr});
+            }
+            argTupleRefs.push_back(std::move(Refs));
+          }
+        }
+
         MacroInvocation mi(/*id*/ id,
                            /*subkind*/ subkind,
                            /*name*/ name,
                            /*invText*/ invText,
+                           /*normalizedInvText*/ normalizedInvText,
                            /*invFile*/ invFile,
                            /*invB*/ invB,
                            /*invE*/ invE,
@@ -946,6 +1005,7 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
                            /*ownerIncludeId*/ ownerIncludeId,
                            /*defParams*/ std::move(defParams),
                            /*invArgRanges*/ std::move(invArgRanges),
+                           /*normalizedInvArgTextRanges*/ std::move(normalizedInvArgTextRanges),
                            /*spans*/ std::move(*spans),
                            /*argSpans*/ std::move(argSpans),
                            /*stringifySpans*/ std::move(stringifySpans),
@@ -954,7 +1014,8 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
                            /*callerMacroId*/ callerMacroId,
                            /*calleeOrigin*/ std::move(calleeOrigin),
                            /*argDeps*/ std::move(argDeps),
-                           /*argRefs*/ std::move(argRefs));
+                           /*argRefs*/ std::move(argRefs),
+                           /*argTupleRefs*/ std::move(argTupleRefs));
 
         model.macroInvs_.push_back(std::move(mi));
       } else if (kindStr == "file") {

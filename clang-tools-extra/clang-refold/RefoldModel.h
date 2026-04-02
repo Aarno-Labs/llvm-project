@@ -304,6 +304,12 @@ public:
     uint32_t byteEnd;
   };
 
+  struct TupleArgRef {
+    uint32_t callerParamIndex;
+    uint32_t callerByteBegin;
+    uint32_t callerByteEnd;
+  };
+
   struct MacroCalleeOrigin {
     MacroCalleeOriginKind kind = MacroCalleeOriginKind::LiteralMacroName;
     std::vector<uint32_t> callerParamIndices;
@@ -327,6 +333,8 @@ public:
     std::vector<MacroDefParam> defParams; // formal parameters from macro definition
     using OptByteRange = std::pair<std::optional<uint64_t>, std::optional<uint64_t>>;
     std::vector<OptByteRange> invArgRanges; // per-formal invocation-argument byte ranges
+    std::optional<StringRef> normalizedInvText;
+    std::vector<OptByteRange> normalizedInvArgTextRanges; // per-formal argument ranges within normalizedInvText
     std::vector<PPSpan> bodySpans;
     std::optional<StringRef> invText;
     std::optional<StringRef> invFile;   // file containing invocation
@@ -338,10 +346,12 @@ public:
     MacroCalleeOrigin calleeOrigin;
     std::vector<std::vector<uint32_t>> argDeps;
     std::vector<std::vector<InvArgRef>> argRefs;
+    std::vector<std::vector<TupleArgRef>> argTupleRefs;
     PPCover cover;
 
     MacroInvocation(uint64_t id, StringRef subkind, StringRef name,
                     std::optional<StringRef> invText,
+                    std::optional<StringRef> normalizedInvText,
                     std::optional<StringRef> invFile,
                     std::optional<uint64_t> invB, std::optional<uint64_t> invE,
                     std::optional<uint64_t> invPPByteBegin,
@@ -349,6 +359,7 @@ public:
                     std::optional<uint64_t> ownerIncludeId,
                     std::vector<MacroDefParam> defParams,
                     std::vector<OptByteRange> invArgRanges,
+                    std::vector<OptByteRange> normalizedInvArgTextRanges,
                     std::vector<PPSpan> spans, std::vector<PPArgSpan> argSpans,
                     std::vector<PPArgSpan> stringifySpans,
                     std::vector<PPArgSpan> pasteSpans,
@@ -356,17 +367,21 @@ public:
                     std::optional<uint64_t> callerMacroId,
                     MacroCalleeOrigin calleeOrigin,
                     std::vector<std::vector<uint32_t>> argDeps,
-                    std::vector<std::vector<InvArgRef>> argRefs) noexcept
+                    std::vector<std::vector<InvArgRef>> argRefs,
+                    std::vector<std::vector<TupleArgRef>> argTupleRefs) noexcept
         : id(id), subkind(subkind), name(name),
           spans(std::move(spans)), argSpans(std::move(argSpans)),
           stringifySpans(std::move(stringifySpans)),
           pasteSpans(std::move(pasteSpans)), defParams(std::move(defParams)),
           invArgRanges(std::move(invArgRanges)),
+          normalizedInvText(normalizedInvText),
+          normalizedInvArgTextRanges(std::move(normalizedInvArgTextRanges)),
           bodySpans(std::move(bodySpans)), invText(invText), invFile(invFile),
           invB(invB), invE(invE), invPPByteBegin(invPPByteBegin),
           invPPByteEnd(invPPByteEnd), ownerIncludeId(ownerIncludeId),
           callerMacroId(callerMacroId), calleeOrigin(std::move(calleeOrigin)),
-          argDeps(std::move(argDeps)), argRefs(std::move(argRefs)) {
+          argDeps(std::move(argDeps)), argRefs(std::move(argRefs)),
+          argTupleRefs(std::move(argTupleRefs)) {
       cover.Init(this->spans, &this->argSpans, &this->bodySpans);
     }
 

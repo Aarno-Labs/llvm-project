@@ -5440,168 +5440,579 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         tokenHunks.size(),
         formatHunkList(tokenHunksForTouchedFormals));
 
+  struct OccObservation {
+    StringRef oldText;
+    std::string newText;
+  };
+
+  auto tryTupleForwardedCallerTupleRewrite =
+      [&](uint32_t callerArgIdx, StringRef baseArgText,
+          ArrayRef<OccObservation> occObservations,
+          std::string &outNewArg) -> bool {
+        auto formatTupleRefs = [&](ArrayRef<RefoldModel::TupleArgRef> refs) {
+          std::string out;
+          raw_string_ostream os(out);
+          os << "[";
+          for (size_t i = 0; i < refs.size(); ++i) {
+            if (i)
+              os << ", ";
+            os << "{caller_param_index=" << refs[i].callerParamIndex
+               << ", caller_byte_begin=" << refs[i].callerByteBegin
+               << ", caller_byte_end=" << refs[i].callerByteEnd << "}";
+          }
+          os << "]";
+          return os.str();
+        };
+
+        auto formatOccurrenceObservations = [&](ArrayRef<OccObservation> obs) {
+          std::string out;
+          raw_string_ostream os(out);
+          os << "[";
+          for (size_t i = 0; i < obs.size(); ++i) {
+            if (i)
+              os << ", ";
+            os << "{old='"
+               << stringutils::showWSWithClip(obs[i].oldText, 120)
+               << "' new='"
+               << stringutils::showWSWithClip(obs[i].newText, 120) << "'}";
+          }
+          os << "]";
+          return os.str();
+        };
+        StringRef parentTrim = baseArgText.trim();
+        trace("macro/tuple",
+              "tuple-forward enter root id={0} name={1} argIdx={2} baseArg='{3}' occObservations={4}",
+              m.id, m.name, callerArgIdx,
+              stringutils::showWSWithClip(baseArgText, 200),
+              formatOccurrenceObservations(occObservations));
+        if (parentTrim.empty())
+          return false;
+
+        const RefoldModel::MacroInvocation *tupleChild = nullptr;
+        SmallVector<std::pair<uint32_t, StringRef>, 8> childArgs;
+        SmallVector<RefoldModel::TupleArgRef, 8> childTupleRefs;
+
+        auto getNormalizedArgText =
+            [&](const RefoldModel::MacroInvocation &inv,
+                uint32_t argIdx) -> std::optional<StringRef> {
+          if (!inv.normalizedInvText)
+            return std::nullopt;
+          if (argIdx >= inv.normalizedInvArgTextRanges.size())
+            return std::nullopt;
+          const auto &rng = inv.normalizedInvArgTextRanges[argIdx];
+          if (!rng.first || !rng.second || *rng.second < *rng.first)
+            return std::nullopt;
+          if (*rng.second > inv.normalizedInvText->size())
+            return std::nullopt;
+          return StringRef(*inv.normalizedInvText)
+              .slice((size_t)*rng.first, (size_t)*rng.second)
+              .trim();
+        };
+
+        for (const auto &cand : model_.GetMacroInvocations()) {
+          if (!cand.callerMacroId || *cand.callerMacroId != m.id)
+            continue;
+          if (!cand.normalizedInvText)
+            continue;
+          if (cand.normalizedInvArgTextRanges.empty() || cand.argTupleRefs.empty())
+            continue;
+          if (cand.normalizedInvArgTextRanges.size() != cand.argTupleRefs.size())
+            continue;
+
+          SmallVector<std::pair<uint32_t, StringRef>, 8> localChildArgs;
+          SmallVector<RefoldModel::TupleArgRef, 8> localTupleRefs;
+          DenseSet<StringRef> seenOldTexts;
+          bool ok = false;
+          for (uint32_t childArgIdx = 0;
+               childArgIdx < cand.argTupleRefs.size(); ++childArgIdx) {
+            const auto &refs = cand.argTupleRefs[childArgIdx];
+            if (refs.size() != 1)
+              continue;
+            const auto &ref = refs.front();
+            if (ref.callerParamIndex != callerArgIdx)
+              continue;
+
+            auto oldArgText = getNormalizedArgText(cand, childArgIdx);
+            if (!oldArgText)
+              return false;
+            if (seenOldTexts.find(*oldArgText) != seenOldTexts.end())
+              return false;
+            seenOldTexts.insert(*oldArgText);
+
+            if (ref.callerByteEnd < ref.callerByteBegin ||
+                ref.callerByteEnd > parentTrim.size())
+              return false;
+            StringRef slice = parentTrim.slice(ref.callerByteBegin, ref.callerByteEnd).trim();
+            if (slice != oldArgText->trim())
+              return false;
+
+            localChildArgs.push_back({childArgIdx, *oldArgText});
+            localTupleRefs.push_back(ref);
+            ok = true;
+          }
+          if (!ok)
+            continue;
+          trace("macro/tuple",
+                "tuple-forward child candidate root id={0} name={1} childId={2} childName={3} normalizedInv='{4}' normalizedRanges={5} tupleRefs={6} childArgs={7}",
+                m.id, m.name, cand.id, cand.name,
+                cand.normalizedInvText ? stringutils::showWSWithClip(*cand.normalizedInvText, 200) : StringRef("<none>"),
+                [&]() {
+                  std::string out; raw_string_ostream os(out); os << "[";
+                  for (size_t ri = 0; ri < cand.normalizedInvArgTextRanges.size(); ++ri) {
+                    if (ri) os << ", ";
+                    const auto &r = cand.normalizedInvArgTextRanges[ri];
+                    os << "{";
+                    os << "b=";
+                    if (r.first) os << *r.first; else os << "null";
+                    os << ", e=";
+                    if (r.second) os << *r.second; else os << "null";
+                    os << "}";
+                    if (cand.normalizedInvText && r.first && r.second && *r.first <= *r.second && *r.second <= cand.normalizedInvText->size())
+                      os << "='" << stringutils::showWSWithClip(cand.normalizedInvText->slice(*r.first, *r.second), 120) << "'";
+                  }
+                  os << "]";
+                  return os.str();
+                }(),
+                formatTupleRefs(localTupleRefs),
+                [&](){ std::string out; raw_string_ostream os(out); os << "["; for (size_t ai = 0; ai < localChildArgs.size(); ++ai) { if (ai) os << ", "; os << "{argIdx=" << localChildArgs[ai].first << ", text='" << stringutils::showWSWithClip(localChildArgs[ai].second, 120) << "'}"; } os << "]"; return os.str(); }());
+          if (tupleChild)
+            return false;
+          tupleChild = &cand;
+          childArgs = std::move(localChildArgs);
+          childTupleRefs = std::move(localTupleRefs);
+        }
+
+        if (!tupleChild || childArgs.empty() || childArgs.size() != childTupleRefs.size())
+          return false;
+
+        StringMap<std::string> newTextByOld;
+        for (const auto &obs : occObservations) {
+          auto it = newTextByOld.find(obs.oldText);
+          if (it == newTextByOld.end()) {
+            newTextByOld[obs.oldText] = obs.newText;
+            continue;
+          }
+          if (it->second != obs.newText)
+            return false;
+        }
+
+        std::string rebuilt = parentTrim.str();
+        SmallVector<unsigned, 8> order(childTupleRefs.size());
+        for (unsigned i = 0; i < childTupleRefs.size(); ++i)
+          order[i] = i;
+        llvm::sort(order, [&](unsigned a, unsigned b) {
+          return childTupleRefs[a].callerByteBegin > childTupleRefs[b].callerByteBegin;
+        });
+
+        bool changed = false;
+        for (unsigned idx : order) {
+          const auto &pair = childArgs[idx];
+          StringRef oldChildText = pair.second.trim();
+          auto it = newTextByOld.find(oldChildText);
+          if (it == newTextByOld.end())
+            continue;
+          const auto &ref = childTupleRefs[idx];
+          rebuilt = stringutils::replaceRange(rebuilt, ref.callerByteBegin,
+                                              ref.callerByteEnd, it->second);
+          if (it->second != oldChildText)
+            changed = true;
+        }
+
+        if (!changed)
+          return false;
+
+        trace("macro/tuple",
+              "tuple-forward rebuilt root id={0} name={1} argIdx={2} parentTrim='{3}' rebuilt='{4}' tupleRefs={5}",
+              m.id, m.name, callerArgIdx,
+              stringutils::showWSWithClip(parentTrim, 200),
+              stringutils::showWSWithClip(rebuilt, 200),
+              formatTupleRefs(childTupleRefs));
+        outNewArg = StringRef(rebuilt).trim().str();
+        trace("macro/args",
+              "    tuple-forwarded rewrite accepted for root id={0} name={1} argIdx={2} childId={3} childName={4} baseArg='{5}' newArg='{6}'",
+              m.id, m.name, callerArgIdx, tupleChild->id, tupleChild->name,
+              stringutils::showWSWithClip(baseArgText, 200),
+              stringutils::showWSWithClip(outNewArg, 200));
+        return true;
+      };
+
+  auto delimiterBalance = [&](StringRef s) {
+    struct Balance {
+      int paren = 0;
+      int bracket = 0;
+      int brace = 0;
+    } bal;
+    for (char c : s) {
+      switch (c) {
+      case '(':
+        ++bal.paren;
+        break;
+      case ')':
+        --bal.paren;
+        break;
+      case '[':
+        ++bal.bracket;
+        break;
+      case ']':
+        --bal.bracket;
+        break;
+      case '{':
+        ++bal.brace;
+        break;
+      case '}':
+        --bal.brace;
+        break;
+      default:
+        break;
+      }
+    }
+    return bal;
+  };
+
+  auto maybeExtendRightBoundaryClosers =
+      [&](const RefoldModel::PPArgSpan &sp,
+          std::pair<size_t, size_t> env,
+          StringRef oldText) -> std::pair<size_t, size_t> {
+        StringRef curText = SliceBSource(env.first, env.second).trim();
+        auto oldBal = delimiterBalance(oldText);
+        auto newBal = delimiterBalance(curText);
+
+        int needParen = std::max(0, newBal.paren - oldBal.paren);
+        int needBracket = std::max(0, newBal.bracket - oldBal.bracket);
+        int needBrace = std::max(0, newBal.brace - oldBal.brace);
+        if (needParen == 0 && needBracket == 0 && needBrace == 0)
+          return env;
+
+        uint64_t aPos = sp.end;
+        size_t bPos = env.second;
+        while ((needParen > 0 || needBracket > 0 || needBrace > 0) &&
+               aPos < aToks_.size() && bPos < bToks_.size()) {
+          StringRef aTok = aToks_[static_cast<size_t>(aPos)].spelling;
+          StringRef bTok = bToks_[bPos].spelling;
+          if (aTok != bTok)
+            break;
+
+          if (aTok == ")" && needParen > 0) {
+            --needParen;
+            ++aPos;
+            ++bPos;
+            env.second = bPos;
+            continue;
+          }
+          if (aTok == "]" && needBracket > 0) {
+            --needBracket;
+            ++aPos;
+            ++bPos;
+            env.second = bPos;
+            continue;
+          }
+          if (aTok == "}" && needBrace > 0) {
+            --needBrace;
+            ++aPos;
+            ++bPos;
+            env.second = bPos;
+            continue;
+          }
+          break;
+        }
+        return env;
+      };
+
   // Compute argument replacements implied by each touched occurrence. Multiple
   // occurrences of the same argIdx must imply the exact same replacement,
   // otherwise the macro cannot be refolded args-only.
   DenseMap<uint32_t, std::string> replByArgIdx;
-  for (size_t i = 0; i < occs.size(); ++i) {
-    const auto &sp = occs[i];
-    uint32_t argIdx = sp.argIdx;
-    if (argIdx >= touched.size() || !touched[argIdx])
+  SmallVector<uint32_t, 8> touchedArgIdxs;
+  for (const auto &sp : occs) {
+    if (sp.argIdx >= touched.size() || !touched[sp.argIdx])
       continue;
+    if (!llvm::is_contained(touchedArgIdxs, sp.argIdx))
+      touchedArgIdxs.push_back(sp.argIdx);
+  }
 
+  for (uint32_t argIdx : touchedArgIdxs) {
     if (static_cast<size_t>(argIdx) >= invArgRanges.size())
       return std::nullopt;
 
-    // Base spelling for this argument in the invocation text (used for splice
-    // and consistency).
     auto r0 = invArgRanges[argIdx];
     StringRef baseArgText = baseInvText.substr(r0.first, r0.second - r0.first);
 
-    // Map the A occurrence envelope to B using byte-level hunks derived from
-    // the global alignment. This leverages producer-provided pp_byte_begin/
-    // pp_byte_end when present and falls back to consumer token offsets
-    // otherwise.
-    auto bEnv = MapAToBTokenEnvelopeByPPArgSpan(sp);
-    if (!bEnv) {
-      // Conservative fallback: use the hunk's B range if the span mapping
-      // fails. If the hunk doesn't have a valid B range either, we cannot
-      // safely derive an args-only replacement.
-      if (h.bStart >= h.bEnd)
-        return std::nullopt;
-      bEnv = {static_cast<size_t>(h.bStart), static_cast<size_t>(h.bEnd)};
-    }
+    SmallVector<OccObservation, 8> occObservations;
+    std::optional<std::string> unifiedNewArg;
+    bool needTupleFallback = false;
 
-    // Extend the mapped B envelope using every hunk that touches this touched
-    // formal, not just the current hunk. This is required for repeated
-    // occurrences where one logical replacement is split across multiple
-    // hunks (for example, a leading insertion plus a token replacement).
-    if (bEnv) {
-      size_t e0 = bEnv->first;
-      size_t e1 = bEnv->second;
-      for (const auto &candH : tokenHunks) {
-        if (auto owned =
-                GetOwnedPureInsertionBRangeForArgSpan(sp, occs, *bEnv, candH)) {
-          const size_t insB0 = owned->first;
-          const size_t insB1 = owned->second;
-          if (!(insB1 < e0 || e1 < insB0)) {
-            e0 = std::min(e0, insB0);
-            e1 = std::max(e1, insB1);
+    for (size_t i = 0; i < occs.size(); ++i) {
+      const auto &sp = occs[i];
+      if (sp.argIdx != argIdx)
+        continue;
+
+      auto bEnv = MapAToBTokenEnvelopeByPPArgSpan(sp);
+      if (!bEnv) {
+        if (h.bStart >= h.bEnd)
+          return std::nullopt;
+        bEnv = {static_cast<size_t>(h.bStart), static_cast<size_t>(h.bEnd)};
+      }
+
+      if (bEnv) {
+        size_t e0 = bEnv->first;
+        size_t e1 = bEnv->second;
+        for (const auto &candH : tokenHunks) {
+          if (auto owned =
+                  GetOwnedPureInsertionBRangeForArgSpan(sp, occs, *bEnv, candH)) {
+            const size_t insB0 = owned->first;
+            const size_t insB1 = owned->second;
+            if (!(insB1 < e0 || e1 < insB0)) {
+              e0 = std::min(e0, insB0);
+              e1 = std::max(e1, insB1);
+            }
+            continue;
           }
-          continue;
+
+          if (candH.aStart == candH.aEnd)
+            continue;
+          if (candH.aStart < sp.end && candH.aEnd > sp.begin &&
+              candH.bStart < candH.bEnd) {
+            e0 = std::min(e0, static_cast<size_t>(candH.bStart));
+            e1 = std::max(e1, static_cast<size_t>(candH.bEnd));
+          }
         }
 
-        if (candH.aStart == candH.aEnd)
-          continue;
-        if (candH.aStart < sp.end && candH.aEnd > sp.begin &&
-            candH.bStart < candH.bEnd) {
-          e0 = std::min(e0, static_cast<size_t>(candH.bStart));
-          e1 = std::max(e1, static_cast<size_t>(candH.bEnd));
+        if (e0 != bEnv->first || e1 != bEnv->second) {
+          trace("macro/args",
+                "  extend env with touched-formal hunks: argIdx={0} env=[{1},{2}) -> [{3},{4})",
+                static_cast<size_t>(argIdx), bEnv->first, bEnv->second, e0, e1);
+          bEnv = std::make_pair(e0, e1);
         }
       }
 
-      if (e0 != bEnv->first || e1 != bEnv->second) {
-        trace("macro/args",
-              "  extend env with touched-formal hunks: argIdx={0} env=[{1},{2}) -> [{3},{4})",
-              static_cast<size_t>(argIdx), bEnv->first, bEnv->second, e0, e1);
-        bEnv = std::make_pair(e0, e1);
-      }
-    }
-
-    // Slice the edited text from B corresponding to this occurrence and treat
-    // it as the candidate replacement for the argument (subject to stringify
-    // decoding and paste lifting below).
-    StringRef bSlice = SliceBSource(bEnv->first, bEnv->second).trim();
-    std::string newArg = bSlice.str();
-
-    // For stringify occurrences, the B slice is a string literal; decode it
-    // back into the argument text that would produce that literal via string-
-    // ification.
-    if (occIsStringify[i]) {
-      auto un = UnstringifyLiteralToArgText(bSlice, isVariadicFormal(argIdx));
-      if (!un)
-        return std::nullopt;
-
-      auto canon = CanonicalizeStringifyInversePayload(*un);
-      if (!canon || StringRef(*canon).trim() != StringRef(*un).trim()) {
-        trace("macro/args",
-              "    stringify inverse ambiguous for argIdx={0} payload='{1}'",
-              argIdx, stringutils::showWSWithClip(*un, 200));
-        return std::nullopt;
+      StringRef oldText = SliceASource(sp.begin, sp.end).trim();
+      if (sp.kind == PPArgSpanKind::Standard) {
+        auto grownEnv = maybeExtendRightBoundaryClosers(sp, *bEnv, oldText);
+        if (grownEnv.second != bEnv->second) {
+          trace("macro/args",
+                "  extend env with stable right closers: argIdx={0} env=[{1},{2}) -> [{3},{4}) old='{5}'",
+                static_cast<size_t>(argIdx), bEnv->first, bEnv->second,
+                grownEnv.first, grownEnv.second,
+                stringutils::showWSWithClip(oldText, 120));
+          bEnv = grownEnv;
+        }
       }
 
-      // The decoded payload itself still has to be canonical, but the source
-      // spelling of the original argument does not. This preserves valid
-      // refolds such as S(a /*c*/ + b) -> S(a - b), where comments/spacing in
-      // the original raw argument should not block reconstruction from a
-      // canonical stringified payload.
-      newArg = std::move(*canon);
+      StringRef bSlice = SliceBSource(bEnv->first, bEnv->second).trim();
+      std::string newArg = bSlice.str();
+
+      if (occIsStringify[i]) {
+        auto un = UnstringifyLiteralToArgText(bSlice, isVariadicFormal(argIdx));
+        if (!un)
+          return std::nullopt;
+
+        auto canon = CanonicalizeStringifyInversePayload(*un);
+        if (!canon || StringRef(*canon).trim() != StringRef(*un).trim()) {
+          trace("macro/args",
+                "    stringify inverse ambiguous for argIdx={0} payload='{1}'",
+                argIdx, stringutils::showWSWithClip(*un, 200));
+          return std::nullopt;
+        }
+        newArg = std::move(*canon);
+        auto oldUn = UnstringifyLiteralToArgText(oldText, true);
+        if (oldUn)
+          oldText = StringRef(*oldUn).trim();
+      }
+
+      if (!occIsStringify[i] && !m.pasteSpans.empty()) {
+        bool argHasPaste = false;
+        for (const auto &ps : m.pasteSpans) {
+          if (ps.argIdx == argIdx) {
+            argHasPaste = true;
+            break;
+          }
+        }
+
+        if (argHasPaste) {
+          StringRef aSlice = SliceASource(sp.begin, sp.end).trim();
+          if (!aSlice.empty()) {
+            size_t pos = baseArgText.find(aSlice);
+            if (pos != StringRef::npos) {
+              std::string cand = baseArgText.substr(0, pos).str() + bSlice.str() +
+                                 baseArgText.substr(pos + aSlice.size()).str();
+              newArg = StringRef(cand).trim().str();
+              trace("macro/args",
+                    "    lift/paste argIdx={0} baseArg={1} aSlice={2} bSlice={3} -> newArg={4}",
+                    argIdx, stringutils::showWSWithClip(baseArgText, 200),
+                    stringutils::showWSWithClip(aSlice, 200),
+                    stringutils::showWSWithClip(bSlice, 200),
+                    stringutils::showWSWithClip(newArg, 200));
+            } else {
+              trace("macro/args",
+                    "    lift/paste FAILED argIdx={0} baseArg={1} aSlice={2} bSlice={3}",
+                    argIdx, stringutils::showWS(baseArgText),
+                    stringutils::showWS(aSlice), stringutils::showWS(bSlice));
+            }
+          }
+        }
+      }
+
+      occObservations.push_back(OccObservation{oldText, newArg});
+      if (!unifiedNewArg)
+        unifiedNewArg = newArg;
+      else if (*unifiedNewArg != newArg)
+        needTupleFallback = true;
     }
 
-    // Optional lift/paste rewrite: when an argument participates in token
-    // pasting, the direct B slice might reflect only the pasted contribution
-    // rather than the full argument spelling. In that case, attempt to replace
-    // only the A occurrence slice within the base argument spelling.
-    if (!occIsStringify[i] && !m.pasteSpans.empty()) {
-      bool argHasPaste = false;
-      for (const auto &ps : m.pasteSpans) {
-        if (ps.argIdx == argIdx) {
-          argHasPaste = true;
+    std::string finalNewArg;
+    bool tupleForwarded = false;
+    if (needTupleFallback) {
+      if (!tryTupleForwardedCallerTupleRewrite(argIdx, baseArgText,
+                                               occObservations, finalNewArg)) {
+        return std::nullopt;
+      }
+      tupleForwarded = true;
+    } else if (unifiedNewArg) {
+      finalNewArg = *unifiedNewArg;
+    } else {
+      continue;
+    }
+
+    if (!isVariadicFormal(argIdx) && hasTopLevelComma(finalNewArg))
+      return std::nullopt;
+
+    auto tupleSliceConsistencyMatchesAllOccurrencesInB = [&]() -> bool {
+      llvm::StringMap<std::string> newTextByOld;
+      for (const auto &obs : occObservations) {
+        StringRef oldKey = StringRef(obs.oldText).trim();
+        StringRef newVal = StringRef(obs.newText).trim();
+        auto it = newTextByOld.find(oldKey);
+        if (it == newTextByOld.end()) {
+          newTextByOld[oldKey] = newVal.str();
+          continue;
+        }
+        if (StringRef(it->second).trim() != newVal)
+          return false;
+      }
+
+      for (const auto &s : m.argSpans) {
+        if (s.argIdx != argIdx || s.kind != PPArgSpanKind::Standard)
+          continue;
+        StringRef oldSlice = SliceASource(s.begin, s.end).trim();
+        auto expectedIt = newTextByOld.find(oldSlice);
+        if (expectedIt == newTextByOld.end())
+          return false;
+
+        auto bEnv = MapAToBTokenEnvelopeByPPArgSpan(s);
+        if (!bEnv)
+          return false;
+
+        size_t lo = bEnv->first;
+        size_t hi = bEnv->second;
+        for (const auto &hk : tokenHunks) {
+          if (auto owned = GetOwnedPureInsertionBRangeForArgSpan(s, m.argSpans,
+                                                                 *bEnv, hk)) {
+            lo = std::min(lo, owned->first);
+            hi = std::max(hi, owned->second);
+            continue;
+          }
+          if (hk.aStart == hk.aEnd)
+            continue;
+          if (hk.aStart < s.end && hk.aEnd > s.begin && hk.bStart < hk.bEnd) {
+            lo = static_cast<size_t>(std::min<uint64_t>(lo, hk.bStart));
+            hi = static_cast<size_t>(std::max<uint64_t>(hi, hk.bEnd));
+          }
+        }
+
+        if (s.kind == PPArgSpanKind::Standard) {
+          auto grownEnv = maybeExtendRightBoundaryClosers(
+              s, std::make_pair(lo, hi), oldSlice);
+          lo = grownEnv.first;
+          hi = grownEnv.second;
+        }
+
+        StringRef tokText = SliceBSource(lo, hi).trim();
+        if (tokText != StringRef(expectedIt->second).trim())
+          return false;
+      }
+      return true;
+    };
+
+    if (!(tupleForwarded
+              ? tupleSliceConsistencyMatchesAllOccurrencesInB()
+              : MacroArgReplacementMatchesAllOccurrencesInB(
+                    m, argIdx, baseArgText, finalNewArg, tokenHunks))) {
+      bool hasTupleChildForArg = false;
+      for (const auto &cand : model_.GetMacroInvocations()) {
+        if (!cand.callerMacroId || *cand.callerMacroId != m.id)
+          continue;
+        if (cand.argTupleRefs.empty())
+          continue;
+        for (const auto &refs : cand.argTupleRefs) {
+          for (const auto &ref : refs) {
+            if (ref.callerParamIndex == argIdx) {
+              hasTupleChildForArg = true;
+              break;
+            }
+          }
+          if (hasTupleChildForArg)
+            break;
+        }
+        if (hasTupleChildForArg)
           break;
-        }
       }
-
-      if (argHasPaste) {
-        StringRef aSlice = SliceASource(sp.begin, sp.end).trim();
-        if (!aSlice.empty()) {
-          size_t pos = baseArgText.find(aSlice);
-          if (pos != StringRef::npos) {
-            std::string cand = baseArgText.substr(0, pos).str() + bSlice.str() +
-                               baseArgText.substr(pos + aSlice.size()).str();
-            newArg = StringRef(cand).trim().str();
-            trace("macro/args",
-                  "    lift/paste argIdx={0} baseArg={1} aSlice={2} bSlice={3} "
-                  "-> newArg={4}",
-                  argIdx, stringutils::showWSWithClip(baseArgText, 200),
-                  stringutils::showWSWithClip(aSlice, 200),
-                  stringutils::showWSWithClip(bSlice, 200),
-                  stringutils::showWSWithClip(newArg, 200));
-          } else {
-            trace("macro/args",
-                  "    lift/paste FAILED argIdx={0} baseArg={1} aSlice={2} "
-                  "bSlice={3}",
-                  argIdx, stringutils::showWS(baseArgText),
-                  stringutils::showWS(aSlice), stringutils::showWS(bSlice));
+      trace("macro/args",
+            "    consistency check FAILED for argIdx={0} newArg='{1}' -> expand",
+            argIdx, stringutils::showWSWithClip(finalNewArg, 200));
+      if (hasTupleChildForArg) {
+        trace("macro/tuple",
+              "tuple-forward consistency failure root id={0} name={1} argIdx={2} baseArg='{3}' newArg='{4}' tokenHunks={5}",
+              m.id, m.name, argIdx,
+              stringutils::showWSWithClip(baseArgText, 200),
+              stringutils::showWSWithClip(finalNewArg, 200),
+              formatHunkList(tokenHunksForTouchedFormals));
+        for (const auto &s : m.argSpans) {
+          if (s.argIdx != argIdx || s.kind != PPArgSpanKind::Standard)
+            continue;
+          auto bEnv = MapAToBTokenEnvelopeByPPArgSpan(s);
+          if (!bEnv) {
+            trace("macro/tuple",
+                  "  standard occurrence has no B envelope root id={0} name={1} argIdx={2} occA=[{3},{4})",
+                  m.id, m.name, argIdx, s.begin, s.end);
+            continue;
           }
+          size_t lo = bEnv->first;
+          size_t hi = bEnv->second;
+          SmallVector<std::string, 8> hunkEffects;
+          for (const auto &hk : tokenHunks) {
+            if (auto owned = GetOwnedPureInsertionBRangeForArgSpan(s, m.argSpans, *bEnv, hk)) {
+              hunkEffects.push_back(formatv("owned {0} -> [{1},{2}) '{3}'", hk.ToString(), owned->first, owned->second, stringutils::showWSWithClip(SliceBSource(owned->first, owned->second), 80)).str());
+              lo = std::min(lo, owned->first);
+              hi = std::max(hi, owned->second);
+              continue;
+            }
+            bool touches = false;
+            if (hk.aStart != hk.aEnd)
+              touches = (hk.aStart < s.end && hk.aEnd > s.begin);
+            if (touches && hk.bStart < hk.bEnd) {
+              hunkEffects.push_back(formatv("overlap {0} -> [{1},{2}) '{3}'", hk.ToString(), (uint64_t)hk.bStart, (uint64_t)hk.bEnd, stringutils::showWSWithClip(SliceBSource(hk.bStart, hk.bEnd), 80)).str());
+              lo = static_cast<size_t>(std::min<uint64_t>(lo, hk.bStart));
+              hi = static_cast<size_t>(std::max<uint64_t>(hi, hk.bEnd));
+            } else {
+              hunkEffects.push_back(formatv("ignored {0}", hk.ToString()).str());
+            }
+          }
+          StringRef tokText = SliceBSource(lo, hi).trim();
+          trace("macro/tuple",
+                "  standard occurrence root id={0} name={1} argIdx={2} occA=[{3},{4}) aSlice='{5}' baseEnv=[{6},{7}) extended=[{8},{9}) tok='{10}' expectedFull='{11}' hunkEffects={12}",
+                m.id, m.name, argIdx, s.begin, s.end,
+                stringutils::showWSWithClip(SliceASource(s.begin, s.end), 120),
+                bEnv->first, bEnv->second, lo, hi,
+                stringutils::showWSWithClip(tokText, 120),
+                stringutils::showWSWithClip(StringRef(finalNewArg).trim(), 120),
+                llvm::join(hunkEffects, " | "));
         }
       }
-    }
-
-    // For non-variadic formals, reject replacements that would introduce
-    // additional top-level commas in the invocation spelling (which would
-    // change the invocation's arity).
-    if (!isVariadicFormal(argIdx) && hasTopLevelComma(newArg))
-      return std::nullopt;
-
-    // If we've already derived a replacement for this argument index, it must
-    // match exactly.
-    if (replByArgIdx.count(argIdx) && replByArgIdx[argIdx] != newArg)
-      return std::nullopt;
-
-    // Final safety gate for this argument: verify that the candidate replace-
-    // ment reproduces all occurrences for argIdx in B, respecting strict/non-
-    // strict stringify policy and paste behavior.
-    if (!MacroArgReplacementMatchesAllOccurrencesInB(m, argIdx, baseArgText,
-                                                     newArg, tokenHunks)) {
-      trace(
-          "macro/args",
-          "    consistency check FAILED for argIdx={0} newArg='{1}' -> expand",
-          argIdx, stringutils::showWSWithClip(newArg, 200));
       return std::nullopt;
     }
 
     trace("macro/args", "    consistency OK for argIdx={0}", argIdx);
-    replByArgIdx[argIdx] = std::move(newArg);
+    replByArgIdx[argIdx] = std::move(finalNewArg);
   }
 
   // If nothing required replacement, there is no meaningful args-only patch to
