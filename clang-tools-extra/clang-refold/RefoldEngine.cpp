@@ -82,6 +82,7 @@
 #include <filesystem>
 #include <functional>
 #include <limits>
+#include <map>
 #include <memory>
 #include <tuple>
 
@@ -248,6 +249,45 @@ struct PasteRunInvertibilityCertificate {
   std::vector<std::string> derivedSegs;
 };
 
+static PasteRunInvertibilityCertificate prependDerivedSegment(
+    PasteRunInvertibilityCertificate cert, StringRef seg) {
+  if (cert.kind != PasteRunInvertibilityKind::Unique)
+    return cert;
+
+  cert.derivedSegs.insert(cert.derivedSegs.begin(), seg.str());
+  return cert;
+}
+
+static PasteRunInvertibilityCertificate mergePasteRunCertificates(
+    PasteRunInvertibilityCertificate lhs,
+    const PasteRunInvertibilityCertificate &rhs) {
+  if (lhs.kind == PasteRunInvertibilityKind::Unsupported ||
+      rhs.kind == PasteRunInvertibilityKind::Unsupported) {
+    lhs.kind = PasteRunInvertibilityKind::Unsupported;
+    lhs.derivedSegs.clear();
+    return lhs;
+  }
+
+  if (rhs.kind == PasteRunInvertibilityKind::NoMatch)
+    return lhs;
+  if (lhs.kind == PasteRunInvertibilityKind::NoMatch)
+    return rhs;
+
+  if (lhs.kind == PasteRunInvertibilityKind::Ambiguous ||
+      rhs.kind == PasteRunInvertibilityKind::Ambiguous) {
+    lhs.kind = PasteRunInvertibilityKind::Ambiguous;
+    lhs.derivedSegs.clear();
+    return lhs;
+  }
+
+  if (lhs.derivedSegs == rhs.derivedSegs)
+    return lhs;
+
+  lhs.kind = PasteRunInvertibilityKind::Ambiguous;
+  lhs.derivedSegs.clear();
+  return lhs;
+}
+
 static PasteRunInvertibilityCertificate
 buildAdjacentPasteRunInvertibilityCertificate(
     StringRef aTok, StringRef bRun,
@@ -258,8 +298,6 @@ buildAdjacentPasteRunInvertibilityCertificate(
 
   std::vector<std::string> oldSegs;
   oldSegs.reserve(runSpans.size());
-  std::string oldRun;
-  oldRun.reserve(aTok.size());
 
   std::optional<uint32_t> prevEnd;
   for (const auto *ps : runSpans) {
@@ -274,93 +312,99 @@ buildAdjacentPasteRunInvertibilityCertificate(
         aTok.substr(static_cast<size_t>(*ps->byteBegin),
                     static_cast<size_t>(*ps->byteEnd - *ps->byteBegin));
     oldSegs.push_back(oldSeg.str());
-    oldRun += oldSeg;
     prevEnd = *ps->byteEnd;
   }
 
-  SmallVector<std::vector<std::string>, 4> candidates;
-  auto addCandidate = [&](std::vector<std::string> segs) {
-    for (const auto &existing : candidates)
-      if (existing == segs)
-        return;
-    candidates.push_back(std::move(segs));
-  };
+  using MemoKey = std::tuple<size_t, size_t, bool>;
+  std::map<MemoKey, PasteRunInvertibilityCertificate> memo;
 
   // A contiguous ## run is invertible when its edited B spelling can be split
   // into per-segment spellings such that every changed segment is isolated by
   // unchanged neighbors (or a run edge). Adjacent edited segments in the same
   // undelimited run are treated as ambiguous because no internal anchor pins
   // their boundary.
-  SmallVector<std::string, 8> curSegs(oldSegs.begin(), oldSegs.end());
   auto solveRun = [&](auto &&self, size_t idx, size_t pos,
-                      bool prevChanged) -> void {
-    if (candidates.size() > 1 || pos > bRun.size())
-      return;
+                      bool prevChanged)
+      -> PasteRunInvertibilityCertificate {
+    MemoKey key{idx, pos, prevChanged};
+    auto it = memo.find(key);
+    if (it != memo.end())
+      return it->second;
+
+    PasteRunInvertibilityCertificate result;
+    result.kind = PasteRunInvertibilityKind::NoMatch;
+
+    if (pos > bRun.size()) {
+      memo.emplace(key, result);
+      return result;
+    }
 
     if (idx == oldSegs.size()) {
       if (pos == bRun.size())
-        addCandidate(std::vector<std::string>(curSegs.begin(), curSegs.end()));
-      return;
+        result.kind = PasteRunInvertibilityKind::Unique;
+      memo.emplace(key, result);
+      return result;
     }
 
     StringRef oldSeg = oldSegs[idx];
+    StringRef rest = bRun.drop_front(pos);
 
-    auto tryUnchanged = [&]() {
-      if (!bRun.drop_front(pos).starts_with(oldSeg))
-        return;
-      curSegs[idx] = oldSeg;
-      self(self, idx + 1, pos + oldSeg.size(), /*prevChanged=*/false);
-    };
-
-    if (prevChanged) {
-      tryUnchanged();
-      return;
+    if (rest.starts_with(oldSeg)) {
+      PasteRunInvertibilityCertificate unchanged =
+          prependDerivedSegment(
+              self(self, idx + 1, pos + oldSeg.size(), /*prevChanged=*/false),
+              oldSeg);
+      result = mergePasteRunCertificates(std::move(result), unchanged);
+      if (result.kind == PasteRunInvertibilityKind::Unsupported ||
+          result.kind == PasteRunInvertibilityKind::Ambiguous) {
+        memo.emplace(key, result);
+        return result;
+      }
     }
 
-    tryUnchanged();
+    if (prevChanged) {
+      memo.emplace(key, result);
+      return result;
+    }
 
     // Current segment edited. The next segment, if any, must remain unchanged
     // and therefore acts as the first available anchor for the edited piece.
     if (idx + 1 == oldSegs.size()) {
-      curSegs[idx] = bRun.drop_front(pos).str();
-      self(self, idx + 1, bRun.size(), /*prevChanged=*/true);
-      return;
+      PasteRunInvertibilityCertificate changed;
+      changed.kind = PasteRunInvertibilityKind::Unique;
+      changed.derivedSegs.push_back(rest.str());
+      result = mergePasteRunCertificates(std::move(result), changed);
+      memo.emplace(key, result);
+      return result;
     }
 
     StringRef nextAnchor = oldSegs[idx + 1];
     if (nextAnchor.empty()) {
-      cert.kind = PasteRunInvertibilityKind::Unsupported;
-      return;
+      result.kind = PasteRunInvertibilityKind::Unsupported;
+      result.derivedSegs.clear();
+      memo.emplace(key, result);
+      return result;
     }
 
-    StringRef rest = bRun.drop_front(pos);
     for (size_t searchPos = 0;; ++searchPos) {
       size_t found = rest.find(nextAnchor, searchPos);
       if (found == StringRef::npos)
         break;
-      curSegs[idx] = rest.take_front(found).str();
-      self(self, idx + 1, pos + found, /*prevChanged=*/true);
-      if (candidates.size() > 1)
-        return;
+
+      PasteRunInvertibilityCertificate changed = prependDerivedSegment(
+          self(self, idx + 1, pos + found, /*prevChanged=*/true),
+          rest.take_front(found));
+      result = mergePasteRunCertificates(std::move(result), changed);
+      if (result.kind == PasteRunInvertibilityKind::Unsupported ||
+          result.kind == PasteRunInvertibilityKind::Ambiguous)
+        break;
     }
+
+    memo.emplace(key, result);
+    return result;
   };
 
-  solveRun(solveRun, 0, 0, /*prevChanged=*/false);
-
-  if (cert.kind == PasteRunInvertibilityKind::Unsupported)
-    return cert;
-  if (candidates.empty()) {
-    cert.kind = PasteRunInvertibilityKind::NoMatch;
-    return cert;
-  }
-  if (candidates.size() > 1) {
-    cert.kind = PasteRunInvertibilityKind::Ambiguous;
-    return cert;
-  }
-
-  cert.kind = PasteRunInvertibilityKind::Unique;
-  cert.derivedSegs = std::move(candidates.front());
-  return cert;
+  return solveRun(solveRun, 0, 0, /*prevChanged=*/false);
 }
 
 /// Return true iff \p replacement has the exact chained-call shape
@@ -4009,128 +4053,142 @@ RefoldEngine::SegmentPastedTokenArgsByFixedSlices(
       return std::nullopt;
   }
 
-  // Initialize the output vector with empty strings.
-  std::vector<std::string> out(spansAsc.size());
+  using MemoKey = std::pair<size_t, size_t>;
+  std::map<MemoKey, std::optional<std::vector<std::string>>> memo;
 
-  // Call the recursive worker.
-  if (!SegmentPastedTokenArgsByFixedSlicesRec(aTok, bTok, spansAsc,
-                                              /*idx*/ 0, /*posA*/ 0,
-                                              /*posB*/ 0, out)) {
+  auto solve = [&](auto &&self, size_t idx,
+                   size_t posB) -> std::optional<std::vector<std::string>> {
+    MemoKey key{idx, posB};
+    auto it = memo.find(key);
+    if (it != memo.end())
+      return it->second;
+
+    size_t posA = 0;
+    if (idx > 0) {
+      if (!spansAsc[idx - 1]->byteEnd) {
+        memo.emplace(key, std::nullopt);
+        return std::nullopt;
+      }
+      posA = static_cast<size_t>(*spansAsc[idx - 1]->byteEnd);
+    }
+
+    if (idx >= spansAsc.size()) {
+      StringRef tail = aTok.substr(posA);
+      std::optional<std::vector<std::string>> result =
+          (bTok.substr(posB) == tail) ? std::optional<std::vector<std::string>>
+                                          (std::vector<std::string>())
+                                      : std::nullopt;
+      memo.emplace(key, result);
+      return result;
+    }
+
+    const auto *ps = spansAsc[idx];
+    if (!ps->byteBegin || !ps->byteEnd || *ps->byteEnd < *ps->byteBegin) {
+      memo.emplace(key, std::nullopt);
+      return std::nullopt;
+    }
+
+    const size_t bA = static_cast<size_t>(*ps->byteBegin);
+    const size_t eA = static_cast<size_t>(*ps->byteEnd);
+    if (bA < posA) {
+      memo.emplace(key, std::nullopt);
+      return std::nullopt;
+    }
+
+    StringRef fixedBefore = aTok.substr(posA, bA - posA);
+    if (!bTok.substr(posB).starts_with(fixedBefore)) {
+      memo.emplace(key, std::nullopt);
+      return std::nullopt;
+    }
+
+    const size_t runStartB = posB + fixedBefore.size();
+
+    size_t runEnd = idx;
+    size_t nextPosA = eA;
+    StringRef fixedAfter;
+    while (true) {
+      if (runEnd + 1 >= spansAsc.size()) {
+        fixedAfter = aTok.substr(nextPosA);
+        break;
+      }
+
+      const auto *cur = spansAsc[runEnd];
+      const auto *next = spansAsc[runEnd + 1];
+      if (!cur->byteEnd || !next->byteBegin ||
+          *next->byteBegin < *cur->byteEnd) {
+        memo.emplace(key, std::nullopt);
+        return std::nullopt;
+      }
+
+      StringRef gap =
+          aTok.substr(static_cast<size_t>(*cur->byteEnd),
+                      static_cast<size_t>(*next->byteBegin - *cur->byteEnd));
+      if (!gap.empty()) {
+        fixedAfter = gap;
+        break;
+      }
+
+      ++runEnd;
+      if (!spansAsc[runEnd]->byteEnd) {
+        memo.emplace(key, std::nullopt);
+        return std::nullopt;
+      }
+      nextPosA = static_cast<size_t>(*spansAsc[runEnd]->byteEnd);
+    }
+
+    auto tryRun = [&](size_t runEndB) -> std::optional<std::vector<std::string>> {
+      if (runEndB < runStartB || runEndB > bTok.size())
+        return std::nullopt;
+
+      auto cert = buildAdjacentPasteRunInvertibilityCertificate(
+          aTok, bTok.substr(runStartB, runEndB - runStartB),
+          spansAsc.slice(idx, runEnd - idx + 1));
+      if (cert.kind == PasteRunInvertibilityKind::Unique &&
+          cert.derivedSegs.size() == runEnd - idx + 1) {
+        if (auto suffix = self(self, runEnd + 1, runEndB)) {
+          std::vector<std::string> combined = cert.derivedSegs;
+          combined.insert(combined.end(), suffix->begin(), suffix->end());
+          return combined;
+        }
+      }
+
+      // Legacy single-span fallback: when the current run contains only one
+      // argument contribution, the fixed slices on either side already pin the
+      // segment boundary. The newer adjacent-run certificate is stricter, but
+      // some pure-paste cases (e.g. CONCAT-style token assembly) are still
+      // structurally invertible via this simpler anchor-based split.
+      if (runEnd == idx) {
+        if (auto suffix = self(self, idx + 1, runEndB)) {
+          std::vector<std::string> combined;
+          combined.reserve(1 + suffix->size());
+          combined.push_back(bTok.substr(runStartB, runEndB - runStartB).str());
+          combined.insert(combined.end(), suffix->begin(), suffix->end());
+          return combined;
+        }
+      }
+
+      return std::nullopt;
+    };
+
+    if (fixedAfter.empty()) {
+      auto result = tryRun(bTok.size());
+      memo.emplace(key, result);
+      return result;
+    }
+
+    for (size_t k = bTok.find(fixedAfter, runStartB); k != StringRef::npos;
+         k = bTok.find(fixedAfter, k + 1)) {
+      if (auto result = tryRun(k)) {
+        memo.emplace(key, result);
+        return result;
+      }
+    }
+
+    memo.emplace(key, std::nullopt);
     return std::nullopt;
-  }
-
-  return out;
-}
-
-bool RefoldEngine::SegmentPastedTokenArgsByFixedSlicesRec(
-    StringRef aTok, StringRef bTok,
-    ArrayRef<const RefoldModel::PPArgSpan *> spansAsc, size_t idx, size_t posA,
-    size_t posB, MutableArrayRef<std::string> out) {
-  // 1. Base Case: All spans processed
-  if (idx >= spansAsc.size()) {
-    // All spans emitted; remaining fixed tail must match exactly.
-    StringRef tail = aTok.substr(posA);
-    return bTok.substr(posB) == tail;
-  }
-
-  const auto *ps = spansAsc[idx];
-
-  // 2. Validate Optionals and Range Consistency
-  if (!ps->byteBegin || !ps->byteEnd || *ps->byteEnd < *ps->byteBegin)
-    return false;
-
-  const size_t bA = static_cast<size_t>(*ps->byteBegin);
-  const size_t eA = static_cast<size_t>(*ps->byteEnd);
-
-  // Ensure current span doesn't overlap backwards into previously processed A
-  // text
-  if (bA < posA)
-    return false;
-
-  // 3. Match the fixed text that appears before this pasted-argument run.
-  StringRef fixedBefore = aTok.substr(posA, bA - posA);
-  if (!bTok.substr(posB).starts_with(fixedBefore))
-    return false;
-
-  const size_t runStartB = posB + fixedBefore.size();
-
-  // 4. Determine the maximal adjacent-span run beginning at idx. Internal
-  // empty gaps correspond to touching pasted contributions; they remain
-  // invertible only while unchanged neighboring segments still pin the
-  // boundaries.
-  size_t runEnd = idx;
-  size_t nextPosA = eA;
-  StringRef fixedAfter;
-  while (true) {
-    if (runEnd + 1 >= spansAsc.size()) {
-      fixedAfter = aTok.substr(nextPosA);
-      break;
-    }
-
-    const auto *cur = spansAsc[runEnd];
-    const auto *next = spansAsc[runEnd + 1];
-    if (!cur->byteEnd || !next->byteBegin || *next->byteBegin < *cur->byteEnd)
-      return false;
-
-    StringRef gap =
-        aTok.substr(static_cast<size_t>(*cur->byteEnd),
-                    static_cast<size_t>(*next->byteBegin - *cur->byteEnd));
-    if (!gap.empty()) {
-      fixedAfter = gap;
-      break;
-    }
-
-    ++runEnd;
-    if (!spansAsc[runEnd]->byteEnd)
-      return false;
-    nextPosA = static_cast<size_t>(*spansAsc[runEnd]->byteEnd);
-  }
-
-  auto tryRun = [&](size_t runEndB) -> bool {
-    if (runEndB < runStartB || runEndB > bTok.size())
-      return false;
-
-    auto cert = buildAdjacentPasteRunInvertibilityCertificate(
-        aTok, bTok.substr(runStartB, runEndB - runStartB),
-        spansAsc.slice(idx, runEnd - idx + 1));
-    if (cert.kind == PasteRunInvertibilityKind::Unique &&
-        cert.derivedSegs.size() == runEnd - idx + 1) {
-      for (size_t i = 0; i < cert.derivedSegs.size(); ++i)
-        out[idx + i] = cert.derivedSegs[i];
-
-      return SegmentPastedTokenArgsByFixedSlicesRec(aTok, bTok, spansAsc,
-                                                    runEnd + 1, nextPosA,
-                                                    runEndB, out);
-    }
-
-    // Legacy single-span fallback: when the current run contains only one
-    // argument contribution, the fixed slices on either side already pin the
-    // segment boundary. The newer adjacent-run certificate is stricter, but
-    // some pure-paste cases (e.g. CONCAT-style token assembly) are still
-    // structurally invertible via this simpler anchor-based split.
-    if (runEnd == idx) {
-      out[idx] = bTok.substr(runStartB, runEndB - runStartB).str();
-      return SegmentPastedTokenArgsByFixedSlicesRec(aTok, bTok, spansAsc,
-                                                    idx + 1, nextPosA,
-                                                    runEndB, out);
-    }
-
-    return false;
   };
 
-  // 5. Match the fixed anchor after the whole touching run. With no tail, the
-  // run consumes the remainder of the B token.
-  if (fixedAfter.empty())
-    return tryRun(bTok.size());
-
-  size_t k = bTok.find(fixedAfter, runStartB);
-  while (k != StringRef::npos) {
-    if (tryRun(k))
-      return true;
-    k = bTok.find(fixedAfter, k + 1);
-  }
-
-  return false;
+  return solve(solve, /*idx=*/0, /*posB=*/0);
 }
 
 StringRef RefoldEngine::DeriveNewPasteSegmentFromSpellingReplacement(
