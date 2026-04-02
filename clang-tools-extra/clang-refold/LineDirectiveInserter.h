@@ -169,9 +169,12 @@ public:
   ///   immediately after the last newline and before that suffix.
   ///
   /// If none of the safe cases apply, this method returns `replacement`
-  /// unchanged. In that case, callers should defer correction (e.g., via a
-  /// pending-resync mechanism that flushes at the next safe BOL while emitting
-  /// subsequent original slices).
+  /// unchanged. This includes cases where the directive would be at BOL within
+  /// the replacement itself, but the replacement would rejoin untouched
+  /// original bytes that continue on the same physical line. In that case,
+  /// callers should defer correction (e.g., via a pending-resync mechanism
+  /// that flushes at the next safe BOL while emitting subsequent original
+  /// slices).
   ///
   /// ### Idempotence
   /// The method suppresses duplicate insertion when the replacement already
