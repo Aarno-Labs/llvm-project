@@ -48,6 +48,7 @@
 #include "clang/Lex/Preprocessor.h"
 #include "clang/Lex/Lexer.h"
 #include "clang/Lex/PreprocessorOptions.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
@@ -2857,15 +2858,71 @@ void RefoldMapBuilder::writeJSON() {
     // Recover a token-interval-based caller relation among macro items.
     // After sorting by begin token (and outer-before-inner on ties), maintain
     // a stack of currently open macro envelopes. The top of the stack is the
-    // innermost enclosing macro, so if the current envelope is fully contained
-    // within it, that stack top is this macro's caller/parent in the nesting
-    // chain.
+    // innermost enclosing macro, so if the current envelope is strictly
+    // contained within it, that stack top is this macro's caller/parent in the
+    // nesting chain. Equal envelopes are not a parent/child relation.
     for (const MacroEnv &Env : MacroEnvs) {
       while (!MacroStack.empty() && Env.BTok >= MacroStack.back().ETok)
         MacroStack.pop_back();
-      if (!MacroStack.empty() && Env.ETok <= MacroStack.back().ETok)
+      if (!MacroStack.empty() && Env.BTok >= MacroStack.back().BTok &&
+          Env.ETok <= MacroStack.back().ETok &&
+          (Env.BTok > MacroStack.back().BTok ||
+           Env.ETok < MacroStack.back().ETok))
         CallerMacroByID.try_emplace(Env.ID, MacroStack.back().ID);
       MacroStack.push_back(Env);
+    }
+
+    llvm::DenseMap<uint64_t, uint64_t> ResolvedCallerByID;
+    ResolvedCallerByID.reserve(MacroEnvs.size());
+    for (const Item &It : Items) {
+      if (It.Kind != IK_Macro)
+        continue;
+      if (It.CallerMacroId) {
+        ResolvedCallerByID[It.ID] = *It.CallerMacroId;
+        continue;
+      }
+      auto CallerIt = CallerMacroByID.find(It.ID);
+      if (CallerIt != CallerMacroByID.end())
+        ResolvedCallerByID[It.ID] = CallerIt->second;
+    }
+
+    llvm::DenseSet<uint64_t> DoneCallerIds;
+    for (const Item &It : Items) {
+      if (It.Kind != IK_Macro || DoneCallerIds.find(It.ID) != DoneCallerIds.end())
+        continue;
+
+      llvm::SmallVector<uint64_t, 8> Path;
+      llvm::DenseMap<uint64_t, unsigned> PathIndex;
+      uint64_t Cur = It.ID;
+
+      while (true) {
+        if (DoneCallerIds.find(Cur) != DoneCallerIds.end())
+          break;
+
+        auto Inserted = PathIndex.try_emplace(Cur, Path.size());
+        if (!Inserted.second) {
+          for (unsigned I = Inserted.first->second; I < Path.size(); ++I)
+            ResolvedCallerByID.erase(Path[I]);
+          break;
+        }
+
+        Path.push_back(Cur);
+
+        auto CurIt = ResolvedCallerByID.find(Cur);
+        if (CurIt == ResolvedCallerByID.end())
+          break;
+
+        const uint64_t CallerId = CurIt->second;
+        if (CallerId == Cur || ItemByID.find(CallerId) == ItemByID.end()) {
+          ResolvedCallerByID.erase(CurIt);
+          break;
+        }
+
+        Cur = CallerId;
+      }
+
+      for (uint64_t Id : Path)
+        DoneCallerIds.insert(Id);
     }
 
     const LangOptions &Lang = PP.getLangOpts();
@@ -3005,21 +3062,15 @@ void RefoldMapBuilder::writeJSON() {
       if (It.Kind != IK_Macro)
         continue;
 
-      // Resolve the caller macro item ID:
-      // Prefer the direct field, but fall back to the side-table if needed
-      // (some items may have been produced before CallerMacroId was wired).
-      std::optional<uint64_t> CallerID = It.CallerMacroId;
-      if (!CallerID) {
-        auto CallerIt = CallerMacroByID.find(It.ID);
-        if (CallerIt != CallerMacroByID.end())
-          CallerID = CallerIt->second;
-      }
-      if (!CallerID)
+      // Resolve the caller macro item ID from the sanitized caller graph.
+      auto CallerIt = ResolvedCallerByID.find(It.ID);
+      if (CallerIt == ResolvedCallerByID.end())
         continue; // no caller => cannot interpret “caller formal” references
+      const uint64_t CallerID = CallerIt->second;
 
       // Look up the caller Item (the macro invocation that produced *this*
       // one). We need its formal parameter list to build name→index mapping.
-      const Item *Caller = ItemByID.lookup(*CallerID);
+      const Item *Caller = ItemByID.lookup(CallerID);
       if (!Caller || Caller->DefParams.empty() || It.InvArgRanges.empty())
         continue;
 
@@ -3102,13 +3153,12 @@ void RefoldMapBuilder::writeJSON() {
       if (It.Kind != IK_Macro)
         continue;
 
-      // Preserve producer-recorded caller macro id; fall back to span-inferred
-      // nesting only when a caller was not determined during preprocessing.
-      if (!It.CallerMacroId) {
-        auto CIt = CallerMacroByID.find(It.ID);
-        if (CIt != CallerMacroByID.end())
-          It.CallerMacroId = CIt->second;
-      }
+      // Materialize the sanitized caller graph onto the serialized items.
+      auto CIt = ResolvedCallerByID.find(It.ID);
+      if (CIt != ResolvedCallerByID.end())
+        It.CallerMacroId = CIt->second;
+      else
+        It.CallerMacroId.reset();
 
       It.InvArgDeps.clear();
       auto DIt = ArgDepsByID.find(It.ID);

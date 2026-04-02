@@ -640,6 +640,10 @@ private:
   // Internal helper to finalize indices and perform deterministic ordering.
   void BuildIndicesAndSort();
 
+  /// Remove invalid caller_macro_id edges so upward caller walks remain
+  /// acyclic and terminate deterministically.
+  void SanitizeMacroCallerGraph();
+
   std::vector<Segment>
   BuildSegmentsForFile(StringRef file, ArrayRef<const Slot *> fileSlots) const;
 };
