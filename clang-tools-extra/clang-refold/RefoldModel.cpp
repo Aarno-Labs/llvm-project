@@ -1109,8 +1109,71 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
   }
 
   // Deterministic ordering & indices
+  model.SanitizeMacroCallerGraph();
   model.BuildIndicesAndSort();
   return model;
+}
+
+void RefoldModel::SanitizeMacroCallerGraph() {
+  DenseMap<uint64_t, MacroInvocation *> MacroById;
+  MacroById.reserve(macroInvs_.size());
+  for (MacroInvocation &MI : macroInvs_)
+    MacroById.try_emplace(MI.id, &MI);
+
+  DenseSet<uint64_t> Done;
+
+  for (MacroInvocation &MI : macroInvs_) {
+    if (Done.find(MI.id) != Done.end())
+      continue;
+
+    std::vector<uint64_t> Path;
+    DenseMap<uint64_t, unsigned> PathIndex;
+    uint64_t Cur = MI.id;
+
+    while (true) {
+      if (Done.find(Cur) != Done.end())
+        break;
+
+      auto Inserted = PathIndex.try_emplace(Cur, Path.size());
+      if (!Inserted.second) {
+        const unsigned CycleBegin = Inserted.first->second;
+        for (unsigned I = CycleBegin; I < Path.size(); ++I) {
+          MacroInvocation *CycleNode = MacroById.lookup(Path[I]);
+          if (!CycleNode || !CycleNode->callerMacroId)
+            continue;
+          warn("model",
+               "dropping cyclic caller_macro_id edge child={0} parent={1}",
+               CycleNode->id, *CycleNode->callerMacroId);
+          CycleNode->callerMacroId.reset();
+        }
+        break;
+      }
+
+      Path.push_back(Cur);
+
+      auto CurIt = MacroById.find(Cur);
+      if (CurIt == MacroById.end())
+        break;
+
+      MacroInvocation *Node = CurIt->second;
+      if (!Node->callerMacroId)
+        break;
+
+      const uint64_t ParentId = *Node->callerMacroId;
+      if (ParentId == Cur || MacroById.find(ParentId) == MacroById.end()) {
+        warn("model",
+             "dropping invalid caller_macro_id edge child={0} parent={1}",
+             Node->id, ParentId);
+        Node->callerMacroId.reset();
+        break;
+      }
+
+      Cur = ParentId;
+    }
+
+    for (uint64_t Id : Path)
+      Done.insert(Id);
+  }
 }
 
 void RefoldModel::BuildIndicesAndSort() {
