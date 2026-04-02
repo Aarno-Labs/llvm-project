@@ -55,6 +55,7 @@
 #include "LineDirectiveInserter.h"
 #include "RefoldModel.h"
 #include "StringUtils.h"
+#include "clang/Basic/LangOptions.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -203,6 +204,9 @@ public:
          ArrayRef<size_t> aTokOff, StringRef bSource, ArrayRef<PPTok> bToks,
          ArrayRef<size_t> bTokOff, bool noLines, bool strict);
 
+  /// Build lexer language options from the producer-captured language name.
+  static clang::LangOptions MakeLexLangOptions(llvm::StringRef langName);
+
 private:
   const RefoldModel model_;
   StringRef aSource_, bSource_;
@@ -210,6 +214,7 @@ private:
   ArrayRef<size_t> aTokOff_, bTokOff_;
   LineDirectiveInserter lineDirs_;
   bool strict_;
+  LangOptions lexLang_;
 
   struct RefoldStats {
     uint64_t totalIncludes = 0;
@@ -421,7 +426,8 @@ private:
                bool strict)
       : model_(std::move(model)), aSource_(aSource), bSource_(bSource),
         aToks_(aToks), bToks_(bToks), aTokOff_(aTokOff), bTokOff_(bTokOff),
-        lineDirs_(!noLines, model_.GetPPCwd()), strict_(strict) {
+        lineDirs_(!noLines, model_.GetPPCwd()), strict_(strict),
+        lexLang_(MakeLexLangOptions(model_.GetPPLang())) {
     BuildMacroInvocationGraph();
   }
 
@@ -656,9 +662,9 @@ private:
   /// \param allowRight Whether a right-side pad is permitted.
   /// \returns `text`, possibly prefixed and/or suffixed with a single space to
   ///          preserve lexical separation across the replacement boundary.
-  static std::string PadAtBoundaries(StringRef base, size_t start, size_t end,
-                                     std::string text, bool allowLeft,
-                                     bool allowRight);
+  std::string PadAtBoundaries(StringRef base, size_t start, size_t end,
+                              std::string text, bool allowLeft,
+                              bool allowRight) const;
 
   /// \brief Computes an "owner depth gap" array used to bias the weighted LCS
   /// anchoring for insertions.

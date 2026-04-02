@@ -138,7 +138,8 @@ namespace {
 /// \note
 ///   This path deliberately avoids the full preprocessor.
 void lexPPTokens(const std::string &bytes, std::vector<PPTok> &out,
-                 std::vector<std::size_t> &startOffs) {
+                 std::vector<std::size_t> &startOffs,
+                 const LangOptions &lang) {
   out.clear();
   startOffs.clear();
 
@@ -181,7 +182,6 @@ void lexPPTokens(const std::string &bytes, std::vector<PPTok> &out,
   const char *b = data.begin();
   const char *e = data.end();
 
-  LangOptions lang; // raw lexing
   Lexer lex(sm.getLocForStartOfFile(fid), lang, b, b, e);
   lex.SetKeepWhitespaceMode(false);
   lex.SetCommentRetentionState(true);
@@ -541,7 +541,9 @@ buildNoLinesIgnoreMask(const json::Object &rootJson, const PPCtx &ctx,
 
   std::vector<PPTok> a0Toks;
   std::vector<std::size_t> a0Off;
-  lexPPTokens(a0Bytes, a0Toks, a0Off);
+  const LangOptions lexLang =
+      RefoldEngine::MakeLexLangOptions(ctx.lang);
+  lexPPTokens(a0Bytes, a0Toks, a0Off, lexLang);
 
   std::vector<uint8_t> a0Sensitive(a0Toks.size(), 0);
   if (auto items = rootJson.getArray("items")) {
@@ -834,20 +836,24 @@ int main(int argc, char **argv) {
 
   // Read files and tokenize.
   std::string aBytes, bBytes;
+  auto ctxOrErr = parsePPCtx(rootJson);
+  if (!ctxOrErr) {
+    handleAllErrors(ctxOrErr.takeError(), [&](const ErrorInfoBase &e) {
+      fatal("model", "failed to parse pp_ctx from refold map: {0}",
+            e.message());
+    });
+  }
+  const PPCtx ctx = *ctxOrErr;
+  const LangOptions lexLang =
+      RefoldEngine::MakeLexLangOptions(ctx.lang);
+
   std::optional<PPCtx> checkCtx;
   if (onlyCheck) {
-    auto ctxOrErr = parsePPCtx(rootJson);
-    if (!ctxOrErr) {
-      handleAllErrors(ctxOrErr.takeError(), [&](const ErrorInfoBase &e) {
-        fatal("model", "failed to parse pp_ctx from refold map: {0}",
-              e.message());
-      });
-    }
-    checkCtx = *ctxOrErr;
+    checkCtx = ctx;
 
     // Preprocess the refolded C source:
     {
-      auto ppOrErr = preprocessToBytes(CheckSrcPath, *ctxOrErr);
+      auto ppOrErr = preprocessToBytes(CheckSrcPath, ctx);
       if (!ppOrErr) {
         handleAllErrors(ppOrErr.takeError(), [&](const ErrorInfoBase &e) {
           fatal("pp", "failed to preprocess --check input: {0}", e.message());
@@ -858,7 +864,7 @@ int main(int argc, char **argv) {
 
     // Preprocess the edited prerpocessed output file:
     {
-      auto ppOrErr = preprocessToBytes(PPModPath, *ctxOrErr);
+      auto ppOrErr = preprocessToBytes(PPModPath, ctx);
       if (!ppOrErr) {
         handleAllErrors(ppOrErr.takeError(), [&](const ErrorInfoBase &e) {
           fatal("pp", "failed to preprocess --pp-mod input: {0}", e.message());
@@ -873,8 +879,8 @@ int main(int argc, char **argv) {
 
   std::vector<PPTok> aToks, bToks;
   std::vector<std::size_t> aTokByteOff, bTokByteOff;
-  lexPPTokens(aBytes, aToks, aTokByteOff);
-  lexPPTokens(bBytes, bToks, bTokByteOff);
+  lexPPTokens(aBytes, aToks, aTokByteOff, lexLang);
+  lexPPTokens(bBytes, bToks, bTokByteOff, lexLang);
   debug("lex", "{0} tokens={1} {2} tokens={3}", PPPath, aToks.size(), PPModPath,
         bToks.size());
 

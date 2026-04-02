@@ -53,6 +53,9 @@
 
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/TokenKinds.h"
+#include "clang/Basic/Diagnostic.h"
+#include "clang/Basic/DiagnosticOptions.h"
+#include "clang/Frontend/CompilerInvocation.h"
 #include "clang/Lex/Lexer.h"
 
 #include "llvm/ADT/ArrayRef.h"
@@ -245,6 +248,20 @@ static StringRef sliceTokenEnvelope(ArrayRef<size_t> tokOff, StringRef source,
   return source.substr(lo, hi - lo);
 }
 } // namespace
+
+clang::LangOptions RefoldEngine::MakeLexLangOptions(llvm::StringRef langName) {
+  IntrusiveRefCntPtr<DiagnosticIDs> diagIDs(new DiagnosticIDs());
+  IntrusiveRefCntPtr<DiagnosticOptions> diagOpts(new DiagnosticOptions());
+  auto *client = new IgnoringDiagConsumer();
+  DiagnosticsEngine diags(diagIDs, diagOpts, client, /*ShouldOwnClient=*/true);
+
+  auto invocation = std::make_shared<CompilerInvocation>();
+  std::string lang = langName.empty() ? "c" : langName.str();
+  std::vector<const char *> args = {"-x", lang.c_str()};
+  CompilerInvocation::CreateFromArgs(*invocation, ArrayRef<const char *>(args),
+                                     diags);
+  return invocation->getLangOpts();
+}
 
 // ========================== Public entry points ==========================
 
@@ -1723,7 +1740,7 @@ struct LexBoundaryToken {
   std::string Spelling;
 };
 
-static void lexBoundaryTokens(StringRef Text,
+static void lexBoundaryTokens(StringRef Text, const LangOptions &Lang,
                               SmallVectorImpl<LexBoundaryToken> &Out) {
   Out.clear();
   if (Text.empty())
@@ -1734,7 +1751,7 @@ static void lexBoundaryTokens(StringRef Text,
   LexBuf.push_back('\0');
   const char *BufStart = LexBuf.data();
   const char *BufEnd = BufStart + Text.size();
-  Lexer Lex(BaseLoc, LangOptions(), BufStart, BufStart, BufEnd);
+  Lexer Lex(BaseLoc, Lang, BufStart, BufStart, BufEnd);
   Token Tok;
 
   while (true) {
@@ -1751,17 +1768,19 @@ static void lexBoundaryTokens(StringRef Text,
   }
 }
 
-static std::optional<LexBoundaryToken> firstLexToken(StringRef Text) {
+static std::optional<LexBoundaryToken> firstLexToken(StringRef Text,
+                                                    const LangOptions &Lang) {
   SmallVector<LexBoundaryToken, 8> Toks;
-  lexBoundaryTokens(Text, Toks);
+  lexBoundaryTokens(Text, Lang, Toks);
   if (Toks.empty())
     return std::nullopt;
   return Toks.front();
 }
 
-static std::optional<LexBoundaryToken> lastLexToken(StringRef Text) {
+static std::optional<LexBoundaryToken> lastLexToken(StringRef Text,
+                                                   const LangOptions &Lang) {
   SmallVector<LexBoundaryToken, 16> Toks;
-  lexBoundaryTokens(Text, Toks);
+  lexBoundaryTokens(Text, Lang, Toks);
   if (Toks.empty())
     return std::nullopt;
   return Toks.back();
@@ -1771,14 +1790,15 @@ static std::optional<LexBoundaryToken> lastLexToken(StringRef Text) {
 /// whitespace would change lexical tokenization compared to placing a space
 /// between them.
 static bool needsLexicalSeparator(const LexBoundaryToken &Left,
-                                  const LexBoundaryToken &Right) {
+                                  const LexBoundaryToken &Right,
+                                  const LangOptions &Lang) {
   const std::string NoSpace = Left.Spelling + Right.Spelling;
   const std::string WithSpace = Left.Spelling + " " + Right.Spelling;
 
   SmallVector<LexBoundaryToken, 8> NoSpaceToks;
   SmallVector<LexBoundaryToken, 8> WithSpaceToks;
-  lexBoundaryTokens(NoSpace, NoSpaceToks);
-  lexBoundaryTokens(WithSpace, WithSpaceToks);
+  lexBoundaryTokens(NoSpace, Lang, NoSpaceToks);
+  lexBoundaryTokens(WithSpace, Lang, WithSpaceToks);
 
   if (NoSpaceToks.size() != WithSpaceToks.size())
     return true;
@@ -1793,7 +1813,8 @@ static bool needsLexicalSeparator(const LexBoundaryToken &Left,
 
 std::string RefoldEngine::PadAtBoundaries(StringRef base, size_t start,
                                           size_t end, std::string text,
-                                          bool allowLeft, bool allowRight) {
+                                          bool allowLeft,
+                                          bool allowRight) const {
   const auto f = stringutils::firstNonWsIdx(text);
   const auto l = stringutils::lastNonWsIdx(text);
 
@@ -1807,8 +1828,10 @@ std::string RefoldEngine::PadAtBoundaries(StringRef base, size_t start,
   const bool hasLeadingWS = (*f > 0);
   const bool hasTrailingWS = (*l + 1 < text.size());
 
-  std::optional<LexBoundaryToken> textFirstTok = firstLexToken(StringRef(text));
-  std::optional<LexBoundaryToken> textLastTok = lastLexToken(StringRef(text));
+  std::optional<LexBoundaryToken> textFirstTok =
+      firstLexToken(StringRef(text), lexLang_);
+  std::optional<LexBoundaryToken> textLastTok =
+      lastLexToken(StringRef(text), lexLang_);
 
   const std::optional<char> leftChar =
       (start > 0 && start <= base.size()) ? std::optional<char>(base[start - 1])
@@ -1827,8 +1850,8 @@ std::string RefoldEngine::PadAtBoundaries(StringRef base, size_t start,
   if (allowLeft && !hasLeadingWS && start > 0 && start <= base.size() &&
       textFirstTok && (!leftChar || !stringutils::isWs(*leftChar))) {
     if (std::optional<LexBoundaryToken> leftTok =
-            lastLexToken(base.take_front(start))) {
-      addLeftSpace = needsLexicalSeparator(*leftTok, *textFirstTok);
+            lastLexToken(base.take_front(start), lexLang_)) {
+      addLeftSpace = needsLexicalSeparator(*leftTok, *textFirstTok, lexLang_);
     }
   }
 
@@ -1843,8 +1866,8 @@ std::string RefoldEngine::PadAtBoundaries(StringRef base, size_t start,
   if (allowRight && !hasTrailingWS && end < base.size() && textLastTok &&
       (!rightChar || !stringutils::isWs(*rightChar))) {
     if (std::optional<LexBoundaryToken> rightTok =
-            firstLexToken(base.drop_front(end))) {
-      addRightSpace = needsLexicalSeparator(*textLastTok, *rightTok);
+            firstLexToken(base.drop_front(end), lexLang_)) {
+      addRightSpace = needsLexicalSeparator(*textLastTok, *rightTok, lexLang_);
     }
   }
 
@@ -4320,7 +4343,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     lexBuf.push_back('\0');
     const char *bufStart = lexBuf.data();
     const char *bufEnd = bufStart + s.size();
-    Lexer lex(baseLoc, LangOptions(), bufStart, bufStart, bufEnd);
+    Lexer lex(baseLoc, lexLang_, bufStart, bufStart, bufEnd);
 
     int parenDepth = 0;
     int bracketDepth = 0;
