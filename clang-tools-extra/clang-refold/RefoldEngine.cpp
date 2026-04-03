@@ -8502,11 +8502,39 @@ RefoldEngine::AppendOriginalSliceWithPending(
 
   uint64_t i = from;
 
-  // Only flush immediately if BOTH:
-  // (1) output is at BOL, and
-  // (2) the next original slice begins at BOL in the original file
+  auto canFlushBeforeUntouchedDirectiveLine = [&](size_t pos) -> bool {
+    if (pos >= original.size())
+      return false;
+
+    size_t lineStart = pos;
+    while (lineStart > 0 && original[lineStart - 1] != '\n')
+      --lineStart;
+
+    if (!stringutils::isIndentOnly(original, lineStart, pos))
+      return false;
+
+    size_t lineEnd = original.find('\n', pos);
+    if (lineEnd == StringRef::npos)
+      lineEnd = original.size();
+
+    size_t firstNonWs = pos;
+    while (firstNonWs < lineEnd && stringutils::isWs(original[firstNonWs]) &&
+           original[firstNonWs] != '\n')
+      ++firstNonWs;
+
+    return firstNonWs < lineEnd && original[firstNonWs] == '#';
+  };
+
+  // Flush immediately when output is already at BOL and the next untouched
+  // bytes are either:
+  // (1) at a true BOL in the original file, or
+  // (2) in the leading indentation of an untouched preprocessor-directive
+  //     line. Directives may legally be preceded by horizontal whitespace, so
+  //     flushing before that indentation keeps the directive line's logical
+  //     location accurate without relaxing the ordinary code-line safety rule.
   if (stringutils::outAtBOL(StringRef(out.data(), out.size())) &&
-      stringutils::isBOL(original, static_cast<size_t>(from))) {
+      (stringutils::isBOL(original, static_cast<size_t>(from)) ||
+       canFlushBeforeUntouchedDirectiveLine(static_cast<size_t>(from)))) {
     size_t line = stringutils::lineAtOffset(original, from);
     std::string directive =
         lineDirs_.FormatLineDirective(line, pending->fileSpellingForDir);
