@@ -10,7 +10,7 @@
 //   • LCS (Longest Common Subsequence) map A→B over arbitrary element types
 //     (typically token spellings), with a stable tie-breaker.
 //   • Hunk construction from an A→B alignment (contiguous edit regions).
-//   • Myers O(N*D) shortest edit script (SES) with coalescing helpers.
+//   • Myers O((N+M)*D) shortest edit script (SES) with linear-space reconstruction.
 //
 // Responsibilities
 // ----------------
@@ -31,7 +31,7 @@
 // Complexity
 // ----------
 //   • LCS:      time O(N*M); DP uses O(N*M) space, Hirschberg uses O(N+M).
-//   • Myers:    expected time O((N+M)*D), space O(N+M) per frontier snapshot.
+//   • Myers:    expected time O((N+M)*D), space O(N+M).
 //   • Hunking:  O(N) over the alignment/map.
 //
 // Public Surface
@@ -866,149 +866,213 @@ std::vector<Hunk> hunksFromMap(ArrayRef<int64_t> map, size_t nA, size_t nB) {
   return hunks;
 }
 
-// ============================= Myers O(n*d) diff =============================
+// ===================== Myers linear-space O((N+M)*D) diff ====================
 
-/// \brief Reconstruct the forward-ordered sequence of Step edits from saved
-/// frontiers.
-///
-/// Given the `trace` of frontier arrays `V` captured after each edit distance
-/// layer `d`, and the terminal coordinates `(x, y)` at minimal edit distance
-/// `dAtEnd`, this function walks backward from `d = dAtEnd` to `0`, choosing
-/// the predecessor diagonal.
-///
-/// * If `V[k-1] < V[k+1]`, the path came from **down**
-///   (`prevK = k+1`, an INSERT in B).
-/// * Otherwise, it came from **right**
-///   (`prevK = k-1`, a DELETE in A).
-///
-/// After choosing `prevK`, the algorithm emits any diagonal moves as `EQUAL`
-/// steps, then emits the single edit step that transitioned to `(x, y)`. The
-/// resulting list of `Step` edits is reversed at the end to obtain forward
-/// order.
-///
-/// \param a Left sequence (used for equality comparisons).
-/// \param b Right sequence (used for equality comparisons).
-/// \param trace List of `V` snapshots (`trace[d-1]` corresponds to the
-///              frontier before layer `d`).
-/// \param x Terminal x-coordinate at the end of the SES.
-/// \param y Terminal y-coordinate at the end of the SES.
-/// \param dAtEnd Minimal edit distance at the end of the forward pass.
-/// \param offset Offset used to index `V` by `k + offset`.
-/// \returns Forward-ordered list of `Step` edits.
-static std::vector<Step> backtrack(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
-                                   ArrayRef<std::vector<int64_t>> trace,
-                                   int64_t x, int64_t y, int64_t dAtEnd,
-                                   int64_t offset) {
-  std::vector<Step> out;
-  for (int64_t d = dAtEnd; d > 0; --d) {
-    // trace contains snapshots of V arrays at each distance d
-    const std::vector<int64_t> &v = trace[static_cast<size_t>(d - 1)];
-    const int64_t k = x - y;
-    const size_t kIndex = static_cast<size_t>(k + offset);
+namespace {
 
-    // Choose predecessor diagonal
-    int64_t prevK;
-    // k == -d means we must have come from above (k+1)
-    // Otherwise, we check if moving from k+1 or k-1 resulted in a further X
-    if (k == -d || (k != d && v[kIndex - 1] < v[kIndex + 1])) {
-      prevK = k + 1; // Vertical move (Insert)
-    } else {
-      prevK = k - 1; // Horizontal move (Delete)
-    }
+struct MiddleSnake {
+  int64_t aStart = 0;
+  int64_t bStart = 0;
+  int64_t aEnd = 0;
+  int64_t bEnd = 0;
+};
 
-    const int64_t xStart = v[static_cast<size_t>(prevK + offset)];
-    const int64_t yStart = xStart - prevK;
-
-    // Diagonal snake: backtrack through equals
-    while (x > xStart && y > yStart) {
-      --x;
-      --y;
-      out.push_back(Step{Op::Equal, static_cast<uint64_t>(x),
-                         static_cast<uint64_t>(x + 1), static_cast<uint64_t>(y),
-                         static_cast<uint64_t>(y + 1)});
-    }
-
-    // Edit step: the move that increased distance d-1 to d
-    if (xStart < x) {
-      --x;
-      out.push_back(Step{Op::Delete, static_cast<uint64_t>(x),
-                         static_cast<uint64_t>(x + 1), static_cast<uint64_t>(y),
-                         static_cast<uint64_t>(y)});
-    } else if (yStart < y) {
-      --y;
-      out.push_back(Step{Op::Insert, static_cast<uint64_t>(x),
-                         static_cast<uint64_t>(x), static_cast<uint64_t>(y),
-                         static_cast<uint64_t>(y + 1)});
-    }
+static void appendEqualSteps(std::vector<Step> &out, uint64_t aLo, uint64_t bLo,
+                             uint64_t len) {
+  for (uint64_t i = 0; i < len; ++i) {
+    out.push_back(
+        Step{Op::Equal, aLo + i, aLo + i + 1, bLo + i, bLo + i + 1});
   }
-
-  // Leading equals before the first edit
-  while (x > 0 && y > 0 &&
-         a[static_cast<size_t>(x - 1)] == b[static_cast<size_t>(y - 1)]) {
-    --x;
-    --y;
-    out.push_back(Step{Op::Equal, static_cast<uint64_t>(x),
-                       static_cast<uint64_t>(x + 1), static_cast<uint64_t>(y),
-                       static_cast<uint64_t>(y + 1)});
-  }
-
-  std::reverse(out.begin(), out.end());
-  return out;
 }
 
-std::vector<Step> diff(ArrayRef<StringRef> a, ArrayRef<StringRef> b) {
-  const int64_t n = static_cast<int64_t>(a.size());
-  const int64_t m = static_cast<int64_t>(b.size());
-  const int64_t max = n + m;
-  const int64_t offset = max;
+static void appendInsertSteps(std::vector<Step> &out, uint64_t aPos,
+                              uint64_t bLo, uint64_t bHi) {
+  for (uint64_t j = bLo; j < bHi; ++j)
+    out.push_back(Step{Op::Insert, aPos, aPos, j, j + 1});
+}
 
-  // V array tracks the furthest x reached on each diagonal k
-  // Range is [-max, max], so size is 2*max + 1
-  std::vector<int64_t> v(static_cast<size_t>(2 * max + 1), -1);
+static void appendDeleteSteps(std::vector<Step> &out, uint64_t aLo,
+                              uint64_t aHi, uint64_t bPos) {
+  for (uint64_t i = aLo; i < aHi; ++i)
+    out.push_back(Step{Op::Delete, i, i + 1, bPos, bPos});
+}
 
-  // Base case: starting point (0,0) on diagonal 0
-  v[static_cast<size_t>(offset + 1)] = 0;
+/// \brief Find Myers' middle snake for the box A[aLo,aHi) × B[bLo,bHi).
+///
+/// This is the linear-space divide-and-conquer core of Myers' shortest edit
+/// script algorithm. It runs simultaneous forward and reverse frontier sweeps
+/// until the two searches overlap, at which point the overlapping diagonal
+/// segment ("middle snake") splits the problem into two strictly smaller
+/// subproblems.
+///
+/// The returned coordinates are absolute indices into \p a and \p b and obey:
+/// * A[aStart,aEnd) == B[bStart,bEnd)
+/// * (aEnd - aStart) == (bEnd - bStart)
+/// * The left subproblem is A[aLo,aStart) × B[bLo,bStart)
+/// * The right subproblem is A[aEnd,aHi) × B[bEnd,bHi)
+static MiddleSnake findMiddleSnake(ArrayRef<StringRef> a, int64_t aLo,
+                                   int64_t aHi, ArrayRef<StringRef> b,
+                                   int64_t bLo, int64_t bHi) {
+  const int64_t n = aHi - aLo;
+  const int64_t m = bHi - bLo;
+  const int64_t delta = n - m;
+  const bool oddDelta = (delta & 1) != 0;
+  const int64_t maxD = (n + m + 1) / 2;
+  const int64_t offset = maxD + 1;
+  const size_t vecSize = static_cast<size_t>(2 * maxD + 3);
 
-  std::vector<std::vector<int64_t>> trace;
-  // Reserve based on expected distance;
-  // for very large diffs, this is the main memory consumer.
-  trace.reserve(static_cast<size_t>(max + 1));
+  std::vector<int64_t> vf(vecSize, -1);
+  std::vector<int64_t> vr(vecSize, -1);
 
-  for (int64_t d = 0; d <= max; ++d) {
-    std::vector<int64_t> vNew = v;
+  // Same initialization convention as the classic O(ND) frontier walk: the
+  // "virtual" diagonal just above k=0 starts at x=0.
+  vf[static_cast<size_t>(offset + 1)] = 0;
+  vr[static_cast<size_t>(offset + 1)] = 0;
 
+  for (int64_t d = 0; d <= maxD; ++d) {
+    // Forward search from (aLo, bLo).
     for (int64_t k = -d; k <= d; k += 2) {
       const size_t kIdx = static_cast<size_t>(k + offset);
 
-      int64_t x;
-      if (k == -d || (k != d && v[kIdx - 1] < v[kIdx + 1])) {
-        x = v[kIdx + 1]; // Move down from k+1 (Insertion)
+      int64_t xStart;
+      if (k == -d || (k != d && vf[kIdx - 1] < vf[kIdx + 1])) {
+        xStart = vf[kIdx + 1]; // down: INSERT from B
       } else {
-        x = v[kIdx - 1] + 1; // Move right from k-1 (Deletion)
+        xStart = vf[kIdx - 1] + 1; // right: DELETE from A
       }
 
-      int64_t y = x - k;
-
-      // Greedy snake (Diagongal)
+      int64_t yStart = xStart - k;
+      int64_t x = xStart;
+      int64_t y = yStart;
       while (x < n && y < m &&
-             a[static_cast<size_t>(x)] == b[static_cast<size_t>(y)]) {
-        x++;
-        y++;
+             a[static_cast<size_t>(aLo + x)] ==
+                 b[static_cast<size_t>(bLo + y)]) {
+        ++x;
+        ++y;
       }
+      vf[kIdx] = x;
 
-      vNew[kIdx] = x;
-
-      if (x >= n && y >= m) {
-        trace.push_back(std::move(vNew));
-        return backtrack(a, b, trace, x, y, d, offset);
+      if (oddDelta) {
+        const int64_t revK = delta - k;
+        if (revK >= -(d - 1) && revK <= (d - 1) &&
+            x + vr[static_cast<size_t>(revK + offset)] >= n) {
+          return MiddleSnake{aLo + xStart, bLo + yStart, aLo + x, bLo + y};
+        }
       }
     }
 
-    trace.push_back(std::move(vNew));
-    v = trace.back();
+    // Reverse search from (aHi, bHi), expressed as distances from the end.
+    for (int64_t revK = -d; revK <= d; revK += 2) {
+      const size_t revIdx = static_cast<size_t>(revK + offset);
+
+      int64_t xEnd;
+      if (revK == -d || (revK != d && vr[revIdx - 1] < vr[revIdx + 1])) {
+        xEnd = vr[revIdx + 1]; // down in reverse space
+      } else {
+        xEnd = vr[revIdx - 1] + 1; // right in reverse space
+      }
+
+      int64_t yEnd = xEnd - revK;
+      int64_t x = xEnd;
+      int64_t y = yEnd;
+      while (x < n && y < m &&
+             a[static_cast<size_t>(aHi - 1 - x)] ==
+                 b[static_cast<size_t>(bHi - 1 - y)]) {
+        ++x;
+        ++y;
+      }
+      vr[revIdx] = x;
+
+      if (!oddDelta) {
+        const int64_t fwdK = delta - revK;
+        if (fwdK >= -d && fwdK <= d &&
+            vf[static_cast<size_t>(fwdK + offset)] + x >= n) {
+          return MiddleSnake{aHi - x, bHi - y, aHi - xEnd, bHi - yEnd};
+        }
+      }
+    }
   }
 
-  return backtrack(a, b, trace, n, m, max, offset);
+  fatal("diff/myers", "internal: failed to find middle snake");
+}
+
+static void diffLinearRec(ArrayRef<StringRef> a, int64_t aLo, int64_t aHi,
+                          ArrayRef<StringRef> b, int64_t bLo, int64_t bHi,
+                          std::vector<Step> &out) {
+  // Peel a common prefix eagerly so recursive boxes stay small and the emitted
+  // script remains in forward order without any post-pass reversal.
+  while (aLo < aHi && bLo < bHi &&
+         a[static_cast<size_t>(aLo)] == b[static_cast<size_t>(bLo)]) {
+    appendEqualSteps(out, static_cast<uint64_t>(aLo),
+                     static_cast<uint64_t>(bLo), 1);
+    ++aLo;
+    ++bLo;
+  }
+
+  // Peel a common suffix, but emit it after the middle box has been processed
+  // so the final SES still appears in forward order.
+  int64_t suffixLen = 0;
+  while (aLo + suffixLen < aHi && bLo + suffixLen < bHi &&
+         a[static_cast<size_t>(aHi - 1 - suffixLen)] ==
+             b[static_cast<size_t>(bHi - 1 - suffixLen)]) {
+    ++suffixLen;
+  }
+
+  const int64_t aMidHi = aHi - suffixLen;
+  const int64_t bMidHi = bHi - suffixLen;
+
+  if (aLo == aMidHi && bLo == bMidHi) {
+    appendEqualSteps(out, static_cast<uint64_t>(aMidHi),
+                     static_cast<uint64_t>(bMidHi),
+                     static_cast<uint64_t>(suffixLen));
+    return;
+  }
+
+  if (aLo == aMidHi) {
+    appendInsertSteps(out, static_cast<uint64_t>(aLo),
+                      static_cast<uint64_t>(bLo),
+                      static_cast<uint64_t>(bMidHi));
+    appendEqualSteps(out, static_cast<uint64_t>(aMidHi),
+                     static_cast<uint64_t>(bMidHi),
+                     static_cast<uint64_t>(suffixLen));
+    return;
+  }
+
+  if (bLo == bMidHi) {
+    appendDeleteSteps(out, static_cast<uint64_t>(aLo),
+                      static_cast<uint64_t>(aMidHi),
+                      static_cast<uint64_t>(bLo));
+    appendEqualSteps(out, static_cast<uint64_t>(aMidHi),
+                     static_cast<uint64_t>(bMidHi),
+                     static_cast<uint64_t>(suffixLen));
+    return;
+  }
+
+  const MiddleSnake snake = findMiddleSnake(a, aLo, aMidHi, b, bLo, bMidHi);
+
+  diffLinearRec(a, aLo, snake.aStart, b, bLo, snake.bStart, out);
+  appendEqualSteps(out, static_cast<uint64_t>(snake.aStart),
+                   static_cast<uint64_t>(snake.bStart),
+                   static_cast<uint64_t>(snake.aEnd - snake.aStart));
+  diffLinearRec(a, snake.aEnd, aMidHi, b, snake.bEnd, bMidHi, out);
+  appendEqualSteps(out, static_cast<uint64_t>(aMidHi),
+                   static_cast<uint64_t>(bMidHi),
+                   static_cast<uint64_t>(suffixLen));
+}
+
+} // namespace
+
+std::vector<Step> diff(ArrayRef<StringRef> a, ArrayRef<StringRef> b) {
+  if (a.size() > static_cast<size_t>(std::numeric_limits<int64_t>::max()) ||
+      b.size() > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+    fatal("diff/myers", "input size exceeds int64_t range");
+  }
+
+  std::vector<Step> out;
+  out.reserve(a.size() + b.size());
+  diffLinearRec(a, 0, static_cast<int64_t>(a.size()), b, 0,
+                static_cast<int64_t>(b.size()), out);
+  return out;
 }
 
 std::vector<Hunk> coalesce(ArrayRef<Step> steps) {
