@@ -10,7 +10,8 @@
 //   • LCS (Longest Common Subsequence) map A→B over arbitrary element types
 //     (typically token spellings), with a stable tie-breaker.
 //   • Hunk construction from an A→B alignment (contiguous edit regions).
-//   • Myers O(N*D) shortest edit script (SES) with coalescing helpers.
+//   • Myers O((N+M)*D) shortest edit script (SES) with linear-space
+//     reconstruction.
 //
 // Responsibilities
 // ----------------
@@ -31,7 +32,7 @@
 // Complexity
 // ----------
 //   • LCS:      time O(N*M); DP uses O(N*M) space, Hirschberg uses O(N+M).
-//   • Myers:    expected time O((N+M)*D), space O(N+M) per frontier snapshot.
+//   • Myers:    expected time O((N+M)*D), space O(N+M).
 //   • Hunking:  O(N) over the alignment/map.
 //
 // Public Surface
@@ -190,17 +191,18 @@ struct Hunk {
 /// \brief Compute the shortest edit script (SES) between sequences A and B.
 ///
 /// Computes the shortest edit script (SES) between sequences `A` and `B`
-/// using Myers’ *O(N·D)* algorithm, returning the edit steps in forward order.
+/// using Myers’ linear-space divide-and-conquer algorithm, returning the edit
+/// steps in forward order.
 ///
-/// The algorithm performs a forward pass over increasing edit distance `d`,
-/// maintaining the furthest-reaching frontier `V[k]` for each diagonal
-/// `k = x - y`, and snapshots each frontier to `trace` for later
-/// reconstruction. When the ends of both sequences are reached, the edit path
-/// is reconstructed by `backtrack(trace, A, B, ...)`.
+/// The implementation finds a middle snake for each active box
+/// `A[aLo,aHi) × B[bLo,bHi)`, recursively solves the left and right
+/// subproblems, and emits the diagonal snake in between. This preserves the
+/// same SES objective as the classic Myers frontier walk, but avoids storing a
+/// full trace of every frontier layer.
 ///
 /// **Complexity:**
 /// * Time: *O((N+M)·D)*
-/// * Space: *O(N+M)* per frontier snapshot, *O(D·(N+M))* total for the trace.
+/// * Space: *O(N+M)*
 /// Here `N = A.size()`, `M = B.size()`, and `D` is the minimal edit distance.
 ///
 /// \param a Left sequence.
