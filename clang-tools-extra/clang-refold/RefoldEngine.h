@@ -496,6 +496,49 @@ private:
         : argIdx(Idx), newSeg(std::move(New)), oldSeg(std::move(Old)) {}
   };
 
+  // ---------------------------- Ownership Helpers ----------------------------
+
+  enum class OwnerKind { TU, Include, Unknown };
+
+  static inline StringRef toString(OwnerKind kind) {
+    switch (kind) {
+    case OwnerKind::TU:
+      return "TU";
+    case OwnerKind::Include:
+      return "Include";
+    case OwnerKind::Unknown:
+      return "Unknown";
+    }
+    llvm_unreachable("Invalid owner kind");
+  }
+
+  // Grant access to the specific formatter specialization
+  template <typename T, typename Enable> friend struct llvm::format_provider;
+
+  struct Owner {
+    OwnerKind kind = OwnerKind::Unknown;
+    std::optional<uint64_t> includeId; // non-nullopt only when kind == INCLUDE
+    std::optional<uint64_t> condArmId; // nullable; non-nullopt when segment is
+                                       // in a specific arm
+
+    static Owner TU(std::optional<uint64_t> condArmId = std::nullopt) {
+      Owner o;
+      o.kind = OwnerKind::TU;
+      o.condArmId = condArmId;
+      return o;
+    }
+    static Owner Include(uint64_t includeId,
+                         std::optional<uint64_t> condArmId = std::nullopt) {
+      Owner o;
+      o.kind = OwnerKind::Include;
+      o.includeId = includeId;
+      o.condArmId = condArmId;
+      return o;
+    }
+    static Owner Unknown() { return Owner(); }
+  };
+
+
   enum class MacroPatchProofKind : uint8_t {
     Unknown,
     CounterLiteral,
@@ -573,6 +616,15 @@ private:
     std::string subtreeExpectedRootFormalSummary;
     std::string subtreeDeferredRootArgSummary;
     std::string subtreeBridgeSensitiveFormalSummary;
+
+    // Layer-6 mixed-owner decomposition certificate metadata.
+    bool ownerCertPresent = false;
+    bool ownerMixedWitness = false;
+    uint8_t ownerKindCode = 0; // 0=unknown, 1=TU, 2=Include
+    uint64_t ownerIncludeIdCert = 0;
+    bool ownerHasCondArmCert = false;
+    uint64_t ownerCondArmIdCert = 0;
+    uint32_t ownerWitnessCount = 0;
   };
 
   struct WholeCoverPlan {
@@ -642,48 +694,6 @@ private:
 
     ByteHunk(uint64_t aStart, uint64_t aEnd, uint64_t bStart, uint64_t bEnd)
       : aStart(aStart), aEnd(aEnd), bStart(bStart), bEnd(bEnd) {}
-  };
-
-  // ---------------------------- Ownership Helpers ----------------------------
-
-  enum class OwnerKind { TU, Include, Unknown };
-
-  static inline StringRef toString(OwnerKind kind) {
-    switch (kind) {
-    case OwnerKind::TU:
-      return "TU";
-    case OwnerKind::Include:
-      return "Include";
-    case OwnerKind::Unknown:
-      return "Unknown";
-    }
-    llvm_unreachable("Invalid owner kind");
-  }
-
-  // Grant access to the specific formatter specialization
-  template <typename T, typename Enable> friend struct llvm::format_provider;
-
-  struct Owner {
-    OwnerKind kind = OwnerKind::Unknown;
-    std::optional<uint64_t> includeId; // non-nullopt only when kind == INCLUDE
-    std::optional<uint64_t> condArmId; // nullable; non-nullopt when segment is
-                                       // in a specific arm
-
-    static Owner TU(std::optional<uint64_t> condArmId = std::nullopt) {
-      Owner o;
-      o.kind = OwnerKind::TU;
-      o.condArmId = condArmId;
-      return o;
-    }
-    static Owner Include(uint64_t includeId,
-                         std::optional<uint64_t> condArmId = std::nullopt) {
-      Owner o;
-      o.kind = OwnerKind::Include;
-      o.includeId = includeId;
-      o.condArmId = condArmId;
-      return o;
-    }
-    static Owner Unknown() { return Owner(); }
   };
 
   // ------------------------------- Core Helpers ------------------------------
@@ -2128,6 +2138,24 @@ private:
   bool WholeCoverPatchMatchesPlan(const MacroPatch &patch,
                                   const WholeCoverPlan &plan,
                                   uint64_t rootMacroId) const;
+
+  /// rief Normalize the current hunk owner into the certificate shape used
+  ///        for structural macro patch continuity.
+  Owner NormalizeHunkOwnerForPatch(StringRef tuPath,
+                                   const diffutils::Hunk &h) const;
+
+  /// rief Return whether a macro patch carries the same non-mixed owner
+  ///        certificate as the current hunk owner.
+  bool MacroPatchOwnerMatches(const MacroPatch &patch,
+                              const Owner &owner) const;
+
+  /// rief Preserve any prior owner certificate from \p src on \p dst.
+  void CarryMacroPatchOwnerCertificate(MacroPatch &dst,
+                                       const MacroPatch &src) const;
+
+  /// rief Stamp the current owner witness onto a macro patch.
+  void StampMacroPatchOwnerWitness(MacroPatch &patch,
+                                   const Owner &owner) const;
 
   /// rief Format a patch proof kind for tracing.
   StringRef FormatMacroPatchProofKind(MacroPatchProofKind kind) const;
