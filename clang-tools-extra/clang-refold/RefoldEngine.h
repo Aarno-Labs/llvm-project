@@ -510,8 +510,14 @@ private:
   };
 
   struct MacroPatch {
-    uint64_t invStart, invEnd;
+    uint64_t invStart = 0, invEnd = 0;
     std::string replacement;
+
+    MacroPatch() = default;
+    MacroPatch(uint64_t invStart, uint64_t invEnd, std::string replacement,
+               uint64_t macroId = 0)
+        : invStart(invStart), invEnd(invEnd),
+          replacement(std::move(replacement)), macroId(macroId) {}
 
     // Canonical macro invocation id for this physical callsite patch. This is
     // used only for statistics attribution; the patch itself is still keyed by
@@ -538,6 +544,35 @@ private:
     uint64_t wholeCoverBRawHi = 0;
     uint64_t wholeCoverBAdjLo = 0;
     uint64_t wholeCoverBAdjHi = 0;
+
+    // Layer-5 subtree-composition audit metadata. This is instrumentation only
+    // and does not participate in admissibility yet.
+    bool subtreeCertBacked = false;
+    uint64_t subtreeLeafMacroId = 0;
+    uint32_t subtreeWitnessCount = 0;
+    uint32_t subtreeInvocationCertCount = 0;
+    uint32_t subtreeFormalCertCount = 0;
+    uint32_t subtreeArgCertCount = 0;
+    uint32_t subtreeLiftChainCount = 0;
+    uint32_t subtreeLiftStepCount = 0;
+    uint32_t subtreeRootMergeCount = 0;
+    bool subtreeUsesLexicalBridge = false;
+    bool subtreeTouchesPaste = false;
+    bool subtreeHasWrapperSemantics = false;
+    bool subtreeHasStringifySemantics = false;
+    bool subtreeHasWideStringifySemantics = false;
+    bool subtreeHasPreferredChildSyntax = false;
+    bool subtreeHasRawInvocationPreservation = false;
+    bool subtreeHasPassthroughFlatten = false;
+    bool subtreeHasBridgeSensitiveStructuredSemantics = false;
+    bool subtreeDeferredPasteDischarged = false;
+    bool subtreeAdmissible = false;
+    uint32_t subtreeExpectedRootFormalCount = 0;
+    uint32_t subtreeDeferredRootArgCount = 0;
+    uint32_t subtreeBridgeSensitiveFormalCount = 0;
+    std::string subtreeExpectedRootFormalSummary;
+    std::string subtreeDeferredRootArgSummary;
+    std::string subtreeBridgeSensitiveFormalSummary;
   };
 
   struct WholeCoverPlan {
@@ -2093,6 +2128,12 @@ private:
   bool WholeCoverPatchMatchesPlan(const MacroPatch &patch,
                                   const WholeCoverPlan &plan,
                                   uint64_t rootMacroId) const;
+
+  /// rief Format a patch proof kind for tracing.
+  StringRef FormatMacroPatchProofKind(MacroPatchProofKind kind) const;
+
+  /// rief Format patch provenance and subtree-composition audit metadata.
+  std::string FormatMacroPatchAudit(const MacroPatch &patch) const;
 
   std::optional<std::string>
   BuildWholeCoverReplacementText(const RefoldModel::MacroInvocation &m) const;
