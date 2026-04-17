@@ -1764,6 +1764,17 @@ std::string RefoldEngine::RefoldOnce() {
     continue;
   }
 
+  // Global fail-closed composition rule: once this attempt has requested
+  // escalation, do not continue composing structural artifacts in the current
+  // tier. The outer escalation ladder will retry under the next more-expanded
+  // policy, and if all tiers request escalation it will emit B directly.
+  if (escalationRequested_) {
+    debug("escalate",
+          "attempt tier={0}: aborting after classification; structural output will be discarded and retried",
+          escalationTier_);
+    return std::string();
+  }
+
   // Inject forced __COUNTER__ patches after normal hunk attribution.
   // This may create macro patches even when no diff hunk touched the invocation
   // (required to prevent later __COUNTER__ values from shifting after an edit).
@@ -1897,6 +1908,17 @@ std::string RefoldEngine::RefoldOnce() {
     MaterializeIncludeExpansion(incId, perInclude, macroPatchesByOwner,
                                 children, includeExpansion,
                                 &appliedExpandedMacroRootIds);
+  }
+
+  // Global fail-closed composition rule: if include realization requested
+  // escalation in this attempt, stop here and let the outer ladder retry under
+  // the next tier rather than continuing to compose or return mixed structural
+  // artifacts from the current tier.
+  if (escalationRequested_) {
+    debug("escalate",
+          "attempt tier={0}: aborting after include materialization; output will be discarded and retried",
+          escalationTier_);
+    return std::string();
   }
 
   // Determine which include ids should count as "expanded" for this refold.
