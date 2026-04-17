@@ -6637,7 +6637,7 @@ StringRef RefoldEngine::SliceSource(ArrayRef<size_t> tokOff, StringRef source,
 
 std::optional<std::string>
 RefoldEngine::UnstringifyLiteralToArgText(StringRef literalTok,
-                                          bool allowTopLevelComma) {
+                                          bool allowTopLevelComma) const {
   StringRef s = literalTok.trim();
   if (s.empty())
     return std::nullopt;
@@ -6683,11 +6683,63 @@ RefoldEngine::UnstringifyLiteralToArgText(StringRef literalTok,
     out.push_back(c);
   }
 
-  // Safety check: a top-level comma would be interpreted as multiple arguments
-  // in a macro invocation. Allow callers that are only normalizing for
-  // comparison (not re-synthesizing invocation text) to opt out.
-  if (!allowTopLevelComma && out.find(',') != std::string::npos)
-    return std::nullopt;
+  // Safety check: only a *top-level* comma would split a macro argument into
+  // multiple arguments when we synthesize invocation text. Nested commas inside
+  // parentheses, brackets, or braces are still a single argument and must be
+  // preserved (for example: CAT(bill, z)). Allow callers that are only
+  // normalizing for comparison (not re-synthesizing invocation text) to opt
+  // out.
+  if (!allowTopLevelComma) {
+    const SourceLocation BaseLoc = SourceLocation::getFromRawEncoding(1);
+    std::string LexBuf = out;
+    LexBuf.push_back('\0');
+    const char *BufStart = LexBuf.data();
+    const char *BufEnd = BufStart + out.size();
+    Lexer Lex(BaseLoc, lexLang_, BufStart, BufStart, BufEnd);
+
+    int ParenDepth = 0;
+    int BracketDepth = 0;
+    int BraceDepth = 0;
+    Token Tok;
+
+    while (true) {
+      Lex.LexFromRawLexer(Tok);
+      if (Tok.is(tok::eof))
+        break;
+      if (Tok.is(tok::comment))
+        continue;
+
+      switch (Tok.getKind()) {
+      case tok::l_paren:
+        ++ParenDepth;
+        break;
+      case tok::r_paren:
+        if (ParenDepth > 0)
+          --ParenDepth;
+        break;
+      case tok::l_square:
+        ++BracketDepth;
+        break;
+      case tok::r_square:
+        if (BracketDepth > 0)
+          --BracketDepth;
+        break;
+      case tok::l_brace:
+        ++BraceDepth;
+        break;
+      case tok::r_brace:
+        if (BraceDepth > 0)
+          --BraceDepth;
+        break;
+      case tok::comma:
+        if (ParenDepth == 0 && BracketDepth == 0 && BraceDepth == 0)
+          return std::nullopt;
+        break;
+      default:
+        break;
+      }
+    }
+  }
 
   // Macros cannot have raw newlines in arguments unless escaped/continued
   if (out.find('\n') != std::string::npos ||
@@ -8452,6 +8504,13 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
   const Owner currentPatchOwner =
       NormalizeHunkOwnerForPatch(model_.GetSourcePath(), h);
+
+  // Set when two different concrete subtree-backed witnesses for the same
+  // root disagree on an overlapping expected-root formal rewrite. Once this is
+  // set for the current pass, we suppress same-root structure-preserving reuse
+  // and let the existing whole-cover fallback logic realize the root instead of
+  // collapsing incompatible witnesses into one root replay.
+  bool conflictingConcreteSubtreeWitnessForcesWholeCover = false;
 
   // Do not downgrade: if we already have a patch for this invocation and it
   // does not look like a callsite invocation anymore (i.e. we already
@@ -16873,6 +16932,164 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     };
 
 
+    struct LocalFormalTextPair {
+      std::string oldText;
+      std::string newText;
+    };
+
+    // The patch audit stores expected-root rewrites in a compact summary form
+    // such as {0:'bill'->'bill', 1:'y'->'z'}. We only need enough structure to
+    // compare same-root witness cohorts, so parse that summary with the raw
+    // lexer instead of hand-scanning punctuation.
+    auto parseExpectedRootFormalSummary = [&](StringRef summary) {
+      DenseMap<uint32_t, LocalFormalTextPair> out;
+      StringRef s = summary.trim();
+      if (s.empty() || s == "{}")
+        return out;
+
+      const SourceLocation BaseLoc = SourceLocation::getFromRawEncoding(1);
+      std::string LexBuf = s.str();
+      LexBuf.push_back('\0');
+      const char *BufStart = LexBuf.data();
+      const char *BufEnd = BufStart + s.size();
+      Lexer Lex(BaseLoc, lexLang_, BufStart, BufStart, BufEnd);
+
+      auto nextNonCommentToken = [&]() {
+        Token Tok;
+        while (true) {
+          Lex.LexFromRawLexer(Tok);
+          if (!Tok.is(tok::comment))
+            return Tok;
+        }
+      };
+
+      auto tokenText = [&](const Token &Tok) -> StringRef {
+        const unsigned offset =
+            Tok.getLocation().getRawEncoding() - BaseLoc.getRawEncoding();
+        return StringRef(BufStart + offset, Tok.getLength());
+      };
+
+      auto parseQuotedPayload = [&](const Token &Tok)
+          -> std::optional<std::string> {
+        switch (Tok.getKind()) {
+        case tok::char_constant:
+        case tok::wide_char_constant:
+        case tok::utf8_char_constant:
+        case tok::utf16_char_constant:
+        case tok::utf32_char_constant:
+          break;
+        default:
+          return std::nullopt;
+        }
+
+        StringRef text = tokenText(Tok);
+        if (text.size() < 2 || text.front() != '\'' || text.back() != '\'')
+          return std::nullopt;
+        return text.drop_front().drop_back().str();
+      };
+
+      Token Tok = nextNonCommentToken();
+      if (!Tok.is(tok::l_brace))
+        return DenseMap<uint32_t, LocalFormalTextPair>{};
+
+      while (true) {
+        Tok = nextNonCommentToken();
+        if (Tok.is(tok::r_brace) || Tok.is(tok::eof))
+          break;
+        if (!Tok.is(tok::numeric_constant))
+          return DenseMap<uint32_t, LocalFormalTextPair>{};
+
+        uint32_t argIdx = 0;
+        if (tokenText(Tok).getAsInteger(10, argIdx))
+          return DenseMap<uint32_t, LocalFormalTextPair>{};
+
+        Tok = nextNonCommentToken();
+        if (!Tok.is(tok::colon))
+          return DenseMap<uint32_t, LocalFormalTextPair>{};
+
+        Tok = nextNonCommentToken();
+        auto oldText = parseQuotedPayload(Tok);
+        if (!oldText)
+          return DenseMap<uint32_t, LocalFormalTextPair>{};
+
+        Tok = nextNonCommentToken();
+        if (!Tok.is(tok::arrow))
+          return DenseMap<uint32_t, LocalFormalTextPair>{};
+
+        Tok = nextNonCommentToken();
+        auto newText = parseQuotedPayload(Tok);
+        if (!newText)
+          return DenseMap<uint32_t, LocalFormalTextPair>{};
+
+        out[argIdx] = LocalFormalTextPair{std::move(*oldText),
+                                          std::move(*newText)};
+
+        Tok = nextNonCommentToken();
+        if (Tok.is(tok::r_brace) || Tok.is(tok::eof))
+          break;
+        if (!Tok.is(tok::comma))
+          return DenseMap<uint32_t, LocalFormalTextPair>{};
+      }
+      return out;
+    };
+
+    // Only compare witnesses that are already at the same concrete discharge
+    // level. Deferred bridge-backed and passthrough-backed candidates are valid
+    // subtree witnesses too, but they intentionally represent the same root at
+    // a different abstraction level and must not be treated as conflicting
+    // concrete cohorts.
+    auto isConcreteSubtreeWitnessCohort = [&](const MacroPatch &patch) {
+      if (!patch.subtreeCertBacked)
+        return false;
+      if (patch.subtreeUsesLexicalBridge)
+        return false;
+      if (patch.subtreeHasPassthroughFlatten)
+        return false;
+      if (patch.subtreeDeferredRootArgCount != 0)
+        return false;
+      return true;
+    };
+
+    // Two different subtree-backed leaves for the same root only force
+    // whole-cover fallback when they disagree on an overlapping concrete root
+    // formal rewrite at the same concrete discharge level. This keeps safe
+    // deferred wrapper/stringify cohorts from being misclassified as conflicts
+    // merely because they preserve the same root through different bridge or
+    // deferred-discharge evidence.
+    auto conflictingConcreteSubtreeWitnesses =
+        [&](const MacroPatch &existing, const MacroPatch &candidate) {
+          if (!existing.subtreeCertBacked || !candidate.subtreeCertBacked)
+            return false;
+          if (existing.proofRootMacroId != m.id ||
+              candidate.proofRootMacroId != m.id)
+            return false;
+          if (!existing.subtreeLeafMacroId || !candidate.subtreeLeafMacroId)
+            return false;
+          if (existing.subtreeLeafMacroId == candidate.subtreeLeafMacroId)
+            return false;
+          if (!isConcreteSubtreeWitnessCohort(existing) ||
+              !isConcreteSubtreeWitnessCohort(candidate))
+            return false;
+
+          const auto existingFormals = parseExpectedRootFormalSummary(
+              existing.subtreeExpectedRootFormalSummary);
+          const auto candidateFormals = parseExpectedRootFormalSummary(
+              candidate.subtreeExpectedRootFormalSummary);
+          for (const auto &KV : existingFormals) {
+            auto it = candidateFormals.find(KV.first);
+            if (it == candidateFormals.end())
+              continue;
+            if (KV.second.oldText != it->second.oldText ||
+                KV.second.newText != it->second.newText)
+              return true;
+          }
+          return false;
+        };
+
+    // Merge a freshly constructed root candidate with an already-tracked
+    // structure-preserving callsite patch for the same invocation span. Before
+    // any text merge happens, reject incompatible concrete subtree cohorts so a
+    // later leaf witness cannot silently rewrite an earlier same-root patch.
     auto mergeCurrentRootWithExistingCallsitePatch =
         [&](MacroPatch &candidate, StringRef label) -> void {
       if (!existingPatch || !existingIsCallsite || baseInvText.empty() ||
@@ -16884,6 +17101,16 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         return;
       if (candidate.replacement == existingPatch->replacement)
         return;
+
+      if (conflictingConcreteSubtreeWitnesses(*existingPatch, candidate)) {
+        conflictingConcreteSubtreeWitnessForcesWholeCover = true;
+        trace("macro/proof",
+              "subtree continuity probe: concrete same-root witness conflict "
+              "forces whole-cover existing[{0}] candidate[{1}]",
+              FormatMacroPatchAudit(*existingPatch),
+              FormatMacroPatchAudit(candidate));
+        return;
+      }
 
       SmallVector<StringRef, 2> repls;
       repls.push_back(StringRef(candidate.replacement));
@@ -16970,7 +17197,15 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               stringutils::showWSWithClip(dag->replacement, 160));
       }
       mergeCurrentRootWithExistingCallsitePatch(*dag, "dag/direct root rewrite");
-      return *dag;
+      if (!conflictingConcreteSubtreeWitnessForcesWholeCover)
+        return *dag;
+
+      trace("macro/dag",
+            "same-root concrete subtree witness conflict suppresses DAG root "
+            "replay: root id={0} name='{1}'; falling back to whole-cover expansion",
+            m.id, m.name);
+      argsOnlyCandidate.reset();
+      reuseExistingCallsitePatch = false;
     }
 
     trace("macro/dag",
@@ -16988,12 +17223,25 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
       reuseExistingCallsitePatch = false;
     }
 
+    // Direct args-only replay is still allowed to compete with an existing
+    // structure-preserving patch, but we trace that comparison explicitly
+    // because mixed_stringify_and_paste was previously slipping through this
+    // path even after the DAG side had already identified a same-root witness
+    // conflict.
     if (argsOnlyCandidate && existingPatch && existingIsCallsite &&
         existingPatch->structurePreserving &&
         existingPatch->proofRootMacroId == m.id && !baseInvText.empty() &&
         argsOnlyCandidate->invStart == existingPatch->invStart &&
         argsOnlyCandidate->invEnd == existingPatch->invEnd &&
         argsOnlyCandidate->replacement != existingPatch->replacement) {
+      if (existingPatch->subtreeCertBacked) {
+        trace("macro/proof",
+              "subtree continuity probe: direct root args-only candidate examined "
+              "against existing subtree-backed callsite patch existing[{0}] candidate[{1}]",
+              FormatMacroPatchAudit(*existingPatch),
+              FormatMacroPatchAudit(*argsOnlyCandidate));
+      }
+
       SmallVector<StringRef, 2> repls;
       repls.push_back(StringRef(argsOnlyCandidate->replacement));
       repls.push_back(StringRef(existingPatch->replacement));
@@ -17039,7 +17287,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     return *argsOnlyCandidate;
   }
 
-  if (reuseExistingCallsitePatch) {
+  if (reuseExistingCallsitePatch &&
+      !conflictingConcreteSubtreeWitnessForcesWholeCover) {
     trace("macro", "callsite patch reused (args-only no-op) inv id={0}",
           m.id);
     if (existingPatch) {
@@ -17055,7 +17304,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     return *existingPatch;
   }
 
-  if (existingPatch && existingIsCallsite && existingPatch->structurePreserving &&
+  if (!conflictingConcreteSubtreeWitnessForcesWholeCover && existingPatch &&
+      existingIsCallsite && existingPatch->structurePreserving &&
       existingPatch->proofRootMacroId == m.id && !baseInvText.empty() &&
       InvocationSpanMatchesCallsitePrefix(baseInvText, m)) {
     trace("macro",
