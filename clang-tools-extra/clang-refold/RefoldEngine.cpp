@@ -14189,6 +14189,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         MixedSemanticInteractions,
         LexicalBridgeWithStructuredSemantics,
         DeferredPasteNotDischarged,
+        PasteWithPassthroughFlatten,
       };
 
       struct SubtreeSemanticAdmissibilityCertificate {
@@ -14579,6 +14580,39 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             hasInteractionScopedPasteSemantics;
         const bool hasBridgeSensitiveStructuredSemantics =
             semantic.hasBridgeSensitiveStructuredSemantics;
+
+        // Strict mode must fail closed when a paste-bearing subtree only reaches
+        // its parent through passthrough flatten. That rewrite path intentionally
+        // drops interior structural boundaries, which makes nested pasted-token
+        // edits underdetermined: multiple replay candidates can survive even
+        // though they share the same final pasted spelling. In that situation we
+        // do not have a unique structure-preserving witness, so the subtree must
+        // expand instead of being accepted as a DAG-root replay candidate.
+        if (semantic.touchesPaste && semantic.hasPassthroughFlatten) {
+          trace("macro/dag",
+                "subtree admissibility reject(lossy pasted flatten): "
+                "lexicalBridge={0} structuredSemantics={1} paste={2} "
+                "interactionPaste={3} passthroughFlatten={4} wrappers={5} "
+                "preferredChildSyntax={6} rawInvocation={7} summary={8}",
+                semantic.usesLexicalBridge ? 1 : 0,
+                hasStructuredSemantics ? 1 : 0,
+                semantic.touchesPaste ? 1 : 0,
+                hasInteractionScopedPasteSemantics ? 1 : 0,
+                semantic.hasPassthroughFlatten ? 1 : 0,
+                semantic.hasWrapperSemantics ? 1 : 0,
+                semantic.hasPreferredChildSyntax ? 1 : 0,
+                semantic.hasRawInvocationPreservation ? 1 : 0,
+                semantic.interactionSummary.detail);
+          cert.valid = false;
+          cert.failure =
+              SubtreeSemanticAdmissibilityFailure::PasteWithPassthroughFlatten;
+          cert.detail =
+              "subtree semantic admissibility failed: paste-bearing subtree "
+              "relies on passthrough flatten and therefore does not have a "
+              "unique structure-preserving witness";
+          return cert;
+        }
+
         if (hasBridgeSensitiveStructuredSemantics) {
           trace("macro/dag",
                 "subtree admissibility reject(bridge-sensitive semantics): "
@@ -17487,34 +17521,39 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
     auto dag = tryDAGChainedArgsOnly();
     if (dag) {
+      bool preferDirectRootCandidate = false;
       if (argsOnlyCandidate && dag->invStart == argsOnlyCandidate->invStart &&
           dag->invEnd == argsOnlyCandidate->invEnd &&
           dag->replacement != argsOnlyCandidate->replacement &&
           !baseInvText.empty()) {
-        SmallVector<StringRef, 2> repls;
-        repls.push_back(StringRef(dag->replacement));
-        repls.push_back(StringRef(argsOnlyCandidate->replacement));
-        auto merged = mergeCompatibleRootCallsiteReplacements(
-            baseInvText, ArrayRef<StringRef>(repls));
-        if (merged && validateMergedDirectAndDagRootReplacement(
-                          baseInvText, StringRef(*merged))) {
+        const bool directValid = validateMergedDirectAndDagRootReplacement(
+            baseInvText, StringRef(argsOnlyCandidate->replacement));
+        const bool dagValid = validateMergedDirectAndDagRootReplacement(
+            baseInvText, StringRef(dag->replacement));
+
+        // If both root-level candidates independently validate, prefer the
+        // direct args-only rewrite instead of merging them into a hybrid root
+        // replacement. The direct candidate preserves the original root
+        // callsite surface without inventing an additional semantic root
+        // rewrite, whereas a merged direct/DAG root can combine evidence from
+        // different proof modes into a less-structural replacement.
+        if (directValid && dagValid) {
+          preferDirectRootCandidate = true;
           trace("macro/dag",
-                "DAG/direct root patches merged: root id={0} name='{1}' "
-                "direct='{2}' dag='{3}' merged='{4}'",
-                m.id, m.name,
-                stringutils::showWSWithClip(argsOnlyCandidate->replacement, 160),
-                stringutils::showWSWithClip(dag->replacement, 160),
-                stringutils::showWSWithClip(*merged, 160));
-          dag->replacement = std::move(*merged);
-          if (!dag->macroId)
-            dag->macroId = argsOnlyCandidate->macroId;
-        } else {
-          trace("macro/dag",
-                "DAG args-only preferred over direct args-only: root id={0} "
-                "name='{1}' direct='{2}' dag='{3}'",
+                "direct args-only preferred over DAG root rewrite when both "
+                "independently validate: root id={0} name='{1}' direct='{2}' "
+                "dag='{3}'",
                 m.id, m.name,
                 stringutils::showWSWithClip(argsOnlyCandidate->replacement, 160),
                 stringutils::showWSWithClip(dag->replacement, 160));
+        } else {
+          trace("macro/dag",
+                "DAG args-only preferred over direct args-only: root id={0} "
+                "name='{1}' direct='{2}' dag='{3}' directValid={4} dagValid={5}",
+                m.id, m.name,
+                stringutils::showWSWithClip(argsOnlyCandidate->replacement, 160),
+                stringutils::showWSWithClip(dag->replacement, 160),
+                directValid ? 1 : 0, dagValid ? 1 : 0);
         }
       } else if (argsOnlyCandidate &&
                  dag->replacement != argsOnlyCandidate->replacement) {
@@ -17525,16 +17564,19 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               stringutils::showWSWithClip(argsOnlyCandidate->replacement, 160),
               stringutils::showWSWithClip(dag->replacement, 160));
       }
-      mergeCurrentRootWithExistingCallsitePatch(*dag, "dag/direct root rewrite");
-      if (!conflictingConcreteSubtreeWitnessForcesWholeCover)
-        return *dag;
+      if (!preferDirectRootCandidate) {
+        mergeCurrentRootWithExistingCallsitePatch(*dag,
+                                                  "dag/direct root rewrite");
+        if (!conflictingConcreteSubtreeWitnessForcesWholeCover)
+          return *dag;
 
-      trace("macro/dag",
-            "same-root concrete subtree witness conflict suppresses DAG root "
-            "replay: root id={0} name='{1}'; falling back to whole-cover expansion",
-            m.id, m.name);
-      argsOnlyCandidate.reset();
-      reuseExistingCallsitePatch = false;
+        trace("macro/dag",
+              "same-root concrete subtree witness conflict suppresses DAG root "
+              "replay: root id={0} name='{1}'; falling back to whole-cover expansion",
+              m.id, m.name);
+        argsOnlyCandidate.reset();
+        reuseExistingCallsitePatch = false;
+      }
     }
 
     trace("macro/dag",
