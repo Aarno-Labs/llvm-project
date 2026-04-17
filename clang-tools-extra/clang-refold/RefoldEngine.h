@@ -496,6 +496,19 @@ private:
         : argIdx(Idx), newSeg(std::move(New)), oldSeg(std::move(Old)) {}
   };
 
+  enum class MacroPatchProofKind : uint8_t {
+    Unknown,
+    CounterLiteral,
+    ArgsOnlyPasteMulti,
+    ArgsOnlyPasteSingle,
+    ArgsOnlyPurePasteOnly,
+    ArgsOnlyStandard,
+    ArgsOnlyPairedPureInsertion,
+    DagSubtreeRoot,
+    CallChainSuffix,
+    WholeCoverFallback,
+  };
+
   struct MacroPatch {
     uint64_t invStart, invEnd;
     std::string replacement;
@@ -505,6 +518,11 @@ private:
     // byte span and owner.
     uint64_t macroId = 0;
 
+    // Proof provenance for layer-3 root/callsite admissibility.
+    MacroPatchProofKind proofKind = MacroPatchProofKind::Unknown;
+    bool proofValidated = false;
+    bool structurePreserving = false;
+    uint64_t proofRootMacroId = 0;
   };
 
   struct IncludePatch {

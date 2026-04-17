@@ -5346,7 +5346,14 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
 
         trace("macro/args", "  args-only SUCCESS newInv='{0}'",
               stringutils::showWSWithClip(newInv, 200));
-        return MacroPatch{*m.invB, *m.invE, std::move(newInv), 0};
+        {
+        MacroPatch patch{*m.invB, *m.invE, std::move(newInv), m.id};
+        patch.proofKind = MacroPatchProofKind::ArgsOnlyPasteMulti;
+        patch.proofValidated = true;
+        patch.structurePreserving = true;
+        patch.proofRootMacroId = m.id;
+        return patch;
+      }
       }
     }
 
@@ -5392,7 +5399,14 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
           stringutils::replaceRange(baseInvText, r.first, r.second, newArg);
       trace("macro/args", "  args-only SUCCESS newInv='{0}'",
             stringutils::showWSWithClip(newInv, 200));
-      return MacroPatch{*m.invB, *m.invE, std::move(newInv), 0};
+      {
+        MacroPatch patch{*m.invB, *m.invE, std::move(newInv), m.id};
+        patch.proofKind = MacroPatchProofKind::ArgsOnlyPasteSingle;
+        patch.proofValidated = true;
+        patch.structurePreserving = true;
+        patch.proofRootMacroId = m.id;
+        return patch;
+      }
     }
 
     // If we touched paste but could not safely derive a paste splice patch,
@@ -5513,7 +5527,14 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
 
     trace("macro/args", "    pure-paste-only SUCCESS newInv='{0}'",
           stringutils::showWSWithClip(newInv, 200));
-    return MacroPatch{*m.invB, *m.invE, std::move(newInv), 0};
+    {
+      MacroPatch patch{*m.invB, *m.invE, std::move(newInv), m.id};
+      patch.proofKind = MacroPatchProofKind::ArgsOnlyPurePasteOnly;
+      patch.proofValidated = true;
+      patch.structurePreserving = true;
+      patch.proofRootMacroId = m.id;
+      return patch;
+    }
   }
 
   if (occs.empty())
@@ -6305,7 +6326,14 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
                                          replByArgIdx[argIdx]);
   }
 
-  return MacroPatch{*m.invB, *m.invE, std::move(finalInv), 0};
+  {
+    MacroPatch patch{*m.invB, *m.invE, std::move(finalInv), m.id};
+    patch.proofKind = MacroPatchProofKind::ArgsOnlyStandard;
+    patch.proofValidated = true;
+    patch.structurePreserving = true;
+    patch.proofRootMacroId = m.id;
+    return patch;
+  }
 }
 
 StringRef RefoldEngine::SliceSource(ArrayRef<size_t> tokOff, StringRef source,
@@ -7879,7 +7907,14 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         repl = SliceBSource(bEnv->first, bEnv->second).trim().str();
     }
     if (repl)
-      return MacroPatch{*invStart, *invEnd, std::move(*repl), 0};
+      {
+        MacroPatch patch{*invStart, *invEnd, std::move(*repl), m.id};
+        patch.proofKind = MacroPatchProofKind::CounterLiteral;
+        patch.proofValidated = true;
+        patch.structurePreserving = false;
+        patch.proofRootMacroId = m.id;
+        return patch;
+      }
   }
 
   trace("macro/whole",
@@ -7911,8 +7946,10 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
       if (p.invStart != *invStart || p.invEnd != *invEnd)
         continue;
 
+      const bool isStructurePreserving =
+          p.structurePreserving && p.proofRootMacroId == m.id;
       const bool isCallsite =
-          InvocationSpanMatchesCallsitePrefix(p.replacement, m);
+          isStructurePreserving && InvocationSpanMatchesCallsitePrefix(p.replacement, m);
       if (!isCallsite) {
         if (!bestNonCallsiteId || id < *bestNonCallsiteId)
           bestNonCallsiteId = id;
@@ -7932,7 +7969,10 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
       auto it = ownerIt->second.find(*bestCallsiteId);
       if (it != ownerIt->second.end()) {
         existingPatch = &it->second;
-        existingIsCallsite = true;
+        existingIsCallsite = it->second.structurePreserving &&
+                             it->second.proofRootMacroId == m.id &&
+                             InvocationSpanMatchesCallsitePrefix(
+                                 it->second.replacement, m);
       }
     }
   }
@@ -8333,7 +8373,14 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             "argIdx={2} cur={3} partner={4} newInv='{5}'",
             m.id, m.name, argIdx, hEff, partner,
             stringutils::showWSWithClip(newInv, 200));
-      return MacroPatch{*m.invB, *m.invE, std::move(newInv), 0};
+      {
+        MacroPatch patch{*m.invB, *m.invE, std::move(newInv), m.id};
+        patch.proofKind = MacroPatchProofKind::ArgsOnlyPairedPureInsertion;
+        patch.proofValidated = true;
+        patch.structurePreserving = true;
+        patch.proofRootMacroId = m.id;
+        return patch;
+      }
     }
 
     return std::nullopt;
@@ -8364,7 +8411,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         // by the current callsite text. Defer reusing it until after DAG
         // chaining has had a chance to preserve deeper structure.
         reuseExistingCallsitePatch =
-            existingPatch && existingIsCallsite && !baseInvText.empty();
+            existingPatch && existingIsCallsite && !baseInvText.empty() &&
+            existingPatch->structurePreserving &&
+            existingPatch->proofRootMacroId == m.id;
       }
     } else if (InvocationSpanMatchesCallsitePrefix(invSpanText, m)) {
       argsOnlyCandidate = tryPairedPureInsertionRootArgsOnly();
@@ -14847,6 +14896,10 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                               .str();
             return cert;
           }
+          if (!candPatch.macroId)
+            candPatch.macroId = m.id;
+          if (!candPatch.proofRootMacroId)
+            candPatch.proofRootMacroId = m.id;
           uniquePatch = std::move(candPatch);
           uniquePatchBaseText = baseText.str();
           uniquePatchValidation = std::move(candidateValidation);
@@ -14940,6 +14993,10 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           return cert;
         }
         if (preferredStructured > 0) {
+          if (!candPatch.macroId)
+            candPatch.macroId = m.id;
+          if (!candPatch.proofRootMacroId)
+            candPatch.proofRootMacroId = m.id;
           uniquePatch = std::move(candPatch);
           uniquePatchBaseText = baseText.str();
           uniquePatchValidation = std::move(candidateValidation);
@@ -15533,7 +15590,11 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                       m.id, leaf.id, *invStart, *invEnd, chainEnd,
                       localEdits.size(), replText.size());
 
-                MacroPatch candPatch{*invStart, chainEnd, replText};
+                MacroPatch candPatch{*invStart, chainEnd, replText, m.id};
+                candPatch.proofKind = MacroPatchProofKind::CallChainSuffix;
+                candPatch.proofValidated = true;
+                candPatch.structurePreserving = true;
+                candPatch.proofRootMacroId = m.id;
 
                 auto acceptCert = acceptOrMergeDAGCandidatePatch(
                     std::move(candPatch),
@@ -15638,6 +15699,11 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           continue;
         }
 
+        rootPatchCert.patch->macroId = m.id;
+        rootPatchCert.patch->proofKind = MacroPatchProofKind::DagSubtreeRoot;
+        rootPatchCert.patch->proofValidated = true;
+        rootPatchCert.patch->structurePreserving = true;
+        rootPatchCert.patch->proofRootMacroId = m.id;
         auto acceptCert = acceptOrMergeDAGCandidatePatch(
             std::move(*rootPatchCert.patch), invSpanText,
             "DAG subtree root patch", &subtreeValidation);
@@ -15763,7 +15829,14 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                 }
                 if (ok) {
                   out.append(covered, cur, covered.size() - cur);
-                  return MacroPatch{minB, maxE, std::move(out)};
+                  {
+                    MacroPatch patch{minB, maxE, std::move(out), m.id};
+                    patch.proofKind = MacroPatchProofKind::CallChainSuffix;
+                    patch.proofValidated = true;
+                    patch.structurePreserving = true;
+                    patch.proofRootMacroId = m.id;
+                    return patch;
+                  }
                 }
               }
             }
@@ -15925,7 +15998,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
     auto mergeCurrentRootWithExistingCallsitePatch =
         [&](MacroPatch &candidate, StringRef label) -> void {
-      if (!existingPatch || !existingIsCallsite || baseInvText.empty())
+      if (!existingPatch || !existingIsCallsite || baseInvText.empty() ||
+          !existingPatch->structurePreserving ||
+          existingPatch->proofRootMacroId != m.id)
         return;
       if (candidate.invStart != existingPatch->invStart ||
           candidate.invEnd != existingPatch->invEnd)
@@ -16021,7 +16096,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     }
 
     if (argsOnlyCandidate && existingPatch && existingIsCallsite &&
-        !baseInvText.empty() && argsOnlyCandidate->invStart == existingPatch->invStart &&
+        existingPatch->structurePreserving &&
+        existingPatch->proofRootMacroId == m.id && !baseInvText.empty() &&
+        argsOnlyCandidate->invStart == existingPatch->invStart &&
         argsOnlyCandidate->invEnd == existingPatch->invEnd &&
         argsOnlyCandidate->replacement != existingPatch->replacement) {
       SmallVector<StringRef, 2> repls;
@@ -16072,7 +16149,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     return *existingPatch;
   }
 
-  if (existingPatch && existingIsCallsite && !baseInvText.empty() &&
+  if (existingPatch && existingIsCallsite && existingPatch->structurePreserving &&
+      existingPatch->proofRootMacroId == m.id && !baseInvText.empty() &&
       InvocationSpanMatchesCallsitePrefix(baseInvText, m)) {
     trace("macro",
           "callsite patch reused (skip whole-cover expansion) inv id={0}",
@@ -16080,7 +16158,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     return *existingPatch;
   }
 
-  if (existingExpandedPatch) {
+  if (existingExpandedPatch && !existingExpandedPatch->structurePreserving) {
     trace("macro",
           "expanded patch reused after preservation attempts failed inv id={0}",
           m.id);
@@ -16173,7 +16251,14 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   if (bTokEnd <= bTokStart)
     return std::nullopt;
   std::string clipped = SliceBSourceClippedAgainstClaims(bTokStart, bTokEnd);
-  return MacroPatch{*invStart, *invEnd, StringRef(clipped).trim().str(), 0};
+  {
+    MacroPatch patch{*invStart, *invEnd, StringRef(clipped).trim().str(), m.id};
+    patch.proofKind = MacroPatchProofKind::WholeCoverFallback;
+    patch.proofValidated = false;
+    patch.structurePreserving = false;
+    patch.proofRootMacroId = m.id;
+    return patch;
+  }
 }
 
 bool RefoldEngine::InvocationSpanMatchesCallsitePrefix(
