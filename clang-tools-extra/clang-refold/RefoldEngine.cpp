@@ -14245,6 +14245,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         bool hasRawInvocationPreservation = false;
         bool hasPassthroughFlatten = false;
         bool hasBridgeSensitiveStructuredSemantics = false;
+        bool hasAcceptedRootPlaceholderReplay = false;
+        bool rootReplayFlattensOnlyWholeChildArgs = false;
+        const RefoldModel::MacroInvocation *acceptedRootReplayInv = nullptr;
         SmallVector<InvocationRewriteCertificate, 8> invocationCertificates;
         SmallVector<FormalRewriteCertificate, 16> formalCertificates;
         SmallVector<ArgSemanticRewriteCertificate, 16> argCertificates;
@@ -14607,10 +14610,29 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         // its parent through passthrough flatten. That rewrite path intentionally
         // drops interior structural boundaries, which makes nested pasted-token
         // edits underdetermined: multiple replay candidates can survive even
-        // though they share the same final pasted spelling. In that situation we
-        // do not have a unique structure-preserving witness, so the subtree must
-        // expand instead of being accepted as a DAG-root replay candidate.
-        if (semantic.touchesPaste && semantic.hasPassthroughFlatten) {
+        // though they share the same final pasted spelling.
+        //
+        // One narrow proof class is still admissible: if the accepted root replay
+        // itself is a deferred wrapper-placeholder replay whose rewritten syntax
+        // is known, and every rewritten root formal corresponds to exactly one
+        // whole-child placeholder, then the parent invocation is certified while
+        // only the child subtree is flattened. In that case we are not inventing
+        // interior child structure; we are preserving only the ancestor syntax
+        // that has already been proven replayable.
+        const bool allowRootPlaceholderFlattenReplay =
+            semantic.hasAcceptedRootPlaceholderReplay &&
+            semantic.rootReplayFlattensOnlyWholeChildArgs &&
+            semantic.acceptedRootReplayInv &&
+            semantic.deferredPasteDischarge.valid &&
+            !semantic.deferredPasteDischarge.deferredInvocations.empty() &&
+            llvm::all_of(
+                semantic.deferredPasteDischarge.deferredInvocations,
+                [&](const InvocationRewriteCertificate *invCert) {
+                  return invCert && invCert->inv &&
+                         invCert->inv->id == semantic.acceptedRootReplayInv->id;
+                });
+        if (semantic.touchesPaste && semantic.hasPassthroughFlatten &&
+            !allowRootPlaceholderFlattenReplay) {
           trace("macro/dag",
                 "subtree admissibility reject(lossy pasted flatten): "
                 "lexicalBridge={0} structuredSemantics={1} paste={2} "
@@ -14633,6 +14655,26 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               "relies on passthrough flatten and therefore does not have a "
               "unique structure-preserving witness";
           return cert;
+        }
+        if (semantic.touchesPaste && semantic.hasPassthroughFlatten &&
+            allowRootPlaceholderFlattenReplay) {
+          trace("macro/dag",
+                "subtree admissibility accept(root placeholder flatten): "
+                "lexicalBridge={0} structuredSemantics={1} paste={2} "
+                "interactionPaste={3} passthroughFlatten={4} wrappers={5} "
+                "preferredChildSyntax={6} rawInvocation={7} rootReplayInv={8} "
+                "summary={9}",
+                semantic.usesLexicalBridge ? 1 : 0,
+                hasStructuredSemantics ? 1 : 0,
+                semantic.touchesPaste ? 1 : 0,
+                hasInteractionScopedPasteSemantics ? 1 : 0,
+                semantic.hasPassthroughFlatten ? 1 : 0,
+                semantic.hasWrapperSemantics ? 1 : 0,
+                semantic.hasPreferredChildSyntax ? 1 : 0,
+                semantic.hasRawInvocationPreservation ? 1 : 0,
+                semantic.acceptedRootReplayInv ? semantic.acceptedRootReplayInv->id
+                                               : 0,
+                semantic.interactionSummary.detail);
         }
 
         if (hasBridgeSensitiveStructuredSemantics) {
@@ -14704,6 +14746,23 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         auto makeFormalKey = [&](const RefoldModel::MacroInvocation *inv,
                                  uint32_t argIdx) -> std::string {
           return formatv("{0}#{1}", inv ? inv->id : 0, argIdx).str();
+        };
+
+        // Returns true iff the original root formal is exactly one top-level
+        // child placeholder and nothing else. This is the structural predicate
+        // for preserving the parent while flattening only that child.
+        auto rootFormalIsWholeSingleChildPlaceholder =
+            [&](const InvocationRewriteCertificate &invCert,
+                uint32_t argIdx) -> bool {
+          if (!invCert.inv)
+            return false;
+          auto rawArg = getInvocationArgText(*invCert.inv, argIdx);
+          if (!rawArg)
+            return false;
+          auto placeholders = getTopLevelLexicalChildrenInArg(*invCert.inv, argIdx);
+          return placeholders.size() == 1 && placeholders.front().child &&
+                 placeholders.front().relBegin == 0 &&
+                 placeholders.front().relEnd == rawArg->size();
         };
 
         auto recordSlotCertificate =
@@ -14810,6 +14869,27 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           cert.rootMergeCertificates.push_back(mergeCert);
 
         recordInvocationCertificate(rootCert);
+
+        // Track whether the accepted root replay qualifies for the narrow
+        // "preserve parent / flatten child" proof class. We only admit root
+        // replays that are already uniquely certified deferred paste replays
+        // with concrete rewritten syntax, and only when every rewritten formal
+        // corresponds to one whole child placeholder in the original root.
+        if (rootCert.kind == InvocationRewriteCertificateKind::Unique &&
+            rootCert.pasteValidation.required && rootCert.pasteValidation.valid &&
+            rootCert.pasteValidation.deferred &&
+            !rootCert.rewrittenInvocationSyntax.empty() && rootCert.inv) {
+          cert.hasAcceptedRootPlaceholderReplay = true;
+          cert.acceptedRootReplayInv = rootCert.inv;
+          cert.rootReplayFlattensOnlyWholeChildArgs = !rootCert.rewrites.empty();
+          for (const auto &rewrite : rootCert.rewrites) {
+            if (!rootFormalIsWholeSingleChildPlaceholder(rootCert,
+                                                         rewrite.argIdx)) {
+              cert.rootReplayFlattensOnlyWholeChildArgs = false;
+              break;
+            }
+          }
+        }
         cert.interactionSummary =
             buildSubtreeInteractionSummaryCertificate(cert.interactionCertificates);
         cert.interactionConsistency =
