@@ -62,6 +62,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/Hashing.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
@@ -78,6 +79,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <set>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -3599,6 +3601,15 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
   }
 
   if (!hasAny) {
+    for (const auto &s : m.stringifySpans) {
+      if (s.argIdx == argIdx) {
+        hasAny = true;
+        break;
+      }
+    }
+  }
+
+  if (!hasAny) {
     for (const auto &s : m.pasteSpans) {
       if (s.argIdx == argIdx) {
         hasAny = true;
@@ -3607,8 +3618,95 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
     }
   }
 
-  if (!hasAny)
+  if (!hasAny) {
+    auto hasDirectOccurrenceSupport = [](const RefoldModel::MacroInvocation &inv,
+                                         uint32_t formalIdx) -> bool {
+      for (const auto &s : inv.argSpans) {
+        if (s.argIdx == formalIdx)
+          return true;
+      }
+      for (const auto &s : inv.stringifySpans) {
+        if (s.argIdx == formalIdx)
+          return true;
+      }
+      for (const auto &s : inv.pasteSpans) {
+        if (s.argIdx == formalIdx)
+          return true;
+      }
+      return false;
+    };
+
+    std::function<bool(const RefoldModel::MacroInvocation &, uint32_t,
+                       std::set<std::pair<uint64_t, uint32_t>> &)>
+        hasOccurrenceSupportThroughGraph;
+
+    hasOccurrenceSupportThroughGraph =
+        [&](const RefoldModel::MacroInvocation &inv, uint32_t formalIdx,
+            std::set<std::pair<uint64_t, uint32_t>> &visiting) -> bool {
+      std::pair<uint64_t, uint32_t> key{inv.id, formalIdx};
+      if (!visiting.insert(key).second)
+        return false;
+
+      auto eraseOnExit = llvm::make_scope_exit([&] { visiting.erase(key); });
+
+      if (hasDirectOccurrenceSupport(inv, formalIdx))
+        return true;
+
+      auto childIt = macroChildrenById_.find(inv.id);
+      if (childIt != macroChildrenById_.end()) {
+        for (const auto *child : childIt->second) {
+          for (uint32_t childFormalIdx = 0;
+               childFormalIdx < child->argDeps.size(); ++childFormalIdx) {
+            bool dependsOnFormal = false;
+            for (uint32_t dep : child->argDeps[childFormalIdx]) {
+              if (dep == formalIdx) {
+                dependsOnFormal = true;
+                break;
+              }
+            }
+            if (!dependsOnFormal)
+              continue;
+            if (hasOccurrenceSupportThroughGraph(*child, childFormalIdx,
+                                                 visiting))
+              return true;
+          }
+        }
+      }
+
+      if (inv.callerMacroId && formalIdx < inv.argDeps.size()) {
+        auto parentChildrenIt = macroChildrenById_.find(*inv.callerMacroId);
+        if (parentChildrenIt != macroChildrenById_.end()) {
+          ArrayRef<uint32_t> deps = inv.argDeps[formalIdx];
+          for (const auto *sib : parentChildrenIt->second) {
+            if (sib->id == inv.id)
+              continue;
+            for (uint32_t sibFormalIdx = 0; sibFormalIdx < sib->argDeps.size();
+                 ++sibFormalIdx) {
+              bool sharesCallerDeps = false;
+              for (uint32_t sibDep : sib->argDeps[sibFormalIdx]) {
+                if (llvm::is_contained(deps, sibDep)) {
+                  sharesCallerDeps = true;
+                  break;
+                }
+              }
+              if (!sharesCallerDeps)
+                continue;
+              if (hasOccurrenceSupportThroughGraph(*sib, sibFormalIdx,
+                                                   visiting))
+                return true;
+            }
+          }
+        }
+      }
+
+      return false;
+    };
+
+    std::set<std::pair<uint64_t, uint32_t>> visiting;
+    if (!hasOccurrenceSupportThroughGraph(m, argIdx, visiting))
+      return false;
     return true;
+  }
 
   const uint64_t maxTok =
       bTokOff_.empty() ? 0ULL : static_cast<uint64_t>(bTokOff_.size() - 1);
@@ -13272,6 +13370,51 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           return false;
         };
 
+        auto rootReplayMatchesLexicalBridgeChain =
+            [&](const InvocationRewriteCertificate &deferredInvCert) -> bool {
+          if (!deferredInvCert.inv || !rootCert.inv ||
+              !rootCert.pasteValidation.valid)
+            return false;
+
+          for (const auto &liftCert : semantic.liftChains) {
+            if (!liftCert.leaf)
+              continue;
+            if (!isAncestorOrSame(deferredInvCert.inv, liftCert.leaf))
+              continue;
+            if (!liftCert.usedLexicalBridge ||
+                liftCert.bridgedRootArgIdxs.empty())
+              continue;
+
+            bool allBridgedRootFormalsMatched = true;
+            for (uint32_t rootArgIdx : liftCert.bridgedRootArgIdxs) {
+              auto rootFormalIt = liftCert.rootFormals.find(rootArgIdx);
+              if (rootFormalIt == liftCert.rootFormals.end()) {
+                allBridgedRootFormalsMatched = false;
+                break;
+              }
+
+              bool matchedRewrite = false;
+              for (const auto &rewrite : rootCert.rewrites) {
+                if (rewrite.argIdx != rootArgIdx)
+                  continue;
+                if (rewrite.oldText == rootFormalIt->second.oldText &&
+                    rewrite.newText == rootFormalIt->second.newText) {
+                  matchedRewrite = true;
+                  break;
+                }
+              }
+              if (!matchedRewrite) {
+                allBridgedRootFormalsMatched = false;
+                break;
+              }
+            }
+
+            if (allBridgedRootFormalsMatched)
+              return true;
+          }
+          return false;
+        };
+
         for (const auto &invCert : semantic.invocationCertificates) {
           if (!invCert.pasteValidation.deferred)
             continue;
@@ -13305,8 +13448,10 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           }
 
           const bool hasAcceptedRootReplayCandidate =
-              invCert.inv && rootCert.inv &&
-              invCert.inv->id == rootCert.inv->id && rootCert.pasteValidation.valid;
+              (invCert.inv && rootCert.inv &&
+               invCert.inv->id == rootCert.inv->id &&
+               rootCert.pasteValidation.valid) ||
+              rootReplayMatchesLexicalBridgeChain(invCert);
 
           trace("macro/dag",
                 "subtree deferred discharge probe: deferredInv id={0} name={1} rootInv id={2} name={3} rootKind={4} rootPasteRequired={5} rootPasteValid={6} rootPasteDeferred={7} hasSemantic={8} hasAncestorReplay={9} hasAcceptedRootReplay={10}",
