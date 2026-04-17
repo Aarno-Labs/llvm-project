@@ -7771,6 +7771,76 @@ bool RefoldEngine::WholeCoverPatchMatchesPlan(const MacroPatch &patch,
          patch.wholeCoverBAdjHi == plan.bTokEnd;
 }
 
+StringRef
+RefoldEngine::FormatMacroPatchProofKind(MacroPatchProofKind kind) const {
+  switch (kind) {
+  case MacroPatchProofKind::Unknown:
+    return "Unknown";
+  case MacroPatchProofKind::CounterLiteral:
+    return "CounterLiteral";
+  case MacroPatchProofKind::ArgsOnlyPasteMulti:
+    return "ArgsOnlyPasteMulti";
+  case MacroPatchProofKind::ArgsOnlyPasteSingle:
+    return "ArgsOnlyPasteSingle";
+  case MacroPatchProofKind::ArgsOnlyPurePasteOnly:
+    return "ArgsOnlyPurePasteOnly";
+  case MacroPatchProofKind::ArgsOnlyStandard:
+    return "ArgsOnlyStandard";
+  case MacroPatchProofKind::ArgsOnlyPairedPureInsertion:
+    return "ArgsOnlyPairedPureInsertion";
+  case MacroPatchProofKind::DagSubtreeRoot:
+    return "DagSubtreeRoot";
+  case MacroPatchProofKind::CallChainSuffix:
+    return "CallChainSuffix";
+  case MacroPatchProofKind::WholeCoverFallback:
+    return "WholeCoverFallback";
+  }
+  return "Unknown";
+}
+
+std::string RefoldEngine::FormatMacroPatchAudit(const MacroPatch &patch) const {
+  return formatv(
+             "proofKind={0} validated={1} struct={2} proofRoot={3} "
+             "subtreeCert={4} leaf={5} witnesses={6} invCerts={7} "
+             "formalCerts={8} argCerts={9} liftChains={10} liftSteps={11} "
+             "rootMerges={12} lexicalBridge={13} paste={14} wrappers={15} "
+             "stringify={16} wideStringify={17} childSyntax={18} "
+             "rawInvocation={19} passthrough={20} bridgeSensitive={21} "
+             "deferredPasteDischarged={22} admissible={23} expRootN={24} "
+             "deferredRootN={25} bridgeFormalN={26} expRoot={27} "
+             "deferredRootArgs={28} bridgeFormals={29} wholeCoverA=[{30},{31}) "
+             "wholeCoverBraw=[{32},{33}) wholeCoverBadj=[{34},{35})",
+             FormatMacroPatchProofKind(patch.proofKind),
+             patch.proofValidated ? 1 : 0,
+             patch.structurePreserving ? 1 : 0, patch.proofRootMacroId,
+             patch.subtreeCertBacked ? 1 : 0, patch.subtreeLeafMacroId,
+             patch.subtreeWitnessCount, patch.subtreeInvocationCertCount,
+             patch.subtreeFormalCertCount, patch.subtreeArgCertCount,
+             patch.subtreeLiftChainCount, patch.subtreeLiftStepCount,
+             patch.subtreeRootMergeCount,
+             patch.subtreeUsesLexicalBridge ? 1 : 0,
+             patch.subtreeTouchesPaste ? 1 : 0,
+             patch.subtreeHasWrapperSemantics ? 1 : 0,
+             patch.subtreeHasStringifySemantics ? 1 : 0,
+             patch.subtreeHasWideStringifySemantics ? 1 : 0,
+             patch.subtreeHasPreferredChildSyntax ? 1 : 0,
+             patch.subtreeHasRawInvocationPreservation ? 1 : 0,
+             patch.subtreeHasPassthroughFlatten ? 1 : 0,
+             patch.subtreeHasBridgeSensitiveStructuredSemantics ? 1 : 0,
+             patch.subtreeDeferredPasteDischarged ? 1 : 0,
+             patch.subtreeAdmissible ? 1 : 0,
+             patch.subtreeExpectedRootFormalCount,
+             patch.subtreeDeferredRootArgCount,
+             patch.subtreeBridgeSensitiveFormalCount,
+             stringutils::showWSWithClip(patch.subtreeExpectedRootFormalSummary, 160),
+             stringutils::showWSWithClip(patch.subtreeDeferredRootArgSummary, 160),
+             stringutils::showWSWithClip(patch.subtreeBridgeSensitiveFormalSummary, 160),
+             patch.wholeCoverALo, patch.wholeCoverAHi, patch.wholeCoverBRawLo,
+             patch.wholeCoverBRawHi, patch.wholeCoverBAdjLo,
+             patch.wholeCoverBAdjHi)
+      .str();
+}
+
 std::optional<std::string>
 RefoldEngine::BuildWholeCoverReplacementText(
     const RefoldModel::MacroInvocation &m) const {
@@ -8017,6 +8087,17 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                                  it->second.replacement, m);
       }
     }
+  }
+
+  if (existingPatch) {
+    trace("macro/proof",
+          "existing callsite patch audit: inv id={0} name={1} {2}", m.id,
+          m.name, FormatMacroPatchAudit(*existingPatch));
+  }
+  if (existingExpandedPatch) {
+    trace("macro/proof",
+          "existing expanded patch audit: inv id={0} name={1} {2}", m.id,
+          m.name, FormatMacroPatchAudit(*existingExpandedPatch));
   }
 
   // Trim equal A/B token edges so args-only can run even if the diff hunk spans
@@ -14313,6 +14394,40 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         bool hasMixedSemanticInteractions = false;
       };
 
+      auto formatBridgeSensitiveFormalSignatureMap =
+          [&](const StringMap<SemanticInteractionSignature> &sigs) {
+            SmallVector<StringRef, 8> keys;
+            keys.reserve(sigs.size());
+            for (const auto &KV : sigs)
+              keys.push_back(KV.getKey());
+            llvm::sort(keys);
+
+            std::string out;
+            raw_string_ostream os(out);
+            os << "{";
+            for (size_t i = 0; i < keys.size(); ++i) {
+              if (i)
+                os << ", ";
+              StringRef key = keys[i];
+              const auto it = sigs.find(key);
+              os << key << ":(paste="
+                 << (it->second.touchesPaste ? 1 : 0)
+                 << ", stringify="
+                 << (it->second.usesStringify ? 1 : 0)
+                 << ", wide="
+                 << (it->second.usesWideStringify ? 1 : 0)
+                 << ", wrapper="
+                 << (it->second.usesPassthroughFlatten ? 1 : 0)
+                 << ", childSyntax="
+                 << (it->second.usesPreferredChildSyntax ? 1 : 0)
+                 << ", raw="
+                 << (it->second.usesRawInvocationPreservation ? 1 : 0)
+                 << ")";
+            }
+            os << "}";
+            return os.str();
+          };
+
       // --- Phase 4: Try leaves, lift, validate, and ensure uniqueness --------
       //
       // We scan leaf candidates (deepest-first) and attempt to produce a root
@@ -14942,6 +15057,10 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             candPatch.macroId = m.id;
           if (!candPatch.proofRootMacroId)
             candPatch.proofRootMacroId = m.id;
+          trace("macro/proof",
+                "DAG candidate accepted as unique root patch: root id={0} "
+                "name={1} stage={2} {3}",
+                m.id, m.name, traceStage, FormatMacroPatchAudit(candPatch));
           uniquePatch = std::move(candPatch);
           uniquePatchBaseText = baseText.str();
           uniquePatchValidation = std::move(candidateValidation);
@@ -14972,8 +15091,29 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         }
 
         if (uniquePatch->replacement == candPatch.replacement) {
+          trace("macro/proof",
+                "DAG equivalent root patch audit: root id={0} name={1} "
+                "stage={2} existing[{3}] candidate[{4}]",
+                m.id, m.name, traceStage, FormatMacroPatchAudit(*uniquePatch),
+                FormatMacroPatchAudit(candPatch));
           auto mergedValidation = mergeDagCandidateValidationMetadata(
               uniquePatchValidation, candidateValidation);
+          if (uniquePatch->subtreeCertBacked || candPatch.subtreeCertBacked) {
+            trace("macro/proof",
+                  "DAG equivalent subtree-plan probe: root id={0} name={1} "
+                  "stage={2} existingExpRoot={3} candidateExpRoot={4} "
+                  "mergedExpRoot(pending) currentDeferredArgs={5} "
+                  "candidateDeferredArgs={6}",
+                  m.id, m.name, traceStage,
+                  stringutils::showWSWithClip(
+                      uniquePatch->subtreeExpectedRootFormalSummary, 160),
+                  stringutils::showWSWithClip(
+                      candPatch.subtreeExpectedRootFormalSummary, 160),
+                  stringutils::showWSWithClip(
+                      uniquePatch->subtreeDeferredRootArgSummary, 160),
+                  stringutils::showWSWithClip(
+                      candPatch.subtreeDeferredRootArgSummary, 160));
+          }
           if (!mergedValidation) {
             cert.failure = DagCandidateAcceptanceFailure::MergedRootValidationFailed;
             cert.detail = formatv(
@@ -14999,6 +15139,17 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             return cert;
           }
 
+          if (uniquePatch->subtreeCertBacked || candPatch.subtreeCertBacked) {
+            trace("macro/proof",
+                  "DAG equivalent subtree-plan merged: root id={0} name={1} "
+                  "stage={2} mergedExpRoot={3} mergedDeferredArgs={4} "
+                  "mergedBridgeFormals={5}",
+                  m.id, m.name, traceStage,
+                  formatFormalTextPairMap(mergedValidation->expectedRootFormals),
+                  FormatUInt32List(mergedValidation->deferOccurrenceArgIdxs),
+                  formatBridgeSensitiveFormalSignatureMap(
+                      mergedValidation->bridgeSensitiveFormalSignatures));
+          }
           uniquePatchValidation = std::move(*mergedValidation);
           cert.accepted = true;
           cert.detail = formatv(
@@ -15026,6 +15177,21 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         int preferredStructured = choosePreferredStructuredDagCandidate(
             uniquePatchValidation, candidateValidation);
         if (preferredStructured < 0) {
+          trace("macro/proof",
+                "DAG structured-choice kept existing patch: root id={0} "
+                "name={1} stage={2} existing[{3}] candidate[{4}]",
+                m.id, m.name, traceStage, FormatMacroPatchAudit(*uniquePatch),
+                FormatMacroPatchAudit(candPatch));
+          if (uniquePatch->subtreeCertBacked || candPatch.subtreeCertBacked) {
+            trace("macro/proof",
+                  "DAG structured subtree-choice kept existing: root id={0} "
+                  "name={1} stage={2} existingExpRoot={3} candidateExpRoot={4}",
+                  m.id, m.name, traceStage,
+                  stringutils::showWSWithClip(
+                      uniquePatch->subtreeExpectedRootFormalSummary, 160),
+                  stringutils::showWSWithClip(
+                      candPatch.subtreeExpectedRootFormalSummary, 160));
+          }
           cert.accepted = true;
           cert.detail = formatv(
                             "{0}: kept existing structured DAG candidate root "
@@ -15039,6 +15205,21 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             candPatch.macroId = m.id;
           if (!candPatch.proofRootMacroId)
             candPatch.proofRootMacroId = m.id;
+          trace("macro/proof",
+                "DAG structured-choice replaced existing patch: root id={0} "
+                "name={1} stage={2} existing[{3}] candidate[{4}]",
+                m.id, m.name, traceStage, FormatMacroPatchAudit(*uniquePatch),
+                FormatMacroPatchAudit(candPatch));
+          if (uniquePatch->subtreeCertBacked || candPatch.subtreeCertBacked) {
+            trace("macro/proof",
+                  "DAG structured subtree-choice replaced existing: root id={0} "
+                  "name={1} stage={2} existingExpRoot={3} candidateExpRoot={4}",
+                  m.id, m.name, traceStage,
+                  stringutils::showWSWithClip(
+                      uniquePatch->subtreeExpectedRootFormalSummary, 160),
+                  stringutils::showWSWithClip(
+                      candPatch.subtreeExpectedRootFormalSummary, 160));
+          }
           uniquePatch = std::move(candPatch);
           uniquePatchBaseText = baseText.str();
           uniquePatchValidation = std::move(candidateValidation);
@@ -15051,6 +15232,11 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           return cert;
         }
 
+        trace("macro/proof",
+              "DAG merge-candidate patch audit: root id={0} name={1} "
+              "stage={2} existing[{3}] candidate[{4}]",
+              m.id, m.name, traceStage, FormatMacroPatchAudit(*uniquePatch),
+              FormatMacroPatchAudit(candPatch));
         SmallVector<StringRef, 2> repls;
         repls.push_back(StringRef(uniquePatch->replacement));
         repls.push_back(StringRef(candPatch.replacement));
@@ -15068,6 +15254,16 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
         auto mergedValidation = mergeDagCandidateValidationMetadata(
             uniquePatchValidation, candidateValidation);
+        if (uniquePatch->subtreeCertBacked || candPatch.subtreeCertBacked) {
+          trace("macro/proof",
+                "DAG merge subtree-plan probe: root id={0} name={1} stage={2} "
+                "existingExpRoot={3} candidateExpRoot={4}",
+                m.id, m.name, traceStage,
+                stringutils::showWSWithClip(
+                    uniquePatch->subtreeExpectedRootFormalSummary, 160),
+                stringutils::showWSWithClip(
+                    candPatch.subtreeExpectedRootFormalSummary, 160));
+        }
         if (!mergedValidation) {
           cert.failure = DagCandidateAcceptanceFailure::MergedRootValidationFailed;
           cert.detail = formatv(
@@ -15079,6 +15275,16 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           return cert;
         }
 
+        if (uniquePatch->subtreeCertBacked || candPatch.subtreeCertBacked) {
+          trace("macro/proof",
+                "DAG merge subtree-plan merged: root id={0} name={1} stage={2} "
+                "mergedExpRoot={3} mergedDeferredArgs={4} mergedBridgeFormals={5}",
+                m.id, m.name, traceStage,
+                formatFormalTextPairMap(mergedValidation->expectedRootFormals),
+                FormatUInt32List(mergedValidation->deferOccurrenceArgIdxs),
+                formatBridgeSensitiveFormalSignatureMap(
+                    mergedValidation->bridgeSensitiveFormalSignatures));
+        }
         if (!validateDagCandidateProof(*mergedValidation,
                                        *uniquePatchBaseText,
                                        StringRef(*merged), traceStage)) {
@@ -15746,6 +15952,59 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         rootPatchCert.patch->proofValidated = true;
         rootPatchCert.patch->structurePreserving = true;
         rootPatchCert.patch->proofRootMacroId = m.id;
+        rootPatchCert.patch->subtreeCertBacked = true;
+        rootPatchCert.patch->subtreeLeafMacroId = leaf.id;
+        rootPatchCert.patch->subtreeWitnessCount = 1;
+        rootPatchCert.patch->subtreeInvocationCertCount =
+            static_cast<uint32_t>(subtreeCert.semantic.invocationCertificates.size());
+        rootPatchCert.patch->subtreeFormalCertCount =
+            static_cast<uint32_t>(subtreeCert.semantic.formalCertificates.size());
+        rootPatchCert.patch->subtreeArgCertCount =
+            static_cast<uint32_t>(subtreeCert.semantic.argCertificates.size());
+        rootPatchCert.patch->subtreeLiftChainCount =
+            static_cast<uint32_t>(subtreeCert.semantic.liftChains.size());
+        rootPatchCert.patch->subtreeLiftStepCount =
+            static_cast<uint32_t>(subtreeCert.semantic.structuredLiftCertificates.size());
+        rootPatchCert.patch->subtreeRootMergeCount =
+            static_cast<uint32_t>(subtreeCert.semantic.rootMergeCertificates.size());
+        rootPatchCert.patch->subtreeUsesLexicalBridge =
+            subtreeCert.semantic.usesLexicalBridge;
+        rootPatchCert.patch->subtreeTouchesPaste =
+            subtreeCert.semantic.touchesPaste;
+        rootPatchCert.patch->subtreeHasWrapperSemantics =
+            subtreeCert.semantic.hasWrapperSemantics;
+        rootPatchCert.patch->subtreeHasStringifySemantics =
+            subtreeCert.semantic.hasStringifySemantics;
+        rootPatchCert.patch->subtreeHasWideStringifySemantics =
+            subtreeCert.semantic.hasWideStringifySemantics;
+        rootPatchCert.patch->subtreeHasPreferredChildSyntax =
+            subtreeCert.semantic.hasPreferredChildSyntax;
+        rootPatchCert.patch->subtreeHasRawInvocationPreservation =
+            subtreeCert.semantic.hasRawInvocationPreservation;
+        rootPatchCert.patch->subtreeHasPassthroughFlatten =
+            subtreeCert.semantic.hasPassthroughFlatten;
+        rootPatchCert.patch->subtreeHasBridgeSensitiveStructuredSemantics =
+            subtreeCert.semantic.hasBridgeSensitiveStructuredSemantics;
+        rootPatchCert.patch->subtreeDeferredPasteDischarged =
+            subtreeCert.semantic.deferredPasteDischarge.valid;
+        rootPatchCert.patch->subtreeAdmissible =
+            subtreeCert.semantic.admissibility.valid;
+        rootPatchCert.patch->subtreeExpectedRootFormalCount =
+            static_cast<uint32_t>(subtreeValidation.expectedRootFormals.size());
+        rootPatchCert.patch->subtreeDeferredRootArgCount =
+            static_cast<uint32_t>(subtreeValidation.deferOccurrenceArgIdxs.size());
+        rootPatchCert.patch->subtreeBridgeSensitiveFormalCount =
+            static_cast<uint32_t>(subtreeValidation.bridgeSensitiveFormalSignatures.size());
+        rootPatchCert.patch->subtreeExpectedRootFormalSummary =
+            formatFormalTextPairMap(subtreeValidation.expectedRootFormals);
+        rootPatchCert.patch->subtreeDeferredRootArgSummary =
+            FormatUInt32List(subtreeValidation.deferOccurrenceArgIdxs);
+        rootPatchCert.patch->subtreeBridgeSensitiveFormalSummary =
+            formatBridgeSensitiveFormalSignatureMap(
+                subtreeValidation.bridgeSensitiveFormalSignatures);
+        trace("macro/proof",
+              "DAG subtree root patch audit: root id={0} leaf id={1} {2}",
+              m.id, leaf.id, FormatMacroPatchAudit(*rootPatchCert.patch));
         auto acceptCert = acceptOrMergeDAGCandidatePatch(
             std::move(*rootPatchCert.patch), invSpanText,
             "DAG subtree root patch", &subtreeValidation);
@@ -16063,6 +16322,14 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               label, m.id, m.name,
               stringutils::showWSWithClip(existingPatch->replacement, 160),
               stringutils::showWSWithClip(candidate.replacement, 160));
+        if (existingPatch->subtreeCertBacked ||
+            candidate.proofKind == MacroPatchProofKind::DagSubtreeRoot) {
+          trace("macro/proof",
+                "subtree continuity probe: merge-rejected existing[{0}] "
+                "candidate[{1}]",
+                FormatMacroPatchAudit(*existingPatch),
+                FormatMacroPatchAudit(candidate));
+        }
         return;
       }
 
@@ -16073,6 +16340,14 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             stringutils::showWSWithClip(existingPatch->replacement, 160),
             stringutils::showWSWithClip(candidate.replacement, 160),
             stringutils::showWSWithClip(*merged, 160));
+      if (existingPatch->subtreeCertBacked ||
+          candidate.proofKind == MacroPatchProofKind::DagSubtreeRoot) {
+        trace("macro/proof",
+              "subtree continuity probe: merge-accepted existing[{0}] "
+              "candidate[{1}]",
+              FormatMacroPatchAudit(*existingPatch),
+              FormatMacroPatchAudit(candidate));
+      }
       candidate.replacement = std::move(*merged);
       if (!candidate.macroId)
         candidate.macroId = existingPatch->macroId;
@@ -16182,12 +16457,25 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   }
 
   if (argsOnlyCandidate) {
+    trace("macro/proof",
+          "returning direct args-only candidate: inv id={0} name={1} {2}",
+          m.id, m.name, FormatMacroPatchAudit(*argsOnlyCandidate));
     return *argsOnlyCandidate;
   }
 
   if (reuseExistingCallsitePatch) {
     trace("macro", "callsite patch reused (args-only no-op) inv id={0}",
           m.id);
+    if (existingPatch) {
+      trace("macro/proof",
+            "reused existing callsite patch audit: inv id={0} name={1} {2}",
+            m.id, m.name, FormatMacroPatchAudit(*existingPatch));
+      if (existingPatch->subtreeCertBacked)
+        trace("macro/proof",
+              "subtree continuity probe: reused subtree-backed callsite patch "
+              "without a fresh subtree winner in this pass inv id={0} name={1}",
+              m.id, m.name);
+    }
     return *existingPatch;
   }
 
@@ -16197,6 +16485,15 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     trace("macro",
           "callsite patch reused (skip whole-cover expansion) inv id={0}",
           m.id);
+    trace("macro/proof",
+          "reused existing callsite patch audit: inv id={0} name={1} {2}",
+          m.id, m.name, FormatMacroPatchAudit(*existingPatch));
+    if (existingPatch->subtreeCertBacked)
+      trace("macro/proof",
+            "subtree continuity probe: reused subtree-backed callsite patch "
+            "from skip-whole-cover path without a fresh subtree winner inv id={0} "
+            "name={1}",
+            m.id, m.name);
     return *existingPatch;
   }
 
@@ -16220,6 +16517,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
       trace("macro",
             "expanded patch reused after preservation attempts failed inv id={0}",
             m.id);
+      trace("macro/proof",
+            "reused existing expanded patch audit: inv id={0} name={1} {2}",
+            m.id, m.name, FormatMacroPatchAudit(*existingExpandedPatch));
       return *existingExpandedPatch;
     }
   }
@@ -16247,6 +16547,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     patch.wholeCoverBRawHi = wholeCoverPlan->rawBTokEnd;
     patch.wholeCoverBAdjLo = wholeCoverPlan->bTokStart;
     patch.wholeCoverBAdjHi = wholeCoverPlan->bTokEnd;
+    trace("macro/proof",
+          "constructed whole-cover fallback patch audit: inv id={0} name={1} {2}",
+          m.id, m.name, FormatMacroPatchAudit(patch));
     return patch;
   }
 }
