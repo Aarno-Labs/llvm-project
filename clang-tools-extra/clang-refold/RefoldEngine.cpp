@@ -8730,37 +8730,37 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   };
 
   SmallVector<char, 16> argTouched(argLikeSpans.size(), 0);
-  if (!ForceWholeCoverMacros() && !argLikeSpans.empty()) {
-    // invB/invE are offsets in the invocation file, not in the A-stream source;
-    // do not slice aSource here (it can be shorter and/or refer to a different
-    // logical file).
-    StringRef invSpanText =
-        !baseInvText.empty()
-            ? baseInvText
-            : (m.invText ? StringRef(*m.invText) : StringRef(""));
-    if (HunkFullyWithinArgSpans(hEff, argLikeSpans, argTouched) &&
-        InvocationSpanMatchesCallsitePrefix(invSpanText, m)) {
-      // First try to patch arguments in-place. If that can't satisfy the
-      // edit, we may still be able to preserve more structure via DAG lifting
-      // below, so keep the candidate around instead of returning immediately.
-      argsOnlyCandidate = BuildMacroInvocationPatchArgsOnly(m, hEff, baseInvText);
-      if (!argsOnlyCandidate) {
-        trace("instr/macro",
-              "args-only: FAIL macro id={0} name='{1}' hunkA=[{2},{3}) "
-              "hunkB=[{4},{5}) (see [trace][macro/args])",
-              m.id, m.name, hEff.aStart, hEff.aEnd, hEff.bStart, hEff.bEnd);
-        // If we already have a callsite patch and args-only yields no
-        // replacement for the trimmed hunk, then the edit is already satisfied
-        // by the current callsite text. Defer reusing it until after DAG
-        // chaining has had a chance to preserve deeper structure.
-        reuseExistingCallsitePatch =
-            existingPatch && existingIsCallsite && !baseInvText.empty() &&
-            existingPatch->structurePreserving &&
-            existingPatch->proofRootMacroId == m.id;
-      }
-    } else if (InvocationSpanMatchesCallsitePrefix(invSpanText, m)) {
-      argsOnlyCandidate = tryPairedPureInsertionRootArgsOnly();
+  StringRef invSpanText =
+      !baseInvText.empty()
+          ? baseInvText
+          : (m.invText ? StringRef(*m.invText) : StringRef(""));
+  const bool rootHasDirectArgLikeSurface =
+      !ForceWholeCoverMacros() && !argLikeSpans.empty() &&
+      HunkFullyWithinArgSpans(hEff, argLikeSpans, argTouched) &&
+      InvocationSpanMatchesCallsitePrefix(invSpanText, m);
+
+  if (rootHasDirectArgLikeSurface) {
+    // First try to patch arguments in-place. If that can't satisfy the
+    // edit, we may still be able to preserve more structure via DAG lifting
+    // below, so keep the candidate around instead of returning immediately.
+    argsOnlyCandidate = BuildMacroInvocationPatchArgsOnly(m, hEff, baseInvText);
+    if (!argsOnlyCandidate) {
+      trace("instr/macro",
+            "args-only: FAIL macro id={0} name='{1}' hunkA=[{2},{3}) "
+            "hunkB=[{4},{5}) (see [trace][macro/args])",
+            m.id, m.name, hEff.aStart, hEff.aEnd, hEff.bStart, hEff.bEnd);
+      // If we already have a callsite patch and args-only yields no
+      // replacement for the trimmed hunk, then the edit is already satisfied
+      // by the current callsite text. Defer reusing it until after DAG
+      // chaining has had a chance to preserve deeper structure.
+      reuseExistingCallsitePatch =
+          existingPatch && existingIsCallsite && !baseInvText.empty() &&
+          existingPatch->structurePreserving &&
+          existingPatch->proofRootMacroId == m.id;
     }
+  } else if (!ForceWholeCoverMacros() && !argLikeSpans.empty() &&
+             InvocationSpanMatchesCallsitePrefix(invSpanText, m)) {
+    argsOnlyCandidate = tryPairedPureInsertionRootArgsOnly();
   }
 
   // 1b) Conservative DAG chaining: if the edited A-span lies within this
@@ -9130,6 +9130,14 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         SmallVector<char, 8> touched;
       };
 
+      struct SplitInsertionRootCandidate {
+        MacroPatch patch;
+        SmallVector<uint32_t, 8> deferOccurrenceArgIdxs;
+      };
+
+      SmallVector<SplitInsertionRootCandidate, 8>
+          splitInsertionRootCandidates;
+
       auto spanBytes = [](const RefoldModel::PPArgSpan &s) -> uint64_t {
         // Prefer spans that are more local in the PP output (smaller ppByte
         // extent).
@@ -9197,6 +9205,39 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                 envTrimRootWithinArgLike ? 1 : 0,
                 pairRootPatch ? 1 : 0,
                 pairRootPatch ? StringRef(pairRootPatch->replacement) : StringRef(""));
+
+          if (pairRootPatch) {
+            SplitInsertionRootCandidate candidate;
+            // Preserve the already-constructed full root-callsite replacement so
+            // it can be validated and merged later through the normal DAG root
+            // candidate path.
+            candidate.patch = std::move(*pairRootPatch);
+
+            // Collect the root formal argument indices touched by the trimmed
+            // combined insertion envelope. We intentionally store formal arg
+            // indices here, not raw arg-like span indices, because a single
+            // formal may appear multiple times at the root callsite.
+            for (size_t idx = 0; idx < envTrimRootTouched.size(); ++idx) {
+              // Ignore untouched spans and any defensive out-of-range cases.
+              if (!envTrimRootTouched[idx] || idx >= argLikeSpans.size())
+                continue;
+              const uint32_t argIdx = argLikeSpans[idx].argIdx;
+              if (argIdx >= numArgs)
+                continue;
+
+              // Defer occurrence-level consistency checks for each touched root
+              // formal exactly once. The later DAG validation step will use this
+              // set to avoid rejecting the reconstructed root patch before its
+              // final root-formal replay is available.
+              if (!llvm::is_contained(candidate.deferOccurrenceArgIdxs, argIdx))
+                candidate.deferOccurrenceArgIdxs.push_back(argIdx);
+            }
+
+            // Keep the deferred formal set stable and deterministic so later
+            // validation and tracing do not depend on discovery order.
+            llvm::sort(candidate.deferOccurrenceArgIdxs);
+            splitInsertionRootCandidates.push_back(std::move(candidate));
+          }
 
           for (const auto &cand : model_.GetMacroInvocations()) {
             auto d = depthToRoot(cand);
@@ -9275,7 +9316,12 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                 "skip leaf id={0} name='{1}': non-literal callee origin on "
                 "path to root id={2}",
                 cand.id, cand.name, m.id);
-          if (hunkWithinCandCover)
+          // Unsupported descendant structure only blocks direct root replay
+          // when the edit cannot already be represented by one of the root's
+          // own argument-like spans. If the root has a direct args-only proof
+          // surface, keep that candidate alive and let DAG lifting compete
+          // normally instead of forcing whole-cover expansion.
+          if (hunkWithinCandCover && !rootHasDirectArgLikeSurface)
             directRootPreservationInadmissible = true;
           continue;
         }
@@ -15950,6 +15996,72 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         return cert;
       };
 
+      // Replay any root-level split-insertion candidates that were proven while
+      // scanning paired pure-insertion envelopes.
+      //
+      // These candidates already carry a concrete replacement for the full root
+      // callsite text (for example, a reconstructed `WRAP(INC, (1) + 3)`), but
+      // they still need to pass through the normal DAG candidate validation and
+      // merge path so they compete consistently with any other root patches.
+      for (const SplitInsertionRootCandidate &candidate :
+           splitInsertionRootCandidates) {
+        // Re-derive the expected root-formal rewrite map directly from the
+        // candidate's replacement text. This gives the DAG validator the same
+        // root-formal expectations it would have had if this candidate had been
+        // produced through the ordinary replay path.
+        auto replayRootFormals = buildRootFormalRewriteMapFromCallsiteReplacement(
+            invSpanText, StringRef(candidate.patch.replacement));
+        if (!replayRootFormals) {
+          trace("macro/dag",
+                "DAG split insertion root patch rejected: root id={0} "
+                "name='{1}' could not derive replay root formals from "
+                "replacement='{2}'",
+                m.id, m.name,
+                stringutils::showWSWithClip(candidate.patch.replacement, 160));
+          continue;
+        }
+
+        // Validate this split-root candidate against the exact set of root
+        // formals implied by the reconstructed replacement. Also defer
+        // occurrence-level consistency checks for the touched root formals so
+        // the validator can discharge them using the final reconstructed root
+        // callsite text rather than rejecting too early.
+        DagCandidateValidationMetadata splitValidation;
+        splitValidation.hasExpectedRootFormals = true;
+        splitValidation.expectedRootFormals = *replayRootFormals;
+        splitValidation.deferOccurrenceArgIdxs.assign(
+            candidate.deferOccurrenceArgIdxs.begin(),
+            candidate.deferOccurrenceArgIdxs.end());
+
+        // Materialize a normal root patch from the queued split candidate.
+        // Mark it as already proof-backed: the split-insertion logic has already
+        // established that this is a structure-preserving args-only root rewrite.
+        MacroPatch splitRootPatch = candidate.patch;
+        splitRootPatch.proofKind =
+            MacroPatchProofKind::ArgsOnlyPairedPureInsertion;
+        splitRootPatch.proofValidated = true;
+        splitRootPatch.structurePreserving = true;
+        splitRootPatch.proofRootMacroId = m.id;
+
+        // Feed the candidate through the shared DAG acceptance/merge logic so it
+        // is deduplicated and checked for incompatibility exactly the same way as
+        // other DAG-derived root patches.
+        auto acceptCert = acceptOrMergeDAGCandidatePatch(
+            std::move(splitRootPatch), invSpanText,
+            "DAG split insertion root patch", &splitValidation);
+        if (!acceptCert.detail.empty())
+          trace("macro/dag", "{0}", acceptCert.detail);
+        if (!acceptCert.accepted) {
+          debug("macro/dag",
+                "DAG args-only ambiguous: incompatible split-insertion root "
+                "patches (root inv id={0} name={1} leafCandidates={2} "
+                "leavesExamined={3} distinctRootPatches={4})",
+                m.id, m.name, leafCands.size(), leavesExamined,
+                distinctRootPatches + 1);
+          return std::nullopt;
+        }
+      }
+
       for (const LeafCandidate &cand : leafCands) {
         ++leavesExamined;
         const RefoldModel::MacroInvocation &leaf = *cand.inv;
@@ -17217,7 +17329,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
       trace("macro/dag",
             "direct args-only/callsite preservation suppressed for root "
             "id={0} name='{1}': touched hunk lies in unsupported descendant "
-            "subtree",
+            "subtree and the root has no direct argument-like replay surface",
             m.id, m.name);
       argsOnlyCandidate.reset();
       reuseExistingCallsitePatch = false;
