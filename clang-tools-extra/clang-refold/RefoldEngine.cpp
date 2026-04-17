@@ -4918,173 +4918,150 @@ std::string RefoldEngine::SplicePasteSegmentIntoSpellingArg(StringRef baseArg,
 std::optional<std::vector<std::pair<size_t, size_t>>>
 RefoldEngine::GetMacroInvocationFormalArgContentRanges(
     const RefoldModel::MacroInvocation &m, StringRef invText) {
-  // Prefer the producer-provided per-formal invocation-argument ranges when
-  // available. This is required for variadic macros where multiple "actual"
-  // arguments correspond to a single formal (e.g. __VA_ARGS__).
-  if (!m.invArgRanges.empty()) {
-    // The producer-provided ranges are absolute byte offsets in the invocation
-    // file, captured from the *original* invocation spelling. If we've already
-    // applied an earlier args-only patch to this invocation (so invText differs
-    // from m.invText), those absolute endpoints no longer line up. Re-parse
-    // current invocation spelling and then re-map to the producer's formal
-    // arity (including the variadic tail) to keep subsequent hunks stable.
-    if (m.invText && invText != *m.invText) {
-      auto parsedOpt =
-          RefoldEngine::ParseMacroInvocationArgContentRanges(invText);
-      if (!parsedOpt)
+  auto emptyAtCloseParenIn = [&](StringRef text) -> std::pair<size_t, size_t> {
+    size_t closeIdx = text.rfind(')');
+    if (closeIdx == StringRef::npos)
+      closeIdx = text.size();
+    return {closeIdx, closeIdx};
+  };
+
+  auto isVariadicFormal = [&](size_t idx) -> bool {
+    return idx < m.defParams.size() && m.defParams[idx].variadic;
+  };
+
+  auto trailingFormalsAreVariadic = [&](size_t beginIdx) -> bool {
+    for (size_t i = beginIdx; i < m.defParams.size(); ++i) {
+      if (!isVariadicFormal(i))
+        return false;
+    }
+    return true;
+  };
+
+  auto mapParsedActualsToFormalRanges =
+      [&](StringRef text,
+          const std::vector<std::pair<size_t, size_t>> &parsed)
+      -> std::optional<std::vector<std::pair<size_t, size_t>>> {
+    const size_t formalN = m.defParams.size();
+    const size_t actualN = parsed.size();
+
+    if (formalN == 0) {
+      if (actualN == 0)
+        return std::vector<std::pair<size_t, size_t>>();
+      return std::nullopt;
+    }
+
+    if (actualN == formalN)
+      return parsed;
+
+    std::vector<std::pair<size_t, size_t>> out;
+    out.reserve(formalN);
+
+    if (actualN > formalN) {
+      if (!isVariadicFormal(formalN - 1))
         return std::nullopt;
-
-      const auto &parsed = *parsedOpt;
-      const size_t formalN = m.invArgRanges.size();
-      const size_t actualN = parsed.size();
-
-      // Helper to return a safe "empty" range at the close-paren location.
-      auto emptyAtCloseParen = [&]() -> std::pair<size_t, size_t> {
-        size_t closeIdx = invText.rfind(')');
-        if (closeIdx == StringRef::npos)
-          closeIdx = invText.size();
-        return {closeIdx, closeIdx};
-      };
-
-      if (actualN == formalN)
-        return parsed;
-
-      std::vector<std::pair<size_t, size_t>> out;
-      out.reserve(formalN);
-
-      if (actualN > formalN && formalN > 0) {
-        // More actual argument ranges were parsed than there are formal
-        // parameters. Treat this as a variadic-style tail: keep the first
-        // (formalN - 1) actuals aligned 1:1 with the corresponding formals,
-        // then make the last formal cover one contiguous source range from the
-        // start of the next actual through the end of the final actual.
-        out.insert(out.end(), parsed.begin(), parsed.begin() + (formalN - 1));
-        out.push_back({parsed[formalN - 1].first, parsed.back().second});
-        return out;
-      }
-
-      // Fewer actual ranges were parsed than there are formals. Preserve the
-      // actuals that do exist, then pad the remaining trailing formals with
-      // empty ranges anchored at the call's closing ')', so the result still
-      // contains one range per formal parameter.
-      out.insert(out.end(), parsed.begin(), parsed.end());
-      for (size_t i = actualN; i < formalN; ++i)
-        out.push_back(emptyAtCloseParen());
+      out.insert(out.end(), parsed.begin(), parsed.begin() + (formalN - 1));
+      out.push_back({parsed[formalN - 1].first, parsed.back().second});
       return out;
     }
 
-    if (!m.invB)
+    if (!trailingFormalsAreVariadic(actualN))
+      return std::nullopt;
+
+    out.insert(out.end(), parsed.begin(), parsed.end());
+    for (size_t i = actualN; i < formalN; ++i)
+      out.push_back(emptyAtCloseParenIn(text));
+    return out;
+  };
+
+  auto parseAndMapFormalRanges = [&](StringRef text)
+      -> std::optional<std::vector<std::pair<size_t, size_t>>> {
+    auto parsedOpt = RefoldEngine::ParseMacroInvocationArgContentRanges(text);
+    if (!parsedOpt)
+      return std::nullopt;
+    return mapParsedActualsToFormalRanges(text, *parsedOpt);
+  };
+
+  auto tryProducerRelativeRanges = [&]()
+      -> std::optional<std::vector<std::pair<size_t, size_t>>> {
+    if (m.invArgRanges.empty() || !m.invB)
       return std::nullopt;
 
     const uint64_t invB = *m.invB;
-
     std::vector<std::pair<size_t, size_t>> out;
     out.reserve(m.invArgRanges.size());
 
-    bool anyInvalid = false;
     for (const auto &R : m.invArgRanges) {
-      // Each recorded invocation-argument range is stored in absolute TU byte
-      // space. Convert it into a half-open byte range relative to invText so
-      // later parsing can index directly into the invocation spelling.
-      if (!R.first || !R.second) {
-        anyInvalid = true;
-        out.emplace_back(static_cast<size_t>(-1), static_cast<size_t>(-1));
-        continue;
-      }
-
-      // Reject malformed absolute ranges that start before the invocation or
-      // whose end precedes the begin.
-      if (*R.first < invB || *R.second < *R.first) {
-        anyInvalid = true;
-        out.emplace_back(static_cast<size_t>(-1), static_cast<size_t>(-1));
-        continue;
-      }
+      if (!R.first || !R.second)
+        return std::nullopt;
+      if (*R.first < invB || *R.second < *R.first)
+        return std::nullopt;
 
       const uint64_t relB64 = *R.first - invB;
       const uint64_t relE64 = *R.second - invB;
-
-      // The relative slice must remain within the invocation text.
-      if (relE64 > invText.size() || relB64 > relE64) {
-        anyInvalid = true;
-        out.emplace_back(static_cast<size_t>(-1), static_cast<size_t>(-1));
-        continue;
-      }
+      if (relE64 > invText.size() || relB64 > relE64)
+        return std::nullopt;
 
       out.emplace_back(static_cast<size_t>(relB64),
                        static_cast<size_t>(relE64));
     }
 
-    if (!anyInvalid)
-      return out;
+    return out;
+  };
 
-    // Try to fill any invalid entries using a conservative textual parse of the
-    // invocation spelling, preserving the formal-parameter indexing when the
-    // parsed arity differs (variadics / missing variadic tail).
-    auto parsedOpt =
-        RefoldEngine::ParseMacroInvocationArgContentRanges(invText);
-    if (!parsedOpt)
+  auto transportArgsOverProducerSlotsExactly =
+      [&](StringRef producerText,
+          const std::vector<std::pair<size_t, size_t>> &producerRanges,
+          StringRef currentText,
+          const std::vector<std::pair<size_t, size_t>> &currentRanges) -> bool {
+    if (producerRanges.size() != currentRanges.size())
+      return false;
+
+    std::string rebuilt;
+    rebuilt.reserve(currentText.size());
+    size_t cur = 0;
+
+    for (size_t i = 0; i < producerRanges.size(); ++i) {
+      size_t pb = producerRanges[i].first;
+      size_t pe = producerRanges[i].second;
+      size_t cb = currentRanges[i].first;
+      size_t ce = currentRanges[i].second;
+
+      if (pb > pe || pe > producerText.size() || pb < cur)
+        return false;
+      if (cb > ce || ce > currentText.size())
+        return false;
+
+      rebuilt.append(producerText.substr(cur, pb - cur));
+      rebuilt.append(currentText.substr(cb, ce - cb));
+      cur = pe;
+    }
+
+    rebuilt.append(producerText.substr(cur));
+    return rebuilt == currentText;
+  };
+
+  if (m.invText) {
+    std::optional<std::vector<std::pair<size_t, size_t>>> producerRangesOpt =
+        tryProducerRelativeRanges();
+    if (!producerRangesOpt)
+      producerRangesOpt = parseAndMapFormalRanges(*m.invText);
+
+    if (invText == *m.invText)
+      return producerRangesOpt;
+
+    auto currentRangesOpt = parseAndMapFormalRanges(invText);
+    if (!producerRangesOpt || !currentRangesOpt)
       return std::nullopt;
 
-    const auto &parsed = *parsedOpt;
-    const size_t formalN = out.size();
-    const size_t actualN = parsed.size();
-
-    // Helper to return a safe "empty" range at the close-paren location.
-    auto emptyAtCloseParen = [&]() -> std::pair<size_t, size_t> {
-      size_t closeIdx = invText.rfind(')');
-      if (closeIdx == StringRef::npos)
-        closeIdx = invText.size();
-      return {closeIdx, closeIdx};
-    };
-
-    if (actualN == formalN) {
-      // Parsed actuals already line up 1:1 with the formal parameter list.
-      // Only fill entries that were not already supplied by the recorded
-      // invocation ranges above.
-      for (size_t i = 0; i < formalN; ++i) {
-        if (out[i].first == static_cast<size_t>(-1))
-          out[i] = parsed[i];
-      }
-      return out;
+    if (!transportArgsOverProducerSlotsExactly(*m.invText, *producerRangesOpt,
+                                               invText, *currentRangesOpt)) {
+      return std::nullopt;
     }
 
-    if (actualN > formalN && formalN > 0) {
-      // More actual argument ranges were parsed than there are formals. Treat
-      // this as a variadic-style tail: keep the leading formals aligned 1:1 to
-      // the corresponding parsed actuals, and let the final formal absorb one
-      // contiguous range from the start of the next actual through the end of
-      // the last actual.
-      for (size_t i = 0; i + 1 < formalN; ++i) {
-        if (out[i].first == static_cast<size_t>(-1))
-          out[i] = parsed[i];
-      }
-
-      // If the last formal did not already have a valid recorded range, make it
-      // span the entire remaining tail of the callsite argument text.
-      if (out[formalN - 1].first == static_cast<size_t>(-1)) {
-        out[formalN - 1] = {parsed[formalN - 1].first, parsed.back().second};
-      }
-      return out;
-    }
-
-    // Fewer actual ranges were parsed than there are formals. Copy over the
-    // actuals that exist, then synthesize empty trailing ranges at the closing
-    // ')' so the result still has one entry per formal parameter.
-    for (size_t i = 0; i < std::min(formalN, actualN); ++i) {
-      if (out[i].first == static_cast<size_t>(-1))
-        out[i] = parsed[i];
-    }
-    for (size_t i = actualN; i < formalN; ++i) {
-      if (out[i].first == static_cast<size_t>(-1))
-        out[i] = emptyAtCloseParen();
-    }
-
-    return out;
+    return currentRangesOpt;
   }
 
-  // Fallback: derive ranges from the invocation spelling. This path assumes a
-  // 1:1 mapping between argument index and "actual" arguments.
-  return RefoldEngine::ParseMacroInvocationArgContentRanges(invText);
+  return parseAndMapFormalRanges(invText);
 }
 
 std::optional<RefoldEngine::MacroPatch>
