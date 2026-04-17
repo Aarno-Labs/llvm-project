@@ -784,9 +784,12 @@ static constexpr const char *RefoldSchema = R"json(
           "description": "A-token spans within pp_cover that originate from the macro body (non-argument tokens)."
         },
         "inv_text": {
-          "type": "string",
+          "type": [
+            "string",
+            "null"
+          ],
           "minLength": 1,
-          "description": "Exact bytes at the macro call site in the source (e.g., 'FOO(1, 2)')."
+          "description": "Exact bytes at the macro call site in the source (e.g., 'FOO(1, 2)'). Null means the producer could not prove an exact raw invocation spelling and intentionally withheld raw-invocation proof material."
         },
         "normalized_inv_text": {
           "type": "string",
