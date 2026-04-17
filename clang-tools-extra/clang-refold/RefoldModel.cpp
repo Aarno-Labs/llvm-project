@@ -698,10 +698,17 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
           return nameOrErr.takeError();
         StringRef name = *nameOrErr;
 
-        auto invTextOrErr = applyToField(asString, *obj, "inv_text", ctxItem);
-        if (!invTextOrErr)
-          return invTextOrErr.takeError();
-        StringRef invText = *invTextOrErr;
+        auto invTextValOrErr = requireField(*obj, "inv_text", ctxItem);
+        if (!invTextValOrErr)
+          return invTextValOrErr.takeError();
+        std::optional<StringRef> invText;
+        if (!(*invTextValOrErr)->getAsNull()) {
+          auto invTextOrErr =
+              asString(**invTextValOrErr, ctxItem + ": inv_text");
+          if (!invTextOrErr)
+            return invTextOrErr.takeError();
+          invText = *invTextOrErr;
+        }
         std::optional<StringRef> normalizedInvText =
             asOptString(*obj, "normalized_inv_text", /*canBeNull=*/true);
 
@@ -1229,6 +1236,7 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
 
   // Deterministic ordering & indices
   model.SanitizeMacroCallerGraph();
+  model.SanitizeMacroProofArtifacts();
   model.BuildIndicesAndSort();
   return model;
 }
@@ -1292,6 +1300,263 @@ void RefoldModel::SanitizeMacroCallerGraph() {
 
     for (uint64_t Id : Path)
       Done.insert(Id);
+  }
+}
+
+void RefoldModel::SanitizeMacroProofArtifacts() {
+  // Build an id -> invocation lookup once so that per-invocation validation can
+  // cheaply consult the caller macro when caller-relative proof metadata exists.
+  DenseMap<uint64_t, MacroInvocation *> MacroById;
+  MacroById.reserve(macroInvs_.size());
+  for (MacroInvocation &MI : macroInvs_)
+    MacroById.try_emplace(MI.id, &MI);
+
+  // Raw proof that depends on exact raw invocation spelling:
+  //   - argDeps: caller-param provenance for each raw argument slice
+  //   - argRefs: byte ranges inside this invocation's raw invText that witness
+  //              where each caller-derived contribution landed
+  auto clearRawProofRefsOnly = [](MacroInvocation &MI) {
+    MI.argDeps.clear();
+    MI.argRefs.clear();
+  };
+
+  // Normalized proof that depends on normalized invocation spelling:
+  //   - normalizedInvArgTextRanges: per-argument ranges in normalizedInvText
+  //   - argTupleRefs: caller-relative tuple forwarding metadata
+  auto clearNormalizedProofRefsOnly = [](MacroInvocation &MI) {
+    MI.normalizedInvArgTextRanges.clear();
+    MI.argTupleRefs.clear();
+  };
+
+  for (MacroInvocation &MI : macroInvs_) {
+    // Recover the caller invocation if it is still present in the model.
+    // Caller presence matters because several proof artifacts store caller
+    // parameter indices and are meaningless if the caller cannot be resolved.
+    const MacroInvocation *Caller = nullptr;
+    if (MI.callerMacroId) {
+      auto It = MacroById.find(*MI.callerMacroId);
+      if (It != MacroById.end())
+        Caller = It->second;
+    }
+
+    // ----- Raw invocation proof validation -----
+    //
+    // Raw proof is only trustworthy if we still have:
+    //   1. exact raw invocation text (`invText`)
+    //   2. the source begin offset for that text (`invB`)
+    //
+    // If either is missing, any raw ranges/refs become unverifiable, so drop
+    // them fail-closed.
+    if (!MI.invText || !MI.invB) {
+      if (!MI.invArgRanges.empty() || !MI.argDeps.empty() || !MI.argRefs.empty()) {
+        warn("model",
+             "dropping raw invocation proof for macro id={0}: exact raw invocation text is unavailable",
+             MI.id);
+        MI.invArgRanges.clear();
+        clearRawProofRefsOnly(MI);
+      }
+    } else {
+      const uint64_t InvBegin = *MI.invB;
+      const uint64_t InvTextSize = MI.invText->size();
+      bool DropRawRanges = false;
+      bool DropRawRefs = false;
+
+      // Each raw argument range is stored in absolute source coordinates and
+      // must lie wholly within the raw invocation spelling [invB, invB+|invText|).
+      for (const auto &Rng : MI.invArgRanges) {
+        if (!Rng.first && !Rng.second)
+          continue;
+        if (!Rng.first || !Rng.second || *Rng.second < *Rng.first ||
+            *Rng.first < InvBegin || (*Rng.second - InvBegin) > InvTextSize) {
+          DropRawRanges = true;
+          break;
+        }
+      }
+
+      if (DropRawRanges) {
+        warn("model",
+             "dropping inconsistent raw invocation ranges for macro id={0}",
+             MI.id);
+        MI.invArgRanges.clear();
+        clearRawProofRefsOnly(MI);
+      } else {
+        // argDeps / argRefs are parallel to invArgRanges: one entry per callee
+        // argument. A size mismatch means the proof shape itself is corrupted.
+        if ((!MI.argDeps.empty() && MI.argDeps.size() != MI.invArgRanges.size()) ||
+            (!MI.argRefs.empty() && MI.argRefs.size() != MI.invArgRanges.size())) {
+          DropRawRefs = true;
+        }
+
+        // Caller-param references are only valid if every referenced parameter
+        // index exists in the resolved caller macro.
+        if (!DropRawRefs && Caller) {
+          for (const auto &Deps : MI.argDeps) {
+            for (uint32_t Dep : Deps) {
+              if (Dep >= Caller->defParams.size()) {
+                DropRawRefs = true;
+                break;
+              }
+            }
+            if (DropRawRefs)
+              break;
+          }
+        }
+
+        if (!DropRawRefs) {
+          for (size_t ArgIdx = 0; ArgIdx < MI.argRefs.size() && !DropRawRefs;
+               ++ArgIdx) {
+            if (ArgIdx >= MI.invArgRanges.size()) {
+              DropRawRefs = true;
+              break;
+            }
+            const auto &Rng = MI.invArgRanges[ArgIdx];
+
+            // A missing raw range means we should not have any byte-level refs
+            // for that argument.
+            if (!Rng.first || !Rng.second) {
+              if (!MI.argRefs[ArgIdx].empty())
+                DropRawRefs = true;
+              continue;
+            }
+
+            // argRefs are recorded in callee-local invText coordinates, so rebase
+            // the absolute raw argument span into [0, |invText|) before checking
+            // containment.
+            const uint64_t RelB = *Rng.first - InvBegin;
+            const uint64_t RelE = *Rng.second - InvBegin;
+            for (const InvArgRef &Ref : MI.argRefs[ArgIdx]) {
+              if (Ref.byteEnd < Ref.byteBegin || Ref.byteEnd > InvTextSize ||
+                  Ref.byteBegin < RelB || Ref.byteEnd > RelE) {
+                DropRawRefs = true;
+                break;
+              }
+              if (Caller && Ref.callerParamIndex >= Caller->defParams.size()) {
+                DropRawRefs = true;
+                break;
+              }
+            }
+          }
+        }
+
+        if (DropRawRefs) {
+          warn("model",
+               "dropping inconsistent raw invocation dependency/ref proof for macro id={0}",
+               MI.id);
+          clearRawProofRefsOnly(MI);
+        }
+      }
+    }
+
+    // ----- Normalized invocation proof validation -----
+    //
+    // Normalized proof is independent from raw spelling, but it still requires
+    // normalizedInvText to exist. Without that text, the normalized ranges/tuple
+    // refs cannot be validated or replayed safely.
+    if (!MI.normalizedInvText) {
+      if (!MI.normalizedInvArgTextRanges.empty() || !MI.argTupleRefs.empty()) {
+        warn("model",
+             "dropping normalized invocation proof for macro id={0}: normalized_inv_text is unavailable",
+             MI.id);
+        clearNormalizedProofRefsOnly(MI);
+      }
+    } else {
+      const uint64_t NormalizedSize = MI.normalizedInvText->size();
+      bool DropNormalizedRanges = false;
+      bool DropTupleRefs = false;
+
+      // Normalized argument ranges are stored directly in normalized-text
+      // coordinates, so they only need to fit within [0, |normalizedInvText|).
+      for (const auto &Rng : MI.normalizedInvArgTextRanges) {
+        if (!Rng.first && !Rng.second)
+          continue;
+        if (!Rng.first || !Rng.second || *Rng.second < *Rng.first ||
+            *Rng.second > NormalizedSize) {
+          DropNormalizedRanges = true;
+          break;
+        }
+      }
+
+      if (DropNormalizedRanges) {
+        warn("model",
+             "dropping inconsistent normalized invocation ranges for macro id={0}",
+             MI.id);
+        clearNormalizedProofRefsOnly(MI);
+      } else {
+        // Tuple refs are parallel to normalized argument ranges.
+        if (!MI.argTupleRefs.empty() &&
+            MI.argTupleRefs.size() != MI.normalizedInvArgTextRanges.size()) {
+          DropTupleRefs = true;
+        }
+
+        if (!DropTupleRefs) {
+          for (const auto &ArgRefs : MI.argTupleRefs) {
+            for (const TupleArgRef &Ref : ArgRefs) {
+              if (Ref.callerByteEnd < Ref.callerByteBegin) {
+                DropTupleRefs = true;
+                break;
+              }
+              if (Caller && Ref.callerParamIndex >= Caller->defParams.size()) {
+                DropTupleRefs = true;
+                break;
+              }
+            }
+            if (DropTupleRefs)
+              break;
+          }
+        }
+
+        if (DropTupleRefs) {
+          warn("model",
+               "dropping inconsistent normalized invocation tuple proof for macro id={0}",
+               MI.id);
+          MI.argTupleRefs.clear();
+        }
+      }
+    }
+
+    // ----- Caller-dependent provenance cleanup -----
+    //
+    // calleeOrigin.callerParamIndices and the caller-relative proof artifacts
+    // below are only meaningful if the caller exists and the referenced caller
+    // parameter indices are valid.
+    if (Caller) {
+      bool OpaqueOrigin = false;
+      for (uint32_t Idx : MI.calleeOrigin.callerParamIndices) {
+        if (Idx >= Caller->defParams.size()) {
+          OpaqueOrigin = true;
+          break;
+        }
+      }
+      if (OpaqueOrigin) {
+        warn("model",
+             "downgrading invalid callee_origin caller-param metadata for macro id={0} to opaque",
+             MI.id);
+        MI.calleeOrigin.kind = MacroCalleeOriginKind::Opaque;
+        MI.calleeOrigin.callerParamIndices.clear();
+      }
+    } else {
+      // If the caller is gone, degrade any caller-dependent origin metadata to
+      // opaque and drop caller-relative proof that cannot be validated anymore.
+      if (!MI.calleeOrigin.callerParamIndices.empty()) {
+        warn("model",
+             "downgrading callee_origin caller-param metadata for macro id={0}: caller invocation is unavailable",
+             MI.id);
+        MI.calleeOrigin.kind = MacroCalleeOriginKind::Opaque;
+        MI.calleeOrigin.callerParamIndices.clear();
+      }
+      if (!MI.argDeps.empty() || !MI.argRefs.empty()) {
+        warn("model",
+             "dropping raw invocation dependency/ref proof for macro id={0}: caller invocation is unavailable",
+             MI.id);
+        clearRawProofRefsOnly(MI);
+      }
+      if (!MI.argTupleRefs.empty()) {
+        warn("model",
+             "dropping normalized invocation tuple proof for macro id={0}: caller invocation is unavailable",
+             MI.id);
+        MI.argTupleRefs.clear();
+      }
+    }
   }
 }
 

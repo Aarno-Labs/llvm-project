@@ -2240,23 +2240,14 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
 
     if (SM.isWrittenInSameFile(InvBeginFileLoc, InvEndFileLoc) &&
         *It.InvEnd >= *It.InvBegin) {
-      It.InvText = Lexer::getSourceText(CharSourceRange::getCharRange(
-                                            InvBeginFileLoc, InvEndFileLoc),
-                                        SM, Lang)
-                       .str();
-    } else {
-      It.InvText = It.Name;
+      std::string SpelledInvText =
+          Lexer::getSourceText(CharSourceRange::getCharRange(InvBeginFileLoc,
+                                                             InvEndFileLoc),
+                               SM, Lang)
+              .str();
+      if (!SpelledInvText.empty())
+        It.InvText = std::move(SpelledInvText);
     }
-  } else {
-    It.InvText = It.Name;
-  }
-
-  if (It.InvText.empty()) {
-    auto &Diags = PP.getDiagnostics();
-    unsigned DiagID = Diags.getCustomDiagID(DiagnosticsEngine::Error,
-                                            "macro invocation text is empty");
-    Diags.Report(MacroNameTok.getLocation(), DiagID);
-    It.InvText = It.Name; // Emergency fallback to keep schema happy
   }
 
   // 2. Compute invocation argument byte ranges (inv_arg_ranges).
@@ -2274,9 +2265,11 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
     const size_t NFormals = MI->getNumParams();
     It.InvArgRanges.resize(NFormals, {std::nullopt, std::nullopt});
 
-    if (It.InvBegin) {
+    if (It.InvBegin && !It.InvText.empty()) {
       (void)computeInvArgRangesFromText(It.InvText, *It.InvBegin, NFormals,
-                                       PP.getLangOpts(), It.InvArgRanges);
+                                        PP.getLangOpts(), It.InvArgRanges);
+    } else {
+      It.InvArgRanges.clear();
     }
   }
 
@@ -2408,7 +2401,11 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
 
     if (!CurIt.CallerMacroId && NameLoc.isMacroID()) {
       SourceLocation L = NameLoc;
-      for (unsigned Depth = 0; Depth != 16 && L.isMacroID(); ++Depth) {
+      llvm::SmallDenseSet<unsigned, 8> SeenMacroCallerLocs;
+      while (L.isMacroID()) {
+        const unsigned RawLoc = L.getRawEncoding();
+        if (!SeenMacroCallerLocs.insert(RawLoc).second)
+          break;
         CharSourceRange ER = SM.getImmediateExpansionRange(L);
         SourceLocation CallerLoc = ER.getBegin();
         if (CallerLoc.isValid()) {
@@ -2725,8 +2722,10 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
       // Conservative fallback: walk up the caller chain when the caller is a
       // MacroID.
       SourceLocation Cur = Caller;
-      for (size_t Depth = 0; Depth < 16; ++Depth) {
-        if (Cur.isInvalid() || !Cur.isMacroID())
+      llvm::SmallDenseSet<unsigned, 8> SeenCallerLocs;
+      while (Cur.isValid() && Cur.isMacroID()) {
+        const unsigned RawLoc = Cur.getRawEncoding();
+        if (!SeenCallerLocs.insert(RawLoc).second)
           break;
         Cur = SM.getImmediateMacroCallerLoc(Cur);
         OuterIdx = LookupMacroItem(Cur);
@@ -3825,8 +3824,9 @@ void RefoldMapBuilder::writeJSON() {
     };
 
     // Like collectCallerFormalDeps(), but records each identifier occurrence's
-    // byte span within inv_text (absolute file bytes via BaseOff + token
-    // offset).
+    // byte span within inv_text. BaseOff is the argument's begin offset within
+    // inv_text, so the stored byte ranges are relative to inv_text rather than
+    // absolute file offsets.
     auto collectCallerFormalRefs =
         [&Lang](llvm::StringRef Text, uint64_t BaseOff,
                 const llvm::StringMap<uint32_t> &NameToIdx)
@@ -3865,8 +3865,8 @@ void RefoldMapBuilder::writeJSON() {
         if (It != NameToIdx.end()) {
           Item::InvArgRef R;
           R.CallerParamIndex = It->second;
-          // Store the identifier's absolute byte span within the invocation
-          // file, not just its offset within Text.v
+          // Store the identifier's byte span within inv_text, rebased by the
+          // argument slice's begin offset.
           R.ByteBegin = static_cast<uint32_t>(BaseOff + Off);
           R.ByteEnd = static_cast<uint32_t>(BaseOff + Off + Tok.getLength());
           Refs.push_back(R);
@@ -4363,8 +4363,10 @@ void RefoldMapBuilder::writeJSON() {
           // Invocation metadata only applies to macro items per the JSON
           // schema.
           if (It.Kind == IK_Macro) {
-            // InvText can't be empty at this point
-            JO.attribute("inv_text", It.InvText);
+            if (!It.InvText.empty())
+              JO.attribute("inv_text", It.InvText);
+            else
+              JO.attribute("inv_text", nullptr);
 
             if (It.NormalizedInvText)
               JO.attribute("normalized_inv_text", *It.NormalizedInvText);

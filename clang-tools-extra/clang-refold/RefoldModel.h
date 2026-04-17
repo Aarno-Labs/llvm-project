@@ -689,6 +689,11 @@ private:
   /// acyclic and terminate deterministically.
   void SanitizeMacroCallerGraph();
 
+  /// Drop only those proof artifacts whose local producer contract is
+  /// impossible to satisfy, while preserving independently useful invocation
+  /// metadata so the consumer continues to fail closed rather than over-expand.
+  void SanitizeMacroProofArtifacts();
+
   std::vector<Segment>
   BuildSegmentsForFile(StringRef file, ArrayRef<const Slot *> fileSlots) const;
 };
