@@ -12012,6 +12012,32 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               siblingLift.nextInv != &parent)
             continue;
 
+          auto siblingLiftHasCertifiedParentFormalEvidence = [&]() {
+            for (const auto &derived : siblingLift.nextFormals) {
+              const uint32_t parentFormal = derived.first;
+              bool certified = false;
+              for (const auto &formalCert : siblingLift.parentFormalCertificates) {
+                if (formalCert.argIdx != parentFormal)
+                  continue;
+                if (formalCert.kind != FormalRewriteCertificateKind::Invalid) {
+                  certified = true;
+                  break;
+                }
+              }
+              if (!certified)
+                return false;
+            }
+            return true;
+          };
+
+          if (!siblingLiftHasCertifiedParentFormalEvidence()) {
+            trace("macro/dag",
+                  "DAG per-hop exact sibling reroot rejected: sibling id={0} name={1} siblingFormal={2} reason=uncertifiedParentFormalEvidence nextFormals={3}",
+                  matchedSibling->id, matchedSibling->name, siblingFormal,
+                  formatFormalTextPairMap(siblingLift.nextFormals));
+            continue;
+          }
+
           if (uniqueLift) {
             trace("macro/dag",
                   "DAG per-hop exact sibling reroot ambiguous sibling-formal seed: sibling id={0} name={1} firstFormal={2} secondFormal={3}",
@@ -13989,6 +14015,88 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         return merged;
       };
 
+      struct InvocationHeadShape {
+        std::string callee;
+        size_t argCount = 0;
+      };
+
+      auto getInvocationHeadShape = [&](StringRef text)
+          -> std::optional<InvocationHeadShape> {
+        StringRef trimmed = text.trim();
+        auto argRangesOpt = ParseMacroInvocationArgContentRanges(trimmed);
+        if (!argRangesOpt)
+          return std::nullopt;
+
+        size_t open = trimmed.find('(');
+        if (open == StringRef::npos)
+          return std::nullopt;
+
+        StringRef callee = trimmed.take_front(open).trim();
+        if (callee.empty())
+          return std::nullopt;
+
+        return InvocationHeadShape{callee.str(), argRangesOpt->size()};
+      };
+
+      auto preservesRootInvocationHead = [&](const FormalTextPair &rewrite)
+          -> bool {
+        auto oldShape = getInvocationHeadShape(rewrite.oldText);
+        auto newShape = getInvocationHeadShape(rewrite.newText);
+        if (!oldShape || !newShape)
+          return false;
+        return oldShape->callee == newShape->callee &&
+               oldShape->argCount == newShape->argCount;
+      };
+
+      auto choosePreferredStructuredDagCandidate =
+          [&](const DagCandidateValidationMetadata &existingValidation,
+              const DagCandidateValidationMetadata &candidateValidation)
+          -> int {
+        if (!existingValidation.hasExpectedRootFormals ||
+            !candidateValidation.hasExpectedRootFormals)
+          return 0;
+
+        if (existingValidation.expectedRootFormals.size() !=
+            candidateValidation.expectedRootFormals.size())
+          return 0;
+
+        bool existingPreferred = false;
+        bool candidatePreferred = false;
+
+        for (const auto &KV : existingValidation.expectedRootFormals) {
+          auto it = candidateValidation.expectedRootFormals.find(KV.first);
+          if (it == candidateValidation.expectedRootFormals.end())
+            return 0;
+
+          const FormalTextPair &existingRewrite = KV.second;
+          const FormalTextPair &candidateRewrite = it->second;
+          if (StringRef(existingRewrite.oldText).trim() !=
+              StringRef(candidateRewrite.oldText).trim())
+            return 0;
+
+          const bool existingPreserves =
+              preservesRootInvocationHead(existingRewrite);
+          const bool candidatePreserves =
+              preservesRootInvocationHead(candidateRewrite);
+
+          if (existingPreserves == candidatePreserves) {
+            if (StringRef(existingRewrite.newText).trim() !=
+                StringRef(candidateRewrite.newText).trim())
+              return 0;
+            continue;
+          }
+
+          if (existingPreserves)
+            existingPreferred = true;
+          if (candidatePreserves)
+            candidatePreferred = true;
+        }
+
+        if (existingPreferred == candidatePreferred)
+          return 0;
+        return existingPreferred ? -1 : 1;
+      };
+
       struct RootProofValidationCertificate {
         bool valid = false;
         DenseMap<uint32_t, FormalTextPair> replayRootFormals;
@@ -14431,6 +14539,30 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           return cert;
         }
 
+        int preferredStructured = choosePreferredStructuredDagCandidate(
+            uniquePatchValidation, candidateValidation);
+        if (preferredStructured < 0) {
+          cert.accepted = true;
+          cert.detail = formatv(
+                            "{0}: kept existing structured DAG candidate root "
+                            "patch root id={1} name={2} over flatter rival",
+                            traceStage, m.id, m.name)
+                            .str();
+          return cert;
+        }
+        if (preferredStructured > 0) {
+          uniquePatch = std::move(candPatch);
+          uniquePatchBaseText = baseText.str();
+          uniquePatchValidation = std::move(candidateValidation);
+          cert.accepted = true;
+          cert.detail = formatv(
+                            "{0}: replaced existing DAG candidate root patch "
+                            "root id={1} name={2} with more structured rival",
+                            traceStage, m.id, m.name)
+                            .str();
+          return cert;
+        }
+
         SmallVector<StringRef, 2> repls;
         repls.push_back(StringRef(uniquePatch->replacement));
         repls.push_back(StringRef(candPatch.replacement));
@@ -14573,10 +14705,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         // only if the split is unique.
         for (auto &kv : unreliPaste) {
           auto &group = kv.second;
-          if (group.size() < 2) {
-            invalid = true;
-            break;
-          }
+          if (group.size() < 2)
+            continue;
 
           llvm::sort(group, [](const RefoldModel::PPArgSpan *a,
                                const RefoldModel::PPArgSpan *b) {

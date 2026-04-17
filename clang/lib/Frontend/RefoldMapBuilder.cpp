@@ -2032,6 +2032,58 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
     return std::nullopt;
   };
 
+  // Recover the enclosing caller for nested invocations that are spelled
+  // literally inside another macro's actual argument text. These invocations
+  // do not surface a MacroID callee token, so the immediate expansion-chain
+  // walk above cannot discover their caller even though they semantically
+  // belong to that caller's prescan expansion.
+  auto findLexicallyContainingCallerIdx =
+      [&](const Item &CurIt) -> std::optional<size_t> {
+    if (!CurIt.InvBegin || !CurIt.InvEnd || CurIt.InvFile.empty() ||
+        *CurIt.InvEnd <= *CurIt.InvBegin)
+      return std::nullopt;
+
+    struct Candidate {
+      size_t Index = 0;
+      uint64_t ArgWidth = 0;
+      uint64_t InvWidth = 0;
+    };
+
+    auto betterCandidate = [](const Candidate &L,
+                              const Candidate &R) -> bool {
+      if (L.ArgWidth != R.ArgWidth)
+        return L.ArgWidth < R.ArgWidth;
+      if (L.InvWidth != R.InvWidth)
+        return L.InvWidth < R.InvWidth;
+      return L.Index > R.Index;
+    };
+
+    std::optional<Candidate> Best;
+    for (size_t I = 0; I < NewIdx; ++I) {
+      const Item &Cand = Items[I];
+      if (Cand.Kind != IK_Macro || Cand.InvFile != CurIt.InvFile ||
+          !Cand.InvBegin || !Cand.InvEnd || Cand.InvArgRanges.empty() ||
+          *Cand.InvEnd <= *Cand.InvBegin)
+        continue;
+
+      for (const auto &R : Cand.InvArgRanges) {
+        if (!R.first || !R.second || *R.second < *R.first)
+          continue;
+        if (*R.first > *CurIt.InvBegin || *CurIt.InvEnd > *R.second)
+          continue;
+
+        Candidate Cur{I, *R.second - *R.first,
+                      *Cand.InvEnd - *Cand.InvBegin};
+        if (!Best || betterCandidate(Cur, *Best))
+          Best = Cur;
+      }
+    }
+
+    if (!Best)
+      return std::nullopt;
+    return Best->Index;
+  };
+
   // If this macro invocation occurred while expanding another macro, record the
   // immediately enclosing (caller) macro invocation's item id and the origin of
   // the callee token itself. The consumer only performs generalized nested
@@ -2063,6 +2115,13 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
       }
     }
 
+    if (!CurIt.CallerMacroId) {
+      if (auto CallerIdx = findLexicallyContainingCallerIdx(CurIt)) {
+        if (*CallerIdx != NewIdx)
+          CurIt.CallerMacroId = Items[*CallerIdx].ID;
+      }
+    }
+
     CurIt.CalleeOrigin.Kind = MCO_LiteralMacroName;
     if (CurIt.CallerMacroId) {
       const Item *CallerIt = nullptr;
@@ -2074,12 +2133,14 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
       }
 
       if (CallerIt) {
-        if (auto ArgIdx = argIndexForSpellingLoc(*CallerIt, NameLoc, SM, Lang,
-                                                 EmitAbsPaths)) {
-          CurIt.CalleeOrigin.Kind = MCO_CallerParam;
-          CurIt.CalleeOrigin.CallerParamIndices.push_back(*ArgIdx);
-        } else if (NameLoc.isMacroID() && SM.isMacroArgExpansion(NameLoc)) {
-          CurIt.CalleeOrigin.Kind = MCO_Opaque;
+        if (NameLoc.isMacroID()) {
+          if (auto ArgIdx = argIndexForSpellingLoc(*CallerIt, NameLoc, SM,
+                                                   Lang, EmitAbsPaths)) {
+            CurIt.CalleeOrigin.Kind = MCO_CallerParam;
+            CurIt.CalleeOrigin.CallerParamIndices.push_back(*ArgIdx);
+          } else if (SM.isMacroArgExpansion(NameLoc)) {
+            CurIt.CalleeOrigin.Kind = MCO_Opaque;
+          }
         }
       } else if (NameLoc.isMacroID()) {
         CurIt.CalleeOrigin.Kind = MCO_Opaque;
