@@ -105,6 +105,92 @@ inline bool HasLiteralMacroCalleeOrigin(
   return M.calleeOrigin.kind == MacroCalleeOriginKind::LiteralMacroName;
 }
 
+/// Recover the spelled text of one invocation argument from the producer-side
+/// callsite surface recorded on a macro invocation.
+///
+/// The producer stores invocation argument byte ranges in TU-relative byte
+/// coordinates. The consumer-side `invText` string, however, is a local slice
+/// covering only the invocation text itself. This helper therefore rebases the
+/// recorded argument byte range through `invB` before slicing `invText`.
+///
+/// Returns `std::nullopt` when the producer did not record a usable invocation
+/// text/range pair for `argIdx`, or when the recorded range does not rebase
+/// cleanly into the local invocation surface. Callers must treat failure as a
+/// proof failure and remain fail-closed.
+static std::optional<StringRef>
+TryGetInvocationArgText(const RefoldModel::MacroInvocation &mi,
+                        unsigned argIdx) {
+  if (!mi.invText)
+    return std::nullopt;
+  if (argIdx >= mi.invArgRanges.size())
+    return std::nullopt;
+
+  const auto &range = mi.invArgRanges[argIdx];
+  if (!range.first || !range.second)
+    return std::nullopt;
+
+  uint64_t byteBegin = *range.first;
+  uint64_t byteEnd = *range.second;
+  if (byteEnd < byteBegin)
+    return std::nullopt;
+
+  if (mi.invB) {
+    if (byteBegin < *mi.invB || byteEnd < *mi.invB)
+      return std::nullopt;
+    byteBegin -= *mi.invB;
+    byteEnd -= *mi.invB;
+  }
+
+  if (byteEnd > mi.invText->size() || byteBegin > byteEnd)
+    return std::nullopt;
+
+  return StringRef(*mi.invText)
+      .slice(static_cast<size_t>(byteBegin), static_cast<size_t>(byteEnd));
+}
+
+/// Return true only for the narrowly proved chunk-5 higher-order case:
+///
+///   * the callee of a descendant invocation comes from exactly one caller
+///     formal slot in `parent`
+///   * the spelled invocation text for that slot is exactly the parent formal
+///     name itself (for example `F` in `APPLY(F, X)`)
+///   * the slot forwards through exactly one `argRef`
+///   * the slot has no tuple forwarding witnesses
+///   * `argDeps` agrees with that single forwarded caller slot
+///
+/// This is intentionally narrower than "general higher-order callee closure".
+/// We only admit the whole-formal forwarding shape that is explicitly proven by
+/// the current producer contract. Any richer shape must continue to fail
+/// closed until the producer emits stronger callee-slice provenance.
+static bool IsWholeFormalCallerForwardSlot(
+    const RefoldModel::MacroInvocation &parent, uint32_t slot) {
+  if (slot >= parent.defParams.size())
+    return false;
+
+  auto templateText = TryGetInvocationArgText(parent, slot);
+  if (!templateText)
+    return false;
+  if (templateText->trim() != parent.defParams[slot].name)
+    return false;
+
+  if (slot >= parent.argRefs.size())
+    return false;
+  ArrayRef<RefoldModel::InvArgRef> refs(parent.argRefs[slot]);
+  if (refs.size() != 1)
+    return false;
+
+  if (slot < parent.argTupleRefs.size() && !parent.argTupleRefs[slot].empty())
+    return false;
+
+  if (slot >= parent.argDeps.size())
+    return false;
+  ArrayRef<uint32_t> deps(parent.argDeps[slot]);
+  if (deps.size() != 1 || deps.front() != refs.front().callerParamIndex)
+    return false;
+
+  return true;
+}
+
 static std::string FormatUInt32List(ArrayRef<uint32_t> values) {
   std::string out;
   raw_string_ostream os(out);
@@ -8878,12 +8964,29 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         return std::nullopt;
       };
 
-      auto pathHasOnlyLiteralCallees =
+      // Accept descendant leaves whose callee ancestry is either fully literal
+      // or closes transitively through the proved whole-formal caller-forwarding
+      // rule above. This is the chunk-5 boundary for the current contract:
+      // anything outside that proof surface remains conservatively rejected.
+      auto pathHasProvableCalleeClosure =
           [&](const RefoldModel::MacroInvocation &cand) -> bool {
         const RefoldModel::MacroInvocation *cur = &cand;
         for (;;) {
-          if (!HasLiteralMacroCalleeOrigin(*cur))
-            return false;
+          if (!HasLiteralMacroCalleeOrigin(*cur)) {
+            if (cur->calleeOrigin.kind != MacroCalleeOriginKind::CallerParam ||
+                !cur->callerMacroId ||
+                cur->calleeOrigin.callerParamIndices.size() != 1)
+              return false;
+
+            auto parentIt = invById.find(*cur->callerMacroId);
+            if (parentIt == invById.end())
+              return false;
+
+            const uint32_t slot = cur->calleeOrigin.callerParamIndices.front();
+            if (!IsWholeFormalCallerForwardSlot(*parentIt->second, slot))
+              return false;
+          }
+
           if (cur->id == m.id)
             return true;
           if (!cur->callerMacroId)
@@ -9326,7 +9429,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         SmallVector<RefoldModel::PPArgSpan, 8> candArgLike = candArgLikeRaw;
         sanitizeArgLikeSpans(candArgLike);
 
-        if (!pathHasOnlyLiteralCallees(cand)) {
+        if (!pathHasProvableCalleeClosure(cand)) {
           trace("macro/dag",
                 "skip leaf id={0} name='{1}': non-literal callee origin on "
                 "path to root id={2}",
