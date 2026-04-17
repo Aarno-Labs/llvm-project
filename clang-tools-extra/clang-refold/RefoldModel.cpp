@@ -261,16 +261,20 @@ parseSpans(const json::Value &val, StringRef ctx,
         return argOrErr.takeError();
       span.argIdx = *argOrErr;
 
-      // If this PPArgSpan has a byte range, then parse byte_begin/byte_end.
-      if (RefoldModel::HasByteRange(*argKind)) {
-        auto bbOrErr = applyToField(asUInt32, *obj, "byte_begin", ctxItem);
-        if (!bbOrErr)
-          return bbOrErr.takeError();
-        span.byteBegin = *bbOrErr;
+      // byte_begin/byte_end describe a token-internal slice within the
+      // spelled output token. Historically only paste spans carried these,
+      // but wrapped stringify spans may also need them (for example L## #x).
+      span.byteBegin = asOptUInt32(*obj, "byte_begin");
+      if (span.byteBegin) {
         auto beOrErr = applyToField(asUInt32, *obj, "byte_end", ctxItem);
         if (!beOrErr)
           return beOrErr.takeError();
         span.byteEnd = *beOrErr;
+      } else if (obj->get("byte_end")) {
+        return make_error<StringError>(
+            formatv("{0}: field 'byte_end' requires 'byte_begin'", ctxItem)
+                .str(),
+            inconvertibleErrorCode());
       }
 
       // Check if there are pp_byte_begin/pp_byte_end pairs.
@@ -304,12 +308,14 @@ bool RefoldModel::PPArgSpan::IsValid() const {
   if (!PPSpan::IsValid())
     return false;
 
-  bool okPaste = (kind != PPArgSpanKind::Paste) ||
-                 (byteBegin && byteEnd && *byteEnd > *byteBegin);
+  bool okTokenSubrange = (!byteBegin && !byteEnd) ||
+                        (byteBegin && byteEnd && *byteEnd > *byteBegin);
+  bool okPaste = (kind != PPArgSpanKind::Paste) || okTokenSubrange;
+  bool okStringify = (kind != PPArgSpanKind::Stringify) || okTokenSubrange;
 
   bool okPP = (!ppByteBegin && !ppByteEnd) || (ppByteBegin && ppByteEnd);
 
-  return okPaste && okPP;
+  return okPaste && okStringify && okPP;
 }
 
 // ========================== RefoldModel construction =========================

@@ -79,7 +79,8 @@ struct ArgTokenSpan {
   std::optional<uint32_t> ArgIndex;
   bool Open = false;
 
-  // For paste_spans only: byte range within the spelled output token
+  // For token-internal provenance spans (currently paste_spans and wrapped
+  // stringify_spans): byte range within the spelled output token
   // [ByteBegin, ByteEnd). When HasByteRange is false, ByteBegin/ByteEnd are
   // ignored.
   uint32_t ByteBegin = 0, ByteEnd = 0;
@@ -278,6 +279,32 @@ inline void touchArgTokSpan(std::vector<ArgTokenSpan> &V, uint64_t TokIdx,
   S.End = TokIdx + 1;
   S.ArgIndex = ArgIndex;
   S.Open = true;
+  V.push_back(S);
+}
+
+inline void appendExactArgTokSpan(std::vector<ArgTokenSpan> &V, uint64_t TokIdx,
+                                  uint32_t ArgIndex, uint32_t ByteBegin,
+                                  uint32_t ByteEnd) {
+  for (const ArgTokenSpan &E : V) {
+    if (E.Begin != TokIdx || E.End != TokIdx + 1)
+      continue;
+    if (E.ArgIndex != ArgIndex || !E.HasByteRange)
+      continue;
+    if (E.ByteBegin == ByteBegin && E.ByteEnd == ByteEnd)
+      return;
+  }
+
+  if (!V.empty() && V.back().Open)
+    V.back().Open = false;
+
+  ArgTokenSpan S;
+  S.Begin = TokIdx;
+  S.End = TokIdx + 1;
+  S.ArgIndex = ArgIndex;
+  S.Open = false;
+  S.HasByteRange = true;
+  S.ByteBegin = ByteBegin;
+  S.ByteEnd = ByteEnd;
   V.push_back(S);
 }
 
