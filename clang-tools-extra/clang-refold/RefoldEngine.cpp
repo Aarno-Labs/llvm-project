@@ -1408,6 +1408,11 @@ std::string RefoldEngine::RefoldOnce() {
                 trace("macro", "callsite patch overwritten inv id={0}",
                       target->id);
             }
+            const Owner currentPatchOwner =
+                NormalizeHunkOwnerForPatch(tuPath, h);
+            if (existingIt != byMacroId.end())
+              CarryMacroPatchOwnerCertificate(*updated, existingIt->second);
+            StampMacroPatchOwnerWitness(*updated, currentPatchOwner);
             updated->macroId = patchKey;
             byMacroId[patchKey] = std::move(*updated);
             appliedMacroPatch = true;
@@ -7771,6 +7776,85 @@ bool RefoldEngine::WholeCoverPatchMatchesPlan(const MacroPatch &patch,
          patch.wholeCoverBAdjHi == plan.bTokEnd;
 }
 
+RefoldEngine::Owner
+RefoldEngine::NormalizeHunkOwnerForPatch(StringRef tuPath,
+                                         const diffutils::Hunk &h) const {
+  Owner owner = ClassifyOwnerWithSegments(tuPath, h);
+  const bool mapsToTU = HunkMapsToTU(h.aStart, h.aEnd, tuPath);
+  if (mapsToTU)
+    return Owner::TU(owner.condArmId);
+  if (owner.kind == OwnerKind::Include && owner.includeId)
+    return Owner::Include(*owner.includeId, owner.condArmId);
+  return Owner::Unknown();
+}
+
+bool RefoldEngine::MacroPatchOwnerMatches(const MacroPatch &patch,
+                                          const Owner &owner) const {
+  if (!patch.ownerCertPresent || patch.ownerMixedWitness)
+    return false;
+  if (owner.kind == OwnerKind::Unknown)
+    return false;
+
+  const uint8_t wantKind =
+      (owner.kind == OwnerKind::TU) ? 1 : (owner.kind == OwnerKind::Include ? 2 : 0);
+  if (patch.ownerKindCode != wantKind)
+    return false;
+
+  const uint64_t wantInclude = owner.includeId.value_or(0);
+  if (patch.ownerIncludeIdCert != wantInclude)
+    return false;
+
+  if (patch.ownerHasCondArmCert != owner.condArmId.has_value())
+    return false;
+  if (patch.ownerHasCondArmCert &&
+      patch.ownerCondArmIdCert != owner.condArmId.value())
+    return false;
+
+  return true;
+}
+
+void RefoldEngine::CarryMacroPatchOwnerCertificate(MacroPatch &dst,
+                                                   const MacroPatch &src) const {
+  dst.ownerCertPresent = src.ownerCertPresent;
+  dst.ownerMixedWitness = src.ownerMixedWitness;
+  dst.ownerKindCode = src.ownerKindCode;
+  dst.ownerIncludeIdCert = src.ownerIncludeIdCert;
+  dst.ownerHasCondArmCert = src.ownerHasCondArmCert;
+  dst.ownerCondArmIdCert = src.ownerCondArmIdCert;
+  dst.ownerWitnessCount = src.ownerWitnessCount;
+}
+
+void RefoldEngine::StampMacroPatchOwnerWitness(MacroPatch &patch,
+                                               const Owner &owner) const {
+  if (owner.kind == OwnerKind::Unknown)
+    return;
+
+  const uint8_t kindCode =
+      (owner.kind == OwnerKind::TU) ? 1 : (owner.kind == OwnerKind::Include ? 2 : 0);
+  const uint64_t includeId = owner.includeId.value_or(0);
+  const bool hasCondArm = owner.condArmId.has_value();
+  const uint64_t condArmId = hasCondArm ? *owner.condArmId : 0;
+
+  if (!patch.ownerCertPresent) {
+    patch.ownerCertPresent = true;
+    patch.ownerMixedWitness = false;
+    patch.ownerKindCode = kindCode;
+    patch.ownerIncludeIdCert = includeId;
+    patch.ownerHasCondArmCert = hasCondArm;
+    patch.ownerCondArmIdCert = condArmId;
+    patch.ownerWitnessCount = 1;
+    return;
+  }
+
+  ++patch.ownerWitnessCount;
+  if (patch.ownerKindCode != kindCode ||
+      patch.ownerIncludeIdCert != includeId ||
+      patch.ownerHasCondArmCert != hasCondArm ||
+      (hasCondArm && patch.ownerCondArmIdCert != condArmId)) {
+    patch.ownerMixedWitness = true;
+  }
+}
+
 StringRef
 RefoldEngine::FormatMacroPatchProofKind(MacroPatchProofKind kind) const {
   switch (kind) {
@@ -7918,6 +8002,11 @@ void RefoldEngine::AddForcedCounterPatches(
           stringutils::showWSWithClip(*replOpt, 64), req.aStart, req.aEnd);
 
     MacroPatch patch{*invStart, *invEnd, std::move(*replOpt)};
+    if (it != byMacroId.end())
+      CarryMacroPatchOwnerCertificate(patch, it->second);
+    StampMacroPatchOwnerWitness(
+        patch, m.ownerIncludeId ? Owner::Include(*m.ownerIncludeId)
+                                : Owner::TU());
     patch.macroId = patchKey;
     byMacroId[patchKey] = std::move(patch);
   }
@@ -8036,6 +8125,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         *invStart, *invEnd, baseInvText.size(), h.aStart, h.aEnd, h.bStart,
         h.bEnd);
 
+  const Owner currentPatchOwner =
+      NormalizeHunkOwnerForPatch(model_.GetSourcePath(), h);
+
   // Do not downgrade: if we already have a patch for this invocation and it
   // does not look like a callsite invocation anymore (i.e. we already
   // realized/expanded it), keep it. If it is still a callsite patch, we may
@@ -8056,6 +8148,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
       const uint64_t id = kv.first;
       const MacroPatch &p = kv.second;
       if (p.invStart != *invStart || p.invEnd != *invEnd)
+        continue;
+      if (!MacroPatchOwnerMatches(p, currentPatchOwner))
         continue;
 
       const bool isStructurePreserving =
@@ -16498,7 +16592,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   }
 
   std::optional<WholeCoverPlan> wholeCoverPlan;
-  if (existingExpandedPatch && !existingExpandedPatch->structurePreserving) {
+  if (existingExpandedPatch && !existingExpandedPatch->structurePreserving &&
+      MacroPatchOwnerMatches(*existingExpandedPatch, currentPatchOwner)) {
     bool reuseExpanded = false;
     if (existingExpandedPatch->proofRootMacroId == m.id) {
       if (existingExpandedPatch->proofKind ==
