@@ -1569,6 +1569,40 @@ void RefoldModel::BuildIndicesAndSort() {
   armById_.clear();
   segmentsByFile_.clear();
 
+  // Some producer paths emit include items with an empty `spans` array even
+  // though the slot stream already carries exact file_begin/file_end ownership
+  // for the included file. That leaves the include with an invalid PP cover,
+  // which in turn makes PP-only include ownership recovery fail for edits that
+  // fall entirely inside the included header. Recover the missing PP cover
+  // deterministically from the include-owned file_begin/file_end slots.
+  DenseMap<uint64_t, uint64_t> includeBeginPPById;
+  DenseMap<uint64_t, uint64_t> includeEndPPById;
+  for (const auto &slot : slots_) {
+    if (!slot.ownerIncludeId || !slot.pp)
+      continue;
+    if (slot.kind == "file_begin") {
+      auto It = includeBeginPPById.find(*slot.ownerIncludeId);
+      if (It == includeBeginPPById.end() || *slot.pp < It->second)
+        includeBeginPPById[*slot.ownerIncludeId] = *slot.pp;
+    } else if (slot.kind == "file_end") {
+      auto It = includeEndPPById.find(*slot.ownerIncludeId);
+      if (It == includeEndPPById.end() || *slot.pp > It->second)
+        includeEndPPById[*slot.ownerIncludeId] = *slot.pp;
+    }
+  }
+  for (auto &inc : includes_) {
+    if (inc.cover.IsValid())
+      continue;
+    auto bIt = includeBeginPPById.find(inc.id);
+    auto eIt = includeEndPPById.find(inc.id);
+    if (bIt == includeBeginPPById.end() || eIt == includeEndPPById.end())
+      continue;
+    if (eIt->second <= bIt->second)
+      continue;
+    inc.spans.push_back(PPSpan{bIt->second, eIt->second});
+    inc.cover.Init(inc.spans);
+  }
+
   // includes: sort by (sitePath, siteB)
   std::sort(includes_.begin(), includes_.end(),
             [](const IncludeItem &a, const IncludeItem &b) {
