@@ -8378,22 +8378,11 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     if (!InvocationSpanMatchesCallsitePrefix(invSpanText, m))
       return std::nullopt;
 
-    auto invArgRangesOpt = GetMacroInvocationFormalArgContentRanges(m, invSpanText);
-    if (!invArgRangesOpt)
-      return std::nullopt;
-    const auto &invArgRanges = *invArgRangesOpt;
-
     std::vector<RefoldModel::PPArgSpan> occs;
     append_range(occs, m.argSpans);
     append_range(occs, m.stringifySpans);
     if (occs.empty())
       return std::nullopt;
-
-    std::vector<char> occIsStringify;
-    occIsStringify.resize(occs.size());
-    std::fill_n(occIsStringify.begin(), m.argSpans.size(), false);
-    std::fill_n(occIsStringify.begin() + m.argSpans.size(),
-                m.stringifySpans.size(), true);
 
     auto buildCombinedInsertionEnvelope =
         [&](const diffutils::Hunk &left, const diffutils::Hunk &right)
@@ -8444,182 +8433,26 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         continue;
 
       const uint32_t argIdx = touchedArgs.front();
-      if (static_cast<size_t>(argIdx) >= invArgRanges.size())
-        continue;
-
-      auto r0 = invArgRanges[argIdx];
-      StringRef baseArgText = invSpanText.substr(r0.first, r0.second - r0.first);
-      SmallVector<diffutils::Hunk, 2> pairHunks{hEff, partner};
-      SmallVector<diffutils::Hunk, 2> consistencyHunks{envTrim, partner};
       trace("macro/args",
             "paired pure-insertion args-only candidate inv id={0} name={1} "
-            "argIdx={2} cur={3} partner={4} envTrim={5} baseArg='{6}' "
-            "consistencyHunks=[{7}, {8}]",
-            m.id, m.name, argIdx, hEff, partner, envTrim,
-            stringutils::showWSWithClip(baseArgText.trim(), 200), envTrim, partner);
-      std::optional<std::string> uniqueNewArg;
-      bool ok = true;
+            "argIdx={2} cur={3} partner={4} envTrim={5} -> delegate to "
+            "standard args-only builder",
+            m.id, m.name, argIdx, hEff, partner, envTrim);
 
-      for (size_t i = 0; i < occs.size(); ++i) {
-        const auto &sp = occs[i];
-        if (sp.argIdx != argIdx)
-          continue;
-
-        auto bEnv = MapAToBTokenEnvelopeByPPArgSpan(sp);
-        if (!bEnv) {
-          trace("macro/args",
-                "paired pure-insertion args-only occurrence missing B envelope "
-                "inv id={0} name={1} argIdx={2} occIndex={3} spanTok=[{4},{5})",
-                m.id, m.name, argIdx, i, sp.begin, sp.end);
-          ok = false;
-          break;
-        }
-
-        size_t lo = bEnv->first;
-        size_t hi = bEnv->second;
-        trace("macro/args",
-              "paired pure-insertion args-only occurrence base envelope inv "
-              "id={0} name={1} argIdx={2} occIndex={3} stringify={4} "
-              "touchedOcc={5} spanTok=[{6},{7}) bEnv=[{8},{9}) baseBSlice='{10}'",
-              m.id, m.name, argIdx, i, occIsStringify[i] ? 1 : 0,
-              touchedOcc[i] ? 1 : 0, sp.begin, sp.end, lo, hi,
-              stringutils::showWSWithClip(SliceBSource(lo, hi).trim(), 200));
-        if (touchedOcc[i]) {
-          const size_t oldLo = lo;
-          const size_t oldHi = hi;
-          lo = std::min(lo, static_cast<size_t>(envTrim.bStart));
-          hi = std::max(hi, static_cast<size_t>(envTrim.bEnd));
-          trace("macro/args",
-                "paired pure-insertion args-only occurrence envTrim widen inv "
-                "id={0} name={1} argIdx={2} occIndex={3} envTrimB=[{4},{5}) "
-                "oldRange=[{6},{7}) newRange=[{8},{9}) slice='{10}'",
-                m.id, m.name, argIdx, i, envTrim.bStart, envTrim.bEnd, oldLo,
-                oldHi, lo, hi,
-                stringutils::showWSWithClip(SliceBSource(lo, hi).trim(), 200));
-        }
-        for (const auto &pairH : pairHunks) {
-          if (auto owned = GetOwnedPureInsertionBRangeForArgSpan(sp, occs, *bEnv,
-                                                                 pairH)) {
-            const size_t oldLo = lo;
-            const size_t oldHi = hi;
-            lo = std::min(lo, owned->first);
-            hi = std::max(hi, owned->second);
-            trace("macro/args",
-                  "paired pure-insertion args-only owned insertion widen inv "
-                  "id={0} name={1} argIdx={2} occIndex={3} pairH={4} "
-                  "owned=[{5},{6}) ownedSlice='{7}' oldRange=[{8},{9}) "
-                  "newRange=[{10},{11}) slice='{12}'",
-                  m.id, m.name, argIdx, i, pairH, owned->first, owned->second,
-                  stringutils::showWSWithClip(
-                      SliceBSource(owned->first, owned->second).trim(), 200),
-                  oldLo, oldHi, lo, hi,
-                  stringutils::showWSWithClip(SliceBSource(lo, hi).trim(), 200));
-          } else {
-            trace("macro/args",
-                  "paired pure-insertion args-only owned insertion miss inv "
-                  "id={0} name={1} argIdx={2} occIndex={3} pairH={4} "
-                  "bEnv=[{5},{6})",
-                  m.id, m.name, argIdx, i, pairH, bEnv->first, bEnv->second);
-          }
-        }
-
-        StringRef bSlice = SliceBSource(lo, hi).trim();
-        std::string newArg = bSlice.str();
-        trace("macro/args",
-              "paired pure-insertion args-only final slice inv id={0} name={1} "
-              "argIdx={2} occIndex={3} finalRange=[{4},{5}) bSlice='{6}'",
-              m.id, m.name, argIdx, i, lo, hi,
-              stringutils::showWSWithClip(bSlice, 200));
-        if (occIsStringify[i]) {
-          auto un = UnstringifyLiteralToArgText(
-              bSlice, isVariadicFormalInInvocation(m, argIdx));
-          if (!un) {
-            trace("macro/args",
-                  "paired pure-insertion args-only unstringify failed inv "
-                  "id={0} name={1} argIdx={2} occIndex={3} slice='{4}'",
-                  m.id, m.name, argIdx, i,
-                  stringutils::showWSWithClip(bSlice, 200));
-            ok = false;
-            break;
-          }
-          auto canon = CanonicalizeStringifyInversePayload(*un);
-          if (!canon || StringRef(*canon).trim() != StringRef(*un).trim()) {
-            trace("macro/args",
-                  "paired pure-insertion args-only stringify canonicalization "
-                  "failed inv id={0} name={1} argIdx={2} occIndex={3} "
-                  "un='{4}' canon='{5}'",
-                  m.id, m.name, argIdx, i,
-                  stringutils::showWSWithClip(*un, 200),
-                  canon ? stringutils::showWSWithClip(*canon, 200)
-                        : std::string("<none>"));
-            ok = false;
-            break;
-          }
-          newArg = std::move(*canon);
-        }
-
-        if (!isVariadicFormalInInvocation(m, argIdx) &&
-            hasTopLevelCommaInRefoldText(newArg)) {
-          trace("macro/args",
-                "paired pure-insertion args-only rejected top-level comma inv "
-                "id={0} name={1} argIdx={2} occIndex={3} newArg='{4}'",
-                m.id, m.name, argIdx, i,
-                stringutils::showWSWithClip(newArg, 200));
-          ok = false;
-          break;
-        }
-
-        const bool occsMatch =
-            MacroArgReplacementMatchesAllOccurrencesInB(
-                m, argIdx, baseArgText, newArg, consistencyHunks);
-        trace("macro/args",
-              "paired pure-insertion args-only occurrence consistency inv "
-              "id={0} name={1} argIdx={2} occIndex={3} baseArg='{4}' "
-              "newArg='{5}' consistencyHunks=[{6}, {7}] rawPair=[{8}, {9}] "
-              "match={10}",
-              m.id, m.name, argIdx, i,
-              stringutils::showWSWithClip(baseArgText.trim(), 200),
-              stringutils::showWSWithClip(newArg, 200), envTrim, partner, hEff,
-              partner, occsMatch ? 1 : 0);
-        if (!occsMatch) {
-          ok = false;
-          break;
-        }
-
-        if (uniqueNewArg && *uniqueNewArg != newArg) {
-          trace("macro/args",
-                "paired pure-insertion args-only conflicting newArg inv "
-                "id={0} name={1} argIdx={2} occIndex={3} first='{4}' "
-                "second='{5}'",
-                m.id, m.name, argIdx, i,
-                stringutils::showWSWithClip(*uniqueNewArg, 200),
-                stringutils::showWSWithClip(newArg, 200));
-          ok = false;
-          break;
-        }
-        uniqueNewArg = std::move(newArg);
-      }
-
-      if (!ok || !uniqueNewArg)
-        continue;
-      if (StringRef(*uniqueNewArg).trim() == baseArgText.trim())
+      auto patch = BuildMacroInvocationPatchArgsOnly(m, envTrim, baseInvText);
+      if (!patch)
         continue;
 
-      std::string newInv = stringutils::replaceRange(invSpanText, r0.first,
-                                                     r0.second, *uniqueNewArg);
       trace("macro/args",
             "paired pure-insertion args-only SUCCESS inv id={0} name={1} "
             "argIdx={2} cur={3} partner={4} newInv='{5}'",
             m.id, m.name, argIdx, hEff, partner,
-            stringutils::showWSWithClip(newInv, 200));
-      {
-        MacroPatch patch{*m.invB, *m.invE, std::move(newInv), m.id};
-        patch.proofKind = MacroPatchProofKind::ArgsOnlyPairedPureInsertion;
-        patch.proofValidated = true;
-        patch.structurePreserving = true;
-        patch.proofRootMacroId = m.id;
-        return patch;
-      }
+            stringutils::showWSWithClip(patch->replacement, 200));
+      patch->proofKind = MacroPatchProofKind::ArgsOnlyPairedPureInsertion;
+      patch->proofValidated = true;
+      patch->structurePreserving = true;
+      patch->proofRootMacroId = m.id;
+      return patch;
     }
 
     return std::nullopt;
