@@ -523,6 +523,37 @@ private:
     bool proofValidated = false;
     bool structurePreserving = false;
     uint64_t proofRootMacroId = 0;
+
+    // Layer-4 whole-cover certificate metadata used to make expanded-patch
+    // reuse fail-closed and provenance-based.
+    bool wholeCoverUsedBodyRange = false;
+    bool wholeCoverSelfContained = false;
+    bool wholeCoverNestedSelfContained = false;
+    bool wholeCoverAdjustedLeft = false;
+    bool wholeCoverAdjustedRight = false;
+    bool wholeCoverClaimsClipped = false;
+    uint64_t wholeCoverALo = 0;
+    uint64_t wholeCoverAHi = 0;
+    uint64_t wholeCoverBRawLo = 0;
+    uint64_t wholeCoverBRawHi = 0;
+    uint64_t wholeCoverBAdjLo = 0;
+    uint64_t wholeCoverBAdjHi = 0;
+  };
+
+  struct WholeCoverPlan {
+    uint64_t covLoA = 0;
+    uint64_t covHiA = 0;
+    bool usedBodyRange = false;
+    bool selfContained = false;
+    bool nestedSelfContained = false;
+    size_t rawBTokStart = 0;
+    size_t rawBTokEnd = 0;
+    size_t bTokStart = 0;
+    size_t bTokEnd = 0;
+    bool adjustedLeft = false;
+    bool adjustedRight = false;
+    bool claimsClipped = false;
+    std::string clippedText;
   };
 
   struct IncludePatch {
@@ -2056,6 +2087,13 @@ private:
   /// replace the callsite. The mapping is structural and claim-aware (B-only
   /// insertion segments that are committed to standalone emission are clipped
   /// out so they are not double-emitted).
+  std::optional<WholeCoverPlan>
+  ComputeWholeCoverPlan(const RefoldModel::MacroInvocation &m) const;
+
+  bool WholeCoverPatchMatchesPlan(const MacroPatch &patch,
+                                  const WholeCoverPlan &plan,
+                                  uint64_t rootMacroId) const;
+
   std::optional<std::string>
   BuildWholeCoverReplacementText(const RefoldModel::MacroInvocation &m) const;
 
