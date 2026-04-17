@@ -1188,11 +1188,26 @@ private:
   /// \returns `true` if all verifiable occurrences of `argIdx` in B are
   ///          consistent with the rewrite; `false` if any required occurrence
   ///          contradicts the rewrite.
+  enum class OccurrenceSupportMode {
+    /// Only metadata attached directly to the current invocation may justify
+    /// occurrence-consistency success. Use this for direct args-only patch
+    /// construction so descendant/sibling support cannot silently substitute
+    /// for missing current-invocation evidence.
+    CurrentInvocationOnly,
+
+    /// Descendant/sibling dependency paths may justify occurrence-consistency
+    /// success. Use this only inside the semantic/DAG certificate pipeline,
+    /// where the caller is already proving carried rewrites through the
+    /// invocation graph.
+    AllowGraphSupport,
+  };
+
   bool MacroArgReplacementMatchesAllOccurrencesInB(
       const RefoldModel::MacroInvocation &m, uint32_t argIdx, StringRef baseArg,
       StringRef newArg, ArrayRef<diffutils::Hunk> tokenHunks) const {
     return MacroArgReplacementMatchesAllOccurrencesInBImpl(
-        m, argIdx, baseArg, newArg, tokenHunks, /*checkPasteSpans*/ true);
+        m, argIdx, baseArg, newArg, tokenHunks, /*checkPasteSpans*/ true,
+        OccurrenceSupportMode::CurrentInvocationOnly);
   }
 
   /// \brief Variant of `MacroArgReplacementMatchesAllOccurrencesInB` that
@@ -1224,7 +1239,34 @@ private:
       const RefoldModel::MacroInvocation &m, uint32_t argIdx, StringRef baseArg,
       StringRef newArg, ArrayRef<diffutils::Hunk> tokenHunks) const {
     return MacroArgReplacementMatchesAllOccurrencesInBImpl(
-        m, argIdx, baseArg, newArg, tokenHunks, /*checkPasteSpans*/ false);
+        m, argIdx, baseArg, newArg, tokenHunks, /*checkPasteSpans*/ false,
+        OccurrenceSupportMode::CurrentInvocationOnly);
+  }
+
+  /// \brief Semantic-proof variant of
+  /// `MacroArgReplacementMatchesAllOccurrencesInB`.
+  ///
+  /// This preserves the existing DAG/subtree/root-proof behavior: when the
+  /// current invocation has no direct occurrence metadata for a formal, the
+  /// consumer may still accept the rewrite if a descendant/sibling dependency
+  /// path proves that the formal participates in occurrence-bearing structure
+  /// elsewhere in the invocation graph.
+  bool MacroArgReplacementMatchesAllOccurrencesInBSemanticProof(
+      const RefoldModel::MacroInvocation &m, uint32_t argIdx, StringRef baseArg,
+      StringRef newArg, ArrayRef<diffutils::Hunk> tokenHunks) const {
+    return MacroArgReplacementMatchesAllOccurrencesInBImpl(
+        m, argIdx, baseArg, newArg, tokenHunks, /*checkPasteSpans*/ true,
+        OccurrenceSupportMode::AllowGraphSupport);
+  }
+
+  /// \brief Semantic-proof variant of
+  /// `MacroArgReplacementMatchesAllOccurrencesInBIgnorePaste`.
+  bool MacroArgReplacementMatchesAllOccurrencesInBIgnorePasteSemanticProof(
+      const RefoldModel::MacroInvocation &m, uint32_t argIdx, StringRef baseArg,
+      StringRef newArg, ArrayRef<diffutils::Hunk> tokenHunks) const {
+    return MacroArgReplacementMatchesAllOccurrencesInBImpl(
+        m, argIdx, baseArg, newArg, tokenHunks, /*checkPasteSpans*/ false,
+        OccurrenceSupportMode::AllowGraphSupport);
   }
 
   /// \brief Core implementation for validating whether a proposed args-only
@@ -1245,10 +1287,11 @@ private:
   ///   (via `##`) attributable to `argIdx`. These are optionally verified.
   ///
   /// ### Conservatism and missing metadata
-  /// If the invocation provides **no occurrence metadata** for `argIdx` (no
-  /// STANDARD and no PASTE spans), this method returns `true` and does not
-  /// block args-only refolding. This avoids penalizing incomplete producer
-  /// metadata.
+  /// When `supportMode` is `CurrentInvocationOnly`, missing STANDARD spans only
+  /// succeed when the current invocation still carries direct STRINGIFY or
+  /// PASTE support for `argIdx`; descendant/sibling support does not count.
+  /// When `supportMode` is `AllowGraphSupport`, the semantic proof pipeline may
+  /// also use descendant/sibling dependency paths as support.
   ///
   /// ### Stringify rule (strict mode)
   /// When `strict` is enabled and `argIdx` is stringified at least once, every
@@ -1281,13 +1324,15 @@ private:
   /// \param tokenHunks edit hunks on the B token stream (used to widen
   ///                   B-envelopes at insertion boundaries)
   /// \param checkPasteSpans whether to attempt per-span paste verification
+  /// \param supportMode whether no-direct-support cases may consult only the
+  ///        current invocation or may also use the invocation graph
   /// \returns `true` if all verifiable occurrences of `argIdx` in B are
   ///          consistent with applying the args-only rewrite; `false` on any
   ///          proven contradiction.
   bool MacroArgReplacementMatchesAllOccurrencesInBImpl(
       const RefoldModel::MacroInvocation &m, uint32_t argIdx, StringRef baseArg,
       StringRef newArg, ArrayRef<diffutils::Hunk> tokenHunks,
-      bool checkPasteSpans) const;
+      bool checkPasteSpans, OccurrenceSupportMode supportMode) const;
 
   /// \brief Return the exact A-side occurrence that owns the pure-insertion gap
   ///        at \p aPos.

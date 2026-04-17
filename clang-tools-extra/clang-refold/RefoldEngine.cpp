@@ -3718,7 +3718,7 @@ RefoldEngine::GetOwnedPureInsertionBRangeForArgSpan(
 bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
     const RefoldModel::MacroInvocation &m, uint32_t argIdx, StringRef baseArg,
     StringRef newArg, ArrayRef<diffutils::Hunk> tokenHunks,
-    bool checkPasteSpans) const {
+    bool checkPasteSpans, OccurrenceSupportMode supportMode) const {
   if (newArg.data() == nullptr)
     return false;
 
@@ -3732,45 +3732,31 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
     }
   }
 
-  if (!hasAny) {
-    for (const auto &s : m.stringifySpans) {
-      if (s.argIdx == argIdx) {
-        hasAny = true;
-        break;
-      }
+  auto hasDirectOccurrenceSupport = [](const RefoldModel::MacroInvocation &inv,
+                                       uint32_t formalIdx) -> bool {
+    for (const auto &s : inv.argSpans) {
+      if (s.argIdx == formalIdx)
+        return true;
     }
-  }
-
-  if (!hasAny) {
-    for (const auto &s : m.pasteSpans) {
-      if (s.argIdx == argIdx) {
-        hasAny = true;
-        break;
-      }
+    for (const auto &s : inv.stringifySpans) {
+      if (s.argIdx == formalIdx)
+        return true;
     }
-  }
+    for (const auto &s : inv.pasteSpans) {
+      if (s.argIdx == formalIdx)
+        return true;
+    }
+    return false;
+  };
 
   if (!hasAny) {
-    auto hasDirectOccurrenceSupport = [](const RefoldModel::MacroInvocation &inv,
-                                         uint32_t formalIdx) -> bool {
-      for (const auto &s : inv.argSpans) {
-        if (s.argIdx == formalIdx)
-          return true;
-      }
-      for (const auto &s : inv.stringifySpans) {
-        if (s.argIdx == formalIdx)
-          return true;
-      }
-      for (const auto &s : inv.pasteSpans) {
-        if (s.argIdx == formalIdx)
-          return true;
-      }
-      return false;
-    };
-
-    std::function<bool(const RefoldModel::MacroInvocation &, uint32_t,
-                       std::set<std::pair<uint64_t, uint32_t>> &)>
-        hasOccurrenceSupportThroughGraph;
+    if (supportMode == OccurrenceSupportMode::CurrentInvocationOnly) {
+      if (!hasDirectOccurrenceSupport(m, argIdx))
+        return false;
+    } else {
+      std::function<bool(const RefoldModel::MacroInvocation &, uint32_t,
+                         std::set<std::pair<uint64_t, uint32_t>> &)>
+          hasOccurrenceSupportThroughGraph;
 
     hasOccurrenceSupportThroughGraph =
         [&](const RefoldModel::MacroInvocation &inv, uint32_t formalIdx,
@@ -3834,10 +3820,10 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
       return false;
     };
 
-    std::set<std::pair<uint64_t, uint32_t>> visiting;
-    if (!hasOccurrenceSupportThroughGraph(m, argIdx, visiting))
-      return false;
-    return true;
+      std::set<std::pair<uint64_t, uint32_t>> visiting;
+      if (!hasOccurrenceSupportThroughGraph(m, argIdx, visiting))
+        return false;
+    }
   }
 
   const uint64_t maxTok =
@@ -11070,7 +11056,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           return cert;
         }
 
-        if (!MacroArgReplacementMatchesAllOccurrencesInBIgnorePaste(
+        if (!MacroArgReplacementMatchesAllOccurrencesInBIgnorePasteSemanticProof(
                 inv, argIdx, oldText, newText, tokenHunksAR)) {
           cert.failure = RawFormalValidationFailure::OccurrenceMismatch;
           cert.detail =
