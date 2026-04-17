@@ -2852,6 +2852,8 @@ bool RefoldEngine::IsInvocationInsideDefineDirective(
             defineEndCache[d.id] = d.siteE;
             defineEnd = d.siteE;
           } else {
+            // The normal case: split the rewritten core around the original
+            // literal delimiters and require a unique segmentation.
             fileTextCache[absPath] = (**bufOrErr).getBuffer().str();
             itTxt = fileTextCache.find(absPath);
           }
@@ -3967,6 +3969,8 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
             if (h.aStart == h.aEnd) {
               touches = false;
             } else {
+            // The normal case: split the rewritten core around the original
+            // literal delimiters and require a unique segmentation.
               touches = (h.aStart < s.end && h.aEnd > s.begin);
             }
             if (touches && h.bStart < h.bEnd) {
@@ -3998,6 +4002,8 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
               tok.size() >= aPref.size() + aSuff.size()) {
             tok = tok.slice(aPref.size(), tok.size() - aSuff.size());
           } else {
+            // The normal case: split the rewritten core around the original
+            // literal delimiters and require a unique segmentation.
             const uint64_t bbC = std::min<uint64_t>(bb, tok.size());
             const uint64_t beC = std::min<uint64_t>(be, tok.size());
             if (beC < bbC)
@@ -6508,6 +6514,8 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
                     stringutils::showWSWithClip(bSlice, 200),
                     stringutils::showWSWithClip(newArg, 200));
             } else {
+            // The normal case: split the rewritten core around the original
+            // literal delimiters and require a unique segmentation.
               trace("macro/args",
                     "    lift/paste FAILED argIdx={0} baseArg={1} aSlice={2} bSlice={3}",
                     argIdx, stringutils::showWS(baseArgText),
@@ -6659,6 +6667,8 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
               lo = static_cast<size_t>(std::min<uint64_t>(lo, hk.bStart));
               hi = static_cast<size_t>(std::max<uint64_t>(hi, hk.bEnd));
             } else {
+            // The normal case: split the rewritten core around the original
+            // literal delimiters and require a unique segmentation.
               hunkEffects.push_back(formatv("ignored {0}", hk.ToString()).str());
             }
           }
@@ -9090,6 +9100,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               b.size() >= aPref.size() + aSuff.size()) {
             b = b.slice(aPref.size(), b.size() - aSuff.size());
           } else {
+            // The normal case: split the rewritten core around the original
+            // literal delimiters and require a unique segmentation.
             reliable = false;
             const uint64_t bbC = std::min<uint64_t>(bb, b.size());
             const uint64_t beC = std::min<uint64_t>(be, b.size());
@@ -9858,6 +9870,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                 return;
             }
           } else {
+            // The normal case: split the rewritten core around the original
+            // literal delimiters and require a unique segmentation.
             for (size_t len = 0; len <= maxLen; ++len) {
               tryLen(len);
               if (solutions.size() > 1)
@@ -10083,6 +10097,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               inChr = false;
             }
           } else {
+            // The normal case: split the rewritten core around the original
+            // literal delimiters and require a unique segmentation.
             if (c == '/' && i + 1 < s.size()) {
               if (s[i + 1] == '/') {
                 inLineComment = true;
@@ -10101,6 +10117,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             } else if (c == '\'') {
               inChr = true;
             } else {
+            // The normal case: split the rewritten core around the original
+            // literal delimiters and require a unique segmentation.
               switch (c) {
               case '(':
                 ++paren;
@@ -10915,6 +10933,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                       return;
                   });
             } else {
+            // The normal case: split the rewritten core around the original
+            // literal delimiters and require a unique segmentation.
               enumerateTopLevelBalancedCutPoints(rest, [&](unsigned cut) {
                 const size_t len = static_cast<size_t>(cut);
                 if (len > maxLen)
@@ -13024,6 +13044,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                        siblingLift.parentInvocationFailure ==
                            InvocationRewriteFailure::None) {
             } else {
+            // The normal case: split the rewritten core around the original
+            // literal delimiters and require a unique segmentation.
               trace("macro/dag",
                     "DAG per-hop exact sibling reroot rejected: sibling id={0} name={1} siblingFormal={2} reason=uncertifiedParentFormalEvidence nextFormals={3}",
                     matchedSibling->id, matchedSibling->name, siblingFormal,
@@ -16471,36 +16493,29 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           SmallVector<StringRef, 4> midBodies;
           oldSegs.reserve(group.size());
           midBodies.reserve(group.size() - 1);
+          bool hasEmptyInternalSeparator = false;
+          bool hasNonEmptyInternalSeparator = false;
           for (size_t i = 0; i < group.size(); ++i) {
             const auto *sp = group[i];
             oldSegs.push_back(oldTok.slice(*sp->byteBegin, *sp->byteEnd));
             if (i + 1 < group.size()) {
-              StringRef mid = oldTok.slice(*sp->byteEnd, *group[i + 1]->byteBegin);
+              StringRef mid =
+                  oldTok.slice(*sp->byteEnd, *group[i + 1]->byteBegin);
               if (mid.empty()) {
-                groupOk = false;
-                break;
+                hasEmptyInternalSeparator = true;
+                continue;
               }
+              hasNonEmptyInternalSeparator = true;
               midBodies.push_back(mid);
             }
           }
-          if (!groupOk) {
+          if (hasEmptyInternalSeparator && hasNonEmptyInternalSeparator) {
             invalid = true;
             break;
           }
 
           StringRef core =
               newTok.slice(leading.size(), newTok.size() - trailing.size());
-
-          auto suffixDelimiterNeed = [&](size_t delimIdx) -> uint64_t {
-            const StringRef delim = midBodies[delimIdx];
-            uint64_t need = 0;
-            for (size_t segIdx = delimIdx + 1; segIdx < oldSegs.size(); ++segIdx)
-              need += countSubstr(oldSegs[segIdx], delim);
-            for (size_t later = delimIdx + 1; later < midBodies.size(); ++later)
-              if (midBodies[later] == delim)
-                ++need;
-            return need;
-          };
 
           SmallVector<StringRef, 4> curSegs;
           SmallVector<SmallVector<StringRef, 4>, 2> splitSolutions;
@@ -16512,34 +16527,163 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             splitSolutions.push_back(std::move(copy));
           };
 
-          auto splitCore = [&](auto &&self, size_t delimIdx, StringRef rest) -> void {
-            if (splitSolutions.size() > 1)
-              return;
-            if (delimIdx == midBodies.size()) {
-              curSegs.push_back(rest);
-              addSplitSolution(curSegs);
-              curSegs.pop_back();
-              return;
+          if (hasEmptyInternalSeparator) {
+            // No literal delimiter survives between adjacent pasted operands.
+            // In that case the only sound split witness is an unchanged operand
+            // that still appears verbatim in the edited pasted core. Accept the
+            // group only when those unchanged anchors induce exactly one
+            // segmentation of the rewritten core back into per-operand pieces.
+            SmallVector<size_t, 4> anchoredIdxs;
+            SmallVector<SmallVector<size_t, 4>, 4> anchorStartsByIdx;
+            anchoredIdxs.reserve(group.size());
+            anchorStartsByIdx.reserve(group.size());
+
+            for (size_t i = 0; i < oldSegs.size(); ++i) {
+              const StringRef anchor = oldSegs[i];
+              if (anchor.empty())
+                continue;
+
+              SmallVector<size_t, 4> starts;
+              for (size_t pos = 0;
+                   (pos = core.find(anchor, pos)) != StringRef::npos; ++pos)
+                starts.push_back(pos);
+              if (starts.empty())
+                continue;
+
+              anchoredIdxs.push_back(i);
+              anchorStartsByIdx.push_back(std::move(starts));
             }
 
-            const StringRef delim = midBodies[delimIdx];
-            const uint64_t needLeft = countSubstr(oldSegs[delimIdx], delim);
-            const uint64_t needRight = suffixDelimiterNeed(delimIdx);
-
-            for (size_t pos = 0;
-                 (pos = rest.find(delim, pos)) != StringRef::npos; ++pos) {
-              StringRef left = rest.slice(0, pos);
-              StringRef tail = rest.drop_front(pos + delim.size());
-              if (countSubstr(left, delim) < needLeft)
-                continue;
-              if (countSubstr(tail, delim) < needRight)
-                continue;
-              curSegs.push_back(left);
-              self(self, delimIdx + 1, tail);
-              curSegs.pop_back();
+            if (anchoredIdxs.empty()) {
+              invalid = true;
+              break;
             }
-          };
-          splitCore(splitCore, 0, core);
+
+            SmallVector<size_t, 4> curAnchorStarts;
+            auto addZeroDelimiterAnchoredSolution =
+                [&](ArrayRef<size_t> anchorStarts) {
+                  SmallVector<StringRef, 4> parts(group.size());
+                  size_t prevConsumed = 0;
+
+                  for (size_t anchorPos = 0; anchorPos < anchoredIdxs.size();
+                       ++anchorPos) {
+                    const size_t anchorIdx = anchoredIdxs[anchorPos];
+                    const size_t anchorBegin = anchorStarts[anchorPos];
+                    const size_t anchorEnd = anchorBegin + oldSegs[anchorIdx].size();
+                    if (anchorBegin < prevConsumed || anchorEnd > core.size())
+                      return;
+
+                    if (anchorPos == 0) {
+                      if (anchorIdx > 1)
+                        return;
+                      if (anchorIdx == 0) {
+                        if (anchorBegin != 0)
+                          return;
+                      } else {
+            // The normal case: split the rewritten core around the original
+            // literal delimiters and require a unique segmentation.
+                        parts[0] = core.slice(0, anchorBegin);
+                      }
+                    } else {
+            // The normal case: split the rewritten core around the original
+            // literal delimiters and require a unique segmentation.
+                      const size_t prevAnchorIdx = anchoredIdxs[anchorPos - 1];
+                      const size_t gapSegments = anchorIdx - prevAnchorIdx - 1;
+                      if (gapSegments > 1)
+                        return;
+                      if (gapSegments == 1)
+                        parts[prevAnchorIdx + 1] =
+                            core.slice(prevConsumed, anchorBegin);
+                      else if (anchorBegin != prevConsumed)
+                        return;
+                    }
+
+                    parts[anchorIdx] = oldSegs[anchorIdx];
+                    prevConsumed = anchorEnd;
+                  }
+
+                  const size_t trailingGapSegments =
+                      group.size() - anchoredIdxs.back() - 1;
+                  if (trailingGapSegments > 1)
+                    return;
+                  if (trailingGapSegments == 0) {
+                    if (prevConsumed != core.size())
+                      return;
+                  } else {
+            // The normal case: split the rewritten core around the original
+            // literal delimiters and require a unique segmentation.
+                    parts[anchoredIdxs.back() + 1] = core.drop_front(prevConsumed);
+                  }
+
+                  addSplitSolution(parts);
+                };
+
+            auto enumerateZeroDelimiterAnchors =
+                [&](auto &&self, size_t anchorPos, size_t minStart) -> void {
+                  if (splitSolutions.size() > 1)
+                    return;
+                  if (anchorPos == anchoredIdxs.size()) {
+                    addZeroDelimiterAnchoredSolution(curAnchorStarts);
+                    return;
+                  }
+
+                  const size_t anchorIdx = anchoredIdxs[anchorPos];
+                  const StringRef anchor = oldSegs[anchorIdx];
+                  for (size_t start : anchorStartsByIdx[anchorPos]) {
+                    if (start < minStart)
+                      continue;
+                    curAnchorStarts.push_back(start);
+                    self(self, anchorPos + 1, start + anchor.size());
+                    curAnchorStarts.pop_back();
+                  }
+                };
+            enumerateZeroDelimiterAnchors(enumerateZeroDelimiterAnchors, 0, 0);
+          } else {
+            // The normal case: split the rewritten core around the original
+            // literal delimiters and require a unique segmentation.
+            auto suffixDelimiterNeed = [&](size_t delimIdx) -> uint64_t {
+              const StringRef delim = midBodies[delimIdx];
+              uint64_t need = 0;
+              for (size_t segIdx = delimIdx + 1; segIdx < oldSegs.size();
+                   ++segIdx)
+                need += countSubstr(oldSegs[segIdx], delim);
+              for (size_t later = delimIdx + 1; later < midBodies.size();
+                   ++later)
+                if (midBodies[later] == delim)
+                  ++need;
+              return need;
+            };
+
+            auto splitCore =
+                [&](auto &&self, size_t delimIdx, StringRef rest) -> void {
+                  if (splitSolutions.size() > 1)
+                    return;
+                  if (delimIdx == midBodies.size()) {
+                    curSegs.push_back(rest);
+                    addSplitSolution(curSegs);
+                    curSegs.pop_back();
+                    return;
+                  }
+
+                  const StringRef delim = midBodies[delimIdx];
+                  const uint64_t needLeft = countSubstr(oldSegs[delimIdx], delim);
+                  const uint64_t needRight = suffixDelimiterNeed(delimIdx);
+
+                  for (size_t pos = 0;
+                       (pos = rest.find(delim, pos)) != StringRef::npos; ++pos) {
+                    StringRef left = rest.slice(0, pos);
+                    StringRef tail = rest.drop_front(pos + delim.size());
+                    if (countSubstr(left, delim) < needLeft)
+                      continue;
+                    if (countSubstr(tail, delim) < needRight)
+                      continue;
+                    curSegs.push_back(left);
+                    self(self, delimIdx + 1, tail);
+                    curSegs.pop_back();
+                  }
+                };
+            splitCore(splitCore, 0, core);
+          }
 
           if (splitSolutions.size() != 1 ||
               splitSolutions[0].size() != group.size()) {
@@ -16690,6 +16834,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                     leaf.id, leaf.name);
               invalid = true;
             } else {
+            // The normal case: split the rewritten core around the original
+            // literal delimiters and require a unique segmentation.
               auto leafRangesOpt = GetMacroInvocationFormalArgContentRanges(
                   leaf, StringRef(*leaf.invText));
               if (!leafRangesOpt) {
