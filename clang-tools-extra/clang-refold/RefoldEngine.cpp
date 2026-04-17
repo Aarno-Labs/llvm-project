@@ -12602,6 +12602,347 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           return cert;
         }
 
+        /// Try to explain an observed rewrite of a pasted surface by replaying
+        /// exactly one direct paste-producing child invocation.
+        ///
+        /// This helper is intentionally narrow: it only succeeds when the child
+        /// has a single paste group, the edited surface can be split back into a
+        /// unique sequence of per-operand segments, and each segment can be
+        /// lifted through the child's formal-derivation certificate. Any
+        /// ambiguity means we do not have a sound inverse-paste witness.
+        auto tryDeriveObservedConstraintsFromDirectPasteChild =
+            [&](const RefoldModel::MacroInvocation &directChild,
+                StringRef observedOld0, StringRef observedNew0,
+                StringRef traceStage)
+            -> std::optional<
+                SmallVector<std::pair<uint32_t, ObservedFormalConstraint>, 4>> {
+          StringRef observedOld = observedOld0.trim();
+          StringRef observedNew = observedNew0.trim();
+          if (observedOld.empty() || observedNew.empty())
+            return std::nullopt;
+
+          // Group spans by their common pasted result. Exact-shape replay only
+          // handles a single pasted product at this hop; multiple independent
+          // paste groups would require choosing between distinct replay regions.
+          DenseMap<uint64_t, SmallVector<const RefoldModel::PPArgSpan *, 4>>
+              pasteGroups;
+          for (const auto &sp : directChild.pasteSpans) {
+            if (!sp.byteBegin || !sp.byteEnd)
+              return std::nullopt;
+            const uint64_t key = (uint64_t(sp.begin) << 32) | uint64_t(sp.end);
+            pasteGroups[key].push_back(&sp);
+          }
+          if (pasteGroups.size() != 1)
+            return std::nullopt;
+
+          auto &group = pasteGroups.begin()->second;
+          if (group.size() < 2)
+            return std::nullopt;
+
+          llvm::sort(group, [](const RefoldModel::PPArgSpan *a,
+                               const RefoldModel::PPArgSpan *b) {
+            if (*a->byteBegin != *b->byteBegin)
+              return *a->byteBegin < *b->byteBegin;
+            if (*a->byteEnd != *b->byteEnd)
+              return *a->byteEnd < *b->byteEnd;
+            return a->argIdx < b->argIdx;
+          });
+
+          const uint64_t oldLen = observedOld.size();
+          for (size_t i = 0; i < group.size(); ++i) {
+            const auto *sp = group[i];
+            if (*sp->byteBegin > *sp->byteEnd || *sp->byteEnd > oldLen)
+              return std::nullopt;
+            if (i > 0 && *group[i - 1]->byteEnd > *sp->byteBegin)
+              return std::nullopt;
+          }
+
+          // The edit must preserve the non-pasted prefix/suffix verbatim.
+          // Otherwise we are no longer replaying the same direct pasted child.
+          StringRef leading = observedOld.take_front(*group.front()->byteBegin);
+          StringRef trailing = observedOld.drop_front(*group.back()->byteEnd);
+          if (!observedNew.starts_with(leading) || !observedNew.ends_with(trailing))
+            return std::nullopt;
+
+          SmallVector<StringRef, 4> oldSegs;
+          SmallVector<StringRef, 4> midBodies;
+          oldSegs.reserve(group.size());
+          midBodies.reserve(group.size() - 1);
+          for (size_t i = 0; i < group.size(); ++i) {
+            const auto *sp = group[i];
+            oldSegs.push_back(observedOld.slice(*sp->byteBegin, *sp->byteEnd));
+            if (i + 1 < group.size()) {
+              StringRef mid =
+                  observedOld.slice(*sp->byteEnd, *group[i + 1]->byteBegin);
+              if (mid.empty())
+                return std::nullopt;
+              midBodies.push_back(mid);
+            }
+          }
+
+          StringRef core = observedNew.slice(leading.size(),
+                                             observedNew.size() - trailing.size());
+
+          // Count how many future occurrences of the current delimiter must be
+          // reserved to make the remainder splittable. This lets the splitter
+          // reject early cuts that would strand a later operand.
+          auto suffixDelimiterNeed = [&](size_t delimIdx) -> uint64_t {
+            const StringRef delim = midBodies[delimIdx];
+            uint64_t need = 0;
+            for (size_t segIdx = delimIdx + 1; segIdx < oldSegs.size(); ++segIdx)
+              need += countSubstr(oldSegs[segIdx], delim);
+            for (size_t later = delimIdx + 1; later < midBodies.size(); ++later)
+              if (midBodies[later] == delim)
+                ++need;
+            return need;
+          };
+
+          SmallVector<StringRef, 4> curSegs;
+          SmallVector<SmallVector<StringRef, 4>, 2> splitSolutions;
+          auto addSplitSolution = [&](const SmallVectorImpl<StringRef> &parts) {
+            SmallVector<StringRef, 4> copy(parts.begin(), parts.end());
+            for (const auto &existing : splitSolutions)
+              if (existing == copy)
+                return;
+            splitSolutions.push_back(std::move(copy));
+          };
+
+          // Split the rewritten pasted core around the original inter-operand
+          // delimiters. We only accept a unique segmentation; if multiple splits
+          // work, the inverse-paste explanation is ambiguous and therefore not a
+          // valid replay certificate.
+          auto splitCore = [&](auto &&self, size_t delimIdx, StringRef rest) -> void {
+            if (splitSolutions.size() > 1)
+              return;
+            if (delimIdx == midBodies.size()) {
+              curSegs.push_back(rest);
+              addSplitSolution(curSegs);
+              curSegs.pop_back();
+              return;
+            }
+
+            const StringRef delim = midBodies[delimIdx];
+            const uint64_t needLeft = countSubstr(oldSegs[delimIdx], delim);
+            const uint64_t needRight = suffixDelimiterNeed(delimIdx);
+
+            for (size_t pos = 0;
+                 (pos = rest.find(delim, pos)) != StringRef::npos; ++pos) {
+              StringRef left = rest.slice(0, pos);
+              StringRef tail = rest.drop_front(pos + delim.size());
+              if (countSubstr(left, delim) < needLeft)
+                continue;
+              if (countSubstr(tail, delim) < needRight)
+                continue;
+              curSegs.push_back(left);
+              self(self, delimIdx + 1, tail);
+              curSegs.pop_back();
+            }
+          };
+          splitCore(splitCore, 0, core);
+          if (splitSolutions.size() != 1 || splitSolutions[0].size() != group.size())
+            return std::nullopt;
+
+          // Lift each recovered child-operand rewrite through the child's normal
+          // parent-constraint derivation, then merge the resulting parent-formal
+          // constraints. Conflicting lifts mean the pasted surface cannot be
+          // explained by one consistent replay of the original child.
+          DenseMap<uint32_t, ObservedFormalConstraint> mergedByFormal;
+          for (size_t i = 0; i < group.size(); ++i) {
+            const uint32_t childFormal = group[i]->argIdx;
+            auto derived = buildParentConstraintDerivationCertificate(
+                directChild, childFormal, oldSegs[i], splitSolutions[0][i],
+                traceStage);
+            if (!derived.valid)
+              return std::nullopt;
+            for (const auto &kv : derived.derivedConstraints) {
+              auto itExisting = mergedByFormal.find(kv.first);
+              if (itExisting == mergedByFormal.end()) {
+                mergedByFormal.insert({kv.first, kv.second});
+                continue;
+              }
+              if (itExisting->second.oldText != kv.second.oldText ||
+                  itExisting->second.newText != kv.second.newText)
+                return std::nullopt;
+            }
+          }
+
+          SmallVector<std::pair<uint32_t, ObservedFormalConstraint>, 4> out;
+          for (const auto &kv : mergedByFormal)
+            out.push_back({kv.first, kv.second});
+          llvm::sort(out, [](const auto &a, const auto &b) {
+            return a.first < b.first;
+          });
+          if (out.empty())
+            return std::nullopt;
+          return out;
+        };
+
+        /// Rebuild the exact original nested paste shape for `target` when the
+        /// observed edit still admits a unique, certificate-backed replay of that
+        /// shape. This never invents a new decomposition; it only preserves the
+        /// tree that originally existed in source.
+        std::function<std::optional<std::string>(
+            const RefoldModel::MacroInvocation &, StringRef, StringRef,
+            StringRef)>
+            tryBuildExactOriginalShapePasteReplaySyntax;
+
+        tryBuildExactOriginalShapePasteReplaySyntax =
+            [&](const RefoldModel::MacroInvocation &target, StringRef observedOld0,
+                StringRef observedNew0, StringRef traceStage)
+            -> std::optional<std::string> {
+          StringRef observedOld = observedOld0.trim();
+          StringRef observedNew = observedNew0.trim();
+          if (!target.invText)
+            return std::nullopt;
+
+          StringRef rawTarget = StringRef(*target.invText).trim();
+          if (rawTarget.empty())
+            return std::nullopt;
+          if (observedOld == observedNew)
+            return rawTarget.str();
+
+          auto childIt = macroChildrenById_.find(target.id);
+          if (childIt == macroChildrenById_.end())
+            return std::nullopt;
+
+          // Stringify wrappers may record paste byte ranges relative to the
+          // quoted surface rather than the raw token text, so probe both forms.
+          auto tryQuoteSurface = [&](StringRef raw) -> std::string {
+            return quoteCStringLiteral(raw);
+          };
+
+          const RefoldModel::MacroInvocation *directPasteChild = nullptr;
+          std::optional<
+              SmallVector<std::pair<uint32_t, ObservedFormalConstraint>, 4>>
+              derivedConstraints;
+          auto sameDerivedConstraints =
+              [&](const SmallVectorImpl<
+                      std::pair<uint32_t, ObservedFormalConstraint>> &lhs,
+                  const SmallVectorImpl<
+                      std::pair<uint32_t, ObservedFormalConstraint>> &rhs)
+              -> bool {
+            if (lhs.size() != rhs.size())
+              return false;
+            for (size_t i = 0; i < lhs.size(); ++i) {
+              if (lhs[i].first != rhs[i].first)
+                return false;
+              if (lhs[i].second.oldText != rhs[i].second.oldText ||
+                  lhs[i].second.newText != rhs[i].second.newText)
+                return false;
+            }
+            return true;
+          };
+
+          // Find the unique direct child whose paste spans can explain the
+          // observed rewrite. If more than one child derives different parent
+          // constraints, the replay would be ambiguous and must be rejected.
+          auto trySelectDirectChildForSurface =
+              [&](StringRef surfaceOld, StringRef surfaceNew) -> bool {
+            for (const auto *cand : childIt->second) {
+              if (!cand || cand->pasteSpans.empty())
+                continue;
+              auto derived = tryDeriveObservedConstraintsFromDirectPasteChild(
+                  *cand, surfaceOld, surfaceNew, traceStage);
+              if (!derived)
+                continue;
+              if (directPasteChild) {
+                if (directPasteChild != cand || !derivedConstraints ||
+                    !sameDerivedConstraints(*derivedConstraints, *derived))
+                  return false;
+                continue;
+              }
+              directPasteChild = cand;
+              derivedConstraints = std::move(derived);
+            }
+            return true;
+          };
+
+          if (!trySelectDirectChildForSurface(observedOld, observedNew))
+            return std::nullopt;
+          if (!directPasteChild) {
+            std::string quotedOld = tryQuoteSurface(observedOld);
+            std::string quotedNew = tryQuoteSurface(observedNew);
+            if (!trySelectDirectChildForSurface(quotedOld, quotedNew))
+              return std::nullopt;
+          }
+          if (!directPasteChild || !derivedConstraints)
+            return std::nullopt;
+
+          // Group the derived constraints by the target's formals. Each group is
+          // later replayed either by recursively preserving a nested child or by
+          // falling back to the normal observed-formal certificate.
+          DenseMap<uint32_t, SmallVector<ObservedFormalConstraint, 2>>
+              groupedObserved;
+          for (const auto &kv : *derivedConstraints)
+            groupedObserved[kv.first].push_back(kv.second);
+
+          DenseMap<uint32_t, FormalTextPair> targetFormals;
+          for (const auto &KV : groupedObserved) {
+            const uint32_t formalIdx = KV.first;
+            auto argText = getInvocationArgText(target, formalIdx);
+            if (!argText)
+              return std::nullopt;
+            const StringRef rawOldArg = argText->trim();
+
+            // When the target formal is exactly one nested child invocation, try
+            // to preserve that nested child first. This is the step that keeps a
+            // chain such as JOIN(JOIN(...), ...) instead of collapsing it to the
+            // already-materialized pasted token.
+            if (KV.second.size() == 1) {
+              const StringRef segOld = StringRef(KV.second.front().oldText).trim();
+              const StringRef segNew = StringRef(KV.second.front().newText).trim();
+              auto placeholders = getTopLevelLexicalChildrenInArg(target, formalIdx);
+              if (placeholders.size() == 1 && placeholders.front().child &&
+                  placeholders.front().relBegin == 0 &&
+                  placeholders.front().relEnd == rawOldArg.size()) {
+                const RefoldModel::MacroInvocation *nestedChild =
+                    placeholders.front().child;
+                if (auto nestedSyntax = tryBuildExactOriginalShapePasteReplaySyntax(
+                        *nestedChild, segOld, segNew,
+                        "DAG per-hop exact original-shape replay")) {
+                  targetFormals[formalIdx] =
+                      FormalTextPair{rawOldArg.str(), std::move(*nestedSyntax)};
+                  continue;
+                }
+              }
+            }
+
+            // Otherwise, certify the formal rewrite in the usual way and let the
+            // wrapper-hop certificate rebuild the target invocation around it.
+            auto formalCert = buildObservedFormalRewriteCertificate(
+                target, formalIdx, KV.second, /*preferredChildSyntax=*/nullptr,
+                traceStage);
+            if (formalCert.kind == FormalRewriteCertificateKind::Invalid)
+              return std::nullopt;
+            targetFormals[formalIdx] =
+                FormalTextPair{formalCert.oldText, formalCert.newText};
+          }
+
+          // Finally, prove that the rewritten formals still fit the target's
+          // original placeholder structure. This is the soundness gate for the
+          // exact-shape replay at this invocation boundary.
+          auto replayCert = buildWrapperPlaceholderHopInvocationCertificate(
+              target, targetFormals, traceStage);
+          if (replayCert.kind == InvocationRewriteCertificateKind::Invalid)
+            return std::nullopt;
+          if (!replayCert.rewrittenInvocationSyntax.empty())
+            return replayCert.rewrittenInvocationSyntax;
+
+          DenseMap<uint32_t, std::string> replByFormal;
+          for (const auto &KV : targetFormals) {
+            StringRef oldText = StringRef(KV.second.oldText).trim();
+            StringRef newText = StringRef(KV.second.newText).trim();
+            if (oldText != newText)
+              replByFormal[KV.first] = newText.str();
+          }
+          return buildRewrittenInvocationSyntax(target, replByFormal);
+        };
+
+        /// Handle the common DAG hop where one child formal maps directly to one
+        /// parent formal. Normally this is a passthrough rewrite, but if the
+        /// child's observed old text is already flatter than the parent's logical
+        /// old argument, probe exact-shape paste replay before accepting that
+        /// flattening loss.
         auto tryBuildDirectPassthroughParentFormalRewrite =
             [&](uint32_t curFormal, uint32_t parentFormal,
                 StringRef curNewText)
@@ -12631,12 +12972,43 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           if (newTrim.empty() || oldTrim == newTrim)
             return std::nullopt;
 
+          // `curFormals` may not carry this formal when the child rewrite was
+          // derived through a different certified path, so guard the lookup.
+          const auto curFormalIt = curFormals.find(curFormal);
+          if (curFormalIt == curFormals.end())
+            return std::nullopt;
+
+          const StringRef childObservedOld =
+              StringRef(curFormalIt->second.oldText).trim();
+
           trace("macro/dag",
                 "DAG per-hop parent formal passthrough flatten candidate: child id={0} name={1} parent id={2} name={3} sourceCurFormal={4} parentFormal={5} childObservedOld='{6}' childObservedNew='{7}' parentLogicalOld='{8}' supportLoss={9}",
                 cur.id, cur.name, parent->id, parent->name, curFormal,
-                parentFormal, StringRef(curFormals.lookup(curFormal).oldText).trim(),
-                newTrim, oldTrim,
-                StringRef(curFormals.lookup(curFormal).oldText).trim() != oldTrim);
+                parentFormal, childObservedOld, newTrim, oldTrim,
+                childObservedOld != oldTrim);
+          // A mismatch here means the child has already collapsed some nested
+          // structure relative to the parent's logical argument. If the parent
+          // argument is exactly one lexical child, try to replay that original
+          // nested shape instead of committing to the flatter replacement text.
+          if (childObservedOld != oldTrim) {
+            auto placeholders = getTopLevelLexicalChildrenInArg(*parent, parentFormal);
+            if (placeholders.size() == 1 && placeholders.front().child &&
+                placeholders.front().relBegin == 0 &&
+                placeholders.front().relEnd == oldTrim.size()) {
+              const RefoldModel::MacroInvocation *nestedChild =
+                  placeholders.front().child;
+              if (auto replaySyntax =
+                      tryBuildExactOriginalShapePasteReplaySyntax(
+                          *nestedChild, childObservedOld, newTrim,
+                          "DAG per-hop exact original-shape replay")) {
+                trace("macro/dag",
+                      "DAG per-hop exact original-shape replay accepted: child id={0} name={1} parent id={2} name={3} sourceCurFormal={4} parentFormal={5} old='{6}' new='{7}'",
+                      cur.id, cur.name, parent->id, parent->name, curFormal,
+                      parentFormal, oldTrim, *replaySyntax);
+                return FormalTextPair{oldTrim.str(), std::move(*replaySyntax)};
+              }
+            }
+          }
 
           return FormalTextPair{oldTrim.str(), newTrim.str()};
         };

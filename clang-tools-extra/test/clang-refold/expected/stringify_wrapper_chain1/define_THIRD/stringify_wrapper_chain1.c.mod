@@ -10,7 +10,7 @@
 #define JOIN_INNER(x, y) x##_##y
 #define JOIN(x, y) JOIN_INNER(x, y)
 
-static const char *s = XSTR(JOIN(JOIN(red, yellow), blue));
+static const char *s = XSTR(JOIN(JOIN(black, green), purple));
 int main(void) {
   return s[0] ? 0 : 1;
 }
