@@ -2221,6 +2221,113 @@ struct LexBoundaryToken {
   std::string Spelling;
 };
 
+/// Byte slice for a single top-level element inside a comma-separated tuple.
+///
+/// `begin`/`end` cover the full half-open byte range for the element inside the
+/// caller argument text. `trimBegin`/`trimEnd` shrink that range to the
+/// non-whitespace payload used for exact old/new text comparisons.
+struct TupleElementSlice {
+  size_t begin = 0;
+  size_t end = 0;
+  size_t trimBegin = 0;
+  size_t trimEnd = 0;
+};
+
+static bool computeTrimmedTupleElement(StringRef Text, size_t Begin, size_t End,
+                                       TupleElementSlice &Out) {
+  Out.begin = Begin;
+  Out.end = End;
+  Out.trimBegin = Begin;
+  Out.trimEnd = End;
+  while (Out.trimBegin < Out.trimEnd &&
+         std::isspace(static_cast<unsigned char>(Text[Out.trimBegin])))
+    ++Out.trimBegin;
+  while (Out.trimEnd > Out.trimBegin &&
+         std::isspace(static_cast<unsigned char>(Text[Out.trimEnd - 1])))
+    --Out.trimEnd;
+  return Out.trimBegin != Out.trimEnd;
+}
+
+/// Split a caller tuple into top-level comma-separated elements using Clang's
+/// raw lexer instead of ad hoc character scanning.
+///
+/// This is intentionally token-based: literals and comments arrive as single
+/// tokens, so only delimiter depth (`()`, `[]`, `{}`) needs to be tracked when
+/// deciding whether a comma separates tuple elements.
+static bool splitTopLevelTupleElementsWithLexer(
+    StringRef Text, const LangOptions &Lang,
+    SmallVectorImpl<TupleElementSlice> &Out) {
+  Out.clear();
+  if (Text.empty())
+    return false;
+
+  const SourceLocation BaseLoc = SourceLocation::getFromRawEncoding(1);
+  std::string LexBuf = Text.str();
+  LexBuf.push_back('\0');
+  const char *BufStart = LexBuf.data();
+  const char *BufEnd = BufStart + Text.size();
+  Lexer Lex(BaseLoc, Lang, BufStart, BufStart, BufEnd);
+
+  size_t ElementBegin = 0;
+  int ParenDepth = 0;
+  int BracketDepth = 0;
+  int BraceDepth = 0;
+  Token Tok;
+
+  while (true) {
+    Lex.LexFromRawLexer(Tok);
+    if (Tok.is(tok::eof))
+      break;
+    if (Tok.is(tok::comment))
+      continue;
+
+    const size_t TokBegin =
+        Tok.getLocation().getRawEncoding() - BaseLoc.getRawEncoding();
+    const size_t TokEnd = TokBegin + Tok.getLength();
+
+    switch (Tok.getKind()) {
+    case tok::l_paren:
+      ++ParenDepth;
+      break;
+    case tok::r_paren:
+      if (ParenDepth > 0)
+        --ParenDepth;
+      break;
+    case tok::l_square:
+      ++BracketDepth;
+      break;
+    case tok::r_square:
+      if (BracketDepth > 0)
+        --BracketDepth;
+      break;
+    case tok::l_brace:
+      ++BraceDepth;
+      break;
+    case tok::r_brace:
+      if (BraceDepth > 0)
+        --BraceDepth;
+      break;
+    case tok::comma:
+      if (ParenDepth == 0 && BracketDepth == 0 && BraceDepth == 0) {
+        TupleElementSlice Elem;
+        if (!computeTrimmedTupleElement(Text, ElementBegin, TokBegin, Elem))
+          return false;
+        Out.push_back(Elem);
+        ElementBegin = TokEnd;
+      }
+      break;
+    default:
+      break;
+    }
+  }
+
+  TupleElementSlice Elem;
+  if (!computeTrimmedTupleElement(Text, ElementBegin, Text.size(), Elem))
+    return false;
+  Out.push_back(Elem);
+  return true;
+}
+
 static void lexBoundaryTokens(StringRef Text, const LangOptions &Lang,
                               SmallVectorImpl<LexBoundaryToken> &Out) {
   Out.clear();
@@ -5795,6 +5902,20 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
           os << "]";
           return os.str();
         };
+
+        /// Tuple rewrite modes are ordered from strongest proof to weakest.
+        ///
+        /// DirectTupleRefs uses producer-supplied tuple element byte ranges in
+        /// the normalized child invocation. VariadicIdentityForward is the
+        /// fallback for variadic forwarding wrappers whose immediate child keeps
+        /// the caller's variadic tuple intact as a single full-width forwarded
+        /// argument (for example `__VA_ARGS__`).
+        enum class TupleRewriteMode {
+          None,
+          DirectTupleRefs,
+          VariadicIdentityForward,
+        };
+
         StringRef parentTrim = baseArgText.trim();
         trace("macro/tuple",
               "tuple-forward enter root id={0} name={1} argIdx={2} baseArg='{3}' occObservations={4}",
@@ -5803,10 +5924,6 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
               formatOccurrenceObservations(occObservations));
         if (parentTrim.empty())
           return false;
-
-        const RefoldModel::MacroInvocation *tupleChild = nullptr;
-        SmallVector<std::pair<uint32_t, StringRef>, 8> childArgs;
-        SmallVector<RefoldModel::TupleArgRef, 8> childTupleRefs;
 
         auto getNormalizedArgText =
             [&](const RefoldModel::MacroInvocation &inv,
@@ -5825,130 +5942,262 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
               .trim();
         };
 
+        auto getInvocationArgText =
+            [&](const RefoldModel::MacroInvocation &inv,
+                uint32_t argIdx) -> std::optional<StringRef> {
+          if (!inv.invText || !inv.invB)
+            return std::nullopt;
+          if (argIdx >= inv.invArgRanges.size())
+            return std::nullopt;
+          const auto &rng = inv.invArgRanges[argIdx];
+          if (!rng.first || !rng.second || *rng.second < *rng.first ||
+              *rng.first < *inv.invB)
+            return std::nullopt;
+          const uint64_t relB = *rng.first - *inv.invB;
+          const uint64_t relE = *rng.second - *inv.invB;
+          if (relE < relB || relE > inv.invText->size())
+            return std::nullopt;
+          return StringRef(*inv.invText)
+              .slice((size_t)relB, (size_t)relE)
+              .trim();
+        };
+
+        // The variadic identity-forward mode reconstructs the caller tuple by
+        // splitting the original variadic actual into top-level elements, then
+        // matching those elements positionally against the observed expansion
+        // occurrences. Use the Clang lexer here so comments, literals, and
+        // escaped text are handled by the token stream rather than by manual
+        // character parsing.
+
+        const RefoldModel::MacroInvocation *tupleChild = nullptr;
+        TupleRewriteMode rewriteMode = TupleRewriteMode::None;
+        SmallVector<std::pair<uint32_t, StringRef>, 8> childArgs;
+        SmallVector<RefoldModel::TupleArgRef, 8> childTupleRefs;
+        std::optional<uint32_t> identityForwardChildArgIdx;
+
         for (const auto &cand : model_.GetMacroInvocations()) {
           if (!cand.callerMacroId || *cand.callerMacroId != m.id)
             continue;
-          if (!cand.normalizedInvText)
-            continue;
-          if (cand.normalizedInvArgTextRanges.empty() || cand.argTupleRefs.empty())
-            continue;
-          if (cand.normalizedInvArgTextRanges.size() != cand.argTupleRefs.size())
+
+          if (cand.normalizedInvText &&
+              !cand.normalizedInvArgTextRanges.empty() &&
+              !cand.argTupleRefs.empty() &&
+              cand.normalizedInvArgTextRanges.size() ==
+                  cand.argTupleRefs.size()) {
+            SmallVector<std::pair<uint32_t, StringRef>, 8> localChildArgs;
+            SmallVector<RefoldModel::TupleArgRef, 8> localTupleRefs;
+            DenseSet<StringRef> seenOldTexts;
+            bool ok = false;
+            for (uint32_t childArgIdx = 0;
+                 childArgIdx < cand.argTupleRefs.size(); ++childArgIdx) {
+              const auto &refs = cand.argTupleRefs[childArgIdx];
+              if (refs.size() != 1)
+                continue;
+              const auto &ref = refs.front();
+              if (ref.callerParamIndex != callerArgIdx)
+                continue;
+
+              auto oldArgText = getNormalizedArgText(cand, childArgIdx);
+              if (!oldArgText)
+                return false;
+              if (seenOldTexts.find(*oldArgText) != seenOldTexts.end())
+                return false;
+              seenOldTexts.insert(*oldArgText);
+
+              if (ref.callerByteEnd < ref.callerByteBegin ||
+                  ref.callerByteEnd > parentTrim.size())
+                return false;
+              StringRef slice =
+                  parentTrim.slice(ref.callerByteBegin, ref.callerByteEnd)
+                      .trim();
+              if (slice != oldArgText->trim())
+                return false;
+
+              localChildArgs.push_back({childArgIdx, *oldArgText});
+              localTupleRefs.push_back(ref);
+              ok = true;
+            }
+            if (ok) {
+              if (tupleChild)
+                return false;
+              tupleChild = &cand;
+              rewriteMode = TupleRewriteMode::DirectTupleRefs;
+              childArgs = std::move(localChildArgs);
+              childTupleRefs = std::move(localTupleRefs);
+              continue;
+            }
+          }
+
+          if (!isVariadicFormal(callerArgIdx) || !cand.invText || !cand.invB ||
+              cand.invArgRanges.empty() || cand.argRefs.empty())
             continue;
 
-          SmallVector<std::pair<uint32_t, StringRef>, 8> localChildArgs;
-          SmallVector<RefoldModel::TupleArgRef, 8> localTupleRefs;
-          DenseSet<StringRef> seenOldTexts;
-          bool ok = false;
+          // Variadic forwarding wrappers may not carry tuple-specific metadata.
+          // Accept a second certified shape where one child argument is a
+          // full-width identity forward of the caller variadic formal. That
+          // proves the caller tuple survives unchanged at the child hop, so we
+          // can safely rebuild it element-by-element from the occurrence
+          // observations.
+          std::optional<uint32_t> localIdentityArgIdx;
           for (uint32_t childArgIdx = 0;
-               childArgIdx < cand.argTupleRefs.size(); ++childArgIdx) {
-            const auto &refs = cand.argTupleRefs[childArgIdx];
+               childArgIdx < cand.invArgRanges.size() &&
+               childArgIdx < cand.argRefs.size();
+               ++childArgIdx) {
+            const auto &rng = cand.invArgRanges[childArgIdx];
+            if (!rng.first || !rng.second || *rng.second < *rng.first ||
+                *rng.first < *cand.invB)
+              continue;
+            const auto &refs = cand.argRefs[childArgIdx];
             if (refs.size() != 1)
               continue;
             const auto &ref = refs.front();
             if (ref.callerParamIndex != callerArgIdx)
               continue;
 
-            auto oldArgText = getNormalizedArgText(cand, childArgIdx);
-            if (!oldArgText)
-              return false;
-            if (seenOldTexts.find(*oldArgText) != seenOldTexts.end())
-              return false;
-            seenOldTexts.insert(*oldArgText);
+            const uint64_t relB = *rng.first - *cand.invB;
+            const uint64_t relE = *rng.second - *cand.invB;
+            if (relE < relB || relE > cand.invText->size())
+              continue;
+            StringRef rawArg =
+                StringRef(*cand.invText).slice((size_t)relB, (size_t)relE);
+            size_t trimLead = 0;
+            while (trimLead < rawArg.size() &&
+                   std::isspace((unsigned char)rawArg[trimLead]))
+              ++trimLead;
+            size_t trimEnd = rawArg.size();
+            while (trimEnd > trimLead &&
+                   std::isspace((unsigned char)rawArg[trimEnd - 1]))
+              --trimEnd;
+            if (trimLead == trimEnd)
+              continue;
 
-            if (ref.callerByteEnd < ref.callerByteBegin ||
-                ref.callerByteEnd > parentTrim.size())
-              return false;
-            StringRef slice = parentTrim.slice(ref.callerByteBegin, ref.callerByteEnd).trim();
-            if (slice != oldArgText->trim())
-              return false;
+            const uint64_t trimmedAbsBegin = relB + trimLead;
+            const uint64_t trimmedAbsEnd = relB + trimEnd;
+            if (ref.byteBegin != trimmedAbsBegin || ref.byteEnd != trimmedAbsEnd)
+              continue;
 
-            localChildArgs.push_back({childArgIdx, *oldArgText});
-            localTupleRefs.push_back(ref);
-            ok = true;
+            auto oldArgText = getInvocationArgText(cand, childArgIdx);
+            if (!oldArgText || oldArgText->empty())
+              continue;
+            if (localIdentityArgIdx)
+              return false;
+            localIdentityArgIdx = childArgIdx;
           }
-          if (!ok)
+
+          if (!localIdentityArgIdx)
             continue;
-          trace("macro/tuple",
-                "tuple-forward child candidate root id={0} name={1} childId={2} childName={3} normalizedInv='{4}' normalizedRanges={5} tupleRefs={6} childArgs={7}",
-                m.id, m.name, cand.id, cand.name,
-                cand.normalizedInvText ? stringutils::showWSWithClip(*cand.normalizedInvText, 200) : StringRef("<none>"),
-                [&]() {
-                  std::string out; raw_string_ostream os(out); os << "[";
-                  for (size_t ri = 0; ri < cand.normalizedInvArgTextRanges.size(); ++ri) {
-                    if (ri) os << ", ";
-                    const auto &r = cand.normalizedInvArgTextRanges[ri];
-                    os << "{";
-                    os << "b=";
-                    if (r.first) os << *r.first; else os << "null";
-                    os << ", e=";
-                    if (r.second) os << *r.second; else os << "null";
-                    os << "}";
-                    if (cand.normalizedInvText && r.first && r.second && *r.first <= *r.second && *r.second <= cand.normalizedInvText->size())
-                      os << "='" << stringutils::showWSWithClip(cand.normalizedInvText->slice(*r.first, *r.second), 120) << "'";
-                  }
-                  os << "]";
-                  return os.str();
-                }(),
-                formatTupleRefs(localTupleRefs),
-                [&](){ std::string out; raw_string_ostream os(out); os << "["; for (size_t ai = 0; ai < localChildArgs.size(); ++ai) { if (ai) os << ", "; os << "{argIdx=" << localChildArgs[ai].first << ", text='" << stringutils::showWSWithClip(localChildArgs[ai].second, 120) << "'}"; } os << "]"; return os.str(); }());
           if (tupleChild)
             return false;
           tupleChild = &cand;
-          childArgs = std::move(localChildArgs);
-          childTupleRefs = std::move(localTupleRefs);
+          rewriteMode = TupleRewriteMode::VariadicIdentityForward;
+          identityForwardChildArgIdx = *localIdentityArgIdx;
         }
 
-        if (!tupleChild || childArgs.empty() || childArgs.size() != childTupleRefs.size())
+        if (!tupleChild)
           return false;
 
-        StringMap<std::string> newTextByOld;
-        for (const auto &obs : occObservations) {
-          auto it = newTextByOld.find(obs.oldText);
-          if (it == newTextByOld.end()) {
-            newTextByOld[obs.oldText] = obs.newText;
-            continue;
-          }
-          if (it->second != obs.newText)
-            return false;
-        }
-
-        std::string rebuilt = parentTrim.str();
-        SmallVector<unsigned, 8> order(childTupleRefs.size());
-        for (unsigned i = 0; i < childTupleRefs.size(); ++i)
-          order[i] = i;
-        llvm::sort(order, [&](unsigned a, unsigned b) {
-          return childTupleRefs[a].callerByteBegin > childTupleRefs[b].callerByteBegin;
-        });
-
+        std::string rebuilt;
         bool changed = false;
-        for (unsigned idx : order) {
-          const auto &pair = childArgs[idx];
-          StringRef oldChildText = pair.second.trim();
-          auto it = newTextByOld.find(oldChildText);
-          if (it == newTextByOld.end())
-            continue;
-          const auto &ref = childTupleRefs[idx];
-          rebuilt = stringutils::replaceRange(rebuilt, ref.callerByteBegin,
-                                              ref.callerByteEnd, it->second);
-          if (it->second != oldChildText)
-            changed = true;
+
+        if (rewriteMode == TupleRewriteMode::DirectTupleRefs) {
+          if (childArgs.empty() || childArgs.size() != childTupleRefs.size())
+            return false;
+
+          StringMap<std::string> newTextByOld;
+          for (const auto &obs : occObservations) {
+            auto it = newTextByOld.find(obs.oldText);
+            if (it == newTextByOld.end()) {
+              newTextByOld[obs.oldText] = obs.newText;
+              continue;
+            }
+            if (it->second != obs.newText)
+              return false;
+          }
+
+          rebuilt = parentTrim.str();
+          SmallVector<unsigned, 8> order(childTupleRefs.size());
+          for (unsigned i = 0; i < childTupleRefs.size(); ++i)
+            order[i] = i;
+          llvm::sort(order, [&](unsigned a, unsigned b) {
+            return childTupleRefs[a].callerByteBegin >
+                   childTupleRefs[b].callerByteBegin;
+          });
+
+          for (unsigned idx : order) {
+            const auto &pair = childArgs[idx];
+            StringRef oldChildText = pair.second.trim();
+            auto it = newTextByOld.find(oldChildText);
+            if (it == newTextByOld.end())
+              continue;
+            const auto &ref = childTupleRefs[idx];
+            rebuilt = stringutils::replaceRange(rebuilt, ref.callerByteBegin,
+                                                ref.callerByteEnd,
+                                                it->second);
+            if (it->second != oldChildText)
+              changed = true;
+          }
+
+          if (!changed)
+            return false;
+
+          trace("macro/tuple",
+                "tuple-forward rebuilt root id={0} name={1} argIdx={2} parentTrim='{3}' rebuilt='{4}' tupleRefs={5}",
+                m.id, m.name, callerArgIdx,
+                stringutils::showWSWithClip(parentTrim, 200),
+                stringutils::showWSWithClip(rebuilt, 200),
+                formatTupleRefs(childTupleRefs));
+        } else if (rewriteMode == TupleRewriteMode::VariadicIdentityForward) {
+          SmallVector<TupleElementSlice, 8> tupleElems;
+          if (!splitTopLevelTupleElementsWithLexer(parentTrim, lexLang_,
+                                                   tupleElems))
+            return false;
+
+          // Identity-forward rewrites are positional: the immediate child keeps
+          // the caller variadic tuple intact, so each observed occurrence must
+          // correspond to exactly one top-level tuple element in order.
+          if (tupleElems.size() != occObservations.size())
+            return false;
+
+          rebuilt = parentTrim.str();
+          for (size_t i = tupleElems.size(); i > 0; --i) {
+            const auto &elem = tupleElems[i - 1];
+            StringRef oldElemText =
+                parentTrim.slice(elem.trimBegin, elem.trimEnd).trim();
+
+            // Replacements apply from right to left so earlier byte offsets stay
+            // valid while we splice into the rebuilt caller tuple.
+            if (oldElemText != occObservations[i - 1].oldText.trim())
+              return false;
+            rebuilt = stringutils::replaceRange(rebuilt, elem.trimBegin,
+                                                elem.trimEnd,
+                                                occObservations[i - 1].newText);
+            if (occObservations[i - 1].newText != oldElemText)
+              changed = true;
+          }
+
+          if (!changed)
+            return false;
+
+          trace("macro/tuple",
+                "tuple-forward rebuilt variadic identity root id={0} name={1} argIdx={2} childId={3} childName={4} childArgIdx={5} parentTrim='{6}' rebuilt='{7}'",
+                m.id, m.name, callerArgIdx, tupleChild->id, tupleChild->name,
+                identityForwardChildArgIdx ? *identityForwardChildArgIdx
+                                           : uint32_t(0),
+                stringutils::showWSWithClip(parentTrim, 200),
+                stringutils::showWSWithClip(rebuilt, 200));
+        } else {
+          return false;
         }
 
-        if (!changed)
-          return false;
-
-        trace("macro/tuple",
-              "tuple-forward rebuilt root id={0} name={1} argIdx={2} parentTrim='{3}' rebuilt='{4}' tupleRefs={5}",
-              m.id, m.name, callerArgIdx,
-              stringutils::showWSWithClip(parentTrim, 200),
-              stringutils::showWSWithClip(rebuilt, 200),
-              formatTupleRefs(childTupleRefs));
         outNewArg = StringRef(rebuilt).trim().str();
         trace("macro/args",
-              "    tuple-forwarded rewrite accepted for root id={0} name={1} argIdx={2} childId={3} childName={4} baseArg='{5}' newArg='{6}'",
+              "    tuple-forwarded rewrite accepted for root id={0} name={1} argIdx={2} childId={3} childName={4} baseArg='{5}' newArg='{6}' mode={7}",
               m.id, m.name, callerArgIdx, tupleChild->id, tupleChild->name,
               stringutils::showWSWithClip(baseArgText, 200),
-              stringutils::showWSWithClip(outNewArg, 200));
+              stringutils::showWSWithClip(outNewArg, 200),
+              rewriteMode == TupleRewriteMode::DirectTupleRefs
+                  ? StringRef("direct_tuple_refs")
+                  : StringRef("variadic_identity_forward"));
         return true;
       };
 
@@ -6858,8 +7107,62 @@ RefoldEngine::MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
 std::optional<std::pair<size_t, size_t>>
 RefoldEngine::MapAToBTokenEnvelopeByPPArgSpan(
     const RefoldModel::PPArgSpan &sp) const {
+  // When the producer recorded a standard occurrence as exactly one A-side
+  // token, prefer an exact token-space projection over byte-envelope snapping.
+  // This avoids ambiguous repeated-token selection after edits such as
+  // variadic forwarding, where the byte-mapped B envelope may contain several
+  // identical spellings (for example multiple `3` tokens) but the token diff
+  // already identifies the unique surviving A->B match in order.
+  auto tryMapSingleStandardTokenExactly =
+      [&](uint64_t aTokIdx) -> std::optional<std::pair<size_t, size_t>> {
+    if (sp.kind != PPArgSpanKind::Standard)
+      return std::nullopt;
+    if (sp.end != sp.begin + 1)
+      return std::nullopt;
+    if (static_cast<size_t>(aTokIdx) >= aToks_.size())
+      return std::nullopt;
+
+    const StringRef want = aToks_[static_cast<size_t>(aTokIdx)].spelling;
+    if (want.empty())
+      return std::nullopt;
+
+    int64_t delta = 0;
+    for (const auto &h : abTokHunks_) {
+      if (aTokIdx < h.aStart)
+        break;
+
+      // If the token lies inside an A-consuming edit hunk, it does not have a
+      // proven exact token-preserving image in B. Fall back to the byte-span
+      // mapper, which is allowed to return a wider replacement envelope.
+      if (aTokIdx >= h.aStart && aTokIdx < h.aEnd)
+        return std::nullopt;
+
+      delta += static_cast<int64_t>(h.bEnd - h.bStart) -
+               static_cast<int64_t>(h.aEnd - h.aStart);
+    }
+
+    const int64_t bj = static_cast<int64_t>(aTokIdx) + delta;
+    if (bj < 0 || static_cast<size_t>(bj) >= bToks_.size())
+      return std::nullopt;
+    if (bToks_[static_cast<size_t>(bj)].spelling != want)
+      return std::nullopt;
+
+    return std::make_pair(static_cast<size_t>(bj),
+                          static_cast<size_t>(bj) + 1);
+  };
+
   // 1. Primary path: Mapping via Preprocessor Byte Spans
   if (sp.ppByteBegin && sp.ppByteEnd) {
+    if (auto exactTokEnv = tryMapSingleStandardTokenExactly(sp.begin)) {
+      trace("byte/env",
+            "PPArgSpan['{0}' arg={1} Aidx={2} single-token exact map -> "
+            "Btok=[{3},{4}) tok='{5}'",
+            sp.kind, sp.argIdx, sp.begin, exactTokEnv->first,
+            exactTokEnv->second,
+            bToks_[exactTokEnv->first].spelling);
+      return exactTokEnv;
+    }
+
     size_t pp0 = static_cast<size_t>(*sp.ppByteBegin);
     size_t pp1 = static_cast<size_t>(*sp.ppByteEnd);
     auto env = MapAByteRangeToBTokenEnvelope(pp0, pp1);
