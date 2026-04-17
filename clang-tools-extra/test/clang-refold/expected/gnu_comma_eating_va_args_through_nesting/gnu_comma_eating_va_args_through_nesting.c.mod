@@ -10,6 +10,6 @@
 
 int main(void) {
   P2("hello\n");
-  printf("n=%d\n", 8);
+  P2("n=%d\n", 8);
   return 0;
 }
