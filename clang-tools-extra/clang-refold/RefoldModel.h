@@ -178,8 +178,8 @@ public:
   static constexpr bool HasByteRange(PPArgSpanKind kind) {
     switch (kind) {
     case PPArgSpanKind::Standard:
-    case PPArgSpanKind::Stringify:
       return false;
+    case PPArgSpanKind::Stringify:
     case PPArgSpanKind::Paste:
       return true;
     }

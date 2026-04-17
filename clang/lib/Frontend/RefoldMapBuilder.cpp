@@ -1191,10 +1191,302 @@ static DecodedPayloadMap decodeStringLiteralPayload(llvm::StringRef Spelling) {
 /// \param Args         Invocation-specific actual arguments in unexpanded form.
 /// \param Lang         Language options (currently unused here; kept for API
 ///                     symmetry with nearby helpers).
+static std::optional<llvm::StringRef>
+getProjectionInvocationArgText(const Item &It, uint32_t ArgIdx) {
+  if (It.NormalizedInvText && ArgIdx < It.NormalizedInvArgTextRanges.size()) {
+    const auto &Rng = It.NormalizedInvArgTextRanges[ArgIdx];
+    if (Rng.first && Rng.second && *Rng.second >= *Rng.first &&
+        *Rng.second <= It.NormalizedInvText->size()) {
+      return llvm::StringRef(*It.NormalizedInvText)
+          .slice(*Rng.first, *Rng.second)
+          .trim();
+    }
+  }
+  return getItemInvocationArgText(It, ArgIdx);
+}
+
+static bool lexRawTokenSpellings(llvm::StringRef Text, const LangOptions &Lang,
+                                 llvm::SmallVectorImpl<std::string> &Out) {
+  Out.clear();
+
+  const SourceLocation BaseLoc = SourceLocation::getFromRawEncoding(1);
+  std::string LexBuf = Text.str();
+  LexBuf.push_back('\0');
+  const char *BufStart = LexBuf.data();
+  const char *BufEnd = BufStart + Text.size();
+  Lexer Lex(BaseLoc, Lang, BufStart, BufStart, BufEnd);
+
+  Token Tok;
+  while (true) {
+    Lex.LexFromRawLexer(Tok);
+    if (Tok.is(tok::eof))
+      break;
+    if (Tok.is(tok::comment))
+      continue;
+    const unsigned Len = Tok.getLength();
+    const size_t Off = static_cast<size_t>(Tok.getLocation().getRawEncoding() -
+                                           BaseLoc.getRawEncoding());
+    if (Off > Text.size() || Off + Len > Text.size())
+      return false;
+    Out.push_back(Text.substr(Off, Len).str());
+  }
+
+  return true;
+}
+
+static std::string stringifyTokenSpellings(llvm::ArrayRef<std::string> Tokens) {
+  std::string Out;
+  Out.push_back('"');
+  for (size_t I = 0; I < Tokens.size(); ++I) {
+    if (I)
+      Out.push_back(' ');
+    for (char C : Tokens[I]) {
+      switch (C) {
+      case 92:
+        Out.push_back(static_cast<char>(92));
+        Out.push_back(static_cast<char>(92));
+        break;
+      case '"':
+        Out.push_back(static_cast<char>(92));
+        Out.push_back('"');
+        break;
+      default:
+        Out.push_back(C);
+        break;
+      }
+    }
+  }
+  Out.push_back('"');
+  return Out;
+}
+
+static const Item *findItemByID(llvm::ArrayRef<Item> Items, uint64_t ID) {
+  for (const Item &It : Items)
+    if (It.ID == ID)
+      return &It;
+  return nullptr;
+}
+
+static llvm::StringRef stripBalancedOuterParens(llvm::StringRef Text) {
+  llvm::StringRef Cur = Text.trim();
+  while (Cur.size() >= 2 && Cur.front() == '(' && Cur.back() == ')') {
+    int Depth = 0;
+    bool Balanced = true;
+    for (size_t I = 0; I < Cur.size(); ++I) {
+      if (Cur[I] == '(') {
+        ++Depth;
+      } else if (Cur[I] == ')') {
+        --Depth;
+        if (Depth < 0) {
+          Balanced = false;
+          break;
+        }
+        if (Depth == 0 && I + 1 != Cur.size()) {
+          Balanced = false;
+          break;
+        }
+      }
+    }
+    if (!Balanced || Depth != 0)
+      break;
+    Cur = Cur.drop_front().drop_back().trim();
+  }
+  return Cur;
+}
+
+static bool tryResolveDirectCallerFormalRef(llvm::StringRef Text,
+                                            const Item &Caller,
+                                            uint32_t &OutCallerParamIdx) {
+  const llvm::StringRef Trimmed = stripBalancedOuterParens(Text);
+  for (uint32_t I = 0; I < Caller.DefParams.size(); ++I) {
+    if (Trimmed == Caller.DefParams[I].Name) {
+      OutCallerParamIdx = I;
+      return true;
+    }
+  }
+  return false;
+}
+
+static const Item *findUniqueWholeArgNestedChild(const Item &Parent,
+                                                 uint32_t ArgIdx,
+                                                 llvm::ArrayRef<Item> Items) {
+  if (ArgIdx >= Parent.InvArgRanges.size() || !Parent.InvBegin ||
+      Parent.InvFile.empty())
+    return nullptr;
+
+  const auto &Rng = Parent.InvArgRanges[ArgIdx];
+  if (!Rng.first || !Rng.second || *Rng.second < *Rng.first ||
+      *Rng.first < *Parent.InvBegin)
+    return nullptr;
+
+  const uint64_t RelB = *Rng.first - *Parent.InvBegin;
+  const uint64_t RelE = *Rng.second - *Parent.InvBegin;
+  if (RelE < RelB || RelE > Parent.InvText.size())
+    return nullptr;
+
+  llvm::StringRef ArgSlice = llvm::StringRef(Parent.InvText)
+                                 .slice(static_cast<size_t>(RelB),
+                                        static_cast<size_t>(RelE));
+  size_t TrimFront = 0;
+  while (TrimFront < ArgSlice.size() &&
+         isSpace</*kWithCR=*/true>(ArgSlice[TrimFront]))
+    ++TrimFront;
+  size_t TrimBack = ArgSlice.size();
+  while (TrimBack > TrimFront &&
+         isSpace</*kWithCR=*/true>(ArgSlice[TrimBack - 1]))
+    --TrimBack;
+
+  const uint64_t TrimmedBegin = *Rng.first + TrimFront;
+  const uint64_t TrimmedEnd = *Rng.first + TrimBack;
+  const Item *Match = nullptr;
+
+  for (const Item &Child : Items) {
+    if (Child.Kind != IK_Macro || Child.ID == Parent.ID || !Child.InvBegin ||
+        !Child.InvEnd || Child.InvFile != Parent.InvFile ||
+        !Child.CallerMacroId || *Child.CallerMacroId != Parent.ID)
+      continue;
+    if (*Child.InvBegin != TrimmedBegin || *Child.InvEnd != TrimmedEnd)
+      continue;
+    if (Match)
+      return nullptr;
+    Match = &Child;
+  }
+
+  return Match;
+}
+
+static bool isWholeArgNestedChild(const Item &Parent, const Item &Child,
+                                 llvm::ArrayRef<Item> Items) {
+  for (uint32_t ArgIdx = 0, E = static_cast<uint32_t>(Parent.InvArgRanges.size());
+       ArgIdx < E; ++ArgIdx) {
+    if (findUniqueWholeArgNestedChild(Parent, ArgIdx, Items) == &Child)
+      return true;
+  }
+  return false;
+}
+
+static const Item *findUniqueCallerChildByInvocationText(const Item &Caller,
+                                                         llvm::StringRef Text,
+                                                         llvm::ArrayRef<Item> Items) {
+  const llvm::StringRef Trimmed = Text.trim();
+  const Item *Match = nullptr;
+  for (const Item &Child : Items) {
+    if (Child.Kind != IK_Macro || !Child.CallerMacroId ||
+        *Child.CallerMacroId != Caller.ID || Child.InvText.empty())
+      continue;
+    if (llvm::StringRef(Child.InvText).trim() != Trimmed)
+      continue;
+    if (Match)
+      return nullptr;
+    Match = &Child;
+  }
+  return Match;
+}
+
+static std::optional<std::string>
+uniqueProjectedExpansionText(const Item &It, llvm::ArrayRef<Item> Items,
+                             unsigned Depth = 0) {
+  if (Depth >= 64)
+    return std::nullopt;
+
+  if (It.PasteTokens.size() == 1 && !It.PasteTokens.front().Spelling.empty())
+    return It.PasteTokens.front().Spelling;
+
+  if (!It.StringifySpell2ArgIndices.empty()) {
+    std::optional<std::string> Only;
+    for (const auto &KV : It.StringifySpell2ArgIndices) {
+      if (Only && *Only != KV.getKey().str())
+        return std::nullopt;
+      Only = KV.getKey().str();
+    }
+    if (Only)
+      return Only;
+  }
+
+  const Item *OnlyChild = nullptr;
+  for (const Item &Child : Items) {
+    if (Child.Kind != IK_Macro || !Child.CallerMacroId ||
+        *Child.CallerMacroId != It.ID)
+      continue;
+    if (isWholeArgNestedChild(It, Child, Items))
+      continue;
+    if (OnlyChild)
+      return std::nullopt;
+    OnlyChild = &Child;
+  }
+
+  if (!OnlyChild) {
+    for (const Item &Child : Items) {
+      if (Child.Kind != IK_Macro || !Child.CallerMacroId ||
+          *Child.CallerMacroId != It.ID)
+        continue;
+      if (OnlyChild)
+        return std::nullopt;
+      OnlyChild = &Child;
+    }
+  }
+
+  if (!OnlyChild)
+    return std::nullopt;
+  return uniqueProjectedExpansionText(*OnlyChild, Items, Depth + 1);
+}
+
+static bool resolveProjectionArgTokenSpellings(
+    const Item &It, uint32_t ArgIdx, llvm::ArrayRef<Item> Items,
+    const LangOptions &Lang, llvm::SmallVectorImpl<std::string> &Out,
+    unsigned Depth = 0) {
+  if (Depth >= 64)
+    return false;
+
+  if (const Item *Child = findUniqueWholeArgNestedChild(It, ArgIdx, Items)) {
+    if (auto Expanded = uniqueProjectedExpansionText(*Child, Items, Depth + 1))
+      return lexRawTokenSpellings(*Expanded, Lang, Out);
+  }
+
+  auto ArgText = getProjectionInvocationArgText(It, ArgIdx);
+  if (!ArgText)
+    return false;
+
+  if (It.CallerMacroId) {
+    if (const Item *Caller = findItemByID(Items, *It.CallerMacroId)) {
+      uint32_t CallerParamIdx = 0;
+      if (tryResolveDirectCallerFormalRef(*ArgText, *Caller, CallerParamIdx)) {
+        if (resolveProjectionArgTokenSpellings(*Caller, CallerParamIdx, Items,
+                                               Lang, Out, Depth + 1))
+          return true;
+      }
+
+      if (const Item *Sibling =
+              findUniqueCallerChildByInvocationText(*Caller, *ArgText, Items)) {
+        if (auto Expanded = uniqueProjectedExpansionText(*Sibling, Items,
+                                                         Depth + 1))
+          return lexRawTokenSpellings(*Expanded, Lang, Out);
+      }
+    }
+  }
+
+  return lexRawTokenSpellings(ArgText->trim(), Lang, Out);
+}
+
+
+static llvm::StringRef canonicalizeStringifyLookupKey(llvm::StringRef Spelled) {
+  const size_t QuotePos = Spelled.find('"');
+  if (QuotePos == llvm::StringRef::npos)
+    return Spelled;
+
+  // Stringification always produces an ordinary quoted string literal. Wider or
+  // differently-encoded string literals can only arise when that stringified
+  // token is later wrapped by another macro (for example L##x). For ownership
+  // and direct-span attribution, canonicalize all such spellings back to the
+  // underlying quoted payload before lookup.
+  return Spelled.substr(QuotePos);
+}
+
 void computeMacroProjectionSites(Item &It, Preprocessor &PP,
                                  const Token &MacroNameTok, const MacroInfo *MI,
                                  const MacroArgs *Args,
-                                 const LangOptions &Lang) {
+                                 const LangOptions &Lang,
+                                 llvm::ArrayRef<Item> Items) {
   // Producer-side metadata for consumer projection through:
   //   - stringification sites:  #param
   //   - token pasting sites:    a ## b
@@ -1203,7 +1495,7 @@ void computeMacroProjectionSites(Item &It, Preprocessor &PP,
   It.PasteSpell2TokenIndices.clear();
   It.PasteTokenCursor = 0;
 
-  if (!MI || !MI->isFunctionLike() || !Args)
+  if (!MI || !MI->isFunctionLike())
     return;
 
   (void)Lang;
@@ -1244,15 +1536,31 @@ void computeMacroProjectionSites(Item &It, Preprocessor &PP,
       if (PIdx < 0)
         continue;
 
-      // Robust: rely on Clang's own macro stringification so the spelled token
-      // matches the preprocessor output byte-for-byte.
+      // Prefer Clang's concrete invocation-time MacroArgs. Those unexpanded
+      // tokens are the actual callee-visible argument spelling after any
+      // caller-side formal substitution, and StringifyArgument() reproduces
+      // the exact stringification bytes that the preprocessor emitted. Only
+      // fall back to the synthetic projection resolver when MacroArgs are not
+      // available for this invocation.
       std::string Quoted = "\"\"";
-      if (const Token *AT =
-              Args->getUnexpArgument(static_cast<unsigned>(PIdx))) {
-        Token StrTok = MacroArgs::StringifyArgument(AT, PP, /*Charify=*/false,
-                                                    /*ExpansionLocStart=*/Loc,
-                                                    /*ExpansionLocEnd=*/Loc);
-        Quoted = PP.getSpelling(StrTok);
+      bool HaveQuoted = false;
+      if (Args) {
+        if (const Token *AT =
+                Args->getUnexpArgument(static_cast<unsigned>(PIdx))) {
+          Token StrTok = MacroArgs::StringifyArgument(
+              AT, PP, /*Charify=*/false, /*ExpansionLocStart=*/Loc,
+              /*ExpansionLocEnd=*/Loc);
+          Quoted = PP.getSpelling(StrTok);
+          HaveQuoted = true;
+        }
+      }
+      if (!HaveQuoted) {
+        llvm::SmallVector<std::string, 16> EffectiveTokens;
+        if (resolveProjectionArgTokenSpellings(It, static_cast<unsigned>(PIdx),
+                                               Items, Lang, EffectiveTokens)) {
+          Quoted = stringifyTokenSpellings(EffectiveTokens);
+          HaveQuoted = true;
+        }
       }
 
       It.StringifySpell2ArgIndices[llvm::StringRef(Quoted)].push_back(
@@ -1299,10 +1607,22 @@ void computeMacroProjectionSites(Item &It, Preprocessor &PP,
 
     int PIdx = paramIndex(RTok);
     if (PIdx >= 0) {
-      if (const Token *AT =
-              Args->getUnexpArgument(static_cast<unsigned>(PIdx))) {
-        for (; !AT->is(tok::eof); ++AT)
-          pushTok(PP.getSpelling(*AT), static_cast<unsigned>(PIdx));
+      bool HaveActualArgTokens = false;
+      if (Args) {
+        if (const Token *AT =
+                Args->getUnexpArgument(static_cast<unsigned>(PIdx))) {
+          HaveActualArgTokens = true;
+          for (; !AT->is(tok::eof); ++AT)
+            pushTok(PP.getSpelling(*AT), static_cast<unsigned>(PIdx));
+        }
+      }
+      if (!HaveActualArgTokens) {
+        llvm::SmallVector<std::string, 16> EffectiveTokens;
+        if (resolveProjectionArgTokenSpellings(It, static_cast<unsigned>(PIdx),
+                                               Items, Lang, EffectiveTokens)) {
+          for (const std::string &Spelling : EffectiveTokens)
+            pushTok(Spelling, static_cast<unsigned>(PIdx));
+        }
       }
       continue;
     }
@@ -1960,8 +2280,6 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
     }
   }
 
-  computeMacroProjectionSites(It, PP, MacroNameTok, MI, Args, Lang);
-
   // 3. Capture Owner ID from the stack before we lose the context
   if (!IncludeStack.empty() && IncludeStack.back())
     It.OwnerIncludeId = static_cast<uint64_t>(*IncludeStack.back());
@@ -1985,13 +2303,6 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
 
   RegisterMacroKey(MacroNameTok.getLocation());
   RegisterMacroKey(Range.getBegin());
-
-  // Register paste-produced spellings for paste-through-stringify projection.
-  for (const auto &E : Items[NewIdx].PasteSpell2TokenIndices) {
-    auto &Vec = PasteSpell2MacroItems[E.getKey()];
-    if (std::find(Vec.begin(), Vec.end(), NewIdx) == Vec.end())
-      Vec.push_back(NewIdx);
-  }
 
   // Helper: map a macro-related location to the corresponding Item index.
   //
@@ -2247,6 +2558,16 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
     }
   }
 
+  computeMacroProjectionSites(Items[NewIdx], PP, MacroNameTok, MI, Args, Lang,
+                              llvm::ArrayRef<Item>(Items));
+
+  // Register paste-produced spellings for paste-through-stringify projection.
+  for (const auto &E : Items[NewIdx].PasteSpell2TokenIndices) {
+    auto &Vec = PasteSpell2MacroItems[E.getKey()];
+    if (std::find(Vec.begin(), Vec.end(), NewIdx) == Vec.end())
+      Vec.push_back(NewIdx);
+  }
+
   // 6. THE SCHEMA FIX:
   // Seed the item with an *empty* open span at the current PP token index.
   //
@@ -2495,6 +2816,20 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
     if (L.isMacroID()) {
       const std::string Sp = PP.getSpelling(Tok);
 
+      auto recordStringifySpanForToken = [&](Item &MI, uint64_t TokIndex,
+                                             unsigned ArgIndex) {
+        const llvm::StringRef CanonicalSp = canonicalizeStringifyLookupKey(Sp);
+        const size_t QuotePos = Sp.find('"');
+        if (QuotePos != std::string::npos && !CanonicalSp.empty()) {
+          appendExactArgTokSpan(MI.StringifySpans, TokIndex, ArgIndex,
+                                static_cast<uint32_t>(QuotePos),
+                                static_cast<uint32_t>(QuotePos +
+                                                      CanonicalSp.size()));
+          return;
+        }
+        touchArgTokSpan(MI.StringifySpans, TokIndex, ArgIndex);
+      };
+
       // Record projections for stringification (#X) and token-pasting (X##Y).
       auto recordProjectionsForItem = [&](Item &MI) {
         if (MI.Kind != IK_Macro)
@@ -2511,10 +2846,12 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
              Tok.is(tok::utf8_string_literal) ||
              Tok.is(tok::utf16_string_literal) ||
              Tok.is(tok::utf32_string_literal))) {
-          auto ItS = MI.StringifySpell2ArgIndices.find(Sp);
+          const llvm::StringRef CanonicalSp = canonicalizeStringifyLookupKey(Sp);
+          auto ItS = MI.StringifySpell2ArgIndices.find(CanonicalSp);
           if (ItS != MI.StringifySpell2ArgIndices.end()) {
             for (unsigned A : ItS->second)
-              touchArgTokSpan(MI.StringifySpans, TokIndex, A);
+              recordStringifySpanForToken(MI, TokIndex, A);
+            touchSpanForItem(MI.ID, TokIndex);
           }
         }
 
@@ -2623,33 +2960,60 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
         !PasteSpell2MacroItems.empty()) {
 
       // Sp = exact spelled bytes of the emitted string-literal token as the
-      // preprocessor outputs it. This is what we key against in
-      // StringifySpell2ArgIndices to identify the stringify owner.
+      // preprocessor outputs it. Stringification ownership, however, is keyed
+      // by the underlying quoted payload spelling because a later wrapper may
+      // add an encoding prefix (for example L##x). Use the canonical payload
+      // spelling for owner lookup, while preserving the full spelled token for
+      // payload decoding below.
       const std::string SpStr = PP.getSpelling(Tok);
       const llvm::StringRef Sp = SpStr;
+      const llvm::StringRef CanonicalSp = canonicalizeStringifyLookupKey(Sp);
 
       // Identify which macro invocation item "owns" this spelled string literal
       // as a result of a `#param` in its replacement list.
       std::optional<size_t> StringifyOwnerIdx;
 
       // Try to attribute this spelled string token to a specific item index I
-      // by checking whether item I recorded a stringify-site mapping for Sp.
+      // by checking whether item I recorded a stringify-site mapping for the
+      // canonicalized quoted payload spelling.
       auto trySetOwner = [&](size_t I) {
-        if (StringifyOwnerIdx)
+        if (StringifyOwnerIdx || I >= Items.size())
           return;
-        auto It = Items[I].StringifySpell2ArgIndices.find(Sp);
+        auto It = Items[I].StringifySpell2ArgIndices.find(CanonicalSp);
         if (It != Items[I].StringifySpell2ArgIndices.end())
           StringifyOwnerIdx = I;
       };
 
+      // rootOf(I): collapse an item index I up through CallerMacroId links
+      // until we reach the root invocation of that expansion family.
+      auto rootOfIndex = [&](size_t I) -> std::optional<uint64_t> {
+        size_t CurI = I;
+        for (unsigned Depth = 0; Depth < 128; ++Depth) {
+          if (CurI >= Items.size())
+            return std::nullopt;
+          if (!Items[CurI].CallerMacroId)
+            return Items[CurI].ID;
+          uint64_t CallerId = *Items[CurI].CallerMacroId;
+          if (CallerId >= Items.size())
+            return std::nullopt;
+          CurI = static_cast<size_t>(CallerId);
+        }
+        return std::nullopt;
+      };
+
+      std::optional<uint64_t> CurrentRootId;
+
       // First attempt: if the current emission is already associated with a
       // macro item (ItemIdx), prefer that.
-      if (ItemIdx)
+      if (ItemIdx) {
         trySetOwner(*ItemIdx);
+        CurrentRootId = rootOfIndex(*ItemIdx);
+      }
 
       // Otherwise, walk up the macro caller chain (bounded) and see if any
       // enclosing macro invocation item performed the stringification that
-      // produced this spelled string token.
+      // produced this spelled string token. Also capture the current root
+      // family while doing so.
       SourceLocation Cur2 = L;
       for (unsigned Depth = 0;
            Depth < 32 && Cur2.isMacroID() && !StringifyOwnerIdx; ++Depth) {
@@ -2657,12 +3021,60 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
         if (Caller.isInvalid())
           break;
         auto ItM = MacroKey2Item.find(keyForMacroLoc(Caller));
-        if (ItM != MacroKey2Item.end())
+        if (ItM != MacroKey2Item.end()) {
+          if (!CurrentRootId)
+            CurrentRootId = rootOfIndex(ItM->second);
           trySetOwner(ItM->second);
+        }
         Cur2 = Caller;
       }
 
+      // Some wrapper configurations represent the true stringify owner as a
+      // sibling-descendant within the same root expansion family rather than
+      // on the immediate macro-caller chain of the final widened token. In
+      // that case, fall back to a unique owner lookup by canonical stringified
+      // payload within the current root family.
+      if (!StringifyOwnerIdx && CurrentRootId) {
+        std::optional<size_t> UniqueOwner;
+        for (size_t I = 0; I < Items.size(); ++I) {
+          if (Items[I].Kind != IK_Macro)
+            continue;
+          auto RootId = rootOfIndex(I);
+          if (!RootId || *RootId != *CurrentRootId)
+            continue;
+          auto It = Items[I].StringifySpell2ArgIndices.find(CanonicalSp);
+          if (It == Items[I].StringifySpell2ArgIndices.end())
+            continue;
+          if (UniqueOwner) {
+            UniqueOwner.reset();
+            break;
+          }
+          UniqueOwner = I;
+        }
+        StringifyOwnerIdx = UniqueOwner;
+      }
+
       if (StringifyOwnerIdx) {
+        auto recordOwnedStringifySpanForToken = [&](Item &MI, uint64_t TokIndex,
+                                                    unsigned ArgIndex) {
+          const size_t QuotePos = Sp.find('"');
+          if (QuotePos != std::string::npos && !CanonicalSp.empty()) {
+            appendExactArgTokSpan(MI.StringifySpans, TokIndex, ArgIndex,
+                                  static_cast<uint32_t>(QuotePos),
+                                  static_cast<uint32_t>(QuotePos +
+                                                        CanonicalSp.size()));
+            return;
+          }
+          touchArgTokSpan(MI.StringifySpans, TokIndex, ArgIndex);
+        };
+
+        auto ItS = Items[*StringifyOwnerIdx].StringifySpell2ArgIndices.find(CanonicalSp);
+        if (ItS != Items[*StringifyOwnerIdx].StringifySpell2ArgIndices.end()) {
+          for (unsigned A : ItS->second)
+            recordOwnedStringifySpanForToken(Items[*StringifyOwnerIdx], TokIndex,
+                                             A);
+          touchSpanForItem(*StringifyOwnerIdx, TokIndex);
+        }
         // Decode the string literal into its "payload" (decoded characters) and
         // a mapping from decoded-payload indices back to (begin,end) spans in
         // the *spelled* token string. We only proceed if that mapping is a
@@ -3614,6 +4026,17 @@ void RefoldMapBuilder::writeJSON() {
       Dst.push_back(T);
     };
 
+    auto appendMergedArgSpanEnvelope = [&](std::vector<TokenSpan> &Dst,
+                                           const ArgTokenSpan &S) {
+      if (S.End <= S.Begin)
+        return;
+      TokenSpan T;
+      T.Begin = S.Begin;
+      T.End = S.End;
+      T.Open = false;
+      appendMergedTokenSpan(Dst, T);
+    };
+
     // Some higher-order intermediate invocations (e.g. BAR(FUNC) -> FOO(X,10)
     // -> FUNC(...)) can legitimately produce no directly-attributed tokens: all
     // printed output is owned by nested child expansions. Once caller links are
@@ -3883,6 +4306,43 @@ void RefoldMapBuilder::writeJSON() {
         break;
     }
 
+    // Some wrapper / prescan-only invocations can still remain zero-width in
+    // `spans` even after provenance propagation, because they never own a
+    // directly printed token in A. In those cases, synthesize the item's token
+    // envelope from its own recorded provenance spans. This stays local and
+    // deterministic: we only use spans already proven to belong to that macro
+    // invocation in A-domain (arg/stringify/paste/body), and we leave any
+    // existing real envelope untouched.
+    bool ProvenanceSynthChanged = false;
+    for (unsigned Pass = 0; Pass < 8; ++Pass) {
+      ProvenanceSynthChanged = false;
+      for (Item &It : Items) {
+        if (It.Kind != IK_Macro || hasRealTokenEnvelope(It))
+          continue;
+
+        std::vector<TokenSpan> SynthSpans;
+        SynthSpans.reserve(It.BodySpans.size() + It.ArgSpans.size() +
+                           It.StringifySpans.size() + It.PasteSpans.size());
+
+        for (const TokenSpan &S : It.BodySpans)
+          appendMergedTokenSpan(SynthSpans, S);
+        for (const ArgTokenSpan &S : It.ArgSpans)
+          appendMergedArgSpanEnvelope(SynthSpans, S);
+        for (const ArgTokenSpan &S : It.StringifySpans)
+          appendMergedArgSpanEnvelope(SynthSpans, S);
+        for (const ArgTokenSpan &S : It.PasteSpans)
+          appendMergedArgSpanEnvelope(SynthSpans, S);
+
+        if (SynthSpans.empty())
+          continue;
+
+        It.Spans = std::move(SynthSpans);
+        ProvenanceSynthChanged = true;
+      }
+      if (!ProvenanceSynthChanged)
+        break;
+    }
+
     // items...
     JO.attributeArray("items", [&] {
       for (const Item &It : Items) {
@@ -4075,6 +4535,22 @@ void RefoldMapBuilder::writeJSON() {
                     JO.attribute("end", S.End);
                     if (S.ArgIndex)
                       JO.attribute("arg_index", *S.ArgIndex);
+                    if (S.HasByteRange) {
+                      bool EmitByteRange = true;
+                      if (S.End == S.Begin + 1 &&
+                          S.Begin < TokPPByteBegin.size() &&
+                          S.Begin < TokPPByteEnd.size()) {
+                        const uint64_t TokLen =
+                            TokPPByteEnd[S.Begin] - TokPPByteBegin[S.Begin];
+                        if (S.ByteBegin == 0 &&
+                            S.ByteEnd == static_cast<uint32_t>(TokLen))
+                          EmitByteRange = false;
+                      }
+                      if (EmitByteRange) {
+                        JO.attribute("byte_begin", S.ByteBegin);
+                        JO.attribute("byte_end", S.ByteEnd);
+                      }
+                    }
                     if (S.End > S.Begin && S.End <= TokPPByteBegin.size()) {
                       JO.attribute("pp_byte_begin", TokPPByteBegin[S.Begin]);
                       JO.attribute("pp_byte_end", TokPPByteEnd[S.End - 1]);

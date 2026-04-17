@@ -118,7 +118,6 @@ static std::string FormatUInt32List(ArrayRef<uint32_t> values) {
   return os.str();
 }
 
-
 static std::string
 FormatInvArgRefList(ArrayRef<RefoldModel::InvArgRef> refs) {
   std::string out;
@@ -237,7 +236,6 @@ CanonicalizeStringifyInversePayload(StringRef raw0) {
 
   return out;
 }
-
 
 enum class PasteRunInvertibilityKind {
   Unique,
@@ -3907,6 +3905,30 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
         if (tok.empty())
           return false;
 
+        if (s.byteBegin && s.byteEnd) {
+          if ((bEnv->second - bEnv->first) != 1)
+            return false;
+          StringRef aTok = SliceASource(static_cast<size_t>(s.begin),
+                                        static_cast<size_t>(s.end));
+          const uint64_t bb = *s.byteBegin;
+          const uint64_t be = *s.byteEnd;
+          if (be < bb || be > static_cast<uint64_t>(aTok.size()))
+            return false;
+          StringRef aPref = aTok.take_front(static_cast<size_t>(bb));
+          StringRef aSuff = aTok.drop_front(static_cast<size_t>(be));
+          if (tok.starts_with(aPref) && tok.ends_with(aSuff) &&
+              tok.size() >= aPref.size() + aSuff.size()) {
+            tok = tok.slice(aPref.size(), tok.size() - aSuff.size());
+          } else {
+            const uint64_t bbC = std::min<uint64_t>(bb, tok.size());
+            const uint64_t beC = std::min<uint64_t>(be, tok.size());
+            if (beC < bbC)
+              return false;
+            tok = tok.slice(static_cast<size_t>(bbC), static_cast<size_t>(beC));
+          }
+          tok = tok.trim();
+        }
+
         std::string expect = stringutils::quoteCString(argTrim);
         if (tok != expect) {
           trace("macro/consistency",
@@ -7369,7 +7391,6 @@ RefoldEngine::MapATokRangeAToBTokenEnvelopeTrimEdgeInsertions(
   return std::make_pair(bBegin, bEnd);
 }
 
-
 std::optional<std::vector<std::pair<size_t, size_t>>>
 RefoldEngine::ParseMacroInvocationArgContentRanges(StringRef invText) {
   // Locate the start of the argument list.
@@ -7502,7 +7523,6 @@ RefoldEngine::BuildIncludeInsertionPatch(const RefoldModel::IncludeItem &inc,
 
   return patch;
 }
-
 
 SmallVector<RefoldEngine::ForcedMacroPatchRequest, 32>
 RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
@@ -7987,7 +8007,6 @@ RefoldEngine::ComputeForcedCounterPatchesFromExpandedMacros(
 
   return forced;
 }
-
 
 std::optional<std::pair<uint64_t, uint64_t>>
 RefoldEngine::GetWholeCoverATokRange(
@@ -8927,10 +8946,11 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         if (!fromB) {
           StringRef a = SliceASource(static_cast<size_t>(sp.begin),
                                      static_cast<size_t>(sp.end));
-          if (sp.kind == PPArgSpanKind::Paste) {
-            // Paste spans can identify a subrange within a single pasted token.
-            if (!sp.byteBegin || !sp.byteEnd)
-              return std::nullopt;
+          if ((sp.kind == PPArgSpanKind::Paste ||
+             sp.kind == PPArgSpanKind::Stringify) &&
+            sp.byteBegin && sp.byteEnd) {
+            // Paste spans and wrapped stringify spans can identify a subrange
+            // within a single output token.
             if ((sp.end - sp.begin) != 1)
               return std::nullopt;
             const uint64_t bb = *sp.byteBegin;
@@ -8951,19 +8971,20 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         StringRef b = SliceBSource(bEnv->first, bEnv->second);
         bool reliable = true;
 
-        if (sp.kind == PPArgSpanKind::Paste) {
-          if (!sp.byteBegin || !sp.byteEnd)
-            return std::nullopt;
+        if ((sp.kind == PPArgSpanKind::Paste ||
+             sp.kind == PPArgSpanKind::Stringify) &&
+            sp.byteBegin && sp.byteEnd) {
           if ((bEnv->second - bEnv->first) != 1)
             return std::nullopt;
           const uint64_t bb = *sp.byteBegin;
           const uint64_t be = *sp.byteEnd;
 
           // Token-internal byte ranges are computed from the A-side token
-          // spelling. If the B-side pasted token changes length (e.g.
-          // L\"hello\" -> L\"goodbye\"), using the raw [bb,be) slice can
-          // truncate the changed segment. When possible, re-derive the B-side
-          // segment by preserving the A-side prefix/suffix around the segment.
+          // spelling. If the B-side token changes length (for example
+          // L"hello" -> L"goodbye" for wrapped stringify, or any pasted
+          // token rewrite), using the raw [bb,be) slice can truncate the
+          // changed segment. Re-derive the B-side segment by peeling any
+          // unchanged prefix/suffix when possible.
           StringRef aTok = SliceASource(static_cast<size_t>(sp.begin),
                                         static_cast<size_t>(sp.end));
           if (be < bb || be > static_cast<uint64_t>(aTok.size()))
@@ -8972,13 +8993,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           StringRef aSuff = aTok.drop_front(static_cast<size_t>(be));
           if (b.starts_with(aPref) && b.ends_with(aSuff) &&
               b.size() >= aPref.size() + aSuff.size()) {
-            // Best case: we can "peel" the unchanged prefix/suffix and get
-            // the true edited middle segment.
             b = b.slice(aPref.size(), b.size() - aSuff.size());
           } else {
-            // Fallback: clamp to the recorded offsets. This may be ambiguous,
-            // so mark unreliable; later we only accept such edits if we can
-            // uniquely split the token at the token level.
             reliable = false;
             const uint64_t bbC = std::min<uint64_t>(bb, b.size());
             const uint64_t beC = std::min<uint64_t>(be, b.size());
@@ -9303,6 +9319,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
       SmallVector<LeafCandidate, 8> leafCands;
       directRootPreservationInadmissible = false;
+
       for (const auto &cand : model_.GetMacroInvocations()) {
         // Only consider invocations that are descendants of the root m.
         auto d = depthToRoot(cand);
@@ -9311,6 +9328,12 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         const bool hunkWithinCandCover =
             cand.cover.begin <= h.aStart && h.aEnd <= cand.cover.end &&
             cand.cover.begin < cand.cover.end;
+
+        SmallVector<RefoldModel::PPArgSpan, 8> candArgLikeRaw;
+        gatherArgLike(cand, candArgLikeRaw);
+        SmallVector<RefoldModel::PPArgSpan, 8> candArgLike = candArgLikeRaw;
+        sanitizeArgLikeSpans(candArgLike);
+
         if (!pathHasOnlyLiteralCallees(cand)) {
           trace("macro/dag",
                 "skip leaf id={0} name='{1}': non-literal callee origin on "
@@ -9328,26 +9351,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
         // Candidate must have argument-like spans; otherwise there's nothing
         // concrete to map an edit to.
-        SmallVector<RefoldModel::PPArgSpan, 8> candArgLike;
-        gatherArgLike(cand, candArgLike);
-        // Filter out argument-like spans that are structurally invalid. A
-        // PPArgSpan is considered invalid if its token-range is empty or
-        // inverted, or if its begin/end values fall outside the range of
-        // available A-side tokens. Such spans can arise from producer
-        // propagation bugs or when a nested invocation was elided; using
-        // them would lead to bogus touched indices or out-of-bounds
-        // access. Skip them here to avoid crashes downstream (see
-        // similar_expansion_paths_ambiguity_path1_path2 regression).
-        sanitizeArgLikeSpans(candArgLike);
-        if (candArgLike.empty()) {
-          if (hunkWithinCandCover) {
-            trace("macro/dag",
-                  "skip leaf id={0} name='{1}': no argument-like spans for "
-                  "touched descendant under root id={2}",
-                  cand.id, cand.name, m.id);
-          }
+        if (candArgLike.empty())
           continue;
-        }
 
         // Determine how many formals this invocation "effectively" has, because
         // spans might reference argIdx beyond invArgRanges size.
@@ -9360,8 +9365,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         // expects one flag per span occurrence, while the later DAG logic
         // reasons per formal arg index.
         SmallVector<char, 8> candTouchedBySpan(candArgLike.size(), 0);
-        if (!HunkFullyWithinArgSpans(h, candArgLike, candTouchedBySpan))
+        if (!HunkFullyWithinArgSpans(h, candArgLike, candTouchedBySpan)) {
           continue;
+        }
 
         SmallVector<char, 8> candTouched(candFormalCount, 0);
         for (size_t si = 0; si < candArgLike.size(); ++si) {
@@ -9378,8 +9384,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             anyTouched = true;
             break;
           }
-        if (!anyTouched)
+        if (!anyTouched) {
           continue;
+        }
 
         // Now verify there's an actual A->B difference within at least one
         // touched arg-like span (otherwise lifting would be a no-op).
@@ -9415,8 +9422,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           }
         }
 
-        if (!anyDiff)
+        if (!anyDiff) {
           continue;
+        }
 
         // Candidate leaf accepted: store its arg-like spans and which formals
         // are touched, plus depth and a locality tie-breaker.
@@ -10946,7 +10954,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             return os.str();
           };
 
-
       enum class FormalRewriteCertificateKind {
         NoChange,
         Unique,
@@ -11615,7 +11622,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         return out;
       };
 
-
       auto mergeCompatibleCallsitePatchReplacements =
           [&](StringRef baseOld, ArrayRef<StringRef> replacements)
           -> std::optional<std::string> {
@@ -11987,6 +11993,124 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           StringRef)>
           buildParentConstraintDerivationCertificate;
 
+        // Attempt to interpret a group of paste-byte ranges in the coordinate
+        // space of the current observed pasted surface.
+        //
+        // Why this is needed:
+        //   For nested paste replay, child paste spans may be recorded in one of
+        //   two coordinate systems:
+        //
+        //   (1) Already-local coordinates:
+        //       The span byte ranges are already relative to the current
+        //       observed surface we are trying to replay. In that case, we can
+        //       use them directly.
+        //
+        //   (2) Enclosing-token coordinates:
+        //       The child spans are still expressed relative to the larger
+        //       enclosing pasted token owned by `surfaceOwner`. In that case,
+        //       we must rebase them into the local observed surface before we
+        //       can derive exact-shape replay constraints.
+        //
+        // This helper first checks whether every span in `group` already fits
+        // within `observedSurface`. If so, it returns those ranges unchanged.
+        //
+        // Otherwise, it looks for the enclosing paste envelope on
+        // `surfaceOwner->pasteSpans` that covers the same emitted token
+        // `[tokBegin, tokEnd)`. If that enclosing envelope exists and its total
+        // width exactly matches `observedSurface`, then each child span is
+        // rebased by subtracting the enclosing base offset.
+        //
+        // The function returns:
+        //   - rebased/local byte ranges on success
+        //   - std::nullopt if the group cannot be interpreted unambiguously in
+        //     the observed-surface coordinate space
+        auto tryRebasePasteGroupToObservedSurface =
+            [&](const RefoldModel::MacroInvocation *surfaceOwner,
+                ArrayRef<const RefoldModel::PPArgSpan *> group,
+                StringRef observedSurface, StringRef traceStage)
+            -> std::optional<SmallVector<std::pair<uint64_t, uint64_t>, 4>> {
+          SmallVector<std::pair<uint64_t, uint64_t>, 4> rebased;
+          rebased.reserve(group.size());
+          const uint64_t observedLen = observedSurface.size();
+
+          // Fast path:
+          // If every span already has a valid byte range fully inside the
+          // current observed surface, then the group is already expressed in the
+          // local coordinate space and does not need rebasing.
+          bool fitsObservedSurface = true;
+          for (const auto *sp : group) {
+            if (!sp->byteBegin || !sp->byteEnd || *sp->byteBegin > *sp->byteEnd ||
+                *sp->byteEnd > observedLen) {
+              fitsObservedSurface = false;
+              break;
+            }
+          }
+          if (fitsObservedSurface) {
+            for (const auto *sp : group)
+              rebased.push_back({*sp->byteBegin, *sp->byteEnd});
+            return rebased;
+          }
+
+          // If the spans do not already fit the observed surface, we can only
+          // recover them if we know which enclosing invocation owns the larger
+          // pasted token that these spans were originally measured against.
+          if (!surfaceOwner)
+            return std::nullopt;
+
+          std::optional<uint64_t> base;
+          std::optional<uint64_t> limit;
+          const uint64_t tokBegin = group.front()->begin;
+          const uint64_t tokEnd = group.front()->end;
+
+          // Find the enclosing paste envelope on the surface owner for the same
+          // emitted token `[tokBegin, tokEnd)`.
+          //
+          // Multiple owner spans may contribute to that token, so we compute the
+          // minimal base and maximal limit across all matching owner paste spans.
+          // The resulting [base, limit) interval is the full owner-local byte
+          // range for the observed pasted surface.
+          for (const auto &ownerSp : surfaceOwner->pasteSpans) {
+            if (!ownerSp.byteBegin || !ownerSp.byteEnd)
+              continue;
+            if (ownerSp.begin != tokBegin || ownerSp.end != tokEnd)
+              continue;
+            base = base ? std::min<uint64_t>(*base, *ownerSp.byteBegin)
+                        : *ownerSp.byteBegin;
+            limit = limit ? std::max<uint64_t>(*limit, *ownerSp.byteEnd)
+                          : *ownerSp.byteEnd;
+          }
+
+          // The enclosing owner envelope must:
+          //   - exist
+          //   - be well-formed
+          //   - have width exactly equal to the current observed surface
+          //
+          // If not, we cannot safely interpret the child spans relative to the
+          // local replay surface.
+          if (!base || !limit || *limit < *base || (*limit - *base) != observedLen)
+            return std::nullopt;
+
+          // Rebase each child span from owner-local/full-token coordinates into
+          // observed-surface-local coordinates by subtracting the enclosing base.
+          //
+          // Each span must lie fully inside the enclosing owner envelope;
+          // otherwise the replay would be inconsistent and must be rejected.
+          for (const auto *sp : group) {
+            if (!sp->byteBegin || !sp->byteEnd)
+              return std::nullopt;
+            if (*sp->byteBegin < *base || *sp->byteEnd < *sp->byteBegin ||
+                *sp->byteEnd > *limit)
+              return std::nullopt;
+            rebased.push_back({*sp->byteBegin - *base, *sp->byteEnd - *base});
+          }
+
+          trace("macro/dag",
+                "{0}: rebased pasted span group to observed surface owner id={1} name={2} base={3} limit={4} observedLen={5}",
+                traceStage, surfaceOwner->id, surfaceOwner->name, *base, *limit,
+                observedLen);
+          return rebased;
+        };
+
       auto tryBuildNestedPasteChainDerivation =
           [&](const RefoldModel::MacroInvocation &cur, uint32_t curFormal,
               StringRef curOld, StringRef curNew,
@@ -12079,17 +12203,18 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         if (oldTok.empty() || newTok.empty())
           return std::nullopt;
 
-        const uint64_t oldLen = oldTok.size();
-        for (size_t i = 0; i < group.size(); ++i) {
-          const auto *sp = group[i];
-          if (*sp->byteBegin > *sp->byteEnd || *sp->byteEnd > oldLen)
-            return std::nullopt;
-          if (i > 0 && *group[i - 1]->byteEnd > *sp->byteBegin)
+        auto rebasedGroup = tryRebasePasteGroupToObservedSurface(
+            &cur, ArrayRef<const RefoldModel::PPArgSpan *>(group), oldTok,
+            traceStage);
+        if (!rebasedGroup)
+          return std::nullopt;
+        for (size_t i = 1; i < rebasedGroup->size(); ++i) {
+          if ((*rebasedGroup)[i - 1].second > (*rebasedGroup)[i].first)
             return std::nullopt;
         }
 
-        StringRef leading = oldTok.take_front(*group.front()->byteBegin);
-        StringRef trailing = oldTok.drop_front(*group.back()->byteEnd);
+        StringRef leading = oldTok.take_front((*rebasedGroup).front().first);
+        StringRef trailing = oldTok.drop_front((*rebasedGroup).back().second);
         if (!newTok.starts_with(leading) || !newTok.ends_with(trailing))
           return std::nullopt;
 
@@ -12098,11 +12223,11 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         oldSegs.reserve(group.size());
         midBodies.reserve(group.size() - 1);
         for (size_t i = 0; i < group.size(); ++i) {
-          const auto *sp = group[i];
-          oldSegs.push_back(oldTok.slice(*sp->byteBegin, *sp->byteEnd));
+          const auto [segBegin, segEnd] = (*rebasedGroup)[i];
+          oldSegs.push_back(oldTok.slice(segBegin, segEnd));
           if (i + 1 < group.size()) {
-            StringRef mid =
-                oldTok.slice(*sp->byteEnd, *group[i + 1]->byteBegin);
+            StringRef mid = oldTok.slice(segEnd,
+                                         (*rebasedGroup)[i + 1].first);
             if (mid.empty())
               return std::nullopt;
             midBodies.push_back(mid);
@@ -12235,7 +12360,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         cert.valid = true;
         return cert;
       };
-
 
       auto tryBuildTwoParentDelimitedDerivation =
           [&](const RefoldModel::MacroInvocation &cur, uint32_t curFormal,
@@ -12804,11 +12928,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                            InvocationRewriteCertificateKind::Invalid &&
                        siblingLift.parentInvocationFailure ==
                            InvocationRewriteFailure::None) {
-              trace("macro/dag",
-                    "DAG per-hop exact sibling reroot accepted without concrete replay: sibling id={0} name={1} siblingFormal={2} parentSyntax='{3}' nextFormals={4}",
-                    matchedSibling->id, matchedSibling->name, siblingFormal,
-                    siblingLift.parentCert.rewrittenInvocationSyntax,
-                    formatFormalTextPairMap(siblingLift.nextFormals));
             } else {
               trace("macro/dag",
                     "DAG per-hop exact sibling reroot rejected: sibling id={0} name={1} siblingFormal={2} reason=uncertifiedParentFormalEvidence nextFormals={3}",
@@ -13019,7 +13138,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         /// lifted through the child's formal-derivation certificate. Any
         /// ambiguity means we do not have a sound inverse-paste witness.
         auto tryDeriveObservedConstraintsFromDirectPasteChild =
-            [&](const RefoldModel::MacroInvocation &directChild,
+            [&](const RefoldModel::MacroInvocation &surfaceOwner,
+                const RefoldModel::MacroInvocation &directChild,
                 StringRef observedOld0, StringRef observedNew0,
                 StringRef traceStage)
             -> std::optional<
@@ -13056,19 +13176,22 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             return a->argIdx < b->argIdx;
           });
 
-          const uint64_t oldLen = observedOld.size();
-          for (size_t i = 0; i < group.size(); ++i) {
-            const auto *sp = group[i];
-            if (*sp->byteBegin > *sp->byteEnd || *sp->byteEnd > oldLen)
-              return std::nullopt;
-            if (i > 0 && *group[i - 1]->byteEnd > *sp->byteBegin)
+          auto rebasedGroup = tryRebasePasteGroupToObservedSurface(
+              &surfaceOwner, ArrayRef<const RefoldModel::PPArgSpan *>(group),
+              observedOld, traceStage);
+          if (!rebasedGroup)
+            return std::nullopt;
+          for (size_t i = 1; i < rebasedGroup->size(); ++i) {
+            if ((*rebasedGroup)[i - 1].second > (*rebasedGroup)[i].first)
               return std::nullopt;
           }
 
           // The edit must preserve the non-pasted prefix/suffix verbatim.
           // Otherwise we are no longer replaying the same direct pasted child.
-          StringRef leading = observedOld.take_front(*group.front()->byteBegin);
-          StringRef trailing = observedOld.drop_front(*group.back()->byteEnd);
+          StringRef leading =
+              observedOld.take_front((*rebasedGroup).front().first);
+          StringRef trailing =
+              observedOld.drop_front((*rebasedGroup).back().second);
           if (!observedNew.starts_with(leading) || !observedNew.ends_with(trailing))
             return std::nullopt;
 
@@ -13077,11 +13200,11 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           oldSegs.reserve(group.size());
           midBodies.reserve(group.size() - 1);
           for (size_t i = 0; i < group.size(); ++i) {
-            const auto *sp = group[i];
-            oldSegs.push_back(observedOld.slice(*sp->byteBegin, *sp->byteEnd));
+            const auto [segBegin, segEnd] = (*rebasedGroup)[i];
+            oldSegs.push_back(observedOld.slice(segBegin, segEnd));
             if (i + 1 < group.size()) {
-              StringRef mid =
-                  observedOld.slice(*sp->byteEnd, *group[i + 1]->byteBegin);
+              StringRef mid = observedOld.slice(segEnd,
+                                                (*rebasedGroup)[i + 1].first);
               if (mid.empty())
                 return std::nullopt;
               midBodies.push_back(mid);
@@ -13250,7 +13373,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               if (!cand || cand->pasteSpans.empty())
                 continue;
               auto derived = tryDeriveObservedConstraintsFromDirectPasteChild(
-                  *cand, surfaceOld, surfaceNew, traceStage);
+                  target, *cand, surfaceOld, surfaceNew, traceStage);
               if (!derived)
                 continue;
               if (directPasteChild) {
@@ -13273,8 +13396,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             if (!trySelectDirectChildForSurface(quotedOld, quotedNew))
               return std::nullopt;
           }
-          if (!directPasteChild || !derivedConstraints)
+          if (!directPasteChild || !derivedConstraints) {
             return std::nullopt;
+          }
 
           // Group the derived constraints by the target's formals. Each group is
           // later replayed either by recursively preserving a nested child or by
@@ -13494,7 +13618,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               sources.push_back(curFormal);
           }
         }
-
 
         DenseMap<uint64_t, std::string> preferredChildSyntax;
         if (!cert.rewrittenChildSyntax.empty())
@@ -17042,7 +17165,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             m.id, m.name, replayFormalCount);
       return true;
     };
-
 
     struct LocalFormalTextPair {
       std::string oldText;
