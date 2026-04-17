@@ -7682,60 +7682,102 @@ bool RefoldEngine::MacroWholeCoverIsSelfContained(
   return cur >= covHiA;
 }
 
-std::optional<std::string>
-RefoldEngine::BuildWholeCoverReplacementText(
+std::optional<RefoldEngine::WholeCoverPlan>
+RefoldEngine::ComputeWholeCoverPlan(
     const RefoldModel::MacroInvocation &m) const {
   auto range = GetWholeCoverATokRange(m);
   if (!range)
     return std::nullopt;
-  uint64_t covLoA = range->first;
-  uint64_t covHiA = range->second;
 
-  if (!MacroWholeCoverIsSelfContained(m)) {
+  WholeCoverPlan plan;
+  plan.covLoA = range->first;
+  plan.covHiA = range->second;
+  plan.usedBodyRange =
+      (m.subkind == "func" && m.defParams.empty() && !m.bodySpans.empty() &&
+       (plan.covLoA != m.cover.begin || plan.covHiA != m.cover.end));
+  plan.selfContained = MacroWholeCoverIsSelfContained(m);
+  plan.nestedSelfContained = NestedWholeCoverIsSelfContained(m);
+  if (!plan.selfContained) {
     trace("macro/whole",
-          "whole-cover rejected inv id={0} name='{1}': non-self-contained cover=[{2},{3})",
-          m.id, m.name, covLoA, covHiA);
+          "whole-cover rejected inv id={0} name='{1}': non-self-contained cover=[{2},{3}) nestedSelfContained={4}",
+          m.id, m.name, plan.covLoA, plan.covHiA,
+          plan.nestedSelfContained ? 1 : 0);
     return std::nullopt;
   }
 
   auto bEnv = MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
-      covLoA, covHiA);
+      plan.covLoA, plan.covHiA);
   if (!bEnv)
     return std::nullopt;
 
-  size_t bTokStart = bEnv->first;
-  size_t bTokEnd = bEnv->second;
-  if (bTokEnd <= bTokStart)
+  plan.rawBTokStart = bEnv->first;
+  plan.rawBTokEnd = bEnv->second;
+  plan.bTokStart = plan.rawBTokStart;
+  plan.bTokEnd = plan.rawBTokEnd;
+  if (plan.bTokEnd <= plan.bTokStart)
     return std::nullopt;
 
-  // Tighten the B-side envelope to the exact A-side boundary tokens when
-  // possible. This mirrors the non-heuristic correction used by
-  // BuildMacroInvocationPatchWholeCover's whole-cover fallback.
-  if (covLoA < aToks_.size() && bTokStart < bToks_.size()) {
-    StringRef want = aToks_[static_cast<size_t>(covLoA)].spelling;
+  if (plan.covLoA < aToks_.size() && plan.bTokStart < bToks_.size()) {
+    StringRef want = aToks_[static_cast<size_t>(plan.covLoA)].spelling;
     if (!want.empty()) {
-      if (bToks_[bTokStart].spelling != want && bTokStart > 0 &&
-          bToks_[bTokStart - 1].spelling == want) {
-        bTokStart--;
+      if (bToks_[plan.bTokStart].spelling != want && plan.bTokStart > 0 &&
+          bToks_[plan.bTokStart - 1].spelling == want) {
+        plan.bTokStart--;
+        plan.adjustedLeft = true;
       }
     }
   }
 
-  if (covHiA > 0 && (covHiA - 1) < aToks_.size() && bTokEnd > 0 &&
-      (bTokEnd - 1) < bToks_.size()) {
-    StringRef want = aToks_[static_cast<size_t>(covHiA - 1)].spelling;
+  if (plan.covHiA > 0 && (plan.covHiA - 1) < aToks_.size() &&
+      plan.bTokEnd > 0 && (plan.bTokEnd - 1) < bToks_.size()) {
+    StringRef want = aToks_[static_cast<size_t>(plan.covHiA - 1)].spelling;
     if (!want.empty()) {
-      if (bToks_[bTokEnd - 1].spelling != want && bTokEnd >= 2 &&
-          bToks_[bTokEnd - 2].spelling == want) {
-        bTokEnd--;
+      if (bToks_[plan.bTokEnd - 1].spelling != want && plan.bTokEnd >= 2 &&
+          bToks_[plan.bTokEnd - 2].spelling == want) {
+        plan.bTokEnd--;
+        plan.adjustedRight = true;
       }
     }
   }
 
-  if (bTokEnd <= bTokStart)
+  if (plan.bTokEnd <= plan.bTokStart)
     return std::nullopt;
-  std::string clipped = SliceBSourceClippedAgainstClaims(bTokStart, bTokEnd);
-  return StringRef(clipped).trim().str();
+
+  std::string unclipped = SliceBSource(plan.bTokStart, plan.bTokEnd).str();
+  std::string clipped =
+      SliceBSourceClippedAgainstClaims(plan.bTokStart, plan.bTokEnd);
+  plan.claimsClipped = (unclipped != clipped);
+  plan.clippedText = StringRef(clipped).trim().str();
+  return plan;
+}
+
+bool RefoldEngine::WholeCoverPatchMatchesPlan(const MacroPatch &patch,
+                                              const WholeCoverPlan &plan,
+                                              uint64_t rootMacroId) const {
+  if (patch.proofKind != MacroPatchProofKind::WholeCoverFallback ||
+      patch.structurePreserving || patch.proofRootMacroId != rootMacroId)
+    return false;
+  return patch.wholeCoverUsedBodyRange == plan.usedBodyRange &&
+         patch.wholeCoverSelfContained == plan.selfContained &&
+         patch.wholeCoverNestedSelfContained == plan.nestedSelfContained &&
+         patch.wholeCoverAdjustedLeft == plan.adjustedLeft &&
+         patch.wholeCoverAdjustedRight == plan.adjustedRight &&
+         patch.wholeCoverClaimsClipped == plan.claimsClipped &&
+         patch.wholeCoverALo == plan.covLoA &&
+         patch.wholeCoverAHi == plan.covHiA &&
+         patch.wholeCoverBRawLo == plan.rawBTokStart &&
+         patch.wholeCoverBRawHi == plan.rawBTokEnd &&
+         patch.wholeCoverBAdjLo == plan.bTokStart &&
+         patch.wholeCoverBAdjHi == plan.bTokEnd;
+}
+
+std::optional<std::string>
+RefoldEngine::BuildWholeCoverReplacementText(
+    const RefoldModel::MacroInvocation &m) const {
+  auto plan = ComputeWholeCoverPlan(m);
+  if (!plan)
+    return std::nullopt;
+  return plan->clippedText;
 }
 
 void RefoldEngine::AddForcedCounterPatches(
@@ -16158,105 +16200,53 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     return *existingPatch;
   }
 
+  std::optional<WholeCoverPlan> wholeCoverPlan;
   if (existingExpandedPatch && !existingExpandedPatch->structurePreserving) {
-    trace("macro",
-          "expanded patch reused after preservation attempts failed inv id={0}",
-          m.id);
-    return *existingExpandedPatch;
-  }
-
-  // 2) Whole-cover fallback: replace invocation with the entire expansion cover
-  // slice from B. cover.begin/cover.end are PP-token indices in A; map them
-  // into a B-token envelope.
-  //
-  // This fallback is only valid when the invocation's replacement surface is
-  // self-contained at its own callsite. Nested child macros whose emitted
-  // tokens are interleaved with parent-owned syntax may still admit certified
-  // args-only / DAG lifting, but they must never whole-cover expand directly
-  // at the child callsite.
-  if (!MacroWholeCoverIsSelfContained(m)) {
-    trace("macro/whole",
-          "whole-cover rejected inv id={0} name='{1}': non-self-contained cover=[{2},{3})",
-          m.id, m.name, m.cover.begin, m.cover.end);
-    return std::nullopt;
-  }
-  uint64_t covLoA = m.cover.begin;
-  uint64_t covHiA = m.cover.end;
-
-  // Same rationale as BuildWholeCoverReplacementText: for no-arg function-like
-  // macros, prefer the precise bodySpans envelope over the conservative cover.
-  if (m.subkind == "func" && m.defParams.empty() && !m.bodySpans.empty()) {
-    uint64_t lo = std::numeric_limits<uint64_t>::max();
-    uint64_t hi = 0;
-    for (const auto &s : m.bodySpans) {
-      if (s.begin < s.end) {
-        lo = std::min(lo, s.begin);
-        hi = std::max(hi, s.end);
+    bool reuseExpanded = false;
+    if (existingExpandedPatch->proofRootMacroId == m.id) {
+      if (existingExpandedPatch->proofKind ==
+              MacroPatchProofKind::CounterLiteral &&
+          m.name == "__COUNTER__") {
+        reuseExpanded = true;
+      } else if (existingExpandedPatch->proofKind ==
+                 MacroPatchProofKind::WholeCoverFallback) {
+        wholeCoverPlan = ComputeWholeCoverPlan(m);
+        if (wholeCoverPlan)
+          reuseExpanded = WholeCoverPatchMatchesPlan(*existingExpandedPatch,
+                                                     *wholeCoverPlan, m.id);
       }
     }
-    if (lo != std::numeric_limits<uint64_t>::max() && lo < hi) {
-      covLoA = lo;
-      covHiA = hi;
+    if (reuseExpanded) {
+      trace("macro",
+            "expanded patch reused after preservation attempts failed inv id={0}",
+            m.id);
+      return *existingExpandedPatch;
     }
   }
 
-  if (covLoA >= covHiA)
+  if (!wholeCoverPlan)
+    wholeCoverPlan = ComputeWholeCoverPlan(m);
+  if (!wholeCoverPlan)
     return std::nullopt;
 
-  auto bEnv = MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
-      covLoA, covHiA);
-  if (!bEnv)
-    return std::nullopt;
-
-  size_t bTokStart = bEnv->first;
-  size_t bTokEnd = bEnv->second;
-  if (bTokEnd <= bTokStart)
-    return std::nullopt;
-
-  // Tighten the B-side envelope to the exact A-side cover boundary tokens when
-  // possible.
-  //
-  // The A→B alignment/byte-envelope mapping can legitimately drop or shift
-  // punctuation tokens (e.g. the leading '(' in an assert() expansion) because
-  // they are extremely common and thus low-information in the diff alignment.
-  // When that happens, whole-cover replacement can produce syntactically wrong
-  // output (missing parens) or double tokens (e.g. ';;').
-  //
-  // We can correct this deterministically by re-aligning the first/last B
-  // tokens to the first/last A tokens of the macro cover, but only when the
-  // expected token exists as an immediately-adjacent neighbor in B. This avoids
-  // any heuristic scanning.
-  if (covLoA < aToks_.size() && bTokStart < bToks_.size()) {
-    StringRef want = aToks_[static_cast<size_t>(covLoA)].spelling;
-    if (!want.empty()) {
-      if (bToks_[bTokStart].spelling != want && bTokStart > 0 &&
-          bToks_[bTokStart - 1].spelling == want) {
-        bTokStart--;
-      }
-    }
-  }
-
-  if (covHiA > 0 && (covHiA - 1) < aToks_.size() && bTokEnd > 0 &&
-      (bTokEnd - 1) < bToks_.size()) {
-    StringRef want = aToks_[static_cast<size_t>(covHiA - 1)].spelling;
-    if (!want.empty()) {
-      if (bToks_[bTokEnd - 1].spelling != want && bTokEnd >= 2 &&
-          bToks_[bTokEnd - 2].spelling == want) {
-        bTokEnd--;
-      }
-    }
-  }
-
-  // Final check to ensure realignment didn't invert or empty the range.
-  if (bTokEnd <= bTokStart)
-    return std::nullopt;
-  std::string clipped = SliceBSourceClippedAgainstClaims(bTokStart, bTokEnd);
   {
-    MacroPatch patch{*invStart, *invEnd, StringRef(clipped).trim().str(), m.id};
+    MacroPatch patch{*invStart, *invEnd, wholeCoverPlan->clippedText, m.id};
     patch.proofKind = MacroPatchProofKind::WholeCoverFallback;
     patch.proofValidated = false;
     patch.structurePreserving = false;
     patch.proofRootMacroId = m.id;
+    patch.wholeCoverUsedBodyRange = wholeCoverPlan->usedBodyRange;
+    patch.wholeCoverSelfContained = wholeCoverPlan->selfContained;
+    patch.wholeCoverNestedSelfContained = wholeCoverPlan->nestedSelfContained;
+    patch.wholeCoverAdjustedLeft = wholeCoverPlan->adjustedLeft;
+    patch.wholeCoverAdjustedRight = wholeCoverPlan->adjustedRight;
+    patch.wholeCoverClaimsClipped = wholeCoverPlan->claimsClipped;
+    patch.wholeCoverALo = wholeCoverPlan->covLoA;
+    patch.wholeCoverAHi = wholeCoverPlan->covHiA;
+    patch.wholeCoverBRawLo = wholeCoverPlan->rawBTokStart;
+    patch.wholeCoverBRawHi = wholeCoverPlan->rawBTokEnd;
+    patch.wholeCoverBAdjLo = wholeCoverPlan->bTokStart;
+    patch.wholeCoverBAdjHi = wholeCoverPlan->bTokEnd;
     return patch;
   }
 }
