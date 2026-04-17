@@ -2447,7 +2447,56 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
             CurIt.CalleeOrigin.Kind = MCO_CallerParam;
             CurIt.CalleeOrigin.CallerParamIndices.push_back(*ArgIdx);
           } else if (SM.isMacroArgExpansion(NameLoc)) {
-            CurIt.CalleeOrigin.Kind = MCO_Opaque;
+            // Some nested higher-order callees are themselves spelled from a
+            // caller formal, but the macro-argument expansion location does not
+            // map directly back to the caller's invocation text. In those
+            // cases, probe a small set of immediate provenance-preserving
+            // alternate location forms. Accept the recovery only when every
+            // successful probe agrees on the same caller slot; otherwise remain
+            // conservative and classify the callee origin as opaque.
+            auto TryRecoverCallerParamFromImmediateForms =
+                [&](SourceLocation BaseLoc) -> std::optional<uint32_t> {
+              SmallVector<SourceLocation, 4> ProbeLocs;
+              llvm::SmallDenseSet<unsigned, 8> SeenLocs;
+
+              auto AddProbeLoc = [&](SourceLocation L) {
+                if (!L.isValid())
+                  return;
+                const unsigned RawLoc = L.getRawEncoding();
+                if (SeenLocs.insert(RawLoc).second)
+                  ProbeLocs.push_back(L);
+              };
+
+              AddProbeLoc(BaseLoc);
+              AddProbeLoc(SM.getImmediateSpellingLoc(BaseLoc));
+              AddProbeLoc(SM.getImmediateMacroCallerLoc(BaseLoc));
+              if (auto ER = SM.getImmediateExpansionRange(BaseLoc); ER.isValid())
+                AddProbeLoc(ER.getBegin());
+
+              std::optional<uint32_t> RecoveredArgIdx;
+              for (SourceLocation ProbeLoc : ProbeLocs) {
+                auto ProbeArgIdx = argIndexForSpellingLoc(*CallerIt, ProbeLoc,
+                                                          SM, Lang,
+                                                          EmitAbsPaths);
+                if (!ProbeArgIdx)
+                  continue;
+                if (!RecoveredArgIdx) {
+                  RecoveredArgIdx = *ProbeArgIdx;
+                  continue;
+                }
+                if (*RecoveredArgIdx != *ProbeArgIdx)
+                  return std::nullopt;
+              }
+              return RecoveredArgIdx;
+            };
+
+            if (auto ArgIdx =
+                    TryRecoverCallerParamFromImmediateForms(NameLoc)) {
+              CurIt.CalleeOrigin.Kind = MCO_CallerParam;
+              CurIt.CalleeOrigin.CallerParamIndices.push_back(*ArgIdx);
+            } else {
+              CurIt.CalleeOrigin.Kind = MCO_Opaque;
+            }
           }
         }
       } else if (NameLoc.isMacroID()) {
