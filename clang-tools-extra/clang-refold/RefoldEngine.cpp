@@ -1014,16 +1014,9 @@ std::string RefoldEngine::RefoldOnce() {
     }
   }
 
-
-  // Cache the token-level hunks for boundary-aware envelope mapping.
+  // Cache the token-level hunks before any owner-aware splitting so A->B
+  // envelope mapping can trim boundary insertions consistently.
   abTokHunks_ = hunks;
-
-  // Build provenance for token-level pure insertions (B-only hunks) and
-  // pre-claim standalone insertions before macro patching so whole-cover
-  // replacements can deterministically avoid double-emitting insertion
-  // payloads.
-  BuildBInsertionProvenance(hunks);
-  PreclaimStandaloneInsertions(tuPath, hunks);
 
   // Build *raw-text* byte hunks once; this enables deterministic mapping of PP
   // byte spans from A->B, without inheriting any ambiguity from token-level
@@ -1033,6 +1026,148 @@ std::string RefoldEngine::RefoldOnce() {
   // place the insertion at an arbitrary stable point, corrupting subsequent
   // A->B byte span mapping.
   abByteHunks_ = BuildByteHunksFromRawText();
+
+  // Split replace hunks when an exact interior owner boundary can be proven.
+  //
+  // This handles edits such as a plain TU token replacement immediately
+  // adjacent to a macro-owned replacement in the same diff hunk. The split is
+  // accepted only when:
+  //   * the whole hunk is not already realizable as a single macro patch,
+  //   * an interior A-token boundary maps to an exact partition of the hunk's
+  //     B-token interval, and
+  //   * the left/right subranges are independently realizable by different
+  //     owners (for example TU on one side and a macro on the other).
+  //
+  // These conditions make the split structural rather than heuristic: the
+  // owner boundary exists in the provenance, and the A->B mapping proves the
+  // corresponding B boundary exactly.
+  if (hunks.size() > 0) {
+    enum class HunkRealizerKind {
+      Unknown,
+      TU,
+      Include,
+      Macro,
+    };
+
+    struct HunkRealizer {
+      HunkRealizerKind kind = HunkRealizerKind::Unknown;
+      uint64_t id = 0;
+
+      bool operator==(const HunkRealizer &other) const {
+        return kind == other.kind && id == other.id;
+      }
+
+      bool operator!=(const HunkRealizer &other) const {
+        return !(*this == other);
+      }
+    };
+
+    auto classifyHunkRealizer = [&](uint64_t aStart,
+                                    uint64_t aEnd) -> HunkRealizer {
+      if (aEnd <= aStart)
+        return {};
+
+      diffutils::Hunk probe{aStart, aEnd, 0, 0};
+      Owner probeOwner = ClassifyOwnerWithSegments(tuPath, probe);
+      if (auto *m =
+              SmallestCoveringPatchableMacro(aStart, aEnd, probeOwner.includeId)) {
+        if (m->invB && m->invE)
+          return {HunkRealizerKind::Macro, m->id};
+      }
+
+      if (probeOwner.kind == OwnerKind::Include && probeOwner.includeId)
+        return {HunkRealizerKind::Include, *probeOwner.includeId};
+
+      if (HunkMapsToTU(aStart, aEnd, tuPath))
+        return {HunkRealizerKind::TU, 0};
+
+      return {};
+    };
+
+    size_t ownerSplitCount = 0;
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      std::vector<diffutils::Hunk> splitHunks;
+      splitHunks.reserve(hunks.size());
+
+      for (const auto &h : hunks) {
+        if (!h.isReplace() || h.aEnd - h.aStart < 2 || h.bEnd - h.bStart < 2) {
+          splitHunks.push_back(h);
+          continue;
+        }
+
+        Owner wholeOwner = ClassifyOwnerWithSegments(tuPath, h);
+        if (auto *wholeMacro =
+                SmallestCoveringPatchableMacro(h.aStart, h.aEnd,
+                                               wholeOwner.includeId)) {
+          if (wholeMacro->invB && wholeMacro->invE) {
+            splitHunks.push_back(h);
+            continue;
+          }
+        }
+
+        bool splitApplied = false;
+        for (uint64_t split = h.aStart + 1; split < h.aEnd; ++split) {
+          auto leftEnv =
+              MapATokRangeAToBTokenEnvelopeTrimEdgeInsertions(h.aStart, split);
+          auto rightEnv =
+              MapATokRangeAToBTokenEnvelopeTrimEdgeInsertions(split, h.aEnd);
+          if (!leftEnv || !rightEnv)
+            continue;
+
+          if (leftEnv->first != static_cast<size_t>(h.bStart) ||
+              rightEnv->second != static_cast<size_t>(h.bEnd) ||
+              leftEnv->second != rightEnv->first)
+            continue;
+
+          HunkRealizer leftRealizer = classifyHunkRealizer(h.aStart, split);
+          HunkRealizer rightRealizer = classifyHunkRealizer(split, h.aEnd);
+          if (leftRealizer.kind == HunkRealizerKind::Unknown ||
+              rightRealizer.kind == HunkRealizerKind::Unknown ||
+              leftRealizer == rightRealizer)
+            continue;
+
+          trace("hunks/norm",
+                "split mixed-owner replace hunk A=[{0},{1}) B=[{2},{3}) at A={4} / B={5}",
+                h.aStart, h.aEnd, h.bStart, h.bEnd, split, leftEnv->second);
+          splitHunks.push_back(diffutils::Hunk{h.aStart, split, h.bStart,
+                                               static_cast<uint64_t>(leftEnv->second)});
+          splitHunks.push_back(diffutils::Hunk{split, h.aEnd,
+                                               static_cast<uint64_t>(rightEnv->first),
+                                               h.bEnd});
+          ++ownerSplitCount;
+          splitApplied = true;
+          changed = true;
+          break;
+        }
+
+        if (!splitApplied)
+          splitHunks.push_back(h);
+      }
+
+      if (changed) {
+        hunks = std::move(splitHunks);
+        abTokHunks_ = hunks;
+      }
+    }
+
+    if (ownerSplitCount) {
+      trace("hunks/norm",
+            "split mixed-owner replace hunks: count={0} finalHunks={1}",
+            ownerSplitCount, hunks.size());
+    }
+  }
+
+  // Refresh the token-level hunk cache after normalization.
+  abTokHunks_ = hunks;
+
+  // Build provenance for token-level pure insertions (B-only hunks) and
+  // pre-claim standalone insertions before macro patching so whole-cover
+  // replacements can deterministically avoid double-emitting insertion
+  // payloads.
+  BuildBInsertionProvenance(hunks);
+  PreclaimStandaloneInsertions(tuPath, hunks);
 
   // DIAGNOSTICS: Output each hunk, when in debug mode, and also perform some
   // input sanitization.
