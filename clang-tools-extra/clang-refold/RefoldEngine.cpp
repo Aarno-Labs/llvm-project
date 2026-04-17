@@ -8253,97 +8253,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     return idx < inv.defParams.size() && inv.defParams[idx].variadic;
   };
 
-  auto hasTopLevelCommaInRefoldText = [&](StringRef s) -> bool {
-    int paren = 0, bracket = 0, brace = 0;
-    bool inStr = false, inChr = false, esc = false;
-    for (size_t i = 0; i < s.size(); ++i) {
-      char c = s[i];
-
-      if (inStr) {
-        if (esc) {
-          esc = false;
-          continue;
-        }
-        if (c == '\\') {
-          esc = true;
-          continue;
-        }
-        if (c == '"')
-          inStr = false;
-        continue;
-      }
-      if (inChr) {
-        if (esc) {
-          esc = false;
-          continue;
-        }
-        if (c == '\\') {
-          esc = true;
-          continue;
-        }
-        if (c == '\'')
-          inChr = false;
-        continue;
-      }
-
-      if (c == '/' && i + 1 < s.size()) {
-        if (s[i + 1] == '/') {
-          i += 2;
-          while (i < s.size() && s[i] != '\n')
-            ++i;
-          continue;
-        }
-        if (s[i + 1] == '*') {
-          i += 2;
-          while (i + 1 < s.size() && !(s[i] == '*' && s[i + 1] == '/'))
-            ++i;
-          if (i + 1 < s.size())
-            ++i;
-          continue;
-        }
-      }
-
-      if (c == '"') {
-        inStr = true;
-        continue;
-      }
-      if (c == '\'') {
-        inChr = true;
-        continue;
-      }
-      switch (c) {
-      case '(':
-        ++paren;
-        break;
-      case ')':
-        if (paren > 0)
-          --paren;
-        break;
-      case '[':
-        ++bracket;
-        break;
-      case ']':
-        if (bracket > 0)
-          --bracket;
-        break;
-      case '{':
-        ++brace;
-        break;
-      case '}':
-        if (brace > 0)
-          --brace;
-        break;
-      case ',':
-        if (paren == 0 && bracket == 0 && brace == 0)
-          return true;
-        break;
-      default:
-        break;
-      }
-    }
-    return false;
-  };
-
   // Important arbitration rule: a direct root args-only patch is not returned
   // immediately. We let the DAG-chained certificate path run afterwards and
   // prefer it when it can produce a unique validated callsite rewrite, because
@@ -14592,6 +14501,35 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                oldShape->argCount == newShape->argCount;
       };
 
+      std::function<unsigned(StringRef, StringRef)> countPreservedInvocationHeads =
+          [&](StringRef oldText, StringRef newText) -> unsigned {
+        auto oldShape = getInvocationHeadShape(oldText);
+        auto newShape = getInvocationHeadShape(newText);
+        if (!oldShape || !newShape)
+          return 0;
+        if (oldShape->callee != newShape->callee ||
+            oldShape->argCount != newShape->argCount)
+          return 0;
+
+        auto oldArgRangesOpt = ParseMacroInvocationArgContentRanges(oldText.trim());
+        auto newArgRangesOpt = ParseMacroInvocationArgContentRanges(newText.trim());
+        if (!oldArgRangesOpt || !newArgRangesOpt ||
+            oldArgRangesOpt->size() != newArgRangesOpt->size())
+          return 0;
+
+        unsigned score = 1;
+        for (size_t i = 0; i < oldArgRangesOpt->size(); ++i) {
+          const auto &oldArgRange = (*oldArgRangesOpt)[i];
+          const auto &newArgRange = (*newArgRangesOpt)[i];
+          score += countPreservedInvocationHeads(
+              oldText.trim().slice((size_t)oldArgRange.first,
+                                   (size_t)oldArgRange.second),
+              newText.trim().slice((size_t)newArgRange.first,
+                                   (size_t)newArgRange.second));
+        }
+        return score;
+      };
+
       auto choosePreferredStructuredDagCandidate =
           [&](const DagCandidateValidationMetadata &existingValidation,
               const DagCandidateValidationMetadata &candidateValidation)
@@ -14622,6 +14560,20 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               preservesRootInvocationHead(existingRewrite);
           const bool candidatePreserves =
               preservesRootInvocationHead(candidateRewrite);
+          const unsigned existingStructureScore =
+              countPreservedInvocationHeads(existingRewrite.oldText,
+                                            existingRewrite.newText);
+          const unsigned candidateStructureScore =
+              countPreservedInvocationHeads(candidateRewrite.oldText,
+                                            candidateRewrite.newText);
+
+          if (existingStructureScore != candidateStructureScore) {
+            if (existingStructureScore > candidateStructureScore)
+              existingPreferred = true;
+            if (candidateStructureScore > existingStructureScore)
+              candidatePreferred = true;
+            continue;
+          }
 
           if (existingPreserves == candidatePreserves) {
             if (StringRef(existingRewrite.newText).trim() !=
