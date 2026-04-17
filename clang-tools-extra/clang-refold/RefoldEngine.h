@@ -649,6 +649,13 @@ private:
     uint64_t aStart, aEnd;   // A-token interval inside include expansion
     uint64_t bStart, bEnd;   // B-token interval
 
+    /// When present, this insertion was classified as belonging to a specific
+    /// selected conditional arm inside the owning include. Include application
+    /// must preserve that ownership and never anchor the insertion outside the
+    /// certified arm body.
+    bool ownerHasCondArmCert = false;
+    uint64_t ownerCondArmIdCert = 0;
+
     std::string ToString() const {
       // 1. Determine the path (Using StringRef to avoid extra copies)
       StringRef path;
@@ -671,9 +678,12 @@ private:
 
       return formatv(
                  "IncludePatch{{incId={0}, path={1}, A=[{2},{3}), B=[{4},{5}), "
-                 "insert='{6}{7}'}",
-                 include->id, path, aStart, aEnd, bStart, bEnd, escapedPreview,
-                 (truncated ? "..." : ""))
+                 "condArm={6}, insert='{7}{8}'}",
+                 include->id, path, aStart, aEnd, bStart, bEnd,
+                 ownerHasCondArmCert
+                     ? std::to_string(ownerCondArmIdCert)
+                     : std::string("(none)"),
+                 escapedPreview, (truncated ? "..." : ""))
           .str();
     }
   };
