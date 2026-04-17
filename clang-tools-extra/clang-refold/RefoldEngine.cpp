@@ -11989,9 +11989,20 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               return true;
             };
 
+        struct ConcreteExemplarReplayLiftResult {
+          enum class State {
+            None,
+            Unique,
+            Ambiguous,
+          };
+
+          State state = State::None;
+          std::optional<StructuredLiftCertificate> lift;
+        };
+
         auto tryBuildConcreteExemplarReplayLift =
             [&](uint32_t siblingFormal, StringRef siblingOldTrim)
-            -> std::optional<StructuredLiftCertificate> {
+            -> ConcreteExemplarReplayLiftResult {
           SmallVector<std::string, 4> parentActuals;
           for (uint32_t parentFormal = 0; parentFormal < parent.invArgRanges.size();
                ++parentFormal) {
@@ -12003,7 +12014,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             }
           }
 
-          std::optional<StructuredLiftCertificate> uniqueProjectedLift;
+          ConcreteExemplarReplayLiftResult result;
           for (const auto &exemplar : model_.GetMacroInvocations()) {
             if (exemplar.id == matchedSibling->id || exemplar.name != matchedSibling->name ||
                 siblingFormal >= exemplar.invArgRanges.size())
@@ -12056,17 +12067,22 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                 projectedLift.nextInv != &parent)
               continue;
 
-            if (uniqueProjectedLift) {
-              if (!sameNextFormals(uniqueProjectedLift->nextFormals,
-                                   projectedLift.nextFormals))
-                return std::nullopt;
+            if (result.lift) {
+              if (!sameNextFormals(result.lift->nextFormals,
+                                   projectedLift.nextFormals)) {
+                result.state = ConcreteExemplarReplayLiftResult::State::Ambiguous;
+                result.lift.reset();
+                return result;
+              }
+              result.state = ConcreteExemplarReplayLiftResult::State::Unique;
               continue;
             }
 
-            uniqueProjectedLift = std::move(projectedLift);
+            result.state = ConcreteExemplarReplayLiftResult::State::Unique;
+            result.lift = std::move(projectedLift);
           }
 
-          return uniqueProjectedLift;
+          return result;
         };
 
         for (uint32_t siblingFormal = 0;
@@ -12128,10 +12144,23 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           };
 
           if (!siblingLiftHasCertifiedParentFormalEvidence()) {
-            if (auto projectedLift =
-                    tryBuildConcreteExemplarReplayLift(siblingFormal,
-                                                       siblingOldTrim)) {
-              siblingLift = std::move(*projectedLift);
+            auto replayResult =
+                tryBuildConcreteExemplarReplayLift(siblingFormal, siblingOldTrim);
+            if (replayResult.state ==
+                    ConcreteExemplarReplayLiftResult::State::Unique &&
+                replayResult.lift) {
+              siblingLift = std::move(*replayResult.lift);
+            } else if (replayResult.state ==
+                           ConcreteExemplarReplayLiftResult::State::None &&
+                       siblingLift.parentCert.kind !=
+                           InvocationRewriteCertificateKind::Invalid &&
+                       siblingLift.parentInvocationFailure ==
+                           InvocationRewriteFailure::None) {
+              trace("macro/dag",
+                    "DAG per-hop exact sibling reroot accepted without concrete replay: sibling id={0} name={1} siblingFormal={2} parentSyntax='{3}' nextFormals={4}",
+                    matchedSibling->id, matchedSibling->name, siblingFormal,
+                    siblingLift.parentCert.rewrittenInvocationSyntax,
+                    formatFormalTextPairMap(siblingLift.nextFormals));
             } else {
               trace("macro/dag",
                     "DAG per-hop exact sibling reroot rejected: sibling id={0} name={1} siblingFormal={2} reason=uncertifiedParentFormalEvidence nextFormals={3}",
