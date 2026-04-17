@@ -16911,12 +16911,22 @@ void RefoldEngine::MaterializeIncludeExpansion(
         edits.push_back(
             TextEdit{siteStart, siteEnd, std::move(wrapped), std::nullopt});
       } else {
-        // Defensive fallback: if site is somehow unmapped, skip replacing.
-        // (This keeps behavior deterministic instead of crashing.)
+        // Unsupported structural child replacement: the parent include has
+        // descendant work, but the child directive site is degenerate in the
+        // includer byte space. Escalate so tier-2 can inline the touched
+        // include subtree from B rather than silently dropping the child
+        // edits.
         debug("include/mat",
               "inc#{0} child#{1} has degenerate site [start={2},end={3}]; "
-              "skipping TextEdit",
+              "requesting escalation",
               inc->id, child->id, siteStart, siteEnd);
+        if (!ForceInlineTouchedIncludesFromB())
+          RequestEscalation(
+              "include/mat",
+              llvm::formatv("degenerate child replace site for parent inc#{0} "
+                            "child#{1} site=[{2},{3})",
+                            inc->id, child->id, siteStart, siteEnd)
+                  .str());
       }
     }
   }
@@ -17187,6 +17197,13 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                 "startByte={3}",
                 file, idx, anchorPP, startByte);
           if (!startByte) {
+            if (!ForceInlineTouchedIncludesFromB())
+              RequestEscalation(
+                  "include/apply",
+                  llvm::formatv("INSERT: failed to map left-neighbor "
+                                "anchorPP={0} in file {1}",
+                                anchorPP ? *anchorPP : 0ULL, file)
+                      .str());
             continue;
           }
         } else if (decl) {
