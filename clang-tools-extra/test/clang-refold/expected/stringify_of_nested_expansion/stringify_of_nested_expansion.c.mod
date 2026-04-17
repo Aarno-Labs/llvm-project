@@ -10,7 +10,7 @@
 #define NAME foo
 #define SUF  bar
 
-const char *s100 = STR(foobaz); // "foobar"
+const char *s100 = STR(XCAT(NAME,baz)); // "foobar"
 
 int main(void) {
   return (s100[0] == 'f' && s100[3] == 'b') ? 0 : 1;

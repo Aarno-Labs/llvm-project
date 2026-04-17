@@ -12,5 +12,5 @@ int foo_bar(void) { return 9; } // different symbol
 
 int main(void) {
   // XCAT(A,B) => CAT(foo_,bar) => foobar
-  return foobar() == 7 ? 0 : 1;
+  return XCAT(foo,B)() == 7 ? 0 : 1;
 }
