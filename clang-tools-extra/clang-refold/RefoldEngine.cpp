@@ -1450,6 +1450,8 @@ std::string RefoldEngine::RefoldOnce() {
         auto [it, _] =
             perInclude.try_emplace(parentBoundaryInc->id, parentBoundaryInc);
         IncludePatch patch = BuildIncludeInsertionPatch(*parentBoundaryInc, h);
+        patch.ownerHasCondArmCert = owner.condArmId.has_value();
+        patch.ownerCondArmIdCert = owner.condArmId.value_or(0);
         it->second.Add(std::move(patch));
         debug("classify",
               "#{0} -> INCLUDE(parent-boundary) inc={1} ({2}) patch={3}", i,
@@ -1466,6 +1468,8 @@ std::string RefoldEngine::RefoldOnce() {
           // NOTE: `inc` cannot be null if owner has an `includeId`
           auto [it, _] = perInclude.try_emplace(inc->id, inc);
           IncludePatch patch = BuildIncludeInsertionPatch(*inc, h);
+          patch.ownerHasCondArmCert = owner.condArmId.has_value();
+          patch.ownerCondArmIdCert = owner.condArmId.value_or(0);
           it->second.Add(std::move(patch));
           debug("classify",
                 "#{0} → INCLUDE(before first cond) include={1} patch={2}", i,
@@ -1493,6 +1497,8 @@ std::string RefoldEngine::RefoldOnce() {
 
       auto [it, _] = perInclude.try_emplace(inc->id, inc);
       IncludePatch patch = BuildIncludeInsertionPatch(*inc, h);
+      patch.ownerHasCondArmCert = owner.condArmId.has_value();
+      patch.ownerCondArmIdCert = owner.condArmId.value_or(0);
       debug("include/patch", "#{0} INC {1} patch={2}", i, h, patch);
       it->second.Add(std::move(patch));
       continue;
@@ -18031,6 +18037,13 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       // INSERT: interpret A-position as "before the next token" in this header.
       const uint64_t pos = p.aStart;
       std::optional<uint64_t> anchorPP;
+      auto anchorMatchesCondArmCert = [&](uint64_t anchorByte) -> bool {
+        if (!p.ownerHasCondArmCert)
+          return true;
+        auto armRef = model_.FindArmRefForByte(file, ie.include->id, anchorByte);
+        return armRef && armRef->arm &&
+               armRef->arm->id == p.ownerCondArmIdCert;
+      };
 
       // If this INSERT gap is exactly the begin of the currently selected
       // conditional arm in this header, treat it as the *boundary before* the
@@ -18060,22 +18073,30 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
             leftArmRef->arm->id == rightArmRef->arm->id)
           return std::nullopt;
 
+        const bool explicitArmOwned =
+            p.ownerHasCondArmCert &&
+            p.ownerCondArmIdCert == rightArmRef->arm->id;
+        if (explicitArmOwned)
+          return std::nullopt;
+
         return std::clamp<uint64_t>(rightArmRef->group->groupB, 0ULL, fileLen);
       };
 
       if (const std::optional<uint64_t> insertByte =
               selectedArmBeginBoundaryByte()) {
-        std::string text =
-            PadAtBoundaries(headerText, static_cast<size_t>(*insertByte),
-                            static_cast<size_t>(*insertByte), p.insertBytes,
-                            /* allowLeft */ true, /* allowRight */ true);
-        edits.push_back(MakeTextEditWithResyncOrPending(
-            headerText, *insertByte, *insertByte, text, file));
+        if (*insertByte <= fileLen && anchorMatchesCondArmCert(*insertByte)) {
+          std::string text =
+              PadAtBoundaries(headerText, static_cast<size_t>(*insertByte),
+                              static_cast<size_t>(*insertByte), p.insertBytes,
+                              /* allowLeft */ true, /* allowRight */ true);
+          edits.push_back(MakeTextEditWithResyncOrPending(
+              headerText, *insertByte, *insertByte, text, file));
 
-        trace("include/apply",
-              "file={0} patch[{1}] INSERT: anchored at selected-arm boundary groupBegin={2}",
-              file, idx, insertByte);
-        continue;
+          trace("include/apply",
+                "file={0} patch[{1}] INSERT: anchored at selected-arm boundary groupBegin={2}",
+                file, idx, insertByte);
+          continue;
+        }
       }
 
       // First, if this INSERT PP gap lies on a boundary between this header
@@ -18086,7 +18107,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       // back to this header).
       if (const std::optional<uint64_t> insertByte =
               ComputeChildBoundaryInsertByte(p, file)) {
-        if (*insertByte <= fileLen) {
+        if (*insertByte <= fileLen && anchorMatchesCondArmCert(*insertByte)) {
           std::string text =
               PadAtBoundaries(headerText, static_cast<size_t>(*insertByte),
                               static_cast<size_t>(*insertByte), p.insertBytes,
@@ -18128,8 +18149,14 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                     .str());
           continue;
         }
-      } else {
-        // 2) No right neighbor; fall back to the last left neighbor.
+        if (!anchorMatchesCondArmCert(*startByte))
+          startByte.reset();
+      }
+
+      if (!startByte) {
+        anchorPP.reset();
+
+        // 2) No usable right neighbor; fall back to the last left neighbor.
         if (pos > ppLo && ppHi > ppLo) {
           for (uint64_t pp = std::min(pos - 1, ppHi - 1);; --pp) {
             auto it = tokmapByPP.find(pp);
@@ -18158,6 +18185,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                       .str());
             continue;
           }
+          if (!anchorMatchesCondArmCert(*startByte))
+            startByte.reset();
         } else if (decl) {
           // 3) No PP neighbor at all in this header, but we have an owning
           // decl: anchor at the end of its header span.
@@ -18166,41 +18195,46 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
               "include/apply",
               "file={0} patch[{1}] INSERT: no neighbors; anchor at declEnd={2}",
               file, idx, startByte);
-        } else {
-          // 4) Fallback: use child '#include' sites inside this header as
-          // synthetic anchors.
-          const std::optional<uint64_t> insertByte =
-              ComputeChildBoundaryInsertByte(p, file);
-          debug("include/apply.", "inserted byte {0}", insertByte);
-          if (insertByte && *insertByte <= fileLen) {
-            std::string text =
-                PadAtBoundaries(headerText, static_cast<size_t>(*insertByte),
-                                static_cast<size_t>(*insertByte), p.insertBytes,
-                                /* allowLeft */ true, /* allowRight */ true);
-            edits.push_back(MakeTextEditWithResyncOrPending(
-                headerText, *insertByte, *insertByte, text, file));
-
-            debug("include/apply.",
-                  "file={0} patch[{1}] INSERT: anchored via child boundary at "
-                  "byte={2}",
-                  file, idx, insertByte);
-          } else {
-            // Preserve old behavior if we still can't place it
-            // deterministically.
-            debug("include/apply.",
-                  "file={0} patch[{1}] INSERT: no neighbors, no decl, no child "
-                  "boundary; SKIP",
-                  file, idx);
-            if (!ForceInlineTouchedIncludesFromB())
-              RequestEscalation(
-                  "include/apply",
-                  llvm::formatv("INSERT: cannot anchor include patch in file "
-                                "{0} (no neighbors/decl/child boundary)",
-                                file)
-                      .str());
-          }
-          continue;
+          if (!anchorMatchesCondArmCert(*startByte))
+            startByte.reset();
         }
+      }
+
+      if (!startByte) {
+        // 4) Fallback: use child '#include' sites inside this header as
+        // synthetic anchors.
+        const std::optional<uint64_t> insertByte =
+            ComputeChildBoundaryInsertByte(p, file);
+        debug("include/apply.", "inserted byte {0}", insertByte);
+        if (insertByte && *insertByte <= fileLen &&
+            anchorMatchesCondArmCert(*insertByte)) {
+          std::string text =
+              PadAtBoundaries(headerText, static_cast<size_t>(*insertByte),
+                              static_cast<size_t>(*insertByte), p.insertBytes,
+                              /* allowLeft */ true, /* allowRight */ true);
+          edits.push_back(MakeTextEditWithResyncOrPending(
+              headerText, *insertByte, *insertByte, text, file));
+
+          debug("include/apply.",
+                "file={0} patch[{1}] INSERT: anchored via child boundary at "
+                "byte={2}",
+                file, idx, insertByte);
+        } else {
+          // Preserve old behavior if we still can't place it
+          // deterministically.
+          debug("include/apply.",
+                "file={0} patch[{1}] INSERT: no neighbors, no decl, no child "
+                "boundary; SKIP",
+                file, idx);
+          if (!ForceInlineTouchedIncludesFromB())
+            RequestEscalation(
+                "include/apply",
+                llvm::formatv("INSERT: cannot anchor include patch in file "
+                              "{0} (no neighbors/decl/child boundary)",
+                              file)
+                    .str());
+        }
+        continue;
       }
 
       endByte = startByte;
