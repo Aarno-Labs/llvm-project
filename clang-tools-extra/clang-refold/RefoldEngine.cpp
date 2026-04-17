@@ -11972,6 +11972,103 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         std::optional<StructuredLiftCertificate> uniqueLift;
         std::optional<uint32_t> uniqueSiblingFormal;
         std::string uniqueSiblingOld;
+
+        auto sameNextFormals =
+            [&](const DenseMap<uint32_t, FormalTextPair> &lhs,
+                const DenseMap<uint32_t, FormalTextPair> &rhs) {
+              if (lhs.size() != rhs.size())
+                return false;
+              for (const auto &KV : lhs) {
+                auto it = rhs.find(KV.first);
+                if (it == rhs.end())
+                  return false;
+                if (it->second.oldText != KV.second.oldText ||
+                    it->second.newText != KV.second.newText)
+                  return false;
+              }
+              return true;
+            };
+
+        auto tryBuildConcreteExemplarReplayLift =
+            [&](uint32_t siblingFormal, StringRef siblingOldTrim)
+            -> std::optional<StructuredLiftCertificate> {
+          SmallVector<std::string, 4> parentActuals;
+          for (uint32_t parentFormal = 0; parentFormal < parent.invArgRanges.size();
+               ++parentFormal) {
+            if (auto parentArg = getInvocationArgText(parent, parentFormal)) {
+              StringRef parentArgTrim = parentArg->trim();
+              if (!parentArgTrim.empty() &&
+                  !llvm::is_contained(parentActuals, parentArgTrim.str()))
+                parentActuals.push_back(parentArgTrim.str());
+            }
+          }
+
+          std::optional<StructuredLiftCertificate> uniqueProjectedLift;
+          for (const auto &exemplar : model_.GetMacroInvocations()) {
+            if (exemplar.id == matchedSibling->id || exemplar.name != matchedSibling->name ||
+                siblingFormal >= exemplar.invArgRanges.size())
+              continue;
+
+            auto exemplarOldArg = getInvocationArgText(exemplar, siblingFormal);
+            if (!exemplarOldArg)
+              continue;
+            StringRef exemplarOldTrim = exemplarOldArg->trim();
+            if (exemplarOldTrim.empty() ||
+                !llvm::is_contained(parentActuals, exemplarOldTrim.str()))
+              continue;
+
+            SmallVector<std::string, 4> projectedConcreteNews;
+            for (const auto &oldExpStr : expansionTextCandidates(exemplar, /*fromB=*/false)) {
+              StringRef projected = DeriveNewPasteSegmentFromSpellingReplacement(
+                  StringRef(oldExpStr).trim(), newTrim, exemplarOldTrim);
+              projected = projected.trim();
+              if (projected.empty() || projected == exemplarOldTrim)
+                continue;
+              if (!llvm::is_contained(projectedConcreteNews, projected.str()))
+                projectedConcreteNews.push_back(projected.str());
+            }
+            if (projectedConcreteNews.size() != 1)
+              continue;
+
+            const std::string &projectedConcreteNew = projectedConcreteNews.front();
+
+            DenseMap<uint32_t, FormalTextPair> exemplarFormals;
+            exemplarFormals[siblingFormal] =
+                FormalTextPair{exemplarOldTrim.str(), projectedConcreteNew};
+            auto exemplarInvCert = buildWrapperPlaceholderHopInvocationCertificate(
+                exemplar, exemplarFormals,
+                "DAG per-hop exact sibling reroot concrete exemplar");
+            if (exemplarInvCert.kind == InvocationRewriteCertificateKind::Invalid)
+              continue;
+
+            DenseMap<uint32_t, FormalTextPair> replayFormals;
+            replayFormals[siblingFormal] =
+                FormalTextPair{siblingOldTrim.str(), projectedConcreteNew};
+            auto replayInvCert = buildWrapperPlaceholderHopInvocationCertificate(
+                *matchedSibling, replayFormals,
+                "DAG per-hop exact sibling reroot concrete replay");
+            if (replayInvCert.kind == InvocationRewriteCertificateKind::Invalid)
+              continue;
+
+            auto projectedLift =
+                buildStructuredLiftCertificate(*matchedSibling, replayFormals);
+            if (projectedLift.kind != StructuredLiftCertificateKind::Unique ||
+                projectedLift.nextInv != &parent)
+              continue;
+
+            if (uniqueProjectedLift) {
+              if (!sameNextFormals(uniqueProjectedLift->nextFormals,
+                                   projectedLift.nextFormals))
+                return std::nullopt;
+              continue;
+            }
+
+            uniqueProjectedLift = std::move(projectedLift);
+          }
+
+          return uniqueProjectedLift;
+        };
+
         for (uint32_t siblingFormal = 0;
              siblingFormal < matchedSibling->invArgRanges.size();
              ++siblingFormal) {
@@ -12031,11 +12128,17 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           };
 
           if (!siblingLiftHasCertifiedParentFormalEvidence()) {
-            trace("macro/dag",
-                  "DAG per-hop exact sibling reroot rejected: sibling id={0} name={1} siblingFormal={2} reason=uncertifiedParentFormalEvidence nextFormals={3}",
-                  matchedSibling->id, matchedSibling->name, siblingFormal,
-                  formatFormalTextPairMap(siblingLift.nextFormals));
-            continue;
+            if (auto projectedLift =
+                    tryBuildConcreteExemplarReplayLift(siblingFormal,
+                                                       siblingOldTrim)) {
+              siblingLift = std::move(*projectedLift);
+            } else {
+              trace("macro/dag",
+                    "DAG per-hop exact sibling reroot rejected: sibling id={0} name={1} siblingFormal={2} reason=uncertifiedParentFormalEvidence nextFormals={3}",
+                    matchedSibling->id, matchedSibling->name, siblingFormal,
+                    formatFormalTextPairMap(siblingLift.nextFormals));
+              continue;
+            }
           }
 
           if (uniqueLift) {

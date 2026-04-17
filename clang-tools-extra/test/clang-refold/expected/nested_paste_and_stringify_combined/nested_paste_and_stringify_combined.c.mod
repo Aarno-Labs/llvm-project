@@ -12,7 +12,7 @@
 #define B mid_
 #define C suf
 
-const char *s115 = STR(pre_mid_sufx); // "pre_mid_suf"
+const char *s115 = STR(P3(A,B,sufx)); // "pre_mid_suf"
 
 int main(void) {
   return (s115[0] == 'p' && s115[4] == 'm') ? 0 : 1;
