@@ -250,8 +250,8 @@ static StringRef sliceTokenEnvelope(ArrayRef<size_t> tokOff, StringRef source,
 } // namespace
 
 clang::LangOptions RefoldEngine::MakeLexLangOptions(llvm::StringRef langName) {
+  DiagnosticOptions diagOpts;
   IntrusiveRefCntPtr<DiagnosticIDs> diagIDs(new DiagnosticIDs());
-  IntrusiveRefCntPtr<DiagnosticOptions> diagOpts(new DiagnosticOptions());
   auto *client = new IgnoringDiagConsumer();
   DiagnosticsEngine diags(diagIDs, diagOpts, client, /*ShouldOwnClient=*/true);
 
@@ -4389,7 +4389,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     }
   };
 
-  trace("macro/args", "  invArgRanges(%d)=%s", invArgRanges.size(),
+  trace("macro/args", "  invArgRanges({0})={1}", invArgRanges.size(),
         stringutils::rangesToStringWithSlices(baseInvText, invArgRanges));
 
   // Fast path for token-paste edits. A single pasted token can embed multiple

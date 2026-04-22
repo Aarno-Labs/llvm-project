@@ -157,8 +157,8 @@ void lexPPTokens(const std::string &bytes, std::vector<PPTok> &out,
   using namespace clang;
 
   // Diagnostics: heap-owning client to avoid double free on destruction.
+  DiagnosticOptions diagOpts;
   IntrusiveRefCntPtr<DiagnosticIDs> diagIDs(new DiagnosticIDs());
-  IntrusiveRefCntPtr<DiagnosticOptions> diagOpts(new DiagnosticOptions());
   auto *client = new IgnoringDiagConsumer(); // owned by Diags
   DiagnosticsEngine diags(diagIDs, diagOpts, client, /*ShouldOwnClient*/ true);
 
@@ -420,10 +420,13 @@ Expected<std::string> preprocessToBytes(StringRef inputPath, const PPCtx &ctx) {
   // Assemble a cc1-style argument list for in-process preprocessing.
   std::vector<std::string> args;
   args.reserve(ctx.argv.size() + 10);
-  args.push_back("-E");
-  args.push_back("-P");
+
+  bool hasE = false;
+  bool hasP = false;
+
   for (size_t i = 0; i < ctx.argv.size(); ++i) {
     StringRef a(ctx.argv[i]);
+
     // The recorded invocation may include refold-map or output flags used when
     // producing the refold map. Strip these so we can redirect output to our
     // temp file.
@@ -437,8 +440,21 @@ Expected<std::string> preprocessToBytes(StringRef inputPath, const PPCtx &ctx) {
       ++i; // skip value
       continue;
     }
+
+    if (a == "-E")
+      hasE = true;
+    else if (a == "-P")
+      hasP = true;
+
     args.push_back(ctx.argv[i]);
   }
+
+  // Force preprocess-only and suppress line markers, but do not duplicate flags
+  // that are already present in the recorded cc1 argv.
+  if (!hasP)
+    args.insert(args.begin(), "-P");
+  if (!hasE)
+    args.insert(args.begin(), "-E");
 
   // Ensure language is specified (important for non-.c suffixes like '.mod').
   bool hasX = false;
@@ -453,7 +469,7 @@ Expected<std::string> preprocessToBytes(StringRef inputPath, const PPCtx &ctx) {
     args.push_back(ctx.lang);
   }
 
-  // Force preprocess-only, suppress line markers, and set output.
+  // Set output and input path.
   args.push_back("-o");
   args.push_back(tmpPath.str().str());
   args.push_back(absInput.str().str());
@@ -463,25 +479,30 @@ Expected<std::string> preprocessToBytes(StringRef inputPath, const PPCtx &ctx) {
   for (const std::string &s : args)
     cargs.push_back(s.c_str());
 
-  // Build a compiler instance using the compiler args that were parsed from the
-  // refold map JSON file.
   clang::CompilerInstance ci;
-  ci.createDiagnostics();
+
+  // In Clang 21.x, getVirtualFileSystem() depends on an existing FileManager,
+  // so diagnostics must be created against an external VFS first.
+  auto vfs = llvm::vfs::getRealFileSystem();
+  ci.createDiagnostics(*vfs);
   if (!ci.hasDiagnostics()) {
     return createStringError(inconvertibleErrorCode(),
                              "failed to create diagnostics engine");
   }
 
-  auto invocation = std::make_shared<clang::CompilerInvocation>();
-  clang::CompilerInvocation::CreateFromArgs(
-      *invocation, ArrayRef<const char *>(cargs), ci.getDiagnostics());
+  if (!clang::CompilerInvocation::CreateFromArgs(
+          ci.getInvocation(), ArrayRef<const char *>(cargs),
+          ci.getDiagnostics())) {
+    return createStringError(inconvertibleErrorCode(),
+                             "failed to parse clang invocation");
+  }
 
   // Be explicit: '-P' should suppress line markers.
-  invocation->getPreprocessorOutputOpts().ShowLineMarkers = false;
-  invocation->getFileSystemOpts().WorkingDir = ctx.cwd;
+  ci.getPreprocessorOutputOpts().ShowLineMarkers = false;
+  ci.getFileSystemOpts().WorkingDir = ctx.cwd;
 
-  ci.setInvocation(invocation);
   ci.createFileManager();
+  ci.createSourceManager(ci.getFileManager());
 
   // Run clang's preprocessor.
   clang::PrintPreprocessedAction action;
@@ -490,8 +511,7 @@ Expected<std::string> preprocessToBytes(StringRef inputPath, const PPCtx &ctx) {
                              "clang preprocessing failed");
   }
 
-  // Read back in the temporary preprocessed output file that was created by
-  // clang.
+  // Read back the temporary preprocessed output file created by clang.
   std::string out;
   readFile(tmpPath, out);
   return out;

@@ -131,7 +131,8 @@ struct format_provider<T, std::enable_if_t<has_enum_to_string<T>::value>> {
 template <typename T>
 struct format_provider<
     llvm::cl::opt<T>,
-    std::enable_if_t<!llvm::detail::use_string_formatter<llvm::cl::opt<T>>::value>> {
+    std::enable_if_t<!llvm::support::detail::use_string_formatter<
+        llvm::cl::opt<T>>::value>> {
   static void format(const llvm::cl::opt<T> &val, llvm::raw_ostream &os,
                      StringRef style) {
     // We delegate to the provider for the underlying type T

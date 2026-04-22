@@ -1179,30 +1179,40 @@ void clang::DoPrintPreprocessedInput(Preprocessor &PP, raw_ostream *OS,
       Preprocessor &PP;
       SourceManager &SM;
       std::shared_ptr<RefoldMapBuilder> R;
+
       Recorder(Preprocessor &PP, std::shared_ptr<RefoldMapBuilder> R)
           : PP(PP), SM(PP.getSourceManager()), R(std::move(R)) {}
+
       void InclusionDirective(SourceLocation HashLoc, const Token &IncludeTok,
                               StringRef FileName, bool IsAngled,
                               CharSourceRange FilenameRange,
                               OptionalFileEntryRef File, StringRef SearchPath,
-                              StringRef RelativePath, const Module *Imported,
+                              StringRef RelativePath,
+                              const Module *SuggestedModule,
+                              bool ModuleImported,
                               SrcMgr::CharacteristicKind FileType) override {
-          R->onIncludeDirective(HashLoc, IncludeTok, FileName, IsAngled,
-            FilenameRange, File, SearchPath, RelativePath);
+        (void)SuggestedModule;
+        (void)ModuleImported;
+        (void)FileType;
+        R->onIncludeDirective(HashLoc, IncludeTok, FileName, IsAngled,
+                              FilenameRange, File, SearchPath, RelativePath);
       }
 
       void MacroDefined(const Token &MacroNameTok,
                         const MacroDirective *MD) override {
         R->onMacroDefined(MacroNameTok, MD);
       }
+
       void MacroUndefined(const Token &MacroNameTok, const MacroDefinition &MD,
                           const MacroDirective *Undef) override {
         R->onMacroUndefined(MacroNameTok, MD, Undef);
       }
+
       void MacroExpands(const Token &MacroNameTok, const MacroDefinition &MD,
                         SourceRange Range, const MacroArgs *Args) override {
         R->onMacroExpands(MacroNameTok, MD, Range, Args);
       }
+
       void FileChanged(SourceLocation Loc, FileChangeReason Reason,
                        SrcMgr::CharacteristicKind, FileID) override {
         if (Reason == PPCallbacks::EnterFile) {
@@ -1215,6 +1225,7 @@ void clang::DoPrintPreprocessedInput(Preprocessor &PP, raw_ostream *OS,
           R->onExitFile();
         }
       }
+
       void EndOfMainFile() override {
         // Finalize exactly once at end of processing.
         R->onEndOfStream();
