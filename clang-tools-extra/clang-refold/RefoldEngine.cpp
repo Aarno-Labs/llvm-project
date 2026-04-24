@@ -2180,7 +2180,9 @@ std::string RefoldEngine::RunSinglePassRefold() {
   // Apply TU edits in descending order of start offset.
   debug("tu/apply", "applying {0} TU edits", tuEdits.size());
   std::string tuResult = ApplyTextEditsWithPendingResync(
-      tuBytes, tuEdits, &appliedExpandedMacroRootIds);
+      tuBytes, tuEdits, &appliedExpandedMacroRootIds, tuPath);
+  if (terminalFallbackRequested_)
+    return std::string();
 
   // Preserve TU-local __FILE__ / __FILE_NAME__ semantics in checker replay.
   //
@@ -10531,6 +10533,8 @@ std::string RefoldEngine::FormatTerminalFallbackWitness(
       return "OwnerUnresolvedNoTUAnchor";
     case TerminalFallbackKind::IncludeRealizationUnmappableBCoverEnvelope:
       return "IncludeRealizationUnmappableBCoverEnvelope";
+    case TerminalFallbackKind::UndischargedEmissionArtifact:
+      return "UndischargedEmissionArtifact";
     case TerminalFallbackKind::MixedExcludedCases:
       return "MixedExcludedCases";
     case TerminalFallbackKind::Unknown:
@@ -20925,7 +20929,11 @@ void RefoldEngine::MaterializeIncludeExpansion(
   debug("include/mat", "inc#{0} applying {1} header TextEdits", inc->id,
         edits.size());
   std::string applied = ApplyTextEditsWithPendingResync(
-      bytes, edits, appliedExpandedMacroRootIds);
+      bytes, edits, appliedExpandedMacroRootIds, headerPath);
+  if (terminalFallbackRequested_) {
+    includeExpansion[includeId] = std::string();
+    return;
+  }
   includeExpansion[includeId] = std::move(applied);
   includeExpansionAcceptedResults[includeId] =
       BuildAcceptedIncludeRealizationCandidate(
@@ -21663,10 +21671,83 @@ void RefoldEngine::AttachAcceptedResultCarrier(
       std::make_shared<AcceptedResultCandidate>(candidate));
 }
 
+bool RefoldEngine::EmittedTextEditHasDischargedAcceptedResults(
+    const TextEdit &edit, StringRef emissionPhase,
+    StringRef emissionOwner) const {
+  const StringRef owner = emissionOwner.empty() ? StringRef("<unknown>")
+                                                : emissionOwner;
+
+  auto carrierIsEmissionDischarged =
+      [&](const AcceptedResultCandidate &carrier) -> bool {
+    if (carrier.kind == AcceptedResultCandidateKind::Unknown ||
+        carrier.kind == AcceptedResultCandidateKind::TerminalOutOfDomain) {
+      return false;
+    }
+
+    if (carrier.proofSummary.discharge.status ==
+        ProofDischargeStatus::Discharged) {
+      return true;
+    }
+
+    // The converted selector sites intentionally reject non-top-level macro
+    // proof roots so nested replay candidates cannot compete as final
+    // top-level winners. The byte-edit emission boundary is narrower: once the
+    // outer construction flow has already selected a structurally preserving
+    // nested macro rewrite, that nested artifact is allowed to reach emitted
+    // source text as long as the *only* remaining rejected obligation is the
+    // top-level-root selector rule. Keep all other rejected proof states
+    // fail-closed here.
+    const ProofDischargeRecord &discharge = carrier.proofSummary.discharge;
+    return carrier.kind == AcceptedResultCandidateKind::MacroPatch &&
+           discharge.failedObligation ==
+               ProofObligationKind::MacroProofRootIsTopLevel &&
+           discharge.failureReason ==
+               ProofFailureReason::NonTopLevelMacroProofRoot;
+  };
+
+  if (edit.acceptedResults.empty()) {
+    RequestTerminalFallback(
+        TerminalFallbackKind::UndischargedEmissionArtifact, emissionPhase,
+        llvm::formatv(
+            "emitted edit bytes=[{0},{1}) in {2} has no normalized accepted-result carriers",
+            edit.start, edit.end, owner)
+            .str());
+    return false;
+  }
+
+  for (size_t i = 0; i < edit.acceptedResults.size(); ++i) {
+    const std::shared_ptr<const AcceptedResultCandidate> &carrier =
+        edit.acceptedResults[i];
+    if (!carrier) {
+      RequestTerminalFallback(
+          TerminalFallbackKind::UndischargedEmissionArtifact, emissionPhase,
+          llvm::formatv(
+              "emitted edit bytes=[{0},{1}) in {2} has null accepted-result carrier #{3}",
+              edit.start, edit.end, owner, i)
+              .str());
+      return false;
+    }
+
+    if (!carrierIsEmissionDischarged(*carrier)) {
+      RequestTerminalFallback(
+          TerminalFallbackKind::UndischargedEmissionArtifact, emissionPhase,
+          llvm::formatv(
+              "emitted edit bytes=[{0},{1}) in {2} carries non-discharged result #{3}: {4}",
+              edit.start, edit.end, owner, i,
+              FormatAcceptedResultCandidate(*carrier))
+              .str());
+      return false;
+    }
+  }
+
+  return true;
+}
+
 std::string
 RefoldEngine::ApplyTextEditsWithPendingResync(
     StringRef originalFileText, ArrayRef<TextEdit> edits,
-    DenseSet<uint64_t> *appliedExpandedMacroRootIds) const {
+    DenseSet<uint64_t> *appliedExpandedMacroRootIds,
+    StringRef emissionOwner) const {
   if (edits.empty())
     return originalFileText.str();
 
@@ -21777,6 +21858,17 @@ RefoldEngine::ApplyTextEditsWithPendingResync(
 
     norm.push_back(std::move(chosen));
     i = j;
+  }
+
+  // Step 2B makes the byte-edit emission boundary proof-gated. By the time an
+  // edit reaches this function, Step 2A should already have attached the
+  // normalized accepted-result carriers for every non-terminal artifact it
+  // composes. Do not emit any edit whose carriers are missing or not yet
+  // discharged.
+  for (const TextEdit &edit : norm) {
+    if (!EmittedTextEditHasDischargedAcceptedResults(
+            edit, "emit/nonterminal", emissionOwner))
+      return originalFileText.str();
   }
 
   // Use SmallString for the output buffer to optimize small file edits.

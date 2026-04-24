@@ -228,6 +228,7 @@ private:
     Unknown,
     OwnerUnresolvedNoTUAnchor,
     IncludeRealizationUnmappableBCoverEnvelope,
+    UndischargedEmissionArtifact,
     MixedExcludedCases,
   };
 
@@ -3656,7 +3657,23 @@ private:
   ///         (locally or deferred).
   std::string ApplyTextEditsWithPendingResync(
       StringRef originalFileText, ArrayRef<TextEdit> edits,
-      DenseSet<uint64_t> *appliedExpandedMacroRootIds = nullptr) const;
+      DenseSet<uint64_t> *appliedExpandedMacroRootIds = nullptr,
+      StringRef emissionOwner = StringRef()) const;
+
+  /// \brief Return whether an emitted non-terminal byte edit is backed only by
+  /// emission-discharged normalized accepted-result carriers.
+  ///
+  /// Step 2B makes proof discharge the universal gate at the actual emission
+  /// boundary. Every non-terminal artifact that survives to a TextEdit must
+  /// carry at least one normalized accepted-result candidate. Most carriers
+  /// must already be fully discharged. One narrow exception remains
+  /// deterministic and fail-closed: a nested macro replay candidate may reach
+  /// emitted source text even though its local proof record still rejects the
+  /// selector-only `MacroProofRootIsTopLevel` obligation. Terminal out-of-
+  /// domain results are never valid carriers for non-terminal emitted edits.
+  bool EmittedTextEditHasDischargedAcceptedResults(
+      const TextEdit &edit, StringRef emissionPhase,
+      StringRef emissionOwner = StringRef()) const;
 
   /// \brief Copy one normalized accepted-result carrier onto an emitted edit.
   void AttachAcceptedResultCarrier(
