@@ -281,14 +281,17 @@ private:
     uint64_t emittedDeclaredClassCarriers = 0;
     uint64_t emittedDischargedCarriers = 0;
     uint64_t emittedSelectorOnlyExceptionCarriers = 0;
+    uint64_t emittedTransitionalTheoremCarriers = 0;
     uint64_t emittedUndischargedCarriers = 0;
     uint64_t emittedUnknownClassCarriers = 0;
     uint64_t emittedOutOfDomainCarriers = 0;
     uint64_t selectorCompetitions = 0;
     uint64_t selectorResolutions = 0;
     uint64_t selectorNoSelectable = 0;
+    uint64_t selectorUnresolvedCompetitions = 0;
     uint64_t selectorDirectBypasses = 0;
     uint64_t explicitTerminalExclusions = 0;
+    uint64_t nonExplicitTerminalExclusions = 0;
     bool theoremSatisfied = true;
     std::string firstViolation;
   };
@@ -363,6 +366,15 @@ private:
   /// result to escape with a violated theorem audit.
   void EnforceTheoremAuditInvariants() const;
 
+  /// Validate that the terminal fallback state itself still classifies as the
+  /// one explicit out-of-domain theorem carrier.
+  ///
+  /// Step 8 closes the final audit hole here: it is not enough for the engine
+  /// to request fallback to B; the resulting witness must also restamp onto the
+  /// normalized terminal explicit-out-of-domain carrier rather than escaping as
+  /// an unclassified fallback side effect.
+  void RecordTerminalFallbackTheoremAudit() const;
+
   /// Build a compact diagnostic string for a strict-mode theorem-audit
   /// fallback.
   std::string BuildTheoremAuditInvariantDetail() const;
@@ -371,28 +383,33 @@ private:
   ///
   /// The counters summarize the declared-domain statement above rather than an
   /// independent ad hoc checklist: every emitted non-terminal carrier must be
-  /// declared, discharged, lattice-selected, and in-domain, while named
-  /// terminal exclusions remain the only acceptable out-of-domain escape.
+  /// declared, discharged, lattice-selected, and in-domain; any transitional
+  /// theorem-facing carrier or unresolved selector competition is a violation;
+  /// and named terminal exclusions remain the only acceptable out-of-domain
+  /// escape.
   void EmitTheoremAudit() const {
     info("theorem",
          "satisfied={0} emittedEdits={1} carriers={2} declared={3} discharged={4} "
-         "selectorOnlyExceptions={5} undischarged={6} unknownClass={7} outOfDomain={8} "
-         "selectorCompetitions={9} selectorResolutions={10} selectorNoSelectable={11} "
-         "selectorDirectBypasses={12} explicitTerminalExclusions={13}",
+         "selectorOnlyExceptions={5} transitional={6} undischarged={7} unknownClass={8} outOfDomain={9} "
+         "selectorCompetitions={10} selectorResolutions={11} selectorNoSelectable={12} selectorUnresolved={13} "
+         "selectorDirectBypasses={14} explicitTerminalExclusions={15} nonExplicitTerminalExclusions={16}",
          lastTheoremAudit_.theoremSatisfied ? 1 : 0,
          lastTheoremAudit_.emittedNonTerminalEdits,
          lastTheoremAudit_.emittedCarriers,
          lastTheoremAudit_.emittedDeclaredClassCarriers,
          lastTheoremAudit_.emittedDischargedCarriers,
          lastTheoremAudit_.emittedSelectorOnlyExceptionCarriers,
+         lastTheoremAudit_.emittedTransitionalTheoremCarriers,
          lastTheoremAudit_.emittedUndischargedCarriers,
          lastTheoremAudit_.emittedUnknownClassCarriers,
          lastTheoremAudit_.emittedOutOfDomainCarriers,
          lastTheoremAudit_.selectorCompetitions,
          lastTheoremAudit_.selectorResolutions,
          lastTheoremAudit_.selectorNoSelectable,
+         lastTheoremAudit_.selectorUnresolvedCompetitions,
          lastTheoremAudit_.selectorDirectBypasses,
-         lastTheoremAudit_.explicitTerminalExclusions);
+         lastTheoremAudit_.explicitTerminalExclusions,
+         lastTheoremAudit_.nonExplicitTerminalExclusions);
     if (!lastTheoremAudit_.theoremSatisfied &&
         !lastTheoremAudit_.firstViolation.empty()) {
       info("theorem", "firstViolation={0}",
