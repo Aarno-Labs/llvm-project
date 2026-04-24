@@ -444,8 +444,10 @@ private:
   ///
   /// Step 2 implements the first concrete partial-expansion proof class. The
   /// witness exists only when exactly one top-level TU-owned macro callsite has
-  /// a proved whole-cover realization plan and that closure contains every
-  /// token-diff hunk for the current run.
+  /// a proved whole-cover realization plan, every token-diff hunk lies inside
+  /// that closure, and the source/frontier checks stay inside the explicit
+  /// single-owner domain (no ambiguity, no foreign overlap, no mixed ownership,
+  /// and no non-self-contained splice frontier).
   std::optional<ExpansionClosureWitness>
   BuildMacroOwnerExpansionClosureWitness() const;
 
