@@ -596,7 +596,7 @@ private:
     MacroDagSubtreeRoot,
     MacroCallChainSuffix,
     MacroCounterLiteral,
-    MacroWholeCoverFallback,
+    MacroWholeCoverRealization,
     IncludePatchPendingMaterialization,
     IncludeDeleteReplaceMappedHeaderTokens,
     IncludeInsertSelectedConditionalBoundary,
@@ -754,7 +754,7 @@ private:
     ArgsOnlyPairedPureInsertion,
     DagSubtreeRoot,
     CallChainSuffix,
-    WholeCoverFallback,
+    WholeCoverRealization,
   };
 
   struct MacroPatch {
@@ -785,8 +785,9 @@ private:
     bool structurePreserving = false;
     uint64_t proofRootMacroId = 0;
 
-    // Layer-4 whole-cover certificate metadata used to make expanded-patch
-    // reuse fail-closed and provenance-based.
+    // Step-4 first-class macro whole-cover realization certificate. These
+    // fields record the exact owner cover, containment witness, and B-side
+    // token-envelope accounting used to justify realized whole-cover output.
     bool wholeCoverUsedBodyRange = false;
     bool wholeCoverSelfContained = false;
     bool wholeCoverNestedSelfContained = false;
@@ -839,6 +840,12 @@ private:
     uint32_t ownerWitnessCount = 0;
   };
 
+  /// \brief Deterministic whole-cover realization plan for one invocation.
+  ///
+  /// ComputeWholeCoverPlan() proves the exact A/B token envelope that a
+  /// whole-cover realization may use. Step 4 promotes the accepted whole-cover
+  /// result into a first-class macro realization proof by copying this plan
+  /// onto the accepted MacroPatch.
   struct WholeCoverPlan {
     uint64_t covLoA = 0;
     uint64_t covHiA = 0;
@@ -2451,6 +2458,16 @@ private:
   void StampMacroPatchProof(MacroPatch &patch, MacroPatchProofKind kind,
                             bool validated, bool structurePreserving,
                             uint64_t proofRootMacroId) const;
+
+  /// \brief Materialize the explicit Step-4 whole-cover realization proof.
+  ///
+  /// Whole-cover output is no longer tracked as an anonymous fallback result.
+  /// This helper stamps the accepted patch as a first-class invocation
+  /// realization proof and copies the exact realization envelope derived by
+  /// ComputeWholeCoverPlan() into the patch-local certificate fields.
+  void StampMacroWholeCoverRealizationPatch(
+      MacroPatch &patch, const WholeCoverPlan &plan,
+      uint64_t proofRootMacroId) const;
 
   /// \brief Classify the current accepted path inventory for a macro patch.
   AcceptancePathInventory
