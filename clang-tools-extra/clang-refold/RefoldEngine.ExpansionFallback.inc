@@ -94,6 +94,138 @@ RefoldEngine::BuildMacroOwnerExpansionClosureWitness() const {
     return true;
   };
 
+  // Step 5 adds explicit interval-level guards instead of relying on the
+  // shape of the surviving candidate set alone. The fallback proof class is
+  // only in-domain when its chosen owner frontier does not interact with any
+  // foreign owner frontier.
+  auto intervalsOverlap = [](uint64_t loA, uint64_t hiA, uint64_t loB,
+                             uint64_t hiB) -> bool {
+    return loA < hiB && loB < hiA;
+  };
+
+  auto isDescendantOf = [&](const RefoldModel::MacroInvocation &node,
+                            const RefoldModel::MacroInvocation &root) -> bool {
+    std::optional<uint64_t> cur = node.callerMacroId;
+    DenseSet<uint64_t> visited;
+    while (cur) {
+      if (!visited.insert(*cur).second)
+        break;
+      if (*cur == root.id)
+        return true;
+      const RefoldModel::MacroInvocation *parent = FindMacroInvocationById(*cur);
+      if (!parent)
+        break;
+      cur = parent->callerMacroId;
+    }
+    return false;
+  };
+
+  auto sourceIntervalIsSelfContainedTUOwned =
+      [&](const RefoldModel::MacroInvocation &root) -> bool {
+    if (!root.invB || !root.invE || *root.invE <= *root.invB)
+      return false;
+
+    ArrayRef<RefoldModel::Segment> segs = model_.GetSegmentsForFile(tuPath);
+    if (segs.empty()) {
+      trace("fallback",
+            "macro-owner closure root rejected: id={0} name='{1}' has no TU segments for source interval",
+            root.id, root.name);
+      return false;
+    }
+
+    // The first synthesized fallback class splices bytes directly back into the
+    // original TU. Make that source frontier explicit: the full callsite byte
+    // interval must be covered by TU-owned segments only, with no include-owner
+    // transitions and no conditional-arm changes inside the splice span.
+    uint64_t cur = *root.invB;
+    std::optional<uint64_t> condArmId;
+    bool sawCondArmId = false;
+    bool sawCoveringSeg = false;
+    for (const auto &seg : segs) {
+      if (seg.e <= cur)
+        continue;
+      if (seg.b >= *root.invE)
+        break;
+      if (!intervalsOverlap(cur, *root.invE, seg.b, seg.e))
+        continue;
+      if (seg.b > cur) {
+        trace("fallback",
+              "macro-owner closure root rejected: id={0} name='{1}' source interval [{2},{3}) has uncovered gap before segment [{4},{5})",
+              root.id, root.name, *root.invB, *root.invE, seg.b, seg.e);
+        return false;
+      }
+      if (seg.ownerIncludeId) {
+        trace("fallback",
+              "macro-owner closure root rejected: id={0} name='{1}' source interval [{2},{3}) crosses include-owned segment [{4},{5}) includeId={6}",
+              root.id, root.name, *root.invB, *root.invE, seg.b, seg.e,
+              *seg.ownerIncludeId);
+        return false;
+      }
+      if (!sawCondArmId) {
+        condArmId = seg.ownerCondArmId;
+        sawCondArmId = true;
+      } else if (condArmId != seg.ownerCondArmId) {
+        trace("fallback",
+              "macro-owner closure root rejected: id={0} name='{1}' source interval [{2},{3}) crosses conditional-arm boundary between {4} and {5}",
+              root.id, root.name, *root.invB, *root.invE,
+              condArmId.value_or(0), seg.ownerCondArmId.value_or(0));
+        return false;
+      }
+      sawCoveringSeg = true;
+      cur = std::max<uint64_t>(cur, seg.e);
+      if (cur >= *root.invE)
+        return true;
+    }
+
+    if (!sawCoveringSeg) {
+      trace("fallback",
+            "macro-owner closure root rejected: id={0} name='{1}' source interval [{2},{3}) has no covering TU segment",
+            root.id, root.name, *root.invB, *root.invE);
+      return false;
+    }
+
+    trace("fallback",
+          "macro-owner closure root rejected: id={0} name='{1}' source interval [{2},{3}) is not fully covered by TU-owned segments",
+          root.id, root.name, *root.invB, *root.invE);
+    return false;
+  };
+
+  // Explicitly reject foreign macro interaction. For the first proof class,
+  // the chosen owner closure must be the only macro-owner region participating
+  // in the run; any intersecting non-descendant macro makes the frontier
+  // ambiguous or mixed-owner and therefore out-of-domain.
+  auto hasForeignOverlapOrMixedOwnership =
+      [&](const RefoldModel::MacroInvocation &root,
+          const WholeCoverPlan &plan) -> bool {
+    for (const auto &other : model_.GetMacroInvocations()) {
+      if (other.id == root.id)
+        continue;
+
+      const bool descendant = isDescendantOf(other, root);
+      const bool sourceOverlap =
+          other.invB && other.invE && *other.invE > *other.invB &&
+          other.invFile && PathsEqual(*other.invFile, tuPath) &&
+          intervalsOverlap(*root.invB, *root.invE, *other.invB, *other.invE);
+      const bool coverOverlap =
+          other.cover.IsValid() &&
+          intervalsOverlap(plan.covLoA, plan.covHiA, other.cover.begin,
+                           other.cover.end);
+
+      if (!sourceOverlap && !coverOverlap)
+        continue;
+
+      if (descendant)
+        continue;
+
+      trace("fallback",
+            "macro-owner closure root rejected: id={0} name='{1}' overlaps foreign macro id={2} name='{3}' sourceOverlap={4} coverOverlap={5} otherOwnerInclude={6}",
+            root.id, root.name, other.id, other.name, sourceOverlap ? 1 : 0,
+            coverOverlap ? 1 : 0, other.ownerIncludeId.value_or(0));
+      return true;
+    }
+    return false;
+  };
+
   SmallVector<MacroOwnerClosureCandidate, 4> candidates;
   for (const auto &m : model_.GetMacroInvocations()) {
     // The first fallback proof class is intentionally narrow: a single
@@ -167,6 +299,17 @@ RefoldEngine::BuildMacroOwnerExpansionClosureWitness() const {
             plan->claimsClipped ? 1 : 0, plan->bTokStart, plan->bTokEnd);
       continue;
     }
+
+    if (!sourceIntervalIsSelfContainedTUOwned(m))
+      continue;
+
+    // Step 5 makes several previously implicit exclusions explicit. Reject any
+    // candidate whose owner frontier overlaps a foreign macro closure or whose
+    // callsite/source frontier crosses a mixed-ownership boundary. The single-
+    // owner fallback class remains valid only when the proved closure is the
+    // one and only owner region needed for the run.
+    if (hasForeignOverlapOrMixedOwnership(m, *plan))
+      continue;
 
     // The proof class is "single owner closes the entire edit set." Any hunk
     // left outside the candidate plan means this root is insufficient and must
