@@ -650,7 +650,49 @@ private:
     FutureProofTarget futureTarget = FutureProofTarget::Unknown;
   };
 
-  /// rief Evidence source used to justify an accepted TU anchor.
+  /// \brief Conflict domain used by the global accepted-result lattice.
+  ///
+  /// Step 10 does not change how candidates are chosen. It names the owner
+  /// domain in which two accepted artifacts may interact so the current global
+  /// selection and overlap rules can be described explicitly and audited in one
+  /// place.
+  enum class LatticeConflictDomain : uint8_t {
+    Unknown,
+    MacroInvocationRootSpan,
+    IncludeOwnerRegion,
+    TUAnchorPoint,
+    WholeTranslationUnit,
+  };
+
+  /// \brief Merge law used when two artifacts in the same lattice domain are
+  /// compatible.
+  enum class LatticeMergeLaw : uint8_t {
+    Unknown,
+    DisjointCompose,
+    NestedOuterShadowsInner,
+    SelectSingleWitness,
+    TerminalReplacesAll,
+  };
+
+  /// \brief Conflict law used when two artifacts in the same lattice domain
+  /// are not simultaneously admissible.
+  enum class LatticeConflictLaw : uint8_t {
+    Unknown,
+    RejectPartialOverlap,
+    PreferStructurePreservation,
+    PreferExactAnchorWitness,
+    PreferOwnerPreservingBeforeRealization,
+    LastResortTerminalFallback,
+  };
+
+  /// \brief Normalized Step-10 description of the current global lattice law.
+  struct GlobalSelectionLattice {
+    LatticeConflictDomain domain = LatticeConflictDomain::Unknown;
+    LatticeMergeLaw mergeLaw = LatticeMergeLaw::Unknown;
+    LatticeConflictLaw conflictLaw = LatticeConflictLaw::Unknown;
+  };
+
+  /// \brief Evidence source used to justify an accepted TU anchor.
   ///
   /// Step 7 lifts the deterministic TU anchoring rules into explicit proof
   /// witnesses so accepted TU-owned insertions can explain which anchor source
@@ -665,7 +707,7 @@ private:
     CorroboratedLeftNeighbor,
   };
 
-  /// rief Compact Step-7 witness for an accepted TU anchor.
+  /// \brief Compact Step-7 witness for an accepted TU anchor.
   struct TUAnchorWitness {
     TUAnchorEvidenceKind evidence = TUAnchorEvidenceKind::Unknown;
     bool hasPPGap = false;
@@ -692,7 +734,7 @@ private:
     bool ownerDepthStable = false;
   };
 
-  /// rief Evidence source used to justify an accepted include-preserving
+  /// \brief Evidence source used to justify an accepted include-preserving
   /// anchor or mapped include byte range.
   ///
   /// Step 8 lifts include-preserving materialization paths into explicit local
@@ -708,7 +750,7 @@ private:
     DeclBoundary,
   };
 
-  /// rief Compact Step-8 witness for an accepted include-preserving path.
+  /// \brief Compact Step-8 witness for an accepted include-preserving path.
   struct IncludeAnchorWitness {
     IncludeAnchorEvidenceKind evidence = IncludeAnchorEvidenceKind::Unknown;
 
@@ -740,7 +782,31 @@ private:
     uint64_t declHeaderE = 0;
   };
 
-  /// rief Status produced when the engine evaluates a local proof contract.
+  /// \brief Evidence source used to justify an accepted include realization.
+  ///
+  /// Step 9 promotes tier-2 include inlining from B into an explicit realized
+  /// proof path by recording the exact include cover and mapped B token
+  /// envelope that were used to materialize the include body.
+  enum class IncludeRealizationEvidenceKind : uint8_t {
+    Unknown,
+    InlineFromBCoverEnvelope,
+  };
+
+  /// \brief Compact Step-9 witness for an accepted include realization path.
+  struct IncludeRealizationWitness {
+    IncludeRealizationEvidenceKind evidence =
+        IncludeRealizationEvidenceKind::Unknown;
+    bool hasIncludeId = false;
+    uint64_t includeId = 0;
+    bool hasACover = false;
+    uint64_t aCoverBegin = 0;
+    uint64_t aCoverEnd = 0;
+    bool hasBTokenEnvelope = false;
+    uint64_t bTokBegin = 0;
+    uint64_t bTokEnd = 0;
+  };
+
+  /// \brief Status produced when the engine evaluates a local proof contract.
   ///
   /// Step 3 introduces explicit obligation/discharge records so accepted
   /// results can be explained in terms of the class-local facts they already
@@ -785,6 +851,10 @@ private:
     IncludeRightNeighborWitnessTracked,
     IncludeLeftNeighborWitnessTracked,
     IncludeDeclBoundaryWitnessTracked,
+    IncludeRealizationWitnessTracked,
+    IncludeRealizationIncludeTracked,
+    IncludeRealizationCoverTracked,
+    IncludeRealizationBEnvelopeTracked,
     TUAnchorPathClassified,
     TUAnchorWitnessTracked,
     TUAnchorPPGapTracked,
@@ -827,6 +897,10 @@ private:
     MissingIncludeRightNeighborWitness,
     MissingIncludeLeftNeighborWitness,
     MissingIncludeDeclBoundaryWitness,
+    MissingIncludeRealizationWitness,
+    MissingIncludeRealizationInclude,
+    MissingIncludeRealizationCover,
+    MissingIncludeRealizationBEnvelope,
     MissingTUAnchorClassification,
     MissingTUAnchorWitness,
     MissingTUAnchorGap,
@@ -871,6 +945,7 @@ private:
     LegacyEscalationDisposition legacyEscalation =
         LegacyEscalationDisposition::None;
     AcceptancePathInventory inventory;
+    GlobalSelectionLattice lattice;
     ProofDischargeRecord discharge;
     bool validated = false;
     bool structurePreserving = false;
@@ -879,6 +954,8 @@ private:
     TUAnchorWitness tuAnchorWitness;
     bool hasIncludeAnchorWitness = false;
     IncludeAnchorWitness includeAnchorWitness;
+    bool hasIncludeRealizationWitness = false;
+    IncludeRealizationWitness includeRealizationWitness;
   };
 
 
@@ -2560,21 +2637,21 @@ private:
                                   const WholeCoverPlan &plan,
                                   uint64_t rootMacroId) const;
 
-  /// rief Normalize the current hunk owner into the certificate shape used
+  /// \brief Normalize the current hunk owner into the certificate shape used
   ///        for structural macro patch continuity.
   Owner NormalizeHunkOwnerForPatch(StringRef tuPath,
                                    const diffutils::Hunk &h) const;
 
-  /// rief Return whether a macro patch carries the same non-mixed owner
+  /// \brief Return whether a macro patch carries the same non-mixed owner
   ///        certificate as the current hunk owner.
   bool MacroPatchOwnerMatches(const MacroPatch &patch,
                               const Owner &owner) const;
 
-  /// rief Preserve any prior owner certificate from \p src on \p dst.
+  /// \brief Preserve any prior owner certificate from \p src on \p dst.
   void CarryMacroPatchOwnerCertificate(MacroPatch &dst,
                                        const MacroPatch &src) const;
 
-  /// rief Stamp the current owner witness onto a macro patch.
+  /// \brief Stamp the current owner witness onto a macro patch.
   void StampMacroPatchOwnerWitness(MacroPatch &patch,
                                    const Owner &owner) const;
 
@@ -2631,7 +2708,8 @@ private:
   ProofSummary BuildAcceptedPathProofSummary(
       AcceptedPathKind currentPath, const IncludePatch *patch = nullptr,
       const TUAnchorWitness *tuAnchorWitness = nullptr,
-      const IncludeAnchorWitness *includeAnchorWitness = nullptr) const;
+      const IncludeAnchorWitness *includeAnchorWitness = nullptr,
+      const IncludeRealizationWitness *includeRealizationWitness = nullptr) const;
 
   /// \brief Build the default Step-1/2/3 proof summary for an include patch.
   ///
@@ -2644,6 +2722,23 @@ private:
       AcceptedPathKind currentPath =
           AcceptedPathKind::IncludePatchPendingMaterialization,
       const IncludePatch *patch = nullptr) const;
+
+  /// \brief Compute the current global lattice law for an accepted summary.
+  ///
+  /// Step 10 centralizes the descriptive merge/conflict policy that already
+  /// exists across macro, include, TU-anchor, and terminal-fallback paths.
+  /// The returned law is still descriptive in this step: later work may make
+  /// selection authoritative over this normalized lattice.
+  GlobalSelectionLattice
+  BuildGlobalSelectionLattice(const ProofSummary &summary) const;
+
+  /// \brief Return whether the normalized lattice prefers \p lhs over \p rhs.
+  ///
+  /// This helper mirrors the existing top-level structural ordering policy in a
+  /// single deterministic comparator without changing the current selection
+  /// sites yet.
+  bool LatticePrefers(const ProofSummary &lhs,
+                      const ProofSummary &rhs) const;
 
   /// \brief Return whether \p m carries usable producer-side paste witnesses.
   ///
@@ -2668,7 +2763,8 @@ private:
       AcceptedPathKind currentPath, const IncludePatch *patch,
       const IncludeAnchorWitness *witness = nullptr) const;
   ProofDischargeRecord ValidateIncludeRealizationProof(
-      AcceptedPathKind currentPath, const IncludePatch *patch) const;
+      AcceptedPathKind currentPath, const IncludePatch *patch,
+      const IncludeRealizationWitness *witness = nullptr) const;
   ProofDischargeRecord ValidateTUAnchorProof(
       AcceptedPathKind currentPath,
       const TUAnchorWitness *witness = nullptr) const;
@@ -2682,11 +2778,16 @@ private:
   StringRef FormatAcceptedPathKind(AcceptedPathKind kind) const;
   StringRef FormatAcceptanceSupportKind(AcceptanceSupportKind support) const;
   StringRef FormatFutureProofTarget(FutureProofTarget target) const;
+  StringRef FormatLatticeConflictDomain(LatticeConflictDomain domain) const;
+  StringRef FormatLatticeMergeLaw(LatticeMergeLaw law) const;
+  StringRef FormatLatticeConflictLaw(LatticeConflictLaw law) const;
   StringRef FormatProofDischargeStatus(ProofDischargeStatus status) const;
   StringRef FormatProofObligationKind(ProofObligationKind obligation) const;
   StringRef FormatProofFailureReason(ProofFailureReason reason) const;
   StringRef FormatTUAnchorEvidenceKind(TUAnchorEvidenceKind kind) const;
   StringRef FormatIncludeAnchorEvidenceKind(IncludeAnchorEvidenceKind kind) const;
+  StringRef FormatIncludeRealizationEvidenceKind(
+      IncludeRealizationEvidenceKind kind) const;
 
   /// \brief Format a concrete TU anchor witness for tracing.
   ///
@@ -2698,16 +2799,30 @@ private:
   /// \brief Format a concrete include anchor witness for tracing.
   std::string FormatIncludeAnchorWitness(const IncludeAnchorWitness &witness) const;
 
-  /// rief Format a patch proof kind for tracing.
+  /// \brief Format a concrete include-realization witness for tracing.
+  ///
+  /// Step 9 records the exact deterministic include cover and mapped B-token
+  /// envelope used when the engine realizes an include directly from the
+  /// modified preprocessed surface. This formatter keeps that witness readable
+  /// in the same audit stream as the normalized proof/discharge metadata.
+  std::string
+  FormatIncludeRealizationWitness(
+      const IncludeRealizationWitness &witness) const;
+
+  /// \brief Format a patch proof kind for tracing.
   StringRef FormatMacroPatchProofKind(MacroPatchProofKind kind) const;
 
-  /// rief Format the Step-2 acceptance-path inventory for tracing.
+  /// \brief Format the Step-2 acceptance-path inventory for tracing.
   std::string
   FormatAcceptancePathInventory(const AcceptancePathInventory &inventory) const;
 
   /// \brief Format a Step-3 proof-discharge record for tracing.
   std::string
   FormatProofDischargeRecord(const ProofDischargeRecord &record) const;
+
+  /// \brief Format the normalized Step-10 lattice law for tracing.
+  std::string
+  FormatGlobalSelectionLattice(const GlobalSelectionLattice &lattice) const;
 
   /// \brief Format the normalized accepted-path audit for tracing.
   ///
@@ -2717,9 +2832,10 @@ private:
   std::string FormatAcceptedPathAudit(
       AcceptedPathKind currentPath, const IncludePatch *patch = nullptr,
       const TUAnchorWitness *tuAnchorWitness = nullptr,
-      const IncludeAnchorWitness *includeAnchorWitness = nullptr) const;
+      const IncludeAnchorWitness *includeAnchorWitness = nullptr,
+      const IncludeRealizationWitness *includeRealizationWitness = nullptr) const;
 
-  /// rief Format patch provenance and subtree-composition audit metadata.
+  /// \brief Format patch provenance and subtree-composition audit metadata.
   std::string FormatMacroPatchAudit(const MacroPatch &patch) const;
 
   std::optional<std::string>
