@@ -8144,7 +8144,7 @@ RefoldEngine::BuildAcceptedIncludeRealizationCandidate(
   candidate.begin = include.siteB;
   candidate.end = include.siteE;
   candidate.hasPayloadPreview = true;
-  candidate.payloadPreview = FormatAcceptedPathKind(currentPath).str();
+  candidate.payloadPreview = formatv("{0}", currentPath).str();
   return candidate;
 }
 

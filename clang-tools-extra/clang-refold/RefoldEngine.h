@@ -695,6 +695,26 @@ private:
     TUTextualEdit,
   };
 
+  friend inline StringRef toString(AcceptedProofClass kind) {
+    switch (kind) {
+    case AcceptedProofClass::Unknown:
+      return "Unknown";
+    case AcceptedProofClass::InvocationPreserving:
+      return "InvocationPreserving";
+    case AcceptedProofClass::InvocationRealization:
+      return "InvocationRealization";
+    case AcceptedProofClass::IncludePreserving:
+      return "IncludePreserving";
+    case AcceptedProofClass::IncludeRealization:
+      return "IncludeRealization";
+    case AcceptedProofClass::TUAnchor:
+      return "TUAnchor";
+    case AcceptedProofClass::TUTextualEdit:
+      return "TUTextualEdit";
+    }
+    return "Unknown";
+  }
+
   /// \brief Whether an accepted result preserves original structure or emits
   /// a realized edited surface.
   enum class RealizationMode : uint8_t {
@@ -702,6 +722,18 @@ private:
     PreserveOriginalStructure,
     RealizeEditedSurface,
   };
+
+  friend inline StringRef toString(RealizationMode mode) {
+    switch (mode) {
+    case RealizationMode::Unknown:
+      return "Unknown";
+    case RealizationMode::PreserveOriginalStructure:
+      return "PreserveOriginalStructure";
+    case RealizationMode::RealizeEditedSurface:
+      return "RealizeEditedSurface";
+    }
+    return "Unknown";
+  }
 
   /// \brief Ranking bucket for choosing among multiple valid candidates.
   ///
@@ -714,6 +746,20 @@ private:
     PreferExactAnchoring,
   };
 
+  friend inline StringRef toString(SelectionPreference preference) {
+    switch (preference) {
+    case SelectionPreference::Unknown:
+      return "Unknown";
+    case SelectionPreference::PreferStructurePreservation:
+      return "PreferStructurePreservation";
+    case SelectionPreference::PreferSurfaceRealization:
+      return "PreferSurfaceRealization";
+    case SelectionPreference::PreferExactAnchoring:
+      return "PreferExactAnchoring";
+    }
+    return "Unknown";
+  }
+
   /// \brief Surface realization choices kept distinct from proof metadata.
   enum class SurfaceDisposition : uint8_t {
     None,
@@ -723,6 +769,24 @@ private:
     RealizeTranslationUnitByteEdit,
     EmitEditedPreprocessedStream,
   };
+
+  friend inline StringRef toString(SurfaceDisposition disposition) {
+    switch (disposition) {
+    case SurfaceDisposition::None:
+      return "None";
+    case SurfaceDisposition::RealizeWholeCoverMacros:
+      return "RealizeWholeCoverMacros";
+    case SurfaceDisposition::RealizeInlineTouchedIncludesFromB:
+      return "RealizeInlineTouchedIncludesFromB";
+    case SurfaceDisposition::RealizeMaterializedIncludeExpansion:
+      return "RealizeMaterializedIncludeExpansion";
+    case SurfaceDisposition::RealizeTranslationUnitByteEdit:
+      return "RealizeTranslationUnitByteEdit";
+    case SurfaceDisposition::EmitEditedPreprocessedStream:
+      return "EmitEditedPreprocessedStream";
+    }
+    return "None";
+  }
 
   /// \brief Inventory of the currently accepted execution paths.
   ///
@@ -756,6 +820,60 @@ private:
     TerminalEmitEditedPreprocessedStream,
   };
 
+  friend inline StringRef toString(AcceptedPathKind kind) {
+    switch (kind) {
+    case AcceptedPathKind::Unknown:
+      return "Unknown";
+    case AcceptedPathKind::MacroArgsOnlyStandard:
+      return "MacroArgsOnlyStandard";
+    case AcceptedPathKind::MacroArgsOnlyPasteSingle:
+      return "MacroArgsOnlyPasteSingle";
+    case AcceptedPathKind::MacroArgsOnlyPasteMulti:
+      return "MacroArgsOnlyPasteMulti";
+    case AcceptedPathKind::MacroArgsOnlyPurePasteOnly:
+      return "MacroArgsOnlyPurePasteOnly";
+    case AcceptedPathKind::MacroArgsOnlyPairedPureInsertion:
+      return "MacroArgsOnlyPairedPureInsertion";
+    case AcceptedPathKind::MacroDagSubtreeRoot:
+      return "MacroDagSubtreeRoot";
+    case AcceptedPathKind::MacroCallChainSuffix:
+      return "MacroCallChainSuffix";
+    case AcceptedPathKind::MacroCounterLiteral:
+      return "MacroCounterLiteral";
+    case AcceptedPathKind::MacroWholeCoverRealization:
+      return "MacroWholeCoverRealization";
+    case AcceptedPathKind::IncludePatchPendingMaterialization:
+      return "IncludePatchPendingMaterialization";
+    case AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens:
+      return "IncludeDeleteReplaceMappedHeaderTokens";
+    case AcceptedPathKind::IncludeInsertSelectedConditionalBoundary:
+      return "IncludeInsertSelectedConditionalBoundary";
+    case AcceptedPathKind::IncludeInsertChildBoundary:
+      return "IncludeInsertChildBoundary";
+    case AcceptedPathKind::IncludeInsertRightNeighborPP:
+      return "IncludeInsertRightNeighborPP";
+    case AcceptedPathKind::IncludeInsertLeftNeighborPP:
+      return "IncludeInsertLeftNeighborPP";
+    case AcceptedPathKind::IncludeInsertDeclBoundary:
+      return "IncludeInsertDeclBoundary";
+    case AcceptedPathKind::IncludeRealizationInlineFromB:
+      return "IncludeRealizationInlineFromB";
+    case AcceptedPathKind::IncludeMaterializedExpansion:
+      return "IncludeMaterializedExpansion";
+    case AcceptedPathKind::TUExactSlotBoundary:
+      return "TUExactSlotBoundary";
+    case AcceptedPathKind::TUProvableInsertionAnchor:
+      return "TUProvableInsertionAnchor";
+    case AcceptedPathKind::TUByteSpanMappedEdit:
+      return "TUByteSpanMappedEdit";
+    case AcceptedPathKind::TUByteSpanConservativeEdit:
+      return "TUByteSpanConservativeEdit";
+    case AcceptedPathKind::TerminalEmitEditedPreprocessedStream:
+      return "TerminalEmitEditedPreprocessedStream";
+    }
+    return "Unknown";
+  }
+
   /// \brief How mature the current acceptance path is in the migration plan.
   enum class AcceptanceSupportKind : uint8_t {
     Unknown,
@@ -763,6 +881,20 @@ private:
     DeterministicButNotFirstClass,
     ExplicitOutOfDomainClass,
   };
+
+  friend inline StringRef toString(AcceptanceSupportKind support) {
+    switch (support) {
+    case AcceptanceSupportKind::Unknown:
+      return "Unknown";
+    case AcceptanceSupportKind::ExplicitProofBacked:
+      return "ExplicitProofBacked";
+    case AcceptanceSupportKind::DeterministicButNotFirstClass:
+      return "DeterministicButNotFirstClass";
+    case AcceptanceSupportKind::ExplicitOutOfDomainClass:
+      return "ExplicitOutOfDomainClass";
+    }
+    return "Unknown";
+  }
 
   /// \brief Future proof-class placeholder targeted by a current path.
   enum class FutureProofTarget : uint8_t {
@@ -790,6 +922,56 @@ private:
     EditedPreprocessedStreamFallback,
   };
 
+  friend inline StringRef toString(FutureProofTarget target) {
+    switch (target) {
+    case FutureProofTarget::Unknown:
+      return "Unknown";
+    case FutureProofTarget::MacroStandardArgsOnly:
+      return "MacroStandardArgsOnly";
+    case FutureProofTarget::MacroPasteSingle:
+      return "MacroPasteSingle";
+    case FutureProofTarget::MacroPasteMultiFixedAnchor:
+      return "MacroPasteMultiFixedAnchor";
+    case FutureProofTarget::MacroPurePasteOnly:
+      return "MacroPurePasteOnly";
+    case FutureProofTarget::MacroPairedPureInsertion:
+      return "MacroPairedPureInsertion";
+    case FutureProofTarget::MacroDagLift:
+      return "MacroDagLift";
+    case FutureProofTarget::MacroCallChainSuffixPreservation:
+      return "MacroCallChainSuffixPreservation";
+    case FutureProofTarget::MacroCounterStabilizationRealization:
+      return "MacroCounterStabilizationRealization";
+    case FutureProofTarget::MacroRealizationWholeCover:
+      return "MacroRealizationWholeCover";
+    case FutureProofTarget::IncludePatchByMappedHeaderTokens:
+      return "IncludePatchByMappedHeaderTokens";
+    case FutureProofTarget::IncludeConditionalArmCertifiedInsertion:
+      return "IncludeConditionalArmCertifiedInsertion";
+    case FutureProofTarget::IncludeInsertionByChildBoundary:
+      return "IncludeInsertionByChildBoundary";
+    case FutureProofTarget::IncludeInsertionByRightNeighborPP:
+      return "IncludeInsertionByRightNeighborPP";
+    case FutureProofTarget::IncludeInsertionByLeftNeighborPP:
+      return "IncludeInsertionByLeftNeighborPP";
+    case FutureProofTarget::IncludeInsertionByDeclBoundary:
+      return "IncludeInsertionByDeclBoundary";
+    case FutureProofTarget::IncludeRealizationCover:
+      return "IncludeRealizationCover";
+    case FutureProofTarget::IncludeMaterializedExpansionRealization:
+      return "IncludeMaterializedExpansionRealization";
+    case FutureProofTarget::TUExactSlotAnchor:
+      return "TUExactSlotAnchor";
+    case FutureProofTarget::TUProvableInsertionAnchor:
+      return "TUProvableInsertionAnchor";
+    case FutureProofTarget::TUByteSpanTextualEdit:
+      return "TUByteSpanTextualEdit";
+    case FutureProofTarget::EditedPreprocessedStreamFallback:
+      return "ExplicitOutOfDomainTerminalResult";
+    }
+    return "Unknown";
+  }
+
   /// \brief Step-2 inventory record that maps a current acceptance path onto
   /// the future proof lattice.
   struct AcceptancePathInventory {
@@ -812,6 +994,22 @@ private:
     WholeTranslationUnit,
   };
 
+  friend inline StringRef toString(LatticeConflictDomain domain) {
+    switch (domain) {
+    case LatticeConflictDomain::Unknown:
+      return "Unknown";
+    case LatticeConflictDomain::MacroInvocationRootSpan:
+      return "MacroInvocationRootSpan";
+    case LatticeConflictDomain::IncludeOwnerRegion:
+      return "IncludeOwnerRegion";
+    case LatticeConflictDomain::TUAnchorPoint:
+      return "TUAnchorPoint";
+    case LatticeConflictDomain::WholeTranslationUnit:
+      return "WholeTranslationUnit";
+    }
+    return "Unknown";
+  }
+
   /// \brief Merge law used when two artifacts in the same lattice domain are
   /// compatible.
   enum class LatticeMergeLaw : uint8_t {
@@ -821,6 +1019,22 @@ private:
     SelectSingleWitness,
     TerminalReplacesAll,
   };
+
+  friend inline StringRef toString(LatticeMergeLaw law) {
+    switch (law) {
+    case LatticeMergeLaw::Unknown:
+      return "Unknown";
+    case LatticeMergeLaw::DisjointCompose:
+      return "DisjointCompose";
+    case LatticeMergeLaw::NestedOuterShadowsInner:
+      return "NestedOuterShadowsInner";
+    case LatticeMergeLaw::SelectSingleWitness:
+      return "SelectSingleWitness";
+    case LatticeMergeLaw::TerminalReplacesAll:
+      return "TerminalReplacesAll";
+    }
+    return "Unknown";
+  }
 
   /// \brief Conflict law used when two artifacts in the same lattice domain
   /// are not simultaneously admissible.
@@ -832,6 +1046,24 @@ private:
     PreferOwnerPreservingBeforeRealization,
     ExplicitOutOfDomainTerminalResult,
   };
+
+  friend inline StringRef toString(LatticeConflictLaw law) {
+    switch (law) {
+    case LatticeConflictLaw::Unknown:
+      return "Unknown";
+    case LatticeConflictLaw::RejectPartialOverlap:
+      return "RejectPartialOverlap";
+    case LatticeConflictLaw::PreferStructurePreservation:
+      return "PreferStructurePreservation";
+    case LatticeConflictLaw::PreferExactAnchorWitness:
+      return "PreferExactAnchorWitness";
+    case LatticeConflictLaw::PreferOwnerPreservingBeforeRealization:
+      return "PreferOwnerPreservingBeforeRealization";
+    case LatticeConflictLaw::ExplicitOutOfDomainTerminalResult:
+      return "ExplicitOutOfDomainTerminalResult";
+    }
+    return "Unknown";
+  }
 
   /// \brief Normalized Step-10 description of the current global lattice law.
   struct GlobalSelectionLattice {
@@ -855,6 +1087,20 @@ private:
     ExplicitOutOfDomainClass,
   };
 
+  friend inline StringRef toString(CompletenessCoverageKind kind) {
+    switch (kind) {
+    case CompletenessCoverageKind::Unknown:
+      return "Unknown";
+    case CompletenessCoverageKind::DeclaredProofClass:
+      return "DeclaredProofClass";
+    case CompletenessCoverageKind::TransitionalGap:
+      return "TransitionalGap";
+    case CompletenessCoverageKind::ExplicitOutOfDomainClass:
+      return "ExplicitOutOfDomainClass";
+    }
+    return "Unknown";
+  }
+
   /// \brief What completeness promise the engine makes for a covered path.
   enum class CompletenessExpectationKind : uint8_t {
     Unknown,
@@ -862,6 +1108,20 @@ private:
     NoClaimPendingClassClosure,
     ExplicitlyOutsideDeclaredSet,
   };
+
+  friend inline StringRef toString(CompletenessExpectationKind kind) {
+    switch (kind) {
+    case CompletenessExpectationKind::Unknown:
+      return "Unknown";
+    case CompletenessExpectationKind::MustDiscoverDeclaredOrStrongerCompatible:
+      return "MustDiscoverDeclaredOrStrongerCompatible";
+    case CompletenessExpectationKind::NoClaimPendingClassClosure:
+      return "NoClaimPendingClassClosure";
+    case CompletenessExpectationKind::ExplicitlyOutsideDeclaredSet:
+      return "ExplicitlyOutsideDeclaredSet";
+    }
+    return "Unknown";
+  }
 
   /// \brief Normalized completeness contract for the declared domain above.
   ///
@@ -891,6 +1151,20 @@ private:
     TransitionalGap,
     ExplicitOutOfDomainClass,
   };
+
+  friend inline StringRef toString(TheoremDomainKind kind) {
+    switch (kind) {
+    case TheoremDomainKind::Unknown:
+      return "Unknown";
+    case TheoremDomainKind::DeclaredInDomainClass:
+      return "DeclaredInDomainClass";
+    case TheoremDomainKind::TransitionalGap:
+      return "TransitionalGap";
+    case TheoremDomainKind::ExplicitOutOfDomainClass:
+      return "ExplicitOutOfDomainClass";
+    }
+    return "Unknown";
+  }
 
   /// \brief Explicit theorem-domain contract derived from the same statement.
   ///
@@ -1040,6 +1314,20 @@ private:
     Rejected,
   };
 
+  friend inline StringRef toString(ProofDischargeStatus status) {
+    switch (status) {
+    case ProofDischargeStatus::Unknown:
+      return "Unknown";
+    case ProofDischargeStatus::PendingMaterialization:
+      return "PendingMaterialization";
+    case ProofDischargeStatus::Discharged:
+      return "Discharged";
+    case ProofDischargeStatus::Rejected:
+      return "Rejected";
+    }
+    return "Unknown";
+  }
+
   /// \brief Named local obligations used by Step 3 proof-discharge records.
   enum class ProofObligationKind : uint8_t {
     Unknown,
@@ -1086,6 +1374,96 @@ private:
     ExplicitOutOfDomainResultTracked,
   };
 
+  friend inline StringRef toString(ProofObligationKind obligation) {
+    switch (obligation) {
+    case ProofObligationKind::Unknown:
+      return "Unknown";
+    case ProofObligationKind::AcceptedPathClassified:
+      return "AcceptedPathClassified";
+    case ProofObligationKind::FutureTargetMapped:
+      return "FutureTargetMapped";
+    case ProofObligationKind::LegacyValidationRecorded:
+      return "LegacyValidationRecorded";
+    case ProofObligationKind::StructureMatchesAcceptedClass:
+      return "StructureMatchesAcceptedClass";
+    case ProofObligationKind::ProofRootTracked:
+      return "ProofRootTracked";
+    case ProofObligationKind::MacroProofRootResolved:
+      return "MacroProofRootResolved";
+    case ProofObligationKind::MacroProofRootIsTopLevel:
+      return "MacroProofRootIsTopLevel";
+    case ProofObligationKind::MacroPasteWitnessPresent:
+      return "MacroPasteWitnessPresent";
+    case ProofObligationKind::MacroPasteWitnessWellFormed:
+      return "MacroPasteWitnessWellFormed";
+    case ProofObligationKind::MacroPasteFreeSurfaceTracked:
+      return "MacroPasteFreeSurfaceTracked";
+    case ProofObligationKind::MacroSubtreeCertificateTracked:
+      return "MacroSubtreeCertificateTracked";
+    case ProofObligationKind::MacroCallChainWitnessTracked:
+      return "MacroCallChainWitnessTracked";
+    case ProofObligationKind::SubtreeAdmissibilityTracked:
+      return "SubtreeAdmissibilityTracked";
+    case ProofObligationKind::WholeCoverBoundsTracked:
+      return "WholeCoverBoundsTracked";
+    case ProofObligationKind::WholeCoverContainmentTracked:
+      return "WholeCoverContainmentTracked";
+    case ProofObligationKind::WholeCoverBoundaryAccountingTracked:
+      return "WholeCoverBoundaryAccountingTracked";
+    case ProofObligationKind::IncludePendingMaterializationClassified:
+      return "IncludePendingMaterializationClassified";
+    case ProofObligationKind::IncludePatchShapeTracked:
+      return "IncludePatchShapeTracked";
+    case ProofObligationKind::IncludeAnchorWitnessTracked:
+      return "IncludeAnchorWitnessTracked";
+    case ProofObligationKind::IncludeAnchorByteTracked:
+      return "IncludeAnchorByteTracked";
+    case ProofObligationKind::IncludeConditionalOwnershipTracked:
+      return "IncludeConditionalOwnershipTracked";
+    case ProofObligationKind::IncludeMappedHeaderRangeTracked:
+      return "IncludeMappedHeaderRangeTracked";
+    case ProofObligationKind::IncludeMappedHeaderByteRangeTracked:
+      return "IncludeMappedHeaderByteRangeTracked";
+    case ProofObligationKind::IncludeSelectedConditionalBoundaryWitnessTracked:
+      return "IncludeSelectedConditionalBoundaryWitnessTracked";
+    case ProofObligationKind::IncludeChildBoundaryWitnessTracked:
+      return "IncludeChildBoundaryWitnessTracked";
+    case ProofObligationKind::IncludeRightNeighborWitnessTracked:
+      return "IncludeRightNeighborWitnessTracked";
+    case ProofObligationKind::IncludeLeftNeighborWitnessTracked:
+      return "IncludeLeftNeighborWitnessTracked";
+    case ProofObligationKind::IncludeDeclBoundaryWitnessTracked:
+      return "IncludeDeclBoundaryWitnessTracked";
+    case ProofObligationKind::IncludeRealizationWitnessTracked:
+      return "IncludeRealizationWitnessTracked";
+    case ProofObligationKind::IncludeRealizationIncludeTracked:
+      return "IncludeRealizationIncludeTracked";
+    case ProofObligationKind::IncludeRealizationCoverTracked:
+      return "IncludeRealizationCoverTracked";
+    case ProofObligationKind::IncludeRealizationBEnvelopeTracked:
+      return "IncludeRealizationBEnvelopeTracked";
+    case ProofObligationKind::TUAnchorPathClassified:
+      return "TUAnchorPathClassified";
+    case ProofObligationKind::TUAnchorWitnessTracked:
+      return "TUAnchorWitnessTracked";
+    case ProofObligationKind::TUAnchorPPGapTracked:
+      return "TUAnchorPPGapTracked";
+    case ProofObligationKind::TUAnchorByteTracked:
+      return "TUAnchorByteTracked";
+    case ProofObligationKind::TUExactSlotWitnessTracked:
+      return "TUExactSlotWitnessTracked";
+    case ProofObligationKind::TUProvableEvidenceTracked:
+      return "TUProvableEvidenceTracked";
+    case ProofObligationKind::TUOutsideIncludeCoverageTracked:
+      return "TUOutsideIncludeCoverageTracked";
+    case ProofObligationKind::TUOwnerDepthStableTracked:
+      return "TUOwnerDepthStableTracked";
+    case ProofObligationKind::ExplicitOutOfDomainResultTracked:
+      return "ExplicitOutOfDomainResultTracked";
+    }
+    return "Unknown";
+  }
+
   /// \brief Why a local proof contract could not be discharged.
   enum class ProofFailureReason : uint8_t {
     None,
@@ -1131,6 +1509,96 @@ private:
     MissingTUOwnerDepthStability,
     ExplicitOutOfDomainResult,
   };
+
+  friend inline StringRef toString(ProofFailureReason reason) {
+    switch (reason) {
+    case ProofFailureReason::None:
+      return "None";
+    case ProofFailureReason::PendingMaterialization:
+      return "PendingMaterialization";
+    case ProofFailureReason::MissingAcceptedPathClassification:
+      return "MissingAcceptedPathClassification";
+    case ProofFailureReason::MissingFutureTargetMapping:
+      return "MissingFutureTargetMapping";
+    case ProofFailureReason::MissingLegacyValidation:
+      return "MissingLegacyValidation";
+    case ProofFailureReason::StructuralMismatch:
+      return "StructuralMismatch";
+    case ProofFailureReason::MissingProofRoot:
+      return "MissingProofRoot";
+    case ProofFailureReason::MissingMacroProofRootResolution:
+      return "MissingMacroProofRootResolution";
+    case ProofFailureReason::NonTopLevelMacroProofRoot:
+      return "NonTopLevelMacroProofRoot";
+    case ProofFailureReason::MissingPasteWitness:
+      return "MissingPasteWitness";
+    case ProofFailureReason::MalformedPasteWitness:
+      return "MalformedPasteWitness";
+    case ProofFailureReason::UnexpectedPasteSurface:
+      return "UnexpectedPasteSurface";
+    case ProofFailureReason::MissingSubtreeCertificate:
+      return "MissingSubtreeCertificate";
+    case ProofFailureReason::MissingCallChainWitness:
+      return "MissingCallChainWitness";
+    case ProofFailureReason::MissingSubtreeAdmissibility:
+      return "MissingSubtreeAdmissibility";
+    case ProofFailureReason::MissingWholeCoverBounds:
+      return "MissingWholeCoverBounds";
+    case ProofFailureReason::MissingWholeCoverContainment:
+      return "MissingWholeCoverContainment";
+    case ProofFailureReason::MissingWholeCoverBoundaryAccounting:
+      return "MissingWholeCoverBoundaryAccounting";
+    case ProofFailureReason::MissingIncludePatchShape:
+      return "MissingIncludePatchShape";
+    case ProofFailureReason::MissingIncludeAnchorWitness:
+      return "MissingIncludeAnchorWitness";
+    case ProofFailureReason::MissingIncludeAnchorByte:
+      return "MissingIncludeAnchorByte";
+    case ProofFailureReason::MissingConditionalOwnership:
+      return "MissingConditionalOwnership";
+    case ProofFailureReason::MissingMappedHeaderRange:
+      return "MissingMappedHeaderRange";
+    case ProofFailureReason::MissingMappedHeaderByteRange:
+      return "MissingMappedHeaderByteRange";
+    case ProofFailureReason::MissingIncludeSelectedConditionalBoundaryWitness:
+      return "MissingIncludeSelectedConditionalBoundaryWitness";
+    case ProofFailureReason::MissingIncludeChildBoundaryWitness:
+      return "MissingIncludeChildBoundaryWitness";
+    case ProofFailureReason::MissingIncludeRightNeighborWitness:
+      return "MissingIncludeRightNeighborWitness";
+    case ProofFailureReason::MissingIncludeLeftNeighborWitness:
+      return "MissingIncludeLeftNeighborWitness";
+    case ProofFailureReason::MissingIncludeDeclBoundaryWitness:
+      return "MissingIncludeDeclBoundaryWitness";
+    case ProofFailureReason::MissingIncludeRealizationWitness:
+      return "MissingIncludeRealizationWitness";
+    case ProofFailureReason::MissingIncludeRealizationInclude:
+      return "MissingIncludeRealizationInclude";
+    case ProofFailureReason::MissingIncludeRealizationCover:
+      return "MissingIncludeRealizationCover";
+    case ProofFailureReason::MissingIncludeRealizationBEnvelope:
+      return "MissingIncludeRealizationBEnvelope";
+    case ProofFailureReason::MissingTUAnchorClassification:
+      return "MissingTUAnchorClassification";
+    case ProofFailureReason::MissingTUAnchorWitness:
+      return "MissingTUAnchorWitness";
+    case ProofFailureReason::MissingTUAnchorGap:
+      return "MissingTUAnchorGap";
+    case ProofFailureReason::MissingTUAnchorByte:
+      return "MissingTUAnchorByte";
+    case ProofFailureReason::MissingTUExactSlotWitness:
+      return "MissingTUExactSlotWitness";
+    case ProofFailureReason::MissingTUProvableAnchorWitness:
+      return "MissingTUProvableAnchorWitness";
+    case ProofFailureReason::MissingTUOutsideIncludeCoverageProof:
+      return "MissingTUOutsideIncludeCoverageProof";
+    case ProofFailureReason::MissingTUOwnerDepthStability:
+      return "MissingTUOwnerDepthStability";
+    case ProofFailureReason::ExplicitOutOfDomainResult:
+      return "ExplicitOutOfDomainResult";
+    }
+    return "None";
+  }
 
   /// \brief Compact record of Step 3 class-local obligation discharge.
   struct ProofDischargeRecord {
@@ -1196,6 +1664,24 @@ private:
     TUTextEdit,
     TerminalOutOfDomain,
   };
+
+  friend inline StringRef toString(AcceptedResultCandidateKind kind) {
+    switch (kind) {
+    case AcceptedResultCandidateKind::Unknown:
+      return "Unknown";
+    case AcceptedResultCandidateKind::MacroPatch:
+      return "MacroPatch";
+    case AcceptedResultCandidateKind::IncludePatch:
+      return "IncludePatch";
+    case AcceptedResultCandidateKind::TUAnchor:
+      return "TUAnchor";
+    case AcceptedResultCandidateKind::TUTextEdit:
+      return "TUTextEdit";
+    case AcceptedResultCandidateKind::TerminalOutOfDomain:
+      return "TerminalOutOfDomain";
+    }
+    return "Unknown";
+  }
 
   /// \brief Normalized wrapper for a concrete accepted result.
   ///
@@ -3193,26 +3679,6 @@ private:
       const TUAnchorWitness *witness = nullptr) const;
 
   /// \brief Formatters for the normalized Step-1/2/3 proof metadata.
-  StringRef FormatAcceptedProofClass(AcceptedProofClass kind) const;
-  StringRef FormatAcceptedResultCandidateKind(
-      AcceptedResultCandidateKind kind) const;
-  StringRef FormatRealizationMode(RealizationMode mode) const;
-  StringRef FormatSelectionPreference(SelectionPreference preference) const;
-  StringRef FormatSurfaceDisposition(
-      SurfaceDisposition disposition) const;
-  StringRef FormatAcceptedPathKind(AcceptedPathKind kind) const;
-  StringRef FormatAcceptanceSupportKind(AcceptanceSupportKind support) const;
-  StringRef FormatFutureProofTarget(FutureProofTarget target) const;
-  StringRef FormatCompletenessCoverageKind(CompletenessCoverageKind kind) const;
-  StringRef
-  FormatCompletenessExpectationKind(CompletenessExpectationKind kind) const;
-  StringRef FormatTheoremDomainKind(TheoremDomainKind kind) const;
-  StringRef FormatLatticeConflictDomain(LatticeConflictDomain domain) const;
-  StringRef FormatLatticeMergeLaw(LatticeMergeLaw law) const;
-  StringRef FormatLatticeConflictLaw(LatticeConflictLaw law) const;
-  StringRef FormatProofDischargeStatus(ProofDischargeStatus status) const;
-  StringRef FormatProofObligationKind(ProofObligationKind obligation) const;
-  StringRef FormatProofFailureReason(ProofFailureReason reason) const;
   StringRef FormatTUAnchorEvidenceKind(TUAnchorEvidenceKind kind) const;
   StringRef FormatIncludeAnchorEvidenceKind(IncludeAnchorEvidenceKind kind) const;
   StringRef FormatIncludeRealizationEvidenceKind(
@@ -4050,7 +4516,9 @@ private:
   static std::string
   PPArgSpanListToString(ArrayRef<RefoldModel::PPArgSpan> spans,
                         ArrayRef<char> isStringify);
+
 };
+
 
 } // namespace refold
 } // namespace clang
