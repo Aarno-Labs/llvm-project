@@ -1004,13 +1004,13 @@ private:
     TerminalFallbackWitness terminalFallbackWitness;
   };
 
-  /// \brief Normalized accepted-result artifact kind used by Patch A.
+  /// \brief Normalized accepted-result artifact kind used by Patch A/B.
   ///
-  /// The current engine still decides acceptance through path-specific control
-  /// flow. Patch A does not change that behavior. Instead it introduces one
-  /// common candidate carrier so the already-selected macro/include/TU/terminal
-  /// results can be wrapped in a uniform shape, traced, and compared without
-  /// committing to a selector rewrite yet.
+  /// Patch A introduced the common carrier so already-accepted
+  /// macro/include/TU/terminal results could be wrapped in one uniform shape.
+  /// Patch B starts using that shape at selected competition sites, while the
+  /// rest of the engine still accepts results through path-specific control
+  /// flow until later selector-closure steps land.
   enum class AcceptedResultCandidateKind : uint8_t {
     Unknown,
     MacroPatch,
@@ -1019,11 +1019,12 @@ private:
     TerminalOutOfDomain,
   };
 
-  /// \brief Trace-only wrapper for a concrete accepted result.
+  /// \brief Normalized wrapper for a concrete accepted result.
   ///
-  /// This is intentionally small and explicit. It carries the normalized proof
-  /// summary plus just enough artifact-local provenance to let later steps
-  /// compare existing behavior against a future candidate-first selector.
+  /// The carrier stays intentionally small and explicit. It holds the
+  /// normalized proof summary plus enough artifact-local provenance for the
+  /// converted Patch-B selection sites to compare accepted outcomes through the
+  /// lattice without rebuilding path-specific ordering logic.
   struct AcceptedResultCandidate {
     AcceptedResultCandidateKind kind = AcceptedResultCandidateKind::Unknown;
     ProofSummary proofSummary = {};
@@ -2812,10 +2813,10 @@ private:
 
   /// \brief Compute the current global lattice law for an accepted summary.
   ///
-  /// Step 10 centralizes the descriptive merge/conflict policy that already
-  /// exists across macro, include, TU-anchor, and terminal-fallback paths.
-  /// The returned law is still descriptive in this step: later work may make
-  /// selection authoritative over this normalized lattice.
+  /// Step 10 centralizes the merge/conflict policy that already exists across
+  /// macro, include, TU-anchor, and terminal-fallback paths. Patch B starts
+  /// using that lattice at converted competition sites; later work will still
+  /// be needed before every selector in the engine is routed through it.
   GlobalSelectionLattice
   BuildGlobalSelectionLattice(const ProofSummary &summary) const;
 
@@ -2829,9 +2830,9 @@ private:
 
   /// \brief Return whether the normalized lattice prefers \p lhs over \p rhs.
   ///
-  /// This helper mirrors the existing top-level structural ordering policy in a
-  /// single deterministic comparator without changing the current selection
-  /// sites yet.
+  /// Patch B uses this comparator directly at the converted selection sites.
+  /// The ordering is deterministic and stable-on-ties so equal summaries can
+  /// preserve the existing caller-supplied precedence order.
   bool LatticePrefers(const ProofSummary &lhs,
                       const ProofSummary &rhs) const;
 
@@ -2857,6 +2858,35 @@ private:
   /// candidate carrier introduced by Patch A.
   AcceptedResultCandidate
   BuildAcceptedTerminalCandidate(const TerminalFallbackWitness &witness) const;
+
+  /// \brief Return whether a normalized accepted result is admissible for
+  /// lattice-based selection at the converted Patch-B sites.
+  ///
+  /// Patch B only changes how already-accepted outcomes are compared. It does
+  /// not yet tighten acceptance to discharged-only proof summaries, so any
+  /// concrete accepted candidate wrapper can participate here. Patch C is where
+  /// the selector will be restricted to discharged candidates only.
+  bool IsSelectableAcceptedResultCandidate(
+      const AcceptedResultCandidate &candidate) const;
+
+  /// \brief Return whether \p lhs outranks \p rhs under the normalized
+  /// candidate ordering used by Patch B.
+  ///
+  /// This lifts the proof-summary lattice comparison to the accepted-result
+  /// carrier and then applies deterministic artifact-local tie-breakers. When
+  /// two candidates are still indistinguishable after those tie-breakers, the
+  /// caller's original enumeration order is preserved.
+  bool AcceptedResultCandidatePrefers(
+      const AcceptedResultCandidate &lhs,
+      const AcceptedResultCandidate &rhs) const;
+
+  /// \brief Return the index of the strongest selectable accepted candidate.
+  ///
+  /// The returned index always refers to the original \p candidates order so
+  /// callers can keep artifact ownership outside the selector while still
+  /// centralizing the lattice-based comparison logic.
+  std::optional<size_t> SelectPreferredAcceptedResultCandidateIndex(
+      ArrayRef<AcceptedResultCandidate> candidates) const;
 
   /// \brief Return whether \p m carries usable producer-side paste witnesses.
   ///
