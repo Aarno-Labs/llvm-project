@@ -5769,7 +5769,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     }
   };
 
-  trace("macro/args", "  invArgRanges(%d)=%s", invArgRanges.size(),
+  trace("macro/args", "  invArgRanges({0})={1}", invArgRanges.size(),
         stringutils::rangesToStringWithSlices(baseInvText, invArgRanges));
 
   // Fast path for token-paste edits. A single pasted token can embed multiple
