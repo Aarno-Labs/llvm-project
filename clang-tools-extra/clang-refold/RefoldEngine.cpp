@@ -55,6 +55,8 @@
 #include "clang/Basic/TokenKinds.h"
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/DiagnosticOptions.h"
+#include "clang/Basic/FileManager.h"
+#include "clang/Basic/SourceManager.h"
 #include "clang/Frontend/CompilerInvocation.h"
 #include "clang/Lex/Lexer.h"
 
@@ -1111,13 +1113,6 @@ std::string RefoldEngine::Refold() {
 
   std::string out = RunSinglePassRefold();
 
-  // Step 8 closes the final theorem-facing audit gap for terminal runs: once
-  // the structural pass has requested fallback, validate that the fallback
-  // witness itself still classifies as the one explicit normalized
-  // out-of-domain carrier rather than only as an operational side effect.
-  if (terminalFallbackRequested_)
-    RecordTerminalFallbackTheoremAudit();
-
   // Step 6 makes the theorem audit authoritative in strict mode: once the
   // structural pass finishes, any surviving theorem-audit violation must be
   // converted into the one explicit terminal fallback rather than merely being
@@ -1131,14 +1126,20 @@ std::string RefoldEngine::Refold() {
   }
 
   // Partial-expansion fallback sits strictly between structural emission and
-  // terminal fallback to B. Step 1 only introduces the stage boundary; until a
-  // concrete proof class lands this path returns std::nullopt and behavior is
-  // unchanged.
+  // terminal fallback to B. A successful synthesis here supersedes the raw-B
+  // terminal carrier, so only record the explicit terminal theorem witness if
+  // this intermediate stage also fails closed.
   if (auto expanded = TryExpansionClosureFallback()) {
     EmitRefoldStats();
     EmitTheoremAudit();
     return *expanded;
   }
+
+  // Step 8 closes the final theorem-facing audit gap for true terminal runs:
+  // once both structural emission and proved intermediate fallback fail, the
+  // remaining result must still classify as the one explicit normalized
+  // out-of-domain carrier rather than only as an operational side effect.
+  RecordTerminalFallbackTheoremAudit();
 
   debug("fallback",
         "terminal fallback: emitting fully expanded edited preprocessed "

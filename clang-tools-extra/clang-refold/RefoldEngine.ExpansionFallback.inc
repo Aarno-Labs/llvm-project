@@ -236,24 +236,185 @@ RefoldEngine::BuildMacroOwnerExpansionClosureWitness() const {
   return witness;
 }
 
-std::optional<std::string> RefoldEngine::TryExpansionClosureFallback() const {
+bool RefoldEngine::ExpansionFallbackReplacementIsReplayStable(
+    StringRef replacementText) const {
+  if (replacementText.empty()) {
+    trace("fallback",
+          "macro-owner fallback synthesis rejected: empty replacement text");
+    return false;
+  }
+
+  // Step 3 keeps source synthesis narrower than the Step 2 witness. The first
+  // emitted fallback class must be replay-stable when re-lexed as ordinary
+  // source text, without relying on preprocessor hide sets. Reject any raw
+  // identifier token for now: direct source replay of identifiers would need a
+  // stronger proof that rescanning cannot trigger further macro expansion.
+  std::string buffer = replacementText.str();
+  if (buffer.empty() || buffer.back() != '\n')
+    buffer.push_back('\n');
+
+  using namespace clang;
+  IntrusiveRefCntPtr<DiagnosticIDs> diagIDs(new DiagnosticIDs());
+  IntrusiveRefCntPtr<DiagnosticOptions> diagOpts(new DiagnosticOptions());
+  auto *client = new IgnoringDiagConsumer();
+  DiagnosticsEngine diags(diagIDs, diagOpts, client,
+                          /*ShouldOwnClient=*/true);
+
+  FileSystemOptions fso;
+  FileManager fm(fso);
+  SourceManager sm(diags, fm);
+  auto mb = llvm::MemoryBuffer::getMemBufferCopy(buffer,
+                                                 "<expansion-fallback>");
+  FileID fid = sm.createFileID(std::move(mb));
+
+  const LangOptions lang = MakeLexLangOptions(model_.GetPPLang());
+  Lexer lex(fid, sm.getBufferOrFake(fid), sm, lang);
+  lex.SetKeepWhitespaceMode(false);
+
+  const StringRef fileBytes = sm.getBufferOrFake(fid).getBuffer();
+  Token token;
+  while (true) {
+    lex.LexFromRawLexer(token);
+    if (token.is(clang::tok::eof))
+      break;
+
+    if (token.is(clang::tok::raw_identifier) || token.is(clang::tok::hash) ||
+        token.is(clang::tok::hashhash)) {
+      const char *ptr = sm.getCharacterData(token.getLocation());
+      const size_t off = static_cast<size_t>(ptr - fileBytes.data());
+      const StringRef spelling(ptr, token.getLength());
+      trace("fallback",
+            "macro-owner fallback synthesis rejected: replay-unstable token kind={0} off={1} spelling='{2}'",
+            clang::tok::getTokenName(token.getKind()), off,
+            stringutils::showWSWithClip(spelling, 80));
+      return false;
+    }
+  }
+
+  return true;
+}
+
+std::optional<std::string>
+RefoldEngine::SynthesizeMacroOwnerExpansionClosureSource(
+    const ExpansionClosureWitness &witness) const {
+  if (witness.kind != ExpansionClosureKind::MacroOwnerWholeExpansion ||
+      !witness.hasRootMacroId || witness.hasOwnerIncludeId) {
+    trace("fallback",
+          "macro-owner fallback synthesis rejected: witness not in single-root macro domain");
+    return std::nullopt;
+  }
+
+  if (!witness.selfContained || witness.claimsClipped ||
+      witness.sourceByteEnd <= witness.sourceByteBegin ||
+      witness.bTokEnd <= witness.bTokBegin) {
+    trace("fallback",
+          "macro-owner fallback synthesis rejected: invalid witness bounds or clipped/selfContained flags source=[{0},{1}) B=[{2},{3}) selfContained={4} claimsClipped={5}",
+          witness.sourceByteBegin, witness.sourceByteEnd, witness.bTokBegin,
+          witness.bTokEnd, witness.selfContained ? 1 : 0,
+          witness.claimsClipped ? 1 : 0);
+    return std::nullopt;
+  }
+
+  const StringRef tuPath = model_.GetSourcePath();
+  if (tuPath.empty()) {
+    trace("fallback",
+          "macro-owner fallback synthesis rejected: empty TU source path");
+    return std::nullopt;
+  }
+
+  const std::string absTuPath = lineDirs_.ToAbsolutePath(tuPath);
+  auto tuBufferOrErr = llvm::MemoryBuffer::getFile(absTuPath);
+  if (!tuBufferOrErr) {
+    debug("fallback",
+          "macro-owner fallback synthesis rejected: failed to read TU source '{0}' ({1})",
+          absTuPath, tuBufferOrErr.getError().message());
+    return std::nullopt;
+  }
+  const StringRef tuBytes = (*tuBufferOrErr)->getBuffer();
+
+  if (witness.sourceByteEnd > tuBytes.size()) {
+    trace("fallback",
+          "macro-owner fallback synthesis rejected: source interval [{0},{1}) exceeds TU size={2}",
+          witness.sourceByteBegin, witness.sourceByteEnd, tuBytes.size());
+    return std::nullopt;
+  }
+
+  // Materialize the witness's full proved B-frontier. Unlike structural
+  // whole-cover patches, this fallback synthesis is a single closed owner
+  // splice, so it must not inherit the standalone-claim clipping used when B
+  // insertions are being emitted through separate structural edits.
+  std::string replacement = SliceBSource(witness.bTokBegin, witness.bTokEnd).str();
+  if (replacement.empty()) {
+    trace("fallback",
+          "macro-owner fallback synthesis rejected: materialization for B=[{0},{1}) is empty",
+          witness.bTokBegin, witness.bTokEnd);
+    return std::nullopt;
+  }
+
+  if (!ExpansionFallbackReplacementIsReplayStable(replacement))
+    return std::nullopt;
+
+  // Re-embed the materialized owner into the TU using the same boundary
+  // spacing and line-drift machinery as ordinary TU byte edits. This keeps the
+  // first synthesis class deterministic and avoids inventing a second emission
+  // path with subtly different token-adjacency or #line behavior.
+  std::string padded =
+      PadAtBoundaries(tuBytes, static_cast<size_t>(witness.sourceByteBegin),
+                      static_cast<size_t>(witness.sourceByteEnd),
+                      std::move(replacement), /*allowLeft=*/true,
+                      /*allowRight=*/true);
+  ResyncOutcome ro = ApplyResyncOrPend(tuBytes, witness.sourceByteBegin,
+                                       witness.sourceByteEnd, padded, tuPath);
+
+  SmallString<0> out;
+  out.reserve(tuBytes.size() -
+              (witness.sourceByteEnd - witness.sourceByteBegin) +
+              ro.text.size() + 64);
+  std::optional<PendingResync> pending;
+  pending = AppendOriginalSliceWithPending(out, tuBytes, 0,
+                                           witness.sourceByteBegin,
+                                           std::move(pending));
+  out.append(ro.text);
+  pending = ro.pending;
+  pending = AppendOriginalSliceWithPending(out, tuBytes, witness.sourceByteEnd,
+                                           tuBytes.size(),
+                                           std::move(pending));
+
+  return std::string(out.str());
+}
+
+std::optional<std::string> RefoldEngine::TryExpansionClosureFallback() {
   if (!terminalFallbackRequested_)
     return std::nullopt;
 
-  // This intermediate stage remains proof-driven: discover a declared witness
-  // kind first, and only later steps are allowed to turn that witness into an
-  // emitted fallback source.
+  // This intermediate stage remains proof-driven: build a declared witness
+  // first, then synthesize source only if the witness survives the narrower
+  // Step 3 replay-stability checks.
   if (auto witness = BuildMacroOwnerExpansionClosureWitness()) {
     debug("fallback", "expansion-closure witness discovered: {0}",
           FormatExpansionClosureWitness(*witness));
+
+    if (auto source = SynthesizeMacroOwnerExpansionClosureSource(*witness)) {
+      debug("fallback",
+            "expansion-closure source synthesized: rootMacro={0} source=[{1},{2}) B=[{3},{4}) outLen={5}",
+            witness->rootMacroId, witness->sourceByteBegin,
+            witness->sourceByteEnd, witness->bTokBegin, witness->bTokEnd,
+            source->size());
+
+      // The first synthesized fallback output is the original TU with exactly
+      // one proved top-level macro owner expanded at its callsite.
+      ResetAttemptStats();
+      lastStats_.expandedMacros = 1;
+      lastStats_.terminalFallbackToB = false;
+      return source;
+    }
+
+    debug("fallback",
+          "expansion-closure stage: witness could not be synthesized into replay-stable source");
   } else {
     debug("fallback",
-          "expansion-closure stage: no proved single-owner macro fallback "
-          "witness available");
+          "expansion-closure stage: no proved single-owner macro fallback witness available");
   }
 
-  // Step 2 only proves the first concrete fallback witness. Source synthesis
-  // still arrives in a later step, so preserve the existing fail-closed
-  // behavior here until the witness is connected to an emitted replacement.
   return std::nullopt;
 }
