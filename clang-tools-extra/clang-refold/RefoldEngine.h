@@ -336,6 +336,18 @@ private:
     uint64_t selectorDirectBypasses = 0;
     uint64_t explicitTerminalExclusions = 0;
     uint64_t nonExplicitTerminalExclusions = 0;
+    /// Coverage counters for the non-theorem-facing intermediate expansion
+    /// fallback stage.
+    ///
+    /// The expansion fallback does not mint theorem-facing carriers by itself,
+    /// so it must not perturb the declared-domain counters above. Track it in a
+    /// separate block instead so the theorem audit can still report whether a
+    /// run discovered a witness, rejected synthesis, or used the proved stage
+    /// to intercept a would-be terminal raw-B fallback.
+    uint64_t expansionFallbackWitnesses = 0;
+    uint64_t expansionFallbackSynthesisSuccesses = 0;
+    uint64_t expansionFallbackSynthesisRejections = 0;
+    uint64_t expansionFallbackTerminalRescues = 0;
     bool theoremSatisfied = true;
     std::string firstViolation;
   };
@@ -490,7 +502,9 @@ private:
          "satisfied={0} emittedEdits={1} carriers={2} declared={3} discharged={4} "
          "selectorOnlyExceptions={5} transitional={6} undischarged={7} unknownClass={8} outOfDomain={9} "
          "selectorCompetitions={10} selectorResolutions={11} selectorNoSelectable={12} selectorUnresolved={13} "
-         "selectorDirectBypasses={14} explicitTerminalExclusions={15} nonExplicitTerminalExclusions={16}",
+         "selectorDirectBypasses={14} explicitTerminalExclusions={15} nonExplicitTerminalExclusions={16} "
+         "expansionFallbackWitnesses={17} expansionFallbackSynthesisSuccesses={18} "
+         "expansionFallbackSynthesisRejections={19} expansionFallbackTerminalRescues={20}",
          lastTheoremAudit_.theoremSatisfied ? 1 : 0,
          lastTheoremAudit_.emittedNonTerminalEdits,
          lastTheoremAudit_.emittedCarriers,
@@ -507,7 +521,11 @@ private:
          lastTheoremAudit_.selectorUnresolvedCompetitions,
          lastTheoremAudit_.selectorDirectBypasses,
          lastTheoremAudit_.explicitTerminalExclusions,
-         lastTheoremAudit_.nonExplicitTerminalExclusions);
+         lastTheoremAudit_.nonExplicitTerminalExclusions,
+         lastTheoremAudit_.expansionFallbackWitnesses,
+         lastTheoremAudit_.expansionFallbackSynthesisSuccesses,
+         lastTheoremAudit_.expansionFallbackSynthesisRejections,
+         lastTheoremAudit_.expansionFallbackTerminalRescues);
     if (!lastTheoremAudit_.theoremSatisfied &&
         !lastTheoremAudit_.firstViolation.empty()) {
       info("theorem", "firstViolation={0}",
