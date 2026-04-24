@@ -8379,11 +8379,17 @@ RefoldEngine::InventoryMacroPatchAcceptancePath(const MacroPatch &patch) const {
     return BuildAcceptancePathInventory(
         AcceptedPathKind::MacroArgsOnlyPurePasteOnly);
   case MacroPatchProofKind::ArgsOnlyPairedPureInsertion:
+    // Paired pure insertion is only valid on non-paste direct arg/stringify
+    // surfaces. The builder already enforces that; Step 6 records it.
     return BuildAcceptancePathInventory(
         AcceptedPathKind::MacroArgsOnlyPairedPureInsertion);
   case MacroPatchProofKind::DagSubtreeRoot:
+    // DAG-preserving rewrites must carry the explicit subtree certificate that
+    // Step 5 started recording on accepted root patches.
     return BuildAcceptancePathInventory(AcceptedPathKind::MacroDagSubtreeRoot);
   case MacroPatchProofKind::CallChainSuffix:
+    // Call-chain suffix rewrites are emitted directly on the root callsite
+    // slice, so the patch's owning macro id must already be that root.
     return BuildAcceptancePathInventory(AcceptedPathKind::MacroCallChainSuffix);
   case MacroPatchProofKind::CounterLiteral:
     return BuildAcceptancePathInventory(AcceptedPathKind::MacroCounterLiteral);
@@ -8551,8 +8557,14 @@ RefoldEngine::ClassifyMacroPatchProof(const MacroPatch &patch) const {
   case MacroPatchProofKind::ArgsOnlyPurePasteOnly:
   case MacroPatchProofKind::ArgsOnlyStandard:
   case MacroPatchProofKind::ArgsOnlyPairedPureInsertion:
+    // Paired pure insertion is only valid on non-paste direct arg/stringify
+    // surfaces. The builder already enforces that; Step 6 records it.
   case MacroPatchProofKind::DagSubtreeRoot:
+    // DAG-preserving rewrites must carry the explicit subtree certificate that
+    // Step 5 started recording on accepted root patches.
   case MacroPatchProofKind::CallChainSuffix:
+    // Call-chain suffix rewrites are emitted directly on the root callsite
+    // slice, so the patch's owning macro id must already be that root.
     summary.acceptedClass = AcceptedProofClass::InvocationPreserving;
     summary.realizationMode = RealizationMode::PreserveOriginalStructure;
     summary.preference = SelectionPreference::PreferStructurePreservation;
@@ -8749,10 +8761,59 @@ RefoldEngine::BuildIncludePatchProofSummary(
   return summary;
 }
 
+bool RefoldEngine::MacroInvocationHasWellFormedPasteWitnesses(
+    const RefoldModel::MacroInvocation &m) const {
+  // Step 6 consumes the exact `paste_tokens` witnesses serialized in Step 5.
+  // A usable witness stream must describe each pasted token as one contiguous
+  // partition of its final spelling, and any argument-derived fragment must
+  // name a formal that exists on the invocation.
+  if (m.pasteTokens.empty())
+    return false;
+
+  llvm::SmallDenseSet<uint32_t, 8> pasteSpanArgIndices;
+  for (const auto &ps : m.pasteSpans)
+    pasteSpanArgIndices.insert(ps.argIdx);
+
+  for (const auto &tok : m.pasteTokens) {
+    if (tok.spelling.empty() || tok.parts.empty())
+      return false;
+
+    uint32_t cursor = 0;
+    bool sawArgDerivedPart = false;
+    for (const auto &part : tok.parts) {
+      if (part.byteBegin != cursor || part.byteEnd < part.byteBegin ||
+          part.byteEnd > tok.spelling.size() || part.byteBegin == part.byteEnd)
+        return false;
+
+      if (part.argIndex) {
+        if (*part.argIndex >= m.defParams.size())
+          return false;
+        if (!pasteSpanArgIndices.empty() &&
+            !pasteSpanArgIndices.count(*part.argIndex))
+          return false;
+        sawArgDerivedPart = true;
+      }
+
+      cursor = part.byteEnd;
+    }
+
+    if (cursor != tok.spelling.size())
+      return false;
+
+    // A pasted token witness that never attributes any bytes back to a formal
+    // is not useful for args-only paste preservation.
+    if (!sawArgDerivedPart)
+      return false;
+  }
+
+  return true;
+}
+
 RefoldEngine::ProofDischargeRecord
 RefoldEngine::ValidateInvocationPreservingProof(const MacroPatch &patch) const {
   ProofDischargeAccumulator discharge;
-  const AcceptancePathInventory inventory = InventoryMacroPatchAcceptancePath(patch);
+  const AcceptancePathInventory inventory =
+      InventoryMacroPatchAcceptancePath(patch);
 
   discharge.Require(inventory.currentPath != AcceptedPathKind::Unknown,
                     ProofObligationKind::AcceptedPathClassified,
@@ -8769,14 +8830,78 @@ RefoldEngine::ValidateInvocationPreservingProof(const MacroPatch &patch) const {
   discharge.Require(patch.proofRootMacroId != 0,
                     ProofObligationKind::ProofRootTracked,
                     ProofFailureReason::MissingProofRoot);
-  if (patch.subtreeCertBacked) {
-    discharge.Require(patch.subtreeAdmissible,
-                      ProofObligationKind::SubtreeAdmissibilityTracked,
-                      ProofFailureReason::MissingSubtreeAdmissibility);
+
+  const RefoldModel::MacroInvocation *root =
+      patch.proofRootMacroId ? FindMacroInvocationById(patch.proofRootMacroId)
+                             : nullptr;
+  discharge.Require(root != nullptr,
+                    ProofObligationKind::MacroProofRootResolved,
+                    ProofFailureReason::MissingMacroProofRootResolution);
+  if (root) {
+    discharge.Require(GetRootMacroId(root->id) == root->id,
+                      ProofObligationKind::MacroProofRootIsTopLevel,
+                      ProofFailureReason::NonTopLevelMacroProofRoot);
+  }
+
+  switch (patch.proofKind) {
+  case MacroPatchProofKind::ArgsOnlyStandard:
+    // Standard args-only rewrites do not rely on producer-side paste
+    // witnesses; the common preserving obligations above are sufficient.
+    break;
+
+  case MacroPatchProofKind::ArgsOnlyPasteSingle:
+  case MacroPatchProofKind::ArgsOnlyPasteMulti:
+  case MacroPatchProofKind::ArgsOnlyPurePasteOnly:
+    // Paste-preserving classes must now be backed by the exact Step-5
+    // `paste_tokens` witness stream for the root invocation.
+    discharge.Require(root && !root->pasteSpans.empty(),
+                      ProofObligationKind::MacroPasteWitnessPresent,
+                      ProofFailureReason::MissingPasteWitness);
+    if (root && !root->pasteSpans.empty()) {
+      discharge.Require(MacroInvocationHasWellFormedPasteWitnesses(*root),
+                        ProofObligationKind::MacroPasteWitnessWellFormed,
+                        ProofFailureReason::MalformedPasteWitness);
+    }
+    break;
+
+  case MacroPatchProofKind::ArgsOnlyPairedPureInsertion:
+    // Paired pure insertion is only valid on non-paste direct arg/stringify
+    // surfaces. The builder already enforces that; Step 6 records it.
+    discharge.Require(root && root->pasteSpans.empty(),
+                      ProofObligationKind::MacroPasteFreeSurfaceTracked,
+                      ProofFailureReason::UnexpectedPasteSurface);
+    break;
+
+  case MacroPatchProofKind::DagSubtreeRoot:
+    // DAG-preserving rewrites must carry the explicit subtree certificate that
+    // Step 5 started recording on accepted root patches.
+    discharge.Require(patch.subtreeCertBacked,
+                      ProofObligationKind::MacroSubtreeCertificateTracked,
+                      ProofFailureReason::MissingSubtreeCertificate);
+    if (patch.subtreeCertBacked) {
+      discharge.Require(patch.subtreeAdmissible,
+                        ProofObligationKind::SubtreeAdmissibilityTracked,
+                        ProofFailureReason::MissingSubtreeAdmissibility);
+    }
+    break;
+
+  case MacroPatchProofKind::CallChainSuffix:
+    // Call-chain suffix rewrites are emitted directly on the root callsite
+    // slice, so the patch's owning macro id must already be that root.
+    discharge.Require(patch.macroId == patch.proofRootMacroId,
+                      ProofObligationKind::MacroCallChainWitnessTracked,
+                      ProofFailureReason::MissingCallChainWitness);
+    break;
+
+  case MacroPatchProofKind::CounterLiteral:
+  case MacroPatchProofKind::WholeCoverRealization:
+  case MacroPatchProofKind::Unknown:
+    break;
   }
 
   return discharge.Finish();
 }
+
 
 RefoldEngine::ProofDischargeRecord
 RefoldEngine::ValidateInvocationRealizationProof(const MacroPatch &patch) const {
@@ -9131,6 +9256,20 @@ StringRef RefoldEngine::FormatProofObligationKind(
     return "StructureMatchesAcceptedClass";
   case ProofObligationKind::ProofRootTracked:
     return "ProofRootTracked";
+  case ProofObligationKind::MacroProofRootResolved:
+    return "MacroProofRootResolved";
+  case ProofObligationKind::MacroProofRootIsTopLevel:
+    return "MacroProofRootIsTopLevel";
+  case ProofObligationKind::MacroPasteWitnessPresent:
+    return "MacroPasteWitnessPresent";
+  case ProofObligationKind::MacroPasteWitnessWellFormed:
+    return "MacroPasteWitnessWellFormed";
+  case ProofObligationKind::MacroPasteFreeSurfaceTracked:
+    return "MacroPasteFreeSurfaceTracked";
+  case ProofObligationKind::MacroSubtreeCertificateTracked:
+    return "MacroSubtreeCertificateTracked";
+  case ProofObligationKind::MacroCallChainWitnessTracked:
+    return "MacroCallChainWitnessTracked";
   case ProofObligationKind::SubtreeAdmissibilityTracked:
     return "SubtreeAdmissibilityTracked";
   case ProofObligationKind::WholeCoverBoundsTracked:
@@ -9171,6 +9310,20 @@ StringRef RefoldEngine::FormatProofFailureReason(ProofFailureReason reason) cons
     return "StructuralMismatch";
   case ProofFailureReason::MissingProofRoot:
     return "MissingProofRoot";
+  case ProofFailureReason::MissingMacroProofRootResolution:
+    return "MissingMacroProofRootResolution";
+  case ProofFailureReason::NonTopLevelMacroProofRoot:
+    return "NonTopLevelMacroProofRoot";
+  case ProofFailureReason::MissingPasteWitness:
+    return "MissingPasteWitness";
+  case ProofFailureReason::MalformedPasteWitness:
+    return "MalformedPasteWitness";
+  case ProofFailureReason::UnexpectedPasteSurface:
+    return "UnexpectedPasteSurface";
+  case ProofFailureReason::MissingSubtreeCertificate:
+    return "MissingSubtreeCertificate";
+  case ProofFailureReason::MissingCallChainWitness:
+    return "MissingCallChainWitness";
   case ProofFailureReason::MissingSubtreeAdmissibility:
     return "MissingSubtreeAdmissibility";
   case ProofFailureReason::MissingWholeCoverBounds:
@@ -9209,10 +9362,16 @@ RefoldEngine::FormatMacroPatchProofKind(MacroPatchProofKind kind) const {
   case MacroPatchProofKind::ArgsOnlyStandard:
     return "ArgsOnlyStandard";
   case MacroPatchProofKind::ArgsOnlyPairedPureInsertion:
+    // Paired pure insertion is only valid on non-paste direct arg/stringify
+    // surfaces. The builder already enforces that; Step 6 records it.
     return "ArgsOnlyPairedPureInsertion";
   case MacroPatchProofKind::DagSubtreeRoot:
+    // DAG-preserving rewrites must carry the explicit subtree certificate that
+    // Step 5 started recording on accepted root patches.
     return "DagSubtreeRoot";
   case MacroPatchProofKind::CallChainSuffix:
+    // Call-chain suffix rewrites are emitted directly on the root callsite
+    // slice, so the patch's owning macro id must already be that root.
     return "CallChainSuffix";
   case MacroPatchProofKind::WholeCoverRealization:
     return "WholeCoverRealization";

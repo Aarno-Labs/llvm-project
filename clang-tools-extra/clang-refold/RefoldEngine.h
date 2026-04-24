@@ -672,6 +672,13 @@ private:
     LegacyValidationRecorded,
     StructureMatchesAcceptedClass,
     ProofRootTracked,
+    MacroProofRootResolved,
+    MacroProofRootIsTopLevel,
+    MacroPasteWitnessPresent,
+    MacroPasteWitnessWellFormed,
+    MacroPasteFreeSurfaceTracked,
+    MacroSubtreeCertificateTracked,
+    MacroCallChainWitnessTracked,
     SubtreeAdmissibilityTracked,
     WholeCoverBoundsTracked,
     WholeCoverContainmentTracked,
@@ -693,6 +700,13 @@ private:
     MissingLegacyValidation,
     StructuralMismatch,
     MissingProofRoot,
+    MissingMacroProofRootResolution,
+    NonTopLevelMacroProofRoot,
+    MissingPasteWitness,
+    MalformedPasteWitness,
+    UnexpectedPasteSurface,
+    MissingSubtreeCertificate,
+    MissingCallChainWitness,
     MissingSubtreeAdmissibility,
     MissingWholeCoverBounds,
     MissingWholeCoverContainment,
@@ -2501,6 +2515,16 @@ private:
       AcceptedPathKind currentPath =
           AcceptedPathKind::IncludePatchPendingMaterialization,
       const IncludePatch *patch = nullptr) const;
+
+  /// \brief Return whether \p m carries usable producer-side paste witnesses.
+  ///
+  /// Step 5 serialized the producer's exact `##` decomposition into the model.
+  /// Step 6 uses that witness stream to tighten the descriptive proof contract
+  /// for macro-preserving paste classes. This helper is intentionally strict:
+  /// each pasted token must have contiguous half-open parts that stay within
+  /// the final spelling, and any argument-derived part must name a valid formal.
+  bool MacroInvocationHasWellFormedPasteWitnesses(
+      const RefoldModel::MacroInvocation &m) const;
 
   /// \brief Validate the current local proof contract for an accepted class.
   ///
