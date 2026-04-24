@@ -7626,15 +7626,19 @@ RefoldEngine::ResolveIncludeRealizationBTokenEnvelope(
     uint64_t beginTok, uint64_t endTok,
     IncludeRealizationEvidenceKind *evidenceKind) const {
   if (auto canonical = MapATokRangeAToBTokenEnvelope(beginTok, endTok)) {
+    // The strongest in-domain witness is the canonical A-cover -> B-envelope
+    // mapping. Record that fact explicitly so the include-realization class
+    // predicate can distinguish canonical witnesses from the deterministic
+    // consensus-rescue fallback below.
     if (evidenceKind)
-      *evidenceKind = IncludeRealizationEvidenceKind::InlineFromBCoverEnvelope;
+      *evidenceKind = IncludeRealizationEvidenceKind::CanonicalBCoverEnvelope;
     return canonical;
   }
 
-  // Step 4A absorbs the include-envelope gap conservatively. When the
-  // canonical mapper cannot recover the B envelope, consult the existing
-  // deterministic rescue projections and accept them only if the usable
-  // projections agree on one non-empty B-token envelope.
+  // Step 4A keeps unresolved include envelopes as an explicit domain wall.
+  // When the canonical mapper cannot recover the B envelope, consult the
+  // existing deterministic rescue projections and accept them only if the
+  // usable projections agree on one non-empty B-token envelope.
   auto isUsableEnvelope = [&](const std::optional<std::pair<size_t, size_t>> &env)
       -> bool {
     if (!env || env->second <= env->first)
@@ -7686,7 +7690,8 @@ RefoldEngine::ResolveIncludeRealizationBTokenEnvelope(
     return std::nullopt;
 
   if (evidenceKind)
-    *evidenceKind = IncludeRealizationEvidenceKind::InlineFromBCoverEnvelope;
+    *evidenceKind =
+        IncludeRealizationEvidenceKind::ConsensusRescuedBCoverEnvelope;
   trace("include/mat",
         "include-realization rescue envelope consensus: A-cover=[{0},{1}) "
         "Btok=[{2},{3})",
@@ -8681,8 +8686,9 @@ RefoldEngine::BuildAcceptancePathInventory(AcceptedPathKind currentPath) const {
     inventory.futureTarget = FutureProofTarget::IncludeInsertionByDeclBoundary;
     break;
   case AcceptedPathKind::IncludeRealizationInlineFromB:
-    // Step 9 promotes deterministic include inlining from B into an explicit
-    // witness-backed include realization proof path.
+    // Step 4A narrows the declared include-realization domain explicitly:
+    // this first-class path exists only when the include cover carries a
+    // canonical or deterministic-consensus B-envelope witness.
     inventory.support = AcceptanceSupportKind::ExplicitProofBacked;
     inventory.futureTarget = FutureProofTarget::IncludeRealizationCover;
     break;
@@ -9992,6 +9998,18 @@ RefoldEngine::ValidateIncludePreservingProof(AcceptedPathKind currentPath,
   return discharge.Finish();
 }
 
+bool RefoldEngine::IsAcceptedIncludeRealizationEvidenceKind(
+    IncludeRealizationEvidenceKind kind) const {
+  switch (kind) {
+  case IncludeRealizationEvidenceKind::CanonicalBCoverEnvelope:
+  case IncludeRealizationEvidenceKind::ConsensusRescuedBCoverEnvelope:
+    return true;
+  case IncludeRealizationEvidenceKind::Unknown:
+    return false;
+  }
+  return false;
+}
+
 RefoldEngine::ProofDischargeRecord
 RefoldEngine::ValidateIncludeRealizationProof(
     AcceptedPathKind currentPath, const IncludePatch *patch,
@@ -10011,9 +10029,14 @@ RefoldEngine::ValidateIncludeRealizationProof(
                     ProofObligationKind::AcceptedPathClassified,
                     ProofFailureReason::MissingAcceptedPathClassification);
   if (currentPath == AcceptedPathKind::IncludeRealizationInlineFromB) {
+    // Step 4A formalizes the class predicate directly in the local proof:
+    // inline include realization is discharged only when the witness records
+    // either the canonical B-envelope mapping or the deterministic
+    // consensus-rescue envelope. Any other evidence kind is outside the
+    // declared domain for this proof class.
     discharge.Require(witness &&
-                          witness->evidence ==
-                              IncludeRealizationEvidenceKind::InlineFromBCoverEnvelope,
+                          IsAcceptedIncludeRealizationEvidenceKind(
+                              witness->evidence),
                       ProofObligationKind::IncludeRealizationWitnessTracked,
                       ProofFailureReason::MissingIncludeRealizationWitness);
     discharge.Require(witness && witness->hasIncludeId && witness->includeId != 0,
@@ -10719,8 +10742,10 @@ StringRef RefoldEngine::FormatIncludeRealizationEvidenceKind(
   switch (kind) {
   case IncludeRealizationEvidenceKind::Unknown:
     return "Unknown";
-  case IncludeRealizationEvidenceKind::InlineFromBCoverEnvelope:
-    return "InlineFromBCoverEnvelope";
+  case IncludeRealizationEvidenceKind::CanonicalBCoverEnvelope:
+    return "CanonicalBCoverEnvelope";
+  case IncludeRealizationEvidenceKind::ConsensusRescuedBCoverEnvelope:
+    return "ConsensusRescuedBCoverEnvelope";
   }
   return "Unknown";
 }
@@ -20915,11 +20940,12 @@ uint64_t RefoldEngine::GetRootMacroId(uint64_t macroId) const {
 std::optional<std::string> RefoldEngine::BuildInlineIncludeRealizationFromB(
     const RefoldModel::IncludeItem &inc, StringRef reason,
     AcceptedResultCandidate *acceptedCandidate) const {
-  // Step 4A strengthens include realization by consulting the deterministic
-  // rescue envelope projections when the canonical A-cover -> B-envelope map is
-  // unavailable. The path remains fail-closed: if the rescue projections do
-  // not yield one usable consensus envelope, the engine stays in the explicit
-  // out-of-domain terminal state.
+  // Step 4A makes the include-realization boundary explicit. Inline
+  // realization is in-domain only when the include cover yields either the
+  // canonical A-cover -> B-envelope mapping or one deterministic
+  // consensus-rescued B envelope. If neither witness exists, the engine stays
+  // in the explicit out-of-domain terminal state instead of manufacturing a
+  // weaker include-realization proof.
   IncludeRealizationEvidenceKind evidenceKind =
       IncludeRealizationEvidenceKind::Unknown;
   auto bEnvOpt = ResolveIncludeRealizationBTokenEnvelope(
@@ -20928,9 +20954,9 @@ std::optional<std::string> RefoldEngine::BuildInlineIncludeRealizationFromB(
     RequestTerminalFallback(
         TerminalFallbackKind::IncludeRealizationUnmappableBCoverEnvelope,
         "include/mat",
-        llvm::formatv("include realization from B failed to resolve a usable "
-                      "B envelope for A cover [{0},{1}) for inc#{2}; "
-                      "reason={3}",
+        llvm::formatv("include realization from B failed to resolve a "
+                      "canonical-or-consensus-resolvable B envelope for "
+                      "A cover [{0},{1}) for inc#{2}; reason={3}",
                       inc.cover.begin, inc.cover.end, inc.id, reason)
             .str());
     return std::nullopt;
