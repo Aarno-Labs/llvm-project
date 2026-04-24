@@ -679,503 +679,7 @@ RefoldEngine::ValidateTUAnchorProof(AcceptedPathKind currentPath,
 }
 
 StringRef
-RefoldEngine::FormatAcceptedProofClass(AcceptedProofClass kind) const {
-  switch (kind) {
-  case AcceptedProofClass::Unknown:
-    return "Unknown";
-  case AcceptedProofClass::InvocationPreserving:
-    return "InvocationPreserving";
-  case AcceptedProofClass::InvocationRealization:
-    return "InvocationRealization";
-  case AcceptedProofClass::IncludePreserving:
-    return "IncludePreserving";
-  case AcceptedProofClass::IncludeRealization:
-    return "IncludeRealization";
-  case AcceptedProofClass::TUAnchor:
-    return "TUAnchor";
-  case AcceptedProofClass::TUTextualEdit:
-    return "TUTextualEdit";
-  }
-  return "Unknown";
-}
-
-StringRef RefoldEngine::FormatAcceptedResultCandidateKind(
-    AcceptedResultCandidateKind kind) const {
-  switch (kind) {
-  case AcceptedResultCandidateKind::Unknown:
-    return "Unknown";
-  case AcceptedResultCandidateKind::MacroPatch:
-    return "MacroPatch";
-  case AcceptedResultCandidateKind::IncludePatch:
-    return "IncludePatch";
-  case AcceptedResultCandidateKind::TUAnchor:
-    return "TUAnchor";
-  case AcceptedResultCandidateKind::TUTextEdit:
-    return "TUTextEdit";
-  case AcceptedResultCandidateKind::TerminalOutOfDomain:
-    return "TerminalOutOfDomain";
-  }
-  return "Unknown";
-}
-
-StringRef RefoldEngine::FormatRealizationMode(RealizationMode mode) const {
-  switch (mode) {
-  case RealizationMode::Unknown:
-    return "Unknown";
-  case RealizationMode::PreserveOriginalStructure:
-    return "PreserveOriginalStructure";
-  case RealizationMode::RealizeEditedSurface:
-    return "RealizeEditedSurface";
-  }
-  return "Unknown";
-}
-
-StringRef
-RefoldEngine::FormatSelectionPreference(SelectionPreference preference) const {
-  switch (preference) {
-  case SelectionPreference::Unknown:
-    return "Unknown";
-  case SelectionPreference::PreferStructurePreservation:
-    return "PreferStructurePreservation";
-  case SelectionPreference::PreferSurfaceRealization:
-    return "PreferSurfaceRealization";
-  case SelectionPreference::PreferExactAnchoring:
-    return "PreferExactAnchoring";
-  }
-  return "Unknown";
-}
-
-StringRef RefoldEngine::FormatSurfaceDisposition(
-    SurfaceDisposition disposition) const {
-  switch (disposition) {
-  case SurfaceDisposition::None:
-    return "None";
-  case SurfaceDisposition::RealizeWholeCoverMacros:
-    return "RealizeWholeCoverMacros";
-  case SurfaceDisposition::RealizeInlineTouchedIncludesFromB:
-    return "RealizeInlineTouchedIncludesFromB";
-  case SurfaceDisposition::RealizeMaterializedIncludeExpansion:
-    return "RealizeMaterializedIncludeExpansion";
-  case SurfaceDisposition::RealizeTranslationUnitByteEdit:
-    return "RealizeTranslationUnitByteEdit";
-  case SurfaceDisposition::EmitEditedPreprocessedStream:
-    return "EmitEditedPreprocessedStream";
-  }
-  return "None";
-}
-
-StringRef RefoldEngine::FormatAcceptedPathKind(AcceptedPathKind kind) const {
-  switch (kind) {
-  case AcceptedPathKind::Unknown:
-    return "Unknown";
-  case AcceptedPathKind::MacroArgsOnlyStandard:
-    return "MacroArgsOnlyStandard";
-  case AcceptedPathKind::MacroArgsOnlyPasteSingle:
-    return "MacroArgsOnlyPasteSingle";
-  case AcceptedPathKind::MacroArgsOnlyPasteMulti:
-    return "MacroArgsOnlyPasteMulti";
-  case AcceptedPathKind::MacroArgsOnlyPurePasteOnly:
-    return "MacroArgsOnlyPurePasteOnly";
-  case AcceptedPathKind::MacroArgsOnlyPairedPureInsertion:
-    return "MacroArgsOnlyPairedPureInsertion";
-  case AcceptedPathKind::MacroDagSubtreeRoot:
-    return "MacroDagSubtreeRoot";
-  case AcceptedPathKind::MacroCallChainSuffix:
-    return "MacroCallChainSuffix";
-  case AcceptedPathKind::MacroCounterLiteral:
-    return "MacroCounterLiteral";
-  case AcceptedPathKind::MacroWholeCoverRealization:
-    return "MacroWholeCoverRealization";
-  case AcceptedPathKind::IncludePatchPendingMaterialization:
-    return "IncludePatchPendingMaterialization";
-  case AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens:
-    return "IncludeDeleteReplaceMappedHeaderTokens";
-  case AcceptedPathKind::IncludeInsertSelectedConditionalBoundary:
-    return "IncludeInsertSelectedConditionalBoundary";
-  case AcceptedPathKind::IncludeInsertChildBoundary:
-    return "IncludeInsertChildBoundary";
-  case AcceptedPathKind::IncludeInsertRightNeighborPP:
-    return "IncludeInsertRightNeighborPP";
-  case AcceptedPathKind::IncludeInsertLeftNeighborPP:
-    return "IncludeInsertLeftNeighborPP";
-  case AcceptedPathKind::IncludeInsertDeclBoundary:
-    return "IncludeInsertDeclBoundary";
-  case AcceptedPathKind::IncludeRealizationInlineFromB:
-    return "IncludeRealizationInlineFromB";
-  case AcceptedPathKind::IncludeMaterializedExpansion:
-    return "IncludeMaterializedExpansion";
-  case AcceptedPathKind::TUExactSlotBoundary:
-    return "TUExactSlotBoundary";
-  case AcceptedPathKind::TUProvableInsertionAnchor:
-    return "TUProvableInsertionAnchor";
-  case AcceptedPathKind::TUByteSpanMappedEdit:
-    return "TUByteSpanMappedEdit";
-  case AcceptedPathKind::TUByteSpanConservativeEdit:
-    return "TUByteSpanConservativeEdit";
-  case AcceptedPathKind::TerminalEmitEditedPreprocessedStream:
-    return "TerminalEmitEditedPreprocessedStream";
-  }
-  return "Unknown";
-}
-
-StringRef
-RefoldEngine::FormatAcceptanceSupportKind(AcceptanceSupportKind support) const {
-  switch (support) {
-  case AcceptanceSupportKind::Unknown:
-    return "Unknown";
-  case AcceptanceSupportKind::ExplicitProofBacked:
-    return "ExplicitProofBacked";
-  case AcceptanceSupportKind::DeterministicButNotFirstClass:
-    return "DeterministicButNotFirstClass";
-  case AcceptanceSupportKind::ExplicitOutOfDomainClass:
-    return "ExplicitOutOfDomainClass";
-  }
-  return "Unknown";
-}
-
-StringRef RefoldEngine::FormatFutureProofTarget(FutureProofTarget target) const {
-  switch (target) {
-  case FutureProofTarget::Unknown:
-    return "Unknown";
-  case FutureProofTarget::MacroStandardArgsOnly:
-    return "MacroStandardArgsOnly";
-  case FutureProofTarget::MacroPasteSingle:
-    return "MacroPasteSingle";
-  case FutureProofTarget::MacroPasteMultiFixedAnchor:
-    return "MacroPasteMultiFixedAnchor";
-  case FutureProofTarget::MacroPurePasteOnly:
-    return "MacroPurePasteOnly";
-  case FutureProofTarget::MacroPairedPureInsertion:
-    return "MacroPairedPureInsertion";
-  case FutureProofTarget::MacroDagLift:
-    return "MacroDagLift";
-  case FutureProofTarget::MacroCallChainSuffixPreservation:
-    return "MacroCallChainSuffixPreservation";
-  case FutureProofTarget::MacroCounterStabilizationRealization:
-    return "MacroCounterStabilizationRealization";
-  case FutureProofTarget::MacroRealizationWholeCover:
-    return "MacroRealizationWholeCover";
-  case FutureProofTarget::IncludePatchByMappedHeaderTokens:
-    return "IncludePatchByMappedHeaderTokens";
-  case FutureProofTarget::IncludeConditionalArmCertifiedInsertion:
-    return "IncludeConditionalArmCertifiedInsertion";
-  case FutureProofTarget::IncludeInsertionByChildBoundary:
-    return "IncludeInsertionByChildBoundary";
-  case FutureProofTarget::IncludeInsertionByRightNeighborPP:
-    return "IncludeInsertionByRightNeighborPP";
-  case FutureProofTarget::IncludeInsertionByLeftNeighborPP:
-    return "IncludeInsertionByLeftNeighborPP";
-  case FutureProofTarget::IncludeInsertionByDeclBoundary:
-    return "IncludeInsertionByDeclBoundary";
-  case FutureProofTarget::IncludeRealizationCover:
-    return "IncludeRealizationCover";
-  case FutureProofTarget::IncludeMaterializedExpansionRealization:
-    return "IncludeMaterializedExpansionRealization";
-  case FutureProofTarget::TUExactSlotAnchor:
-    return "TUExactSlotAnchor";
-  case FutureProofTarget::TUProvableInsertionAnchor:
-    return "TUProvableInsertionAnchor";
-  case FutureProofTarget::TUByteSpanTextualEdit:
-    return "TUByteSpanTextualEdit";
-  case FutureProofTarget::EditedPreprocessedStreamFallback:
-    return "ExplicitOutOfDomainTerminalResult";
-  }
-  return "Unknown";
-}
-
-StringRef RefoldEngine::FormatCompletenessCoverageKind(
-    CompletenessCoverageKind kind) const {
-  switch (kind) {
-  case CompletenessCoverageKind::Unknown:
-    return "Unknown";
-  case CompletenessCoverageKind::DeclaredProofClass:
-    return "DeclaredProofClass";
-  case CompletenessCoverageKind::TransitionalGap:
-    return "TransitionalGap";
-  case CompletenessCoverageKind::ExplicitOutOfDomainClass:
-    return "ExplicitOutOfDomainClass";
-  }
-  return "Unknown";
-}
-
-StringRef RefoldEngine::FormatCompletenessExpectationKind(
-    CompletenessExpectationKind kind) const {
-  switch (kind) {
-  case CompletenessExpectationKind::Unknown:
-    return "Unknown";
-  case CompletenessExpectationKind::MustDiscoverDeclaredOrStrongerCompatible:
-    return "MustDiscoverDeclaredOrStrongerCompatible";
-  case CompletenessExpectationKind::NoClaimPendingClassClosure:
-    return "NoClaimPendingClassClosure";
-  case CompletenessExpectationKind::ExplicitlyOutsideDeclaredSet:
-    return "ExplicitlyOutsideDeclaredSet";
-  }
-  return "Unknown";
-}
-
-StringRef RefoldEngine::FormatTheoremDomainKind(
-    TheoremDomainKind kind) const {
-  switch (kind) {
-  case TheoremDomainKind::Unknown:
-    return "Unknown";
-  case TheoremDomainKind::DeclaredInDomainClass:
-    return "DeclaredInDomainClass";
-  case TheoremDomainKind::TransitionalGap:
-    return "TransitionalGap";
-  case TheoremDomainKind::ExplicitOutOfDomainClass:
-    return "ExplicitOutOfDomainClass";
-  }
-  return "Unknown";
-}
-
-StringRef RefoldEngine::FormatLatticeConflictDomain(
-    LatticeConflictDomain domain) const {
-  switch (domain) {
-  case LatticeConflictDomain::Unknown:
-    return "Unknown";
-  case LatticeConflictDomain::MacroInvocationRootSpan:
-    return "MacroInvocationRootSpan";
-  case LatticeConflictDomain::IncludeOwnerRegion:
-    return "IncludeOwnerRegion";
-  case LatticeConflictDomain::TUAnchorPoint:
-    return "TUAnchorPoint";
-  case LatticeConflictDomain::WholeTranslationUnit:
-    return "WholeTranslationUnit";
-  }
-  return "Unknown";
-}
-
-StringRef RefoldEngine::FormatLatticeMergeLaw(LatticeMergeLaw law) const {
-  switch (law) {
-  case LatticeMergeLaw::Unknown:
-    return "Unknown";
-  case LatticeMergeLaw::DisjointCompose:
-    return "DisjointCompose";
-  case LatticeMergeLaw::NestedOuterShadowsInner:
-    return "NestedOuterShadowsInner";
-  case LatticeMergeLaw::SelectSingleWitness:
-    return "SelectSingleWitness";
-  case LatticeMergeLaw::TerminalReplacesAll:
-    return "TerminalReplacesAll";
-  }
-  return "Unknown";
-}
-
-StringRef RefoldEngine::FormatLatticeConflictLaw(LatticeConflictLaw law) const {
-  switch (law) {
-  case LatticeConflictLaw::Unknown:
-    return "Unknown";
-  case LatticeConflictLaw::RejectPartialOverlap:
-    return "RejectPartialOverlap";
-  case LatticeConflictLaw::PreferStructurePreservation:
-    return "PreferStructurePreservation";
-  case LatticeConflictLaw::PreferExactAnchorWitness:
-    return "PreferExactAnchorWitness";
-  case LatticeConflictLaw::PreferOwnerPreservingBeforeRealization:
-    return "PreferOwnerPreservingBeforeRealization";
-  case LatticeConflictLaw::ExplicitOutOfDomainTerminalResult:
-    return "ExplicitOutOfDomainTerminalResult";
-  }
-  return "Unknown";
-}
-
-StringRef RefoldEngine::FormatProofDischargeStatus(
-    ProofDischargeStatus status) const {
-  switch (status) {
-  case ProofDischargeStatus::Unknown:
-    return "Unknown";
-  case ProofDischargeStatus::PendingMaterialization:
-    return "PendingMaterialization";
-  case ProofDischargeStatus::Discharged:
-    return "Discharged";
-  case ProofDischargeStatus::Rejected:
-    return "Rejected";
-  }
-  return "Unknown";
-}
-
-StringRef RefoldEngine::FormatProofObligationKind(
-    ProofObligationKind obligation) const {
-  switch (obligation) {
-  case ProofObligationKind::Unknown:
-    return "Unknown";
-  case ProofObligationKind::AcceptedPathClassified:
-    return "AcceptedPathClassified";
-  case ProofObligationKind::FutureTargetMapped:
-    return "FutureTargetMapped";
-  case ProofObligationKind::LegacyValidationRecorded:
-    return "LegacyValidationRecorded";
-  case ProofObligationKind::StructureMatchesAcceptedClass:
-    return "StructureMatchesAcceptedClass";
-  case ProofObligationKind::ProofRootTracked:
-    return "ProofRootTracked";
-  case ProofObligationKind::MacroProofRootResolved:
-    return "MacroProofRootResolved";
-  case ProofObligationKind::MacroProofRootIsTopLevel:
-    return "MacroProofRootIsTopLevel";
-  case ProofObligationKind::MacroPasteWitnessPresent:
-    return "MacroPasteWitnessPresent";
-  case ProofObligationKind::MacroPasteWitnessWellFormed:
-    return "MacroPasteWitnessWellFormed";
-  case ProofObligationKind::MacroPasteFreeSurfaceTracked:
-    return "MacroPasteFreeSurfaceTracked";
-  case ProofObligationKind::MacroSubtreeCertificateTracked:
-    return "MacroSubtreeCertificateTracked";
-  case ProofObligationKind::MacroCallChainWitnessTracked:
-    return "MacroCallChainWitnessTracked";
-  case ProofObligationKind::SubtreeAdmissibilityTracked:
-    return "SubtreeAdmissibilityTracked";
-  case ProofObligationKind::WholeCoverBoundsTracked:
-    return "WholeCoverBoundsTracked";
-  case ProofObligationKind::WholeCoverContainmentTracked:
-    return "WholeCoverContainmentTracked";
-  case ProofObligationKind::WholeCoverBoundaryAccountingTracked:
-    return "WholeCoverBoundaryAccountingTracked";
-  case ProofObligationKind::IncludePendingMaterializationClassified:
-    return "IncludePendingMaterializationClassified";
-  case ProofObligationKind::IncludePatchShapeTracked:
-    return "IncludePatchShapeTracked";
-  case ProofObligationKind::IncludeAnchorWitnessTracked:
-    return "IncludeAnchorWitnessTracked";
-  case ProofObligationKind::IncludeAnchorByteTracked:
-    return "IncludeAnchorByteTracked";
-  case ProofObligationKind::IncludeConditionalOwnershipTracked:
-    return "IncludeConditionalOwnershipTracked";
-  case ProofObligationKind::IncludeMappedHeaderRangeTracked:
-    return "IncludeMappedHeaderRangeTracked";
-  case ProofObligationKind::IncludeMappedHeaderByteRangeTracked:
-    return "IncludeMappedHeaderByteRangeTracked";
-  case ProofObligationKind::IncludeSelectedConditionalBoundaryWitnessTracked:
-    return "IncludeSelectedConditionalBoundaryWitnessTracked";
-  case ProofObligationKind::IncludeChildBoundaryWitnessTracked:
-    return "IncludeChildBoundaryWitnessTracked";
-  case ProofObligationKind::IncludeRightNeighborWitnessTracked:
-    return "IncludeRightNeighborWitnessTracked";
-  case ProofObligationKind::IncludeLeftNeighborWitnessTracked:
-    return "IncludeLeftNeighborWitnessTracked";
-  case ProofObligationKind::IncludeDeclBoundaryWitnessTracked:
-    return "IncludeDeclBoundaryWitnessTracked";
-  case ProofObligationKind::IncludeRealizationWitnessTracked:
-    return "IncludeRealizationWitnessTracked";
-  case ProofObligationKind::IncludeRealizationIncludeTracked:
-    return "IncludeRealizationIncludeTracked";
-  case ProofObligationKind::IncludeRealizationCoverTracked:
-    return "IncludeRealizationCoverTracked";
-  case ProofObligationKind::IncludeRealizationBEnvelopeTracked:
-    return "IncludeRealizationBEnvelopeTracked";
-  case ProofObligationKind::TUAnchorPathClassified:
-    return "TUAnchorPathClassified";
-  case ProofObligationKind::TUAnchorWitnessTracked:
-    return "TUAnchorWitnessTracked";
-  case ProofObligationKind::TUAnchorPPGapTracked:
-    return "TUAnchorPPGapTracked";
-  case ProofObligationKind::TUAnchorByteTracked:
-    return "TUAnchorByteTracked";
-  case ProofObligationKind::TUExactSlotWitnessTracked:
-    return "TUExactSlotWitnessTracked";
-  case ProofObligationKind::TUProvableEvidenceTracked:
-    return "TUProvableEvidenceTracked";
-  case ProofObligationKind::TUOutsideIncludeCoverageTracked:
-    return "TUOutsideIncludeCoverageTracked";
-  case ProofObligationKind::TUOwnerDepthStableTracked:
-    return "TUOwnerDepthStableTracked";
-  case ProofObligationKind::ExplicitOutOfDomainResultTracked:
-    return "ExplicitOutOfDomainResultTracked";
-  }
-  return "Unknown";
-}
-
-StringRef RefoldEngine::FormatProofFailureReason(ProofFailureReason reason) const {
-  switch (reason) {
-  case ProofFailureReason::None:
-    return "None";
-  case ProofFailureReason::PendingMaterialization:
-    return "PendingMaterialization";
-  case ProofFailureReason::MissingAcceptedPathClassification:
-    return "MissingAcceptedPathClassification";
-  case ProofFailureReason::MissingFutureTargetMapping:
-    return "MissingFutureTargetMapping";
-  case ProofFailureReason::MissingLegacyValidation:
-    return "MissingLegacyValidation";
-  case ProofFailureReason::StructuralMismatch:
-    return "StructuralMismatch";
-  case ProofFailureReason::MissingProofRoot:
-    return "MissingProofRoot";
-  case ProofFailureReason::MissingMacroProofRootResolution:
-    return "MissingMacroProofRootResolution";
-  case ProofFailureReason::NonTopLevelMacroProofRoot:
-    return "NonTopLevelMacroProofRoot";
-  case ProofFailureReason::MissingPasteWitness:
-    return "MissingPasteWitness";
-  case ProofFailureReason::MalformedPasteWitness:
-    return "MalformedPasteWitness";
-  case ProofFailureReason::UnexpectedPasteSurface:
-    return "UnexpectedPasteSurface";
-  case ProofFailureReason::MissingSubtreeCertificate:
-    return "MissingSubtreeCertificate";
-  case ProofFailureReason::MissingCallChainWitness:
-    return "MissingCallChainWitness";
-  case ProofFailureReason::MissingSubtreeAdmissibility:
-    return "MissingSubtreeAdmissibility";
-  case ProofFailureReason::MissingWholeCoverBounds:
-    return "MissingWholeCoverBounds";
-  case ProofFailureReason::MissingWholeCoverContainment:
-    return "MissingWholeCoverContainment";
-  case ProofFailureReason::MissingWholeCoverBoundaryAccounting:
-    return "MissingWholeCoverBoundaryAccounting";
-  case ProofFailureReason::MissingIncludePatchShape:
-    return "MissingIncludePatchShape";
-  case ProofFailureReason::MissingIncludeAnchorWitness:
-    return "MissingIncludeAnchorWitness";
-  case ProofFailureReason::MissingIncludeAnchorByte:
-    return "MissingIncludeAnchorByte";
-  case ProofFailureReason::MissingConditionalOwnership:
-    return "MissingConditionalOwnership";
-  case ProofFailureReason::MissingMappedHeaderRange:
-    return "MissingMappedHeaderRange";
-  case ProofFailureReason::MissingMappedHeaderByteRange:
-    return "MissingMappedHeaderByteRange";
-  case ProofFailureReason::MissingIncludeSelectedConditionalBoundaryWitness:
-    return "MissingIncludeSelectedConditionalBoundaryWitness";
-  case ProofFailureReason::MissingIncludeChildBoundaryWitness:
-    return "MissingIncludeChildBoundaryWitness";
-  case ProofFailureReason::MissingIncludeRightNeighborWitness:
-    return "MissingIncludeRightNeighborWitness";
-  case ProofFailureReason::MissingIncludeLeftNeighborWitness:
-    return "MissingIncludeLeftNeighborWitness";
-  case ProofFailureReason::MissingIncludeDeclBoundaryWitness:
-    return "MissingIncludeDeclBoundaryWitness";
-  case ProofFailureReason::MissingIncludeRealizationWitness:
-    return "MissingIncludeRealizationWitness";
-  case ProofFailureReason::MissingIncludeRealizationInclude:
-    return "MissingIncludeRealizationInclude";
-  case ProofFailureReason::MissingIncludeRealizationCover:
-    return "MissingIncludeRealizationCover";
-  case ProofFailureReason::MissingIncludeRealizationBEnvelope:
-    return "MissingIncludeRealizationBEnvelope";
-  case ProofFailureReason::MissingTUAnchorClassification:
-    return "MissingTUAnchorClassification";
-  case ProofFailureReason::MissingTUAnchorWitness:
-    return "MissingTUAnchorWitness";
-  case ProofFailureReason::MissingTUAnchorGap:
-    return "MissingTUAnchorGap";
-  case ProofFailureReason::MissingTUAnchorByte:
-    return "MissingTUAnchorByte";
-  case ProofFailureReason::MissingTUExactSlotWitness:
-    return "MissingTUExactSlotWitness";
-  case ProofFailureReason::MissingTUProvableAnchorWitness:
-    return "MissingTUProvableAnchorWitness";
-  case ProofFailureReason::MissingTUOutsideIncludeCoverageProof:
-    return "MissingTUOutsideIncludeCoverageProof";
-  case ProofFailureReason::MissingTUOwnerDepthStability:
-    return "MissingTUOwnerDepthStability";
-  case ProofFailureReason::ExplicitOutOfDomainResult:
-    return "ExplicitOutOfDomainResult";
-  }
-  return "None";
-}
-
-StringRef RefoldEngine::FormatTUAnchorEvidenceKind(
+RefoldEngine::FormatTUAnchorEvidenceKind(
     TUAnchorEvidenceKind kind) const {
   switch (kind) {
   case TUAnchorEvidenceKind::Unknown:
@@ -1455,9 +959,9 @@ RefoldEngine::FormatMacroPatchProofKind(MacroPatchProofKind kind) const {
 std::string RefoldEngine::FormatAcceptancePathInventory(
     const AcceptancePathInventory &inventory) const {
   return formatv("currentPath={0} support={1} futureTarget={2}",
-                 FormatAcceptedPathKind(inventory.currentPath),
-                 FormatAcceptanceSupportKind(inventory.support),
-                 FormatFutureProofTarget(inventory.futureTarget))
+                 inventory.currentPath,
+                 inventory.support,
+                 inventory.futureTarget)
       .str();
 }
 
@@ -1466,19 +970,19 @@ std::string RefoldEngine::FormatProofDischargeRecord(
   return formatv(
              "status={0} evaluated={1} satisfied={2} failedObligation={3} "
              "failureReason={4}",
-             FormatProofDischargeStatus(record.status),
+             record.status,
              record.obligationsEvaluated, record.obligationsSatisfied,
-             FormatProofObligationKind(record.failedObligation),
-             FormatProofFailureReason(record.failureReason))
+             record.failedObligation,
+             record.failureReason)
       .str();
 }
 
 std::string RefoldEngine::FormatGlobalSelectionLattice(
     const GlobalSelectionLattice &lattice) const {
   return formatv("domain={0} mergeLaw={1} conflictLaw={2}",
-                 FormatLatticeConflictDomain(lattice.domain),
-                 FormatLatticeMergeLaw(lattice.mergeLaw),
-                 FormatLatticeConflictLaw(lattice.conflictLaw))
+                 lattice.domain,
+                 lattice.mergeLaw,
+                 lattice.conflictLaw)
       .str();
 }
 
@@ -1487,18 +991,18 @@ std::string RefoldEngine::FormatCompletenessContract(
   if (contract.hasExplicitExclusion) {
     const TerminalFallbackWitness witness{contract.explicitExclusion, 0, false, std::string()};
     return formatv("coverage={0} expectation={1} declaredTarget={2} counts={3} exclusion={4}",
-                   FormatCompletenessCoverageKind(contract.coverage),
-                   FormatCompletenessExpectationKind(contract.expectation),
-                   FormatFutureProofTarget(contract.declaredTarget),
+                   contract.coverage,
+                   contract.expectation,
+                   contract.declaredTarget,
                    contract.countsTowardDeclaredCoverage ? 1 : 0,
                    FormatTerminalFallbackWitness(witness))
         .str();
   }
   return formatv(
              "coverage={0} expectation={1} declaredTarget={2} counts={3}",
-             FormatCompletenessCoverageKind(contract.coverage),
-             FormatCompletenessExpectationKind(contract.expectation),
-             FormatFutureProofTarget(contract.declaredTarget),
+             contract.coverage,
+             contract.expectation,
+             contract.declaredTarget,
              contract.countsTowardDeclaredCoverage ? 1 : 0)
       .str();
 }
@@ -1509,19 +1013,19 @@ std::string RefoldEngine::FormatTheoremDomainContract(
     const TerminalFallbackWitness witness{contract.explicitExclusion, 0, false, std::string()};
     return formatv(
                "kind={0} inDeclaredDomain={1} counts={2} declaredTarget={3} exclusion={4}",
-               FormatTheoremDomainKind(contract.kind),
+               contract.kind,
                contract.inDeclaredDomain ? 1 : 0,
                contract.countsTowardCompleteness ? 1 : 0,
-               FormatFutureProofTarget(contract.declaredTarget),
+               contract.declaredTarget,
                FormatTerminalFallbackWitness(witness))
         .str();
   }
   return formatv(
              "kind={0} inDeclaredDomain={1} counts={2} declaredTarget={3}",
-             FormatTheoremDomainKind(contract.kind),
+             contract.kind,
              contract.inDeclaredDomain ? 1 : 0,
              contract.countsTowardCompleteness ? 1 : 0,
-             FormatFutureProofTarget(contract.declaredTarget))
+             contract.declaredTarget)
       .str();
 }
 
@@ -1653,11 +1157,11 @@ RefoldEngine::FormatAcceptedResultCandidate(
              "kind={0} class={1} realization={2} preference={3} "
              "surfaceDisposition={4} inventory={5} lattice={6} "
              "completeness={7} theoremDomain={8} discharge={9}{10}",
-             FormatAcceptedResultCandidateKind(candidate.kind),
-             FormatAcceptedProofClass(candidate.proofSummary.acceptedClass),
-             FormatRealizationMode(candidate.proofSummary.realizationMode),
-             FormatSelectionPreference(candidate.proofSummary.preference),
-             FormatSurfaceDisposition(candidate.proofSummary.surfaceDisposition),
+             candidate.kind,
+             candidate.proofSummary.acceptedClass,
+             candidate.proofSummary.realizationMode,
+             candidate.proofSummary.preference,
+             candidate.proofSummary.surfaceDisposition,
              FormatAcceptancePathInventory(candidate.proofSummary.inventory),
              FormatGlobalSelectionLattice(candidate.proofSummary.lattice),
              FormatCompletenessContract(candidate.proofSummary.completeness),
@@ -1684,10 +1188,10 @@ std::string RefoldEngine::FormatMacroPatchAudit(const MacroPatch &patch) const {
              "deferredRootArgs={38} bridgeFormals={39} wholeCoverA=[{40},{41}) "
              "wholeCoverBraw=[{42},{43}) wholeCoverBadj=[{44},{45})",
              FormatMacroPatchProofKind(patch.proofKind),
-             FormatAcceptedProofClass(summary.acceptedClass),
-             FormatRealizationMode(summary.realizationMode),
-             FormatSelectionPreference(summary.preference),
-             FormatSurfaceDisposition(summary.surfaceDisposition),
+             summary.acceptedClass,
+             summary.realizationMode,
+             summary.preference,
+             summary.surfaceDisposition,
              FormatAcceptancePathInventory(summary.inventory),
              FormatGlobalSelectionLattice(summary.lattice),
              FormatCompletenessContract(summary.completeness),
