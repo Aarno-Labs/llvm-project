@@ -976,11 +976,12 @@ private:
   /// \brief Common proof-summary carrier used during the proof-lattice
   /// migration.
   ///
-  /// In Step 1 this is descriptive metadata only. The legacy proof fields on
-  /// concrete patch objects remain behaviorally authoritative so the refolder's
-  /// semantics do not change while we separate proof class, realization mode,
-  /// selection preference, surface disposition, and the current-path inventory
-  /// introduced by Step 2.
+  /// The summary still mirrors path-specific construction in parts of the
+  /// engine, but Patch C makes its local discharge result behaviorally
+  /// authoritative at the converted selector sites. That lets those sites
+  /// reject wrapped candidates whose declared proof class cannot actually be
+  /// discharged, while the remaining migration work continues to convert the
+  /// rest of the engine to candidate-first selection.
   struct ProofSummary {
     AcceptedProofClass acceptedClass = AcceptedProofClass::Unknown;
     RealizationMode realizationMode = RealizationMode::Unknown;
@@ -1131,6 +1132,17 @@ private:
     std::string subtreeExpectedRootFormalSummary;
     std::string subtreeDeferredRootArgSummary;
     std::string subtreeBridgeSensitiveFormalSummary;
+
+    // Direct args-only paste replay proof metadata.
+    //
+    // Some accepted paste-preserving args-only patches are justified directly
+    // from the producer-side root `paste_tokens` witness stream. Others are
+    // justified by the engine's own replay check, which re-applies the
+    // rewritten invocation arguments and proves that every pasted token
+    // occurrence reconstructs the edited B surface exactly. Record the latter
+    // case on the patch so Patch C can treat that deterministic replay as an
+    // authoritative proof source at the converted selector sites.
+    bool pasteReplayValidated = false;
 
     // Layer-6 mixed-owner decomposition certificate metadata.
     bool ownerCertPresent = false;
@@ -2860,12 +2872,13 @@ private:
   BuildAcceptedTerminalCandidate(const TerminalFallbackWitness &witness) const;
 
   /// \brief Return whether a normalized accepted result is admissible for
-  /// lattice-based selection at the converted Patch-B sites.
+  /// lattice-based selection at the converted selector sites.
   ///
-  /// Patch B only changes how already-accepted outcomes are compared. It does
-  /// not yet tighten acceptance to discharged-only proof summaries, so any
-  /// concrete accepted candidate wrapper can participate here. Patch C is where
-  /// the selector will be restricted to discharged candidates only.
+  /// Patch C makes proof discharge the participation gate for the converted
+  /// selector sites. A non-terminal candidate may participate only when its
+  /// declared proof class discharged successfully; the explicit terminal
+  /// out-of-domain result remains selectable only as the named terminal
+  /// rejection class.
   bool IsSelectableAcceptedResultCandidate(
       const AcceptedResultCandidate &candidate) const;
 
@@ -2891,10 +2904,22 @@ private:
   /// \brief Return whether \p m carries usable producer-side paste witnesses.
   ///
   /// Step 5 serialized the producer's exact `##` decomposition into the model.
-  /// Step 6 uses that witness stream to tighten the descriptive proof contract
-  /// for macro-preserving paste classes. This helper is intentionally strict:
-  /// each pasted token must have contiguous half-open parts that stay within
-  /// the final spelling, and any argument-derived part must name a valid formal.
+  /// Patch C may discharge a paste-preserving args-only class from either of
+  /// two deterministic proof sources: a usable producer-side root witness
+  /// stream, checked here, or an explicit direct replay check recorded on the
+  /// accepted patch. This helper validates only the producer-side witness
+  /// source.
+  ///
+  /// The producer records only the argument-derived fragments of each pasted
+  /// token; literal glue bytes from the macro body (for example the `_` in
+  /// `X##_##Y`) may appear as gaps between recorded parts. The helper is
+  /// therefore strict about ordered, non-overlapping half-open ranges that
+  /// stay within the final spelling, but it does not require the recorded
+  /// parts to form a contiguous partition of the pasted token. It also accepts
+  /// the parent-level case where `pasteSpans` are only propagated child-paste
+  /// contributors inside a standard occurrence of the same formal, because
+  /// those spans are validated by the args-only replay proof rather than by a
+  /// direct parent-level `paste_tokens` decomposition.
   bool MacroInvocationHasWellFormedPasteWitnesses(
       const RefoldModel::MacroInvocation &m) const;
 
