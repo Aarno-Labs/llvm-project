@@ -2983,6 +2983,21 @@ private:
   AcceptedResultCandidate
   BuildAcceptedMacroCandidate(const MacroPatch &patch) const;
 
+  /// \brief Wrap a macro patch in the discharged carrier used at the actual
+  /// byte-edit emission boundary.
+  ///
+  /// Step 2 separates selector admissibility from emitted semantic proof for
+  /// nested invocation-preserving macro artifacts. Selector competition still
+  /// uses BuildAcceptedMacroCandidate(), which retains the top-level proof-root
+  /// obligation for final competition. Once a nested preserving artifact has
+  /// already been selected by an internal construction flow and is about to be
+  /// emitted as a concrete TextEdit, this helper rebuilds its normalized proof
+  /// summary with the emission-specific preserving validator so the byte-edit
+  /// boundary sees a fully discharged carrier rather than a selector-only
+  /// exception.
+  AcceptedResultCandidate
+  BuildAcceptedEmittedMacroCandidate(const MacroPatch &patch) const;
+
   /// \brief Wrap an already-accepted include path in the normalized candidate
   /// carrier introduced by Patch A.
   AcceptedResultCandidate BuildAcceptedIncludeCandidate(
@@ -3094,6 +3109,18 @@ private:
   /// proof contract until they are moved onto the normalized selector path.
   ProofDischargeRecord
   ValidateInvocationPreservingProof(const MacroPatch &patch) const;
+
+  /// \brief Validate the emitted semantic proof contract for a preserving
+  /// macro patch.
+  ///
+  /// Step 2 removes the byte-edit boundary's selector-only exception by
+  /// rebuilding emitted nested preserving macro carriers under this validator.
+  /// It discharges the same semantic obligations as
+  /// ValidateInvocationPreservingProof(), but it does not re-impose the
+  /// top-level proof-root selector rule that is only relevant while competing
+  /// for final selection.
+  ProofDischargeRecord
+  ValidateEmittedInvocationPreservingProof(const MacroPatch &patch) const;
   ProofDischargeRecord
   ValidateInvocationRealizationProof(const MacroPatch &patch) const;
   ProofDischargeRecord ValidateIncludePreservingProof(
@@ -3769,14 +3796,12 @@ private:
   /// \brief Return whether an emitted non-terminal byte edit is backed only by
   /// emission-discharged normalized accepted-result carriers.
   ///
-  /// Step 2B makes proof discharge the universal gate at the actual emission
+  /// Step 2 makes proof discharge the universal gate at the actual emission
   /// boundary. Every non-terminal artifact that survives to a TextEdit must
-  /// carry at least one normalized accepted-result candidate. Most carriers
-  /// must already be fully discharged. One narrow exception remains
-  /// deterministic and fail-closed: a nested macro replay candidate may reach
-  /// emitted source text even though its local proof record still rejects the
-  /// selector-only `MacroProofRootIsTopLevel` obligation. Terminal out-of-
-  /// domain results are never valid carriers for non-terminal emitted edits.
+  /// carry at least one normalized accepted-result candidate, and every such
+  /// carrier must already be fully discharged under the proof contract that is
+  /// appropriate for emitted source text. Terminal out-of-domain results are
+  /// never valid carriers for non-terminal emitted edits.
   bool EmittedTextEditHasDischargedAcceptedResults(
       const TextEdit &edit, StringRef emissionPhase,
       StringRef emissionOwner = StringRef()) const;

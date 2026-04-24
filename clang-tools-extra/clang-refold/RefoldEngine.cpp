@@ -2101,7 +2101,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
                           ? std::make_optional(GetRootMacroId(mp.macroId))
                           : std::nullopt,
                       {}};
-        AttachAcceptedResultCarrier(edit, BuildAcceptedMacroCandidate(mp));
+        AttachAcceptedResultCarrier(edit, BuildAcceptedEmittedMacroCandidate(mp));
         tuEdits.push_back(std::move(edit));
       } else {
         trace("macro/tu", "  TU macro patch shadowed (skipped) inv=[{0},{1})",
@@ -9383,6 +9383,31 @@ RefoldEngine::BuildAcceptedMacroCandidate(const MacroPatch &patch) const {
 }
 
 RefoldEngine::AcceptedResultCandidate
+RefoldEngine::BuildAcceptedEmittedMacroCandidate(const MacroPatch &patch) const {
+  AcceptedResultCandidate candidate = BuildAcceptedMacroCandidate(patch);
+
+  // Step 2 removes the byte-edit boundary's selector-only nested-macro
+  // exception by restamping emitted preserving macro artifacts onto the
+  // emission-specific discharge rule. Selector competition still uses the
+  // stronger top-level proof-root contract through BuildAcceptedMacroCandidate().
+  if (candidate.kind == AcceptedResultCandidateKind::MacroPatch &&
+      candidate.proofSummary.acceptedClass ==
+          AcceptedProofClass::InvocationPreserving &&
+      AcceptedResultCandidateHasOnlyNonTopLevelMacroSelectorFailure(candidate)) {
+    candidate.proofSummary.discharge =
+        ValidateEmittedInvocationPreservingProof(patch);
+    candidate.proofSummary.lattice =
+        BuildGlobalSelectionLattice(candidate.proofSummary);
+    candidate.proofSummary.completeness =
+        BuildCompletenessContract(candidate.proofSummary);
+    candidate.proofSummary.theoremDomain =
+        BuildTheoremDomainContract(candidate.proofSummary);
+  }
+
+  return candidate;
+}
+
+RefoldEngine::AcceptedResultCandidate
 RefoldEngine::BuildAcceptedIncludeCandidate(
     AcceptedPathKind currentPath, const IncludePatch &patch,
     const IncludeAnchorWitness *includeAnchorWitness,
@@ -9664,6 +9689,88 @@ RefoldEngine::ValidateInvocationPreservingProof(const MacroPatch &patch) const {
   case MacroPatchProofKind::CallChainSuffix:
     // Call-chain suffix rewrites are emitted directly on the root callsite
     // slice, so the patch's owning macro id must already be that root.
+    discharge.Require(patch.macroId == patch.proofRootMacroId,
+                      ProofObligationKind::MacroCallChainWitnessTracked,
+                      ProofFailureReason::MissingCallChainWitness);
+    break;
+
+  case MacroPatchProofKind::CounterLiteral:
+  case MacroPatchProofKind::WholeCoverRealization:
+  case MacroPatchProofKind::Unknown:
+    break;
+  }
+
+  return discharge.Finish();
+}
+
+RefoldEngine::ProofDischargeRecord
+RefoldEngine::ValidateEmittedInvocationPreservingProof(
+    const MacroPatch &patch) const {
+  ProofDischargeAccumulator discharge;
+  const AcceptancePathInventory inventory =
+      InventoryMacroPatchAcceptancePath(patch);
+
+  discharge.Require(inventory.currentPath != AcceptedPathKind::Unknown,
+                    ProofObligationKind::AcceptedPathClassified,
+                    ProofFailureReason::MissingAcceptedPathClassification);
+  discharge.Require(inventory.futureTarget != FutureProofTarget::Unknown,
+                    ProofObligationKind::FutureTargetMapped,
+                    ProofFailureReason::MissingFutureTargetMapping);
+  discharge.Require(patch.proofValidated,
+                    ProofObligationKind::LegacyValidationRecorded,
+                    ProofFailureReason::MissingLegacyValidation);
+  discharge.Require(patch.structurePreserving,
+                    ProofObligationKind::StructureMatchesAcceptedClass,
+                    ProofFailureReason::StructuralMismatch);
+  discharge.Require(patch.proofRootMacroId != 0,
+                    ProofObligationKind::ProofRootTracked,
+                    ProofFailureReason::MissingProofRoot);
+
+  const RefoldModel::MacroInvocation *root =
+      patch.proofRootMacroId ? FindMacroInvocationById(patch.proofRootMacroId)
+                             : nullptr;
+  discharge.Require(root != nullptr,
+                    ProofObligationKind::MacroProofRootResolved,
+                    ProofFailureReason::MissingMacroProofRootResolution);
+
+  switch (patch.proofKind) {
+  case MacroPatchProofKind::ArgsOnlyStandard:
+    break;
+
+  case MacroPatchProofKind::ArgsOnlyPasteSingle:
+  case MacroPatchProofKind::ArgsOnlyPasteMulti:
+  case MacroPatchProofKind::ArgsOnlyPurePasteOnly: {
+    discharge.Require(root && !root->pasteSpans.empty(),
+                      ProofObligationKind::MacroPasteWitnessPresent,
+                      ProofFailureReason::MissingPasteWitness);
+    if (root && !root->pasteSpans.empty()) {
+      const bool hasProducerWitness =
+          MacroInvocationHasWellFormedPasteWitnesses(*root);
+      discharge.Require(hasProducerWitness || patch.pasteReplayValidated,
+                        ProofObligationKind::MacroPasteWitnessWellFormed,
+                        ProofFailureReason::MalformedPasteWitness);
+    }
+    break;
+  }
+
+  case MacroPatchProofKind::ArgsOnlyPairedPureInsertion:
+    discharge.Require(root && root->pasteSpans.empty(),
+                      ProofObligationKind::MacroPasteFreeSurfaceTracked,
+                      ProofFailureReason::UnexpectedPasteSurface);
+    break;
+
+  case MacroPatchProofKind::DagSubtreeRoot:
+    discharge.Require(patch.subtreeCertBacked,
+                      ProofObligationKind::MacroSubtreeCertificateTracked,
+                      ProofFailureReason::MissingSubtreeCertificate);
+    if (patch.subtreeCertBacked) {
+      discharge.Require(patch.subtreeAdmissible,
+                        ProofObligationKind::SubtreeAdmissibilityTracked,
+                        ProofFailureReason::MissingSubtreeAdmissibility);
+    }
+    break;
+
+  case MacroPatchProofKind::CallChainSuffix:
     discharge.Require(patch.macroId == patch.proofRootMacroId,
                       ProofObligationKind::MacroCallChainWitnessTracked,
                       ProofFailureReason::MissingCallChainWitness);
@@ -20536,9 +20643,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   // macro candidate competition handle nested preserving artifacts too. The
   // one extra local rule is that non-top-level construction sites may admit
   // selector-only nested macro carriers whose only failed obligation is the
-  // top-level proof-root requirement; those carriers remain theorem-audited at
-  // later emission boundaries until step 2 gives them a fully discharged
-  // emitted representation.
+  // top-level proof-root requirement. Step 2 then restamps any such selected
+  // emitted artifact onto an emission-discharged carrier before it reaches the
+  // byte-edit boundary.
   const bool allowNonTopLevelMacroSelectorFailure =
       GetRootMacroId(m.id) != m.id;
 
@@ -20944,7 +21051,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
                         ? std::make_optional(GetRootMacroId(mp.macroId))
                         : std::nullopt,
                     {}};
-      AttachAcceptedResultCarrier(edit, BuildAcceptedMacroCandidate(mp));
+      AttachAcceptedResultCarrier(edit, BuildAcceptedEmittedMacroCandidate(mp));
       edits.push_back(std::move(edit));
     }
   }
@@ -21891,24 +21998,6 @@ bool RefoldEngine::EmittedTextEditHasDischargedAcceptedResults(
       return true;
     }
 
-    // The converted selector sites intentionally reject non-top-level macro
-    // proof roots so nested replay candidates cannot compete as final
-    // top-level winners. The byte-edit emission boundary is narrower: once the
-    // outer construction flow has already selected a structurally preserving
-    // nested macro rewrite, that nested artifact is allowed to reach emitted
-    // source text as long as the *only* remaining rejected obligation is the
-    // top-level-root selector rule. The theorem audit still records this as a
-    // violation because it means the emitted artifact was not locally
-    // discharged in the strong final-theorem sense.
-    const bool selectorOnlyException =
-        AcceptedResultCandidateHasOnlyNonTopLevelMacroSelectorFailure(carrier);
-    if (selectorOnlyException) {
-      ++lastTheoremAudit_.emittedSelectorOnlyExceptionCarriers;
-      NoteTheoremAuditViolation(
-          "emitted nested macro carrier relied on non-top-level selector exception");
-      return true;
-    }
-
     ++lastTheoremAudit_.emittedUndischargedCarriers;
     NoteTheoremAuditViolation(
         "emitted carrier failed local proof discharge at the byte-edit boundary");
@@ -22074,11 +22163,11 @@ RefoldEngine::ApplyTextEditsWithPendingResync(
     i = j;
   }
 
-  // Step 2B makes the byte-edit emission boundary proof-gated. By the time an
-  // edit reaches this function, Step 2A should already have attached the
-  // normalized accepted-result carriers for every non-terminal artifact it
-  // composes. Do not emit any edit whose carriers are missing or not yet
-  // discharged.
+  // Step 2 makes the byte-edit emission boundary proof-gated. By the time an
+  // edit reaches this function, every non-terminal artifact it composes must
+  // already carry normalized accepted-result carriers that are fully
+  // discharged for emitted source text. Do not emit any edit whose carriers
+  // are missing or not yet discharged.
   for (const TextEdit &edit : norm) {
     if (!EmittedTextEditHasDischargedAcceptedResults(
             edit, "emit/nonterminal", emissionOwner))
