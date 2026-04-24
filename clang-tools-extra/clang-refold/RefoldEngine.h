@@ -538,6 +538,67 @@ private:
     static Owner Unknown() { return Owner(); }
   };
 
+  /// \brief Top-level buckets for the accepted-result proof lattice.
+  ///
+  /// Step 1 introduces these categories without changing refolding behavior.
+  /// They let the engine describe what class of result was accepted without
+  /// conflating that classification with candidate ranking or the legacy retry
+  /// ladder.
+  enum class AcceptedProofClass : uint8_t {
+    Unknown,
+    InvocationPreserving,
+    InvocationRealization,
+    IncludePreserving,
+    IncludeRealization,
+    TUAnchor,
+  };
+
+  /// \brief Whether an accepted result preserves original structure or emits
+  /// a realized edited surface.
+  enum class RealizationMode : uint8_t {
+    Unknown,
+    PreserveOriginalStructure,
+    RealizeEditedSurface,
+  };
+
+  /// \brief Ranking bucket for choosing among multiple valid candidates.
+  ///
+  /// Preference is tracked separately from proof validity so later steps can
+  /// delete the escalation ladder without losing the current structural-vs-
+  /// realization ordering policy.
+  enum class SelectionPreference : uint8_t {
+    Unknown,
+    PreferStructurePreservation,
+    PreferSurfaceRealization,
+    PreferExactAnchoring,
+  };
+
+  /// \brief Legacy retry states kept distinct from proof metadata.
+  enum class LegacyEscalationDisposition : uint8_t {
+    None,
+    RetryWholeCoverMacros,
+    RetryInlineTouchedIncludesFromB,
+    EmitEditedPreprocessedStream,
+  };
+
+  /// \brief Common proof-summary carrier used during the proof-lattice
+  /// migration.
+  ///
+  /// In Step 1 this is descriptive metadata only. The legacy proof fields on
+  /// concrete patch objects remain behaviorally authoritative so the refolder's
+  /// semantics do not change while we separate proof class, realization mode,
+  /// selection preference, and escalation history.
+  struct ProofSummary {
+    AcceptedProofClass acceptedClass = AcceptedProofClass::Unknown;
+    RealizationMode realizationMode = RealizationMode::Unknown;
+    SelectionPreference preference = SelectionPreference::Unknown;
+    LegacyEscalationDisposition legacyEscalation =
+        LegacyEscalationDisposition::None;
+    bool validated = false;
+    bool structurePreserving = false;
+    uint64_t proofRootMacroId = 0;
+  };
+
 
   enum class MacroPatchProofKind : uint8_t {
     Unknown,
@@ -566,6 +627,14 @@ private:
     // used only for statistics attribution; the patch itself is still keyed by
     // byte span and owner.
     uint64_t macroId = 0;
+
+    // Step-1 proof-lattice migration summary. This mirrors the legacy fields
+    // below so later steps can reason about proof class vs. selection
+    // preference without rewriting macro-patch behavior yet.
+    // Default-initialize the normalized proof summary so aggregate
+    // construction of IncludePatch remains warning-free until all call sites
+    // are migrated to stamp proof metadata explicitly.
+    ProofSummary proofSummary = {};
 
     // Proof provenance for layer-3 root/callsite admissibility.
     MacroPatchProofKind proofKind = MacroPatchProofKind::Unknown;
@@ -648,6 +717,11 @@ private:
     std::string insertBytes; // exact B bytes
     uint64_t aStart, aEnd;   // A-token interval inside include expansion
     uint64_t bStart, bEnd;   // B-token interval
+
+    // Step-1 proof-lattice migration summary for include-owned patch
+    // candidates. Include proofs remain descriptive until later steps convert
+    // include realization/preservation into explicit proof classes.
+    ProofSummary proofSummary;
 
     /// When present, this insertion was classified as belonging to a specific
     /// selected conditional arm inside the owning include. Include application
@@ -2211,6 +2285,42 @@ private:
   /// rief Stamp the current owner witness onto a macro patch.
   void StampMacroPatchOwnerWitness(MacroPatch &patch,
                                    const Owner &owner) const;
+
+  /// \brief Build the normalized proof summary for a macro patch.
+  ///
+  /// This is the Step-1 bridge between the legacy macro-specific proof fields
+  /// and the top-level proof-lattice vocabulary. The mapping is descriptive
+  /// only in this step and intentionally does not alter candidate selection.
+  ProofSummary ClassifyMacroPatchProof(const MacroPatch &patch) const;
+
+  /// \brief Synchronize the Step-1 proof summary with the legacy macro patch
+  /// proof fields.
+  ///
+  /// During the migration, the legacy fields remain the behaviorally
+  /// authoritative source of truth. This helper mirrors them into the generic
+  /// proof summary so later steps can switch over incrementally.
+  void SyncMacroPatchProofSummary(MacroPatch &patch) const;
+
+  /// \brief Assign a macro patch proof in one place and update the normalized
+  /// proof summary at the same time.
+  void StampMacroPatchProof(MacroPatch &patch, MacroPatchProofKind kind,
+                            bool validated, bool structurePreserving,
+                            uint64_t proofRootMacroId) const;
+
+  /// \brief Build the default Step-1 proof summary for an include patch.
+  ///
+  /// Include proofs are not yet explicit, but Step 1 still records whether the
+  /// current path is structural or a realized include surface so later steps
+  /// can convert include handling to first-class proof classes without another
+  /// metadata redesign.
+  ProofSummary BuildIncludePatchProofSummary(bool realizedSurface) const;
+
+  /// \brief Formatters for the normalized Step-1 proof metadata.
+  StringRef FormatAcceptedProofClass(AcceptedProofClass kind) const;
+  StringRef FormatRealizationMode(RealizationMode mode) const;
+  StringRef FormatSelectionPreference(SelectionPreference preference) const;
+  StringRef FormatLegacyEscalationDisposition(
+      LegacyEscalationDisposition disposition) const;
 
   /// rief Format a patch proof kind for tracing.
   StringRef FormatMacroPatchProofKind(MacroPatchProofKind kind) const;

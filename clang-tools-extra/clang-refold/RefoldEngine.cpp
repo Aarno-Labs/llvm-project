@@ -5588,10 +5588,9 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
               stringutils::showWSWithClip(newInv, 200));
         {
         MacroPatch patch{*m.invB, *m.invE, std::move(newInv), m.id};
-        patch.proofKind = MacroPatchProofKind::ArgsOnlyPasteMulti;
-        patch.proofValidated = true;
-        patch.structurePreserving = true;
-        patch.proofRootMacroId = m.id;
+        StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyPasteMulti,
+                             /*validated=*/true,
+                             /*structurePreserving=*/true, m.id);
         return patch;
       }
       }
@@ -5641,10 +5640,9 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
             stringutils::showWSWithClip(newInv, 200));
       {
         MacroPatch patch{*m.invB, *m.invE, std::move(newInv), m.id};
-        patch.proofKind = MacroPatchProofKind::ArgsOnlyPasteSingle;
-        patch.proofValidated = true;
-        patch.structurePreserving = true;
-        patch.proofRootMacroId = m.id;
+        StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyPasteSingle,
+                             /*validated=*/true,
+                             /*structurePreserving=*/true, m.id);
         return patch;
       }
     }
@@ -5769,10 +5767,10 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
           stringutils::showWSWithClip(newInv, 200));
     {
       MacroPatch patch{*m.invB, *m.invE, std::move(newInv), m.id};
-      patch.proofKind = MacroPatchProofKind::ArgsOnlyPurePasteOnly;
-      patch.proofValidated = true;
-      patch.structurePreserving = true;
-      patch.proofRootMacroId = m.id;
+      StampMacroPatchProof(patch,
+                           MacroPatchProofKind::ArgsOnlyPurePasteOnly,
+                           /*validated=*/true,
+                           /*structurePreserving=*/true, m.id);
       return patch;
     }
   }
@@ -6714,10 +6712,9 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
 
   {
     MacroPatch patch{*m.invB, *m.invE, std::move(finalInv), m.id};
-    patch.proofKind = MacroPatchProofKind::ArgsOnlyStandard;
-    patch.proofValidated = true;
-    patch.structurePreserving = true;
-    patch.proofRootMacroId = m.id;
+    StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyStandard,
+                         /*validated=*/true,
+                         /*structurePreserving=*/true, m.id);
     return patch;
   }
 }
@@ -7602,7 +7599,8 @@ RefoldEngine::BuildIncludeInsertionPatch(const RefoldModel::IncludeItem &inc,
   }
 
   IncludePatch patch{&inc,  std::move(insertBytes), h.aStart, h.aEnd, h.bStart,
-                     h.bEnd};
+                     h.bEnd,
+                     BuildIncludePatchProofSummary(/*realizedSurface=*/false)};
 
   trace("include/patch",
         "built inc #{0} patch A[{1},{2})->B[{3},{4}) len(insertBytes)={5}",
@@ -8339,6 +8337,147 @@ void RefoldEngine::StampMacroPatchOwnerWitness(MacroPatch &patch,
   }
 }
 
+RefoldEngine::ProofSummary
+RefoldEngine::ClassifyMacroPatchProof(const MacroPatch &patch) const {
+  ProofSummary summary;
+  summary.validated = patch.proofValidated;
+  summary.structurePreserving = patch.structurePreserving;
+  summary.proofRootMacroId = patch.proofRootMacroId;
+
+  switch (patch.proofKind) {
+  case MacroPatchProofKind::ArgsOnlyPasteMulti:
+  case MacroPatchProofKind::ArgsOnlyPasteSingle:
+  case MacroPatchProofKind::ArgsOnlyPurePasteOnly:
+  case MacroPatchProofKind::ArgsOnlyStandard:
+  case MacroPatchProofKind::ArgsOnlyPairedPureInsertion:
+  case MacroPatchProofKind::DagSubtreeRoot:
+  case MacroPatchProofKind::CallChainSuffix:
+    summary.acceptedClass = AcceptedProofClass::InvocationPreserving;
+    summary.realizationMode = RealizationMode::PreserveOriginalStructure;
+    summary.preference = SelectionPreference::PreferStructurePreservation;
+    break;
+
+  case MacroPatchProofKind::CounterLiteral:
+  case MacroPatchProofKind::WholeCoverFallback:
+    summary.acceptedClass = AcceptedProofClass::InvocationRealization;
+    summary.realizationMode = RealizationMode::RealizeEditedSurface;
+    summary.preference = SelectionPreference::PreferSurfaceRealization;
+    break;
+
+  case MacroPatchProofKind::Unknown:
+    if (patch.structurePreserving) {
+      summary.acceptedClass = AcceptedProofClass::InvocationPreserving;
+      summary.realizationMode = RealizationMode::PreserveOriginalStructure;
+      summary.preference = SelectionPreference::PreferStructurePreservation;
+    } else if (patch.proofValidated || patch.proofRootMacroId) {
+      summary.acceptedClass = AcceptedProofClass::InvocationRealization;
+      summary.realizationMode = RealizationMode::RealizeEditedSurface;
+      summary.preference = SelectionPreference::PreferSurfaceRealization;
+    }
+    break;
+  }
+
+  return summary;
+}
+
+void RefoldEngine::SyncMacroPatchProofSummary(MacroPatch &patch) const {
+  patch.proofSummary = ClassifyMacroPatchProof(patch);
+}
+
+void RefoldEngine::StampMacroPatchProof(MacroPatch &patch,
+                                        MacroPatchProofKind kind,
+                                        bool validated,
+                                        bool structurePreserving,
+                                        uint64_t proofRootMacroId) const {
+  patch.proofKind = kind;
+  patch.proofValidated = validated;
+  patch.structurePreserving = structurePreserving;
+  patch.proofRootMacroId = proofRootMacroId;
+  SyncMacroPatchProofSummary(patch);
+}
+
+RefoldEngine::ProofSummary
+RefoldEngine::BuildIncludePatchProofSummary(bool realizedSurface) const {
+  ProofSummary summary;
+  summary.acceptedClass = realizedSurface
+                              ? AcceptedProofClass::IncludeRealization
+                              : AcceptedProofClass::IncludePreserving;
+  summary.realizationMode = realizedSurface
+                                ? RealizationMode::RealizeEditedSurface
+                                : RealizationMode::PreserveOriginalStructure;
+  summary.preference = realizedSurface
+                           ? SelectionPreference::PreferSurfaceRealization
+                           : SelectionPreference::PreferStructurePreservation;
+  summary.legacyEscalation = realizedSurface
+                                 ? LegacyEscalationDisposition::
+                                       RetryInlineTouchedIncludesFromB
+                                 : LegacyEscalationDisposition::None;
+  summary.validated = false;
+  summary.structurePreserving = !realizedSurface;
+  return summary;
+}
+
+StringRef
+RefoldEngine::FormatAcceptedProofClass(AcceptedProofClass kind) const {
+  switch (kind) {
+  case AcceptedProofClass::Unknown:
+    return "Unknown";
+  case AcceptedProofClass::InvocationPreserving:
+    return "InvocationPreserving";
+  case AcceptedProofClass::InvocationRealization:
+    return "InvocationRealization";
+  case AcceptedProofClass::IncludePreserving:
+    return "IncludePreserving";
+  case AcceptedProofClass::IncludeRealization:
+    return "IncludeRealization";
+  case AcceptedProofClass::TUAnchor:
+    return "TUAnchor";
+  }
+  return "Unknown";
+}
+
+StringRef RefoldEngine::FormatRealizationMode(RealizationMode mode) const {
+  switch (mode) {
+  case RealizationMode::Unknown:
+    return "Unknown";
+  case RealizationMode::PreserveOriginalStructure:
+    return "PreserveOriginalStructure";
+  case RealizationMode::RealizeEditedSurface:
+    return "RealizeEditedSurface";
+  }
+  return "Unknown";
+}
+
+StringRef
+RefoldEngine::FormatSelectionPreference(SelectionPreference preference) const {
+  switch (preference) {
+  case SelectionPreference::Unknown:
+    return "Unknown";
+  case SelectionPreference::PreferStructurePreservation:
+    return "PreferStructurePreservation";
+  case SelectionPreference::PreferSurfaceRealization:
+    return "PreferSurfaceRealization";
+  case SelectionPreference::PreferExactAnchoring:
+    return "PreferExactAnchoring";
+  }
+  return "Unknown";
+}
+
+StringRef RefoldEngine::FormatLegacyEscalationDisposition(
+    LegacyEscalationDisposition disposition) const {
+  switch (disposition) {
+  case LegacyEscalationDisposition::None:
+    return "None";
+  case LegacyEscalationDisposition::RetryWholeCoverMacros:
+    return "RetryWholeCoverMacros";
+  case LegacyEscalationDisposition::RetryInlineTouchedIncludesFromB:
+    return "RetryInlineTouchedIncludesFromB";
+  case LegacyEscalationDisposition::EmitEditedPreprocessedStream:
+    return "EmitEditedPreprocessedStream";
+  }
+  return "None";
+}
+
 StringRef
 RefoldEngine::FormatMacroPatchProofKind(MacroPatchProofKind kind) const {
   switch (kind) {
@@ -8367,18 +8506,24 @@ RefoldEngine::FormatMacroPatchProofKind(MacroPatchProofKind kind) const {
 }
 
 std::string RefoldEngine::FormatMacroPatchAudit(const MacroPatch &patch) const {
+  const ProofSummary summary = ClassifyMacroPatchProof(patch);
   return formatv(
-             "proofKind={0} validated={1} struct={2} proofRoot={3} "
-             "subtreeCert={4} leaf={5} witnesses={6} invCerts={7} "
-             "formalCerts={8} argCerts={9} liftChains={10} liftSteps={11} "
-             "rootMerges={12} lexicalBridge={13} paste={14} wrappers={15} "
-             "stringify={16} wideStringify={17} childSyntax={18} "
-             "rawInvocation={19} passthrough={20} bridgeSensitive={21} "
-             "deferredPasteDischarged={22} admissible={23} expRootN={24} "
-             "deferredRootN={25} bridgeFormalN={26} expRoot={27} "
-             "deferredRootArgs={28} bridgeFormals={29} wholeCoverA=[{30},{31}) "
-             "wholeCoverBraw=[{32},{33}) wholeCoverBadj=[{34},{35})",
+             "proofKind={0} topClass={1} realization={2} preference={3} "
+             "legacyEscalation={4} validated={5} struct={6} proofRoot={7} "
+             "subtreeCert={8} leaf={9} witnesses={10} invCerts={11} "
+             "formalCerts={12} argCerts={13} liftChains={14} liftSteps={15} "
+             "rootMerges={16} lexicalBridge={17} paste={18} wrappers={19} "
+             "stringify={20} wideStringify={21} childSyntax={22} "
+             "rawInvocation={23} passthrough={24} bridgeSensitive={25} "
+             "deferredPasteDischarged={26} admissible={27} expRootN={28} "
+             "deferredRootN={29} bridgeFormalN={30} expRoot={31} "
+             "deferredRootArgs={32} bridgeFormals={33} wholeCoverA=[{34},{35}) "
+             "wholeCoverBraw=[{36},{37}) wholeCoverBadj=[{38},{39})",
              FormatMacroPatchProofKind(patch.proofKind),
+             FormatAcceptedProofClass(summary.acceptedClass),
+             FormatRealizationMode(summary.realizationMode),
+             FormatSelectionPreference(summary.preference),
+             FormatLegacyEscalationDisposition(summary.legacyEscalation),
              patch.proofValidated ? 1 : 0,
              patch.structurePreserving ? 1 : 0, patch.proofRootMacroId,
              patch.subtreeCertBacked ? 1 : 0, patch.subtreeLeafMacroId,
@@ -8594,10 +8739,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     if (repl)
       {
         MacroPatch patch{*invStart, *invEnd, std::move(*repl), m.id};
-        patch.proofKind = MacroPatchProofKind::CounterLiteral;
-        patch.proofValidated = true;
-        patch.structurePreserving = false;
-        patch.proofRootMacroId = m.id;
+        StampMacroPatchProof(patch, MacroPatchProofKind::CounterLiteral,
+                             /*validated=*/true,
+                             /*structurePreserving=*/false, m.id);
         return patch;
       }
   }
@@ -8826,10 +8970,10 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             "argIdx={2} cur={3} partner={4} newInv='{5}'",
             m.id, m.name, argIdx, hEff, partner,
             stringutils::showWSWithClip(patch->replacement, 200));
-      patch->proofKind = MacroPatchProofKind::ArgsOnlyPairedPureInsertion;
-      patch->proofValidated = true;
-      patch->structurePreserving = true;
-      patch->proofRootMacroId = m.id;
+      StampMacroPatchProof(*patch,
+                           MacroPatchProofKind::ArgsOnlyPairedPureInsertion,
+                           /*validated=*/true,
+                           /*structurePreserving=*/true, m.id);
       return patch;
     }
 
@@ -16090,8 +16234,10 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           }
           if (!candPatch.macroId)
             candPatch.macroId = m.id;
-          if (!candPatch.proofRootMacroId)
+          if (!candPatch.proofRootMacroId) {
             candPatch.proofRootMacroId = m.id;
+            SyncMacroPatchProofSummary(candPatch);
+          }
           trace("macro/proof",
                 "DAG candidate accepted as unique root patch: root id={0} "
                 "name={1} stage={2} {3}",
@@ -16238,8 +16384,10 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         if (preferredStructured > 0) {
           if (!candPatch.macroId)
             candPatch.macroId = m.id;
-          if (!candPatch.proofRootMacroId)
+          if (!candPatch.proofRootMacroId) {
             candPatch.proofRootMacroId = m.id;
+            SyncMacroPatchProofSummary(candPatch);
+          }
           trace("macro/proof",
                 "DAG structured-choice replaced existing patch: root id={0} "
                 "name={1} stage={2} existing[{3}] candidate[{4}]",
@@ -16391,11 +16539,10 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         // Mark it as already proof-backed: the split-insertion logic has already
         // established that this is a structure-preserving args-only root rewrite.
         MacroPatch splitRootPatch = candidate.patch;
-        splitRootPatch.proofKind =
-            MacroPatchProofKind::ArgsOnlyPairedPureInsertion;
-        splitRootPatch.proofValidated = true;
-        splitRootPatch.structurePreserving = true;
-        splitRootPatch.proofRootMacroId = m.id;
+        StampMacroPatchProof(splitRootPatch,
+                             MacroPatchProofKind::ArgsOnlyPairedPureInsertion,
+                             /*validated=*/true,
+                             /*structurePreserving=*/true, m.id);
 
         // Feed the candidate through the shared DAG acceptance/merge logic so it
         // is deduplicated and checked for incompatibility exactly the same way as
@@ -17064,10 +17211,10 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                       localEdits.size(), replText.size());
 
                 MacroPatch candPatch{*invStart, chainEnd, replText, m.id};
-                candPatch.proofKind = MacroPatchProofKind::CallChainSuffix;
-                candPatch.proofValidated = true;
-                candPatch.structurePreserving = true;
-                candPatch.proofRootMacroId = m.id;
+                StampMacroPatchProof(candPatch,
+                                     MacroPatchProofKind::CallChainSuffix,
+                                     /*validated=*/true,
+                                     /*structurePreserving=*/true, m.id);
 
                 auto acceptCert = acceptOrMergeDAGCandidatePatch(
                     std::move(candPatch),
@@ -17173,10 +17320,10 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         }
 
         rootPatchCert.patch->macroId = m.id;
-        rootPatchCert.patch->proofKind = MacroPatchProofKind::DagSubtreeRoot;
-        rootPatchCert.patch->proofValidated = true;
-        rootPatchCert.patch->structurePreserving = true;
-        rootPatchCert.patch->proofRootMacroId = m.id;
+        StampMacroPatchProof(*rootPatchCert.patch,
+                             MacroPatchProofKind::DagSubtreeRoot,
+                             /*validated=*/true,
+                             /*structurePreserving=*/true, m.id);
         rootPatchCert.patch->subtreeCertBacked = true;
         rootPatchCert.patch->subtreeLeafMacroId = leaf.id;
         rootPatchCert.patch->subtreeWitnessCount = 1;
@@ -17357,10 +17504,10 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                   out.append(covered, cur, covered.size() - cur);
                   {
                     MacroPatch patch{minB, maxE, std::move(out), m.id};
-                    patch.proofKind = MacroPatchProofKind::CallChainSuffix;
-                    patch.proofValidated = true;
-                    patch.structurePreserving = true;
-                    patch.proofRootMacroId = m.id;
+                    StampMacroPatchProof(patch,
+                                         MacroPatchProofKind::CallChainSuffix,
+                                         /*validated=*/true,
+                                         /*structurePreserving=*/true, m.id);
                     return patch;
                   }
                 }
@@ -17955,10 +18102,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
   {
     MacroPatch patch{*invStart, *invEnd, wholeCoverPlan->clippedText, m.id};
-    patch.proofKind = MacroPatchProofKind::WholeCoverFallback;
-    patch.proofValidated = false;
-    patch.structurePreserving = false;
-    patch.proofRootMacroId = m.id;
+    StampMacroPatchProof(patch, MacroPatchProofKind::WholeCoverFallback,
+                         /*validated=*/false,
+                         /*structurePreserving=*/false, m.id);
     patch.wholeCoverUsedBodyRange = wholeCoverPlan->usedBodyRange;
     patch.wholeCoverSelfContained = wholeCoverPlan->selfContained;
     patch.wholeCoverNestedSelfContained = wholeCoverPlan->nestedSelfContained;
