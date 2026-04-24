@@ -250,6 +250,50 @@ private:
     std::string primaryReason;
   };
 
+  /// \brief Declared fallback-closure classes that sit strictly between
+  /// structural source emission and terminal fallback to B.
+  ///
+  /// Step 1 for proved partial-expansion fallback intentionally introduces the
+  /// carrier before any behavioral change. The engine may only emit one of
+  /// these fallback-expanded results once a concrete witness builder exists and
+  /// can prove a closed owner set, exact frontier, and valid materialization.
+  enum class ExpansionClosureKind : uint8_t {
+    Unknown,
+    MacroOwnerWholeExpansion,
+  };
+
+  friend inline StringRef toString(ExpansionClosureKind kind) {
+    switch (kind) {
+    case ExpansionClosureKind::Unknown:
+      return "Unknown";
+    case ExpansionClosureKind::MacroOwnerWholeExpansion:
+      return "MacroOwnerWholeExpansion";
+    }
+    return "Unknown";
+  }
+
+  /// \brief Compact witness for a proved partial-expansion fallback region.
+  ///
+  /// The first supported domain is planned to be a single macro-owner whole
+  /// expansion closure. The witness shape is introduced now so later patches
+  /// can populate it from existing whole-cover machinery without changing the
+  /// fallback pipeline again.
+  struct ExpansionClosureWitness {
+    ExpansionClosureKind kind = ExpansionClosureKind::Unknown;
+    bool hasRootMacroId = false;
+    uint64_t rootMacroId = 0;
+    bool hasOwnerIncludeId = false;
+    uint64_t ownerIncludeId = 0;
+    uint64_t sourceByteBegin = 0;
+    uint64_t sourceByteEnd = 0;
+    uint64_t coverATokBegin = 0;
+    uint64_t coverATokEnd = 0;
+    size_t bTokBegin = 0;
+    size_t bTokEnd = 0;
+    bool selfContained = false;
+    bool claimsClipped = false;
+  };
+
   struct RefoldStats {
     uint64_t totalIncludes = 0;
     uint64_t expandedIncludes = 0;
@@ -378,6 +422,27 @@ private:
   /// Build a compact diagnostic string for a strict-mode theorem-audit
   /// fallback.
   std::string BuildTheoremAuditInvariantDetail() const;
+
+  /// \brief Attempt the proof-backed partial-expansion fallback stage.
+  ///
+  /// This stage is intentionally separate from both structural refolding and
+  /// terminal fallback to B. Step 1 only installs the seam; until a concrete
+  /// proof class is implemented this returns \c std::nullopt and preserves the
+  /// exact current behavior.
+  std::optional<std::string> TryExpansionClosureFallback() const;
+
+  /// \brief Build the first planned single-owner macro expansion witness.
+  ///
+  /// The initial partial-expansion domain will be a single top-level macro
+  /// owner whose full callsite can be replaced by a proved materialization.
+  /// Step 1 only declares the witness builder entry point; later patches will
+  /// connect it to existing whole-cover planning and theorem-facing discharge.
+  std::optional<ExpansionClosureWitness>
+  BuildMacroOwnerExpansionClosureWitness() const;
+
+  /// \brief Render an expansion-closure witness for trace output.
+  std::string
+  FormatExpansionClosureWitness(const ExpansionClosureWitness &witness) const;
 
   /// Emit a compact theorem-audit summary for the current run.
   ///
