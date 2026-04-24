@@ -3636,7 +3636,7 @@ void RefoldMapBuilder::writeJSON() {
   llvm::json::OStream JO(OS, /*Indent=*/2);
 
   JO.object([&] {
-    JO.attribute("version", "2.2");
+    JO.attribute("version", "2.3");
 
     const auto &PPO = PP.getPreprocessorOpts();
     std::string LangStr = computeLangStr(PP.getLangOpts());
@@ -4626,6 +4626,29 @@ void RefoldMapBuilder::writeJSON() {
                       JO.attribute("pp_byte_begin", TokPPByteBegin[S.Begin]);
                       JO.attribute("pp_byte_end", TokPPByteEnd[S.End - 1]);
                     }
+                  });
+                }
+              });
+            }
+            if (!It.PasteTokens.empty()) {
+              // Serialize the exact pasted-token witnesses in expansion order.
+              // This preserves the producer's deterministic replay order even
+              // when the same pasted spelling is synthesized multiple times
+              // within one invocation.
+              JO.attributeArray("paste_tokens", [&] {
+                for (const PasteToken &PT : It.PasteTokens) {
+                  JO.object([&] {
+                    JO.attribute("spelling", PT.Spelling);
+                    JO.attributeArray("parts", [&] {
+                      for (const PastePart &Part : PT.Parts) {
+                        JO.object([&] {
+                          if (Part.ArgIndex)
+                            JO.attribute("arg_index", *Part.ArgIndex);
+                          JO.attribute("byte_begin", Part.ByteBegin);
+                          JO.attribute("byte_end", Part.ByteEnd);
+                        });
+                      }
+                    });
                   });
                 }
               });

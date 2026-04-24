@@ -178,11 +178,16 @@ struct Item {
   // invocation (using MacroArgs) and then match printed macro-body tokens
   // against those spellings during onToken().
   //
-  // These are not serialized; only StringifySpans/PasteSpans are.
+  // StringifySpell2ArgIndices remains producer-internal because the consumer
+  // already receives the exact stringify spans. PasteTokens, however, are now
+  // serialized so the consumer can carry a first-class witness for the exact
+  // pasted spelling, the ordered decomposition into literal/argument-derived
+  // parts, and the deterministic replay order for repeated identical spellings.
   StringMap<SmallVector<uint32_t, 2>> StringifySpell2ArgIndices;
 
   // Precomputed token-paste projections for this macro invocation, in expansion
-  // order.
+  // order. Array order is the replay order used by the consumer when the same
+  // pasted spelling occurs multiple times within one invocation.
   SmallVector<PasteToken, 4> PasteTokens;
   size_t PasteTokenCursor = 0;
 
