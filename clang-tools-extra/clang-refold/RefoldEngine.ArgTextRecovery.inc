@@ -1,0 +1,214 @@
+//===--- RefoldEngine.ArgTextRecovery.inc -------------------*- C++ -*-===//
+//
+// `RefoldEngine` members physically split out of `RefoldEngine.cpp`.
+//
+// This fragment groups methods that recover or normalize raw macro argument
+// text from textual spellings. These helpers answer "what is the raw argument
+// content represented by this invocation text or stringified literal?"
+//
+// This file is included directly by `RefoldEngine.cpp`, so this is only a
+// physical file split. No ownership, access, or behavioral semantics change.
+//
+//===----------------------------------------------------------------------===//
+
+std::optional<std::string>
+RefoldEngine::UnstringifyLiteralToArgText(StringRef literalTok,
+                                          bool allowTopLevelComma) const {
+  StringRef s = literalTok.trim();
+  if (s.empty())
+    return std::nullopt;
+
+  // Find the opening quote (after any optional prefix)
+  size_t q = s.find('\"');
+  if (q == StringRef::npos)
+    return std::nullopt;
+
+  // Validate the prefix (L, u, U, u8)
+  StringRef prefix = s.substr(0, q);
+  if (!prefix.empty()) {
+    if (prefix != "L" && prefix != "u" && prefix != "U" && prefix != "u8")
+      return std::nullopt;
+  }
+
+  // Ensure it has a closing quote and is at least ""
+  if (s.size() < q + 2 || s.back() != '\"')
+    return std::nullopt;
+
+  // Extract content between the quotes
+  StringRef body = s.slice(q + 1, s.size() - 1);
+
+  std::string out;
+  out.reserve(body.size());
+
+  for (size_t i = 0; i < body.size(); ++i) {
+    const char c = body[i];
+    if (c == '\\' && i + 1 < body.size()) {
+      const char n = body[i + 1];
+      // Stringification only escapes backslashes and quotes
+      if (n == '\\' || n == '\"') {
+        out.push_back(n);
+        i++;
+        continue;
+      }
+      // Preserve other escape sequences (like \n, \t) as-is
+      out.push_back(c);
+      out.push_back(n);
+      i++;
+      continue;
+    }
+    out.push_back(c);
+  }
+
+  // Safety check: only a *top-level* comma would split a macro argument into
+  // multiple arguments when we synthesize invocation text. Nested commas inside
+  // parentheses, brackets, or braces are still a single argument and must be
+  // preserved (for example: CAT(bill, z)). Allow callers that are only
+  // normalizing for comparison (not re-synthesizing invocation text) to opt
+  // out.
+  if (!allowTopLevelComma) {
+    const SourceLocation BaseLoc = SourceLocation::getFromRawEncoding(1);
+    std::string LexBuf = out;
+    LexBuf.push_back('\0');
+    const char *BufStart = LexBuf.data();
+    const char *BufEnd = BufStart + out.size();
+    Lexer Lex(BaseLoc, lexLang_, BufStart, BufStart, BufEnd);
+
+    int ParenDepth = 0;
+    int BracketDepth = 0;
+    int BraceDepth = 0;
+    Token Tok;
+
+    while (true) {
+      Lex.LexFromRawLexer(Tok);
+      if (Tok.is(tok::eof))
+        break;
+      if (Tok.is(tok::comment))
+        continue;
+
+      switch (Tok.getKind()) {
+      case tok::l_paren:
+        ++ParenDepth;
+        break;
+      case tok::r_paren:
+        if (ParenDepth > 0)
+          --ParenDepth;
+        break;
+      case tok::l_square:
+        ++BracketDepth;
+        break;
+      case tok::r_square:
+        if (BracketDepth > 0)
+          --BracketDepth;
+        break;
+      case tok::l_brace:
+        ++BraceDepth;
+        break;
+      case tok::r_brace:
+        if (BraceDepth > 0)
+          --BraceDepth;
+        break;
+      case tok::comma:
+        if (ParenDepth == 0 && BracketDepth == 0 && BraceDepth == 0)
+          return std::nullopt;
+        break;
+      default:
+        break;
+      }
+    }
+  }
+
+  // Macros cannot have raw newlines in arguments unless escaped/continued
+  if (out.find('\n') != std::string::npos ||
+      out.find('\r') != std::string::npos)
+    return std::nullopt;
+
+  return out;
+}
+
+std::optional<std::vector<std::pair<size_t, size_t>>>
+RefoldEngine::ParseMacroInvocationArgContentRanges(StringRef invText) {
+  // Locate the start of the argument list.
+  size_t open = invText.find('(');
+  if (open == StringRef::npos)
+    return std::nullopt;
+
+  std::vector<std::pair<size_t, size_t>> out;
+  size_t n = invText.size();
+
+  // Special-case: empty argument list "()" (or only whitespace/comments inside)
+  // means *zero* arguments. The previous logic treated this as a single empty
+  // argument, which is incorrect for C/C++ macro calls and breaks args-only
+  // lifting for zero-arg call chains like "PICK1()(10)".
+  const size_t afterOpen = open + 1;
+  const size_t firstTok = stringutils::skipWSAndComments(invText, afterOpen);
+  if (firstTok < n && invText[firstTok] == ')')
+    return out;
+
+  uint32_t depth = 0; // Track nested parentheses, brackets, or braces.
+  bool inS = false;   // Inside a single-quoted character literal.
+  bool inD = false;   // Inside a double-quoted string literal.
+
+  size_t argStart = open + 1;
+  for (size_t i = argStart; i < n; i++) {
+    char c = invText[i];
+
+    // Handle escaping and termination inside character literals.
+    if (inS) {
+      if (c == '\\' && i + 1 < n) {
+        i++; // Skip escaped characters.
+        continue;
+      }
+      if (c == '\'')
+        inS = false;
+      continue;
+    }
+
+    // Handle escaping and termination inside string literals.
+    if (inD) {
+      if (c == '\\' && i + 1 < n) {
+        i++; // Skip escaped characters.
+        continue;
+      }
+      if (c == '"')
+        inD = false;
+      continue;
+    }
+
+    // Enter literal state if a quote is encountered.
+    if (c == '\'') {
+      inS = true;
+      continue;
+    }
+    if (c == '"') {
+      inD = true;
+      continue;
+    }
+
+    // Increment depth for nested groups; commas inside these do not
+    // separate macro arguments.
+    if (c == '(' || c == '[' || c == '{') {
+      depth++;
+      continue;
+    }
+
+    // Handle the closing of a group or the entire argument list.
+    if (c == ')') {
+      if (depth == 0) {
+        // Final argument reached at the closing parenthesis of the call.
+        out.push_back(stringutils::trimWsRange(invText, argStart, i));
+        return out;
+      }
+      depth--;
+      continue;
+    }
+
+    // A comma at depth 0 signifies the end of one macro argument.
+    if (c == ',' && depth == 0) {
+      out.push_back(stringutils::trimWsRange(invText, argStart, i));
+      argStart = i + 1;
+    }
+  }
+
+  // If the loop finishes without hitting the final ')', the syntax is invalid.
+  return std::nullopt;
+}
