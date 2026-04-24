@@ -7615,6 +7615,79 @@ RefoldEngine::MapATokRangeAToBTokenEnvelopeTrimEdgeInsertions(
   return std::make_pair(bBegin, bEnd);
 }
 
+std::optional<std::pair<size_t, size_t>>
+RefoldEngine::ResolveIncludeRealizationBTokenEnvelope(
+    uint64_t beginTok, uint64_t endTok,
+    IncludeRealizationEvidenceKind *evidenceKind) const {
+  if (auto canonical = MapATokRangeAToBTokenEnvelope(beginTok, endTok)) {
+    if (evidenceKind)
+      *evidenceKind = IncludeRealizationEvidenceKind::InlineFromBCoverEnvelope;
+    return canonical;
+  }
+
+  // Step 4A absorbs the include-envelope gap conservatively. When the
+  // canonical mapper cannot recover the B envelope, consult the existing
+  // deterministic rescue projections and accept them only if the usable
+  // projections agree on one non-empty B-token envelope.
+  auto isUsableEnvelope = [&](const std::optional<std::pair<size_t, size_t>> &env)
+      -> bool {
+    if (!env || env->second <= env->first)
+      return false;
+    return !SliceBSource(env->first, env->second).trim().empty();
+  };
+
+  const auto wholeCover =
+      MapATokRangeAToBTokenEnvelopeWholeCover(beginTok, endTok);
+  const auto preserveBoundary =
+      MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(beginTok, endTok);
+  const auto trimEdge =
+      MapATokRangeAToBTokenEnvelopeTrimEdgeInsertions(beginTok, endTok);
+
+  std::optional<std::pair<size_t, size_t>> consensus;
+  bool sawUsableRescue = false;
+  bool conflict = false;
+
+  auto consider = [&](StringRef label,
+                      const std::optional<std::pair<size_t, size_t>> &env) {
+    if (!isUsableEnvelope(env)) {
+      trace("include/mat",
+            "include-realization rescue envelope unavailable: label={0} "
+            "A-cover=[{1},{2})",
+            label, beginTok, endTok);
+      return;
+    }
+
+    sawUsableRescue = true;
+    trace("include/mat",
+          "include-realization rescue envelope: label={0} A-cover=[{1},{2}) "
+          "Btok=[{3},{4}) text={5}",
+          label, beginTok, endTok, env->first, env->second,
+          stringutils::showWSWithClip(SliceBSource(env->first, env->second),
+                                      120));
+    if (!consensus) {
+      consensus = *env;
+      return;
+    }
+    if (*consensus != *env)
+      conflict = true;
+  };
+
+  consider("whole-cover", wholeCover);
+  consider("preserve-boundary-insertions", preserveBoundary);
+  consider("trim-edge-insertions", trimEdge);
+
+  if (!sawUsableRescue || conflict || !consensus)
+    return std::nullopt;
+
+  if (evidenceKind)
+    *evidenceKind = IncludeRealizationEvidenceKind::InlineFromBCoverEnvelope;
+  trace("include/mat",
+        "include-realization rescue envelope consensus: A-cover=[{0},{1}) "
+        "Btok=[{2},{3})",
+        beginTok, endTok, consensus->first, consensus->second);
+  return consensus;
+}
+
 std::optional<std::vector<std::pair<size_t, size_t>>>
 RefoldEngine::ParseMacroInvocationArgContentRanges(StringRef invText) {
   // Locate the start of the argument list.
@@ -20657,25 +20730,29 @@ uint64_t RefoldEngine::GetRootMacroId(uint64_t macroId) const {
 std::optional<std::string> RefoldEngine::BuildInlineIncludeRealizationFromB(
     const RefoldModel::IncludeItem &inc, StringRef reason,
     AcceptedResultCandidate *acceptedCandidate) const {
-  // The include-realization proof class is defined only when the include
-  // cover on the A side can be mapped to an exact B-token envelope. If that
-  // envelope cannot be recovered, this is not a weaker accepted realization
-  // path; it is an explicit out-of-domain terminal result.
-  auto bEnvOpt = MapATokRangeAToBTokenEnvelope(inc.cover.begin, inc.cover.end);
+  // Step 4A strengthens include realization by consulting the deterministic
+  // rescue envelope projections when the canonical A-cover -> B-envelope map is
+  // unavailable. The path remains fail-closed: if the rescue projections do
+  // not yield one usable consensus envelope, the engine stays in the explicit
+  // out-of-domain terminal state.
+  IncludeRealizationEvidenceKind evidenceKind =
+      IncludeRealizationEvidenceKind::Unknown;
+  auto bEnvOpt = ResolveIncludeRealizationBTokenEnvelope(
+      inc.cover.begin, inc.cover.end, &evidenceKind);
   if (!bEnvOpt) {
     RequestTerminalFallback(
         TerminalFallbackKind::IncludeRealizationUnmappableBCoverEnvelope,
         "include/mat",
-        llvm::formatv("include realization from B failed to map A "
-                      "cover [{0},{1}) for inc#{2}; reason={3}",
+        llvm::formatv("include realization from B failed to resolve a usable "
+                      "B envelope for A cover [{0},{1}) for inc#{2}; "
+                      "reason={3}",
                       inc.cover.begin, inc.cover.end, inc.id, reason)
             .str());
     return std::nullopt;
   }
 
   IncludeRealizationWitness realizationWitness;
-  realizationWitness.evidence =
-      IncludeRealizationEvidenceKind::InlineFromBCoverEnvelope;
+  realizationWitness.evidence = evidenceKind;
   realizationWitness.hasIncludeId = true;
   realizationWitness.includeId = inc.id;
   realizationWitness.hasACover = true;

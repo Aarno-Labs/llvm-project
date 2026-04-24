@@ -2636,6 +2636,22 @@ private:
   MapATokRangeAToBTokenEnvelopeTrimEdgeInsertions(uint64_t beginTok,
                                                   uint64_t endTok) const;
 
+  /// \brief Resolve an include-realization B-token envelope from an A-cover.
+  ///
+  /// The canonical include-realization path uses
+  /// \c MapATokRangeAToBTokenEnvelope to recover the exact B-side token
+  /// envelope for the include cover. Step 4A strengthens that witness search by
+  /// also consulting the existing deterministic rescue projections when the
+  /// canonical mapping is unavailable.
+  ///
+  /// To stay fail-closed, this helper only accepts a rescue envelope when the
+  /// available non-canonical projections agree on one non-empty B-token range.
+  /// Disagreement between rescue projections remains an explicit out-of-domain
+  /// terminal case rather than a guessed realization.
+  std::optional<std::pair<size_t, size_t>>
+  ResolveIncludeRealizationBTokenEnvelope(
+      uint64_t beginTok, uint64_t endTok,
+      IncludeRealizationEvidenceKind *evidenceKind = nullptr) const;
 
   /// \brief Parses the raw text of a function-like macro invocation to identify
   /// the byte ranges of its individual arguments.
