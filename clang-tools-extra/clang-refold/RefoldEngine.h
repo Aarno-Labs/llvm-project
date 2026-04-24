@@ -460,8 +460,7 @@ private:
   // Emission ownership for a pure B-only insertion segment.
   enum class BInsertionClaim : uint8_t {
     Unclaimed = 0,
-    Standalone = 1, // emitted as a TU/include/arm insertion patch
-    MacroAbsorb = 2 // reserved for future (macro patch intentionally absorbs)
+    Standalone = 1 // emitted as a TU/include/arm insertion patch
   };
 
   // Provenance record for one token-level pure insertion hunk:
@@ -1858,37 +1857,6 @@ private:
   ///                  payload from **B**.
   IncludePatch BuildIncludeInsertionPatch(const RefoldModel::IncludeItem &inc,
                                           const diffutils::Hunk &h) const;
-
-  /// \brief Computes a B-side preprocessor token envelope `[begin, end)` for a
-  /// macro invocation.
-  ///
-  /// The envelope is the minimal half-open token range on the B-side covering
-  /// the union of the macro invocation's **BODY spans** and **ARGUMENT spans**.
-  /// When `onlyInvFile` is `true`, tokens are counted only if their
-  /// `TokMapEntry::File` equals `m.InvFile`; otherwise, tokens from *any* file
-  /// are eligible (useful when macro body tokens originate from headers).
-  ///
-  /// Implementation details:
-  ///   - Walks all BODY and ARG spans in `m`.
-  ///   - For each preprocessor token index `pp` in a span, looks up
-  ///     `M.tokmapByPP[pp]` and (optionally) filters by `InvFile`.
-  ///   - Tracks the minimal `begin` and maximal `end` (exclusive) token index
-  ///   seen.
-  ///
-  /// Returns `false` if no eligible tokens were found (e.g., spans are
-  /// empty/invalid, or all tokens were filtered out by `onlyInvFile`).
-  ///
-  /// @param m            The macro invocation whose BODY/ARG spans contribute
-  /// to the envelope.
-  /// @param onlyInvFile  If `true`, restrict tokens to those mapped to
-  /// `m.InvFile`;
-  ///                     if `false`, accept tokens regardless of file origin.
-  /// @param begin        (Output) Lowest qualifying B-token index.
-  /// @param end          (Output) Highest qualifying B-token index (exclusive).
-  /// @return `true` if an envelope was found, `false` otherwise.
-  bool MacroExpansionEnvelopeB(const RefoldModel::MacroInvocation &m,
-                               bool onlyInvFile, uint64_t &begin,
-                               uint64_t &end) const;
 
   /// \brief Checks whether an args-only rewrite of a single macro parameter is
   /// consistent with all **observable** occurrences of that parameter in the
