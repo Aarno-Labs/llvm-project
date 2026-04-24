@@ -2053,16 +2053,30 @@ std::string RefoldEngine::RunSinglePassRefold() {
       continue;
     }
 
+    // Before we escalate to the explicit terminal out-of-domain carrier, try
+    // one last source-closure class that keeps already-proved structural work
+    // alive: materialize an exact contiguous run of top-level TU `#include`
+    // directives directly into TU source text when that include run is the
+    // whole unresolved PP cover.
+    if (auto closureEdit =
+            BuildTUIncludeClosureEditForUnresolvedHunk(h, tuPath, tuBytes)) {
+      debug("classify",
+            "#{0} -> TU include-closure bytes=[{1},{2}) textLen={3}", i,
+            closureEdit->start, closureEdit->end, closureEdit->text.size());
+      tuEdits.push_back(std::move(*closureEdit));
+      continue;
+    }
+
     debug("classify",
           "#{0} dropping edit {1}: owner unresolved and no TU byte span "
-          "available (no include guessing).",
+          "available (no include-closure witness).",
           i, h);
     // Step 5 chooses the honest theorem-boundary interpretation for this last
     // ownership gap. By the time control reaches this branch, the engine has
     // already failed to prove a macro owner, include owner, truthful TU-owned
-    // byte span, and (for pure insertions) an exact/provable TU insertion
-    // anchor. Do not manufacture a weaker success class here; terminate via
-    // the named out-of-domain boundary instead.
+    // byte span, any exact/provable TU insertion anchor, and the first hybrid
+    // TU include-closure fallback class. Do not manufacture a weaker success
+    // class here; terminate via the named out-of-domain boundary instead.
     RequestTerminalFallback(
         TerminalFallbackKind::OwnerUnresolvedNoTUAnchor, "classify",
         BuildOwnerUnresolvedNoTUAnchorDetail(i, h, tuPath, owner, mapsToTU));

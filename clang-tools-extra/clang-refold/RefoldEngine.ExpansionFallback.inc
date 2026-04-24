@@ -379,6 +379,149 @@ RefoldEngine::BuildMacroOwnerExpansionClosureWitness() const {
   return witness;
 }
 
+std::optional<RefoldEngine::TextEdit>
+RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
+    const diffutils::Hunk &h, StringRef tuPath, StringRef tuBytes) const {
+  // This helper is intentionally narrower than ordinary include realization.
+  // It is the first hybrid source-closure class used to keep already-proved
+  // structural artifacts (for example a preserved macro callsite rewrite)
+  // while materializing one otherwise-unresolved PP region directly into the
+  // TU source. Stay fail-closed unless the closure is exact and self-contained.
+  if (h.isInsertOnly()) {
+    trace("fallback",
+          "TU include-closure rejected: insert-only hunk A=[{0},{1}) B=[{2},{3}) is outside the first closure-edit domain",
+          h.aStart, h.aEnd, h.bStart, h.bEnd);
+    return std::nullopt;
+  }
+
+  SmallVector<const RefoldModel::IncludeItem *, 8> touched;
+  for (const auto &inc : model_.GetIncludes()) {
+    // Only top-level includes spelled directly in the TU are eligible for this
+    // first source-closure class. Nested includes already have a dedicated
+    // include-materialization path, while non-TU sites would need a different
+    // embedding proof.
+    if (inc.parent || !PathsEqual(inc.sitePath, tuPath))
+      continue;
+    if (inc.cover.end <= h.aStart || inc.cover.begin >= h.aEnd)
+      continue;
+    touched.push_back(&inc);
+  }
+
+  if (touched.empty()) {
+    trace("fallback",
+          "TU include-closure rejected: no top-level TU include touches hunk A=[{0},{1})",
+          h.aStart, h.aEnd);
+    return std::nullopt;
+  }
+
+  llvm::sort(touched, [](const RefoldModel::IncludeItem *lhs,
+                         const RefoldModel::IncludeItem *rhs) {
+    if (lhs->siteB != rhs->siteB)
+      return lhs->siteB < rhs->siteB;
+    return lhs->id < rhs->id;
+  });
+
+  const RefoldModel::IncludeItem *first = touched.front();
+  const RefoldModel::IncludeItem *last = touched.back();
+  uint64_t coverBegin = first->cover.begin;
+  uint64_t coverEnd = coverBegin;
+
+  for (const RefoldModel::IncludeItem *inc : touched) {
+    if (inc->cover.begin != coverEnd || inc->cover.end <= inc->cover.begin) {
+      trace("fallback",
+            "TU include-closure rejected: touched includes do not form one contiguous A-cover at inc#{0} cover=[{1},{2}) expectedBegin={3}",
+            inc->id, inc->cover.begin, inc->cover.end, coverEnd);
+      return std::nullopt;
+    }
+    coverEnd = inc->cover.end;
+  }
+
+  // Keep the first hybrid closure exact: do not silently widen beyond the
+  // unresolved PP hunk. If the touched include run would over-cover the hunk,
+  // a larger search lattice is needed and remains out-of-domain for now.
+  if (coverBegin != h.aStart || coverEnd != h.aEnd) {
+    trace("fallback",
+          "TU include-closure rejected: touched include cover A=[{0},{1}) does not exactly match hunk A=[{2},{3})",
+          coverBegin, coverEnd, h.aStart, h.aEnd);
+    return std::nullopt;
+  }
+
+  if (first->siteB >= first->siteE || last->siteE > tuBytes.size() ||
+      first->siteB >= last->siteE) {
+    trace("fallback",
+          "TU include-closure rejected: invalid TU source interval [{0},{1}) fileLen={2}",
+          first->siteB, last->siteE, tuBytes.size());
+    return std::nullopt;
+  }
+
+  uint64_t sourceCursor = first->siteB;
+  for (const RefoldModel::IncludeItem *inc : touched) {
+    if (inc->siteB < sourceCursor || inc->siteE > tuBytes.size() ||
+        inc->siteB >= inc->siteE) {
+      trace("fallback",
+            "TU include-closure rejected: invalid include site for inc#{0} site=[{1},{2}) cursor={3} fileLen={4}",
+            inc->id, inc->siteB, inc->siteE, sourceCursor, tuBytes.size());
+      return std::nullopt;
+    }
+
+    // The TU closure may absorb only the include directives themselves plus
+    // whitespace between neighboring directives. Comments or other spelled TU
+    // text would require a richer source-frontier proof.
+    if (inc->siteB > sourceCursor) {
+      StringRef gap = tuBytes.slice(sourceCursor, inc->siteB);
+      if (!gap.empty() && !stringutils::isWhitespace(gap)) {
+        trace("fallback",
+              "TU include-closure rejected: non-whitespace TU gap between include directives before inc#{0} gap='{1}'",
+              inc->id, stringutils::showWSWithClip(gap, 120));
+        return std::nullopt;
+      }
+    }
+
+    sourceCursor = inc->siteE;
+  }
+
+  IncludeRealizationEvidenceKind evidenceKind =
+      IncludeRealizationEvidenceKind::Unknown;
+  auto bEnvelope =
+      ResolveIncludeRealizationBTokenEnvelope(coverBegin, coverEnd,
+                                             &evidenceKind);
+  if (!bEnvelope) {
+    trace("fallback",
+          "TU include-closure rejected: no canonical-or-consensus B envelope for A-cover [{0},{1})",
+          coverBegin, coverEnd);
+    return std::nullopt;
+  }
+
+  std::string replacement =
+      SliceBSource(bEnvelope->first, bEnvelope->second).str();
+  std::string rawReplacement = replacement;
+  std::string padded = PadAtBoundaries(
+      tuBytes, static_cast<size_t>(first->siteB), static_cast<size_t>(last->siteE),
+      std::move(replacement), /*allowLeft=*/true, /*allowRight=*/true);
+
+  debug("fallback",
+        "TU include-closure accepted: includes=[{0},{1}] source=[{2},{3}) A=[{4},{5}) B=[{6},{7}) evidence={8} raw='{9}' padded='{10}'",
+        first->id, last->id, first->siteB, last->siteE, coverBegin, coverEnd,
+        bEnvelope->first, bEnvelope->second,
+        FormatIncludeRealizationEvidenceKind(evidenceKind),
+        stringutils::showWSWithClip(rawReplacement, 120),
+        stringutils::showWSWithClip(padded, 120));
+
+  ResyncOutcome ro =
+      ApplyResyncOrPend(tuBytes, first->siteB, last->siteE, padded, tuPath);
+  TextEdit edit{first->siteB, last->siteE, std::move(ro.text),
+                std::move(ro.pending), std::nullopt, {}};
+
+  // The emitted artifact is still a deterministic TU byte replacement even
+  // though the witness came from an exact include-closure proof. Reuse the TU
+  // textual-edit carrier until a dedicated closure-edit proof class exists.
+  AttachAcceptedResultCarrier(
+      edit, BuildAcceptedTUTextEditCandidate(
+                AcceptedPathKind::TUByteSpanConservativeEdit, first->siteB,
+                last->siteE, StringRef(rawReplacement)));
+  return edit;
+}
+
 bool RefoldEngine::ExpansionFallbackReplacementIsReplayStable(
     StringRef replacementText) const {
   if (replacementText.empty()) {
