@@ -1706,8 +1706,13 @@ std::string RefoldEngine::RunSinglePassRefold() {
 
         ResyncOutcome ro = ApplyResyncOrPend(tuBytes, span->first, span->second,
                                              padded, tuPath);
-        tuEdits.push_back(TextEdit{span->first, span->second,
-                                   std::move(ro.text), std::move(ro.pending)});
+        TextEdit edit{span->first, span->second, std::move(ro.text),
+                      std::move(ro.pending), std::nullopt, {}};
+        AttachAcceptedResultCarrier(
+            edit, BuildAcceptedTUTextEditCandidate(
+                      AcceptedPathKind::TUByteSpanMappedEdit, span->first,
+                      span->second, StringRef(padded)));
+        tuEdits.push_back(std::move(edit));
         continue;
       } else {
         debug("classify",
@@ -1833,8 +1838,13 @@ std::string RefoldEngine::RunSinglePassRefold() {
 
       ResyncOutcome ro =
           ApplyResyncOrPend(tuBytes, span->first, span->second, padded, tuPath);
-      tuEdits.push_back(TextEdit{span->first, span->second, std::move(ro.text),
-                                 std::move(ro.pending)});
+      TextEdit edit{span->first, span->second, std::move(ro.text),
+                    std::move(ro.pending), std::nullopt, {}};
+      AttachAcceptedResultCarrier(
+          edit, BuildAcceptedTUTextEditCandidate(
+                    AcceptedPathKind::TUByteSpanConservativeEdit, span->first,
+                    span->second, StringRef(padded)));
+      tuEdits.push_back(std::move(edit));
       continue;
     }
 
@@ -1955,6 +1965,11 @@ std::string RefoldEngine::RunSinglePassRefold() {
   // Cache for realized expansion text per include id.
   DenseMap<uint64_t, std::string> includeExpansion;
 
+  // Step 2A: every materialized include expansion also carries a normalized
+  // accepted-result summary so the later TU/header emission boundary does not
+  // have to reconstruct where that emitted non-terminal artifact came from.
+  DenseMap<uint64_t, AcceptedResultCandidate> includeExpansionAcceptedResults;
+
   // Build the set of include-ids that must be realized.
   DenseSet<uint64_t> seeds;
 
@@ -1996,6 +2011,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
     debug("include/mat", "materialize seed include #{0}", incId);
     MaterializeIncludeExpansion(incId, perInclude, macroPatchesByOwner,
                                 children, includeExpansion,
+                                includeExpansionAcceptedResults,
                                 &appliedExpandedMacroRootIds);
   }
 
@@ -2073,11 +2089,14 @@ std::string RefoldEngine::RunSinglePassRefold() {
               mp.invStart, mpEnd, mp.replacement.size());
         ResyncOutcome ro = ApplyResyncOrPend(tuBytes, mp.invStart, mpEnd,
                                              mp.replacement, tuPath);
-        tuEdits.push_back(TextEdit{
-            mp.invStart, mpEnd, std::move(ro.text), std::move(ro.pending),
-            MacroPatchRemainsExpanded(mp)
-                ? std::make_optional(GetRootMacroId(mp.macroId))
-                : std::nullopt});
+        TextEdit edit{mp.invStart, mpEnd, std::move(ro.text),
+                      std::move(ro.pending),
+                      MacroPatchRemainsExpanded(mp)
+                          ? std::make_optional(GetRootMacroId(mp.macroId))
+                          : std::nullopt,
+                      {}};
+        AttachAcceptedResultCarrier(edit, BuildAcceptedMacroCandidate(mp));
+        tuEdits.push_back(std::move(edit));
       } else {
         trace("macro/tu", "  TU macro patch shadowed (skipped) inv=[{0},{1})",
               mp.invStart, mpEnd);
@@ -2145,8 +2164,16 @@ std::string RefoldEngine::RunSinglePassRefold() {
       std::string wrapped = lineDirs_.WrapIncludeExpansion(
           headerPath, tuPath, stringutils::lineAtOffset(tuBytes, siteE),
           expText);
-      tuEdits.push_back(
-          TextEdit{siteB, siteE, std::move(wrapped), std::nullopt});
+      TextEdit edit{siteB, siteE, std::move(wrapped), std::nullopt,
+                    std::nullopt, {}};
+      auto itAccepted = includeExpansionAcceptedResults.find(incId);
+      if (itAccepted != includeExpansionAcceptedResults.end())
+        AttachAcceptedResultCarrier(edit, itAccepted->second);
+      else
+        AttachAcceptedResultCarrier(
+            edit, BuildAcceptedIncludeRealizationCandidate(
+                      AcceptedPathKind::IncludeMaterializedExpansion, *inc));
+      tuEdits.push_back(std::move(edit));
     }
   }
 
@@ -8568,6 +8595,15 @@ RefoldEngine::BuildAcceptancePathInventory(AcceptedPathKind currentPath) const {
     inventory.support = AcceptanceSupportKind::ExplicitProofBacked;
     inventory.futureTarget = FutureProofTarget::IncludeRealizationCover;
     break;
+  case AcceptedPathKind::IncludeMaterializedExpansion:
+    // Step 2A gives recursively materialized include expansions an explicit
+    // normalized carrier at the parent/TU emission boundary, but the path
+    // remains transitional until a later step closes the full realization
+    // proof contract.
+    inventory.support = AcceptanceSupportKind::DeterministicButNotFirstClass;
+    inventory.futureTarget =
+        FutureProofTarget::IncludeMaterializedExpansionRealization;
+    break;
   case AcceptedPathKind::TUExactSlotBoundary:
     // Step 7 formalizes exact slot anchors as first-class TU anchor proofs.
     inventory.support = AcceptanceSupportKind::ExplicitProofBacked;
@@ -8578,6 +8614,14 @@ RefoldEngine::BuildAcceptancePathInventory(AcceptedPathKind currentPath) const {
     // into explicit proof-backed paths once they carry a local witness.
     inventory.support = AcceptanceSupportKind::ExplicitProofBacked;
     inventory.futureTarget = FutureProofTarget::TUProvableInsertionAnchor;
+    break;
+  case AcceptedPathKind::TUByteSpanMappedEdit:
+  case AcceptedPathKind::TUByteSpanConservativeEdit:
+    // Step 2A makes TU byte-span edits explicit emitted artifacts with a
+    // normalized carrier, while keeping them transitional until the direct TU
+    // textual proof contract is fully formalized.
+    inventory.support = AcceptanceSupportKind::DeterministicButNotFirstClass;
+    inventory.futureTarget = FutureProofTarget::TUByteSpanTextualEdit;
     break;
   case AcceptedPathKind::TerminalEmitEditedPreprocessedStream:
     inventory.support = AcceptanceSupportKind::ExplicitOutOfDomainClass;
@@ -8700,6 +8744,7 @@ RefoldEngine::ClassifyMacroPatchProof(const MacroPatch &patch) const {
   case AcceptedProofClass::IncludePreserving:
   case AcceptedProofClass::IncludeRealization:
   case AcceptedProofClass::TUAnchor:
+  case AcceptedProofClass::TUTextualEdit:
     break;
   }
 
@@ -8793,6 +8838,25 @@ RefoldEngine::ProofSummary RefoldEngine::BuildAcceptedPathProofSummary(
         currentPath, patch, includeRealizationWitness);
     break;
 
+  case AcceptedPathKind::IncludeMaterializedExpansion: {
+    summary.acceptedClass = AcceptedProofClass::IncludeRealization;
+    summary.realizationMode = RealizationMode::RealizeEditedSurface;
+    summary.preference = SelectionPreference::PreferSurfaceRealization;
+    summary.surfaceDisposition =
+        SurfaceDisposition::RealizeMaterializedIncludeExpansion;
+    summary.structurePreserving = false;
+    ProofDischargeAccumulator discharge;
+    discharge.Require(summary.inventory.currentPath != AcceptedPathKind::Unknown,
+                      ProofObligationKind::AcceptedPathClassified,
+                      ProofFailureReason::MissingAcceptedPathClassification);
+    discharge.Require(
+        summary.inventory.futureTarget != FutureProofTarget::Unknown,
+        ProofObligationKind::FutureTargetMapped,
+        ProofFailureReason::MissingFutureTargetMapping);
+    summary.discharge = discharge.Finish();
+    break;
+  }
+
   case AcceptedPathKind::TUExactSlotBoundary:
   case AcceptedPathKind::TUProvableInsertionAnchor:
     summary.acceptedClass = AcceptedProofClass::TUAnchor;
@@ -8805,6 +8869,26 @@ RefoldEngine::ProofSummary RefoldEngine::BuildAcceptedPathProofSummary(
     }
     summary.discharge = ValidateTUAnchorProof(currentPath, tuAnchorWitness);
     break;
+
+  case AcceptedPathKind::TUByteSpanMappedEdit:
+  case AcceptedPathKind::TUByteSpanConservativeEdit: {
+    summary.acceptedClass = AcceptedProofClass::TUTextualEdit;
+    summary.realizationMode = RealizationMode::RealizeEditedSurface;
+    summary.preference = SelectionPreference::PreferSurfaceRealization;
+    summary.surfaceDisposition =
+        SurfaceDisposition::RealizeTranslationUnitByteEdit;
+    summary.structurePreserving = false;
+    ProofDischargeAccumulator discharge;
+    discharge.Require(summary.inventory.currentPath != AcceptedPathKind::Unknown,
+                      ProofObligationKind::AcceptedPathClassified,
+                      ProofFailureReason::MissingAcceptedPathClassification);
+    discharge.Require(
+        summary.inventory.futureTarget != FutureProofTarget::Unknown,
+        ProofObligationKind::FutureTargetMapped,
+        ProofFailureReason::MissingFutureTargetMapping);
+    summary.discharge = discharge.Finish();
+    break;
+  }
 
   case AcceptedPathKind::TerminalEmitEditedPreprocessedStream: {
     if (terminalFallbackWitness) {
@@ -8927,6 +9011,12 @@ RefoldEngine::BuildGlobalSelectionLattice(const ProofSummary &summary) const {
     lattice.conflictLaw = LatticeConflictLaw::PreferExactAnchorWitness;
     break;
 
+  case AcceptedProofClass::TUTextualEdit:
+    lattice.domain = LatticeConflictDomain::WholeTranslationUnit;
+    lattice.mergeLaw = LatticeMergeLaw::DisjointCompose;
+    lattice.conflictLaw = LatticeConflictLaw::RejectPartialOverlap;
+    break;
+
   case AcceptedProofClass::Unknown:
     break;
   }
@@ -9045,10 +9135,14 @@ bool RefoldEngine::LatticePrefers(const ProofSummary &lhs,
       return 1;
     case SurfaceDisposition::RealizeInlineTouchedIncludesFromB:
       return 2;
-    case SurfaceDisposition::EmitEditedPreprocessedStream:
+    case SurfaceDisposition::RealizeMaterializedIncludeExpansion:
       return 3;
+    case SurfaceDisposition::RealizeTranslationUnitByteEdit:
+      return 4;
+    case SurfaceDisposition::EmitEditedPreprocessedStream:
+      return 5;
     }
-    return 3;
+    return 5;
   };
 
   const uint8_t lhsPreference = preferenceRank(lhs.preference);
@@ -9197,6 +9291,40 @@ RefoldEngine::BuildAcceptedIncludeCandidate(
   candidate.hasPayloadPreview = true;
   candidate.payloadPreview =
       stringutils::showWSWithClip(patch.insertBytes, 120);
+  return candidate;
+}
+
+RefoldEngine::AcceptedResultCandidate
+RefoldEngine::BuildAcceptedIncludeRealizationCandidate(
+    AcceptedPathKind currentPath, const RefoldModel::IncludeItem &include,
+    const IncludeRealizationWitness *includeRealizationWitness) const {
+  AcceptedResultCandidate candidate;
+  candidate.kind = AcceptedResultCandidateKind::IncludePatch;
+  candidate.proofSummary = BuildAcceptedPathProofSummary(
+      currentPath, /*patch=*/nullptr, /*tuAnchorWitness=*/nullptr,
+      /*includeAnchorWitness=*/nullptr, includeRealizationWitness);
+  candidate.hasOwnerIncludeId = true;
+  candidate.ownerIncludeId = include.id;
+  candidate.begin = include.siteB;
+  candidate.end = include.siteE;
+  candidate.hasPayloadPreview = true;
+  candidate.payloadPreview = FormatAcceptedPathKind(currentPath).str();
+  return candidate;
+}
+
+RefoldEngine::AcceptedResultCandidate
+RefoldEngine::BuildAcceptedTUTextEditCandidate(
+    AcceptedPathKind currentPath, uint64_t begin, uint64_t end,
+    StringRef payloadPreview) const {
+  AcceptedResultCandidate candidate;
+  candidate.kind = AcceptedResultCandidateKind::TUTextEdit;
+  candidate.proofSummary = BuildAcceptedPathProofSummary(
+      currentPath, /*patch=*/nullptr, /*tuAnchorWitness=*/nullptr,
+      /*includeAnchorWitness=*/nullptr, /*includeRealizationWitness=*/nullptr);
+  candidate.begin = begin;
+  candidate.end = end;
+  candidate.hasPayloadPreview = true;
+  candidate.payloadPreview = payloadPreview.str();
   return candidate;
 }
 
@@ -9618,6 +9746,7 @@ RefoldEngine::ValidateIncludePreservingProof(AcceptedPathKind currentPath,
     break;
   case AcceptedPathKind::IncludePatchPendingMaterialization:
   case AcceptedPathKind::IncludeRealizationInlineFromB:
+  case AcceptedPathKind::IncludeMaterializedExpansion:
   case AcceptedPathKind::Unknown:
   case AcceptedPathKind::MacroArgsOnlyStandard:
   case AcceptedPathKind::MacroArgsOnlyPasteSingle:
@@ -9630,6 +9759,8 @@ RefoldEngine::ValidateIncludePreservingProof(AcceptedPathKind currentPath,
   case AcceptedPathKind::MacroWholeCoverRealization:
   case AcceptedPathKind::TUExactSlotBoundary:
   case AcceptedPathKind::TUProvableInsertionAnchor:
+  case AcceptedPathKind::TUByteSpanMappedEdit:
+  case AcceptedPathKind::TUByteSpanConservativeEdit:
   case AcceptedPathKind::TerminalEmitEditedPreprocessedStream:
     break;
   }
@@ -9651,25 +9782,31 @@ RefoldEngine::ValidateIncludeRealizationProof(
   discharge.Require(inventory.futureTarget != FutureProofTarget::Unknown,
                     ProofObligationKind::FutureTargetMapped,
                     ProofFailureReason::MissingFutureTargetMapping);
-  discharge.Require(currentPath == AcceptedPathKind::IncludeRealizationInlineFromB,
+  discharge.Require(currentPath == AcceptedPathKind::IncludeRealizationInlineFromB ||
+                        currentPath == AcceptedPathKind::IncludeMaterializedExpansion,
                     ProofObligationKind::AcceptedPathClassified,
                     ProofFailureReason::MissingAcceptedPathClassification);
-  discharge.Require(witness &&
-                        witness->evidence ==
-                            IncludeRealizationEvidenceKind::InlineFromBCoverEnvelope,
-                    ProofObligationKind::IncludeRealizationWitnessTracked,
-                    ProofFailureReason::MissingIncludeRealizationWitness);
-  discharge.Require(witness && witness->hasIncludeId && witness->includeId != 0,
-                    ProofObligationKind::IncludeRealizationIncludeTracked,
-                    ProofFailureReason::MissingIncludeRealizationInclude);
-  discharge.Require(witness && witness->hasACover &&
-                        witness->aCoverEnd >= witness->aCoverBegin,
-                    ProofObligationKind::IncludeRealizationCoverTracked,
-                    ProofFailureReason::MissingIncludeRealizationCover);
-  discharge.Require(witness && witness->hasBTokenEnvelope &&
-                        witness->bTokEnd >= witness->bTokBegin,
-                    ProofObligationKind::IncludeRealizationBEnvelopeTracked,
-                    ProofFailureReason::MissingIncludeRealizationBEnvelope);
+  if (currentPath == AcceptedPathKind::IncludeRealizationInlineFromB) {
+    discharge.Require(witness &&
+                          witness->evidence ==
+                              IncludeRealizationEvidenceKind::InlineFromBCoverEnvelope,
+                      ProofObligationKind::IncludeRealizationWitnessTracked,
+                      ProofFailureReason::MissingIncludeRealizationWitness);
+    discharge.Require(witness && witness->hasIncludeId && witness->includeId != 0,
+                      ProofObligationKind::IncludeRealizationIncludeTracked,
+                      ProofFailureReason::MissingIncludeRealizationInclude);
+    discharge.Require(witness && witness->hasACover &&
+                          witness->aCoverEnd >= witness->aCoverBegin,
+                      ProofObligationKind::IncludeRealizationCoverTracked,
+                      ProofFailureReason::MissingIncludeRealizationCover);
+    discharge.Require(witness && witness->hasBTokenEnvelope &&
+                          witness->bTokEnd >= witness->bTokBegin,
+                      ProofObligationKind::IncludeRealizationBEnvelopeTracked,
+                      ProofFailureReason::MissingIncludeRealizationBEnvelope);
+  } else {
+    discharge.Require(true, ProofObligationKind::AcceptedPathClassified,
+                      ProofFailureReason::MissingAcceptedPathClassification);
+  }
   return discharge.Finish();
 }
 
@@ -9768,6 +9905,9 @@ RefoldEngine::ValidateTUAnchorProof(AcceptedPathKind currentPath,
   case AcceptedPathKind::IncludeInsertLeftNeighborPP:
   case AcceptedPathKind::IncludeInsertDeclBoundary:
   case AcceptedPathKind::IncludeRealizationInlineFromB:
+  case AcceptedPathKind::IncludeMaterializedExpansion:
+  case AcceptedPathKind::TUByteSpanMappedEdit:
+  case AcceptedPathKind::TUByteSpanConservativeEdit:
   case AcceptedPathKind::TerminalEmitEditedPreprocessedStream:
     break;
   }
@@ -9789,6 +9929,8 @@ RefoldEngine::FormatAcceptedProofClass(AcceptedProofClass kind) const {
     return "IncludeRealization";
   case AcceptedProofClass::TUAnchor:
     return "TUAnchor";
+  case AcceptedProofClass::TUTextualEdit:
+    return "TUTextualEdit";
   }
   return "Unknown";
 }
@@ -9804,6 +9946,8 @@ StringRef RefoldEngine::FormatAcceptedResultCandidateKind(
     return "IncludePatch";
   case AcceptedResultCandidateKind::TUAnchor:
     return "TUAnchor";
+  case AcceptedResultCandidateKind::TUTextEdit:
+    return "TUTextEdit";
   case AcceptedResultCandidateKind::TerminalOutOfDomain:
     return "TerminalOutOfDomain";
   }
@@ -9846,6 +9990,10 @@ StringRef RefoldEngine::FormatSurfaceDisposition(
     return "RealizeWholeCoverMacros";
   case SurfaceDisposition::RealizeInlineTouchedIncludesFromB:
     return "RealizeInlineTouchedIncludesFromB";
+  case SurfaceDisposition::RealizeMaterializedIncludeExpansion:
+    return "RealizeMaterializedIncludeExpansion";
+  case SurfaceDisposition::RealizeTranslationUnitByteEdit:
+    return "RealizeTranslationUnitByteEdit";
   case SurfaceDisposition::EmitEditedPreprocessedStream:
     return "EmitEditedPreprocessedStream";
   }
@@ -9890,10 +10038,16 @@ StringRef RefoldEngine::FormatAcceptedPathKind(AcceptedPathKind kind) const {
     return "IncludeInsertDeclBoundary";
   case AcceptedPathKind::IncludeRealizationInlineFromB:
     return "IncludeRealizationInlineFromB";
+  case AcceptedPathKind::IncludeMaterializedExpansion:
+    return "IncludeMaterializedExpansion";
   case AcceptedPathKind::TUExactSlotBoundary:
     return "TUExactSlotBoundary";
   case AcceptedPathKind::TUProvableInsertionAnchor:
     return "TUProvableInsertionAnchor";
+  case AcceptedPathKind::TUByteSpanMappedEdit:
+    return "TUByteSpanMappedEdit";
+  case AcceptedPathKind::TUByteSpanConservativeEdit:
+    return "TUByteSpanConservativeEdit";
   case AcceptedPathKind::TerminalEmitEditedPreprocessedStream:
     return "TerminalEmitEditedPreprocessedStream";
   }
@@ -9951,10 +10105,14 @@ StringRef RefoldEngine::FormatFutureProofTarget(FutureProofTarget target) const 
     return "IncludeInsertionByDeclBoundary";
   case FutureProofTarget::IncludeRealizationCover:
     return "IncludeRealizationCover";
+  case FutureProofTarget::IncludeMaterializedExpansionRealization:
+    return "IncludeMaterializedExpansionRealization";
   case FutureProofTarget::TUExactSlotAnchor:
     return "TUExactSlotAnchor";
   case FutureProofTarget::TUProvableInsertionAnchor:
     return "TUProvableInsertionAnchor";
+  case FutureProofTarget::TUByteSpanTextualEdit:
+    return "TUByteSpanTextualEdit";
   case FutureProofTarget::EditedPreprocessedStreamFallback:
     return "ExplicitOutOfDomainTerminalResult";
   }
@@ -10576,6 +10734,9 @@ RefoldEngine::FormatAcceptedResultCandidate(
     if (candidate.hasAnchorByte) {
       artifact += formatv(" tuByte={0}", candidate.anchorByte).str();
     }
+    break;
+  case AcceptedResultCandidateKind::TUTextEdit:
+    artifact = formatv("bytes=[{0},{1})", candidate.begin, candidate.end).str();
     break;
   case AcceptedResultCandidateKind::TerminalOutOfDomain:
   case AcceptedResultCandidateKind::Unknown:
@@ -19618,7 +19779,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                 edits.reserve(tokEdits.size());
                 for (const auto &te : tokEdits)
                   edits.push_back(TextEdit{te.bAbs - minB, te.eAbs - minB,
-                                           te.repl, std::nullopt});
+                                           te.repl, std::nullopt,
+                                           std::nullopt, {}});
                 llvm::sort(edits, [](const TextEdit &a, const TextEdit &b) {
                   return a.start < b.start;
                 });
@@ -20482,7 +20644,8 @@ uint64_t RefoldEngine::GetRootMacroId(uint64_t macroId) const {
 }
 
 std::optional<std::string> RefoldEngine::BuildInlineIncludeRealizationFromB(
-    const RefoldModel::IncludeItem &inc, StringRef reason) const {
+    const RefoldModel::IncludeItem &inc, StringRef reason,
+    AcceptedResultCandidate *acceptedCandidate) const {
   // The include-realization proof class is defined only when the include
   // cover on the A side can be mapped to an exact B-token envelope. If that
   // envelope cannot be recovered, this is not a weaker accepted realization
@@ -20511,18 +20674,16 @@ std::optional<std::string> RefoldEngine::BuildInlineIncludeRealizationFromB(
   realizationWitness.bTokBegin = bEnvOpt->first;
   realizationWitness.bTokEnd = bEnvOpt->second;
 
-  AcceptedResultCandidate realizationCandidate;
-  realizationCandidate.kind = AcceptedResultCandidateKind::IncludePatch;
-  realizationCandidate.proofSummary = BuildAcceptedPathProofSummary(
-      AcceptedPathKind::IncludeRealizationInlineFromB,
-      /*patch=*/nullptr, /*tuAnchorWitness=*/nullptr,
-      /*includeAnchorWitness=*/nullptr, &realizationWitness);
-  realizationCandidate.hasOwnerIncludeId = true;
-  realizationCandidate.ownerIncludeId = inc.id;
+  AcceptedResultCandidate realizationCandidate =
+      BuildAcceptedIncludeRealizationCandidate(
+          AcceptedPathKind::IncludeRealizationInlineFromB, inc,
+          &realizationWitness);
   debug("include/mat",
         "realize from B inc#{0} reason='{1}' bTok=[{2},{3}) candidate={4}",
         inc.id, reason, bEnvOpt->first, bEnvOpt->second,
         FormatAcceptedResultCandidate(realizationCandidate));
+  if (acceptedCandidate)
+    *acceptedCandidate = realizationCandidate;
   return SliceBSource(bEnvOpt->first, bEnvOpt->second).str();
 }
 
@@ -20535,6 +20696,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
     const DenseMap<uint64_t, std::vector<const RefoldModel::IncludeItem *>>
         &children,
     DenseMap<uint64_t, std::string> &includeExpansion,
+    DenseMap<uint64_t, AcceptedResultCandidate> &includeExpansionAcceptedResults,
     DenseSet<uint64_t> *appliedExpandedMacroRootIds) const {
   // Already materialized?
   if (includeExpansion.count(includeId)) {
@@ -20605,11 +20767,14 @@ void RefoldEngine::MaterializeIncludeExpansion(
             inc->id, mp.invStart, mpEnd, mp.replacement.size());
       ResyncOutcome ro = ApplyResyncOrPend(bytes, mp.invStart, mpEnd,
                                            mp.replacement, headerPath);
-      edits.push_back(TextEdit{mp.invStart, mpEnd, std::move(ro.text),
-                               std::move(ro.pending),
-                               MacroPatchRemainsExpanded(mp)
-                                   ? std::make_optional(GetRootMacroId(mp.macroId))
-                                   : std::nullopt});
+      TextEdit edit{mp.invStart, mpEnd, std::move(ro.text),
+                    std::move(ro.pending),
+                    MacroPatchRemainsExpanded(mp)
+                        ? std::make_optional(GetRootMacroId(mp.macroId))
+                        : std::nullopt,
+                    {}};
+      AttachAcceptedResultCarrier(edit, BuildAcceptedMacroCandidate(mp));
+      edits.push_back(std::move(edit));
     }
   }
 
@@ -20620,9 +20785,12 @@ void RefoldEngine::MaterializeIncludeExpansion(
             inc->id, it->second.patches.size());
       IncludeTextEditPlan plan = ComputeIncludeTextEdits(it->second, bytes);
       if (plan.requiresIncludeRealization) {
+        AcceptedResultCandidate realizationCandidate;
         if (auto realized = BuildInlineIncludeRealizationFromB(
-                *inc, plan.realizationReason)) {
+                *inc, plan.realizationReason, &realizationCandidate)) {
           includeExpansion[includeId] = std::move(*realized);
+          includeExpansionAcceptedResults[includeId] =
+              std::move(realizationCandidate);
           return;
         }
         includeExpansion[includeId] = std::string();
@@ -20631,8 +20799,10 @@ void RefoldEngine::MaterializeIncludeExpansion(
       for (auto &te : plan.edits) {
         ResyncOutcome ro =
             ApplyResyncOrPend(bytes, te.start, te.end, te.text, headerPath);
-        edits.push_back(TextEdit{te.start, te.end, std::move(ro.text),
-                                 std::move(ro.pending)});
+        TextEdit edit{te.start, te.end, std::move(ro.text),
+                      std::move(ro.pending), std::nullopt, {}};
+        edit.acceptedResults = std::move(te.acceptedResults);
+        edits.push_back(std::move(edit));
       }
     } else {
       debug("include/mat", "inc#{0} has no include patches", inc->id);
@@ -20689,6 +20859,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
       // Ensure the child is materialized first (depth-first).
       MaterializeIncludeExpansion(child->id, perInclude, macroPatchesByOwner,
                                   children, includeExpansion,
+                                  includeExpansionAcceptedResults,
                                   appliedExpandedMacroRootIds);
 
       // The child directive's site is recorded in the includer byte space.
@@ -20714,8 +20885,16 @@ void RefoldEngine::MaterializeIncludeExpansion(
         std::string wrapped = lineDirs_.WrapIncludeExpansion(
             childHeaderPath, headerPath,
             stringutils::lineAtOffset(bytes, child->siteE), childText);
-        edits.push_back(
-            TextEdit{siteStart, siteEnd, std::move(wrapped), std::nullopt});
+        TextEdit edit{siteStart, siteEnd, std::move(wrapped), std::nullopt,
+                      std::nullopt, {}};
+        auto itAccepted = includeExpansionAcceptedResults.find(child->id);
+        if (itAccepted != includeExpansionAcceptedResults.end())
+          AttachAcceptedResultCarrier(edit, itAccepted->second);
+        else
+          AttachAcceptedResultCarrier(
+              edit, BuildAcceptedIncludeRealizationCandidate(
+                        AcceptedPathKind::IncludeMaterializedExpansion, *child));
+        edits.push_back(std::move(edit));
       } else {
         // A degenerate child site cannot discharge an include-preserving edit
         // plan for the parent. Select the explicit include-realization proof
@@ -20724,13 +20903,17 @@ void RefoldEngine::MaterializeIncludeExpansion(
               "inc#{0} child#{1} has degenerate site [start={2},end={3}]; "
               "realizing parent include from B",
               inc->id, child->id, siteStart, siteEnd);
+        AcceptedResultCandidate realizationCandidate;
         if (auto realized = BuildInlineIncludeRealizationFromB(
                 *inc,
                 llvm::formatv("degenerate child replace site for parent inc#{0} "
                               "child#{1} site=[{2},{3})",
                               inc->id, child->id, siteStart, siteEnd)
-                    .str())) {
+                    .str(),
+                &realizationCandidate)) {
           includeExpansion[includeId] = std::move(*realized);
+          includeExpansionAcceptedResults[includeId] =
+              std::move(realizationCandidate);
         } else {
           includeExpansion[includeId] = std::string();
         }
@@ -20744,6 +20927,9 @@ void RefoldEngine::MaterializeIncludeExpansion(
   std::string applied = ApplyTextEditsWithPendingResync(
       bytes, edits, appliedExpandedMacroRootIds);
   includeExpansion[includeId] = std::move(applied);
+  includeExpansionAcceptedResults[includeId] =
+      BuildAcceptedIncludeRealizationCandidate(
+          AcceptedPathKind::IncludeMaterializedExpansion, *inc);
   debug("include/mat", "EXIT inc#{0} resultLen={1}", inc->id,
         includeExpansion[includeId].size());
 }
@@ -20891,6 +21077,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
 
     std::optional<uint64_t> startByte;
     std::optional<uint64_t> endByte;
+    IncludeAnchorWitness mappedHeaderWitness;
 
     const auto &tokmapByPP = model_.GetTokmapByPP();
     if (isInsert) {
@@ -20961,8 +21148,12 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                             static_cast<size_t>(candidate.anchorByte),
                             p.insertBytes,
                             /* allowLeft */ true, /* allowRight */ true);
-        plan.edits.push_back(MakeTextEditWithResyncOrPending(
-            headerText, candidate.anchorByte, candidate.anchorByte, text, file));
+        TextEdit edit = MakeTextEditWithResyncOrPending(
+            headerText, candidate.anchorByte, candidate.anchorByte, text, file);
+        AttachAcceptedResultCarrier(
+            edit, BuildAcceptedIncludeCandidate(candidate.path, p,
+                                                &candidate.witness));
+        plan.edits.push_back(std::move(edit));
       };
 
       // If this INSERT gap is exactly the begin of the currently selected
@@ -21216,7 +21407,6 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                                        /* fallbackToEOF */ false, fileLen);
       endByte =
           ByteEndForPPInFile(file, *lastPP, /* fallbackToEOF */ false, fileLen);
-      IncludeAnchorWitness mappedHeaderWitness;
       mappedHeaderWitness.evidence = IncludeAnchorEvidenceKind::MappedHeaderTokens;
       mappedHeaderWitness.hasFirstPP = firstPP.has_value();
       mappedHeaderWitness.firstPP = firstPP ? *firstPP : 0ULL;
@@ -21296,8 +21486,13 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
             stringutils::showWS(replDbg));
     }
 
-    plan.edits.push_back(MakeTextEditWithResyncOrPending(
-        headerText, *startByte, *endByte, replacement, file));
+    TextEdit edit = MakeTextEditWithResyncOrPending(
+        headerText, *startByte, *endByte, replacement, file);
+    AttachAcceptedResultCarrier(
+        edit, BuildAcceptedIncludeCandidate(
+                  AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens, p,
+                  &mappedHeaderWitness));
+    plan.edits.push_back(std::move(edit));
   }
 
   // Apply all edits inside this header, highest offset first so earlier edits
@@ -21462,6 +21657,12 @@ RefoldEngine::ApplyResyncOrPend(StringRef originalFileText, uint64_t start,
                        PendingResync{fileSpellingForDirective}};
 }
 
+void RefoldEngine::AttachAcceptedResultCarrier(
+    TextEdit &edit, const AcceptedResultCandidate &candidate) const {
+  edit.acceptedResults.push_back(
+      std::make_shared<AcceptedResultCandidate>(candidate));
+}
+
 std::string
 RefoldEngine::ApplyTextEditsWithPendingResync(
     StringRef originalFileText, ArrayRef<TextEdit> edits,
@@ -21535,6 +21736,9 @@ RefoldEngine::ApplyTextEditsWithPendingResync(
         merged.text.append(ordered[k].e->text);
         if (ordered[k].e->pending)
           merged.pending = ordered[k].e->pending;
+        merged.acceptedResults.insert(merged.acceptedResults.end(),
+                                      ordered[k].e->acceptedResults.begin(),
+                                      ordered[k].e->acceptedResults.end());
       }
 
       trace("edits/apply",

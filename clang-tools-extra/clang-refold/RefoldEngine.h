@@ -66,6 +66,7 @@
 #include "llvm/Support/JSON.h"
 
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -477,6 +478,8 @@ private:
         : text(std::move(t)), pending(std::move(p)) {}
   };
 
+  struct AcceptedResultCandidate;
+
   struct TextEdit {
     uint64_t start, end;
     std::string text;
@@ -485,6 +488,14 @@ private:
     // Root macro invocation id to charge as expanded if this edit survives
     // normalization and is applied in the final chosen refold result.
     std::optional<uint64_t> expandedMacroRootId = std::nullopt;
+
+    // Normalized accepted-result carriers for the non-terminal artifacts that
+    // were composed into this final emitted edit. Step 2A is structural only:
+    // it does not change emission semantics, but it makes the proof-bearing
+    // source of each emitted artifact explicit at the byte-edit boundary so a
+    // later universal proof gate can reason over the actual emitted surface.
+    std::vector<std::shared_ptr<const AcceptedResultCandidate>>
+        acceptedResults;
   };
 
   // Result of planning header-local edits for one include. When
@@ -561,6 +572,7 @@ private:
     IncludePreserving,
     IncludeRealization,
     TUAnchor,
+    TUTextualEdit,
   };
 
   /// \brief Whether an accepted result preserves original structure or emits
@@ -587,6 +599,8 @@ private:
     None,
     RealizeWholeCoverMacros,
     RealizeInlineTouchedIncludesFromB,
+    RealizeMaterializedIncludeExpansion,
+    RealizeTranslationUnitByteEdit,
     EmitEditedPreprocessedStream,
   };
 
@@ -614,8 +628,11 @@ private:
     IncludeInsertLeftNeighborPP,
     IncludeInsertDeclBoundary,
     IncludeRealizationInlineFromB,
+    IncludeMaterializedExpansion,
     TUExactSlotBoundary,
     TUProvableInsertionAnchor,
+    TUByteSpanMappedEdit,
+    TUByteSpanConservativeEdit,
     TerminalEmitEditedPreprocessedStream,
   };
 
@@ -646,8 +663,10 @@ private:
     IncludeInsertionByLeftNeighborPP,
     IncludeInsertionByDeclBoundary,
     IncludeRealizationCover,
+    IncludeMaterializedExpansionRealization,
     TUExactSlotAnchor,
     TUProvableInsertionAnchor,
+    TUByteSpanTextualEdit,
     EditedPreprocessedStreamFallback,
   };
 
@@ -1039,6 +1058,7 @@ private:
     MacroPatch,
     IncludePatch,
     TUAnchor,
+    TUTextEdit,
     TerminalOutOfDomain,
   };
 
@@ -2895,10 +2915,23 @@ private:
       const IncludeRealizationWitness *includeRealizationWitness = nullptr)
       const;
 
+  /// \brief Wrap an emitted include realization in the normalized candidate
+  /// carrier.
+  AcceptedResultCandidate BuildAcceptedIncludeRealizationCandidate(
+      AcceptedPathKind currentPath, const RefoldModel::IncludeItem &include,
+      const IncludeRealizationWitness *includeRealizationWitness = nullptr)
+      const;
+
   /// \brief Wrap an already-accepted TU anchor in the normalized candidate
   /// carrier introduced by Patch A.
   AcceptedResultCandidate BuildAcceptedTUAnchorCandidate(
       AcceptedPathKind currentPath, const TUAnchorWitness &witness) const;
+
+  /// \brief Wrap a direct TU byte-span edit in the normalized candidate
+  /// carrier.
+  AcceptedResultCandidate BuildAcceptedTUTextEditCandidate(
+      AcceptedPathKind currentPath, uint64_t begin, uint64_t end,
+      StringRef payloadPreview = StringRef()) const;
 
   /// \brief Wrap the explicit terminal out-of-domain result in the normalized
   /// candidate carrier introduced by Patch A.
@@ -3316,14 +3349,17 @@ private:
       const DenseMap<uint64_t, std::vector<const RefoldModel::IncludeItem *>>
           &children,
       DenseMap<uint64_t, std::string> &includeExpansion,
+      DenseMap<uint64_t, AcceptedResultCandidate>
+          &includeExpansionAcceptedResults,
       DenseSet<uint64_t> *appliedExpandedMacroRootIds = nullptr) const;
 
   // Realize an include directly from the edited preprocessed stream B. This is
   // the single-pass include-realization path used when local include
   // preservation cannot discharge a deterministic anchored edit plan.
   std::optional<std::string>
-  BuildInlineIncludeRealizationFromB(const RefoldModel::IncludeItem &inc,
-                                     llvm::StringRef reason) const;
+  BuildInlineIncludeRealizationFromB(
+      const RefoldModel::IncludeItem &inc, llvm::StringRef reason,
+      AcceptedResultCandidate *acceptedCandidate = nullptr) const;
 
   /// \brief Selects the most appropriate HeaderDecl within an IncludeItem to
   /// serve as the declaration-level anchor for an include-scoped patch.
@@ -3551,7 +3587,8 @@ private:
                                            StringRef fileSpelling) const {
     ResyncOutcome o =
         ApplyResyncOrPend(original, start, end, replacement, fileSpelling);
-    return TextEdit{start, end, std::move(o.text), std::move(o.pending)};
+    return TextEdit{start, end, std::move(o.text), std::move(o.pending),
+                    std::nullopt, {}};
   }
 
   /// \brief Computes how to preserve __LINE__ after applying replacement to
@@ -3620,6 +3657,10 @@ private:
   std::string ApplyTextEditsWithPendingResync(
       StringRef originalFileText, ArrayRef<TextEdit> edits,
       DenseSet<uint64_t> *appliedExpandedMacroRootIds = nullptr) const;
+
+  /// \brief Copy one normalized accepted-result carrier onto an emitted edit.
+  void AttachAcceptedResultCarrier(
+      TextEdit &edit, const AcceptedResultCandidate &candidate) const;
 
   /// \brief Appends an unchanged slice of the original file original[from:to)
   /// into out, while attempting to flush a previously-deferred PendingResync at
