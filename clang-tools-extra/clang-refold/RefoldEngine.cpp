@@ -8878,9 +8878,11 @@ RefoldEngine::BuildGlobalSelectionLattice(const ProofSummary &summary) const {
   GlobalSelectionLattice lattice;
 
   // Step 10 lifts the current global merge/conflict policy into one explicit
-  // lattice description. This makes the conflict/merge policy explicit; candidate choice is being moved under this lattice one selection site at a time. It names
-  // the owner domain, compatible-merge rule, and incompatible-conflict rule
-  // that the current engine already relies on.
+  // lattice description. Converted Patch-B sites now compare accepted results
+  // through this lattice directly, while the remaining sites still route into
+  // it one selector at a time. The lattice names the owner domain,
+  // compatible-merge rule, and incompatible-conflict rule that the current
+  // engine already relies on.
   switch (summary.acceptedClass) {
   case AcceptedProofClass::InvocationPreserving:
   case AcceptedProofClass::InvocationRealization:
@@ -9018,6 +9020,71 @@ bool RefoldEngine::LatticePrefers(const ProofSummary &lhs,
 
   return static_cast<uint8_t>(lhs.inventory.currentPath) <
          static_cast<uint8_t>(rhs.inventory.currentPath);
+}
+
+bool RefoldEngine::IsSelectableAcceptedResultCandidate(
+    const AcceptedResultCandidate &candidate) const {
+  // Patch B only converts how already-accepted outcomes are compared. It does
+  // not yet tighten acceptance to discharged-only proof summaries; that is left
+  // for the later Patch-C closure step. As a result, any concrete accepted
+  // candidate wrapper is admissible here as long as it names a real artifact.
+  return candidate.kind != AcceptedResultCandidateKind::Unknown;
+}
+
+bool RefoldEngine::AcceptedResultCandidatePrefers(
+    const AcceptedResultCandidate &lhs,
+    const AcceptedResultCandidate &rhs) const {
+  if (LatticePrefers(lhs.proofSummary, rhs.proofSummary))
+    return true;
+  if (LatticePrefers(rhs.proofSummary, lhs.proofSummary))
+    return false;
+
+  // The lattice intentionally stays coarse. When two summaries tie, prefer the
+  // candidate that is more specific about the concrete artifact it will emit.
+  // This keeps the converted sites deterministic without reintroducing ad hoc
+  // path-specific ordering logic.
+  if (lhs.kind != rhs.kind)
+    return static_cast<uint8_t>(lhs.kind) < static_cast<uint8_t>(rhs.kind);
+
+  if (lhs.begin != rhs.begin)
+    return lhs.begin < rhs.begin;
+  if (lhs.end != rhs.end)
+    return lhs.end < rhs.end;
+
+  if (lhs.hasRootMacroId != rhs.hasRootMacroId)
+    return lhs.hasRootMacroId;
+  if (lhs.hasRootMacroId && lhs.rootMacroId != rhs.rootMacroId)
+    return lhs.rootMacroId < rhs.rootMacroId;
+
+  if (lhs.hasOwnerIncludeId != rhs.hasOwnerIncludeId)
+    return lhs.hasOwnerIncludeId;
+  if (lhs.hasOwnerIncludeId && lhs.ownerIncludeId != rhs.ownerIncludeId)
+    return lhs.ownerIncludeId < rhs.ownerIncludeId;
+
+  if (lhs.hasAnchorByte != rhs.hasAnchorByte)
+    return lhs.hasAnchorByte;
+  if (lhs.hasAnchorByte && lhs.anchorByte != rhs.anchorByte)
+    return lhs.anchorByte < rhs.anchorByte;
+
+  return false;
+}
+
+std::optional<size_t> RefoldEngine::SelectPreferredAcceptedResultCandidateIndex(
+    ArrayRef<AcceptedResultCandidate> candidates) const {
+  std::optional<size_t> bestIdx;
+
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    if (!IsSelectableAcceptedResultCandidate(candidates[i]))
+      continue;
+    if (!bestIdx) {
+      bestIdx = i;
+      continue;
+    }
+    if (AcceptedResultCandidatePrefers(candidates[i], candidates[*bestIdx]))
+      bestIdx = i;
+  }
+
+  return bestIdx;
 }
 
 RefoldEngine::AcceptedResultCandidate
@@ -19936,94 +20003,191 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     }
   }
 
-  if (argsOnlyCandidate) {
-    const AcceptedResultCandidate acceptedCandidate =
-        BuildAcceptedMacroCandidate(*argsOnlyCandidate);
-    trace("macro/proof",
-          "returning direct args-only candidate: inv id={0} name={1} {2}",
-          m.id, m.name, FormatAcceptedResultCandidate(acceptedCandidate));
-    return *argsOnlyCandidate;
-  }
-
-  if (reuseExistingCallsitePatch &&
-      !conflictingConcreteSubtreeWitnessForcesWholeCover) {
-    trace("macro", "callsite patch reused (args-only no-op) inv id={0}",
-          m.id);
-    if (existingPatch) {
-      const AcceptedResultCandidate acceptedCandidate =
-          BuildAcceptedMacroCandidate(*existingPatch);
-      trace("macro/proof",
-            "reused existing callsite patch audit: inv id={0} name={1} {2}",
-            m.id, m.name, FormatAcceptedResultCandidate(acceptedCandidate));
-      if (existingPatch->subtreeCertBacked)
-        trace("macro/proof",
-              "subtree continuity probe: reused subtree-backed callsite patch "
-              "without a fresh subtree winner in this pass inv id={0} name={1}",
-              m.id, m.name);
-    }
-    return *existingPatch;
-  }
-
-  if (!conflictingConcreteSubtreeWitnessForcesWholeCover && existingPatch &&
+  const bool canReuseExistingCallsiteNoOp =
+      reuseExistingCallsitePatch && !conflictingConcreteSubtreeWitnessForcesWholeCover &&
+      existingPatch;
+  const bool canReuseExistingCallsiteSkipWholeCover =
+      !canReuseExistingCallsiteNoOp &&
+      !conflictingConcreteSubtreeWitnessForcesWholeCover && existingPatch &&
       existingIsCallsite && existingPatch->structurePreserving &&
       existingPatch->proofRootMacroId == m.id && !baseInvText.empty() &&
-      InvocationSpanMatchesCallsitePrefix(baseInvText, m)) {
-    trace("macro",
-          "callsite patch reused (skip whole-cover expansion) inv id={0}",
-          m.id);
-    trace("macro/proof",
-          "reused existing callsite patch audit: inv id={0} name={1} {2}",
-          m.id, m.name, FormatMacroPatchAudit(*existingPatch));
-    if (existingPatch->subtreeCertBacked)
-      trace("macro/proof",
-            "subtree continuity probe: reused subtree-backed callsite patch "
-            "from skip-whole-cover path without a fresh subtree winner inv id={0} "
-            "name={1}",
-            m.id, m.name);
-    return *existingPatch;
-  }
+      InvocationSpanMatchesCallsitePrefix(baseInvText, m);
 
   std::optional<WholeCoverPlan> wholeCoverPlan;
+  bool canReuseExistingExpanded = false;
   if (existingExpandedPatch && !existingExpandedPatch->structurePreserving &&
       MacroPatchOwnerMatches(*existingExpandedPatch, currentPatchOwner)) {
-    bool reuseExpanded = false;
     if (existingExpandedPatch->proofRootMacroId == m.id) {
       if (existingExpandedPatch->proofKind ==
               MacroPatchProofKind::CounterLiteral &&
           m.name == "__COUNTER__") {
-        reuseExpanded = true;
+        canReuseExistingExpanded = true;
       } else if (existingExpandedPatch->proofKind ==
                  MacroPatchProofKind::WholeCoverRealization) {
         wholeCoverPlan = ComputeWholeCoverPlan(m);
         if (wholeCoverPlan)
-          reuseExpanded = WholeCoverPatchMatchesPlan(*existingExpandedPatch,
-                                                     *wholeCoverPlan, m.id);
+          canReuseExistingExpanded = WholeCoverPatchMatchesPlan(
+              *existingExpandedPatch, *wholeCoverPlan, m.id);
       }
-    }
-    if (reuseExpanded) {
-      trace("macro",
-            "expanded patch reused after preservation attempts failed inv id={0}",
-            m.id);
-      trace("macro/proof",
-            "reused existing expanded patch audit: inv id={0} name={1} {2}",
-            m.id, m.name, FormatMacroPatchAudit(*existingExpandedPatch));
-      return *existingExpandedPatch;
     }
   }
 
   if (!wholeCoverPlan)
     wholeCoverPlan = ComputeWholeCoverPlan(m);
-  if (!wholeCoverPlan)
-    return std::nullopt;
 
-  {
+  enum class FinalMacroCandidateOrigin : uint8_t {
+    DirectArgsOnly,
+    ReuseExistingCallsiteNoOp,
+    ReuseExistingCallsiteSkipWholeCover,
+    ReuseExistingExpanded,
+    WholeCoverRealization,
+  };
+
+  struct FinalMacroCandidate {
+    MacroPatch patch;
+    AcceptedResultCandidate acceptedCandidate;
+    FinalMacroCandidateOrigin origin =
+        FinalMacroCandidateOrigin::WholeCoverRealization;
+  };
+
+  auto formatFinalMacroCandidateOrigin =
+      [](FinalMacroCandidateOrigin origin) -> StringRef {
+    switch (origin) {
+    case FinalMacroCandidateOrigin::DirectArgsOnly:
+      return "direct-args-only";
+    case FinalMacroCandidateOrigin::ReuseExistingCallsiteNoOp:
+      return "reuse-existing-callsite-no-op";
+    case FinalMacroCandidateOrigin::ReuseExistingCallsiteSkipWholeCover:
+      return "reuse-existing-callsite-skip-whole-cover";
+    case FinalMacroCandidateOrigin::ReuseExistingExpanded:
+      return "reuse-existing-expanded";
+    case FinalMacroCandidateOrigin::WholeCoverRealization:
+      return "whole-cover-realization";
+    }
+    return "unknown";
+  };
+
+  // Patch B makes the final macro-return site operate on explicit accepted
+  // candidates rather than on a chain of early returns. The candidate list is
+  // still built from the legacy admissibility checks above; only the final
+  // arbitration is moved under the normalized lattice comparator.
+  SmallVector<FinalMacroCandidate, 5> finalMacroCandidates;
+  auto addFinalMacroCandidate = [&](const MacroPatch &patch,
+                                   FinalMacroCandidateOrigin origin) {
+    FinalMacroCandidate entry;
+    entry.patch = patch;
+    entry.acceptedCandidate = BuildAcceptedMacroCandidate(entry.patch);
+    entry.origin = origin;
+    trace("macro/proof",
+          "final macro candidate: inv id={0} name={1} origin={2} {3}",
+          m.id, m.name, formatFinalMacroCandidateOrigin(origin),
+          FormatAcceptedResultCandidate(entry.acceptedCandidate));
+    finalMacroCandidates.push_back(std::move(entry));
+  };
+
+  if (argsOnlyCandidate)
+    addFinalMacroCandidate(*argsOnlyCandidate,
+                           FinalMacroCandidateOrigin::DirectArgsOnly);
+
+  if (canReuseExistingCallsiteNoOp) {
+    addFinalMacroCandidate(*existingPatch,
+                           FinalMacroCandidateOrigin::ReuseExistingCallsiteNoOp);
+  }
+
+  if (canReuseExistingCallsiteSkipWholeCover) {
+    addFinalMacroCandidate(
+        *existingPatch,
+        FinalMacroCandidateOrigin::ReuseExistingCallsiteSkipWholeCover);
+  }
+
+  if (canReuseExistingExpanded) {
+    addFinalMacroCandidate(*existingExpandedPatch,
+                           FinalMacroCandidateOrigin::ReuseExistingExpanded);
+  }
+
+  if (wholeCoverPlan) {
     MacroPatch patch{*invStart, *invEnd, wholeCoverPlan->clippedText, m.id};
     StampMacroWholeCoverRealizationPatch(patch, *wholeCoverPlan, m.id);
+    addFinalMacroCandidate(patch,
+                           FinalMacroCandidateOrigin::WholeCoverRealization);
+  }
+
+  if (finalMacroCandidates.empty())
+    return std::nullopt;
+
+  SmallVector<AcceptedResultCandidate, 5> acceptedCandidates;
+  acceptedCandidates.reserve(finalMacroCandidates.size());
+  for (const FinalMacroCandidate &candidate : finalMacroCandidates)
+    acceptedCandidates.push_back(candidate.acceptedCandidate);
+
+  const std::optional<size_t> selectedIdx =
+      SelectPreferredAcceptedResultCandidateIndex(acceptedCandidates);
+  if (!selectedIdx)
+    return std::nullopt;
+
+  const FinalMacroCandidate &selected = finalMacroCandidates[*selectedIdx];
+  trace("macro/proof",
+        "lattice-selected final macro candidate: inv id={0} name={1} origin={2} {3}",
+        m.id, m.name, formatFinalMacroCandidateOrigin(selected.origin),
+        FormatAcceptedResultCandidate(selected.acceptedCandidate));
+
+  switch (selected.origin) {
+  case FinalMacroCandidateOrigin::DirectArgsOnly:
+    trace("macro/proof",
+          "returning direct args-only candidate: inv id={0} name={1} {2}",
+          m.id, m.name,
+          FormatAcceptedResultCandidate(selected.acceptedCandidate));
+    break;
+
+  case FinalMacroCandidateOrigin::ReuseExistingCallsiteNoOp:
+    trace("macro", "callsite patch reused (args-only no-op) inv id={0}",
+          m.id);
+    trace("macro/proof",
+          "reused existing callsite patch audit: inv id={0} name={1} {2}",
+          m.id, m.name,
+          FormatAcceptedResultCandidate(selected.acceptedCandidate));
+    if (selected.patch.subtreeCertBacked)
+      trace("macro/proof",
+            "subtree continuity probe: reused subtree-backed callsite patch "
+            "without a fresh subtree winner in this pass inv id={0} name={1}",
+            m.id, m.name);
+    break;
+
+  case FinalMacroCandidateOrigin::ReuseExistingCallsiteSkipWholeCover:
+    trace("macro",
+          "callsite patch reused (skip whole-cover expansion) inv id={0}",
+          m.id);
+    trace("macro/proof",
+          "reused existing callsite patch audit: inv id={0} name={1} {2}",
+          m.id, m.name,
+          FormatAcceptedResultCandidate(selected.acceptedCandidate));
+    if (selected.patch.subtreeCertBacked)
+      trace("macro/proof",
+            "subtree continuity probe: reused subtree-backed callsite patch "
+            "from skip-whole-cover path without a fresh subtree winner inv id={0} "
+            "name={1}",
+            m.id, m.name);
+    break;
+
+  case FinalMacroCandidateOrigin::ReuseExistingExpanded:
+    trace("macro",
+          "expanded patch reused after preservation attempts failed inv id={0}",
+          m.id);
+    trace("macro/proof",
+          "reused existing expanded patch audit: inv id={0} name={1} {2}",
+          m.id, m.name,
+          FormatAcceptedResultCandidate(selected.acceptedCandidate));
+    break;
+
+  case FinalMacroCandidateOrigin::WholeCoverRealization:
     trace("macro/proof",
           "constructed whole-cover realization patch audit: inv id={0} name={1} {2}",
-          m.id, m.name, FormatMacroPatchAudit(patch));
-    return patch;
+          m.id, m.name,
+          FormatAcceptedResultCandidate(selected.acceptedCandidate));
+    break;
   }
+
+  return selected.patch;
 }
 
 bool RefoldEngine::InvocationSpanMatchesCallsitePrefix(
@@ -20511,10 +20675,10 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         uint64_t anchorByte = 0;
       };
 
-      // Patch A keeps include materialization behavior unchanged, but it
-      // wraps each concrete anchor choice in the normalized candidate carrier
-      // so later steps can compare legacy anchor selection against an explicit
-      // candidate-first selector.
+      // Patch A introduced the normalized include candidate carrier. Patch B
+      // starts using that carrier here so concrete anchor choices are compared
+      // through the shared accepted-result selector instead of by local
+      // construction order.
       auto traceInsertCandidate = [&](const InsertAnchorCandidate &candidate,
                                       StringRef stage) {
         const AcceptedResultCandidate acceptedCandidate =
@@ -20531,28 +20695,24 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         if (candidates.empty())
           return std::nullopt;
 
-        size_t bestIdx = 0;
-        for (size_t candIdx = 1; candIdx < candidates.size(); ++candIdx) {
-          const AcceptedResultCandidate candCandidate =
-              BuildAcceptedIncludeCandidate(candidates[candIdx].path, p,
-                                            &candidates[candIdx].witness);
-          const AcceptedResultCandidate bestCandidate =
-              BuildAcceptedIncludeCandidate(candidates[bestIdx].path, p,
-                                            &candidates[bestIdx].witness);
-          if (LatticePrefers(candCandidate.proofSummary,
-                             bestCandidate.proofSummary)) {
-            bestIdx = candIdx;
-          }
+        SmallVector<AcceptedResultCandidate, 4> acceptedCandidates;
+        acceptedCandidates.reserve(candidates.size());
+        for (const InsertAnchorCandidate &candidate : candidates) {
+          acceptedCandidates.push_back(
+              BuildAcceptedIncludeCandidate(candidate.path, p,
+                                            &candidate.witness));
         }
 
-        const AcceptedResultCandidate selectedCandidate =
-            BuildAcceptedIncludeCandidate(candidates[bestIdx].path, p,
-                                          &candidates[bestIdx].witness);
+        const std::optional<size_t> bestIdx =
+            SelectPreferredAcceptedResultCandidateIndex(acceptedCandidates);
+        if (!bestIdx)
+          return std::nullopt;
+
         trace("include/apply",
               "file={0} patch[{1}] INSERT: selected candidate anchorByte={2} candidate={3}",
-              file, idx, candidates[bestIdx].anchorByte,
-              FormatAcceptedResultCandidate(selectedCandidate));
-        return candidates[bestIdx];
+              file, idx, candidates[*bestIdx].anchorByte,
+              FormatAcceptedResultCandidate(acceptedCandidates[*bestIdx]));
+        return candidates[*bestIdx];
       };
 
       auto commitInsertCandidate = [&](const InsertAnchorCandidate &candidate) {
