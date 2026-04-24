@@ -429,7 +429,7 @@ private:
   /// terminal fallback to B. Step 1 installs the seam and Step 2 may now derive
   /// a concrete single-owner macro witness, but no partial-expansion source is
   /// emitted until a later synthesis step connects that witness to output.
-  std::optional<std::string> TryExpansionClosureFallback() const;
+  std::optional<std::string> TryExpansionClosureFallback();
 
   /// \brief Build the single-owner macro whole-expansion fallback witness.
   ///
@@ -439,6 +439,28 @@ private:
   /// token-diff hunk for the current run.
   std::optional<ExpansionClosureWitness>
   BuildMacroOwnerExpansionClosureWitness() const;
+
+  /// \brief Attempt to synthesize a source-level fallback from one macro-owner
+  /// whole-expansion witness.
+  ///
+  /// Step 3 keeps this narrower than the witness domain itself. The first
+  /// synthesis class emits a direct TU callsite splice only when the
+  /// materialized B-surface is replay-stable as raw source bytes and can be
+  /// embedded back into the TU with the usual line-drift resynchronization
+  /// machinery. Otherwise the stage fails closed and the engine keeps falling
+  /// back to the terminal edited-preprocessed stream result.
+  std::optional<std::string>
+  SynthesizeMacroOwnerExpansionClosureSource(
+      const ExpansionClosureWitness &witness) const;
+
+  /// \brief Return whether a materialized fallback replacement is replay-stable
+  /// as direct source text for the first synthesis class.
+  ///
+  /// The initial Step 3 domain deliberately excludes identifiers because the
+  /// source-level replay would otherwise need a stronger proof that rescanning
+  /// the synthesized bytes cannot trigger further macro expansion.
+  bool ExpansionFallbackReplacementIsReplayStable(
+      StringRef replacementText) const;
 
   /// \brief Render an expansion-closure witness for trace output.
   std::string
