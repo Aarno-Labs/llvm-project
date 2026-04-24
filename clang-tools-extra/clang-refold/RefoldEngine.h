@@ -1004,6 +1004,46 @@ private:
     TerminalFallbackWitness terminalFallbackWitness;
   };
 
+  /// \brief Normalized accepted-result artifact kind used by Patch A.
+  ///
+  /// The current engine still decides acceptance through path-specific control
+  /// flow. Patch A does not change that behavior. Instead it introduces one
+  /// common candidate carrier so the already-selected macro/include/TU/terminal
+  /// results can be wrapped in a uniform shape, traced, and compared without
+  /// committing to a selector rewrite yet.
+  enum class AcceptedResultCandidateKind : uint8_t {
+    Unknown,
+    MacroPatch,
+    IncludePatch,
+    TUAnchor,
+    TerminalOutOfDomain,
+  };
+
+  /// \brief Trace-only wrapper for a concrete accepted result.
+  ///
+  /// This is intentionally small and explicit. It carries the normalized proof
+  /// summary plus just enough artifact-local provenance to let later steps
+  /// compare existing behavior against a future candidate-first selector.
+  struct AcceptedResultCandidate {
+    AcceptedResultCandidateKind kind = AcceptedResultCandidateKind::Unknown;
+    ProofSummary proofSummary = {};
+
+    // Artifact-local span / owner metadata.
+    uint64_t begin = 0;
+    uint64_t end = 0;
+    bool hasOwnerIncludeId = false;
+    uint64_t ownerIncludeId = 0;
+    bool hasRootMacroId = false;
+    uint64_t rootMacroId = 0;
+    bool hasAnchorByte = false;
+    uint64_t anchorByte = 0;
+
+    // Human-readable preview of the selected surface. This is tracing-only and
+    // never participates in admissibility or ordering.
+    bool hasPayloadPreview = false;
+    std::string payloadPreview;
+  };
+
 
   enum class MacroPatchProofKind : uint8_t {
     Unknown,
@@ -2795,6 +2835,29 @@ private:
   bool LatticePrefers(const ProofSummary &lhs,
                       const ProofSummary &rhs) const;
 
+  /// \brief Wrap an already-accepted macro patch in the normalized candidate
+  /// carrier introduced by Patch A.
+  AcceptedResultCandidate
+  BuildAcceptedMacroCandidate(const MacroPatch &patch) const;
+
+  /// \brief Wrap an already-accepted include path in the normalized candidate
+  /// carrier introduced by Patch A.
+  AcceptedResultCandidate BuildAcceptedIncludeCandidate(
+      AcceptedPathKind currentPath, const IncludePatch &patch,
+      const IncludeAnchorWitness *includeAnchorWitness = nullptr,
+      const IncludeRealizationWitness *includeRealizationWitness = nullptr)
+      const;
+
+  /// \brief Wrap an already-accepted TU anchor in the normalized candidate
+  /// carrier introduced by Patch A.
+  AcceptedResultCandidate BuildAcceptedTUAnchorCandidate(
+      AcceptedPathKind currentPath, const TUAnchorWitness &witness) const;
+
+  /// \brief Wrap the explicit terminal out-of-domain result in the normalized
+  /// candidate carrier introduced by Patch A.
+  AcceptedResultCandidate
+  BuildAcceptedTerminalCandidate(const TerminalFallbackWitness &witness) const;
+
   /// \brief Return whether \p m carries usable producer-side paste witnesses.
   ///
   /// Step 5 serialized the producer's exact `##` decomposition into the model.
@@ -2826,6 +2889,8 @@ private:
 
   /// \brief Formatters for the normalized Step-1/2/3 proof metadata.
   StringRef FormatAcceptedProofClass(AcceptedProofClass kind) const;
+  StringRef FormatAcceptedResultCandidateKind(
+      AcceptedResultCandidateKind kind) const;
   StringRef FormatRealizationMode(RealizationMode mode) const;
   StringRef FormatSelectionPreference(SelectionPreference preference) const;
   StringRef FormatSurfaceDisposition(
@@ -2904,6 +2969,10 @@ private:
       const IncludeAnchorWitness *includeAnchorWitness = nullptr,
       const IncludeRealizationWitness *includeRealizationWitness = nullptr,
       const TerminalFallbackWitness *terminalFallbackWitness = nullptr) const;
+
+  /// \brief Format a normalized accepted-result candidate for tracing.
+  std::string
+  FormatAcceptedResultCandidate(const AcceptedResultCandidate &candidate) const;
 
   /// \brief Format patch provenance and subtree-composition audit metadata.
   std::string FormatMacroPatchAudit(const MacroPatch &patch) const;
