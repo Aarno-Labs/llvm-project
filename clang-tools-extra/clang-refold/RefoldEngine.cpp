@@ -696,6 +696,59 @@ void RefoldEngine::RequestTerminalFallback(TerminalFallbackKind kind, StringRef 
   debug("fallback", "REQUEST terminal fallback: {0}: {1}", phase, detail);
 }
 
+void RefoldEngine::EnforceTheoremAuditInvariants() const {
+  // Step 6 closes the loop between the theorem-audit counters and the run's
+  // success/failure semantics. The audit must not remain a passive dashboard in
+  // strict mode.
+  if (lastTheoremAudit_.selectorDirectBypasses != 0) {
+    NoteTheoremAuditViolation(
+        "selector resolved an emitted result through a direct bypass");
+  }
+  if (lastTheoremAudit_.emittedSelectorOnlyExceptionCarriers != 0) {
+    NoteTheoremAuditViolation(
+        "emitted edit relied on selector-only exception carrier");
+  }
+  if (lastTheoremAudit_.emittedUnknownClassCarriers != 0) {
+    NoteTheoremAuditViolation(
+        "emitted edit carried unknown-class theorem artifact");
+  }
+  if (lastTheoremAudit_.emittedUndischargedCarriers != 0) {
+    NoteTheoremAuditViolation(
+        "emitted edit carried undischarged theorem artifact");
+  }
+  if (lastTheoremAudit_.emittedOutOfDomainCarriers != 0) {
+    NoteTheoremAuditViolation(
+        "non-terminal emitted edit carried explicit out-of-domain theorem artifact");
+  }
+
+  if (!strict_ || terminalFallbackRequested_ ||
+      lastTheoremAudit_.theoremSatisfied) {
+    return;
+  }
+
+  RequestTerminalFallback(TerminalFallbackKind::TheoremAuditInvariantViolation,
+                          "theorem",
+                          BuildTheoremAuditInvariantDetail());
+}
+
+std::string RefoldEngine::BuildTheoremAuditInvariantDetail() const {
+  const std::string firstViolation =
+      lastTheoremAudit_.firstViolation.empty()
+          ? std::string("<none>")
+          : stringutils::showWSWithClip(lastTheoremAudit_.firstViolation, 200);
+
+  return llvm::formatv(
+             "strict theorem-audit invariant violation: firstViolation='{0}' "
+             "selectorDirectBypasses={1} selectorOnlyExceptions={2} "
+             "undischarged={3} unknownClass={4} outOfDomain={5}",
+             firstViolation, lastTheoremAudit_.selectorDirectBypasses,
+             lastTheoremAudit_.emittedSelectorOnlyExceptionCarriers,
+             lastTheoremAudit_.emittedUndischargedCarriers,
+             lastTheoremAudit_.emittedUnknownClassCarriers,
+             lastTheoremAudit_.emittedOutOfDomainCarriers)
+      .str();
+}
+
 void RefoldEngine::BuildBInsertionProvenance(ArrayRef<diffutils::Hunk> hunks) {
   // Build a structural provenance map for *token-level pure insertions*.
   //
@@ -899,6 +952,13 @@ std::string RefoldEngine::Refold() {
   ResetTheoremAudit();
 
   std::string out = RunSinglePassRefold();
+
+  // Step 6 makes the theorem audit authoritative in strict mode: once the
+  // structural pass finishes, any surviving theorem-audit violation must be
+  // converted into the one explicit terminal fallback rather than merely being
+  // reported.
+  EnforceTheoremAuditInvariants();
+
   if (!terminalFallbackRequested_) {
     EmitRefoldStats();
     EmitTheoremAudit();
@@ -10885,6 +10945,8 @@ std::string RefoldEngine::FormatTerminalFallbackWitness(
       return "IncludeRealizationUnmappableBCoverEnvelope";
     case TerminalFallbackKind::UndischargedEmissionArtifact:
       return "UndischargedEmissionArtifact";
+    case TerminalFallbackKind::TheoremAuditInvariantViolation:
+      return "TheoremAuditInvariantViolation";
     case TerminalFallbackKind::MixedExcludedCases:
       return "MixedExcludedCases";
     case TerminalFallbackKind::Unknown:

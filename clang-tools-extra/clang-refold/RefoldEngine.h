@@ -235,6 +235,10 @@ private:
     OwnerUnresolvedNoTUAnchor,
     IncludeRealizationUnmappableBCoverEnvelope,
     UndischargedEmissionArtifact,
+    /// Step 6: strict mode turns any surviving theorem-audit invariant
+    /// violation into the one explicit terminal out-of-domain result instead of
+    /// merely logging it as a dashboard counter.
+    TheoremAuditInvariantViolation,
     MixedExcludedCases,
   };
 
@@ -333,6 +337,18 @@ private:
       lastTheoremAudit_.firstViolation = detail.str();
     lastTheoremAudit_.theoremSatisfied = false;
   }
+
+
+  /// Step 6 upgrades the theorem audit from a descriptive dashboard into an
+  /// invariant checker. This helper normalizes any surviving counter-based
+  /// violations onto the theorem state and, in strict mode, requests the one
+  /// explicit terminal fallback instead of allowing a structurally-refolded
+  /// result to escape with a violated theorem audit.
+  void EnforceTheoremAuditInvariants() const;
+
+  /// Build a compact diagnostic string for a strict-mode theorem-audit
+  /// fallback.
+  std::string BuildTheoremAuditInvariantDetail() const;
 
   /// Emit a compact theorem-audit summary for the current run.
   void EmitTheoremAudit() const {
