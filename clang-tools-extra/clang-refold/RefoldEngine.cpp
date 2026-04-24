@@ -916,6 +916,9 @@ std::string RefoldEngine::Refold() {
   debug("escalate",
         "ESCALATION terminal: emitting fully expanded edited preprocessed "
         "stream (B). reasons={0}", escalationReasons_.size());
+  debug("proof/inventory", "terminal result {0}",
+        FormatAcceptancePathInventory(BuildAcceptancePathInventory(
+            AcceptedPathKind::TerminalEmitEditedPreprocessedStream)));
   for (const auto &r : escalationReasons_)
     debug("escalate", "  {0}", r);
   lastStats_ = RefoldStats{};
@@ -3123,8 +3126,10 @@ RefoldEngine::FindProvableTUInsertionAnchor(uint64_t pp,
   // TU byte boundary corresponding to this PP gap.
   if (auto slotAnchor = AnchorToExactSlotBoundaryFromPPGap(tuPath, pp)) {
     trace("hunk",
-          "    insertion gap PP={0} mapsToTU via slot boundary TU byte {1}", pp,
-          slotAnchor);
+          "    insertion gap PP={0} mapsToTU via slot boundary TU byte {1} inventory={2}",
+          pp, slotAnchor,
+          FormatAcceptancePathInventory(BuildAcceptancePathInventory(
+              AcceptedPathKind::TUExactSlotBoundary)));
     return slotAnchor;
   }
 
@@ -3217,8 +3222,10 @@ RefoldEngine::FindProvableTUInsertionAnchor(uint64_t pp,
 
     trace("tu/anchor",
           "pure insertion arg-like begin anchor: ppGap={0} -> macro id={1} "
-          "name='{2}' invB={3}",
-          pp, best->id, best->name, *best->invB);
+          "name='{2}' invB={3} inventory={4}",
+          pp, best->id, best->name, *best->invB,
+          FormatAcceptancePathInventory(BuildAcceptancePathInventory(
+              AcceptedPathKind::TUProvableInsertionAnchor)));
     return *best->invB;
   };
 
@@ -3238,8 +3245,14 @@ RefoldEngine::FindProvableTUInsertionAnchor(uint64_t pp,
     auto rightIt = tokmapByPP.find(pp);
     if (rightIt != tokmapByPP.end()) {
       const auto &right = rightIt->second;
-      if (PathsEqual(tuPath, right.file))
+      if (PathsEqual(tuPath, right.file)) {
+        trace("tu/anchor",
+              "provable TU insertion anchor: ppGap={0} -> right neighbor byte={1} inventory={2}",
+              pp, right.b,
+              FormatAcceptancePathInventory(BuildAcceptancePathInventory(
+                  AcceptedPathKind::TUProvableInsertionAnchor)));
         return right.b;
+      }
       return std::nullopt;
     }
   }
@@ -3251,8 +3264,14 @@ RefoldEngine::FindProvableTUInsertionAnchor(uint64_t pp,
     auto leftIt = tokmapByPP.find(pp - 1);
     if (leftIt != tokmapByPP.end()) {
       const auto &left = leftIt->second;
-      if (PathsEqual(tuPath, left.file))
+      if (PathsEqual(tuPath, left.file)) {
+        trace("tu/anchor",
+              "provable TU insertion anchor: ppGap={0} -> left neighbor byte={1} inventory={2}",
+              pp, left.e,
+              FormatAcceptancePathInventory(BuildAcceptancePathInventory(
+                  AcceptedPathKind::TUProvableInsertionAnchor)));
         return left.e;
+      }
       return std::nullopt;
     }
   }
@@ -3321,8 +3340,19 @@ RefoldEngine::FindProvableTUInsertionAnchor(uint64_t pp,
 
   // Use the nearer corroborating TU boundary as the concrete zero-width anchor,
   // preferring the right side on an equal-distance tie.
-  if (dRight <= dLeft)
+  if (dRight <= dLeft) {
+    trace("tu/anchor",
+          "provable TU insertion anchor: ppGap={0} -> corroborated right byte={1} inventory={2}",
+          pp, right->b,
+          FormatAcceptancePathInventory(BuildAcceptancePathInventory(
+              AcceptedPathKind::TUProvableInsertionAnchor)));
     return right->b;
+  }
+  trace("tu/anchor",
+        "provable TU insertion anchor: ppGap={0} -> corroborated left byte={1} inventory={2}",
+        pp, left->e,
+        FormatAcceptancePathInventory(BuildAcceptancePathInventory(
+            AcceptedPathKind::TUProvableInsertionAnchor)));
   return left->e;
 }
 
@@ -3516,8 +3546,10 @@ RefoldEngine::AnchorToExactSlotBoundaryFromPPGap(StringRef tuPath,
   if (best) {
     trace("slots/anchor",
           "AnchorToExactSlotBoundaryFromPPGap: ppGap={0} -> slotId={1} "
-          "kind={2} tuByte={3}",
-          ppGap, best->slot->id, best->slot->kind, best->b);
+          "kind={2} tuByte={3} inventory={4}",
+          ppGap, best->slot->id, best->slot->kind, best->b,
+          FormatAcceptancePathInventory(BuildAcceptancePathInventory(
+              AcceptedPathKind::TUExactSlotBoundary)));
   } else {
     trace("slots/anchor",
           "AnchorToExactSlotBoundaryFromPPGap: ppGap={0} -> <none>", ppGap);
@@ -7600,7 +7632,9 @@ RefoldEngine::BuildIncludeInsertionPatch(const RefoldModel::IncludeItem &inc,
 
   IncludePatch patch{&inc,  std::move(insertBytes), h.aStart, h.aEnd, h.bStart,
                      h.bEnd,
-                     BuildIncludePatchProofSummary(/*realizedSurface=*/false)};
+                     BuildIncludePatchProofSummary(
+                         /*realizedSurface=*/false,
+                         AcceptedPathKind::IncludePatchPendingMaterialization)};
 
   trace("include/patch",
         "built inc #{0} patch A[{1},{2})->B[{3},{4}) len(insertBytes)={5}",
@@ -8337,12 +8371,141 @@ void RefoldEngine::StampMacroPatchOwnerWitness(MacroPatch &patch,
   }
 }
 
+RefoldEngine::AcceptancePathInventory
+RefoldEngine::InventoryMacroPatchAcceptancePath(const MacroPatch &patch) const {
+  switch (patch.proofKind) {
+  case MacroPatchProofKind::ArgsOnlyStandard:
+    return BuildAcceptancePathInventory(AcceptedPathKind::MacroArgsOnlyStandard);
+  case MacroPatchProofKind::ArgsOnlyPasteSingle:
+    return BuildAcceptancePathInventory(
+        AcceptedPathKind::MacroArgsOnlyPasteSingle);
+  case MacroPatchProofKind::ArgsOnlyPasteMulti:
+    return BuildAcceptancePathInventory(
+        AcceptedPathKind::MacroArgsOnlyPasteMulti);
+  case MacroPatchProofKind::ArgsOnlyPurePasteOnly:
+    return BuildAcceptancePathInventory(
+        AcceptedPathKind::MacroArgsOnlyPurePasteOnly);
+  case MacroPatchProofKind::ArgsOnlyPairedPureInsertion:
+    return BuildAcceptancePathInventory(
+        AcceptedPathKind::MacroArgsOnlyPairedPureInsertion);
+  case MacroPatchProofKind::DagSubtreeRoot:
+    return BuildAcceptancePathInventory(AcceptedPathKind::MacroDagSubtreeRoot);
+  case MacroPatchProofKind::CallChainSuffix:
+    return BuildAcceptancePathInventory(AcceptedPathKind::MacroCallChainSuffix);
+  case MacroPatchProofKind::CounterLiteral:
+    return BuildAcceptancePathInventory(AcceptedPathKind::MacroCounterLiteral);
+  case MacroPatchProofKind::WholeCoverFallback:
+    return BuildAcceptancePathInventory(
+        AcceptedPathKind::MacroWholeCoverFallback);
+  case MacroPatchProofKind::Unknown:
+    return BuildAcceptancePathInventory(AcceptedPathKind::Unknown);
+  }
+
+  return BuildAcceptancePathInventory(AcceptedPathKind::Unknown);
+}
+
+RefoldEngine::AcceptancePathInventory
+RefoldEngine::BuildAcceptancePathInventory(AcceptedPathKind currentPath) const {
+  AcceptancePathInventory inventory;
+  inventory.currentPath = currentPath;
+
+  switch (currentPath) {
+  case AcceptedPathKind::MacroArgsOnlyStandard:
+    inventory.support = AcceptanceSupportKind::ExplicitProofBacked;
+    inventory.futureTarget = FutureProofTarget::MacroStandardArgsOnly;
+    break;
+  case AcceptedPathKind::MacroArgsOnlyPasteSingle:
+    inventory.support = AcceptanceSupportKind::ExplicitProofBacked;
+    inventory.futureTarget = FutureProofTarget::MacroPasteSingle;
+    break;
+  case AcceptedPathKind::MacroArgsOnlyPasteMulti:
+    inventory.support = AcceptanceSupportKind::ExplicitProofBacked;
+    inventory.futureTarget = FutureProofTarget::MacroPasteMultiFixedAnchor;
+    break;
+  case AcceptedPathKind::MacroArgsOnlyPurePasteOnly:
+    inventory.support = AcceptanceSupportKind::ExplicitProofBacked;
+    inventory.futureTarget = FutureProofTarget::MacroPurePasteOnly;
+    break;
+  case AcceptedPathKind::MacroArgsOnlyPairedPureInsertion:
+    inventory.support = AcceptanceSupportKind::ExplicitProofBacked;
+    inventory.futureTarget = FutureProofTarget::MacroPairedPureInsertion;
+    break;
+  case AcceptedPathKind::MacroDagSubtreeRoot:
+    inventory.support = AcceptanceSupportKind::ExplicitProofBacked;
+    inventory.futureTarget = FutureProofTarget::MacroDagLift;
+    break;
+  case AcceptedPathKind::MacroCallChainSuffix:
+    inventory.support = AcceptanceSupportKind::ExplicitProofBacked;
+    inventory.futureTarget = FutureProofTarget::MacroCallChainSuffixPreservation;
+    break;
+  case AcceptedPathKind::MacroCounterLiteral:
+    inventory.support = AcceptanceSupportKind::ExplicitProofBacked;
+    inventory.futureTarget =
+        FutureProofTarget::MacroCounterStabilizationRealization;
+    break;
+  case AcceptedPathKind::MacroWholeCoverFallback:
+    inventory.support = AcceptanceSupportKind::DeterministicButNotFirstClass;
+    inventory.futureTarget = FutureProofTarget::MacroRealizationWholeCover;
+    break;
+  case AcceptedPathKind::IncludePatchPendingMaterialization:
+    inventory.support = AcceptanceSupportKind::DeterministicButNotFirstClass;
+    inventory.futureTarget = FutureProofTarget::Unknown;
+    break;
+  case AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens:
+    inventory.support = AcceptanceSupportKind::DeterministicButNotFirstClass;
+    inventory.futureTarget = FutureProofTarget::IncludePatchByMappedHeaderTokens;
+    break;
+  case AcceptedPathKind::IncludeInsertSelectedConditionalBoundary:
+    inventory.support = AcceptanceSupportKind::DeterministicButNotFirstClass;
+    inventory.futureTarget =
+        FutureProofTarget::IncludeConditionalArmCertifiedInsertion;
+    break;
+  case AcceptedPathKind::IncludeInsertChildBoundary:
+    inventory.support = AcceptanceSupportKind::DeterministicButNotFirstClass;
+    inventory.futureTarget = FutureProofTarget::IncludeInsertionByChildBoundary;
+    break;
+  case AcceptedPathKind::IncludeInsertRightNeighborPP:
+    inventory.support = AcceptanceSupportKind::DeterministicButNotFirstClass;
+    inventory.futureTarget = FutureProofTarget::IncludeInsertionByRightNeighborPP;
+    break;
+  case AcceptedPathKind::IncludeInsertLeftNeighborPP:
+    inventory.support = AcceptanceSupportKind::DeterministicButNotFirstClass;
+    inventory.futureTarget = FutureProofTarget::IncludeInsertionByLeftNeighborPP;
+    break;
+  case AcceptedPathKind::IncludeInsertDeclBoundary:
+    inventory.support = AcceptanceSupportKind::DeterministicButNotFirstClass;
+    inventory.futureTarget = FutureProofTarget::IncludeInsertionByDeclBoundary;
+    break;
+  case AcceptedPathKind::IncludeRealizationInlineFromB:
+    inventory.support = AcceptanceSupportKind::DeterministicButNotFirstClass;
+    inventory.futureTarget = FutureProofTarget::IncludeRealizationCover;
+    break;
+  case AcceptedPathKind::TUExactSlotBoundary:
+    inventory.support = AcceptanceSupportKind::DeterministicButNotFirstClass;
+    inventory.futureTarget = FutureProofTarget::TUExactSlotAnchor;
+    break;
+  case AcceptedPathKind::TUProvableInsertionAnchor:
+    inventory.support = AcceptanceSupportKind::DeterministicButNotFirstClass;
+    inventory.futureTarget = FutureProofTarget::TUProvableInsertionAnchor;
+    break;
+  case AcceptedPathKind::TerminalEmitEditedPreprocessedStream:
+    inventory.support = AcceptanceSupportKind::LegacyTerminalFallback;
+    inventory.futureTarget = FutureProofTarget::EditedPreprocessedStreamFallback;
+    break;
+  case AcceptedPathKind::Unknown:
+    break;
+  }
+
+  return inventory;
+}
+
 RefoldEngine::ProofSummary
 RefoldEngine::ClassifyMacroPatchProof(const MacroPatch &patch) const {
   ProofSummary summary;
   summary.validated = patch.proofValidated;
   summary.structurePreserving = patch.structurePreserving;
   summary.proofRootMacroId = patch.proofRootMacroId;
+  summary.inventory = InventoryMacroPatchAcceptancePath(patch);
 
   switch (patch.proofKind) {
   case MacroPatchProofKind::ArgsOnlyPasteMulti:
@@ -8358,10 +8521,16 @@ RefoldEngine::ClassifyMacroPatchProof(const MacroPatch &patch) const {
     break;
 
   case MacroPatchProofKind::CounterLiteral:
+    summary.acceptedClass = AcceptedProofClass::InvocationRealization;
+    summary.realizationMode = RealizationMode::RealizeEditedSurface;
+    summary.preference = SelectionPreference::PreferSurfaceRealization;
+    break;
+
   case MacroPatchProofKind::WholeCoverFallback:
     summary.acceptedClass = AcceptedProofClass::InvocationRealization;
     summary.realizationMode = RealizationMode::RealizeEditedSurface;
     summary.preference = SelectionPreference::PreferSurfaceRealization;
+    summary.legacyEscalation = LegacyEscalationDisposition::RetryWholeCoverMacros;
     break;
 
   case MacroPatchProofKind::Unknown:
@@ -8397,7 +8566,8 @@ void RefoldEngine::StampMacroPatchProof(MacroPatch &patch,
 }
 
 RefoldEngine::ProofSummary
-RefoldEngine::BuildIncludePatchProofSummary(bool realizedSurface) const {
+RefoldEngine::BuildIncludePatchProofSummary(
+    bool realizedSurface, AcceptedPathKind currentPath) const {
   ProofSummary summary;
   summary.acceptedClass = realizedSurface
                               ? AcceptedProofClass::IncludeRealization
@@ -8412,6 +8582,7 @@ RefoldEngine::BuildIncludePatchProofSummary(bool realizedSurface) const {
                                  ? LegacyEscalationDisposition::
                                        RetryInlineTouchedIncludesFromB
                                  : LegacyEscalationDisposition::None;
+  summary.inventory = BuildAcceptancePathInventory(currentPath);
   summary.validated = false;
   summary.structurePreserving = !realizedSurface;
   return summary;
@@ -8478,6 +8649,115 @@ StringRef RefoldEngine::FormatLegacyEscalationDisposition(
   return "None";
 }
 
+StringRef RefoldEngine::FormatAcceptedPathKind(AcceptedPathKind kind) const {
+  switch (kind) {
+  case AcceptedPathKind::Unknown:
+    return "Unknown";
+  case AcceptedPathKind::MacroArgsOnlyStandard:
+    return "MacroArgsOnlyStandard";
+  case AcceptedPathKind::MacroArgsOnlyPasteSingle:
+    return "MacroArgsOnlyPasteSingle";
+  case AcceptedPathKind::MacroArgsOnlyPasteMulti:
+    return "MacroArgsOnlyPasteMulti";
+  case AcceptedPathKind::MacroArgsOnlyPurePasteOnly:
+    return "MacroArgsOnlyPurePasteOnly";
+  case AcceptedPathKind::MacroArgsOnlyPairedPureInsertion:
+    return "MacroArgsOnlyPairedPureInsertion";
+  case AcceptedPathKind::MacroDagSubtreeRoot:
+    return "MacroDagSubtreeRoot";
+  case AcceptedPathKind::MacroCallChainSuffix:
+    return "MacroCallChainSuffix";
+  case AcceptedPathKind::MacroCounterLiteral:
+    return "MacroCounterLiteral";
+  case AcceptedPathKind::MacroWholeCoverFallback:
+    return "MacroWholeCoverFallback";
+  case AcceptedPathKind::IncludePatchPendingMaterialization:
+    return "IncludePatchPendingMaterialization";
+  case AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens:
+    return "IncludeDeleteReplaceMappedHeaderTokens";
+  case AcceptedPathKind::IncludeInsertSelectedConditionalBoundary:
+    return "IncludeInsertSelectedConditionalBoundary";
+  case AcceptedPathKind::IncludeInsertChildBoundary:
+    return "IncludeInsertChildBoundary";
+  case AcceptedPathKind::IncludeInsertRightNeighborPP:
+    return "IncludeInsertRightNeighborPP";
+  case AcceptedPathKind::IncludeInsertLeftNeighborPP:
+    return "IncludeInsertLeftNeighborPP";
+  case AcceptedPathKind::IncludeInsertDeclBoundary:
+    return "IncludeInsertDeclBoundary";
+  case AcceptedPathKind::IncludeRealizationInlineFromB:
+    return "IncludeRealizationInlineFromB";
+  case AcceptedPathKind::TUExactSlotBoundary:
+    return "TUExactSlotBoundary";
+  case AcceptedPathKind::TUProvableInsertionAnchor:
+    return "TUProvableInsertionAnchor";
+  case AcceptedPathKind::TerminalEmitEditedPreprocessedStream:
+    return "TerminalEmitEditedPreprocessedStream";
+  }
+  return "Unknown";
+}
+
+StringRef
+RefoldEngine::FormatAcceptanceSupportKind(AcceptanceSupportKind support) const {
+  switch (support) {
+  case AcceptanceSupportKind::Unknown:
+    return "Unknown";
+  case AcceptanceSupportKind::ExplicitProofBacked:
+    return "ExplicitProofBacked";
+  case AcceptanceSupportKind::DeterministicButNotFirstClass:
+    return "DeterministicButNotFirstClass";
+  case AcceptanceSupportKind::LegacyTerminalFallback:
+    return "LegacyTerminalFallback";
+  }
+  return "Unknown";
+}
+
+StringRef RefoldEngine::FormatFutureProofTarget(FutureProofTarget target) const {
+  switch (target) {
+  case FutureProofTarget::Unknown:
+    return "Unknown";
+  case FutureProofTarget::MacroStandardArgsOnly:
+    return "MacroStandardArgsOnly";
+  case FutureProofTarget::MacroPasteSingle:
+    return "MacroPasteSingle";
+  case FutureProofTarget::MacroPasteMultiFixedAnchor:
+    return "MacroPasteMultiFixedAnchor";
+  case FutureProofTarget::MacroPurePasteOnly:
+    return "MacroPurePasteOnly";
+  case FutureProofTarget::MacroPairedPureInsertion:
+    return "MacroPairedPureInsertion";
+  case FutureProofTarget::MacroDagLift:
+    return "MacroDagLift";
+  case FutureProofTarget::MacroCallChainSuffixPreservation:
+    return "MacroCallChainSuffixPreservation";
+  case FutureProofTarget::MacroCounterStabilizationRealization:
+    return "MacroCounterStabilizationRealization";
+  case FutureProofTarget::MacroRealizationWholeCover:
+    return "MacroRealizationWholeCover";
+  case FutureProofTarget::IncludePatchByMappedHeaderTokens:
+    return "IncludePatchByMappedHeaderTokens";
+  case FutureProofTarget::IncludeConditionalArmCertifiedInsertion:
+    return "IncludeConditionalArmCertifiedInsertion";
+  case FutureProofTarget::IncludeInsertionByChildBoundary:
+    return "IncludeInsertionByChildBoundary";
+  case FutureProofTarget::IncludeInsertionByRightNeighborPP:
+    return "IncludeInsertionByRightNeighborPP";
+  case FutureProofTarget::IncludeInsertionByLeftNeighborPP:
+    return "IncludeInsertionByLeftNeighborPP";
+  case FutureProofTarget::IncludeInsertionByDeclBoundary:
+    return "IncludeInsertionByDeclBoundary";
+  case FutureProofTarget::IncludeRealizationCover:
+    return "IncludeRealizationCover";
+  case FutureProofTarget::TUExactSlotAnchor:
+    return "TUExactSlotAnchor";
+  case FutureProofTarget::TUProvableInsertionAnchor:
+    return "TUProvableInsertionAnchor";
+  case FutureProofTarget::EditedPreprocessedStreamFallback:
+    return "EditedPreprocessedStreamFallback";
+  }
+  return "Unknown";
+}
+
 StringRef
 RefoldEngine::FormatMacroPatchProofKind(MacroPatchProofKind kind) const {
   switch (kind) {
@@ -8505,25 +8785,36 @@ RefoldEngine::FormatMacroPatchProofKind(MacroPatchProofKind kind) const {
   return "Unknown";
 }
 
+std::string RefoldEngine::FormatAcceptancePathInventory(
+    const AcceptancePathInventory &inventory) const {
+  return formatv("currentPath={0} support={1} futureTarget={2}",
+                 FormatAcceptedPathKind(inventory.currentPath),
+                 FormatAcceptanceSupportKind(inventory.support),
+                 FormatFutureProofTarget(inventory.futureTarget))
+      .str();
+}
+
 std::string RefoldEngine::FormatMacroPatchAudit(const MacroPatch &patch) const {
   const ProofSummary summary = ClassifyMacroPatchProof(patch);
   return formatv(
              "proofKind={0} topClass={1} realization={2} preference={3} "
-             "legacyEscalation={4} validated={5} struct={6} proofRoot={7} "
-             "subtreeCert={8} leaf={9} witnesses={10} invCerts={11} "
-             "formalCerts={12} argCerts={13} liftChains={14} liftSteps={15} "
-             "rootMerges={16} lexicalBridge={17} paste={18} wrappers={19} "
-             "stringify={20} wideStringify={21} childSyntax={22} "
-             "rawInvocation={23} passthrough={24} bridgeSensitive={25} "
-             "deferredPasteDischarged={26} admissible={27} expRootN={28} "
-             "deferredRootN={29} bridgeFormalN={30} expRoot={31} "
-             "deferredRootArgs={32} bridgeFormals={33} wholeCoverA=[{34},{35}) "
-             "wholeCoverBraw=[{36},{37}) wholeCoverBadj=[{38},{39})",
+             "legacyEscalation={4} inventory={5} validated={6} struct={7} "
+             "proofRoot={8} subtreeCert={9} leaf={10} witnesses={11} "
+             "invCerts={12} formalCerts={13} argCerts={14} liftChains={15} "
+             "liftSteps={16} rootMerges={17} lexicalBridge={18} paste={19} "
+             "wrappers={20} stringify={21} wideStringify={22} "
+             "childSyntax={23} rawInvocation={24} passthrough={25} "
+             "bridgeSensitive={26} deferredPasteDischarged={27} "
+             "admissible={28} expRootN={29} deferredRootN={30} "
+             "bridgeFormalN={31} expRoot={32} deferredRootArgs={33} "
+             "bridgeFormals={34} wholeCoverA=[{35},{36}) "
+             "wholeCoverBraw=[{37},{38}) wholeCoverBadj=[{39},{40})",
              FormatMacroPatchProofKind(patch.proofKind),
              FormatAcceptedProofClass(summary.acceptedClass),
              FormatRealizationMode(summary.realizationMode),
              FormatSelectionPreference(summary.preference),
              FormatLegacyEscalationDisposition(summary.legacyEscalation),
+             FormatAcceptancePathInventory(summary.inventory),
              patch.proofValidated ? 1 : 0,
              patch.structurePreserving ? 1 : 0, patch.proofRootMacroId,
              patch.subtreeCertBacked ? 1 : 0, patch.subtreeLeafMacroId,
@@ -18219,8 +18510,10 @@ void RefoldEngine::MaterializeIncludeExpansion(
     includeExpansion[includeId] =
         SliceBSource(bEnvOpt->first, bEnvOpt->second).str();
     debug("include/mat",
-          "FORCE inline from B tier={0} inc#{1} bTok=[{2},{3})",
-          escalationTier_, inc->id, bEnvOpt->first, bEnvOpt->second);
+          "FORCE inline from B tier={0} inc#{1} bTok=[{2},{3}) inventory={4}",
+          escalationTier_, inc->id, bEnvOpt->first, bEnvOpt->second,
+          FormatAcceptancePathInventory(BuildAcceptancePathInventory(
+              AcceptedPathKind::IncludeRealizationInlineFromB)));
     return;
   }
 
@@ -18498,6 +18791,13 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     const IncludePatch &p = ie.patches[idx];
     trace("include/patch", "computeIncludeTextEdits: patch={0}", p);
 
+    // Step 2 inventories the exact include-materialization path chosen for
+    // each accepted edit. Include patches are created in a pending state and
+    // become concrete only when this routine selects a specific anchor.
+    auto includeInventoryFor = [&](AcceptedPathKind path) {
+      return FormatAcceptancePathInventory(BuildAcceptancePathInventory(path));
+    };
+
     const bool isInsert = (p.aStart == p.aEnd) && (p.bStart < p.bEnd);
     const bool isDelete = (p.aStart < p.aEnd) && (p.bStart == p.bEnd);
     const bool isReplace = (p.aStart < p.aEnd) && (p.bStart < p.bEnd);
@@ -18610,8 +18910,10 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
               headerText, *insertByte, *insertByte, text, file));
 
           trace("include/apply",
-                "file={0} patch[{1}] INSERT: anchored at selected-arm boundary groupBegin={2}",
-                file, idx, insertByte);
+                "file={0} patch[{1}] INSERT: anchored at selected-arm boundary groupBegin={2} inventory={3}",
+                file, idx, insertByte,
+                includeInventoryFor(
+                    AcceptedPathKind::IncludeInsertSelectedConditionalBoundary));
           continue;
         }
       }
@@ -18634,8 +18936,9 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
 
           trace("include/apply",
                 "file={0} patch[{1}] INSERT: anchored via child boundary at "
-                "byte={2}",
-                file, idx, insertByte);
+                "byte={2} inventory={3}",
+                file, idx, insertByte,
+                includeInventoryFor(AcceptedPathKind::IncludeInsertChildBoundary));
           continue;
         }
       }
@@ -18655,8 +18958,9 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                                          /* fallbackToEOF */ false, fileLen);
         trace("include/apply",
               "file={0} patch[{1}] INSERT: right-neighbor anchorPP={2} -> "
-              "startByte={3}",
-              file, idx, anchorPP, startByte);
+              "startByte={3} inventory={4}",
+              file, idx, anchorPP, startByte,
+              includeInventoryFor(AcceptedPathKind::IncludeInsertRightNeighborPP));
         if (!startByte) {
           if (!ForceInlineTouchedIncludesFromB())
             RequestEscalation(
@@ -18690,8 +18994,9 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
           startByte = ByteEndForPPInFile(file, *anchorPP, false, fileLen);
           trace("include/apply",
                 "file={0} patch[{1}] INSERT: left-neighbor anchorPP={2} -> "
-                "startByte={3}",
-                file, idx, anchorPP, startByte);
+                "startByte={3} inventory={4}",
+                file, idx, anchorPP, startByte,
+                includeInventoryFor(AcceptedPathKind::IncludeInsertLeftNeighborPP));
           if (!startByte) {
             if (!ForceInlineTouchedIncludesFromB())
               RequestEscalation(
@@ -18710,8 +19015,9 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
           startByte = std::clamp<uint64_t>(decl->headerE, 0ULL, fileLen);
           trace(
               "include/apply",
-              "file={0} patch[{1}] INSERT: no neighbors; anchor at declEnd={2}",
-              file, idx, startByte);
+              "file={0} patch[{1}] INSERT: no neighbors; anchor at declEnd={2} inventory={3}",
+              file, idx, startByte,
+              includeInventoryFor(AcceptedPathKind::IncludeInsertDeclBoundary));
           if (!anchorMatchesCondArmCert(*startByte))
             startByte.reset();
         }
@@ -18734,8 +19040,9 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
 
           debug("include/apply.",
                 "file={0} patch[{1}] INSERT: anchored via child boundary at "
-                "byte={2}",
-                file, idx, insertByte);
+                "byte={2} inventory={3}",
+                file, idx, insertByte,
+                includeInventoryFor(AcceptedPathKind::IncludeInsertChildBoundary));
         } else {
           // Preserve old behavior if we still can't place it
           // deterministically.
@@ -18799,8 +19106,10 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
           ByteEndForPPInFile(file, *lastPP, /* fallbackToEOF */ false, fileLen);
       trace("include/apply",
             "file={0} patch[{1}] DELETE/REPLACE: firstPP={2} lastPP={3} -> "
-            "bytes=[{4},{5})",
-            file, idx, firstPP, lastPP, startByte, endByte);
+            "bytes=[{4},{5}) inventory={6}",
+            file, idx, firstPP, lastPP, startByte, endByte,
+            includeInventoryFor(
+                AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens));
       if (!startByte || !endByte) {
         if (!ForceInlineTouchedIncludesFromB())
           RequestEscalation(

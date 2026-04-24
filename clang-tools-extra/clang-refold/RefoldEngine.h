@@ -581,19 +581,90 @@ private:
     EmitEditedPreprocessedStream,
   };
 
+  /// \brief Inventory of the currently accepted execution paths.
+  ///
+  /// Step 2 does not change how the engine refolds code. Instead it names the
+  /// concrete path that produced an accepted result today so we can map that
+  /// path onto the future proof lattice one class at a time.
+  enum class AcceptedPathKind : uint8_t {
+    Unknown,
+    MacroArgsOnlyStandard,
+    MacroArgsOnlyPasteSingle,
+    MacroArgsOnlyPasteMulti,
+    MacroArgsOnlyPurePasteOnly,
+    MacroArgsOnlyPairedPureInsertion,
+    MacroDagSubtreeRoot,
+    MacroCallChainSuffix,
+    MacroCounterLiteral,
+    MacroWholeCoverFallback,
+    IncludePatchPendingMaterialization,
+    IncludeDeleteReplaceMappedHeaderTokens,
+    IncludeInsertSelectedConditionalBoundary,
+    IncludeInsertChildBoundary,
+    IncludeInsertRightNeighborPP,
+    IncludeInsertLeftNeighborPP,
+    IncludeInsertDeclBoundary,
+    IncludeRealizationInlineFromB,
+    TUExactSlotBoundary,
+    TUProvableInsertionAnchor,
+    TerminalEmitEditedPreprocessedStream,
+  };
+
+  /// \brief How mature the current acceptance path is in the migration plan.
+  enum class AcceptanceSupportKind : uint8_t {
+    Unknown,
+    ExplicitProofBacked,
+    DeterministicButNotFirstClass,
+    LegacyTerminalFallback,
+  };
+
+  /// \brief Future proof-class placeholder targeted by a current path.
+  enum class FutureProofTarget : uint8_t {
+    Unknown,
+    MacroStandardArgsOnly,
+    MacroPasteSingle,
+    MacroPasteMultiFixedAnchor,
+    MacroPurePasteOnly,
+    MacroPairedPureInsertion,
+    MacroDagLift,
+    MacroCallChainSuffixPreservation,
+    MacroCounterStabilizationRealization,
+    MacroRealizationWholeCover,
+    IncludePatchByMappedHeaderTokens,
+    IncludeConditionalArmCertifiedInsertion,
+    IncludeInsertionByChildBoundary,
+    IncludeInsertionByRightNeighborPP,
+    IncludeInsertionByLeftNeighborPP,
+    IncludeInsertionByDeclBoundary,
+    IncludeRealizationCover,
+    TUExactSlotAnchor,
+    TUProvableInsertionAnchor,
+    EditedPreprocessedStreamFallback,
+  };
+
+  /// \brief Step-2 inventory record that maps a current acceptance path onto
+  /// the future proof lattice.
+  struct AcceptancePathInventory {
+    AcceptedPathKind currentPath = AcceptedPathKind::Unknown;
+    AcceptanceSupportKind support = AcceptanceSupportKind::Unknown;
+    FutureProofTarget futureTarget = FutureProofTarget::Unknown;
+  };
+
   /// \brief Common proof-summary carrier used during the proof-lattice
   /// migration.
   ///
   /// In Step 1 this is descriptive metadata only. The legacy proof fields on
   /// concrete patch objects remain behaviorally authoritative so the refolder's
   /// semantics do not change while we separate proof class, realization mode,
-  /// selection preference, and escalation history.
+  /// selection preference, escalation history, and the current-path inventory
+  /// introduced by Step 2.
   struct ProofSummary {
     AcceptedProofClass acceptedClass = AcceptedProofClass::Unknown;
     RealizationMode realizationMode = RealizationMode::Unknown;
     SelectionPreference preference = SelectionPreference::Unknown;
     LegacyEscalationDisposition legacyEscalation =
         LegacyEscalationDisposition::None;
+    AcceptancePathInventory inventory;
     bool validated = false;
     bool structurePreserving = false;
     uint64_t proofRootMacroId = 0;
@@ -628,12 +699,11 @@ private:
     // byte span and owner.
     uint64_t macroId = 0;
 
-    // Step-1 proof-lattice migration summary. This mirrors the legacy fields
-    // below so later steps can reason about proof class vs. selection
-    // preference without rewriting macro-patch behavior yet.
-    // Default-initialize the normalized proof summary so aggregate
-    // construction of IncludePatch remains warning-free until all call sites
-    // are migrated to stamp proof metadata explicitly.
+    // Step-1/2 proof-lattice migration summary. This mirrors the legacy
+    // fields below so later steps can reason about proof class, selection
+    // preference, and current acceptance-path inventory without rewriting
+    // macro-patch behavior yet. Default-initialize the normalized proof
+    // summary so aggregate construction of MacroPatch remains warning-free.
     ProofSummary proofSummary = {};
 
     // Proof provenance for layer-3 root/callsite admissibility.
@@ -718,10 +788,12 @@ private:
     uint64_t aStart, aEnd;   // A-token interval inside include expansion
     uint64_t bStart, bEnd;   // B-token interval
 
-    // Step-1 proof-lattice migration summary for include-owned patch
+    // Step-1/2 proof-lattice migration summary for include-owned patch
     // candidates. Include proofs remain descriptive until later steps convert
-    // include realization/preservation into explicit proof classes.
-    ProofSummary proofSummary;
+    // include realization/preservation into explicit proof classes. For
+    // include patches the exact accepted path is not known until materialization
+    // chooses a concrete anchor, so Step 2 starts them in a pending state.
+    ProofSummary proofSummary = {};
 
     /// When present, this insertion was classified as belonging to a specific
     /// selected conditional arm inside the owning include. Include application
@@ -2307,23 +2379,44 @@ private:
                             bool validated, bool structurePreserving,
                             uint64_t proofRootMacroId) const;
 
-  /// \brief Build the default Step-1 proof summary for an include patch.
-  ///
-  /// Include proofs are not yet explicit, but Step 1 still records whether the
-  /// current path is structural or a realized include surface so later steps
-  /// can convert include handling to first-class proof classes without another
-  /// metadata redesign.
-  ProofSummary BuildIncludePatchProofSummary(bool realizedSurface) const;
+  /// \brief Classify the current accepted path inventory for a macro patch.
+  AcceptancePathInventory
+  InventoryMacroPatchAcceptancePath(const MacroPatch &patch) const;
 
-  /// \brief Formatters for the normalized Step-1 proof metadata.
+  /// \brief Complete the Step-2 inventory mapping for a named accepted path.
+  ///
+  /// This centralizes the mapping from "how the engine accepts a result
+  /// today" to "which future proof class should replace that path."
+  AcceptancePathInventory
+  BuildAcceptancePathInventory(AcceptedPathKind currentPath) const;
+
+  /// \brief Build the default Step-1/2 proof summary for an include patch.
+  ///
+  /// Include proofs are not yet explicit, but Step 1/2 still records whether
+  /// the current path is structural or a realized include surface. Preserving
+  /// include patches start in a pending state and are mapped to a concrete
+  /// accepted path once materialization chooses an anchor.
+  ProofSummary BuildIncludePatchProofSummary(
+      bool realizedSurface,
+      AcceptedPathKind currentPath =
+          AcceptedPathKind::IncludePatchPendingMaterialization) const;
+
+  /// \brief Formatters for the normalized Step-1/2 proof metadata.
   StringRef FormatAcceptedProofClass(AcceptedProofClass kind) const;
   StringRef FormatRealizationMode(RealizationMode mode) const;
   StringRef FormatSelectionPreference(SelectionPreference preference) const;
   StringRef FormatLegacyEscalationDisposition(
       LegacyEscalationDisposition disposition) const;
+  StringRef FormatAcceptedPathKind(AcceptedPathKind kind) const;
+  StringRef FormatAcceptanceSupportKind(AcceptanceSupportKind support) const;
+  StringRef FormatFutureProofTarget(FutureProofTarget target) const;
 
   /// rief Format a patch proof kind for tracing.
   StringRef FormatMacroPatchProofKind(MacroPatchProofKind kind) const;
+
+  /// rief Format the Step-2 acceptance-path inventory for tracing.
+  std::string
+  FormatAcceptancePathInventory(const AcceptancePathInventory &inventory) const;
 
   /// rief Format patch provenance and subtree-composition audit metadata.
   std::string FormatMacroPatchAudit(const MacroPatch &patch) const;
