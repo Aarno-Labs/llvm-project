@@ -8564,7 +8564,9 @@ RefoldEngine::BuildAcceptancePathInventory(AcceptedPathKind currentPath) const {
     inventory.futureTarget = FutureProofTarget::IncludeInsertionByDeclBoundary;
     break;
   case AcceptedPathKind::IncludeRealizationInlineFromB:
-    inventory.support = AcceptanceSupportKind::DeterministicButNotFirstClass;
+    // Step 9 promotes deterministic include inlining from B into an explicit
+    // witness-backed include realization proof path.
+    inventory.support = AcceptanceSupportKind::ExplicitProofBacked;
     inventory.futureTarget = FutureProofTarget::IncludeRealizationCover;
     break;
   case AcceptedPathKind::TUExactSlotBoundary:
@@ -8702,6 +8704,7 @@ RefoldEngine::ClassifyMacroPatchProof(const MacroPatch &patch) const {
     break;
   }
 
+  summary.lattice = BuildGlobalSelectionLattice(summary);
   return summary;
 }
 
@@ -8748,7 +8751,8 @@ void RefoldEngine::StampMacroWholeCoverRealizationPatch(
 RefoldEngine::ProofSummary RefoldEngine::BuildAcceptedPathProofSummary(
     AcceptedPathKind currentPath, const IncludePatch *patch,
     const TUAnchorWitness *tuAnchorWitness,
-    const IncludeAnchorWitness *includeAnchorWitness) const {
+    const IncludeAnchorWitness *includeAnchorWitness,
+    const IncludeRealizationWitness *includeRealizationWitness) const {
   ProofSummary summary;
   summary.inventory = BuildAcceptancePathInventory(currentPath);
 
@@ -8779,7 +8783,12 @@ RefoldEngine::ProofSummary RefoldEngine::BuildAcceptedPathProofSummary(
     summary.legacyEscalation =
         LegacyEscalationDisposition::RetryInlineTouchedIncludesFromB;
     summary.structurePreserving = false;
-    summary.discharge = ValidateIncludeRealizationProof(currentPath, patch);
+    if (includeRealizationWitness) {
+      summary.hasIncludeRealizationWitness = true;
+      summary.includeRealizationWitness = *includeRealizationWitness;
+    }
+    summary.discharge = ValidateIncludeRealizationProof(
+        currentPath, patch, includeRealizationWitness);
     break;
 
   case AcceptedPathKind::TUExactSlotBoundary:
@@ -8827,6 +8836,7 @@ RefoldEngine::ProofSummary RefoldEngine::BuildAcceptedPathProofSummary(
     break;
   }
 
+  summary.lattice = BuildGlobalSelectionLattice(summary);
   return summary;
 }
 
@@ -8855,13 +8865,117 @@ RefoldEngine::BuildIncludePatchProofSummary(
                                    : LegacyEscalationDisposition::None;
     summary.structurePreserving = !realizedSurface;
     summary.discharge = realizedSurface
-                            ? ValidateIncludeRealizationProof(currentPath, patch)
+                            ? ValidateIncludeRealizationProof(
+                                  currentPath, patch,
+                                  /*witness=*/nullptr)
                             : ValidateIncludePreservingProof(currentPath, patch,
                                                              /*witness=*/nullptr);
   }
 
+  summary.lattice = BuildGlobalSelectionLattice(summary);
   summary.validated = false;
   return summary;
+}
+
+RefoldEngine::GlobalSelectionLattice
+RefoldEngine::BuildGlobalSelectionLattice(const ProofSummary &summary) const {
+  GlobalSelectionLattice lattice;
+
+  // Step 10 lifts the current global merge/conflict policy into one explicit
+  // lattice description. This does not change candidate choice yet; it names
+  // the owner domain, compatible-merge rule, and incompatible-conflict rule
+  // that the current engine already relies on.
+  switch (summary.acceptedClass) {
+  case AcceptedProofClass::InvocationPreserving:
+  case AcceptedProofClass::InvocationRealization:
+    lattice.domain = LatticeConflictDomain::MacroInvocationRootSpan;
+    lattice.mergeLaw = LatticeMergeLaw::NestedOuterShadowsInner;
+    lattice.conflictLaw =
+        summary.realizationMode == RealizationMode::PreserveOriginalStructure
+            ? LatticeConflictLaw::PreferStructurePreservation
+            : LatticeConflictLaw::RejectPartialOverlap;
+    break;
+
+  case AcceptedProofClass::IncludePreserving:
+    lattice.domain = LatticeConflictDomain::IncludeOwnerRegion;
+    lattice.mergeLaw = LatticeMergeLaw::DisjointCompose;
+    lattice.conflictLaw =
+        LatticeConflictLaw::PreferOwnerPreservingBeforeRealization;
+    break;
+
+  case AcceptedProofClass::IncludeRealization:
+    lattice.domain = LatticeConflictDomain::IncludeOwnerRegion;
+    lattice.mergeLaw = LatticeMergeLaw::SelectSingleWitness;
+    lattice.conflictLaw =
+        LatticeConflictLaw::PreferOwnerPreservingBeforeRealization;
+    break;
+
+  case AcceptedProofClass::TUAnchor:
+    lattice.domain = LatticeConflictDomain::TUAnchorPoint;
+    lattice.mergeLaw = LatticeMergeLaw::SelectSingleWitness;
+    lattice.conflictLaw = LatticeConflictLaw::PreferExactAnchorWitness;
+    break;
+
+  case AcceptedProofClass::Unknown:
+    break;
+  }
+
+  if (summary.inventory.currentPath ==
+      AcceptedPathKind::TerminalEmitEditedPreprocessedStream) {
+    lattice.domain = LatticeConflictDomain::WholeTranslationUnit;
+    lattice.mergeLaw = LatticeMergeLaw::TerminalReplacesAll;
+    lattice.conflictLaw = LatticeConflictLaw::LastResortTerminalFallback;
+  }
+
+  return lattice;
+}
+
+bool RefoldEngine::LatticePrefers(const ProofSummary &lhs,
+                                  const ProofSummary &rhs) const {
+  auto preferenceRank = [](SelectionPreference preference) -> uint8_t {
+    switch (preference) {
+    case SelectionPreference::PreferExactAnchoring:
+      return 0;
+    case SelectionPreference::PreferStructurePreservation:
+      return 1;
+    case SelectionPreference::PreferSurfaceRealization:
+      return 2;
+    case SelectionPreference::Unknown:
+      return 3;
+    }
+    return 3;
+  };
+
+  auto escalationRank = [](LegacyEscalationDisposition disposition) -> uint8_t {
+    switch (disposition) {
+    case LegacyEscalationDisposition::None:
+      return 0;
+    case LegacyEscalationDisposition::RetryWholeCoverMacros:
+      return 1;
+    case LegacyEscalationDisposition::RetryInlineTouchedIncludesFromB:
+      return 2;
+    case LegacyEscalationDisposition::EmitEditedPreprocessedStream:
+      return 3;
+    }
+    return 3;
+  };
+
+  const uint8_t lhsPreference = preferenceRank(lhs.preference);
+  const uint8_t rhsPreference = preferenceRank(rhs.preference);
+  if (lhsPreference != rhsPreference)
+    return lhsPreference < rhsPreference;
+
+  const uint8_t lhsEscalation = escalationRank(lhs.legacyEscalation);
+  const uint8_t rhsEscalation = escalationRank(rhs.legacyEscalation);
+  if (lhsEscalation != rhsEscalation)
+    return lhsEscalation < rhsEscalation;
+
+  if (lhs.acceptedClass != rhs.acceptedClass)
+    return static_cast<uint8_t>(lhs.acceptedClass) <
+           static_cast<uint8_t>(rhs.acceptedClass);
+
+  return static_cast<uint8_t>(lhs.inventory.currentPath) <
+         static_cast<uint8_t>(rhs.inventory.currentPath);
 }
 
 bool RefoldEngine::MacroInvocationHasWellFormedPasteWitnesses(
@@ -9211,11 +9325,13 @@ RefoldEngine::ValidateIncludePreservingProof(AcceptedPathKind currentPath,
 }
 
 RefoldEngine::ProofDischargeRecord
-RefoldEngine::ValidateIncludeRealizationProof(AcceptedPathKind currentPath,
-                                              const IncludePatch *patch) const {
+RefoldEngine::ValidateIncludeRealizationProof(
+    AcceptedPathKind currentPath, const IncludePatch *patch,
+    const IncludeRealizationWitness *witness) const {
   (void)patch;
   ProofDischargeAccumulator discharge;
-  const AcceptancePathInventory inventory = BuildAcceptancePathInventory(currentPath);
+  const AcceptancePathInventory inventory =
+      BuildAcceptancePathInventory(currentPath);
   discharge.Require(inventory.currentPath != AcceptedPathKind::Unknown,
                     ProofObligationKind::AcceptedPathClassified,
                     ProofFailureReason::MissingAcceptedPathClassification);
@@ -9223,8 +9339,24 @@ RefoldEngine::ValidateIncludeRealizationProof(AcceptedPathKind currentPath,
                     ProofObligationKind::FutureTargetMapped,
                     ProofFailureReason::MissingFutureTargetMapping);
   discharge.Require(currentPath == AcceptedPathKind::IncludeRealizationInlineFromB,
-                    ProofObligationKind::LegacyFallbackExplicitlyTracked,
-                    ProofFailureReason::LegacyFallback);
+                    ProofObligationKind::AcceptedPathClassified,
+                    ProofFailureReason::MissingAcceptedPathClassification);
+  discharge.Require(witness &&
+                        witness->evidence ==
+                            IncludeRealizationEvidenceKind::InlineFromBCoverEnvelope,
+                    ProofObligationKind::IncludeRealizationWitnessTracked,
+                    ProofFailureReason::MissingIncludeRealizationWitness);
+  discharge.Require(witness && witness->hasIncludeId && witness->includeId != 0,
+                    ProofObligationKind::IncludeRealizationIncludeTracked,
+                    ProofFailureReason::MissingIncludeRealizationInclude);
+  discharge.Require(witness && witness->hasACover &&
+                        witness->aCoverEnd >= witness->aCoverBegin,
+                    ProofObligationKind::IncludeRealizationCoverTracked,
+                    ProofFailureReason::MissingIncludeRealizationCover);
+  discharge.Require(witness && witness->hasBTokenEnvelope &&
+                        witness->bTokEnd >= witness->bTokBegin,
+                    ProofObligationKind::IncludeRealizationBEnvelopeTracked,
+                    ProofFailureReason::MissingIncludeRealizationBEnvelope);
   return discharge.Finish();
 }
 
@@ -9499,6 +9631,57 @@ StringRef RefoldEngine::FormatFutureProofTarget(FutureProofTarget target) const 
   return "Unknown";
 }
 
+StringRef RefoldEngine::FormatLatticeConflictDomain(
+    LatticeConflictDomain domain) const {
+  switch (domain) {
+  case LatticeConflictDomain::Unknown:
+    return "Unknown";
+  case LatticeConflictDomain::MacroInvocationRootSpan:
+    return "MacroInvocationRootSpan";
+  case LatticeConflictDomain::IncludeOwnerRegion:
+    return "IncludeOwnerRegion";
+  case LatticeConflictDomain::TUAnchorPoint:
+    return "TUAnchorPoint";
+  case LatticeConflictDomain::WholeTranslationUnit:
+    return "WholeTranslationUnit";
+  }
+  return "Unknown";
+}
+
+StringRef RefoldEngine::FormatLatticeMergeLaw(LatticeMergeLaw law) const {
+  switch (law) {
+  case LatticeMergeLaw::Unknown:
+    return "Unknown";
+  case LatticeMergeLaw::DisjointCompose:
+    return "DisjointCompose";
+  case LatticeMergeLaw::NestedOuterShadowsInner:
+    return "NestedOuterShadowsInner";
+  case LatticeMergeLaw::SelectSingleWitness:
+    return "SelectSingleWitness";
+  case LatticeMergeLaw::TerminalReplacesAll:
+    return "TerminalReplacesAll";
+  }
+  return "Unknown";
+}
+
+StringRef RefoldEngine::FormatLatticeConflictLaw(LatticeConflictLaw law) const {
+  switch (law) {
+  case LatticeConflictLaw::Unknown:
+    return "Unknown";
+  case LatticeConflictLaw::RejectPartialOverlap:
+    return "RejectPartialOverlap";
+  case LatticeConflictLaw::PreferStructurePreservation:
+    return "PreferStructurePreservation";
+  case LatticeConflictLaw::PreferExactAnchorWitness:
+    return "PreferExactAnchorWitness";
+  case LatticeConflictLaw::PreferOwnerPreservingBeforeRealization:
+    return "PreferOwnerPreservingBeforeRealization";
+  case LatticeConflictLaw::LastResortTerminalFallback:
+    return "LastResortTerminalFallback";
+  }
+  return "Unknown";
+}
+
 StringRef RefoldEngine::FormatProofDischargeStatus(
     ProofDischargeStatus status) const {
   switch (status) {
@@ -9575,6 +9758,14 @@ StringRef RefoldEngine::FormatProofObligationKind(
     return "IncludeLeftNeighborWitnessTracked";
   case ProofObligationKind::IncludeDeclBoundaryWitnessTracked:
     return "IncludeDeclBoundaryWitnessTracked";
+  case ProofObligationKind::IncludeRealizationWitnessTracked:
+    return "IncludeRealizationWitnessTracked";
+  case ProofObligationKind::IncludeRealizationIncludeTracked:
+    return "IncludeRealizationIncludeTracked";
+  case ProofObligationKind::IncludeRealizationCoverTracked:
+    return "IncludeRealizationCoverTracked";
+  case ProofObligationKind::IncludeRealizationBEnvelopeTracked:
+    return "IncludeRealizationBEnvelopeTracked";
   case ProofObligationKind::TUAnchorPathClassified:
     return "TUAnchorPathClassified";
   case ProofObligationKind::TUAnchorWitnessTracked:
@@ -9657,6 +9848,14 @@ StringRef RefoldEngine::FormatProofFailureReason(ProofFailureReason reason) cons
     return "MissingIncludeLeftNeighborWitness";
   case ProofFailureReason::MissingIncludeDeclBoundaryWitness:
     return "MissingIncludeDeclBoundaryWitness";
+  case ProofFailureReason::MissingIncludeRealizationWitness:
+    return "MissingIncludeRealizationWitness";
+  case ProofFailureReason::MissingIncludeRealizationInclude:
+    return "MissingIncludeRealizationInclude";
+  case ProofFailureReason::MissingIncludeRealizationCover:
+    return "MissingIncludeRealizationCover";
+  case ProofFailureReason::MissingIncludeRealizationBEnvelope:
+    return "MissingIncludeRealizationBEnvelope";
   case ProofFailureReason::MissingTUAnchorClassification:
     return "MissingTUAnchorClassification";
   case ProofFailureReason::MissingTUAnchorWitness:
@@ -9758,6 +9957,31 @@ std::string RefoldEngine::FormatIncludeAnchorWitness(
       .str();
 }
 
+StringRef RefoldEngine::FormatIncludeRealizationEvidenceKind(
+    IncludeRealizationEvidenceKind kind) const {
+  switch (kind) {
+  case IncludeRealizationEvidenceKind::Unknown:
+    return "Unknown";
+  case IncludeRealizationEvidenceKind::InlineFromBCoverEnvelope:
+    return "InlineFromBCoverEnvelope";
+  }
+  return "Unknown";
+}
+
+std::string RefoldEngine::FormatIncludeRealizationWitness(
+    const IncludeRealizationWitness &witness) const {
+  return formatv(
+             "kind={0} includeId={1}{2} aCover=[{3},{4}){5} "
+             "bTokEnvelope=[{6},{7}){8}",
+             FormatIncludeRealizationEvidenceKind(witness.evidence),
+             witness.includeId, witness.hasIncludeId ? "" : "(missing)",
+             witness.aCoverBegin, witness.aCoverEnd,
+             witness.hasACover ? "" : "(missing)", witness.bTokBegin,
+             witness.bTokEnd,
+             witness.hasBTokenEnvelope ? "" : "(missing)")
+      .str();
+}
+
 StringRef
 RefoldEngine::FormatMacroPatchProofKind(MacroPatchProofKind kind) const {
   switch (kind) {
@@ -9812,28 +10036,51 @@ std::string RefoldEngine::FormatProofDischargeRecord(
       .str();
 }
 
+std::string RefoldEngine::FormatGlobalSelectionLattice(
+    const GlobalSelectionLattice &lattice) const {
+  return formatv("domain={0} mergeLaw={1} conflictLaw={2}",
+                 FormatLatticeConflictDomain(lattice.domain),
+                 FormatLatticeMergeLaw(lattice.mergeLaw),
+                 FormatLatticeConflictLaw(lattice.conflictLaw))
+      .str();
+}
+
 std::string RefoldEngine::FormatAcceptedPathAudit(
     AcceptedPathKind currentPath, const IncludePatch *patch,
     const TUAnchorWitness *tuAnchorWitness,
-    const IncludeAnchorWitness *includeAnchorWitness) const {
+    const IncludeAnchorWitness *includeAnchorWitness,
+    const IncludeRealizationWitness *includeRealizationWitness) const {
   const ProofSummary summary = BuildAcceptedPathProofSummary(
-      currentPath, patch, tuAnchorWitness, includeAnchorWitness);
+      currentPath, patch, tuAnchorWitness, includeAnchorWitness,
+      includeRealizationWitness);
   if (summary.hasTUAnchorWitness) {
-    return formatv("inventory={0} discharge={1} tuAnchor={2}",
+    return formatv("inventory={0} lattice={1} discharge={2} tuAnchor={3}",
                    FormatAcceptancePathInventory(summary.inventory),
+                   FormatGlobalSelectionLattice(summary.lattice),
                    FormatProofDischargeRecord(summary.discharge),
                    FormatTUAnchorWitness(summary.tuAnchorWitness))
         .str();
   }
   if (summary.hasIncludeAnchorWitness) {
-    return formatv("inventory={0} discharge={1} includeAnchor={2}",
+    return formatv("inventory={0} lattice={1} discharge={2} includeAnchor={3}",
                    FormatAcceptancePathInventory(summary.inventory),
+                   FormatGlobalSelectionLattice(summary.lattice),
                    FormatProofDischargeRecord(summary.discharge),
                    FormatIncludeAnchorWitness(summary.includeAnchorWitness))
         .str();
   }
-  return formatv("inventory={0} discharge={1}",
+  if (summary.hasIncludeRealizationWitness) {
+    return formatv("inventory={0} lattice={1} discharge={2} includeRealization={3}",
+                   FormatAcceptancePathInventory(summary.inventory),
+                   FormatGlobalSelectionLattice(summary.lattice),
+                   FormatProofDischargeRecord(summary.discharge),
+                   FormatIncludeRealizationWitness(
+                       summary.includeRealizationWitness))
+        .str();
+  }
+  return formatv("inventory={0} lattice={1} discharge={2}",
                  FormatAcceptancePathInventory(summary.inventory),
+                 FormatGlobalSelectionLattice(summary.lattice),
                  FormatProofDischargeRecord(summary.discharge))
       .str();
 }
@@ -9842,23 +10089,24 @@ std::string RefoldEngine::FormatMacroPatchAudit(const MacroPatch &patch) const {
   const ProofSummary summary = ClassifyMacroPatchProof(patch);
   return formatv(
              "proofKind={0} topClass={1} realization={2} preference={3} "
-             "legacyEscalation={4} inventory={5} discharge={6} "
-             "validated={7} struct={8} proofRoot={9} subtreeCert={10} "
-             "leaf={11} witnesses={12} invCerts={13} formalCerts={14} "
-             "argCerts={15} liftChains={16} liftSteps={17} rootMerges={18} "
-             "lexicalBridge={19} paste={20} wrappers={21} stringify={22} "
-             "wideStringify={23} childSyntax={24} rawInvocation={25} "
-             "passthrough={26} bridgeSensitive={27} "
-             "deferredPasteDischarged={28} admissible={29} expRootN={30} "
-             "deferredRootN={31} bridgeFormalN={32} expRoot={33} "
-             "deferredRootArgs={34} bridgeFormals={35} wholeCoverA=[{36},{37}) "
-             "wholeCoverBraw=[{38},{39}) wholeCoverBadj=[{40},{41})",
+             "legacyEscalation={4} inventory={5} lattice={6} discharge={7} "
+             "validated={8} struct={9} proofRoot={10} subtreeCert={11} "
+             "leaf={12} witnesses={13} invCerts={14} formalCerts={15} "
+             "argCerts={16} liftChains={17} liftSteps={18} rootMerges={19} "
+             "lexicalBridge={20} paste={21} wrappers={22} stringify={23} "
+             "wideStringify={24} childSyntax={25} rawInvocation={26} "
+             "passthrough={27} bridgeSensitive={28} "
+             "deferredPasteDischarged={29} admissible={30} expRootN={31} "
+             "deferredRootN={32} bridgeFormalN={33} expRoot={34} "
+             "deferredRootArgs={35} bridgeFormals={36} wholeCoverA=[{37},{38}) "
+             "wholeCoverBraw=[{39},{40}) wholeCoverBadj=[{41},{42})",
              FormatMacroPatchProofKind(patch.proofKind),
              FormatAcceptedProofClass(summary.acceptedClass),
              FormatRealizationMode(summary.realizationMode),
              FormatSelectionPreference(summary.preference),
              FormatLegacyEscalationDisposition(summary.legacyEscalation),
              FormatAcceptancePathInventory(summary.inventory),
+             FormatGlobalSelectionLattice(summary.lattice),
              FormatProofDischargeRecord(summary.discharge),
              patch.proofValidated ? 1 : 0,
              patch.structurePreserving ? 1 : 0, patch.proofRootMacroId,
@@ -19540,10 +19788,29 @@ void RefoldEngine::MaterializeIncludeExpansion(
     }
     includeExpansion[includeId] =
         SliceBSource(bEnvOpt->first, bEnvOpt->second).str();
+
+    // Step 9 records the exact include cover and mapped B token envelope used
+    // when tier-2 realizes a touched include directly from the edited
+    // preprocessed stream.
+    IncludeRealizationWitness realizationWitness;
+    realizationWitness.evidence =
+        IncludeRealizationEvidenceKind::InlineFromBCoverEnvelope;
+    realizationWitness.hasIncludeId = true;
+    realizationWitness.includeId = inc->id;
+    realizationWitness.hasACover = true;
+    realizationWitness.aCoverBegin = inc->cover.begin;
+    realizationWitness.aCoverEnd = inc->cover.end;
+    realizationWitness.hasBTokenEnvelope = true;
+    realizationWitness.bTokBegin = bEnvOpt->first;
+    realizationWitness.bTokEnd = bEnvOpt->second;
+
     debug("include/mat",
           "FORCE inline from B tier={0} inc#{1} bTok=[{2},{3}) inventory={4}",
           escalationTier_, inc->id, bEnvOpt->first, bEnvOpt->second,
-          FormatAcceptedPathAudit(AcceptedPathKind::IncludeRealizationInlineFromB));
+          FormatAcceptedPathAudit(
+              AcceptedPathKind::IncludeRealizationInlineFromB,
+              /*patch=*/nullptr, /*tuAnchorWitness=*/nullptr,
+              /*includeAnchorWitness=*/nullptr, &realizationWitness));
     return;
   }
 
