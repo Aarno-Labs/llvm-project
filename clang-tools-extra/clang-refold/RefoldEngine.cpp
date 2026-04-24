@@ -3120,15 +3120,20 @@ RefoldEngine::SmallestCoveringPatchableMacro(
 
 std::optional<uint64_t>
 RefoldEngine::FindProvableTUInsertionAnchor(uint64_t pp,
-                                            StringRef tuPath) const {
+                                            StringRef tuPath,
+                                            TUAnchorWitness *witness) const {
   // First prefer an exact structural slot anchor recorded by the producer.
   // These anchors are the strongest evidence because they identify a specific
   // TU byte boundary corresponding to this PP gap.
-  if (auto slotAnchor = AnchorToExactSlotBoundaryFromPPGap(tuPath, pp)) {
+  TUAnchorWitness slotWitness;
+  if (auto slotAnchor = AnchorToExactSlotBoundaryFromPPGap(tuPath, pp, &slotWitness)) {
+    if (witness)
+      *witness = slotWitness;
     trace("hunk",
           "    insertion gap PP={0} mapsToTU via slot boundary TU byte {1} inventory={2}",
           pp, slotAnchor,
-          FormatAcceptedPathAudit(AcceptedPathKind::TUExactSlotBoundary));
+          FormatAcceptedPathAudit(AcceptedPathKind::TUExactSlotBoundary,
+                                  /*patch=*/nullptr, &slotWitness));
     return slotAnchor;
   }
 
@@ -3219,11 +3224,22 @@ RefoldEngine::FindProvableTUInsertionAnchor(uint64_t pp,
     if (!best)
       return std::nullopt;
 
+    TUAnchorWitness argLikeWitness;
+    argLikeWitness.evidence = TUAnchorEvidenceKind::ArgLikeBegin;
+    argLikeWitness.hasPPGap = true;
+    argLikeWitness.ppGap = pp;
+    argLikeWitness.hasTUByte = true;
+    argLikeWitness.tuByte = *best->invB;
+    argLikeWitness.macroId = best->id;
+    argLikeWitness.outsideIncludeCoverage = true;
+    if (witness)
+      *witness = argLikeWitness;
     trace("tu/anchor",
           "pure insertion arg-like begin anchor: ppGap={0} -> macro id={1} "
           "name='{2}' invB={3} inventory={4}",
           pp, best->id, best->name, *best->invB,
-          FormatAcceptedPathAudit(AcceptedPathKind::TUProvableInsertionAnchor));
+          FormatAcceptedPathAudit(AcceptedPathKind::TUProvableInsertionAnchor,
+                                  /*patch=*/nullptr, &argLikeWitness));
     return *best->invB;
   };
 
@@ -3244,10 +3260,22 @@ RefoldEngine::FindProvableTUInsertionAnchor(uint64_t pp,
     if (rightIt != tokmapByPP.end()) {
       const auto &right = rightIt->second;
       if (PathsEqual(tuPath, right.file)) {
+        TUAnchorWitness rightWitness;
+        rightWitness.evidence = TUAnchorEvidenceKind::ImmediateRightNeighbor;
+        rightWitness.hasPPGap = true;
+        rightWitness.ppGap = pp;
+        rightWitness.hasTUByte = true;
+        rightWitness.tuByte = right.b;
+        rightWitness.hasRightNeighbor = true;
+        rightWitness.rightNeighborPP = pp;
+        rightWitness.outsideIncludeCoverage = true;
+        if (witness)
+          *witness = rightWitness;
         trace("tu/anchor",
               "provable TU insertion anchor: ppGap={0} -> right neighbor byte={1} inventory={2}",
               pp, right.b,
-              FormatAcceptedPathAudit(AcceptedPathKind::TUProvableInsertionAnchor));
+              FormatAcceptedPathAudit(AcceptedPathKind::TUProvableInsertionAnchor,
+                                      /*patch=*/nullptr, &rightWitness));
         return right.b;
       }
       return std::nullopt;
@@ -3262,10 +3290,22 @@ RefoldEngine::FindProvableTUInsertionAnchor(uint64_t pp,
     if (leftIt != tokmapByPP.end()) {
       const auto &left = leftIt->second;
       if (PathsEqual(tuPath, left.file)) {
+        TUAnchorWitness leftWitness;
+        leftWitness.evidence = TUAnchorEvidenceKind::ImmediateLeftNeighbor;
+        leftWitness.hasPPGap = true;
+        leftWitness.ppGap = pp;
+        leftWitness.hasTUByte = true;
+        leftWitness.tuByte = left.e;
+        leftWitness.hasLeftNeighbor = true;
+        leftWitness.leftNeighborPP = pp - 1;
+        leftWitness.outsideIncludeCoverage = true;
+        if (witness)
+          *witness = leftWitness;
         trace("tu/anchor",
               "provable TU insertion anchor: ppGap={0} -> left neighbor byte={1} inventory={2}",
               pp, left.e,
-              FormatAcceptedPathAudit(AcceptedPathKind::TUProvableInsertionAnchor));
+              FormatAcceptedPathAudit(AcceptedPathKind::TUProvableInsertionAnchor,
+                                      /*patch=*/nullptr, &leftWitness));
         return left.e;
       }
       return std::nullopt;
@@ -3337,16 +3377,50 @@ RefoldEngine::FindProvableTUInsertionAnchor(uint64_t pp,
   // Use the nearer corroborating TU boundary as the concrete zero-width anchor,
   // preferring the right side on an equal-distance tie.
   if (dRight <= dLeft) {
+    TUAnchorWitness corroboratedRightWitness;
+    corroboratedRightWitness.evidence =
+        TUAnchorEvidenceKind::CorroboratedRightNeighbor;
+    corroboratedRightWitness.hasPPGap = true;
+    corroboratedRightWitness.ppGap = pp;
+    corroboratedRightWitness.hasTUByte = true;
+    corroboratedRightWitness.tuByte = right->b;
+    corroboratedRightWitness.hasLeftNeighbor = true;
+    corroboratedRightWitness.leftNeighborPP = pp - dLeft;
+    corroboratedRightWitness.hasRightNeighbor = true;
+    corroboratedRightWitness.rightNeighborPP = pp + dRight;
+    corroboratedRightWitness.outsideIncludeCoverage = true;
+    corroboratedRightWitness.ownerDepthStable = true;
+    if (witness)
+      *witness = corroboratedRightWitness;
     trace("tu/anchor",
           "provable TU insertion anchor: ppGap={0} -> corroborated right byte={1} inventory={2}",
           pp, right->b,
-          FormatAcceptedPathAudit(AcceptedPathKind::TUProvableInsertionAnchor));
+          FormatAcceptedPathAudit(AcceptedPathKind::TUProvableInsertionAnchor,
+                                  /*patch=*/nullptr,
+                                  &corroboratedRightWitness));
     return right->b;
   }
+  TUAnchorWitness corroboratedLeftWitness;
+  corroboratedLeftWitness.evidence =
+      TUAnchorEvidenceKind::CorroboratedLeftNeighbor;
+  corroboratedLeftWitness.hasPPGap = true;
+  corroboratedLeftWitness.ppGap = pp;
+  corroboratedLeftWitness.hasTUByte = true;
+  corroboratedLeftWitness.tuByte = left->e;
+  corroboratedLeftWitness.hasLeftNeighbor = true;
+  corroboratedLeftWitness.leftNeighborPP = pp - dLeft;
+  corroboratedLeftWitness.hasRightNeighbor = true;
+  corroboratedLeftWitness.rightNeighborPP = pp + dRight;
+  corroboratedLeftWitness.outsideIncludeCoverage = true;
+  corroboratedLeftWitness.ownerDepthStable = true;
+  if (witness)
+    *witness = corroboratedLeftWitness;
   trace("tu/anchor",
         "provable TU insertion anchor: ppGap={0} -> corroborated left byte={1} inventory={2}",
         pp, left->e,
-        FormatAcceptedPathAudit(AcceptedPathKind::TUProvableInsertionAnchor));
+        FormatAcceptedPathAudit(AcceptedPathKind::TUProvableInsertionAnchor,
+                                /*patch=*/nullptr,
+                                &corroboratedLeftWitness));
   return left->e;
 }
 
@@ -3395,7 +3469,8 @@ bool RefoldEngine::HunkMapsToTU(uint64_t a0, uint64_t a1,
 
 std::optional<uint64_t>
 RefoldEngine::AnchorToExactSlotBoundaryFromPPGap(StringRef tuPath,
-                                                   uint64_t ppGap) const {
+                                                   uint64_t ppGap,
+                                                   TUAnchorWitness *witness) const {
   // Candidate record for potential anchor points
   struct Cand {
     uint64_t pp; // PP coordinate for the boundary
@@ -3538,11 +3613,22 @@ RefoldEngine::AnchorToExactSlotBoundaryFromPPGap(StringRef tuPath,
   }
 
   if (best) {
+    if (witness) {
+      witness->evidence = TUAnchorEvidenceKind::ExactSlotBoundary;
+      witness->hasPPGap = true;
+      witness->ppGap = ppGap;
+      witness->hasTUByte = true;
+      witness->tuByte = best->b;
+      witness->exactPPMatch = true;
+      witness->slotId = best->slot->id;
+      witness->slotKind = best->slot->kind.str();
+    }
     trace("slots/anchor",
           "AnchorToExactSlotBoundaryFromPPGap: ppGap={0} -> slotId={1} "
           "kind={2} tuByte={3} inventory={4}",
           ppGap, best->slot->id, best->slot->kind, best->b,
-          FormatAcceptedPathAudit(AcceptedPathKind::TUExactSlotBoundary));
+          FormatAcceptedPathAudit(AcceptedPathKind::TUExactSlotBoundary,
+                                  /*patch=*/nullptr, witness));
   } else {
     trace("slots/anchor",
           "AnchorToExactSlotBoundaryFromPPGap: ppGap={0} -> <none>", ppGap);
@@ -8480,11 +8566,14 @@ RefoldEngine::BuildAcceptancePathInventory(AcceptedPathKind currentPath) const {
     inventory.futureTarget = FutureProofTarget::IncludeRealizationCover;
     break;
   case AcceptedPathKind::TUExactSlotBoundary:
-    inventory.support = AcceptanceSupportKind::DeterministicButNotFirstClass;
+    // Step 7 formalizes exact slot anchors as first-class TU anchor proofs.
+    inventory.support = AcceptanceSupportKind::ExplicitProofBacked;
     inventory.futureTarget = FutureProofTarget::TUExactSlotAnchor;
     break;
   case AcceptedPathKind::TUProvableInsertionAnchor:
-    inventory.support = AcceptanceSupportKind::DeterministicButNotFirstClass;
+    // Step 7 likewise promotes deterministic non-slot TU insertion anchors
+    // into explicit proof-backed paths once they carry a local witness.
+    inventory.support = AcceptanceSupportKind::ExplicitProofBacked;
     inventory.futureTarget = FutureProofTarget::TUProvableInsertionAnchor;
     break;
   case AcceptedPathKind::TerminalEmitEditedPreprocessedStream:
@@ -8655,7 +8744,8 @@ void RefoldEngine::StampMacroWholeCoverRealizationPatch(
 }
 
 RefoldEngine::ProofSummary RefoldEngine::BuildAcceptedPathProofSummary(
-    AcceptedPathKind currentPath, const IncludePatch *patch) const {
+    AcceptedPathKind currentPath, const IncludePatch *patch,
+    const TUAnchorWitness *tuAnchorWitness) const {
   ProofSummary summary;
   summary.inventory = BuildAcceptancePathInventory(currentPath);
 
@@ -8690,7 +8780,11 @@ RefoldEngine::ProofSummary RefoldEngine::BuildAcceptedPathProofSummary(
     summary.realizationMode = RealizationMode::PreserveOriginalStructure;
     summary.preference = SelectionPreference::PreferExactAnchoring;
     summary.structurePreserving = true;
-    summary.discharge = ValidateTUAnchorProof(currentPath);
+    if (tuAnchorWitness) {
+      summary.hasTUAnchorWitness = true;
+      summary.tuAnchorWitness = *tuAnchorWitness;
+    }
+    summary.discharge = ValidateTUAnchorProof(currentPath, tuAnchorWitness);
     break;
 
   case AcceptedPathKind::TerminalEmitEditedPreprocessedStream: {
@@ -9042,9 +9136,11 @@ RefoldEngine::ValidateIncludeRealizationProof(AcceptedPathKind currentPath,
 }
 
 RefoldEngine::ProofDischargeRecord
-RefoldEngine::ValidateTUAnchorProof(AcceptedPathKind currentPath) const {
+RefoldEngine::ValidateTUAnchorProof(AcceptedPathKind currentPath,
+                                   const TUAnchorWitness *witness) const {
   ProofDischargeAccumulator discharge;
-  const AcceptancePathInventory inventory = BuildAcceptancePathInventory(currentPath);
+  const AcceptancePathInventory inventory =
+      BuildAcceptancePathInventory(currentPath);
   const bool classified = currentPath == AcceptedPathKind::TUExactSlotBoundary ||
                           currentPath == AcceptedPathKind::TUProvableInsertionAnchor;
   discharge.Require(classified,
@@ -9053,6 +9149,90 @@ RefoldEngine::ValidateTUAnchorProof(AcceptedPathKind currentPath) const {
   discharge.Require(inventory.futureTarget != FutureProofTarget::Unknown,
                     ProofObligationKind::FutureTargetMapped,
                     ProofFailureReason::MissingFutureTargetMapping);
+  // Step 7 requires every accepted TU anchor path to carry an explicit local
+  // witness describing which deterministic anchor source succeeded.
+  discharge.Require(witness && witness->evidence != TUAnchorEvidenceKind::Unknown,
+                    ProofObligationKind::TUAnchorWitnessTracked,
+                    ProofFailureReason::MissingTUAnchorWitness);
+  discharge.Require(witness && witness->hasPPGap,
+                    ProofObligationKind::TUAnchorPPGapTracked,
+                    ProofFailureReason::MissingTUAnchorGap);
+  discharge.Require(witness && witness->hasTUByte,
+                    ProofObligationKind::TUAnchorByteTracked,
+                    ProofFailureReason::MissingTUAnchorByte);
+
+  if (!witness)
+    return discharge.Finish();
+
+  switch (currentPath) {
+  case AcceptedPathKind::TUExactSlotBoundary: {
+    const bool exactSlotWitness =
+        witness->evidence == TUAnchorEvidenceKind::ExactSlotBoundary &&
+        witness->exactPPMatch && witness->slotId != 0 &&
+        !witness->slotKind.empty();
+    discharge.Require(exactSlotWitness,
+                      ProofObligationKind::TUExactSlotWitnessTracked,
+                      ProofFailureReason::MissingTUExactSlotWitness);
+    break;
+  }
+
+  case AcceptedPathKind::TUProvableInsertionAnchor: {
+    bool provableWitness = false;
+    switch (witness->evidence) {
+    case TUAnchorEvidenceKind::ArgLikeBegin:
+      provableWitness = (witness->macroId != 0);
+      break;
+    case TUAnchorEvidenceKind::ImmediateRightNeighbor:
+      provableWitness = witness->hasRightNeighbor;
+      break;
+    case TUAnchorEvidenceKind::ImmediateLeftNeighbor:
+      provableWitness = witness->hasLeftNeighbor;
+      break;
+    case TUAnchorEvidenceKind::CorroboratedRightNeighbor:
+    case TUAnchorEvidenceKind::CorroboratedLeftNeighbor:
+      provableWitness = witness->hasLeftNeighbor && witness->hasRightNeighbor;
+      break;
+    case TUAnchorEvidenceKind::Unknown:
+    case TUAnchorEvidenceKind::ExactSlotBoundary:
+      provableWitness = false;
+      break;
+    }
+    discharge.Require(provableWitness,
+                      ProofObligationKind::TUProvableEvidenceTracked,
+                      ProofFailureReason::MissingTUProvableAnchorWitness);
+    discharge.Require(witness->outsideIncludeCoverage,
+                      ProofObligationKind::TUOutsideIncludeCoverageTracked,
+                      ProofFailureReason::MissingTUOutsideIncludeCoverageProof);
+    if (witness->evidence == TUAnchorEvidenceKind::CorroboratedRightNeighbor ||
+        witness->evidence == TUAnchorEvidenceKind::CorroboratedLeftNeighbor) {
+      discharge.Require(witness->ownerDepthStable,
+                        ProofObligationKind::TUOwnerDepthStableTracked,
+                        ProofFailureReason::MissingTUOwnerDepthStability);
+    }
+    break;
+  }
+
+  case AcceptedPathKind::Unknown:
+  case AcceptedPathKind::MacroArgsOnlyStandard:
+  case AcceptedPathKind::MacroArgsOnlyPasteSingle:
+  case AcceptedPathKind::MacroArgsOnlyPasteMulti:
+  case AcceptedPathKind::MacroArgsOnlyPurePasteOnly:
+  case AcceptedPathKind::MacroArgsOnlyPairedPureInsertion:
+  case AcceptedPathKind::MacroDagSubtreeRoot:
+  case AcceptedPathKind::MacroCallChainSuffix:
+  case AcceptedPathKind::MacroCounterLiteral:
+  case AcceptedPathKind::MacroWholeCoverRealization:
+  case AcceptedPathKind::IncludePatchPendingMaterialization:
+  case AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens:
+  case AcceptedPathKind::IncludeInsertSelectedConditionalBoundary:
+  case AcceptedPathKind::IncludeInsertChildBoundary:
+  case AcceptedPathKind::IncludeInsertRightNeighborPP:
+  case AcceptedPathKind::IncludeInsertLeftNeighborPP:
+  case AcceptedPathKind::IncludeInsertDeclBoundary:
+  case AcceptedPathKind::IncludeRealizationInlineFromB:
+  case AcceptedPathKind::TerminalEmitEditedPreprocessedStream:
+    break;
+  }
   return discharge.Finish();
 }
 
@@ -9288,6 +9468,20 @@ StringRef RefoldEngine::FormatProofObligationKind(
     return "IncludeMappedHeaderRangeTracked";
   case ProofObligationKind::TUAnchorPathClassified:
     return "TUAnchorPathClassified";
+  case ProofObligationKind::TUAnchorWitnessTracked:
+    return "TUAnchorWitnessTracked";
+  case ProofObligationKind::TUAnchorPPGapTracked:
+    return "TUAnchorPPGapTracked";
+  case ProofObligationKind::TUAnchorByteTracked:
+    return "TUAnchorByteTracked";
+  case ProofObligationKind::TUExactSlotWitnessTracked:
+    return "TUExactSlotWitnessTracked";
+  case ProofObligationKind::TUProvableEvidenceTracked:
+    return "TUProvableEvidenceTracked";
+  case ProofObligationKind::TUOutsideIncludeCoverageTracked:
+    return "TUOutsideIncludeCoverageTracked";
+  case ProofObligationKind::TUOwnerDepthStableTracked:
+    return "TUOwnerDepthStableTracked";
   case ProofObligationKind::LegacyFallbackExplicitlyTracked:
     return "LegacyFallbackExplicitlyTracked";
   }
@@ -9340,10 +9534,63 @@ StringRef RefoldEngine::FormatProofFailureReason(ProofFailureReason reason) cons
     return "MissingMappedHeaderRange";
   case ProofFailureReason::MissingTUAnchorClassification:
     return "MissingTUAnchorClassification";
+  case ProofFailureReason::MissingTUAnchorWitness:
+    return "MissingTUAnchorWitness";
+  case ProofFailureReason::MissingTUAnchorGap:
+    return "MissingTUAnchorGap";
+  case ProofFailureReason::MissingTUAnchorByte:
+    return "MissingTUAnchorByte";
+  case ProofFailureReason::MissingTUExactSlotWitness:
+    return "MissingTUExactSlotWitness";
+  case ProofFailureReason::MissingTUProvableAnchorWitness:
+    return "MissingTUProvableAnchorWitness";
+  case ProofFailureReason::MissingTUOutsideIncludeCoverageProof:
+    return "MissingTUOutsideIncludeCoverageProof";
+  case ProofFailureReason::MissingTUOwnerDepthStability:
+    return "MissingTUOwnerDepthStability";
   case ProofFailureReason::LegacyFallback:
     return "LegacyFallback";
   }
   return "None";
+}
+
+StringRef RefoldEngine::FormatTUAnchorEvidenceKind(
+    TUAnchorEvidenceKind kind) const {
+  switch (kind) {
+  case TUAnchorEvidenceKind::Unknown:
+    return "Unknown";
+  case TUAnchorEvidenceKind::ExactSlotBoundary:
+    return "ExactSlotBoundary";
+  case TUAnchorEvidenceKind::ArgLikeBegin:
+    return "ArgLikeBegin";
+  case TUAnchorEvidenceKind::ImmediateRightNeighbor:
+    return "ImmediateRightNeighbor";
+  case TUAnchorEvidenceKind::ImmediateLeftNeighbor:
+    return "ImmediateLeftNeighbor";
+  case TUAnchorEvidenceKind::CorroboratedRightNeighbor:
+    return "CorroboratedRightNeighbor";
+  case TUAnchorEvidenceKind::CorroboratedLeftNeighbor:
+    return "CorroboratedLeftNeighbor";
+  }
+  return "Unknown";
+}
+
+std::string RefoldEngine::FormatTUAnchorWitness(
+    const TUAnchorWitness &witness) const {
+  return formatv(
+             "kind={0} ppGap={1}{2} tuByte={3}{4} slotId={5} slotKind={6} "
+             "macroId={7} leftPP={8}{9} rightPP={10}{11} outsideInclude={12} "
+             "ownerDepthStable={13} exactPP={14}",
+             FormatTUAnchorEvidenceKind(witness.evidence), witness.ppGap,
+             witness.hasPPGap ? "" : "(missing)", witness.tuByte,
+             witness.hasTUByte ? "" : "(missing)", witness.slotId,
+             witness.slotKind.empty() ? StringRef("(none)") : StringRef(witness.slotKind),
+             witness.macroId, witness.leftNeighborPP,
+             witness.hasLeftNeighbor ? "" : "(missing)", witness.rightNeighborPP,
+             witness.hasRightNeighbor ? "" : "(missing)",
+             witness.outsideIncludeCoverage ? 1 : 0,
+             witness.ownerDepthStable ? 1 : 0, witness.exactPPMatch ? 1 : 0)
+      .str();
 }
 
 StringRef
@@ -9401,8 +9648,17 @@ std::string RefoldEngine::FormatProofDischargeRecord(
 }
 
 std::string RefoldEngine::FormatAcceptedPathAudit(
-    AcceptedPathKind currentPath, const IncludePatch *patch) const {
-  const ProofSummary summary = BuildAcceptedPathProofSummary(currentPath, patch);
+    AcceptedPathKind currentPath, const IncludePatch *patch,
+    const TUAnchorWitness *tuAnchorWitness) const {
+  const ProofSummary summary =
+      BuildAcceptedPathProofSummary(currentPath, patch, tuAnchorWitness);
+  if (summary.hasTUAnchorWitness) {
+    return formatv("inventory={0} discharge={1} tuAnchor={2}",
+                   FormatAcceptancePathInventory(summary.inventory),
+                   FormatProofDischargeRecord(summary.discharge),
+                   FormatTUAnchorWitness(summary.tuAnchorWitness))
+        .str();
+  }
   return formatv("inventory={0} discharge={1}",
                  FormatAcceptancePathInventory(summary.inventory),
                  FormatProofDischargeRecord(summary.discharge))
