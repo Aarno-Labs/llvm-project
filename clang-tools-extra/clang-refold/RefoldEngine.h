@@ -216,6 +216,26 @@ private:
   bool strict_;
   LangOptions lexLang_;
 
+  /// \brief Explicit classification for the remaining terminal fallback exits.
+  ///
+  /// The post-Step-12 engine no longer retries under more expanded tiers. If a
+  /// helper still cannot discharge into the declared proof lattice, it requests
+  /// the one explicit terminal fallback. Track which exclusion triggered that
+  /// fallback so the completeness boundary is stated in terms of named
+  /// out-of-domain cases rather than an opaque escape hatch.
+  enum class TerminalFallbackKind : uint8_t {
+    Unknown,
+    OwnerUnresolvedNoTUAnchor,
+    IncludeRealizationUnmappableBCoverEnvelope,
+    MixedExcludedCases,
+  };
+
+  /// \brief Compact witness describing why the single-pass engine fell back to B.
+  struct TerminalFallbackWitness {
+    TerminalFallbackKind kind = TerminalFallbackKind::Unknown;
+    uint32_t requestCount = 0;
+  };
+
   struct RefoldStats {
     uint64_t totalIncludes = 0;
     uint64_t expandedIncludes = 0;
@@ -227,51 +247,46 @@ private:
 
   RefoldStats lastStats_;
 
-  // Escalation scaffold: if any edit/patch cannot be applied deterministically
-  // under the structural policy, record the failure and fall back to emitting
-  // the fully expanded edited preprocessed stream (B). This guarantees that we
-  // never silently drop edits (at the cost of additional expansion).
+  // Single-pass terminal-fallback scaffold: if any edit/patch cannot be
+  // discharged into the declared proof/lattice outcomes in the current pass,
+  // record the reason and fall back to emitting the fully expanded edited
+  // preprocessed stream (B). This keeps the engine fail-closed without routing
+  // through hidden retry tiers.
   //
-  // Note: escalation is requested from several helper routines that are
-  // logically "const" (e.g. include materialization). Treat the escalation
-  // state as diagnostic/side-channel state via `mutable`.
+  // Note: the fallback is requested from several helper routines that are
+  // logically "const" (for example include materialization). Treat the
+  // fallback state as diagnostic/side-channel state via `mutable`.
   mutable bool escalationRequested_ = false;
   mutable std::vector<std::string> escalationReasons_;
+  mutable TerminalFallbackKind terminalFallbackKind_ =
+      TerminalFallbackKind::Unknown;
+  mutable uint32_t terminalFallbackRequestCount_ = 0;
 
-  /// \brief Record that the current refold attempt must escalate.
+  /// \brief Record that the current pass must fall back to the explicit
+  /// terminal edited-preprocessed-stream result.
   ///
-  /// Called when an edit or include-owned patch cannot be applied
-  /// deterministically under the current structural policy/tier. The outer
-  /// escalation driver (\c Refold()) will log reasons and retry at a more
-  /// conservative tier, or fall back to emitting B.
+  /// Step 12 removes the retry ladder, but it keeps one fail-closed terminal
+  /// outcome outside the declared completeness set. Helpers call this when
+  /// they cannot discharge an edit into the single-pass proof/lattice
+  /// outcomes.
+  void RequestEscalation(TerminalFallbackKind kind, llvm::StringRef phase,
+                         llvm::StringRef detail) const;
   void RequestEscalation(llvm::StringRef phase, llvm::StringRef detail) const;
 
-  // Escalation ladder tiers (increasingly conservative projections):
-  //   0: normal structural refold
-  //   1: force whole-cover macro replacement (skip args-only + DAG-lift)
-  //   2: force inlining touched includes from B slices
-  // Final fallback (handled by Refold()): emit fully expanded edited
-  // preprocessed stream (B).
+  // Compatibility slot retained so existing statistics continue to report the
+  // execution mode. After Step 12 there is only one structural pass, so the
+  // recorded tier remains zero for successful refolds and one for the
+  // terminal fallback path.
   unsigned escalationTier_ = 0;
 
-  /// \brief True iff this tier forces whole-cover macro replacement.
+  /// \brief Clear per-pass terminal-fallback state.
   ///
-  /// At tier >= 1, the engine disables args-only/DAG macro lifting and prefers
-  /// replacing the full invocation cover to reduce ambiguity.
-  bool ForceWholeCoverMacros() const { return escalationTier_ >= 1; }
-
-  /// \brief True iff this tier forces inlining of touched includes from B.
-  ///
-  /// At tier >= 2, include realization may inline include expansion bytes
-  /// directly from B-domain slices instead of applying anchored header edits.
-  bool ForceInlineTouchedIncludesFromB() const { return escalationTier_ >= 2; }
-
-  /// \brief Clear per-attempt escalation state.
-  ///
-  /// This is invoked once per tier attempt before running \c RefoldOnce().
+  /// This is invoked once before running the single structural pass.
   void ResetEscalationState() const {
     escalationRequested_ = false;
     escalationReasons_.clear();
+    terminalFallbackKind_ = TerminalFallbackKind::Unknown;
+    terminalFallbackRequestCount_ = 0;
   }
 
   /// Reset the per-attempt refold statistics to a clean baseline.
@@ -446,16 +461,17 @@ private:
   ///
   /// This is the main instance entry point. It classifies token hunks, plans
   /// TU/include/macro edits under the structural policy, materializes the
-  /// refolded translation unit, and applies any escalation-tier retries (via
-  /// \c RefoldOnce()) when \c RequestEscalation() is raised.
+  /// refolded translation unit, and either returns that single-pass result or
+  /// falls back to the explicit terminal edited-preprocessed-stream outcome.
   ///
   /// \returns The refolded C/C++ source text for the translation unit.
   std::string Refold();
 
-  /// \brief Run a single refold attempt under the current escalation tier.
+  /// \brief Run the single structural refold pass.
   ///
-  /// The outer \c Refold() method is responsible for reacting to
-  /// \c RequestEscalation() and potentially retrying under a higher tier.
+  /// The outer \c Refold() method reacts to \c RequestEscalation() by
+  /// selecting the explicit terminal fallback, not by retrying under a more
+  /// conservative tier.
   std::string RefoldOnce();
 
   // ---------------------------- Small Data Records ---------------------------
@@ -485,6 +501,16 @@ private:
     // Root macro invocation id to charge as expanded if this edit survives
     // normalization and is applied in the final chosen refold result.
     std::optional<uint64_t> expandedMacroRootId = std::nullopt;
+  };
+
+  // Result of planning header-local edits for one include. When
+  // requiresIncludeRealization is set, the caller must stop trying to anchor
+  // header-local edits and realize the include directly from the edited
+  // preprocessed stream B instead.
+  struct IncludeTextEditPlan {
+    std::vector<TextEdit> edits;
+    bool requiresIncludeRealization = false;
+    std::string realizationReason;
   };
 
   struct PasteArgEdit {
@@ -816,7 +842,7 @@ private:
 
   /// \brief Evidence source used to justify an accepted include realization.
   ///
-  /// Step 9 promotes tier-2 include inlining from B into an explicit realized
+  /// Step 9/12 model direct include realization from B as an explicit realized
   /// proof path by recording the exact include cover and mapped B token
   /// envelope that were used to materialize the include body.
   enum class IncludeRealizationEvidenceKind : uint8_t {
@@ -989,6 +1015,8 @@ private:
     IncludeAnchorWitness includeAnchorWitness;
     bool hasIncludeRealizationWitness = false;
     IncludeRealizationWitness includeRealizationWitness;
+    bool hasTerminalFallbackWitness = false;
+    TerminalFallbackWitness terminalFallbackWitness;
   };
 
 
@@ -2742,7 +2770,8 @@ private:
       AcceptedPathKind currentPath, const IncludePatch *patch = nullptr,
       const TUAnchorWitness *tuAnchorWitness = nullptr,
       const IncludeAnchorWitness *includeAnchorWitness = nullptr,
-      const IncludeRealizationWitness *includeRealizationWitness = nullptr) const;
+      const IncludeRealizationWitness *includeRealizationWitness = nullptr,
+      const TerminalFallbackWitness *terminalFallbackWitness = nullptr) const;
 
   /// \brief Build the default Step-1/2/3 proof summary for an include patch.
   ///
@@ -2853,6 +2882,13 @@ private:
   FormatIncludeRealizationWitness(
       const IncludeRealizationWitness &witness) const;
 
+  /// \brief Build the explicit terminal-fallback witness for the current pass.
+  TerminalFallbackWitness BuildTerminalFallbackWitness() const;
+
+  /// \brief Format the explicit terminal-fallback witness for tracing.
+  std::string
+  FormatTerminalFallbackWitness(const TerminalFallbackWitness &witness) const;
+
   /// \brief Format a patch proof kind for tracing.
   StringRef FormatMacroPatchProofKind(MacroPatchProofKind kind) const;
 
@@ -2881,7 +2917,8 @@ private:
       AcceptedPathKind currentPath, const IncludePatch *patch = nullptr,
       const TUAnchorWitness *tuAnchorWitness = nullptr,
       const IncludeAnchorWitness *includeAnchorWitness = nullptr,
-      const IncludeRealizationWitness *includeRealizationWitness = nullptr) const;
+      const IncludeRealizationWitness *includeRealizationWitness = nullptr,
+      const TerminalFallbackWitness *terminalFallbackWitness = nullptr) const;
 
   /// \brief Format patch provenance and subtree-composition audit metadata.
   std::string FormatMacroPatchAudit(const MacroPatch &patch) const;
@@ -3132,6 +3169,13 @@ private:
       DenseMap<uint64_t, std::string> &includeExpansion,
       DenseSet<uint64_t> *appliedExpandedMacroRootIds = nullptr) const;
 
+  // Realize an include directly from the edited preprocessed stream B. This is
+  // the single-pass include-realization path used when local include
+  // preservation cannot discharge a deterministic anchored edit plan.
+  std::optional<std::string>
+  BuildInlineIncludeRealizationFromB(const RefoldModel::IncludeItem &inc,
+                                     llvm::StringRef reason) const;
+
   /// \brief Selects the most appropriate HeaderDecl within an IncludeItem to
   /// serve as the declaration-level anchor for an include-scoped patch.
   ///
@@ -3258,8 +3302,8 @@ private:
   ///                   `ie.include`.
   /// \returns Header-local `TextEdit`s (byte offsets into `headerText`), sorted
   ///          by descending `start`.
-  std::vector<TextEdit> ComputeIncludeTextEdits(const IncludeEdits &ie,
-                                                std::string headerText) const;
+  IncludeTextEditPlan ComputeIncludeTextEdits(const IncludeEdits &ie,
+                                              std::string headerText) const;
 
   /// \brief Computes a deterministic insertion byte offset for a header-scoped
   /// *pure INSERT* when the normal token-based anchoring mechanisms provide no
