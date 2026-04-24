@@ -224,6 +224,12 @@ private:
   /// the one explicit terminal fallback. Track which exclusion triggered that
   /// fallback so the completeness boundary is stated in terms of named
   /// out-of-domain cases rather than an opaque escape hatch.
+  ///
+  /// Step 5 formalizes `OwnerUnresolvedNoTUAnchor` as an explicit theorem
+  /// boundary rather than a vague implementation leftover. That exclusion means
+  /// the edit had no macro/include owner and also lacked the TU witness needed
+  /// to stay in-domain: a truthful TU-owned mapped span for non-insertions, or
+  /// an exact/provable TU insertion anchor for pure insertions.
   enum class TerminalFallbackKind : uint8_t {
     Unknown,
     OwnerUnresolvedNoTUAnchor,
@@ -3199,6 +3205,26 @@ private:
 
   /// \brief Build the explicit terminal-fallback witness for the current pass.
   TerminalFallbackWitness BuildTerminalFallbackWitness() const;
+
+  /// \brief Return whether the hunk lies on the explicit unresolved-owner
+  /// / no-TU-anchor theorem boundary.
+  ///
+  /// Step 5 chooses the conservative domain-wall interpretation for the last
+  /// ownership gap. This predicate does not search for any new witness. It only
+  /// re-states the evidence that has already been exhausted:
+  ///
+  /// * no resolved macro/TU/include owner remained,
+  /// * no exact include-boundary owner exists for a pure insertion,
+  /// * no truthful TU-owned mapped span exists for the A interval, and
+  /// * for pure insertions, no exact/provable TU insertion anchor exists.
+  ///
+  /// When all of those facts hold, the edit is explicitly outside the declared
+  /// structural refolding domain and must terminate via
+  /// `OwnerUnresolvedNoTUAnchor`.
+  bool IsOwnerUnresolvedNoTUAnchorOutOfDomain(
+      const diffutils::Hunk &h, StringRef tuPath, const Owner &owner,
+      bool mapsToTU) const;
+
   /// \brief Build a detailed terminal-fallback reason for the unresolved-owner
   /// / no-TU-anchor domain wall.
   ///
@@ -3209,7 +3235,6 @@ private:
   std::string BuildOwnerUnresolvedNoTUAnchorDetail(
       size_t hunkIndex, const diffutils::Hunk &h, StringRef tuPath,
       const Owner &owner, bool mapsToTU) const;
-
 
   /// \brief Format the explicit terminal-fallback witness for tracing.
   std::string
