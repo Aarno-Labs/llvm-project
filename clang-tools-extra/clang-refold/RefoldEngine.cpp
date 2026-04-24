@@ -679,9 +679,9 @@ Expected<std::string> RefoldEngine::Refold(
   return engine.Refold();
 }
 
-void RefoldEngine::RequestEscalation(TerminalFallbackKind kind, StringRef phase,
+void RefoldEngine::RequestTerminalFallback(TerminalFallbackKind kind, StringRef phase,
                                     StringRef detail) const {
-  escalationRequested_ = true;
+  terminalFallbackRequested_ = true;
   ++terminalFallbackRequestCount_;
   if (terminalFallbackKind_ == TerminalFallbackKind::Unknown) {
     terminalFallbackKind_ = kind;
@@ -689,15 +689,11 @@ void RefoldEngine::RequestEscalation(TerminalFallbackKind kind, StringRef phase,
              terminalFallbackKind_ != kind) {
     terminalFallbackKind_ = TerminalFallbackKind::MixedExcludedCases;
   }
-  if (escalationReasons_.size() < 64) {
-    escalationReasons_.push_back(
+  if (terminalFallbackReasons_.size() < 64) {
+    terminalFallbackReasons_.push_back(
         llvm::formatv("{0}: {1}", phase, detail).str());
   }
-  debug("escalate", "REQUEST terminal fallback: {0}: {1}", phase, detail);
-}
-
-void RefoldEngine::RequestEscalation(StringRef phase, StringRef detail) const {
-  RequestEscalation(TerminalFallbackKind::Unknown, phase, detail);
+  debug("fallback", "REQUEST terminal fallback: {0}: {1}", phase, detail);
 }
 
 void RefoldEngine::BuildBInsertionProvenance(ArrayRef<diffutils::Hunk> hunks) {
@@ -895,24 +891,22 @@ RefoldEngine::SliceBSourceClippedAgainstClaims(size_t bTokStart,
 }
 
 std::string RefoldEngine::Refold() {
-  // Step 12 collapses the operational retry ladder into a single structural
-  // pass. Any site that still cannot discharge into an explicit proof/lattice
-  // outcome now requests the terminal fallback directly instead of asking for a
-  // more-expanded retry tier.
-  escalationTier_ = 0;
-  ResetEscalationState();
+  // The engine is single-pass: either the structural pass discharges into the
+  // declared proof/lattice outcomes, or it requests the one explicit terminal
+  // fallback to the fully expanded edited preprocessed stream (B).
+  ResetTerminalFallbackState();
   ResetAttemptStats();
 
-  std::string out = RefoldOnce();
-  if (!escalationRequested_) {
+  std::string out = RunSinglePassRefold();
+  if (!terminalFallbackRequested_) {
     EmitRefoldStats();
     return out;
   }
 
-  debug("escalate",
+  debug("fallback",
         "terminal fallback: emitting fully expanded edited preprocessed "
         "stream (B). reasons={0}",
-        escalationReasons_.size());
+        terminalFallbackReasons_.size());
   const TerminalFallbackWitness terminalWitness = BuildTerminalFallbackWitness();
   debug("proof/inventory", "terminal result {0}",
         FormatAcceptedPathAudit(
@@ -920,8 +914,8 @@ std::string RefoldEngine::Refold() {
             /*patch=*/nullptr, /*tuAnchorWitness=*/nullptr,
             /*includeAnchorWitness=*/nullptr,
             /*includeRealizationWitness=*/nullptr, &terminalWitness));
-  for (const auto &r : escalationReasons_)
-    debug("escalate", "  {0}", r);
+  for (const auto &r : terminalFallbackReasons_)
+    debug("fallback", "  {0}", r);
 
   lastStats_ = RefoldStats{};
   lastStats_.totalIncludes = model_.GetIncludes().size();
@@ -931,13 +925,12 @@ std::string RefoldEngine::Refold() {
       ++lastStats_.totalMacros;
   }
   lastStats_.expandedMacros = lastStats_.totalMacros;
-  lastStats_.tier = 1;
   lastStats_.terminalFallbackToB = true;
   EmitRefoldStats();
   return bSource_.str();
 }
 
-std::string RefoldEngine::RefoldOnce() {
+std::string RefoldEngine::RunSinglePassRefold() {
   // Make sure that when we re-lex the A-stream tokens that it matches the token
   // count as listed in the refold map JSON file.
   if (static_cast<size_t>(model_.GetTokensCountA()) != aToks_.size()) {
@@ -1851,7 +1844,11 @@ std::string RefoldEngine::RefoldOnce() {
           "#{0} dropping edit {1}: owner unresolved and no TU byte span "
           "available (no include guessing).",
           i, h);
-    RequestEscalation(
+    // No declared macro/include/TU proof class can discharge an edit that has
+    // neither a resolved structural owner nor a provable TU anchor. Treat this
+    // as an explicit out-of-domain terminal result rather than silently
+    // synthesizing ownership.
+    RequestTerminalFallback(
         TerminalFallbackKind::OwnerUnresolvedNoTUAnchor, "classify",
         llvm::formatv("dropped edit #{0} (owner unresolved, no TU byte span)",
                       i)
@@ -1863,8 +1860,8 @@ std::string RefoldEngine::RefoldOnce() {
   // requested terminal fallback, do not continue composing structural
   // artifacts. The outer driver will discard the current attempt and emit B
   // directly.
-  if (escalationRequested_) {
-    debug("escalate",
+  if (terminalFallbackRequested_) {
+    debug("fallback",
           "single-pass refold aborted after classification; terminal fallback will be emitted");
     return std::string();
   }
@@ -2007,8 +2004,8 @@ std::string RefoldEngine::RefoldOnce() {
   // Global fail-closed composition rule: if include realization requested the
   // terminal fallback in this single pass, stop here rather than continuing to
   // compose or return mixed structural artifacts.
-  if (escalationRequested_) {
-    debug("escalate",
+  if (terminalFallbackRequested_) {
+    debug("fallback",
           "single-pass refold aborted after include materialization; terminal fallback will be emitted");
     return std::string();
   }
@@ -8562,7 +8559,7 @@ RefoldEngine::BuildAcceptancePathInventory(AcceptedPathKind currentPath) const {
     inventory.futureTarget = FutureProofTarget::TUProvableInsertionAnchor;
     break;
   case AcceptedPathKind::TerminalEmitEditedPreprocessedStream:
-    inventory.support = AcceptanceSupportKind::LegacyTerminalFallback;
+    inventory.support = AcceptanceSupportKind::ExplicitOutOfDomainClass;
     inventory.futureTarget = FutureProofTarget::EditedPreprocessedStreamFallback;
     break;
   case AcceptedPathKind::Unknown:
@@ -8654,8 +8651,8 @@ RefoldEngine::ClassifyMacroPatchProof(const MacroPatch &patch) const {
     summary.acceptedClass = AcceptedProofClass::InvocationRealization;
     summary.realizationMode = RealizationMode::RealizeEditedSurface;
     summary.preference = SelectionPreference::PreferSurfaceRealization;
-    summary.legacyEscalation =
-        LegacyEscalationDisposition::RetryWholeCoverMacros;
+    summary.surfaceDisposition =
+        SurfaceDisposition::RealizeWholeCoverMacros;
     break;
 
   case MacroPatchProofKind::Unknown:
@@ -8763,8 +8760,8 @@ RefoldEngine::ProofSummary RefoldEngine::BuildAcceptedPathProofSummary(
     summary.acceptedClass = AcceptedProofClass::IncludeRealization;
     summary.realizationMode = RealizationMode::RealizeEditedSurface;
     summary.preference = SelectionPreference::PreferSurfaceRealization;
-    summary.legacyEscalation =
-        LegacyEscalationDisposition::RetryInlineTouchedIncludesFromB;
+    summary.surfaceDisposition =
+        SurfaceDisposition::RealizeInlineTouchedIncludesFromB;
     summary.structurePreserving = false;
     if (includeRealizationWitness) {
       summary.hasIncludeRealizationWitness = true;
@@ -8794,8 +8791,8 @@ RefoldEngine::ProofSummary RefoldEngine::BuildAcceptedPathProofSummary(
     }
     summary.realizationMode = RealizationMode::RealizeEditedSurface;
     summary.preference = SelectionPreference::PreferSurfaceRealization;
-    summary.legacyEscalation =
-        LegacyEscalationDisposition::EmitEditedPreprocessedStream;
+    summary.surfaceDisposition =
+        SurfaceDisposition::EmitEditedPreprocessedStream;
     ProofDischargeAccumulator discharge;
     discharge.Require(summary.inventory.currentPath != AcceptedPathKind::Unknown,
                       ProofObligationKind::AcceptedPathClassified,
@@ -8804,8 +8801,8 @@ RefoldEngine::ProofSummary RefoldEngine::BuildAcceptedPathProofSummary(
         summary.inventory.futureTarget != FutureProofTarget::Unknown,
         ProofObligationKind::FutureTargetMapped,
         ProofFailureReason::MissingFutureTargetMapping);
-    discharge.Fail(ProofObligationKind::LegacyFallbackExplicitlyTracked,
-                   ProofFailureReason::LegacyFallback);
+    discharge.Fail(ProofObligationKind::ExplicitOutOfDomainResultTracked,
+                   ProofFailureReason::ExplicitOutOfDomainResult);
     summary.discharge = discharge.Finish();
     break;
   }
@@ -8847,10 +8844,10 @@ RefoldEngine::BuildIncludePatchProofSummary(
     summary.preference = realizedSurface
                              ? SelectionPreference::PreferSurfaceRealization
                              : SelectionPreference::PreferStructurePreservation;
-    summary.legacyEscalation = realizedSurface
-                                   ? LegacyEscalationDisposition::
-                                         RetryInlineTouchedIncludesFromB
-                                   : LegacyEscalationDisposition::None;
+    summary.surfaceDisposition = realizedSurface
+                                   ? SurfaceDisposition::
+                                         RealizeInlineTouchedIncludesFromB
+                                   : SurfaceDisposition::None;
     summary.structurePreserving = !realizedSurface;
     summary.discharge = realizedSurface
                             ? ValidateIncludeRealizationProof(
@@ -8871,7 +8868,7 @@ RefoldEngine::BuildGlobalSelectionLattice(const ProofSummary &summary) const {
   GlobalSelectionLattice lattice;
 
   // Step 10 lifts the current global merge/conflict policy into one explicit
-  // lattice description. This does not change candidate choice yet; it names
+  // lattice description. This makes the conflict/merge policy explicit; candidate choice is being moved under this lattice one selection site at a time. It names
   // the owner domain, compatible-merge rule, and incompatible-conflict rule
   // that the current engine already relies on.
   switch (summary.acceptedClass) {
@@ -8913,7 +8910,7 @@ RefoldEngine::BuildGlobalSelectionLattice(const ProofSummary &summary) const {
       AcceptedPathKind::TerminalEmitEditedPreprocessedStream) {
     lattice.domain = LatticeConflictDomain::WholeTranslationUnit;
     lattice.mergeLaw = LatticeMergeLaw::TerminalReplacesAll;
-    lattice.conflictLaw = LatticeConflictLaw::LastResortTerminalFallback;
+    lattice.conflictLaw = LatticeConflictLaw::ExplicitOutOfDomainTerminalResult;
   }
 
   return lattice;
@@ -8930,10 +8927,14 @@ RefoldEngine::BuildCompletenessContract(const ProofSummary &summary) const {
   if (summary.inventory.currentPath ==
           AcceptedPathKind::TerminalEmitEditedPreprocessedStream ||
       summary.inventory.support ==
-          AcceptanceSupportKind::LegacyTerminalFallback) {
-    contract.coverage = CompletenessCoverageKind::LegacyOutOfScopeFallback;
+          AcceptanceSupportKind::ExplicitOutOfDomainClass) {
+    contract.coverage = CompletenessCoverageKind::ExplicitOutOfDomainClass;
     contract.expectation =
         CompletenessExpectationKind::ExplicitlyOutsideDeclaredSet;
+    if (summary.hasTerminalFallbackWitness) {
+      contract.hasExplicitExclusion = true;
+      contract.explicitExclusion = summary.terminalFallbackWitness.kind;
+    }
     return contract;
   }
 
@@ -8975,15 +8976,15 @@ bool RefoldEngine::LatticePrefers(const ProofSummary &lhs,
     return 3;
   };
 
-  auto escalationRank = [](LegacyEscalationDisposition disposition) -> uint8_t {
+  auto surfaceDispositionRank = [](SurfaceDisposition disposition) -> uint8_t {
     switch (disposition) {
-    case LegacyEscalationDisposition::None:
+    case SurfaceDisposition::None:
       return 0;
-    case LegacyEscalationDisposition::RetryWholeCoverMacros:
+    case SurfaceDisposition::RealizeWholeCoverMacros:
       return 1;
-    case LegacyEscalationDisposition::RetryInlineTouchedIncludesFromB:
+    case SurfaceDisposition::RealizeInlineTouchedIncludesFromB:
       return 2;
-    case LegacyEscalationDisposition::EmitEditedPreprocessedStream:
+    case SurfaceDisposition::EmitEditedPreprocessedStream:
       return 3;
     }
     return 3;
@@ -8994,10 +8995,10 @@ bool RefoldEngine::LatticePrefers(const ProofSummary &lhs,
   if (lhsPreference != rhsPreference)
     return lhsPreference < rhsPreference;
 
-  const uint8_t lhsEscalation = escalationRank(lhs.legacyEscalation);
-  const uint8_t rhsEscalation = escalationRank(rhs.legacyEscalation);
-  if (lhsEscalation != rhsEscalation)
-    return lhsEscalation < rhsEscalation;
+  const uint8_t lhsSurfaceDisposition = surfaceDispositionRank(lhs.surfaceDisposition);
+  const uint8_t rhsSurfaceDisposition = surfaceDispositionRank(rhs.surfaceDisposition);
+  if (lhsSurfaceDisposition != rhsSurfaceDisposition)
+    return lhsSurfaceDisposition < rhsSurfaceDisposition;
 
   if (lhs.acceptedClass != rhs.acceptedClass)
     return static_cast<uint8_t>(lhs.acceptedClass) <
@@ -9536,16 +9537,16 @@ RefoldEngine::FormatSelectionPreference(SelectionPreference preference) const {
   return "Unknown";
 }
 
-StringRef RefoldEngine::FormatLegacyEscalationDisposition(
-    LegacyEscalationDisposition disposition) const {
+StringRef RefoldEngine::FormatSurfaceDisposition(
+    SurfaceDisposition disposition) const {
   switch (disposition) {
-  case LegacyEscalationDisposition::None:
+  case SurfaceDisposition::None:
     return "None";
-  case LegacyEscalationDisposition::RetryWholeCoverMacros:
-    return "RetryWholeCoverMacros";
-  case LegacyEscalationDisposition::RetryInlineTouchedIncludesFromB:
-    return "RetryInlineTouchedIncludesFromB";
-  case LegacyEscalationDisposition::EmitEditedPreprocessedStream:
+  case SurfaceDisposition::RealizeWholeCoverMacros:
+    return "RealizeWholeCoverMacros";
+  case SurfaceDisposition::RealizeInlineTouchedIncludesFromB:
+    return "RealizeInlineTouchedIncludesFromB";
+  case SurfaceDisposition::EmitEditedPreprocessedStream:
     return "EmitEditedPreprocessedStream";
   }
   return "None";
@@ -9608,8 +9609,8 @@ RefoldEngine::FormatAcceptanceSupportKind(AcceptanceSupportKind support) const {
     return "ExplicitProofBacked";
   case AcceptanceSupportKind::DeterministicButNotFirstClass:
     return "DeterministicButNotFirstClass";
-  case AcceptanceSupportKind::LegacyTerminalFallback:
-    return "LegacyTerminalFallback";
+  case AcceptanceSupportKind::ExplicitOutOfDomainClass:
+    return "ExplicitOutOfDomainClass";
   }
   return "Unknown";
 }
@@ -9669,8 +9670,8 @@ StringRef RefoldEngine::FormatCompletenessCoverageKind(
     return "DeclaredProofClass";
   case CompletenessCoverageKind::TransitionalGap:
     return "TransitionalGap";
-  case CompletenessCoverageKind::LegacyOutOfScopeFallback:
-    return "LegacyOutOfScopeFallback";
+  case CompletenessCoverageKind::ExplicitOutOfDomainClass:
+    return "ExplicitOutOfDomainClass";
   }
   return "Unknown";
 }
@@ -9735,8 +9736,8 @@ StringRef RefoldEngine::FormatLatticeConflictLaw(LatticeConflictLaw law) const {
     return "PreferExactAnchorWitness";
   case LatticeConflictLaw::PreferOwnerPreservingBeforeRealization:
     return "PreferOwnerPreservingBeforeRealization";
-  case LatticeConflictLaw::LastResortTerminalFallback:
-    return "LastResortTerminalFallback";
+  case LatticeConflictLaw::ExplicitOutOfDomainTerminalResult:
+    return "ExplicitOutOfDomainTerminalResult";
   }
   return "Unknown";
 }
@@ -9841,8 +9842,8 @@ StringRef RefoldEngine::FormatProofObligationKind(
     return "TUOutsideIncludeCoverageTracked";
   case ProofObligationKind::TUOwnerDepthStableTracked:
     return "TUOwnerDepthStableTracked";
-  case ProofObligationKind::LegacyFallbackExplicitlyTracked:
-    return "LegacyFallbackExplicitlyTracked";
+  case ProofObligationKind::ExplicitOutOfDomainResultTracked:
+    return "ExplicitOutOfDomainResultTracked";
   }
   return "Unknown";
 }
@@ -9931,8 +9932,8 @@ StringRef RefoldEngine::FormatProofFailureReason(ProofFailureReason reason) cons
     return "MissingTUOutsideIncludeCoverageProof";
   case ProofFailureReason::MissingTUOwnerDepthStability:
     return "MissingTUOwnerDepthStability";
-  case ProofFailureReason::LegacyFallback:
-    return "LegacyFallback";
+  case ProofFailureReason::ExplicitOutOfDomainResult:
+    return "ExplicitOutOfDomainResult";
   }
   return "None";
 }
@@ -10135,6 +10136,16 @@ std::string RefoldEngine::FormatGlobalSelectionLattice(
 
 std::string RefoldEngine::FormatCompletenessContract(
     const CompletenessContract &contract) const {
+  if (contract.hasExplicitExclusion) {
+    const TerminalFallbackWitness witness{contract.explicitExclusion, 0};
+    return formatv("coverage={0} expectation={1} declaredTarget={2} counts={3} exclusion={4}",
+                   FormatCompletenessCoverageKind(contract.coverage),
+                   FormatCompletenessExpectationKind(contract.expectation),
+                   FormatFutureProofTarget(contract.declaredTarget),
+                   contract.countsTowardDeclaredCoverage ? 1 : 0,
+                   FormatTerminalFallbackWitness(witness))
+        .str();
+  }
   return formatv(
              "coverage={0} expectation={1} declaredTarget={2} counts={3}",
              FormatCompletenessCoverageKind(contract.coverage),
@@ -10202,7 +10213,7 @@ std::string RefoldEngine::FormatMacroPatchAudit(const MacroPatch &patch) const {
   const ProofSummary summary = ClassifyMacroPatchProof(patch);
   return formatv(
              "proofKind={0} topClass={1} realization={2} preference={3} "
-             "legacyEscalation={4} inventory={5} lattice={6} completeness={7} "
+             "surfaceDisposition={4} inventory={5} lattice={6} completeness={7} "
              "discharge={8} validated={9} struct={10} proofRoot={11} subtreeCert={12} "
              "leaf={13} witnesses={14} invCerts={15} formalCerts={16} "
              "argCerts={17} liftChains={18} liftSteps={19} rootMerges={20} "
@@ -10217,7 +10228,7 @@ std::string RefoldEngine::FormatMacroPatchAudit(const MacroPatch &patch) const {
              FormatAcceptedProofClass(summary.acceptedClass),
              FormatRealizationMode(summary.realizationMode),
              FormatSelectionPreference(summary.preference),
-             FormatLegacyEscalationDisposition(summary.legacyEscalation),
+             FormatSurfaceDisposition(summary.surfaceDisposition),
              FormatAcceptancePathInventory(summary.inventory),
              FormatGlobalSelectionLattice(summary.lattice),
              FormatCompletenessContract(summary.completeness),
@@ -19885,13 +19896,13 @@ uint64_t RefoldEngine::GetRootMacroId(uint64_t macroId) const {
 
 std::optional<std::string> RefoldEngine::BuildInlineIncludeRealizationFromB(
     const RefoldModel::IncludeItem &inc, StringRef reason) const {
-  // The include-realization proof class already models the exact A-cover and
-  // mapped B-envelope used when an include must be realized directly from the
-  // edited preprocessed stream. Step 12A selects that class immediately in the
-  // same pass instead of routing through the removed retry ladder.
+  // The include-realization proof class is defined only when the include
+  // cover on the A side can be mapped to an exact B-token envelope. If that
+  // envelope cannot be recovered, this is not a weaker accepted realization
+  // path; it is an explicit out-of-domain terminal result.
   auto bEnvOpt = MapATokRangeAToBTokenEnvelope(inc.cover.begin, inc.cover.end);
   if (!bEnvOpt) {
-    RequestEscalation(
+    RequestTerminalFallback(
         TerminalFallbackKind::IncludeRealizationUnmappableBCoverEnvelope,
         "include/mat",
         llvm::formatv("include realization from B failed to map A "
@@ -20117,8 +20128,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
       } else {
         // A degenerate child site cannot discharge an include-preserving edit
         // plan for the parent. Select the explicit include-realization proof
-        // class for the whole parent include immediately instead of routing
-        // through the removed retry ladder.
+        // class for the whole parent include immediately.
         debug("include/mat",
               "inc#{0} child#{1} has degenerate site [start={2},end={3}]; "
               "realizing parent include from B",
@@ -20295,13 +20305,62 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     if (isInsert) {
       // INSERT: interpret A-position as "before the next token" in this header.
       const uint64_t pos = p.aStart;
-      std::optional<uint64_t> anchorPP;
       auto anchorMatchesCondArmCert = [&](uint64_t anchorByte) -> bool {
         if (!p.ownerHasCondArmCert)
           return true;
         auto armRef = model_.FindArmRefForByte(file, ie.include->id, anchorByte);
         return armRef && armRef->arm &&
                armRef->arm->id == p.ownerCondArmIdCert;
+      };
+
+      struct InsertAnchorCandidate {
+        AcceptedPathKind path = AcceptedPathKind::Unknown;
+        IncludeAnchorWitness witness;
+        uint64_t anchorByte = 0;
+      };
+
+      auto traceInsertCandidate = [&](const InsertAnchorCandidate &candidate,
+                                      StringRef stage) {
+        trace("include/apply",
+              "file={0} patch[{1}] INSERT: candidate stage={2} anchorByte={3} inventory={4}",
+              file, idx, stage, candidate.anchorByte,
+              includeInventoryFor(candidate.path, &candidate.witness));
+      };
+
+      auto selectBestInsertCandidate =
+          [&](ArrayRef<InsertAnchorCandidate> candidates)
+          -> std::optional<InsertAnchorCandidate> {
+        if (candidates.empty())
+          return std::nullopt;
+
+        size_t bestIdx = 0;
+        for (size_t candIdx = 1; candIdx < candidates.size(); ++candIdx) {
+          const ProofSummary candSummary = BuildAcceptedPathProofSummary(
+              candidates[candIdx].path, &p, /*tuAnchorWitness=*/nullptr,
+              &candidates[candIdx].witness);
+          const ProofSummary bestSummary = BuildAcceptedPathProofSummary(
+              candidates[bestIdx].path, &p, /*tuAnchorWitness=*/nullptr,
+              &candidates[bestIdx].witness);
+          if (LatticePrefers(candSummary, bestSummary))
+            bestIdx = candIdx;
+        }
+
+        trace("include/apply",
+              "file={0} patch[{1}] INSERT: selected candidate anchorByte={2} inventory={3}",
+              file, idx, candidates[bestIdx].anchorByte,
+              includeInventoryFor(candidates[bestIdx].path,
+                                  &candidates[bestIdx].witness));
+        return candidates[bestIdx];
+      };
+
+      auto commitInsertCandidate = [&](const InsertAnchorCandidate &candidate) {
+        std::string text =
+            PadAtBoundaries(headerText, static_cast<size_t>(candidate.anchorByte),
+                            static_cast<size_t>(candidate.anchorByte),
+                            p.insertBytes,
+                            /* allowLeft */ true, /* allowRight */ true);
+        plan.edits.push_back(MakeTextEditWithResyncOrPending(
+            headerText, candidate.anchorByte, candidate.anchorByte, text, file));
       };
 
       // If this INSERT gap is exactly the begin of the currently selected
@@ -20341,209 +20400,178 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         return std::clamp<uint64_t>(rightArmRef->group->groupB, 0ULL, fileLen);
       };
 
-      if (const std::optional<uint64_t> insertByte =
-              selectedArmBeginBoundaryByte()) {
-        if (*insertByte <= fileLen && anchorMatchesCondArmCert(*insertByte)) {
-          IncludeAnchorWitness witness;
-          witness.evidence =
-              IncludeAnchorEvidenceKind::SelectedConditionalBoundary;
-          witness.hasAnchorByte = true;
-          witness.anchorByte = *insertByte;
-          if (auto rightArmRef = model_.FindArmRefAtPP(pos); rightArmRef &&
-              rightArmRef->arm) {
-            witness.hasCondArmId = true;
-            witness.condArmId = rightArmRef->arm->id;
+      {
+        SmallVector<InsertAnchorCandidate, 2> topTierCandidates;
+
+        if (const std::optional<uint64_t> insertByte =
+                selectedArmBeginBoundaryByte()) {
+          if (*insertByte <= fileLen && anchorMatchesCondArmCert(*insertByte)) {
+            InsertAnchorCandidate candidate;
+            candidate.path =
+                AcceptedPathKind::IncludeInsertSelectedConditionalBoundary;
+            candidate.anchorByte = *insertByte;
+            candidate.witness.evidence =
+                IncludeAnchorEvidenceKind::SelectedConditionalBoundary;
+            candidate.witness.hasAnchorByte = true;
+            candidate.witness.anchorByte = *insertByte;
+            if (auto rightArmRef = model_.FindArmRefAtPP(pos); rightArmRef &&
+                rightArmRef->arm) {
+              candidate.witness.hasCondArmId = true;
+              candidate.witness.condArmId = rightArmRef->arm->id;
+            }
+            traceInsertCandidate(candidate, "selected-conditional-boundary");
+            topTierCandidates.push_back(std::move(candidate));
           }
+        }
 
-          std::string text =
-              PadAtBoundaries(headerText, static_cast<size_t>(*insertByte),
-                              static_cast<size_t>(*insertByte), p.insertBytes,
-                              /* allowLeft */ true, /* allowRight */ true);
-          plan.edits.push_back(MakeTextEditWithResyncOrPending(
-              headerText, *insertByte, *insertByte, text, file));
+        IncludeAnchorWitness childBoundaryWitness;
+        if (const std::optional<uint64_t> insertByte =
+                ComputeChildBoundaryInsertByte(p, file, &childBoundaryWitness)) {
+          if (*insertByte <= fileLen && anchorMatchesCondArmCert(*insertByte)) {
+            InsertAnchorCandidate candidate;
+            candidate.path = AcceptedPathKind::IncludeInsertChildBoundary;
+            candidate.anchorByte = *insertByte;
+            candidate.witness = childBoundaryWitness;
+            candidate.witness.hasAnchorByte = true;
+            candidate.witness.anchorByte = *insertByte;
+            traceInsertCandidate(candidate, "child-boundary");
+            topTierCandidates.push_back(std::move(candidate));
+          }
+        }
 
-          trace("include/apply",
-                "file={0} patch[{1}] INSERT: anchored at selected-arm boundary groupBegin={2} inventory={3}",
-                file, idx, insertByte,
-                includeInventoryFor(
-                    AcceptedPathKind::IncludeInsertSelectedConditionalBoundary,
-                    &witness));
+        if (auto selected = selectBestInsertCandidate(topTierCandidates)) {
+          commitInsertCandidate(*selected);
           continue;
         }
       }
 
-      // First, if this INSERT PP gap lies on a boundary between this header
-      // and one of its direct child includes, prefer anchoring at the child's
-      // include-site byte position. This avoids placing boundary insertions at
-      // the next mapped PP token in the header, which is often *after* the
-      // child include directive (since tokens from the included file do not map
-      // back to this header).
-      IncludeAnchorWitness childBoundaryWitness;
-      if (const std::optional<uint64_t> insertByte =
-              ComputeChildBoundaryInsertByte(p, file, &childBoundaryWitness)) {
-        if (*insertByte <= fileLen && anchorMatchesCondArmCert(*insertByte)) {
-          childBoundaryWitness.hasAnchorByte = true;
-          childBoundaryWitness.anchorByte = *insertByte;
-          std::string text =
-              PadAtBoundaries(headerText, static_cast<size_t>(*insertByte),
-                              static_cast<size_t>(*insertByte), p.insertBytes,
-                              /* allowLeft */ true, /* allowRight */ true);
-          plan.edits.push_back(MakeTextEditWithResyncOrPending(
-              headerText, *insertByte, *insertByte, text, file));
-
-          trace("include/apply",
-                "file={0} patch[{1}] INSERT: anchored via child boundary at "
-                "byte={2} inventory={3}",
-                file, idx, insertByte,
-                includeInventoryFor(AcceptedPathKind::IncludeInsertChildBoundary,
-                                    &childBoundaryWitness));
-          continue;
-        }
-      }
-
-      // 1) Prefer the right neighbor: smallest pp >= pos in [ppLo, ppHi).
+      std::optional<uint64_t> rightAnchorPP;
       for (uint64_t pp = std::max(pos, ppLo); pp < ppHi; ++pp) {
         auto it = tokmapByPP.find(pp);
         if (it != tokmapByPP.end() && PathsEqual(it->second.file, file)) {
-          anchorPP = pp;
+          rightAnchorPP = pp;
           break;
         }
       }
 
-      if (anchorPP) {
-        // Insert immediately before the right neighbor token.
-        startByte = ByteStartForPPInFile(file, *anchorPP,
-                                         /* fallbackToEOF */ false, fileLen);
+      if (rightAnchorPP) {
+        const std::optional<uint64_t> rightStartByte =
+            ByteStartForPPInFile(file, *rightAnchorPP,
+                                 /* fallbackToEOF */ false, fileLen);
         IncludeAnchorWitness rightNeighborWitness;
         rightNeighborWitness.evidence = IncludeAnchorEvidenceKind::RightNeighborPP;
-        rightNeighborWitness.hasNeighborPP = anchorPP.has_value();
-        rightNeighborWitness.neighborPP = anchorPP ? *anchorPP : 0ULL;
-        rightNeighborWitness.hasAnchorByte = startByte.has_value();
-        rightNeighborWitness.anchorByte = startByte ? *startByte : 0ULL;
+        rightNeighborWitness.hasNeighborPP = true;
+        rightNeighborWitness.neighborPP = *rightAnchorPP;
+        rightNeighborWitness.hasAnchorByte = rightStartByte.has_value();
+        rightNeighborWitness.anchorByte = rightStartByte ? *rightStartByte : 0ULL;
         trace("include/apply",
-              "file={0} patch[{1}] INSERT: right-neighbor anchorPP={2} -> "
-              "startByte={3} inventory={4}",
-              file, idx, anchorPP, startByte,
+              "file={0} patch[{1}] INSERT: right-neighbor anchorPP={2} -> startByte={3} inventory={4}",
+              file, idx, rightAnchorPP, rightStartByte,
               includeInventoryFor(AcceptedPathKind::IncludeInsertRightNeighborPP,
                                   &rightNeighborWitness));
-        if (!startByte) {
+        if (!rightStartByte) {
           plan.requiresIncludeRealization = true;
           plan.realizationReason =
               llvm::formatv("INSERT: failed to map anchorPP={0} in file {1}",
-                            anchorPP ? *anchorPP : 0ULL, file)
+                            *rightAnchorPP, file)
                   .str();
           return plan;
         }
-        if (!anchorMatchesCondArmCert(*startByte))
-          startByte.reset();
-      }
-
-      if (!startByte) {
-        anchorPP.reset();
-
-        // 2) No usable right neighbor; fall back to the last left neighbor.
-        if (pos > ppLo && ppHi > ppLo) {
-          for (uint64_t pp = std::min(pos - 1, ppHi - 1);; --pp) {
-            auto it = tokmapByPP.find(pp);
-            if (it != tokmapByPP.end() && PathsEqual(it->second.file, file)) {
-              anchorPP = pp;
-              break;
-            }
-            if (pp == ppLo)
-              break;
-          }
-        }
-
-        if (anchorPP) {
-          startByte = ByteEndForPPInFile(file, *anchorPP, false, fileLen);
-          IncludeAnchorWitness leftNeighborWitness;
-          leftNeighborWitness.evidence = IncludeAnchorEvidenceKind::LeftNeighborPP;
-          leftNeighborWitness.hasNeighborPP = anchorPP.has_value();
-          leftNeighborWitness.neighborPP = anchorPP ? *anchorPP : 0ULL;
-          leftNeighborWitness.hasAnchorByte = startByte.has_value();
-          leftNeighborWitness.anchorByte = startByte ? *startByte : 0ULL;
-          trace("include/apply",
-                "file={0} patch[{1}] INSERT: left-neighbor anchorPP={2} -> "
-                "startByte={3} inventory={4}",
-                file, idx, anchorPP, startByte,
-                includeInventoryFor(AcceptedPathKind::IncludeInsertLeftNeighborPP,
-                                    &leftNeighborWitness));
-          if (!startByte) {
-            plan.requiresIncludeRealization = true;
-            plan.realizationReason =
-                llvm::formatv("INSERT: failed to map left-neighbor "
-                              "anchorPP={0} in file {1}",
-                              anchorPP ? *anchorPP : 0ULL, file)
-                    .str();
-            return plan;
-          }
-          if (!anchorMatchesCondArmCert(*startByte))
-            startByte.reset();
-        } else if (decl) {
-          // 3) No PP neighbor at all in this header, but we have an owning
-          // decl: anchor at the end of its header span.
-          startByte = std::clamp<uint64_t>(decl->headerE, 0ULL, fileLen);
-          IncludeAnchorWitness declWitness;
-          declWitness.evidence = IncludeAnchorEvidenceKind::DeclBoundary;
-          declWitness.hasAnchorByte = startByte.has_value();
-          declWitness.anchorByte = startByte ? *startByte : 0ULL;
-          declWitness.hasDeclHeaderRange = true;
-          declWitness.declHeaderB = decl->headerB;
-          declWitness.declHeaderE = decl->headerE;
-          trace(
-              "include/apply",
-              "file={0} patch[{1}] INSERT: no neighbors; anchor at declEnd={2} inventory={3}",
-              file, idx, startByte,
-              includeInventoryFor(AcceptedPathKind::IncludeInsertDeclBoundary,
-                                  &declWitness));
-          if (!anchorMatchesCondArmCert(*startByte))
-            startByte.reset();
+        if (anchorMatchesCondArmCert(*rightStartByte)) {
+          InsertAnchorCandidate candidate;
+          candidate.path = AcceptedPathKind::IncludeInsertRightNeighborPP;
+          candidate.anchorByte = *rightStartByte;
+          candidate.witness = rightNeighborWitness;
+          traceInsertCandidate(candidate, "right-neighbor");
+          commitInsertCandidate(candidate);
+          continue;
         }
       }
 
-      if (!startByte) {
-        // 4) Fallback: use child '#include' sites inside this header as
-        // synthetic anchors.
-        IncludeAnchorWitness childBoundaryWitness;
-        const std::optional<uint64_t> insertByte =
-            ComputeChildBoundaryInsertByte(p, file, &childBoundaryWitness);
-        debug("include/apply.", "inserted byte {0}", insertByte);
-        if (insertByte && *insertByte <= fileLen &&
-            anchorMatchesCondArmCert(*insertByte)) {
-          std::string text =
-              PadAtBoundaries(headerText, static_cast<size_t>(*insertByte),
-                              static_cast<size_t>(*insertByte), p.insertBytes,
-                              /* allowLeft */ true, /* allowRight */ true);
-          plan.edits.push_back(MakeTextEditWithResyncOrPending(
-              headerText, *insertByte, *insertByte, text, file));
+      std::optional<uint64_t> leftAnchorPP;
+      if (pos > ppLo && ppHi > ppLo) {
+        for (uint64_t pp = std::min(pos - 1, ppHi - 1);; --pp) {
+          auto it = tokmapByPP.find(pp);
+          if (it != tokmapByPP.end() && PathsEqual(it->second.file, file)) {
+            leftAnchorPP = pp;
+            break;
+          }
+          if (pp == ppLo)
+            break;
+        }
+      }
 
-          childBoundaryWitness.hasAnchorByte = true;
-          childBoundaryWitness.anchorByte = *insertByte;
-          debug("include/apply.",
-                "file={0} patch[{1}] INSERT: anchored via child boundary at "
-                "byte={2} inventory={3}",
-                file, idx, insertByte,
-                includeInventoryFor(AcceptedPathKind::IncludeInsertChildBoundary,
-                                    &childBoundaryWitness));
-        } else {
-          // Preserve old behavior if we still can't place it
-          // deterministically.
-          debug("include/apply.",
-                "file={0} patch[{1}] INSERT: no neighbors, no decl, no child "
-                "boundary; SKIP",
-                file, idx);
+      SmallVector<InsertAnchorCandidate, 2> fallbackCandidates;
+      if (leftAnchorPP) {
+        const std::optional<uint64_t> leftStartByte =
+            ByteEndForPPInFile(file, *leftAnchorPP, false, fileLen);
+        IncludeAnchorWitness leftNeighborWitness;
+        leftNeighborWitness.evidence = IncludeAnchorEvidenceKind::LeftNeighborPP;
+        leftNeighborWitness.hasNeighborPP = true;
+        leftNeighborWitness.neighborPP = *leftAnchorPP;
+        leftNeighborWitness.hasAnchorByte = leftStartByte.has_value();
+        leftNeighborWitness.anchorByte = leftStartByte ? *leftStartByte : 0ULL;
+        trace("include/apply",
+              "file={0} patch[{1}] INSERT: left-neighbor anchorPP={2} -> startByte={3} inventory={4}",
+              file, idx, leftAnchorPP, leftStartByte,
+              includeInventoryFor(AcceptedPathKind::IncludeInsertLeftNeighborPP,
+                                  &leftNeighborWitness));
+        if (!leftStartByte) {
           plan.requiresIncludeRealization = true;
           plan.realizationReason =
-              llvm::formatv("INSERT: cannot anchor include patch in file "
-                            "{0} (no neighbors/decl/child boundary)",
-                            file)
+              llvm::formatv("INSERT: failed to map left-neighbor anchorPP={0} in file {1}",
+                            *leftAnchorPP, file)
                   .str();
           return plan;
         }
+        if (anchorMatchesCondArmCert(*leftStartByte)) {
+          InsertAnchorCandidate candidate;
+          candidate.path = AcceptedPathKind::IncludeInsertLeftNeighborPP;
+          candidate.anchorByte = *leftStartByte;
+          candidate.witness = leftNeighborWitness;
+          traceInsertCandidate(candidate, "left-neighbor");
+          fallbackCandidates.push_back(std::move(candidate));
+        }
+      } else if (decl) {
+        const uint64_t declAnchorByte =
+            std::clamp<uint64_t>(decl->headerE, 0ULL, fileLen);
+        IncludeAnchorWitness declWitness;
+        declWitness.evidence = IncludeAnchorEvidenceKind::DeclBoundary;
+        declWitness.hasAnchorByte = true;
+        declWitness.anchorByte = declAnchorByte;
+        declWitness.hasDeclHeaderRange = true;
+        declWitness.declHeaderB = decl->headerB;
+        declWitness.declHeaderE = decl->headerE;
+        trace("include/apply",
+              "file={0} patch[{1}] INSERT: no neighbors; anchor at declEnd={2} inventory={3}",
+              file, idx, declAnchorByte,
+              includeInventoryFor(AcceptedPathKind::IncludeInsertDeclBoundary,
+                                  &declWitness));
+        if (anchorMatchesCondArmCert(declAnchorByte)) {
+          InsertAnchorCandidate candidate;
+          candidate.path = AcceptedPathKind::IncludeInsertDeclBoundary;
+          candidate.anchorByte = declAnchorByte;
+          candidate.witness = declWitness;
+          traceInsertCandidate(candidate, "decl-boundary");
+          fallbackCandidates.push_back(std::move(candidate));
+        }
+      }
+
+      if (auto selected = selectBestInsertCandidate(fallbackCandidates)) {
+        commitInsertCandidate(*selected);
         continue;
       }
 
-      endByte = startByte;
+      debug("include/apply.",
+            "file={0} patch[{1}] INSERT: no admissible include-preserving anchor; realizing include",
+            file, idx);
+      plan.requiresIncludeRealization = true;
+      plan.realizationReason =
+          llvm::formatv("INSERT: cannot anchor include patch in file {0} "
+                        "(no admissible neighbors/decl/child boundary)",
+                        file)
+              .str();
+      return plan;
     } else {
       // DELETE / REPLACE: map non-empty A-range to byte range within this
       // header.

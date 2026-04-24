@@ -241,7 +241,6 @@ private:
     uint64_t expandedIncludes = 0;
     uint64_t totalMacros = 0;
     uint64_t expandedMacros = 0;
-    unsigned tier = 0;
     bool terminalFallbackToB = false;
   };
 
@@ -250,14 +249,13 @@ private:
   // Single-pass terminal-fallback scaffold: if any edit/patch cannot be
   // discharged into the declared proof/lattice outcomes in the current pass,
   // record the reason and fall back to emitting the fully expanded edited
-  // preprocessed stream (B). This keeps the engine fail-closed without routing
-  // through hidden retry tiers.
+  // preprocessed stream (B). This keeps the engine fail-closed.
   //
   // Note: the fallback is requested from several helper routines that are
   // logically "const" (for example include materialization). Treat the
   // fallback state as diagnostic/side-channel state via `mutable`.
-  mutable bool escalationRequested_ = false;
-  mutable std::vector<std::string> escalationReasons_;
+  mutable bool terminalFallbackRequested_ = false;
+  mutable std::vector<std::string> terminalFallbackReasons_;
   mutable TerminalFallbackKind terminalFallbackKind_ =
       TerminalFallbackKind::Unknown;
   mutable uint32_t terminalFallbackRequestCount_ = 0;
@@ -265,26 +263,17 @@ private:
   /// \brief Record that the current pass must fall back to the explicit
   /// terminal edited-preprocessed-stream result.
   ///
-  /// Step 12 removes the retry ladder, but it keeps one fail-closed terminal
-  /// outcome outside the declared completeness set. Helpers call this when
-  /// they cannot discharge an edit into the single-pass proof/lattice
-  /// outcomes.
-  void RequestEscalation(TerminalFallbackKind kind, llvm::StringRef phase,
-                         llvm::StringRef detail) const;
-  void RequestEscalation(llvm::StringRef phase, llvm::StringRef detail) const;
-
-  // Compatibility slot retained so existing statistics continue to report the
-  // execution mode. After Step 12 there is only one structural pass, so the
-  // recorded tier remains zero for successful refolds and one for the
-  // terminal fallback path.
-  unsigned escalationTier_ = 0;
+  /// Helpers call this when they cannot discharge an edit into one of the
+  /// single-pass proof/lattice outcomes.
+  void RequestTerminalFallback(TerminalFallbackKind kind, llvm::StringRef phase,
+                               llvm::StringRef detail) const;
 
   /// \brief Clear per-pass terminal-fallback state.
   ///
   /// This is invoked once before running the single structural pass.
-  void ResetEscalationState() const {
-    escalationRequested_ = false;
-    escalationReasons_.clear();
+  void ResetTerminalFallbackState() const {
+    terminalFallbackRequested_ = false;
+    terminalFallbackReasons_.clear();
     terminalFallbackKind_ = TerminalFallbackKind::Unknown;
     terminalFallbackRequestCount_ = 0;
   }
@@ -296,9 +285,7 @@ private:
   /// include total is the size of the recorded include tree. The macro total is
   /// the number of top-level macro invocation roots recorded during
   /// preprocessing, excluding nested expansion nodes that are attributable to an
-  /// outer caller via \c callerMacroId. The current escalation tier is also
-  /// snapshotted so that the emitted statistics reflect the tier under which
-  /// the attempt ran.
+  /// outer caller via \c callerMacroId.
   void ResetAttemptStats() {
     lastStats_ = RefoldStats{};
     lastStats_.totalIncludes = model_.GetIncludes().size();
@@ -306,7 +293,6 @@ private:
       if (!mi.callerMacroId)
         ++lastStats_.totalMacros;
     }
-    lastStats_.tier = escalationTier_;
   }
 
   /// Emit a one-line summary of the final refolding statistics.
@@ -314,14 +300,13 @@ private:
   /// The summary reports how many includes and top-level macro invocations
   /// remained expanded in the chosen refold result, relative to the total
   /// number of includes and root macro invocations recorded in the model. The
-  /// output also includes the escalation tier used for the winning attempt and
-  /// annotates the line when refolding terminated by falling back to the fully
+  /// line is annotated when refolding terminated by falling back to the fully
   /// expanded B-side text.
   void EmitRefoldStats() const {
     info("stats",
-         "includes-expanded={0}/{1} macros-expanded={2}/{3} tier={4}{5}",
+         "includes-expanded={0}/{1} macros-expanded={2}/{3}{4}",
          lastStats_.expandedIncludes, lastStats_.totalIncludes,
-         lastStats_.expandedMacros, lastStats_.totalMacros, lastStats_.tier,
+         lastStats_.expandedMacros, lastStats_.totalMacros,
          lastStats_.terminalFallbackToB ? " terminal-fallback=B" : "");
   }
 
@@ -469,10 +454,9 @@ private:
 
   /// \brief Run the single structural refold pass.
   ///
-  /// The outer \c Refold() method reacts to \c RequestEscalation() by
-  /// selecting the explicit terminal fallback, not by retrying under a more
-  /// conservative tier.
-  std::string RefoldOnce();
+  /// The caller reacts to \c RequestTerminalFallback() by selecting the
+  /// explicit terminal fallback result.
+  std::string RunSinglePassRefold();
 
   // ---------------------------- Small Data Records ---------------------------
 
@@ -589,9 +573,8 @@ private:
 
   /// \brief Ranking bucket for choosing among multiple valid candidates.
   ///
-  /// Preference is tracked separately from proof validity so later steps can
-  /// delete the escalation ladder without losing the current structural-vs-
-  /// realization ordering policy.
+  /// Preference is tracked separately from proof validity so ordering policy
+  /// remains explicit rather than being hidden in construction order.
   enum class SelectionPreference : uint8_t {
     Unknown,
     PreferStructurePreservation,
@@ -599,11 +582,11 @@ private:
     PreferExactAnchoring,
   };
 
-  /// \brief Legacy retry states kept distinct from proof metadata.
-  enum class LegacyEscalationDisposition : uint8_t {
+  /// \brief Surface realization choices kept distinct from proof metadata.
+  enum class SurfaceDisposition : uint8_t {
     None,
-    RetryWholeCoverMacros,
-    RetryInlineTouchedIncludesFromB,
+    RealizeWholeCoverMacros,
+    RealizeInlineTouchedIncludesFromB,
     EmitEditedPreprocessedStream,
   };
 
@@ -641,7 +624,7 @@ private:
     Unknown,
     ExplicitProofBacked,
     DeterministicButNotFirstClass,
-    LegacyTerminalFallback,
+    ExplicitOutOfDomainClass,
   };
 
   /// \brief Future proof-class placeholder targeted by a current path.
@@ -708,7 +691,7 @@ private:
     PreferStructurePreservation,
     PreferExactAnchorWitness,
     PreferOwnerPreservingBeforeRealization,
-    LastResortTerminalFallback,
+    ExplicitOutOfDomainTerminalResult,
   };
 
   /// \brief Normalized Step-10 description of the current global lattice law.
@@ -725,12 +708,12 @@ private:
   /// makes the scope of the completeness claim explicit: accepted paths either
   /// already correspond to a declared proof class, remain transitional while a
   /// class is still being closed, or sit outside the declared class set
-  /// entirely (for example the terminal edited-preprocessed fallback).
+  /// entirely (for example an explicit terminal out-of-domain result).
   enum class CompletenessCoverageKind : uint8_t {
     Unknown,
     DeclaredProofClass,
     TransitionalGap,
-    LegacyOutOfScopeFallback,
+    ExplicitOutOfDomainClass,
   };
 
   /// \brief What completeness promise the engine makes for a covered path.
@@ -748,6 +731,8 @@ private:
         CompletenessExpectationKind::Unknown;
     FutureProofTarget declaredTarget = FutureProofTarget::Unknown;
     bool countsTowardDeclaredCoverage = false;
+    bool hasExplicitExclusion = false;
+    TerminalFallbackKind explicitExclusion = TerminalFallbackKind::Unknown;
   };
 
   /// \brief Evidence source used to justify an accepted TU anchor.
@@ -921,7 +906,7 @@ private:
     TUProvableEvidenceTracked,
     TUOutsideIncludeCoverageTracked,
     TUOwnerDepthStableTracked,
-    LegacyFallbackExplicitlyTracked,
+    ExplicitOutOfDomainResultTracked,
   };
 
   /// \brief Why a local proof contract could not be discharged.
@@ -967,7 +952,7 @@ private:
     MissingTUProvableAnchorWitness,
     MissingTUOutsideIncludeCoverageProof,
     MissingTUOwnerDepthStability,
-    LegacyFallback,
+    ExplicitOutOfDomainResult,
   };
 
   /// \brief Compact record of Step 3 class-local obligation discharge.
@@ -994,14 +979,14 @@ private:
   /// In Step 1 this is descriptive metadata only. The legacy proof fields on
   /// concrete patch objects remain behaviorally authoritative so the refolder's
   /// semantics do not change while we separate proof class, realization mode,
-  /// selection preference, escalation history, and the current-path inventory
+  /// selection preference, surface disposition, and the current-path inventory
   /// introduced by Step 2.
   struct ProofSummary {
     AcceptedProofClass acceptedClass = AcceptedProofClass::Unknown;
     RealizationMode realizationMode = RealizationMode::Unknown;
     SelectionPreference preference = SelectionPreference::Unknown;
-    LegacyEscalationDisposition legacyEscalation =
-        LegacyEscalationDisposition::None;
+    SurfaceDisposition surfaceDisposition =
+        SurfaceDisposition::None;
     AcceptancePathInventory inventory;
     GlobalSelectionLattice lattice;
     CompletenessContract completeness;
@@ -2843,8 +2828,8 @@ private:
   StringRef FormatAcceptedProofClass(AcceptedProofClass kind) const;
   StringRef FormatRealizationMode(RealizationMode mode) const;
   StringRef FormatSelectionPreference(SelectionPreference preference) const;
-  StringRef FormatLegacyEscalationDisposition(
-      LegacyEscalationDisposition disposition) const;
+  StringRef FormatSurfaceDisposition(
+      SurfaceDisposition disposition) const;
   StringRef FormatAcceptedPathKind(AcceptedPathKind kind) const;
   StringRef FormatAcceptanceSupportKind(AcceptanceSupportKind support) const;
   StringRef FormatFutureProofTarget(FutureProofTarget target) const;
