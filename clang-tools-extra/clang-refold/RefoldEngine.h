@@ -929,12 +929,17 @@ private:
 
   /// \brief Evidence source used to justify an accepted include realization.
   ///
-  /// Step 9/12 model direct include realization from B as an explicit realized
-  /// proof path by recording the exact include cover and mapped B token
-  /// envelope that were used to materialize the include body.
+  /// Step 4A makes the include-realization domain boundary explicit. An inline
+  /// include realization is in-domain only when the include cover admits either
+  /// the canonical A-cover -> B-envelope mapping or one deterministic
+  /// consensus-rescue envelope recovered from the existing non-canonical
+  /// projections. Any include realization that cannot produce one of those two
+  /// witnesses remains outside the declared domain and must terminate via the
+  /// explicit terminal fallback instead of manufacturing a weaker proof class.
   enum class IncludeRealizationEvidenceKind : uint8_t {
     Unknown,
-    InlineFromBCoverEnvelope,
+    CanonicalBCoverEnvelope,
+    ConsensusRescuedBCoverEnvelope,
   };
 
   /// \brief Compact Step-9 witness for an accepted include realization path.
@@ -2706,8 +2711,11 @@ private:
   ///
   /// To stay fail-closed, this helper only accepts a rescue envelope when the
   /// available non-canonical projections agree on one non-empty B-token range.
-  /// Disagreement between rescue projections remains an explicit out-of-domain
-  /// terminal case rather than a guessed realization.
+  /// The returned evidence kind therefore states the full class predicate for
+  /// inline include realization: the witness must be either canonical or a
+  /// deterministic consensus rescue. Any unresolved or conflicting B-envelope
+  /// recovery remains an explicit out-of-domain terminal case rather than a
+  /// guessed realization.
   std::optional<std::pair<size_t, size_t>>
   ResolveIncludeRealizationBTokenEnvelope(
       uint64_t beginTok, uint64_t endTok,
@@ -3127,6 +3135,15 @@ private:
   ProofDischargeRecord ValidateIncludePreservingProof(
       AcceptedPathKind currentPath, const IncludePatch *patch,
       const IncludeAnchorWitness *witness = nullptr) const;
+  /// \brief Return whether an include-realization witness is inside the
+  /// declared Step-4A realization domain.
+  ///
+  /// Inline include realization is first-class only when the witness records a
+  /// canonical B-cover envelope or a deterministic consensus-rescued B-cover
+  /// envelope. Unknown evidence kinds remain outside the declared theorem
+  /// domain and must surface only through the explicit terminal fallback.
+  bool IsAcceptedIncludeRealizationEvidenceKind(
+      IncludeRealizationEvidenceKind kind) const;
   ProofDischargeRecord ValidateIncludeRealizationProof(
       AcceptedPathKind currentPath, const IncludePatch *patch,
       const IncludeRealizationWitness *witness = nullptr) const;
