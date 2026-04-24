@@ -1860,10 +1860,12 @@ std::string RefoldEngine::RunSinglePassRefold() {
           "#{0} dropping edit {1}: owner unresolved and no TU byte span "
           "available (no include guessing).",
           i, h);
-    // No declared macro/include/TU proof class can discharge an edit that has
-    // neither a resolved structural owner nor a provable TU anchor. Treat this
-    // as an explicit out-of-domain terminal result rather than silently
-    // synthesizing ownership.
+    // Step 5 chooses the honest theorem-boundary interpretation for this last
+    // ownership gap. By the time control reaches this branch, the engine has
+    // already failed to prove a macro owner, include owner, truthful TU-owned
+    // byte span, and (for pure insertions) an exact/provable TU insertion
+    // anchor. Do not manufacture a weaker success class here; terminate via
+    // the named out-of-domain boundary instead.
     RequestTerminalFallback(
         TerminalFallbackKind::OwnerUnresolvedNoTUAnchor, "classify",
         BuildOwnerUnresolvedNoTUAnchorDetail(i, h, tuPath, owner, mapsToTU));
@@ -9126,7 +9128,9 @@ RefoldEngine::BuildCompletenessContract(const ProofSummary &summary) const {
   // relative to every imaginable refolding. After step 3, any remaining
   // transitional path should be an internal non-emitting staging state;
   // emitted non-terminal artifacts are expected to land either in a declared
-  // proof class or in an explicit out-of-domain terminal result.
+  // proof class or in an explicit out-of-domain terminal result. Step 5 makes
+  // `OwnerUnresolvedNoTUAnchor` part of that explicit terminal boundary rather
+  // than leaving it as an implicit leftover ownership gap.
   if (summary.inventory.currentPath ==
           AcceptedPathKind::TerminalEmitEditedPreprocessedStream ||
       summary.inventory.support ==
@@ -10776,12 +10780,61 @@ RefoldEngine::BuildTerminalFallbackWitness() const {
   return witness;
 }
 
+bool RefoldEngine::IsOwnerUnresolvedNoTUAnchorOutOfDomain(
+    const diffutils::Hunk &h, StringRef tuPath, const Owner &owner,
+    bool mapsToTU) const {
+  // The declared domain excludes this case only after all deterministic owner
+  // and TU witness searches have already failed. This helper is intentionally
+  // derived-only: it does not invent new anchors or infer ownership from
+  // proximity.
+  if (owner.kind != OwnerKind::Unknown)
+    return false;
+
+  if (h.isInsertOnly()) {
+    if (BoundaryParentIncludeForPureInsertion(h))
+      return false;
+    if (mapsToTU)
+      return false;
+    if (FindProvableTUInsertionAnchor(h.aStart, tuPath))
+      return false;
+    if (TUByteSpan(h.aStart, h.aEnd, tuPath))
+      return false;
+    return true;
+  }
+
+  if (mapsToTU)
+    return false;
+  if (TUByteSpan(h.aStart, h.aEnd, tuPath))
+    return false;
+  return true;
+}
+
 std::string RefoldEngine::BuildOwnerUnresolvedNoTUAnchorDetail(
     size_t hunkIndex, const diffutils::Hunk &h, StringRef tuPath,
     const Owner &owner, bool mapsToTU) const {
   const bool isInsertion = h.aStart == h.aEnd;
+  // Reaching this detail builder already means the earlier macro-owner and
+  // include-owner searches failed to claim the edit. Record that control-flow
+  // fact explicitly so the terminal witness states the declared domain wall in
+  // theorem terms rather than only in terms of the final `Owner` enum.
+  const bool macroOwnerExhausted = true;
+  const bool includeOwnerExhausted = owner.kind != OwnerKind::Include;
+
+  const RefoldModel::IncludeItem *boundaryInc = nullptr;
+  if (isInsertion)
+    boundaryInc = BoundaryParentIncludeForPureInsertion(h);
+  const bool hasBoundaryInclude = boundaryInc != nullptr;
+
+  std::optional<uint64_t> provableInsertionAnchor;
+  if (isInsertion)
+    provableInsertionAnchor = FindProvableTUInsertionAnchor(h.aStart, tuPath);
+  const bool hasProvableInsertionAnchor = provableInsertionAnchor.has_value();
+
   std::optional<std::pair<uint64_t, uint64_t>> tuSpan =
       TUByteSpan(h.aStart, h.aEnd, tuPath);
+  const bool hasTUByteSpan = tuSpan.has_value();
+  const bool declaredDomainWall =
+      IsOwnerUnresolvedNoTUAnchorOutOfDomain(h, tuPath, owner, mapsToTU);
 
   std::string exactSlot = "n/a";
   std::string insertionAnchor = "n/a";
@@ -10792,13 +10845,13 @@ std::string RefoldEngine::BuildOwnerUnresolvedNoTUAnchorDetail(
     else
       exactSlot = "none";
 
-    if (auto anchor = FindProvableTUInsertionAnchor(h.aStart, tuPath))
-      insertionAnchor = llvm::formatv("{0}", *anchor).str();
+    if (provableInsertionAnchor)
+      insertionAnchor = llvm::formatv("{0}", *provableInsertionAnchor).str();
     else
       insertionAnchor = "none";
 
-    if (const auto *inc = BoundaryParentIncludeForPureInsertion(h))
-      boundaryParent = llvm::formatv("inc#{0}", inc->id).str();
+    if (boundaryInc)
+      boundaryParent = llvm::formatv("inc#{0}", boundaryInc->id).str();
     else
       boundaryParent = "none";
   }
@@ -10808,12 +10861,17 @@ std::string RefoldEngine::BuildOwnerUnresolvedNoTUAnchorDetail(
              : std::string("none");
 
   return llvm::formatv(
-             "edit #{0} A=[{1},{2}) insert={3} owner={4} mapsToTU={5} "
-             "TUByteSpan={6} exactSlot={7} insertionAnchor={8} "
-             "boundaryParentInclude={9}",
+             "edit #{0} A=[{1},{2}) insert={3} owner={4} macroOwnerExhausted={5} "
+             "includeOwnerExhausted={6} mapsToTU={7} TUByteSpan={8} hasTUByteSpan={9} "
+             "exactSlot={10} insertionAnchor={11} hasProvableInsertionAnchor={12} "
+             "boundaryParentInclude={13} hasBoundaryInclude={14} declaredDomainWall={15}",
              hunkIndex, h.aStart, h.aEnd, isInsertion ? "yes" : "no",
-             toString(owner.kind), mapsToTU ? "yes" : "no", tuSpanStr,
-             exactSlot, insertionAnchor, boundaryParent)
+             toString(owner.kind), macroOwnerExhausted ? "yes" : "no",
+             includeOwnerExhausted ? "yes" : "no", mapsToTU ? "yes" : "no",
+             tuSpanStr, hasTUByteSpan ? "yes" : "no", exactSlot,
+             insertionAnchor, hasProvableInsertionAnchor ? "yes" : "no",
+             boundaryParent, hasBoundaryInclude ? "yes" : "no",
+             declaredDomainWall ? "yes" : "no")
       .str();
 }
 
