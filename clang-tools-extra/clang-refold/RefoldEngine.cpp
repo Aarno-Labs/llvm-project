@@ -5690,6 +5690,10 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyPasteMulti,
                              /*validated=*/true,
                              /*structurePreserving=*/true, m.id);
+        // The builder already proved this rewrite by replaying the rewritten
+        // invocation arguments against every pasted token occurrence in B.
+        // Carry that proof source onto the accepted patch for Patch C.
+        patch.pasteReplayValidated = true;
         return patch;
       }
       }
@@ -5742,6 +5746,10 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyPasteSingle,
                              /*validated=*/true,
                              /*structurePreserving=*/true, m.id);
+        // Single-segment paste rewrites are admitted only after direct replay
+        // validation against all touched occurrences in B. Record that proof
+        // source explicitly for the Patch C discharge gate.
+        patch.pasteReplayValidated = true;
         return patch;
       }
     }
@@ -5870,6 +5878,9 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
                            MacroPatchProofKind::ArgsOnlyPurePasteOnly,
                            /*validated=*/true,
                            /*structurePreserving=*/true, m.id);
+      // Pure-paste-only rewrites have no standard or stringify occurrences to
+      // lean on, so successful all-paste replay is the decisive proof source.
+      patch.pasteReplayValidated = true;
       return patch;
     }
   }
@@ -9024,11 +9035,23 @@ bool RefoldEngine::LatticePrefers(const ProofSummary &lhs,
 
 bool RefoldEngine::IsSelectableAcceptedResultCandidate(
     const AcceptedResultCandidate &candidate) const {
-  // Patch B only converts how already-accepted outcomes are compared. It does
-  // not yet tighten acceptance to discharged-only proof summaries; that is left
-  // for the later Patch-C closure step. As a result, any concrete accepted
-  // candidate wrapper is admissible here as long as it names a real artifact.
-  return candidate.kind != AcceptedResultCandidateKind::Unknown;
+  if (candidate.kind == AcceptedResultCandidateKind::Unknown)
+    return false;
+
+  const ProofDischargeRecord &discharge = candidate.proofSummary.discharge;
+  if (discharge.status == ProofDischargeStatus::Discharged)
+    return true;
+
+  // Patch C makes discharge the participation gate for converted selector
+  // sites, but the one explicit terminal out-of-domain result is still allowed
+  // to flow through the normalized candidate carrier so the terminal theorem
+  // boundary stays named and auditable.
+  return candidate.kind == AcceptedResultCandidateKind::TerminalOutOfDomain &&
+         discharge.status == ProofDischargeStatus::Rejected &&
+         discharge.failedObligation ==
+             ProofObligationKind::ExplicitOutOfDomainResultTracked &&
+         discharge.failureReason ==
+             ProofFailureReason::ExplicitOutOfDomainResult;
 }
 
 bool RefoldEngine::AcceptedResultCandidatePrefers(
@@ -9072,6 +9095,11 @@ bool RefoldEngine::AcceptedResultCandidatePrefers(
 std::optional<size_t> RefoldEngine::SelectPreferredAcceptedResultCandidateIndex(
     ArrayRef<AcceptedResultCandidate> candidates) const {
   std::optional<size_t> bestIdx;
+
+  // The caller still controls enumeration order. This selector only filters
+  // that list to candidates whose proof summaries are allowed to participate,
+  // then applies the normalized lattice/tie-break ordering while preserving
+  // stable caller order when the candidates remain indistinguishable.
 
   for (size_t i = 0; i < candidates.size(); ++i) {
     if (!IsSelectableAcceptedResultCandidate(candidates[i]))
@@ -9166,11 +9194,60 @@ RefoldEngine::BuildAcceptedTerminalCandidate(
 bool RefoldEngine::MacroInvocationHasWellFormedPasteWitnesses(
     const RefoldModel::MacroInvocation &m) const {
   // Step 6 consumes the exact `paste_tokens` witnesses serialized in Step 5.
-  // A usable witness stream must describe each pasted token as one contiguous
-  // partition of its final spelling, and any argument-derived fragment must
-  // name a formal that exists on the invocation.
+  // The producer records the argument-derived fragments of each pasted token,
+  // but it does not need to emit the literal glue bytes that came from the
+  // macro body itself. For example, `X##_##Y` may serialize only the `X` and
+  // `Y` slices while leaving the `_` as an uncovered gap in the final spelling.
+  //
+  // The witness stream is therefore usable when each recorded fragment is
+  // ordered, non-overlapping, non-empty, and stays within the pasted token's
+  // spelling, and when every argument-derived fragment names a valid formal.
+  // Requiring a contiguous partition of the final spelling would incorrectly
+  // reject perfectly valid producer witnesses for common paste patterns.
+  //
+  // There is one additional producer-side case that must also be treated as
+  // witness-backed: a parent invocation can carry `pasteSpans` that are only
+  // propagated child-paste contributors inside a standard occurrence of the
+  // same parent formal. Those spans are validated at the child/current-surface
+  // level by the existing args-only safety gates and do not require a direct
+  // parent-level `paste_tokens` decomposition.
+  auto hasOnlyPropagatedChildPasteSpans = [&]() -> bool {
+    if (m.pasteSpans.empty())
+      return false;
+
+    DenseMap<uint32_t, SmallVector<std::pair<uint64_t, uint64_t>, 4>>
+        standardOccByteRangesByArg;
+    for (const auto &occ : m.argSpans) {
+      if (occ.kind != PPArgSpanKind::Standard || !occ.ppByteBegin ||
+          !occ.ppByteEnd)
+        continue;
+      standardOccByteRangesByArg[occ.argIdx].push_back(
+          {static_cast<uint64_t>(*occ.ppByteBegin),
+           static_cast<uint64_t>(*occ.ppByteEnd)});
+    }
+
+    bool sawPasteSpan = false;
+    for (const auto &ps : m.pasteSpans) {
+      sawPasteSpan = true;
+      if (!ps.ppByteBegin || !ps.ppByteEnd)
+        return false;
+
+      auto stdIt = standardOccByteRangesByArg.find(ps.argIdx);
+      if (stdIt == standardOccByteRangesByArg.end())
+        return false;
+
+      const std::pair<uint64_t, uint64_t> spanBytes = {
+          static_cast<uint64_t>(*ps.ppByteBegin),
+          static_cast<uint64_t>(*ps.ppByteEnd)};
+      if (!llvm::is_contained(stdIt->second, spanBytes))
+        return false;
+    }
+
+    return sawPasteSpan;
+  };
+
   if (m.pasteTokens.empty())
-    return false;
+    return hasOnlyPropagatedChildPasteSpans();
 
   llvm::SmallDenseSet<uint32_t, 8> pasteSpanArgIndices;
   for (const auto &ps : m.pasteSpans)
@@ -9180,11 +9257,15 @@ bool RefoldEngine::MacroInvocationHasWellFormedPasteWitnesses(
     if (tok.spelling.empty() || tok.parts.empty())
       return false;
 
-    uint32_t cursor = 0;
+    uint32_t prevEnd = 0;
     bool sawArgDerivedPart = false;
     for (const auto &part : tok.parts) {
-      if (part.byteBegin != cursor || part.byteEnd < part.byteBegin ||
-          part.byteEnd > tok.spelling.size() || part.byteBegin == part.byteEnd)
+      if (part.byteEnd <= part.byteBegin || part.byteEnd > tok.spelling.size())
+        return false;
+
+      // Parts must remain in producer order and may be adjacent or separated by
+      // literal macro-body glue, but they must never overlap or move backward.
+      if (part.byteBegin < prevEnd)
         return false;
 
       if (part.argIndex) {
@@ -9196,13 +9277,10 @@ bool RefoldEngine::MacroInvocationHasWellFormedPasteWitnesses(
         sawArgDerivedPart = true;
       }
 
-      cursor = part.byteEnd;
+      prevEnd = part.byteEnd;
     }
 
-    if (cursor != tok.spelling.size())
-      return false;
-
-    // A pasted token witness that never attributes any bytes back to a formal
+    // A pasted-token witness that never attributes any bytes back to a formal
     // is not useful for args-only paste preservation.
     if (!sawArgDerivedPart)
       return false;
@@ -9253,18 +9331,30 @@ RefoldEngine::ValidateInvocationPreservingProof(const MacroPatch &patch) const {
 
   case MacroPatchProofKind::ArgsOnlyPasteSingle:
   case MacroPatchProofKind::ArgsOnlyPasteMulti:
-  case MacroPatchProofKind::ArgsOnlyPurePasteOnly:
-    // Paste-preserving classes must now be backed by the exact Step-5
-    // `paste_tokens` witness stream for the root invocation.
+  case MacroPatchProofKind::ArgsOnlyPurePasteOnly: {
+    // Paste-preserving args-only classes can be discharged from either of the
+    // two deterministic proof sources the builder already relies on today:
+    //
+    // * a usable producer-side root `paste_tokens` witness stream
+    // * or a direct replay proof recorded on the accepted patch after the
+    //   rewritten invocation arguments were shown to reconstruct the edited
+    //   B-side pasted tokens exactly
+    //
+    // Wrapper/variadic chains such as XSTR(XCAT(...)) legitimately use the
+    // second source when the root invocation carries propagated paste spans
+    // but no standalone root-level `paste_tokens` decomposition.
     discharge.Require(root && !root->pasteSpans.empty(),
                       ProofObligationKind::MacroPasteWitnessPresent,
                       ProofFailureReason::MissingPasteWitness);
     if (root && !root->pasteSpans.empty()) {
-      discharge.Require(MacroInvocationHasWellFormedPasteWitnesses(*root),
+      const bool hasProducerWitness =
+          MacroInvocationHasWellFormedPasteWitnesses(*root);
+      discharge.Require(hasProducerWitness || patch.pasteReplayValidated,
                         ProofObligationKind::MacroPasteWitnessWellFormed,
                         ProofFailureReason::MalformedPasteWitness);
     }
     break;
+  }
 
   case MacroPatchProofKind::ArgsOnlyPairedPureInsertion:
     // Paired pure insertion is only valid on non-paste direct arg/stringify
@@ -10471,10 +10561,11 @@ std::string RefoldEngine::FormatMacroPatchAudit(const MacroPatch &patch) const {
              "lexicalBridge={21} paste={22} wrappers={23} stringify={24} "
              "wideStringify={25} childSyntax={26} rawInvocation={27} "
              "passthrough={28} bridgeSensitive={29} "
-             "deferredPasteDischarged={30} admissible={31} expRootN={32} "
-             "deferredRootN={33} bridgeFormalN={34} expRoot={35} "
-             "deferredRootArgs={36} bridgeFormals={37} wholeCoverA=[{38},{39}) "
-             "wholeCoverBraw=[{40},{41}) wholeCoverBadj=[{42},{43})",
+             "deferredPasteDischarged={30} admissible={31} "
+             "pasteReplayValidated={32} expRootN={33} "
+             "deferredRootN={34} bridgeFormalN={35} expRoot={36} "
+             "deferredRootArgs={37} bridgeFormals={38} wholeCoverA=[{39},{40}) "
+             "wholeCoverBraw=[{41},{42}) wholeCoverBadj=[{43},{44})",
              FormatMacroPatchProofKind(patch.proofKind),
              FormatAcceptedProofClass(summary.acceptedClass),
              FormatRealizationMode(summary.realizationMode),
@@ -10502,6 +10593,7 @@ std::string RefoldEngine::FormatMacroPatchAudit(const MacroPatch &patch) const {
              patch.subtreeHasBridgeSensitiveStructuredSemantics ? 1 : 0,
              patch.subtreeDeferredPasteDischarged ? 1 : 0,
              patch.subtreeAdmissible ? 1 : 0,
+             patch.pasteReplayValidated ? 1 : 0,
              patch.subtreeExpectedRootFormalCount,
              patch.subtreeDeferredRootArgCount,
              patch.subtreeBridgeSensitiveFormalCount,
@@ -20067,10 +20159,11 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     return "unknown";
   };
 
-  // Patch B makes the final macro-return site operate on explicit accepted
-  // candidates rather than on a chain of early returns. The candidate list is
-  // still built from the legacy admissibility checks above; only the final
-  // arbitration is moved under the normalized lattice comparator.
+  // Patch B moved the final macro-return site onto explicit accepted
+  // candidates rather than a chain of early returns. Patch C keeps the
+  // existing candidate discovery logic above, but now only candidates whose
+  // declared proof summaries discharge successfully may participate in the
+  // final lattice arbitration.
   SmallVector<FinalMacroCandidate, 5> finalMacroCandidates;
   auto addFinalMacroCandidate = [&](const MacroPatch &patch,
                                    FinalMacroCandidateOrigin origin) {
@@ -20122,8 +20215,13 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
   const std::optional<size_t> selectedIdx =
       SelectPreferredAcceptedResultCandidateIndex(acceptedCandidates);
-  if (!selectedIdx)
+  if (!selectedIdx) {
+    trace("macro/proof",
+          "no final macro candidate survived proof-discharge gating: inv id={0} "
+          "name={1} candidates={2}",
+          m.id, m.name, finalMacroCandidates.size());
     return std::nullopt;
+  }
 
   const FinalMacroCandidate &selected = finalMacroCandidates[*selectedIdx];
   trace("macro/proof",
@@ -20676,9 +20774,9 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       };
 
       // Patch A introduced the normalized include candidate carrier. Patch B
-      // starts using that carrier here so concrete anchor choices are compared
-      // through the shared accepted-result selector instead of by local
-      // construction order.
+      // moved this anchor competition onto the shared selector, and Patch C
+      // now requires each wrapped anchor candidate to discharge its local
+      // include-preserving proof obligations before it can participate.
       auto traceInsertCandidate = [&](const InsertAnchorCandidate &candidate,
                                       StringRef stage) {
         const AcceptedResultCandidate acceptedCandidate =
@@ -20705,8 +20803,13 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
 
         const std::optional<size_t> bestIdx =
             SelectPreferredAcceptedResultCandidateIndex(acceptedCandidates);
-        if (!bestIdx)
+        if (!bestIdx) {
+          trace("include/apply",
+                "file={0} patch[{1}] INSERT: no candidate survived proof-discharge "
+                "gating",
+                file, idx);
           return std::nullopt;
+        }
 
         trace("include/apply",
               "file={0} patch[{1}] INSERT: selected candidate anchorByte={2} candidate={3}",
