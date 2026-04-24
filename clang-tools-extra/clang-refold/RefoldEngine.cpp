@@ -711,6 +711,10 @@ void RefoldEngine::EnforceTheoremAuditInvariants() const {
     NoteTheoremAuditViolation(
         "emitted edit relied on selector-only exception carrier");
   }
+  if (lastTheoremAudit_.emittedTransitionalTheoremCarriers != 0) {
+    NoteTheoremAuditViolation(
+        "emitted edit carried transitional theorem-facing artifact");
+  }
   if (lastTheoremAudit_.emittedUnknownClassCarriers != 0) {
     NoteTheoremAuditViolation(
         "emitted edit carried unknown-class theorem artifact");
@@ -723,6 +727,14 @@ void RefoldEngine::EnforceTheoremAuditInvariants() const {
     NoteTheoremAuditViolation(
         "non-terminal emitted edit carried explicit out-of-domain theorem artifact");
   }
+  if (lastTheoremAudit_.selectorUnresolvedCompetitions != 0) {
+    NoteTheoremAuditViolation(
+        "selector competition ended without a lattice-selected winner");
+  }
+  if (lastTheoremAudit_.nonExplicitTerminalExclusions != 0) {
+    NoteTheoremAuditViolation(
+        "terminal fallback was not classified as an explicit out-of-domain theorem result");
+  }
 
   if (!strict_ || terminalFallbackRequested_ ||
       lastTheoremAudit_.theoremSatisfied) {
@@ -734,6 +746,52 @@ void RefoldEngine::EnforceTheoremAuditInvariants() const {
                           BuildTheoremAuditInvariantDetail());
 }
 
+void RefoldEngine::RecordTerminalFallbackTheoremAudit() const {
+  if (!terminalFallbackRequested_)
+    return;
+
+  const TerminalFallbackWitness witness = BuildTerminalFallbackWitness();
+  const AcceptedResultCandidate candidate =
+      BuildAcceptedTerminalCandidate(witness);
+  const ProofSummary &summary = candidate.proofSummary;
+
+  // Step 8 requires the terminal exclusion to remain explicit all the way
+  // through the normalized proof carrier. Merely requesting fallback is not
+  // sufficient; the resulting terminal witness must classify as the named
+  // explicit out-of-domain theorem result.
+  const bool explicitTerminalCarrier =
+      candidate.kind == AcceptedResultCandidateKind::TerminalOutOfDomain &&
+      summary.inventory.currentPath ==
+          AcceptedPathKind::TerminalEmitEditedPreprocessedStream &&
+      summary.inventory.support ==
+          AcceptanceSupportKind::ExplicitOutOfDomainClass &&
+      summary.completeness.coverage ==
+          CompletenessCoverageKind::ExplicitOutOfDomainClass &&
+      summary.theoremDomain.kind ==
+          TheoremDomainKind::ExplicitOutOfDomainClass &&
+      summary.theoremDomain.hasExplicitExclusion &&
+      summary.theoremDomain.explicitExclusion != TerminalFallbackKind::Unknown &&
+      summary.theoremDomain.explicitExclusion == witness.kind &&
+      summary.hasTerminalFallbackWitness &&
+      summary.discharge.status == ProofDischargeStatus::Rejected &&
+      summary.discharge.failedObligation ==
+          ProofObligationKind::ExplicitOutOfDomainResultTracked &&
+      summary.discharge.failureReason ==
+          ProofFailureReason::ExplicitOutOfDomainResult;
+
+  if (explicitTerminalCarrier) {
+    ++lastTheoremAudit_.explicitTerminalExclusions;
+    return;
+  }
+
+  ++lastTheoremAudit_.nonExplicitTerminalExclusions;
+  NoteTheoremAuditViolation(llvm::formatv(
+                               "terminal fallback escaped theorem-domain classification: witness={0} candidate={1}",
+                               FormatTerminalFallbackWitness(witness),
+                               FormatAcceptedResultCandidate(candidate))
+                               .str());
+}
+
 std::string RefoldEngine::BuildTheoremAuditInvariantDetail() const {
   const std::string firstViolation =
       lastTheoremAudit_.firstViolation.empty()
@@ -742,13 +800,17 @@ std::string RefoldEngine::BuildTheoremAuditInvariantDetail() const {
 
   return llvm::formatv(
              "strict theorem-audit invariant violation: firstViolation='{0}' "
-             "selectorDirectBypasses={1} selectorOnlyExceptions={2} "
-             "undischarged={3} unknownClass={4} outOfDomain={5}",
+             "selectorDirectBypasses={1} selectorOnlyExceptions={2} transitional={3} "
+             "undischarged={4} unknownClass={5} outOfDomain={6} "
+             "selectorUnresolved={7} nonExplicitTerminalExclusions={8}",
              firstViolation, lastTheoremAudit_.selectorDirectBypasses,
              lastTheoremAudit_.emittedSelectorOnlyExceptionCarriers,
+             lastTheoremAudit_.emittedTransitionalTheoremCarriers,
              lastTheoremAudit_.emittedUndischargedCarriers,
              lastTheoremAudit_.emittedUnknownClassCarriers,
-             lastTheoremAudit_.emittedOutOfDomainCarriers)
+             lastTheoremAudit_.emittedOutOfDomainCarriers,
+             lastTheoremAudit_.selectorUnresolvedCompetitions,
+             lastTheoremAudit_.nonExplicitTerminalExclusions)
       .str();
 }
 
@@ -956,6 +1018,13 @@ std::string RefoldEngine::Refold() {
 
   std::string out = RunSinglePassRefold();
 
+  // Step 8 closes the final theorem-facing audit gap for terminal runs: once
+  // the structural pass has requested fallback, validate that the fallback
+  // witness itself still classifies as the one explicit normalized
+  // out-of-domain carrier rather than only as an operational side effect.
+  if (terminalFallbackRequested_)
+    RecordTerminalFallbackTheoremAudit();
+
   // Step 6 makes the theorem audit authoritative in strict mode: once the
   // structural pass finishes, any surviving theorem-audit violation must be
   // converted into the one explicit terminal fallback rather than merely being
@@ -972,11 +1041,6 @@ std::string RefoldEngine::Refold() {
         "terminal fallback: emitting fully expanded edited preprocessed "
         "stream (B). reasons={0}",
         terminalFallbackReasons_.size());
-  if (terminalFallbackKind_ != TerminalFallbackKind::Unknown)
-    ++lastTheoremAudit_.explicitTerminalExclusions;
-  else
-    NoteTheoremAuditViolation(
-        "terminal fallback requested without an explicit exclusion kind");
   const TerminalFallbackWitness terminalWitness = BuildTerminalFallbackWitness();
   const AcceptedResultCandidate terminalCandidate =
       BuildAcceptedTerminalCandidate(terminalWitness);
@@ -9433,6 +9497,8 @@ std::optional<size_t> RefoldEngine::SelectPreferredAcceptedResultCandidateIndex(
       ++lastTheoremAudit_.selectorResolutions;
   } else if (!bestIdx && !candidates.empty()) {
     ++lastTheoremAudit_.selectorNoSelectable;
+    if (candidates.size() > 1)
+      ++lastTheoremAudit_.selectorUnresolvedCompetitions;
   }
 
   return bestIdx;
@@ -22132,9 +22198,21 @@ bool RefoldEngine::EmittedTextEditHasDischargedAcceptedResults(
             TheoremDomainKind::TransitionalGap ||
         carrier.proofSummary.completeness.coverage ==
             CompletenessCoverageKind::TransitionalGap) {
+      ++lastTheoremAudit_.emittedTransitionalTheoremCarriers;
       ++lastTheoremAudit_.emittedUndischargedCarriers;
       NoteTheoremAuditViolation(
           "emitted carrier remained transitional at the byte-edit boundary");
+      return false;
+    }
+
+    if (carrier.proofSummary.theoremDomain.kind !=
+            TheoremDomainKind::DeclaredInDomainClass ||
+        !carrier.proofSummary.theoremDomain.inDeclaredDomain ||
+        carrier.proofSummary.completeness.coverage !=
+            CompletenessCoverageKind::DeclaredProofClass) {
+      ++lastTheoremAudit_.emittedOutOfDomainCarriers;
+      NoteTheoremAuditViolation(
+          "emitted carrier was not theorem-domain in-domain at the byte-edit boundary");
       return false;
     }
 
