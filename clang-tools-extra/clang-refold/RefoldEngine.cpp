@@ -698,8 +698,11 @@ void RefoldEngine::RequestTerminalFallback(TerminalFallbackKind kind, StringRef 
 
 void RefoldEngine::EnforceTheoremAuditInvariants() const {
   // Step 6 closes the loop between the theorem-audit counters and the run's
-  // success/failure semantics. The audit must not remain a passive dashboard in
-  // strict mode.
+  // success/failure semantics, while step 7 fixes what those counters mean:
+  // any emitted non-terminal result that is not declared,
+  // explicit-proof-backed, locally discharged, lattice-resolved, and in-domain
+  // violates the declared theorem domain and therefore forces terminal
+  // fallback in strict mode.
   if (lastTheoremAudit_.selectorDirectBypasses != 0) {
     NoteTheoremAuditViolation(
         "selector resolved an emitted result through a direct bypass");
@@ -9184,13 +9187,13 @@ RefoldEngine::CompletenessContract
 RefoldEngine::BuildCompletenessContract(const ProofSummary &summary) const {
   CompletenessContract contract;
 
-  // Completeness is defined relative to the declared proof-class set, not
-  // relative to every imaginable refolding. After step 3, any remaining
-  // transitional path should be an internal non-emitting staging state;
-  // emitted non-terminal artifacts are expected to land either in a declared
-  // proof class or in an explicit out-of-domain terminal result. Step 5 makes
-  // `OwnerUnresolvedNoTUAnchor` part of that explicit terminal boundary rather
-  // than leaving it as an implicit leftover ownership gap.
+  // Step 7 fixes the declared domain explicitly. For theorem-facing summaries,
+  // completeness is measured only relative to carriers that belong to the
+  // declared proof-class set. Internal staging states may still exist while an
+  // object is being materialized, but they must not survive to emission.
+  // Anything that cannot be represented as a declared, explicit-proof-backed,
+  // locally discharged, lattice-resolved in-domain carrier instead becomes a
+  // named explicit out-of-domain boundary.
   if (summary.inventory.currentPath ==
           AcceptedPathKind::TerminalEmitEditedPreprocessedStream ||
       summary.inventory.support ==
@@ -9231,9 +9234,11 @@ RefoldEngine::TheoremDomainContract
 RefoldEngine::BuildTheoremDomainContract(const ProofSummary &summary) const {
   TheoremDomainContract contract;
 
-  // Patch D makes the theorem boundary explicit from the same normalized facts
-  // already used for completeness reporting. This helper is intentionally
-  // derived-only: it does not introduce new acceptance behavior.
+  // Step 7 requires theorem-domain reporting, completeness reporting, and the
+  // theorem audit to say the same thing. This helper remains derived-only: it
+  // does not introduce new acceptance behavior, it only restates whether the
+  // summary is in-domain, transitional-internal, or an explicit named
+  // out-of-domain class under the same declared-domain contract.
   switch (summary.completeness.coverage) {
   case CompletenessCoverageKind::DeclaredProofClass:
     contract.kind = TheoremDomainKind::DeclaredInDomainClass;

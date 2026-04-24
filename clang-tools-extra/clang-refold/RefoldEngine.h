@@ -258,6 +258,23 @@ private:
     bool terminalFallbackToB = false;
   };
 
+  /// \brief Declared structural-refolding domain used by the theorem audit.
+  ///
+  /// Step 7 freezes the theorem/completeness target so later work does not
+  /// silently move the goalposts. The engine treats an input as inside the
+  /// declared structural domain iff every emitted non-terminal artifact can be
+  /// represented by a normalized accepted-result carrier such that:
+  ///   - the carrier belongs to a declared proof class,
+  ///   - the carrier is explicit-proof-backed,
+  ///   - the carrier is inside the declared domain,
+  ///   - the carrier is locally discharged,
+  ///   - final competition is resolved only by the shared lattice, and
+  ///   - no unresolved owner / unresolved B-envelope exclusion remains except
+  ///     those explicitly tracked as named out-of-domain terminal results.
+  ///
+  /// Internal staging objects may temporarily lack one of these properties, but
+  /// they are not theorem-facing and therefore do not count toward the domain
+  /// statement until they are restamped onto a concrete emitted carrier.
   struct TheoremAuditStats {
     uint64_t emittedNonTerminalEdits = 0;
     uint64_t emittedCarriers = 0;
@@ -351,6 +368,11 @@ private:
   std::string BuildTheoremAuditInvariantDetail() const;
 
   /// Emit a compact theorem-audit summary for the current run.
+  ///
+  /// The counters summarize the declared-domain statement above rather than an
+  /// independent ad hoc checklist: every emitted non-terminal carrier must be
+  /// declared, discharged, lattice-selected, and in-domain, while named
+  /// terminal exclusions remain the only acceptable out-of-domain escape.
   void EmitTheoremAudit() const {
     info("theorem",
          "satisfied={0} emittedEdits={1} carriers={2} declared={3} discharged={4} "
@@ -825,7 +847,12 @@ private:
     ExplicitlyOutsideDeclaredSet,
   };
 
-  /// \brief Normalized Step-11 completeness contract.
+  /// \brief Normalized completeness contract for the declared domain above.
+  ///
+  /// This contract answers only one question: whether a theorem-facing carrier
+  /// already lies in the declared proof-class set, remains an internal-only
+  /// transitional gap that must not reach emission, or is explicitly outside
+  /// the declared set as a named terminal boundary.
   struct CompletenessContract {
     CompletenessCoverageKind coverage = CompletenessCoverageKind::Unknown;
     CompletenessExpectationKind expectation =
@@ -838,10 +865,10 @@ private:
 
   /// \brief The summary's position relative to the declared theorem domain.
   ///
-  /// Patch D makes the theorem boundary explicit in the normalized proof
-  /// summary. A result either lies inside the declared proof-class domain,
-  /// remains transitional while a path is still being closed, or is explicitly
-  /// outside the theorem domain as a named out-of-domain class.
+  /// This enum is the theorem-domain projection of the same declared-domain
+  /// statement: theorem-facing results are either in-domain declared proof
+  /// classes or explicit named out-of-domain classes. Transitional states may
+  /// still exist internally, but they are not allowed to survive to emission.
   enum class TheoremDomainKind : uint8_t {
     Unknown,
     DeclaredInDomainClass,
@@ -849,7 +876,12 @@ private:
     ExplicitOutOfDomainClass,
   };
 
-  /// \brief Explicit domain contract derived from the completeness inventory.
+  /// \brief Explicit theorem-domain contract derived from the same statement.
+  ///
+  /// The theorem-domain view must say the same thing as the completeness view:
+  /// theorem-facing carriers are either in-domain declared proof classes or
+  /// explicit out-of-domain classes. Transitional states may still exist
+  /// internally, but step 3 requires them to be non-emitting staging objects.
   struct TheoremDomainContract {
     TheoremDomainKind kind = TheoremDomainKind::Unknown;
     bool inDeclaredDomain = false;
@@ -2984,20 +3016,22 @@ private:
   GlobalSelectionLattice
   BuildGlobalSelectionLattice(const ProofSummary &summary) const;
 
-  /// \brief Compute the Step-11 completeness contract for an accepted summary.
+  /// \brief Compute the completeness contract for an accepted summary.
   ///
-  /// The contract states whether the accepted path already belongs to the
-  /// declared proof-class set and, if so, which declared class completeness
-  /// should be measured against.
+  /// This is the machine-readable form of the declared-domain statement above:
+  /// a theorem-facing summary either belongs to a declared proof class, is an
+  /// internal-only transitional state that must not survive to emission, or is
+  /// explicitly outside the declared set as a named terminal boundary.
   CompletenessContract
   BuildCompletenessContract(const ProofSummary &summary) const;
 
   /// \brief Compute the explicit theorem-domain contract for an accepted summary.
   ///
-  /// Patch D derives a compact theorem-domain classification from the existing
-  /// acceptance inventory and completeness contract so tracing and audit output
-  /// can state directly whether a result is in-domain, transitional, or an
-  /// explicit out-of-domain class.
+  /// This must stay definitionally aligned with the completeness contract and
+  /// theorem audit: theorem-facing summaries are in-domain only when they are
+  /// declared, explicit-proof-backed, locally discharged, lattice-resolved, and
+  /// free of unresolved owner / envelope exclusions other than named terminal
+  /// out-of-domain results.
   TheoremDomainContract
   BuildTheoremDomainContract(const ProofSummary &summary) const;
 
