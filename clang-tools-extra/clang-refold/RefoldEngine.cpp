@@ -1130,6 +1130,16 @@ std::string RefoldEngine::Refold() {
     return out;
   }
 
+  // Partial-expansion fallback sits strictly between structural emission and
+  // terminal fallback to B. Step 1 only introduces the stage boundary; until a
+  // concrete proof class lands this path returns std::nullopt and behavior is
+  // unchanged.
+  if (auto expanded = TryExpansionClosureFallback()) {
+    EmitRefoldStats();
+    EmitTheoremAudit();
+    return *expanded;
+  }
+
   debug("fallback",
         "terminal fallback: emitting fully expanded edited preprocessed "
         "stream (B). reasons={0}",
@@ -7004,6 +7014,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
 #include "RefoldEngine.ArgTextRecovery.inc"
 #include "RefoldEngine.IncludeInsertion.inc"
 #include "RefoldEngine.CounterStabilization.inc"
+#include "RefoldEngine.ExpansionFallback.inc"
 
 
 std::optional<std::pair<uint64_t, uint64_t>>
