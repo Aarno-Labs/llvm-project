@@ -650,7 +650,49 @@ private:
     FutureProofTarget futureTarget = FutureProofTarget::Unknown;
   };
 
-  /// \brief Status produced when the engine evaluates a local proof contract.
+  /// rief Evidence source used to justify an accepted TU anchor.
+  ///
+  /// Step 7 lifts the deterministic TU anchoring rules into explicit proof
+  /// witnesses so accepted TU-owned insertions can explain which anchor source
+  /// was used and which non-crossing facts were relied upon.
+  enum class TUAnchorEvidenceKind : uint8_t {
+    Unknown,
+    ExactSlotBoundary,
+    ArgLikeBegin,
+    ImmediateRightNeighbor,
+    ImmediateLeftNeighbor,
+    CorroboratedRightNeighbor,
+    CorroboratedLeftNeighbor,
+  };
+
+  /// rief Compact Step-7 witness for an accepted TU anchor.
+  struct TUAnchorWitness {
+    TUAnchorEvidenceKind evidence = TUAnchorEvidenceKind::Unknown;
+    bool hasPPGap = false;
+    uint64_t ppGap = 0;
+    bool hasTUByte = false;
+    uint64_t tuByte = 0;
+
+    // Exact structural slot anchor metadata.
+    bool exactPPMatch = false;
+    uint64_t slotId = 0;
+    std::string slotKind;
+
+    // Arg-like begin anchor metadata.
+    uint64_t macroId = 0;
+
+    // Neighbor-based anchor metadata.
+    bool hasLeftNeighbor = false;
+    uint64_t leftNeighborPP = 0;
+    bool hasRightNeighbor = false;
+    uint64_t rightNeighborPP = 0;
+
+    // Ownership/non-crossing metadata for provable TU insertion anchors.
+    bool outsideIncludeCoverage = false;
+    bool ownerDepthStable = false;
+  };
+
+  /// rief Status produced when the engine evaluates a local proof contract.
   ///
   /// Step 3 introduces explicit obligation/discharge records so accepted
   /// results can be explained in terms of the class-local facts they already
@@ -688,6 +730,13 @@ private:
     IncludeConditionalOwnershipTracked,
     IncludeMappedHeaderRangeTracked,
     TUAnchorPathClassified,
+    TUAnchorWitnessTracked,
+    TUAnchorPPGapTracked,
+    TUAnchorByteTracked,
+    TUExactSlotWitnessTracked,
+    TUProvableEvidenceTracked,
+    TUOutsideIncludeCoverageTracked,
+    TUOwnerDepthStableTracked,
     LegacyFallbackExplicitlyTracked,
   };
 
@@ -715,6 +764,13 @@ private:
     MissingConditionalOwnership,
     MissingMappedHeaderRange,
     MissingTUAnchorClassification,
+    MissingTUAnchorWitness,
+    MissingTUAnchorGap,
+    MissingTUAnchorByte,
+    MissingTUExactSlotWitness,
+    MissingTUProvableAnchorWitness,
+    MissingTUOutsideIncludeCoverageProof,
+    MissingTUOwnerDepthStability,
     LegacyFallback,
   };
 
@@ -755,6 +811,8 @@ private:
     bool validated = false;
     bool structurePreserving = false;
     uint64_t proofRootMacroId = 0;
+    bool hasTUAnchorWitness = false;
+    TUAnchorWitness tuAnchorWitness;
   };
 
 
@@ -1200,8 +1258,9 @@ private:
   ///
   /// \returns The TU byte offset of the zero-width insertion anchor when a
   ///          truthful TU proof succeeds; otherwise \c std::nullopt.
-  std::optional<uint64_t> FindProvableTUInsertionAnchor(uint64_t pp,
-                                                        StringRef tuPath) const;
+  std::optional<uint64_t> FindProvableTUInsertionAnchor(
+      uint64_t pp, StringRef tuPath,
+      TUAnchorWitness *witness = nullptr) const;
 
   /// Anchors a *pure insertion* (a PP-gap insertion) to a deterministic,
   /// canonical TU byte boundary representing the *same* preprocessed
@@ -1246,8 +1305,9 @@ private:
   /// \returns the TU byte offset of an exact canonical boundary matching
   ///          `ppGap`, or `std::nullopt` if `ppGap` is not exactly on a known boundary
   ///          (caller should fall back)
-  std::optional<uint64_t>
-  AnchorToExactSlotBoundaryFromPPGap(StringRef tuPath, uint64_t ppGap) const;
+  std::optional<uint64_t> AnchorToExactSlotBoundaryFromPPGap(
+      StringRef tuPath, uint64_t ppGap,
+      TUAnchorWitness *witness = nullptr) const;
 
   /// \brief Finds the ID of the narrowest include range that covers a given PP
   /// index.
@@ -2501,8 +2561,8 @@ private:
   /// anchors. When \p patch is null, only obligations that can be discharged
   /// from the path classification itself are evaluated.
   ProofSummary BuildAcceptedPathProofSummary(
-      AcceptedPathKind currentPath,
-      const IncludePatch *patch = nullptr) const;
+      AcceptedPathKind currentPath, const IncludePatch *patch = nullptr,
+      const TUAnchorWitness *tuAnchorWitness = nullptr) const;
 
   /// \brief Build the default Step-1/2/3 proof summary for an include patch.
   ///
@@ -2539,7 +2599,9 @@ private:
       AcceptedPathKind currentPath, const IncludePatch *patch) const;
   ProofDischargeRecord ValidateIncludeRealizationProof(
       AcceptedPathKind currentPath, const IncludePatch *patch) const;
-  ProofDischargeRecord ValidateTUAnchorProof(AcceptedPathKind currentPath) const;
+  ProofDischargeRecord ValidateTUAnchorProof(
+      AcceptedPathKind currentPath,
+      const TUAnchorWitness *witness = nullptr) const;
 
   /// \brief Formatters for the normalized Step-1/2/3 proof metadata.
   StringRef FormatAcceptedProofClass(AcceptedProofClass kind) const;
@@ -2553,6 +2615,14 @@ private:
   StringRef FormatProofDischargeStatus(ProofDischargeStatus status) const;
   StringRef FormatProofObligationKind(ProofObligationKind obligation) const;
   StringRef FormatProofFailureReason(ProofFailureReason reason) const;
+  StringRef FormatTUAnchorEvidenceKind(TUAnchorEvidenceKind kind) const;
+
+  /// \brief Format a concrete TU anchor witness for tracing.
+  ///
+  /// Step 7 records the exact deterministic TU evidence used to justify a
+  /// successful TU anchor. This formatter keeps that witness readable in the
+  /// same audit stream as the normalized proof/discharge metadata.
+  std::string FormatTUAnchorWitness(const TUAnchorWitness &witness) const;
 
   /// rief Format a patch proof kind for tracing.
   StringRef FormatMacroPatchProofKind(MacroPatchProofKind kind) const;
@@ -2566,8 +2636,13 @@ private:
   FormatProofDischargeRecord(const ProofDischargeRecord &record) const;
 
   /// \brief Format the normalized accepted-path audit for tracing.
-  std::string FormatAcceptedPathAudit(AcceptedPathKind currentPath,
-                                      const IncludePatch *patch = nullptr) const;
+  ///
+  /// TU anchor paths do not materialize through IncludePatch, so Step 7 allows
+  /// callers to provide an explicit TU witness directly when formatting an
+  /// accepted-path audit entry.
+  std::string FormatAcceptedPathAudit(
+      AcceptedPathKind currentPath, const IncludePatch *patch = nullptr,
+      const TUAnchorWitness *tuAnchorWitness = nullptr) const;
 
   /// rief Format patch provenance and subtree-composition audit metadata.
   std::string FormatMacroPatchAudit(const MacroPatch &patch) const;
