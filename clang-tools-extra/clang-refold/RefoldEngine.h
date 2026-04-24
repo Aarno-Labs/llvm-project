@@ -426,17 +426,17 @@ private:
   /// \brief Attempt the proof-backed partial-expansion fallback stage.
   ///
   /// This stage is intentionally separate from both structural refolding and
-  /// terminal fallback to B. Step 1 only installs the seam; until a concrete
-  /// proof class is implemented this returns \c std::nullopt and preserves the
-  /// exact current behavior.
+  /// terminal fallback to B. Step 1 installs the seam and Step 2 may now derive
+  /// a concrete single-owner macro witness, but no partial-expansion source is
+  /// emitted until a later synthesis step connects that witness to output.
   std::optional<std::string> TryExpansionClosureFallback() const;
 
-  /// \brief Build the first planned single-owner macro expansion witness.
+  /// \brief Build the single-owner macro whole-expansion fallback witness.
   ///
-  /// The initial partial-expansion domain will be a single top-level macro
-  /// owner whose full callsite can be replaced by a proved materialization.
-  /// Step 1 only declares the witness builder entry point; later patches will
-  /// connect it to existing whole-cover planning and theorem-facing discharge.
+  /// Step 2 implements the first concrete partial-expansion proof class. The
+  /// witness exists only when exactly one top-level TU-owned macro callsite has
+  /// a proved whole-cover realization plan and that closure contains every
+  /// token-diff hunk for the current run.
   std::optional<ExpansionClosureWitness>
   BuildMacroOwnerExpansionClosureWitness() const;
 
