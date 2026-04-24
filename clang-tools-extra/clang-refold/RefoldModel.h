@@ -310,6 +310,28 @@ public:
     uint32_t callerByteEnd;
   };
 
+  /// One contiguous contribution to a pasted token's final spelling.
+  ///
+  /// `argIndex` names the macro parameter that contributed this substring when
+  /// the part is argument-derived. A missing `argIndex` denotes a literal body
+  /// fragment that participated in the `##` synthesis. `byteBegin`/`byteEnd`
+  /// are half-open byte offsets within the pasted token's final spelled text.
+  struct PastePart {
+    std::optional<uint32_t> argIndex;
+    uint32_t byteBegin;
+    uint32_t byteEnd;
+  };
+
+  /// Exact witness for one token synthesized by `##` within a specific macro
+  /// invocation.
+  ///
+  /// Array order is significant: it is the producer's deterministic replay
+  /// order for repeated identical pasted spellings inside the same invocation.
+  struct PasteToken {
+    StringRef spelling;
+    std::vector<PastePart> parts;
+  };
+
   struct MacroCalleeOrigin {
     MacroCalleeOriginKind kind = MacroCalleeOriginKind::LiteralMacroName;
     std::vector<uint32_t> callerParamIndices;
@@ -330,6 +352,7 @@ public:
     std::vector<PPArgSpan> argSpans;
     std::vector<PPArgSpan> stringifySpans;
     std::vector<PPArgSpan> pasteSpans;
+    std::vector<PasteToken> pasteTokens; // exact producer-side ## witnesses
     std::vector<MacroDefParam> defParams; // formal parameters from macro definition
     using OptByteRange = std::pair<std::optional<uint64_t>, std::optional<uint64_t>>;
     std::vector<OptByteRange> invArgRanges; // per-formal invocation-argument byte ranges
@@ -363,6 +386,7 @@ public:
                     std::vector<PPSpan> spans, std::vector<PPArgSpan> argSpans,
                     std::vector<PPArgSpan> stringifySpans,
                     std::vector<PPArgSpan> pasteSpans,
+                    std::vector<PasteToken> pasteTokens,
                     std::vector<PPSpan> bodySpans,
                     std::optional<uint64_t> callerMacroId,
                     MacroCalleeOrigin calleeOrigin,
@@ -372,8 +396,9 @@ public:
         : id(id), subkind(subkind), name(name),
           spans(std::move(spans)), argSpans(std::move(argSpans)),
           stringifySpans(std::move(stringifySpans)),
-          pasteSpans(std::move(pasteSpans)), defParams(std::move(defParams)),
-          invArgRanges(std::move(invArgRanges)),
+          pasteSpans(std::move(pasteSpans)),
+          pasteTokens(std::move(pasteTokens)),
+          defParams(std::move(defParams)), invArgRanges(std::move(invArgRanges)),
           normalizedInvText(normalizedInvText),
           normalizedInvArgTextRanges(std::move(normalizedInvArgTextRanges)),
           bodySpans(std::move(bodySpans)), invText(invText), invFile(invFile),

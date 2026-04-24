@@ -913,6 +913,13 @@ static constexpr const char *RefoldSchema = R"json(
             }
           },
           "description": "Per-callee-parameter structural forwarding from a caller formal tuple/signature. For parameter i, arg_tuple_refs[i] is an ordered sequence of slices within the trimmed caller-formal text that produce this callee argument. This is used for higher-order forms such as '(G z)' where callee arguments are unpacked from a single caller formal rather than referenced by name."
+        },
+        "paste_tokens": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PasteToken"
+          },
+          "description": "Exact producer-side witnesses for tokens synthesized by `##` within this invocation, recorded in deterministic expansion order. This preserves both the final pasted spelling and the ordered decomposition into literal and argument-derived parts."
         }
       },
       "dependentRequired": {
@@ -1270,6 +1277,52 @@ static constexpr const char *RefoldSchema = R"json(
         }
       },
       "description": "A single formal macro parameter from the macro definition corresponding to a recorded invocation."
+    },
+    "PastePart": {
+      "type": "object",
+      "required": [
+        "byte_begin",
+        "byte_end"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "arg_index": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Macro parameter index that contributed this contiguous substring of the pasted token spelling. Omitted for literal body fragments participating in the paste."
+        },
+        "byte_begin": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Inclusive byte offset of this part within the final pasted token spelling."
+        },
+        "byte_end": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Exclusive byte offset of this part within the final pasted token spelling."
+        }
+      }
+    },
+    "PasteToken": {
+      "type": "object",
+      "required": [
+        "spelling",
+        "parts"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "spelling": {
+          "type": "string",
+          "description": "Exact spelled token synthesized by one `##` projection for this invocation."
+        },
+        "parts": {
+          "type": "array",
+          "description": "Ordered decomposition of the pasted token spelling into literal and argument-derived parts. Array order is the in-token left-to-right order.",
+          "items": {
+            "$ref": "#/$defs/PastePart"
+          }
+        }
+      }
     },
     "TupleArgRef": {
       "type": "object",

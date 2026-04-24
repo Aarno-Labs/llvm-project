@@ -829,6 +829,70 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
           bodySpans = std::move(*sp);
         }
 
+        // `paste_tokens` preserves the producer's exact `##` witnesses in the
+        // order they were synthesized for this invocation. Step 5 only loads
+        // the data into the model; later proof classes can consume it without
+        // reconstructing paste decomposition from spans alone.
+        std::vector<RefoldModel::PasteToken> pasteTokens;
+        if (auto TokensArr = asOptArray(*obj, "paste_tokens", /*allowNull=*/true)) {
+          pasteTokens.reserve((**TokensArr).size());
+          for (const json::Value &Entry : **TokensArr) {
+            auto ObjOrErr = asObject(Entry, ctxItem);
+            if (!ObjOrErr)
+              fatal("model", "{0}: paste_tokens entry is not an object", ctxItem);
+            const json::Object &TokObj = **ObjOrErr;
+
+            const json::Value *SpellingVal = TokObj.get("spelling");
+            if (!SpellingVal)
+              fatal("model", "{0}: paste_tokens entry missing spelling", ctxItem);
+            auto SpellingOrErr = asString(*SpellingVal,
+                                          ctxItem + ": paste_tokens.spelling");
+            if (!SpellingOrErr)
+              fatal("model", "{0}: paste_tokens.spelling is not a string", ctxItem);
+
+            const json::Value *PartsVal = TokObj.get("parts");
+            if (!PartsVal)
+              fatal("model", "{0}: paste_tokens entry missing parts", ctxItem);
+            auto PartsArrOrErr = asArray(*PartsVal, ctxItem + ": paste_tokens.parts");
+            if (!PartsArrOrErr)
+              fatal("model", "{0}: paste_tokens.parts is not an array", ctxItem);
+
+            std::vector<RefoldModel::PastePart> parts;
+            parts.reserve((**PartsArrOrErr).size());
+            for (const json::Value &PartVal : **PartsArrOrErr) {
+              auto PartObjOrErr = asObject(PartVal, ctxItem);
+              if (!PartObjOrErr)
+                fatal("model", "{0}: paste_tokens part is not an object", ctxItem);
+              const json::Object &PartObj = **PartObjOrErr;
+
+              std::optional<uint32_t> ArgIndex =
+                  asOptUInt32(PartObj, "arg_index", /*canBeNull=*/true);
+
+              const json::Value *ByteBVal = PartObj.get("byte_begin");
+              if (!ByteBVal)
+                fatal("model", "{0}: paste_tokens part missing byte_begin", ctxItem);
+              auto ByteBOrErr = asUInt32(*ByteBVal,
+                                         ctxItem + ": paste_tokens.part.byte_begin");
+              if (!ByteBOrErr)
+                fatal("model", "{0}: paste_tokens.part.byte_begin is not a uint32", ctxItem);
+
+              const json::Value *ByteEVal = PartObj.get("byte_end");
+              if (!ByteEVal)
+                fatal("model", "{0}: paste_tokens part missing byte_end", ctxItem);
+              auto ByteEOrErr = asUInt32(*ByteEVal,
+                                         ctxItem + ": paste_tokens.part.byte_end");
+              if (!ByteEOrErr)
+                fatal("model", "{0}: paste_tokens.part.byte_end is not a uint32", ctxItem);
+
+              parts.push_back(RefoldModel::PastePart{ArgIndex, *ByteBOrErr,
+                                                     *ByteEOrErr});
+            }
+
+            pasteTokens.push_back(
+                RefoldModel::PasteToken{*SpellingOrErr, std::move(parts)});
+          }
+        }
+
         std::optional<uint64_t> callerMacroId =
             asOptUInt64(*obj, "caller_macro_id", /*canBeNull=*/true);
 
@@ -1023,6 +1087,7 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
                            /*argSpans*/ std::move(argSpans),
                            /*stringifySpans*/ std::move(stringifySpans),
                            /*pasteSpans*/ std::move(pasteSpans),
+                           /*pasteTokens*/ std::move(pasteTokens),
                            /*bodySpans*/ std::move(bodySpans),
                            /*callerMacroId*/ callerMacroId,
                            /*calleeOrigin*/ std::move(calleeOrigin),
