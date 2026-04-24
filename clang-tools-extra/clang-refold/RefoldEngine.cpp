@@ -7816,11 +7816,16 @@ RefoldEngine::BuildIncludeInsertionPatch(const RefoldModel::IncludeItem &inc,
           inc.id, uBStart, uBEnd, numOffsets);
   }
 
-  IncludePatch patch{&inc,  std::move(insertBytes), h.aStart, h.aEnd, h.bStart,
-                     h.bEnd,
-                     BuildIncludePatchProofSummary(
-                         /*realizedSurface=*/false,
-                         AcceptedPathKind::IncludePatchPendingMaterialization)};
+  IncludePatch patch{&inc, std::move(insertBytes), h.aStart, h.aEnd, h.bStart,
+                     h.bEnd};
+
+  // Pre-materialization include patches are internal staging objects only.
+  // Do not stamp a normalized accepted path here; the concrete preserving
+  // anchor or realization class is chosen later during materialization and
+  // only that restamped result may cross a theorem-facing boundary.
+  patch.proofSummary = BuildIncludePatchProofSummary(/*realizedSurface=*/false,
+                                                    AcceptedPathKind::Unknown,
+                                                    &patch);
 
   trace("include/patch",
         "built inc #{0} patch A[{1},{2})->B[{3},{4}) len(insertBytes)={5}",
@@ -8640,7 +8645,12 @@ RefoldEngine::BuildAcceptancePathInventory(AcceptedPathKind currentPath) const {
     inventory.futureTarget = FutureProofTarget::MacroRealizationWholeCover;
     break;
   case AcceptedPathKind::IncludePatchPendingMaterialization:
-    inventory.support = AcceptanceSupportKind::DeterministicButNotFirstClass;
+    // Pending include materialization is now an internal-only staging state.
+    // Do not expose it as a normalized accepted path with transitional
+    // support; any theorem-facing summary that still references this state
+    // must fail closed and restamp onto a concrete include class first.
+    inventory.currentPath = AcceptedPathKind::Unknown;
+    inventory.support = AcceptanceSupportKind::Unknown;
     inventory.futureTarget = FutureProofTarget::Unknown;
     break;
   case AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens:
@@ -8884,10 +8894,17 @@ RefoldEngine::ProofSummary RefoldEngine::BuildAcceptedPathProofSummary(
     const IncludeRealizationWitness *includeRealizationWitness,
     const TerminalFallbackWitness *terminalFallbackWitness) const {
   ProofSummary summary;
+
   summary.inventory = BuildAcceptancePathInventory(currentPath);
 
   switch (currentPath) {
   case AcceptedPathKind::IncludePatchPendingMaterialization:
+    // Pending include materialization is an internal working state, not a
+    // theorem-facing accepted path. Keep the switch exhaustive so enum
+    // coverage remains explicit under -Wswitch, but fail closed here by
+    // returning the default/empty summary rather than manufacturing a
+    // transitional accepted carrier.
+    return summary;
   case AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens:
   case AcceptedPathKind::IncludeInsertSelectedConditionalBoundary:
   case AcceptedPathKind::IncludeInsertChildBoundary:
@@ -9019,38 +9036,19 @@ RefoldEngine::ProofSummary
 RefoldEngine::BuildIncludePatchProofSummary(
     bool realizedSurface, AcceptedPathKind currentPath,
     const IncludePatch *patch) const {
+  (void)realizedSurface;
+  (void)patch;
+
+  // IncludePatch is a pre-materialization working object. By default it does
+  // not claim any normalized accepted path at all; only the later
+  // witness-backed materialization step may mint theorem-facing include
+  // preserving or realization summaries. If a caller explicitly provides a
+  // concrete include path, reuse the accepted-path classifier for that final
+  // restamped state.
+  if (currentPath == AcceptedPathKind::Unknown)
+    return ProofSummary{};
+
   ProofSummary summary = BuildAcceptedPathProofSummary(currentPath, patch);
-
-  // Preserve the historical realized-surface classification if an internal
-  // caller still reaches this helper before stamping a concrete include path.
-  // Patch D keeps this fallback explicit in the theorem-domain summary rather
-  // than pretending it already belongs to a declared proof class.
-  if (summary.acceptedClass == AcceptedProofClass::Unknown) {
-    summary.acceptedClass = realizedSurface
-                                ? AcceptedProofClass::IncludeRealization
-                                : AcceptedProofClass::IncludePreserving;
-    summary.realizationMode = realizedSurface
-                                  ? RealizationMode::RealizeEditedSurface
-                                  : RealizationMode::PreserveOriginalStructure;
-    summary.preference = realizedSurface
-                             ? SelectionPreference::PreferSurfaceRealization
-                             : SelectionPreference::PreferStructurePreservation;
-    summary.surfaceDisposition = realizedSurface
-                                   ? SurfaceDisposition::
-                                         RealizeInlineTouchedIncludesFromB
-                                   : SurfaceDisposition::None;
-    summary.structurePreserving = !realizedSurface;
-    summary.discharge = realizedSurface
-                            ? ValidateIncludeRealizationProof(
-                                  currentPath, patch,
-                                  /*witness=*/nullptr)
-                            : ValidateIncludePreservingProof(currentPath, patch,
-                                                             /*witness=*/nullptr);
-  }
-
-  summary.lattice = BuildGlobalSelectionLattice(summary);
-  summary.completeness = BuildCompletenessContract(summary);
-  summary.theoremDomain = BuildTheoremDomainContract(summary);
   summary.validated = false;
   return summary;
 }
@@ -9841,17 +9839,14 @@ RefoldEngine::ValidateIncludePreservingProof(AcceptedPathKind currentPath,
                                              const IncludePatch *patch,
                                              const IncludeAnchorWitness *witness) const {
   if (currentPath == AcceptedPathKind::IncludePatchPendingMaterialization) {
-    // This is the one remaining transitional include state: a deterministic
-    // pre-emission staging patch that still awaits a concrete preserving or
-    // realization class. Step 2B's universal emission gate makes this state
-    // unreachable at any final emitted byte-edit boundary.
-    ProofDischargeRecord pending;
-    pending.status = ProofDischargeStatus::PendingMaterialization;
-    pending.failureReason = ProofFailureReason::PendingMaterialization;
-    pending.failedObligation =
-        ProofObligationKind::IncludePendingMaterializationClassified;
-    pending.obligationsEvaluated = 1;
-    return pending;
+    // Pending include materialization is internal-only after step 3. If some
+    // caller still tries to validate it as a theorem-facing include path, fail
+    // closed immediately rather than reporting a live transitional discharge
+    // state.
+    ProofDischargeAccumulator discharge;
+    discharge.Fail(ProofObligationKind::IncludePendingMaterializationClassified,
+                   ProofFailureReason::PendingMaterialization);
+    return discharge.Finish();
   }
 
   ProofDischargeAccumulator discharge;

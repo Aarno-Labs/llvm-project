@@ -1284,12 +1284,13 @@ private:
     uint64_t aStart, aEnd;   // A-token interval inside include expansion
     uint64_t bStart, bEnd;   // B-token interval
 
-    // Normalized proof summary for include-owned patch candidates.
+    // Internal working summary for include-owned patch candidates.
     // Include patches are created before materialization chooses a concrete
     // preserving anchor or realization envelope, so pre-materialization
-    // summaries may temporarily sit on the pending include path. Once a
-    // concrete include path is chosen, the accepted result is restamped onto
-    // the explicit witness-backed preserving or realization class.
+    // patches must not claim a normalized accepted path yet. The patch-level
+    // summary therefore stays internal-only until materialization restamps the
+    // emitted accepted result onto an explicit witness-backed preserving or
+    // realization class.
     ProofSummary proofSummary = {};
 
     /// When present, this insertion was classified as belonging to a specific
@@ -2931,17 +2932,17 @@ private:
       const IncludeRealizationWitness *includeRealizationWitness = nullptr,
       const TerminalFallbackWitness *terminalFallbackWitness = nullptr) const;
 
-  /// \brief Build the default Step-1/2/3 proof summary for an include patch.
+  /// \brief Build the internal working proof summary for an include patch.
   ///
   /// Include patches are created before materialization chooses a concrete
   /// preserving anchor or realization envelope. The resulting summary therefore
-  /// starts on the pending include path and is restamped onto a concrete
-  /// witness-backed include class once materialization chooses an accepted
-  /// path.
+  /// is only a staging object, so the default summary intentionally avoids
+  /// claiming any normalized accepted path. Callers must restamp the emitted
+  /// accepted result onto a concrete witness-backed include class once
+  /// materialization chooses the final path.
   ProofSummary BuildIncludePatchProofSummary(
       bool realizedSurface,
-      AcceptedPathKind currentPath =
-          AcceptedPathKind::IncludePatchPendingMaterialization,
+      AcceptedPathKind currentPath = AcceptedPathKind::Unknown,
       const IncludePatch *patch = nullptr) const;
 
   /// \brief Compute the current global lattice law for an accepted summary.
