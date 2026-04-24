@@ -908,12 +908,10 @@ std::string RefoldEngine::Refold() {
         "stream (B). reasons={0}",
         terminalFallbackReasons_.size());
   const TerminalFallbackWitness terminalWitness = BuildTerminalFallbackWitness();
+  const AcceptedResultCandidate terminalCandidate =
+      BuildAcceptedTerminalCandidate(terminalWitness);
   debug("proof/inventory", "terminal result {0}",
-        FormatAcceptedPathAudit(
-            AcceptedPathKind::TerminalEmitEditedPreprocessedStream,
-            /*patch=*/nullptr, /*tuAnchorWitness=*/nullptr,
-            /*includeAnchorWitness=*/nullptr,
-            /*includeRealizationWitness=*/nullptr, &terminalWitness));
+        FormatAcceptedResultCandidate(terminalCandidate));
   for (const auto &r : terminalFallbackReasons_)
     debug("fallback", "  {0}", r);
 
@@ -3107,11 +3105,12 @@ RefoldEngine::FindProvableTUInsertionAnchor(uint64_t pp,
   if (auto slotAnchor = AnchorToExactSlotBoundaryFromPPGap(tuPath, pp, &slotWitness)) {
     if (witness)
       *witness = slotWitness;
+    const AcceptedResultCandidate slotCandidate =
+        BuildAcceptedTUAnchorCandidate(AcceptedPathKind::TUExactSlotBoundary,
+                                       slotWitness);
     trace("hunk",
-          "    insertion gap PP={0} mapsToTU via slot boundary TU byte {1} inventory={2}",
-          pp, slotAnchor,
-          FormatAcceptedPathAudit(AcceptedPathKind::TUExactSlotBoundary,
-                                  /*patch=*/nullptr, &slotWitness));
+          "    insertion gap PP={0} mapsToTU via slot boundary TU byte {1} candidate={2}",
+          pp, slotAnchor, FormatAcceptedResultCandidate(slotCandidate));
     return slotAnchor;
   }
 
@@ -3212,12 +3211,14 @@ RefoldEngine::FindProvableTUInsertionAnchor(uint64_t pp,
     argLikeWitness.outsideIncludeCoverage = true;
     if (witness)
       *witness = argLikeWitness;
+    const AcceptedResultCandidate argLikeCandidate =
+        BuildAcceptedTUAnchorCandidate(
+            AcceptedPathKind::TUProvableInsertionAnchor, argLikeWitness);
     trace("tu/anchor",
           "pure insertion arg-like begin anchor: ppGap={0} -> macro id={1} "
-          "name='{2}' invB={3} inventory={4}",
+          "name='{2}' invB={3} candidate={4}",
           pp, best->id, best->name, *best->invB,
-          FormatAcceptedPathAudit(AcceptedPathKind::TUProvableInsertionAnchor,
-                                  /*patch=*/nullptr, &argLikeWitness));
+          FormatAcceptedResultCandidate(argLikeCandidate));
     return *best->invB;
   };
 
@@ -3249,11 +3250,12 @@ RefoldEngine::FindProvableTUInsertionAnchor(uint64_t pp,
         rightWitness.outsideIncludeCoverage = true;
         if (witness)
           *witness = rightWitness;
+        const AcceptedResultCandidate rightCandidate =
+            BuildAcceptedTUAnchorCandidate(
+                AcceptedPathKind::TUProvableInsertionAnchor, rightWitness);
         trace("tu/anchor",
-              "provable TU insertion anchor: ppGap={0} -> right neighbor byte={1} inventory={2}",
-              pp, right.b,
-              FormatAcceptedPathAudit(AcceptedPathKind::TUProvableInsertionAnchor,
-                                      /*patch=*/nullptr, &rightWitness));
+              "provable TU insertion anchor: ppGap={0} -> right neighbor byte={1} candidate={2}",
+              pp, right.b, FormatAcceptedResultCandidate(rightCandidate));
         return right.b;
       }
       return std::nullopt;
@@ -3279,11 +3281,12 @@ RefoldEngine::FindProvableTUInsertionAnchor(uint64_t pp,
         leftWitness.outsideIncludeCoverage = true;
         if (witness)
           *witness = leftWitness;
+        const AcceptedResultCandidate leftCandidate =
+            BuildAcceptedTUAnchorCandidate(
+                AcceptedPathKind::TUProvableInsertionAnchor, leftWitness);
         trace("tu/anchor",
-              "provable TU insertion anchor: ppGap={0} -> left neighbor byte={1} inventory={2}",
-              pp, left.e,
-              FormatAcceptedPathAudit(AcceptedPathKind::TUProvableInsertionAnchor,
-                                      /*patch=*/nullptr, &leftWitness));
+              "provable TU insertion anchor: ppGap={0} -> left neighbor byte={1} candidate={2}",
+              pp, left.e, FormatAcceptedResultCandidate(leftCandidate));
         return left.e;
       }
       return std::nullopt;
@@ -3370,12 +3373,14 @@ RefoldEngine::FindProvableTUInsertionAnchor(uint64_t pp,
     corroboratedRightWitness.ownerDepthStable = true;
     if (witness)
       *witness = corroboratedRightWitness;
+    const AcceptedResultCandidate corroboratedRightCandidate =
+        BuildAcceptedTUAnchorCandidate(
+            AcceptedPathKind::TUProvableInsertionAnchor,
+            corroboratedRightWitness);
     trace("tu/anchor",
-          "provable TU insertion anchor: ppGap={0} -> corroborated right byte={1} inventory={2}",
+          "provable TU insertion anchor: ppGap={0} -> corroborated right byte={1} candidate={2}",
           pp, right->b,
-          FormatAcceptedPathAudit(AcceptedPathKind::TUProvableInsertionAnchor,
-                                  /*patch=*/nullptr,
-                                  &corroboratedRightWitness));
+          FormatAcceptedResultCandidate(corroboratedRightCandidate));
     return right->b;
   }
   TUAnchorWitness corroboratedLeftWitness;
@@ -3393,12 +3398,14 @@ RefoldEngine::FindProvableTUInsertionAnchor(uint64_t pp,
   corroboratedLeftWitness.ownerDepthStable = true;
   if (witness)
     *witness = corroboratedLeftWitness;
+  const AcceptedResultCandidate corroboratedLeftCandidate =
+      BuildAcceptedTUAnchorCandidate(
+          AcceptedPathKind::TUProvableInsertionAnchor,
+          corroboratedLeftWitness);
   trace("tu/anchor",
-        "provable TU insertion anchor: ppGap={0} -> corroborated left byte={1} inventory={2}",
+        "provable TU insertion anchor: ppGap={0} -> corroborated left byte={1} candidate={2}",
         pp, left->e,
-        FormatAcceptedPathAudit(AcceptedPathKind::TUProvableInsertionAnchor,
-                                /*patch=*/nullptr,
-                                &corroboratedLeftWitness));
+        FormatAcceptedResultCandidate(corroboratedLeftCandidate));
   return left->e;
 }
 
@@ -3591,22 +3598,25 @@ RefoldEngine::AnchorToExactSlotBoundaryFromPPGap(StringRef tuPath,
   }
 
   if (best) {
-    if (witness) {
-      witness->evidence = TUAnchorEvidenceKind::ExactSlotBoundary;
-      witness->hasPPGap = true;
-      witness->ppGap = ppGap;
-      witness->hasTUByte = true;
-      witness->tuByte = best->b;
-      witness->exactPPMatch = true;
-      witness->slotId = best->slot->id;
-      witness->slotKind = best->slot->kind.str();
-    }
+    TUAnchorWitness exactSlotWitness;
+    exactSlotWitness.evidence = TUAnchorEvidenceKind::ExactSlotBoundary;
+    exactSlotWitness.hasPPGap = true;
+    exactSlotWitness.ppGap = ppGap;
+    exactSlotWitness.hasTUByte = true;
+    exactSlotWitness.tuByte = best->b;
+    exactSlotWitness.exactPPMatch = true;
+    exactSlotWitness.slotId = best->slot->id;
+    exactSlotWitness.slotKind = best->slot->kind.str();
+    if (witness)
+      *witness = exactSlotWitness;
+    const AcceptedResultCandidate exactSlotCandidate =
+        BuildAcceptedTUAnchorCandidate(AcceptedPathKind::TUExactSlotBoundary,
+                                       exactSlotWitness);
     trace("slots/anchor",
           "AnchorToExactSlotBoundaryFromPPGap: ppGap={0} -> slotId={1} "
-          "kind={2} tuByte={3} inventory={4}",
+          "kind={2} tuByte={3} candidate={4}",
           ppGap, best->slot->id, best->slot->kind, best->b,
-          FormatAcceptedPathAudit(AcceptedPathKind::TUExactSlotBoundary,
-                                  /*patch=*/nullptr, witness));
+          FormatAcceptedResultCandidate(exactSlotCandidate));
   } else {
     trace("slots/anchor",
           "AnchorToExactSlotBoundaryFromPPGap: ppGap={0} -> <none>", ppGap);
@@ -8995,8 +9005,10 @@ bool RefoldEngine::LatticePrefers(const ProofSummary &lhs,
   if (lhsPreference != rhsPreference)
     return lhsPreference < rhsPreference;
 
-  const uint8_t lhsSurfaceDisposition = surfaceDispositionRank(lhs.surfaceDisposition);
-  const uint8_t rhsSurfaceDisposition = surfaceDispositionRank(rhs.surfaceDisposition);
+  const uint8_t lhsSurfaceDisposition =
+      surfaceDispositionRank(lhs.surfaceDisposition);
+  const uint8_t rhsSurfaceDisposition =
+      surfaceDispositionRank(rhs.surfaceDisposition);
   if (lhsSurfaceDisposition != rhsSurfaceDisposition)
     return lhsSurfaceDisposition < rhsSurfaceDisposition;
 
@@ -9006,6 +9018,82 @@ bool RefoldEngine::LatticePrefers(const ProofSummary &lhs,
 
   return static_cast<uint8_t>(lhs.inventory.currentPath) <
          static_cast<uint8_t>(rhs.inventory.currentPath);
+}
+
+RefoldEngine::AcceptedResultCandidate
+RefoldEngine::BuildAcceptedMacroCandidate(const MacroPatch &patch) const {
+  AcceptedResultCandidate candidate;
+  candidate.kind = AcceptedResultCandidateKind::MacroPatch;
+  candidate.proofSummary = ClassifyMacroPatchProof(patch);
+  candidate.begin = patch.invStart;
+  candidate.end = patch.invEnd;
+  if (patch.proofRootMacroId) {
+    candidate.hasRootMacroId = true;
+    candidate.rootMacroId = patch.proofRootMacroId;
+  }
+  candidate.hasPayloadPreview = true;
+  candidate.payloadPreview =
+      stringutils::showWSWithClip(patch.replacement, 120);
+  return candidate;
+}
+
+RefoldEngine::AcceptedResultCandidate
+RefoldEngine::BuildAcceptedIncludeCandidate(
+    AcceptedPathKind currentPath, const IncludePatch &patch,
+    const IncludeAnchorWitness *includeAnchorWitness,
+    const IncludeRealizationWitness *includeRealizationWitness) const {
+  AcceptedResultCandidate candidate;
+  candidate.kind = AcceptedResultCandidateKind::IncludePatch;
+  candidate.proofSummary = BuildAcceptedPathProofSummary(
+      currentPath, &patch, /*tuAnchorWitness=*/nullptr, includeAnchorWitness,
+      includeRealizationWitness);
+  candidate.begin = patch.aStart;
+  candidate.end = patch.aEnd;
+  if (patch.include) {
+    candidate.hasOwnerIncludeId = true;
+    candidate.ownerIncludeId = patch.include->id;
+  }
+  if (includeAnchorWitness && includeAnchorWitness->hasAnchorByte) {
+    candidate.hasAnchorByte = true;
+    candidate.anchorByte = includeAnchorWitness->anchorByte;
+  }
+  if (includeRealizationWitness && includeRealizationWitness->hasIncludeId) {
+    candidate.hasOwnerIncludeId = true;
+    candidate.ownerIncludeId = includeRealizationWitness->includeId;
+  }
+  candidate.hasPayloadPreview = true;
+  candidate.payloadPreview =
+      stringutils::showWSWithClip(patch.insertBytes, 120);
+  return candidate;
+}
+
+RefoldEngine::AcceptedResultCandidate
+RefoldEngine::BuildAcceptedTUAnchorCandidate(
+    AcceptedPathKind currentPath, const TUAnchorWitness &witness) const {
+  AcceptedResultCandidate candidate;
+  candidate.kind = AcceptedResultCandidateKind::TUAnchor;
+  candidate.proofSummary = BuildAcceptedPathProofSummary(
+      currentPath, /*patch=*/nullptr, &witness);
+  if (witness.hasPPGap)
+    candidate.begin = candidate.end = witness.ppGap;
+  if (witness.hasTUByte) {
+    candidate.hasAnchorByte = true;
+    candidate.anchorByte = witness.tuByte;
+  }
+  return candidate;
+}
+
+RefoldEngine::AcceptedResultCandidate
+RefoldEngine::BuildAcceptedTerminalCandidate(
+    const TerminalFallbackWitness &witness) const {
+  AcceptedResultCandidate candidate;
+  candidate.kind = AcceptedResultCandidateKind::TerminalOutOfDomain;
+  candidate.proofSummary = BuildAcceptedPathProofSummary(
+      AcceptedPathKind::TerminalEmitEditedPreprocessedStream,
+      /*patch=*/nullptr, /*tuAnchorWitness=*/nullptr,
+      /*includeAnchorWitness=*/nullptr,
+      /*includeRealizationWitness=*/nullptr, &witness);
+  return candidate;
 }
 
 bool RefoldEngine::MacroInvocationHasWellFormedPasteWitnesses(
@@ -9506,6 +9594,23 @@ RefoldEngine::FormatAcceptedProofClass(AcceptedProofClass kind) const {
     return "IncludeRealization";
   case AcceptedProofClass::TUAnchor:
     return "TUAnchor";
+  }
+  return "Unknown";
+}
+
+StringRef RefoldEngine::FormatAcceptedResultCandidateKind(
+    AcceptedResultCandidateKind kind) const {
+  switch (kind) {
+  case AcceptedResultCandidateKind::Unknown:
+    return "Unknown";
+  case AcceptedResultCandidateKind::MacroPatch:
+    return "MacroPatch";
+  case AcceptedResultCandidateKind::IncludePatch:
+    return "IncludePatch";
+  case AcceptedResultCandidateKind::TUAnchor:
+    return "TUAnchor";
+  case AcceptedResultCandidateKind::TerminalOutOfDomain:
+    return "TerminalOutOfDomain";
   }
   return "Unknown";
 }
@@ -10206,6 +10311,85 @@ std::string RefoldEngine::FormatAcceptedPathAudit(
                  FormatGlobalSelectionLattice(summary.lattice),
                  FormatCompletenessContract(summary.completeness),
                  FormatProofDischargeRecord(summary.discharge))
+      .str();
+}
+
+std::string
+RefoldEngine::FormatAcceptedResultCandidate(
+    const AcceptedResultCandidate &candidate) const {
+  std::string artifact;
+  switch (candidate.kind) {
+  case AcceptedResultCandidateKind::MacroPatch:
+    artifact = formatv("span=[{0},{1})", candidate.begin, candidate.end).str();
+    if (candidate.hasRootMacroId) {
+      artifact += formatv(" rootMacro={0}", candidate.rootMacroId).str();
+    }
+    break;
+  case AcceptedResultCandidateKind::IncludePatch:
+    artifact = formatv("aSpan=[{0},{1})", candidate.begin, candidate.end).str();
+    if (candidate.hasOwnerIncludeId) {
+      artifact += formatv(" ownerInclude={0}", candidate.ownerIncludeId).str();
+    }
+    if (candidate.hasAnchorByte) {
+      artifact += formatv(" anchorByte={0}", candidate.anchorByte).str();
+    }
+    break;
+  case AcceptedResultCandidateKind::TUAnchor:
+    artifact = formatv("ppGap={0}", candidate.begin).str();
+    if (candidate.hasAnchorByte) {
+      artifact += formatv(" tuByte={0}", candidate.anchorByte).str();
+    }
+    break;
+  case AcceptedResultCandidateKind::TerminalOutOfDomain:
+  case AcceptedResultCandidateKind::Unknown:
+    break;
+  }
+
+  if (candidate.proofSummary.hasTUAnchorWitness) {
+    artifact += formatv(" tuAnchor={0}",
+                        FormatTUAnchorWitness(
+                            candidate.proofSummary.tuAnchorWitness))
+                    .str();
+  }
+  if (candidate.proofSummary.hasIncludeAnchorWitness) {
+    artifact += formatv(" includeAnchor={0}",
+                        FormatIncludeAnchorWitness(
+                            candidate.proofSummary.includeAnchorWitness))
+                    .str();
+  }
+  if (candidate.proofSummary.hasIncludeRealizationWitness) {
+    artifact +=
+        formatv(" includeRealization={0}",
+                FormatIncludeRealizationWitness(
+                    candidate.proofSummary.includeRealizationWitness))
+            .str();
+  }
+  if (candidate.proofSummary.hasTerminalFallbackWitness) {
+    artifact += formatv(" terminalFallback={0}",
+                        FormatTerminalFallbackWitness(
+                            candidate.proofSummary.terminalFallbackWitness))
+                    .str();
+  }
+  if (candidate.hasPayloadPreview) {
+    artifact += formatv(" payload='{0}'", candidate.payloadPreview).str();
+  }
+
+  const std::string artifactSuffix =
+      artifact.empty() ? std::string() : formatv(" artifact={0}", artifact).str();
+  return formatv(
+             "kind={0} class={1} realization={2} preference={3} "
+             "surfaceDisposition={4} inventory={5} lattice={6} "
+             "completeness={7} discharge={8}{9}",
+             FormatAcceptedResultCandidateKind(candidate.kind),
+             FormatAcceptedProofClass(candidate.proofSummary.acceptedClass),
+             FormatRealizationMode(candidate.proofSummary.realizationMode),
+             FormatSelectionPreference(candidate.proofSummary.preference),
+             FormatSurfaceDisposition(candidate.proofSummary.surfaceDisposition),
+             FormatAcceptancePathInventory(candidate.proofSummary.inventory),
+             FormatGlobalSelectionLattice(candidate.proofSummary.lattice),
+             FormatCompletenessContract(candidate.proofSummary.completeness),
+             FormatProofDischargeRecord(candidate.proofSummary.discharge),
+             artifactSuffix)
       .str();
 }
 
@@ -19753,9 +19937,11 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   }
 
   if (argsOnlyCandidate) {
+    const AcceptedResultCandidate acceptedCandidate =
+        BuildAcceptedMacroCandidate(*argsOnlyCandidate);
     trace("macro/proof",
           "returning direct args-only candidate: inv id={0} name={1} {2}",
-          m.id, m.name, FormatMacroPatchAudit(*argsOnlyCandidate));
+          m.id, m.name, FormatAcceptedResultCandidate(acceptedCandidate));
     return *argsOnlyCandidate;
   }
 
@@ -19764,9 +19950,11 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     trace("macro", "callsite patch reused (args-only no-op) inv id={0}",
           m.id);
     if (existingPatch) {
+      const AcceptedResultCandidate acceptedCandidate =
+          BuildAcceptedMacroCandidate(*existingPatch);
       trace("macro/proof",
             "reused existing callsite patch audit: inv id={0} name={1} {2}",
-            m.id, m.name, FormatMacroPatchAudit(*existingPatch));
+            m.id, m.name, FormatAcceptedResultCandidate(acceptedCandidate));
       if (existingPatch->subtreeCertBacked)
         trace("macro/proof",
               "subtree continuity probe: reused subtree-backed callsite patch "
@@ -19924,14 +20112,18 @@ std::optional<std::string> RefoldEngine::BuildInlineIncludeRealizationFromB(
   realizationWitness.bTokBegin = bEnvOpt->first;
   realizationWitness.bTokEnd = bEnvOpt->second;
 
+  AcceptedResultCandidate realizationCandidate;
+  realizationCandidate.kind = AcceptedResultCandidateKind::IncludePatch;
+  realizationCandidate.proofSummary = BuildAcceptedPathProofSummary(
+      AcceptedPathKind::IncludeRealizationInlineFromB,
+      /*patch=*/nullptr, /*tuAnchorWitness=*/nullptr,
+      /*includeAnchorWitness=*/nullptr, &realizationWitness);
+  realizationCandidate.hasOwnerIncludeId = true;
+  realizationCandidate.ownerIncludeId = inc.id;
   debug("include/mat",
-        "realize from B inc#{0} reason='{1}' bTok=[{2},{3}) inventory={4}",
+        "realize from B inc#{0} reason='{1}' bTok=[{2},{3}) candidate={4}",
         inc.id, reason, bEnvOpt->first, bEnvOpt->second,
-        FormatAcceptedPathAudit(AcceptedPathKind::IncludeRealizationInlineFromB,
-                                /*patch=*/nullptr,
-                                /*tuAnchorWitness=*/nullptr,
-                                /*includeAnchorWitness=*/nullptr,
-                                &realizationWitness));
+        FormatAcceptedResultCandidate(realizationCandidate));
   return SliceBSource(bEnvOpt->first, bEnvOpt->second).str();
 }
 
@@ -20319,12 +20511,18 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         uint64_t anchorByte = 0;
       };
 
+      // Patch A keeps include materialization behavior unchanged, but it
+      // wraps each concrete anchor choice in the normalized candidate carrier
+      // so later steps can compare legacy anchor selection against an explicit
+      // candidate-first selector.
       auto traceInsertCandidate = [&](const InsertAnchorCandidate &candidate,
                                       StringRef stage) {
+        const AcceptedResultCandidate acceptedCandidate =
+            BuildAcceptedIncludeCandidate(candidate.path, p, &candidate.witness);
         trace("include/apply",
-              "file={0} patch[{1}] INSERT: candidate stage={2} anchorByte={3} inventory={4}",
+              "file={0} patch[{1}] INSERT: candidate stage={2} anchorByte={3} candidate={4}",
               file, idx, stage, candidate.anchorByte,
-              includeInventoryFor(candidate.path, &candidate.witness));
+              FormatAcceptedResultCandidate(acceptedCandidate));
       };
 
       auto selectBestInsertCandidate =
@@ -20335,21 +20533,25 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
 
         size_t bestIdx = 0;
         for (size_t candIdx = 1; candIdx < candidates.size(); ++candIdx) {
-          const ProofSummary candSummary = BuildAcceptedPathProofSummary(
-              candidates[candIdx].path, &p, /*tuAnchorWitness=*/nullptr,
-              &candidates[candIdx].witness);
-          const ProofSummary bestSummary = BuildAcceptedPathProofSummary(
-              candidates[bestIdx].path, &p, /*tuAnchorWitness=*/nullptr,
-              &candidates[bestIdx].witness);
-          if (LatticePrefers(candSummary, bestSummary))
+          const AcceptedResultCandidate candCandidate =
+              BuildAcceptedIncludeCandidate(candidates[candIdx].path, p,
+                                            &candidates[candIdx].witness);
+          const AcceptedResultCandidate bestCandidate =
+              BuildAcceptedIncludeCandidate(candidates[bestIdx].path, p,
+                                            &candidates[bestIdx].witness);
+          if (LatticePrefers(candCandidate.proofSummary,
+                             bestCandidate.proofSummary)) {
             bestIdx = candIdx;
+          }
         }
 
+        const AcceptedResultCandidate selectedCandidate =
+            BuildAcceptedIncludeCandidate(candidates[bestIdx].path, p,
+                                          &candidates[bestIdx].witness);
         trace("include/apply",
-              "file={0} patch[{1}] INSERT: selected candidate anchorByte={2} inventory={3}",
+              "file={0} patch[{1}] INSERT: selected candidate anchorByte={2} candidate={3}",
               file, idx, candidates[bestIdx].anchorByte,
-              includeInventoryFor(candidates[bestIdx].path,
-                                  &candidates[bestIdx].witness));
+              FormatAcceptedResultCandidate(selectedCandidate));
         return candidates[bestIdx];
       };
 
