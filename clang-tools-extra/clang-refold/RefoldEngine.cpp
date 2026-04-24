@@ -8537,28 +8537,30 @@ RefoldEngine::BuildAcceptancePathInventory(AcceptedPathKind currentPath) const {
     inventory.futureTarget = FutureProofTarget::Unknown;
     break;
   case AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens:
-    inventory.support = AcceptanceSupportKind::DeterministicButNotFirstClass;
+    // Step 8 promotes deterministic include-preserving materialization paths
+    // into explicit witness-backed proof classes.
+    inventory.support = AcceptanceSupportKind::ExplicitProofBacked;
     inventory.futureTarget = FutureProofTarget::IncludePatchByMappedHeaderTokens;
     break;
   case AcceptedPathKind::IncludeInsertSelectedConditionalBoundary:
-    inventory.support = AcceptanceSupportKind::DeterministicButNotFirstClass;
+    inventory.support = AcceptanceSupportKind::ExplicitProofBacked;
     inventory.futureTarget =
         FutureProofTarget::IncludeConditionalArmCertifiedInsertion;
     break;
   case AcceptedPathKind::IncludeInsertChildBoundary:
-    inventory.support = AcceptanceSupportKind::DeterministicButNotFirstClass;
+    inventory.support = AcceptanceSupportKind::ExplicitProofBacked;
     inventory.futureTarget = FutureProofTarget::IncludeInsertionByChildBoundary;
     break;
   case AcceptedPathKind::IncludeInsertRightNeighborPP:
-    inventory.support = AcceptanceSupportKind::DeterministicButNotFirstClass;
+    inventory.support = AcceptanceSupportKind::ExplicitProofBacked;
     inventory.futureTarget = FutureProofTarget::IncludeInsertionByRightNeighborPP;
     break;
   case AcceptedPathKind::IncludeInsertLeftNeighborPP:
-    inventory.support = AcceptanceSupportKind::DeterministicButNotFirstClass;
+    inventory.support = AcceptanceSupportKind::ExplicitProofBacked;
     inventory.futureTarget = FutureProofTarget::IncludeInsertionByLeftNeighborPP;
     break;
   case AcceptedPathKind::IncludeInsertDeclBoundary:
-    inventory.support = AcceptanceSupportKind::DeterministicButNotFirstClass;
+    inventory.support = AcceptanceSupportKind::ExplicitProofBacked;
     inventory.futureTarget = FutureProofTarget::IncludeInsertionByDeclBoundary;
     break;
   case AcceptedPathKind::IncludeRealizationInlineFromB:
@@ -8745,7 +8747,8 @@ void RefoldEngine::StampMacroWholeCoverRealizationPatch(
 
 RefoldEngine::ProofSummary RefoldEngine::BuildAcceptedPathProofSummary(
     AcceptedPathKind currentPath, const IncludePatch *patch,
-    const TUAnchorWitness *tuAnchorWitness) const {
+    const TUAnchorWitness *tuAnchorWitness,
+    const IncludeAnchorWitness *includeAnchorWitness) const {
   ProofSummary summary;
   summary.inventory = BuildAcceptancePathInventory(currentPath);
 
@@ -8761,7 +8764,12 @@ RefoldEngine::ProofSummary RefoldEngine::BuildAcceptedPathProofSummary(
     summary.realizationMode = RealizationMode::PreserveOriginalStructure;
     summary.preference = SelectionPreference::PreferStructurePreservation;
     summary.structurePreserving = true;
-    summary.discharge = ValidateIncludePreservingProof(currentPath, patch);
+    if (includeAnchorWitness) {
+      summary.hasIncludeAnchorWitness = true;
+      summary.includeAnchorWitness = *includeAnchorWitness;
+    }
+    summary.discharge =
+        ValidateIncludePreservingProof(currentPath, patch, includeAnchorWitness);
     break;
 
   case AcceptedPathKind::IncludeRealizationInlineFromB:
@@ -8848,7 +8856,8 @@ RefoldEngine::BuildIncludePatchProofSummary(
     summary.structurePreserving = !realizedSurface;
     summary.discharge = realizedSurface
                             ? ValidateIncludeRealizationProof(currentPath, patch)
-                            : ValidateIncludePreservingProof(currentPath, patch);
+                            : ValidateIncludePreservingProof(currentPath, patch,
+                                                             /*witness=*/nullptr);
   }
 
   summary.validated = false;
@@ -9049,7 +9058,8 @@ RefoldEngine::ValidateInvocationRealizationProof(const MacroPatch &patch) const 
 
 RefoldEngine::ProofDischargeRecord
 RefoldEngine::ValidateIncludePreservingProof(AcceptedPathKind currentPath,
-                                             const IncludePatch *patch) const {
+                                             const IncludePatch *patch,
+                                             const IncludeAnchorWitness *witness) const {
   if (currentPath == AcceptedPathKind::IncludePatchPendingMaterialization) {
     ProofDischargeRecord pending;
     pending.status = ProofDischargeStatus::PendingMaterialization;
@@ -9074,27 +9084,110 @@ RefoldEngine::ValidateIncludePreservingProof(AcceptedPathKind currentPath,
   if (!patch)
     return discharge.Finish();
 
+  discharge.Require(witness &&
+                        witness->evidence != IncludeAnchorEvidenceKind::Unknown,
+                    ProofObligationKind::IncludeAnchorWitnessTracked,
+                    ProofFailureReason::MissingIncludeAnchorWitness);
+
   switch (currentPath) {
   case AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens:
     discharge.Require(patch->aStart < patch->aEnd,
                       ProofObligationKind::IncludeMappedHeaderRangeTracked,
                       ProofFailureReason::MissingMappedHeaderRange);
+    discharge.Require(witness &&
+                          witness->evidence ==
+                              IncludeAnchorEvidenceKind::MappedHeaderTokens,
+                      ProofObligationKind::IncludeAnchorWitnessTracked,
+                      ProofFailureReason::MissingIncludeAnchorWitness);
+    discharge.Require(witness && witness->hasFirstPP && witness->hasLastPP &&
+                          witness->firstPP <= witness->lastPP,
+                      ProofObligationKind::IncludeMappedHeaderRangeTracked,
+                      ProofFailureReason::MissingMappedHeaderRange);
+    discharge.Require(witness && witness->hasByteRange &&
+                          witness->startByte <= witness->endByte,
+                      ProofObligationKind::IncludeMappedHeaderByteRangeTracked,
+                      ProofFailureReason::MissingMappedHeaderByteRange);
     break;
   case AcceptedPathKind::IncludeInsertSelectedConditionalBoundary:
     discharge.Require(patch->aStart == patch->aEnd,
                       ProofObligationKind::IncludePatchShapeTracked,
                       ProofFailureReason::MissingIncludePatchShape);
-    discharge.Require(patch->ownerHasCondArmCert,
-                      ProofObligationKind::IncludeConditionalOwnershipTracked,
-                      ProofFailureReason::MissingConditionalOwnership);
+    discharge.Require(witness &&
+                          witness->evidence ==
+                              IncludeAnchorEvidenceKind::SelectedConditionalBoundary,
+                      ProofObligationKind::IncludeSelectedConditionalBoundaryWitnessTracked,
+                      ProofFailureReason::MissingIncludeSelectedConditionalBoundaryWitness);
+    discharge.Require(witness && witness->hasAnchorByte,
+                      ProofObligationKind::IncludeAnchorByteTracked,
+                      ProofFailureReason::MissingIncludeAnchorByte);
+    discharge.Require(witness && witness->hasCondArmId,
+                      ProofObligationKind::IncludeSelectedConditionalBoundaryWitnessTracked,
+                      ProofFailureReason::MissingIncludeSelectedConditionalBoundaryWitness);
     break;
   case AcceptedPathKind::IncludeInsertChildBoundary:
+    discharge.Require(patch->aStart == patch->aEnd,
+                      ProofObligationKind::IncludePatchShapeTracked,
+                      ProofFailureReason::MissingIncludePatchShape);
+    discharge.Require(witness &&
+                          witness->evidence ==
+                              IncludeAnchorEvidenceKind::ChildBoundary,
+                      ProofObligationKind::IncludeChildBoundaryWitnessTracked,
+                      ProofFailureReason::MissingIncludeChildBoundaryWitness);
+    discharge.Require(witness && witness->hasAnchorByte,
+                      ProofObligationKind::IncludeAnchorByteTracked,
+                      ProofFailureReason::MissingIncludeAnchorByte);
+    discharge.Require(witness && witness->hasChildIncludeId,
+                      ProofObligationKind::IncludeChildBoundaryWitnessTracked,
+                      ProofFailureReason::MissingIncludeChildBoundaryWitness);
+    break;
   case AcceptedPathKind::IncludeInsertRightNeighborPP:
+    discharge.Require(patch->aStart == patch->aEnd,
+                      ProofObligationKind::IncludePatchShapeTracked,
+                      ProofFailureReason::MissingIncludePatchShape);
+    discharge.Require(witness &&
+                          witness->evidence ==
+                              IncludeAnchorEvidenceKind::RightNeighborPP,
+                      ProofObligationKind::IncludeRightNeighborWitnessTracked,
+                      ProofFailureReason::MissingIncludeRightNeighborWitness);
+    discharge.Require(witness && witness->hasAnchorByte,
+                      ProofObligationKind::IncludeAnchorByteTracked,
+                      ProofFailureReason::MissingIncludeAnchorByte);
+    discharge.Require(witness && witness->hasNeighborPP,
+                      ProofObligationKind::IncludeRightNeighborWitnessTracked,
+                      ProofFailureReason::MissingIncludeRightNeighborWitness);
+    break;
   case AcceptedPathKind::IncludeInsertLeftNeighborPP:
+    discharge.Require(patch->aStart == patch->aEnd,
+                      ProofObligationKind::IncludePatchShapeTracked,
+                      ProofFailureReason::MissingIncludePatchShape);
+    discharge.Require(witness &&
+                          witness->evidence ==
+                              IncludeAnchorEvidenceKind::LeftNeighborPP,
+                      ProofObligationKind::IncludeLeftNeighborWitnessTracked,
+                      ProofFailureReason::MissingIncludeLeftNeighborWitness);
+    discharge.Require(witness && witness->hasAnchorByte,
+                      ProofObligationKind::IncludeAnchorByteTracked,
+                      ProofFailureReason::MissingIncludeAnchorByte);
+    discharge.Require(witness && witness->hasNeighborPP,
+                      ProofObligationKind::IncludeLeftNeighborWitnessTracked,
+                      ProofFailureReason::MissingIncludeLeftNeighborWitness);
+    break;
   case AcceptedPathKind::IncludeInsertDeclBoundary:
     discharge.Require(patch->aStart == patch->aEnd,
                       ProofObligationKind::IncludePatchShapeTracked,
                       ProofFailureReason::MissingIncludePatchShape);
+    discharge.Require(witness &&
+                          witness->evidence ==
+                              IncludeAnchorEvidenceKind::DeclBoundary,
+                      ProofObligationKind::IncludeDeclBoundaryWitnessTracked,
+                      ProofFailureReason::MissingIncludeDeclBoundaryWitness);
+    discharge.Require(witness && witness->hasAnchorByte,
+                      ProofObligationKind::IncludeAnchorByteTracked,
+                      ProofFailureReason::MissingIncludeAnchorByte);
+    discharge.Require(witness && witness->hasDeclHeaderRange &&
+                          witness->anchorByte == witness->declHeaderE,
+                      ProofObligationKind::IncludeDeclBoundaryWitnessTracked,
+                      ProofFailureReason::MissingIncludeDeclBoundaryWitness);
     break;
   case AcceptedPathKind::IncludePatchPendingMaterialization:
   case AcceptedPathKind::IncludeRealizationInlineFromB:
@@ -9462,10 +9555,26 @@ StringRef RefoldEngine::FormatProofObligationKind(
     return "IncludePendingMaterializationClassified";
   case ProofObligationKind::IncludePatchShapeTracked:
     return "IncludePatchShapeTracked";
+  case ProofObligationKind::IncludeAnchorWitnessTracked:
+    return "IncludeAnchorWitnessTracked";
+  case ProofObligationKind::IncludeAnchorByteTracked:
+    return "IncludeAnchorByteTracked";
   case ProofObligationKind::IncludeConditionalOwnershipTracked:
     return "IncludeConditionalOwnershipTracked";
   case ProofObligationKind::IncludeMappedHeaderRangeTracked:
     return "IncludeMappedHeaderRangeTracked";
+  case ProofObligationKind::IncludeMappedHeaderByteRangeTracked:
+    return "IncludeMappedHeaderByteRangeTracked";
+  case ProofObligationKind::IncludeSelectedConditionalBoundaryWitnessTracked:
+    return "IncludeSelectedConditionalBoundaryWitnessTracked";
+  case ProofObligationKind::IncludeChildBoundaryWitnessTracked:
+    return "IncludeChildBoundaryWitnessTracked";
+  case ProofObligationKind::IncludeRightNeighborWitnessTracked:
+    return "IncludeRightNeighborWitnessTracked";
+  case ProofObligationKind::IncludeLeftNeighborWitnessTracked:
+    return "IncludeLeftNeighborWitnessTracked";
+  case ProofObligationKind::IncludeDeclBoundaryWitnessTracked:
+    return "IncludeDeclBoundaryWitnessTracked";
   case ProofObligationKind::TUAnchorPathClassified:
     return "TUAnchorPathClassified";
   case ProofObligationKind::TUAnchorWitnessTracked:
@@ -9528,10 +9637,26 @@ StringRef RefoldEngine::FormatProofFailureReason(ProofFailureReason reason) cons
     return "MissingWholeCoverBoundaryAccounting";
   case ProofFailureReason::MissingIncludePatchShape:
     return "MissingIncludePatchShape";
+  case ProofFailureReason::MissingIncludeAnchorWitness:
+    return "MissingIncludeAnchorWitness";
+  case ProofFailureReason::MissingIncludeAnchorByte:
+    return "MissingIncludeAnchorByte";
   case ProofFailureReason::MissingConditionalOwnership:
     return "MissingConditionalOwnership";
   case ProofFailureReason::MissingMappedHeaderRange:
     return "MissingMappedHeaderRange";
+  case ProofFailureReason::MissingMappedHeaderByteRange:
+    return "MissingMappedHeaderByteRange";
+  case ProofFailureReason::MissingIncludeSelectedConditionalBoundaryWitness:
+    return "MissingIncludeSelectedConditionalBoundaryWitness";
+  case ProofFailureReason::MissingIncludeChildBoundaryWitness:
+    return "MissingIncludeChildBoundaryWitness";
+  case ProofFailureReason::MissingIncludeRightNeighborWitness:
+    return "MissingIncludeRightNeighborWitness";
+  case ProofFailureReason::MissingIncludeLeftNeighborWitness:
+    return "MissingIncludeLeftNeighborWitness";
+  case ProofFailureReason::MissingIncludeDeclBoundaryWitness:
+    return "MissingIncludeDeclBoundaryWitness";
   case ProofFailureReason::MissingTUAnchorClassification:
     return "MissingTUAnchorClassification";
   case ProofFailureReason::MissingTUAnchorWitness:
@@ -9593,6 +9718,46 @@ std::string RefoldEngine::FormatTUAnchorWitness(
       .str();
 }
 
+StringRef RefoldEngine::FormatIncludeAnchorEvidenceKind(
+    IncludeAnchorEvidenceKind kind) const {
+  switch (kind) {
+  case IncludeAnchorEvidenceKind::Unknown:
+    return "Unknown";
+  case IncludeAnchorEvidenceKind::MappedHeaderTokens:
+    return "MappedHeaderTokens";
+  case IncludeAnchorEvidenceKind::SelectedConditionalBoundary:
+    return "SelectedConditionalBoundary";
+  case IncludeAnchorEvidenceKind::ChildBoundary:
+    return "ChildBoundary";
+  case IncludeAnchorEvidenceKind::RightNeighborPP:
+    return "RightNeighborPP";
+  case IncludeAnchorEvidenceKind::LeftNeighborPP:
+    return "LeftNeighborPP";
+  case IncludeAnchorEvidenceKind::DeclBoundary:
+    return "DeclBoundary";
+  }
+  return "Unknown";
+}
+
+std::string RefoldEngine::FormatIncludeAnchorWitness(
+    const IncludeAnchorWitness &witness) const {
+  return formatv(
+             "kind={0} anchorByte={1}{2} byteRange=[{3},{4}){5} firstPP={6}{7} "
+             "lastPP={8}{9} neighborPP={10}{11} condArm={12}{13} childInc={14}{15} "
+             "decl=[{16},{17}){18}",
+             FormatIncludeAnchorEvidenceKind(witness.evidence),
+             witness.anchorByte, witness.hasAnchorByte ? "" : "(missing)",
+             witness.startByte, witness.endByte,
+             witness.hasByteRange ? "" : "(missing)", witness.firstPP,
+             witness.hasFirstPP ? "" : "(missing)", witness.lastPP,
+             witness.hasLastPP ? "" : "(missing)", witness.neighborPP,
+             witness.hasNeighborPP ? "" : "(missing)", witness.condArmId,
+             witness.hasCondArmId ? "" : "(missing)", witness.childIncludeId,
+             witness.hasChildIncludeId ? "" : "(missing)", witness.declHeaderB,
+             witness.declHeaderE, witness.hasDeclHeaderRange ? "" : "(missing)")
+      .str();
+}
+
 StringRef
 RefoldEngine::FormatMacroPatchProofKind(MacroPatchProofKind kind) const {
   switch (kind) {
@@ -9649,14 +9814,22 @@ std::string RefoldEngine::FormatProofDischargeRecord(
 
 std::string RefoldEngine::FormatAcceptedPathAudit(
     AcceptedPathKind currentPath, const IncludePatch *patch,
-    const TUAnchorWitness *tuAnchorWitness) const {
-  const ProofSummary summary =
-      BuildAcceptedPathProofSummary(currentPath, patch, tuAnchorWitness);
+    const TUAnchorWitness *tuAnchorWitness,
+    const IncludeAnchorWitness *includeAnchorWitness) const {
+  const ProofSummary summary = BuildAcceptedPathProofSummary(
+      currentPath, patch, tuAnchorWitness, includeAnchorWitness);
   if (summary.hasTUAnchorWitness) {
     return formatv("inventory={0} discharge={1} tuAnchor={2}",
                    FormatAcceptancePathInventory(summary.inventory),
                    FormatProofDischargeRecord(summary.discharge),
                    FormatTUAnchorWitness(summary.tuAnchorWitness))
+        .str();
+  }
+  if (summary.hasIncludeAnchorWitness) {
+    return formatv("inventory={0} discharge={1} includeAnchor={2}",
+                   FormatAcceptancePathInventory(summary.inventory),
+                   FormatProofDischargeRecord(summary.discharge),
+                   FormatIncludeAnchorWitness(summary.includeAnchorWitness))
         .str();
   }
   return formatv("inventory={0} discharge={1}",
@@ -19652,8 +19825,10 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     // include-materialization path. The patch itself provides the class-local
     // witness data (for example whether the edit is an insertion or is owned
     // by a selected conditional arm).
-    auto includeInventoryFor = [&](AcceptedPathKind path) {
-      return FormatAcceptedPathAudit(path, &p);
+    auto includeInventoryFor = [&](AcceptedPathKind path,
+                                  const IncludeAnchorWitness *witness = nullptr) {
+      return FormatAcceptedPathAudit(path, &p, /*tuAnchorWitness=*/nullptr,
+                                     witness);
     };
 
     const bool isInsert = (p.aStart == p.aEnd) && (p.bStart < p.bEnd);
@@ -19760,6 +19935,17 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       if (const std::optional<uint64_t> insertByte =
               selectedArmBeginBoundaryByte()) {
         if (*insertByte <= fileLen && anchorMatchesCondArmCert(*insertByte)) {
+          IncludeAnchorWitness witness;
+          witness.evidence =
+              IncludeAnchorEvidenceKind::SelectedConditionalBoundary;
+          witness.hasAnchorByte = true;
+          witness.anchorByte = *insertByte;
+          if (auto rightArmRef = model_.FindArmRefAtPP(pos); rightArmRef &&
+              rightArmRef->arm) {
+            witness.hasCondArmId = true;
+            witness.condArmId = rightArmRef->arm->id;
+          }
+
           std::string text =
               PadAtBoundaries(headerText, static_cast<size_t>(*insertByte),
                               static_cast<size_t>(*insertByte), p.insertBytes,
@@ -19771,7 +19957,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                 "file={0} patch[{1}] INSERT: anchored at selected-arm boundary groupBegin={2} inventory={3}",
                 file, idx, insertByte,
                 includeInventoryFor(
-                    AcceptedPathKind::IncludeInsertSelectedConditionalBoundary));
+                    AcceptedPathKind::IncludeInsertSelectedConditionalBoundary,
+                    &witness));
           continue;
         }
       }
@@ -19782,9 +19969,12 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       // the next mapped PP token in the header, which is often *after* the
       // child include directive (since tokens from the included file do not map
       // back to this header).
+      IncludeAnchorWitness childBoundaryWitness;
       if (const std::optional<uint64_t> insertByte =
-              ComputeChildBoundaryInsertByte(p, file)) {
+              ComputeChildBoundaryInsertByte(p, file, &childBoundaryWitness)) {
         if (*insertByte <= fileLen && anchorMatchesCondArmCert(*insertByte)) {
+          childBoundaryWitness.hasAnchorByte = true;
+          childBoundaryWitness.anchorByte = *insertByte;
           std::string text =
               PadAtBoundaries(headerText, static_cast<size_t>(*insertByte),
                               static_cast<size_t>(*insertByte), p.insertBytes,
@@ -19796,7 +19986,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                 "file={0} patch[{1}] INSERT: anchored via child boundary at "
                 "byte={2} inventory={3}",
                 file, idx, insertByte,
-                includeInventoryFor(AcceptedPathKind::IncludeInsertChildBoundary));
+                includeInventoryFor(AcceptedPathKind::IncludeInsertChildBoundary,
+                                    &childBoundaryWitness));
           continue;
         }
       }
@@ -19814,11 +20005,18 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         // Insert immediately before the right neighbor token.
         startByte = ByteStartForPPInFile(file, *anchorPP,
                                          /* fallbackToEOF */ false, fileLen);
+        IncludeAnchorWitness rightNeighborWitness;
+        rightNeighborWitness.evidence = IncludeAnchorEvidenceKind::RightNeighborPP;
+        rightNeighborWitness.hasNeighborPP = anchorPP.has_value();
+        rightNeighborWitness.neighborPP = anchorPP ? *anchorPP : 0ULL;
+        rightNeighborWitness.hasAnchorByte = startByte.has_value();
+        rightNeighborWitness.anchorByte = startByte ? *startByte : 0ULL;
         trace("include/apply",
               "file={0} patch[{1}] INSERT: right-neighbor anchorPP={2} -> "
               "startByte={3} inventory={4}",
               file, idx, anchorPP, startByte,
-              includeInventoryFor(AcceptedPathKind::IncludeInsertRightNeighborPP));
+              includeInventoryFor(AcceptedPathKind::IncludeInsertRightNeighborPP,
+                                  &rightNeighborWitness));
         if (!startByte) {
           if (!ForceInlineTouchedIncludesFromB())
             RequestEscalation(
@@ -19850,11 +20048,18 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
 
         if (anchorPP) {
           startByte = ByteEndForPPInFile(file, *anchorPP, false, fileLen);
+          IncludeAnchorWitness leftNeighborWitness;
+          leftNeighborWitness.evidence = IncludeAnchorEvidenceKind::LeftNeighborPP;
+          leftNeighborWitness.hasNeighborPP = anchorPP.has_value();
+          leftNeighborWitness.neighborPP = anchorPP ? *anchorPP : 0ULL;
+          leftNeighborWitness.hasAnchorByte = startByte.has_value();
+          leftNeighborWitness.anchorByte = startByte ? *startByte : 0ULL;
           trace("include/apply",
                 "file={0} patch[{1}] INSERT: left-neighbor anchorPP={2} -> "
                 "startByte={3} inventory={4}",
                 file, idx, anchorPP, startByte,
-                includeInventoryFor(AcceptedPathKind::IncludeInsertLeftNeighborPP));
+                includeInventoryFor(AcceptedPathKind::IncludeInsertLeftNeighborPP,
+                                    &leftNeighborWitness));
           if (!startByte) {
             if (!ForceInlineTouchedIncludesFromB())
               RequestEscalation(
@@ -19871,11 +20076,19 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
           // 3) No PP neighbor at all in this header, but we have an owning
           // decl: anchor at the end of its header span.
           startByte = std::clamp<uint64_t>(decl->headerE, 0ULL, fileLen);
+          IncludeAnchorWitness declWitness;
+          declWitness.evidence = IncludeAnchorEvidenceKind::DeclBoundary;
+          declWitness.hasAnchorByte = startByte.has_value();
+          declWitness.anchorByte = startByte ? *startByte : 0ULL;
+          declWitness.hasDeclHeaderRange = true;
+          declWitness.declHeaderB = decl->headerB;
+          declWitness.declHeaderE = decl->headerE;
           trace(
               "include/apply",
               "file={0} patch[{1}] INSERT: no neighbors; anchor at declEnd={2} inventory={3}",
               file, idx, startByte,
-              includeInventoryFor(AcceptedPathKind::IncludeInsertDeclBoundary));
+              includeInventoryFor(AcceptedPathKind::IncludeInsertDeclBoundary,
+                                  &declWitness));
           if (!anchorMatchesCondArmCert(*startByte))
             startByte.reset();
         }
@@ -19884,8 +20097,9 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       if (!startByte) {
         // 4) Fallback: use child '#include' sites inside this header as
         // synthetic anchors.
+        IncludeAnchorWitness childBoundaryWitness;
         const std::optional<uint64_t> insertByte =
-            ComputeChildBoundaryInsertByte(p, file);
+            ComputeChildBoundaryInsertByte(p, file, &childBoundaryWitness);
         debug("include/apply.", "inserted byte {0}", insertByte);
         if (insertByte && *insertByte <= fileLen &&
             anchorMatchesCondArmCert(*insertByte)) {
@@ -19896,11 +20110,14 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
           edits.push_back(MakeTextEditWithResyncOrPending(
               headerText, *insertByte, *insertByte, text, file));
 
+          childBoundaryWitness.hasAnchorByte = true;
+          childBoundaryWitness.anchorByte = *insertByte;
           debug("include/apply.",
                 "file={0} patch[{1}] INSERT: anchored via child boundary at "
                 "byte={2} inventory={3}",
                 file, idx, insertByte,
-                includeInventoryFor(AcceptedPathKind::IncludeInsertChildBoundary));
+                includeInventoryFor(AcceptedPathKind::IncludeInsertChildBoundary,
+                                    &childBoundaryWitness));
         } else {
           // Preserve old behavior if we still can't place it
           // deterministically.
@@ -19962,12 +20179,22 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                                        /* fallbackToEOF */ false, fileLen);
       endByte =
           ByteEndForPPInFile(file, *lastPP, /* fallbackToEOF */ false, fileLen);
+      IncludeAnchorWitness mappedHeaderWitness;
+      mappedHeaderWitness.evidence = IncludeAnchorEvidenceKind::MappedHeaderTokens;
+      mappedHeaderWitness.hasFirstPP = firstPP.has_value();
+      mappedHeaderWitness.firstPP = firstPP ? *firstPP : 0ULL;
+      mappedHeaderWitness.hasLastPP = lastPP.has_value();
+      mappedHeaderWitness.lastPP = lastPP ? *lastPP : 0ULL;
+      mappedHeaderWitness.hasByteRange = startByte.has_value() && endByte.has_value();
+      mappedHeaderWitness.startByte = startByte ? *startByte : 0ULL;
+      mappedHeaderWitness.endByte = endByte ? *endByte : 0ULL;
       trace("include/apply",
             "file={0} patch[{1}] DELETE/REPLACE: firstPP={2} lastPP={3} -> "
             "bytes=[{4},{5}) inventory={6}",
             file, idx, firstPP, lastPP, startByte, endByte,
             includeInventoryFor(
-                AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens));
+                AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens,
+                &mappedHeaderWitness));
       if (!startByte || !endByte) {
         if (!ForceInlineTouchedIncludesFromB())
           RequestEscalation(
@@ -20064,7 +20291,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
 
 std::optional<uint64_t>
 RefoldEngine::ComputeChildBoundaryInsertByte(const IncludePatch &p,
-                                             StringRef file) const {
+                                             StringRef file,
+                                             IncludeAnchorWitness *witness) const {
   // Which include are we editing?
   const RefoldModel::IncludeItem *owner = p.include;
   if (!owner) {
@@ -20131,6 +20359,13 @@ RefoldEngine::ComputeChildBoundaryInsertByte(const IncludePatch &p,
             "== {1} in file={2}; candidates: {3}",
             beginMatches.size(), pos, file, dump(beginMatches));
     }
+    if (witness) {
+      witness->evidence = IncludeAnchorEvidenceKind::ChildBoundary;
+      witness->hasChildIncludeId = true;
+      witness->childIncludeId = beginMatches[0]->id;
+      witness->hasAnchorByte = true;
+      witness->anchorByte = beginMatches[0]->siteB;
+    }
     return beginMatches[0]->siteB;
   }
 
@@ -20140,6 +20375,13 @@ RefoldEngine::ComputeChildBoundaryInsertByte(const IncludePatch &p,
             "ambiguous child include boundary: {0} children have cover.end == "
             "{1} in file={2}; candidates: {3}",
             endMatches.size(), pos, file, dump(endMatches));
+    }
+    if (witness) {
+      witness->evidence = IncludeAnchorEvidenceKind::ChildBoundary;
+      witness->hasChildIncludeId = true;
+      witness->childIncludeId = endMatches[0]->id;
+      witness->hasAnchorByte = true;
+      witness->anchorByte = endMatches[0]->siteE;
     }
     return endMatches[0]->siteE;
   }

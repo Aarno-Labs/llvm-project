@@ -692,6 +692,54 @@ private:
     bool ownerDepthStable = false;
   };
 
+  /// rief Evidence source used to justify an accepted include-preserving
+  /// anchor or mapped include byte range.
+  ///
+  /// Step 8 lifts include-preserving materialization paths into explicit local
+  /// witnesses so each accepted include patch can explain which deterministic
+  /// anchoring or mapping rule was used.
+  enum class IncludeAnchorEvidenceKind : uint8_t {
+    Unknown,
+    MappedHeaderTokens,
+    SelectedConditionalBoundary,
+    ChildBoundary,
+    RightNeighborPP,
+    LeftNeighborPP,
+    DeclBoundary,
+  };
+
+  /// rief Compact Step-8 witness for an accepted include-preserving path.
+  struct IncludeAnchorWitness {
+    IncludeAnchorEvidenceKind evidence = IncludeAnchorEvidenceKind::Unknown;
+
+    // Concrete byte placement inside the edited header file. Inserts use a
+    // single anchor byte; mapped delete/replace paths use an explicit byte
+    // range.
+    bool hasAnchorByte = false;
+    uint64_t anchorByte = 0;
+    bool hasByteRange = false;
+    uint64_t startByte = 0;
+    uint64_t endByte = 0;
+
+    // PP-token provenance for mapped delete/replace paths and neighbor-based
+    // insertion anchors.
+    bool hasFirstPP = false;
+    uint64_t firstPP = 0;
+    bool hasLastPP = false;
+    uint64_t lastPP = 0;
+    bool hasNeighborPP = false;
+    uint64_t neighborPP = 0;
+
+    // Conditional, child-include, and declaration boundary metadata.
+    bool hasCondArmId = false;
+    uint64_t condArmId = 0;
+    bool hasChildIncludeId = false;
+    uint64_t childIncludeId = 0;
+    bool hasDeclHeaderRange = false;
+    uint64_t declHeaderB = 0;
+    uint64_t declHeaderE = 0;
+  };
+
   /// rief Status produced when the engine evaluates a local proof contract.
   ///
   /// Step 3 introduces explicit obligation/discharge records so accepted
@@ -727,8 +775,16 @@ private:
     WholeCoverBoundaryAccountingTracked,
     IncludePendingMaterializationClassified,
     IncludePatchShapeTracked,
+    IncludeAnchorWitnessTracked,
+    IncludeAnchorByteTracked,
     IncludeConditionalOwnershipTracked,
     IncludeMappedHeaderRangeTracked,
+    IncludeMappedHeaderByteRangeTracked,
+    IncludeSelectedConditionalBoundaryWitnessTracked,
+    IncludeChildBoundaryWitnessTracked,
+    IncludeRightNeighborWitnessTracked,
+    IncludeLeftNeighborWitnessTracked,
+    IncludeDeclBoundaryWitnessTracked,
     TUAnchorPathClassified,
     TUAnchorWitnessTracked,
     TUAnchorPPGapTracked,
@@ -761,8 +817,16 @@ private:
     MissingWholeCoverContainment,
     MissingWholeCoverBoundaryAccounting,
     MissingIncludePatchShape,
+    MissingIncludeAnchorWitness,
+    MissingIncludeAnchorByte,
     MissingConditionalOwnership,
     MissingMappedHeaderRange,
+    MissingMappedHeaderByteRange,
+    MissingIncludeSelectedConditionalBoundaryWitness,
+    MissingIncludeChildBoundaryWitness,
+    MissingIncludeRightNeighborWitness,
+    MissingIncludeLeftNeighborWitness,
+    MissingIncludeDeclBoundaryWitness,
     MissingTUAnchorClassification,
     MissingTUAnchorWitness,
     MissingTUAnchorGap,
@@ -813,6 +877,8 @@ private:
     uint64_t proofRootMacroId = 0;
     bool hasTUAnchorWitness = false;
     TUAnchorWitness tuAnchorWitness;
+    bool hasIncludeAnchorWitness = false;
+    IncludeAnchorWitness includeAnchorWitness;
   };
 
 
@@ -2558,11 +2624,14 @@ private:
   ///
   /// Step 3 uses this helper to attach class-local obligation/discharge
   /// metadata to non-macro accepted paths such as include anchors and TU
-  /// anchors. When \p patch is null, only obligations that can be discharged
-  /// from the path classification itself are evaluated.
+  /// anchors. Later steps may supply an explicit TU/include witness so the
+  /// accepted-path audit can report the exact deterministic anchor or mapped
+  /// byte range that was used. When \p patch is null, only obligations that
+  /// can be discharged from the path classification itself are evaluated.
   ProofSummary BuildAcceptedPathProofSummary(
       AcceptedPathKind currentPath, const IncludePatch *patch = nullptr,
-      const TUAnchorWitness *tuAnchorWitness = nullptr) const;
+      const TUAnchorWitness *tuAnchorWitness = nullptr,
+      const IncludeAnchorWitness *includeAnchorWitness = nullptr) const;
 
   /// \brief Build the default Step-1/2/3 proof summary for an include patch.
   ///
@@ -2596,7 +2665,8 @@ private:
   ProofDischargeRecord
   ValidateInvocationRealizationProof(const MacroPatch &patch) const;
   ProofDischargeRecord ValidateIncludePreservingProof(
-      AcceptedPathKind currentPath, const IncludePatch *patch) const;
+      AcceptedPathKind currentPath, const IncludePatch *patch,
+      const IncludeAnchorWitness *witness = nullptr) const;
   ProofDischargeRecord ValidateIncludeRealizationProof(
       AcceptedPathKind currentPath, const IncludePatch *patch) const;
   ProofDischargeRecord ValidateTUAnchorProof(
@@ -2616,6 +2686,7 @@ private:
   StringRef FormatProofObligationKind(ProofObligationKind obligation) const;
   StringRef FormatProofFailureReason(ProofFailureReason reason) const;
   StringRef FormatTUAnchorEvidenceKind(TUAnchorEvidenceKind kind) const;
+  StringRef FormatIncludeAnchorEvidenceKind(IncludeAnchorEvidenceKind kind) const;
 
   /// \brief Format a concrete TU anchor witness for tracing.
   ///
@@ -2623,6 +2694,9 @@ private:
   /// successful TU anchor. This formatter keeps that witness readable in the
   /// same audit stream as the normalized proof/discharge metadata.
   std::string FormatTUAnchorWitness(const TUAnchorWitness &witness) const;
+
+  /// \brief Format a concrete include anchor witness for tracing.
+  std::string FormatIncludeAnchorWitness(const IncludeAnchorWitness &witness) const;
 
   /// rief Format a patch proof kind for tracing.
   StringRef FormatMacroPatchProofKind(MacroPatchProofKind kind) const;
@@ -2642,7 +2716,8 @@ private:
   /// accepted-path audit entry.
   std::string FormatAcceptedPathAudit(
       AcceptedPathKind currentPath, const IncludePatch *patch = nullptr,
-      const TUAnchorWitness *tuAnchorWitness = nullptr) const;
+      const TUAnchorWitness *tuAnchorWitness = nullptr,
+      const IncludeAnchorWitness *includeAnchorWitness = nullptr) const;
 
   /// rief Format patch provenance and subtree-composition audit metadata.
   std::string FormatMacroPatchAudit(const MacroPatch &patch) const;
@@ -3080,12 +3155,15 @@ private:
   /// \param file The header file path whose text is being edited; only child
   ///             includes whose `sitePath` equals `file` are considered as
   ///             anchors.
+  /// \param witness Optional Step-8 witness sink that records which child
+  ///               boundary was chosen when the fallback succeeds.
   /// \return A byte offset within `file` at which the insertion should be
   /// applied,
   ///         or `std::nullopt` if this fallback does not apply or no stable anchor can be
   ///         found.
-  std::optional<uint64_t> ComputeChildBoundaryInsertByte(const IncludePatch &p,
-                                                         StringRef file) const;
+  std::optional<uint64_t> ComputeChildBoundaryInsertByte(
+      const IncludePatch &p, StringRef file,
+      IncludeAnchorWitness *witness = nullptr) const;
 
   /// \brief Creates a TextEdit for [start,end) in original that preserves
   /// __LINE__ transparency.
