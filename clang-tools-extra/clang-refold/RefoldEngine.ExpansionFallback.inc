@@ -495,21 +495,106 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   std::string replacement =
       SliceBSource(bEnvelope->first, bEnvelope->second).str();
   std::string rawReplacement = replacement;
+
+  // The closure begins at the exact include-directive run proved above, but we
+  // may later extend its right edge over immediately following untouched TU
+  // line(s). That keeps any required physical-line compensation after copied
+  // suffix lines such as `};` instead of introducing a blank line inside the
+  // realized replacement itself.
+  uint64_t closureSourceEnd = last->siteE;
   std::string padded = PadAtBoundaries(
-      tuBytes, static_cast<size_t>(first->siteB), static_cast<size_t>(last->siteE),
-      std::move(replacement), /*allowLeft=*/true, /*allowRight=*/true);
+      tuBytes, static_cast<size_t>(first->siteB),
+      static_cast<size_t>(closureSourceEnd), std::move(replacement),
+      /*allowLeft=*/true, /*allowRight=*/true);
+
+  // This closure class replaces only a contiguous run of top-level include
+  // directives plus whitespace between them. Preserve the original physical
+  // line count of the replaced source so the untouched suffix can resume on its
+  // original logical line without needing a #line directive. When there is a
+  // deficit, first try to sink it past immediately following untouched TU
+  // line(s) by absorbing those exact source bytes into the same TU edit.
+  const size_t origNl =
+      stringutils::countNewlines(tuBytes, first->siteB, closureSourceEnd);
+  const size_t initialReplNl = stringutils::countNewlines(padded);
+  if (origNl > initialReplNl) {
+    size_t remainingPadNl = origNl - initialReplNl;
+
+    auto intervalOverlapsSpelledArtifact =
+        [&](uint64_t begin, uint64_t end) -> bool {
+      for (const auto &inc : model_.GetIncludes()) {
+        if (!PathsEqual(inc.sitePath, tuPath))
+          continue;
+        if (inc.siteB < end && begin < inc.siteE)
+          return true;
+      }
+      for (const auto &m : model_.GetMacroInvocations()) {
+        if (m.invFile && !m.invFile->empty() && !PathsEqual(*m.invFile, tuPath))
+          continue;
+        if (!m.invB || !m.invE)
+          continue;
+        if (*m.invB < end && begin < *m.invE)
+          return true;
+      }
+      return false;
+    };
+
+    if (remainingPadNl > 0 && closureSourceEnd < tuBytes.size()) {
+      const uint64_t lineBegin = closureSourceEnd;
+      uint64_t lineEnd = lineBegin;
+      while (lineEnd < tuBytes.size() && tuBytes[lineEnd] != '\n')
+        ++lineEnd;
+      if (lineEnd < tuBytes.size())
+        ++lineEnd;
+
+      // Sink the unavoidable physical-line compensation past at most one
+      // immediately following substantive TU line. This is enough to move the
+      // blank-line surrogate past a copied suffix line such as `};`, while
+      // remaining conservative: copied-line absorption is newline-deficit
+      // invariant, so absorbing additional lines would only push the eventual
+      // compensation point farther down the file without improving correctness.
+      if (lineEnd > lineBegin &&
+          !intervalOverlapsSpelledArtifact(lineBegin, lineEnd)) {
+        StringRef line = tuBytes.slice(lineBegin, lineEnd);
+        StringRef trimmed = line.trim();
+        if (!trimmed.empty() && trimmed.front() != '#') {
+          padded.append(line.begin(), line.end());
+          closureSourceEnd = lineEnd;
+
+          // Re-emitting one untouched trailing line verbatim moves the eventual
+          // physical-line compensation point to just after that copied line,
+          // but it does not reduce the outstanding newline deficit. The
+          // original source span grows by the same newline count as the
+          // replacement text, so the difference between them is invariant under
+          // this exact copied-line absorption.
+          trace("fallback",
+                "TU include-closure newline sink: absorbed source=[{0},{1}) line='{2}' remainingPad={3} (single-line invariant-preserving sink)",
+                lineBegin, lineEnd, stringutils::showWSWithClip(line, 120),
+                remainingPadNl);
+        }
+      }
+    }
+
+    if (remainingPadNl > 0)
+      padded.append(remainingPadNl, '\n');
+
+    trace("fallback",
+          "TU include-closure newline pad: source=[{0},{1}) origNl={2} replNl={3} addNl={4} finalSourceEnd={5} result='{6}'",
+          first->siteB, last->siteE, origNl, initialReplNl,
+          origNl - initialReplNl, closureSourceEnd,
+          stringutils::showWSWithClip(padded, 120));
+  }
 
   debug("fallback",
         "TU include-closure accepted: includes=[{0},{1}] source=[{2},{3}) A=[{4},{5}) B=[{6},{7}) evidence={8} raw='{9}' padded='{10}'",
-        first->id, last->id, first->siteB, last->siteE, coverBegin, coverEnd,
-        bEnvelope->first, bEnvelope->second,
+        first->id, last->id, first->siteB, closureSourceEnd, coverBegin,
+        coverEnd, bEnvelope->first, bEnvelope->second,
         FormatIncludeRealizationEvidenceKind(evidenceKind),
         stringutils::showWSWithClip(rawReplacement, 120),
         stringutils::showWSWithClip(padded, 120));
 
-  ResyncOutcome ro =
-      ApplyResyncOrPend(tuBytes, first->siteB, last->siteE, padded, tuPath);
-  TextEdit edit{first->siteB, last->siteE, std::move(ro.text),
+  ResyncOutcome ro = ApplyResyncOrPend(tuBytes, first->siteB, closureSourceEnd,
+                                       padded, tuPath);
+  TextEdit edit{first->siteB, closureSourceEnd, std::move(ro.text),
                 std::move(ro.pending), std::nullopt, {}};
 
   // The emitted artifact is still a deterministic TU byte replacement even
