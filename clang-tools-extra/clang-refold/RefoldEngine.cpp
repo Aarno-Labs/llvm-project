@@ -9270,6 +9270,19 @@ bool RefoldEngine::IsSelectableAcceptedResultCandidate(
              ProofFailureReason::ExplicitOutOfDomainResult;
 }
 
+bool RefoldEngine::AcceptedResultCandidateHasOnlyNonTopLevelMacroSelectorFailure(
+    const AcceptedResultCandidate &candidate) const {
+  if (candidate.kind != AcceptedResultCandidateKind::MacroPatch)
+    return false;
+
+  const ProofDischargeRecord &discharge = candidate.proofSummary.discharge;
+  return discharge.status == ProofDischargeStatus::Rejected &&
+         discharge.failedObligation ==
+             ProofObligationKind::MacroProofRootIsTopLevel &&
+         discharge.failureReason ==
+             ProofFailureReason::NonTopLevelMacroProofRoot;
+}
+
 bool RefoldEngine::AcceptedResultCandidatePrefers(
     const AcceptedResultCandidate &lhs,
     const AcceptedResultCandidate &rhs) const {
@@ -9309,17 +9322,28 @@ bool RefoldEngine::AcceptedResultCandidatePrefers(
 }
 
 std::optional<size_t> RefoldEngine::SelectPreferredAcceptedResultCandidateIndex(
-    ArrayRef<AcceptedResultCandidate> candidates) const {
+    ArrayRef<AcceptedResultCandidate> candidates,
+    bool allowNonTopLevelMacroSelectorFailure) const {
   std::optional<size_t> bestIdx;
   uint64_t selectableCount = 0;
 
   // The caller still controls enumeration order. This selector only filters
   // that list to candidates whose proof summaries are allowed to participate,
   // then applies the normalized lattice/tie-break ordering while preserving
-  // stable caller order when the candidates remain indistinguishable.
+  // stable caller order when the candidates remain indistinguishable. One
+  // internal macro-construction site may additionally admit nested
+  // structure-preserving macro artifacts whose only remaining failed
+  // obligation is the top-level proof-root selector rule; this removes the
+  // last direct selector bypass without relaxing the theorem-facing discharge
+  // gate at any emitted boundary.
 
   for (size_t i = 0; i < candidates.size(); ++i) {
-    if (!IsSelectableAcceptedResultCandidate(candidates[i]))
+    const bool selectable =
+        IsSelectableAcceptedResultCandidate(candidates[i]) ||
+        (allowNonTopLevelMacroSelectorFailure &&
+         AcceptedResultCandidateHasOnlyNonTopLevelMacroSelectorFailure(
+             candidates[i]));
+    if (!selectable)
       continue;
     ++selectableCount;
     if (!bestIdx) {
@@ -20508,33 +20532,15 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     }
   }
 
-  // The final accepted-result selector is now authoritative for top-level
-  // emitted macro outcomes, but nested DAG-preserving roots are still
-  // intermediate artifacts that can feed outer wrapper / call-chain
-  // preservation. Their proof summaries intentionally fail the top-level root
-  // discharge obligation, so forcing them through the final selector here
-  // would incorrectly collapse them to whole-cover realization before the
-  // outer preserving owner gets a chance to absorb them.
-  //
-  // Keep the historical nested-DAG short-circuit until the later closure steps
-  // move intermediate preserving artifacts onto a selector/discharge model that
-  // does not require them to masquerade as final top-level emitted results.
-  if (dagRootCandidate && !conflictingConcreteSubtreeWitnessForcesWholeCover &&
-      GetRootMacroId(m.id) != m.id) {
-    ++lastTheoremAudit_.selectorDirectBypasses;
-    NoteTheoremAuditViolation(
-        llvm::formatv(
-            "nested DAG root replay bypassed final selector for inv id={0} name='{1}'",
-            m.id, m.name)
-            .str());
-    trace("macro/proof",
-          "returning nested DAG root replay candidate before final selector: "
-          "inv id={0} name={1} {2}",
-          m.id, m.name,
-          FormatAcceptedResultCandidate(BuildAcceptedMacroCandidate(
-              *dagRootCandidate)));
-    return *dagRootCandidate;
-  }
+  // Step 1 removes the last direct macro-selector bypass by letting the final
+  // macro candidate competition handle nested preserving artifacts too. The
+  // one extra local rule is that non-top-level construction sites may admit
+  // selector-only nested macro carriers whose only failed obligation is the
+  // top-level proof-root requirement; those carriers remain theorem-audited at
+  // later emission boundaries until step 2 gives them a fully discharged
+  // emitted representation.
+  const bool allowNonTopLevelMacroSelectorFailure =
+      GetRootMacroId(m.id) != m.id;
 
   const bool canReuseExistingCallsiteNoOp =
       reuseExistingCallsitePatch && !conflictingConcreteSubtreeWitnessForcesWholeCover &&
@@ -20605,9 +20611,11 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
   // Patch B moved the final macro-return site onto explicit accepted
   // candidates rather than a chain of early returns. Patch C keeps the
-  // existing candidate discovery logic above, but now only candidates whose
-  // declared proof summaries discharge successfully may participate in the
-  // final lattice arbitration.
+  // existing candidate discovery logic above and still uses proof discharge as
+  // the default participation gate. Step 1 adds the one scoped exception
+  // needed to remove the final direct bypass: non-top-level macro
+  // construction sites may also admit selector-only nested preserving
+  // artifacts whose sole failed obligation is the top-level proof-root rule.
   SmallVector<FinalMacroCandidate, 5> finalMacroCandidates;
   auto addFinalMacroCandidate = [&](const MacroPatch &patch,
                                    FinalMacroCandidateOrigin origin) {
@@ -20662,12 +20670,14 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     acceptedCandidates.push_back(candidate.acceptedCandidate);
 
   const std::optional<size_t> selectedIdx =
-      SelectPreferredAcceptedResultCandidateIndex(acceptedCandidates);
+      SelectPreferredAcceptedResultCandidateIndex(
+          acceptedCandidates, allowNonTopLevelMacroSelectorFailure);
   if (!selectedIdx) {
     trace("macro/proof",
           "no final macro candidate survived proof-discharge gating: inv id={0} "
-          "name={1} candidates={2}",
-          m.id, m.name, finalMacroCandidates.size());
+          "name={1} candidates={2} allowNestedSelectorOnly={3}",
+          m.id, m.name, finalMacroCandidates.size(),
+          allowNonTopLevelMacroSelectorFailure ? 1 : 0);
     return std::nullopt;
   }
 
@@ -21890,13 +21900,8 @@ bool RefoldEngine::EmittedTextEditHasDischargedAcceptedResults(
     // top-level-root selector rule. The theorem audit still records this as a
     // violation because it means the emitted artifact was not locally
     // discharged in the strong final-theorem sense.
-    const ProofDischargeRecord &discharge = carrier.proofSummary.discharge;
     const bool selectorOnlyException =
-        carrier.kind == AcceptedResultCandidateKind::MacroPatch &&
-        discharge.failedObligation ==
-            ProofObligationKind::MacroProofRootIsTopLevel &&
-        discharge.failureReason ==
-            ProofFailureReason::NonTopLevelMacroProofRoot;
+        AcceptedResultCandidateHasOnlyNonTopLevelMacroSelectorFailure(carrier);
     if (selectorOnlyException) {
       ++lastTheoremAudit_.emittedSelectorOnlyExceptionCarriers;
       NoteTheoremAuditViolation(

@@ -3036,13 +3036,33 @@ private:
       const AcceptedResultCandidate &lhs,
       const AcceptedResultCandidate &rhs) const;
 
+  /// \brief Return whether \p candidate failed only the nested-macro
+  /// top-level selector rule.
+  ///
+  /// Step 1 removes the last direct macro-selector bypass by letting nested
+  /// DAG/callsite preservation artifacts flow through the explicit candidate
+  /// selector instead of returning them directly. Those intermediate nested
+  /// artifacts are still rejected by the theorem-facing discharge rule that
+  /// requires a top-level proof root, so this helper isolates the one
+  /// narrowly-scoped selector-only failure that the non-top-level macro
+  /// construction site may admit locally while preserving the existing final
+  /// top-level gating everywhere else.
+  bool AcceptedResultCandidateHasOnlyNonTopLevelMacroSelectorFailure(
+      const AcceptedResultCandidate &candidate) const;
+
   /// \brief Return the index of the strongest selectable accepted candidate.
   ///
   /// The returned index always refers to the original \p candidates order so
   /// callers can keep artifact ownership outside the selector while still
-  /// centralizing the lattice-based comparison logic.
+  /// centralizing the lattice-based comparison logic. When
+  /// \p allowNonTopLevelMacroSelectorFailure is true, the selector also admits
+  /// nested macro-preserving artifacts whose only failed obligation is the
+  /// top-level proof-root rule; this is reserved for the internal non-top-
+  /// level macro construction site that still needs those artifacts as
+  /// intermediate results.
   std::optional<size_t> SelectPreferredAcceptedResultCandidateIndex(
-      ArrayRef<AcceptedResultCandidate> candidates) const;
+      ArrayRef<AcceptedResultCandidate> candidates,
+      bool allowNonTopLevelMacroSelectorFailure = false) const;
 
   /// \brief Return whether \p m carries usable producer-side paste witnesses.
   ///
