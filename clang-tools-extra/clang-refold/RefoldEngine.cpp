@@ -1104,9 +1104,10 @@ RefoldEngine::SliceBSourceClippedAgainstClaims(size_t bTokStart,
 }
 
 std::string RefoldEngine::Refold() {
-  // The engine is single-pass: either the structural pass discharges into the
-  // declared proof/lattice outcomes, or it requests the one explicit terminal
-  // fallback to the fully expanded edited preprocessed stream (B).
+  // The engine is single-pass: it first attempts structural refolding, then
+  // (if structural proof discharge requests fallback) resolves the post-
+  // structural fallback choice between the proved intermediate expansion stage
+  // and the explicit raw-B terminal carrier.
   ResetTerminalFallbackState();
   ResetAttemptStats();
   ResetTheoremAudit();
@@ -1119,52 +1120,12 @@ std::string RefoldEngine::Refold() {
   // reported.
   EnforceTheoremAuditInvariants();
 
-  if (!terminalFallbackRequested_) {
-    EmitRefoldStats();
-    EmitTheoremAudit();
-    return out;
-  }
+  if (terminalFallbackRequested_)
+    out = ResolvePostStructuralFallback();
 
-  // Partial-expansion fallback sits strictly between structural emission and
-  // terminal fallback to B. A successful synthesis here supersedes the raw-B
-  // terminal carrier, so only record the explicit terminal theorem witness if
-  // this intermediate stage also fails closed.
-  if (auto expanded = TryExpansionClosureFallback()) {
-    EmitRefoldStats();
-    EmitTheoremAudit();
-    return *expanded;
-  }
-
-  // Step 8 closes the final theorem-facing audit gap for true terminal runs:
-  // once both structural emission and proved intermediate fallback fail, the
-  // remaining result must still classify as the one explicit normalized
-  // out-of-domain carrier rather than only as an operational side effect.
-  RecordTerminalFallbackTheoremAudit();
-
-  debug("fallback",
-        "terminal fallback: emitting fully expanded edited preprocessed "
-        "stream (B). reasons={0}",
-        terminalFallbackReasons_.size());
-  const TerminalFallbackWitness terminalWitness = BuildTerminalFallbackWitness();
-  const AcceptedResultCandidate terminalCandidate =
-      BuildAcceptedTerminalCandidate(terminalWitness);
-  debug("proof/inventory", "terminal result {0}",
-        FormatAcceptedResultCandidate(terminalCandidate));
-  for (const auto &r : terminalFallbackReasons_)
-    debug("fallback", "  {0}", r);
-
-  lastStats_ = RefoldStats{};
-  lastStats_.totalIncludes = model_.GetIncludes().size();
-  lastStats_.expandedIncludes = lastStats_.totalIncludes;
-  for (const auto &mi : model_.GetMacroInvocations()) {
-    if (!mi.callerMacroId)
-      ++lastStats_.totalMacros;
-  }
-  lastStats_.expandedMacros = lastStats_.totalMacros;
-  lastStats_.terminalFallbackToB = true;
   EmitRefoldStats();
   EmitTheoremAudit();
-  return bSource_.str();
+  return out;
 }
 
 std::string RefoldEngine::RunSinglePassRefold() {
