@@ -8598,11 +8598,12 @@ RefoldEngine::BuildAcceptancePathInventory(AcceptedPathKind currentPath) const {
     inventory.futureTarget = FutureProofTarget::IncludeRealizationCover;
     break;
   case AcceptedPathKind::IncludeMaterializedExpansion:
-    // Step 2A gives recursively materialized include expansions an explicit
-    // normalized carrier at the parent/TU emission boundary, but the path
-    // remains transitional until a later step closes the full realization
-    // proof contract.
-    inventory.support = AcceptanceSupportKind::DeterministicButNotFirstClass;
+    // Step 3 closes the remaining emitted transitional gap for recursively
+    // materialized include expansions. By the time this path reaches an
+    // emitted parent/TU edit, step 2A has attached an explicit normalized
+    // carrier and step 2B has made its discharge record behaviorally
+    // authoritative at the emission boundary.
+    inventory.support = AcceptanceSupportKind::ExplicitProofBacked;
     inventory.futureTarget =
         FutureProofTarget::IncludeMaterializedExpansionRealization;
     break;
@@ -8619,10 +8620,11 @@ RefoldEngine::BuildAcceptancePathInventory(AcceptedPathKind currentPath) const {
     break;
   case AcceptedPathKind::TUByteSpanMappedEdit:
   case AcceptedPathKind::TUByteSpanConservativeEdit:
-    // Step 2A makes TU byte-span edits explicit emitted artifacts with a
-    // normalized carrier, while keeping them transitional until the direct TU
-    // textual proof contract is fully formalized.
-    inventory.support = AcceptanceSupportKind::DeterministicButNotFirstClass;
+    // Step 3 closes the remaining emitted transitional gap for direct TU byte
+    // edits. These paths now participate as explicit proof-backed TU textual
+    // realizations because step 2A attaches normalized carriers and step 2B
+    // enforces their discharge at the byte-edit emission boundary.
+    inventory.support = AcceptanceSupportKind::ExplicitProofBacked;
     inventory.futureTarget = FutureProofTarget::TUByteSpanTextualEdit;
     break;
   case AcceptedPathKind::TerminalEmitEditedPreprocessedStream:
@@ -9038,9 +9040,10 @@ RefoldEngine::BuildCompletenessContract(const ProofSummary &summary) const {
   CompletenessContract contract;
 
   // Completeness is defined relative to the declared proof-class set, not
-  // relative to every imaginable refolding. A path therefore either already
-  // counts toward the declared set, remains transitional while a class is
-  // still being closed, or is explicitly outside the declared set.
+  // relative to every imaginable refolding. After step 3, any remaining
+  // transitional path should be an internal non-emitting staging state;
+  // emitted non-terminal artifacts are expected to land either in a declared
+  // proof class or in an explicit out-of-domain terminal result.
   if (summary.inventory.currentPath ==
           AcceptedPathKind::TerminalEmitEditedPreprocessedStream ||
       summary.inventory.support ==
@@ -9618,6 +9621,10 @@ RefoldEngine::ValidateIncludePreservingProof(AcceptedPathKind currentPath,
                                              const IncludePatch *patch,
                                              const IncludeAnchorWitness *witness) const {
   if (currentPath == AcceptedPathKind::IncludePatchPendingMaterialization) {
+    // This is the one remaining transitional include state: a deterministic
+    // pre-emission staging patch that still awaits a concrete preserving or
+    // realization class. Step 2B's universal emission gate makes this state
+    // unreachable at any final emitted byte-edit boundary.
     ProofDischargeRecord pending;
     pending.status = ProofDischargeStatus::PendingMaterialization;
     pending.failureReason = ProofFailureReason::PendingMaterialization;
@@ -21684,6 +21691,20 @@ bool RefoldEngine::EmittedTextEditHasDischargedAcceptedResults(
       return false;
     }
 
+    // Step 3 is meant to eliminate transitional-gap states from emitted
+    // behavior, not merely relabel them in the normalized proof model. Keep
+    // any remaining non-first-class / transitional carrier fail-closed at the
+    // byte-edit emission boundary even if some earlier stage forgot to stamp a
+    // stronger local diagnosis onto the discharge record.
+    if (carrier.proofSummary.inventory.support !=
+            AcceptanceSupportKind::ExplicitProofBacked ||
+        carrier.proofSummary.theoremDomain.kind ==
+            TheoremDomainKind::TransitionalGap ||
+        carrier.proofSummary.completeness.coverage ==
+            CompletenessCoverageKind::TransitionalGap) {
+      return false;
+    }
+
     if (carrier.proofSummary.discharge.status ==
         ProofDischargeStatus::Discharged) {
       return true;
@@ -21695,8 +21716,9 @@ bool RefoldEngine::EmittedTextEditHasDischargedAcceptedResults(
     // outer construction flow has already selected a structurally preserving
     // nested macro rewrite, that nested artifact is allowed to reach emitted
     // source text as long as the *only* remaining rejected obligation is the
-    // top-level-root selector rule. Keep all other rejected proof states
-    // fail-closed here.
+    // top-level-root selector rule. Keep all other rejected proof states --
+    // including the last internal transitional state
+    // `IncludePatchPendingMaterialization` -- fail-closed here.
     const ProofDischargeRecord &discharge = carrier.proofSummary.discharge;
     return carrier.kind == AcceptedResultCandidateKind::MacroPatch &&
            discharge.failedObligation ==
