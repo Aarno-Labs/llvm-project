@@ -248,7 +248,26 @@ private:
     bool terminalFallbackToB = false;
   };
 
+  struct TheoremAuditStats {
+    uint64_t emittedNonTerminalEdits = 0;
+    uint64_t emittedCarriers = 0;
+    uint64_t emittedDeclaredClassCarriers = 0;
+    uint64_t emittedDischargedCarriers = 0;
+    uint64_t emittedSelectorOnlyExceptionCarriers = 0;
+    uint64_t emittedUndischargedCarriers = 0;
+    uint64_t emittedUnknownClassCarriers = 0;
+    uint64_t emittedOutOfDomainCarriers = 0;
+    uint64_t selectorCompetitions = 0;
+    uint64_t selectorResolutions = 0;
+    uint64_t selectorNoSelectable = 0;
+    uint64_t selectorDirectBypasses = 0;
+    uint64_t explicitTerminalExclusions = 0;
+    bool theoremSatisfied = true;
+    std::string firstViolation;
+  };
+
   RefoldStats lastStats_;
+  mutable TheoremAuditStats lastTheoremAudit_;
 
   // Single-pass terminal-fallback scaffold: if any edit/patch cannot be
   // discharged into the declared proof/lattice outcomes in the current pass,
@@ -296,6 +315,44 @@ private:
     for (const auto &mi : model_.GetMacroInvocations()) {
       if (!mi.callerMacroId)
         ++lastStats_.totalMacros;
+    }
+  }
+
+  /// Reset the per-run theorem audit counters.
+  void ResetTheoremAudit() const { lastTheoremAudit_ = TheoremAuditStats{}; }
+
+  /// Record the first theorem-audit violation encountered in the current run.
+  void NoteTheoremAuditViolation(llvm::StringRef detail) const {
+    if (lastTheoremAudit_.theoremSatisfied)
+      lastTheoremAudit_.firstViolation = detail.str();
+    lastTheoremAudit_.theoremSatisfied = false;
+  }
+
+  /// Emit a compact theorem-audit summary for the current run.
+  void EmitTheoremAudit() const {
+    info("theorem",
+         "satisfied={0} emittedEdits={1} carriers={2} declared={3} discharged={4} "
+         "selectorOnlyExceptions={5} undischarged={6} unknownClass={7} outOfDomain={8} "
+         "selectorCompetitions={9} selectorResolutions={10} selectorNoSelectable={11} "
+         "selectorDirectBypasses={12} explicitTerminalExclusions={13}",
+         lastTheoremAudit_.theoremSatisfied ? 1 : 0,
+         lastTheoremAudit_.emittedNonTerminalEdits,
+         lastTheoremAudit_.emittedCarriers,
+         lastTheoremAudit_.emittedDeclaredClassCarriers,
+         lastTheoremAudit_.emittedDischargedCarriers,
+         lastTheoremAudit_.emittedSelectorOnlyExceptionCarriers,
+         lastTheoremAudit_.emittedUndischargedCarriers,
+         lastTheoremAudit_.emittedUnknownClassCarriers,
+         lastTheoremAudit_.emittedOutOfDomainCarriers,
+         lastTheoremAudit_.selectorCompetitions,
+         lastTheoremAudit_.selectorResolutions,
+         lastTheoremAudit_.selectorNoSelectable,
+         lastTheoremAudit_.selectorDirectBypasses,
+         lastTheoremAudit_.explicitTerminalExclusions);
+    if (!lastTheoremAudit_.theoremSatisfied &&
+        !lastTheoremAudit_.firstViolation.empty()) {
+      info("theorem", "firstViolation={0}",
+           stringutils::showWSWithClip(lastTheoremAudit_.firstViolation, 220));
     }
   }
 

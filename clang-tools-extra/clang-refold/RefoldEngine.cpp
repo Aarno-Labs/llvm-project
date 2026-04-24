@@ -896,10 +896,12 @@ std::string RefoldEngine::Refold() {
   // fallback to the fully expanded edited preprocessed stream (B).
   ResetTerminalFallbackState();
   ResetAttemptStats();
+  ResetTheoremAudit();
 
   std::string out = RunSinglePassRefold();
   if (!terminalFallbackRequested_) {
     EmitRefoldStats();
+    EmitTheoremAudit();
     return out;
   }
 
@@ -907,6 +909,11 @@ std::string RefoldEngine::Refold() {
         "terminal fallback: emitting fully expanded edited preprocessed "
         "stream (B). reasons={0}",
         terminalFallbackReasons_.size());
+  if (terminalFallbackKind_ != TerminalFallbackKind::Unknown)
+    ++lastTheoremAudit_.explicitTerminalExclusions;
+  else
+    NoteTheoremAuditViolation(
+        "terminal fallback requested without an explicit exclusion kind");
   const TerminalFallbackWitness terminalWitness = BuildTerminalFallbackWitness();
   const AcceptedResultCandidate terminalCandidate =
       BuildAcceptedTerminalCandidate(terminalWitness);
@@ -925,6 +932,7 @@ std::string RefoldEngine::Refold() {
   lastStats_.expandedMacros = lastStats_.totalMacros;
   lastStats_.terminalFallbackToB = true;
   EmitRefoldStats();
+  EmitTheoremAudit();
   return bSource_.str();
 }
 
@@ -9303,6 +9311,7 @@ bool RefoldEngine::AcceptedResultCandidatePrefers(
 std::optional<size_t> RefoldEngine::SelectPreferredAcceptedResultCandidateIndex(
     ArrayRef<AcceptedResultCandidate> candidates) const {
   std::optional<size_t> bestIdx;
+  uint64_t selectableCount = 0;
 
   // The caller still controls enumeration order. This selector only filters
   // that list to candidates whose proof summaries are allowed to participate,
@@ -9312,12 +9321,21 @@ std::optional<size_t> RefoldEngine::SelectPreferredAcceptedResultCandidateIndex(
   for (size_t i = 0; i < candidates.size(); ++i) {
     if (!IsSelectableAcceptedResultCandidate(candidates[i]))
       continue;
+    ++selectableCount;
     if (!bestIdx) {
       bestIdx = i;
       continue;
     }
     if (AcceptedResultCandidatePrefers(candidates[i], candidates[*bestIdx]))
       bestIdx = i;
+  }
+
+  if (selectableCount > 1) {
+    ++lastTheoremAudit_.selectorCompetitions;
+    if (bestIdx)
+      ++lastTheoremAudit_.selectorResolutions;
+  } else if (!bestIdx && !candidates.empty()) {
+    ++lastTheoremAudit_.selectorNoSelectable;
   }
 
   return bestIdx;
@@ -20503,6 +20521,12 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   // does not require them to masquerade as final top-level emitted results.
   if (dagRootCandidate && !conflictingConcreteSubtreeWitnessForcesWholeCover &&
       GetRootMacroId(m.id) != m.id) {
+    ++lastTheoremAudit_.selectorDirectBypasses;
+    NoteTheoremAuditViolation(
+        llvm::formatv(
+            "nested DAG root replay bypassed final selector for inv id={0} name='{1}'",
+            m.id, m.name)
+            .str());
     trace("macro/proof",
           "returning nested DAG root replay candidate before final selector: "
           "inv id={0} name={1} {2}",
@@ -21809,13 +21833,30 @@ bool RefoldEngine::EmittedTextEditHasDischargedAcceptedResults(
     StringRef emissionOwner) const {
   const StringRef owner = emissionOwner.empty() ? StringRef("<unknown>")
                                                 : emissionOwner;
+  ++lastTheoremAudit_.emittedNonTerminalEdits;
 
   auto carrierIsEmissionDischarged =
       [&](const AcceptedResultCandidate &carrier) -> bool {
-    if (carrier.kind == AcceptedResultCandidateKind::Unknown ||
-        carrier.kind == AcceptedResultCandidateKind::TerminalOutOfDomain) {
+    ++lastTheoremAudit_.emittedCarriers;
+
+    if (carrier.kind == AcceptedResultCandidateKind::Unknown) {
+      ++lastTheoremAudit_.emittedUnknownClassCarriers;
+      NoteTheoremAuditViolation("emitted carrier had unknown candidate kind");
       return false;
     }
+    if (carrier.kind == AcceptedResultCandidateKind::TerminalOutOfDomain) {
+      ++lastTheoremAudit_.emittedOutOfDomainCarriers;
+      NoteTheoremAuditViolation(
+          "non-terminal emitted edit carried explicit out-of-domain result");
+      return false;
+    }
+    if (carrier.proofSummary.acceptedClass == AcceptedProofClass::Unknown) {
+      ++lastTheoremAudit_.emittedUnknownClassCarriers;
+      NoteTheoremAuditViolation(
+          "emitted carrier did not belong to a declared accepted proof class");
+      return false;
+    }
+    ++lastTheoremAudit_.emittedDeclaredClassCarriers;
 
     // Step 3 is meant to eliminate transitional-gap states from emitted
     // behavior, not merely relabel them in the normalized proof model. Keep
@@ -21828,11 +21869,15 @@ bool RefoldEngine::EmittedTextEditHasDischargedAcceptedResults(
             TheoremDomainKind::TransitionalGap ||
         carrier.proofSummary.completeness.coverage ==
             CompletenessCoverageKind::TransitionalGap) {
+      ++lastTheoremAudit_.emittedUndischargedCarriers;
+      NoteTheoremAuditViolation(
+          "emitted carrier remained transitional at the byte-edit boundary");
       return false;
     }
 
     if (carrier.proofSummary.discharge.status ==
         ProofDischargeStatus::Discharged) {
+      ++lastTheoremAudit_.emittedDischargedCarriers;
       return true;
     }
 
@@ -21842,18 +21887,32 @@ bool RefoldEngine::EmittedTextEditHasDischargedAcceptedResults(
     // outer construction flow has already selected a structurally preserving
     // nested macro rewrite, that nested artifact is allowed to reach emitted
     // source text as long as the *only* remaining rejected obligation is the
-    // top-level-root selector rule. Keep all other rejected proof states --
-    // including the last internal transitional state
-    // `IncludePatchPendingMaterialization` -- fail-closed here.
+    // top-level-root selector rule. The theorem audit still records this as a
+    // violation because it means the emitted artifact was not locally
+    // discharged in the strong final-theorem sense.
     const ProofDischargeRecord &discharge = carrier.proofSummary.discharge;
-    return carrier.kind == AcceptedResultCandidateKind::MacroPatch &&
-           discharge.failedObligation ==
-               ProofObligationKind::MacroProofRootIsTopLevel &&
-           discharge.failureReason ==
-               ProofFailureReason::NonTopLevelMacroProofRoot;
+    const bool selectorOnlyException =
+        carrier.kind == AcceptedResultCandidateKind::MacroPatch &&
+        discharge.failedObligation ==
+            ProofObligationKind::MacroProofRootIsTopLevel &&
+        discharge.failureReason ==
+            ProofFailureReason::NonTopLevelMacroProofRoot;
+    if (selectorOnlyException) {
+      ++lastTheoremAudit_.emittedSelectorOnlyExceptionCarriers;
+      NoteTheoremAuditViolation(
+          "emitted nested macro carrier relied on non-top-level selector exception");
+      return true;
+    }
+
+    ++lastTheoremAudit_.emittedUndischargedCarriers;
+    NoteTheoremAuditViolation(
+        "emitted carrier failed local proof discharge at the byte-edit boundary");
+    return false;
   };
 
   if (edit.acceptedResults.empty()) {
+    NoteTheoremAuditViolation(
+        "emitted edit reached the byte-edit boundary without accepted-result carriers");
     RequestTerminalFallback(
         TerminalFallbackKind::UndischargedEmissionArtifact, emissionPhase,
         llvm::formatv(
@@ -21867,6 +21926,8 @@ bool RefoldEngine::EmittedTextEditHasDischargedAcceptedResults(
     const std::shared_ptr<const AcceptedResultCandidate> &carrier =
         edit.acceptedResults[i];
     if (!carrier) {
+      NoteTheoremAuditViolation(
+          "emitted edit carried a null accepted-result carrier");
       RequestTerminalFallback(
           TerminalFallbackKind::UndischargedEmissionArtifact, emissionPhase,
           llvm::formatv(
