@@ -236,6 +236,8 @@ private:
   struct TerminalFallbackWitness {
     TerminalFallbackKind kind = TerminalFallbackKind::Unknown;
     uint32_t requestCount = 0;
+    bool hasPrimaryReason = false;
+    std::string primaryReason;
   };
 
   struct RefoldStats {
@@ -3075,6 +3077,17 @@ private:
 
   /// \brief Build the explicit terminal-fallback witness for the current pass.
   TerminalFallbackWitness BuildTerminalFallbackWitness() const;
+  /// \brief Build a detailed terminal-fallback reason for the unresolved-owner
+  /// / no-TU-anchor domain wall.
+  ///
+  /// This helper records the deterministic owner and TU-anchor searches that
+  /// were already exhausted before the engine concluded that no declared
+  /// macro/include/TU proof class could own the edit. It does not guess a new
+  /// owner or widen admissibility.
+  std::string BuildOwnerUnresolvedNoTUAnchorDetail(
+      size_t hunkIndex, const diffutils::Hunk &h, StringRef tuPath,
+      const Owner &owner, bool mapsToTU) const;
+
 
   /// \brief Format the explicit terminal-fallback witness for tracing.
   std::string

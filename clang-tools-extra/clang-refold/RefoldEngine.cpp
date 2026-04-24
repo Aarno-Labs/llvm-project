@@ -1858,9 +1858,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
     // synthesizing ownership.
     RequestTerminalFallback(
         TerminalFallbackKind::OwnerUnresolvedNoTUAnchor, "classify",
-        llvm::formatv("dropped edit #{0} (owner unresolved, no TU byte span)",
-                      i)
-            .str());
+        BuildOwnerUnresolvedNoTUAnchorDetail(i, h, tuPath, owner, mapsToTU));
     continue;
   }
 
@@ -10602,7 +10600,52 @@ RefoldEngine::BuildTerminalFallbackWitness() const {
   TerminalFallbackWitness witness;
   witness.kind = terminalFallbackKind_;
   witness.requestCount = terminalFallbackRequestCount_;
+  if (!terminalFallbackReasons_.empty()) {
+    witness.hasPrimaryReason = true;
+    witness.primaryReason = terminalFallbackReasons_.front();
+  }
   return witness;
+}
+
+std::string RefoldEngine::BuildOwnerUnresolvedNoTUAnchorDetail(
+    size_t hunkIndex, const diffutils::Hunk &h, StringRef tuPath,
+    const Owner &owner, bool mapsToTU) const {
+  const bool isInsertion = h.aStart == h.aEnd;
+  std::optional<std::pair<uint64_t, uint64_t>> tuSpan =
+      TUByteSpan(h.aStart, h.aEnd, tuPath);
+
+  std::string exactSlot = "n/a";
+  std::string insertionAnchor = "n/a";
+  std::string boundaryParent = "n/a";
+  if (isInsertion) {
+    if (auto slot = AnchorToExactSlotBoundaryFromPPGap(tuPath, h.aStart))
+      exactSlot = llvm::formatv("{0}", *slot).str();
+    else
+      exactSlot = "none";
+
+    if (auto anchor = FindProvableTUInsertionAnchor(h.aStart, tuPath))
+      insertionAnchor = llvm::formatv("{0}", *anchor).str();
+    else
+      insertionAnchor = "none";
+
+    if (const auto *inc = BoundaryParentIncludeForPureInsertion(h))
+      boundaryParent = llvm::formatv("inc#{0}", inc->id).str();
+    else
+      boundaryParent = "none";
+  }
+
+  const std::string tuSpanStr =
+      tuSpan ? llvm::formatv("[{0},{1})", tuSpan->first, tuSpan->second).str()
+             : std::string("none");
+
+  return llvm::formatv(
+             "edit #{0} A=[{1},{2}) insert={3} owner={4} mapsToTU={5} "
+             "TUByteSpan={6} exactSlot={7} insertionAnchor={8} "
+             "boundaryParentInclude={9}",
+             hunkIndex, h.aStart, h.aEnd, isInsertion ? "yes" : "no",
+             toString(owner.kind), mapsToTU ? "yes" : "no", tuSpanStr,
+             exactSlot, insertionAnchor, boundaryParent)
+      .str();
 }
 
 std::string RefoldEngine::FormatTerminalFallbackWitness(
@@ -10623,8 +10666,14 @@ std::string RefoldEngine::FormatTerminalFallbackWitness(
     return "Unknown";
   };
 
-  return formatv("kind={0} requestCount={1}", formatKind(witness.kind),
-                 witness.requestCount)
+  if (!witness.hasPrimaryReason)
+    return formatv("kind={0} requestCount={1}", formatKind(witness.kind),
+                   witness.requestCount)
+        .str();
+
+  return formatv("kind={0} requestCount={1} primaryReason='{2}'",
+                 formatKind(witness.kind), witness.requestCount,
+                 stringutils::showWSWithClip(witness.primaryReason, 200))
       .str();
 }
 
@@ -10694,7 +10743,7 @@ std::string RefoldEngine::FormatGlobalSelectionLattice(
 std::string RefoldEngine::FormatCompletenessContract(
     const CompletenessContract &contract) const {
   if (contract.hasExplicitExclusion) {
-    const TerminalFallbackWitness witness{contract.explicitExclusion, 0};
+    const TerminalFallbackWitness witness{contract.explicitExclusion, 0, false, std::string()};
     return formatv("coverage={0} expectation={1} declaredTarget={2} counts={3} exclusion={4}",
                    FormatCompletenessCoverageKind(contract.coverage),
                    FormatCompletenessExpectationKind(contract.expectation),
@@ -10715,7 +10764,7 @@ std::string RefoldEngine::FormatCompletenessContract(
 std::string RefoldEngine::FormatTheoremDomainContract(
     const TheoremDomainContract &contract) const {
   if (contract.hasExplicitExclusion) {
-    const TerminalFallbackWitness witness{contract.explicitExclusion, 0};
+    const TerminalFallbackWitness witness{contract.explicitExclusion, 0, false, std::string()};
     return formatv(
                "kind={0} inDeclaredDomain={1} counts={2} declaredTarget={3} exclusion={4}",
                FormatTheoremDomainKind(contract.kind),
