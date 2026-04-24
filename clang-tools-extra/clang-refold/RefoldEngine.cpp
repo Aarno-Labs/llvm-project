@@ -11006,6 +11006,12 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   // that path can preserve deeper nested macro structure that a direct root
   // argument rewrite would flatten.
   std::optional<MacroPatch> argsOnlyCandidate;
+  // Keep the preferred DAG root replay alive until the shared final macro
+  // selector runs. Step 1 removes the last behavioral macro bypass by carrying
+  // this candidate through the same final arbitration as the other accepted
+  // macro outcomes instead of returning it immediately from the local DAG
+  // competition block.
+  std::optional<MacroPatch> dagRootCandidate;
   bool reuseExistingCallsitePatch = false;
 
   SmallVector<RefoldModel::PPArgSpan, 16> argLikeSpans;
@@ -20023,6 +20029,10 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         candidate.macroId = existingPatch->macroId;
     };
 
+    // Keep the preferred DAG root replay as an explicit final candidate
+    // instead of returning it immediately. The storage for that candidate is
+    // owned by the outer final-selection frame so the same accepted DAG root
+    // patch can participate in the common selector later in the function.
     auto dag = tryDAGChainedArgsOnly();
     if (dag) {
       bool preferDirectRootCandidate = false;
@@ -20075,23 +20085,31 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
       if (!preferDirectRootCandidate) {
         mergeCurrentRootWithExistingCallsitePatch(*dag,
                                                   "dag/direct root rewrite");
-        if (!conflictingConcreteSubtreeWitnessForcesWholeCover)
-          return *dag;
-
-        trace("macro/dag",
-              "same-root concrete subtree witness conflict suppresses DAG root "
-              "replay: root id={0} name='{1}'; falling back to whole-cover expansion",
-              m.id, m.name);
-        argsOnlyCandidate.reset();
-        reuseExistingCallsitePatch = false;
+        if (!conflictingConcreteSubtreeWitnessForcesWholeCover) {
+          // The DAG candidate has already won the local same-root competition
+          // against the direct args-only replay. Preserve that decision by
+          // carrying only the DAG root candidate into the final selector; the
+          // shared selector still arbitrates it against whole-cover and any
+          // reusable already-tracked patch for the same invocation span.
+          dagRootCandidate = *dag;
+          argsOnlyCandidate.reset();
+        } else {
+          trace("macro/dag",
+                "same-root concrete subtree witness conflict suppresses DAG root "
+                "replay: root id={0} name='{1}'; falling back to whole-cover expansion",
+                m.id, m.name);
+          argsOnlyCandidate.reset();
+          reuseExistingCallsitePatch = false;
+        }
       }
     }
 
-    trace("macro/dag",
-          "DAG args-only: no patch produced for root id={0} name='{1}'; "
-          "will fall back to direct args-only / existing callsite / "
-          "whole-cover replacement as needed",
-          m.id, m.name);
+    if (!dagRootCandidate)
+      trace("macro/dag",
+            "DAG args-only: no surviving DAG root candidate for root id={0} "
+            "name='{1}'; will fall back to direct args-only / existing "
+            "callsite / whole-cover replacement as needed",
+            m.id, m.name);
     if (directRootPreservationInadmissible) {
       trace("macro/dag",
             "direct args-only/callsite preservation suppressed for root "
@@ -20177,6 +20195,28 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     }
   }
 
+  // The final accepted-result selector is now authoritative for top-level
+  // emitted macro outcomes, but nested DAG-preserving roots are still
+  // intermediate artifacts that can feed outer wrapper / call-chain
+  // preservation. Their proof summaries intentionally fail the top-level root
+  // discharge obligation, so forcing them through the final selector here
+  // would incorrectly collapse them to whole-cover realization before the
+  // outer preserving owner gets a chance to absorb them.
+  //
+  // Keep the historical nested-DAG short-circuit until the later closure steps
+  // move intermediate preserving artifacts onto a selector/discharge model that
+  // does not require them to masquerade as final top-level emitted results.
+  if (dagRootCandidate && !conflictingConcreteSubtreeWitnessForcesWholeCover &&
+      GetRootMacroId(m.id) != m.id) {
+    trace("macro/proof",
+          "returning nested DAG root replay candidate before final selector: "
+          "inv id={0} name={1} {2}",
+          m.id, m.name,
+          FormatAcceptedResultCandidate(BuildAcceptedMacroCandidate(
+              *dagRootCandidate)));
+    return *dagRootCandidate;
+  }
+
   const bool canReuseExistingCallsiteNoOp =
       reuseExistingCallsitePatch && !conflictingConcreteSubtreeWitnessForcesWholeCover &&
       existingPatch;
@@ -20211,6 +20251,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
   enum class FinalMacroCandidateOrigin : uint8_t {
     DirectArgsOnly,
+    DagRootReplay,
     ReuseExistingCallsiteNoOp,
     ReuseExistingCallsiteSkipWholeCover,
     ReuseExistingExpanded,
@@ -20229,6 +20270,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     switch (origin) {
     case FinalMacroCandidateOrigin::DirectArgsOnly:
       return "direct-args-only";
+    case FinalMacroCandidateOrigin::DagRootReplay:
+      return "dag-root-replay";
     case FinalMacroCandidateOrigin::ReuseExistingCallsiteNoOp:
       return "reuse-existing-callsite-no-op";
     case FinalMacroCandidateOrigin::ReuseExistingCallsiteSkipWholeCover:
@@ -20263,6 +20306,10 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   if (argsOnlyCandidate)
     addFinalMacroCandidate(*argsOnlyCandidate,
                            FinalMacroCandidateOrigin::DirectArgsOnly);
+
+  if (dagRootCandidate)
+    addFinalMacroCandidate(*dagRootCandidate,
+                           FinalMacroCandidateOrigin::DagRootReplay);
 
   if (canReuseExistingCallsiteNoOp) {
     addFinalMacroCandidate(*existingPatch,
@@ -20315,6 +20362,14 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   case FinalMacroCandidateOrigin::DirectArgsOnly:
     trace("macro/proof",
           "returning direct args-only candidate: inv id={0} name={1} {2}",
+          m.id, m.name,
+          FormatAcceptedResultCandidate(selected.acceptedCandidate));
+    break;
+
+  case FinalMacroCandidateOrigin::DagRootReplay:
+    trace("macro/proof",
+          "returning DAG root replay candidate through final selector: inv "
+          "id={0} name={1} {2}",
           m.id, m.name,
           FormatAcceptedResultCandidate(selected.acceptedCandidate));
     break;
