@@ -8705,6 +8705,7 @@ RefoldEngine::ClassifyMacroPatchProof(const MacroPatch &patch) const {
   }
 
   summary.lattice = BuildGlobalSelectionLattice(summary);
+  summary.completeness = BuildCompletenessContract(summary);
   return summary;
 }
 
@@ -8837,6 +8838,7 @@ RefoldEngine::ProofSummary RefoldEngine::BuildAcceptedPathProofSummary(
   }
 
   summary.lattice = BuildGlobalSelectionLattice(summary);
+  summary.completeness = BuildCompletenessContract(summary);
   return summary;
 }
 
@@ -8873,6 +8875,7 @@ RefoldEngine::BuildIncludePatchProofSummary(
   }
 
   summary.lattice = BuildGlobalSelectionLattice(summary);
+  summary.completeness = BuildCompletenessContract(summary);
   summary.validated = false;
   return summary;
 }
@@ -8928,6 +8931,46 @@ RefoldEngine::BuildGlobalSelectionLattice(const ProofSummary &summary) const {
   }
 
   return lattice;
+}
+
+RefoldEngine::CompletenessContract
+RefoldEngine::BuildCompletenessContract(const ProofSummary &summary) const {
+  CompletenessContract contract;
+
+  // Step 11 defines completeness relative to the declared proof-class set,
+  // not relative to every imaginable refolding. A path therefore either
+  // already counts toward the declared set, remains transitional while a class
+  // is still being closed, or is explicitly outside the declared set.
+  if (summary.inventory.currentPath ==
+          AcceptedPathKind::TerminalEmitEditedPreprocessedStream ||
+      summary.inventory.support ==
+          AcceptanceSupportKind::LegacyTerminalFallback) {
+    contract.coverage = CompletenessCoverageKind::LegacyOutOfScopeFallback;
+    contract.expectation =
+        CompletenessExpectationKind::ExplicitlyOutsideDeclaredSet;
+    return contract;
+  }
+
+  if (summary.inventory.futureTarget != FutureProofTarget::Unknown &&
+      summary.inventory.support ==
+          AcceptanceSupportKind::ExplicitProofBacked) {
+    contract.coverage = CompletenessCoverageKind::DeclaredProofClass;
+    contract.expectation =
+        CompletenessExpectationKind::MustDiscoverDeclaredOrStrongerCompatible;
+    contract.declaredTarget = summary.inventory.futureTarget;
+    contract.countsTowardDeclaredCoverage = true;
+    return contract;
+  }
+
+  if (summary.inventory.currentPath != AcceptedPathKind::Unknown) {
+    contract.coverage = CompletenessCoverageKind::TransitionalGap;
+    contract.expectation =
+        CompletenessExpectationKind::NoClaimPendingClassClosure;
+    contract.declaredTarget = summary.inventory.futureTarget;
+    return contract;
+  }
+
+  return contract;
 }
 
 bool RefoldEngine::LatticePrefers(const ProofSummary &lhs,
@@ -9631,6 +9674,36 @@ StringRef RefoldEngine::FormatFutureProofTarget(FutureProofTarget target) const 
   return "Unknown";
 }
 
+StringRef RefoldEngine::FormatCompletenessCoverageKind(
+    CompletenessCoverageKind kind) const {
+  switch (kind) {
+  case CompletenessCoverageKind::Unknown:
+    return "Unknown";
+  case CompletenessCoverageKind::DeclaredProofClass:
+    return "DeclaredProofClass";
+  case CompletenessCoverageKind::TransitionalGap:
+    return "TransitionalGap";
+  case CompletenessCoverageKind::LegacyOutOfScopeFallback:
+    return "LegacyOutOfScopeFallback";
+  }
+  return "Unknown";
+}
+
+StringRef RefoldEngine::FormatCompletenessExpectationKind(
+    CompletenessExpectationKind kind) const {
+  switch (kind) {
+  case CompletenessExpectationKind::Unknown:
+    return "Unknown";
+  case CompletenessExpectationKind::MustDiscoverDeclaredOrStrongerCompatible:
+    return "MustDiscoverDeclaredOrStrongerCompatible";
+  case CompletenessExpectationKind::NoClaimPendingClassClosure:
+    return "NoClaimPendingClassClosure";
+  case CompletenessExpectationKind::ExplicitlyOutsideDeclaredSet:
+    return "ExplicitlyOutsideDeclaredSet";
+  }
+  return "Unknown";
+}
+
 StringRef RefoldEngine::FormatLatticeConflictDomain(
     LatticeConflictDomain domain) const {
   switch (domain) {
@@ -10045,6 +10118,17 @@ std::string RefoldEngine::FormatGlobalSelectionLattice(
       .str();
 }
 
+std::string RefoldEngine::FormatCompletenessContract(
+    const CompletenessContract &contract) const {
+  return formatv(
+             "coverage={0} expectation={1} declaredTarget={2} counts={3}",
+             FormatCompletenessCoverageKind(contract.coverage),
+             FormatCompletenessExpectationKind(contract.expectation),
+             FormatFutureProofTarget(contract.declaredTarget),
+             contract.countsTowardDeclaredCoverage ? 1 : 0)
+      .str();
+}
+
 std::string RefoldEngine::FormatAcceptedPathAudit(
     AcceptedPathKind currentPath, const IncludePatch *patch,
     const TUAnchorWitness *tuAnchorWitness,
@@ -10054,33 +10138,37 @@ std::string RefoldEngine::FormatAcceptedPathAudit(
       currentPath, patch, tuAnchorWitness, includeAnchorWitness,
       includeRealizationWitness);
   if (summary.hasTUAnchorWitness) {
-    return formatv("inventory={0} lattice={1} discharge={2} tuAnchor={3}",
+    return formatv("inventory={0} lattice={1} completeness={2} discharge={3} tuAnchor={4}",
                    FormatAcceptancePathInventory(summary.inventory),
                    FormatGlobalSelectionLattice(summary.lattice),
+                   FormatCompletenessContract(summary.completeness),
                    FormatProofDischargeRecord(summary.discharge),
                    FormatTUAnchorWitness(summary.tuAnchorWitness))
         .str();
   }
   if (summary.hasIncludeAnchorWitness) {
-    return formatv("inventory={0} lattice={1} discharge={2} includeAnchor={3}",
+    return formatv("inventory={0} lattice={1} completeness={2} discharge={3} includeAnchor={4}",
                    FormatAcceptancePathInventory(summary.inventory),
                    FormatGlobalSelectionLattice(summary.lattice),
+                   FormatCompletenessContract(summary.completeness),
                    FormatProofDischargeRecord(summary.discharge),
                    FormatIncludeAnchorWitness(summary.includeAnchorWitness))
         .str();
   }
   if (summary.hasIncludeRealizationWitness) {
-    return formatv("inventory={0} lattice={1} discharge={2} includeRealization={3}",
+    return formatv("inventory={0} lattice={1} completeness={2} discharge={3} includeRealization={4}",
                    FormatAcceptancePathInventory(summary.inventory),
                    FormatGlobalSelectionLattice(summary.lattice),
+                   FormatCompletenessContract(summary.completeness),
                    FormatProofDischargeRecord(summary.discharge),
                    FormatIncludeRealizationWitness(
                        summary.includeRealizationWitness))
         .str();
   }
-  return formatv("inventory={0} lattice={1} discharge={2}",
+  return formatv("inventory={0} lattice={1} completeness={2} discharge={3}",
                  FormatAcceptancePathInventory(summary.inventory),
                  FormatGlobalSelectionLattice(summary.lattice),
+                 FormatCompletenessContract(summary.completeness),
                  FormatProofDischargeRecord(summary.discharge))
       .str();
 }
@@ -10089,17 +10177,17 @@ std::string RefoldEngine::FormatMacroPatchAudit(const MacroPatch &patch) const {
   const ProofSummary summary = ClassifyMacroPatchProof(patch);
   return formatv(
              "proofKind={0} topClass={1} realization={2} preference={3} "
-             "legacyEscalation={4} inventory={5} lattice={6} discharge={7} "
-             "validated={8} struct={9} proofRoot={10} subtreeCert={11} "
-             "leaf={12} witnesses={13} invCerts={14} formalCerts={15} "
-             "argCerts={16} liftChains={17} liftSteps={18} rootMerges={19} "
-             "lexicalBridge={20} paste={21} wrappers={22} stringify={23} "
-             "wideStringify={24} childSyntax={25} rawInvocation={26} "
-             "passthrough={27} bridgeSensitive={28} "
-             "deferredPasteDischarged={29} admissible={30} expRootN={31} "
-             "deferredRootN={32} bridgeFormalN={33} expRoot={34} "
-             "deferredRootArgs={35} bridgeFormals={36} wholeCoverA=[{37},{38}) "
-             "wholeCoverBraw=[{39},{40}) wholeCoverBadj=[{41},{42})",
+             "legacyEscalation={4} inventory={5} lattice={6} completeness={7} "
+             "discharge={8} validated={9} struct={10} proofRoot={11} subtreeCert={12} "
+             "leaf={13} witnesses={14} invCerts={15} formalCerts={16} "
+             "argCerts={17} liftChains={18} liftSteps={19} rootMerges={20} "
+             "lexicalBridge={21} paste={22} wrappers={23} stringify={24} "
+             "wideStringify={25} childSyntax={26} rawInvocation={27} "
+             "passthrough={28} bridgeSensitive={29} "
+             "deferredPasteDischarged={30} admissible={31} expRootN={32} "
+             "deferredRootN={33} bridgeFormalN={34} expRoot={35} "
+             "deferredRootArgs={36} bridgeFormals={37} wholeCoverA=[{38},{39}) "
+             "wholeCoverBraw=[{40},{41}) wholeCoverBadj=[{42},{43})",
              FormatMacroPatchProofKind(patch.proofKind),
              FormatAcceptedProofClass(summary.acceptedClass),
              FormatRealizationMode(summary.realizationMode),
@@ -10107,6 +10195,7 @@ std::string RefoldEngine::FormatMacroPatchAudit(const MacroPatch &patch) const {
              FormatLegacyEscalationDisposition(summary.legacyEscalation),
              FormatAcceptancePathInventory(summary.inventory),
              FormatGlobalSelectionLattice(summary.lattice),
+             FormatCompletenessContract(summary.completeness),
              FormatProofDischargeRecord(summary.discharge),
              patch.proofValidated ? 1 : 0,
              patch.structurePreserving ? 1 : 0, patch.proofRootMacroId,
