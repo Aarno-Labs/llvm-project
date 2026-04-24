@@ -8268,7 +8268,7 @@ RefoldEngine::ComputeWholeCoverPlan(
 bool RefoldEngine::WholeCoverPatchMatchesPlan(const MacroPatch &patch,
                                               const WholeCoverPlan &plan,
                                               uint64_t rootMacroId) const {
-  if (patch.proofKind != MacroPatchProofKind::WholeCoverFallback ||
+  if (patch.proofKind != MacroPatchProofKind::WholeCoverRealization ||
       patch.structurePreserving || patch.proofRootMacroId != rootMacroId)
     return false;
   return patch.wholeCoverUsedBodyRange == plan.usedBodyRange &&
@@ -8387,9 +8387,9 @@ RefoldEngine::InventoryMacroPatchAcceptancePath(const MacroPatch &patch) const {
     return BuildAcceptancePathInventory(AcceptedPathKind::MacroCallChainSuffix);
   case MacroPatchProofKind::CounterLiteral:
     return BuildAcceptancePathInventory(AcceptedPathKind::MacroCounterLiteral);
-  case MacroPatchProofKind::WholeCoverFallback:
+  case MacroPatchProofKind::WholeCoverRealization:
     return BuildAcceptancePathInventory(
-        AcceptedPathKind::MacroWholeCoverFallback);
+        AcceptedPathKind::MacroWholeCoverRealization);
   case MacroPatchProofKind::Unknown:
     return BuildAcceptancePathInventory(AcceptedPathKind::Unknown);
   }
@@ -8436,8 +8436,8 @@ RefoldEngine::BuildAcceptancePathInventory(AcceptedPathKind currentPath) const {
     inventory.futureTarget =
         FutureProofTarget::MacroCounterStabilizationRealization;
     break;
-  case AcceptedPathKind::MacroWholeCoverFallback:
-    inventory.support = AcceptanceSupportKind::DeterministicButNotFirstClass;
+  case AcceptedPathKind::MacroWholeCoverRealization:
+    inventory.support = AcceptanceSupportKind::ExplicitProofBacked;
     inventory.futureTarget = FutureProofTarget::MacroRealizationWholeCover;
     break;
   case AcceptedPathKind::IncludePatchPendingMaterialization:
@@ -8564,7 +8564,7 @@ RefoldEngine::ClassifyMacroPatchProof(const MacroPatch &patch) const {
     summary.preference = SelectionPreference::PreferSurfaceRealization;
     break;
 
-  case MacroPatchProofKind::WholeCoverFallback:
+  case MacroPatchProofKind::WholeCoverRealization:
     summary.acceptedClass = AcceptedProofClass::InvocationRealization;
     summary.realizationMode = RealizationMode::RealizeEditedSurface;
     summary.preference = SelectionPreference::PreferSurfaceRealization;
@@ -8616,6 +8616,30 @@ void RefoldEngine::StampMacroPatchProof(MacroPatch &patch,
   patch.structurePreserving = structurePreserving;
   patch.proofRootMacroId = proofRootMacroId;
   SyncMacroPatchProofSummary(patch);
+}
+
+void RefoldEngine::StampMacroWholeCoverRealizationPatch(
+    MacroPatch &patch, const WholeCoverPlan &plan,
+    uint64_t proofRootMacroId) const {
+  // Step 4 promotes accepted whole-cover output into an explicit invocation
+  // realization proof. The plan already carries the exact A/B token envelope
+  // and containment facts, so stamping it here keeps the accepted patch
+  // deterministic and fully described without changing selection behavior.
+  StampMacroPatchProof(patch, MacroPatchProofKind::WholeCoverRealization,
+                       /*validated=*/true,
+                       /*structurePreserving=*/false, proofRootMacroId);
+  patch.wholeCoverUsedBodyRange = plan.usedBodyRange;
+  patch.wholeCoverSelfContained = plan.selfContained;
+  patch.wholeCoverNestedSelfContained = plan.nestedSelfContained;
+  patch.wholeCoverAdjustedLeft = plan.adjustedLeft;
+  patch.wholeCoverAdjustedRight = plan.adjustedRight;
+  patch.wholeCoverClaimsClipped = plan.claimsClipped;
+  patch.wholeCoverALo = plan.covLoA;
+  patch.wholeCoverAHi = plan.covHiA;
+  patch.wholeCoverBRawLo = plan.rawBTokStart;
+  patch.wholeCoverBRawHi = plan.rawBTokEnd;
+  patch.wholeCoverBAdjLo = plan.bTokStart;
+  patch.wholeCoverBAdjHi = plan.bTokEnd;
 }
 
 RefoldEngine::ProofSummary RefoldEngine::BuildAcceptedPathProofSummary(
@@ -8685,7 +8709,7 @@ RefoldEngine::ProofSummary RefoldEngine::BuildAcceptedPathProofSummary(
   case AcceptedPathKind::MacroDagSubtreeRoot:
   case AcceptedPathKind::MacroCallChainSuffix:
   case AcceptedPathKind::MacroCounterLiteral:
-  case AcceptedPathKind::MacroWholeCoverFallback:
+  case AcceptedPathKind::MacroWholeCoverRealization:
     break;
   }
 
@@ -8769,13 +8793,19 @@ RefoldEngine::ValidateInvocationRealizationProof(const MacroPatch &patch) const 
                     ProofObligationKind::ProofRootTracked,
                     ProofFailureReason::MissingProofRoot);
 
-  if (patch.proofKind == MacroPatchProofKind::WholeCoverFallback) {
+  if (patch.proofKind == MacroPatchProofKind::WholeCoverRealization) {
     const bool boundsTracked = patch.wholeCoverALo <= patch.wholeCoverAHi &&
                                patch.wholeCoverBRawLo <= patch.wholeCoverBRawHi &&
                                patch.wholeCoverBAdjLo <= patch.wholeCoverBAdjHi;
     const bool boundaryAccountingTracked = boundsTracked &&
                                            patch.wholeCoverBRawLo <= patch.wholeCoverBAdjLo &&
                                            patch.wholeCoverBAdjHi <= patch.wholeCoverBRawHi;
+    discharge.Require(patch.proofValidated,
+                      ProofObligationKind::LegacyValidationRecorded,
+                      ProofFailureReason::MissingLegacyValidation);
+    discharge.Require(!patch.structurePreserving,
+                      ProofObligationKind::StructureMatchesAcceptedClass,
+                      ProofFailureReason::StructuralMismatch);
     discharge.Require(boundsTracked,
                       ProofObligationKind::WholeCoverBoundsTracked,
                       ProofFailureReason::MissingWholeCoverBounds);
@@ -8858,7 +8888,7 @@ RefoldEngine::ValidateIncludePreservingProof(AcceptedPathKind currentPath,
   case AcceptedPathKind::MacroDagSubtreeRoot:
   case AcceptedPathKind::MacroCallChainSuffix:
   case AcceptedPathKind::MacroCounterLiteral:
-  case AcceptedPathKind::MacroWholeCoverFallback:
+  case AcceptedPathKind::MacroWholeCoverRealization:
   case AcceptedPathKind::TUExactSlotBoundary:
   case AcceptedPathKind::TUProvableInsertionAnchor:
   case AcceptedPathKind::TerminalEmitEditedPreprocessedStream:
@@ -8982,8 +9012,8 @@ StringRef RefoldEngine::FormatAcceptedPathKind(AcceptedPathKind kind) const {
     return "MacroCallChainSuffix";
   case AcceptedPathKind::MacroCounterLiteral:
     return "MacroCounterLiteral";
-  case AcceptedPathKind::MacroWholeCoverFallback:
-    return "MacroWholeCoverFallback";
+  case AcceptedPathKind::MacroWholeCoverRealization:
+    return "MacroWholeCoverRealization";
   case AcceptedPathKind::IncludePatchPendingMaterialization:
     return "IncludePatchPendingMaterialization";
   case AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens:
@@ -9184,8 +9214,8 @@ RefoldEngine::FormatMacroPatchProofKind(MacroPatchProofKind kind) const {
     return "DagSubtreeRoot";
   case MacroPatchProofKind::CallChainSuffix:
     return "CallChainSuffix";
-  case MacroPatchProofKind::WholeCoverFallback:
-    return "WholeCoverFallback";
+  case MacroPatchProofKind::WholeCoverRealization:
+    return "WholeCoverRealization";
   }
   return "Unknown";
 }
@@ -18795,7 +18825,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           m.name == "__COUNTER__") {
         reuseExpanded = true;
       } else if (existingExpandedPatch->proofKind ==
-                 MacroPatchProofKind::WholeCoverFallback) {
+                 MacroPatchProofKind::WholeCoverRealization) {
         wholeCoverPlan = ComputeWholeCoverPlan(m);
         if (wholeCoverPlan)
           reuseExpanded = WholeCoverPatchMatchesPlan(*existingExpandedPatch,
@@ -18820,23 +18850,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
   {
     MacroPatch patch{*invStart, *invEnd, wholeCoverPlan->clippedText, m.id};
-    StampMacroPatchProof(patch, MacroPatchProofKind::WholeCoverFallback,
-                         /*validated=*/false,
-                         /*structurePreserving=*/false, m.id);
-    patch.wholeCoverUsedBodyRange = wholeCoverPlan->usedBodyRange;
-    patch.wholeCoverSelfContained = wholeCoverPlan->selfContained;
-    patch.wholeCoverNestedSelfContained = wholeCoverPlan->nestedSelfContained;
-    patch.wholeCoverAdjustedLeft = wholeCoverPlan->adjustedLeft;
-    patch.wholeCoverAdjustedRight = wholeCoverPlan->adjustedRight;
-    patch.wholeCoverClaimsClipped = wholeCoverPlan->claimsClipped;
-    patch.wholeCoverALo = wholeCoverPlan->covLoA;
-    patch.wholeCoverAHi = wholeCoverPlan->covHiA;
-    patch.wholeCoverBRawLo = wholeCoverPlan->rawBTokStart;
-    patch.wholeCoverBRawHi = wholeCoverPlan->rawBTokEnd;
-    patch.wholeCoverBAdjLo = wholeCoverPlan->bTokStart;
-    patch.wholeCoverBAdjHi = wholeCoverPlan->bTokEnd;
+    StampMacroWholeCoverRealizationPatch(patch, *wholeCoverPlan, m.id);
     trace("macro/proof",
-          "constructed whole-cover fallback patch audit: inv id={0} name={1} {2}",
+          "constructed whole-cover realization patch audit: inv id={0} name={1} {2}",
           m.id, m.name, FormatMacroPatchAudit(patch));
     return patch;
   }
