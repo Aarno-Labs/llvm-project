@@ -3912,62 +3912,6 @@ RefoldEngine::BoundaryParentIncludeForPureInsertion(
 
 // ===================== Patch builders (include & macro) ======================
 
-bool RefoldEngine::MacroExpansionEnvelopeB(
-    const RefoldModel::MacroInvocation &m, bool onlyInvFile, uint64_t &begin,
-    uint64_t &end) const {
-  const auto &tokMapByPP = model_.GetTokmapByPP();
-  if (tokMapByPP.empty())
-    return false;
-
-  uint64_t lo = std::numeric_limits<uint64_t>::max();
-  uint64_t hi = 0;
-  bool any = false;
-
-  // Expand the PP envelope with mapped tokens from [l,h), optionally restricted
-  // to tokens that resolve to the invocation's source file.
-  auto addRange = [&](uint64_t l, uint64_t h) {
-    for (uint64_t pp = l; pp < h; ++pp) {
-      auto it = tokMapByPP.find(pp);
-      if (it == tokMapByPP.end())
-        continue;
-
-      const auto &t = it->second;
-
-      if (onlyInvFile) {
-        if (!m.invFile || !PathsEqual(t.file, *m.invFile))
-          continue;
-      }
-
-      if (pp < lo)
-        lo = pp;
-      if (pp + 1 > hi)
-        hi = pp + 1;
-      any = true;
-    }
-  };
-
-  // BODY spans
-  for (const auto &s : m.bodySpans) {
-    if (!s.IsValid())
-      continue;
-    addRange(s.begin, s.end);
-  }
-
-  // ARG spans
-  for (const auto &s : m.argSpans) {
-    if (!s.IsValid())
-      continue;
-    addRange(s.begin, s.end);
-  }
-
-  if (!any)
-    return false;
-
-  begin = lo;
-  end = hi;
-  return true;
-}
-
 std::optional<size_t> RefoldEngine::FindExactOwningArgSpanForPureInsertion(
     uint64_t aPos, ArrayRef<RefoldModel::PPArgSpan> argSpans) const {
   auto isCommaTok = [&](uint64_t a) -> bool {
