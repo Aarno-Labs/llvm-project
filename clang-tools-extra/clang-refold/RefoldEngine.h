@@ -735,6 +735,29 @@ private:
     TerminalFallbackKind explicitExclusion = TerminalFallbackKind::Unknown;
   };
 
+  /// \brief The summary's position relative to the declared theorem domain.
+  ///
+  /// Patch D makes the theorem boundary explicit in the normalized proof
+  /// summary. A result either lies inside the declared proof-class domain,
+  /// remains transitional while a path is still being closed, or is explicitly
+  /// outside the theorem domain as a named out-of-domain class.
+  enum class TheoremDomainKind : uint8_t {
+    Unknown,
+    DeclaredInDomainClass,
+    TransitionalGap,
+    ExplicitOutOfDomainClass,
+  };
+
+  /// \brief Explicit domain contract derived from the completeness inventory.
+  struct TheoremDomainContract {
+    TheoremDomainKind kind = TheoremDomainKind::Unknown;
+    bool inDeclaredDomain = false;
+    bool countsTowardCompleteness = false;
+    FutureProofTarget declaredTarget = FutureProofTarget::Unknown;
+    bool hasExplicitExclusion = false;
+    TerminalFallbackKind explicitExclusion = TerminalFallbackKind::Unknown;
+  };
+
   /// \brief Evidence source used to justify an accepted TU anchor.
   ///
   /// Step 7 lifts the deterministic TU anchoring rules into explicit proof
@@ -851,11 +874,11 @@ private:
 
   /// \brief Status produced when the engine evaluates a local proof contract.
   ///
-  /// Step 3 introduces explicit obligation/discharge records so accepted
-  /// results can be explained in terms of the class-local facts they already
-  /// rely on today. These records are descriptive in this step: the legacy
-  /// acceptance logic remains behaviorally authoritative until later steps
-  /// switch selection over to the normalized proof lattice.
+  /// The engine records explicit local obligations for every normalized proof
+  /// summary. Converted selector sites already use the discharge result as the
+  /// participation gate, while the remaining construction paths still mirror
+  /// their local facts into the same record so the theorem boundary stays
+  /// explicit during migration.
   enum class ProofDischargeStatus : uint8_t {
     Unknown,
     PendingMaterialization,
@@ -967,21 +990,19 @@ private:
   /// \brief Small Step-3 helper that accumulates class-local obligations.
   ///
   /// This remains a private implementation detail because later steps may
-  /// replace the descriptive discharge bookkeeping introduced in Step 3 with
-  /// stronger, selection-authoritative proof objects. Keeping the accumulator
-  /// nested here lets the out-of-line implementation reuse the normalized
-  /// proof types without widening RefoldEngine's public API.
+  /// replace the current local-discharge bookkeeping with even stronger proof
+  /// objects. Keeping the accumulator nested here lets the out-of-line
+  /// implementation reuse the normalized proof types without widening
+  /// RefoldEngine's public API.
   struct ProofDischargeAccumulator;
 
-  /// \brief Common proof-summary carrier used during the proof-lattice
-  /// migration.
+  /// \brief Common proof-summary carrier used during the proof/lattice model.
   ///
-  /// The summary still mirrors path-specific construction in parts of the
-  /// engine, but Patch C makes its local discharge result behaviorally
-  /// authoritative at the converted selector sites. That lets those sites
-  /// reject wrapped candidates whose declared proof class cannot actually be
-  /// discharged, while the remaining migration work continues to convert the
-  /// rest of the engine to candidate-first selection.
+  /// The summary packages the accepted-path inventory, local discharge result,
+  /// lattice law, completeness contract, and explicit theorem-domain position
+  /// for one accepted artifact. Converted selector sites already use the
+  /// discharge result and lattice law operationally; the remaining migration
+  /// work is to route every competition site through this same carrier.
   struct ProofSummary {
     AcceptedProofClass acceptedClass = AcceptedProofClass::Unknown;
     RealizationMode realizationMode = RealizationMode::Unknown;
@@ -991,6 +1012,7 @@ private:
     AcceptancePathInventory inventory;
     GlobalSelectionLattice lattice;
     CompletenessContract completeness;
+    TheoremDomainContract theoremDomain;
     ProofDischargeRecord discharge;
     bool validated = false;
     bool structurePreserving = false;
@@ -1182,11 +1204,12 @@ private:
     uint64_t aStart, aEnd;   // A-token interval inside include expansion
     uint64_t bStart, bEnd;   // B-token interval
 
-    // Step-1/2 proof-lattice migration summary for include-owned patch
-    // candidates. Include proofs remain descriptive until later steps convert
-    // include realization/preservation into explicit proof classes. For
-    // include patches the exact accepted path is not known until materialization
-    // chooses a concrete anchor, so Step 2 starts them in a pending state.
+    // Normalized proof summary for include-owned patch candidates.
+    // Include patches are created before materialization chooses a concrete
+    // preserving anchor or realization envelope, so pre-materialization
+    // summaries may temporarily sit on the pending include path. Once a
+    // concrete include path is chosen, the accepted result is restamped onto
+    // the explicit witness-backed preserving or realization class.
     ProofSummary proofSummary = {};
 
     /// When present, this insertion was classified as belonging to a specific
@@ -2756,9 +2779,10 @@ private:
 
   /// \brief Build the normalized proof summary for a macro patch.
   ///
-  /// This is the Step-1 bridge between the legacy macro-specific proof fields
-  /// and the top-level proof-lattice vocabulary. The mapping is descriptive
-  /// only in this step and intentionally does not alter candidate selection.
+  /// This bridges the macro-specific proof fields onto the normalized proof
+  /// summary. Converted selector sites already use the resulting lattice and
+  /// discharge metadata operationally; non-converted sites still mirror their
+  /// chosen patch through this same summary for auditability.
   ProofSummary ClassifyMacroPatchProof(const MacroPatch &patch) const;
 
   /// \brief Synchronize the Step-1 proof summary with the legacy macro patch
@@ -2813,10 +2837,11 @@ private:
 
   /// \brief Build the default Step-1/2/3 proof summary for an include patch.
   ///
-  /// Include proofs are not yet selection-authoritative, but Step 3 now records
-  /// which local obligations are already discharged for the currently chosen
-  /// include path. Preserving include patches start in a pending state and are
-  /// mapped to a concrete accepted path once materialization chooses an anchor.
+  /// Include patches are created before materialization chooses a concrete
+  /// preserving anchor or realization envelope. The resulting summary therefore
+  /// starts on the pending include path and is restamped onto a concrete
+  /// witness-backed include class once materialization chooses an accepted
+  /// path.
   ProofSummary BuildIncludePatchProofSummary(
       bool realizedSurface,
       AcceptedPathKind currentPath =
@@ -2834,11 +2859,20 @@ private:
 
   /// \brief Compute the Step-11 completeness contract for an accepted summary.
   ///
-  /// The contract is descriptive in this step. It states whether the accepted
-  /// path already belongs to the declared proof-class set and, if so, which
-  /// declared class completeness should be measured against.
+  /// The contract states whether the accepted path already belongs to the
+  /// declared proof-class set and, if so, which declared class completeness
+  /// should be measured against.
   CompletenessContract
   BuildCompletenessContract(const ProofSummary &summary) const;
+
+  /// \brief Compute the explicit theorem-domain contract for an accepted summary.
+  ///
+  /// Patch D derives a compact theorem-domain classification from the existing
+  /// acceptance inventory and completeness contract so tracing and audit output
+  /// can state directly whether a result is in-domain, transitional, or an
+  /// explicit out-of-domain class.
+  TheoremDomainContract
+  BuildTheoremDomainContract(const ProofSummary &summary) const;
 
   /// \brief Return whether the normalized lattice prefers \p lhs over \p rhs.
   ///
@@ -2925,9 +2959,10 @@ private:
 
   /// \brief Validate the current local proof contract for an accepted class.
   ///
-  /// These validators are descriptive in Step 3. They lift the existing
-  /// deterministic checks into named obligations without changing acceptance
-  /// behavior yet.
+  /// These validators lift the existing deterministic checks into named local
+  /// obligations. Converted selector sites already use their discharge result
+  /// operationally; remaining sites still mirror their facts into the same
+  /// proof contract until they are moved onto the normalized selector path.
   ProofDischargeRecord
   ValidateInvocationPreservingProof(const MacroPatch &patch) const;
   ProofDischargeRecord
@@ -2956,6 +2991,7 @@ private:
   StringRef FormatCompletenessCoverageKind(CompletenessCoverageKind kind) const;
   StringRef
   FormatCompletenessExpectationKind(CompletenessExpectationKind kind) const;
+  StringRef FormatTheoremDomainKind(TheoremDomainKind kind) const;
   StringRef FormatLatticeConflictDomain(LatticeConflictDomain domain) const;
   StringRef FormatLatticeMergeLaw(LatticeMergeLaw law) const;
   StringRef FormatLatticeConflictLaw(LatticeConflictLaw law) const;
@@ -3012,6 +3048,10 @@ private:
   /// \brief Format the normalized Step-11 completeness contract for tracing.
   std::string
   FormatCompletenessContract(const CompletenessContract &contract) const;
+
+  /// \brief Format the normalized theorem-domain contract for tracing.
+  std::string
+  FormatTheoremDomainContract(const TheoremDomainContract &contract) const;
 
   /// \brief Format the normalized accepted-path audit for tracing.
   ///

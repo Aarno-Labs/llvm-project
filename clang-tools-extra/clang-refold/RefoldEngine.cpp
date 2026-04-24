@@ -8705,6 +8705,7 @@ RefoldEngine::ClassifyMacroPatchProof(const MacroPatch &patch) const {
 
   summary.lattice = BuildGlobalSelectionLattice(summary);
   summary.completeness = BuildCompletenessContract(summary);
+  summary.theoremDomain = BuildTheoremDomainContract(summary);
   return summary;
 }
 
@@ -8843,6 +8844,7 @@ RefoldEngine::ProofSummary RefoldEngine::BuildAcceptedPathProofSummary(
 
   summary.lattice = BuildGlobalSelectionLattice(summary);
   summary.completeness = BuildCompletenessContract(summary);
+  summary.theoremDomain = BuildTheoremDomainContract(summary);
   return summary;
 }
 
@@ -8852,9 +8854,10 @@ RefoldEngine::BuildIncludePatchProofSummary(
     const IncludePatch *patch) const {
   ProofSummary summary = BuildAcceptedPathProofSummary(currentPath, patch);
 
-  // Step 1 introduced the realized-surface flag before include paths were fully
-  // inventory-backed. Preserve that behavior as a fallback if the named path is
-  // still unknown during migration.
+  // Preserve the historical realized-surface classification if an internal
+  // caller still reaches this helper before stamping a concrete include path.
+  // Patch D keeps this fallback explicit in the theorem-domain summary rather
+  // than pretending it already belongs to a declared proof class.
   if (summary.acceptedClass == AcceptedProofClass::Unknown) {
     summary.acceptedClass = realizedSurface
                                 ? AcceptedProofClass::IncludeRealization
@@ -8880,6 +8883,7 @@ RefoldEngine::BuildIncludePatchProofSummary(
 
   summary.lattice = BuildGlobalSelectionLattice(summary);
   summary.completeness = BuildCompletenessContract(summary);
+  summary.theoremDomain = BuildTheoremDomainContract(summary);
   summary.validated = false;
   return summary;
 }
@@ -8888,12 +8892,10 @@ RefoldEngine::GlobalSelectionLattice
 RefoldEngine::BuildGlobalSelectionLattice(const ProofSummary &summary) const {
   GlobalSelectionLattice lattice;
 
-  // Step 10 lifts the current global merge/conflict policy into one explicit
-  // lattice description. Converted Patch-B sites now compare accepted results
-  // through this lattice directly, while the remaining sites still route into
-  // it one selector at a time. The lattice names the owner domain,
-  // compatible-merge rule, and incompatible-conflict rule that the current
-  // engine already relies on.
+  // The global lattice names the owner domain, compatible-merge rule, and
+  // incompatible-conflict rule that accepted results obey. Converted selector
+  // sites already compare candidates through this lattice directly; the
+  // remaining sites are expected to converge on the same law.
   switch (summary.acceptedClass) {
   case AcceptedProofClass::InvocationPreserving:
   case AcceptedProofClass::InvocationRealization:
@@ -8943,10 +8945,10 @@ RefoldEngine::CompletenessContract
 RefoldEngine::BuildCompletenessContract(const ProofSummary &summary) const {
   CompletenessContract contract;
 
-  // Step 11 defines completeness relative to the declared proof-class set,
-  // not relative to every imaginable refolding. A path therefore either
-  // already counts toward the declared set, remains transitional while a class
-  // is still being closed, or is explicitly outside the declared set.
+  // Completeness is defined relative to the declared proof-class set, not
+  // relative to every imaginable refolding. A path therefore either already
+  // counts toward the declared set, remains transitional while a class is
+  // still being closed, or is explicitly outside the declared set.
   if (summary.inventory.currentPath ==
           AcceptedPathKind::TerminalEmitEditedPreprocessedStream ||
       summary.inventory.support ==
@@ -8978,6 +8980,42 @@ RefoldEngine::BuildCompletenessContract(const ProofSummary &summary) const {
         CompletenessExpectationKind::NoClaimPendingClassClosure;
     contract.declaredTarget = summary.inventory.futureTarget;
     return contract;
+  }
+
+  return contract;
+}
+
+RefoldEngine::TheoremDomainContract
+RefoldEngine::BuildTheoremDomainContract(const ProofSummary &summary) const {
+  TheoremDomainContract contract;
+
+  // Patch D makes the theorem boundary explicit from the same normalized facts
+  // already used for completeness reporting. This helper is intentionally
+  // derived-only: it does not introduce new acceptance behavior.
+  switch (summary.completeness.coverage) {
+  case CompletenessCoverageKind::DeclaredProofClass:
+    contract.kind = TheoremDomainKind::DeclaredInDomainClass;
+    contract.inDeclaredDomain = true;
+    contract.countsTowardCompleteness =
+        summary.completeness.countsTowardDeclaredCoverage;
+    contract.declaredTarget = summary.completeness.declaredTarget;
+    break;
+
+  case CompletenessCoverageKind::TransitionalGap:
+    contract.kind = TheoremDomainKind::TransitionalGap;
+    contract.declaredTarget = summary.completeness.declaredTarget;
+    break;
+
+  case CompletenessCoverageKind::ExplicitOutOfDomainClass:
+    contract.kind = TheoremDomainKind::ExplicitOutOfDomainClass;
+    contract.hasExplicitExclusion =
+        summary.completeness.hasExplicitExclusion;
+    contract.explicitExclusion = summary.completeness.explicitExclusion;
+    contract.declaredTarget = summary.completeness.declaredTarget;
+    break;
+
+  case CompletenessCoverageKind::Unknown:
+    break;
   }
 
   return contract;
@@ -9918,7 +9956,7 @@ StringRef RefoldEngine::FormatFutureProofTarget(FutureProofTarget target) const 
   case FutureProofTarget::TUProvableInsertionAnchor:
     return "TUProvableInsertionAnchor";
   case FutureProofTarget::EditedPreprocessedStreamFallback:
-    return "EditedPreprocessedStreamFallback";
+    return "ExplicitOutOfDomainTerminalResult";
   }
   return "Unknown";
 }
@@ -9949,6 +9987,21 @@ StringRef RefoldEngine::FormatCompletenessExpectationKind(
     return "NoClaimPendingClassClosure";
   case CompletenessExpectationKind::ExplicitlyOutsideDeclaredSet:
     return "ExplicitlyOutsideDeclaredSet";
+  }
+  return "Unknown";
+}
+
+StringRef RefoldEngine::FormatTheoremDomainKind(
+    TheoremDomainKind kind) const {
+  switch (kind) {
+  case TheoremDomainKind::Unknown:
+    return "Unknown";
+  case TheoremDomainKind::DeclaredInDomainClass:
+    return "DeclaredInDomainClass";
+  case TheoremDomainKind::TransitionalGap:
+    return "TransitionalGap";
+  case TheoremDomainKind::ExplicitOutOfDomainClass:
+    return "ExplicitOutOfDomainClass";
   }
   return "Unknown";
 }
@@ -10417,6 +10470,28 @@ std::string RefoldEngine::FormatCompletenessContract(
       .str();
 }
 
+std::string RefoldEngine::FormatTheoremDomainContract(
+    const TheoremDomainContract &contract) const {
+  if (contract.hasExplicitExclusion) {
+    const TerminalFallbackWitness witness{contract.explicitExclusion, 0};
+    return formatv(
+               "kind={0} inDeclaredDomain={1} counts={2} declaredTarget={3} exclusion={4}",
+               FormatTheoremDomainKind(contract.kind),
+               contract.inDeclaredDomain ? 1 : 0,
+               contract.countsTowardCompleteness ? 1 : 0,
+               FormatFutureProofTarget(contract.declaredTarget),
+               FormatTerminalFallbackWitness(witness))
+        .str();
+  }
+  return formatv(
+             "kind={0} inDeclaredDomain={1} counts={2} declaredTarget={3}",
+             FormatTheoremDomainKind(contract.kind),
+             contract.inDeclaredDomain ? 1 : 0,
+             contract.countsTowardCompleteness ? 1 : 0,
+             FormatFutureProofTarget(contract.declaredTarget))
+      .str();
+}
+
 std::string RefoldEngine::FormatAcceptedPathAudit(
     AcceptedPathKind currentPath, const IncludePatch *patch,
     const TUAnchorWitness *tuAnchorWitness,
@@ -10427,46 +10502,51 @@ std::string RefoldEngine::FormatAcceptedPathAudit(
       currentPath, patch, tuAnchorWitness, includeAnchorWitness,
       includeRealizationWitness, terminalFallbackWitness);
   if (summary.hasTUAnchorWitness) {
-    return formatv("inventory={0} lattice={1} completeness={2} discharge={3} tuAnchor={4}",
+    return formatv("inventory={0} lattice={1} completeness={2} theoremDomain={3} discharge={4} tuAnchor={5}",
                    FormatAcceptancePathInventory(summary.inventory),
                    FormatGlobalSelectionLattice(summary.lattice),
                    FormatCompletenessContract(summary.completeness),
+                   FormatTheoremDomainContract(summary.theoremDomain),
                    FormatProofDischargeRecord(summary.discharge),
                    FormatTUAnchorWitness(summary.tuAnchorWitness))
         .str();
   }
   if (summary.hasIncludeAnchorWitness) {
-    return formatv("inventory={0} lattice={1} completeness={2} discharge={3} includeAnchor={4}",
+    return formatv("inventory={0} lattice={1} completeness={2} theoremDomain={3} discharge={4} includeAnchor={5}",
                    FormatAcceptancePathInventory(summary.inventory),
                    FormatGlobalSelectionLattice(summary.lattice),
                    FormatCompletenessContract(summary.completeness),
+                   FormatTheoremDomainContract(summary.theoremDomain),
                    FormatProofDischargeRecord(summary.discharge),
                    FormatIncludeAnchorWitness(summary.includeAnchorWitness))
         .str();
   }
   if (summary.hasIncludeRealizationWitness) {
-    return formatv("inventory={0} lattice={1} completeness={2} discharge={3} includeRealization={4}",
+    return formatv("inventory={0} lattice={1} completeness={2} theoremDomain={3} discharge={4} includeRealization={5}",
                    FormatAcceptancePathInventory(summary.inventory),
                    FormatGlobalSelectionLattice(summary.lattice),
                    FormatCompletenessContract(summary.completeness),
+                   FormatTheoremDomainContract(summary.theoremDomain),
                    FormatProofDischargeRecord(summary.discharge),
                    FormatIncludeRealizationWitness(
                        summary.includeRealizationWitness))
         .str();
   }
   if (summary.hasTerminalFallbackWitness) {
-    return formatv("inventory={0} lattice={1} completeness={2} discharge={3} terminalFallback={4}",
+    return formatv("inventory={0} lattice={1} completeness={2} theoremDomain={3} discharge={4} terminalOutOfDomain={5}",
                    FormatAcceptancePathInventory(summary.inventory),
                    FormatGlobalSelectionLattice(summary.lattice),
                    FormatCompletenessContract(summary.completeness),
+                   FormatTheoremDomainContract(summary.theoremDomain),
                    FormatProofDischargeRecord(summary.discharge),
                    FormatTerminalFallbackWitness(summary.terminalFallbackWitness))
         .str();
   }
-  return formatv("inventory={0} lattice={1} completeness={2} discharge={3}",
+  return formatv("inventory={0} lattice={1} completeness={2} theoremDomain={3} discharge={4}",
                  FormatAcceptancePathInventory(summary.inventory),
                  FormatGlobalSelectionLattice(summary.lattice),
                  FormatCompletenessContract(summary.completeness),
+                 FormatTheoremDomainContract(summary.theoremDomain),
                  FormatProofDischargeRecord(summary.discharge))
       .str();
 }
@@ -10522,7 +10602,7 @@ RefoldEngine::FormatAcceptedResultCandidate(
             .str();
   }
   if (candidate.proofSummary.hasTerminalFallbackWitness) {
-    artifact += formatv(" terminalFallback={0}",
+    artifact += formatv(" terminalOutOfDomain={0}",
                         FormatTerminalFallbackWitness(
                             candidate.proofSummary.terminalFallbackWitness))
                     .str();
@@ -10536,7 +10616,7 @@ RefoldEngine::FormatAcceptedResultCandidate(
   return formatv(
              "kind={0} class={1} realization={2} preference={3} "
              "surfaceDisposition={4} inventory={5} lattice={6} "
-             "completeness={7} discharge={8}{9}",
+             "completeness={7} theoremDomain={8} discharge={9}{10}",
              FormatAcceptedResultCandidateKind(candidate.kind),
              FormatAcceptedProofClass(candidate.proofSummary.acceptedClass),
              FormatRealizationMode(candidate.proofSummary.realizationMode),
@@ -10545,6 +10625,7 @@ RefoldEngine::FormatAcceptedResultCandidate(
              FormatAcceptancePathInventory(candidate.proofSummary.inventory),
              FormatGlobalSelectionLattice(candidate.proofSummary.lattice),
              FormatCompletenessContract(candidate.proofSummary.completeness),
+             FormatTheoremDomainContract(candidate.proofSummary.theoremDomain),
              FormatProofDischargeRecord(candidate.proofSummary.discharge),
              artifactSuffix)
       .str();
@@ -10555,17 +10636,17 @@ std::string RefoldEngine::FormatMacroPatchAudit(const MacroPatch &patch) const {
   return formatv(
              "proofKind={0} topClass={1} realization={2} preference={3} "
              "surfaceDisposition={4} inventory={5} lattice={6} completeness={7} "
-             "discharge={8} validated={9} struct={10} proofRoot={11} subtreeCert={12} "
-             "leaf={13} witnesses={14} invCerts={15} formalCerts={16} "
-             "argCerts={17} liftChains={18} liftSteps={19} rootMerges={20} "
-             "lexicalBridge={21} paste={22} wrappers={23} stringify={24} "
-             "wideStringify={25} childSyntax={26} rawInvocation={27} "
-             "passthrough={28} bridgeSensitive={29} "
-             "deferredPasteDischarged={30} admissible={31} "
-             "pasteReplayValidated={32} expRootN={33} "
-             "deferredRootN={34} bridgeFormalN={35} expRoot={36} "
-             "deferredRootArgs={37} bridgeFormals={38} wholeCoverA=[{39},{40}) "
-             "wholeCoverBraw=[{41},{42}) wholeCoverBadj=[{43},{44})",
+             "theoremDomain={8} discharge={9} validated={10} struct={11} proofRoot={12} subtreeCert={13} "
+             "leaf={14} witnesses={15} invCerts={16} formalCerts={17} "
+             "argCerts={18} liftChains={19} liftSteps={20} rootMerges={21} "
+             "lexicalBridge={22} paste={23} wrappers={24} stringify={25} "
+             "wideStringify={26} childSyntax={27} rawInvocation={28} "
+             "passthrough={29} bridgeSensitive={30} "
+             "deferredPasteDischarged={31} admissible={32} "
+             "pasteReplayValidated={33} expRootN={34} "
+             "deferredRootN={35} bridgeFormalN={36} expRoot={37} "
+             "deferredRootArgs={38} bridgeFormals={39} wholeCoverA=[{40},{41}) "
+             "wholeCoverBraw=[{42},{43}) wholeCoverBadj=[{44},{45})",
              FormatMacroPatchProofKind(patch.proofKind),
              FormatAcceptedProofClass(summary.acceptedClass),
              FormatRealizationMode(summary.realizationMode),
@@ -10574,6 +10655,7 @@ std::string RefoldEngine::FormatMacroPatchAudit(const MacroPatch &patch) const {
              FormatAcceptancePathInventory(summary.inventory),
              FormatGlobalSelectionLattice(summary.lattice),
              FormatCompletenessContract(summary.completeness),
+             FormatTheoremDomainContract(summary.theoremDomain),
              FormatProofDischargeRecord(summary.discharge),
              patch.proofValidated ? 1 : 0,
              patch.structurePreserving ? 1 : 0, patch.proofRootMacroId,
