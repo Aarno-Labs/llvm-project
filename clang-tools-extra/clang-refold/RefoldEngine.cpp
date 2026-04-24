@@ -917,8 +917,8 @@ std::string RefoldEngine::Refold() {
         "ESCALATION terminal: emitting fully expanded edited preprocessed "
         "stream (B). reasons={0}", escalationReasons_.size());
   debug("proof/inventory", "terminal result {0}",
-        FormatAcceptancePathInventory(BuildAcceptancePathInventory(
-            AcceptedPathKind::TerminalEmitEditedPreprocessedStream)));
+        FormatAcceptedPathAudit(
+            AcceptedPathKind::TerminalEmitEditedPreprocessedStream));
   for (const auto &r : escalationReasons_)
     debug("escalate", "  {0}", r);
   lastStats_ = RefoldStats{};
@@ -3128,8 +3128,7 @@ RefoldEngine::FindProvableTUInsertionAnchor(uint64_t pp,
     trace("hunk",
           "    insertion gap PP={0} mapsToTU via slot boundary TU byte {1} inventory={2}",
           pp, slotAnchor,
-          FormatAcceptancePathInventory(BuildAcceptancePathInventory(
-              AcceptedPathKind::TUExactSlotBoundary)));
+          FormatAcceptedPathAudit(AcceptedPathKind::TUExactSlotBoundary));
     return slotAnchor;
   }
 
@@ -3224,8 +3223,7 @@ RefoldEngine::FindProvableTUInsertionAnchor(uint64_t pp,
           "pure insertion arg-like begin anchor: ppGap={0} -> macro id={1} "
           "name='{2}' invB={3} inventory={4}",
           pp, best->id, best->name, *best->invB,
-          FormatAcceptancePathInventory(BuildAcceptancePathInventory(
-              AcceptedPathKind::TUProvableInsertionAnchor)));
+          FormatAcceptedPathAudit(AcceptedPathKind::TUProvableInsertionAnchor));
     return *best->invB;
   };
 
@@ -3249,8 +3247,7 @@ RefoldEngine::FindProvableTUInsertionAnchor(uint64_t pp,
         trace("tu/anchor",
               "provable TU insertion anchor: ppGap={0} -> right neighbor byte={1} inventory={2}",
               pp, right.b,
-              FormatAcceptancePathInventory(BuildAcceptancePathInventory(
-                  AcceptedPathKind::TUProvableInsertionAnchor)));
+              FormatAcceptedPathAudit(AcceptedPathKind::TUProvableInsertionAnchor));
         return right.b;
       }
       return std::nullopt;
@@ -3268,8 +3265,7 @@ RefoldEngine::FindProvableTUInsertionAnchor(uint64_t pp,
         trace("tu/anchor",
               "provable TU insertion anchor: ppGap={0} -> left neighbor byte={1} inventory={2}",
               pp, left.e,
-              FormatAcceptancePathInventory(BuildAcceptancePathInventory(
-                  AcceptedPathKind::TUProvableInsertionAnchor)));
+              FormatAcceptedPathAudit(AcceptedPathKind::TUProvableInsertionAnchor));
         return left.e;
       }
       return std::nullopt;
@@ -3344,15 +3340,13 @@ RefoldEngine::FindProvableTUInsertionAnchor(uint64_t pp,
     trace("tu/anchor",
           "provable TU insertion anchor: ppGap={0} -> corroborated right byte={1} inventory={2}",
           pp, right->b,
-          FormatAcceptancePathInventory(BuildAcceptancePathInventory(
-              AcceptedPathKind::TUProvableInsertionAnchor)));
+          FormatAcceptedPathAudit(AcceptedPathKind::TUProvableInsertionAnchor));
     return right->b;
   }
   trace("tu/anchor",
         "provable TU insertion anchor: ppGap={0} -> corroborated left byte={1} inventory={2}",
         pp, left->e,
-        FormatAcceptancePathInventory(BuildAcceptancePathInventory(
-            AcceptedPathKind::TUProvableInsertionAnchor)));
+        FormatAcceptedPathAudit(AcceptedPathKind::TUProvableInsertionAnchor));
   return left->e;
 }
 
@@ -3548,8 +3542,7 @@ RefoldEngine::AnchorToExactSlotBoundaryFromPPGap(StringRef tuPath,
           "AnchorToExactSlotBoundaryFromPPGap: ppGap={0} -> slotId={1} "
           "kind={2} tuByte={3} inventory={4}",
           ppGap, best->slot->id, best->slot->kind, best->b,
-          FormatAcceptancePathInventory(BuildAcceptancePathInventory(
-              AcceptedPathKind::TUExactSlotBoundary)));
+          FormatAcceptedPathAudit(AcceptedPathKind::TUExactSlotBoundary));
   } else {
     trace("slots/anchor",
           "AnchorToExactSlotBoundaryFromPPGap: ppGap={0} -> <none>", ppGap);
@@ -8499,6 +8492,51 @@ RefoldEngine::BuildAcceptancePathInventory(AcceptedPathKind currentPath) const {
   return inventory;
 }
 
+/// \brief Step-3 accumulator implementation for class-local obligations.
+///
+/// The helper is defined out of line so RefoldEngine.cpp can reuse one piece
+/// of deterministic bookkeeping across macro, include, and TU proof families
+/// without exposing the Step-3 discharge mechanics outside RefoldEngine.
+struct RefoldEngine::ProofDischargeAccumulator {
+  ProofDischargeRecord record;
+
+  explicit ProofDischargeAccumulator(
+      ProofDischargeStatus initialStatus = ProofDischargeStatus::Unknown) {
+    record.status = initialStatus;
+  }
+
+  void Satisfy(ProofObligationKind obligation) {
+    (void)obligation;
+    ++record.obligationsEvaluated;
+    ++record.obligationsSatisfied;
+    if (record.status == ProofDischargeStatus::Unknown)
+      record.status = ProofDischargeStatus::Discharged;
+  }
+
+  void Fail(ProofObligationKind obligation, ProofFailureReason reason) {
+    ++record.obligationsEvaluated;
+    if (record.failedObligation == ProofObligationKind::Unknown)
+      record.failedObligation = obligation;
+    if (record.failureReason == ProofFailureReason::None)
+      record.failureReason = reason;
+    record.status = ProofDischargeStatus::Rejected;
+  }
+
+  void Require(bool condition, ProofObligationKind obligation,
+               ProofFailureReason reason) {
+    if (condition)
+      Satisfy(obligation);
+    else
+      Fail(obligation, reason);
+  }
+
+  ProofDischargeRecord Finish() {
+    if (record.status == ProofDischargeStatus::Unknown)
+      record.status = ProofDischargeStatus::Discharged;
+    return record;
+  }
+};
+
 RefoldEngine::ProofSummary
 RefoldEngine::ClassifyMacroPatchProof(const MacroPatch &patch) const {
   ProofSummary summary;
@@ -8530,7 +8568,8 @@ RefoldEngine::ClassifyMacroPatchProof(const MacroPatch &patch) const {
     summary.acceptedClass = AcceptedProofClass::InvocationRealization;
     summary.realizationMode = RealizationMode::RealizeEditedSurface;
     summary.preference = SelectionPreference::PreferSurfaceRealization;
-    summary.legacyEscalation = LegacyEscalationDisposition::RetryWholeCoverMacros;
+    summary.legacyEscalation =
+        LegacyEscalationDisposition::RetryWholeCoverMacros;
     break;
 
   case MacroPatchProofKind::Unknown:
@@ -8543,6 +8582,20 @@ RefoldEngine::ClassifyMacroPatchProof(const MacroPatch &patch) const {
       summary.realizationMode = RealizationMode::RealizeEditedSurface;
       summary.preference = SelectionPreference::PreferSurfaceRealization;
     }
+    break;
+  }
+
+  switch (summary.acceptedClass) {
+  case AcceptedProofClass::InvocationPreserving:
+    summary.discharge = ValidateInvocationPreservingProof(patch);
+    break;
+  case AcceptedProofClass::InvocationRealization:
+    summary.discharge = ValidateInvocationRealizationProof(patch);
+    break;
+  case AcceptedProofClass::Unknown:
+  case AcceptedProofClass::IncludePreserving:
+  case AcceptedProofClass::IncludeRealization:
+  case AcceptedProofClass::TUAnchor:
     break;
   }
 
@@ -8565,27 +8618,287 @@ void RefoldEngine::StampMacroPatchProof(MacroPatch &patch,
   SyncMacroPatchProofSummary(patch);
 }
 
+RefoldEngine::ProofSummary RefoldEngine::BuildAcceptedPathProofSummary(
+    AcceptedPathKind currentPath, const IncludePatch *patch) const {
+  ProofSummary summary;
+  summary.inventory = BuildAcceptancePathInventory(currentPath);
+
+  switch (currentPath) {
+  case AcceptedPathKind::IncludePatchPendingMaterialization:
+  case AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens:
+  case AcceptedPathKind::IncludeInsertSelectedConditionalBoundary:
+  case AcceptedPathKind::IncludeInsertChildBoundary:
+  case AcceptedPathKind::IncludeInsertRightNeighborPP:
+  case AcceptedPathKind::IncludeInsertLeftNeighborPP:
+  case AcceptedPathKind::IncludeInsertDeclBoundary:
+    summary.acceptedClass = AcceptedProofClass::IncludePreserving;
+    summary.realizationMode = RealizationMode::PreserveOriginalStructure;
+    summary.preference = SelectionPreference::PreferStructurePreservation;
+    summary.structurePreserving = true;
+    summary.discharge = ValidateIncludePreservingProof(currentPath, patch);
+    break;
+
+  case AcceptedPathKind::IncludeRealizationInlineFromB:
+    summary.acceptedClass = AcceptedProofClass::IncludeRealization;
+    summary.realizationMode = RealizationMode::RealizeEditedSurface;
+    summary.preference = SelectionPreference::PreferSurfaceRealization;
+    summary.legacyEscalation =
+        LegacyEscalationDisposition::RetryInlineTouchedIncludesFromB;
+    summary.structurePreserving = false;
+    summary.discharge = ValidateIncludeRealizationProof(currentPath, patch);
+    break;
+
+  case AcceptedPathKind::TUExactSlotBoundary:
+  case AcceptedPathKind::TUProvableInsertionAnchor:
+    summary.acceptedClass = AcceptedProofClass::TUAnchor;
+    summary.realizationMode = RealizationMode::PreserveOriginalStructure;
+    summary.preference = SelectionPreference::PreferExactAnchoring;
+    summary.structurePreserving = true;
+    summary.discharge = ValidateTUAnchorProof(currentPath);
+    break;
+
+  case AcceptedPathKind::TerminalEmitEditedPreprocessedStream: {
+    summary.realizationMode = RealizationMode::RealizeEditedSurface;
+    summary.preference = SelectionPreference::PreferSurfaceRealization;
+    summary.legacyEscalation =
+        LegacyEscalationDisposition::EmitEditedPreprocessedStream;
+    ProofDischargeAccumulator discharge;
+    discharge.Require(summary.inventory.currentPath != AcceptedPathKind::Unknown,
+                      ProofObligationKind::AcceptedPathClassified,
+                      ProofFailureReason::MissingAcceptedPathClassification);
+    discharge.Require(
+        summary.inventory.futureTarget != FutureProofTarget::Unknown,
+        ProofObligationKind::FutureTargetMapped,
+        ProofFailureReason::MissingFutureTargetMapping);
+    discharge.Fail(ProofObligationKind::LegacyFallbackExplicitlyTracked,
+                   ProofFailureReason::LegacyFallback);
+    summary.discharge = discharge.Finish();
+    break;
+  }
+
+  case AcceptedPathKind::Unknown:
+  case AcceptedPathKind::MacroArgsOnlyStandard:
+  case AcceptedPathKind::MacroArgsOnlyPasteSingle:
+  case AcceptedPathKind::MacroArgsOnlyPasteMulti:
+  case AcceptedPathKind::MacroArgsOnlyPurePasteOnly:
+  case AcceptedPathKind::MacroArgsOnlyPairedPureInsertion:
+  case AcceptedPathKind::MacroDagSubtreeRoot:
+  case AcceptedPathKind::MacroCallChainSuffix:
+  case AcceptedPathKind::MacroCounterLiteral:
+  case AcceptedPathKind::MacroWholeCoverFallback:
+    break;
+  }
+
+  return summary;
+}
+
 RefoldEngine::ProofSummary
 RefoldEngine::BuildIncludePatchProofSummary(
-    bool realizedSurface, AcceptedPathKind currentPath) const {
-  ProofSummary summary;
-  summary.acceptedClass = realizedSurface
-                              ? AcceptedProofClass::IncludeRealization
-                              : AcceptedProofClass::IncludePreserving;
-  summary.realizationMode = realizedSurface
-                                ? RealizationMode::RealizeEditedSurface
-                                : RealizationMode::PreserveOriginalStructure;
-  summary.preference = realizedSurface
-                           ? SelectionPreference::PreferSurfaceRealization
-                           : SelectionPreference::PreferStructurePreservation;
-  summary.legacyEscalation = realizedSurface
-                                 ? LegacyEscalationDisposition::
-                                       RetryInlineTouchedIncludesFromB
-                                 : LegacyEscalationDisposition::None;
-  summary.inventory = BuildAcceptancePathInventory(currentPath);
+    bool realizedSurface, AcceptedPathKind currentPath,
+    const IncludePatch *patch) const {
+  ProofSummary summary = BuildAcceptedPathProofSummary(currentPath, patch);
+
+  // Step 1 introduced the realized-surface flag before include paths were fully
+  // inventory-backed. Preserve that behavior as a fallback if the named path is
+  // still unknown during migration.
+  if (summary.acceptedClass == AcceptedProofClass::Unknown) {
+    summary.acceptedClass = realizedSurface
+                                ? AcceptedProofClass::IncludeRealization
+                                : AcceptedProofClass::IncludePreserving;
+    summary.realizationMode = realizedSurface
+                                  ? RealizationMode::RealizeEditedSurface
+                                  : RealizationMode::PreserveOriginalStructure;
+    summary.preference = realizedSurface
+                             ? SelectionPreference::PreferSurfaceRealization
+                             : SelectionPreference::PreferStructurePreservation;
+    summary.legacyEscalation = realizedSurface
+                                   ? LegacyEscalationDisposition::
+                                         RetryInlineTouchedIncludesFromB
+                                   : LegacyEscalationDisposition::None;
+    summary.structurePreserving = !realizedSurface;
+    summary.discharge = realizedSurface
+                            ? ValidateIncludeRealizationProof(currentPath, patch)
+                            : ValidateIncludePreservingProof(currentPath, patch);
+  }
+
   summary.validated = false;
-  summary.structurePreserving = !realizedSurface;
   return summary;
+}
+
+RefoldEngine::ProofDischargeRecord
+RefoldEngine::ValidateInvocationPreservingProof(const MacroPatch &patch) const {
+  ProofDischargeAccumulator discharge;
+  const AcceptancePathInventory inventory = InventoryMacroPatchAcceptancePath(patch);
+
+  discharge.Require(inventory.currentPath != AcceptedPathKind::Unknown,
+                    ProofObligationKind::AcceptedPathClassified,
+                    ProofFailureReason::MissingAcceptedPathClassification);
+  discharge.Require(inventory.futureTarget != FutureProofTarget::Unknown,
+                    ProofObligationKind::FutureTargetMapped,
+                    ProofFailureReason::MissingFutureTargetMapping);
+  discharge.Require(patch.proofValidated,
+                    ProofObligationKind::LegacyValidationRecorded,
+                    ProofFailureReason::MissingLegacyValidation);
+  discharge.Require(patch.structurePreserving,
+                    ProofObligationKind::StructureMatchesAcceptedClass,
+                    ProofFailureReason::StructuralMismatch);
+  discharge.Require(patch.proofRootMacroId != 0,
+                    ProofObligationKind::ProofRootTracked,
+                    ProofFailureReason::MissingProofRoot);
+  if (patch.subtreeCertBacked) {
+    discharge.Require(patch.subtreeAdmissible,
+                      ProofObligationKind::SubtreeAdmissibilityTracked,
+                      ProofFailureReason::MissingSubtreeAdmissibility);
+  }
+
+  return discharge.Finish();
+}
+
+RefoldEngine::ProofDischargeRecord
+RefoldEngine::ValidateInvocationRealizationProof(const MacroPatch &patch) const {
+  ProofDischargeAccumulator discharge;
+  const AcceptancePathInventory inventory = InventoryMacroPatchAcceptancePath(patch);
+
+  discharge.Require(inventory.currentPath != AcceptedPathKind::Unknown,
+                    ProofObligationKind::AcceptedPathClassified,
+                    ProofFailureReason::MissingAcceptedPathClassification);
+  discharge.Require(inventory.futureTarget != FutureProofTarget::Unknown,
+                    ProofObligationKind::FutureTargetMapped,
+                    ProofFailureReason::MissingFutureTargetMapping);
+  discharge.Require(patch.proofRootMacroId != 0,
+                    ProofObligationKind::ProofRootTracked,
+                    ProofFailureReason::MissingProofRoot);
+
+  if (patch.proofKind == MacroPatchProofKind::WholeCoverFallback) {
+    const bool boundsTracked = patch.wholeCoverALo <= patch.wholeCoverAHi &&
+                               patch.wholeCoverBRawLo <= patch.wholeCoverBRawHi &&
+                               patch.wholeCoverBAdjLo <= patch.wholeCoverBAdjHi;
+    const bool boundaryAccountingTracked = boundsTracked &&
+                                           patch.wholeCoverBRawLo <= patch.wholeCoverBAdjLo &&
+                                           patch.wholeCoverBAdjHi <= patch.wholeCoverBRawHi;
+    discharge.Require(boundsTracked,
+                      ProofObligationKind::WholeCoverBoundsTracked,
+                      ProofFailureReason::MissingWholeCoverBounds);
+    discharge.Require(patch.wholeCoverSelfContained ||
+                          patch.wholeCoverNestedSelfContained,
+                      ProofObligationKind::WholeCoverContainmentTracked,
+                      ProofFailureReason::MissingWholeCoverContainment);
+    discharge.Require(boundaryAccountingTracked,
+                      ProofObligationKind::WholeCoverBoundaryAccountingTracked,
+                      ProofFailureReason::MissingWholeCoverBoundaryAccounting);
+  } else {
+    discharge.Require(patch.proofValidated,
+                      ProofObligationKind::LegacyValidationRecorded,
+                      ProofFailureReason::MissingLegacyValidation);
+    discharge.Require(!patch.structurePreserving,
+                      ProofObligationKind::StructureMatchesAcceptedClass,
+                      ProofFailureReason::StructuralMismatch);
+  }
+
+  return discharge.Finish();
+}
+
+RefoldEngine::ProofDischargeRecord
+RefoldEngine::ValidateIncludePreservingProof(AcceptedPathKind currentPath,
+                                             const IncludePatch *patch) const {
+  if (currentPath == AcceptedPathKind::IncludePatchPendingMaterialization) {
+    ProofDischargeRecord pending;
+    pending.status = ProofDischargeStatus::PendingMaterialization;
+    pending.failureReason = ProofFailureReason::PendingMaterialization;
+    pending.failedObligation =
+        ProofObligationKind::IncludePendingMaterializationClassified;
+    pending.obligationsEvaluated = 1;
+    return pending;
+  }
+
+  ProofDischargeAccumulator discharge;
+  const AcceptancePathInventory inventory = BuildAcceptancePathInventory(currentPath);
+  discharge.Require(inventory.currentPath != AcceptedPathKind::Unknown,
+                    ProofObligationKind::AcceptedPathClassified,
+                    ProofFailureReason::MissingAcceptedPathClassification);
+  discharge.Require(inventory.futureTarget != FutureProofTarget::Unknown,
+                    ProofObligationKind::FutureTargetMapped,
+                    ProofFailureReason::MissingFutureTargetMapping);
+  discharge.Require(patch != nullptr,
+                    ProofObligationKind::IncludePatchShapeTracked,
+                    ProofFailureReason::MissingIncludePatchShape);
+  if (!patch)
+    return discharge.Finish();
+
+  switch (currentPath) {
+  case AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens:
+    discharge.Require(patch->aStart < patch->aEnd,
+                      ProofObligationKind::IncludeMappedHeaderRangeTracked,
+                      ProofFailureReason::MissingMappedHeaderRange);
+    break;
+  case AcceptedPathKind::IncludeInsertSelectedConditionalBoundary:
+    discharge.Require(patch->aStart == patch->aEnd,
+                      ProofObligationKind::IncludePatchShapeTracked,
+                      ProofFailureReason::MissingIncludePatchShape);
+    discharge.Require(patch->ownerHasCondArmCert,
+                      ProofObligationKind::IncludeConditionalOwnershipTracked,
+                      ProofFailureReason::MissingConditionalOwnership);
+    break;
+  case AcceptedPathKind::IncludeInsertChildBoundary:
+  case AcceptedPathKind::IncludeInsertRightNeighborPP:
+  case AcceptedPathKind::IncludeInsertLeftNeighborPP:
+  case AcceptedPathKind::IncludeInsertDeclBoundary:
+    discharge.Require(patch->aStart == patch->aEnd,
+                      ProofObligationKind::IncludePatchShapeTracked,
+                      ProofFailureReason::MissingIncludePatchShape);
+    break;
+  case AcceptedPathKind::IncludePatchPendingMaterialization:
+  case AcceptedPathKind::IncludeRealizationInlineFromB:
+  case AcceptedPathKind::Unknown:
+  case AcceptedPathKind::MacroArgsOnlyStandard:
+  case AcceptedPathKind::MacroArgsOnlyPasteSingle:
+  case AcceptedPathKind::MacroArgsOnlyPasteMulti:
+  case AcceptedPathKind::MacroArgsOnlyPurePasteOnly:
+  case AcceptedPathKind::MacroArgsOnlyPairedPureInsertion:
+  case AcceptedPathKind::MacroDagSubtreeRoot:
+  case AcceptedPathKind::MacroCallChainSuffix:
+  case AcceptedPathKind::MacroCounterLiteral:
+  case AcceptedPathKind::MacroWholeCoverFallback:
+  case AcceptedPathKind::TUExactSlotBoundary:
+  case AcceptedPathKind::TUProvableInsertionAnchor:
+  case AcceptedPathKind::TerminalEmitEditedPreprocessedStream:
+    break;
+  }
+
+  return discharge.Finish();
+}
+
+RefoldEngine::ProofDischargeRecord
+RefoldEngine::ValidateIncludeRealizationProof(AcceptedPathKind currentPath,
+                                              const IncludePatch *patch) const {
+  (void)patch;
+  ProofDischargeAccumulator discharge;
+  const AcceptancePathInventory inventory = BuildAcceptancePathInventory(currentPath);
+  discharge.Require(inventory.currentPath != AcceptedPathKind::Unknown,
+                    ProofObligationKind::AcceptedPathClassified,
+                    ProofFailureReason::MissingAcceptedPathClassification);
+  discharge.Require(inventory.futureTarget != FutureProofTarget::Unknown,
+                    ProofObligationKind::FutureTargetMapped,
+                    ProofFailureReason::MissingFutureTargetMapping);
+  discharge.Require(currentPath == AcceptedPathKind::IncludeRealizationInlineFromB,
+                    ProofObligationKind::LegacyFallbackExplicitlyTracked,
+                    ProofFailureReason::LegacyFallback);
+  return discharge.Finish();
+}
+
+RefoldEngine::ProofDischargeRecord
+RefoldEngine::ValidateTUAnchorProof(AcceptedPathKind currentPath) const {
+  ProofDischargeAccumulator discharge;
+  const AcceptancePathInventory inventory = BuildAcceptancePathInventory(currentPath);
+  const bool classified = currentPath == AcceptedPathKind::TUExactSlotBoundary ||
+                          currentPath == AcceptedPathKind::TUProvableInsertionAnchor;
+  discharge.Require(classified,
+                    ProofObligationKind::TUAnchorPathClassified,
+                    ProofFailureReason::MissingTUAnchorClassification);
+  discharge.Require(inventory.futureTarget != FutureProofTarget::Unknown,
+                    ProofObligationKind::FutureTargetMapped,
+                    ProofFailureReason::MissingFutureTargetMapping);
+  return discharge.Finish();
 }
 
 StringRef
@@ -8758,6 +9071,98 @@ StringRef RefoldEngine::FormatFutureProofTarget(FutureProofTarget target) const 
   return "Unknown";
 }
 
+StringRef RefoldEngine::FormatProofDischargeStatus(
+    ProofDischargeStatus status) const {
+  switch (status) {
+  case ProofDischargeStatus::Unknown:
+    return "Unknown";
+  case ProofDischargeStatus::PendingMaterialization:
+    return "PendingMaterialization";
+  case ProofDischargeStatus::Discharged:
+    return "Discharged";
+  case ProofDischargeStatus::Rejected:
+    return "Rejected";
+  }
+  return "Unknown";
+}
+
+StringRef RefoldEngine::FormatProofObligationKind(
+    ProofObligationKind obligation) const {
+  switch (obligation) {
+  case ProofObligationKind::Unknown:
+    return "Unknown";
+  case ProofObligationKind::AcceptedPathClassified:
+    return "AcceptedPathClassified";
+  case ProofObligationKind::FutureTargetMapped:
+    return "FutureTargetMapped";
+  case ProofObligationKind::LegacyValidationRecorded:
+    return "LegacyValidationRecorded";
+  case ProofObligationKind::StructureMatchesAcceptedClass:
+    return "StructureMatchesAcceptedClass";
+  case ProofObligationKind::ProofRootTracked:
+    return "ProofRootTracked";
+  case ProofObligationKind::SubtreeAdmissibilityTracked:
+    return "SubtreeAdmissibilityTracked";
+  case ProofObligationKind::WholeCoverBoundsTracked:
+    return "WholeCoverBoundsTracked";
+  case ProofObligationKind::WholeCoverContainmentTracked:
+    return "WholeCoverContainmentTracked";
+  case ProofObligationKind::WholeCoverBoundaryAccountingTracked:
+    return "WholeCoverBoundaryAccountingTracked";
+  case ProofObligationKind::IncludePendingMaterializationClassified:
+    return "IncludePendingMaterializationClassified";
+  case ProofObligationKind::IncludePatchShapeTracked:
+    return "IncludePatchShapeTracked";
+  case ProofObligationKind::IncludeConditionalOwnershipTracked:
+    return "IncludeConditionalOwnershipTracked";
+  case ProofObligationKind::IncludeMappedHeaderRangeTracked:
+    return "IncludeMappedHeaderRangeTracked";
+  case ProofObligationKind::TUAnchorPathClassified:
+    return "TUAnchorPathClassified";
+  case ProofObligationKind::LegacyFallbackExplicitlyTracked:
+    return "LegacyFallbackExplicitlyTracked";
+  }
+  return "Unknown";
+}
+
+StringRef RefoldEngine::FormatProofFailureReason(ProofFailureReason reason) const {
+  switch (reason) {
+  case ProofFailureReason::None:
+    return "None";
+  case ProofFailureReason::PendingMaterialization:
+    return "PendingMaterialization";
+  case ProofFailureReason::MissingAcceptedPathClassification:
+    return "MissingAcceptedPathClassification";
+  case ProofFailureReason::MissingFutureTargetMapping:
+    return "MissingFutureTargetMapping";
+  case ProofFailureReason::MissingLegacyValidation:
+    return "MissingLegacyValidation";
+  case ProofFailureReason::StructuralMismatch:
+    return "StructuralMismatch";
+  case ProofFailureReason::MissingProofRoot:
+    return "MissingProofRoot";
+  case ProofFailureReason::MissingSubtreeAdmissibility:
+    return "MissingSubtreeAdmissibility";
+  case ProofFailureReason::MissingWholeCoverBounds:
+    return "MissingWholeCoverBounds";
+  case ProofFailureReason::MissingWholeCoverContainment:
+    return "MissingWholeCoverContainment";
+  case ProofFailureReason::MissingWholeCoverBoundaryAccounting:
+    return "MissingWholeCoverBoundaryAccounting";
+  case ProofFailureReason::MissingIncludePatchShape:
+    return "MissingIncludePatchShape";
+  case ProofFailureReason::MissingConditionalOwnership:
+    return "MissingConditionalOwnership";
+  case ProofFailureReason::MissingMappedHeaderRange:
+    return "MissingMappedHeaderRange";
+  case ProofFailureReason::MissingTUAnchorClassification:
+    return "MissingTUAnchorClassification";
+  case ProofFailureReason::LegacyFallback:
+    return "LegacyFallback";
+  }
+  return "None";
+}
+
 StringRef
 RefoldEngine::FormatMacroPatchProofKind(MacroPatchProofKind kind) const {
   switch (kind) {
@@ -8794,27 +9199,49 @@ std::string RefoldEngine::FormatAcceptancePathInventory(
       .str();
 }
 
+std::string RefoldEngine::FormatProofDischargeRecord(
+    const ProofDischargeRecord &record) const {
+  return formatv(
+             "status={0} evaluated={1} satisfied={2} failedObligation={3} "
+             "failureReason={4}",
+             FormatProofDischargeStatus(record.status),
+             record.obligationsEvaluated, record.obligationsSatisfied,
+             FormatProofObligationKind(record.failedObligation),
+             FormatProofFailureReason(record.failureReason))
+      .str();
+}
+
+std::string RefoldEngine::FormatAcceptedPathAudit(
+    AcceptedPathKind currentPath, const IncludePatch *patch) const {
+  const ProofSummary summary = BuildAcceptedPathProofSummary(currentPath, patch);
+  return formatv("inventory={0} discharge={1}",
+                 FormatAcceptancePathInventory(summary.inventory),
+                 FormatProofDischargeRecord(summary.discharge))
+      .str();
+}
+
 std::string RefoldEngine::FormatMacroPatchAudit(const MacroPatch &patch) const {
   const ProofSummary summary = ClassifyMacroPatchProof(patch);
   return formatv(
              "proofKind={0} topClass={1} realization={2} preference={3} "
-             "legacyEscalation={4} inventory={5} validated={6} struct={7} "
-             "proofRoot={8} subtreeCert={9} leaf={10} witnesses={11} "
-             "invCerts={12} formalCerts={13} argCerts={14} liftChains={15} "
-             "liftSteps={16} rootMerges={17} lexicalBridge={18} paste={19} "
-             "wrappers={20} stringify={21} wideStringify={22} "
-             "childSyntax={23} rawInvocation={24} passthrough={25} "
-             "bridgeSensitive={26} deferredPasteDischarged={27} "
-             "admissible={28} expRootN={29} deferredRootN={30} "
-             "bridgeFormalN={31} expRoot={32} deferredRootArgs={33} "
-             "bridgeFormals={34} wholeCoverA=[{35},{36}) "
-             "wholeCoverBraw=[{37},{38}) wholeCoverBadj=[{39},{40})",
+             "legacyEscalation={4} inventory={5} discharge={6} "
+             "validated={7} struct={8} proofRoot={9} subtreeCert={10} "
+             "leaf={11} witnesses={12} invCerts={13} formalCerts={14} "
+             "argCerts={15} liftChains={16} liftSteps={17} rootMerges={18} "
+             "lexicalBridge={19} paste={20} wrappers={21} stringify={22} "
+             "wideStringify={23} childSyntax={24} rawInvocation={25} "
+             "passthrough={26} bridgeSensitive={27} "
+             "deferredPasteDischarged={28} admissible={29} expRootN={30} "
+             "deferredRootN={31} bridgeFormalN={32} expRoot={33} "
+             "deferredRootArgs={34} bridgeFormals={35} wholeCoverA=[{36},{37}) "
+             "wholeCoverBraw=[{38},{39}) wholeCoverBadj=[{40},{41})",
              FormatMacroPatchProofKind(patch.proofKind),
              FormatAcceptedProofClass(summary.acceptedClass),
              FormatRealizationMode(summary.realizationMode),
              FormatSelectionPreference(summary.preference),
              FormatLegacyEscalationDisposition(summary.legacyEscalation),
              FormatAcceptancePathInventory(summary.inventory),
+             FormatProofDischargeRecord(summary.discharge),
              patch.proofValidated ? 1 : 0,
              patch.structurePreserving ? 1 : 0, patch.proofRootMacroId,
              patch.subtreeCertBacked ? 1 : 0, patch.subtreeLeafMacroId,
@@ -18512,8 +18939,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
     debug("include/mat",
           "FORCE inline from B tier={0} inc#{1} bTok=[{2},{3}) inventory={4}",
           escalationTier_, inc->id, bEnvOpt->first, bEnvOpt->second,
-          FormatAcceptancePathInventory(BuildAcceptancePathInventory(
-              AcceptedPathKind::IncludeRealizationInlineFromB)));
+          FormatAcceptedPathAudit(AcceptedPathKind::IncludeRealizationInlineFromB));
     return;
   }
 
@@ -18791,11 +19217,12 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     const IncludePatch &p = ie.patches[idx];
     trace("include/patch", "computeIncludeTextEdits: patch={0}", p);
 
-    // Step 2 inventories the exact include-materialization path chosen for
-    // each accepted edit. Include patches are created in a pending state and
-    // become concrete only when this routine selects a specific anchor.
+    // Step 3 records the local obligations discharged by each accepted
+    // include-materialization path. The patch itself provides the class-local
+    // witness data (for example whether the edit is an insertion or is owned
+    // by a selected conditional arm).
     auto includeInventoryFor = [&](AcceptedPathKind path) {
-      return FormatAcceptancePathInventory(BuildAcceptancePathInventory(path));
+      return FormatAcceptedPathAudit(path, &p);
     };
 
     const bool isInsert = (p.aStart == p.aEnd) && (p.bStart < p.bEnd);
