@@ -650,6 +650,78 @@ private:
     FutureProofTarget futureTarget = FutureProofTarget::Unknown;
   };
 
+  /// \brief Status produced when the engine evaluates a local proof contract.
+  ///
+  /// Step 3 introduces explicit obligation/discharge records so accepted
+  /// results can be explained in terms of the class-local facts they already
+  /// rely on today. These records are descriptive in this step: the legacy
+  /// acceptance logic remains behaviorally authoritative until later steps
+  /// switch selection over to the normalized proof lattice.
+  enum class ProofDischargeStatus : uint8_t {
+    Unknown,
+    PendingMaterialization,
+    Discharged,
+    Rejected,
+  };
+
+  /// \brief Named local obligations used by Step 3 proof-discharge records.
+  enum class ProofObligationKind : uint8_t {
+    Unknown,
+    AcceptedPathClassified,
+    FutureTargetMapped,
+    LegacyValidationRecorded,
+    StructureMatchesAcceptedClass,
+    ProofRootTracked,
+    SubtreeAdmissibilityTracked,
+    WholeCoverBoundsTracked,
+    WholeCoverContainmentTracked,
+    WholeCoverBoundaryAccountingTracked,
+    IncludePendingMaterializationClassified,
+    IncludePatchShapeTracked,
+    IncludeConditionalOwnershipTracked,
+    IncludeMappedHeaderRangeTracked,
+    TUAnchorPathClassified,
+    LegacyFallbackExplicitlyTracked,
+  };
+
+  /// \brief Why a local proof contract could not be discharged.
+  enum class ProofFailureReason : uint8_t {
+    None,
+    PendingMaterialization,
+    MissingAcceptedPathClassification,
+    MissingFutureTargetMapping,
+    MissingLegacyValidation,
+    StructuralMismatch,
+    MissingProofRoot,
+    MissingSubtreeAdmissibility,
+    MissingWholeCoverBounds,
+    MissingWholeCoverContainment,
+    MissingWholeCoverBoundaryAccounting,
+    MissingIncludePatchShape,
+    MissingConditionalOwnership,
+    MissingMappedHeaderRange,
+    MissingTUAnchorClassification,
+    LegacyFallback,
+  };
+
+  /// \brief Compact record of Step 3 class-local obligation discharge.
+  struct ProofDischargeRecord {
+    ProofDischargeStatus status = ProofDischargeStatus::Unknown;
+    ProofFailureReason failureReason = ProofFailureReason::None;
+    ProofObligationKind failedObligation = ProofObligationKind::Unknown;
+    uint16_t obligationsEvaluated = 0;
+    uint16_t obligationsSatisfied = 0;
+  };
+
+  /// \brief Small Step-3 helper that accumulates class-local obligations.
+  ///
+  /// This remains a private implementation detail because later steps may
+  /// replace the descriptive discharge bookkeeping introduced in Step 3 with
+  /// stronger, selection-authoritative proof objects. Keeping the accumulator
+  /// nested here lets the out-of-line implementation reuse the normalized
+  /// proof types without widening RefoldEngine's public API.
+  struct ProofDischargeAccumulator;
+
   /// \brief Common proof-summary carrier used during the proof-lattice
   /// migration.
   ///
@@ -665,6 +737,7 @@ private:
     LegacyEscalationDisposition legacyEscalation =
         LegacyEscalationDisposition::None;
     AcceptancePathInventory inventory;
+    ProofDischargeRecord discharge;
     bool validated = false;
     bool structurePreserving = false;
     uint64_t proofRootMacroId = 0;
@@ -2390,18 +2463,44 @@ private:
   AcceptancePathInventory
   BuildAcceptancePathInventory(AcceptedPathKind currentPath) const;
 
-  /// \brief Build the default Step-1/2 proof summary for an include patch.
+  /// \brief Build a normalized proof summary for a concrete accepted path.
   ///
-  /// Include proofs are not yet explicit, but Step 1/2 still records whether
-  /// the current path is structural or a realized include surface. Preserving
-  /// include patches start in a pending state and are mapped to a concrete
-  /// accepted path once materialization chooses an anchor.
+  /// Step 3 uses this helper to attach class-local obligation/discharge
+  /// metadata to non-macro accepted paths such as include anchors and TU
+  /// anchors. When \p patch is null, only obligations that can be discharged
+  /// from the path classification itself are evaluated.
+  ProofSummary BuildAcceptedPathProofSummary(
+      AcceptedPathKind currentPath,
+      const IncludePatch *patch = nullptr) const;
+
+  /// \brief Build the default Step-1/2/3 proof summary for an include patch.
+  ///
+  /// Include proofs are not yet selection-authoritative, but Step 3 now records
+  /// which local obligations are already discharged for the currently chosen
+  /// include path. Preserving include patches start in a pending state and are
+  /// mapped to a concrete accepted path once materialization chooses an anchor.
   ProofSummary BuildIncludePatchProofSummary(
       bool realizedSurface,
       AcceptedPathKind currentPath =
-          AcceptedPathKind::IncludePatchPendingMaterialization) const;
+          AcceptedPathKind::IncludePatchPendingMaterialization,
+      const IncludePatch *patch = nullptr) const;
 
-  /// \brief Formatters for the normalized Step-1/2 proof metadata.
+  /// \brief Validate the current local proof contract for an accepted class.
+  ///
+  /// These validators are descriptive in Step 3. They lift the existing
+  /// deterministic checks into named obligations without changing acceptance
+  /// behavior yet.
+  ProofDischargeRecord
+  ValidateInvocationPreservingProof(const MacroPatch &patch) const;
+  ProofDischargeRecord
+  ValidateInvocationRealizationProof(const MacroPatch &patch) const;
+  ProofDischargeRecord ValidateIncludePreservingProof(
+      AcceptedPathKind currentPath, const IncludePatch *patch) const;
+  ProofDischargeRecord ValidateIncludeRealizationProof(
+      AcceptedPathKind currentPath, const IncludePatch *patch) const;
+  ProofDischargeRecord ValidateTUAnchorProof(AcceptedPathKind currentPath) const;
+
+  /// \brief Formatters for the normalized Step-1/2/3 proof metadata.
   StringRef FormatAcceptedProofClass(AcceptedProofClass kind) const;
   StringRef FormatRealizationMode(RealizationMode mode) const;
   StringRef FormatSelectionPreference(SelectionPreference preference) const;
@@ -2410,6 +2509,9 @@ private:
   StringRef FormatAcceptedPathKind(AcceptedPathKind kind) const;
   StringRef FormatAcceptanceSupportKind(AcceptanceSupportKind support) const;
   StringRef FormatFutureProofTarget(FutureProofTarget target) const;
+  StringRef FormatProofDischargeStatus(ProofDischargeStatus status) const;
+  StringRef FormatProofObligationKind(ProofObligationKind obligation) const;
+  StringRef FormatProofFailureReason(ProofFailureReason reason) const;
 
   /// rief Format a patch proof kind for tracing.
   StringRef FormatMacroPatchProofKind(MacroPatchProofKind kind) const;
@@ -2417,6 +2519,14 @@ private:
   /// rief Format the Step-2 acceptance-path inventory for tracing.
   std::string
   FormatAcceptancePathInventory(const AcceptancePathInventory &inventory) const;
+
+  /// \brief Format a Step-3 proof-discharge record for tracing.
+  std::string
+  FormatProofDischargeRecord(const ProofDischargeRecord &record) const;
+
+  /// \brief Format the normalized accepted-path audit for tracing.
+  std::string FormatAcceptedPathAudit(AcceptedPathKind currentPath,
+                                      const IncludePatch *patch = nullptr) const;
 
   /// rief Format patch provenance and subtree-composition audit metadata.
   std::string FormatMacroPatchAudit(const MacroPatch &patch) const;
