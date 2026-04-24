@@ -163,6 +163,7 @@ struct PPTok {
 /// \author jeikenberry
 class RefoldEngine {
 struct ByteHunk;
+struct TextEdit;
 public:
   /// \brief Perform the end-to-end refolding process for a translation unit.
   ///
@@ -451,6 +452,32 @@ private:
   /// first and only record / emit the raw-B terminal carrier when that
   /// intermediate stage fails closed.
   std::string ResolvePostStructuralFallback();
+
+  /// \brief Try to realize one unresolved TU-owned edit as a proved source
+  ///        closure over a contiguous run of top-level `#include` directives.
+  ///
+  /// This is the first hybrid fallback/edit-composition helper used to avoid
+  /// discarding already-proved structural artifacts when one PP hunk cannot be
+  /// anchored directly as a macro/include/TU edit. The helper stays deliberately
+  /// narrow:
+  ///
+  /// * only non-insertion hunks are eligible,
+  /// * only top-level TU `#include` directives are considered,
+  /// * the touched include run must form one exact contiguous A-cover with no
+  ///   PP gaps,
+  /// * the corresponding source bytes in the TU may contain only the include
+  ///   directives themselves plus whitespace between them,
+  /// * and the replacement text must come from a canonical-or-consensus B
+  ///   envelope for that exact include closure.
+  ///
+  /// When those obligations hold, the result is staged as one explicit TU text
+  /// edit and later composed together with ordinary TU edits and macro callsite
+  /// patches. Otherwise the caller must keep the hunk out-of-domain and retain
+  /// the existing terminal fallback behavior.
+  std::optional<TextEdit>
+  BuildTUIncludeClosureEditForUnresolvedHunk(const diffutils::Hunk &h,
+                                             llvm::StringRef tuPath,
+                                             llvm::StringRef tuBytes) const;
 
   /// \brief Build the single-owner macro whole-expansion fallback witness.
   ///
