@@ -423,13 +423,22 @@ private:
   /// fallback.
   std::string BuildTheoremAuditInvariantDetail() const;
 
-  /// \brief Attempt the proof-backed partial-expansion fallback stage.
+  /// \brief Attempt the proof-backed intermediate expansion-fallback stage.
   ///
-  /// This stage is intentionally separate from both structural refolding and
-  /// terminal fallback to B. Step 1 installs the seam and Step 2 may now derive
-  /// a concrete single-owner macro witness, but no partial-expansion source is
-  /// emitted until a later synthesis step connects that witness to output.
+  /// This stage sits strictly between structural refolding and the explicit
+  /// terminal fallback to B. It may now derive a concrete single-owner macro
+  /// witness and, when Step 3 synthesis succeeds, return a source-level
+  /// fallback-expanded TU instead of letting the run proceed to raw B.
   std::optional<std::string> TryExpansionClosureFallback();
+
+  /// \brief Resolve the full post-structural fallback result for the current
+  /// run.
+  ///
+  /// Step 4 makes the intermediate expansion-fallback stage authoritative: if
+  /// terminal fallback was requested, try the proved expansion-fallback source
+  /// first and only record / emit the raw-B terminal carrier when that
+  /// intermediate stage fails closed.
+  std::string ResolvePostStructuralFallback();
 
   /// \brief Build the single-owner macro whole-expansion fallback witness.
   ///

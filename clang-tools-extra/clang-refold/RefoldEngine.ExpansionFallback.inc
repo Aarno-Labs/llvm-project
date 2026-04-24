@@ -418,3 +418,39 @@ std::optional<std::string> RefoldEngine::TryExpansionClosureFallback() {
 
   return std::nullopt;
 }
+
+std::string RefoldEngine::ResolvePostStructuralFallback() {
+  if (!terminalFallbackRequested_)
+    return std::string();
+
+  // Step 4 makes the intermediate expansion-fallback stage authoritative. Once
+  // structural emission has failed closed, the engine must try the proved
+  // expansion closure before it records or emits the raw-B terminal carrier.
+  if (auto expanded = TryExpansionClosureFallback())
+    return *expanded;
+
+  // Reaching this point means both structural emission and the intermediate
+  // proof-backed expansion stage failed closed. Only now do we normalize the
+  // run onto the one explicit terminal out-of-domain carrier.
+  RecordTerminalFallbackTheoremAudit();
+
+  debug("fallback",
+        "terminal fallback: emitting fully expanded edited preprocessed "
+        "stream (B). reasons={0}",
+        terminalFallbackReasons_.size());
+  const TerminalFallbackWitness terminalWitness = BuildTerminalFallbackWitness();
+  const AcceptedResultCandidate terminalCandidate =
+      BuildAcceptedTerminalCandidate(terminalWitness);
+  debug("proof/inventory", "terminal result {0}",
+        FormatAcceptedResultCandidate(terminalCandidate));
+  for (const auto &r : terminalFallbackReasons_)
+    debug("fallback", "  {0}", r);
+
+  // The raw-B terminal carrier is the fully expanded surface, so every include
+  // and every top-level macro root remains expanded in the final result.
+  ResetAttemptStats();
+  lastStats_.expandedIncludes = lastStats_.totalIncludes;
+  lastStats_.expandedMacros = lastStats_.totalMacros;
+  lastStats_.terminalFallbackToB = true;
+  return bSource_.str();
+}
