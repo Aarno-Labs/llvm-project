@@ -679,13 +679,25 @@ Expected<std::string> RefoldEngine::Refold(
   return engine.Refold();
 }
 
-void RefoldEngine::RequestEscalation(StringRef phase, StringRef detail) const {
+void RefoldEngine::RequestEscalation(TerminalFallbackKind kind, StringRef phase,
+                                    StringRef detail) const {
   escalationRequested_ = true;
+  ++terminalFallbackRequestCount_;
+  if (terminalFallbackKind_ == TerminalFallbackKind::Unknown) {
+    terminalFallbackKind_ = kind;
+  } else if (kind != TerminalFallbackKind::Unknown &&
+             terminalFallbackKind_ != kind) {
+    terminalFallbackKind_ = TerminalFallbackKind::MixedExcludedCases;
+  }
   if (escalationReasons_.size() < 64) {
     escalationReasons_.push_back(
         llvm::formatv("{0}: {1}", phase, detail).str());
   }
-  debug("escalate", "REQUEST escalation: {0}: {1}", phase, detail);
+  debug("escalate", "REQUEST terminal fallback: {0}: {1}", phase, detail);
+}
+
+void RefoldEngine::RequestEscalation(StringRef phase, StringRef detail) const {
+  RequestEscalation(TerminalFallbackKind::Unknown, phase, detail);
 }
 
 void RefoldEngine::BuildBInsertionProvenance(ArrayRef<diffutils::Hunk> hunks) {
@@ -883,44 +895,34 @@ RefoldEngine::SliceBSourceClippedAgainstClaims(size_t bTokStart,
 }
 
 std::string RefoldEngine::Refold() {
-  // Multi-tier escalation ladder: retry refolding under increasingly
-  // conservative (more-expanded) policies before falling back to emitting B.
-  //
-  //   tier 0: normal structural refold
-  //   tier 1: force whole-cover macro replacement
-  //   tier 2: force inlining touched includes from B slices
-  //
-  // If escalation is still requested after tier 2, emit the fully expanded
-  // edited preprocessed stream (B).
-  constexpr unsigned kMaxTier = 2;
-  for (unsigned tier = 0; tier <= kMaxTier; ++tier) {
-    escalationTier_ = tier;
-    ResetEscalationState();
-    ResetAttemptStats();
+  // Step 12 collapses the operational retry ladder into a single structural
+  // pass. Any site that still cannot discharge into an explicit proof/lattice
+  // outcome now requests the terminal fallback directly instead of asking for a
+  // more-expanded retry tier.
+  escalationTier_ = 0;
+  ResetEscalationState();
+  ResetAttemptStats();
 
-    if (tier != 0)
-      debug("escalate", "ESCALATION tier={0}: retrying refold", tier);
-
-    std::string out = RefoldOnce();
-    if (!escalationRequested_) {
-      EmitRefoldStats();
-      return out;
-    }
-
-    debug("escalate", "ESCALATION tier={0}: requested; advancing. reasons={1}",
-          tier, escalationReasons_.size());
-    for (const auto &r : escalationReasons_)
-      debug("escalate", "  {0}", r);
+  std::string out = RefoldOnce();
+  if (!escalationRequested_) {
+    EmitRefoldStats();
+    return out;
   }
 
   debug("escalate",
-        "ESCALATION terminal: emitting fully expanded edited preprocessed "
-        "stream (B). reasons={0}", escalationReasons_.size());
+        "terminal fallback: emitting fully expanded edited preprocessed "
+        "stream (B). reasons={0}",
+        escalationReasons_.size());
+  const TerminalFallbackWitness terminalWitness = BuildTerminalFallbackWitness();
   debug("proof/inventory", "terminal result {0}",
         FormatAcceptedPathAudit(
-            AcceptedPathKind::TerminalEmitEditedPreprocessedStream));
+            AcceptedPathKind::TerminalEmitEditedPreprocessedStream,
+            /*patch=*/nullptr, /*tuAnchorWitness=*/nullptr,
+            /*includeAnchorWitness=*/nullptr,
+            /*includeRealizationWitness=*/nullptr, &terminalWitness));
   for (const auto &r : escalationReasons_)
     debug("escalate", "  {0}", r);
+
   lastStats_ = RefoldStats{};
   lastStats_.totalIncludes = model_.GetIncludes().size();
   lastStats_.expandedIncludes = lastStats_.totalIncludes;
@@ -929,7 +931,7 @@ std::string RefoldEngine::Refold() {
       ++lastStats_.totalMacros;
   }
   lastStats_.expandedMacros = lastStats_.totalMacros;
-  lastStats_.tier = kMaxTier + 1;
+  lastStats_.tier = 1;
   lastStats_.terminalFallbackToB = true;
   EmitRefoldStats();
   return bSource_.str();
@@ -1850,21 +1852,20 @@ std::string RefoldEngine::RefoldOnce() {
           "available (no include guessing).",
           i, h);
     RequestEscalation(
-        "classify",
+        TerminalFallbackKind::OwnerUnresolvedNoTUAnchor, "classify",
         llvm::formatv("dropped edit #{0} (owner unresolved, no TU byte span)",
                       i)
             .str());
     continue;
   }
 
-  // Global fail-closed composition rule: once this attempt has requested
-  // escalation, do not continue composing structural artifacts in the current
-  // tier. The outer escalation ladder will retry under the next more-expanded
-  // policy, and if all tiers request escalation it will emit B directly.
+  // Global fail-closed composition rule: once this single structural pass has
+  // requested terminal fallback, do not continue composing structural
+  // artifacts. The outer driver will discard the current attempt and emit B
+  // directly.
   if (escalationRequested_) {
     debug("escalate",
-          "attempt tier={0}: aborting after classification; structural output will be discarded and retried",
-          escalationTier_);
+          "single-pass refold aborted after classification; terminal fallback will be emitted");
     return std::string();
   }
 
@@ -2003,42 +2004,22 @@ std::string RefoldEngine::RefoldOnce() {
                                 &appliedExpandedMacroRootIds);
   }
 
-  // Global fail-closed composition rule: if include realization requested
-  // escalation in this attempt, stop here and let the outer ladder retry under
-  // the next tier rather than continuing to compose or return mixed structural
-  // artifacts from the current tier.
+  // Global fail-closed composition rule: if include realization requested the
+  // terminal fallback in this single pass, stop here rather than continuing to
+  // compose or return mixed structural artifacts.
   if (escalationRequested_) {
     debug("escalate",
-          "attempt tier={0}: aborting after include materialization; output will be discarded and retried",
-          escalationTier_);
+          "single-pass refold aborted after include materialization; terminal fallback will be emitted");
     return std::string();
   }
 
-  // Determine which include ids should count as "expanded" for this refold.
-  // If forced inlining of touched includes from B is enabled, start from the
-  // includes that have explicit expansion materialization and close that set
-  // downward through the include tree so all nested children are marked
-  // expanded too. Otherwise, count only the includes that appear directly in
-  // includeExpansion. Record the final expanded-include count in stats.
+  // Determine which include ids count as expanded in the chosen single-pass
+  // result. After Step 12, include realization is selected directly in the
+  // same pass, so the set is exactly the include ids that materialized an
+  // expansion text.
   DenseSet<uint64_t> expandedIncludeIds;
-  if (ForceInlineTouchedIncludesFromB()) {
-    SmallVector<uint64_t, 32> stack;
-    for (const auto &kv : includeExpansion)
-      stack.push_back(kv.first);
-    while (!stack.empty()) {
-      const uint64_t id = stack.pop_back_val();
-      if (!expandedIncludeIds.insert(id).second)
-        continue;
-      auto childIt = children.find(id);
-      if (childIt == children.end())
-        continue;
-      for (const RefoldModel::IncludeItem *child : childIt->second)
-        stack.push_back(child->id);
-    }
-  } else {
-    for (const auto &kv : includeExpansion)
-      expandedIncludeIds.insert(kv.first);
-  }
+  for (const auto &kv : includeExpansion)
+    expandedIncludeIds.insert(kv.first);
   lastStats_.expandedIncludes = expandedIncludeIds.size();
 
   // 6a) TU macro patches (ownerIncludeId == std::nullopt) and include
@@ -2229,13 +2210,13 @@ std::string RefoldEngine::RefoldOnce() {
     }
   }
 
-  // Note: escalation handling is performed by the outer ladder in Refold().
-  if (ForceInlineTouchedIncludesFromB()) {
-    for (const auto &mi : model_.GetMacroInvocations()) {
-      if (mi.ownerIncludeId &&
-          expandedIncludeIds.find(*mi.ownerIncludeId) != expandedIncludeIds.end())
-        appliedExpandedMacroRootIds.insert(GetRootMacroId(mi.id));
-    }
+  // Charge root macros that remain inside expanded include bodies so the final
+  // statistics continue to reflect which macro structure was realized rather
+  // than preserved in the single-pass result.
+  for (const auto &mi : model_.GetMacroInvocations()) {
+    if (mi.ownerIncludeId &&
+        expandedIncludeIds.find(*mi.ownerIncludeId) != expandedIncludeIds.end())
+      appliedExpandedMacroRootIds.insert(GetRootMacroId(mi.id));
   }
   lastStats_.expandedMacros = appliedExpandedMacroRootIds.size();
 
@@ -8753,7 +8734,8 @@ RefoldEngine::ProofSummary RefoldEngine::BuildAcceptedPathProofSummary(
     AcceptedPathKind currentPath, const IncludePatch *patch,
     const TUAnchorWitness *tuAnchorWitness,
     const IncludeAnchorWitness *includeAnchorWitness,
-    const IncludeRealizationWitness *includeRealizationWitness) const {
+    const IncludeRealizationWitness *includeRealizationWitness,
+    const TerminalFallbackWitness *terminalFallbackWitness) const {
   ProofSummary summary;
   summary.inventory = BuildAcceptancePathInventory(currentPath);
 
@@ -8806,6 +8788,10 @@ RefoldEngine::ProofSummary RefoldEngine::BuildAcceptedPathProofSummary(
     break;
 
   case AcceptedPathKind::TerminalEmitEditedPreprocessedStream: {
+    if (terminalFallbackWitness) {
+      summary.hasTerminalFallbackWitness = true;
+      summary.terminalFallbackWitness = *terminalFallbackWitness;
+    }
     summary.realizationMode = RealizationMode::RealizeEditedSurface;
     summary.preference = SelectionPreference::PreferSurfaceRealization;
     summary.legacyEscalation =
@@ -10055,6 +10041,35 @@ std::string RefoldEngine::FormatIncludeRealizationWitness(
       .str();
 }
 
+RefoldEngine::TerminalFallbackWitness
+RefoldEngine::BuildTerminalFallbackWitness() const {
+  TerminalFallbackWitness witness;
+  witness.kind = terminalFallbackKind_;
+  witness.requestCount = terminalFallbackRequestCount_;
+  return witness;
+}
+
+std::string RefoldEngine::FormatTerminalFallbackWitness(
+    const TerminalFallbackWitness &witness) const {
+  auto formatKind = [](TerminalFallbackKind kind) -> const char * {
+    switch (kind) {
+    case TerminalFallbackKind::OwnerUnresolvedNoTUAnchor:
+      return "OwnerUnresolvedNoTUAnchor";
+    case TerminalFallbackKind::IncludeRealizationUnmappableBCoverEnvelope:
+      return "IncludeRealizationUnmappableBCoverEnvelope";
+    case TerminalFallbackKind::MixedExcludedCases:
+      return "MixedExcludedCases";
+    case TerminalFallbackKind::Unknown:
+      return "Unknown";
+    }
+    return "Unknown";
+  };
+
+  return formatv("kind={0} requestCount={1}", formatKind(witness.kind),
+                 witness.requestCount)
+      .str();
+}
+
 StringRef
 RefoldEngine::FormatMacroPatchProofKind(MacroPatchProofKind kind) const {
   switch (kind) {
@@ -10133,10 +10148,11 @@ std::string RefoldEngine::FormatAcceptedPathAudit(
     AcceptedPathKind currentPath, const IncludePatch *patch,
     const TUAnchorWitness *tuAnchorWitness,
     const IncludeAnchorWitness *includeAnchorWitness,
-    const IncludeRealizationWitness *includeRealizationWitness) const {
+    const IncludeRealizationWitness *includeRealizationWitness,
+    const TerminalFallbackWitness *terminalFallbackWitness) const {
   const ProofSummary summary = BuildAcceptedPathProofSummary(
       currentPath, patch, tuAnchorWitness, includeAnchorWitness,
-      includeRealizationWitness);
+      includeRealizationWitness, terminalFallbackWitness);
   if (summary.hasTUAnchorWitness) {
     return formatv("inventory={0} lattice={1} completeness={2} discharge={3} tuAnchor={4}",
                    FormatAcceptancePathInventory(summary.inventory),
@@ -10163,6 +10179,15 @@ std::string RefoldEngine::FormatAcceptedPathAudit(
                    FormatProofDischargeRecord(summary.discharge),
                    FormatIncludeRealizationWitness(
                        summary.includeRealizationWitness))
+        .str();
+  }
+  if (summary.hasTerminalFallbackWitness) {
+    return formatv("inventory={0} lattice={1} completeness={2} discharge={3} terminalFallback={4}",
+                   FormatAcceptancePathInventory(summary.inventory),
+                   FormatGlobalSelectionLattice(summary.lattice),
+                   FormatCompletenessContract(summary.completeness),
+                   FormatProofDischargeRecord(summary.discharge),
+                   FormatTerminalFallbackWitness(summary.terminalFallbackWitness))
         .str();
   }
   return formatv("inventory={0} lattice={1} completeness={2} discharge={3}",
@@ -10553,8 +10578,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   argLikeSpans.append(m.pasteSpans.begin(), m.pasteSpans.end());
 
   auto tryPairedPureInsertionRootArgsOnly = [&]() -> std::optional<MacroPatch> {
-    if (ForceWholeCoverMacros())
-      return std::nullopt;
     if (hEff.aStart != hEff.aEnd || hEff.bStart >= hEff.bEnd)
       return std::nullopt;
     if (argLikeSpans.empty())
@@ -10659,7 +10682,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           ? baseInvText
           : (m.invText ? StringRef(*m.invText) : StringRef(""));
   const bool rootHasDirectArgLikeSurface =
-      !ForceWholeCoverMacros() && !argLikeSpans.empty() &&
+      !argLikeSpans.empty() &&
       HunkFullyWithinArgSpans(hEff, argLikeSpans, argTouched) &&
       InvocationSpanMatchesCallsitePrefix(invSpanText, m);
 
@@ -10682,7 +10705,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           existingPatch->structurePreserving &&
           existingPatch->proofRootMacroId == m.id;
     }
-  } else if (!ForceWholeCoverMacros() && !argLikeSpans.empty() &&
+  } else if (!argLikeSpans.empty() &&
              InvocationSpanMatchesCallsitePrefix(invSpanText, m)) {
     argsOnlyCandidate = tryPairedPureInsertionRootArgsOnly();
   }
@@ -10699,8 +10722,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   //   * If the inverse is ambiguous, unsupported, or does not match the
   //     observed text, lifting fails and we conservatively keep the subtree
   //     expanded.
-  if (!ForceWholeCoverMacros() && m.subkind == "func" &&
-      HasLiteralMacroCalleeOrigin(m)) {
+  if (m.subkind == "func" && HasLiteralMacroCalleeOrigin(m)) {
     bool directRootPreservationInadmissible = false;
     auto tryDAGChainedArgsOnly = [&]() -> std::optional<MacroPatch> {
       // --- Phase 0: Preconditions / root invocation parsing ------------------
@@ -19577,18 +19599,22 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         const bool dagValid = validateMergedDirectAndDagRootReplacement(
             baseInvText, StringRef(dag->replacement));
 
-        // If both root-level candidates independently validate, prefer the
-        // direct args-only rewrite instead of merging them into a hybrid root
-        // replacement. The direct candidate preserves the original root
-        // callsite surface without inventing an additional semantic root
-        // rewrite, whereas a merged direct/DAG root can combine evidence from
-        // different proof modes into a less-structural replacement.
+        // Step 12 finalization makes the normalized lattice comparator
+        // authoritative for same-root root-level competition. Once both
+        // candidates are individually valid, choose the stronger compatible
+        // proof class by the explicit lattice law rather than by an ad hoc
+        // direct-vs-DAG heuristic.
         if (directValid && dagValid) {
-          preferDirectRootCandidate = true;
+          const bool preferDirect =
+              LatticePrefers(argsOnlyCandidate->proofSummary, dag->proofSummary);
+          const bool preferDag =
+              LatticePrefers(dag->proofSummary, argsOnlyCandidate->proofSummary);
+          preferDirectRootCandidate = preferDirect || !preferDag;
           trace("macro/dag",
-                "direct args-only preferred over DAG root rewrite when both "
-                "independently validate: root id={0} name='{1}' direct='{2}' "
-                "dag='{3}'",
+                "lattice-selected {0} over {1} for same-root root rewrite "
+                "competition: root id={2} name='{3}' direct='{4}' dag='{5}'",
+                preferDirectRootCandidate ? "direct args-only" : "DAG root",
+                preferDirectRootCandidate ? "DAG root" : "direct args-only",
                 m.id, m.name,
                 stringutils::showWSWithClip(argsOnlyCandidate->replacement, 160),
                 stringutils::showWSWithClip(dag->replacement, 160));
@@ -19692,6 +19718,24 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                 stringutils::showWSWithClip(argsOnlyCandidate->replacement, 160));
           argsOnlyCandidate.reset();
           reuseExistingCallsitePatch = true;
+        } else {
+          const bool preferDirect =
+              LatticePrefers(argsOnlyCandidate->proofSummary,
+                             existingPatch->proofSummary);
+          const bool preferExisting =
+              LatticePrefers(existingPatch->proofSummary,
+                             argsOnlyCandidate->proofSummary);
+          if (preferExisting && !preferDirect) {
+            trace("macro/dag",
+                  "lattice-selected existing callsite patch over direct root "
+                  "args-only rewrite after merge rejection: inv id={0} "
+                  "name='{1}' existing='{2}' current='{3}'",
+                  m.id, m.name,
+                  stringutils::showWSWithClip(existingPatch->replacement, 160),
+                  stringutils::showWSWithClip(argsOnlyCandidate->replacement, 160));
+            argsOnlyCandidate.reset();
+            reuseExistingCallsitePatch = true;
+          }
         }
       }
     }
@@ -19839,6 +19883,47 @@ uint64_t RefoldEngine::GetRootMacroId(uint64_t macroId) const {
   return cur->id;
 }
 
+std::optional<std::string> RefoldEngine::BuildInlineIncludeRealizationFromB(
+    const RefoldModel::IncludeItem &inc, StringRef reason) const {
+  // The include-realization proof class already models the exact A-cover and
+  // mapped B-envelope used when an include must be realized directly from the
+  // edited preprocessed stream. Step 12A selects that class immediately in the
+  // same pass instead of routing through the removed retry ladder.
+  auto bEnvOpt = MapATokRangeAToBTokenEnvelope(inc.cover.begin, inc.cover.end);
+  if (!bEnvOpt) {
+    RequestEscalation(
+        TerminalFallbackKind::IncludeRealizationUnmappableBCoverEnvelope,
+        "include/mat",
+        llvm::formatv("include realization from B failed to map A "
+                      "cover [{0},{1}) for inc#{2}; reason={3}",
+                      inc.cover.begin, inc.cover.end, inc.id, reason)
+            .str());
+    return std::nullopt;
+  }
+
+  IncludeRealizationWitness realizationWitness;
+  realizationWitness.evidence =
+      IncludeRealizationEvidenceKind::InlineFromBCoverEnvelope;
+  realizationWitness.hasIncludeId = true;
+  realizationWitness.includeId = inc.id;
+  realizationWitness.hasACover = true;
+  realizationWitness.aCoverBegin = inc.cover.begin;
+  realizationWitness.aCoverEnd = inc.cover.end;
+  realizationWitness.hasBTokenEnvelope = true;
+  realizationWitness.bTokBegin = bEnvOpt->first;
+  realizationWitness.bTokEnd = bEnvOpt->second;
+
+  debug("include/mat",
+        "realize from B inc#{0} reason='{1}' bTok=[{2},{3}) inventory={4}",
+        inc.id, reason, bEnvOpt->first, bEnvOpt->second,
+        FormatAcceptedPathAudit(AcceptedPathKind::IncludeRealizationInlineFromB,
+                                /*patch=*/nullptr,
+                                /*tuAnchorWitness=*/nullptr,
+                                /*includeAnchorWitness=*/nullptr,
+                                &realizationWitness));
+  return SliceBSource(bEnvOpt->first, bEnvOpt->second).str();
+}
+
 // ============ Include processing (normalize, materialize, apply) =============
 
 void RefoldEngine::MaterializeIncludeExpansion(
@@ -19858,50 +19943,6 @@ void RefoldEngine::MaterializeIncludeExpansion(
   const RefoldModel::IncludeItem *inc = model_.GetIncludeById(includeId);
   if (!inc)
     fatal("include/mat", "unknown includeId {0}", includeId);
-
-  if (ForceInlineTouchedIncludesFromB()) {
-    // Tier-2 escalation: bypass include text patching and inline the include's
-    // fully expanded B-side slice for the include cover. This preserves edits
-    // inside the include subtree, at the cost of expansion.
-    auto bEnvOpt =
-        MapATokRangeAToBTokenEnvelope(inc->cover.begin, inc->cover.end);
-    if (!bEnvOpt) {
-      RequestEscalation("include/mat",
-                        llvm::formatv("tier2 inline-from-B: failed to map A "
-                                      "cover [{0},{1}) for inc#{2}",
-                                      inc->cover.begin, inc->cover.end,
-                                      includeId)
-                            .str());
-      includeExpansion[includeId] = std::string();
-      return;
-    }
-    includeExpansion[includeId] =
-        SliceBSource(bEnvOpt->first, bEnvOpt->second).str();
-
-    // Step 9 records the exact include cover and mapped B token envelope used
-    // when tier-2 realizes a touched include directly from the edited
-    // preprocessed stream.
-    IncludeRealizationWitness realizationWitness;
-    realizationWitness.evidence =
-        IncludeRealizationEvidenceKind::InlineFromBCoverEnvelope;
-    realizationWitness.hasIncludeId = true;
-    realizationWitness.includeId = inc->id;
-    realizationWitness.hasACover = true;
-    realizationWitness.aCoverBegin = inc->cover.begin;
-    realizationWitness.aCoverEnd = inc->cover.end;
-    realizationWitness.hasBTokenEnvelope = true;
-    realizationWitness.bTokBegin = bEnvOpt->first;
-    realizationWitness.bTokEnd = bEnvOpt->second;
-
-    debug("include/mat",
-          "FORCE inline from B tier={0} inc#{1} bTok=[{2},{3}) inventory={4}",
-          escalationTier_, inc->id, bEnvOpt->first, bEnvOpt->second,
-          FormatAcceptedPathAudit(
-              AcceptedPathKind::IncludeRealizationInlineFromB,
-              /*patch=*/nullptr, /*tuAnchorWitness=*/nullptr,
-              /*includeAnchorWitness=*/nullptr, &realizationWitness));
-    return;
-  }
 
   debug("include/mat",
         "ENTER inc#{0} target={1} resolved={2} sitePath={3} site=[{4},{5}) "
@@ -19975,8 +20016,17 @@ void RefoldEngine::MaterializeIncludeExpansion(
     if (!it->second.patches.empty()) {
       debug("include/mat", "inc#{0} adding {1} include patches as TextEdits",
             inc->id, it->second.patches.size());
-      auto moreEdits = ComputeIncludeTextEdits(it->second, bytes);
-      for (auto &te : moreEdits) {
+      IncludeTextEditPlan plan = ComputeIncludeTextEdits(it->second, bytes);
+      if (plan.requiresIncludeRealization) {
+        if (auto realized = BuildInlineIncludeRealizationFromB(
+                *inc, plan.realizationReason)) {
+          includeExpansion[includeId] = std::move(*realized);
+          return;
+        }
+        includeExpansion[includeId] = std::string();
+        return;
+      }
+      for (auto &te : plan.edits) {
         ResyncOutcome ro =
             ApplyResyncOrPend(bytes, te.start, te.end, te.text, headerPath);
         edits.push_back(TextEdit{te.start, te.end, std::move(ro.text),
@@ -20065,22 +20115,25 @@ void RefoldEngine::MaterializeIncludeExpansion(
         edits.push_back(
             TextEdit{siteStart, siteEnd, std::move(wrapped), std::nullopt});
       } else {
-        // Unsupported structural child replacement: the parent include has
-        // descendant work, but the child directive site is degenerate in the
-        // includer byte space. Escalate so tier-2 can inline the touched
-        // include subtree from B rather than silently dropping the child
-        // edits.
+        // A degenerate child site cannot discharge an include-preserving edit
+        // plan for the parent. Select the explicit include-realization proof
+        // class for the whole parent include immediately instead of routing
+        // through the removed retry ladder.
         debug("include/mat",
               "inc#{0} child#{1} has degenerate site [start={2},end={3}]; "
-              "requesting escalation",
+              "realizing parent include from B",
               inc->id, child->id, siteStart, siteEnd);
-        if (!ForceInlineTouchedIncludesFromB())
-          RequestEscalation(
-              "include/mat",
-              llvm::formatv("degenerate child replace site for parent inc#{0} "
-                            "child#{1} site=[{2},{3})",
-                            inc->id, child->id, siteStart, siteEnd)
-                  .str());
+        if (auto realized = BuildInlineIncludeRealizationFromB(
+                *inc,
+                llvm::formatv("degenerate child replace site for parent inc#{0} "
+                              "child#{1} site=[{2},{3})",
+                              inc->id, child->id, siteStart, siteEnd)
+                    .str())) {
+          includeExpansion[includeId] = std::move(*realized);
+        } else {
+          includeExpansion[includeId] = std::string();
+        }
+        return;
       }
     }
   }
@@ -20150,7 +20203,7 @@ RefoldEngine::FindHeaderDeclForPatch(const RefoldModel::IncludeItem &inc,
   return bestCover ? bestCover : bestOverlap;
 }
 
-std::vector<RefoldEngine::TextEdit>
+RefoldEngine::IncludeTextEditPlan
 RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                                       std::string headerText) const {
   const std::string file = resolveHeaderPath(*ie.include);
@@ -20171,7 +20224,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
 
   // Single list of edits; we will apply them highest-offset-first so indices
   // remain stable as we mutate the StringBuilder.
-  std::vector<TextEdit> edits;
+  IncludeTextEditPlan plan;
 
   for (size_t idx = 0; idx < ie.patches.size(); ++idx) {
     const IncludePatch &p = ie.patches[idx];
@@ -20306,7 +20359,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
               PadAtBoundaries(headerText, static_cast<size_t>(*insertByte),
                               static_cast<size_t>(*insertByte), p.insertBytes,
                               /* allowLeft */ true, /* allowRight */ true);
-          edits.push_back(MakeTextEditWithResyncOrPending(
+          plan.edits.push_back(MakeTextEditWithResyncOrPending(
               headerText, *insertByte, *insertByte, text, file));
 
           trace("include/apply",
@@ -20335,7 +20388,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
               PadAtBoundaries(headerText, static_cast<size_t>(*insertByte),
                               static_cast<size_t>(*insertByte), p.insertBytes,
                               /* allowLeft */ true, /* allowRight */ true);
-          edits.push_back(MakeTextEditWithResyncOrPending(
+          plan.edits.push_back(MakeTextEditWithResyncOrPending(
               headerText, *insertByte, *insertByte, text, file));
 
           trace("include/apply",
@@ -20374,13 +20427,12 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
               includeInventoryFor(AcceptedPathKind::IncludeInsertRightNeighborPP,
                                   &rightNeighborWitness));
         if (!startByte) {
-          if (!ForceInlineTouchedIncludesFromB())
-            RequestEscalation(
-                "include/apply",
-                llvm::formatv("INSERT: failed to map anchorPP={0} in file {1}",
-                              anchorPP ? *anchorPP : 0ULL, file)
-                    .str());
-          continue;
+          plan.requiresIncludeRealization = true;
+          plan.realizationReason =
+              llvm::formatv("INSERT: failed to map anchorPP={0} in file {1}",
+                            anchorPP ? *anchorPP : 0ULL, file)
+                  .str();
+          return plan;
         }
         if (!anchorMatchesCondArmCert(*startByte))
           startByte.reset();
@@ -20417,14 +20469,13 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                 includeInventoryFor(AcceptedPathKind::IncludeInsertLeftNeighborPP,
                                     &leftNeighborWitness));
           if (!startByte) {
-            if (!ForceInlineTouchedIncludesFromB())
-              RequestEscalation(
-                  "include/apply",
-                  llvm::formatv("INSERT: failed to map left-neighbor "
-                                "anchorPP={0} in file {1}",
-                                anchorPP ? *anchorPP : 0ULL, file)
-                      .str());
-            continue;
+            plan.requiresIncludeRealization = true;
+            plan.realizationReason =
+                llvm::formatv("INSERT: failed to map left-neighbor "
+                              "anchorPP={0} in file {1}",
+                              anchorPP ? *anchorPP : 0ULL, file)
+                    .str();
+            return plan;
           }
           if (!anchorMatchesCondArmCert(*startByte))
             startByte.reset();
@@ -20463,7 +20514,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
               PadAtBoundaries(headerText, static_cast<size_t>(*insertByte),
                               static_cast<size_t>(*insertByte), p.insertBytes,
                               /* allowLeft */ true, /* allowRight */ true);
-          edits.push_back(MakeTextEditWithResyncOrPending(
+          plan.edits.push_back(MakeTextEditWithResyncOrPending(
               headerText, *insertByte, *insertByte, text, file));
 
           childBoundaryWitness.hasAnchorByte = true;
@@ -20481,13 +20532,13 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                 "file={0} patch[{1}] INSERT: no neighbors, no decl, no child "
                 "boundary; SKIP",
                 file, idx);
-          if (!ForceInlineTouchedIncludesFromB())
-            RequestEscalation(
-                "include/apply",
-                llvm::formatv("INSERT: cannot anchor include patch in file "
-                              "{0} (no neighbors/decl/child boundary)",
-                              file)
-                    .str());
+          plan.requiresIncludeRealization = true;
+          plan.realizationReason =
+              llvm::formatv("INSERT: cannot anchor include patch in file "
+                            "{0} (no neighbors/decl/child boundary)",
+                            file)
+                  .str();
+          return plan;
         }
         continue;
       }
@@ -20522,13 +20573,13 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
               "file={0} patch[{1}] DELETE/REPLACE: no mapped PP tokens in "
               "header; SKIP",
               file, idx);
-        if (!ForceInlineTouchedIncludesFromB())
-          RequestEscalation("include/apply",
-                            llvm::formatv("DELETE/REPLACE: no mapped PP tokens "
-                                          "for patch[{0}] in header file {1}",
-                                          idx, file)
-                                .str());
-        continue;
+        plan.requiresIncludeRealization = true;
+        plan.realizationReason =
+            llvm::formatv("DELETE/REPLACE: no mapped PP tokens for patch[{0}] "
+                          "in header file {1}",
+                          idx, file)
+                .str();
+        return plan;
       }
 
       startByte = ByteStartForPPInFile(file, *firstPP,
@@ -20552,14 +20603,13 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                 AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens,
                 &mappedHeaderWitness));
       if (!startByte || !endByte) {
-        if (!ForceInlineTouchedIncludesFromB())
-          RequestEscalation(
-              "include/apply",
-              llvm::formatv("DELETE/REPLACE: failed to map first/last PP "
-                            "tokens to bytes in file {0}",
-                            file)
-                  .str());
-        continue;
+        plan.requiresIncludeRealization = true;
+        plan.realizationReason =
+            llvm::formatv("DELETE/REPLACE: failed to map first/last PP tokens "
+                          "to bytes in file {0}",
+                          file)
+                .str();
+        return plan;
       }
     }
 
@@ -20616,22 +20666,22 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
             stringutils::showWS(replDbg));
     }
 
-    edits.push_back(MakeTextEditWithResyncOrPending(
+    plan.edits.push_back(MakeTextEditWithResyncOrPending(
         headerText, *startByte, *endByte, replacement, file));
   }
 
   // Apply all edits inside this header, highest offset first so earlier edits
   // do not disturb the coordinates of later ones.
-  sort(edits, [](const TextEdit &lhs, const TextEdit &rhs) {
+  sort(plan.edits, [](const TextEdit &lhs, const TextEdit &rhs) {
     if (lhs.start != rhs.start)
       return lhs.start > rhs.start;
     return lhs.end > rhs.end;
   });
 
   debug("include/apply", "file={0} computed {1} header TextEdits", file,
-        edits.size());
+        plan.edits.size());
 
-  for (const auto &e : edits) {
+  for (const auto &e : plan.edits) {
     trace("include/apply",
           "file={0} header TextEdit bytes=[{1},{2}) replLen={3}", file, e.start,
           e.end, e.text.size());
@@ -20642,7 +20692,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     }
   }
 
-  return edits;
+  return plan;
 }
 
 std::optional<uint64_t>
