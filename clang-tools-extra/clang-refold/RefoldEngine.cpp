@@ -897,7 +897,9 @@ std::string RefoldEngine::BuildTheoremAuditInvariantDetail() const {
              "strict theorem-audit invariant violation: firstViolation='{0}' "
              "selectorDirectBypasses={1} selectorOnlyExceptions={2} transitional={3} "
              "undischarged={4} unknownClass={5} outOfDomain={6} "
-             "selectorUnresolved={7} nonExplicitTerminalExclusions={8}",
+             "selectorUnresolved={7} nonExplicitTerminalExclusions={8} "
+             "expansionFallbackWitnesses={9} expansionFallbackSynthesisSuccesses={10} "
+             "expansionFallbackSynthesisRejections={11} expansionFallbackTerminalRescues={12}",
              firstViolation, lastTheoremAudit_.selectorDirectBypasses,
              lastTheoremAudit_.emittedSelectorOnlyExceptionCarriers,
              lastTheoremAudit_.emittedTransitionalTheoremCarriers,
@@ -905,7 +907,11 @@ std::string RefoldEngine::BuildTheoremAuditInvariantDetail() const {
              lastTheoremAudit_.emittedUnknownClassCarriers,
              lastTheoremAudit_.emittedOutOfDomainCarriers,
              lastTheoremAudit_.selectorUnresolvedCompetitions,
-             lastTheoremAudit_.nonExplicitTerminalExclusions)
+             lastTheoremAudit_.nonExplicitTerminalExclusions,
+             lastTheoremAudit_.expansionFallbackWitnesses,
+             lastTheoremAudit_.expansionFallbackSynthesisSuccesses,
+             lastTheoremAudit_.expansionFallbackSynthesisRejections,
+             lastTheoremAudit_.expansionFallbackTerminalRescues)
       .str();
 }
 

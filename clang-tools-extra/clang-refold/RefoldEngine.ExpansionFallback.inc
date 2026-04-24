@@ -534,10 +534,16 @@ std::optional<std::string> RefoldEngine::TryExpansionClosureFallback() {
   // first, then synthesize source only if the witness survives the narrower
   // Step 3 replay-stability checks.
   if (auto witness = BuildMacroOwnerExpansionClosureWitness()) {
+    // Step 6 keeps the new intermediate fallback class visible in the theorem
+    // audit without restamping it as a theorem-facing carrier. These counters
+    // are coverage-only: they report whether the run found a declared witness
+    // and whether synthesis stayed inside the Step 3 replay-stable subset.
+    ++lastTheoremAudit_.expansionFallbackWitnesses;
     debug("fallback", "expansion-closure witness discovered: {0}",
           FormatExpansionClosureWitness(*witness));
 
     if (auto source = SynthesizeMacroOwnerExpansionClosureSource(*witness)) {
+      ++lastTheoremAudit_.expansionFallbackSynthesisSuccesses;
       debug("fallback",
             "expansion-closure source synthesized: rootMacro={0} source=[{1},{2}) B=[{3},{4}) outLen={5}",
             witness->rootMacroId, witness->sourceByteBegin,
@@ -552,6 +558,7 @@ std::optional<std::string> RefoldEngine::TryExpansionClosureFallback() {
       return source;
     }
 
+    ++lastTheoremAudit_.expansionFallbackSynthesisRejections;
     debug("fallback",
           "expansion-closure stage: witness could not be synthesized into replay-stable source");
   } else {
@@ -569,8 +576,15 @@ std::string RefoldEngine::ResolvePostStructuralFallback() {
   // Step 4 makes the intermediate expansion-fallback stage authoritative. Once
   // structural emission has failed closed, the engine must try the proved
   // expansion closure before it records or emits the raw-B terminal carrier.
-  if (auto expanded = TryExpansionClosureFallback())
+  if (auto expanded = TryExpansionClosureFallback()) {
+    // Count the one case where the proved intermediate expansion stage
+    // successfully intercepts a raw-B terminal fallback. This remains coverage
+    // only: the synthesized source is not a theorem-facing carrier, but the
+    // audit should still say that the terminal request was resolved by the
+    // declared intermediate fallback class instead of by raw B.
+    ++lastTheoremAudit_.expansionFallbackTerminalRescues;
     return *expanded;
+  }
 
   // Reaching this point means both structural emission and the intermediate
   // proof-backed expansion stage failed closed. Only now do we normalize the
