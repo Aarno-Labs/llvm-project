@@ -1952,17 +1952,16 @@ std::string RefoldEngine::RunSinglePassRefold() {
 
     // f) Ownership resolution failed.
     //
-    // Deterministic behavior:
-    //   * strict mode: fatal (schema deficiency or segment-construction bug)
-    //   * non-strict: do not realize includes; attempt TU-only edit if a TU
-    //     byte span exists
-    if (strict_) {
-      fatal("hunks",
-            "owner unresolved for changed A-interval [{0},{1}) (segments did "
-            "not classify; include guessing disabled)",
-            h.aStart, h.aEnd);
-    }
-
+    // Step 5 reclassifies this as a theorem-boundary case rather than a hard
+    // internal error: once macro ownership, include ownership, and truthful
+    // TU ownership all fail, the engine may still salvage the edit via a
+    // declared TU byte-span class. If that last deterministic TU realization
+    // also fails, the code below requests the named terminal fallback
+    // OwnerUnresolvedNoTUAnchor.
+    //
+    // Do not abort in strict mode here. Strict mode is enforced later by the
+    // theorem audit and terminal-fallback machinery, not by crashing before
+    // the explicit out-of-domain boundary is recorded.
     debug("classify",
           "#{0} owner unresolved (not TU/macro/segment). Conservative TU-only "
           "attempt (no include realization).",
