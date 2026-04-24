@@ -692,6 +692,38 @@ private:
     LatticeConflictLaw conflictLaw = LatticeConflictLaw::Unknown;
   };
 
+  /// \brief Whether an accepted path currently participates in the declared
+  /// completeness set.
+  ///
+  /// Step 11 does not claim the engine is globally complete yet. Instead it
+  /// makes the scope of the completeness claim explicit: accepted paths either
+  /// already correspond to a declared proof class, remain transitional while a
+  /// class is still being closed, or sit outside the declared class set
+  /// entirely (for example the terminal edited-preprocessed fallback).
+  enum class CompletenessCoverageKind : uint8_t {
+    Unknown,
+    DeclaredProofClass,
+    TransitionalGap,
+    LegacyOutOfScopeFallback,
+  };
+
+  /// \brief What completeness promise the engine makes for a covered path.
+  enum class CompletenessExpectationKind : uint8_t {
+    Unknown,
+    MustDiscoverDeclaredOrStrongerCompatible,
+    NoClaimPendingClassClosure,
+    ExplicitlyOutsideDeclaredSet,
+  };
+
+  /// \brief Normalized Step-11 completeness contract.
+  struct CompletenessContract {
+    CompletenessCoverageKind coverage = CompletenessCoverageKind::Unknown;
+    CompletenessExpectationKind expectation =
+        CompletenessExpectationKind::Unknown;
+    FutureProofTarget declaredTarget = FutureProofTarget::Unknown;
+    bool countsTowardDeclaredCoverage = false;
+  };
+
   /// \brief Evidence source used to justify an accepted TU anchor.
   ///
   /// Step 7 lifts the deterministic TU anchoring rules into explicit proof
@@ -946,6 +978,7 @@ private:
         LegacyEscalationDisposition::None;
     AcceptancePathInventory inventory;
     GlobalSelectionLattice lattice;
+    CompletenessContract completeness;
     ProofDischargeRecord discharge;
     bool validated = false;
     bool structurePreserving = false;
@@ -2732,6 +2765,14 @@ private:
   GlobalSelectionLattice
   BuildGlobalSelectionLattice(const ProofSummary &summary) const;
 
+  /// \brief Compute the Step-11 completeness contract for an accepted summary.
+  ///
+  /// The contract is descriptive in this step. It states whether the accepted
+  /// path already belongs to the declared proof-class set and, if so, which
+  /// declared class completeness should be measured against.
+  CompletenessContract
+  BuildCompletenessContract(const ProofSummary &summary) const;
+
   /// \brief Return whether the normalized lattice prefers \p lhs over \p rhs.
   ///
   /// This helper mirrors the existing top-level structural ordering policy in a
@@ -2778,6 +2819,9 @@ private:
   StringRef FormatAcceptedPathKind(AcceptedPathKind kind) const;
   StringRef FormatAcceptanceSupportKind(AcceptanceSupportKind support) const;
   StringRef FormatFutureProofTarget(FutureProofTarget target) const;
+  StringRef FormatCompletenessCoverageKind(CompletenessCoverageKind kind) const;
+  StringRef
+  FormatCompletenessExpectationKind(CompletenessExpectationKind kind) const;
   StringRef FormatLatticeConflictDomain(LatticeConflictDomain domain) const;
   StringRef FormatLatticeMergeLaw(LatticeMergeLaw law) const;
   StringRef FormatLatticeConflictLaw(LatticeConflictLaw law) const;
@@ -2823,6 +2867,10 @@ private:
   /// \brief Format the normalized Step-10 lattice law for tracing.
   std::string
   FormatGlobalSelectionLattice(const GlobalSelectionLattice &lattice) const;
+
+  /// \brief Format the normalized Step-11 completeness contract for tracing.
+  std::string
+  FormatCompletenessContract(const CompletenessContract &contract) const;
 
   /// \brief Format the normalized accepted-path audit for tracing.
   ///
