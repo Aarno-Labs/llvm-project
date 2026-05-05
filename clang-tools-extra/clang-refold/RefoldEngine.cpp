@@ -1409,6 +1409,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
        tuPath, aSource_.size(), bSource_.size(), aToks_.size(), bToks_.size());
 
   abTokHunks_.clear();
+  abTokMapA2B_.clear();
+  abTokMapB2A_.clear();
 
   // Read in the translation unit file / C source.
   std::unique_ptr<llvm::MemoryBuffer> tuBuffer;
@@ -1504,6 +1506,9 @@ std::string RefoldEngine::RunSinglePassRefold() {
     if (bj >= 0 && static_cast<size_t>(bj) < b2a.size())
       b2a[static_cast<size_t>(bj)] = static_cast<int64_t>(ai);
   }
+
+  abTokMapA2B_ = a2b;
+  abTokMapB2A_ = b2a;
 
   size_t trimmedEdgeMatched = 0;
   for (auto &h : hunks) {
@@ -2455,6 +2460,9 @@ std::string RefoldEngine::RunSinglePassRefold() {
               span->first, span->second, h.aStart, h.aEnd);
 
         std::string repl;
+        const uint64_t rawTUStart = span->first;
+        const uint64_t rawTUEnd = span->second;
+
         if (h.bStart < h.bEnd) {
           StringRef bSlice =
               h.isInsertOnly()
@@ -2622,6 +2630,17 @@ std::string RefoldEngine::RunSinglePassRefold() {
                                              padded, tuPath);
         TextEdit edit{span->first, span->second, std::move(ro.text),
                       std::move(ro.pending), std::nullopt, {}};
+        edit.isDirectTUHunkEdit = true;
+        edit.directTUHunkIndex = i;
+        edit.directTUHunkAStart = h.aStart;
+        edit.directTUHunkAEnd = h.aEnd;
+        edit.directTUHunkBStart = h.bStart;
+        edit.directTUHunkBEnd = h.bEnd;
+        edit.directTURawStart = rawTUStart;
+        edit.directTURawEnd = rawTUEnd;
+        edit.directTUFinalStart = span->first;
+        edit.directTUFinalEnd = span->second;
+
         AttachAcceptedResultCarrier(
             edit, BuildAcceptedTUTextEditCandidate(
                       AcceptedPathKind::TUByteSpanMappedEdit, span->first,
@@ -2655,6 +2674,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
 
     if (auto span = TUByteSpan(h.aStart, h.aEnd, tuPath)) { // [b, e)
       std::string repl;
+      const uint64_t rawTUStart = span->first;
+      const uint64_t rawTUEnd = span->second;
       if (isDel) {
         repl = "";
       } else {
@@ -2829,6 +2850,17 @@ std::string RefoldEngine::RunSinglePassRefold() {
           ApplyResyncOrPend(tuBytes, span->first, span->second, padded, tuPath);
       TextEdit edit{span->first, span->second, std::move(ro.text),
                     std::move(ro.pending), std::nullopt, {}};
+      edit.isDirectTUHunkEdit = true;
+      edit.directTUHunkIndex = i;
+      edit.directTUHunkAStart = h.aStart;
+      edit.directTUHunkAEnd = h.aEnd;
+      edit.directTUHunkBStart = h.bStart;
+      edit.directTUHunkBEnd = h.bEnd;
+      edit.directTURawStart = rawTUStart;
+      edit.directTURawEnd = rawTUEnd;
+      edit.directTUFinalStart = span->first;
+      edit.directTUFinalEnd = span->second;
+
       AttachAcceptedResultCarrier(
           edit, BuildAcceptedTUTextEditCandidate(
                     AcceptedPathKind::TUByteSpanConservativeEdit, span->first,

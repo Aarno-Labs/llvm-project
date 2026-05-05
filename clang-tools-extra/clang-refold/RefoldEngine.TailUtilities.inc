@@ -1383,6 +1383,302 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
     i = j;
   }
 
+  auto sortNormalizedTextEdits = [](SmallVectorImpl<TextEdit> &items) {
+    sort(items, [](const TextEdit &a, const TextEdit &b) {
+      if (a.start != b.start)
+        return a.start < b.start;
+      return a.end < b.end;
+    });
+  };
+
+  auto findDirectEditForHunk = [&](uint64_t hunkIndex)
+      -> std::optional<size_t> {
+    for (size_t idx = 0; idx < norm.size(); ++idx) {
+      const TextEdit &edit = norm[idx];
+      if (edit.directTUHunkIndex && *edit.directTUHunkIndex == hunkIndex)
+        return idx;
+    }
+    return std::nullopt;
+  };
+
+  auto sourceTokenSpan = [&](uint64_t aTok)
+      -> std::optional<std::pair<uint64_t, uint64_t>> {
+    if (aTok >= static_cast<uint64_t>(aToks_.size()))
+      return std::nullopt;
+    return TUByteSpan(aTok, aTok + 1, emissionOwner);
+  };
+
+  struct ClosedTURealizationCandidate {
+    uint64_t firstHunk = 0;
+    uint64_t lastHunk = 0;
+    uint64_t sourceBegin = 0;
+    uint64_t sourceEnd = 0;
+    uint64_t bBegin = 0;
+    uint64_t bEnd = 0;
+    SmallVector<size_t, 16> editIndices;
+  };
+
+  auto checkClosedTURealizationCandidate = [&](uint64_t firstHunk,
+                                               uint64_t lastHunk,
+                                               ClosedTURealizationCandidate
+                                                   &candidate) -> bool {
+    candidate = ClosedTURealizationCandidate{};
+    candidate.firstHunk = firstHunk;
+    candidate.lastHunk = lastHunk;
+
+    for (uint64_t hunkIndex = firstHunk; hunkIndex <= lastHunk; ++hunkIndex) {
+      std::optional<size_t> editIndex = findDirectEditForHunk(hunkIndex);
+      if (!editIndex)
+        return false;
+      candidate.editIndices.push_back(*editIndex);
+      if (hunkIndex == std::numeric_limits<uint64_t>::max())
+        break;
+    }
+
+    candidate.sourceBegin = std::numeric_limits<uint64_t>::max();
+    candidate.sourceEnd = 0;
+    candidate.bBegin = std::numeric_limits<uint64_t>::max();
+    candidate.bEnd = 0;
+
+    std::optional<uint64_t> previousBEnd;
+    for (size_t editIndex : candidate.editIndices) {
+      const TextEdit &edit = norm[editIndex];
+      if (!edit.isDirectTUHunkEdit || !edit.directTUHunkBStart ||
+          !edit.directTUHunkBEnd)
+        return false;
+      if (previousBEnd && *edit.directTUHunkBStart < *previousBEnd)
+        return false;
+      previousBEnd = edit.directTUHunkBEnd;
+      candidate.sourceBegin = std::min(candidate.sourceBegin, edit.start);
+      candidate.sourceEnd = std::max(candidate.sourceEnd, edit.end);
+      candidate.bBegin = std::min(candidate.bBegin, *edit.directTUHunkBStart);
+      candidate.bEnd = std::max(candidate.bEnd, *edit.directTUHunkBEnd);
+    }
+
+    if (candidate.sourceBegin == std::numeric_limits<uint64_t>::max() ||
+        candidate.sourceBegin >= candidate.sourceEnd)
+      return false;
+    if (candidate.bBegin == std::numeric_limits<uint64_t>::max() ||
+        candidate.bBegin >= candidate.bEnd ||
+        candidate.bEnd > static_cast<uint64_t>(bToks_.size()))
+      return false;
+
+    auto candidateContainsEdit = [&](size_t editIndex) {
+      for (size_t candidateEditIndex : candidate.editIndices) {
+        if (candidateEditIndex == editIndex)
+          return true;
+      }
+      return false;
+    };
+
+    // The synthesized closure is allowed to replace only the selected hunk run.
+    // Any independent edit that overlaps the closure, or any insertion strictly
+    // inside it, would require another composition law and is therefore rejected.
+    for (size_t editIndex = 0; editIndex < norm.size(); ++editIndex) {
+      if (candidateContainsEdit(editIndex))
+        continue;
+      const TextEdit &edit = norm[editIndex];
+      const bool nonZeroOverlap =
+          edit.start < candidate.sourceEnd && candidate.sourceBegin < edit.end;
+      const bool interiorInsertion =
+          edit.start == edit.end && candidate.sourceBegin < edit.start &&
+          edit.start < candidate.sourceEnd;
+      if (nonZeroOverlap || interiorInsertion)
+        return false;
+    }
+
+    // Prove that every A token physically consumed by the source interval has
+    // no matched B occurrence outside the candidate B interval.  This is what
+    // prevents a closure from stealing a stable token whose true B-side mate
+    // remains outside the replacement.
+    for (uint64_t aTok = 0; aTok < static_cast<uint64_t>(aToks_.size());
+         ++aTok) {
+      std::optional<std::pair<uint64_t, uint64_t>> span =
+          sourceTokenSpan(aTok);
+      if (!span)
+        continue;
+
+      const bool overlapsSource =
+          span->first < candidate.sourceEnd && candidate.sourceBegin < span->second;
+      if (!overlapsSource)
+        continue;
+
+      if (span->first < candidate.sourceBegin ||
+          candidate.sourceEnd < span->second)
+        return false;
+
+      if (aTok < static_cast<uint64_t>(abTokMapA2B_.size())) {
+        const int64_t mappedB = abTokMapA2B_[static_cast<size_t>(aTok)];
+        if (mappedB >= 0 &&
+            (static_cast<uint64_t>(mappedB) < candidate.bBegin ||
+             static_cast<uint64_t>(mappedB) >= candidate.bEnd))
+          return false;
+      }
+    }
+
+    // Symmetrically, every matched B token emitted by the replacement must map
+    // back to an A token wholly contained in the source interval.  Otherwise the
+    // candidate would duplicate or move an outside stable token.
+    for (uint64_t bTok = candidate.bBegin; bTok < candidate.bEnd; ++bTok) {
+      if (bTok >= static_cast<uint64_t>(abTokMapB2A_.size()))
+        return false;
+      const int64_t mappedA = abTokMapB2A_[static_cast<size_t>(bTok)];
+      if (mappedA < 0)
+        continue;
+
+      std::optional<std::pair<uint64_t, uint64_t>> span =
+          sourceTokenSpan(static_cast<uint64_t>(mappedA));
+      if (!span || span->first < candidate.sourceBegin ||
+          candidate.sourceEnd < span->second)
+        return false;
+    }
+
+    return true;
+  };
+
+  auto tryBuildClosedTURealization = [&](size_t overlapIndex,
+                                         TextEdit &closure) -> bool {
+    if (abTokMapA2B_.empty() || abTokMapB2A_.empty())
+      return false;
+
+    size_t clusterBegin = overlapIndex == 0 ? 0 : overlapIndex - 1;
+    uint64_t coverBegin = norm[clusterBegin].start;
+    uint64_t coverEnd = norm[clusterBegin].end;
+    while (clusterBegin > 0) {
+      const TextEdit &prev = norm[clusterBegin - 1];
+      if (prev.end <= coverBegin)
+        break;
+      --clusterBegin;
+      coverBegin = std::min(coverBegin, prev.start);
+      coverEnd = std::max(coverEnd, prev.end);
+    }
+
+    size_t clusterEnd = overlapIndex + 1;
+    if (overlapIndex < norm.size()) {
+      coverBegin = std::min(coverBegin, norm[overlapIndex].start);
+      coverEnd = std::max(coverEnd, norm[overlapIndex].end);
+    }
+    while (clusterEnd < norm.size()) {
+      const TextEdit &next = norm[clusterEnd];
+      if (next.start >= coverEnd)
+        break;
+      coverBegin = std::min(coverBegin, next.start);
+      coverEnd = std::max(coverEnd, next.end);
+      ++clusterEnd;
+    }
+
+    std::optional<uint64_t> hunkMin;
+    std::optional<uint64_t> hunkMax;
+    for (size_t i = clusterBegin; i < clusterEnd; ++i) {
+      const TextEdit &edit = norm[i];
+      if (!edit.isDirectTUHunkEdit || !edit.directTUHunkIndex)
+        return false;
+      hunkMin = hunkMin ? std::min(*hunkMin, *edit.directTUHunkIndex)
+                        : *edit.directTUHunkIndex;
+      hunkMax = hunkMax ? std::max(*hunkMax, *edit.directTUHunkIndex)
+                        : *edit.directTUHunkIndex;
+    }
+    if (!hunkMin || !hunkMax)
+      return false;
+
+    uint64_t directLo = *hunkMin;
+    while (directLo > 0 && findDirectEditForHunk(directLo - 1))
+      --directLo;
+
+    uint64_t directHi = *hunkMax;
+    while (directHi + 1 < static_cast<uint64_t>(abTokHunks_.size()) &&
+           findDirectEditForHunk(directHi + 1))
+      ++directHi;
+
+    std::optional<ClosedTURealizationCandidate> best;
+    const uint64_t minWidth = *hunkMax - *hunkMin + 1;
+    const uint64_t maxWidth = directHi - directLo + 1;
+    for (uint64_t width = minWidth; width <= maxWidth; ++width) {
+      bool searchedAnyAtThisWidth = false;
+      for (uint64_t first = directLo; first + width - 1 <= directHi; ++first) {
+        const uint64_t last = first + width - 1;
+        if (first > *hunkMin || last < *hunkMax)
+          continue;
+        searchedAnyAtThisWidth = true;
+
+        ClosedTURealizationCandidate candidate;
+        if (checkClosedTURealizationCandidate(first, last, candidate)) {
+          best = std::move(candidate);
+          break;
+        }
+      }
+      if (best || !searchedAnyAtThisWidth)
+        break;
+    }
+    if (!best)
+      return false;
+
+    StringRef replacement = sliceExactTokenCoverage(
+        bTokOff_, bToks_, bSource_, best->bBegin, best->bEnd);
+    ResyncOutcome ro = ApplyResyncOrPend(originalFileText, best->sourceBegin,
+                                         best->sourceEnd, replacement,
+                                         emissionOwner);
+    closure = TextEdit{best->sourceBegin, best->sourceEnd, std::move(ro.text),
+                       std::move(ro.pending), std::nullopt, {}};
+    AttachAcceptedResultCarrier(
+        closure, BuildAcceptedTUTextEditCandidate(
+                     AcceptedPathKind::TUByteSpanConservativeEdit,
+                     best->sourceBegin, best->sourceEnd, replacement));
+
+    SmallVector<TextEdit, 32> resolved;
+    resolved.reserve(norm.size() - best->editIndices.size() + 1);
+    auto shouldRemove = [&](size_t editIndex) {
+      for (size_t candidateEditIndex : best->editIndices) {
+        if (candidateEditIndex == editIndex)
+          return true;
+      }
+      return false;
+    };
+    for (size_t i = 0; i < norm.size(); ++i) {
+      if (!shouldRemove(i))
+        resolved.push_back(std::move(norm[i]));
+    }
+    resolved.push_back(std::move(closure));
+    sortNormalizedTextEdits(resolved);
+    norm = std::move(resolved);
+
+    debug("edits/apply",
+          "resolved uncomposable direct TU hunk run in {0}: hunks=[{1},{2}] "
+          "source=[{3},{4}) Btok=[{5},{6}) replLen={7}",
+          emissionOwner, best->firstHunk, best->lastHunk, best->sourceBegin,
+          best->sourceEnd, best->bBegin, best->bEnd, replacement.size());
+    return true;
+  };
+
+  // Some token-LCS tie choices can split one logical B-side TU realization
+  // around stable punctuation tokens.  If the resulting direct TU hunk edits
+  // overlap after lexical widening, first try to replace the minimal enclosing
+  // direct-hunk run by one source/B-token-closed realization.  This is not a
+  // merge heuristic: it is accepted only when the A→B and B→A token maps prove
+  // that the source interval and replacement interval are mutually closed.
+  for (;;) {
+    uint64_t cursor = 0;
+    bool changed = false;
+    for (size_t editIndex = 0; editIndex < norm.size(); ++editIndex) {
+      const TextEdit &edit = norm[editIndex];
+      if (edit.end < edit.start || edit.end > originalFileText.size())
+        break;
+      if (edit.start < cursor) {
+        TextEdit closure;
+        if (tryBuildClosedTURealization(editIndex, closure)) {
+          changed = true;
+          break;
+        }
+        changed = false;
+        editIndex = norm.size();
+        break;
+      }
+      cursor = edit.end;
+    }
+    if (!changed)
+      break;
+  }
+
   // Step 2 makes the byte-edit emission boundary proof-gated. By the time an
   // edit reaches this function, every non-terminal artifact it composes must
   // already carry normalized accepted-result carriers that are fully
