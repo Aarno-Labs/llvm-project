@@ -119,14 +119,26 @@ struct InvArgTupleRef {
 };
 
 struct PastePart {
-  // ArgIndex >= 0 is a macro argument index; nullopt denotes a literal
-  // contribution.
+  // ArgIndex >= 0 is a macro argument index; nullopt denotes a fixed literal
+  // contribution from the macro replacement list.
   std::optional<uint32_t> ArgIndex = std::nullopt;
+
+  // Byte range of this part inside the final pasted token spelling.
   uint32_t ByteBegin = 0;
   uint32_t ByteEnd = 0;
-  
-  // Add an explicit constructor to ensure no garbage bytes
-  PastePart() : ArgIndex(std::nullopt), ByteBegin(0), ByteEnd(0) {}
+
+  // Exact spelling of this part as it contributes to the final pasted token.
+  // For literal parts, this is the fixed delimiter/body text. For argument
+  // parts, this is the substituted argument-token spelling.
+  std::string Spelling;
+
+  // Optional byte range inside the invocation argument spelling that produced
+  // this argument part. These offsets are relative to that argument's raw text,
+  // not absolute file offsets. They are intentionally absent for synthetic or
+  // recursively resolved projection text where the producer cannot prove a
+  // direct invocation-argument slice.
+  std::optional<uint32_t> ArgByteBegin;
+  std::optional<uint32_t> ArgByteEnd;
 };
 
 struct PasteToken {

@@ -310,16 +310,28 @@ public:
     uint32_t callerByteEnd;
   };
 
+  enum class PastePartKind { Arg, Literal };
+
   /// One contiguous contribution to a pasted token's final spelling.
   ///
-  /// `argIndex` names the macro parameter that contributed this substring when
-  /// the part is argument-derived. A missing `argIndex` denotes a literal body
-  /// fragment that participated in the `##` synthesis. `byteBegin`/`byteEnd`
-  /// are half-open byte offsets within the pasted token's final spelled text.
+  /// `kind` records whether the part came from an invocation argument or from
+  /// fixed replacement-list text. `byteBegin`/`byteEnd` are half-open byte
+  /// offsets within the final pasted-token spelling, and `spelling` is the
+  /// exact byte slice occupying that range.
+  ///
+  /// For argument-derived parts, `argIndex` names the contributing formal. When
+  /// present, `argByteBegin`/`argByteEnd` identify the exact byte slice within
+  /// the original invocation argument that supplied this pasted part. The
+  /// consumer can then splice replay-derived edits back into the argument
+  /// without guessing via prefix/suffix matching.
   struct PastePart {
+    PastePartKind kind = PastePartKind::Literal;
     std::optional<uint32_t> argIndex;
-    uint32_t byteBegin;
-    uint32_t byteEnd;
+    uint32_t byteBegin = 0;
+    uint32_t byteEnd = 0;
+    StringRef spelling;
+    std::optional<uint32_t> argByteBegin;
+    std::optional<uint32_t> argByteEnd;
   };
 
   /// Exact witness for one token synthesized by `##` within a specific macro
