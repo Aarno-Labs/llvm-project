@@ -481,10 +481,10 @@ private:
   /// \brief Resolve the full post-structural fallback result for the current
   /// run.
   ///
-  /// Step 4 makes the intermediate expansion-fallback stage authoritative: if
-  /// terminal fallback was requested, try the proved expansion-fallback source
-  /// first and only record / emit the raw-B terminal carrier when that
-  /// intermediate stage fails closed.
+  /// If terminal fallback was requested, try the legacy proved expansion source
+  /// first, but audit any discovered witness as dominated by the normal macro
+  /// whole-cover candidate path before synthesis. Only record / emit the raw-B
+  /// terminal carrier when that dominated safety net also fails closed.
   std::string ResolvePostStructuralFallback();
 
   /// \brief Try to realize one unresolved TU-owned edit as a proved source
@@ -529,6 +529,19 @@ private:
   /// and no non-self-contained splice frontier).
   std::optional<ExpansionClosureWitness>
   BuildMacroOwnerExpansionClosureWitness() const;
+
+  /// \brief Verify that a post-terminal macro-owner witness is dominated by the
+  ///        normal macro whole-cover candidate path.
+  ///
+  /// The macro expansion-closure fallback is now a legacy safety net rather than
+  /// an independent completeness mechanism. If it discovers a witness, the same
+  /// root macro should have been visible earlier through
+  /// SmallestCoveringPatchableMacro() and should restamp to the normal
+  /// MacroWholeCoverRealization proof carrier. This audit is intentionally
+  /// side-effect-free: it reconstructs only the selector visibility and proof
+  /// metadata needed to prove dominance, and never stages or emits an edit.
+  bool MacroOwnerExpansionClosureWitnessIsDominated(
+      const ExpansionClosureWitness &witness, std::string &detail) const;
 
   /// \brief Attempt to synthesize a source-level fallback from one macro-owner
   /// whole-expansion witness.
