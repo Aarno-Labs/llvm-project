@@ -58,7 +58,6 @@
 #include "StringUtils.h"
 #include "llvm/ADT/StringRef.h"
 
-#include <cctype>
 #include <cstdio>
 #include <string>
 
@@ -70,16 +69,10 @@ bool isIdentifierOnly(StringRef s) {
   s = s.trim();
   if (s.empty())
     return false;
-  auto isIdentStart = [](unsigned char c) -> bool {
-    return std::isalpha(c) || c == '_';
-  };
-  auto isIdentCont = [](unsigned char c) -> bool {
-    return std::isalnum(c) || c == '_';
-  };
-  if (!isIdentStart(static_cast<unsigned char>(s.front())))
+  if (!isIdentStart(s.front()))
     return false;
   for (char ch : s.drop_front()) {
-    if (!isIdentCont(static_cast<unsigned char>(ch)))
+    if (!isIdentPart(ch))
       return false;
   }
   return true;
@@ -117,8 +110,7 @@ bool isIdentifierOrSimpleCallExpr(StringRef replacement) {
 size_t skipWSAndComments(StringRef s, size_t i) {
   const size_t n = s.size();
   while (i < n) {
-    unsigned char c = static_cast<unsigned char>(s[i]);
-    if (std::isspace(c)) {
+    if (isWs(s[i])) {
       ++i;
       continue;
     }
@@ -230,6 +222,207 @@ StringRef trimEdgeSpaces(StringRef s) {
     return s; // no trimming needed; return the original string ref
 
   return s.substr(lo, hi - lo); // return trimmed portion
+}
+
+std::vector<StringRef> splitChars(StringRef s) {
+  std::vector<StringRef> refs;
+  refs.reserve(s.size());
+  for (size_t i = 0; i < s.size(); ++i)
+    refs.push_back(s.substr(i, 1));
+  return refs;
+}
+
+std::optional<std::string> canonicalizeStringifyInversePayload(StringRef raw0) {
+  StringRef raw = raw0.trim();
+
+  enum class LexState { Normal, String, Char };
+  LexState state = LexState::Normal;
+
+  std::string out;
+  out.reserve(raw.size());
+
+  bool pendingSpace = false;
+  auto flushPendingSpace = [&]() {
+    if (pendingSpace && !out.empty())
+      out.push_back(' ');
+    pendingSpace = false;
+  };
+
+  for (size_t i = 0; i < raw.size(); ++i) {
+    const char c = raw[i];
+
+    switch (state) {
+    case LexState::Normal:
+      if (isWs(c)) {
+        pendingSpace = !out.empty();
+        continue;
+      }
+
+      if (c == '/' && i + 1 < raw.size()) {
+        const char n = raw[i + 1];
+        if (n == '/' || n == '*')
+          return std::nullopt;
+      }
+
+      flushPendingSpace();
+      out.push_back(c);
+      if (c == '"')
+        state = LexState::String;
+      else if (c == '\'')
+        state = LexState::Char;
+      continue;
+
+    case LexState::String:
+      out.push_back(c);
+      if (c == '\\') {
+        if (i + 1 >= raw.size())
+          return std::nullopt;
+        out.push_back(raw[++i]);
+        continue;
+      }
+      if (c == '"')
+        state = LexState::Normal;
+      continue;
+
+    case LexState::Char:
+      out.push_back(c);
+      if (c == '\\') {
+        if (i + 1 >= raw.size())
+          return std::nullopt;
+        out.push_back(raw[++i]);
+        continue;
+      }
+      if (c == '\'')
+        state = LexState::Normal;
+      continue;
+    }
+  }
+
+  if (state != LexState::Normal)
+    return std::nullopt;
+
+  return out;
+}
+
+namespace {
+
+std::pair<size_t, size_t> clampUnorderedRange(StringRef text, size_t begin,
+                                             size_t end) {
+  begin = std::min(begin, text.size());
+  end = std::min(end, text.size());
+  if (end < begin)
+    std::swap(begin, end);
+  return {begin, end};
+}
+
+} // namespace
+
+bool rangeContainsNewline(StringRef text, size_t begin, size_t end) {
+  const auto range = clampUnorderedRange(text, begin, end);
+  return text.substr(range.first, range.second - range.first).find('\n') !=
+         StringRef::npos;
+}
+
+bool rangeContainsOnlyWhitespace(StringRef text, size_t begin, size_t end) {
+  const auto range = clampUnorderedRange(text, begin, end);
+  return isWhitespace(text.substr(range.first, range.second - range.first));
+}
+
+size_t lineStartOffset(StringRef text, size_t pos) {
+  pos = std::min(pos, text.size());
+  while (pos > 0 && text[pos - 1] != '\n' && text[pos - 1] != '\r')
+    --pos;
+  return pos;
+}
+
+size_t lineEndOffset(StringRef text, size_t pos) {
+  pos = std::min(pos, text.size());
+  while (pos < text.size() && text[pos] != '\n' && text[pos] != '\r')
+    ++pos;
+  return pos;
+}
+
+bool beginsLineAfterWhitespace(StringRef text, size_t offset) {
+  return rangeContainsOnlyWhitespace(text, lineStartOffset(text, offset),
+                                     offset);
+}
+
+bool endsLineBeforeWhitespace(StringRef text, size_t offset) {
+  return rangeContainsOnlyWhitespace(text, offset, lineEndOffset(text, offset));
+}
+
+bool shouldPreserveFinalCallSuffixGroup(StringRef replacement) {
+  StringRef s = replacement.trim();
+  if (s.empty())
+    return false;
+
+  size_t pos = skipWSAndComments(s, 0);
+  if (pos >= s.size() || s[pos] != '(')
+    return false;
+
+  const size_t headEnd = findMatchingRParen(s, pos);
+  if (headEnd == StringRef::npos)
+    return false;
+
+  const size_t firstInside = skipWSAndComments(s, pos + 1);
+  if (firstInside >= headEnd)
+    return false;
+
+  pos = skipWSAndComments(s, headEnd + 1);
+  bool sawCallGroup = false;
+  while (pos < s.size() && s[pos] == '(') {
+    const size_t groupEnd = findMatchingRParen(s, pos);
+    if (groupEnd == StringRef::npos)
+      return false;
+    sawCallGroup = true;
+    pos = skipWSAndComments(s, groupEnd + 1);
+  }
+
+  return sawCallGroup && pos == s.size();
+}
+
+uint64_t extendChainedCallEnd(StringRef fileText, uint64_t invEnd,
+                              StringRef replacement) {
+  if (invEnd > fileText.size())
+    return invEnd;
+
+  if (isIdentifierOrSimpleCallExpr(replacement))
+    return invEnd;
+
+  const bool preserveFinalSuffixGroup =
+      shouldPreserveFinalCallSuffixGroup(replacement);
+
+  size_t pos = skipWSAndComments(fileText, static_cast<size_t>(invEnd));
+  if (pos >= fileText.size() || fileText[pos] != '(')
+    return invEnd;
+
+  std::vector<uint64_t> groupEnds;
+  while (pos < fileText.size() && fileText[pos] == '(') {
+    const size_t r = findMatchingRParen(fileText, pos);
+    if (r == StringRef::npos)
+      break;
+    groupEnds.push_back(static_cast<uint64_t>(r + 1));
+    pos = skipWSAndComments(fileText, r + 1);
+  }
+
+  if (groupEnds.empty())
+    return invEnd;
+
+  size_t consume = groupEnds.size();
+  if (preserveFinalSuffixGroup && consume > 0)
+    consume -= 1;
+  return (consume == 0) ? invEnd : groupEnds[consume - 1];
+}
+
+bool startsWithAfterWhitespace(StringRef s, StringRef lit) {
+  size_t i = 0;
+  while (i < s.size()) {
+    char c = s[i];
+    if (c != ' ' && c != '\t' && c != '\r' && c != '\n')
+      break;
+    ++i;
+  }
+  return s.drop_front(i).starts_with(lit);
 }
 
 std::string quoteCString(StringRef s) {

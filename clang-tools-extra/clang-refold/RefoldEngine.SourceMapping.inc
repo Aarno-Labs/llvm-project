@@ -100,22 +100,10 @@ bool RefoldEngine::HunkFullyWithinArgSpans(
 
 std::vector<RefoldEngine::ByteHunk>
 RefoldEngine::BuildByteHunksFromRawText() const {
-  // We still need a physical array of "elements" for ArrayRef, but now, each
-  // element is just 16 bytes (pointer + length) instead of a 32-byte
-  // heap-allocating std::string.
-  auto ToRefVec = [](StringRef s) {
-    std::vector<StringRef> v;
-    v.reserve(s.size());
-    for (size_t i = 0; i < s.size(); ++i) {
-      // Point to a 1-character substring within the existing aText/bText. This
-      // is O(1) and performs NO heap allocation for the character.
-      v.push_back(s.substr(i, 1));
-    }
-    return v;
-  };
-
-  std::vector<StringRef> aRefs = ToRefVec(aSource_);
-  std::vector<StringRef> bRefs = ToRefVec(bSource_);
+  // Point each diff element into the existing source buffers. This keeps the
+  // byte-level diff allocation-light while still satisfying ArrayRef storage.
+  std::vector<StringRef> aRefs = stringutils::splitChars(aSource_);
+  std::vector<StringRef> bRefs = stringutils::splitChars(bSource_);
 
   // diff now takes ArrayRef<StringRef>
   auto steps = diffutils::diff(aRefs, bRefs);

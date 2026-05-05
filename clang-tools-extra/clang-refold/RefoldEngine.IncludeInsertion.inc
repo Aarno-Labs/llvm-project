@@ -104,15 +104,15 @@ RefoldEngine::BuildIncludeInsertionPatch(const RefoldModel::IncludeItem &inc,
   if (uBStart < numOffsets && uBEnd < numOffsets && uBEnd >= uBStart) {
     // Replacement and deletion patches have an original header byte span whose
     // untouched leading/trailing whitespace remains in the header when the edit
-    // is applied.  Therefore the replacement payload must cover exactly the
+    // is applied. Therefore the replacement payload must cover exactly the
     // replacement tokens and must not steal the inter-token whitespace before
-    // the next B token.  This matters for mixed-owner partitions: if an
-    // include segment `10 +` is followed by a macro segment `ID(20)`, the
-    // newline/indentation between `+` and `20` belongs to the macro/TU
-    // boundary, not to the materialized include body.  Absorbing it here would
-    // create artificial newline drift inside the header, producing gratuitous
-    // blank lines in --no-lines mode and duplicate header-local #line resyncs
-    // when line directives are enabled.
+    // the next B token. This matters for mixed-owner partitions: if an include
+    // segment `10 +` is followed by a macro segment `ID(20)`, the newline /
+    // indentation between `+` and `20` belongs to the macro/TU boundary, not
+    // to the materialized include body. Absorbing it here would create
+    // artificial newline drift inside the header, producing gratuitous blank
+    // lines in --no-lines mode and duplicate header-local #line resyncs when
+    // line directives are enabled.
     //
     // Pure insertions are different: there is no original source span whose
     // surrounding whitespace can be retained, so keep the full token envelope
@@ -125,8 +125,8 @@ RefoldEngine::BuildIncludeInsertionPatch(const RefoldModel::IncludeItem &inc,
                                                      h.bEnd);
     insertBytes = bSlice.str();
   } else {
-    // Hardening: Log an error or assert if we get a hunk that points
-    // outside our known token universe.
+    // Hardening: Log an error or assert if we get a hunk that points outside
+    // our known token universe.
     fatal("include/patch",
           "hunk bounds exceed token offset table for inc #{0}: "
           "B[{1},{2}) requested, but bTokOff only has {3} entries",

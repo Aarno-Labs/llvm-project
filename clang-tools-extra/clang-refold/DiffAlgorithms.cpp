@@ -88,8 +88,8 @@ bool shouldUseGreedyApproach(unsigned long long n, unsigned long long m,
   if (n >= std::numeric_limits<unsigned long long>::max() - 1ULL ||
       m >= std::numeric_limits<unsigned long long>::max() - 1ULL) {
     warn("lcs/map",
-         "hirschberg fallback: (n+1) or (m+1) would overflow unsigned long long "
-         "(n={0}, m={1})",
+         "hirschberg fallback: (n+1) or (m+1) would overflow unsigned long long"
+         " (n={0}, m={1})",
          n, m);
     return true; // (n+1) or (m+1) would overflow ULL anyway
   } else {
@@ -132,44 +132,6 @@ inline bool isCoreBetter(unsigned candLen, std::uint64_t candCost,
   if (candLen != bestLen)
     return candLen > bestLen;
   return candCost < bestCost;
-}
-
-/// Canonical predecessor order to use after the scalar structural objective
-/// has already proven predecessor states equivalent.
-///
-/// These orders are diagnostic only. They model possible ways a future
-/// heuristic-free implementation could canonicalize equal (LCS-length,
-/// ownerDepthGap-cost) states. The order matters twice: first while filling the
-/// DP table, where equal-core predecessor states may store the same score but
-/// encode different latent paths, and again while backtracking through that
-/// table. The previous shadow pass varied only backtracking; this one varies
-/// both axes so the trace is a faithful oracle for scalar-only replacements.
-enum class StructuralBacktrackOrder {
-  DiagDeleteInsert,
-  DiagInsertDelete,
-  DeleteDiagInsert,
-  DeleteInsertDiag,
-  InsertDiagDelete,
-  InsertDeleteDiag,
-};
-
-[[maybe_unused]]
-static inline StringRef toString(StructuralBacktrackOrder order) {
-  switch (order) {
-  case StructuralBacktrackOrder::DiagDeleteInsert:
-    return "diag-delete-insert";
-  case StructuralBacktrackOrder::DiagInsertDelete:
-    return "diag-insert-delete";
-  case StructuralBacktrackOrder::DeleteDiagInsert:
-    return "delete-diag-insert";
-  case StructuralBacktrackOrder::DeleteInsertDiag:
-    return "delete-insert-diag";
-  case StructuralBacktrackOrder::InsertDiagDelete:
-    return "insert-diag-delete";
-  case StructuralBacktrackOrder::InsertDeleteDiag:
-    return "insert-delete-diag";
-  }
-  llvm_unreachable("invalid structural backtrack order");
 }
 
 static uint64_t hunkAWidth(const Hunk &h) { return h.aEnd - h.aStart; }
@@ -378,22 +340,23 @@ static uint64_t bPairSurfaceRank(ArrayRef<LcsBGapProvenance> profiles,
   return rank;
 }
 
-/// Remove individually admissible anchors that are not mutually order-compatible.
+/// Remove individually admissible anchors that are not mutually order-
+/// compatible.
 ///
 /// The core admissibility pass reasons about one candidate anchor at a time: an
-/// A/B token pair may occur in some optimal owner-aware LCS path.  In highly
+/// A/B token pair may occur in some optimal owner-aware LCS path. In highly
 /// repetitive regions, two such individually valid anchors can still be
-/// mutually exclusive because they cross in B order.  Returning both violates
+/// mutually exclusive because they cross in B order. Returning both violates
 /// the A->B map contract and later hunk construction is undefined.
 ///
-/// This cleanup is deliberately conservative.  It does not pick a longest
+/// This cleanup is deliberately conservative. It does not pick a longest
 /// increasing subsequence, because that would select one of several equally
-/// valid repeated-token explanations.  Instead, an anchor is retained only if it
-/// is order-compatible with every other currently retained anchor: all mapped
-/// anchors to its left must map to smaller B indices, and all mapped anchors to
-/// its right must map to larger B indices.  Any anchor involved in a crossing is
-/// suppressed, widening the surrounding edit island and preserving fail-closed
-/// behavior.
+/// valid repeated-token explanations. Instead, an anchor is retained only if
+/// it is order-compatible with every other currently retained anchor: all
+/// mapped anchors to its left must map to smaller B indices, and all mapped
+/// anchors to its right must map to larger B indices. Any anchor involved in a
+/// crossing is suppressed, widening the surrounding edit island and preserving
+/// fail-closed behavior.
 static size_t suppressOrderConflictingAnchors(std::vector<int64_t> &map) {
   const size_t n = map.size();
   if (n == 0)
@@ -433,14 +396,15 @@ static size_t suppressOrderConflictingAnchors(std::vector<int64_t> &map) {
 /// The algorithm separates optimality from certification:
 ///  * compute the core owner-aware LCS objective with no neighbor-spelling tie:
 ///    maximize length, then minimize ownerDepthGap cost;
-///  * retain only anchors forced by that core objective, meaning both sides have
-///    exactly one admissible partner;
+///  * retain only anchors forced by that core objective, meaning both sides
+///    have exactly one admissible partner;
 ///  * restore ambiguous equal-token edge anchors only when they create a unique
 ///    best pure-insertion frontier under structural boundary ranks.
 ///
 /// If a hunk still has no unique boundary-preserving pure-insertion candidate,
-/// the ambiguous anchors remain suppressed. That is fail-closed: downstream code
-/// sees a wider edit island instead of an arbitrary repeated punctuation anchor.
+/// the ambiguous anchors remain suppressed. That is fail-closed: downstream
+/// code sees a wider edit island instead of an arbitrary repeated punctuation
+/// anchor.
 static bool buildBoundaryPureCertifiedMap(
     ArrayRef<StringRef> a, ArrayRef<StringRef> b,
     ArrayRef<uint32_t> ownerDepthGap, ArrayRef<LcsGapProvenance> gapProvenance,
@@ -477,8 +441,8 @@ static bool buildBoundaryPureCertifiedMap(
   };
 
   // Count every individually admissible partner in the optimal core objective.
-  // An anchor is forced only when both directions are unique: A[i] can match one
-  // B token, and that B token can match only this A token.
+  // An anchor is forced only when both directions are unique: A[i] can match
+  // one B token, and that B token can match only this A token.
   std::vector<uint32_t> aPartnerCount(n, 0);
   std::vector<uint32_t> bPartnerCount(m, 0);
   std::vector<int64_t> firstBPartner(n, -1);
@@ -507,7 +471,8 @@ static bool buildBoundaryPureCertifiedMap(
 
   // Defensive monotonicity cleanup: individual admissibility is local to a
   // token pair, so suppress any rare crossing anchors before hunk construction.
-  const size_t suppressedForcedAnchors = suppressOrderConflictingAnchors(outMap);
+  const size_t suppressedForcedAnchors =
+      suppressOrderConflictingAnchors(outMap);
   if (suppressedForcedAnchors != 0) {
     trace("lcs/map",
           "suppressed {0} order-conflicting individually-admissible anchors "
@@ -569,8 +534,8 @@ static bool buildBoundaryPureCertifiedMap(
       };
 
   // Each forced hunk is a conservative edit island. Try to shrink only its
-  // edges by restoring ambiguous equal-token anchors when the resulting frontier
-  // is uniquely certified as a boundary-preserving pure insertion.
+  // edges by restoring ambiguous equal-token anchors when the resulting
+  // frontier is uniquely certified as a boundary-preserving pure insertion.
   const std::vector<Hunk> forcedHunks = hunksFromMap(outMap, n, m);
   size_t normalizedHunks = 0;
   size_t ambiguousHunks = 0;
@@ -633,8 +598,8 @@ static bool buildBoundaryPureCertifiedMap(
     if (!haveBest) {
       // A boundary-pure insertion can also be hidden behind an unchanged token
       // immediately to the left of the insertion frontier. This occurs when a
-      // line-local macro expansion is edited and a B-only after-boundary payload
-      // is appended before the next unchanged token. Equal-offset edge
+      // line-local macro expansion is edited and a B-only after-boundary
+      // payload is appended before the next unchanged token. Equal-offset edge
       // restoration cannot prove that shape because the delimiter token is no
       // longer at the same relative B offset, but the shape is still fully
       // certifiable:
@@ -1343,8 +1308,8 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
 
   // If the full admissibility tables exceed the configured DP budget, fall back
   // to the exact weighted Hirschberg/core-DP implementation. This path uses
-  // the same core objective without the removed neighbor-coherence heuristic; it
-  // merely lacks the full ambiguity-certification table.
+  // the same core objective without the removed neighbor-coherence heuristic;
+  // it merely lacks the full ambiguity-certification table.
   return lcsMapAB(a, b, ArrayRef<uint32_t>(ownerDepthGap), maxCells);
 }
 

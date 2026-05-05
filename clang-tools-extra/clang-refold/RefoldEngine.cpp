@@ -80,16 +80,18 @@
 
 #include <algorithm>
 #include <array>
-#include <cctype>
 #include <set>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
 #include <optional>
+#include <string>
 #include <tuple>
+#include <vector>
 
 using namespace llvm;
 
@@ -104,14 +106,14 @@ struct LexBoundaryToken {
   size_t End = 0;
 };
 
-static std::optional<LexBoundaryToken> firstLexToken(StringRef Text,
-                                                    const LangOptions &Lang);
-static std::optional<LexBoundaryToken> lastLexToken(StringRef Text,
-                                                   const LangOptions &Lang);
-static bool needsLexicalSeparator(const LexBoundaryToken &Left,
-                                  const LexBoundaryToken &Right,
-                                  const LangOptions &Lang);
-static bool isSeparatorGapReplacementPunctuation(tok::TokenKind Kind);
+static std::optional<LexBoundaryToken> firstLexToken(StringRef text,
+                                                    const LangOptions &lang);
+static std::optional<LexBoundaryToken> lastLexToken(StringRef text,
+                                                   const LangOptions &lang);
+static bool needsLexicalSeparator(const LexBoundaryToken &left,
+                                  const LexBoundaryToken &right,
+                                  const LangOptions &lang);
+static bool isSeparatorGapReplacementPunctuation(tok::TokenKind kind);
 
 inline std::string resolveHeaderPath(const RefoldModel::IncludeItem &inc) {
   return (inc.resolvedPath && !inc.resolvedPath->empty())
@@ -119,9 +121,9 @@ inline std::string resolveHeaderPath(const RefoldModel::IncludeItem &inc) {
              : stringutils::stripHeaderToken(inc.target).str();
 }
 
-inline bool HasLiteralMacroCalleeOrigin(
-    const RefoldModel::MacroInvocation &M) {
-  return M.calleeOrigin.kind == MacroCalleeOriginKind::LiteralMacroName;
+inline bool hasLiteralMacroCalleeOrigin(
+    const RefoldModel::MacroInvocation &mi) {
+  return mi.calleeOrigin.kind == MacroCalleeOriginKind::LiteralMacroName;
 }
 
 /// Recover the spelled text of one invocation argument from the producer-side
@@ -137,7 +139,7 @@ inline bool HasLiteralMacroCalleeOrigin(
 /// cleanly into the local invocation surface. Callers must treat failure as a
 /// proof failure and remain fail-closed.
 static std::optional<StringRef>
-TryGetInvocationArgText(const RefoldModel::MacroInvocation &mi,
+tryGetInvocationArgText(const RefoldModel::MacroInvocation &mi,
                         unsigned argIdx) {
   if (!mi.invText)
     return std::nullopt;
@@ -181,12 +183,12 @@ TryGetInvocationArgText(const RefoldModel::MacroInvocation &mi,
 /// We only admit the whole-formal forwarding shape that is explicitly proven by
 /// the current producer contract. Any richer shape must continue to fail
 /// closed until the producer emits stronger callee-slice provenance.
-static bool IsWholeFormalCallerForwardSlot(
+static bool isWholeFormalCallerForwardSlot(
     const RefoldModel::MacroInvocation &parent, uint32_t slot) {
   if (slot >= parent.defParams.size())
     return false;
 
-  auto templateText = TryGetInvocationArgText(parent, slot);
+  auto templateText = tryGetInvocationArgText(parent, slot);
   if (!templateText)
     return false;
   if (templateText->trim() != parent.defParams[slot].name)
@@ -210,7 +212,7 @@ static bool IsWholeFormalCallerForwardSlot(
   return true;
 }
 
-static std::string FormatUInt32List(ArrayRef<uint32_t> values) {
+static std::string formatUInt32List(ArrayRef<uint32_t> values) {
   std::string out;
   raw_string_ostream os(out);
   os << "[";
@@ -224,7 +226,7 @@ static std::string FormatUInt32List(ArrayRef<uint32_t> values) {
 }
 
 static std::string
-FormatInvArgRefList(ArrayRef<RefoldModel::InvArgRef> refs) {
+formatInvArgRefList(ArrayRef<RefoldModel::InvArgRef> refs) {
   std::string out;
   raw_string_ostream os(out);
   os << "[";
@@ -239,31 +241,110 @@ FormatInvArgRefList(ArrayRef<RefoldModel::InvArgRef> refs) {
 }
 
 static std::string
-FormatInvocationArgRange(const RefoldModel::MacroInvocation::OptByteRange &R) {
+formatInvocationArgRange(
+    const RefoldModel::MacroInvocation::OptByteRange &range) {
   std::string out;
   raw_string_ostream os(out);
   os << "[";
-  if (R.first)
-    os << *R.first;
+  if (range.first)
+    os << *range.first;
   else
     os << "?";
   os << ",";
-  if (R.second)
-    os << *R.second;
+  if (range.second)
+    os << *range.second;
   else
     os << "?";
   os << ")";
   return os.str();
 }
 
+struct CompatibleStringRewriteHunk {
+  uint64_t oldBegin = 0;
+  uint64_t oldEnd = 0;
+  std::string repl;
+};
+
+static bool sameCompatibleStringRewriteHunk(
+    const CompatibleStringRewriteHunk &lhs,
+    const CompatibleStringRewriteHunk &rhs) {
+  return lhs.oldBegin == rhs.oldBegin && lhs.oldEnd == rhs.oldEnd &&
+         lhs.repl == rhs.repl;
+}
+
+static bool compatibleStringRewriteHunksOverlap(
+    const CompatibleStringRewriteHunk &lhs,
+    const CompatibleStringRewriteHunk &rhs) {
+  return lhs.oldBegin < rhs.oldEnd && rhs.oldBegin < lhs.oldEnd;
+}
+
+/// Merge several independently-proven replacements against the same base text.
+///
+/// Each replacement is diffed against \p baseOld at character granularity.
+/// Identical hunks are deduplicated, disjoint hunks are composed, and any
+/// conflicting overlap fails closed. This centralizes the previous local
+/// callsite/formal merge lambdas without changing their conflict policy.
+static std::optional<std::string>
+mergeCompatibleStringReplacements(StringRef baseOld,
+                                  ArrayRef<StringRef> replacements) {
+  std::vector<CompatibleStringRewriteHunk> merged;
+  std::vector<StringRef> aRefs = stringutils::splitChars(baseOld);
+
+  for (StringRef replText : replacements) {
+    if (replText == baseOld)
+      continue;
+
+    std::vector<StringRef> bRefs = stringutils::splitChars(replText);
+    auto steps = diffutils::diff(aRefs, bRefs);
+    auto hunks = diffutils::coalesce(steps);
+
+    for (const auto &hunk : hunks) {
+      CompatibleStringRewriteHunk piece{
+          hunk.aStart, hunk.aEnd,
+          replText.slice(static_cast<size_t>(hunk.bStart),
+                         static_cast<size_t>(hunk.bEnd))
+              .str()};
+
+      auto it = std::lower_bound(
+          merged.begin(), merged.end(), piece.oldBegin,
+          [](const CompatibleStringRewriteHunk &h, uint64_t pos) {
+            return h.oldBegin < pos;
+          });
+
+      if (it != merged.begin()) {
+        const auto &prev = *std::prev(it);
+        if (sameCompatibleStringRewriteHunk(prev, piece))
+          continue;
+        if (compatibleStringRewriteHunksOverlap(prev, piece))
+          return std::nullopt;
+      }
+      if (it != merged.end()) {
+        if (sameCompatibleStringRewriteHunk(*it, piece))
+          continue;
+        if (compatibleStringRewriteHunksOverlap(*it, piece))
+          return std::nullopt;
+      }
+
+      merged.insert(it, std::move(piece));
+    }
+  }
+
+  std::string out = baseOld.str();
+  for (auto it = merged.rbegin(); it != merged.rend(); ++it)
+    out.replace(static_cast<size_t>(it->oldBegin),
+                static_cast<size_t>(it->oldEnd - it->oldBegin), it->repl);
+  return out;
+}
+
 /// Collect the uint32_t keys of an associative container in deterministic
 /// ascending order.
 template <typename MapLike>
-static SmallVector<uint32_t, 8> CollectSortedUInt32Keys(const MapLike &mapLike) {
+static SmallVector<uint32_t, 8>
+collectSortedUInt32Keys(const MapLike &mapLike) {
   SmallVector<uint32_t, 8> keys;
   keys.reserve(mapLike.size());
-  for (const auto &KV : mapLike)
-    keys.push_back(KV.first);
+  for (const auto &kv : mapLike)
+    keys.push_back(kv.first);
   llvm::sort(keys);
   return keys;
 }
@@ -274,7 +355,7 @@ static SmallVector<uint32_t, 8> CollectSortedUInt32Keys(const MapLike &mapLike) 
 /// pasted product, so callers that reason about support ledgers first need a
 /// deduplicated arg-index view.
 static SmallVector<uint32_t, 8>
-CollectSortedUniquePasteArgIdxs(ArrayRef<RefoldModel::PPArgSpan> pasteSpans) {
+collectSortedUniquePasteArgIdxs(ArrayRef<RefoldModel::PPArgSpan> pasteSpans) {
   SmallVector<uint32_t, 8> argIdxs;
   for (const auto &ps : pasteSpans) {
     if (!llvm::is_contained(argIdxs, ps.argIdx))
@@ -286,7 +367,7 @@ CollectSortedUniquePasteArgIdxs(ArrayRef<RefoldModel::PPArgSpan> pasteSpans) {
 
 /// Return the sorted subset of `required` that is not present in `provided`.
 static SmallVector<uint32_t, 8>
-ComputeSortedMissingUInt32s(ArrayRef<uint32_t> required,
+computeSortedMissingUInt32s(ArrayRef<uint32_t> required,
                             ArrayRef<uint32_t> provided) {
   SmallVector<uint32_t, 8> missing;
   for (uint32_t value : required) {
@@ -299,9 +380,9 @@ ComputeSortedMissingUInt32s(ArrayRef<uint32_t> required,
 
 /// Return true when the given invocation argument contributes to any pasted
 /// token emitted by the invocation.
-static bool InvocationArgTouchesPaste(const RefoldModel::MacroInvocation &MI,
+static bool invocationArgTouchesPaste(const RefoldModel::MacroInvocation &mi,
                                       uint32_t argIdx) {
-  for (const auto &ps : MI.pasteSpans) {
+  for (const auto &ps : mi.pasteSpans) {
     if (ps.argIdx == argIdx)
       return true;
   }
@@ -309,10 +390,10 @@ static bool InvocationArgTouchesPaste(const RefoldModel::MacroInvocation &MI,
 }
 
 /// Return true when any arg index in `argIdxs` participates in a pasted token.
-static bool AnyInvocationArgTouchesPaste(const RefoldModel::MacroInvocation &MI,
+static bool anyInvocationArgTouchesPaste(const RefoldModel::MacroInvocation &mi,
                                          ArrayRef<uint32_t> argIdxs) {
   for (uint32_t argIdx : argIdxs) {
-    if (InvocationArgTouchesPaste(MI, argIdx))
+    if (invocationArgTouchesPaste(mi, argIdx))
       return true;
   }
   return false;
@@ -321,11 +402,11 @@ static bool AnyInvocationArgTouchesPaste(const RefoldModel::MacroInvocation &MI,
 /// Return true when every touched paste arg in `argIdxs` belongs to the
 /// supplied allow-list set. Non-paste arguments are ignored.
 template <typename SetLike>
-static bool AllTouchedPasteArgsAreContained(
-    const RefoldModel::MacroInvocation &MI, ArrayRef<uint32_t> argIdxs,
+static bool allTouchedPasteArgsAreContained(
+    const RefoldModel::MacroInvocation &mi, ArrayRef<uint32_t> argIdxs,
     const SetLike &allowedArgIdxs) {
   for (uint32_t argIdx : argIdxs) {
-    if (InvocationArgTouchesPaste(MI, argIdx) && !allowedArgIdxs.count(argIdx))
+    if (invocationArgTouchesPaste(mi, argIdx) && !allowedArgIdxs.count(argIdx))
       return false;
   }
   return true;
@@ -336,7 +417,7 @@ static bool AllTouchedPasteArgsAreContained(
 /// Some call sites already require concrete byte ranges and some are still
 /// screening for missing ranges. Centralizing the ordering keeps all of those
 /// paths consistent without changing their local preconditions.
-static bool PasteSpanPtrLessByByteRange(const RefoldModel::PPArgSpan *a,
+static bool pasteSpanPtrLessByByteRange(const RefoldModel::PPArgSpan *a,
                                         const RefoldModel::PPArgSpan *b) {
   if (a->byteBegin != b->byteBegin)
     return a->byteBegin < b->byteBegin;
@@ -347,92 +428,6 @@ static bool PasteSpanPtrLessByByteRange(const RefoldModel::PPArgSpan *a,
   if (a->end != b->end)
     return a->end < b->end;
   return a->argIdx < b->argIdx;
-}
-
-/// 
-/// Stringification (`#arg`) is not a free inverse: comments disappear and
-/// arbitrary runs of PP whitespace collapse to single spaces in the resulting
-/// string literal. To avoid inventing a non-unique source spelling when we map
-/// an edited string literal back into raw argument syntax, we only accept
-/// payloads that are already in a simple canonical source form:
-///   * leading/trailing PP whitespace removed,
-///   * every inter-token whitespace run collapsed to a single ASCII space,
-///   * no comments outside literals,
-///   * balanced string/char literals.
-///
-/// If the trimmed payload is not already equal to that canonical form, the
-/// inverse is ambiguous and we conservatively reject it.
-static std::optional<std::string>
-CanonicalizeStringifyInversePayload(StringRef raw0) {
-  StringRef raw = raw0.trim();
-
-  enum class LexState { Normal, String, Char };
-  LexState state = LexState::Normal;
-
-  std::string out;
-  out.reserve(raw.size());
-
-  bool pendingSpace = false;
-  auto flushPendingSpace = [&]() {
-    if (pendingSpace && !out.empty())
-      out.push_back(' ');
-    pendingSpace = false;
-  };
-
-  for (size_t i = 0; i < raw.size(); ++i) {
-    const char c = raw[i];
-
-    switch (state) {
-    case LexState::Normal:
-      if (stringutils::isWs(c)) {
-        pendingSpace = !out.empty();
-        continue;
-      }
-
-      if (c == '/' && i + 1 < raw.size()) {
-        const char n = raw[i + 1];
-        if (n == '/' || n == '*')
-          return std::nullopt;
-      }
-
-      flushPendingSpace();
-      out.push_back(c);
-      if (c == '"')
-        state = LexState::String;
-      else if (c == '\'')
-        state = LexState::Char;
-      continue;
-
-    case LexState::String:
-      out.push_back(c);
-      if (c == '\\') {
-        if (i + 1 >= raw.size())
-          return std::nullopt;
-        out.push_back(raw[++i]);
-        continue;
-      }
-      if (c == '"')
-        state = LexState::Normal;
-      continue;
-
-    case LexState::Char:
-      out.push_back(c);
-      if (c == '\\') {
-        if (i + 1 >= raw.size())
-          return std::nullopt;
-        out.push_back(raw[++i]);
-        continue;
-      }
-      if (c == '\'')
-        state = LexState::Normal;
-      continue;
-    }
-  }
-
-  if (state != LexState::Normal)
-    return std::nullopt;
-
-  return out;
 }
 
 enum class PasteRunInvertibilityKind {
@@ -612,7 +607,12 @@ buildAdjacentPasteRunInvertibilityCertificate(
 /// are possible and the consumer must fail closed. `NoMatch` means this witness
 /// cannot explain the edited token. `Unsupported` denotes malformed or
 /// currently out-of-domain witness shapes.
-enum class PasteReplaySegmentationKind { Unique, NoMatch, Ambiguous, Unsupported };
+enum class PasteReplaySegmentationKind {
+  Unique,
+  NoMatch,
+  Ambiguous,
+  Unsupported
+};
 
 /// Result of replaying one edited pasted-token spelling through one original
 /// replay witness. For a successful replay, `argSegments` contains replacement
@@ -657,12 +657,13 @@ static PasteReplaySegmentationResult mergePasteReplayResults(
 /// `paste_spans[]` contains one entry per argument contribution, while
 /// `paste_tokens[]` contains one entry per final pasted token. The producer
 /// serializes both in token order, so this helper reconstructs the distinct
-/// `(begin,end)` paste-token order from `paste_spans[]` and uses the same ordinal
-/// to find the replay witness. The spelling check prevents accidental matches
-/// if the metadata is malformed or from a different schema generation.
-static const RefoldModel::PasteToken *findPasteTokenWitnessForSpan(
-    const RefoldModel::MacroInvocation &M, const RefoldModel::PPArgSpan &Span,
-    StringRef ATokSpelling) {
+/// `(begin,end)` paste-token order from `paste_spans[]` and uses the same
+/// ordinal to find the replay witness. The spelling check prevents accidental
+/// matches if the metadata is malformed or from a different schema generation.
+static const RefoldModel::PasteToken *
+findPasteTokenWitnessForSpan(const RefoldModel::MacroInvocation &M,
+                             const RefoldModel::PPArgSpan &Span,
+                             StringRef ATokSpelling) {
   if (M.pasteTokens.empty())
     return nullptr;
 
@@ -847,111 +848,6 @@ static PasteReplaySegmentationResult segmentPastedTokenByReplayWitness(
 }
 
 
-/// Return true iff \p replacement has the exact chained-call shape
-///   (<non-empty head>)(...)...
-/// i.e. a balanced parenthesized callable head followed by one or more
-/// balanced call-suffix groups, with only whitespace/comments between
-/// groups and nothing trailing afterward.
-///
-/// This is used by chained-call patch extension to detect replacements
-/// such as `(f)(x)` or `((f))(x)(y)`, where the final trailing source
-/// call group should remain outside the replacement.
-static bool shouldPreserveFinalCallSuffixGroup(StringRef replacement) {
-  StringRef s = replacement.trim();
-  if (s.empty())
-    return false;
-
-  size_t pos = stringutils::skipWSAndComments(s, 0);
-  if (pos >= s.size() || s[pos] != '(')
-    return false;
-
-  const size_t headEnd = stringutils::findMatchingRParen(s, pos);
-  if (headEnd == StringRef::npos)
-    return false;
-
-  const size_t firstInside = stringutils::skipWSAndComments(s, pos + 1);
-  if (firstInside >= headEnd)
-    return false;
-
-  // Require one or more trailing call groups.
-  pos = stringutils::skipWSAndComments(s, headEnd + 1);
-  bool sawCallGroup = false;
-  while (pos < s.size() && s[pos] == '(') {
-    const size_t groupEnd = stringutils::findMatchingRParen(s, pos);
-    if (groupEnd == StringRef::npos)
-      return false;
-    sawCallGroup = true;
-    pos = stringutils::skipWSAndComments(s, groupEnd + 1);
-  }
-
-  return sawCallGroup && pos == s.size();
-}
-
-/// Extend a macro invocation's replacement end across trailing chained-call
-/// suffix groups in the original source, when those groups should be absorbed
-/// into the replacement.
-///
-/// Starting at \p invEnd, this scans forward through any immediately following
-/// balanced `(...)` groups (skipping whitespace/comments between groups) and
-/// returns the byte offset after the last group that should be consumed.
-///
-/// Consumption policy:
-///   - If \p replacement still looks directly callable (for example `IDENT` or
-///     `IDENT(...)`), do not consume any trailing source call groups.
-///   - Otherwise, consume trailing source `(...)` groups as part of the patch.
-///   - Exception: if \p replacement is itself a full parenthesized chained-call
-///     surface such as `(f)(x)` or `((f))(x)(y)`, preserve the final trailing
-///     source call group so the outermost call remains outside the replacement.
-///
-/// Returns \p invEnd unchanged if no trailing call-suffix groups should be
-/// consumed or if no balanced group begins at/after \p invEnd.
-static uint64_t extendChainedCallEnd(StringRef fileText, uint64_t invEnd,
-                                     StringRef replacement) {
-  if (invEnd > fileText.size())
-    return invEnd;
-
-  // Preserve chained call parens for replacements that still look
-  // callable:
-  //   * IDENT
-  //   * IDENT(...)
-  // In these cases, any trailing '(...)' sequences are likely
-  // function-call suffixes that must remain.
-  if (stringutils::isIdentifierOrSimpleCallExpr(replacement))
-    return invEnd;
-
-  // When the replacement is itself a parenthesized callable head
-  // followed by one or more call groups, preserve the final trailing
-  // source suffix group. This keeps chained-call forms such as
-  // '(f)(x)' or '((f))(x)(y)' from consuming the call that should
-  // remain outside the replacement.
-  const bool preserveFinalSuffixGroup =
-      shouldPreserveFinalCallSuffixGroup(replacement);
-
-  size_t pos =
-      stringutils::skipWSAndComments(fileText, static_cast<size_t>(invEnd));
-  if (pos >= fileText.size() || fileText[pos] != '(')
-    return invEnd;
-
-  // Collect the end offsets of each consecutive balanced trailing `(...)`
-  // suffix group after the invocation, skipping intervening whitespace/comments.
-  SmallVector<uint64_t, 4> groupEnds;
-  while (pos < fileText.size() && fileText[pos] == '(') {
-    const size_t r = stringutils::findMatchingRParen(fileText, pos);
-    if (r == StringRef::npos)
-      break;
-    groupEnds.push_back(static_cast<uint64_t>(r + 1));
-    pos = stringutils::skipWSAndComments(fileText, r + 1);
-  }
-
-  if (groupEnds.empty())
-    return invEnd;
-
-  size_t consume = groupEnds.size();
-  if (preserveFinalSuffixGroup && consume > 0)
-    consume -= 1;
-  return (consume == 0) ? invEnd : groupEnds[consume - 1];
-}
-
 // Slice the exact byte coverage of tokens [startTok,endTok): from the first
 // token's start to the last token's end, excluding any inter-token whitespace
 // that follows the final token and belongs to later untouched text.
@@ -1018,10 +914,11 @@ clang::LangOptions RefoldEngine::MakeLexLangOptions(llvm::StringRef langName) {
 
 // ========================== Public entry points ==========================
 
-Expected<std::string> RefoldEngine::Refold(
-    const json::Object &rootJson, StringRef aSource, ArrayRef<PPTok> aToks,
-    ArrayRef<size_t> aTokOff, StringRef bSource, ArrayRef<PPTok> bToks,
-    ArrayRef<size_t> bTokOff, bool noLines, bool strict) {
+Expected<std::string>
+RefoldEngine::Refold(const json::Object &rootJson, StringRef aSource,
+                     ArrayRef<PPTok> aToks, ArrayRef<size_t> aTokOff,
+                     StringRef bSource, ArrayRef<PPTok> bToks,
+                     ArrayRef<size_t> bTokOff, bool noLines, bool strict) {
   // Build the refold model based on the parsed JSON object.
   auto mOrErr = RefoldModel::FromJson(rootJson);
   if (!mOrErr)
@@ -1033,8 +930,9 @@ Expected<std::string> RefoldEngine::Refold(
   return engine.Refold();
 }
 
-void RefoldEngine::RequestTerminalFallback(TerminalFallbackKind kind, StringRef phase,
-                                    StringRef detail) const {
+void RefoldEngine::RequestTerminalFallback(TerminalFallbackKind kind,
+                                           StringRef phase,
+                                           StringRef detail) const {
   terminalFallbackRequested_ = true;
   ++terminalFallbackRequestCount_;
   if (terminalFallbackKind_ == TerminalFallbackKind::Unknown) {
@@ -1078,16 +976,16 @@ void RefoldEngine::EnforceTheoremAuditInvariants() const {
         "emitted edit carried undischarged theorem artifact");
   }
   if (lastTheoremAudit_.emittedOutOfDomainCarriers != 0) {
-    NoteTheoremAuditViolation(
-        "non-terminal emitted edit carried explicit out-of-domain theorem artifact");
+    NoteTheoremAuditViolation("non-terminal emitted edit carried explicit "
+                              "out-of-domain theorem artifact");
   }
   if (lastTheoremAudit_.selectorUnresolvedCompetitions != 0) {
     NoteTheoremAuditViolation(
         "selector competition ended without a lattice-selected winner");
   }
   if (lastTheoremAudit_.nonExplicitTerminalExclusions != 0) {
-    NoteTheoremAuditViolation(
-        "terminal fallback was not classified as an explicit out-of-domain theorem result");
+    NoteTheoremAuditViolation("terminal fallback was not classified as an "
+                              "explicit out-of-domain theorem result");
   }
 
   if (!strict_ || terminalFallbackRequested_ ||
@@ -1096,8 +994,7 @@ void RefoldEngine::EnforceTheoremAuditInvariants() const {
   }
 
   RequestTerminalFallback(TerminalFallbackKind::TheoremAuditInvariantViolation,
-                          "theorem",
-                          BuildTheoremAuditInvariantDetail());
+                          "theorem", BuildTheoremAuditInvariantDetail());
 }
 
 void RefoldEngine::RecordTerminalFallbackTheoremAudit() const {
@@ -1124,7 +1021,8 @@ void RefoldEngine::RecordTerminalFallbackTheoremAudit() const {
       summary.theoremDomain.kind ==
           TheoremDomainKind::ExplicitOutOfDomainClass &&
       summary.theoremDomain.hasExplicitExclusion &&
-      summary.theoremDomain.explicitExclusion != TerminalFallbackKind::Unknown &&
+      summary.theoremDomain.explicitExclusion !=
+          TerminalFallbackKind::Unknown &&
       summary.theoremDomain.explicitExclusion == witness.kind &&
       summary.hasTerminalFallbackWitness &&
       summary.discharge.status == ProofDischargeStatus::Rejected &&
@@ -1139,11 +1037,11 @@ void RefoldEngine::RecordTerminalFallbackTheoremAudit() const {
   }
 
   ++lastTheoremAudit_.nonExplicitTerminalExclusions;
-  NoteTheoremAuditViolation(llvm::formatv(
-                               "terminal fallback escaped theorem-domain classification: witness={0} candidate={1}",
-                               witness,
-                               FormatAcceptedResultCandidate(candidate))
-                               .str());
+  NoteTheoremAuditViolation(
+      llvm::formatv("terminal fallback escaped theorem-domain classification: "
+                    "witness={0} candidate={1}",
+                    witness, FormatAcceptedResultCandidate(candidate))
+          .str());
 }
 
 std::string RefoldEngine::BuildTheoremAuditInvariantDetail() const {
@@ -1154,11 +1052,13 @@ std::string RefoldEngine::BuildTheoremAuditInvariantDetail() const {
 
   return llvm::formatv(
              "strict theorem-audit invariant violation: firstViolation='{0}' "
-             "selectorDirectBypasses={1} selectorOnlyExceptions={2} transitional={3} "
-             "undischarged={4} unknownClass={5} outOfDomain={6} "
+             "selectorDirectBypasses={1} selectorOnlyExceptions={2} "
+             "transitional={3} undischarged={4} unknownClass={5} outOfDomain={6} "
              "selectorUnresolved={7} nonExplicitTerminalExclusions={8} "
-             "expansionFallbackWitnesses={9} expansionFallbackSynthesisSuccesses={10} "
-             "expansionFallbackSynthesisRejections={11} expansionFallbackTerminalRescues={12}",
+             "expansionFallbackWitnesses={9} "
+             "expansionFallbackSynthesisSuccesses={10} "
+             "expansionFallbackSynthesisRejections={11} "
+             "expansionFallbackTerminalRescues={12}",
              firstViolation, lastTheoremAudit_.selectorDirectBypasses,
              lastTheoremAudit_.emittedSelectorOnlyExceptionCarriers,
              lastTheoremAudit_.emittedTransitionalTheoremCarriers,
@@ -1689,7 +1589,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
 
       bool operator<(const HunkRealizer &other) const {
         if (kind != other.kind)
-          return static_cast<unsigned>(kind) < static_cast<unsigned>(other.kind);
+          return static_cast<unsigned>(kind) <
+                 static_cast<unsigned>(other.kind);
         return id < other.id;
       }
     };
@@ -1715,8 +1616,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
 
       diffutils::Hunk probe{aStart, aEnd, 0, 0};
       Owner probeOwner = ClassifyOwnerWithSegments(tuPath, probe);
-      if (auto *m =
-              SmallestCoveringPatchableMacro(aStart, aEnd, probeOwner.includeId)) {
+      if (auto *m = SmallestCoveringPatchableMacro(aStart, aEnd,
+                                                   probeOwner.includeId)) {
         if (m->invB && m->invE)
           return {HunkRealizerKind::Macro, m->id};
       }
@@ -1771,9 +1672,9 @@ std::string RefoldEngine::RunSinglePassRefold() {
         return std::nullopt;
 
       // If the whole hunk is already a patchable macro invocation, leave it as
-      // one hunk. Splitting inside an already-proven whole macro candidate would
-      // make this normalization pass compete with the macro lattice rather than
-      // merely exposing otherwise independent owners.
+      // one hunk. Splitting inside an already-proven whole macro candidate
+      // would make this normalization pass compete with the macro lattice
+      // rather than merely exposing otherwise independent owners.
       Owner wholeOwner = ClassifyOwnerWithSegments(tuPath, h);
       if (auto *wholeMacro = SmallestCoveringPatchableMacro(
               h.aStart, h.aEnd, wholeOwner.includeId)) {
@@ -2247,9 +2148,9 @@ std::string RefoldEngine::RunSinglePassRefold() {
       ++directStandardOccurrences;
     }
 
-    // Stringify and paste uses transform the argument spelling before it reaches
-    // the PP output. A direct TU argument edit is not equivalent to an args-only
-    // reconstruction for those cases.
+    // Stringify and paste uses transform the argument spelling before it
+    // reaches the PP output. A direct TU argument edit is not equivalent to an
+    // args-only reconstruction for those cases.
     for (const auto &occ : macro.stringifySpans)
       if (occ.argIdx == *touchedArgIdx)
         return false;
@@ -2645,14 +2546,15 @@ std::string RefoldEngine::RunSinglePassRefold() {
         }
 
         // If our TU span stops at an identifier and is immediately followed by
-        // a "(...)" chain, consume that suffix only when token provenance proves
-        // the suffix belongs to this hunk's B-side replacement interval.  This
-        // prevents a wrapper-name replacement from swallowing the original
+        // a "(...)" chain, consume that suffix only when token provenance
+        // proves the suffix belongs to this hunk's B-side replacement interval.
+        // This prevents a wrapper-name replacement from swallowing the original
         // argument list while a separate insertion hunk still targets a byte
         // inside that argument list.
         if (span->first < span->second) {
           const uint64_t oldEnd = span->second;
-          const uint64_t extEnd = extendChainedCallEnd(tuBytes, oldEnd, repl);
+          const uint64_t extEnd =
+              stringutils::extendChainedCallEnd(tuBytes, oldEnd, repl);
           if (extEnd != oldEnd &&
               tuExtensionIsBTokenClosed(h.aEnd, oldEnd, extEnd, h.bStart,
                                         h.bEnd)) {
@@ -2867,11 +2769,12 @@ std::string RefoldEngine::RunSinglePassRefold() {
 
       // If our TU span stops at an identifier and is immediately followed by a
       // "(...)" chain, consume that suffix only when token provenance proves
-      // the suffix belongs to this hunk's B-side replacement interval.  This is
+      // the suffix belongs to this hunk's B-side replacement interval. This is
       // the conservative-path counterpart of the mapped-TU guard above.
       if (span->first < span->second) {
         const uint64_t oldEnd = span->second;
-        const uint64_t extEnd = extendChainedCallEnd(tuBytes, oldEnd, repl);
+        const uint64_t extEnd =
+              stringutils::extendChainedCallEnd(tuBytes, oldEnd, repl);
         if (extEnd != oldEnd &&
             tuExtensionIsBTokenClosed(h.aEnd, oldEnd, extEnd, h.bStart,
                                       h.bEnd)) {
@@ -3181,7 +3084,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
     SmallVector<std::pair<uint64_t, uint64_t>, 16> accepted;
     for (const auto &mp : tuMacroPatches) {
       uint64_t mpEnd =
-          extendChainedCallEnd(StringRef(tuBytes), mp.invEnd, mp.replacement);
+          stringutils::extendChainedCallEnd(StringRef(tuBytes), mp.invEnd,
+                                         mp.replacement);
       if (mpEnd != mp.invEnd) {
         debug("macro/chain",
               "TU extend chained callsite [{0},{1}) -> [{0},{2})", mp.invStart,
@@ -3322,19 +3226,6 @@ std::string RefoldEngine::RunSinglePassRefold() {
   // invoked in the TU, line directives are enabled, and the output does not
   // already begin with a #line directive.
   if (lineDirs_.Enabled() && !tuResult.empty()) {
-    auto startsWithLine = [](StringRef s) -> bool {
-      size_t i = 0;
-      while (i < s.size()) {
-        char c = s[i];
-        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
-          ++i;
-          continue;
-        }
-        break;
-      }
-      return s.drop_front(i).starts_with("#line");
-    };
-
     bool needsTUPrologue = false;
     for (const auto &m : model_.GetMacroInvocations()) {
       if (m.name != "__FILE__" && m.name != "__FILE_NAME__")
@@ -3353,7 +3244,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
       break;
     }
 
-    if (needsTUPrologue && !startsWithLine(StringRef(tuResult))) {
+    if (needsTUPrologue &&
+        !stringutils::startsWithAfterWhitespace(StringRef(tuResult), "#line")) {
       std::string dir = lineDirs_.FormatLineDirective(1, tuPath);
       if (!dir.empty())
         tuResult.insert(0, dir);
@@ -3630,41 +3522,6 @@ RefoldEngine::ComputeLcsBGapProvenanceForPP() {
   const size_t N = bToks_.size();
   std::vector<LcsBGapProvenance> profiles(N + 1);
 
-  auto containsNewline = [&](size_t begin, size_t end) -> bool {
-    begin = std::min(begin, bSource_.size());
-    end = std::min(end, bSource_.size());
-    if (end < begin)
-      std::swap(begin, end);
-    return bSource_.substr(begin, end - begin).find('\n') != StringRef::npos;
-  };
-
-  auto onlyWhitespace = [&](size_t begin, size_t end) -> bool {
-    begin = std::min(begin, bSource_.size());
-    end = std::min(end, bSource_.size());
-    if (end < begin)
-      std::swap(begin, end);
-    for (char ch : bSource_.substr(begin, end - begin)) {
-      if (!isHorizontalWhitespace(ch) && ch != '\n' && ch != '\r')
-        return false;
-    }
-    return true;
-  };
-
-  auto lineStart = [&](size_t pos) -> size_t {
-    pos = std::min(pos, bSource_.size());
-    while (pos > 0 && bSource_[pos - 1] != '\n' && bSource_[pos - 1] != '\r')
-      --pos;
-    return pos;
-  };
-
-  auto lineEnd = [&](size_t pos) -> size_t {
-    pos = std::min(pos, bSource_.size());
-    while (pos < bSource_.size() && bSource_[pos] != '\n' &&
-           bSource_[pos] != '\r')
-      ++pos;
-    return pos;
-  };
-
   auto tokenBegin = [&](size_t tok) -> size_t {
     if (tok >= bTokOff_.size())
       return bSource_.size();
@@ -3681,14 +3538,6 @@ RefoldEngine::ComputeLcsBGapProvenanceForPP() {
     return std::min(spellingEnd, bSource_.size());
   };
 
-  auto beginsLine = [&](size_t begin) -> bool {
-    return onlyWhitespace(lineStart(begin), begin);
-  };
-
-  auto endsLine = [&](size_t end) -> bool {
-    return onlyWhitespace(end, lineEnd(end));
-  };
-
   for (size_t gap = 0; gap <= N; ++gap) {
     LcsBGapProvenance profile;
     profile.hasLeftToken = gap > 0;
@@ -3701,26 +3550,34 @@ RefoldEngine::ComputeLcsBGapProvenanceForPP() {
     profile.gapBeginByte = static_cast<uint64_t>(gapBegin);
     profile.gapEndByte = static_cast<uint64_t>(gapEnd);
 
-    profile.gapContainsNewline = containsNewline(gapBegin, gapEnd);
-    profile.gapContainsOnlyWhitespace = onlyWhitespace(gapBegin, gapEnd);
-    profile.gapAtLineStart = beginsLine(gapBegin);
-    profile.gapAtLineEnd = endsLine(gapEnd);
+    profile.gapContainsNewline =
+        stringutils::rangeContainsNewline(bSource_, gapBegin, gapEnd);
+    profile.gapContainsOnlyWhitespace =
+        stringutils::rangeContainsOnlyWhitespace(bSource_, gapBegin, gapEnd);
+    profile.gapAtLineStart =
+        stringutils::beginsLineAfterWhitespace(bSource_, gapBegin);
+    profile.gapAtLineEnd =
+        stringutils::endsLineBeforeWhitespace(bSource_, gapEnd);
 
     if (profile.hasLeftToken) {
       const size_t leftBegin = tokenBegin(gap - 1);
       const size_t leftEnd = tokenEnd(gap - 1);
       profile.leftTokenBeginByte = static_cast<uint64_t>(leftBegin);
       profile.leftTokenEndByte = static_cast<uint64_t>(leftEnd);
-      profile.leftTokenStartsLine = beginsLine(leftBegin);
-      profile.leftTokenEndsLine = endsLine(leftEnd);
+      profile.leftTokenStartsLine =
+          stringutils::beginsLineAfterWhitespace(bSource_, leftBegin);
+      profile.leftTokenEndsLine =
+          stringutils::endsLineBeforeWhitespace(bSource_, leftEnd);
     }
     if (profile.hasRightToken) {
       const size_t rightBegin = tokenBegin(gap);
       const size_t rightEnd = tokenEnd(gap);
       profile.rightTokenBeginByte = static_cast<uint64_t>(rightBegin);
       profile.rightTokenEndByte = static_cast<uint64_t>(rightEnd);
-      profile.rightTokenStartsLine = beginsLine(rightBegin);
-      profile.rightTokenEndsLine = endsLine(rightEnd);
+      profile.rightTokenStartsLine =
+          stringutils::beginsLineAfterWhitespace(bSource_, rightBegin);
+      profile.rightTokenEndsLine =
+          stringutils::endsLineBeforeWhitespace(bSource_, rightEnd);
     }
 
     profiles[gap] = profile;
@@ -3744,19 +3601,15 @@ struct TupleElementSlice {
   size_t trimEnd = 0;
 };
 
-static bool computeTrimmedTupleElement(StringRef Text, size_t Begin, size_t End,
-                                       TupleElementSlice &Out) {
-  Out.begin = Begin;
-  Out.end = End;
-  Out.trimBegin = Begin;
-  Out.trimEnd = End;
-  while (Out.trimBegin < Out.trimEnd &&
-         std::isspace(static_cast<unsigned char>(Text[Out.trimBegin])))
-    ++Out.trimBegin;
-  while (Out.trimEnd > Out.trimBegin &&
-         std::isspace(static_cast<unsigned char>(Text[Out.trimEnd - 1])))
-    --Out.trimEnd;
-  return Out.trimBegin != Out.trimEnd;
+static bool computeTrimmedTupleElement(StringRef text, size_t begin, size_t end,
+                                       TupleElementSlice &out) {
+  out.begin = begin;
+  out.end = end;
+  out.trimBegin = begin;
+  out.trimEnd = end;
+  std::tie(out.trimBegin, out.trimEnd) =
+      stringutils::trimWsRange(text, begin, end);
+  return out.trimBegin != out.trimEnd;
 }
 
 /// Split a caller tuple into top-level comma-separated elements using Clang's
@@ -3766,65 +3619,65 @@ static bool computeTrimmedTupleElement(StringRef Text, size_t Begin, size_t End,
 /// tokens, so only delimiter depth (`()`, `[]`, `{}`) needs to be tracked when
 /// deciding whether a comma separates tuple elements.
 static bool splitTopLevelTupleElementsWithLexer(
-    StringRef Text, const LangOptions &Lang,
-    SmallVectorImpl<TupleElementSlice> &Out) {
-  Out.clear();
-  if (Text.empty())
+    StringRef text, const LangOptions &lang,
+    SmallVectorImpl<TupleElementSlice> &out) {
+  out.clear();
+  if (text.empty())
     return false;
 
-  const SourceLocation BaseLoc = SourceLocation::getFromRawEncoding(1);
-  std::string LexBuf = Text.str();
-  LexBuf.push_back('\0');
-  const char *BufStart = LexBuf.data();
-  const char *BufEnd = BufStart + Text.size();
-  Lexer Lex(BaseLoc, Lang, BufStart, BufStart, BufEnd);
+  const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
+  std::string lexBuf = text.str();
+  lexBuf.push_back('\0');
+  const char *bufStart = lexBuf.data();
+  const char *bufEnd = bufStart + text.size();
+  Lexer lexer(baseLoc, lang, bufStart, bufStart, bufEnd);
 
-  size_t ElementBegin = 0;
-  int ParenDepth = 0;
-  int BracketDepth = 0;
-  int BraceDepth = 0;
-  Token Tok;
+  size_t elementBegin = 0;
+  int parenDepth = 0;
+  int bracketDepth = 0;
+  int braceDepth = 0;
+  Token token;
 
   while (true) {
-    Lex.LexFromRawLexer(Tok);
-    if (Tok.is(tok::eof))
+    lexer.LexFromRawLexer(token);
+    if (token.is(tok::eof))
       break;
-    if (Tok.is(tok::comment))
+    if (token.is(tok::comment))
       continue;
 
-    const size_t TokBegin =
-        Tok.getLocation().getRawEncoding() - BaseLoc.getRawEncoding();
-    const size_t TokEnd = TokBegin + Tok.getLength();
+    const size_t tokBegin =
+        token.getLocation().getRawEncoding() - baseLoc.getRawEncoding();
+    const size_t tokEnd = tokBegin + token.getLength();
 
-    switch (Tok.getKind()) {
+    switch (token.getKind()) {
     case tok::l_paren:
-      ++ParenDepth;
+      ++parenDepth;
       break;
     case tok::r_paren:
-      if (ParenDepth > 0)
-        --ParenDepth;
+      if (parenDepth > 0)
+        --parenDepth;
       break;
     case tok::l_square:
-      ++BracketDepth;
+      ++bracketDepth;
       break;
     case tok::r_square:
-      if (BracketDepth > 0)
-        --BracketDepth;
+      if (bracketDepth > 0)
+        --bracketDepth;
       break;
     case tok::l_brace:
-      ++BraceDepth;
+      ++braceDepth;
       break;
     case tok::r_brace:
-      if (BraceDepth > 0)
-        --BraceDepth;
+      if (braceDepth > 0)
+        --braceDepth;
       break;
     case tok::comma:
-      if (ParenDepth == 0 && BracketDepth == 0 && BraceDepth == 0) {
-        TupleElementSlice Elem;
-        if (!computeTrimmedTupleElement(Text, ElementBegin, TokBegin, Elem))
+      if (parenDepth == 0 && bracketDepth == 0 && braceDepth == 0) {
+        TupleElementSlice elem;
+        if (!computeTrimmedTupleElement(text, elementBegin, tokBegin, elem))
           return false;
-        Out.push_back(Elem);
-        ElementBegin = TokEnd;
+        out.push_back(elem);
+        elementBegin = tokEnd;
       }
       break;
     default:
@@ -3832,85 +3685,85 @@ static bool splitTopLevelTupleElementsWithLexer(
     }
   }
 
-  TupleElementSlice Elem;
-  if (!computeTrimmedTupleElement(Text, ElementBegin, Text.size(), Elem))
+  TupleElementSlice elem;
+  if (!computeTrimmedTupleElement(text, elementBegin, text.size(), elem))
     return false;
-  Out.push_back(Elem);
+  out.push_back(elem);
   return true;
 }
 
-static void lexBoundaryTokens(StringRef Text, const LangOptions &Lang,
-                              SmallVectorImpl<LexBoundaryToken> &Out) {
-  Out.clear();
-  if (Text.empty())
+static void lexBoundaryTokens(StringRef text, const LangOptions &lang,
+                              SmallVectorImpl<LexBoundaryToken> &out) {
+  out.clear();
+  if (text.empty())
     return;
 
-  const SourceLocation BaseLoc = SourceLocation::getFromRawEncoding(1);
-  std::string LexBuf = Text.str();
-  LexBuf.push_back('\0');
-  const char *BufStart = LexBuf.data();
-  const char *BufEnd = BufStart + Text.size();
-  Lexer Lex(BaseLoc, Lang, BufStart, BufStart, BufEnd);
-  Token Tok;
+  const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
+  std::string lexBuf = text.str();
+  lexBuf.push_back('\0');
+  const char *bufStart = lexBuf.data();
+  const char *bufEnd = bufStart + text.size();
+  Lexer lexer(baseLoc, lang, bufStart, bufStart, bufEnd);
+  Token token;
 
   while (true) {
-    Lex.LexFromRawLexer(Tok);
-    if (Tok.is(tok::eof))
+    lexer.LexFromRawLexer(token);
+    if (token.is(tok::eof))
       break;
-    if (Tok.is(tok::comment))
+    if (token.is(tok::comment))
       continue;
 
-    const unsigned Off =
-        Tok.getLocation().getRawEncoding() - BaseLoc.getRawEncoding();
-    Out.push_back({Tok.getKind(),
-                   std::string(Text.substr(Off, Tok.getLength())), Off,
-                   Off + Tok.getLength()});
+    const unsigned offset =
+        token.getLocation().getRawEncoding() - baseLoc.getRawEncoding();
+    out.push_back({token.getKind(),
+                   std::string(text.substr(offset, token.getLength())), offset,
+                   offset + token.getLength()});
   }
 }
 
-static std::optional<LexBoundaryToken> firstLexToken(StringRef Text,
-                                                    const LangOptions &Lang) {
-  SmallVector<LexBoundaryToken, 8> Toks;
-  lexBoundaryTokens(Text, Lang, Toks);
-  if (Toks.empty())
+static std::optional<LexBoundaryToken> firstLexToken(StringRef text,
+                                                    const LangOptions &lang) {
+  SmallVector<LexBoundaryToken, 8> toks;
+  lexBoundaryTokens(text, lang, toks);
+  if (toks.empty())
     return std::nullopt;
-  return Toks.front();
+  return toks.front();
 }
 
-static std::optional<LexBoundaryToken> lastLexToken(StringRef Text,
-                                                   const LangOptions &Lang) {
-  SmallVector<LexBoundaryToken, 16> Toks;
-  lexBoundaryTokens(Text, Lang, Toks);
-  if (Toks.empty())
+static std::optional<LexBoundaryToken> lastLexToken(StringRef text,
+                                                   const LangOptions &lang) {
+  SmallVector<LexBoundaryToken, 16> toks;
+  lexBoundaryTokens(text, lang, toks);
+  if (toks.empty())
     return std::nullopt;
-  return Toks.back();
+  return toks.back();
 }
 
-/// Return true iff placing Left and Right adjacent with no separating
+/// Return true iff placing `left` and `right` adjacent with no separating
 /// whitespace would change lexical tokenization compared to placing a space
 /// between them.
-static bool needsLexicalSeparator(const LexBoundaryToken &Left,
-                                  const LexBoundaryToken &Right,
-                                  const LangOptions &Lang) {
-  const std::string NoSpace = Left.Spelling + Right.Spelling;
-  const std::string WithSpace = Left.Spelling + " " + Right.Spelling;
+static bool needsLexicalSeparator(const LexBoundaryToken &left,
+                                  const LexBoundaryToken &right,
+                                  const LangOptions &lang) {
+  const std::string noSpace = left.Spelling + right.Spelling;
+  const std::string withSpace = left.Spelling + " " + right.Spelling;
 
-  SmallVector<LexBoundaryToken, 8> NoSpaceToks;
-  SmallVector<LexBoundaryToken, 8> WithSpaceToks;
-  lexBoundaryTokens(NoSpace, Lang, NoSpaceToks);
-  lexBoundaryTokens(WithSpace, Lang, WithSpaceToks);
+  SmallVector<LexBoundaryToken, 8> noSpaceToks;
+  SmallVector<LexBoundaryToken, 8> withSpaceToks;
+  lexBoundaryTokens(noSpace, lang, noSpaceToks);
+  lexBoundaryTokens(withSpace, lang, withSpaceToks);
 
-  if (NoSpaceToks.size() != WithSpaceToks.size())
+  if (noSpaceToks.size() != withSpaceToks.size())
     return true;
-  for (size_t I = 0; I < NoSpaceToks.size(); ++I) {
-    if (NoSpaceToks[I].Kind != WithSpaceToks[I].Kind ||
-        NoSpaceToks[I].Spelling != WithSpaceToks[I].Spelling)
+  for (size_t i = 0; i < noSpaceToks.size(); ++i) {
+    if (noSpaceToks[i].Kind != withSpaceToks[i].Kind ||
+        noSpaceToks[i].Spelling != withSpaceToks[i].Spelling)
       return true;
   }
   return false;
 }
 
-/// Return true iff \p Kind is separator punctuation that may legitimately
+/// Return true iff \p kind is separator punctuation that may legitimately
 /// replace a horizontal source gap between two tokens.
 ///
 /// This is intentionally narrower than "left-attachable punctuation": closing
@@ -3918,8 +3771,8 @@ static bool needsLexicalSeparator(const LexBoundaryToken &Left,
 /// they are not treated as gap replacements here. Callers must still prove with
 /// `needsLexicalSeparator()` that attaching the punctuation to the token on its
 /// left preserves lexical tokenization.
-static bool isSeparatorGapReplacementPunctuation(tok::TokenKind Kind) {
-  switch (Kind) {
+static bool isSeparatorGapReplacementPunctuation(tok::TokenKind kind) {
+  switch (kind) {
   case tok::comma:
   case tok::semi:
   case tok::colon:
@@ -4319,7 +4172,7 @@ bool RefoldEngine::IsInvocationInsideDefineDirective(
   if (vec.empty())
     return false;
 
-  // Binary-search for the last define extent whose begin offset is <= x.  This
+  // Binary-search for the last define extent whose begin offset is <= x. This
   // is the normal candidate in the non-overlapping case.
   size_t lo = 0;
   size_t hi = vec.size();
@@ -4546,7 +4399,7 @@ RefoldEngine::FindProvableTUInsertionAnchor(uint64_t pp, StringRef tuPath,
 
   auto includeDirectiveBoundaryAnchor = [&]() -> std::optional<uint64_t> {
     // Strict consumer-side proof for the narrow include-boundary case where a
-    // producer slot would normally be present.  A PP gap at the exact boundary
+    // producer slot would normally be present. A PP gap at the exact boundary
     // between two top-level include expansions denotes the TU source boundary
     // between the two include directive lines, but IncludeIdCoveringPPIndex(pp)
     // treats that same coordinate as being inside the right include's cover.
@@ -4574,13 +4427,13 @@ RefoldEngine::FindProvableTUInsertionAnchor(uint64_t pp, StringRef tuPath,
     if (!leftInc || !rightInc || leftInc->id == rightInc->id)
       return std::nullopt;
 
-    // Do not infer through nested include structure.  This helper is only for a
+    // Do not infer through nested include structure. This helper is only for a
     // TU insertion between two include directive lines spelled in tuPath.
     if (leftInc->parent || rightInc->parent)
       return std::nullopt;
 
     // If there are comments, blank lines, or any other bytes between the
-    // directives, strict mode still requires an exact producer slot.  Without
+    // directives, strict mode still requires an exact producer slot. Without
     // that slot there is no canonical byte inside the wider source gap.
     if (leftInc->siteE != rightInc->siteB)
       return std::nullopt;
@@ -4607,15 +4460,15 @@ RefoldEngine::FindProvableTUInsertionAnchor(uint64_t pp, StringRef tuPath,
             AcceptedPathKind::TUProvableInsertionAnchor,
             includeBoundaryWitness);
     trace("tu/anchor",
-          "provable TU insertion anchor: ppGap={0} -> include boundary byte={1} "
-          "leftInclude={2} rightInclude={3} candidate={4}",
+          "provable TU insertion anchor: ppGap={0} -> include boundary byte={1}"
+          " leftInclude={2} rightInclude={3} candidate={4}",
           pp, leftInc->siteE, leftInc->id, rightInc->id,
           FormatAcceptedResultCandidate(includeBoundaryCandidate));
     return leftInc->siteE;
   };
 
   // Try the exact include-directive-boundary proof before the generic include
-  // coverage wall.  The boundary coordinate is allowed to equal the first token
+  // coverage wall. The boundary coordinate is allowed to equal the first token
   // of the right include expansion even though that makes
   // IncludeIdCoveringPPIndex report the right include as covering pp.
   if (auto includeAnchor = includeDirectiveBoundaryAnchor())
@@ -5488,7 +5341,7 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
 
     // Check all STRINGIFY spans for this argument, but only in strict mode.
     if (argIsStringified) {
-      auto canonArg = CanonicalizeStringifyInversePayload(argTrim);
+      auto canonArg = stringutils::canonicalizeStringifyInversePayload(argTrim);
       if (!canonArg || StringRef(*canonArg).trim() != argTrim)
         return false;
 
@@ -6464,7 +6317,7 @@ bool RefoldEngine::PasteArgReplacementsMatchAllPasteTokensInB(
 
           formalSummaries.push_back(
               formatv("formal={0} deps={1}", formalIdx,
-                      FormatUInt32List(child->argDeps[formalIdx]))
+                      formatUInt32List(child->argDeps[formalIdx]))
                   .str());
         }
 
@@ -6565,18 +6418,18 @@ bool RefoldEngine::PasteArgReplacementsMatchAllPasteTokensInB(
     std::vector<RefoldModel::PPArgSpan> &spans = spansByTok[key];
 
     SmallVector<uint32_t, 8> carriedArgIdxs =
-        CollectSortedUInt32Keys(replByArgIdx);
+        collectSortedUInt32Keys(replByArgIdx);
     SmallVector<uint32_t, 8> directPasteArgIdxs =
-        CollectSortedUniquePasteArgIdxs(spans);
+        collectSortedUniquePasteArgIdxs(spans);
     SmallVector<uint32_t, 8> carriedButDirectMissingArgIdxs =
-        ComputeSortedMissingUInt32s(carriedArgIdxs, directPasteArgIdxs);
+        computeSortedMissingUInt32s(carriedArgIdxs, directPasteArgIdxs);
     trace("macro/paste",
           " paste support ledger: inv id={0} name={1} tokRange=[{2},{3}) "
           "carriedArgs={4} directPasteArgs={5} carriedButDirectMissing={6} "
           "nestedDelegationCandidates={7}",
-          m.id, m.name, beginTok, endTok, FormatUInt32List(carriedArgIdxs),
-          FormatUInt32List(directPasteArgIdxs),
-          FormatUInt32List(carriedButDirectMissingArgIdxs),
+          m.id, m.name, beginTok, endTok, formatUInt32List(carriedArgIdxs),
+          formatUInt32List(directPasteArgIdxs),
+          formatUInt32List(carriedButDirectMissingArgIdxs),
           formatNestedDelegationCandidates(carriedButDirectMissingArgIdxs,
                                            beginTok, endTok));
     for (const auto &ps : spans) {
@@ -7015,7 +6868,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
   // from exact occurrence boundaries and exact mapped B-envelope adjacency.
   const diffutils::Hunk tokenHunksCurrent[] = {hArgs};
 
-  if (!HasLiteralMacroCalleeOrigin(m)) {
+  if (!hasLiteralMacroCalleeOrigin(m)) {
     trace("macro/args",
           "args-only disabled: non-literal callee origin kind={0} inv id={1} "
           "name={2}",
@@ -7097,7 +6950,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
 
   auto tryTemplateSolvedArgsOnlyPatch = [&]() -> std::optional<MacroPatch> {
     // Treat the whole macro expansion as a deterministic template made of
-    // fixed body tokens and argument-occurrence variables.  This proves split
+    // fixed body tokens and argument-occurrence variables. This proves split
     // edits that the LCS exposes as separate islands around macro-body
     // punctuation, e.g. repeated formals and tuple forwarding wrappers.
     if (!m.stringifySpans.empty() || !m.pasteSpans.empty())
@@ -7165,8 +7018,8 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     });
 
     // Reject unless body/argument spans form an exact partition of the macro
-    // cover. Any gap would be unmodelled fixed syntax, so the template would not
-    // explain the whole expansion surface.
+    // cover. Any gap would be unmodelled fixed syntax, so the template would
+    // not explain the whole expansion surface.
     uint64_t cursor = cover->first;
     for (const auto &elem : elems) {
       if (elem.aBegin != cursor)
@@ -7181,8 +7034,8 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     if (!bEnv || bEnv->first >= bEnv->second)
       return std::nullopt;
 
-    // Keep this proof path bounded and deterministic.  Large covers stay on
-    // the existing conservative paths rather than using an expensive solver.
+    // Keep this proof path bounded and deterministic. Large covers stay on the
+    // existing conservative paths rather than using an expensive solver.
     if (elems.size() > 64 || (bEnv->second - bEnv->first) > 256 ||
         occurrenceCount > 32)
       return std::nullopt;
@@ -7254,7 +7107,8 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       for (const auto &cand : model_.GetMacroInvocations()) {
         if (!cand.callerMacroId || *cand.callerMacroId != m.id)
           continue;
-        if (!cand.normalizedInvText || cand.normalizedInvArgTextRanges.empty() ||
+        if (!cand.normalizedInvText ||
+            cand.normalizedInvArgTextRanges.empty() ||
             cand.argTupleRefs.empty() ||
             cand.normalizedInvArgTextRanges.size() != cand.argTupleRefs.size())
           continue;
@@ -7323,8 +7177,8 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       for (const auto &entry : occByArg) {
         const uint32_t argIdx = entry.first;
         auto argRange = invArgRanges[argIdx];
-        StringRef baseArgText =
-            baseInvText.substr(argRange.first, argRange.second - argRange.first);
+        StringRef baseArgText = baseInvText.substr(
+            argRange.first, argRange.second - argRange.first);
         StringRef baseTrim = baseArgText.trim();
 
         SmallVector<std::string, 8> oldOccs;
@@ -7808,10 +7662,10 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
   };
 
   // A provenance-only LCS can split one logical macro-argument rewrite into
-  // several pure-insertion islands around repeated punctuation.  When the
+  // several pure-insertion islands around repeated punctuation. When the
   // current seed is a pure insertion, widen the set of touched formals to every
   // occurrence in this same invocation cover that is independently touched by
-  // another token hunk.  This does not move hunk boundaries and does not inspect
+  // another token hunk. This does not move hunk boundaries and does not inspect
   // neighboring token spellings; it only lets the existing replay validator see
   // the complete split edit before deciding whether an args-only rewrite is
   // actually proven.
@@ -8181,13 +8035,9 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         StringRef rawArg =
             StringRef(*cand.invText).slice((size_t)relB, (size_t)relE);
         size_t trimLead = 0;
-        while (trimLead < rawArg.size() &&
-               std::isspace((unsigned char)rawArg[trimLead]))
-          ++trimLead;
         size_t trimEnd = rawArg.size();
-        while (trimEnd > trimLead &&
-               std::isspace((unsigned char)rawArg[trimEnd - 1]))
-          --trimEnd;
+        std::tie(trimLead, trimEnd) =
+            stringutils::trimWsRange(rawArg, 0, rawArg.size());
         if (trimLead == trimEnd)
           continue;
 
@@ -8497,7 +8347,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         if (!un)
           return std::nullopt;
 
-        auto canon = CanonicalizeStringifyInversePayload(*un);
+        auto canon = stringutils::canonicalizeStringifyInversePayload(*un);
         if (!canon || StringRef(*canon).trim() != StringRef(*un).trim()) {
           trace("macro/args",
                 "    stringify inverse ambiguous for argIdx={0} payload='{1}'",
@@ -8731,12 +8581,12 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       StringRef trimmedFinal(finalNewArg);
       trimmedFinal = trimmedFinal.trim();
 
-      // The replay check above validates the edited expansion surface.  For the
+      // The replay check above validates the edited expansion surface. For the
       // invocation spelling, however, a variadic formal does not own the fixed
-      // separator before it.  If deletion of the first tuple element left that
+      // separator before it. If deletion of the first tuple element left that
       // separator at the front of the reconstructed replacement, remove exactly
-      // one leading comma so the callsite spells the shortened tuple rather than
-      // an empty first variadic argument.
+      // one leading comma so the callsite spells the shortened tuple rather
+      // than an empty first variadic argument.
       if (!trimmedFinal.empty() && trimmedFinal.front() == ',') {
         trimmedFinal = trimmedFinal.drop_front();
         while (!trimmedFinal.empty() &&
@@ -8786,7 +8636,6 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
 #include "RefoldEngine.IncludeInsertion.inc"
 #include "RefoldEngine.CounterStabilization.inc"
 #include "RefoldEngine.ExpansionFallback.inc"
-
 
 std::optional<std::pair<uint64_t, uint64_t>>
 RefoldEngine::GetWholeCoverATokRange(
@@ -8915,11 +8764,10 @@ RefoldEngine::ComputeWholeCoverPlan(
     StringRef want = aToks_[static_cast<size_t>(plan.covHiA - 1)].spelling;
     if (!want.empty()) {
       // Do not contract a whole-cover replacement across a trailing B comment.
-      // Comments are source trivia, not macro-body delimiter tokens; clipping one
-      // out here splits an otherwise line-local insertion and forces a spurious
-      // #line resynchronization before the comment text.
-      const bool rightIsComment =
-          bToks_[plan.bTokEnd - 1].kind == "comment";
+      // Comments are source trivia, not macro-body delimiter tokens; clipping
+      // one out here splits an otherwise line-local insertion and forces a
+      // spurious #line resynchronization before the comment text.
+      const bool rightIsComment = bToks_[plan.bTokEnd - 1].kind == "comment";
       if (!rightIsComment && bToks_[plan.bTokEnd - 1].spelling != want &&
           plan.bTokEnd >= 2 && bToks_[plan.bTokEnd - 2].spelling == want) {
         plan.bTokEnd--;
@@ -10467,7 +10315,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   //   * If the inverse is ambiguous, unsupported, or does not match the
   //     observed text, lifting fails and we conservatively keep the subtree
   //     expanded.
-  if (m.subkind == "func" && HasLiteralMacroCalleeOrigin(m)) {
+  if (m.subkind == "func" && hasLiteralMacroCalleeOrigin(m)) {
     bool directRootPreservationInadmissible = false;
     auto tryDAGChainedArgsOnly = [&]() -> std::optional<MacroPatch> {
       // --- Phase 0: Preconditions / root invocation parsing ------------------
@@ -10566,7 +10414,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           [&](const RefoldModel::MacroInvocation &cand) -> bool {
         const RefoldModel::MacroInvocation *cur = &cand;
         for (;;) {
-          if (!HasLiteralMacroCalleeOrigin(*cur)) {
+          if (!hasLiteralMacroCalleeOrigin(*cur)) {
             if (cur->calleeOrigin.kind != MacroCalleeOriginKind::CallerParam ||
                 !cur->callerMacroId ||
                 cur->calleeOrigin.callerParamIndices.size() != 1)
@@ -10577,7 +10425,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               return false;
 
             const uint32_t slot = cur->calleeOrigin.callerParamIndices.front();
-            if (!IsWholeFormalCallerForwardSlot(*parentIt->second, slot))
+            if (!isWholeFormalCallerForwardSlot(*parentIt->second, slot))
               return false;
           }
 
@@ -11004,10 +10852,10 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                 formatTokHunk(partner), formatTokHunk(env), cand.cover.begin,
                 cand.cover.end, candCurWithinArgLike ? 1 : 0,
                 candEnvWithinArgLike ? 1 : 0, candEnvTrimWithinArgLike ? 1 : 0,
-                candCurWithinBody ? 1 : 0, FormatUInt32List(curBodyTouched),
-                candEnvWithinBody ? 1 : 0, FormatUInt32List(envBodyTouched),
+                candCurWithinBody ? 1 : 0, formatUInt32List(curBodyTouched),
+                candEnvWithinBody ? 1 : 0, formatUInt32List(envBodyTouched),
                 candEnvTrimWithinBody ? 1 : 0,
-                FormatUInt32List(envTrimBodyTouched),
+                formatUInt32List(envTrimBodyTouched),
                 static_cast<uint64_t>(candArgLikeProbe.size()),
                 static_cast<uint64_t>(cand.argRefs.size()),
                 cand.invText ? StringRef(*cand.invText).trim()
@@ -11275,13 +11123,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             StringRef(*inv.invText).slice((size_t)relB, (size_t)relE);
 
         size_t trimLead = 0;
-        while (trimLead < rawArg.size() &&
-               std::isspace((unsigned char)rawArg[trimLead]))
-          ++trimLead;
         size_t trimEnd = rawArg.size();
-        while (trimEnd > trimLead &&
-               std::isspace((unsigned char)rawArg[trimEnd - 1]))
-          --trimEnd;
+        std::tie(trimLead, trimEnd) =
+            stringutils::trimWsRange(rawArg, 0, rawArg.size());
 
         ArgRefTemplate out;
         out.argText = rawArg.slice(trimLead, trimEnd).str();
@@ -11512,15 +11356,12 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         if (relE < relB || relE > inv.invText->size())
           return std::nullopt;
 
-        StringRef raw = StringRef(*inv.invText).slice((size_t)relB, (size_t)relE);
+        StringRef raw =
+            StringRef(*inv.invText).slice((size_t)relB, (size_t)relE);
         size_t trimLead = 0;
-        while (trimLead < raw.size() &&
-               std::isspace((unsigned char)raw[trimLead]))
-          ++trimLead;
         size_t trimEnd = raw.size();
-        while (trimEnd > trimLead &&
-               std::isspace((unsigned char)raw[trimEnd - 1]))
-          --trimEnd;
+        std::tie(trimLead, trimEnd) =
+            stringutils::trimWsRange(raw, 0, raw.size());
 
         TrimmedArgInfo out;
         out.text = raw.slice(trimLead, trimEnd).str();
@@ -11649,11 +11490,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                                                   size_t pos) -> bool {
         if (pos == 0 || pos >= s.size())
           return true;
-        auto isIdentBody = [](char c) {
-          unsigned char uc = static_cast<unsigned char>(c);
-          return std::isalnum(uc) || c == '_';
-        };
-        return !(isIdentBody(s[pos - 1]) && isIdentBody(s[pos]));
+        return !(stringutils::isIdentPart(s[pos - 1]) &&
+                 stringutils::isIdentPart(s[pos]));
       };
 
       auto enumerateTopLevelBalancedCutPoints =
@@ -11711,8 +11549,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             } else if (c == '\'') {
               inChr = true;
             } else {
-            // The normal case: split the rewritten core around the original
-            // literal delimiters and require a unique segmentation.
+              // The normal case: split the rewritten core around the original
+              // literal delimiters and require a unique segmentation.
               switch (c) {
               case '(':
                 ++paren;
@@ -11939,7 +11777,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
             if (kind == WrapperChainKind::StringLiteral ||
                 kind == WrapperChainKind::WideStringLiteral) {
-              auto canon = CanonicalizeStringifyInversePayload(logical);
+              auto canon =
+                  stringutils::canonicalizeStringifyInversePayload(logical);
               if (!canon ||
                   StringRef(*canon).trim() != StringRef(logical).trim())
                 return;
@@ -12340,8 +12179,10 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           if (!decoded)
             return false;
 
-          auto canonDecoded = CanonicalizeStringifyInversePayload(*decoded);
-          auto canonExpected = CanonicalizeStringifyInversePayload(expected0);
+          auto canonDecoded =
+              stringutils::canonicalizeStringifyInversePayload(*decoded);
+          auto canonExpected =
+              stringutils::canonicalizeStringifyInversePayload(expected0);
           if (!canonDecoded || !canonExpected)
             return false;
 
@@ -12913,7 +12754,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           cert.canonicalLogicalInputs.push_back(normalized);
         };
 
-        cert.touchesPaste = InvocationArgTouchesPaste(inv, argIdx);
+        cert.touchesPaste = invocationArgTouchesPaste(inv, argIdx);
 
         for (const auto &slotCert : argCert.slotCertificates) {
           switch (slotCert.decision.kind) {
@@ -12941,18 +12782,17 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             cert.usesStringify = true;
             if (slotCert.wrapperKind == WrapperChainKind::WideStringLiteral)
               cert.usesWideStringify = true;
-            auto canon =
-                CanonicalizeStringifyInversePayload(slotCert.logicalInputText);
+            auto canon = stringutils::canonicalizeStringifyInversePayload(
+                slotCert.logicalInputText);
             if (!canon || StringRef(*canon).trim() !=
                               StringRef(slotCert.logicalInputText).trim()) {
               cert.valid = false;
               cert.failure =
                   SemanticInteractionFailure::NonCanonicalLogicalInput;
-              cert.detail = formatv(
-                                "{0}: inv id={1} name={2} argIdx={3} "
-                                "interaction canonical logical payload "
-                                "failed",
-                                traceStage, inv.id, inv.name, argIdx)
+              cert.detail = formatv("{0}: inv id={1} name={2} argIdx={3} "
+                                    "interaction canonical logical payload "
+                                    "failed",
+                                    traceStage, inv.id, inv.name, argIdx)
                                 .str();
               return cert;
             }
@@ -12993,8 +12833,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           cert.kind = SemanticInteractionKind::Mixed;
 
         cert.detail = formatv(
-                          "semantic interaction: inv id={0} name={1} argIdx={2} "
-                          "kind={3} slots={4} logicalInputs={5} paste={6} "
+                          "semantic interaction: inv id={0} name={1} argIdx={2}"
+                          " kind={3} slots={4} logicalInputs={5} paste={6} "
                           "rawChildInput={7}",
                           inv.id, inv.name, argIdx,
                           static_cast<unsigned>(cert.kind),
@@ -13166,8 +13006,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           cert.kind = FormalRewriteCertificateKind::NoChange;
           cert.detail = formatv(
                             "{0}: inv id={1} name={2} argIdx={3} certified "
-                            "rewrite collapsed to no-change old='{4}' new='{5}' "
-                            "argRewriteCerts={6} interactionCerts={7}",
+                            "rewrite collapsed to no-change old='{4}' new='{5}'"
+                            " argRewriteCerts={6} interactionCerts={7}",
                             traceStage, inv.id, inv.name, argIdx, oldTrim,
                             mergedTrim,
                             cert.argRewriteCertificates.size(),
@@ -13254,147 +13094,26 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         return out;
       };
 
-      auto toSingleCharRefs = [&](StringRef s) {
-        std::vector<StringRef> refs;
-        refs.reserve(s.size());
-        for (size_t i = 0; i < s.size(); ++i)
-          refs.push_back(s.substr(i, 1));
-        return refs;
-      };
-
-      struct FormalRewriteHunk {
-        uint64_t oldBegin;
-        uint64_t oldEnd;
-        std::string repl;
-      };
-
       mergeCompatibleFormalRewrites =
           [&](StringRef baseOld0, ArrayRef<FormalTextPair> rewrites)
           -> std::optional<std::string> {
         const StringRef baseOld = baseOld0.trim();
-        std::vector<FormalRewriteHunk> merged;
+        std::vector<std::string> replacementStorage;
+        replacementStorage.reserve(rewrites.size());
 
         for (const auto &rewrite : rewrites) {
           if (StringRef(rewrite.oldText).trim() != baseOld)
             return std::nullopt;
-
-          const StringRef newText = StringRef(rewrite.newText).trim();
-          if (newText == baseOld)
-            continue;
-
-          std::vector<StringRef> aRefs = toSingleCharRefs(baseOld);
-          std::vector<StringRef> bRefs = toSingleCharRefs(newText);
-          auto steps = diffutils::diff(aRefs, bRefs);
-          auto hunks = diffutils::coalesce(steps);
-
-          for (const auto &hunk : hunks) {
-            FormalRewriteHunk piece{hunk.aStart, hunk.aEnd,
-                                    newText.slice((size_t)hunk.bStart,
-                                                  (size_t)hunk.bEnd)
-                                        .str()};
-
-            auto sameHunk = [&](const FormalRewriteHunk &a,
-                                const FormalRewriteHunk &b) {
-              return a.oldBegin == b.oldBegin && a.oldEnd == b.oldEnd &&
-                     a.repl == b.repl;
-            };
-
-            auto overlaps = [&](const FormalRewriteHunk &a,
-                                const FormalRewriteHunk &b) {
-              return a.oldBegin < b.oldEnd && b.oldBegin < a.oldEnd;
-            };
-
-            auto it = std::lower_bound(
-                merged.begin(), merged.end(), piece.oldBegin,
-                [](const FormalRewriteHunk &h, uint64_t pos) {
-                  return h.oldBegin < pos;
-                });
-
-            if (it != merged.begin()) {
-              const auto &prev = *std::prev(it);
-              if (sameHunk(prev, piece))
-                continue;
-              if (overlaps(prev, piece))
-                return std::nullopt;
-            }
-            if (it != merged.end()) {
-              if (sameHunk(*it, piece))
-                continue;
-              if (overlaps(*it, piece))
-                return std::nullopt;
-            }
-
-            merged.insert(it, std::move(piece));
-          }
+          replacementStorage.push_back(
+              StringRef(rewrite.newText).trim().str());
         }
 
-        std::string out = baseOld.str();
-        for (auto it = merged.rbegin(); it != merged.rend(); ++it)
-          out.replace((size_t)it->oldBegin,
-                      (size_t)(it->oldEnd - it->oldBegin), it->repl);
-        return out;
-      };
+        SmallVector<StringRef, 8> replacementRefs;
+        replacementRefs.reserve(replacementStorage.size());
+        for (const std::string &replacement : replacementStorage)
+          replacementRefs.push_back(StringRef(replacement));
 
-      auto mergeCompatibleCallsitePatchReplacements =
-          [&](StringRef baseOld, ArrayRef<StringRef> replacements)
-          -> std::optional<std::string> {
-        std::vector<FormalRewriteHunk> merged;
-
-        for (StringRef replText : replacements) {
-          if (replText == baseOld)
-            continue;
-
-          std::vector<StringRef> aRefs = toSingleCharRefs(baseOld);
-          std::vector<StringRef> bRefs = toSingleCharRefs(replText);
-          auto steps = diffutils::diff(aRefs, bRefs);
-          auto hunks = diffutils::coalesce(steps);
-
-          for (const auto &hunk : hunks) {
-            FormalRewriteHunk piece{hunk.aStart, hunk.aEnd,
-                                    replText.slice((size_t)hunk.bStart,
-                                                   (size_t)hunk.bEnd)
-                                        .str()};
-
-            auto sameHunk = [&](const FormalRewriteHunk &a,
-                                const FormalRewriteHunk &b) {
-              return a.oldBegin == b.oldBegin && a.oldEnd == b.oldEnd &&
-                     a.repl == b.repl;
-            };
-
-            auto overlaps = [&](const FormalRewriteHunk &a,
-                                const FormalRewriteHunk &b) {
-              return a.oldBegin < b.oldEnd && b.oldBegin < a.oldEnd;
-            };
-
-            auto it = std::lower_bound(
-                merged.begin(), merged.end(), piece.oldBegin,
-                [](const FormalRewriteHunk &h, uint64_t pos) {
-                  return h.oldBegin < pos;
-                });
-
-            if (it != merged.begin()) {
-              const auto &prev = *std::prev(it);
-              if (sameHunk(prev, piece))
-                continue;
-              if (overlaps(prev, piece))
-                return std::nullopt;
-            }
-            if (it != merged.end()) {
-              if (sameHunk(*it, piece))
-                continue;
-              if (overlaps(*it, piece))
-                return std::nullopt;
-            }
-
-            merged.insert(it, std::move(piece));
-          }
-        }
-
-        std::string out = baseOld.str();
-        for (auto it = merged.rbegin(); it != merged.rend(); ++it)
-          out.replace((size_t)it->oldBegin,
-                      (size_t)(it->oldEnd - it->oldBegin), it->repl);
-        return out;
+        return mergeCompatibleStringReplacements(baseOld, replacementRefs);
       };
 
       enum class InvocationRewriteCertificateKind {
@@ -13483,7 +13202,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
           cert.replacementByArgIdx[argIdx] = newText.str();
           if (!cert.touchesPaste)
-            cert.touchesPaste = InvocationArgTouchesPaste(inv, argIdx);
+            cert.touchesPaste = invocationArgTouchesPaste(inv, argIdx);
 
           if (oldText == newText)
             continue;
@@ -13493,27 +13212,27 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         }
 
         auto providedArgIdxs = argOrder;
-        auto carriedArgIdxs = CollectSortedUInt32Keys(cert.replacementByArgIdx);
+        auto carriedArgIdxs = collectSortedUInt32Keys(cert.replacementByArgIdx);
         SmallVector<uint32_t, 8> changedArgIdxs;
         changedArgIdxs.reserve(cert.rewrites.size());
         for (const auto &rewrite : cert.rewrites)
           changedArgIdxs.push_back(rewrite.argIdx);
         llvm::sort(changedArgIdxs);
         auto requiredPasteArgIdxs =
-            CollectSortedUniquePasteArgIdxs(inv.pasteSpans);
+            collectSortedUniquePasteArgIdxs(inv.pasteSpans);
         auto missingSupportArgIdxs =
-            ComputeSortedMissingUInt32s(requiredPasteArgIdxs, carriedArgIdxs);
+            computeSortedMissingUInt32s(requiredPasteArgIdxs, carriedArgIdxs);
 
         trace("macro/proof",
               "{0}: invocation support ledger enter inv id={1} name={2} "
               "provided={3} changed={4} carried={5} requiredPaste={6} "
               "missingSupport={7} deferredArgs={8}",
-              traceStage, inv.id, inv.name, FormatUInt32List(providedArgIdxs),
-              FormatUInt32List(changedArgIdxs),
-              FormatUInt32List(carriedArgIdxs),
-              FormatUInt32List(requiredPasteArgIdxs),
-              FormatUInt32List(missingSupportArgIdxs),
-              FormatUInt32List(deferOccurrenceArgIdxs));
+              traceStage, inv.id, inv.name, formatUInt32List(providedArgIdxs),
+              formatUInt32List(changedArgIdxs),
+              formatUInt32List(carriedArgIdxs),
+              formatUInt32List(requiredPasteArgIdxs),
+              formatUInt32List(missingSupportArgIdxs),
+              formatUInt32List(deferOccurrenceArgIdxs));
 
         if (cert.rewrites.empty()) {
           cert.kind = InvocationRewriteCertificateKind::NoChange;
@@ -13522,10 +13241,10 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                 "name={2} provided={3} carried={4} requiredPaste={5} "
                 "missingSupport={6}",
                 traceStage, inv.id, inv.name,
-                FormatUInt32List(providedArgIdxs),
-                FormatUInt32List(carriedArgIdxs),
-                FormatUInt32List(requiredPasteArgIdxs),
-                FormatUInt32List(missingSupportArgIdxs));
+                formatUInt32List(providedArgIdxs),
+                formatUInt32List(carriedArgIdxs),
+                formatUInt32List(requiredPasteArgIdxs),
+                formatUInt32List(missingSupportArgIdxs));
           return cert;
         }
 
@@ -13538,11 +13257,11 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               "provided={3} changed={4} carried={5} requiredPaste={6} "
               "missingSupport={7} pasteRequired={8} pasteValid={9} "
               "pasteDeferred={10}",
-              traceStage, inv.id, inv.name, FormatUInt32List(providedArgIdxs),
-              FormatUInt32List(changedArgIdxs),
-              FormatUInt32List(carriedArgIdxs),
-              FormatUInt32List(requiredPasteArgIdxs),
-              FormatUInt32List(missingSupportArgIdxs),
+              traceStage, inv.id, inv.name, formatUInt32List(providedArgIdxs),
+              formatUInt32List(changedArgIdxs),
+              formatUInt32List(carriedArgIdxs),
+              formatUInt32List(requiredPasteArgIdxs),
+              formatUInt32List(missingSupportArgIdxs),
               cert.pasteValidation.required ? 1 : 0,
               cert.pasteValidation.valid ? 1 : 0,
               cert.pasteValidation.deferred ? 1 : 0);
@@ -13824,7 +13543,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                           "nested child matches parent child id={1} name={2} "
                           "argIdx={3} matches={4}",
                           traceStage, cur.id, cur.name, curFormal,
-                          FormatUInt32List(nestedMatches)),
+                          formatUInt32List(nestedMatches)),
                     std::nullopt);
           nested = cand;
         }
@@ -13877,7 +13596,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         if (group.size() < 2)
           return std::nullopt;
 
-        llvm::sort(group, PasteSpanPtrLessByByteRange);
+        llvm::sort(group, pasteSpanPtrLessByByteRange);
 
         StringRef oldTok = curOld.trim();
         StringRef newTok = curNew.trim();
@@ -14152,17 +13871,17 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             os << "<none>";
           os << "' invArgRange=";
           if (curFormal < cur.invArgRanges.size())
-            os << FormatInvocationArgRange(cur.invArgRanges[curFormal]);
+            os << formatInvocationArgRange(cur.invArgRanges[curFormal]);
           else
             os << "<missing>";
           os << " argDeps=";
           if (curFormal < cur.argDeps.size())
-            os << FormatUInt32List(cur.argDeps[curFormal]);
+            os << formatUInt32List(cur.argDeps[curFormal]);
           else
             os << "<missing>";
           os << " argRefs=";
           if (curFormal < cur.argRefs.size())
-            os << FormatInvArgRefList(cur.argRefs[curFormal]);
+            os << formatInvArgRefList(cur.argRefs[curFormal]);
           else
             os << "<missing>";
           return os.str();
@@ -14851,7 +14570,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           if (group.size() < 2)
             return std::nullopt;
 
-          llvm::sort(group, PasteSpanPtrLessByByteRange);
+          llvm::sort(group, pasteSpanPtrLessByByteRange);
 
           auto rebasedGroup = tryRebasePasteGroupToObservedSurface(
               &surfaceOwner, ArrayRef<const RefoldModel::PPArgSpan *>(group),
@@ -15317,17 +15036,17 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               formatObservedConstraintsMap(parentObserved),
               cert.rewrittenChildSyntax);
 
-        auto observedParentArgIdxs = CollectSortedUInt32Keys(parentObserved);
+        auto observedParentArgIdxs = collectSortedUInt32Keys(parentObserved);
         auto requiredParentPasteArgIdxs =
-            CollectSortedUniquePasteArgIdxs(parent->pasteSpans);
+            collectSortedUniquePasteArgIdxs(parent->pasteSpans);
         trace("macro/proof",
               "DAG per-hop proof ledger observed: child id={0} name={1} "
               "parent id={2} name={3} observedParentArgs={4} "
               "requiredParentPasteArgs={5} unresolvedChildFormals={6}",
               cur.id, cur.name, parent->id, parent->name,
-              FormatUInt32List(observedParentArgIdxs),
-              FormatUInt32List(requiredParentPasteArgIdxs),
-              FormatUInt32List(unresolvedChildFormals));
+              formatUInt32List(observedParentArgIdxs),
+              formatUInt32List(requiredParentPasteArgIdxs),
+              formatUInt32List(unresolvedChildFormals));
 
         DenseMap<uint32_t, FormalTextPair> parentFormals;
         for (const auto &KV : parentObserved) {
@@ -15392,8 +15111,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               FormalTextPair{formalCert.oldText, formalCert.newText};
         }
 
-        auto carriedParentArgIdxs = CollectSortedUInt32Keys(parentFormals);
-        auto missingParentSupportArgIdxs = ComputeSortedMissingUInt32s(
+        auto carriedParentArgIdxs = collectSortedUInt32Keys(parentFormals);
+        auto missingParentSupportArgIdxs = computeSortedMissingUInt32s(
             requiredParentPasteArgIdxs, carriedParentArgIdxs);
         trace("macro/proof",
               "DAG per-hop proof ledger carried: child id={0} name={1} "
@@ -15402,11 +15121,11 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               "requiredParentPasteArgs={6} missingSupport={7} "
               "unresolvedChildFormals={8}",
               cur.id, cur.name, parent->id, parent->name,
-              FormatUInt32List(observedParentArgIdxs),
-              FormatUInt32List(carriedParentArgIdxs),
-              FormatUInt32List(requiredParentPasteArgIdxs),
-              FormatUInt32List(missingParentSupportArgIdxs),
-              FormatUInt32List(unresolvedChildFormals));
+              formatUInt32List(observedParentArgIdxs),
+              formatUInt32List(carriedParentArgIdxs),
+              formatUInt32List(requiredParentPasteArgIdxs),
+              formatUInt32List(missingParentSupportArgIdxs),
+              formatUInt32List(unresolvedChildFormals));
 
         auto unresolvedDerivationsDischargedByBodySpace = [&]() {
           if (unresolvedChildFormals.empty())
@@ -15440,7 +15159,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                 "id={0} name={1} parent id={2} name={3} unresolved={4} "
                 "parentFormals={5} reason={6}",
                 cur.id, cur.name, parent->id, parent->name,
-                FormatUInt32List(unresolvedChildFormals),
+                formatUInt32List(unresolvedChildFormals),
                 formatFormalTextPairs(parentFormals), cert.detail);
           cert.kind = StructuredLiftCertificateKind::NeedsLexicalBridge;
           cert.nextInv = parent;
@@ -15453,7 +15172,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                 "semantics: child id={0} name={1} parent id={2} name={3} "
                 "unresolved={4} parentFormals={5}",
                 cur.id, cur.name, parent->id, parent->name,
-                FormatUInt32List(unresolvedChildFormals),
+                formatUInt32List(unresolvedChildFormals),
                 formatFormalTextPairs(parentFormals));
         }
 
@@ -15660,7 +15379,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                           "DAG lift chain: leaf id={0} name={1} leafArgs={2} "
                           "steps={3} lexicalBridge={4} rootFormals={5}",
                           leaf.id, leaf.name,
-                          FormatUInt32List(cert.leafArgIdxs), cert.steps.size(),
+                          formatUInt32List(cert.leafArgIdxs), cert.steps.size(),
                           cert.usedLexicalBridge ? 1 : 0,
                           cert.rootFormals.size())
                           .str();
@@ -16276,7 +15995,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                   "usedLexicalBridge={3} detail={4}",
                   lift.leaf ? lift.leaf->id : 0,
                   lift.leaf ? lift.leaf->name : StringRef("<none>"),
-                  FormatUInt32List(lift.leafArgIdxs),
+                  formatUInt32List(lift.leafArgIdxs),
                   lift.usedLexicalBridge ? 1 : 0, lift.detail);
           }
           for (const auto &step : semantic.structuredLiftCertificates) {
@@ -16668,7 +16387,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                                         "name={1} leaf id={2} name={3} "
                                         "groupArgs={4}",
                                         m.id, m.name, leaf.id, leaf.name,
-                                        FormatUInt32List(liftCert.leafArgIdxs))
+                                        formatUInt32List(liftCert.leafArgIdxs))
                                     .str();
             return cert;
           }
@@ -16791,8 +16510,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                 "rootPasteRequired={9} "
                 "rootPasteDeferred={10}",
                 m.id, m.name, leaf.id, leaf.name,
-                FormatUInt32List(rootFormalArgIdxs),
-                FormatUInt32List(cert.deferRootOccurrenceArgIdxs),
+                formatUInt32List(rootFormalArgIdxs),
+                formatUInt32List(cert.deferRootOccurrenceArgIdxs),
                 cert.liftCertificates.size(),
                 cert.leafCert.pasteValidation.required ? 1 : 0,
                 cert.leafCert.pasteValidation.deferred ? 1 : 0,
@@ -17399,7 +17118,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                 traceStage, m.id, m.name,
                 formatFormalTextPairMap(*replayRootFormals),
                 formatFormalTextPairMap(*expectedRootFormals),
-                FormatUInt32List(replayAugmentedSupportOnlyArgIdxs));
+                formatUInt32List(replayAugmentedSupportOnlyArgIdxs));
 
           auto newRangesOpt =
               GetMacroInvocationFormalArgContentRanges(m, newText);
@@ -17481,11 +17200,11 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                 "supportOnlyMissingArgs={5} mismatchedExpectedArgs={6} "
                 "unexpectedReplayArgs={7}",
                 traceStage, m.id, m.name,
-                FormatUInt32List(missingExpectedArgIdxs),
-                FormatUInt32List(unchangedConcreteMissingArgIdxs),
-                FormatUInt32List(supportOnlyMissingArgIdxs),
-                FormatUInt32List(mismatchedExpectedArgIdxs),
-                FormatUInt32List(unexpectedReplayArgIdxs));
+                formatUInt32List(missingExpectedArgIdxs),
+                formatUInt32List(unchangedConcreteMissingArgIdxs),
+                formatUInt32List(supportOnlyMissingArgIdxs),
+                formatUInt32List(mismatchedExpectedArgIdxs),
+                formatUInt32List(unexpectedReplayArgIdxs));
 
           if (replayRootFormals->size() != expectedRootFormals->size()) {
             cert.detail = formatv(
@@ -17585,8 +17304,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               "{0}: DAG candidate proof ledger enter root id={1} name={2} "
               "expectedRootArgs={3} deferredArgs={4} bridgeSensitive={5} "
               "mixed={6}",
-              traceStage, m.id, m.name, FormatUInt32List(expectedRootArgIdxs),
-              FormatUInt32List(deferredArgs),
+              traceStage, m.id, m.name, formatUInt32List(expectedRootArgIdxs),
+              formatUInt32List(deferredArgs),
               validation.hasBridgeSensitiveStructuredSemantics ? 1 : 0,
               validation.hasMixedSemanticInteractions ? 1 : 0);
         if (validation.hasMixedSemanticInteractions) {
@@ -17628,7 +17347,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             "{0}: DAG candidate proof ledger replay root id={1} name={2} "
             "replayRootArgs={3} replayPasteRequired={4} replayPasteValid={5} "
             "replayPasteDeferred={6}",
-            traceStage, m.id, m.name, FormatUInt32List(replayRootArgIdxs),
+            traceStage, m.id, m.name, formatUInt32List(replayRootArgIdxs),
             proofCert.replayInvocationCertificate.pasteValidation.required ? 1
                                                                            : 0,
             proofCert.replayInvocationCertificate.pasteValidation.valid ? 1 : 0,
@@ -17783,7 +17502,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                 "mergedBridgeFormals={5}",
                 m.id, m.name, traceStage,
                 formatFormalTextPairMap(mergedValidation->expectedRootFormals),
-                FormatUInt32List(mergedValidation->deferOccurrenceArgIdxs),
+                formatUInt32List(mergedValidation->deferOccurrenceArgIdxs),
                 formatBridgeSensitiveFormalSignatureMap(
                     mergedValidation->bridgeSensitiveFormalSignatures));
           }
@@ -17880,7 +17599,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         SmallVector<StringRef, 2> repls;
         repls.push_back(StringRef(uniquePatch->replacement));
         repls.push_back(StringRef(candPatch.replacement));
-        auto merged = mergeCompatibleCallsitePatchReplacements(
+        auto merged = mergeCompatibleStringReplacements(
             *uniquePatchBaseText, ArrayRef<StringRef>(repls));
         if (!merged) {
           cert.failure = DagCandidateAcceptanceFailure::MergeConflict;
@@ -17921,7 +17640,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                 "mergedBridgeFormals={5}",
                 m.id, m.name, traceStage,
                 formatFormalTextPairMap(mergedValidation->expectedRootFormals),
-                FormatUInt32List(mergedValidation->deferOccurrenceArgIdxs),
+                formatUInt32List(mergedValidation->deferOccurrenceArgIdxs),
                 formatBridgeSensitiveFormalSignatureMap(
                     mergedValidation->bridgeSensitiveFormalSignatures));
         }
@@ -18107,7 +17826,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           if (group.size() < 2)
             continue;
 
-          llvm::sort(group, PasteSpanPtrLessByByteRange);
+          llvm::sort(group, pasteSpanPtrLessByByteRange);
 
           bool groupOk = true;
           for (const RefoldModel::PPArgSpan *sp : group) {
@@ -18472,10 +18191,10 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
         const bool leafTouchesPaste =
             !leaf.pasteSpans.empty() &&
-            AnyInvocationArgTouchesPaste(leaf, leafEditArgIdxs);
+            anyInvocationArgTouchesPaste(leaf, leafEditArgIdxs);
         const bool allTouchedPasteArgsFromObservedLeafSeed =
             leafTouchesPaste &&
-            AllTouchedPasteArgsAreContained(leaf, leafEditArgIdxs,
+            allTouchedPasteArgsAreContained(leaf, leafEditArgIdxs,
                                            observedLeafSeedArgIdxs);
 
         // Paste-aware leaf certificate: when multiple leaf-formal rewrites
@@ -18551,7 +18270,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             // phase: consume any trailing "(...)" groups after the root
             // invocation.
             const uint64_t chainEnd =
-                extendChainedCallEnd(fileText, *invEnd, "((x)+1)");
+                stringutils::extendChainedCallEnd(fileText, *invEnd, "((x)+1)");
             if (chainEnd > *invEnd && chainEnd <= (uint64_t)fileText.size()) {
               struct LocalEdit {
                 uint64_t begin; // relative to invStart
@@ -18799,7 +18518,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         rootPatchCert.patch->subtreeExpectedRootFormalSummary =
             formatFormalTextPairMap(subtreeValidation.expectedRootFormals);
         rootPatchCert.patch->subtreeDeferredRootArgSummary =
-            FormatUInt32List(subtreeValidation.deferOccurrenceArgIdxs);
+            formatUInt32List(subtreeValidation.deferOccurrenceArgIdxs);
         rootPatchCert.patch->subtreeBridgeSensitiveFormalSummary =
             formatBridgeSensitiveFormalSignatureMap(
                 subtreeValidation.bridgeSensitiveFormalSignatures);
@@ -18849,7 +18568,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     // (e.g. currying-style chains like GET_MATH(ADD)(10)(20)), patch those
     // bytes directly. This preserves the call chain and avoids whole-cover
     // expansion.
-    if (HasLiteralMacroCalleeOrigin(m) && m.invFile && m.invB && m.invE) {
+    if (hasLiteralMacroCalleeOrigin(m) && m.invFile && m.invB && m.invE) {
       std::string invAbs = lineDirs_.ToAbsolutePath(*m.invFile);
       auto bufOrErr = MemoryBuffer::getFile(invAbs);
       if (bufOrErr) {
@@ -18859,7 +18578,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         const uint64_t invEndAbs = *m.invE;
         if (invEndAbs <= n) {
           const uint64_t chainEndAbs =
-              extendChainedCallEnd(invFileText, invEndAbs, StringRef());
+              stringutils::extendChainedCallEnd(invFileText, invEndAbs,
+                                          StringRef());
           if (chainEndAbs > invEndAbs) {
             const uint64_t aLen = h.aEnd - h.aStart;
             const uint64_t bLen = h.bEnd - h.bStart;
@@ -18952,79 +18672,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     // available: the DAG path has already proved a structure-preserving nested
     // inverse, while the direct root patch only proves expansion equality at
     // this callsite.
-    auto mergeCompatibleRootCallsiteReplacements =
-        [&](StringRef baseOld, ArrayRef<StringRef> replacements)
-        -> std::optional<std::string> {
-      struct RootCallsiteRewriteHunk {
-        uint64_t oldBegin;
-        uint64_t oldEnd;
-        std::string repl;
-      };
-
-      auto toSingleCharRefsLocal = [&](StringRef S) {
-        std::vector<StringRef> refs;
-        refs.reserve(S.size());
-        for (size_t i = 0; i < S.size(); ++i)
-          refs.push_back(S.slice(i, i + 1));
-        return refs;
-      };
-
-      std::vector<RootCallsiteRewriteHunk> merged;
-      for (StringRef replText : replacements) {
-        if (replText == baseOld)
-          continue;
-
-        std::vector<StringRef> aRefs = toSingleCharRefsLocal(baseOld);
-        std::vector<StringRef> bRefs = toSingleCharRefsLocal(replText);
-        auto steps = diffutils::diff(aRefs, bRefs);
-        auto hunks = diffutils::coalesce(steps);
-
-        for (const auto &hunk : hunks) {
-          RootCallsiteRewriteHunk piece{
-              hunk.aStart, hunk.aEnd,
-              replText.slice((size_t)hunk.bStart, (size_t)hunk.bEnd).str()};
-
-          auto sameHunk = [&](const RootCallsiteRewriteHunk &a,
-                              const RootCallsiteRewriteHunk &b) {
-            return a.oldBegin == b.oldBegin && a.oldEnd == b.oldEnd &&
-                   a.repl == b.repl;
-          };
-
-          auto overlaps = [&](const RootCallsiteRewriteHunk &a,
-                              const RootCallsiteRewriteHunk &b) {
-            return a.oldBegin < b.oldEnd && b.oldBegin < a.oldEnd;
-          };
-
-          auto it = std::lower_bound(
-              merged.begin(), merged.end(), piece.oldBegin,
-              [](const RootCallsiteRewriteHunk &h, uint64_t pos) {
-                return h.oldBegin < pos;
-              });
-
-          if (it != merged.begin()) {
-            const auto &prev = *std::prev(it);
-            if (sameHunk(prev, piece))
-              continue;
-            if (overlaps(prev, piece))
-              return std::nullopt;
-          }
-          if (it != merged.end()) {
-            if (sameHunk(*it, piece))
-              continue;
-            if (overlaps(*it, piece))
-              return std::nullopt;
-          }
-
-          merged.insert(it, std::move(piece));
-        }
-      }
-
-      std::string out = baseOld.str();
-      for (auto it = merged.rbegin(); it != merged.rend(); ++it)
-        out.replace((size_t)it->oldBegin,
-                    (size_t)(it->oldEnd - it->oldBegin), it->repl);
-      return out;
-    };
 
     auto validateMergedDirectAndDagRootReplacement =
         [&](StringRef baseText, StringRef newText) -> bool {
@@ -19114,31 +18761,31 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
       if (s.empty() || s == "{}")
         return out;
 
-      const SourceLocation BaseLoc = SourceLocation::getFromRawEncoding(1);
-      std::string LexBuf = s.str();
-      LexBuf.push_back('\0');
-      const char *BufStart = LexBuf.data();
-      const char *BufEnd = BufStart + s.size();
-      Lexer Lex(BaseLoc, lexLang_, BufStart, BufStart, BufEnd);
+      const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
+      std::string lexBuf = s.str();
+      lexBuf.push_back('\0');
+      const char *bufStart = lexBuf.data();
+      const char *bufEnd = bufStart + s.size();
+      Lexer lexer(baseLoc, lexLang_, bufStart, bufStart, bufEnd);
 
       auto nextNonCommentToken = [&]() {
-        Token Tok;
+        Token token;
         while (true) {
-          Lex.LexFromRawLexer(Tok);
-          if (!Tok.is(tok::comment))
-            return Tok;
+          lexer.LexFromRawLexer(token);
+          if (!token.is(tok::comment))
+            return token;
         }
       };
 
-      auto tokenText = [&](const Token &Tok) -> StringRef {
+      auto tokenText = [&](const Token &token) -> StringRef {
         const unsigned offset =
-            Tok.getLocation().getRawEncoding() - BaseLoc.getRawEncoding();
-        return StringRef(BufStart + offset, Tok.getLength());
+            token.getLocation().getRawEncoding() - baseLoc.getRawEncoding();
+        return StringRef(bufStart + offset, token.getLength());
       };
 
-      auto parseQuotedPayload = [&](const Token &Tok)
+      auto parseQuotedPayload = [&](const Token &token)
           -> std::optional<std::string> {
-        switch (Tok.getKind()) {
+        switch (token.getKind()) {
         case tok::char_constant:
         case tok::wide_char_constant:
         case tok::utf8_char_constant:
@@ -19149,52 +18796,52 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           return std::nullopt;
         }
 
-        StringRef text = tokenText(Tok);
+        StringRef text = tokenText(token);
         if (text.size() < 2 || text.front() != '\'' || text.back() != '\'')
           return std::nullopt;
         return text.drop_front().drop_back().str();
       };
 
-      Token Tok = nextNonCommentToken();
-      if (!Tok.is(tok::l_brace))
+      Token token = nextNonCommentToken();
+      if (!token.is(tok::l_brace))
         return DenseMap<uint32_t, LocalFormalTextPair>{};
 
       while (true) {
-        Tok = nextNonCommentToken();
-        if (Tok.is(tok::r_brace) || Tok.is(tok::eof))
+        token = nextNonCommentToken();
+        if (token.is(tok::r_brace) || token.is(tok::eof))
           break;
-        if (!Tok.is(tok::numeric_constant))
+        if (!token.is(tok::numeric_constant))
           return DenseMap<uint32_t, LocalFormalTextPair>{};
 
         uint32_t argIdx = 0;
-        if (tokenText(Tok).getAsInteger(10, argIdx))
+        if (tokenText(token).getAsInteger(10, argIdx))
           return DenseMap<uint32_t, LocalFormalTextPair>{};
 
-        Tok = nextNonCommentToken();
-        if (!Tok.is(tok::colon))
+        token = nextNonCommentToken();
+        if (!token.is(tok::colon))
           return DenseMap<uint32_t, LocalFormalTextPair>{};
 
-        Tok = nextNonCommentToken();
-        auto oldText = parseQuotedPayload(Tok);
+        token = nextNonCommentToken();
+        auto oldText = parseQuotedPayload(token);
         if (!oldText)
           return DenseMap<uint32_t, LocalFormalTextPair>{};
 
-        Tok = nextNonCommentToken();
-        if (!Tok.is(tok::arrow))
+        token = nextNonCommentToken();
+        if (!token.is(tok::arrow))
           return DenseMap<uint32_t, LocalFormalTextPair>{};
 
-        Tok = nextNonCommentToken();
-        auto newText = parseQuotedPayload(Tok);
+        token = nextNonCommentToken();
+        auto newText = parseQuotedPayload(token);
         if (!newText)
           return DenseMap<uint32_t, LocalFormalTextPair>{};
 
         out[argIdx] = LocalFormalTextPair{std::move(*oldText),
                                           std::move(*newText)};
 
-        Tok = nextNonCommentToken();
-        if (Tok.is(tok::r_brace) || Tok.is(tok::eof))
+        token = nextNonCommentToken();
+        if (token.is(tok::r_brace) || token.is(tok::eof))
           break;
-        if (!Tok.is(tok::comma))
+        if (!token.is(tok::comma))
           return DenseMap<uint32_t, LocalFormalTextPair>{};
       }
       return out;
@@ -19282,7 +18929,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
       SmallVector<StringRef, 2> repls;
       repls.push_back(StringRef(candidate.replacement));
       repls.push_back(StringRef(existingPatch->replacement));
-      auto merged = mergeCompatibleRootCallsiteReplacements(
+      auto merged = mergeCompatibleStringReplacements(
           baseInvText, ArrayRef<StringRef>(repls));
       if (!merged || !validateMergedDirectAndDagRootReplacement(
                          baseInvText, StringRef(*merged))) {
@@ -19442,7 +19089,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
       SmallVector<StringRef, 2> repls;
       repls.push_back(StringRef(argsOnlyCandidate->replacement));
       repls.push_back(StringRef(existingPatch->replacement));
-      auto merged = mergeCompatibleRootCallsiteReplacements(
+      auto merged = mergeCompatibleStringReplacements(
           baseInvText, ArrayRef<StringRef>(repls));
       if (merged && validateMergedDirectAndDagRootReplacement(
                         baseInvText, StringRef(*merged))) {
@@ -19718,7 +19365,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
   case FinalMacroCandidateOrigin::WholeCoverRealization:
     trace("macro/proof",
-          "constructed whole-cover realization patch audit: inv id={0} name={1} {2}",
+          "constructed whole-cover realization patch audit: inv id={0} "
+          "name={1} {2}",
           m.id, m.name,
           FormatAcceptedResultCandidate(selected.acceptedCandidate));
     break;
