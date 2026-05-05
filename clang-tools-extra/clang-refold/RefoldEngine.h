@@ -497,21 +497,27 @@ private:
   ///
   /// * only non-insertion hunks are eligible,
   /// * only top-level TU `#include` directives are considered,
-  /// * the touched include run must form one exact contiguous A-cover with no
-  ///   PP gaps,
+  /// * the touched include run must form one contiguous A-cover with no PP
+  ///   gaps,
+  /// * the hunk must either match that cover exactly or be widenable to it
+  ///   without absorbing any other token hunk,
   /// * the corresponding source bytes in the TU may contain only the include
   ///   directives themselves plus whitespace between them,
+  /// * the widened source interval must not overlap an already-staged
+  ///   source edit,
   /// * and the replacement text must come from a canonical-or-consensus B
-  ///   envelope for that exact include closure.
+  ///   envelope for the full include closure.
   ///
   /// When those obligations hold, the result is staged as one explicit TU text
   /// edit and later composed together with ordinary TU edits and macro callsite
   /// patches. Otherwise the caller must keep the hunk out-of-domain and retain
   /// the existing terminal fallback behavior.
   std::optional<TextEdit>
-  BuildTUIncludeClosureEditForUnresolvedHunk(const diffutils::Hunk &h,
-                                             llvm::StringRef tuPath,
-                                             llvm::StringRef tuBytes) const;
+  BuildTUIncludeClosureEditForUnresolvedHunk(
+      const diffutils::Hunk &h, llvm::StringRef tuPath,
+      llvm::StringRef tuBytes,
+      llvm::ArrayRef<std::pair<uint64_t, uint64_t>> stagedSourceIntervals)
+      const;
 
   /// \brief Build the single-owner macro whole-expansion fallback witness.
   ///
