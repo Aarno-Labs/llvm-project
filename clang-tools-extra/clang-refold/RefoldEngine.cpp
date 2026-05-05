@@ -3015,79 +3015,49 @@ bool RefoldEngine::IsInvocationInsideDefineDirective(
   if (!m.invFile || !m.invB || !m.invE)
     return false;
 
-  // NOTE: MacroDirective.siteB/siteE typically covers only the first physical
-  // line of the #define directive. For multi-line macro definitions ("\\\n"
-  // line splices), invocations spelled in the macro body may appear after
-  // siteE. We therefore compute the actual directive extent by scanning the
-  // source text until we reach a newline that is NOT line-spliced.
+  // MacroDirective::siteB/siteE normally covers the first physical line of a
+  // #define directive. For line-spliced macro definitions, invocations spelled
+  // in the replacement list may appear after siteE, so the index widens each
+  // directive extent to the first newline that is not escaped by a line splice.
   //
-  // NOTE: This predicate may be queried extremely frequently during macro
-  // selection. Avoid O(Ninvocations*Ndirectives) behavior by indexing all
-  // #define directive extents once per process, keyed by absolute file path.
-  //
-  // IMPORTANT: intentionally avoid RefoldEngine::PathsEqual() here. The
-  // canonicalization it performs can be expensive in tight loops and can
-  // dominate runtime for large preprocessed streams.
+  // Keep this cache on the RefoldEngine instance. The directive list and
+  // logical-to-absolute path resolver come from the current refold model; a
+  // process-global cache can misclassify later runs that reuse the same process
+  // with different model/path state.
+  if (!definesIndexBuilt_) {
+    definesIndexBuilt_ = true;
+    defineFileTextCache_.clear();
+    defineEndCache_.clear();
+    definesByAbsPath_.clear();
 
-  struct DefineExtent {
-    uint64_t b;
-    uint64_t e;
-  };
-
-  // Cache file text by absolute path to avoid repeated disk reads.
-  static llvm::StringMap<std::string> fileTextCache;
-  // Cache computed end offsets per directive id.
-  static llvm::DenseMap<uint64_t, uint64_t> defineEndCache;
-  // Index define extents per absolute path (built lazily).
-  static llvm::StringMap<std::vector<DefineExtent>> definesByAbsPath;
-  static bool definesIndexBuilt = false;
-
-  if (!definesIndexBuilt) {
-    definesIndexBuilt = true;
-
-    // Build a lexical containment index for `#define` directives, keyed by the
-    // directive's absolute source path. For each producer-reported `#define`,
-    // widen its recorded end to the true physical end of the directive by
-    // following any `\\\n` line-spliced continuation lines, then record the
-    // resulting byte range `[siteB, defineEnd)` in `definesByAbsPath`.
-    //
-    // This is used by IsInvocationInsideDefineDirective(): a macro invocation
-    // is considered "inside a define" if its spelled byte range falls within
-    // one of these per-file define extents.
-    //
-    // To keep repeated queries cheap, we cache:
-    //   - the loaded source text for each file (`fileTextCache`)
-    //   - the computed widened end for each directive (`defineEndCache`)
     for (const auto &d : model_.GetMacroDirectives()) {
       if ("#define" != d.subkind)
         continue;
       if (d.sitePath.empty())
         continue;
 
-      // Compute (or fetch) the true end of the #define directive in its source
-      // file, including any "\\\n" line-spliced continuation lines.
+      // Compute, or fetch, the widened physical end of this #define directive.
       uint64_t defineEnd = d.siteE;
-      auto itEnd = defineEndCache.find(d.id);
-      if (itEnd != defineEndCache.end()) {
+      auto itEnd = defineEndCache_.find(d.id);
+      if (itEnd != defineEndCache_.end()) {
         defineEnd = itEnd->second;
       } else {
         std::string absPath = lineDirs_.ToAbsolutePath(d.sitePath);
-        auto itTxt = fileTextCache.find(absPath);
-        if (itTxt == fileTextCache.end()) {
+        auto itTxt = defineFileTextCache_.find(absPath);
+        if (itTxt == defineFileTextCache_.end()) {
           auto bufOrErr = llvm::MemoryBuffer::getFile(absPath);
           if (!bufOrErr) {
-            // Best-effort: fall back to the producer-provided site range.
-            defineEndCache[d.id] = d.siteE;
+            // Best effort: keep the producer-provided one-line extent if the
+            // source file cannot be loaded in the current replay environment.
+            defineEndCache_[d.id] = d.siteE;
             defineEnd = d.siteE;
           } else {
-            // The normal case: split the rewritten core around the original
-            // literal delimiters and require a unique segmentation.
-            fileTextCache[absPath] = (**bufOrErr).getBuffer().str();
-            itTxt = fileTextCache.find(absPath);
+            defineFileTextCache_[absPath] = (**bufOrErr).getBuffer().str();
+            itTxt = defineFileTextCache_.find(absPath);
           }
         }
 
-        if (itTxt != fileTextCache.end()) {
+        if (itTxt != defineFileTextCache_.end()) {
           StringRef bytes(itTxt->second);
           uint64_t i = d.siteB;
           if (i > bytes.size())
@@ -3099,74 +3069,71 @@ bool RefoldEngine::IsInvocationInsideDefineDirective(
               i = bytes.size();
               break;
             }
-            // Advance past the newline.
+
             i = static_cast<uint64_t>(nl + 1);
             if (!stringutils::isLineSplice(bytes, nl))
               break;
           }
 
           defineEnd = i;
-          defineEndCache[d.id] = defineEnd;
+          defineEndCache_[d.id] = defineEnd;
         }
       }
 
       const std::string absPath = lineDirs_.ToAbsolutePath(d.sitePath);
-      definesByAbsPath[absPath].push_back(DefineExtent{d.siteB, defineEnd});
+      definesByAbsPath_[absPath].push_back(
+          DefineDirectiveExtent{d.siteB, defineEnd});
     }
 
-    // Sort extents by begin offset for binary-search probing.
-    for (auto &kv : definesByAbsPath) {
+    for (auto &kv : definesByAbsPath_) {
       auto &vec = kv.getValue();
-      llvm::sort(vec, [](const DefineExtent &x, const DefineExtent &y) {
-        if (x.b != y.b)
-          return x.b < y.b;
-        return x.e < y.e;
+      llvm::sort(vec, [](const DefineDirectiveExtent &x,
+                         const DefineDirectiveExtent &y) {
+        if (x.begin != y.begin)
+          return x.begin < y.begin;
+        return x.end < y.end;
       });
     }
   }
 
-  // Normalize the invocation file spelling the same way we keyed the define
-  // index, then look up all #define extents recorded for that file.
   const std::string invAbs = lineDirs_.ToAbsolutePath(*m.invFile);
-  auto it = definesByAbsPath.find(invAbs);
-  if (it == definesByAbsPath.end())
+  auto it = definesByAbsPath_.find(invAbs);
+  if (it == definesByAbsPath_.end())
     return false;
 
-  // Use the invocation's start byte as the lexical containment probe.
   const uint64_t x = *m.invB;
   const auto &vec = it->second;
   if (vec.empty())
     return false;
 
-  // Binary-search for the last define extent whose begin offset is <= x.
-  // The extents are sorted by begin offset, so this gives the only candidate
-  // that can still contain the probe byte.
-  size_t lo = 0, hi = vec.size();
+  // Binary-search for the last define extent whose begin offset is <= x.  This
+  // is the normal candidate in the non-overlapping case.
+  size_t lo = 0;
+  size_t hi = vec.size();
   while (lo < hi) {
     size_t mid = lo + (hi - lo) / 2;
-    if (vec[mid].b <= x)
+    if (vec[mid].begin <= x)
       lo = mid + 1;
     else
       hi = mid;
   }
-  if (lo == 0)
-    return false;
 
-  // Containment is half-open: [b,e). If the invocation start byte falls inside
-  // the candidate define extent, treat the invocation as lexically inside that
-  // #define directive.
-  const DefineExtent cand = vec[lo - 1];
-  if (x >= cand.b && x < cand.e)
+  auto contains = [&](const DefineDirectiveExtent &extent) {
+    return x >= extent.begin && x < extent.end;
+  };
+
+  if (lo != 0 && contains(vec[lo - 1]))
     return true;
 
-  // Conservative fallback: in unusual cases where extents overlap, linearly
-  // scan a handful of adjacent ranges.
+  // Overlapping #define extents are unusual but legal in the metadata model.
+  // Scan the adjacent window around the binary-search position exactly as the
+  // previous implementation did, but against this engine's private index.
   for (size_t i = lo; i < vec.size() && i < lo + 4; ++i) {
-    if (x >= vec[i].b && x < vec[i].e)
+    if (contains(vec[i]))
       return true;
   }
   for (size_t i = lo; i > 0 && i + 4 > lo; --i) {
-    if (x >= vec[i - 1].b && x < vec[i - 1].e)
+    if (contains(vec[i - 1]))
       return true;
   }
 

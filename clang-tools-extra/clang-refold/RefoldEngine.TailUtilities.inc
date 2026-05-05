@@ -1240,9 +1240,9 @@ RefoldEngine::ApplyTextEditsWithPendingResync(
   // We now:
   //  * Preserve and concatenate multiple INSERT edits with identical
   //    zero-length spans ([x,x)) in their original order.
-  //  * For non-zero spans, keep the last edit (as the prior map effectively
-  //    did) but retain any pending-resync from earlier edits, and emit a trace
-  //    if the payloads disagree.
+  //  * Merge duplicate non-zero edits only when they carry the same
+  //    replacement payload; conflicting duplicate replacements request the
+  //    explicit terminal fallback instead of selecting a writer by order.
 
   struct EditRef {
     const TextEdit *e;
@@ -1310,32 +1310,60 @@ RefoldEngine::ApplyTextEditsWithPendingResync(
       continue;
     }
 
-    // Non-zero span duplicates: keep the last edit by order, but preserve any
-    // pending resync request.
-    const TextEdit *last = ordered[j - 1].e;
-    TextEdit chosen = *last;
-
-    for (size_t k = i; k < j; ++k) {
-      if (ordered[k].e->pending)
-        chosen.pending = ordered[k].e->pending;
-    }
-
-    if (inTraceMode()) {
-      bool disagree = false;
-      for (size_t k = i; k + 1 < j; ++k) {
-        if (ordered[k].e->text != last->text) {
-          disagree = true;
-          break;
-        }
-      }
-      if (disagree) {
-        trace("edits/apply",
-              "multiple edits share span [{0},{1}); keeping last (idx={2})", s,
-              t, ordered[j - 1].idx);
+    // Non-zero span duplicates must be identical to compose safely.  Choosing
+    // an arbitrary writer for the same replaced byte range is not a proof; if
+    // two producers disagree about the replacement payload, fail closed and let
+    // the caller select the explicit terminal fallback path.
+    const TextEdit *first = ordered[i].e;
+    bool payloadsAgree = true;
+    for (size_t k = i + 1; k < j; ++k) {
+      if (ordered[k].e->text != first->text) {
+        payloadsAgree = false;
+        break;
       }
     }
 
-    norm.push_back(std::move(chosen));
+    if (!payloadsAgree) {
+      RequestTerminalFallback(
+          TerminalFallbackKind::UndischargedEmissionArtifact, "edits/apply",
+          llvm::formatv(
+              "conflicting duplicate non-zero edits for span [{0},{1}) in {2}",
+              s, t, emissionOwner)
+              .str());
+      return originalFileText.str();
+    }
+
+    TextEdit merged = *first;
+    for (size_t k = i + 1; k < j; ++k) {
+      const TextEdit &dup = *ordered[k].e;
+      if (dup.pending)
+        merged.pending = dup.pending;
+
+      if (merged.expandedMacroRootId && dup.expandedMacroRootId &&
+          *merged.expandedMacroRootId != *dup.expandedMacroRootId) {
+        RequestTerminalFallback(
+            TerminalFallbackKind::UndischargedEmissionArtifact,
+            "edits/apply",
+            llvm::formatv("duplicate non-zero edits for span [{0},{1}) in {2} "
+                          "carry incompatible expanded macro roots {3} and {4}",
+                          s, t, emissionOwner, *merged.expandedMacroRootId,
+                          *dup.expandedMacroRootId)
+                .str());
+        return originalFileText.str();
+      }
+      if (!merged.expandedMacroRootId && dup.expandedMacroRootId)
+        merged.expandedMacroRootId = dup.expandedMacroRootId;
+
+      merged.acceptedResults.insert(merged.acceptedResults.end(),
+                                    dup.acceptedResults.begin(),
+                                    dup.acceptedResults.end());
+    }
+
+    trace("edits/apply",
+          "merged {0} identical non-zero edits at [{1},{2}) into one edit",
+          j - i, s, t);
+
+    norm.push_back(std::move(merged));
     i = j;
   }
 

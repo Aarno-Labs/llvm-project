@@ -367,6 +367,29 @@ private:
   /// canonicalized at most once per refold engine instance.
   mutable llvm::StringMap<std::string> canonicalPathCache_;
 
+  /// Half-open physical source extent of a #define directive, including any
+  /// line-spliced continuation lines.
+  struct DefineDirectiveExtent {
+    uint64_t begin = 0;
+    uint64_t end = 0;
+  };
+
+  /// Per-engine source-text cache used while building the #define containment
+  /// index. This must not be process-global because the directive list and
+  /// line-directive path resolver are properties of the current refold model.
+  mutable llvm::StringMap<std::string> defineFileTextCache_;
+
+  /// Per-engine cache of widened #define directive end offsets keyed by
+  /// producer directive id.
+  mutable llvm::DenseMap<uint64_t, uint64_t> defineEndCache_;
+
+  /// Per-engine index of #define directive extents keyed by absolute source
+  /// path.
+  mutable llvm::StringMap<std::vector<DefineDirectiveExtent>> definesByAbsPath_;
+
+  /// True once definesByAbsPath_ has been built for this engine instance.
+  mutable bool definesIndexBuilt_ = false;
+
   // Single-pass terminal-fallback scaffold: if any edit/patch cannot be
   // discharged into the declared proof/lattice outcomes in the current pass,
   // record the reason and fall back to emitting the fully expanded edited
