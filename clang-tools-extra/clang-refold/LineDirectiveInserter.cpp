@@ -59,8 +59,9 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
 
   auto rejoinsUntouchedTailSafelyAtBOL = [&](uint64_t editEnd) -> bool {
     const size_t n = originalFileText.size();
-    const size_t pos =
-        (editEnd >= static_cast<uint64_t>(n)) ? n : static_cast<size_t>(editEnd);
+    const size_t pos = (editEnd >= static_cast<uint64_t>(n))
+                           ? n
+                           : static_cast<size_t>(editEnd);
 
     if (pos == n || stringutils::isBOL(originalFileText, pos))
       return true;

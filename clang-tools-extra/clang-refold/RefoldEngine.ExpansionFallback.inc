@@ -48,8 +48,8 @@ std::string RefoldEngine::FormatExpansionClosureWitness(
 std::optional<RefoldEngine::ExpansionClosureWitness>
 RefoldEngine::BuildMacroOwnerExpansionClosureWitness() const {
   if (!terminalFallbackRequested_) {
-    trace("fallback",
-          "macro-owner closure witness rejected: terminal fallback not requested");
+    trace("fallback", "macro-owner closure witness rejected: terminal fallback "
+                      "not requested");
     return std::nullopt;
   }
 
@@ -80,7 +80,7 @@ RefoldEngine::BuildMacroOwnerExpansionClosureWitness() const {
   // require strict interior placement so the witness does not rely on a
   // boundary-adjacent ownership guess.
   auto hunkIsClosedByPlan = [&](const diffutils::Hunk &h,
-                               const WholeCoverPlan &plan) -> bool {
+                                const WholeCoverPlan &plan) -> bool {
     const bool aClosed =
         h.isInsertOnly() ? (plan.covLoA < h.aStart && h.aStart < plan.covHiA)
                          : (plan.covLoA <= h.aStart && h.aEnd <= plan.covHiA);
@@ -112,7 +112,8 @@ RefoldEngine::BuildMacroOwnerExpansionClosureWitness() const {
         break;
       if (*cur == root.id)
         return true;
-      const RefoldModel::MacroInvocation *parent = FindMacroInvocationById(*cur);
+      const RefoldModel::MacroInvocation *parent =
+          FindMacroInvocationById(*cur);
       if (!parent)
         break;
       cur = parent->callerMacroId;
@@ -128,7 +129,8 @@ RefoldEngine::BuildMacroOwnerExpansionClosureWitness() const {
     ArrayRef<RefoldModel::Segment> segs = model_.GetSegmentsForFile(tuPath);
     if (segs.empty()) {
       trace("fallback",
-            "macro-owner closure root rejected: id={0} name='{1}' has no TU segments for source interval",
+            "macro-owner closure root rejected: id={0} name='{1}' has no TU "
+            "segments for source interval",
             root.id, root.name);
       return false;
     }
@@ -150,13 +152,16 @@ RefoldEngine::BuildMacroOwnerExpansionClosureWitness() const {
         continue;
       if (seg.b > cur) {
         trace("fallback",
-              "macro-owner closure root rejected: id={0} name='{1}' source interval [{2},{3}) has uncovered gap before segment [{4},{5})",
+              "macro-owner closure root rejected: id={0} name='{1}' source "
+              "interval [{2},{3}) has uncovered gap before segment [{4},{5})",
               root.id, root.name, *root.invB, *root.invE, seg.b, seg.e);
         return false;
       }
       if (seg.ownerIncludeId) {
         trace("fallback",
-              "macro-owner closure root rejected: id={0} name='{1}' source interval [{2},{3}) crosses include-owned segment [{4},{5}) includeId={6}",
+              "macro-owner closure root rejected: id={0} name='{1}' source "
+              "interval [{2},{3}) crosses include-owned segment [{4},{5}) "
+              "includeId={6}",
               root.id, root.name, *root.invB, *root.invE, seg.b, seg.e,
               *seg.ownerIncludeId);
         return false;
@@ -166,9 +171,11 @@ RefoldEngine::BuildMacroOwnerExpansionClosureWitness() const {
         sawCondArmId = true;
       } else if (condArmId != seg.ownerCondArmId) {
         trace("fallback",
-              "macro-owner closure root rejected: id={0} name='{1}' source interval [{2},{3}) crosses conditional-arm boundary between {4} and {5}",
-              root.id, root.name, *root.invB, *root.invE,
-              condArmId.value_or(0), seg.ownerCondArmId.value_or(0));
+              "macro-owner closure root rejected: id={0} name='{1}' source "
+              "interval [{2},{3}) crosses conditional-arm boundary between {4} "
+              "and {5}",
+              root.id, root.name, *root.invB, *root.invE, condArmId.value_or(0),
+              seg.ownerCondArmId.value_or(0));
         return false;
       }
       sawCoveringSeg = true;
@@ -179,13 +186,15 @@ RefoldEngine::BuildMacroOwnerExpansionClosureWitness() const {
 
     if (!sawCoveringSeg) {
       trace("fallback",
-            "macro-owner closure root rejected: id={0} name='{1}' source interval [{2},{3}) has no covering TU segment",
+            "macro-owner closure root rejected: id={0} name='{1}' source "
+            "interval [{2},{3}) has no covering TU segment",
             root.id, root.name, *root.invB, *root.invE);
       return false;
     }
 
     trace("fallback",
-          "macro-owner closure root rejected: id={0} name='{1}' source interval [{2},{3}) is not fully covered by TU-owned segments",
+          "macro-owner closure root rejected: id={0} name='{1}' source "
+          "interval [{2},{3}) is not fully covered by TU-owned segments",
           root.id, root.name, *root.invB, *root.invE);
     return false;
   };
@@ -218,7 +227,9 @@ RefoldEngine::BuildMacroOwnerExpansionClosureWitness() const {
         continue;
 
       trace("fallback",
-            "macro-owner closure root rejected: id={0} name='{1}' overlaps foreign macro id={2} name='{3}' sourceOverlap={4} coverOverlap={5} otherOwnerInclude={6}",
+            "macro-owner closure root rejected: id={0} name='{1}' overlaps "
+            "foreign macro id={2} name='{3}' sourceOverlap={4} "
+            "coverOverlap={5} otherOwnerInclude={6}",
             root.id, root.name, other.id, other.name, sourceOverlap ? 1 : 0,
             coverOverlap ? 1 : 0, other.ownerIncludeId.value_or(0));
       return true;
@@ -240,42 +251,48 @@ RefoldEngine::BuildMacroOwnerExpansionClosureWitness() const {
     // provenance is incomplete, we cannot soundly materialize the owner later.
     if (!m.invText || !m.invFile || !m.invB || !m.invE) {
       trace("fallback",
-            "macro-owner closure root rejected: id={0} name='{1}' missing callsite provenance",
+            "macro-owner closure root rejected: id={0} name='{1}' missing "
+            "callsite provenance",
             m.id, m.name);
       continue;
     }
 
     if (!PathsEqual(*m.invFile, tuPath)) {
       trace("fallback",
-            "macro-owner closure root rejected: id={0} name='{1}' callsite file='{2}' not TU='{3}'",
+            "macro-owner closure root rejected: id={0} name='{1}' callsite "
+            "file='{2}' not TU='{3}'",
             m.id, m.name, StringRef(*m.invFile), tuPath);
       continue;
     }
 
     if (m.ownerIncludeId) {
       trace("fallback",
-            "macro-owner closure root rejected: id={0} name='{1}' belongs to include #{2}",
+            "macro-owner closure root rejected: id={0} name='{1}' belongs to "
+            "include #{2}",
             m.id, m.name, *m.ownerIncludeId);
       continue;
     }
 
     if (*m.invE <= *m.invB) {
       trace("fallback",
-            "macro-owner closure root rejected: id={0} name='{1}' empty/invalid source range [{2},{3})",
+            "macro-owner closure root rejected: id={0} name='{1}' "
+            "empty/invalid source range [{2},{3})",
             m.id, m.name, *m.invB, *m.invE);
       continue;
     }
 
     if (IsInvocationInsideDefineDirective(m)) {
       trace("fallback",
-            "macro-owner closure root rejected: id={0} name='{1}' invocation inside define directive",
+            "macro-owner closure root rejected: id={0} name='{1}' invocation "
+            "inside define directive",
             m.id, m.name);
       continue;
     }
 
     if (!InvocationSpanMatchesCallsitePrefix(*m.invText, m)) {
       trace("fallback",
-            "macro-owner closure root rejected: id={0} name='{1}' invocation text does not match callsite prefix",
+            "macro-owner closure root rejected: id={0} name='{1}' invocation "
+            "text does not match callsite prefix",
             m.id, m.name);
       continue;
     }
@@ -286,7 +303,8 @@ RefoldEngine::BuildMacroOwnerExpansionClosureWitness() const {
     auto plan = ComputeWholeCoverPlan(m);
     if (!plan) {
       trace("fallback",
-            "macro-owner closure root rejected: id={0} name='{1}' has no whole-cover plan",
+            "macro-owner closure root rejected: id={0} name='{1}' has no "
+            "whole-cover plan",
             m.id, m.name);
       continue;
     }
@@ -294,7 +312,8 @@ RefoldEngine::BuildMacroOwnerExpansionClosureWitness() const {
     if (!plan->selfContained || plan->claimsClipped ||
         plan->bTokEnd <= plan->bTokStart) {
       trace("fallback",
-            "macro-owner closure root rejected: id={0} name='{1}' selfContained={2} claimsClipped={3} B=[{4},{5})",
+            "macro-owner closure root rejected: id={0} name='{1}' "
+            "selfContained={2} claimsClipped={3} B=[{4},{5})",
             m.id, m.name, plan->selfContained ? 1 : 0,
             plan->claimsClipped ? 1 : 0, plan->bTokStart, plan->bTokEnd);
       continue;
@@ -319,10 +338,12 @@ RefoldEngine::BuildMacroOwnerExpansionClosureWitness() const {
       if (hunkIsClosedByPlan(h, *plan))
         continue;
 
-      trace("fallback",
-            "macro-owner closure root rejected: id={0} name='{1}' does not close hunk A=[{2},{3}) B=[{4},{5}) coverA=[{6},{7}) coverB=[{8},{9})",
-            m.id, m.name, h.aStart, h.aEnd, h.bStart, h.bEnd, plan->covLoA,
-            plan->covHiA, plan->bTokStart, plan->bTokEnd);
+      trace(
+          "fallback",
+          "macro-owner closure root rejected: id={0} name='{1}' does not close "
+          "hunk A=[{2},{3}) B=[{4},{5}) coverA=[{6},{7}) coverB=[{8},{9})",
+          m.id, m.name, h.aStart, h.aEnd, h.bStart, h.bEnd, plan->covLoA,
+          plan->covHiA, plan->bTokStart, plan->bTokEnd);
       closesAllHunks = false;
       break;
     }
@@ -331,15 +352,16 @@ RefoldEngine::BuildMacroOwnerExpansionClosureWitness() const {
       continue;
 
     trace("fallback",
-          "macro-owner closure root accepted: id={0} name='{1}' source=[{2},{3}) coverA=[{4},{5}) B=[{6},{7})",
+          "macro-owner closure root accepted: id={0} name='{1}' "
+          "source=[{2},{3}) coverA=[{4},{5}) B=[{6},{7})",
           m.id, m.name, *m.invB, *m.invE, plan->covLoA, plan->covHiA,
           plan->bTokStart, plan->bTokEnd);
     candidates.push_back(MacroOwnerClosureCandidate{&m, *plan});
   }
 
   if (candidates.empty()) {
-    trace("fallback",
-          "macro-owner closure witness rejected: no single-owner root candidate survived");
+    trace("fallback", "macro-owner closure witness rejected: no single-owner "
+                      "root candidate survived");
     return std::nullopt;
   }
 
@@ -379,7 +401,6 @@ RefoldEngine::BuildMacroOwnerExpansionClosureWitness() const {
   return witness;
 }
 
-
 bool RefoldEngine::MacroOwnerExpansionClosureWitnessIsDominated(
     const ExpansionClosureWitness &witness, std::string &detail) const {
   auto reject = [&](std::string why) -> bool {
@@ -392,9 +413,10 @@ bool RefoldEngine::MacroOwnerExpansionClosureWitnessIsDominated(
   // macro-owner expansion closure path, so it cannot prove dominance.
   if (witness.kind != ExpansionClosureKind::MacroOwnerWholeExpansion ||
       !witness.hasRootMacroId || witness.hasOwnerIncludeId) {
-    return reject(formatv("witness is outside macro-owner whole-expansion domain: {0}",
-                          FormatExpansionClosureWitness(witness))
-                      .str());
+    return reject(
+        formatv("witness is outside macro-owner whole-expansion domain: {0}",
+                FormatExpansionClosureWitness(witness))
+            .str());
   }
 
   const RefoldModel::MacroInvocation *root =
@@ -406,7 +428,8 @@ bool RefoldEngine::MacroOwnerExpansionClosureWitnessIsDominated(
   }
 
   if (!root->invB || !root->invE || *root->invE <= *root->invB) {
-    return reject(formatv("root macro id {0} name='{1}' lacks a valid callsite source interval",
+    return reject(formatv("root macro id {0} name='{1}' lacks a valid callsite "
+                          "source interval",
                           root->id, root->name)
                       .str());
   }
@@ -416,7 +439,8 @@ bool RefoldEngine::MacroOwnerExpansionClosureWitnessIsDominated(
   // ordinary selector path without relying on post-terminal state.
   auto plan = ComputeWholeCoverPlan(*root);
   if (!plan) {
-    return reject(formatv("root macro id {0} name='{1}' no longer has a normal whole-cover plan",
+    return reject(formatv("root macro id {0} name='{1}' no longer has a normal "
+                          "whole-cover plan",
                           root->id, root->name)
                       .str());
   }
@@ -429,20 +453,23 @@ bool RefoldEngine::MacroOwnerExpansionClosureWitnessIsDominated(
       plan->selfContained == witness.selfContained &&
       plan->claimsClipped == witness.claimsClipped;
   if (!planMatchesWitness) {
-    return reject(formatv("normal whole-cover plan for root macro id {0} name='{1}' does not match fallback witness: plan coverA=[{2},{3}) B=[{4},{5}) selfContained={6} claimsClipped={7}; witness={8}",
-                          root->id, root->name, plan->covLoA, plan->covHiA,
-                          plan->bTokStart, plan->bTokEnd,
-                          plan->selfContained ? 1 : 0,
-                          plan->claimsClipped ? 1 : 0,
-                          FormatExpansionClosureWitness(witness))
-                      .str());
+    return reject(
+        formatv("normal whole-cover plan for root macro id {0} name='{1}' does "
+                "not match fallback witness: plan coverA=[{2},{3}) B=[{4},{5}) "
+                "selfContained={6} claimsClipped={7}; witness={8}",
+                root->id, root->name, plan->covLoA, plan->covHiA,
+                plan->bTokStart, plan->bTokEnd, plan->selfContained ? 1 : 0,
+                plan->claimsClipped ? 1 : 0,
+                FormatExpansionClosureWitness(witness))
+            .str());
   }
 
-  // Restamp the recomputed plan exactly as BuildMacroInvocationPatchWholeCover()
-  // does for its normal WholeCoverRealization candidate, then require that the
-  // normalized proof carrier discharges. This proves the witness is not merely a
-  // raw replacement string; it is visible through the first-class macro
-  // realization proof class.
+  // Restamp the recomputed plan exactly as
+  // BuildMacroInvocationPatchWholeCover() does for its normal
+  // WholeCoverRealization candidate, then require that the normalized proof
+  // carrier discharges. This proves the witness is not merely a raw replacement
+  // string; it is visible through the first-class macro realization proof
+  // class.
   MacroPatch patch{*root->invB, *root->invE, plan->clippedText, root->id};
   StampMacroWholeCoverRealizationPatch(patch, *plan, root->id);
   const AcceptedResultCandidate candidate = BuildAcceptedMacroCandidate(patch);
@@ -451,16 +478,17 @@ bool RefoldEngine::MacroOwnerExpansionClosureWitnessIsDominated(
       summary.inventory.currentPath !=
           AcceptedPathKind::MacroWholeCoverRealization ||
       summary.discharge.status != ProofDischargeStatus::Discharged) {
-    return reject(formatv("normal whole-cover candidate for root macro id {0} name='{1}' did not discharge as MacroWholeCoverRealization: {2}",
-                          root->id, root->name,
-                          FormatAcceptedResultCandidate(candidate))
-                      .str());
+    return reject(
+        formatv("normal whole-cover candidate for root macro id {0} name='{1}' "
+                "did not discharge as MacroWholeCoverRealization: {2}",
+                root->id, root->name, FormatAcceptedResultCandidate(candidate))
+            .str());
   }
 
   auto hunkIsClosedByPlan = [&](const diffutils::Hunk &h) -> bool {
-    const bool aClosed = h.isInsertOnly()
-                             ? (plan->covLoA < h.aStart && h.aStart < plan->covHiA)
-                             : (plan->covLoA <= h.aStart && h.aEnd <= plan->covHiA);
+    const bool aClosed =
+        h.isInsertOnly() ? (plan->covLoA < h.aStart && h.aStart < plan->covHiA)
+                         : (plan->covLoA <= h.aStart && h.aEnd <= plan->covHiA);
     if (!aClosed)
       return false;
     if (h.bStart < h.bEnd &&
@@ -486,16 +514,19 @@ bool RefoldEngine::MacroOwnerExpansionClosureWitnessIsDominated(
 
   const StringRef tuPath = model_.GetSourcePath();
   if (tuPath.empty())
-    return reject("empty TU source path while auditing macro-owner fallback dominance");
+    return reject(
+        "empty TU source path while auditing macro-owner fallback dominance");
 
   unsigned closedHunks = 0;
   for (const diffutils::Hunk &h : abTokHunks_) {
     if (!hunkIsClosedByPlan(h)) {
-      return reject(formatv("root macro id {0} name='{1}' normal plan does not close hunk A=[{2},{3}) B=[{4},{5}) coverA=[{6},{7}) coverB=[{8},{9})",
-                            root->id, root->name, h.aStart, h.aEnd, h.bStart,
-                            h.bEnd, plan->covLoA, plan->covHiA,
-                            plan->bTokStart, plan->bTokEnd)
-                        .str());
+      return reject(
+          formatv(
+              "root macro id {0} name='{1}' normal plan does not close hunk "
+              "A=[{2},{3}) B=[{4},{5}) coverA=[{6},{7}) coverB=[{8},{9})",
+              root->id, root->name, h.aStart, h.aEnd, h.bStart, h.bEnd,
+              plan->covLoA, plan->covHiA, plan->bTokStart, plan->bTokEnd)
+              .str());
     }
 
     // Mirror the ordinary hunk-classification selector exactly: classify the
@@ -505,20 +536,25 @@ bool RefoldEngine::MacroOwnerExpansionClosureWitnessIsDominated(
     const RefoldModel::MacroInvocation *selected =
         SmallestCoveringPatchableMacro(h.aStart, h.aEnd, owner.includeId);
     if (!selected) {
-      return reject(formatv("normal selector found no covering macro for hunk A=[{0},{1}) B=[{2},{3}) ownerKind={4} ownerInclude={5}",
-                            h.aStart, h.aEnd, h.bStart, h.bEnd, owner.kind,
-                            owner.includeId.value_or(0))
-                        .str());
+      return reject(
+          formatv("normal selector found no covering macro for hunk "
+                  "A=[{0},{1}) B=[{2},{3}) ownerKind={4} ownerInclude={5}",
+                  h.aStart, h.aEnd, h.bStart, h.bEnd, owner.kind,
+                  owner.includeId.value_or(0))
+              .str());
     }
 
     if (!selected->invB || !selected->invE) {
-      return reject(formatv("normal selector chose macro id {0} name='{1}' for hunk A=[{2},{3}) but it lacks callsite provenance",
+      return reject(formatv("normal selector chose macro id {0} name='{1}' for "
+                            "hunk A=[{2},{3}) but it lacks callsite provenance",
                             selected->id, selected->name, h.aStart, h.aEnd)
                         .str());
     }
 
     if (!reachesRootThroughNormalClimb(selected)) {
-      return reject(formatv("normal selector chose macro id {0} name='{1}' for hunk A=[{2},{3}), but its caller chain does not reach fallback root id {4} name='{5}'",
+      return reject(formatv("normal selector chose macro id {0} name='{1}' for "
+                            "hunk A=[{2},{3}), but its caller chain does not "
+                            "reach fallback root id {4} name='{5}'",
                             selected->id, selected->name, h.aStart, h.aEnd,
                             root->id, root->name)
                         .str());
@@ -526,11 +562,13 @@ bool RefoldEngine::MacroOwnerExpansionClosureWitnessIsDominated(
     ++closedHunks;
   }
 
-  detail = formatv("dominated by normal MacroWholeCoverRealization root id={0} name='{1}' source=[{2},{3}) coverA=[{4},{5}) B=[{6},{7}) hunks={8}",
-                   root->id, root->name, *root->invB, *root->invE,
-                   plan->covLoA, plan->covHiA, plan->bTokStart,
-                   plan->bTokEnd, closedHunks)
-               .str();
+  detail =
+      formatv(
+          "dominated by normal MacroWholeCoverRealization root id={0} "
+          "name='{1}' source=[{2},{3}) coverA=[{4},{5}) B=[{6},{7}) hunks={8}",
+          root->id, root->name, *root->invB, *root->invE, plan->covLoA,
+          plan->covHiA, plan->bTokStart, plan->bTokEnd, closedHunks)
+          .str();
   return true;
 }
 
@@ -546,7 +584,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   // without absorbing any independent token diff.
   if (h.isInsertOnly()) {
     trace("fallback",
-          "TU include-closure rejected: insert-only hunk A=[{0},{1}) B=[{2},{3}) is outside the first closure-edit domain",
+          "TU include-closure rejected: insert-only hunk A=[{0},{1}) "
+          "B=[{2},{3}) is outside the first closure-edit domain",
           h.aStart, h.aEnd, h.bStart, h.bEnd);
     return std::nullopt;
   }
@@ -566,7 +605,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
 
   if (touched.empty()) {
     trace("fallback",
-          "TU include-closure rejected: no top-level TU include touches hunk A=[{0},{1})",
+          "TU include-closure rejected: no top-level TU include touches hunk "
+          "A=[{0},{1})",
           h.aStart, h.aEnd);
     return std::nullopt;
   }
@@ -586,7 +626,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   for (const RefoldModel::IncludeItem *inc : touched) {
     if (inc->cover.begin != coverEnd || inc->cover.end <= inc->cover.begin) {
       trace("fallback",
-            "TU include-closure rejected: touched includes do not form one contiguous A-cover at inc#{0} cover=[{1},{2}) expectedBegin={3}",
+            "TU include-closure rejected: touched includes do not form one "
+            "contiguous A-cover at inc#{0} cover=[{1},{2}) expectedBegin={3}",
             inc->id, inc->cover.begin, inc->cover.end, coverEnd);
       return std::nullopt;
     }
@@ -645,7 +686,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   if (!exactCover) {
     if (!hunkInsideCover) {
       trace("fallback",
-            "TU include-closure rejected: touched include cover A=[{0},{1}) does not contain hunk A=[{2},{3})",
+            "TU include-closure rejected: touched include cover A=[{0},{1}) "
+            "does not contain hunk A=[{2},{3})",
             coverBegin, coverEnd, h.aStart, h.aEnd);
       return std::nullopt;
     }
@@ -659,7 +701,9 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     const bool suffixClean = !rangeHasForeignTokenDiff(h.aEnd, coverEnd);
     if (!prefixClean || !suffixClean) {
       trace("fallback",
-            "TU include-closure rejected: widening A=[{0},{1}) around hunk A=[{2},{3}) would absorb foreign token edits prefixClean={4} suffixClean={5}",
+            "TU include-closure rejected: widening A=[{0},{1}) around hunk "
+            "A=[{2},{3}) would absorb foreign token edits prefixClean={4} "
+            "suffixClean={5}",
             coverBegin, coverEnd, h.aStart, h.aEnd, prefixClean ? 1 : 0,
             suffixClean ? 1 : 0);
       return std::nullopt;
@@ -667,20 +711,23 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
 
     if (sourceTouchesStagedEdit(first->siteB, last->siteE)) {
       trace("fallback",
-            "TU include-closure rejected: widened source interval [{0},{1}) would absorb an already-staged source edit",
+            "TU include-closure rejected: widened source interval [{0},{1}) "
+            "would absorb an already-staged source edit",
             first->siteB, last->siteE);
       return std::nullopt;
     }
 
     trace("fallback",
-          "TU include-closure widening accepted: hunk A=[{0},{1}) widened to include cover A=[{2},{3})",
+          "TU include-closure widening accepted: hunk A=[{0},{1}) widened to "
+          "include cover A=[{2},{3})",
           h.aStart, h.aEnd, coverBegin, coverEnd);
   }
 
   if (first->siteB >= first->siteE || last->siteE > tuBytes.size() ||
       first->siteB >= last->siteE) {
     trace("fallback",
-          "TU include-closure rejected: invalid TU source interval [{0},{1}) fileLen={2}",
+          "TU include-closure rejected: invalid TU source interval [{0},{1}) "
+          "fileLen={2}",
           first->siteB, last->siteE, tuBytes.size());
     return std::nullopt;
   }
@@ -690,7 +737,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     if (inc->siteB < sourceCursor || inc->siteE > tuBytes.size() ||
         inc->siteB >= inc->siteE) {
       trace("fallback",
-            "TU include-closure rejected: invalid include site for inc#{0} site=[{1},{2}) cursor={3} fileLen={4}",
+            "TU include-closure rejected: invalid include site for inc#{0} "
+            "site=[{1},{2}) cursor={3} fileLen={4}",
             inc->id, inc->siteB, inc->siteE, sourceCursor, tuBytes.size());
       return std::nullopt;
     }
@@ -702,7 +750,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       StringRef gap = tuBytes.slice(sourceCursor, inc->siteB);
       if (!gap.empty() && !stringutils::isWhitespace(gap)) {
         trace("fallback",
-              "TU include-closure rejected: non-whitespace TU gap between include directives before inc#{0} gap='{1}'",
+              "TU include-closure rejected: non-whitespace TU gap between "
+              "include directives before inc#{0} gap='{1}'",
               inc->id, stringutils::showWSWithClip(gap, 120));
         return std::nullopt;
       }
@@ -713,19 +762,20 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
 
   IncludeRealizationEvidenceKind evidenceKind =
       IncludeRealizationEvidenceKind::Unknown;
-  auto bEnvelope =
-      ResolveIncludeRealizationBTokenEnvelope(coverBegin, coverEnd,
-                                             &evidenceKind);
+  auto bEnvelope = ResolveIncludeRealizationBTokenEnvelope(coverBegin, coverEnd,
+                                                           &evidenceKind);
   if (!bEnvelope) {
     trace("fallback",
-          "TU include-closure rejected: no canonical-or-consensus B envelope for A-cover [{0},{1})",
+          "TU include-closure rejected: no canonical-or-consensus B envelope "
+          "for A-cover [{0},{1})",
           coverBegin, coverEnd);
     return std::nullopt;
   }
 
   if (h.bStart < bEnvelope->first || h.bEnd > bEnvelope->second) {
     trace("fallback",
-          "TU include-closure rejected: hunk B=[{0},{1}) is outside include-cover B envelope [{2},{3})",
+          "TU include-closure rejected: hunk B=[{0},{1}) is outside "
+          "include-cover B envelope [{2},{3})",
           h.bStart, h.bEnd, bEnvelope->first, bEnvelope->second);
     return std::nullopt;
   }
@@ -757,8 +807,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   if (origNl > initialReplNl) {
     size_t remainingPadNl = origNl - initialReplNl;
 
-    auto intervalOverlapsSpelledArtifact =
-        [&](uint64_t begin, uint64_t end) -> bool {
+    auto intervalOverlapsSpelledArtifact = [&](uint64_t begin,
+                                               uint64_t end) -> bool {
       for (const auto &inc : model_.GetIncludes()) {
         if (!PathsEqual(inc.sitePath, tuPath))
           continue;
@@ -805,7 +855,9 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
           // replacement text, so the difference between them is invariant under
           // this exact copied-line absorption.
           trace("fallback",
-                "TU include-closure newline sink: absorbed source=[{0},{1}) line='{2}' remainingPad={3} (single-line invariant-preserving sink)",
+                "TU include-closure newline sink: absorbed source=[{0},{1}) "
+                "line='{2}' remainingPad={3} (single-line invariant-preserving "
+                "sink)",
                 lineBegin, lineEnd, stringutils::showWSWithClip(line, 120),
                 remainingPadNl);
         }
@@ -820,7 +872,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
         // resync is needed, it will be emitted as a #line directive after any
         // copied suffix line absorbed above.
         trace("fallback",
-              "TU include-closure physical newline pad deferred to #line resync: source=[{0},{1}) suppressedNl={2}",
+              "TU include-closure physical newline pad deferred to #line "
+              "resync: source=[{0},{1}) suppressedNl={2}",
               first->siteB, closureSourceEnd, remainingPadNl);
       } else {
         // In --no-lines mode, clang-refold intentionally does not preserve
@@ -830,7 +883,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
         // the refolded source. Boundary padding above is still responsible for
         // lexical separation; this padding is solely for physical line count.
         trace("fallback",
-              "TU include-closure physical newline pad suppressed by --no-lines: source=[{0},{1}) suppressedNl={2}",
+              "TU include-closure physical newline pad suppressed by "
+              "--no-lines: source=[{0},{1}) suppressedNl={2}",
               first->siteB, closureSourceEnd, remainingPadNl);
       }
       remainingPadNl = 0;
@@ -840,23 +894,24 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       padded.append(remainingPadNl, '\n');
 
     trace("fallback",
-          "TU include-closure newline pad: source=[{0},{1}) origNl={2} replNl={3} physicalPadNl={4} finalSourceEnd={5} result='{6}'",
+          "TU include-closure newline pad: source=[{0},{1}) origNl={2} "
+          "replNl={3} physicalPadNl={4} finalSourceEnd={5} result='{6}'",
           first->siteB, last->siteE, origNl, initialReplNl, remainingPadNl,
           closureSourceEnd, stringutils::showWSWithClip(padded, 120));
   }
 
   debug("fallback",
-        "TU include-closure accepted: includes=[{0},{1}] source=[{2},{3}) A=[{4},{5}) B=[{6},{7}) evidence={8} raw='{9}' padded='{10}'",
+        "TU include-closure accepted: includes=[{0},{1}] source=[{2},{3}) "
+        "A=[{4},{5}) B=[{6},{7}) evidence={8} raw='{9}' padded='{10}'",
         first->id, last->id, first->siteB, closureSourceEnd, coverBegin,
-        coverEnd, bEnvelope->first, bEnvelope->second,
-        evidenceKind,
+        coverEnd, bEnvelope->first, bEnvelope->second, evidenceKind,
         stringutils::showWSWithClip(rawReplacement, 120),
         stringutils::showWSWithClip(padded, 120));
 
   ResyncOutcome ro = ApplyResyncOrPend(tuBytes, first->siteB, closureSourceEnd,
                                        padded, tuPath);
-  TextEdit edit{first->siteB, closureSourceEnd, std::move(ro.text),
-                std::move(ro.pending), std::nullopt, {}};
+  TextEdit edit{first->siteB,          closureSourceEnd, std::move(ro.text),
+                std::move(ro.pending), std::nullopt,     {}};
 
   // The emitted artifact is still a deterministic TU byte replacement even
   // though the witness came from an exact include-closure proof. Reuse the TU
@@ -895,8 +950,8 @@ bool RefoldEngine::ExpansionFallbackReplacementIsReplayStable(
   FileSystemOptions fso;
   FileManager fm(fso);
   SourceManager sm(diags, fm);
-  auto mb = llvm::MemoryBuffer::getMemBufferCopy(buffer,
-                                                 "<expansion-fallback>");
+  auto mb =
+      llvm::MemoryBuffer::getMemBufferCopy(buffer, "<expansion-fallback>");
   FileID fid = sm.createFileID(std::move(mb));
 
   const LangOptions lang = MakeLexLangOptions(model_.GetPPLang());
@@ -916,7 +971,8 @@ bool RefoldEngine::ExpansionFallbackReplacementIsReplayStable(
       const size_t off = static_cast<size_t>(ptr - fileBytes.data());
       const StringRef spelling(ptr, token.getLength());
       trace("fallback",
-            "macro-owner fallback synthesis rejected: replay-unstable token kind={0} off={1} spelling='{2}'",
+            "macro-owner fallback synthesis rejected: replay-unstable token "
+            "kind={0} off={1} spelling='{2}'",
             clang::tok::getTokenName(token.getKind()), off,
             stringutils::showWSWithClip(spelling, 80));
       return false;
@@ -931,8 +987,8 @@ RefoldEngine::SynthesizeMacroOwnerExpansionClosureSource(
     const ExpansionClosureWitness &witness) const {
   if (witness.kind != ExpansionClosureKind::MacroOwnerWholeExpansion ||
       !witness.hasRootMacroId || witness.hasOwnerIncludeId) {
-    trace("fallback",
-          "macro-owner fallback synthesis rejected: witness not in single-root macro domain");
+    trace("fallback", "macro-owner fallback synthesis rejected: witness not in "
+                      "single-root macro domain");
     return std::nullopt;
   }
 
@@ -940,7 +996,9 @@ RefoldEngine::SynthesizeMacroOwnerExpansionClosureSource(
       witness.sourceByteEnd <= witness.sourceByteBegin ||
       witness.bTokEnd <= witness.bTokBegin) {
     trace("fallback",
-          "macro-owner fallback synthesis rejected: invalid witness bounds or clipped/selfContained flags source=[{0},{1}) B=[{2},{3}) selfContained={4} claimsClipped={5}",
+          "macro-owner fallback synthesis rejected: invalid witness bounds or "
+          "clipped/selfContained flags source=[{0},{1}) B=[{2},{3}) "
+          "selfContained={4} claimsClipped={5}",
           witness.sourceByteBegin, witness.sourceByteEnd, witness.bTokBegin,
           witness.bTokEnd, witness.selfContained ? 1 : 0,
           witness.claimsClipped ? 1 : 0);
@@ -958,7 +1016,8 @@ RefoldEngine::SynthesizeMacroOwnerExpansionClosureSource(
   auto tuBufferOrErr = llvm::MemoryBuffer::getFile(absTuPath);
   if (!tuBufferOrErr) {
     debug("fallback",
-          "macro-owner fallback synthesis rejected: failed to read TU source '{0}' ({1})",
+          "macro-owner fallback synthesis rejected: failed to read TU source "
+          "'{0}' ({1})",
           absTuPath, tuBufferOrErr.getError().message());
     return std::nullopt;
   }
@@ -966,7 +1025,8 @@ RefoldEngine::SynthesizeMacroOwnerExpansionClosureSource(
 
   if (witness.sourceByteEnd > tuBytes.size()) {
     trace("fallback",
-          "macro-owner fallback synthesis rejected: source interval [{0},{1}) exceeds TU size={2}",
+          "macro-owner fallback synthesis rejected: source interval [{0},{1}) "
+          "exceeds TU size={2}",
           witness.sourceByteBegin, witness.sourceByteEnd, tuBytes.size());
     return std::nullopt;
   }
@@ -975,10 +1035,12 @@ RefoldEngine::SynthesizeMacroOwnerExpansionClosureSource(
   // whole-cover patches, this fallback synthesis is a single closed owner
   // splice, so it must not inherit the standalone-claim clipping used when B
   // insertions are being emitted through separate structural edits.
-  std::string replacement = SliceBSource(witness.bTokBegin, witness.bTokEnd).str();
+  std::string replacement =
+      SliceBSource(witness.bTokBegin, witness.bTokEnd).str();
   if (replacement.empty()) {
     trace("fallback",
-          "macro-owner fallback synthesis rejected: materialization for B=[{0},{1}) is empty",
+          "macro-owner fallback synthesis rejected: materialization for "
+          "B=[{0},{1}) is empty",
           witness.bTokBegin, witness.bTokEnd);
     return std::nullopt;
   }
@@ -1003,14 +1065,12 @@ RefoldEngine::SynthesizeMacroOwnerExpansionClosureSource(
               (witness.sourceByteEnd - witness.sourceByteBegin) +
               ro.text.size() + 64);
   std::optional<PendingResync> pending;
-  pending = AppendOriginalSliceWithPending(out, tuBytes, 0,
-                                           witness.sourceByteBegin,
-                                           std::move(pending));
+  pending = AppendOriginalSliceWithPending(
+      out, tuBytes, 0, witness.sourceByteBegin, std::move(pending));
   out.append(ro.text);
   pending = ro.pending;
   pending = AppendOriginalSliceWithPending(out, tuBytes, witness.sourceByteEnd,
-                                           tuBytes.size(),
-                                           std::move(pending));
+                                           tuBytes.size(), std::move(pending));
 
   return std::string(out.str());
 }
@@ -1020,8 +1080,8 @@ std::optional<std::string> RefoldEngine::TryExpansionClosureFallback() {
     return std::nullopt;
 
   // This legacy safety net remains proof-driven, but it must no longer be an
-  // independent completeness mechanism. Build a declared witness, audit that the
-  // same root would have been visible through the normal macro whole-cover
+  // independent completeness mechanism. Build a declared witness, audit that
+  // the same root would have been visible through the normal macro whole-cover
   // candidate path, then synthesize source only if replay-stability also holds.
   if (auto witness = BuildMacroOwnerExpansionClosureWitness()) {
     // Step 6 keeps the new intermediate fallback class visible in the theorem
@@ -1040,7 +1100,9 @@ std::optional<std::string> RefoldEngine::TryExpansionClosureFallback() {
             dominanceDetail);
     } else {
       const std::string diagnostic =
-          formatv("post-terminal macro expansion closure witness was not visible through the normal MacroWholeCoverRealization candidate path: witness={0}; reason={1}",
+          formatv("post-terminal macro expansion closure witness was not "
+                  "visible through the normal MacroWholeCoverRealization "
+                  "candidate path: witness={0}; reason={1}",
                   FormatExpansionClosureWitness(*witness), dominanceDetail)
               .str();
       if (strict_)
@@ -1051,7 +1113,8 @@ std::optional<std::string> RefoldEngine::TryExpansionClosureFallback() {
     if (auto source = SynthesizeMacroOwnerExpansionClosureSource(*witness)) {
       ++lastTheoremAudit_.expansionFallbackSynthesisSuccesses;
       debug("fallback",
-            "expansion-closure source synthesized: rootMacro={0} source=[{1},{2}) B=[{3},{4}) outLen={5}",
+            "expansion-closure source synthesized: rootMacro={0} "
+            "source=[{1},{2}) B=[{3},{4}) outLen={5}",
             witness->rootMacroId, witness->sourceByteBegin,
             witness->sourceByteEnd, witness->bTokBegin, witness->bTokEnd,
             source->size());
@@ -1065,11 +1128,11 @@ std::optional<std::string> RefoldEngine::TryExpansionClosureFallback() {
     }
 
     ++lastTheoremAudit_.expansionFallbackSynthesisRejections;
-    debug("fallback",
-          "expansion-closure stage: witness could not be synthesized into replay-stable source");
+    debug("fallback", "expansion-closure stage: witness could not be "
+                      "synthesized into replay-stable source");
   } else {
-    debug("fallback",
-          "expansion-closure stage: no proved single-owner macro fallback witness available");
+    debug("fallback", "expansion-closure stage: no proved single-owner macro "
+                      "fallback witness available");
   }
 
   return std::nullopt;
@@ -1079,9 +1142,10 @@ std::string RefoldEngine::ResolvePostStructuralFallback() {
   if (!terminalFallbackRequested_)
     return std::string();
 
-  // Once structural emission has failed closed, retain the old expansion-closure
-  // safety net before raw-B terminal fallback, but require any discovered witness
-  // to pass the dominance audit in TryExpansionClosureFallback().
+  // Once structural emission has failed closed, retain the old
+  // expansion-closure safety net before raw-B terminal fallback, but require
+  // any discovered witness to pass the dominance audit in
+  // TryExpansionClosureFallback().
   if (auto expanded = TryExpansionClosureFallback()) {
     // Count the one case where the proved intermediate expansion stage
     // successfully intercepts a raw-B terminal fallback. This remains coverage
@@ -1101,7 +1165,8 @@ std::string RefoldEngine::ResolvePostStructuralFallback() {
         "terminal fallback: emitting fully expanded edited preprocessed "
         "stream (B). reasons={0}",
         terminalFallbackReasons_.size());
-  const TerminalFallbackWitness terminalWitness = BuildTerminalFallbackWitness();
+  const TerminalFallbackWitness terminalWitness =
+      BuildTerminalFallbackWitness();
   const AcceptedResultCandidate terminalCandidate =
       BuildAcceptedTerminalCandidate(terminalWitness);
   debug("proof/inventory", "terminal result {0}",

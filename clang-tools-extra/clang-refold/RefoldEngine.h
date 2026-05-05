@@ -265,7 +265,8 @@ private:
     return "Unknown";
   }
 
-  /// \brief Compact witness describing why the single-pass engine fell back to B.
+  /// \brief Compact witness describing why the single-pass engine fell back to
+  /// B.
   struct TerminalFallbackWitness {
     TerminalFallbackKind kind = TerminalFallbackKind::Unknown;
     uint32_t requestCount = 0;
@@ -280,9 +281,10 @@ private:
                            witness.requestCount)
           .str();
 
-    return llvm::formatv("kind={0} requestCount={1} primaryReason='{2}'",
-                         kindName, witness.requestCount,
-                         stringutils::showWSWithClip(witness.primaryReason, 200))
+    return llvm::formatv(
+               "kind={0} requestCount={1} primaryReason='{2}'", kindName,
+               witness.requestCount,
+               stringutils::showWSWithClip(witness.primaryReason, 200))
         .str();
   }
 
@@ -462,8 +464,8 @@ private:
   /// reinitializes the invariant totals from the loaded refold model. The
   /// include total is the size of the recorded include tree. The macro total is
   /// the number of top-level macro invocation roots recorded during
-  /// preprocessing, excluding nested expansion nodes that are attributable to an
-  /// outer caller via \c callerMacroId.
+  /// preprocessing, excluding nested expansion nodes that are attributable to
+  /// an outer caller via \c callerMacroId.
   void ResetAttemptStats() {
     lastStats_ = RefoldStats{};
     lastStats_.totalIncludes = model_.GetIncludes().size();
@@ -526,8 +528,8 @@ private:
   ///
   /// This is the first hybrid fallback/edit-composition helper used to avoid
   /// discarding already-proved structural artifacts when one PP hunk cannot be
-  /// anchored directly as a macro/include/TU edit. The helper stays deliberately
-  /// narrow:
+  /// anchored directly as a macro/include/TU edit. The helper stays
+  /// deliberately narrow:
   ///
   /// * only non-insertion hunks are eligible,
   /// * only top-level TU `#include` directives are considered,
@@ -567,9 +569,9 @@ private:
   /// \brief Verify that a post-terminal macro-owner witness is dominated by the
   ///        normal macro whole-cover candidate path.
   ///
-  /// The macro expansion-closure fallback is now a legacy safety net rather than
-  /// an independent completeness mechanism. If it discovers a witness, the same
-  /// root macro should have been visible earlier through
+  /// The macro expansion-closure fallback is now a legacy safety net rather
+  /// than an independent completeness mechanism. If it discovers a witness, the
+  /// same root macro should have been visible earlier through
   /// SmallestCoveringPatchableMacro() and should restamp to the normal
   /// MacroWholeCoverRealization proof carrier. This audit is intentionally
   /// side-effect-free: it reconstructs only the selector visibility and proof
@@ -586,8 +588,7 @@ private:
   /// embedded back into the TU with the usual line-drift resynchronization
   /// machinery. Otherwise the stage fails closed and the engine keeps falling
   /// back to the terminal edited-preprocessed stream result.
-  std::optional<std::string>
-  SynthesizeMacroOwnerExpansionClosureSource(
+  std::optional<std::string> SynthesizeMacroOwnerExpansionClosureSource(
       const ExpansionClosureWitness &witness) const;
 
   /// \brief Return whether a materialized fallback replacement is replay-stable
@@ -596,8 +597,8 @@ private:
   /// The initial Step 3 domain deliberately excludes identifiers because the
   /// source-level replay would otherwise need a stronger proof that rescanning
   /// the synthesized bytes cannot trigger further macro expansion.
-  bool ExpansionFallbackReplacementIsReplayStable(
-      StringRef replacementText) const;
+  bool
+  ExpansionFallbackReplacementIsReplayStable(StringRef replacementText) const;
 
   /// \brief Render an expansion-closure witness for trace output.
   std::string
@@ -613,12 +614,18 @@ private:
   /// escape.
   void EmitTheoremAudit() const {
     info("theorem",
-         "satisfied={0} emittedEdits={1} carriers={2} declared={3} discharged={4} "
-         "selectorOnlyExceptions={5} transitional={6} undischarged={7} unknownClass={8} outOfDomain={9} "
-         "selectorCompetitions={10} selectorResolutions={11} selectorNoSelectable={12} selectorUnresolved={13} "
-         "selectorDirectBypasses={14} explicitTerminalExclusions={15} nonExplicitTerminalExclusions={16} "
-         "expansionFallbackWitnesses={17} expansionFallbackSynthesisSuccesses={18} "
-         "expansionFallbackSynthesisRejections={19} expansionFallbackTerminalRescues={20}",
+         "satisfied={0} emittedEdits={1} carriers={2} declared={3} "
+         "discharged={4} "
+         "selectorOnlyExceptions={5} transitional={6} undischarged={7} "
+         "unknownClass={8} outOfDomain={9} "
+         "selectorCompetitions={10} selectorResolutions={11} "
+         "selectorNoSelectable={12} selectorUnresolved={13} "
+         "selectorDirectBypasses={14} explicitTerminalExclusions={15} "
+         "nonExplicitTerminalExclusions={16} "
+         "expansionFallbackWitnesses={17} "
+         "expansionFallbackSynthesisSuccesses={18} "
+         "expansionFallbackSynthesisRejections={19} "
+         "expansionFallbackTerminalRescues={20}",
          lastTheoremAudit_.theoremSatisfied ? 1 : 0,
          lastTheoremAudit_.emittedNonTerminalEdits,
          lastTheoremAudit_.emittedCarriers,
@@ -655,8 +662,7 @@ private:
   /// line is annotated when refolding terminated by falling back to the fully
   /// expanded B-side text.
   void EmitRefoldStats() const {
-    info("stats",
-         "includes-expanded={0}/{1} macros-expanded={2}/{3}{4}",
+    info("stats", "includes-expanded={0}/{1} macros-expanded={2}/{3}{4}",
          lastStats_.expandedIncludes, lastStats_.totalIncludes,
          lastStats_.expandedMacros, lastStats_.totalMacros,
          lastStats_.terminalFallbackToB ? " terminal-fallback=B" : "");
@@ -2258,7 +2264,8 @@ private:
   ///             each token in \p Toks; must be the same size as \p Toks and
   ///             index-aligned.
   /// \returns A list of lexeme strings of size Toks.size(), containing either
-  ///          the original token spelling or a position-tied whitespace sentinel.
+  ///          the original token spelling or a position-tied whitespace
+  ///          sentinel.
   static std::vector<StringRef> MapLexemes(ArrayRef<PPTok> toks,
                                            ArrayRef<size_t> offs);
 
@@ -2467,10 +2474,10 @@ private:
   ///        gap \p pp.
   ///
   /// Determines whether the empty A-side hunk at preprocessing-output gap
-  /// \p pp has a \em provable insertion point in the translation unit identified
-  /// by \p tuPath. This proof is used for two purposes: deciding whether the
-  /// pure insertion is truthfully TU-owned, and materializing the corresponding
-  /// zero-width TU span in byte space.
+  /// \p pp has a \em provable insertion point in the translation unit
+  /// identified by \p tuPath. This proof is used for two purposes: deciding
+  /// whether the pure insertion is truthfully TU-owned, and materializing the
+  /// corresponding zero-width TU span in byte space.
   ///
   /// The check is intentionally fail-closed. It accepts only:
   ///   - exact structural slot anchors recorded by the producer,
@@ -2489,9 +2496,9 @@ private:
   ///
   /// \returns The TU byte offset of the zero-width insertion anchor when a
   ///          truthful TU proof succeeds; otherwise \c std::nullopt.
-  std::optional<uint64_t> FindProvableTUInsertionAnchor(
-      uint64_t pp, StringRef tuPath,
-      TUAnchorWitness *witness = nullptr) const;
+  std::optional<uint64_t>
+  FindProvableTUInsertionAnchor(uint64_t pp, StringRef tuPath,
+                                TUAnchorWitness *witness = nullptr) const;
 
   /// Anchors a *pure insertion* (a PP-gap insertion) to a deterministic,
   /// canonical TU byte boundary representing the *same* preprocessed
@@ -2503,9 +2510,9 @@ private:
   /// structural boundary corresponding to that same PP coordinate.
   ///
   /// **Key property:** this method performs *no* "nearest" snapping. If `ppGap`
-  /// does not exactly match a known boundary PP coordinate, it returns `std::nullopt`
-  /// so callers can fall back to neighbor-based span anchoring. This avoids
-  /// regressions where an insertion belonging inside a nested owner
+  /// does not exactly match a known boundary PP coordinate, it returns
+  /// `std::nullopt` so callers can fall back to neighbor-based span anchoring.
+  /// This avoids regressions where an insertion belonging inside a nested owner
   /// (include/arm) is incorrectly pulled out to a shallower boundary.
   ///
   /// **Boundary sources considered** (each producing a candidate `(pp,b)`
@@ -2534,11 +2541,11 @@ private:
   /// \param ppGap  the PP gap index (between PP tokens) representing the
   ///               desired insertion coordinate
   /// \returns the TU byte offset of an exact canonical boundary matching
-  ///          `ppGap`, or `std::nullopt` if `ppGap` is not exactly on a known boundary
-  ///          (caller should fall back)
-  std::optional<uint64_t> AnchorToExactSlotBoundaryFromPPGap(
-      StringRef tuPath, uint64_t ppGap,
-      TUAnchorWitness *witness = nullptr) const;
+  ///          `ppGap`, or `std::nullopt` if `ppGap` is not exactly on a known
+  ///          boundary (caller should fall back)
+  std::optional<uint64_t>
+  AnchorToExactSlotBoundaryFromPPGap(StringRef tuPath, uint64_t ppGap,
+                                     TUAnchorWitness *witness = nullptr) const;
 
   /// \brief Finds the ID of the narrowest include range that covers a given PP
   /// index.
@@ -2569,22 +2576,24 @@ private:
     return bestId;
   }
 
-  /// \brief Compute the TU (translation unit) byte span \c [b,e) that corresponds
-  /// to an A-side PP-token interval \c [a0,a1).
+  /// \brief Compute the TU (translation unit) byte span \c [b,e) that
+  /// corresponds to an A-side PP-token interval \c [a0,a1).
   ///
-  /// This routine converts a diff hunk expressed in A-token indices into a concrete
-  /// byte range in the TU source file. The contract is intentionally conservative:
-  /// if the interval cannot be proven to touch the TU (or cannot be safely anchored
-  /// into the TU for a pure insertion), the method returns \c std::nullopt rather
-  /// than "snapping" across ownership boundaries.
+  /// This routine converts a diff hunk expressed in A-token indices into a
+  /// concrete byte range in the TU source file. The contract is intentionally
+  /// conservative: if the interval cannot be proven to touch the TU (or cannot
+  /// be safely anchored into the TU for a pure insertion), the method returns
+  /// \c std::nullopt rather than "snapping" across ownership boundaries.
   ///
   /// \par Behavior
   /// 1. **Normalize indices:** if \p a0 > \p a1 the bounds are swapped.
-  /// 2. **Pure insertion fast-path:** if \p a0 == \p a1, first try to anchor on an
+  /// 2. **Pure insertion fast-path:** if \p a0 == \p a1, first try to anchor on
+  /// an
   ///    *exact* canonical TU slot boundary recorded at the same PP gap via
   ///    AnchorToExactSlotBoundaryFromPPGap(). If present, returns \c {b,b}.
   /// 3. **Direct TU coverage:** for non-empty intervals, scan PP indices in
-  ///    \c [a0,a1) and consider only tokmap entries whose \c TokMapEntry::file equals
+  ///    \c [a0,a1) and consider only tokmap entries whose \c TokMapEntry::file
+  ///    equals
   ///    \p tuPath. If any exist, returns the minimal enclosing TU byte span
   ///    \c [min(ent.b), max(ent.e)).
   /// 4. **No TU-mapped tokens:**
@@ -2594,12 +2603,15 @@ private:
   ///      FindProvableTUInsertionAnchor(). If it succeeds, return \c {b,b};
   ///      otherwise return \c std::nullopt.
   ///
-  /// A returned span \c {b,b} denotes a concrete insertion anchor point in the TU.
+  /// A returned span \c {b,b} denotes a concrete insertion anchor point in the
+  /// TU.
   ///
   /// \param a0 Inclusive start A-side PP-token index.
   /// \param a1 Exclusive end A-side PP-token index.
-  /// \param tuPath Absolute/canonical TU path (must match \c TokMapEntry::file).
-  /// \returns A TU byte span \c [b,e) (or \c {b,b} for a pure insertion anchor),
+  /// \param tuPath Absolute/canonical TU path (must match \c
+  /// TokMapEntry::file).
+  /// \returns A TU byte span \c [b,e) (or \c {b,b} for a pure insertion
+  /// anchor),
   ///          or \c std::nullopt if no TU span/anchor can be derived safely.
   std::optional<std::pair<uint64_t, uint64_t>>
   TUByteSpan(uint64_t a0, uint64_t a1, StringRef tuPath) const;
@@ -2725,9 +2737,10 @@ private:
   ///
   /// This is used when the caller performs pasted-token validation at a higher
   /// level (e.g., validating that a set of arg replacements reconstructs the
-  /// entire pasted token exactly via `PasteArgReplacementsMatchAllPasteTokensInB`).
-  /// In that situation, re-validating each paste span in isolation can cause
-  /// false negatives, because:
+  /// entire pasted token exactly via
+  /// `PasteArgReplacementsMatchAllPasteTokensInB`). In that situation,
+  /// re-validating each paste span in isolation can cause false negatives,
+  /// because:
   /// * Multiple arguments may contribute to a single pasted token.
   /// * One edit hunk may modify multiple pasted segments simultaneously.
   /// * Local A->B mapping can be partial away from the edit site.
@@ -2916,16 +2929,17 @@ private:
   static bool HunkTouchesAnyPasteToken(const RefoldModel::MacroInvocation &m,
                                        const diffutils::Hunk &h);
 
-  /// \brief Attempts to derive a single-argument "paste edit" for a token-pasting
-  /// (`##`) macro invocation.
+  /// \brief Attempts to derive a single-argument "paste edit" for a
+  /// token-pasting (`##`) macro invocation.
   ///
   /// This is the fast-path used when a hunk touches a `pasteSpans` occurrence.
   /// In this case, the edited region in the preprocessed output may lie
   /// *inside* a single pasted token (e.g., changing `a_b_c` to `a_d_c`), which
   /// cannot be recovered by standard token-to-token argument span matching.
   /// Instead, the refolder tries to attribute the change to exactly one
-  /// contributing argument by using the producer-provided `[byteBegin, byteEnd)`
-  /// subrange describing each argument's slice within the pasted token.
+  /// contributing argument by using the producer-provided `[byteBegin,
+  /// byteEnd)` subrange describing each argument's slice within the pasted
+  /// token.
   ///
   /// ### High-level algorithm
   /// 1. Collect all `pasteSpans` that intersect the hunk in A-token space.
@@ -2990,14 +3004,14 @@ private:
   ///    trailing newlines.
   /// 5. Deterministically segment the B token into per-argument regions.
   ///
-  /// Segmentation is performed by anchoring on the *fixed* (non-span) substrings
-  /// between paste spans in the A token. For a contiguous run of adjacent spans
-  /// (no fixed internal anchor), the inversion now computes an explicit
-  /// certificate: the run is invertible when unchanged neighboring segments pin
-  /// the boundary, and conservatively ambiguous once more than one touching
-  /// span in the same run would need to change. This supports edits such as
-  /// `a##b##c -> foo##b##c` while still rejecting underdetermined rewrites like
-  /// `a##b##c -> foo##bar##c`.
+  /// Segmentation is performed by anchoring on the *fixed* (non-span)
+  /// substrings between paste spans in the A token. For a contiguous run of
+  /// adjacent spans (no fixed internal anchor), the inversion now computes an
+  /// explicit certificate: the run is invertible when unchanged neighboring
+  /// segments pin the boundary, and conservatively ambiguous once more than one
+  /// touching span in the same run would need to change. This supports edits
+  /// such as `a##b##c -> foo##b##c` while still rejecting underdetermined
+  /// rewrites like `a##b##c -> foo##bar##c`.
   ///
   /// ### Return value
   /// On success, returns a list of `PasteArgEdit` objects, one per affected
@@ -3021,9 +3035,9 @@ private:
   DerivePasteArgEdits(const RefoldModel::MacroInvocation &m,
                       const diffutils::Hunk &h) const;
 
-  /// \brief Segments the edited pasted-token spelling (`bTok`) into per-argument
-  /// substrings by using the original pasted-token spelling (`aTok`) as an
-  /// anchor template.
+  /// \brief Segments the edited pasted-token spelling (`bTok`) into
+  /// per-argument substrings by using the original pasted-token spelling
+  /// (`aTok`) as an anchor template.
   ///
   /// The input `spansAsc` identifies the argument-contributed regions inside
   /// `aTok`: each `PPArgSpan` provides `[byteBegin, byteEnd)` offsets that
@@ -3098,8 +3112,8 @@ private:
   /// \param oldSeg sub-segment from the pasted token that originated from
   ///               `baseArg`
   /// \returns the pasted-token replacement segment implied by
-  ///          `baseArg -> newArg`, or an empty `StringRef()` if the segment cannot be
-  ///          derived soundly.
+  ///          `baseArg -> newArg`, or an empty `StringRef()` if the segment
+  ///          cannot be derived soundly.
   static StringRef DeriveNewPasteSegmentFromSpellingReplacement(
       StringRef baseArg, StringRef newArg, StringRef oldSeg);
 
@@ -3223,9 +3237,9 @@ private:
   ///
   /// ## Recovery: conservative textual parse
   ///
-  /// If some producer-provided ranges are missing/invalid, this routine attempts
-  /// to fill them using a conservative parse of the invocation spelling. When
-  /// the parsed arity differs from the formal arity:
+  /// If some producer-provided ranges are missing/invalid, this routine
+  /// attempts to fill them using a conservative parse of the invocation
+  /// spelling. When the parsed arity differs from the formal arity:
   ///
   /// * **`actualN == formalN`**: fill missing entries 1:1.
   /// * **`actualN > formalN`**: treat as variadic and merge the remaining tail
@@ -3316,22 +3330,23 @@ private:
   /// table.
   ///
   /// This helper converts a half-open token interval `[startTok, endTok)` into
-  /// a byte-offset range using `tokOff` and returns the corresponding `StringRef`
-  /// of `source`.
+  /// a byte-offset range using `tokOff` and returns the corresponding
+  /// `StringRef` of `source`.
   ///
   /// `tokOff` is the token-to-byte offset table:
   /// * `tokOff[i]` is the starting byte offset of token `i`.
   /// * The table is expected to have length `(numTokens + 1)`, where the final
   ///   entry `tokOff[numTokens]` equals `source.size()` (end sentinel).
   ///
-  /// For robustness, this method clamps token indices into the valid table range
-  /// and clamps derived byte offsets into `[0, source.size()]`.
+  /// For robustness, this method clamps token indices into the valid table
+  /// range and clamps derived byte offsets into `[0, source.size()]`.
   ///
   /// \param tokOff   Token-to-byte offset table.
   /// \param source   The source text to slice.
   /// \param startTok Inclusive start token index.
   /// \param endTok   Exclusive end token index.
-  /// \returns A `StringRef` of the source covered by tokens `[startTok, endTok)`.
+  /// \returns A `StringRef` of the source covered by tokens `[startTok,
+  /// endTok)`.
   static StringRef SliceSource(ArrayRef<size_t> tokOff, StringRef source,
                                uint64_t startTok, uint64_t endTok);
 
@@ -3500,9 +3515,10 @@ private:
   /// \returns A pair representing the [begin, end) token indices in source B.
   std::pair<size_t, size_t>
   MapAByteRangeToBTokenEnvelope(size_t aByteBegin, size_t aByteEnd) const;
+
   std::pair<size_t, size_t>
-  MapAByteRangeToBTokenEnvelopePreserveBoundaryInsertions(size_t aByteBegin,
-                                                          size_t aByteEnd) const;
+  MapAByteRangeToBTokenEnvelopePreserveBoundaryInsertions(
+      size_t aByteBegin, size_t aByteEnd) const;
 
   /// \brief Maps a macro argument span to its corresponding B-token envelope.
   ///
@@ -3528,9 +3544,10 @@ private:
   /// \returns The B-token range if the input is valid, std::nullopt otherwise.
   std::optional<std::pair<size_t, size_t>>
   MapATokRangeAToBTokenEnvelope(uint64_t beginTok, uint64_t endTok) const;
+
   std::optional<std::pair<size_t, size_t>>
-  MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(uint64_t beginTok,
-                                                          uint64_t endTok) const;
+  MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
+      uint64_t beginTok, uint64_t endTok) const;
 
   /// \brief Map an A-token range to its B-token envelope for whole-cover
   /// replacement.
@@ -3549,8 +3566,8 @@ private:
   ///
   /// Rationale:
   ///   Byte-level envelope mapping can legally absorb a pure-insertion hunk
-  ///   anchored exactly at `beginTok` or `endTok` into the mapped B envelope for
-  ///   the interior A span. For whole-cover macro replacement, those edge
+  ///   anchored exactly at `beginTok` or `endTok` into the mapped B envelope
+  ///   for the interior A span. For whole-cover macro replacement, those edge
   ///   insertions are outside the macro cover and are applied separately; if
   ///   they are also included in the whole-cover slice, the insertion material
   ///   is duplicated. This method enforces a deterministic "no absorption of
@@ -3835,7 +3852,8 @@ private:
   CompletenessContract
   BuildCompletenessContract(const ProofSummary &summary) const;
 
-  /// \brief Compute the explicit theorem-domain contract for an accepted summary.
+  /// \brief Compute the explicit theorem-domain contract for an accepted
+  /// summary.
   ///
   /// This must stay definitionally aligned with the completeness contract and
   /// theorem audit: theorem-facing summaries are in-domain only when they are
@@ -4026,7 +4044,8 @@ private:
   std::string FormatTUAnchorWitness(const TUAnchorWitness &witness) const;
 
   /// \brief Format a concrete include anchor witness for tracing.
-  std::string FormatIncludeAnchorWitness(const IncludeAnchorWitness &witness) const;
+  std::string
+  FormatIncludeAnchorWitness(const IncludeAnchorWitness &witness) const;
 
   /// \brief Format a concrete include-realization witness for tracing.
   ///
@@ -4522,8 +4541,8 @@ private:
   /// "between-children" positions:
   /// - If `pos` lies *strictly inside* a child’s cover window
   ///   (`kid.coverBegin < pos && pos < kid.coverEnd`), this fallback does not
-  ///   apply and returns `std::nullopt` (the insertion should have been owned by that
-  ///   child include).
+  ///   apply and returns `std::nullopt` (the insertion should have been owned
+  ///   by that child include).
   /// - Boundary positions are allowed (`pos == kid.coverBegin` or
   ///   `pos == kid.coverEnd`) and are treated as being "between" children.
   ///
@@ -4540,7 +4559,8 @@ private:
   ///    by returning `right.siteB`.
   /// 2. Else if `left` exists, insert *after* the left child’s `#include` site
   ///    by returning `left.siteE`.
-  /// 3. Otherwise return `std::nullopt` to indicate that no sane anchor could be derived.
+  /// 3. Otherwise return `std::nullopt` to indicate that no sane anchor could
+  ///    be derived.
   ///
   /// This method does not validate that the returned site offsets are within
   /// the current header text bounds; callers should ensure the returned byte
@@ -4556,9 +4576,8 @@ private:
   /// \param witness Optional Step-8 witness sink that records which child
   ///               boundary was chosen when the fallback succeeds.
   /// \return A byte offset within `file` at which the insertion should be
-  /// applied,
-  ///         or `std::nullopt` if this fallback does not apply or no stable anchor can be
-  ///         found.
+  ///         applied, or `std::nullopt` if this fallback does not apply or no
+  ///         stable anchor can be found.
   std::optional<uint64_t> ComputeChildBoundaryInsertByte(
       const IncludePatch &p, StringRef file,
       IncludeAnchorWitness *witness = nullptr) const;
@@ -4732,8 +4751,8 @@ private:
   ///
   /// If \p pp maps to an entry whose \c file matches the requested \p file,
   /// this returns the mapped begin byte offset (\c b). Otherwise, this returns
-  /// \p fileLen when \p fallbackToEOF is enabled, or `std::nullopt` when fallback is
-  /// disabled.
+  /// \p fileLen when \p fallbackToEOF is enabled, or `std::nullopt` when
+  /// fallback is disabled.
   ///
   /// The \p fallbackToEOF behavior is intended for boundary cases where we want
   /// a deterministic anchoring point even when a PP position does not directly
@@ -4742,13 +4761,15 @@ private:
   ///
   /// \param file the file path whose mapping is being queried (TU or included
   ///        header)
-  /// \param pp the PP token index in the A-side preprocessed token stream to resolve
+  /// \param pp the PP token index in the A-side preprocessed token stream to
+  /// resolve
   /// \param fallbackToEOF if true, return \p fileLen when \p pp does not map
   ///        into \p file
   /// \param fileLen the length of \p file in bytes (used only when
   ///        \p fallbackToEOF is true)
   /// \return the mapped start byte offset in \p file, or \p fileLen when
-  ///         falling back to EOF, or `std::nullopt` if unmapped and fallback is disabled
+  ///         falling back to EOF, or `std::nullopt` if unmapped and fallback is
+  ///         disabled
   std::optional<uint64_t> ByteStartForPPInFile(StringRef file, uint64_t pp,
                                                bool fallbackToEOF,
                                                size_t fileLen) const {
@@ -4768,13 +4789,15 @@ private:
   ///
   /// \param file the file path whose mapping is being queried (TU or included
   ///        header)
-  /// \param pp the PP token index in the A-side preprocessed token stream to resolve
+  /// \param pp the PP token index in the A-side preprocessed token stream to
+  ///        resolve
   /// \param fallbackToEOF if true, return \p fileLen when \p pp does not map
   ///        into \p file
   /// \param fileLen the length of \p file in bytes (used only when
   ///        \p fallbackToEOF is true)
   /// \return the mapped end byte offset in \p file, or \p fileLen when falling
-  ///         back to EOF, or `std::nullopt` if unmapped and fallback is disabled
+  ///         back to EOF, or `std::nullopt` if unmapped and fallback is
+  ///         disabled
   std::optional<uint64_t> ByteEndForPPInFile(StringRef file, uint64_t pp,
                                              bool fallbackToEOF,
                                              size_t fileLen) const {
@@ -4865,7 +4888,6 @@ template <> struct format_provider<RefoldEngine::TerminalFallbackWitness> {
     os << toString(witness);
   }
 };
-
 
 template <> struct DenseMapInfo<std::optional<uint64_t>> {
   static inline std::optional<uint64_t> getEmptyKey() {

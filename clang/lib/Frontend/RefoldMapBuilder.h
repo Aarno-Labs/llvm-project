@@ -397,18 +397,19 @@ class RefoldMapBuilder {
   /// emitted by '#'.
   llvm::StringMap<llvm::SmallVector<size_t, 2>> PasteSpell2MacroItems;
   llvm::StringMap<size_t> IncludeKey2Item;
-  std::vector<std::optional<size_t>> IncludeStack; // item indices (include items),
-                                                   // nullopt for none
+  std::vector<std::optional<size_t>> IncludeStack; // item indices (include
+                                                   // items), nullopt for none
   std::optional<size_t> CurrentFileItem;
 
   std::vector<TokMapEntry> TokMap;
 
   std::string OutPath;
-  std::string Cwd; // Captured working directory (for resolving relative spellings)
+  std::string
+      Cwd; // Captured working directory (for resolving relative spellings)
 
-  std::string TUSourcePath;   // TU path spelling (for JSON 'source')
-  bool EmitAbsPaths = false;  // If true, emit canonical absolute paths
-  bool EnableByteSpans;       // If true, then serialize the per-token byte spans
+  std::string TUSourcePath;  // TU path spelling (for JSON 'source')
+  bool EmitAbsPaths = false; // If true, emit canonical absolute paths
+  bool EnableByteSpans;      // If true, then serialize the per-token byte spans
 
   /// Map resolved absolute include directories -> original `-I` spellings.
   llvm::StringMap<std::string> IncludeDirAbs2Spelling;

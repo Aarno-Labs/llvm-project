@@ -138,7 +138,8 @@ void RefoldEngine::MaterializeIncludeExpansion(
     const DenseMap<uint64_t, std::vector<const RefoldModel::IncludeItem *>>
         &children,
     DenseMap<uint64_t, std::string> &includeExpansion,
-    DenseMap<uint64_t, AcceptedResultCandidate> &includeExpansionAcceptedResults,
+    DenseMap<uint64_t, AcceptedResultCandidate>
+        &includeExpansionAcceptedResults,
     DenseSet<uint64_t> *appliedExpandedMacroRootIds) const {
   // Already materialized?
   if (includeExpansion.count(includeId)) {
@@ -330,12 +331,14 @@ void RefoldEngine::MaterializeIncludeExpansion(
         TextEdit edit{siteStart, siteEnd, std::move(wrapped), std::nullopt,
                       std::nullopt, {}};
         auto itAccepted = includeExpansionAcceptedResults.find(child->id);
-        if (itAccepted != includeExpansionAcceptedResults.end())
+        if (itAccepted != includeExpansionAcceptedResults.end()) {
           AttachAcceptedResultCarrier(edit, itAccepted->second);
-        else
+        } else {
           AttachAcceptedResultCarrier(
-              edit, BuildAcceptedIncludeRealizationCandidate(
-                        AcceptedPathKind::IncludeMaterializedExpansion, *child));
+              edit,
+              BuildAcceptedIncludeRealizationCandidate(
+                  AcceptedPathKind::IncludeMaterializedExpansion, *child));
+        }
         edits.push_back(std::move(edit));
       } else {
         // A degenerate child site cannot discharge an include-preserving edit
@@ -468,7 +471,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     // witness data (for example whether the edit is an insertion or is owned
     // by a selected conditional arm).
     auto includeInventoryFor = [&](AcceptedPathKind path,
-                                  const IncludeAnchorWitness *witness = nullptr) {
+                                   const IncludeAnchorWitness *witness =
+                                       nullptr) {
       return FormatAcceptedPathAudit(path, &p, /*tuAnchorWitness=*/nullptr,
                                      witness);
     };
@@ -532,9 +536,9 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       auto anchorMatchesCondArmCert = [&](uint64_t anchorByte) -> bool {
         if (!p.ownerHasCondArmCert)
           return true;
-        auto armRef = model_.FindArmRefForByte(file, ie.include->id, anchorByte);
-        return armRef && armRef->arm &&
-               armRef->arm->id == p.ownerCondArmIdCert;
+        auto armRef =
+            model_.FindArmRefForByte(file, ie.include->id, anchorByte);
+        return armRef && armRef->arm && armRef->arm->id == p.ownerCondArmIdCert;
       };
 
       struct InsertAnchorCandidate {
@@ -550,9 +554,11 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       auto traceInsertCandidate = [&](const InsertAnchorCandidate &candidate,
                                       StringRef stage) {
         const AcceptedResultCandidate acceptedCandidate =
-            BuildAcceptedIncludeCandidate(candidate.path, p, &candidate.witness);
+            BuildAcceptedIncludeCandidate(candidate.path, p,
+                                          &candidate.witness);
         trace("include/apply",
-              "file={0} patch[{1}] INSERT: candidate stage={2} anchorByte={3} candidate={4}",
+              "file={0} patch[{1}] INSERT: candidate stage={2} anchorByte={3} "
+              "candidate={4}",
               file, idx, stage, candidate.anchorByte,
               FormatAcceptedResultCandidate(acceptedCandidate));
       };
@@ -575,25 +581,26 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
             SelectPreferredAcceptedResultCandidateIndex(acceptedCandidates);
         if (!bestIdx) {
           trace("include/apply",
-                "file={0} patch[{1}] INSERT: no candidate survived proof-discharge "
+                "file={0} patch[{1}] INSERT: no candidate survived "
+                "proof-discharge "
                 "gating",
                 file, idx);
           return std::nullopt;
         }
 
         trace("include/apply",
-              "file={0} patch[{1}] INSERT: selected candidate anchorByte={2} candidate={3}",
+              "file={0} patch[{1}] INSERT: selected candidate anchorByte={2} "
+              "candidate={3}",
               file, idx, candidates[*bestIdx].anchorByte,
               FormatAcceptedResultCandidate(acceptedCandidates[*bestIdx]));
         return candidates[*bestIdx];
       };
 
       auto commitInsertCandidate = [&](const InsertAnchorCandidate &candidate) {
-        std::string text =
-            PadAtBoundaries(headerText, static_cast<size_t>(candidate.anchorByte),
-                            static_cast<size_t>(candidate.anchorByte),
-                            p.insertBytes,
-                            /* allowLeft */ true, /* allowRight */ true);
+        std::string text = PadAtBoundaries(
+            headerText, static_cast<size_t>(candidate.anchorByte),
+            static_cast<size_t>(candidate.anchorByte), p.insertBytes,
+            /* allowLeft */ true, /* allowRight */ true);
         TextEdit edit = MakeTextEditWithResyncOrPending(
             headerText, candidate.anchorByte, candidate.anchorByte, text, file);
         AttachAcceptedResultCarrier(
@@ -665,7 +672,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
 
         IncludeAnchorWitness childBoundaryWitness;
         if (const std::optional<uint64_t> insertByte =
-                ComputeChildBoundaryInsertByte(p, file, &childBoundaryWitness)) {
+                ComputeChildBoundaryInsertByte(p, file,
+                                               &childBoundaryWitness)) {
           if (*insertByte <= fileLen && anchorMatchesCondArmCert(*insertByte)) {
             InsertAnchorCandidate candidate;
             candidate.path = AcceptedPathKind::IncludeInsertChildBoundary;
@@ -698,16 +706,20 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
             ByteStartForPPInFile(file, *rightAnchorPP,
                                  /* fallbackToEOF */ false, fileLen);
         IncludeAnchorWitness rightNeighborWitness;
-        rightNeighborWitness.evidence = IncludeAnchorEvidenceKind::RightNeighborPP;
+        rightNeighborWitness.evidence =
+            IncludeAnchorEvidenceKind::RightNeighborPP;
         rightNeighborWitness.hasNeighborPP = true;
         rightNeighborWitness.neighborPP = *rightAnchorPP;
         rightNeighborWitness.hasAnchorByte = rightStartByte.has_value();
-        rightNeighborWitness.anchorByte = rightStartByte ? *rightStartByte : 0ULL;
-        trace("include/apply",
-              "file={0} patch[{1}] INSERT: right-neighbor anchorPP={2} -> startByte={3} inventory={4}",
-              file, idx, rightAnchorPP, rightStartByte,
-              includeInventoryFor(AcceptedPathKind::IncludeInsertRightNeighborPP,
-                                  &rightNeighborWitness));
+        rightNeighborWitness.anchorByte =
+            rightStartByte ? *rightStartByte : 0ULL;
+        trace(
+            "include/apply",
+            "file={0} patch[{1}] INSERT: right-neighbor anchorPP={2} -> "
+            "startByte={3} inventory={4}",
+            file, idx, rightAnchorPP, rightStartByte,
+            includeInventoryFor(AcceptedPathKind::IncludeInsertRightNeighborPP,
+                                &rightNeighborWitness));
         if (!rightStartByte) {
           plan.requiresIncludeRealization = true;
           plan.realizationReason =
@@ -745,20 +757,23 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         const std::optional<uint64_t> leftStartByte =
             ByteEndForPPInFile(file, *leftAnchorPP, false, fileLen);
         IncludeAnchorWitness leftNeighborWitness;
-        leftNeighborWitness.evidence = IncludeAnchorEvidenceKind::LeftNeighborPP;
+        leftNeighborWitness.evidence =
+            IncludeAnchorEvidenceKind::LeftNeighborPP;
         leftNeighborWitness.hasNeighborPP = true;
         leftNeighborWitness.neighborPP = *leftAnchorPP;
         leftNeighborWitness.hasAnchorByte = leftStartByte.has_value();
         leftNeighborWitness.anchorByte = leftStartByte ? *leftStartByte : 0ULL;
         trace("include/apply",
-              "file={0} patch[{1}] INSERT: left-neighbor anchorPP={2} -> startByte={3} inventory={4}",
+              "file={0} patch[{1}] INSERT: left-neighbor anchorPP={2} -> "
+              "startByte={3} inventory={4}",
               file, idx, leftAnchorPP, leftStartByte,
               includeInventoryFor(AcceptedPathKind::IncludeInsertLeftNeighborPP,
                                   &leftNeighborWitness));
         if (!leftStartByte) {
           plan.requiresIncludeRealization = true;
           plan.realizationReason =
-              llvm::formatv("INSERT: failed to map left-neighbor anchorPP={0} in file {1}",
+              llvm::formatv("INSERT: failed to map left-neighbor anchorPP={0} "
+                            "in file {1}",
                             *leftAnchorPP, file)
                   .str();
           return plan;
@@ -782,7 +797,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         declWitness.declHeaderB = decl->headerB;
         declWitness.declHeaderE = decl->headerE;
         trace("include/apply",
-              "file={0} patch[{1}] INSERT: no neighbors; anchor at declEnd={2} inventory={3}",
+              "file={0} patch[{1}] INSERT: no neighbors; anchor at declEnd={2} "
+              "inventory={3}",
               file, idx, declAnchorByte,
               includeInventoryFor(AcceptedPathKind::IncludeInsertDeclBoundary,
                                   &declWitness));
@@ -802,7 +818,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       }
 
       debug("include/apply.",
-            "file={0} patch[{1}] INSERT: no admissible include-preserving anchor; realizing include",
+            "file={0} patch[{1}] INSERT: no admissible include-preserving "
+            "anchor; realizing include",
             file, idx);
       plan.requiresIncludeRealization = true;
       plan.realizationReason =
@@ -853,12 +870,14 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                                        /* fallbackToEOF */ false, fileLen);
       endByte =
           ByteEndForPPInFile(file, *lastPP, /* fallbackToEOF */ false, fileLen);
-      mappedHeaderWitness.evidence = IncludeAnchorEvidenceKind::MappedHeaderTokens;
+      mappedHeaderWitness.evidence =
+          IncludeAnchorEvidenceKind::MappedHeaderTokens;
       mappedHeaderWitness.hasFirstPP = firstPP.has_value();
       mappedHeaderWitness.firstPP = firstPP ? *firstPP : 0ULL;
       mappedHeaderWitness.hasLastPP = lastPP.has_value();
       mappedHeaderWitness.lastPP = lastPP ? *lastPP : 0ULL;
-      mappedHeaderWitness.hasByteRange = startByte.has_value() && endByte.has_value();
+      mappedHeaderWitness.hasByteRange =
+          startByte.has_value() && endByte.has_value();
       mappedHeaderWitness.startByte = startByte ? *startByte : 0ULL;
       mappedHeaderWitness.endByte = endByte ? *endByte : 0ULL;
       trace("include/apply",
@@ -966,10 +985,9 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
   return plan;
 }
 
-std::optional<uint64_t>
-RefoldEngine::ComputeChildBoundaryInsertByte(const IncludePatch &p,
-                                             StringRef file,
-                                             IncludeAnchorWitness *witness) const {
+std::optional<uint64_t> RefoldEngine::ComputeChildBoundaryInsertByte(
+    const IncludePatch &p, StringRef file,
+    IncludeAnchorWitness *witness) const {
   // Which include are we editing?
   const RefoldModel::IncludeItem *owner = p.include;
   if (!owner) {
@@ -1163,8 +1181,8 @@ bool RefoldEngine::EmittedTextEditHasDischargedAcceptedResults(
         carrier.proofSummary.completeness.coverage !=
             CompletenessCoverageKind::DeclaredProofClass) {
       ++lastTheoremAudit_.emittedOutOfDomainCarriers;
-      NoteTheoremAuditViolation(
-          "emitted carrier was not theorem-domain in-domain at the byte-edit boundary");
+      NoteTheoremAuditViolation("emitted carrier was not theorem-domain "
+                                "in-domain at the byte-edit boundary");
       return false;
     }
 
@@ -1175,19 +1193,19 @@ bool RefoldEngine::EmittedTextEditHasDischargedAcceptedResults(
     }
 
     ++lastTheoremAudit_.emittedUndischargedCarriers;
-    NoteTheoremAuditViolation(
-        "emitted carrier failed local proof discharge at the byte-edit boundary");
+    NoteTheoremAuditViolation("emitted carrier failed local proof discharge at "
+                              "the byte-edit boundary");
     return false;
   };
 
   if (edit.acceptedResults.empty()) {
-    NoteTheoremAuditViolation(
-        "emitted edit reached the byte-edit boundary without accepted-result carriers");
+    NoteTheoremAuditViolation("emitted edit reached the byte-edit boundary "
+                              "without accepted-result carriers");
     RequestTerminalFallback(
         TerminalFallbackKind::UndischargedEmissionArtifact, emissionPhase,
-        llvm::formatv(
-            "emitted edit bytes=[{0},{1}) in {2} has no normalized accepted-result carriers",
-            edit.start, edit.end, owner)
+        llvm::formatv("emitted edit bytes=[{0},{1}) in {2} has no normalized "
+                      "accepted-result carriers",
+                      edit.start, edit.end, owner)
             .str());
     return false;
   }
@@ -1200,9 +1218,9 @@ bool RefoldEngine::EmittedTextEditHasDischargedAcceptedResults(
           "emitted edit carried a null accepted-result carrier");
       RequestTerminalFallback(
           TerminalFallbackKind::UndischargedEmissionArtifact, emissionPhase,
-          llvm::formatv(
-              "emitted edit bytes=[{0},{1}) in {2} has null accepted-result carrier #{3}",
-              edit.start, edit.end, owner, i)
+          llvm::formatv("emitted edit bytes=[{0},{1}) in {2} has null "
+                        "accepted-result carrier #{3}",
+                        edit.start, edit.end, owner, i)
               .str());
       return false;
     }
@@ -1210,10 +1228,10 @@ bool RefoldEngine::EmittedTextEditHasDischargedAcceptedResults(
     if (!carrierIsEmissionDischarged(*carrier)) {
       RequestTerminalFallback(
           TerminalFallbackKind::UndischargedEmissionArtifact, emissionPhase,
-          llvm::formatv(
-              "emitted edit bytes=[{0},{1}) in {2} carries non-discharged result #{3}: {4}",
-              edit.start, edit.end, owner, i,
-              FormatAcceptedResultCandidate(*carrier))
+          llvm::formatv("emitted edit bytes=[{0},{1}) in {2} carries "
+                        "non-discharged result #{3}: {4}",
+                        edit.start, edit.end, owner, i,
+                        FormatAcceptedResultCandidate(*carrier))
               .str());
       return false;
     }
@@ -1222,8 +1240,7 @@ bool RefoldEngine::EmittedTextEditHasDischargedAcceptedResults(
   return true;
 }
 
-std::string
-RefoldEngine::ApplyTextEditsWithPendingResync(
+std::string RefoldEngine::ApplyTextEditsWithPendingResync(
     StringRef originalFileText, ArrayRef<TextEdit> edits,
     DenseSet<uint64_t> *appliedExpandedMacroRootIds,
     StringRef emissionOwner) const {
@@ -1342,8 +1359,7 @@ RefoldEngine::ApplyTextEditsWithPendingResync(
       if (merged.expandedMacroRootId && dup.expandedMacroRootId &&
           *merged.expandedMacroRootId != *dup.expandedMacroRootId) {
         RequestTerminalFallback(
-            TerminalFallbackKind::UndischargedEmissionArtifact,
-            "edits/apply",
+            TerminalFallbackKind::UndischargedEmissionArtifact, "edits/apply",
             llvm::formatv("duplicate non-zero edits for span [{0},{1}) in {2} "
                           "carry incompatible expanded macro roots {3} and {4}",
                           s, t, emissionOwner, *merged.expandedMacroRootId,
@@ -1373,8 +1389,8 @@ RefoldEngine::ApplyTextEditsWithPendingResync(
   // discharged for emitted source text. Do not emit any edit whose carriers
   // are missing or not yet discharged.
   for (const TextEdit &edit : norm) {
-    if (!EmittedTextEditHasDischargedAcceptedResults(
-            edit, "emit/nonterminal", emissionOwner))
+    if (!EmittedTextEditHasDischargedAcceptedResults(edit, "emit/nonterminal",
+                                                     emissionOwner))
       return originalFileText.str();
   }
 

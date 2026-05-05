@@ -29,8 +29,8 @@ RefoldEngine::ResolveIncludeRealizationBTokenEnvelope(
   // When the canonical mapper cannot recover the B envelope, consult the
   // existing deterministic rescue projections and accept them only if the
   // usable projections agree on one non-empty B-token envelope.
-  auto isUsableEnvelope = [&](const std::optional<std::pair<size_t, size_t>> &env)
-      -> bool {
+  auto isUsableEnvelope =
+      [&](const std::optional<std::pair<size_t, size_t>> &env) -> bool {
     if (!env || env->second <= env->first)
       return false;
     return !SliceBSource(env->first, env->second).trim().empty();

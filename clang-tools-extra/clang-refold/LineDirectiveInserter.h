@@ -279,8 +279,8 @@ private:
   /// \param to end index (exclusive) of the line (not including the newline)
   /// \return parsed directive state or null if the line does not match the
   ///         expected form
-  static std::optional<LineDirectiveState> ParseLineDirective(StringRef src,
-                                                              size_t from, size_t to);
+  static std::optional<LineDirectiveState>
+  ParseLineDirective(StringRef src, size_t from, size_t to);
 
   /// \brief Computes whether emitting `#line targetLine "fileSpellingForDir"` at
   /// the current output position would have no effect on the logical location.
