@@ -574,14 +574,37 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       }
     }
 
+    if (remainingPadNl > 0) {
+      if (lineDirs_.Enabled()) {
+        // Keep line-preservation semantic rather than physical in normal mode:
+        // suppress synthetic blank padding here and let ApplyResyncOrPend()
+        // observe the unchanged newline deficit over the final edit span. If a
+        // resync is needed, it will be emitted as a #line directive after any
+        // copied suffix line absorbed above.
+        trace("fallback",
+              "TU include-closure physical newline pad deferred to #line resync: source=[{0},{1}) suppressedNl={2}",
+              first->siteB, closureSourceEnd, remainingPadNl);
+      } else {
+        // In --no-lines mode, clang-refold intentionally does not preserve
+        // source-location semantics. The verification path already masks
+        // location-sensitive predefined macro differences for this mode, so
+        // newline-deficit padding would only manufacture visible blank lines in
+        // the refolded source. Boundary padding above is still responsible for
+        // lexical separation; this padding is solely for physical line count.
+        trace("fallback",
+              "TU include-closure physical newline pad suppressed by --no-lines: source=[{0},{1}) suppressedNl={2}",
+              first->siteB, closureSourceEnd, remainingPadNl);
+      }
+      remainingPadNl = 0;
+    }
+
     if (remainingPadNl > 0)
       padded.append(remainingPadNl, '\n');
 
     trace("fallback",
-          "TU include-closure newline pad: source=[{0},{1}) origNl={2} replNl={3} addNl={4} finalSourceEnd={5} result='{6}'",
-          first->siteB, last->siteE, origNl, initialReplNl,
-          origNl - initialReplNl, closureSourceEnd,
-          stringutils::showWSWithClip(padded, 120));
+          "TU include-closure newline pad: source=[{0},{1}) origNl={2} replNl={3} physicalPadNl={4} finalSourceEnd={5} result='{6}'",
+          first->siteB, last->siteE, origNl, initialReplNl, remainingPadNl,
+          closureSourceEnd, stringutils::showWSWithClip(padded, 120));
   }
 
   debug("fallback",
