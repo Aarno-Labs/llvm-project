@@ -129,6 +129,24 @@ RefoldEngine::BuildByteHunksFromRawText() const {
   return out;
 }
 
+void RefoldEngine::BuildByteHunkPrefixDeltaCache() {
+  abByteHunkPrefixDelta_.clear();
+
+  if (!abByteHunks_ || abByteHunks_->empty())
+    return;
+
+  abByteHunkPrefixDelta_.reserve(abByteHunks_->size() + 1);
+  abByteHunkPrefixDelta_.push_back(0);
+
+  int64_t runningDelta = 0;
+  for (const ByteHunk &h : *abByteHunks_) {
+    runningDelta +=
+        static_cast<int64_t>(h.bEnd - h.bStart) -
+        static_cast<int64_t>(h.aEnd - h.aStart);
+    abByteHunkPrefixDelta_.push_back(runningDelta);
+  }
+}
+
 size_t RefoldEngine::MapAByteToBByteLowerBound(size_t aByte) const {
   if (!abByteHunks_ || abByteHunks_->empty())
     return aByte;
@@ -153,12 +171,12 @@ size_t RefoldEngine::MapAByteToBByteLowerBound(size_t aByte) const {
     }
   }
 
-  // 3. Handle the Cumulative Delta.
-  int64_t delta = 0;
-  for (auto current = abByteHunks_->begin(); current != it; ++current) {
-    delta += (static_cast<int64_t>(current->bEnd - current->bStart) -
-              static_cast<int64_t>(current->aEnd - current->aStart));
-  }
+  const size_t prefixIndex =
+      static_cast<size_t>(std::distance(abByteHunks_->begin(), it));
+  const int64_t delta =
+      prefixIndex < abByteHunkPrefixDelta_.size()
+          ? abByteHunkPrefixDelta_[prefixIndex]
+          : 0;
 
   int64_t result = static_cast<int64_t>(aByte) + delta;
   return static_cast<size_t>(std::max<int64_t>(0, result));
@@ -175,12 +193,11 @@ size_t RefoldEngine::MapAByteToBByteUpperBound(size_t aByte) const {
       abByteHunks_->begin(), abByteHunks_->end(), searchVal,
       [](const ByteHunk &h, uint64_t val) { return h.aStart < val; });
 
-  // 3. Accumulate delta from all hunks preceding 'it'
-  int64_t delta = 0;
-  for (auto current = abByteHunks_->begin(); current != it; ++current) {
-    delta += (static_cast<int64_t>(current->bEnd - current->bStart) -
-              static_cast<int64_t>(current->aEnd - current->aStart));
-  }
+  const size_t prefixIndex =
+      static_cast<size_t>(std::distance(abByteHunks_->begin(), it));
+  int64_t delta = prefixIndex < abByteHunkPrefixDelta_.size()
+                      ? abByteHunkPrefixDelta_[prefixIndex]
+                      : 0;
 
   // 4. Handle boundary conditions at the 'it' position
   if (it != abByteHunks_->end()) {

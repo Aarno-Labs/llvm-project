@@ -1314,6 +1314,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
   // place the insertion at an arbitrary stable point, corrupting subsequent
   // A->B byte span mapping.
   abByteHunks_ = BuildByteHunksFromRawText();
+  BuildByteHunkPrefixDeltaCache();
 
   // Split replace hunks when an exact interior owner boundary can be proven.
   //

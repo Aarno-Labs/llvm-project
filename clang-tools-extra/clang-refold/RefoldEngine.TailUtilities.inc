@@ -1512,24 +1512,31 @@ RefoldEngine::AppendOriginalSliceWithPending(
 
 // ==================== Low-level file & mapping utilities =====================
 
-bool RefoldEngine::PathsEqual(StringRef a, StringRef b) {
+void RefoldEngine::CacheCanonicalPath(StringRef path) const {
+  auto it = canonicalPathCache_.find(path);
+  if (it != canonicalPathCache_.end())
+    return;
+
+  std::error_code ec;
+  const auto canonical = std::filesystem::weakly_canonical(
+      std::filesystem::path(path.str()), ec);
+  if (ec) {
+    fatal("path/canon", "failed to canonicalize '{0}': {1}", path,
+          ec.message());
+  }
+
+  canonicalPathCache_.insert({path, canonical.string()});
+}
+
+bool RefoldEngine::PathsEqual(StringRef a, StringRef b) const {
   if (a.empty() || b.empty())
     return a == b;
 
-  std::error_code ecA, ecB;
-  const auto ca =
-      std::filesystem::weakly_canonical(std::filesystem::path(a.str()), ecA);
-  const auto cb =
-      std::filesystem::weakly_canonical(std::filesystem::path(b.str()), ecB);
+  CacheCanonicalPath(a);
+  CacheCanonicalPath(b);
 
-  if (ecA) {
-    fatal("path/canon", "failed to canonicalize '{0}': {1}", a, ecA.message());
-  }
-  if (ecB) {
-    fatal("path/canon", "failed to canonicalize '{0}': {1}", b, ecB.message());
-  }
-
-  return ca == cb;
+  return canonicalPathCache_.find(a)->getValue() ==
+         canonicalPathCache_.find(b)->getValue();
 }
 
 // ======================= Diagnostics & Debug Utilities =======================

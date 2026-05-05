@@ -60,6 +60,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FormatVariadic.h"
@@ -356,6 +357,16 @@ private:
   RefoldStats lastStats_;
   mutable TheoremAuditStats lastTheoremAudit_;
 
+  /// \brief Cache of weakly-canonicalized filesystem paths used by hot-path
+  /// ownership and mapping queries.
+  ///
+  /// Path comparison remains semantically identical to the historical
+  /// implementation: non-empty paths are still compared via
+  /// `std::filesystem::weakly_canonical()`, and canonicalization failures are
+  /// still fatal. The only change is that each distinct raw path spelling is
+  /// canonicalized at most once per refold engine instance.
+  mutable llvm::StringMap<std::string> canonicalPathCache_;
+
   // Single-pass terminal-fallback scaffold: if any edit/patch cannot be
   // discharged into the declared proof/lattice outcomes in the current pass,
   // record the reason and fall back to emitting the fully expanded edited
@@ -588,6 +599,14 @@ private:
   std::vector<diffutils::Hunk> abTokHunks_;
 
   std::optional<std::vector<ByteHunk>> abByteHunks_;
+
+  /// \brief Prefix-summed A->B byte-length delta for \c abByteHunks_.
+  ///
+  /// Entry \c i stores the cumulative `(bLen - aLen)` contributed by the
+  /// first \c i byte hunks. This keeps repeated A-byte→B-byte coordinate
+  /// projection at `O(log H)` after the initial binary search instead of
+  /// re-walking all preceding hunks on every lookup.
+  std::vector<int64_t> abByteHunkPrefixDelta_;
 
   // ---------------------------------------------------------------------------
   // B token provenance / ownership for pure insertions
@@ -3246,6 +3265,10 @@ private:
   ///          [begin, end) byte offsets in the A and B source buffers.
   std::vector<ByteHunk> BuildByteHunksFromRawText() const;
 
+  /// \brief Build the prefix-summed A->B byte delta cache for
+  /// \c abByteHunks_.
+  void BuildByteHunkPrefixDeltaCache();
+
   /// \brief Projects a byte offset from source A to source B using
   /// lower-bound semantics.
   ///
@@ -4600,6 +4623,12 @@ private:
     return fallbackToEOF ? std::optional<uint64_t>(fileLen) : std::nullopt;
   }
 
+  /// \brief Ensure that \p path has a cached weakly-canonical spelling.
+  ///
+  /// Canonicalization failures are fatal, matching the historical behavior of
+  /// \c PathsEqual().
+  void CacheCanonicalPath(StringRef path) const;
+
   /// \brief Compare two paths for equality after weak canonicalization.
   ///
   /// If either path is empty, returns string equality directly. Otherwise both
@@ -4609,7 +4638,7 @@ private:
   /// \param a First path.
   /// \param b Second path.
   /// \returns `true` if canonical paths are equal; `false` otherwise.
-  static bool PathsEqual(StringRef a, StringRef b);
+  bool PathsEqual(StringRef a, StringRef b) const;
 
   // ---------------------- Diagnostics & Debug Utilities ----------------------
 
