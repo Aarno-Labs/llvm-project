@@ -245,6 +245,26 @@ private:
     MixedExcludedCases,
   };
 
+  friend inline StringRef toString(TerminalFallbackKind kind) {
+    switch (kind) {
+    case TerminalFallbackKind::Unknown:
+      return "Unknown";
+    case TerminalFallbackKind::OwnerUnresolvedNoTUAnchor:
+      return "OwnerUnresolvedNoTUAnchor";
+    case TerminalFallbackKind::IncludeRealizationUnmappableBCoverEnvelope:
+      return "IncludeRealizationUnmappableBCoverEnvelope";
+    case TerminalFallbackKind::UndischargedEmissionArtifact:
+      return "UndischargedEmissionArtifact";
+    case TerminalFallbackKind::UncomposableEmissionEditSet:
+      return "UncomposableEmissionEditSet";
+    case TerminalFallbackKind::TheoremAuditInvariantViolation:
+      return "TheoremAuditInvariantViolation";
+    case TerminalFallbackKind::MixedExcludedCases:
+      return "MixedExcludedCases";
+    }
+    return "Unknown";
+  }
+
   /// \brief Compact witness describing why the single-pass engine fell back to B.
   struct TerminalFallbackWitness {
     TerminalFallbackKind kind = TerminalFallbackKind::Unknown;
@@ -252,6 +272,19 @@ private:
     bool hasPrimaryReason = false;
     std::string primaryReason;
   };
+
+  friend inline std::string toString(const TerminalFallbackWitness &witness) {
+    const StringRef kindName = toString(witness.kind);
+    if (!witness.hasPrimaryReason)
+      return llvm::formatv("kind={0} requestCount={1}", kindName,
+                           witness.requestCount)
+          .str();
+
+    return llvm::formatv("kind={0} requestCount={1} primaryReason='{2}'",
+                         kindName, witness.requestCount,
+                         stringutils::showWSWithClip(witness.primaryReason, 200))
+        .str();
+  }
 
   /// \brief Declared fallback-closure classes that sit strictly between
   /// structural source emission and terminal fallback to B.
@@ -851,7 +884,7 @@ private:
 
   enum class OwnerKind { TU, Include, Unknown };
 
-  static inline StringRef toString(OwnerKind kind) {
+  friend inline StringRef toString(OwnerKind kind) {
     switch (kind) {
     case OwnerKind::TU:
       return "TU";
@@ -1407,6 +1440,28 @@ private:
     CorroboratedLeftNeighbor,
   };
 
+  friend inline StringRef toString(TUAnchorEvidenceKind kind) {
+    switch (kind) {
+    case TUAnchorEvidenceKind::Unknown:
+      return "Unknown";
+    case TUAnchorEvidenceKind::ExactSlotBoundary:
+      return "ExactSlotBoundary";
+    case TUAnchorEvidenceKind::ArgLikeBegin:
+      return "ArgLikeBegin";
+    case TUAnchorEvidenceKind::ImmediateRightNeighbor:
+      return "ImmediateRightNeighbor";
+    case TUAnchorEvidenceKind::ImmediateLeftNeighbor:
+      return "ImmediateLeftNeighbor";
+    case TUAnchorEvidenceKind::IncludeDirectiveBoundary:
+      return "IncludeDirectiveBoundary";
+    case TUAnchorEvidenceKind::CorroboratedRightNeighbor:
+      return "CorroboratedRightNeighbor";
+    case TUAnchorEvidenceKind::CorroboratedLeftNeighbor:
+      return "CorroboratedLeftNeighbor";
+    }
+    return "Unknown";
+  }
+
   /// \brief Compact Step-7 witness for an accepted TU anchor.
   struct TUAnchorWitness {
     TUAnchorEvidenceKind evidence = TUAnchorEvidenceKind::Unknown;
@@ -1449,6 +1504,26 @@ private:
     LeftNeighborPP,
     DeclBoundary,
   };
+
+  friend inline StringRef toString(IncludeAnchorEvidenceKind kind) {
+    switch (kind) {
+    case IncludeAnchorEvidenceKind::Unknown:
+      return "Unknown";
+    case IncludeAnchorEvidenceKind::MappedHeaderTokens:
+      return "MappedHeaderTokens";
+    case IncludeAnchorEvidenceKind::SelectedConditionalBoundary:
+      return "SelectedConditionalBoundary";
+    case IncludeAnchorEvidenceKind::ChildBoundary:
+      return "ChildBoundary";
+    case IncludeAnchorEvidenceKind::RightNeighborPP:
+      return "RightNeighborPP";
+    case IncludeAnchorEvidenceKind::LeftNeighborPP:
+      return "LeftNeighborPP";
+    case IncludeAnchorEvidenceKind::DeclBoundary:
+      return "DeclBoundary";
+    }
+    return "Unknown";
+  }
 
   /// \brief Compact Step-8 witness for an accepted include-preserving path.
   struct IncludeAnchorWitness {
@@ -1496,6 +1571,18 @@ private:
     CanonicalBCoverEnvelope,
     ConsensusRescuedBCoverEnvelope,
   };
+
+  friend inline StringRef toString(IncludeRealizationEvidenceKind kind) {
+    switch (kind) {
+    case IncludeRealizationEvidenceKind::Unknown:
+      return "Unknown";
+    case IncludeRealizationEvidenceKind::CanonicalBCoverEnvelope:
+      return "CanonicalBCoverEnvelope";
+    case IncludeRealizationEvidenceKind::ConsensusRescuedBCoverEnvelope:
+      return "ConsensusRescuedBCoverEnvelope";
+    }
+    return "Unknown";
+  }
 
   /// \brief Compact Step-9 witness for an accepted include realization path.
   struct IncludeRealizationWitness {
@@ -1933,6 +2020,32 @@ private:
     CallChainSuffix,
     WholeCoverRealization,
   };
+
+  friend inline StringRef toString(MacroPatchProofKind kind) {
+    switch (kind) {
+    case MacroPatchProofKind::Unknown:
+      return "Unknown";
+    case MacroPatchProofKind::CounterLiteral:
+      return "CounterLiteral";
+    case MacroPatchProofKind::ArgsOnlyPasteMulti:
+      return "ArgsOnlyPasteMulti";
+    case MacroPatchProofKind::ArgsOnlyPasteSingle:
+      return "ArgsOnlyPasteSingle";
+    case MacroPatchProofKind::ArgsOnlyPurePasteOnly:
+      return "ArgsOnlyPurePasteOnly";
+    case MacroPatchProofKind::ArgsOnlyStandard:
+      return "ArgsOnlyStandard";
+    case MacroPatchProofKind::ArgsOnlyPairedPureInsertion:
+      return "ArgsOnlyPairedPureInsertion";
+    case MacroPatchProofKind::DagSubtreeRoot:
+      return "DagSubtreeRoot";
+    case MacroPatchProofKind::CallChainSuffix:
+      return "CallChainSuffix";
+    case MacroPatchProofKind::WholeCoverRealization:
+      return "WholeCoverRealization";
+    }
+    return "Unknown";
+  }
 
   struct MacroPatch {
     uint64_t invStart = 0, invEnd = 0;
@@ -3904,12 +4017,7 @@ private:
       AcceptedPathKind currentPath,
       const TUAnchorWitness *witness = nullptr) const;
 
-  /// \brief Formatters for the normalized Step-1/2/3 proof metadata.
-  StringRef FormatTUAnchorEvidenceKind(TUAnchorEvidenceKind kind) const;
-  StringRef FormatIncludeAnchorEvidenceKind(IncludeAnchorEvidenceKind kind) const;
-  StringRef FormatIncludeRealizationEvidenceKind(
-      IncludeRealizationEvidenceKind kind) const;
-
+  /// \brief Format concrete proof witnesses for tracing.
   /// \brief Format a concrete TU anchor witness for tracing.
   ///
   /// Step 7 records the exact deterministic TU evidence used to justify a
@@ -3962,13 +4070,6 @@ private:
   std::string BuildOwnerUnresolvedNoTUAnchorDetail(
       size_t hunkIndex, const diffutils::Hunk &h, StringRef tuPath,
       const Owner &owner, bool mapsToTU) const;
-
-  /// \brief Format the explicit terminal-fallback witness for tracing.
-  std::string
-  FormatTerminalFallbackWitness(const TerminalFallbackWitness &witness) const;
-
-  /// \brief Format a patch proof kind for tracing.
-  StringRef FormatMacroPatchProofKind(MacroPatchProofKind kind) const;
 
   /// \brief Format the Step-2 acceptance-path inventory for tracing.
   std::string
@@ -4758,23 +4859,13 @@ private:
 namespace llvm {
 using namespace clang::refold;
 
-template <> struct format_provider<RefoldEngine::OwnerKind> {
-  static void format(const RefoldEngine::OwnerKind &kind, raw_ostream &os,
-                     StringRef style) {
-
-    switch (kind) {
-    case RefoldEngine::OwnerKind::TU:
-      os << "TU";
-      break;
-    case RefoldEngine::OwnerKind::Include:
-      os << "Include";
-      break;
-    case RefoldEngine::OwnerKind::Unknown:
-      os << "Unknown";
-      break;
-    }
+template <> struct format_provider<RefoldEngine::TerminalFallbackWitness> {
+  static void format(const RefoldEngine::TerminalFallbackWitness &witness,
+                     raw_ostream &os, StringRef style) {
+    os << toString(witness);
   }
 };
+
 
 template <> struct DenseMapInfo<std::optional<uint64_t>> {
   static inline std::optional<uint64_t> getEmptyKey() {

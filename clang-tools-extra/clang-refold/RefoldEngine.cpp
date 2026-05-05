@@ -1141,7 +1141,7 @@ void RefoldEngine::RecordTerminalFallbackTheoremAudit() const {
   ++lastTheoremAudit_.nonExplicitTerminalExclusions;
   NoteTheoremAuditViolation(llvm::formatv(
                                "terminal fallback escaped theorem-domain classification: witness={0} candidate={1}",
-                               FormatTerminalFallbackWitness(witness),
+                               witness,
                                FormatAcceptedResultCandidate(candidate))
                                .str());
 }

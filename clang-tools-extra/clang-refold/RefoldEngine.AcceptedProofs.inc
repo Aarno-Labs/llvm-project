@@ -683,37 +683,13 @@ RefoldEngine::ValidateTUAnchorProof(AcceptedPathKind currentPath,
   return discharge.Finish();
 }
 
-StringRef
-RefoldEngine::FormatTUAnchorEvidenceKind(
-    TUAnchorEvidenceKind kind) const {
-  switch (kind) {
-  case TUAnchorEvidenceKind::Unknown:
-    return "Unknown";
-  case TUAnchorEvidenceKind::ExactSlotBoundary:
-    return "ExactSlotBoundary";
-  case TUAnchorEvidenceKind::ArgLikeBegin:
-    return "ArgLikeBegin";
-  case TUAnchorEvidenceKind::ImmediateRightNeighbor:
-    return "ImmediateRightNeighbor";
-  case TUAnchorEvidenceKind::ImmediateLeftNeighbor:
-    return "ImmediateLeftNeighbor";
-  case TUAnchorEvidenceKind::IncludeDirectiveBoundary:
-    return "IncludeDirectiveBoundary";
-  case TUAnchorEvidenceKind::CorroboratedRightNeighbor:
-    return "CorroboratedRightNeighbor";
-  case TUAnchorEvidenceKind::CorroboratedLeftNeighbor:
-    return "CorroboratedLeftNeighbor";
-  }
-  return "Unknown";
-}
-
 std::string RefoldEngine::FormatTUAnchorWitness(
     const TUAnchorWitness &witness) const {
   return formatv(
              "kind={0} ppGap={1}{2} tuByte={3}{4} slotId={5} slotKind={6} "
              "macroId={7} leftPP={8}{9} rightPP={10}{11} outsideInclude={12} "
              "ownerDepthStable={13} exactPP={14}",
-             FormatTUAnchorEvidenceKind(witness.evidence), witness.ppGap,
+             witness.evidence, witness.ppGap,
              witness.hasPPGap ? "" : "(missing)", witness.tuByte,
              witness.hasTUByte ? "" : "(missing)", witness.slotId,
              witness.slotKind.empty() ? StringRef("(none)") : StringRef(witness.slotKind),
@@ -725,34 +701,13 @@ std::string RefoldEngine::FormatTUAnchorWitness(
       .str();
 }
 
-StringRef RefoldEngine::FormatIncludeAnchorEvidenceKind(
-    IncludeAnchorEvidenceKind kind) const {
-  switch (kind) {
-  case IncludeAnchorEvidenceKind::Unknown:
-    return "Unknown";
-  case IncludeAnchorEvidenceKind::MappedHeaderTokens:
-    return "MappedHeaderTokens";
-  case IncludeAnchorEvidenceKind::SelectedConditionalBoundary:
-    return "SelectedConditionalBoundary";
-  case IncludeAnchorEvidenceKind::ChildBoundary:
-    return "ChildBoundary";
-  case IncludeAnchorEvidenceKind::RightNeighborPP:
-    return "RightNeighborPP";
-  case IncludeAnchorEvidenceKind::LeftNeighborPP:
-    return "LeftNeighborPP";
-  case IncludeAnchorEvidenceKind::DeclBoundary:
-    return "DeclBoundary";
-  }
-  return "Unknown";
-}
-
 std::string RefoldEngine::FormatIncludeAnchorWitness(
     const IncludeAnchorWitness &witness) const {
   return formatv(
              "kind={0} anchorByte={1}{2} byteRange=[{3},{4}){5} firstPP={6}{7} "
              "lastPP={8}{9} neighborPP={10}{11} condArm={12}{13} childInc={14}{15} "
              "decl=[{16},{17}){18}",
-             FormatIncludeAnchorEvidenceKind(witness.evidence),
+             witness.evidence,
              witness.anchorByte, witness.hasAnchorByte ? "" : "(missing)",
              witness.startByte, witness.endByte,
              witness.hasByteRange ? "" : "(missing)", witness.firstPP,
@@ -765,25 +720,12 @@ std::string RefoldEngine::FormatIncludeAnchorWitness(
       .str();
 }
 
-StringRef RefoldEngine::FormatIncludeRealizationEvidenceKind(
-    IncludeRealizationEvidenceKind kind) const {
-  switch (kind) {
-  case IncludeRealizationEvidenceKind::Unknown:
-    return "Unknown";
-  case IncludeRealizationEvidenceKind::CanonicalBCoverEnvelope:
-    return "CanonicalBCoverEnvelope";
-  case IncludeRealizationEvidenceKind::ConsensusRescuedBCoverEnvelope:
-    return "ConsensusRescuedBCoverEnvelope";
-  }
-  return "Unknown";
-}
-
 std::string RefoldEngine::FormatIncludeRealizationWitness(
     const IncludeRealizationWitness &witness) const {
   return formatv(
              "kind={0} includeId={1}{2} aCover=[{3},{4}){5} "
              "bTokEnvelope=[{6},{7}){8}",
-             FormatIncludeRealizationEvidenceKind(witness.evidence),
+             witness.evidence,
              witness.includeId, witness.hasIncludeId ? "" : "(missing)",
              witness.aCoverBegin, witness.aCoverEnd,
              witness.hasACover ? "" : "(missing)", witness.bTokBegin,
@@ -899,72 +841,6 @@ std::string RefoldEngine::BuildOwnerUnresolvedNoTUAnchorDetail(
       .str();
 }
 
-std::string RefoldEngine::FormatTerminalFallbackWitness(
-    const TerminalFallbackWitness &witness) const {
-  auto formatKind = [](TerminalFallbackKind kind) -> const char * {
-    switch (kind) {
-    case TerminalFallbackKind::OwnerUnresolvedNoTUAnchor:
-      return "OwnerUnresolvedNoTUAnchor";
-    case TerminalFallbackKind::IncludeRealizationUnmappableBCoverEnvelope:
-      return "IncludeRealizationUnmappableBCoverEnvelope";
-    case TerminalFallbackKind::UndischargedEmissionArtifact:
-      return "UndischargedEmissionArtifact";
-    case TerminalFallbackKind::UncomposableEmissionEditSet:
-      return "UncomposableEmissionEditSet";
-    case TerminalFallbackKind::TheoremAuditInvariantViolation:
-      return "TheoremAuditInvariantViolation";
-    case TerminalFallbackKind::MixedExcludedCases:
-      return "MixedExcludedCases";
-    case TerminalFallbackKind::Unknown:
-      return "Unknown";
-    }
-    return "Unknown";
-  };
-
-  if (!witness.hasPrimaryReason)
-    return formatv("kind={0} requestCount={1}", formatKind(witness.kind),
-                   witness.requestCount)
-        .str();
-
-  return formatv("kind={0} requestCount={1} primaryReason='{2}'",
-                 formatKind(witness.kind), witness.requestCount,
-                 stringutils::showWSWithClip(witness.primaryReason, 200))
-      .str();
-}
-
-StringRef
-RefoldEngine::FormatMacroPatchProofKind(MacroPatchProofKind kind) const {
-  switch (kind) {
-  case MacroPatchProofKind::Unknown:
-    return "Unknown";
-  case MacroPatchProofKind::CounterLiteral:
-    return "CounterLiteral";
-  case MacroPatchProofKind::ArgsOnlyPasteMulti:
-    return "ArgsOnlyPasteMulti";
-  case MacroPatchProofKind::ArgsOnlyPasteSingle:
-    return "ArgsOnlyPasteSingle";
-  case MacroPatchProofKind::ArgsOnlyPurePasteOnly:
-    return "ArgsOnlyPurePasteOnly";
-  case MacroPatchProofKind::ArgsOnlyStandard:
-    return "ArgsOnlyStandard";
-  case MacroPatchProofKind::ArgsOnlyPairedPureInsertion:
-    // Paired pure insertion is only valid on non-paste direct arg/stringify
-    // surfaces. The builder already enforces that; Step 6 records it.
-    return "ArgsOnlyPairedPureInsertion";
-  case MacroPatchProofKind::DagSubtreeRoot:
-    // DAG-preserving rewrites must carry the explicit subtree certificate that
-    // Step 5 started recording on accepted root patches.
-    return "DagSubtreeRoot";
-  case MacroPatchProofKind::CallChainSuffix:
-    // Call-chain suffix rewrites are emitted directly on the root callsite
-    // slice, so the patch's owning macro id must already be that root.
-    return "CallChainSuffix";
-  case MacroPatchProofKind::WholeCoverRealization:
-    return "WholeCoverRealization";
-  }
-  return "Unknown";
-}
-
 std::string RefoldEngine::FormatAcceptancePathInventory(
     const AcceptancePathInventory &inventory) const {
   return formatv("currentPath={0} support={1} futureTarget={2}",
@@ -1004,7 +880,7 @@ std::string RefoldEngine::FormatCompletenessContract(
                    contract.expectation,
                    contract.declaredTarget,
                    contract.countsTowardDeclaredCoverage ? 1 : 0,
-                   FormatTerminalFallbackWitness(witness))
+                   witness)
         .str();
   }
   return formatv(
@@ -1026,7 +902,7 @@ std::string RefoldEngine::FormatTheoremDomainContract(
                contract.inDeclaredDomain ? 1 : 0,
                contract.countsTowardCompleteness ? 1 : 0,
                contract.declaredTarget,
-               FormatTerminalFallbackWitness(witness))
+               witness)
         .str();
   }
   return formatv(
@@ -1085,7 +961,7 @@ std::string RefoldEngine::FormatAcceptedPathAudit(
                    FormatCompletenessContract(summary.completeness),
                    FormatTheoremDomainContract(summary.theoremDomain),
                    FormatProofDischargeRecord(summary.discharge),
-                   FormatTerminalFallbackWitness(summary.terminalFallbackWitness))
+                   summary.terminalFallbackWitness)
         .str();
   }
   return formatv("inventory={0} lattice={1} completeness={2} theoremDomain={3} discharge={4}",
@@ -1152,8 +1028,7 @@ RefoldEngine::FormatAcceptedResultCandidate(
   }
   if (candidate.proofSummary.hasTerminalFallbackWitness) {
     artifact += formatv(" terminalOutOfDomain={0}",
-                        FormatTerminalFallbackWitness(
-                            candidate.proofSummary.terminalFallbackWitness))
+                        candidate.proofSummary.terminalFallbackWitness)
                     .str();
   }
   if (candidate.hasPayloadPreview) {
@@ -1196,7 +1071,7 @@ std::string RefoldEngine::FormatMacroPatchAudit(const MacroPatch &patch) const {
              "deferredRootN={35} bridgeFormalN={36} expRoot={37} "
              "deferredRootArgs={38} bridgeFormals={39} wholeCoverA=[{40},{41}) "
              "wholeCoverBraw=[{42},{43}) wholeCoverBadj=[{44},{45})",
-             FormatMacroPatchProofKind(patch.proofKind),
+             patch.proofKind,
              summary.acceptedClass,
              summary.realizationMode,
              summary.preference,
