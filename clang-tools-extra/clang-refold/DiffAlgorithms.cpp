@@ -8,7 +8,8 @@
 // refolding’s token alignment and edit extraction:
 //
 //   • LCS (Longest Common Subsequence) map A→B over arbitrary element types
-//     (typically token spellings), with a stable tie-breaker.
+//     (typically token spellings), including owner-aware and
+//     provenance-certified variants used by the refolder.
 //   • Hunk construction from an A→B alignment (contiguous edit regions).
 //   • Myers O((N+M)*D) shortest edit script (SES) with linear-space reconstruc-
 //     tion.
@@ -16,15 +17,17 @@
 // Responsibilities
 // ----------------
 //   • lcsMapAB: compute a one-sided mapping from indices in A to matching
-//     indices in B (or -1 if unmatched), using a DP table with a deterministic
-//     backtrack rule (on ties, advance in A).
+//     indices in B (or -1 if unmatched). The structured overload first solves
+//     the owner-aware LCS objective and then suppresses/restores ambiguous
+//     anchors using provenance certificates.
 //   • hunksFromMap: convert an A→B map into ordered edit hunks between anchors.
 //   • myersDiff / coalesce: produce SES steps (EQUAL/INSERT/DELETE) and merge
 //     adjacent non-EQUAL runs into hunks.
 //
 // Determinism & Policy
 // --------------------
-//   • All algorithms break ties consistently for stable output across runs.
+//   • Algorithms are deterministic. The refolder-facing LCS overload avoids
+//     lexical neighbor tie heuristics by keeping only certified anchors.
 //   • Large-input guard: LCS switches to Hirschberg recursion (exact) when
 //     the full DP table would exceed a configured cell budget.
 //   • Utilities are side-effect free and operate on caller-owned sequences.
@@ -37,8 +40,9 @@
 //
 // Public Surface
 // --------------
-//   • std::vector<int> lcsMapAB(...):
-//       A[i] -> B[j] (j >= 0) or -1; deterministic tie-break.
+//   • std::vector<int64_t> lcsMapAB(...):
+//       A[i] -> B[j] (j >= 0) or -1; owner-aware/provenance-certified when
+//       structured gap profiles are supplied.
 //   • std::vector<Hunk> hunksFromMap(const std::vector<int>& map,
 //                                    int nA, int nB):
 //       contiguous edit regions between anchors, half-open indices.
@@ -62,11 +66,11 @@
 #include "DiffAlgorithms.h"
 #include "StringUtils.h"
 #include "llvm/ADT/ArrayRef.h"
-#include "llvm/ADT/DenseMap.h"
 
 #include <algorithm>
 #include <climits>
 #include <cstring>
+#include <cstdint>
 #include <limits>
 #include <string>
 #include <vector>
@@ -123,52 +127,665 @@ bool shouldUseGreedyApproach(unsigned long long n, unsigned long long m,
   return false;
 }
 
-inline bool isBetter(unsigned candLen, std::uint64_t candCost,
-                     std::uint32_t candTie, unsigned bestLen,
-                     std::uint64_t bestCost, std::uint32_t bestTie) {
+inline bool isCoreBetter(unsigned candLen, std::uint64_t candCost,
+                         unsigned bestLen, std::uint64_t bestCost) {
   if (candLen != bestLen)
     return candLen > bestLen;
-  if (candCost != bestCost)
-    return candCost < bestCost;
-  return candTie < bestTie;
+  return candCost < bestCost;
 }
 
-// Small tie-break penalty for ambiguous matches.
-//
-// The weighted-LCS objective is (1) maximize LCS length, then (2) minimize
-// ownerDepthGap cost. Those objectives implement the boundary policy.
-//
-// In many real-world streams, there can still be multiple optimal solutions
-// with identical (len,cost), especially around highly repetitive tokens
-// (punctuation, keywords, small literals). A naive backtrack that prefers the
-// diagonal match can then "steal" from adjacent insertions by matching a token
-// to the wrong repeated occurrence.
-//
-// We resolve this by introducing a tertiary objective dpTie that is only used
-// when (len,cost) are equal. dpTie prefers matches whose immediate neighbors
-// (prev/next) also match, biasing toward locally consistent alignments without
-// changing optimality under (len,cost).
-inline std::uint32_t
-matchTiePenalty(ArrayRef<StringRef> a, ArrayRef<StringRef> b, size_t ai,
-                size_t bj,
-                const llvm::DenseMap<StringRef, unsigned> & /*freqA*/,
-                const llvm::DenseMap<StringRef, unsigned> & /*freqB*/) {
-  // Deterministic tertiary objective for tie-breaking among solutions with
-  // identical (len,cost): prefer locally coherent alignments.
-  //
-  // Penalize a candidate match when its immediate neighbors disagree. This
-  // biases toward choosing the occurrence that is consistent with surrounding
-  // context, preventing optimal-but-pathological anchors that can absorb
-  // nearby insertions.
+/// Canonical predecessor order to use after the scalar structural objective
+/// has already proven predecessor states equivalent.
+///
+/// These orders are diagnostic only. They model possible ways a future
+/// heuristic-free implementation could canonicalize equal (LCS-length,
+/// ownerDepthGap-cost) states. The order matters twice: first while filling the
+/// DP table, where equal-core predecessor states may store the same score but
+/// encode different latent paths, and again while backtracking through that
+/// table. The previous shadow pass varied only backtracking; this one varies
+/// both axes so the trace is a faithful oracle for scalar-only replacements.
+enum class StructuralBacktrackOrder {
+  DiagDeleteInsert,
+  DiagInsertDelete,
+  DeleteDiagInsert,
+  DeleteInsertDiag,
+  InsertDiagDelete,
+  InsertDeleteDiag,
+};
 
-  std::uint32_t p = 0;
-  // Previous token agreement (bigram coherence).
-  if (ai > 0 && bj > 0)
-    p += (a[ai - 1] == b[bj - 1]) ? 0U : 1U;
-  // Next token agreement (lookahead coherence).
-  if (ai + 1 < a.size() && bj + 1 < b.size())
-    p += (a[ai + 1] == b[bj + 1]) ? 0U : 1U;
-  return p;
+[[maybe_unused]]
+static inline StringRef toString(StructuralBacktrackOrder order) {
+  switch (order) {
+  case StructuralBacktrackOrder::DiagDeleteInsert:
+    return "diag-delete-insert";
+  case StructuralBacktrackOrder::DiagInsertDelete:
+    return "diag-insert-delete";
+  case StructuralBacktrackOrder::DeleteDiagInsert:
+    return "delete-diag-insert";
+  case StructuralBacktrackOrder::DeleteInsertDiag:
+    return "delete-insert-diag";
+  case StructuralBacktrackOrder::InsertDiagDelete:
+    return "insert-diag-delete";
+  case StructuralBacktrackOrder::InsertDeleteDiag:
+    return "insert-delete-diag";
+  }
+  llvm_unreachable("invalid structural backtrack order");
+}
+
+static uint64_t hunkAWidth(const Hunk &h) { return h.aEnd - h.aStart; }
+static uint64_t hunkBWidth(const Hunk &h) { return h.bEnd - h.bStart; }
+
+/// Add \p extra to \p base without allowing unsigned wraparound.
+static bool addCostChecked(uint64_t base, uint32_t extra, uint64_t &out) {
+  if (base > std::numeric_limits<uint64_t>::max() - extra)
+    return false;
+  out = base + extra;
+  return true;
+}
+
+/// DP cell for the heuristic-free structural LCS objective.
+///
+/// This intentionally omits the old neighbor-coherence tie penalty. It models
+/// only the proof-relevant core objective: maximize LCS length, then minimize
+/// ownerDepthGap cost. The forward/suffix tables built from this cell certify
+/// whether a token pair is admissible in any optimal core solution.
+struct CoreLcsCell {
+  uint32_t len = 0;
+  uint64_t cost = 0;
+};
+
+/// Compute forward and suffix DP tables for the structural LCS core objective.
+///
+/// The suffix table uses the same transition costs as the forward table:
+/// deleting A[i] pays ownerDepthGap[i + 1], and inserting B[j] at the current
+/// A gap pays ownerDepthGap[i]. Keeping those costs identical makes the
+/// admissibility check a real certificate for the same objective used to build
+/// the production map.
+static bool buildCoreLcsDpTables(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
+                                 ArrayRef<uint32_t> ownerDepthGap,
+                                 unsigned long long maxCells,
+                                 std::vector<CoreLcsCell> &forward,
+                                 std::vector<CoreLcsCell> &suffix,
+                                 size_t &stride) {
+  const size_t n = a.size();
+  const size_t m = b.size();
+  const unsigned long long nu = static_cast<unsigned long long>(n);
+  const unsigned long long mu = static_cast<unsigned long long>(m);
+  if (shouldUseGreedyApproach(nu, mu, maxCells))
+    return false;
+
+  stride = m + 1;
+  const size_t cells = (n + 1) * (m + 1);
+  forward.assign(cells, CoreLcsCell{});
+  suffix.assign(cells, CoreLcsCell{});
+
+  auto idx = [&](size_t i, size_t j) -> size_t { return i * stride + j; };
+  auto better = [](const CoreLcsCell &cand, const CoreLcsCell &best) {
+    return isCoreBetter(cand.len, cand.cost, best.len, best.cost);
+  };
+
+  for (size_t i = 0; i <= n; ++i) {
+    for (size_t j = 0; j <= m; ++j) {
+      if (i == 0 && j == 0)
+        continue;
+
+      CoreLcsCell best{0, std::numeric_limits<uint64_t>::max()};
+
+      if (i > 0 && j > 0 && a[i - 1] == b[j - 1]) {
+        CoreLcsCell cand = forward[idx(i - 1, j - 1)];
+        ++cand.len;
+        if (better(cand, best))
+          best = cand;
+      }
+
+      if (i > 0) {
+        CoreLcsCell cand = forward[idx(i - 1, j)];
+        if (addCostChecked(cand.cost, ownerDepthGap[i], cand.cost) &&
+            better(cand, best))
+          best = cand;
+      }
+
+      if (j > 0) {
+        CoreLcsCell cand = forward[idx(i, j - 1)];
+        if (addCostChecked(cand.cost, ownerDepthGap[i], cand.cost) &&
+            better(cand, best))
+          best = cand;
+      }
+
+      forward[idx(i, j)] = best;
+    }
+  }
+
+  for (size_t ii = n + 1; ii > 0; --ii) {
+    const size_t i = ii - 1;
+    for (size_t jj = m + 1; jj > 0; --jj) {
+      const size_t j = jj - 1;
+      if (i == n && j == m)
+        continue;
+
+      CoreLcsCell best{0, std::numeric_limits<uint64_t>::max()};
+
+      if (i < n && j < m && a[i] == b[j]) {
+        CoreLcsCell cand = suffix[idx(i + 1, j + 1)];
+        ++cand.len;
+        if (better(cand, best))
+          best = cand;
+      }
+
+      if (i < n) {
+        CoreLcsCell cand = suffix[idx(i + 1, j)];
+        if (addCostChecked(cand.cost, ownerDepthGap[i + 1], cand.cost) &&
+            better(cand, best))
+          best = cand;
+      }
+
+      if (j < m) {
+        CoreLcsCell cand = suffix[idx(i, j + 1)];
+        if (addCostChecked(cand.cost, ownerDepthGap[i], cand.cost) &&
+            better(cand, best))
+          best = cand;
+      }
+
+      suffix[idx(i, j)] = best;
+    }
+  }
+
+  return true;
+}
+
+static bool hasProvenanceId(uint64_t value) {
+  return value != LcsGapProvenance::NoId;
+}
+
+/// Rank the amount of original-side structural boundary retained at an
+/// insertion gap.
+///
+/// This is not a lexical-neighbor preference. It uses only the provenance facts
+/// that the refolder's boundary policy already reasons about: include depth and
+/// identity, conditional group/arm identity, and macro root/leaf identity. A
+/// larger rank means the gap preserves a more specific owner boundary.
+static uint64_t aBoundaryRetentionRank(ArrayRef<LcsGapProvenance> profiles,
+                                       uint64_t gap) {
+  if (gap >= profiles.size())
+    return 0;
+
+  const LcsGapProvenance &profile = profiles[static_cast<size_t>(gap)];
+  uint64_t rank = profile.ownerDepth;
+  rank += static_cast<uint64_t>(profile.includeDepth) * 8;
+  rank += static_cast<uint64_t>(profile.conditionalDepth) * 8;
+  rank += static_cast<uint64_t>(profile.macroDepth) * 8;
+  rank += hasProvenanceId(profile.leftIncludeId) ? 1 : 0;
+  rank += hasProvenanceId(profile.rightIncludeId) ? 1 : 0;
+  rank += hasProvenanceId(profile.lcaIncludeId) ? 1 : 0;
+  rank += hasProvenanceId(profile.leftCondGroupId) ? 1 : 0;
+  rank += hasProvenanceId(profile.leftCondArmId) ? 1 : 0;
+  rank += hasProvenanceId(profile.rightCondGroupId) ? 1 : 0;
+  rank += hasProvenanceId(profile.rightCondArmId) ? 1 : 0;
+  rank += hasProvenanceId(profile.leftMacroRootId) ? 1 : 0;
+  rank += hasProvenanceId(profile.leftMacroLeafId) ? 1 : 0;
+  rank += hasProvenanceId(profile.rightMacroRootId) ? 1 : 0;
+  rank += hasProvenanceId(profile.rightMacroLeafId) ? 1 : 0;
+  rank += profile.leftMacroRoleMask ? 1 : 0;
+  rank += profile.rightMacroRoleMask ? 1 : 0;
+  return rank;
+}
+
+static bool sameBLineShape(const LcsBGapProvenance &lhs,
+                           const LcsBGapProvenance &rhs) {
+  return lhs.hasLeftToken == rhs.hasLeftToken &&
+         lhs.hasRightToken == rhs.hasRightToken &&
+         lhs.gapContainsNewline == rhs.gapContainsNewline &&
+         lhs.gapContainsOnlyWhitespace == rhs.gapContainsOnlyWhitespace &&
+         lhs.gapAtLineStart == rhs.gapAtLineStart &&
+         lhs.gapAtLineEnd == rhs.gapAtLineEnd &&
+         lhs.leftTokenStartsLine == rhs.leftTokenStartsLine &&
+         lhs.leftTokenEndsLine == rhs.leftTokenEndsLine &&
+         lhs.rightTokenStartsLine == rhs.rightTokenStartsLine &&
+         lhs.rightTokenEndsLine == rhs.rightTokenEndsLine;
+}
+
+/// Rank the edited-side line/gap surface around one B-side gap.
+///
+/// This is intentionally structural rather than lexical: it never looks at the
+/// neighboring token spellings. It is used only after A-side owner-boundary
+/// specificity, to separate candidates that preserve the same core LCS proof.
+static uint64_t bGapSurfaceRank(ArrayRef<LcsBGapProvenance> profiles,
+                                uint64_t gap) {
+  if (gap >= profiles.size())
+    return 0;
+
+  const LcsBGapProvenance &profile = profiles[static_cast<size_t>(gap)];
+  uint64_t rank = 0;
+  rank += profile.hasLeftToken ? 1 : 0;
+  rank += profile.hasRightToken ? 1 : 0;
+  rank += profile.gapContainsOnlyWhitespace ? 1 : 0;
+  rank += !profile.gapContainsNewline ? 4 : 0;
+  rank += !profile.gapAtLineStart ? 2 : 0;
+  rank += !profile.gapAtLineEnd ? 2 : 0;
+  rank += profile.leftTokenEndsLine == profile.rightTokenEndsLine ? 1 : 0;
+  rank += profile.leftTokenStartsLine == profile.rightTokenStartsLine ? 1 : 0;
+  return rank;
+}
+
+static uint64_t bPairSurfaceRank(ArrayRef<LcsBGapProvenance> profiles,
+                                 uint64_t bStart, uint64_t bEnd) {
+  uint64_t rank = bGapSurfaceRank(profiles, bStart) +
+                  bGapSurfaceRank(profiles, bEnd);
+  if (bStart < profiles.size() && bEnd < profiles.size() &&
+      sameBLineShape(profiles[static_cast<size_t>(bStart)],
+                     profiles[static_cast<size_t>(bEnd)]))
+    rank += 8;
+  return rank;
+}
+
+/// Remove individually admissible anchors that are not mutually order-compatible.
+///
+/// The core admissibility pass reasons about one candidate anchor at a time: an
+/// A/B token pair may occur in some optimal owner-aware LCS path.  In highly
+/// repetitive regions, two such individually valid anchors can still be
+/// mutually exclusive because they cross in B order.  Returning both violates
+/// the A->B map contract and later hunk construction is undefined.
+///
+/// This cleanup is deliberately conservative.  It does not pick a longest
+/// increasing subsequence, because that would select one of several equally
+/// valid repeated-token explanations.  Instead, an anchor is retained only if it
+/// is order-compatible with every other currently retained anchor: all mapped
+/// anchors to its left must map to smaller B indices, and all mapped anchors to
+/// its right must map to larger B indices.  Any anchor involved in a crossing is
+/// suppressed, widening the surrounding edit island and preserving fail-closed
+/// behavior.
+static size_t suppressOrderConflictingAnchors(std::vector<int64_t> &map) {
+  const size_t n = map.size();
+  if (n == 0)
+    return 0;
+
+  std::vector<int64_t> maxLeft(n, -1);
+  int64_t leftMax = -1;
+  for (size_t i = 0; i < n; ++i) {
+    maxLeft[i] = leftMax;
+    if (map[i] >= 0)
+      leftMax = std::max(leftMax, map[i]);
+  }
+
+  std::vector<int64_t> minRight(n, std::numeric_limits<int64_t>::max());
+  int64_t rightMin = std::numeric_limits<int64_t>::max();
+  for (size_t i = n; i-- > 0;) {
+    minRight[i] = rightMin;
+    if (map[i] >= 0)
+      rightMin = std::min(rightMin, map[i]);
+  }
+
+  size_t suppressed = 0;
+  for (size_t i = 0; i < n; ++i) {
+    const int64_t bj = map[i];
+    if (bj < 0)
+      continue;
+    if (maxLeft[i] >= bj || minRight[i] <= bj) {
+      map[i] = -1;
+      ++suppressed;
+    }
+  }
+  return suppressed;
+}
+
+/// Build the heuristic-free provenance-certified LCS map used by refolding.
+///
+/// The algorithm separates optimality from certification:
+///  * compute the core owner-aware LCS objective with no neighbor-spelling tie:
+///    maximize length, then minimize ownerDepthGap cost;
+///  * retain only anchors forced by that core objective, meaning both sides have
+///    exactly one admissible partner;
+///  * restore ambiguous equal-token edge anchors only when they create a unique
+///    best pure-insertion frontier under structural boundary ranks.
+///
+/// If a hunk still has no unique boundary-preserving pure-insertion candidate,
+/// the ambiguous anchors remain suppressed. That is fail-closed: downstream code
+/// sees a wider edit island instead of an arbitrary repeated punctuation anchor.
+static bool buildBoundaryPureCertifiedMap(
+    ArrayRef<StringRef> a, ArrayRef<StringRef> b,
+    ArrayRef<uint32_t> ownerDepthGap, ArrayRef<LcsGapProvenance> gapProvenance,
+    ArrayRef<LcsBGapProvenance> bGapProvenance,
+    unsigned long long maxCells, std::vector<int64_t> &outMap) {
+  const size_t n = a.size();
+  const size_t m = b.size();
+  outMap.assign(n, -1);
+  if (n == 0 || m == 0)
+    return true;
+  if (ownerDepthGap.size() != n + 1 || gapProvenance.size() != n + 1)
+    return false;
+
+  std::vector<CoreLcsCell> forward;
+  std::vector<CoreLcsCell> suffix;
+  size_t stride = 0;
+  if (!buildCoreLcsDpTables(a, b, ownerDepthGap, maxCells, forward, suffix,
+                            stride))
+    return false;
+
+  auto idx = [&](size_t i, size_t j) -> size_t { return i * stride + j; };
+  const CoreLcsCell total = forward[idx(n, m)];
+
+  auto isCoreAdmissible = [&](size_t ai, size_t bj) -> bool {
+    if (ai >= n || bj >= m || a[ai] != b[bj])
+      return false;
+    const CoreLcsCell &prefix = forward[idx(ai, bj)];
+    const CoreLcsCell &tail = suffix[idx(ai + 1, bj + 1)];
+    if (prefix.len + 1U + tail.len != total.len)
+      return false;
+    if (prefix.cost > std::numeric_limits<uint64_t>::max() - tail.cost)
+      return false;
+    return prefix.cost + tail.cost == total.cost;
+  };
+
+  // Count every individually admissible partner in the optimal core objective.
+  // An anchor is forced only when both directions are unique: A[i] can match one
+  // B token, and that B token can match only this A token.
+  std::vector<uint32_t> aPartnerCount(n, 0);
+  std::vector<uint32_t> bPartnerCount(m, 0);
+  std::vector<int64_t> firstBPartner(n, -1);
+  for (size_t ai = 0; ai < n; ++ai) {
+    for (size_t bj = 0; bj < m; ++bj) {
+      if (!isCoreAdmissible(ai, bj))
+        continue;
+      if (aPartnerCount[ai] == 0)
+        firstBPartner[ai] = static_cast<int64_t>(bj);
+      ++aPartnerCount[ai];
+      ++bPartnerCount[bj];
+    }
+  }
+
+  // Seed the map with only forced anchors. Repeated punctuation/literals that
+  // have several optimal explanations remain unmatched until a later boundary
+  // proof restores them at an edit edge.
+  for (size_t ai = 0; ai < n; ++ai) {
+    if (aPartnerCount[ai] != 1)
+      continue;
+    const int64_t bj = firstBPartner[ai];
+    if (bj >= 0 && bj < static_cast<int64_t>(m) &&
+        bPartnerCount[static_cast<size_t>(bj)] == 1)
+      outMap[ai] = bj;
+  }
+
+  // Defensive monotonicity cleanup: individual admissibility is local to a
+  // token pair, so suppress any rare crossing anchors before hunk construction.
+  const size_t suppressedForcedAnchors = suppressOrderConflictingAnchors(outMap);
+  if (suppressedForcedAnchors != 0) {
+    trace("lcs/map",
+          "suppressed {0} order-conflicting individually-admissible anchors "
+          "from forced core map",
+          suppressedForcedAnchors);
+  }
+
+  auto canUseAmbiguousEdgeAnchor = [&](uint64_t ai64, uint64_t bj64) -> bool {
+    if (ai64 >= n || bj64 >= m)
+      return false;
+    const size_t ai = static_cast<size_t>(ai64);
+    const size_t bj = static_cast<size_t>(bj64);
+    if (a[ai] != b[bj])
+      return false;
+    if (!isCoreAdmissible(ai, bj))
+      return false;
+    return !(aPartnerCount[ai] == 1 && bPartnerCount[bj] == 1);
+  };
+
+  struct BoundaryPureCandidate {
+    uint64_t left = 0;
+    uint64_t right = 0;
+    uint64_t balance = 0;
+    uint64_t boundaryRank = 0;
+    uint64_t bPairRank = 0;
+  };
+
+  struct SuffixInsertionCandidate {
+    uint64_t left = 0;
+    uint64_t right = 0;
+    uint64_t anchorA = 0;
+    uint64_t anchorB = 0;
+    uint64_t boundaryRank = 0;
+    uint64_t bPairRank = 0;
+    uint64_t restoredAnchors = 0;
+  };
+
+  auto betterCandidate = [](const BoundaryPureCandidate &cand,
+                            const BoundaryPureCandidate &best) {
+    if (cand.balance != best.balance)
+      return cand.balance < best.balance;
+    if (cand.boundaryRank != best.boundaryRank)
+      return cand.boundaryRank > best.boundaryRank;
+    return cand.bPairRank > best.bPairRank;
+  };
+
+  auto betterSuffixInsertionCandidate =
+      [](const SuffixInsertionCandidate &cand,
+         const SuffixInsertionCandidate &best) {
+        if (cand.boundaryRank != best.boundaryRank)
+          return cand.boundaryRank > best.boundaryRank;
+        if (cand.bPairRank != best.bPairRank)
+          return cand.bPairRank > best.bPairRank;
+        if (cand.restoredAnchors != best.restoredAnchors)
+          return cand.restoredAnchors > best.restoredAnchors;
+        if (cand.right != best.right)
+          return cand.right > best.right;
+        return cand.left > best.left;
+      };
+
+  // Each forced hunk is a conservative edit island. Try to shrink only its
+  // edges by restoring ambiguous equal-token anchors when the resulting frontier
+  // is uniquely certified as a boundary-preserving pure insertion.
+  const std::vector<Hunk> forcedHunks = hunksFromMap(outMap, n, m);
+  size_t normalizedHunks = 0;
+  size_t ambiguousHunks = 0;
+  for (const Hunk &forced : forcedHunks) {
+    const uint64_t maxSharedWidth =
+        std::min(hunkAWidth(forced), hunkBWidth(forced));
+    if (maxSharedWidth == 0)
+      continue;
+
+    // Compute the maximal ambiguous equal-token edge runs. These are candidates
+    // for restoration; interior ambiguous anchors are intentionally ignored.
+    uint64_t maxPrefix = 0;
+    while (maxPrefix < maxSharedWidth &&
+           canUseAmbiguousEdgeAnchor(forced.aStart + maxPrefix,
+                                     forced.bStart + maxPrefix))
+      ++maxPrefix;
+
+    uint64_t maxSuffix = 0;
+    while (maxSuffix < maxSharedWidth &&
+           canUseAmbiguousEdgeAnchor(forced.aEnd - maxSuffix - 1,
+                                     forced.bEnd - maxSuffix - 1))
+      ++maxSuffix;
+
+    // First handle the symmetric case: restore some left and/or right edge
+    // anchors so the remaining hunk is exactly A-empty/B-nonempty.
+    bool haveBest = false;
+    BoundaryPureCandidate best;
+    size_t bestCount = 0;
+    for (uint64_t left = 0; left <= maxPrefix; ++left) {
+      for (uint64_t right = 0; right <= maxSuffix; ++right) {
+        if (left + right > maxSharedWidth)
+          continue;
+        const uint64_t aStart = forced.aStart + left;
+        const uint64_t aEnd = forced.aEnd - right;
+        const uint64_t bStart = forced.bStart + left;
+        const uint64_t bEnd = forced.bEnd - right;
+        if (aStart > aEnd || bStart > bEnd)
+          continue;
+        if (!(aStart == aEnd && bStart < bEnd))
+          continue;
+
+        BoundaryPureCandidate cand;
+        cand.left = left;
+        cand.right = right;
+        cand.balance = left > right ? left - right : right - left;
+        cand.boundaryRank = aBoundaryRetentionRank(gapProvenance, aStart);
+        cand.bPairRank = bPairSurfaceRank(bGapProvenance, bStart, bEnd);
+        if (!haveBest || betterCandidate(cand, best)) {
+          best = cand;
+          haveBest = true;
+          bestCount = 1;
+        } else if (cand.balance == best.balance &&
+                   cand.boundaryRank == best.boundaryRank &&
+                   cand.bPairRank == best.bPairRank) {
+          ++bestCount;
+        }
+      }
+    }
+
+    if (!haveBest) {
+      // A boundary-pure insertion can also be hidden behind an unchanged token
+      // immediately to the left of the insertion frontier. This occurs when a
+      // line-local macro expansion is edited and a B-only after-boundary payload
+      // is appended before the next unchanged token. Equal-offset edge
+      // restoration cannot prove that shape because the delimiter token is no
+      // longer at the same relative B offset, but the shape is still fully
+      // certifiable:
+      //
+      //   [left edit]  anchor  [B-only suffix insertion]  [right edge anchors]
+      //
+      // The restored internal anchor must be core-LCS-admissible, the suffix
+      // insertion must be bounded by at least one restored right-edge anchor,
+      // and the selected frontier must be unique under structural A-gap and
+      // B-gap ranks. No neighboring token spelling is consulted to choose the
+      // frontier; spellings are used only for ordinary LCS anchor equality.
+      bool haveSuffixBest = false;
+      SuffixInsertionCandidate suffixBest;
+      size_t suffixBestCount = 0;
+
+      for (uint64_t right = 1; right <= maxSuffix; ++right) {
+        const uint64_t aPureGap = forced.aEnd - right;
+        const uint64_t bPureEnd = forced.bEnd - right;
+        if (aPureGap == 0 || aPureGap <= forced.aStart ||
+            bPureEnd <= forced.bStart)
+          continue;
+
+        const uint64_t anchorA = aPureGap - 1;
+        for (uint64_t left = 0; left <= maxPrefix; ++left) {
+          if (left + right + 1 > maxSharedWidth)
+            continue;
+          const uint64_t leftA = forced.aStart + left;
+          const uint64_t leftB = forced.bStart + left;
+          if (anchorA < leftA)
+            continue;
+
+          for (uint64_t anchorB = leftB; anchorB < bPureEnd; ++anchorB) {
+            if (!canUseAmbiguousEdgeAnchor(anchorA, anchorB))
+              continue;
+
+            const uint64_t insertionBegin = anchorB + 1;
+            if (insertionBegin >= bPureEnd)
+              continue;
+
+            SuffixInsertionCandidate cand;
+            cand.left = left;
+            cand.right = right;
+            cand.anchorA = anchorA;
+            cand.anchorB = anchorB;
+            cand.boundaryRank =
+                aBoundaryRetentionRank(gapProvenance, aPureGap);
+            cand.bPairRank =
+                bPairSurfaceRank(bGapProvenance, insertionBegin, bPureEnd);
+            cand.restoredAnchors = left + right + 1;
+
+            if (!haveSuffixBest ||
+                betterSuffixInsertionCandidate(cand, suffixBest)) {
+              suffixBest = cand;
+              haveSuffixBest = true;
+              suffixBestCount = 1;
+            } else if (cand.boundaryRank == suffixBest.boundaryRank &&
+                       cand.bPairRank == suffixBest.bPairRank &&
+                       cand.restoredAnchors == suffixBest.restoredAnchors &&
+                       cand.right == suffixBest.right &&
+                       cand.left == suffixBest.left) {
+              ++suffixBestCount;
+            }
+          }
+        }
+      }
+
+      if (!haveSuffixBest)
+        continue;
+      if (suffixBestCount != 1) {
+        ++ambiguousHunks;
+        continue;
+      }
+
+      trace("lcs/map",
+            "certified suffix-insertion frontier: hunk=A[{0},{1})/B[{2},{3}) "
+            "left={4} anchor=A{5}->B{6} right={7} boundaryRank={8} "
+            "bPairRank={9}",
+            forced.aStart, forced.aEnd, forced.bStart, forced.bEnd,
+            suffixBest.left, suffixBest.anchorA, suffixBest.anchorB,
+            suffixBest.right, suffixBest.boundaryRank, suffixBest.bPairRank);
+
+      for (uint64_t off = 0; off < suffixBest.left; ++off) {
+        outMap[static_cast<size_t>(forced.aStart + off)] =
+            static_cast<int64_t>(forced.bStart + off);
+      }
+      outMap[static_cast<size_t>(suffixBest.anchorA)] =
+          static_cast<int64_t>(suffixBest.anchorB);
+      for (uint64_t off = 0; off < suffixBest.right; ++off) {
+        outMap[static_cast<size_t>(forced.aEnd - suffixBest.right + off)] =
+            static_cast<int64_t>(forced.bEnd - suffixBest.right + off);
+      }
+
+      ++normalizedHunks;
+      continue;
+    }
+    if (bestCount != 1) {
+      ++ambiguousHunks;
+      continue;
+    }
+
+    for (uint64_t off = 0; off < best.left; ++off) {
+      outMap[static_cast<size_t>(forced.aStart + off)] =
+          static_cast<int64_t>(forced.bStart + off);
+    }
+    for (uint64_t off = 0; off < best.right; ++off) {
+      outMap[static_cast<size_t>(forced.aEnd - best.right + off)] =
+          static_cast<int64_t>(forced.bEnd - best.right + off);
+    }
+    ++normalizedHunks;
+  }
+
+  // The final map must remain a strict A→B monotone alignment. If an edge
+  // restoration unexpectedly crosses another anchor, discard restored ambiguous
+  // edges and return to the fail-closed forced-anchor map.
+  int64_t previousB = -1;
+  for (size_t ai = 0; ai < outMap.size(); ++ai) {
+    const int64_t bj = outMap[ai];
+    if (bj < 0)
+      continue;
+    if (bj <= previousB) {
+      trace("lcs/map",
+            "certified boundary-pure map lost monotonicity at A={0} B={1} "
+            "after previous B={2}; returning ambiguity-suppressed map",
+            ai, bj, previousB);
+      outMap.assign(n, -1);
+      for (size_t forcedAi = 0; forcedAi < n; ++forcedAi) {
+        if (aPartnerCount[forcedAi] != 1)
+          continue;
+        const int64_t forcedBj = firstBPartner[forcedAi];
+        if (forcedBj >= 0 && forcedBj < static_cast<int64_t>(m) &&
+            bPartnerCount[static_cast<size_t>(forcedBj)] == 1)
+          outMap[forcedAi] = forcedBj;
+      }
+      const size_t suppressedFallbackAnchors =
+          suppressOrderConflictingAnchors(outMap);
+      if (suppressedFallbackAnchors != 0) {
+        trace("lcs/map",
+              "suppressed {0} order-conflicting anchors while falling back "
+              "to ambiguity-suppressed core map",
+              suppressedFallbackAnchors);
+      }
+      return true;
+    }
+    previousB = bj;
+  }
+
+  trace("lcs/map",
+        "certified boundary-pure map: forcedHunks={0} normalizedHunks={1} "
+        "ambiguousNormalizationHunks={2}",
+        forcedHunks.size(), normalizedHunks, ambiguousHunks);
+  return true;
 }
 
 // ===================== Hirschberg (exact, linear space) ======================
@@ -176,18 +793,16 @@ matchTiePenalty(ArrayRef<StringRef> a, ArrayRef<StringRef> b, size_t ai,
 struct Score {
   uint32_t len = 0;
   uint64_t cost = 0;
-  uint32_t tie = 0;
 
   Score operator+(const Score &other) const {
     Score out;
     out.len = len + other.len;
     out.cost = cost + other.cost;
-    out.tie = tie + other.tie;
     return out;
   }
 
   bool operator==(const Score &other) const {
-    return len == other.len && cost == other.cost && tie == other.tie;
+    return len == other.len && cost == other.cost;
   }
 };
 
@@ -219,10 +834,8 @@ struct GapView {
 };
 
 static std::vector<Score>
-computeRowWeighted(const SpanView &aV, const SpanView &bV, const GapView &gapV,
-                   ArrayRef<StringRef> aFull, ArrayRef<StringRef> bFull,
-                   const llvm::DenseMap<StringRef, unsigned> &freqA,
-                   const llvm::DenseMap<StringRef, unsigned> &freqB) {
+computeRowWeighted(const SpanView &aV, const SpanView &bV,
+                   const GapView &gapV) {
   const size_t n = aV.size();
   const size_t m = bV.size();
   if (gapV.size() != n + 1)
@@ -231,7 +844,7 @@ computeRowWeighted(const SpanView &aV, const SpanView &bV, const GapView &gapV,
   std::vector<Score> dp(m + 1);
   std::vector<Score> ndp(m + 1);
 
-  dp[0] = Score{0, 0, 0};
+  dp[0] = Score{0, 0};
   // Row 0: only insertions, charged at boundary 0.
   for (size_t j = 1; j <= m; ++j) {
     dp[j] = dp[j - 1];
@@ -248,14 +861,10 @@ computeRowWeighted(const SpanView &aV, const SpanView &bV, const GapView &gapV,
       Score best;
       best.len = 0;
       best.cost = std::numeric_limits<uint64_t>::max();
-      best.tie = std::numeric_limits<uint32_t>::max();
-
       // 1) Match (diag)
       if (aV.at(i - 1) == bV.at(j - 1)) {
         Score cand = diagPrev;
         cand.len += 1U;
-        cand.tie += matchTiePenalty(aFull, bFull, aV.absIndex(i - 1),
-                                    bV.absIndex(j - 1), freqA, freqB);
         best = cand;
       }
 
@@ -263,8 +872,7 @@ computeRowWeighted(const SpanView &aV, const SpanView &bV, const GapView &gapV,
       {
         Score cand = dp[j];
         cand.cost += static_cast<uint64_t>(gapV.at(i));
-        if (isBetter(cand.len, cand.cost, cand.tie, best.len, best.cost,
-                     best.tie)) {
+        if (isCoreBetter(cand.len, cand.cost, best.len, best.cost)) {
           best = cand;
         }
       }
@@ -273,8 +881,7 @@ computeRowWeighted(const SpanView &aV, const SpanView &bV, const GapView &gapV,
       {
         Score cand = ndp[j - 1];
         cand.cost += static_cast<uint64_t>(gapV.at(i));
-        if (isBetter(cand.len, cand.cost, cand.tie, best.len, best.cost,
-                     best.tie)) {
+        if (isCoreBetter(cand.len, cand.cost, best.len, best.cost)) {
           best = cand;
         }
       }
@@ -289,13 +896,9 @@ computeRowWeighted(const SpanView &aV, const SpanView &bV, const GapView &gapV,
   return dp;
 }
 
-static void
-solveSmallWeightedDP(const SpanView &aV, const SpanView &bV,
-                     const GapView &gapV, ArrayRef<StringRef> aFull,
-                     ArrayRef<StringRef> bFull,
-                     const llvm::DenseMap<StringRef, unsigned> &freqA,
-                     const llvm::DenseMap<StringRef, unsigned> &freqB,
-                     std::vector<int64_t> &outMap) {
+static void solveSmallWeightedDP(const SpanView &aV, const SpanView &bV,
+                                 const GapView &gapV,
+                                 std::vector<int64_t> &outMap) {
   const size_t n = aV.size();
   const size_t m = bV.size();
   if (gapV.size() != n + 1)
@@ -306,15 +909,11 @@ solveSmallWeightedDP(const SpanView &aV, const SpanView &bV,
 
   std::vector<uint32_t> dpLen(cells, 0);
   std::vector<uint64_t> dpCost(cells, 0);
-  std::vector<uint32_t> dpTie(cells, 0);
-
   auto idx = [&](size_t i, size_t j) -> size_t { return i * stride + j; };
   auto len = [&](size_t i, size_t j) -> uint32_t & { return dpLen[idx(i, j)]; };
   auto cost = [&](size_t i, size_t j) -> uint64_t & {
     return dpCost[idx(i, j)];
   };
-  auto tie = [&](size_t i, size_t j) -> uint32_t & { return dpTie[idx(i, j)]; };
-
   for (size_t i = 0; i <= n; ++i) {
     for (size_t j = 0; j <= m; ++j) {
       if (i == 0 && j == 0)
@@ -322,15 +921,10 @@ solveSmallWeightedDP(const SpanView &aV, const SpanView &bV,
 
       uint32_t bestLen = 0;
       uint64_t bestCost = std::numeric_limits<uint64_t>::max();
-      uint32_t bestTie = std::numeric_limits<uint32_t>::max();
-
       // Match
       if (i > 0 && j > 0 && aV.at(i - 1) == bV.at(j - 1)) {
         bestLen = len(i - 1, j - 1) + 1U;
         bestCost = cost(i - 1, j - 1);
-        bestTie = tie(i - 1, j - 1) +
-                  matchTiePenalty(aFull, bFull, aV.absIndex(i - 1),
-                                  bV.absIndex(j - 1), freqA, freqB);
       }
 
       // Delete A (pay at boundary i)
@@ -338,11 +932,9 @@ solveSmallWeightedDP(const SpanView &aV, const SpanView &bV,
         const uint32_t candLen = len(i - 1, j);
         const uint64_t candCost =
             cost(i - 1, j) + static_cast<uint64_t>(gapV.at(i));
-        const uint32_t candTie = tie(i - 1, j);
-        if (isBetter(candLen, candCost, candTie, bestLen, bestCost, bestTie)) {
+        if (isCoreBetter(candLen, candCost, bestLen, bestCost)) {
           bestLen = candLen;
           bestCost = candCost;
-          bestTie = candTie;
         }
       }
 
@@ -351,18 +943,14 @@ solveSmallWeightedDP(const SpanView &aV, const SpanView &bV,
         const uint32_t candLen = len(i, j - 1);
         const uint64_t candCost =
             cost(i, j - 1) + static_cast<uint64_t>(gapV.at(i));
-        const uint32_t candTie = tie(i, j - 1);
-        if (isBetter(candLen, candCost, candTie, bestLen, bestCost, bestTie)) {
+        if (isCoreBetter(candLen, candCost, bestLen, bestCost)) {
           bestLen = candLen;
           bestCost = candCost;
-          bestTie = candTie;
         }
       }
 
       len(i, j) = bestLen;
       cost(i, j) = bestCost;
-      tie(i, j) =
-          (bestTie == std::numeric_limits<uint32_t>::max()) ? 0U : bestTie;
     }
   }
 
@@ -372,16 +960,12 @@ solveSmallWeightedDP(const SpanView &aV, const SpanView &bV,
   while (i > 0 || j > 0) {
     const uint32_t curLen = len(i, j);
     const uint64_t curCost = cost(i, j);
-    const uint32_t curTie = tie(i, j);
-
     bool moved = false;
 
     // Diagonal match
     if (i > 0 && j > 0 && aV.at(i - 1) == bV.at(j - 1)) {
-      const uint32_t pen = matchTiePenalty(aFull, bFull, aV.absIndex(i - 1),
-                                           bV.absIndex(j - 1), freqA, freqB);
-      if (len(i - 1, j - 1) == curLen - 1U && cost(i - 1, j - 1) == curCost &&
-          tie(i - 1, j - 1) + pen == curTie) {
+      if (len(i - 1, j - 1) == curLen - 1U &&
+          cost(i - 1, j - 1) == curCost) {
         outMap[aV.absIndex(i - 1)] = static_cast<int64_t>(bV.absIndex(j - 1));
         --i;
         --j;
@@ -392,8 +976,7 @@ solveSmallWeightedDP(const SpanView &aV, const SpanView &bV,
     // Up (delete A)
     if (!moved && i > 0) {
       if (len(i - 1, j) == curLen &&
-          cost(i - 1, j) + static_cast<uint64_t>(gapV.at(i)) == curCost &&
-          tie(i - 1, j) == curTie) {
+          cost(i - 1, j) + static_cast<uint64_t>(gapV.at(i)) == curCost) {
         --i;
         moved = true;
       }
@@ -402,8 +985,7 @@ solveSmallWeightedDP(const SpanView &aV, const SpanView &bV,
     // Left (insert B)
     if (!moved && j > 0) {
       if (len(i, j - 1) == curLen &&
-          cost(i, j - 1) + static_cast<uint64_t>(gapV.at(i)) == curCost &&
-          tie(i, j - 1) == curTie) {
+          cost(i, j - 1) + static_cast<uint64_t>(gapV.at(i)) == curCost) {
         --j;
         moved = true;
       }
@@ -414,13 +996,9 @@ solveSmallWeightedDP(const SpanView &aV, const SpanView &bV,
   }
 }
 
-static void
-hirschbergWeightedRec(const SpanView &aV, const SpanView &bV,
-                      const GapView &gapV, ArrayRef<StringRef> aFull,
-                      ArrayRef<StringRef> bFull,
-                      const llvm::DenseMap<StringRef, unsigned> &freqA,
-                      const llvm::DenseMap<StringRef, unsigned> &freqB,
-                      std::vector<int64_t> &outMap) {
+static void hirschbergWeightedRec(const SpanView &aV, const SpanView &bV,
+                                  const GapView &gapV,
+                                  std::vector<int64_t> &outMap) {
   const size_t n = aV.size();
   const size_t m = bV.size();
   if (n == 0 || m == 0)
@@ -430,7 +1008,7 @@ hirschbergWeightedRec(const SpanView &aV, const SpanView &bV,
   const unsigned long long cells = static_cast<unsigned long long>(n + 1ULL) *
                                    static_cast<unsigned long long>(m + 1ULL);
   if (cells <= (1ULL << 20)) {
-    solveSmallWeightedDP(aV, bV, gapV, aFull, bFull, freqA, freqB, outMap);
+    solveSmallWeightedDP(aV, bV, gapV, outMap);
     return;
   }
 
@@ -443,23 +1021,23 @@ hirschbergWeightedRec(const SpanView &aV, const SpanView &bV,
   const GapView gapRight{gapV.base, gapV.off + mid, (n - mid) + 1, gapV.rev};
 
   const std::vector<Score> leftRow =
-      computeRowWeighted(aLeft, bV, gapLeft, aFull, bFull, freqA, freqB);
+      computeRowWeighted(aLeft, bV, gapLeft);
 
   const SpanView aRightRev{aV.base, aV.off + mid, n - mid, true};
   const GapView gapRightRev{gapV.base, gapV.off + mid, (n - mid) + 1, true};
   const SpanView bRev{bV.base, bV.off, m, true};
 
-  const std::vector<Score> rightRowRev = computeRowWeighted(
-      aRightRev, bRev, gapRightRev, aFull, bFull, freqA, freqB);
+  const std::vector<Score> rightRowRev =
+      computeRowWeighted(aRightRev, bRev, gapRightRev);
 
-  // Choose split j maximizing combined (len, cost, tie). On exact equality,
-  // prefer the smallest j for determinism.
+  // Choose split j maximizing the core objective (length, then inverse cost).
+  // On exact equality, prefer the smallest j for determinism.
   size_t bestJ = 0;
   Score best = leftRow[0] + rightRowRev[m];
   for (size_t j = 1; j <= m; ++j) {
     Score cand = leftRow[j] + rightRowRev[m - j];
-    if (isBetter(cand.len, cand.cost, cand.tie, best.len, best.cost,
-                 best.tie) || (cand == best && j < bestJ)) {
+    if (isCoreBetter(cand.len, cand.cost, best.len, best.cost) ||
+        (cand == best && j < bestJ)) {
       bestJ = j;
       best = cand;
     }
@@ -468,22 +1046,18 @@ hirschbergWeightedRec(const SpanView &aV, const SpanView &bV,
   const SpanView bLeft{bV.base, bV.off, bestJ, bV.rev};
   const SpanView bRight{bV.base, bV.off + bestJ, m - bestJ, bV.rev};
 
-  hirschbergWeightedRec(aLeft, bLeft, gapLeft, aFull, bFull, freqA, freqB,
-                        outMap);
-  hirschbergWeightedRec(aRight, bRight, gapRight, aFull, bFull, freqA, freqB,
-                        outMap);
+  hirschbergWeightedRec(aLeft, bLeft, gapLeft, outMap);
+  hirschbergWeightedRec(aRight, bRight, gapRight, outMap);
 }
 
 static std::vector<int64_t>
 lcsMapABHirschbergWeighted(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
-                           ArrayRef<uint32_t> ownerDepthGap,
-                           const llvm::DenseMap<StringRef, unsigned> &freqA,
-                           const llvm::DenseMap<StringRef, unsigned> &freqB) {
+                           ArrayRef<uint32_t> ownerDepthGap) {
   std::vector<int64_t> out(a.size(), -1);
   const SpanView aV{a, 0, a.size(), false};
   const SpanView bV{b, 0, b.size(), false};
   const GapView gV{ownerDepthGap, 0, ownerDepthGap.size(), false};
-  hirschbergWeightedRec(aV, bV, gV, a, b, freqA, freqB, out);
+  hirschbergWeightedRec(aV, bV, gV, out);
   return out;
 }
 
@@ -604,13 +1178,13 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a,
 
   const size_t n = a.size(), m = b.size();
 
-  // Early outs for empties
+  // Early outs for empties.
   if (n == 0)
     return {};
   if (m == 0)
     return std::vector<int64_t>(n, -1);
 
-  // Validate ownerDepthGap shape
+  // Validate ownerDepthGap shape.
   if (ownerDepthGap.size() != n + 1) {
     fatal("lcs/map", "ownerDepthGap length must be A.size() + 1");
   }
@@ -620,29 +1194,20 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a,
   if (m > MAX)
     fatal("lcs/map", "B.size() exceeds int64_t index range");
 
-  // Build frequency maps once per call for ambiguity detection (also used by
-  // Hirschberg).
-  llvm::DenseMap<StringRef, unsigned> freqA;
-  llvm::DenseMap<StringRef, unsigned> freqB;
-  freqA.reserve(a.size());
-  freqB.reserve(b.size());
-  for (StringRef t : a)
-    ++freqA[t];
-  for (StringRef t : b)
-    ++freqB[t];
-
   // DP table guard: if the full (n+1)*(m+1) table is too large, use Hirschberg
   // to remain exact while using only O(n+m) memory.
   const unsigned long long nu = static_cast<unsigned long long>(n);
   const unsigned long long mu = static_cast<unsigned long long>(m);
   const bool useHirschberg = shouldUseGreedyApproach(nu, mu, maxCells);
-  if (useHirschberg)
-    return lcsMapABHirschbergWeighted(a, b, ownerDepthGap, freqA, freqB);
+  if (useHirschberg) {
+    std::vector<int64_t> map =
+        lcsMapABHirschbergWeighted(a, b, ownerDepthGap);
+    return map;
+  }
 
   // ---------------- DP path: (n+1) x (m+1) tables, row-major -----------------
   // dpLen(i,j)  = max LCS length for A[0..i) vs B[0..j)
   // dpCost(i,j) = min accumulated gap cost among paths achieving dpLen(i,j)
-  // dpTie(i,j)  = min tie-break penalty among paths achieving (dpLen, dpCost)
   //
   // Transitions into (i,j):
   //   match:     from (i-1,j-1), +1 length, +0 cost
@@ -652,24 +1217,20 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a,
   const size_t cells = (n + 1) * (m + 1);
 
   std::vector<uint32_t> dpLen(cells, 0);
-  // Using uint64_t for cost to prevent overflow during accumulation
+  // Using uint64_t for cost prevents overflow during accumulation.
   std::vector<uint64_t> dpCost(cells, 0);
-  std::vector<uint32_t> dpTie(cells, 0);
 
-  auto idx = [&](size_t i, size_t j) -> size_t {
-    return i * stride + j;
-  };
+  auto idx = [&](size_t i, size_t j) -> size_t { return i * stride + j; };
   auto len = [&](size_t i, size_t j) -> uint32_t & {
     return dpLen[idx(i, j)];
   };
   auto cost = [&](size_t i, size_t j) -> uint64_t & {
     return dpCost[idx(i, j)];
   };
-  auto tie = [&](size_t i, size_t j) -> uint32_t & {
-    return dpTie[idx(i, j)];
-  };
 
-  // Fill DP table forward
+  // Fill DP table forward. Equal-core predecessor states keep the first
+  // considered transition, preserving the existing deterministic order:
+  // diagonal, then delete, then insert.
   for (size_t i = 0; i <= n; ++i) {
     for (size_t j = 0; j <= m; ++j) {
       if (i == 0 && j == 0)
@@ -677,48 +1238,37 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a,
 
       uint32_t bestLen = 0;
       uint64_t bestCost = std::numeric_limits<uint64_t>::max();
-      uint32_t bestTie = std::numeric_limits<uint32_t>::max();
 
-      // 1) Match (diagonal)
+      // 1) Match (diagonal).
       if (i > 0 && j > 0 && a[i - 1] == b[j - 1]) {
         bestLen = len(i - 1, j - 1) + 1U;
         bestCost = cost(i - 1, j - 1);
-        bestTie = tie(i - 1, j - 1) +
-                  matchTiePenalty(a, b, i - 1, j - 1, freqA, freqB);
       }
 
-      // 2) Delete A (vertical move: i-1 -> i), pay ownerDepthGap[i]
+      // 2) Delete A (vertical move: i-1 -> i), pay ownerDepthGap[i].
       if (i > 0) {
         const uint32_t candLen = len(i - 1, j);
         const uint64_t candCost =
             cost(i - 1, j) + static_cast<uint64_t>(ownerDepthGap[i]);
-        const uint32_t candTie = tie(i - 1, j);
-
-        if (isBetter(candLen, candCost, candTie, bestLen, bestCost, bestTie)) {
+        if (isCoreBetter(candLen, candCost, bestLen, bestCost)) {
           bestLen = candLen;
           bestCost = candCost;
-          bestTie = candTie;
         }
       }
 
-      // 3) Insert B (horizontal move: j-1 -> j), pay ownerDepthGap[i]
+      // 3) Insert B (horizontal move: j-1 -> j), pay ownerDepthGap[i].
       if (j > 0) {
         const uint32_t candLen = len(i, j - 1);
         const uint64_t candCost =
             cost(i, j - 1) + static_cast<uint64_t>(ownerDepthGap[i]);
-        const uint32_t candTie = tie(i, j - 1);
-
-        if (isBetter(candLen, candCost, candTie, bestLen, bestCost, bestTie)) {
+        if (isCoreBetter(candLen, candCost, bestLen, bestCost)) {
           bestLen = candLen;
           bestCost = candCost;
-          bestTie = candTie;
         }
       }
 
       len(i, j) = bestLen;
       cost(i, j) = bestCost;
-      tie(i, j) =
-          (bestTie == std::numeric_limits<uint32_t>::max()) ? 0U : bestTie;
     }
   }
 
@@ -730,15 +1280,13 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a,
   while (i > 0 || j > 0) {
     const uint32_t curLen = len(i, j);
     const uint64_t curCost = cost(i, j);
-    const uint32_t curTie = tie(i, j);
 
     bool moved = false;
 
-    // Diagonal (match)
+    // Diagonal (match).
     if (i > 0 && j > 0 && a[i - 1] == b[j - 1]) {
-      const uint32_t pen = matchTiePenalty(a, b, i - 1, j - 1, freqA, freqB);
-      if (len(i - 1, j - 1) == curLen - 1U && cost(i - 1, j - 1) == curCost &&
-          tie(i - 1, j - 1) + pen == curTie) {
+      if (len(i - 1, j - 1) == curLen - 1U &&
+          cost(i - 1, j - 1) == curCost) {
         map[i - 1] = static_cast<int64_t>(j - 1);
         --i;
         --j;
@@ -746,21 +1294,19 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a,
       }
     }
 
-    // Up (delete A): from (i-1, j) paying ownerDepthGap[i]
+    // Up (delete A): from (i-1, j) paying ownerDepthGap[i].
     if (!moved && i > 0) {
       if (len(i - 1, j) == curLen &&
-          cost(i - 1, j) + static_cast<uint64_t>(ownerDepthGap[i]) == curCost &&
-          tie(i - 1, j) == curTie) {
+          cost(i - 1, j) + static_cast<uint64_t>(ownerDepthGap[i]) == curCost) {
         --i;
         moved = true;
       }
     }
 
-    // Left (insert B): from (i, j-1) paying ownerDepthGap[i]
+    // Left (insert B): from (i, j-1) paying ownerDepthGap[i].
     if (!moved && j > 0) {
       if (len(i, j - 1) == curLen &&
-          cost(i, j - 1) + static_cast<uint64_t>(ownerDepthGap[i]) == curCost &&
-          tie(i, j - 1) == curTie) {
+          cost(i, j - 1) + static_cast<uint64_t>(ownerDepthGap[i]) == curCost) {
         --j;
         moved = true;
       }
@@ -773,11 +1319,64 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a,
   return map;
 }
 
-// ==================== LCS (DP with Hirschberg fallback) ======================
+std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
+                              ArrayRef<LcsGapProvenance> gapProvenance,
+                              unsigned long long maxCells) {
+  if (gapProvenance.size() != a.size() + 1)
+    fatal("lcs/map", "gapProvenance length must be A.size() + 1");
+
+  std::vector<uint32_t> ownerDepthGap;
+  ownerDepthGap.reserve(gapProvenance.size());
+  for (const LcsGapProvenance &profile : gapProvenance)
+    ownerDepthGap.push_back(profile.ownerDepth);
+
+  // A caller without edited-side gap profiles still receives the certified
+  // ambiguity-suppressed map. The B-side ranks collapse to zero, so ambiguous
+  // edge anchors are restored only when A-side provenance alone proves a unique
+  // frontier.
+  std::vector<LcsBGapProvenance> emptyBGapProvenance(b.size() + 1);
+  std::vector<int64_t> map;
+  if (buildBoundaryPureCertifiedMap(a, b, ownerDepthGap, gapProvenance,
+                                    emptyBGapProvenance, maxCells, map)) {
+    return map;
+  }
+
+  // If the full admissibility tables exceed the configured DP budget, fall back
+  // to the exact weighted Hirschberg/core-DP implementation. This path uses
+  // the same core objective without the removed neighbor-coherence heuristic; it
+  // merely lacks the full ambiguity-certification table.
+  return lcsMapAB(a, b, ArrayRef<uint32_t>(ownerDepthGap), maxCells);
+}
+
+std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
+                              ArrayRef<LcsGapProvenance> gapProvenance,
+                              ArrayRef<LcsBGapProvenance> bGapProvenance,
+                              unsigned long long maxCells) {
+  if (bGapProvenance.size() != b.size() + 1)
+    fatal("lcs/map", "bGapProvenance length must be B.size() + 1");
+
+  if (gapProvenance.size() != a.size() + 1)
+    fatal("lcs/map", "gapProvenance length must be A.size() + 1");
+
+  std::vector<uint32_t> ownerDepthGap;
+  ownerDepthGap.reserve(gapProvenance.size());
+  for (const LcsGapProvenance &profile : gapProvenance)
+    ownerDepthGap.push_back(profile.ownerDepth);
+
+  std::vector<int64_t> map;
+  if (buildBoundaryPureCertifiedMap(a, b, ownerDepthGap, gapProvenance,
+                                    bGapProvenance, maxCells, map)) {
+    return map;
+  }
+
+  // See the A-only overload above: this is the exact core fallback, not a
+  // return to the old neighbor-coherence heuristic.
+  return lcsMapAB(a, b, ArrayRef<uint32_t>(ownerDepthGap), maxCells);
+}
 
 [[maybe_unused]]
 std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
-                          unsigned long long maxCells) {
+                              unsigned long long maxCells) {
   const size_t n = a.size(), m = b.size();
 
   // Early outs for empties
@@ -870,7 +1469,6 @@ std::vector<Hunk> hunksFromMap(ArrayRef<int64_t> map, size_t nA, size_t nB) {
 // ===================== Myers linear-space O((N+M)*D) diff ====================
 
 namespace {
-
 struct MiddleSnake {
   int64_t aStart = 0;
   int64_t bStart = 0;
@@ -1060,7 +1658,6 @@ static void diffLinearRec(ArrayRef<StringRef> a, int64_t aLo, int64_t aHi,
                    static_cast<uint64_t>(bMidHi),
                    static_cast<uint64_t>(suffixLen));
 }
-
 } // namespace
 
 std::vector<Step> diff(ArrayRef<StringRef> a, ArrayRef<StringRef> b) {

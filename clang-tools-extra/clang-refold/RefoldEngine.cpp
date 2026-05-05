@@ -1459,9 +1459,14 @@ std::string RefoldEngine::RunSinglePassRefold() {
       [](StringRef msg) { trace("lcs/ownerGap", msg); });
   trace("lcs/ownerGap", sep);
 
-  // 2) LCS over tokens (A → B) with owner-aware cost model. and dump A → B
-  // map.
-  auto a2b = diffutils::lcsMapAB(aSeq, bSeq, ownerDepthGap_);
+  // 2) LCS over tokens (A → B). The structured provenance profiles preserve
+  // the scalar owner-depth cost used by the core objective, then add exact
+  // include/conditional/macro identity and edited-side line-shape data so the
+  // diff layer can suppress ambiguous repeated-token anchors and restore only
+  // certified boundary-preserving frontiers.
+  auto gapProvenance = ComputeLcsGapProvenanceForPP();
+  auto bGapProvenance = ComputeLcsBGapProvenanceForPP();
+  auto a2b = diffutils::lcsMapAB(aSeq, bSeq, gapProvenance, bGapProvenance);
   trace("lcs/a2b", "a2b:");
   trace("lcs/a2b", "====");
   logFormattedArray<int64_t>(a2b, /* k */ MAX_COLS, /* sameWidth */ true,
@@ -3358,6 +3363,298 @@ std::vector<uint32_t> RefoldEngine::ComputeOwnerDepthGapsForPP() {
   }
 
   return ownerDepthGap;
+}
+
+
+std::vector<diffutils::LcsGapProvenance>
+RefoldEngine::ComputeLcsGapProvenanceForPP() {
+  using diffutils::LcsGapProvenance;
+
+  // The core LCS still consumes the same scalar owner-depth array as before.
+  // The remaining fields below carry identity, not extra cost: they let the
+  // diff layer prove whether an ambiguous equal-token frontier preserves an
+  // include, conditional, or macro boundary.
+
+  const size_t N = aTokOff_.size() - 1;
+  std::vector<LcsGapProvenance> profiles(N + 1);
+  const std::vector<uint32_t> ownerDepthGap = ComputeOwnerDepthGapsForPP();
+
+  struct MacroTokenContext {
+    uint64_t rootId = LcsGapProvenance::NoId;
+    uint64_t leafId = LcsGapProvenance::NoId;
+    uint32_t depth = 0;
+    uint32_t roleMask = 0;
+  };
+
+  auto spanContains = [](const auto &span, uint64_t pp) -> bool {
+    return span.IsValid() && span.begin <= pp && pp < span.end;
+  };
+
+  auto macroDepthAndRoot = [&](const RefoldModel::MacroInvocation &m,
+                               uint64_t &rootId) -> uint32_t {
+    rootId = m.id;
+    uint32_t depth = 1;
+    const RefoldModel::MacroInvocation *cur = &m;
+    SmallDenseSet<uint64_t, 8> seen;
+    seen.insert(cur->id);
+    while (cur->callerMacroId) {
+      const uint64_t parentId = *cur->callerMacroId;
+      if (seen.contains(parentId))
+        break;
+      seen.insert(parentId);
+      const RefoldModel::MacroInvocation *parent =
+          FindMacroInvocationById(parentId);
+      if (!parent)
+        break;
+      cur = parent;
+      rootId = cur->id;
+      ++depth;
+    }
+    return depth;
+  };
+
+  auto macroRoleMaskAtPP = [&](const RefoldModel::MacroInvocation &m,
+                               uint64_t pp) -> uint32_t {
+    uint32_t mask = 0;
+    for (const auto &span : m.argSpans) {
+      if (spanContains(span, pp)) {
+        mask |= 1U; // argument contribution
+        break;
+      }
+    }
+    for (const auto &span : m.stringifySpans) {
+      if (spanContains(span, pp)) {
+        mask |= 2U; // stringification contribution
+        break;
+      }
+    }
+    for (const auto &span : m.pasteSpans) {
+      if (spanContains(span, pp)) {
+        mask |= 4U; // token-paste contribution
+        break;
+      }
+    }
+    for (const auto &span : m.bodySpans) {
+      if (spanContains(span, pp)) {
+        mask |= 8U; // replacement-list/body contribution
+        break;
+      }
+    }
+    for (const auto &span : m.spans) {
+      if (spanContains(span, pp)) {
+        mask |= 16U; // general expansion coverage
+        break;
+      }
+    }
+    return mask;
+  };
+
+  auto macroContextAtPP = [&](uint64_t pp) -> MacroTokenContext {
+    MacroTokenContext best;
+    uint64_t bestCoverWidth = std::numeric_limits<uint64_t>::max();
+    for (const auto &m : model_.GetMacroInvocations()) {
+      if (!m.Covers(pp, pp + 1))
+        continue;
+
+      uint64_t rootId = m.id;
+      const uint32_t depth = macroDepthAndRoot(m, rootId);
+      const uint64_t coverWidth = m.cover.IsValid()
+                                      ? (m.cover.end - m.cover.begin)
+                                      : std::numeric_limits<uint64_t>::max();
+
+      // Prefer the deepest invocation in the caller chain. If two records have
+      // the same caller depth for this token, the narrower cover is the more
+      // precise leaf owner. This ranking feeds the production LCS provenance
+      // certificate; it does not directly choose an edit by token spelling.
+      if (depth > best.depth ||
+          (depth == best.depth && coverWidth < bestCoverWidth)) {
+        best.rootId = rootId;
+        best.leafId = m.id;
+        best.depth = depth;
+        best.roleMask = macroRoleMaskAtPP(m, pp);
+        bestCoverWidth = coverWidth;
+      }
+    }
+    return best;
+  };
+
+  auto fillSide = [&](LcsGapProvenance &profile, uint64_t pp, bool leftSide) {
+    const std::optional<uint64_t> includeId = model_.InnermostIncludeAtPP(pp);
+    const std::optional<RefoldModel::ArmRef> armRef = model_.FindArmRefAtPP(pp);
+    const MacroTokenContext macro = macroContextAtPP(pp);
+
+    if (leftSide) {
+      profile.leftIncludeId = includeId.value_or(LcsGapProvenance::NoId);
+      if (armRef) {
+        profile.leftCondGroupId = armRef->group->id;
+        profile.leftCondArmId = armRef->arm->id;
+      }
+      profile.leftMacroRootId = macro.rootId;
+      profile.leftMacroLeafId = macro.leafId;
+      profile.leftMacroRoleMask = macro.roleMask;
+    } else {
+      profile.rightIncludeId = includeId.value_or(LcsGapProvenance::NoId);
+      if (armRef) {
+        profile.rightCondGroupId = armRef->group->id;
+        profile.rightCondArmId = armRef->arm->id;
+      }
+      profile.rightMacroRootId = macro.rootId;
+      profile.rightMacroLeafId = macro.leafId;
+      profile.rightMacroRoleMask = macro.roleMask;
+    }
+
+    profile.macroDepth = std::max(profile.macroDepth, macro.depth);
+  };
+
+  for (size_t k = 0; k <= N; ++k) {
+    LcsGapProvenance profile;
+    profile.ownerDepth = ownerDepthGap[k];
+
+    std::optional<uint64_t> leftInc;
+    std::optional<uint64_t> rightInc;
+    std::optional<RefoldModel::ArmRef> leftArmRef;
+    std::optional<RefoldModel::ArmRef> rightArmRef;
+
+    if (k > 0) {
+      const uint64_t leftPP = static_cast<uint64_t>(k - 1);
+      leftInc = model_.InnermostIncludeAtPP(leftPP);
+      leftArmRef = model_.FindArmRefAtPP(leftPP);
+      fillSide(profile, leftPP, /*leftSide=*/true);
+    }
+    if (k < N) {
+      const uint64_t rightPP = static_cast<uint64_t>(k);
+      rightInc = model_.InnermostIncludeAtPP(rightPP);
+      rightArmRef = model_.FindArmRefAtPP(rightPP);
+      fillSide(profile, rightPP, /*leftSide=*/false);
+    }
+
+    const std::optional<uint64_t> lca =
+        model_.LeastCommonAncestorInclude(leftInc, rightInc);
+    profile.lcaIncludeId = lca.value_or(LcsGapProvenance::NoId);
+    profile.includeDepth = model_.GetIncludeDepth(lca);
+
+    const uint32_t leftCondDepth =
+        leftArmRef ? model_.GetCondArmDepth(leftArmRef->arm->id) : 0;
+    const uint32_t rightCondDepth =
+        rightArmRef ? model_.GetCondArmDepth(rightArmRef->arm->id) : 0;
+    profile.conditionalDepth = std::min(leftCondDepth, rightCondDepth);
+
+    profiles[k] = profile;
+  }
+
+  return profiles;
+}
+
+
+std::vector<diffutils::LcsBGapProvenance>
+RefoldEngine::ComputeLcsBGapProvenanceForPP() {
+  using diffutils::LcsBGapProvenance;
+
+  // B-side tokens have no producer ownership graph, so this records only source
+  // surface facts around each edited token gap. The LCS certificate may use
+  // these facts to break otherwise equivalent pure-insertion frontiers without
+  // reintroducing the removed neighboring-token spelling heuristic.
+
+  const size_t N = bToks_.size();
+  std::vector<LcsBGapProvenance> profiles(N + 1);
+
+  auto containsNewline = [&](size_t begin, size_t end) -> bool {
+    begin = std::min(begin, bSource_.size());
+    end = std::min(end, bSource_.size());
+    if (end < begin)
+      std::swap(begin, end);
+    return bSource_.substr(begin, end - begin).find('\n') != StringRef::npos;
+  };
+
+  auto onlyWhitespace = [&](size_t begin, size_t end) -> bool {
+    begin = std::min(begin, bSource_.size());
+    end = std::min(end, bSource_.size());
+    if (end < begin)
+      std::swap(begin, end);
+    for (char ch : bSource_.substr(begin, end - begin)) {
+      if (!isHorizontalWhitespace(ch) && ch != '\n' && ch != '\r')
+        return false;
+    }
+    return true;
+  };
+
+  auto lineStart = [&](size_t pos) -> size_t {
+    pos = std::min(pos, bSource_.size());
+    while (pos > 0 && bSource_[pos - 1] != '\n' && bSource_[pos - 1] != '\r')
+      --pos;
+    return pos;
+  };
+
+  auto lineEnd = [&](size_t pos) -> size_t {
+    pos = std::min(pos, bSource_.size());
+    while (pos < bSource_.size() && bSource_[pos] != '\n' &&
+           bSource_[pos] != '\r')
+      ++pos;
+    return pos;
+  };
+
+  auto tokenBegin = [&](size_t tok) -> size_t {
+    if (tok >= bTokOff_.size())
+      return bSource_.size();
+    return std::min(bTokOff_[tok], bSource_.size());
+  };
+
+  auto tokenEnd = [&](size_t tok) -> size_t {
+    if (tok >= N)
+      return bSource_.size();
+    const size_t begin = tokenBegin(tok);
+    const size_t spellingEnd = begin + bToks_[tok].spelling.size();
+    if (tok + 1 < bTokOff_.size())
+      return std::min(spellingEnd, bTokOff_[tok + 1]);
+    return std::min(spellingEnd, bSource_.size());
+  };
+
+  auto beginsLine = [&](size_t begin) -> bool {
+    return onlyWhitespace(lineStart(begin), begin);
+  };
+
+  auto endsLine = [&](size_t end) -> bool {
+    return onlyWhitespace(end, lineEnd(end));
+  };
+
+  for (size_t gap = 0; gap <= N; ++gap) {
+    LcsBGapProvenance profile;
+    profile.hasLeftToken = gap > 0;
+    profile.hasRightToken = gap < N;
+
+    const size_t gapBegin = profile.hasLeftToken ? tokenEnd(gap - 1) : 0;
+    const size_t gapEnd =
+        profile.hasRightToken ? tokenBegin(gap) : bSource_.size();
+
+    profile.gapBeginByte = static_cast<uint64_t>(gapBegin);
+    profile.gapEndByte = static_cast<uint64_t>(gapEnd);
+
+    profile.gapContainsNewline = containsNewline(gapBegin, gapEnd);
+    profile.gapContainsOnlyWhitespace = onlyWhitespace(gapBegin, gapEnd);
+    profile.gapAtLineStart = beginsLine(gapBegin);
+    profile.gapAtLineEnd = endsLine(gapEnd);
+
+    if (profile.hasLeftToken) {
+      const size_t leftBegin = tokenBegin(gap - 1);
+      const size_t leftEnd = tokenEnd(gap - 1);
+      profile.leftTokenBeginByte = static_cast<uint64_t>(leftBegin);
+      profile.leftTokenEndByte = static_cast<uint64_t>(leftEnd);
+      profile.leftTokenStartsLine = beginsLine(leftBegin);
+      profile.leftTokenEndsLine = endsLine(leftEnd);
+    }
+    if (profile.hasRightToken) {
+      const size_t rightBegin = tokenBegin(gap);
+      const size_t rightEnd = tokenEnd(gap);
+      profile.rightTokenBeginByte = static_cast<uint64_t>(rightBegin);
+      profile.rightTokenEndByte = static_cast<uint64_t>(rightEnd);
+      profile.rightTokenStartsLine = beginsLine(rightBegin);
+      profile.rightTokenEndsLine = endsLine(rightEnd);
+    }
+
+    profiles[gap] = profile;
+  }
+
+  return profiles;
 }
 
 // ============================= Boundary helpers ==============================
@@ -6726,6 +7023,375 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
   trace("macro/args", "  invArgRanges({0})={1}", invArgRanges.size(),
         stringutils::rangesToStringWithSlices(baseInvText, invArgRanges));
 
+  auto tryTemplateSolvedArgsOnlyPatch = [&]() -> std::optional<MacroPatch> {
+    // Treat the whole macro expansion as a deterministic template made of
+    // fixed body tokens and argument-occurrence variables.  This proves split
+    // edits that the LCS exposes as separate islands around macro-body
+    // punctuation, e.g. repeated formals and tuple forwarding wrappers.
+    if (!m.stringifySpans.empty() || !m.pasteSpans.empty())
+      return std::nullopt;
+
+    auto cover = GetWholeCoverATokRange(m);
+    if (!cover)
+      return std::nullopt;
+
+    struct TemplateElem {
+      bool isArg = false;
+      uint64_t aBegin = 0;
+      uint64_t aEnd = 0;
+      uint32_t argIdx = 0;
+      size_t occurrenceOrdinal = 0;
+    };
+
+    // Build a linear template over the macro's A-side whole cover. Body spans
+    // are fixed terminals; standard argument spans are variables whose B-side
+    // slices must be solved consistently across all occurrences.
+    SmallVector<TemplateElem, 32> elems;
+    for (const auto &bs : m.bodySpans) {
+      if (bs.begin < bs.end)
+        elems.push_back({false, bs.begin, bs.end, 0, 0});
+    }
+
+    size_t occurrenceCount = 0;
+    for (const auto &as : m.argSpans) {
+      if (as.kind != PPArgSpanKind::Standard || as.begin >= as.end)
+        continue;
+      if (static_cast<size_t>(as.argIdx) >= invArgRanges.size())
+        return std::nullopt;
+      elems.push_back({true, as.begin, as.end, as.argIdx, occurrenceCount++});
+    }
+
+    if (occurrenceCount == 0 || elems.empty())
+      return std::nullopt;
+
+    bool needsCrossOccurrenceProof = false;
+    DenseMap<uint32_t, unsigned> argOccurrenceCounts;
+    for (const auto &elem : elems) {
+      if (!elem.isArg)
+        continue;
+      ++argOccurrenceCounts[elem.argIdx];
+      auto r = invArgRanges[elem.argIdx];
+      StringRef baseArg =
+          baseInvText.substr(r.first, r.second - r.first).trim();
+      StringRef occText = SliceASource(elem.aBegin, elem.aEnd).trim();
+      if (occText != baseArg)
+        needsCrossOccurrenceProof = true;
+    }
+    for (const auto &entry : argOccurrenceCounts) {
+      if (entry.second > 1)
+        needsCrossOccurrenceProof = true;
+    }
+    if (!needsCrossOccurrenceProof)
+      return std::nullopt;
+
+    llvm::sort(elems, [](const TemplateElem &a, const TemplateElem &b) {
+      if (a.aBegin != b.aBegin)
+        return a.aBegin < b.aBegin;
+      if (a.aEnd != b.aEnd)
+        return a.aEnd < b.aEnd;
+      return a.isArg < b.isArg;
+    });
+
+    // Reject unless body/argument spans form an exact partition of the macro
+    // cover. Any gap would be unmodelled fixed syntax, so the template would not
+    // explain the whole expansion surface.
+    uint64_t cursor = cover->first;
+    for (const auto &elem : elems) {
+      if (elem.aBegin != cursor)
+        return std::nullopt;
+      cursor = elem.aEnd;
+    }
+    if (cursor != cover->second)
+      return std::nullopt;
+
+    auto bEnv = MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
+        cover->first, cover->second);
+    if (!bEnv || bEnv->first >= bEnv->second)
+      return std::nullopt;
+
+    // Keep this proof path bounded and deterministic.  Large covers stay on
+    // the existing conservative paths rather than using an expensive solver.
+    if (elems.size() > 64 || (bEnv->second - bEnv->first) > 256 ||
+        occurrenceCount > 32)
+      return std::nullopt;
+
+    auto bodyMatchesAt = [&](const TemplateElem &elem, size_t bPos) -> bool {
+      const size_t len = static_cast<size_t>(elem.aEnd - elem.aBegin);
+      if (bPos + len > bEnv->second)
+        return false;
+      for (size_t i = 0; i < len; ++i) {
+        if (aToks_[static_cast<size_t>(elem.aBegin) + i].spelling !=
+            bToks_[bPos + i].spelling)
+          return false;
+      }
+      return true;
+    };
+
+    const std::pair<size_t, size_t> unset = {
+        std::numeric_limits<size_t>::max(),
+        std::numeric_limits<size_t>::max()};
+    std::vector<std::pair<size_t, size_t>> curAssign(occurrenceCount, unset);
+    std::vector<std::vector<std::pair<size_t, size_t>>> solutions;
+
+    // Enumerate all bounded assignments of B-token intervals to argument
+    // occurrences while requiring fixed body spans to match literally. The cap
+    // keeps this a small proof search rather than an unbounded parser.
+    std::function<void(size_t, size_t)> dfs = [&](size_t elemIdx,
+                                                  size_t bPos) {
+      if (solutions.size() > 16)
+        return;
+      if (elemIdx == elems.size()) {
+        if (bPos == bEnv->second)
+          solutions.push_back(curAssign);
+        return;
+      }
+
+      const TemplateElem &elem = elems[elemIdx];
+      if (!elem.isArg) {
+        const size_t len = static_cast<size_t>(elem.aEnd - elem.aBegin);
+        if (bodyMatchesAt(elem, bPos))
+          dfs(elemIdx + 1, bPos + len);
+        return;
+      }
+
+      for (size_t end = bPos + 1; end <= bEnv->second; ++end) {
+        curAssign[elem.occurrenceOrdinal] = {bPos, end};
+        dfs(elemIdx + 1, end);
+        curAssign[elem.occurrenceOrdinal] = unset;
+        if (solutions.size() > 16)
+          return;
+      }
+    };
+
+    dfs(0, bEnv->first);
+    if (solutions.empty() || solutions.size() > 16)
+      return std::nullopt;
+
+    auto findDirectTupleRefsForArg =
+        [&](uint32_t callerArgIdx,
+            SmallVectorImpl<RefoldModel::TupleArgRef> &outRefs) -> bool {
+      outRefs.clear();
+      StringRef parentTrim =
+          baseInvText.substr(invArgRanges[callerArgIdx].first,
+                             invArgRanges[callerArgIdx].second -
+                                 invArgRanges[callerArgIdx].first)
+              .trim();
+      bool matched = false;
+      SmallVector<RefoldModel::TupleArgRef, 8> matchedRefs;
+
+      for (const auto &cand : model_.GetMacroInvocations()) {
+        if (!cand.callerMacroId || *cand.callerMacroId != m.id)
+          continue;
+        if (!cand.normalizedInvText || cand.normalizedInvArgTextRanges.empty() ||
+            cand.argTupleRefs.empty() ||
+            cand.normalizedInvArgTextRanges.size() != cand.argTupleRefs.size())
+          continue;
+
+        SmallVector<RefoldModel::TupleArgRef, 8> localRefs;
+        bool any = false;
+        for (uint32_t childArgIdx = 0; childArgIdx < cand.argTupleRefs.size();
+             ++childArgIdx) {
+          const auto &refs = cand.argTupleRefs[childArgIdx];
+          if (refs.size() != 1)
+            continue;
+          const auto &ref = refs.front();
+          if (ref.callerParamIndex != callerArgIdx)
+            continue;
+          if (ref.callerByteEnd < ref.callerByteBegin ||
+              ref.callerByteEnd > parentTrim.size())
+            return false;
+          const auto &rng = cand.normalizedInvArgTextRanges[childArgIdx];
+          if (!rng.first || !rng.second || *rng.second < *rng.first ||
+              *rng.second > cand.normalizedInvText->size())
+            return false;
+          StringRef childText = StringRef(*cand.normalizedInvText)
+                                    .slice((size_t)*rng.first,
+                                           (size_t)*rng.second)
+                                    .trim();
+          StringRef parentSlice =
+              parentTrim.slice(ref.callerByteBegin, ref.callerByteEnd).trim();
+          if (childText != parentSlice)
+            return false;
+          localRefs.push_back(ref);
+          any = true;
+        }
+        if (!any)
+          continue;
+        if (matched)
+          return false;
+        matched = true;
+        matchedRefs = std::move(localRefs);
+      }
+
+      if (!matched)
+        return false;
+      llvm::sort(matchedRefs, [](const RefoldModel::TupleArgRef &a,
+                                 const RefoldModel::TupleArgRef &b) {
+        return a.callerByteBegin < b.callerByteBegin;
+      });
+      outRefs.append(matchedRefs.begin(), matchedRefs.end());
+      return true;
+    };
+
+    auto buildCandidateInvocation =
+        [&](ArrayRef<std::pair<size_t, size_t>> sol,
+            std::string &outInv) -> bool {
+      // Convert one solved expansion template back into call-site argument text.
+      // Whole-argument occurrences must agree exactly; tuple/variadic cases may
+      // rewrite individual top-level elements only when metadata identifies the
+      // corresponding caller slices.
+      DenseMap<uint32_t, SmallVector<size_t, 8>> occByArg;
+      for (const auto &elem : elems) {
+        if (elem.isArg)
+          occByArg[elem.argIdx].push_back(elem.occurrenceOrdinal);
+      }
+
+      DenseMap<uint32_t, std::string> replByArg;
+      bool changed = false;
+      for (const auto &entry : occByArg) {
+        const uint32_t argIdx = entry.first;
+        auto argRange = invArgRanges[argIdx];
+        StringRef baseArgText =
+            baseInvText.substr(argRange.first, argRange.second - argRange.first);
+        StringRef baseTrim = baseArgText.trim();
+
+        SmallVector<std::string, 8> oldOccs;
+        SmallVector<std::string, 8> newOccs;
+        for (size_t occOrdinal : entry.second) {
+          const TemplateElem *occElem = nullptr;
+          for (const auto &elem : elems) {
+            if (elem.isArg && elem.occurrenceOrdinal == occOrdinal) {
+              occElem = &elem;
+              break;
+            }
+          }
+          if (!occElem)
+            return false;
+          oldOccs.push_back(SliceASource(occElem->aBegin, occElem->aEnd)
+                                .trim()
+                                .str());
+          const auto &range = sol[occOrdinal];
+          newOccs.push_back(SliceBSource(range.first, range.second)
+                                .trim()
+                                .str());
+          if (newOccs.back().empty())
+            return false;
+        }
+
+        bool allOldAreWholeArg = true;
+        bool allNewSame = !newOccs.empty();
+        for (size_t i = 0; i < oldOccs.size(); ++i) {
+          if (StringRef(oldOccs[i]).trim() != baseTrim)
+            allOldAreWholeArg = false;
+          if (StringRef(newOccs[i]).trim() != StringRef(newOccs[0]).trim())
+            allNewSame = false;
+        }
+
+        std::string replacement;
+        if (allOldAreWholeArg && allNewSame) {
+          replacement = StringRef(newOccs[0]).trim().str();
+        } else if (isVariadicFormal(argIdx)) {
+          SmallVector<TupleElementSlice, 8> tupleElems;
+          if (!splitTopLevelTupleElementsWithLexer(baseTrim, lexLang_,
+                                                   tupleElems))
+            return false;
+          if (tupleElems.size() != oldOccs.size())
+            return false;
+
+          replacement = baseTrim.str();
+          for (size_t i = tupleElems.size(); i > 0; --i) {
+            const size_t idx = i - 1;
+            const auto &elem = tupleElems[idx];
+            StringRef oldElem =
+                baseTrim.slice(elem.trimBegin, elem.trimEnd).trim();
+            if (oldElem != StringRef(oldOccs[idx]).trim())
+              return false;
+            replacement = stringutils::replaceRange(
+                replacement, elem.trimBegin, elem.trimEnd, newOccs[idx]);
+          }
+        } else {
+          SmallVector<RefoldModel::TupleArgRef, 8> tupleRefs;
+          if (!findDirectTupleRefsForArg(argIdx, tupleRefs))
+            return false;
+          if (tupleRefs.size() != oldOccs.size())
+            return false;
+
+          replacement = baseTrim.str();
+          for (size_t i = tupleRefs.size(); i > 0; --i) {
+            const size_t idx = i - 1;
+            const auto &ref = tupleRefs[idx];
+            StringRef oldElem =
+                baseTrim.slice(ref.callerByteBegin, ref.callerByteEnd).trim();
+            if (oldElem != StringRef(oldOccs[idx]).trim())
+              return false;
+            replacement = stringutils::replaceRange(
+                replacement, ref.callerByteBegin, ref.callerByteEnd,
+                newOccs[idx]);
+          }
+        }
+
+        replacement = StringRef(replacement).trim().str();
+        if (replacement.empty())
+          return false;
+        if (!isVariadicFormal(argIdx) && hasTopLevelComma(replacement))
+          return false;
+        if (StringRef(replacement).trim() != baseTrim)
+          changed = true;
+        replByArg[argIdx] = std::move(replacement);
+      }
+
+      if (!changed || replByArg.empty())
+        return false;
+
+      outInv = baseInvText.str();
+      auto keys = llvm::to_vector(
+          llvm::map_range(replByArg, [](const auto &e) { return e.first; }));
+      std::sort(keys.begin(), keys.end(), [&](uint32_t a, uint32_t b) {
+        return invArgRanges[a].first > invArgRanges[b].first;
+      });
+      for (uint32_t argIdx : keys) {
+        auto r = invArgRanges[argIdx];
+        outInv = stringutils::replaceRange(outInv, r.first, r.second,
+                                           replByArg[argIdx]);
+      }
+      return true;
+    };
+
+    // Multiple token-template assignments are acceptable only when they all
+    // reconstruct the same invocation spelling. Otherwise the expansion surface
+    // is underdetermined and this proof path fails closed.
+    std::optional<std::string> uniqueInv;
+    for (const auto &sol : solutions) {
+      std::string candidate;
+      if (!buildCandidateInvocation(sol, candidate))
+        continue;
+      if (!uniqueInv) {
+        uniqueInv = std::move(candidate);
+        continue;
+      }
+      if (*uniqueInv != candidate)
+        return std::nullopt;
+    }
+
+    if (!uniqueInv)
+      return std::nullopt;
+
+    trace("macro/template",
+          "template solver SUCCESS root id={0} name={1} coverA=[{2},{3}) "
+          "coverB=[{4},{5}) newInv='{6}'",
+          m.id, m.name, cover->first, cover->second, bEnv->first, bEnv->second,
+          stringutils::showWSWithClip(*uniqueInv, 240));
+
+    MacroPatch patch{*m.invB, *m.invE, std::move(*uniqueInv), m.id};
+    StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyStandard,
+                         /*validated=*/true,
+                         /*structurePreserving=*/true, m.id);
+    return patch;
+  };
+
+  if (auto templatePatch = tryTemplateSolvedArgsOnlyPatch())
+    return templatePatch;
+
   // Fast path for token-paste edits. A single pasted token can embed multiple
   // argument contributions (e.g., X##_##Y##_##Z), so a single edit hunk may
   // change multiple arg segments inside that token (e.g., a_b_c -> d_e_f). In
@@ -7051,27 +7717,58 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     touched[sp.argIdx] = 1;
   }
 
+  auto hunkTouchesFormalOccurrence =
+      [&](const diffutils::Hunk &cand,
+          const RefoldModel::PPArgSpan &sp) -> bool {
+    // For replacements/deletions, touching is ordinary A-range overlap. For
+    // pure insertions, the hunk has no A width, so require the existing
+    // argument-span ownership helper to prove that the B insertion belongs to
+    // this occurrence.
+    if (cand.aStart == cand.aEnd) {
+      auto bEnv = MapAToBTokenEnvelopeByPPArgSpan(sp);
+      if (!bEnv)
+        return false;
+      return GetOwnedPureInsertionBRangeForArgSpan(sp, occs, *bEnv, cand)
+          .has_value();
+    }
+
+    return cand.aStart < sp.end && cand.aEnd > sp.begin;
+  };
+
+  // A provenance-only LCS can split one logical macro-argument rewrite into
+  // several pure-insertion islands around repeated punctuation.  When the
+  // current seed is a pure insertion, widen the set of touched formals to every
+  // occurrence in this same invocation cover that is independently touched by
+  // another token hunk.  This does not move hunk boundaries and does not inspect
+  // neighboring token spellings; it only lets the existing replay validator see
+  // the complete split edit before deciding whether an args-only rewrite is
+  // actually proven.
+  if (hArgs.aStart == hArgs.aEnd && hArgs.bStart < hArgs.bEnd) {
+    for (const diffutils::Hunk &cand : abTokHunks_) {
+      if (cand.aStart < m.cover.begin || cand.aEnd > m.cover.end)
+        continue;
+      if (cand.bStart >= cand.bEnd)
+        continue;
+
+      for (const auto &sp : occs) {
+        if (sp.argIdx >= touched.size())
+          return std::nullopt;
+        if (hunkTouchesFormalOccurrence(cand, sp))
+          touched[sp.argIdx] = 1;
+      }
+    }
+  }
+
   trace("macro/args", "  touchedOcc={0}",
         stringutils::boolArrayToString(touchedOcc));
   trace("macro/args", "  touched={0}", stringutils::boolArrayToString(touched));
 
   auto hunkTouchesTouchedFormal =
       [&](const diffutils::Hunk &cand) -> bool {
-    for (size_t occIdx = 0; occIdx < occs.size(); ++occIdx) {
-      const auto &sp = occs[occIdx];
+    for (const auto &sp : occs) {
       if (sp.argIdx >= touched.size() || !touched[sp.argIdx])
         continue;
-
-      if (cand.aStart == cand.aEnd) {
-        auto bEnv = MapAToBTokenEnvelopeByPPArgSpan(sp);
-        if (!bEnv)
-          continue;
-        if (GetOwnedPureInsertionBRangeForArgSpan(sp, occs, *bEnv, cand))
-          return true;
-        continue;
-      }
-
-      if (cand.aStart < sp.end && cand.aEnd > sp.begin)
+      if (hunkTouchesFormalOccurrence(cand, sp))
         return true;
     }
     return false;
@@ -7958,6 +8655,25 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       return std::nullopt;
     }
 
+    if (isVariadicFormal(argIdx)) {
+      StringRef trimmedFinal(finalNewArg);
+      trimmedFinal = trimmedFinal.trim();
+
+      // The replay check above validates the edited expansion surface.  For the
+      // invocation spelling, however, a variadic formal does not own the fixed
+      // separator before it.  If deletion of the first tuple element left that
+      // separator at the front of the reconstructed replacement, remove exactly
+      // one leading comma so the callsite spells the shortened tuple rather than
+      // an empty first variadic argument.
+      if (!trimmedFinal.empty() && trimmedFinal.front() == ',') {
+        trimmedFinal = trimmedFinal.drop_front();
+        while (!trimmedFinal.empty() &&
+               (trimmedFinal.front() == ' ' || trimmedFinal.front() == '\t'))
+          trimmedFinal = trimmedFinal.drop_front();
+        finalNewArg = trimmedFinal.str();
+      }
+    }
+
     trace("macro/args", "    consistency OK for argIdx={0}", argIdx);
     replByArgIdx[argIdx] = std::move(finalNewArg);
   }
@@ -8126,8 +8842,14 @@ RefoldEngine::ComputeWholeCoverPlan(
       plan.bTokEnd > 0 && (plan.bTokEnd - 1) < bToks_.size()) {
     StringRef want = aToks_[static_cast<size_t>(plan.covHiA - 1)].spelling;
     if (!want.empty()) {
-      if (bToks_[plan.bTokEnd - 1].spelling != want && plan.bTokEnd >= 2 &&
-          bToks_[plan.bTokEnd - 2].spelling == want) {
+      // Do not contract a whole-cover replacement across a trailing B comment.
+      // Comments are source trivia, not macro-body delimiter tokens; clipping one
+      // out here splits an otherwise line-local insertion and forces a spurious
+      // #line resynchronization before the comment text.
+      const bool rightIsComment =
+          bToks_[plan.bTokEnd - 1].kind == "comment";
+      if (!rightIsComment && bToks_[plan.bTokEnd - 1].spelling != want &&
+          plan.bTokEnd >= 2 && bToks_[plan.bTokEnd - 2].spelling == want) {
         plan.bTokEnd--;
         plan.adjustedRight = true;
       }
