@@ -3,7 +3,7 @@ int some_prefix_func(char* c);
 #pragma once
 
 #ifdef XXX
-int first(short  x);
+int first(short x);
 #define FOO(X) (X + X)
 int last(int x);
 #else

@@ -379,6 +379,161 @@ RefoldEngine::BuildMacroOwnerExpansionClosureWitness() const {
   return witness;
 }
 
+
+bool RefoldEngine::MacroOwnerExpansionClosureWitnessIsDominated(
+    const ExpansionClosureWitness &witness, std::string &detail) const {
+  auto reject = [&](std::string why) -> bool {
+    detail = std::move(why);
+    return false;
+  };
+
+  // This audit is intentionally definitionally aligned with the fallback
+  // witness domain. Any other witness kind is not evidence about the legacy
+  // macro-owner expansion closure path, so it cannot prove dominance.
+  if (witness.kind != ExpansionClosureKind::MacroOwnerWholeExpansion ||
+      !witness.hasRootMacroId || witness.hasOwnerIncludeId) {
+    return reject(formatv("witness is outside macro-owner whole-expansion domain: {0}",
+                          FormatExpansionClosureWitness(witness))
+                      .str());
+  }
+
+  const RefoldModel::MacroInvocation *root =
+      FindMacroInvocationById(witness.rootMacroId);
+  if (!root) {
+    return reject(formatv("root macro id {0} is not present in the model",
+                          witness.rootMacroId)
+                      .str());
+  }
+
+  if (!root->invB || !root->invE || *root->invE <= *root->invB) {
+    return reject(formatv("root macro id {0} name='{1}' lacks a valid callsite source interval",
+                          root->id, root->name)
+                      .str());
+  }
+
+  // Recompute the same whole-cover plan used by normal macro candidate
+  // construction. A dominated fallback witness must be reproducible from the
+  // ordinary selector path without relying on post-terminal state.
+  auto plan = ComputeWholeCoverPlan(*root);
+  if (!plan) {
+    return reject(formatv("root macro id {0} name='{1}' no longer has a normal whole-cover plan",
+                          root->id, root->name)
+                      .str());
+  }
+
+  const bool planMatchesWitness =
+      plan->covLoA == witness.coverATokBegin &&
+      plan->covHiA == witness.coverATokEnd &&
+      plan->bTokStart == witness.bTokBegin &&
+      plan->bTokEnd == witness.bTokEnd &&
+      plan->selfContained == witness.selfContained &&
+      plan->claimsClipped == witness.claimsClipped;
+  if (!planMatchesWitness) {
+    return reject(formatv("normal whole-cover plan for root macro id {0} name='{1}' does not match fallback witness: plan coverA=[{2},{3}) B=[{4},{5}) selfContained={6} claimsClipped={7}; witness={8}",
+                          root->id, root->name, plan->covLoA, plan->covHiA,
+                          plan->bTokStart, plan->bTokEnd,
+                          plan->selfContained ? 1 : 0,
+                          plan->claimsClipped ? 1 : 0,
+                          FormatExpansionClosureWitness(witness))
+                      .str());
+  }
+
+  // Restamp the recomputed plan exactly as BuildMacroInvocationPatchWholeCover()
+  // does for its normal WholeCoverRealization candidate, then require that the
+  // normalized proof carrier discharges. This proves the witness is not merely a
+  // raw replacement string; it is visible through the first-class macro
+  // realization proof class.
+  MacroPatch patch{*root->invB, *root->invE, plan->clippedText, root->id};
+  StampMacroWholeCoverRealizationPatch(patch, *plan, root->id);
+  const AcceptedResultCandidate candidate = BuildAcceptedMacroCandidate(patch);
+  const ProofSummary &summary = candidate.proofSummary;
+  if (candidate.kind != AcceptedResultCandidateKind::MacroPatch ||
+      summary.inventory.currentPath !=
+          AcceptedPathKind::MacroWholeCoverRealization ||
+      summary.discharge.status != ProofDischargeStatus::Discharged) {
+    return reject(formatv("normal whole-cover candidate for root macro id {0} name='{1}' did not discharge as MacroWholeCoverRealization: {2}",
+                          root->id, root->name,
+                          FormatAcceptedResultCandidate(candidate))
+                      .str());
+  }
+
+  auto hunkIsClosedByPlan = [&](const diffutils::Hunk &h) -> bool {
+    const bool aClosed = h.isInsertOnly()
+                             ? (plan->covLoA < h.aStart && h.aStart < plan->covHiA)
+                             : (plan->covLoA <= h.aStart && h.aEnd <= plan->covHiA);
+    if (!aClosed)
+      return false;
+    if (h.bStart < h.bEnd &&
+        (h.bStart < plan->bTokStart || h.bEnd > plan->bTokEnd))
+      return false;
+    return true;
+  };
+
+  auto reachesRootThroughNormalClimb =
+      [&](const RefoldModel::MacroInvocation *selected) -> bool {
+    DenseSet<uint64_t> visited;
+    for (const RefoldModel::MacroInvocation *cur = selected; cur;) {
+      if (!visited.insert(cur->id).second)
+        return false;
+      if (cur->id == root->id)
+        return true;
+      if (!cur->callerMacroId)
+        return false;
+      cur = FindMacroInvocationById(*cur->callerMacroId);
+    }
+    return false;
+  };
+
+  const StringRef tuPath = model_.GetSourcePath();
+  if (tuPath.empty())
+    return reject("empty TU source path while auditing macro-owner fallback dominance");
+
+  unsigned closedHunks = 0;
+  for (const diffutils::Hunk &h : abTokHunks_) {
+    if (!hunkIsClosedByPlan(h)) {
+      return reject(formatv("root macro id {0} name='{1}' normal plan does not close hunk A=[{2},{3}) B=[{4},{5}) coverA=[{6},{7}) coverB=[{8},{9})",
+                            root->id, root->name, h.aStart, h.aEnd, h.bStart,
+                            h.bEnd, plan->covLoA, plan->covHiA,
+                            plan->bTokStart, plan->bTokEnd)
+                        .str());
+    }
+
+    // Mirror the ordinary hunk-classification selector exactly: classify the
+    // hunk's current owner, ask for the smallest patchable covering macro, then
+    // allow the existing normal path's caller-chain climb to reach the root.
+    Owner owner = ClassifyOwnerWithSegments(tuPath, h);
+    const RefoldModel::MacroInvocation *selected =
+        SmallestCoveringPatchableMacro(h.aStart, h.aEnd, owner.includeId);
+    if (!selected) {
+      return reject(formatv("normal selector found no covering macro for hunk A=[{0},{1}) B=[{2},{3}) ownerKind={4} ownerInclude={5}",
+                            h.aStart, h.aEnd, h.bStart, h.bEnd, owner.kind,
+                            owner.includeId.value_or(0))
+                        .str());
+    }
+
+    if (!selected->invB || !selected->invE) {
+      return reject(formatv("normal selector chose macro id {0} name='{1}' for hunk A=[{2},{3}) but it lacks callsite provenance",
+                            selected->id, selected->name, h.aStart, h.aEnd)
+                        .str());
+    }
+
+    if (!reachesRootThroughNormalClimb(selected)) {
+      return reject(formatv("normal selector chose macro id {0} name='{1}' for hunk A=[{2},{3}), but its caller chain does not reach fallback root id {4} name='{5}'",
+                            selected->id, selected->name, h.aStart, h.aEnd,
+                            root->id, root->name)
+                        .str());
+    }
+    ++closedHunks;
+  }
+
+  detail = formatv("dominated by normal MacroWholeCoverRealization root id={0} name='{1}' source=[{2},{3}) coverA=[{4},{5}) B=[{6},{7}) hunks={8}",
+                   root->id, root->name, *root->invB, *root->invE,
+                   plan->covLoA, plan->covHiA, plan->bTokStart,
+                   plan->bTokEnd, closedHunks)
+               .str();
+  return true;
+}
+
 std::optional<RefoldEngine::TextEdit>
 RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     const diffutils::Hunk &h, StringRef tuPath, StringRef tuBytes,
@@ -864,9 +1019,10 @@ std::optional<std::string> RefoldEngine::TryExpansionClosureFallback() {
   if (!terminalFallbackRequested_)
     return std::nullopt;
 
-  // This intermediate stage remains proof-driven: build a declared witness
-  // first, then synthesize source only if the witness survives the narrower
-  // Step 3 replay-stability checks.
+  // This legacy safety net remains proof-driven, but it must no longer be an
+  // independent completeness mechanism. Build a declared witness, audit that the
+  // same root would have been visible through the normal macro whole-cover
+  // candidate path, then synthesize source only if replay-stability also holds.
   if (auto witness = BuildMacroOwnerExpansionClosureWitness()) {
     // Step 6 keeps the new intermediate fallback class visible in the theorem
     // audit without restamping it as a theorem-facing carrier. These counters
@@ -875,6 +1031,22 @@ std::optional<std::string> RefoldEngine::TryExpansionClosureFallback() {
     ++lastTheoremAudit_.expansionFallbackWitnesses;
     debug("fallback", "expansion-closure witness discovered: {0}",
           FormatExpansionClosureWitness(*witness));
+
+    std::string dominanceDetail;
+    if (MacroOwnerExpansionClosureWitnessIsDominated(*witness,
+                                                     dominanceDetail)) {
+      debug("fallback/audit",
+            "post-terminal macro expansion closure is dominated: {0}",
+            dominanceDetail);
+    } else {
+      const std::string diagnostic =
+          formatv("post-terminal macro expansion closure witness was not visible through the normal MacroWholeCoverRealization candidate path: witness={0}; reason={1}",
+                  FormatExpansionClosureWitness(*witness), dominanceDetail)
+              .str();
+      if (strict_)
+        fatal("fallback/audit", "{0}", diagnostic);
+      warn("fallback/audit", "{0}", diagnostic);
+    }
 
     if (auto source = SynthesizeMacroOwnerExpansionClosureSource(*witness)) {
       ++lastTheoremAudit_.expansionFallbackSynthesisSuccesses;
@@ -907,9 +1079,9 @@ std::string RefoldEngine::ResolvePostStructuralFallback() {
   if (!terminalFallbackRequested_)
     return std::string();
 
-  // Step 4 makes the intermediate expansion-fallback stage authoritative. Once
-  // structural emission has failed closed, the engine must try the proved
-  // expansion closure before it records or emits the raw-B terminal carrier.
+  // Once structural emission has failed closed, retain the old expansion-closure
+  // safety net before raw-B terminal fallback, but require any discovered witness
+  // to pass the dominance audit in TryExpansionClosureFallback().
   if (auto expanded = TryExpansionClosureFallback()) {
     // Count the one case where the proved intermediate expansion stage
     // successfully intercepts a raw-B terminal fallback. This remains coverage

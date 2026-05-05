@@ -1370,6 +1370,12 @@ std::string RefoldEngine::RunSinglePassRefold() {
       bool operator!=(const HunkRealizer &other) const {
         return !(*this == other);
       }
+
+      bool operator<(const HunkRealizer &other) const {
+        if (kind != other.kind)
+          return static_cast<unsigned>(kind) < static_cast<unsigned>(other.kind);
+        return id < other.id;
+      }
     };
 
     auto realizerToString = [](const HunkRealizer &r) -> std::string {
@@ -1416,10 +1422,27 @@ std::string RefoldEngine::RunSinglePassRefold() {
       HunkRealizer realizer;
     };
 
+    struct PartitionStateKey {
+      uint64_t bPos = 0;
+      HunkRealizer firstRealizer;
+      HunkRealizer lastRealizer;
+      bool mixed = false;
+
+      bool operator<(const PartitionStateKey &other) const {
+        if (bPos != other.bPos)
+          return bPos < other.bPos;
+        if (firstRealizer != other.firstRealizer)
+          return firstRealizer < other.firstRealizer;
+        if (lastRealizer != other.lastRealizer)
+          return lastRealizer < other.lastRealizer;
+        return mixed < other.mixed;
+      }
+    };
+
     struct PartitionParent {
       bool valid = false;
       size_t edgeIndex = 0;
-      uint64_t prevB = 0;
+      PartitionStateKey prev;
       unsigned cost = 0;
     };
 
@@ -1478,10 +1501,14 @@ std::string RefoldEngine::RunSinglePassRefold() {
         }
       }
 
-      std::vector<std::map<uint64_t, PartitionParent>> dp(
+      std::vector<std::map<PartitionStateKey, PartitionParent>> dp(
           static_cast<size_t>(aLen) + 1);
-      dp[0][h.bStart] = PartitionParent{/*valid=*/true, /*edgeIndex=*/0,
-                                        /*prevB=*/h.bStart, /*cost=*/0};
+      const PartitionStateKey startKey{/*bPos=*/h.bStart,
+                                       /*firstRealizer=*/{},
+                                       /*lastRealizer=*/{},
+                                       /*mixed=*/false};
+      dp[0][startKey] = PartitionParent{/*valid=*/true, /*edgeIndex=*/0,
+                                        /*prev=*/{}, /*cost=*/0};
 
       for (uint64_t aOff = 0; aOff < aLen; ++aOff) {
         auto &states = dp[static_cast<size_t>(aOff)];
@@ -1489,35 +1516,67 @@ std::string RefoldEngine::RunSinglePassRefold() {
           continue;
 
         for (const auto &state : states) {
-          const uint64_t curB = state.first;
+          const PartitionStateKey &key = state.first;
           const unsigned curCost = state.second.cost;
 
           for (size_t edgeIndex : edgesByAOffset[static_cast<size_t>(aOff)]) {
             const PartitionEdge &edge = edges[edgeIndex];
-            if (edge.bStart != curB)
+            if (edge.bStart != key.bPos)
               continue;
+
+            PartitionStateKey nextKey;
+            nextKey.bPos = edge.bEnd;
+            nextKey.lastRealizer = edge.realizer;
+
+            if (key.firstRealizer.kind == HunkRealizerKind::Unknown) {
+              nextKey.firstRealizer = edge.realizer;
+              nextKey.mixed = false;
+            } else {
+              // Do not allow adjacent segments with the same realizer. Such
+              // fragments should have been represented by one wider edge, and
+              // permitting them can manufacture artificial partitions.
+              if (key.lastRealizer == edge.realizer)
+                continue;
+              nextKey.firstRealizer = key.firstRealizer;
+              nextKey.mixed = key.mixed || edge.realizer != key.firstRealizer;
+            }
 
             auto &dst = dp[static_cast<size_t>(edge.aEnd - h.aStart)];
             const unsigned nextCost = curCost + 1;
-            auto existing = dst.find(edge.bEnd);
+            auto existing = dst.find(nextKey);
             if (existing == dst.end() || nextCost < existing->second.cost) {
-              dst[edge.bEnd] = PartitionParent{/*valid=*/true, edgeIndex,
-                                               /*prevB=*/curB, nextCost};
+              dst[nextKey] = PartitionParent{/*valid=*/true, edgeIndex,
+                                             /*prev=*/key, nextCost};
             }
           }
         }
       }
 
-      auto finalIt = dp[static_cast<size_t>(aLen)].find(h.bEnd);
-      if (finalIt == dp[static_cast<size_t>(aLen)].end())
+      const auto &finalStates = dp[static_cast<size_t>(aLen)];
+      auto bestFinal = finalStates.end();
+      for (auto it = finalStates.begin(); it != finalStates.end(); ++it) {
+        const PartitionStateKey &key = it->first;
+        if (key.bPos != h.bEnd || !key.mixed)
+          continue;
+        if (bestFinal == finalStates.end() ||
+            it->second.cost < bestFinal->second.cost) {
+          bestFinal = it;
+        }
+      }
+      if (bestFinal == finalStates.end())
         return std::nullopt;
 
+      // Reconstruct the lowest-cost mixed-realizer path. The DP tracks mixedness
+      // as part of the state, rather than choosing the cheapest path first and
+      // checking mixedness afterwards. This prevents a coarse TU edge from
+      // swallowing a smaller macro/include segment and suppressing a valid
+      // structure-preserving split.
       SmallVector<PartitionEdge, 8> path;
       uint64_t aPos = h.aEnd;
-      uint64_t bPos = h.bEnd;
+      PartitionStateKey stateKey = bestFinal->first;
       while (aPos != h.aStart) {
         const uint64_t aOff = aPos - h.aStart;
-        const auto stateIt = dp[static_cast<size_t>(aOff)].find(bPos);
+        const auto stateIt = dp[static_cast<size_t>(aOff)].find(stateKey);
         if (stateIt == dp[static_cast<size_t>(aOff)].end() ||
             !stateIt->second.valid)
           return std::nullopt;
@@ -1525,29 +1584,12 @@ std::string RefoldEngine::RunSinglePassRefold() {
         const PartitionEdge &edge = edges[stateIt->second.edgeIndex];
         path.push_back(edge);
         aPos = edge.aStart;
-        bPos = stateIt->second.prevB;
+        stateKey = stateIt->second.prev;
       }
       std::reverse(path.begin(), path.end());
 
       if (path.size() < 2)
         return std::nullopt;
-
-      bool hasMixedRealizers = false;
-      for (size_t i = 1; i < path.size(); ++i) {
-        if (path[i].realizer != path[0].realizer) {
-          hasMixedRealizers = true;
-          break;
-        }
-      }
-      if (!hasMixedRealizers)
-        return std::nullopt;
-
-      // Adjacent equal realizers should have been represented by one wider
-      // edge. Reject rather than emitting needlessly fragmented hunks.
-      for (size_t i = 1; i < path.size(); ++i) {
-        if (path[i - 1].realizer == path[i].realizer)
-          return std::nullopt;
-      }
 
       return path;
     };
