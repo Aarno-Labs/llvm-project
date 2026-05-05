@@ -32,33 +32,36 @@ bool RefoldEngine::InvocationSpanMatchesCallsitePrefix(
   const size_t n = invSpanText.size();
   size_t i = 0;
 
-  // Skip leading whitespace.
+  // Match against the spelled callsite prefix, ignoring only leading trivia
+  // before the macro name.
   while (i < n && stringutils::isWs(invSpanText[i]))
     i++;
 
   if (i >= n)
     return false;
 
-  // Verify identifier start.
+  // The callsite must begin with an identifier spelling. This intentionally
+  // avoids substring matching inside larger expressions or tokens.
   const char c0 = invSpanText[i];
   if (!stringutils::isIdentStart(c0))
     return false;
 
-  // Find end of identifier.
   size_t j = i + 1;
   while (j < n && stringutils::isIdentPart(invSpanText[j]))
     j++;
 
-  // Check if the identifier matches the macro name.
+  // The leading identifier must be exactly the invocation's macro name.
   StringRef ident = invSpanText.slice(i, j);
   if (ident != m.name)
     return false;
 
-  // Object-like macro: identifier match at span start is sufficient.
+  // Object-like macros have no required argument-list syntax, so the leading
+  // identifier match is enough to identify the callsite prefix.
   if (m.subkind != "func")
     return true;
 
-  // Function-like macro: must be followed by '(' (allowing whitespace).
+  // Function-like macros must be followed by an opening parenthesis, with
+  // ordinary whitespace allowed between the macro name and '('.
   while (j < n && stringutils::isWs(invSpanText[j]))
     j++;
 
@@ -70,6 +73,9 @@ uint64_t RefoldEngine::GetRootMacroId(uint64_t macroId) const {
   if (!cur)
     return macroId;
 
+  // Walk callerMacroId links to the outermost invocation in this
+  // macro-expansion chain. If the model has a missing parent link, return the
+  // highest resolved invocation rather than inventing a root.
   while (cur->callerMacroId) {
     const RefoldModel::MacroInvocation *parent =
         FindMacroInvocationById(*cur->callerMacroId);
@@ -83,12 +89,11 @@ uint64_t RefoldEngine::GetRootMacroId(uint64_t macroId) const {
 std::optional<std::string> RefoldEngine::BuildInlineIncludeRealizationFromB(
     const RefoldModel::IncludeItem &inc, StringRef reason,
     AcceptedResultCandidate *acceptedCandidate) const {
-  // Step 4A makes the include-realization boundary explicit. Inline
-  // realization is in-domain only when the include cover yields either the
-  // canonical A-cover -> B-envelope mapping or one deterministic
-  // consensus-rescued B envelope. If neither witness exists, the engine stays
-  // in the explicit out-of-domain terminal state instead of manufacturing a
-  // weaker include-realization proof.
+  // Inline include realization is theorem-facing only when the include's
+  // A-cover can be projected to a concrete B-token envelope by an accepted
+  // witness: either the canonical A-cover mapping or a deterministic
+  // consensus-rescued envelope. If no such envelope exists, do not synthesize a
+  // weaker realization; request the explicit terminal fallback instead.
   IncludeRealizationEvidenceKind evidenceKind =
       IncludeRealizationEvidenceKind::Unknown;
   auto bEnvOpt = ResolveIncludeRealizationBTokenEnvelope(
@@ -105,6 +110,9 @@ std::optional<std::string> RefoldEngine::BuildInlineIncludeRealizationFromB(
     return std::nullopt;
   }
 
+  // Record the precise realization witness that will justify slicing B for this
+  // include: which include was realized, which A cover was replaced, and which
+  // B-token envelope supplied the materialized text.
   IncludeRealizationWitness realizationWitness;
   realizationWitness.evidence = evidenceKind;
   realizationWitness.hasIncludeId = true;
@@ -116,6 +124,9 @@ std::optional<std::string> RefoldEngine::BuildInlineIncludeRealizationFromB(
   realizationWitness.bTokBegin = bEnvOpt->first;
   realizationWitness.bTokEnd = bEnvOpt->second;
 
+  // Build the normalized accepted-result carrier before returning the sliced
+  // text, so callers that emit this realization can attach the same witness and
+  // proof-discharge metadata to the final edit.
   AcceptedResultCandidate realizationCandidate =
       BuildAcceptedIncludeRealizationCandidate(
           AcceptedPathKind::IncludeRealizationInlineFromB, inc,
@@ -126,6 +137,7 @@ std::optional<std::string> RefoldEngine::BuildInlineIncludeRealizationFromB(
         FormatAcceptedResultCandidate(realizationCandidate));
   if (acceptedCandidate)
     *acceptedCandidate = realizationCandidate;
+
   return SliceBSource(bEnvOpt->first, bEnvOpt->second).str();
 }
 
@@ -141,7 +153,9 @@ void RefoldEngine::MaterializeIncludeExpansion(
     DenseMap<uint64_t, AcceptedResultCandidate>
         &includeExpansionAcceptedResults,
     DenseSet<uint64_t> *appliedExpandedMacroRootIds) const {
-  // Already materialized?
+  // Include materialization is memoized by include id. A parent may reach the
+  // same child through recursive expansion, so avoid rebuilding already
+  // materialized text.
   if (includeExpansion.count(includeId)) {
     debug("include/mat", "SKIP inc#{0} (already materialized)", includeId);
     return;
@@ -159,8 +173,9 @@ void RefoldEngine::MaterializeIncludeExpansion(
 
   const std::string headerPath = resolveHeaderPath(*inc);
 
-  // Start from the raw header text that was preloaded into includeExpansion.
-  // If it wasn’t preseeded for some reason, load deterministically by path.
+  // Start from the header's original source bytes. Some callers preseed
+  // `includeExpansion` with raw header text; otherwise load it
+  // deterministically from the resolved header path.
   std::string bytes;
   if (auto it = includeExpansion.find(includeId); it != includeExpansion.end())
     bytes = it->second;
@@ -171,7 +186,6 @@ void RefoldEngine::MaterializeIncludeExpansion(
             bufOrErr.getError().message());
     }
 
-    // Treat as raw bytes; copy into std::string
     const MemoryBuffer &mb = **bufOrErr;
     bytes.assign(mb.getBufferStart(), mb.getBufferEnd());
   } else {
@@ -191,11 +205,14 @@ void RefoldEngine::MaterializeIncludeExpansion(
       (macroIt != macroPatchesByOwner.end()) ? macroIt->second.size() : 0,
       (childIt != children.end()) ? childIt->second.size() : 0);
 
-  // Collect byte-level edits to apply within this header.
+  // Accumulate all local edits in this header byte space, then apply them once
+  // at the end. This lets include edits, macro patches, and child include
+  // materializations participate in one overlap/resync pass.
   std::vector<TextEdit> edits;
 
-  // 1) Macro-patch edits owned by this include (invocation byte ranges already
-  // in the owner’s file space).
+  // 1) Macro patches owned by this include. Macro invocation ranges are already
+  // recorded in the owner file's byte space, so they can be converted directly
+  // into local header TextEdits.
   if (auto it = macroPatchesByOwner.find(includeId);
       it != macroPatchesByOwner.end()) {
     for (const auto &mp : it->second) {
@@ -206,11 +223,17 @@ void RefoldEngine::MaterializeIncludeExpansion(
               "inc#{0} extend chained callsite [{1},{2}) -> [{1},{3})", inc->id,
               mp.invStart, mp.invEnd, mpEnd);
       }
+
       debug("include/mat", "inc#{0} macroPatch inv=[{1},{2}) replLen={3}",
             inc->id, mp.invStart, mpEnd, mp.replacement.size());
+
+      // Apply local line-resync policy before staging the edit, and carry the
+      // accepted macro proof metadata to the emitted TextEdit.
       ResyncOutcome ro = ApplyResyncOrPend(bytes, mp.invStart, mpEnd,
                                            mp.replacement, headerPath);
-      TextEdit edit{mp.invStart, mpEnd, std::move(ro.text),
+      TextEdit edit{mp.invStart,
+                    mpEnd,
+                    std::move(ro.text),
                     std::move(ro.pending),
                     MacroPatchRemainsExpanded(mp)
                         ? std::make_optional(GetRootMacroId(mp.macroId))
@@ -221,11 +244,14 @@ void RefoldEngine::MaterializeIncludeExpansion(
     }
   }
 
-  // 2) A/B include insert/delete/replace patches that belong to this include.
+  // 2) Include-preserving edits owned by this include. If those edits cannot be
+  // discharged as local anchored edits, materialize the whole include directly
+  // from B using the include-realization proof path.
   if (auto it = perInclude.find(includeId); it != perInclude.end()) {
     if (!it->second.patches.empty()) {
       debug("include/mat", "inc#{0} adding {1} include patches as TextEdits",
             inc->id, it->second.patches.size());
+
       IncludeTextEditPlan plan = ComputeIncludeTextEdits(it->second, bytes);
       if (plan.requiresIncludeRealization) {
         AcceptedResultCandidate realizationCandidate;
@@ -239,11 +265,13 @@ void RefoldEngine::MaterializeIncludeExpansion(
         includeExpansion[includeId] = std::string();
         return;
       }
+
       for (auto &te : plan.edits) {
         ResyncOutcome ro =
             ApplyResyncOrPend(bytes, te.start, te.end, te.text, headerPath);
-        TextEdit edit{te.start, te.end, std::move(ro.text),
-                      std::move(ro.pending), std::nullopt, {}};
+        TextEdit edit{te.start,           te.end,
+                      std::move(ro.text), std::move(ro.pending),
+                      std::nullopt,       {}};
         edit.acceptedResults = std::move(te.acceptedResults);
         edits.push_back(std::move(edit));
       }
@@ -254,8 +282,10 @@ void RefoldEngine::MaterializeIncludeExpansion(
     debug("include/mat", "inc#{0} has no include patches", inc->id);
   }
 
+  // Return true if this include subtree contains any work that requires
+  // materialization: local include edits, local macro patches, or descendant
+  // includes with work. Clean child subtrees are left as spelled directives.
   auto hasDescendantWork = [&](auto &&self, uint64_t id) -> bool {
-    // Direct work at this node?
     bool selfWork = false;
     if (auto it = perInclude.find(id); it != perInclude.end())
       selfWork = !it->second.patches.empty();
@@ -270,7 +300,6 @@ void RefoldEngine::MaterializeIncludeExpansion(
       return true;
     }
 
-    // Otherwise, recurse into children
     if (auto it = children.find(id); it != children.end()) {
       for (const auto *child : it->second) {
         if (self(self, child->id)) {
@@ -285,8 +314,9 @@ void RefoldEngine::MaterializeIncludeExpansion(
     return false;
   };
 
-  // 3) Recurse into child includes that have any descendant work, and
-  // replace each child directive with the child’s fully materialized text.
+  // 3) Materialize child includes only when their subtree has work. For each
+  // dirty child, recursively build the child's fully materialized text and then
+  // replace the child's include directive in this header.
   if (auto it = children.find(includeId); it != children.end()) {
     for (const auto *child : it->second) {
       const bool todo = hasDescendantWork(hasDescendantWork, child->id);
@@ -296,16 +326,18 @@ void RefoldEngine::MaterializeIncludeExpansion(
             inc->id, child->id, child->target, child->resolvedPath,
             child->siteB, child->siteE, todo ? "YES" : "NO");
       if (!todo) {
-        continue; // leave untouched: keep the original directive as-is
+        // No descendant edits depend on this child, so preserve the original
+        // include directive instead of expanding it unnecessarily.
+        continue;
       }
 
-      // Ensure the child is materialized first (depth-first).
+      // Depth-first materialization ensures the child replacement is already
+      // complete before it is wrapped and inserted into the parent header.
       MaterializeIncludeExpansion(child->id, perInclude, macroPatchesByOwner,
                                   children, includeExpansion,
                                   includeExpansionAcceptedResults,
                                   appliedExpandedMacroRootIds);
 
-      // The child directive's site is recorded in the includer byte space.
       const auto &childText = includeExpansion[child->id];
       const size_t n = bytes.size();
       const uint64_t siteStart = std::clamp<uint64_t>(child->siteB, 0ULL, n);
@@ -324,12 +356,19 @@ void RefoldEngine::MaterializeIncludeExpansion(
             child->resolvedPath);
 
       if (siteStart < siteEnd) {
+        // Wrap the materialized child body with #line directives so diagnostics
+        // and line-sensitive builtins resume in the child and then return to
+        // the parent header after the include directive.
         std::string childHeaderPath = resolveHeaderPath(*child);
         std::string wrapped = lineDirs_.WrapIncludeExpansion(
             childHeaderPath, headerPath,
             stringutils::lineAtOffset(bytes, child->siteE), childText);
-        TextEdit edit{siteStart, siteEnd, std::move(wrapped), std::nullopt,
-                      std::nullopt, {}};
+        TextEdit edit{siteStart,    siteEnd,      std::move(wrapped),
+                      std::nullopt, std::nullopt, {}};
+
+        // Preserve the child's accepted-result carrier if the child was
+        // materialized through a specific realization path; otherwise record
+        // the generic materialized-expansion carrier for this child include.
         auto itAccepted = includeExpansionAcceptedResults.find(child->id);
         if (itAccepted != includeExpansionAcceptedResults.end()) {
           AttachAcceptedResultCarrier(edit, itAccepted->second);
@@ -369,12 +408,17 @@ void RefoldEngine::MaterializeIncludeExpansion(
 
   debug("include/mat", "inc#{0} applying {1} header TextEdits", inc->id,
         edits.size());
+
+  // Apply all staged edits in this header. If application requests terminal
+  // fallback, leave this include empty so callers do not consume a partial
+  // materialization.
   std::string applied = ApplyTextEditsWithPendingResync(
       bytes, edits, appliedExpandedMacroRootIds, headerPath);
   if (terminalFallbackRequested_) {
     includeExpansion[includeId] = std::string();
     return;
   }
+
   includeExpansion[includeId] = std::move(applied);
   includeExpansionAcceptedResults[includeId] =
       BuildAcceptedIncludeRealizationCandidate(
@@ -396,7 +440,8 @@ RefoldEngine::FindHeaderDeclForPatch(const RefoldModel::IncludeItem &inc,
   const RefoldModel::HeaderDecl *bestOverlap = nullptr;
 
   auto getSpanLen = [](const RefoldModel::HeaderDecl *d) -> uint64_t {
-    // Standardize: ensure we don't underflow if a span is somehow malformed.
+    // Treat malformed declaration spans as zero-length for tie-breaking rather
+    // than allowing unsigned underflow.
     if (d->span.end <= d->span.begin)
       return 0;
     return d->span.end - d->span.begin;
@@ -407,30 +452,28 @@ RefoldEngine::FindHeaderDeclForPatch(const RefoldModel::IncludeItem &inc,
     const uint64_t dHi = d.span.end;
     const uint64_t curSpanLen = dHi - dLo;
 
-    // Pure insertion: treat as attached at aLo
+    // For a pure insertion, attach the patch to the smallest declaration whose
+    // closed declaration range contains the insertion point. The end boundary is
+    // intentionally inclusive so insertions immediately after a declaration body
+    // still belong to that declaration.
     if (aLo == aHi) {
-      // Special case: insertions at decl end are treated as inclusive
       if (aLo >= dLo && aLo <= dHi) {
-        // Tie-breaker: prefer the "tightest" (smallest) declaration that covers
-        // this point.
         if (!bestCover || curSpanLen < getSpanLen(bestCover))
           bestCover = &d;
       }
       continue;
     }
 
-    // Non-empty A-interval
+    // For non-empty patches, prefer a declaration that fully contains the
+    // edited A interval. If no declaration covers the interval, fall back to the
+    // smallest declaration that merely overlaps it.
     const bool covers = (aLo >= dLo && aHi <= dHi);
     const bool overlaps = (aLo < dHi && aHi > dLo);
 
     if (covers) {
-      // Prioritize "Cover": we want the smallest decl that completely contains
-      // the patch.
       if (!bestCover || curSpanLen < getSpanLen(bestCover))
         bestCover = &d;
     } else if (overlaps) {
-      // Fallback to "Overlap": if no decl covers it, find the smallest one that
-      // touches it.
       if (!bestOverlap || curSpanLen < getSpanLen(bestOverlap))
         bestOverlap = &d;
     }
@@ -466,7 +509,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     const IncludePatch &p = ie.patches[idx];
     trace("include/patch", "computeIncludeTextEdits: patch={0}", p);
 
-    // Step 3 records the local obligations discharged by each accepted
+    // Record the local obligations discharged by each accepted
     // include-materialization path. The patch itself provides the class-local
     // witness data (for example whether the edit is an insertion or is owned
     // by a selected conditional arm).
@@ -563,6 +606,9 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
               FormatAcceptedResultCandidate(acceptedCandidate));
       };
 
+      // Select the best theorem-facing insertion anchor by wrapping each local
+      // anchor candidate in the accepted-result carrier and letting the shared
+      // proof-discharge/lattice selector choose among them.
       auto selectBestInsertCandidate =
           [&](ArrayRef<InsertAnchorCandidate> candidates)
           -> std::optional<InsertAnchorCandidate> {
@@ -572,9 +618,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         SmallVector<AcceptedResultCandidate, 4> acceptedCandidates;
         acceptedCandidates.reserve(candidates.size());
         for (const InsertAnchorCandidate &candidate : candidates) {
-          acceptedCandidates.push_back(
-              BuildAcceptedIncludeCandidate(candidate.path, p,
-                                            &candidate.witness));
+          acceptedCandidates.push_back(BuildAcceptedIncludeCandidate(
+              candidate.path, p, &candidate.witness));
         }
 
         const std::optional<size_t> bestIdx =
@@ -596,6 +641,9 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         return candidates[*bestIdx];
       };
 
+      // Materialize the selected insertion anchor as a header-local TextEdit,
+      // applying boundary padding and line-resync handling before attaching the
+      // accepted include-candidate carrier.
       auto commitInsertCandidate = [&](const InsertAnchorCandidate &candidate) {
         std::string text = PadAtBoundaries(
             headerText, static_cast<size_t>(candidate.anchorByte),
@@ -647,6 +695,10 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       };
 
       {
+        // First try the strongest insertion anchors: boundaries already tied to
+        // the selected conditional arm or to a child include boundary. These
+        // anchors preserve include structure without relying on neighboring PP
+        // tokens.
         SmallVector<InsertAnchorCandidate, 2> topTierCandidates;
 
         if (const std::optional<uint64_t> insertByte =
@@ -660,8 +712,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                 IncludeAnchorEvidenceKind::SelectedConditionalBoundary;
             candidate.witness.hasAnchorByte = true;
             candidate.witness.anchorByte = *insertByte;
-            if (auto rightArmRef = model_.FindArmRefAtPP(pos); rightArmRef &&
-                rightArmRef->arm) {
+            if (auto rightArmRef = model_.FindArmRefAtPP(pos);
+                rightArmRef && rightArmRef->arm) {
               candidate.witness.hasCondArmId = true;
               candidate.witness.condArmId = rightArmRef->arm->id;
             }
@@ -692,6 +744,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         }
       }
 
+      // If no structural boundary anchor won, look for the nearest mapped PP
+      // token to the right in the same file and anchor before it.
       std::optional<uint64_t> rightAnchorPP;
       for (uint64_t pp = std::max(pos, ppLo); pp < ppHi; ++pp) {
         auto it = tokmapByPP.find(pp);
@@ -739,6 +793,10 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         }
       }
 
+      // Right-neighbor anchoring is preferred because it naturally inserts
+      // before the next stable token. If unavailable, collect weaker fallback
+      // anchors: the nearest mapped left neighbor, or the containing
+      // declaration boundary when no neighbor exists.
       std::optional<uint64_t> leftAnchorPP;
       if (pos > ppLo && ppHi > ppLo) {
         for (uint64_t pp = std::min(pos - 1, ppHi - 1);; --pp) {
@@ -787,6 +845,9 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
           fallbackCandidates.push_back(std::move(candidate));
         }
       } else if (decl) {
+        // With no mapped PP neighbor, fall back to the declaration boundary
+        // that owns this patch. This keeps the insertion local to the header
+        // declaration instead of widening immediately to include realization.
         const uint64_t declAnchorByte =
             std::clamp<uint64_t>(decl->headerE, 0ULL, fileLen);
         IncludeAnchorWitness declWitness;
@@ -817,6 +878,9 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         continue;
       }
 
+      // No include-preserving insertion anchor discharged. Switch to the
+      // explicit include-realization path instead of manufacturing a weaker
+      // insertion witness.
       debug("include/apply.",
             "file={0} patch[{1}] INSERT: no admissible include-preserving "
             "anchor; realizing include",
@@ -829,8 +893,9 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
               .str();
       return plan;
     } else {
-      // DELETE / REPLACE: map non-empty A-range to byte range within this
-      // header.
+      // DELETE / REPLACE: intersect the patch's non-empty A-token range with
+      // the PP-token range owned by this header/declaration. Only the
+      // intersection can be materialized as a local header edit.
       uint64_t aLo = std::max(p.aStart, ppLo);
       uint64_t aHi = std::min(p.aEnd, ppHi);
       if (aHi <= aLo) {
@@ -841,6 +906,9 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         continue;
       }
 
+      // Find the first and last PP tokens in the intersected patch range that
+      // actually map back to this header file. These tokens define the concrete
+      // source byte range to replace/delete in the header.
       std::optional<uint64_t> firstPP, lastPP;
       for (uint64_t pp = aLo; pp < aHi; ++pp) {
         auto it = tokmapByPP.find(pp);
@@ -852,7 +920,9 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       }
 
       if (!firstPP || !lastPP) {
-        // No tokens from this patch actually map into this header file.
+        // The token intersection exists in PP space, but none of those tokens
+        // have a source mapping into this header. Fall back to include
+        // realization rather than manufacturing a header byte range.
         debug("include/apply",
               "file={0} patch[{1}] DELETE/REPLACE: no mapped PP tokens in "
               "header; SKIP",
@@ -866,10 +936,13 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         return plan;
       }
 
+      // Convert the mapped PP-token endpoints to a closed source byte envelope
+      // in the header. The witness records both the PP-token evidence and the
+      // resolved byte range so proof discharge can validate this include edit.
       startByte = ByteStartForPPInFile(file, *firstPP,
-                                       /* fallbackToEOF */ false, fileLen);
+                                       /*fallbackToEOF=*/false, fileLen);
       endByte =
-          ByteEndForPPInFile(file, *lastPP, /* fallbackToEOF */ false, fileLen);
+          ByteEndForPPInFile(file, *lastPP, /*fallbackToEOF=*/false, fileLen);
       mappedHeaderWitness.evidence =
           IncludeAnchorEvidenceKind::MappedHeaderTokens;
       mappedHeaderWitness.hasFirstPP = firstPP.has_value();
@@ -887,6 +960,9 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
             includeInventoryFor(
                 AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens,
                 &mappedHeaderWitness));
+
+      // If either endpoint cannot be projected into header bytes, this patch
+      // cannot be represented as an include-preserving mapped-header edit.
       if (!startByte || !endByte) {
         plan.requiresIncludeRealization = true;
         plan.realizationReason =
@@ -898,30 +974,38 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       }
     }
 
-    // Clamp to the declaration’s header_span, if any, so we never cross decl
-    // boundaries for DELETE/REPLACE. For INSERTs we intentionally allow the
-    // anchor to sit on the boundary between two declarations so that a new
-    // declaration can be injected cleanly between them.
+    // For DELETE/REPLACE, keep the resolved byte range inside the declaration
+    // that owns the patch. INSERTs are different: their anchor may legitimately
+    // sit on the boundary between declarations, so do not clamp insertion
+    // anchors into one side of that boundary.
     if (!isInsert && decl) {
       startByte = std::clamp(*startByte, decl->headerB, decl->headerE);
       endByte = std::clamp(*endByte, decl->headerB, decl->headerE);
     }
 
-    // Sanity clamp to file bounds.
+    // If no byte anchor/range was resolved, this patch cannot produce a local
+    // header edit.
     if (!startByte)
       continue;
 
+    // Clamp the final edit range to the physical header buffer. `endByte` is
+    // clamped relative to `startByte` so malformed or boundary-adjusted ranges
+    // collapse to a safe empty edit instead of inverting.
     const uint64_t fLen = static_cast<uint64_t>(fileLen);
     startByte = std::clamp(*startByte, uint64_t(0), fLen);
     endByte = std::clamp(*endByte, *startByte, fLen);
 
+    // DELETE emits an empty replacement; INSERT and REPLACE both use the
+    // B-derived patch payload carried by the IncludePatch.
     std::string replacement = isDelete ? "" : p.insertBytes;
 
     if (inTraceMode()) {
       StringRef opKind =
           isInsert ? "INSERT" : (isDelete ? "DELETE" : "REPLACE");
 
-      // DEBUG: log the exact slice and replacement we are about to apply.
+      // Log the concrete header slice and replacement payload at the byte range
+      // that will be staged. This is intentionally after all clamping so the
+      // trace reflects the actual emitted edit.
       const std::string originalSlice =
           headerText.substr(*startByte, *endByte - *startByte);
       std::string origDbg = originalSlice;
@@ -934,6 +1018,9 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         replDbg = replDbg.substr(0, MAX_DBG) + "…";
       }
 
+      // Include declaration context when available; it explains why the final
+      // byte range may have been clamped narrower than the raw mapped PP-token
+      // envelope.
       std::string declInfo = "<none>";
       if (decl) {
         declInfo =
@@ -951,6 +1038,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
             stringutils::showWS(replDbg));
     }
 
+    // Stage the include-preserving mapped-header edit and attach the witness
+    // that records which PP tokens and header bytes justified the edit range.
     TextEdit edit = MakeTextEditWithResyncOrPending(
         headerText, *startByte, *endByte, replacement, file);
     AttachAcceptedResultCarrier(
@@ -988,40 +1077,37 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
 std::optional<uint64_t> RefoldEngine::ComputeChildBoundaryInsertByte(
     const IncludePatch &p, StringRef file,
     IncludeAnchorWitness *witness) const {
-  // Which include are we editing?
+  // Child-boundary anchoring only applies to patches owned by a concrete parent
+  // include. Without that owner, there is no child include set to inspect.
   const RefoldModel::IncludeItem *owner = p.include;
-  if (!owner) {
+  if (!owner)
     return std::nullopt;
-  }
 
-  // Structural boundary selection:
-  //   * If the INSERT PP-gap is strictly inside a child include's PP cover,
-  //     this is not a boundary insertion in the parent (it should have been a
-  //     child-owned patch).
-  //   * If the gap is exactly on a child cover boundary, we can anchor at that
-  //     child's include-site byte span.
-  //
-  // Contract: boundary anchors must be unambiguous. If multiple children claim
-  // the same boundary PP position, we must fail rather than guess.
-
-  uint64_t pos = p.aStart; // PP position of the INSERT gap
+  // The INSERT hunk's A-side start is the PP-gap where the new text should be
+  // anchored. This helper only recognizes gaps that coincide exactly with a
+  // direct child include's cover boundary.
+  uint64_t pos = p.aStart;
 
   SmallVector<const RefoldModel::IncludeItem *, 4> beginMatches;
   SmallVector<const RefoldModel::IncludeItem *, 4> endMatches;
 
   for (const auto &child : model_.GetIncludes()) {
-    // Only check direct children of the owner.
+    // Only direct children of this include can supply a boundary in the current
+    // parent header.
     if (!child.parent || *child.parent != owner->id)
       continue;
 
-    // Paths must match the file currently being processed.
+    // The child include directive must be spelled in the header file currently
+    // being materialized.
     if (!PathsEqual(child.sitePath, file))
       continue;
 
     const uint64_t cb = child.cover.begin;
     const uint64_t ce = child.cover.end;
 
-    // If the gap is strictly inside, this is the wrong mechanism.
+    // A gap strictly inside the child's PP cover is not a parent boundary. That
+    // edit should be represented as child-owned work, not as an insertion at
+    // the parent include site.
     if (cb < pos && pos < ce)
       return std::nullopt;
 
@@ -1046,7 +1132,9 @@ std::optional<uint64_t> RefoldEngine::ComputeChildBoundaryInsertByte(
     return out;
   };
 
-  // Prefer anchoring before a child whose cover begins at this gap.
+  // Prefer anchoring before a child include whose PP cover begins at the gap.
+  // The returned byte is the beginning of the child's spelled include
+  // directive.
   if (!beginMatches.empty()) {
     if (beginMatches.size() != 1) {
       fatal("include/boundary",
@@ -1064,6 +1152,8 @@ std::optional<uint64_t> RefoldEngine::ComputeChildBoundaryInsertByte(
     return beginMatches[0]->siteB;
   }
 
+  // Otherwise, anchor after the unique child include whose PP cover ends at the
+  // gap. The returned byte is the end of the child's spelled include directive.
   if (!endMatches.empty()) {
     if (endMatches.size() != 1) {
       fatal("include/boundary",
@@ -1088,13 +1178,17 @@ RefoldEngine::ResyncOutcome
 RefoldEngine::ApplyResyncOrPend(StringRef originalFileText, uint64_t start,
                                 uint64_t end, StringRef replacement,
                                 StringRef fileSpellingForDirective) const {
+  // If the replacement preserves the original newline count, no line-state
+  // correction is needed.
   size_t origNl = stringutils::countNewlines(originalFileText, start, end);
   size_t replNl =
       stringutils::countNewlines(replacement, 0, replacement.size());
   if (origNl == replNl)
     return ResyncOutcome(replacement.str(), std::nullopt);
 
-  // Drift detected: decide whether to inject a local `#line` or defer.
+  // Newline drift means the following untouched source would resume at a
+  // different logical line unless we emit a #line directive. Prefer a local
+  // directive immediately after the replacement when that can be done safely.
   size_t resumeLine = stringutils::lineAtOffset(originalFileText, end);
   trace("linedir/resync",
         "drift: span=[{0},{1}) origNl={2} replNl={3} resumeLine={4} file={5} "
@@ -1102,17 +1196,20 @@ RefoldEngine::ApplyResyncOrPend(StringRef originalFileText, uint64_t start,
         start, end, origNl, replNl, resumeLine, fileSpellingForDirective,
         stringutils::showWSWithClip(replacement, 100));
 
-  // Attempt local injection first.
   std::string injected = lineDirs_.MaybeAppendResyncAfterReplacement(
       originalFileText, start, end, replacement, fileSpellingForDirective);
 
-  // If the returned string changed, injection succeeded.
+  // A changed result means the directive was inserted directly into this
+  // replacement, so no deferred resync state needs to be carried forward.
   if (injected != replacement) {
     trace("linedir/resync", "local inject succeeded: resumeLine={0} file={1}",
           resumeLine, fileSpellingForDirective);
     return ResyncOutcome(std::move(injected), std::nullopt);
   }
 
+  // Local injection was not safe, usually because the replacement rejoins
+  // untouched bytes mid-line. Carry a pending resync so the next copied
+  // original slice can emit the directive at a valid boundary.
   trace("linedir/resync",
         "local inject failed -> PENDING: resumeLine={0} file={1}", resumeLine,
         fileSpellingForDirective);
@@ -1130,14 +1227,17 @@ void RefoldEngine::AttachAcceptedResultCarrier(
 bool RefoldEngine::EmittedTextEditHasDischargedAcceptedResults(
     const TextEdit &edit, StringRef emissionPhase,
     StringRef emissionOwner) const {
-  const StringRef owner = emissionOwner.empty() ? StringRef("<unknown>")
-                                                : emissionOwner;
+  const StringRef owner =
+      emissionOwner.empty() ? StringRef("<unknown>") : emissionOwner;
   ++lastTheoremAudit_.emittedNonTerminalEdits;
 
   auto carrierIsEmissionDischarged =
       [&](const AcceptedResultCandidate &carrier) -> bool {
     ++lastTheoremAudit_.emittedCarriers;
 
+    // Emitted byte edits must be backed by ordinary in-domain accepted results.
+    // Unknown carriers and explicit terminal/out-of-domain carriers are never
+    // valid on a non-terminal edit.
     if (carrier.kind == AcceptedResultCandidateKind::Unknown) {
       ++lastTheoremAudit_.emittedUnknownClassCarriers;
       NoteTheoremAuditViolation("emitted carrier had unknown candidate kind");
@@ -1157,11 +1257,10 @@ bool RefoldEngine::EmittedTextEditHasDischargedAcceptedResults(
     }
     ++lastTheoremAudit_.emittedDeclaredClassCarriers;
 
-    // Step 3 is meant to eliminate transitional-gap states from emitted
-    // behavior, not merely relabel them in the normalized proof model. Keep
-    // any remaining non-first-class / transitional carrier fail-closed at the
-    // byte-edit emission boundary even if some earlier stage forgot to stamp a
-    // stronger local diagnosis onto the discharge record.
+    // Transitional-gap states must be eliminated before emission. This check
+    // fail-closes any carrier that is not explicitly proof-backed or still
+    // reports a transitional theorem/completeness domain, even if earlier
+    // selection code allowed it to reach the edit boundary.
     if (carrier.proofSummary.inventory.support !=
             AcceptanceSupportKind::ExplicitProofBacked ||
         carrier.proofSummary.theoremDomain.kind ==
@@ -1175,6 +1274,9 @@ bool RefoldEngine::EmittedTextEditHasDischargedAcceptedResults(
       return false;
     }
 
+    // The carrier must describe a declared in-domain proof class, not merely a
+    // syntactically classified candidate. This is the theorem-domain gate for
+    // emitted non-terminal edits.
     if (carrier.proofSummary.theoremDomain.kind !=
             TheoremDomainKind::DeclaredInDomainClass ||
         !carrier.proofSummary.theoremDomain.inDeclaredDomain ||
@@ -1186,6 +1288,8 @@ bool RefoldEngine::EmittedTextEditHasDischargedAcceptedResults(
       return false;
     }
 
+    // Finally require the local validator for this accepted-result class to
+    // have discharged all obligations.
     if (carrier.proofSummary.discharge.status ==
         ProofDischargeStatus::Discharged) {
       ++lastTheoremAudit_.emittedDischargedCarriers;
@@ -1198,6 +1302,9 @@ bool RefoldEngine::EmittedTextEditHasDischargedAcceptedResults(
     return false;
   };
 
+  // Every emitted non-terminal edit must carry at least one selected
+  // accepted-result witness. An unannotated edit is an emission artifact, not a
+  // theorem-facing refolding result.
   if (edit.acceptedResults.empty()) {
     NoteTheoremAuditViolation("emitted edit reached the byte-edit boundary "
                               "without accepted-result carriers");
@@ -1210,6 +1317,9 @@ bool RefoldEngine::EmittedTextEditHasDischargedAcceptedResults(
     return false;
   }
 
+  // Validate every carrier attached to the edit. Multiple carriers are allowed
+  // when one concrete edit composes several accepted results, but each carrier
+  // must independently discharge.
   for (size_t i = 0; i < edit.acceptedResults.size(); ++i) {
     const std::shared_ptr<const AcceptedResultCandidate> &carrier =
         edit.acceptedResults[i];
@@ -1453,9 +1563,16 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
     TextEdit merged = *first;
     for (size_t k = i + 1; k < j; ++k) {
       const TextEdit &dup = *ordered[k].e;
+
+      // Identical non-zero edits collapse to one physical replacement, but any
+      // deferred line-resync state produced by the later duplicate must still be
+      // preserved on the merged edit.
       if (dup.pending)
         merged.pending = dup.pending;
 
+      // If duplicate edits represent an expanded macro replacement, they must
+      // agree on the same expanded root. Different roots for the same concrete
+      // byte span would make the emitted edit's proof carrier ambiguous.
       if (merged.expandedMacroRootId && dup.expandedMacroRootId &&
           *merged.expandedMacroRootId != *dup.expandedMacroRootId) {
         RequestTerminalFallback(
@@ -1467,9 +1584,16 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
                 .str());
         return originalFileText.str();
       }
+
+      // A duplicate may carry the expanded-root marker even when the first edit
+      // did not. Preserve that marker so counter stabilization and audit still
+      // see the emitted replacement as macro-expanded.
       if (!merged.expandedMacroRootId && dup.expandedMacroRootId)
         merged.expandedMacroRootId = dup.expandedMacroRootId;
 
+      // Keep all accepted-result carriers from the equivalent duplicates. The
+      // text replacement is shared, but each proof witness still explains one
+      // path that contributed to the emitted edit.
       merged.acceptedResults.insert(merged.acceptedResults.end(),
                                     dup.acceptedResults.begin(),
                                     dup.acceptedResults.end());
@@ -1518,14 +1642,21 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
     SmallVector<size_t, 16> editIndices;
   };
 
-  auto checkClosedTURealizationCandidate = [&](uint64_t firstHunk,
-                                               uint64_t lastHunk,
-                                               ClosedTURealizationCandidate
-                                                   &candidate) -> bool {
+  // Validate that a contiguous run of direct TU-hunk edits can be replaced by
+  // one closed TU realization. The candidate is accepted only when every hunk
+  // in the run has a direct edit, the source/B envelopes are monotone and
+  // non-empty, no independent edit intrudes into the source interval, and the
+  // A↔B token map proves that all stable tokens crossing either envelope stay
+  // inside the corresponding opposite envelope.
+  auto checkClosedTURealizationCandidate =
+      [&](uint64_t firstHunk, uint64_t lastHunk,
+          ClosedTURealizationCandidate &candidate) -> bool {
     candidate = ClosedTURealizationCandidate{};
     candidate.firstHunk = firstHunk;
     candidate.lastHunk = lastHunk;
 
+    // The closure is defined over a contiguous hunk run, so every hunk in the
+    // run must already have a direct TU edit that can be absorbed.
     for (uint64_t hunkIndex = firstHunk; hunkIndex <= lastHunk; ++hunkIndex) {
       std::optional<size_t> editIndex = findDirectEditForHunk(hunkIndex);
       if (!editIndex)
@@ -1540,6 +1671,9 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
     candidate.bBegin = std::numeric_limits<uint64_t>::max();
     candidate.bEnd = 0;
 
+    // Build the source byte envelope and B-token envelope for the selected
+    // direct edits. The B intervals must appear in order; otherwise a single
+    // replacement would not preserve the token-order proof for the hunk run.
     std::optional<uint64_t> previousBEnd;
     for (size_t editIndex : candidate.editIndices) {
       const TextEdit &edit = norm[editIndex];
@@ -1555,6 +1689,8 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
       candidate.bEnd = std::max(candidate.bEnd, *edit.directTUHunkBEnd);
     }
 
+    // The synthesized replacement must cover a real source byte interval and a
+    // real B-token interval.
     if (candidate.sourceBegin == std::numeric_limits<uint64_t>::max() ||
         candidate.sourceBegin >= candidate.sourceEnd)
       return false;
@@ -1571,30 +1707,29 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
       return false;
     };
 
-    // The synthesized closure is allowed to replace only the selected hunk run.
-    // Any independent edit that overlaps the closure, or any insertion strictly
-    // inside it, would require another composition law and is therefore rejected.
+    // The closure may compose only the selected hunk-run edits. Any other edit
+    // that overlaps the source envelope, including a zero-width insertion
+    // inside it, would need a separate composition law and is rejected here.
     for (size_t editIndex = 0; editIndex < norm.size(); ++editIndex) {
       if (candidateContainsEdit(editIndex))
         continue;
       const TextEdit &edit = norm[editIndex];
       const bool nonZeroOverlap =
           edit.start < candidate.sourceEnd && candidate.sourceBegin < edit.end;
-      const bool interiorInsertion =
-          edit.start == edit.end && candidate.sourceBegin < edit.start &&
-          edit.start < candidate.sourceEnd;
+      const bool interiorInsertion = edit.start == edit.end &&
+                                     candidate.sourceBegin < edit.start &&
+                                     edit.start < candidate.sourceEnd;
       if (nonZeroOverlap || interiorInsertion)
         return false;
     }
 
-    // Prove that every A token physically consumed by the source interval has
-    // no matched B occurrence outside the candidate B interval. This is what
-    // prevents a closure from stealing a stable token whose true B-side mate
-    // remains outside the replacement.
+    // A-side closure: every A token whose source bytes overlap the candidate
+    // must be wholly contained by the candidate source interval. If that token
+    // has a stable B mate, that B mate must also lie inside the candidate
+    // replacement envelope.
     for (uint64_t aTok = 0; aTok < static_cast<uint64_t>(aToks_.size());
          ++aTok) {
-      std::optional<std::pair<uint64_t, uint64_t>> span =
-          sourceTokenSpan(aTok);
+      std::optional<std::pair<uint64_t, uint64_t>> span = sourceTokenSpan(aTok);
       if (!span)
         continue;
 
@@ -1616,9 +1751,9 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
       }
     }
 
-    // Symmetrically, every matched B token emitted by the replacement must map
-    // back to an A token wholly contained in the source interval. Otherwise the
-    // candidate would duplicate or move an outside stable token.
+    // B-side closure: every stable B token emitted by the replacement must map
+    // back to an A token wholly contained by the source interval. This prevents
+    // the synthesized edit from duplicating or moving stable outside tokens.
     for (uint64_t bTok = candidate.bBegin; bTok < candidate.bEnd; ++bTok) {
       if (bTok >= static_cast<uint64_t>(abTokMapB2A_.size()))
         return false;
@@ -1636,11 +1771,21 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
     return true;
   };
 
+  // Try to replace an uncomposable cluster of overlapping direct TU-hunk edits
+  // with one conservative closed TU realization. The synthesized edit is
+  // accepted only if a contiguous direct-hunk run can be proven closed in both
+  // source-byte space and B-token space by the A↔B token maps.
   auto tryBuildClosedTURealization = [&](size_t overlapIndex,
                                          TextEdit &closure) -> bool {
+    // Closed realization depends on both token-map directions: A tokens inside
+    // the source interval must map into the B envelope, and stable B tokens in
+    // the B envelope must map back into the source interval.
     if (abTokMapA2B_.empty() || abTokMapB2A_.empty())
       return false;
 
+    // Start from the overlap point and collect the full source-overlap cluster
+    // around it. The cluster determines the minimum set of direct edits that
+    // must be absorbed by the synthesized closure.
     size_t clusterBegin = overlapIndex == 0 ? 0 : overlapIndex - 1;
     uint64_t coverBegin = norm[clusterBegin].start;
     uint64_t coverEnd = norm[clusterBegin].end;
@@ -1667,6 +1812,8 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
       ++clusterEnd;
     }
 
+    // Every edit in the overlap cluster must be a direct TU-hunk edit. Mixed
+    // edit classes would require a separate composition law, so fail closed.
     std::optional<uint64_t> hunkMin;
     std::optional<uint64_t> hunkMax;
     for (size_t i = clusterBegin; i < clusterEnd; ++i) {
@@ -1681,6 +1828,9 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
     if (!hunkMin || !hunkMax)
       return false;
 
+    // Expand to the maximal contiguous run of direct TU hunks available around
+    // the cluster. The search below starts with the minimal cluster-covering
+    // run and widens only as needed to find a closed realization.
     uint64_t directLo = *hunkMin;
     while (directLo > 0 && findDirectEditForHunk(directLo - 1))
       --directLo;
@@ -1690,6 +1840,9 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
            findDirectEditForHunk(directHi + 1))
       ++directHi;
 
+    // Prefer the smallest closed hunk run that contains the overlap cluster.
+    // This keeps the synthesized TU edit as local as possible while still
+    // allowing widening when closure requires adjacent direct hunks.
     std::optional<ClosedTURealizationCandidate> best;
     const uint64_t minWidth = *hunkMax - *hunkMin + 1;
     const uint64_t maxWidth = directHi - directLo + 1;
@@ -1713,18 +1866,23 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
     if (!best)
       return false;
 
-    StringRef replacement = sliceExactTokenCoverage(
-        bTokOff_, bToks_, bSource_, best->bBegin, best->bEnd);
-    ResyncOutcome ro = ApplyResyncOrPend(originalFileText, best->sourceBegin,
-                                         best->sourceEnd, replacement,
-                                         emissionOwner);
-    closure = TextEdit{best->sourceBegin, best->sourceEnd, std::move(ro.text),
-                       std::move(ro.pending), std::nullopt, {}};
+    // Materialize exactly the proven B-token envelope, then apply the same
+    // line-resync machinery used by ordinary emitted edits.
+    StringRef replacement = sliceExactTokenCoverage(bTokOff_, bToks_, bSource_,
+                                                    best->bBegin, best->bEnd);
+    ResyncOutcome ro =
+        ApplyResyncOrPend(originalFileText, best->sourceBegin, best->sourceEnd,
+                          replacement, emissionOwner);
+    closure =
+        TextEdit{best->sourceBegin,     best->sourceEnd, std::move(ro.text),
+                 std::move(ro.pending), std::nullopt,    {}};
     AttachAcceptedResultCarrier(
         closure, BuildAcceptedTUTextEditCandidate(
                      AcceptedPathKind::TUByteSpanConservativeEdit,
                      best->sourceBegin, best->sourceEnd, replacement));
 
+    // Replace the absorbed direct edits with the single closed realization and
+    // re-sort so downstream application sees a normal non-overlapping edit set.
     SmallVector<TextEdit, 32> resolved;
     resolved.reserve(norm.size() - best->editIndices.size() + 1);
     auto shouldRemove = [&](size_t editIndex) {
@@ -1779,8 +1937,8 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
       break;
   }
 
-  // Step 2 makes the byte-edit emission boundary proof-gated. By the time an
-  // edit reaches this function, every non-terminal artifact it composes must
+  // The byte-edit emission boundary is proof-gated. By the time an edit
+  // reaches this function, every non-terminal artifact it composes must
   // already carry normalized accepted-result carriers that are fully
   // discharged for emitted source text. Do not emit any edit whose carriers
   // are missing or not yet discharged.
@@ -1825,7 +1983,8 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
     validatedCursor = e.end;
   }
 
-  // Use SmallString for the output buffer to optimize small file edits.
+  // Assemble the final file by copying original slices between the normalized
+  // edits and splicing each replacement at its staged byte range.
   SmallString<0> out;
   out.reserve(originalFileText.size() + 128);
   std::optional<PendingResync> pending = std::nullopt;
@@ -1833,15 +1992,22 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
   uint64_t cursor = 0;
 
   for (const auto &e : norm) {
-    // Pass the SmallString to the appender.
+    // Copy the untouched source before this edit. If a previous replacement
+    // could not safely emit its #line resync locally, this copy step is also the
+    // next opportunity to flush that pending resync at a safe boundary.
     pending = AppendOriginalSliceWithPending(out, originalFileText, cursor,
                                              e.start, std::move(pending));
 
+    // Record expanded macro roots that actually made it into the emitted text.
+    // Counter stabilization uses this to force later __COUNTER__-sensitive
+    // macro occurrences when needed.
     if (appliedExpandedMacroRootIds && e.expandedMacroRootId)
       appliedExpandedMacroRootIds->insert(*e.expandedMacroRootId);
 
     out.append(e.text);
 
+    // Carry any resync that the edit itself could not emit locally. It will be
+    // discharged by the next copied original slice, or by the final tail copy.
     if (e.pending) {
       pending = e.pending;
     }
@@ -1849,6 +2015,8 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
     cursor = e.end;
   }
 
+  // Copy the final untouched tail and flush any pending line resync that
+  // survived the last replacement.
   pending = AppendOriginalSliceWithPending(out, originalFileText, cursor, n,
                                            std::move(pending));
 
@@ -1859,6 +2027,9 @@ std::optional<RefoldEngine::PendingResync>
 RefoldEngine::AppendOriginalSliceWithPending(
     SmallVectorImpl<char> &out, llvm::StringRef original, uint64_t from,
     uint64_t to, std::optional<RefoldEngine::PendingResync> pending) const {
+  // Fast path: if there is no pending #line correction, or line directives are
+  // disabled, this helper is just a straight copy of the untouched source
+  // slice.
   if (!pending || !lineDirs_.Enabled()) {
     auto slice = original.slice(from, to);
     out.append(slice.begin(), slice.end());
@@ -1871,6 +2042,8 @@ RefoldEngine::AppendOriginalSliceWithPending(
     if (pos >= original.size())
       return false;
 
+    // Find the physical start of the current line and require that `pos` is
+    // still inside that line's indentation prefix.
     size_t lineStart = pos;
     while (lineStart > 0 && original[lineStart - 1] != '\n')
       --lineStart;
@@ -1882,6 +2055,9 @@ RefoldEngine::AppendOriginalSliceWithPending(
     if (lineEnd == StringRef::npos)
       lineEnd = original.size();
 
+    // A preprocessor directive may be preceded by horizontal whitespace. If the
+    // first non-whitespace character is '#', flushing before the indentation is
+    // still a directive-line-safe resync point.
     size_t firstNonWs = pos;
     while (firstNonWs < lineEnd && stringutils::isWs(original[firstNonWs]) &&
            original[firstNonWs] != '\n')
@@ -1890,13 +2066,10 @@ RefoldEngine::AppendOriginalSliceWithPending(
     return firstNonWs < lineEnd && original[firstNonWs] == '#';
   };
 
-  // Flush immediately when output is already at BOL and the next untouched
-  // bytes are either:
-  // (1) at a true BOL in the original file, or
-  // (2) in the leading indentation of an untouched preprocessor-directive
-  //     line. Directives may legally be preceded by horizontal whitespace, so
-  //     flushing before that indentation keeps the directive line's logical
-  //     location accurate without relaxing the ordinary code-line safety rule.
+  // Prefer to flush the pending resync before copying this slice when the
+  // emitted output is already at BOL and the untouched input also resumes at a
+  // safe line boundary. This handles both true BOL and the indentation prefix
+  // of an untouched preprocessor directive line.
   if (stringutils::outAtBOL(StringRef(out.data(), out.size())) &&
       (stringutils::isBOL(original, static_cast<size_t>(from)) ||
        canFlushBeforeUntouchedDirectiveLine(static_cast<size_t>(from)))) {
@@ -1904,9 +2077,10 @@ RefoldEngine::AppendOriginalSliceWithPending(
     std::string directive =
         lineDirs_.FormatLineDirective(line, pending->fileSpellingForDir);
 
-    // Create a view of the current buffer for the check
     StringRef currentOut(out.data(), out.size());
 
+    // Avoid emitting a redundant directive when the current output state
+    // already represents the requested file/line location.
     if (LineDirectiveInserter::ShouldEmitLineDirective(
             currentOut, pending->fileSpellingForDir, line, directive)) {
       trace("line/pending",
@@ -1927,8 +2101,9 @@ RefoldEngine::AppendOriginalSliceWithPending(
     return std::nullopt;
   }
 
-  // Otherwise, scan forward for the first safe newline boundary (not
-  // line-spliced).
+  // If the slice does not begin at a safe flush point, copy forward until the
+  // first real newline boundary. Line-spliced newlines are not safe because
+  // they do not end the logical source line.
   while (i < to) {
     size_t nl = original.find('\n', i);
     if (nl == llvm::StringRef::npos || nl >= static_cast<size_t>(to))
@@ -1944,7 +2119,6 @@ RefoldEngine::AppendOriginalSliceWithPending(
       std::string directive =
           lineDirs_.FormatLineDirective(line, pending->fileSpellingForDir);
 
-      // Update our view of the output after appending the newline
       StringRef currentOut(out.data(), out.size());
       if (LineDirectiveInserter::ShouldEmitLineDirective(
               currentOut, pending->fileSpellingForDir, line, directive)) {
@@ -1966,7 +2140,9 @@ RefoldEngine::AppendOriginalSliceWithPending(
     }
   }
 
-  // Clean up remaining bytes
+  // Copy any bytes after the flush point, or the whole slice tail if no safe
+  // flush point was found. In the latter case, return the still-pending resync
+  // so a later original slice can discharge it.
   if (i < to) {
     auto remaining =
         original.slice(static_cast<size_t>(i), static_cast<size_t>(to));
@@ -2017,11 +2193,15 @@ void RefoldEngine::DebugIncludePatch(StringRef tag,
     return std::nullopt;
   };
 
+  // Convert the token hunk endpoints to byte offsets when the offset tables
+  // have entries for those token boundaries.
   const std::optional<uint64_t> a0 = getByteOff(h.aStart, aTokOff_);
   const std::optional<uint64_t> a1 = getByteOff(h.aEnd, aTokOff_);
   const std::optional<uint64_t> b0 = getByteOff(h.bStart, bTokOff_);
   const std::optional<uint64_t> b1 = getByteOff(h.bEnd, bTokOff_);
 
+  // Slice previews are diagnostic-only. Leave them empty if the projected byte
+  // range is missing or invalid rather than risking an out-of-range access.
   StringRef aSlice = "";
   if (a0 && a1 && *a1 >= *a0 && *a1 <= aSource_.size()) {
     aSlice = aSource_.substr(static_cast<size_t>(*a0),
@@ -2046,6 +2226,8 @@ std::string RefoldEngine::PPArgSpanToString(const RefoldModel::PPArgSpan &sp,
   std::string storage;
   llvm::raw_string_ostream os(storage);
 
+  // Print the common PP-argument span fields first so all span kinds share a
+  // stable diagnostic shape.
   os << formatv("{kind='{0}', A=[{1},{2}), argIdx={3}", sp.kind, sp.begin,
                 sp.end, sp.argIdx);
 
@@ -2053,6 +2235,8 @@ std::string RefoldEngine::PPArgSpanToString(const RefoldModel::PPArgSpan &sp,
     os << ", occ=STRINGIFY";
   }
 
+  // Paste spans may describe a byte subrange inside one pasted PP token, so
+  // include that finer-grained range only for paste metadata.
   if (sp.kind == PPArgSpanKind::Paste) {
     os << formatv(", byte=[{0},{1})", sp.byteBegin, sp.byteEnd);
   }
@@ -2072,6 +2256,8 @@ RefoldEngine::PPArgSpanListToString(ArrayRef<RefoldModel::PPArgSpan> spans,
     if (i > 0)
       os << ", ";
 
+    // `isStringify` is parallel metadata when available; missing entries mean
+    // the corresponding span is not marked as a stringify occurrence.
     bool isStr = (i < isStringify.size() && isStringify[i]);
     os << PPArgSpanToString(spans[i], isStr);
   }

@@ -155,11 +155,11 @@ struct PPTok {
 ///
 /// Unsupported / out of scope:
 ///
-/// The engine intentionally does not attempt to model complex preprocessor
-/// features that require semantic re-expansion (e.g., token-pasting, variadics,
-/// or aggressive escape normalization). In such cases it prefers
-/// deterministic expansion of the affected macro instance over speculative
-/// rewriting.
+/// The engine intentionally refuses macro-preserving rewrites unless the
+/// producer map supplies enough local proof for the relevant feature (including
+/// paste, stringify, variadic forwarding, and wrapper chains). When such proof
+/// is unavailable, it prefers deterministic expansion of the affected macro
+/// instance over speculative rewriting.
 ///
 /// \author jeikenberry
 class RefoldEngine {
@@ -221,14 +221,14 @@ private:
 
   /// \brief Explicit classification for the remaining terminal fallback exits.
   ///
-  /// The post-Step-12 engine no longer retries under more expanded tiers. If a
+  /// The engine no longer retries under more expanded tiers. If a
   /// helper still cannot discharge into the declared proof lattice, it requests
   /// the one explicit terminal fallback. Track which exclusion triggered that
   /// fallback so the completeness boundary is stated in terms of named
   /// out-of-domain cases rather than an opaque escape hatch.
   ///
-  /// Step 5 formalizes `OwnerUnresolvedNoTUAnchor` as an explicit theorem
-  /// boundary rather than a vague implementation leftover. That exclusion means
+  /// `OwnerUnresolvedNoTUAnchor` is an explicit theorem boundary rather than a
+  /// vague implementation leftover. That exclusion means
   /// the edit had no macro/include owner and also lacked the TU witness needed
   /// to stay in-domain: a truthful TU-owned mapped span for non-insertions, or
   /// an exact/provable TU insertion anchor for pure insertions.
@@ -238,8 +238,8 @@ private:
     IncludeRealizationUnmappableBCoverEnvelope,
     UndischargedEmissionArtifact,
     UncomposableEmissionEditSet,
-    /// Step 6: strict mode turns any surviving theorem-audit invariant
-    /// violation into the one explicit terminal out-of-domain result instead of
+    /// Strict mode turns any surviving theorem-audit invariant violation into
+    /// the one explicit terminal out-of-domain result instead of
     /// merely logging it as a dashboard counter.
     TheoremAuditInvariantViolation,
     MixedExcludedCases,
@@ -291,8 +291,8 @@ private:
   /// \brief Declared fallback-closure classes that sit strictly between
   /// structural source emission and terminal fallback to B.
   ///
-  /// Step 1 for proved partial-expansion fallback intentionally introduces the
-  /// carrier before any behavioral change. The engine may only emit one of
+  /// Proved partial-expansion fallback introduces the carrier before any
+  /// behavioral change. The engine may only emit one of
   /// these fallback-expanded results once a concrete witness builder exists and
   /// can prove a closed owner set, exact frontier, and valid materialization.
   enum class ExpansionClosureKind : uint8_t {
@@ -342,7 +342,7 @@ private:
 
   /// \brief Declared structural-refolding domain used by the theorem audit.
   ///
-  /// Step 7 freezes the theorem/completeness target so later work does not
+  /// The theorem/completeness target is explicit so later work does not
   /// silently move the goalposts. The engine treats an input as inside the
   /// declared structural domain iff every emitted non-terminal artifact can be
   /// represented by a normalized accepted-result carrier such that:
@@ -486,8 +486,8 @@ private:
   }
 
 
-  /// Step 6 upgrades the theorem audit from a descriptive dashboard into an
-  /// invariant checker. This helper normalizes any surviving counter-based
+  /// The theorem audit is an invariant checker rather than only a descriptive
+  /// dashboard. This helper normalizes any surviving counter-based
   /// violations onto the theorem state and, in strict mode, requests the one
   /// explicit terminal fallback instead of allowing a structurally-refolded
   /// result to escape with a violated theorem audit.
@@ -496,8 +496,8 @@ private:
   /// Validate that the terminal fallback state itself still classifies as the
   /// one explicit out-of-domain theorem carrier.
   ///
-  /// Step 8 closes the final audit hole here: it is not enough for the engine
-  /// to request fallback to B; the resulting witness must also restamp onto the
+  /// Requesting fallback to B is not enough; the resulting witness must also
+  /// restamp onto the
   /// normalized terminal explicit-out-of-domain carrier rather than escaping as
   /// an unclassified fallback side effect.
   void RecordTerminalFallbackTheoremAudit() const;
@@ -510,7 +510,7 @@ private:
   ///
   /// This stage sits strictly between structural refolding and the explicit
   /// terminal fallback to B. It may now derive a concrete single-owner macro
-  /// witness and, when Step 3 synthesis succeeds, return a source-level
+  /// witness and, when synthesis succeeds, return a source-level
   /// fallback-expanded TU instead of letting the run proceed to raw B.
   std::optional<std::string> TryExpansionClosureFallback();
 
@@ -557,8 +557,8 @@ private:
 
   /// \brief Build the single-owner macro whole-expansion fallback witness.
   ///
-  /// Step 2 implements the first concrete partial-expansion proof class. The
-  /// witness exists only when exactly one top-level TU-owned macro callsite has
+  /// Build the concrete partial-expansion proof witness. The witness exists
+  /// only when exactly one top-level TU-owned macro callsite has
   /// a proved whole-cover realization plan, every token-diff hunk lies inside
   /// that closure, and the source/frontier checks stay inside the explicit
   /// single-owner domain (no ambiguity, no foreign overlap, no mixed ownership,
@@ -582,8 +582,8 @@ private:
   /// \brief Attempt to synthesize a source-level fallback from one macro-owner
   /// whole-expansion witness.
   ///
-  /// Step 3 keeps this narrower than the witness domain itself. The first
-  /// synthesis class emits a direct TU callsite splice only when the
+  /// Keep this narrower than the witness domain itself. The synthesis class
+  /// emits a direct TU callsite splice only when the
   /// materialized B-surface is replay-stable as raw source bytes and can be
   /// embedded back into the TU with the usual line-drift resynchronization
   /// machinery. Otherwise the stage fails closed and the engine keeps falling
@@ -594,7 +594,7 @@ private:
   /// \brief Return whether a materialized fallback replacement is replay-stable
   /// as direct source text for the first synthesis class.
   ///
-  /// The initial Step 3 domain deliberately excludes identifiers because the
+  /// The initial synthesis domain deliberately excludes identifiers because the
   /// source-level replay would otherwise need a stronger proof that rescanning
   /// the synthesized bytes cannot trigger further macro expansion.
   bool
@@ -865,8 +865,8 @@ private:
     std::optional<uint64_t> expandedMacroRootId = std::nullopt;
 
     // Normalized accepted-result carriers for the non-terminal artifacts that
-    // were composed into this final emitted edit. Step 2A is structural only:
-    // it does not change emission semantics, but it makes the proof-bearing
+    // were composed into this final emitted edit. This is structural only: it
+    // does not change emission semantics, but it makes the proof-bearing
     // source of each emitted artifact explicit at the byte-edit boundary so a
     // later universal proof gate can reason over the actual emitted surface.
     std::vector<std::shared_ptr<const AcceptedResultCandidate>>
@@ -960,8 +960,8 @@ private:
 
   /// \brief Top-level buckets for the accepted-result proof lattice.
   ///
-  /// Step 1 introduces these categories without changing refolding behavior.
-  /// They let the engine describe what class of result was accepted without
+  /// These categories let the engine describe what class of result was accepted
+  /// without changing refolding behavior or
   /// conflating that classification with candidate ranking or the legacy retry
   /// ladder.
   enum class AcceptedProofClass : uint8_t {
@@ -1069,8 +1069,8 @@ private:
 
   /// \brief Inventory of the currently accepted execution paths.
   ///
-  /// Step 2 does not change how the engine refolds code. Instead it names the
-  /// concrete path that produced an accepted result today so we can map that
+  /// This inventory does not change how the engine refolds code. Instead it
+  /// names the concrete path that produced an accepted result so we can map that
   /// path onto the future proof lattice one class at a time.
   enum class AcceptedPathKind : uint8_t {
     Unknown,
@@ -1251,8 +1251,8 @@ private:
     return "Unknown";
   }
 
-  /// \brief Step-2 inventory record that maps a current acceptance path onto
-  /// the future proof lattice.
+  /// \brief Inventory record that maps a current acceptance path onto the proof
+  /// lattice.
   struct AcceptancePathInventory {
     AcceptedPathKind currentPath = AcceptedPathKind::Unknown;
     AcceptanceSupportKind support = AcceptanceSupportKind::Unknown;
@@ -1261,7 +1261,7 @@ private:
 
   /// \brief Conflict domain used by the global accepted-result lattice.
   ///
-  /// Step 10 does not change how candidates are chosen. It names the owner
+  /// This does not change how candidates are chosen. It names the owner
   /// domain in which two accepted artifacts may interact so the current global
   /// selection and overlap rules can be described explicitly and audited in one
   /// place.
@@ -1344,7 +1344,7 @@ private:
     return "Unknown";
   }
 
-  /// \brief Normalized Step-10 description of the current global lattice law.
+  /// \brief Normalized description of the current global lattice law.
   struct GlobalSelectionLattice {
     LatticeConflictDomain domain = LatticeConflictDomain::Unknown;
     LatticeMergeLaw mergeLaw = LatticeMergeLaw::Unknown;
@@ -1354,8 +1354,8 @@ private:
   /// \brief Whether an accepted path currently participates in the declared
   /// completeness set.
   ///
-  /// Step 11 does not claim the engine is globally complete yet. Instead it
-  /// makes the scope of the completeness claim explicit: accepted paths either
+  /// This does not claim the engine is globally complete yet. Instead it makes
+  /// the scope of the completeness claim explicit: accepted paths either
   /// already correspond to a declared proof class, remain transitional while a
   /// class is still being closed, or sit outside the declared class set
   /// entirely (for example an explicit terminal out-of-domain result).
@@ -1450,7 +1450,7 @@ private:
   /// The theorem-domain view must say the same thing as the completeness view:
   /// theorem-facing carriers are either in-domain declared proof classes or
   /// explicit out-of-domain classes. Transitional states may still exist
-  /// internally, but step 3 requires them to be non-emitting staging objects.
+  /// internally, but they must remain non-emitting staging objects.
   struct TheoremDomainContract {
     TheoremDomainKind kind = TheoremDomainKind::Unknown;
     bool inDeclaredDomain = false;
@@ -1462,7 +1462,7 @@ private:
 
   /// \brief Evidence source used to justify an accepted TU anchor.
   ///
-  /// Step 7 lifts the deterministic TU anchoring rules into explicit proof
+  /// Deterministic TU anchoring rules are represented as explicit proof
   /// witnesses so accepted TU-owned insertions can explain which anchor source
   /// was used and which non-crossing facts were relied upon.
   enum class TUAnchorEvidenceKind : uint8_t {
@@ -1498,7 +1498,7 @@ private:
     return "Unknown";
   }
 
-  /// \brief Compact Step-7 witness for an accepted TU anchor.
+  /// \brief Compact witness for an accepted TU anchor.
   struct TUAnchorWitness {
     TUAnchorEvidenceKind evidence = TUAnchorEvidenceKind::Unknown;
     bool hasPPGap = false;
@@ -1528,8 +1528,8 @@ private:
   /// \brief Evidence source used to justify an accepted include-preserving
   /// anchor or mapped include byte range.
   ///
-  /// Step 8 lifts include-preserving materialization paths into explicit local
-  /// witnesses so each accepted include patch can explain which deterministic
+  /// Include-preserving materialization paths use explicit local witnesses so
+  /// each accepted include patch can explain which deterministic
   /// anchoring or mapping rule was used.
   enum class IncludeAnchorEvidenceKind : uint8_t {
     Unknown,
@@ -1561,7 +1561,7 @@ private:
     return "Unknown";
   }
 
-  /// \brief Compact Step-8 witness for an accepted include-preserving path.
+  /// \brief Compact witness for an accepted include-preserving path.
   struct IncludeAnchorWitness {
     IncludeAnchorEvidenceKind evidence = IncludeAnchorEvidenceKind::Unknown;
 
@@ -1595,8 +1595,8 @@ private:
 
   /// \brief Evidence source used to justify an accepted include realization.
   ///
-  /// Step 4A makes the include-realization domain boundary explicit. An inline
-  /// include realization is in-domain only when the include cover admits either
+  /// The include-realization domain boundary is explicit. An inline include
+  /// realization is in-domain only when the include cover admits either
   /// the canonical A-cover -> B-envelope mapping or one deterministic
   /// consensus-rescue envelope recovered from the existing non-canonical
   /// projections. Any include realization that cannot produce one of those two
@@ -1620,7 +1620,7 @@ private:
     return "Unknown";
   }
 
-  /// \brief Compact Step-9 witness for an accepted include realization path.
+  /// \brief Compact witness for an accepted include realization path.
   struct IncludeRealizationWitness {
     IncludeRealizationEvidenceKind evidence =
         IncludeRealizationEvidenceKind::Unknown;
@@ -1662,7 +1662,7 @@ private:
     return "Unknown";
   }
 
-  /// \brief Named local obligations used by Step 3 proof-discharge records.
+  /// \brief Named local obligations used by proof-discharge records.
   enum class ProofObligationKind : uint8_t {
     Unknown,
     AcceptedPathClassified,
@@ -1934,7 +1934,7 @@ private:
     return "None";
   }
 
-  /// \brief Compact record of Step 3 class-local obligation discharge.
+  /// \brief Compact record of class-local obligation discharge.
   struct ProofDischargeRecord {
     ProofDischargeStatus status = ProofDischargeStatus::Unknown;
     ProofFailureReason failureReason = ProofFailureReason::None;
@@ -1943,9 +1943,9 @@ private:
     uint16_t obligationsSatisfied = 0;
   };
 
-  /// \brief Small Step-3 helper that accumulates class-local obligations.
+  /// \brief Small helper that accumulates class-local obligations.
   ///
-  /// This remains a private implementation detail because later steps may
+  /// This remains a private implementation detail because future proof work may
   /// replace the current local-discharge bookkeeping with even stronger proof
   /// objects. Keeping the accumulator nested here lets the out-of-line
   /// implementation reuse the normalized proof types without widening
@@ -2098,8 +2098,8 @@ private:
     // byte span and owner.
     uint64_t macroId = 0;
 
-    // Step-1/2 proof-lattice migration summary. This mirrors the legacy
-    // fields below so later steps can reason about proof class, selection
+    // Proof-lattice migration summary. This mirrors the legacy fields below so
+    // later proof code can reason about proof class, selection
     // preference, and current acceptance-path inventory without rewriting
     // macro-patch behavior yet. Default-initialize the normalized proof
     // summary so aggregate construction of MacroPatch remains warning-free.
@@ -2111,7 +2111,7 @@ private:
     bool structurePreserving = false;
     uint64_t proofRootMacroId = 0;
 
-    // Step-4 first-class macro whole-cover realization certificate. These
+    // First-class macro whole-cover realization certificate. These
     // fields record the exact owner cover, containment witness, and B-side
     // token-envelope accounting used to justify realized whole-cover output.
     bool wholeCoverUsedBodyRange = false;
@@ -2180,8 +2180,8 @@ private:
   /// \brief Deterministic whole-cover realization plan for one invocation.
   ///
   /// ComputeWholeCoverPlan() proves the exact A/B token envelope that a
-  /// whole-cover realization may use. Step 4 promotes the accepted whole-cover
-  /// result into a first-class macro realization proof by copying this plan
+  /// whole-cover realization may use. The accepted whole-cover result becomes
+  /// a first-class macro realization proof by copying this plan
   /// onto the accepted MacroPatch.
   struct WholeCoverPlan {
     uint64_t covLoA = 0;
@@ -3564,6 +3564,18 @@ private:
   std::pair<size_t, size_t>
   MapAByteRangeToBTokenEnvelope(size_t aByteBegin, size_t aByteEnd) const;
 
+  /// \brief Maps an A byte range to a B token envelope while preserving
+  /// boundary insertions.
+  ///
+  /// This variant is used when the mapped range must retain B-side insertions
+  /// that occur exactly at the projected A-range boundaries. Unlike the plain
+  /// envelope mapper, it treats boundary-adjacent inserted tokens as part of
+  /// the resulting B envelope when they are associated with the mapped range
+  /// rather than with surrounding untouched text.
+  ///
+  /// \param aByteBegin The starting byte offset in source A.
+  /// \param aByteEnd The ending byte offset (exclusive) in source A.
+  /// \returns A pair representing the [begin, end) token indices in source B.
   std::pair<size_t, size_t>
   MapAByteRangeToBTokenEnvelopePreserveBoundaryInsertions(
       size_t aByteBegin, size_t aByteEnd) const;
@@ -3593,6 +3605,18 @@ private:
   std::optional<std::pair<size_t, size_t>>
   MapATokRangeAToBTokenEnvelope(uint64_t beginTok, uint64_t endTok) const;
 
+  /// \brief Maps an A token range to a B token envelope while preserving
+  /// boundary insertions.
+  ///
+  /// Converts an A-side token range into its corresponding A byte range, then
+  /// projects that range into B token space using the boundary-preserving
+  /// envelope mapper. This keeps B-side insertions that occur at the projected
+  /// range boundaries attached to the mapped token envelope when they belong to
+  /// the range being materialized.
+  ///
+  /// \param beginTok The starting token index in source A.
+  /// \param endTok The ending token index (exclusive) in source A.
+  /// \returns The B-token range if the input is valid, std::nullopt otherwise.
   std::optional<std::pair<size_t, size_t>>
   MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
       uint64_t beginTok, uint64_t endTok) const;
@@ -3634,8 +3658,8 @@ private:
   ///
   /// The canonical include-realization path uses
   /// \c MapATokRangeAToBTokenEnvelope to recover the exact B-side token
-  /// envelope for the include cover. Step 4A strengthens that witness search by
-  /// also consulting the existing deterministic rescue projections when the
+  /// envelope for the include cover. The witness search also consults the
+  /// existing deterministic rescue projections when the
   /// canonical mapping is unavailable.
   ///
   /// To stay fail-closed, this helper only accepts a rescue envelope when the
@@ -3789,27 +3813,69 @@ private:
   std::optional<WholeCoverPlan>
   ComputeWholeCoverPlan(const RefoldModel::MacroInvocation &m) const;
 
+  /// \brief Return whether an existing whole-cover patch still matches the
+  ///        current whole-cover plan.
+  ///
+  /// Reusable expanded patches are accepted only when their recorded proof
+  /// root, replacement span, clipped replacement text, containment flags, and
+  /// B-side envelope accounting agree with the plan that would be constructed
+  /// for the current root macro invocation.
+  ///
+  /// \param patch The previously built macro patch being considered for reuse.
+  /// \param plan The current whole-cover plan for the root macro invocation.
+  /// \param rootMacroId The proof-root macro id that the patch must match.
+  /// \returns True if \p patch is the same whole-cover realization described by
+  ///          \p plan.
   bool WholeCoverPatchMatchesPlan(const MacroPatch &patch,
                                   const WholeCoverPlan &plan,
                                   uint64_t rootMacroId) const;
 
-  /// \brief Normalize the current hunk owner into the certificate shape used
-  ///        for structural macro patch continuity.
+  /// \brief Build the owner certificate used for macro patch continuity.
+  ///
+  /// Re-classifies the hunk owner in the current TU context and normalizes it
+  /// into the non-mixed owner shape stored on macro patches. This gives later
+  /// same-root reuse and merge checks a stable owner witness instead of relying
+  /// only on byte spans or macro ids.
+  ///
+  /// \param tuPath The translation-unit source path used for owner lookup.
+  /// \param h The token hunk whose owner is being normalized.
+  /// \returns The normalized owner certificate for \p h.
   Owner NormalizeHunkOwnerForPatch(StringRef tuPath,
                                    const diffutils::Hunk &h) const;
 
-  /// \brief Return whether a macro patch carries the same non-mixed owner
-  ///        certificate as the current hunk owner.
+  /// \brief Return whether a macro patch belongs to the same normalized owner.
+  ///
+  /// Compares the owner certificate carried by \p patch with the owner inferred
+  /// for the current hunk. Mixed or missing owner evidence does not match; this
+  /// predicate is used to prevent patch reuse or merge across distinct include
+  /// or TU ownership domains.
+  ///
+  /// \param patch The macro patch whose stored owner witness is being checked.
+  /// \param owner The normalized owner certificate for the current hunk.
+  /// \returns True if \p patch and \p owner describe the same non-mixed owner.
   bool MacroPatchOwnerMatches(const MacroPatch &patch,
                               const Owner &owner) const;
 
-  /// \brief Preserve any prior owner certificate from \p src on \p dst.
+  /// \brief Copy an existing macro patch owner certificate onto another patch.
+  ///
+  /// Used when a candidate patch is derived from or merged with an already
+  /// accepted patch and must preserve that patch's owner witness for later
+  /// continuity checks and theorem audit.
+  ///
+  /// \param dst The patch receiving the owner certificate.
+  /// \param src The patch whose owner certificate should be preserved.
   void CarryMacroPatchOwnerCertificate(MacroPatch &dst,
                                        const MacroPatch &src) const;
 
-  /// \brief Stamp the current owner witness onto a macro patch.
-  void StampMacroPatchOwnerWitness(MacroPatch &patch,
-                                   const Owner &owner) const;
+  /// \brief Stamp a normalized owner witness onto a macro patch.
+  ///
+  /// Records the owner certificate for the patch at construction time so later
+  /// reuse, merge, and expanded-patch stabilization checks can verify that the
+  /// patch still belongs to the same ownership domain.
+  ///
+  /// \param patch The macro patch to annotate.
+  /// \param owner The normalized owner certificate to store on \p patch.
+  void StampMacroPatchOwnerWitness(MacroPatch &patch, const Owner &owner) const;
 
   /// \brief Build the normalized proof summary for a macro patch.
   ///
@@ -3819,7 +3885,7 @@ private:
   /// chosen patch through this same summary for auditability.
   ProofSummary ClassifyMacroPatchProof(const MacroPatch &patch) const;
 
-  /// \brief Synchronize the Step-1 proof summary with the legacy macro patch
+  /// \brief Synchronize the normalized proof summary with the legacy macro patch
   /// proof fields.
   ///
   /// During the migration, the legacy fields remain the behaviorally
@@ -3827,13 +3893,26 @@ private:
   /// proof summary so later steps can switch over incrementally.
   void SyncMacroPatchProofSummary(MacroPatch &patch) const;
 
-  /// \brief Assign a macro patch proof in one place and update the normalized
-  /// proof summary at the same time.
+  /// \brief Stamp proof metadata onto a macro patch.
+  ///
+  /// Centralizes the update of both the legacy proof fields and the normalized
+  /// proof summary used by accepted-result selection and proof discharge. Use
+  /// this helper whenever a macro patch's proof kind, validation status,
+  /// structure-preservation class, or proof root is assigned so those views
+  /// cannot drift apart.
+  ///
+  /// \param patch The macro patch to annotate.
+  /// \param kind The proof class that justifies the patch.
+  /// \param validated Whether the patch has discharged its local validation
+  ///        obligations.
+  /// \param structurePreserving Whether the proof preserves source invocation
+  ///        structure rather than realizing expansion text.
+  /// \param proofRootMacroId The root macro invocation id for the proof tree.
   void StampMacroPatchProof(MacroPatch &patch, MacroPatchProofKind kind,
                             bool validated, bool structurePreserving,
                             uint64_t proofRootMacroId) const;
 
-  /// \brief Materialize the explicit Step-4 whole-cover realization proof.
+  /// \brief Materialize the explicit whole-cover realization proof.
   ///
   /// Whole-cover output is no longer tracked as an anonymous fallback result.
   /// This helper stamps the accepted patch as a first-class invocation
@@ -3843,22 +3922,36 @@ private:
       MacroPatch &patch, const WholeCoverPlan &plan,
       uint64_t proofRootMacroId) const;
 
-  /// \brief Classify the current accepted path inventory for a macro patch.
+  /// \brief Build the accepted-path inventory for a macro patch.
+  ///
+  /// Reads the patch's stamped proof metadata and classifies it into the
+  /// normalized accepted path used by the theorem-audit and proof-discharge
+  /// machinery. This is the macro-patch-specific entry point before the generic
+  /// accepted-path inventory mapping is applied.
+  ///
+  /// \param patch The macro patch whose proof metadata should be classified.
+  /// \returns The accepted-path inventory for \p patch.
   AcceptancePathInventory
   InventoryMacroPatchAcceptancePath(const MacroPatch &patch) const;
 
-  /// \brief Complete the Step-2 inventory mapping for a named accepted path.
+  /// \brief Map an accepted path to its proof-discharge inventory.
   ///
-  /// This centralizes the mapping from "how the engine accepts a result
-  /// today" to "which future proof class should replace that path."
+  /// Centralizes the mapping from the engine's current accepted-result path to
+  /// the future theorem-facing proof target that is expected to discharge it.
+  /// Validators use this inventory to check that each accepted result is both
+  /// classified and assigned to a declared proof class.
+  ///
+  /// \param currentPath The accepted path currently used by the engine.
+  /// \returns The inventory record for \p currentPath, including its future
+  ///          proof target.
   AcceptancePathInventory
   BuildAcceptancePathInventory(AcceptedPathKind currentPath) const;
 
   /// \brief Build a normalized proof summary for a concrete accepted path.
   ///
-  /// Step 3 uses this helper to attach class-local obligation/discharge
-  /// metadata to non-macro accepted paths such as include anchors and TU
-  /// anchors. Later steps may supply an explicit TU/include witness so the
+  /// This helper attaches class-local obligation/discharge metadata to
+  /// non-macro accepted paths such as include anchors and TU anchors. Callers
+  /// may supply an explicit TU/include witness so the
   /// accepted-path audit can report the exact deterministic anchor or mapped
   /// byte range that was used. When \p patch is null, only obligations that
   /// can be discharged from the path classification itself are evaluated.
@@ -3884,7 +3977,7 @@ private:
 
   /// \brief Compute the current global lattice law for an accepted summary.
   ///
-  /// Step 10 centralizes the merge/conflict policy that already exists across
+  /// Centralize the merge/conflict policy that already exists across
   /// macro, include, TU-anchor, and terminal-fallback paths. Patch B starts
   /// using that lattice at converted competition sites; later work will still
   /// be needed before every selector in the engine is routed through it.
@@ -3916,18 +4009,26 @@ private:
   /// Patch B uses this comparator directly at the converted selection sites.
   /// The ordering is deterministic and stable-on-ties so equal summaries can
   /// preserve the existing caller-supplied precedence order.
-  bool LatticePrefers(const ProofSummary &lhs,
-                      const ProofSummary &rhs) const;
+  bool LatticePrefers(const ProofSummary &lhs, const ProofSummary &rhs) const;
 
-  /// \brief Wrap an already-accepted macro patch in the normalized candidate
-  /// carrier introduced by Patch A.
+  /// \brief Build an accepted-result candidate for a macro patch.
+  ///
+  /// Packages an already constructed macro patch with its normalized accepted
+  /// path, proof-discharge inventory, proof summary, and macro-patch audit
+  /// metadata. This is the macro-specific candidate wrapper used by final
+  /// selection, theorem audit, and proof discharge.
+  ///
+  /// \param patch The macro patch whose stamped proof metadata should be
+  /// wrapped
+  ///        as an accepted-result candidate.
+  /// \returns The normalized accepted-result candidate for \p patch.
   AcceptedResultCandidate
   BuildAcceptedMacroCandidate(const MacroPatch &patch) const;
 
   /// \brief Wrap a macro patch in the discharged carrier used at the actual
   /// byte-edit emission boundary.
   ///
-  /// Step 2 separates selector admissibility from emitted semantic proof for
+  /// Separate selector admissibility from emitted semantic proof for
   /// nested invocation-preserving macro artifacts. Selector competition still
   /// uses BuildAcceptedMacroCandidate(), which retains the top-level proof-root
   /// obligation for final competition. Once a nested preserving artifact has
@@ -3939,34 +4040,86 @@ private:
   AcceptedResultCandidate
   BuildAcceptedEmittedMacroCandidate(const MacroPatch &patch) const;
 
-  /// \brief Wrap an already-accepted include path in the normalized candidate
-  /// carrier introduced by Patch A.
+  /// \brief Build an accepted-result candidate for an include-preserving or
+  ///        include-realization path.
+  ///
+  /// Packages an already constructed include patch with its normalized accepted
+  /// path, proof-discharge inventory, and optional include witnesses. Include
+  /// preserving paths should provide an anchor witness; inline/materialized
+  /// realization paths should provide the corresponding realization witness.
+  ///
+  /// \param currentPath The accepted include path represented by \p patch.
+  /// \param patch The include patch being wrapped for selection/audit.
+  /// \param includeAnchorWitness Optional anchor witness for include-preserving
+  ///        paths.
+  /// \param includeRealizationWitness Optional realization witness for include
+  ///        realization paths.
+  /// \returns The normalized accepted-result candidate for the include result.
   AcceptedResultCandidate BuildAcceptedIncludeCandidate(
       AcceptedPathKind currentPath, const IncludePatch &patch,
       const IncludeAnchorWitness *includeAnchorWitness = nullptr,
-      const IncludeRealizationWitness *includeRealizationWitness = nullptr)
-      const;
+      const IncludeRealizationWitness *includeRealizationWitness =
+          nullptr) const;
 
-  /// \brief Wrap an emitted include realization in the normalized candidate
-  /// carrier.
+  /// \brief Build an accepted-result candidate for an emitted include
+  ///        realization.
+  ///
+  /// Used when the engine materializes an include expansion directly rather
+  /// than carrying an `IncludePatch` from the ordinary include-patch path. The
+  /// include item identifies the realized include, while the optional witness
+  /// records the realization envelope or materialization evidence.
+  ///
+  /// \param currentPath The include realization path being emitted.
+  /// \param include The include item whose expansion was realized.
+  /// \param includeRealizationWitness Optional witness describing the
+  ///        realization evidence.
+  /// \returns The normalized accepted-result candidate for the emitted include
+  ///          realization.
   AcceptedResultCandidate BuildAcceptedIncludeRealizationCandidate(
       AcceptedPathKind currentPath, const RefoldModel::IncludeItem &include,
-      const IncludeRealizationWitness *includeRealizationWitness = nullptr)
-      const;
+      const IncludeRealizationWitness *includeRealizationWitness =
+          nullptr) const;
 
-  /// \brief Wrap an already-accepted TU anchor in the normalized candidate
-  /// carrier introduced by Patch A.
-  AcceptedResultCandidate BuildAcceptedTUAnchorCandidate(
-      AcceptedPathKind currentPath, const TUAnchorWitness &witness) const;
+  /// \brief Build an accepted-result candidate for a TU anchor edit.
+  ///
+  /// Packages a TU exact-slot or provable-insertion anchor witness into the
+  /// normalized candidate form used by final selection, theorem audit, and
+  /// proof discharge.
+  ///
+  /// \param currentPath The TU anchor accepted path.
+  /// \param witness The local TU anchor witness that justifies the insertion
+  ///        point.
+  /// \returns The normalized accepted-result candidate for the TU anchor.
+  AcceptedResultCandidate
+  BuildAcceptedTUAnchorCandidate(AcceptedPathKind currentPath,
+                                 const TUAnchorWitness &witness) const;
 
-  /// \brief Wrap a direct TU byte-span edit in the normalized candidate
-  /// carrier.
+  /// \brief Build an accepted-result candidate for a direct TU byte-span edit.
+  ///
+  /// Represents a theorem-facing TU text edit whose source byte range is
+  /// already known. The optional payload preview is diagnostic/audit metadata
+  /// only; the candidate identity is the accepted path plus byte span.
+  ///
+  /// \param currentPath The TU byte-span accepted path.
+  /// \param begin The starting TU byte offset.
+  /// \param end The ending TU byte offset, exclusive.
+  /// \param payloadPreview Optional shortened replacement payload for audit
+  ///        diagnostics.
+  /// \returns The normalized accepted-result candidate for the TU byte edit.
   AcceptedResultCandidate BuildAcceptedTUTextEditCandidate(
       AcceptedPathKind currentPath, uint64_t begin, uint64_t end,
       StringRef payloadPreview = StringRef()) const;
 
-  /// \brief Wrap the explicit terminal out-of-domain result in the normalized
-  /// candidate carrier introduced by Patch A.
+  /// \brief Build an accepted-result candidate for terminal fallback.
+  ///
+  /// Wraps the explicit out-of-domain terminal result in the same normalized
+  /// candidate structure as ordinary accepted results. This keeps terminal
+  /// fallback visible to selection, theorem audit, and proof-discharge
+  /// reporting instead of treating it as an implicit escape path.
+  ///
+  /// \param witness The terminal fallback witness describing the fallback kind
+  ///        and primary reason.
+  /// \returns The normalized accepted-result candidate for terminal fallback.
   AcceptedResultCandidate
   BuildAcceptedTerminalCandidate(const TerminalFallbackWitness &witness) const;
 
@@ -3995,7 +4148,7 @@ private:
   /// \brief Return whether \p candidate failed only the nested-macro
   /// top-level selector rule.
   ///
-  /// Step 1 removes the last direct macro-selector bypass by letting nested
+  /// Remove the last direct macro-selector bypass by letting nested
   /// DAG/callsite preservation artifacts flow through the explicit candidate
   /// selector instead of returning them directly. Those intermediate nested
   /// artifacts are still rejected by the theorem-facing discharge rule that
@@ -4022,7 +4175,7 @@ private:
 
   /// \brief Return whether \p m carries usable producer-side paste witnesses.
   ///
-  /// Step 5 serialized the producer's exact `##` decomposition into the model.
+  /// The producer's exact `##` decomposition is serialized into the model.
   /// Patch C may discharge a paste-preserving args-only class from either of
   /// two deterministic proof sources: a usable producer-side root witness
   /// stream, checked here, or an explicit direct replay check recorded on the
@@ -4054,7 +4207,7 @@ private:
   /// \brief Validate the emitted semantic proof contract for a preserving
   /// macro patch.
   ///
-  /// Step 2 removes the byte-edit boundary's selector-only exception by
+  /// Remove the byte-edit boundary's selector-only exception by
   /// rebuilding emitted nested preserving macro carriers under this validator.
   /// It discharges the same semantic obligations as
   /// ValidateInvocationPreservingProof(), but it does not re-impose the
@@ -4062,13 +4215,42 @@ private:
   /// for final selection.
   ProofDischargeRecord
   ValidateEmittedInvocationPreservingProof(const MacroPatch &patch) const;
+
+  /// \brief Discharge the proof obligations for a macro invocation-realization
+  ///        patch.
+  ///
+  /// Validates that the macro patch is classified as a realization path rather
+  /// than an invocation-preserving path, carries a tracked proof root, and has
+  /// the proof metadata required by its realization class. Whole-cover
+  /// realization patches must additionally record their A/B envelopes,
+  /// containment status, and boundary-accounting metadata.
+  ///
+  /// \param patch The macro patch whose realization proof metadata should be
+  ///        validated.
+  /// \returns The proof-discharge record containing all satisfied and failed
+  ///          obligations.
   ProofDischargeRecord
   ValidateInvocationRealizationProof(const MacroPatch &patch) const;
+
+  /// \brief Discharge the proof obligations for an include-preserving path.
+  ///
+  /// Validates that the accepted include path is classified, mapped to a future
+  /// proof target, backed by an include patch shape, and justified by the
+  /// anchor witness required for that specific include-preserving path. This
+  /// covers mapped-header replacement/deletion and the supported include
+  /// insertion-anchor classes.
+  ///
+  /// \param currentPath The include-preserving accepted path being validated.
+  /// \param patch The include patch shape being discharged.
+  /// \param witness Optional anchor witness for the include path.
+  /// \returns The proof-discharge record containing all satisfied and failed
+  ///          obligations.
   ProofDischargeRecord ValidateIncludePreservingProof(
       AcceptedPathKind currentPath, const IncludePatch *patch,
       const IncludeAnchorWitness *witness = nullptr) const;
+
   /// \brief Return whether an include-realization witness is inside the
-  /// declared Step-4A realization domain.
+  /// declared include-realization domain.
   ///
   /// Inline include realization is first-class only when the witness records a
   /// canonical B-cover envelope or a deterministic consensus-rescued B-cover
@@ -4076,17 +4258,45 @@ private:
   /// domain and must surface only through the explicit terminal fallback.
   bool IsAcceptedIncludeRealizationEvidenceKind(
       IncludeRealizationEvidenceKind kind) const;
+
+  /// \brief Discharge the proof obligations for an include-realization path.
+  ///
+  /// Validates that the accepted path is one of the declared include
+  /// realization classes and is mapped to a future proof target. Inline
+  /// realization from B must additionally carry a realization witness that
+  /// identifies the include, the A-side cover, and the B-token envelope used to
+  /// materialize the replacement.
+  ///
+  /// \param currentPath The include-realization accepted path being validated.
+  /// \param patch Optional include patch associated with the realization path.
+  /// \param witness Optional realization witness for inline/materialized
+  ///        include evidence.
+  /// \returns The proof-discharge record containing all satisfied and failed
+  ///          obligations.
   ProofDischargeRecord ValidateIncludeRealizationProof(
       AcceptedPathKind currentPath, const IncludePatch *patch,
       const IncludeRealizationWitness *witness = nullptr) const;
-  ProofDischargeRecord ValidateTUAnchorProof(
-      AcceptedPathKind currentPath,
-      const TUAnchorWitness *witness = nullptr) const;
+
+  /// \brief Discharge the proof obligations for a TU anchor path.
+  ///
+  /// Validates that the accepted path is a TU exact-slot or provable-insertion
+  /// anchor and that it carries the local witness fields required by that
+  /// anchor class. Exact-slot anchors must identify the matched slot, while
+  /// provable insertion anchors must record the supporting neighbor,
+  /// include-boundary, macro, or corroborated-owner evidence.
+  ///
+  /// \param currentPath The TU anchor accepted path being validated.
+  /// \param witness Optional TU anchor witness describing the insertion point.
+  /// \returns The proof-discharge record containing all satisfied and failed
+  ///          obligations.
+  ProofDischargeRecord
+  ValidateTUAnchorProof(AcceptedPathKind currentPath,
+                        const TUAnchorWitness *witness = nullptr) const;
 
   /// \brief Format concrete proof witnesses for tracing.
   /// \brief Format a concrete TU anchor witness for tracing.
   ///
-  /// Step 7 records the exact deterministic TU evidence used to justify a
+  /// Record the exact deterministic TU evidence used to justify a
   /// successful TU anchor. This formatter keeps that witness readable in the
   /// same audit stream as the normalized proof/discharge metadata.
   std::string FormatTUAnchorWitness(const TUAnchorWitness &witness) const;
@@ -4097,7 +4307,7 @@ private:
 
   /// \brief Format a concrete include-realization witness for tracing.
   ///
-  /// Step 9 records the exact deterministic include cover and mapped B-token
+  /// Record the exact deterministic include cover and mapped B-token
   /// envelope used when the engine realizes an include directly from the
   /// modified preprocessed surface. This formatter keeps that witness readable
   /// in the same audit stream as the normalized proof/discharge metadata.
@@ -4105,13 +4315,21 @@ private:
   FormatIncludeRealizationWitness(
       const IncludeRealizationWitness &witness) const;
 
-  /// \brief Build the explicit terminal-fallback witness for the current pass.
+  /// \brief Build the terminal-fallback witness for the current refold pass.
+  ///
+  /// Captures the terminal fallback kind, the number of fallback requests, and
+  /// the primary recorded reason for falling out of the declared refolding
+  /// domain. The resulting witness is used to make terminal fallback explicit
+  /// in accepted-result selection, theorem audit, and proof-discharge
+  /// reporting.
+  ///
+  /// \returns The terminal fallback witness for the current pass.
   TerminalFallbackWitness BuildTerminalFallbackWitness() const;
 
   /// \brief Return whether the hunk lies on the explicit unresolved-owner
   /// / no-TU-anchor theorem boundary.
   ///
-  /// Step 5 chooses the conservative domain-wall interpretation for the last
+  /// Use the conservative domain-wall interpretation for the last
   /// ownership gap. This predicate does not search for any new witness. It only
   /// re-states the evidence that has already been exhausted:
   ///
@@ -4138,19 +4356,19 @@ private:
       size_t hunkIndex, const diffutils::Hunk &h, StringRef tuPath,
       const Owner &owner, bool mapsToTU) const;
 
-  /// \brief Format the Step-2 acceptance-path inventory for tracing.
+  /// \brief Format the acceptance-path inventory for tracing.
   std::string
   FormatAcceptancePathInventory(const AcceptancePathInventory &inventory) const;
 
-  /// \brief Format a Step-3 proof-discharge record for tracing.
+  /// \brief Format a proof-discharge record for tracing.
   std::string
   FormatProofDischargeRecord(const ProofDischargeRecord &record) const;
 
-  /// \brief Format the normalized Step-10 lattice law for tracing.
+  /// \brief Format the normalized lattice law for tracing.
   std::string
   FormatGlobalSelectionLattice(const GlobalSelectionLattice &lattice) const;
 
-  /// \brief Format the normalized Step-11 completeness contract for tracing.
+  /// \brief Format the normalized completeness contract for tracing.
   std::string
   FormatCompletenessContract(const CompletenessContract &contract) const;
 
@@ -4160,8 +4378,8 @@ private:
 
   /// \brief Format the normalized accepted-path audit for tracing.
   ///
-  /// TU anchor paths do not materialize through IncludePatch, so Step 7 allows
-  /// callers to provide an explicit TU witness directly when formatting an
+  /// TU anchor paths do not materialize through IncludePatch, so callers may
+  /// provide an explicit TU witness directly when formatting an
   /// accepted-path audit entry.
   std::string FormatAcceptedPathAudit(
       AcceptedPathKind currentPath, const IncludePatch *patch = nullptr,
@@ -4177,6 +4395,16 @@ private:
   /// \brief Format patch provenance and subtree-composition audit metadata.
   std::string FormatMacroPatchAudit(const MacroPatch &patch) const;
 
+  /// \brief Build the replacement text for a macro whole-cover realization.
+  ///
+  /// Computes the same whole-cover plan used by macro patch construction and
+  /// returns its clipped replacement text. This helper is for callers that need
+  /// the materialized whole-cover text without constructing a full
+  /// `MacroPatch`.
+  ///
+  /// \param m The macro invocation whose whole expansion should be realized.
+  /// \returns The planned replacement text if a valid whole-cover plan exists;
+  ///          std::nullopt otherwise.
   std::optional<std::string>
   BuildWholeCoverReplacementText(const RefoldModel::MacroInvocation &m) const;
 
@@ -4425,11 +4653,22 @@ private:
           &includeExpansionAcceptedResults,
       DenseSet<uint64_t> *appliedExpandedMacroRootIds = nullptr) const;
 
-  // Realize an include directly from the edited preprocessed stream B. This is
-  // the single-pass include-realization path used when local include
-  // preservation cannot discharge a deterministic anchored edit plan.
-  std::optional<std::string>
-  BuildInlineIncludeRealizationFromB(
+  /// \brief Realize an include directly from the edited preprocessed stream B.
+  ///
+  /// Builds the single-pass include-realization replacement used when local
+  /// include preservation cannot discharge a deterministic anchored edit plan.
+  /// The realization is taken from the include's B-side token envelope and,
+  /// when requested, records the accepted-result candidate/witness that
+  /// justifies the emitted materialization.
+  ///
+  /// \param inc The include item whose expansion should be realized.
+  /// \param reason Diagnostic context explaining why inline realization was
+  ///        selected.
+  /// \param acceptedCandidate Optional output slot for the normalized accepted
+  ///        result candidate associated with this realization.
+  /// \returns The realized include replacement text if construction succeeds;
+  ///          std::nullopt otherwise.
+  std::optional<std::string> BuildInlineIncludeRealizationFromB(
       const RefoldModel::IncludeItem &inc, llvm::StringRef reason,
       AcceptedResultCandidate *acceptedCandidate = nullptr) const;
 
@@ -4621,7 +4860,7 @@ private:
   /// \param file The header file path whose text is being edited; only child
   ///             includes whose `sitePath` equals `file` are considered as
   ///             anchors.
-  /// \param witness Optional Step-8 witness sink that records which child
+  /// \param witness Optional witness sink that records which child
   ///               boundary was chosen when the fallback succeeds.
   /// \return A byte offset within `file` at which the insertion should be
   ///         applied, or `std::nullopt` if this fallback does not apply or no
@@ -4674,7 +4913,7 @@ private:
   /// 1. Computes the logical resume line for the first character at `end` in
   ///    the original file,
   /// 2. Attempts a local resync by calling
-  ///    LineDirectiveInserter::maybeAppendResyncAfterReplacement,
+  ///    LineDirectiveInserter::MaybeAppendResyncAfterReplacement,
   /// 3. If local injection succeeds, returns (injectedReplacement, nullopt),
   /// 4. Otherwise, returns (replacement, PendingResync(fileSpelling)) so the
   ///    emission layer can flush a #line directive at the next safe BOL.
@@ -4734,8 +4973,8 @@ private:
   /// \brief Return whether an emitted non-terminal byte edit is backed only by
   /// emission-discharged normalized accepted-result carriers.
   ///
-  /// Step 2 makes proof discharge the universal gate at the actual emission
-  /// boundary. Every non-terminal artifact that survives to a TextEdit must
+  /// Proof discharge is the universal gate at the actual emission boundary.
+  /// Every non-terminal artifact that survives to a TextEdit must
   /// carry at least one normalized accepted-result candidate, and every such
   /// carrier must already be fully discharged under the proof contract that is
   /// appropriate for emitted source text. Terminal out-of-domain results are
@@ -4744,9 +4983,20 @@ private:
       const TextEdit &edit, StringRef emissionPhase,
       StringRef emissionOwner = StringRef()) const;
 
-  /// \brief Copy one normalized accepted-result carrier onto an emitted edit.
-  void AttachAcceptedResultCarrier(
-      TextEdit &edit, const AcceptedResultCandidate &candidate) const;
+  /// \brief Attach accepted-result metadata to an emitted text edit.
+  ///
+  /// Copies the normalized accepted-result carrier selected by the proof
+  /// lattice onto the concrete `TextEdit` that will be emitted. This preserves
+  /// the accepted path, proof-discharge inventory, witnesses, and audit
+  /// metadata at the byte-edit boundary so later validation/reporting can
+  /// reason about the emitted edit without re-running candidate selection.
+  ///
+  /// \param edit The emitted text edit to annotate.
+  /// \param candidate The accepted-result candidate whose carrier metadata
+  ///        should be copied onto \p edit.
+  void
+  AttachAcceptedResultCarrier(TextEdit &edit,
+                              const AcceptedResultCandidate &candidate) const;
 
   /// \brief Appends an unchanged slice of the original file original[from:to)
   /// into out, while attempting to flush a previously-deferred PendingResync at

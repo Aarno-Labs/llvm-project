@@ -5,7 +5,7 @@
 // preprocessor. The model captures the logical mapping between preprocessor
 // constructs in the original source (A) and the corresponding constructs in the
 // edited preprocessed stream (B).
- //
+//
 // The RefoldModel serves as a stable, deterministic schema layer over the
 // untyped JSON representation, providing strongly typed access to:
 //   - Include items (#include, #include_next directives)
@@ -17,7 +17,7 @@
 //
 // Author:
 //   jeikenberry
- //
+//
 //===----------------------------------------------------------------------===//
 
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDMODEL_H
@@ -498,6 +498,7 @@ public:
   };
 
   // =============================== Conditionals ==============================
+
   struct CondArm {
     uint64_t id;
     uint64_t groupId; // owning CondGroup id
@@ -643,6 +644,12 @@ public:
   }
 
   // --- Slot queries ---
+  /// Return all slots matching the supplied exact-match filters.
+  ///
+  /// Each engaged optional is a required equality predicate; each disengaged
+  /// optional is a wildcard. Results are returned in deterministic source order
+  /// (byte range, optional PP index, then slot id), matching the implementation
+  /// in RefoldModel.cpp.
   std::vector<const Slot *>
   FindSlots(std::optional<StringRef> file, std::optional<StringRef> kind,
             std::optional<uint64_t> ref,
@@ -675,6 +682,11 @@ public:
     return it->second;
   }
 
+  /// Map a half-open A-token span to the producer tokmap entries it contains.
+  ///
+  /// Invalid spans return an empty vector. Missing PP indices are skipped rather
+  /// than synthesized, because not every preprocessed token is guaranteed to
+  /// have a concrete source spelling in tokmap.
   std::vector<TokMapEntry> MapSpan(const PPSpan &span) const;
 
 private:

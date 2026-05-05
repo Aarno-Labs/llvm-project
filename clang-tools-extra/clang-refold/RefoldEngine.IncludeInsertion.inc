@@ -16,19 +16,19 @@ RefoldEngine::ResolveIncludeRealizationBTokenEnvelope(
     uint64_t beginTok, uint64_t endTok,
     IncludeRealizationEvidenceKind *evidenceKind) const {
   if (auto canonical = MapATokRangeAToBTokenEnvelope(beginTok, endTok)) {
-    // The strongest in-domain witness is the canonical A-cover -> B-envelope
-    // mapping. Record that fact explicitly so the include-realization class
-    // predicate can distinguish canonical witnesses from the deterministic
-    // consensus-rescue fallback below.
+    // Prefer the ordinary A-cover -> B-envelope projection. This is the
+    // canonical include-realization witness because it follows the same mapping
+    // path used for normal A-token covers and needs no rescue consensus.
     if (evidenceKind)
       *evidenceKind = IncludeRealizationEvidenceKind::CanonicalBCoverEnvelope;
     return canonical;
   }
 
-  // Step 4A keeps unresolved include envelopes as an explicit domain wall.
-  // When the canonical mapper cannot recover the B envelope, consult the
-  // existing deterministic rescue projections and accept them only if the
-  // usable projections agree on one non-empty B-token envelope.
+  // If the canonical mapper cannot recover a B envelope, try the deterministic
+  // rescue projections. The include realization is still accepted only when all
+  // usable rescue projections agree on one non-empty B-token envelope. A
+  // missing projection is allowed; conflicting usable projections are a domain
+  // wall.
   auto isUsableEnvelope =
       [&](const std::optional<std::pair<size_t, size_t>> &env) -> bool {
     if (!env || env->second <= env->first)
@@ -47,6 +47,8 @@ RefoldEngine::ResolveIncludeRealizationBTokenEnvelope(
   bool sawUsableRescue = false;
   bool conflict = false;
 
+  // Add one rescue projection to the consensus set. Unusable envelopes are
+  // diagnostic-only; usable envelopes must all equal the first usable envelope.
   auto consider = [&](StringRef label,
                       const std::optional<std::pair<size_t, size_t>> &env) {
     if (!isUsableEnvelope(env)) {
@@ -64,6 +66,7 @@ RefoldEngine::ResolveIncludeRealizationBTokenEnvelope(
           label, beginTok, endTok, env->first, env->second,
           stringutils::showWSWithClip(SliceBSource(env->first, env->second),
                                       120));
+
     if (!consensus) {
       consensus = *env;
       return;
@@ -76,6 +79,8 @@ RefoldEngine::ResolveIncludeRealizationBTokenEnvelope(
   consider("preserve-boundary-insertions", preserveBoundary);
   consider("trim-edge-insertions", trimEdge);
 
+  // Fail closed if no deterministic rescue produced material text, or if the
+  // rescue projections disagree about the B-side envelope.
   if (!sawUsableRescue || conflict || !consensus)
     return std::nullopt;
 

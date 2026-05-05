@@ -135,10 +135,9 @@ RefoldEngine::ParseMacroInvocationArgContentRanges(StringRef invText) {
   std::vector<std::pair<size_t, size_t>> out;
   size_t n = invText.size();
 
-  // Special-case: empty argument list "()" (or only whitespace/comments inside)
-  // means *zero* arguments. The previous logic treated this as a single empty
-  // argument, which is incorrect for C/C++ macro calls and breaks args-only
-  // lifting for zero-arg call chains like "PICK1()(10)".
+  // Special-case: an empty argument list "()" (or only whitespace/comments
+  // inside) denotes zero macro arguments, not one empty argument. That matters
+  // for args-only lifting of zero-arg call chains such as "PICK1()(10)".
   const size_t afterOpen = open + 1;
   const size_t firstTok = stringutils::skipWSAndComments(invText, afterOpen);
   if (firstTok < n && invText[firstTok] == ')')
