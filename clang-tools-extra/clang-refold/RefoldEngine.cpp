@@ -1515,6 +1515,70 @@ std::string RefoldEngine::RunSinglePassRefold() {
   abTokMapA2B_ = a2b;
   abTokMapB2A_ = b2a;
 
+  /// Return true when extending a TU byte replacement from `oldEnd` to
+  /// `extEnd` would not consume any stable A-token whose selected B-side mate
+  /// remains outside the current hunk's B-token replacement interval.
+  ///
+  /// Chained-call extension is a byte-level convenience: it lets a replacement
+  /// consume a following `(…)` suffix when the replacement itself already owns
+  /// that call surface. It is not allowed to steal original call-argument
+  /// tokens that the A/B LCS still treats as stable outside this hunk. When
+  /// such a stable token exists, the caller must preserve the original suffix
+  /// and let any separate insertion/replacement hunk compose at its own proven
+  /// byte anchor.
+  auto tuExtensionIsBTokenClosed = [&](uint64_t aTokStart, uint64_t oldEnd,
+                                       uint64_t extEnd, uint64_t bStart,
+                                       uint64_t bEnd) -> bool {
+    if (extEnd <= oldEnd)
+      return true;
+    if (abTokMapA2B_.empty())
+      return false;
+
+    const uint64_t tokCount = static_cast<uint64_t>(aToks_.size());
+    for (uint64_t aTok = std::min(aTokStart, tokCount); aTok < tokCount;
+         ++aTok) {
+      std::optional<std::pair<uint64_t, uint64_t>> span =
+          TUByteSpan(aTok, aTok + 1, tuPath);
+      if (!span)
+        continue;
+
+      if (span->second <= oldEnd)
+        continue;
+      if (span->first >= extEnd)
+        break;
+
+      // A partial-token overlap would mean the byte extension cut through an
+      // A token. There is no token-closure proof for that shape, so preserve
+      // the suffix rather than widening the edit.
+      if (span->first < oldEnd || extEnd < span->second) {
+        debug("edit/tu",
+              "preserve trailing call/arg chain [{0},{1}) because extension "
+              "would partially consume A token {2} span=[{3},{4})",
+              oldEnd, extEnd, aTok, span->first, span->second);
+        return false;
+      }
+
+      if (aTok >= static_cast<uint64_t>(abTokMapA2B_.size()))
+        return false;
+
+      const int64_t mappedB = abTokMapA2B_[static_cast<size_t>(aTok)];
+      if (mappedB < 0)
+        continue;
+
+      if (static_cast<uint64_t>(mappedB) < bStart ||
+          static_cast<uint64_t>(mappedB) >= bEnd) {
+        debug("edit/tu",
+              "preserve trailing call/arg chain [{0},{1}) because consumed "
+              "A token {2} maps to B token {3} outside replacement "
+              "B[{4},{5})",
+              oldEnd, extEnd, aTok, mappedB, bStart, bEnd);
+        return false;
+      }
+    }
+
+    return true;
+  };
+
   size_t trimmedEdgeMatched = 0;
   for (auto &h : hunks) {
     if (!h.isInsertOnly())
@@ -2581,12 +2645,17 @@ std::string RefoldEngine::RunSinglePassRefold() {
         }
 
         // If our TU span stops at an identifier and is immediately followed by
-        // a "(...)" chain, decide whether to consume it or preserve it based on
-        // the replacement.
+        // a "(...)" chain, consume that suffix only when token provenance proves
+        // the suffix belongs to this hunk's B-side replacement interval.  This
+        // prevents a wrapper-name replacement from swallowing the original
+        // argument list while a separate insertion hunk still targets a byte
+        // inside that argument list.
         if (span->first < span->second) {
           const uint64_t oldEnd = span->second;
           const uint64_t extEnd = extendChainedCallEnd(tuBytes, oldEnd, repl);
-          if (extEnd != oldEnd) {
+          if (extEnd != oldEnd &&
+              tuExtensionIsBTokenClosed(h.aEnd, oldEnd, extEnd, h.bStart,
+                                        h.bEnd)) {
             debug("edit/tu",
                   "TU extend trailing call/arg chain [{0},{1}) -> [{0},{2})",
                   span->first, oldEnd, extEnd);
@@ -2797,12 +2866,15 @@ std::string RefoldEngine::RunSinglePassRefold() {
       }
 
       // If our TU span stops at an identifier and is immediately followed by a
-      // "(...)" chain, decide whether to consume it or preserve it based on the
-      // replacement.
+      // "(...)" chain, consume that suffix only when token provenance proves
+      // the suffix belongs to this hunk's B-side replacement interval.  This is
+      // the conservative-path counterpart of the mapped-TU guard above.
       if (span->first < span->second) {
         const uint64_t oldEnd = span->second;
         const uint64_t extEnd = extendChainedCallEnd(tuBytes, oldEnd, repl);
-        if (extEnd != oldEnd) {
+        if (extEnd != oldEnd &&
+            tuExtensionIsBTokenClosed(h.aEnd, oldEnd, extEnd, h.bStart,
+                                      h.bEnd)) {
           debug("edit/tu",
                 "TU extend trailing call/arg chain [{0},{1}) -> [{0},{2})",
                 span->first, oldEnd, extEnd);
