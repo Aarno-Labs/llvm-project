@@ -652,32 +652,35 @@ static Error compareTokens(ArrayRef<PPTok> aToks, ArrayRef<PPTok> bToks) {
 static Error compareTokensNoLinesAware(ArrayRef<PPTok> aToks,
                                        ArrayRef<PPTok> bToks,
                                        ArrayRef<uint8_t> ignoreMask) {
+  // Compare token spellings up to the min length first.
   const size_t n = std::min(aToks.size(), bToks.size());
   for (size_t i = 0; i < n; ++i) {
-    if (aToks[i].spelling == bToks[i].spelling)
-      continue;
-    const bool ign = (i < ignoreMask.size()) && ignoreMask[i] &&
-                     canIgnoreNoLinesMismatch(aToks[i], bToks[i]);
-    if (ign) {
-      debug("compare",
-            "--no-lines: ignoring builtin loc macro mismatch at index {0}: "
-            "A='{1}' B='{2}'",
-            i,
-            stringutils::showWS(
-                stringutils::clip(StringRef(aToks[i].spelling), 100)),
-            stringutils::showWS(
-                stringutils::clip(StringRef(bToks[i].spelling), 180)));
-      continue;
-    }
     const std::string aDbg = stringutils::showWS(
         stringutils::clip(StringRef(aToks[i].spelling), 100));
     const std::string bDbg = stringutils::showWS(
         stringutils::clip(StringRef(bToks[i].spelling), 180));
-    return createStringError(
-        inconvertibleErrorCode(),
-        formatv("token mismatch at index {0}: A='{1}' B='{2}'", i, aDbg, bDbg)
-            .str());
+
+    if (aToks[i].spelling != bToks[i].spelling) {
+      const bool ign = (i < ignoreMask.size()) && ignoreMask[i] &&
+                       canIgnoreNoLinesMismatch(aToks[i], bToks[i]);
+      if (ign) {
+        debug("compare",
+              "--no-lines: ignoring builtin loc macro mismatch at index {0}: "
+              "A='{1}' B='{2}'",
+              i, aDbg, bDbg);
+        continue;
+      }
+
+      return createStringError(
+          inconvertibleErrorCode(),
+          formatv("token mismatch at index {0}: A='{1}' B='{2}'", i, aDbg, bDbg)
+              .str());
+    }
+
+    debug("compare", "token match at index {0}: A='{1}' B='{2}'", i, aDbg,
+          bDbg);
   }
+
   if (aToks.size() != bToks.size()) {
     return createStringError(
         inconvertibleErrorCode(),
