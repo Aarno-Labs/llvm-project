@@ -2375,6 +2375,24 @@ private:
   /// \return an array `ownerDepthGap` indexed by PP gap `k` in `[0..N]`
   std::vector<uint32_t> ComputeOwnerDepthGapsForPP();
 
+  /// \brief Compute structured A-side gap provenance for certified LCS mapping.
+  ///
+  /// This is the identity-preserving counterpart to `ComputeOwnerDepthGapsForPP`.
+  /// It records the include, conditional-arm, and macro-expansion context on both
+  /// sides of each PP-token gap while preserving the same scalar `ownerDepth`
+  /// used by the core LCS objective. DiffAlgorithms uses these profiles to keep
+  /// forced anchors and to restore ambiguous edge anchors only when a unique
+  /// owner-preserving frontier is certified.
+  std::vector<diffutils::LcsGapProvenance> ComputeLcsGapProvenanceForPP();
+
+  /// \brief Compute edited-side source-surface profiles for B-side token gaps.
+  ///
+  /// These profiles describe line affinity and whitespace/newline shape around
+  /// each B-token gap. The certified LCS map uses them as a structural
+  /// discriminator for otherwise equivalent pure-insertion frontiers; absolute
+  /// byte offsets are retained for trace diagnostics only.
+  std::vector<diffutils::LcsBGapProvenance> ComputeLcsBGapProvenanceForPP();
+
   /// \brief Classifies the logical "owner" of a diff hunk using the precomputed
   /// segment map for the translation unit.
   ///

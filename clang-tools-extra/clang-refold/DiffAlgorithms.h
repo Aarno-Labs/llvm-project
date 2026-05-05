@@ -8,7 +8,8 @@
 // refolding’s token alignment and edit extraction:
 //
 //   • LCS (Longest Common Subsequence) map A→B over arbitrary element types
-//     (typically token spellings), with a stable tie-breaker.
+//     (typically token spellings), including owner-aware and
+//     provenance-certified variants used by the refolder.
 //   • Hunk construction from an A→B alignment (contiguous edit regions).
 //   • Myers O((N+M)*D) shortest edit script (SES) with linear-space
 //     reconstruction.
@@ -16,15 +17,17 @@
 // Responsibilities
 // ----------------
 //   • lcsMapAB: compute a one-sided mapping from indices in A to matching
-//     indices in B (or -1 if unmatched), using a DP table with a deterministic
-//     backtrack rule (on ties, advance in A).
+//     indices in B (or -1 if unmatched). The structured overload first solves
+//     the owner-aware LCS objective and then suppresses/restores ambiguous
+//     anchors using provenance certificates.
 //   • hunksFromMap: convert an A→B map into ordered edit hunks between anchors.
 //   • myersDiff / coalesce: produce SES steps (EQUAL/INSERT/DELETE) and merge
 //     adjacent non-EQUAL runs into hunks.
 //
 // Determinism & Policy
 // --------------------
-//   • All algorithms break ties consistently for stable output across runs.
+//   • Algorithms are deterministic. The refolder-facing LCS overload avoids
+//     lexical neighbor tie heuristics by keeping only certified anchors.
 //   • Large-input guard: LCS switches to Hirschberg recursion (exact) when
 //     the full DP table would exceed a configured cell budget.
 //   • Utilities are side-effect free and operate on caller-owned sequences.
@@ -37,8 +40,9 @@
 //
 // Public Surface
 // --------------
-//   • std::vector<int> lcsMapAB(...):
-//       A[i] -> B[j] (j >= 0) or -1; deterministic tie-break.
+//   • std::vector<int64_t> lcsMapAB(...):
+//       A[i] -> B[j] (j >= 0) or -1; owner-aware/provenance-certified when
+//       structured gap profiles are supplied.
 //   • std::vector<Hunk> hunksFromMap(const std::vector<int>& map,
 //                                    size_t nA, size_t nB):
 //       contiguous edit regions between anchors, half-open indices.
@@ -68,6 +72,8 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -227,13 +233,78 @@ std::vector<Hunk> coalesce(ArrayRef<Step> steps);
 
 // ========================== LCS alignment utilities ==========================
 
+
+/// \brief Structured provenance for one A-side token gap used by LCS.
+///
+/// `ownerDepthGap` intentionally collapses nested ownership into one scalar.
+/// The scalar remains the primary cost for the core LCS objective, while the
+/// identity-bearing fields below are used to certify boundary-preserving
+/// ambiguous-edge restoration without looking at neighboring token spellings.
+struct LcsGapProvenance {
+  static constexpr uint64_t NoId = std::numeric_limits<uint64_t>::max();
+
+  uint32_t ownerDepth = 0;
+  uint32_t includeDepth = 0;
+  uint32_t conditionalDepth = 0;
+  uint32_t macroDepth = 0;
+
+  uint64_t leftIncludeId = NoId;
+  uint64_t rightIncludeId = NoId;
+  uint64_t lcaIncludeId = NoId;
+
+  uint64_t leftCondGroupId = NoId;
+  uint64_t leftCondArmId = NoId;
+  uint64_t rightCondGroupId = NoId;
+  uint64_t rightCondArmId = NoId;
+
+  uint64_t leftMacroRootId = NoId;
+  uint64_t leftMacroLeafId = NoId;
+  uint64_t rightMacroRootId = NoId;
+  uint64_t rightMacroLeafId = NoId;
+
+  uint32_t leftMacroRoleMask = 0;
+  uint32_t rightMacroRoleMask = 0;
+};
+
+
+/// \brief Edited-side structural surface for one B-side token gap.
+///
+/// `LcsGapProvenance` describes where an A-side gap came from in the original
+/// preprocessor provenance graph. B-side gap provenance describes the edited
+/// insertion island's structural surface: line affinity and whitespace/newline
+/// shape around adjacent tokens. It deliberately does not include neighboring
+/// token spellings, so using it is not the removed neighbor-coherence heuristic.
+struct LcsBGapProvenance {
+  static constexpr uint64_t NoOffset = std::numeric_limits<uint64_t>::max();
+
+  bool hasLeftToken = false;
+  bool hasRightToken = false;
+  bool gapContainsNewline = false;
+  bool gapContainsOnlyWhitespace = true;
+  bool gapAtLineStart = false;
+  bool gapAtLineEnd = false;
+  bool leftTokenStartsLine = false;
+  bool leftTokenEndsLine = false;
+  bool rightTokenStartsLine = false;
+  bool rightTokenEndsLine = false;
+
+  // Byte coordinates in the edited preprocessed stream. The production ranking
+  // uses the boolean line/whitespace shape above; absolute offsets are retained
+  // for trace output and postmortem diagnostics, not as proof inputs.
+  uint64_t gapBeginByte = NoOffset;
+  uint64_t gapEndByte = NoOffset;
+  uint64_t leftTokenBeginByte = NoOffset;
+  uint64_t leftTokenEndByte = NoOffset;
+  uint64_t rightTokenBeginByte = NoOffset;
+  uint64_t rightTokenEndByte = NoOffset;
+};
+
 /// \brief Compute an owner-aware LCS backmap from sequence A to B.
 ///
 /// Computes a one-sided longest common subsequence (LCS) mapping from sequence
-/// `A` to `B` that respects the structural ownership of tokens. Unlike a
-/// standard greedy LCS, this algorithm penalizes or prohibits alignments
-/// between tokens that belong to different logical owners (e.g., different
-/// include files or macro expansions).
+/// `A` to `B` using the scalar owner-depth cost supplied by the caller. This is
+/// the core weighted LCS objective: maximize matched-token count, then minimize
+/// the accumulated cost of edits crossing owner gaps.
 ///
 /// Returns an array `map` of length `A.size()` where `map[i] = j` if `A[i]`
 /// participates in a valid alignment with `B[j]`, or `-1` if `A[i]` is
@@ -241,18 +312,11 @@ std::vector<Hunk> coalesce(ArrayRef<Step> steps);
 ///
 /// ### Structural Constraints (Owner-Awareness)
 ///
-/// The `ownerDepthGap` parameter provides the hierarchical "cost" of aligning
-/// tokens at specific indices. The algorithm uses this to ensure that tokens
-/// stay within their respective boundaries, preventing the "drift" where a
-/// token in a header is mistakenly aligned with an identical-looking token
-/// in the main TU.
-///
-/// ### Tie-breaker and Stability
-///
-/// In the event of equal LCS scores, the algorithm prefers advancing in `A`
-/// (skipping `A[i]`) to maintain a stable, deterministic bias toward earlier
-/// indices in `B`. This ensures that edits are projected back to the most
-/// conservative possible locations in the original source.
+/// The `ownerDepthGap` parameter is indexed by A-side token gaps. Higher values
+/// make it more expensive for edits to cross deeper include/conditional owner
+/// boundaries. This scalar overload is deterministic but does not perform the
+/// full repeated-token ambiguity certification provided by the structured
+/// provenance overloads below.
 ///
 /// ### Performance & Scaling
 ///
@@ -270,36 +334,43 @@ std::vector<Hunk> coalesce(ArrayRef<Step> steps);
 ///
 /// \param a The original (Source A) sequence of tokens/strings.
 /// \param b The edited (Source B) sequence of tokens/strings.
-/// \param ownerDepthGap A parallel array to \p a indicating the ownership
-///        depth or boundary cost for each token.
+/// \param ownerDepthGap A gap array of size `a.size() + 1` giving the
+///        ownership/boundary cost at each A-side token gap.
 /// \param maxCells The threshold for the DP table size (N*M) before switching
 ///        to Hirschberg recursion.
 /// \returns A vector mapping each index in \p a to its corresponding index
 ///          in \p b, or -1 if the token was deleted or moved.
-std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a,
-                          ArrayRef<StringRef> b,
-                          ArrayRef<uint32_t> ownerDepthGap,
-                          unsigned long long maxCells = DEFAULT_MAX_CELLS);
+std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
+                              ArrayRef<uint32_t> ownerDepthGap,
+                              unsigned long long maxCells = DEFAULT_MAX_CELLS);
 
-/// \brief Compute a one-sided LCS backmap from sequence A to B using DP.
+/// \brief Compute the provenance-certified owner-aware LCS map.
 ///
-/// Computes a one-sided longest common subsequence (LCS) mapping from
-/// sequence `A` to `B` with a deterministic tie-breaker.
+/// This overload derives the scalar owner-depth array from `gapProvenance` and
+/// then builds a certified partial map: only core-LCS-forced anchors are kept,
+/// and ambiguous equal-token edge anchors are restored only when the structured
+/// boundary profile proves a unique pure-insertion frontier.
+std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
+                              ArrayRef<LcsGapProvenance> gapProvenance,
+                              unsigned long long maxCells = DEFAULT_MAX_CELLS);
+
+/// \brief Same as the structured-provenance overload, with edited-side B-gap
+/// surface profiles used as the final structural discriminator for otherwise
+/// equivalent pure-insertion frontiers.
+std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
+                              ArrayRef<LcsGapProvenance> gapProvenance,
+                              ArrayRef<LcsBGapProvenance> bGapProvenance,
+                              unsigned long long maxCells = DEFAULT_MAX_CELLS);
+
+/// \brief Compute a plain deterministic one-sided LCS backmap from A to B.
 ///
-/// Returns an array `map` of length `A.size()` where `map[i] = j` if
-/// `A[i]` participates in an LCS alignment with `B[j]` (order-preserving),
-/// or `-1` if `A[i]` is unmatched.
+/// This overload is for generic sequence alignment when no owner/provenance
+/// information is available. It returns an order-preserving map of length
+/// `A.size()` where `map[i] = j` if `A[i]` participates in the selected LCS
+/// alignment with `B[j]`, or `-1` if `A[i]` is unmatched.
 ///
-/// ### Tie-breaker (determinism)
-///
-/// When backtracking the DP table at a mismatch and both candidate
-/// continuations have equal score, this implementation advances in `A`
-/// (prefers `(i+1, j)` over `(i, j+1)`). In other words, on ties it
-/// *skips `A[i]`* rather than `B[j]`.
-///
-/// **Effect:** Produces a stable alignment that biases matches toward
-/// earlier indices in `B` and removes ambiguity among multiple optimal
-/// LCS paths.
+/// This path is deterministic but intentionally does not provide the refolder's
+/// owner-aware or provenance-certified ambiguity handling.
 ///
 /// ### Large-input guard
 ///
