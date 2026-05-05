@@ -88,6 +88,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <tuple>
 
 using namespace llvm;
@@ -96,6 +97,22 @@ namespace clang {
 namespace refold {
 
 namespace {
+struct LexBoundaryToken {
+  tok::TokenKind Kind = tok::unknown;
+  std::string Spelling;
+  size_t Begin = 0;
+  size_t End = 0;
+};
+
+static std::optional<LexBoundaryToken> firstLexToken(StringRef Text,
+                                                    const LangOptions &Lang);
+static std::optional<LexBoundaryToken> lastLexToken(StringRef Text,
+                                                   const LangOptions &Lang);
+static bool needsLexicalSeparator(const LexBoundaryToken &Left,
+                                  const LexBoundaryToken &Right,
+                                  const LangOptions &Lang);
+static bool isSeparatorGapReplacementPunctuation(tok::TokenKind Kind);
+
 inline std::string resolveHeaderPath(const RefoldModel::IncludeItem &inc) {
   return (inc.resolvedPath && !inc.resolvedPath->empty())
              ? inc.resolvedPath->str()
@@ -1861,6 +1878,82 @@ std::string RefoldEngine::RunSinglePassRefold() {
           }
         }
 
+        bool consumedSeparatorGapForPunctuation = false;
+
+        // A zero-width PP insertion can map to the right edge of an existing
+        // whitespace separator in the TU. For separator punctuation such as a
+        // comma, the source edit is not "insert after the old gap"; it is
+        // "replace the old separator gap with the new separator spelling".
+        //
+        // Only perform that span correction when every byte being consumed is
+        // ordinary horizontal TU whitespace between two real tokens. Includes
+        // and macro invocation spellings are excluded so this never steals
+        // whitespace that belongs to a spelled artifact, and the lexer check
+        // proves that attaching the punctuation to the left token preserves
+        // tokenization.
+        if (h.isInsertOnly() && span->first == span->second && !repl.empty() &&
+            !stringutils::isWs(repl.front()) && span->first > 0 &&
+            span->first < tuBytes.size() &&
+            (tuBytes[span->first - 1] == ' ' ||
+             tuBytes[span->first - 1] == '\t') &&
+            !stringutils::isWs(tuBytes[span->first])) {
+          auto intervalOverlapsSpelledArtifact =
+              [&](uint64_t begin, uint64_t end) -> bool {
+            for (const auto &inc : model_.GetIncludes()) {
+              if (!PathsEqual(inc.sitePath, tuPath))
+                continue;
+              if (inc.siteB < end && begin < inc.siteE)
+                return true;
+            }
+            for (const auto &m : model_.GetMacroInvocations()) {
+              if (m.invFile && !m.invFile->empty() &&
+                  !PathsEqual(*m.invFile, tuPath))
+                continue;
+              if (!m.invB || !m.invE)
+                continue;
+              if (*m.invB < end && begin < *m.invE)
+                return true;
+            }
+            return false;
+          };
+
+          uint64_t gapBegin = span->first;
+          while (gapBegin > 0 && (tuBytes[gapBegin - 1] == ' ' ||
+                                  tuBytes[gapBegin - 1] == '\t'))
+            --gapBegin;
+
+          if (gapBegin < span->first &&
+              !intervalOverlapsSpelledArtifact(gapBegin, span->first)) {
+            std::optional<LexBoundaryToken> leftTok =
+                lastLexToken(tuBytes.take_front(gapBegin), lexLang_);
+            std::optional<LexBoundaryToken> rightTok =
+                firstLexToken(tuBytes.drop_front(span->first), lexLang_);
+            std::optional<LexBoundaryToken> replFirstTok =
+                firstLexToken(StringRef(repl), lexLang_);
+            std::optional<LexBoundaryToken> replLastTok =
+                lastLexToken(StringRef(repl), lexLang_);
+
+            // Consuming the original separator gap is only whitespace-preserving
+            // if the replacement is lexically valid on both sides of the gap:
+            // the inserted punctuation must be able to attach to the left token,
+            // and the replacement text must still provide any separator required
+            // before the original right token.
+            if (leftTok && rightTok && replFirstTok && replLastTok &&
+                leftTok->End == gapBegin && rightTok->Begin == 0 &&
+                isSeparatorGapReplacementPunctuation(replFirstTok->Kind) &&
+                !needsLexicalSeparator(*leftTok, *replFirstTok, lexLang_) &&
+                !needsLexicalSeparator(*replLastTok, *rightTok, lexLang_)) {
+              debug("edit/tu",
+                    "TU insertion consumes ordinary separator gap [{0},{1}) "
+                    "for punctuation '{2}'",
+                    gapBegin, span->first,
+                    stringutils::showWSWithClip(replFirstTok->Spelling, 40));
+              span->first = gapBegin;
+              consumedSeparatorGapForPunctuation = true;
+            }
+          }
+        }
+
         // If our TU span stops at an identifier and is immediately followed by
         // a "(...)" chain, decide whether to consume it or preserve it based on
         // the replacement.
@@ -1891,7 +1984,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
         // If we’re replacing a non-empty TU gap and the inserted text doesn’t
         // start with WS, prefix EXACTLY ONE space from the gap to preserve
         // “return injected” (no double spaces).
-        if (replacingGap && !repl.empty() && !stringutils::isWs(repl.front()))
+        if (replacingGap && !consumedSeparatorGapForPunctuation &&
+            !repl.empty() && !stringutils::isWs(repl.front()))
           repl.insert(repl.begin(), ' ');
 
         // Final boundary spacing fixup:
@@ -1988,6 +2082,81 @@ std::string RefoldEngine::RunSinglePassRefold() {
         }
       }
 
+      bool consumedSeparatorGapForPunctuation = false;
+
+      // A zero-width PP insertion can map to the right edge of an existing
+      // whitespace separator in the TU. For separator punctuation such as a
+      // comma, widen the replacement span over that exact ordinary separator
+      // gap so the edit replaces the gap instead of inserting after it.
+      //
+      // The widening is deliberately narrow: only spaces/tabs immediately to
+      // the left of the anchor may be consumed, the right side must be a real
+      // non-whitespace TU byte, the gap must not overlap include/macro spelling
+      // artifacts, and the lexer must prove the inserted punctuation can attach
+      // to the left token without changing tokenization.
+      if (!isDel && h.isInsertOnly() && span->first == span->second &&
+          !repl.empty() && !stringutils::isWs(repl.front()) &&
+          span->first > 0 && span->first < tuBytes.size() &&
+          (tuBytes[span->first - 1] == ' ' ||
+           tuBytes[span->first - 1] == '\t') &&
+          !stringutils::isWs(tuBytes[span->first])) {
+        auto intervalOverlapsSpelledArtifact =
+            [&](uint64_t begin, uint64_t end) -> bool {
+          for (const auto &inc : model_.GetIncludes()) {
+            if (!PathsEqual(inc.sitePath, tuPath))
+              continue;
+            if (inc.siteB < end && begin < inc.siteE)
+              return true;
+          }
+          for (const auto &m : model_.GetMacroInvocations()) {
+            if (m.invFile && !m.invFile->empty() &&
+                !PathsEqual(*m.invFile, tuPath))
+              continue;
+            if (!m.invB || !m.invE)
+              continue;
+            if (*m.invB < end && begin < *m.invE)
+              return true;
+          }
+          return false;
+        };
+
+        uint64_t gapBegin = span->first;
+        while (gapBegin > 0 && (tuBytes[gapBegin - 1] == ' ' ||
+                                tuBytes[gapBegin - 1] == '\t'))
+          --gapBegin;
+
+        if (gapBegin < span->first &&
+            !intervalOverlapsSpelledArtifact(gapBegin, span->first)) {
+          std::optional<LexBoundaryToken> leftTok =
+              lastLexToken(tuBytes.take_front(gapBegin), lexLang_);
+          std::optional<LexBoundaryToken> rightTok =
+              firstLexToken(tuBytes.drop_front(span->first), lexLang_);
+          std::optional<LexBoundaryToken> replFirstTok =
+              firstLexToken(StringRef(repl), lexLang_);
+          std::optional<LexBoundaryToken> replLastTok =
+              lastLexToken(StringRef(repl), lexLang_);
+
+          // Consuming the original separator gap is only whitespace-preserving
+          // if the replacement is lexically valid on both sides of the gap:
+          // the inserted punctuation must be able to attach to the left token,
+          // and the replacement text must still provide any separator required
+          // before the original right token.
+          if (leftTok && rightTok && replFirstTok && replLastTok &&
+              leftTok->End == gapBegin && rightTok->Begin == 0 &&
+              isSeparatorGapReplacementPunctuation(replFirstTok->Kind) &&
+              !needsLexicalSeparator(*leftTok, *replFirstTok, lexLang_) &&
+              !needsLexicalSeparator(*replLastTok, *rightTok, lexLang_)) {
+            debug("edit/tu",
+                  "TU conservative insertion consumes ordinary separator gap "
+                  "[{0},{1}) for punctuation '{2}'",
+                  gapBegin, span->first,
+                  stringutils::showWSWithClip(replFirstTok->Spelling, 40));
+            span->first = gapBegin;
+            consumedSeparatorGapForPunctuation = true;
+          }
+        }
+      }
+
       // If our TU span stops at an identifier and is immediately followed by a
       // "(...)" chain, decide whether to consume it or preserve it based on the
       // replacement.
@@ -2010,7 +2179,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
         std::string original(tuBytes.data() + span->first,
                              tuBytes.data() + span->second);
         replacingGap = !original.empty() && stringutils::isWhitespace(original);
-        if (replacingGap) {
+        if (replacingGap && !consumedSeparatorGapForPunctuation) {
           // Preserve exactly the gap as the replacement.
           repl = std::move(original);
         }
@@ -2023,7 +2192,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
       // replacement text does not already begin with whitespace, prefix a
       // single space so adjacent tokens remain separated. Add only one space,
       // even if the original gap was wider, to avoid duplicating spacing.
-      if (replacingGap && !repl.empty() && !stringutils::isWs(repl.front()))
+      if (replacingGap && !consumedSeparatorGapForPunctuation &&
+          !repl.empty() && !stringutils::isWs(repl.front()))
         repl.insert(repl.begin(), ' ');
 
       // Keep a copy for logging; PadAtBoundaries consumes via move.
@@ -2534,11 +2704,6 @@ std::vector<uint32_t> RefoldEngine::ComputeOwnerDepthGapsForPP() {
 // ============================= Boundary helpers ==============================
 
 namespace {
-struct LexBoundaryToken {
-  tok::TokenKind Kind = tok::unknown;
-  std::string Spelling;
-};
-
 /// Byte slice for a single top-level element inside a comma-separated tuple.
 ///
 /// `begin`/`end` cover the full half-open byte range for the element inside the
@@ -2669,8 +2834,9 @@ static void lexBoundaryTokens(StringRef Text, const LangOptions &Lang,
 
     const unsigned Off =
         Tok.getLocation().getRawEncoding() - BaseLoc.getRawEncoding();
-    Out.push_back(
-        {Tok.getKind(), std::string(Text.substr(Off, Tok.getLength()))});
+    Out.push_back({Tok.getKind(),
+                   std::string(Text.substr(Off, Tok.getLength())), Off,
+                   Off + Tok.getLength()});
   }
 }
 
@@ -2714,6 +2880,25 @@ static bool needsLexicalSeparator(const LexBoundaryToken &Left,
       return true;
   }
   return false;
+}
+
+/// Return true iff \p Kind is separator punctuation that may legitimately
+/// replace a horizontal source gap between two tokens.
+///
+/// This is intentionally narrower than "left-attachable punctuation": closing
+/// delimiters and operators can carry context-sensitive spacing conventions, so
+/// they are not treated as gap replacements here. Callers must still prove with
+/// `needsLexicalSeparator()` that attaching the punctuation to the token on its
+/// left preserves lexical tokenization.
+static bool isSeparatorGapReplacementPunctuation(tok::TokenKind Kind) {
+  switch (Kind) {
+  case tok::comma:
+  case tok::semi:
+  case tok::colon:
+    return true;
+  default:
+    return false;
+  }
 }
 } // namespace
 
