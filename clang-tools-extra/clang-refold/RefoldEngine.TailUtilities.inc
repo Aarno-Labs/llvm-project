@@ -1341,6 +1341,106 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
     }
 
     if (!payloadsAgree) {
+      auto tryMergeDirectDuplicateFragments = [&]() -> std::optional<TextEdit> {
+        SmallVector<const TextEdit *, 8> fragments;
+        fragments.reserve(j - i);
+
+        // This merge is only valid for duplicate fragments that still have a
+        // direct one-to-one TU hunk witness.  Anything synthesized, macro-owned,
+        // include-owned, or missing hunk provenance must stay on the normal
+        // composition path.
+        for (size_t k = i; k < j; ++k) {
+          const TextEdit &edit = *ordered[k].e;
+          if (!edit.isDirectTUHunkEdit || !edit.directTUHunkIndex ||
+              !edit.directTUHunkAStart || !edit.directTUHunkAEnd ||
+              !edit.directTUHunkBStart || !edit.directTUHunkBEnd)
+            return std::nullopt;
+          fragments.push_back(&edit);
+        }
+
+        // Reconstruct the original hunk order before proving adjacency.  The
+        // duplicate group is ordered by emitted byte span, which is not enough
+        // to prove that the B-side replacement interval is contiguous.
+        sort(fragments, [](const TextEdit *lhs, const TextEdit *rhs) {
+          return *lhs->directTUHunkIndex < *rhs->directTUHunkIndex;
+        });
+
+        // Adjacent duplicate fragments may be collapsed only when they form one
+        // uninterrupted run in both the A token hunks and B token hunks.  This
+        // prevents merging unrelated fragments that merely overlap the same
+        // emitted byte span.
+        for (size_t k = 1; k < fragments.size(); ++k) {
+          const TextEdit &prev = *fragments[k - 1];
+          const TextEdit &cur = *fragments[k];
+
+          if (*cur.directTUHunkIndex != *prev.directTUHunkIndex + 1)
+            return std::nullopt;
+          if (*cur.directTUHunkAStart != *prev.directTUHunkAEnd)
+            return std::nullopt;
+          if (*cur.directTUHunkBStart != *prev.directTUHunkBEnd)
+            return std::nullopt;
+        }
+
+        // The merged replacement is exactly the contiguous B-token envelope
+        // covered by the duplicate fragment run.
+        const uint64_t bBegin = *fragments.front()->directTUHunkBStart;
+        const uint64_t bEnd = *fragments.back()->directTUHunkBEnd;
+        if (bBegin >= bEnd || bEnd > static_cast<uint64_t>(bToks_.size()))
+          return std::nullopt;
+
+        StringRef replacement =
+            sliceExactTokenCoverage(bTokOff_, bToks_, bSource_, bBegin, bEnd);
+        if (replacement.empty())
+          return std::nullopt;
+
+        // Apply normal resync handling to the whole duplicate byte span, rather
+        // than preserving each fragment's already-conflicting local resync.
+        ResyncOutcome ro = ApplyResyncOrPend(originalFileText, s, t,
+                                             replacement, emissionOwner);
+        TextEdit merged{s, t, std::move(ro.text), std::move(ro.pending),
+                        std::nullopt, {}};
+
+        // Preserve existing proof carriers from the fragments.  If the fragments
+        // carry macro-root provenance, they must all agree on the same root.
+        for (const TextEdit *fragment : fragments) {
+          if (fragment->expandedMacroRootId) {
+            if (merged.expandedMacroRootId &&
+                *merged.expandedMacroRootId != *fragment->expandedMacroRootId)
+              return std::nullopt;
+            merged.expandedMacroRootId = fragment->expandedMacroRootId;
+          }
+          merged.acceptedResults.insert(merged.acceptedResults.end(),
+                                        fragment->acceptedResults.begin(),
+                                        fragment->acceptedResults.end());
+        }
+
+        // Add a carrier for the actual emitted merged surface so the final proof
+        // gate can reason about this replacement as one conservative TU edit.
+        AttachAcceptedResultCarrier(
+            merged, BuildAcceptedTUTextEditCandidate(
+                        AcceptedPathKind::TUByteSpanConservativeEdit, s, t,
+                        replacement));
+
+        trace("edits/apply",
+              "merged {0} adjacent direct duplicate fragments at [{1},{2}) "
+              "from Btok=[{3},{4}) into len={5}",
+              fragments.size(), s, t, bBegin, bEnd, replacement.size());
+        return merged;
+      };
+
+      // Split token-LCS frontiers can produce several direct TU hunk fragments
+      // for the same original byte span.  If those fragments are adjacent in
+      // both A-token and B-token space, they are not competing writers: they are
+      // one replacement that was fragmented before byte emission.  Rebuild that
+      // replacement from the closed B-token interval; otherwise keep the
+      // existing fail-closed duplicate-edit policy.
+      if (std::optional<TextEdit> mergedDirectDuplicate =
+              tryMergeDirectDuplicateFragments()) {
+        norm.push_back(std::move(*mergedDirectDuplicate));
+        i = j;
+        continue;
+      }
+
       RequestTerminalFallback(
           TerminalFallbackKind::UndischargedEmissionArtifact, "edits/apply",
           llvm::formatv(
