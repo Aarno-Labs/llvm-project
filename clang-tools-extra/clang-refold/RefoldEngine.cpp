@@ -71,6 +71,7 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/FormatVariadic.h"
@@ -114,6 +115,10 @@ static bool needsLexicalSeparator(const LexBoundaryToken &left,
                                   const LexBoundaryToken &right,
                                   const LangOptions &lang);
 static bool isSeparatorGapReplacementPunctuation(tok::TokenKind kind);
+static bool hasTopLevelCommaWithLexer(StringRef text, const LangOptions &lang);
+static void enumerateTopLevelBalancedCutPointsWithLexer(
+    StringRef text, const LangOptions &lang,
+    function_ref<void(unsigned)> emitCut);
 
 inline std::string resolveHeaderPath(const RefoldModel::IncludeItem &inc) {
   return (inc.resolvedPath && !inc.resolvedPath->empty())
@@ -2004,64 +2009,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
   };
 
   auto hasTopLevelCommaInReplacement = [&](StringRef text) -> bool {
-    // Detect whether using this replacement text as a single macro argument
-    // would change the invocation arity.
-    //
-    // This must be token-based rather than character-based: commas inside
-    // comments, string literals, character literals, or nested delimiters do
-    // not split a macro argument. Raw lexing gives us the same lexical
-    // treatment the preprocessor would use for the replacement spelling.
-    const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
-    std::string lexBuf = text.str();
-    lexBuf.push_back('\0');
-    const char *bufStart = lexBuf.data();
-    const char *bufEnd = bufStart + text.size();
-    Lexer lex(baseLoc, lexLang_, bufStart, bufStart, bufEnd);
-
-    int parenDepth = 0;
-    int bracketDepth = 0;
-    int braceDepth = 0;
-    Token tok;
-
-    for (;;) {
-      lex.LexFromRawLexer(tok);
-      if (tok.is(tok::eof))
-        return false;
-      if (tok.is(tok::comment))
-        continue;
-
-      switch (tok.getKind()) {
-      case tok::l_paren:
-        ++parenDepth;
-        break;
-      case tok::r_paren:
-        if (parenDepth > 0)
-          --parenDepth;
-        break;
-      case tok::l_square:
-        ++bracketDepth;
-        break;
-      case tok::r_square:
-        if (bracketDepth > 0)
-          --bracketDepth;
-        break;
-      case tok::l_brace:
-        ++braceDepth;
-        break;
-      case tok::r_brace:
-        if (braceDepth > 0)
-          --braceDepth;
-        break;
-      case tok::comma:
-        // Only an undelimited comma would split the replacement into multiple
-        // macro arguments if it were written back into the original invocation.
-        if (parenDepth == 0 && bracketDepth == 0 && braceDepth == 0)
-          return true;
-        break;
-      default:
-        break;
-      }
-    }
+    return hasTopLevelCommaWithLexer(text, lexLang_);
   };
 
   auto shouldPreferTUArgEditOverMacroArgsOnly =
@@ -3610,6 +3558,206 @@ static bool computeTrimmedTupleElement(StringRef text, size_t begin, size_t end,
   std::tie(out.trimBegin, out.trimEnd) =
       stringutils::trimWsRange(text, begin, end);
   return out.trimBegin != out.trimEnd;
+}
+
+static size_t tokenOffsetFromBase(const Token &token,
+                                  SourceLocation baseLoc) {
+  return token.getLocation().getRawEncoding() - baseLoc.getRawEncoding();
+}
+
+static size_t tokenEndOffsetFromBase(const Token &token,
+                                     SourceLocation baseLoc) {
+  return tokenOffsetFromBase(token, baseLoc) + token.getLength();
+}
+
+static void emitByteCutRange(size_t begin, size_t end,
+                             function_ref<void(unsigned)> emitCut) {
+  for (size_t cut = begin + 1; cut <= end; ++cut)
+    emitCut(static_cast<unsigned>(cut));
+}
+
+static bool isOpaqueLiteralToken(tok::TokenKind kind) {
+  switch (kind) {
+  case tok::string_literal:
+  case tok::wide_string_literal:
+  case tok::utf8_string_literal:
+  case tok::utf16_string_literal:
+  case tok::utf32_string_literal:
+  case tok::char_constant:
+  case tok::wide_char_constant:
+  case tok::utf8_char_constant:
+  case tok::utf16_char_constant:
+  case tok::utf32_char_constant:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static std::optional<size_t> commentCutEnd(StringRef text, size_t begin,
+                                           size_t end) {
+  StringRef comment = text.slice(begin, end);
+  if (comment.starts_with("//")) {
+    const size_t newline = text.find('\n', begin);
+    if (newline == StringRef::npos)
+      return std::nullopt;
+    return newline + 1;
+  }
+
+  if (comment.starts_with("/*")) {
+    const size_t close = text.find("*/", begin + 2);
+    if (close == StringRef::npos)
+      return std::nullopt;
+    return close + 2;
+  }
+
+  return end;
+}
+
+static void updateTopLevelDelimiterDepth(tok::TokenKind kind,
+                                         int &parenDepth,
+                                         int &bracketDepth,
+                                         int &braceDepth) {
+  switch (kind) {
+  case tok::l_paren:
+    ++parenDepth;
+    break;
+  case tok::r_paren:
+    if (parenDepth > 0)
+      --parenDepth;
+    break;
+  case tok::l_square:
+    ++bracketDepth;
+    break;
+  case tok::r_square:
+    if (bracketDepth > 0)
+      --bracketDepth;
+    break;
+  case tok::l_brace:
+    ++braceDepth;
+    break;
+  case tok::r_brace:
+    if (braceDepth > 0)
+      --braceDepth;
+    break;
+  default:
+    break;
+  }
+}
+
+static bool isAtTopLevel(int parenDepth, int bracketDepth, int braceDepth) {
+  return parenDepth == 0 && bracketDepth == 0 && braceDepth == 0;
+}
+
+/// Detect whether `text` contains a comma that would split a single macro
+/// argument if the text were written back into a function-like invocation.
+///
+/// Raw lexing keeps comments and literals opaque, so only delimiter depth has
+/// to be tracked here. This avoids the duplicated ad hoc string/character
+/// scanner previously used by macro replay validation.
+static bool hasTopLevelCommaWithLexer(StringRef text,
+                                      const LangOptions &lang) {
+  const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
+  std::string lexBuf = text.str();
+  lexBuf.push_back('\0');
+  const char *bufStart = lexBuf.data();
+  const char *bufEnd = bufStart + text.size();
+  Lexer lexer(baseLoc, lang, bufStart, bufStart, bufEnd);
+  lexer.SetCommentRetentionState(true);
+
+  int parenDepth = 0;
+  int bracketDepth = 0;
+  int braceDepth = 0;
+  Token token;
+
+  while (true) {
+    lexer.LexFromRawLexer(token);
+    if (token.is(tok::eof))
+      return false;
+    if (token.is(tok::comment))
+      continue;
+
+    if (token.is(tok::comma) &&
+        isAtTopLevel(parenDepth, bracketDepth, braceDepth))
+      return true;
+
+    updateTopLevelDelimiterDepth(token.getKind(), parenDepth, bracketDepth,
+                                 braceDepth);
+  }
+}
+
+/// Enumerate byte cut-points that are balanced with respect to top-level
+/// delimiters in `text`.
+///
+/// The old scanner emitted every safe byte boundary outside comments, literals,
+/// and nested delimiter groups. This lexer-backed implementation preserves that
+/// contract: tokens decide what text is opaque, while byte-range emission keeps
+/// the previous cut-point granularity for whitespace, identifiers, and ordinary
+/// punctuation.
+static void enumerateTopLevelBalancedCutPointsWithLexer(
+    StringRef text, const LangOptions &lang,
+    function_ref<void(unsigned)> emitCut) {
+  emitCut(0u);
+  if (text.empty())
+    return;
+
+  const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
+  std::string lexBuf = text.str();
+  lexBuf.push_back('\0');
+  const char *bufStart = lexBuf.data();
+  const char *bufEnd = bufStart + text.size();
+  Lexer lexer(baseLoc, lang, bufStart, bufStart, bufEnd);
+  lexer.SetCommentRetentionState(true);
+
+  int parenDepth = 0;
+  int bracketDepth = 0;
+  int braceDepth = 0;
+  size_t covered = 0;
+  Token token;
+
+  while (true) {
+    lexer.LexFromRawLexer(token);
+    if (token.is(tok::eof))
+      break;
+
+    const size_t tokenBegin = std::min(tokenOffsetFromBase(token, baseLoc),
+                                       text.size());
+    const size_t tokenEnd = std::min(tokenEndOffsetFromBase(token, baseLoc),
+                                     text.size());
+
+    if (covered < tokenBegin &&
+        isAtTopLevel(parenDepth, bracketDepth, braceDepth))
+      emitByteCutRange(covered, tokenBegin, emitCut);
+
+    if (token.is(tok::comment)) {
+      covered = tokenEnd;
+      std::optional<size_t> cutEnd = commentCutEnd(text, tokenBegin, tokenEnd);
+      if (cutEnd) {
+        covered = std::min(*cutEnd, text.size());
+        if (isAtTopLevel(parenDepth, bracketDepth, braceDepth))
+          emitCut(static_cast<unsigned>(covered));
+      }
+      continue;
+    }
+
+    if (isOpaqueLiteralToken(token.getKind())) {
+      covered = tokenEnd;
+      if (isAtTopLevel(parenDepth, bracketDepth, braceDepth))
+        emitCut(static_cast<unsigned>(tokenEnd));
+      continue;
+    }
+
+    updateTopLevelDelimiterDepth(token.getKind(), parenDepth, bracketDepth,
+                                 braceDepth);
+    covered = tokenEnd;
+
+    if (isAtTopLevel(parenDepth, bracketDepth, braceDepth))
+      emitByteCutRange(tokenBegin, tokenEnd, emitCut);
+  }
+
+  if (covered < text.size() &&
+      isAtTopLevel(parenDepth, bracketDepth, braceDepth))
+    emitByteCutRange(covered, text.size(), emitCut);
 }
 
 /// Split a caller tuple into top-level comma-separated elements using Clang's
@@ -5255,67 +5403,67 @@ bool RefoldEngine::MacroArgReplacementMatchesAllOccurrencesInBImpl(
                          std::set<std::pair<uint64_t, uint32_t>> &)>
           hasOccurrenceSupportThroughGraph;
 
-    hasOccurrenceSupportThroughGraph =
-        [&](const RefoldModel::MacroInvocation &inv, uint32_t formalIdx,
-            std::set<std::pair<uint64_t, uint32_t>> &visiting) -> bool {
-      std::pair<uint64_t, uint32_t> key{inv.id, formalIdx};
-      if (!visiting.insert(key).second)
-        return false;
+      hasOccurrenceSupportThroughGraph =
+          [&](const RefoldModel::MacroInvocation &inv, uint32_t formalIdx,
+              std::set<std::pair<uint64_t, uint32_t>> &visiting) -> bool {
+        std::pair<uint64_t, uint32_t> key{inv.id, formalIdx};
+        if (!visiting.insert(key).second)
+          return false;
 
-      auto eraseOnExit = llvm::make_scope_exit([&] { visiting.erase(key); });
+        auto eraseOnExit = llvm::make_scope_exit([&] { visiting.erase(key); });
 
-      if (hasDirectOccurrenceSupport(inv, formalIdx))
-        return true;
+        if (hasDirectOccurrenceSupport(inv, formalIdx))
+          return true;
 
-      auto childIt = macroChildrenById_.find(inv.id);
-      if (childIt != macroChildrenById_.end()) {
-        for (const auto *child : childIt->second) {
-          for (uint32_t childFormalIdx = 0;
-               childFormalIdx < child->argDeps.size(); ++childFormalIdx) {
-            bool dependsOnFormal = false;
-            for (uint32_t dep : child->argDeps[childFormalIdx]) {
-              if (dep == formalIdx) {
-                dependsOnFormal = true;
-                break;
-              }
-            }
-            if (!dependsOnFormal)
-              continue;
-            if (hasOccurrenceSupportThroughGraph(*child, childFormalIdx,
-                                                 visiting))
-              return true;
-          }
-        }
-      }
-
-      if (inv.callerMacroId && formalIdx < inv.argDeps.size()) {
-        auto parentChildrenIt = macroChildrenById_.find(*inv.callerMacroId);
-        if (parentChildrenIt != macroChildrenById_.end()) {
-          ArrayRef<uint32_t> deps = inv.argDeps[formalIdx];
-          for (const auto *sib : parentChildrenIt->second) {
-            if (sib->id == inv.id)
-              continue;
-            for (uint32_t sibFormalIdx = 0; sibFormalIdx < sib->argDeps.size();
-                 ++sibFormalIdx) {
-              bool sharesCallerDeps = false;
-              for (uint32_t sibDep : sib->argDeps[sibFormalIdx]) {
-                if (llvm::is_contained(deps, sibDep)) {
-                  sharesCallerDeps = true;
+        auto childIt = macroChildrenById_.find(inv.id);
+        if (childIt != macroChildrenById_.end()) {
+          for (const auto *child : childIt->second) {
+            for (uint32_t childFormalIdx = 0;
+                 childFormalIdx < child->argDeps.size(); ++childFormalIdx) {
+              bool dependsOnFormal = false;
+              for (uint32_t dep : child->argDeps[childFormalIdx]) {
+                if (dep == formalIdx) {
+                  dependsOnFormal = true;
                   break;
                 }
               }
-              if (!sharesCallerDeps)
+              if (!dependsOnFormal)
                 continue;
-              if (hasOccurrenceSupportThroughGraph(*sib, sibFormalIdx,
+              if (hasOccurrenceSupportThroughGraph(*child, childFormalIdx,
                                                    visiting))
                 return true;
             }
           }
         }
-      }
 
-      return false;
-    };
+        if (inv.callerMacroId && formalIdx < inv.argDeps.size()) {
+          auto parentChildrenIt = macroChildrenById_.find(*inv.callerMacroId);
+          if (parentChildrenIt != macroChildrenById_.end()) {
+            ArrayRef<uint32_t> deps = inv.argDeps[formalIdx];
+            for (const auto *sib : parentChildrenIt->second) {
+              if (sib->id == inv.id)
+                continue;
+              for (uint32_t sibFormalIdx = 0;
+                   sibFormalIdx < sib->argDeps.size(); ++sibFormalIdx) {
+                bool sharesCallerDeps = false;
+                for (uint32_t sibDep : sib->argDeps[sibFormalIdx]) {
+                  if (llvm::is_contained(deps, sibDep)) {
+                    sharesCallerDeps = true;
+                    break;
+                  }
+                }
+                if (!sharesCallerDeps)
+                  continue;
+                if (hasOccurrenceSupportThroughGraph(*sib, sibFormalIdx,
+                                                     visiting))
+                  return true;
+              }
+            }
+          }
+        }
+
+        return false;
+      };
 
       std::set<std::pair<uint64_t, uint32_t>> visiting;
       if (!hasOccurrenceSupportThroughGraph(m, argIdx, visiting))
@@ -11395,97 +11543,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         return SliceASource(covLoA, covHiA).trim().str();
       };
 
-      auto hasTopLevelCommaInRefoldText = [&](StringRef s) -> bool {
-        int paren = 0, bracket = 0, brace = 0;
-        bool inStr = false, inChr = false, esc = false;
-        for (size_t i = 0; i < s.size(); ++i) {
-          char c = s[i];
-
-          if (inStr) {
-            if (esc) {
-              esc = false;
-              continue;
-            }
-            if (c == '\\') {
-              esc = true;
-              continue;
-            }
-            if (c == '"')
-              inStr = false;
-            continue;
-          }
-          if (inChr) {
-            if (esc) {
-              esc = false;
-              continue;
-            }
-            if (c == '\\') {
-              esc = true;
-              continue;
-            }
-            if (c == '\'')
-              inChr = false;
-            continue;
-          }
-
-          if (c == '/' && i + 1 < s.size()) {
-            if (s[i + 1] == '/') {
-              i += 2;
-              while (i < s.size() && s[i] != '\n')
-                ++i;
-              continue;
-            }
-            if (s[i + 1] == '*') {
-              i += 2;
-              while (i + 1 < s.size() && !(s[i] == '*' && s[i + 1] == '/'))
-                ++i;
-              if (i + 1 < s.size())
-                ++i;
-              continue;
-            }
-          }
-
-          if (c == '"') {
-            inStr = true;
-            continue;
-          }
-          if (c == '\'') {
-            inChr = true;
-            continue;
-          }
-          switch (c) {
-          case '(':
-            ++paren;
-            break;
-          case ')':
-            if (paren > 0)
-              --paren;
-            break;
-          case '[':
-            ++bracket;
-            break;
-          case ']':
-            if (bracket > 0)
-              --bracket;
-            break;
-          case '{':
-            ++brace;
-            break;
-          case '}':
-            if (brace > 0)
-              --brace;
-            break;
-          case ',':
-            if (paren == 0 && bracket == 0 && brace == 0)
-              return true;
-            break;
-          default:
-            break;
-          }
-        }
-        return false;
-      };
-
       auto isLikelyTokenBoundaryInRefoldText = [&](StringRef s,
                                                   size_t pos) -> bool {
         if (pos == 0 || pos >= s.size())
@@ -11494,104 +11551,13 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                  stringutils::isIdentPart(s[pos]));
       };
 
-      auto enumerateTopLevelBalancedCutPoints =
-          [&](StringRef s, auto &&emitCut) {
-        int paren = 0, bracket = 0, brace = 0;
-        bool inStr = false, inChr = false, esc = false;
-        bool inLineComment = false, inBlockComment = false;
-
-        emitCut(0u);
-        for (size_t i = 0; i < s.size(); ++i) {
-          const char c = s[i];
-
-          if (inLineComment) {
-            if (c == '\n')
-              inLineComment = false;
-          } else if (inBlockComment) {
-            if (c == '*' && i + 1 < s.size() && s[i + 1] == '/') {
-              inBlockComment = false;
-              ++i;
-            }
-          } else if (inStr) {
-            if (esc) {
-              esc = false;
-            } else if (c == '\\') {
-              esc = true;
-            } else if (c == '"') {
-              inStr = false;
-            }
-          } else if (inChr) {
-            if (esc) {
-              esc = false;
-            } else if (c == '\\') {
-              esc = true;
-            } else if (c == '\'') {
-              inChr = false;
-            }
-          } else {
-            // The normal case: split the rewritten core around the original
-            // literal delimiters and require a unique segmentation.
-            if (c == '/' && i + 1 < s.size()) {
-              if (s[i + 1] == '/') {
-                inLineComment = true;
-                ++i;
-                continue;
-              }
-              if (s[i + 1] == '*') {
-                inBlockComment = true;
-                ++i;
-                continue;
-              }
-            }
-
-            if (c == '"') {
-              inStr = true;
-            } else if (c == '\'') {
-              inChr = true;
-            } else {
-              // The normal case: split the rewritten core around the original
-              // literal delimiters and require a unique segmentation.
-              switch (c) {
-              case '(':
-                ++paren;
-                break;
-              case ')':
-                if (paren > 0)
-                  --paren;
-                break;
-              case '[':
-                ++bracket;
-                break;
-              case ']':
-                if (bracket > 0)
-                  --bracket;
-                break;
-              case '{':
-                ++brace;
-                break;
-              case '}':
-                if (brace > 0)
-                  --brace;
-                break;
-              default:
-                break;
-              }
-            }
-          }
-
-          if (!inStr && !inChr && !esc && !inLineComment && !inBlockComment &&
-              paren == 0 && bracket == 0 && brace == 0) {
-            emitCut(static_cast<unsigned>(i + 1));
-          }
-        }
-      };
-
       auto isBalancedRefoldFragment = [&](StringRef s) -> bool {
         bool balancedAtEnd = false;
-        enumerateTopLevelBalancedCutPoints(s, [&](unsigned cut) {
-          if (cut == s.size())
-            balancedAtEnd = true;
-        });
+        enumerateTopLevelBalancedCutPointsWithLexer(s, lexLang_,
+                                                    [&](unsigned cut) {
+                                                      if (cut == s.size())
+                                                        balancedAtEnd = true;
+                                                    });
         return balancedAtEnd;
       };
 
@@ -11600,15 +11566,16 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               auto &&emitMatch) {
         if (needle.empty())
           return;
-        enumerateTopLevelBalancedCutPoints(haystack, [&](unsigned cut) {
-          const size_t pos = static_cast<size_t>(cut);
-          if (pos > maxPos)
-            return;
-          if (!isLikelyTokenBoundaryInRefoldText(haystack, pos))
-            return;
-          if (haystack.drop_front(pos).starts_with(needle))
-            emitMatch(pos);
-        });
+        enumerateTopLevelBalancedCutPointsWithLexer(
+            haystack, lexLang_, [&](unsigned cut) {
+              const size_t pos = static_cast<size_t>(cut);
+              if (pos > maxPos)
+                return;
+              if (!isLikelyTokenBoundaryInRefoldText(haystack, pos))
+                return;
+              if (haystack.drop_front(pos).starts_with(needle))
+                emitMatch(pos);
+            });
       };
 
       auto buildRewrittenInvocationSyntax =
@@ -11643,7 +11610,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           StringRef newArg = StringRef(KV.second).trim();
           const bool allowComma =
               argIdx < inv.defParams.size() && inv.defParams[argIdx].variadic;
-          if (!allowComma && hasTopLevelCommaInRefoldText(newArg))
+          if (!allowComma && hasTopLevelCommaWithLexer(newArg, lexLang_))
             return std::nullopt;
 
           edits.push_back(LocalEdit{relB, relE, newArg.str()});
@@ -12378,17 +12345,18 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             } else {
               // The normal case: split the rewritten core around the original
               // literal delimiters and require a unique segmentation.
-              enumerateTopLevelBalancedCutPoints(rest, [&](unsigned cut) {
-                const size_t len = static_cast<size_t>(cut);
-                if (len > maxLen)
-                  return;
-                if (!isLikelyTokenBoundaryInRefoldText(rest, len) ||
-                    !isBalancedRefoldFragment(rest.take_front(len)))
-                  return;
-                emitPiece(rest.take_front(len));
-                if (newSolutions.size() > 1)
-                  return;
-              });
+              enumerateTopLevelBalancedCutPointsWithLexer(
+                  rest, lexLang_, [&](unsigned cut) {
+                    const size_t len = static_cast<size_t>(cut);
+                    if (len > maxLen)
+                      return;
+                    if (!isLikelyTokenBoundaryInRefoldText(rest, len) ||
+                        !isBalancedRefoldFragment(rest.take_front(len)))
+                      return;
+                    emitPiece(rest.take_front(len));
+                    if (newSolutions.size() > 1)
+                      return;
+                  });
             }
           };
 
@@ -12606,7 +12574,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         }
 
         if (!isVariadicFormalInInvocation(inv, argIdx) &&
-            hasTopLevelCommaInRefoldText(newText)) {
+            hasTopLevelCommaWithLexer(newText, lexLang_)) {
           cert.failure = RawFormalValidationFailure::ArityChange;
           cert.detail = formatv(
                             "{0}: inv id={1} name={2} argIdx={3} arity "
