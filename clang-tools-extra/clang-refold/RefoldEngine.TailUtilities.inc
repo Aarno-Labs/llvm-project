@@ -199,8 +199,8 @@ void RefoldEngine::MaterializeIncludeExpansion(
   if (auto it = macroPatchesByOwner.find(includeId);
       it != macroPatchesByOwner.end()) {
     for (const auto &mp : it->second) {
-      uint64_t mpEnd =
-          extendChainedCallEnd(StringRef(bytes), mp.invEnd, mp.replacement);
+      uint64_t mpEnd = stringutils::extendChainedCallEnd(
+          StringRef(bytes), mp.invEnd, mp.replacement);
       if (mpEnd != mp.invEnd) {
         debug("macro/chain",
               "inc#{0} extend chained callsite [{1},{2}) -> [{1},{3})", inc->id,
@@ -351,8 +351,8 @@ void RefoldEngine::MaterializeIncludeExpansion(
         AcceptedResultCandidate realizationCandidate;
         if (auto realized = BuildInlineIncludeRealizationFromB(
                 *inc,
-                llvm::formatv("degenerate child replace site for parent inc#{0} "
-                              "child#{1} site=[{2},{3})",
+                llvm::formatv("degenerate child replace site for parent inc#{0}"
+                              " child#{1} site=[{2},{3})",
                               inc->id, child->id, siteStart, siteEnd)
                     .str(),
                 &realizationCandidate)) {
@@ -512,7 +512,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     // land exactly at a declaration boundary (for example, between
     // `int yyy(...);` and `int zzz(...);`) can anchor to the first token
     // of the following declaration rather than being forced back inside the
-    // previous one.  For DELETE / REPLACE we restrict to the owning decl.
+    // previous one. For DELETE / REPLACE we restrict to the owning decl.
     uint64_t ppLo = coverBegin;
     uint64_t ppHi = coverEnd;
     if (!isInsert && decl) {
@@ -899,7 +899,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     }
 
     // Clamp to the declaration’s header_span, if any, so we never cross decl
-    // boundaries for DELETE/REPLACE.  For INSERTs we intentionally allow the
+    // boundaries for DELETE/REPLACE. For INSERTs we intentionally allow the
     // anchor to sit on the boundary between two declarations so that a new
     // declaration can be injected cleanly between them.
     if (!isInsert && decl) {
@@ -1327,7 +1327,7 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
       continue;
     }
 
-    // Non-zero span duplicates must be identical to compose safely.  Choosing
+    // Non-zero span duplicates must be identical to compose safely. Choosing
     // an arbitrary writer for the same replaced byte range is not a proof; if
     // two producers disagree about the replacement payload, fail closed and let
     // the caller select the explicit terminal fallback path.
@@ -1346,7 +1346,7 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
         fragments.reserve(j - i);
 
         // This merge is only valid for duplicate fragments that still have a
-        // direct one-to-one TU hunk witness.  Anything synthesized, macro-owned,
+        // direct one-to-one TU hunk witness. Anything synthesized, macro-owned,
         // include-owned, or missing hunk provenance must stay on the normal
         // composition path.
         for (size_t k = i; k < j; ++k) {
@@ -1358,7 +1358,7 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
           fragments.push_back(&edit);
         }
 
-        // Reconstruct the original hunk order before proving adjacency.  The
+        // Reconstruct the original hunk order before proving adjacency. The
         // duplicate group is ordered by emitted byte span, which is not enough
         // to prove that the B-side replacement interval is contiguous.
         sort(fragments, [](const TextEdit *lhs, const TextEdit *rhs) {
@@ -1366,7 +1366,7 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
         });
 
         // Adjacent duplicate fragments may be collapsed only when they form one
-        // uninterrupted run in both the A token hunks and B token hunks.  This
+        // uninterrupted run in both the A token hunks and B token hunks. This
         // prevents merging unrelated fragments that merely overlap the same
         // emitted byte span.
         for (size_t k = 1; k < fragments.size(); ++k) {
@@ -1400,7 +1400,7 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
         TextEdit merged{s, t, std::move(ro.text), std::move(ro.pending),
                         std::nullopt, {}};
 
-        // Preserve existing proof carriers from the fragments.  If the fragments
+        // Preserve existing proof carriers from the fragments. If the fragments
         // carry macro-root provenance, they must all agree on the same root.
         for (const TextEdit *fragment : fragments) {
           if (fragment->expandedMacroRootId) {
@@ -1429,9 +1429,9 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
       };
 
       // Split token-LCS frontiers can produce several direct TU hunk fragments
-      // for the same original byte span.  If those fragments are adjacent in
+      // for the same original byte span. If those fragments are adjacent in
       // both A-token and B-token space, they are not competing writers: they are
-      // one replacement that was fragmented before byte emission.  Rebuild that
+      // one replacement that was fragmented before byte emission. Rebuild that
       // replacement from the closed B-token interval; otherwise keep the
       // existing fail-closed duplicate-edit policy.
       if (std::optional<TextEdit> mergedDirectDuplicate =
@@ -1588,7 +1588,7 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
     }
 
     // Prove that every A token physically consumed by the source interval has
-    // no matched B occurrence outside the candidate B interval.  This is what
+    // no matched B occurrence outside the candidate B interval. This is what
     // prevents a closure from stealing a stable token whose true B-side mate
     // remains outside the replacement.
     for (uint64_t aTok = 0; aTok < static_cast<uint64_t>(aToks_.size());
@@ -1598,8 +1598,8 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
       if (!span)
         continue;
 
-      const bool overlapsSource =
-          span->first < candidate.sourceEnd && candidate.sourceBegin < span->second;
+      const bool overlapsSource = span->first < candidate.sourceEnd &&
+                                  candidate.sourceBegin < span->second;
       if (!overlapsSource)
         continue;
 
@@ -1617,7 +1617,7 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
     }
 
     // Symmetrically, every matched B token emitted by the replacement must map
-    // back to an A token wholly contained in the source interval.  Otherwise the
+    // back to an A token wholly contained in the source interval. Otherwise the
     // candidate would duplicate or move an outside stable token.
     for (uint64_t bTok = candidate.bBegin; bTok < candidate.bEnd; ++bTok) {
       if (bTok >= static_cast<uint64_t>(abTokMapB2A_.size()))
@@ -1751,9 +1751,9 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
   };
 
   // Some token-LCS tie choices can split one logical B-side TU realization
-  // around stable punctuation tokens.  If the resulting direct TU hunk edits
+  // around stable punctuation tokens. If the resulting direct TU hunk edits
   // overlap after lexical widening, first try to replace the minimal enclosing
-  // direct-hunk run by one source/B-token-closed realization.  This is not a
+  // direct-hunk run by one source/B-token-closed realization. This is not a
   // merge heuristic: it is accepted only when the A→B and B→A token maps prove
   // that the source interval and replacement interval are mutually closed.
   for (;;) {

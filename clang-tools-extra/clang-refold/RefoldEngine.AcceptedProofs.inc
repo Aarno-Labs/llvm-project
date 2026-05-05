@@ -901,8 +901,8 @@ std::string RefoldEngine::FormatTheoremDomainContract(
   if (contract.hasExplicitExclusion) {
     const TerminalFallbackWitness witness{contract.explicitExclusion, 0, false,
                                           std::string()};
-    return formatv("kind={0} inDeclaredDomain={1} counts={2} declaredTarget={3} "
-                   "exclusion={4}",
+    return formatv("kind={0} inDeclaredDomain={1} counts={2} declaredTarget={3}"
+                   " exclusion={4}",
                    contract.kind, contract.inDeclaredDomain ? 1 : 0,
                    contract.countsTowardCompleteness ? 1 : 0,
                    contract.declaredTarget, witness)

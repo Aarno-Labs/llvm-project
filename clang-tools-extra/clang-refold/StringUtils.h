@@ -65,8 +65,14 @@
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
+#include <string>
+#include <type_traits>
+#include <utility>
+#include <vector>
 
 using namespace llvm;
 
@@ -246,6 +252,70 @@ inline bool isIndentOnly(StringRef s, size_t from, size_t to) {
 }
 
 std::string quoteCString(StringRef s);
+
+/// Return one StringRef per byte/character in \p s.
+///
+/// The returned references point into \p s, so callers must keep the source
+/// buffer alive while using the vector. This is primarily used to run the
+/// generic diff machinery at byte/character granularity without allocating one
+/// std::string per character.
+std::vector<StringRef> splitChars(StringRef s);
+
+/// Canonicalize the raw payload recovered from a stringification inverse.
+///
+/// This mirrors the preprocessor's stringify normalization for the supported
+/// inverse domain: trim leading/trailing PP whitespace, collapse each
+/// inter-token whitespace run to one ASCII space, reject comments outside
+/// literals, and preserve escape-aware string/character literal contents.
+/// Returns nullopt when the payload is malformed or outside that domain.
+std::optional<std::string> canonicalizeStringifyInversePayload(StringRef raw);
+
+/// True iff the clamped byte range [begin, end) contains a line-feed.
+///
+/// The endpoints are first clamped into [0, text.size()]. If the resulting end
+/// precedes the begin, the bounds are swapped so callers may pass unordered
+/// byte offsets without changing the queried set of bytes.
+bool rangeContainsNewline(StringRef text, size_t begin, size_t end);
+
+/// True iff the clamped byte range [begin, end) contains only PP whitespace.
+///
+/// The accepted whitespace set is the same ASCII set as isWs(): space, HT, LF,
+/// VT, FF, and CR. The endpoints are clamped and unordered bounds are swapped
+/// using the same policy as rangeContainsNewline().
+bool rangeContainsOnlyWhitespace(StringRef text, size_t begin, size_t end);
+
+/// Return the byte offset of the start of the physical line containing \p pos.
+///
+/// The input offset is clamped into [0, text.size()]. Both LF and CR terminate
+/// a line for this byte-level helper.
+size_t lineStartOffset(StringRef text, size_t pos);
+
+/// Return the byte offset one-past the last non-newline byte of the physical
+/// line containing \p pos.
+///
+/// The input offset is clamped into [0, text.size()]. Both LF and CR terminate
+/// a line for this byte-level helper.
+size_t lineEndOffset(StringRef text, size_t pos);
+
+/// True iff only line whitespace appears between the containing line start and
+/// \p offset.
+bool beginsLineAfterWhitespace(StringRef text, size_t offset);
+
+/// True iff only line whitespace appears between \p offset and the containing
+/// line end.
+bool endsLineBeforeWhitespace(StringRef text, size_t offset);
+
+/// True iff \p replacement is a parenthesized callable head followed by one or
+/// more balanced call-suffix groups, with no trailing non-comment content.
+bool shouldPreserveFinalCallSuffixGroup(StringRef replacement);
+
+/// Extend an invocation end offset over trailing chained-call suffix groups
+/// when the replacement is no longer directly callable.
+uint64_t extendChainedCallEnd(StringRef fileText, uint64_t invEnd,
+                              StringRef replacement);
+
+/// Return true iff the first non-whitespace bytes of \p s start with \p lit.
+bool startsWithAfterWhitespace(StringRef s, StringRef lit);
 
 /// Replace the substring in \p s spanning [begin, end) with \p repl.
 inline std::string replaceRange(StringRef s, size_t begin, size_t end,

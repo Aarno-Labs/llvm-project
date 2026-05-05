@@ -2104,7 +2104,7 @@ RefoldModel::FirstConditionalArmStartA(const CondGroup &group) const {
 
   for (const auto &slot : slots_) {
     // Early exits remain the same (very fast)
-    // TODO: We should replace this with a call to PathesEqual
+    // TODO: We should replace this with a call to PathsEqual
     if (slot.kind != "arm_begin" || slot.file != group.file)
       continue;
 

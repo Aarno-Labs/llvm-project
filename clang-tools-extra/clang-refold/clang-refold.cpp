@@ -537,8 +537,8 @@ static bool canIgnoreNoLinesMismatch(const PPTok &aTok, const PPTok &bTok) {
 /// Minimal macro metadata needed by the --no-lines checker recovery path.
 ///
 /// The producer can report zero-length `spans` for predefined location
-/// builtins.  When that happens, the checker uses the macro call chain
-/// and caller `body_spans` to recover the generated token position without
+/// builtins. When that happens, the checker uses the macro call chain and
+/// caller `body_spans` to recover the generated token position without
 /// broadening the normal ignore rule.
 struct NoLinesMacroInfo {
   uint64_t id = 0;
@@ -571,7 +571,7 @@ static std::optional<uint64_t> getJSONUInt64(const json::Object &obj,
 }
 
 /// Return true when any span covers at least one token after clamping to the
-/// token stream length.  Zero-length spans intentionally return false.
+/// token stream length. Zero-length spans intentionally return false.
 static bool spanMarksAnyToken(ArrayRef<RefoldModel::PPSpan> spans,
                               size_t tokenCount) {
   for (const auto &sp : spans) {
@@ -623,7 +623,7 @@ readSourceForNoLines(StringRef path, const PPCtx &ctx,
 /// Compute the 1-based physical source line containing `offset`.
 ///
 /// The value is used only as one exact candidate spelling for zero-length
-/// `__LINE__` metadata.  If the source cannot be read, callers fail closed by
+/// `__LINE__` metadata. If the source cannot be read, callers fail closed by
 /// leaving the allowed-spelling set empty.
 static std::optional<uint64_t> lineNumberAtSourceOffset(
     StringRef path, uint64_t offset, const PPCtx &ctx,
@@ -682,7 +682,7 @@ static void addPathSpellingsForNoLinesBuiltin(
 /// event under `--no-lines`.
 ///
 /// For path-valued builtins, include the builtin's file, each caller's file, and
-/// the TU source path where applicable.  For `__LINE__`, compute exact physical
+/// the TU source path where applicable. For `__LINE__`, compute exact physical
 /// line numbers from invocation offsets when the source bytes are available.
 static std::set<std::string> buildAllowedSpellingsForNoLinesBuiltin(
     const NoLinesMacroInfo &item, ArrayRef<const NoLinesMacroInfo *> chain,
@@ -738,8 +738,8 @@ static bool tokenMatchesNoLinesBuiltinEvent(const PPTok &tok,
 }
 
 /// Materialize the sorted unique token indices covered by a caller macro body.
-/// These are the only positions considered when recovering a child builtin whose
-/// own span did not cover any token.
+/// These are the only positions considered when recovering a child builtin
+/// whose own span did not cover any token.
 static std::vector<size_t>
 bodyTokenCandidatesForNoLines(ArrayRef<RefoldModel::PPSpan> bodySpans,
                               size_t tokenCount) {
@@ -761,10 +761,10 @@ bodyTokenCandidatesForNoLines(ArrayRef<RefoldModel::PPSpan> bodySpans,
 /// producer spans.
 ///
 /// Recovery is deliberately conservative: each builtin event is anchored to the
-/// nearest caller macro with token-covering `body_spans`, then the events for an
-/// anchor are matched to body tokens in producer order.  Tokens are marked only
-/// when the monotone assignment is unique; ambiguous or unanchored cases remain
-/// unmarked so the validator fails closed.
+/// nearest caller macro with token-covering `body_spans`, then the events for
+/// an anchor are matched to body tokens in producer order. Tokens are marked
+/// only when the monotone assignment is unique; ambiguous or unanchored cases
+/// remain unmarked so the validator fails closed.
 static void recoverZeroLengthNoLinesBuiltinSpans(
     const json::Object &rootJson, const PPCtx &ctx, ArrayRef<PPTok> a0Toks,
     MutableArrayRef<uint8_t> a0Sensitive, StringRef sourcePath) {
@@ -772,7 +772,7 @@ static void recoverZeroLengthNoLinesBuiltinSpans(
   if (!items)
     return;
 
-  // Reparse only the macro metadata needed by the checker.  The ordinal records
+  // Reparse only the macro metadata needed by the checker. The ordinal records
   // producer item order, which is the order used for monotone recovery below.
   std::map<uint64_t, NoLinesMacroInfo> macrosById;
   size_t ordinal = 0;
@@ -863,7 +863,7 @@ static void recoverZeroLengthNoLinesBuiltinSpans(
   for (auto &entry : eventsByAnchor) {
     std::vector<NoLinesSensitiveEvent> &events = entry.second;
 
-    // Match events to tokens in metadata order.  This preserves the original
+    // Match events to tokens in metadata order. This preserves the original
     // macro-expansion order and prevents arbitrary same-spelling token choices.
     std::sort(events.begin(), events.end(),
               [](const NoLinesSensitiveEvent &lhs,
@@ -890,7 +890,7 @@ static void recoverZeroLengthNoLinesBuiltinSpans(
       }
     }
 
-    // Count monotone assignments, saturated at two.  We only need to know
+    // Count monotone assignments, saturated at two. We only need to know
     // whether the assignment is absent, unique, or ambiguous.
     std::vector<std::vector<uint8_t>> ways(
         eCount + 1, std::vector<uint8_t>(cCount + 1, 0));

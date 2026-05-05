@@ -353,7 +353,8 @@ public:
     StringRef name;
     bool variadic;
 
-    MacroDefParam(StringRef Name, bool Variadic) : name(Name), variadic(Variadic) {}
+    MacroDefParam(StringRef Name, bool Variadic)
+        : name(Name), variadic(Variadic) {}
   };
 
   struct MacroInvocation {
@@ -544,7 +545,7 @@ public:
   ///         success, or an error if required fields are missing or invalid.
   ///
   /// \see RefoldSchema.h
-  static Expected<RefoldModel> FromJson(const json::Object &Root);
+  static Expected<RefoldModel> FromJson(const json::Object &root);
 
   // ============================== Basic getters ==============================
 
