@@ -166,18 +166,16 @@ def main():
   # 4) Compare final refolded output
   run(f'diff -u {shlex.quote(exp_mod)} {shlex.quote(out_mod)}')
 
-  # 5) Run the checker only if --with-lines was provided
-  if args.with_lines:
-    verify_out = os.path.join(tmp_out, f'{testname}.verify.out')
-
-    clang_refold_checker_cmd = (
-        f'{shlex.quote(args.refolder)} '
-        f'--log-level={shlex.quote(args.log)} '
-        f'--check {shlex.quote(out_mod)} '
-        f'--pp-mod {shlex.quote(exp_i_mod)} '
-        f'--refold-map {shlex.quote(out_json)}'
-    )
-    run(clang_refold_checker_cmd, verify_out)
+  # 5) Run the checker
+  verify_out = os.path.join(tmp_out, f'{testname}.verify.out')
+  clang_refold_checker_cmd = (
+      f'{shlex.quote(args.refolder)} {line_flag} '
+      f'--log-level={shlex.quote(args.log)} '
+      f'--check {shlex.quote(out_mod)} '
+      f'--pp-mod {shlex.quote(exp_i_mod)} '
+      f'--refold-map {shlex.quote(out_json)}'
+  )
+  run(clang_refold_checker_cmd, verify_out)
 
 
 if __name__ == '__main__':
