@@ -1333,20 +1333,24 @@ std::string RefoldEngine::RunSinglePassRefold() {
   abByteHunks_ = BuildByteHunksFromRawText();
   BuildByteHunkPrefixDeltaCache();
 
-  // Split replace hunks when an exact interior owner boundary can be proven.
+  // Split replace hunks when a deterministic mixed-owner partition can be
+  // proven.
   //
-  // This handles edits such as a plain TU token replacement immediately
-  // adjacent to a macro-owned replacement in the same diff hunk. The split is
-  // accepted only when:
-  //   * the whole hunk is not already realizable as a single macro patch,
-  //   * an interior A-token boundary maps to an exact partition of the hunk's
-  //     B-token interval, and
-  //   * the left/right subranges are independently realizable by different
-  //     owners (for example TU on one side and a macro on the other).
+  // The old normalizer accepted only the two-piece case where one interior
+  // A-token boundary also proved one exact interior B-token boundary. That was
+  // sound, but incomplete for hunks containing more than two independently
+  // realizable regions. Generalize the proof to an ordered partition:
   //
-  // These conditions make the split structural rather than heuristic: the
-  // owner boundary exists in the provenance, and the A->B mapping proves the
-  // corresponding B boundary exactly.
+  //   * every segment consumes a non-empty A subrange;
+  //   * every segment has a known TU/include/macro realizer;
+  //   * every segment has an A->B token envelope inside the original hunk;
+  //   * segment B envelopes are contiguous and exactly tile the original B
+  //     hunk; and
+  //   * the final partition contains at least two different realizers.
+  //
+  // This remains a normalization-only proof. Each emitted sub-hunk is still
+  // validated later by the ordinary macro/include/TU classifier before any
+  // source edit is accepted.
   if (hunks.size() > 0) {
     enum class HunkRealizerKind {
       Unknown,
@@ -1366,6 +1370,20 @@ std::string RefoldEngine::RunSinglePassRefold() {
       bool operator!=(const HunkRealizer &other) const {
         return !(*this == other);
       }
+    };
+
+    auto realizerToString = [](const HunkRealizer &r) -> std::string {
+      switch (r.kind) {
+      case HunkRealizerKind::TU:
+        return "TU";
+      case HunkRealizerKind::Include:
+        return llvm::formatv("Include#{0}", r.id).str();
+      case HunkRealizerKind::Macro:
+        return llvm::formatv("Macro#{0}", r.id).str();
+      case HunkRealizerKind::Unknown:
+        break;
+      }
+      return "Unknown";
     };
 
     auto classifyHunkRealizer = [&](uint64_t aStart,
@@ -1390,7 +1408,151 @@ std::string RefoldEngine::RunSinglePassRefold() {
       return {};
     };
 
-    size_t ownerSplitCount = 0;
+    struct PartitionEdge {
+      uint64_t aStart = 0;
+      uint64_t aEnd = 0;
+      uint64_t bStart = 0;
+      uint64_t bEnd = 0;
+      HunkRealizer realizer;
+    };
+
+    struct PartitionParent {
+      bool valid = false;
+      size_t edgeIndex = 0;
+      uint64_t prevB = 0;
+      unsigned cost = 0;
+    };
+
+    auto tryBuildMixedOwnerPartition =
+        [&](const diffutils::Hunk &h)
+            -> std::optional<SmallVector<PartitionEdge, 8>> {
+      if (!h.isReplace() || h.aEnd <= h.aStart || h.bEnd <= h.bStart)
+        return std::nullopt;
+      if (h.aEnd - h.aStart < 2)
+        return std::nullopt;
+
+      // If the whole hunk is already a patchable macro invocation, leave it as
+      // one hunk. Splitting inside an already-proven whole macro candidate would
+      // make this normalization pass compete with the macro lattice rather than
+      // merely exposing otherwise independent owners.
+      Owner wholeOwner = ClassifyOwnerWithSegments(tuPath, h);
+      if (auto *wholeMacro = SmallestCoveringPatchableMacro(
+              h.aStart, h.aEnd, wholeOwner.includeId)) {
+        if (wholeMacro->invB && wholeMacro->invE)
+          return std::nullopt;
+      }
+
+      const uint64_t aLen = h.aEnd - h.aStart;
+      std::vector<PartitionEdge> edges;
+      std::vector<std::vector<size_t>> edgesByAOffset(
+          static_cast<size_t>(aLen) + 1);
+
+      for (uint64_t aLo = h.aStart; aLo < h.aEnd; ++aLo) {
+        // Prefer wider segments when several partitions have the same number of
+        // pieces. This keeps source structure maximally coarse while remaining
+        // deterministic.
+        for (uint64_t aHi = h.aEnd; aHi > aLo; --aHi) {
+          HunkRealizer realizer = classifyHunkRealizer(aLo, aHi);
+          if (realizer.kind == HunkRealizerKind::Unknown)
+            continue;
+
+          auto env = MapATokRangeAToBTokenEnvelopeTrimEdgeInsertions(aLo, aHi);
+          if (!env)
+            continue;
+          if (env->first < static_cast<size_t>(h.bStart) ||
+              env->second > static_cast<size_t>(h.bEnd) ||
+              env->first >= env->second)
+            continue;
+
+          PartitionEdge edge;
+          edge.aStart = aLo;
+          edge.aEnd = aHi;
+          edge.bStart = static_cast<uint64_t>(env->first);
+          edge.bEnd = static_cast<uint64_t>(env->second);
+          edge.realizer = realizer;
+
+          const size_t edgeIndex = edges.size();
+          edges.push_back(edge);
+          edgesByAOffset[static_cast<size_t>(aLo - h.aStart)].push_back(
+              edgeIndex);
+        }
+      }
+
+      std::vector<std::map<uint64_t, PartitionParent>> dp(
+          static_cast<size_t>(aLen) + 1);
+      dp[0][h.bStart] = PartitionParent{/*valid=*/true, /*edgeIndex=*/0,
+                                        /*prevB=*/h.bStart, /*cost=*/0};
+
+      for (uint64_t aOff = 0; aOff < aLen; ++aOff) {
+        auto &states = dp[static_cast<size_t>(aOff)];
+        if (states.empty())
+          continue;
+
+        for (const auto &state : states) {
+          const uint64_t curB = state.first;
+          const unsigned curCost = state.second.cost;
+
+          for (size_t edgeIndex : edgesByAOffset[static_cast<size_t>(aOff)]) {
+            const PartitionEdge &edge = edges[edgeIndex];
+            if (edge.bStart != curB)
+              continue;
+
+            auto &dst = dp[static_cast<size_t>(edge.aEnd - h.aStart)];
+            const unsigned nextCost = curCost + 1;
+            auto existing = dst.find(edge.bEnd);
+            if (existing == dst.end() || nextCost < existing->second.cost) {
+              dst[edge.bEnd] = PartitionParent{/*valid=*/true, edgeIndex,
+                                               /*prevB=*/curB, nextCost};
+            }
+          }
+        }
+      }
+
+      auto finalIt = dp[static_cast<size_t>(aLen)].find(h.bEnd);
+      if (finalIt == dp[static_cast<size_t>(aLen)].end())
+        return std::nullopt;
+
+      SmallVector<PartitionEdge, 8> path;
+      uint64_t aPos = h.aEnd;
+      uint64_t bPos = h.bEnd;
+      while (aPos != h.aStart) {
+        const uint64_t aOff = aPos - h.aStart;
+        const auto stateIt = dp[static_cast<size_t>(aOff)].find(bPos);
+        if (stateIt == dp[static_cast<size_t>(aOff)].end() ||
+            !stateIt->second.valid)
+          return std::nullopt;
+
+        const PartitionEdge &edge = edges[stateIt->second.edgeIndex];
+        path.push_back(edge);
+        aPos = edge.aStart;
+        bPos = stateIt->second.prevB;
+      }
+      std::reverse(path.begin(), path.end());
+
+      if (path.size() < 2)
+        return std::nullopt;
+
+      bool hasMixedRealizers = false;
+      for (size_t i = 1; i < path.size(); ++i) {
+        if (path[i].realizer != path[0].realizer) {
+          hasMixedRealizers = true;
+          break;
+        }
+      }
+      if (!hasMixedRealizers)
+        return std::nullopt;
+
+      // Adjacent equal realizers should have been represented by one wider
+      // edge. Reject rather than emitting needlessly fragmented hunks.
+      for (size_t i = 1; i < path.size(); ++i) {
+        if (path[i - 1].realizer == path[i].realizer)
+          return std::nullopt;
+      }
+
+      return path;
+    };
+
+    size_t ownerPartitionCount = 0;
     bool changed = true;
     while (changed) {
       changed = false;
@@ -1398,58 +1560,28 @@ std::string RefoldEngine::RunSinglePassRefold() {
       splitHunks.reserve(hunks.size());
 
       for (const auto &h : hunks) {
-        if (!h.isReplace() || h.aEnd - h.aStart < 2 || h.bEnd - h.bStart < 2) {
+        auto partition = tryBuildMixedOwnerPartition(h);
+        if (!partition) {
           splitHunks.push_back(h);
           continue;
         }
 
-        Owner wholeOwner = ClassifyOwnerWithSegments(tuPath, h);
-        if (auto *wholeMacro =
-                SmallestCoveringPatchableMacro(h.aStart, h.aEnd,
-                                               wholeOwner.includeId)) {
-          if (wholeMacro->invB && wholeMacro->invE) {
-            splitHunks.push_back(h);
-            continue;
-          }
-        }
+        trace("hunks/norm",
+              "partition mixed-owner replace hunk A=[{0},{1}) B=[{2},{3}) "
+              "segments={4}",
+              h.aStart, h.aEnd, h.bStart, h.bEnd, partition->size());
 
-        bool splitApplied = false;
-        for (uint64_t split = h.aStart + 1; split < h.aEnd; ++split) {
-          auto leftEnv =
-              MapATokRangeAToBTokenEnvelopeTrimEdgeInsertions(h.aStart, split);
-          auto rightEnv =
-              MapATokRangeAToBTokenEnvelopeTrimEdgeInsertions(split, h.aEnd);
-          if (!leftEnv || !rightEnv)
-            continue;
-
-          if (leftEnv->first != static_cast<size_t>(h.bStart) ||
-              rightEnv->second != static_cast<size_t>(h.bEnd) ||
-              leftEnv->second != rightEnv->first)
-            continue;
-
-          HunkRealizer leftRealizer = classifyHunkRealizer(h.aStart, split);
-          HunkRealizer rightRealizer = classifyHunkRealizer(split, h.aEnd);
-          if (leftRealizer.kind == HunkRealizerKind::Unknown ||
-              rightRealizer.kind == HunkRealizerKind::Unknown ||
-              leftRealizer == rightRealizer)
-            continue;
-
+        for (const PartitionEdge &edge : *partition) {
           trace("hunks/norm",
-                "split mixed-owner replace hunk A=[{0},{1}) B=[{2},{3}) at A={4} / B={5}",
-                h.aStart, h.aEnd, h.bStart, h.bEnd, split, leftEnv->second);
-          splitHunks.push_back(diffutils::Hunk{h.aStart, split, h.bStart,
-                                               static_cast<uint64_t>(leftEnv->second)});
-          splitHunks.push_back(diffutils::Hunk{split, h.aEnd,
-                                               static_cast<uint64_t>(rightEnv->first),
-                                               h.bEnd});
-          ++ownerSplitCount;
-          splitApplied = true;
-          changed = true;
-          break;
+                "  segment A=[{0},{1}) B=[{2},{3}) realizer={4}",
+                edge.aStart, edge.aEnd, edge.bStart, edge.bEnd,
+                realizerToString(edge.realizer));
+          splitHunks.push_back(diffutils::Hunk{edge.aStart, edge.aEnd,
+                                               edge.bStart, edge.bEnd});
         }
 
-        if (!splitApplied)
-          splitHunks.push_back(h);
+        ++ownerPartitionCount;
+        changed = true;
       }
 
       if (changed) {
@@ -1458,10 +1590,10 @@ std::string RefoldEngine::RunSinglePassRefold() {
       }
     }
 
-    if (ownerSplitCount) {
+    if (ownerPartitionCount) {
       trace("hunks/norm",
-            "split mixed-owner replace hunks: count={0} finalHunks={1}",
-            ownerSplitCount, hunks.size());
+            "partitioned mixed-owner replace hunks: count={0} finalHunks={1}",
+            ownerPartitionCount, hunks.size());
     }
   }
 

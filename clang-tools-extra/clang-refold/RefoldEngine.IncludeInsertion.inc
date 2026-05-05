@@ -97,23 +97,33 @@ RefoldEngine::BuildIncludeInsertionPatch(const RefoldModel::IncludeItem &inc,
 
   std::string insertBytes;
   const size_t numOffsets = bTokOff_.size();
-  const size_t sourceLen = bSource_.size();
-
   const size_t uBStart = static_cast<size_t>(h.bStart);
   const size_t uBEnd = static_cast<size_t>(h.bEnd);
 
   // Validate hunk bounds against B-token offsets.
   if (uBStart < numOffsets && uBEnd < numOffsets && uBEnd >= uBStart) {
-    size_t b0 = bTokOff_[uBStart];
-    size_t b1 = bTokOff_[uBEnd];
-
-    // Clamp byte offsets to the actual length of bSource_ (defensively handle
-    // huge sizes).
-    b0 = std::min(b0, sourceLen);
-    b1 = std::clamp(b1, b0, sourceLen);
-    if (b1 > b0) {
-      insertBytes = bSource_.substr(b0, b1 - b0).str();
-    }
+    // Replacement and deletion patches have an original header byte span whose
+    // untouched leading/trailing whitespace remains in the header when the edit
+    // is applied.  Therefore the replacement payload must cover exactly the
+    // replacement tokens and must not steal the inter-token whitespace before
+    // the next B token.  This matters for mixed-owner partitions: if an
+    // include segment `10 +` is followed by a macro segment `ID(20)`, the
+    // newline/indentation between `+` and `20` belongs to the macro/TU
+    // boundary, not to the materialized include body.  Absorbing it here would
+    // create artificial newline drift inside the header, producing gratuitous
+    // blank lines in --no-lines mode and duplicate header-local #line resyncs
+    // when line directives are enabled.
+    //
+    // Pure insertions are different: there is no original source span whose
+    // surrounding whitespace can be retained, so keep the full token envelope
+    // to preserve the inserted B-side payload.
+    StringRef bSlice = h.isInsertOnly()
+                           ? sliceTokenEnvelope(bTokOff_, bSource_, h.bStart,
+                                                h.bEnd)
+                           : sliceExactTokenCoverage(bTokOff_, bToks_,
+                                                     bSource_, h.bStart,
+                                                     h.bEnd);
+    insertBytes = bSlice.str();
   } else {
     // Hardening: Log an error or assert if we get a hunk that points
     // outside our known token universe.
