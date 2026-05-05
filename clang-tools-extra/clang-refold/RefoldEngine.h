@@ -1396,6 +1396,7 @@ private:
     ArgLikeBegin,
     ImmediateRightNeighbor,
     ImmediateLeftNeighbor,
+    IncludeDirectiveBoundary,
     CorroboratedRightNeighbor,
     CorroboratedLeftNeighbor,
   };

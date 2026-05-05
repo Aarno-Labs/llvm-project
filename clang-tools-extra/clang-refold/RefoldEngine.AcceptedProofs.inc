@@ -627,6 +627,9 @@ RefoldEngine::ValidateTUAnchorProof(AcceptedPathKind currentPath,
     case TUAnchorEvidenceKind::ImmediateLeftNeighbor:
       provableWitness = witness->hasLeftNeighbor;
       break;
+    case TUAnchorEvidenceKind::IncludeDirectiveBoundary:
+      provableWitness = witness->hasLeftNeighbor && witness->hasRightNeighbor;
+      break;
     case TUAnchorEvidenceKind::CorroboratedRightNeighbor:
     case TUAnchorEvidenceKind::CorroboratedLeftNeighbor:
       provableWitness = witness->hasLeftNeighbor && witness->hasRightNeighbor;
@@ -639,7 +642,9 @@ RefoldEngine::ValidateTUAnchorProof(AcceptedPathKind currentPath,
     discharge.Require(provableWitness,
                       ProofObligationKind::TUProvableEvidenceTracked,
                       ProofFailureReason::MissingTUProvableAnchorWitness);
-    discharge.Require(witness->outsideIncludeCoverage,
+    discharge.Require(witness->outsideIncludeCoverage ||
+                          witness->evidence ==
+                              TUAnchorEvidenceKind::IncludeDirectiveBoundary,
                       ProofObligationKind::TUOutsideIncludeCoverageTracked,
                       ProofFailureReason::MissingTUOutsideIncludeCoverageProof);
     if (witness->evidence == TUAnchorEvidenceKind::CorroboratedRightNeighbor ||
@@ -692,6 +697,8 @@ RefoldEngine::FormatTUAnchorEvidenceKind(
     return "ImmediateRightNeighbor";
   case TUAnchorEvidenceKind::ImmediateLeftNeighbor:
     return "ImmediateLeftNeighbor";
+  case TUAnchorEvidenceKind::IncludeDirectiveBoundary:
+    return "IncludeDirectiveBoundary";
   case TUAnchorEvidenceKind::CorroboratedRightNeighbor:
     return "CorroboratedRightNeighbor";
   case TUAnchorEvidenceKind::CorroboratedLeftNeighbor:
