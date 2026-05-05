@@ -306,11 +306,12 @@ RefoldEngine::ValidateEmittedInvocationPreservingProof(
   return discharge.Finish();
 }
 
-
 RefoldEngine::ProofDischargeRecord
-RefoldEngine::ValidateInvocationRealizationProof(const MacroPatch &patch) const {
+RefoldEngine::ValidateInvocationRealizationProof(
+    const MacroPatch &patch) const {
   ProofDischargeAccumulator discharge;
-  const AcceptancePathInventory inventory = InventoryMacroPatchAcceptancePath(patch);
+  const AcceptancePathInventory inventory =
+      InventoryMacroPatchAcceptancePath(patch);
 
   discharge.Require(inventory.currentPath != AcceptedPathKind::Unknown,
                     ProofObligationKind::AcceptedPathClassified,
@@ -323,12 +324,13 @@ RefoldEngine::ValidateInvocationRealizationProof(const MacroPatch &patch) const 
                     ProofFailureReason::MissingProofRoot);
 
   if (patch.proofKind == MacroPatchProofKind::WholeCoverRealization) {
-    const bool boundsTracked = patch.wholeCoverALo <= patch.wholeCoverAHi &&
-                               patch.wholeCoverBRawLo <= patch.wholeCoverBRawHi &&
-                               patch.wholeCoverBAdjLo <= patch.wholeCoverBAdjHi;
-    const bool boundaryAccountingTracked = boundsTracked &&
-                                           patch.wholeCoverBRawLo <= patch.wholeCoverBAdjLo &&
-                                           patch.wholeCoverBAdjHi <= patch.wholeCoverBRawHi;
+    const bool boundsTracked =
+        patch.wholeCoverALo <= patch.wholeCoverAHi &&
+        patch.wholeCoverBRawLo <= patch.wholeCoverBRawHi &&
+        patch.wholeCoverBAdjLo <= patch.wholeCoverBAdjHi;
+    const bool boundaryAccountingTracked =
+        boundsTracked && patch.wholeCoverBRawLo <= patch.wholeCoverBAdjLo &&
+        patch.wholeCoverBAdjHi <= patch.wholeCoverBRawHi;
     discharge.Require(patch.proofValidated,
                       ProofObligationKind::LegacyValidationRecorded,
                       ProofFailureReason::MissingLegacyValidation);
@@ -357,10 +359,9 @@ RefoldEngine::ValidateInvocationRealizationProof(const MacroPatch &patch) const 
   return discharge.Finish();
 }
 
-RefoldEngine::ProofDischargeRecord
-RefoldEngine::ValidateIncludePreservingProof(AcceptedPathKind currentPath,
-                                             const IncludePatch *patch,
-                                             const IncludeAnchorWitness *witness) const {
+RefoldEngine::ProofDischargeRecord RefoldEngine::ValidateIncludePreservingProof(
+    AcceptedPathKind currentPath, const IncludePatch *patch,
+    const IncludeAnchorWitness *witness) const {
   if (currentPath == AcceptedPathKind::IncludePatchPendingMaterialization) {
     // Pending include materialization is internal-only after step 3. If some
     // caller still tries to validate it as a theorem-facing include path, fail
@@ -373,7 +374,8 @@ RefoldEngine::ValidateIncludePreservingProof(AcceptedPathKind currentPath,
   }
 
   ProofDischargeAccumulator discharge;
-  const AcceptancePathInventory inventory = BuildAcceptancePathInventory(currentPath);
+  const AcceptancePathInventory inventory =
+      BuildAcceptancePathInventory(currentPath);
   discharge.Require(inventory.currentPath != AcceptedPathKind::Unknown,
                     ProofObligationKind::AcceptedPathClassified,
                     ProofFailureReason::MissingAcceptedPathClassification);
@@ -414,25 +416,25 @@ RefoldEngine::ValidateIncludePreservingProof(AcceptedPathKind currentPath,
     discharge.Require(patch->aStart == patch->aEnd,
                       ProofObligationKind::IncludePatchShapeTracked,
                       ProofFailureReason::MissingIncludePatchShape);
-    discharge.Require(witness &&
-                          witness->evidence ==
-                              IncludeAnchorEvidenceKind::SelectedConditionalBoundary,
-                      ProofObligationKind::IncludeSelectedConditionalBoundaryWitnessTracked,
-                      ProofFailureReason::MissingIncludeSelectedConditionalBoundaryWitness);
+    discharge.Require(
+        witness && witness->evidence ==
+                       IncludeAnchorEvidenceKind::SelectedConditionalBoundary,
+        ProofObligationKind::IncludeSelectedConditionalBoundaryWitnessTracked,
+        ProofFailureReason::MissingIncludeSelectedConditionalBoundaryWitness);
     discharge.Require(witness && witness->hasAnchorByte,
                       ProofObligationKind::IncludeAnchorByteTracked,
                       ProofFailureReason::MissingIncludeAnchorByte);
-    discharge.Require(witness && witness->hasCondArmId,
-                      ProofObligationKind::IncludeSelectedConditionalBoundaryWitnessTracked,
-                      ProofFailureReason::MissingIncludeSelectedConditionalBoundaryWitness);
+    discharge.Require(
+        witness && witness->hasCondArmId,
+        ProofObligationKind::IncludeSelectedConditionalBoundaryWitnessTracked,
+        ProofFailureReason::MissingIncludeSelectedConditionalBoundaryWitness);
     break;
   case AcceptedPathKind::IncludeInsertChildBoundary:
     discharge.Require(patch->aStart == patch->aEnd,
                       ProofObligationKind::IncludePatchShapeTracked,
                       ProofFailureReason::MissingIncludePatchShape);
-    discharge.Require(witness &&
-                          witness->evidence ==
-                              IncludeAnchorEvidenceKind::ChildBoundary,
+    discharge.Require(witness && witness->evidence ==
+                                     IncludeAnchorEvidenceKind::ChildBoundary,
                       ProofObligationKind::IncludeChildBoundaryWitnessTracked,
                       ProofFailureReason::MissingIncludeChildBoundaryWitness);
     discharge.Require(witness && witness->hasAnchorByte,
@@ -446,9 +448,8 @@ RefoldEngine::ValidateIncludePreservingProof(AcceptedPathKind currentPath,
     discharge.Require(patch->aStart == patch->aEnd,
                       ProofObligationKind::IncludePatchShapeTracked,
                       ProofFailureReason::MissingIncludePatchShape);
-    discharge.Require(witness &&
-                          witness->evidence ==
-                              IncludeAnchorEvidenceKind::RightNeighborPP,
+    discharge.Require(witness && witness->evidence ==
+                                     IncludeAnchorEvidenceKind::RightNeighborPP,
                       ProofObligationKind::IncludeRightNeighborWitnessTracked,
                       ProofFailureReason::MissingIncludeRightNeighborWitness);
     discharge.Require(witness && witness->hasAnchorByte,
@@ -462,9 +463,8 @@ RefoldEngine::ValidateIncludePreservingProof(AcceptedPathKind currentPath,
     discharge.Require(patch->aStart == patch->aEnd,
                       ProofObligationKind::IncludePatchShapeTracked,
                       ProofFailureReason::MissingIncludePatchShape);
-    discharge.Require(witness &&
-                          witness->evidence ==
-                              IncludeAnchorEvidenceKind::LeftNeighborPP,
+    discharge.Require(witness && witness->evidence ==
+                                     IncludeAnchorEvidenceKind::LeftNeighborPP,
                       ProofObligationKind::IncludeLeftNeighborWitnessTracked,
                       ProofFailureReason::MissingIncludeLeftNeighborWitness);
     discharge.Require(witness && witness->hasAnchorByte,
@@ -478,9 +478,8 @@ RefoldEngine::ValidateIncludePreservingProof(AcceptedPathKind currentPath,
     discharge.Require(patch->aStart == patch->aEnd,
                       ProofObligationKind::IncludePatchShapeTracked,
                       ProofFailureReason::MissingIncludePatchShape);
-    discharge.Require(witness &&
-                          witness->evidence ==
-                              IncludeAnchorEvidenceKind::DeclBoundary,
+    discharge.Require(witness && witness->evidence ==
+                                     IncludeAnchorEvidenceKind::DeclBoundary,
                       ProofObligationKind::IncludeDeclBoundaryWitnessTracked,
                       ProofFailureReason::MissingIncludeDeclBoundaryWitness);
     discharge.Require(witness && witness->hasAnchorByte,
@@ -541,22 +540,23 @@ RefoldEngine::ValidateIncludeRealizationProof(
   discharge.Require(inventory.futureTarget != FutureProofTarget::Unknown,
                     ProofObligationKind::FutureTargetMapped,
                     ProofFailureReason::MissingFutureTargetMapping);
-  discharge.Require(currentPath == AcceptedPathKind::IncludeRealizationInlineFromB ||
-                        currentPath == AcceptedPathKind::IncludeMaterializedExpansion,
-                    ProofObligationKind::AcceptedPathClassified,
-                    ProofFailureReason::MissingAcceptedPathClassification);
+  discharge.Require(
+      currentPath == AcceptedPathKind::IncludeRealizationInlineFromB ||
+          currentPath == AcceptedPathKind::IncludeMaterializedExpansion,
+      ProofObligationKind::AcceptedPathClassified,
+      ProofFailureReason::MissingAcceptedPathClassification);
   if (currentPath == AcceptedPathKind::IncludeRealizationInlineFromB) {
     // Step 4A formalizes the class predicate directly in the local proof:
     // inline include realization is discharged only when the witness records
     // either the canonical B-envelope mapping or the deterministic
     // consensus-rescue envelope. Any other evidence kind is outside the
     // declared domain for this proof class.
-    discharge.Require(witness &&
-                          IsAcceptedIncludeRealizationEvidenceKind(
-                              witness->evidence),
-                      ProofObligationKind::IncludeRealizationWitnessTracked,
-                      ProofFailureReason::MissingIncludeRealizationWitness);
-    discharge.Require(witness && witness->hasIncludeId && witness->includeId != 0,
+    discharge.Require(
+        witness && IsAcceptedIncludeRealizationEvidenceKind(witness->evidence),
+        ProofObligationKind::IncludeRealizationWitnessTracked,
+        ProofFailureReason::MissingIncludeRealizationWitness);
+    discharge.Require(witness && witness->hasIncludeId &&
+                          witness->includeId != 0,
                       ProofObligationKind::IncludeRealizationIncludeTracked,
                       ProofFailureReason::MissingIncludeRealizationInclude);
     discharge.Require(witness && witness->hasACover &&
@@ -576,21 +576,22 @@ RefoldEngine::ValidateIncludeRealizationProof(
 
 RefoldEngine::ProofDischargeRecord
 RefoldEngine::ValidateTUAnchorProof(AcceptedPathKind currentPath,
-                                   const TUAnchorWitness *witness) const {
+                                    const TUAnchorWitness *witness) const {
   ProofDischargeAccumulator discharge;
   const AcceptancePathInventory inventory =
       BuildAcceptancePathInventory(currentPath);
-  const bool classified = currentPath == AcceptedPathKind::TUExactSlotBoundary ||
-                          currentPath == AcceptedPathKind::TUProvableInsertionAnchor;
-  discharge.Require(classified,
-                    ProofObligationKind::TUAnchorPathClassified,
+  const bool classified =
+      currentPath == AcceptedPathKind::TUExactSlotBoundary ||
+      currentPath == AcceptedPathKind::TUProvableInsertionAnchor;
+  discharge.Require(classified, ProofObligationKind::TUAnchorPathClassified,
                     ProofFailureReason::MissingTUAnchorClassification);
   discharge.Require(inventory.futureTarget != FutureProofTarget::Unknown,
                     ProofObligationKind::FutureTargetMapped,
                     ProofFailureReason::MissingFutureTargetMapping);
   // Step 7 requires every accepted TU anchor path to carry an explicit local
   // witness describing which deterministic anchor source succeeded.
-  discharge.Require(witness && witness->evidence != TUAnchorEvidenceKind::Unknown,
+  discharge.Require(witness &&
+                        witness->evidence != TUAnchorEvidenceKind::Unknown,
                     ProofObligationKind::TUAnchorWitnessTracked,
                     ProofFailureReason::MissingTUAnchorWitness);
   discharge.Require(witness && witness->hasPPGap,
@@ -683,8 +684,8 @@ RefoldEngine::ValidateTUAnchorProof(AcceptedPathKind currentPath,
   return discharge.Finish();
 }
 
-std::string RefoldEngine::FormatTUAnchorWitness(
-    const TUAnchorWitness &witness) const {
+std::string
+RefoldEngine::FormatTUAnchorWitness(const TUAnchorWitness &witness) const {
   return formatv(
              "kind={0} ppGap={1}{2} tuByte={3}{4} slotId={5} slotKind={6} "
              "macroId={7} leftPP={8}{9} rightPP={10}{11} outsideInclude={12} "
@@ -692,9 +693,11 @@ std::string RefoldEngine::FormatTUAnchorWitness(
              witness.evidence, witness.ppGap,
              witness.hasPPGap ? "" : "(missing)", witness.tuByte,
              witness.hasTUByte ? "" : "(missing)", witness.slotId,
-             witness.slotKind.empty() ? StringRef("(none)") : StringRef(witness.slotKind),
+             witness.slotKind.empty() ? StringRef("(none)")
+                                      : StringRef(witness.slotKind),
              witness.macroId, witness.leftNeighborPP,
-             witness.hasLeftNeighbor ? "" : "(missing)", witness.rightNeighborPP,
+             witness.hasLeftNeighbor ? "" : "(missing)",
+             witness.rightNeighborPP,
              witness.hasRightNeighbor ? "" : "(missing)",
              witness.outsideIncludeCoverage ? 1 : 0,
              witness.ownerDepthStable ? 1 : 0, witness.exactPPMatch ? 1 : 0)
@@ -705,16 +708,17 @@ std::string RefoldEngine::FormatIncludeAnchorWitness(
     const IncludeAnchorWitness &witness) const {
   return formatv(
              "kind={0} anchorByte={1}{2} byteRange=[{3},{4}){5} firstPP={6}{7} "
-             "lastPP={8}{9} neighborPP={10}{11} condArm={12}{13} childInc={14}{15} "
+             "lastPP={8}{9} neighborPP={10}{11} condArm={12}{13} "
+             "childInc={14}{15} "
              "decl=[{16},{17}){18}",
-             witness.evidence,
-             witness.anchorByte, witness.hasAnchorByte ? "" : "(missing)",
-             witness.startByte, witness.endByte,
-             witness.hasByteRange ? "" : "(missing)", witness.firstPP,
-             witness.hasFirstPP ? "" : "(missing)", witness.lastPP,
-             witness.hasLastPP ? "" : "(missing)", witness.neighborPP,
-             witness.hasNeighborPP ? "" : "(missing)", witness.condArmId,
-             witness.hasCondArmId ? "" : "(missing)", witness.childIncludeId,
+             witness.evidence, witness.anchorByte,
+             witness.hasAnchorByte ? "" : "(missing)", witness.startByte,
+             witness.endByte, witness.hasByteRange ? "" : "(missing)",
+             witness.firstPP, witness.hasFirstPP ? "" : "(missing)",
+             witness.lastPP, witness.hasLastPP ? "" : "(missing)",
+             witness.neighborPP, witness.hasNeighborPP ? "" : "(missing)",
+             witness.condArmId, witness.hasCondArmId ? "" : "(missing)",
+             witness.childIncludeId,
              witness.hasChildIncludeId ? "" : "(missing)", witness.declHeaderB,
              witness.declHeaderE, witness.hasDeclHeaderRange ? "" : "(missing)")
       .str();
@@ -722,15 +726,13 @@ std::string RefoldEngine::FormatIncludeAnchorWitness(
 
 std::string RefoldEngine::FormatIncludeRealizationWitness(
     const IncludeRealizationWitness &witness) const {
-  return formatv(
-             "kind={0} includeId={1}{2} aCover=[{3},{4}){5} "
-             "bTokEnvelope=[{6},{7}){8}",
-             witness.evidence,
-             witness.includeId, witness.hasIncludeId ? "" : "(missing)",
-             witness.aCoverBegin, witness.aCoverEnd,
-             witness.hasACover ? "" : "(missing)", witness.bTokBegin,
-             witness.bTokEnd,
-             witness.hasBTokenEnvelope ? "" : "(missing)")
+  return formatv("kind={0} includeId={1}{2} aCover=[{3},{4}){5} "
+                 "bTokEnvelope=[{6},{7}){8}",
+                 witness.evidence, witness.includeId,
+                 witness.hasIncludeId ? "" : "(missing)", witness.aCoverBegin,
+                 witness.aCoverEnd, witness.hasACover ? "" : "(missing)",
+                 witness.bTokBegin, witness.bTokEnd,
+                 witness.hasBTokenEnvelope ? "" : "(missing)")
       .str();
 }
 
@@ -826,18 +828,22 @@ std::string RefoldEngine::BuildOwnerUnresolvedNoTUAnchorDetail(
       tuSpan ? llvm::formatv("[{0},{1})", tuSpan->first, tuSpan->second).str()
              : std::string("none");
 
-  return llvm::formatv(
-             "edit #{0} A=[{1},{2}) insert={3} owner={4} macroOwnerExhausted={5} "
-             "includeOwnerExhausted={6} mapsToTU={7} TUByteSpan={8} hasTUByteSpan={9} "
-             "exactSlot={10} insertionAnchor={11} hasProvableInsertionAnchor={12} "
-             "boundaryParentInclude={13} hasBoundaryInclude={14} declaredDomainWall={15}",
-             hunkIndex, h.aStart, h.aEnd, isInsertion ? "yes" : "no",
-             toString(owner.kind), macroOwnerExhausted ? "yes" : "no",
-             includeOwnerExhausted ? "yes" : "no", mapsToTU ? "yes" : "no",
-             tuSpanStr, hasTUByteSpan ? "yes" : "no", exactSlot,
-             insertionAnchor, hasProvableInsertionAnchor ? "yes" : "no",
-             boundaryParent, hasBoundaryInclude ? "yes" : "no",
-             declaredDomainWall ? "yes" : "no")
+  return llvm::formatv("edit #{0} A=[{1},{2}) insert={3} owner={4} "
+                       "macroOwnerExhausted={5} "
+                       "includeOwnerExhausted={6} mapsToTU={7} TUByteSpan={8} "
+                       "hasTUByteSpan={9} "
+                       "exactSlot={10} insertionAnchor={11} "
+                       "hasProvableInsertionAnchor={12} "
+                       "boundaryParentInclude={13} hasBoundaryInclude={14} "
+                       "declaredDomainWall={15}",
+                       hunkIndex, h.aStart, h.aEnd, isInsertion ? "yes" : "no",
+                       toString(owner.kind), macroOwnerExhausted ? "yes" : "no",
+                       includeOwnerExhausted ? "yes" : "no",
+                       mapsToTU ? "yes" : "no", tuSpanStr,
+                       hasTUByteSpan ? "yes" : "no", exactSlot, insertionAnchor,
+                       hasProvableInsertionAnchor ? "yes" : "no",
+                       boundaryParent, hasBoundaryInclude ? "yes" : "no",
+                       declaredDomainWall ? "yes" : "no")
       .str();
 }
 
@@ -874,43 +880,38 @@ std::string RefoldEngine::FormatGlobalSelectionLattice(
 std::string RefoldEngine::FormatCompletenessContract(
     const CompletenessContract &contract) const {
   if (contract.hasExplicitExclusion) {
-    const TerminalFallbackWitness witness{contract.explicitExclusion, 0, false, std::string()};
-    return formatv("coverage={0} expectation={1} declaredTarget={2} counts={3} exclusion={4}",
-                   contract.coverage,
-                   contract.expectation,
+    const TerminalFallbackWitness witness{contract.explicitExclusion, 0, false,
+                                          std::string()};
+    return formatv("coverage={0} expectation={1} declaredTarget={2} counts={3} "
+                   "exclusion={4}",
+                   contract.coverage, contract.expectation,
                    contract.declaredTarget,
-                   contract.countsTowardDeclaredCoverage ? 1 : 0,
-                   witness)
+                   contract.countsTowardDeclaredCoverage ? 1 : 0, witness)
         .str();
   }
-  return formatv(
-             "coverage={0} expectation={1} declaredTarget={2} counts={3}",
-             contract.coverage,
-             contract.expectation,
-             contract.declaredTarget,
-             contract.countsTowardDeclaredCoverage ? 1 : 0)
+  return formatv("coverage={0} expectation={1} declaredTarget={2} counts={3}",
+                 contract.coverage, contract.expectation,
+                 contract.declaredTarget,
+                 contract.countsTowardDeclaredCoverage ? 1 : 0)
       .str();
 }
 
 std::string RefoldEngine::FormatTheoremDomainContract(
     const TheoremDomainContract &contract) const {
   if (contract.hasExplicitExclusion) {
-    const TerminalFallbackWitness witness{contract.explicitExclusion, 0, false, std::string()};
-    return formatv(
-               "kind={0} inDeclaredDomain={1} counts={2} declaredTarget={3} exclusion={4}",
-               contract.kind,
-               contract.inDeclaredDomain ? 1 : 0,
-               contract.countsTowardCompleteness ? 1 : 0,
-               contract.declaredTarget,
-               witness)
+    const TerminalFallbackWitness witness{contract.explicitExclusion, 0, false,
+                                          std::string()};
+    return formatv("kind={0} inDeclaredDomain={1} counts={2} declaredTarget={3} "
+                   "exclusion={4}",
+                   contract.kind, contract.inDeclaredDomain ? 1 : 0,
+                   contract.countsTowardCompleteness ? 1 : 0,
+                   contract.declaredTarget, witness)
         .str();
   }
-  return formatv(
-             "kind={0} inDeclaredDomain={1} counts={2} declaredTarget={3}",
-             contract.kind,
-             contract.inDeclaredDomain ? 1 : 0,
-             contract.countsTowardCompleteness ? 1 : 0,
-             contract.declaredTarget)
+  return formatv("kind={0} inDeclaredDomain={1} counts={2} declaredTarget={3}",
+                 contract.kind, contract.inDeclaredDomain ? 1 : 0,
+                 contract.countsTowardCompleteness ? 1 : 0,
+                 contract.declaredTarget)
       .str();
 }
 
@@ -924,7 +925,8 @@ std::string RefoldEngine::FormatAcceptedPathAudit(
       currentPath, patch, tuAnchorWitness, includeAnchorWitness,
       includeRealizationWitness, terminalFallbackWitness);
   if (summary.hasTUAnchorWitness) {
-    return formatv("inventory={0} lattice={1} completeness={2} theoremDomain={3} discharge={4} tuAnchor={5}",
+    return formatv("inventory={0} lattice={1} completeness={2} "
+                   "theoremDomain={3} discharge={4} tuAnchor={5}",
                    FormatAcceptancePathInventory(summary.inventory),
                    FormatGlobalSelectionLattice(summary.lattice),
                    FormatCompletenessContract(summary.completeness),
@@ -934,7 +936,8 @@ std::string RefoldEngine::FormatAcceptedPathAudit(
         .str();
   }
   if (summary.hasIncludeAnchorWitness) {
-    return formatv("inventory={0} lattice={1} completeness={2} theoremDomain={3} discharge={4} includeAnchor={5}",
+    return formatv("inventory={0} lattice={1} completeness={2} "
+                   "theoremDomain={3} discharge={4} includeAnchor={5}",
                    FormatAcceptancePathInventory(summary.inventory),
                    FormatGlobalSelectionLattice(summary.lattice),
                    FormatCompletenessContract(summary.completeness),
@@ -944,7 +947,8 @@ std::string RefoldEngine::FormatAcceptedPathAudit(
         .str();
   }
   if (summary.hasIncludeRealizationWitness) {
-    return formatv("inventory={0} lattice={1} completeness={2} theoremDomain={3} discharge={4} includeRealization={5}",
+    return formatv("inventory={0} lattice={1} completeness={2} "
+                   "theoremDomain={3} discharge={4} includeRealization={5}",
                    FormatAcceptancePathInventory(summary.inventory),
                    FormatGlobalSelectionLattice(summary.lattice),
                    FormatCompletenessContract(summary.completeness),
@@ -955,7 +959,8 @@ std::string RefoldEngine::FormatAcceptedPathAudit(
         .str();
   }
   if (summary.hasTerminalFallbackWitness) {
-    return formatv("inventory={0} lattice={1} completeness={2} theoremDomain={3} discharge={4} terminalOutOfDomain={5}",
+    return formatv("inventory={0} lattice={1} completeness={2} "
+                   "theoremDomain={3} discharge={4} terminalOutOfDomain={5}",
                    FormatAcceptancePathInventory(summary.inventory),
                    FormatGlobalSelectionLattice(summary.lattice),
                    FormatCompletenessContract(summary.completeness),
@@ -964,7 +969,8 @@ std::string RefoldEngine::FormatAcceptedPathAudit(
                    summary.terminalFallbackWitness)
         .str();
   }
-  return formatv("inventory={0} lattice={1} completeness={2} theoremDomain={3} discharge={4}",
+  return formatv("inventory={0} lattice={1} completeness={2} theoremDomain={3} "
+                 "discharge={4}",
                  FormatAcceptancePathInventory(summary.inventory),
                  FormatGlobalSelectionLattice(summary.lattice),
                  FormatCompletenessContract(summary.completeness),
@@ -1036,13 +1042,13 @@ RefoldEngine::FormatAcceptedResultCandidate(
   }
 
   const std::string artifactSuffix =
-      artifact.empty() ? std::string() : formatv(" artifact={0}", artifact).str();
+      artifact.empty() ? std::string()
+                       : formatv(" artifact={0}", artifact).str();
   return formatv(
              "kind={0} class={1} realization={2} preference={3} "
              "surfaceDisposition={4} inventory={5} lattice={6} "
              "completeness={7} theoremDomain={8} discharge={9}{10}",
-             candidate.kind,
-             candidate.proofSummary.acceptedClass,
+             candidate.kind, candidate.proofSummary.acceptedClass,
              candidate.proofSummary.realizationMode,
              candidate.proofSummary.preference,
              candidate.proofSummary.surfaceDisposition,
@@ -1059,8 +1065,10 @@ std::string RefoldEngine::FormatMacroPatchAudit(const MacroPatch &patch) const {
   const ProofSummary summary = ClassifyMacroPatchProof(patch);
   return formatv(
              "proofKind={0} topClass={1} realization={2} preference={3} "
-             "surfaceDisposition={4} inventory={5} lattice={6} completeness={7} "
-             "theoremDomain={8} discharge={9} validated={10} struct={11} proofRoot={12} subtreeCert={13} "
+             "surfaceDisposition={4} inventory={5} lattice={6} "
+             "completeness={7} "
+             "theoremDomain={8} discharge={9} validated={10} struct={11} "
+             "proofRoot={12} subtreeCert={13} "
              "leaf={14} witnesses={15} invCerts={16} formalCerts={17} "
              "argCerts={18} liftChains={19} liftSteps={20} rootMerges={21} "
              "lexicalBridge={22} paste={23} wrappers={24} stringify={25} "
@@ -1071,23 +1079,19 @@ std::string RefoldEngine::FormatMacroPatchAudit(const MacroPatch &patch) const {
              "deferredRootN={35} bridgeFormalN={36} expRoot={37} "
              "deferredRootArgs={38} bridgeFormals={39} wholeCoverA=[{40},{41}) "
              "wholeCoverBraw=[{42},{43}) wholeCoverBadj=[{44},{45})",
-             patch.proofKind,
-             summary.acceptedClass,
-             summary.realizationMode,
-             summary.preference,
-             summary.surfaceDisposition,
+             patch.proofKind, summary.acceptedClass, summary.realizationMode,
+             summary.preference, summary.surfaceDisposition,
              FormatAcceptancePathInventory(summary.inventory),
              FormatGlobalSelectionLattice(summary.lattice),
              FormatCompletenessContract(summary.completeness),
              FormatTheoremDomainContract(summary.theoremDomain),
              FormatProofDischargeRecord(summary.discharge),
-             patch.proofValidated ? 1 : 0,
-             patch.structurePreserving ? 1 : 0, patch.proofRootMacroId,
-             patch.subtreeCertBacked ? 1 : 0, patch.subtreeLeafMacroId,
-             patch.subtreeWitnessCount, patch.subtreeInvocationCertCount,
-             patch.subtreeFormalCertCount, patch.subtreeArgCertCount,
-             patch.subtreeLiftChainCount, patch.subtreeLiftStepCount,
-             patch.subtreeRootMergeCount,
+             patch.proofValidated ? 1 : 0, patch.structurePreserving ? 1 : 0,
+             patch.proofRootMacroId, patch.subtreeCertBacked ? 1 : 0,
+             patch.subtreeLeafMacroId, patch.subtreeWitnessCount,
+             patch.subtreeInvocationCertCount, patch.subtreeFormalCertCount,
+             patch.subtreeArgCertCount, patch.subtreeLiftChainCount,
+             patch.subtreeLiftStepCount, patch.subtreeRootMergeCount,
              patch.subtreeUsesLexicalBridge ? 1 : 0,
              patch.subtreeTouchesPaste ? 1 : 0,
              patch.subtreeHasWrapperSemantics ? 1 : 0,
@@ -1103,9 +1107,12 @@ std::string RefoldEngine::FormatMacroPatchAudit(const MacroPatch &patch) const {
              patch.subtreeExpectedRootFormalCount,
              patch.subtreeDeferredRootArgCount,
              patch.subtreeBridgeSensitiveFormalCount,
-             stringutils::showWSWithClip(patch.subtreeExpectedRootFormalSummary, 160),
-             stringutils::showWSWithClip(patch.subtreeDeferredRootArgSummary, 160),
-             stringutils::showWSWithClip(patch.subtreeBridgeSensitiveFormalSummary, 160),
+             stringutils::showWSWithClip(patch.subtreeExpectedRootFormalSummary,
+                                         160),
+             stringutils::showWSWithClip(patch.subtreeDeferredRootArgSummary,
+                                         160),
+             stringutils::showWSWithClip(
+                 patch.subtreeBridgeSensitiveFormalSummary, 160),
              patch.wholeCoverALo, patch.wholeCoverAHi, patch.wholeCoverBRawLo,
              patch.wholeCoverBRawHi, patch.wholeCoverBAdjLo,
              patch.wholeCoverBAdjHi)

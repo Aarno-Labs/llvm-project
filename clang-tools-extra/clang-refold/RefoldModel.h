@@ -365,11 +365,16 @@ public:
     std::vector<PPArgSpan> stringifySpans;
     std::vector<PPArgSpan> pasteSpans;
     std::vector<PasteToken> pasteTokens; // exact producer-side ## witnesses
-    std::vector<MacroDefParam> defParams; // formal parameters from macro definition
-    using OptByteRange = std::pair<std::optional<uint64_t>, std::optional<uint64_t>>;
-    std::vector<OptByteRange> invArgRanges; // per-formal invocation-argument byte ranges
+    std::vector<MacroDefParam>
+        defParams; // formal parameters from macro definition
+    using OptByteRange =
+        std::pair<std::optional<uint64_t>, std::optional<uint64_t>>;
+    std::vector<OptByteRange>
+        invArgRanges; // per-formal invocation-argument byte ranges
     std::optional<StringRef> normalizedInvText;
-    std::vector<OptByteRange> normalizedInvArgTextRanges; // per-formal argument ranges within normalizedInvText
+    std::vector<OptByteRange>
+        normalizedInvArgTextRanges; // per-formal argument ranges within
+                                    // normalizedInvText
     std::vector<PPSpan> bodySpans;
     std::optional<StringRef> invText;
     std::optional<StringRef> invFile;   // file containing invocation

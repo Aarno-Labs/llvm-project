@@ -1390,9 +1390,9 @@ static bool isWholeArgNestedChild(const Item &Parent, const Item &Child,
   return false;
 }
 
-static const Item *findUniqueCallerChildByInvocationText(const Item &Caller,
-                                                         llvm::StringRef Text,
-                                                         llvm::ArrayRef<Item> Items) {
+static const Item *
+findUniqueCallerChildByInvocationText(const Item &Caller, llvm::StringRef Text,
+                                      llvm::ArrayRef<Item> Items) {
   const llvm::StringRef Trimmed = Text.trim();
   const Item *Match = nullptr;
   for (const Item &Child : Items) {
@@ -1678,7 +1678,8 @@ void computeMacroProjectionSites(Item &It, Preprocessor &PP,
         for (; !AT->is(tok::eof); ++AT)
           ActualSpellings.push_back(PP.getSpelling(*AT));
 
-        if (HaveTextTokens && tokenSpellingsEqual(TextTokens, ActualSpellings)) {
+        if (HaveTextTokens &&
+            tokenSpellingsEqual(TextTokens, ActualSpellings)) {
           Out.append(TextTokens.begin(), TextTokens.end());
           return true;
         }
@@ -1706,8 +1707,9 @@ void computeMacroProjectionSites(Item &It, Preprocessor &PP,
       } else if (!It.CallerMacroId) {
         // For a direct invocation, the raw invocation argument text is the
         // producer's best available proof of the unexpanded argument tokens. In
-        // nested invocations, however, caller-formal substitution may change the
-        // effective text, so keep failing closed unless the resolver proves it.
+        // nested invocations, however, caller-formal substitution may change
+        // the effective text, so keep failing closed unless the resolver proves
+        // it.
         Out.append(TextTokens.begin(), TextTokens.end());
         return true;
       }
@@ -2438,9 +2440,10 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
   // invocation-site argument ranges can prove that this location originated
   // from one of its actual arguments. Cache the resolved alias so subsequent
   // lookups for the same raw MacroID location are O(1).
-  auto LookupMacroItem = [&](SourceLocation Loc,
-                             size_t SearchLimit = std::numeric_limits<size_t>::max())
-      -> std::optional<size_t> {
+  auto LookupMacroItem =
+      [&](SourceLocation Loc,
+          size_t SearchLimit =
+              std::numeric_limits<size_t>::max()) -> std::optional<size_t> {
     if (Loc.isInvalid())
       return std::nullopt;
 
@@ -2602,14 +2605,15 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
               AddProbeLoc(BaseLoc);
               AddProbeLoc(SM.getImmediateSpellingLoc(BaseLoc));
               AddProbeLoc(SM.getImmediateMacroCallerLoc(BaseLoc));
-              if (auto ER = SM.getImmediateExpansionRange(BaseLoc); ER.isValid())
+              if (auto ER = SM.getImmediateExpansionRange(BaseLoc);
+                  ER.isValid()) {
                 AddProbeLoc(ER.getBegin());
+              }
 
               std::optional<uint32_t> RecoveredArgIdx;
               for (SourceLocation ProbeLoc : ProbeLocs) {
-                auto ProbeArgIdx = argIndexForSpellingLoc(*CallerIt, ProbeLoc,
-                                                          SM, Lang,
-                                                          EmitAbsPaths);
+                auto ProbeArgIdx = argIndexForSpellingLoc(
+                    *CallerIt, ProbeLoc, SM, Lang, EmitAbsPaths);
                 if (!ProbeArgIdx)
                   continue;
                 if (!RecoveredArgIdx) {
@@ -2670,19 +2674,22 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
           std::optional<uint32_t> UniqueCallerFormal;
           std::vector<std::vector<InvArgTupleRef>> TupleRefs;
           std::string NormalizedInvText;
-          std::vector<std::pair<std::optional<uint32_t>, std::optional<uint32_t>>>
+          std::vector<
+              std::pair<std::optional<uint32_t>, std::optional<uint32_t>>>
               NormalizedRanges;
 
           for (uint32_t CallerFormal = 0;
                CallerFormal < CallerIt->InvArgRanges.size(); ++CallerFormal) {
-            auto CallerArgText = getItemInvocationArgText(*CallerIt, CallerFormal);
+            auto CallerArgText =
+                getItemInvocationArgText(*CallerIt, CallerFormal);
             if (!CallerArgText)
               continue;
 
-            std::vector<std::pair<std::optional<uint32_t>, std::optional<uint32_t>>>
+            std::vector<
+                std::pair<std::optional<uint32_t>, std::optional<uint32_t>>>
                 TupleRanges;
-            if (!computeTupleElementRangesFromText(*CallerArgText, PP.getLangOpts(),
-                                                   TupleRanges))
+            if (!computeTupleElementRangesFromText(
+                    *CallerArgText, PP.getLangOpts(), TupleRanges))
               continue;
             if (TupleRanges.size() != CalleeArgTexts.size())
               continue;
@@ -2818,7 +2825,7 @@ void RefoldMapBuilder::onEnterFile(SourceLocation IncludeLoc) {
 }
 
 void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
-                           uint64_t PPByteEnd) {
+                               uint64_t PPByteEnd) {
   if (!enabled())
     return;
   if (Tok.is(tok::eof))
@@ -3026,7 +3033,8 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
              Tok.is(tok::utf8_string_literal) ||
              Tok.is(tok::utf16_string_literal) ||
              Tok.is(tok::utf32_string_literal))) {
-          const llvm::StringRef CanonicalSp = canonicalizeStringifyLookupKey(Sp);
+          const llvm::StringRef CanonicalSp =
+              canonicalizeStringifyLookupKey(Sp);
           auto ItS = MI.StringifySpell2ArgIndices.find(CanonicalSp);
           if (ItS != MI.StringifySpell2ArgIndices.end()) {
             for (unsigned A : ItS->second)
@@ -3248,11 +3256,12 @@ void RefoldMapBuilder::onToken(const Token &Tok, uint64_t PPByteBegin,
           touchArgTokSpan(MI.StringifySpans, TokIndex, ArgIndex);
         };
 
-        auto ItS = Items[*StringifyOwnerIdx].StringifySpell2ArgIndices.find(CanonicalSp);
+        auto ItS = Items[*StringifyOwnerIdx].StringifySpell2ArgIndices.find(
+            CanonicalSp);
         if (ItS != Items[*StringifyOwnerIdx].StringifySpell2ArgIndices.end()) {
           for (unsigned A : ItS->second)
-            recordOwnedStringifySpanForToken(Items[*StringifyOwnerIdx], TokIndex,
-                                             A);
+            recordOwnedStringifySpanForToken(Items[*StringifyOwnerIdx],
+                                             TokIndex, A);
           touchSpanForItem(*StringifyOwnerIdx, TokIndex);
         }
         // Decode the string literal into its "payload" (decoded characters) and
@@ -3904,7 +3913,8 @@ void RefoldMapBuilder::writeJSON() {
 
     llvm::DenseSet<uint64_t> DoneCallerIds;
     for (const Item &It : Items) {
-      if (It.Kind != IK_Macro || DoneCallerIds.find(It.ID) != DoneCallerIds.end())
+      if (It.Kind != IK_Macro ||
+          DoneCallerIds.find(It.ID) != DoneCallerIds.end())
         continue;
 
       llvm::SmallVector<uint64_t, 8> Path;
@@ -4450,7 +4460,8 @@ void RefoldMapBuilder::writeJSON() {
             Parent.InvFile.empty())
           continue;
 
-        for (uint32_t ArgIdx = 0; ArgIdx < Parent.InvArgRanges.size(); ++ArgIdx) {
+        for (uint32_t ArgIdx = 0; ArgIdx < Parent.InvArgRanges.size();
+             ++ArgIdx) {
           const auto &R = Parent.InvArgRanges[ArgIdx];
           if (!R.first || !R.second || *R.second < *R.first)
             continue;
@@ -4655,8 +4666,9 @@ void RefoldMapBuilder::writeJSON() {
                       JO.attribute("kind", D.Kind);
                       JO.attribute("name", D.Name);
                       JO.attributeObject("header_span", [&] {
-                        // Header file path is implied by the include's resolved_path.
-                        // Omitting it here significantly reduces map size for large headers.
+                        // Header file path is implied by the include's
+                        // resolved_path. Omitting it here significantly reduces
+                        // map size for large headers.
                         JO.attribute("b", D.HeaderB);
                         JO.attribute("e", D.HeaderE);
                       });

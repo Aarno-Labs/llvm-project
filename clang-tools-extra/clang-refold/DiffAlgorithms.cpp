@@ -10,7 +10,8 @@
 //   • LCS (Longest Common Subsequence) map A→B over arbitrary element types
 //     (typically token spellings), with a stable tie-breaker.
 //   • Hunk construction from an A→B alignment (contiguous edit regions).
-//   • Myers O((N+M)*D) shortest edit script (SES) with linear-space reconstruction.
+//   • Myers O((N+M)*D) shortest edit script (SES) with linear-space reconstruc-
+//     tion.
 //
 // Responsibilities
 // ----------------
