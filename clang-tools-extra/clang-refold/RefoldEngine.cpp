@@ -3896,6 +3896,84 @@ RefoldEngine::FindProvableTUInsertionAnchor(uint64_t pp,
     return slotAnchor;
   }
 
+
+  auto includeDirectiveBoundaryAnchor = [&]() -> std::optional<uint64_t> {
+    // Strict consumer-side proof for the narrow include-boundary case where a
+    // producer slot would normally be present.  A PP gap at the exact boundary
+    // between two top-level include expansions denotes the TU source boundary
+    // between the two include directive lines, but IncludeIdCoveringPPIndex(pp)
+    // treats that same coordinate as being inside the right include's cover.
+    // Recognize only the unambiguous form: two adjacent include directives in
+    // this TU, with the left include ending at pp, the right include beginning
+    // at pp, and no intervening source bytes between the directive records.
+    const RefoldModel::IncludeItem *leftInc = nullptr;
+    const RefoldModel::IncludeItem *rightInc = nullptr;
+
+    for (const auto &inc : model_.GetIncludes()) {
+      if (!inc.cover.IsValid() || !PathsEqual(inc.sitePath, tuPath))
+        continue;
+      if (inc.cover.end == pp) {
+        if (!leftInc || std::tie(inc.siteE, inc.id) <
+                            std::tie(leftInc->siteE, leftInc->id))
+          leftInc = &inc;
+      }
+      if (inc.cover.begin == pp) {
+        if (!rightInc || std::tie(inc.siteB, inc.id) <
+                             std::tie(rightInc->siteB, rightInc->id))
+          rightInc = &inc;
+      }
+    }
+
+    if (!leftInc || !rightInc || leftInc->id == rightInc->id)
+      return std::nullopt;
+
+    // Do not infer through nested include structure.  This helper is only for a
+    // TU insertion between two include directive lines spelled in tuPath.
+    if (leftInc->parent || rightInc->parent)
+      return std::nullopt;
+
+    // If there are comments, blank lines, or any other bytes between the
+    // directives, strict mode still requires an exact producer slot.  Without
+    // that slot there is no canonical byte inside the wider source gap.
+    if (leftInc->siteE != rightInc->siteB)
+      return std::nullopt;
+
+    TUAnchorWitness includeBoundaryWitness;
+    includeBoundaryWitness.evidence =
+        TUAnchorEvidenceKind::IncludeDirectiveBoundary;
+    includeBoundaryWitness.hasPPGap = true;
+    includeBoundaryWitness.ppGap = pp;
+    includeBoundaryWitness.hasTUByte = true;
+    includeBoundaryWitness.tuByte = leftInc->siteE;
+    includeBoundaryWitness.hasLeftNeighbor = true;
+    includeBoundaryWitness.leftNeighborPP = pp - 1;
+    includeBoundaryWitness.hasRightNeighbor = true;
+    includeBoundaryWitness.rightNeighborPP = pp;
+    includeBoundaryWitness.outsideIncludeCoverage = false;
+    includeBoundaryWitness.ownerDepthStable = true;
+
+    if (witness)
+      *witness = includeBoundaryWitness;
+
+    const AcceptedResultCandidate includeBoundaryCandidate =
+        BuildAcceptedTUAnchorCandidate(
+            AcceptedPathKind::TUProvableInsertionAnchor,
+            includeBoundaryWitness);
+    trace("tu/anchor",
+          "provable TU insertion anchor: ppGap={0} -> include boundary byte={1} "
+          "leftInclude={2} rightInclude={3} candidate={4}",
+          pp, leftInc->siteE, leftInc->id, rightInc->id,
+          FormatAcceptedResultCandidate(includeBoundaryCandidate));
+    return leftInc->siteE;
+  };
+
+  // Try the exact include-directive-boundary proof before the generic include
+  // coverage wall.  The boundary coordinate is allowed to equal the first token
+  // of the right include expansion even though that makes IncludeIdCoveringPPIndex
+  // report the right include as covering pp.
+  if (auto includeAnchor = includeDirectiveBoundaryAnchor())
+    return includeAnchor;
+
   // A PP gap that lies inside an include expansion cannot be materialized as a
   // TU insertion. Fail closed before considering weaker local evidence.
   if (IncludeIdCoveringPPIndex(pp))
