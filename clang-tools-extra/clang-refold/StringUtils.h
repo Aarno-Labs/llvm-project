@@ -13,23 +13,20 @@
 // -----------
 //  • Whitespace predicates:
 //      - isWs(char)                  : PP whitespace (space, HT, LF, VT, FF,
-//      CR)
-//      - isAsciiWhitespace(StringRef): true iff every char is PP whitespace
+//                                      CR)
+//      - isWhitespace(StringRef)     : true iff every byte is PP whitespace
 //  • Identifier predicates (ASCII):
-//      - isAsciiAlpha(char), isAsciiDigit(char)
-//      - isAsciiIdentStart(char)     : '_' or ASCII letter
-//      - isAsciiIdentChar(char)      : start-char or digit
-//      - isIdentChar(char)           : same as isAsciiIdentChar (for glue
-//      checks)
-//      - isIdentifierOnly(StringRef) : non-empty, first not digit, all ident
-//      chars
+//      - isIdentStart(char)          : '_' or ASCII letter
+//      - isIdentPart(char)           : start-char or digit
+//      - isIdentifierOnly(StringRef) : trimmed text is one identifier token
+//      - isIdentifierOrSimpleCallExpr(StringRef): identifier or IDENT(...)
 //  • Index scans:
-//      - firstNonWsIdx(StringRef)    : first non-WS index or -1
-//      - lastNonWsIdx(StringRef)     : last  non-WS index or -1
+//      - firstNonWsIdx(StringRef)    : first non-WS index or nullopt
+//      - lastNonWsIdx(StringRef)     : last non-WS index or nullopt
 //  • Debug formatting helpers:
 //      - showWS(StringRef)           : visualize whitespace (·, \t, \n, \r, \f,
-//      \v)
-//      - clip(StringRef, int)        : truncate with length suffix
+//                                      \v)
+//      - clip(StringRef, size_t)     : truncate with length suffix
 //
 // Design notes
 // ------------
@@ -40,14 +37,13 @@
 //
 // Usage
 // -----
-//   if (isAsciiWhitespace(S)) { … }
-//   bool glue = isIdentChar(L) && isIdentChar(R);  // conservative boundary
-//   check int f = firstNonWsIdx(Txt);                    // -1 if all
-//   whitespace
+//   if (isWhitespace(S)) { … }
+//   bool glue = isIdentPart(L) && isIdentPart(R);  // conservative boundary
+//   auto first = firstNonWsIdx(Txt);               // nullopt if all whitespace
 //
 // Policy
 // ------
-//  • Keep helpers minimal and header-only for inlining.
+//  • Keep helpers minimal and allocation-free where practical.
 //  • Behavior must not depend on locale or environment.
 //
 // Author:
@@ -82,16 +78,19 @@ namespace stringutils {
 
 // ------------------- Single-char predicates (ASCII only) ---------------------
 
+/// True for the ASCII whitespace set recognized by the C/C++ preprocessor.
 inline constexpr bool isWs(char c) noexcept {
   // C/C++ PP whitespace: space, HT, LF, VT, FF, CR
   return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' ||
          c == '\r';
 }
 
+/// True for the ASCII start character of an identifier-like spelling.
 inline constexpr bool isIdentStart(char c) noexcept {
   return c == '_' || isAlpha(c);
 }
 
+/// True for an ASCII identifier continuation character.
 inline constexpr bool isIdentPart(char c) noexcept {
   return isIdentStart(c) || isDigit(c);
 }
@@ -106,32 +105,45 @@ inline constexpr bool isIdentPart(char c) noexcept {
 // (INC3()) would leave a dangling "(…)" suffix, yielding invalid code.
 // When the replacement is not a bare identifier, conservatively consume any
 // immediately following "(...)" groups.
+/// True iff \p s trims to one identifier token spelling.
 bool isIdentifierOnly(StringRef s);
 
+/// True iff \p replacement is either an identifier or a simple callable head.
+///
+/// This is used by chained-call preservation: an identifier or `IDENT(...)`
+/// replacement can still receive following call-suffix groups without needing
+/// the refolder to consume them.
 bool isIdentifierOrSimpleCallExpr(StringRef replacement);
 
+/// True iff every byte in \p s is PP whitespace.
 inline bool isWhitespace(StringRef s) noexcept {
   return all_of(s, [](char c) { return isWs(c); });
 }
 
 // ---------------------- Index scans (return -1 if none) ----------------------
 
+/// Return the first non-whitespace byte offset, or nullopt for all-whitespace.
 inline std::optional<size_t> firstNonWsIdx(StringRef s) noexcept {
   size_t idx = s.find_first_not_of(" \t\n\v\f\r");
   return (idx == StringRef::npos) ? std::nullopt : std::make_optional(idx);
 }
 
+/// Return the last non-whitespace byte offset, or nullopt for all-whitespace.
 inline std::optional<size_t> lastNonWsIdx(StringRef s) noexcept {
   size_t idx = s.find_last_not_of(" \t\n\v\f\r");
   return (idx == StringRef::npos) ? std::nullopt : std::make_optional(idx);
 }
 
+/// Skip ASCII whitespace and complete C/C++ comments starting at \p i.
 size_t skipWSAndComments(StringRef s, size_t i);
 
+/// Find the matching right parenthesis for \p lParenIdx, ignoring comments and
+/// string/character literal contents.
 size_t findMatchingRParen(StringRef s, size_t lParenIdx);
 
 // --------------------- Diagnostics helpers (pure string) ---------------------
 
+/// Render whitespace visibly for diagnostics while preserving non-whitespace.
 inline std::string showWS(StringRef s) {
   std::string out;
   out.reserve(s.size() * 2);
@@ -163,16 +175,19 @@ inline std::string showWS(StringRef s) {
   return out;
 }
 
+/// Clip \p s to at most \p n bytes and append the original length when clipped.
 inline std::string clip(StringRef s, size_t n) {
   if (s.size() <= n)
     return s.str();
   return (Twine(s.substr(0, n)) + "…(" + Twine(s.size()) + ")").str();
 }
 
+/// Clip a string and then render whitespace visibly for compact diagnostics.
 inline std::string showWSWithClip(StringRef s, size_t n) {
   return showWS(clip(s, n));
 }
 
+/// Return LLVM's escaped representation of \p s for diagnostics.
 inline std::string escape(StringRef s) {
   std::string buffer;
   llvm::raw_string_ostream os(buffer);
@@ -206,10 +221,11 @@ inline std::pair<size_t, size_t> trimWsRange(StringRef s, size_t b, size_t e) {
   return {b, e};
 }
 
-/// \brief Like Java's String::trim(), but only trims ASCII space and tab.
+/// \brief Trim only ASCII space and tab from both ends.
 ///
 /// This removes leading and trailing `' '` and `'\t'` characters and returns a
-/// view into the original string (no allocation).
+/// view into the original string (no allocation). Newlines and other PP
+/// whitespace are intentionally preserved.
 ///
 /// \param S The input string.
 /// \returns A StringRef with leading/trailing spaces and tabs removed.
@@ -229,6 +245,7 @@ inline StringRef stripTrailingNewlines(StringRef s) noexcept {
   return s;
 }
 
+/// True iff the newline at \p nlIdx is escaped by a C line splice.
 inline bool isLineSplice(StringRef s, size_t nlIdx) {
   if (nlIdx == 0 || nlIdx > s.size())
     return false;
@@ -251,7 +268,26 @@ inline bool isIndentOnly(StringRef s, size_t from, size_t to) {
   return s.slice(start, end).find_first_not_of(" \t\r") == StringRef::npos;
 }
 
+/// \brief Quote text as a C string spelling.
+///
+/// Escapes characters that must be escaped inside a C string token, including
+/// backslashes, double quotes, and common control characters, then wraps the
+/// result in double quotes.
+///
+/// \param s The raw text to quote.
+/// \returns The escaped C string spelling, including surrounding quotes.
 std::string quoteCString(StringRef s);
+
+/// \brief Quote text as a minimally escaped C string literal token.
+///
+/// This helper wraps \p s in double quotes and escapes only bytes that would
+/// terminate or escape the literal spelling (`\\` and `"`). It deliberately
+/// preserves all other bytes verbatim. Use quoteCString() when control
+/// characters must be rendered as C escape sequences.
+///
+/// \param s The raw string-literal payload.
+/// \returns The minimally escaped string literal spelling, including quotes.
+std::string quoteCStringLiteral(StringRef s);
 
 /// Return one StringRef per byte/character in \p s.
 ///
@@ -353,6 +389,7 @@ inline StringRef stripHeaderToken(StringRef token) {
   return token;
 }
 
+/// Format an unsigned value with left zero padding to \p width columns.
 inline std::string zpadUnsigned(size_t v, unsigned width) {
   std::string s = formatv("{0}", v).str();
   if (s.size() < width)
@@ -360,6 +397,7 @@ inline std::string zpadUnsigned(size_t v, unsigned width) {
   return s;
 }
 
+/// Convert supported scalar/logging element types to strings.
 template <typename T> std::string stringifyElement(const T &elem) {
   if constexpr (std::is_same_v<T, std::string>) {
     return elem;
@@ -405,6 +443,7 @@ inline bool looksLikeStringLiteralToken(StringRef tok) {
   return false;
 }
 
+/// Return a compact escaped tail of an output buffer for trace diagnostics.
 inline std::string dbgOutTail(StringRef out) {
   size_t tailStart = out.size() > 140 ? out.size() - 140 : 0;
   StringRef tail = out.drop_front(tailStart);
@@ -418,7 +457,7 @@ inline std::string dbgOutTail(StringRef out) {
   return result;
 }
 
-/** True iff offset is a beginning-of-line in text. */
+/// True iff \p offset is a beginning-of-line in \p text.
 inline bool isBOL(StringRef text, size_t offset) {
   size_t o = std::clamp(offset, size_t(0), text.size());
   return (o == 0) || (text[o - 1] == '\n');
@@ -428,10 +467,13 @@ inline bool isBOL(StringRef text, size_t offset) {
 //   return out.endswith(suffix);
 // }
 
+/// True iff appending at the end of \p s would occur at beginning-of-line.
 inline bool outAtBOL(StringRef s) { return s.empty() || s.back() == '\n'; }
 
+/// True iff \p s has a final LF byte.
 inline bool endsWithLf(StringRef s) { return !s.empty() && s.back() == '\n'; }
 
+/// True iff \p lit appears at byte offset \p offset in \p s.
 inline bool startsWith(StringRef s, size_t offset, StringRef lit) {
   const size_t n = s.size();
   const size_t m = lit.size();
@@ -440,6 +482,7 @@ inline bool startsWith(StringRef s, size_t offset, StringRef lit) {
   return s.substr(offset).starts_with(lit);
 }
 
+/// Find the last occurrence of \p ch at or before \p fromInclusive.
 inline size_t lastIndexOfChar(StringRef s, char ch, size_t fromInclusive) {
   if (s.empty())
     return StringRef::npos;
@@ -450,7 +493,7 @@ inline size_t lastIndexOfChar(StringRef s, char ch, size_t fromInclusive) {
   return s.take_front(limit + 1).rfind(ch);
 }
 
-/** 1-based line number at the given offset. */
+/// Return the 1-based physical line number at \p offset.
 inline size_t lineAtOffset(StringRef text, uint64_t offset) {
   const size_t o = (offset >= static_cast<uint64_t>(text.size()))
                        ? text.size()
@@ -458,10 +501,10 @@ inline size_t lineAtOffset(StringRef text, uint64_t offset) {
   return 1 + text.take_front(o).count('\n');
 }
 
-/** Count '\n' in an entire sequence. */
+/// Count LF bytes in an entire sequence.
 inline size_t countNewlines(StringRef s) { return s.count('\n'); }
 
-/** Count '\n' in text from range [start, end). */
+/// Count LF bytes in the clamped half-open range [start, end).
 inline size_t countNewlines(StringRef text, uint64_t start, uint64_t end) {
   const size_t len = text.size();
 
@@ -483,6 +526,7 @@ inline size_t countNewlines(StringRef text, uint64_t start, uint64_t end) {
   return text.slice(s, e).count('\n');
 }
 
+/// Count LF bytes in [from,to) that are not escaped by a C line splice.
 inline size_t countNonSplicedNewlines(StringRef s, size_t from, size_t to) {
   const size_t n = s.size();
 
@@ -505,6 +549,7 @@ inline size_t countNonSplicedNewlines(StringRef s, size_t from, size_t to) {
   return count;
 }
 
+/// Render a boolean/byte array as a compact `0`/`1` string.
 inline std::string boolArrayToString(ArrayRef<char> touched) {
   std::string res;
   res.reserve(touched.size());
@@ -513,6 +558,7 @@ inline std::string boolArrayToString(ArrayRef<char> touched) {
   return res;
 }
 
+/// Format byte ranges and their corresponding slices for diagnostics.
 inline std::string
 rangesToStringWithSlices(StringRef invText,
                          ArrayRef<std::pair<size_t, size_t>> ranges) {

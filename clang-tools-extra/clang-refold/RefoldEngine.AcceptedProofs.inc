@@ -23,7 +23,7 @@
 
 bool RefoldEngine::MacroInvocationHasWellFormedPasteWitnesses(
     const RefoldModel::MacroInvocation &m) const {
-  // Step 6 consumes the exact `paste_tokens` witnesses serialized in Step 5.
+  // Consume the exact `paste_tokens` witnesses serialized by the producer.
   // The producer records the argument-derived fragments of each pasted token,
   // but it does not need to emit the literal glue bytes that came from the
   // macro body itself. For example, `X##_##Y` may serialize only the `X` and
@@ -125,6 +125,10 @@ RefoldEngine::ValidateInvocationPreservingProof(const MacroPatch &patch) const {
   const AcceptancePathInventory inventory =
       InventoryMacroPatchAcceptancePath(patch);
 
+  // First verify that the patch carries the normalized proof metadata required
+  // for any invocation-preserving candidate. These obligations classify the
+  // accepted path, map it to a future proof target, and ensure the legacy patch
+  // flags agree with the structure-preserving proof class.
   discharge.Require(inventory.currentPath != AcceptedPathKind::Unknown,
                     ProofObligationKind::AcceptedPathClassified,
                     ProofFailureReason::MissingAcceptedPathClassification);
@@ -141,6 +145,9 @@ RefoldEngine::ValidateInvocationPreservingProof(const MacroPatch &patch) const {
                     ProofObligationKind::ProofRootTracked,
                     ProofFailureReason::MissingProofRoot);
 
+  // Invocation-preserving macro proofs are anchored at a tracked proof root,
+  // not just at the local patch span. Resolve that root and require it to be
+  // the top-level macro invocation for this proof tree.
   const RefoldModel::MacroInvocation *root =
       patch.proofRootMacroId ? FindMacroInvocationById(patch.proofRootMacroId)
                              : nullptr;
@@ -188,15 +195,16 @@ RefoldEngine::ValidateInvocationPreservingProof(const MacroPatch &patch) const {
 
   case MacroPatchProofKind::ArgsOnlyPairedPureInsertion:
     // Paired pure insertion is only valid on non-paste direct arg/stringify
-    // surfaces. The builder already enforces that; Step 6 records it.
+    // surfaces. The builder already enforces that; the proof record makes the
+    // requirement explicit.
     discharge.Require(root && root->pasteSpans.empty(),
                       ProofObligationKind::MacroPasteFreeSurfaceTracked,
                       ProofFailureReason::UnexpectedPasteSurface);
     break;
 
   case MacroPatchProofKind::DagSubtreeRoot:
-    // DAG-preserving rewrites must carry the explicit subtree certificate that
-    // Step 5 started recording on accepted root patches.
+    // DAG-preserving rewrites must carry the explicit subtree certificate
+    // recorded on accepted root patches.
     discharge.Require(patch.subtreeCertBacked,
                       ProofObligationKind::MacroSubtreeCertificateTracked,
                       ProofFailureReason::MissingSubtreeCertificate);
@@ -231,6 +239,9 @@ RefoldEngine::ValidateEmittedInvocationPreservingProof(
   const AcceptancePathInventory inventory =
       InventoryMacroPatchAcceptancePath(patch);
 
+  // All emitted invocation-preserving patches must carry the normalized proof
+  // metadata needed by the accepted-result lattice. These checks establish the
+  // common baseline before validating proof-kind-specific witnesses below.
   discharge.Require(inventory.currentPath != AcceptedPathKind::Unknown,
                     ProofObligationKind::AcceptedPathClassified,
                     ProofFailureReason::MissingAcceptedPathClassification);
@@ -247,6 +258,8 @@ RefoldEngine::ValidateEmittedInvocationPreservingProof(
                     ProofObligationKind::ProofRootTracked,
                     ProofFailureReason::MissingProofRoot);
 
+  // Resolve the proof root once so proof-kind-specific checks can validate the
+  // emitted patch against the macro invocation that justified the proof.
   const RefoldModel::MacroInvocation *root =
       patch.proofRootMacroId ? FindMacroInvocationById(patch.proofRootMacroId)
                              : nullptr;
@@ -261,6 +274,9 @@ RefoldEngine::ValidateEmittedInvocationPreservingProof(
   case MacroPatchProofKind::ArgsOnlyPasteSingle:
   case MacroPatchProofKind::ArgsOnlyPasteMulti:
   case MacroPatchProofKind::ArgsOnlyPurePasteOnly: {
+    // Paste-sensitive args-only proofs must be backed by either well-formed
+    // producer paste witnesses on the root invocation or an explicit replay
+    // validation recorded on the emitted patch.
     discharge.Require(root && !root->pasteSpans.empty(),
                       ProofObligationKind::MacroPasteWitnessPresent,
                       ProofFailureReason::MissingPasteWitness);
@@ -275,12 +291,17 @@ RefoldEngine::ValidateEmittedInvocationPreservingProof(
   }
 
   case MacroPatchProofKind::ArgsOnlyPairedPureInsertion:
+    // Paired pure insertion is only an invocation-preserving proof on a
+    // paste-free root surface; paste-bearing roots need the paste-specific
+    // witness paths above.
     discharge.Require(root && root->pasteSpans.empty(),
                       ProofObligationKind::MacroPasteFreeSurfaceTracked,
                       ProofFailureReason::UnexpectedPasteSurface);
     break;
 
   case MacroPatchProofKind::DagSubtreeRoot:
+    // DAG subtree root patches must carry the subtree certificate summary that
+    // proved the leaf-to-root lift and final semantic admissibility.
     discharge.Require(patch.subtreeCertBacked,
                       ProofObligationKind::MacroSubtreeCertificateTracked,
                       ProofFailureReason::MissingSubtreeCertificate);
@@ -292,6 +313,8 @@ RefoldEngine::ValidateEmittedInvocationPreservingProof(
     break;
 
   case MacroPatchProofKind::CallChainSuffix:
+    // A call-chain suffix patch is tied directly to the root invocation whose
+    // suffix was edited; it is not a detached nested proof-root carrier.
     discharge.Require(patch.macroId == patch.proofRootMacroId,
                       ProofObligationKind::MacroCallChainWitnessTracked,
                       ProofFailureReason::MissingCallChainWitness);
@@ -313,6 +336,9 @@ RefoldEngine::ValidateInvocationRealizationProof(
   const AcceptancePathInventory inventory =
       InventoryMacroPatchAcceptancePath(patch);
 
+  // Invocation-realization patches still need the common accepted-path
+  // metadata, but unlike invocation-preserving proofs they are expected to
+  // realize expansion text rather than preserve source invocation structure.
   discharge.Require(inventory.currentPath != AcceptedPathKind::Unknown,
                     ProofObligationKind::AcceptedPathClassified,
                     ProofFailureReason::MissingAcceptedPathClassification);
@@ -324,6 +350,9 @@ RefoldEngine::ValidateInvocationRealizationProof(
                     ProofFailureReason::MissingProofRoot);
 
   if (patch.proofKind == MacroPatchProofKind::WholeCoverRealization) {
+    // Whole-cover realization has additional audit obligations: the A/B token
+    // envelopes, adjusted B envelope, containment status, and boundary
+    // accounting must all be explicitly recorded on the emitted patch.
     const bool boundsTracked =
         patch.wholeCoverALo <= patch.wholeCoverAHi &&
         patch.wholeCoverBRawLo <= patch.wholeCoverBRawHi &&
@@ -348,6 +377,9 @@ RefoldEngine::ValidateInvocationRealizationProof(
                       ProofObligationKind::WholeCoverBoundaryAccountingTracked,
                       ProofFailureReason::MissingWholeCoverBoundaryAccounting);
   } else {
+    // Other realization paths currently rely on the common legacy validation
+    // bit plus the non-structure-preserving accepted class. They do not carry
+    // the whole-cover-specific envelope metadata checked above.
     discharge.Require(patch.proofValidated,
                       ProofObligationKind::LegacyValidationRecorded,
                       ProofFailureReason::MissingLegacyValidation);
@@ -363,10 +395,9 @@ RefoldEngine::ProofDischargeRecord RefoldEngine::ValidateIncludePreservingProof(
     AcceptedPathKind currentPath, const IncludePatch *patch,
     const IncludeAnchorWitness *witness) const {
   if (currentPath == AcceptedPathKind::IncludePatchPendingMaterialization) {
-    // Pending include materialization is internal-only after step 3. If some
-    // caller still tries to validate it as a theorem-facing include path, fail
-    // closed immediately rather than reporting a live transitional discharge
-    // state.
+    // Pending include materialization is internal-only. If some caller still
+    // tries to validate it as a theorem-facing include path, fail closed
+    // immediately rather than reporting a live transitional discharge state.
     ProofDischargeAccumulator discharge;
     discharge.Fail(ProofObligationKind::IncludePendingMaterializationClassified,
                    ProofFailureReason::PendingMaterialization);
@@ -376,6 +407,10 @@ RefoldEngine::ProofDischargeRecord RefoldEngine::ValidateIncludePreservingProof(
   ProofDischargeAccumulator discharge;
   const AcceptancePathInventory inventory =
       BuildAcceptancePathInventory(currentPath);
+
+  // Common include-preserving baseline: the accepted path must be classified,
+  // mapped to a future proof target, and backed by an actual include patch
+  // shape before path-specific witness obligations are checked below.
   discharge.Require(inventory.currentPath != AcceptedPathKind::Unknown,
                     ProofObligationKind::AcceptedPathClassified,
                     ProofFailureReason::MissingAcceptedPathClassification);
@@ -388,6 +423,9 @@ RefoldEngine::ProofDischargeRecord RefoldEngine::ValidateIncludePreservingProof(
   if (!patch)
     return discharge.Finish();
 
+  // Every include-preserving path needs an anchor witness. The switch below
+  // refines this generic requirement into the exact witness kind and fields
+  // required by each accepted include path.
   discharge.Require(witness &&
                         witness->evidence != IncludeAnchorEvidenceKind::Unknown,
                     ProofObligationKind::IncludeAnchorWitnessTracked,
@@ -395,6 +433,8 @@ RefoldEngine::ProofDischargeRecord RefoldEngine::ValidateIncludePreservingProof(
 
   switch (currentPath) {
   case AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens:
+    // Replacement/deletion over an existing include must be tied to concrete
+    // mapped header tokens and the corresponding source byte range.
     discharge.Require(patch->aStart < patch->aEnd,
                       ProofObligationKind::IncludeMappedHeaderRangeTracked,
                       ProofFailureReason::MissingMappedHeaderRange);
@@ -412,7 +452,10 @@ RefoldEngine::ProofDischargeRecord RefoldEngine::ValidateIncludePreservingProof(
                       ProofObligationKind::IncludeMappedHeaderByteRangeTracked,
                       ProofFailureReason::MissingMappedHeaderByteRange);
     break;
+
   case AcceptedPathKind::IncludeInsertSelectedConditionalBoundary:
+    // Conditional-boundary insertion is zero-width in A and must be anchored to
+    // the selected conditional arm boundary byte.
     discharge.Require(patch->aStart == patch->aEnd,
                       ProofObligationKind::IncludePatchShapeTracked,
                       ProofFailureReason::MissingIncludePatchShape);
@@ -429,7 +472,10 @@ RefoldEngine::ProofDischargeRecord RefoldEngine::ValidateIncludePreservingProof(
         ProofObligationKind::IncludeSelectedConditionalBoundaryWitnessTracked,
         ProofFailureReason::MissingIncludeSelectedConditionalBoundaryWitness);
     break;
+
   case AcceptedPathKind::IncludeInsertChildBoundary:
+    // Child-boundary insertion is also zero-width, but the witness must name
+    // the child include whose boundary supplies the insertion anchor.
     discharge.Require(patch->aStart == patch->aEnd,
                       ProofObligationKind::IncludePatchShapeTracked,
                       ProofFailureReason::MissingIncludePatchShape);
@@ -444,7 +490,11 @@ RefoldEngine::ProofDischargeRecord RefoldEngine::ValidateIncludePreservingProof(
                       ProofObligationKind::IncludeChildBoundaryWitnessTracked,
                       ProofFailureReason::MissingIncludeChildBoundaryWitness);
     break;
+
   case AcceptedPathKind::IncludeInsertRightNeighborPP:
+    // Right-neighbor insertion anchors before a known preprocessor token. The
+    // anchor byte and neighbor PP token together identify the stable insertion
+    // point.
     discharge.Require(patch->aStart == patch->aEnd,
                       ProofObligationKind::IncludePatchShapeTracked,
                       ProofFailureReason::MissingIncludePatchShape);
@@ -459,7 +509,11 @@ RefoldEngine::ProofDischargeRecord RefoldEngine::ValidateIncludePreservingProof(
                       ProofObligationKind::IncludeRightNeighborWitnessTracked,
                       ProofFailureReason::MissingIncludeRightNeighborWitness);
     break;
+
   case AcceptedPathKind::IncludeInsertLeftNeighborPP:
+    // Left-neighbor insertion anchors after a known preprocessor token. As with
+    // the right-neighbor case, require both the byte anchor and the neighbor PP
+    // identity so the insertion point is theorem-facing.
     discharge.Require(patch->aStart == patch->aEnd,
                       ProofObligationKind::IncludePatchShapeTracked,
                       ProofFailureReason::MissingIncludePatchShape);
@@ -474,7 +528,11 @@ RefoldEngine::ProofDischargeRecord RefoldEngine::ValidateIncludePreservingProof(
                       ProofObligationKind::IncludeLeftNeighborWitnessTracked,
                       ProofFailureReason::MissingIncludeLeftNeighborWitness);
     break;
+
   case AcceptedPathKind::IncludeInsertDeclBoundary:
+    // Declaration-boundary insertion is anchored at the end of the declaration
+    // header range. Requiring anchorByte == declHeaderE prevents a witness from
+    // naming the right range but anchoring at a different byte.
     discharge.Require(patch->aStart == patch->aEnd,
                       ProofObligationKind::IncludePatchShapeTracked,
                       ProofFailureReason::MissingIncludePatchShape);
@@ -490,6 +548,7 @@ RefoldEngine::ProofDischargeRecord RefoldEngine::ValidateIncludePreservingProof(
                       ProofObligationKind::IncludeDeclBoundaryWitnessTracked,
                       ProofFailureReason::MissingIncludeDeclBoundaryWitness);
     break;
+
   case AcceptedPathKind::IncludePatchPendingMaterialization:
   case AcceptedPathKind::IncludeRealizationInlineFromB:
   case AcceptedPathKind::IncludeMaterializedExpansion:
@@ -508,6 +567,9 @@ RefoldEngine::ProofDischargeRecord RefoldEngine::ValidateIncludePreservingProof(
   case AcceptedPathKind::TUByteSpanMappedEdit:
   case AcceptedPathKind::TUByteSpanConservativeEdit:
   case AcceptedPathKind::TerminalEmitEditedPreprocessedStream:
+    // Non-include-preserving paths have no additional obligations in this
+    // validator. The common path-classification checks above still record any
+    // mismatch if such a path reaches this function unexpectedly.
     break;
   }
 
@@ -516,6 +578,8 @@ RefoldEngine::ProofDischargeRecord RefoldEngine::ValidateIncludePreservingProof(
 
 bool RefoldEngine::IsAcceptedIncludeRealizationEvidenceKind(
     IncludeRealizationEvidenceKind kind) const {
+  // Only realized B-cover envelopes are theorem-facing include realization
+  // evidence; Unknown is an undischarched realization witness.
   switch (kind) {
   case IncludeRealizationEvidenceKind::CanonicalBCoverEnvelope:
   case IncludeRealizationEvidenceKind::ConsensusRescuedBCoverEnvelope:
@@ -534,6 +598,10 @@ RefoldEngine::ValidateIncludeRealizationProof(
   ProofDischargeAccumulator discharge;
   const AcceptancePathInventory inventory =
       BuildAcceptancePathInventory(currentPath);
+
+  // Common include-realization baseline: the path must be classified, mapped to
+  // a future proof target, and belong to one of the declared include
+  // realization proof classes.
   discharge.Require(inventory.currentPath != AcceptedPathKind::Unknown,
                     ProofObligationKind::AcceptedPathClassified,
                     ProofFailureReason::MissingAcceptedPathClassification);
@@ -545,9 +613,9 @@ RefoldEngine::ValidateIncludeRealizationProof(
           currentPath == AcceptedPathKind::IncludeMaterializedExpansion,
       ProofObligationKind::AcceptedPathClassified,
       ProofFailureReason::MissingAcceptedPathClassification);
+
   if (currentPath == AcceptedPathKind::IncludeRealizationInlineFromB) {
-    // Step 4A formalizes the class predicate directly in the local proof:
-    // inline include realization is discharged only when the witness records
+    // Inline include realization is discharged only when the witness records
     // either the canonical B-envelope mapping or the deterministic
     // consensus-rescue envelope. Any other evidence kind is outside the
     // declared domain for this proof class.
@@ -555,6 +623,10 @@ RefoldEngine::ValidateIncludeRealizationProof(
         witness && IsAcceptedIncludeRealizationEvidenceKind(witness->evidence),
         ProofObligationKind::IncludeRealizationWitnessTracked,
         ProofFailureReason::MissingIncludeRealizationWitness);
+
+    // The witness must identify the include being realized, the A-side cover
+    // being replaced, and the B-side token envelope that supplies the
+    // realization text.
     discharge.Require(witness && witness->hasIncludeId &&
                           witness->includeId != 0,
                       ProofObligationKind::IncludeRealizationIncludeTracked,
@@ -568,9 +640,12 @@ RefoldEngine::ValidateIncludeRealizationProof(
                       ProofObligationKind::IncludeRealizationBEnvelopeTracked,
                       ProofFailureReason::MissingIncludeRealizationBEnvelope);
   } else {
+    // Materialized include expansion is already represented by the accepted
+    // path classification. It has no inline B-envelope witness obligations.
     discharge.Require(true, ProofObligationKind::AcceptedPathClassified,
                       ProofFailureReason::MissingAcceptedPathClassification);
   }
+
   return discharge.Finish();
 }
 
@@ -580,6 +655,11 @@ RefoldEngine::ValidateTUAnchorProof(AcceptedPathKind currentPath,
   ProofDischargeAccumulator discharge;
   const AcceptancePathInventory inventory =
       BuildAcceptancePathInventory(currentPath);
+
+  // TU anchor validation applies only to the two accepted TU insertion-anchor
+  // classes. Other accepted paths may still reach this function accidentally,
+  // but they must fail the classification obligation rather than being treated
+  // as anchor proofs.
   const bool classified =
       currentPath == AcceptedPathKind::TUExactSlotBoundary ||
       currentPath == AcceptedPathKind::TUProvableInsertionAnchor;
@@ -588,8 +668,10 @@ RefoldEngine::ValidateTUAnchorProof(AcceptedPathKind currentPath,
   discharge.Require(inventory.futureTarget != FutureProofTarget::Unknown,
                     ProofObligationKind::FutureTargetMapped,
                     ProofFailureReason::MissingFutureTargetMapping);
-  // Step 7 requires every accepted TU anchor path to carry an explicit local
-  // witness describing which deterministic anchor source succeeded.
+
+  // Every accepted TU anchor path must carry an explicit local witness
+  // describing which deterministic anchor source succeeded, plus the PP-gap and
+  // TU-byte location where the insertion is anchored.
   discharge.Require(witness &&
                         witness->evidence != TUAnchorEvidenceKind::Unknown,
                     ProofObligationKind::TUAnchorWitnessTracked,
@@ -606,6 +688,9 @@ RefoldEngine::ValidateTUAnchorProof(AcceptedPathKind currentPath,
 
   switch (currentPath) {
   case AcceptedPathKind::TUExactSlotBoundary: {
+    // Exact-slot anchors are the strongest TU anchor class: the witness must
+    // name the exact slot, prove the PP gap matched exactly, and preserve the
+    // slot kind for auditability.
     const bool exactSlotWitness =
         witness->evidence == TUAnchorEvidenceKind::ExactSlotBoundary &&
         witness->exactPPMatch && witness->slotId != 0 &&
@@ -617,6 +702,9 @@ RefoldEngine::ValidateTUAnchorProof(AcceptedPathKind currentPath,
   }
 
   case AcceptedPathKind::TUProvableInsertionAnchor: {
+    // Provable insertion anchors are a family of weaker local anchors. Each
+    // evidence kind has its own minimal witness fields; the common PP-gap/TU-byte
+    // obligations above are not enough by themselves.
     bool provableWitness = false;
     switch (witness->evidence) {
     case TUAnchorEvidenceKind::ArgLikeBegin:
@@ -643,11 +731,19 @@ RefoldEngine::ValidateTUAnchorProof(AcceptedPathKind currentPath,
     discharge.Require(provableWitness,
                       ProofObligationKind::TUProvableEvidenceTracked,
                       ProofFailureReason::MissingTUProvableAnchorWitness);
+
+    // Ordinary TU anchors must be outside include coverage so they do not
+    // silently target materialized include text. Include-directive boundaries
+    // are the explicit exception because the directive itself supplies the
+    // include-aware anchor.
     discharge.Require(witness->outsideIncludeCoverage ||
                           witness->evidence ==
                               TUAnchorEvidenceKind::IncludeDirectiveBoundary,
                       ProofObligationKind::TUOutsideIncludeCoverageTracked,
                       ProofFailureReason::MissingTUOutsideIncludeCoverageProof);
+
+    // Corroborated neighbor anchors rely on stable ownership across both
+    // neighbors, so require the recorded owner-depth stability proof.
     if (witness->evidence == TUAnchorEvidenceKind::CorroboratedRightNeighbor ||
         witness->evidence == TUAnchorEvidenceKind::CorroboratedLeftNeighbor) {
       discharge.Require(witness->ownerDepthStable,
@@ -679,8 +775,12 @@ RefoldEngine::ValidateTUAnchorProof(AcceptedPathKind currentPath,
   case AcceptedPathKind::TUByteSpanMappedEdit:
   case AcceptedPathKind::TUByteSpanConservativeEdit:
   case AcceptedPathKind::TerminalEmitEditedPreprocessedStream:
+    // Non-TU-anchor paths have no path-specific obligations here; the common
+    // classification check above records the failure if one reaches this
+    // validator.
     break;
   }
+
   return discharge.Finish();
 }
 
@@ -741,6 +841,10 @@ RefoldEngine::BuildTerminalFallbackWitness() const {
   TerminalFallbackWitness witness;
   witness.kind = terminalFallbackKind_;
   witness.requestCount = terminalFallbackRequestCount_;
+
+  // Preserve the first recorded terminal-fallback reason as the primary audit
+  // witness; later reasons remain diagnostic context outside this compact
+  // theorem-facing record.
   if (!terminalFallbackReasons_.empty()) {
     witness.hasPrimaryReason = true;
     witness.primaryReason = terminalFallbackReasons_.front();
@@ -751,14 +855,19 @@ RefoldEngine::BuildTerminalFallbackWitness() const {
 bool RefoldEngine::IsOwnerUnresolvedNoTUAnchorOutOfDomain(
     const diffutils::Hunk &h, StringRef tuPath, const Owner &owner,
     bool mapsToTU) const {
-  // The declared domain excludes this case only after all deterministic owner
-  // and TU witness searches have already failed. This helper is intentionally
-  // derived-only: it does not invent new anchors or infer ownership from
-  // proximity.
+  // This is the explicit out-of-domain predicate for hunks whose owner could
+  // not be resolved and whose TU-level fallback witnesses are also unavailable.
+  // It must remain derived-only: by the time this helper returns true, all
+  // deterministic owner, include-boundary, TU-anchor, and TU-byte-span searches
+  // have already failed. Do not infer ownership from proximity here.
   if (owner.kind != OwnerKind::Unknown)
     return false;
 
   if (h.isInsertOnly()) {
+    // Pure insertions have extra deterministic witnesses: they may belong to a
+    // parent include boundary, a provable TU insertion anchor, or a zero-width
+    // TU byte span. Only if all of those are absent is the insertion outside
+    // the declared refolding domain.
     if (BoundaryParentIncludeForPureInsertion(h))
       return false;
     if (mapsToTU)
@@ -770,6 +879,9 @@ bool RefoldEngine::IsOwnerUnresolvedNoTUAnchorOutOfDomain(
     return true;
   }
 
+  // Non-insertion hunks are in-domain if the token map or TU byte-span mapping
+  // can still witness the affected range. Without either, there is no declared
+  // theorem-facing owner or TU anchor for this hunk.
   if (mapsToTU)
     return false;
   if (TUByteSpan(h.aStart, h.aEnd, tuPath))
@@ -781,29 +893,40 @@ std::string RefoldEngine::BuildOwnerUnresolvedNoTUAnchorDetail(
     size_t hunkIndex, const diffutils::Hunk &h, StringRef tuPath,
     const Owner &owner, bool mapsToTU) const {
   const bool isInsertion = h.aStart == h.aEnd;
-  // Reaching this detail builder already means the earlier macro-owner and
-  // include-owner searches failed to claim the edit. Record that control-flow
-  // fact explicitly so the terminal witness states the declared domain wall in
-  // theorem terms rather than only in terms of the final `Owner` enum.
+
+  // This detail string is emitted only after normal owner resolution has failed
+  // to produce a macro/include/TU witness. Record those exhausted search spaces
+  // explicitly so the terminal fallback explains the domain wall in proof
+  // terms, not merely as `OwnerKind::Unknown`.
   const bool macroOwnerExhausted = true;
   const bool includeOwnerExhausted = owner.kind != OwnerKind::Include;
 
+  // For pure insertions, check whether the insertion could still be explained
+  // by an include-boundary parent. If present, this is a deterministic include
+  // witness, not an out-of-domain owner-unresolved case.
   const RefoldModel::IncludeItem *boundaryInc = nullptr;
   if (isInsertion)
     boundaryInc = BoundaryParentIncludeForPureInsertion(h);
   const bool hasBoundaryInclude = boundaryInc != nullptr;
 
+  // Also test the TU insertion-anchor path. A provable TU anchor keeps an
+  // otherwise ownerless insertion inside the declared refolding domain.
   std::optional<uint64_t> provableInsertionAnchor;
   if (isInsertion)
     provableInsertionAnchor = FindProvableTUInsertionAnchor(h.aStart, tuPath);
   const bool hasProvableInsertionAnchor = provableInsertionAnchor.has_value();
 
+  // Finally, check whether the hunk can be represented directly as a TU byte
+  // span. This is the last generic TU witness before the edit is declared
+  // outside the owner/TU-anchor domain.
   std::optional<std::pair<uint64_t, uint64_t>> tuSpan =
       TUByteSpan(h.aStart, h.aEnd, tuPath);
   const bool hasTUByteSpan = tuSpan.has_value();
   const bool declaredDomainWall =
       IsOwnerUnresolvedNoTUAnchorOutOfDomain(h, tuPath, owner, mapsToTU);
 
+  // These insertion-only fields make the diagnostic precise about which
+  // insertion witnesses were attempted and whether each one was absent.
   std::string exactSlot = "n/a";
   std::string insertionAnchor = "n/a";
   std::string boundaryParent = "n/a";
@@ -850,30 +973,25 @@ std::string RefoldEngine::BuildOwnerUnresolvedNoTUAnchorDetail(
 std::string RefoldEngine::FormatAcceptancePathInventory(
     const AcceptancePathInventory &inventory) const {
   return formatv("currentPath={0} support={1} futureTarget={2}",
-                 inventory.currentPath,
-                 inventory.support,
+                 inventory.currentPath, inventory.support,
                  inventory.futureTarget)
       .str();
 }
 
 std::string RefoldEngine::FormatProofDischargeRecord(
     const ProofDischargeRecord &record) const {
-  return formatv(
-             "status={0} evaluated={1} satisfied={2} failedObligation={3} "
-             "failureReason={4}",
-             record.status,
-             record.obligationsEvaluated, record.obligationsSatisfied,
-             record.failedObligation,
-             record.failureReason)
+  return formatv("status={0} evaluated={1} satisfied={2} failedObligation={3} "
+                 "failureReason={4}",
+                 record.status, record.obligationsEvaluated,
+                 record.obligationsSatisfied, record.failedObligation,
+                 record.failureReason)
       .str();
 }
 
 std::string RefoldEngine::FormatGlobalSelectionLattice(
     const GlobalSelectionLattice &lattice) const {
-  return formatv("domain={0} mergeLaw={1} conflictLaw={2}",
-                 lattice.domain,
-                 lattice.mergeLaw,
-                 lattice.conflictLaw)
+  return formatv("domain={0} mergeLaw={1} conflictLaw={2}", lattice.domain,
+                 lattice.mergeLaw, lattice.conflictLaw)
       .str();
 }
 
@@ -979,8 +1097,7 @@ std::string RefoldEngine::FormatAcceptedPathAudit(
       .str();
 }
 
-std::string
-RefoldEngine::FormatAcceptedResultCandidate(
+std::string RefoldEngine::FormatAcceptedResultCandidate(
     const AcceptedResultCandidate &candidate) const {
   std::string artifact;
   switch (candidate.kind) {
@@ -1014,10 +1131,10 @@ RefoldEngine::FormatAcceptedResultCandidate(
   }
 
   if (candidate.proofSummary.hasTUAnchorWitness) {
-    artifact += formatv(" tuAnchor={0}",
-                        FormatTUAnchorWitness(
-                            candidate.proofSummary.tuAnchorWitness))
-                    .str();
+    artifact +=
+        formatv(" tuAnchor={0}",
+                FormatTUAnchorWitness(candidate.proofSummary.tuAnchorWitness))
+            .str();
   }
   if (candidate.proofSummary.hasIncludeAnchorWitness) {
     artifact += formatv(" includeAnchor={0}",
@@ -1026,11 +1143,10 @@ RefoldEngine::FormatAcceptedResultCandidate(
                     .str();
   }
   if (candidate.proofSummary.hasIncludeRealizationWitness) {
-    artifact +=
-        formatv(" includeRealization={0}",
-                FormatIncludeRealizationWitness(
-                    candidate.proofSummary.includeRealizationWitness))
-            .str();
+    artifact += formatv(" includeRealization={0}",
+                        FormatIncludeRealizationWitness(
+                            candidate.proofSummary.includeRealizationWitness))
+                    .str();
   }
   if (candidate.proofSummary.hasTerminalFallbackWitness) {
     artifact += formatv(" terminalOutOfDomain={0}",
@@ -1119,9 +1235,10 @@ std::string RefoldEngine::FormatMacroPatchAudit(const MacroPatch &patch) const {
       .str();
 }
 
-std::optional<std::string>
-RefoldEngine::BuildWholeCoverReplacementText(
+std::optional<std::string> RefoldEngine::BuildWholeCoverReplacementText(
     const RefoldModel::MacroInvocation &m) const {
+  // Reuse the same whole-cover planning path used by patch construction so the
+  // returned replacement text obeys the same clipping/envelope policy.
   auto plan = ComputeWholeCoverPlan(m);
   if (!plan)
     return std::nullopt;

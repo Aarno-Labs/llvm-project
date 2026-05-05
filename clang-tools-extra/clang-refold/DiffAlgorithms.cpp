@@ -83,6 +83,9 @@ constexpr size_t MAX =
     static_cast<size_t>(std::numeric_limits<int64_t>::max());
 
 namespace {
+/// Return true when the exact full DP table would exceed the configured cell or
+/// allocation budget and the caller must use the exact linear-space Hirschberg
+/// path. The function name is historical; the fallback is not greedy.
 bool shouldUseGreedyApproach(unsigned long long n, unsigned long long m,
                              unsigned long long maxCells) {
   if (n >= std::numeric_limits<unsigned long long>::max() - 1ULL ||
@@ -127,6 +130,8 @@ bool shouldUseGreedyApproach(unsigned long long n, unsigned long long m,
   return false;
 }
 
+/// Compare structural-LCS candidates: longer subsequence first, then lower
+/// owner-depth cost.
 inline bool isCoreBetter(unsigned candLen, std::uint64_t candCost,
                          unsigned bestLen, std::uint64_t bestCost) {
   if (candLen != bestLen)
@@ -134,7 +139,9 @@ inline bool isCoreBetter(unsigned candLen, std::uint64_t candCost,
   return candCost < bestCost;
 }
 
+/// Return the width of a hunk on the A side.
 static uint64_t hunkAWidth(const Hunk &h) { return h.aEnd - h.aStart; }
+/// Return the width of a hunk on the B side.
 static uint64_t hunkBWidth(const Hunk &h) { return h.bEnd - h.bStart; }
 
 /// Add \p extra to \p base without allowing unsigned wraparound.
@@ -173,6 +180,9 @@ static bool buildCoreLcsDpTables(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
   const size_t m = b.size();
   const unsigned long long nu = static_cast<unsigned long long>(n);
   const unsigned long long mu = static_cast<unsigned long long>(m);
+
+  // Refuse to build quadratic DP tables when the configured cell budget says
+  // this input must fall back to the exact linear-space Hirschberg path.
   if (shouldUseGreedyApproach(nu, mu, maxCells))
     return false;
 
@@ -186,6 +196,9 @@ static bool buildCoreLcsDpTables(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
     return isCoreBetter(cand.len, cand.cost, best.len, best.cost);
   };
 
+  // Forward DP over prefixes A[0..i) and B[0..j). Each cell stores the best
+  // objective value reachable for that prefix pair: maximize kept length, then
+  // minimize structural gap cost.
   for (size_t i = 0; i <= n; ++i) {
     for (size_t j = 0; j <= m; ++j) {
       if (i == 0 && j == 0)
@@ -193,6 +206,8 @@ static bool buildCoreLcsDpTables(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
 
       CoreLcsCell best{0, std::numeric_limits<uint64_t>::max()};
 
+      // Keep a matching token pair. Matching increases the LCS length and does
+      // not pay an owner-depth gap cost.
       if (i > 0 && j > 0 && a[i - 1] == b[j - 1]) {
         CoreLcsCell cand = forward[idx(i - 1, j - 1)];
         ++cand.len;
@@ -200,6 +215,8 @@ static bool buildCoreLcsDpTables(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
           best = cand;
       }
 
+      // Delete A[i - 1]. In prefix coordinates, this deletion crosses the gap
+      // after that A token, represented by ownerDepthGap[i].
       if (i > 0) {
         CoreLcsCell cand = forward[idx(i - 1, j)];
         if (addCostChecked(cand.cost, ownerDepthGap[i], cand.cost) &&
@@ -207,6 +224,8 @@ static bool buildCoreLcsDpTables(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
           best = cand;
       }
 
+      // Insert B[j - 1] at the current A prefix boundary. This insertion is
+      // charged to the same A gap ownerDepthGap[i].
       if (j > 0) {
         CoreLcsCell cand = forward[idx(i, j - 1)];
         if (addCostChecked(cand.cost, ownerDepthGap[i], cand.cost) &&
@@ -218,6 +237,10 @@ static bool buildCoreLcsDpTables(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
     }
   }
 
+  // Suffix DP over suffixes A[i..n) and B[j..m). This table answers the same
+  // objective as `forward`, but from the opposite direction so later
+  // admissibility checks can prove that a proposed split still lies on an
+  // optimal full solution.
   for (size_t ii = n + 1; ii > 0; --ii) {
     const size_t i = ii - 1;
     for (size_t jj = m + 1; jj > 0; --jj) {
@@ -227,6 +250,7 @@ static bool buildCoreLcsDpTables(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
 
       CoreLcsCell best{0, std::numeric_limits<uint64_t>::max()};
 
+      // Keep a matching token pair at the start of both suffixes.
       if (i < n && j < m && a[i] == b[j]) {
         CoreLcsCell cand = suffix[idx(i + 1, j + 1)];
         ++cand.len;
@@ -234,6 +258,8 @@ static bool buildCoreLcsDpTables(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
           best = cand;
       }
 
+      // Delete A[i]. In suffix coordinates, deleting this token advances to
+      // A[i + 1..), so the crossed gap is ownerDepthGap[i + 1].
       if (i < n) {
         CoreLcsCell cand = suffix[idx(i + 1, j)];
         if (addCostChecked(cand.cost, ownerDepthGap[i + 1], cand.cost) &&
@@ -241,6 +267,8 @@ static bool buildCoreLcsDpTables(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
           best = cand;
       }
 
+      // Insert B[j] at the current A suffix boundary. This mirrors the forward
+      // insertion rule and charges ownerDepthGap[i].
       if (j < m) {
         CoreLcsCell cand = suffix[idx(i, j + 1)];
         if (addCostChecked(cand.cost, ownerDepthGap[i], cand.cost) &&
@@ -255,6 +283,7 @@ static bool buildCoreLcsDpTables(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
   return true;
 }
 
+/// Return true iff a provenance id is present rather than the sentinel zero.
 static bool hasProvenanceId(uint64_t value) {
   return value != LcsGapProvenance::NoId;
 }
@@ -272,6 +301,9 @@ static uint64_t aBoundaryRetentionRank(ArrayRef<LcsGapProvenance> profiles,
     return 0;
 
   const LcsGapProvenance &profile = profiles[static_cast<size_t>(gap)];
+
+  // Depth carries the coarse owner-boundary strength; identity fields then add
+  // small tie-breaking increments without introducing token-spelling bias.
   uint64_t rank = profile.ownerDepth;
   rank += static_cast<uint64_t>(profile.includeDepth) * 8;
   rank += static_cast<uint64_t>(profile.conditionalDepth) * 8;
@@ -292,6 +324,7 @@ static uint64_t aBoundaryRetentionRank(ArrayRef<LcsGapProvenance> profiles,
   return rank;
 }
 
+/// True when two B gaps expose the same line-boundary shape.
 static bool sameBLineShape(const LcsBGapProvenance &lhs,
                            const LcsBGapProvenance &rhs) {
   return lhs.hasLeftToken == rhs.hasLeftToken &&
@@ -329,14 +362,16 @@ static uint64_t bGapSurfaceRank(ArrayRef<LcsBGapProvenance> profiles,
   return rank;
 }
 
+/// Rank a matched B-token pair using the surrounding B-gap surfaces.
 static uint64_t bPairSurfaceRank(ArrayRef<LcsBGapProvenance> profiles,
                                  uint64_t bStart, uint64_t bEnd) {
   uint64_t rank = bGapSurfaceRank(profiles, bStart) +
                   bGapSurfaceRank(profiles, bEnd);
   if (bStart < profiles.size() && bEnd < profiles.size() &&
       sameBLineShape(profiles[static_cast<size_t>(bStart)],
-                     profiles[static_cast<size_t>(bEnd)]))
+                     profiles[static_cast<size_t>(bEnd)])) {
     rank += 8;
+  }
   return rank;
 }
 
@@ -362,6 +397,8 @@ static size_t suppressOrderConflictingAnchors(std::vector<int64_t> &map) {
   if (n == 0)
     return 0;
 
+  // Prefix scan: for each A index, remember the largest retained B index to
+  // its left. A valid anchor must be strictly greater than this value.
   std::vector<int64_t> maxLeft(n, -1);
   int64_t leftMax = -1;
   for (size_t i = 0; i < n; ++i) {
@@ -370,6 +407,8 @@ static size_t suppressOrderConflictingAnchors(std::vector<int64_t> &map) {
       leftMax = std::max(leftMax, map[i]);
   }
 
+  // Suffix scan: symmetrically remember the smallest retained B index to the
+  // right. A valid anchor must be strictly smaller than this value.
   std::vector<int64_t> minRight(n, std::numeric_limits<int64_t>::max());
   int64_t rightMin = std::numeric_limits<int64_t>::max();
   for (size_t i = n; i-- > 0;) {
@@ -378,6 +417,8 @@ static size_t suppressOrderConflictingAnchors(std::vector<int64_t> &map) {
       rightMin = std::min(rightMin, map[i]);
   }
 
+  // Drop any anchor that crosses either side. This deliberately widens hunks
+  // instead of choosing one arbitrary explanation for repeated tokens.
   size_t suppressed = 0;
   for (size_t i = 0; i < n; ++i) {
     const int64_t bj = map[i];
@@ -418,6 +459,8 @@ static bool buildBoundaryPureCertifiedMap(
   if (ownerDepthGap.size() != n + 1 || gapProvenance.size() != n + 1)
     return false;
 
+  // The forward/suffix tables let us ask whether any proposed A/B equal-token
+  // pair participates in at least one globally optimal core LCS solution.
   std::vector<CoreLcsCell> forward;
   std::vector<CoreLcsCell> suffix;
   size_t stride = 0;
@@ -429,6 +472,8 @@ static bool buildBoundaryPureCertifiedMap(
   const CoreLcsCell total = forward[idx(n, m)];
 
   auto isCoreAdmissible = [&](size_t ai, size_t bj) -> bool {
+    // Splice prefix + this match + suffix. The candidate is admissible only if
+    // it preserves both the optimal LCS length and the optimal owner-depth cost.
     if (ai >= n || bj >= m || a[ai] != b[bj])
       return false;
     const CoreLcsCell &prefix = forward[idx(ai, bj)];
@@ -480,6 +525,9 @@ static bool buildBoundaryPureCertifiedMap(
           suppressedForcedAnchors);
   }
 
+  // Return true when a matching A/B token pair can serve as an ambiguous edge
+  // anchor: it must be core-admissible, but not already a unique one-to-one
+  // match that would be handled by the ordinary anchor path.
   auto canUseAmbiguousEdgeAnchor = [&](uint64_t ai64, uint64_t bj64) -> bool {
     if (ai64 >= n || bj64 >= m)
       return false;
@@ -510,6 +558,9 @@ static bool buildBoundaryPureCertifiedMap(
     uint64_t restoredAnchors = 0;
   };
 
+  // Order boundary-pure candidates by the deterministic preference used for
+  // anchor selection: best balance first, then stronger boundary evidence, then
+  // stronger B-side pair evidence.
   auto betterCandidate = [](const BoundaryPureCandidate &cand,
                             const BoundaryPureCandidate &best) {
     if (cand.balance != best.balance)
@@ -519,6 +570,9 @@ static bool buildBoundaryPureCertifiedMap(
     return cand.bPairRank > best.bPairRank;
   };
 
+  // Order suffix-insertion candidates by deterministic recovery strength:
+  // prefer stronger boundary evidence, stronger B-side pair evidence, more
+  // restored anchors, then the rightmost compatible insertion window.
   auto betterSuffixInsertionCandidate =
       [](const SuffixInsertionCandidate &cand,
          const SuffixInsertionCandidate &best) {
@@ -615,6 +669,9 @@ static bool buildBoundaryPureCertifiedMap(
       SuffixInsertionCandidate suffixBest;
       size_t suffixBestCount = 0;
 
+      // Enumerate possible right-edge restorations first. `right` gives the
+      // number of unchanged trailing anchors that bound the B-only suffix
+      // insertion from the right.
       for (uint64_t right = 1; right <= maxSuffix; ++right) {
         const uint64_t aPureGap = forced.aEnd - right;
         const uint64_t bPureEnd = forced.bEnd - right;
@@ -622,6 +679,9 @@ static bool buildBoundaryPureCertifiedMap(
             bPureEnd <= forced.bStart)
           continue;
 
+        // The insertion frontier is immediately after this restored internal
+        // anchor. The anchor is allowed to move on the B side, unlike the
+        // equal-offset edge anchors handled by the earlier path.
         const uint64_t anchorA = aPureGap - 1;
         for (uint64_t left = 0; left <= maxPrefix; ++left) {
           if (left + right + 1 > maxSharedWidth)
@@ -639,13 +699,15 @@ static bool buildBoundaryPureCertifiedMap(
             if (insertionBegin >= bPureEnd)
               continue;
 
+            // Rank the candidate by the structural boundary it preserves and
+            // by the B-only surface that would be inserted. The comparator
+            // below uses only these proof ranks plus deterministic tie-breaks.
             SuffixInsertionCandidate cand;
             cand.left = left;
             cand.right = right;
             cand.anchorA = anchorA;
             cand.anchorB = anchorB;
-            cand.boundaryRank =
-                aBoundaryRetentionRank(gapProvenance, aPureGap);
+            cand.boundaryRank = aBoundaryRetentionRank(gapProvenance, aPureGap);
             cand.bPairRank =
                 bPairSurfaceRank(bGapProvenance, insertionBegin, bPureEnd);
             cand.restoredAnchors = left + right + 1;
@@ -681,6 +743,10 @@ static bool buildBoundaryPureCertifiedMap(
             suffixBest.left, suffixBest.anchorA, suffixBest.anchorB,
             suffixBest.right, suffixBest.boundaryRank, suffixBest.bPairRank);
 
+      // Commit only the anchors proven by the suffix-insertion certificate:
+      // unchanged prefix anchors, the moved internal anchor, and unchanged
+      // suffix anchors. The B-only interval between anchorB and the right edge
+      // intentionally remains unmapped.
       for (uint64_t off = 0; off < suffixBest.left; ++off) {
         outMap[static_cast<size_t>(forced.aStart + off)] =
             static_cast<int64_t>(forced.bStart + off);
@@ -695,11 +761,14 @@ static bool buildBoundaryPureCertifiedMap(
       ++normalizedHunks;
       continue;
     }
+
     if (bestCount != 1) {
       ++ambiguousHunks;
       continue;
     }
 
+    // Restore only the uniquely certified equal-token edge runs. The middle of
+    // the hunk remains B-only, which downstream code can treat as an insertion.
     for (uint64_t off = 0; off < best.left; ++off) {
       outMap[static_cast<size_t>(forced.aStart + off)] =
           static_cast<int64_t>(forced.bStart + off);
@@ -724,6 +793,11 @@ static bool buildBoundaryPureCertifiedMap(
             "certified boundary-pure map lost monotonicity at A={0} B={1} "
             "after previous B={2}; returning ambiguity-suppressed map",
             ai, bj, previousB);
+
+      // Rebuild the fallback map from only unique one-to-one token partners.
+      // This intentionally drops every ambiguity-restored edge and keeps only
+      // anchors that are independently forced by both A-side and B-side
+      // uniqueness.
       outMap.assign(n, -1);
       for (size_t forcedAi = 0; forcedAi < n; ++forcedAi) {
         if (aPartnerCount[forcedAi] != 1)
@@ -733,6 +807,9 @@ static bool buildBoundaryPureCertifiedMap(
             bPartnerCount[static_cast<size_t>(forcedBj)] == 1)
           outMap[forcedAi] = forcedBj;
       }
+
+      // Even the unique-partner fallback must be order-clean before it leaves
+      // this function.
       const size_t suppressedFallbackAnchors =
           suppressOrderConflictingAnchors(outMap);
       if (suppressedFallbackAnchors != 0) {
@@ -798,6 +875,7 @@ struct GapView {
   }
 };
 
+/// Compute one weighted Hirschberg LCS DP row for the given span views.
 static std::vector<Score>
 computeRowWeighted(const SpanView &aV, const SpanView &bV,
                    const GapView &gapV) {
@@ -861,6 +939,8 @@ computeRowWeighted(const SpanView &aV, const SpanView &bV,
   return dp;
 }
 
+/// Solve a small weighted-LCS box with the full DP table and append anchors in
+/// forward order.
 static void solveSmallWeightedDP(const SpanView &aV, const SpanView &bV,
                                  const GapView &gapV,
                                  std::vector<int64_t> &outMap) {
@@ -961,6 +1041,14 @@ static void solveSmallWeightedDP(const SpanView &aV, const SpanView &bV,
   }
 }
 
+/// Recursively solve weighted LCS with Hirschberg splitting.
+///
+/// This is the structural-cost counterpart to the unweighted Hirschberg solver.
+/// It avoids materializing a full quadratic DP table for large boxes by
+/// splitting A in half, choosing the B split that maximizes the weighted core
+/// objective, and recursively solving the two induced subproblems. The
+/// objective is the same one used by the exact weighted DP path: maximize LCS
+/// length, then minimize owner-depth gap cost.
 static void hirschbergWeightedRec(const SpanView &aV, const SpanView &bV,
                                   const GapView &gapV,
                                   std::vector<int64_t> &outMap) {
@@ -977,6 +1065,9 @@ static void hirschbergWeightedRec(const SpanView &aV, const SpanView &bV,
     return;
   }
 
+  // Split A in half. The gap view is split with one extra element on each side
+  // because A-side gap costs are indexed at token boundaries, so an A span of
+  // length k owns k + 1 gap positions.
   const size_t mid = n / 2;
 
   const SpanView aLeft{aV.base, aV.off, mid, aV.rev};
@@ -985,9 +1076,14 @@ static void hirschbergWeightedRec(const SpanView &aV, const SpanView &bV,
   const SpanView aRight{aV.base, aV.off + mid, n - mid, aV.rev};
   const GapView gapRight{gapV.base, gapV.off + mid, (n - mid) + 1, gapV.rev};
 
+  // Compute the best weighted LCS objective for every possible B split after
+  // solving the left half of A against each prefix of B.
   const std::vector<Score> leftRow =
       computeRowWeighted(aLeft, bV, gapLeft);
 
+  // Compute the corresponding suffix objectives by solving the right half of A
+  // and B in reverse. rightRowRev[m - j] is the score for A[mid..n) against
+  // B[j..m).
   const SpanView aRightRev{aV.base, aV.off + mid, n - mid, true};
   const GapView gapRightRev{gapV.base, gapV.off + mid, (n - mid) + 1, true};
   const SpanView bRev{bV.base, bV.off, m, true};
@@ -1008,6 +1104,8 @@ static void hirschbergWeightedRec(const SpanView &aV, const SpanView &bV,
     }
   }
 
+  // Recurse on the two independently optimal subproblems induced by the chosen
+  // B split. Both calls write their anchors into the shared global output map.
   const SpanView bLeft{bV.base, bV.off, bestJ, bV.rev};
   const SpanView bRight{bV.base, bV.off + bestJ, m - bestJ, bV.rev};
 
@@ -1015,6 +1113,7 @@ static void hirschbergWeightedRec(const SpanView &aV, const SpanView &bV,
   hirschbergWeightedRec(aRight, bRight, gapRight, outMap);
 }
 
+/// Entry point for the linear-space weighted LCS fallback.
 static std::vector<int64_t>
 lcsMapABHirschbergWeighted(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
                            ArrayRef<uint32_t> ownerDepthGap) {
@@ -1026,13 +1125,21 @@ lcsMapABHirschbergWeighted(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
   return out;
 }
 
-// Unweighted Hirschberg (length-only) used for the non-policy overload.
+/// Compute one unweighted Hirschberg LCS length row.
+///
+/// This is the length-only row builder used by the non-policy overload. It
+/// computes the final DP row for `aV` against every prefix of `bV`, using only
+/// two rows of storage so Hirschberg can choose a split without materializing
+/// the full table.
 static std::vector<unsigned> computeRowLen(const SpanView &aV,
                                            const SpanView &bV) {
   const size_t n = aV.size();
   const size_t m = bV.size();
   std::vector<unsigned> dp(m + 1, 0);
   std::vector<unsigned> ndp(m + 1, 0);
+
+  // `dp` is the previous A-row and `ndp` is the row being built. `diagPrev`
+  // carries the old dp[j - 1] value needed for the match transition.
   for (size_t i = 1; i <= n; ++i) {
     ndp[0] = 0;
     unsigned diagPrev = 0;
@@ -1051,6 +1158,12 @@ static std::vector<unsigned> computeRowLen(const SpanView &aV,
   return dp;
 }
 
+/// Solve a small unweighted LCS subproblem with a full suffix-DP table.
+///
+/// This is the exact base case for the non-policy Hirschberg path. It
+/// materializes the complete DP table for the current `SpanView` box, then
+/// backtracks greedily through that table to emit A→B anchors into the shared
+/// absolute `outMap`.
 static void solveSmallUnweightedDP(const SpanView &aV, const SpanView &bV,
                                    std::vector<int64_t> &outMap) {
   const size_t n = aV.size();
@@ -1062,6 +1175,7 @@ static void solveSmallUnweightedDP(const SpanView &aV, const SpanView &bV,
     return dp[i * stride + j];
   };
 
+  // Build suffix DP: DP(i, j) is the LCS length of A[i..n) and B[j..m).
   for (size_t i = n; i-- > 0;) {
     for (size_t j = m; j-- > 0;) {
       DP(i, j) = (aV.at(i) == bV.at(j)) ? DP(i + 1, j + 1) + 1U
@@ -1069,6 +1183,8 @@ static void solveSmallUnweightedDP(const SpanView &aV, const SpanView &bV,
     }
   }
 
+  // Walk one deterministic optimal path through the table and record matches
+  // using absolute indices from the original token streams.
   size_t i = 0, j = 0;
   while (i < n && j < m) {
     if (aV.at(i) == bV.at(j)) {
@@ -1083,6 +1199,12 @@ static void solveSmallUnweightedDP(const SpanView &aV, const SpanView &bV,
   }
 }
 
+/// Recursively solve unweighted LCS with Hirschberg splitting.
+///
+/// This is the length-only counterpart to the weighted Hirschberg solver. It
+/// avoids materializing a full quadratic DP table for large boxes by splitting
+/// A in half, choosing the B split that preserves the maximum LCS length, and
+/// recursively solving the two induced subproblems.
 static void hirschbergUnweightedRec(const SpanView &aV, const SpanView &bV,
                                     std::vector<int64_t> &outMap) {
   const size_t n = aV.size();
@@ -1090,6 +1212,7 @@ static void hirschbergUnweightedRec(const SpanView &aV, const SpanView &bV,
   if (n == 0 || m == 0)
     return;
 
+  // Small exact DP base case.
   const unsigned long long cells = static_cast<unsigned long long>(n + 1ULL) *
                                    static_cast<unsigned long long>(m + 1ULL);
   if (cells <= (1ULL << 20)) {
@@ -1097,15 +1220,24 @@ static void hirschbergUnweightedRec(const SpanView &aV, const SpanView &bV,
     return;
   }
 
+  // Split A in half. Hirschberg only materializes one DP row per side, so this
+  // keeps memory linear in |B| while preserving the exact LCS objective.
   const size_t mid = n / 2;
   const SpanView aLeft{aV.base, aV.off, mid, aV.rev};
   const SpanView aRight{aV.base, aV.off + mid, n - mid, aV.rev};
 
+  // Compute the best unweighted LCS length for the left half of A against every
+  // prefix of B.
   const std::vector<unsigned> leftRow = computeRowLen(aLeft, bV);
+
+  // Compute suffix objectives by solving the right half of A and B in reverse.
+  // rightRowRev[m - j] is the LCS length of A[mid..n) against B[j..m).
   const SpanView aRightRev{aV.base, aV.off + mid, n - mid, true};
   const SpanView bRev{bV.base, bV.off, m, true};
   const std::vector<unsigned> rightRowRev = computeRowLen(aRightRev, bRev);
 
+  // Choose the B split that maximizes the total LCS length. On ties, prefer the
+  // smallest split index for deterministic output.
   size_t bestJ = 0;
   unsigned bestLen = leftRow[0] + rightRowRev[m];
   for (size_t j = 1; j <= m; ++j) {
@@ -1116,6 +1248,8 @@ static void hirschbergUnweightedRec(const SpanView &aV, const SpanView &bV,
     }
   }
 
+  // Recurse on the two subproblems induced by the chosen B split. Both calls
+  // write their anchors into the shared global output map.
   const SpanView bLeft{bV.base, bV.off, bestJ, bV.rev};
   const SpanView bRight{bV.base, bV.off + bestJ, m - bestJ, bV.rev};
 
@@ -1123,6 +1257,7 @@ static void hirschbergUnweightedRec(const SpanView &aV, const SpanView &bV,
   hirschbergUnweightedRec(aRight, bRight, outMap);
 }
 
+/// Entry point for the linear-space unweighted LCS fallback.
 static std::vector<int64_t> lcsMapABHirschberg(ArrayRef<StringRef> a,
                                                ArrayRef<StringRef> b) {
   std::vector<int64_t> out(a.size(), -1);
@@ -1135,10 +1270,9 @@ static std::vector<int64_t> lcsMapABHirschberg(ArrayRef<StringRef> a,
 
 // ================ Weighted LCS (DP with Hirschberg fallback) =================
 
-std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a,
-                          ArrayRef<StringRef> b,
-                          ArrayRef<uint32_t> ownerDepthGap,
-                          unsigned long long maxCells) {
+std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
+                              ArrayRef<uint32_t> ownerDepthGap,
+                              unsigned long long maxCells) {
   using namespace clang::refold;
 
   const size_t n = a.size(), m = b.size();
@@ -1165,8 +1299,7 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a,
   const unsigned long long mu = static_cast<unsigned long long>(m);
   const bool useHirschberg = shouldUseGreedyApproach(nu, mu, maxCells);
   if (useHirschberg) {
-    std::vector<int64_t> map =
-        lcsMapABHirschbergWeighted(a, b, ownerDepthGap);
+    std::vector<int64_t> map = lcsMapABHirschbergWeighted(a, b, ownerDepthGap);
     return map;
   }
 
@@ -1186,9 +1319,7 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a,
   std::vector<uint64_t> dpCost(cells, 0);
 
   auto idx = [&](size_t i, size_t j) -> size_t { return i * stride + j; };
-  auto len = [&](size_t i, size_t j) -> uint32_t & {
-    return dpLen[idx(i, j)];
-  };
+  auto len = [&](size_t i, size_t j) -> uint32_t & { return dpLen[idx(i, j)]; };
   auto cost = [&](size_t i, size_t j) -> uint64_t & {
     return dpCost[idx(i, j)];
   };
@@ -1441,6 +1572,7 @@ struct MiddleSnake {
   int64_t bEnd = 0;
 };
 
+/// Append one equal run to the SES, if non-empty.
 static void appendEqualSteps(std::vector<Step> &out, uint64_t aLo, uint64_t bLo,
                              uint64_t len) {
   for (uint64_t i = 0; i < len; ++i) {
@@ -1449,12 +1581,14 @@ static void appendEqualSteps(std::vector<Step> &out, uint64_t aLo, uint64_t bLo,
   }
 }
 
+/// Append one insertion run to the SES, if non-empty.
 static void appendInsertSteps(std::vector<Step> &out, uint64_t aPos,
                               uint64_t bLo, uint64_t bHi) {
   for (uint64_t j = bLo; j < bHi; ++j)
     out.push_back(Step{Op::Insert, aPos, aPos, j, j + 1});
 }
 
+/// Append one deletion run to the SES, if non-empty.
 static void appendDeleteSteps(std::vector<Step> &out, uint64_t aLo,
                               uint64_t aHi, uint64_t bPos) {
   for (uint64_t i = aLo; i < aHi; ++i)
@@ -1474,6 +1608,7 @@ static void appendDeleteSteps(std::vector<Step> &out, uint64_t aLo,
 /// * (aEnd - aStart) == (bEnd - bStart)
 /// * The left subproblem is A[aLo,aStart) × B[bLo,bStart)
 /// * The right subproblem is A[aEnd,aHi) × B[bEnd,bHi)
+/// Find the middle snake used by Myers' divide-and-conquer SES recursion.
 static MiddleSnake findMiddleSnake(ArrayRef<StringRef> a, int64_t aLo,
                                    int64_t aHi, ArrayRef<StringRef> b,
                                    int64_t bLo, int64_t bHi) {
@@ -1560,6 +1695,13 @@ static MiddleSnake findMiddleSnake(ArrayRef<StringRef> a, int64_t aLo,
   fatal("diff/myers", "internal: failed to find middle snake");
 }
 
+/// Emit a shortest edit script for one Myers divide-and-conquer subproblem.
+///
+/// This is the recursive linear-space Myers path. It trims equal prefix/suffix
+/// runs from the current A/B box, handles empty-middle base cases directly, and
+/// otherwise splits the remaining middle box at Myers' middle snake. Steps are
+/// appended in forward order as recursion unwinds, so callers do not need a
+/// reversal or normalization pass.
 static void diffLinearRec(ArrayRef<StringRef> a, int64_t aLo, int64_t aHi,
                           ArrayRef<StringRef> b, int64_t bLo, int64_t bHi,
                           std::vector<Step> &out) {
@@ -1582,6 +1724,8 @@ static void diffLinearRec(ArrayRef<StringRef> a, int64_t aLo, int64_t aHi,
     ++suffixLen;
   }
 
+  // Exclude the peeled suffix from the recursive middle box. The suffix is
+  // emitted exactly once at each return site after the middle work is done.
   const int64_t aMidHi = aHi - suffixLen;
   const int64_t bMidHi = bHi - suffixLen;
 
@@ -1592,6 +1736,8 @@ static void diffLinearRec(ArrayRef<StringRef> a, int64_t aLo, int64_t aHi,
     return;
   }
 
+  // If the A side of the middle box is empty, the remaining B middle is a pure
+  // insertion before the peeled suffix.
   if (aLo == aMidHi) {
     appendInsertSteps(out, static_cast<uint64_t>(aLo),
                       static_cast<uint64_t>(bLo),
@@ -1602,6 +1748,8 @@ static void diffLinearRec(ArrayRef<StringRef> a, int64_t aLo, int64_t aHi,
     return;
   }
 
+  // If the B side of the middle box is empty, the remaining A middle is a pure
+  // deletion before the peeled suffix.
   if (bLo == bMidHi) {
     appendDeleteSteps(out, static_cast<uint64_t>(aLo),
                       static_cast<uint64_t>(aMidHi),
@@ -1614,6 +1762,9 @@ static void diffLinearRec(ArrayRef<StringRef> a, int64_t aLo, int64_t aHi,
 
   const MiddleSnake snake = findMiddleSnake(a, aLo, aMidHi, b, bLo, bMidHi);
 
+  // Recurse around the middle snake. The snake itself is an equal run on an
+  // optimal SES path, so it can be emitted directly between the two
+  // subproblems.
   diffLinearRec(a, aLo, snake.aStart, b, bLo, snake.bStart, out);
   appendEqualSteps(out, static_cast<uint64_t>(snake.aStart),
                    static_cast<uint64_t>(snake.bStart),

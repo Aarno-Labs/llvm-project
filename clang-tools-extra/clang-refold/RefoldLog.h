@@ -5,21 +5,19 @@
 // Overview
 // --------
 // Provides a tiny, LLVM-friendly logging facade with explicit log levels and
-// printf-free formatting via llvm::formatv. The interface is header-only for
-// call sites (definitions typically live alongside the library) and aims to be
-// simple, deterministic, and easy to stub in unit tests.
+// printf-free formatting via llvm::formatv. The logging helpers are implemented
+// inline for use from the refolder without introducing a separate logging
+// library.
 //
 // Features
 // --------
 //  • Log levels: trace, debug, info, warn, error, fatal (fatal terminates).
 //  • Format strings use llvm::formatv-style placeholders: {0}, {1}, ...
-//  • Destination: llvm::raw_ostream (errs() by default); pluggable sinks.
+//  • Destination: llvm::outs(), with colors when the stream supports them.
 //  • Category tag (e.g., "lexer", "json") for structured filtering.
 //  • Global runtime level gate; cheap level checks to avoid formatting costs.
-//  • Optional compile-time stripping of verbose levels (TRACE/DEBUG) via
-//  macros. • Thread-friendly: emits one complete line per call; synchronization
-//  is
-//    delegated to the chosen raw_ostream implementation.
+//  • One complete line is emitted per call; any synchronization is delegated to
+//    the underlying raw_ostream implementation.
 //
 // Usage
 // -----
@@ -35,8 +33,8 @@
 // ------
 //  • Logging must never throw; formatting failures are treated as best-effort.
 //  • Fatal logs end the process deterministically after emitting the message.
-//  • Library users can override the output stream and termination hook
-//    (e.g., to funnel logs into test buffers).
+//  • Fatal logs abort the process after printing; non-fatal logs return to the
+//    caller after emission.
 //
 // Public API (summary)
 // --------------------

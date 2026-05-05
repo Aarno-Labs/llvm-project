@@ -66,10 +66,9 @@ struct LineDirectiveState {
 ///    most recent emitted #line state and the naturally-emitted newlines since
 ///    then.
 ///
-/// **Note on indices:** All offsets passed to this class are Java String
-/// indices. In practice your inputs are ASCII/UTF-8 preprocessor output where
-/// "byte offset" and "char index" coincide; if that assumption changes, call
-/// sites must be audited.
+/// **Note on indices:** All offsets passed to this class are byte offsets into
+/// the corresponding `StringRef`. The refolder treats source and preprocessor
+/// buffers as byte streams; callers must not pass decoded character indices.
 class LineDirectiveInserter {
 public:
   LineDirectiveInserter(bool enabled, StringRef cwd);
@@ -97,8 +96,9 @@ public:
   /// \brief Formats a single #line directive with conventional clang-style
   /// quoting.
   ///
-  /// The returned string always ends in `\n` to ensure the directive forms a
-  /// complete preprocessing line when inserted at a BOL.
+  /// For nonzero line numbers, the returned string always ends in `\n` so the
+  /// directive forms a complete preprocessing line when inserted at a BOL. A
+  /// zero line number produces the empty string.
   ///
   /// \param lineNo 1-based logical line number to set
   /// \param spelledFile file spelling to embed in the directive
@@ -271,8 +271,9 @@ private:
   ///     #line <digits> "file"
   ///
   /// This parser is intentionally minimal and only supports the directive forms
-  /// the refolder itself emits. It supports basic backslash escaping within the
-  /// quoted file string by treating `\"` and `\\` as a single character.
+  /// the refolder itself emits. Within the quoted file spelling, a backslash
+  /// escapes the following byte, which is enough to invert EscapeForLineDirective()
+  /// for the paths this class emits.
   ///
   /// \param src source buffer
   /// \param from start index (inclusive) of the line

@@ -71,7 +71,7 @@ RefoldEngine::BuildMacroOwnerExpansionClosureWitness() const {
     WholeCoverPlan plan;
   };
 
-  // Step 2 deliberately proves only a whole-owner closure. A candidate root
+  // This witness deliberately proves only a whole-owner closure. A candidate root
   // is admissible only if every observed token hunk fits completely inside the
   // root's whole-cover envelope.
   //
@@ -94,7 +94,7 @@ RefoldEngine::BuildMacroOwnerExpansionClosureWitness() const {
     return true;
   };
 
-  // Step 5 adds explicit interval-level guards instead of relying on the
+  // Use explicit interval-level guards instead of relying on the
   // shape of the surviving candidate set alone. The fallback proof class is
   // only in-domain when its chosen owner frontier does not interact with any
   // foreign owner frontier.
@@ -243,7 +243,7 @@ RefoldEngine::BuildMacroOwnerExpansionClosureWitness() const {
     // top-level TU callsite macro whose whole-cover plan closes every edited
     // hunk by itself. Nested roots, include-owned callsites, define-body
     // invocations, and any clipped / non-self-contained plans remain
-    // out-of-domain for this step.
+    // out-of-domain for this fallback proof.
     if (m.callerMacroId)
       continue;
 
@@ -298,7 +298,7 @@ RefoldEngine::BuildMacroOwnerExpansionClosureWitness() const {
     }
 
     // Reuse the existing whole-cover computation as the closure/frontier
-    // witness. Step 2 only accepts roots whose existing plan already proves a
+    // witness. Accept only roots whose existing plan already proves a
     // self-contained, unclipped edited B-surface.
     auto plan = ComputeWholeCoverPlan(m);
     if (!plan) {
@@ -322,7 +322,7 @@ RefoldEngine::BuildMacroOwnerExpansionClosureWitness() const {
     if (!sourceIntervalIsSelfContainedTUOwned(m))
       continue;
 
-    // Step 5 makes several previously implicit exclusions explicit. Reject any
+    // Make several previously implicit exclusions explicit. Reject any
     // candidate whose owner frontier overlaps a foreign macro closure or whose
     // callsite/source frontier crosses a mixed-ownership boundary. The single-
     // owner fallback class remains valid only when the proved closure is the
@@ -383,8 +383,9 @@ RefoldEngine::BuildMacroOwnerExpansionClosureWitness() const {
 
   const auto &cand = candidates.front();
   ExpansionClosureWitness witness;
+
   // Record only the proved owner interval and the cover/B frontiers needed by
-  // later synthesis. Step 2 does not attempt to materialize text yet.
+  // later synthesis. This witness builder does not attempt to materialize text yet.
   witness.kind = ExpansionClosureKind::MacroOwnerWholeExpansion;
   witness.hasRootMacroId = true;
   witness.rootMacroId = cand.root->id;
@@ -485,6 +486,8 @@ bool RefoldEngine::MacroOwnerExpansionClosureWitnessIsDominated(
             .str());
   }
 
+  // Return true when the hunk is fully contained by the whole-cover plan's
+  // A-side cover and, for non-empty B ranges, by the plan's B-token envelope.
   auto hunkIsClosedByPlan = [&](const diffutils::Hunk &h) -> bool {
     const bool aClosed =
         h.isInsertOnly() ? (plan->covLoA < h.aStart && h.aStart < plan->covHiA)
@@ -497,6 +500,8 @@ bool RefoldEngine::MacroOwnerExpansionClosureWitnessIsDominated(
     return true;
   };
 
+  // Return true when `selected` reaches `root` by following ordinary
+  // callerMacroId links without cycles or broken parent references.
   auto reachesRootThroughNormalClimb =
       [&](const RefoldModel::MacroInvocation *selected) -> bool {
     DenseSet<uint64_t> visited;
@@ -611,6 +616,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     return std::nullopt;
   }
 
+  // Process touched includes in TU order so the closure can be proven as one
+  // contiguous include cover rather than as a set of unrelated include ranges.
   llvm::sort(touched, [](const RefoldModel::IncludeItem *lhs,
                          const RefoldModel::IncludeItem *rhs) {
     if (lhs->siteB != rhs->siteB)
@@ -623,6 +630,9 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   uint64_t coverBegin = first->cover.begin;
   uint64_t coverEnd = coverBegin;
 
+  // Require the touched include covers to tile exactly. Any gap, overlap, or
+  // empty include cover means the hunk cannot be represented by one
+  // include-closure replacement.
   for (const RefoldModel::IncludeItem *inc : touched) {
     if (inc->cover.begin != coverEnd || inc->cover.end <= inc->cover.begin) {
       trace("fallback",
@@ -634,6 +644,9 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     coverEnd = inc->cover.end;
   }
 
+  // `exactCover` means the edit already matches the include closure. The
+  // wider `hunkInsideCover` case is a controlled widening: the hunk may be
+  // absorbed only if later checks prove the wider include closure is safe.
   const bool exactCover = coverBegin == h.aStart && coverEnd == h.aEnd;
   const bool hunkInsideCover = coverBegin <= h.aStart && h.aEnd <= coverEnd;
 
@@ -643,8 +656,11 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
            lhs.bStart == rhs.bStart && lhs.bEnd == rhs.bEnd;
   };
 
-  auto hunkTouchesAClosedRange = [](const diffutils::Hunk &cand,
-                                    uint64_t begin, uint64_t end) -> bool {
+  // Return true when `cand` would be absorbed by the closed A-side range
+  // [begin, end]. Token-consuming edits use interval overlap; pure insertions
+  // use the closed insertion-gap test.
+  auto hunkTouchesAClosedRange = [](const diffutils::Hunk &cand, uint64_t begin,
+                                    uint64_t end) -> bool {
     if (end < begin)
       end = begin;
 
@@ -659,6 +675,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
            cand.aStart <= end;
   };
 
+  // Return true when the proposed widened A range would cover any other token
+  // diff hunk besides the hunk currently being realized.
   auto rangeHasForeignTokenDiff = [&](uint64_t begin, uint64_t end) -> bool {
     for (const diffutils::Hunk &cand : abTokHunks_) {
       if (sameTokenHunk(cand, h))
@@ -669,6 +687,9 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     return false;
   };
 
+  // Return true when the proposed widened source range would overlap an edit
+  // that has already been staged. Zero-width staged edits are treated as closed
+  // insertion points.
   auto sourceTouchesStagedEdit = [&](uint64_t begin, uint64_t end) -> bool {
     for (const auto &interval : stagedSourceIntervals) {
       if (interval.first < interval.second) {
@@ -807,6 +828,9 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   if (origNl > initialReplNl) {
     size_t remainingPadNl = origNl - initialReplNl;
 
+    // Return true when the source interval overlaps a spelled include directive
+    // or macro invocation in this TU. Widened include-closure edits must not
+    // absorb such artifacts implicitly.
     auto intervalOverlapsSpelledArtifact = [&](uint64_t begin,
                                                uint64_t end) -> bool {
       for (const auto &inc : model_.GetIncludes()) {
@@ -931,11 +955,15 @@ bool RefoldEngine::ExpansionFallbackReplacementIsReplayStable(
     return false;
   }
 
-  // Step 3 keeps source synthesis narrower than the Step 2 witness. The first
-  // emitted fallback class must be replay-stable when re-lexed as ordinary
-  // source text, without relying on preprocessor hide sets. Reject any raw
-  // identifier token for now: direct source replay of identifiers would need a
-  // stronger proof that rescanning cannot trigger further macro expansion.
+  // Expansion fallback emits ordinary source text, not a preprocessor token
+  // stream with the original hide-set context. Therefore the replacement must
+  // be stable if it is lexed again as source: it must not contain tokens that
+  // could participate in another macro-expansion decision.
+  //
+  // For the current fallback class, reject raw identifiers and preprocessor
+  // paste/directive operators. Accepting those would require a stronger proof
+  // that rescanning the emitted text cannot trigger a different macro expansion
+  // than the original expansion witness.
   std::string buffer = replacementText.str();
   if (buffer.empty() || buffer.back() != '\n')
     buffer.push_back('\n');
@@ -954,6 +982,9 @@ bool RefoldEngine::ExpansionFallbackReplacementIsReplayStable(
       llvm::MemoryBuffer::getMemBufferCopy(buffer, "<expansion-fallback>");
   FileID fid = sm.createFileID(std::move(mb));
 
+  // Raw-lex the synthesized replacement under the same language options used
+  // by the recorded preprocessor model. This checks the text as source
+  // spelling, without macro expansion or preprocessor state.
   const LangOptions lang = MakeLexLangOptions(model_.GetPPLang());
   Lexer lex(fid, sm.getBufferOrFake(fid), sm, lang);
   lex.SetKeepWhitespaceMode(false);
@@ -965,6 +996,9 @@ bool RefoldEngine::ExpansionFallbackReplacementIsReplayStable(
     if (token.is(clang::tok::eof))
       break;
 
+    // These token kinds are replay-unstable in ordinary source text: an
+    // identifier may expand as a macro, and #/## have preprocessor semantics
+    // that are not justified by this fallback proof.
     if (token.is(clang::tok::raw_identifier) || token.is(clang::tok::hash) ||
         token.is(clang::tok::hashhash)) {
       const char *ptr = sm.getCharacterData(token.getLocation());
@@ -985,6 +1019,10 @@ bool RefoldEngine::ExpansionFallbackReplacementIsReplayStable(
 std::optional<std::string>
 RefoldEngine::SynthesizeMacroOwnerExpansionClosureSource(
     const ExpansionClosureWitness &witness) const {
+  // This synthesis path is intentionally narrow: it only handles a single
+  // self-contained top-level macro-owner expansion in the TU. Include-owned
+  // witnesses, clipped witnesses, and multi-owner closures must use their
+  // normal structural/whole-cover paths instead.
   if (witness.kind != ExpansionClosureKind::MacroOwnerWholeExpansion ||
       !witness.hasRootMacroId || witness.hasOwnerIncludeId) {
     trace("fallback", "macro-owner fallback synthesis rejected: witness not in "
@@ -992,6 +1030,9 @@ RefoldEngine::SynthesizeMacroOwnerExpansionClosureSource(
     return std::nullopt;
   }
 
+  // The witness must describe one complete, unclipped source interval and one
+  // non-empty B-token envelope. If any of these invariants are missing, the
+  // fallback would not be a closed owner splice.
   if (!witness.selfContained || witness.claimsClipped ||
       witness.sourceByteEnd <= witness.sourceByteBegin ||
       witness.bTokEnd <= witness.bTokBegin) {
@@ -1012,6 +1053,8 @@ RefoldEngine::SynthesizeMacroOwnerExpansionClosureSource(
     return std::nullopt;
   }
 
+  // Read the original TU source because this fallback emits a complete TU text,
+  // not just a local replacement fragment.
   const std::string absTuPath = lineDirs_.ToAbsolutePath(tuPath);
   auto tuBufferOrErr = llvm::MemoryBuffer::getFile(absTuPath);
   if (!tuBufferOrErr) {
@@ -1031,10 +1074,10 @@ RefoldEngine::SynthesizeMacroOwnerExpansionClosureSource(
     return std::nullopt;
   }
 
-  // Materialize the witness's full proved B-frontier. Unlike structural
-  // whole-cover patches, this fallback synthesis is a single closed owner
-  // splice, so it must not inherit the standalone-claim clipping used when B
-  // insertions are being emitted through separate structural edits.
+  // Materialize the witness's full proved B frontier. Unlike structural
+  // whole-cover patches, this fallback is a single closed owner splice, so it
+  // must not inherit standalone-claim clipping that is only valid when B
+  // insertions are emitted through separate structural edits.
   std::string replacement =
       SliceBSource(witness.bTokBegin, witness.bTokEnd).str();
   if (replacement.empty()) {
@@ -1045,13 +1088,16 @@ RefoldEngine::SynthesizeMacroOwnerExpansionClosureSource(
     return std::nullopt;
   }
 
+  // The synthesized source must be safe to replay as ordinary source text. In
+  // particular, it must not rely on hidden preprocessor state from the original
+  // expansion.
   if (!ExpansionFallbackReplacementIsReplayStable(replacement))
     return std::nullopt;
 
   // Re-embed the materialized owner into the TU using the same boundary
   // spacing and line-drift machinery as ordinary TU byte edits. This keeps the
-  // first synthesis class deterministic and avoids inventing a second emission
-  // path with subtly different token-adjacency or #line behavior.
+  // synthesis class deterministic and avoids a separate emission path with
+  // subtly different token-adjacency or #line behavior.
   std::string padded =
       PadAtBoundaries(tuBytes, static_cast<size_t>(witness.sourceByteBegin),
                       static_cast<size_t>(witness.sourceByteEnd),
@@ -1060,6 +1106,9 @@ RefoldEngine::SynthesizeMacroOwnerExpansionClosureSource(
   ResyncOutcome ro = ApplyResyncOrPend(tuBytes, witness.sourceByteBegin,
                                        witness.sourceByteEnd, padded, tuPath);
 
+  // Assemble the final TU text while preserving pending line-resync state
+  // across copied original slices. The only changed region is the witnessed
+  // source byte interval.
   SmallString<0> out;
   out.reserve(tuBytes.size() -
               (witness.sourceByteEnd - witness.sourceByteBegin) +
@@ -1079,19 +1128,33 @@ std::optional<std::string> RefoldEngine::TryExpansionClosureFallback() {
   if (!terminalFallbackRequested_)
     return std::nullopt;
 
-  // This legacy safety net remains proof-driven, but it must no longer be an
-  // independent completeness mechanism. Build a declared witness, audit that
-  // the same root would have been visible through the normal macro whole-cover
-  // candidate path, then synthesize source only if replay-stability also holds.
+  // Try the post-terminal expansion-closure safety net.
+  //
+  // This path is still proof-driven, but it is no longer allowed to be an
+  // independent completeness mechanism. A synthesized result is admissible only
+  // if:
+  //
+  //   1. a declared single-owner macro expansion-closure witness exists,
+  //   2. that witness is dominated by the normal MacroWholeCoverRealization
+  //      candidate path, and
+  //   3. the synthesized source text is replay-stable when re-lexed as
+  //      ordinary source.
+  //
+  // In other words, this stage may materialize a dominated fallback witness,
+  // but it must not discover a refolding class that the normal candidate system
+  // failed to expose.
   if (auto witness = BuildMacroOwnerExpansionClosureWitness()) {
-    // Step 6 keeps the new intermediate fallback class visible in the theorem
-    // audit without restamping it as a theorem-facing carrier. These counters
-    // are coverage-only: they report whether the run found a declared witness
-    // and whether synthesis stayed inside the Step 3 replay-stable subset.
+    // Record the intermediate fallback witness for theorem-audit coverage. This
+    // does not restamp the witness as a theorem-facing accepted carrier; it
+    // only reports that the fallback stage found a declared witness to inspect.
     ++lastTheoremAudit_.expansionFallbackWitnesses;
     debug("fallback", "expansion-closure witness discovered: {0}",
           FormatExpansionClosureWitness(*witness));
 
+    // The dominance check is the key guardrail: if this witness was not visible
+    // through the ordinary macro whole-cover candidate path, then this fallback
+    // would be adding a separate completeness mechanism instead of merely
+    // materializing an already-dominated proof shape.
     std::string dominanceDetail;
     if (MacroOwnerExpansionClosureWitnessIsDominated(*witness,
                                                      dominanceDetail)) {
@@ -1110,6 +1173,9 @@ std::optional<std::string> RefoldEngine::TryExpansionClosureFallback() {
       warn("fallback/audit", "{0}", diagnostic);
     }
 
+    // Even a dominated witness must synthesize into replay-stable source. This
+    // prevents emitting expansion text that would rely on original preprocessor
+    // state such as hide sets.
     if (auto source = SynthesizeMacroOwnerExpansionClosureSource(*witness)) {
       ++lastTheoremAudit_.expansionFallbackSynthesisSuccesses;
       debug("fallback",
@@ -1119,8 +1185,9 @@ std::optional<std::string> RefoldEngine::TryExpansionClosureFallback() {
             witness->sourceByteEnd, witness->bTokBegin, witness->bTokEnd,
             source->size());
 
-      // The first synthesized fallback output is the original TU with exactly
-      // one proved top-level macro owner expanded at its callsite.
+      // The synthesized output is the original TU with exactly one proved
+      // top-level macro owner expanded at its callsite, not a terminal fallback
+      // to the edited preprocessed stream.
       ResetAttemptStats();
       lastStats_.expandedMacros = 1;
       lastStats_.terminalFallbackToB = false;

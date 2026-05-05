@@ -13,23 +13,20 @@
 // -----------
 //  • Whitespace predicates:
 //      - isWs(char)                  : PP whitespace (space, HT, LF, VT, FF,
-//      CR)
-//      - isAsciiWhitespace(StringRef): true iff every char is PP whitespace
+//                                      CR)
+//      - isWhitespace(StringRef)     : true iff every byte is PP whitespace
 //  • Identifier predicates (ASCII):
-//      - isAsciiAlpha(char), isAsciiDigit(char)
-//      - isAsciiIdentStart(char)     : '_' or ASCII letter
-//      - isAsciiIdentChar(char)      : start-char or digit
-//      - isIdentChar(char)           : same as isAsciiIdentChar (for glue
-//      checks)
-//      - isIdentifierOnly(StringRef) : non-empty, first not digit, all ident
-//      chars
+//      - isIdentStart(char)          : '_' or ASCII letter
+//      - isIdentPart(char)           : start-char or digit
+//      - isIdentifierOnly(StringRef) : trimmed text is one identifier token
+//      - isIdentifierOrSimpleCallExpr(StringRef): identifier or IDENT(...)
 //  • Index scans:
-//      - firstNonWsIdx(StringRef)    : first non-WS index or -1
-//      - lastNonWsIdx(StringRef)     : last  non-WS index or -1
+//      - firstNonWsIdx(StringRef)    : first non-WS index or nullopt
+//      - lastNonWsIdx(StringRef)     : last non-WS index or nullopt
 //  • Debug formatting helpers:
 //      - showWS(StringRef)           : visualize whitespace (·, \t, \n, \r, \f,
-//      \v)
-//      - clip(StringRef, int)        : truncate with length suffix
+//                                      \v)
+//      - clip(StringRef, size_t)     : truncate with length suffix
 //  
 // Design notes
 // ------------
@@ -40,14 +37,13 @@
 //
 // Usage
 // -----
-//   if (isAsciiWhitespace(S)) { … }
-//   bool glue = isIdentChar(L) && isIdentChar(R);  // conservative boundary
-//   check int f = firstNonWsIdx(Txt);                    // -1 if all
-//   whitespace 
-//  
+//   if (isWhitespace(S)) { … }
+//   bool glue = isIdentPart(L) && isIdentPart(R);  // conservative boundary
+//   auto first = firstNonWsIdx(Txt);               // nullopt if all whitespace
+//
 // Policy
 // ------
-//  • Keep helpers minimal and header-only for inlining.
+//  • Keep helpers minimal and allocation-free where practical.
 //  • Behavior must not depend on locale or environment.
 //
 // Author:               
@@ -65,6 +61,7 @@ namespace clang {
 namespace refold {
 namespace stringutils {
 
+/// Return true when the trimmed spelling is exactly one ASCII identifier.
 bool isIdentifierOnly(StringRef s) {
   s = s.trim();
   if (s.empty())
@@ -78,6 +75,7 @@ bool isIdentifierOnly(StringRef s) {
   return true;
 }
 
+/// Return true when a replacement can safely keep following call suffixes.
 bool isIdentifierOrSimpleCallExpr(StringRef replacement) {
   StringRef s = replacement.trim();
   if (s.empty())
@@ -107,6 +105,7 @@ bool isIdentifierOrSimpleCallExpr(StringRef replacement) {
   return i == s.size();
 }
 
+/// Advance over whitespace and complete line/block comments from \p i.
 size_t skipWSAndComments(StringRef s, size_t i) {
   const size_t n = s.size();
   while (i < n) {
@@ -135,6 +134,7 @@ size_t skipWSAndComments(StringRef s, size_t i) {
   return i;
 }
 
+/// Find the matching ')' for a '(' while treating comments and literals as opaque.
 size_t findMatchingRParen(StringRef s, size_t lParenIdx) {
   const size_t n = s.size();
   if (lParenIdx >= n || s[lParenIdx] != '(')
@@ -200,6 +200,7 @@ size_t findMatchingRParen(StringRef s, size_t lParenIdx) {
   return StringRef::npos;
 }
 
+/// Trim only ASCII spaces and tabs from both ends of \p s.
 StringRef trimEdgeSpaces(StringRef s) {
   size_t lo = 0;
   size_t hi = s.size();
@@ -224,6 +225,7 @@ StringRef trimEdgeSpaces(StringRef s) {
   return s.substr(lo, hi - lo); // return trimmed portion
 }
 
+/// Return one StringRef slice per byte in \p s.
 std::vector<StringRef> splitChars(StringRef s) {
   std::vector<StringRef> refs;
   refs.reserve(s.size());
@@ -232,6 +234,7 @@ std::vector<StringRef> splitChars(StringRef s) {
   return refs;
 }
 
+/// Canonicalize raw text recovered from an inverse stringification witness.
 std::optional<std::string> canonicalizeStringifyInversePayload(StringRef raw0) {
   StringRef raw = raw0.trim();
 
@@ -241,6 +244,8 @@ std::optional<std::string> canonicalizeStringifyInversePayload(StringRef raw0) {
   std::string out;
   out.reserve(raw.size());
 
+  // Outside literals, stringify collapses each run of whitespace to one space
+  // between tokens. Delay emission until the next real byte proves it is needed.
   bool pendingSpace = false;
   auto flushPendingSpace = [&]() {
     if (pendingSpace && !out.empty())
@@ -253,6 +258,8 @@ std::optional<std::string> canonicalizeStringifyInversePayload(StringRef raw0) {
 
     switch (state) {
     case LexState::Normal:
+      // Normalize token-separating whitespace, reject comments, and otherwise
+      // copy bytes verbatim until entering a literal state.
       if (isWs(c)) {
         pendingSpace = !out.empty();
         continue;
@@ -273,6 +280,8 @@ std::optional<std::string> canonicalizeStringifyInversePayload(StringRef raw0) {
       continue;
 
     case LexState::String:
+      // Literal bodies are preserved byte-for-byte except that a dangling escape
+      // makes the inverse witness invalid.
       out.push_back(c);
       if (c == '\\') {
         if (i + 1 >= raw.size())
@@ -306,6 +315,7 @@ std::optional<std::string> canonicalizeStringifyInversePayload(StringRef raw0) {
 
 namespace {
 
+/// Clamp a possibly unordered half-open byte range into \p text.
 std::pair<size_t, size_t> clampUnorderedRange(StringRef text, size_t begin,
                                              size_t end) {
   begin = std::min(begin, text.size());
@@ -317,17 +327,20 @@ std::pair<size_t, size_t> clampUnorderedRange(StringRef text, size_t begin,
 
 } // namespace
 
+/// Return true if a clamped byte range contains an LF byte.
 bool rangeContainsNewline(StringRef text, size_t begin, size_t end) {
   const auto range = clampUnorderedRange(text, begin, end);
   return text.substr(range.first, range.second - range.first).find('\n') !=
          StringRef::npos;
 }
 
+/// Return true if a clamped byte range contains only PP whitespace.
 bool rangeContainsOnlyWhitespace(StringRef text, size_t begin, size_t end) {
   const auto range = clampUnorderedRange(text, begin, end);
   return isWhitespace(text.substr(range.first, range.second - range.first));
 }
 
+/// Return the physical-line start byte offset containing \p pos.
 size_t lineStartOffset(StringRef text, size_t pos) {
   pos = std::min(pos, text.size());
   while (pos > 0 && text[pos - 1] != '\n' && text[pos - 1] != '\r')
@@ -335,6 +348,7 @@ size_t lineStartOffset(StringRef text, size_t pos) {
   return pos;
 }
 
+/// Return the physical-line end byte offset containing \p pos.
 size_t lineEndOffset(StringRef text, size_t pos) {
   pos = std::min(pos, text.size());
   while (pos < text.size() && text[pos] != '\n' && text[pos] != '\r')
@@ -342,15 +356,18 @@ size_t lineEndOffset(StringRef text, size_t pos) {
   return pos;
 }
 
+/// Return true iff only whitespace precedes \p offset on its physical line.
 bool beginsLineAfterWhitespace(StringRef text, size_t offset) {
   return rangeContainsOnlyWhitespace(text, lineStartOffset(text, offset),
                                      offset);
 }
 
+/// Return true iff only whitespace follows \p offset on its physical line.
 bool endsLineBeforeWhitespace(StringRef text, size_t offset) {
   return rangeContainsOnlyWhitespace(text, offset, lineEndOffset(text, offset));
 }
 
+/// Decide whether the last chained-call suffix belongs to the replacement.
 bool shouldPreserveFinalCallSuffixGroup(StringRef replacement) {
   StringRef s = replacement.trim();
   if (s.empty())
@@ -381,6 +398,7 @@ bool shouldPreserveFinalCallSuffixGroup(StringRef replacement) {
   return sawCallGroup && pos == s.size();
 }
 
+/// Extend an invocation byte end over chained-call suffixes when required.
 uint64_t extendChainedCallEnd(StringRef fileText, uint64_t invEnd,
                               StringRef replacement) {
   if (invEnd > fileText.size())
@@ -397,6 +415,8 @@ uint64_t extendChainedCallEnd(StringRef fileText, uint64_t invEnd,
     return invEnd;
 
   std::vector<uint64_t> groupEnds;
+  // Collect each immediately adjacent balanced call-suffix group. The caller
+  // later decides whether the final group must remain attached to the new head.
   while (pos < fileText.size() && fileText[pos] == '(') {
     const size_t r = findMatchingRParen(fileText, pos);
     if (r == StringRef::npos)
@@ -414,6 +434,7 @@ uint64_t extendChainedCallEnd(StringRef fileText, uint64_t invEnd,
   return (consume == 0) ? invEnd : groupEnds[consume - 1];
 }
 
+/// Return true iff \p lit appears after leading whitespace in \p s.
 bool startsWithAfterWhitespace(StringRef s, StringRef lit) {
   size_t i = 0;
   while (i < s.size()) {
@@ -425,6 +446,7 @@ bool startsWithAfterWhitespace(StringRef s, StringRef lit) {
   return s.drop_front(i).starts_with(lit);
 }
 
+/// Quote and escape \p s as a C string literal spelling.
 std::string quoteCString(StringRef s) {
   std::string res = "\"";
   for (char c : s) {
@@ -464,6 +486,20 @@ std::string quoteCString(StringRef s) {
   }
   res += "\"";
   return res;
+}
+
+/// Quote \p s as a minimal C string literal spelling.
+std::string quoteCStringLiteral(StringRef s) {
+  std::string out;
+  out.reserve(s.size() + 2);
+  out.push_back('"');
+  for (char c : s) {
+    if (c == '\\' || c == '"')
+      out.push_back('\\');
+    out.push_back(c);
+  }
+  out.push_back('"');
+  return out;
 }
 
 } // namespace stringutils

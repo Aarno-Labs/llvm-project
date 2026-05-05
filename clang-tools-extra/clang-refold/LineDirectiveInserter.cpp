@@ -21,6 +21,8 @@ std::string LineDirectiveInserter::ToAbsolutePath(StringRef spelledPath) const {
     if (cwd_.empty()) {
       llvm::sys::fs::make_absolute(path);
     } else {
+      // Use the preprocessor working directory captured for this refold run
+      // instead of the process CWD, which may differ during replay/testing.
       llvm::SmallString<256> base(cwd_);
       llvm::sys::path::append(base, path);
       path = base;
@@ -43,6 +45,8 @@ std::string LineDirectiveInserter::WrapIncludeExpansion(
   result += FormatLineDirective(1, childFileSpelling);
   result += childBody.str();
 
+  // Ensure the resume directive begins on its own line even when the included
+  // body did not end with a newline.
   if (!childBody.empty() && childBody.back() != '\n') {
     result += '\n';
   }
@@ -57,6 +61,10 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
   if (!enabled_)
     return replacement.str();
 
+  // A resync directive is safe only if it rejoins the untouched original file
+  // at a physical line boundary. We also allow rejoining before indentation-only
+  // tail bytes, because the directive can be inserted before that indentation
+  // without being stranded in the middle of a source line.
   auto rejoinsUntouchedTailSafelyAtBOL = [&](uint64_t editEnd) -> bool {
     const size_t n = originalFileText.size();
     const size_t pos = (editEnd >= static_cast<uint64_t>(n))
@@ -73,6 +81,8 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
     return stringutils::isIndentOnly(originalFileText, pos, nl);
   };
 
+  // No line directive is needed when the replacement preserves the original
+  // physical newline count across the edited byte range.
   size_t origNl = stringutils::countNewlines(originalFileText, s, e);
   size_t replNl = stringutils::countNewlines(replacement);
 
@@ -83,14 +93,15 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
     return replacement.str();
   }
 
+  // The resume directive points at the original source line where the untouched
+  // suffix begins after the replacement.
   size_t resumeLine = stringutils::lineAtOffset(originalFileText, e);
   std::string directive =
       FormatLineDirective(resumeLine, fileSpellingForDirective);
 
-  // Ensure directive begins at BOL in the emitted output. Also require that
-  // the replacement rejoins untouched original bytes only at a line boundary
-  // (or before indentation-only tail bytes), so the directive cannot end up
-  // stranded before untouched code that continues on the same physical line.
+  // Empty replacements can only be replaced by a bare directive when both sides
+  // of the deletion are line-safe. Otherwise the directive would be injected
+  // into the middle of an existing physical line.
   if (replacement.empty()) {
     if (!stringutils::isBOL(originalFileText, static_cast<size_t>(s)) ||
         !rejoinsUntouchedTailSafelyAtBOL(e)) {
@@ -107,6 +118,8 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
     return directive;
   }
 
+  // If the replacement already ends at BOL, append the directive after it. The
+  // untouched original tail must also rejoin safely at a line boundary.
   if (replacement.back() == '\n') {
     if (!rejoinsUntouchedTailSafelyAtBOL(e)) {
       trace("linedir/local",
@@ -115,7 +128,9 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
             resumeLine, fileSpellingForDirective, e);
       return replacement.str();
     }
-    // Idempotence: avoid appending the same directive twice.
+
+    // Idempotence: avoid appending the same directive twice when this helper is
+    // reached repeatedly for an already-resynced replacement.
     if (replacement.ends_with(directive)) {
       trace("linedir/local",
             "skip (already endsWith directive): resumeLine={0} file={1}",
@@ -127,6 +142,9 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
     return replacement.str() + directive;
   }
 
+  // Otherwise, the only remaining safe insertion point is before a trailing
+  // indentation-only suffix inside the replacement. That preserves the suffix
+  // indentation while still placing the directive at BOL.
   size_t lastNl = replacement.rfind('\n');
   if (lastNl != StringRef::npos) {
     size_t bol = lastNl + 1;
@@ -144,8 +162,8 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
             "file={1} lastNl={2} bol={3}",
             resumeLine, fileSpellingForDirective, lastNl, bol);
 
-      // Idempotence: if the prior line is already the same directive, don't
-      // emit it again.
+      // Idempotence: if the prior line is already the same directive, do not
+      // emit it again before the indentation-only suffix.
       if (replacement.substr(0, bol).ends_with(directive)) {
         trace("linedir/local",
               "skip (directive already present immediately before indent-only "
@@ -160,6 +178,9 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
       return res;
     }
 
+    // There is a newline, but the tail after it contains substantive text. A
+    // directive inserted there would split replacement text rather than cleanly
+    // resume the original file.
     if (inTraceMode()) {
       const size_t start =
           static_cast<size_t>(std::clamp(bol, size_t(0), replacement.size()));
@@ -171,6 +192,8 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
             stringutils::showWS(stringutils::clip(replFromBol, 80)));
     }
   } else {
+    // With no newline in the replacement, there is no BOL insertion point for
+    // the directive.
     trace("linedir/local",
           "cannot inject (no newline in replacement): resumeLine={0} file={1} "
           "replTail={2}",
@@ -285,15 +308,17 @@ std::string LineDirectiveInserter::EscapeForLineDirective(StringRef path) {
   escaped.reserve(path.size());
   for (char c : path) {
     if (c == '\\') {
+      // #line filenames are emitted inside double quotes, so preserve a literal
+      // backslash by escaping it in the directive spelling.
       escaped.append("\\\\");
     } else if (c == '\"') {
+      // Keep embedded quotes from terminating the quoted filename.
       escaped.append("\\\"");
     } else {
       escaped.push_back(c);
     }
   }
 
-  // Convert to std::string. This creates the heap-allocated string once.
   return std::string(escaped.str());
 }
 

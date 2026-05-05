@@ -43,6 +43,7 @@ using namespace llvm;
 namespace {
 using namespace clang::refold;
 
+/// Look up a required JSON field and return a typed Error on absence.
 Expected<const json::Value *> requireField(const json::Object &obj,
                                            StringRef key, StringRef ctx) {
   if (const json::Value *val = obj.get(key))
@@ -52,6 +53,7 @@ Expected<const json::Value *> requireField(const json::Object &obj,
                            key.str().c_str(), ctx.str().c_str());
 }
 
+/// Require a JSON value to be an object at the supplied diagnostic context.
 Expected<const json::Object *> asObject(const json::Value &val, StringRef ctx) {
   if (auto *obj = val.getAsObject())
     return obj;
@@ -59,6 +61,7 @@ Expected<const json::Object *> asObject(const json::Value &val, StringRef ctx) {
                            ctx.str().c_str());
 }
 
+/// Require a JSON value to be an array at the supplied diagnostic context.
 Expected<const json::Array *> asArray(const json::Value &val, StringRef ctx) {
   if (auto *arr = val.getAsArray())
     return arr;
@@ -66,6 +69,7 @@ Expected<const json::Array *> asArray(const json::Value &val, StringRef ctx) {
                            ctx.str().c_str());
 }
 
+/// Require a JSON value to be a string and return it as a StringRef view.
 Expected<StringRef> asString(const json::Value &val, StringRef ctx) {
   if (auto str = val.getAsString())
     return *str;
@@ -73,6 +77,7 @@ Expected<StringRef> asString(const json::Value &val, StringRef ctx) {
                            ctx.str().c_str());
 }
 
+/// Require a JSON integer to fit in uint32_t.
 Expected<uint32_t> asUInt32(const json::Value &val, StringRef ctx) {
   if (auto n = val.getAsUINT64()) {
     if (*n <= std::numeric_limits<uint32_t>::max())
@@ -82,6 +87,7 @@ Expected<uint32_t> asUInt32(const json::Value &val, StringRef ctx) {
                            ctx.str().c_str());
 }
 
+/// Require a JSON integer to fit in uint64_t.
 Expected<uint64_t> asUInt64(const json::Value &val, StringRef ctx) {
   if (auto n = val.getAsUINT64())
     return *n;
@@ -89,6 +95,7 @@ Expected<uint64_t> asUInt64(const json::Value &val, StringRef ctx) {
                            ctx.str().c_str());
 }
 
+/// Require a JSON value to be boolean.
 Expected<bool> asBool(const json::Value &val, StringRef ctx) {
   if (auto b = val.getAsBoolean()) {
     return *b;
@@ -97,6 +104,7 @@ Expected<bool> asBool(const json::Value &val, StringRef ctx) {
                            ctx.str().c_str());
 }
 
+/// Read an optional array field, treating null as valid only when requested.
 std::optional<const json::Array *>
 asOptArray(const json::Object &obj, StringRef key, bool canBeNull = false) {
   if (const json::Value *val = obj.get(key)) {
@@ -116,6 +124,10 @@ asOptArray(const json::Object &obj, StringRef key, bool canBeNull = false) {
   return std::nullopt;
 }
 
+/// Read an optional string field, treating null as valid only when requested.
+///
+/// Type mismatches are returned as std::nullopt; callers rely on the prior JSON
+/// schema validation pass to reject malformed typed fields.
 std::optional<StringRef> asOptString(const json::Object &obj, StringRef key,
                                      bool canBeNull = false) {
   if (const json::Value *val = obj.get(key)) {
@@ -130,6 +142,11 @@ std::optional<StringRef> asOptString(const json::Object &obj, StringRef key,
 }
 
 [[maybe_unused]]
+/// Read an optional uint32_t field.
+///
+/// Out-of-range integer values are fatal because they cannot be represented in
+/// the target type. Non-integer values are returned as std::nullopt; callers
+/// rely on schema validation to catch malformed typed fields.
 std::optional<uint32_t> asOptUInt32(const json::Object &obj, StringRef key,
                                     bool canBeNull = false) {
   if (const json::Value *val = obj.get(key)) {
@@ -149,6 +166,10 @@ std::optional<uint32_t> asOptUInt32(const json::Object &obj, StringRef key,
   return std::nullopt;
 }
 
+/// Read an optional uint64_t field.
+///
+/// Non-integer values are returned as std::nullopt; callers rely on schema
+/// validation to catch malformed typed fields.
 std::optional<uint64_t> asOptUInt64(const json::Object &obj, StringRef key,
                                     bool canBeNull = false) {
   if (const json::Value *val = obj.get(key)) {
@@ -163,6 +184,10 @@ std::optional<uint64_t> asOptUInt64(const json::Object &obj, StringRef key,
 }
 
 [[maybe_unused]]
+/// Read an optional bool field.
+///
+/// Non-boolean values are returned as std::nullopt; callers rely on schema
+/// validation to catch malformed typed fields.
 std::optional<bool> asOptBool(const json::Object &obj, StringRef key,
                               bool canBeNull = false) {
   if (const json::Value *val = obj.get(key)) {
@@ -176,6 +201,7 @@ std::optional<bool> asOptBool(const json::Object &obj, StringRef key,
   return std::nullopt;
 }
 
+/// Apply a typed parser to a required field, preserving Expected error flow.
 template <typename Fn>
 auto applyToField(Fn &&fn, const json::Object &obj, StringRef key,
                   StringRef ctx = "root")
@@ -187,12 +213,14 @@ auto applyToField(Fn &&fn, const json::Object &obj, StringRef key,
   return std::forward<decltype(fn)>(fn)(**fieldOrErr, key);
 }
 
+/// Return one array element as an object with contextual diagnostics.
 Expected<const json::Object *> arrayObjElemAt(const json::Array &arr,
                                               std::size_t idx, StringRef ctx) {
   const json::Value &val = arr[idx];
   return asObject(val, ctx);
 }
 
+/// Read an optional array of uint64_t values.
 static std::optional<std::vector<uint64_t>>
 readUint64Array(const json::Object &parent, StringRef field) {
   const json::Array *arr = parent.getArray(field);
@@ -216,6 +244,11 @@ namespace clang {
 namespace refold {
 
 namespace {
+/// Parse a JSON span array into strongly typed PPSpan/PPArgSpan records.
+///
+/// For PPArgSpan, \p argKind records which producer span family supplied the
+/// element so later proof code can distinguish argument, stringify, and paste
+/// provenance.
 template <typename T = RefoldModel::PPSpan>
 Expected<std::vector<T>>
 parseSpans(const json::Value &val, StringRef ctx,
@@ -299,6 +332,7 @@ parseSpans(const json::Value &val, StringRef ctx,
 // Public wrapper for parsing PPSpan arrays from JSON. This is used by the
 // clang-refold driver for ancillary checks (e.g., --check + --no-lines ignore
 // masks) without duplicating parsing logic.
+/// Parse ordinary preprocessor token spans.
 Expected<std::vector<RefoldModel::PPSpan>>
 parsePPSpans(const json::Value &val, StringRef ctx) {
   return parseSpans<RefoldModel::PPSpan>(val, ctx);
@@ -368,12 +402,13 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
   if (pbeOrErr)
     model.tokPPByteEndA_ = std::move(*pbeOrErr);
 
-  // Make sure we have both tokPPByteBeginA_ and tokPPByteEndA_.
-  if (model.tokPPByteBeginA_) {
-    if (!model.tokPPByteEndA_)
-      model.tokPPByteBeginA_ = std::nullopt;
+  // Keep the optional per-token A-byte arrays only when the producer supplied
+  // both halves of the begin/end pair. A single half is not useful for safe
+  // byte-envelope reasoning, so drop it fail-closed.
+  if (model.tokPPByteBeginA_ && !model.tokPPByteEndA_) {
+    model.tokPPByteBeginA_ = std::nullopt;
     warn("model", "missing per-token pp byte end spans");
-  } else if (model.tokPPByteEndA_) {
+  } else if (model.tokPPByteEndA_ && !model.tokPPByteBeginA_) {
     model.tokPPByteEndA_ = std::nullopt;
     warn("model", "missing per-token pp byte begin spans");
   }
@@ -761,6 +796,9 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
         auto parseOptByteRanges = [&](StringRef fieldName,
                                       std::vector<MacroInvocation::OptByteRange>
                                           &out) {
+          // These ranges intentionally preserve nullable endpoints from older
+          // producer schemas; downstream proof code decides whether null ranges
+          // are sufficient for the specific certificate being built.
           if (auto arr = asOptArray(*obj, fieldName, /*canBeNull=*/true)) {
             for (const auto &elem : **arr) {
               auto *rObj = elem.getAsObject();
@@ -834,8 +872,8 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
         }
 
         // `paste_tokens` preserves the producer's exact `##` witnesses in the
-        // order they were synthesized for this invocation. Step 5 only loads
-        // the data into the model; later proof classes can consume it without
+        // order they were synthesized for this invocation. Loading the data into
+        // the model lets later proof classes consume it without
         // reconstructing paste decomposition from spans alone.
         std::vector<RefoldModel::PasteToken> pasteTokens;
         if (auto TokensArr =
@@ -881,6 +919,8 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
 
               std::optional<StringRef> KindText =
                   asOptString(PartObj, "kind", /*canBeNull=*/true);
+              // Older maps can omit `kind`; infer it from arg_index, then verify
+              // any explicit spelling agrees with the inferred payload shape.
               RefoldModel::PastePartKind Kind =
                   ArgIndex ? RefoldModel::PastePartKind::Arg
                            : RefoldModel::PastePartKind::Literal;
@@ -928,6 +968,8 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
 
               std::optional<StringRef> PartSpelling =
                   asOptString(PartObj, "spelling", /*canBeNull=*/true);
+              // The byte range is authoritative. A redundant part spelling is
+              // accepted only when it exactly matches that slice.
               StringRef DerivedSpelling =
                   SpellingOrErr->slice(*ByteBOrErr, *ByteEOrErr);
               if (PartSpelling && *PartSpelling != DerivedSpelling)
@@ -1006,6 +1048,9 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
             }
           }
         } else if (callerMacroId) {
+          // Nested invocations from older producer maps lack precise callee
+          // provenance, so classify them as opaque instead of assuming a literal
+          // macro-name owner.
           calleeOrigin.kind = MacroCalleeOriginKind::Opaque;
         } else {
           calleeOrigin.kind =
@@ -1401,6 +1446,8 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
 }
 
 void RefoldModel::SanitizeMacroCallerGraph() {
+  // Build an id lookup so caller_macro_id edges can be validated without
+  // repeatedly scanning the invocation vector.
   DenseMap<uint64_t, MacroInvocation *> MacroById;
   MacroById.reserve(macroInvs_.size());
   for (MacroInvocation &MI : macroInvs_)
@@ -1412,6 +1459,9 @@ void RefoldModel::SanitizeMacroCallerGraph() {
     if (Done.find(MI.id) != Done.end())
       continue;
 
+    // Walk this invocation's caller chain while tracking the current DFS path.
+    // PathIndex lets us distinguish a real cycle from a chain that simply
+    // reaches a node already sanitized by an earlier walk.
     std::vector<uint64_t> Path;
     DenseMap<uint64_t, unsigned> PathIndex;
     uint64_t Cur = MI.id;
@@ -1422,6 +1472,9 @@ void RefoldModel::SanitizeMacroCallerGraph() {
 
       auto Inserted = PathIndex.try_emplace(Cur, Path.size());
       if (!Inserted.second) {
+        // A caller chain must be a tree/forest edge toward an outer invocation.
+        // If it loops back into the current path, drop the caller edge from
+        // every node in the cycle so later upward walks cannot recurse forever.
         const unsigned CycleBegin = Inserted.first->second;
         for (unsigned I = CycleBegin; I < Path.size(); ++I) {
           MacroInvocation *CycleNode = MacroById.lookup(Path[I]);
@@ -1447,6 +1500,8 @@ void RefoldModel::SanitizeMacroCallerGraph() {
 
       const uint64_t ParentId = *Node->callerMacroId;
       if (ParentId == Cur || MacroById.find(ParentId) == MacroById.end()) {
+        // Self-edges and references to missing invocations cannot be used as
+        // structural caller links, so remove them before proof construction.
         warn("model",
              "dropping invalid caller_macro_id edge child={0} parent={1}",
              Node->id, ParentId);
@@ -1836,12 +1891,16 @@ void RefoldModel::BuildIndicesAndSort() {
 std::vector<const RefoldModel::CondGroup *>
 RefoldModel::GetCondGroups(StringRef file,
                            std::optional<uint64_t> parentIncludeId) const {
+  // Conditional groups are indexed separately for TU-level conditionals and
+  // include-owned conditionals. Pick the index that matches the requested owner
+  // domain so callers do not accidentally mix arms from another expansion site.
   if (!parentIncludeId.has_value()) {
     auto it = condsByFile_.find(file);
     if (it != condsByFile_.end())
       return it->second;
     return {};
   }
+
   auto fit = condsByFileByOwner_.find(file);
   if (fit == condsByFileByOwner_.end())
     return {};
@@ -1863,12 +1922,16 @@ RefoldModel::FindArmRefForByte(StringRef file,
       continue;
 
     for (const CondArm &arm : group->arms) {
-      // Skip non-selected arms when the producer emitted selection metadata.
+      // Only selected arms can describe emitted source when selection metadata
+      // is available.
       if (!arm.selected)
         continue;
       if (!arm.ContainsByte(byteOffset))
         continue;
 
+      // Prefer the deepest selected arm containing the byte. Nested
+      // conditionals should resolve to the most local arm witness, not an outer
+      // enclosing arm.
       uint32_t depth = GetCondArmDepth(arm.id);
       if (depth > bestDepth) {
         bestDepth = depth;
@@ -1882,6 +1945,9 @@ RefoldModel::FindArmRefForByte(StringRef file,
 
 std::optional<const RefoldModel::Slot *>
 RefoldModel::GetArmBeginSlot(uint64_t armId) const {
+  // When the arm is indexed, search in its exact file/include-owner domain
+  // first so duplicate arm ids or slots from other materialization contexts
+  // cannot satisfy the lookup.
   if (auto ref = GetArmRefById(armId)) {
     auto slots = FindSlots(ref->group->file, "arm_begin", armId,
                            ref->group->parentIncludeId);
@@ -1889,6 +1955,9 @@ RefoldModel::GetArmBeginSlot(uint64_t armId) const {
       return slots.front();
     return std::nullopt;
   }
+
+  // Fallback for older or partially indexed metadata where the arm ref was not
+  // recorded but the slot table still carries the arm id.
   auto slots = FindSlots(std::nullopt, "arm_begin", armId, std::nullopt);
   if (!slots.empty())
     return slots.front();
@@ -1897,6 +1966,9 @@ RefoldModel::GetArmBeginSlot(uint64_t armId) const {
 
 std::optional<const RefoldModel::Slot *>
 RefoldModel::GetArmEndSlot(uint64_t armId) const {
+  // When the arm is indexed, search in its exact file/include-owner domain
+  // first so duplicate arm ids or slots from other materialization contexts
+  // cannot satisfy the lookup.
   if (auto ref = GetArmRefById(armId)) {
     auto slots = FindSlots(ref->group->file, "arm_end", armId,
                            ref->group->parentIncludeId);
@@ -1904,6 +1976,9 @@ RefoldModel::GetArmEndSlot(uint64_t armId) const {
       return slots.front();
     return std::nullopt;
   }
+
+  // Fallback for older or partially indexed metadata where the arm ref was not
+  // recorded but the slot table still carries the arm id.
   auto slots = FindSlots(std::nullopt, "arm_end", armId, std::nullopt);
   if (!slots.empty())
     return slots.front();
@@ -1914,6 +1989,10 @@ std::vector<RefoldModel::Segment>
 RefoldModel::BuildSegmentsForFile(StringRef file,
                                   ArrayRef<const Slot *> fileSlots) const {
   std::vector<const Slot *> sorted = fileSlots;
+
+  // Process slot events in source order. Ties are broken deterministically so
+  // segment construction is stable even when several metadata events occur at
+  // the same byte offset.
   std::sort(
       sorted.begin(), sorted.end(), [](const Slot *first, const Slot *second) {
         if (first->b != second->b)
@@ -1932,6 +2011,9 @@ RefoldModel::BuildSegmentsForFile(StringRef file,
       });
 
   std::vector<Segment> segs;
+
+  // These track the active ownership state after applying all slot events at
+  // the current byte position. Each emitted segment inherits this state.
   std::optional<uint64_t> currentIncludeId;
   std::optional<uint64_t> currentArmId;
 
@@ -1939,7 +2021,9 @@ RefoldModel::BuildSegmentsForFile(StringRef file,
   while (i < sorted.size()) {
     const uint64_t pos = sorted[i]->b;
 
-    // Apply all events at |pos|.
+    // Apply every metadata event at this byte offset before emitting the
+    // segment that starts here. This makes begin/end slots define ownership for
+    // the half-open interval [pos, nextPos).
     size_t j = i;
     for (; j < sorted.size() && sorted[j]->b == pos; ++j) {
       const Slot &s = *sorted[j];
@@ -1958,6 +2042,9 @@ RefoldModel::BuildSegmentsForFile(StringRef file,
 
     if (j >= sorted.size())
       break;
+
+    // The next distinct slot position closes the segment opened by the state we
+    // just computed. Empty ranges are ignored.
     const uint64_t nextPos = sorted[j]->b;
     if (pos < nextPos) {
       Segment seg;
@@ -1975,6 +2062,8 @@ RefoldModel::BuildSegmentsForFile(StringRef file,
 }
 
 uint32_t RefoldModel::GetIncludeDepth(std::optional<uint64_t> includeId) const {
+  // TU-owned source has depth 0. Include-owned source starts at depth 1 and
+  // increases through the parent include chain.
   if (!includeId)
     return 0;
 
@@ -1987,6 +2076,8 @@ uint32_t RefoldModel::GetIncludeDepth(std::optional<uint64_t> includeId) const {
   if (inc && inc->parent)
     depth = GetIncludeDepth(inc->parent) + 1;
 
+  // Cache the computed depth because ownership queries may ask for the same
+  // include repeatedly while resolving segments, conditionals, and PP tokens.
   includeDepthCache_[*includeId] = depth;
   return depth;
 }
@@ -1996,6 +2087,9 @@ RefoldModel::InnermostIncludeAtPP(uint64_t ppIndex) const {
   std::optional<int> bestId;
   uint32_t bestDepth = 0;
 
+  // Multiple include covers can contain the same PP token when includes are
+  // nested. Pick the deepest containing include so the returned owner is the
+  // most local include expansion, not an outer parent.
   for (const auto &inc : includes_) {
     if (inc.cover.begin <= ppIndex && ppIndex < inc.cover.end) {
       uint32_t depth = GetIncludeDepth(inc.id);
@@ -2014,11 +2108,18 @@ RefoldModel::LeastCommonAncestorInclude(std::optional<uint64_t> a,
                                         std::optional<uint64_t> b) const {
   if (a == b)
     return a;
+
+  // The TU/root owner is represented as std::nullopt. If only one side is
+  // include-owned, their only common owner is the TU/root domain.
   if (!a || !b)
     return std::nullopt;
 
   auto buildChainRootTo = [this](std::optional<uint64_t> id) {
     std::vector<uint64_t> chain;
+
+    // Build the include-parent chain from the leaf include up to the outermost
+    // include, then reverse it so both chains can be compared from the root
+    // downward.
     while (id) {
       chain.push_back(*id);
       const IncludeItem *inc = GetIncludeById(*id);
@@ -2026,6 +2127,7 @@ RefoldModel::LeastCommonAncestorInclude(std::optional<uint64_t> a,
         break;
       id = inc->parent;
     }
+
     std::reverse(chain.begin(), chain.end());
     return chain;
   };
@@ -2033,6 +2135,8 @@ RefoldModel::LeastCommonAncestorInclude(std::optional<uint64_t> a,
   std::vector<uint64_t> chainA = buildChainRootTo(a);
   std::vector<uint64_t> chainB = buildChainRootTo(b);
 
+  // Walk both root-to-leaf chains until they diverge. The last equal include id
+  // is the deepest common include owner.
   std::optional<uint64_t> lastCommon;
   const size_t n = std::min(chainA.size(), chainB.size());
   for (size_t i = 0; i < n; ++i) {
@@ -2049,12 +2153,17 @@ uint32_t RefoldModel::GetCondGroupDepth(uint64_t groupId) const {
     return it->second;
 
   const CondGroup *group = GetCondGroupById(groupId);
+
+  // Top-level conditional groups have depth 1. A group nested inside another
+  // conditional arm is one level deeper than the parent arm's group.
   uint32_t depth = 1;
   if (group && group->parentArmId) {
     if (auto parentArm = GetArmRefById(*group->parentArmId))
       depth = GetCondGroupDepth(parentArm->group->id) + 1;
   }
 
+  // Cache depths because conditional ownership lookups repeatedly compare
+  // nesting levels while selecting the innermost arm/group witness.
   condGroupDepthCache_[groupId] = depth;
   return depth;
 }
@@ -2091,9 +2200,8 @@ RefoldModel::FirstConditionalArmStartA(const CondGroup &group) const {
   if (group.arms.empty())
     return std::nullopt;
 
-  // 1. Use a stack-allocated set if arms are few (standard)
-  // or a DenseSet for larger groups.
-  // For LLVM, SmallPtrSet is great, but here we have IDs (integers).
+  // Build an O(1) membership set for the group's arm ids. SmallDenseSet keeps
+  // the common few-arm case inline while still handling larger conditionals.
   SmallDenseSet<uint64_t, 8> armIds;
   armIds.reserve(group.arms.size());
   for (const auto &arm : group.arms)
@@ -2103,8 +2211,8 @@ RefoldModel::FirstConditionalArmStartA(const CondGroup &group) const {
   bool found = false;
 
   for (const auto &slot : slots_) {
-    // Early exits remain the same (very fast)
-    // TODO: We should replace this with a call to PathsEqual
+    // Only arm-begin slots in the same recorded file and include-owner domain
+    // can mark the first A-token position for this conditional group.
     if (slot.kind != "arm_begin" || slot.file != group.file)
       continue;
 
@@ -2114,7 +2222,7 @@ RefoldModel::FirstConditionalArmStartA(const CondGroup &group) const {
     if (!slot.pp || !slot.ref)
       continue;
 
-    // 2. O(1) lookup instead of the O(M) any_of
+    // Reject slots for other conditional groups.
     if (!armIds.count(*slot.ref))
       continue;
 
@@ -2131,6 +2239,10 @@ std::vector<const RefoldModel::Slot *> RefoldModel::FindSlots(
     std::optional<StringRef> file, std::optional<StringRef> kind,
     std::optional<uint64_t> ref, std::optional<uint64_t> ownerIncludeId) const {
   std::vector<const Slot *> out;
+
+  // Apply each supplied field as an exact-match filter. Omitted filters are
+  // wildcards, which lets callers search broadly and then rely on the stable
+  // ordering below.
   for (const auto &slot : slots_) {
     if (file && slot.file != *file)
       continue;
@@ -2142,17 +2254,22 @@ std::vector<const RefoldModel::Slot *> RefoldModel::FindSlots(
       continue;
     out.push_back(&slot);
   }
-  // ordered by (b, e, pp, id)
+
+  // Return slots in deterministic source order. Missing PP indices sort after
+  // concrete PP indices at the same byte range, and id is the final tie-breaker
+  // for otherwise identical metadata.
   std::sort(out.begin(), out.end(), [](const Slot *a, const Slot *b) {
     if (a->b != b->b)
       return a->b < b->b;
     if (a->e != b->e)
       return a->e < b->e;
+
     constexpr auto MAX = std::numeric_limits<std::uint64_t>::max();
     uint64_t ap = a->pp ? *a->pp : MAX;
     uint64_t bp = b->pp ? *b->pp : MAX;
     if (ap != bp)
       return ap < bp;
+
     return a->id < b->id;
   });
   return out;
@@ -2168,6 +2285,9 @@ RefoldModel::MapSpan(const PPSpan &span) const {
   const uint64_t count = span.end - span.begin;
   out.reserve(static_cast<std::size_t>(count));
 
+  // Convert the half-open PP-token span to the source-token mappings recorded
+  // by the producer. Missing PP indices are skipped because not every
+  // preprocessed token necessarily has a concrete source spelling.
   for (uint64_t i = span.begin; i < span.end; ++i) {
     auto it = tokmapByPP_.find(i);
     if (it != tokmapByPP_.end()) {

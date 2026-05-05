@@ -23,13 +23,13 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
 
   SmallVector<Occ, 32> occs;
 
-  // Collect __COUNTER__ occurrences in PP-token space.
+  // Collect every recorded __COUNTER__ occurrence in PP-token space.
   //
-  // Note: when __COUNTER__ is consumed by token paste or stringification, the
-  // producer may record a zero-length span (begin==end) anchored at the output
-  // token index affected by the counter. Treat such anchors as a single-token
-  // occurrence so edits to pasted/stringified counter materialize and trigger
-  // suffix stabilization.
+  // Normal counter expansions have a non-empty output span. When __COUNTER__ is
+  // consumed by token paste or stringification, however, the producer may record
+  // a zero-length anchor at the affected output token. Treat that anchor as a
+  // one-token occurrence so edits to pasted/stringified counter output still
+  // trigger suffix stabilization.
   auto addOcc = [&](const RefoldModel::MacroInvocation &mi, uint64_t b,
                     uint64_t e) {
     if (e > b) {
@@ -48,13 +48,16 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
     if (!mi.invB || !mi.invE || !mi.invText)
       continue;
 
+    // Body spans are the most precise description of emitted macro-body output,
+    // so prefer them over generic spans/cover when available.
     if (!mi.bodySpans.empty()) {
       for (const auto &bs : mi.bodySpans)
         addOcc(mi, bs.begin, bs.end);
       continue;
     }
 
-    // Prefer explicit spans when present, including zero-length anchors.
+    // Explicit spans are the next-best producer witness, including zero-length
+    // anchors for paste/stringify cases.
     if (!mi.spans.empty()) {
       for (const auto &s : mi.spans)
         addOcc(mi, s.begin, s.end);
@@ -68,8 +71,9 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
   if (occs.empty())
     return {};
 
-  // Determine the true PP-owner include for each occurrence and drop any
-  // producer-merged duplicates whose ownerIncludeId does not match.
+  // Determine the actual PP-owner include for each occurrence. This filters out
+  // producer-merged duplicate records whose recorded ownerIncludeId does not
+  // match the owner inferred from the current TU segmentation.
   SmallVector<Occ, 32> filtered;
   filtered.reserve(occs.size());
   for (const auto &o : occs) {
@@ -84,8 +88,8 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
     if (owner.kind == OwnerKind::Include)
       ownerInc = owner.includeId;
 
-    // If the producer says this macro belongs to an include instance, require
-    // the occurrence to actually be owned by that include.
+    // If the producer says this macro belongs to a specific include instance,
+    // require the token occurrence to be owned by that same include instance.
     if (o.m->ownerIncludeId && ownerInc && *o.m->ownerIncludeId != *ownerInc)
       continue;
 
@@ -95,7 +99,8 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
   if (filtered.empty())
     return {};
 
-  // Sort by PP-token order.
+  // Process occurrences in PP-token order so "first edited counter" has the
+  // same meaning as the preprocessor's increasing __COUNTER__ sequence.
   llvm::sort(filtered, [](const Occ &A, const Occ &B) {
     if (A.aStart != B.aStart)
       return A.aStart < B.aStart;
@@ -106,6 +111,9 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
     return A.m->id < B.m->id;
   });
 
+  // A counter occurrence is considered edited if any A-side token in its
+  // occurrence range is unmapped, maps outside B, or maps to a token with a
+  // different spelling.
   auto isEditedOcc = [&](const Occ &o) -> bool {
     for (uint64_t ai = o.aStart; ai < o.aEnd; ++ai) {
       if (static_cast<size_t>(ai) >= a2b.size() ||
@@ -138,10 +146,10 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
       return false;
     };
 
-    // Compare the emitted output segments directly when the producer recorded
-    // them. Do not collapse discontiguous bodySpans into one merged envelope:
-    // the holes between body spans are caller-formal substitution sites, and
-    // edits to those sites must not be misclassified as edits to an embedded
+    // Compare emitted output segments directly when the producer recorded them.
+    // Do not collapse discontiguous bodySpans into one merged envelope: the
+    // holes between body spans are caller-formal substitution sites, and edits
+    // to those sites must not be misclassified as edits to an embedded
     // __COUNTER__ occurrence.
     if (!m.bodySpans.empty()) {
       for (const auto &s : m.bodySpans) {
@@ -151,6 +159,8 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
       return false;
     }
 
+    // Explicit spans may also include zero-length paste/stringify anchors. For
+    // those anchors, compare the anchored token as the effective output slice.
     if (!m.spans.empty()) {
       for (const auto &s : m.spans) {
         if (s.begin < s.end) {
@@ -181,7 +191,7 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
   }
 
   // Fallback: some nested-macro scenarios record __COUNTER__ with a zero-length
-  // PP span anchored at a caller site that is *not* the edited output token
+  // PP span anchored at a caller site that is not the edited output token
   // itself. In those cases, the direct __COUNTER__ occurrence comparison above
   // can miss the edit. Recover by lifting each __COUNTER__ occurrence to a
   // patchable caller macro whose bodySpans/cover correspond to the actual
@@ -192,6 +202,8 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
     for (const auto &mi : model_.GetMacroInvocations())
       invById[mi.id] = &mi;
 
+    // Walk out of macro-definition-only frames until reaching the invocation
+    // that can actually be patched in source.
     auto findPatchableCaller = [&](const RefoldModel::MacroInvocation &mi)
         -> const RefoldModel::MacroInvocation * {
       const RefoldModel::MacroInvocation *cur = &mi;
@@ -224,7 +236,9 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
           return std::make_pair(lo, hi);
       }
 
-      // Next: explicit spans (including 0-length anchors).
+      // Next, use explicit spans. Zero-length anchors are widened to the
+      // anchored token so paste/stringify counter outputs still have a concrete
+      // comparison range.
       if (!m.spans.empty()) {
         uint64_t lo = std::numeric_limits<uint64_t>::max();
         uint64_t hi = 0;
@@ -298,7 +312,9 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
     return {};
   }
 
-  // Define a unique key structure for our DenseSet
+  // Unique key for forced patch requests. Counter stabilization may encounter
+  // multiple counter occurrences covered by the same patchable macro; emit only
+  // one forced request per owner/include + invocation byte range.
   struct MacroKey {
     std::optional<uint64_t> ownerId;
     uint64_t start;
@@ -308,6 +324,10 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
   SmallVector<ForcedMacroPatchRequest, 32> forced;
   llvm::DenseSet<llvm::hash_code> seen;
 
+  // Once one __COUNTER__ occurrence is edited, every subsequent occurrence in
+  // PP order must be forced through macro realization as well. Otherwise the
+  // counter sequence after the edit could remain stale relative to the edited
+  // preprocessed stream.
   for (const Occ &o : llvm::drop_begin(filtered, firstEditedIdx)) {
     const auto *root =
         SmallestCoveringPatchableMacro(o.aStart, o.aEnd, o.ownerInc);
@@ -359,6 +379,9 @@ RefoldEngine::ComputeForcedCounterPatchesFromExpandedMacros(
 
   SmallVector<Occ, 32> occs;
 
+  // Record a __COUNTER__ occurrence in PP-token space. Zero-length producer
+  // anchors are widened to one token so pasted/stringified counter output still
+  // participates in stabilization.
   auto addOcc = [&](const RefoldModel::MacroInvocation &mi, uint64_t b,
                     uint64_t e) {
     if (e > b) {
@@ -371,6 +394,8 @@ RefoldEngine::ComputeForcedCounterPatchesFromExpandedMacros(
     }
   };
 
+  // Collect all recorded __COUNTER__ outputs. Prefer the most precise producer
+  // ranges first: bodySpans, then explicit spans, then the fallback cover.
   for (const auto &mi : model_.GetMacroInvocations()) {
     if (mi.name != "__COUNTER__")
       continue;
@@ -396,6 +421,9 @@ RefoldEngine::ComputeForcedCounterPatchesFromExpandedMacros(
   if (occs.empty())
     return {};
 
+  // Reclassify each occurrence against the current TU segmentation. This drops
+  // producer-merged duplicate records whose recorded include owner does not
+  // match the owner inferred from the actual occurrence range.
   SmallVector<Occ, 32> filtered;
   filtered.reserve(occs.size());
   for (const auto &o : occs) {
@@ -419,6 +447,8 @@ RefoldEngine::ComputeForcedCounterPatchesFromExpandedMacros(
   if (filtered.empty())
     return {};
 
+  // Stabilization follows PP-token order because later __COUNTER__ values depend
+  // on the sequence established by all earlier counter expansions.
   llvm::sort(filtered, [](const Occ &A, const Occ &B) {
     if (A.aStart != B.aStart)
       return A.aStart < B.aStart;
@@ -429,6 +459,9 @@ RefoldEngine::ComputeForcedCounterPatchesFromExpandedMacros(
     return A.m->id < B.m->id;
   });
 
+  // Return true when the patch already selected for `root` is an expanded
+  // realization. Once one counter-bearing macro remains expanded, all following
+  // counter-bearing roots must also be forced to preserve counter sequencing.
   auto hasExpandedPatchFor = [&](const RefoldModel::MacroInvocation &root)
       -> bool {
     const auto oit = macroPatchByOwnerByMacroId.find(root.ownerIncludeId);
@@ -450,6 +483,9 @@ RefoldEngine::ComputeForcedCounterPatchesFromExpandedMacros(
     return false;
   };
 
+  // Find the first __COUNTER__ occurrence whose smallest patchable owner is
+  // already going to remain expanded. That point starts the forced-stabilization
+  // suffix.
   int firstExpandedIdx = -1;
   for (size_t i = 0; i < filtered.size(); ++i) {
     const auto *root =
@@ -468,6 +504,10 @@ RefoldEngine::ComputeForcedCounterPatchesFromExpandedMacros(
 
   SmallVector<ForcedMacroPatchRequest, 32> forced;
   llvm::DenseSet<llvm::hash_code> seen;
+
+  // Force every counter occurrence from the first expanded one onward. Dedup by
+  // owner/include plus invocation byte span because multiple occurrences may be
+  // covered by the same patchable macro invocation.
   for (const Occ &o : llvm::drop_begin(filtered, firstExpandedIdx)) {
     const auto *root =
         SmallestCoveringPatchableMacro(o.aStart, o.aEnd, o.ownerInc);
