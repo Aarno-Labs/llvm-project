@@ -2226,11 +2226,22 @@ std::string RefoldEngine::RunSinglePassRefold() {
 
     // Before we escalate to the explicit terminal out-of-domain carrier, try
     // one last source-closure class that keeps already-proved structural work
-    // alive: materialize an exact contiguous run of top-level TU `#include`
-    // directives directly into TU source text when that include run is the
-    // whole unresolved PP cover.
-    if (auto closureEdit =
-            BuildTUIncludeClosureEditForUnresolvedHunk(h, tuPath, tuBytes)) {
+    // alive: materialize a contiguous run of top-level TU `#include`
+    // directives directly into TU source text when that include run either
+    // exactly covers the unresolved PP hunk or can be widened to the full
+    // include cover without absorbing another token diff.
+    SmallVector<std::pair<uint64_t, uint64_t>, 8> stagedSourceIntervals;
+    for (const TextEdit &edit : tuEdits)
+      stagedSourceIntervals.push_back({edit.start, edit.end});
+    if (auto it = macroPatchByOwnerByMacroId.find(std::nullopt);
+        it != macroPatchByOwnerByMacroId.end()) {
+      for (const auto &kv : it->second)
+        stagedSourceIntervals.push_back(
+            {kv.second.invStart, kv.second.invEnd});
+    }
+
+    if (auto closureEdit = BuildTUIncludeClosureEditForUnresolvedHunk(
+            h, tuPath, tuBytes, stagedSourceIntervals)) {
       debug("classify",
             "#{0} -> TU include-closure bytes=[{1},{2}) textLen={3}", i,
             closureEdit->start, closureEdit->end, closureEdit->text.size());

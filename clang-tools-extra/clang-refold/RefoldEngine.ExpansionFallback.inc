@@ -381,12 +381,14 @@ RefoldEngine::BuildMacroOwnerExpansionClosureWitness() const {
 
 std::optional<RefoldEngine::TextEdit>
 RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
-    const diffutils::Hunk &h, StringRef tuPath, StringRef tuBytes) const {
+    const diffutils::Hunk &h, StringRef tuPath, StringRef tuBytes,
+    ArrayRef<std::pair<uint64_t, uint64_t>> stagedSourceIntervals) const {
   // This helper is intentionally narrower than ordinary include realization.
   // It is the first hybrid source-closure class used to keep already-proved
   // structural artifacts (for example a preserved macro callsite rewrite)
   // while materializing one otherwise-unresolved PP region directly into the
-  // TU source. Stay fail-closed unless the closure is exact and self-contained.
+  // TU source. Stay fail-closed unless the closure is exact or can be widened
+  // without absorbing any independent token diff.
   if (h.isInsertOnly()) {
     trace("fallback",
           "TU include-closure rejected: insert-only hunk A=[{0},{1}) B=[{2},{3}) is outside the first closure-edit domain",
@@ -436,14 +438,88 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     coverEnd = inc->cover.end;
   }
 
-  // Keep the first hybrid closure exact: do not silently widen beyond the
-  // unresolved PP hunk. If the touched include run would over-cover the hunk,
-  // a larger search lattice is needed and remains out-of-domain for now.
-  if (coverBegin != h.aStart || coverEnd != h.aEnd) {
+  const bool exactCover = coverBegin == h.aStart && coverEnd == h.aEnd;
+  const bool hunkInsideCover = coverBegin <= h.aStart && h.aEnd <= coverEnd;
+
+  auto sameTokenHunk = [](const diffutils::Hunk &lhs,
+                          const diffutils::Hunk &rhs) -> bool {
+    return lhs.aStart == rhs.aStart && lhs.aEnd == rhs.aEnd &&
+           lhs.bStart == rhs.bStart && lhs.bEnd == rhs.bEnd;
+  };
+
+  auto hunkTouchesAClosedRange = [](const diffutils::Hunk &cand,
+                                    uint64_t begin, uint64_t end) -> bool {
+    if (end < begin)
+      end = begin;
+
+    // A-consuming edits touch the extra cover when their token intervals
+    // overlap it. Pure insertions touch the cover when their insertion anchor
+    // lies in the closed gap interval: a widened include materialization would
+    // otherwise absorb the insertion payload without going through the normal
+    // candidate-conflict law.
+    if (cand.aStart < cand.aEnd)
+      return cand.aStart < end && begin < cand.aEnd;
+    return cand.bStart < cand.bEnd && cand.aStart >= begin &&
+           cand.aStart <= end;
+  };
+
+  auto rangeHasForeignTokenDiff = [&](uint64_t begin, uint64_t end) -> bool {
+    for (const diffutils::Hunk &cand : abTokHunks_) {
+      if (sameTokenHunk(cand, h))
+        continue;
+      if (hunkTouchesAClosedRange(cand, begin, end))
+        return true;
+    }
+    return false;
+  };
+
+  auto sourceTouchesStagedEdit = [&](uint64_t begin, uint64_t end) -> bool {
+    for (const auto &interval : stagedSourceIntervals) {
+      if (interval.first < interval.second) {
+        if (interval.first < end && begin < interval.second)
+          return true;
+        continue;
+      }
+
+      if (begin <= interval.first && interval.first <= end)
+        return true;
+    }
+    return false;
+  };
+
+  if (!exactCover) {
+    if (!hunkInsideCover) {
+      trace("fallback",
+            "TU include-closure rejected: touched include cover A=[{0},{1}) does not contain hunk A=[{2},{3})",
+            coverBegin, coverEnd, h.aStart, h.aEnd);
+      return std::nullopt;
+    }
+
+    // Widening from the unresolved hunk to the complete include-cover is
+    // admissible only when the widened-away prefix/suffix are observationally
+    // unchanged in the token diff. That keeps this as an include-closure proof,
+    // not a hidden multi-region merge: any independent token edit or insertion
+    // in the extra cover must be handled by the normal partition/lattice path.
+    const bool prefixClean = !rangeHasForeignTokenDiff(coverBegin, h.aStart);
+    const bool suffixClean = !rangeHasForeignTokenDiff(h.aEnd, coverEnd);
+    if (!prefixClean || !suffixClean) {
+      trace("fallback",
+            "TU include-closure rejected: widening A=[{0},{1}) around hunk A=[{2},{3}) would absorb foreign token edits prefixClean={4} suffixClean={5}",
+            coverBegin, coverEnd, h.aStart, h.aEnd, prefixClean ? 1 : 0,
+            suffixClean ? 1 : 0);
+      return std::nullopt;
+    }
+
+    if (sourceTouchesStagedEdit(first->siteB, last->siteE)) {
+      trace("fallback",
+            "TU include-closure rejected: widened source interval [{0},{1}) would absorb an already-staged source edit",
+            first->siteB, last->siteE);
+      return std::nullopt;
+    }
+
     trace("fallback",
-          "TU include-closure rejected: touched include cover A=[{0},{1}) does not exactly match hunk A=[{2},{3})",
-          coverBegin, coverEnd, h.aStart, h.aEnd);
-    return std::nullopt;
+          "TU include-closure widening accepted: hunk A=[{0},{1}) widened to include cover A=[{2},{3})",
+          h.aStart, h.aEnd, coverBegin, coverEnd);
   }
 
   if (first->siteB >= first->siteE || last->siteE > tuBytes.size() ||
@@ -489,6 +565,13 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     trace("fallback",
           "TU include-closure rejected: no canonical-or-consensus B envelope for A-cover [{0},{1})",
           coverBegin, coverEnd);
+    return std::nullopt;
+  }
+
+  if (h.bStart < bEnvelope->first || h.bEnd > bEnvelope->second) {
+    trace("fallback",
+          "TU include-closure rejected: hunk B=[{0},{1}) is outside include-cover B envelope [{2},{3})",
+          h.bStart, h.bEnd, bEnvelope->first, bEnvelope->second);
     return std::nullopt;
   }
 
