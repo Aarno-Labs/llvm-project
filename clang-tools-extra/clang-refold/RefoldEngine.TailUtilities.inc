@@ -1378,24 +1378,49 @@ RefoldEngine::ApplyTextEditsWithPendingResync(
       return originalFileText.str();
   }
 
+  const size_t n = originalFileText.size();
+
+  // Validate the normalized edit set before appending any bytes or recording
+  // side effects. The applicator has only one sound composition law here:
+  // edits must be in bounds and non-overlapping in original-file byte space.
+  // If that law is violated, do not guess whether an insertion should be
+  // merged into, ordered around, or shadowed by a replacement. Fail closed to
+  // the explicit terminal fallback instead.
+  uint64_t validatedCursor = 0;
+  for (size_t editIndex = 0; editIndex < norm.size(); ++editIndex) {
+    const TextEdit &e = norm[editIndex];
+    if (e.end < e.start || e.end > n) {
+      RequestTerminalFallback(
+          TerminalFallbackKind::UncomposableEmissionEditSet, "edits/apply",
+          llvm::formatv(
+              "bad normalized edit bounds in {0}: edit#{1}=[{2},{3}) "
+              "fileLen={4} textLen={5}",
+              emissionOwner, editIndex, e.start, e.end, n, e.text.size())
+              .str());
+      return originalFileText.str();
+    }
+    if (e.start < validatedCursor) {
+      RequestTerminalFallback(
+          TerminalFallbackKind::UncomposableEmissionEditSet, "edits/apply",
+          llvm::formatv(
+              "overlapping normalized edits in {0}: previousEnd={1} "
+              "edit#{2}=[{3},{4}) textLen={5}",
+              emissionOwner, validatedCursor, editIndex, e.start, e.end,
+              e.text.size())
+              .str());
+      return originalFileText.str();
+    }
+    validatedCursor = e.end;
+  }
+
   // Use SmallString for the output buffer to optimize small file edits.
   SmallString<0> out;
   out.reserve(originalFileText.size() + 128);
   std::optional<PendingResync> pending = std::nullopt;
 
   uint64_t cursor = 0;
-  size_t n = originalFileText.size();
 
   for (const auto &e : norm) {
-    if (e.end < e.start || e.end > n) {
-      fatal("edits/apply", "bad edit bounds [{0},{1}) fileLen={2}", e.start,
-            e.end, n);
-    }
-    if (e.start < cursor) {
-      fatal("edits/apply", "overlapping edits: cursor={0} nextStart={1}",
-            cursor, e.start);
-    }
-
     // Pass the SmallString to the appender.
     pending = AppendOriginalSliceWithPending(out, originalFileText, cursor,
                                              e.start, std::move(pending));
