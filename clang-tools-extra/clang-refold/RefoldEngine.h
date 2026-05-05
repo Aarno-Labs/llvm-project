@@ -680,6 +680,17 @@ private:
   /// into a larger mapped envelope (e.g., macro whole-cover replacement).
   std::vector<diffutils::Hunk> abTokHunks_;
 
+  /// Cached token-level A/B maps for the current refold invocation.
+  ///
+  /// Final TU emission uses these as proof inputs when it has to decide whether
+  /// an otherwise uncomposable cluster of direct TU hunk edits can be replaced
+  /// by one closed source/B-token realization. The closure proof requires that
+  /// every matched A token physically consumed by the source interval maps into
+  /// the candidate B interval, and every matched B token emitted by that
+  /// replacement maps back into the same source interval.
+  std::vector<int64_t> abTokMapA2B_;
+  std::vector<int64_t> abTokMapB2A_;
+
   std::optional<std::vector<ByteHunk>> abByteHunks_;
 
   /// \brief Prefix-summed A->B byte-length delta for \c abByteHunks_.
@@ -860,6 +871,25 @@ private:
     // later universal proof gate can reason over the actual emitted surface.
     std::vector<std::shared_ptr<const AcceptedResultCandidate>>
         acceptedResults;
+
+    // Optional provenance for a TextEdit emitted directly from a single
+    // token-level TU hunk. This is deliberately not inferred for macro,
+    // include, or synthesized closure edits: the closed-realization resolver
+    // may only coalesce edits that still have a one-to-one token-hunk witness.
+    bool isDirectTUHunkEdit = false;
+    std::optional<uint64_t> directTUHunkIndex = std::nullopt;
+    std::optional<uint64_t> directTUHunkAStart = std::nullopt;
+    std::optional<uint64_t> directTUHunkAEnd = std::nullopt;
+    std::optional<uint64_t> directTUHunkBStart = std::nullopt;
+    std::optional<uint64_t> directTUHunkBEnd = std::nullopt;
+
+    // Raw and final TU byte spans for direct TU hunk edits. raw* records the
+    // immediate token-map span before lexical widening/spacing repair; final*
+    // records the span actually handed to the byte applicator.
+    std::optional<uint64_t> directTURawStart = std::nullopt;
+    std::optional<uint64_t> directTURawEnd = std::nullopt;
+    std::optional<uint64_t> directTUFinalStart = std::nullopt;
+    std::optional<uint64_t> directTUFinalEnd = std::nullopt;
   };
 
   // Result of planning header-local edits for one include. When
