@@ -1786,6 +1786,193 @@ std::string RefoldEngine::RunSinglePassRefold() {
           stringutils::showWSWithClip(lead, 220));
   };
 
+  auto hasTopLevelCommaInReplacement = [&](StringRef text) -> bool {
+    // Detect whether using this replacement text as a single macro argument
+    // would change the invocation arity.
+    //
+    // This must be token-based rather than character-based: commas inside
+    // comments, string literals, character literals, or nested delimiters do not
+    // split a macro argument. Raw lexing gives us the same lexical treatment the
+    // preprocessor would use for the replacement spelling.
+    const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
+    std::string lexBuf = text.str();
+    lexBuf.push_back('\0');
+    const char *bufStart = lexBuf.data();
+    const char *bufEnd = bufStart + text.size();
+    Lexer lex(baseLoc, lexLang_, bufStart, bufStart, bufEnd);
+
+    int parenDepth = 0;
+    int bracketDepth = 0;
+    int braceDepth = 0;
+    Token tok;
+
+    for (;;) {
+      lex.LexFromRawLexer(tok);
+      if (tok.is(tok::eof))
+        return false;
+      if (tok.is(tok::comment))
+        continue;
+
+      switch (tok.getKind()) {
+      case tok::l_paren:
+        ++parenDepth;
+        break;
+      case tok::r_paren:
+        if (parenDepth > 0)
+          --parenDepth;
+        break;
+      case tok::l_square:
+        ++bracketDepth;
+        break;
+      case tok::r_square:
+        if (bracketDepth > 0)
+          --bracketDepth;
+        break;
+      case tok::l_brace:
+        ++braceDepth;
+        break;
+      case tok::r_brace:
+        if (braceDepth > 0)
+          --braceDepth;
+        break;
+      case tok::comma:
+        // Only an undelimited comma would split the replacement into multiple
+        // macro arguments if it were written back into the original invocation.
+        if (parenDepth == 0 && bracketDepth == 0 && braceDepth == 0)
+          return true;
+        break;
+      default:
+        break;
+      }
+    }
+  };
+
+  auto shouldPreferTUArgEditOverMacroArgsOnly =
+      [&](const RefoldModel::MacroInvocation &macro,
+          const diffutils::Hunk &hunk,
+          const MacroPatch &macroCandidate) -> bool {
+    // Cross-domain lattice preference:
+    //
+    // The same PP hunk can sometimes be represented in two valid ways:
+    //
+    //   1. a macro args-only rewrite, e.g. ID(/*keep*/ 1) -> ID(2)
+    //   2. an exact TU byte edit inside the original argument spelling,
+    //      e.g. ID(/*keep*/ 1) -> ID(/*keep*/ 2)
+    //
+    // Prefer the TU edit when it is provably equivalent, because it preserves
+    // callsite trivia that macro argument reconstruction does not retain. This
+    // is intentionally not a general "TU beats macro" rule; it applies only to
+    // a single direct argument occurrence whose source spelling can be edited
+    // without changing macro arity or expansion multiplicity.
+
+    // Only compete against an already-proven, structure-preserving args-only
+    // macro candidate. Other macro proofs have their own stronger invariants and
+    // should not be displaced by this narrow preference.
+    if (macroCandidate.proofKind != MacroPatchProofKind::ArgsOnlyStandard ||
+        !macroCandidate.proofValidated || !macroCandidate.structurePreserving)
+      return false;
+
+    // This preference rewrites existing source bytes inside an argument. Pure
+    // insertions/deletions and empty B ranges need different anchoring rules.
+    if (!hunk.isReplace() || hunk.aStart >= hunk.aEnd ||
+        hunk.bStart >= hunk.bEnd)
+      return false;
+
+    // The invocation itself must be spelled in the main TU. If the invocation is
+    // include-owned or lacks callsite provenance, rewriting its argument bytes
+    // here would cross source ownership boundaries.
+    if (!macro.invB || !macro.invE || !macro.invFile ||
+        !PathsEqual(*macro.invFile, tuPath))
+      return false;
+
+    // The PP hunk must map back to a concrete TU token range. This prevents
+    // choosing a TU-byte edit for tokens that only exist through macro body
+    // spelling, include materialization, or another non-TU source.
+    if (!HunkMapsToTU(hunk.aStart, hunk.aEnd, tuPath))
+      return false;
+
+    auto span = TUByteSpan(hunk.aStart, hunk.aEnd, tuPath);
+    if (!span || span->first >= span->second)
+      return false;
+
+    // The concrete source bytes for the hunk must lie inside the invocation
+    // callsite. Otherwise the edit is not an argument-local alternative to the
+    // macro candidate.
+    if (span->first < *macro.invB || span->second > *macro.invE)
+      return false;
+
+    std::optional<uint32_t> touchedArgIdx;
+    for (const auto &occ : macro.argSpans) {
+      if (occ.kind != PPArgSpanKind::Standard)
+        continue;
+
+      // Find the single STANDARD expansion occurrence that covers the PP hunk.
+      // If more than one argument occurrence covers it, the hunk is ambiguous
+      // and must stay on the existing macro proof path.
+      if (occ.begin <= hunk.aStart && hunk.aEnd <= occ.end) {
+        if (touchedArgIdx)
+          return false;
+        touchedArgIdx = occ.argIdx;
+      }
+    }
+    if (!touchedArgIdx)
+      return false;
+
+    unsigned directStandardOccurrences = 0;
+    for (const auto &occ : macro.argSpans) {
+      if (occ.argIdx != *touchedArgIdx)
+        continue;
+
+      // Editing the argument source changes every expansion of that formal in
+      // this invocation. Therefore the preference is sound only when the formal
+      // appears exactly once, and only as a direct STANDARD substitution.
+      if (occ.kind != PPArgSpanKind::Standard)
+        return false;
+      ++directStandardOccurrences;
+    }
+
+    // Stringify and paste uses transform the argument spelling before it reaches
+    // the PP output. A direct TU argument edit is not equivalent to an args-only
+    // reconstruction for those cases.
+    for (const auto &occ : macro.stringifySpans)
+      if (occ.argIdx == *touchedArgIdx)
+        return false;
+    for (const auto &occ : macro.pasteSpans)
+      if (occ.argIdx == *touchedArgIdx)
+        return false;
+
+    if (directStandardOccurrences != 1)
+      return false;
+
+    if (*touchedArgIdx >= macro.invArgRanges.size())
+      return false;
+    const auto &argRange = macro.invArgRanges[*touchedArgIdx];
+    if (!argRange.first || !argRange.second ||
+        *argRange.second < *argRange.first)
+      return false;
+
+    // The source byte span must be contained in the original argument spelling,
+    // not merely somewhere inside the invocation parentheses.
+    if (span->first < *argRange.first || span->second > *argRange.second)
+      return false;
+
+    StringRef replacement = sliceExactTokenCoverage(
+        bTokOff_, bToks_, bSource_, hunk.bStart, hunk.bEnd);
+
+    // Replacing an argument subrange with a top-level comma would split the
+    // original invocation argument list. That is a semantic arity change, so it
+    // must remain on the macro reconstruction/fallback path.
+    if (hasTopLevelCommaInReplacement(replacement))
+      return false;
+
+    trace("select/lattice",
+          "prefer TU arg edit over macro args-only: macro id={0} name='{1}' "
+          "argIdx={2} hunk A=[{3},{4}) B=[{5},{6}) src=[{7},{8})",
+          macro.id, macro.name, *touchedArgIdx, hunk.aStart, hunk.aEnd,
+          hunk.bStart, hunk.bEnd, span->first, span->second);
+    return true;
+  };
+
   // Iterate over all hunks:
   for (size_t i = 0; i < hunks.size(); ++i) {
     const auto &h = hunks[i];
@@ -1879,6 +2066,15 @@ std::string RefoldEngine::RunSinglePassRefold() {
           auto updated = BuildMacroInvocationPatchWholeCover(
               *target, h, currentInvText, macroPatchByOwnerByMacroId);
           if (updated) {
+            if (existingIt == byMacroId.end() &&
+                shouldPreferTUArgEditOverMacroArgsOnly(*target, h, *updated)) {
+              trace("select/lattice",
+                    "defer macro args-only patch for inv id={0} name='{1}' "
+                    "so exact TU argument edit can compete",
+                    target->id, target->name);
+              break;
+            }
+
             if (hadExistingCallsitePatch) {
               if (prevCallsiteReplacement == updated->replacement)
                 trace("macro", "callsite patch reused inv id={0}", target->id);
