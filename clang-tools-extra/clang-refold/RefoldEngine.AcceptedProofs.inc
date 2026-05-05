@@ -909,6 +909,8 @@ std::string RefoldEngine::FormatTerminalFallbackWitness(
       return "IncludeRealizationUnmappableBCoverEnvelope";
     case TerminalFallbackKind::UndischargedEmissionArtifact:
       return "UndischargedEmissionArtifact";
+    case TerminalFallbackKind::UncomposableEmissionEditSet:
+      return "UncomposableEmissionEditSet";
     case TerminalFallbackKind::TheoremAuditInvariantViolation:
       return "TheoremAuditInvariantViolation";
     case TerminalFallbackKind::MixedExcludedCases:

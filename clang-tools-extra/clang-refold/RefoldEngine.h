@@ -237,6 +237,7 @@ private:
     OwnerUnresolvedNoTUAnchor,
     IncludeRealizationUnmappableBCoverEnvelope,
     UndischargedEmissionArtifact,
+    UncomposableEmissionEditSet,
     /// Step 6: strict mode turns any surviving theorem-audit invariant
     /// violation into the one explicit terminal out-of-domain result instead of
     /// merely logging it as a dashboard counter.
