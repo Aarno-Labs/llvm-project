@@ -1205,8 +1205,14 @@ getProjectionInvocationArgText(const Item &It, uint32_t ArgIdx) {
   return getItemInvocationArgText(It, ArgIdx);
 }
 
-static bool lexRawTokenSpellings(llvm::StringRef Text, const LangOptions &Lang,
-                                 llvm::SmallVectorImpl<std::string> &Out) {
+struct RawTokenSlice {
+  std::string Spelling;
+  uint32_t ByteBegin = 0;
+  uint32_t ByteEnd = 0;
+};
+
+static bool lexRawTokenSlices(llvm::StringRef Text, const LangOptions &Lang,
+                              llvm::SmallVectorImpl<RawTokenSlice> &Out) {
   Out.clear();
 
   const SourceLocation BaseLoc = SourceLocation::getFromRawEncoding(1);
@@ -1226,11 +1232,30 @@ static bool lexRawTokenSpellings(llvm::StringRef Text, const LangOptions &Lang,
     const unsigned Len = Tok.getLength();
     const size_t Off = static_cast<size_t>(Tok.getLocation().getRawEncoding() -
                                            BaseLoc.getRawEncoding());
-    if (Off > Text.size() || Off + Len > Text.size())
+    if (Off > Text.size() || Off + Len > Text.size() ||
+        Off > std::numeric_limits<uint32_t>::max() ||
+        Off + Len > std::numeric_limits<uint32_t>::max())
       return false;
-    Out.push_back(Text.substr(Off, Len).str());
+
+    RawTokenSlice Slice;
+    Slice.Spelling = Text.substr(Off, Len).str();
+    Slice.ByteBegin = static_cast<uint32_t>(Off);
+    Slice.ByteEnd = static_cast<uint32_t>(Off + Len);
+    Out.push_back(std::move(Slice));
   }
 
+  return true;
+}
+
+static bool lexRawTokenSpellings(llvm::StringRef Text, const LangOptions &Lang,
+                                 llvm::SmallVectorImpl<std::string> &Out) {
+  llvm::SmallVector<RawTokenSlice, 16> Slices;
+  if (!lexRawTokenSlices(Text, Lang, Slices))
+    return false;
+
+  Out.clear();
+  for (const RawTokenSlice &Slice : Slices)
+    Out.push_back(Slice.Spelling);
   return true;
 }
 
@@ -1574,29 +1599,147 @@ void computeMacroProjectionSites(Item &It, Preprocessor &PP,
   if (!HasHashHash)
     return;
 
+  struct ProjectionToken {
+    std::string Spelling;
+    std::optional<uint32_t> ArgByteBegin;
+    std::optional<uint32_t> ArgByteEnd;
+  };
+
   struct SubstTok {
     bool IsHashHash = false;
     bool IsPasteResult = false;
     std::string Text;
-    SmallVector<PastePart, 4> Parts; // only arg-sourced parts are tracked
+    SmallVector<PastePart, 4> Parts;
   };
 
   SmallVector<SubstTok, 64> Seq;
 
-  auto pushTok = [&](std::string Text, std::optional<unsigned> ArgIdx) {
+  auto tokenSpellingsEqual = [](llvm::ArrayRef<ProjectionToken> LHS,
+                                llvm::ArrayRef<std::string> RHS) -> bool {
+    if (LHS.size() != RHS.size())
+      return false;
+    for (size_t I = 0, E = LHS.size(); I != E; ++I)
+      if (LHS[I].Spelling != RHS[I])
+        return false;
+    return true;
+  };
+
+  auto projectionTokensFromArgText =
+      [&](uint32_t ArgIdx,
+          llvm::SmallVectorImpl<ProjectionToken> &Out) -> bool {
+    Out.clear();
+
+    auto ArgText = getProjectionInvocationArgText(It, ArgIdx);
+    if (!ArgText)
+      return false;
+
+    llvm::SmallVector<RawTokenSlice, 16> Slices;
+    if (!lexRawTokenSlices(*ArgText, Lang, Slices))
+      return false;
+
+    for (const RawTokenSlice &Slice : Slices) {
+      ProjectionToken Tok;
+      Tok.Spelling = Slice.Spelling;
+      Tok.ArgByteBegin = Slice.ByteBegin;
+      Tok.ArgByteEnd = Slice.ByteEnd;
+      Out.push_back(std::move(Tok));
+    }
+    return true;
+  };
+
+  auto fallbackProjectionTokens =
+      [&](uint32_t ArgIdx,
+          llvm::SmallVectorImpl<ProjectionToken> &Out) -> bool {
+    llvm::SmallVector<std::string, 16> EffectiveTokens;
+    if (!resolveProjectionArgTokenSpellings(It, ArgIdx, Items, Lang,
+                                            EffectiveTokens))
+      return false;
+
+    Out.clear();
+    for (const std::string &Spelling : EffectiveTokens) {
+      ProjectionToken Tok;
+      Tok.Spelling = Spelling;
+      Out.push_back(std::move(Tok));
+    }
+    return true;
+  };
+
+  auto invocationProjectionTokens =
+      [&](uint32_t ArgIdx,
+          llvm::SmallVectorImpl<ProjectionToken> &Out) -> bool {
+    Out.clear();
+
+    llvm::SmallVector<ProjectionToken, 16> TextTokens;
+    const bool HaveTextTokens = projectionTokensFromArgText(ArgIdx, TextTokens);
+
+    if (Args) {
+      if (const Token *AT = Args->getUnexpArgument(ArgIdx)) {
+        llvm::SmallVector<std::string, 16> ActualSpellings;
+        for (; !AT->is(tok::eof); ++AT)
+          ActualSpellings.push_back(PP.getSpelling(*AT));
+
+        if (HaveTextTokens && tokenSpellingsEqual(TextTokens, ActualSpellings)) {
+          Out.append(TextTokens.begin(), TextTokens.end());
+          return true;
+        }
+
+        // Keep the historical Clang-provided spellings if the raw invocation
+        // slice does not exactly match the MacroArgs token stream. We still
+        // emit the paste replay, but omit unproven argument byte slices.
+        for (const std::string &Spelling : ActualSpellings) {
+          ProjectionToken Tok;
+          Tok.Spelling = Spelling;
+          Out.push_back(std::move(Tok));
+        }
+        return true;
+      }
+    }
+
+    if (HaveTextTokens) {
+      llvm::SmallVector<std::string, 16> ResolvedSpellings;
+      if (resolveProjectionArgTokenSpellings(It, ArgIdx, Items, Lang,
+                                             ResolvedSpellings)) {
+        if (tokenSpellingsEqual(TextTokens, ResolvedSpellings)) {
+          Out.append(TextTokens.begin(), TextTokens.end());
+          return true;
+        }
+      } else if (!It.CallerMacroId) {
+        // For a direct invocation, the raw invocation argument text is the
+        // producer's best available proof of the unexpanded argument tokens. In
+        // nested invocations, however, caller-formal substitution may change the
+        // effective text, so keep failing closed unless the resolver proves it.
+        Out.append(TextTokens.begin(), TextTokens.end());
+        return true;
+      }
+    }
+
+    return fallbackProjectionTokens(ArgIdx, Out);
+  };
+
+  auto pushTok = [&](std::string Text, std::optional<unsigned> ArgIdx,
+                     std::optional<uint32_t> ArgByteBegin = std::nullopt,
+                     std::optional<uint32_t> ArgByteEnd = std::nullopt) {
     SubstTok S;
     S.Text = std::move(Text);
-    if (ArgIdx && !S.Text.empty()) {
+    if (!S.Text.empty()) {
       PastePart P;
-      P.ArgIndex = static_cast<uint32_t>(*ArgIdx);
+      if (ArgIdx)
+        P.ArgIndex = static_cast<uint32_t>(*ArgIdx);
       P.ByteBegin = 0;
       P.ByteEnd = static_cast<uint32_t>(S.Text.size());
-      S.Parts.push_back(P);
+      P.Spelling = S.Text;
+      P.ArgByteBegin = ArgByteBegin;
+      P.ArgByteEnd = ArgByteEnd;
+      S.Parts.push_back(std::move(P));
     }
     Seq.push_back(std::move(S));
   };
 
-  // Substitute params with unexpanded argument token spellings.
+  // Substitute parameters with unexpanded argument token spellings. For each
+  // substituted token, retain the exact argument-text slice when the producer
+  // can prove that the raw invocation spelling and Clang's MacroArgs token
+  // stream agree. Otherwise, preserve the spelling but omit the source slice so
+  // the consumer can fail closed for slice-sensitive inversions.
   for (const Token &RTok : MI->tokens()) {
     if (RTok.is(tok::hashhash)) {
       SubstTok Op;
@@ -1607,22 +1750,11 @@ void computeMacroProjectionSites(Item &It, Preprocessor &PP,
 
     int PIdx = paramIndex(RTok);
     if (PIdx >= 0) {
-      bool HaveActualArgTokens = false;
-      if (Args) {
-        if (const Token *AT =
-                Args->getUnexpArgument(static_cast<unsigned>(PIdx))) {
-          HaveActualArgTokens = true;
-          for (; !AT->is(tok::eof); ++AT)
-            pushTok(PP.getSpelling(*AT), static_cast<unsigned>(PIdx));
-        }
-      }
-      if (!HaveActualArgTokens) {
-        llvm::SmallVector<std::string, 16> EffectiveTokens;
-        if (resolveProjectionArgTokenSpellings(It, static_cast<unsigned>(PIdx),
-                                               Items, Lang, EffectiveTokens)) {
-          for (const std::string &Spelling : EffectiveTokens)
-            pushTok(Spelling, static_cast<unsigned>(PIdx));
-        }
+      llvm::SmallVector<ProjectionToken, 16> Tokens;
+      if (invocationProjectionTokens(static_cast<uint32_t>(PIdx), Tokens)) {
+        for (const ProjectionToken &Tok : Tokens)
+          pushTok(Tok.Spelling, static_cast<unsigned>(PIdx),
+                  Tok.ArgByteBegin, Tok.ArgByteEnd);
       }
       continue;
     }
@@ -3636,7 +3768,7 @@ void RefoldMapBuilder::writeJSON() {
   llvm::json::OStream JO(OS, /*Indent=*/2);
 
   JO.object([&] {
-    JO.attribute("version", "2.3");
+    JO.attribute("version", "2.4");
 
     const auto &PPO = PP.getPreprocessorOpts();
     std::string LangStr = computeLangStr(PP.getLangOpts());
@@ -4642,10 +4774,17 @@ void RefoldMapBuilder::writeJSON() {
                     JO.attributeArray("parts", [&] {
                       for (const PastePart &Part : PT.Parts) {
                         JO.object([&] {
+                          JO.attribute("kind",
+                                       Part.ArgIndex ? "arg" : "literal");
                           if (Part.ArgIndex)
                             JO.attribute("arg_index", *Part.ArgIndex);
                           JO.attribute("byte_begin", Part.ByteBegin);
                           JO.attribute("byte_end", Part.ByteEnd);
+                          JO.attribute("spelling", Part.Spelling);
+                          if (Part.ArgByteBegin && Part.ArgByteEnd) {
+                            JO.attribute("arg_byte_begin", *Part.ArgByteBegin);
+                            JO.attribute("arg_byte_end", *Part.ArgByteEnd);
+                          }
                         });
                       }
                     });

@@ -7,6 +7,6 @@
 
 #define NUMCAT(a, b) a##b
 int main(void) {
-  int v = 5678;
+  int v = NUMCAT(56, 78);
   return v == 1234 ? 0 : 1;
 }

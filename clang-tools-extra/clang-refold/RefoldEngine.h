@@ -836,9 +836,14 @@ private:
     uint32_t argIdx;
     std::string newSeg;
     std::string oldSeg;
+    std::optional<uint32_t> argByteBegin;
+    std::optional<uint32_t> argByteEnd;
 
-    PasteArgEdit(uint32_t Idx, std::string New, std::string Old)
-        : argIdx(Idx), newSeg(std::move(New)), oldSeg(std::move(Old)) {}
+    PasteArgEdit(uint32_t Idx, std::string New, std::string Old,
+                 std::optional<uint32_t> ArgByteBegin = std::nullopt,
+                 std::optional<uint32_t> ArgByteEnd = std::nullopt)
+        : argIdx(Idx), newSeg(std::move(New)), oldSeg(std::move(Old)),
+          argByteBegin(ArgByteBegin), argByteEnd(ArgByteEnd) {}
   };
 
   // ---------------------------- Ownership Helpers ----------------------------
@@ -3069,6 +3074,17 @@ private:
   static std::string SplicePasteSegmentIntoSpellingArg(StringRef baseArg,
                                                        StringRef oldSeg,
                                                        StringRef newSeg);
+
+  /// \brief Splice a replay-derived paste edit through an exact producer slice.
+  ///
+  /// This is the non-inferential counterpart to
+  /// `SplicePasteSegmentIntoSpellingArg`. The producer has already recorded the
+  /// byte range inside the original invocation argument that supplied the paste
+  /// part, so the consumer only verifies that the range still spells `oldSeg`
+  /// and then replaces exactly that range with `newSeg`.
+  static std::string SplicePasteSegmentIntoSpellingArgExact(
+      StringRef baseArg, uint32_t argByteBegin, uint32_t argByteEnd,
+      StringRef oldSeg, StringRef newSeg);
 
   /// \brief Return per-formal argument content ranges for a function-like macro
   /// invocation.

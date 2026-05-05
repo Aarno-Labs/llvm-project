@@ -604,6 +604,248 @@ buildAdjacentPasteRunInvertibilityCertificate(
 
   return solveRun(solveRun, 0, 0, /*prevChanged=*/false);
 }
+/// Classification for replaying an edited pasted token through producer-side
+/// `paste_tokens` metadata.
+///
+/// `Unique` means the edited token has exactly one segmentation compatible
+/// with the replay witness. `Ambiguous` means multiple different segmentations
+/// are possible and the consumer must fail closed. `NoMatch` means this witness
+/// cannot explain the edited token. `Unsupported` denotes malformed or
+/// currently out-of-domain witness shapes.
+enum class PasteReplaySegmentationKind { Unique, NoMatch, Ambiguous, Unsupported };
+
+/// Result of replaying one edited pasted-token spelling through one original
+/// replay witness. For a successful replay, `argSegments` contains replacement
+/// text for argument-derived parts in witness order; literal parts are omitted
+/// because they must match the edited token exactly.
+struct PasteReplaySegmentationResult {
+  PasteReplaySegmentationKind kind = PasteReplaySegmentationKind::Unsupported;
+  std::vector<std::string> argSegments;
+};
+
+/// Merge two replay attempts for the same pasted token. If two distinct
+/// successful segmentations exist, preserving the paste expression would invent
+/// source structure, so the merged result is ambiguous.
+static PasteReplaySegmentationResult mergePasteReplayResults(
+    PasteReplaySegmentationResult lhs,
+    const PasteReplaySegmentationResult &rhs) {
+  if (lhs.kind == PasteReplaySegmentationKind::Unsupported ||
+      rhs.kind == PasteReplaySegmentationKind::Unsupported) {
+    lhs.kind = PasteReplaySegmentationKind::Unsupported;
+    lhs.argSegments.clear();
+    return lhs;
+  }
+  if (rhs.kind == PasteReplaySegmentationKind::NoMatch)
+    return lhs;
+  if (lhs.kind == PasteReplaySegmentationKind::NoMatch)
+    return rhs;
+  if (lhs.kind == PasteReplaySegmentationKind::Ambiguous ||
+      rhs.kind == PasteReplaySegmentationKind::Ambiguous) {
+    lhs.kind = PasteReplaySegmentationKind::Ambiguous;
+    lhs.argSegments.clear();
+    return lhs;
+  }
+  if (lhs.argSegments == rhs.argSegments)
+    return lhs;
+  lhs.kind = PasteReplaySegmentationKind::Ambiguous;
+  lhs.argSegments.clear();
+  return lhs;
+}
+
+/// Return the `paste_tokens[]` witness corresponding to a paste span.
+///
+/// `paste_spans[]` contains one entry per argument contribution, while
+/// `paste_tokens[]` contains one entry per final pasted token. The producer
+/// serializes both in token order, so this helper reconstructs the distinct
+/// `(begin,end)` paste-token order from `paste_spans[]` and uses the same ordinal
+/// to find the replay witness. The spelling check prevents accidental matches
+/// if the metadata is malformed or from a different schema generation.
+static const RefoldModel::PasteToken *findPasteTokenWitnessForSpan(
+    const RefoldModel::MacroInvocation &M, const RefoldModel::PPArgSpan &Span,
+    StringRef ATokSpelling) {
+  if (M.pasteTokens.empty())
+    return nullptr;
+
+  SmallVector<std::pair<uint64_t, uint64_t>, 8> tokenOrder;
+  for (const auto &PS : M.pasteSpans) {
+    std::pair<uint64_t, uint64_t> key{PS.begin, PS.end};
+    if (llvm::find(tokenOrder, key) == tokenOrder.end())
+      tokenOrder.push_back(key);
+  }
+
+  auto it = llvm::find(tokenOrder,
+                       std::pair<uint64_t, uint64_t>{Span.begin, Span.end});
+  if (it == tokenOrder.end())
+    return nullptr;
+  const size_t index = static_cast<size_t>(std::distance(tokenOrder.begin(), it));
+  if (index >= M.pasteTokens.size())
+    return nullptr;
+
+  const RefoldModel::PasteToken &witness = M.pasteTokens[index];
+  if (witness.spelling != ATokSpelling)
+    return nullptr;
+  return &witness;
+}
+
+/// Segment a delimiter-free run of adjacent argument-derived paste parts.
+///
+/// When adjacent argument parts have no literal bytes between them, the edited
+/// token spelling contains no internal boundary marker. The only accepted rule
+/// here is shape preservation: the edited run must have the same total width as
+/// the original run and is split by the original part widths. For example,
+/// `ab | cd` may replay `wxyz` as `wx | yz`; a different total width remains
+/// out of domain unless literal anchors elsewhere pin the boundaries.
+static PasteReplaySegmentationResult segmentArgRunByReplayWidths(
+    StringRef BRun, ArrayRef<RefoldModel::PastePart> parts) {
+  PasteReplaySegmentationResult result;
+  if (parts.empty())
+    return result;
+
+  if (parts.size() == 1) {
+    result.kind = PasteReplaySegmentationKind::Unique;
+    result.argSegments.push_back(BRun.str());
+    return result;
+  }
+
+  size_t requiredLen = 0;
+  for (const auto &part : parts) {
+    if (part.kind != RefoldModel::PastePartKind::Arg ||
+        part.byteEnd < part.byteBegin)
+      return result;
+    requiredLen += static_cast<size_t>(part.byteEnd - part.byteBegin);
+  }
+  if (requiredLen != BRun.size()) {
+    result.kind = PasteReplaySegmentationKind::NoMatch;
+    return result;
+  }
+
+  result.kind = PasteReplaySegmentationKind::Unique;
+  size_t pos = 0;
+  for (const auto &part : parts) {
+    const size_t width = static_cast<size_t>(part.byteEnd - part.byteBegin);
+    result.argSegments.push_back(BRun.substr(pos, width).str());
+    pos += width;
+  }
+  return result;
+}
+
+/// Replay an edited pasted-token spelling through the producer witness.
+///
+/// Literal witness parts are exact anchors and must occur unchanged in B. Runs
+/// of argument parts are segmented by `segmentArgRunByReplayWidths()`. If a
+/// literal anchor can be placed in more than one way and those placements imply
+/// different argument segments, the result is ambiguous and rejected by the
+/// caller.
+static PasteReplaySegmentationResult segmentPastedTokenByReplayWitness(
+    StringRef BTokSpelling, const RefoldModel::PasteToken &witness) {
+  PasteReplaySegmentationResult unsupported;
+  if (witness.parts.empty())
+    return unsupported;
+
+  uint32_t expectedBegin = 0;
+  for (const auto &part : witness.parts) {
+    if (part.byteBegin != expectedBegin || part.byteEnd < part.byteBegin ||
+        part.byteEnd > witness.spelling.size())
+      return unsupported;
+    if (part.spelling != witness.spelling.slice(part.byteBegin, part.byteEnd))
+      return unsupported;
+    if (part.kind == RefoldModel::PastePartKind::Arg && !part.argIndex)
+      return unsupported;
+    if (part.kind == RefoldModel::PastePartKind::Literal && part.argIndex)
+      return unsupported;
+    expectedBegin = part.byteEnd;
+  }
+  if (expectedBegin != witness.spelling.size())
+    return unsupported;
+
+  using MemoKey = std::pair<size_t, size_t>;
+  std::map<MemoKey, PasteReplaySegmentationResult> memo;
+
+  auto solve = [&](auto &&self, size_t partIdx,
+                   size_t posB) -> PasteReplaySegmentationResult {
+    MemoKey key{partIdx, posB};
+    auto memoIt = memo.find(key);
+    if (memoIt != memo.end())
+      return memoIt->second;
+
+    PasteReplaySegmentationResult result;
+    result.kind = PasteReplaySegmentationKind::NoMatch;
+
+    if (posB > BTokSpelling.size()) {
+      memo.emplace(key, result);
+      return result;
+    }
+
+    if (partIdx == witness.parts.size()) {
+      if (posB == BTokSpelling.size())
+        result.kind = PasteReplaySegmentationKind::Unique;
+      memo.emplace(key, result);
+      return result;
+    }
+
+    const RefoldModel::PastePart &part = witness.parts[partIdx];
+    if (part.kind == RefoldModel::PastePartKind::Literal) {
+      if (!BTokSpelling.substr(posB).starts_with(part.spelling)) {
+        memo.emplace(key, result);
+        return result;
+      }
+      result = self(self, partIdx + 1, posB + part.spelling.size());
+      memo.emplace(key, result);
+      return result;
+    }
+
+    size_t runEnd = partIdx;
+    while (runEnd < witness.parts.size() &&
+           witness.parts[runEnd].kind == RefoldModel::PastePartKind::Arg)
+      ++runEnd;
+
+    auto tryRun = [&](size_t runEndB) -> PasteReplaySegmentationResult {
+      if (runEndB < posB || runEndB > BTokSpelling.size())
+        return PasteReplaySegmentationResult{};
+      ArrayRef<RefoldModel::PastePart> witnessParts(witness.parts);
+      auto runSeg = segmentArgRunByReplayWidths(
+          BTokSpelling.substr(posB, runEndB - posB),
+          witnessParts.slice(partIdx, runEnd - partIdx));
+      if (runSeg.kind != PasteReplaySegmentationKind::Unique)
+        return runSeg;
+      auto suffix = self(self, runEnd, runEndB);
+      if (suffix.kind != PasteReplaySegmentationKind::Unique)
+        return suffix;
+      runSeg.argSegments.insert(runSeg.argSegments.end(),
+                                suffix.argSegments.begin(),
+                                suffix.argSegments.end());
+      return runSeg;
+    };
+
+    if (runEnd == witness.parts.size()) {
+      result = tryRun(BTokSpelling.size());
+      memo.emplace(key, result);
+      return result;
+    }
+
+    StringRef anchor = witness.parts[runEnd].spelling;
+    if (anchor.empty()) {
+      result.kind = PasteReplaySegmentationKind::Unsupported;
+      memo.emplace(key, result);
+      return result;
+    }
+
+    for (size_t found = BTokSpelling.find(anchor, posB);
+         found != StringRef::npos;
+         found = BTokSpelling.find(anchor, found + 1)) {
+      result = mergePasteReplayResults(std::move(result), tryRun(found));
+      if (result.kind == PasteReplaySegmentationKind::Unsupported ||
+          result.kind == PasteReplaySegmentationKind::Ambiguous)
+        break;
+    }
+
+    memo.emplace(key, result);
+    return result;
+  };
+
+  return solve(solve, /*partIdx=*/0, /*posB=*/0);
+}
+
 
 /// Return true iff \p replacement has the exact chained-call shape
 ///   (<non-empty head>)(...)...
@@ -5344,9 +5586,59 @@ RefoldEngine::DerivePasteArgEdits(const RefoldModel::MacroInvocation &m,
   StringRef aTokRaw = SliceASource(tokenSpan->begin, tokenSpan->end);
   StringRef bTokRaw = SliceBSource(bEnvOpt->first, bEnvOpt->second);
 
-  // Strip trailing newlines to stabilize within-token diffs.
+  // Strip trailing newlines to stabilize within-token diffs for the
+  // legacy source-slice segmenter. The replay-witness path below uses lexer
+  // token spellings instead, because `Slice*Source()` may include trailing
+  // whitespace between adjacent PP tokens.
   StringRef aTok = stringutils::stripTrailingNewlines(aTokRaw);
   StringRef bTok = stringutils::stripTrailingNewlines(bTokRaw);
+
+  // Prefer the producer's exact paste replay witness when it is present. The
+  // witness gives the original ordered arg/literal decomposition of the pasted
+  // token, so we can refold adjacent changed paste parts without inventing a
+  // split from raw text alone. For delimiter-free adjacent arg runs, the only
+  // accepted policy is shape preservation: the edited run must split by the
+  // original part widths. All literal parts remain exact anchors.
+  if (tokenSpan->end == tokenSpan->begin + 1 &&
+      bEnvOpt->second == bEnvOpt->first + 1 &&
+      tokenSpan->begin < aToks_.size() && bEnvOpt->first < bToks_.size()) {
+    StringRef aTokSpelling = aToks_[tokenSpan->begin].spelling;
+    StringRef bTokSpelling = bToks_[bEnvOpt->first].spelling;
+    if (const auto *witness =
+            findPasteTokenWitnessForSpan(m, *tokenSpan, aTokSpelling)) {
+      auto replay = segmentPastedTokenByReplayWitness(bTokSpelling, *witness);
+      if (replay.kind == PasteReplaySegmentationKind::Unique) {
+        std::vector<PasteArgEdit> edits;
+        size_t argPartIdx = 0;
+        for (const auto &part : witness->parts) {
+          if (part.kind != RefoldModel::PastePartKind::Arg)
+            continue;
+          if (!part.argIndex || argPartIdx >= replay.argSegments.size())
+            return std::nullopt;
+          StringRef oldSeg = part.spelling;
+          const std::string &newSeg = replay.argSegments[argPartIdx++];
+          if (oldSeg == newSeg)
+            continue;
+          edits.emplace_back(*part.argIndex, newSeg, oldSeg.str(),
+                             part.argByteBegin, part.argByteEnd);
+        }
+        if (argPartIdx != replay.argSegments.size())
+          return std::nullopt;
+        if (!edits.empty()) {
+          trace("macro/paste",
+                "paste replay witness derived {0} arg edit(s): inv id={1} "
+                "name={2} aTok='{3}' bTok='{4}'",
+                static_cast<unsigned>(edits.size()), m.id, m.name,
+                aTokSpelling, bTokSpelling);
+          return edits;
+        }
+        return std::nullopt;
+      }
+      if (replay.kind == PasteReplaySegmentationKind::Ambiguous ||
+          replay.kind == PasteReplaySegmentationKind::Unsupported)
+        return std::nullopt;
+    }
+  }
 
   // Multi-span paste edits may change the overall pasted token length (e.g.,
   // a_b_c -> foo_bar_baz). This is still safe to refold *as long as* the
@@ -6127,6 +6419,22 @@ std::string RefoldEngine::SplicePasteSegmentIntoSpellingArg(StringRef baseArg,
   return "";
 }
 
+std::string RefoldEngine::SplicePasteSegmentIntoSpellingArgExact(
+    StringRef baseArg, uint32_t argByteBegin, uint32_t argByteEnd,
+    StringRef oldSeg, StringRef newSeg) {
+  if (argByteEnd < argByteBegin || argByteEnd > baseArg.size())
+    return "";
+
+  // The producer-provided range is authoritative only if it still names the
+  // exact old segment inside the current invocation argument spelling. If it no
+  // longer matches, falling back to prefix/suffix inference would reintroduce
+  // the ambiguity this metadata is meant to avoid.
+  if (baseArg.slice(argByteBegin, argByteEnd) != oldSeg)
+    return "";
+
+  return stringutils::replaceRange(baseArg, argByteBegin, argByteEnd, newSeg);
+}
+
 std::optional<std::vector<std::pair<size_t, size_t>>>
 RefoldEngine::GetMacroInvocationFormalArgContentRanges(
     const RefoldModel::MacroInvocation &m, StringRef invText) {
@@ -6396,10 +6704,16 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         StringRef baseArgText =
             baseInvText.substr(range.first, range.second - range.first);
 
-        // Splice the sub-token replacement into the spelling arg
-        // conservatively.
-        std::string newArg = SplicePasteSegmentIntoSpellingArg(
-            baseArgText, pae.oldSeg, pae.newSeg);
+        // Prefer an exact source-slice splice when the replay witness
+        // provides one. Otherwise retain the existing conservative boundary
+        // splice for legacy paste-span metadata.
+        std::string newArg =
+            (pae.argByteBegin && pae.argByteEnd)
+                ? SplicePasteSegmentIntoSpellingArgExact(
+                      baseArgText, *pae.argByteBegin, *pae.argByteEnd,
+                      pae.oldSeg, pae.newSeg)
+                : SplicePasteSegmentIntoSpellingArg(baseArgText, pae.oldSeg,
+                                                    pae.newSeg);
         if (newArg.empty()) {
           // Deleting an entire argument (making it empty) is legal. Accept this
           // only when the paste-span covered the whole argument spelling.
@@ -6491,8 +6805,13 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
 
       auto r = invArgRanges[argIdx];
       StringRef baseArgText = baseInvText.substr(r.first, r.second - r.first);
-      std::string newArg = SplicePasteSegmentIntoSpellingArg(
-          baseArgText, pae->oldSeg, pae->newSeg);
+      std::string newArg =
+          (pae->argByteBegin && pae->argByteEnd)
+              ? SplicePasteSegmentIntoSpellingArgExact(
+                    baseArgText, *pae->argByteBegin, *pae->argByteEnd,
+                    pae->oldSeg, pae->newSeg)
+              : SplicePasteSegmentIntoSpellingArg(baseArgText, pae->oldSeg,
+                                                  pae->newSeg);
       if (newArg.empty()) {
         // Deleting an entire argument (making it empty) is legal. Accept this
         // only when the paste-span covered the whole argument spelling.
@@ -6580,8 +6899,13 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       auto range = invArgRanges[argIdx];
       StringRef baseArgText =
           baseInvText.substr(range.first, range.second - range.first);
-      std::string newArg = SplicePasteSegmentIntoSpellingArg(
-          baseArgText, pae.oldSeg, pae.newSeg);
+      std::string newArg =
+          (pae.argByteBegin && pae.argByteEnd)
+              ? SplicePasteSegmentIntoSpellingArgExact(
+                    baseArgText, *pae.argByteBegin, *pae.argByteEnd,
+                    pae.oldSeg, pae.newSeg)
+              : SplicePasteSegmentIntoSpellingArg(baseArgText, pae.oldSeg,
+                                                  pae.newSeg);
       if (newArg.empty()) {
         if (!(StringRef(pae.newSeg).trim().empty() &&
               baseArgText.trim() == StringRef(pae.oldSeg).trim())) {

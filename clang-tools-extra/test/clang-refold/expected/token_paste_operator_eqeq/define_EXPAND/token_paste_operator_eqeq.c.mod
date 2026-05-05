@@ -7,6 +7,6 @@
 
 #define OP2(a, b) a##b
 int main(void) {
-  int v = (1 && 1);
+  int v = (1 OP2(&, &) 1);
   return v ? 0 : 1;
 }

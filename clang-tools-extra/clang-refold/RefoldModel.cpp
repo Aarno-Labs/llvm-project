@@ -868,6 +868,27 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
               std::optional<uint32_t> ArgIndex =
                   asOptUInt32(PartObj, "arg_index", /*canBeNull=*/true);
 
+              std::optional<StringRef> KindText =
+                  asOptString(PartObj, "kind", /*canBeNull=*/true);
+              RefoldModel::PastePartKind Kind =
+                  ArgIndex ? RefoldModel::PastePartKind::Arg
+                           : RefoldModel::PastePartKind::Literal;
+              if (KindText) {
+                if (*KindText == "arg")
+                  Kind = RefoldModel::PastePartKind::Arg;
+                else if (*KindText == "literal")
+                  Kind = RefoldModel::PastePartKind::Literal;
+                else
+                  fatal("model", "{0}: paste_tokens.part.kind is invalid: {1}",
+                        ctxItem, *KindText);
+              }
+              if (Kind == RefoldModel::PastePartKind::Arg && !ArgIndex)
+                fatal("model", "{0}: arg paste_tokens part missing arg_index",
+                      ctxItem);
+              if (Kind == RefoldModel::PastePartKind::Literal && ArgIndex)
+                fatal("model", "{0}: literal paste_tokens part has arg_index",
+                      ctxItem);
+
               const json::Value *ByteBVal = PartObj.get("byte_begin");
               if (!ByteBVal)
                 fatal("model", "{0}: paste_tokens part missing byte_begin", ctxItem);
@@ -883,9 +904,39 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
                                          ctxItem + ": paste_tokens.part.byte_end");
               if (!ByteEOrErr)
                 fatal("model", "{0}: paste_tokens.part.byte_end is not a uint32", ctxItem);
+              if (*ByteEOrErr < *ByteBOrErr ||
+                  *ByteEOrErr > SpellingOrErr->size())
+                fatal("model", "{0}: paste_tokens part byte range is invalid",
+                      ctxItem);
 
-              parts.push_back(RefoldModel::PastePart{ArgIndex, *ByteBOrErr,
-                                                     *ByteEOrErr});
+              std::optional<StringRef> PartSpelling =
+                  asOptString(PartObj, "spelling", /*canBeNull=*/true);
+              StringRef DerivedSpelling =
+                  SpellingOrErr->slice(*ByteBOrErr, *ByteEOrErr);
+              if (PartSpelling && *PartSpelling != DerivedSpelling)
+                fatal("model",
+                      "{0}: paste_tokens.part.spelling does not match byte range",
+                      ctxItem);
+              StringRef StoredSpelling =
+                  PartSpelling ? *PartSpelling : DerivedSpelling;
+
+              std::optional<uint32_t> ArgByteBegin =
+                  asOptUInt32(PartObj, "arg_byte_begin", /*canBeNull=*/true);
+              std::optional<uint32_t> ArgByteEnd =
+                  asOptUInt32(PartObj, "arg_byte_end", /*canBeNull=*/true);
+              if (ArgByteBegin.has_value() != ArgByteEnd.has_value())
+                fatal("model", "{0}: paste_tokens arg byte range is incomplete",
+                      ctxItem);
+              if (ArgByteBegin && *ArgByteEnd < *ArgByteBegin)
+                fatal("model", "{0}: paste_tokens arg byte range is invalid",
+                      ctxItem);
+              if (Kind == RefoldModel::PastePartKind::Literal && ArgByteBegin)
+                fatal("model", "{0}: literal paste_tokens part has arg byte range",
+                      ctxItem);
+
+              parts.push_back(RefoldModel::PastePart{
+                  Kind, ArgIndex, *ByteBOrErr, *ByteEOrErr, StoredSpelling,
+                  ArgByteBegin, ArgByteEnd});
             }
 
             pasteTokens.push_back(

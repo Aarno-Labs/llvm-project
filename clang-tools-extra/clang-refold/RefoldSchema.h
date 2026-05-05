@@ -919,7 +919,7 @@ static constexpr const char *RefoldSchema = R"json(
           "items": {
             "$ref": "#/$defs/PasteToken"
           },
-          "description": "Exact producer-side witnesses for tokens synthesized by `##` within this invocation, recorded in deterministic expansion order. This preserves both the final pasted spelling and the ordered decomposition into literal and argument-derived parts."
+          "description": "Exact producer-side witnesses for tokens synthesized by `##` within this invocation, recorded in deterministic expansion order. Each witness records the final pasted spelling and an ordered replay segmentation tree containing argument slices and fixed literal spans."
         }
       },
       "dependentRequired": {
@@ -1300,8 +1300,39 @@ static constexpr const char *RefoldSchema = R"json(
           "type": "integer",
           "minimum": 0,
           "description": "Exclusive byte offset of this part within the final pasted token spelling."
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "arg",
+            "literal"
+          ],
+          "description": "Part discriminator. arg means the bytes came from a macro argument token; literal means the bytes are fixed replacement-list text participating in the paste."
+        },
+        "spelling": {
+          "type": "string",
+          "description": "Exact bytes contributed by this part to the final pasted token spelling."
+        },
+        "arg_byte_begin": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "For arg parts, begin byte offset within the invocation argument spelling that supplied this part. Omitted when the producer cannot prove a direct argument-source slice."
+        },
+        "arg_byte_end": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "For arg parts, end byte offset within the invocation argument spelling that supplied this part. Omitted when the producer cannot prove a direct argument-source slice."
         }
-      }
+      },
+      "dependentRequired": {
+        "arg_byte_begin": [
+          "arg_byte_end"
+        ],
+        "arg_byte_end": [
+          "arg_byte_begin"
+        ]
+      },
+      "description": "One ordered segment of an exact pasted-token replay. Arg segments identify the formal argument and optional source slice; literal segments identify fixed replacement-list bytes such as delimiter tokens."
     },
     "PasteToken": {
       "type": "object",
@@ -1317,7 +1348,7 @@ static constexpr const char *RefoldSchema = R"json(
         },
         "parts": {
           "type": "array",
-          "description": "Ordered decomposition of the pasted token spelling into literal and argument-derived parts. Array order is the in-token left-to-right order.",
+          "description": "Ordered exact replay decomposition of the pasted token spelling. The segments tile the final token byte range from left to right and include both argument-derived slices and fixed literal/delimiter spans.",
           "items": {
             "$ref": "#/$defs/PastePart"
           }
