@@ -849,7 +849,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
         "TU include-closure accepted: includes=[{0},{1}] source=[{2},{3}) A=[{4},{5}) B=[{6},{7}) evidence={8} raw='{9}' padded='{10}'",
         first->id, last->id, first->siteB, closureSourceEnd, coverBegin,
         coverEnd, bEnvelope->first, bEnvelope->second,
-        FormatIncludeRealizationEvidenceKind(evidenceKind),
+        evidenceKind,
         stringutils::showWSWithClip(rawReplacement, 120),
         stringutils::showWSWithClip(padded, 120));
 
