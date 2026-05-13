@@ -907,6 +907,191 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       const RefoldModel::MacroInvocation *child = nullptr;
     };
 
+    auto sortChildren = [](SmallVectorImpl<ChildPiece> &children) {
+      llvm::sort(children, [](const ChildPiece &lhs, const ChildPiece &rhs) {
+        if (lhs.begin != rhs.begin)
+          return lhs.begin < rhs.begin;
+        if (lhs.end != rhs.end)
+          return lhs.end < rhs.end;
+        return lhs.child->id < rhs.child->id;
+      });
+    };
+
+    auto sourceRangeIsTiledByNeutralNestedMacros =
+        [&](uint64_t begin, uint64_t end, StringRef rangeFile) -> bool {
+      if (begin > end)
+        return false;
+
+      SmallVector<ChildPiece, 8> children;
+      for (const auto &candidate : model_.GetMacroInvocations()) {
+        if (!candidate.callerMacroId || *candidate.callerMacroId != m.id)
+          continue;
+
+        // The range can be either the defining directive's replacement list or
+        // the invocation argument text in this materialized header.  Only
+        // nested invocations physically spelled in that same source range are
+        // allowed to account for non-trivia bytes.
+        if (!candidate.invFile || candidate.invFile->empty() ||
+            !PathsEqual(*candidate.invFile, rangeFile))
+          continue;
+        if (!candidate.invB || !candidate.invE ||
+            *candidate.invB >= *candidate.invE)
+          continue;
+        if (*candidate.invB < begin || end < *candidate.invE)
+          continue;
+
+        children.push_back({*candidate.invB, *candidate.invE, &candidate});
+      }
+
+      sortChildren(children);
+
+      uint64_t cursor = begin;
+      for (const ChildPiece &piece : children) {
+        if (piece.begin < cursor)
+          return false;
+
+        StringRef gap;
+        if (PathsEqual(rangeFile, replacement->directive->sitePath)) {
+          if (cursor < replacement->fileBase || piece.begin < cursor ||
+              piece.begin > replacement->fileBase +
+                                replacement->directive->text.size())
+            return false;
+          const size_t gapBegin =
+              static_cast<size_t>(cursor - replacement->fileBase);
+          const size_t gapEnd =
+              static_cast<size_t>(piece.begin - replacement->fileBase);
+          gap = replacement->directive->text.slice(gapBegin, gapEnd);
+        } else if (PathsEqual(rangeFile, file)) {
+          if (piece.begin > headerText.size())
+            return false;
+          gap = StringRef(headerText).slice(cursor, piece.begin);
+        } else {
+          return false;
+        }
+
+        if (!isWsOrCompleteCommentTrivia(gap))
+          return false;
+        if (!headerMacroInvocationIsSourceNeutralZeroTokenImpl(*piece.child,
+                                                              visiting))
+          return false;
+        cursor = piece.end;
+      }
+
+      StringRef suffix;
+      if (PathsEqual(rangeFile, replacement->directive->sitePath)) {
+        if (cursor < replacement->fileBase || end < cursor ||
+            end > replacement->fileBase + replacement->directive->text.size())
+          return false;
+        const size_t suffixBegin =
+            static_cast<size_t>(cursor - replacement->fileBase);
+        const size_t suffixEnd =
+            static_cast<size_t>(end - replacement->fileBase);
+        suffix = replacement->directive->text.slice(suffixBegin, suffixEnd);
+      } else if (PathsEqual(rangeFile, file)) {
+        if (end > headerText.size())
+          return false;
+        suffix = StringRef(headerText).slice(cursor, end);
+      } else {
+        return false;
+      }
+
+      return isWsOrCompleteCommentTrivia(suffix);
+    };
+
+    StringRef replacementText =
+        replacement->directive->text.substr(replacement->replacementTextBegin);
+
+    // A literal empty replacement list is source-neutral.
+    if (isWsOrCompleteCommentTrivia(replacementText))
+      return finish(true);
+
+    // First try the definition-site proof that existed for wrappers such as
+    // `#define WRAP_EMPTY() EMPTY()`: every non-trivia byte in the replacement
+    // list must be covered by a nested macro invocation that recursively proves
+    // zero-token neutrality.  The formal-parameter proof below is an additional
+    // admissible case, not a replacement for this one.
+    if (sourceRangeIsTiledByNeutralNestedMacros(replacement->fileBegin,
+                                                replacement->fileEnd,
+                                                replacement->directive->sitePath))
+      return finish(true);
+
+    if (m.subkind == "func") {
+      if (m.defParams.empty() || m.invArgRanges.size() < m.defParams.size())
+        return finish(false);
+
+      DenseMap<StringRef, unsigned> paramIndexByName;
+      for (unsigned i = 0, e = m.defParams.size(); i != e; ++i) {
+        // Variadic substitution is deliberately outside this proof.  It can
+        // introduce separators and empty/non-empty distinctions that are not
+        // represented by this simple per-formal range check.
+        if (m.defParams[i].variadic)
+          return finish(false);
+        paramIndexByName.try_emplace(m.defParams[i].name, i);
+      }
+
+      SmallVector<unsigned, 4> usedParams;
+      StringRef text = replacement->directive->text;
+      size_t pos = replacement->replacementTextBegin;
+      while (pos < text.size()) {
+        if (stringutils::isWs(text[pos])) {
+          ++pos;
+          continue;
+        }
+
+        StringRef tail = text.substr(pos);
+        if (tail.starts_with("/*")) {
+          const size_t commentEnd = text.find("*/", pos + 2);
+          if (commentEnd == StringRef::npos)
+            return finish(false);
+          pos = commentEnd + 2;
+          continue;
+        }
+        if (tail.starts_with("//")) {
+          const size_t commentEnd = text.find('\n', pos + 2);
+          pos = commentEnd == StringRef::npos ? text.size() : commentEnd + 1;
+          continue;
+        }
+
+        // The only source-bearing replacement-list tokens admitted for a
+        // function-like zero-token wrapper are formal parameter names.  After
+        // substitution, each used argument must independently prove to be a
+        // zero-token source-neutral range.
+        if (!stringutils::isIdentStart(text[pos]))
+          return finish(false);
+        const size_t identBegin = pos++;
+        while (pos < text.size() && stringutils::isIdentPart(text[pos]))
+          ++pos;
+        StringRef ident = text.slice(identBegin, pos);
+        auto it = paramIndexByName.find(ident);
+        if (it == paramIndexByName.end())
+          return finish(false);
+        usedParams.push_back(it->second);
+      }
+
+      if (usedParams.empty())
+        return finish(false);
+
+      llvm::sort(usedParams);
+      usedParams.erase(std::unique(usedParams.begin(), usedParams.end()),
+                       usedParams.end());
+
+      for (unsigned argIdx : usedParams) {
+        const auto &range = m.invArgRanges[argIdx];
+        if (!range.first || !range.second || *range.first > *range.second)
+          return finish(false);
+        if (!m.invFile || m.invFile->empty())
+          return finish(false);
+        if (!sourceRangeIsTiledByNeutralNestedMacros(*range.first,
+                                                     *range.second, *m.invFile))
+          return finish(false);
+      }
+
+      return finish(true);
+    }
+
+    if (m.subkind != "obj")
+      return finish(false);
+
     SmallVector<ChildPiece, 8> children;
     for (const auto &candidate : model_.GetMacroInvocations()) {
       // Nested macro invocations are the only non-trivia source allowed in the
@@ -925,16 +1110,13 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       children.push_back({*candidate.invB, *candidate.invE, &candidate});
     }
 
+    if (children.empty())
+      return finish(false);
+
     // Tile the replacement list from left to right.  Sorting gives deterministic
     // overlap detection and ensures every byte between child invocations is
     // checked as trivia/comment-only source.
-    llvm::sort(children, [](const ChildPiece &lhs, const ChildPiece &rhs) {
-      if (lhs.begin != rhs.begin)
-        return lhs.begin < rhs.begin;
-      if (lhs.end != rhs.end)
-        return lhs.end < rhs.end;
-      return lhs.child->id < rhs.child->id;
-    });
+    sortChildren(children);
 
     uint64_t cursor = replacement->fileBegin;
     for (const ChildPiece &piece : children) {
