@@ -1870,6 +1870,140 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     return !needsLexicalSeparator(*leftTok, *rightTok, lexLang_);
   };
 
+  auto headerTextContainsDirectiveLine = [](StringRef text) {
+    // Carrying a macro-state directive across another preprocessing directive
+    // would require proving the intervening directive's own side effects. This
+    // helper is intentionally conservative: any physical line whose first
+    // non-horizontal-whitespace character is '#' makes the crossed header chunk
+    // observable and blocks the carry proof.
+    bool atLineStart = true;
+    bool onlyHorizontalWsOnLine = true;
+    for (char c : text) {
+      if (atLineStart) {
+        atLineStart = false;
+        onlyHorizontalWsOnLine = true;
+      }
+      if (c == '\n') {
+        atLineStart = true;
+        onlyHorizontalWsOnLine = true;
+        continue;
+      }
+      if (onlyHorizontalWsOnLine && stringutils::isNonNewlineWs(c))
+        continue;
+      if (onlyHorizontalWsOnLine && c == '#')
+        return true;
+      onlyHorizontalWsOnLine = false;
+    }
+    return false;
+  };
+
+  auto functionLikeInvocationStartsInHeaderChunk =
+      [&](StringRef name, StringRef chunk, StringRef following) {
+        if (name.empty() || chunk.empty())
+          return false;
+
+        // Lex the crossed chunk together with the immediately-following bytes
+        // so a function-like invocation split at the carry boundary is still
+        // observed. Only identifiers whose spelling starts inside `chunk` can
+        // make the crossed source depend on the carried definition; `following`
+        // exists solely to supply the possible '(' token after a trailing name.
+        const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
+        std::string lexBuf;
+        lexBuf.reserve(chunk.size() + following.size() + 1);
+        lexBuf.append(chunk.begin(), chunk.end());
+        lexBuf.append(following.begin(), following.end());
+        lexBuf.push_back('\0');
+
+        const char *bufStart = lexBuf.data();
+        const char *bufEnd = bufStart + chunk.size() + following.size();
+        Lexer lexer(baseLoc, lexLang_, bufStart, bufStart, bufEnd);
+        lexer.SetCommentRetentionState(true);
+
+        bool pendingChunkName = false;
+        Token token;
+        while (true) {
+          lexer.LexFromRawLexer(token);
+          if (token.is(tok::eof))
+            return false;
+          if (token.is(tok::comment))
+            continue;
+
+          if (pendingChunkName) {
+            if (token.is(tok::l_paren))
+              return true;
+            pendingChunkName = false;
+          }
+
+          if (!token.is(tok::raw_identifier) && !token.is(tok::identifier))
+            continue;
+
+          const size_t localBegin = tokenOffsetFromBase(token, baseLoc);
+          const size_t localEnd = tokenEndOffsetFromBase(token, baseLoc);
+          if (localEnd < localBegin || localEnd > chunk.size())
+            continue;
+
+          pendingChunkName =
+              StringRef(lexBuf).slice(localBegin, localEnd) == name;
+        }
+      };
+
+  auto headerSourceChunkObservesDefinitionWhenCrossed =
+      [&](const RefoldModel::MacroDirective &definition, StringRef macroName,
+          StringRef chunk, StringRef following) {
+        // Return true when moving `definition` from before `chunk` to after the
+        // replacement would change how the original crossed header bytes were
+        // preprocessed. In that case those bytes are part of the old proof
+        // state, so the directive must keep its original source order.
+        if (chunk.empty())
+          return false;
+        if (headerTextContainsDirectiveLine(chunk))
+          return true;
+
+        switch (headerMacroObservationKindForDirective(definition, macroName)) {
+        case HeaderMacroReplacementObservationKind::IdentifierToken:
+          return rawIdentifierAppearsInHeaderReplacement(macroName, chunk);
+        case HeaderMacroReplacementObservationKind::FunctionLikeInvocation:
+          return functionLikeInvocationStartsInHeaderChunk(macroName, chunk,
+                                                          following);
+        }
+        return true;
+      };
+
+  auto activeHeaderDefinitionAtByte =
+      [&](const RefoldModel::MacroDirective &definition, StringRef macroName,
+          uint64_t offset) {
+        // The carry proof applies only to the definition that is active at the
+        // replacement start. Re-emitting a shadowed definition after the B
+        // payload would synthesize a macro state that never existed at this
+        // point in the original header.
+        const RefoldModel::MacroDirective *active = nullptr;
+        uint64_t activeEnd = 0;
+        for (const auto &candidate : model_.GetMacroDirectives()) {
+          std::optional<HeaderMacroStateDirectivePiece> piece =
+              headerMacroStateDirectiveInterval(candidate);
+          if (!piece || piece->end > offset)
+            continue;
+          if (StringRef(piece->name) != macroName)
+            continue;
+          if (!active || piece->end > activeEnd ||
+              (piece->end == activeEnd && candidate.id > active->id)) {
+            active = &candidate;
+            activeEnd = piece->end;
+          }
+        }
+        return active == &definition && definition.subkind == "#define";
+      };
+
+  auto headerRangeOverlapsStagedEdit = [&](uint64_t begin, uint64_t end) {
+    // Do not carry directive text that is already being rewritten by another
+    // staged header edit. A directive can be moved only when its original bytes
+    // are still intact and owned by this single materialization proof.
+    for (const TextEdit &edit : plan.edits)
+      if (begin < edit.end && end > edit.start)
+        return true;
+    return false;
+  };
+
 
   auto tokenRangesHaveSameSpelling = [&](uint64_t aBegin, uint64_t aEnd,
                                            uint64_t bBegin, uint64_t bEnd) {
@@ -3087,6 +3221,157 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     // DELETE emits an empty replacement; INSERT and REPLACE both use the
     // B-derived patch payload carried by the IncludePatch.
     std::string replacement = isDelete ? "" : materialInsertBytes;
+
+    if (isReplace && startByte && endByte && *startByte <= *endByte &&
+        !replacement.empty() &&
+        replacementHeaderSuffixBoundaryAllowsDirectiveLine(
+            StringRef(replacement), *endByte)) {
+      struct HeaderMacroStateCarryCandidate {
+        const RefoldModel::MacroDirective *directive = nullptr;
+        HeaderMacroStateDirectivePiece piece;
+      };
+
+      // Collect active header-owned #define directives that currently precede
+      // this header-local replacement and that the B-derived replacement would
+      // observe if they stayed there.  Those are exactly the definitions whose
+      // source-order position must be reconsidered to make the replacement see
+      // B's macro state.
+      SmallVector<HeaderMacroStateCarryCandidate, 4> carryCandidates;
+      for (const auto &directive : model_.GetMacroDirectives()) {
+        if (directive.subkind != "#define")
+          continue;
+
+        std::optional<HeaderMacroStateDirectivePiece> piece =
+            headerMacroStateDirectiveInterval(directive);
+        if (!piece || piece->end > *startByte)
+          continue;
+        if (headerRangeOverlapsStagedEdit(piece->begin, piece->end))
+          continue;
+        if (!activeHeaderDefinitionAtByte(directive, piece->name, *startByte))
+          continue;
+        if (!headerReplacementObservesMacroStateDirective(
+                directive, StringRef(replacement),
+                /*unparseableObserves=*/false))
+          continue;
+
+        // Header materialization has the same placement-sensitive macro-state
+        // invariant as TU gap carry.  If an active #define remains before a
+        // header-local replacement, the replacement is preprocessed under the
+        // old macro state rather than B's macro state.  We may carry that
+        // definition after the replacement only when the crossed original
+        // header bytes do not themselves observe the definition; otherwise
+        // those bytes are part of the old zero-token proof and must keep the
+        // original source order.
+        if (headerSourceChunkObservesDefinitionWhenCrossed(
+                directive, piece->name,
+                StringRef(headerText).slice(piece->end, *startByte),
+                StringRef(headerText).slice(*startByte, *endByte)))
+          continue;
+
+        carryCandidates.push_back(HeaderMacroStateCarryCandidate{&directive,
+                                                                 *piece});
+      }
+
+      if (!carryCandidates.empty()) {
+        // Apply carries in source order so widening the replacement is
+        // deterministic and so each directive is removed from its original
+        // position exactly once before being re-emitted after the payload.
+        llvm::sort(carryCandidates,
+                   [](const HeaderMacroStateCarryCandidate &lhs,
+                      const HeaderMacroStateCarryCandidate &rhs) {
+                     if (lhs.piece.begin != rhs.piece.begin)
+                       return lhs.piece.begin < rhs.piece.begin;
+                     return lhs.directive->id < rhs.directive->id;
+                   });
+
+        bool admissibleCarry = true;
+        const uint64_t newStart = carryCandidates.front().piece.begin;
+        uint64_t cursor = newStart;
+        for (const HeaderMacroStateCarryCandidate &candidate : carryCandidates) {
+          if (cursor > candidate.piece.begin) {
+            admissibleCarry = false;
+            break;
+          }
+          StringRef crossed =
+              StringRef(headerText).slice(cursor, candidate.piece.begin);
+          StringRef following =
+              StringRef(headerText).slice(candidate.piece.begin, *startByte);
+          // Once an earlier definition is carried, every byte crossed before
+          // the next carried directive must remain non-observing for that prior
+          // definition.  This keeps multi-directive carries from silently moving
+          // a macro past source that depended on the old ordering.
+          for (const HeaderMacroStateCarryCandidate &prior : carryCandidates) {
+            if (prior.piece.end <= cursor)
+              continue;
+            if (prior.piece.begin >= candidate.piece.begin)
+              break;
+            if (headerSourceChunkObservesDefinitionWhenCrossed(
+                    *prior.directive, prior.piece.name, crossed, following)) {
+              admissibleCarry = false;
+              break;
+            }
+          }
+          if (!admissibleCarry)
+            break;
+          cursor = candidate.piece.end;
+        }
+
+        if (admissibleCarry) {
+          std::string carriedReplacement;
+          carriedReplacement.reserve((*startByte - newStart) +
+                                     replacement.size() + 64);
+
+          // Rebuild the widened header edit as:
+          //   preserved bytes before carried directives,
+          //   B-derived replacement payload,
+          //   carried #define directive lines.
+          // The directive bytes are intentionally omitted from their original
+          // locations and appended after the payload so the payload is not
+          // macro-expanded by definitions that B did not have active there.
+          cursor = newStart;
+          for (const HeaderMacroStateCarryCandidate &candidate :
+               carryCandidates) {
+            if (cursor > candidate.piece.begin) {
+              admissibleCarry = false;
+              break;
+            }
+            carriedReplacement.append(headerText.begin() + cursor,
+                                      headerText.begin() + candidate.piece.begin);
+            cursor = candidate.piece.end;
+          }
+
+          if (admissibleCarry) {
+            carriedReplacement.append(headerText.begin() + cursor,
+                                      headerText.begin() + *startByte);
+            carriedReplacement += replacement;
+            if (!carriedReplacement.empty() &&
+                carriedReplacement.back() != '\n')
+              carriedReplacement.push_back('\n');
+            for (const HeaderMacroStateCarryCandidate &candidate :
+                 carryCandidates) {
+              carriedReplacement.append(candidate.directive->text.begin(),
+                                        candidate.directive->text.end());
+              if (carriedReplacement.empty() ||
+                  carriedReplacement.back() != '\n')
+                carriedReplacement.push_back('\n');
+            }
+
+            trace("include/apply",
+                  "file={0} patch[{1}] carried {2} active header #define "
+                  "directive(s) after replacement bytes=[{3},{4}) -> "
+                  "[{5},{6})",
+                  file, idx, carryCandidates.size(), *startByte, *endByte,
+                  newStart, *endByte);
+
+            *startByte = newStart;
+            replacement = std::move(carriedReplacement);
+            mappedHeaderWitness.hasByteRange = true;
+            mappedHeaderWitness.startByte = *startByte;
+            mappedHeaderWitness.endByte = *endByte;
+          }
+        }
+      }
+    }
 
     if (!headerGapPreservations.empty()) {
       // Emit preserved gap pieces after the B-derived payload. That keeps
