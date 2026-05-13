@@ -1836,6 +1836,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     std::optional<uint64_t> endByte;
     IncludeAnchorWitness mappedHeaderWitness;
     SmallVector<HeaderPreservedGapPiece, 4> headerGapPreservations;
+    std::optional<SourceLineDirectiveGapResume> headerSourceLineDirectiveResume;
     bool usedFullHeaderEnvelope = false;
 
     const auto &tokmapByPP = model_.GetTokmapByPP();
@@ -2463,6 +2464,18 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         if (sourceEnvelope) {
           if (!proveOwnerSourceEnvelopeGaps(
                   hunkSourcePieces, [&](uint64_t gapBegin, uint64_t gapEnd) {
+                if (std::optional<SourceLineDirectiveGapResume> lineResume =
+                        computeSourceLineDirectiveGapResume(
+                            StringRef(headerText), gapBegin, gapEnd,
+                            sourceEnvelope->end, file)) {
+                  // Header full-envelope widening uses the same owner-piece gap
+                  // proof as TU/include closure.  A source-spelled #line gap is
+                  // not disposable trivia, but it is preservable by carrying its
+                  // net line state forward to the untouched header suffix.
+                  headerSourceLineDirectiveResume = std::move(lineResume);
+                  return true;
+                }
+
                 SmallVector<HeaderPreservedGapPiece, 4> gapPieces;
                 for (const auto &directive : model_.GetMacroDirectives()) {
                   std::optional<HeaderMacroStateDirectivePiece> directivePiece =
@@ -2565,8 +2578,30 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         }
 
         if (sourceEnvelope) {
+          auto canEmitLineDirectiveBeforeHeaderTail = [&](uint64_t pos) -> bool {
+            if (pos >= headerText.size())
+              return true;
+            if (stringutils::isBOL(StringRef(headerText), static_cast<size_t>(pos)))
+              return true;
+
+            size_t lineStart = static_cast<size_t>(pos);
+            while (lineStart > 0 && headerText[lineStart - 1] != '\n')
+              --lineStart;
+            return stringutils::isIndentOnly(StringRef(headerText), lineStart,
+                                             static_cast<size_t>(pos));
+          };
+
+          const bool hasHeaderSuffixAfterSourceLineDirective =
+              headerSourceLineDirectiveResume &&
+              sourceEnvelope->end < headerText.size();
+          const bool canRestoreSourceLineState =
+              !headerSourceLineDirectiveResume ||
+              (!hasHeaderSuffixAfterSourceLineDirective ||
+               (lineDirs_.Enabled() && !isDelete &&
+                canEmitLineDirectiveBeforeHeaderTail(sourceEnvelope->end)));
+
           if (sourceEnvelope->begin <= *startByte &&
-              *endByte <= sourceEnvelope->end &&
+              *endByte <= sourceEnvelope->end && canRestoreSourceLineState &&
               replacementHeaderSuffixBoundaryAllowsDirectiveLine(
                   StringRef(materialInsertBytes), sourceEnvelope->end)) {
             startByte = sourceEnvelope->begin;
@@ -2628,6 +2663,22 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       }
     }
 
+    const bool emitsHeaderSourceLineDirectiveResume =
+        lineDirs_.Enabled() && usedFullHeaderEnvelope &&
+        headerSourceLineDirectiveResume && *endByte < fileLen;
+    if (emitsHeaderSourceLineDirectiveResume) {
+      if (!replacement.empty() && replacement.back() != '\n')
+        replacement.push_back('\n');
+      replacement += lineDirs_.FormatLineDirective(
+          headerSourceLineDirectiveResume->lineAtResume,
+          headerSourceLineDirectiveResume->fileSpelling);
+      trace("include/apply",
+            "file={0} patch[{1}] emitted source #line resume line={2} "
+            "resumeFile={3}",
+            file, idx, headerSourceLineDirectiveResume->lineAtResume,
+            headerSourceLineDirectiveResume->fileSpelling);
+    }
+
     if (inTraceMode()) {
       StringRef opKind =
           isInsert ? "INSERT" : (isDelete ? "DELETE" : "REPLACE");
@@ -2669,8 +2720,11 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
 
     // Stage the include-preserving mapped-header edit and attach the witness
     // that records which PP tokens and header bytes justified the edit range.
-    TextEdit edit = MakeTextEditWithResyncOrPending(
-        headerText, *startByte, *endByte, replacement, file);
+    TextEdit edit = emitsHeaderSourceLineDirectiveResume
+                        ? TextEdit{*startByte, *endByte, std::move(replacement),
+                                   std::nullopt, std::nullopt, {}}
+                        : MakeTextEditWithResyncOrPending(
+                              headerText, *startByte, *endByte, replacement, file);
     AttachAcceptedResultCarrier(
         edit, BuildAcceptedIncludeCandidate(
                   AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens, p,

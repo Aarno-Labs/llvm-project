@@ -262,6 +262,194 @@ static bool startsWithPreprocessorDirectiveTrivia(StringRef text) {
   return rest.starts_with("#");
 }
 
+
+struct SourceLineDirectiveGapResume {
+  size_t lineAtResume = 0;
+  std::string fileSpelling;
+};
+
+/// Parse one source-spelled `#line` directive line.
+///
+/// The refold map does not currently record `#line` as a first-class artifact,
+/// because it contributes no ordinary PP tokens.  Mixed source-envelope proofs
+/// therefore recover this narrow directive shape directly from the source bytes
+/// when a `#line` line lies between otherwise required owner pieces.
+///
+/// This parser is intentionally stricter than the general preprocessor grammar:
+/// it accepts only a complete physical `#line <digits> ["file"]` line with
+/// optional horizontal whitespace.  Macro-dependent or line-spliced directive
+/// spellings remain outside this proof class.
+static std::optional<LineDirectiveState>
+parseSourceLineDirectiveLine(StringRef line, StringRef currentFileSpelling) {
+  if (line.ends_with("\n"))
+    line = line.drop_back();
+  if (line.ends_with("\r"))
+    line = line.drop_back();
+
+  if (line.rtrim(" \t\v\f").ends_with("\\"))
+    return std::nullopt;
+
+  StringRef rest = line.ltrim(" \t\v\f");
+  if (!rest.consume_front("#"))
+    return std::nullopt;
+  rest = rest.ltrim(" \t\v\f");
+  if (!rest.consume_front("line"))
+    return std::nullopt;
+  if (!rest.empty() && stringutils::isIdentPart(rest.front()))
+    return std::nullopt;
+  if (rest.empty() || !stringutils::isWs(rest.front()))
+    return std::nullopt;
+  rest = rest.ltrim(" \t\v\f");
+
+  StringRef digits = rest.take_while([](char c) { return '0' <= c && c <= '9'; });
+  if (digits.empty())
+    return std::nullopt;
+
+  size_t lineAfterDirective = 0;
+  if (digits.getAsInteger(10, lineAfterDirective) || lineAfterDirective == 0)
+    return std::nullopt;
+  rest = rest.drop_front(digits.size()).ltrim(" \t\v\f");
+
+  std::string fileSpelling = currentFileSpelling.str();
+  if (!rest.empty()) {
+    if (!rest.consume_front("\""))
+      return std::nullopt;
+
+    fileSpelling.clear();
+    bool closedQuote = false;
+    while (!rest.empty()) {
+      char ch = rest.front();
+      rest = rest.drop_front();
+      if (ch == '\"') {
+        closedQuote = true;
+        break;
+      }
+      if (ch == '\\') {
+        if (rest.empty())
+          return std::nullopt;
+        ch = rest.front();
+        rest = rest.drop_front();
+      }
+      fileSpelling.push_back(ch);
+    }
+    if (!closedQuote)
+      return std::nullopt;
+    if (!rest.trim(" \t\v\f").empty())
+      return std::nullopt;
+  }
+
+  return LineDirectiveState(fileSpelling, lineAfterDirective, 0);
+}
+
+/// Prove that a source gap is made only of trivia plus complete source-spelled
+/// `#line` directives, and compute the logical file/line state at `resumeOffset`.
+///
+/// The returned directive state is the state that must be re-established before
+/// the untouched suffix beginning at `resumeOffset` is copied.  Counting continues
+/// from the last accepted `#line` directive through the consumed source interval,
+/// so a directive before a consumed include line is rewritten to the line that the
+/// suffix would have observed after that include line had executed.
+static std::optional<SourceLineDirectiveGapResume>
+computeSourceLineDirectiveGapResume(StringRef fileText, uint64_t gapBegin,
+                                    uint64_t gapEnd, uint64_t resumeOffset,
+                                    StringRef defaultFileSpelling) {
+  if (gapBegin >= gapEnd || gapEnd > fileText.size() ||
+      resumeOffset < gapEnd || resumeOffset > fileText.size())
+    return std::nullopt;
+
+  uint64_t cursor = gapBegin;
+  bool atLineStart = stringutils::beginsLineAfterWs(fileText, gapBegin);
+  bool sawLineDirective = false;
+  size_t lastLineAfterDirective = 0;
+  uint64_t lastAfterDirectiveOffset = gapBegin;
+  std::string currentFileSpelling = defaultFileSpelling.str();
+
+  auto skipCompleteComment = [&](uint64_t &pos) -> bool {
+    if (pos + 1 >= gapEnd || fileText[pos] != '/')
+      return false;
+
+    if (fileText[pos + 1] == '*') {
+      const uint64_t before = pos;
+      pos += 2;
+      bool closed = false;
+      while (pos + 1 < gapEnd) {
+        if (fileText[pos] == '*' && fileText[pos + 1] == '/') {
+          pos += 2;
+          closed = true;
+          break;
+        }
+        ++pos;
+      }
+      if (!closed)
+        return false;
+      StringRef skipped = fileText.slice(before, pos);
+      atLineStart = skipped.ends_with("\n") || skipped.ends_with("\r");
+      return true;
+    }
+
+    if (fileText[pos + 1] == '/') {
+      pos += 2;
+      while (pos < gapEnd && fileText[pos] != '\n' && fileText[pos] != '\r')
+        ++pos;
+      if (pos < gapEnd)
+        ++pos;
+      atLineStart = true;
+      return true;
+    }
+
+    return false;
+  };
+
+  while (cursor < gapEnd) {
+    char ch = fileText[cursor];
+    if (stringutils::isWs(ch)) {
+      // Horizontal indentation before a directive is still directive-line
+      // prefix, while a physical newline starts a fresh directive line.
+      if (ch == '\n' || ch == '\r')
+        atLineStart = true;
+      ++cursor;
+      continue;
+    }
+
+    if (ch == '/') {
+      if (!skipCompleteComment(cursor))
+        return std::nullopt;
+      continue;
+    }
+
+    if (ch != '#' || !atLineStart)
+      return std::nullopt;
+
+    uint64_t lineEnd = cursor;
+    while (lineEnd < gapEnd && fileText[lineEnd] != '\n')
+      ++lineEnd;
+    const bool hasNewline = lineEnd < gapEnd;
+    const uint64_t afterLine = hasNewline ? lineEnd + 1 : lineEnd;
+
+    std::optional<LineDirectiveState> state =
+        parseSourceLineDirectiveLine(fileText.slice(cursor, lineEnd),
+                                     currentFileSpelling);
+    if (!state)
+      return std::nullopt;
+
+    sawLineDirective = true;
+    currentFileSpelling = state->fileSpelling;
+    lastLineAfterDirective = state->lineAfterDir;
+    lastAfterDirectiveOffset = afterLine;
+    cursor = afterLine;
+    atLineStart = true;
+  }
+
+  if (!sawLineDirective)
+    return std::nullopt;
+
+  const size_t delta = stringutils::countNonSplicedNewlines(
+      fileText, static_cast<size_t>(lastAfterDirectiveOffset),
+      static_cast<size_t>(resumeOffset));
+  return SourceLineDirectiveGapResume{lastLineAfterDirective + delta,
+                                      std::move(currentFileSpelling)};
+}
+
 std::string RefoldEngine::FormatExpansionClosureWitness(
     const ExpansionClosureWitness &witness) const {
   // Keep fallback-witness logging compact and mechanically comparable so the
@@ -2226,6 +2414,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   };
 
   std::string mixedPreservedConditionalControlTrivia;
+  std::optional<SourceLineDirectiveGapResume> mixedSourceLineDirectiveResume;
 
   // Prove a mixed TU/include closure.
   //
@@ -2687,6 +2876,24 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
                       /*allowTUConditionalControl=*/true))
                 return true;
 
+              if (std::optional<SourceLineDirectiveGapResume> lineResume =
+                      computeSourceLineDirectiveGapResume(
+                          tuBytes, gapBegin, gapEnd, sourceEnd, tuPath)) {
+                // A source-spelled #line directive contributes no PP tokens, but
+                // it is not disposable trivia: it changes the presumed file/line
+                // state for the untouched suffix.  Admit the gap only by carrying
+                // a replacement-local resync that restores the state observed
+                // after the whole consumed source envelope.
+                mixedSourceLineDirectiveResume = std::move(lineResume);
+                trace("fallback",
+                      "TU/include closure preserving source #line state from "
+                      "gap=[{0},{1}) resumeLine={2} file={3}",
+                      gapBegin, gapEnd,
+                      mixedSourceLineDirectiveResume->lineAtResume,
+                      mixedSourceLineDirectiveResume->fileSpelling);
+                return true;
+              }
+
               if (std::optional<std::string> pragmaReason =
                       nonConsumableTUPragmaGapReason(gapBegin, gapEnd)) {
                 trace("fallback", "TU/include closure rejected: {0}",
@@ -2701,6 +2908,43 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
               return false;
             }))
       return std::nullopt;
+
+    auto canEmitLineDirectiveBeforeOriginalTail = [&](uint64_t pos) -> bool {
+      if (pos >= tuBytes.size())
+        return true;
+      if (stringutils::isBOL(tuBytes, static_cast<size_t>(pos)))
+        return true;
+
+      size_t lineStart = static_cast<size_t>(pos);
+      while (lineStart > 0 && tuBytes[lineStart - 1] != '\n')
+        --lineStart;
+      return stringutils::isIndentOnly(tuBytes, lineStart, static_cast<size_t>(pos));
+    };
+
+    if (mixedSourceLineDirectiveResume && !lineDirs_.Enabled() &&
+        sourceEnd < tuBytes.size()) {
+      trace("fallback",
+            "TU/include closure rejected: source #line gap needs enabled "
+            "line directives to preserve the untouched suffix");
+      return std::nullopt;
+    }
+
+    if (lineDirs_.Enabled() && mixedSourceLineDirectiveResume &&
+        h.isDeleteOnly()) {
+      trace("fallback",
+            "TU/include closure rejected: delete-only source #line gap needs "
+            "an explicit resync payload");
+      return std::nullopt;
+    }
+
+    if (lineDirs_.Enabled() && mixedSourceLineDirectiveResume &&
+        !canEmitLineDirectiveBeforeOriginalTail(sourceEnd)) {
+      trace("fallback",
+            "TU/include closure rejected: source #line state from consumed "
+            "gap cannot be restored before non-BOL suffix at source={0}",
+            sourceEnd);
+      return std::nullopt;
+    }
 
     trace("fallback",
           "TU/include closure source interval accepted: source=[{0},{1}) "
@@ -2922,6 +3166,26 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       static_cast<size_t>(closureSourceEnd), std::move(replacement),
       /*allowLeft=*/true, /*allowRight=*/true);
 
+  const bool emitsSourceLineDirectiveResume =
+      lineDirs_.Enabled() && mixedSourceLineDirectiveResume &&
+      sourceEnd < tuBytes.size();
+  if (emitsSourceLineDirectiveResume) {
+    // The consumed source envelope contained a source-spelled #line directive.
+    // Re-emit only its net state, adjusted through the consumed envelope, so the
+    // untouched suffix observes the same presumed file/line as it did in the
+    // original source.  This explicit resync supersedes the usual physical
+    // newline-drift compensation below.
+    if (!padded.empty() && padded.back() != '\n')
+      padded.push_back('\n');
+    padded += lineDirs_.FormatLineDirective(
+        mixedSourceLineDirectiveResume->lineAtResume,
+        mixedSourceLineDirectiveResume->fileSpelling);
+    trace("fallback",
+          "TU/include closure emitted source #line resume line={0} file={1}",
+          mixedSourceLineDirectiveResume->lineAtResume,
+          mixedSourceLineDirectiveResume->fileSpelling);
+  }
+
   // This closure class replaces only a contiguous run of top-level include
   // directives plus admitted inert trivia between them. Preserve the original
   // physical line count of the replaced source so the untouched suffix can
@@ -2932,7 +3196,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   const size_t origNl =
       stringutils::countNewlines(tuBytes, sourceBegin, closureSourceEnd);
   const size_t initialReplNl = stringutils::countNewlines(padded);
-  if (origNl > initialReplNl) {
+  if (!emitsSourceLineDirectiveResume && origNl > initialReplNl) {
     size_t remainingPadNl = origNl - initialReplNl;
 
     // Return true when the source interval overlaps a spelled include directive
@@ -3039,8 +3303,10 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
         stringutils::showWsWithClip(rawReplacement, 120),
         stringutils::showWsWithClip(padded, 120));
 
-  ResyncOutcome ro = ApplyResyncOrPend(tuBytes, sourceBegin, closureSourceEnd,
-                                       padded, tuPath);
+  ResyncOutcome ro = emitsSourceLineDirectiveResume
+                         ? ResyncOutcome(padded, std::nullopt)
+                         : ApplyResyncOrPend(tuBytes, sourceBegin,
+                                             closureSourceEnd, padded, tuPath);
   TextEdit edit{sourceBegin,           closureSourceEnd, std::move(ro.text),
                 std::move(ro.pending), std::nullopt,     {}};
 
