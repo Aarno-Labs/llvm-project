@@ -1060,24 +1060,144 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     return includeHasRecordedSideEffectsImpl(inc, visiting);
   };
 
+  // Return true iff the macro definition is a plain empty-replacement-list
+  // #define.  This deliberately does not admit every macro invocation that
+  // happens to produce no PP tokens: a non-empty replacement list could contain
+  // preprocessing side effects such as _Pragma.  Empty replacement lists are
+  // source-neutral by construction, so a complete callsite inside the closure
+  // envelope may be consumed with the replaced source interval.
+  auto macroDefinitionHasEmptyReplacementList =
+      [&](const RefoldModel::MacroInvocation &m) -> bool {
+    if (!m.definitionDirectiveId)
+      return false;
+
+    const RefoldModel::MacroDirective *definition = nullptr;
+    for (const auto &directive : model_.GetMacroDirectives())
+      if (directive.id == *m.definitionDirectiveId) {
+        definition = &directive;
+        break;
+      }
+
+    if (!definition || definition->subkind != "#define")
+      return false;
+
+    auto isHorizontalWS = [](char ch) {
+      return ch == ' ' || ch == '\t' || ch == '\v' || ch == '\f';
+    };
+    auto isIdentifierContinue = [](char ch) {
+      return ch == '_' || ('a' <= ch && ch <= 'z') ||
+             ('A' <= ch && ch <= 'Z') || ('0' <= ch && ch <= '9');
+    };
+    auto skipHorizontalWS = [&](StringRef text, size_t &pos) {
+      while (pos < text.size() && isHorizontalWS(text[pos]))
+        ++pos;
+    };
+
+    StringRef text = definition->text;
+    size_t pos = 0;
+    skipHorizontalWS(text, pos);
+    if (pos >= text.size() || text[pos] != '#')
+      return false;
+    ++pos;
+    skipHorizontalWS(text, pos);
+    if (!text.substr(pos).starts_with("define"))
+      return false;
+    pos += StringRef("define").size();
+    if (pos < text.size() && isIdentifierContinue(text[pos]))
+      return false;
+    skipHorizontalWS(text, pos);
+
+    if (!text.substr(pos).starts_with(m.name))
+      return false;
+    pos += m.name.size();
+    if (pos < text.size() && isIdentifierContinue(text[pos]))
+      return false;
+
+    if (m.subkind == "func") {
+      // Function-like macro definitions require the parameter list to start
+      // immediately after the name.  Skip the balanced parameter list, then
+      // require the replacement list to be only trivia.
+      if (pos >= text.size() || text[pos] != '(')
+        return false;
+      unsigned depth = 0;
+      while (pos < text.size()) {
+        char ch = text[pos++];
+        if (ch == '(') {
+          ++depth;
+          continue;
+        }
+        if (ch == ')') {
+          if (depth == 0)
+            return false;
+          --depth;
+          if (depth == 0)
+            break;
+        }
+      }
+      if (depth != 0)
+        return false;
+    }
+
+    return isWhitespaceOrCompleteCommentTrivia(text.substr(pos));
+  };
+
+  // Return true iff this invocation contributed no A-side PP material.  Such a
+  // callsite is source structure rather than token material for the current
+  // hunk; if the complete invocation lies inside a proved replacement envelope,
+  // the envelope may consume it just like a zero-token include gap.
+  auto macroInvocationHasMaterializedPPTokens =
+      [&](const RefoldModel::MacroInvocation &m) -> bool {
+    if (m.cover.IsValid())
+      return true;
+    for (const auto &span : m.stringifySpans)
+      if (span.IsValid())
+        return true;
+    for (const auto &span : m.pasteSpans)
+      if (span.IsValid())
+        return true;
+    return false;
+  };
+
+  // Return true iff the macro invocation is a complete zero-token TU callsite
+  // inside the candidate replacement envelope.  Partial overlaps remain
+  // non-refoldable here because deleting only part of a macro call would not be
+  // a proved source closure.
+  auto macroInvocationIsConsumableZeroTokenGap =
+      [&](const RefoldModel::MacroInvocation &m, uint64_t begin,
+          uint64_t end) -> bool {
+    if (m.invFile && !m.invFile->empty() && !PathsEqual(*m.invFile, tuPath))
+      return false;
+    if (!m.invB || !m.invE || *m.invB >= *m.invE)
+      return false;
+    if (*m.invB < begin || end < *m.invE)
+      return false;
+    return !macroInvocationHasMaterializedPPTokens(m) &&
+           macroDefinitionHasEmptyReplacementList(m);
+  };
+
   // Prove that a source gap inside the replacement envelope consists only of
-  // whitespace plus complete unrelated include trees whose own expansions are
-  // empty and whose recorded structure is either absent or limited to
-  // source-neutral control structure, nested zero-token includes, and
-  // consumable macro-state directives.
+  // whitespace plus complete source-neutral artifacts: zero-token include trees
+  // and invocations of empty-replacement-list macros.
   //
-  // Such an include has no PP tokens, so token overlap alone cannot make it a
-  // touched include.  If it lies physically between required source pieces of a
-  // proved closure, however, it is part of the source interval being replaced.
-  // We therefore consume it with the closure; preserving it before or after the
-  // B-side material would move a directive across the edit boundary and would
-  // describe a different source-order program.
-  auto gapIsConsumableEmptyIncludeClosure = [&](uint64_t gapBegin,
-                                               uint64_t gapEnd) -> bool {
+  // These artifacts have no PP tokens, so token overlap alone cannot make them
+  // part of the touched hunk.  If they lie physically between required source
+  // pieces of a proved closure, however, they are inside the source interval
+  // being replaced.  We therefore consume them with the closure; preserving
+  // them before or after the B-side material would move source structure across
+  // the edit boundary and would describe a different source-order program.
+  auto gapIsConsumableZeroTokenSourceClosure = [&](uint64_t gapBegin,
+                                                  uint64_t gapEnd) -> bool {
     if (gapBegin >= gapEnd || gapEnd > tuBytes.size())
       return false;
 
-    SmallVector<const RefoldModel::IncludeItem *, 4> emptyIncludes;
+    struct GapPiece {
+      uint64_t begin;
+      uint64_t end;
+      uint64_t id;
+      StringRef kind;
+    };
+
+    SmallVector<GapPiece, 8> pieces;
     for (const auto &inc : model_.GetIncludes()) {
       if (!PathsEqual(inc.sitePath, tuPath) || includeIsTouched(inc))
         continue;
@@ -1085,34 +1205,47 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
         continue;
       if (gapBegin <= inc.siteB && inc.siteE <= gapEnd &&
           inc.siteB < inc.siteE)
-        emptyIncludes.push_back(&inc);
+        pieces.push_back({inc.siteB, inc.siteE, inc.id, "include"});
     }
 
-    if (emptyIncludes.empty())
+    for (const auto &m : model_.GetMacroInvocations())
+      if (macroInvocationIsConsumableZeroTokenGap(m, gapBegin, gapEnd))
+        pieces.push_back({*m.invB, *m.invE, m.id, "macro"});
+
+    if (pieces.empty())
       return false;
 
-    llvm::sort(emptyIncludes, [](const RefoldModel::IncludeItem *lhs,
-                                 const RefoldModel::IncludeItem *rhs) {
-      if (lhs->siteB != rhs->siteB)
-        return lhs->siteB < rhs->siteB;
-      return lhs->id < rhs->id;
+    llvm::sort(pieces, [](const GapPiece &lhs, const GapPiece &rhs) {
+      if (lhs.begin != rhs.begin)
+        return lhs.begin < rhs.begin;
+      if (lhs.end != rhs.end)
+        return lhs.end < rhs.end;
+      if (lhs.kind != rhs.kind)
+        return lhs.kind < rhs.kind;
+      return lhs.id < rhs.id;
     });
 
     uint64_t cursor = gapBegin;
-    for (const RefoldModel::IncludeItem *inc : emptyIncludes) {
-      if (inc->siteB < cursor)
+    uint64_t includeCount = 0;
+    uint64_t macroCount = 0;
+    for (const GapPiece &piece : pieces) {
+      if (piece.begin < cursor)
         return false;
-      if (!stringutils::isWhitespace(tuBytes.slice(cursor, inc->siteB)))
+      if (!stringutils::isWhitespace(tuBytes.slice(cursor, piece.begin)))
         return false;
-      cursor = inc->siteE;
+      cursor = piece.end;
+      if (piece.kind == "include")
+        ++includeCount;
+      else
+        ++macroCount;
     }
     if (!stringutils::isWhitespace(tuBytes.slice(cursor, gapEnd)))
       return false;
 
     trace("fallback",
-          "TU/include closure consuming zero-token include source gap "
-          "source=[{0},{1}) includes={2}",
-          gapBegin, gapEnd, emptyIncludes.size());
+          "TU/include closure consuming zero-token source gap "
+          "source=[{0},{1}) includes={2} macros={3}",
+          gapBegin, gapEnd, includeCount, macroCount);
     return true;
   };
 
@@ -1246,16 +1379,19 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       return std::nullopt;
     }
 
-    // Likewise, do not delete or partially overwrite a macro invocation that
-    // was not part of the closure proof.  Mixed TU/include closure is
-    // intentionally limited to ordinary TU spelling plus touched include
-    // directives.
+    // Do not delete or partially overwrite source-bearing macro invocations.
+    // A complete zero-token callsite is different: it produced no PP material
+    // and lies inside the source interval replaced by this closure, so it is
+    // consumed as a source-neutral gap artifact.
     for (const auto &m : model_.GetMacroInvocations()) {
       if (m.invFile && !m.invFile->empty() && !PathsEqual(*m.invFile, tuPath))
         continue;
       if (!m.invB || !m.invE)
         continue;
       if (*m.invB < sourceEnd && sourceBegin < *m.invE) {
+        if (macroInvocationIsConsumableZeroTokenGap(m, sourceBegin,
+                                                   sourceEnd))
+          continue;
         trace("fallback",
               "TU/include closure rejected: source interval [{0},{1}) would "
               "absorb macro invocation id={2} name='{3}' site=[{4},{5})",
@@ -1265,19 +1401,17 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     }
 
     // The envelope may widen across physical gaps between required pieces, but
-    // only across whitespace or complete zero-token include trees whose
-    // recorded structure is source-neutral conditional control, nested
-    // zero-token includes, and consumable macro state.  Those includes are
-    // consumed by the replacement: they sit inside
-    // the source interval whose A-side material was replaced by the B-side
-    // hunk.  Any other byte would be meaningful source text that the proof has
-    // not justified replacing.
+    // only across whitespace or complete zero-token source artifacts.  These
+    // artifacts are consumed by the replacement because they sit inside the
+    // source interval whose A-side material was replaced by the B-side hunk.
+    // Any other byte would be meaningful source text that the proof has not
+    // justified replacing.
     uint64_t cursor = sourceBegin;
     for (const auto &piece : mergedPieces) {
       if (piece.first > cursor) {
         StringRef gap = tuBytes.slice(cursor, piece.first);
         if (!stringutils::isWhitespace(gap) &&
-            !gapIsConsumableEmptyIncludeClosure(cursor, piece.first)) {
+            !gapIsConsumableZeroTokenSourceClosure(cursor, piece.first)) {
           trace("fallback",
                 "TU/include closure rejected: non-whitespace TU gap inside "
                 "mixed source interval [{0},{1}) gap='{2}'",
@@ -1358,19 +1492,18 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
 
     // The pure include closure may absorb touched include directives plus
     // source-neutral whitespace between neighboring directives.  It may also
-    // consume a complete zero-token include tree whose recorded structure is
-    // limited to source-neutral conditional control, nested zero-token includes,
-    // and consumable macro-state directives when that include lies between the
-    // touched directives: the
-    // directive is inside the replaced source envelope even though it
-    // contributed no PP tokens.  Comments outside such complete include gaps
+    // consume complete zero-token source artifacts, such as empty include trees
+    // and invocations of empty-replacement-list macros, when they lie between
+    // touched directives.  Those artifacts are inside the replaced source
+    // envelope even though they
+    // contributed no PP tokens.  Comments outside such complete zero-token gaps
     // are still preserved verbatim rather than silently deleted.
     if (inc->siteB > sourceCursor) {
       StringRef gap = tuBytes.slice(sourceCursor, inc->siteB);
       if (!gap.empty() && !stringutils::isWhitespace(gap)) {
-        if (gapIsConsumableEmptyIncludeClosure(sourceCursor, inc->siteB)) {
+        if (gapIsConsumableZeroTokenSourceClosure(sourceCursor, inc->siteB)) {
           trace("fallback",
-                "TU include-closure consuming zero-token include gap before "
+                "TU include-closure consuming zero-token source gap before "
                 "inc#{0} gap='{1}'",
                 inc->id, stringutils::showWSWithClip(gap, 120));
         } else if (!isPreservableIncludeClosureGapTrivia(gap)) {
