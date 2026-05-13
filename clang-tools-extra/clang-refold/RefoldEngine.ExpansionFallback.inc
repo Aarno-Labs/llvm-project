@@ -954,11 +954,109 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   uint64_t sourceBegin = first->siteB;
   uint64_t sourceEnd = last->siteE;
 
+  // Return true iff the PP token is part of one of the include expansions that
+  // this closure is explicitly consuming.
   auto tokenCoveredByTouchedInclude = [&](uint64_t pp) -> bool {
     for (const RefoldModel::IncludeItem *inc : touched)
       if (inc->cover.begin <= pp && pp < inc->cover.end)
         return true;
     return false;
+  };
+
+  // Return true iff this include directive belongs to the touched include run
+  // whose expansion participates in the closure proof.
+  auto includeIsTouched = [&](const RefoldModel::IncludeItem &inc) -> bool {
+    for (const RefoldModel::IncludeItem *touchedInc : touched)
+      if (touchedInc->id == inc.id)
+        return true;
+    return false;
+  };
+
+  // Return true iff the refold map records source structure inside this include
+  // that prevents treating a zero-token include as safely consumable trivia.
+  auto includeHasRecordedSideEffects =
+      [&](const RefoldModel::IncludeItem &inc) -> bool {
+    // Header declarations are semantic structure, even if this include did not
+    // contribute tokens to the particular A-side hunk being refolded.
+    if (!inc.decls.empty())
+      return true;
+
+    // Nested includes mean this directive has transitive preprocessing
+    // structure; do not erase it as an empty local gap.
+    for (const auto &child : model_.GetIncludes())
+      if (child.parent && *child.parent == inc.id)
+        return true;
+
+    for (const auto &directive : model_.GetMacroDirectives())
+      if (directive.ownerIncludeId && *directive.ownerIncludeId == inc.id)
+        return true;
+
+    for (const auto &group : model_.GetConds())
+      if (group.parentIncludeId && *group.parentIncludeId == inc.id)
+        return true;
+
+    // Pragmas are keyed by physical file path rather than include id, so check
+    // the resolved header path when available.
+    if (inc.resolvedPath)
+      for (const auto &pragma : model_.GetPragmas())
+        if (PathsEqual(pragma.sitePath, *inc.resolvedPath))
+          return true;
+
+    return false;
+  };
+
+  // Prove that a source gap inside the replacement envelope consists only of
+  // whitespace plus complete unrelated includes whose own expansion is empty
+  // and side-effect-free in the refold map.
+  //
+  // Such an include has no PP tokens, so token overlap alone cannot make it a
+  // touched include.  If it lies physically between required source pieces of a
+  // proved closure, however, it is part of the source interval being replaced.
+  // We therefore consume it with the closure; preserving it before or after the
+  // B-side material would move a directive across the edit boundary and would
+  // describe a different source-order program.
+  auto gapIsConsumableEmptyIncludeClosure = [&](uint64_t gapBegin,
+                                               uint64_t gapEnd) -> bool {
+    if (gapBegin >= gapEnd || gapEnd > tuBytes.size())
+      return false;
+
+    SmallVector<const RefoldModel::IncludeItem *, 4> emptyIncludes;
+    for (const auto &inc : model_.GetIncludes()) {
+      if (!PathsEqual(inc.sitePath, tuPath) || includeIsTouched(inc))
+        continue;
+      if (inc.cover.IsValid() || includeHasRecordedSideEffects(inc))
+        continue;
+      if (gapBegin <= inc.siteB && inc.siteE <= gapEnd &&
+          inc.siteB < inc.siteE)
+        emptyIncludes.push_back(&inc);
+    }
+
+    if (emptyIncludes.empty())
+      return false;
+
+    llvm::sort(emptyIncludes, [](const RefoldModel::IncludeItem *lhs,
+                                 const RefoldModel::IncludeItem *rhs) {
+      if (lhs->siteB != rhs->siteB)
+        return lhs->siteB < rhs->siteB;
+      return lhs->id < rhs->id;
+    });
+
+    uint64_t cursor = gapBegin;
+    for (const RefoldModel::IncludeItem *inc : emptyIncludes) {
+      if (inc->siteB < cursor)
+        return false;
+      if (!stringutils::isWhitespace(tuBytes.slice(cursor, inc->siteB)))
+        return false;
+      cursor = inc->siteE;
+    }
+    if (!stringutils::isWhitespace(tuBytes.slice(cursor, gapEnd)))
+      return false;
+
+    trace("fallback",
+          "TU/include closure consuming empty-include source gap "
+          "source=[{0},{1}) includes={2}",
+          gapBegin, gapEnd, emptyIncludes.size());
+    return true;
   };
 
   // Prove a mixed TU/include closure.
@@ -1064,28 +1162,29 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     sourceBegin = mergedPieces.front().first;
     sourceEnd = mergedPieces.back().second;
 
-    // Do not absorb any include directive other than the run whose expansion is
-    // explicitly part of this closure.  This prevents a nearby unrelated
-    // include from being deleted merely because it lies between two required
-    // pieces.
+    // Do not silently delete any include directive other than the run whose
+    // expansion is explicitly part of this closure.  A complete unrelated
+    // include with an empty, side-effect-free PP cover may be consumed only when
+    // it is fully inside the same source envelope.  That makes it part of the
+    // replaced source interval, not trivia to preserve or reorder around the
+    // B-side material.
     for (const auto &inc : model_.GetIncludes()) {
       if (!PathsEqual(inc.sitePath, tuPath))
         continue;
       if (inc.siteB >= sourceEnd || sourceBegin >= inc.siteE)
         continue;
-      bool isTouched = false;
-      for (const RefoldModel::IncludeItem *touchedInc : touched)
-        if (touchedInc->id == inc.id) {
-          isTouched = true;
-          break;
-        }
-      if (!isTouched) {
-        trace("fallback",
-              "TU/include closure rejected: source interval [{0},{1}) would "
-              "absorb unrelated include id={2} site=[{3},{4})",
-              sourceBegin, sourceEnd, inc.id, inc.siteB, inc.siteE);
-        return std::nullopt;
-      }
+      if (includeIsTouched(inc))
+        continue;
+      if (!inc.cover.IsValid() && !includeHasRecordedSideEffects(inc) &&
+          sourceBegin <= inc.siteB && inc.siteE <= sourceEnd)
+        continue;
+
+      trace("fallback",
+            "TU/include closure rejected: source interval [{0},{1}) would "
+            "absorb unrelated include id={2} site=[{3},{4}) cover=[{5},{6})",
+            sourceBegin, sourceEnd, inc.id, inc.siteB, inc.siteE,
+            inc.cover.begin, inc.cover.end);
+      return std::nullopt;
     }
 
     // Likewise, do not delete or partially overwrite a macro invocation that
@@ -1107,13 +1206,17 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     }
 
     // The envelope may widen across physical gaps between required pieces, but
-    // only across trivia.  Any non-whitespace byte in a gap would be meaningful
-    // source text that the proof has not justified replacing.
+    // only across whitespace or complete zero-token includes that are proven
+    // side-effect-free.  Those empty includes are consumed by the replacement:
+    // they sit inside the source interval whose A-side material was replaced by
+    // the B-side hunk.  Any other byte would be meaningful source text that the
+    // proof has not justified replacing.
     uint64_t cursor = sourceBegin;
     for (const auto &piece : mergedPieces) {
       if (piece.first > cursor) {
         StringRef gap = tuBytes.slice(cursor, piece.first);
-        if (!stringutils::isWhitespace(gap)) {
+        if (!stringutils::isWhitespace(gap) &&
+            !gapIsConsumableEmptyIncludeClosure(cursor, piece.first)) {
           trace("fallback",
                 "TU/include closure rejected: non-whitespace TU gap inside "
                 "mixed source interval [{0},{1}) gap='{2}'",
@@ -1192,27 +1295,34 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       return std::nullopt;
     }
 
-    // The TU closure may absorb only include directives plus inert trivia
-    // between neighboring directives. Whitespace is already source-neutral;
-    // comments and literal empty conditional-control groups are admitted only
-    // because the emitted edit preserves their bytes verbatim instead of
-    // silently deleting user-written text.
+    // The pure include closure may absorb touched include directives plus
+    // source-neutral whitespace between neighboring directives.  It may also
+    // consume a complete empty, side-effect-free include that lies between the
+    // touched directives, because that directive is inside the replaced source
+    // envelope even though it contributed no PP tokens.  Comments and literal
+    // empty conditional-control groups are still preserved verbatim rather than
+    // silently deleted.
     if (inc->siteB > sourceCursor) {
       StringRef gap = tuBytes.slice(sourceCursor, inc->siteB);
       if (!gap.empty() && !stringutils::isWhitespace(gap)) {
-        if (!isPreservableIncludeClosureGapTrivia(gap)) {
+        if (gapIsConsumableEmptyIncludeClosure(sourceCursor, inc->siteB)) {
+          trace("fallback",
+                "TU include-closure consuming empty include gap before "
+                "inc#{0} gap='{1}'",
+                inc->id, stringutils::showWSWithClip(gap, 120));
+        } else if (!isPreservableIncludeClosureGapTrivia(gap)) {
           trace("fallback",
                 "TU include-closure rejected: non-trivia TU gap between "
                 "include directives before inc#{0} gap='{1}'",
                 inc->id, stringutils::showWSWithClip(gap, 120));
           return std::nullopt;
+        } else {
+          preservedGapTrivia.append(gap.begin(), gap.end());
+          trace("fallback",
+                "TU include-closure preserving inert trivia gap before "
+                "inc#{0} gap='{1}'",
+                inc->id, stringutils::showWSWithClip(gap, 120));
         }
-
-        preservedGapTrivia.append(gap.begin(), gap.end());
-        trace("fallback",
-              "TU include-closure preserving inert trivia gap before inc#{0} "
-              "gap='{1}'",
-              inc->id, stringutils::showWSWithClip(gap, 120));
       }
     }
 
@@ -1280,6 +1390,12 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
 
   std::string rawReplacement = SliceBSource(bMaterialBegin, bMaterialEnd).str();
   std::string replacement = rawReplacement;
+
+  // Preserve legacy inert trivia between touched include directives.  Empty
+  // side-effect-free includes admitted by the gap proof above are deliberately
+  // not appended here: they lie inside the source envelope replaced by this
+  // closure, so the B-side material consumes them along with the adjacent
+  // TU/include tokens.
   if (!preservedGapTrivia.empty()) {
     if (startsWithPreprocessorDirectiveTrivia(preservedGapTrivia) &&
         !replacement.empty() && replacement.back() != '\n')
