@@ -909,14 +909,20 @@ lineControlNestedMacroInvocationArgTexts(
 /// follows only producer-recorded child macro invocations whose `caller_macro_id`
 /// is the macro being expanded.  Each child must occur unambiguously as a whole
 /// identifier in the current replacement text and must itself satisfy the same
-/// simple line-control replacement rules.  Cycles, unsupported macro operators,
-/// ambiguous repeated child spellings, and excessive expansion depth all fail
-/// closed before the strict line-control parser sees the rewritten directive.
+/// simple line-control replacement rules, or be a recorded predefined builtin
+/// accepted by the caller's line-control builtin resolver.  The builtin hook is
+/// needed for forms such as `#line LINE_NO(__LINE__)`: after substituting
+/// `LINE_NO(x)` with its argument, the producer-recorded child `__LINE__`
+/// invocation is the only deterministic witness for the numeric operand.
+/// Cycles, unsupported macro operators, ambiguous repeated child spellings, and
+/// excessive expansion depth all fail closed before the strict line-control
+/// parser sees the rewritten directive.
 static std::optional<SourceLineDirectiveMacroReplacement>
 expandLineControlMacroReplacementText(
     const RefoldModel &model, const RefoldModel::MacroInvocation &macro,
     ArrayRef<StringRef> invocationArgTexts,
-    SmallVectorImpl<uint64_t> &activeMacroIds) {
+    SmallVectorImpl<uint64_t> &activeMacroIds,
+    SourceLineDirectiveBuiltinMacroResolver builtinMacroResolver = nullptr) {
   if (activeMacroIds.size() > 32)
     return std::nullopt;
   if (std::find(activeMacroIds.begin(), activeMacroIds.end(), macro.id) !=
@@ -925,8 +931,18 @@ expandLineControlMacroReplacementText(
 
   std::optional<std::string> replacement =
       simpleLineControlMacroReplacementText(model, macro, invocationArgTexts);
-  if (!replacement)
-    return std::nullopt;
+  if (!replacement) {
+    if (!builtinMacroResolver)
+      return std::nullopt;
+
+    // Predefined builtins have no defining directive to recover through the
+    // normal replacement-list path.  They can still be valid line-control
+    // operands when the producer recorded the invocation site and the caller's
+    // resolver can prove the concrete spelling from source-location state.
+    replacement = builtinMacroResolver(macro);
+    if (!replacement)
+      return std::nullopt;
+  }
 
   SourceLineDirectiveMacroReplacement out;
   out.text = std::move(*replacement);
@@ -965,8 +981,9 @@ expandLineControlMacroReplacementText(
     }
 
     std::optional<SourceLineDirectiveMacroReplacement> childReplacement =
-        expandLineControlMacroReplacementText(model, child, *childArgTexts,
-                                              activeMacroIds);
+        expandLineControlMacroReplacementText(
+            model, child, *childArgTexts, activeMacroIds,
+            builtinMacroResolver);
     if (!childReplacement) {
       activeMacroIds.pop_back();
       return std::nullopt;
@@ -1041,6 +1058,9 @@ rewriteSourceLineDirectiveLogicalLineMacros(
     SmallVector<uint64_t, 4> macroInvocationIds;
   };
 
+  SourceLineDirectiveBuiltinMacroResolver usableBuiltinMacroResolver =
+      logicalLineSpellingIsContiguous ? builtinMacroResolver : nullptr;
+
   auto findLogicalIndex = [&](uint64_t sourceOffset) -> std::optional<size_t> {
     auto it = std::lower_bound(logicalLineSourceOffsets.begin(),
                                logicalLineSourceOffsets.end(), sourceOffset);
@@ -1057,7 +1077,16 @@ rewriteSourceLineDirectiveLogicalLineMacros(
 
   SmallVector<ReplacementPiece, 4> pieces;
   for (const RefoldModel::MacroInvocation &macro : model.GetMacroInvocations()) {
-    if (!macro.invFile || macro.invFile->empty() || !pathsEqual(*macro.invFile, file))
+    // Replacement pieces for nested macro invocations are produced by walking
+    // the recorded expansion DAG from their source-spelled root.  Adding them
+    // again as independent logical-line pieces would create overlapping edits
+    // for forms such as `#line LINE_NO(__LINE__)`, where the builtin is both
+    // physically inside the root invocation spelling and semantically a child
+    // of that invocation.
+    if (macro.callerMacroId)
+      continue;
+    if (!macro.invFile || macro.invFile->empty() ||
+        !pathsEqual(*macro.invFile, file))
       continue;
     if (ownerIncludeId &&
         (!macro.ownerIncludeId || *macro.ownerIncludeId != *ownerIncludeId))
@@ -1132,9 +1161,9 @@ rewriteSourceLineDirectiveLogicalLineMacros(
     // resolver and only for an unspliced logical directive line; otherwise the
     // physical source offsets alone are not enough to model the builtin's
     // presumed-location semantics.
-    if (builtinMacroResolver && logicalLineSpellingIsContiguous) {
+    if (usableBuiltinMacroResolver) {
       if (std::optional<std::string> builtinReplacement =
-              builtinMacroResolver(macro)) {
+              usableBuiltinMacroResolver(macro)) {
         SourceLineDirectiveMacroReplacement builtin;
         builtin.text = std::move(*builtinReplacement);
         builtin.macroInvocationIds.push_back(macro.id);
@@ -1145,7 +1174,8 @@ rewriteSourceLineDirectiveLogicalLineMacros(
     if (!replacement) {
       SmallVector<uint64_t, 8> activeMacroIds;
       replacement = expandLineControlMacroReplacementText(
-          model, macro, invocationArgTexts, activeMacroIds);
+          model, macro, invocationArgTexts, activeMacroIds,
+          usableBuiltinMacroResolver);
     }
     if (!replacement)
       return std::nullopt;
