@@ -2047,6 +2047,58 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       }
     }
 
+    auto ppSpanInsideMaterial = [&](const RefoldModel::PPSpan &span) -> bool {
+      if (!span.IsValid() || span.begin >= span.end)
+        return true;
+      return materialBeginA <= span.begin && span.end <= materialEndA;
+    };
+
+    auto macroInvocationMaterialIsConsumed =
+        [&](const RefoldModel::MacroInvocation &m,
+            std::optional<uint64_t> sourceBeginBound = std::nullopt,
+            std::optional<uint64_t> sourceEndBound = std::nullopt) -> bool {
+      if (!m.invFile || m.invFile->empty() || !PathsEqual(*m.invFile, tuPath))
+        return false;
+      if (!m.invB || !m.invE || *m.invB >= *m.invE || *m.invE > tuBytes.size())
+        return false;
+      if (sourceBeginBound && *m.invB < *sourceBeginBound)
+        return false;
+      if (sourceEndBound && *sourceEndBound < *m.invE)
+        return false;
+
+      bool sawMaterializedSpan = false;
+      auto checkSpan = [&](const RefoldModel::PPSpan &span) -> bool {
+        if (!span.IsValid() || span.begin >= span.end)
+          return true;
+        sawMaterializedSpan = true;
+        return ppSpanInsideMaterial(span);
+      };
+
+      // A source-bearing macro call may be consumed by this replacement only
+      // when every PP span the producer attributes to that invocation is wholly
+      // inside the A-side material being replaced. Then the callsite is not an
+      // unrelated artifact: it is one of the source pieces whose produced tokens
+      // are removed by the hunk. Any span escaping the material range means
+      // deleting the call would also delete surviving PP tokens, so reject.
+      for (const auto &span : m.spans)
+        if (!checkSpan(span))
+          return false;
+      for (const auto &span : m.bodySpans)
+        if (!checkSpan(span))
+          return false;
+      for (const auto &span : m.argSpans)
+        if (!checkSpan(span))
+          return false;
+      for (const auto &span : m.stringifySpans)
+        if (!checkSpan(span))
+          return false;
+      for (const auto &span : m.pasteSpans)
+        if (!checkSpan(span))
+          return false;
+
+      return sawMaterializedSpan;
+    };
+
     // If the consumed A-token material came from inside a TU conditional arm,
     // consume the complete conditional group as a required source piece.  The
     // byte-level gap proof can already consume neutral conditional-control
@@ -2085,6 +2137,18 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
 
       sourcePieces.push_back({group.groupB, group.groupE});
     }
+
+    // Collapse any complete source-bearing macro invocation whose produced PP
+    // material is wholly replaced by this hunk into one required source piece.
+    // Token-level mappings inside macro expansions often point only at the
+    // macro name or argument bytes; if we kept only those token pieces, the
+    // verifier would later see punctuation from the callsite, such as the
+    // parentheses in KEEP(2), as unexplained interstitial source.  The complete
+    // macro callsite is the actual source artifact whose material is consumed,
+    // so prove it once and tile the envelope with that whole interval.
+    for (const auto &m : model_.GetMacroInvocations())
+      if (macroInvocationMaterialIsConsumed(m))
+        sourcePieces.push_back({*m.invB, *m.invE});
 
     // The mixed proof is only for hunks that actually consume ordinary TU
     // spelling.  If no TU token was seen, the pure include-closure path is the
@@ -2166,50 +2230,6 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       return std::nullopt;
     }
 
-    auto ppSpanInsideMaterial = [&](const RefoldModel::PPSpan &span) -> bool {
-      if (!span.IsValid() || span.begin >= span.end)
-        return true;
-      return materialBeginA <= span.begin && span.end <= materialEndA;
-    };
-
-    auto macroInvocationMaterialIsConsumed =
-        [&](const RefoldModel::MacroInvocation &m) -> bool {
-      if (!m.invB || !m.invE || *m.invB < sourceBegin || sourceEnd < *m.invE)
-        return false;
-
-      bool sawMaterializedSpan = false;
-      auto checkSpan = [&](const RefoldModel::PPSpan &span) -> bool {
-        if (!span.IsValid() || span.begin >= span.end)
-          return true;
-        sawMaterializedSpan = true;
-        return ppSpanInsideMaterial(span);
-      };
-
-      // A source-bearing macro call may be consumed by this replacement only
-      // when every PP span the producer attributes to that invocation is wholly
-      // inside the A-side material being replaced.  Then the callsite is not an
-      // unrelated artifact: it is one of the source pieces whose produced tokens
-      // are removed by the hunk.  Any span escaping the material range means
-      // deleting the call would also delete surviving PP tokens, so reject.
-      for (const auto &span : m.spans)
-        if (!checkSpan(span))
-          return false;
-      for (const auto &span : m.bodySpans)
-        if (!checkSpan(span))
-          return false;
-      for (const auto &span : m.argSpans)
-        if (!checkSpan(span))
-          return false;
-      for (const auto &span : m.stringifySpans)
-        if (!checkSpan(span))
-          return false;
-      for (const auto &span : m.pasteSpans)
-        if (!checkSpan(span))
-          return false;
-
-      return sawMaterializedSpan;
-    };
-
     // Do not delete or partially overwrite unrelated macro invocations.  Two
     // complete-callsite cases are allowed inside the replacement envelope:
     //
@@ -2228,7 +2248,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       if (*m.invB < sourceEnd && sourceBegin < *m.invE) {
         if (macroInvocationIsConsumableZeroTokenGap(m, sourceBegin,
                                                    sourceEnd) ||
-            macroInvocationMaterialIsConsumed(m))
+            macroInvocationMaterialIsConsumed(m, sourceBegin, sourceEnd))
           continue;
         trace("fallback",
               "TU/include closure rejected: source interval [{0},{1}) would "
