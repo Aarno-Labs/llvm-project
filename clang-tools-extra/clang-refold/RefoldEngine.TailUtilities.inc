@@ -1288,6 +1288,17 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
           auto it = paramIndexByName.find(ident);
           if (it == paramIndexByName.end())
             return false;
+
+          // Token pasting can still be source-neutral in the placemarker
+          // domain.  The shared helper admits only paste chains whose operands
+          // are formals with token-empty invocation arguments; any paste that
+          // could synthesize real PP-token material remains outside this proof.
+          if (consumeNeutralPlacemarkerPasteChain(
+                  text, pos, end, it->second, paramIndexByName,
+                  skipReplacementTriviaUntil, argumentRangeIsNeutral,
+                  usedParams))
+            continue;
+
           usedParams.push_back(it->second);
         }
 
