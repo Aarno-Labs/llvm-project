@@ -78,11 +78,18 @@ namespace stringutils {
 
 // ------------------- Single-char predicates (ASCII only) ---------------------
 
+// Return true for whitespace that can separate tokens without acting as a
+// source-line break for this check.  The name intentionally excludes '\n' and
+// '\r'; '\v' and '\f' are C/C++ whitespace characters, but they are not treated
+// here as newline delimiters
+inline constexpr bool isNonNewlineWs(char c) {
+  return c == ' ' || c == '\t' || c == '\v' || c == '\f';
+}
+
 /// True for the ASCII whitespace set recognized by the C/C++ preprocessor.
 inline constexpr bool isWs(char c) noexcept {
   // C/C++ PP whitespace: space, HT, LF, VT, FF, CR
-  return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' ||
-         c == '\r';
+  return c == '\n' || c == '\r' || isNonNewlineWs(c);
 }
 
 /// True for the ASCII start character of an identifier-like spelling.
@@ -140,6 +147,12 @@ size_t skipWSAndComments(StringRef s, size_t i);
 /// Find the matching right parenthesis for \p lParenIdx, ignoring comments and
 /// string/character literal contents.
 size_t findMatchingRParen(StringRef s, size_t lParenIdx);
+
+/// Advance `pos` over whitespace that does not cross a source-line boundary.
+inline constexpr void skipNonNewlineWs(StringRef text, size_t &pos) {
+  while (pos < text.size() && stringutils::isNonNewlineWs(text[pos]))
+    ++pos;
+}
 
 // --------------------- Diagnostics helpers (pure string) ---------------------
 
