@@ -974,18 +974,43 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
 
   // Return true iff the refold map records source structure inside this include
   // that cannot be consumed as part of a zero-token replacement gap.
-  auto includeHasRecordedSideEffects =
-      [&](const RefoldModel::IncludeItem &inc) -> bool {
+  //
+  // The predicate is intentionally transitive: a top-level zero-token include
+  // may contain nested zero-token includes, and the outer directive is still
+  // safe to consume when every descendant is itself source-neutral.  A nested
+  // include that materializes tokens, or that owns non-consumable structure,
+  // keeps the whole include tree outside this proof class.
+  std::function<bool(const RefoldModel::IncludeItem &, DenseSet<uint64_t> &)>
+      includeHasRecordedSideEffectsImpl;
+  includeHasRecordedSideEffectsImpl =
+      [&](const RefoldModel::IncludeItem &inc, DenseSet<uint64_t> &visiting)
+          -> bool {
+    // A cycle would indicate malformed include-parent metadata.  Do not try to
+    // prove closure through it; reject rather than deleting uncertain state.
+    if (!visiting.insert(inc.id).second)
+      return true;
+
+    auto finish = [&](bool hasSideEffects) {
+      visiting.erase(inc.id);
+      return hasSideEffects;
+    };
+
     // Header declarations are semantic structure, even if this include did not
     // contribute tokens to the particular A-side hunk being refolded.
     if (!inc.decls.empty())
-      return true;
+      return finish(true);
 
-    // Nested includes mean this directive has transitive preprocessing
-    // structure; do not erase it as an empty local gap.
-    for (const auto &child : model_.GetIncludes())
-      if (child.parent && *child.parent == inc.id)
-        return true;
+    // A nested include is not inherently a side effect.  It is consumable when
+    // its own expansion is empty and its descendants/directives are consumable
+    // by the same zero-token include-gap proof.
+    for (const auto &child : model_.GetIncludes()) {
+      if (!child.parent || *child.parent != inc.id)
+        continue;
+      if (child.cover.IsValid())
+        return finish(true);
+      if (includeHasRecordedSideEffectsImpl(child, visiting))
+        return finish(true);
+    }
 
     // Include-owned #define/#undef directives are macro-state transitions, not
     // PP tokens.  When their containing zero-token include lies inside the
@@ -999,7 +1024,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     for (const auto &directive : model_.GetMacroDirectives())
       if (directive.ownerIncludeId && *directive.ownerIncludeId == inc.id &&
           directive.subkind != "#define" && directive.subkind != "#undef")
-        return true;
+        return finish(true);
 
     // Conditional control directives are also source structure, but an
     // include-local conditional group with no materialized A tokens is source
@@ -1016,7 +1041,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
 
       for (const RefoldModel::CondArm &arm : group.arms)
         if (arm.span && arm.span->IsValid() && arm.span->begin < arm.span->end)
-          return true;
+          return finish(true);
     }
 
     // Pragmas are keyed by physical file path rather than include id, so check
@@ -1024,15 +1049,22 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     if (inc.resolvedPath)
       for (const auto &pragma : model_.GetPragmas())
         if (PathsEqual(pragma.sitePath, *inc.resolvedPath))
-          return true;
+          return finish(true);
 
-    return false;
+    return finish(false);
+  };
+
+  auto includeHasRecordedSideEffects =
+      [&](const RefoldModel::IncludeItem &inc) -> bool {
+    DenseSet<uint64_t> visiting;
+    return includeHasRecordedSideEffectsImpl(inc, visiting);
   };
 
   // Prove that a source gap inside the replacement envelope consists only of
-  // whitespace plus complete unrelated includes whose own expansion is empty
-  // and whose recorded structure is either absent or limited to source-neutral
-  // control structure and consumable macro-state directives.
+  // whitespace plus complete unrelated include trees whose own expansions are
+  // empty and whose recorded structure is either absent or limited to
+  // source-neutral control structure, nested zero-token includes, and
+  // consumable macro-state directives.
   //
   // Such an include has no PP tokens, so token overlap alone cannot make it a
   // touched include.  If it lies physically between required source pieces of a
@@ -1191,9 +1223,10 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     // expansion is explicitly part of this closure.  A complete unrelated
     // include with an empty PP cover may be consumed only when it is fully
     // inside the same source envelope and all recorded structure is either
-    // absent or limited to source-neutral conditional control and consumable
-    // macro-state directives.  That makes it part of the replaced source
-    // interval, not trivia to preserve or reorder around the B-side material.
+    // absent or limited to source-neutral conditional control, nested
+    // zero-token includes, and consumable macro-state directives.  That makes
+    // it part of the replaced source interval, not trivia to preserve or
+    // reorder around the B-side material.
     for (const auto &inc : model_.GetIncludes()) {
       if (!PathsEqual(inc.sitePath, tuPath))
         continue;
@@ -1232,9 +1265,10 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     }
 
     // The envelope may widen across physical gaps between required pieces, but
-    // only across whitespace or complete zero-token includes whose recorded
-    // structure is source-neutral conditional control and consumable macro
-    // state.  Those includes are consumed by the replacement: they sit inside
+    // only across whitespace or complete zero-token include trees whose
+    // recorded structure is source-neutral conditional control, nested
+    // zero-token includes, and consumable macro state.  Those includes are
+    // consumed by the replacement: they sit inside
     // the source interval whose A-side material was replaced by the B-side
     // hunk.  Any other byte would be meaningful source text that the proof has
     // not justified replacing.
@@ -1324,9 +1358,10 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
 
     // The pure include closure may absorb touched include directives plus
     // source-neutral whitespace between neighboring directives.  It may also
-    // consume a complete zero-token include whose recorded structure is limited
-    // to source-neutral conditional control and consumable macro-state
-    // directives when that include lies between the touched directives: the
+    // consume a complete zero-token include tree whose recorded structure is
+    // limited to source-neutral conditional control, nested zero-token includes,
+    // and consumable macro-state directives when that include lies between the
+    // touched directives: the
     // directive is inside the replaced source envelope even though it
     // contributed no PP tokens.  Comments outside such complete include gaps
     // are still preserved verbatim rather than silently deleted.
