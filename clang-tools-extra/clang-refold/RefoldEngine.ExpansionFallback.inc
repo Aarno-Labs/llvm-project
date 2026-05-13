@@ -1007,6 +1007,32 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     return false;
   };
 
+  // Return true iff the macro invocation is part of the source spelling of a
+  // touched include directive.  Macro-expanded include targets, for example
+  //
+  //   #define HDR "two.inc"
+  //   #include HDR
+  //
+  // are control spelling for the include directive, not independent TU material.
+  // When the closure consumes the touched include site, complete macro calls
+  // wholly inside that site are consumed with it.  Partial overlaps remain
+  // rejected by the ordinary macro-overlap guard below.
+  auto macroInvocationIsInsideTouchedIncludeDirective =
+      [&](const RefoldModel::MacroInvocation &m) -> bool {
+    if (!m.invFile || m.invFile->empty() || !PathsEqual(*m.invFile, tuPath))
+      return false;
+    if (!m.invB || !m.invE || *m.invB >= *m.invE)
+      return false;
+
+    for (const RefoldModel::IncludeItem *inc : touched) {
+      if (!PathsEqual(inc->sitePath, tuPath))
+        continue;
+      if (inc->siteB <= *m.invB && *m.invE <= inc->siteE)
+        return true;
+    }
+    return false;
+  };
+
   // Return true iff the pragma is explicitly classified as source-neutral when
   // its containing include directive is consumed by a zero-token gap closure.
   //
@@ -2343,14 +2369,16 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       return std::nullopt;
     }
 
-    // Do not delete or partially overwrite unrelated macro invocations.  Two
+    // Do not delete or partially overwrite unrelated macro invocations.  Three
     // complete-callsite cases are allowed inside the replacement envelope:
     //
+    //   * macro-expanded include-target spelling inside a touched include
+    //     directive, because the directive site is already a required piece;
     //   * zero-token source-neutral macro gaps, which contributed no PP tokens;
     //   * source-bearing macro calls whose entire produced PP material is
     //     already inside this hunk's A-side replacement range.
     //
-    // The latter case is the source-bearing analogue of the zero-token gap: the
+    // The last case is the source-bearing analogue of the zero-token gap: the
     // macro invocation is not being preserved or moved, it is part of the source
     // interval whose materialized tokens the user replaced.
     for (const auto &m : model_.GetMacroInvocations()) {
@@ -2359,7 +2387,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       if (!m.invB || !m.invE)
         continue;
       if (*m.invB < sourceEnd && sourceBegin < *m.invE) {
-        if (macroInvocationIsConsumableZeroTokenGap(m, sourceBegin,
+        if (macroInvocationIsInsideTouchedIncludeDirective(m) ||
+            macroInvocationIsConsumableZeroTokenGap(m, sourceBegin,
                                                    sourceEnd) ||
             macroInvocationMaterialIsConsumed(m, sourceBegin, sourceEnd))
           continue;
