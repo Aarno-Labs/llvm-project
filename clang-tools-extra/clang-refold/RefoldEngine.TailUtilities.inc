@@ -2489,9 +2489,10 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                             StringRef(headerText), gapBegin, gapEnd,
                             sourceEnvelope->end, file)) {
                   // Header full-envelope widening uses the same owner-piece gap
-                  // proof as TU/include closure.  A source-spelled #line gap is
-                  // not disposable trivia, but it is preservable by carrying its
-                  // net line state forward to the untouched header suffix.
+                  // proof as TU/include closure.  A source-spelled
+                  // line-control gap is not disposable trivia, but it is
+                  // preservable by carrying its net line state forward to the
+                  // untouched header suffix.
                   headerSourceLineDirectiveResume = std::move(lineResume);
                   return true;
                 }
@@ -2678,8 +2679,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         headerSourceLineDirectiveResume && *endByte < fileLen;
     if (emitsHeaderSourceLineDirectiveResume) {
       // A full-envelope delete has no B-derived payload, but the consumed
-      // source interval may still have carried a #line directive whose net
-      // state must be restored before the untouched header suffix. Emit a
+      // source interval may still have carried a line-control directive whose
+      // net state must be restored before the untouched header suffix. Emit a
       // resync-only replacement in that case; non-empty replacements get the
       // same directive on a fresh physical line after their edited payload.
       if (replacement.empty()) {

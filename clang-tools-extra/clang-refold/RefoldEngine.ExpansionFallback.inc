@@ -320,18 +320,21 @@ static bool collectPhase2LogicalLine(StringRef fileText, uint64_t lineBegin,
   return true;
 }
 
-/// Parse one source-spelled `#line` directive logical line.
+/// Parse one source-spelled line-control directive logical line.
 ///
-/// The refold map does not currently record `#line` as a first-class artifact,
-/// because it contributes no ordinary PP tokens.  Mixed source-envelope proofs
-/// therefore recover this narrow directive shape directly from the source bytes
-/// when a `#line` line lies between otherwise required owner pieces.
+/// The refold map does not currently record line-control directives as
+/// first-class artifacts because they contribute no ordinary PP tokens.  Mixed
+/// source-envelope proofs therefore recover this narrow directive shape
+/// directly from the source bytes when a source-only line-control line lies
+/// between otherwise required owner pieces.
 ///
 /// The input is a translation-phase-2 logical line: any C backslash-newline
 /// splices have already been removed by the caller.  This parser is still
 /// intentionally stricter than the general preprocessor grammar: it accepts
-/// only source-spelled `#line <digits> ["file"]` with optional horizontal
-/// whitespace.  Macro-dependent spellings remain outside this proof class.
+/// only source-spelled `#line <digits> ["file"]` and the Clang/GCC numeric
+/// line-marker spelling `# <digits> ["file"]`, both with optional horizontal
+/// whitespace.  Macro-dependent spellings and line-marker flags remain outside
+/// this proof class.
 static std::optional<LineDirectiveState>
 parseSourceLineDirectiveLogicalLine(StringRef line,
                                     StringRef currentFileSpelling) {
@@ -347,13 +350,20 @@ parseSourceLineDirectiveLogicalLine(StringRef line,
   if (!rest.consume_front("#"))
     return std::nullopt;
   rest = rest.ltrim(" \t\v\f");
-  if (!rest.consume_front("line"))
+
+  // Accept both standard-looking `#line 123 "file"` and the numeric
+  // preprocessed line-marker form `# 123 "file"`.  Both establish the same
+  // logical file/line state for the following source line, but neither leaves
+  // ordinary PP tokens that the refold map can recover from A/B.
+  if (rest.consume_front("line")) {
+    if (!rest.empty() && stringutils::isIdentPart(rest.front()))
+      return std::nullopt;
+    if (rest.empty() || !stringutils::isWs(rest.front()))
+      return std::nullopt;
+    rest = rest.ltrim(" \t\v\f");
+  } else if (rest.empty() || !('0' <= rest.front() && rest.front() <= '9')) {
     return std::nullopt;
-  if (!rest.empty() && stringutils::isIdentPart(rest.front()))
-    return std::nullopt;
-  if (rest.empty() || !stringutils::isWs(rest.front()))
-    return std::nullopt;
-  rest = rest.ltrim(" \t\v\f");
+  }
 
   StringRef digits = rest.take_while([](char c) { return '0' <= c && c <= '9'; });
   if (digits.empty())
@@ -2957,11 +2967,11 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
               if (std::optional<SourceLineDirectiveGapResume> lineResume =
                       computeSourceLineDirectiveGapResume(
                           tuBytes, gapBegin, gapEnd, sourceEnd, tuPath)) {
-                // A source-spelled #line directive contributes no PP tokens, but
-                // it is not disposable trivia: it changes the presumed file/line
-                // state for the untouched suffix.  Admit the gap only by carrying
-                // a replacement-local resync that restores the state observed
-                // after the whole consumed source envelope.
+                // A source-spelled line-control directive contributes no PP
+                // tokens, but it is not disposable trivia: it changes the
+                // presumed file/line state for the untouched suffix.  Admit the
+                // gap only by carrying a replacement-local resync that restores
+                // the state observed after the whole consumed source envelope.
                 mixedSourceLineDirectiveResume = std::move(lineResume);
                 trace("fallback",
                       "TU/include closure preserving source #line state from "
@@ -3238,13 +3248,14 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       lineDirs_.Enabled() && mixedSourceLineDirectiveResume &&
       sourceEnd < tuBytes.size();
   if (emitsSourceLineDirectiveResume) {
-    // The consumed source envelope contained a source-spelled #line directive.
-    // Re-emit only its net state, adjusted through the consumed envelope, so the
-    // untouched suffix observes the same presumed file/line as it did in the
-    // original source. Replacement hunks normally carry edited B material before
-    // the resync; delete-only hunks have no such payload, so they may need a
-    // leading physical newline to make the resync a standalone preprocessing
-    // directive rather than gluing `#line` onto the preceding source line.
+    // The consumed source envelope contained a source-spelled line-control
+    // directive.  Re-emit only its net state, adjusted through the consumed
+    // envelope, so the untouched suffix observes the same presumed file/line as
+    // it did in the original source. Replacement hunks normally carry edited B
+    // material before the resync; delete-only hunks have no such payload, so
+    // they may need a leading physical newline to make the resync a standalone
+    // preprocessing directive rather than gluing `#line` onto the preceding
+    // source line.
     if (padded.empty()) {
       if (!lineDirectiveStartsAtPrefix(sourceBegin))
         padded.push_back('\n');
