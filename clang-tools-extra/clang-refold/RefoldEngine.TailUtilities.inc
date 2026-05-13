@@ -2689,9 +2689,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       } else if (replacement.back() != '\n') {
         replacement.push_back('\n');
       }
-      replacement += lineDirs_.FormatLineDirective(
-          headerSourceLineDirectiveResume->lineAtResume,
-          headerSourceLineDirectiveResume->fileSpelling);
+      replacement +=
+          formatSourceLineDirectiveGapResume(*headerSourceLineDirectiveResume);
       trace("include/apply",
             "file={0} patch[{1}] emitted source #line resume line={2} "
             "resumeFile={3}",
