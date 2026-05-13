@@ -13252,6 +13252,18 @@ void RefoldEngine::AddForcedCounterPatches(
                                            ? Owner::Include(*m.ownerIncludeId)
                                            : Owner::TU());
 
+    // Forced __COUNTER__ stabilization is an invocation-realization proof, not
+    // an anonymous text edit.  The forced root is often the spelling of
+    // __COUNTER__ itself, but it can also be an enclosing macro invocation whose
+    // expansion observes __COUNTER__ (for example PRINT(...) wrapping
+    // __COUNTER__).  In both cases the emitted patch is required solely to keep
+    // the counter sequence consistent after an earlier counter occurrence was
+    // realized, so stamp every forced counter-stabilization patch with the
+    // explicit counter proof class.
+    StampMacroPatchProof(patch, MacroPatchProofKind::CounterLiteral,
+                         /*validated=*/true,
+                         /*structurePreserving=*/false, m.id);
+
     // Use the coalesced key as the patch macro ID so later owner/macro maps see
     // one canonical patch per physical invocation span.
     patch.macroId = patchKey;
