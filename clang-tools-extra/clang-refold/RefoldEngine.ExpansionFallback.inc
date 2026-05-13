@@ -21,23 +21,26 @@
 //
 //===----------------------------------------------------------------------===//
 
-
 /// Return true iff `text` is only whitespace and complete C/C++ comments.
 ///
-/// TU include-closure may preserve such gaps as inert source trivia while
-/// replacing the surrounding include directive run. The parser is deliberately
-/// strict: unterminated comments and any lexer-visible spelling remain outside
-/// this proof class and continue to fail closed.
+/// This is intentionally a lexical-trivia predicate, not a preprocessing
+/// predicate. Include-closure may carry these bytes through a replacement
+/// because comments and whitespace do not contribute preprocessing tokens.
+/// Anything that would lex as a real token, including malformed or
+/// unterminated comments, remains outside this proof class.
 static bool isWhitespaceOrCompleteCommentTrivia(StringRef text) {
   size_t i = 0;
   const size_t n = text.size();
 
   while (i < n) {
+    // Ordinary whitespace is inert and may be skipped byte-for-byte.
     if (stringutils::isWs(text[i])) {
       ++i;
       continue;
     }
 
+    // The only non-whitespace spelling admitted here is a complete comment.
+    // A lone '/' or any other token spelling is therefore a hard rejection.
     if (i + 1 >= n || text[i] != '/')
       return false;
 
@@ -52,17 +55,26 @@ static bool isWhitespaceOrCompleteCommentTrivia(StringRef text) {
         }
         ++i;
       }
+
+      // Do not treat a malformed block comment as trivia; fail closed so the
+      // caller can choose a wider structural fallback or terminal B.
       if (!closed)
         return false;
+
       continue;
     }
 
     if (text[i + 1] == '/') {
       i += 2;
+
+      // A line comment is complete at the physical newline, or at EOF for the
+      // isolated gap buffer. The caller preserves the original bytes, so the
+      // newline, if present, is retained.
       while (i < n && text[i] != '\n')
         ++i;
       if (i < n)
         ++i;
+
       continue;
     }
 
@@ -72,10 +84,22 @@ static bool isWhitespaceOrCompleteCommentTrivia(StringRef text) {
   return true;
 }
 
-/// Parse a conditional-control directive line admitted as inert include-gap
-/// trivia. Only literal `#if 0` / `#if 1` groups are accepted; directives with
-/// macro-dependent conditions, side effects, or escaped physical lines remain
-/// outside this proof class.
+/// Parse one admitted conditional-control directive line.
+///
+/// This recognizes only the small directive grammar that include-closure is
+/// allowed to preserve as an inert gap:
+///
+///   #if 0
+///   #if 1
+///   #elif 0
+///   #elif 1
+///   #else
+///   #endif
+///
+/// The `depth` argument tracks balance across the preserved gap. The function
+/// rejects escaped physical lines, macro-dependent conditions, trailing tokens,
+/// and every directive with side effects. In particular, this is not a general
+/// preprocessor directive parser.
 static bool parseLiteralEmptyConditionalDirectiveLine(StringRef line,
                                                       unsigned &depth) {
   if (line.ends_with("\n"))
@@ -83,6 +107,8 @@ static bool parseLiteralEmptyConditionalDirectiveLine(StringRef line,
   if (line.ends_with("\r"))
     line = line.drop_back();
 
+  // A trailing backslash would splice this physical line with the next one.
+  // That makes the gap non-local, so it is outside the preserved-trivia proof.
   StringRef noTrailingHorizontalWS = line.rtrim(" \t\v\f");
   if (noTrailingHorizontalWS.ends_with("\\"))
     return false;
@@ -92,6 +118,8 @@ static bool parseLiteralEmptyConditionalDirectiveLine(StringRef line,
     return false;
   rest = rest.ltrim(" \t\v\f");
 
+  // Keep directive recognition syntactic and state-free. We only need the
+  // directive keyword and the remaining literal condition, not macro expansion.
   StringRef keyword = rest.take_while([](char c) {
     return ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z') ||
            ('0' <= c && c <= '9') || c == '_';
@@ -125,11 +153,19 @@ static bool parseLiteralEmptyConditionalDirectiveLine(StringRef line,
   return false;
 }
 
-/// Return true iff `text` is trivia that may be preserved while closing over a
-/// TU include directive run. In addition to whitespace/comments, this admits
-/// complete empty conditional-control groups whose `#if` / `#elif` conditions
-/// are literal `0` or `1`, so moving them with the preserved gap does not
-/// depend on macro state removed by materializing the neighboring includes.
+/// Return true iff `text` may be carried through a TU include-closure edit.
+///
+/// This predicate defines the source-preservation proof for bytes between
+/// touched top-level include directives. The gap is accepted only when every
+/// byte is either:
+///
+///   * whitespace/comment trivia, or
+///   * part of a complete empty literal conditional-control island.
+///
+/// Accepted bytes are preserved verbatim in the emitted replacement. They are
+/// never silently deleted. Anything that can affect macro state, include state,
+/// diagnostics, line state, or later preprocessing remains outside this proof
+/// class and forces the caller to fail closed.
 static bool isPreservableIncludeClosureGapTrivia(StringRef text) {
   if (isWhitespaceOrCompleteCommentTrivia(text))
     return true;
@@ -170,17 +206,29 @@ static bool isPreservableIncludeClosureGapTrivia(StringRef text) {
   bool atLineStart = true;
   while (i < n) {
     if (stringutils::isWs(text[i])) {
+      // Directives are only admitted at physical line start, modulo horizontal
+      // whitespace already consumed by the directive parser.
       atLineStart = text[i] == '\n';
       ++i;
       continue;
     }
 
     if (text[i] == '/') {
+      const size_t before = i;
       if (!skipCompleteComment(i))
         return false;
+
+      // A line comment consumes its terminating newline when present, so the
+      // next non-whitespace byte is physically at the start of a new line. A
+      // block comment may contain newlines too; preserve directive legality by
+      // checking the skipped spelling.
+      StringRef skipped = text.slice(before, i);
+      atLineStart = skipped.ends_with("\n");
       continue;
     }
 
+    // Do not accept a '#' embedded after real spelling on the same line. That
+    // would not be a preprocessing directive in the preserved source.
     if (!atLineStart && text[i] != '#')
       return false;
 
@@ -190,9 +238,13 @@ static bool isPreservableIncludeClosureGapTrivia(StringRef text) {
     if (lineEnd < n)
       ++lineEnd;
 
-    if (!parseLiteralEmptyConditionalDirectiveLine(
-            text.slice(i, lineEnd), depth))
+    // Only balanced, empty, literal conditional-control directives are
+    // preservable. All other directives are macro/preprocessor state and must
+    // remain outside this include-closure proof.
+    if (!parseLiteralEmptyConditionalDirectiveLine(text.slice(i, lineEnd),
+                                                   depth)) {
       return false;
+    }
 
     sawConditionalDirective = true;
     atLineStart = true;
@@ -839,12 +891,6 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   const bool exactCover = coverBegin == h.aStart && coverEnd == h.aEnd;
   const bool hunkInsideCover = coverBegin <= h.aStart && h.aEnd <= coverEnd;
 
-  auto sameTokenHunk = [](const diffutils::Hunk &lhs,
-                          const diffutils::Hunk &rhs) -> bool {
-    return lhs.aStart == rhs.aStart && lhs.aEnd == rhs.aEnd &&
-           lhs.bStart == rhs.bStart && lhs.bEnd == rhs.bEnd;
-  };
-
   // Return true when `cand` would be absorbed by the closed A-side range
   // [begin, end]. Token-consuming edits use interval overlap; pure insertions
   // use the closed insertion-gap test.
@@ -868,7 +914,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   // diff hunk besides the hunk currently being realized.
   auto rangeHasForeignTokenDiff = [&](uint64_t begin, uint64_t end) -> bool {
     for (const diffutils::Hunk &cand : abTokHunks_) {
-      if (sameTokenHunk(cand, h))
+      if (cand == h)
         continue;
       if (hunkTouchesAClosedRange(cand, begin, end))
         return true;

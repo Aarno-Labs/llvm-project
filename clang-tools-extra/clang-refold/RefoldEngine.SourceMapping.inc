@@ -104,7 +104,7 @@ bool RefoldEngine::HunkFullyWithinArgSpans(
   return any;
 }
 
-std::vector<RefoldEngine::ByteHunk>
+std::vector<diffutils::Hunk>
 RefoldEngine::BuildByteHunksFromRawText() const {
   // Diff at byte granularity by representing each source character as a
   // one-character StringRef into the existing source buffers. This avoids
@@ -113,15 +113,7 @@ RefoldEngine::BuildByteHunksFromRawText() const {
   std::vector<StringRef> bRefs = stringutils::splitChars(bSource_);
 
   auto steps = diffutils::diff(aRefs, bRefs);
-  auto hunks = diffutils::coalesce(steps);
-
-  // Convert generic diff hunks into the engine's byte-hunk representation.
-  std::vector<ByteHunk> out;
-  out.reserve(hunks.size());
-  for (const auto &h : hunks) {
-    out.emplace_back(h.aStart, h.aEnd, h.bStart, h.bEnd);
-  }
-  return out;
+  return diffutils::coalesce(steps);
 }
 
 void RefoldEngine::BuildByteHunkPrefixDeltaCache() {
@@ -136,7 +128,7 @@ void RefoldEngine::BuildByteHunkPrefixDeltaCache() {
   abByteHunkPrefixDelta_.push_back(0);
 
   int64_t runningDelta = 0;
-  for (const ByteHunk &h : *abByteHunks_) {
+  for (const diffutils::Hunk &h : *abByteHunks_) {
     runningDelta += static_cast<int64_t>(h.bEnd - h.bStart) -
                     static_cast<int64_t>(h.aEnd - h.aStart);
     abByteHunkPrefixDelta_.push_back(runningDelta);
@@ -153,7 +145,7 @@ size_t RefoldEngine::MapAByteToBByteLowerBound(size_t aByte) const {
   // Any hunk before this iterator contributes to the cumulative length delta.
   auto it = std::lower_bound(
       abByteHunks_->begin(), abByteHunks_->end(), searchVal,
-      [](const ByteHunk &h, uint64_t val) { return h.aStart < val; });
+      [](const diffutils::Hunk &h, uint64_t val) { return h.aStart < val; });
 
   // If `aByte` falls inside the previous edit hunk, it does not have a stable
   // one-to-one byte mapping. Return the start of that hunk's B-side envelope as
@@ -189,7 +181,7 @@ size_t RefoldEngine::MapAByteToBByteUpperBound(size_t aByte) const {
   // Hunks before this point contribute their cumulative length delta directly.
   auto it = std::lower_bound(
       abByteHunks_->begin(), abByteHunks_->end(), searchVal,
-      [](const ByteHunk &h, uint64_t val) { return h.aStart < val; });
+      [](const diffutils::Hunk &h, uint64_t val) { return h.aStart < val; });
 
   const size_t prefixIndex =
       static_cast<size_t>(std::distance(abByteHunks_->begin(), it));
@@ -310,7 +302,7 @@ RefoldEngine::MapAByteRangeToBTokenEnvelope(size_t aByteBegin,
       const uint64_t val = static_cast<uint64_t>(aByte);
       auto it = std::lower_bound(
           abByteHunks_->begin(), abByteHunks_->end(), val,
-          [](const ByteHunk &h, uint64_t v) { return h.aStart < v; });
+          [](const diffutils::Hunk &h, uint64_t v) { return h.aStart < v; });
 
       unsigned shown = 0;
       for (auto cur = it;
@@ -318,7 +310,7 @@ RefoldEngine::MapAByteRangeToBTokenEnvelope(size_t aByteBegin,
            ++cur) {
         if (cur->bEnd > cur->bStart) {
           trace("byte/env",
-                "A{0} boundary has pure-insertion ByteHunk: A@{1} -> "
+                "A{0} boundary has pure-insertion byte Hunk: A@{1} -> "
                 "Bbytes=[{2},{3}) (len={4})",
                 which, aByte, static_cast<size_t>(cur->bStart),
                 static_cast<size_t>(cur->bEnd),
@@ -347,7 +339,7 @@ RefoldEngine::MapAByteRangeToBTokenEnvelope(size_t aByteBegin,
       const uint64_t key = static_cast<uint64_t>(aByteBegin);
       auto it = std::lower_bound(
           abByteHunks_->begin(), abByteHunks_->end(), key,
-          [](const ByteHunk &h, uint64_t v) { return h.aStart < v; });
+          [](const diffutils::Hunk &h, uint64_t v) { return h.aStart < v; });
 
       for (auto cur = it;
            cur != abByteHunks_->end() && cur->aStart == key && cur->aEnd == key;
@@ -375,7 +367,7 @@ RefoldEngine::MapAByteRangeToBTokenEnvelope(size_t aByteBegin,
       const uint64_t key = static_cast<uint64_t>(aByteEnd);
       auto it = std::lower_bound(
           abByteHunks_->begin(), abByteHunks_->end(), key,
-          [](const ByteHunk &h, uint64_t v) { return h.aStart < v; });
+          [](const diffutils::Hunk &h, uint64_t v) { return h.aStart < v; });
 
       for (auto cur = it;
            cur != abByteHunks_->end() && cur->aStart == key && cur->aEnd == key;
