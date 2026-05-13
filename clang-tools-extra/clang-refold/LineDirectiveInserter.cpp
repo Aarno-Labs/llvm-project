@@ -189,7 +189,7 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
             "cannot inject at tail (non-indent suffix): resumeLine={0} "
             "file={1} lastNl={2} tail={3}",
             resumeLine, fileSpellingForDirective, lastNl,
-            stringutils::showWS(stringutils::clip(replFromBol, 80)));
+            stringutils::showWs(stringutils::clip(replFromBol, 80)));
     }
   } else {
     // With no newline in the replacement, there is no BOL insertion point for
@@ -198,7 +198,7 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
           "cannot inject (no newline in replacement): resumeLine={0} file={1} "
           "replTail={2}",
           resumeLine, fileSpellingForDirective,
-          stringutils::showWS(stringutils::clip(replacement, 80)));
+          stringutils::showWs(stringutils::clip(replacement, 80)));
   }
 
   return replacement.str();

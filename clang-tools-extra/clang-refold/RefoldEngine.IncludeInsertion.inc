@@ -64,7 +64,7 @@ RefoldEngine::ResolveIncludeRealizationBTokenEnvelope(
           "include-realization rescue envelope: label={0} A-cover=[{1},{2}) "
           "Btok=[{3},{4}) text={5}",
           label, beginTok, endTok, env->first, env->second,
-          stringutils::showWSWithClip(SliceBSource(env->first, env->second),
+          stringutils::showWsWithClip(SliceBSource(env->first, env->second),
                                       120));
 
     if (!consensus) {

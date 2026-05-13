@@ -1223,11 +1223,11 @@ std::string RefoldEngine::FormatMacroPatchAudit(const MacroPatch &patch) const {
              patch.subtreeExpectedRootFormalCount,
              patch.subtreeDeferredRootArgCount,
              patch.subtreeBridgeSensitiveFormalCount,
-             stringutils::showWSWithClip(patch.subtreeExpectedRootFormalSummary,
+             stringutils::showWsWithClip(patch.subtreeExpectedRootFormalSummary,
                                          160),
-             stringutils::showWSWithClip(patch.subtreeDeferredRootArgSummary,
+             stringutils::showWsWithClip(patch.subtreeDeferredRootArgSummary,
                                          160),
-             stringutils::showWSWithClip(
+             stringutils::showWsWithClip(
                  patch.subtreeBridgeSensitiveFormalSummary, 160),
              patch.wholeCoverALo, patch.wholeCoverAHi, patch.wholeCoverBRawLo,
              patch.wholeCoverBRawHi, patch.wholeCoverBAdjLo,

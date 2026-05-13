@@ -330,7 +330,7 @@ static bool sameBLineShape(const LcsBGapProvenance &lhs,
   return lhs.hasLeftToken == rhs.hasLeftToken &&
          lhs.hasRightToken == rhs.hasRightToken &&
          lhs.gapContainsNewline == rhs.gapContainsNewline &&
-         lhs.gapContainsOnlyWhitespace == rhs.gapContainsOnlyWhitespace &&
+         lhs.gapContainsOnlyWs == rhs.gapContainsOnlyWs &&
          lhs.gapAtLineStart == rhs.gapAtLineStart &&
          lhs.gapAtLineEnd == rhs.gapAtLineEnd &&
          lhs.leftTokenStartsLine == rhs.leftTokenStartsLine &&
@@ -353,7 +353,7 @@ static uint64_t bGapSurfaceRank(ArrayRef<LcsBGapProvenance> profiles,
   uint64_t rank = 0;
   rank += profile.hasLeftToken ? 1 : 0;
   rank += profile.hasRightToken ? 1 : 0;
-  rank += profile.gapContainsOnlyWhitespace ? 1 : 0;
+  rank += profile.gapContainsOnlyWs ? 1 : 0;
   rank += !profile.gapContainsNewline ? 4 : 0;
   rank += !profile.gapAtLineStart ? 2 : 0;
   rank += !profile.gapAtLineEnd ? 2 : 0;

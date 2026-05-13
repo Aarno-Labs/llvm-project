@@ -14,7 +14,7 @@
 //  • Whitespace predicates:
 //      - isWs(char)                  : PP whitespace (space, HT, LF, VT, FF,
 //                                      CR)
-//      - isWhitespace(StringRef)     : true iff every byte is PP whitespace
+//      - isWs(StringRef)             : true iff every byte is PP whitespace
 //  • Identifier predicates (ASCII):
 //      - isIdentStart(char)          : '_' or ASCII letter
 //      - isIdentPart(char)           : start-char or digit
@@ -24,7 +24,7 @@
 //      - firstNonWsIdx(StringRef)    : first non-WS index or nullopt
 //      - lastNonWsIdx(StringRef)     : last non-WS index or nullopt
 //  • Debug formatting helpers:
-//      - showWS(StringRef)           : visualize whitespace (·, \t, \n, \r, \f,
+//      - showWs(StringRef)           : visualize whitespace (·, \t, \n, \r, \f,
 //                                      \v)
 //      - clip(StringRef, size_t)     : truncate with length suffix
 //  
@@ -37,7 +37,7 @@
 //
 // Usage
 // -----
-//   if (isWhitespace(S)) { … }
+//   if (isWs(S)) { … }
 //   bool glue = isIdentPart(L) && isIdentPart(R);  // conservative boundary
 //   auto first = firstNonWsIdx(Txt);               // nullopt if all whitespace
 //
@@ -81,32 +81,32 @@ bool isIdentifierOrSimpleCallExpr(StringRef replacement) {
   if (s.empty())
     return false;
 
-  if (stringutils::isIdentifierOnly(stringutils::trimEdgeSpaces(s)))
+  if (isIdentifierOnly(trimEdgeSpaces(s)))
     return true;
 
   // Accept the common "IDENT(...)" shape (with balanced parens and only
   // trailing whitespace).
   size_t i = 0;
-  if (!stringutils::isIdentStart(s[i]))
+  if (!isIdentStart(s[i]))
     return false;
   ++i;
-  while (i < s.size() && stringutils::isIdentPart(s[i]))
+  while (i < s.size() && isIdentPart(s[i]))
     ++i;
 
-  i = stringutils::skipWSAndComments(s, i);
+  i = skipWsAndComments(s, i);
   if (i >= s.size() || s[i] != '(')
     return false;
 
-  size_t rparen = stringutils::findMatchingRParen(s, i);
+  size_t rparen = findMatchingRParen(s, i);
   if (rparen == StringRef::npos)
     return false;
 
-  i = stringutils::skipWSAndComments(s, rparen + 1);
+  i = skipWsAndComments(s, rparen + 1);
   return i == s.size();
 }
 
 /// Advance over whitespace and complete line/block comments from \p i.
-size_t skipWSAndComments(StringRef s, size_t i) {
+size_t skipWsAndComments(StringRef s, size_t i) {
   const size_t n = s.size();
   while (i < n) {
     if (isWs(s[i])) {
@@ -313,67 +313,13 @@ std::optional<std::string> canonicalizeStringifyInversePayload(StringRef raw0) {
   return out;
 }
 
-namespace {
-
-/// Clamp a possibly unordered half-open byte range into \p text.
-std::pair<size_t, size_t> clampUnorderedRange(StringRef text, size_t begin,
-                                             size_t end) {
-  begin = std::min(begin, text.size());
-  end = std::min(end, text.size());
-  if (end < begin)
-    std::swap(begin, end);
-  return {begin, end};
-}
-
-} // namespace
-
-/// Return true if a clamped byte range contains an LF byte.
-bool rangeContainsNewline(StringRef text, size_t begin, size_t end) {
-  const auto range = clampUnorderedRange(text, begin, end);
-  return text.substr(range.first, range.second - range.first).find('\n') !=
-         StringRef::npos;
-}
-
-/// Return true if a clamped byte range contains only PP whitespace.
-bool rangeContainsOnlyWhitespace(StringRef text, size_t begin, size_t end) {
-  const auto range = clampUnorderedRange(text, begin, end);
-  return isWhitespace(text.substr(range.first, range.second - range.first));
-}
-
-/// Return the physical-line start byte offset containing \p pos.
-size_t lineStartOffset(StringRef text, size_t pos) {
-  pos = std::min(pos, text.size());
-  while (pos > 0 && text[pos - 1] != '\n' && text[pos - 1] != '\r')
-    --pos;
-  return pos;
-}
-
-/// Return the physical-line end byte offset containing \p pos.
-size_t lineEndOffset(StringRef text, size_t pos) {
-  pos = std::min(pos, text.size());
-  while (pos < text.size() && text[pos] != '\n' && text[pos] != '\r')
-    ++pos;
-  return pos;
-}
-
-/// Return true iff only whitespace precedes \p offset on its physical line.
-bool beginsLineAfterWhitespace(StringRef text, size_t offset) {
-  return rangeContainsOnlyWhitespace(text, lineStartOffset(text, offset),
-                                     offset);
-}
-
-/// Return true iff only whitespace follows \p offset on its physical line.
-bool endsLineBeforeWhitespace(StringRef text, size_t offset) {
-  return rangeContainsOnlyWhitespace(text, offset, lineEndOffset(text, offset));
-}
-
 /// Decide whether the last chained-call suffix belongs to the replacement.
 bool shouldPreserveFinalCallSuffixGroup(StringRef replacement) {
   StringRef s = replacement.trim();
   if (s.empty())
     return false;
 
-  size_t pos = skipWSAndComments(s, 0);
+  size_t pos = skipWsAndComments(s, 0);
   if (pos >= s.size() || s[pos] != '(')
     return false;
 
@@ -381,18 +327,18 @@ bool shouldPreserveFinalCallSuffixGroup(StringRef replacement) {
   if (headEnd == StringRef::npos)
     return false;
 
-  const size_t firstInside = skipWSAndComments(s, pos + 1);
+  const size_t firstInside = skipWsAndComments(s, pos + 1);
   if (firstInside >= headEnd)
     return false;
 
-  pos = skipWSAndComments(s, headEnd + 1);
+  pos = skipWsAndComments(s, headEnd + 1);
   bool sawCallGroup = false;
   while (pos < s.size() && s[pos] == '(') {
     const size_t groupEnd = findMatchingRParen(s, pos);
     if (groupEnd == StringRef::npos)
       return false;
     sawCallGroup = true;
-    pos = skipWSAndComments(s, groupEnd + 1);
+    pos = skipWsAndComments(s, groupEnd + 1);
   }
 
   return sawCallGroup && pos == s.size();
@@ -410,7 +356,7 @@ uint64_t extendChainedCallEnd(StringRef fileText, uint64_t invEnd,
   const bool preserveFinalSuffixGroup =
       shouldPreserveFinalCallSuffixGroup(replacement);
 
-  size_t pos = skipWSAndComments(fileText, static_cast<size_t>(invEnd));
+  size_t pos = skipWsAndComments(fileText, static_cast<size_t>(invEnd));
   if (pos >= fileText.size() || fileText[pos] != '(')
     return invEnd;
 
@@ -422,7 +368,7 @@ uint64_t extendChainedCallEnd(StringRef fileText, uint64_t invEnd,
     if (r == StringRef::npos)
       break;
     groupEnds.push_back(static_cast<uint64_t>(r + 1));
-    pos = skipWSAndComments(fileText, r + 1);
+    pos = skipWsAndComments(fileText, r + 1);
   }
 
   if (groupEnds.empty())
@@ -435,7 +381,7 @@ uint64_t extendChainedCallEnd(StringRef fileText, uint64_t invEnd,
 }
 
 /// Return true iff \p lit appears after leading whitespace in \p s.
-bool startsWithAfterWhitespace(StringRef s, StringRef lit) {
+bool startsWithAfterWs(StringRef s, StringRef lit) {
   size_t i = 0;
   while (i < s.size()) {
     char c = s[i];

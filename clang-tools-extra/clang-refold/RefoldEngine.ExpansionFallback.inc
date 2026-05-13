@@ -28,7 +28,7 @@
 /// because comments and whitespace do not contribute preprocessing tokens.
 /// Anything that would lex as a real token, including malformed or
 /// unterminated comments, remains outside this proof class.
-static bool isWhitespaceOrCompleteCommentTrivia(StringRef text) {
+static bool isWsOrCompleteCommentTrivia(StringRef text) {
   size_t i = 0;
   const size_t n = text.size();
 
@@ -109,8 +109,8 @@ static bool parseLiteralEmptyConditionalDirectiveLine(StringRef line,
 
   // A trailing backslash would splice this physical line with the next one.
   // That makes the gap non-local, so it is outside the preserved-trivia proof.
-  StringRef noTrailingHorizontalWS = line.rtrim(" \t\v\f");
-  if (noTrailingHorizontalWS.ends_with("\\"))
+  StringRef noTrailingHorizontalWs = line.rtrim(" \t\v\f");
+  if (noTrailingHorizontalWs.ends_with("\\"))
     return false;
 
   StringRef rest = line.ltrim(" \t\v\f");
@@ -167,7 +167,7 @@ static bool parseLiteralEmptyConditionalDirectiveLine(StringRef line,
 /// diagnostics, line state, or later preprocessing remains outside this proof
 /// class and forces the caller to fail closed.
 static bool isPreservableIncludeClosureGapTrivia(StringRef text) {
-  if (isWhitespaceOrCompleteCommentTrivia(text))
+  if (isWsOrCompleteCommentTrivia(text))
     return true;
 
   size_t i = 0;
@@ -1056,8 +1056,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
                                            DenseSet<uint64_t> &)>
       includeRecordedSideEffectReasonImpl;
   includeRecordedSideEffectReasonImpl =
-      [&](const RefoldModel::IncludeItem &inc, DenseSet<uint64_t> &visiting)
-          -> std::optional<std::string> {
+      [&](const RefoldModel::IncludeItem &inc,
+          DenseSet<uint64_t> &visiting) -> std::optional<std::string> {
     // A cycle would indicate malformed include-parent metadata.  Do not try to
     // prove closure through it; reject rather than deleting uncertain state.
     if (!visiting.insert(inc.id).second)
@@ -1106,21 +1106,23 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     // replacement envelope, the directive is consumed with that envelope.  Any
     // surviving source that still observes the removed macro state is handled
     // later by the macro-state liveness repair passes: consumed #defines can be
-    // preserved or replaced with whole-cover callsite realizations, and consumed
-    // #undefs can be preserved when removing them would resurrect an earlier
-    // definition.  Directives outside that nameable macro-state class remain
-    // side-effect-bearing structure that this closure must not erase.
-    for (const auto &directive : model_.GetMacroDirectives())
+    // preserved or replaced with whole-cover callsite realizations, and
+    // consumed #undefs can be preserved when removing them would resurrect an
+    // earlier definition.  Directives outside that nameable macro-state class
+    // remain side-effect-bearing structure that this closure must not erase.
+    for (const auto &directive : model_.GetMacroDirectives()) {
       if (directive.ownerIncludeId && *directive.ownerIncludeId == inc.id &&
-          directive.subkind != "#define" && directive.subkind != "#undef")
-        return finish(llvm::formatv("include id={0} path='{1}' owns "
-                                    "non-consumable macro directive id={2} "
-                                    "subkind='{3}' text='{4}'",
-                                    inc.id, includePathForDiagnostic(inc),
-                                    directive.id, directive.subkind,
-                                    stringutils::showWSWithClip(directive.text,
-                                                                 120))
-                          .str());
+          directive.subkind != "#define" && directive.subkind != "#undef") {
+        return finish(
+            llvm::formatv("include id={0} path='{1}' owns "
+                          "non-consumable macro directive id={2} "
+                          "subkind='{3}' text='{4}'",
+                          inc.id, includePathForDiagnostic(inc), directive.id,
+                          directive.subkind,
+                          stringutils::showWsWithClip(directive.text, 120))
+                .str());
+      }
+    }
 
     // Conditional control directives are also source structure, but an
     // include-local conditional group with no materialized A tokens is source
@@ -1135,8 +1137,9 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       if (!group.parentIncludeId || *group.parentIncludeId != inc.id)
         continue;
 
-      for (const RefoldModel::CondArm &arm : group.arms)
-        if (arm.span && arm.span->IsValid() && arm.span->begin < arm.span->end)
+      for (const RefoldModel::CondArm &arm : group.arms) {
+        if (arm.span && arm.span->IsValid() &&
+            arm.span->begin < arm.span->end) {
           return finish(llvm::formatv("include id={0} path='{1}' owns "
                                       "conditional group id={2} arm id={3} "
                                       "with materialized PP span=[{4},{5})",
@@ -1144,6 +1147,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
                                       group.id, arm.id, arm.span->begin,
                                       arm.span->end)
                             .str());
+        }
+      }
     }
 
     // Pragmas are keyed by physical file path rather than include id, so check
@@ -1158,20 +1163,21 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       for (const auto &pragma : model_.GetPragmas()) {
         if (!PathsEqual(pragma.sitePath, *inc.resolvedPath))
           continue;
-        if (!pragmaIsConsumableIncludeLocalState(pragma))
-          return finish(llvm::formatv("include id={0} path='{1}' contains "
-                                      "non-consumable pragma id={2} text='{3}'",
-                                      inc.id, includePathForDiagnostic(inc),
-                                      pragma.id,
-                                      stringutils::showWSWithClip(pragma.text,
-                                                                   120))
-                            .str());
-        if (includeHasNonPragmaStructure(inc))
+        if (!pragmaIsConsumableIncludeLocalState(pragma)) {
+          return finish(
+              llvm::formatv("include id={0} path='{1}' contains "
+                            "non-consumable pragma id={2} text='{3}'",
+                            inc.id, includePathForDiagnostic(inc), pragma.id,
+                            stringutils::showWsWithClip(pragma.text, 120))
+                  .str());
+        }
+        if (includeHasNonPragmaStructure(inc)) {
           return finish(llvm::formatv("include id={0} path='{1}' contains "
                                       "#pragma once with additional recorded "
                                       "source structure",
                                       inc.id, includePathForDiagnostic(inc))
                             .str());
+        }
       }
 
     return finish(std::nullopt);
@@ -1374,7 +1380,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
         replacement->directive->text.substr(replacement->replacementTextBegin);
 
     // A literal empty replacement list is source-neutral by construction.
-    if (isWhitespaceOrCompleteCommentTrivia(replacementText))
+    if (isWsOrCompleteCommentTrivia(replacementText))
       return finish(true);
 
     // Non-empty function-like wrappers require argument-substitution and
@@ -1449,7 +1455,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       const size_t gapEnd =
           static_cast<size_t>(piece.begin - replacement->fileBase);
       StringRef gap = replacement->directive->text.slice(gapBegin, gapEnd);
-      if (!isWhitespaceOrCompleteCommentTrivia(gap))
+      if (!isWsOrCompleteCommentTrivia(gap))
         return finish(false);
 
       // The child itself must satisfy the same zero-token source-neutral proof.
@@ -1467,7 +1473,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     const size_t suffixBegin =
         static_cast<size_t>(cursor - replacement->fileBase);
     StringRef suffix = replacement->directive->text.substr(suffixBegin);
-    if (!isWhitespaceOrCompleteCommentTrivia(suffix))
+    if (!isWsOrCompleteCommentTrivia(suffix))
       return finish(false);
 
     return finish(true);
@@ -1551,7 +1557,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     for (const GapPiece &piece : pieces) {
       if (piece.begin < cursor)
         return false;
-      if (!stringutils::isWhitespace(tuBytes.slice(cursor, piece.begin)))
+      if (!stringutils::isWs(tuBytes.slice(cursor, piece.begin)))
         return false;
       cursor = piece.end;
       if (piece.kind == "include")
@@ -1559,7 +1565,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       else
         ++macroCount;
     }
-    if (!stringutils::isWhitespace(tuBytes.slice(cursor, gapEnd)))
+    if (!stringutils::isWs(tuBytes.slice(cursor, gapEnd)))
       return false;
 
     trace("fallback",
@@ -1741,12 +1747,12 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     for (const auto &piece : mergedPieces) {
       if (piece.first > cursor) {
         StringRef gap = tuBytes.slice(cursor, piece.first);
-        if (!stringutils::isWhitespace(gap) &&
+        if (!stringutils::isWs(gap) &&
             !gapIsConsumableZeroTokenSourceClosure(cursor, piece.first)) {
           trace("fallback",
                 "TU/include closure rejected: non-whitespace TU gap inside "
                 "mixed source interval [{0},{1}) gap='{2}'",
-                cursor, piece.first, stringutils::showWSWithClip(gap, 120));
+                cursor, piece.first, stringutils::showWsWithClip(gap, 120));
           return std::nullopt;
         }
       }
@@ -1831,24 +1837,24 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     // are still preserved verbatim rather than silently deleted.
     if (inc->siteB > sourceCursor) {
       StringRef gap = tuBytes.slice(sourceCursor, inc->siteB);
-      if (!gap.empty() && !stringutils::isWhitespace(gap)) {
+      if (!gap.empty() && !stringutils::isWs(gap)) {
         if (gapIsConsumableZeroTokenSourceClosure(sourceCursor, inc->siteB)) {
           trace("fallback",
                 "TU include-closure consuming zero-token source gap before "
                 "inc#{0} gap='{1}'",
-                inc->id, stringutils::showWSWithClip(gap, 120));
+                inc->id, stringutils::showWsWithClip(gap, 120));
         } else if (!isPreservableIncludeClosureGapTrivia(gap)) {
           trace("fallback",
                 "TU include-closure rejected: non-trivia TU gap between "
                 "include directives before inc#{0} gap='{1}'",
-                inc->id, stringutils::showWSWithClip(gap, 120));
+                inc->id, stringutils::showWsWithClip(gap, 120));
           return std::nullopt;
         } else {
           preservedGapTrivia.append(gap.begin(), gap.end());
           trace("fallback",
                 "TU include-closure preserving inert trivia gap before "
                 "inc#{0} gap='{1}'",
-                inc->id, stringutils::showWSWithClip(gap, 120));
+                inc->id, stringutils::showWsWithClip(gap, 120));
         }
       }
     }
@@ -2008,7 +2014,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
                 "TU include-closure newline sink: absorbed source=[{0},{1}) "
                 "line='{2}' remainingPad={3} (single-line invariant-preserving "
                 "sink)",
-                lineBegin, lineEnd, stringutils::showWSWithClip(line, 120),
+                lineBegin, lineEnd, stringutils::showWsWithClip(line, 120),
                 remainingPadNl);
         }
       }
@@ -2047,7 +2053,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
           "TU include-closure newline pad: source=[{0},{1}) origNl={2} "
           "replNl={3} physicalPadNl={4} finalSourceEnd={5} result='{6}'",
           sourceBegin, sourceEnd, origNl, initialReplNl, remainingPadNl,
-          closureSourceEnd, stringutils::showWSWithClip(padded, 120));
+          closureSourceEnd, stringutils::showWsWithClip(padded, 120));
   }
 
   debug("fallback",
@@ -2055,8 +2061,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
         "A=[{4},{5}) B=[{6},{7}) evidence={8} raw='{9}' padded='{10}'",
         first->id, last->id, sourceBegin, closureSourceEnd, materialBeginA,
         materialEndA, bEnvelope->first, bEnvelope->second, evidenceKind,
-        stringutils::showWSWithClip(rawReplacement, 120),
-        stringutils::showWSWithClip(padded, 120));
+        stringutils::showWsWithClip(rawReplacement, 120),
+        stringutils::showWsWithClip(padded, 120));
 
   ResyncOutcome ro = ApplyResyncOrPend(tuBytes, sourceBegin, closureSourceEnd,
                                        padded, tuPath);
@@ -2134,7 +2140,7 @@ bool RefoldEngine::ExpansionFallbackReplacementIsReplayStable(
             "macro-owner fallback synthesis rejected: replay-unstable token "
             "kind={0} off={1} spelling='{2}'",
             clang::tok::getTokenName(token.getKind()), off,
-            stringutils::showWSWithClip(spelling, 80));
+            stringutils::showWsWithClip(spelling, 80));
       return false;
     }
   }

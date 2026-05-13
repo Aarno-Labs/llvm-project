@@ -1034,8 +1034,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
             "file={0} patch[{1}] kind={2} A=[{3},{4}) B=[{5},{6}) pp=[{7},{8}) "
             "bytes=[{9},{10}) decl={11} orig='{12}' repl='{13}'",
             file, idx, opKind, p.aStart, p.aEnd, p.bStart, p.bEnd, ppLo, ppHi,
-            startByte, endByte, declInfo, stringutils::showWS(origDbg),
-            stringutils::showWS(replDbg));
+            startByte, endByte, declInfo, stringutils::showWs(origDbg),
+            stringutils::showWs(replDbg));
     }
 
     // Stage the include-preserving mapped-header edit and attach the witness
@@ -1194,7 +1194,7 @@ RefoldEngine::ApplyResyncOrPend(StringRef originalFileText, uint64_t start,
         "drift: span=[{0},{1}) origNl={2} replNl={3} resumeLine={4} file={5} "
         "replTail={6}",
         start, end, origNl, replNl, resumeLine, fileSpellingForDirective,
-        stringutils::showWSWithClip(replacement, 100));
+        stringutils::showWsWithClip(replacement, 100));
 
   std::string injected = lineDirs_.MaybeAppendResyncAfterReplacement(
       originalFileText, start, end, replacement, fileSpellingForDirective);
@@ -2217,8 +2217,8 @@ void RefoldEngine::DebugIncludePatch(StringRef tag,
         "{0} inc #{1} hunk A[{2},{3})->B[{4},{5}) Abytes=[{6},{7}) "
         "Bbytes=[{8},{9}) Aslice='{10}' Bslice='{11}'",
         tag, inc.id, h.aStart, h.aEnd, h.bStart, h.bEnd, a0, a1, b0, b1,
-        stringutils::showWSWithClip(aSlice, 120),
-        stringutils::showWSWithClip(bSlice, 120));
+        stringutils::showWsWithClip(aSlice, 120),
+        stringutils::showWsWithClip(bSlice, 120));
 }
 
 std::string RefoldEngine::PPArgSpanToString(const RefoldModel::PPArgSpan &sp,

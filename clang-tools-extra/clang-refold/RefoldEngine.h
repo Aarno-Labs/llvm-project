@@ -283,7 +283,7 @@ private:
     return llvm::formatv(
                "kind={0} requestCount={1} primaryReason='{2}'", kindName,
                witness.requestCount,
-               stringutils::showWSWithClip(witness.primaryReason, 200))
+               stringutils::showWsWithClip(witness.primaryReason, 200))
         .str();
   }
 
@@ -651,7 +651,7 @@ private:
     if (!lastTheoremAudit_.theoremSatisfied &&
         !lastTheoremAudit_.firstViolation.empty()) {
       info("theorem", "firstViolation={0}",
-           stringutils::showWSWithClip(lastTheoremAudit_.firstViolation, 220));
+           stringutils::showWsWithClip(lastTheoremAudit_.firstViolation, 220));
     }
   }
 
@@ -2270,9 +2270,7 @@ private:
   /// diff/LCS alignment.
   ///
   /// This method produces the token sequence consumed by the LCS/Myers
-  /// pipeline. For most tokens, the emitted element is simply PPTok::spelling.
-  /// For ASCII-whitespace tokens, the emitted element is replaced with a
-  /// position-tied sentinel of the form "WS@<offset>".
+  /// pipeline. The emitted element is simply PPTok::spelling.
   ///
   /// The whitespace sentinel prevents the aligner from treating arbitrary
   /// whitespace runs as interchangeable anchors. By tying whitespace lexemes to
@@ -2859,7 +2857,7 @@ private:
   ///
   /// ### Stringify rule (strict mode)
   /// When `strict` is enabled and `argIdx` is stringified at least once, every
-  /// stringify occurrence must exactly equal `QuoteCString(trimEdgeWS(newArg))`.
+  /// stringify occurrence must exactly equal `QuoteCString(trimEdgeWs(newArg))`.
   /// If any stringify occurrence disagrees, the method returns `false`.
   ///
   /// ### Paste consumption model for STANDARD spans

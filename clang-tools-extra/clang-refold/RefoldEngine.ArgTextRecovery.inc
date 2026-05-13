@@ -139,7 +139,7 @@ RefoldEngine::ParseMacroInvocationArgContentRanges(StringRef invText) {
   // inside) denotes zero macro arguments, not one empty argument. That matters
   // for args-only lifting of zero-arg call chains such as "PICK1()(10)".
   const size_t afterOpen = open + 1;
-  const size_t firstTok = stringutils::skipWSAndComments(invText, afterOpen);
+  const size_t firstTok = stringutils::skipWsAndComments(invText, afterOpen);
   if (firstTok < n && invText[firstTok] == ')')
     return out;
 
