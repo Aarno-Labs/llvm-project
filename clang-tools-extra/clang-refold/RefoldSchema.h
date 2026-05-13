@@ -840,6 +840,14 @@ static constexpr const char *RefoldSchema = R"json(
             "$ref": "#/$defs/OptByteRange"
           }
         },
+        "definition_directive_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "Directive item id for the active macro definition used by this invocation, when known. This allows the consumer to detect preserved call sites whose defining #define was consumed by a TU edit."
+        },
         "caller_macro_id": {
           "type": "integer",
           "minimum": 0,

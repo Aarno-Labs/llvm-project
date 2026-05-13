@@ -383,6 +383,7 @@ public:
     std::optional<uint64_t> invPPByteBegin,
         invPPByteEnd; // A-stream byte envelope
     std::optional<uint64_t> ownerIncludeId;
+    std::optional<uint64_t> definitionDirectiveId;
     std::optional<uint64_t> callerMacroId;
     MacroCalleeOrigin calleeOrigin;
     std::vector<std::vector<uint32_t>> argDeps;
@@ -398,6 +399,7 @@ public:
                     std::optional<uint64_t> invPPByteBegin,
                     std::optional<uint64_t> invPPByteEnd,
                     std::optional<uint64_t> ownerIncludeId,
+                    std::optional<uint64_t> definitionDirectiveId,
                     std::vector<MacroDefParam> defParams,
                     std::vector<OptByteRange> invArgRanges,
                     std::vector<OptByteRange> normalizedInvArgTextRanges,
@@ -422,6 +424,7 @@ public:
           bodySpans(std::move(bodySpans)), invText(invText), invFile(invFile),
           invB(invB), invE(invE), invPPByteBegin(invPPByteBegin),
           invPPByteEnd(invPPByteEnd), ownerIncludeId(ownerIncludeId),
+          definitionDirectiveId(definitionDirectiveId),
           callerMacroId(callerMacroId), calleeOrigin(std::move(calleeOrigin)),
           argDeps(std::move(argDeps)), argRefs(std::move(argRefs)),
           argTupleRefs(std::move(argTupleRefs)) {

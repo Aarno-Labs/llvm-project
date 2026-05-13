@@ -48,6 +48,7 @@
 #include "clang/Basic/SourceManager.h"
 #include "clang/Lex/MacroInfo.h"
 #include "clang/Lex/Preprocessor.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 
@@ -220,6 +221,10 @@ struct Item {
   // identifies the immediately enclosing caller invocation (its Item::ID).
   // InvArgDeps records, for each invocation argument, which caller formal(s)
   // the raw argument text references (by index in the caller's DefParams).
+  // Exact #define directive item used as the active definition for this
+  // invocation, when the defining directive was recorded in this map.
+  std::optional<uint64_t> DefinitionDirectiveId;
+
   std::optional<uint64_t> CallerMacroId;
   MacroCalleeOrigin CalleeOrigin;
   std::vector<std::vector<uint32_t>> InvArgDeps;
@@ -391,6 +396,7 @@ class RefoldMapBuilder {
 
   std::vector<Item> Items;
   llvm::StringMap<size_t> MacroKey2Item;
+  llvm::DenseMap<const MacroInfo *, uint64_t> MacroInfo2DefinitionDirectiveId;
   /// Global index of paste-produced token spellings -> macro invocation items
   /// that can produce that spelling. Used for paste-through-stringify
   /// projection when a pasted token is later embedded inside a string literal

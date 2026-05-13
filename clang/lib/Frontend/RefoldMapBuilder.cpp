@@ -2268,6 +2268,12 @@ void RefoldMapBuilder::onMacroDefined(const Token &MacroNameTok,
   // consumer can attribute this directive to the include that brought it in.
   if (!IncludeStack.empty() && IncludeStack.back())
     Items.back().OwnerIncludeId = static_cast<uint64_t>(*IncludeStack.back());
+
+  // Remember the exact recorded #define item for this MacroInfo so later
+  // MacroExpands callbacks can serialize a deterministic invocation ->
+  // definition edge.  This is stronger than reconstructing macro liveness from
+  // source order in the consumer, especially across redefinitions and includes.
+  MacroInfo2DefinitionDirectiveId[MI] = Items.back().ID;
 }
 
 void RefoldMapBuilder::onMacroUndefined(const Token &MacroNameTok,
@@ -2349,6 +2355,11 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
 
   It.Loc = Range.getBegin();
   It.IsBuiltinMacro = (MI != nullptr && MI->isBuiltinMacro());
+  if (MI) {
+    auto DefIt = MacroInfo2DefinitionDirectiveId.find(MI);
+    if (DefIt != MacroInfo2DefinitionDirectiveId.end())
+      It.DefinitionDirectiveId = DefIt->second;
+  }
 
   // --- Invocation text + byte range logic ---
   SourceLocation BeginTokLoc = Range.getBegin();
@@ -4816,6 +4827,10 @@ void RefoldMapBuilder::writeJSON() {
                 }
               });
             }
+
+            if (It.DefinitionDirectiveId)
+              JO.attribute("definition_directive_id",
+                           *It.DefinitionDirectiveId);
 
             if (It.CallerMacroId)
               JO.attribute("caller_macro_id", *It.CallerMacroId);
