@@ -3859,33 +3859,41 @@ std::string RefoldEngine::RunSinglePassRefold() {
                                                 tuBytes.size()))
       continue;
 
-    // The repair is to re-emit the consumed #undef before the replacement text.
-    // That is only syntactically valid if the TU edit starts at a physical BOL;
-    // otherwise we cannot place a preprocessing directive there safely.
-    if (edit.start != 0 && tuBytes[edit.start - 1] != '\n') {
+    // Preserve the consumed #undef with the edit that swallowed it.  The
+    // shared macro-state preservation helper handles both proof shapes:
+    // before-replacement insertion when the edit already starts at physical
+    // BOL, and after-replacement insertion when the replacement payload cannot
+    // observe the macro name and the directive/suffix boundary is safe.  This
+    // is the #undef mirror of consumed-#define liveness repair: the transition
+    // is zero-token source structure, but later preserved source can still
+    // observe whether that transition remains in the macro-state stream.
+    std::optional<MacroStatePreservationPlacement> placement =
+        tryQueueMacroStateDirectivePreservation(*editIndex, undefDirective,
+                                                ref.name);
+    if (!placement) {
       RequestTerminalFallback(
           TerminalFallbackKind::UndischargedEmissionArtifact,
           "macro-undef-liveness",
           llvm::formatv("#undef directive #{0} for macro '{1}' was consumed "
-                        "by TU edit [{2},{3}), but the edit does not start "
-                        "at physical BOL so the directive cannot be "
-                        "preserved before surviving observations",
+                        "by TU edit [{2},{3}), but it could not be preserved "
+                        "without exposing the replacement payload to the "
+                        "macro name or breaking the replacement/suffix "
+                        "boundary",
                         undefDirective.id, ref.name, edit.start, edit.end)
               .str());
       continue;
     }
 
-    // Preserve the #undef with the edit that consumed it. This keeps the
-    // original macro-state transition visible to later preserved source.
-    macroStatePreservationsByEdit[*editIndex].push_back(
-        MacroStatePreservation{
-            &undefDirective, MacroStatePreservationPlacement::BeforeReplacement});
     ++undefLivenessHazards;
     warn("macro/liveness",
          "preserving consumed #undef to prevent resurrected macro definition: "
-         "macro='{0}' undefDirective=#{1} priorDefine=#{2} edit=[{3},{4})",
+         "macro='{0}' undefDirective=#{1} priorDefine=#{2} edit=[{3},{4}) "
+         "placement={5}",
          ref.name, undefDirective.id, previousDefinition->id, edit.start,
-         edit.end);
+         edit.end,
+         *placement == MacroStatePreservationPlacement::BeforeReplacement
+             ? "before-replacement"
+             : "after-replacement");
   }
 
   if (terminalFallbackRequested_) {
