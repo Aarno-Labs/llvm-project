@@ -315,6 +315,58 @@ static bool conditionalGroupIsNeutralIsland(
                                              policy, recursionStack);
 }
 
+/// Consume a token-paste chain only in the placemarker domain.
+///
+/// This helper is shared by the TU mixed-closure and header include-envelope
+/// zero-token macro proofs.  A paste chain is neutral only when every operand is
+/// a formal parameter and every corresponding invocation argument has already
+/// discharged the caller's token-empty argument proof.  That admits forms such
+/// as `#define CAT(a,b) a ## b` with `CAT(,)`, while still rejecting literals,
+/// non-empty operands, unrecorded identifiers, and paste chains that synthesize
+/// real PP-token material.
+static bool consumeNeutralPlacemarkerPasteChain(
+    StringRef text, size_t &pos, size_t end, unsigned firstParam,
+    const DenseMap<StringRef, unsigned> &paramIndexByName,
+    function_ref<bool(size_t &, size_t)> skipReplacementTriviaUntil,
+    function_ref<bool(unsigned)> argumentRangeIsNeutral,
+    SmallVectorImpl<unsigned> &usedParams) {
+  size_t cursor = pos;
+  if (!skipReplacementTriviaUntil(cursor, end))
+    return false;
+  if (cursor + 1 >= end || text[cursor] != '#' || text[cursor + 1] != '#')
+    return false;
+
+  if (!argumentRangeIsNeutral(firstParam))
+    return false;
+  usedParams.push_back(firstParam);
+
+  while (cursor + 1 < end && text[cursor] == '#' && text[cursor + 1] == '#') {
+    cursor += 2;
+    if (!skipReplacementTriviaUntil(cursor, end))
+      return false;
+    if (cursor >= end || !stringutils::isIdentStart(text[cursor]))
+      return false;
+
+    const size_t operandBegin = cursor++;
+    while (cursor < end && stringutils::isIdentPart(text[cursor]))
+      ++cursor;
+    StringRef operand = text.slice(operandBegin, cursor);
+
+    auto paramIt = paramIndexByName.find(operand);
+    if (paramIt == paramIndexByName.end())
+      return false;
+    if (!argumentRangeIsNeutral(paramIt->second))
+      return false;
+    usedParams.push_back(paramIt->second);
+
+    if (!skipReplacementTriviaUntil(cursor, end))
+      return false;
+  }
+
+  pos = cursor;
+  return true;
+}
+
 /// Byte envelope covered by normalized owner-proof source pieces.
 struct OwnerProofSourceEnvelope { uint64_t begin = 0, end = 0; };
 
