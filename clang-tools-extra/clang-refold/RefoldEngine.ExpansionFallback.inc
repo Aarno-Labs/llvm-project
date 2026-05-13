@@ -268,19 +268,73 @@ struct SourceLineDirectiveGapResume {
   std::string fileSpelling;
 };
 
-/// Parse one source-spelled `#line` directive line.
+/// Build the translation-phase-2 logical spelling of one source line.
+///
+/// Source-level `#line` gaps are parsed from raw file bytes because they do not
+/// have ordinary PP tokens in the refold map.  Directive recognition occurs
+/// after C line splicing, so a `#` line whose trailing backslash splices the
+/// following `line 123` text is the same logical directive as `#line 123`.
+/// This helper removes only literal
+/// backslash-newline and backslash-CRLF pairs that are fully contained in the
+/// proved source gap, then returns the byte just after the terminating
+/// non-spliced newline.
+static bool collectPhase2LogicalLine(StringRef fileText, uint64_t lineBegin,
+                                     uint64_t limit, std::string &logicalLine,
+                                     uint64_t &afterLine) {
+  if (lineBegin > limit || limit > fileText.size())
+    return false;
+
+  logicalLine.clear();
+  for (uint64_t pos = lineBegin; pos < limit;) {
+    char ch = fileText[pos];
+
+    // C translation phase 2 deletes backslash-newline pairs before
+    // preprocessing directives are recognized.  Require the whole pair to be
+    // inside the already-proved source gap so the closure does not depend on
+    // bytes outside its envelope.
+    if (ch == '\\') {
+      if (pos + 1 < limit && fileText[pos + 1] == '\n') {
+        pos += 2;
+        continue;
+      }
+      if (pos + 2 < limit && fileText[pos + 1] == '\r' &&
+          fileText[pos + 2] == '\n') {
+        pos += 3;
+        continue;
+      }
+    }
+
+    if (ch == '\n') {
+      afterLine = pos + 1;
+      return true;
+    }
+
+    logicalLine.push_back(ch);
+    ++pos;
+  }
+
+  // Preserve the previous EOF-without-newline behavior for a complete final
+  // directive line.  A dangling trailing backslash remains in logicalLine and
+  // will be rejected by the strict #line parser below.
+  afterLine = limit;
+  return true;
+}
+
+/// Parse one source-spelled `#line` directive logical line.
 ///
 /// The refold map does not currently record `#line` as a first-class artifact,
 /// because it contributes no ordinary PP tokens.  Mixed source-envelope proofs
 /// therefore recover this narrow directive shape directly from the source bytes
 /// when a `#line` line lies between otherwise required owner pieces.
 ///
-/// This parser is intentionally stricter than the general preprocessor grammar:
-/// it accepts only a complete physical `#line <digits> ["file"]` line with
-/// optional horizontal whitespace.  Macro-dependent or line-spliced directive
-/// spellings remain outside this proof class.
+/// The input is a translation-phase-2 logical line: any C backslash-newline
+/// splices have already been removed by the caller.  This parser is still
+/// intentionally stricter than the general preprocessor grammar: it accepts
+/// only source-spelled `#line <digits> ["file"]` with optional horizontal
+/// whitespace.  Macro-dependent spellings remain outside this proof class.
 static std::optional<LineDirectiveState>
-parseSourceLineDirectiveLine(StringRef line, StringRef currentFileSpelling) {
+parseSourceLineDirectiveLogicalLine(StringRef line,
+                                    StringRef currentFileSpelling) {
   if (line.ends_with("\n"))
     line = line.drop_back();
   if (line.ends_with("\r"))
@@ -420,15 +474,14 @@ computeSourceLineDirectiveGapResume(StringRef fileText, uint64_t gapBegin,
     if (ch != '#' || !atLineStart)
       return std::nullopt;
 
-    uint64_t lineEnd = cursor;
-    while (lineEnd < gapEnd && fileText[lineEnd] != '\n')
-      ++lineEnd;
-    const bool hasNewline = lineEnd < gapEnd;
-    const uint64_t afterLine = hasNewline ? lineEnd + 1 : lineEnd;
+    std::string logicalLine;
+    uint64_t afterLine = cursor;
+    if (!collectPhase2LogicalLine(fileText, cursor, gapEnd, logicalLine,
+                                  afterLine))
+      return std::nullopt;
 
     std::optional<LineDirectiveState> state =
-        parseSourceLineDirectiveLine(fileText.slice(cursor, lineEnd),
-                                     currentFileSpelling);
+        parseSourceLineDirectiveLogicalLine(logicalLine, currentFileSpelling);
     if (!state)
       return std::nullopt;
 
