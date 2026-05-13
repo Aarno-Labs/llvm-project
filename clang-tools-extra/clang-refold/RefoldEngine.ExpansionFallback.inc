@@ -298,9 +298,14 @@ struct SourceLineDirectiveMacroReplacement {
   SmallVector<uint64_t, 4> macroInvocationIds;
 };
 
+using SourceLineDirectiveBuiltinMacroResolver =
+    std::function<std::optional<std::string>(
+        const RefoldModel::MacroInvocation &)>;
+
 using SourceLineDirectiveLogicalLineRewriter =
     std::function<std::optional<SourceLineDirectiveLogicalLineRewrite>(
-        StringRef, ArrayRef<uint64_t>)>;
+        StringRef, ArrayRef<uint64_t>,
+        SourceLineDirectiveBuiltinMacroResolver)>;
 
 /// Build the translation-phase-2 logical spelling of one source line.
 ///
@@ -357,6 +362,48 @@ static bool collectPhase2LogicalLine(
   // will be rejected by the strict #line parser below.
   afterLine = limit;
   return true;
+}
+
+
+/// Return true if the source prefix may already have changed the presumed
+/// line-control state before a zero-token `__LINE__` operand is encountered.
+///
+/// Predefined `__LINE__` expands to the current presumed line number, not
+/// blindly to the physical file line.  The refold map records the builtin
+/// invocation site, but not a first-class line-control state snapshot for that
+/// site.  Therefore this local proof uses the physical line number only when
+/// the same source file prefix contains no earlier line-control directive.
+/// Inside a source gap, later directives are handled by
+/// computeSourceLineDirectiveGapResume()'s running state before the builtin is
+/// substituted.
+static bool sourcePrefixMayContainLineControlDirective(StringRef fileText,
+                                                       uint64_t limit) {
+  limit = std::min<uint64_t>(limit, fileText.size());
+
+  for (uint64_t lineBegin = 0; lineBegin < limit;) {
+    std::string logicalLine;
+    uint64_t afterLine = lineBegin;
+    if (!collectPhase2LogicalLine(fileText, lineBegin, limit, logicalLine,
+                                  afterLine))
+      return true;
+
+    StringRef rest = StringRef(logicalLine).ltrim(" \t\v\f");
+    if (rest.consume_front("#")) {
+      rest = rest.ltrim(" \t\v\f");
+      if (rest.starts_with("line") &&
+          (rest.size() == StringRef("line").size() ||
+           !stringutils::isIdentPart(rest[StringRef("line").size()])))
+        return true;
+      if (!rest.empty() && '0' <= rest.front() && rest.front() <= '9')
+        return true;
+    }
+
+    if (afterLine <= lineBegin)
+      return true;
+    lineBegin = afterLine;
+  }
+
+  return false;
 }
 
 /// Parse one source-spelled line-control directive logical line.
@@ -896,9 +943,18 @@ rewriteSourceLineDirectiveLogicalLineMacros(
     const RefoldModel &model, StringRef file, StringRef logicalLine,
     ArrayRef<uint64_t> logicalLineSourceOffsets,
     const std::function<bool(StringRef, StringRef)> &pathsEqual,
-    std::optional<uint64_t> ownerIncludeId = std::nullopt) {
+    std::optional<uint64_t> ownerIncludeId = std::nullopt,
+    SourceLineDirectiveBuiltinMacroResolver builtinMacroResolver = nullptr) {
   if (logicalLineSourceOffsets.size() != logicalLine.size())
     return std::nullopt;
+
+  bool logicalLineSpellingIsContiguous = true;
+  for (size_t i = 1; i < logicalLineSourceOffsets.size(); ++i) {
+    if (logicalLineSourceOffsets[i] != logicalLineSourceOffsets[i - 1] + 1) {
+      logicalLineSpellingIsContiguous = false;
+      break;
+    }
+  }
 
   struct ReplacementPiece {
     size_t begin = 0;
@@ -991,10 +1047,29 @@ rewriteSourceLineDirectiveLogicalLineMacros(
       }
     }
 
-    SmallVector<uint64_t, 8> activeMacroIds;
-    std::optional<SourceLineDirectiveMacroReplacement> replacement =
-        expandLineControlMacroReplacementText(model, macro, invocationArgTexts,
-                                              activeMacroIds);
+    std::optional<SourceLineDirectiveMacroReplacement> replacement;
+
+    // Predefined location macros have no #define directive to recover, but the
+    // producer still records their complete callsite in the source-only
+    // directive gap.  Accept such a builtin only through the caller-provided
+    // resolver and only for an unspliced logical directive line; otherwise the
+    // physical source offsets alone are not enough to model the builtin's
+    // presumed-location semantics.
+    if (builtinMacroResolver && logicalLineSpellingIsContiguous) {
+      if (std::optional<std::string> builtinReplacement =
+              builtinMacroResolver(macro)) {
+        SourceLineDirectiveMacroReplacement builtin;
+        builtin.text = std::move(*builtinReplacement);
+        builtin.macroInvocationIds.push_back(macro.id);
+        replacement = std::move(builtin);
+      }
+    }
+
+    if (!replacement) {
+      SmallVector<uint64_t, 8> activeMacroIds;
+      replacement = expandLineControlMacroReplacementText(
+          model, macro, invocationArgTexts, activeMacroIds);
+    }
     if (!replacement)
       return std::nullopt;
 
@@ -1075,6 +1150,8 @@ computeSourceLineDirectiveGapResume(
   uint64_t lastAfterDirectiveOffset = gapBegin;
   std::string currentFileSpelling = defaultFileSpelling.str();
   std::string currentLineMarkerFlags;
+  const bool prefixHasLineControl =
+      sourcePrefixMayContainLineControlDirective(fileText, gapBegin);
 
   auto skipCompleteComment = [&](uint64_t &pos) -> bool {
     if (pos + 1 >= gapEnd || fileText[pos] != '/')
@@ -1143,7 +1220,29 @@ computeSourceLineDirectiveGapResume(
     std::optional<ParsedSourceLineDirectiveLogicalLine> state =
         parseSourceLineDirectiveLogicalLine(logicalLine, currentFileSpelling);
     if (!state && logicalLineRewriter) {
-      rewrite = logicalLineRewriter(logicalLine, logicalLineSourceOffsets);
+      SourceLineDirectiveBuiltinMacroResolver builtinMacroResolver =
+          [&](const RefoldModel::MacroInvocation &macro)
+          -> std::optional<std::string> {
+        if (macro.name != "__LINE__" || macro.subkind != "obj" ||
+            sourceLineDirectiveMacroHasMaterializedPPTokens(macro) ||
+            !macro.invB || !macro.invE || *macro.invB >= *macro.invE)
+          return std::nullopt;
+
+        if (sawLineDirective) {
+          const size_t delta = stringutils::countNonSplicedNewlines(
+              fileText, static_cast<size_t>(lastAfterDirectiveOffset),
+              static_cast<size_t>(*macro.invB));
+          return std::to_string(lastLineAfterDirective + delta);
+        }
+
+        if (prefixHasLineControl)
+          return std::nullopt;
+
+        return std::to_string(stringutils::lineAtOffset(fileText, *macro.invB));
+      };
+
+      rewrite = logicalLineRewriter(logicalLine, logicalLineSourceOffsets,
+                                    builtinMacroResolver);
       if (rewrite)
         state = parseSourceLineDirectiveLogicalLine(rewrite->line,
                                                    currentFileSpelling);
@@ -3569,11 +3668,13 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     }
 
     SourceLineDirectiveLogicalLineRewriter sourceLineDirectiveLineRewriter =
-        [&](StringRef logicalLine, ArrayRef<uint64_t> sourceOffsets)
+        [&](StringRef logicalLine, ArrayRef<uint64_t> sourceOffsets,
+            SourceLineDirectiveBuiltinMacroResolver builtinMacroResolver)
             -> std::optional<SourceLineDirectiveLogicalLineRewrite> {
       return rewriteSourceLineDirectiveLogicalLineMacros(
           model_, tuPath, logicalLine, sourceOffsets,
-          [&](StringRef lhs, StringRef rhs) { return PathsEqual(lhs, rhs); });
+          [&](StringRef lhs, StringRef rhs) { return PathsEqual(lhs, rhs); },
+          std::nullopt, std::move(builtinMacroResolver));
     };
 
     DenseSet<uint64_t> mixedSourceLineDirectiveMacroIds;
