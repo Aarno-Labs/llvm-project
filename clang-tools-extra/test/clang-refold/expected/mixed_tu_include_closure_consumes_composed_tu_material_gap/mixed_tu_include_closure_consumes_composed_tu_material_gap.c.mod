@@ -6,4 +6,9 @@
 int untouched = KEEP(5);
 
 int arr[] = { 3
+#if 1
+#if 1
+FORWARD(EMPTY)
+#endif
+#endif
 };

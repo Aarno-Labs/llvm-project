@@ -676,13 +676,18 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     return piece;
   };
 
+  std::function<bool(const RefoldModel::MacroInvocation &)>
+      headerMacroInvocationIsSourceNeutralZeroToken;
+
   // Return true iff a recorded conditional group in this materialized header
   // can be preserved as a complete zero-token gap piece. This is the
   // header-owned counterpart of the TU zero-token conditional-gap proof: the
   // group bytes may be carried forward only when the producer recorded no
-  // selected-arm PP material and no active body artifacts inside the group.
-  // Macro invocations in conditional-control lines are allowed because the
-  // complete group is preserved verbatim; they are not independently deleted.
+  // selected-arm PP material and every selected-arm body artifact either has no
+  // source-state effect or discharges its own neutral proof. Macro invocations
+  // in conditional-control lines are allowed because the complete group is
+  // preserved verbatim; arm-body macro invocations must prove zero-token
+  // neutrality through the ordinary header macro-gap proof.
   auto headerConditionalGroupIsPreservableGap =
       [&](const RefoldModel::CondGroup &group, uint64_t gapBegin,
           uint64_t gapEnd) -> bool {
@@ -732,12 +737,16 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         return false;
 
     // Header control-line macro invocations are safe to preserve with the
-    // complete conditional island.  Macro invocations in arm bodies are body
-    // artifacts and need their own proof.
+    // complete conditional island.  Arm-body macro invocations are safe only
+    // when they independently prove source-neutral zero-token behavior; that
+    // composes the conditional-island proof with the existing macro-gap proof
+    // instead of treating every body macro as source-bearing.
     for (const auto &macro : model_.GetMacroInvocations())
       if (macro.invFile && PathsEqual(*macro.invFile, file) && macro.invB &&
           macro.invE && insideGroup(*macro.invB, *macro.invE) &&
-          insideAnyArmBody(*macro.invB, *macro.invE))
+          insideAnyArmBody(*macro.invB, *macro.invE) &&
+          (!headerMacroInvocationIsSourceNeutralZeroToken ||
+           !headerMacroInvocationIsSourceNeutralZeroToken(macro)))
         return false;
 
     return true;
@@ -1374,6 +1383,12 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     return finish(isWsOrCompleteCommentTrivia(suffix));
   };
 
+  headerMacroInvocationIsSourceNeutralZeroToken =
+      [&](const RefoldModel::MacroInvocation &m) -> bool {
+    DenseSet<uint64_t> visiting;
+    return headerMacroInvocationIsSourceNeutralZeroTokenImpl(m, visiting);
+  };
+
   auto headerMacroInvocationIsPreservableGap =
       [&](const RefoldModel::MacroInvocation &m, uint64_t gapBegin,
           uint64_t gapEnd) -> bool {
@@ -1394,8 +1409,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     if (m.invText && StringRef(headerText).slice(*m.invB, *m.invE) != *m.invText)
       return false;
 
-    DenseSet<uint64_t> visiting;
-    return headerMacroInvocationIsSourceNeutralZeroTokenImpl(m, visiting);
+    return headerMacroInvocationIsSourceNeutralZeroToken(m);
   };
 
   auto headerIncludeIsDescendantOf =
