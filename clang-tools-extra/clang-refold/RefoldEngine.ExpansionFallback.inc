@@ -879,6 +879,52 @@ static bool sourceSuffixMayObservePresumedFileSpelling(
   return false;
 }
 
+/// Return true iff a raw backslash escape in a line-control stringification
+/// operand has the same decoded spelling under the local parser used by this
+/// proof and Clang's string-literal interpretation for `#line` filenames.
+///
+/// C macro stringification only doubles backslashes that occur inside string or
+/// character literals.  A backslash that appears as its own preprocessing-token
+/// spelling outside a literal is copied into the stringified filename operand
+/// verbatim.  For line-control repair we can safely model only the escape forms
+/// whose observable filename byte is obtained by deleting the backslash:
+/// unknown ordinary escapes, escaped quote/question/backslash, and escaped
+/// horizontal whitespace.  Numeric escapes, universal-character escapes, and
+/// named control escapes are rejected because proving their decoded byte
+/// sequence would require a broader C string-literal interpreter than this
+/// proof owns.
+static bool isAdmittedLineControlRawStringifyEscape(char escaped) {
+  if (escaped == '\n' || escaped == '\r')
+    return false;
+
+  if (escaped == '\"' || escaped == '?' || escaped == '\\')
+    return true;
+
+  if (stringutils::isNonNewlineWs(escaped))
+    return true;
+
+  if ('0' <= escaped && escaped <= '7')
+    return false;
+
+  switch (escaped) {
+  case 'a':
+  case 'b':
+  case 'e':
+  case 'E':
+  case 'f':
+  case 'n':
+  case 'r':
+  case 't':
+  case 'v':
+  case 'x':
+  case 'u':
+  case 'U':
+    return false;
+  default:
+    return true;
+  }
+}
+
 /// Produce the string literal spelling for a macro argument used by the `#`
 /// operator inside a source-only line-control directive.
 ///
@@ -891,18 +937,26 @@ static bool sourceSuffixMayObservePresumedFileSpelling(
 ///
 /// Complete block comments are modeled as the single whitespace character
 /// produced before macro replacement, even when the comment body spans physical
-/// source lines.  Explicit backslashes outside literals and line comments still
-/// fail closed because they interact with phase-2/directive-line state outside
-/// this local proof.
+/// source lines.  A raw backslash outside a literal is admitted only for the
+/// bounded escape subset accepted by
+/// isAdmittedLineControlRawStringifyEscape(); all other escape forms fail
+/// closed and must be handled by a wider proof or terminal fallback.
 static std::optional<std::string>
 stringifyLineControlMacroArgument(StringRef argument) {
   StringRef trimmed = argument.trim(" \t\v\f\r\n");
-  std::string normalized;
+  std::string stringified = "\"";
+  bool hasPayload = false;
   bool pendingSpace = false;
 
+  auto appendStringifiedPayloadByte = [&](char byte) {
+    std::string quoted = stringutils::quoteCString(StringRef(&byte, 1));
+    stringified.append(quoted.begin() + 1, quoted.end() - 1);
+    hasPayload = true;
+  };
+
   auto appendPendingSpace = [&]() {
-    if (pendingSpace && !normalized.empty())
-      normalized.push_back(' ');
+    if (pendingSpace && hasPayload)
+      appendStringifiedPayloadByte(' ');
     pendingSpace = false;
   };
 
@@ -910,7 +964,7 @@ stringifyLineControlMacroArgument(StringRef argument) {
     char ch = trimmed[pos];
 
     if (stringutils::isWs(ch)) {
-      pendingSpace = !normalized.empty();
+      pendingSpace = hasPayload;
       ++pos;
       continue;
     }
@@ -938,18 +992,33 @@ stringifyLineControlMacroArgument(StringRef argument) {
         if (!closed)
           return std::nullopt;
         if (commentBegin != pos)
-          pendingSpace = !normalized.empty();
+          pendingSpace = hasPayload;
         continue;
       }
       if (trimmed[pos + 1] == '/')
         return std::nullopt;
     }
 
-    // A raw backslash outside a literal participates in translation phase 2 or
-    // an implementation-specific token spelling.  Keep this bounded proof to
-    // ordinary tokens plus escape-aware string/character literal tokens.
-    if (ch == '\\')
-      return std::nullopt;
+    if (ch == '\\') {
+      if (pos + 1 >= trimmed.size())
+        return std::nullopt;
+
+      const char escaped = trimmed[pos + 1];
+      if (!isAdmittedLineControlRawStringifyEscape(escaped))
+        return std::nullopt;
+
+      appendPendingSpace();
+      // Outside a literal, macro stringification copies this backslash into the
+      // generated filename string literal rather than doubling it.  The strict
+      // line-control parser that consumes this spelling below models precisely
+      // the admitted subset above by deleting the backslash and preserving the
+      // escaped byte.
+      stringified.push_back('\\');
+      stringified.push_back(escaped);
+      hasPayload = true;
+      pos += 2;
+      continue;
+    }
 
     if (ch == '\"' || ch == '\'') {
       appendPendingSpace();
@@ -978,16 +1047,18 @@ stringifyLineControlMacroArgument(StringRef argument) {
       if (!closed)
         return std::nullopt;
 
-      normalized.append(trimmed.begin() + literalBegin, trimmed.begin() + pos);
+      for (char literalByte : trimmed.slice(literalBegin, pos))
+        appendStringifiedPayloadByte(literalByte);
       continue;
     }
 
     appendPendingSpace();
-    normalized.push_back(ch);
+    appendStringifiedPayloadByte(ch);
     ++pos;
   }
 
-  return stringutils::quoteCString(normalized);
+  stringified.push_back('\"');
+  return stringified;
 }
 
 /// Return true iff a recorded macro argument contains at least one preprocessing
