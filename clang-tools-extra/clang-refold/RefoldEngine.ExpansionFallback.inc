@@ -72,6 +72,144 @@ static bool isWhitespaceOrCompleteCommentTrivia(StringRef text) {
   return true;
 }
 
+/// Parse a conditional-control directive line admitted as inert include-gap
+/// trivia. Only literal `#if 0` / `#if 1` groups are accepted; directives with
+/// macro-dependent conditions, side effects, or escaped physical lines remain
+/// outside this proof class.
+static bool parseLiteralEmptyConditionalDirectiveLine(StringRef line,
+                                                      unsigned &depth) {
+  if (line.ends_with("\n"))
+    line = line.drop_back();
+  if (line.ends_with("\r"))
+    line = line.drop_back();
+
+  StringRef noTrailingHorizontalWS = line.rtrim(" \t\v\f");
+  if (noTrailingHorizontalWS.ends_with("\\"))
+    return false;
+
+  StringRef rest = line.ltrim(" \t\v\f");
+  if (!rest.consume_front("#"))
+    return false;
+  rest = rest.ltrim(" \t\v\f");
+
+  StringRef keyword = rest.take_while([](char c) {
+    return ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z') ||
+           ('0' <= c && c <= '9') || c == '_';
+  });
+  rest = rest.drop_front(keyword.size()).trim(" \t\v\f");
+
+  auto isLiteralBit = [](StringRef text) { return text == "0" || text == "1"; };
+
+  if (keyword == "if") {
+    if (!isLiteralBit(rest))
+      return false;
+    ++depth;
+    return true;
+  }
+
+  if (keyword == "elif") {
+    return depth > 0 && isLiteralBit(rest);
+  }
+
+  if (keyword == "else") {
+    return depth > 0 && rest.empty();
+  }
+
+  if (keyword == "endif") {
+    if (depth == 0 || !rest.empty())
+      return false;
+    --depth;
+    return true;
+  }
+
+  return false;
+}
+
+/// Return true iff `text` is trivia that may be preserved while closing over a
+/// TU include directive run. In addition to whitespace/comments, this admits
+/// complete empty conditional-control groups whose `#if` / `#elif` conditions
+/// are literal `0` or `1`, so moving them with the preserved gap does not
+/// depend on macro state removed by materializing the neighboring includes.
+static bool isPreservableIncludeClosureGapTrivia(StringRef text) {
+  if (isWhitespaceOrCompleteCommentTrivia(text))
+    return true;
+
+  size_t i = 0;
+  const size_t n = text.size();
+  unsigned depth = 0;
+  bool sawConditionalDirective = false;
+
+  auto skipCompleteComment = [&](size_t &cursor) -> bool {
+    if (cursor + 1 >= n || text[cursor] != '/')
+      return false;
+
+    if (text[cursor + 1] == '*') {
+      cursor += 2;
+      while (cursor + 1 < n) {
+        if (text[cursor] == '*' && text[cursor + 1] == '/') {
+          cursor += 2;
+          return true;
+        }
+        ++cursor;
+      }
+      return false;
+    }
+
+    if (text[cursor + 1] == '/') {
+      cursor += 2;
+      while (cursor < n && text[cursor] != '\n')
+        ++cursor;
+      if (cursor < n)
+        ++cursor;
+      return true;
+    }
+
+    return false;
+  };
+
+  bool atLineStart = true;
+  while (i < n) {
+    if (stringutils::isWs(text[i])) {
+      atLineStart = text[i] == '\n';
+      ++i;
+      continue;
+    }
+
+    if (text[i] == '/') {
+      if (!skipCompleteComment(i))
+        return false;
+      continue;
+    }
+
+    if (!atLineStart && text[i] != '#')
+      return false;
+
+    size_t lineEnd = i;
+    while (lineEnd < n && text[lineEnd] != '\n')
+      ++lineEnd;
+    if (lineEnd < n)
+      ++lineEnd;
+
+    if (!parseLiteralEmptyConditionalDirectiveLine(
+            text.slice(i, lineEnd), depth))
+      return false;
+
+    sawConditionalDirective = true;
+    atLineStart = true;
+    i = lineEnd;
+  }
+
+  return sawConditionalDirective && depth == 0;
+}
+
+/// Return true when preserved trivia begins with a preprocessing directive after
+/// optional horizontal whitespace. Such trivia must be placed at the start of a
+/// physical line when appended after materialized B tokens.
+static bool startsWithPreprocessorDirectiveTrivia(StringRef text) {
+  StringRef rest = text.ltrim(" \t\v\f");
+  return rest.starts_with("#");
+}
+
 std::string RefoldEngine::FormatExpansionClosureWitness(
     const ExpansionClosureWitness &witness) const {
   // Keep fallback-witness logging compact and mechanically comparable so the
@@ -818,12 +956,13 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
 
     // The TU closure may absorb only include directives plus inert trivia
     // between neighboring directives. Whitespace is already source-neutral;
-    // complete comments are admitted only because the emitted edit preserves
-    // their bytes verbatim instead of silently deleting user-written text.
+    // comments and literal empty conditional-control groups are admitted only
+    // because the emitted edit preserves their bytes verbatim instead of
+    // silently deleting user-written text.
     if (inc->siteB > sourceCursor) {
       StringRef gap = tuBytes.slice(sourceCursor, inc->siteB);
       if (!gap.empty() && !stringutils::isWhitespace(gap)) {
-        if (!isWhitespaceOrCompleteCommentTrivia(gap)) {
+        if (!isPreservableIncludeClosureGapTrivia(gap)) {
           trace("fallback",
                 "TU include-closure rejected: non-trivia TU gap between "
                 "include directives before inc#{0} gap='{1}'",
@@ -892,8 +1031,12 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
 
   std::string rawReplacement = SliceBSource(bMaterialBegin, bMaterialEnd).str();
   std::string replacement = rawReplacement;
-  if (!preservedGapTrivia.empty())
+  if (!preservedGapTrivia.empty()) {
+    if (startsWithPreprocessorDirectiveTrivia(preservedGapTrivia) &&
+        !replacement.empty() && replacement.back() != '\n')
+      replacement.push_back('\n');
     replacement.append(preservedGapTrivia.begin(), preservedGapTrivia.end());
+  }
 
   // The closure begins at the exact include-directive run proved above, but we
   // may later extend its right edge over immediately following untouched TU
@@ -907,10 +1050,11 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       /*allowLeft=*/true, /*allowRight=*/true);
 
   // This closure class replaces only a contiguous run of top-level include
-  // directives plus whitespace between them. Preserve the original physical
-  // line count of the replaced source so the untouched suffix can resume on its
-  // original logical line without needing a #line directive. When there is a
-  // deficit, first try to sink it past immediately following untouched TU
+  // directives plus admitted inert trivia between them. Preserve the original
+  // physical line count of the replaced source so the untouched suffix can
+  // resume on its original logical line without needing a #line directive.
+  // When there is a deficit, first try to sink it past immediately following
+  // untouched TU
   // line(s) by absorbing those exact source bytes into the same TU edit.
   const size_t origNl =
       stringutils::countNewlines(tuBytes, first->siteB, closureSourceEnd);
