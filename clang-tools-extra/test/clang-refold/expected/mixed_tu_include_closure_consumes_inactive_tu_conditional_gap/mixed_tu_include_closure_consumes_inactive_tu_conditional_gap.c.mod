@@ -4,4 +4,8 @@
 int untouched = KEEP(5);
 
 int arr[] = { 3
+#if 0
+#define DEAD_VALUE 99
+int dead = KEEP(10);
+#endif
 };

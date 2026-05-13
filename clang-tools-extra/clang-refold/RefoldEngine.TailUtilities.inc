@@ -680,7 +680,9 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
   // can be preserved as a complete zero-token gap piece. This is the
   // header-owned counterpart of the TU zero-token conditional-gap proof: the
   // group bytes may be carried forward only when the producer recorded no
-  // selected-arm PP material and no active source artifacts inside the group.
+  // selected-arm PP material and no active body artifacts inside the group.
+  // Macro invocations in conditional-control lines are allowed because the
+  // complete group is preserved verbatim; they are not independently deleted.
   auto headerConditionalGroupIsPreservableGap =
       [&](const RefoldModel::CondGroup &group, uint64_t gapBegin,
           uint64_t gapEnd) -> bool {
@@ -704,17 +706,20 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       return group.groupB <= b && b < e && e <= group.groupE;
     };
 
+    auto insideAnyArmBody = [&](uint64_t b, uint64_t e) {
+      for (const RefoldModel::CondArm &arm : group.arms)
+        if (arm.bodyB <= b && b < e && e <= arm.bodyE)
+          return true;
+      return false;
+    };
+
     // Do not hide recorded active source artifacts inside an opaque preserved
     // conditional group. Inactive-arm text is normally not recorded by the
-    // producer; recorded includes/macros/directives/pragmas require their own
-    // proof and therefore block this zero-token gap class.
+    // producer; recorded includes/directives/pragmas require their own proof and
+    // therefore block this zero-token gap class.
     for (const auto &inc : model_.GetIncludes())
-      if (PathsEqual(inc.sitePath, file) && inc.parent && *inc.parent == ie.include->id &&
-          insideGroup(inc.siteB, inc.siteE))
-        return false;
-    for (const auto &macro : model_.GetMacroInvocations())
-      if (macro.invFile && PathsEqual(*macro.invFile, file) && macro.invB &&
-          macro.invE && insideGroup(*macro.invB, *macro.invE))
+      if (PathsEqual(inc.sitePath, file) && inc.parent &&
+          *inc.parent == ie.include->id && insideGroup(inc.siteB, inc.siteE))
         return false;
     for (const auto &directive : model_.GetMacroDirectives())
       if (PathsEqual(directive.sitePath, file) && directive.ownerIncludeId &&
@@ -724,6 +729,15 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     for (const auto &pragma : model_.GetPragmas())
       if (PathsEqual(pragma.sitePath, file) &&
           insideGroup(pragma.siteB, pragma.siteE))
+        return false;
+
+    // Header control-line macro invocations are safe to preserve with the
+    // complete conditional island.  Macro invocations in arm bodies are body
+    // artifacts and need their own proof.
+    for (const auto &macro : model_.GetMacroInvocations())
+      if (macro.invFile && PathsEqual(*macro.invFile, file) && macro.invB &&
+          macro.invE && insideGroup(*macro.invB, *macro.invE) &&
+          insideAnyArmBody(*macro.invB, *macro.invE))
         return false;
 
     return true;

@@ -4628,6 +4628,75 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     return true;
   };
 
+  // Return true iff a complete TU conditional group is source-neutral
+  // inside a mixed TU/include source envelope.
+  //
+  // This is the recorded-structure proof for conditional islands that produce
+  // no A-side tokens.  Unlike the literal textual #if/#endif scanner, it does
+  // not try to evaluate the condition.  The producer has already recorded the
+  // selected arm and the arm token spans; this proof only checks that replaying
+  // the complete group verbatim is a neutral source gap.  Macro invocations in
+  // conditional-control lines are therefore allowed because they remain inside
+  // the preserved group.  Recorded artifacts in arm bodies still fail closed:
+  // those may carry source tokens, macro state, include effects, or pragmas that
+  // require their own proof.
+  auto conditionalGroupIsConsumableZeroTokenGap =
+      [&](const RefoldModel::CondGroup &group, uint64_t begin,
+          uint64_t end) -> bool {
+    if (!PathsEqual(group.file, tuPath) || group.parentIncludeId)
+      return false;
+    if (group.groupB >= group.groupE || group.groupE > tuBytes.size())
+      return false;
+    if (group.groupB < begin || end < group.groupE)
+      return false;
+
+    // A selected arm with materialized A tokens is source-bearing.  It is
+    // handled by the material-consumption proof that adds the whole group as a
+    // required source piece when those tokens are inside the replacement.
+    for (const RefoldModel::CondArm &arm : group.arms)
+      if (arm.selected && arm.span && arm.span->IsValid() &&
+          arm.span->begin < arm.span->end)
+        return false;
+
+    auto insideGroup = [&](uint64_t b, uint64_t e) {
+      return group.groupB <= b && b < e && e <= group.groupE;
+    };
+
+    auto insideAnyArmBody = [&](uint64_t b, uint64_t e) {
+      for (const RefoldModel::CondArm &arm : group.arms)
+        if (arm.bodyB <= b && b < e && e <= arm.bodyE)
+          return true;
+      return false;
+    };
+
+    // Includes, macro-state directives, and pragmas inside the group are not
+    // zero-token control-line spelling.  They can affect the suffix even when
+    // they do not produce ordinary PP tokens, so they need a separate proof.
+    for (const auto &inc : model_.GetIncludes())
+      if (PathsEqual(inc.sitePath, tuPath) && insideGroup(inc.siteB, inc.siteE))
+        return false;
+    for (const auto &directive : model_.GetMacroDirectives())
+      if (PathsEqual(directive.sitePath, tuPath) &&
+          insideGroup(directive.siteB, directive.siteE))
+        return false;
+    for (const auto &pragma : model_.GetPragmas())
+      if (PathsEqual(pragma.sitePath, tuPath) &&
+          insideGroup(pragma.siteB, pragma.siteE))
+        return false;
+
+    // Macro invocations in #if/#elif control lines are allowed because the
+    // complete conditional group is preserved as source.  Macro invocations in
+    // arm bodies are source-bearing body artifacts and remain outside this
+    // neutral-control proof.
+    for (const auto &macro : model_.GetMacroInvocations())
+      if (macro.invFile && PathsEqual(*macro.invFile, tuPath) && macro.invB &&
+          macro.invE && insideGroup(*macro.invB, *macro.invE) &&
+          insideAnyArmBody(*macro.invB, *macro.invE))
+        return false;
+
+    return true;
+  };
+
   // Prove that a source gap inside a replacement envelope consists only of
   // lexical trivia plus complete source-neutral artifacts: zero-token include
   // trees, source-neutral zero-token macro invocation trees, and TU-spelled
@@ -4656,59 +4725,6 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       uint64_t end;
       uint64_t id;
       StringRef kind;
-    };
-
-    // Return true iff a recorded TU conditional group is source-neutral when
-    // consumed as one complete gap artifact.  This is the inactive-branch
-    // counterpart to the existing composed-gap scanner: if the selected arm
-    // produces no PP tokens and the map records no active source artifacts
-    // inside the group, then the entire conditional group contributed no
-    // observable A-side material.  Arbitrary bytes in inactive arms are safe to
-    // consume only through this complete-group proof; they must not be parsed as
-    // ordinary live TU source.
-    auto conditionalGroupIsConsumableZeroTokenGap =
-        [&](const RefoldModel::CondGroup &group, uint64_t begin,
-            uint64_t end) -> bool {
-      if (!PathsEqual(group.file, tuPath) || group.parentIncludeId)
-        return false;
-      if (group.groupB >= group.groupE || group.groupE > tuBytes.size())
-        return false;
-      if (group.groupB < begin || end < group.groupE)
-        return false;
-
-      // A selected arm with materialized A tokens is source-bearing.  It is
-      // handled by the material-consumption proof that adds the whole group as
-      // a required source piece when those tokens are inside the replacement.
-      for (const RefoldModel::CondArm &arm : group.arms)
-        if (arm.selected && arm.span && arm.span->IsValid() &&
-            arm.span->begin < arm.span->end)
-          return false;
-
-      auto insideGroup = [&](uint64_t b, uint64_t e) {
-        return group.groupB <= b && b < e && e <= group.groupE;
-      };
-
-      // Do not hide active, recorded source artifacts inside an opaque
-      // conditional piece.  Those artifacts need their own proof, liveness
-      // repair, or fail-closed diagnostic.  Inactive-arm text is normally not
-      // recorded by the producer, which is precisely the case this proof admits.
-      for (const auto &inc : model_.GetIncludes())
-        if (PathsEqual(inc.sitePath, tuPath) && insideGroup(inc.siteB, inc.siteE))
-          return false;
-      for (const auto &macro : model_.GetMacroInvocations())
-        if (macro.invFile && PathsEqual(*macro.invFile, tuPath) && macro.invB &&
-            macro.invE && insideGroup(*macro.invB, *macro.invE))
-          return false;
-      for (const auto &directive : model_.GetMacroDirectives())
-        if (PathsEqual(directive.sitePath, tuPath) &&
-            insideGroup(directive.siteB, directive.siteE))
-          return false;
-      for (const auto &pragma : model_.GetPragmas())
-        if (PathsEqual(pragma.sitePath, tuPath) &&
-            insideGroup(pragma.siteB, pragma.siteE))
-          return false;
-
-      return true;
     };
 
     SmallVector<GapPiece, 8> pieces;
@@ -4906,7 +4922,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   };
 
   struct TUPreservedGapPiece {
-    enum class Kind { ZeroTokenMacroInvocation };
+    enum class Kind { ZeroTokenMacroInvocation, ZeroTokenConditionalGroup };
 
     Kind kind = Kind::ZeroTokenMacroInvocation;
     uint64_t begin = 0;
@@ -4920,7 +4936,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     return std::string();
   };
 
-  auto collectPreservableZeroTokenMacroGapPieces =
+  auto collectPreservableZeroTokenGapPieces =
       [&](uint64_t gapBegin, uint64_t gapEnd,
           SmallVectorImpl<TUPreservedGapPiece> &out) -> bool {
     if (gapBegin >= gapEnd || gapEnd > tuBytes.size())
@@ -4930,12 +4946,21 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       uint64_t begin;
       uint64_t end;
       uint64_t id;
+      TUPreservedGapPiece::Kind kind;
     };
 
     SmallVector<GapPiece, 8> pieces;
     for (const auto &m : model_.GetMacroInvocations())
       if (macroInvocationIsConsumableZeroTokenGap(m, gapBegin, gapEnd))
-        pieces.push_back({*m.invB, *m.invE, m.id});
+        pieces.push_back({*m.invB, *m.invE, m.id,
+                          TUPreservedGapPiece::Kind::
+                              ZeroTokenMacroInvocation});
+
+    for (const auto &group : model_.GetConds())
+      if (conditionalGroupIsConsumableZeroTokenGap(group, gapBegin, gapEnd))
+        pieces.push_back({group.groupB, group.groupE, group.id,
+                          TUPreservedGapPiece::Kind::
+                              ZeroTokenConditionalGroup});
 
     if (pieces.empty())
       return false;
@@ -4943,14 +4968,30 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     SmallVector<TUPreservedGapPiece, 8> accepted;
     if (!proveOwnerProofGap(
             pieces, gapBegin, gapEnd,
-            [](const GapPiece &, const GapPiece &) { return false; },
+            [](const GapPiece &lhs, const GapPiece &rhs) {
+              return lhs.kind < rhs.kind;
+            },
             [](const GapPiece &outer, const GapPiece &piece) {
               if (outer.begin <= piece.begin && piece.end <= outer.end) {
-                // Nested zero-token macro invocations are already part of the
-                // outer invocation's source-neutral proof. Preserve only the
-                // outer callsite text so the refolded source does not duplicate
-                // the same gap structure.
-                return true;
+                if (outer.kind == TUPreservedGapPiece::Kind::
+                                      ZeroTokenMacroInvocation &&
+                    piece.kind == TUPreservedGapPiece::Kind::
+                                      ZeroTokenMacroInvocation) {
+                  // Nested zero-token macro invocations are already part of
+                  // the outer invocation's source-neutral proof. Preserve only
+                  // the outer callsite text so the refolded source does not
+                  // duplicate the same gap structure.
+                  return true;
+                }
+
+                if (outer.kind == TUPreservedGapPiece::Kind::
+                                      ZeroTokenConditionalGroup) {
+                  // A preserved complete conditional group owns everything in
+                  // its source island, including control-line macro uses and
+                  // nested inactive conditional records.  Those inner records
+                  // are not independently emitted as gap pieces.
+                  return true;
+                }
               }
               return false;
             },
@@ -4958,16 +4999,15 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
               return isWsOrCompleteCommentTrivia(tuBytes.slice(begin, end));
             },
             [&](const GapPiece &piece) {
-              accepted.push_back({TUPreservedGapPiece::Kind::
-                                      ZeroTokenMacroInvocation,
-                                  piece.begin, piece.end, piece.id});
+              accepted.push_back({piece.kind, piece.begin, piece.end,
+                                  piece.id});
             }))
       return false;
 
     out.append(accepted.begin(), accepted.end());
     trace("fallback",
-          "TU/include closure preserving zero-token macro source gap "
-          "source=[{0},{1}) macros={2}",
+          "TU/include closure preserving zero-token source gap "
+          "source=[{0},{1}) pieces={2}",
           gapBegin, gapEnd, accepted.size());
     return true;
   };
@@ -5455,12 +5495,32 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       return false;
     };
 
-    // Do not delete or partially overwrite unrelated macro invocations.  Three
+    auto macroInvocationIsInsidePreservableZeroTokenConditionalGap =
+        [&](const RefoldModel::MacroInvocation &macro) -> bool {
+      if (!macro.invFile || macro.invFile->empty() ||
+          !PathsEqual(*macro.invFile, tuPath))
+        return false;
+      if (!macro.invB || !macro.invE || *macro.invB >= *macro.invE)
+        return false;
+
+      for (const auto &group : model_.GetConds()) {
+        if (!conditionalGroupIsConsumableZeroTokenGap(group, sourceBegin,
+                                                      sourceEnd))
+          continue;
+        if (group.groupB <= *macro.invB && *macro.invB < *macro.invE &&
+            *macro.invE <= group.groupE)
+          return true;
+      }
+      return false;
+    };
+
+    // Do not delete or partially overwrite unrelated macro invocations.  Four
     // complete-callsite cases are allowed inside the replacement envelope:
     //
     //   * macro-expanded include-target spelling inside a touched include
     //     directive, because the directive site is already a required piece;
     //   * zero-token source-neutral macro gaps, which contributed no PP tokens;
+    //   * macro uses in preserved zero-token conditional-control islands;
     //   * source-bearing macro calls whose entire produced PP material is
     //     already inside this hunk's A-side replacement range.
     //
@@ -5478,7 +5538,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
                                                    sourceEnd) ||
             macroInvocationMaterialIsConsumed(m, sourceBegin, sourceEnd) ||
             mixedSourceLineDirectiveMacroIds.contains(m.id) ||
-            macroInvocationIsInsideConsumableSourceLineDirectiveGap(m))
+            macroInvocationIsInsideConsumableSourceLineDirectiveGap(m) ||
+            macroInvocationIsInsidePreservableZeroTokenConditionalGap(m))
           continue;
         trace("fallback",
               "TU/include closure rejected: source interval [{0},{1}) would "
@@ -5513,7 +5574,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
                 return true;
 
               SmallVector<TUPreservedGapPiece, 4> preservedZeroTokenPieces;
-              if (collectPreservableZeroTokenMacroGapPieces(
+              if (collectPreservableZeroTokenGapPieces(
                       gapBegin, gapEnd, preservedZeroTokenPieces)) {
                 mixedPreservedZeroTokenGapPieces.append(
                     preservedZeroTokenPieces.begin(),
@@ -5804,12 +5865,13 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     replacement.append(preservedGapTrivia.begin(), preservedGapTrivia.end());
   }
 
-  // Mixed TU/include closures may span source-neutral macro callsites that
-  // contributed no PP tokens. These callsites are not stale source: preserving
-  // them keeps the refolded source closer to the original while the zero-token
-  // proof above guarantees that replaying them cannot change the B token
-  // stream. Emit only the normalized top-level gap pieces, not the surrounding
-  // trivia, mirroring the header owner-envelope preservation path.
+  // Mixed TU/include closures may span source-neutral macro callsites or complete
+  // conditional islands that contributed no PP tokens. These pieces are not
+  // stale source: preserving them keeps the refolded source closer to the
+  // original while the zero-token proof above guarantees that replaying them
+  // cannot change the B token stream. Emit only the normalized top-level gap
+  // pieces, not the surrounding trivia, mirroring the header owner-envelope
+  // preservation path.
   if (!mixedPreservedZeroTokenGapPieces.empty()) {
     if (!replacement.empty() && replacement.back() != '\n')
       replacement.push_back('\n');
