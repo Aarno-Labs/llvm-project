@@ -1383,20 +1383,173 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     if (isWsOrCompleteCommentTrivia(replacementText))
       return finish(true);
 
-    // Non-empty function-like wrappers require argument-substitution and
-    // parameter-use reasoning.  Keep them outside this source-neutral proof.
-    if (m.subkind != "obj")
-      return finish(false);
-
     struct ChildPiece {
       uint64_t begin;
       uint64_t end;
       const RefoldModel::MacroInvocation *child;
     };
 
+    auto sortChildren = [](SmallVectorImpl<ChildPiece> &children) {
+      llvm::sort(children, [](const ChildPiece &lhs, const ChildPiece &rhs) {
+        if (lhs.begin != rhs.begin)
+          return lhs.begin < rhs.begin;
+        if (lhs.end != rhs.end)
+          return lhs.end < rhs.end;
+        return lhs.child->id < rhs.child->id;
+      });
+    };
+
+    auto sourceRangeIsTiledByNeutralNestedMacros =
+        [&](uint64_t begin, uint64_t end, StringRef file) -> bool {
+      if (begin > end)
+        return false;
+
+      SmallVector<ChildPiece, 8> children;
+      for (const auto &candidate : model_.GetMacroInvocations()) {
+        if (!candidate.callerMacroId || *candidate.callerMacroId != m.id)
+          continue;
+
+        // Only nested callsites physically spelled inside this source range can
+        // tile it.  Malformed or out-of-file candidates are harmless here: if
+        // they were needed to cover non-trivia bytes, the later trivia-gap check
+        // will reject the range fail-closed.
+        if (!candidate.invFile || candidate.invFile->empty() ||
+            !PathsEqual(*candidate.invFile, file))
+          continue;
+        if (!candidate.invB || !candidate.invE ||
+            *candidate.invB >= *candidate.invE)
+          continue;
+        if (*candidate.invB < begin || end < *candidate.invE)
+          continue;
+
+        children.push_back({*candidate.invB, *candidate.invE, &candidate});
+      }
+
+      sortChildren(children);
+
+      uint64_t cursor = begin;
+      for (const ChildPiece &piece : children) {
+        if (piece.begin < cursor)
+          return false;
+
+        StringRef gap;
+        if (PathsEqual(file, replacement->directive->sitePath)) {
+          const size_t gapBegin =
+              static_cast<size_t>(cursor - replacement->fileBase);
+          const size_t gapEnd =
+              static_cast<size_t>(piece.begin - replacement->fileBase);
+          gap = replacement->directive->text.slice(gapBegin, gapEnd);
+        } else if (PathsEqual(file, tuPath)) {
+          gap = tuBytes.slice(cursor, piece.begin);
+        } else {
+          return false;
+        }
+
+        if (!isWsOrCompleteCommentTrivia(gap))
+          return false;
+
+        if (!macroInvocationIsSourceNeutralZeroTokenImpl(*piece.child, visiting))
+          return false;
+
+        cursor = piece.end;
+      }
+
+      StringRef suffix;
+      if (PathsEqual(file, replacement->directive->sitePath)) {
+        const size_t suffixBegin =
+            static_cast<size_t>(cursor - replacement->fileBase);
+        const size_t suffixEnd = static_cast<size_t>(end - replacement->fileBase);
+        suffix = replacement->directive->text.slice(suffixBegin, suffixEnd);
+      } else if (PathsEqual(file, tuPath)) {
+        suffix = tuBytes.slice(cursor, end);
+      } else {
+        return false;
+      }
+
+      return isWsOrCompleteCommentTrivia(suffix);
+    };
+
+    // Function-like zero-token wrappers are admissible only in a narrow
+    // forwarding domain.  The replacement list may mention formals, and after
+    // substitution each used argument must itself be tiled by recorded
+    // zero-token macro invocations plus trivia.  This admits FORWARD(EMPTY)
+    // without trying to model arbitrary macro semantics.
+    if (m.subkind == "func") {
+      if (m.defParams.empty() || m.invArgRanges.size() < m.defParams.size())
+        return finish(false);
+
+      DenseMap<StringRef, unsigned> paramIndexByName;
+      for (unsigned i = 0, e = m.defParams.size(); i != e; ++i) {
+        if (m.defParams[i].variadic)
+          return finish(false);
+        paramIndexByName.try_emplace(m.defParams[i].name, i);
+      }
+
+      SmallVector<unsigned, 4> usedParams;
+      StringRef text = replacement->directive->text;
+      size_t pos = replacement->replacementTextBegin;
+      while (pos < text.size()) {
+        if (stringutils::isWs(text[pos])) {
+          ++pos;
+          continue;
+        }
+
+        StringRef tail = text.substr(pos);
+        if (tail.starts_with("/*")) {
+          const size_t end = text.find("*/", pos + 2);
+          if (end == StringRef::npos)
+            return finish(false);
+          pos = end + 2;
+          continue;
+        }
+        if (tail.starts_with("//")) {
+          const size_t end = text.find('\n', pos + 2);
+          pos = end == StringRef::npos ? text.size() : end + 1;
+          continue;
+        }
+
+        // The only non-trivia replacement-list tokens admitted here are formal
+        // parameter names.  Operators, literals, _Pragma, #, ##, punctuation,
+        // and unrecorded identifiers remain outside this proof class.
+        if (!stringutils::isIdentStart(text[pos]))
+          return finish(false);
+        const size_t identBegin = pos++;
+        while (pos < text.size() && stringutils::isIdentPart(text[pos]))
+          ++pos;
+        StringRef ident = text.slice(identBegin, pos);
+        auto it = paramIndexByName.find(ident);
+        if (it == paramIndexByName.end())
+          return finish(false);
+        usedParams.push_back(it->second);
+      }
+
+      if (usedParams.empty())
+        return finish(false);
+
+      llvm::sort(usedParams);
+      usedParams.erase(std::unique(usedParams.begin(), usedParams.end()),
+                       usedParams.end());
+
+      for (unsigned argIdx : usedParams) {
+        const auto &range = m.invArgRanges[argIdx];
+        if (!range.first || !range.second || *range.first > *range.second)
+          return finish(false);
+        if (!m.invFile || m.invFile->empty())
+          return finish(false);
+        if (!sourceRangeIsTiledByNeutralNestedMacros(*range.first,
+                                                     *range.second, *m.invFile))
+          return finish(false);
+      }
+
+      return finish(true);
+    }
+
+    if (m.subkind != "obj")
+      return finish(false);
+
     // Collect the nested macro invocations that the producer recorded inside
     // this macro's replacement list.  These are the only non-trivia source
-    // bytes a non-empty wrapper is allowed to contain.
+    // bytes a non-empty object-like wrapper is allowed to contain.
     SmallVector<ChildPiece, 8> children;
     for (const auto &candidate : model_.GetMacroInvocations()) {
       if (!candidate.callerMacroId || *candidate.callerMacroId != m.id)
@@ -1425,20 +1578,12 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       children.push_back({*candidate.invB, *candidate.invE, &candidate});
     }
 
-    // A non-empty wrapper with no recorded children contains unaccounted source
-    // text, so it is not source-neutral under this proof.
+    // A non-empty object-like wrapper with no recorded children contains
+    // unaccounted source text, so it is not source-neutral under this proof.
     if (children.empty())
       return finish(false);
 
-    // Process child callsites in source order so we can prove that the gaps
-    // between them are trivia and that their intervals do not overlap.
-    llvm::sort(children, [](const ChildPiece &lhs, const ChildPiece &rhs) {
-      if (lhs.begin != rhs.begin)
-        return lhs.begin < rhs.begin;
-      if (lhs.end != rhs.end)
-        return lhs.end < rhs.end;
-      return lhs.child->id < rhs.child->id;
-    });
+    sortChildren(children);
 
     uint64_t cursor = replacement->fileBegin;
     for (const ChildPiece &piece : children) {
@@ -1674,12 +1819,40 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     llvm::sort(pieces, [](const GapPiece &lhs, const GapPiece &rhs) {
       if (lhs.begin != rhs.begin)
         return lhs.begin < rhs.begin;
+      // Put the widest piece first for a shared begin so an outer macro
+      // invocation shadows any nested macro calls spelled inside its argument
+      // list.  The outer macro proof is responsible for recursively proving
+      // those nested calls source-neutral.
       if (lhs.end != rhs.end)
-        return lhs.end < rhs.end;
+        return lhs.end > rhs.end;
       if (lhs.kind != rhs.kind)
         return lhs.kind < rhs.kind;
       return lhs.id < rhs.id;
     });
+
+    SmallVector<GapPiece, 8> outerPieces;
+    for (const GapPiece &piece : pieces) {
+      if (outerPieces.empty() || piece.begin >= outerPieces.back().end) {
+        outerPieces.push_back(piece);
+        continue;
+      }
+
+      const GapPiece &outer = outerPieces.back();
+      if (outer.begin <= piece.begin && piece.end <= outer.end &&
+          outer.kind == "macro" && piece.kind == "macro") {
+        // A function-like zero-token macro such as FORWARD(EMPTY) records both
+        // the outer callsite and the nested EMPTY callsite in the same TU gap.
+        // Once the outer macro has been proved source-neutral, the nested
+        // callsite is part of that proof, not a second independent gap piece.
+        continue;
+      }
+
+      // Any other overlap would make the source tiling ambiguous: includes,
+      // directives, and unrelated macro calls must remain disjoint at this
+      // level of the closure proof.
+      return false;
+    }
+    pieces = std::move(outerPieces);
 
     uint64_t cursor = gapBegin;
     uint64_t includeCount = 0;
