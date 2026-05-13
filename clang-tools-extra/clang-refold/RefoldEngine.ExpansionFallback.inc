@@ -939,8 +939,200 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     return false;
   };
 
+  // The include-only closure case below materializes exactly the include cover.
+  // A mixed TU/include hunk is wider: the edit consumes tokens on both sides of
+  // the include cover, so the A materialization range must close over the whole
+  // touched token interval.
+  const uint64_t closureBegin = std::min(h.aStart, coverBegin);
+  const uint64_t closureEnd = std::max(h.aEnd, coverEnd);
+  const bool mixedTUIncludeClosure = !hunkInsideCover;
+
+  // Defaults for the pure include-closure case.  The mixed case widens both the
+  // materialized A token range and the source byte interval below.
+  uint64_t materialBeginA = coverBegin;
+  uint64_t materialEndA = coverEnd;
+  uint64_t sourceBegin = first->siteB;
+  uint64_t sourceEnd = last->siteE;
+
+  auto tokenCoveredByTouchedInclude = [&](uint64_t pp) -> bool {
+    for (const RefoldModel::IncludeItem *inc : touched)
+      if (inc->cover.begin <= pp && pp < inc->cover.end)
+        return true;
+    return false;
+  };
+
+  // Prove a mixed TU/include closure.
+  //
+  // This handles a single replacement hunk whose A-side tokens are split
+  // between ordinary TU spelling and the complete expansion of a contiguous
+  // top-level include run, for example:
+  //
+  //   int arr[] = { 1,
+  //   #include "two.inc"
+  //   };
+  //
+  // rewritten from preprocessed tokens:
+  //
+  //   { 1, 2 }  ->  { 3 }
+  //
+  // Replacing only the TU-owned bytes for "1," is unsound: the include
+  // directive would remain in the source and replay its old "2" token.  The
+  // only source realization we accept here is therefore one TU byte interval
+  // that spans all TU tokens consumed by the hunk and all touched include
+  // directive sites.
+  if (mixedTUIncludeClosure) {
+    materialBeginA = closureBegin;
+    materialEndA = closureEnd;
+
+    // Collect the source intervals that must be consumed by the closure:
+    //   * every touched include directive site, and
+    //   * every TU-owned token in the widened A token interval.
+    //
+    // Later checks prove these pieces merge into one safe TU replacement span
+    // with only whitespace between pieces and no unrelated artifacts absorbed.
+    SmallVector<std::pair<uint64_t, uint64_t>, 16> sourcePieces;
+    sourcePieces.reserve(touched.size() + (closureEnd - closureBegin));
+    for (const RefoldModel::IncludeItem *inc : touched)
+      sourcePieces.push_back({inc->siteB, inc->siteE});
+
+    bool sawTUToken = false;
+    const auto &tokmapByPP = model_.GetTokmapByPP();
+    for (uint64_t pp = closureBegin; pp < closureEnd; ++pp) {
+      auto it = tokmapByPP.find(pp);
+      if (it == tokmapByPP.end())
+        continue;
+
+      const auto &entry = it->second;
+      if (PathsEqual(entry.file, tuPath)) {
+        sourcePieces.push_back({entry.b, entry.e});
+        sawTUToken = true;
+        continue;
+      }
+
+      // Any non-TU token in the closure must be explained by one of the touched
+      // include covers.  Otherwise this is not a TU/include closure; it would
+      // be a mixed-owner edit involving some third artifact that this proof
+      // does not know how to realize soundly.
+      if (!tokenCoveredByTouchedInclude(pp)) {
+        trace("fallback",
+              "TU/include closure rejected: A token {0} maps to file={1} "
+              "outside the touched include run A=[{2},{3})",
+              pp, entry.file, coverBegin, coverEnd);
+        return std::nullopt;
+      }
+    }
+
+    // The mixed proof is only for hunks that actually consume ordinary TU
+    // spelling.  If no TU token was seen, the pure include-closure path is the
+    // appropriate proof shape instead.
+    if (!sawTUToken) {
+      trace("fallback",
+            "TU/include closure rejected: mixed closure A=[{0},{1}) has no "
+            "TU-owned source token",
+            closureBegin, closureEnd);
+      return std::nullopt;
+    }
+
+    // Normalize the collected source pieces so the rest of the proof can reason
+    // about the single candidate replacement envelope.
+    llvm::sort(sourcePieces, [](const auto &lhs, const auto &rhs) {
+      if (lhs.first != rhs.first)
+        return lhs.first < rhs.first;
+      return lhs.second < rhs.second;
+    });
+
+    SmallVector<std::pair<uint64_t, uint64_t>, 16> mergedPieces;
+    for (const auto &piece : sourcePieces) {
+      if (piece.first >= piece.second || piece.second > tuBytes.size()) {
+        trace("fallback",
+              "TU/include closure rejected: invalid source piece [{0},{1}) "
+              "fileLen={2}",
+              piece.first, piece.second, tuBytes.size());
+        return std::nullopt;
+      }
+      if (mergedPieces.empty() || piece.first > mergedPieces.back().second) {
+        mergedPieces.push_back(piece);
+        continue;
+      }
+      mergedPieces.back().second =
+          std::max(mergedPieces.back().second, piece.second);
+    }
+
+    // The replacement will cover the whole byte envelope from the first
+    // required source piece through the last.  Subsequent checks prove that
+    // widening this far does not silently consume meaningful unrelated source.
+    sourceBegin = mergedPieces.front().first;
+    sourceEnd = mergedPieces.back().second;
+
+    // Do not absorb any include directive other than the run whose expansion is
+    // explicitly part of this closure.  This prevents a nearby unrelated
+    // include from being deleted merely because it lies between two required
+    // pieces.
+    for (const auto &inc : model_.GetIncludes()) {
+      if (!PathsEqual(inc.sitePath, tuPath))
+        continue;
+      if (inc.siteB >= sourceEnd || sourceBegin >= inc.siteE)
+        continue;
+      bool isTouched = false;
+      for (const RefoldModel::IncludeItem *touchedInc : touched)
+        if (touchedInc->id == inc.id) {
+          isTouched = true;
+          break;
+        }
+      if (!isTouched) {
+        trace("fallback",
+              "TU/include closure rejected: source interval [{0},{1}) would "
+              "absorb unrelated include id={2} site=[{3},{4})",
+              sourceBegin, sourceEnd, inc.id, inc.siteB, inc.siteE);
+        return std::nullopt;
+      }
+    }
+
+    // Likewise, do not delete or partially overwrite a macro invocation that
+    // was not part of the closure proof.  Mixed TU/include closure is
+    // intentionally limited to ordinary TU spelling plus touched include
+    // directives.
+    for (const auto &m : model_.GetMacroInvocations()) {
+      if (m.invFile && !m.invFile->empty() && !PathsEqual(*m.invFile, tuPath))
+        continue;
+      if (!m.invB || !m.invE)
+        continue;
+      if (*m.invB < sourceEnd && sourceBegin < *m.invE) {
+        trace("fallback",
+              "TU/include closure rejected: source interval [{0},{1}) would "
+              "absorb macro invocation id={2} name='{3}' site=[{4},{5})",
+              sourceBegin, sourceEnd, m.id, m.name, *m.invB, *m.invE);
+        return std::nullopt;
+      }
+    }
+
+    // The envelope may widen across physical gaps between required pieces, but
+    // only across trivia.  Any non-whitespace byte in a gap would be meaningful
+    // source text that the proof has not justified replacing.
+    uint64_t cursor = sourceBegin;
+    for (const auto &piece : mergedPieces) {
+      if (piece.first > cursor) {
+        StringRef gap = tuBytes.slice(cursor, piece.first);
+        if (!stringutils::isWhitespace(gap)) {
+          trace("fallback",
+                "TU/include closure rejected: non-whitespace TU gap inside "
+                "mixed source interval [{0},{1}) gap='{2}'",
+                cursor, piece.first, stringutils::showWSWithClip(gap, 120));
+          return std::nullopt;
+        }
+      }
+      cursor = piece.second;
+    }
+
+    trace("fallback",
+          "TU/include closure source interval accepted: source=[{0},{1}) "
+          "A=[{2},{3}) includeCover=[{4},{5})",
+          sourceBegin, sourceEnd, materialBeginA, materialEndA, coverBegin,
+          coverEnd);
+  }
+
   if (!exactCover) {
-    if (!hunkInsideCover) {
+    if (!hunkInsideCover && !mixedTUIncludeClosure) {
       trace("fallback",
             "TU include-closure rejected: touched include cover A=[{0},{1}) "
             "does not contain hunk A=[{2},{3})",
@@ -948,13 +1140,13 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       return std::nullopt;
     }
 
-    // Widening from the unresolved hunk to the complete include-cover is
+    // Widening from the unresolved hunk to the complete closure A-range is
     // admissible only when the widened-away prefix/suffix are observationally
-    // unchanged in the token diff. That keeps this as an include-closure proof,
+    // unchanged in the token diff. That keeps this as a source-closure proof,
     // not a hidden multi-region merge: any independent token edit or insertion
     // in the extra cover must be handled by the normal partition/lattice path.
-    const bool prefixClean = !rangeHasForeignTokenDiff(coverBegin, h.aStart);
-    const bool suffixClean = !rangeHasForeignTokenDiff(h.aEnd, coverEnd);
+    const bool prefixClean = !rangeHasForeignTokenDiff(materialBeginA, h.aStart);
+    const bool suffixClean = !rangeHasForeignTokenDiff(h.aEnd, materialEndA);
     if (!prefixClean || !suffixClean) {
       trace("fallback",
             "TU include-closure rejected: widening A=[{0},{1}) around hunk "
@@ -965,26 +1157,26 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       return std::nullopt;
     }
 
-    if (sourceTouchesStagedEdit(first->siteB, last->siteE)) {
+    if (sourceTouchesStagedEdit(sourceBegin, sourceEnd)) {
       trace("fallback",
             "TU include-closure rejected: widened source interval [{0},{1}) "
             "would absorb an already-staged source edit",
-            first->siteB, last->siteE);
+            sourceBegin, sourceEnd);
       return std::nullopt;
     }
 
     trace("fallback",
           "TU include-closure widening accepted: hunk A=[{0},{1}) widened to "
-          "include cover A=[{2},{3})",
-          h.aStart, h.aEnd, coverBegin, coverEnd);
+          "closure A=[{2},{3}) source=[{4},{5})",
+          h.aStart, h.aEnd, materialBeginA, materialEndA, sourceBegin,
+          sourceEnd);
   }
 
-  if (first->siteB >= first->siteE || last->siteE > tuBytes.size() ||
-      first->siteB >= last->siteE) {
+  if (sourceBegin >= sourceEnd || sourceEnd > tuBytes.size()) {
     trace("fallback",
           "TU include-closure rejected: invalid TU source interval [{0},{1}) "
           "fileLen={2}",
-          first->siteB, last->siteE, tuBytes.size());
+          sourceBegin, sourceEnd, tuBytes.size());
     return std::nullopt;
   }
 
@@ -1029,47 +1221,58 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
 
   IncludeRealizationEvidenceKind evidenceKind =
       IncludeRealizationEvidenceKind::Unknown;
-  auto bEnvelope = ResolveIncludeRealizationBTokenEnvelope(coverBegin, coverEnd,
+  auto bEnvelope = ResolveIncludeRealizationBTokenEnvelope(materialBeginA,
+                                                           materialEndA,
                                                            &evidenceKind);
+  if (!bEnvelope && materialBeginA == h.aStart && materialEndA == h.aEnd) {
+    bEnvelope = std::make_pair(static_cast<size_t>(h.bStart),
+                               static_cast<size_t>(h.bEnd));
+    evidenceKind = IncludeRealizationEvidenceKind::CanonicalBCoverEnvelope;
+    trace("fallback",
+          "TU/include closure using exact diff hunk B envelope: "
+          "A=[{0},{1}) B=[{2},{3})",
+          materialBeginA, materialEndA, h.bStart, h.bEnd);
+  }
   if (!bEnvelope) {
     trace("fallback",
           "TU include-closure rejected: no canonical-or-consensus B envelope "
           "for A-cover [{0},{1})",
-          coverBegin, coverEnd);
+          materialBeginA, materialEndA);
     return std::nullopt;
   }
 
   auto bMaterialBegin = bEnvelope->first;
   auto bMaterialEnd = bEnvelope->second;
 
-  // Canonical A-cover projection can include stable boundary tokens that are
+  // Pure include-closure projection can include stable boundary tokens that are
   // outside the include cover, such as the `{` before an include run inside an
   // initializer. The source edit starts at the first include directive, so such
   // outside anchors must not be materialized or they would be duplicated in the
-  // TU. Trim only B tokens that are proven stable and mapped to A tokens outside
-  // the include cover; unmatched B tokens and stable tokens inside the cover
-  // remain part of the realization payload.
-  auto bTokenMapsOutsideCover = [&](size_t bTok) -> bool {
-    if (bTok >= abTokMapB2A_.size())
-      return false;
-    const int64_t mappedA = abTokMapB2A_[bTok];
-    if (mappedA < 0)
-      return false;
-    const uint64_t aTok = static_cast<uint64_t>(mappedA);
-    return aTok < coverBegin || aTok >= coverEnd;
-  };
+  // TU. A mixed TU/include closure consumes those TU-side boundary tokens as
+  // part of the same source interval, so it keeps the full closure envelope.
+  if (!mixedTUIncludeClosure) {
+    auto bTokenMapsOutsideCover = [&](size_t bTok) -> bool {
+      if (bTok >= abTokMapB2A_.size())
+        return false;
+      const int64_t mappedA = abTokMapB2A_[bTok];
+      if (mappedA < 0)
+        return false;
+      const uint64_t aTok = static_cast<uint64_t>(mappedA);
+      return aTok < coverBegin || aTok >= coverEnd;
+    };
 
-  while (bMaterialBegin < bMaterialEnd &&
-         bTokenMapsOutsideCover(bMaterialBegin))
-    ++bMaterialBegin;
-  while (bMaterialBegin < bMaterialEnd &&
-         bTokenMapsOutsideCover(bMaterialEnd - 1))
-    --bMaterialEnd;
+    while (bMaterialBegin < bMaterialEnd &&
+           bTokenMapsOutsideCover(bMaterialBegin))
+      ++bMaterialBegin;
+    while (bMaterialBegin < bMaterialEnd &&
+           bTokenMapsOutsideCover(bMaterialEnd - 1))
+      --bMaterialEnd;
+  }
 
   if (h.bStart < bMaterialBegin || h.bEnd > bMaterialEnd) {
     trace("fallback",
           "TU include-closure rejected: hunk B=[{0},{1}) is outside trimmed "
-          "include-cover B material [{2},{3}) from envelope [{4},{5})",
+          "closure B material [{2},{3}) from envelope [{4},{5})",
           h.bStart, h.bEnd, bMaterialBegin, bMaterialEnd, bEnvelope->first,
           bEnvelope->second);
     return std::nullopt;
@@ -1084,14 +1287,15 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     replacement.append(preservedGapTrivia.begin(), preservedGapTrivia.end());
   }
 
-  // The closure begins at the exact include-directive run proved above, but we
-  // may later extend its right edge over immediately following untouched TU
-  // line(s). That keeps any required physical-line compensation after copied
-  // suffix lines such as `};` instead of introducing a blank line inside the
-  // realized replacement itself.
-  uint64_t closureSourceEnd = last->siteE;
+  // The closure begins at the proved source interval.  For a pure include
+  // closure that is the include-directive run; for a mixed TU/include closure it
+  // also includes the directly consumed TU tokens adjacent to that run.  We may
+  // later extend the right edge over immediately following untouched TU line(s)
+  // so any required physical-line compensation lands after copied suffix lines
+  // such as `};` instead of inside the realized replacement itself.
+  uint64_t closureSourceEnd = sourceEnd;
   std::string padded = PadAtBoundaries(
-      tuBytes, static_cast<size_t>(first->siteB),
+      tuBytes, static_cast<size_t>(sourceBegin),
       static_cast<size_t>(closureSourceEnd), std::move(replacement),
       /*allowLeft=*/true, /*allowRight=*/true);
 
@@ -1103,7 +1307,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   // untouched TU
   // line(s) by absorbing those exact source bytes into the same TU edit.
   const size_t origNl =
-      stringutils::countNewlines(tuBytes, first->siteB, closureSourceEnd);
+      stringutils::countNewlines(tuBytes, sourceBegin, closureSourceEnd);
   const size_t initialReplNl = stringutils::countNewlines(padded);
   if (origNl > initialReplNl) {
     size_t remainingPadNl = origNl - initialReplNl;
@@ -1178,7 +1382,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
         trace("fallback",
               "TU include-closure physical newline pad deferred to #line "
               "resync: source=[{0},{1}) suppressedNl={2}",
-              first->siteB, closureSourceEnd, remainingPadNl);
+              sourceBegin, closureSourceEnd, remainingPadNl);
       } else {
         // In --no-lines mode, clang-refold intentionally does not preserve
         // source-location semantics. The verification path already masks
@@ -1189,7 +1393,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
         trace("fallback",
               "TU include-closure physical newline pad suppressed by "
               "--no-lines: source=[{0},{1}) suppressedNl={2}",
-              first->siteB, closureSourceEnd, remainingPadNl);
+              sourceBegin, closureSourceEnd, remainingPadNl);
       }
       remainingPadNl = 0;
     }
@@ -1200,21 +1404,21 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     trace("fallback",
           "TU include-closure newline pad: source=[{0},{1}) origNl={2} "
           "replNl={3} physicalPadNl={4} finalSourceEnd={5} result='{6}'",
-          first->siteB, last->siteE, origNl, initialReplNl, remainingPadNl,
+          sourceBegin, sourceEnd, origNl, initialReplNl, remainingPadNl,
           closureSourceEnd, stringutils::showWSWithClip(padded, 120));
   }
 
   debug("fallback",
         "TU include-closure accepted: includes=[{0},{1}] source=[{2},{3}) "
         "A=[{4},{5}) B=[{6},{7}) evidence={8} raw='{9}' padded='{10}'",
-        first->id, last->id, first->siteB, closureSourceEnd, coverBegin,
-        coverEnd, bEnvelope->first, bEnvelope->second, evidenceKind,
+        first->id, last->id, sourceBegin, closureSourceEnd, materialBeginA,
+        materialEndA, bEnvelope->first, bEnvelope->second, evidenceKind,
         stringutils::showWSWithClip(rawReplacement, 120),
         stringutils::showWSWithClip(padded, 120));
 
-  ResyncOutcome ro = ApplyResyncOrPend(tuBytes, first->siteB, closureSourceEnd,
+  ResyncOutcome ro = ApplyResyncOrPend(tuBytes, sourceBegin, closureSourceEnd,
                                        padded, tuPath);
-  TextEdit edit{first->siteB,          closureSourceEnd, std::move(ro.text),
+  TextEdit edit{sourceBegin,           closureSourceEnd, std::move(ro.text),
                 std::move(ro.pending), std::nullopt,     {}};
 
   // The emitted artifact is still a deterministic TU byte replacement even
@@ -1222,8 +1426,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   // textual-edit carrier until a dedicated closure-edit proof class exists.
   AttachAcceptedResultCarrier(
       edit, BuildAcceptedTUTextEditCandidate(
-                AcceptedPathKind::TUByteSpanConservativeEdit, first->siteB,
-                last->siteE, StringRef(rawReplacement)));
+                AcceptedPathKind::TUByteSpanConservativeEdit, sourceBegin,
+                closureSourceEnd, StringRef(rawReplacement)));
   return edit;
 }
 
