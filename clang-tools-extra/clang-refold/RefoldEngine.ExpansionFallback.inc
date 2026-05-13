@@ -1639,16 +1639,105 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     uint64_t includeCount = 0;
     uint64_t macroCount = 0;
     uint64_t macroDirectiveCount = 0;
+    uint64_t conditionalCount = 0;
+    unsigned conditionalDepth = 0;
+
+    // Scan source bytes that are not covered by recorded zero-token artifacts.
+    // These interstitial bytes may contain ordinary lexical trivia and literal
+    // conditional-control directives.  The conditional depth is carried across
+    // consumed artifacts, which is what admits shapes such as:
+    //
+    //   #if 1
+    //   #define GAP_VALUE 99
+    //   #endif
+    //
+    // when the #define line is itself a proved consumable macro-state artifact.
+    bool atLineStart = stringutils::beginsLineAfterWs(tuBytes, gapBegin);
+    auto scanNeutralControlTrivia = [&](uint64_t limit) -> bool {
+      while (cursor < limit) {
+        char ch = tuBytes[cursor];
+        if (stringutils::isWs(ch)) {
+          atLineStart = ch == '\n' || ch == '\r';
+          ++cursor;
+          continue;
+        }
+
+        if (ch == '/') {
+          const uint64_t before = cursor;
+          StringRef rest = tuBytes.drop_front(cursor);
+          if (rest.starts_with("/*")) {
+            cursor += 2;
+            bool closed = false;
+            while (cursor + 1 < limit) {
+              if (tuBytes[cursor] == '*' && tuBytes[cursor + 1] == '/') {
+                cursor += 2;
+                closed = true;
+                break;
+              }
+              ++cursor;
+            }
+            if (!closed)
+              return false;
+            StringRef skipped = tuBytes.slice(before, cursor);
+            atLineStart = skipped.ends_with("\n") || skipped.ends_with("\r");
+            continue;
+          }
+
+          if (rest.starts_with("//")) {
+            cursor += 2;
+            while (cursor < limit && tuBytes[cursor] != '\n' &&
+                   tuBytes[cursor] != '\r')
+              ++cursor;
+
+            // A line comment may end at the end of the whole gap, but it may
+            // not run into a following recorded artifact.  In that case the
+            // artifact's spelling would be inside the comment, contradicting the
+            // proof that it is an independently recorded source artifact.
+            if (cursor >= limit)
+              return limit == gapEnd;
+
+            ++cursor;
+            atLineStart = true;
+            continue;
+          }
+        }
+
+        // Literal conditional-control directives are source-neutral only at a
+        // physical directive boundary.  Any other directive or token spelling is
+        // real source that this closure has not proved safe to erase.
+        if (ch != '#' || !atLineStart)
+          return false;
+
+        uint64_t lineEnd = cursor;
+        while (lineEnd < limit && tuBytes[lineEnd] != '\n')
+          ++lineEnd;
+        if (lineEnd < limit)
+          ++lineEnd;
+
+        if (!parseLiteralEmptyConditionalDirectiveLine(
+                tuBytes.slice(cursor, lineEnd), conditionalDepth))
+          return false;
+
+        ++conditionalCount;
+        cursor = lineEnd;
+        atLineStart = true;
+      }
+      return cursor == limit;
+    };
+
     for (const GapPiece &piece : pieces) {
       if (piece.begin < cursor)
         return false;
-      // Gaps around recorded zero-token artifacts may contain only lexical
-      // trivia.  A complete comment is as source-neutral as whitespace here:
-      // it contributes no PP tokens and lies inside the source interval being
-      // replaced.
-      if (!isWsOrCompleteCommentTrivia(tuBytes.slice(cursor, piece.begin)))
+      if (!scanNeutralControlTrivia(piece.begin))
         return false;
+
+      // The artifact itself has already been independently proved zero-token and
+      // complete.  Consume it as one opaque source-neutral piece, then continue
+      // scanning the surrounding control/trivia bytes at the same conditional
+      // depth.
+      StringRef pieceBytes = tuBytes.slice(piece.begin, piece.end);
       cursor = piece.end;
+      atLineStart = pieceBytes.ends_with("\n") || pieceBytes.ends_with("\r");
       if (piece.kind == "include")
         ++includeCount;
       else if (piece.kind == "macro")
@@ -1656,15 +1745,16 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       else
         ++macroDirectiveCount;
     }
-    // The suffix after the final zero-token artifact must also be trivia,
-    // otherwise the replacement envelope would erase unproved source spelling.
-    if (!isWsOrCompleteCommentTrivia(tuBytes.slice(cursor, gapEnd)))
+
+    if (!scanNeutralControlTrivia(gapEnd) || conditionalDepth != 0)
       return false;
 
     trace("fallback",
           "TU/include closure consuming zero-token source gap "
-          "source=[{0},{1}) includes={2} macros={3} macroDirectives={4}",
-          gapBegin, gapEnd, includeCount, macroCount, macroDirectiveCount);
+          "source=[{0},{1}) includes={2} macros={3} macroDirectives={4} "
+          "conditionalDirectives={5}",
+          gapBegin, gapEnd, includeCount, macroCount, macroDirectiveCount,
+          conditionalCount);
     return true;
   };
 
