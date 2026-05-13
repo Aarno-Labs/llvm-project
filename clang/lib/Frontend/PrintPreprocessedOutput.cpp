@@ -97,6 +97,7 @@ private:
   bool KeepSystemIncludes;
   raw_ostream *OrigOS;
   std::unique_ptr<llvm::raw_null_ostream> NullOS;
+  RefoldMapBuilder *RefoldRecorder = nullptr;
 
   Token PrevTok;
   Token PrevPrevTok;
@@ -105,13 +106,15 @@ public:
   PrintPPOutputPPCallbacks(Preprocessor &pp, raw_ostream *os, bool lineMarkers,
                            bool defines, bool DumpIncludeDirectives,
                            bool UseLineDirectives, bool MinimizeWhitespace,
-                           bool DirectivesOnly, bool KeepSystemIncludes)
+                           bool DirectivesOnly, bool KeepSystemIncludes,
+                           RefoldMapBuilder *Recorder)
       : PP(pp), SM(PP.getSourceManager()), ConcatInfo(PP), OS(os),
         DisableLineMarkers(lineMarkers), DumpDefines(defines),
         DumpIncludeDirectives(DumpIncludeDirectives),
         UseLineDirectives(UseLineDirectives),
         MinimizeWhitespace(MinimizeWhitespace), DirectivesOnly(DirectivesOnly),
-        KeepSystemIncludes(KeepSystemIncludes), OrigOS(os) {
+        KeepSystemIncludes(KeepSystemIncludes), OrigOS(os),
+        RefoldRecorder(Recorder) {
     CurLine = 0;
     CurFilename += "<uninit>";
     EmittedTokensOnThisLine = false;
@@ -136,6 +139,15 @@ public:
     return EmittedDirectiveOnThisLine;
   }
 
+  void recordPragma(SourceLocation Loc) {
+    // Keep pragma recording independent from printing. Pragmas often produce no
+    // ordinary PP tokens, but they are still source structure the refold
+    // consumer must see before deciding whether a zero-token include gap is
+    // safe to consume.
+    if (RefoldRecorder)
+      RefoldRecorder->onPragma(Loc, StringRef());
+  }
+
   /// Ensure that the output stream position is at the beginning of a new line
   /// and inserts one if it does not. It is intended to ensure that directives
   /// inserted by the directives not from the input source (such as #line) are
@@ -153,6 +165,8 @@ public:
                           StringRef RelativePath, const Module *Imported,
                           SrcMgr::CharacteristicKind FileType) override;
   void Ident(SourceLocation Loc, StringRef str) override;
+  void PragmaDirective(SourceLocation Loc,
+                       PragmaIntroducerKind Introducer) override;
   void PragmaMessage(SourceLocation Loc, StringRef Namespace,
                      PragmaMessageKind Kind, StringRef Str) override;
   void PragmaDebug(SourceLocation Loc, StringRef DebugType) override;
@@ -344,6 +358,12 @@ void PrintPPOutputPPCallbacks::FileChanged(SourceLocation Loc,
     if (IncludeLoc.isValid())
       MoveToLine(IncludeLoc, /*RequireStartOfLine=*/false);
   } else if (Reason == PPCallbacks::SystemHeaderPragma) {
+    // `#pragma GCC system_header` is reported as a file-change reason rather
+    // than through one of the ordinary pragma callbacks. Record it so the
+    // refold map does not mistake the containing zero-token include for empty
+    // trivia that a closure proof may freely consume.
+    recordPragma(Loc);
+
     // GCC emits the # directive for this directive on the line AFTER the
     // directive and emits a bunch of spaces that aren't needed. This is because
     // otherwise we will emit a line marker for THIS line, which requires an
@@ -470,6 +490,21 @@ void PrintPPOutputPPCallbacks::Ident(SourceLocation Loc, StringRef S) {
   setEmittedTokensOnThisLine();
 }
 
+void PrintPPOutputPPCallbacks::PragmaDirective(
+    SourceLocation Loc, PragmaIntroducerKind Introducer) {
+  // This generic hook fires for pragma directives before the pragma-specific
+  // callback or handler runs. Only raw `#pragma` lines have directive-line
+  // byte spans that can be consumed by include-closure proofs; `_Pragma` is an
+  // expression-like spelling and is handled by the existing pragma handler path
+  // when it needs to be represented.
+  if (Introducer != PIK_HashPragma)
+    return;
+
+  // Recording the source line gives the refold consumer a conservative
+  // structural marker for otherwise tokenless pragma state inside include gaps.
+  recordPragma(Loc);
+}
+
 /// MacroDefined - This hook is called whenever a macro definition is seen.
 void PrintPPOutputPPCallbacks::MacroDefined(const Token &MacroNameTok,
                                             const MacroDirective *MD) {
@@ -522,6 +557,7 @@ void PrintPPOutputPPCallbacks::PragmaMessage(SourceLocation Loc,
                                              StringRef Namespace,
                                              PragmaMessageKind Kind,
                                              StringRef Str) {
+  recordPragma(Loc);
   MoveToLine(Loc, /*RequireStartOfLine=*/true);
   *OS << "#pragma ";
   if (!Namespace.empty())
@@ -547,6 +583,7 @@ void PrintPPOutputPPCallbacks::PragmaMessage(SourceLocation Loc,
 
 void PrintPPOutputPPCallbacks::PragmaDebug(SourceLocation Loc,
                                            StringRef DebugType) {
+  recordPragma(Loc);
   MoveToLine(Loc, /*RequireStartOfLine=*/true);
 
   *OS << "#pragma clang __debug ";
@@ -557,6 +594,7 @@ void PrintPPOutputPPCallbacks::PragmaDebug(SourceLocation Loc,
 
 void PrintPPOutputPPCallbacks::
 PragmaDiagnosticPush(SourceLocation Loc, StringRef Namespace) {
+  recordPragma(Loc);
   MoveToLine(Loc, /*RequireStartOfLine=*/true);
   *OS << "#pragma " << Namespace << " diagnostic push";
   setEmittedDirectiveOnThisLine();
@@ -564,6 +602,7 @@ PragmaDiagnosticPush(SourceLocation Loc, StringRef Namespace) {
 
 void PrintPPOutputPPCallbacks::
 PragmaDiagnosticPop(SourceLocation Loc, StringRef Namespace) {
+  recordPragma(Loc);
   MoveToLine(Loc, /*RequireStartOfLine=*/true);
   *OS << "#pragma " << Namespace << " diagnostic pop";
   setEmittedDirectiveOnThisLine();
@@ -573,6 +612,7 @@ void PrintPPOutputPPCallbacks::PragmaDiagnostic(SourceLocation Loc,
                                                 StringRef Namespace,
                                                 diag::Severity Map,
                                                 StringRef Str) {
+  recordPragma(Loc);
   MoveToLine(Loc, /*RequireStartOfLine=*/true);
   *OS << "#pragma " << Namespace << " diagnostic ";
   switch (Map) {
@@ -599,6 +639,7 @@ void PrintPPOutputPPCallbacks::PragmaDiagnostic(SourceLocation Loc,
 void PrintPPOutputPPCallbacks::PragmaWarning(SourceLocation Loc,
                                              PragmaWarningSpecifier WarningSpec,
                                              ArrayRef<int> Ids) {
+  recordPragma(Loc);
   MoveToLine(Loc, /*RequireStartOfLine=*/true);
 
   *OS << "#pragma warning(";
@@ -623,6 +664,7 @@ void PrintPPOutputPPCallbacks::PragmaWarning(SourceLocation Loc,
 
 void PrintPPOutputPPCallbacks::PragmaWarningPush(SourceLocation Loc,
                                                  int Level) {
+  recordPragma(Loc);
   MoveToLine(Loc, /*RequireStartOfLine=*/true);
   *OS << "#pragma warning(push";
   if (Level >= 0)
@@ -632,6 +674,7 @@ void PrintPPOutputPPCallbacks::PragmaWarningPush(SourceLocation Loc,
 }
 
 void PrintPPOutputPPCallbacks::PragmaWarningPop(SourceLocation Loc) {
+  recordPragma(Loc);
   MoveToLine(Loc, /*RequireStartOfLine=*/true);
   *OS << "#pragma warning(pop)";
   setEmittedDirectiveOnThisLine();
@@ -639,6 +682,7 @@ void PrintPPOutputPPCallbacks::PragmaWarningPop(SourceLocation Loc) {
 
 void PrintPPOutputPPCallbacks::PragmaExecCharsetPush(SourceLocation Loc,
                                                      StringRef Str) {
+  recordPragma(Loc);
   MoveToLine(Loc, /*RequireStartOfLine=*/true);
   *OS << "#pragma character_execution_set(push";
   if (!Str.empty())
@@ -648,6 +692,7 @@ void PrintPPOutputPPCallbacks::PragmaExecCharsetPush(SourceLocation Loc,
 }
 
 void PrintPPOutputPPCallbacks::PragmaExecCharsetPop(SourceLocation Loc) {
+  recordPragma(Loc);
   MoveToLine(Loc, /*RequireStartOfLine=*/true);
   *OS << "#pragma character_execution_set(pop)";
   setEmittedDirectiveOnThisLine();
@@ -655,6 +700,7 @@ void PrintPPOutputPPCallbacks::PragmaExecCharsetPop(SourceLocation Loc) {
 
 void PrintPPOutputPPCallbacks::
 PragmaAssumeNonNullBegin(SourceLocation Loc) {
+  recordPragma(Loc);
   MoveToLine(Loc, /*RequireStartOfLine=*/true);
   *OS << "#pragma clang assume_nonnull begin";
   setEmittedDirectiveOnThisLine();
@@ -662,6 +708,7 @@ PragmaAssumeNonNullBegin(SourceLocation Loc) {
 
 void PrintPPOutputPPCallbacks::
 PragmaAssumeNonNullEnd(SourceLocation Loc) {
+  recordPragma(Loc);
   MoveToLine(Loc, /*RequireStartOfLine=*/true);
   *OS << "#pragma clang assume_nonnull end";
   setEmittedDirectiveOnThisLine();
@@ -1030,7 +1077,8 @@ void clang::DoPrintPreprocessedInput(Preprocessor &PP, raw_ostream *OS,
   PrintPPOutputPPCallbacks *Callbacks = new PrintPPOutputPPCallbacks(
       PP, OutOS, !Opts.ShowLineMarkers, Opts.ShowMacros,
       Opts.ShowIncludeDirectives, Opts.UseLineDirectives,
-      Opts.MinimizeWhitespace, Opts.DirectivesOnly, Opts.KeepSystemIncludes);
+      Opts.MinimizeWhitespace, Opts.DirectivesOnly, Opts.KeepSystemIncludes,
+      RefoldRecorder.get());
 
   // Expand macros in pragmas with -fms-extensions.  The assumption is that
   // the majority of pragmas in such a file will be Microsoft pragmas.
