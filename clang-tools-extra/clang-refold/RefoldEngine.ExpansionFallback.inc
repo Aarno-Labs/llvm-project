@@ -307,6 +307,102 @@ using SourceLineDirectiveLogicalLineRewriter =
         StringRef, ArrayRef<uint64_t>,
         SourceLineDirectiveBuiltinMacroResolver)>;
 
+/// Return `text` after applying the translation-phase-2 splice deletion rule.
+///
+/// The owner-envelope line-control proof operates on a phase-2 logical directive
+/// line, while the producer records macro invocation and argument byte ranges in
+/// the original source spelling.  When a recorded invocation crosses a literal
+/// backslash-newline pair, compare and substitute the post-splice spelling rather
+/// than requiring physically contiguous source bytes.
+static std::optional<std::string>
+removePhase2SplicesForLineControl(StringRef text) {
+  std::string out;
+  out.reserve(text.size());
+
+  enum class ScanState { Ordinary, StringLiteral, CharLiteral, BlockComment };
+  ScanState state = ScanState::Ordinary;
+
+  auto skipSplice = [&](size_t &pos) -> bool {
+    if (text[pos] != '\\')
+      return false;
+    if (pos + 1 < text.size() && text[pos + 1] == '\n') {
+      pos += 2;
+      return true;
+    }
+    if (pos + 2 < text.size() && text[pos + 1] == '\r' &&
+        text[pos + 2] == '\n') {
+      pos += 3;
+      return true;
+    }
+    return false;
+  };
+
+  for (size_t pos = 0; pos < text.size();) {
+    if (state == ScanState::Ordinary) {
+      if (skipSplice(pos))
+        continue;
+      if (text[pos] == '"') {
+        state = ScanState::StringLiteral;
+        out.push_back(text[pos++]);
+        continue;
+      }
+      if (text[pos] == '\'') {
+        state = ScanState::CharLiteral;
+        out.push_back(text[pos++]);
+        continue;
+      }
+      if (pos + 1 < text.size() && text[pos] == '/' &&
+          text[pos + 1] == '*') {
+        state = ScanState::BlockComment;
+        out.push_back(text[pos++]);
+        out.push_back(text[pos++]);
+        continue;
+      }
+
+      out.push_back(text[pos++]);
+      continue;
+    }
+
+    if (state == ScanState::BlockComment) {
+      // Splices inside comments would require jointly modeling phase 2 and
+      // phase 3 inside the macro argument.  Keep this local proof to splices
+      // between ordinary preprocessing tokens.
+      if (skipSplice(pos))
+        return std::nullopt;
+      if (pos + 1 < text.size() && text[pos] == '*' && text[pos + 1] == '/') {
+        out.push_back(text[pos++]);
+        out.push_back(text[pos++]);
+        state = ScanState::Ordinary;
+        continue;
+      }
+      out.push_back(text[pos++]);
+      continue;
+    }
+
+    // Preserve literal spellings opaquely, but reject line-spliced literals so
+    // this proof does not broaden the earlier literal-aware stringification
+    // rule beyond complete source-spelled literal tokens.
+    if (skipSplice(pos))
+      return std::nullopt;
+
+    char ch = text[pos++];
+    out.push_back(ch);
+    if (ch == '\\') {
+      if (pos >= text.size())
+        return std::nullopt;
+      out.push_back(text[pos++]);
+      continue;
+    }
+    if ((state == ScanState::StringLiteral && ch == '"') ||
+        (state == ScanState::CharLiteral && ch == '\''))
+      state = ScanState::Ordinary;
+  }
+
+  if (state != ScanState::Ordinary)
+    return std::nullopt;
+  return out;
+}
+
 /// Build the translation-phase-2 logical spelling of one source line.
 ///
 /// Source-level `#line` gaps are parsed from raw file bytes because they do not
@@ -404,6 +500,80 @@ static bool collectPhase2LogicalLine(
   return true;
 }
 
+/// Return the raw source offset from which physical newlines inside a proved
+/// line-control directive affect the resumed line state.
+///
+/// `collectPhase2LogicalLine()` removes backslash-newline splices before the
+/// directive is parsed, but not every removed physical newline advances the
+/// presumed line established by the directive.  Splices that merely form the
+/// directive introducer itself, such as `#\nline 123` or `#li\nne 123`, are
+/// consumed before the line operand is recognized and do not add to the resumed
+/// value.  Physical newlines after the directive has reached its operand field,
+/// including line continuations inside the filename macro argument and newlines
+/// inside block comments, do advance the line observed by the copied suffix.
+///
+/// The returned offset is just after the whitespace that separates the directive
+/// keyword/marker from its line operand.  Counting physical LF bytes from that
+/// raw offset through the collected directive line, minus the terminating
+/// directive newline, gives exactly the internal physical-line advance that must
+/// be added to the parsed line number.
+static std::optional<uint64_t> sourceLineDirectiveResumeCountBegin(
+    StringRef logicalLine, ArrayRef<uint64_t> logicalLineSourceOffsets) {
+  if (logicalLine.size() != logicalLineSourceOffsets.size() ||
+      logicalLine.empty())
+    return std::nullopt;
+
+  size_t pos = 0;
+  stringutils::skipNonNewlineWs(logicalLine, pos);
+  if (pos >= logicalLine.size() || logicalLine[pos] != '#')
+    return std::nullopt;
+
+  const size_t hashIndex = pos;
+  ++pos;
+  const size_t afterHash = pos;
+  stringutils::skipNonNewlineWs(logicalLine, pos);
+
+  if (pos < logicalLine.size() && logicalLine.substr(pos).starts_with("line")) {
+    const size_t afterLineKeyword = pos + StringRef("line").size();
+    if (afterLineKeyword < logicalLine.size() &&
+        stringutils::isIdentPart(logicalLine[afterLineKeyword]))
+      return std::nullopt;
+    if (afterLineKeyword >= logicalLine.size() ||
+        !stringutils::isNonNewlineWs(logicalLine[afterLineKeyword]))
+      return std::nullopt;
+
+    size_t afterSeparator = afterLineKeyword;
+    stringutils::skipNonNewlineWs(logicalLine, afterSeparator);
+    if (afterSeparator == afterLineKeyword)
+      return std::nullopt;
+
+    return logicalLineSourceOffsets[afterSeparator - 1] + 1;
+  }
+
+  if (pos < logicalLine.size() && isDigit(logicalLine[pos])) {
+    // Numeric line markers may be written either as `#123` or `# 123`.  When
+    // whitespace separates `#` from the number, count from just after that
+    // whitespace; otherwise count from just after `#` itself.
+    if (pos > afterHash)
+      return logicalLineSourceOffsets[pos - 1] + 1;
+    return logicalLineSourceOffsets[hashIndex] + 1;
+  }
+
+  return std::nullopt;
+}
+
+/// Count physical source lines inside a complete line-control directive that
+/// are part of the directive body rather than the terminating directive newline.
+static size_t countLineControlDirectiveBodyPhysicalNewlines(
+    StringRef fileText, uint64_t countBegin, uint64_t afterLine) {
+  if (countBegin >= afterLine || afterLine > fileText.size())
+    return 0;
+
+  size_t count = stringutils::countNewlines(fileText, countBegin, afterLine);
+  if (count != 0 && afterLine != 0 && fileText[afterLine - 1] == '\n')
+    --count;
+  return count;
+}
 
 /// Return true if the source prefix may already have changed the presumed
 /// line-control state before a zero-token `__LINE__` operand is encountered.
@@ -1208,11 +1378,12 @@ expandLineControlMacroReplacementText(
 /// line-control logical line.
 ///
 /// The substitution is used only as a precursor to the strict line-control
-/// parser.  It accepts complete callsites whose source bytes map contiguously
-/// into the phase-2 logical line and whose replacement text is recovered from a
-/// simple recorded #define.  Partial callsites, nested/overlapping source
-/// ranges, unsupported parameterized replacement semantics, and unrecorded
-/// expansions all fail closed.
+/// parser.  It accepts complete callsites whose recorded source spelling maps
+/// into the phase-2 logical line after deleting literal backslash-newline
+/// splices, and whose replacement text is recovered from a simple recorded
+/// #define.  Partial callsites, nested/overlapping source ranges, unsupported
+/// parameterized replacement semantics, and unrecorded expansions all fail
+/// closed.
 static std::optional<SourceLineDirectiveLogicalLineRewrite>
 rewriteSourceLineDirectiveLogicalLineMacros(
     const RefoldModel &model, StringRef file, StringRef logicalLine,
@@ -1281,18 +1452,13 @@ rewriteSourceLineDirectiveLogicalLineMacros(
         *endIndex > logicalLine.size())
       continue;
 
-    bool contiguousSourceSpelling = true;
-    for (size_t i = *beginIndex; i != *endIndex; ++i) {
-      if (logicalLineSourceOffsets[i] != *macro.invB + (i - *beginIndex)) {
-        contiguousSourceSpelling = false;
-        break;
-      }
-    }
-    if (!contiguousSourceSpelling)
+    StringRef logicalInvocation =
+        logicalLine.substr(*beginIndex, *endIndex - *beginIndex);
+    if (!macro.invText)
       continue;
-
-    if (macro.invText && logicalLine.substr(*beginIndex, *endIndex - *beginIndex) !=
-                             *macro.invText)
+    std::optional<std::string> phase2Invocation =
+        removePhase2SplicesForLineControl(*macro.invText);
+    if (!phase2Invocation || logicalInvocation != *phase2Invocation)
       continue;
 
     SmallVector<StringRef, 4> invocationArgTexts;
@@ -1314,23 +1480,27 @@ rewriteSourceLineDirectiveLogicalLineMacros(
             *argEndIndex > logicalLine.size())
           return std::nullopt;
 
-        // The argument text must also be a contiguous source spelling inside
-        // this phase-2 logical line.  If it crosses a splice boundary, comes
-        // from a nested macro body, or otherwise cannot be sliced directly from
-        // the recorded directive bytes, this local substitution proof stops.
-        bool contiguousArgSpelling = true;
-        for (size_t i = *argBeginIndex; i != *argEndIndex; ++i) {
-          if (logicalLineSourceOffsets[i] !=
-              *argRange.first + (i - *argBeginIndex)) {
-            contiguousArgSpelling = false;
-            break;
-          }
-        }
-        if (!contiguousArgSpelling)
+        StringRef logicalArg =
+            logicalLine.substr(*argBeginIndex, *argEndIndex - *argBeginIndex);
+
+        // Macro argument ranges are recorded in the physical source spelling,
+        // while this proof substitutes from the phase-2 logical directive line.
+        // A backslash-newline inside the argument is therefore safe only when
+        // the recorded invocation text, after phase-2 splice deletion, matches
+        // the exact logical slice we are about to substitute.
+        const uint64_t relativeArgBegin = *argRange.first - *macro.invB;
+        const uint64_t relativeArgEnd = *argRange.second - *macro.invB;
+        if (relativeArgBegin > relativeArgEnd ||
+            relativeArgEnd > macro.invText->size())
+          return std::nullopt;
+        std::optional<std::string> phase2Arg =
+            removePhase2SplicesForLineControl(macro.invText->slice(
+                static_cast<size_t>(relativeArgBegin),
+                static_cast<size_t>(relativeArgEnd)));
+        if (!phase2Arg || logicalArg != *phase2Arg)
           return std::nullopt;
 
-        invocationArgTexts.push_back(
-            logicalLine.substr(*argBeginIndex, *argEndIndex - *argBeginIndex));
+        invocationArgTexts.push_back(logicalArg);
       }
     }
 
@@ -1631,18 +1801,25 @@ computeSourceLineDirectiveGapResume(
       currentLineMarkerFlags = state->lineMarkerFlags;
 
     // A source-spelled line-control directive normally resumes the next
-    // physical line at the parsed line number.  If the directive contains a
-    // complete block comment with physical newlines, phase 3 replaces the
-    // whole comment with one whitespace character for directive parsing, but
+    // physical line at the parsed line number.  If the directive logical line
+    // spans multiple physical source lines after the line operand field begins,
     // those physical newlines still advance the presumed line counter before
-    // the following source line.  Count only non-spliced newlines in the raw
-    // directive bytes and subtract the terminating directive newline; any
-    // remaining newlines are inside the directive body and must be reflected in
-    // the resume state.
-    size_t directiveBodyNewlines = stringutils::countNonSplicedNewlines(
-        fileText, static_cast<size_t>(cursor), static_cast<size_t>(afterLine));
-    if (directiveBodyNewlines > 0)
-      --directiveBodyNewlines;
+    // the following source line.  That applies both to newlines inside complete
+    // block comments, which phase 3 replaces with whitespace, and to phase-2
+    // backslash-newline splices inside directive operands.
+    //
+    // Do not simply count every newline from the initial `#`: splices that form
+    // the directive introducer itself, such as `#\nline 123`, are consumed
+    // before the line operand is recognized and do not change the resumed line.
+    // Count from the raw source offset that begins the operand field instead.
+    std::optional<uint64_t> directiveCountBegin =
+        sourceLineDirectiveResumeCountBegin(logicalLine,
+                                            logicalLineSourceOffsets);
+    if (!directiveCountBegin)
+      return std::nullopt;
+    const size_t directiveBodyNewlines =
+        countLineControlDirectiveBodyPhysicalNewlines(
+            fileText, *directiveCountBegin, afterLine);
     lastLineAfterDirective =
         state->lineAfterDirective + directiveBodyNewlines;
     lastAfterDirectiveOffset = afterLine;
