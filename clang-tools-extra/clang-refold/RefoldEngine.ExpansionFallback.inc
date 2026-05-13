@@ -313,10 +313,13 @@ using SourceLineDirectiveLogicalLineRewriter =
 /// have ordinary PP tokens in the refold map.  Directive recognition occurs
 /// after C line splicing, so a `#` line whose trailing backslash splices the
 /// following `line 123` text is the same logical directive as `#line 123`.
-/// This helper removes only literal
-/// backslash-newline and backslash-CRLF pairs that are fully contained in the
-/// proved source gap, then returns the byte just after the terminating
-/// non-spliced newline.
+/// Block comments inside a directive are recognized before choosing the
+/// terminating newline, because phase 3 replaces a complete comment with one
+/// whitespace character; physical newlines inside such comments are therefore
+/// part of the directive spelling, not the directive terminator.  This helper
+/// removes only literal backslash-newline and backslash-CRLF pairs that are
+/// fully contained in the proved source gap, then returns the byte just after
+/// the terminating non-spliced newline.
 static bool collectPhase2LogicalLine(
     StringRef fileText, uint64_t lineBegin, uint64_t limit,
     std::string &logicalLine, uint64_t &afterLine,
@@ -327,6 +330,28 @@ static bool collectPhase2LogicalLine(
   logicalLine.clear();
   if (logicalLineSourceOffsets)
     logicalLineSourceOffsets->clear();
+
+  auto appendSourceByte = [&](uint64_t pos) {
+    logicalLine.push_back(fileText[pos]);
+    if (logicalLineSourceOffsets)
+      logicalLineSourceOffsets->push_back(pos);
+  };
+
+  auto skipPhase2Splice = [&](uint64_t &pos) -> bool {
+    if (fileText[pos] != '\\')
+      return false;
+    if (pos + 1 < limit && fileText[pos + 1] == '\n') {
+      pos += 2;
+      return true;
+    }
+    if (pos + 2 < limit && fileText[pos + 1] == '\r' &&
+        fileText[pos + 2] == '\n') {
+      pos += 3;
+      return true;
+    }
+    return false;
+  };
+
   for (uint64_t pos = lineBegin; pos < limit;) {
     char ch = fileText[pos];
 
@@ -334,16 +359,34 @@ static bool collectPhase2LogicalLine(
     // preprocessing directives are recognized.  Require the whole pair to be
     // inside the already-proved source gap so the closure does not depend on
     // bytes outside its envelope.
-    if (ch == '\\') {
-      if (pos + 1 < limit && fileText[pos + 1] == '\n') {
-        pos += 2;
-        continue;
+    if (skipPhase2Splice(pos))
+      continue;
+
+    // A block comment that starts on a directive line is translated to one
+    // whitespace character before macro expansion.  Newlines inside the
+    // complete comment therefore do not terminate the directive.  Keep the raw
+    // comment spelling and source-offset map so later stringification proofs
+    // can apply their own phase-3 whitespace normalization to the recorded
+    // macro argument.
+    if (ch == '/' && pos + 1 < limit && fileText[pos + 1] == '*') {
+      appendSourceByte(pos++);
+      appendSourceByte(pos++);
+      bool closed = false;
+      while (pos < limit) {
+        if (skipPhase2Splice(pos))
+          continue;
+        if (pos + 1 < limit && fileText[pos] == '*' &&
+            fileText[pos + 1] == '/') {
+          appendSourceByte(pos++);
+          appendSourceByte(pos++);
+          closed = true;
+          break;
+        }
+        appendSourceByte(pos++);
       }
-      if (pos + 2 < limit && fileText[pos + 1] == '\r' &&
-          fileText[pos + 2] == '\n') {
-        pos += 3;
-        continue;
-      }
+      if (!closed)
+        return false;
+      continue;
     }
 
     if (ch == '\n') {
@@ -351,10 +394,7 @@ static bool collectPhase2LogicalLine(
       return true;
     }
 
-    logicalLine.push_back(ch);
-    if (logicalLineSourceOffsets)
-      logicalLineSourceOffsets->push_back(pos);
-    ++pos;
+    appendSourceByte(pos++);
   }
 
   // Preserve the previous EOF-without-newline behavior for a complete final
@@ -659,10 +699,11 @@ static bool sourceSuffixMayObservePresumedFileSpelling(
 /// whitespace to one space, preserve string/character literal token spelling,
 /// and finally quote the resulting character sequence as a C string token.
 ///
-/// Same-line block comments are modeled as the single whitespace character
-/// produced before macro replacement.  Explicit backslashes outside literals,
-/// line comments, and newline-bearing block comments still fail closed because
-/// they interact with phase-2/directive-line state outside this local proof.
+/// Complete block comments are modeled as the single whitespace character
+/// produced before macro replacement, even when the comment body spans physical
+/// source lines.  Explicit backslashes outside literals and line comments still
+/// fail closed because they interact with phase-2/directive-line state outside
+/// this local proof.
 static std::optional<std::string>
 stringifyLineControlMacroArgument(StringRef argument) {
   StringRef trimmed = argument.trim(" \t\v\f\r\n");
@@ -685,20 +726,18 @@ stringifyLineControlMacroArgument(StringRef argument) {
     }
 
     // Comments are replaced by one whitespace character before macro
-    // stringification.  Because this proof works from the complete recorded
-    // argument spelling, a complete same-line block comment can be modeled as a
-    // pending inter-token space and then normalized with adjacent whitespace
-    // below.  Line comments and newline-bearing block comments remain outside
-    // this local proof: in a preprocessing directive they interact with the
-    // directive-line boundary rather than just the macro argument spelling.
+    // stringification.  Because collectPhase2LogicalLine has already proved
+    // that a block comment in a directive gap is complete and wholly inside the
+    // logical directive, it is safe to model the whole comment as one pending
+    // inter-token space and normalize it with adjacent whitespace below.  Line
+    // comments remain outside this local proof because they terminate at the
+    // physical directive-line boundary.
     if (ch == '/' && pos + 1 < trimmed.size()) {
       if (trimmed[pos + 1] == '*') {
         const size_t commentBegin = pos;
         pos += 2;
         bool closed = false;
         while (pos + 1 < trimmed.size()) {
-          if (trimmed[pos] == '\n' || trimmed[pos] == '\r')
-            return std::nullopt;
           if (trimmed[pos] == '*' && trimmed[pos + 1] == '/') {
             pos += 2;
             closed = true;
@@ -1590,7 +1629,22 @@ computeSourceLineDirectiveGapResume(
     currentFileSpelling = state->fileSpelling;
     if (state->updatesLineMarkerFlags)
       currentLineMarkerFlags = state->lineMarkerFlags;
-    lastLineAfterDirective = state->lineAfterDirective;
+
+    // A source-spelled line-control directive normally resumes the next
+    // physical line at the parsed line number.  If the directive contains a
+    // complete block comment with physical newlines, phase 3 replaces the
+    // whole comment with one whitespace character for directive parsing, but
+    // those physical newlines still advance the presumed line counter before
+    // the following source line.  Count only non-spliced newlines in the raw
+    // directive bytes and subtract the terminating directive newline; any
+    // remaining newlines are inside the directive body and must be reflected in
+    // the resume state.
+    size_t directiveBodyNewlines = stringutils::countNonSplicedNewlines(
+        fileText, static_cast<size_t>(cursor), static_cast<size_t>(afterLine));
+    if (directiveBodyNewlines > 0)
+      --directiveBodyNewlines;
+    lastLineAfterDirective =
+        state->lineAfterDirective + directiveBodyNewlines;
     lastAfterDirectiveOffset = afterLine;
     cursor = afterLine;
     atLineStart = true;
