@@ -1077,32 +1077,6 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         return *variadicTailIsNeutral;
       };
 
-      auto skipReplacementTrivia = [&](size_t &pos) -> bool {
-        StringRef text = replacement->directive->text;
-        while (pos < text.size()) {
-          if (stringutils::isWs(text[pos])) {
-            ++pos;
-            continue;
-          }
-
-          StringRef tail = text.substr(pos);
-          if (tail.starts_with("/*")) {
-            const size_t commentEnd = text.find("*/", pos + 2);
-            if (commentEnd == StringRef::npos)
-              return false;
-            pos = commentEnd + 2;
-            continue;
-          }
-          if (tail.starts_with("//")) {
-            const size_t commentEnd = text.find('\n', pos + 2);
-            pos = commentEnd == StringRef::npos ? text.size() : commentEnd + 1;
-            continue;
-          }
-          return true;
-        }
-        return true;
-      };
-
       auto parseVaOptPayloadEnd = [&](size_t openParen) -> std::optional<size_t> {
         StringRef text = replacement->directive->text;
         if (openParen >= text.size() || text[openParen] != '(')
@@ -1176,47 +1150,158 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       };
 
       SmallVector<unsigned, 4> usedParams;
-      bool sawErasedVaOpt = false;
       StringRef text = replacement->directive->text;
-      size_t pos = replacement->replacementTextBegin;
-      while (pos < text.size()) {
-        if (!skipReplacementTrivia(pos))
-          return finish(false);
-        if (pos >= text.size())
-          break;
 
-        // The only source-bearing replacement-list tokens admitted for a
-        // function-like zero-token wrapper are formal parameter names, plus an
-        // erased `__VA_OPT__(...)` whose variadic tail is independently proved
-        // token-empty.  After substitution, each used argument must still
-        // independently prove to be a zero-token source-neutral range.
-        if (!stringutils::isIdentStart(text[pos]))
-          return finish(false);
-        const size_t identBegin = pos++;
-        while (pos < text.size() && stringutils::isIdentPart(text[pos]))
-          ++pos;
-        StringRef ident = text.slice(identBegin, pos);
+      auto replacementFragmentIsTiledByNeutralNestedMacros =
+          [&](size_t begin, size_t end) -> bool {
+        if (begin > end || end > text.size())
+          return false;
+        return sourceRangeIsTiledByNeutralNestedMacros(
+            replacement->fileBase + static_cast<uint64_t>(begin),
+            replacement->fileBase + static_cast<uint64_t>(end),
+            replacement->directive->sitePath,
+            HeaderZeroTokenRangeSurface::DefinitionReplacementList);
+      };
 
-        if (ident == "__VA_OPT__") {
-          if (!proveVariadicTailNeutral())
-            return finish(false);
-          if (!skipReplacementTrivia(pos))
-            return finish(false);
-          std::optional<size_t> afterVaOpt = parseVaOptPayloadEnd(pos);
-          if (!afterVaOpt)
-            return finish(false);
-          pos = *afterVaOpt;
-          sawErasedVaOpt = true;
-          continue;
+      auto skipReplacementTriviaUntil = [&](size_t &pos,
+                                            size_t limit) -> bool {
+        if (limit > text.size())
+          return false;
+        while (pos < limit) {
+          if (stringutils::isWs(text[pos])) {
+            ++pos;
+            continue;
+          }
+
+          StringRef tail = text.substr(pos, limit - pos);
+          if (tail.starts_with("/*")) {
+            const size_t commentEnd = text.find("*/", pos + 2);
+            if (commentEnd == StringRef::npos || commentEnd + 2 > limit)
+              return false;
+            pos = commentEnd + 2;
+            continue;
+          }
+          if (tail.starts_with("//")) {
+            const size_t commentEnd = text.find('\n', pos + 2);
+            if (commentEnd != StringRef::npos && commentEnd < limit)
+              return false;
+            pos = limit;
+            continue;
+          }
+          return true;
+        }
+        return true;
+      };
+
+      auto neutralNestedChildAt = [&](size_t pos,
+                                      size_t limit) -> std::optional<size_t> {
+        if (limit > text.size())
+          return std::nullopt;
+
+        const uint64_t filePos =
+            replacement->fileBase + static_cast<uint64_t>(pos);
+        const uint64_t fileLimit =
+            replacement->fileBase + static_cast<uint64_t>(limit);
+
+        const RefoldModel::MacroInvocation *matched = nullptr;
+        for (const auto &candidate : model_.GetMacroInvocations()) {
+          if (!candidate.callerMacroId || *candidate.callerMacroId != m.id)
+            continue;
+          if (!candidate.invFile || candidate.invFile->empty() ||
+              !PathsEqual(*candidate.invFile, replacement->directive->sitePath))
+            continue;
+          if (!candidate.invB || !candidate.invE ||
+              *candidate.invB >= *candidate.invE)
+            continue;
+          if (*candidate.invB != filePos || *candidate.invE > fileLimit)
+            continue;
+
+          // Two direct children cannot soundly claim the same source spelling
+          // in this local replacement-list proof.  Reject duplicate ownership
+          // rather than choosing one heuristically.
+          if (matched)
+            return std::nullopt;
+          matched = &candidate;
         }
 
-        auto it = paramIndexByName.find(ident);
-        if (it == paramIndexByName.end())
-          return finish(false);
-        usedParams.push_back(it->second);
-      }
+        if (!matched)
+          return std::nullopt;
+        if (!headerMacroInvocationIsSourceNeutralZeroTokenImpl(*matched, visiting))
+          return std::nullopt;
+        return static_cast<size_t>(*matched->invE - replacement->fileBase);
+      };
 
-      if (usedParams.empty() && !sawErasedVaOpt)
+      std::function<bool(size_t, size_t)> replacementFragmentIsNeutral;
+      replacementFragmentIsNeutral = [&](size_t begin, size_t end) -> bool {
+        if (begin > end || end > text.size())
+          return false;
+
+        // A fragment made entirely of nested recorded zero-token macro
+        // invocations plus trivia is neutral regardless of whether it is the
+        // whole replacement list or the selected payload of __VA_OPT__.
+        if (replacementFragmentIsTiledByNeutralNestedMacros(begin, end))
+          return true;
+
+        size_t pos = begin;
+        while (pos < end) {
+          if (!skipReplacementTriviaUntil(pos, end))
+            return false;
+          if (pos >= end)
+            break;
+
+          if (std::optional<size_t> childEnd = neutralNestedChildAt(pos, end)) {
+            pos = *childEnd;
+            continue;
+          }
+
+          if (!stringutils::isIdentStart(text[pos]))
+            return false;
+          const size_t identBegin = pos++;
+          while (pos < end && stringutils::isIdentPart(text[pos]))
+            ++pos;
+          StringRef ident = text.slice(identBegin, pos);
+
+          if (ident == "__VA_OPT__") {
+            if (!skipReplacementTriviaUntil(pos, end))
+              return false;
+            std::optional<size_t> afterVaOpt = parseVaOptPayloadEnd(pos);
+            if (!afterVaOpt || *afterVaOpt > end)
+              return false;
+
+            const size_t payloadBegin = pos + 1;
+            const size_t payloadEnd = *afterVaOpt - 1;
+
+            // __VA_OPT__ is neutral in either of two proof-bounded cases:
+            //   * the variadic tail is proved token-empty, so the payload is
+            //     erased and need not be inspected; or
+            //   * the payload itself is proved zero-token, so exposing it also
+            //     contributes no PP tokens.
+            // This branch-independent rule covers both erased forwarding forms
+            // and non-erased payloads such as __VA_OPT__(EMPTY), without
+            // evaluating arbitrary payload semantics.
+            if (!proveVariadicTailNeutral() &&
+                !replacementFragmentIsNeutral(payloadBegin, payloadEnd))
+              return false;
+
+            pos = *afterVaOpt;
+            continue;
+          }
+
+          // Outside __VA_OPT__, the only non-trivia replacement-list
+          // identifiers admitted by the function-like wrapper proof are formal
+          // parameter names.  Their invocation argument ranges are checked once
+          // after the fragment walk completes.
+          auto it = paramIndexByName.find(ident);
+          if (it == paramIndexByName.end())
+            return false;
+          usedParams.push_back(it->second);
+        }
+
+        return true;
+      };
+
+      if (!replacementFragmentIsNeutral(replacement->replacementTextBegin,
+                                        text.size()))
         return finish(false);
 
       llvm::sort(usedParams);
