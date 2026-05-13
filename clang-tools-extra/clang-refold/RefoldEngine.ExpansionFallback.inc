@@ -6454,8 +6454,8 @@ bool RefoldEngine::ExpansionFallbackReplacementIsReplayStable(
     buffer.push_back('\n');
 
   using namespace clang;
+  DiagnosticOptions diagOpts;
   IntrusiveRefCntPtr<DiagnosticIDs> diagIDs(new DiagnosticIDs());
-  IntrusiveRefCntPtr<DiagnosticOptions> diagOpts(new DiagnosticOptions());
   auto *client = new IgnoringDiagConsumer();
   DiagnosticsEngine diags(diagIDs, diagOpts, client,
                           /*ShouldOwnClient=*/true);
