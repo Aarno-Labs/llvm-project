@@ -572,6 +572,83 @@ static bool sourceLineDirectiveMacroHasMaterializedPPTokens(
   return false;
 }
 
+/// Return true iff the untouched suffix may observe the current presumed file.
+///
+/// Volatile string-valued predefined macros such as `__DATE__` can be valid
+/// filename operands in a source-only line-control directive, but the refold map
+/// does not record their concrete expansion value.  Such a gap is still
+/// token-preservable when the remaining source can only observe the resumed line
+/// number.  This conservative predicate rejects any later `__FILE__` or
+/// `__FILE_NAME__` use recorded by the producer, and also rejects raw source
+/// spellings of those builtins in the suffix as a fail-closed backstop for
+/// cases not represented by an invocation with a usable source range.
+static bool sourceSuffixMayObservePresumedFileSpelling(
+    const RefoldModel &model, StringRef file, uint64_t resumeOffset,
+    const std::function<bool(StringRef, StringRef)> &pathsEqual,
+    StringRef fileText) {
+  auto findMacroById = [&](uint64_t id)
+      -> const RefoldModel::MacroInvocation * {
+    for (const RefoldModel::MacroInvocation &candidate :
+         model.GetMacroInvocations())
+      if (candidate.id == id)
+        return &candidate;
+    return nullptr;
+  };
+
+  std::function<bool(const RefoldModel::MacroInvocation &,
+                     SmallVectorImpl<uint64_t> &)>
+      invocationMayOccurInSuffix =
+          [&](const RefoldModel::MacroInvocation &macro,
+              SmallVectorImpl<uint64_t> &activeIds) -> bool {
+    if (std::find(activeIds.begin(), activeIds.end(), macro.id) !=
+        activeIds.end())
+      return true;
+
+    activeIds.push_back(macro.id);
+    auto popAndReturn = [&](bool value) {
+      activeIds.pop_back();
+      return value;
+    };
+
+    if (macro.invFile && !macro.invFile->empty() &&
+        pathsEqual(*macro.invFile, file)) {
+      if (!macro.invB)
+        return popAndReturn(true);
+      if (*macro.invB >= resumeOffset)
+        return popAndReturn(true);
+    }
+
+    if (macro.callerMacroId) {
+      const RefoldModel::MacroInvocation *caller =
+          findMacroById(*macro.callerMacroId);
+      if (!caller)
+        return popAndReturn(true);
+      return popAndReturn(invocationMayOccurInSuffix(*caller, activeIds));
+    }
+
+    if (!macro.invFile || macro.invFile->empty())
+      return popAndReturn(true);
+    return popAndReturn(false);
+  };
+
+  for (const RefoldModel::MacroInvocation &macro : model.GetMacroInvocations()) {
+    if (macro.name != "__FILE__" && macro.name != "__FILE_NAME__")
+      continue;
+
+    SmallVector<uint64_t, 8> activeIds;
+    if (invocationMayOccurInSuffix(macro, activeIds))
+      return true;
+  }
+
+  if (resumeOffset < fileText.size()) {
+    StringRef suffix = fileText.substr(static_cast<size_t>(resumeOffset));
+    if (suffix.contains("__FILE__") || suffix.contains("__FILE_NAME__"))
+      return true;
+  }
+
+  return false;
+}
+
 /// Substitute invocation arguments through a simple function-like replacement
 /// list used inside a source-only line-control directive.
 ///
@@ -1139,7 +1216,8 @@ computeSourceLineDirectiveGapResume(
     uint64_t resumeOffset, StringRef defaultFileSpelling,
     SourceLineDirectiveLogicalLineRewriter logicalLineRewriter = nullptr,
     SmallVectorImpl<uint64_t> *acceptedMacroInvocationIds = nullptr,
-    StringRef baseFileSpelling = StringRef()) {
+    StringRef baseFileSpelling = StringRef(),
+    bool allowUnknownFilenameOperand = false) {
   if (gapBegin >= gapEnd || gapEnd > fileText.size() ||
       resumeOffset < gapEnd || resumeOffset > fileText.size())
     return std::nullopt;
@@ -1305,6 +1383,20 @@ computeSourceLineDirectiveGapResume(
           if (baseSpelling.empty())
             return std::nullopt;
           return formatLineControlFileOperand(baseSpelling);
+        }
+
+        if (macro.name == "__DATE__" || macro.name == "__TIME__" ||
+            macro.name == "__TIMESTAMP__") {
+          // These predefined macros expand to volatile string literals.  The
+          // current refold map records the source invocation but not the exact
+          // expansion text that was used when A was produced.  Therefore they
+          // are admitted only when the caller has proved that the untouched
+          // suffix cannot observe the filename component of this line-control
+          // state.  In that case any stable filename spelling is token-
+          // equivalent; the resumed line number is the only observable state.
+          if (!allowUnknownFilenameOperand)
+            return std::nullopt;
+          return formatLineControlFileOperand(defaultFileSpelling);
         }
 
         return std::nullopt;
@@ -3770,7 +3862,14 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
         SmallVector<uint64_t, 4> acceptedMacroIds;
         if (!computeSourceLineDirectiveGapResume(
                 tuBytes, gapBegin, gapEnd, sourceEnd, tuPath,
-                sourceLineDirectiveLineRewriter, &acceptedMacroIds))
+                sourceLineDirectiveLineRewriter, &acceptedMacroIds,
+                StringRef(),
+                !sourceSuffixMayObservePresumedFileSpelling(
+                    model_, tuPath, sourceEnd,
+                    [&](StringRef lhs, StringRef rhs) {
+                      return PathsEqual(lhs, rhs);
+                    },
+                    tuBytes)))
           continue;
 
         recordSourceLineDirectiveMacroIds(acceptedMacroIds);
@@ -3845,7 +3944,14 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
               if (std::optional<SourceLineDirectiveGapResume> lineResume =
                       computeSourceLineDirectiveGapResume(
                           tuBytes, gapBegin, gapEnd, sourceEnd, tuPath,
-                          sourceLineDirectiveLineRewriter, &acceptedMacroIds)) {
+                          sourceLineDirectiveLineRewriter, &acceptedMacroIds,
+                          StringRef(),
+                          !sourceSuffixMayObservePresumedFileSpelling(
+                              model_, tuPath, sourceEnd,
+                              [&](StringRef lhs, StringRef rhs) {
+                                return PathsEqual(lhs, rhs);
+                              },
+                              tuBytes))) {
                 // A source-spelled line-control directive contributes no PP
                 // tokens, but it is not disposable trivia: it changes the
                 // presumed file/line state for the untouched suffix.  Admit the
