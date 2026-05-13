@@ -5,4 +5,5 @@
 int untouched = KEEP(5);
 
 int arr[] = { 3
+EMPTY
 };
