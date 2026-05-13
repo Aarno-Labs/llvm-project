@@ -656,6 +656,68 @@ decodeBoundedLineControlHexEscapeValue(StringRef &rest) {
   return value;
 }
 
+/// Decode exactly `digits` hexadecimal digits after a universal-character-name
+/// introducer and advance `rest` past the digits on success.
+static std::optional<uint32_t>
+decodeLineControlUniversalCharacterNameValue(StringRef &rest,
+                                             unsigned digits) {
+  if (rest.size() < digits)
+    return std::nullopt;
+
+  uint32_t value = 0;
+  for (unsigned i = 0; i < digits; ++i) {
+    const char ch = rest[i];
+    if (!isLineControlHexDigit(ch))
+      return std::nullopt;
+    value = (value << 4) | lineControlHexValue(ch);
+  }
+
+  rest = rest.drop_front(digits);
+  return value;
+}
+
+/// Return true iff a decoded universal-character-name is within the stable
+/// Unicode scalar range this filename proof can replay as UTF-8 bytes.
+///
+/// C universal-character names for the basic source character set and control
+/// characters are intentionally left outside this proof.  Admitting only scalar
+/// values at or above U+00A0 matches the portable UCN domain used for ordinary
+/// source text and avoids collisions with the existing exact tables for quotes,
+/// backslashes, physical newlines, and named control escapes.
+static bool isReplayableLineControlUniversalCharacterName(uint32_t value) {
+  return 0x00a0u <= value && value <= 0x10ffffu &&
+         !(0xd800u <= value && value <= 0xdfffu);
+}
+
+/// Append the UTF-8 spelling Clang uses for an admitted universal-character-name
+/// in a narrow #line filename string literal.
+static bool appendLineControlUTF8(std::string &out, uint32_t value) {
+  if (!isReplayableLineControlUniversalCharacterName(value))
+    return false;
+
+  if (value <= 0x7fu) {
+    out.push_back(static_cast<char>(value));
+    return true;
+  }
+  if (value <= 0x7ffu) {
+    out.push_back(static_cast<char>(0xc0u | (value >> 6)));
+    out.push_back(static_cast<char>(0x80u | (value & 0x3fu)));
+    return true;
+  }
+  if (value <= 0xffffu) {
+    out.push_back(static_cast<char>(0xe0u | (value >> 12)));
+    out.push_back(static_cast<char>(0x80u | ((value >> 6) & 0x3fu)));
+    out.push_back(static_cast<char>(0x80u | (value & 0x3fu)));
+    return true;
+  }
+
+  out.push_back(static_cast<char>(0xf0u | (value >> 18)));
+  out.push_back(static_cast<char>(0x80u | ((value >> 12) & 0x3fu)));
+  out.push_back(static_cast<char>(0x80u | ((value >> 6) & 0x3fu)));
+  out.push_back(static_cast<char>(0x80u | (value & 0x3fu)));
+  return true;
+}
+
 /// Return true iff a decoded numeric filename byte can be replayed by this
 /// proof's #line formatter without introducing control-flow-sensitive source
 /// structure into the emitted directive.
@@ -676,16 +738,17 @@ static bool isReplayableLineControlNumericFilenameByte(unsigned value) {
 /// The parser accepts:
 /// * ordinary unknown escapes, whose observable spelling is the escaped byte;
 /// * escaped quote, question mark, and backslash;
-/// * bounded octal escapes that decode to printable ASCII; and
-/// * bounded hexadecimal escapes that decode to printable ASCII.
+/// * bounded octal escapes that decode to printable ASCII;
+/// * bounded hexadecimal escapes that decode to printable ASCII; and
+/// * universal-character names that decode to replayable Unicode scalars.
 ///
 /// Named control escapes (`\n`, `\t`, etc.) are decoded through an explicit
 /// table and later replayed by LineDirectiveInserter::EscapeForLineDirective().
-/// Universal-character names, empty hex escapes, out-of-range numeric escapes,
-/// and physical line breaks fail closed.  Those forms either require a wider C
-/// string-literal interpreter or would produce bytes this local proof does not
-/// know how to replay safely.
-static std::optional<char> decodeLineControlFilenameEscape(StringRef &rest) {
+/// Universal-character names are emitted as UTF-8 bytes, which the #line
+/// formatter already preserves byte-for-byte.  Empty hex escapes, out-of-range
+/// numeric escapes, invalid UCN scalars, and physical line breaks fail closed.
+static std::optional<std::string>
+decodeLineControlFilenameEscape(StringRef &rest) {
   if (rest.empty())
     return std::nullopt;
 
@@ -704,7 +767,7 @@ static std::optional<char> decodeLineControlFilenameEscape(StringRef &rest) {
     }
     if (!isReplayableLineControlNumericFilenameByte(value))
       return std::nullopt;
-    return static_cast<char>(value);
+    return std::string(1, static_cast<char>(value));
   }
 
   if (escaped == 'x') {
@@ -713,52 +776,63 @@ static std::optional<char> decodeLineControlFilenameEscape(StringRef &rest) {
         decodeBoundedLineControlHexEscapeValue(rest);
     if (!value || !isReplayableLineControlNumericFilenameByte(*value))
       return std::nullopt;
-    return static_cast<char>(*value);
+    return std::string(1, static_cast<char>(*value));
+  }
+
+  if (escaped == 'u' || escaped == 'U') {
+    rest = rest.drop_front();
+    std::optional<uint32_t> value =
+        decodeLineControlUniversalCharacterNameValue(
+            rest, escaped == 'u' ? 4u : 8u);
+    if (!value)
+      return std::nullopt;
+
+    std::string utf8;
+    if (!appendLineControlUTF8(utf8, *value))
+      return std::nullopt;
+    return utf8;
   }
 
   switch (escaped) {
-  case '\"':
+  case '"':
   case '?':
   case '\\':
     rest = rest.drop_front();
-    return escaped;
+    return std::string(1, escaped);
   case 'a':
     rest = rest.drop_front();
-    return '\a';
+    return std::string(1, '\a');
   case 'b':
     rest = rest.drop_front();
-    return '\b';
+    return std::string(1, '\b');
   case 'e':
   case 'E':
     // Clang accepts \e/\E as an extension and records the same escape byte
     // that it later prints for __FILE__.  Model it explicitly instead of
     // treating it as a warningful unknown escape.
     rest = rest.drop_front();
-    return static_cast<char>(0x1b);
+    return std::string(1, static_cast<char>(0x1b));
   case 'f':
     rest = rest.drop_front();
-    return '\f';
+    return std::string(1, '\f');
   case 'n':
     rest = rest.drop_front();
-    return '\n';
+    return std::string(1, '\n');
   case 'r':
     rest = rest.drop_front();
-    return '\r';
+    return std::string(1, '\r');
   case 't':
     rest = rest.drop_front();
-    return '\t';
+    return std::string(1, '\t');
   case 'v':
     rest = rest.drop_front();
-    return '\v';
-  case 'u':
-  case 'U':
-    return std::nullopt;
+    return std::string(1, '\v');
   default:
     // Clang's warningful ordinary unknown escapes in #line filenames delete the
     // backslash and preserve the escaped byte.  This matches the prior bounded
     // raw-backslash proof and is still reparsed by the strict directive parser.
     rest = rest.drop_front();
-    return escaped;
+    return std::string(1, escaped);
   }
 }
 
@@ -787,10 +861,12 @@ parseLineControlFilenameLiteral(StringRef &rest) {
     if (ch == '\n' || ch == '\r')
       return std::nullopt;
     if (ch == '\\') {
-      std::optional<char> decoded = decodeLineControlFilenameEscape(rest);
+      std::optional<std::string> decoded =
+          decodeLineControlFilenameEscape(rest);
       if (!decoded)
         return std::nullopt;
-      ch = *decoded;
+      fileSpelling += *decoded;
+      continue;
     }
     fileSpelling.push_back(ch);
   }
@@ -1054,12 +1130,14 @@ static bool sourceSuffixMayObservePresumedFileSpelling(
 /// formatSourceLineDirectiveGapResume() can replay without guessing:
 /// * warningful ordinary unknown escapes;
 /// * escaped quote, question mark, backslash, and horizontal whitespace; and
-/// * bounded octal/hexadecimal escapes that decode to printable ASCII; and
+/// * bounded octal/hexadecimal escapes that decode to printable ASCII;
 /// * named C escapes whose decoded bytes can be replayed exactly by the #line
-///   formatter.
+///   formatter; and
+/// * universal-character names whose decoded scalar can be replayed as UTF-8.
 ///
-/// Universal-character names remain fail-closed.  They require a wider
-/// character-set proof than this owner-envelope closure currently owns.
+/// Invalid universal-character names remain fail-closed.  The admitted subset
+/// is deliberately limited to valid Unicode scalars outside the basic/control
+/// character range so replay can preserve the filename bytes without guessing.
 static std::optional<size_t>
 findAdmittedLineControlRawStringifyEscapeEnd(StringRef text,
                                              size_t backslashPos) {
@@ -1091,6 +1169,16 @@ findAdmittedLineControlRawStringifyEscapeEnd(StringRef text,
     std::optional<unsigned> value =
         decodeBoundedLineControlHexEscapeValue(tail);
     if (!value || !isReplayableLineControlNumericFilenameByte(*value))
+      return std::nullopt;
+    return text.size() - tail.size();
+  }
+
+  if (escaped == 'u' || escaped == 'U') {
+    StringRef tail = text.substr(cursor + 1);
+    std::optional<uint32_t> value =
+        decodeLineControlUniversalCharacterNameValue(
+            tail, escaped == 'u' ? 4u : 8u);
+    if (!value || !isReplayableLineControlUniversalCharacterName(*value))
       return std::nullopt;
     return text.size() - tail.size();
   }
@@ -1135,7 +1223,8 @@ findAdmittedLineControlRawStringifyEscapeEnd(StringRef text,
 /// line-control filename parser above; all other escape forms fail closed and
 /// must be handled by a wider proof or terminal fallback.  Named C escapes are
 /// admitted because the parser decodes them to exact bytes and the #line
-/// formatter knows how to spell those bytes again.
+/// formatter knows how to spell those bytes again.  Universal-character names
+/// are admitted only when their decoded scalar can be replayed as UTF-8 bytes.
 static std::optional<std::string>
 stringifyLineControlMacroArgument(StringRef argument) {
   StringRef trimmed = argument.trim(" \t\v\f\r\n");
