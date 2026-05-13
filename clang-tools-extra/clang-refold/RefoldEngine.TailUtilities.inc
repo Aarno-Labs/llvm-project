@@ -505,6 +505,197 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
   // remain stable as we mutate the StringBuilder.
   IncludeTextEditPlan plan;
 
+  struct HeaderMacroStateDirectivePiece {
+    const RefoldModel::MacroDirective *directive = nullptr;
+    uint64_t begin = 0;
+    uint64_t end = 0;
+    std::string name;
+  };
+
+  // Recover the macro identifier from a recorded macro-state directive.  Keep
+  // this parser strict: the preservation proof below is only for complete
+  // `#define NAME ...` / `#undef NAME` directive lines recorded by the producer.
+  auto parseHeaderMacroStateDirectiveName =
+      [](StringRef text,
+         StringRef expectedSubkind) -> std::optional<std::string> {
+    // Accept leading indentation, but require the directive spelling itself to
+    // start with a real preprocessor marker from the recorded directive text.
+    StringRef s = text.ltrim();
+    if (!s.consume_front("#"))
+      return std::nullopt;
+    s = s.ltrim();
+
+    // `MacroDirective::subkind` stores the spelling with the leading '#'.
+    // Drop it here and require a standalone directive keyword, not a prefix of
+    // some longer identifier-like token.
+    StringRef keyword = expectedSubkind.drop_front();
+    if (!s.consume_front(keyword))
+      return std::nullopt;
+    if (!s.empty() && stringutils::isIdentPart(s.front()))
+      return std::nullopt;
+
+    // The first identifier after #define/#undef is the macro state key.  For a
+    // function-like define, this stops before the opening paren, which is the
+    // name spelling needed for replacement-payload liveness checks.
+    s = s.ltrim();
+    if (s.empty() || !stringutils::isIdentStart(s.front()))
+      return std::nullopt;
+
+    size_t end = 1;
+    while (end < s.size() && stringutils::isIdentPart(s[end]))
+      ++end;
+    return s.take_front(end).str();
+  };
+
+  // Return true if `text` contains `name` as a real raw identifier token.  This
+  // prevents after-replacement directive preservation from accidentally making
+  // the B-derived replacement payload observe a macro-state transition that was
+  // not visible while B was produced.
+  auto rawIdentifierAppearsInHeaderReplacement = [&](StringRef name,
+                                                     StringRef text) {
+    if (name.empty() || text.empty())
+      return false;
+
+    // Use Clang's raw lexer rather than substring matching so comments,
+    // literals, and identifier substrings do not falsely count as macro uses.
+    const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
+    std::string lexBuf = text.str();
+    lexBuf.push_back('\0');
+
+    const char *bufStart = lexBuf.data();
+    const char *bufEnd = bufStart + text.size();
+    Lexer lexer(baseLoc, lexLang_, bufStart, bufStart, bufEnd);
+    lexer.SetCommentRetentionState(true);
+
+    Token token;
+    while (true) {
+      lexer.LexFromRawLexer(token);
+      if (token.is(tok::eof))
+        return false;
+      if (token.is(tok::comment))
+        continue;
+      if (!token.is(tok::raw_identifier) && !token.is(tok::identifier))
+        continue;
+
+      // Compare the original replacement slice for the token.  The lexer token
+      // kind tells us this is an identifier; the slice check proves it is the
+      // specific macro name whose state would be reintroduced.
+      const size_t localBegin = tokenOffsetFromBase(token, baseLoc);
+      const size_t localEnd = tokenEndOffsetFromBase(token, baseLoc);
+      if (localEnd < localBegin || localEnd > text.size())
+        continue;
+      if (text.slice(localBegin, localEnd) == name)
+        return true;
+    }
+  };
+
+  // Recover the complete physical source line for a macro-state directive that
+  // was spelled in this include expansion.  MacroDirective::siteB is anchored at
+  // the macro name, so translate through the recorded directive text and require
+  // an exact byte match in the header buffer before using the interval.
+  auto headerMacroStateDirectiveInterval =
+      [&](const RefoldModel::MacroDirective &directive)
+          -> std::optional<HeaderMacroStateDirectivePiece> {
+    // Only preserve directives physically spelled by this include expansion.
+    // A same-path directive from a different include instance has a different
+    // macro-state lifetime and cannot be used to tile this header gap.
+    if (!PathsEqual(directive.sitePath, file))
+      return std::nullopt;
+    if (!directive.ownerIncludeId || *directive.ownerIncludeId != ie.include->id)
+      return std::nullopt;
+
+    // This proof class preserves macro state only.  Conditional directives,
+    // includes, pragmas, and other PP structure need their own owners/proofs.
+    if (directive.subkind != "#define" && directive.subkind != "#undef")
+      return std::nullopt;
+
+    std::optional<std::string> name = parseHeaderMacroStateDirectiveName(
+        directive.text, directive.subkind);
+    if (!name)
+      return std::nullopt;
+
+    // Re-scan the recorded directive text to find the byte offset of the macro
+    // name inside that text.  The producer records siteB at the name spelling,
+    // so this offset lets us recover the directive line's start in the header.
+    StringRef text = directive.text;
+    size_t pos = 0;
+    stringutils::skipNonNewlineWs(text, pos);
+    if (pos >= text.size() || text[pos] != '#')
+      return std::nullopt;
+    ++pos;
+    stringutils::skipNonNewlineWs(text, pos);
+
+    StringRef keyword = directive.subkind.drop_front();
+    if (!text.substr(pos).starts_with(keyword))
+      return std::nullopt;
+    pos += keyword.size();
+    if (pos < text.size() && stringutils::isIdentPart(text[pos]))
+      return std::nullopt;
+    stringutils::skipNonNewlineWs(text, pos);
+
+    const size_t nameTextBegin = pos;
+    if (pos >= text.size() || !stringutils::isIdentStart(text[pos]))
+      return std::nullopt;
+    ++pos;
+    while (pos < text.size() && stringutils::isIdentPart(text[pos]))
+      ++pos;
+
+    if (directive.siteB < nameTextBegin)
+      return std::nullopt;
+
+    // Translate from the macro-name anchor back to the full directive interval
+    // and byte-verify it.  This rejects stale metadata, partial lines, and any
+    // directive text that cannot be proven to be exactly the header spelling.
+    const uint64_t fileBegin = directive.siteB - nameTextBegin;
+    const uint64_t fileEnd = fileBegin + text.size();
+    if (fileBegin >= fileEnd || fileEnd > headerText.size())
+      return std::nullopt;
+    if (StringRef(headerText).slice(fileBegin, fileEnd) != text)
+      return std::nullopt;
+
+    HeaderMacroStateDirectivePiece piece;
+    piece.directive = &directive;
+    piece.begin = fileBegin;
+    piece.end = fileEnd;
+    piece.name = std::move(*name);
+    return piece;
+  };
+
+  auto replacementHeaderSuffixBoundaryAllowsDirectiveLine =
+      [&](StringRef replacement, uint64_t sourceEnd) {
+    if (sourceEnd > headerText.size())
+      return false;
+
+    // Do not insert a directive after a line splice or trailing backslash: the
+    // `#` would be joined to the previous logical source line instead of
+    // starting a standalone preprocessing directive.
+    if (!replacement.empty()) {
+      if (replacement.back() == '\n') {
+        if (stringutils::isLineSplice(replacement, replacement.size() - 1))
+          return false;
+      } else if (replacement.back() == '\\') {
+        return false;
+      }
+    }
+
+    // Whitespace on either side is already a lexical separator.  Otherwise,
+    // fall back to token-boundary checking so widening the edit cannot glue two
+    // neighboring tokens into a different token spelling.
+    if (replacement.empty() || stringutils::isWs(replacement.back()))
+      return true;
+    if (sourceEnd >= headerText.size() || stringutils::isWs(headerText[sourceEnd]))
+      return true;
+
+    std::optional<LexBoundaryToken> leftTok =
+        lastLexToken(replacement, lexLang_);
+    std::optional<LexBoundaryToken> rightTok =
+        firstLexToken(StringRef(headerText).drop_front(sourceEnd), lexLang_);
+    if (!leftTok || !rightTok)
+      return true;
+
+    return !needsLexicalSeparator(*leftTok, *rightTok, lexLang_);
+  };
+
   for (size_t idx = 0; idx < ie.patches.size(); ++idx) {
     const IncludePatch &p = ie.patches[idx];
     trace("include/patch", "computeIncludeTextEdits: patch={0}", p);
@@ -571,6 +762,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     std::optional<uint64_t> startByte;
     std::optional<uint64_t> endByte;
     IncludeAnchorWitness mappedHeaderWitness;
+    SmallVector<HeaderMacroStateDirectivePiece, 4>
+        headerMacroStatePreservations;
 
     const auto &tokmapByPP = model_.GetTokmapByPP();
     if (isInsert) {
@@ -972,13 +1165,169 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                 .str();
         return plan;
       }
+
+      // A single PP hunk can legitimately cross two neighboring header
+      // declarations when the source between their tokens is zero-token
+      // macro-state structure, e.g. `1;\n#undef FOO\nint`.  The ordinary
+      // declaration-local projection intentionally clamps to one declaration,
+      // but doing so leaves stale spelling from the second declaration in the
+      // materialized header.  When the complete hunk maps to this include and
+      // every inter-token gap is trivia plus complete recorded #define/#undef
+      // lines, widen the header edit to the full mapped-token envelope and
+      // re-emit those macro-state lines after the B-derived payload.  This is
+      // the include-owned counterpart of TU macro-state liveness preservation:
+      // the replacement tokens do not observe the preserved directive, while
+      // the untouched suffix/header tail still sees the original macro state.
+      const bool declClippedNonEmptyPatch =
+          decl && (p.aStart < ppLo || ppHi < p.aEnd);
+      if (declClippedNonEmptyPatch) {
+        struct HeaderTokenInterval {
+          uint64_t pp = 0;
+          uint64_t begin = 0;
+          uint64_t end = 0;
+        };
+
+        // Reconstruct the full physical header envelope for the original PP
+        // hunk, ignoring tokens from other owners.  The later gap proof is only
+        // valid when the hunk's relevant tokens all map back to this header.
+        SmallVector<HeaderTokenInterval, 8> hunkTokenIntervals;
+        const uint64_t fullLo = std::max(p.aStart, coverBegin);
+        const uint64_t fullHi = std::min(p.aEnd, coverEnd);
+        for (uint64_t pp = fullLo; pp < fullHi; ++pp) {
+          auto it = tokmapByPP.find(pp);
+          if (it == tokmapByPP.end() || !PathsEqual(it->second.file, file))
+            continue;
+
+          // Refuse fallback-to-EOF anchors here: widening across declarations
+          // needs precise token byte bounds on both sides of each gap.
+          std::optional<uint64_t> tokBegin = ByteStartForPPInFile(
+              file, pp, /*fallbackToEOF=*/false, fileLen);
+          std::optional<uint64_t> tokEnd = ByteEndForPPInFile(
+              file, pp, /*fallbackToEOF=*/false, fileLen);
+          if (!tokBegin || !tokEnd || *tokBegin >= *tokEnd) {
+            hunkTokenIntervals.clear();
+            break;
+          }
+          hunkTokenIntervals.push_back({pp, *tokBegin, *tokEnd});
+        }
+
+        // Sort by physical header order.  PP order is only a tie-breaker for
+        // duplicate/degenerate mappings; the edit range is a source byte range.
+        llvm::sort(hunkTokenIntervals,
+                   [](const HeaderTokenInterval &lhs,
+                      const HeaderTokenInterval &rhs) {
+          if (lhs.begin != rhs.begin)
+            return lhs.begin < rhs.begin;
+          if (lhs.end != rhs.end)
+            return lhs.end < rhs.end;
+          return lhs.pp < rhs.pp;
+        });
+
+        // At least two header tokens are required; otherwise there is no
+        // inter-token gap to prove and no reason to override decl clamping.
+        bool canUseFullHeaderEnvelope = hunkTokenIntervals.size() >= 2;
+        SmallVector<HeaderMacroStateDirectivePiece, 4> preservedPieces;
+        for (size_t ti = 1; canUseFullHeaderEnvelope &&
+                            ti < hunkTokenIntervals.size(); ++ti) {
+          const uint64_t gapBegin = hunkTokenIntervals[ti - 1].end;
+          const uint64_t gapEnd = hunkTokenIntervals[ti].begin;
+          if (gapBegin > gapEnd) {
+            canUseFullHeaderEnvelope = false;
+            break;
+          }
+          if (gapBegin == gapEnd)
+            continue;
+
+          // The only non-trivia source we are allowed to cross is a complete
+          // recorded macro-state directive owned by this include.  Anything
+          // else in the gap leaves the declaration clamp in place.
+          SmallVector<HeaderMacroStateDirectivePiece, 4> gapPieces;
+          for (const auto &directive : model_.GetMacroDirectives()) {
+            std::optional<HeaderMacroStateDirectivePiece> piece =
+                headerMacroStateDirectiveInterval(directive);
+            if (!piece || piece->begin < gapBegin || gapEnd < piece->end)
+              continue;
+            // Re-emitting the directive after the replacement is safe only if
+            // the B-derived payload does not itself mention that macro name;
+            // otherwise we would change the macro state seen by replacement
+            // tokens relative to the edited preprocessed stream.
+            if (rawIdentifierAppearsInHeaderReplacement(
+                    piece->name, StringRef(p.insertBytes))) {
+              canUseFullHeaderEnvelope = false;
+              break;
+            }
+            gapPieces.push_back(std::move(*piece));
+          }
+          if (!canUseFullHeaderEnvelope)
+            break;
+
+          // Tile the gap in source order, not discovery order from the global
+          // directive table.
+          llvm::sort(gapPieces,
+                     [](const HeaderMacroStateDirectivePiece &lhs,
+                        const HeaderMacroStateDirectivePiece &rhs) {
+            if (lhs.begin != rhs.begin)
+              return lhs.begin < rhs.begin;
+            if (lhs.end != rhs.end)
+              return lhs.end < rhs.end;
+            return lhs.directive->id < rhs.directive->id;
+          });
+
+          // Prove an exact cover of the gap: trivia/comment bytes may surround
+          // preserved macro-state lines, but no ordinary source bytes may be
+          // skipped by the widened edit.
+          uint64_t cursor = gapBegin;
+          for (const HeaderMacroStateDirectivePiece &piece : gapPieces) {
+            if (piece.begin < cursor ||
+                !isWsOrCompleteCommentTrivia(
+                    StringRef(headerText).slice(cursor, piece.begin))) {
+              canUseFullHeaderEnvelope = false;
+              break;
+            }
+            cursor = piece.end;
+          }
+          if (!canUseFullHeaderEnvelope)
+            break;
+          if (!isWsOrCompleteCommentTrivia(
+                  StringRef(headerText).slice(cursor, gapEnd))) {
+            canUseFullHeaderEnvelope = false;
+            break;
+          }
+
+          preservedPieces.append(gapPieces.begin(), gapPieces.end());
+        }
+
+        if (canUseFullHeaderEnvelope && !preservedPieces.empty()) {
+          // Replace the decl-local byte range only after proving the full hunk
+          // envelope contains the originally resolved range and can be followed
+          // by a preserved directive line without lexical splicing/gluing.
+          const uint64_t fullStart = hunkTokenIntervals.front().begin;
+          const uint64_t fullEnd = hunkTokenIntervals.back().end;
+          if (fullStart <= *startByte && *endByte <= fullEnd &&
+              replacementHeaderSuffixBoundaryAllowsDirectiveLine(
+                  StringRef(p.insertBytes), fullEnd)) {
+            startByte = fullStart;
+            endByte = fullEnd;
+            headerMacroStatePreservations = std::move(preservedPieces);
+            mappedHeaderWitness.startByte = fullStart;
+            mappedHeaderWitness.endByte = fullEnd;
+            mappedHeaderWitness.firstPP = hunkTokenIntervals.front().pp;
+            mappedHeaderWitness.lastPP = hunkTokenIntervals.back().pp;
+            trace("include/apply",
+                  "file={0} patch[{1}] DELETE/REPLACE: widened across "
+                  "header macro-state gap bytes=[{2},{3}) preserved={4}",
+                  file, idx, fullStart, fullEnd,
+                  headerMacroStatePreservations.size());
+          }
+        }
+      }
     }
 
     // For DELETE/REPLACE, keep the resolved byte range inside the declaration
     // that owns the patch. INSERTs are different: their anchor may legitimately
     // sit on the boundary between declarations, so do not clamp insertion
     // anchors into one side of that boundary.
-    if (!isInsert && decl) {
+    if (!isInsert && decl && headerMacroStatePreservations.empty()) {
       startByte = std::clamp(*startByte, decl->headerB, decl->headerE);
       endByte = std::clamp(*endByte, decl->headerB, decl->headerE);
     }
@@ -998,6 +1347,22 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     // DELETE emits an empty replacement; INSERT and REPLACE both use the
     // B-derived patch payload carried by the IncludePatch.
     std::string replacement = isDelete ? "" : p.insertBytes;
+
+    if (!headerMacroStatePreservations.empty()) {
+      // Emit preserved macro-state lines after the B-derived payload.  That
+      // keeps replacement tokens in the same macro environment as B, while the
+      // untouched header suffix sees the restored macro state.
+      if (!replacement.empty() && replacement.back() != '\n')
+        replacement.push_back('\n');
+      for (const HeaderMacroStateDirectivePiece &piece :
+           headerMacroStatePreservations) {
+        if (!piece.directive)
+          continue;
+        replacement += piece.directive->text.str();
+        if (replacement.empty() || replacement.back() != '\n')
+          replacement.push_back('\n');
+      }
+    }
 
     if (inTraceMode()) {
       StringRef opKind =
