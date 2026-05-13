@@ -6,5 +6,5 @@ int untouched = KEEP(5);
 
 int arr[] = { 1,
 EMPTY
-#include "headers/two.inc"
+#include "two.inc"
 };

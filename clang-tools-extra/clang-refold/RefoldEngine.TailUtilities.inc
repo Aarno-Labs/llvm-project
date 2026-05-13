@@ -1023,75 +1023,195 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         return finish(false);
 
       DenseMap<StringRef, unsigned> paramIndexByName;
+      std::optional<unsigned> variadicParamIndex;
       for (unsigned i = 0, e = m.defParams.size(); i != e; ++i) {
         // Variadic formals are safe in the same narrow forwarding proof as
         // ordinary formals.  The replacement list may only mention the formal
         // identifier, and the corresponding invocation argument range must be
         // tiled entirely by recorded nested zero-token macro invocations plus
-        // trivia below.  This is not a general variadic macro evaluator:
-        // non-empty variadic material, punctuation, __VA_OPT__, #, ##, and
-        // unrecorded source still fail closed because they are not formal
-        // identifiers whose argument ranges discharge the neutral tiling proof.
+        // trivia below.  `__VA_OPT__` is admitted only in the erased case,
+        // where that same variadic range proves token-empty before the payload
+        // is ignored.
         paramIndexByName.try_emplace(m.defParams[i].name, i);
+        if (m.defParams[i].variadic) {
+          if (variadicParamIndex)
+            return finish(false);
+          variadicParamIndex = i;
+        }
       }
 
+      auto argumentRangeIsNeutral = [&](unsigned argIdx) -> bool {
+        const auto &range = m.invArgRanges[argIdx];
+        if (!range.first || !range.second || *range.first > *range.second)
+          return false;
+        if (!m.invFile || m.invFile->empty())
+          return false;
+        return sourceRangeIsTiledByNeutralNestedMacros(
+            *range.first, *range.second, *m.invFile,
+            HeaderZeroTokenRangeSurface::InvocationArgument);
+      };
+
+      std::optional<bool> variadicTailIsNeutral;
+      auto proveVariadicTailNeutral = [&]() -> bool {
+        if (variadicTailIsNeutral)
+          return *variadicTailIsNeutral;
+        if (!variadicParamIndex || *variadicParamIndex >= m.invArgRanges.size()) {
+          variadicTailIsNeutral = false;
+          return false;
+        }
+        variadicTailIsNeutral = argumentRangeIsNeutral(*variadicParamIndex);
+        return *variadicTailIsNeutral;
+      };
+
+      auto skipReplacementTrivia = [&](size_t &pos) -> bool {
+        StringRef text = replacement->directive->text;
+        while (pos < text.size()) {
+          if (stringutils::isWs(text[pos])) {
+            ++pos;
+            continue;
+          }
+
+          StringRef tail = text.substr(pos);
+          if (tail.starts_with("/*")) {
+            const size_t commentEnd = text.find("*/", pos + 2);
+            if (commentEnd == StringRef::npos)
+              return false;
+            pos = commentEnd + 2;
+            continue;
+          }
+          if (tail.starts_with("//")) {
+            const size_t commentEnd = text.find('\n', pos + 2);
+            pos = commentEnd == StringRef::npos ? text.size() : commentEnd + 1;
+            continue;
+          }
+          return true;
+        }
+        return true;
+      };
+
+      auto parseVaOptPayloadEnd = [&](size_t openParen) -> std::optional<size_t> {
+        StringRef text = replacement->directive->text;
+        if (openParen >= text.size() || text[openParen] != '(')
+          return std::nullopt;
+
+        unsigned depth = 1;
+        for (size_t pos = openParen + 1; pos < text.size();) {
+          const char ch = text[pos];
+          if (ch == '\n' || ch == '\r')
+            return std::nullopt;
+
+          if (ch == '"' || ch == '\'') {
+            const char quote = ch;
+            ++pos;
+            bool closed = false;
+            while (pos < text.size()) {
+              const char litCh = text[pos++];
+              if (litCh == '\n' || litCh == '\r')
+                return std::nullopt;
+              if (litCh == '\\') {
+                if (pos >= text.size())
+                  return std::nullopt;
+                ++pos;
+                continue;
+              }
+              if (litCh == quote) {
+                closed = true;
+                break;
+              }
+            }
+            if (!closed)
+              return std::nullopt;
+            continue;
+          }
+
+          if (pos + 1 < text.size() && ch == '/') {
+            if (text[pos + 1] == '*') {
+              pos += 2;
+              bool closed = false;
+              while (pos + 1 < text.size()) {
+                if (text[pos] == '*' && text[pos + 1] == '/') {
+                  pos += 2;
+                  closed = true;
+                  break;
+                }
+                ++pos;
+              }
+              if (!closed)
+                return std::nullopt;
+              continue;
+            }
+            if (text[pos + 1] == '/')
+              return std::nullopt;
+          }
+
+          if (ch == '(') {
+            ++depth;
+            ++pos;
+            continue;
+          }
+          if (ch == ')') {
+            --depth;
+            if (depth == 0)
+              return pos + 1;
+            ++pos;
+            continue;
+          }
+          ++pos;
+        }
+        return std::nullopt;
+      };
+
       SmallVector<unsigned, 4> usedParams;
+      bool sawErasedVaOpt = false;
       StringRef text = replacement->directive->text;
       size_t pos = replacement->replacementTextBegin;
       while (pos < text.size()) {
-        if (stringutils::isWs(text[pos])) {
-          ++pos;
-          continue;
-        }
-
-        StringRef tail = text.substr(pos);
-        if (tail.starts_with("/*")) {
-          const size_t commentEnd = text.find("*/", pos + 2);
-          if (commentEnd == StringRef::npos)
-            return finish(false);
-          pos = commentEnd + 2;
-          continue;
-        }
-        if (tail.starts_with("//")) {
-          const size_t commentEnd = text.find('\n', pos + 2);
-          pos = commentEnd == StringRef::npos ? text.size() : commentEnd + 1;
-          continue;
-        }
+        if (!skipReplacementTrivia(pos))
+          return finish(false);
+        if (pos >= text.size())
+          break;
 
         // The only source-bearing replacement-list tokens admitted for a
-        // function-like zero-token wrapper are formal parameter names.  After
-        // substitution, each used argument must independently prove to be a
-        // zero-token source-neutral range.
+        // function-like zero-token wrapper are formal parameter names, plus an
+        // erased `__VA_OPT__(...)` whose variadic tail is independently proved
+        // token-empty.  After substitution, each used argument must still
+        // independently prove to be a zero-token source-neutral range.
         if (!stringutils::isIdentStart(text[pos]))
           return finish(false);
         const size_t identBegin = pos++;
         while (pos < text.size() && stringutils::isIdentPart(text[pos]))
           ++pos;
         StringRef ident = text.slice(identBegin, pos);
+
+        if (ident == "__VA_OPT__") {
+          if (!proveVariadicTailNeutral())
+            return finish(false);
+          if (!skipReplacementTrivia(pos))
+            return finish(false);
+          std::optional<size_t> afterVaOpt = parseVaOptPayloadEnd(pos);
+          if (!afterVaOpt)
+            return finish(false);
+          pos = *afterVaOpt;
+          sawErasedVaOpt = true;
+          continue;
+        }
+
         auto it = paramIndexByName.find(ident);
         if (it == paramIndexByName.end())
           return finish(false);
         usedParams.push_back(it->second);
       }
 
-      if (usedParams.empty())
+      if (usedParams.empty() && !sawErasedVaOpt)
         return finish(false);
 
       llvm::sort(usedParams);
       usedParams.erase(std::unique(usedParams.begin(), usedParams.end()),
                        usedParams.end());
 
-      for (unsigned argIdx : usedParams) {
-        const auto &range = m.invArgRanges[argIdx];
-        if (!range.first || !range.second || *range.first > *range.second)
+      for (unsigned argIdx : usedParams)
+        if (!argumentRangeIsNeutral(argIdx))
           return finish(false);
-        if (!m.invFile || m.invFile->empty())
-          return finish(false);
-        if (!sourceRangeIsTiledByNeutralNestedMacros(
-                *range.first, *range.second, *m.invFile,
-                HeaderZeroTokenRangeSurface::InvocationArgument))
-          return finish(false);
-      }
 
       return finish(true);
     }

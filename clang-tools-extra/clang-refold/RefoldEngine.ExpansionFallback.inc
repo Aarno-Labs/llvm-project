@@ -3991,27 +3991,66 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       });
     };
 
+    enum class ZeroTokenRangeSurface {
+      DefinitionReplacementList,
+      InvocationArgument
+    };
+
     auto sourceRangeIsTiledByNeutralNestedMacros =
-        [&](uint64_t begin, uint64_t end, StringRef file) -> bool {
+        [&](uint64_t begin, uint64_t end, StringRef rangeFile,
+            ZeroTokenRangeSurface surface) -> bool {
       if (begin > end)
         return false;
+
+      // The definition replacement list and the invocation argument can be
+      // spelled in the same physical TU file.  Keep the source surface explicit:
+      // replacement-list tiling slices the producer-recorded directive text,
+      // while invocation-argument tiling slices the materialized TU source.
+      auto sliceTrivia = [&](uint64_t sliceBegin, uint64_t sliceEnd)
+          -> std::optional<StringRef> {
+        if (sliceEnd < sliceBegin)
+          return std::nullopt;
+
+        switch (surface) {
+        case ZeroTokenRangeSurface::DefinitionReplacementList: {
+          if (!PathsEqual(rangeFile, replacement->directive->sitePath))
+            return std::nullopt;
+          const uint64_t textBegin = replacement->fileBase;
+          const uint64_t textEnd =
+              replacement->fileBase + replacement->directive->text.size();
+          if (sliceBegin < textBegin || sliceEnd > textEnd)
+            return std::nullopt;
+          return replacement->directive->text.slice(
+              static_cast<size_t>(sliceBegin - replacement->fileBase),
+              static_cast<size_t>(sliceEnd - replacement->fileBase));
+        }
+        case ZeroTokenRangeSurface::InvocationArgument:
+          if (!PathsEqual(rangeFile, tuPath) || sliceEnd > tuBytes.size())
+            return std::nullopt;
+          return tuBytes.slice(sliceBegin, sliceEnd);
+        }
+
+        return std::nullopt;
+      };
 
       SmallVector<ChildPiece, 8> children;
       for (const auto &candidate : model_.GetMacroInvocations()) {
         if (!candidate.callerMacroId || *candidate.callerMacroId != m.id)
           continue;
 
-        // Only nested callsites physically spelled inside this source range can
-        // tile it.  Malformed or out-of-file candidates are harmless here: if
-        // they were needed to cover non-trivia bytes, the later trivia-gap check
-        // will reject the range fail-closed.
+        // Only nested callsites physically spelled on this source surface can
+        // tile it.  Malformed or out-of-surface candidates are harmless here:
+        // if they were needed to cover non-trivia bytes, the later trivia-gap
+        // check will reject the range fail-closed.
         if (!candidate.invFile || candidate.invFile->empty() ||
-            !PathsEqual(*candidate.invFile, file))
+            !PathsEqual(*candidate.invFile, rangeFile))
           continue;
         if (!candidate.invB || !candidate.invE ||
             *candidate.invB >= *candidate.invE)
           continue;
         if (*candidate.invB < begin || end < *candidate.invE)
+          continue;
+        if (!sliceTrivia(*candidate.invB, *candidate.invE))
           continue;
 
         children.push_back({*candidate.invB, *candidate.invE, &candidate});
@@ -4024,20 +4063,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
         if (piece.begin < cursor)
           return false;
 
-        StringRef gap;
-        if (PathsEqual(file, replacement->directive->sitePath)) {
-          const size_t gapBegin =
-              static_cast<size_t>(cursor - replacement->fileBase);
-          const size_t gapEnd =
-              static_cast<size_t>(piece.begin - replacement->fileBase);
-          gap = replacement->directive->text.slice(gapBegin, gapEnd);
-        } else if (PathsEqual(file, tuPath)) {
-          gap = tuBytes.slice(cursor, piece.begin);
-        } else {
-          return false;
-        }
-
-        if (!isWsOrCompleteCommentTrivia(gap))
+        std::optional<StringRef> gap = sliceTrivia(cursor, piece.begin);
+        if (!gap || !isWsOrCompleteCommentTrivia(*gap))
           return false;
 
         if (!macroInvocationIsSourceNeutralZeroTokenImpl(*piece.child, visiting))
@@ -4046,19 +4073,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
         cursor = piece.end;
       }
 
-      StringRef suffix;
-      if (PathsEqual(file, replacement->directive->sitePath)) {
-        const size_t suffixBegin =
-            static_cast<size_t>(cursor - replacement->fileBase);
-        const size_t suffixEnd = static_cast<size_t>(end - replacement->fileBase);
-        suffix = replacement->directive->text.slice(suffixBegin, suffixEnd);
-      } else if (PathsEqual(file, tuPath)) {
-        suffix = tuBytes.slice(cursor, end);
-      } else {
-        return false;
-      }
-
-      return isWsOrCompleteCommentTrivia(suffix);
+      std::optional<StringRef> suffix = sliceTrivia(cursor, end);
+      return suffix && isWsOrCompleteCommentTrivia(*suffix);
     };
 
     // Function-like zero-token wrappers are admissible only in a narrow
@@ -4072,73 +4088,199 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
         return finish(false);
 
       DenseMap<StringRef, unsigned> paramIndexByName;
+      std::optional<unsigned> variadicParamIndex;
       for (unsigned i = 0, e = m.defParams.size(); i != e; ++i) {
         // Variadic formals are safe in the same proof domain as ordinary
         // formals: the replacement list may only forward the formal spelling,
         // and the corresponding invocation argument range must be wholly tiled
-        // by recorded nested zero-token calls plus trivia.  We therefore do
-        // not need a separate variadic macro evaluator here; non-empty
-        // variadic material, punctuation, __VA_OPT__, #, ##, and unrecorded
-        // tokens still fail below because they are not formal identifiers whose
-        // argument ranges satisfy the neutral tiling proof.
+        // by recorded nested zero-token calls plus trivia.  `__VA_OPT__` is
+        // admitted only in the erased case, where the same variadic argument
+        // range proves token-empty before the payload is ignored.
         paramIndexByName.try_emplace(m.defParams[i].name, i);
+        if (m.defParams[i].variadic) {
+          if (variadicParamIndex)
+            return finish(false);
+          variadicParamIndex = i;
+        }
       }
 
+      auto argumentRangeIsNeutral = [&](unsigned argIdx) -> bool {
+        const auto &range = m.invArgRanges[argIdx];
+        if (!range.first || !range.second || *range.first > *range.second)
+          return false;
+        if (!m.invFile || m.invFile->empty())
+          return false;
+        return sourceRangeIsTiledByNeutralNestedMacros(
+            *range.first, *range.second, *m.invFile,
+            ZeroTokenRangeSurface::InvocationArgument);
+      };
+
+      std::optional<bool> variadicTailIsNeutral;
+      auto proveVariadicTailNeutral = [&]() -> bool {
+        if (variadicTailIsNeutral)
+          return *variadicTailIsNeutral;
+        if (!variadicParamIndex || *variadicParamIndex >= m.invArgRanges.size()) {
+          variadicTailIsNeutral = false;
+          return false;
+        }
+        variadicTailIsNeutral = argumentRangeIsNeutral(*variadicParamIndex);
+        return *variadicTailIsNeutral;
+      };
+
+      auto skipReplacementTrivia = [&](size_t &pos) -> bool {
+        StringRef text = replacement->directive->text;
+        while (pos < text.size()) {
+          if (stringutils::isWs(text[pos])) {
+            ++pos;
+            continue;
+          }
+
+          StringRef tail = text.substr(pos);
+          if (tail.starts_with("/*")) {
+            const size_t end = text.find("*/", pos + 2);
+            if (end == StringRef::npos)
+              return false;
+            pos = end + 2;
+            continue;
+          }
+          if (tail.starts_with("//")) {
+            const size_t end = text.find('\n', pos + 2);
+            pos = end == StringRef::npos ? text.size() : end + 1;
+            continue;
+          }
+          return true;
+        }
+        return true;
+      };
+
+      auto parseVaOptPayloadEnd = [&](size_t openParen) -> std::optional<size_t> {
+        StringRef text = replacement->directive->text;
+        if (openParen >= text.size() || text[openParen] != '(')
+          return std::nullopt;
+
+        unsigned depth = 1;
+        for (size_t pos = openParen + 1; pos < text.size();) {
+          const char ch = text[pos];
+          if (ch == '\n' || ch == '\r')
+            return std::nullopt;
+
+          if (ch == '"' || ch == '\'') {
+            const char quote = ch;
+            ++pos;
+            bool closed = false;
+            while (pos < text.size()) {
+              const char litCh = text[pos++];
+              if (litCh == '\n' || litCh == '\r')
+                return std::nullopt;
+              if (litCh == '\\') {
+                if (pos >= text.size())
+                  return std::nullopt;
+                ++pos;
+                continue;
+              }
+              if (litCh == quote) {
+                closed = true;
+                break;
+              }
+            }
+            if (!closed)
+              return std::nullopt;
+            continue;
+          }
+
+          if (pos + 1 < text.size() && ch == '/') {
+            if (text[pos + 1] == '*') {
+              pos += 2;
+              bool closed = false;
+              while (pos + 1 < text.size()) {
+                if (text[pos] == '*' && text[pos + 1] == '/') {
+                  pos += 2;
+                  closed = true;
+                  break;
+                }
+                ++pos;
+              }
+              if (!closed)
+                return std::nullopt;
+              continue;
+            }
+            if (text[pos + 1] == '/')
+              return std::nullopt;
+          }
+
+          if (ch == '(') {
+            ++depth;
+            ++pos;
+            continue;
+          }
+          if (ch == ')') {
+            --depth;
+            if (depth == 0)
+              return pos + 1;
+            ++pos;
+            continue;
+          }
+          ++pos;
+        }
+        return std::nullopt;
+      };
+
       SmallVector<unsigned, 4> usedParams;
+      bool sawErasedVaOpt = false;
       StringRef text = replacement->directive->text;
       size_t pos = replacement->replacementTextBegin;
       while (pos < text.size()) {
-        if (stringutils::isWs(text[pos])) {
-          ++pos;
-          continue;
-        }
+        if (!skipReplacementTrivia(pos))
+          return finish(false);
+        if (pos >= text.size())
+          break;
 
-        StringRef tail = text.substr(pos);
-        if (tail.starts_with("/*")) {
-          const size_t end = text.find("*/", pos + 2);
-          if (end == StringRef::npos)
-            return finish(false);
-          pos = end + 2;
-          continue;
-        }
-        if (tail.starts_with("//")) {
-          const size_t end = text.find('\n', pos + 2);
-          pos = end == StringRef::npos ? text.size() : end + 1;
-          continue;
-        }
-
-        // The only non-trivia replacement-list tokens admitted here are formal
-        // parameter names.  Operators, literals, _Pragma, #, ##, punctuation,
-        // and unrecorded identifiers remain outside this proof class.
         if (!stringutils::isIdentStart(text[pos]))
           return finish(false);
         const size_t identBegin = pos++;
         while (pos < text.size() && stringutils::isIdentPart(text[pos]))
           ++pos;
         StringRef ident = text.slice(identBegin, pos);
+
+        // In a zero-token invocation, `__VA_OPT__(...)` is source-neutral only
+        // when the recorded variadic tail is itself proved token-empty.  Then
+        // the preprocessor erases the complete payload, so the payload's
+        // internal tokens are not part of the emitted replacement list.  If the
+        // tail is not neutral, this bounded proof fails closed instead of
+        // evaluating arbitrary `__VA_OPT__` payload semantics.
+        if (ident == "__VA_OPT__") {
+          if (!proveVariadicTailNeutral())
+            return finish(false);
+          if (!skipReplacementTrivia(pos))
+            return finish(false);
+          std::optional<size_t> afterVaOpt = parseVaOptPayloadEnd(pos);
+          if (!afterVaOpt)
+            return finish(false);
+          pos = *afterVaOpt;
+          sawErasedVaOpt = true;
+          continue;
+        }
+
+        // The only non-trivia replacement-list tokens otherwise admitted here
+        // are formal parameter names.  Operators, literals, _Pragma, #, ##,
+        // punctuation, and unrecorded identifiers remain outside this proof
+        // class.
         auto it = paramIndexByName.find(ident);
         if (it == paramIndexByName.end())
           return finish(false);
         usedParams.push_back(it->second);
       }
 
-      if (usedParams.empty())
+      if (usedParams.empty() && !sawErasedVaOpt)
         return finish(false);
 
       llvm::sort(usedParams);
       usedParams.erase(std::unique(usedParams.begin(), usedParams.end()),
                        usedParams.end());
 
-      for (unsigned argIdx : usedParams) {
-        const auto &range = m.invArgRanges[argIdx];
-        if (!range.first || !range.second || *range.first > *range.second)
+      for (unsigned argIdx : usedParams)
+        if (!argumentRangeIsNeutral(argIdx))
           return finish(false);
-        if (!m.invFile || m.invFile->empty())
-          return finish(false);
-        if (!sourceRangeIsTiledByNeutralNestedMacros(*range.first,
-                                                     *range.second, *m.invFile))
-          return finish(false);
-      }
 
       return finish(true);
     }
@@ -4763,7 +4905,75 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     return true;
   };
 
+  struct TUPreservedGapPiece {
+    enum class Kind { ZeroTokenMacroInvocation };
+
+    Kind kind = Kind::ZeroTokenMacroInvocation;
+    uint64_t begin = 0;
+    uint64_t end = 0;
+    uint64_t id = 0;
+  };
+
+  auto preservedTUGapPieceText = [&](const TUPreservedGapPiece &piece) {
+    if (piece.end <= tuBytes.size() && piece.begin <= piece.end)
+      return tuBytes.slice(piece.begin, piece.end).str();
+    return std::string();
+  };
+
+  auto collectPreservableZeroTokenMacroGapPieces =
+      [&](uint64_t gapBegin, uint64_t gapEnd,
+          SmallVectorImpl<TUPreservedGapPiece> &out) -> bool {
+    if (gapBegin >= gapEnd || gapEnd > tuBytes.size())
+      return false;
+
+    struct GapPiece {
+      uint64_t begin;
+      uint64_t end;
+      uint64_t id;
+    };
+
+    SmallVector<GapPiece, 8> pieces;
+    for (const auto &m : model_.GetMacroInvocations())
+      if (macroInvocationIsConsumableZeroTokenGap(m, gapBegin, gapEnd))
+        pieces.push_back({*m.invB, *m.invE, m.id});
+
+    if (pieces.empty())
+      return false;
+
+    SmallVector<TUPreservedGapPiece, 8> accepted;
+    if (!proveOwnerProofGap(
+            pieces, gapBegin, gapEnd,
+            [](const GapPiece &, const GapPiece &) { return false; },
+            [](const GapPiece &outer, const GapPiece &piece) {
+              if (outer.begin <= piece.begin && piece.end <= outer.end) {
+                // Nested zero-token macro invocations are already part of the
+                // outer invocation's source-neutral proof. Preserve only the
+                // outer callsite text so the refolded source does not duplicate
+                // the same gap structure.
+                return true;
+              }
+              return false;
+            },
+            [&](uint64_t begin, uint64_t end) {
+              return isWsOrCompleteCommentTrivia(tuBytes.slice(begin, end));
+            },
+            [&](const GapPiece &piece) {
+              accepted.push_back({TUPreservedGapPiece::Kind::
+                                      ZeroTokenMacroInvocation,
+                                  piece.begin, piece.end, piece.id});
+            }))
+      return false;
+
+    out.append(accepted.begin(), accepted.end());
+    trace("fallback",
+          "TU/include closure preserving zero-token macro source gap "
+          "source=[{0},{1}) macros={2}",
+          gapBegin, gapEnd, accepted.size());
+    return true;
+  };
+
   std::string mixedPreservedConditionalControlTrivia;
+  SmallVector<TUPreservedGapPiece, 8> mixedPreservedZeroTokenGapPieces;
   std::optional<SourceLineDirectiveGapResume> mixedSourceLineDirectiveResume;
 
   auto lineDirectiveStartsAtPrefix = [&](uint64_t pos) -> bool {
@@ -5299,8 +5509,19 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
                                                              gap.end());
                 return true;
               }
-              if (isPreservableIncludeClosureGapTrivia(gap) ||
-                  gapIsConsumableZeroTokenSourceClosure(
+              if (isPreservableIncludeClosureGapTrivia(gap))
+                return true;
+
+              SmallVector<TUPreservedGapPiece, 4> preservedZeroTokenPieces;
+              if (collectPreservableZeroTokenMacroGapPieces(
+                      gapBegin, gapEnd, preservedZeroTokenPieces)) {
+                mixedPreservedZeroTokenGapPieces.append(
+                    preservedZeroTokenPieces.begin(),
+                    preservedZeroTokenPieces.end());
+                return true;
+              }
+
+              if (gapIsConsumableZeroTokenSourceClosure(
                       gapBegin, gapEnd,
                       /*allowTUConditionalControl=*/true))
                 return true;
@@ -5581,6 +5802,26 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
         !replacement.empty() && replacement.back() != '\n')
       replacement.push_back('\n');
     replacement.append(preservedGapTrivia.begin(), preservedGapTrivia.end());
+  }
+
+  // Mixed TU/include closures may span source-neutral macro callsites that
+  // contributed no PP tokens. These callsites are not stale source: preserving
+  // them keeps the refolded source closer to the original while the zero-token
+  // proof above guarantees that replaying them cannot change the B token
+  // stream. Emit only the normalized top-level gap pieces, not the surrounding
+  // trivia, mirroring the header owner-envelope preservation path.
+  if (!mixedPreservedZeroTokenGapPieces.empty()) {
+    if (!replacement.empty() && replacement.back() != '\n')
+      replacement.push_back('\n');
+    for (const TUPreservedGapPiece &piece :
+         mixedPreservedZeroTokenGapPieces) {
+      std::string pieceText = preservedTUGapPieceText(piece);
+      if (pieceText.empty())
+        continue;
+      replacement += pieceText;
+      if (replacement.empty() || replacement.back() != '\n')
+        replacement.push_back('\n');
+    }
   }
 
   // The closure begins at the proved source interval.  For a pure include
