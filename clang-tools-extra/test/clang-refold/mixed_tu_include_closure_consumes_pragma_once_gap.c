@@ -1,0 +1,9 @@
+// RUN: %clang-refold-tester mixed_tu_include_closure_consumes_pragma_once_gap
+#define KEEP(x) ((x) + 1)
+
+int untouched = KEEP(5);
+
+int arr[] = { 1,
+#include "pragma_once_gap.inc"
+#include "two.inc"
+};
