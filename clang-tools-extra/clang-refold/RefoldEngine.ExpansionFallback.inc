@@ -1790,8 +1790,14 @@ rewriteSourceLineDirectiveLogicalLineMacros(
     SmallVector<uint64_t, 4> macroInvocationIds;
   };
 
-  SourceLineDirectiveBuiltinMacroResolver usableBuiltinMacroResolver =
-      logicalLineSpellingIsContiguous ? builtinMacroResolver : nullptr;
+  auto logicalSliceIsSourceContiguous = [&](size_t begin, size_t end) -> bool {
+    if (begin > end || end > logicalLineSourceOffsets.size())
+      return false;
+    for (size_t i = begin + 1; i < end; ++i)
+      if (logicalLineSourceOffsets[i] != logicalLineSourceOffsets[i - 1] + 1)
+        return false;
+    return true;
+  };
 
   auto findLogicalIndex = [&](uint64_t sourceOffset) -> std::optional<size_t> {
     auto it = std::lower_bound(logicalLineSourceOffsets.begin(),
@@ -1834,6 +1840,12 @@ rewriteSourceLineDirectiveLogicalLineMacros(
 
     StringRef logicalInvocation =
         logicalLine.substr(*beginIndex, *endIndex - *beginIndex);
+    const bool macroLogicalSliceIsContiguous =
+        logicalSliceIsSourceContiguous(*beginIndex, *endIndex);
+    SourceLineDirectiveBuiltinMacroResolver macroBuiltinMacroResolver =
+        (logicalLineSpellingIsContiguous || macroLogicalSliceIsContiguous)
+            ? builtinMacroResolver
+            : nullptr;
     if (!macro.invText)
       continue;
     std::optional<std::string> phase2Invocation =
@@ -1889,12 +1901,14 @@ rewriteSourceLineDirectiveLogicalLineMacros(
     // Predefined location macros have no #define directive to recover, but the
     // producer still records their complete callsite in the source-only
     // directive gap.  Accept such a builtin only through the caller-provided
-    // resolver and only for an unspliced logical directive line; otherwise the
-    // physical source offsets alone are not enough to model the builtin's
-    // presumed-location semantics.
-    if (usableBuiltinMacroResolver) {
+    // resolver after either the whole logical line or this invocation's own
+    // logical slice is source-contiguous.  That admits splices outside the
+    // builtin callsite, such as `#\\nline __LINE__`, but still fails closed
+    // when the builtin invocation itself cannot be mapped to a stable source
+    // location spelling.
+    if (macroBuiltinMacroResolver) {
       if (std::optional<std::string> builtinReplacement =
-              usableBuiltinMacroResolver(macro)) {
+              macroBuiltinMacroResolver(macro)) {
         SourceLineDirectiveMacroReplacement builtin;
         builtin.text = std::move(*builtinReplacement);
         builtin.macroInvocationIds.push_back(macro.id);
@@ -1906,7 +1920,7 @@ rewriteSourceLineDirectiveLogicalLineMacros(
       SmallVector<uint64_t, 8> activeMacroIds;
       replacement = expandLineControlMacroReplacementText(
           model, macro, invocationArgTexts, activeMacroIds,
-          usableBuiltinMacroResolver);
+          macroBuiltinMacroResolver);
     }
     if (!replacement)
       return std::nullopt;
