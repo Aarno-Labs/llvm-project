@@ -986,40 +986,29 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     StringRef text = pragma.text.trim();
     size_t pos = 0;
 
-    auto isHorizontalWS = [](char ch) {
-      return ch == ' ' || ch == '\t' || ch == '\v' || ch == '\f';
-    };
-    auto isIdentifierContinue = [](char ch) {
-      return ch == '_' || ('a' <= ch && ch <= 'z') ||
-             ('A' <= ch && ch <= 'Z') || ('0' <= ch && ch <= '9');
-    };
-    auto skipHorizontalWS = [&](size_t &cursor) {
-      while (cursor < text.size() && isHorizontalWS(text[cursor]))
-        ++cursor;
-    };
     auto consumeWord = [&](StringRef word) {
       if (!text.substr(pos).starts_with(word))
         return false;
       pos += word.size();
-      if (pos < text.size() && isIdentifierContinue(text[pos]))
+      if (pos < text.size() && stringutils::isIdentPart(text[pos]))
         return false;
       return true;
     };
 
-    skipHorizontalWS(pos);
+    stringutils::skipNonNewlineWs(text, pos);
     if (pos >= text.size() || text[pos] != '#')
       return false;
     ++pos;
 
-    skipHorizontalWS(pos);
+    stringutils::skipNonNewlineWs(text, pos);
     if (!consumeWord("pragma"))
       return false;
 
-    skipHorizontalWS(pos);
+    stringutils::skipNonNewlineWs(text, pos);
     if (!consumeWord("once"))
       return false;
 
-    skipHorizontalWS(pos);
+    stringutils::skipNonNewlineWs(text, pos);
     return pos == text.size();
   };
 
@@ -1199,65 +1188,81 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     return includeRecordedSideEffectReason(inc).has_value();
   };
 
-  // Return true iff the macro definition is a plain empty-replacement-list
-  // #define.  This deliberately does not admit every macro invocation that
-  // happens to produce no PP tokens: a non-empty replacement list could contain
-  // preprocessing side effects such as _Pragma.  Empty replacement lists are
-  // source-neutral by construction, so a complete callsite inside the closure
-  // envelope may be consumed with the replaced source interval.
-  auto macroDefinitionHasEmptyReplacementList =
-      [&](const RefoldModel::MacroInvocation &m) -> bool {
+  struct MacroDefinitionReplacementList {
+    const RefoldModel::MacroDirective *directive = nullptr;
+    size_t nameTextBegin = 0;
+    size_t replacementTextBegin = 0;
+    uint64_t fileBase = 0;
+    uint64_t fileBegin = 0;
+    uint64_t fileEnd = 0;
+  };
+
+  auto findMacroDefinitionDirective =
+      [&](const RefoldModel::MacroInvocation &m)
+          -> const RefoldModel::MacroDirective * {
     if (!m.definitionDirectiveId)
-      return false;
+      return nullptr;
 
-    const RefoldModel::MacroDirective *definition = nullptr;
     for (const auto &directive : model_.GetMacroDirectives())
-      if (directive.id == *m.definitionDirectiveId) {
-        definition = &directive;
-        break;
-      }
+      if (directive.id == *m.definitionDirectiveId)
+        return &directive;
+    return nullptr;
+  };
 
+  // Parse the recorded #define text and return the replacement-list range in
+  // both directive-text coordinates and source-file byte coordinates.
+  //
+  // MacroDirective::text contains the full directive spelling, but siteB/siteE
+  // anchor only the directive payload in the source file: siteB is the byte of
+  // the macro name, not the byte of '#'.  Keep the text offset of the name so
+  // nested macro callsites recorded inside a replacement list can be compared
+  // against the correct source-file byte interval.
+  auto macroDefinitionReplacementList =
+      [&](const RefoldModel::MacroInvocation &m)
+          -> std::optional<MacroDefinitionReplacementList> {
+    const RefoldModel::MacroDirective *definition =
+        findMacroDefinitionDirective(m);
     if (!definition || definition->subkind != "#define")
-      return false;
-
-    auto isHorizontalWS = [](char ch) {
-      return ch == ' ' || ch == '\t' || ch == '\v' || ch == '\f';
-    };
-    auto isIdentifierContinue = [](char ch) {
-      return ch == '_' || ('a' <= ch && ch <= 'z') ||
-             ('A' <= ch && ch <= 'Z') || ('0' <= ch && ch <= '9');
-    };
-    auto skipHorizontalWS = [&](StringRef text, size_t &pos) {
-      while (pos < text.size() && isHorizontalWS(text[pos]))
-        ++pos;
-    };
+      return std::nullopt;
 
     StringRef text = definition->text;
     size_t pos = 0;
-    skipHorizontalWS(text, pos);
-    if (pos >= text.size() || text[pos] != '#')
-      return false;
-    ++pos;
-    skipHorizontalWS(text, pos);
-    if (!text.substr(pos).starts_with("define"))
-      return false;
-    pos += StringRef("define").size();
-    if (pos < text.size() && isIdentifierContinue(text[pos]))
-      return false;
-    skipHorizontalWS(text, pos);
 
+    // Re-parse only the directive prefix we need: optional horizontal/trivia
+    // whitespace, '#', optional whitespace, and the 'define' directive keyword.
+    stringutils::skipNonNewlineWs(text, pos);
+    if (pos >= text.size() || text[pos] != '#')
+      return std::nullopt;
+    ++pos;
+    stringutils::skipNonNewlineWs(text, pos);
+
+    // Require the exact preprocessing directive keyword, not an identifier that
+    // merely starts with "define".
+    if (!text.substr(pos).starts_with("define"))
+      return std::nullopt;
+    pos += StringRef("define").size();
+    if (pos < text.size() && stringutils::isIdentPart(text[pos]))
+      return std::nullopt;
+    stringutils::skipNonNewlineWs(text, pos);
+
+    // The next token must be the macro name recorded on the invocation.  Record
+    // its directive-text offset so we can translate later replacement-list
+    // offsets back into source-file byte coordinates.
+    const size_t nameTextBegin = pos;
     if (!text.substr(pos).starts_with(m.name))
-      return false;
+      return std::nullopt;
     pos += m.name.size();
-    if (pos < text.size() && isIdentifierContinue(text[pos]))
-      return false;
+
+    // Avoid accepting a prefix of a longer macro identifier.
+    if (pos < text.size() && stringutils::isIdentPart(text[pos]))
+      return std::nullopt;
 
     if (m.subkind == "func") {
       // Function-like macro definitions require the parameter list to start
-      // immediately after the name.  Skip the balanced parameter list, then
-      // require the replacement list to be only trivia.
+      // immediately after the name.  Skip the balanced parameter list; the
+      // replacement list begins immediately after the closing paren.
       if (pos >= text.size() || text[pos] != '(')
-        return false;
+        return std::nullopt;
       unsigned depth = 0;
       while (pos < text.size()) {
         char ch = text[pos++];
@@ -1267,17 +1272,33 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
         }
         if (ch == ')') {
           if (depth == 0)
-            return false;
+            return std::nullopt;
           --depth;
           if (depth == 0)
             break;
         }
       }
       if (depth != 0)
-        return false;
+        return std::nullopt;
     }
 
-    return isWhitespaceOrCompleteCommentTrivia(text.substr(pos));
+    // `siteB` is expected to be the source byte for the macro name.  If a map
+    // violates that contract, fail closed rather than comparing nested callsite
+    // bytes against a synthetic coordinate system.
+    if (definition->siteB < nameTextBegin)
+      return std::nullopt;
+
+    MacroDefinitionReplacementList result;
+    result.directive = definition;
+    result.nameTextBegin = nameTextBegin;
+    result.replacementTextBegin = pos;
+    result.fileBase = definition->siteB - nameTextBegin;
+    result.fileBegin = result.fileBase + pos;
+    result.fileEnd = definition->siteE;
+    if (result.fileBegin > result.fileEnd ||
+        result.fileEnd > result.fileBase + text.size())
+      return std::nullopt;
+    return result;
   };
 
   // Return true iff this invocation contributed no A-side PP material.  Such a
@@ -1297,6 +1318,167 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     return false;
   };
 
+  // Recursively prove that a zero-token macro invocation is source-neutral.
+  //
+  // The old admissible case was a literal empty-replacement-list macro:
+  //
+  //   #define EMPTY
+  //   EMPTY
+  //
+  // This additionally admits object-like wrapper macros whose replacement list
+  // is tiled by recorded nested zero-token macro invocations, for example:
+  //
+  //   #define EMPTY
+  //   #define WRAP_EMPTY EMPTY
+  //   WRAP_EMPTY
+  //
+  // The proof remains intentionally narrow.  Every non-trivia byte in the
+  // wrapper's replacement list must belong to a nested macro invocation
+  // recorded in the refold map, and every nested invocation must satisfy this
+  // same proof. That avoids treating arbitrary non-empty replacement lists,
+  // literals, operators, `_Pragma`, or unrecorded identifiers as source-neutral
+  // merely because the final PP cover happens to be empty.
+  std::function<bool(const RefoldModel::MacroInvocation &,
+                     DenseSet<uint64_t> &)>
+      macroInvocationIsSourceNeutralZeroTokenImpl;
+  macroInvocationIsSourceNeutralZeroTokenImpl =
+      [&](const RefoldModel::MacroInvocation &m,
+          DenseSet<uint64_t> &visiting) -> bool {
+    // A consumable gap macro must not contribute any final PP-token material.
+    // If the invocation produced tokens, it is source-bearing and this proof
+    // does not apply.
+    if (macroInvocationHasMaterializedPPTokens(m))
+      return false;
+
+    // Reject recursive/cyclic macro invocation graphs fail-closed.  The proof
+    // is structural recursion over the recorded macro DAG, so revisiting the
+    // same invocation would mean the map cannot establish a finite neutral
+    // tiling.
+    if (!visiting.insert(m.id).second)
+      return false;
+
+    auto finish = [&](bool result) {
+      visiting.erase(m.id);
+      return result;
+    };
+
+    // Recover the defining #define and the replacement-list byte range. Without
+    // a schema-valid definition anchor, nested invocation byte intervals cannot
+    // be compared against the replacement list soundly.
+    std::optional<MacroDefinitionReplacementList> replacement =
+        macroDefinitionReplacementList(m);
+    if (!replacement)
+      return finish(false);
+
+    StringRef replacementText =
+        replacement->directive->text.substr(replacement->replacementTextBegin);
+
+    // A literal empty replacement list is source-neutral by construction.
+    if (isWhitespaceOrCompleteCommentTrivia(replacementText))
+      return finish(true);
+
+    // Non-empty function-like wrappers require argument-substitution and
+    // parameter-use reasoning.  Keep them outside this source-neutral proof.
+    if (m.subkind != "obj")
+      return finish(false);
+
+    struct ChildPiece {
+      uint64_t begin;
+      uint64_t end;
+      const RefoldModel::MacroInvocation *child;
+    };
+
+    // Collect the nested macro invocations that the producer recorded inside
+    // this macro's replacement list.  These are the only non-trivia source
+    // bytes a non-empty wrapper is allowed to contain.
+    SmallVector<ChildPiece, 8> children;
+    for (const auto &candidate : model_.GetMacroInvocations()) {
+      if (!candidate.callerMacroId || *candidate.callerMacroId != m.id)
+        continue;
+
+      // Nested invocations must be physically spelled in the defining directive
+      // for this macro.  Otherwise they cannot tile this replacement list.
+      if (!candidate.invFile || candidate.invFile->empty() ||
+          !PathsEqual(*candidate.invFile, replacement->directive->sitePath))
+        return finish(false);
+
+      // Require a concrete, non-empty source callsite interval for the child.
+      // Zero-token refers to the produced PP coverage, not to the source
+      // spelling of the nested macro name.
+      if (!candidate.invB || !candidate.invE ||
+          *candidate.invB >= *candidate.invE)
+        return finish(false);
+
+      // The child callsite must lie wholly inside the replacement-list source
+      // interval.  A partial overlap would mean the wrapper contains source
+      // bytes that this proof has not accounted for.
+      if (*candidate.invB < replacement->fileBegin ||
+          replacement->fileEnd < *candidate.invE)
+        return finish(false);
+
+      children.push_back({*candidate.invB, *candidate.invE, &candidate});
+    }
+
+    // A non-empty wrapper with no recorded children contains unaccounted source
+    // text, so it is not source-neutral under this proof.
+    if (children.empty())
+      return finish(false);
+
+    // Process child callsites in source order so we can prove that the gaps
+    // between them are trivia and that their intervals do not overlap.
+    llvm::sort(children, [](const ChildPiece &lhs, const ChildPiece &rhs) {
+      if (lhs.begin != rhs.begin)
+        return lhs.begin < rhs.begin;
+      if (lhs.end != rhs.end)
+        return lhs.end < rhs.end;
+      return lhs.child->id < rhs.child->id;
+    });
+
+    uint64_t cursor = replacement->fileBegin;
+    for (const ChildPiece &piece : children) {
+      // Overlapping or out-of-order child intervals would make the tiling
+      // ambiguous.  Reject rather than trying to normalize it heuristically.
+      if (piece.begin < cursor)
+        return finish(false);
+
+      // Every byte before the next child invocation must be pure trivia.  Any
+      // identifier, literal, operator, or _Pragma-like spelling here would be
+      // source-bearing replacement-list material.
+      const size_t gapBegin =
+          static_cast<size_t>(cursor - replacement->fileBase);
+      const size_t gapEnd =
+          static_cast<size_t>(piece.begin - replacement->fileBase);
+      StringRef gap = replacement->directive->text.slice(gapBegin, gapEnd);
+      if (!isWhitespaceOrCompleteCommentTrivia(gap))
+        return finish(false);
+
+      // The child itself must satisfy the same zero-token source-neutral proof.
+      // This is what admits WRAP_EMPTY -> EMPTY, while still rejecting wrappers
+      // that eventually expand to real replacement-list text.
+      if (!macroInvocationIsSourceNeutralZeroTokenImpl(*piece.child, visiting))
+        return finish(false);
+
+      cursor = piece.end;
+    }
+
+    // After the final child, the replacement-list suffix must also be trivia.
+    // This completes the tiling proof for the wrapper's entire replacement
+    // list.
+    const size_t suffixBegin =
+        static_cast<size_t>(cursor - replacement->fileBase);
+    StringRef suffix = replacement->directive->text.substr(suffixBegin);
+    if (!isWhitespaceOrCompleteCommentTrivia(suffix))
+      return finish(false);
+
+    return finish(true);
+  };
+
+  auto macroInvocationIsSourceNeutralZeroToken =
+      [&](const RefoldModel::MacroInvocation &m) -> bool {
+    DenseSet<uint64_t> visiting;
+    return macroInvocationIsSourceNeutralZeroTokenImpl(m, visiting);
+  };
+
   // Return true iff the macro invocation is a complete zero-token TU callsite
   // inside the candidate replacement envelope.  Partial overlaps remain
   // non-refoldable here because deleting only part of a macro call would not be
@@ -1310,13 +1492,12 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       return false;
     if (*m.invB < begin || end < *m.invE)
       return false;
-    return !macroInvocationHasMaterializedPPTokens(m) &&
-           macroDefinitionHasEmptyReplacementList(m);
+    return macroInvocationIsSourceNeutralZeroToken(m);
   };
 
   // Prove that a source gap inside the replacement envelope consists only of
   // whitespace plus complete source-neutral artifacts: zero-token include trees
-  // and invocations of empty-replacement-list macros.
+  // and source-neutral zero-token macro invocation trees.
   //
   // These artifacts have no PP tokens, so token overlap alone cannot make them
   // part of the touched hunk.  If they lie physically between required source
