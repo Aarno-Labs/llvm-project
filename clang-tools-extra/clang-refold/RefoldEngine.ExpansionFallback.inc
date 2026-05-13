@@ -266,6 +266,26 @@ static bool startsWithPreprocessorDirectiveTrivia(StringRef text) {
 struct SourceLineDirectiveGapResume {
   size_t lineAtResume = 0;
   std::string fileSpelling;
+
+  /// Optional numeric line-marker flags to replay with the resume directive.
+  /// Empty means the canonical `#line` spelling is sufficient.
+  std::string lineMarkerFlags;
+};
+
+struct ParsedSourceLineDirectiveLogicalLine {
+  size_t lineAfterDirective = 0;
+  std::string fileSpelling;
+
+  /// True iff this directive resets the active numeric line-marker flags.
+  /// Canonical `#line` directives and filename-less numeric markers preserve
+  /// the prior flag state; numeric markers with an explicit filename establish
+  /// a fresh flag state, even when that state is empty.
+  bool updatesLineMarkerFlags = false;
+
+  /// Canonicalized replayable flags from a numeric line marker.  This accepts
+  /// only flags that can be locally re-emitted without needing to prove a
+  /// preprocessor include-stack pop.
+  std::string lineMarkerFlags;
 };
 
 /// Build the translation-phase-2 logical spelling of one source line.
@@ -333,9 +353,11 @@ static bool collectPhase2LogicalLine(StringRef fileText, uint64_t lineBegin,
 /// intentionally stricter than the general preprocessor grammar: it accepts
 /// only source-spelled `#line <digits> ["file"]` and the Clang/GCC numeric
 /// line-marker spelling `# <digits> ["file"]`, both with optional horizontal
-/// whitespace.  Macro-dependent spellings and line-marker flags remain outside
+/// whitespace.  Numeric line-marker flags are accepted only for the replayable
+/// flag forms that can be re-emitted as the local resume directive;
+/// macro-dependent spellings and include-stack-pop flag forms remain outside
 /// this proof class.
-static std::optional<LineDirectiveState>
+static std::optional<ParsedSourceLineDirectiveLogicalLine>
 parseSourceLineDirectiveLogicalLine(StringRef line,
                                     StringRef currentFileSpelling) {
   if (line.ends_with("\n"))
@@ -355,13 +377,16 @@ parseSourceLineDirectiveLogicalLine(StringRef line,
   // preprocessed line-marker form `# 123 "file"`.  Both establish the same
   // logical file/line state for the following source line, but neither leaves
   // ordinary PP tokens that the refold map can recover from A/B.
+  bool isNumericLineMarker = false;
   if (rest.consume_front("line")) {
     if (!rest.empty() && stringutils::isIdentPart(rest.front()))
       return std::nullopt;
     if (rest.empty() || !stringutils::isWs(rest.front()))
       return std::nullopt;
     rest = rest.ltrim(" \t\v\f");
-  } else if (rest.empty() || !('0' <= rest.front() && rest.front() <= '9')) {
+  } else if (!rest.empty() && '0' <= rest.front() && rest.front() <= '9') {
+    isNumericLineMarker = true;
+  } else {
     return std::nullopt;
   }
 
@@ -375,10 +400,12 @@ parseSourceLineDirectiveLogicalLine(StringRef line,
   rest = rest.drop_front(digits.size()).ltrim(" \t\v\f");
 
   std::string fileSpelling = currentFileSpelling.str();
+  bool hasExplicitFileSpelling = false;
   if (!rest.empty()) {
     if (!rest.consume_front("\""))
       return std::nullopt;
 
+    hasExplicitFileSpelling = true;
     fileSpelling.clear();
     bool closedQuote = false;
     while (!rest.empty()) {
@@ -398,11 +425,88 @@ parseSourceLineDirectiveLogicalLine(StringRef line,
     }
     if (!closedQuote)
       return std::nullopt;
-    if (!rest.trim(" \t\v\f").empty())
-      return std::nullopt;
   }
 
-  return LineDirectiveState(fileSpelling, lineAfterDirective, 0);
+  std::string lineMarkerFlags;
+  rest = rest.ltrim(" \t\v\f");
+  if (!rest.empty()) {
+    if (!isNumericLineMarker)
+      return std::nullopt;
+
+    // Clang/GCC line markers may carry flags after the filename.  Replaying
+    // flag 1 (new file), 3 (system header), and 4 (extern C system header) is
+    // locally deterministic because those flags describe the state that the
+    // following suffix observes.  Flag 2 pops the preprocessor include stack;
+    // proving that stack operation after moving the directive would require
+    // additional context, so leave that form outside this proof class.
+    bool sawFlag1 = false;
+    bool sawFlag3 = false;
+    bool sawFlag4 = false;
+    while (!rest.empty()) {
+      StringRef flagText = rest.take_while([](char c) {
+        return '0' <= c && c <= '9';
+      });
+      if (flagText.empty())
+        return std::nullopt;
+
+      unsigned flag = 0;
+      if (flagText.getAsInteger(10, flag))
+        return std::nullopt;
+      switch (flag) {
+      case 1:
+        if (sawFlag1 || sawFlag3 || sawFlag4)
+          return std::nullopt;
+        sawFlag1 = true;
+        break;
+      case 3:
+        if (sawFlag3 || sawFlag4)
+          return std::nullopt;
+        sawFlag3 = true;
+        break;
+      case 4:
+        if (!sawFlag3 || sawFlag4)
+          return std::nullopt;
+        sawFlag4 = true;
+        break;
+      default:
+        return std::nullopt;
+      }
+
+      if (!lineMarkerFlags.empty())
+        lineMarkerFlags.push_back(' ');
+      lineMarkerFlags += std::to_string(flag);
+
+      rest = rest.drop_front(flagText.size());
+      if (rest.empty())
+        break;
+      if (!stringutils::isWs(rest.front()))
+        return std::nullopt;
+      rest = rest.ltrim(" \t\v\f");
+    }
+  }
+
+  return ParsedSourceLineDirectiveLogicalLine{
+      lineAfterDirective, fileSpelling,
+      isNumericLineMarker && hasExplicitFileSpelling, lineMarkerFlags};
+}
+
+/// Format the local resume directive for a consumed source-only line-control
+/// gap.  Canonical #line spelling is used unless the consumed state carries
+/// numeric line-marker flags that must be replayed to preserve the suffix state.
+static std::string
+formatSourceLineDirectiveGapResume(const SourceLineDirectiveGapResume &resume) {
+  if (resume.lineMarkerFlags.empty())
+    return LineDirectiveInserter::FormatLineDirective(resume.lineAtResume,
+                                                      resume.fileSpelling);
+
+  std::string result = "# ";
+  result += std::to_string(resume.lineAtResume);
+  result += " \"";
+  result += LineDirectiveInserter::EscapeForLineDirective(resume.fileSpelling);
+  result += "\" ";
+  result += resume.lineMarkerFlags;
+  result += '\n';
+  return result;
 }
 
 /// Prove that a source gap is made only of trivia plus complete source-spelled
@@ -427,6 +531,7 @@ computeSourceLineDirectiveGapResume(StringRef fileText, uint64_t gapBegin,
   size_t lastLineAfterDirective = 0;
   uint64_t lastAfterDirectiveOffset = gapBegin;
   std::string currentFileSpelling = defaultFileSpelling.str();
+  std::string currentLineMarkerFlags;
 
   auto skipCompleteComment = [&](uint64_t &pos) -> bool {
     if (pos + 1 >= gapEnd || fileText[pos] != '/')
@@ -490,14 +595,16 @@ computeSourceLineDirectiveGapResume(StringRef fileText, uint64_t gapBegin,
                                   afterLine))
       return std::nullopt;
 
-    std::optional<LineDirectiveState> state =
+    std::optional<ParsedSourceLineDirectiveLogicalLine> state =
         parseSourceLineDirectiveLogicalLine(logicalLine, currentFileSpelling);
     if (!state)
       return std::nullopt;
 
     sawLineDirective = true;
     currentFileSpelling = state->fileSpelling;
-    lastLineAfterDirective = state->lineAfterDir;
+    if (state->updatesLineMarkerFlags)
+      currentLineMarkerFlags = state->lineMarkerFlags;
+    lastLineAfterDirective = state->lineAfterDirective;
     lastAfterDirectiveOffset = afterLine;
     cursor = afterLine;
     atLineStart = true;
@@ -510,7 +617,8 @@ computeSourceLineDirectiveGapResume(StringRef fileText, uint64_t gapBegin,
       fileText, static_cast<size_t>(lastAfterDirectiveOffset),
       static_cast<size_t>(resumeOffset));
   return SourceLineDirectiveGapResume{lastLineAfterDirective + delta,
-                                      std::move(currentFileSpelling)};
+                                      std::move(currentFileSpelling),
+                                      std::move(currentLineMarkerFlags)};
 }
 
 std::string RefoldEngine::FormatExpansionClosureWitness(
@@ -3263,9 +3371,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       padded.push_back('\n');
     }
 
-    padded += lineDirs_.FormatLineDirective(
-        mixedSourceLineDirectiveResume->lineAtResume,
-        mixedSourceLineDirectiveResume->fileSpelling);
+    padded +=
+        formatSourceLineDirectiveGapResume(*mixedSourceLineDirectiveResume);
     trace("fallback",
           "TU/include closure emitted source #line resume line={0} file={1}",
           mixedSourceLineDirectiveResume->lineAtResume,
