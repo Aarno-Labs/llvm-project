@@ -709,6 +709,23 @@ parseSourceLineDirectiveLogicalLine(StringRef line,
   std::string lineMarkerFlags;
   rest = rest.ltrim(" \t\v\f");
   if (!rest.empty()) {
+    // Clang accepts extra preprocessing tokens after the filename operand of
+    // the canonical `#line` spelling, diagnoses them, and preserves only the
+    // first string literal as the presumed filename.  Source-only gap repair
+    // must model that state rather than reject the whole owner envelope: a
+    // macro-expanded filename can legally produce adjacent string literals
+    // such as `#line 123 "gap" ".c"`, where the suffix observes `"gap"`.
+    // Keep this limited to canonical `#line` with an explicit filename.  The
+    // numeric line-marker spelling uses trailing tokens as semantic flags and
+    // must remain strictly parsed below.
+    if (!isNumericLineMarker && hasExplicitFileSpelling)
+      rest = StringRef();
+
+    if (rest.empty())
+      return ParsedSourceLineDirectiveLogicalLine{
+          lineAfterDirective, fileSpelling,
+          isNumericLineMarker && hasExplicitFileSpelling, lineMarkerFlags};
+
     if (!isNumericLineMarker)
       return std::nullopt;
 
