@@ -973,6 +973,233 @@ stringifyLineControlMacroArgument(StringRef argument) {
   return stringutils::quoteCString(normalized);
 }
 
+/// Return true iff a recorded macro argument contains at least one preprocessing
+/// token after the local phase-3 comment-to-whitespace rule.
+///
+/// `__VA_OPT__` is controlled by whether the variadic tail contains any
+/// preprocessing tokens, not by whether the raw argument spelling is non-empty.
+/// The line-control proof only has source slices, so it accepts the bounded
+/// subset it already knows how to reason about: whitespace plus complete block
+/// comments are token-empty, a line comment or malformed comment fails closed,
+/// and any other byte proves that at least one token-like spelling is present.
+static std::optional<bool>
+lineControlArgumentContainsPPTokens(StringRef argument) {
+  for (size_t pos = 0; pos < argument.size();) {
+    if (stringutils::isWs(argument[pos])) {
+      ++pos;
+      continue;
+    }
+
+    if (pos + 1 < argument.size() && argument[pos] == '/') {
+      if (argument[pos + 1] == '*') {
+        pos += 2;
+        bool closed = false;
+        while (pos + 1 < argument.size()) {
+          if (argument[pos] == '*' && argument[pos + 1] == '/') {
+            pos += 2;
+            closed = true;
+            break;
+          }
+          ++pos;
+        }
+        if (!closed)
+          return std::nullopt;
+        continue;
+      }
+      if (argument[pos + 1] == '/')
+        return std::nullopt;
+    }
+
+    return true;
+  }
+
+  return false;
+}
+
+/// Return the raw payload inside one `__VA_OPT__(...)` occurrence.
+///
+/// This scans only enough replacement-list structure to find the matching
+/// close-paren without being confused by parentheses inside string/character
+/// literals or complete block comments.  The payload is not interpreted here;
+/// after `__VA_OPT__` is erased or exposed, the normal bounded line-control
+/// replacement-list evaluator still performs argument substitution,
+/// stringification, paste-witness replay, and final strict #line parsing.
+static std::optional<std::pair<StringRef, size_t>>
+parseLineControlVaOptPayload(StringRef replacement, size_t openParen) {
+  if (openParen >= replacement.size() || replacement[openParen] != '(')
+    return std::nullopt;
+
+  const size_t payloadBegin = openParen + 1;
+  unsigned depth = 1;
+  for (size_t pos = payloadBegin; pos < replacement.size();) {
+    char ch = replacement[pos];
+
+    if (ch == '\n' || ch == '\r')
+      return std::nullopt;
+
+    if (ch == '"' || ch == '\'') {
+      const char quote = ch;
+      ++pos;
+      bool closed = false;
+      while (pos < replacement.size()) {
+        char litCh = replacement[pos++];
+        if (litCh == '\n' || litCh == '\r')
+          return std::nullopt;
+        if (litCh == '\\') {
+          if (pos >= replacement.size())
+            return std::nullopt;
+          ++pos;
+          continue;
+        }
+        if (litCh == quote) {
+          closed = true;
+          break;
+        }
+      }
+      if (!closed)
+        return std::nullopt;
+      continue;
+    }
+
+    if (pos + 1 < replacement.size() && ch == '/') {
+      if (replacement[pos + 1] == '*') {
+        pos += 2;
+        bool closed = false;
+        while (pos + 1 < replacement.size()) {
+          if (replacement[pos] == '*' && replacement[pos + 1] == '/') {
+            pos += 2;
+            closed = true;
+            break;
+          }
+          ++pos;
+        }
+        if (!closed)
+          return std::nullopt;
+        continue;
+      }
+      if (replacement[pos + 1] == '/')
+        return std::nullopt;
+    }
+
+    if (ch == '(') {
+      ++depth;
+      ++pos;
+      continue;
+    }
+    if (ch == ')') {
+      --depth;
+      if (depth == 0)
+        return std::make_pair(replacement.slice(payloadBegin, pos), pos + 1);
+      ++pos;
+      continue;
+    }
+
+    ++pos;
+  }
+
+  return std::nullopt;
+}
+
+/// Expand top-level `__VA_OPT__(...)` operators in a recorded replacement list.
+///
+/// This is not a general macro expander.  It implements only the local C99/C23
+/// variadic gate needed before the existing line-control evaluator runs: if the
+/// producer-recorded variadic tail contains tokens, expose the `__VA_OPT__`
+/// payload; otherwise erase it.  The exposed payload is then processed by the
+/// normal proof path, so unsupported contents still fail closed at argument
+/// substitution, paste-witness replay, or the final strict line-control parse.
+static std::optional<std::string> expandLineControlVaOptOperators(
+    StringRef replacement, ArrayRef<RefoldModel::MacroDefParam> params,
+    ArrayRef<StringRef> invocationArgTexts) {
+  if (params.size() != invocationArgTexts.size())
+    return std::nullopt;
+
+  std::optional<bool> variadicTailHasTokens;
+  for (size_t i = 0; i != params.size(); ++i) {
+    if (!params[i].variadic)
+      continue;
+    if (variadicTailHasTokens)
+      return std::nullopt;
+    std::optional<bool> hasTokens =
+        lineControlArgumentContainsPPTokens(invocationArgTexts[i]);
+    if (!hasTokens)
+      return std::nullopt;
+    variadicTailHasTokens = *hasTokens;
+  }
+
+  std::string out;
+  out.reserve(replacement.size());
+  bool sawVaOpt = false;
+
+  for (size_t pos = 0; pos < replacement.size();) {
+    char ch = replacement[pos];
+
+    if (ch == '\n' || ch == '\r')
+      return std::nullopt;
+
+    if (ch == '"' || ch == '\'') {
+      const size_t literalBegin = pos;
+      const char quote = ch;
+      ++pos;
+      bool closed = false;
+      while (pos < replacement.size()) {
+        char litCh = replacement[pos++];
+        if (litCh == '\n' || litCh == '\r')
+          return std::nullopt;
+        if (litCh == '\\') {
+          if (pos >= replacement.size())
+            return std::nullopt;
+          ++pos;
+          continue;
+        }
+        if (litCh == quote) {
+          closed = true;
+          break;
+        }
+      }
+      if (!closed)
+        return std::nullopt;
+      out.append(replacement.begin() + literalBegin, replacement.begin() + pos);
+      continue;
+    }
+
+    if (stringutils::isIdentStart(ch)) {
+      size_t identEnd = pos + 1;
+      while (identEnd < replacement.size() &&
+             stringutils::isIdentPart(replacement[identEnd]))
+        ++identEnd;
+      StringRef ident = replacement.slice(pos, identEnd);
+      if (ident != "__VA_OPT__") {
+        out.append(ident.begin(), ident.end());
+        pos = identEnd;
+        continue;
+      }
+
+      if (!variadicTailHasTokens)
+        return std::nullopt;
+      size_t openParen = identEnd;
+      stringutils::skipNonNewlineWs(replacement, openParen);
+      std::optional<std::pair<StringRef, size_t>> payload =
+          parseLineControlVaOptPayload(replacement, openParen);
+      if (!payload)
+        return std::nullopt;
+
+      sawVaOpt = true;
+      if (*variadicTailHasTokens)
+        out.append(payload->first.begin(), payload->first.end());
+      pos = payload->second;
+      continue;
+    }
+
+    out.push_back(ch);
+    ++pos;
+  }
+
+  if (!sawVaOpt)
+    return std::nullopt;
+  return out;
+}
+
 /// Substitute invocation arguments through a simple function-like replacement
 /// list used inside a source-only line-control directive.
 ///
@@ -989,6 +1216,22 @@ static std::optional<std::string> substituteLineControlMacroParameters(
     ArrayRef<RefoldModel::PasteToken> pasteTokens) {
   if (params.size() != invocationArgTexts.size())
     return std::nullopt;
+
+  // `__VA_OPT__(...)` gates a replacement-list fragment on the presence of
+  // tokens in the variadic tail.  Normalize that operator before the ordinary
+  // parameter-substitution walk below; the exposed payload still passes through
+  // the same formal substitution, stringification, paste-witness replay, and
+  // strict final line-control parse as any other replacement-list text.
+  if (replacement.contains("__VA_OPT__")) {
+    std::optional<std::string> expandedVaOpt =
+        expandLineControlVaOptOperators(replacement, params,
+                                        invocationArgTexts);
+    if (!expandedVaOpt)
+      return std::nullopt;
+    return substituteLineControlMacroParameters(*expandedVaOpt, params,
+                                                invocationArgTexts,
+                                                pasteTokens);
+  }
 
   // Variadic formals are safe to substitute in this bounded proof when the
   // producer recorded exactly one argument spelling for the variadic tail.
