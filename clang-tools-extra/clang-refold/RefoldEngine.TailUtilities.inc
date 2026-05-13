@@ -3767,10 +3767,142 @@ bool RefoldEngine::EmittedTextEditHasDischargedAcceptedResults(
   return true;
 }
 
+std::optional<std::pair<uint64_t, uint64_t>>
+RefoldEngine::BTokenRangeToByteRange(uint64_t bTokBegin,
+                                     uint64_t bTokEnd) const {
+  // B-token envelopes are half-open, so bTokEnd is allowed to name the
+  // sentinel offset immediately after the last B token. Keeping the conversion
+  // through bTokOff_ preserves the exact byte spelling chosen by the B lexer.
+  if (bTokEnd < bTokBegin)
+    return std::nullopt;
+  if (bTokEnd >= static_cast<uint64_t>(bTokOff_.size()))
+    return std::nullopt;
+
+  const uint64_t begin =
+      static_cast<uint64_t>(bTokOff_[static_cast<size_t>(bTokBegin)]);
+  const uint64_t end =
+      static_cast<uint64_t>(bTokOff_[static_cast<size_t>(bTokEnd)]);
+  if (end < begin || end > static_cast<uint64_t>(bSource_.size()))
+    return std::nullopt;
+  return std::make_pair(begin, end);
+}
+
+void RefoldEngine::StampTextEditMaterializedBByteRange(TextEdit &edit,
+                                                       uint64_t begin,
+                                                       uint64_t end) const {
+  if (end < begin || end > static_cast<uint64_t>(bSource_.size()))
+    fatal("edit-map", "invalid materialized B byte range [{0},{1}) bLen={2}",
+          begin, end, bSource_.size());
+  edit.materializedBByteBegin = begin;
+  edit.materializedBByteEnd = end;
+}
+
+void RefoldEngine::StampTextEditMaterializedBTokenRange(
+    TextEdit &edit, uint64_t bTokBegin, uint64_t bTokEnd) const {
+  std::optional<std::pair<uint64_t, uint64_t>> bytes =
+      BTokenRangeToByteRange(bTokBegin, bTokEnd);
+  if (!bytes)
+    fatal("edit-map", "invalid materialized B token range [{0},{1}) bToks={2}",
+          bTokBegin, bTokEnd, bToks_.size());
+  StampTextEditMaterializedBByteRange(edit, bytes->first, bytes->second);
+}
+
+void RefoldEngine::StampTextEditMaterializedOutputTextRange(
+    TextEdit &edit, uint64_t begin, uint64_t end) const {
+  if (end < begin || end > static_cast<uint64_t>(edit.text.size()))
+    fatal("edit-map",
+          "invalid materialized output byte range [{0},{1}) textLen={2}",
+          begin, end, edit.text.size());
+  edit.materializedOutputTextBegin = begin;
+  edit.materializedOutputTextEnd = end;
+}
+
+std::optional<std::pair<uint64_t, uint64_t>>
+RefoldEngine::TextEditMaterializedOutputTextRange(const TextEdit &edit) const {
+  if (edit.materializedOutputTextBegin && edit.materializedOutputTextEnd) {
+    if (*edit.materializedOutputTextEnd < *edit.materializedOutputTextBegin ||
+        *edit.materializedOutputTextEnd >
+            static_cast<uint64_t>(edit.text.size()))
+      return std::nullopt;
+    return std::make_pair(*edit.materializedOutputTextBegin,
+                          *edit.materializedOutputTextEnd);
+  }
+
+  return std::make_pair(uint64_t{0}, static_cast<uint64_t>(edit.text.size()));
+}
+
+std::optional<std::pair<uint64_t, uint64_t>>
+RefoldEngine::MacroPatchMaterializedOutputTextRange(
+    const MacroPatch &patch) const {
+  if (!patch.hasMaterializedOutputByteRange)
+    return std::nullopt;
+  if (patch.materializedOutputByteEnd < patch.materializedOutputByteStart ||
+      patch.materializedOutputByteEnd >
+          static_cast<uint64_t>(patch.replacement.size()))
+    return std::nullopt;
+  return std::make_pair(patch.materializedOutputByteStart,
+                        patch.materializedOutputByteEnd);
+}
+
+std::optional<std::pair<uint64_t, uint64_t>>
+RefoldEngine::TextEditMaterializedBByteRange(const TextEdit &edit) const {
+  if (edit.materializedBByteBegin && edit.materializedBByteEnd) {
+    if (*edit.materializedBByteEnd < *edit.materializedBByteBegin ||
+        *edit.materializedBByteEnd > static_cast<uint64_t>(bSource_.size()))
+      return std::nullopt;
+    return std::make_pair(*edit.materializedBByteBegin,
+                          *edit.materializedBByteEnd);
+  }
+
+  if (edit.directTUHunkBStart && edit.directTUHunkBEnd)
+    return BTokenRangeToByteRange(*edit.directTUHunkBStart,
+                                  *edit.directTUHunkBEnd);
+
+  return std::nullopt;
+}
+
+std::optional<std::pair<uint64_t, uint64_t>>
+RefoldEngine::MacroPatchMaterializedBByteRange(const MacroPatch &patch) const {
+  // Prefer an explicitly stamped envelope.  Structure-preserving macro patches
+  // use this to distinguish two edit-map meanings that share the same physical
+  // TextEdit: ordinary argument rewrites map the B side to the whole expansion
+  // envelope they regenerate, while pure insertions intentionally stay narrow
+  // and let the final TextEdit/hunk metadata provide the inserted payload.
+  if (patch.hasMaterializedBTokenRange) {
+    if (auto bytes = BTokenRangeToByteRange(patch.materializedBTokStart,
+                                            patch.materializedBTokEnd))
+      return bytes;
+  }
+
+  uint64_t macroId = patch.proofRootMacroId ? patch.proofRootMacroId
+                                            : patch.macroId;
+  if (macroId == 0)
+    return std::nullopt;
+
+  const RefoldModel::MacroInvocation *macro = FindMacroInvocationById(macroId);
+  if (!macro)
+    return std::nullopt;
+
+  if (auto plan = ComputeWholeCoverPlan(*macro))
+    return BTokenRangeToByteRange(plan->bTokStart, plan->bTokEnd);
+
+  if (auto env = MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
+          macro->cover.begin, macro->cover.end))
+    return BTokenRangeToByteRange(env->first, env->second);
+
+  return std::nullopt;
+}
+
 std::string RefoldEngine::ApplyTextEditsWithPendingResync(
     StringRef originalFileText, ArrayRef<TextEdit> edits,
     DenseSet<uint64_t> *appliedExpandedMacroRootIds,
-    StringRef emissionOwner) const {
+    StringRef emissionOwner,
+    std::vector<MaterializedEditMapping> *materializedEditMappings) const {
+  // Source-side ranges are only knowable at this final splice boundary: every
+  // earlier candidate still may be merged, dropped, widened, or followed by a
+  // pending resync before it becomes physical output.
+  if (materializedEditMappings)
+    materializedEditMappings->clear();
   if (edits.empty())
     return originalFileText.str();
 
@@ -3836,14 +3968,52 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
         totalLen += ordered[k].e->text.size();
       merged.text.reserve(totalLen);
 
+      std::optional<uint64_t> mergedBByteBegin;
+      std::optional<uint64_t> mergedBByteEnd;
+      bool mergedBByteRangeContiguous = true;
+      std::optional<uint64_t> mergedOutByteBegin;
+      std::optional<uint64_t> mergedOutByteEnd;
+      // Same-offset insertions become one physical edit in source order. The
+      // sidecar can describe that merged edit only when the contributing
+      // B-side witnesses tile one contiguous byte range in the same order.
       for (size_t k = i; k < j; ++k) {
+        const uint64_t fragmentOutputBase =
+            static_cast<uint64_t>(merged.text.size());
         merged.text.append(ordered[k].e->text);
         if (ordered[k].e->pending)
           merged.pending = ordered[k].e->pending;
         merged.acceptedResults.insert(merged.acceptedResults.end(),
                                       ordered[k].e->acceptedResults.begin(),
                                       ordered[k].e->acceptedResults.end());
+        if (auto bRange = TextEditMaterializedBByteRange(*ordered[k].e)) {
+          if (!mergedBByteBegin) {
+            mergedBByteBegin = bRange->first;
+            mergedBByteEnd = bRange->second;
+          } else if (mergedBByteEnd && *mergedBByteEnd == bRange->first) {
+            mergedBByteEnd = bRange->second;
+          } else {
+            mergedBByteRangeContiguous = false;
+          }
+        } else if (materializedEditMappings) {
+          mergedBByteRangeContiguous = false;
+        }
+        if (auto outRange =
+                TextEditMaterializedOutputTextRange(*ordered[k].e)) {
+          const uint64_t outBegin = fragmentOutputBase + outRange->first;
+          const uint64_t outEnd = fragmentOutputBase + outRange->second;
+          mergedOutByteBegin =
+              mergedOutByteBegin ? std::min(*mergedOutByteBegin, outBegin)
+                                 : outBegin;
+          mergedOutByteEnd =
+              mergedOutByteEnd ? std::max(*mergedOutByteEnd, outEnd) : outEnd;
+        }
       }
+      if (mergedBByteBegin && mergedBByteEnd && mergedBByteRangeContiguous)
+        StampTextEditMaterializedBByteRange(merged, *mergedBByteBegin,
+                                            *mergedBByteEnd);
+      if (mergedOutByteBegin && mergedOutByteEnd)
+        StampTextEditMaterializedOutputTextRange(merged, *mergedOutByteBegin,
+                                                 *mergedOutByteEnd);
 
       trace("edits/apply",
             "merged {0} insertion edits at [{1},{2}) into len={3}", j - i, s, t,
@@ -3926,6 +4096,7 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
                                              replacement, emissionOwner);
         TextEdit merged{s, t, std::move(ro.text), std::move(ro.pending),
                         std::nullopt, {}};
+        StampTextEditMaterializedBTokenRange(merged, bBegin, bEnd);
 
         // Preserve existing proof carriers from the fragments. If the fragments
         // carry macro-root provenance, they must all agree on the same root.
@@ -3978,6 +4149,12 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
     }
 
     TextEdit merged = *first;
+    std::optional<std::pair<uint64_t, uint64_t>> mergedBRange =
+        TextEditMaterializedBByteRange(merged);
+    bool mergedBRangeAmbiguous = false;
+    std::optional<std::pair<uint64_t, uint64_t>> mergedOutRange =
+        TextEditMaterializedOutputTextRange(merged);
+    bool mergedOutRangeAmbiguous = false;
     for (size_t k = i + 1; k < j; ++k) {
       const TextEdit &dup = *ordered[k].e;
 
@@ -4008,6 +4185,26 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
       if (!merged.expandedMacroRootId && dup.expandedMacroRootId)
         merged.expandedMacroRootId = dup.expandedMacroRootId;
 
+      if (std::optional<std::pair<uint64_t, uint64_t>> dupBRange =
+              TextEditMaterializedBByteRange(dup)) {
+        if (!mergedBRange) {
+          mergedBRange = dupBRange;
+        } else if (mergedBRange->first != dupBRange->first ||
+                   mergedBRange->second != dupBRange->second) {
+          mergedBRangeAmbiguous = true;
+        }
+      }
+
+      if (std::optional<std::pair<uint64_t, uint64_t>> dupOutRange =
+              TextEditMaterializedOutputTextRange(dup)) {
+        if (!mergedOutRange) {
+          mergedOutRange = dupOutRange;
+        } else if (mergedOutRange->first != dupOutRange->first ||
+                   mergedOutRange->second != dupOutRange->second) {
+          mergedOutRangeAmbiguous = true;
+        }
+      }
+
       // Keep all accepted-result carriers from the equivalent duplicates. The
       // text replacement is shared, but each proof witness still explains one
       // path that contributed to the emitted edit.
@@ -4015,6 +4212,32 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
                                     dup.acceptedResults.begin(),
                                     dup.acceptedResults.end());
     }
+
+    if (mergedBRangeAmbiguous && materializedEditMappings) {
+      RequestTerminalFallback(
+          TerminalFallbackKind::UndischargedEmissionArtifact, "edit-map",
+          llvm::formatv("duplicate non-zero edits for span [{0},{1}) in {2} "
+                        "carry different B-side materialization ranges",
+                        s, t, emissionOwner)
+              .str());
+      return originalFileText.str();
+    }
+    if (mergedOutRangeAmbiguous && materializedEditMappings) {
+      RequestTerminalFallback(
+          TerminalFallbackKind::UndischargedEmissionArtifact, "edit-map",
+          llvm::formatv("duplicate non-zero edits for span [{0},{1}) in {2} "
+                        "carry different refolded-output materialization "
+                        "ranges",
+                        s, t, emissionOwner)
+              .str());
+      return originalFileText.str();
+    }
+    if (mergedBRange)
+      StampTextEditMaterializedBByteRange(merged, mergedBRange->first,
+                                          mergedBRange->second);
+    if (mergedOutRange)
+      StampTextEditMaterializedOutputTextRange(merged, mergedOutRange->first,
+                                               mergedOutRange->second);
 
     trace("edits/apply",
           "merged {0} identical non-zero edits at [{1},{2}) into one edit",
@@ -4293,6 +4516,7 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
     closure =
         TextEdit{best->sourceBegin,     best->sourceEnd, std::move(ro.text),
                  std::move(ro.pending), std::nullopt,    {}};
+    StampTextEditMaterializedBTokenRange(closure, best->bBegin, best->bEnd);
     AttachAcceptedResultCarrier(
         closure, BuildAcceptedTUTextEditCandidate(
                      AcceptedPathKind::TUByteSpanConservativeEdit,
@@ -4421,7 +4645,41 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
     if (appliedExpandedMacroRootIds && e.expandedMacroRootId)
       appliedExpandedMacroRootIds->insert(*e.expandedMacroRootId);
 
+    const uint64_t emittedBegin = static_cast<uint64_t>(out.size());
     out.append(e.text);
+
+    // Record only the replacement bytes written by this edit. Copied original
+    // slices and emitted #line/resync material are intentionally outside the
+    // mapped source range because they are not materialized B edit payload.
+    if (materializedEditMappings) {
+      std::optional<std::pair<uint64_t, uint64_t>> bRange =
+          TextEditMaterializedBByteRange(e);
+      if (!bRange) {
+        RequestTerminalFallback(
+            TerminalFallbackKind::UndischargedEmissionArtifact, "edit-map",
+            llvm::formatv("emitted edit in {0} at source=[{1},{2}) lacks a "
+                          "deterministic B-side materialization range",
+                          emissionOwner, e.start, e.end)
+                .str());
+        materializedEditMappings->clear();
+        return originalFileText.str();
+      }
+      std::optional<std::pair<uint64_t, uint64_t>> outRange =
+          TextEditMaterializedOutputTextRange(e);
+      if (!outRange) {
+        RequestTerminalFallback(
+            TerminalFallbackKind::UndischargedEmissionArtifact, "edit-map",
+            llvm::formatv("emitted edit in {0} at source=[{1},{2}) carries "
+                          "invalid refolded-output materialization range",
+                          emissionOwner, e.start, e.end)
+                .str());
+        materializedEditMappings->clear();
+        return originalFileText.str();
+      }
+      materializedEditMappings->push_back(MaterializedEditMapping{
+          bRange->first, bRange->second, emittedBegin + outRange->first,
+          emittedBegin + outRange->second});
+    }
 
     // Carry any resync that the edit itself could not emit locally. It will be
     // discharged by the next copied original slice, or by the final tail copy.

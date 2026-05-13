@@ -85,6 +85,24 @@ struct PPTok {
   std::string spelling;
 };
 
+/// Half-open byte mapping for one edit that survived final TU emission.
+///
+/// `modifiedPreprocessed*` is expressed in the edited preprocessed stream B
+/// passed via `--pp-mod`. `refoldedSource*` is expressed in the final refolded
+/// C source emitted to `--out`. All ranges are byte offsets and use the same
+/// half-open `[begin,end)` convention as the rest of the engine.
+///
+/// The two sides are materialization envelopes, not necessarily byte-for-byte
+/// textual correspondences. For example, a macro-argument rewrite may map a
+/// whole B-side macro expansion envelope to the compact argument text in the
+/// preserved source invocation that regenerates that expansion.
+struct MaterializedEditMapping {
+  uint64_t modifiedPreprocessedBegin = 0;
+  uint64_t modifiedPreprocessedEnd = 0;
+  uint64_t refoldedSourceBegin = 0;
+  uint64_t refoldedSourceEnd = 0;
+};
+
 
 /// \brief Deterministic refolder that projects edits made to raw preprocessed
 /// C back onto the original translation unit (TU) without re-running the
@@ -204,7 +222,9 @@ public:
   static Expected<std::string>
   Refold(const json::Object &rootJson, StringRef aSource, ArrayRef<PPTok> aToks,
          ArrayRef<size_t> aTokOff, StringRef bSource, ArrayRef<PPTok> bToks,
-         ArrayRef<size_t> bTokOff, bool noLines, bool strict);
+         ArrayRef<size_t> bTokOff, bool noLines, bool strict,
+         std::vector<MaterializedEditMapping> *materializedEditMappings =
+             nullptr);
 
   /// Build lexer language options from the producer-captured language name.
   static clang::LangOptions MakeLexLangOptions(llvm::StringRef langName);
@@ -217,6 +237,7 @@ private:
   LineDirectiveInserter lineDirs_;
   bool strict_;
   LangOptions lexLang_;
+  std::vector<MaterializedEditMapping> *materializedEditMappings_ = nullptr;
 
   /// \brief Explicit classification for the remaining terminal fallback exits.
   ///
@@ -800,11 +821,14 @@ private:
   RefoldEngine(RefoldModel model, StringRef aSource, ArrayRef<PPTok> aToks,
                ArrayRef<size_t> aTokOff, StringRef bSource,
                ArrayRef<PPTok> bToks, ArrayRef<size_t> bTokOff, bool noLines,
-               bool strict)
+               bool strict,
+               std::vector<MaterializedEditMapping> *materializedEditMappings =
+                   nullptr)
       : model_(std::move(model)), aSource_(aSource), bSource_(bSource),
         aToks_(aToks), bToks_(bToks), aTokOff_(aTokOff), bTokOff_(bTokOff),
         lineDirs_(!noLines, model_.GetPPCwd()), strict_(strict),
-        lexLang_(MakeLexLangOptions(model_.GetPPLang())) {
+        lexLang_(MakeLexLangOptions(model_.GetPPLang())),
+        materializedEditMappings_(materializedEditMappings) {
     BuildMacroInvocationGraph();
   }
 
@@ -891,6 +915,20 @@ private:
     std::optional<uint64_t> directTURawEnd = std::nullopt;
     std::optional<uint64_t> directTUFinalStart = std::nullopt;
     std::optional<uint64_t> directTUFinalEnd = std::nullopt;
+
+    // Optional B-side byte range for the materialized replacement. This is set
+    // by the producer of the final edit surface, then consumed only by the
+    // optional sidecar mapping writer at the final TU emission boundary.
+    std::optional<uint64_t> materializedBByteBegin = std::nullopt;
+    std::optional<uint64_t> materializedBByteEnd = std::nullopt;
+
+    // Optional byte range inside `text` that should be reported as the
+    // refolded-output side of the materialized edit map. Most edits map to
+    // their whole replacement text. Invocation-preserving macro rewrites can
+    // replace a full callsite while only the rewritten argument envelope is the
+    // source surface corresponding to the B-side materialization witness.
+    std::optional<uint64_t> materializedOutputTextBegin = std::nullopt;
+    std::optional<uint64_t> materializedOutputTextEnd = std::nullopt;
   };
 
   // Result of planning header-local edits for one include. When
@@ -2167,6 +2205,25 @@ private:
     // case on the patch so Patch C can treat that deterministic replay as an
     // authoritative proof source at the converted selector sites.
     bool pasteReplayValidated = false;
+
+    // B-token envelope that corresponds to the materialized B-side surface for
+    // this physical callsite patch. Whole-cover patches stamp the exact replay
+    // envelope. Structure-preserving macro patches may also stamp the whole
+    // expansion envelope when a compact invocation-argument rewrite represents
+    // that expansion in the refolded source. Narrow pure-insertion patches leave
+    // this unset so final emission can map only the inserted payload bytes.
+    bool hasMaterializedBTokenRange = false;
+    uint64_t materializedBTokStart = 0;
+    uint64_t materializedBTokEnd = 0;
+
+    // Optional byte range inside `replacement` that is the output-side surface
+    // corresponding to the materialized B witness. This is deliberately
+    // separate from invStart/invEnd: a structure-preserving macro patch may
+    // physically rewrite the whole invocation while the B edit maps only to
+    // the rewritten argument envelope inside that invocation.
+    bool hasMaterializedOutputByteRange = false;
+    uint64_t materializedOutputByteStart = 0;
+    uint64_t materializedOutputByteEnd = 0;
 
     // Layer-6 mixed-owner decomposition certificate metadata.
     bool ownerCertPresent = false;
@@ -4959,7 +5016,46 @@ private:
   std::string ApplyTextEditsWithPendingResync(
       StringRef originalFileText, ArrayRef<TextEdit> edits,
       DenseSet<uint64_t> *appliedExpandedMacroRootIds = nullptr,
-      StringRef emissionOwner = StringRef()) const;
+      StringRef emissionOwner = StringRef(),
+      std::vector<MaterializedEditMapping> *materializedEditMappings =
+          nullptr) const;
+
+  /// Convert a B-token range into a half-open B-byte range.
+  std::optional<std::pair<uint64_t, uint64_t>>
+  BTokenRangeToByteRange(uint64_t bTokBegin, uint64_t bTokEnd) const;
+
+  /// Stamp a TextEdit with the B-byte range of the materialized surface.
+  void StampTextEditMaterializedBByteRange(TextEdit &edit, uint64_t begin,
+                                           uint64_t end) const;
+
+  /// Stamp a TextEdit with the B-byte range described by a B-token envelope.
+  void StampTextEditMaterializedBTokenRange(TextEdit &edit,
+                                            uint64_t bTokBegin,
+                                            uint64_t bTokEnd) const;
+
+  /// Stamp a TextEdit with the replacement-text subrange to report on the
+  /// refolded-output side of the optional materialized edit map.
+  void StampTextEditMaterializedOutputTextRange(TextEdit &edit,
+                                                uint64_t begin,
+                                                uint64_t end) const;
+
+  /// Return the replacement-text subrange to report for a final TextEdit.
+  std::optional<std::pair<uint64_t, uint64_t>>
+  TextEditMaterializedOutputTextRange(const TextEdit &edit) const;
+
+  /// Return the replacement-text subrange to report for a macro patch.
+  std::optional<std::pair<uint64_t, uint64_t>>
+  MacroPatchMaterializedOutputTextRange(const MacroPatch &patch) const;
+
+  /// Return the B-byte range carried by a final TextEdit, recovering direct TU
+  /// hunk ranges from token provenance when the byte range was not pre-stamped.
+  std::optional<std::pair<uint64_t, uint64_t>>
+  TextEditMaterializedBByteRange(const TextEdit &edit) const;
+
+  /// Return the B-byte range for a macro patch, using its stamped envelope when
+  /// present and falling back to the macro's mapped expansion cover otherwise.
+  std::optional<std::pair<uint64_t, uint64_t>>
+  MacroPatchMaterializedBByteRange(const MacroPatch &patch) const;
 
   /// \brief Return whether an emitted non-terminal byte edit is backed only by
   /// emission-discharged normalized accepted-result carriers.
