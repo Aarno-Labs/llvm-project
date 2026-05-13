@@ -21,6 +21,57 @@
 //
 //===----------------------------------------------------------------------===//
 
+
+/// Return true iff `text` is only whitespace and complete C/C++ comments.
+///
+/// TU include-closure may preserve such gaps as inert source trivia while
+/// replacing the surrounding include directive run. The parser is deliberately
+/// strict: unterminated comments and any lexer-visible spelling remain outside
+/// this proof class and continue to fail closed.
+static bool isWhitespaceOrCompleteCommentTrivia(StringRef text) {
+  size_t i = 0;
+  const size_t n = text.size();
+
+  while (i < n) {
+    if (stringutils::isWs(text[i])) {
+      ++i;
+      continue;
+    }
+
+    if (i + 1 >= n || text[i] != '/')
+      return false;
+
+    if (text[i + 1] == '*') {
+      i += 2;
+      bool closed = false;
+      while (i + 1 < n) {
+        if (text[i] == '*' && text[i + 1] == '/') {
+          i += 2;
+          closed = true;
+          break;
+        }
+        ++i;
+      }
+      if (!closed)
+        return false;
+      continue;
+    }
+
+    if (text[i + 1] == '/') {
+      i += 2;
+      while (i < n && text[i] != '\n')
+        ++i;
+      if (i < n)
+        ++i;
+      continue;
+    }
+
+    return false;
+  }
+
+  return true;
+}
+
 std::string RefoldEngine::FormatExpansionClosureWitness(
     const ExpansionClosureWitness &witness) const {
   // Keep fallback-witness logging compact and mechanically comparable so the
@@ -753,6 +804,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     return std::nullopt;
   }
 
+  std::string preservedGapTrivia;
   uint64_t sourceCursor = first->siteB;
   for (const RefoldModel::IncludeItem *inc : touched) {
     if (inc->siteB < sourceCursor || inc->siteE > tuBytes.size() ||
@@ -764,17 +816,26 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       return std::nullopt;
     }
 
-    // The TU closure may absorb only the include directives themselves plus
-    // whitespace between neighboring directives. Comments or other spelled TU
-    // text would require a richer source-frontier proof.
+    // The TU closure may absorb only include directives plus inert trivia
+    // between neighboring directives. Whitespace is already source-neutral;
+    // complete comments are admitted only because the emitted edit preserves
+    // their bytes verbatim instead of silently deleting user-written text.
     if (inc->siteB > sourceCursor) {
       StringRef gap = tuBytes.slice(sourceCursor, inc->siteB);
       if (!gap.empty() && !stringutils::isWhitespace(gap)) {
+        if (!isWhitespaceOrCompleteCommentTrivia(gap)) {
+          trace("fallback",
+                "TU include-closure rejected: non-trivia TU gap between "
+                "include directives before inc#{0} gap='{1}'",
+                inc->id, stringutils::showWSWithClip(gap, 120));
+          return std::nullopt;
+        }
+
+        preservedGapTrivia.append(gap.begin(), gap.end());
         trace("fallback",
-              "TU include-closure rejected: non-whitespace TU gap between "
-              "include directives before inc#{0} gap='{1}'",
+              "TU include-closure preserving inert trivia gap before inc#{0} "
+              "gap='{1}'",
               inc->id, stringutils::showWSWithClip(gap, 120));
-        return std::nullopt;
       }
     }
 
@@ -793,17 +854,46 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     return std::nullopt;
   }
 
-  if (h.bStart < bEnvelope->first || h.bEnd > bEnvelope->second) {
+  auto bMaterialBegin = bEnvelope->first;
+  auto bMaterialEnd = bEnvelope->second;
+
+  // Canonical A-cover projection can include stable boundary tokens that are
+  // outside the include cover, such as the `{` before an include run inside an
+  // initializer. The source edit starts at the first include directive, so such
+  // outside anchors must not be materialized or they would be duplicated in the
+  // TU. Trim only B tokens that are proven stable and mapped to A tokens outside
+  // the include cover; unmatched B tokens and stable tokens inside the cover
+  // remain part of the realization payload.
+  auto bTokenMapsOutsideCover = [&](size_t bTok) -> bool {
+    if (bTok >= abTokMapB2A_.size())
+      return false;
+    const int64_t mappedA = abTokMapB2A_[bTok];
+    if (mappedA < 0)
+      return false;
+    const uint64_t aTok = static_cast<uint64_t>(mappedA);
+    return aTok < coverBegin || aTok >= coverEnd;
+  };
+
+  while (bMaterialBegin < bMaterialEnd &&
+         bTokenMapsOutsideCover(bMaterialBegin))
+    ++bMaterialBegin;
+  while (bMaterialBegin < bMaterialEnd &&
+         bTokenMapsOutsideCover(bMaterialEnd - 1))
+    --bMaterialEnd;
+
+  if (h.bStart < bMaterialBegin || h.bEnd > bMaterialEnd) {
     trace("fallback",
-          "TU include-closure rejected: hunk B=[{0},{1}) is outside "
-          "include-cover B envelope [{2},{3})",
-          h.bStart, h.bEnd, bEnvelope->first, bEnvelope->second);
+          "TU include-closure rejected: hunk B=[{0},{1}) is outside trimmed "
+          "include-cover B material [{2},{3}) from envelope [{4},{5})",
+          h.bStart, h.bEnd, bMaterialBegin, bMaterialEnd, bEnvelope->first,
+          bEnvelope->second);
     return std::nullopt;
   }
 
-  std::string replacement =
-      SliceBSource(bEnvelope->first, bEnvelope->second).str();
-  std::string rawReplacement = replacement;
+  std::string rawReplacement = SliceBSource(bMaterialBegin, bMaterialEnd).str();
+  std::string replacement = rawReplacement;
+  if (!preservedGapTrivia.empty())
+    replacement.append(preservedGapTrivia.begin(), preservedGapTrivia.end());
 
   // The closure begins at the exact include-directive run proved above, but we
   // may later extend its right edge over immediately following untouched TU
