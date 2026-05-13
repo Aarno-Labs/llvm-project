@@ -1120,6 +1120,161 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     return true;
   };
 
+
+  auto ppSpanInsideHeaderMaterial = [&](const RefoldModel::PPSpan &span,
+                                        uint64_t materialBeginA,
+                                        uint64_t materialEndA) {
+    if (!span.IsValid() || span.begin >= span.end)
+      return true;
+    return materialBeginA <= span.begin && span.end <= materialEndA;
+  };
+
+  auto headerArmIsSameOrNestedUnder = [&](const RefoldModel::ArmRef &candidate,
+                                          uint64_t ancestorArmId) {
+    if (!candidate.group || !candidate.arm)
+      return false;
+    if (candidate.arm->id == ancestorArmId)
+      return true;
+
+    // FindArmRefAtPP() reports the innermost selected arm that owns a token.
+    // When proving that an outer header conditional group is wholly consumed,
+    // tokens in nested selected arms still count as effective material of the
+    // outer arm. Walk parent-arm links until either the queried arm is found or
+    // the chain leaves the nested conditional tree.
+    const RefoldModel::CondGroup *group = candidate.group;
+    while (group && group->parentArmId) {
+      if (*group->parentArmId == ancestorArmId)
+        return true;
+      std::optional<RefoldModel::ArmRef> parent =
+          model_.GetArmRefById(*group->parentArmId);
+      if (!parent || !parent->group)
+        break;
+      group = parent->group;
+    }
+    return false;
+  };
+
+  auto headerSelectedArmEffectiveMaterialInside =
+      [&](const RefoldModel::CondArm &arm, uint64_t materialBeginA,
+          uint64_t materialEndA) {
+    bool sawEffectiveMaterial = false;
+    for (uint64_t pp = 0; pp < aToks_.size(); ++pp) {
+      std::optional<RefoldModel::ArmRef> owner = model_.FindArmRefAtPP(pp);
+      if (!owner || !headerArmIsSameOrNestedUnder(*owner, arm.id))
+        continue;
+
+      sawEffectiveMaterial = true;
+      if (pp < materialBeginA || pp >= materialEndA)
+        return false;
+    }
+
+    // Prefer effective PP ownership when the map can answer it, because the
+    // direct arm span may omit include- or macro-produced tokens controlled by
+    // this arm. Fall back to the direct span only for older/sparse maps.
+    if (sawEffectiveMaterial)
+      return true;
+    return arm.span && arm.span->IsValid() && arm.span->begin < arm.span->end &&
+           ppSpanInsideHeaderMaterial(*arm.span, materialBeginA, materialEndA);
+  };
+
+  auto headerConditionalGroupIsConsumedSourceEnvelope =
+      [&](const RefoldModel::CondGroup &group, uint64_t materialBeginA,
+          uint64_t materialEndA) {
+    if (!PathsEqual(group.file, file))
+      return false;
+    if (!group.parentIncludeId || *group.parentIncludeId != ie.include->id)
+      return false;
+    if (group.groupB >= group.groupE || group.groupE > headerText.size())
+      return false;
+
+    // This is the source-bearing counterpart of the zero-token conditional gap
+    // proof.  The complete directive group may become a source-envelope piece
+    // only when the selected arm's effective PP material is wholly consumed by
+    // the A-side replacement material.  Otherwise copying/removing the group
+    // would move surviving tokens across conditional-control structure.
+    for (const RefoldModel::CondArm &arm : group.arms) {
+      if (!arm.selected)
+        continue;
+      if (headerSelectedArmEffectiveMaterialInside(arm, materialBeginA,
+                                                  materialEndA))
+        return true;
+    }
+    return false;
+  };
+
+  auto headerMacroInvocationIsConsumedSourceEnvelope =
+      [&](const RefoldModel::MacroInvocation &m, uint64_t materialBeginA,
+          uint64_t materialEndA) {
+    if (!m.invFile || m.invFile->empty() || !PathsEqual(*m.invFile, file))
+      return false;
+    if (!m.ownerIncludeId || *m.ownerIncludeId != ie.include->id)
+      return false;
+    if (!m.invB || !m.invE || *m.invB >= *m.invE ||
+        *m.invE > headerText.size())
+      return false;
+    if (m.invText && StringRef(headerText).slice(*m.invB, *m.invE) != *m.invText)
+      return false;
+
+    bool sawMaterializedSpan = false;
+    auto checkSpan = [&](const RefoldModel::PPSpan &span) {
+      if (!span.IsValid() || span.begin >= span.end)
+        return true;
+      sawMaterializedSpan = true;
+      return ppSpanInsideHeaderMaterial(span, materialBeginA, materialEndA);
+    };
+
+    // A source-bearing macro callsite is consumable only when every PP range
+    // the producer attributes to the invocation is covered by the replacement
+    // material. This prevents deleting a callsite whose expansion still has
+    // surviving output elsewhere in B.
+    for (const auto &span : m.spans)
+      if (!checkSpan(span))
+        return false;
+    for (const auto &span : m.bodySpans)
+      if (!checkSpan(span))
+        return false;
+    for (const auto &span : m.argSpans)
+      if (!checkSpan(span))
+        return false;
+    for (const auto &span : m.stringifySpans)
+      if (!checkSpan(span))
+        return false;
+    for (const auto &span : m.pasteSpans)
+      if (!checkSpan(span))
+        return false;
+
+    return sawMaterializedSpan;
+  };
+
+  auto headerMacroInvocationOverlapsMaterial =
+      [&](const RefoldModel::MacroInvocation &m, uint64_t materialBeginA,
+          uint64_t materialEndA) {
+    if (!m.invFile || m.invFile->empty() || !PathsEqual(*m.invFile, file))
+      return false;
+    if (!m.ownerIncludeId || *m.ownerIncludeId != ie.include->id)
+      return false;
+    if (!m.cover.IsValid() || m.cover.begin >= m.cover.end)
+      return false;
+    return materialBeginA < m.cover.end && m.cover.begin < materialEndA;
+  };
+
+  auto headerConditionalGroupSelectedMaterialOverlaps =
+      [&](const RefoldModel::CondGroup &group, uint64_t materialBeginA,
+          uint64_t materialEndA) {
+    if (!PathsEqual(group.file, file))
+      return false;
+    if (!group.parentIncludeId || *group.parentIncludeId != ie.include->id)
+      return false;
+    for (const RefoldModel::CondArm &arm : group.arms) {
+      if (!arm.selected || !arm.span || !arm.span->IsValid() ||
+          arm.span->begin >= arm.span->end)
+        continue;
+      if (materialBeginA < arm.span->end && arm.span->begin < materialEndA)
+        return true;
+    }
+    return false;
+  };
+
   auto replacementHeaderSuffixBoundaryAllowsDirectiveLine =
       [&](StringRef replacement, uint64_t sourceEnd) {
     if (sourceEnd > headerText.size())
@@ -1271,6 +1426,77 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     return true;
   };
 
+
+  auto tryBuildConsumedHeaderConditionalCoalescedPatch =
+      [&](size_t idx, IncludePatch &coalesced, size_t &skipThrough) {
+    if (idx + 1 >= ie.patches.size())
+      return false;
+
+    const IncludePatch &first = ie.patches[idx];
+    if (first.aStart >= first.aEnd)
+      return false;
+
+    // Some LCS shapes preserve a token from inside a selected conditional arm
+    // (for example the '=' in `int middle = 99;`) while adjacent hunks delete
+    // the rest of that arm.  Per-patch materialization cannot prove the whole
+    // #if/#endif envelope because no individual patch covers the selected arm.
+    // Merge the shortest adjacent patch run that does cover a complete selected
+    // header conditional group, then let the normal header source-envelope
+    // proof consume the group as one source piece.
+    for (size_t endIdx = idx + 1; endIdx < ie.patches.size(); ++endIdx) {
+      const IncludePatch &last = ie.patches[endIdx];
+      if (last.include != first.include)
+        break;
+      if (last.ownerHasCondArmCert != first.ownerHasCondArmCert)
+        break;
+      if (last.ownerHasCondArmCert &&
+          last.ownerCondArmIdCert != first.ownerCondArmIdCert)
+        break;
+      if (last.aStart >= last.aEnd || last.aEnd <= first.aStart)
+        break;
+      if (last.bEnd < first.bStart)
+        break;
+
+      const uint64_t materialBeginA = first.aStart;
+      const uint64_t materialEndA = last.aEnd;
+      bool consumesConditionalGroup = false;
+      bool overlapsConditionalGroup = false;
+      for (const auto &group : model_.GetConds()) {
+        if (!headerConditionalGroupSelectedMaterialOverlaps(
+                group, materialBeginA, materialEndA))
+          continue;
+        overlapsConditionalGroup = true;
+        if (headerConditionalGroupIsConsumedSourceEnvelope(
+                group, materialBeginA, materialEndA)) {
+          consumesConditionalGroup = true;
+          break;
+        }
+      }
+
+      if (overlapsConditionalGroup && !consumesConditionalGroup)
+        continue;
+      if (!consumesConditionalGroup)
+        continue;
+
+      coalesced = first;
+      coalesced.aEnd = materialEndA;
+      coalesced.bEnd = last.bEnd;
+      coalesced.insertBytes = sliceExactTokenCoverage(
+                                  bTokOff_, bToks_, bSource_, coalesced.bStart,
+                                  coalesced.bEnd)
+                                  .str();
+      skipThrough = endIdx;
+      trace("include/apply",
+            "file={0} coalesced patch[{1}..{2}] across consumed header "
+            "conditional group: A=[{3},{4}) B=[{5},{6})",
+            file, idx, skipThrough, coalesced.aStart, coalesced.aEnd,
+            coalesced.bStart, coalesced.bEnd);
+      return true;
+    }
+
+    return false;
+  };
+
   auto tryBuildMaterialChildStateCoalescedPatch =
       [&](size_t idx, IncludePatch &coalesced, size_t &skipThrough) {
     if (idx + 1 >= ie.patches.size())
@@ -1358,7 +1584,9 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     IncludePatch coalescedPatch = ie.patches[idx];
     size_t skipThrough = idx;
     const IncludePatch *patchPtr = &ie.patches[idx];
-    if (tryBuildMaterialChildStateCoalescedPatch(idx, coalescedPatch,
+    if (tryBuildConsumedHeaderConditionalCoalescedPatch(idx, coalescedPatch,
+                                                       skipThrough) ||
+        tryBuildMaterialChildStateCoalescedPatch(idx, coalescedPatch,
                                                  skipThrough)) {
       patchPtr = &coalescedPatch;
       for (size_t skipIdx = idx + 1; skipIdx <= skipThrough; ++skipIdx)
@@ -1951,9 +2179,54 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         hasPartialChildIncludeOverlap = true;
       }
 
+
+      bool hasCompleteMacroInvocationPiece = false;
+      bool hasCompleteConditionalGroupPiece = false;
+      bool hasPartialMacroInvocationOverlap = false;
+      bool hasPartialConditionalGroupOverlap = false;
+
+      for (const auto &macro : model_.GetMacroInvocations()) {
+        if (!headerMacroInvocationOverlapsMaterial(macro, fullLo, fullHi))
+          continue;
+        if (headerMacroInvocationIsConsumedSourceEnvelope(macro, fullLo,
+                                                          fullHi)) {
+          hasCompleteMacroInvocationPiece = true;
+          hunkSourcePieces.push_back({*macro.invB, *macro.invE,
+                                      macro.cover.begin, macro.cover.end,
+                                      macro.id, "macro-invocation"});
+          continue;
+        }
+
+        // A partial source-bearing macro overlap means the parent header edit
+        // would delete only part of the callsite's produced material.  That is
+        // not a source-envelope proof; require a stronger/coalesced candidate.
+        hasPartialMacroInvocationOverlap = true;
+      }
+
+      for (const auto &group : model_.GetConds()) {
+        if (!headerConditionalGroupSelectedMaterialOverlaps(group, fullLo,
+                                                            fullHi))
+          continue;
+        if (headerConditionalGroupIsConsumedSourceEnvelope(group, fullLo,
+                                                           fullHi)) {
+          hasCompleteConditionalGroupPiece = true;
+          hunkSourcePieces.push_back({group.groupB, group.groupE, fullLo,
+                                      fullHi, group.id, "conditional-group"});
+          continue;
+        }
+
+        // The hunk touches selected conditional output but does not consume the
+        // selected arm.  Do not widen across the directive wrapper unless a
+        // coalesced patch can prove the whole group is replaced.
+        hasPartialConditionalGroupOverlap = true;
+      }
+
       const bool shouldTryFullHeaderEnvelope =
-          declClippedNonEmptyPatch || hasCompleteChildIncludePiece;
-      if (shouldTryFullHeaderEnvelope && !hasPartialChildIncludeOverlap) {
+          declClippedNonEmptyPatch || hasCompleteChildIncludePiece ||
+          hasCompleteMacroInvocationPiece || hasCompleteConditionalGroupPiece;
+      if (shouldTryFullHeaderEnvelope && !hasPartialChildIncludeOverlap &&
+          !hasPartialMacroInvocationOverlap &&
+          !hasPartialConditionalGroupOverlap) {
         llvm::sort(hunkSourcePieces,
                    [](const HeaderSourceEnvelopePiece &lhs,
                       const HeaderSourceEnvelopePiece &rhs) {
@@ -1980,6 +2253,23 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
             // Tokens produced by a child include are owned by the child site.
             // Once the complete child include is a source-envelope piece, any
             // mapped child token inside that site is not a second parent piece.
+            continue;
+          }
+          if (outer.begin <= piece.begin && piece.end <= outer.end &&
+              outer.kind == "macro-invocation" && piece.kind == "token") {
+            // Macro-expanded tokens often map to the macro callsite spelling.
+            // Once the complete source-bearing invocation is proved consumed,
+            // those mapped token intervals are internal evidence, not separate
+            // parent-header source pieces.
+            continue;
+          }
+          if (outer.begin <= piece.begin && piece.end <= outer.end &&
+              outer.kind == "conditional-group" &&
+              (piece.kind == "token" || piece.kind == "macro-invocation" ||
+               piece.kind == "child-include")) {
+            // A consumed conditional group owns the selected-arm source inside
+            // its directive wrapper.  Nested token/macro/include pieces inside
+            // the group are covered by the group-level source-envelope proof.
             continue;
           }
 
