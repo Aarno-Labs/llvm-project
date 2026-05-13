@@ -2262,6 +2262,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     return true;
   };
 
+  std::string mixedPreservedConditionalControlTrivia;
+
   // Prove a mixed TU/include closure.
   //
   // This handles a single replacement hunk whose A-side tokens are split
@@ -2329,6 +2331,54 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       return materialBeginA <= span.begin && span.end <= materialEndA;
     };
 
+    auto armIsSameOrNestedUnder = [&](const RefoldModel::ArmRef &candidate,
+                                      uint64_t ancestorArmId) -> bool {
+      if (!candidate.group || !candidate.arm)
+        return false;
+      if (candidate.arm->id == ancestorArmId)
+        return true;
+
+      // `FindArmRefAtPP()` intentionally returns the innermost selected arm for
+      // a PP token.  When deciding whether an outer selected arm is completely
+      // consumed, tokens owned by nested selected arms still belong to the
+      // outer arm's effective material.  Walk parent-arm links from the
+      // innermost group back toward the TU and accept any descendant of the
+      // queried arm.
+      const RefoldModel::CondGroup *group = candidate.group;
+      while (group && group->parentArmId) {
+        if (*group->parentArmId == ancestorArmId)
+          return true;
+        std::optional<RefoldModel::ArmRef> parent =
+            model_.GetArmRefById(*group->parentArmId);
+        if (!parent || !parent->group)
+          break;
+        group = parent->group;
+      }
+      return false;
+    };
+
+    auto selectedArmEffectiveMaterialInside =
+        [&](const RefoldModel::CondArm &arm) -> bool {
+      bool sawEffectiveMaterial = false;
+      for (uint64_t pp = 0; pp < aToks_.size(); ++pp) {
+        std::optional<RefoldModel::ArmRef> owner = model_.FindArmRefAtPP(pp);
+        if (!owner || !armIsSameOrNestedUnder(*owner, arm.id))
+          continue;
+
+        sawEffectiveMaterial = true;
+        if (pp < materialBeginA || pp >= materialEndA)
+          return false;
+      }
+
+      // Prefer the effective ownership proof when it found material.  For older
+      // maps that cannot answer PP ownership, fall back to the recorded direct
+      // span so existing exact whole-arm closures keep their previous domain.
+      if (sawEffectiveMaterial)
+        return true;
+      return arm.span && arm.span->IsValid() &&
+             arm.span->begin < arm.span->end && ppSpanInsideMaterial(*arm.span);
+    };
+
     auto macroInvocationMaterialIsConsumed =
         [&](const RefoldModel::MacroInvocation &m,
             std::optional<uint64_t> sourceBeginBound = std::nullopt,
@@ -2391,11 +2441,9 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
 
       bool consumesSelectedArm = false;
       for (const RefoldModel::CondArm &arm : group.arms) {
-        if (!arm.selected || !arm.span || !arm.span->IsValid() ||
-            arm.span->begin >= arm.span->end)
+        if (!arm.selected)
           continue;
-        if (materialBeginA <= arm.span->begin &&
-            arm.span->end <= materialEndA) {
+        if (selectedArmEffectiveMaterialInside(arm)) {
           consumesSelectedArm = true;
           break;
         }
@@ -2467,6 +2515,113 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     // widening this far does not silently consume meaningful unrelated source.
     sourceBegin = mergedPieces.front().first;
     sourceEnd = mergedPieces.back().second;
+
+    auto gapHasMappedTUToken = [&](uint64_t gapBegin,
+                                   uint64_t gapEnd) -> bool {
+      for (const auto &entry : model_.GetTokmap()) {
+        if (!PathsEqual(entry.file, tuPath))
+          continue;
+        if (entry.b < gapEnd && gapBegin < entry.e)
+          return true;
+      }
+      return false;
+    };
+
+    auto gapHasRecordedNonConditionalArtifact = [&](uint64_t gapBegin,
+                                                    uint64_t gapEnd) -> bool {
+      auto overlapsGap = [&](uint64_t begin, uint64_t end) {
+        return begin < gapEnd && gapBegin < end;
+      };
+
+      for (const auto &inc : model_.GetIncludes())
+        if (PathsEqual(inc.sitePath, tuPath) && overlapsGap(inc.siteB, inc.siteE))
+          return true;
+      for (const auto &m : model_.GetMacroInvocations())
+        if (m.invFile && PathsEqual(*m.invFile, tuPath) && m.invB && m.invE &&
+            overlapsGap(*m.invB, *m.invE))
+          return true;
+      for (const auto &directive : model_.GetMacroDirectives())
+        if (PathsEqual(directive.sitePath, tuPath) &&
+            overlapsGap(directive.siteB, directive.siteE))
+          return true;
+      for (const auto &pragma : model_.GetPragmas())
+        if (PathsEqual(pragma.sitePath, tuPath) &&
+            overlapsGap(pragma.siteB, pragma.siteE))
+          return true;
+      return false;
+    };
+
+    auto gapIsRecordedConditionalControlTail = [&](uint64_t gapBegin,
+                                                   uint64_t gapEnd) -> bool {
+      if (!h.isDeleteOnly() || gapBegin >= gapEnd || gapEnd > tuBytes.size())
+        return false;
+      if (gapHasMappedTUToken(gapBegin, gapEnd) ||
+          gapHasRecordedNonConditionalArtifact(gapBegin, gapEnd))
+        return false;
+
+      const RefoldModel::CondGroup *owningGroup = nullptr;
+      for (const auto &group : model_.GetConds()) {
+        if (!PathsEqual(group.file, tuPath) || group.parentIncludeId)
+          continue;
+        if (group.groupB < gapBegin && gapBegin < group.groupE &&
+            gapEnd == group.groupE) {
+          owningGroup = &group;
+          break;
+        }
+      }
+      if (!owningGroup)
+        return false;
+
+      StringRef text = tuBytes.slice(gapBegin, gapEnd);
+      size_t cursor = 0;
+      bool sawEndif = false;
+      bool atLineStart = stringutils::beginsLineAfterWs(tuBytes, gapBegin);
+      while (cursor < text.size()) {
+        char ch = text[cursor];
+        if (stringutils::isWs(ch)) {
+          atLineStart = ch == '\n' || ch == '\r';
+          ++cursor;
+          continue;
+        }
+        if (ch != '#' || !atLineStart)
+          return false;
+
+        size_t lineEnd = cursor;
+        while (lineEnd < text.size() && text[lineEnd] != '\n')
+          ++lineEnd;
+        const bool hasNewline = lineEnd < text.size();
+        if (hasNewline)
+          ++lineEnd;
+
+        StringRef line = text.slice(cursor, lineEnd);
+        if (line.ends_with("\n"))
+          line = line.drop_back();
+        if (line.ends_with("\r"))
+          line = line.drop_back();
+        StringRef rest = line.ltrim(" \t\v\f");
+        if (!rest.consume_front("#"))
+          return false;
+        rest = rest.ltrim(" \t\v\f");
+        if (!rest.consume_front("endif"))
+          return false;
+        rest = rest.trim(" \t\v\f");
+        if (!rest.empty())
+          return false;
+
+        sawEndif = true;
+        cursor = lineEnd;
+        atLineStart = true;
+      }
+
+      if (!sawEndif)
+        return false;
+
+      trace("fallback",
+            "TU/include closure preserving conditional-control tail "
+            "source=[{0},{1}) group={2}",
+            gapBegin, gapEnd, owningGroup->id);
+      return true;
+    };
 
     // Do not silently delete any include directive other than the run whose
     // expansion is explicitly part of this closure.  A complete unrelated
@@ -2549,9 +2704,14 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     for (const auto &piece : mergedPieces) {
       if (piece.first > cursor) {
         StringRef gap = tuBytes.slice(cursor, piece.first);
-        if (!isPreservableIncludeClosureGapTrivia(gap) &&
-            !gapIsConsumableZeroTokenSourceClosure(
-                cursor, piece.first, /*allowTUConditionalControl=*/true)) {
+        const bool preserveConditionalControlTail =
+            gapIsRecordedConditionalControlTail(cursor, piece.first);
+        if (preserveConditionalControlTail) {
+          mixedPreservedConditionalControlTrivia.append(gap.begin(), gap.end());
+        } else if (!isPreservableIncludeClosureGapTrivia(gap) &&
+                   !gapIsConsumableZeroTokenSourceClosure(
+                       cursor, piece.first,
+                       /*allowTUConditionalControl=*/true)) {
           if (std::optional<std::string> pragmaReason =
                   nonConsumableTUPragmaGapReason(cursor, piece.first)) {
             trace("fallback", "TU/include closure rejected: {0}",
@@ -2682,7 +2842,21 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   auto bEnvelope = ResolveIncludeRealizationBTokenEnvelope(materialBeginA,
                                                            materialEndA,
                                                            &evidenceKind);
-  if (!bEnvelope && materialBeginA == h.aStart && materialEndA == h.aEnd) {
+  if (h.isDeleteOnly() && materialBeginA == h.aStart &&
+      materialEndA == h.aEnd) {
+    // A delete-only exact closure has no edited B material by definition.  Do
+    // not let a neighbor-based cover projection reintroduce adjacent surviving
+    // tokens into the replacement; any source-control bytes that must survive
+    // are carried explicitly as preserved trivia below.
+    bEnvelope = std::make_pair(static_cast<size_t>(h.bStart),
+                               static_cast<size_t>(h.bEnd));
+    evidenceKind = IncludeRealizationEvidenceKind::CanonicalBCoverEnvelope;
+    trace("fallback",
+          "TU/include closure using exact delete hunk B envelope: "
+          "A=[{0},{1}) B=[{2},{3})",
+          materialBeginA, materialEndA, h.bStart, h.bEnd);
+  } else if (!bEnvelope && materialBeginA == h.aStart &&
+             materialEndA == h.aEnd) {
     bEnvelope = std::make_pair(static_cast<size_t>(h.bStart),
                                static_cast<size_t>(h.bEnd));
     evidenceKind = IncludeRealizationEvidenceKind::CanonicalBCoverEnvelope;
@@ -2738,6 +2912,19 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
 
   std::string rawReplacement = SliceBSource(bMaterialBegin, bMaterialEnd).str();
   std::string replacement = rawReplacement;
+
+  // Delete-only mixed closures may span a conditional-control tail that must
+  // remain in the TU even though the source pieces on both sides are consumed.
+  // Such bytes are admitted only when they are a complete recorded #endif tail
+  // with no mapped PP tokens or unrelated source artifacts in the gap.
+  if (!mixedPreservedConditionalControlTrivia.empty()) {
+    if (startsWithPreprocessorDirectiveTrivia(
+            mixedPreservedConditionalControlTrivia) &&
+        !replacement.empty() && replacement.back() != '\n')
+      replacement.push_back('\n');
+    replacement.append(mixedPreservedConditionalControlTrivia.begin(),
+                       mixedPreservedConditionalControlTrivia.end());
+  }
 
   // Preserve legacy inert trivia between touched include directives.  Empty
   // includes admitted by the gap proof above are deliberately not appended here:
