@@ -653,40 +653,83 @@ static bool sourceSuffixMayObservePresumedFileSpelling(
 /// operator inside a source-only line-control directive.
 ///
 /// This is the small, proof-local subset of C macro stringification needed for
-/// line-control operands.  It normalizes leading/trailing and internal
-/// whitespace in the invocation argument, then emits a C string token spelling
-/// for the resulting character sequence.  Inputs that would require the full
-/// preprocessor token stream to stringify correctly, such as comments, string
-/// or character literals, or explicit backslashes, fail closed.
+/// line-control operands.  It mirrors the observable pieces of the preprocessor
+/// stringification rule that can be proved from the complete recorded argument
+/// spelling: trim leading/trailing whitespace, collapse each run of inter-token
+/// whitespace to one space, preserve string/character literal token spelling,
+/// and finally quote the resulting character sequence as a C string token.
+///
+/// Explicit backslashes outside literals and comments still fail closed.  They
+/// require either tokenization before stringification or phase/comment state
+/// that this local source-gap proof does not model.
 static std::optional<std::string>
 stringifyLineControlMacroArgument(StringRef argument) {
-  // Comments are replaced by whitespace before macro stringification, but this
-  // local proof operates on recorded source spelling rather than a tokenized
-  // replacement stream.  Do not guess how comment bytes collapse.
-  if (argument.contains("//") || argument.contains("/*"))
-    return std::nullopt;
-
-  // Stringification has special escaping rules for quotes and backslashes that
-  // appear inside string/character literals.  Keep this proof to non-literal
-  // filename spellings such as `gap.c`; more complex operands need producer
-  // evidence for the already-stringified token.
-  if (argument.contains('\"') || argument.contains('\'') ||
-      argument.contains('\\'))
-    return std::nullopt;
-
   StringRef trimmed = argument.trim(" \t\v\f\r\n");
   std::string normalized;
   bool pendingSpace = false;
-  for (char ch : trimmed) {
+
+  auto appendPendingSpace = [&]() {
+    if (pendingSpace && !normalized.empty())
+      normalized.push_back(' ');
+    pendingSpace = false;
+  };
+
+  for (size_t pos = 0; pos < trimmed.size();) {
+    char ch = trimmed[pos];
+
     if (stringutils::isWs(ch)) {
       pendingSpace = !normalized.empty();
+      ++pos;
       continue;
     }
-    if (pendingSpace) {
-      normalized.push_back(' ');
-      pendingSpace = false;
+
+    // Comments are replaced by whitespace before macro stringification.  The
+    // current proof intentionally works from source bytes rather than a PP-token
+    // stream, so do not guess how a comment-bearing argument tokenizes.
+    if (ch == '/' && pos + 1 < trimmed.size() &&
+        (trimmed[pos + 1] == '/' || trimmed[pos + 1] == '*'))
+      return std::nullopt;
+
+    // A raw backslash outside a literal participates in translation phase 2 or
+    // an implementation-specific token spelling.  Keep this bounded proof to
+    // ordinary tokens plus escape-aware string/character literal tokens.
+    if (ch == '\\')
+      return std::nullopt;
+
+    if (ch == '\"' || ch == '\'') {
+      appendPendingSpace();
+
+      const char quote = ch;
+      const size_t literalBegin = pos;
+      ++pos;
+      bool closed = false;
+      while (pos < trimmed.size()) {
+        char litCh = trimmed[pos++];
+        if (litCh == '\n' || litCh == '\r')
+          return std::nullopt;
+        if (litCh == '\\') {
+          if (pos >= trimmed.size())
+            return std::nullopt;
+          char escaped = trimmed[pos++];
+          if (escaped == '\n' || escaped == '\r')
+            return std::nullopt;
+          continue;
+        }
+        if (litCh == quote) {
+          closed = true;
+          break;
+        }
+      }
+      if (!closed)
+        return std::nullopt;
+
+      normalized.append(trimmed.begin() + literalBegin, trimmed.begin() + pos);
+      continue;
     }
+
+    appendPendingSpace();
     normalized.push_back(ch);
+    ++pos;
   }
 
   return stringutils::quoteCString(normalized);
