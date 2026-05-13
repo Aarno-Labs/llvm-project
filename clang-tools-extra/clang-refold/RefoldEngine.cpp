@@ -268,11 +268,16 @@ static bool conditionalGroupIsNeutralIslandImpl(
     return false;
   }
 
-  for (const auto &directive : model.GetMacroDirectives())
-    if (policy.directiveBelongs(directive) &&
-        insideGroup(directive.siteB, directive.siteE) &&
-        !insideNeutralNestedConditional(directive.siteB, directive.siteE))
-      return false;
+  // Macro-state directives inside the preserved group are allowed.  Unlike a
+  // consumed opaque gap, a preserved complete conditional island carries the
+  // directive spelling forward in source order, so active #define/#undef state
+  // transitions remain visible to the suffix exactly through the source text
+  // that originally produced them.  Nested conditional islands already own
+  // their inner directives recursively, so there is no separate directive
+  // rejection here.  Pragmas remain fail-closed below because the refold map
+  // does not currently model their state domain precisely enough to prove that
+  // preserving the surrounding island preserves every relevant compiler state
+  // interaction.
 
   for (const auto &pragma : model.GetPragmas())
     if (policy.pragmaBelongs(pragma) &&
