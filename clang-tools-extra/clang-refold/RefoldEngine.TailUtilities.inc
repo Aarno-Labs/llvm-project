@@ -1155,8 +1155,217 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     return !needsLexicalSeparator(*leftTok, *rightTok, lexLang_);
   };
 
+
+  auto tokenRangesHaveSameSpelling = [&](uint64_t aBegin, uint64_t aEnd,
+                                           uint64_t bBegin, uint64_t bEnd) {
+    if (aEnd < aBegin || bEnd < bBegin ||
+        (aEnd - aBegin) != (bEnd - bBegin))
+      return false;
+    if (aEnd > static_cast<uint64_t>(aToks_.size()) ||
+        bEnd > static_cast<uint64_t>(bToks_.size()))
+      return false;
+    for (uint64_t i = 0; i < aEnd - aBegin; ++i)
+      if (aToks_[static_cast<size_t>(aBegin + i)].spelling !=
+          bToks_[static_cast<size_t>(bBegin + i)].spelling)
+        return false;
+    return true;
+  };
+
+  auto includeOwnsDirective = [&](const RefoldModel::MacroDirective &directive,
+                                  const RefoldModel::IncludeItem &root) {
+    if (!directive.ownerIncludeId)
+      return false;
+    if (*directive.ownerIncludeId == root.id)
+      return true;
+    for (const auto &inc : model_.GetIncludes())
+      if (inc.id == *directive.ownerIncludeId)
+        return headerIncludeIsDescendantOf(inc, root);
+    return false;
+  };
+
+  auto recordedMacroDirectiveMatchesOwnerFile =
+      [&](const RefoldModel::MacroDirective &directive) {
+    const RefoldModel::IncludeItem *owner = nullptr;
+    if (!directive.ownerIncludeId)
+      return false;
+    for (const auto &inc : model_.GetIncludes())
+      if (inc.id == *directive.ownerIncludeId) {
+        owner = &inc;
+        break;
+      }
+    if (!owner)
+      return false;
+
+    std::optional<std::string> name =
+        macroDirectiveNameFromRecordedText(directive);
+    if (!name)
+      return false;
+
+    StringRef text = directive.text;
+    size_t pos = 0;
+    stringutils::skipNonNewlineWs(text, pos);
+    if (pos >= text.size() || text[pos] != '#')
+      return false;
+    ++pos;
+    stringutils::skipNonNewlineWs(text, pos);
+
+    StringRef keyword = directive.subkind.drop_front();
+    if (!text.substr(pos).starts_with(keyword))
+      return false;
+    pos += keyword.size();
+    if (pos < text.size() && stringutils::isIdentPart(text[pos]))
+      return false;
+    stringutils::skipNonNewlineWs(text, pos);
+
+    const size_t nameTextBegin = pos;
+    if (!text.substr(pos).starts_with(*name))
+      return false;
+    if (directive.siteB < nameTextBegin)
+      return false;
+
+    const uint64_t fileBegin = directive.siteB - nameTextBegin;
+    const uint64_t fileEnd = fileBegin + text.size();
+    const std::string ownerPath = resolveHeaderPath(*owner);
+    auto bufOrErr = MemoryBuffer::getFile(lineDirs_.ToAbsolutePath(ownerPath));
+    if (!bufOrErr)
+      return false;
+    const MemoryBuffer &mb = **bufOrErr;
+    StringRef ownerBytes(mb.getBufferStart(), mb.getBufferSize());
+    if (fileBegin >= fileEnd || fileEnd > ownerBytes.size())
+      return false;
+    return ownerBytes.slice(fileBegin, fileEnd) == text;
+  };
+
+  auto collectMacroStatePreservationsFromIncludeSubtree =
+      [&](const RefoldModel::IncludeItem &root, StringRef replacement,
+          SmallVectorImpl<HeaderPreservedGapPiece> &out) {
+    SmallVector<HeaderPreservedGapPiece, 4> pieces;
+    for (const auto &directive : model_.GetMacroDirectives()) {
+      if (directive.subkind != "#define" && directive.subkind != "#undef")
+        continue;
+      if (!includeOwnsDirective(directive, root))
+        continue;
+
+      std::optional<std::string> name =
+          macroDirectiveNameFromRecordedText(directive);
+      if (!name)
+        return false;
+      if (rawIdentifierAppearsInHeaderReplacement(*name, replacement))
+        return false;
+      if (!recordedMacroDirectiveMatchesOwnerFile(directive))
+        return false;
+
+      HeaderPreservedGapPiece piece;
+      piece.kind = HeaderPreservedGapPiece::Kind::MacroStateDirective;
+      piece.directive = &directive;
+      piece.id = directive.id;
+      piece.macroName = std::move(*name);
+      pieces.push_back(std::move(piece));
+    }
+
+    llvm::sort(pieces, [](const HeaderPreservedGapPiece &lhs,
+                          const HeaderPreservedGapPiece &rhs) {
+      return lhs.id < rhs.id;
+    });
+    out.append(pieces.begin(), pieces.end());
+    return true;
+  };
+
+  auto tryBuildMaterialChildStateCoalescedPatch =
+      [&](size_t idx, IncludePatch &coalesced, size_t &skipThrough) {
+    if (idx + 1 >= ie.patches.size())
+      return false;
+
+    const IncludePatch &first = ie.patches[idx];
+    const IncludePatch &second = ie.patches[idx + 1];
+    if (first.include != second.include)
+      return false;
+    if (first.ownerHasCondArmCert != second.ownerHasCondArmCert)
+      return false;
+    if (first.ownerHasCondArmCert &&
+        first.ownerCondArmIdCert != second.ownerCondArmIdCert)
+      return false;
+    if (first.aStart >= first.aEnd || second.aStart >= second.aEnd)
+      return false;
+    if (second.aEnd <= first.aStart || second.bEnd < first.bStart)
+      return false;
+
+    for (const auto &child : model_.GetIncludes()) {
+      if (!child.parent || *child.parent != ie.include->id ||
+          !PathsEqual(child.sitePath, file) || !child.cover.IsValid())
+        continue;
+      if (child.cover.end <= child.cover.begin)
+        continue;
+
+      if (!(first.aStart < child.cover.begin &&
+            child.cover.begin < first.aEnd &&
+            first.aEnd <= second.aStart &&
+            second.aStart < child.cover.end &&
+            child.cover.end < second.aEnd))
+        continue;
+
+      uint64_t prefix = 0;
+      while (first.aStart + prefix < child.cover.begin &&
+             first.bStart + prefix < second.bEnd &&
+             tokenRangesHaveSameSpelling(first.aStart + prefix,
+                                         first.aStart + prefix + 1,
+                                         first.bStart + prefix,
+                                         first.bStart + prefix + 1)) {
+        ++prefix;
+      }
+
+      if (first.aStart + prefix >= child.cover.begin ||
+          first.bStart + prefix > second.bEnd)
+        continue;
+
+      const uint64_t newAStart = first.aStart + prefix;
+      const uint64_t newBStart = first.bStart + prefix;
+      std::string newInsert = sliceExactTokenCoverage(
+                                  bTokOff_, bToks_, bSource_, newBStart,
+                                  second.bEnd)
+                                  .str();
+
+      SmallVector<HeaderPreservedGapPiece, 4> statePieces;
+      if (!collectMacroStatePreservationsFromIncludeSubtree(
+              child, StringRef(newInsert), statePieces) ||
+          statePieces.empty())
+        continue;
+
+      coalesced = first;
+      coalesced.aStart = newAStart;
+      coalesced.aEnd = second.aEnd;
+      coalesced.bStart = newBStart;
+      coalesced.bEnd = second.bEnd;
+      coalesced.insertBytes = std::move(newInsert);
+      skipThrough = idx + 1;
+      trace("include/apply",
+            "file={0} coalesced patch[{1}..{2}] across material child "
+            "include #{3}: A=[{4},{5}) B=[{6},{7})",
+            file, idx, skipThrough, child.id, coalesced.aStart,
+            coalesced.aEnd, coalesced.bStart, coalesced.bEnd);
+      return true;
+    }
+
+    return false;
+  };
+
+  DenseSet<size_t> skippedIncludePatchIndices;
+
   for (size_t idx = 0; idx < ie.patches.size(); ++idx) {
-    const IncludePatch &p = ie.patches[idx];
+    if (skippedIncludePatchIndices.count(idx))
+      continue;
+
+    IncludePatch coalescedPatch = ie.patches[idx];
+    size_t skipThrough = idx;
+    const IncludePatch *patchPtr = &ie.patches[idx];
+    if (tryBuildMaterialChildStateCoalescedPatch(idx, coalescedPatch,
+                                                 skipThrough)) {
+      patchPtr = &coalescedPatch;
+      for (size_t skipIdx = idx + 1; skipIdx <= skipThrough; ++skipIdx)
+        skippedIncludePatchIndices.insert(skipIdx);
+    }
+
+    const IncludePatch &p = *patchPtr;
     trace("include/patch", "computeIncludeTextEdits: patch={0}", p);
 
     // Record the local obligations discharged by each accepted
@@ -1231,21 +1440,6 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     uint64_t materialBStart = p.bStart;
     uint64_t materialBEnd = p.bEnd;
     std::string materialInsertBytes = p.insertBytes;
-
-    auto tokenRangesHaveSameSpelling = [&](uint64_t aBegin, uint64_t aEnd,
-                                           uint64_t bBegin, uint64_t bEnd) {
-      if (aEnd < aBegin || bEnd < bBegin ||
-          (aEnd - aBegin) != (bEnd - bBegin))
-        return false;
-      if (aEnd > static_cast<uint64_t>(aToks_.size()) ||
-          bEnd > static_cast<uint64_t>(bToks_.size()))
-        return false;
-      for (uint64_t i = 0; i < aEnd - aBegin; ++i)
-        if (aToks_[static_cast<size_t>(aBegin + i)].spelling !=
-            bToks_[static_cast<size_t>(bBegin + i)].spelling)
-          return false;
-      return true;
-    };
 
     // If a replacement hunk starts by re-emitting the exact tokens of a
     // complete child include, keep that include as the survivor and remove the
@@ -1795,6 +1989,18 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         hunkSourcePieces = std::move(outerPieces);
 
         SmallVector<HeaderPreservedGapPiece, 4> preservedPieces;
+        for (const HeaderSourceEnvelopePiece &piece : hunkSourcePieces) {
+          if (piece.kind != "child-include")
+            continue;
+          const RefoldModel::IncludeItem *child = model_.GetIncludeById(piece.id);
+          if (!child)
+            continue;
+          if (!collectMacroStatePreservationsFromIncludeSubtree(
+                  *child, StringRef(materialInsertBytes), preservedPieces)) {
+            canUseFullHeaderEnvelope = false;
+            break;
+          }
+        }
         for (size_t ti = 1; canUseFullHeaderEnvelope &&
                             ti < hunkSourcePieces.size(); ++ti) {
           const uint64_t gapBegin = hunkSourcePieces[ti - 1].end;
