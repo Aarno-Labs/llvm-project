@@ -1577,6 +1577,52 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     return interval;
   };
 
+  // Return a TU-spelled pragma that is wholly contained in the physical source
+  // line being scanned, if the refold map recorded one there.
+  //
+  // Unlike #define/#undef, pragmas are deliberately not treated as consumable
+  // source-neutral artifacts here.  A pragma may mutate compiler state without
+  // producing PP tokens, and the refold map currently records only its spelling
+  // and source anchors, not the state region needed to prove deletion safe.
+  // This helper is therefore diagnostic-only: it lets the rejection log name the
+  // exact pragma that blocked the closure instead of reporting an opaque
+  // non-trivia gap.
+  auto findTUPragmaOnSourceLine = [&](uint64_t lineBegin, uint64_t lineEnd)
+      -> const RefoldModel::PragmaDirective * {
+    for (const auto &pragma : model_.GetPragmas()) {
+      if (!PathsEqual(pragma.sitePath, tuPath))
+        continue;
+      if (lineBegin <= pragma.siteB && pragma.siteE <= lineEnd &&
+          pragma.siteB < pragma.siteE)
+        return &pragma;
+    }
+    return nullptr;
+  };
+
+  // Return a concrete diagnostic when a TU gap contains a recorded pragma that
+  // blocks closure.  This is checked at the outer rejection site as well as in
+  // the line scanner, because a pragma-only gap has no consumable recorded
+  // pieces; without this fast path the scanner is never entered and the user
+  // only sees a generic "non-trivia gap" rejection.
+  auto nonConsumableTUPragmaGapReason = [&](uint64_t gapBegin,
+                                            uint64_t gapEnd)
+      -> std::optional<std::string> {
+    for (const auto &pragma : model_.GetPragmas()) {
+      if (!PathsEqual(pragma.sitePath, tuPath))
+        continue;
+      if (gapBegin <= pragma.siteB && pragma.siteE <= gapEnd &&
+          pragma.siteB < pragma.siteE) {
+        return llvm::formatv("source gap [{0},{1}) contains non-consumable "
+                             "TU pragma id={2} site=[{3},{4}) text='{5}'",
+                             gapBegin, gapEnd, pragma.id, pragma.siteB,
+                             pragma.siteE,
+                             stringutils::showWsWithClip(pragma.text, 120))
+            .str();
+      }
+    }
+    return std::nullopt;
+  };
+
   // Prove that a source gap inside the replacement envelope consists only of
   // lexical trivia plus complete source-neutral artifacts: zero-token include
   // trees, source-neutral zero-token macro invocation trees, and TU-spelled
@@ -1715,8 +1761,17 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
           ++lineEnd;
 
         if (!parseLiteralEmptyConditionalDirectiveLine(
-                tuBytes.slice(cursor, lineEnd), conditionalDepth))
+                tuBytes.slice(cursor, lineEnd), conditionalDepth)) {
+          if (const RefoldModel::PragmaDirective *pragma =
+                  findTUPragmaOnSourceLine(cursor, lineEnd)) {
+            trace("fallback",
+                  "TU/include closure rejected: source gap [{0},{1}) contains "
+                  "non-consumable TU pragma id={2} site=[{3},{4}) text='{5}'",
+                  gapBegin, gapEnd, pragma->id, pragma->siteB, pragma->siteE,
+                  stringutils::showWsWithClip(pragma->text, 120));
+          }
           return false;
+        }
 
         ++conditionalCount;
         cursor = lineEnd;
@@ -1934,10 +1989,17 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
         StringRef gap = tuBytes.slice(cursor, piece.first);
         if (!isPreservableIncludeClosureGapTrivia(gap) &&
             !gapIsConsumableZeroTokenSourceClosure(cursor, piece.first)) {
-          trace("fallback",
-                "TU/include closure rejected: non-trivia TU gap inside "
-                "mixed source interval [{0},{1}) gap='{2}'",
-                cursor, piece.first, stringutils::showWsWithClip(gap, 120));
+          if (std::optional<std::string> pragmaReason =
+                  nonConsumableTUPragmaGapReason(cursor, piece.first)) {
+            trace("fallback", "TU/include closure rejected: {0}",
+                  *pragmaReason);
+          } else {
+            trace("fallback",
+                  "TU/include closure rejected: non-trivia TU gap inside "
+                  "mixed source interval [{0},{1}) gap='{2}'",
+                  cursor, piece.first,
+                  stringutils::showWsWithClip(gap, 120));
+          }
           return std::nullopt;
         }
       }
