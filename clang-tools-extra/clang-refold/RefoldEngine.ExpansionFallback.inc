@@ -2047,6 +2047,45 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       }
     }
 
+    // If the consumed A-token material came from inside a TU conditional arm,
+    // consume the complete conditional group as a required source piece.  The
+    // byte-level gap proof can already consume neutral conditional-control
+    // islands whose bodies produce no tokens, but it cannot balance an opening
+    // #if in one inter-piece gap against a closing #endif after a real source
+    // piece.  A selected arm whose complete PP span is inside the replacement
+    // material is different: its directive wrapper is part of the same source
+    // interval whose produced tokens are being replaced, so the whole group must
+    // be considered a required piece of the closure rather than trivia around
+    // neighboring token pieces.
+    for (const auto &group : model_.GetConds()) {
+      if (!PathsEqual(group.file, tuPath) || group.parentIncludeId)
+        continue;
+
+      bool consumesSelectedArm = false;
+      for (const RefoldModel::CondArm &arm : group.arms) {
+        if (!arm.selected || !arm.span || !arm.span->IsValid() ||
+            arm.span->begin >= arm.span->end)
+          continue;
+        if (materialBeginA <= arm.span->begin &&
+            arm.span->end <= materialEndA) {
+          consumesSelectedArm = true;
+          break;
+        }
+      }
+
+      if (!consumesSelectedArm)
+        continue;
+      if (group.groupB >= group.groupE || group.groupE > tuBytes.size()) {
+        trace("fallback",
+              "TU/include closure rejected: invalid consumed conditional "
+              "group id={0} source=[{1},{2}) fileLen={3}",
+              group.id, group.groupB, group.groupE, tuBytes.size());
+        return std::nullopt;
+      }
+
+      sourcePieces.push_back({group.groupB, group.groupE});
+    }
+
     // The mixed proof is only for hunks that actually consume ordinary TU
     // spelling.  If no TU token was seen, the pure include-closure path is the
     // appropriate proof shape instead.
@@ -2127,10 +2166,60 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       return std::nullopt;
     }
 
-    // Do not delete or partially overwrite source-bearing macro invocations.
-    // A complete zero-token callsite is different: it produced no PP material
-    // and lies inside the source interval replaced by this closure, so it is
-    // consumed as a source-neutral gap artifact.
+    auto ppSpanInsideMaterial = [&](const RefoldModel::PPSpan &span) -> bool {
+      if (!span.IsValid() || span.begin >= span.end)
+        return true;
+      return materialBeginA <= span.begin && span.end <= materialEndA;
+    };
+
+    auto macroInvocationMaterialIsConsumed =
+        [&](const RefoldModel::MacroInvocation &m) -> bool {
+      if (!m.invB || !m.invE || *m.invB < sourceBegin || sourceEnd < *m.invE)
+        return false;
+
+      bool sawMaterializedSpan = false;
+      auto checkSpan = [&](const RefoldModel::PPSpan &span) -> bool {
+        if (!span.IsValid() || span.begin >= span.end)
+          return true;
+        sawMaterializedSpan = true;
+        return ppSpanInsideMaterial(span);
+      };
+
+      // A source-bearing macro call may be consumed by this replacement only
+      // when every PP span the producer attributes to that invocation is wholly
+      // inside the A-side material being replaced.  Then the callsite is not an
+      // unrelated artifact: it is one of the source pieces whose produced tokens
+      // are removed by the hunk.  Any span escaping the material range means
+      // deleting the call would also delete surviving PP tokens, so reject.
+      for (const auto &span : m.spans)
+        if (!checkSpan(span))
+          return false;
+      for (const auto &span : m.bodySpans)
+        if (!checkSpan(span))
+          return false;
+      for (const auto &span : m.argSpans)
+        if (!checkSpan(span))
+          return false;
+      for (const auto &span : m.stringifySpans)
+        if (!checkSpan(span))
+          return false;
+      for (const auto &span : m.pasteSpans)
+        if (!checkSpan(span))
+          return false;
+
+      return sawMaterializedSpan;
+    };
+
+    // Do not delete or partially overwrite unrelated macro invocations.  Two
+    // complete-callsite cases are allowed inside the replacement envelope:
+    //
+    //   * zero-token source-neutral macro gaps, which contributed no PP tokens;
+    //   * source-bearing macro calls whose entire produced PP material is
+    //     already inside this hunk's A-side replacement range.
+    //
+    // The latter case is the source-bearing analogue of the zero-token gap: the
+    // macro invocation is not being preserved or moved, it is part of the source
+    // interval whose materialized tokens the user replaced.
     for (const auto &m : model_.GetMacroInvocations()) {
       if (m.invFile && !m.invFile->empty() && !PathsEqual(*m.invFile, tuPath))
         continue;
@@ -2138,7 +2227,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
         continue;
       if (*m.invB < sourceEnd && sourceBegin < *m.invE) {
         if (macroInvocationIsConsumableZeroTokenGap(m, sourceBegin,
-                                                   sourceEnd))
+                                                   sourceEnd) ||
+            macroInvocationMaterialIsConsumed(m))
           continue;
         trace("fallback",
               "TU/include closure rejected: source interval [{0},{1}) would "
