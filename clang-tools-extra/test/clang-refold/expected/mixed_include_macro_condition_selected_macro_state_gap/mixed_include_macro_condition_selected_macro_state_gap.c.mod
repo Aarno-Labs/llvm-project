@@ -7,4 +7,4 @@ int x =
 #endif
 ;
 #line 10 "mixed_include_macro_condition_selected_macro_state_gap.c"
-int y = 99 + __LINE__;
+int y = GAP_VALUE + __LINE__;
