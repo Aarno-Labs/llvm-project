@@ -534,14 +534,16 @@ private:
   /// * only top-level TU `#include` directives are considered,
   /// * the touched include run must form one contiguous A-cover with no PP
   ///   gaps,
-  /// * the hunk must either match that cover exactly or be widenable to it
-  ///   without absorbing any other token hunk,
-  /// * the corresponding source bytes in the TU may contain only the include
-  ///   directives themselves plus whitespace between them,
+  /// * the hunk must either match that cover exactly, be widenable to it
+  ///   without absorbing any other token hunk, or form one mixed TU/include
+  ///   closure with directly consumed TU tokens adjacent to the include run,
+  /// * the corresponding source bytes in the TU may contain only consumed TU
+  ///   token spellings, the include directives themselves, and whitespace
+  ///   between those pieces,
   /// * the widened source interval must not overlap an already-staged
   ///   source edit,
   /// * and the replacement text must come from a canonical-or-consensus B
-  ///   envelope for the full include closure.
+  ///   envelope for the full source closure.
   ///
   /// When those obligations hold, the result is staged as one explicit TU text
   /// edit and later composed together with ordinary TU edits and macro callsite

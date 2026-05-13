@@ -2741,6 +2741,54 @@ std::string RefoldEngine::RunSinglePassRefold() {
           "attempt (no include realization).",
           i);
 
+    auto hunkConsumesNonTUMappedToken = [&]() -> bool {
+      const auto &tokmapByPP = model_.GetTokmapByPP();
+      for (uint64_t pp = h.aStart; pp < h.aEnd; ++pp) {
+        auto it = tokmapByPP.find(pp);
+        if (it == tokmapByPP.end())
+          continue;
+        if (!PathsEqual(it->second.file, tuPath))
+          return true;
+      }
+      return false;
+    };
+
+    // A conservative TU byte-span edit may only be used when the whole
+    // consumed hunk is TU-owned.  If the hunk also consumes tokens produced by
+    // a top-level include, replacing only the TU subset would leave the
+    // original include directive alive and replay stale tokens.  First try the
+    // explicit TU/include closure proof; otherwise fail closed instead of
+    // manufacturing an unsound partial TU edit.
+    if (hunkConsumesNonTUMappedToken()) {
+      SmallVector<std::pair<uint64_t, uint64_t>, 8> stagedSourceIntervals;
+      for (const TextEdit &edit : tuEdits)
+        stagedSourceIntervals.push_back({edit.start, edit.end});
+      if (auto it = macroPatchByOwnerByMacroId.find(std::nullopt);
+          it != macroPatchByOwnerByMacroId.end()) {
+        for (const auto &kv : it->second)
+          stagedSourceIntervals.push_back(
+              {kv.second.invStart, kv.second.invEnd});
+      }
+
+      if (auto closureEdit = BuildTUIncludeClosureEditForUnresolvedHunk(
+              h, tuPath, tuBytes, stagedSourceIntervals)) {
+        debug("classify",
+              "#{0} -> TU/include closure bytes=[{1},{2}) textLen={3}", i,
+              closureEdit->start, closureEdit->end, closureEdit->text.size());
+        tuEdits.push_back(std::move(*closureEdit));
+        continue;
+      }
+
+      debug("classify",
+            "#{0} mixed-owner hunk consumes non-TU tokens and has no "
+            "TU/include closure witness; requesting terminal fallback.",
+            i);
+      RequestTerminalFallback(
+          TerminalFallbackKind::OwnerUnresolvedNoTUAnchor, "classify",
+          BuildOwnerUnresolvedNoTUAnchorDetail(i, h, tuPath, owner, mapsToTU));
+      continue;
+    }
+
     if (auto span = TUByteSpan(h.aStart, h.aEnd, tuPath)) { // [b, e)
       std::string repl;
       const uint64_t rawTUStart = span->first;
