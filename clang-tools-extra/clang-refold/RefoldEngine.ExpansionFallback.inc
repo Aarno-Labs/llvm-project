@@ -520,21 +520,111 @@ static bool sourceLineDirectiveMacroHasMaterializedPPTokens(
   return false;
 }
 
-/// Recover a simple object-like or argument-free function-like macro
-/// replacement spelling that can participate in a source-only line-control
-/// directive.
+/// Substitute invocation arguments through a simple function-like replacement
+/// list used inside a source-only line-control directive.
+///
+/// This is intentionally a token-spelling substitution, not a general macro
+/// expander.  The caller supplies exact source spellings for complete invocation
+/// arguments that are wholly inside the already-proved logical directive line.
+/// The resulting replacement text is still parsed by the strict line-control
+/// parser, so any unsupported macro semantics remain fail-closed.
+static std::optional<std::string> substituteLineControlMacroParameters(
+    StringRef replacement, ArrayRef<RefoldModel::MacroDefParam> params,
+    ArrayRef<StringRef> invocationArgTexts) {
+  if (params.size() != invocationArgTexts.size())
+    return std::nullopt;
+
+  for (const RefoldModel::MacroDefParam &param : params)
+    if (param.variadic)
+      return std::nullopt;
+
+  auto lookupParam = [&](StringRef ident) -> std::optional<StringRef> {
+    for (size_t i = 0; i != params.size(); ++i)
+      if (params[i].name == ident)
+        return invocationArgTexts[i];
+    return std::nullopt;
+  };
+
+  std::string out;
+  out.reserve(replacement.size());
+  for (size_t pos = 0; pos < replacement.size();) {
+    char ch = replacement[pos];
+
+    // Stringification and token pasting are macro operators, not direct textual
+    // replacement.  Leave those outside this narrow line-control proof.
+    if (ch == '#')
+      return std::nullopt;
+
+    // Comments in a replacement list are translated to whitespace before macro
+    // replacement.  The refold map currently gives us the recorded directive
+    // spelling rather than a tokenized replacement list, so avoid guessing.
+    if (ch == '/' && pos + 1 < replacement.size() &&
+        (replacement[pos + 1] == '/' || replacement[pos + 1] == '*'))
+      return std::nullopt;
+
+    // Copy string and character literals opaquely so formal names inside a
+    // literal are not substituted as identifiers.
+    if (ch == '"' || ch == '\'') {
+      const char quote = ch;
+      out.push_back(ch);
+      ++pos;
+      bool closed = false;
+      while (pos < replacement.size()) {
+        char litCh = replacement[pos++];
+        out.push_back(litCh);
+        if (litCh == '\\') {
+          if (pos >= replacement.size())
+            return std::nullopt;
+          out.push_back(replacement[pos++]);
+          continue;
+        }
+        if (litCh == quote) {
+          closed = true;
+          break;
+        }
+      }
+      if (!closed)
+        return std::nullopt;
+      continue;
+    }
+
+    if (stringutils::isIdentStart(ch)) {
+      size_t end = pos + 1;
+      while (end < replacement.size() &&
+             stringutils::isIdentPart(replacement[end]))
+        ++end;
+      StringRef ident = replacement.slice(pos, end);
+      if (std::optional<StringRef> argText = lookupParam(ident))
+        out.append(argText->begin(), argText->end());
+      else
+        out.append(ident.begin(), ident.end());
+      pos = end;
+      continue;
+    }
+
+    out.push_back(ch);
+    ++pos;
+  }
+
+  return out;
+}
+
+/// Recover a simple macro replacement spelling that can participate in a
+/// source-only line-control directive.
 ///
 /// This is intentionally not a general macro expander.  The refold map records
-/// the macro invocation and the defining directive, but it does not record a
-/// dedicated expanded token stream for #line directive operands.  Therefore the
-/// repair only substitutes complete callsites whose replacement list is spelled
-/// directly in the recorded #define text; the resulting logical directive line
-/// is still fed to the strict line-control parser before the gap is accepted.
+/// the macro invocation, the defining directive, and exact invocation argument
+/// byte ranges, but it does not record a dedicated expanded token stream for
+/// #line directive operands.  Therefore the repair only substitutes complete
+/// callsites whose replacement list is spelled directly in the recorded #define
+/// text.  For function-like macros with parameters, only direct formal-token
+/// substitution is allowed; paste, stringify, variadics, comments, multiline
+/// replacement lists, and any resulting non-line-control spelling fail closed
+/// when the strict parser is re-run on the rewritten directive line.
 static std::optional<std::string> simpleLineControlMacroReplacementText(
-    const RefoldModel &model, const RefoldModel::MacroInvocation &macro) {
+    const RefoldModel &model, const RefoldModel::MacroInvocation &macro,
+    ArrayRef<StringRef> invocationArgTexts) {
   if (macro.subkind != "obj" && macro.subkind != "func")
-    return std::nullopt;
-  if (macro.subkind == "func" && !macro.defParams.empty())
     return std::nullopt;
   if (!macro.definitionDirectiveId ||
       sourceLineDirectiveMacroHasMaterializedPPTokens(macro))
@@ -570,7 +660,10 @@ static std::optional<std::string> simpleLineControlMacroReplacementText(
   if (pos < text.size() && stringutils::isIdentPart(text[pos]))
     return std::nullopt;
 
-  if (macro.subkind == "func") {
+  if (macro.subkind == "obj") {
+    if (!invocationArgTexts.empty())
+      return std::nullopt;
+  } else {
     if (pos >= text.size() || text[pos] != '(')
       return std::nullopt;
     unsigned depth = 0;
@@ -604,6 +697,12 @@ static std::optional<std::string> simpleLineControlMacroReplacementText(
       replacement.rtrim(" \t\v\f").ends_with("\\"))
     return std::nullopt;
 
+  if (macro.subkind == "func" && !macro.defParams.empty())
+    return substituteLineControlMacroParameters(replacement, macro.defParams,
+                                                invocationArgTexts);
+
+  if (!invocationArgTexts.empty())
+    return std::nullopt;
   return replacement.str();
 }
 
@@ -614,8 +713,8 @@ static std::optional<std::string> simpleLineControlMacroReplacementText(
 /// parser.  It accepts complete callsites whose source bytes map contiguously
 /// into the phase-2 logical line and whose replacement text is recovered from a
 /// simple recorded #define.  Partial callsites, nested/overlapping source
-/// ranges, parameterized replacement semantics, and unrecorded expansions all
-/// fail closed.
+/// ranges, unsupported parameterized replacement semantics, and unrecorded
+/// expansions all fail closed.
 static std::optional<SourceLineDirectiveLogicalLineRewrite>
 rewriteSourceLineDirectiveLogicalLineMacros(
     const RefoldModel &model, StringRef file, StringRef logicalLine,
@@ -676,8 +775,47 @@ rewriteSourceLineDirectiveLogicalLineMacros(
                              *macro.invText)
       continue;
 
+    SmallVector<StringRef, 4> invocationArgTexts;
+    if (macro.subkind == "func" && !macro.defParams.empty()) {
+      if (macro.invArgRanges.size() != macro.defParams.size())
+        return std::nullopt;
+
+      for (const RefoldModel::MacroInvocation::OptByteRange &argRange :
+           macro.invArgRanges) {
+        if (!argRange.first || !argRange.second ||
+            *argRange.first > *argRange.second)
+          return std::nullopt;
+
+        std::optional<size_t> argBeginIndex =
+            findLogicalIndex(*argRange.first);
+        std::optional<size_t> argEndIndex =
+            findLogicalEndIndex(*argRange.second);
+        if (!argBeginIndex || !argEndIndex || *argBeginIndex > *argEndIndex ||
+            *argEndIndex > logicalLine.size())
+          return std::nullopt;
+
+        // The argument text must also be a contiguous source spelling inside
+        // this phase-2 logical line.  If it crosses a splice boundary, comes
+        // from a nested macro body, or otherwise cannot be sliced directly from
+        // the recorded directive bytes, this local substitution proof stops.
+        bool contiguousArgSpelling = true;
+        for (size_t i = *argBeginIndex; i != *argEndIndex; ++i) {
+          if (logicalLineSourceOffsets[i] !=
+              *argRange.first + (i - *argBeginIndex)) {
+            contiguousArgSpelling = false;
+            break;
+          }
+        }
+        if (!contiguousArgSpelling)
+          return std::nullopt;
+
+        invocationArgTexts.push_back(
+            logicalLine.substr(*argBeginIndex, *argEndIndex - *argBeginIndex));
+      }
+    }
+
     std::optional<std::string> replacement =
-        simpleLineControlMacroReplacementText(model, macro);
+        simpleLineControlMacroReplacementText(model, macro, invocationArgTexts);
     if (!replacement)
       return std::nullopt;
 
