@@ -163,7 +163,6 @@ struct PPTok {
 ///
 /// \author jeikenberry
 class RefoldEngine {
-struct ByteHunk;
 struct TextEdit;
 public:
   /// \brief Perform the end-to-end refolding process for a translation unit.
@@ -691,7 +690,7 @@ private:
   std::vector<int64_t> abTokMapA2B_;
   std::vector<int64_t> abTokMapB2A_;
 
-  std::optional<std::vector<ByteHunk>> abByteHunks_;
+  std::optional<std::vector<diffutils::Hunk>> abByteHunks_;
 
   /// \brief Prefix-summed A->B byte-length delta for \c abByteHunks_.
   ///
@@ -2263,14 +2262,6 @@ private:
     void Add(IncludePatch &&P) { patches.push_back(std::move(P)); }
   };
 
-  struct ByteHunk {
-    uint64_t aStart, aEnd;
-    uint64_t bStart, bEnd;
-
-    ByteHunk(uint64_t aStart, uint64_t aEnd, uint64_t bStart, uint64_t bEnd)
-      : aStart(aStart), aEnd(aEnd), bStart(bStart), bEnd(bEnd) {}
-  };
-
   // ------------------------------- Core Helpers ------------------------------
 
   /// \brief Maps preprocessor tokens into a stable lexeme sequence suitable for
@@ -2383,7 +2374,7 @@ private:
   /// used by the core LCS objective. DiffAlgorithms uses these profiles to keep
   /// forced anchors and to restore ambiguous edge anchors only when a unique
   /// owner-preserving frontier is certified.
-  std::vector<diffutils::LcsGapProvenance> ComputeLcsGapProvenanceForPP();
+  std::vector<diffutils::LcsAGapProvenance> ComputeLcsAGapProvenanceForPP();
 
   /// \brief Compute edited-side source-surface profiles for B-side token gaps.
   ///
@@ -3497,9 +3488,9 @@ private:
   /// resolved correctly. Input indices are clamped to valid token ranges to
   /// ensure safety against alignment anomalies.
   ///
-  /// \returns A vector of \c ByteHunk objects containing the corresponding
+  /// \returns A vector of \c Hunk objects containing the corresponding
   ///          [begin, end) byte offsets in the A and B source buffers.
-  std::vector<ByteHunk> BuildByteHunksFromRawText() const;
+  std::vector<diffutils::Hunk> BuildByteHunksFromRawText() const;
 
   /// \brief Build the prefix-summed A->B byte delta cache for
   /// \c abByteHunks_.

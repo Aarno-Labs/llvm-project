@@ -285,7 +285,7 @@ static bool buildCoreLcsDpTables(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
 
 /// Return true iff a provenance id is present rather than the sentinel zero.
 static bool hasProvenanceId(uint64_t value) {
-  return value != LcsGapProvenance::NoId;
+  return value != LcsAGapProvenance::NoId;
 }
 
 /// Rank the amount of original-side structural boundary retained at an
@@ -295,12 +295,12 @@ static bool hasProvenanceId(uint64_t value) {
 /// that the refolder's boundary policy already reasons about: include depth and
 /// identity, conditional group/arm identity, and macro root/leaf identity. A
 /// larger rank means the gap preserves a more specific owner boundary.
-static uint64_t aBoundaryRetentionRank(ArrayRef<LcsGapProvenance> profiles,
+static uint64_t aBoundaryRetentionRank(ArrayRef<LcsAGapProvenance> profiles,
                                        uint64_t gap) {
   if (gap >= profiles.size())
     return 0;
 
-  const LcsGapProvenance &profile = profiles[static_cast<size_t>(gap)];
+  const LcsAGapProvenance &profile = profiles[static_cast<size_t>(gap)];
 
   // Depth carries the coarse owner-boundary strength; identity fields then add
   // small tie-breaking increments without introducing token-spelling bias.
@@ -448,7 +448,7 @@ static size_t suppressOrderConflictingAnchors(std::vector<int64_t> &map) {
 /// anchor.
 static bool buildBoundaryPureCertifiedMap(
     ArrayRef<StringRef> a, ArrayRef<StringRef> b,
-    ArrayRef<uint32_t> ownerDepthGap, ArrayRef<LcsGapProvenance> gapProvenance,
+    ArrayRef<uint32_t> ownerDepthGap, ArrayRef<LcsAGapProvenance> gapProvenance,
     ArrayRef<LcsBGapProvenance> bGapProvenance,
     unsigned long long maxCells, std::vector<int64_t> &outMap) {
   const size_t n = a.size();
@@ -1416,14 +1416,14 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
 }
 
 std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
-                              ArrayRef<LcsGapProvenance> gapProvenance,
+                              ArrayRef<LcsAGapProvenance> gapProvenance,
                               unsigned long long maxCells) {
   if (gapProvenance.size() != a.size() + 1)
     fatal("lcs/map", "gapProvenance length must be A.size() + 1");
 
   std::vector<uint32_t> ownerDepthGap;
   ownerDepthGap.reserve(gapProvenance.size());
-  for (const LcsGapProvenance &profile : gapProvenance)
+  for (const LcsAGapProvenance &profile : gapProvenance)
     ownerDepthGap.push_back(profile.ownerDepth);
 
   // A caller without edited-side gap profiles still receives the certified
@@ -1445,7 +1445,7 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
 }
 
 std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
-                              ArrayRef<LcsGapProvenance> gapProvenance,
+                              ArrayRef<LcsAGapProvenance> gapProvenance,
                               ArrayRef<LcsBGapProvenance> bGapProvenance,
                               unsigned long long maxCells) {
   if (bGapProvenance.size() != b.size() + 1)
@@ -1456,7 +1456,7 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
 
   std::vector<uint32_t> ownerDepthGap;
   ownerDepthGap.reserve(gapProvenance.size());
-  for (const LcsGapProvenance &profile : gapProvenance)
+  for (const LcsAGapProvenance &profile : gapProvenance)
     ownerDepthGap.push_back(profile.ownerDepth);
 
   std::vector<int64_t> map;

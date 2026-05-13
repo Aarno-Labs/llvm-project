@@ -172,6 +172,13 @@ struct Hunk {
   bool isReplace() const { return (aStart < aEnd) && (bStart < bEnd); }
   bool isEqual() const { return (aStart == aEnd) && (bStart == bEnd); }
 
+  bool operator==(const Hunk &other) const {
+    return aStart == other.aStart && aEnd == other.aEnd &&
+           bStart == other.bStart && bEnd == other.bEnd;
+  }
+
+  bool operator!=(const Hunk &other) const { return !(*this == other); }
+
   template <bool kVerbose = false> std::string ToString() const {
     if (kVerbose) {
       std::string kind;
@@ -240,7 +247,7 @@ std::vector<Hunk> coalesce(ArrayRef<Step> steps);
 /// The scalar remains the primary cost for the core LCS objective, while the
 /// identity-bearing fields below are used to certify boundary-preserving
 /// ambiguous-edge restoration without looking at neighboring token spellings.
-struct LcsGapProvenance {
+struct LcsAGapProvenance {
   static constexpr uint64_t NoId = std::numeric_limits<uint64_t>::max();
 
   uint32_t ownerDepth = 0;
@@ -269,7 +276,7 @@ struct LcsGapProvenance {
 
 /// \brief Edited-side structural surface for one B-side token gap.
 ///
-/// `LcsGapProvenance` describes where an A-side gap came from in the original
+/// `LcsAGapProvenance` describes where an A-side gap came from in the original
 /// preprocessor provenance graph. B-side gap provenance describes the edited
 /// insertion island's structural surface: line affinity and whitespace/newline
 /// shape around adjacent tokens. It deliberately does not include neighboring
@@ -351,14 +358,14 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
 /// and ambiguous equal-token edge anchors are restored only when the structured
 /// boundary profile proves a unique pure-insertion frontier.
 std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
-                              ArrayRef<LcsGapProvenance> gapProvenance,
+                              ArrayRef<LcsAGapProvenance> gapProvenance,
                               unsigned long long maxCells = DEFAULT_MAX_CELLS);
 
 /// \brief Same as the structured-provenance overload, with edited-side B-gap
 /// surface profiles used as the final structural discriminator for otherwise
 /// equivalent pure-insertion frontiers.
 std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
-                              ArrayRef<LcsGapProvenance> gapProvenance,
+                              ArrayRef<LcsAGapProvenance> gapProvenance,
                               ArrayRef<LcsBGapProvenance> bGapProvenance,
                               unsigned long long maxCells = DEFAULT_MAX_CELLS);
 

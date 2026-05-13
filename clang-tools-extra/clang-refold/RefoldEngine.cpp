@@ -1483,7 +1483,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
   // include/conditional/macro identity and edited-side line-shape data so the
   // diff layer can suppress ambiguous repeated-token anchors and restore only
   // certified boundary-preserving frontiers.
-  auto gapProvenance = ComputeLcsGapProvenanceForPP();
+  auto gapProvenance = ComputeLcsAGapProvenanceForPP();
   auto bGapProvenance = ComputeLcsBGapProvenanceForPP();
   auto a2b = diffutils::lcsMapAB(aSeq, bSeq, gapProvenance, bGapProvenance);
   trace("lcs/a2b", "a2b:");
@@ -3008,21 +3008,28 @@ std::string RefoldEngine::RunSinglePassRefold() {
     std::string name;
   };
 
-  auto parseMacroDirectiveName = [](StringRef text,
-                                    StringRef expectedSubkind)
-      -> std::optional<std::string> {
+  // Extract the macro identifier from a spelling of the expected directive kind
+  // (for example, `#define FOO ...` or `#undef FOO`). This is intentionally a
+  // strict directive-shape parser: if the spelling is not exactly the requested
+  // directive followed by an identifier, return no name.
+  auto parseMacroDirectiveName =
+      [](StringRef text,
+         StringRef expectedSubkind) -> std::optional<std::string> {
     StringRef s = text.ltrim();
     if (!s.consume_front("#"))
       return std::nullopt;
     s = s.ltrim();
 
+    // `expectedSubkind` is stored in directive form (for example, "#define");
+    // after consuming '#', match only the directive keyword itself.
     StringRef keyword = expectedSubkind.drop_front();
     if (!s.consume_front(keyword))
       return std::nullopt;
+
+    // Reject prefix matches such as "#defined" when looking for "#define".
     if (!s.empty()) {
       const char c = s.front();
-      if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-          (c >= '0' && c <= '9') || c == '_')
+      if (stringutils::isIdentPart(c))
         return std::nullopt;
     }
 
@@ -3030,22 +3037,20 @@ std::string RefoldEngine::RunSinglePassRefold() {
     if (s.empty())
       return std::nullopt;
 
-    auto isIdentStart = [](char c) {
-      return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
-    };
-    auto isIdentContinue = [&](char c) {
-      return isIdentStart(c) || (c >= '0' && c <= '9');
-    };
-
-    if (!isIdentStart(s.front()))
+    // The macro name must be a normal preprocessing identifier.
+    if (!stringutils::isIdentStart(s.front()))
       return std::nullopt;
 
     size_t end = 1;
-    while (end < s.size() && isIdentContinue(s[end]))
+    while (end < s.size() && stringutils::isIdentPart(s[end]))
       ++end;
     return s.take_front(end).str();
   };
 
+  // Build a name-indexed view of macro-state directives that can affect later
+  // preserved source. The refold map records directive text generically, so we
+  // recover the macro identifier here and keep both an id lookup for exact
+  // producer references and a source-order list for interval/liveness checks.
   DenseMap<uint64_t, NamedMacroDirectiveRef> macroDirectiveById;
   SmallVector<NamedMacroDirectiveRef, 64> namedMacroDirectives;
   for (const auto &directive : model_.GetMacroDirectives()) {
@@ -3059,17 +3064,20 @@ std::string RefoldEngine::RunSinglePassRefold() {
     macroDirectiveById[directive.id] = ref;
     namedMacroDirectives.push_back(std::move(ref));
   }
-  llvm::sort(namedMacroDirectives,
-             [](const NamedMacroDirectiveRef &lhs,
-                const NamedMacroDirectiveRef &rhs) {
-               return lhs.directive->id < rhs.directive->id;
-             });
+
+  // Keep the ordered view deterministic so macro-state damage intervals can be
+  // computed by walking directives in their original source order.
+  llvm::sort(namedMacroDirectives, [](const NamedMacroDirectiveRef &lhs,
+                                      const NamedMacroDirectiveRef &rhs) {
+    return lhs.directive->id < rhs.directive->id;
+  });
 
   auto sourceIntervalsOverlap = [](uint64_t aBegin, uint64_t aEnd,
                                    uint64_t bBegin, uint64_t bEnd) {
     return aBegin < bEnd && bBegin < aEnd;
   };
 
+  // Return true if any final TU edit touches the given source byte interval.
   auto intervalOverlapsFinalTUEdit = [&](uint64_t begin, uint64_t end) {
     for (const TextEdit &edit : tuEdits) {
       if (sourceIntervalsOverlap(begin, end, edit.start, edit.end))
@@ -3078,6 +3086,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
     return false;
   };
 
+  // Find the single final TU edit that fully contains a source byte interval.
   auto finalTUEditContainingInterval =
       [&](uint64_t begin, uint64_t end) -> std::optional<size_t> {
     for (size_t editIndex = 0; editIndex < tuEdits.size(); ++editIndex) {
@@ -3088,6 +3097,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
     return std::nullopt;
   };
 
+  // Spell a preserved macro-state directive as a complete physical line.
   auto directiveTextForPreservation =
       [](const RefoldModel::MacroDirective &directive) {
     std::string text = directive.text.str();
@@ -3096,6 +3106,11 @@ std::string RefoldEngine::RunSinglePassRefold() {
     return text;
   };
 
+  // Return true if `text` contains `name` as a real raw identifier token.
+  //
+  // This is used as a conservative macro-state safety check: if the replacement
+  // payload itself mentions the macro name, then re-emitting a consumed
+  // `#define` before that payload could change how the payload preprocesses.
   auto rawIdentifierAppearsInText = [&](StringRef name, StringRef text) {
     if (name.empty() || text.empty())
       return false;
@@ -3103,6 +3118,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
     const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
     std::string lexBuf = text.str();
     lexBuf.push_back('\0');
+
     const char *bufStart = lexBuf.data();
     const char *bufEnd = bufStart + text.size();
     Lexer lexer(baseLoc, lexLang_, bufStart, bufStart, bufEnd);
@@ -3113,8 +3129,12 @@ std::string RefoldEngine::RunSinglePassRefold() {
       lexer.LexFromRawLexer(token);
       if (token.is(tok::eof))
         return false;
+
+      // Comments are retained so the raw lexer can step over them explicitly,
+      // but macro-state observations inside comments are irrelevant.
       if (token.is(tok::comment))
         continue;
+
       if (!token.is(tok::raw_identifier) && !token.is(tok::identifier))
         continue;
 
@@ -3122,6 +3142,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
       const size_t localEnd = tokenEndOffsetFromBase(token, baseLoc);
       if (localEnd < localBegin || localEnd > text.size())
         continue;
+
       if (text.slice(localBegin, localEnd) == name)
         return true;
     }
@@ -3131,6 +3152,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
       macroStatePreservationsByEdit;
   DenseSet<uint64_t> preservedDefinitionDirectiveIds;
 
+  // Return true when a final TU edit consumes bytes from this macro definition.
   auto definitionDirectiveTouchedByTUEdit =
       [&](const RefoldModel::MacroDirective &directive) {
         if (directive.subkind != "#define")
@@ -3140,6 +3162,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
         return intervalOverlapsFinalTUEdit(directive.siteB, directive.siteE);
       };
 
+  // Return true if this physical macro callsite is already being rewritten by
+  // an accepted macro patch, so macro-state repair should not patch it again.
   auto physicalCallsiteAlreadyHasPatch =
       [&](const RefoldModel::MacroInvocation &m) {
         if (!m.invB || !m.invE)
@@ -3155,6 +3179,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
         return false;
       };
 
+  // Return true when the invocation spelling remains in the untouched TU suffix
+  // and can therefore observe macro-state changes caused by earlier TU edits.
   auto invocationCallsiteSurvivesTUEdits =
       [&](const RefoldModel::MacroInvocation &m) {
         if (!m.invFile || !m.invB || !m.invE || *m.invE < *m.invB)
@@ -3164,9 +3190,12 @@ std::string RefoldEngine::RunSinglePassRefold() {
         return !intervalOverlapsFinalTUEdit(*m.invB, *m.invE);
       };
 
+  // Older refold maps may not carry an exact invocation -> definition edge.
+  // Reconstruct the active same-name definition from producer/source order as a
+  // compatibility fallback.
   auto fallbackActiveDefinitionForInvocation =
       [&](const RefoldModel::MacroInvocation &m)
-          -> const RefoldModel::MacroDirective * {
+      -> const RefoldModel::MacroDirective * {
     const RefoldModel::MacroDirective *best = nullptr;
     for (const NamedMacroDirectiveRef &ref : namedMacroDirectives) {
       const RefoldModel::MacroDirective &directive = *ref.directive;
@@ -3183,9 +3212,12 @@ std::string RefoldEngine::RunSinglePassRefold() {
     return best;
   };
 
+  // Return the exact macro definition used by this invocation, preferring the
+  // producer-recorded definition edge and falling back to source-order recovery
+  // for older refold maps.
   auto activeDefinitionForInvocation =
       [&](const RefoldModel::MacroInvocation &m)
-          -> const RefoldModel::MacroDirective * {
+      -> const RefoldModel::MacroDirective * {
     if (m.definitionDirectiveId) {
       auto it = macroDirectiveById.find(*m.definitionDirectiveId);
       if (it != macroDirectiveById.end() && it->second.directive &&
@@ -3198,11 +3230,23 @@ std::string RefoldEngine::RunSinglePassRefold() {
 
   size_t preservedDefinitionLivenessDirectives = 0;
   size_t forcedDefinitionLivenessPatches = 0;
+
+  // Repair surviving macro call sites whose active #define was consumed by a
+  // final TU edit. Such call sites are still spelled in the output source, so
+  // dropping the defining directive would make the refolded source invalid or
+  // bind the call to a different macro-state interval.
   for (const RefoldModel::MacroInvocation &m : model_.GetMacroInvocations()) {
+    // Only physical top-level call sites can survive as source spelling here.
+    // Nested macro expansions and macro invocations inside #define directives
+    // are repaired by their owning expansion/definition paths instead.
     if (m.callerMacroId)
       continue;
     if (IsInvocationInsideDefineDirective(m))
       continue;
+
+    // Ignore call sites that were deleted/replaced by TU edits or already have
+    // an accepted macro patch. This pass only repairs otherwise-preserved
+    // suffix/source spelling that would observe changed macro state.
     if (!invocationCallsiteSurvivesTUEdits(m))
       continue;
     if (physicalCallsiteAlreadyHasPatch(m))
@@ -3220,14 +3264,19 @@ std::string RefoldEngine::RunSinglePassRefold() {
       const bool editStartsAtPhysicalBOL =
           edit.start == 0 || tuBytes[edit.start - 1] == '\n';
 
-      // Prefer preserving the consumed #define over expanding later call sites,
-      // but only when inserting the directive at the replacement frontier cannot
-      // change the B-side replacement payload itself.  If the replacement text
-      // already contains the macro name as a raw identifier, the preserved
-      // definition would become visible too early and could rewrite B tokens.
-      if (editStartsAtPhysicalBOL &&
-          !rawIdentifierAppearsInText(m.name, StringRef(edit.text))) {
+      // Prefer preserving the consumed #define over expanding later call sites:
+      // this keeps the original macro abstraction and repairs all dependent
+      // surviving calls at once. This is only legal when the directive can be
+      // emitted at a physical BOL and when making it visible before the
+      // replacement payload cannot rewrite B-side replacement tokens.
+      const bool replacementObservesName =
+          rawIdentifierAppearsInText(m.name, StringRef(edit.text));
+      if (editStartsAtPhysicalBOL && !replacementObservesName) {
         preservedDefinition = true;
+
+        // Multiple surviving call sites may depend on the same consumed
+        // definition. Preserve the directive once, then let all dependent calls
+        // reuse that repaired macro state.
         if (!preservedDefinitionDirectiveIds.contains(definition->id)) {
           macroStatePreservationsByEdit[*editIndex].push_back(definition);
           preservedDefinitionDirectiveIds.insert(definition->id);
@@ -3244,19 +3293,26 @@ std::string RefoldEngine::RunSinglePassRefold() {
                 m.name, definition->id, m.id);
         }
       } else {
+        // Preserving the directive would either be syntactically invalid or
+        // would expose the replacement payload to a macro definition that was
+        // not visible in B. In that case, repair this call site locally by
+        // materializing its B-side whole-cover expansion.
         debug("macro/liveness",
               "cannot preserve consumed #define before dependent callsite; "
               "falling back to whole-cover realization: macro='{0}' "
               "defDirective=#{1} inv=#{2} editStartsAtBOL={3} "
               "replacementObservesName={4}",
               m.name, definition->id, m.id, editStartsAtPhysicalBOL,
-              rawIdentifierAppearsInText(m.name, StringRef(edit.text)));
+              replacementObservesName);
       }
     }
 
     if (preservedDefinition)
       continue;
 
+    // If the #define cannot be safely preserved, the only structural repair is
+    // to remove this call site's dependency on that macro state by emitting the
+    // B-side expansion at the call site.
     std::optional<WholeCoverPlan> plan = ComputeWholeCoverPlan(m);
     if (!plan) {
       RequestTerminalFallback(
@@ -3278,6 +3334,10 @@ std::string RefoldEngine::RunSinglePassRefold() {
                                            : Owner::TU());
 
     auto &byMacroId = macroPatchByOwnerByMacroId[m.ownerIncludeId];
+
+    // Reuse an existing physical-callsite key if one was already allocated for
+    // the same byte interval. Otherwise use this invocation id as the stable key
+    // for the forced whole-cover patch.
     std::optional<uint64_t> existingKey;
     for (const auto &kv : byMacroId) {
       const MacroPatch &existing = kv.second;
@@ -3286,6 +3346,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
           existingKey = kv.first;
       }
     }
+
     const uint64_t patchKey = existingKey.value_or(m.id);
     patch.macroId = patchKey;
     byMacroId[patchKey] = std::move(patch);
@@ -3344,6 +3405,9 @@ std::string RefoldEngine::RunSinglePassRefold() {
     return active;
   };
 
+  // Return true if this macro-state directive remains available in the emitted
+  // TU source, either because it belongs to another file or because no final TU
+  // edit consumes its spelling.
   auto directiveSurvivesTUEdits =
       [&](const RefoldModel::MacroDirective &directive) {
     if (!PathsEqual(directive.sitePath, tuPath))
@@ -3351,40 +3415,54 @@ std::string RefoldEngine::RunSinglePassRefold() {
     return !intervalOverlapsFinalTUEdit(directive.siteB, directive.siteE);
   };
 
+  // Return true if a preserved TU byte interval contains `name` as a real
+  // identifier token. Identifiers inside bytes already replaced by final TU
+  // edits are ignored because those source bytes will not survive into the
+  // emitted file.
   auto rawIdentifierAppearsInPreservedTUBytes =
       [&](StringRef name, uint64_t begin, uint64_t end) {
-    if (begin >= end || begin >= tuBytes.size())
-      return false;
-    end = std::min<uint64_t>(end, tuBytes.size());
+        if (begin >= end || begin >= tuBytes.size())
+          return false;
+        end = std::min<uint64_t>(end, tuBytes.size());
 
-    const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
-    std::string lexBuf = tuBytes.slice(begin, end).str();
-    lexBuf.push_back('\0');
-    const char *bufStart = lexBuf.data();
-    const char *bufEnd = bufStart + (end - begin);
-    Lexer lexer(baseLoc, lexLang_, bufStart, bufStart, bufEnd);
-    lexer.SetCommentRetentionState(true);
+        const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
+        std::string lexBuf = tuBytes.slice(begin, end).str();
+        lexBuf.push_back('\0');
 
-    Token token;
-    while (true) {
-      lexer.LexFromRawLexer(token);
-      if (token.is(tok::eof))
-        return false;
-      if (token.is(tok::comment))
-        continue;
-      if (!token.is(tok::raw_identifier) && !token.is(tok::identifier))
-        continue;
+        const char *bufStart = lexBuf.data();
+        const char *bufEnd = bufStart + (end - begin);
+        Lexer lexer(baseLoc, lexLang_, bufStart, bufStart, bufEnd);
+        lexer.SetCommentRetentionState(true);
 
-      const size_t localBegin = tokenOffsetFromBase(token, baseLoc);
-      const size_t localEnd = tokenEndOffsetFromBase(token, baseLoc);
-      const uint64_t absBegin = begin + localBegin;
-      const uint64_t absEnd = begin + localEnd;
-      if (intervalOverlapsFinalTUEdit(absBegin, absEnd))
-        continue;
-      if (tuBytes.slice(absBegin, absEnd) == name)
-        return true;
-    }
-  };
+        Token token;
+        while (true) {
+          lexer.LexFromRawLexer(token);
+          if (token.is(tok::eof))
+            return false;
+
+          // Comments are retained so the raw lexer can skip them explicitly,
+          // but macro-state observations inside comments do not matter.
+          if (token.is(tok::comment))
+            continue;
+
+          if (!token.is(tok::raw_identifier) && !token.is(tok::identifier))
+            continue;
+
+          const size_t localBegin = tokenOffsetFromBase(token, baseLoc);
+          const size_t localEnd = tokenEndOffsetFromBase(token, baseLoc);
+          const uint64_t absBegin = begin + localBegin;
+          const uint64_t absEnd = begin + localEnd;
+
+          // Ignore identifiers in source bytes that a final TU edit replaces.
+          // Those spellings are not part of the preserved suffix/prefix that
+          // can observe repaired macro state.
+          if (intervalOverlapsFinalTUEdit(absBegin, absEnd))
+            continue;
+
+          if (tuBytes.slice(absBegin, absEnd) == name)
+            return true;
+        }
+      };
 
   size_t undefLivenessHazards = 0;
   for (const NamedMacroDirectiveRef &ref : namedMacroDirectives) {
@@ -3394,23 +3472,35 @@ std::string RefoldEngine::RunSinglePassRefold() {
     if (!PathsEqual(undefDirective.sitePath, tuPath))
       continue;
 
+    // Only a consumed #undef can create a liveness hazard. If the directive is
+    // merely preserved by the ordinary source suffix/prefix, macro state stays
+    // consistent without any repair.
     std::optional<size_t> editIndex = finalTUEditContainingInterval(
         undefDirective.siteB, undefDirective.siteE);
     if (!editIndex)
       continue;
 
+    // Deleting #undef NAME is only dangerous when a previous surviving
+    // #define NAME would become live again.
     const RefoldModel::MacroDirective *previousDefinition =
         previousLiveDefinitionBeforeDirective(ref);
     if (!previousDefinition || !directiveSurvivesTUEdits(*previousDefinition))
       continue;
 
     const TextEdit &edit = tuEdits[*editIndex];
-    const uint64_t observationBegin = std::max<uint64_t>(edit.end,
-                                                         undefDirective.siteE);
+
+    // Look only after the consumed #undef/edit frontier. Earlier source either
+    // belongs to the replacement itself or cannot observe the resurrected macro
+    // state caused by removing this #undef.
+    const uint64_t observationBegin =
+        std::max<uint64_t>(edit.end, undefDirective.siteE);
     if (!rawIdentifierAppearsInPreservedTUBytes(ref.name, observationBegin,
                                                 tuBytes.size()))
       continue;
 
+    // The repair is to re-emit the consumed #undef before the replacement text.
+    // That is only syntactically valid if the TU edit starts at a physical BOL;
+    // otherwise we cannot place a preprocessing directive there safely.
     if (edit.start != 0 && tuBytes[edit.start - 1] != '\n') {
       RequestTerminalFallback(
           TerminalFallbackKind::UndischargedEmissionArtifact,
@@ -3424,6 +3514,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
       continue;
     }
 
+    // Preserve the #undef with the edit that consumed it. This keeps the
+    // original macro-state transition visible to later preserved source.
     macroStatePreservationsByEdit[*editIndex].push_back(&undefDirective);
     ++undefLivenessHazards;
     warn("macro/liveness",
@@ -3439,21 +3531,27 @@ std::string RefoldEngine::RunSinglePassRefold() {
     return std::string();
   }
 
+  // Apply all macro-state directive preservations collected above. A single TU
+  // edit may need to carry multiple directives, so preserve their original
+  // source order before prefixing the replacement text.
   for (auto &entry : macroStatePreservationsByEdit) {
     TextEdit &edit = tuEdits[entry.first];
     SmallVector<const RefoldModel::MacroDirective *, 8> directives(
         entry.second.begin(), entry.second.end());
-    llvm::sort(directives,
-               [](const RefoldModel::MacroDirective *lhs,
-                  const RefoldModel::MacroDirective *rhs) {
-                 if (lhs->siteB != rhs->siteB)
-                   return lhs->siteB < rhs->siteB;
-                 return lhs->id < rhs->id;
-               });
+    llvm::sort(directives, [](const RefoldModel::MacroDirective *lhs,
+                              const RefoldModel::MacroDirective *rhs) {
+      if (lhs->siteB != rhs->siteB)
+        return lhs->siteB < rhs->siteB;
+      return lhs->id < rhs->id;
+    });
 
     std::string prefix;
     for (const RefoldModel::MacroDirective *directive : directives)
       prefix += directiveTextForPreservation(*directive);
+
+    // The edit still replaces the same original byte interval, but its emitted
+    // text now begins with the preserved macro-state directives needed by
+    // later source.
     edit.text.insert(0, prefix);
     AttachAcceptedResultCarrier(
         edit, BuildAcceptedTUTextEditCandidate(
@@ -3898,9 +3996,9 @@ std::vector<uint32_t> RefoldEngine::ComputeOwnerDepthGapsForPP() {
 }
 
 
-std::vector<diffutils::LcsGapProvenance>
-RefoldEngine::ComputeLcsGapProvenanceForPP() {
-  using diffutils::LcsGapProvenance;
+std::vector<diffutils::LcsAGapProvenance>
+RefoldEngine::ComputeLcsAGapProvenanceForPP() {
+  using diffutils::LcsAGapProvenance;
 
   // The core LCS still consumes the same scalar owner-depth array as before.
   // The remaining fields below carry identity, not extra cost: they let the
@@ -3908,12 +4006,12 @@ RefoldEngine::ComputeLcsGapProvenanceForPP() {
   // include, conditional, or macro boundary.
 
   const size_t N = aTokOff_.size() - 1;
-  std::vector<LcsGapProvenance> profiles(N + 1);
+  std::vector<LcsAGapProvenance> profiles(N + 1);
   const std::vector<uint32_t> ownerDepthGap = ComputeOwnerDepthGapsForPP();
 
   struct MacroTokenContext {
-    uint64_t rootId = LcsGapProvenance::NoId;
-    uint64_t leafId = LcsGapProvenance::NoId;
+    uint64_t rootId = LcsAGapProvenance::NoId;
+    uint64_t leafId = LcsAGapProvenance::NoId;
     uint32_t depth = 0;
     uint32_t roleMask = 0;
   };
@@ -4014,7 +4112,7 @@ RefoldEngine::ComputeLcsGapProvenanceForPP() {
     return best;
   };
 
-  auto fillSide = [&](LcsGapProvenance &profile, uint64_t pp, bool leftSide) {
+  auto fillSide = [&](LcsAGapProvenance &profile, uint64_t pp, bool leftSide) {
     // A gap has independent left/right token provenance. Preserve the side so
     // the LCS certifier can distinguish boundaries from interiors.
     const std::optional<uint64_t> includeId = model_.InnermostIncludeAtPP(pp);
@@ -4022,7 +4120,7 @@ RefoldEngine::ComputeLcsGapProvenanceForPP() {
     const MacroTokenContext macro = macroContextAtPP(pp);
 
     if (leftSide) {
-      profile.leftIncludeId = includeId.value_or(LcsGapProvenance::NoId);
+      profile.leftIncludeId = includeId.value_or(LcsAGapProvenance::NoId);
       if (armRef) {
         profile.leftCondGroupId = armRef->group->id;
         profile.leftCondArmId = armRef->arm->id;
@@ -4031,7 +4129,7 @@ RefoldEngine::ComputeLcsGapProvenanceForPP() {
       profile.leftMacroLeafId = macro.leafId;
       profile.leftMacroRoleMask = macro.roleMask;
     } else {
-      profile.rightIncludeId = includeId.value_or(LcsGapProvenance::NoId);
+      profile.rightIncludeId = includeId.value_or(LcsAGapProvenance::NoId);
       if (armRef) {
         profile.rightCondGroupId = armRef->group->id;
         profile.rightCondArmId = armRef->arm->id;
@@ -4045,7 +4143,7 @@ RefoldEngine::ComputeLcsGapProvenanceForPP() {
   };
 
   for (size_t k = 0; k <= N; ++k) {
-    LcsGapProvenance profile;
+    LcsAGapProvenance profile;
 
     // `k` names the gap between PP tokens:
     //
@@ -4092,7 +4190,7 @@ RefoldEngine::ComputeLcsGapProvenanceForPP() {
     // exclusively to either side.
     const std::optional<uint64_t> lca =
         model_.LeastCommonAncestorInclude(leftInc, rightInc);
-    profile.lcaIncludeId = lca.value_or(LcsGapProvenance::NoId);
+    profile.lcaIncludeId = lca.value_or(LcsAGapProvenance::NoId);
     profile.includeDepth = model_.GetIncludeDepth(lca);
 
     // Conditional provenance is also boundary-shared: a gap can only safely
