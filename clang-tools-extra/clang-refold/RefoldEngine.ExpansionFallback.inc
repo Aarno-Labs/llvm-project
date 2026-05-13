@@ -1829,6 +1829,143 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     return std::nullopt;
   };
 
+  // Return true iff a recorded TU conditional group may be preserved as
+  // inert inter-include source in a pure include-closure replacement.
+  //
+  // This is the preservation-side counterpart to the mixed-envelope conditional
+  // consumption proof below.  The static textual parser intentionally accepts
+  // only a tiny literal grammar (`#if 0`, `#if 1`, ...), because it has no
+  // preprocessor state.  For source forms such as `#ifdef ENABLE_GAP`, the
+  // refold map already gives us the deterministic proof object: a complete
+  // conditional-group byte interval and the PP spans materialized by each arm.
+  //
+  // Pure include closure does not delete these bytes.  It projects the touched
+  // include material into B and carries source-neutral inter-include control
+  // structure forward verbatim.  Therefore a recorded conditional group is
+  // preservable when it is complete, TU-spelled, wholly inside the gap, and no
+  // arm materialized PP tokens in A.  Active source-bearing artifacts inside the
+  // group remain outside this proof; they require their own preservation/repair
+  // model rather than being hidden inside an opaque conditional gap.
+  auto conditionalGroupIsPreservableIncludeClosureGap =
+      [&](const RefoldModel::CondGroup &group, uint64_t gapBegin,
+          uint64_t gapEnd) -> bool {
+    if (!PathsEqual(group.file, tuPath) || group.parentIncludeId)
+      return false;
+    if (group.groupB >= group.groupE || group.groupE > tuBytes.size())
+      return false;
+    if (group.groupB < gapBegin || gapEnd < group.groupE)
+      return false;
+    if (!stringutils::beginsLineAfterWs(tuBytes, group.groupB))
+      return false;
+
+    for (const RefoldModel::CondArm &arm : group.arms)
+      if (arm.span && arm.span->IsValid() && arm.span->begin < arm.span->end)
+        return false;
+
+    auto insideGroup = [&](uint64_t b, uint64_t e) {
+      return group.groupB <= b && b < e && e <= group.groupE;
+    };
+
+    // The group itself is preserved, but do not treat it as an opaque proof box
+    // if the producer recorded active source artifacts inside it.  Those
+    // artifacts may carry macro, include, pragma, or macro-call state that this
+    // narrow inter-include preservation proof is not responsible for modeling.
+    for (const auto &inc : model_.GetIncludes())
+      if (PathsEqual(inc.sitePath, tuPath) && insideGroup(inc.siteB, inc.siteE))
+        return false;
+    for (const auto &macro : model_.GetMacroInvocations())
+      if (macro.invFile && PathsEqual(*macro.invFile, tuPath) && macro.invB &&
+          macro.invE && insideGroup(*macro.invB, *macro.invE))
+        return false;
+    for (const auto &directive : model_.GetMacroDirectives())
+      if (PathsEqual(directive.sitePath, tuPath) &&
+          insideGroup(directive.siteB, directive.siteE))
+        return false;
+    for (const auto &pragma : model_.GetPragmas())
+      if (PathsEqual(pragma.sitePath, tuPath) &&
+          insideGroup(pragma.siteB, pragma.siteE))
+        return false;
+
+    return true;
+  };
+
+  // Return true iff a pure include-closure inter-include gap can be preserved
+  // verbatim by tiling it with lexical trivia and complete recorded zero-token
+  // conditional groups.
+  //
+  // This extends `isPreservableIncludeClosureGapTrivia()` without weakening its
+  // no-heuristics contract.  The directive spelling inside each conditional
+  // group can be macro-dependent (`#ifdef`, `#ifndef`, `#if defined(...)`, ...)
+  // because the producer has already recorded the complete group boundaries and
+  // which arms materialized A tokens for this preprocessing run.  We preserve
+  // the original bytes rather than consuming them, so this helper is used only
+  // by the pure include-closure gap path.
+  auto gapIsPreservableRecordedConditionalIncludeClosure =
+      [&](uint64_t gapBegin, uint64_t gapEnd) -> bool {
+    if (gapBegin >= gapEnd || gapEnd > tuBytes.size())
+      return false;
+
+    struct ConditionalPiece {
+      uint64_t begin;
+      uint64_t end;
+      uint64_t id;
+    };
+
+    SmallVector<ConditionalPiece, 8> pieces;
+    for (const auto &group : model_.GetConds())
+      if (conditionalGroupIsPreservableIncludeClosureGap(group, gapBegin,
+                                                        gapEnd))
+        pieces.push_back({group.groupB, group.groupE, group.id});
+
+    if (pieces.empty())
+      return false;
+
+    llvm::sort(pieces, [](const ConditionalPiece &lhs,
+                          const ConditionalPiece &rhs) {
+      if (lhs.begin != rhs.begin)
+        return lhs.begin < rhs.begin;
+      if (lhs.end != rhs.end)
+        return lhs.end > rhs.end;
+      return lhs.id < rhs.id;
+    });
+
+    SmallVector<ConditionalPiece, 8> outerPieces;
+    for (const ConditionalPiece &piece : pieces) {
+      if (outerPieces.empty() || piece.begin >= outerPieces.back().end) {
+        outerPieces.push_back(piece);
+        continue;
+      }
+
+      const ConditionalPiece &outer = outerPieces.back();
+      if (outer.begin <= piece.begin && piece.end <= outer.end) {
+        // Nested conditional groups are represented by the producer as separate
+        // records.  Once the outer complete group is preserved verbatim, nested
+        // conditional records inside its bytes are not independent gap pieces.
+        continue;
+      }
+
+      return false;
+    }
+
+    uint64_t cursor = gapBegin;
+    for (const ConditionalPiece &piece : outerPieces) {
+      if (piece.begin < cursor)
+        return false;
+      if (!isWsOrCompleteCommentTrivia(tuBytes.slice(cursor, piece.begin)))
+        return false;
+      cursor = piece.end;
+    }
+
+    if (!isWsOrCompleteCommentTrivia(tuBytes.slice(cursor, gapEnd)))
+      return false;
+
+    trace("fallback",
+          "TU include-closure preserving recorded conditional gap "
+          "source=[{0},{1}) conditionalGroups={2}",
+          gapBegin, gapEnd, outerPieces.size());
+    return true;
+  };
+
   // Prove that a source gap inside a replacement envelope consists only of
   // lexical trivia plus complete source-neutral artifacts: zero-token include
   // trees, source-neutral zero-token macro invocation trees, and TU-spelled
@@ -2519,7 +2656,9 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
                 "TU include-closure consuming zero-token source gap before "
                 "inc#{0} gap='{1}'",
                 inc->id, stringutils::showWsWithClip(gap, 120));
-        } else if (!isPreservableIncludeClosureGapTrivia(gap)) {
+        } else if (!isPreservableIncludeClosureGapTrivia(gap) &&
+                   !gapIsPreservableRecordedConditionalIncludeClosure(
+                       sourceCursor, inc->siteB)) {
           trace("fallback",
                 "TU include-closure rejected: non-trivia TU gap between "
                 "include directives before inc#{0} gap='{1}'",
@@ -2528,7 +2667,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
         } else {
           preservedGapTrivia.append(gap.begin(), gap.end());
           trace("fallback",
-                "TU include-closure preserving inert trivia gap before "
+                "TU include-closure preserving inert trivia/control gap before "
                 "inc#{0} gap='{1}'",
                 inc->id, stringutils::showWsWithClip(gap, 120));
         }
