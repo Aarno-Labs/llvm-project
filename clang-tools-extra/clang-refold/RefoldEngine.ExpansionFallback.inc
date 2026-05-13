@@ -2066,20 +2066,19 @@ static std::optional<std::string> simpleLineControlMacroReplacementText(
   return replacement.str();
 }
 
-/// Find the single identifier-token occurrence of `name` inside `text`.
+/// Find whole-token occurrences of `name` inside recovered replacement text.
 ///
-/// Recursive line-control macro repair uses producer-recorded child macro
-/// invocations rather than scanning arbitrary identifiers as expansion
-/// candidates.  This helper only locates where that already-recorded child
-/// invocation appears in the current replacement spelling.  Ambiguous repeated
-/// spellings fail closed because the refold map does not give this local string
-/// a token index that would disambiguate two identical macro names.
-static std::optional<std::pair<size_t, size_t>>
-findUniqueLineControlMacroNameOccurrence(StringRef text, StringRef name) {
+/// Recursive line-control macro repair never treats these textual occurrences
+/// as independent expansion candidates.  The producer has already recorded the
+/// child macro invocations that occurred while expanding the parent macro; this
+/// helper only recovers the corresponding byte ranges in the parent's recovered
+/// replacement-list spelling.
+static SmallVector<std::pair<size_t, size_t>, 4>
+findLineControlMacroNameOccurrences(StringRef text, StringRef name) {
+  SmallVector<std::pair<size_t, size_t>, 4> occurrences;
   if (name.empty())
-    return std::nullopt;
+    return occurrences;
 
-  std::optional<std::pair<size_t, size_t>> found;
   for (size_t pos = 0; pos < text.size();) {
     size_t match = text.find(name, pos);
     if (match == StringRef::npos)
@@ -2090,16 +2089,75 @@ findUniqueLineControlMacroNameOccurrence(StringRef text, StringRef name) {
         match == 0 || !stringutils::isIdentPart(text[match - 1]);
     const bool endsAtIdentBoundary =
         end == text.size() || !stringutils::isIdentPart(text[end]);
-    if (beginsAtIdentBoundary && endsAtIdentBoundary) {
-      if (found)
-        return std::nullopt;
-      found = std::make_pair(match, end);
-    }
+    if (beginsAtIdentBoundary && endsAtIdentBoundary)
+      occurrences.push_back(std::make_pair(match, end));
 
     pos = match + 1;
   }
 
-  return found;
+  return occurrences;
+}
+
+/// Locate the replacement-list occurrence that corresponds to one recorded
+/// child macro invocation.
+///
+/// The earlier proof required the child invocation spelling to occur exactly
+/// once in the parent's recovered replacement text.  That was sound but too
+/// narrow for definitions such as `#define FILE_NAME F F`: the refold map
+/// records both child invocations, and their source byte order disambiguates the
+/// two identical `F` spellings deterministically.  When repeated spellings are
+/// present, require a one-to-one correspondence between recorded same-spelling
+/// children and textual whole-token occurrences, then match them by source order
+/// and occurrence order.  Any unrecorded extra occurrence, missing source range,
+/// or ordering ambiguity still fails closed.
+static std::optional<std::pair<size_t, size_t>>
+findLineControlMacroOccurrenceForChild(
+    const RefoldModel &model, const RefoldModel::MacroInvocation &parent,
+    const RefoldModel::MacroInvocation &child, StringRef text) {
+  if (!child.invText || child.invText->empty())
+    return std::nullopt;
+
+  SmallVector<std::pair<size_t, size_t>, 4> occurrences =
+      findLineControlMacroNameOccurrences(text, *child.invText);
+  if (occurrences.empty())
+    return std::nullopt;
+  if (occurrences.size() == 1)
+    return occurrences.front();
+
+  SmallVector<const RefoldModel::MacroInvocation *, 4> siblings;
+  for (const RefoldModel::MacroInvocation &candidate :
+       model.GetMacroInvocations()) {
+    if (!candidate.callerMacroId || *candidate.callerMacroId != parent.id)
+      continue;
+    if (!candidate.invText || *candidate.invText != *child.invText)
+      continue;
+    if (!candidate.invFile || !candidate.invB || !candidate.invE)
+      return std::nullopt;
+    siblings.push_back(&candidate);
+  }
+
+  // Do not guess which occurrence is semantic when the replacement spelling
+  // contains additional same-spelled identifiers that the producer did not
+  // record as child macro invocations.
+  if (siblings.size() != occurrences.size())
+    return std::nullopt;
+
+  llvm::sort(siblings, [](const RefoldModel::MacroInvocation *lhs,
+                          const RefoldModel::MacroInvocation *rhs) {
+    if (*lhs->invFile != *rhs->invFile)
+      return lhs->invFile->compare(*rhs->invFile) < 0;
+    if (*lhs->invB != *rhs->invB)
+      return *lhs->invB < *rhs->invB;
+    if (*lhs->invE != *rhs->invE)
+      return *lhs->invE < *rhs->invE;
+    return lhs->id < rhs->id;
+  });
+
+  for (size_t i = 0; i != siblings.size(); ++i)
+    if (siblings[i]->id == child.id)
+      return occurrences[i];
+
+  return std::nullopt;
 }
 
 /// Recover invocation argument spellings for a macro invocation that happened
@@ -2198,7 +2256,7 @@ expandLineControlMacroReplacementText(
     }
 
     std::optional<std::pair<size_t, size_t>> occurrence =
-        findUniqueLineControlMacroNameOccurrence(out.text, *child.invText);
+        findLineControlMacroOccurrenceForChild(model, macro, child, out.text);
     if (!occurrence) {
       activeMacroIds.pop_back();
       return std::nullopt;
