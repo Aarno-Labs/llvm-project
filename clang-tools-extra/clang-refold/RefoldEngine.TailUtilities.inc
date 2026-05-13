@@ -2484,14 +2484,16 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         if (sourceEnvelope) {
           SourceLineDirectiveLogicalLineRewriter
               headerSourceLineDirectiveLineRewriter =
-                  [&](StringRef logicalLine, ArrayRef<uint64_t> sourceOffsets)
+                  [&](StringRef logicalLine, ArrayRef<uint64_t> sourceOffsets,
+                      SourceLineDirectiveBuiltinMacroResolver
+                          builtinMacroResolver)
               -> std::optional<SourceLineDirectiveLogicalLineRewrite> {
             return rewriteSourceLineDirectiveLogicalLineMacros(
                 model_, file, logicalLine, sourceOffsets,
                 [&](StringRef lhs, StringRef rhs) {
                   return PathsEqual(lhs, rhs);
                 },
-                ie.include->id);
+                ie.include->id, std::move(builtinMacroResolver));
           };
 
           if (!proveOwnerSourceEnvelopeGaps(
