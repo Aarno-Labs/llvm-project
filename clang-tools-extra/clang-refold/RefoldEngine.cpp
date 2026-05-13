@@ -3985,10 +3985,14 @@ std::string RefoldEngine::RunSinglePassRefold() {
     const bool editStartsAtPhysicalBOL =
         edit.start == 0 || tuBytes[edit.start - 1] == '\n';
     if (editStartsAtPhysicalBOL) {
-      // A before-replacement preservation makes the directive active while the
-      // replacement payload is preprocessed. That placement is admissible only
-      // when the payload cannot observe the restored macro-state transition.
-      if (replacementObservesDefinition)
+      // Before-replacement placement has opposite polarity for #define and
+      // #undef. Re-emitting a consumed #define before the payload makes that
+      // definition active for the replacement, so the payload must not observe
+      // it. Re-emitting a consumed #undef before the payload is the repair: it
+      // intentionally removes any prior live definition before the replacement
+      // tokens are preprocessed, matching the B-side macro-state environment
+      // and keeping later surviving source protected by the same transition.
+      if (directive.subkind == "#define" && replacementObservesDefinition)
         return std::nullopt;
       macroStatePreservationsByEdit[editIndex].push_back(
           MacroStatePreservation{
