@@ -4546,16 +4546,23 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       return group.groupB <= b && b < e && e <= group.groupE;
     };
 
+    auto insideAnyArmBody = [&](uint64_t b, uint64_t e) {
+      for (const RefoldModel::CondArm &arm : group.arms)
+        if (arm.bodyB <= b && b < e && e <= arm.bodyE)
+          return true;
+      return false;
+    };
+
     // The group itself is preserved, but do not treat it as an opaque proof box
-    // if the producer recorded active source artifacts inside it.  Those
-    // artifacts may carry macro, include, pragma, or macro-call state that this
-    // narrow inter-include preservation proof is not responsible for modeling.
+    // if the producer recorded active source artifacts inside an arm body.
+    // Include directives, macro-state directives, and pragmas may affect later
+    // preprocessing state, so any recorded instance still blocks this narrow
+    // preservation proof.  Macro invocations are different: a macro used only
+    // by a #if/#elif control expression is preserved as source spelling along
+    // with the complete group, so it is not hidden or deleted.  Only macro
+    // invocations recorded inside arm bodies remain outside this proof.
     for (const auto &inc : model_.GetIncludes())
       if (PathsEqual(inc.sitePath, tuPath) && insideGroup(inc.siteB, inc.siteE))
-        return false;
-    for (const auto &macro : model_.GetMacroInvocations())
-      if (macro.invFile && PathsEqual(*macro.invFile, tuPath) && macro.invB &&
-          macro.invE && insideGroup(*macro.invB, *macro.invE))
         return false;
     for (const auto &directive : model_.GetMacroDirectives())
       if (PathsEqual(directive.sitePath, tuPath) &&
@@ -4564,6 +4571,11 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     for (const auto &pragma : model_.GetPragmas())
       if (PathsEqual(pragma.sitePath, tuPath) &&
           insideGroup(pragma.siteB, pragma.siteE))
+        return false;
+    for (const auto &macro : model_.GetMacroInvocations())
+      if (macro.invFile && PathsEqual(*macro.invFile, tuPath) && macro.invB &&
+          macro.invE && insideGroup(*macro.invB, *macro.invE) &&
+          insideAnyArmBody(*macro.invB, *macro.invE))
         return false;
 
     return true;
