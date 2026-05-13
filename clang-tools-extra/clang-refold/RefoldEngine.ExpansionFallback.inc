@@ -659,9 +659,10 @@ static bool sourceSuffixMayObservePresumedFileSpelling(
 /// whitespace to one space, preserve string/character literal token spelling,
 /// and finally quote the resulting character sequence as a C string token.
 ///
-/// Explicit backslashes outside literals and comments still fail closed.  They
-/// require either tokenization before stringification or phase/comment state
-/// that this local source-gap proof does not model.
+/// Same-line block comments are modeled as the single whitespace character
+/// produced before macro replacement.  Explicit backslashes outside literals,
+/// line comments, and newline-bearing block comments still fail closed because
+/// they interact with phase-2/directive-line state outside this local proof.
 static std::optional<std::string>
 stringifyLineControlMacroArgument(StringRef argument) {
   StringRef trimmed = argument.trim(" \t\v\f\r\n");
@@ -683,12 +684,37 @@ stringifyLineControlMacroArgument(StringRef argument) {
       continue;
     }
 
-    // Comments are replaced by whitespace before macro stringification.  The
-    // current proof intentionally works from source bytes rather than a PP-token
-    // stream, so do not guess how a comment-bearing argument tokenizes.
-    if (ch == '/' && pos + 1 < trimmed.size() &&
-        (trimmed[pos + 1] == '/' || trimmed[pos + 1] == '*'))
-      return std::nullopt;
+    // Comments are replaced by one whitespace character before macro
+    // stringification.  Because this proof works from the complete recorded
+    // argument spelling, a complete same-line block comment can be modeled as a
+    // pending inter-token space and then normalized with adjacent whitespace
+    // below.  Line comments and newline-bearing block comments remain outside
+    // this local proof: in a preprocessing directive they interact with the
+    // directive-line boundary rather than just the macro argument spelling.
+    if (ch == '/' && pos + 1 < trimmed.size()) {
+      if (trimmed[pos + 1] == '*') {
+        const size_t commentBegin = pos;
+        pos += 2;
+        bool closed = false;
+        while (pos + 1 < trimmed.size()) {
+          if (trimmed[pos] == '\n' || trimmed[pos] == '\r')
+            return std::nullopt;
+          if (trimmed[pos] == '*' && trimmed[pos + 1] == '/') {
+            pos += 2;
+            closed = true;
+            break;
+          }
+          ++pos;
+        }
+        if (!closed)
+          return std::nullopt;
+        if (commentBegin != pos)
+          pendingSpace = !normalized.empty();
+        continue;
+      }
+      if (trimmed[pos + 1] == '/')
+        return std::nullopt;
+    }
 
     // A raw backslash outside a literal participates in translation phase 2 or
     // an implementation-specific token spelling.  Keep this bounded proof to
