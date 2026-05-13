@@ -1223,22 +1223,78 @@ computeSourceLineDirectiveGapResume(
       SourceLineDirectiveBuiltinMacroResolver builtinMacroResolver =
           [&](const RefoldModel::MacroInvocation &macro)
           -> std::optional<std::string> {
-        if (macro.name != "__LINE__" || macro.subkind != "obj" ||
+        if (macro.subkind != "obj" ||
             sourceLineDirectiveMacroHasMaterializedPPTokens(macro) ||
             !macro.invB || !macro.invE || *macro.invB >= *macro.invE)
           return std::nullopt;
 
-        if (sawLineDirective) {
-          const size_t delta = stringutils::countNonSplicedNewlines(
-              fileText, static_cast<size_t>(lastAfterDirectiveOffset),
-              static_cast<size_t>(*macro.invB));
-          return std::to_string(lastLineAfterDirective + delta);
+        // Predefined location macros inside #line operands expand according to
+        // the presumed location state at the invocation site.  When this gap
+        // proof has already accepted an earlier line-control directive in the
+        // same consumed interval, the running state below is exact.  Otherwise
+        // use the physical source location only if the prefix contains no
+        // earlier line-control directive that could have changed the presumed
+        // file/line state outside the gap being proved.
+        auto currentPresumedFileSpelling = [&]() -> std::optional<std::string> {
+          if (sawLineDirective)
+            return currentFileSpelling;
+          if (prefixHasLineControl)
+            return std::nullopt;
+          if (macro.invFile && !macro.invFile->empty())
+            return macro.invFile->str();
+          return defaultFileSpelling.str();
+        };
+
+        if (macro.name == "__LINE__") {
+          if (sawLineDirective) {
+            const size_t delta = stringutils::countNonSplicedNewlines(
+                fileText, static_cast<size_t>(lastAfterDirectiveOffset),
+                static_cast<size_t>(*macro.invB));
+            return std::to_string(lastLineAfterDirective + delta);
+          }
+
+          if (prefixHasLineControl)
+            return std::nullopt;
+
+          return std::to_string(
+              stringutils::lineAtOffset(fileText, *macro.invB));
         }
 
-        if (prefixHasLineControl)
-          return std::nullopt;
+        auto formatLineControlFileOperand =
+            [](StringRef fileSpelling) -> std::optional<std::string> {
+          // The rewritten directive is parsed by the same narrow #line parser
+          // used for source-spelled gaps.  Keep that parser's inverse exact:
+          // quote the file operand and escape only bytes meaningful inside the
+          // directive string.  Physical newlines cannot appear inside the
+          // single logical directive line being proved.
+          if (fileSpelling.contains('\n') || fileSpelling.contains('\r'))
+            return std::nullopt;
 
-        return std::to_string(stringutils::lineAtOffset(fileText, *macro.invB));
+          std::string replacement = "\"";
+          replacement +=
+              LineDirectiveInserter::EscapeForLineDirective(fileSpelling);
+          replacement += "\"";
+          return replacement;
+        };
+
+        if (macro.name == "__FILE__") {
+          std::optional<std::string> fileSpelling =
+              currentPresumedFileSpelling();
+          if (!fileSpelling)
+            return std::nullopt;
+          return formatLineControlFileOperand(*fileSpelling);
+        }
+
+        if (macro.name == "__FILE_NAME__") {
+          std::optional<std::string> fileSpelling =
+              currentPresumedFileSpelling();
+          if (!fileSpelling)
+            return std::nullopt;
+          return formatLineControlFileOperand(
+              sys::path::filename(StringRef(*fileSpelling)));
+        }
+
+        return std::nullopt;
       };
 
       rewrite = logicalLineRewriter(logicalLine, logicalLineSourceOffsets,
