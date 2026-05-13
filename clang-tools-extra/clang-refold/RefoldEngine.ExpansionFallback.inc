@@ -1744,9 +1744,10 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     }
 
     // The envelope may widen across physical gaps between required pieces, but
-    // only across lexical trivia or complete zero-token source artifacts.
-    // Complete comments are consumed with the replacement for the same reason
-    // as whitespace: they contribute no PP tokens and are physically inside the
+    // only across source-neutral control/trivia or complete zero-token source
+    // artifacts.  Complete comments and literal empty conditional-control
+    // islands are consumed with the replacement for the same reason as
+    // whitespace: they contribute no PP tokens and are physically inside the
     // source interval whose A-side material was replaced by the B-side hunk.
     // Any other byte would be meaningful source text that the proof has not
     // justified replacing.
@@ -1754,7 +1755,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     for (const auto &piece : mergedPieces) {
       if (piece.first > cursor) {
         StringRef gap = tuBytes.slice(cursor, piece.first);
-        if (!isWsOrCompleteCommentTrivia(gap) &&
+        if (!isPreservableIncludeClosureGapTrivia(gap) &&
             !gapIsConsumableZeroTokenSourceClosure(cursor, piece.first)) {
           trace("fallback",
                 "TU/include closure rejected: non-trivia TU gap inside "
