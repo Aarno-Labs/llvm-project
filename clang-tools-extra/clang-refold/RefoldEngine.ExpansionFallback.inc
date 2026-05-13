@@ -619,6 +619,165 @@ static bool sourcePrefixMayContainLineControlDirective(StringRef fileText,
   return false;
 }
 
+/// Return true iff `c` is one of the hexadecimal digits accepted by C escape
+/// sequences.  Keep this helper local to the line-control proof so the escape
+/// decoder below is byte-oriented and independent from any host locale state.
+static bool isLineControlHexDigit(char c) {
+  return ('0' <= c && c <= '9') || ('a' <= c && c <= 'f') ||
+         ('A' <= c && c <= 'F');
+}
+
+/// Convert a hexadecimal digit already accepted by isLineControlHexDigit().
+static unsigned lineControlHexValue(char c) {
+  if ('0' <= c && c <= '9')
+    return static_cast<unsigned>(c - '0');
+  if ('a' <= c && c <= 'f')
+    return static_cast<unsigned>(c - 'a' + 10);
+  return static_cast<unsigned>(c - 'A' + 10);
+}
+
+/// Decode a greedy hexadecimal escape value and advance `rest` past every hex
+/// digit consumed by the C string-literal grammar.  Values outside one byte are
+/// rejected before arithmetic can overflow.
+static std::optional<unsigned>
+decodeBoundedLineControlHexEscapeValue(StringRef &rest) {
+  if (rest.empty() || !isLineControlHexDigit(rest.front()))
+    return std::nullopt;
+
+  unsigned value = 0;
+  do {
+    const unsigned digit = lineControlHexValue(rest.front());
+    if (value > (0xffu - digit) / 16u)
+      return std::nullopt;
+    value = (value * 16u) + digit;
+    rest = rest.drop_front();
+  } while (!rest.empty() && isLineControlHexDigit(rest.front()));
+
+  return value;
+}
+
+/// Return true iff a decoded numeric filename byte can be replayed by this
+/// proof's #line formatter without introducing control-flow-sensitive source
+/// structure into the emitted directive.
+///
+/// Numeric C escapes are decoded only for ordinary printable ASCII bytes.  That
+/// covers the deterministic filename spellings needed for source-only
+/// line-control repair while avoiding implementation-defined character-set
+/// questions and bytes such as physical newlines, NUL, or other controls that
+/// LineDirectiveInserter::EscapeForLineDirective() does not currently model.
+static bool isReplayableLineControlNumericFilenameByte(unsigned value) {
+  return 0x20 <= value && value <= 0x7e;
+}
+
+/// Decode the bounded subset of C string-literal escapes that this source-only
+/// line-control proof can replay exactly for a filename operand.
+///
+/// The parser accepts:
+/// * ordinary unknown escapes, whose observable spelling is the escaped byte;
+/// * escaped quote, question mark, and backslash;
+/// * bounded octal escapes that decode to printable ASCII; and
+/// * bounded hexadecimal escapes that decode to printable ASCII.
+///
+/// Named control escapes (`\n`, `\t`, etc.), universal-character names, empty
+/// hex escapes, out-of-range numeric escapes, and physical line breaks fail
+/// closed.  Those forms either require a wider C string-literal interpreter or
+/// would produce bytes the current #line formatter cannot replay safely.
+static std::optional<char> decodeLineControlFilenameEscape(StringRef &rest) {
+  if (rest.empty())
+    return std::nullopt;
+
+  const char escaped = rest.front();
+  if (escaped == '\n' || escaped == '\r')
+    return std::nullopt;
+
+  if ('0' <= escaped && escaped <= '7') {
+    unsigned value = 0;
+    unsigned digits = 0;
+    while (!rest.empty() && digits < 3 && '0' <= rest.front() &&
+           rest.front() <= '7') {
+      value = (value * 8) + static_cast<unsigned>(rest.front() - '0');
+      rest = rest.drop_front();
+      ++digits;
+    }
+    if (!isReplayableLineControlNumericFilenameByte(value))
+      return std::nullopt;
+    return static_cast<char>(value);
+  }
+
+  if (escaped == 'x') {
+    rest = rest.drop_front();
+    std::optional<unsigned> value =
+        decodeBoundedLineControlHexEscapeValue(rest);
+    if (!value || !isReplayableLineControlNumericFilenameByte(*value))
+      return std::nullopt;
+    return static_cast<char>(*value);
+  }
+
+  switch (escaped) {
+  case '\"':
+  case '?':
+  case '\\':
+    rest = rest.drop_front();
+    return escaped;
+  case 'a':
+  case 'b':
+  case 'e':
+  case 'E':
+  case 'f':
+  case 'n':
+  case 'r':
+  case 't':
+  case 'v':
+  case 'u':
+  case 'U':
+    return std::nullopt;
+  default:
+    // Clang's warningful ordinary unknown escapes in #line filenames delete the
+    // backslash and preserve the escaped byte.  This matches the prior bounded
+    // raw-backslash proof and is still reparsed by the strict directive parser.
+    rest = rest.drop_front();
+    return escaped;
+  }
+}
+
+/// Parse and decode a quoted #line filename operand.
+///
+/// This is deliberately narrower than a general C string-literal parser.  It is
+/// the inverse of the filename spellings this proof may synthesize and replay:
+/// exact ordinary bytes, conservative quote/backslash escapes, warningful
+/// ordinary unknown escapes, and printable-ASCII numeric escapes.  Unsupported
+/// escape forms fail closed so the owner-envelope closure can fall back instead
+/// of guessing the filename state observed by later `__FILE__` uses.
+static std::optional<std::string>
+parseLineControlFilenameLiteral(StringRef &rest) {
+  if (!rest.consume_front("\""))
+    return std::nullopt;
+
+  std::string fileSpelling;
+  bool closedQuote = false;
+  while (!rest.empty()) {
+    char ch = rest.front();
+    rest = rest.drop_front();
+    if (ch == '\"') {
+      closedQuote = true;
+      break;
+    }
+    if (ch == '\n' || ch == '\r')
+      return std::nullopt;
+    if (ch == '\\') {
+      std::optional<char> decoded = decodeLineControlFilenameEscape(rest);
+      if (!decoded)
+        return std::nullopt;
+      ch = *decoded;
+    }
+    fileSpelling.push_back(ch);
+  }
+
+  if (!closedQuote)
+    return std::nullopt;
+  return fileSpelling;
+}
+
 /// Parse one source-spelled line-control directive logical line.
 ///
 /// The refold map does not currently record line-control directives as
@@ -681,29 +840,12 @@ parseSourceLineDirectiveLogicalLine(StringRef line,
   std::string fileSpelling = currentFileSpelling.str();
   bool hasExplicitFileSpelling = false;
   if (!rest.empty()) {
-    if (!rest.consume_front("\""))
-      return std::nullopt;
-
     hasExplicitFileSpelling = true;
-    fileSpelling.clear();
-    bool closedQuote = false;
-    while (!rest.empty()) {
-      char ch = rest.front();
-      rest = rest.drop_front();
-      if (ch == '\"') {
-        closedQuote = true;
-        break;
-      }
-      if (ch == '\\') {
-        if (rest.empty())
-          return std::nullopt;
-        ch = rest.front();
-        rest = rest.drop_front();
-      }
-      fileSpelling.push_back(ch);
-    }
-    if (!closedQuote)
+    std::optional<std::string> parsedFileSpelling =
+        parseLineControlFilenameLiteral(rest);
+    if (!parsedFileSpelling)
       return std::nullopt;
+    fileSpelling = std::move(*parsedFileSpelling);
   }
 
   std::string lineMarkerFlags;
@@ -879,32 +1021,61 @@ static bool sourceSuffixMayObservePresumedFileSpelling(
   return false;
 }
 
-/// Return true iff a raw backslash escape in a line-control stringification
-/// operand has the same decoded spelling under the local parser used by this
-/// proof and Clang's string-literal interpretation for `#line` filenames.
+/// Return the end offset of an admitted raw backslash escape in an argument
+/// that is about to be macro-stringified for a line-control filename operand.
 ///
 /// C macro stringification only doubles backslashes that occur inside string or
 /// character literals.  A backslash that appears as its own preprocessing-token
-/// spelling outside a literal is copied into the stringified filename operand
-/// verbatim.  For line-control repair we can safely model only the escape forms
-/// whose observable filename byte is obtained by deleting the backslash:
-/// unknown ordinary escapes, escaped quote/question/backslash, and escaped
-/// horizontal whitespace.  Numeric escapes, universal-character escapes, and
-/// named control escapes are rejected because proving their decoded byte
-/// sequence would require a broader C string-literal interpreter than this
-/// proof owns.
-static bool isAdmittedLineControlRawStringifyEscape(char escaped) {
+/// spelling outside a literal is copied into the generated filename string
+/// literal verbatim.  This helper admits exactly the raw escape spellings that
+/// parseLineControlFilenameLiteral() can decode and
+/// formatSourceLineDirectiveGapResume() can replay without guessing:
+/// * warningful ordinary unknown escapes;
+/// * escaped quote, question mark, backslash, and horizontal whitespace; and
+/// * bounded octal/hexadecimal escapes that decode to printable ASCII.
+///
+/// Named control escapes and universal-character names remain fail-closed.
+/// They are deterministic C escapes, but replaying their decoded control or
+/// non-ASCII bytes would require a wider filename-literal and #line formatting
+/// proof than this owner-envelope closure currently owns.
+static std::optional<size_t>
+findAdmittedLineControlRawStringifyEscapeEnd(StringRef text,
+                                             size_t backslashPos) {
+  if (backslashPos >= text.size() || text[backslashPos] != '\\' ||
+      backslashPos + 1 >= text.size())
+    return std::nullopt;
+
+  size_t cursor = backslashPos + 1;
+  const char escaped = text[cursor];
   if (escaped == '\n' || escaped == '\r')
-    return false;
+    return std::nullopt;
 
-  if (escaped == '\"' || escaped == '?' || escaped == '\\')
-    return true;
+  if ('0' <= escaped && escaped <= '7') {
+    unsigned value = 0;
+    unsigned digits = 0;
+    while (cursor < text.size() && digits < 3 && '0' <= text[cursor] &&
+           text[cursor] <= '7') {
+      value = (value * 8) + static_cast<unsigned>(text[cursor] - '0');
+      ++cursor;
+      ++digits;
+    }
+    if (!isReplayableLineControlNumericFilenameByte(value))
+      return std::nullopt;
+    return cursor;
+  }
 
-  if (stringutils::isNonNewlineWs(escaped))
-    return true;
+  if (escaped == 'x') {
+    StringRef tail = text.substr(cursor + 1);
+    std::optional<unsigned> value =
+        decodeBoundedLineControlHexEscapeValue(tail);
+    if (!value || !isReplayableLineControlNumericFilenameByte(*value))
+      return std::nullopt;
+    return text.size() - tail.size();
+  }
 
-  if ('0' <= escaped && escaped <= '7')
-    return false;
+  if (escaped == '\"' || escaped == '?' || escaped == '\\' ||
+      stringutils::isNonNewlineWs(escaped))
+    return backslashPos + 2;
 
   switch (escaped) {
   case 'a':
@@ -916,12 +1087,11 @@ static bool isAdmittedLineControlRawStringifyEscape(char escaped) {
   case 'r':
   case 't':
   case 'v':
-  case 'x':
   case 'u':
   case 'U':
-    return false;
+    return std::nullopt;
   default:
-    return true;
+    return backslashPos + 2;
   }
 }
 
@@ -937,10 +1107,10 @@ static bool isAdmittedLineControlRawStringifyEscape(char escaped) {
 ///
 /// Complete block comments are modeled as the single whitespace character
 /// produced before macro replacement, even when the comment body spans physical
-/// source lines.  A raw backslash outside a literal is admitted only for the
-/// bounded escape subset accepted by
-/// isAdmittedLineControlRawStringifyEscape(); all other escape forms fail
-/// closed and must be handled by a wider proof or terminal fallback.
+/// source lines.  A raw backslash outside a literal is admitted only when the
+/// resulting filename string-literal escape is decoded by the bounded
+/// line-control filename parser above; all other escape forms fail closed and
+/// must be handled by a wider proof or terminal fallback.
 static std::optional<std::string>
 stringifyLineControlMacroArgument(StringRef argument) {
   StringRef trimmed = argument.trim(" \t\v\f\r\n");
@@ -1000,23 +1170,19 @@ stringifyLineControlMacroArgument(StringRef argument) {
     }
 
     if (ch == '\\') {
-      if (pos + 1 >= trimmed.size())
-        return std::nullopt;
-
-      const char escaped = trimmed[pos + 1];
-      if (!isAdmittedLineControlRawStringifyEscape(escaped))
+      std::optional<size_t> escapeEnd =
+          findAdmittedLineControlRawStringifyEscapeEnd(trimmed, pos);
+      if (!escapeEnd)
         return std::nullopt;
 
       appendPendingSpace();
       // Outside a literal, macro stringification copies this backslash into the
-      // generated filename string literal rather than doubling it.  The strict
-      // line-control parser that consumes this spelling below models precisely
-      // the admitted subset above by deleting the backslash and preserving the
-      // escaped byte.
-      stringified.push_back('\\');
-      stringified.push_back(escaped);
+      // generated filename string literal rather than doubling it.  Preserve the
+      // whole admitted raw escape spelling and let the strict filename-literal
+      // parser decode the same bounded subset that was proved above.
+      stringified.append(trimmed.begin() + pos, trimmed.begin() + *escapeEnd);
       hasPayload = true;
-      pos += 2;
+      pos = *escapeEnd;
       continue;
     }
 
