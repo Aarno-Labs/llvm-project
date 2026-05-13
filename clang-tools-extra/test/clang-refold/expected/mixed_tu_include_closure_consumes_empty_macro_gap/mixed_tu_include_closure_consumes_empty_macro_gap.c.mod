@@ -1,4 +1,4 @@
-// RUN: %clang-refold-tester mixed_tu_include_closure_rejects_empty_macro_gap
+// RUN: %clang-refold-tester mixed_tu_include_closure_consumes_empty_macro_gap
 #define KEEP(x) ((x) + 1)
 #define EMPTY
 
