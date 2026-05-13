@@ -4064,16 +4064,23 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     // Function-like zero-token wrappers are admissible only in a narrow
     // forwarding domain.  The replacement list may mention formals, and after
     // substitution each used argument must itself be tiled by recorded
-    // zero-token macro invocations plus trivia.  This admits FORWARD(EMPTY)
-    // without trying to model arbitrary macro semantics.
+    // zero-token macro invocations plus trivia.  This admits wrappers such as
+    // FORWARD(EMPTY) and VAR_FORWARD(EMPTY) without trying to model arbitrary
+    // macro semantics.
     if (m.subkind == "func") {
       if (m.defParams.empty() || m.invArgRanges.size() < m.defParams.size())
         return finish(false);
 
       DenseMap<StringRef, unsigned> paramIndexByName;
       for (unsigned i = 0, e = m.defParams.size(); i != e; ++i) {
-        if (m.defParams[i].variadic)
-          return finish(false);
+        // Variadic formals are safe in the same proof domain as ordinary
+        // formals: the replacement list may only forward the formal spelling,
+        // and the corresponding invocation argument range must be wholly tiled
+        // by recorded nested zero-token calls plus trivia.  We therefore do
+        // not need a separate variadic macro evaluator here; non-empty
+        // variadic material, punctuation, __VA_OPT__, #, ##, and unrecorded
+        // tokens still fail below because they are not formal identifiers whose
+        // argument ranges satisfy the neutral tiling proof.
         paramIndexByName.try_emplace(m.defParams[i].name, i);
       }
 
