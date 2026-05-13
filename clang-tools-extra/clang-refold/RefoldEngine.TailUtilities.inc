@@ -913,20 +913,59 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       });
     };
 
+    enum class HeaderZeroTokenRangeSurface {
+      DefinitionReplacementList,
+      InvocationArgument
+    };
+
     auto sourceRangeIsTiledByNeutralNestedMacros =
-        [&](uint64_t begin, uint64_t end, StringRef rangeFile) -> bool {
+        [&](uint64_t begin, uint64_t end, StringRef rangeFile,
+            HeaderZeroTokenRangeSurface surface) -> bool {
       if (begin > end)
         return false;
+
+      // The byte coordinates recorded for a nested zero-token proof may refer
+      // either to the defining directive's replacement-list spelling or to the
+      // materialized invocation argument spelling in the current header.  Those
+      // two surfaces can be in the same physical file, so path equality alone
+      // is not enough to decide which buffer should be sliced.  Keep the origin
+      // explicit at each callsite: replacement-list tiling uses the producer's
+      // recorded directive text, while formal-argument tiling uses the actual
+      // materialized header bytes at the invocation callsite.
+      auto sliceTrivia = [&](uint64_t sliceBegin, uint64_t sliceEnd)
+          -> std::optional<StringRef> {
+        if (sliceEnd < sliceBegin)
+          return std::nullopt;
+
+        switch (surface) {
+        case HeaderZeroTokenRangeSurface::DefinitionReplacementList: {
+          if (!PathsEqual(rangeFile, replacement->directive->sitePath))
+            return std::nullopt;
+          const uint64_t textBegin = replacement->fileBase;
+          const uint64_t textEnd =
+              replacement->fileBase + replacement->directive->text.size();
+          if (sliceBegin < textBegin || sliceEnd > textEnd)
+            return std::nullopt;
+          return replacement->directive->text.slice(
+              static_cast<size_t>(sliceBegin - replacement->fileBase),
+              static_cast<size_t>(sliceEnd - replacement->fileBase));
+        }
+        case HeaderZeroTokenRangeSurface::InvocationArgument:
+          if (!PathsEqual(rangeFile, file) || sliceEnd > headerText.size())
+            return std::nullopt;
+          return StringRef(headerText).slice(sliceBegin, sliceEnd);
+        }
+
+        return std::nullopt;
+      };
 
       SmallVector<ChildPiece, 8> children;
       for (const auto &candidate : model_.GetMacroInvocations()) {
         if (!candidate.callerMacroId || *candidate.callerMacroId != m.id)
           continue;
 
-        // The range can be either the defining directive's replacement list or
-        // the invocation argument text in this materialized header.  Only
-        // nested invocations physically spelled in that same source range are
-        // allowed to account for non-trivia bytes.
+        // Only nested invocations physically spelled on the same source surface
+        // may account for non-trivia bytes in the checked interval.
         if (!candidate.invFile || candidate.invFile->empty() ||
             !PathsEqual(*candidate.invFile, rangeFile))
           continue;
@@ -934,6 +973,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
             *candidate.invB >= *candidate.invE)
           continue;
         if (*candidate.invB < begin || end < *candidate.invE)
+          continue;
+        if (!sliceTrivia(*candidate.invB, *candidate.invE))
           continue;
 
         children.push_back({*candidate.invB, *candidate.invE, &candidate});
@@ -946,26 +987,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         if (piece.begin < cursor)
           return false;
 
-        StringRef gap;
-        if (PathsEqual(rangeFile, replacement->directive->sitePath)) {
-          if (cursor < replacement->fileBase || piece.begin < cursor ||
-              piece.begin > replacement->fileBase +
-                                replacement->directive->text.size())
-            return false;
-          const size_t gapBegin =
-              static_cast<size_t>(cursor - replacement->fileBase);
-          const size_t gapEnd =
-              static_cast<size_t>(piece.begin - replacement->fileBase);
-          gap = replacement->directive->text.slice(gapBegin, gapEnd);
-        } else if (PathsEqual(rangeFile, file)) {
-          if (piece.begin > headerText.size())
-            return false;
-          gap = StringRef(headerText).slice(cursor, piece.begin);
-        } else {
-          return false;
-        }
-
-        if (!isWsOrCompleteCommentTrivia(gap))
+        std::optional<StringRef> gap = sliceTrivia(cursor, piece.begin);
+        if (!gap || !isWsOrCompleteCommentTrivia(*gap))
           return false;
         if (!headerMacroInvocationIsSourceNeutralZeroTokenImpl(*piece.child,
                                                               visiting))
@@ -973,25 +996,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         cursor = piece.end;
       }
 
-      StringRef suffix;
-      if (PathsEqual(rangeFile, replacement->directive->sitePath)) {
-        if (cursor < replacement->fileBase || end < cursor ||
-            end > replacement->fileBase + replacement->directive->text.size())
-          return false;
-        const size_t suffixBegin =
-            static_cast<size_t>(cursor - replacement->fileBase);
-        const size_t suffixEnd =
-            static_cast<size_t>(end - replacement->fileBase);
-        suffix = replacement->directive->text.slice(suffixBegin, suffixEnd);
-      } else if (PathsEqual(rangeFile, file)) {
-        if (end > headerText.size())
-          return false;
-        suffix = StringRef(headerText).slice(cursor, end);
-      } else {
-        return false;
-      }
-
-      return isWsOrCompleteCommentTrivia(suffix);
+      std::optional<StringRef> suffix = sliceTrivia(cursor, end);
+      return suffix && isWsOrCompleteCommentTrivia(*suffix);
     };
 
     StringRef replacementText =
@@ -1006,9 +1012,10 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     // list must be covered by a nested macro invocation that recursively proves
     // zero-token neutrality.  The formal-parameter proof below is an additional
     // admissible case, not a replacement for this one.
-    if (sourceRangeIsTiledByNeutralNestedMacros(replacement->fileBegin,
-                                                replacement->fileEnd,
-                                                replacement->directive->sitePath))
+    if (sourceRangeIsTiledByNeutralNestedMacros(
+            replacement->fileBegin, replacement->fileEnd,
+            replacement->directive->sitePath,
+            HeaderZeroTokenRangeSurface::DefinitionReplacementList))
       return finish(true);
 
     if (m.subkind == "func") {
@@ -1017,11 +1024,14 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
 
       DenseMap<StringRef, unsigned> paramIndexByName;
       for (unsigned i = 0, e = m.defParams.size(); i != e; ++i) {
-        // Variadic substitution is deliberately outside this proof.  It can
-        // introduce separators and empty/non-empty distinctions that are not
-        // represented by this simple per-formal range check.
-        if (m.defParams[i].variadic)
-          return finish(false);
+        // Variadic formals are safe in the same narrow forwarding proof as
+        // ordinary formals.  The replacement list may only mention the formal
+        // identifier, and the corresponding invocation argument range must be
+        // tiled entirely by recorded nested zero-token macro invocations plus
+        // trivia below.  This is not a general variadic macro evaluator:
+        // non-empty variadic material, punctuation, __VA_OPT__, #, ##, and
+        // unrecorded source still fail closed because they are not formal
+        // identifiers whose argument ranges discharge the neutral tiling proof.
         paramIndexByName.try_emplace(m.defParams[i].name, i);
       }
 
@@ -1077,8 +1087,9 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
           return finish(false);
         if (!m.invFile || m.invFile->empty())
           return finish(false);
-        if (!sourceRangeIsTiledByNeutralNestedMacros(*range.first,
-                                                     *range.second, *m.invFile))
+        if (!sourceRangeIsTiledByNeutralNestedMacros(
+                *range.first, *range.second, *m.invFile,
+                HeaderZeroTokenRangeSurface::InvocationArgument))
           return finish(false);
       }
 
@@ -2422,9 +2433,16 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       const bool shouldTryFullHeaderEnvelope =
           declClippedNonEmptyPatch || hasCompleteChildIncludePiece ||
           hasCompleteMacroInvocationPiece || hasCompleteConditionalGroupPiece;
-      if (shouldTryFullHeaderEnvelope && !hasPartialChildIncludeOverlap &&
-          !hasPartialMacroInvocationOverlap &&
-          !hasPartialConditionalGroupOverlap) {
+      const bool fullHeaderEnvelopeBlockedByPartialOverlap =
+          shouldTryFullHeaderEnvelope &&
+          (hasPartialChildIncludeOverlap || hasPartialMacroInvocationOverlap ||
+           hasPartialConditionalGroupOverlap);
+      const bool mustUseFullHeaderEnvelope =
+          hasCompleteChildIncludePiece || hasCompleteMacroInvocationPiece ||
+          hasCompleteConditionalGroupPiece ||
+          fullHeaderEnvelopeBlockedByPartialOverlap;
+      if (shouldTryFullHeaderEnvelope &&
+          !fullHeaderEnvelopeBlockedByPartialOverlap) {
         std::optional<OwnerProofSourceEnvelope> sourceEnvelope;
         if (hunkSourcePieces.size() >= 2 &&
             normalizeOwnerProofPieces(
@@ -2652,6 +2670,30 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                   headerGapPreservations.size(), hunkSourcePieces.size());
           }
         }
+      }
+
+      // If the replacement material intersects complete child source structure
+      // owned by this header, a plain mapped-token edit is not a valid proof: it
+      // can replace only the directly mapped parent tokens and leave stale
+      // neighboring macro/include syntax behind.  Either the edit widened to the
+      // proven source envelope above, or this include must be realized from B.
+      if (fullHeaderEnvelopeBlockedByPartialOverlap) {
+        plan.requiresIncludeRealization = true;
+        plan.realizationReason =
+            llvm::formatv("DELETE/REPLACE: patch[{0}] in header file {1} "
+                          "partially overlaps source-envelope structure",
+                          idx, file)
+                .str();
+        return plan;
+      }
+      if (mustUseFullHeaderEnvelope && !usedFullHeaderEnvelope) {
+        plan.requiresIncludeRealization = true;
+        plan.realizationReason =
+            llvm::formatv("DELETE/REPLACE: patch[{0}] in header file {1} "
+                          "requires a full source-envelope proof",
+                          idx, file)
+                .str();
+        return plan;
       }
     }
 
