@@ -287,7 +287,7 @@ struct LcsBGapProvenance {
   bool hasLeftToken = false;
   bool hasRightToken = false;
   bool gapContainsNewline = false;
-  bool gapContainsOnlyWhitespace = true;
+  bool gapContainsOnlyWs = true;
   bool gapAtLineStart = false;
   bool gapAtLineEnd = false;
   bool leftTokenStartsLine = false;

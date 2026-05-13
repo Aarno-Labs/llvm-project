@@ -222,7 +222,7 @@ void lexPPTokens(const std::string &bytes, std::vector<PPTok> &out,
 
     trace("lexer/parsed", "kind={0} spelled={1} off={2} len={3} li={4} co={5}",
           kindName,
-          stringutils::showWS(stringutils::clip(StringRef(ppt.spelling), 80)),
+          stringutils::showWs(stringutils::clip(StringRef(ppt.spelling), 80)),
           off, len, line, col);
 
     out.push_back(std::move(ppt));
@@ -1019,9 +1019,9 @@ static Error compareTokens(ArrayRef<PPTok> aToks, ArrayRef<PPTok> bToks) {
   // Compare token spellings up to the min length first.
   const size_t n = std::min(aToks.size(), bToks.size());
   for (size_t i = 0; i < n; ++i) {
-    const std::string aDbg = stringutils::showWS(
+    const std::string aDbg = stringutils::showWs(
         stringutils::clip(StringRef(aToks[i].spelling), 100));
-    const std::string bDbg = stringutils::showWS(
+    const std::string bDbg = stringutils::showWs(
         stringutils::clip(StringRef(bToks[i].spelling), 180));
     if (aToks[i].spelling != bToks[i].spelling) {
       return createStringError(
@@ -1048,9 +1048,9 @@ static Error compareTokensNoLinesAware(ArrayRef<PPTok> aToks,
   // Compare token spellings up to the min length first.
   const size_t n = std::min(aToks.size(), bToks.size());
   for (size_t i = 0; i < n; ++i) {
-    const std::string aDbg = stringutils::showWS(
+    const std::string aDbg = stringutils::showWs(
         stringutils::clip(StringRef(aToks[i].spelling), 100));
-    const std::string bDbg = stringutils::showWS(
+    const std::string bDbg = stringutils::showWs(
         stringutils::clip(StringRef(bToks[i].spelling), 180));
 
     if (aToks[i].spelling != bToks[i].spelling) {

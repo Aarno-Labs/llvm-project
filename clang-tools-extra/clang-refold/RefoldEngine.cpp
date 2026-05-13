@@ -1167,7 +1167,7 @@ std::string RefoldEngine::BuildTheoremAuditInvariantDetail() const {
   const std::string firstViolation =
       lastTheoremAudit_.firstViolation.empty()
           ? std::string("<none>")
-          : stringutils::showWSWithClip(lastTheoremAudit_.firstViolation, 200);
+          : stringutils::showWsWithClip(lastTheoremAudit_.firstViolation, 200);
 
   return llvm::formatv(
              "strict theorem-audit invariant violation: firstViolation='{0}' "
@@ -2031,7 +2031,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
     StringRef bfrag = bSource_.substr(lo, hi - lo);
 
     // Happy Path: Log the successfully extracted fragment
-    std::string shown = stringutils::showWSWithClip(bfrag, 160);
+    std::string shown = stringutils::showWsWithClip(bfrag, 160);
     debug("hunks", "#{0} {1:verbose} B='{2}'", i, h, shown);
   }
 
@@ -2150,7 +2150,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
     b1 = std::min(b1, bMax);
     StringRef lead = SliceBSource(b0, std::min(b0 + 24, b1));
     trace(tag, "{0}: Btok=[{1},{2}) lead='{3}'", label, b0, b1,
-          stringutils::showWSWithClip(lead, 220));
+          stringutils::showWsWithClip(lead, 220));
   };
 
   auto hasTopLevelCommaInReplacement = [&](StringRef text) -> bool {
@@ -2631,7 +2631,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
                     "TU insertion consumes ordinary separator gap [{0},{1}) "
                     "for punctuation '{2}'",
                     gapBegin, span->first,
-                    stringutils::showWSWithClip(replFirstTok->Spelling, 40));
+                    stringutils::showWsWithClip(replFirstTok->Spelling, 40));
               span->first = gapBegin;
               consumedSeparatorGapForPunctuation = true;
             }
@@ -2669,7 +2669,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
         }
 
         bool replacingGap =
-            !original.empty() && stringutils::isWhitespace(original);
+            !original.empty() && stringutils::isWs(original);
 
         // If we’re replacing a non-empty TU gap and the inserted text doesn’t
         // start with WS, prefix EXACTLY ONE space from the gap to preserve
@@ -2692,8 +2692,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
 
         debug("classify",
               "#{0} -> TU  bytes=[{1},{2}) rawRepl='{3}' paddedRepl='{4}'", i,
-              span->first, span->second, stringutils::showWSWithClip(repl, 160),
-              stringutils::showWSWithClip(padded, 160));
+              span->first, span->second, stringutils::showWsWithClip(repl, 160),
+              stringutils::showWsWithClip(padded, 160));
 
         ResyncOutcome ro = ApplyResyncOrPend(tuBytes, span->first, span->second,
                                              padded, tuPath);
@@ -2901,7 +2901,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
                   "TU conservative insertion consumes ordinary separator gap "
                   "[{0},{1}) for punctuation '{2}'",
                   gapBegin, span->first,
-                  stringutils::showWSWithClip(replFirstTok->Spelling, 40));
+                  stringutils::showWsWithClip(replFirstTok->Spelling, 40));
             span->first = gapBegin;
             consumedSeparatorGapForPunctuation = true;
           }
@@ -2933,7 +2933,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
       if (span->first < span->second) {
         std::string original(tuBytes.data() + span->first,
                              tuBytes.data() + span->second);
-        replacingGap = !original.empty() && stringutils::isWhitespace(original);
+        replacingGap = !original.empty() && stringutils::isWs(original);
         if (replacingGap && !consumedSeparatorGapForPunctuation) {
           // Preserve exactly the gap as the replacement.
           repl = std::move(original);
@@ -2964,8 +2964,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
             "#{0} -> TU (conservative) bytes=[{1},{2}) rawRepl='{3}' "
             "paddedRepl='{4}'",
             i, span->first, span->second,
-            stringutils::showWSWithClip(rawRepl, 160),
-            stringutils::showWSWithClip(padded, 160));
+            stringutils::showWsWithClip(rawRepl, 160),
+            stringutils::showWsWithClip(padded, 160));
 
       ResyncOutcome ro =
           ApplyResyncOrPend(tuBytes, span->first, span->second, padded, tuPath);
@@ -4067,7 +4067,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
     }
 
     if (needsTUPrologue &&
-        !stringutils::startsWithAfterWhitespace(StringRef(tuResult), "#line")) {
+        !stringutils::startsWithAfterWs(StringRef(tuResult), "#line")) {
       std::string dir = lineDirs_.FormatLineDirective(1, tuPath);
       if (!dir.empty())
         tuResult.insert(0, dir);
@@ -4096,7 +4096,7 @@ std::vector<StringRef> RefoldEngine::MapLexemes(ArrayRef<PPTok> toks,
   out.reserve(toks.size());
   for (std::size_t i = 0; i < toks.size(); ++i) {
     const auto &s = toks[i].spelling;
-    if (stringutils::isWhitespace(s)) {
+    if (stringutils::isWs(s)) {
       // We should never encounter a whitespace token
       fatal("map/lexemes", "token at index {0} is whitespace", i);
     } else {
@@ -4432,12 +4432,12 @@ RefoldEngine::ComputeLcsBGapProvenanceForPP() {
     // lexical-neighbor heuristics.
     profile.gapContainsNewline =
         stringutils::rangeContainsNewline(bSource_, gapBegin, gapEnd);
-    profile.gapContainsOnlyWhitespace =
-        stringutils::rangeContainsOnlyWhitespace(bSource_, gapBegin, gapEnd);
+    profile.gapContainsOnlyWs =
+        stringutils::rangeContainsOnlyWs(bSource_, gapBegin, gapEnd);
     profile.gapAtLineStart =
-        stringutils::beginsLineAfterWhitespace(bSource_, gapBegin);
+        stringutils::beginsLineAfterWs(bSource_, gapBegin);
     profile.gapAtLineEnd =
-        stringutils::endsLineBeforeWhitespace(bSource_, gapEnd);
+        stringutils::endsLineBeforeWs(bSource_, gapEnd);
 
     // If there is a token to the left, record its byte extent and whether that
     // token itself touches a logical line boundary. Later ranking can then
@@ -4449,9 +4449,9 @@ RefoldEngine::ComputeLcsBGapProvenanceForPP() {
       profile.leftTokenBeginByte = static_cast<uint64_t>(leftBegin);
       profile.leftTokenEndByte = static_cast<uint64_t>(leftEnd);
       profile.leftTokenStartsLine =
-          stringutils::beginsLineAfterWhitespace(bSource_, leftBegin);
+          stringutils::beginsLineAfterWs(bSource_, leftBegin);
       profile.leftTokenEndsLine =
-          stringutils::endsLineBeforeWhitespace(bSource_, leftEnd);
+          stringutils::endsLineBeforeWs(bSource_, leftEnd);
     }
 
     // Symmetrically record the right token's byte extent and line-boundary
@@ -4463,9 +4463,9 @@ RefoldEngine::ComputeLcsBGapProvenanceForPP() {
       profile.rightTokenBeginByte = static_cast<uint64_t>(rightBegin);
       profile.rightTokenEndByte = static_cast<uint64_t>(rightEnd);
       profile.rightTokenStartsLine =
-          stringutils::beginsLineAfterWhitespace(bSource_, rightBegin);
+          stringutils::beginsLineAfterWs(bSource_, rightBegin);
       profile.rightTokenEndsLine =
-          stringutils::endsLineBeforeWhitespace(bSource_, rightEnd);
+          stringutils::endsLineBeforeWs(bSource_, rightEnd);
     }
 
     // Store the completed B-gap profile. LCS tie resolution and edit-frontier
@@ -4963,8 +4963,8 @@ std::string RefoldEngine::PadAtBoundaries(StringRef base, size_t start,
 
   // If the replacement already has whitespace at an edge, treat that side as
   // already separated and never add another padding space there.
-  const bool hasLeadingWS = (*f > 0);
-  const bool hasTrailingWS = (*l + 1 < text.size());
+  const bool hasLeadingWs = (*f > 0);
+  const bool hasTrailingWs = (*l + 1 < text.size());
 
   std::optional<LexBoundaryToken> textFirstTok =
       firstLexToken(StringRef(text), lexLang_);
@@ -4985,7 +4985,7 @@ std::string RefoldEngine::PadAtBoundaries(StringRef base, size_t start,
   //     immediate boundary whitespace, and
   //   - juxtaposing the left boundary token and the replacement's first token
   //     would change lexical tokenization.
-  if (allowLeft && !hasLeadingWS && start > 0 && start <= base.size() &&
+  if (allowLeft && !hasLeadingWs && start > 0 && start <= base.size() &&
       textFirstTok && (!leftChar || !stringutils::isWs(*leftChar))) {
     if (std::optional<LexBoundaryToken> leftTok =
             lastLexToken(base.take_front(start), lexLang_)) {
@@ -5001,7 +5001,7 @@ std::string RefoldEngine::PadAtBoundaries(StringRef base, size_t start,
   //     immediate boundary whitespace, and
   //   - juxtaposing the replacement's last token and the right boundary token
   //     would change lexical tokenization.
-  if (allowRight && !hasTrailingWS && end < base.size() && textLastTok &&
+  if (allowRight && !hasTrailingWs && end < base.size() && textLastTok &&
       (!rightChar || !stringutils::isWs(*rightChar))) {
     if (std::optional<LexBoundaryToken> rightTok =
             firstLexToken(base.drop_front(end), lexLang_)) {
@@ -8227,7 +8227,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
   }
 
   trace("macro/args", "args-only? inv id={0} name={1} {2} baseInv={3}", m.id,
-        m.name, h, stringutils::showWSWithClip(baseInvText, 200));
+        m.name, h, stringutils::showWsWithClip(baseInvText, 200));
 
   // Parse the byte ranges for each argument's "content" within the invocation
   // spelling. These ranges are later used to splice per-arg replacements back
@@ -8744,7 +8744,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
           "template solver SUCCESS root id={0} name={1} coverA=[{2},{3}) "
           "coverB=[{4},{5}) newInv='{6}'",
           m.id, m.name, cover->first, cover->second, bEnv->first, bEnv->second,
-          stringutils::showWSWithClip(*uniqueInv, 240));
+          stringutils::showWsWithClip(*uniqueInv, 240));
 
     MacroPatch patch{*m.invB, *m.invE, std::move(*uniqueInv), m.id};
     StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyStandard,
@@ -8846,7 +8846,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         }
 
         trace("macro/args", "  args-only SUCCESS newInv='{0}'",
-              stringutils::showWSWithClip(newInv, 200));
+              stringutils::showWsWithClip(newInv, 200));
         {
         MacroPatch patch{*m.invB, *m.invE, std::move(newInv), m.id};
         StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyPasteMulti,
@@ -8907,7 +8907,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       std::string newInv =
           stringutils::replaceRange(baseInvText, r.first, r.second, newArg);
       trace("macro/args", "  args-only SUCCESS newInv='{0}'",
-            stringutils::showWSWithClip(newInv, 200));
+            stringutils::showWsWithClip(newInv, 200));
       {
         MacroPatch patch{*m.invB, *m.invE, std::move(newInv), m.id};
         StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyPasteSingle,
@@ -8999,9 +8999,9 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
           trace("macro/args",
                 "    pure-paste-only: splice failed argIdx={0} baseArg='{1}' "
                 "oldSeg='{2}' newSeg='{3}'",
-                argIdx, stringutils::showWSWithClip(baseArgText, 120),
-                stringutils::showWSWithClip(pae.oldSeg, 120),
-                stringutils::showWSWithClip(pae.newSeg, 120));
+                argIdx, stringutils::showWsWithClip(baseArgText, 120),
+                stringutils::showWsWithClip(pae.oldSeg, 120),
+                stringutils::showWsWithClip(pae.newSeg, 120));
           return std::nullopt;
         }
       }
@@ -9012,7 +9012,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         trace("macro/args",
               "    pure-paste-only: argIdx={0} replacement introduces "
               "top-level comma: '{1}'",
-              argIdx, stringutils::showWSWithClip(newArg, 120));
+              argIdx, stringutils::showWsWithClip(newArg, 120));
         return std::nullopt;
       }
 
@@ -9024,8 +9024,8 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
           trace("macro/args",
                 "    pure-paste-only: conflicting replacements for argIdx={0} "
                 "'{1}' vs '{2}'",
-                argIdx, stringutils::showWSWithClip(existing->second, 120),
-                stringutils::showWSWithClip(newArg, 120));
+                argIdx, stringutils::showWsWithClip(existing->second, 120),
+                stringutils::showWsWithClip(newArg, 120));
           return std::nullopt;
         }
         continue;
@@ -9070,7 +9070,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     }
 
     trace("macro/args", "    pure-paste-only SUCCESS newInv='{0}'",
-          stringutils::showWSWithClip(newInv, 200));
+          stringutils::showWsWithClip(newInv, 200));
     {
       MacroPatch patch{*m.invB, *m.invE, std::move(newInv), m.id};
       StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyPurePasteOnly,
@@ -9408,8 +9408,8 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       for (size_t i = 0; i < obs.size(); ++i) {
         if (i)
           os << ", ";
-        os << "{old='" << stringutils::showWSWithClip(obs[i].oldText, 120)
-           << "' new='" << stringutils::showWSWithClip(obs[i].newText, 120)
+        os << "{old='" << stringutils::showWsWithClip(obs[i].oldText, 120)
+           << "' new='" << stringutils::showWsWithClip(obs[i].newText, 120)
            << "'}";
       }
       os << "]";
@@ -9434,7 +9434,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
           "tuple-forward enter root id={0} name={1} argIdx={2} "
           "baseArg='{3}' occObservations={4}",
           m.id, m.name, callerArgIdx,
-          stringutils::showWSWithClip(baseArgText, 200),
+          stringutils::showWsWithClip(baseArgText, 200),
           formatOccurrenceObservations(occObservations));
 
     // There is no caller tuple to rewrite if the parent argument is empty.
@@ -9690,8 +9690,8 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
             "tuple-forward rebuilt root id={0} name={1} argIdx={2} "
             "parentTrim='{3}' rebuilt='{4}' tupleRefs={5}",
             m.id, m.name, callerArgIdx,
-            stringutils::showWSWithClip(parentTrim, 200),
-            stringutils::showWSWithClip(rebuilt, 200),
+            stringutils::showWsWithClip(parentTrim, 200),
+            stringutils::showWsWithClip(rebuilt, 200),
             formatTupleRefs(childTupleRefs));
     } else if (rewriteMode == TupleRewriteMode::VariadicIdentityForward) {
       SmallVector<TupleElementSlice, 8> tupleElems;
@@ -9736,8 +9736,8 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
             m.id, m.name, callerArgIdx, tupleChild->id, tupleChild->name,
             identityForwardChildArgIdx ? *identityForwardChildArgIdx
                                        : uint32_t(0),
-            stringutils::showWSWithClip(parentTrim, 200),
-            stringutils::showWSWithClip(rebuilt, 200));
+            stringutils::showWsWithClip(parentTrim, 200),
+            stringutils::showWsWithClip(rebuilt, 200));
     } else {
       return false;
     }
@@ -9751,8 +9751,8 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
           "argIdx={2} childId={3} childName={4} baseArg='{5}' newArg='{6}' "
           "mode={7}",
           m.id, m.name, callerArgIdx, tupleChild->id, tupleChild->name,
-          stringutils::showWSWithClip(baseArgText, 200),
-          stringutils::showWSWithClip(outNewArg, 200),
+          stringutils::showWsWithClip(baseArgText, 200),
+          stringutils::showWsWithClip(outNewArg, 200),
           rewriteMode == TupleRewriteMode::DirectTupleRefs
               ? StringRef("direct_tuple_refs")
               : StringRef("variadic_identity_forward"));
@@ -9955,7 +9955,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
                 "env=[{1},{2}) -> [{3},{4}) old='{5}'",
                 static_cast<size_t>(argIdx), bEnv->first, bEnv->second,
                 grownEnv.first, grownEnv.second,
-                stringutils::showWSWithClip(oldText, 120));
+                stringutils::showWsWithClip(oldText, 120));
           bEnv = grownEnv;
         }
       }
@@ -9976,7 +9976,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         if (!canon || StringRef(*canon).trim() != StringRef(*un).trim()) {
           trace("macro/args",
                 "    stringify inverse ambiguous for argIdx={0} payload='{1}'",
-                argIdx, stringutils::showWSWithClip(*un, 200));
+                argIdx, stringutils::showWsWithClip(*un, 200));
           return std::nullopt;
         }
 
@@ -10015,10 +10015,10 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
               trace("macro/args",
                     "    lift/paste argIdx={0} baseArg={1} aSlice={2} "
                     "bSlice={3} -> newArg={4}",
-                    argIdx, stringutils::showWSWithClip(baseArgText, 200),
-                    stringutils::showWSWithClip(aSlice, 200),
-                    stringutils::showWSWithClip(bSlice, 200),
-                    stringutils::showWSWithClip(newArg, 200));
+                    argIdx, stringutils::showWsWithClip(baseArgText, 200),
+                    stringutils::showWsWithClip(aSlice, 200),
+                    stringutils::showWsWithClip(bSlice, 200),
+                    stringutils::showWsWithClip(newArg, 200));
             } else {
               // The pasted occurrence could not be located inside the original
               // call-site argument, so leave `newArg` as the direct B slice and
@@ -10027,8 +10027,8 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
               trace("macro/args",
                     "    lift/paste FAILED argIdx={0} baseArg={1} aSlice={2} "
                     "bSlice={3}",
-                    argIdx, stringutils::showWS(baseArgText),
-                    stringutils::showWS(aSlice), stringutils::showWS(bSlice));
+                    argIdx, stringutils::showWs(baseArgText),
+                    stringutils::showWs(aSlice), stringutils::showWs(bSlice));
             }
           }
         }
@@ -10172,15 +10172,15 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       trace(
           "macro/args",
           "    consistency check FAILED for argIdx={0} newArg='{1}' -> expand",
-          argIdx, stringutils::showWSWithClip(finalNewArg, 200));
+          argIdx, stringutils::showWsWithClip(finalNewArg, 200));
 
       if (hasTupleChildForArg) {
         trace("macro/tuple",
               "tuple-forward consistency failure root id={0} name={1} "
               "argIdx={2} baseArg='{3}' newArg='{4}' tokenHunks={5}",
               m.id, m.name, argIdx,
-              stringutils::showWSWithClip(baseArgText, 200),
-              stringutils::showWSWithClip(finalNewArg, 200),
+              stringutils::showWsWithClip(baseArgText, 200),
+              stringutils::showWsWithClip(finalNewArg, 200),
               formatHunkList(tokenHunksForTouchedFormals));
 
         for (const auto &s : m.argSpans) {
@@ -10209,7 +10209,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
               hunkEffects.push_back(
                   formatv("owned {0} -> [{1},{2}) '{3}'", hk.ToString(),
                           owned->first, owned->second,
-                          stringutils::showWSWithClip(
+                          stringutils::showWsWithClip(
                               SliceBSource(owned->first, owned->second), 80))
                       .str());
               lo = std::min(lo, owned->first);
@@ -10225,7 +10225,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
               hunkEffects.push_back(
                   formatv("overlap {0} -> [{1},{2}) '{3}'", hk.ToString(),
                           (uint64_t)hk.bStart, (uint64_t)hk.bEnd,
-                          stringutils::showWSWithClip(
+                          stringutils::showWsWithClip(
                               SliceBSource(hk.bStart, hk.bEnd), 80))
                       .str());
               lo = static_cast<size_t>(std::min<uint64_t>(lo, hk.bStart));
@@ -10246,10 +10246,10 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
                 "extended=[{8},{9}) tok='{10}' expectedFull='{11}' "
                 "hunkEffects={12}",
                 m.id, m.name, argIdx, s.begin, s.end,
-                stringutils::showWSWithClip(SliceASource(s.begin, s.end), 120),
+                stringutils::showWsWithClip(SliceASource(s.begin, s.end), 120),
                 bEnv->first, bEnv->second, lo, hi,
-                stringutils::showWSWithClip(tokText, 120),
-                stringutils::showWSWithClip(StringRef(finalNewArg).trim(), 120),
+                stringutils::showWsWithClip(tokText, 120),
+                stringutils::showWsWithClip(StringRef(finalNewArg).trim(), 120),
                 llvm::join(hunkEffects, " | "));
         }
       }
@@ -11456,7 +11456,7 @@ RefoldEngine::BuildAcceptedMacroCandidate(const MacroPatch &patch) const {
 
   candidate.hasPayloadPreview = true;
   candidate.payloadPreview =
-      stringutils::showWSWithClip(patch.replacement, 120);
+      stringutils::showWsWithClip(patch.replacement, 120);
   return candidate;
 }
 
@@ -11530,7 +11530,7 @@ RefoldEngine::BuildAcceptedIncludeCandidate(
 
   candidate.hasPayloadPreview = true;
   candidate.payloadPreview =
-      stringutils::showWSWithClip(patch.insertBytes, 120);
+      stringutils::showWsWithClip(patch.insertBytes, 120);
   return candidate;
 }
 
@@ -11691,7 +11691,7 @@ void RefoldEngine::AddForcedCounterPatches(
           "__COUNTER__: force patch id={0} name='{1}' ownerInc={2} "
           "inv=[{3},{4}) repl='{5}' Aocc=[{6},{7})",
           m.id, m.name, m.ownerIncludeId, *invStart, *invEnd,
-          stringutils::showWSWithClip(*replOpt, 64), req.aStart, req.aEnd);
+          stringutils::showWsWithClip(*replOpt, 64), req.aStart, req.aEnd);
 
     // Install the forced patch under the coalesced physical-span key. If this
     // replaces a previous call-site-shaped patch, carry its owner certificate
@@ -12121,7 +12121,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             "paired pure-insertion args-only SUCCESS inv id={0} name={1} "
             "argIdx={2} cur={3} partner={4} newInv='{5}'",
             m.id, m.name, argIdx, hEff, partner,
-            stringutils::showWSWithClip(patch->replacement, 200));
+            stringutils::showWsWithClip(patch->replacement, 200));
 
       StampMacroPatchProof(*patch,
                            MacroPatchProofKind::ArgsOnlyPairedPureInsertion,
@@ -14531,9 +14531,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               const uint32_t argIdx = argIdxs[i];
               const auto it = formals.find(argIdx);
               os << argIdx << ":'"
-                 << stringutils::showWSWithClip(it->second.oldText, 80)
+                 << stringutils::showWsWithClip(it->second.oldText, 80)
                  << "'->'"
-                 << stringutils::showWSWithClip(it->second.newText, 80) << "'";
+                 << stringutils::showWsWithClip(it->second.newText, 80) << "'";
             }
             os << "}";
             return os.str();
@@ -19649,7 +19649,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                   "merge DAG validation metadata root id={0} name={1} "
                   "argIdx={2} collapsed to base text base='{3}' variants={4}",
                   m.id, m.name, argIdx,
-                  stringutils::showWSWithClip(baseArgText, 120),
+                  stringutils::showWsWithClip(baseArgText, 120),
                   KV.second.size());
             continue;
           }
@@ -19984,10 +19984,10 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                       "name={2} argIdx={3} concreteOld='{4}' concreteNew='{5}' "
                       "expectedOld='{6}' expectedNew='{7}'",
                       traceStage, m.id, m.name, KV.first,
-                      stringutils::showWSWithClip(concreteOld, 120),
-                      stringutils::showWSWithClip(concreteNew, 120),
-                      stringutils::showWSWithClip(KV.second.oldText, 120),
-                      stringutils::showWSWithClip(KV.second.newText, 120));
+                      stringutils::showWsWithClip(concreteOld, 120),
+                      stringutils::showWsWithClip(concreteNew, 120),
+                      stringutils::showWsWithClip(KV.second.oldText, 120),
+                      stringutils::showWsWithClip(KV.second.newText, 120));
                 }
               }
               continue;
@@ -20001,10 +20001,10 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                     "name={2} argIdx={3} derivedOld='{4}' derivedNew='{5}' "
                     "expectedOld='{6}' expectedNew='{7}'",
                     traceStage, m.id, m.name, KV.first,
-                    stringutils::showWSWithClip(it->second.oldText, 120),
-                    stringutils::showWSWithClip(it->second.newText, 120),
-                    stringutils::showWSWithClip(KV.second.oldText, 120),
-                    stringutils::showWSWithClip(KV.second.newText, 120));
+                    stringutils::showWsWithClip(it->second.oldText, 120),
+                    stringutils::showWsWithClip(it->second.newText, 120),
+                    stringutils::showWsWithClip(KV.second.oldText, 120),
+                    stringutils::showWsWithClip(KV.second.newText, 120));
             }
           }
 
@@ -20351,13 +20351,13 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                   "mergedExpRoot(pending) currentDeferredArgs={5} "
                   "candidateDeferredArgs={6}",
                   m.id, m.name, traceStage,
-                  stringutils::showWSWithClip(
+                  stringutils::showWsWithClip(
                       uniquePatch->subtreeExpectedRootFormalSummary, 160),
-                  stringutils::showWSWithClip(
+                  stringutils::showWsWithClip(
                       candPatch.subtreeExpectedRootFormalSummary, 160),
-                  stringutils::showWSWithClip(
+                  stringutils::showWsWithClip(
                       uniquePatch->subtreeDeferredRootArgSummary, 160),
-                  stringutils::showWSWithClip(
+                  stringutils::showWsWithClip(
                       candPatch.subtreeDeferredRootArgSummary, 160));
           }
           if (!mergedValidation) {
@@ -20441,9 +20441,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                   "DAG structured subtree-choice kept existing: root id={0} "
                   "name={1} stage={2} existingExpRoot={3} candidateExpRoot={4}",
                   m.id, m.name, traceStage,
-                  stringutils::showWSWithClip(
+                  stringutils::showWsWithClip(
                       uniquePatch->subtreeExpectedRootFormalSummary, 160),
-                  stringutils::showWSWithClip(
+                  stringutils::showWsWithClip(
                       candPatch.subtreeExpectedRootFormalSummary, 160));
           }
           cert.accepted = true;
@@ -20472,9 +20472,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                 "DAG structured subtree-choice replaced existing: root id={0} "
                 "name={1} stage={2} existingExpRoot={3} candidateExpRoot={4}",
                 m.id, m.name, traceStage,
-                stringutils::showWSWithClip(
+                stringutils::showWsWithClip(
                     uniquePatch->subtreeExpectedRootFormalSummary, 160),
-                stringutils::showWSWithClip(
+                stringutils::showWsWithClip(
                     candPatch.subtreeExpectedRootFormalSummary, 160));
           }
           uniquePatch = std::move(candPatch);
@@ -20519,9 +20519,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                 "DAG merge subtree-plan probe: root id={0} name={1} stage={2} "
                 "existingExpRoot={3} candidateExpRoot={4}",
                 m.id, m.name, traceStage,
-                stringutils::showWSWithClip(
+                stringutils::showWsWithClip(
                     uniquePatch->subtreeExpectedRootFormalSummary, 160),
-                stringutils::showWSWithClip(
+                stringutils::showWsWithClip(
                     candPatch.subtreeExpectedRootFormalSummary, 160));
         }
         if (!mergedValidation) {
@@ -20599,7 +20599,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                 "name='{1}' could not derive replay root formals from "
                 "replacement='{2}'",
                 m.id, m.name,
-                stringutils::showWSWithClip(candidate.patch.replacement, 160));
+                stringutils::showWsWithClip(candidate.patch.replacement, 160));
           continue;
         }
 
@@ -21390,7 +21390,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                 "DAG subtree root proof validation failed: rejecting root "
                 "id={0} name={1} leaf id={2} name={3} repl='{4}'",
                 m.id, m.name, leaf.id, leaf.name,
-                stringutils::showWSWithClip(rootPatchCert.patch->replacement,
+                stringutils::showWsWithClip(rootPatchCert.patch->replacement,
                                             160));
           continue;
         }
@@ -21936,8 +21936,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               "existing callsite patch not merged with {0}: inv id={1} "
               "name='{2}' existing='{3}' current='{4}'",
               label, m.id, m.name,
-              stringutils::showWSWithClip(existingPatch->replacement, 160),
-              stringutils::showWSWithClip(candidate.replacement, 160));
+              stringutils::showWsWithClip(existingPatch->replacement, 160),
+              stringutils::showWsWithClip(candidate.replacement, 160));
         if (existingPatch->subtreeCertBacked ||
             candidate.proofKind == MacroPatchProofKind::DagSubtreeRoot) {
           trace("macro/proof",
@@ -21953,9 +21953,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             "existing callsite patch merged with {0}: inv id={1} name='{2}' "
             "existing='{3}' current='{4}' merged='{5}'",
             label, m.id, m.name,
-            stringutils::showWSWithClip(existingPatch->replacement, 160),
-            stringutils::showWSWithClip(candidate.replacement, 160),
-            stringutils::showWSWithClip(*merged, 160));
+            stringutils::showWsWithClip(existingPatch->replacement, 160),
+            stringutils::showWsWithClip(candidate.replacement, 160),
+            stringutils::showWsWithClip(*merged, 160));
       if (existingPatch->subtreeCertBacked ||
           candidate.proofKind == MacroPatchProofKind::DagSubtreeRoot) {
         trace("macro/proof",
@@ -22016,16 +22016,16 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               preferDirectRootCandidate ? "direct args-only" : "DAG root",
               preferDirectRootCandidate ? "DAG root" : "direct args-only", m.id,
               m.name,
-              stringutils::showWSWithClip(argsOnlyCandidate->replacement, 160),
-              stringutils::showWSWithClip(dag->replacement, 160));
+              stringutils::showWsWithClip(argsOnlyCandidate->replacement, 160),
+              stringutils::showWsWithClip(dag->replacement, 160));
         } else {
           trace(
               "macro/dag",
               "DAG args-only preferred over direct args-only: root id={0} "
               "name='{1}' direct='{2}' dag='{3}' directValid={4} dagValid={5}",
               m.id, m.name,
-              stringutils::showWSWithClip(argsOnlyCandidate->replacement, 160),
-              stringutils::showWSWithClip(dag->replacement, 160),
+              stringutils::showWsWithClip(argsOnlyCandidate->replacement, 160),
+              stringutils::showWsWithClip(dag->replacement, 160),
               directValid ? 1 : 0, dagValid ? 1 : 0);
         }
       } else if (argsOnlyCandidate &&
@@ -22037,8 +22037,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               "DAG args-only preferred over direct args-only: root id={0} "
               "name='{1}' direct='{2}' dag='{3}'",
               m.id, m.name,
-              stringutils::showWSWithClip(argsOnlyCandidate->replacement, 160),
-              stringutils::showWSWithClip(dag->replacement, 160));
+              stringutils::showWsWithClip(argsOnlyCandidate->replacement, 160),
+              stringutils::showWsWithClip(dag->replacement, 160));
       }
 
       if (!preferDirectRootCandidate) {
@@ -22128,9 +22128,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               "rewrite: inv id={0} name='{1}' existing='{2}' current='{3}' "
               "merged='{4}'",
               m.id, m.name,
-              stringutils::showWSWithClip(existingPatch->replacement, 160),
-              stringutils::showWSWithClip(argsOnlyCandidate->replacement, 160),
-              stringutils::showWSWithClip(*merged, 160));
+              stringutils::showWsWithClip(existingPatch->replacement, 160),
+              stringutils::showWsWithClip(argsOnlyCandidate->replacement, 160),
+              stringutils::showWsWithClip(*merged, 160));
         argsOnlyCandidate->replacement = std::move(*merged);
         if (!argsOnlyCandidate->macroId)
           argsOnlyCandidate->macroId = existingPatch->macroId;
@@ -22145,8 +22145,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               "rewrite: inv id={0} name='{1}' existing='{2}' current='{3}' "
               "directValid={4}",
               m.id, m.name,
-              stringutils::showWSWithClip(existingPatch->replacement, 160),
-              stringutils::showWSWithClip(argsOnlyCandidate->replacement, 160),
+              stringutils::showWsWithClip(existingPatch->replacement, 160),
+              stringutils::showWsWithClip(argsOnlyCandidate->replacement, 160),
               directValid ? 1 : 0);
         if (!directValid) {
           trace(
@@ -22155,8 +22155,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               "existing callsite patch: inv id={0} name='{1}' existing='{2}' "
               "current='{3}'",
               m.id, m.name,
-              stringutils::showWSWithClip(existingPatch->replacement, 160),
-              stringutils::showWSWithClip(argsOnlyCandidate->replacement, 160));
+              stringutils::showWsWithClip(existingPatch->replacement, 160),
+              stringutils::showWsWithClip(argsOnlyCandidate->replacement, 160));
           argsOnlyCandidate.reset();
           reuseExistingCallsitePatch = true;
         } else {
@@ -22173,8 +22173,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                   "args-only rewrite after merge rejection: inv id={0} "
                   "name='{1}' existing='{2}' current='{3}'",
                   m.id, m.name,
-                  stringutils::showWSWithClip(existingPatch->replacement, 160),
-                  stringutils::showWSWithClip(argsOnlyCandidate->replacement,
+                  stringutils::showWsWithClip(existingPatch->replacement, 160),
+                  stringutils::showWsWithClip(argsOnlyCandidate->replacement,
                                               160));
             argsOnlyCandidate.reset();
             reuseExistingCallsitePatch = true;

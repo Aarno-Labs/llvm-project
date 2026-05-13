@@ -14,7 +14,7 @@
 //  • Whitespace predicates:
 //      - isWs(char)                  : PP whitespace (space, HT, LF, VT, FF,
 //                                      CR)
-//      - isWhitespace(StringRef)     : true iff every byte is PP whitespace
+//      - isWs(StringRef)             : true iff every byte is PP whitespace
 //  • Identifier predicates (ASCII):
 //      - isIdentStart(char)          : '_' or ASCII letter
 //      - isIdentPart(char)           : start-char or digit
@@ -24,7 +24,7 @@
 //      - firstNonWsIdx(StringRef)    : first non-WS index or nullopt
 //      - lastNonWsIdx(StringRef)     : last non-WS index or nullopt
 //  • Debug formatting helpers:
-//      - showWS(StringRef)           : visualize whitespace (·, \t, \n, \r, \f,
+//      - showWs(StringRef)           : visualize whitespace (·, \t, \n, \r, \f,
 //                                      \v)
 //      - clip(StringRef, size_t)     : truncate with length suffix
 //
@@ -37,7 +37,7 @@
 //
 // Usage
 // -----
-//   if (isWhitespace(S)) { … }
+//   if (isWs(S)) { … }
 //   bool glue = isIdentPart(L) && isIdentPart(R);  // conservative boundary
 //   auto first = firstNonWsIdx(Txt);               // nullopt if all whitespace
 //
@@ -123,7 +123,7 @@ bool isIdentifierOnly(StringRef s);
 bool isIdentifierOrSimpleCallExpr(StringRef replacement);
 
 /// True iff every byte in \p s is PP whitespace.
-inline bool isWhitespace(StringRef s) noexcept {
+inline bool isWs(StringRef s) noexcept {
   return all_of(s, [](char c) { return isWs(c); });
 }
 
@@ -142,7 +142,7 @@ inline std::optional<size_t> lastNonWsIdx(StringRef s) noexcept {
 }
 
 /// Skip ASCII whitespace and complete C/C++ comments starting at \p i.
-size_t skipWSAndComments(StringRef s, size_t i);
+size_t skipWsAndComments(StringRef s, size_t i);
 
 /// Find the matching right parenthesis for \p lParenIdx, ignoring comments and
 /// string/character literal contents.
@@ -150,14 +150,14 @@ size_t findMatchingRParen(StringRef s, size_t lParenIdx);
 
 /// Advance `pos` over whitespace that does not cross a source-line boundary.
 inline constexpr void skipNonNewlineWs(StringRef text, size_t &pos) {
-  while (pos < text.size() && stringutils::isNonNewlineWs(text[pos]))
+  while (pos < text.size() && isNonNewlineWs(text[pos]))
     ++pos;
 }
 
 // --------------------- Diagnostics helpers (pure string) ---------------------
 
 /// Render whitespace visibly for diagnostics while preserving non-whitespace.
-inline std::string showWS(StringRef s) {
+inline std::string showWs(StringRef s) {
   std::string out;
   out.reserve(s.size() * 2);
   for (char c : s) {
@@ -196,8 +196,8 @@ inline std::string clip(StringRef s, size_t n) {
 }
 
 /// Clip a string and then render whitespace visibly for compact diagnostics.
-inline std::string showWSWithClip(StringRef s, size_t n) {
-  return showWS(clip(s, n));
+inline std::string showWsWithClip(StringRef s, size_t n) {
+  return showWs(clip(s, n));
 }
 
 /// Return LLVM's escaped representation of \p s for diagnostics.
@@ -259,7 +259,7 @@ inline StringRef stripTrailingNewlines(StringRef s) noexcept {
 }
 
 /// True iff the newline at \p nlIdx is escaped by a C line splice.
-inline bool isLineSplice(StringRef s, size_t nlIdx) {
+inline constexpr bool isLineSplice(StringRef s, size_t nlIdx) {
   if (nlIdx == 0 || nlIdx > s.size())
     return false;
   char prev = s[nlIdx - 1];
@@ -319,40 +319,77 @@ std::vector<StringRef> splitChars(StringRef s);
 /// Returns nullopt when the payload is malformed or outside that domain.
 std::optional<std::string> canonicalizeStringifyInversePayload(StringRef raw);
 
+namespace {
+
+/// Clamp a possibly unordered half-open byte range into \p text.
+std::pair<size_t, size_t> clampUnorderedRange(StringRef text, size_t begin,
+                                             size_t end) {
+  begin = std::min(begin, text.size());
+  end = std::min(end, text.size());
+  if (end < begin)
+    std::swap(begin, end);
+  return {begin, end};
+}
+
+} // namespace
+
 /// True iff the clamped byte range [begin, end) contains a line-feed.
 ///
 /// The endpoints are first clamped into [0, text.size()]. If the resulting end
 /// precedes the begin, the bounds are swapped so callers may pass unordered
 /// byte offsets without changing the queried set of bytes.
-bool rangeContainsNewline(StringRef text, size_t begin, size_t end);
+inline constexpr bool rangeContainsNewline(StringRef text, size_t begin,
+                                           size_t end) {
+  const auto range = clampUnorderedRange(text, begin, end);
+  return text.substr(range.first, range.second - range.first).find('\n') !=
+         StringRef::npos;
+}
 
 /// True iff the clamped byte range [begin, end) contains only PP whitespace.
 ///
 /// The accepted whitespace set is the same ASCII set as isWs(): space, HT, LF,
 /// VT, FF, and CR. The endpoints are clamped and unordered bounds are swapped
 /// using the same policy as rangeContainsNewline().
-bool rangeContainsOnlyWhitespace(StringRef text, size_t begin, size_t end);
+inline constexpr bool rangeContainsOnlyWs(StringRef text, size_t begin,
+                                          size_t end) {
+  const auto range = clampUnorderedRange(text, begin, end);
+  return isWs(text.substr(range.first, range.second - range.first));
+}
 
 /// Return the byte offset of the start of the physical line containing \p pos.
 ///
 /// The input offset is clamped into [0, text.size()]. Both LF and CR terminate
 /// a line for this byte-level helper.
-size_t lineStartOffset(StringRef text, size_t pos);
+inline constexpr size_t lineStartOffset(StringRef text, size_t pos) {
+  pos = std::min(pos, text.size());
+  while (pos > 0 && text[pos - 1] != '\n' && text[pos - 1] != '\r')
+    --pos;
+  return pos;
+}
 
 /// Return the byte offset one-past the last non-newline byte of the physical
 /// line containing \p pos.
 ///
 /// The input offset is clamped into [0, text.size()]. Both LF and CR terminate
 /// a line for this byte-level helper.
-size_t lineEndOffset(StringRef text, size_t pos);
+inline constexpr size_t lineEndOffset(StringRef text, size_t pos) {
+  pos = std::min(pos, text.size());
+  while (pos < text.size() && text[pos] != '\n' && text[pos] != '\r')
+    ++pos;
+  return pos;
+}
 
 /// True iff only line whitespace appears between the containing line start and
 /// \p offset.
-bool beginsLineAfterWhitespace(StringRef text, size_t offset);
+inline constexpr bool beginsLineAfterWs(StringRef text, size_t offset) {
+  return rangeContainsOnlyWs(text, lineStartOffset(text, offset), offset);
+}
 
 /// True iff only line whitespace appears between \p offset and the containing
 /// line end.
-bool endsLineBeforeWhitespace(StringRef text, size_t offset);
+inline constexpr bool endsLineBeforeWs(StringRef text, size_t offset) {
+  return rangeContainsOnlyWs(text, offset, lineEndOffset(text, offset));
+}
 
 /// True iff \p replacement is a parenthesized callable head followed by one or
 /// more balanced call-suffix groups, with no trailing non-comment content.
@@ -364,7 +401,7 @@ uint64_t extendChainedCallEnd(StringRef fileText, uint64_t invEnd,
                               StringRef replacement);
 
 /// Return true iff the first non-whitespace bytes of \p s start with \p lit.
-bool startsWithAfterWhitespace(StringRef s, StringRef lit);
+bool startsWithAfterWs(StringRef s, StringRef lit);
 
 /// Replace the substring in \p s spanning [begin, end) with \p repl.
 inline std::string replaceRange(StringRef s, size_t begin, size_t end,
@@ -584,7 +621,7 @@ rangesToStringWithSlices(StringRef invText,
     if (!invText.empty() && r.second >= r.first &&
         static_cast<size_t>(r.second) <= invText.size()) {
       sb += "='" +
-            showWSWithClip(invText.substr(r.first, r.second - r.first), 200) +
+            showWsWithClip(invText.substr(r.first, r.second - r.first), 200) +
             "'";
     }
   }

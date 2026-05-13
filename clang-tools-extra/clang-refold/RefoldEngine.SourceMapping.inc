@@ -356,7 +356,7 @@ RefoldEngine::MapAByteRangeToBTokenEnvelope(size_t aByteBegin,
                     "trimBegin: Abytes=[{0},{1}) hunkBbytes=[{2},{3}) "
                     "Btrim=[{4},{5}) text='{6}'",
                     aByteBegin, aByteEnd, cur->bStart, cur->bEnd, oldBegin,
-                    bByteBegin, stringutils::showWSWithClip(trimmed, 220));
+                    bByteBegin, stringutils::showWsWithClip(trimmed, 220));
             }
           }
         }
@@ -384,7 +384,7 @@ RefoldEngine::MapAByteRangeToBTokenEnvelope(size_t aByteBegin,
                     "trimEnd: Abytes=[{0},{1}) hunkBbytes=[{2},{3}) "
                     "Btrim=[{4},{5}) text='{6}'",
                     aByteBegin, aByteEnd, cur->bStart, cur->bEnd, bByteEnd,
-                    oldEnd, stringutils::showWSWithClip(trimmed, 220));
+                    oldEnd, stringutils::showWsWithClip(trimmed, 220));
             }
           }
         }
