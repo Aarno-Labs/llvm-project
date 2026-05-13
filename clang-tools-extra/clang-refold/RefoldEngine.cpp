@@ -3840,16 +3840,58 @@ std::string RefoldEngine::RunSinglePassRefold() {
     }
   };
 
-  // Return true if a function-like macro invocation starts inside
-  // `replacement`. The following `(` may live either in the replacement itself
-  // or across the edit/suffix boundary; both cases would let a before-payload
-  // definition preservation change B-side replacement tokens. Invocations that
-  // start in the preserved suffix are intentionally ignored because restoring
-  // the definition for such later source is the purpose of this repair.
-  auto functionLikeInvocationStartsInReplacement =
-      [&](StringRef name, StringRef replacement, StringRef suffix) {
+  // Return the replacement-local byte offset of the first identifier token that
+  // would observe an object-like macro definition.  The offset identifies the
+  // start of the token, which lets #undef repair place the undef before the
+  // observing token when an existing physical line boundary makes that legal.
+  auto firstRawIdentifierObservationOffset =
+      [&](StringRef name, StringRef text) -> std::optional<size_t> {
+    if (name.empty() || text.empty())
+      return std::nullopt;
+
+    const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
+    std::string lexBuf = text.str();
+    lexBuf.push_back('\0');
+
+    const char *bufStart = lexBuf.data();
+    const char *bufEnd = bufStart + text.size();
+    Lexer lexer(baseLoc, lexLang_, bufStart, bufStart, bufEnd);
+    lexer.SetCommentRetentionState(true);
+
+    Token token;
+    while (true) {
+      lexer.LexFromRawLexer(token);
+      if (token.is(tok::eof))
+        return std::nullopt;
+
+      // Comments are retained so the raw lexer can step over them explicitly,
+      // but macro-state observations inside comments are irrelevant.
+      if (token.is(tok::comment))
+        continue;
+
+      if (!token.is(tok::raw_identifier) && !token.is(tok::identifier))
+        continue;
+
+      const size_t localBegin = tokenOffsetFromBase(token, baseLoc);
+      const size_t localEnd = tokenEndOffsetFromBase(token, baseLoc);
+      if (localEnd < localBegin || localEnd > text.size())
+        continue;
+
+      if (text.slice(localBegin, localEnd) == name)
+        return localBegin;
+    }
+  };
+
+  // Return the replacement-local byte offset of the macro-name token that starts
+  // the first function-like invocation in `replacement`.  The following `(` may
+  // live either in the replacement itself or across the edit/suffix boundary;
+  // both cases mean the replacement would be preprocessed differently if the
+  // prior function-like definition remained active up to that token.
+  auto firstFunctionLikeInvocationOffsetInReplacement =
+      [&](StringRef name, StringRef replacement, StringRef suffix)
+          -> std::optional<size_t> {
         if (name.empty() || replacement.empty())
-          return false;
+          return std::nullopt;
 
         const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
         std::string lexBuf;
@@ -3863,12 +3905,12 @@ std::string RefoldEngine::RunSinglePassRefold() {
         Lexer lexer(baseLoc, lexLang_, bufStart, bufStart, bufEnd);
         lexer.SetCommentRetentionState(true);
 
-        bool pendingReplacementName = false;
+        std::optional<size_t> pendingReplacementNameBegin;
         Token token;
         while (true) {
           lexer.LexFromRawLexer(token);
           if (token.is(tok::eof))
-            return false;
+            return std::nullopt;
 
           // Whitespace is not returned by the raw lexer and comments are not
           // preprocessing tokens for function-like invocation adjacency, so a
@@ -3876,10 +3918,10 @@ std::string RefoldEngine::RunSinglePassRefold() {
           if (token.is(tok::comment))
             continue;
 
-          if (pendingReplacementName) {
+          if (pendingReplacementNameBegin) {
             if (token.is(tok::l_paren))
-              return true;
-            pendingReplacementName = false;
+              return *pendingReplacementNameBegin;
+            pendingReplacementNameBegin.reset();
           }
 
           if (!token.is(tok::raw_identifier) && !token.is(tok::identifier))
@@ -3890,9 +3932,27 @@ std::string RefoldEngine::RunSinglePassRefold() {
           if (localEnd < localBegin || localEnd > replacement.size())
             continue;
 
-          pendingReplacementName =
-              StringRef(lexBuf).slice(localBegin, localEnd) == name;
+          if (StringRef(lexBuf).slice(localBegin, localEnd) == name)
+            pendingReplacementNameBegin = localBegin;
         }
+      };
+
+  // Return the replacement-local byte offset of the first token that would
+  // observe `definition` if the definition were active before the replacement.
+  // Object-like definitions are observed by the identifier token itself;
+  // function-like definitions are observed only by a real NAME(...) invocation.
+  auto firstReplacementObservationOffset =
+      [&](const TextEdit &edit, const RefoldModel::MacroDirective &definition,
+          StringRef macroName) -> std::optional<size_t> {
+        switch (macroObservationKindForDefinition(definition, macroName)) {
+        case MacroReplacementObservationKind::IdentifierToken:
+          return firstRawIdentifierObservationOffset(macroName,
+                                                     StringRef(edit.text));
+        case MacroReplacementObservationKind::FunctionLikeInvocation:
+          return firstFunctionLikeInvocationOffsetInReplacement(
+              macroName, StringRef(edit.text), tuBytes.drop_front(edit.end));
+        }
+        return std::nullopt;
       };
 
   // Return true when a replacement payload can observe a consumed macro
@@ -3901,18 +3961,35 @@ std::string RefoldEngine::RunSinglePassRefold() {
   auto replacementObservesPreservedDefinition =
       [&](const TextEdit &edit, const RefoldModel::MacroDirective &definition,
           StringRef macroName) {
-        switch (macroObservationKindForDefinition(definition, macroName)) {
-        case MacroReplacementObservationKind::IdentifierToken:
-          return rawIdentifierAppearsInText(macroName, StringRef(edit.text));
-        case MacroReplacementObservationKind::FunctionLikeInvocation:
-          return functionLikeInvocationStartsInReplacement(
-              macroName, StringRef(edit.text), tuBytes.drop_front(edit.end));
-        }
-        return true;
+        return firstReplacementObservationOffset(edit, definition, macroName)
+            .has_value();
       };
+
+  // Find an existing physical line boundary in `replacement` at or before the
+  // first observing token.  This is the only interior split point that can host
+  // a carried directive without manufacturing arbitrary token splits: the bytes
+  // before the boundary stay in the old macro state, then the directive line is
+  // emitted, and all bytes from the boundary onward see the repaired state.
+  auto replacementLineStartBeforeObservation =
+      [&](StringRef replacement, size_t observationOffset)
+          -> std::optional<size_t> {
+    if (observationOffset > replacement.size())
+      return std::nullopt;
+
+    for (size_t i = observationOffset; i > 0; --i) {
+      const size_t nl = i - 1;
+      if (replacement[nl] != '\n')
+        continue;
+      if (stringutils::isLineSplice(replacement, nl))
+        return std::nullopt;
+      return nl + 1;
+    }
+    return std::nullopt;
+  };
 
   enum class MacroStatePreservationPlacement {
     BeforeReplacement,
+    InsideReplacement,
     AfterReplacement,
   };
 
@@ -3920,6 +3997,20 @@ std::string RefoldEngine::RunSinglePassRefold() {
     const RefoldModel::MacroDirective *directive = nullptr;
     MacroStatePreservationPlacement placement =
         MacroStatePreservationPlacement::BeforeReplacement;
+    size_t replacementOffset = 0;
+  };
+
+  auto macroStatePreservationPlacementName =
+      [](MacroStatePreservationPlacement placement) -> StringRef {
+    switch (placement) {
+    case MacroStatePreservationPlacement::BeforeReplacement:
+      return "before-replacement";
+    case MacroStatePreservationPlacement::InsideReplacement:
+      return "inside-replacement";
+    case MacroStatePreservationPlacement::AfterReplacement:
+      return "after-replacement";
+    }
+    return "unknown";
   };
 
   std::map<size_t, SmallVector<MacroStatePreservation, 4>>
@@ -3972,15 +4063,32 @@ std::string RefoldEngine::RunSinglePassRefold() {
   // before later preserved source or includes can observe its absence.
   auto tryQueueMacroStateDirectivePreservation =
       [&](size_t editIndex, const RefoldModel::MacroDirective &directive,
-          StringRef macroName) -> std::optional<MacroStatePreservationPlacement> {
+          StringRef macroName,
+          const RefoldModel::MacroDirective *observedDefinition)
+      -> std::optional<MacroStatePreservationPlacement> {
     if (editIndex >= tuEdits.size())
       return std::nullopt;
 
     TextEdit &edit = tuEdits[editIndex];
-    const bool replacementObservesDefinition =
-        directive.subkind == "#define"
-            ? replacementObservesPreservedDefinition(edit, directive, macroName)
-            : rawIdentifierAppearsInText(macroName, StringRef(edit.text));
+
+    // The directive being preserved is not always the directive whose expansion
+    // semantics the replacement might observe.  For consumed #define repair the
+    // two are the same directive.  For consumed #undef repair, however, moving
+    // the #undef after the payload leaves the previous live #define active
+    // while the payload is preprocessed.  Therefore the after-placement safety
+    // check must use the previous definition's observation class: object-like
+    // definitions are observed by the identifier token, while function-like
+    // definitions are observed only by a real NAME(...) invocation.
+    const RefoldModel::MacroDirective *definitionObservedByReplacement =
+        observedDefinition ? observedDefinition
+                           : (directive.subkind == "#define" ? &directive
+                                                               : nullptr);
+    const std::optional<size_t> firstObservationOffset =
+        definitionObservedByReplacement
+            ? firstReplacementObservationOffset(edit, *definitionObservedByReplacement,
+                                                macroName)
+            : firstRawIdentifierObservationOffset(macroName, StringRef(edit.text));
+    const bool replacementObservesDefinition = firstObservationOffset.has_value();
 
     const bool editStartsAtPhysicalBOL =
         edit.start == 0 || tuBytes[edit.start - 1] == '\n';
@@ -4000,15 +4108,6 @@ std::string RefoldEngine::RunSinglePassRefold() {
       return MacroStatePreservationPlacement::BeforeReplacement;
     }
 
-    // A #undef must still be observed conservatively for after-replacement
-    // placement: moving the undef after the payload leaves any prior definition
-    // active while that payload is preprocessed.  A #define is the opposite: an
-    // after-replacement placement is exactly how we keep the payload from
-    // observing the restored definition while making it available to the
-    // surviving suffix/include that needs it.
-    if (directive.subkind == "#undef" && replacementObservesDefinition)
-      return std::nullopt;
-
     std::optional<MacroDirectiveSourceInterval> directiveInterval =
         macroDirectiveFullSourceInterval(directive);
     if (!directiveInterval)
@@ -4016,6 +4115,36 @@ std::string RefoldEngine::RunSinglePassRefold() {
     if (directiveInterval->begin < edit.start ||
         edit.end < directiveInterval->end)
       return std::nullopt;
+
+    // A #undef normally cannot be delayed until after a replacement that observes
+    // the prior live definition: doing so would preprocess the replacement under
+    // the wrong macro state.  There is, however, one strictly local repair that
+    // preserves source structure without inventing an arbitrary split: when the
+    // replacement already contains a real physical line boundary before the first
+    // observing token, emit the consumed #undef at that boundary.  Bytes before
+    // the boundary remain in the old macro state; the observing token and the
+    // surviving suffix see the post-undef state, exactly as B requires.
+    if (directive.subkind == "#undef" && replacementObservesDefinition) {
+      if (!firstObservationOffset)
+        return std::nullopt;
+      std::optional<size_t> insertionOffset =
+          replacementLineStartBeforeObservation(StringRef(edit.text),
+                                                *firstObservationOffset);
+      if (!insertionOffset)
+        return std::nullopt;
+
+      macroStatePreservationsByEdit[editIndex].push_back(
+          MacroStatePreservation{
+              &directive, MacroStatePreservationPlacement::InsideReplacement,
+              *insertionOffset});
+      return MacroStatePreservationPlacement::InsideReplacement;
+    }
+
+    // For non-observing #undef payloads and for #define carry, after-replacement
+    // placement restores the directive before later preserved source/includes can
+    // observe its absence.  The replacement/suffix boundary still has to admit a
+    // directive line so the inserted zero-token directive cannot accidentally join
+    // the replacement and suffix into a different token stream.
     if (!replacementSuffixBoundaryAllowsDirectiveLine(edit))
       return std::nullopt;
 
@@ -4083,8 +4212,9 @@ std::string RefoldEngine::RunSinglePassRefold() {
         case MacroReplacementObservationKind::IdentifierToken:
           return rawIdentifierAppearsInText(macroName, chunk);
         case MacroReplacementObservationKind::FunctionLikeInvocation:
-          return functionLikeInvocationStartsInReplacement(macroName, chunk,
-                                                           following);
+          return firstFunctionLikeInvocationOffsetInReplacement(macroName, chunk,
+                                                                following)
+              .has_value();
         }
         return true;
       };
@@ -4512,7 +4642,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
         std::optional<MacroStatePreservationPlacement> placement;
         if (!preservedDefinitionDirectiveIds.contains(definition->id))
           placement = tryQueueMacroStateDirectivePreservation(
-              *editIndex, *definition, m.name);
+              *editIndex, *definition, m.name,
+              /*observedDefinition=*/nullptr);
         else
           placement = MacroStatePreservationPlacement::BeforeReplacement;
 
@@ -4531,9 +4662,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
                  "placement={5}",
                  m.name, definition->id, m.id, tuEdits[*editIndex].start,
                  tuEdits[*editIndex].end,
-                 *placement == MacroStatePreservationPlacement::BeforeReplacement
-                     ? "before-replacement"
-                     : "after-replacement");
+                 macroStatePreservationPlacementName(*placement));
           } else {
             debug("macro/liveness",
                   "macro callsite can reuse already-preserved #define: "
@@ -4766,8 +4895,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
     // is zero-token source structure, but later preserved source can still
     // observe whether that transition remains in the macro-state stream.
     std::optional<MacroStatePreservationPlacement> placement =
-        tryQueueMacroStateDirectivePreservation(*editIndex, undefDirective,
-                                                ref.name);
+        tryQueueMacroStateDirectivePreservation(
+            *editIndex, undefDirective, ref.name, previousDefinition);
     if (!placement) {
       RequestTerminalFallback(
           TerminalFallbackKind::UndischargedEmissionArtifact,
@@ -4789,9 +4918,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
          "placement={5}",
          ref.name, undefDirective.id, previousDefinition->id, edit.start,
          edit.end,
-         *placement == MacroStatePreservationPlacement::BeforeReplacement
-             ? "before-replacement"
-             : "after-replacement");
+         macroStatePreservationPlacementName(*placement));
   }
 
   if (terminalFallbackRequested_) {
@@ -4819,6 +4946,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
 
     std::string prefix;
     std::string suffix;
+    std::map<size_t, std::string> interiorInsertions;
     for (const MacroStatePreservation &preservation : preservations) {
       if (!preservation.directive)
         continue;
@@ -4828,15 +4956,42 @@ std::string RefoldEngine::RunSinglePassRefold() {
         continue;
       }
 
+      if (preservation.placement ==
+          MacroStatePreservationPlacement::InsideReplacement) {
+        // Interior placement is used only at a real line boundary already present
+        // in the replacement text.  Keep the B-derived bytes on both sides of the
+        // boundary unchanged and inject the zero-token directive line between
+        // them, so the token that would observe a resurrected definition sees
+        // the repaired post-directive macro state.
+        interiorInsertions[preservation.replacementOffset] +=
+            directiveTextForPreservation(*preservation.directive);
+        continue;
+      }
+
       if (suffix.empty() && !edit.text.empty() && edit.text.back() != '\n')
         suffix.push_back('\n');
       suffix += directiveTextForPreservation(*preservation.directive);
     }
 
     // The edit still replaces the same original byte interval. Prefix
-    // preservations keep state visible before the replacement payload; suffix
-    // preservations delay state until after the edited payload so B-side
+    // preservations keep state visible before the replacement payload; interior
+    // preservations split the payload only at an existing physical line boundary;
+    // suffix preservations delay state until after the edited payload so B-side
     // replacement tokens cannot accidentally observe a consumed directive.
+    if (!interiorInsertions.empty()) {
+      std::string replacementWithInteriorPreservations;
+      size_t cursor = 0;
+      for (const auto &insertion : interiorInsertions) {
+        const size_t offset = std::min(insertion.first, edit.text.size());
+        replacementWithInteriorPreservations.append(edit.text.begin() + cursor,
+                                                    edit.text.begin() + offset);
+        replacementWithInteriorPreservations += insertion.second;
+        cursor = offset;
+      }
+      replacementWithInteriorPreservations.append(edit.text.begin() + cursor,
+                                                  edit.text.end());
+      edit.text = std::move(replacementWithInteriorPreservations);
+    }
     if (!prefix.empty())
       edit.text.insert(0, prefix);
     if (!suffix.empty())
