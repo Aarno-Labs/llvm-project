@@ -288,6 +288,15 @@ struct ParsedSourceLineDirectiveLogicalLine {
   std::string lineMarkerFlags;
 };
 
+struct SourceLineDirectiveLogicalLineRewrite {
+  std::string line;
+  SmallVector<uint64_t, 4> macroInvocationIds;
+};
+
+using SourceLineDirectiveLogicalLineRewriter =
+    std::function<std::optional<SourceLineDirectiveLogicalLineRewrite>(
+        StringRef, ArrayRef<uint64_t>)>;
+
 /// Build the translation-phase-2 logical spelling of one source line.
 ///
 /// Source-level `#line` gaps are parsed from raw file bytes because they do not
@@ -298,13 +307,16 @@ struct ParsedSourceLineDirectiveLogicalLine {
 /// backslash-newline and backslash-CRLF pairs that are fully contained in the
 /// proved source gap, then returns the byte just after the terminating
 /// non-spliced newline.
-static bool collectPhase2LogicalLine(StringRef fileText, uint64_t lineBegin,
-                                     uint64_t limit, std::string &logicalLine,
-                                     uint64_t &afterLine) {
+static bool collectPhase2LogicalLine(
+    StringRef fileText, uint64_t lineBegin, uint64_t limit,
+    std::string &logicalLine, uint64_t &afterLine,
+    SmallVectorImpl<uint64_t> *logicalLineSourceOffsets = nullptr) {
   if (lineBegin > limit || limit > fileText.size())
     return false;
 
   logicalLine.clear();
+  if (logicalLineSourceOffsets)
+    logicalLineSourceOffsets->clear();
   for (uint64_t pos = lineBegin; pos < limit;) {
     char ch = fileText[pos];
 
@@ -330,6 +342,8 @@ static bool collectPhase2LogicalLine(StringRef fileText, uint64_t lineBegin,
     }
 
     logicalLine.push_back(ch);
+    if (logicalLineSourceOffsets)
+      logicalLineSourceOffsets->push_back(pos);
     ++pos;
   }
 
@@ -490,6 +504,213 @@ parseSourceLineDirectiveLogicalLine(StringRef line,
       isNumericLineMarker && hasExplicitFileSpelling, lineMarkerFlags};
 }
 
+
+/// Return true iff a macro invocation produced ordinary PP material that would
+/// need the normal macro-realization machinery rather than line-control repair.
+static bool sourceLineDirectiveMacroHasMaterializedPPTokens(
+    const RefoldModel::MacroInvocation &macro) {
+  if (macro.cover.IsValid())
+    return true;
+  for (const RefoldModel::PPSpan &span : macro.stringifySpans)
+    if (span.IsValid())
+      return true;
+  for (const RefoldModel::PPSpan &span : macro.pasteSpans)
+    if (span.IsValid())
+      return true;
+  return false;
+}
+
+/// Recover a simple object-like or argument-free function-like macro
+/// replacement spelling that can participate in a source-only line-control
+/// directive.
+///
+/// This is intentionally not a general macro expander.  The refold map records
+/// the macro invocation and the defining directive, but it does not record a
+/// dedicated expanded token stream for #line directive operands.  Therefore the
+/// repair only substitutes complete callsites whose replacement list is spelled
+/// directly in the recorded #define text; the resulting logical directive line
+/// is still fed to the strict line-control parser before the gap is accepted.
+static std::optional<std::string> simpleLineControlMacroReplacementText(
+    const RefoldModel &model, const RefoldModel::MacroInvocation &macro) {
+  if (macro.subkind != "obj" && macro.subkind != "func")
+    return std::nullopt;
+  if (macro.subkind == "func" && !macro.defParams.empty())
+    return std::nullopt;
+  if (!macro.definitionDirectiveId ||
+      sourceLineDirectiveMacroHasMaterializedPPTokens(macro))
+    return std::nullopt;
+
+  const RefoldModel::MacroDirective *definition = nullptr;
+  for (const RefoldModel::MacroDirective &directive : model.GetMacroDirectives())
+    if (directive.id == *macro.definitionDirectiveId) {
+      definition = &directive;
+      break;
+    }
+  if (!definition || definition->subkind != "#define")
+    return std::nullopt;
+
+  StringRef text = definition->text;
+  size_t pos = 0;
+  stringutils::skipNonNewlineWs(text, pos);
+  if (pos >= text.size() || text[pos] != '#')
+    return std::nullopt;
+  ++pos;
+  stringutils::skipNonNewlineWs(text, pos);
+
+  if (!text.substr(pos).starts_with("define"))
+    return std::nullopt;
+  pos += StringRef("define").size();
+  if (pos < text.size() && stringutils::isIdentPart(text[pos]))
+    return std::nullopt;
+  stringutils::skipNonNewlineWs(text, pos);
+
+  if (!text.substr(pos).starts_with(macro.name))
+    return std::nullopt;
+  pos += macro.name.size();
+  if (pos < text.size() && stringutils::isIdentPart(text[pos]))
+    return std::nullopt;
+
+  if (macro.subkind == "func") {
+    if (pos >= text.size() || text[pos] != '(')
+      return std::nullopt;
+    unsigned depth = 0;
+    while (pos < text.size()) {
+      char ch = text[pos++];
+      if (ch == '(') {
+        ++depth;
+        continue;
+      }
+      if (ch == ')') {
+        if (depth == 0)
+          return std::nullopt;
+        --depth;
+        if (depth == 0)
+          break;
+      }
+    }
+    if (depth != 0)
+      return std::nullopt;
+  }
+
+  StringRef replacement = text.substr(pos).trim(" \t\v\f\r\n");
+  if (replacement.empty())
+    return std::nullopt;
+
+  // Multi-line replacement lists and line continuations require a real macro
+  // expansion model for directive operands.  Keep this proof to one recorded
+  // replacement-list line and let the final line-control parser reject anything
+  // that is not a valid numeric/string line-control operand sequence.
+  if (replacement.contains('\n') || replacement.contains('\r') ||
+      replacement.rtrim(" \t\v\f").ends_with("\\"))
+    return std::nullopt;
+
+  return replacement.str();
+}
+
+/// Substitute simple recorded macro invocations into one source-only
+/// line-control logical line.
+///
+/// The substitution is used only as a precursor to the strict line-control
+/// parser.  It accepts complete callsites whose source bytes map contiguously
+/// into the phase-2 logical line and whose replacement text is recovered from a
+/// simple recorded #define.  Partial callsites, nested/overlapping source
+/// ranges, parameterized replacement semantics, and unrecorded expansions all
+/// fail closed.
+static std::optional<SourceLineDirectiveLogicalLineRewrite>
+rewriteSourceLineDirectiveLogicalLineMacros(
+    const RefoldModel &model, StringRef file, StringRef logicalLine,
+    ArrayRef<uint64_t> logicalLineSourceOffsets,
+    const std::function<bool(StringRef, StringRef)> &pathsEqual,
+    std::optional<uint64_t> ownerIncludeId = std::nullopt) {
+  if (logicalLineSourceOffsets.size() != logicalLine.size())
+    return std::nullopt;
+
+  struct ReplacementPiece {
+    size_t begin = 0;
+    size_t end = 0;
+    uint64_t macroId = 0;
+    std::string replacement;
+  };
+
+  auto findLogicalIndex = [&](uint64_t sourceOffset) -> std::optional<size_t> {
+    auto it = std::lower_bound(logicalLineSourceOffsets.begin(),
+                               logicalLineSourceOffsets.end(), sourceOffset);
+    if (it == logicalLineSourceOffsets.end() || *it != sourceOffset)
+      return std::nullopt;
+    return static_cast<size_t>(it - logicalLineSourceOffsets.begin());
+  };
+
+  auto findLogicalEndIndex = [&](uint64_t sourceOffset) -> std::optional<size_t> {
+    auto it = std::lower_bound(logicalLineSourceOffsets.begin(),
+                               logicalLineSourceOffsets.end(), sourceOffset);
+    return static_cast<size_t>(it - logicalLineSourceOffsets.begin());
+  };
+
+  SmallVector<ReplacementPiece, 4> pieces;
+  for (const RefoldModel::MacroInvocation &macro : model.GetMacroInvocations()) {
+    if (!macro.invFile || macro.invFile->empty() || !pathsEqual(*macro.invFile, file))
+      continue;
+    if (ownerIncludeId &&
+        (!macro.ownerIncludeId || *macro.ownerIncludeId != *ownerIncludeId))
+      continue;
+    if (!macro.invB || !macro.invE || *macro.invB >= *macro.invE)
+      continue;
+
+    std::optional<size_t> beginIndex = findLogicalIndex(*macro.invB);
+    std::optional<size_t> endIndex = findLogicalEndIndex(*macro.invE);
+    if (!beginIndex || !endIndex || *beginIndex >= *endIndex ||
+        *endIndex > logicalLine.size())
+      continue;
+
+    bool contiguousSourceSpelling = true;
+    for (size_t i = *beginIndex; i != *endIndex; ++i) {
+      if (logicalLineSourceOffsets[i] != *macro.invB + (i - *beginIndex)) {
+        contiguousSourceSpelling = false;
+        break;
+      }
+    }
+    if (!contiguousSourceSpelling)
+      continue;
+
+    if (macro.invText && logicalLine.substr(*beginIndex, *endIndex - *beginIndex) !=
+                             *macro.invText)
+      continue;
+
+    std::optional<std::string> replacement =
+        simpleLineControlMacroReplacementText(model, macro);
+    if (!replacement)
+      return std::nullopt;
+
+    pieces.push_back({*beginIndex, *endIndex, macro.id, std::move(*replacement)});
+  }
+
+  if (pieces.empty())
+    return std::nullopt;
+
+  llvm::sort(pieces, [](const ReplacementPiece &lhs,
+                        const ReplacementPiece &rhs) {
+    if (lhs.begin != rhs.begin)
+      return lhs.begin < rhs.begin;
+    if (lhs.end != rhs.end)
+      return lhs.end < rhs.end;
+    return lhs.macroId < rhs.macroId;
+  });
+
+  SourceLineDirectiveLogicalLineRewrite out;
+  size_t cursor = 0;
+  for (const ReplacementPiece &piece : pieces) {
+    if (piece.begin < cursor)
+      return std::nullopt;
+    out.line.append(logicalLine.begin() + cursor,
+                    logicalLine.begin() + piece.begin);
+    out.line += piece.replacement;
+    out.macroInvocationIds.push_back(piece.macroId);
+    cursor = piece.end;
+  }
+  out.line.append(logicalLine.begin() + cursor, logicalLine.end());
+  return out;
+}
+
 /// Format the local resume directive for a consumed source-only line-control
 /// gap.  Canonical #line spelling is used unless the consumed state carries
 /// numeric line-marker flags that must be replayed to preserve the suffix state.
@@ -518,9 +739,11 @@ formatSourceLineDirectiveGapResume(const SourceLineDirectiveGapResume &resume) {
 /// so a directive before a consumed include line is rewritten to the line that the
 /// suffix would have observed after that include line had executed.
 static std::optional<SourceLineDirectiveGapResume>
-computeSourceLineDirectiveGapResume(StringRef fileText, uint64_t gapBegin,
-                                    uint64_t gapEnd, uint64_t resumeOffset,
-                                    StringRef defaultFileSpelling) {
+computeSourceLineDirectiveGapResume(
+    StringRef fileText, uint64_t gapBegin, uint64_t gapEnd,
+    uint64_t resumeOffset, StringRef defaultFileSpelling,
+    SourceLineDirectiveLogicalLineRewriter logicalLineRewriter = nullptr,
+    SmallVectorImpl<uint64_t> *acceptedMacroInvocationIds = nullptr) {
   if (gapBegin >= gapEnd || gapEnd > fileText.size() ||
       resumeOffset < gapEnd || resumeOffset > fileText.size())
     return std::nullopt;
@@ -590,15 +813,26 @@ computeSourceLineDirectiveGapResume(StringRef fileText, uint64_t gapBegin,
       return std::nullopt;
 
     std::string logicalLine;
+    SmallVector<uint64_t, 64> logicalLineSourceOffsets;
     uint64_t afterLine = cursor;
     if (!collectPhase2LogicalLine(fileText, cursor, gapEnd, logicalLine,
-                                  afterLine))
+                                  afterLine, &logicalLineSourceOffsets))
       return std::nullopt;
 
+    std::optional<SourceLineDirectiveLogicalLineRewrite> rewrite;
     std::optional<ParsedSourceLineDirectiveLogicalLine> state =
         parseSourceLineDirectiveLogicalLine(logicalLine, currentFileSpelling);
+    if (!state && logicalLineRewriter) {
+      rewrite = logicalLineRewriter(logicalLine, logicalLineSourceOffsets);
+      if (rewrite)
+        state = parseSourceLineDirectiveLogicalLine(rewrite->line,
+                                                   currentFileSpelling);
+    }
     if (!state)
       return std::nullopt;
+    if (rewrite && acceptedMacroInvocationIds)
+      acceptedMacroInvocationIds->append(rewrite->macroInvocationIds.begin(),
+                                         rewrite->macroInvocationIds.end());
 
     sawLineDirective = true;
     currentFileSpelling = state->fileSpelling;
@@ -3014,6 +3248,49 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       return std::nullopt;
     }
 
+    SourceLineDirectiveLogicalLineRewriter sourceLineDirectiveLineRewriter =
+        [&](StringRef logicalLine, ArrayRef<uint64_t> sourceOffsets)
+            -> std::optional<SourceLineDirectiveLogicalLineRewrite> {
+      return rewriteSourceLineDirectiveLogicalLineMacros(
+          model_, tuPath, logicalLine, sourceOffsets,
+          [&](StringRef lhs, StringRef rhs) { return PathsEqual(lhs, rhs); });
+    };
+
+    DenseSet<uint64_t> mixedSourceLineDirectiveMacroIds;
+    auto recordSourceLineDirectiveMacroIds =
+        [&](ArrayRef<uint64_t> macroIds) {
+      for (uint64_t macroId : macroIds)
+        mixedSourceLineDirectiveMacroIds.insert(macroId);
+    };
+
+    auto macroInvocationIsInsideConsumableSourceLineDirectiveGap =
+        [&](const RefoldModel::MacroInvocation &macro) -> bool {
+      if (!macro.invFile || macro.invFile->empty() ||
+          !PathsEqual(*macro.invFile, tuPath))
+        return false;
+      if (!macro.invB || !macro.invE || *macro.invB >= *macro.invE)
+        return false;
+
+      for (size_t idx = 1; idx < mergedPieces.size(); ++idx) {
+        const uint64_t gapBegin = mergedPieces[idx - 1].second;
+        const uint64_t gapEnd = mergedPieces[idx].first;
+        if (*macro.invB < gapBegin || gapEnd < *macro.invE)
+          continue;
+
+        SmallVector<uint64_t, 4> acceptedMacroIds;
+        if (!computeSourceLineDirectiveGapResume(
+                tuBytes, gapBegin, gapEnd, sourceEnd, tuPath,
+                sourceLineDirectiveLineRewriter, &acceptedMacroIds))
+          continue;
+
+        recordSourceLineDirectiveMacroIds(acceptedMacroIds);
+        for (uint64_t macroId : acceptedMacroIds)
+          if (macroId == macro.id)
+            return true;
+      }
+      return false;
+    };
+
     // Do not delete or partially overwrite unrelated macro invocations.  Three
     // complete-callsite cases are allowed inside the replacement envelope:
     //
@@ -3035,7 +3312,9 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
         if (macroInvocationIsInsideTouchedIncludeDirective(m) ||
             macroInvocationIsConsumableZeroTokenGap(m, sourceBegin,
                                                    sourceEnd) ||
-            macroInvocationMaterialIsConsumed(m, sourceBegin, sourceEnd))
+            macroInvocationMaterialIsConsumed(m, sourceBegin, sourceEnd) ||
+            mixedSourceLineDirectiveMacroIds.contains(m.id) ||
+            macroInvocationIsInsideConsumableSourceLineDirectiveGap(m))
           continue;
         trace("fallback",
               "TU/include closure rejected: source interval [{0},{1}) would "
@@ -3072,15 +3351,18 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
                       /*allowTUConditionalControl=*/true))
                 return true;
 
+              SmallVector<uint64_t, 4> acceptedMacroIds;
               if (std::optional<SourceLineDirectiveGapResume> lineResume =
                       computeSourceLineDirectiveGapResume(
-                          tuBytes, gapBegin, gapEnd, sourceEnd, tuPath)) {
+                          tuBytes, gapBegin, gapEnd, sourceEnd, tuPath,
+                          sourceLineDirectiveLineRewriter, &acceptedMacroIds)) {
                 // A source-spelled line-control directive contributes no PP
                 // tokens, but it is not disposable trivia: it changes the
                 // presumed file/line state for the untouched suffix.  Admit the
                 // gap only by carrying a replacement-local resync that restores
                 // the state observed after the whole consumed source envelope.
                 mixedSourceLineDirectiveResume = std::move(lineResume);
+                recordSourceLineDirectiveMacroIds(acceptedMacroIds);
                 trace("fallback",
                       "TU/include closure preserving source #line state from "
                       "gap=[{0},{1}) resumeLine={2} file={3}",
