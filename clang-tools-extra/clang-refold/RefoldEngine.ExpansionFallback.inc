@@ -649,14 +649,59 @@ static bool sourceSuffixMayObservePresumedFileSpelling(
   return false;
 }
 
+/// Produce the string literal spelling for a macro argument used by the `#`
+/// operator inside a source-only line-control directive.
+///
+/// This is the small, proof-local subset of C macro stringification needed for
+/// line-control operands.  It normalizes leading/trailing and internal
+/// whitespace in the invocation argument, then emits a C string token spelling
+/// for the resulting character sequence.  Inputs that would require the full
+/// preprocessor token stream to stringify correctly, such as comments, string
+/// or character literals, or explicit backslashes, fail closed.
+static std::optional<std::string>
+stringifyLineControlMacroArgument(StringRef argument) {
+  // Comments are replaced by whitespace before macro stringification, but this
+  // local proof operates on recorded source spelling rather than a tokenized
+  // replacement stream.  Do not guess how comment bytes collapse.
+  if (argument.contains("//") || argument.contains("/*"))
+    return std::nullopt;
+
+  // Stringification has special escaping rules for quotes and backslashes that
+  // appear inside string/character literals.  Keep this proof to non-literal
+  // filename spellings such as `gap.c`; more complex operands need producer
+  // evidence for the already-stringified token.
+  if (argument.contains('\"') || argument.contains('\'') ||
+      argument.contains('\\'))
+    return std::nullopt;
+
+  StringRef trimmed = argument.trim(" \t\v\f\r\n");
+  std::string normalized;
+  bool pendingSpace = false;
+  for (char ch : trimmed) {
+    if (stringutils::isWs(ch)) {
+      pendingSpace = !normalized.empty();
+      continue;
+    }
+    if (pendingSpace) {
+      normalized.push_back(' ');
+      pendingSpace = false;
+    }
+    normalized.push_back(ch);
+  }
+
+  return stringutils::quoteCString(normalized);
+}
+
 /// Substitute invocation arguments through a simple function-like replacement
 /// list used inside a source-only line-control directive.
 ///
 /// This is intentionally a token-spelling substitution, not a general macro
 /// expander.  The caller supplies exact source spellings for complete invocation
 /// arguments that are wholly inside the already-proved logical directive line.
-/// The resulting replacement text is still parsed by the strict line-control
-/// parser, so any unsupported macro semantics remain fail-closed.
+/// Direct formal substitution is supported, and `# formal` is supported through
+/// the conservative line-control stringification helper above.  The resulting
+/// replacement text is still parsed by the strict line-control parser, so any
+/// unsupported macro semantics remain fail-closed.
 static std::optional<std::string> substituteLineControlMacroParameters(
     StringRef replacement, ArrayRef<RefoldModel::MacroDefParam> params,
     ArrayRef<StringRef> invocationArgTexts) {
@@ -679,10 +724,37 @@ static std::optional<std::string> substituteLineControlMacroParameters(
   for (size_t pos = 0; pos < replacement.size();) {
     char ch = replacement[pos];
 
-    // Stringification and token pasting are macro operators, not direct textual
-    // replacement.  Leave those outside this narrow line-control proof.
-    if (ch == '#')
-      return std::nullopt;
+    if (ch == '#') {
+      // Token pasting changes token boundaries and cannot be modeled by this
+      // local spelling substitution.
+      if (pos + 1 < replacement.size() && replacement[pos + 1] == '#')
+        return std::nullopt;
+
+      // The stringification operator is deterministic for complete recorded
+      // arguments.  Accept only `# formal` and let the final line-control parser
+      // certify that the produced string literal is legal in this directive.
+      size_t identBegin = pos + 1;
+      stringutils::skipNonNewlineWs(replacement, identBegin);
+      if (identBegin >= replacement.size() ||
+          !stringutils::isIdentStart(replacement[identBegin]))
+        return std::nullopt;
+      size_t identEnd = identBegin + 1;
+      while (identEnd < replacement.size() &&
+             stringutils::isIdentPart(replacement[identEnd]))
+        ++identEnd;
+
+      StringRef ident = replacement.slice(identBegin, identEnd);
+      std::optional<StringRef> argText = lookupParam(ident);
+      if (!argText)
+        return std::nullopt;
+      std::optional<std::string> stringified =
+          stringifyLineControlMacroArgument(*argText);
+      if (!stringified)
+        return std::nullopt;
+      out += *stringified;
+      pos = identEnd;
+      continue;
+    }
 
     // Comments in a replacement list are translated to whitespace before macro
     // replacement.  The refold map currently gives us the recorded directive
@@ -746,10 +818,11 @@ static std::optional<std::string> substituteLineControlMacroParameters(
 /// byte ranges, but it does not record a dedicated expanded token stream for
 /// #line directive operands.  Therefore the repair only substitutes complete
 /// callsites whose replacement list is spelled directly in the recorded #define
-/// text.  For function-like macros with parameters, only direct formal-token
-/// substitution is allowed; paste, stringify, variadics, comments, multiline
-/// replacement lists, and any resulting non-line-control spelling fail closed
-/// when the strict parser is re-run on the rewritten directive line.
+/// text.  For function-like macros with parameters, direct formal-token
+/// substitution and conservative `# formal` stringification are allowed; paste,
+/// variadics, comments, multiline replacement lists, and any resulting
+/// non-line-control spelling fail closed when the strict parser is re-run on
+/// the rewritten directive line.
 static std::optional<std::string> simpleLineControlMacroReplacementText(
     const RefoldModel &model, const RefoldModel::MacroInvocation &macro,
     ArrayRef<StringRef> invocationArgTexts) {
