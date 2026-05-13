@@ -293,6 +293,11 @@ struct SourceLineDirectiveLogicalLineRewrite {
   SmallVector<uint64_t, 4> macroInvocationIds;
 };
 
+struct SourceLineDirectiveMacroReplacement {
+  std::string text;
+  SmallVector<uint64_t, 4> macroInvocationIds;
+};
+
 using SourceLineDirectiveLogicalLineRewriter =
     std::function<std::optional<SourceLineDirectiveLogicalLineRewrite>(
         StringRef, ArrayRef<uint64_t>)>;
@@ -706,6 +711,177 @@ static std::optional<std::string> simpleLineControlMacroReplacementText(
   return replacement.str();
 }
 
+/// Find the single identifier-token occurrence of `name` inside `text`.
+///
+/// Recursive line-control macro repair uses producer-recorded child macro
+/// invocations rather than scanning arbitrary identifiers as expansion
+/// candidates.  This helper only locates where that already-recorded child
+/// invocation appears in the current replacement spelling.  Ambiguous repeated
+/// spellings fail closed because the refold map does not give this local string
+/// a token index that would disambiguate two identical macro names.
+static std::optional<std::pair<size_t, size_t>>
+findUniqueLineControlMacroNameOccurrence(StringRef text, StringRef name) {
+  if (name.empty())
+    return std::nullopt;
+
+  std::optional<std::pair<size_t, size_t>> found;
+  for (size_t pos = 0; pos < text.size();) {
+    size_t match = text.find(name, pos);
+    if (match == StringRef::npos)
+      break;
+
+    const size_t end = match + name.size();
+    const bool beginsAtIdentBoundary =
+        match == 0 || !stringutils::isIdentPart(text[match - 1]);
+    const bool endsAtIdentBoundary =
+        end == text.size() || !stringutils::isIdentPart(text[end]);
+    if (beginsAtIdentBoundary && endsAtIdentBoundary) {
+      if (found)
+        return std::nullopt;
+      found = std::make_pair(match, end);
+    }
+
+    pos = match + 1;
+  }
+
+  return found;
+}
+
+/// Recover invocation argument spellings for a macro invocation that happened
+/// while expanding another macro replacement list.
+///
+/// The producer records `normalized_inv_text` for macro calls after macro
+/// argument prescan.  When the child call itself has parameters, those
+/// normalized argument ranges are the only source-local spellings this narrow
+/// line-control proof can use without running a full preprocessor.  If any
+/// argument is missing or malformed, the caller fails closed.
+static std::optional<SmallVector<StringRef, 4>>
+lineControlNestedMacroInvocationArgTexts(
+    const RefoldModel::MacroInvocation &macro) {
+  SmallVector<StringRef, 4> args;
+  if (macro.subkind != "func" || macro.defParams.empty())
+    return args;
+
+  if (!macro.normalizedInvText ||
+      macro.normalizedInvArgTextRanges.size() != macro.defParams.size())
+    return std::nullopt;
+
+  StringRef normalized = *macro.normalizedInvText;
+  for (const RefoldModel::MacroInvocation::OptByteRange &range :
+       macro.normalizedInvArgTextRanges) {
+    if (!range.first || !range.second || *range.first > *range.second ||
+        *range.second > normalized.size())
+      return std::nullopt;
+    args.push_back(normalized.slice(*range.first, *range.second));
+  }
+
+  return args;
+}
+
+/// Recursively expand the bounded macro DAG recorded for a line-control operand.
+///
+/// This is still not a general macro expander.  It starts from the same simple
+/// replacement-list recovery used for directly spelled macro operands, then
+/// follows only producer-recorded child macro invocations whose `caller_macro_id`
+/// is the macro being expanded.  Each child must occur unambiguously as a whole
+/// identifier in the current replacement text and must itself satisfy the same
+/// simple line-control replacement rules.  Cycles, unsupported macro operators,
+/// ambiguous repeated child spellings, and excessive expansion depth all fail
+/// closed before the strict line-control parser sees the rewritten directive.
+static std::optional<SourceLineDirectiveMacroReplacement>
+expandLineControlMacroReplacementText(
+    const RefoldModel &model, const RefoldModel::MacroInvocation &macro,
+    ArrayRef<StringRef> invocationArgTexts,
+    SmallVectorImpl<uint64_t> &activeMacroIds) {
+  if (activeMacroIds.size() > 32)
+    return std::nullopt;
+  if (std::find(activeMacroIds.begin(), activeMacroIds.end(), macro.id) !=
+      activeMacroIds.end())
+    return std::nullopt;
+
+  std::optional<std::string> replacement =
+      simpleLineControlMacroReplacementText(model, macro, invocationArgTexts);
+  if (!replacement)
+    return std::nullopt;
+
+  SourceLineDirectiveMacroReplacement out;
+  out.text = std::move(*replacement);
+  out.macroInvocationIds.push_back(macro.id);
+
+  activeMacroIds.push_back(macro.id);
+  struct ChildReplacementPiece {
+    size_t begin = 0;
+    size_t end = 0;
+    uint64_t macroId = 0;
+    std::string replacement;
+    SmallVector<uint64_t, 4> macroInvocationIds;
+  };
+
+  SmallVector<ChildReplacementPiece, 4> childPieces;
+  for (const RefoldModel::MacroInvocation &child : model.GetMacroInvocations()) {
+    if (!child.callerMacroId || *child.callerMacroId != macro.id)
+      continue;
+    if (!child.invText || child.invText->empty()) {
+      activeMacroIds.pop_back();
+      return std::nullopt;
+    }
+
+    std::optional<std::pair<size_t, size_t>> occurrence =
+        findUniqueLineControlMacroNameOccurrence(out.text, *child.invText);
+    if (!occurrence) {
+      activeMacroIds.pop_back();
+      return std::nullopt;
+    }
+
+    std::optional<SmallVector<StringRef, 4>> childArgTexts =
+        lineControlNestedMacroInvocationArgTexts(child);
+    if (!childArgTexts) {
+      activeMacroIds.pop_back();
+      return std::nullopt;
+    }
+
+    std::optional<SourceLineDirectiveMacroReplacement> childReplacement =
+        expandLineControlMacroReplacementText(model, child, *childArgTexts,
+                                              activeMacroIds);
+    if (!childReplacement) {
+      activeMacroIds.pop_back();
+      return std::nullopt;
+    }
+
+    childPieces.push_back({occurrence->first, occurrence->second, child.id,
+                           std::move(childReplacement->text),
+                           std::move(childReplacement->macroInvocationIds)});
+  }
+  activeMacroIds.pop_back();
+
+  if (childPieces.empty())
+    return out;
+
+  llvm::sort(childPieces, [](const ChildReplacementPiece &lhs,
+                             const ChildReplacementPiece &rhs) {
+    if (lhs.begin != rhs.begin)
+      return lhs.begin < rhs.begin;
+    if (lhs.end != rhs.end)
+      return lhs.end < rhs.end;
+    return lhs.macroId < rhs.macroId;
+  });
+
+  std::string expanded;
+  size_t cursor = 0;
+  for (const ChildReplacementPiece &piece : childPieces) {
+    if (piece.begin < cursor)
+      return std::nullopt;
+    expanded.append(out.text.begin() + cursor, out.text.begin() + piece.begin);
+    expanded += piece.replacement;
+    out.macroInvocationIds.append(piece.macroInvocationIds.begin(),
+                                  piece.macroInvocationIds.end());
+    cursor = piece.end;
+  }
+  expanded.append(out.text.begin() + cursor, out.text.end());
+  out.text = std::move(expanded);
+  return out;
+}
+
 /// Substitute simple recorded macro invocations into one source-only
 /// line-control logical line.
 ///
@@ -729,6 +905,7 @@ rewriteSourceLineDirectiveLogicalLineMacros(
     size_t end = 0;
     uint64_t macroId = 0;
     std::string replacement;
+    SmallVector<uint64_t, 4> macroInvocationIds;
   };
 
   auto findLogicalIndex = [&](uint64_t sourceOffset) -> std::optional<size_t> {
@@ -814,12 +991,16 @@ rewriteSourceLineDirectiveLogicalLineMacros(
       }
     }
 
-    std::optional<std::string> replacement =
-        simpleLineControlMacroReplacementText(model, macro, invocationArgTexts);
+    SmallVector<uint64_t, 8> activeMacroIds;
+    std::optional<SourceLineDirectiveMacroReplacement> replacement =
+        expandLineControlMacroReplacementText(model, macro, invocationArgTexts,
+                                              activeMacroIds);
     if (!replacement)
       return std::nullopt;
 
-    pieces.push_back({*beginIndex, *endIndex, macro.id, std::move(*replacement)});
+    pieces.push_back({*beginIndex, *endIndex, macro.id,
+                      std::move(replacement->text),
+                      std::move(replacement->macroInvocationIds)});
   }
 
   if (pieces.empty())
@@ -842,7 +1023,8 @@ rewriteSourceLineDirectiveLogicalLineMacros(
     out.line.append(logicalLine.begin() + cursor,
                     logicalLine.begin() + piece.begin);
     out.line += piece.replacement;
-    out.macroInvocationIds.push_back(piece.macroId);
+    out.macroInvocationIds.append(piece.macroInvocationIds.begin(),
+                                  piece.macroInvocationIds.end());
     cursor = piece.end;
   }
   out.line.append(logicalLine.begin() + cursor, logicalLine.end());
