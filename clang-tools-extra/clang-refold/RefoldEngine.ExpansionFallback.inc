@@ -663,8 +663,9 @@ decodeBoundedLineControlHexEscapeValue(StringRef &rest) {
 /// Numeric C escapes are decoded only for ordinary printable ASCII bytes.  That
 /// covers the deterministic filename spellings needed for source-only
 /// line-control repair while avoiding implementation-defined character-set
-/// questions and bytes such as physical newlines, NUL, or other controls that
-/// LineDirectiveInserter::EscapeForLineDirective() does not currently model.
+/// questions and arbitrary control bytes.  Named control escapes are handled by
+/// their own exact table below because the #line formatter can replay those
+/// spellings without guessing.
 static bool isReplayableLineControlNumericFilenameByte(unsigned value) {
   return 0x20 <= value && value <= 0x7e;
 }
@@ -678,10 +679,12 @@ static bool isReplayableLineControlNumericFilenameByte(unsigned value) {
 /// * bounded octal escapes that decode to printable ASCII; and
 /// * bounded hexadecimal escapes that decode to printable ASCII.
 ///
-/// Named control escapes (`\n`, `\t`, etc.), universal-character names, empty
-/// hex escapes, out-of-range numeric escapes, and physical line breaks fail
-/// closed.  Those forms either require a wider C string-literal interpreter or
-/// would produce bytes the current #line formatter cannot replay safely.
+/// Named control escapes (`\n`, `\t`, etc.) are decoded through an explicit
+/// table and later replayed by LineDirectiveInserter::EscapeForLineDirective().
+/// Universal-character names, empty hex escapes, out-of-range numeric escapes,
+/// and physical line breaks fail closed.  Those forms either require a wider C
+/// string-literal interpreter or would produce bytes this local proof does not
+/// know how to replay safely.
 static std::optional<char> decodeLineControlFilenameEscape(StringRef &rest) {
   if (rest.empty())
     return std::nullopt;
@@ -720,14 +723,33 @@ static std::optional<char> decodeLineControlFilenameEscape(StringRef &rest) {
     rest = rest.drop_front();
     return escaped;
   case 'a':
+    rest = rest.drop_front();
+    return '\a';
   case 'b':
+    rest = rest.drop_front();
+    return '\b';
   case 'e':
   case 'E':
+    // Clang accepts \e/\E as an extension and records the same escape byte
+    // that it later prints for __FILE__.  Model it explicitly instead of
+    // treating it as a warningful unknown escape.
+    rest = rest.drop_front();
+    return static_cast<char>(0x1b);
   case 'f':
+    rest = rest.drop_front();
+    return '\f';
   case 'n':
+    rest = rest.drop_front();
+    return '\n';
   case 'r':
+    rest = rest.drop_front();
+    return '\r';
   case 't':
+    rest = rest.drop_front();
+    return '\t';
   case 'v':
+    rest = rest.drop_front();
+    return '\v';
   case 'u':
   case 'U':
     return std::nullopt;
@@ -1032,12 +1054,12 @@ static bool sourceSuffixMayObservePresumedFileSpelling(
 /// formatSourceLineDirectiveGapResume() can replay without guessing:
 /// * warningful ordinary unknown escapes;
 /// * escaped quote, question mark, backslash, and horizontal whitespace; and
-/// * bounded octal/hexadecimal escapes that decode to printable ASCII.
+/// * bounded octal/hexadecimal escapes that decode to printable ASCII; and
+/// * named C escapes whose decoded bytes can be replayed exactly by the #line
+///   formatter.
 ///
-/// Named control escapes and universal-character names remain fail-closed.
-/// They are deterministic C escapes, but replaying their decoded control or
-/// non-ASCII bytes would require a wider filename-literal and #line formatting
-/// proof than this owner-envelope closure currently owns.
+/// Universal-character names remain fail-closed.  They require a wider
+/// character-set proof than this owner-envelope closure currently owns.
 static std::optional<size_t>
 findAdmittedLineControlRawStringifyEscapeEnd(StringRef text,
                                              size_t backslashPos) {
@@ -1087,6 +1109,7 @@ findAdmittedLineControlRawStringifyEscapeEnd(StringRef text,
   case 'r':
   case 't':
   case 'v':
+    return backslashPos + 2;
   case 'u':
   case 'U':
     return std::nullopt;
@@ -1110,7 +1133,9 @@ findAdmittedLineControlRawStringifyEscapeEnd(StringRef text,
 /// source lines.  A raw backslash outside a literal is admitted only when the
 /// resulting filename string-literal escape is decoded by the bounded
 /// line-control filename parser above; all other escape forms fail closed and
-/// must be handled by a wider proof or terminal fallback.
+/// must be handled by a wider proof or terminal fallback.  Named C escapes are
+/// admitted because the parser decodes them to exact bytes and the #line
+/// formatter knows how to spell those bytes again.
 static std::optional<std::string>
 stringifyLineControlMacroArgument(StringRef argument) {
   StringRef trimmed = argument.trim(" \t\v\f\r\n");

@@ -239,6 +239,7 @@ public:
   /// This performs conservative escaping:
   /// - `\` becomes `\\`
   /// - `"` becomes `\"`
+  /// - named control bytes such as newline and tab are emitted as C escapes
   ///
   /// Other characters are left unchanged.
   ///
@@ -271,9 +272,8 @@ private:
   ///     #line <digits> "file"
   ///
   /// This parser is intentionally minimal and only supports the directive forms
-  /// the refolder itself emits. Within the quoted file spelling, a backslash
-  /// escapes the following byte, which is enough to invert EscapeForLineDirective()
-  /// for the paths this class emits.
+  /// the refolder itself emits. Within the quoted file spelling, it decodes the
+  /// same conservative escape set produced by EscapeForLineDirective().
   ///
   /// \param src source buffer
   /// \param from start index (inclusive) of the line

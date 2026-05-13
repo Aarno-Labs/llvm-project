@@ -274,7 +274,10 @@ LineDirectiveInserter::ParseLineDirective(StringRef src, size_t from,
   while (p < to && stringutils::isWs(src[p]))
     p++;
 
-  // 5. Parse Quoted File Spelling with Escaping
+  // 5. Parse quoted file spelling with the exact escapes this class emits.
+  // This is not a general C string-literal parser; it is only the inverse of
+  // EscapeForLineDirective() so no-op/resync checks can compare the logical
+  // filename state represented by previously emitted local #line directives.
   llvm::SmallString<64> fileSpelling;
   if (p < to && src[p] == '"') {
     p++; // consume opening quote
@@ -283,7 +286,44 @@ LineDirectiveInserter::ParseLineDirective(StringRef src, size_t from,
       if (c == '"')
         break; // closing quote
       if (c == '\\' && p < to) {
-        fileSpelling.push_back(src[p++]);
+        char escaped = src[p++];
+        switch (escaped) {
+        case '"':
+        case '\\':
+          fileSpelling.push_back(escaped);
+          break;
+        case 'a':
+          fileSpelling.push_back('\a');
+          break;
+        case 'b':
+          fileSpelling.push_back('\b');
+          break;
+        case 'e':
+        case 'E':
+          fileSpelling.push_back(static_cast<char>(0x1b));
+          break;
+        case 'f':
+          fileSpelling.push_back('\f');
+          break;
+        case 'n':
+          fileSpelling.push_back('\n');
+          break;
+        case 'r':
+          fileSpelling.push_back('\r');
+          break;
+        case 't':
+          fileSpelling.push_back('\t');
+          break;
+        case 'v':
+          fileSpelling.push_back('\v');
+          break;
+        default:
+          // Preserve the old parser's conservative behavior for any spelling
+          // not emitted by EscapeForLineDirective(): a backslash protects the
+          // next byte literally.
+          fileSpelling.push_back(escaped);
+          break;
+        }
       } else {
         fileSpelling.push_back(c);
       }
@@ -307,15 +347,48 @@ std::string LineDirectiveInserter::EscapeForLineDirective(StringRef path) {
   llvm::SmallString<64> escaped;
   escaped.reserve(path.size());
   for (char c : path) {
-    if (c == '\\') {
+    switch (c) {
+    case '\\':
       // #line filenames are emitted inside double quotes, so preserve a literal
       // backslash by escaping it in the directive spelling.
       escaped.append("\\\\");
-    } else if (c == '\"') {
+      break;
+    case '\"':
       // Keep embedded quotes from terminating the quoted filename.
       escaped.append("\\\"");
-    } else {
+      break;
+    case '\a':
+      escaped.append("\\a");
+      break;
+    case '\b':
+      escaped.append("\\b");
+      break;
+    case '\f':
+      escaped.append("\\f");
+      break;
+    case '\n':
+      // Never place a physical newline inside a #line filename; spell the
+      // logical filename byte as a C escape so the directive remains one
+      // preprocessing line.
+      escaped.append("\\n");
+      break;
+    case '\r':
+      escaped.append("\\r");
+      break;
+    case '\t':
+      escaped.append("\\t");
+      break;
+    case '\v':
+      escaped.append("\\v");
+      break;
+    case static_cast<char>(0x1b):
+      // Clang accepts both \e and \E; use one canonical spelling when replaying
+      // an escape byte recovered from a source-only line-control filename.
+      escaped.append("\\e");
+      break;
+    default:
       escaped.push_back(c);
+      break;
     }
   }
 
