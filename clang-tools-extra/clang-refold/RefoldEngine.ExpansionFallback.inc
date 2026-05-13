@@ -972,44 +972,144 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     return false;
   };
 
-  // Return true iff the refold map records source structure inside this include
-  // that cannot be consumed as part of a zero-token replacement gap.
+  // Return true iff the pragma is explicitly classified as source-neutral when
+  // its containing include directive is consumed by a zero-token gap closure.
+  //
+  // Keep this whitelist deliberately small.  Most pragmas model compiler state
+  // rather than token material, and the refold map does not currently carry the
+  // state-region information needed to replay or repair them.  `#pragma once`
+  // is the one admitted spelling because, for an otherwise source-neutral
+  // zero-token include, suppressing future textual inclusion of the same
+  // zero-token file cannot change the PP token stream.
+  auto pragmaIsConsumableIncludeLocalState =
+      [&](const RefoldModel::PragmaDirective &pragma) -> bool {
+    StringRef text = pragma.text.trim();
+    size_t pos = 0;
+
+    auto isHorizontalWS = [](char ch) {
+      return ch == ' ' || ch == '\t' || ch == '\v' || ch == '\f';
+    };
+    auto isIdentifierContinue = [](char ch) {
+      return ch == '_' || ('a' <= ch && ch <= 'z') ||
+             ('A' <= ch && ch <= 'Z') || ('0' <= ch && ch <= '9');
+    };
+    auto skipHorizontalWS = [&](size_t &cursor) {
+      while (cursor < text.size() && isHorizontalWS(text[cursor]))
+        ++cursor;
+    };
+    auto consumeWord = [&](StringRef word) {
+      if (!text.substr(pos).starts_with(word))
+        return false;
+      pos += word.size();
+      if (pos < text.size() && isIdentifierContinue(text[pos]))
+        return false;
+      return true;
+    };
+
+    skipHorizontalWS(pos);
+    if (pos >= text.size() || text[pos] != '#')
+      return false;
+    ++pos;
+
+    skipHorizontalWS(pos);
+    if (!consumeWord("pragma"))
+      return false;
+
+    skipHorizontalWS(pos);
+    if (!consumeWord("once"))
+      return false;
+
+    skipHorizontalWS(pos);
+    return pos == text.size();
+  };
+
+  // Return true iff the include has structure other than an explicitly
+  // consumable pragma.  This is stricter than the general zero-token include
+  // proof: `#pragma once` is considered source-neutral only for an otherwise
+  // empty include.  If a pragma appears next to macro-state, conditionals,
+  // nested includes, declarations, or any other recorded structure, keep the
+  // include outside this proof class until the refold map records enough
+  // pragma-state information to prove the combined effect.
+  auto includeHasNonPragmaStructure =
+      [&](const RefoldModel::IncludeItem &inc) -> bool {
+    if (!inc.decls.empty())
+      return true;
+
+    for (const auto &child : model_.GetIncludes())
+      if (child.parent && *child.parent == inc.id)
+        return true;
+
+    for (const auto &directive : model_.GetMacroDirectives())
+      if (directive.ownerIncludeId && *directive.ownerIncludeId == inc.id)
+        return true;
+
+    for (const auto &group : model_.GetConds())
+      if (group.parentIncludeId && *group.parentIncludeId == inc.id)
+        return true;
+
+    return false;
+  };
+
+  auto includePathForDiagnostic = [](const RefoldModel::IncludeItem &inc) {
+    return inc.resolvedPath ? *inc.resolvedPath : inc.target;
+  };
+
+  // Return the first recorded reason that prevents treating this include as a
+  // consumable zero-token source gap, or std::nullopt when the include tree is
+  // source-neutral for this closure proof.
   //
   // The predicate is intentionally transitive: a top-level zero-token include
   // may contain nested zero-token includes, and the outer directive is still
-  // safe to consume when every descendant is itself source-neutral.  A nested
-  // include that materializes tokens, or that owns non-consumable structure,
-  // keeps the whole include tree outside this proof class.
-  std::function<bool(const RefoldModel::IncludeItem &, DenseSet<uint64_t> &)>
-      includeHasRecordedSideEffectsImpl;
-  includeHasRecordedSideEffectsImpl =
+  // safe to consume when every descendant is itself source-neutral.  Returning a
+  // concrete reason keeps the later terminal-fallback trace actionable instead
+  // of merely saying that an unrelated include was absorbed.
+  std::function<std::optional<std::string>(const RefoldModel::IncludeItem &,
+                                           DenseSet<uint64_t> &)>
+      includeRecordedSideEffectReasonImpl;
+  includeRecordedSideEffectReasonImpl =
       [&](const RefoldModel::IncludeItem &inc, DenseSet<uint64_t> &visiting)
-          -> bool {
+          -> std::optional<std::string> {
     // A cycle would indicate malformed include-parent metadata.  Do not try to
     // prove closure through it; reject rather than deleting uncertain state.
     if (!visiting.insert(inc.id).second)
-      return true;
+      return llvm::formatv("include-parent cycle reaches include id={0}",
+                           inc.id)
+          .str();
 
-    auto finish = [&](bool hasSideEffects) {
+    auto finish = [&](std::optional<std::string> reason) {
       visiting.erase(inc.id);
-      return hasSideEffects;
+      return reason;
     };
 
     // Header declarations are semantic structure, even if this include did not
     // contribute tokens to the particular A-side hunk being refolded.
     if (!inc.decls.empty())
-      return finish(true);
+      return finish(llvm::formatv("include id={0} path='{1}' has {2} "
+                                  "recorded header declaration(s)",
+                                  inc.id, includePathForDiagnostic(inc),
+                                  inc.decls.size())
+                        .str());
 
     // A nested include is not inherently a side effect.  It is consumable when
     // its own expansion is empty and its descendants/directives are consumable
-    // by the same zero-token include-gap proof.
+    // by the same zero-token include-gap proof.  Record which child blocked the
+    // proof so the mixed-closure rejection points at the real source structure.
     for (const auto &child : model_.GetIncludes()) {
       if (!child.parent || *child.parent != inc.id)
         continue;
       if (child.cover.IsValid())
-        return finish(true);
-      if (includeHasRecordedSideEffectsImpl(child, visiting))
-        return finish(true);
+        return finish(llvm::formatv("child include id={0} path='{1}' "
+                                    "materializes PP cover=[{2},{3})",
+                                    child.id, includePathForDiagnostic(child),
+                                    child.cover.begin, child.cover.end)
+                          .str());
+      if (std::optional<std::string> childReason =
+              includeRecordedSideEffectReasonImpl(child, visiting))
+        return finish(llvm::formatv("child include id={0} path='{1}' rejected: "
+                                    "{2}",
+                                    child.id, includePathForDiagnostic(child),
+                                    *childReason)
+                          .str());
     }
 
     // Include-owned #define/#undef directives are macro-state transitions, not
@@ -1024,7 +1124,14 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     for (const auto &directive : model_.GetMacroDirectives())
       if (directive.ownerIncludeId && *directive.ownerIncludeId == inc.id &&
           directive.subkind != "#define" && directive.subkind != "#undef")
-        return finish(true);
+        return finish(llvm::formatv("include id={0} path='{1}' owns "
+                                    "non-consumable macro directive id={2} "
+                                    "subkind='{3}' text='{4}'",
+                                    inc.id, includePathForDiagnostic(inc),
+                                    directive.id, directive.subkind,
+                                    stringutils::showWSWithClip(directive.text,
+                                                                 120))
+                          .str());
 
     // Conditional control directives are also source structure, but an
     // include-local conditional group with no materialized A tokens is source
@@ -1041,23 +1148,55 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
 
       for (const RefoldModel::CondArm &arm : group.arms)
         if (arm.span && arm.span->IsValid() && arm.span->begin < arm.span->end)
-          return finish(true);
+          return finish(llvm::formatv("include id={0} path='{1}' owns "
+                                      "conditional group id={2} arm id={3} "
+                                      "with materialized PP span=[{4},{5})",
+                                      inc.id, includePathForDiagnostic(inc),
+                                      group.id, arm.id, arm.span->begin,
+                                      arm.span->end)
+                            .str());
     }
 
     // Pragmas are keyed by physical file path rather than include id, so check
-    // the resolved header path when available.
+    // the resolved header path when available.  Unknown pragmas are always
+    // side-effect-bearing here: they can affect diagnostics, layout,
+    // optimization, visibility, attributes, or later preprocessing state while
+    // contributing no PP tokens.  The only pragma admitted by this closure is
+    // an explicitly parsed `#pragma once` in an otherwise source-neutral
+    // zero-token include.  Anything richer must wait for a pragma-state proof
+    // or a repair mechanism analogous to macro-state liveness.
     if (inc.resolvedPath)
-      for (const auto &pragma : model_.GetPragmas())
-        if (PathsEqual(pragma.sitePath, *inc.resolvedPath))
-          return finish(true);
+      for (const auto &pragma : model_.GetPragmas()) {
+        if (!PathsEqual(pragma.sitePath, *inc.resolvedPath))
+          continue;
+        if (!pragmaIsConsumableIncludeLocalState(pragma))
+          return finish(llvm::formatv("include id={0} path='{1}' contains "
+                                      "non-consumable pragma id={2} text='{3}'",
+                                      inc.id, includePathForDiagnostic(inc),
+                                      pragma.id,
+                                      stringutils::showWSWithClip(pragma.text,
+                                                                   120))
+                            .str());
+        if (includeHasNonPragmaStructure(inc))
+          return finish(llvm::formatv("include id={0} path='{1}' contains "
+                                      "#pragma once with additional recorded "
+                                      "source structure",
+                                      inc.id, includePathForDiagnostic(inc))
+                            .str());
+      }
 
-    return finish(false);
+    return finish(std::nullopt);
+  };
+
+  auto includeRecordedSideEffectReason =
+      [&](const RefoldModel::IncludeItem &inc) -> std::optional<std::string> {
+    DenseSet<uint64_t> visiting;
+    return includeRecordedSideEffectReasonImpl(inc, visiting);
   };
 
   auto includeHasRecordedSideEffects =
       [&](const RefoldModel::IncludeItem &inc) -> bool {
-    DenseSet<uint64_t> visiting;
-    return includeHasRecordedSideEffectsImpl(inc, visiting);
+    return includeRecordedSideEffectReason(inc).has_value();
   };
 
   // Return true iff the macro definition is a plain empty-replacement-list
@@ -1367,15 +1506,26 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
         continue;
       if (includeIsTouched(inc))
         continue;
-      if (!inc.cover.IsValid() && !includeHasRecordedSideEffects(inc) &&
+      std::optional<std::string> sideEffectReason =
+          includeRecordedSideEffectReason(inc);
+      if (!inc.cover.IsValid() && !sideEffectReason &&
           sourceBegin <= inc.siteB && inc.siteE <= sourceEnd)
         continue;
 
-      trace("fallback",
-            "TU/include closure rejected: source interval [{0},{1}) would "
-            "absorb unrelated include id={2} site=[{3},{4}) cover=[{5},{6})",
-            sourceBegin, sourceEnd, inc.id, inc.siteB, inc.siteE,
-            inc.cover.begin, inc.cover.end);
+      if (sideEffectReason) {
+        trace("fallback",
+              "TU/include closure rejected: source interval [{0},{1}) would "
+              "absorb unrelated include id={2} site=[{3},{4}) cover=[{5},{6}): "
+              "{7}",
+              sourceBegin, sourceEnd, inc.id, inc.siteB, inc.siteE,
+              inc.cover.begin, inc.cover.end, *sideEffectReason);
+      } else {
+        trace("fallback",
+              "TU/include closure rejected: source interval [{0},{1}) would "
+              "absorb unrelated include id={2} site=[{3},{4}) cover=[{5},{6})",
+              sourceBegin, sourceEnd, inc.id, inc.siteB, inc.siteE,
+              inc.cover.begin, inc.cover.end);
+      }
       return std::nullopt;
     }
 

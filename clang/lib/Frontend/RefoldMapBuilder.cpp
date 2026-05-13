@@ -2789,25 +2789,90 @@ void RefoldMapBuilder::onPragma(SourceLocation HashLoc, StringRef FullText) {
   if (!enabled())
     return;
 
+  SourceLocation FileLoc = SM.getFileLoc(HashLoc);
+  if (!FileLoc.isValid())
+    return;
+
+  std::optional<std::pair<uint64_t, uint64_t>> Line;
+  std::optional<std::string> SourceText;
+
+  // Pragma callbacks are not uniform about the exact location they provide:
+  // the generic PPCallbacks hook normally points at the pragma introducer,
+  // while some pragma-specific paths can report a token on the same physical
+  // line.  For pragmas, record the whole physical source line containing the
+  // callback location instead of assuming the location is already the '#'.
+  bool Invalid = false;
+  FileID FID = SM.getFileID(FileLoc);
+  StringRef Buf = SM.getBufferData(FID, &Invalid);
+  if (!Invalid) {
+    const size_t N = Buf.size();
+    const size_t Off = std::min<size_t>(SM.getFileOffset(FileLoc), N);
+
+    size_t B = Off;
+    while (B > 0 && Buf[B - 1] != '\n' && Buf[B - 1] != '\r')
+      --B;
+
+    size_t E = Off;
+    while (E < N && Buf[E] != '\n' && Buf[E] != '\r')
+      ++E;
+    if (E < N) {
+      if (Buf[E] == '\r' && E + 1 < N && Buf[E + 1] == '\n')
+        E += 2;
+      else
+        ++E;
+    }
+
+    Line = std::make_pair(static_cast<uint64_t>(B), static_cast<uint64_t>(E));
+    SourceText = Buf.slice(B, E).str();
+  }
+
+  const std::string SitePath = filePathForLocAbs(SM, FileLoc, EmitAbsPaths);
+
+  // Multiple PP callback paths can report the same pragma. For example, the
+  // generic PragmaDirective hook can fire before an UnknownPragmaHandler, and
+  // `#pragma GCC system_header` is also visible as a FileChanged reason. Keep
+  // only one structural marker for a physical pragma line.
+  if (Line) {
+    for (const Item &Existing : Items) {
+      if (Existing.Kind != IK_Directive || Existing.Subkind != "#pragma")
+        continue;
+      if (Existing.SitePath == SitePath && Existing.SiteBegin &&
+          Existing.SiteEnd && *Existing.SiteBegin == Line->first &&
+          *Existing.SiteEnd == Line->second)
+        return;
+    }
+  }
+
   // Model a preprocessor pragma as a directive Item so the consumer can keep
-  // it anchored to its original file/byte span when projecting edits.
+  // it anchored to its original file/byte span when projecting edits. Pragmas
+  // do not materialize ordinary PP tokens, but they can still mutate compiler
+  // state; recording them prevents the consumer from treating their include as
+  // an empty source-neutral gap unless it has an explicit proof for that
+  // pragma kind. If neither the callback nor the source manager can provide a
+  // concrete spelling, do not emit a malformed schema item.
+  if (FullText.empty() && !SourceText)
+    return;
+
   Item It;
   It.ID = Items.size();
   It.Kind = IK_Directive;
   It.Subkind = "#pragma";
-  It.Loc = HashLoc;
+  It.Loc = FileLoc;
 
-  // Capture the directive's original text verbatim (as emitted/observed by the
-  // preprocessor), including any trailing newline already present in FullText.
-  It.Text = FullText.str();
+  // Prefer the exact source line when the callback did not provide a canonical
+  // pragma spelling. UnknownPragmaHandler still passes its reconstructed text so
+  // macro-expanded pragma spellings remain stable in preprocessed output.
+  if (!FullText.empty())
+    It.Text = FullText.str();
+  else if (SourceText)
+    It.Text = *SourceText;
 
   // Site info (line byte span and file path).
-  auto Line = computeDirectiveLine(HashLoc);
   if (Line) {
     It.SiteBegin = Line->first;
     It.SiteEnd = Line->second;
   }
-  It.SitePath = filePathForLocAbs(SM, HashLoc, EmitAbsPaths);
+  It.SitePath = SitePath;
 
   Items.push_back(std::move(It));
 
@@ -4914,14 +4979,22 @@ void RefoldMapBuilder::writeJSON() {
             }
           }
 
-          JO.attributeArray("spans", [&] {
-            for (const auto &S : It.Spans) {
-              JO.object([&] {
-                JO.attribute("begin", S.Begin);
-                JO.attribute("end", S.End);
-              });
-            }
-          });
+          // Every source-bearing item except #pragma has an A-token span
+          // vector in the schema. Pragmas intentionally do not: they mutate
+          // compiler/preprocessor state but normally contribute no ordinary PP
+          // tokens, so their schema record is just exact text plus source
+          // anchors. Emitting an empty "spans" property here would violate the
+          // closed DirectivePragmaItem schema.
+          if (!(It.Kind == IK_Directive && It.Subkind == "#pragma")) {
+            JO.attributeArray("spans", [&] {
+              for (const auto &S : It.Spans) {
+                JO.object([&] {
+                  JO.attribute("begin", S.Begin);
+                  JO.attribute("end", S.End);
+                });
+              }
+            });
+          }
         });
       }
     });
