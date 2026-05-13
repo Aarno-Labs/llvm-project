@@ -512,6 +512,18 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     std::string name;
   };
 
+  struct HeaderPreservedGapPiece {
+    enum class Kind { MacroStateDirective, ZeroTokenConditionalGroup };
+
+    Kind kind = Kind::MacroStateDirective;
+    const RefoldModel::MacroDirective *directive = nullptr;
+    const RefoldModel::CondGroup *group = nullptr;
+    uint64_t begin = 0;
+    uint64_t end = 0;
+    uint64_t id = 0;
+    std::string macroName;
+  };
+
   // Recover the macro identifier from a recorded macro-state directive.  Keep
   // this parser strict: the preservation proof below is only for complete
   // `#define NAME ...` / `#undef NAME` directive lines recorded by the producer.
@@ -661,6 +673,68 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     return piece;
   };
 
+  // Return true iff a recorded conditional group in this materialized header
+  // can be preserved as a complete zero-token gap piece. This is the
+  // header-owned counterpart of the TU zero-token conditional-gap proof: the
+  // group bytes may be carried forward only when the producer recorded no
+  // selected-arm PP material and no active source artifacts inside the group.
+  auto headerConditionalGroupIsPreservableGap =
+      [&](const RefoldModel::CondGroup &group, uint64_t gapBegin,
+          uint64_t gapEnd) -> bool {
+    if (!PathsEqual(group.file, file))
+      return false;
+    if (!group.parentIncludeId || *group.parentIncludeId != ie.include->id)
+      return false;
+    if (group.groupB >= group.groupE || group.groupE > headerText.size())
+      return false;
+    if (group.groupB < gapBegin || gapEnd < group.groupE)
+      return false;
+    if (!stringutils::beginsLineAfterWs(headerText, group.groupB))
+      return false;
+
+    for (const RefoldModel::CondArm &arm : group.arms)
+      if (arm.selected && arm.span && arm.span->IsValid() &&
+          arm.span->begin < arm.span->end)
+        return false;
+
+    auto insideGroup = [&](uint64_t b, uint64_t e) {
+      return group.groupB <= b && b < e && e <= group.groupE;
+    };
+
+    // Do not hide recorded active source artifacts inside an opaque preserved
+    // conditional group. Inactive-arm text is normally not recorded by the
+    // producer; recorded includes/macros/directives/pragmas require their own
+    // proof and therefore block this zero-token gap class.
+    for (const auto &inc : model_.GetIncludes())
+      if (PathsEqual(inc.sitePath, file) && inc.parent && *inc.parent == ie.include->id &&
+          insideGroup(inc.siteB, inc.siteE))
+        return false;
+    for (const auto &macro : model_.GetMacroInvocations())
+      if (macro.invFile && PathsEqual(*macro.invFile, file) && macro.invB &&
+          macro.invE && insideGroup(*macro.invB, *macro.invE))
+        return false;
+    for (const auto &directive : model_.GetMacroDirectives())
+      if (PathsEqual(directive.sitePath, file) && directive.ownerIncludeId &&
+          *directive.ownerIncludeId == ie.include->id &&
+          insideGroup(directive.siteB, directive.siteE))
+        return false;
+    for (const auto &pragma : model_.GetPragmas())
+      if (PathsEqual(pragma.sitePath, file) &&
+          insideGroup(pragma.siteB, pragma.siteE))
+        return false;
+
+    return true;
+  };
+
+  auto preservedGapPieceText = [&](const HeaderPreservedGapPiece &piece) {
+    if (piece.kind == HeaderPreservedGapPiece::Kind::MacroStateDirective &&
+        piece.directive)
+      return piece.directive->text.str();
+    if (piece.end <= headerText.size() && piece.begin <= piece.end)
+      return StringRef(headerText).slice(piece.begin, piece.end).str();
+    return std::string();
+  };
+
   auto replacementHeaderSuffixBoundaryAllowsDirectiveLine =
       [&](StringRef replacement, uint64_t sourceEnd) {
     if (sourceEnd > headerText.size())
@@ -762,10 +836,76 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     std::optional<uint64_t> startByte;
     std::optional<uint64_t> endByte;
     IncludeAnchorWitness mappedHeaderWitness;
-    SmallVector<HeaderMacroStateDirectivePiece, 4>
-        headerMacroStatePreservations;
+    SmallVector<HeaderPreservedGapPiece, 4> headerGapPreservations;
+    bool usedFullHeaderEnvelope = false;
 
     const auto &tokmapByPP = model_.GetTokmapByPP();
+
+    uint64_t materialAStart = p.aStart;
+    uint64_t materialAEnd = p.aEnd;
+    uint64_t materialBStart = p.bStart;
+    uint64_t materialBEnd = p.bEnd;
+    std::string materialInsertBytes = p.insertBytes;
+
+    auto tokenRangesHaveSameSpelling = [&](uint64_t aBegin, uint64_t aEnd,
+                                           uint64_t bBegin, uint64_t bEnd) {
+      if (aEnd < aBegin || bEnd < bBegin ||
+          (aEnd - aBegin) != (bEnd - bBegin))
+        return false;
+      if (aEnd > static_cast<uint64_t>(aToks_.size()) ||
+          bEnd > static_cast<uint64_t>(bToks_.size()))
+        return false;
+      for (uint64_t i = 0; i < aEnd - aBegin; ++i)
+        if (aToks_[static_cast<size_t>(aBegin + i)].spelling !=
+            bToks_[static_cast<size_t>(bBegin + i)].spelling)
+          return false;
+      return true;
+    };
+
+    // If a replacement hunk starts by re-emitting the exact tokens of a
+    // complete child include, keep that include as the survivor and remove the
+    // matching prefix from the materialized replacement. This is the header
+    // analogue of preferring the selected-arm include owner in mixed
+    // TU/include closures: identical duplicate tokens should not force us to
+    // replace a preserved include with raw B bytes.
+    if (isReplace) {
+      bool strippedPrefix = true;
+      while (strippedPrefix && materialAStart < materialAEnd &&
+             materialBStart < materialBEnd) {
+        strippedPrefix = false;
+        for (const auto &child : model_.GetIncludes()) {
+          if (!child.parent || *child.parent != ie.include->id ||
+              !PathsEqual(child.sitePath, file) || !child.cover.IsValid())
+            continue;
+          if (child.cover.begin != materialAStart ||
+              child.cover.end > materialAEnd)
+            continue;
+
+          const uint64_t childTokenCount = child.cover.end - child.cover.begin;
+          if (materialBStart + childTokenCount > materialBEnd)
+            continue;
+          if (!tokenRangesHaveSameSpelling(child.cover.begin, child.cover.end,
+                                           materialBStart,
+                                           materialBStart + childTokenCount))
+            continue;
+
+          trace("include/apply",
+                "file={0} patch[{1}] preserving child include prefix inc#{2} "
+                "A=[{3},{4}) B=[{5},{6})",
+                file, idx, child.id, child.cover.begin, child.cover.end,
+                materialBStart, materialBStart + childTokenCount);
+          materialAStart = child.cover.end;
+          materialBStart += childTokenCount;
+          materialInsertBytes =
+              sliceExactTokenCoverage(bTokOff_, bToks_, bSource_,
+                                      materialBStart, materialBEnd)
+                  .str();
+          strippedPrefix = true;
+          break;
+        }
+      }
+    }
+
     if (isInsert) {
       // INSERT: interpret A-position as "before the next token" in this header.
       const uint64_t pos = p.aStart;
@@ -1089,8 +1229,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       // DELETE / REPLACE: intersect the patch's non-empty A-token range with
       // the PP-token range owned by this header/declaration. Only the
       // intersection can be materialized as a local header edit.
-      uint64_t aLo = std::max(p.aStart, ppLo);
-      uint64_t aHi = std::min(p.aEnd, ppHi);
+      uint64_t aLo = std::max(materialAStart, ppLo);
+      uint64_t aHi = std::min(materialAEnd, ppHi);
       if (aHi <= aLo) {
         // Nothing of this patch lies in this header/declaration.
         debug("include/apply",
@@ -1166,71 +1306,114 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         return plan;
       }
 
-      // A single PP hunk can legitimately cross two neighboring header
-      // declarations when the source between their tokens is zero-token
-      // macro-state structure, e.g. `1;\n#undef FOO\nint`.  The ordinary
-      // declaration-local projection intentionally clamps to one declaration,
-      // but doing so leaves stale spelling from the second declaration in the
-      // materialized header.  When the complete hunk maps to this include and
-      // every inter-token gap is trivia plus complete recorded #define/#undef
-      // lines, widen the header edit to the full mapped-token envelope and
-      // re-emit those macro-state lines after the B-derived payload.  This is
-      // the include-owned counterpart of TU macro-state liveness preservation:
-      // the replacement tokens do not observe the preserved directive, while
-      // the untouched suffix/header tail still sees the original macro state.
+      // A single PP hunk can legitimately cross neighboring header-owned
+      // source pieces when the bytes between the material tokens are complete
+      // zero-token preprocessor structure. The ordinary mapped-token range is
+      // intentionally local, but leaving the rest of the hunk in the header can
+      // preserve stale source (`int`, a comma, or an include directive). Build
+      // a full source envelope from header tokens and complete child-include
+      // sites, then prove every inter-piece gap before overriding the local
+      // range.
       const bool declClippedNonEmptyPatch =
-          decl && (p.aStart < ppLo || ppHi < p.aEnd);
-      if (declClippedNonEmptyPatch) {
-        struct HeaderTokenInterval {
-          uint64_t pp = 0;
-          uint64_t begin = 0;
-          uint64_t end = 0;
-        };
+          decl && (materialAStart < ppLo || ppHi < materialAEnd);
+      struct HeaderSourceEnvelopePiece {
+        uint64_t begin = 0;
+        uint64_t end = 0;
+        uint64_t ppBegin = 0;
+        uint64_t ppEnd = 0;
+        uint64_t id = 0;
+        StringRef kind;
+      };
 
-        // Reconstruct the full physical header envelope for the original PP
-        // hunk, ignoring tokens from other owners.  The later gap proof is only
-        // valid when the hunk's relevant tokens all map back to this header.
-        SmallVector<HeaderTokenInterval, 8> hunkTokenIntervals;
-        const uint64_t fullLo = std::max(p.aStart, coverBegin);
-        const uint64_t fullHi = std::min(p.aEnd, coverEnd);
-        for (uint64_t pp = fullLo; pp < fullHi; ++pp) {
-          auto it = tokmapByPP.find(pp);
-          if (it == tokmapByPP.end() || !PathsEqual(it->second.file, file))
-            continue;
+      SmallVector<HeaderSourceEnvelopePiece, 8> hunkSourcePieces;
+      bool hasCompleteChildIncludePiece = false;
+      bool hasPartialChildIncludeOverlap = false;
+      const uint64_t fullLo = std::max(materialAStart, coverBegin);
+      const uint64_t fullHi = std::min(materialAEnd, coverEnd);
 
-          // Refuse fallback-to-EOF anchors here: widening across declarations
-          // needs precise token byte bounds on both sides of each gap.
-          std::optional<uint64_t> tokBegin = ByteStartForPPInFile(
-              file, pp, /*fallbackToEOF=*/false, fileLen);
-          std::optional<uint64_t> tokEnd = ByteEndForPPInFile(
-              file, pp, /*fallbackToEOF=*/false, fileLen);
-          if (!tokBegin || !tokEnd || *tokBegin >= *tokEnd) {
-            hunkTokenIntervals.clear();
-            break;
-          }
-          hunkTokenIntervals.push_back({pp, *tokBegin, *tokEnd});
+      for (uint64_t pp = fullLo; pp < fullHi; ++pp) {
+        auto it = tokmapByPP.find(pp);
+        if (it == tokmapByPP.end() || !PathsEqual(it->second.file, file))
+          continue;
+
+        // Refuse fallback-to-EOF anchors here: widening across header source
+        // pieces needs precise token byte bounds on both sides of each gap.
+        std::optional<uint64_t> tokBegin = ByteStartForPPInFile(
+            file, pp, /*fallbackToEOF=*/false, fileLen);
+        std::optional<uint64_t> tokEnd = ByteEndForPPInFile(
+            file, pp, /*fallbackToEOF=*/false, fileLen);
+        if (!tokBegin || !tokEnd || *tokBegin >= *tokEnd) {
+          hunkSourcePieces.clear();
+          break;
+        }
+        hunkSourcePieces.push_back(
+            {*tokBegin, *tokEnd, pp, pp + 1, pp, "token"});
+      }
+
+      for (const auto &child : model_.GetIncludes()) {
+        if (!child.parent || *child.parent != ie.include->id || !PathsEqual(child.sitePath, file) ||
+            !child.cover.IsValid())
+          continue;
+        if (child.cover.end <= fullLo || fullHi <= child.cover.begin)
+          continue;
+
+        if (fullLo <= child.cover.begin && child.cover.end <= fullHi &&
+            child.siteB < child.siteE && child.siteE <= headerText.size()) {
+          hasCompleteChildIncludePiece = true;
+          hunkSourcePieces.push_back({child.siteB, child.siteE,
+                                      child.cover.begin, child.cover.end,
+                                      child.id, "child-include"});
+          continue;
         }
 
-        // Sort by physical header order.  PP order is only a tie-breaker for
-        // duplicate/degenerate mappings; the edit range is a source byte range.
-        llvm::sort(hunkTokenIntervals,
-                   [](const HeaderTokenInterval &lhs,
-                      const HeaderTokenInterval &rhs) {
+        // A partial child-include overlap would require editing inside the
+        // child include and its parent directive at the same time. Leave that
+        // to include realization rather than inventing a parent-local range.
+        hasPartialChildIncludeOverlap = true;
+      }
+
+      const bool shouldTryFullHeaderEnvelope =
+          declClippedNonEmptyPatch || hasCompleteChildIncludePiece;
+      if (shouldTryFullHeaderEnvelope && !hasPartialChildIncludeOverlap) {
+        llvm::sort(hunkSourcePieces,
+                   [](const HeaderSourceEnvelopePiece &lhs,
+                      const HeaderSourceEnvelopePiece &rhs) {
           if (lhs.begin != rhs.begin)
             return lhs.begin < rhs.begin;
           if (lhs.end != rhs.end)
-            return lhs.end < rhs.end;
-          return lhs.pp < rhs.pp;
+            return lhs.end > rhs.end;
+          if (lhs.kind != rhs.kind)
+            return lhs.kind < rhs.kind;
+          return lhs.id < rhs.id;
         });
 
-        // At least two header tokens are required; otherwise there is no
-        // inter-token gap to prove and no reason to override decl clamping.
-        bool canUseFullHeaderEnvelope = hunkTokenIntervals.size() >= 2;
-        SmallVector<HeaderMacroStateDirectivePiece, 4> preservedPieces;
+        SmallVector<HeaderSourceEnvelopePiece, 8> outerPieces;
+        bool canUseFullHeaderEnvelope = hunkSourcePieces.size() >= 2;
+        for (const HeaderSourceEnvelopePiece &piece : hunkSourcePieces) {
+          if (outerPieces.empty() || piece.begin >= outerPieces.back().end) {
+            outerPieces.push_back(piece);
+            continue;
+          }
+
+          const HeaderSourceEnvelopePiece &outer = outerPieces.back();
+          if (outer.begin <= piece.begin && piece.end <= outer.end &&
+              outer.kind == "child-include" && piece.kind == "token") {
+            // Tokens produced by a child include are owned by the child site.
+            // Once the complete child include is a source-envelope piece, any
+            // mapped child token inside that site is not a second parent piece.
+            continue;
+          }
+
+          canUseFullHeaderEnvelope = false;
+          break;
+        }
+        hunkSourcePieces = std::move(outerPieces);
+
+        SmallVector<HeaderPreservedGapPiece, 4> preservedPieces;
         for (size_t ti = 1; canUseFullHeaderEnvelope &&
-                            ti < hunkTokenIntervals.size(); ++ti) {
-          const uint64_t gapBegin = hunkTokenIntervals[ti - 1].end;
-          const uint64_t gapEnd = hunkTokenIntervals[ti].begin;
+                            ti < hunkSourcePieces.size(); ++ti) {
+          const uint64_t gapBegin = hunkSourcePieces[ti - 1].end;
+          const uint64_t gapEnd = hunkSourcePieces[ti].begin;
           if (gapBegin > gapEnd) {
             canUseFullHeaderEnvelope = false;
             break;
@@ -1238,46 +1421,80 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
           if (gapBegin == gapEnd)
             continue;
 
-          // The only non-trivia source we are allowed to cross is a complete
-          // recorded macro-state directive owned by this include.  Anything
-          // else in the gap leaves the declaration clamp in place.
-          SmallVector<HeaderMacroStateDirectivePiece, 4> gapPieces;
+          SmallVector<HeaderPreservedGapPiece, 4> gapPieces;
           for (const auto &directive : model_.GetMacroDirectives()) {
-            std::optional<HeaderMacroStateDirectivePiece> piece =
+            std::optional<HeaderMacroStateDirectivePiece> directivePiece =
                 headerMacroStateDirectiveInterval(directive);
-            if (!piece || piece->begin < gapBegin || gapEnd < piece->end)
+            if (!directivePiece || directivePiece->begin < gapBegin ||
+                gapEnd < directivePiece->end)
               continue;
-            // Re-emitting the directive after the replacement is safe only if
-            // the B-derived payload does not itself mention that macro name;
-            // otherwise we would change the macro state seen by replacement
-            // tokens relative to the edited preprocessed stream.
             if (rawIdentifierAppearsInHeaderReplacement(
-                    piece->name, StringRef(p.insertBytes))) {
+                    directivePiece->name, StringRef(materialInsertBytes))) {
               canUseFullHeaderEnvelope = false;
               break;
             }
-            gapPieces.push_back(std::move(*piece));
+
+            HeaderPreservedGapPiece piece;
+            piece.kind = HeaderPreservedGapPiece::Kind::MacroStateDirective;
+            piece.directive = directivePiece->directive;
+            piece.begin = directivePiece->begin;
+            piece.end = directivePiece->end;
+            piece.id = directivePiece->directive ? directivePiece->directive->id : 0;
+            piece.macroName = std::move(directivePiece->name);
+            gapPieces.push_back(std::move(piece));
           }
           if (!canUseFullHeaderEnvelope)
             break;
 
-          // Tile the gap in source order, not discovery order from the global
-          // directive table.
+          for (const auto &group : model_.GetConds()) {
+            if (!headerConditionalGroupIsPreservableGap(group, gapBegin,
+                                                       gapEnd))
+              continue;
+            HeaderPreservedGapPiece piece;
+            piece.kind = HeaderPreservedGapPiece::Kind::ZeroTokenConditionalGroup;
+            piece.group = &group;
+            piece.begin = group.groupB;
+            piece.end = group.groupE;
+            piece.id = group.id;
+            gapPieces.push_back(std::move(piece));
+          }
+
           llvm::sort(gapPieces,
-                     [](const HeaderMacroStateDirectivePiece &lhs,
-                        const HeaderMacroStateDirectivePiece &rhs) {
+                     [](const HeaderPreservedGapPiece &lhs,
+                        const HeaderPreservedGapPiece &rhs) {
             if (lhs.begin != rhs.begin)
               return lhs.begin < rhs.begin;
             if (lhs.end != rhs.end)
-              return lhs.end < rhs.end;
-            return lhs.directive->id < rhs.directive->id;
+              return lhs.end > rhs.end;
+            if (lhs.kind != rhs.kind)
+              return static_cast<unsigned>(lhs.kind) <
+                     static_cast<unsigned>(rhs.kind);
+            return lhs.id < rhs.id;
           });
 
-          // Prove an exact cover of the gap: trivia/comment bytes may surround
-          // preserved macro-state lines, but no ordinary source bytes may be
-          // skipped by the widened edit.
+          SmallVector<HeaderPreservedGapPiece, 4> outerGapPieces;
+          for (const HeaderPreservedGapPiece &piece : gapPieces) {
+            if (outerGapPieces.empty() || piece.begin >= outerGapPieces.back().end) {
+              outerGapPieces.push_back(piece);
+              continue;
+            }
+
+            const HeaderPreservedGapPiece &outer = outerGapPieces.back();
+            if (outer.begin <= piece.begin && piece.end <= outer.end &&
+                outer.kind ==
+                    HeaderPreservedGapPiece::Kind::ZeroTokenConditionalGroup &&
+                piece.kind ==
+                    HeaderPreservedGapPiece::Kind::ZeroTokenConditionalGroup)
+              continue;
+
+            canUseFullHeaderEnvelope = false;
+            break;
+          }
+          if (!canUseFullHeaderEnvelope)
+            break;
+
           uint64_t cursor = gapBegin;
-          for (const HeaderMacroStateDirectivePiece &piece : gapPieces) {
+          for (const HeaderPreservedGapPiece &piece : outerGapPieces) {
             if (piece.begin < cursor ||
                 !isWsOrCompleteCommentTrivia(
                     StringRef(headerText).slice(cursor, piece.begin))) {
@@ -1294,30 +1511,28 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
             break;
           }
 
-          preservedPieces.append(gapPieces.begin(), gapPieces.end());
+          preservedPieces.append(outerGapPieces.begin(), outerGapPieces.end());
         }
 
-        if (canUseFullHeaderEnvelope && !preservedPieces.empty()) {
-          // Replace the decl-local byte range only after proving the full hunk
-          // envelope contains the originally resolved range and can be followed
-          // by a preserved directive line without lexical splicing/gluing.
-          const uint64_t fullStart = hunkTokenIntervals.front().begin;
-          const uint64_t fullEnd = hunkTokenIntervals.back().end;
+        if (canUseFullHeaderEnvelope && !hunkSourcePieces.empty()) {
+          const uint64_t fullStart = hunkSourcePieces.front().begin;
+          const uint64_t fullEnd = hunkSourcePieces.back().end;
           if (fullStart <= *startByte && *endByte <= fullEnd &&
               replacementHeaderSuffixBoundaryAllowsDirectiveLine(
-                  StringRef(p.insertBytes), fullEnd)) {
+                  StringRef(materialInsertBytes), fullEnd)) {
             startByte = fullStart;
             endByte = fullEnd;
-            headerMacroStatePreservations = std::move(preservedPieces);
+            headerGapPreservations = std::move(preservedPieces);
+            usedFullHeaderEnvelope = true;
             mappedHeaderWitness.startByte = fullStart;
             mappedHeaderWitness.endByte = fullEnd;
-            mappedHeaderWitness.firstPP = hunkTokenIntervals.front().pp;
-            mappedHeaderWitness.lastPP = hunkTokenIntervals.back().pp;
+            mappedHeaderWitness.firstPP = hunkSourcePieces.front().ppBegin;
+            mappedHeaderWitness.lastPP = hunkSourcePieces.back().ppEnd - 1;
             trace("include/apply",
                   "file={0} patch[{1}] DELETE/REPLACE: widened across "
-                  "header macro-state gap bytes=[{2},{3}) preserved={4}",
-                  file, idx, fullStart, fullEnd,
-                  headerMacroStatePreservations.size());
+                  "header source gap bytes=[{2},{3}) preserved={4} pieces={5}",
+                  file, idx, fullStart, fullEnd, headerGapPreservations.size(),
+                  hunkSourcePieces.size());
           }
         }
       }
@@ -1327,7 +1542,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     // that owns the patch. INSERTs are different: their anchor may legitimately
     // sit on the boundary between declarations, so do not clamp insertion
     // anchors into one side of that boundary.
-    if (!isInsert && decl && headerMacroStatePreservations.empty()) {
+    if (!isInsert && decl && !usedFullHeaderEnvelope) {
       startByte = std::clamp(*startByte, decl->headerB, decl->headerE);
       endByte = std::clamp(*endByte, decl->headerB, decl->headerE);
     }
@@ -1346,19 +1561,19 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
 
     // DELETE emits an empty replacement; INSERT and REPLACE both use the
     // B-derived patch payload carried by the IncludePatch.
-    std::string replacement = isDelete ? "" : p.insertBytes;
+    std::string replacement = isDelete ? "" : materialInsertBytes;
 
-    if (!headerMacroStatePreservations.empty()) {
-      // Emit preserved macro-state lines after the B-derived payload.  That
-      // keeps replacement tokens in the same macro environment as B, while the
-      // untouched header suffix sees the restored macro state.
+    if (!headerGapPreservations.empty()) {
+      // Emit preserved gap pieces after the B-derived payload. That keeps
+      // replacement tokens in the same preprocessing environment as B, while
+      // the untouched header suffix sees the restored zero-token structure.
       if (!replacement.empty() && replacement.back() != '\n')
         replacement.push_back('\n');
-      for (const HeaderMacroStateDirectivePiece &piece :
-           headerMacroStatePreservations) {
-        if (!piece.directive)
+      for (const HeaderPreservedGapPiece &piece : headerGapPreservations) {
+        std::string pieceText = preservedGapPieceText(piece);
+        if (pieceText.empty())
           continue;
-        replacement += piece.directive->text.str();
+        replacement += pieceText;
         if (replacement.empty() || replacement.back() != '\n')
           replacement.push_back('\n');
       }
