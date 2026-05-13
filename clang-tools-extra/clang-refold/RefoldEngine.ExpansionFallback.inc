@@ -719,17 +719,34 @@ static bool appendLineControlUTF8(std::string &out, uint32_t value) {
 }
 
 /// Return true iff a decoded numeric filename byte can be replayed by this
-/// proof's #line formatter without introducing control-flow-sensitive source
-/// structure into the emitted directive.
+/// proof's #line formatter without introducing a literal control byte or
+/// physical line break into the emitted directive.
 ///
-/// Numeric C escapes are decoded only for ordinary printable ASCII bytes.  That
-/// covers the deterministic filename spellings needed for source-only
-/// line-control repair while avoiding implementation-defined character-set
-/// questions and arbitrary control bytes.  Named control escapes are handled by
-/// their own exact table below because the #line formatter can replay those
-/// spellings without guessing.
+/// Numeric C escapes in a macro-stringified #line filename denote the same
+/// filename bytes as named escapes once the generated string literal is
+/// interpreted.  Admit exactly the byte values that the replay formatter can
+/// spell deterministically: ordinary printable ASCII plus the bounded control
+/// bytes for which EscapeForLineDirective() has an explicit one-line escape
+/// spelling.  Other control bytes, NUL, and high bytes stay outside this proof
+/// so the owner-envelope closure fails closed instead of emitting source whose
+/// line-control semantics depend on implementation-defined character handling.
 static bool isReplayableLineControlNumericFilenameByte(unsigned value) {
-  return 0x20 <= value && value <= 0x7e;
+  if (0x20 <= value && value <= 0x7e)
+    return true;
+
+  switch (value) {
+  case '\a':
+  case '\b':
+  case '\f':
+  case '\n':
+  case '\r':
+  case '\t':
+  case '\v':
+  case 0x1b:
+    return true;
+  default:
+    return false;
+  }
 }
 
 /// Decode the bounded subset of C string-literal escapes that this source-only
@@ -738,8 +755,8 @@ static bool isReplayableLineControlNumericFilenameByte(unsigned value) {
 /// The parser accepts:
 /// * ordinary unknown escapes, whose observable spelling is the escaped byte;
 /// * escaped quote, question mark, and backslash;
-/// * bounded octal escapes that decode to printable ASCII;
-/// * bounded hexadecimal escapes that decode to printable ASCII; and
+/// * bounded octal escapes that decode to replayable filename bytes;
+/// * bounded hexadecimal escapes that decode to replayable filename bytes; and
 /// * universal-character names that decode to replayable Unicode scalars.
 ///
 /// Named control escapes (`\n`, `\t`, etc.) are decoded through an explicit
@@ -841,9 +858,10 @@ decodeLineControlFilenameEscape(StringRef &rest) {
 /// This is deliberately narrower than a general C string-literal parser.  It is
 /// the inverse of the filename spellings this proof may synthesize and replay:
 /// exact ordinary bytes, conservative quote/backslash escapes, warningful
-/// ordinary unknown escapes, and printable-ASCII numeric escapes.  Unsupported
-/// escape forms fail closed so the owner-envelope closure can fall back instead
-/// of guessing the filename state observed by later `__FILE__` uses.
+/// ordinary unknown escapes, and numeric escapes that decode to replayable
+/// filename bytes.  Unsupported escape forms fail closed so the
+/// owner-envelope closure can fall back instead of guessing the filename state
+/// observed by later `__FILE__` uses.
 static std::optional<std::string>
 parseLineControlFilenameLiteral(StringRef &rest) {
   if (!rest.consume_front("\""))
@@ -1130,7 +1148,8 @@ static bool sourceSuffixMayObservePresumedFileSpelling(
 /// formatSourceLineDirectiveGapResume() can replay without guessing:
 /// * warningful ordinary unknown escapes;
 /// * escaped quote, question mark, backslash, and horizontal whitespace; and
-/// * bounded octal/hexadecimal escapes that decode to printable ASCII;
+/// * bounded octal/hexadecimal escapes that decode to replayable filename
+///   bytes;
 /// * named C escapes whose decoded bytes can be replayed exactly by the #line
 ///   formatter; and
 /// * universal-character names whose decoded scalar can be replayed as UTF-8.
