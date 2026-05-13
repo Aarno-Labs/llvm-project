@@ -1502,8 +1502,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   };
 
   // Prove that a source gap inside the replacement envelope consists only of
-  // whitespace plus complete source-neutral artifacts: zero-token include trees
-  // and source-neutral zero-token macro invocation trees.
+  // lexical trivia plus complete source-neutral artifacts: zero-token include
+  // trees and source-neutral zero-token macro invocation trees.
   //
   // These artifacts have no PP tokens, so token overlap alone cannot make them
   // part of the touched hunk.  If they lie physically between required source
@@ -1557,7 +1557,11 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     for (const GapPiece &piece : pieces) {
       if (piece.begin < cursor)
         return false;
-      if (!stringutils::isWs(tuBytes.slice(cursor, piece.begin)))
+      // Gaps around recorded zero-token artifacts may contain only lexical
+      // trivia.  A complete comment is as source-neutral as whitespace here:
+      // it contributes no PP tokens and lies inside the source interval being
+      // replaced.
+      if (!isWsOrCompleteCommentTrivia(tuBytes.slice(cursor, piece.begin)))
         return false;
       cursor = piece.end;
       if (piece.kind == "include")
@@ -1565,7 +1569,9 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       else
         ++macroCount;
     }
-    if (!stringutils::isWs(tuBytes.slice(cursor, gapEnd)))
+    // The suffix after the final zero-token artifact must also be trivia,
+    // otherwise the replacement envelope would erase unproved source spelling.
+    if (!isWsOrCompleteCommentTrivia(tuBytes.slice(cursor, gapEnd)))
       return false;
 
     trace("fallback",
@@ -1738,8 +1744,9 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     }
 
     // The envelope may widen across physical gaps between required pieces, but
-    // only across whitespace or complete zero-token source artifacts.  These
-    // artifacts are consumed by the replacement because they sit inside the
+    // only across lexical trivia or complete zero-token source artifacts.
+    // Complete comments are consumed with the replacement for the same reason
+    // as whitespace: they contribute no PP tokens and are physically inside the
     // source interval whose A-side material was replaced by the B-side hunk.
     // Any other byte would be meaningful source text that the proof has not
     // justified replacing.
@@ -1747,10 +1754,10 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     for (const auto &piece : mergedPieces) {
       if (piece.first > cursor) {
         StringRef gap = tuBytes.slice(cursor, piece.first);
-        if (!stringutils::isWs(gap) &&
+        if (!isWsOrCompleteCommentTrivia(gap) &&
             !gapIsConsumableZeroTokenSourceClosure(cursor, piece.first)) {
           trace("fallback",
-                "TU/include closure rejected: non-whitespace TU gap inside "
+                "TU/include closure rejected: non-trivia TU gap inside "
                 "mixed source interval [{0},{1}) gap='{2}'",
                 cursor, piece.first, stringutils::showWsWithClip(gap, 120));
           return std::nullopt;
