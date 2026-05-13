@@ -3700,11 +3700,65 @@ std::string RefoldEngine::RunSinglePassRefold() {
     return text;
   };
 
+  enum class MacroReplacementObservationKind {
+    IdentifierToken,
+    FunctionLikeInvocation,
+  };
+
+  // Return the observation shape that can make a replacement payload see a
+  // consumed definition if that definition is preserved before the payload.
+  //
+  // Object-like macros are observed by any preprocessing identifier token with
+  // the macro name. Function-like macros are observed only by an invocation: a
+  // macro-name token whose next non-comment preprocessing token is `(`. This is
+  // the first-order invariant for definition preservation; the source spelling
+  // of the name alone is not enough to reject a function-like macro repair.
+  auto macroObservationKindForDefinition =
+      [&](const RefoldModel::MacroDirective &definition, StringRef macroName) {
+        if (definition.subkind != "#define")
+          return MacroReplacementObservationKind::IdentifierToken;
+
+        StringRef text = definition.text;
+        size_t pos = 0;
+        stringutils::skipNonNewlineWs(text, pos);
+        if (pos >= text.size() || text[pos] != '#')
+          return MacroReplacementObservationKind::IdentifierToken;
+        ++pos;
+        stringutils::skipNonNewlineWs(text, pos);
+
+        StringRef keyword = "define";
+        if (!text.substr(pos).starts_with(keyword))
+          return MacroReplacementObservationKind::IdentifierToken;
+        pos += keyword.size();
+        if (pos < text.size() && stringutils::isIdentPart(text[pos]))
+          return MacroReplacementObservationKind::IdentifierToken;
+        stringutils::skipNonNewlineWs(text, pos);
+
+        const size_t nameBegin = pos;
+        if (pos >= text.size() || !stringutils::isIdentStart(text[pos]))
+          return MacroReplacementObservationKind::IdentifierToken;
+        ++pos;
+        while (pos < text.size() && stringutils::isIdentPart(text[pos]))
+          ++pos;
+
+        if (text.slice(nameBegin, pos) != macroName)
+          return MacroReplacementObservationKind::IdentifierToken;
+
+        // In C/C++, a function-like macro definition has the left parenthesis
+        // immediately after the macro name. Whitespace or comments between the
+        // name and `(` make the definition object-like, so only a byte-adjacent
+        // `(` proves the narrower observation class.
+        if (pos < text.size() && text[pos] == '(')
+          return MacroReplacementObservationKind::FunctionLikeInvocation;
+
+        return MacroReplacementObservationKind::IdentifierToken;
+      };
+
   // Return true if `text` contains `name` as a real raw identifier token.
   //
-  // This is used as a conservative macro-state safety check: if the replacement
-  // payload itself mentions the macro name, then re-emitting a consumed
-  // `#define` before that payload could change how the payload preprocesses.
+  // This is the observation predicate for object-like macro definitions: once
+  // the definition is active, the identifier token itself is enough to change
+  // how the replacement payload preprocesses.
   auto rawIdentifierAppearsInText = [&](StringRef name, StringRef text) {
     if (name.empty() || text.empty())
       return false;
@@ -3741,6 +3795,77 @@ std::string RefoldEngine::RunSinglePassRefold() {
         return true;
     }
   };
+
+  // Return true if a function-like macro invocation starts inside
+  // `replacement`. The following `(` may live either in the replacement itself
+  // or across the edit/suffix boundary; both cases would let a before-payload
+  // definition preservation change B-side replacement tokens. Invocations that
+  // start in the preserved suffix are intentionally ignored because restoring
+  // the definition for such later source is the purpose of this repair.
+  auto functionLikeInvocationStartsInReplacement =
+      [&](StringRef name, StringRef replacement, StringRef suffix) {
+        if (name.empty() || replacement.empty())
+          return false;
+
+        const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
+        std::string lexBuf;
+        lexBuf.reserve(replacement.size() + suffix.size() + 1);
+        lexBuf.append(replacement.begin(), replacement.end());
+        lexBuf.append(suffix.begin(), suffix.end());
+        lexBuf.push_back('\0');
+
+        const char *bufStart = lexBuf.data();
+        const char *bufEnd = bufStart + replacement.size() + suffix.size();
+        Lexer lexer(baseLoc, lexLang_, bufStart, bufStart, bufEnd);
+        lexer.SetCommentRetentionState(true);
+
+        bool pendingReplacementName = false;
+        Token token;
+        while (true) {
+          lexer.LexFromRawLexer(token);
+          if (token.is(tok::eof))
+            return false;
+
+          // Whitespace is not returned by the raw lexer and comments are not
+          // preprocessing tokens for function-like invocation adjacency, so a
+          // retained comment does not clear the pending macro-name token.
+          if (token.is(tok::comment))
+            continue;
+
+          if (pendingReplacementName) {
+            if (token.is(tok::l_paren))
+              return true;
+            pendingReplacementName = false;
+          }
+
+          if (!token.is(tok::raw_identifier) && !token.is(tok::identifier))
+            continue;
+
+          const size_t localBegin = tokenOffsetFromBase(token, baseLoc);
+          const size_t localEnd = tokenEndOffsetFromBase(token, baseLoc);
+          if (localEnd < localBegin || localEnd > replacement.size())
+            continue;
+
+          pendingReplacementName =
+              StringRef(lexBuf).slice(localBegin, localEnd) == name;
+        }
+      };
+
+  // Return true when a replacement payload can observe a consumed macro
+  // definition if the directive is preserved before that payload. This is the
+  // placement safety gate used by macro-definition liveness repair.
+  auto replacementObservesPreservedDefinition =
+      [&](const TextEdit &edit, const RefoldModel::MacroDirective &definition,
+          StringRef macroName) {
+        switch (macroObservationKindForDefinition(definition, macroName)) {
+        case MacroReplacementObservationKind::IdentifierToken:
+          return rawIdentifierAppearsInText(macroName, StringRef(edit.text));
+        case MacroReplacementObservationKind::FunctionLikeInvocation:
+          return functionLikeInvocationStartsInReplacement(
+              macroName, StringRef(edit.text), tuBytes.drop_front(edit.end));
+        }
+        return true;
+      };
 
   enum class MacroStatePreservationPlacement {
     BeforeReplacement,
@@ -3808,9 +3933,11 @@ std::string RefoldEngine::RunSinglePassRefold() {
       return std::nullopt;
 
     TextEdit &edit = tuEdits[editIndex];
-    const bool replacementObservesName =
-        rawIdentifierAppearsInText(macroName, StringRef(edit.text));
-    if (replacementObservesName)
+    const bool replacementObservesDefinition =
+        directive.subkind == "#define"
+            ? replacementObservesPreservedDefinition(edit, directive, macroName)
+            : rawIdentifierAppearsInText(macroName, StringRef(edit.text));
+    if (replacementObservesDefinition)
       return std::nullopt;
 
     const bool editStartsAtPhysicalBOL =
