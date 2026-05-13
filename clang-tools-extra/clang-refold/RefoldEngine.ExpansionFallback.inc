@@ -364,11 +364,14 @@ removePhase2SplicesForLineControl(StringRef text) {
     }
 
     if (state == ScanState::BlockComment) {
-      // Splices inside comments would require jointly modeling phase 2 and
-      // phase 3 inside the macro argument.  Keep this local proof to splices
-      // between ordinary preprocessing tokens.
+      // Translation phase 2 removes backslash-newline pairs before phase 3
+      // replaces a complete block comment with whitespace.  This local proof
+      // therefore may delete splice pairs inside a recorded block comment while
+      // still leaving the comment itself for the later stringification helper
+      // to collapse to one whitespace unit.  Literal splices remain rejected
+      // below because they affect token spelling rather than comment erasure.
       if (skipSplice(pos))
-        return std::nullopt;
+        continue;
       if (pos + 1 < text.size() && text[pos] == '*' && text[pos + 1] == '/') {
         out.push_back(text[pos++]);
         out.push_back(text[pos++]);
