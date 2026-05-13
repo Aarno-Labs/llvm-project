@@ -158,6 +158,157 @@ inline bool hasLiteralMacroCalleeOrigin(
   return mi.calleeOrigin.kind == MacroCalleeOriginKind::LiteralMacroName;
 }
 
+/// Controls which conditional arms must have no materialized PP tokens for a
+/// preserved conditional island to be source-neutral.
+enum class NeutralConditionalArmSpanMode { AllArms, SelectedArmsOnly };
+
+/// Owner-specific hooks for the shared neutral conditional-island proof.
+///
+/// The proof itself is owner-polymorphic: TU gaps, pure include-closure gaps,
+/// and header-owned gaps have the same first-order invariant, but differ in how
+/// model records are associated with the current owner surface and how neutral
+/// include/macro artifacts are discharged.
+struct NeutralConditionalIslandPolicy {
+  StringRef sourceText;
+  bool requireGroupBeginAtLineStart = false;
+  NeutralConditionalArmSpanMode armSpanMode =
+      NeutralConditionalArmSpanMode::SelectedArmsOnly;
+
+  function_ref<bool(const RefoldModel::CondGroup &)> groupBelongs;
+  function_ref<bool(const RefoldModel::IncludeItem &)> includeBelongs;
+  function_ref<bool(const RefoldModel::IncludeItem &)> includeIsNeutral;
+  function_ref<bool(const RefoldModel::MacroDirective &)> directiveBelongs;
+  function_ref<bool(const RefoldModel::PragmaDirective &)> pragmaBelongs;
+  function_ref<bool(const RefoldModel::MacroInvocation &)> macroBelongs;
+  function_ref<bool(const RefoldModel::MacroInvocation &)> macroIsNeutral;
+};
+
+/// Return true iff \p arm has A-side PP material that would make a preserved
+/// conditional island source-bearing under \p mode.
+static bool neutralConditionalArmHasMaterializedTokens(
+    const RefoldModel::CondArm &arm, NeutralConditionalArmSpanMode mode) {
+  if (mode == NeutralConditionalArmSpanMode::SelectedArmsOnly &&
+      !arm.selected)
+    return false;
+  return arm.span && arm.span->IsValid() && arm.span->begin < arm.span->end;
+}
+
+/// Recursive implementation for neutral conditional-island proof.
+///
+/// A complete conditional group may be preserved as neutral source iff it is
+/// wholly inside the source gap, has no materialized PP tokens under the
+/// caller-selected arm policy, and every recorded arm-body artifact is either
+/// owned by a recursively neutral nested conditional island or independently
+/// discharges the appropriate neutral macro/include proof.
+static bool conditionalGroupIsNeutralIslandImpl(
+    const RefoldModel &model, const RefoldModel::CondGroup &group,
+    uint64_t gapBegin, uint64_t gapEnd,
+    const NeutralConditionalIslandPolicy &policy,
+    SmallVectorImpl<uint64_t> &recursionStack) {
+  if (!policy.groupBelongs(group))
+    return false;
+  if (group.groupB >= group.groupE ||
+      group.groupE > policy.sourceText.size())
+    return false;
+  if (group.groupB < gapBegin || gapEnd < group.groupE)
+    return false;
+  if (policy.requireGroupBeginAtLineStart &&
+      !stringutils::beginsLineAfterWs(policy.sourceText, group.groupB))
+    return false;
+
+  for (uint64_t activeId : recursionStack)
+    if (activeId == group.id)
+      return false;
+
+  for (const RefoldModel::CondArm &arm : group.arms)
+    if (neutralConditionalArmHasMaterializedTokens(arm, policy.armSpanMode))
+      return false;
+
+  recursionStack.push_back(group.id);
+  auto popStack = llvm::make_scope_exit([&] { recursionStack.pop_back(); });
+
+  auto insideGroup = [&](uint64_t b, uint64_t e) {
+    return group.groupB <= b && b < e && e <= group.groupE;
+  };
+
+  auto insideAnyArmBody = [&](uint64_t b, uint64_t e) {
+    for (const RefoldModel::CondArm &arm : group.arms)
+      if (arm.bodyB <= b && b < e && e <= arm.bodyE)
+        return true;
+    return false;
+  };
+
+  auto insideNeutralNestedConditional = [&](uint64_t b, uint64_t e) {
+    for (const auto &nested : model.GetConds()) {
+      if (nested.id == group.id)
+        continue;
+      if (!policy.groupBelongs(nested))
+        continue;
+      if (nested.groupB < group.groupB || group.groupE < nested.groupE)
+        continue;
+      if (!(nested.groupB <= b && b < e && e <= nested.groupE))
+        continue;
+      if (!insideAnyArmBody(nested.groupB, nested.groupE))
+        continue;
+      if (conditionalGroupIsNeutralIslandImpl(
+              model, nested, group.groupB, group.groupE, policy,
+              recursionStack))
+        return true;
+    }
+    return false;
+  };
+
+  for (const auto &inc : model.GetIncludes()) {
+    if (!policy.includeBelongs(inc) || !insideGroup(inc.siteB, inc.siteE))
+      continue;
+    if (insideNeutralNestedConditional(inc.siteB, inc.siteE))
+      continue;
+    if (insideAnyArmBody(inc.siteB, inc.siteE) && policy.includeIsNeutral(inc))
+      continue;
+    return false;
+  }
+
+  for (const auto &directive : model.GetMacroDirectives())
+    if (policy.directiveBelongs(directive) &&
+        insideGroup(directive.siteB, directive.siteE) &&
+        !insideNeutralNestedConditional(directive.siteB, directive.siteE))
+      return false;
+
+  for (const auto &pragma : model.GetPragmas())
+    if (policy.pragmaBelongs(pragma) &&
+        insideGroup(pragma.siteB, pragma.siteE) &&
+        !insideNeutralNestedConditional(pragma.siteB, pragma.siteE))
+      return false;
+
+  // Macro invocations in #if/#elif control lines are allowed because the
+  // complete conditional group is preserved verbatim.  Arm-body macro
+  // invocations must either belong to a neutral nested conditional island or
+  // independently prove source-neutral zero-token behavior.
+  for (const auto &macro : model.GetMacroInvocations()) {
+    if (!policy.macroBelongs(macro) || !macro.invB || !macro.invE ||
+        !insideGroup(*macro.invB, *macro.invE) ||
+        !insideAnyArmBody(*macro.invB, *macro.invE))
+      continue;
+    if (insideNeutralNestedConditional(*macro.invB, *macro.invE))
+      continue;
+    if (policy.macroIsNeutral(macro))
+      continue;
+    return false;
+  }
+
+  return true;
+}
+
+/// Return true iff \p group discharges the shared neutral conditional-island
+/// proof under the caller-provided owner policy.
+static bool conditionalGroupIsNeutralIsland(
+    const RefoldModel &model, const RefoldModel::CondGroup &group,
+    uint64_t gapBegin, uint64_t gapEnd,
+    const NeutralConditionalIslandPolicy &policy) {
+  SmallVector<uint64_t, 8> recursionStack;
+  return conditionalGroupIsNeutralIslandImpl(model, group, gapBegin, gapEnd,
+                                             policy, recursionStack);
+}
 
 /// Byte envelope covered by normalized owner-proof source pieces.
 struct OwnerProofSourceEnvelope { uint64_t begin = 0, end = 0; };

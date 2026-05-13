@@ -4606,99 +4606,44 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   // arm materialized PP tokens in A.  Active source-bearing artifacts inside the
   // group remain outside this proof; they require their own preservation/repair
   // model rather than being hidden inside an opaque conditional gap.
-  std::function<bool(const RefoldModel::CondGroup &, uint64_t, uint64_t)>
-      conditionalGroupIsPreservableIncludeClosureGap;
-  conditionalGroupIsPreservableIncludeClosureGap =
+  auto conditionalGroupIsPreservableIncludeClosureGap =
       [&](const RefoldModel::CondGroup &group, uint64_t gapBegin,
           uint64_t gapEnd) -> bool {
-    if (!PathsEqual(group.file, tuPath) || group.parentIncludeId)
-      return false;
-    if (group.groupB >= group.groupE || group.groupE > tuBytes.size())
-      return false;
-    if (group.groupB < gapBegin || gapEnd < group.groupE)
-      return false;
-    if (!stringutils::beginsLineAfterWs(tuBytes, group.groupB))
-      return false;
-
-    for (const RefoldModel::CondArm &arm : group.arms)
-      if (arm.span && arm.span->IsValid() && arm.span->begin < arm.span->end)
-        return false;
-
-    auto insideGroup = [&](uint64_t b, uint64_t e) {
-      return group.groupB <= b && b < e && e <= group.groupE;
+    auto groupBelongs = [&](const RefoldModel::CondGroup &candidate) {
+      return PathsEqual(candidate.file, tuPath) && !candidate.parentIncludeId;
+    };
+    auto includeBelongs = [&](const RefoldModel::IncludeItem &inc) {
+      return PathsEqual(inc.sitePath, tuPath);
+    };
+    auto includeIsNeutral = [&](const RefoldModel::IncludeItem &inc) {
+      return !inc.cover.IsValid() && !includeHasRecordedSideEffects(inc);
+    };
+    auto directiveBelongs = [&](const RefoldModel::MacroDirective &directive) {
+      return PathsEqual(directive.sitePath, tuPath);
+    };
+    auto pragmaBelongs = [&](const RefoldModel::PragmaDirective &pragma) {
+      return PathsEqual(pragma.sitePath, tuPath);
+    };
+    auto macroBelongs = [&](const RefoldModel::MacroInvocation &macro) {
+      return macro.invFile && PathsEqual(*macro.invFile, tuPath);
+    };
+    auto macroIsNeutral = [&](const RefoldModel::MacroInvocation &macro) {
+      return macroInvocationIsSourceNeutralZeroToken(macro);
     };
 
-    auto insideAnyArmBody = [&](uint64_t b, uint64_t e) {
-      for (const RefoldModel::CondArm &arm : group.arms)
-        if (arm.bodyB <= b && b < e && e <= arm.bodyE)
-          return true;
-      return false;
-    };
-
-    // Artifacts inside a nested complete conditional group are owned by that
-    // nested island, not by this parent arm body.  Prove the nested island
-    // recursively before letting it suppress the parent-level artifact check;
-    // otherwise a source-bearing nested group would be hidden inside the
-    // parent's neutral proof.
-    auto insideNeutralNestedConditional = [&](uint64_t b, uint64_t e) {
-      for (const auto &nested : model_.GetConds()) {
-        if (nested.id == group.id)
-          continue;
-        if (!PathsEqual(nested.file, tuPath) || nested.parentIncludeId)
-          continue;
-        if (nested.groupB < group.groupB || group.groupE < nested.groupE)
-          continue;
-        if (!(nested.groupB <= b && b < e && e <= nested.groupE))
-          continue;
-        if (!insideAnyArmBody(nested.groupB, nested.groupE))
-          continue;
-        if (conditionalGroupIsPreservableIncludeClosureGap(
-                nested, group.groupB, group.groupE))
-          return true;
-      }
-      return false;
-    };
-
-    // The group itself is preserved, but do not treat it as an opaque proof box
-    // if the producer recorded active source artifacts inside an arm body.
-    // Include directives are compositional: an arm-body include is admissible
-    // only when the existing zero-token include-subtree proof says it produced
-    // no PP material and has no unhandled side effect.  Since the whole
-    // conditional island is copied forward, the include directive is not hidden
-    // or deleted; this check only proves that it is neutral with respect to the
-    // edited token envelope.  Macro invocations follow the same rule below.
-    // Macro-state directives and pragmas still block this narrow proof until
-    // they get their own selected-arm neutrality model.
-    for (const auto &inc : model_.GetIncludes()) {
-      if (!PathsEqual(inc.sitePath, tuPath) ||
-          !insideGroup(inc.siteB, inc.siteE))
-        continue;
-      if (insideNeutralNestedConditional(inc.siteB, inc.siteE))
-        continue;
-      if (insideAnyArmBody(inc.siteB, inc.siteE) && !inc.cover.IsValid() &&
-          !includeHasRecordedSideEffects(inc))
-        continue;
-      return false;
-    }
-    for (const auto &directive : model_.GetMacroDirectives())
-      if (PathsEqual(directive.sitePath, tuPath) &&
-          insideGroup(directive.siteB, directive.siteE) &&
-          !insideNeutralNestedConditional(directive.siteB, directive.siteE))
-        return false;
-    for (const auto &pragma : model_.GetPragmas())
-      if (PathsEqual(pragma.sitePath, tuPath) &&
-          insideGroup(pragma.siteB, pragma.siteE) &&
-          !insideNeutralNestedConditional(pragma.siteB, pragma.siteE))
-        return false;
-    for (const auto &macro : model_.GetMacroInvocations())
-      if (macro.invFile && PathsEqual(*macro.invFile, tuPath) && macro.invB &&
-          macro.invE && insideGroup(*macro.invB, *macro.invE) &&
-          insideAnyArmBody(*macro.invB, *macro.invE) &&
-          !insideNeutralNestedConditional(*macro.invB, *macro.invE) &&
-          !macroInvocationIsSourceNeutralZeroToken(macro))
-        return false;
-
-    return true;
+    NeutralConditionalIslandPolicy policy{
+        tuBytes,
+        /*requireGroupBeginAtLineStart=*/true,
+        NeutralConditionalArmSpanMode::AllArms,
+        groupBelongs,
+        includeBelongs,
+        includeIsNeutral,
+        directiveBelongs,
+        pragmaBelongs,
+        macroBelongs,
+        macroIsNeutral};
+    return conditionalGroupIsNeutralIsland(model_, group, gapBegin, gapEnd,
+                                           policy);
   };
 
   // Return true iff a pure include-closure inter-include gap can be preserved
@@ -4772,103 +4717,43 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   // the preserved group.  Recorded artifacts in arm bodies still fail closed:
   // those may carry source tokens, macro state, include effects, or pragmas that
   // require their own proof.
-  std::function<bool(const RefoldModel::CondGroup &, uint64_t, uint64_t)>
-      conditionalGroupIsConsumableZeroTokenGap;
-  conditionalGroupIsConsumableZeroTokenGap =
+  auto conditionalGroupIsConsumableZeroTokenGap =
       [&](const RefoldModel::CondGroup &group, uint64_t begin,
           uint64_t end) -> bool {
-    if (!PathsEqual(group.file, tuPath) || group.parentIncludeId)
-      return false;
-    if (group.groupB >= group.groupE || group.groupE > tuBytes.size())
-      return false;
-    if (group.groupB < begin || end < group.groupE)
-      return false;
-
-    // A selected arm with materialized A tokens is source-bearing.  It is
-    // handled by the material-consumption proof that adds the whole group as a
-    // required source piece when those tokens are inside the replacement.
-    for (const RefoldModel::CondArm &arm : group.arms)
-      if (arm.selected && arm.span && arm.span->IsValid() &&
-          arm.span->begin < arm.span->end)
-        return false;
-
-    auto insideGroup = [&](uint64_t b, uint64_t e) {
-      return group.groupB <= b && b < e && e <= group.groupE;
+    auto groupBelongs = [&](const RefoldModel::CondGroup &candidate) {
+      return PathsEqual(candidate.file, tuPath) && !candidate.parentIncludeId;
+    };
+    auto includeBelongs = [&](const RefoldModel::IncludeItem &inc) {
+      return PathsEqual(inc.sitePath, tuPath);
+    };
+    auto includeIsNeutral = [&](const RefoldModel::IncludeItem &inc) {
+      return !inc.cover.IsValid() && !includeHasRecordedSideEffects(inc);
+    };
+    auto directiveBelongs = [&](const RefoldModel::MacroDirective &directive) {
+      return PathsEqual(directive.sitePath, tuPath);
+    };
+    auto pragmaBelongs = [&](const RefoldModel::PragmaDirective &pragma) {
+      return PathsEqual(pragma.sitePath, tuPath);
+    };
+    auto macroBelongs = [&](const RefoldModel::MacroInvocation &macro) {
+      return macro.invFile && PathsEqual(*macro.invFile, tuPath);
+    };
+    auto macroIsNeutral = [&](const RefoldModel::MacroInvocation &macro) {
+      return macroInvocationIsSourceNeutralZeroToken(macro);
     };
 
-    auto insideAnyArmBody = [&](uint64_t b, uint64_t e) {
-      for (const RefoldModel::CondArm &arm : group.arms)
-        if (arm.bodyB <= b && b < e && e <= arm.bodyE)
-          return true;
-      return false;
-    };
-
-    // Artifacts inside a nested complete conditional group are owned by that
-    // nested island, not by this parent arm body.  Prove the nested island
-    // recursively before letting it suppress the parent-level artifact check;
-    // otherwise a source-bearing nested group would be hidden inside the
-    // parent's neutral proof.
-    auto insideNeutralNestedConditional = [&](uint64_t b, uint64_t e) {
-      for (const auto &nested : model_.GetConds()) {
-        if (nested.id == group.id)
-          continue;
-        if (!PathsEqual(nested.file, tuPath) || nested.parentIncludeId)
-          continue;
-        if (nested.groupB < group.groupB || group.groupE < nested.groupE)
-          continue;
-        if (!(nested.groupB <= b && b < e && e <= nested.groupE))
-          continue;
-        if (!insideAnyArmBody(nested.groupB, nested.groupE))
-          continue;
-        if (conditionalGroupIsConsumableZeroTokenGap(
-                nested, group.groupB, group.groupE))
-          return true;
-      }
-      return false;
-    };
-
-    // Includes in selected arm bodies are compositional neutral artifacts, just
-    // like zero-token macro invocations: if the include subtree produced no PP
-    // material and has no unhandled recorded side effect, preserving the whole
-    // conditional island preserves the include directive at its original source
-    // position instead of hiding or deleting it.  Includes outside arm bodies or
-    // includes that fail the zero-token subtree proof remain source-bearing.
-    for (const auto &inc : model_.GetIncludes()) {
-      if (!PathsEqual(inc.sitePath, tuPath) ||
-          !insideGroup(inc.siteB, inc.siteE))
-        continue;
-      if (insideNeutralNestedConditional(inc.siteB, inc.siteE))
-        continue;
-      if (insideAnyArmBody(inc.siteB, inc.siteE) && !inc.cover.IsValid() &&
-          !includeHasRecordedSideEffects(inc))
-        continue;
-      return false;
-    }
-    for (const auto &directive : model_.GetMacroDirectives())
-      if (PathsEqual(directive.sitePath, tuPath) &&
-          insideGroup(directive.siteB, directive.siteE) &&
-          !insideNeutralNestedConditional(directive.siteB, directive.siteE))
-        return false;
-    for (const auto &pragma : model_.GetPragmas())
-      if (PathsEqual(pragma.sitePath, tuPath) &&
-          insideGroup(pragma.siteB, pragma.siteE) &&
-          !insideNeutralNestedConditional(pragma.siteB, pragma.siteE))
-        return false;
-
-    // Macro invocations in #if/#elif control lines are allowed because the
-    // complete conditional group is preserved as source.  Macro invocations in
-    // arm bodies are also allowed when the existing zero-token macro proof says
-    // they contribute no PP tokens and carry no modeled side effect.  Any
-    // source-bearing body macro remains outside this neutral-island proof.
-    for (const auto &macro : model_.GetMacroInvocations())
-      if (macro.invFile && PathsEqual(*macro.invFile, tuPath) && macro.invB &&
-          macro.invE && insideGroup(*macro.invB, *macro.invE) &&
-          insideAnyArmBody(*macro.invB, *macro.invE) &&
-          !insideNeutralNestedConditional(*macro.invB, *macro.invE) &&
-          !macroInvocationIsSourceNeutralZeroToken(macro))
-        return false;
-
-    return true;
+    NeutralConditionalIslandPolicy policy{
+        tuBytes,
+        /*requireGroupBeginAtLineStart=*/false,
+        NeutralConditionalArmSpanMode::SelectedArmsOnly,
+        groupBelongs,
+        includeBelongs,
+        includeIsNeutral,
+        directiveBelongs,
+        pragmaBelongs,
+        macroBelongs,
+        macroIsNeutral};
+    return conditionalGroupIsNeutralIsland(model_, group, begin, end, policy);
   };
 
   // Prove that a source gap inside a replacement envelope consists only of
