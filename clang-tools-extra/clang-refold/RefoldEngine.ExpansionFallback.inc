@@ -4637,10 +4637,11 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     // if the producer recorded active source artifacts inside an arm body.
     // Include directives, macro-state directives, and pragmas may affect later
     // preprocessing state, so any recorded instance still blocks this narrow
-    // preservation proof.  Macro invocations are different: a macro used only
-    // by a #if/#elif control expression is preserved as source spelling along
-    // with the complete group, so it is not hidden or deleted.  Only macro
-    // invocations recorded inside arm bodies remain outside this proof.
+    // preservation proof.  Macro invocations are compositional: control-line
+    // uses are preserved with the directive spelling, and arm-body uses are
+    // admissible only when they independently prove source-neutral zero-token
+    // behavior.  That is the complete invariant for a neutral conditional
+    // island: every selected-arm artifact must itself be neutral.
     for (const auto &inc : model_.GetIncludes())
       if (PathsEqual(inc.sitePath, tuPath) && insideGroup(inc.siteB, inc.siteE))
         return false;
@@ -4655,7 +4656,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     for (const auto &macro : model_.GetMacroInvocations())
       if (macro.invFile && PathsEqual(*macro.invFile, tuPath) && macro.invB &&
           macro.invE && insideGroup(*macro.invB, *macro.invE) &&
-          insideAnyArmBody(*macro.invB, *macro.invE))
+          insideAnyArmBody(*macro.invB, *macro.invE) &&
+          !macroInvocationIsSourceNeutralZeroToken(macro))
         return false;
 
     return true;
@@ -4778,12 +4780,14 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
 
     // Macro invocations in #if/#elif control lines are allowed because the
     // complete conditional group is preserved as source.  Macro invocations in
-    // arm bodies are source-bearing body artifacts and remain outside this
-    // neutral-control proof.
+    // arm bodies are also allowed when the existing zero-token macro proof says
+    // they contribute no PP tokens and carry no modeled side effect.  Any
+    // source-bearing body macro remains outside this neutral-island proof.
     for (const auto &macro : model_.GetMacroInvocations())
       if (macro.invFile && PathsEqual(*macro.invFile, tuPath) && macro.invB &&
           macro.invE && insideGroup(*macro.invB, *macro.invE) &&
-          insideAnyArmBody(*macro.invB, *macro.invE))
+          insideAnyArmBody(*macro.invB, *macro.invE) &&
+          !macroInvocationIsSourceNeutralZeroToken(macro))
         return false;
 
     return true;
