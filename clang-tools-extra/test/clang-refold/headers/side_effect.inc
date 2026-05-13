@@ -1,0 +1,1 @@
+#define SIDE_EFFECT_VALUE 99

@@ -3145,6 +3145,68 @@ std::string RefoldEngine::RunSinglePassRefold() {
     return std::nullopt;
   };
 
+  // Return the outermost include directive, spelled in the TU, that makes an
+  // include-owned artifact visible in the main source stream.  For nested
+  // includes, the artifact's immediate owner lives in a header, but deleting
+  // the outer TU #include still consumes the artifact from the emitted TU's
+  // preprocessing environment.
+  auto outermostOwningIncludeSiteInTU =
+      [&](std::optional<uint64_t> includeId)
+          -> const RefoldModel::IncludeItem * {
+    if (!includeId)
+      return nullptr;
+
+    const RefoldModel::IncludeItem *cur = model_.GetIncludeById(*includeId);
+    while (cur) {
+      if (PathsEqual(cur->sitePath, tuPath))
+        return cur;
+      if (!cur->parent)
+        return nullptr;
+      cur = model_.GetIncludeById(*cur->parent);
+    }
+    return nullptr;
+  };
+
+  // Return the TU include directive that makes an include-owned macro-state
+  // directive visible in the main source stream.  The directive's own byte
+  // range is in the header file, but deleting the owning #include site consumes
+  // that macro-state transition from the emitted TU.
+  auto owningIncludeSiteInTU =
+      [&](const RefoldModel::MacroDirective &directive)
+          -> const RefoldModel::IncludeItem * {
+    return outermostOwningIncludeSiteInTU(directive.ownerIncludeId);
+  };
+
+  // Return the final TU edit that fully consumes this macro-state directive.
+  // TU-spelled directives are matched by their own byte range.  Include-owned
+  // directives are matched by the owning include site, since that is the source
+  // spelling actually removed from the output file.
+  auto finalTUEditContainingMacroDirective =
+      [&](const RefoldModel::MacroDirective &directive)
+          -> std::optional<size_t> {
+    if (PathsEqual(directive.sitePath, tuPath))
+      return finalTUEditContainingInterval(directive.siteB, directive.siteE);
+
+    if (const RefoldModel::IncludeItem *inc = owningIncludeSiteInTU(directive))
+      return finalTUEditContainingInterval(inc->siteB, inc->siteE);
+
+    return std::nullopt;
+  };
+
+  // Return true when this macro-state directive is touched by any final TU edit.
+  // For include-owned directives, touching the owning include site is enough to
+  // remove the directive from the refolded TU's preprocessing environment.
+  auto macroDirectiveTouchedByTUEdit =
+      [&](const RefoldModel::MacroDirective &directive) {
+    if (PathsEqual(directive.sitePath, tuPath))
+      return intervalOverlapsFinalTUEdit(directive.siteB, directive.siteE);
+
+    if (const RefoldModel::IncludeItem *inc = owningIncludeSiteInTU(directive))
+      return intervalOverlapsFinalTUEdit(inc->siteB, inc->siteE);
+
+    return false;
+  };
+
   // Spell a preserved macro-state directive as a complete physical line.
   auto directiveTextForPreservation =
       [](const RefoldModel::MacroDirective &directive) {
@@ -3200,14 +3262,14 @@ std::string RefoldEngine::RunSinglePassRefold() {
       macroStatePreservationsByEdit;
   DenseSet<uint64_t> preservedDefinitionDirectiveIds;
 
-  // Return true when a final TU edit consumes bytes from this macro definition.
+  // Return true when a final TU edit consumes bytes from this macro
+  // definition, either directly in the TU or indirectly by consuming the
+  // top-level include that owns the definition.
   auto definitionDirectiveTouchedByTUEdit =
       [&](const RefoldModel::MacroDirective &directive) {
         if (directive.subkind != "#define")
           return false;
-        if (!PathsEqual(directive.sitePath, tuPath))
-          return false;
-        return intervalOverlapsFinalTUEdit(directive.siteB, directive.siteE);
+        return macroDirectiveTouchedByTUEdit(directive);
       };
 
   // Return true if this physical macro callsite is already being rewritten by
@@ -3226,6 +3288,31 @@ std::string RefoldEngine::RunSinglePassRefold() {
         }
         return false;
       };
+
+  // Return the TU include directive that makes a header-spelled macro
+  // invocation survive in the emitted source.  If that include site is not
+  // replaced, deleting an earlier include-owned definition can change how the
+  // preserved header is preprocessed.
+  auto owningIncludeSiteForInvocationInTU =
+      [&](const RefoldModel::MacroInvocation &m)
+          -> const RefoldModel::IncludeItem * {
+    return outermostOwningIncludeSiteInTU(m.ownerIncludeId);
+  };
+
+  // Return true when a macro invocation spelled in a preserved include remains
+  // observable after TU edits.  Such a callsite cannot be patched directly by a
+  // TU text edit, so a consumed active definition for it is a hard liveness
+  // hazard rather than a candidate for local callsite repair.
+  auto includeOwnedInvocationSurvivesTUEdits =
+      [&](const RefoldModel::MacroInvocation &m) {
+    if (m.invFile && PathsEqual(*m.invFile, tuPath))
+      return false;
+    const RefoldModel::IncludeItem *inc =
+        owningIncludeSiteForInvocationInTU(m);
+    if (!inc)
+      return false;
+    return !intervalOverlapsFinalTUEdit(inc->siteB, inc->siteE);
+  };
 
   // Return true when the invocation spelling remains in the untouched TU suffix
   // and can therefore observe macro-state changes caused by earlier TU edits.
@@ -3292,12 +3379,15 @@ std::string RefoldEngine::RunSinglePassRefold() {
     if (IsInvocationInsideDefineDirective(m))
       continue;
 
-    // Ignore call sites that were deleted/replaced by TU edits or already have
-    // an accepted macro patch. This pass only repairs otherwise-preserved
-    // suffix/source spelling that would observe changed macro state.
-    if (!invocationCallsiteSurvivesTUEdits(m))
-      continue;
-    if (physicalCallsiteAlreadyHasPatch(m))
+    // Ignore call sites that were deleted/replaced by TU edits.  TU-spelled
+    // call sites can be repaired locally by preserving the consumed definition
+    // or by forcing a whole-cover macro realization.  Header-spelled call sites
+    // inside a surviving include cannot be patched directly here; if they
+    // depend on a consumed definition, the edit is outside this proof class.
+    const bool survivesAsTUCallsite = invocationCallsiteSurvivesTUEdits(m);
+    const bool survivesAsIncludeCallsite =
+        includeOwnedInvocationSurvivesTUEdits(m);
+    if (!survivesAsTUCallsite && !survivesAsIncludeCallsite)
       continue;
 
     const RefoldModel::MacroDirective *definition =
@@ -3305,9 +3395,28 @@ std::string RefoldEngine::RunSinglePassRefold() {
     if (!definition || !definitionDirectiveTouchedByTUEdit(*definition))
       continue;
 
+    if (survivesAsIncludeCallsite) {
+      RequestTerminalFallback(
+          TerminalFallbackKind::UndischargedEmissionArtifact,
+          "macro-definition-liveness",
+          llvm::formatv(
+              "macro '{0}' invocation #{1} survives inside preserved include "
+              "site, but active definition directive #{2} was consumed by a "
+              "TU edit and header callsites cannot be repaired locally",
+              m.name, m.id, definition->id)
+              .str());
+      continue;
+    }
+
+    // Ignore surviving TU call sites that already have an accepted macro patch.
+    // This pass only repairs otherwise-preserved suffix/source spelling that
+    // would observe changed macro state.
+    if (physicalCallsiteAlreadyHasPatch(m))
+      continue;
+
     bool preservedDefinition = false;
-    if (std::optional<size_t> editIndex = finalTUEditContainingInterval(
-            definition->siteB, definition->siteE)) {
+    if (std::optional<size_t> editIndex =
+            finalTUEditContainingMacroDirective(*definition)) {
       const TextEdit &edit = tuEdits[*editIndex];
       const bool editStartsAtPhysicalBOL =
           edit.start == 0 || tuBytes[edit.start - 1] == '\n';
@@ -3454,13 +3563,12 @@ std::string RefoldEngine::RunSinglePassRefold() {
   };
 
   // Return true if this macro-state directive remains available in the emitted
-  // TU source, either because it belongs to another file or because no final TU
-  // edit consumes its spelling.
+  // TU source.  Include-owned directives survive only when their owning include
+  // site survives; otherwise the edit consumed the directive's source-level
+  // entry point even though the directive bytes live in a header file.
   auto directiveSurvivesTUEdits =
       [&](const RefoldModel::MacroDirective &directive) {
-    if (!PathsEqual(directive.sitePath, tuPath))
-      return true;
-    return !intervalOverlapsFinalTUEdit(directive.siteB, directive.siteE);
+    return !macroDirectiveTouchedByTUEdit(directive);
   };
 
   // Return true if a preserved TU byte interval contains `name` as a real
@@ -3517,14 +3625,13 @@ std::string RefoldEngine::RunSinglePassRefold() {
     const RefoldModel::MacroDirective &undefDirective = *ref.directive;
     if (undefDirective.subkind != "#undef")
       continue;
-    if (!PathsEqual(undefDirective.sitePath, tuPath))
-      continue;
 
     // Only a consumed #undef can create a liveness hazard. If the directive is
     // merely preserved by the ordinary source suffix/prefix, macro state stays
-    // consistent without any repair.
-    std::optional<size_t> editIndex = finalTUEditContainingInterval(
-        undefDirective.siteB, undefDirective.siteE);
+    // consistent without any repair.  Include-owned #undef directives are
+    // considered consumed when their owning include site is consumed.
+    std::optional<size_t> editIndex =
+        finalTUEditContainingMacroDirective(undefDirective);
     if (!editIndex)
       continue;
 
@@ -3539,9 +3646,10 @@ std::string RefoldEngine::RunSinglePassRefold() {
 
     // Look only after the consumed #undef/edit frontier. Earlier source either
     // belongs to the replacement itself or cannot observe the resurrected macro
-    // state caused by removing this #undef.
-    const uint64_t observationBegin =
-        std::max<uint64_t>(edit.end, undefDirective.siteE);
+    // state caused by removing this #undef.  For include-owned #undef
+    // directives, the header byte offset is unrelated to the TU; the containing
+    // edit end is the only relevant observation frontier.
+    const uint64_t observationBegin = edit.end;
     if (!rawIdentifierAppearsInPreservedTUBytes(ref.name, observationBegin,
                                                 tuBytes.size()))
       continue;

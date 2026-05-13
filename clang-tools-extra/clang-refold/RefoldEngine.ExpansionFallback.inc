@@ -973,7 +973,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   };
 
   // Return true iff the refold map records source structure inside this include
-  // that prevents treating a zero-token include as safely consumable trivia.
+  // that cannot be consumed as part of a zero-token replacement gap.
   auto includeHasRecordedSideEffects =
       [&](const RefoldModel::IncludeItem &inc) -> bool {
     // Header declarations are semantic structure, even if this include did not
@@ -987,8 +987,18 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       if (child.parent && *child.parent == inc.id)
         return true;
 
+    // Include-owned #define directives are macro-state transitions, not PP
+    // tokens.  When their containing zero-token include lies inside the
+    // replacement envelope, the directive is consumed with that envelope.  Any
+    // surviving source that still needs the definition is handled later by the
+    // macro-definition liveness repair pass, which can either preserve the
+    // directive where syntactically valid or force dependent TU call sites to
+    // whole-cover realizations.  #undef remains outside this proof because
+    // deleting it can resurrect earlier definitions for raw identifiers in
+    // preserved headers, which this closure cannot inspect or repair.
     for (const auto &directive : model_.GetMacroDirectives())
-      if (directive.ownerIncludeId && *directive.ownerIncludeId == inc.id)
+      if (directive.ownerIncludeId && *directive.ownerIncludeId == inc.id &&
+          directive.subkind != "#define")
         return true;
 
     for (const auto &group : model_.GetConds())
@@ -1007,7 +1017,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
 
   // Prove that a source gap inside the replacement envelope consists only of
   // whitespace plus complete unrelated includes whose own expansion is empty
-  // and side-effect-free in the refold map.
+  // and whose recorded structure is either absent or consumable macro state.
   //
   // Such an include has no PP tokens, so token overlap alone cannot make it a
   // touched include.  If it lies physically between required source pieces of a
@@ -1164,10 +1174,11 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
 
     // Do not silently delete any include directive other than the run whose
     // expansion is explicitly part of this closure.  A complete unrelated
-    // include with an empty, side-effect-free PP cover may be consumed only when
-    // it is fully inside the same source envelope.  That makes it part of the
-    // replaced source interval, not trivia to preserve or reorder around the
-    // B-side material.
+    // include with an empty PP cover may be consumed only when it is fully
+    // inside the same source envelope and all recorded structure is either
+    // absent or consumable macro state.  That makes it part of the replaced
+    // source interval, not trivia to preserve or reorder around the B-side
+    // material.
     for (const auto &inc : model_.GetIncludes()) {
       if (!PathsEqual(inc.sitePath, tuPath))
         continue;
@@ -1206,8 +1217,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     }
 
     // The envelope may widen across physical gaps between required pieces, but
-    // only across whitespace or complete zero-token includes that are proven
-    // side-effect-free.  Those empty includes are consumed by the replacement:
+    // only across whitespace or complete zero-token includes whose recorded
+    // structure is consumable.  Those includes are consumed by the replacement:
     // they sit inside the source interval whose A-side material was replaced by
     // the B-side hunk.  Any other byte would be meaningful source text that the
     // proof has not justified replacing.
@@ -1297,11 +1308,11 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
 
     // The pure include closure may absorb touched include directives plus
     // source-neutral whitespace between neighboring directives.  It may also
-    // consume a complete empty, side-effect-free include that lies between the
-    // touched directives, because that directive is inside the replaced source
-    // envelope even though it contributed no PP tokens.  Comments and literal
-    // empty conditional-control groups are still preserved verbatim rather than
-    // silently deleted.
+    // consume a complete empty include whose recorded structure is consumable
+    // when that include lies between the touched directives: the directive is
+    // inside the replaced source envelope even though it contributed no PP
+    // tokens.  Comments and literal empty conditional-control groups are still
+    // preserved verbatim rather than silently deleted.
     if (inc->siteB > sourceCursor) {
       StringRef gap = tuBytes.slice(sourceCursor, inc->siteB);
       if (!gap.empty() && !stringutils::isWhitespace(gap)) {
@@ -1392,10 +1403,9 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   std::string replacement = rawReplacement;
 
   // Preserve legacy inert trivia between touched include directives.  Empty
-  // side-effect-free includes admitted by the gap proof above are deliberately
-  // not appended here: they lie inside the source envelope replaced by this
-  // closure, so the B-side material consumes them along with the adjacent
-  // TU/include tokens.
+  // includes admitted by the gap proof above are deliberately not appended here:
+  // they lie inside the source envelope replaced by this closure, so the B-side
+  // material consumes them along with the adjacent TU/include tokens.
   if (!preservedGapTrivia.empty()) {
     if (startsWithPreprocessorDirectiveTrivia(preservedGapTrivia) &&
         !replacement.empty() && replacement.back() != '\n')
