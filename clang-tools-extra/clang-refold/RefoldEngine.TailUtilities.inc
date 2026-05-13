@@ -2482,12 +2482,25 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
           }
         }
         if (sourceEnvelope) {
+          SourceLineDirectiveLogicalLineRewriter
+              headerSourceLineDirectiveLineRewriter =
+                  [&](StringRef logicalLine, ArrayRef<uint64_t> sourceOffsets)
+              -> std::optional<SourceLineDirectiveLogicalLineRewrite> {
+            return rewriteSourceLineDirectiveLogicalLineMacros(
+                model_, file, logicalLine, sourceOffsets,
+                [&](StringRef lhs, StringRef rhs) {
+                  return PathsEqual(lhs, rhs);
+                },
+                ie.include->id);
+          };
+
           if (!proveOwnerSourceEnvelopeGaps(
                   hunkSourcePieces, [&](uint64_t gapBegin, uint64_t gapEnd) {
                 if (std::optional<SourceLineDirectiveGapResume> lineResume =
                         computeSourceLineDirectiveGapResume(
                             StringRef(headerText), gapBegin, gapEnd,
-                            sourceEnvelope->end, file)) {
+                            sourceEnvelope->end, file,
+                            headerSourceLineDirectiveLineRewriter)) {
                   // Header full-envelope widening uses the same owner-piece gap
                   // proof as TU/include closure.  A source-spelled
                   // line-control gap is not disposable trivia, but it is
