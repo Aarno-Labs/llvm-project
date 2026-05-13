@@ -3786,22 +3786,85 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     return includeRecordedSideEffectReason(inc).has_value();
   };
 
-  auto identifierAppearsInHunkReplacement = [&](StringRef name) -> bool {
+  auto rawIdentifierAppearsInHunkReplacement = [&](StringRef name) -> bool {
     if (name.empty())
       return false;
+
     StringRef text = SliceBSource(h.bStart, h.bEnd);
-    size_t pos = 0;
-    while ((pos = text.find(name, pos)) != StringRef::npos) {
-      const bool leftOk = pos == 0 || !stringutils::isIdentPart(text[pos - 1]);
-      const size_t end = pos + name.size();
-      const bool rightOk =
-          end == text.size() || !stringutils::isIdentPart(text[end]);
-      if (leftOk && rightOk)
+    if (text.empty())
+      return false;
+
+    const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
+    std::string lexBuf = text.str();
+    lexBuf.push_back('\0');
+
+    const char *bufStart = lexBuf.data();
+    const char *bufEnd = bufStart + text.size();
+    Lexer lexer(baseLoc, lexLang_, bufStart, bufStart, bufEnd);
+    lexer.SetCommentRetentionState(true);
+
+    Token token;
+    while (true) {
+      lexer.LexFromRawLexer(token);
+      if (token.is(tok::eof))
+        return false;
+      if (token.is(tok::comment))
+        continue;
+      if (!token.is(tok::raw_identifier) && !token.is(tok::identifier))
+        continue;
+
+      const size_t localBegin = tokenOffsetFromBase(token, baseLoc);
+      const size_t localEnd = tokenEndOffsetFromBase(token, baseLoc);
+      if (localEnd < localBegin || localEnd > text.size())
+        continue;
+      if (text.slice(localBegin, localEnd) == name)
         return true;
-      pos = end;
     }
-    return false;
   };
+
+  auto functionLikeInvocationAppearsInHunkReplacement =
+      [&](StringRef name) -> bool {
+        if (name.empty())
+          return false;
+
+        StringRef text = SliceBSource(h.bStart, h.bEnd);
+        if (text.empty())
+          return false;
+
+        const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
+        std::string lexBuf = text.str();
+        lexBuf.push_back('\0');
+
+        const char *bufStart = lexBuf.data();
+        const char *bufEnd = bufStart + text.size();
+        Lexer lexer(baseLoc, lexLang_, bufStart, bufStart, bufEnd);
+        lexer.SetCommentRetentionState(true);
+
+        bool pendingName = false;
+        Token token;
+        while (true) {
+          lexer.LexFromRawLexer(token);
+          if (token.is(tok::eof))
+            return false;
+          if (token.is(tok::comment))
+            continue;
+
+          if (pendingName) {
+            if (token.is(tok::l_paren))
+              return true;
+            pendingName = false;
+          }
+
+          if (!token.is(tok::raw_identifier) && !token.is(tok::identifier))
+            continue;
+
+          const size_t localBegin = tokenOffsetFromBase(token, baseLoc);
+          const size_t localEnd = tokenEndOffsetFromBase(token, baseLoc);
+          if (localEnd < localBegin || localEnd > text.size())
+            continue;
+          pendingName = text.slice(localBegin, localEnd) == name;
+        }
+      };
 
   auto macroDirectiveNameFromRecordedText =
       [&](const RefoldModel::MacroDirective &directive)
@@ -3829,6 +3892,53 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       ++end;
     return text.take_front(end).str();
   };
+
+  auto macroDirectiveIsFunctionLikeDefinition =
+      [&](const RefoldModel::MacroDirective &directive, StringRef macroName) {
+        if (directive.subkind != "#define")
+          return false;
+
+        StringRef text = directive.text;
+        size_t pos = 0;
+        stringutils::skipNonNewlineWs(text, pos);
+        if (pos >= text.size() || text[pos] != '#')
+          return false;
+        ++pos;
+        stringutils::skipNonNewlineWs(text, pos);
+
+        StringRef keyword = "define";
+        if (!text.substr(pos).starts_with(keyword))
+          return false;
+        pos += keyword.size();
+        if (pos < text.size() && stringutils::isIdentPart(text[pos]))
+          return false;
+        stringutils::skipNonNewlineWs(text, pos);
+
+        const size_t nameBegin = pos;
+        if (pos >= text.size() || !stringutils::isIdentStart(text[pos]))
+          return false;
+        ++pos;
+        while (pos < text.size() && stringutils::isIdentPart(text[pos]))
+          ++pos;
+
+        return text.slice(nameBegin, pos) == macroName && pos < text.size() &&
+               text[pos] == '(';
+      };
+
+  // Return true when the B-side replacement hunk can observe a macro-state
+  // transition preserved after that hunk. Object-like definitions and #undef
+  // transitions are conservatively keyed by identifier occurrence; a
+  // function-like #define is keyed by actual invocation syntax instead.
+  auto hunkReplacementObservesMacroStateDirective =
+      [&](const RefoldModel::MacroDirective &directive) {
+        std::optional<std::string> name =
+            macroDirectiveNameFromRecordedText(directive);
+        if (!name)
+          return true;
+        if (macroDirectiveIsFunctionLikeDefinition(directive, *name))
+          return functionLikeInvocationAppearsInHunkReplacement(*name);
+        return rawIdentifierAppearsInHunkReplacement(*name);
+      };
 
   auto includeIsDescendantOf = [&](const RefoldModel::IncludeItem &candidate,
                                    const RefoldModel::IncludeItem &root) {
@@ -3899,11 +4009,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       if (!ownedByInclude)
         continue;
 
-      std::optional<std::string> name =
-          macroDirectiveNameFromRecordedText(directive);
-      if (!name)
-        return finish(false);
-      if (identifierAppearsInHunkReplacement(*name))
+      if (hunkReplacementObservesMacroStateDirective(directive))
         return finish(false);
     }
 

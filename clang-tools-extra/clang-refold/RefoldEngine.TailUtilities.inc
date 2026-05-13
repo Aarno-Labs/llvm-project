@@ -562,10 +562,57 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     return s.take_front(end).str();
   };
 
+  enum class HeaderMacroReplacementObservationKind {
+    IdentifierToken,
+    FunctionLikeInvocation,
+  };
+
+  // Return the observation shape for a header-owned macro-state directive.
+  // This mirrors the TU macro-liveness proof: object-like definitions and
+  // #undef transitions are conservatively observed by an identifier token,
+  // while function-like #defines are observed only by an actual invocation.
+  auto headerMacroObservationKindForDirective =
+      [&](const RefoldModel::MacroDirective &directive, StringRef macroName) {
+        if (directive.subkind != "#define")
+          return HeaderMacroReplacementObservationKind::IdentifierToken;
+
+        StringRef text = directive.text;
+        size_t pos = 0;
+        stringutils::skipNonNewlineWs(text, pos);
+        if (pos >= text.size() || text[pos] != '#')
+          return HeaderMacroReplacementObservationKind::IdentifierToken;
+        ++pos;
+        stringutils::skipNonNewlineWs(text, pos);
+
+        StringRef keyword = "define";
+        if (!text.substr(pos).starts_with(keyword))
+          return HeaderMacroReplacementObservationKind::IdentifierToken;
+        pos += keyword.size();
+        if (pos < text.size() && stringutils::isIdentPart(text[pos]))
+          return HeaderMacroReplacementObservationKind::IdentifierToken;
+        stringutils::skipNonNewlineWs(text, pos);
+
+        const size_t nameBegin = pos;
+        if (pos >= text.size() || !stringutils::isIdentStart(text[pos]))
+          return HeaderMacroReplacementObservationKind::IdentifierToken;
+        ++pos;
+        while (pos < text.size() && stringutils::isIdentPart(text[pos]))
+          ++pos;
+
+        if (text.slice(nameBegin, pos) != macroName)
+          return HeaderMacroReplacementObservationKind::IdentifierToken;
+
+        // Function-like macro definitions require byte-adjacent `(` after the
+        // macro name. Whitespace/comments mean the #define is object-like, so
+        // fall back to identifier-token observation in that case.
+        if (pos < text.size() && text[pos] == '(')
+          return HeaderMacroReplacementObservationKind::FunctionLikeInvocation;
+
+        return HeaderMacroReplacementObservationKind::IdentifierToken;
+      };
+
   // Return true if `text` contains `name` as a real raw identifier token.  This
-  // prevents after-replacement directive preservation from accidentally making
-  // the B-derived replacement payload observe a macro-state transition that was
-  // not visible while B was produced.
+  // is the observation predicate for object-like macro-state effects.
   auto rawIdentifierAppearsInHeaderReplacement = [&](StringRef name,
                                                      StringRef text) {
     if (name.empty() || text.empty())
@@ -603,6 +650,70 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         return true;
     }
   };
+
+  // Return true if `replacement` contains a real function-like invocation of
+  // `name`. A bare occurrence of a function-like macro name is not an
+  // observation of the macro definition, so it must not block preservation.
+  auto functionLikeInvocationAppearsInHeaderReplacement =
+      [&](StringRef name, StringRef replacement) {
+        if (name.empty() || replacement.empty())
+          return false;
+
+        const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
+        std::string lexBuf = replacement.str();
+        lexBuf.push_back('\0');
+
+        const char *bufStart = lexBuf.data();
+        const char *bufEnd = bufStart + replacement.size();
+        Lexer lexer(baseLoc, lexLang_, bufStart, bufStart, bufEnd);
+        lexer.SetCommentRetentionState(true);
+
+        bool pendingName = false;
+        Token token;
+        while (true) {
+          lexer.LexFromRawLexer(token);
+          if (token.is(tok::eof))
+            return false;
+          if (token.is(tok::comment))
+            continue;
+
+          if (pendingName) {
+            if (token.is(tok::l_paren))
+              return true;
+            pendingName = false;
+          }
+
+          if (!token.is(tok::raw_identifier) && !token.is(tok::identifier))
+            continue;
+
+          const size_t localBegin = tokenOffsetFromBase(token, baseLoc);
+          const size_t localEnd = tokenEndOffsetFromBase(token, baseLoc);
+          if (localEnd < localBegin || localEnd > replacement.size())
+            continue;
+          pendingName = replacement.slice(localBegin, localEnd) == name;
+        }
+      };
+
+  // Return true when preserving this macro-state directive could change the
+  // B-derived replacement payload under the owner-polymorphic header gap proof.
+  auto headerReplacementObservesMacroStateDirective =
+      [&](const RefoldModel::MacroDirective &directive, StringRef replacement,
+          bool unparseableObserves) {
+        std::optional<std::string> name =
+            parseHeaderMacroStateDirectiveName(directive.text,
+                                               directive.subkind);
+        if (!name)
+          return unparseableObserves;
+
+        switch (headerMacroObservationKindForDirective(directive, *name)) {
+        case HeaderMacroReplacementObservationKind::IdentifierToken:
+          return rawIdentifierAppearsInHeaderReplacement(*name, replacement);
+        case HeaderMacroReplacementObservationKind::FunctionLikeInvocation:
+          return functionLikeInvocationAppearsInHeaderReplacement(*name,
+                                                                 replacement);
+        }
+        return true;
+      };
 
   // Recover the complete physical source line for a macro-state directive that
   // was spelled in this include expansion.  MacroDirective::siteB is anchored at
@@ -1529,9 +1640,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
           }
       if (!ownedByChild)
         continue;
-      std::optional<std::string> name =
-          macroDirectiveNameFromRecordedText(directive);
-      if (name && rawIdentifierAppearsInHeaderReplacement(*name, replacement))
+      if (headerReplacementObservesMacroStateDirective(
+              directive, replacement, /*unparseableObserves=*/false))
         return false;
     }
 
@@ -1851,11 +1961,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       if (!includeOwnsDirective(directive, root))
         continue;
 
-      std::optional<std::string> name =
-          macroDirectiveNameFromRecordedText(directive);
-      if (!name)
-        return false;
-      if (rawIdentifierAppearsInHeaderReplacement(*name, replacement))
+      if (headerReplacementObservesMacroStateDirective(
+              directive, replacement, /*unparseableObserves=*/true))
         return false;
       if (!recordedMacroDirectiveMatchesOwnerFile(directive))
         return false;
@@ -2785,9 +2892,10 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                   if (!directivePiece || directivePiece->begin < gapBegin ||
                       gapEnd < directivePiece->end)
                     continue;
-                  if (rawIdentifierAppearsInHeaderReplacement(
-                          directivePiece->name,
-                          StringRef(materialInsertBytes)))
+                  if (headerReplacementObservesMacroStateDirective(
+                          *directivePiece->directive,
+                          StringRef(materialInsertBytes),
+                          /*unparseableObserves=*/true))
                     return false;
 
                   HeaderPreservedGapPiece piece;
