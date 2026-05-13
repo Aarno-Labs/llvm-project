@@ -1453,6 +1453,26 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     return false;
   };
 
+  auto headerLineDirectiveStartsAtPrefix = [&](uint64_t pos) -> bool {
+    if (pos >= headerText.size())
+      return true;
+    if (stringutils::isBOL(StringRef(headerText), static_cast<size_t>(pos)))
+      return true;
+
+    size_t lineStart = static_cast<size_t>(pos);
+    while (lineStart > 0 && headerText[lineStart - 1] != '\n')
+      --lineStart;
+    return stringutils::isIndentOnly(StringRef(headerText), lineStart,
+                                     static_cast<size_t>(pos));
+  };
+
+  auto canStartHeaderLineDirectiveWithOptionalLeadingNewline =
+      [&](uint64_t pos) -> bool {
+    if (headerLineDirectiveStartsAtPrefix(pos))
+      return true;
+    return pos == 0 || headerText[pos - 1] != '\\';
+  };
+
   auto replacementHeaderSuffixBoundaryAllowsDirectiveLine =
       [&](StringRef replacement, uint64_t sourceEnd) {
     if (sourceEnd > headerText.size())
@@ -2578,27 +2598,17 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         }
 
         if (sourceEnvelope) {
-          auto canEmitLineDirectiveBeforeHeaderTail = [&](uint64_t pos) -> bool {
-            if (pos >= headerText.size())
-              return true;
-            if (stringutils::isBOL(StringRef(headerText), static_cast<size_t>(pos)))
-              return true;
-
-            size_t lineStart = static_cast<size_t>(pos);
-            while (lineStart > 0 && headerText[lineStart - 1] != '\n')
-              --lineStart;
-            return stringutils::isIndentOnly(StringRef(headerText), lineStart,
-                                             static_cast<size_t>(pos));
-          };
-
           const bool hasHeaderSuffixAfterSourceLineDirective =
               headerSourceLineDirectiveResume &&
               sourceEnvelope->end < headerText.size();
           const bool canRestoreSourceLineState =
               !headerSourceLineDirectiveResume ||
               (!hasHeaderSuffixAfterSourceLineDirective ||
-               (lineDirs_.Enabled() && !isDelete &&
-                canEmitLineDirectiveBeforeHeaderTail(sourceEnvelope->end)));
+               (lineDirs_.Enabled() &&
+                headerLineDirectiveStartsAtPrefix(sourceEnvelope->end) &&
+                (!isDelete ||
+                 canStartHeaderLineDirectiveWithOptionalLeadingNewline(
+                     sourceEnvelope->begin))));
 
           if (sourceEnvelope->begin <= *startByte &&
               *endByte <= sourceEnvelope->end && canRestoreSourceLineState &&
@@ -2667,8 +2677,17 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         lineDirs_.Enabled() && usedFullHeaderEnvelope &&
         headerSourceLineDirectiveResume && *endByte < fileLen;
     if (emitsHeaderSourceLineDirectiveResume) {
-      if (!replacement.empty() && replacement.back() != '\n')
+      // A full-envelope delete has no B-derived payload, but the consumed
+      // source interval may still have carried a #line directive whose net
+      // state must be restored before the untouched header suffix. Emit a
+      // resync-only replacement in that case; non-empty replacements get the
+      // same directive on a fresh physical line after their edited payload.
+      if (replacement.empty()) {
+        if (!headerLineDirectiveStartsAtPrefix(*startByte))
+          replacement.push_back('\n');
+      } else if (replacement.back() != '\n') {
         replacement.push_back('\n');
+      }
       replacement += lineDirs_.FormatLineDirective(
           headerSourceLineDirectiveResume->lineAtResume,
           headerSourceLineDirectiveResume->fileSpelling);

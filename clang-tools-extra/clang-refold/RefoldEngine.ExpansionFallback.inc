@@ -2416,6 +2416,31 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   std::string mixedPreservedConditionalControlTrivia;
   std::optional<SourceLineDirectiveGapResume> mixedSourceLineDirectiveResume;
 
+  auto lineDirectiveStartsAtPrefix = [&](uint64_t pos) -> bool {
+    if (pos >= tuBytes.size())
+      return true;
+    if (stringutils::isBOL(tuBytes, static_cast<size_t>(pos)))
+      return true;
+
+    size_t lineStart = static_cast<size_t>(pos);
+    while (lineStart > 0 && tuBytes[lineStart - 1] != '\n')
+      --lineStart;
+    return stringutils::isIndentOnly(tuBytes, lineStart,
+                                     static_cast<size_t>(pos));
+  };
+
+  auto canStartLineDirectiveWithOptionalLeadingNewline =
+      [&](uint64_t pos) -> bool {
+    if (lineDirectiveStartsAtPrefix(pos))
+      return true;
+
+    // A delete-only closure may need to synthesize a leading newline before the
+    // replacement-local #line directive. Reject the only local case where that
+    // newline would be swallowed as a line splice instead of starting a fresh
+    // preprocessing directive.
+    return pos == 0 || tuBytes[pos - 1] != '\\';
+  };
+
   // Prove a mixed TU/include closure.
   //
   // This handles a single replacement hunk whose A-side tokens are split
@@ -2909,18 +2934,6 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
             }))
       return std::nullopt;
 
-    auto canEmitLineDirectiveBeforeOriginalTail = [&](uint64_t pos) -> bool {
-      if (pos >= tuBytes.size())
-        return true;
-      if (stringutils::isBOL(tuBytes, static_cast<size_t>(pos)))
-        return true;
-
-      size_t lineStart = static_cast<size_t>(pos);
-      while (lineStart > 0 && tuBytes[lineStart - 1] != '\n')
-        --lineStart;
-      return stringutils::isIndentOnly(tuBytes, lineStart, static_cast<size_t>(pos));
-    };
-
     if (mixedSourceLineDirectiveResume && !lineDirs_.Enabled() &&
         sourceEnd < tuBytes.size()) {
       trace("fallback",
@@ -2930,19 +2943,21 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     }
 
     if (lineDirs_.Enabled() && mixedSourceLineDirectiveResume &&
-        h.isDeleteOnly()) {
-      trace("fallback",
-            "TU/include closure rejected: delete-only source #line gap needs "
-            "an explicit resync payload");
-      return std::nullopt;
-    }
-
-    if (lineDirs_.Enabled() && mixedSourceLineDirectiveResume &&
-        !canEmitLineDirectiveBeforeOriginalTail(sourceEnd)) {
+        !lineDirectiveStartsAtPrefix(sourceEnd)) {
       trace("fallback",
             "TU/include closure rejected: source #line state from consumed "
             "gap cannot be restored before non-BOL suffix at source={0}",
             sourceEnd);
+      return std::nullopt;
+    }
+
+    if (lineDirs_.Enabled() && mixedSourceLineDirectiveResume &&
+        h.isDeleteOnly() &&
+        !canStartLineDirectiveWithOptionalLeadingNewline(sourceBegin)) {
+      trace("fallback",
+            "TU/include closure rejected: delete-only source #line resume "
+            "would be line-spliced at source={0}",
+            sourceBegin);
       return std::nullopt;
     }
 
@@ -3173,10 +3188,17 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     // The consumed source envelope contained a source-spelled #line directive.
     // Re-emit only its net state, adjusted through the consumed envelope, so the
     // untouched suffix observes the same presumed file/line as it did in the
-    // original source.  This explicit resync supersedes the usual physical
-    // newline-drift compensation below.
-    if (!padded.empty() && padded.back() != '\n')
+    // original source. Replacement hunks normally carry edited B material before
+    // the resync; delete-only hunks have no such payload, so they may need a
+    // leading physical newline to make the resync a standalone preprocessing
+    // directive rather than gluing `#line` onto the preceding source line.
+    if (padded.empty()) {
+      if (!lineDirectiveStartsAtPrefix(sourceBegin))
+        padded.push_back('\n');
+    } else if (padded.back() != '\n') {
       padded.push_back('\n');
+    }
+
     padded += lineDirs_.FormatLineDirective(
         mixedSourceLineDirectiveResume->lineAtResume,
         mixedSourceLineDirectiveResume->fileSpelling);
