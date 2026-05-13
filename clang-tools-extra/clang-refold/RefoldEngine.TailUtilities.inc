@@ -690,7 +690,9 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
   // in conditional-control lines are allowed because the complete group is
   // preserved verbatim; arm-body macro invocations must prove zero-token
   // neutrality through the ordinary header macro-gap proof.
-  auto headerConditionalGroupIsPreservableGap =
+  std::function<bool(const RefoldModel::CondGroup &, uint64_t, uint64_t)>
+      headerConditionalGroupIsPreservableGap;
+  headerConditionalGroupIsPreservableGap =
       [&](const RefoldModel::CondGroup &group, uint64_t gapBegin,
           uint64_t gapEnd) -> bool {
     if (!PathsEqual(group.file, file))
@@ -720,6 +722,31 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       return false;
     };
 
+    // Artifacts inside a nested complete conditional group are owned by that
+    // nested island, not by this parent arm body.  Prove the nested island
+    // recursively before letting it suppress the parent-level artifact check;
+    // otherwise a source-bearing nested group would be hidden inside the
+    // parent's neutral proof.
+    auto insideNeutralNestedConditional = [&](uint64_t b, uint64_t e) {
+      for (const auto &nested : model_.GetConds()) {
+        if (nested.id == group.id)
+          continue;
+        if (!PathsEqual(nested.file, file) || !nested.parentIncludeId ||
+            *nested.parentIncludeId != ie.include->id)
+          continue;
+        if (nested.groupB < group.groupB || group.groupE < nested.groupE)
+          continue;
+        if (!(nested.groupB <= b && b < e && e <= nested.groupE))
+          continue;
+        if (!insideAnyArmBody(nested.groupB, nested.groupE))
+          continue;
+        if (headerConditionalGroupIsPreservableGap(
+                nested, group.groupB, group.groupE))
+          return true;
+      }
+      return false;
+    };
+
     // Do not hide recorded active source artifacts inside an opaque preserved
     // conditional group.  Arm-body includes are allowed only when they
     // independently discharge the header zero-token include-subtree proof; then
@@ -732,6 +759,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
           *inc.parent != ie.include->id ||
           !insideGroup(inc.siteB, inc.siteE))
         continue;
+      if (insideNeutralNestedConditional(inc.siteB, inc.siteE))
+        continue;
       if (insideAnyArmBody(inc.siteB, inc.siteE) &&
           headerIncludeIsSourceNeutralZeroToken &&
           headerIncludeIsSourceNeutralZeroToken(inc))
@@ -741,11 +770,13 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     for (const auto &directive : model_.GetMacroDirectives())
       if (PathsEqual(directive.sitePath, file) && directive.ownerIncludeId &&
           *directive.ownerIncludeId == ie.include->id &&
-          insideGroup(directive.siteB, directive.siteE))
+          insideGroup(directive.siteB, directive.siteE) &&
+          !insideNeutralNestedConditional(directive.siteB, directive.siteE))
         return false;
     for (const auto &pragma : model_.GetPragmas())
       if (PathsEqual(pragma.sitePath, file) &&
-          insideGroup(pragma.siteB, pragma.siteE))
+          insideGroup(pragma.siteB, pragma.siteE) &&
+          !insideNeutralNestedConditional(pragma.siteB, pragma.siteE))
         return false;
 
     // Header control-line macro invocations are safe to preserve with the
@@ -757,6 +788,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       if (macro.invFile && PathsEqual(*macro.invFile, file) && macro.invB &&
           macro.invE && insideGroup(*macro.invB, *macro.invE) &&
           insideAnyArmBody(*macro.invB, *macro.invE) &&
+          !insideNeutralNestedConditional(*macro.invB, *macro.invE) &&
           (!headerMacroInvocationIsSourceNeutralZeroToken ||
            !headerMacroInvocationIsSourceNeutralZeroToken(macro)))
         return false;
