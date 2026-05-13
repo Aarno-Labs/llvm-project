@@ -1354,7 +1354,9 @@ Expected<std::string>
 RefoldEngine::Refold(const json::Object &rootJson, StringRef aSource,
                      ArrayRef<PPTok> aToks, ArrayRef<size_t> aTokOff,
                      StringRef bSource, ArrayRef<PPTok> bToks,
-                     ArrayRef<size_t> bTokOff, bool noLines, bool strict) {
+                     ArrayRef<size_t> bTokOff, bool noLines, bool strict,
+                     std::vector<MaterializedEditMapping>
+                         *materializedEditMappings) {
   // Build the refold model based on the parsed JSON object.
   auto mOrErr = RefoldModel::FromJson(rootJson);
   if (!mOrErr)
@@ -1362,7 +1364,8 @@ RefoldEngine::Refold(const json::Object &rootJson, StringRef aSource,
 
   // Construct an engine and run the instance pipeline.
   RefoldEngine engine(std::move(*mOrErr), aSource, aToks, aTokOff, bSource,
-                      bToks, bTokOff, noLines, strict);
+                      bToks, bTokOff, noLines, strict,
+                      materializedEditMappings);
   return engine.Refold();
 }
 
@@ -1709,6 +1712,9 @@ RefoldEngine::SliceBSourceClippedAgainstClaims(size_t bTokStart,
 }
 
 std::string RefoldEngine::Refold() {
+  if (materializedEditMappings_)
+    materializedEditMappings_->clear();
+
   // The engine is single-pass: it first attempts structural refolding, then
   // (if structural proof discharge requests fallback) resolves the post-
   // structural fallback choice between the proved intermediate expansion stage
@@ -2716,8 +2722,35 @@ std::string RefoldEngine::RunSinglePassRefold() {
             }
             const Owner currentPatchOwner =
                 NormalizeHunkOwnerForPatch(tuPath, h);
-            if (existingIt != byMacroId.end())
+            if (existingIt != byMacroId.end()) {
               CarryMacroPatchOwnerCertificate(*updated, existingIt->second);
+              if (existingIt->second.hasMaterializedBTokenRange) {
+                if (!updated->hasMaterializedBTokenRange) {
+                  updated->hasMaterializedBTokenRange = true;
+                  updated->materializedBTokStart =
+                      existingIt->second.materializedBTokStart;
+                  updated->materializedBTokEnd =
+                      existingIt->second.materializedBTokEnd;
+                } else {
+                  updated->materializedBTokStart = std::min(
+                      updated->materializedBTokStart,
+                      existingIt->second.materializedBTokStart);
+                  updated->materializedBTokEnd = std::max(
+                      updated->materializedBTokEnd,
+                      existingIt->second.materializedBTokEnd);
+                }
+              }
+            }
+            if (!updated->hasMaterializedBTokenRange) {
+              updated->hasMaterializedBTokenRange = true;
+              updated->materializedBTokStart = h.bStart;
+              updated->materializedBTokEnd = h.bEnd;
+            } else {
+              updated->materializedBTokStart =
+                  std::min(updated->materializedBTokStart, h.bStart);
+              updated->materializedBTokEnd =
+                  std::max(updated->materializedBTokEnd, h.bEnd);
+            }
             StampMacroPatchOwnerWitness(*updated, currentPatchOwner);
             updated->macroId = patchKey;
             byMacroId[patchKey] = std::move(*updated);
@@ -2846,6 +2879,12 @@ std::string RefoldEngine::RunSinglePassRefold() {
         std::string repl;
         const uint64_t rawTUStart = span->first;
         const uint64_t rawTUEnd = span->second;
+        std::optional<uint64_t> materializedBByteBegin;
+        std::optional<uint64_t> materializedBByteEnd;
+        if (auto bBytes = BTokenRangeToByteRange(h.bStart, h.bEnd)) {
+          materializedBByteBegin = bBytes->first;
+          materializedBByteEnd = bBytes->second;
+        }
 
         if (h.bStart < h.bEnd) {
           StringRef bSlice =
@@ -2877,8 +2916,10 @@ std::string RefoldEngine::RunSinglePassRefold() {
                   (span->first > 0 &&
                    (tuBytes[span->first - 1] == ' ' ||
                     tuBytes[span->first - 1] == '\t'));
-              if (!hasSpaceLeft)
+              if (!hasSpaceLeft) {
                 repl.insert(0, std::string(bSource_.data() + p, b0 - p));
+                materializedBByteBegin = static_cast<uint64_t>(p);
+              }
             }
           }
         }
@@ -3030,6 +3071,9 @@ std::string RefoldEngine::RunSinglePassRefold() {
         edit.directTURawEnd = rawTUEnd;
         edit.directTUFinalStart = span->first;
         edit.directTUFinalEnd = span->second;
+        if (materializedBByteBegin && materializedBByteEnd)
+          StampTextEditMaterializedBByteRange(edit, *materializedBByteBegin,
+                                              *materializedBByteEnd);
 
         AttachAcceptedResultCarrier(
             edit, BuildAcceptedTUTextEditCandidate(
@@ -3114,6 +3158,12 @@ std::string RefoldEngine::RunSinglePassRefold() {
       std::string repl;
       const uint64_t rawTUStart = span->first;
       const uint64_t rawTUEnd = span->second;
+      std::optional<uint64_t> materializedBByteBegin;
+      std::optional<uint64_t> materializedBByteEnd;
+      if (auto bBytes = BTokenRangeToByteRange(h.bStart, h.bEnd)) {
+        materializedBByteBegin = bBytes->first;
+        materializedBByteEnd = bBytes->second;
+      }
       if (isDel) {
         repl = "";
       } else {
@@ -3149,8 +3199,10 @@ std::string RefoldEngine::RunSinglePassRefold() {
           const bool tuHasSpaceLeft =
               span->first > 0 && (tuBytes[span->first - 1] == ' ' ||
                                   tuBytes[span->first - 1] == '\t');
-          if (!tuHasSpaceLeft)
+          if (!tuHasSpaceLeft) {
             repl.insert(0, std::string(bSource_.data() + p, b0 - p));
+            materializedBByteBegin = static_cast<uint64_t>(p);
+          }
         }
       }
 
@@ -3302,6 +3354,9 @@ std::string RefoldEngine::RunSinglePassRefold() {
       edit.directTURawEnd = rawTUEnd;
       edit.directTUFinalStart = span->first;
       edit.directTUFinalEnd = span->second;
+      if (materializedBByteBegin && materializedBByteEnd)
+        StampTextEditMaterializedBByteRange(edit, *materializedBByteBegin,
+                                            *materializedBByteEnd);
 
       AttachAcceptedResultCarrier(
           edit, BuildAcceptedTUTextEditCandidate(
@@ -5233,6 +5288,12 @@ std::string RefoldEngine::RunSinglePassRefold() {
                           ? std::make_optional(GetRootMacroId(mp.macroId))
                           : std::nullopt,
                       {}};
+        if (auto bRange = MacroPatchMaterializedBByteRange(mp))
+          StampTextEditMaterializedBByteRange(edit, bRange->first,
+                                              bRange->second);
+        if (auto outRange = MacroPatchMaterializedOutputTextRange(mp))
+          StampTextEditMaterializedOutputTextRange(edit, outRange->first,
+                                                   outRange->second);
         AttachAcceptedResultCarrier(edit,
                                     BuildAcceptedEmittedMacroCandidate(mp));
         tuEdits.push_back(std::move(edit));
@@ -5306,6 +5367,9 @@ std::string RefoldEngine::RunSinglePassRefold() {
       TextEdit edit{siteB, siteE, std::move(wrapped), std::nullopt,
                     std::nullopt, {}};
       auto itAccepted = includeExpansionAcceptedResults.find(incId);
+      if (auto bEnv = ResolveIncludeRealizationBTokenEnvelope(inc->cover.begin,
+                                                               inc->cover.end))
+        StampTextEditMaterializedBTokenRange(edit, bEnv->first, bEnv->second);
       if (itAccepted != includeExpansionAcceptedResults.end())
         AttachAcceptedResultCarrier(edit, itAccepted->second);
       else
@@ -5319,7 +5383,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
   // Apply TU edits in descending order of start offset.
   debug("tu/apply", "applying {0} TU edits", tuEdits.size());
   std::string tuResult = ApplyTextEditsWithPendingResync(
-      tuBytes, tuEdits, &appliedExpandedMacroRootIds, tuPath);
+      tuBytes, tuEdits, &appliedExpandedMacroRootIds, tuPath,
+      materializedEditMappings_);
   if (terminalFallbackRequested_)
     return std::string();
 
@@ -9524,6 +9589,121 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     return std::nullopt;
   const auto &invArgRanges = *rangesOpt;
 
+  struct InvocationRewriteWithRange {
+    std::string text;
+    uint64_t materializedOutputByteStart = 0;
+    uint64_t materializedOutputByteEnd = 0;
+  };
+
+  auto buildInvocationRewriteWithRange =
+      [&](const DenseMap<uint32_t, std::string> &replByArgIdx,
+          const DenseMap<uint32_t, std::pair<uint64_t, uint64_t>>
+              *materializedRangeByArgIdx = nullptr)
+      -> std::optional<InvocationRewriteWithRange> {
+    if (replByArgIdx.empty())
+      return std::nullopt;
+
+    SmallVector<uint32_t, 8> keys;
+    keys.reserve(replByArgIdx.size());
+    for (const auto &entry : replByArgIdx) {
+      if (static_cast<size_t>(entry.first) >= invArgRanges.size())
+        return std::nullopt;
+      keys.push_back(entry.first);
+    }
+
+    llvm::sort(keys, [&](uint32_t lhs, uint32_t rhs) {
+      const auto lhsRange = invArgRanges[lhs];
+      const auto rhsRange = invArgRanges[rhs];
+      if (lhsRange.first != rhsRange.first)
+        return lhsRange.first < rhsRange.first;
+      return lhs < rhs;
+    });
+
+    InvocationRewriteWithRange out;
+    out.text.reserve(baseInvText.size());
+
+    uint64_t cursor = 0;
+    std::optional<uint64_t> mappedBegin;
+    std::optional<uint64_t> mappedEnd;
+    for (uint32_t argIdx : keys) {
+      auto r = invArgRanges[argIdx];
+      if (r.second < r.first || r.second > baseInvText.size() ||
+          r.first < cursor)
+        return std::nullopt;
+
+      out.text += baseInvText.slice(cursor, r.first).str();
+
+      auto replIt = replByArgIdx.find(argIdx);
+      if (replIt == replByArgIdx.end())
+        return std::nullopt;
+
+      const uint64_t replBegin = static_cast<uint64_t>(out.text.size());
+      out.text.append(replIt->second);
+      const uint64_t replEnd = static_cast<uint64_t>(out.text.size());
+
+      uint64_t materializedBegin = replBegin;
+      uint64_t materializedEnd = replEnd;
+      if (materializedRangeByArgIdx) {
+        auto matIt = materializedRangeByArgIdx->find(argIdx);
+        if (matIt != materializedRangeByArgIdx->end()) {
+          const uint64_t relBegin = matIt->second.first;
+          const uint64_t relEnd = matIt->second.second;
+          if (relEnd < relBegin || relEnd > replIt->second.size())
+            return std::nullopt;
+          materializedBegin = replBegin + relBegin;
+          materializedEnd = replBegin + relEnd;
+        }
+      }
+
+      mappedBegin = mappedBegin ? std::min(*mappedBegin, materializedBegin)
+                                : materializedBegin;
+      mappedEnd = mappedEnd ? std::max(*mappedEnd, materializedEnd)
+                            : materializedEnd;
+
+      cursor = r.second;
+    }
+
+    out.text += baseInvText.substr(cursor).str();
+    if (!mappedBegin || !mappedEnd)
+      return std::nullopt;
+
+    out.materializedOutputByteStart = *mappedBegin;
+    out.materializedOutputByteEnd = *mappedEnd;
+    return out;
+  };
+
+  auto stampMacroPatchMaterializedOutputRange =
+      [](MacroPatch &patch, const InvocationRewriteWithRange &rewrite) {
+        patch.hasMaterializedOutputByteRange = true;
+        patch.materializedOutputByteStart = rewrite.materializedOutputByteStart;
+        patch.materializedOutputByteEnd = rewrite.materializedOutputByteEnd;
+      };
+
+  auto stampMacroPatchMaterializedBTokenRange =
+      [](MacroPatch &patch, uint64_t bTokBegin, uint64_t bTokEnd) {
+        patch.hasMaterializedBTokenRange = true;
+        patch.materializedBTokStart = bTokBegin;
+        patch.materializedBTokEnd = bTokEnd;
+      };
+
+  auto stampMacroPatchWholeExpansionBRange = [&](MacroPatch &patch) -> bool {
+    std::optional<std::pair<uint64_t, uint64_t>> cover =
+        GetWholeCoverATokRange(m);
+    if (!cover)
+      return false;
+
+    std::optional<std::pair<size_t, size_t>> bEnv =
+        MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
+            cover->first, cover->second);
+    if (!bEnv || bEnv->first >= bEnv->second)
+      return false;
+
+    stampMacroPatchMaterializedBTokenRange(
+        patch, static_cast<uint64_t>(bEnv->first),
+        static_cast<uint64_t>(bEnv->second));
+    return true;
+  };
+
   auto isVariadicFormal = [&](uint32_t idx) -> bool {
     return idx < m.defParams.size() && m.defParams[idx].variadic;
   };
@@ -9849,8 +10029,9 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     // agree globally, while variadic/tuple-shaped occurrences may rewrite
     // individual top-level caller slices only when the slice metadata proves
     // the correspondence.
-    auto buildCandidateInvocation = [&](ArrayRef<std::pair<size_t, size_t>> sol,
-                                        std::string &outInv) -> bool {
+    auto buildCandidateInvocation =
+        [&](ArrayRef<std::pair<size_t, size_t>> sol)
+        -> std::optional<InvocationRewriteWithRange> {
       // Group template argument occurrences by the caller formal they came
       // from. Each group must collapse into one replacement for that formal.
       DenseMap<uint32_t, SmallVector<size_t, 8>> occByArg;
@@ -9882,7 +10063,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
             }
           }
           if (!occElem)
-            return false;
+            return std::nullopt;
 
           oldOccs.push_back(
               SliceASource(occElem->aBegin, occElem->aEnd).trim().str());
@@ -9895,7 +10076,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
           // replay path expects every matched occurrence to carry concrete
           // replacement text.
           if (newOccs.back().empty())
-            return false;
+            return std::nullopt;
         }
 
         // The simple case is a whole-argument rewrite: every old occurrence
@@ -9923,9 +10104,9 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
           SmallVector<TupleElementSlice, 8> tupleElems;
           if (!splitTopLevelTupleElementsWithLexer(baseTrim, lexLang_,
                                                    tupleElems))
-            return false;
+            return std::nullopt;
           if (tupleElems.size() != oldOccs.size())
-            return false;
+            return std::nullopt;
 
           replacement = baseTrim.str();
 
@@ -9937,7 +10118,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
             StringRef oldElem =
                 baseTrim.slice(elem.trimBegin, elem.trimEnd).trim();
             if (oldElem != StringRef(oldOccs[idx]).trim())
-              return false;
+              return std::nullopt;
             replacement = stringutils::replaceRange(replacement, elem.trimBegin,
                                                     elem.trimEnd, newOccs[idx]);
           }
@@ -9948,9 +10129,9 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
           // substring edit.
           SmallVector<RefoldModel::TupleArgRef, 8> tupleRefs;
           if (!findDirectTupleRefsForArg(argIdx, tupleRefs))
-            return false;
+            return std::nullopt;
           if (tupleRefs.size() != oldOccs.size())
-            return false;
+            return std::nullopt;
 
           replacement = baseTrim.str();
 
@@ -9961,7 +10142,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
             StringRef oldElem =
                 baseTrim.slice(ref.callerByteBegin, ref.callerByteEnd).trim();
             if (oldElem != StringRef(oldOccs[idx]).trim())
-              return false;
+              return std::nullopt;
             replacement =
                 stringutils::replaceRange(replacement, ref.callerByteBegin,
                                           ref.callerByteEnd, newOccs[idx]);
@@ -9975,9 +10156,9 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         // change invocation arity/syntax rather than merely replacing the
         // argument payload.
         if (replacement.empty())
-          return false;
+          return std::nullopt;
         if (!isVariadicFormal(argIdx) && hasTopLevelComma(replacement))
-          return false;
+          return std::nullopt;
 
         if (StringRef(replacement).trim() != baseTrim)
           changed = true;
@@ -9987,53 +10168,53 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       // Do not synthesize a candidate invocation unless the solved template
       // actually changes at least one call-site argument.
       if (!changed || replByArg.empty())
-        return false;
+        return std::nullopt;
 
-      outInv = baseInvText.str();
-
-      // Replace invocation arguments from right to left so each recorded
-      // argument range remains valid in the original invocation spelling.
-      auto keys = llvm::to_vector(
-          llvm::map_range(replByArg, [](const auto &e) { return e.first; }));
-      std::sort(keys.begin(), keys.end(), [&](uint32_t a, uint32_t b) {
-        return invArgRanges[a].first > invArgRanges[b].first;
-      });
-
-      for (uint32_t argIdx : keys) {
-        auto r = invArgRanges[argIdx];
-        outInv = stringutils::replaceRange(outInv, r.first, r.second,
-                                           replByArg[argIdx]);
-      }
-
-      return true;
+      return buildInvocationRewriteWithRange(replByArg);
     };
 
     // Multiple token-template assignments are acceptable only when they all
     // reconstruct the same invocation spelling. Otherwise the expansion surface
     // is underdetermined and this proof path fails closed.
-    std::optional<std::string> uniqueInv;
+    std::optional<InvocationRewriteWithRange> uniqueRewrite;
     for (const auto &sol : solutions) {
-      std::string candidate;
-      if (!buildCandidateInvocation(sol, candidate))
+      std::optional<InvocationRewriteWithRange> candidate =
+          buildCandidateInvocation(sol);
+      if (!candidate)
         continue;
-      if (!uniqueInv) {
-        uniqueInv = std::move(candidate);
+      if (!uniqueRewrite) {
+        uniqueRewrite = std::move(*candidate);
         continue;
       }
-      if (*uniqueInv != candidate)
+      if (uniqueRewrite->text != candidate->text)
         return std::nullopt;
+      uniqueRewrite->materializedOutputByteStart = std::min(
+          uniqueRewrite->materializedOutputByteStart,
+          candidate->materializedOutputByteStart);
+      uniqueRewrite->materializedOutputByteEnd = std::max(
+          uniqueRewrite->materializedOutputByteEnd,
+          candidate->materializedOutputByteEnd);
     }
 
-    if (!uniqueInv)
+    if (!uniqueRewrite)
       return std::nullopt;
 
     trace("macro/template",
           "template solver SUCCESS root id={0} name={1} coverA=[{2},{3}) "
           "coverB=[{4},{5}) newInv='{6}'",
           m.id, m.name, cover->first, cover->second, bEnv->first, bEnv->second,
-          stringutils::showWsWithClip(*uniqueInv, 240));
+          stringutils::showWsWithClip(uniqueRewrite->text, 240));
 
-    MacroPatch patch{*m.invB, *m.invE, std::move(*uniqueInv), m.id};
+    MacroPatch patch{*m.invB, *m.invE, std::move(uniqueRewrite->text), m.id};
+    stampMacroPatchMaterializedOutputRange(patch, *uniqueRewrite);
+    // The template solver proves the rewritten invocation by replaying the
+    // whole macro expansion template.  The compact source argument range is the
+    // output-side surface, but the B-side witness is the full expansion
+    // envelope, including fixed macro-body tokens before and after the changed
+    // argument occurrences.
+    stampMacroPatchMaterializedBTokenRange(
+        patch, static_cast<uint64_t>(bEnv->first),
+        static_cast<uint64_t>(bEnv->second));
     StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyStandard,
                          /*validated=*/true,
                          /*structurePreserving=*/true, m.id);
@@ -10118,33 +10299,31 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
           return std::nullopt;
         }
 
-        // Apply all replacements to the invocation string (descending order).
-        std::string newInv = baseInvText.str();
-        auto keys = llvm::to_vector<8>(
-            llvm::map_range(replByArgIdx, [](auto &e) { return e.first; }));
-        std::sort(keys.begin(), keys.end(), [&](uint32_t a, uint32_t b) {
-          return invArgRanges[a].first > invArgRanges[b].first;
-        });
-
-        for (uint32_t argIdx : keys) {
-          auto r = invArgRanges[argIdx];
-          newInv = stringutils::replaceRange(newInv, r.first, r.second,
-                                             replByArgIdx[argIdx]);
-        }
+        std::optional<InvocationRewriteWithRange> rewrite =
+            buildInvocationRewriteWithRange(replByArgIdx);
+        if (!rewrite)
+          return std::nullopt;
 
         trace("macro/args", "  args-only SUCCESS newInv='{0}'",
-              stringutils::showWsWithClip(newInv, 200));
+              stringutils::showWsWithClip(rewrite->text, 200));
         {
-        MacroPatch patch{*m.invB, *m.invE, std::move(newInv), m.id};
-        StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyPasteMulti,
-                             /*validated=*/true,
-                             /*structurePreserving=*/true, m.id);
-        // The builder already proved this rewrite by replaying the rewritten
-        // invocation arguments against every pasted token occurrence in B.
-        // Carry that proof source onto the accepted patch for Patch C.
-        patch.pasteReplayValidated = true;
-        return patch;
-      }
+          MacroPatch patch{*m.invB, *m.invE, std::move(rewrite->text), m.id};
+          stampMacroPatchMaterializedOutputRange(patch, *rewrite);
+          // Paste replay validates the rewritten callsite against every pasted
+          // token occurrence in the expansion.  For the edit map, therefore,
+          // the B-side materialization is the whole expansion cover that the
+          // source argument rewrite regenerates, not merely the first changed
+          // pasted-token hunk.
+          stampMacroPatchWholeExpansionBRange(patch);
+          StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyPasteMulti,
+                               /*validated=*/true,
+                               /*structurePreserving=*/true, m.id);
+          // The builder already proved this rewrite by replaying the rewritten
+          // invocation arguments against every pasted token occurrence in B.
+          // Carry that proof source onto the accepted patch for Patch C.
+          patch.pasteReplayValidated = true;
+          return patch;
+        }
       }
     }
 
@@ -10191,12 +10370,22 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         return std::nullopt;
       }
 
-      std::string newInv =
-          stringutils::replaceRange(baseInvText, r.first, r.second, newArg);
+      DenseMap<uint32_t, std::string> singleReplByArgIdx;
+      singleReplByArgIdx[argIdx] = std::move(newArg);
+      std::optional<InvocationRewriteWithRange> rewrite =
+          buildInvocationRewriteWithRange(singleReplByArgIdx);
+      if (!rewrite)
+        return std::nullopt;
+
       trace("macro/args", "  args-only SUCCESS newInv='{0}'",
-            stringutils::showWsWithClip(newInv, 200));
+            stringutils::showWsWithClip(rewrite->text, 200));
       {
-        MacroPatch patch{*m.invB, *m.invE, std::move(newInv), m.id};
+        MacroPatch patch{*m.invB, *m.invE, std::move(rewrite->text), m.id};
+        stampMacroPatchMaterializedOutputRange(patch, *rewrite);
+        // As with the multi-paste path, the source argument rewrite is a
+        // compact representation of the macro's replayed expansion surface.
+        // Keep the B-side map anchored to that whole expansion envelope.
+        stampMacroPatchWholeExpansionBRange(patch);
         StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyPasteSingle,
                              /*validated=*/true,
                              /*structurePreserving=*/true, m.id);
@@ -10340,26 +10529,20 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       return std::nullopt;
     }
 
-    // Materialize the rewritten invocation by replacing affected arguments from
-    // right to left, preserving the original byte ranges for arguments that
-    // have not yet been rewritten.
-    std::string newInv = baseInvText.str();
-    auto keys = llvm::to_vector<8>(
-        llvm::map_range(replByArgIdx, [](auto &e) { return e.first; }));
-    std::sort(keys.begin(), keys.end(), [&](uint32_t a, uint32_t b) {
-      return invArgRanges[a].first > invArgRanges[b].first;
-    });
-
-    for (uint32_t argIdx : keys) {
-      auto r = invArgRanges[argIdx];
-      newInv = stringutils::replaceRange(newInv, r.first, r.second,
-                                         replByArgIdx[argIdx]);
-    }
+    std::optional<InvocationRewriteWithRange> rewrite =
+        buildInvocationRewriteWithRange(replByArgIdx);
+    if (!rewrite)
+      return std::nullopt;
 
     trace("macro/args", "    pure-paste-only SUCCESS newInv='{0}'",
-          stringutils::showWsWithClip(newInv, 200));
+          stringutils::showWsWithClip(rewrite->text, 200));
     {
-      MacroPatch patch{*m.invB, *m.invE, std::move(newInv), m.id};
+      MacroPatch patch{*m.invB, *m.invE, std::move(rewrite->text), m.id};
+      stampMacroPatchMaterializedOutputRange(patch, *rewrite);
+      // Pure-paste-only replay has no standard/stringify occurrence to define
+      // a smaller B-side surface.  The proved replay unit is the full expansion
+      // cover reconstructed from the rewritten invocation arguments.
+      stampMacroPatchWholeExpansionBRange(patch);
       StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyPurePasteOnly,
                            /*validated=*/true,
                            /*structurePreserving=*/true, m.id);
@@ -10658,6 +10841,11 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     // The rewritten spelling inferred for that same occurrence from the token
     // hunk set.
     std::string newText;
+
+    // Optional byte range inside newText that corresponds exactly to B-only
+    // insertion payload owned by this occurrence. When absent, the whole
+    // rewritten argument remains the conservative materialized output range.
+    std::optional<std::pair<uint64_t, uint64_t>> materializedNewTextRange;
   };
 
   // Try to rebuild a caller tuple argument from occurrence observations that
@@ -11148,6 +11336,8 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
   // occurrences of the same argIdx must imply the exact same replacement,
   // otherwise the macro cannot be refolded args-only.
   DenseMap<uint32_t, std::string> replByArgIdx;
+  DenseMap<uint32_t, std::pair<uint64_t, uint64_t>>
+      materializedRangeByArgIdx;
   SmallVector<uint32_t, 8> touchedArgIdxs;
   for (const auto &sp : occs) {
     if (sp.argIdx >= touched.size() || !touched[sp.argIdx])
@@ -11165,6 +11355,9 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
 
     SmallVector<OccObservation, 8> occObservations;
     std::optional<std::string> unifiedNewArg;
+    std::optional<std::pair<uint64_t, uint64_t>>
+        unifiedMaterializedNewTextRange;
+    bool sawUntrackedMaterializedNewTextRange = false;
     bool needTupleFallback = false;
 
     for (size_t i = 0; i < occs.size(); ++i) {
@@ -11183,6 +11376,9 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         bEnv = {static_cast<size_t>(h.bStart), static_cast<size_t>(h.bEnd)};
       }
 
+      std::optional<std::pair<size_t, size_t>> ownedInsertionBRange;
+      bool contributedNonInsertionHunk = false;
+
       if (bEnv) {
         size_t e0 = bEnv->first;
         size_t e1 = bEnv->second;
@@ -11193,7 +11389,9 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         for (const auto &candH : tokenHunks) {
           // Pure insertions have no A-side interval, so accept them only when
           // the ownership helper proves the inserted B range belongs to this
-          // exact argument occurrence.
+          // exact argument occurrence. Record those inserted B tokens
+          // separately: they are the precise output-side materialization
+          // surface for insertion-only argument rewrites.
           if (auto owned = GetOwnedPureInsertionBRangeForArgSpan(
                   sp, occs, *bEnv, candH)) {
             const size_t insB0 = owned->first;
@@ -11201,6 +11399,14 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
             if (!(insB1 < e0 || e1 < insB0)) {
               e0 = std::min(e0, insB0);
               e1 = std::max(e1, insB1);
+              if (ownedInsertionBRange) {
+                ownedInsertionBRange->first =
+                    std::min(ownedInsertionBRange->first, insB0);
+                ownedInsertionBRange->second =
+                    std::max(ownedInsertionBRange->second, insB1);
+              } else {
+                ownedInsertionBRange = std::make_pair(insB0, insB1);
+              }
             }
             continue;
           }
@@ -11212,6 +11418,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
             continue;
           if (candH.aStart < sp.end && candH.aEnd > sp.begin &&
               candH.bStart < candH.bEnd) {
+            contributedNonInsertionHunk = true;
             e0 = std::min(e0, static_cast<size_t>(candH.bStart));
             e1 = std::max(e1, static_cast<size_t>(candH.bEnd));
           }
@@ -11249,6 +11456,32 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
 
       StringRef bSlice = SliceBSource(bEnv->first, bEnv->second).trim();
       std::string newArg = bSlice.str();
+
+      std::optional<std::pair<uint64_t, uint64_t>>
+          materializedNewTextRange;
+      if (!occIsStringify[i] && ownedInsertionBRange &&
+          !contributedNonInsertionHunk) {
+        if (auto insertedBytes = BTokenRangeToByteRange(
+                ownedInsertionBRange->first, ownedInsertionBRange->second)) {
+          const char *sourceBegin = bSource_.data();
+          const char *sourceEnd = sourceBegin + bSource_.size();
+          const char *sliceBeginPtr = bSlice.data();
+          const char *sliceEndPtr = sliceBeginPtr + bSlice.size();
+          if (sourceBegin <= sliceBeginPtr && sliceBeginPtr <= sourceEnd &&
+              sourceBegin <= sliceEndPtr && sliceEndPtr <= sourceEnd) {
+            const uint64_t sliceBegin =
+                static_cast<uint64_t>(sliceBeginPtr - sourceBegin);
+            const uint64_t sliceEnd =
+                static_cast<uint64_t>(sliceEndPtr - sourceBegin);
+            if (insertedBytes->first >= sliceBegin &&
+                insertedBytes->second <= sliceEnd) {
+              materializedNewTextRange = std::make_pair(
+                  insertedBytes->first - sliceBegin,
+                  insertedBytes->second - sliceBegin);
+            }
+          }
+        }
+      }
 
       if (occIsStringify[i]) {
         // Stringify occurrences expose a string literal in the expansion, not
@@ -11299,6 +11532,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
                                  bSlice.str() +
                                  baseArgText.substr(pos + aSlice.size()).str();
               newArg = StringRef(cand).trim().str();
+              materializedNewTextRange = std::nullopt;
               trace("macro/args",
                     "    lift/paste argIdx={0} baseArg={1} aSlice={2} "
                     "bSlice={3} -> newArg={4}",
@@ -11325,7 +11559,21 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       // for this formal agree on one replacement, the args-only path can
       // rewrite the formal directly; disagreement triggers the tuple-forwarding
       // fallback.
-      occObservations.push_back(OccObservation{oldText, newArg});
+      occObservations.push_back(
+          OccObservation{oldText, newArg, materializedNewTextRange});
+      if (!materializedNewTextRange) {
+        sawUntrackedMaterializedNewTextRange = true;
+      } else if (unifiedMaterializedNewTextRange) {
+        unifiedMaterializedNewTextRange->first = std::min(
+            unifiedMaterializedNewTextRange->first,
+            materializedNewTextRange->first);
+        unifiedMaterializedNewTextRange->second = std::max(
+            unifiedMaterializedNewTextRange->second,
+            materializedNewTextRange->second);
+      } else {
+        unifiedMaterializedNewTextRange = *materializedNewTextRange;
+      }
+
       if (!unifiedNewArg)
         unifiedNewArg = newArg;
       else if (*unifiedNewArg != newArg)
@@ -11351,6 +11599,13 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     } else {
       // This formal had no usable observation from the touched hunk set.
       continue;
+    }
+
+    std::optional<std::pair<uint64_t, uint64_t>> finalMaterializedRange;
+    if (!tupleForwarded && !sawUntrackedMaterializedNewTextRange &&
+        unifiedMaterializedNewTextRange && unifiedNewArg &&
+        finalNewArg == *unifiedNewArg) {
+      finalMaterializedRange = *unifiedMaterializedNewTextRange;
     }
 
     // Replacing a non-variadic formal with a top-level comma would change macro
@@ -11560,10 +11815,15 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
                (trimmedFinal.front() == ' ' || trimmedFinal.front() == '\t'))
           trimmedFinal = trimmedFinal.drop_front();
         finalNewArg = trimmedFinal.str();
+        finalMaterializedRange = std::nullopt;
       }
     }
 
     trace("macro/args", "    consistency OK for argIdx={0}", argIdx);
+    if (finalMaterializedRange &&
+        finalMaterializedRange->second <= finalNewArg.size()) {
+      materializedRangeByArgIdx[argIdx] = *finalMaterializedRange;
+    }
     replByArgIdx[argIdx] = std::move(finalNewArg);
   }
 
@@ -11574,23 +11834,22 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     return std::nullopt;
   }
 
-  // Apply replacements to the invocation string. We apply in descending argIdx
-  // order so earlier replacements cannot shift the byte ranges of later ones in
-  // the same baseInvText.
-  std::string finalInv = baseInvText.str();
-  auto finalKeys = llvm::to_vector(
-      llvm::map_range(replByArgIdx, [](auto &e) { return e.first; }));
-  std::sort(finalKeys.begin(), finalKeys.end(), [&](uint32_t a, uint32_t b) {
-    return invArgRanges[a].first > invArgRanges[b].first;
-  });
-  for (uint32_t argIdx : finalKeys) {
-    auto r = invArgRanges[argIdx];
-    finalInv = stringutils::replaceRange(finalInv, r.first, r.second,
-                                         replByArgIdx[argIdx]);
-  }
+  std::optional<InvocationRewriteWithRange> rewrite =
+      buildInvocationRewriteWithRange(replByArgIdx, &materializedRangeByArgIdx);
+  if (!rewrite)
+    return std::nullopt;
 
   {
-    MacroPatch patch{*m.invB, *m.invE, std::move(finalInv), m.id};
+    MacroPatch patch{*m.invB, *m.invE, std::move(rewrite->text), m.id};
+    stampMacroPatchMaterializedOutputRange(patch, *rewrite);
+    // For ordinary replacements, the invocation argument is the compact source
+    // surface that regenerates the macro's B-side expansion envelope.  Pure
+    // insertion accounting is different: when materializedRangeByArgIdx is
+    // populated, the edit map intentionally stays on the inserted B payload and
+    // the matching inserted output subrange instead of widening to unchanged
+    // macro-body text.
+    if (materializedRangeByArgIdx.empty())
+      stampMacroPatchWholeExpansionBRange(patch);
     StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyStandard,
                          /*validated=*/true,
                          /*structurePreserving=*/true, m.id);
@@ -12229,6 +12488,9 @@ void RefoldEngine::StampMacroWholeCoverRealizationPatch(
   patch.wholeCoverBRawHi = plan.rawBTokEnd;
   patch.wholeCoverBAdjLo = plan.bTokStart;
   patch.wholeCoverBAdjHi = plan.bTokEnd;
+  patch.hasMaterializedBTokenRange = true;
+  patch.materializedBTokStart = plan.bTokStart;
+  patch.materializedBTokEnd = plan.bTokEnd;
 }
 
 RefoldEngine::ProofSummary RefoldEngine::BuildAcceptedPathProofSummary(
@@ -20818,20 +21080,40 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
         // Materialize the replacement for the entire root invocation by copying
         // untouched text between argument edits and substituting each certified
-        // new argument spelling at its original argument range.
+        // new argument spelling at its original argument range. At the same time,
+        // remember the output-side subrange occupied by the substituted root
+        // argument payloads. The physical patch still covers the full invocation,
+        // but the optional edit map should point at the root formal text that
+        // actually represents the B-side materialized hunk.
         std::string replText;
         replText.reserve(invSpanText.size());
+        std::optional<uint64_t> materializedOutputBegin;
+        std::optional<uint64_t> materializedOutputEnd;
         cur = 0;
         for (const auto &e : cert.edits) {
           auto mid = invSpanText.slice((size_t)cur, (size_t)e.begin);
           replText.append(mid.begin(), mid.end());
+          const uint64_t replBegin = static_cast<uint64_t>(replText.size());
           replText.append(e.repl);
+          const uint64_t replEnd = static_cast<uint64_t>(replText.size());
+          materializedOutputBegin = materializedOutputBegin
+                                        ? std::min(*materializedOutputBegin,
+                                                   replBegin)
+                                        : replBegin;
+          materializedOutputEnd = materializedOutputEnd
+                                      ? std::max(*materializedOutputEnd, replEnd)
+                                      : replEnd;
           cur = e.end;
         }
         auto tail = invSpanText.drop_front((size_t)cur);
         replText.append(tail.begin(), tail.end());
 
         MacroPatch patch{*invStart, *invEnd, std::move(replText), 0};
+        if (materializedOutputBegin && materializedOutputEnd) {
+          patch.hasMaterializedOutputByteRange = true;
+          patch.materializedOutputByteStart = *materializedOutputBegin;
+          patch.materializedOutputByteEnd = *materializedOutputEnd;
+        }
         cert.patch = std::move(patch);
         cert.kind = RootPatchConstructionCertificateKind::Unique;
         cert.detail =
@@ -21849,6 +22131,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         // proof-valid. Update the unique patch in place while preserving the
         // accumulated validation metadata for any later candidate.
         uniquePatch->replacement = std::move(*merged);
+        uniquePatch->hasMaterializedOutputByteRange = false;
         uniquePatchValidation = std::move(*mergedValidation);
         if (!uniquePatch->macroId)
           uniquePatch->macroId = candPatch.macroId;
@@ -23256,6 +23539,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
       // replay validation, so update only the candidate. The caller remains
       // responsible for final acceptance/selection of that candidate.
       candidate.replacement = std::move(*merged);
+      candidate.hasMaterializedOutputByteRange = false;
       if (!candidate.macroId)
         candidate.macroId = existingPatch->macroId;
     };
@@ -23419,6 +23703,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               stringutils::showWsWithClip(argsOnlyCandidate->replacement, 160),
               stringutils::showWsWithClip(*merged, 160));
         argsOnlyCandidate->replacement = std::move(*merged);
+        argsOnlyCandidate->hasMaterializedOutputByteRange = false;
         if (!argsOnlyCandidate->macroId)
           argsOnlyCandidate->macroId = existingPatch->macroId;
       } else {

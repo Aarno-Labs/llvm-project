@@ -6419,6 +6419,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
                                              closureSourceEnd, padded, tuPath);
   TextEdit edit{sourceBegin,           closureSourceEnd, std::move(ro.text),
                 std::move(ro.pending), std::nullopt,     {}};
+  StampTextEditMaterializedBTokenRange(edit, bEnvelope->first,
+                                       bEnvelope->second);
 
   // The emitted artifact is still a deterministic TU byte replacement even
   // though the witness came from an exact include-closure proof. Reuse the TU
@@ -6599,7 +6601,20 @@ RefoldEngine::SynthesizeMacroOwnerExpansionClosureSource(
   std::optional<PendingResync> pending;
   pending = AppendOriginalSliceWithPending(
       out, tuBytes, 0, witness.sourceByteBegin, std::move(pending));
+  const uint64_t emittedBegin = static_cast<uint64_t>(out.size());
   out.append(ro.text);
+  const uint64_t emittedEnd = static_cast<uint64_t>(out.size());
+  if (materializedEditMappings_) {
+    materializedEditMappings_->clear();
+    if (auto bBytes = BTokenRangeToByteRange(witness.bTokBegin,
+                                             witness.bTokEnd)) {
+      materializedEditMappings_->push_back(MaterializedEditMapping{
+          bBytes->first, bBytes->second, emittedBegin, emittedEnd});
+    } else {
+      fatal("edit-map", "invalid expansion fallback B token range [{0},{1})",
+            witness.bTokBegin, witness.bTokEnd);
+    }
+  }
   pending = ro.pending;
   pending = AppendOriginalSliceWithPending(out, tuBytes, witness.sourceByteEnd,
                                            tuBytes.size(), std::move(pending));
@@ -6730,5 +6745,11 @@ std::string RefoldEngine::ResolvePostStructuralFallback() {
   lastStats_.expandedIncludes = lastStats_.totalIncludes;
   lastStats_.expandedMacros = lastStats_.totalMacros;
   lastStats_.terminalFallbackToB = true;
+  if (materializedEditMappings_) {
+    materializedEditMappings_->clear();
+    materializedEditMappings_->push_back(MaterializedEditMapping{
+        0, static_cast<uint64_t>(bSource_.size()), 0,
+        static_cast<uint64_t>(bSource_.size())});
+  }
   return bSource_.str();
 }

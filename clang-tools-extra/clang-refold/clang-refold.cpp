@@ -18,6 +18,7 @@
 //   -r, --refold-map   Path to refold map JSON produced by the modified
 //                      Clang preprocessor (.refold.json).
 //   -o, --out          Path to write the refolded TU (.c.mod).
+//   --emit-edit-map    Write B↔source byte ranges for materialized edits.
 //  --log-level=<value> Set log level (default is --info)
 //    =trace             -   Trace
 //    =debug             -   Debug
@@ -1083,6 +1084,54 @@ static Error compareTokensNoLinesAware(ArrayRef<PPTok> aToks,
   return Error::success();
 }
 
+/// Write the optional materialized-edit map as stable, human-readable JSON.
+///
+/// The schema is deliberately small: each entry records one materialized edit
+/// with a half-open B-byte range from `--pp-mod` and the half-open byte range in
+/// the final `--out` source that represents that B-side materialization.  These
+/// are source-envelope ranges: a structure-preserving macro edit may map an
+/// expanded B envelope to the rewritten invocation argument that regenerates it.
+static void
+writeMaterializedEditMap(StringRef path, StringRef ppModPath,
+                         StringRef modifiedSrcPath,
+                         ArrayRef<MaterializedEditMapping> mappings) {
+  std::error_code ec;
+  raw_fd_ostream os(path, ec, sys::fs::OF_Text);
+  if (ec)
+    fatal("edit-map/write", "cannot write {0}: {1}", path, ec.message());
+
+  // Keep the range shape identical for both sides of every edit.  The
+  // surrounding object names say which file the range belongs to.
+  auto writeByteRangeObject = [](json::OStream &j, uint64_t begin,
+                                 uint64_t end) {
+    j.attribute("begin", begin);
+    j.attribute("end", end);
+  };
+
+  json::OStream j(os, /*IndentSize=*/2);
+  j.object([&] {
+    j.attribute("modified_pp_source", ppModPath);
+    j.attribute("refolded_output", modifiedSrcPath);
+
+    j.attributeArray("edits", [&] {
+      for (const MaterializedEditMapping &m : mappings) {
+        j.object([&] {
+          j.attributeObject("modified_pp_byte_range", [&] {
+            writeByteRangeObject(j, m.modifiedPreprocessedBegin,
+                                 m.modifiedPreprocessedEnd);
+          });
+          j.attributeObject("refolded_output_byte_range", [&] {
+            writeByteRangeObject(j, m.refoldedSourceBegin, m.refoldedSourceEnd);
+          });
+        });
+      }
+    });
+  });
+
+  os << '\n';
+  os.close();
+}
+
 } // end anonymous namespace
 
 // ------------------------- Command-Line Options ------------------------------
@@ -1137,6 +1186,12 @@ static cl::opt<std::string> ModifiedSrcPath(
 static cl::alias ModifiedSrcPathShort("o", cl::desc("Alias for --out"),
                                       cl::aliasopt(ModifiedSrcPath),
                                       cl::cat(RefoldCategory));
+
+static cl::opt<std::string> EmitEditMapPath(
+    "emit-edit-map",
+    cl::desc("Path to write materialized edit map JSON containing "
+             "B-to-refolded-output byte ranges"),
+    cl::value_desc("file"), cl::cat(RefoldCategory));
 
 static cl::opt<std::string> CheckSrcPath(
     "check", // long name: --check
@@ -1223,18 +1278,22 @@ int main(int argc, char **argv) {
   requireExactlyOnce("--refold-map", RefoldJSONPath);
   requireExactlyOnce("--pp-mod", PPModPath);
 
+  const bool emitEditMap = EmitEditMapPath.getNumOccurrences() != 0;
+
   if (onlyCheck) {
     requireExactlyOnce("--check", CheckSrcPath);
     // Verify mode.
     if (PPPath.getNumOccurrences() != 0 ||
-        ModifiedSrcPath.getNumOccurrences() != 0) {
+        ModifiedSrcPath.getNumOccurrences() != 0 || emitEditMap) {
       fatal("cli", "invalid option combination: --check cannot be used with "
-                   "--pp or --out");
+                   "--pp, --out, or --emit-edit-map");
     }
   } else {
     // Refold mode.
     requireExactlyOnce("--pp", PPPath);
     requireExactlyOnce("--out", ModifiedSrcPath);
+    if (emitEditMap && EmitEditMapPath.getValue().empty())
+      fatal("cli", "--emit-edit-map requires a non-empty output path");
   }
 
   // Parse and validate the refold map JSON file.
@@ -1344,9 +1403,11 @@ int main(int argc, char **argv) {
   }
 
   // Default behavior: single refold.
+  std::vector<MaterializedEditMapping> materializedEditMappings;
   auto refoldedOrErr = RefoldEngine::Refold(
       rootJson, aBytes, aToks, aTokByteOff, bBytes, bToks, bTokByteOff,
-      NoLines, StrictMode);
+      NoLines, StrictMode,
+      emitEditMap ? &materializedEditMappings : nullptr);
   if (!refoldedOrErr) {
     handleAllErrors(refoldedOrErr.takeError(), [&](const ErrorInfoBase &e) {
       fatal("model", "failed to parse refold model: {0}", e.message());
@@ -1362,5 +1423,12 @@ int main(int argc, char **argv) {
   os << *refoldedOrErr;
   os.close();
   info("finished", "wrote refolded C source: {0}", ModifiedSrcPath);
+
+  if (emitEditMap) {
+    writeMaterializedEditMap(EmitEditMapPath.getValue(), PPModPath,
+                             ModifiedSrcPath, materializedEditMappings);
+    info("finished", "wrote materialized edit map: {0}",
+         EmitEditMapPath.getValue());
+  }
   return 0;
 }
