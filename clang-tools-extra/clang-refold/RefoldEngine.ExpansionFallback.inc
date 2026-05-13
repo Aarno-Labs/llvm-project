@@ -1558,8 +1558,12 @@ static std::optional<std::string> simpleLineControlMacroReplacementText(
   }
 
   StringRef replacement = text.substr(pos).trim(" \t\v\f\r\n");
-  if (replacement.empty())
-    return std::nullopt;
+
+  // An empty replacement list is a legitimate zero-token macro expansion.  In
+  // a source-only line-control gap it can expose the real directive operands,
+  // for example `#line EMPTY 123 "file"`.  Keep the substitution explicit and
+  // let the final strict line-control parser decide whether deleting the
+  // invocation produces a valid directive.
 
   // Multi-line replacement lists and line continuations require a real macro
   // expansion model for directive operands.  Keep this proof to one recorded
