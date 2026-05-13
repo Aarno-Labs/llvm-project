@@ -2851,19 +2851,36 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                         },
                         [](const HeaderPreservedGapPiece &outer,
                            const HeaderPreservedGapPiece &piece) {
-                          if (outer.kind == piece.kind &&
-                              (outer.kind == HeaderPreservedGapPiece::Kind::
-                                                 ZeroTokenConditionalGroup ||
-                               outer.kind == HeaderPreservedGapPiece::Kind::
-                                                 ZeroTokenMacroInvocation)) {
-                            // Nested zero-token conditional groups and nested
-                            // zero-token macro invocations are consumed by
-                            // their outer proof piece. Once the outer source
-                            // interval is proved neutral, keeping the inner
-                            // record as a separate tiling piece would only
-                            // double-count the same bytes.
+                          if (outer.kind == HeaderPreservedGapPiece::Kind::
+                                                ZeroTokenMacroInvocation &&
+                              piece.kind == HeaderPreservedGapPiece::Kind::
+                                                ZeroTokenMacroInvocation) {
+                            // Nested zero-token macro invocations are already
+                            // part of the outer invocation's source-neutral
+                            // proof. Preserve only the outer callsite text so
+                            // the refolded header does not duplicate the same
+                            // gap structure.
                             return true;
                           }
+
+                          if (outer.kind == HeaderPreservedGapPiece::Kind::
+                                                ZeroTokenConditionalGroup) {
+                            // A preserved complete conditional group owns every
+                            // artifact inside its source island after the
+                            // shared conditional-island proof has discharged
+                            // those artifacts. This includes nested conditional
+                            // records, zero-token macro calls, zero-token or
+                            // state-preserving child includes, and direct
+                            // macro-state directives in selected arms.
+                            //
+                            // Without this ownership rule, the gap tiler would
+                            // see both the outer #if/#endif island and its
+                            // already-proved child include/directive pieces as
+                            // overlapping top-level proof pieces, reject the
+                            // header envelope, and fall back to raw B.
+                            return true;
+                          }
+
                           return false;
                         },
                         [&](uint64_t begin, uint64_t end) {

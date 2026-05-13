@@ -3498,33 +3498,25 @@ std::string RefoldEngine::RunSinglePassRefold() {
     return outermostOwningIncludeSiteInTU(directive.ownerIncludeId);
   };
 
-  // Return true when a final TU edit carries this include directive forward
-  // instead of deleting it.  Include-owned macro-state directives are consumed
-  // only if the owning include site disappears from the emitted TU stream.
-  //
-  // A TU replacement may cover the include site's original bytes while also
-  // preserving that include directive as part of a source island, for example a
-  // preserved conditional gap.  In that case descendants such as #define/#undef
-  // lines inside the header remain live through the include and must not be
-  // repaired again by hoisting their directive text into the TU.
-  auto includeSitePreservedByFinalTUEdit =
-      [&](const RefoldModel::IncludeItem &inc) {
-    std::optional<size_t> editIndex =
-        finalTUEditContainingInterval(inc.siteB, inc.siteE);
-    if (!editIndex)
-      return false;
+  auto includeDirectiveText = [&](const RefoldModel::IncludeItem &inc)
+      -> StringRef {
+    if (!inc.text.empty())
+      return inc.text;
+    if (PathsEqual(inc.sitePath, tuPath) && inc.siteE <= tuBytes.size())
+      return tuBytes.slice(inc.siteB, inc.siteE);
+    return StringRef();
+  };
 
-    const TextEdit &edit = tuEdits[*editIndex];
-    StringRef directiveText = inc.text;
-    if (directiveText.empty())
-      directiveText = tuBytes.slice(inc.siteB, inc.siteE);
+  // Match a real preserved directive line, not an arbitrary occurrence of the
+  // same bytes in replacement payload text.  The preserved include may be nested
+  // under a carried-forward #if/#endif island, but the directive must still begin
+  // at physical BOL modulo horizontal whitespace.
+  auto includeDirectiveAppearsAtLineStart =
+      [&](const TextEdit &edit, const RefoldModel::IncludeItem &inc) {
+    StringRef directiveText = includeDirectiveText(inc);
     if (directiveText.empty())
       return false;
 
-    // Match a real preserved directive line, not an arbitrary occurrence of the
-    // same bytes in replacement payload text.  The preserved include may be
-    // nested under a carried-forward #if/#endif island, but the directive must
-    // still begin at physical BOL modulo horizontal whitespace.
     auto atDirectiveLineStart = [](StringRef replacement, size_t pos) {
       size_t lineBegin = replacement.rfind('\n', pos);
       lineBegin = lineBegin == StringRef::npos ? 0 : lineBegin + 1;
@@ -3544,6 +3536,58 @@ std::string RefoldEngine::RunSinglePassRefold() {
     return false;
   };
 
+  // Return true when a final TU edit carries this include directive forward
+  // instead of deleting it.  Include-owned macro-state directives are consumed
+  // only if the owning include site disappears from the emitted TU stream.
+  //
+  // A TU replacement may cover the include site's original bytes while also
+  // preserving that include directive as part of a source island, for example a
+  // preserved conditional gap.  In that case descendants such as #define/#undef
+  // lines inside the header remain live through the include and must not be
+  // repaired again by hoisting their directive text into the TU.
+  auto includeSitePreservedByFinalTUEdit =
+      [&](const RefoldModel::IncludeItem &inc) {
+    std::optional<size_t> editIndex =
+        finalTUEditContainingInterval(inc.siteB, inc.siteE);
+    if (!editIndex)
+      return false;
+    return includeDirectiveAppearsAtLineStart(tuEdits[*editIndex], inc);
+  };
+
+  auto includeAncestrySitePreservedByFinalTUEdit =
+      [&](const RefoldModel::MacroDirective &directive) {
+    if (!directive.ownerIncludeId)
+      return false;
+
+    const RefoldModel::IncludeItem *outerTU =
+        outermostOwningIncludeSiteInTU(directive.ownerIncludeId);
+    if (!outerTU)
+      return false;
+
+    std::optional<size_t> editIndex =
+        finalTUEditContainingInterval(outerTU->siteB, outerTU->siteE);
+    if (!editIndex)
+      return false;
+    const TextEdit &edit = tuEdits[*editIndex];
+
+    // Header materialization may remove the outer TU #include while preserving
+    // a descendant include directive in the materialized replacement text.  Walk
+    // from the directive's immediate owning include toward the TU include; if
+    // any include in that ancestry is carried forward as a directive line, then
+    // the macro-state transition remains available through source order and must
+    // not be repaired by hoisting the header directive into the TU.
+    const RefoldModel::IncludeItem *cur =
+        model_.GetIncludeById(*directive.ownerIncludeId);
+    while (cur) {
+      if (includeDirectiveAppearsAtLineStart(edit, *cur))
+        return true;
+      if (!cur->parent)
+        break;
+      cur = model_.GetIncludeById(*cur->parent);
+    }
+    return false;
+  };
+
   // Return the final TU edit that fully consumes this macro-state directive.
   // TU-spelled directives are matched by their own byte range.  Include-owned
   // directives are matched by the owning include site, since that is the source
@@ -3555,6 +3599,9 @@ std::string RefoldEngine::RunSinglePassRefold() {
           -> std::optional<size_t> {
     if (PathsEqual(directive.sitePath, tuPath))
       return finalTUEditContainingInterval(directive.siteB, directive.siteE);
+
+    if (includeAncestrySitePreservedByFinalTUEdit(directive))
+      return std::nullopt;
 
     if (const RefoldModel::IncludeItem *inc = owningIncludeSiteInTU(directive)) {
       if (includeSitePreservedByFinalTUEdit(*inc))
@@ -3573,6 +3620,9 @@ std::string RefoldEngine::RunSinglePassRefold() {
       [&](const RefoldModel::MacroDirective &directive) {
     if (PathsEqual(directive.sitePath, tuPath))
       return intervalOverlapsFinalTUEdit(directive.siteB, directive.siteE);
+
+    if (includeAncestrySitePreservedByFinalTUEdit(directive))
+      return false;
 
     if (const RefoldModel::IncludeItem *inc = owningIncludeSiteInTU(directive)) {
       if (includeSitePreservedByFinalTUEdit(*inc))
