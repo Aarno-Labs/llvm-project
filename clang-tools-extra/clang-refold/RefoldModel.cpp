@@ -764,6 +764,9 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
             asOptUInt64(*obj, "inv_pp_byte_end");
         std::optional<uint64_t> ownerIncludeId =
             asOptUInt64(*obj, "owner_include_id");
+        std::optional<uint64_t> definitionDirectiveId =
+            asOptUInt64(*obj, "definition_directive_id",
+                        /*canBeNull=*/true);
         std::vector<MacroDefParam> defParams;
         if (auto ParamsArr =
                 asOptArray(*obj, "def_params", /*allowNull=*/true)) {
@@ -1218,6 +1221,7 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
                            /*invPPByteBegin*/ invPPByteBegin,
                            /*invPPByteEnd*/ invPPByteEnd,
                            /*ownerIncludeId*/ ownerIncludeId,
+                           /*definitionDirectiveId*/ definitionDirectiveId,
                            /*defParams*/ std::move(defParams),
                            /*invArgRanges*/ std::move(invArgRanges),
                            /*normalizedInvArgTextRanges*/
