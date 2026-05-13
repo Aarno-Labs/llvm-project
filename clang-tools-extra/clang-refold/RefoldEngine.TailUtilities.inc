@@ -513,11 +513,18 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
   };
 
   struct HeaderPreservedGapPiece {
-    enum class Kind { MacroStateDirective, ZeroTokenConditionalGroup };
+    enum class Kind {
+      MacroStateDirective,
+      ZeroTokenConditionalGroup,
+      ZeroTokenMacroInvocation,
+      ZeroTokenChildInclude
+    };
 
     Kind kind = Kind::MacroStateDirective;
     const RefoldModel::MacroDirective *directive = nullptr;
     const RefoldModel::CondGroup *group = nullptr;
+    const RefoldModel::MacroInvocation *macro = nullptr;
+    const RefoldModel::IncludeItem *include = nullptr;
     uint64_t begin = 0;
     uint64_t end = 0;
     uint64_t id = 0;
@@ -727,12 +734,390 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
   };
 
   auto preservedGapPieceText = [&](const HeaderPreservedGapPiece &piece) {
+    // Macro-state directives are preserved from the producer's recorded text so
+    // spelling such as leading whitespace and line continuations matches the
+    // directive record, not a best-effort slice reconstructed from ownership.
     if (piece.kind == HeaderPreservedGapPiece::Kind::MacroStateDirective &&
         piece.directive)
       return piece.directive->text.str();
+
+    // Other preserved gap pieces are source intervals in the materialized
+    // header buffer.  Require a valid in-buffer range before copying bytes into
+    // the replacement payload.
     if (piece.end <= headerText.size() && piece.begin <= piece.end)
       return StringRef(headerText).slice(piece.begin, piece.end).str();
     return std::string();
+  };
+
+  // File-byte interval for the replacement list of the #define that created a
+  // header macro invocation.  The interval starts after the macro name and
+  // parameter list, because only the replacement list must be tiled by nested
+  // zero-token invocations and trivia.
+  struct HeaderMacroReplacementList {
+    const RefoldModel::MacroDirective *directive = nullptr;
+    size_t nameTextBegin = 0;
+    size_t replacementTextBegin = 0;
+    uint64_t fileBase = 0;
+    uint64_t fileBegin = 0;
+    uint64_t fileEnd = 0;
+  };
+
+  auto findHeaderMacroDefinitionDirective =
+      [&](const RefoldModel::MacroInvocation &m)
+          -> const RefoldModel::MacroDirective * {
+    // The producer records the defining directive id for macro invocations.
+    // Treat a missing/stale reference as unproved instead of guessing by name.
+    if (!m.definitionDirectiveId)
+      return nullptr;
+    for (const auto &directive : model_.GetMacroDirectives())
+      if (directive.id == *m.definitionDirectiveId)
+        return &directive;
+    return nullptr;
+  };
+
+  // Parse the defining #define enough to recover the replacement-list source
+  // interval.  Header zero-token macro gaps use this to prove that a wrapper
+  // invocation's replacement list is tiled only by nested zero-token calls and
+  // trivia, rather than by unrecorded source-bearing replacement text.
+  auto headerMacroDefinitionReplacementList =
+      [&](const RefoldModel::MacroInvocation &m)
+          -> std::optional<HeaderMacroReplacementList> {
+    const RefoldModel::MacroDirective *definition =
+        findHeaderMacroDefinitionDirective(m);
+    if (!definition || definition->subkind != "#define")
+      return std::nullopt;
+
+    StringRef text = definition->text;
+    size_t pos = 0;
+
+    // Validate the directive spelling rather than assuming MacroDirective::text
+    // is well-formed.  This keeps the zero-token proof fail-closed if the
+    // producer ever records an unexpected directive form.
+    stringutils::skipNonNewlineWs(text, pos);
+    if (pos >= text.size() || text[pos] != '#')
+      return std::nullopt;
+    ++pos;
+    stringutils::skipNonNewlineWs(text, pos);
+
+    if (!text.substr(pos).starts_with("define"))
+      return std::nullopt;
+    pos += StringRef("define").size();
+    if (pos < text.size() && stringutils::isIdentPart(text[pos]))
+      return std::nullopt;
+    stringutils::skipNonNewlineWs(text, pos);
+
+    // siteB is anchored at the macro name, so remember the name's offset in
+    // directive.text.  That lets us translate replacement-list offsets back to
+    // file bytes and byte-verify nested invocation callsites.
+    const size_t nameTextBegin = pos;
+    if (!text.substr(pos).starts_with(m.name))
+      return std::nullopt;
+    pos += m.name.size();
+    if (pos < text.size() && stringutils::isIdentPart(text[pos]))
+      return std::nullopt;
+
+    if (m.subkind == "func") {
+      // Function-like macros may have parameters between the name and the
+      // replacement list.  Skip the balanced parameter list so fileBegin lands
+      // on the first byte that can contribute replacement-list source.
+      if (pos >= text.size() || text[pos] != '(')
+        return std::nullopt;
+      unsigned depth = 0;
+      while (pos < text.size()) {
+        char ch = text[pos++];
+        if (ch == '(') {
+          ++depth;
+          continue;
+        }
+        if (ch == ')') {
+          if (depth == 0)
+            return std::nullopt;
+          --depth;
+          if (depth == 0)
+            break;
+        }
+      }
+      if (depth != 0)
+        return std::nullopt;
+    }
+
+    if (definition->siteB < nameTextBegin)
+      return std::nullopt;
+
+    HeaderMacroReplacementList result;
+    result.directive = definition;
+    result.nameTextBegin = nameTextBegin;
+    result.replacementTextBegin = pos;
+    // Convert directive.text-local offsets into materialized header bytes.
+    // siteE bounds the complete directive line recorded by the producer.
+    result.fileBase = definition->siteB - nameTextBegin;
+    result.fileBegin = result.fileBase + pos;
+    result.fileEnd = definition->siteE;
+    if (result.fileBegin > result.fileEnd ||
+        result.fileEnd > result.fileBase + text.size())
+      return std::nullopt;
+    return result;
+  };
+
+  auto headerMacroInvocationHasMaterializedPPTokens =
+      [&](const RefoldModel::MacroInvocation &m) -> bool {
+    // Any materialized expansion, stringify, or paste span means this invocation
+    // is not a source-neutral gap.  Such invocations must be represented by
+    // normal macro realization machinery, not by copying their callsite through
+    // a header gap.
+    if (m.cover.IsValid())
+      return true;
+    for (const auto &span : m.stringifySpans)
+      if (span.IsValid())
+        return true;
+    for (const auto &span : m.pasteSpans)
+      if (span.IsValid())
+        return true;
+    return false;
+  };
+
+  std::function<bool(const RefoldModel::MacroInvocation &,
+                     DenseSet<uint64_t> &)>
+      headerMacroInvocationIsSourceNeutralZeroTokenImpl;
+  headerMacroInvocationIsSourceNeutralZeroTokenImpl =
+      [&](const RefoldModel::MacroInvocation &m,
+          DenseSet<uint64_t> &visiting) -> bool {
+    // A zero-token invocation must be token-neutral at every recorded expansion
+    // boundary.  Cycles are rejected even though real preprocessing would have
+    // disabled recursive expansion, because the source-neutral proof needs a
+    // finite acyclic tiling of replacement-list bytes.
+    if (headerMacroInvocationHasMaterializedPPTokens(m))
+      return false;
+    if (!visiting.insert(m.id).second)
+      return false;
+
+    auto finish = [&](bool result) {
+      visiting.erase(m.id);
+      return result;
+    };
+
+    std::optional<HeaderMacroReplacementList> replacement =
+        headerMacroDefinitionReplacementList(m);
+    if (!replacement)
+      return finish(false);
+
+    struct ChildPiece {
+      uint64_t begin = 0;
+      uint64_t end = 0;
+      const RefoldModel::MacroInvocation *child = nullptr;
+    };
+
+    SmallVector<ChildPiece, 8> children;
+    for (const auto &candidate : model_.GetMacroInvocations()) {
+      // Nested macro invocations are the only non-trivia source allowed in the
+      // replacement list.  Require them to be direct children of this expansion
+      // and to live within the defining directive's replacement-list interval.
+      if (!candidate.callerMacroId || *candidate.callerMacroId != m.id)
+        continue;
+      if (!candidate.invFile || candidate.invFile->empty() ||
+          !candidate.invB || !candidate.invE || *candidate.invB >= *candidate.invE)
+        return finish(false);
+      if (!PathsEqual(*candidate.invFile, replacement->directive->sitePath))
+        return finish(false);
+      if (*candidate.invB < replacement->fileBegin ||
+          replacement->fileEnd < *candidate.invE)
+        return finish(false);
+      children.push_back({*candidate.invB, *candidate.invE, &candidate});
+    }
+
+    // Tile the replacement list from left to right.  Sorting gives deterministic
+    // overlap detection and ensures every byte between child invocations is
+    // checked as trivia/comment-only source.
+    llvm::sort(children, [](const ChildPiece &lhs, const ChildPiece &rhs) {
+      if (lhs.begin != rhs.begin)
+        return lhs.begin < rhs.begin;
+      if (lhs.end != rhs.end)
+        return lhs.end < rhs.end;
+      return lhs.child->id < rhs.child->id;
+    });
+
+    uint64_t cursor = replacement->fileBegin;
+    for (const ChildPiece &piece : children) {
+      // Overlapping children or source-bearing text between children defeats the
+      // proof.  Each child must recursively prove that it also expands to no PP
+      // material.
+      if (piece.begin < cursor)
+        return finish(false);
+      const size_t gapBegin =
+          static_cast<size_t>(cursor - replacement->fileBase);
+      const size_t gapEnd =
+          static_cast<size_t>(piece.begin - replacement->fileBase);
+      if (!isWsOrCompleteCommentTrivia(
+              replacement->directive->text.slice(gapBegin, gapEnd)))
+        return finish(false);
+      if (!headerMacroInvocationIsSourceNeutralZeroTokenImpl(*piece.child,
+                                                            visiting))
+        return finish(false);
+      cursor = piece.end;
+    }
+
+    // After the last nested zero-token invocation, the remaining replacement
+    // list suffix must also be trivia-only.  Otherwise the macro has unmodeled
+    // source-bearing replacement text and cannot be copied as a neutral gap.
+    const size_t suffixBegin =
+        static_cast<size_t>(cursor - replacement->fileBase);
+    StringRef suffix = replacement->directive->text.slice(
+        suffixBegin, replacement->directive->text.size());
+    return finish(isWsOrCompleteCommentTrivia(suffix));
+  };
+
+  auto headerMacroInvocationIsPreservableGap =
+      [&](const RefoldModel::MacroInvocation &m, uint64_t gapBegin,
+          uint64_t gapEnd) -> bool {
+    // The invocation must be physically spelled in this materialized header gap
+    // and owned by the include instance currently being rewritten.
+    if (!m.invFile || m.invFile->empty() || !PathsEqual(*m.invFile, file))
+      return false;
+    if (!m.ownerIncludeId || *m.ownerIncludeId != ie.include->id)
+      return false;
+    if (!m.invB || !m.invE || *m.invB >= *m.invE)
+      return false;
+    if (*m.invB < gapBegin || gapEnd < *m.invE)
+      return false;
+    if (*m.invE > headerText.size())
+      return false;
+    // Byte-verify the recorded callsite text before preserving it.  This keeps
+    // stale or ambiguous refold-map offsets from authorizing a source copy.
+    if (m.invText && StringRef(headerText).slice(*m.invB, *m.invE) != *m.invText)
+      return false;
+
+    DenseSet<uint64_t> visiting;
+    return headerMacroInvocationIsSourceNeutralZeroTokenImpl(m, visiting);
+  };
+
+  auto headerIncludeIsDescendantOf =
+      [&](const RefoldModel::IncludeItem &candidate,
+          const RefoldModel::IncludeItem &root) -> bool {
+    // Walk producer include-parent links rather than inferring ancestry from
+    // paths.  Multiple include instances of the same file may exist, and the
+    // preservation proof is instance-specific.
+    std::optional<uint64_t> cur = candidate.parent;
+    while (cur) {
+      if (*cur == root.id)
+        return true;
+      const RefoldModel::IncludeItem *parent = nullptr;
+      for (const auto &inc : model_.GetIncludes())
+        if (inc.id == *cur) {
+          parent = &inc;
+          break;
+        }
+      if (!parent)
+        return false;
+      cur = parent->parent;
+    }
+    return false;
+  };
+
+  auto macroDirectiveNameFromRecordedText =
+      [&](const RefoldModel::MacroDirective &directive)
+          -> std::optional<std::string> {
+    // Only macro-state transitions matter for replacement-payload exposure.
+    // Other directives in a zero-token include subtree are irrelevant here.
+    if (directive.subkind != "#define" && directive.subkind != "#undef")
+      return std::nullopt;
+    return parseHeaderMacroStateDirectiveName(directive.text,
+                                              directive.subkind);
+  };
+
+  auto headerZeroTokenChildIncludeIsPreservableGap =
+      [&](const RefoldModel::IncludeItem &child, uint64_t gapBegin,
+          uint64_t gapEnd, StringRef replacement) -> bool {
+    // Preserve only complete direct child include directives spelled in the
+    // current parent header gap.  Nested descendants are checked below as part
+    // of proving that the entire child include subtree is token-neutral.
+    if (!child.parent || *child.parent != ie.include->id)
+      return false;
+    if (!PathsEqual(child.sitePath, file))
+      return false;
+    if (child.siteB >= child.siteE || child.siteE > headerText.size())
+      return false;
+    if (child.siteB < gapBegin || gapEnd < child.siteE)
+      return false;
+    if (child.cover.IsValid())
+      return false;
+    if (child.text.empty() ||
+        StringRef(headerText).slice(child.siteB, child.siteE) != child.text)
+      return false;
+
+    // A zero-token include subtree may contain nested include directives, but
+    // none of those descendants may contribute materialized PP tokens.
+    for (const auto &inc : model_.GetIncludes()) {
+      if (&inc == &child)
+        continue;
+      if (!headerIncludeIsDescendantOf(inc, child))
+        continue;
+      if (inc.cover.IsValid())
+        return false;
+    }
+
+    for (const auto &macro : model_.GetMacroInvocations()) {
+      // Macro calls inside the include subtree are allowed only when they are
+      // themselves zero-token.  Any expansion, paste, or stringify output means
+      // the include is not a neutral gap owner.
+      if (!macro.ownerIncludeId)
+        continue;
+      bool ownedByChild = *macro.ownerIncludeId == child.id;
+      if (!ownedByChild)
+        for (const auto &inc : model_.GetIncludes())
+          if (inc.id == *macro.ownerIncludeId &&
+              headerIncludeIsDescendantOf(inc, child)) {
+            ownedByChild = true;
+            break;
+          }
+      if (ownedByChild && headerMacroInvocationHasMaterializedPPTokens(macro))
+        return false;
+    }
+
+    for (const auto &group : model_.GetConds()) {
+      // Conditional groups inside the include subtree are acceptable only if no
+      // selected arm produced PP material.  Otherwise preserving the include as
+      // a zero-token gap would silently discard live conditional output.
+      if (!group.parentIncludeId)
+        continue;
+      bool ownedByChild = *group.parentIncludeId == child.id;
+      if (!ownedByChild)
+        for (const auto &inc : model_.GetIncludes())
+          if (inc.id == *group.parentIncludeId &&
+              headerIncludeIsDescendantOf(inc, child)) {
+            ownedByChild = true;
+            break;
+          }
+      if (!ownedByChild)
+        continue;
+      for (const RefoldModel::CondArm &arm : group.arms)
+        if (arm.span && arm.span->IsValid() && arm.span->begin < arm.span->end)
+          return false;
+    }
+
+    for (const auto &directive : model_.GetMacroDirectives()) {
+      // Macro-state transitions in a preserved zero-token include become visible
+      // after the replacement payload is emitted.  Reject the preservation if
+      // the B-derived replacement text mentions that macro name, because then
+      // moving the transition could change how the replacement preprocesses.
+      if (!directive.ownerIncludeId)
+        continue;
+      bool ownedByChild = *directive.ownerIncludeId == child.id;
+      if (!ownedByChild)
+        for (const auto &inc : model_.GetIncludes())
+          if (inc.id == *directive.ownerIncludeId &&
+              headerIncludeIsDescendantOf(inc, child)) {
+            ownedByChild = true;
+            break;
+          }
+      if (!ownedByChild)
+        continue;
+      std::optional<std::string> name =
+          macroDirectiveNameFromRecordedText(directive);
+      if (name && rawIdentifierAppearsInHeaderReplacement(*name, replacement))
+        return false;
+    }
+
+    return true;
   };
 
   auto replacementHeaderSuffixBoundaryAllowsDirectiveLine =
@@ -1459,6 +1844,32 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
             gapPieces.push_back(std::move(piece));
           }
 
+          for (const auto &macro : model_.GetMacroInvocations()) {
+            if (!headerMacroInvocationIsPreservableGap(macro, gapBegin,
+                                                       gapEnd))
+              continue;
+            HeaderPreservedGapPiece piece;
+            piece.kind = HeaderPreservedGapPiece::Kind::ZeroTokenMacroInvocation;
+            piece.macro = &macro;
+            piece.begin = *macro.invB;
+            piece.end = *macro.invE;
+            piece.id = macro.id;
+            gapPieces.push_back(std::move(piece));
+          }
+
+          for (const auto &child : model_.GetIncludes()) {
+            if (!headerZeroTokenChildIncludeIsPreservableGap(
+                    child, gapBegin, gapEnd, StringRef(materialInsertBytes)))
+              continue;
+            HeaderPreservedGapPiece piece;
+            piece.kind = HeaderPreservedGapPiece::Kind::ZeroTokenChildInclude;
+            piece.include = &child;
+            piece.begin = child.siteB;
+            piece.end = child.siteE;
+            piece.id = child.id;
+            gapPieces.push_back(std::move(piece));
+          }
+
           llvm::sort(gapPieces,
                      [](const HeaderPreservedGapPiece &lhs,
                         const HeaderPreservedGapPiece &rhs) {
@@ -1481,11 +1892,16 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
 
             const HeaderPreservedGapPiece &outer = outerGapPieces.back();
             if (outer.begin <= piece.begin && piece.end <= outer.end &&
-                outer.kind ==
-                    HeaderPreservedGapPiece::Kind::ZeroTokenConditionalGroup &&
-                piece.kind ==
-                    HeaderPreservedGapPiece::Kind::ZeroTokenConditionalGroup)
+                outer.kind == piece.kind &&
+                (outer.kind == HeaderPreservedGapPiece::Kind::ZeroTokenConditionalGroup ||
+                 outer.kind == HeaderPreservedGapPiece::Kind::ZeroTokenMacroInvocation)) {
+              // Nested zero-token conditional groups and nested zero-token
+              // macro invocations are consumed by their outer proof piece. Once
+              // the outer source interval is proved neutral, keeping the inner
+              // record as a separate tiling piece would only double-count the
+              // same bytes.
               continue;
+            }
 
             canUseFullHeaderEnvelope = false;
             break;
