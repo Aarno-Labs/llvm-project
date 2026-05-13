@@ -990,9 +990,14 @@ static std::optional<std::string> substituteLineControlMacroParameters(
   if (params.size() != invocationArgTexts.size())
     return std::nullopt;
 
-  for (const RefoldModel::MacroDefParam &param : params)
-    if (param.variadic)
-      return std::nullopt;
+  // Variadic formals are safe to substitute in this bounded proof when the
+  // producer recorded exactly one argument spelling for the variadic tail.
+  // That is the same shape used by the normal macro machinery: `__VA_ARGS__`
+  // or a named GNU variadic formal behaves like another formal whose argument
+  // range covers the complete tail spelling, including any top-level commas.
+  // We do not try to interpret the tail here; the rewritten directive is still
+  // parsed by the strict line-control parser, which rejects invalid comma
+  // sequences, empty operands, or any unsupported result.
 
   auto lookupParam = [&](StringRef ident) -> std::optional<StringRef> {
     for (size_t i = 0; i != params.size(); ++i)
@@ -1224,9 +1229,10 @@ static std::optional<std::string> substituteLineControlMacroParameters(
 /// callsites whose replacement list is spelled directly in the recorded #define
 /// text.  For function-like macros with parameters, direct formal-token
 /// substitution, conservative `# formal` stringification, and producer-witnessed
-/// `##` paste runs are allowed; variadics, comments, multiline replacement
-/// lists, and any resulting non-line-control spelling fail closed when the
-/// strict parser is re-run on the rewritten directive line.
+/// `##` paste runs are allowed.  Variadic formals use the producer-recorded
+/// tail argument as an ordinary substitution operand; comments, multiline
+/// replacement lists, and any resulting non-line-control spelling fail closed
+/// when the strict parser is re-run on the rewritten directive line.
 static std::optional<std::string> simpleLineControlMacroReplacementText(
     const RefoldModel &model, const RefoldModel::MacroInvocation &macro,
     ArrayRef<StringRef> invocationArgTexts) {
@@ -1511,7 +1517,10 @@ expandLineControlMacroReplacementText(
 /// splices, and whose replacement text is recovered from a simple recorded
 /// #define.  Partial callsites, nested/overlapping source ranges, unsupported
 /// parameterized replacement semantics, and unrecorded expansions all fail
-/// closed.
+/// closed.  Variadic formals are allowed only as ordinary recorded argument
+/// substitutions: the producer has already collapsed the variadic tail into the
+/// matching argument range, and the final strict line-control parse remains the
+/// authority on whether the substituted spelling is a valid directive operand.
 static std::optional<SourceLineDirectiveLogicalLineRewrite>
 rewriteSourceLineDirectiveLogicalLineMacros(
     const RefoldModel &model, StringRef file, StringRef logicalLine,
