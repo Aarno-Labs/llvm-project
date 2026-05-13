@@ -4635,16 +4635,23 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
 
     // The group itself is preserved, but do not treat it as an opaque proof box
     // if the producer recorded active source artifacts inside an arm body.
-    // Include directives, macro-state directives, and pragmas may affect later
-    // preprocessing state, so any recorded instance still blocks this narrow
-    // preservation proof.  Macro invocations are compositional: control-line
-    // uses are preserved with the directive spelling, and arm-body uses are
-    // admissible only when they independently prove source-neutral zero-token
-    // behavior.  That is the complete invariant for a neutral conditional
-    // island: every selected-arm artifact must itself be neutral.
-    for (const auto &inc : model_.GetIncludes())
-      if (PathsEqual(inc.sitePath, tuPath) && insideGroup(inc.siteB, inc.siteE))
-        return false;
+    // Include directives are compositional: an arm-body include is admissible
+    // only when the existing zero-token include-subtree proof says it produced
+    // no PP material and has no unhandled side effect.  Since the whole
+    // conditional island is copied forward, the include directive is not hidden
+    // or deleted; this check only proves that it is neutral with respect to the
+    // edited token envelope.  Macro invocations follow the same rule below.
+    // Macro-state directives and pragmas still block this narrow proof until
+    // they get their own selected-arm neutrality model.
+    for (const auto &inc : model_.GetIncludes()) {
+      if (!PathsEqual(inc.sitePath, tuPath) ||
+          !insideGroup(inc.siteB, inc.siteE))
+        continue;
+      if (insideAnyArmBody(inc.siteB, inc.siteE) && !inc.cover.IsValid() &&
+          !includeHasRecordedSideEffects(inc))
+        continue;
+      return false;
+    }
     for (const auto &directive : model_.GetMacroDirectives())
       if (PathsEqual(directive.sitePath, tuPath) &&
           insideGroup(directive.siteB, directive.siteE))
@@ -4763,12 +4770,21 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       return false;
     };
 
-    // Includes, macro-state directives, and pragmas inside the group are not
-    // zero-token control-line spelling.  They can affect the suffix even when
-    // they do not produce ordinary PP tokens, so they need a separate proof.
-    for (const auto &inc : model_.GetIncludes())
-      if (PathsEqual(inc.sitePath, tuPath) && insideGroup(inc.siteB, inc.siteE))
-        return false;
+    // Includes in selected arm bodies are compositional neutral artifacts, just
+    // like zero-token macro invocations: if the include subtree produced no PP
+    // material and has no unhandled recorded side effect, preserving the whole
+    // conditional island preserves the include directive at its original source
+    // position instead of hiding or deleting it.  Includes outside arm bodies or
+    // includes that fail the zero-token subtree proof remain source-bearing.
+    for (const auto &inc : model_.GetIncludes()) {
+      if (!PathsEqual(inc.sitePath, tuPath) ||
+          !insideGroup(inc.siteB, inc.siteE))
+        continue;
+      if (insideAnyArmBody(inc.siteB, inc.siteE) && !inc.cover.IsValid() &&
+          !includeHasRecordedSideEffects(inc))
+        continue;
+      return false;
+    }
     for (const auto &directive : model_.GetMacroDirectives())
       if (PathsEqual(directive.sitePath, tuPath) &&
           insideGroup(directive.siteB, directive.siteE))

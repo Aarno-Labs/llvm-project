@@ -678,6 +678,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
 
   std::function<bool(const RefoldModel::MacroInvocation &)>
       headerMacroInvocationIsSourceNeutralZeroToken;
+  std::function<bool(const RefoldModel::IncludeItem &)>
+      headerIncludeIsSourceNeutralZeroToken;
 
   // Return true iff a recorded conditional group in this materialized header
   // can be preserved as a complete zero-token gap piece. This is the
@@ -719,13 +721,23 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     };
 
     // Do not hide recorded active source artifacts inside an opaque preserved
-    // conditional group. Inactive-arm text is normally not recorded by the
-    // producer; recorded includes/directives/pragmas require their own proof and
-    // therefore block this zero-token gap class.
-    for (const auto &inc : model_.GetIncludes())
-      if (PathsEqual(inc.sitePath, file) && inc.parent &&
-          *inc.parent == ie.include->id && insideGroup(inc.siteB, inc.siteE))
-        return false;
+    // conditional group.  Arm-body includes are allowed only when they
+    // independently discharge the header zero-token include-subtree proof; then
+    // preserving the complete conditional island keeps the include directive
+    // visible at its original source position while proving that it contributes
+    // no PP material.  Directives/pragmas and non-neutral includes still block
+    // this narrow proof.
+    for (const auto &inc : model_.GetIncludes()) {
+      if (!PathsEqual(inc.sitePath, file) || !inc.parent ||
+          *inc.parent != ie.include->id ||
+          !insideGroup(inc.siteB, inc.siteE))
+        continue;
+      if (insideAnyArmBody(inc.siteB, inc.siteE) &&
+          headerIncludeIsSourceNeutralZeroToken &&
+          headerIncludeIsSourceNeutralZeroToken(inc))
+        continue;
+      return false;
+    }
     for (const auto &directive : model_.GetMacroDirectives())
       if (PathsEqual(directive.sitePath, file) && directive.ownerIncludeId &&
           *directive.ownerIncludeId == ie.include->id &&
@@ -1540,6 +1552,18 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     }
 
     return true;
+  };
+
+  headerIncludeIsSourceNeutralZeroToken =
+      [&](const RefoldModel::IncludeItem &child) -> bool {
+    // Header conditional islands are preserved verbatim, so an include inside
+    // a selected arm is admissible when the ordinary header include-gap proof
+    // can prove the complete child include subtree contributes no PP material.
+    // Use the full materialized header as the gap surface here: the containing
+    // conditional proof has already checked that the include site lies inside
+    // the preserved group.
+    return headerZeroTokenChildIncludeIsPreservableGap(
+        child, 0, headerText.size(), StringRef());
   };
 
 
