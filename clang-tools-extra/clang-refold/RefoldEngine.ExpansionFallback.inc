@@ -982,7 +982,8 @@ stringifyLineControlMacroArgument(StringRef argument) {
 /// unsupported macro semantics remain fail-closed.
 static std::optional<std::string> substituteLineControlMacroParameters(
     StringRef replacement, ArrayRef<RefoldModel::MacroDefParam> params,
-    ArrayRef<StringRef> invocationArgTexts) {
+    ArrayRef<StringRef> invocationArgTexts,
+    ArrayRef<RefoldModel::PasteToken> pasteTokens) {
   if (params.size() != invocationArgTexts.size())
     return std::nullopt;
 
@@ -997,14 +998,133 @@ static std::optional<std::string> substituteLineControlMacroParameters(
     return std::nullopt;
   };
 
+  auto parseReplacementAtom =
+      [&](size_t atomBegin)
+          -> std::optional<std::tuple<size_t, std::string, bool>> {
+    if (atomBegin >= replacement.size())
+      return std::nullopt;
+
+    const char atomCh = replacement[atomBegin];
+    if (atomCh == '#')
+      return std::nullopt;
+
+    // Copy string and character literals opaquely so formal names inside a
+    // literal are not substituted as identifiers.  Literals can participate in
+    // a pasted-token witness only when the producer recorded the resulting
+    // paste spelling, which is still certified by the final line-control parse.
+    if (atomCh == '"' || atomCh == '\'') {
+      const char quote = atomCh;
+      size_t end = atomBegin + 1;
+      bool closed = false;
+      while (end < replacement.size()) {
+        char litCh = replacement[end++];
+        if (litCh == '\\') {
+          if (end >= replacement.size())
+            return std::nullopt;
+          ++end;
+          continue;
+        }
+        if (litCh == quote) {
+          closed = true;
+          break;
+        }
+      }
+      if (!closed)
+        return std::nullopt;
+      return std::make_tuple(
+          end, replacement.slice(atomBegin, end).str(), false);
+    }
+
+    if (stringutils::isIdentStart(atomCh)) {
+      size_t end = atomBegin + 1;
+      while (end < replacement.size() &&
+             stringutils::isIdentPart(replacement[end]))
+        ++end;
+      StringRef ident = replacement.slice(atomBegin, end);
+      if (std::optional<StringRef> argText = lookupParam(ident))
+        return std::make_tuple(end, argText->str(), true);
+      return std::make_tuple(end, ident.str(), false);
+    }
+
+    // Consume a small pp-number spelling as one atom so literal paste operands
+    // such as `12 ## b` can use the same producer paste-token witness path as
+    // formal-parameter operands.  The final strict line-control parse still
+    // decides whether the pasted spelling is usable in this directive.
+    if (isDigit(atomCh) || atomCh == '.') {
+      size_t end = atomBegin + 1;
+      while (end < replacement.size() &&
+             (stringutils::isIdentPart(replacement[end]) ||
+              replacement[end] == '.'))
+        ++end;
+      return std::make_tuple(end, replacement.slice(atomBegin, end).str(),
+                             false);
+    }
+
+    // Treat one non-whitespace, non-comment punctuation byte as an atom.
+    if (!stringutils::isWs(atomCh) && atomCh != '/')
+      return std::make_tuple(atomBegin + 1, std::string(1, atomCh), false);
+
+    return std::nullopt;
+  };
+
+  auto appendPasteRunIfPresent = [&](size_t atomBegin, std::string &out,
+                                     size_t &nextPos,
+                                     size_t &pasteTokenIndex) -> bool {
+    std::optional<std::tuple<size_t, std::string, bool>> atom =
+        parseReplacementAtom(atomBegin);
+    if (!atom)
+      return false;
+
+    size_t probe = std::get<0>(*atom);
+    stringutils::skipNonNewlineWs(replacement, probe);
+    if (probe + 1 >= replacement.size() || replacement[probe] != '#' ||
+        replacement[probe + 1] != '#')
+      return false;
+
+    // A replacement-list ## run is deterministic here because the producer
+    // serialized the exact pasted-token spelling for this invocation.  Consume
+    // the whole adjacent paste chain and emit one recorded pasted token, then
+    // let the strict line-control parser reject anything that is not a valid
+    // directive operand.
+    size_t cursor = probe;
+    do {
+      cursor += 2;
+      stringutils::skipNonNewlineWs(replacement, cursor);
+      std::optional<std::tuple<size_t, std::string, bool>> rhs =
+          parseReplacementAtom(cursor);
+      if (!rhs)
+        return false;
+      cursor = std::get<0>(*rhs);
+      probe = cursor;
+      stringutils::skipNonNewlineWs(replacement, probe);
+    } while (probe + 1 < replacement.size() && replacement[probe] == '#' &&
+             replacement[probe + 1] == '#');
+
+    if (pasteTokenIndex >= pasteTokens.size())
+      return false;
+    out.append(pasteTokens[pasteTokenIndex].spelling.begin(),
+               pasteTokens[pasteTokenIndex].spelling.end());
+    ++pasteTokenIndex;
+    nextPos = cursor;
+    return true;
+  };
+
   std::string out;
   out.reserve(replacement.size());
+  size_t pasteTokenIndex = 0;
   for (size_t pos = 0; pos < replacement.size();) {
     char ch = replacement[pos];
 
+    size_t pasteRunEnd = pos;
+    if (appendPasteRunIfPresent(pos, out, pasteRunEnd, pasteTokenIndex)) {
+      pos = pasteRunEnd;
+      continue;
+    }
+
     if (ch == '#') {
-      // Token pasting changes token boundaries and cannot be modeled by this
-      // local spelling substitution.
+      // Token pasting is handled above as a whole replacement-list paste run
+      // using the producer's exact paste-token witness.  A bare `##` here means
+      // the replacement list was malformed or the run could not be proved.
       if (pos + 1 < replacement.size() && replacement[pos + 1] == '#')
         return std::nullopt;
 
@@ -1085,6 +1205,9 @@ static std::optional<std::string> substituteLineControlMacroParameters(
     ++pos;
   }
 
+  if (pasteTokenIndex != pasteTokens.size())
+    return std::nullopt;
+
   return out;
 }
 
@@ -1097,10 +1220,10 @@ static std::optional<std::string> substituteLineControlMacroParameters(
 /// #line directive operands.  Therefore the repair only substitutes complete
 /// callsites whose replacement list is spelled directly in the recorded #define
 /// text.  For function-like macros with parameters, direct formal-token
-/// substitution and conservative `# formal` stringification are allowed; paste,
-/// variadics, comments, multiline replacement lists, and any resulting
-/// non-line-control spelling fail closed when the strict parser is re-run on
-/// the rewritten directive line.
+/// substitution, conservative `# formal` stringification, and producer-witnessed
+/// `##` paste runs are allowed; variadics, comments, multiline replacement
+/// lists, and any resulting non-line-control spelling fail closed when the
+/// strict parser is re-run on the rewritten directive line.
 static std::optional<std::string> simpleLineControlMacroReplacementText(
     const RefoldModel &model, const RefoldModel::MacroInvocation &macro,
     ArrayRef<StringRef> invocationArgTexts) {
@@ -1177,9 +1300,11 @@ static std::optional<std::string> simpleLineControlMacroReplacementText(
       replacement.rtrim(" \t\v\f").ends_with("\\"))
     return std::nullopt;
 
-  if (macro.subkind == "func" && !macro.defParams.empty())
+  if ((macro.subkind == "func" && !macro.defParams.empty()) ||
+      !macro.pasteTokens.empty())
     return substituteLineControlMacroParameters(replacement, macro.defParams,
-                                                invocationArgTexts);
+                                                invocationArgTexts,
+                                                macro.pasteTokens);
 
   if (!invocationArgTexts.empty())
     return std::nullopt;
