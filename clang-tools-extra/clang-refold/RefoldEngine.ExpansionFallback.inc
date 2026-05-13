@@ -868,28 +868,63 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
 
   const RefoldModel::IncludeItem *first = touched.front();
   const RefoldModel::IncludeItem *last = touched.back();
-  uint64_t coverBegin = first->cover.begin;
-  uint64_t coverEnd = coverBegin;
 
-  // Require the touched include covers to tile exactly. Any gap, overlap, or
-  // empty include cover means the hunk cannot be represented by one
-  // include-closure replacement.
+  uint64_t coverBegin = std::numeric_limits<uint64_t>::max();
+  uint64_t coverEnd = 0;
   for (const RefoldModel::IncludeItem *inc : touched) {
-    if (inc->cover.begin != coverEnd || inc->cover.end <= inc->cover.begin) {
+    if (inc->cover.end <= inc->cover.begin) {
       trace("fallback",
-            "TU include-closure rejected: touched includes do not form one "
-            "contiguous A-cover at inc#{0} cover=[{1},{2}) expectedBegin={3}",
-            inc->id, inc->cover.begin, inc->cover.end, coverEnd);
+            "TU include-closure rejected: touched include inc#{0} has empty "
+            "or invalid A-cover [{1},{2})",
+            inc->id, inc->cover.begin, inc->cover.end);
       return std::nullopt;
     }
-    coverEnd = inc->cover.end;
+    coverBegin = std::min(coverBegin, inc->cover.begin);
+    coverEnd = std::max(coverEnd, inc->cover.end);
+  }
+
+  // Pure include closure is the old include-only proof: touched include covers
+  // must form one contiguous A-token run so their B material can be projected as
+  // a single include realization.  Mixed TU/include closure is broader.  It may
+  // touch several include runs separated by TU-owned material, but only if the
+  // later whole-envelope proof consumes that intervening material as part of the
+  // same source replacement.  Do not reject split include runs here; treating
+  // them as mixed gives the material-gap verifier a chance to prove or reject
+  // the complete source interval deterministically.
+  SmallVector<const RefoldModel::IncludeItem *, 8> coverOrdered = touched;
+  llvm::sort(coverOrdered, [](const RefoldModel::IncludeItem *lhs,
+                              const RefoldModel::IncludeItem *rhs) {
+    if (lhs->cover.begin != rhs->cover.begin)
+      return lhs->cover.begin < rhs->cover.begin;
+    if (lhs->cover.end != rhs->cover.end)
+      return lhs->cover.end < rhs->cover.end;
+    return lhs->id < rhs->id;
+  });
+
+  bool includeCoversContiguous = true;
+  uint64_t expectedCoverBegin = coverBegin;
+  for (const RefoldModel::IncludeItem *inc : coverOrdered) {
+    if (inc->cover.begin != expectedCoverBegin) {
+      includeCoversContiguous = false;
+      trace("fallback",
+            "TU include-closure treating touched includes as mixed: split "
+            "A-cover at inc#{0} cover=[{1},{2}) expectedBegin={3}",
+            inc->id, inc->cover.begin, inc->cover.end, expectedCoverBegin);
+      break;
+    }
+    expectedCoverBegin = inc->cover.end;
   }
 
   // `exactCover` means the edit already matches the include closure. The
   // wider `hunkInsideCover` case is a controlled widening: the hunk may be
-  // absorbed only if later checks prove the wider include closure is safe.
-  const bool exactCover = coverBegin == h.aStart && coverEnd == h.aEnd;
-  const bool hunkInsideCover = coverBegin <= h.aStart && h.aEnd <= coverEnd;
+  // absorbed only if later checks prove the wider include closure is safe. Split
+  // include runs are always mixed, even when the hunk lies inside the min/max
+  // include cover, because the intervening TU-owned material must be consumed by
+  // the whole-envelope proof rather than by pure include projection.
+  const bool exactCover = includeCoversContiguous && coverBegin == h.aStart &&
+                          coverEnd == h.aEnd;
+  const bool hunkInsideCover = includeCoversContiguous &&
+                               coverBegin <= h.aStart && h.aEnd <= coverEnd;
 
   // Return true when `cand` would be absorbed by the closed A-side range
   // [begin, end]. Token-consuming edits use interval overlap; pure insertions
@@ -2357,15 +2392,16 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       return std::nullopt;
     }
 
-    // The pure include closure may absorb touched include directives plus
-    // source-neutral whitespace between neighboring directives.  It may also
-    // consume complete zero-token source artifacts, such as empty include trees
-    // and invocations of empty-replacement-list macros, when they lie between
-    // touched directives.  Those artifacts are inside the replaced source
-    // envelope even though they
-    // contributed no PP tokens.  Comments outside such complete zero-token gaps
-    // are still preserved verbatim rather than silently deleted.
-    if (inc->siteB > sourceCursor) {
+    // Inter-include source bytes are handled differently for pure and mixed
+    // closures.  In a pure include closure, the source edit starts at the first
+    // include directive and projects include material only, so inert comments or
+    // directive-control trivia between adjacent include directives may need to
+    // be preserved verbatim.  In a mixed TU/include closure, the earlier
+    // whole-envelope verifier has already proved every gap between required
+    // source pieces, including bytes between split include runs, and those bytes
+    // are consumed by the B-side replacement.  Revalidating or preserving them
+    // here would reintroduce the old contiguous-include assumption.
+    if (!mixedTUIncludeClosure && inc->siteB > sourceCursor) {
       StringRef gap = tuBytes.slice(sourceCursor, inc->siteB);
       if (!gap.empty() && !stringutils::isWs(gap)) {
         if (gapIsConsumableZeroTokenSourceClosure(sourceCursor, inc->siteB)) {
