@@ -1501,9 +1501,87 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     return macroInvocationIsSourceNeutralZeroToken(m);
   };
 
+  struct MacroDirectiveSourceInterval {
+    uint64_t begin = 0;
+    uint64_t end = 0;
+  };
+
+  // Recover the full physical source interval for a TU-spelled macro-state
+  // directive.  MacroDirective::siteB is anchored at the macro name rather than
+  // at '#', so use the recorded directive spelling to translate the name offset
+  // back to the directive's real source begin.
+  auto macroDirectiveFullSourceInterval =
+      [&](const RefoldModel::MacroDirective &directive)
+          -> std::optional<MacroDirectiveSourceInterval> {
+    if (!PathsEqual(directive.sitePath, tuPath) || directive.ownerIncludeId)
+      return std::nullopt;
+    if (directive.subkind != "#define" && directive.subkind != "#undef")
+      return std::nullopt;
+
+    StringRef text = directive.text;
+    if (text.empty())
+      return std::nullopt;
+
+    size_t pos = 0;
+    stringutils::skipNonNewlineWs(text, pos);
+    if (pos >= text.size() || text[pos] != '#')
+      return std::nullopt;
+    ++pos;
+    stringutils::skipNonNewlineWs(text, pos);
+
+    // Match the recorded directive kind exactly; accepting an identifier prefix
+    // here would make the later byte-coordinate reconstruction unsound.
+    StringRef keyword = directive.subkind.drop_front();
+    if (!text.substr(pos).starts_with(keyword))
+      return std::nullopt;
+    pos += keyword.size();
+    if (pos < text.size() && stringutils::isIdentPart(text[pos]))
+      return std::nullopt;
+    stringutils::skipNonNewlineWs(text, pos);
+
+    // The next token is the macro name.  Its text offset is the bridge between
+    // directive-text coordinates and source-file byte coordinates because the
+    // producer records siteB at this token.
+    const size_t nameTextBegin = pos;
+    if (pos >= text.size() || !stringutils::isIdentStart(text[pos]))
+      return std::nullopt;
+    ++pos;
+    while (pos < text.size() && stringutils::isIdentPart(text[pos]))
+      ++pos;
+
+    if (directive.siteB < nameTextBegin)
+      return std::nullopt;
+
+    const uint64_t fileBegin = directive.siteB - nameTextBegin;
+    const uint64_t fileEnd = fileBegin + text.size();
+    if (fileBegin >= fileEnd || fileEnd > tuBytes.size())
+      return std::nullopt;
+
+    // Require an exact byte match so this proof consumes the directive that the
+    // producer recorded, not a synthetic interval inferred from stale anchors.
+    if (tuBytes.slice(fileBegin, fileEnd) != text)
+      return std::nullopt;
+
+    return MacroDirectiveSourceInterval{fileBegin, fileEnd};
+  };
+
+  auto macroDirectiveIsConsumableStateGap =
+      [&](const RefoldModel::MacroDirective &directive, uint64_t begin,
+          uint64_t end) -> std::optional<MacroDirectiveSourceInterval> {
+    std::optional<MacroDirectiveSourceInterval> interval =
+        macroDirectiveFullSourceInterval(directive);
+    if (!interval)
+      return std::nullopt;
+    if (interval->begin < begin || end < interval->end)
+      return std::nullopt;
+    return interval;
+  };
+
   // Prove that a source gap inside the replacement envelope consists only of
   // lexical trivia plus complete source-neutral artifacts: zero-token include
-  // trees and source-neutral zero-token macro invocation trees.
+  // trees, source-neutral zero-token macro invocation trees, and TU-spelled
+  // macro-state directives whose later liveness obligations are handled by the
+  // macro-state repair pass.
   //
   // These artifacts have no PP tokens, so token overlap alone cannot make them
   // part of the touched hunk.  If they lie physically between required source
@@ -1538,6 +1616,12 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       if (macroInvocationIsConsumableZeroTokenGap(m, gapBegin, gapEnd))
         pieces.push_back({*m.invB, *m.invE, m.id, "macro"});
 
+    for (const auto &directive : model_.GetMacroDirectives())
+      if (std::optional<MacroDirectiveSourceInterval> interval =
+              macroDirectiveIsConsumableStateGap(directive, gapBegin, gapEnd))
+        pieces.push_back({interval->begin, interval->end, directive.id,
+                          "macro-directive"});
+
     if (pieces.empty())
       return false;
 
@@ -1554,6 +1638,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     uint64_t cursor = gapBegin;
     uint64_t includeCount = 0;
     uint64_t macroCount = 0;
+    uint64_t macroDirectiveCount = 0;
     for (const GapPiece &piece : pieces) {
       if (piece.begin < cursor)
         return false;
@@ -1566,8 +1651,10 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       cursor = piece.end;
       if (piece.kind == "include")
         ++includeCount;
-      else
+      else if (piece.kind == "macro")
         ++macroCount;
+      else
+        ++macroDirectiveCount;
     }
     // The suffix after the final zero-token artifact must also be trivia,
     // otherwise the replacement envelope would erase unproved source spelling.
@@ -1576,8 +1663,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
 
     trace("fallback",
           "TU/include closure consuming zero-token source gap "
-          "source=[{0},{1}) includes={2} macros={3}",
-          gapBegin, gapEnd, includeCount, macroCount);
+          "source=[{0},{1}) includes={2} macros={3} macroDirectives={4}",
+          gapBegin, gapEnd, includeCount, macroCount, macroDirectiveCount);
     return true;
   };
 
