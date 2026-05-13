@@ -158,6 +158,119 @@ inline bool hasLiteralMacroCalleeOrigin(
   return mi.calleeOrigin.kind == MacroCalleeOriginKind::LiteralMacroName;
 }
 
+
+/// Byte envelope covered by normalized owner-proof source pieces.
+struct OwnerProofSourceEnvelope { uint64_t begin = 0, end = 0; };
+
+/// Owner-proof interval accessors. Structural pieces expose begin/end; merged TU
+/// byte ranges are represented as plain pairs.
+template <typename PieceT>
+static uint64_t ownerProofPieceBegin(const PieceT &piece) { return piece.begin; }
+
+template <typename PieceT>
+static uint64_t ownerProofPieceEnd(const PieceT &piece) { return piece.end; }
+
+static uint64_t ownerProofPieceBegin(
+    const std::pair<uint64_t, uint64_t> &piece) { return piece.first; }
+
+static uint64_t ownerProofPieceEnd(
+    const std::pair<uint64_t, uint64_t> &piece) { return piece.second; }
+
+/// Sort by source interval, absorb caller-approved nested pieces, and reject
+/// every other overlap as ambiguous.
+template <typename PieceT, typename KindLess, typename NestedCovered>
+static bool normalizeOwnerProofPieces(SmallVectorImpl<PieceT> &pieces,
+                                      KindLess kindLess,
+                                      NestedCovered nestedCovered) {
+  llvm::sort(pieces, [&](const PieceT &lhs, const PieceT &rhs) {
+    const uint64_t lhsBegin = ownerProofPieceBegin(lhs);
+    const uint64_t rhsBegin = ownerProofPieceBegin(rhs);
+    if (lhsBegin != rhsBegin)
+      return lhsBegin < rhsBegin;
+
+    const uint64_t lhsEnd = ownerProofPieceEnd(lhs);
+    const uint64_t rhsEnd = ownerProofPieceEnd(rhs);
+    if (lhsEnd != rhsEnd)
+      return lhsEnd > rhsEnd;
+
+    if (kindLess(lhs, rhs))
+      return true;
+    if (kindLess(rhs, lhs))
+      return false;
+    return lhs.id < rhs.id;
+  });
+
+  SmallVector<PieceT, 8> outerPieces;
+  for (const PieceT &piece : pieces) {
+    const uint64_t pieceBegin = ownerProofPieceBegin(piece);
+    const uint64_t pieceEnd = ownerProofPieceEnd(piece);
+    if (outerPieces.empty() ||
+        pieceBegin >= ownerProofPieceEnd(outerPieces.back())) {
+      outerPieces.push_back(piece);
+      continue;
+    }
+
+    const PieceT &outer = outerPieces.back();
+    if (ownerProofPieceBegin(outer) <= pieceBegin &&
+        pieceEnd <= ownerProofPieceEnd(outer) && nestedCovered(outer, piece))
+      continue;
+
+    return false;
+  }
+
+  pieces.clear();
+  pieces.append(outerPieces.begin(), outerPieces.end());
+  return true;
+}
+
+/// Prove every physical gap between normalized source-envelope pieces.
+template <typename PieceT, typename ProveGap>
+static bool proveOwnerSourceEnvelopeGaps(
+    const SmallVectorImpl<PieceT> &pieces, ProveGap proveGap) {
+  if (pieces.empty())
+    return true;
+
+  uint64_t cursor = ownerProofPieceEnd(pieces.front());
+  for (size_t idx = 1; idx < pieces.size(); ++idx) {
+    const PieceT &piece = pieces[idx];
+    const uint64_t pieceBegin = ownerProofPieceBegin(piece);
+    const uint64_t pieceEnd = ownerProofPieceEnd(piece);
+    if (pieceBegin < cursor)
+      return false;
+    if (pieceBegin > cursor && !proveGap(cursor, pieceBegin))
+      return false;
+    cursor = pieceEnd;
+  }
+
+  return true;
+}
+
+/// Normalize and tile one owner-local source gap.
+template <typename PieceT, typename KindLess, typename NestedCovered,
+          typename NeutralRange, typename ConsumePiece>
+static bool proveOwnerProofGap(SmallVectorImpl<PieceT> &pieces,
+                               uint64_t gapBegin, uint64_t gapEnd,
+                               KindLess kindLess,
+                               NestedCovered nestedCovered,
+                               NeutralRange neutralRange,
+                               ConsumePiece consumePiece) {
+  if (!normalizeOwnerProofPieces(pieces, kindLess, nestedCovered))
+    return false;
+
+  uint64_t cursor = gapBegin;
+  for (const PieceT &piece : pieces) {
+    const uint64_t pieceBegin = ownerProofPieceBegin(piece);
+    const uint64_t pieceEnd = ownerProofPieceEnd(piece);
+    if (pieceBegin < cursor)
+      return false;
+    if (!neutralRange(cursor, pieceBegin))
+      return false;
+    consumePiece(piece);
+    cursor = pieceEnd;
+  }
+  return neutralRange(cursor, gapEnd);
+}
+
 /// Recover the spelled text of one invocation argument from the producer-side
 /// callsite surface recorded on a macro invocation.
 ///

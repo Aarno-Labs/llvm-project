@@ -522,13 +522,9 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
 
     Kind kind = Kind::MacroStateDirective;
     const RefoldModel::MacroDirective *directive = nullptr;
-    const RefoldModel::CondGroup *group = nullptr;
-    const RefoldModel::MacroInvocation *macro = nullptr;
-    const RefoldModel::IncludeItem *include = nullptr;
     uint64_t begin = 0;
     uint64_t end = 0;
     uint64_t id = 0;
-    std::string macroName;
   };
 
   // Recover the macro identifier from a recorded macro-state directive.  Keep
@@ -1596,7 +1592,6 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       piece.kind = HeaderPreservedGapPiece::Kind::MacroStateDirective;
       piece.directive = &directive;
       piece.id = directive.id;
-      piece.macroName = std::move(*name);
       pieces.push_back(std::move(piece));
     }
 
@@ -2409,224 +2404,184 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       if (shouldTryFullHeaderEnvelope && !hasPartialChildIncludeOverlap &&
           !hasPartialMacroInvocationOverlap &&
           !hasPartialConditionalGroupOverlap) {
-        llvm::sort(hunkSourcePieces,
-                   [](const HeaderSourceEnvelopePiece &lhs,
-                      const HeaderSourceEnvelopePiece &rhs) {
-          if (lhs.begin != rhs.begin)
-            return lhs.begin < rhs.begin;
-          if (lhs.end != rhs.end)
-            return lhs.end > rhs.end;
-          if (lhs.kind != rhs.kind)
-            return lhs.kind < rhs.kind;
-          return lhs.id < rhs.id;
-        });
-
-        SmallVector<HeaderSourceEnvelopePiece, 8> outerPieces;
-        bool canUseFullHeaderEnvelope = hunkSourcePieces.size() >= 2;
-        for (const HeaderSourceEnvelopePiece &piece : hunkSourcePieces) {
-          if (outerPieces.empty() || piece.begin >= outerPieces.back().end) {
-            outerPieces.push_back(piece);
-            continue;
-          }
-
-          const HeaderSourceEnvelopePiece &outer = outerPieces.back();
-          if (outer.begin <= piece.begin && piece.end <= outer.end &&
-              outer.kind == "child-include" && piece.kind == "token") {
-            // Tokens produced by a child include are owned by the child site.
-            // Once the complete child include is a source-envelope piece, any
-            // mapped child token inside that site is not a second parent piece.
-            continue;
-          }
-          if (outer.begin <= piece.begin && piece.end <= outer.end &&
-              outer.kind == "macro-invocation" && piece.kind == "token") {
-            // Macro-expanded tokens often map to the macro callsite spelling.
-            // Once the complete source-bearing invocation is proved consumed,
-            // those mapped token intervals are internal evidence, not separate
-            // parent-header source pieces.
-            continue;
-          }
-          if (outer.begin <= piece.begin && piece.end <= outer.end &&
-              outer.kind == "conditional-group" &&
-              (piece.kind == "token" || piece.kind == "macro-invocation" ||
-               piece.kind == "child-include")) {
-            // A consumed conditional group owns the selected-arm source inside
-            // its directive wrapper.  Nested token/macro/include pieces inside
-            // the group are covered by the group-level source-envelope proof.
-            continue;
-          }
-
-          canUseFullHeaderEnvelope = false;
-          break;
-        }
-        hunkSourcePieces = std::move(outerPieces);
+        std::optional<OwnerProofSourceEnvelope> sourceEnvelope;
+        if (hunkSourcePieces.size() >= 2 &&
+            normalizeOwnerProofPieces(
+                hunkSourcePieces,
+                [](const HeaderSourceEnvelopePiece &lhs,
+                   const HeaderSourceEnvelopePiece &rhs) {
+                  return lhs.kind < rhs.kind;
+                },
+                [](const HeaderSourceEnvelopePiece &outer,
+                   const HeaderSourceEnvelopePiece &piece) {
+                  if (outer.kind == "child-include" && piece.kind == "token") {
+                    // Tokens produced by a child include are owned by the child
+                    // site. Once the complete child include is a source-envelope
+                    // piece, any mapped child token inside that site is not a
+                    // second parent piece.
+                    return true;
+                  }
+                  if (outer.kind == "macro-invocation" &&
+                      piece.kind == "token") {
+                    // Macro-expanded tokens often map to the macro callsite
+                    // spelling. Once the complete source-bearing invocation is
+                    // proved consumed, those mapped token intervals are internal
+                    // evidence, not separate parent-header pieces.
+                    return true;
+                  }
+                  if (outer.kind == "conditional-group" &&
+                      (piece.kind == "token" ||
+                       piece.kind == "macro-invocation" ||
+                       piece.kind == "child-include")) {
+                    // A consumed conditional group owns the selected-arm source
+                    // inside its directive wrapper. Nested token/macro/include
+                    // pieces inside the group are covered by the group-level
+                    // source-envelope proof.
+                    return true;
+                  }
+                  return false;
+                }))
+          sourceEnvelope = {ownerProofPieceBegin(hunkSourcePieces.front()),
+                            ownerProofPieceEnd(hunkSourcePieces.back())};
 
         SmallVector<HeaderPreservedGapPiece, 4> preservedPieces;
-        for (const HeaderSourceEnvelopePiece &piece : hunkSourcePieces) {
-          if (piece.kind != "child-include")
-            continue;
-          const RefoldModel::IncludeItem *child = model_.GetIncludeById(piece.id);
-          if (!child)
-            continue;
-          if (!collectMacroStatePreservationsFromIncludeSubtree(
-                  *child, StringRef(materialInsertBytes), preservedPieces)) {
-            canUseFullHeaderEnvelope = false;
-            break;
-          }
-        }
-        for (size_t ti = 1; canUseFullHeaderEnvelope &&
-                            ti < hunkSourcePieces.size(); ++ti) {
-          const uint64_t gapBegin = hunkSourcePieces[ti - 1].end;
-          const uint64_t gapEnd = hunkSourcePieces[ti].begin;
-          if (gapBegin > gapEnd) {
-            canUseFullHeaderEnvelope = false;
-            break;
-          }
-          if (gapBegin == gapEnd)
-            continue;
-
-          SmallVector<HeaderPreservedGapPiece, 4> gapPieces;
-          for (const auto &directive : model_.GetMacroDirectives()) {
-            std::optional<HeaderMacroStateDirectivePiece> directivePiece =
-                headerMacroStateDirectiveInterval(directive);
-            if (!directivePiece || directivePiece->begin < gapBegin ||
-                gapEnd < directivePiece->end)
+        if (sourceEnvelope) {
+          for (const HeaderSourceEnvelopePiece &piece : hunkSourcePieces) {
+            if (piece.kind != "child-include")
               continue;
-            if (rawIdentifierAppearsInHeaderReplacement(
-                    directivePiece->name, StringRef(materialInsertBytes))) {
-              canUseFullHeaderEnvelope = false;
+            const RefoldModel::IncludeItem *child =
+                model_.GetIncludeById(piece.id);
+            if (!child)
+              continue;
+            if (!collectMacroStatePreservationsFromIncludeSubtree(
+                    *child, StringRef(materialInsertBytes), preservedPieces)) {
+              sourceEnvelope.reset();
               break;
             }
-
-            HeaderPreservedGapPiece piece;
-            piece.kind = HeaderPreservedGapPiece::Kind::MacroStateDirective;
-            piece.directive = directivePiece->directive;
-            piece.begin = directivePiece->begin;
-            piece.end = directivePiece->end;
-            piece.id = directivePiece->directive ? directivePiece->directive->id : 0;
-            piece.macroName = std::move(directivePiece->name);
-            gapPieces.push_back(std::move(piece));
           }
-          if (!canUseFullHeaderEnvelope)
-            break;
+        }
+        if (sourceEnvelope) {
+          if (!proveOwnerSourceEnvelopeGaps(
+                  hunkSourcePieces, [&](uint64_t gapBegin, uint64_t gapEnd) {
+                SmallVector<HeaderPreservedGapPiece, 4> gapPieces;
+                for (const auto &directive : model_.GetMacroDirectives()) {
+                  std::optional<HeaderMacroStateDirectivePiece> directivePiece =
+                      headerMacroStateDirectiveInterval(directive);
+                  if (!directivePiece || directivePiece->begin < gapBegin ||
+                      gapEnd < directivePiece->end)
+                    continue;
+                  if (rawIdentifierAppearsInHeaderReplacement(
+                          directivePiece->name,
+                          StringRef(materialInsertBytes)))
+                    return false;
 
-          for (const auto &group : model_.GetConds()) {
-            if (!headerConditionalGroupIsPreservableGap(group, gapBegin,
-                                                       gapEnd))
-              continue;
-            HeaderPreservedGapPiece piece;
-            piece.kind = HeaderPreservedGapPiece::Kind::ZeroTokenConditionalGroup;
-            piece.group = &group;
-            piece.begin = group.groupB;
-            piece.end = group.groupE;
-            piece.id = group.id;
-            gapPieces.push_back(std::move(piece));
-          }
+                  HeaderPreservedGapPiece piece;
+                  piece.kind =
+                      HeaderPreservedGapPiece::Kind::MacroStateDirective;
+                  piece.directive = directivePiece->directive;
+                  piece.begin = directivePiece->begin;
+                  piece.end = directivePiece->end;
+                  piece.id = directivePiece->directive
+                                 ? directivePiece->directive->id
+                                 : 0;
+                  gapPieces.push_back(std::move(piece));
+                }
 
-          for (const auto &macro : model_.GetMacroInvocations()) {
-            if (!headerMacroInvocationIsPreservableGap(macro, gapBegin,
-                                                       gapEnd))
-              continue;
-            HeaderPreservedGapPiece piece;
-            piece.kind = HeaderPreservedGapPiece::Kind::ZeroTokenMacroInvocation;
-            piece.macro = &macro;
-            piece.begin = *macro.invB;
-            piece.end = *macro.invE;
-            piece.id = macro.id;
-            gapPieces.push_back(std::move(piece));
-          }
+                for (const auto &group : model_.GetConds()) {
+                  if (!headerConditionalGroupIsPreservableGap(
+                          group, gapBegin, gapEnd))
+                    continue;
+                  HeaderPreservedGapPiece piece;
+                  piece.kind = HeaderPreservedGapPiece::Kind::
+                      ZeroTokenConditionalGroup;
+                  piece.begin = group.groupB;
+                  piece.end = group.groupE;
+                  piece.id = group.id;
+                  gapPieces.push_back(std::move(piece));
+                }
 
-          for (const auto &child : model_.GetIncludes()) {
-            if (!headerZeroTokenChildIncludeIsPreservableGap(
-                    child, gapBegin, gapEnd, StringRef(materialInsertBytes)))
-              continue;
-            HeaderPreservedGapPiece piece;
-            piece.kind = HeaderPreservedGapPiece::Kind::ZeroTokenChildInclude;
-            piece.include = &child;
-            piece.begin = child.siteB;
-            piece.end = child.siteE;
-            piece.id = child.id;
-            gapPieces.push_back(std::move(piece));
-          }
+                for (const auto &macro : model_.GetMacroInvocations()) {
+                  if (!headerMacroInvocationIsPreservableGap(
+                          macro, gapBegin, gapEnd))
+                    continue;
+                  HeaderPreservedGapPiece piece;
+                  piece.kind = HeaderPreservedGapPiece::Kind::
+                      ZeroTokenMacroInvocation;
+                  piece.begin = *macro.invB;
+                  piece.end = *macro.invE;
+                  piece.id = macro.id;
+                  gapPieces.push_back(std::move(piece));
+                }
 
-          llvm::sort(gapPieces,
-                     [](const HeaderPreservedGapPiece &lhs,
-                        const HeaderPreservedGapPiece &rhs) {
-            if (lhs.begin != rhs.begin)
-              return lhs.begin < rhs.begin;
-            if (lhs.end != rhs.end)
-              return lhs.end > rhs.end;
-            if (lhs.kind != rhs.kind)
-              return static_cast<unsigned>(lhs.kind) <
-                     static_cast<unsigned>(rhs.kind);
-            return lhs.id < rhs.id;
-          });
+                for (const auto &child : model_.GetIncludes()) {
+                  if (!headerZeroTokenChildIncludeIsPreservableGap(
+                          child, gapBegin, gapEnd,
+                          StringRef(materialInsertBytes)))
+                    continue;
+                  HeaderPreservedGapPiece piece;
+                  piece.kind =
+                      HeaderPreservedGapPiece::Kind::ZeroTokenChildInclude;
+                  piece.begin = child.siteB;
+                  piece.end = child.siteE;
+                  piece.id = child.id;
+                  gapPieces.push_back(std::move(piece));
+                }
 
-          SmallVector<HeaderPreservedGapPiece, 4> outerGapPieces;
-          for (const HeaderPreservedGapPiece &piece : gapPieces) {
-            if (outerGapPieces.empty() || piece.begin >= outerGapPieces.back().end) {
-              outerGapPieces.push_back(piece);
-              continue;
-            }
+                if (!proveOwnerProofGap(
+                        gapPieces, gapBegin, gapEnd,
+                        [](const HeaderPreservedGapPiece &lhs,
+                           const HeaderPreservedGapPiece &rhs) {
+                          return static_cast<unsigned>(lhs.kind) <
+                                 static_cast<unsigned>(rhs.kind);
+                        },
+                        [](const HeaderPreservedGapPiece &outer,
+                           const HeaderPreservedGapPiece &piece) {
+                          if (outer.kind == piece.kind &&
+                              (outer.kind == HeaderPreservedGapPiece::Kind::
+                                                 ZeroTokenConditionalGroup ||
+                               outer.kind == HeaderPreservedGapPiece::Kind::
+                                                 ZeroTokenMacroInvocation)) {
+                            // Nested zero-token conditional groups and nested
+                            // zero-token macro invocations are consumed by
+                            // their outer proof piece. Once the outer source
+                            // interval is proved neutral, keeping the inner
+                            // record as a separate tiling piece would only
+                            // double-count the same bytes.
+                            return true;
+                          }
+                          return false;
+                        },
+                        [&](uint64_t begin, uint64_t end) {
+                          return isWsOrCompleteCommentTrivia(
+                              StringRef(headerText).slice(begin, end));
+                        },
+                        [](const HeaderPreservedGapPiece &) {}))
+                  return false;
 
-            const HeaderPreservedGapPiece &outer = outerGapPieces.back();
-            if (outer.begin <= piece.begin && piece.end <= outer.end &&
-                outer.kind == piece.kind &&
-                (outer.kind == HeaderPreservedGapPiece::Kind::ZeroTokenConditionalGroup ||
-                 outer.kind == HeaderPreservedGapPiece::Kind::ZeroTokenMacroInvocation)) {
-              // Nested zero-token conditional groups and nested zero-token
-              // macro invocations are consumed by their outer proof piece. Once
-              // the outer source interval is proved neutral, keeping the inner
-              // record as a separate tiling piece would only double-count the
-              // same bytes.
-              continue;
-            }
-
-            canUseFullHeaderEnvelope = false;
-            break;
-          }
-          if (!canUseFullHeaderEnvelope)
-            break;
-
-          uint64_t cursor = gapBegin;
-          for (const HeaderPreservedGapPiece &piece : outerGapPieces) {
-            if (piece.begin < cursor ||
-                !isWsOrCompleteCommentTrivia(
-                    StringRef(headerText).slice(cursor, piece.begin))) {
-              canUseFullHeaderEnvelope = false;
-              break;
-            }
-            cursor = piece.end;
-          }
-          if (!canUseFullHeaderEnvelope)
-            break;
-          if (!isWsOrCompleteCommentTrivia(
-                  StringRef(headerText).slice(cursor, gapEnd))) {
-            canUseFullHeaderEnvelope = false;
-            break;
-          }
-
-          preservedPieces.append(outerGapPieces.begin(), outerGapPieces.end());
+                preservedPieces.append(gapPieces.begin(), gapPieces.end());
+                return true;
+              }))
+            sourceEnvelope.reset();
         }
 
-        if (canUseFullHeaderEnvelope && !hunkSourcePieces.empty()) {
-          const uint64_t fullStart = hunkSourcePieces.front().begin;
-          const uint64_t fullEnd = hunkSourcePieces.back().end;
-          if (fullStart <= *startByte && *endByte <= fullEnd &&
+        if (sourceEnvelope) {
+          if (sourceEnvelope->begin <= *startByte &&
+              *endByte <= sourceEnvelope->end &&
               replacementHeaderSuffixBoundaryAllowsDirectiveLine(
-                  StringRef(materialInsertBytes), fullEnd)) {
-            startByte = fullStart;
-            endByte = fullEnd;
+                  StringRef(materialInsertBytes), sourceEnvelope->end)) {
+            startByte = sourceEnvelope->begin;
+            endByte = sourceEnvelope->end;
             headerGapPreservations = std::move(preservedPieces);
             usedFullHeaderEnvelope = true;
-            mappedHeaderWitness.startByte = fullStart;
-            mappedHeaderWitness.endByte = fullEnd;
+            mappedHeaderWitness.startByte = sourceEnvelope->begin;
+            mappedHeaderWitness.endByte = sourceEnvelope->end;
             mappedHeaderWitness.firstPP = hunkSourcePieces.front().ppBegin;
             mappedHeaderWitness.lastPP = hunkSourcePieces.back().ppEnd - 1;
             trace("include/apply",
                   "file={0} patch[{1}] DELETE/REPLACE: widened across "
                   "header source gap bytes=[{2},{3}) preserved={4} pieces={5}",
-                  file, idx, fullStart, fullEnd, headerGapPreservations.size(),
-                  hunkSourcePieces.size());
+                  file, idx, sourceEnvelope->begin, sourceEnvelope->end,
+                  headerGapPreservations.size(), hunkSourcePieces.size());
           }
         }
       }
