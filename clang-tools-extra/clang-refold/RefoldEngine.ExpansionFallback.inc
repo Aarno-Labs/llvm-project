@@ -3786,6 +3786,183 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     return includeRecordedSideEffectReason(inc).has_value();
   };
 
+  auto identifierAppearsInHunkReplacement = [&](StringRef name) -> bool {
+    if (name.empty())
+      return false;
+    StringRef text = SliceBSource(h.bStart, h.bEnd);
+    size_t pos = 0;
+    while ((pos = text.find(name, pos)) != StringRef::npos) {
+      const bool leftOk = pos == 0 || !stringutils::isIdentPart(text[pos - 1]);
+      const size_t end = pos + name.size();
+      const bool rightOk =
+          end == text.size() || !stringutils::isIdentPart(text[end]);
+      if (leftOk && rightOk)
+        return true;
+      pos = end;
+    }
+    return false;
+  };
+
+  auto macroDirectiveNameFromRecordedText =
+      [&](const RefoldModel::MacroDirective &directive)
+          -> std::optional<std::string> {
+    if (directive.subkind != "#define" && directive.subkind != "#undef")
+      return std::nullopt;
+
+    StringRef text = directive.text.ltrim();
+    if (!text.consume_front("#"))
+      return std::nullopt;
+    text = text.ltrim();
+
+    StringRef keyword = directive.subkind.drop_front();
+    if (!text.consume_front(keyword))
+      return std::nullopt;
+    if (!text.empty() && stringutils::isIdentPart(text.front()))
+      return std::nullopt;
+
+    text = text.ltrim();
+    if (text.empty() || !stringutils::isIdentStart(text.front()))
+      return std::nullopt;
+
+    size_t end = 1;
+    while (end < text.size() && stringutils::isIdentPart(text[end]))
+      ++end;
+    return text.take_front(end).str();
+  };
+
+  auto includeIsDescendantOf = [&](const RefoldModel::IncludeItem &candidate,
+                                   const RefoldModel::IncludeItem &root) {
+    std::optional<uint64_t> cur = candidate.parent;
+    while (cur) {
+      if (*cur == root.id)
+        return true;
+      const RefoldModel::IncludeItem *parent = nullptr;
+      for (const auto &inc : model_.GetIncludes())
+        if (inc.id == *cur) {
+          parent = &inc;
+          break;
+        }
+      if (!parent)
+        return false;
+      cur = parent->parent;
+    }
+    return false;
+  };
+
+  // Return true iff a complete include directive can be carried forward as part
+  // of a preserved conditional island even though its subtree has modeled
+  // macro-state effects.
+  //
+  // This is deliberately stricter than ordinary include preservation and
+  // different from the zero-token include consumption proof above.  The include
+  // is not deleted: its directive remains in the emitted conditional island, so
+  // #define/#undef state transitions and #pragma once remain in source order.
+  // Still fail closed for declarations, token-producing descendants, generic
+  // pragmas, non-macro-state directives, and replacement text that mentions a
+  // macro whose state would be introduced only after the replacement payload.
+  std::function<bool(const RefoldModel::IncludeItem &, DenseSet<uint64_t> &)>
+      includeIsPreservableConditionalStateIncludeImpl;
+  includeIsPreservableConditionalStateIncludeImpl =
+      [&](const RefoldModel::IncludeItem &inc, DenseSet<uint64_t> &visiting)
+          -> bool {
+    if (inc.cover.IsValid())
+      return false;
+    if (!visiting.insert(inc.id).second)
+      return false;
+
+    auto finish = [&](bool result) {
+      visiting.erase(inc.id);
+      return result;
+    };
+
+    if (!inc.decls.empty())
+      return finish(false);
+
+    for (const auto &child : model_.GetIncludes()) {
+      if (!child.parent || *child.parent != inc.id)
+        continue;
+      if (!includeIsPreservableConditionalStateIncludeImpl(child, visiting))
+        return finish(false);
+    }
+
+    for (const auto &directive : model_.GetMacroDirectives()) {
+      if (!directive.ownerIncludeId)
+        continue;
+      bool ownedByInclude = *directive.ownerIncludeId == inc.id;
+      if (!ownedByInclude)
+        for (const auto &child : model_.GetIncludes())
+          if (child.id == *directive.ownerIncludeId &&
+              includeIsDescendantOf(child, inc)) {
+            ownedByInclude = true;
+            break;
+          }
+      if (!ownedByInclude)
+        continue;
+
+      std::optional<std::string> name =
+          macroDirectiveNameFromRecordedText(directive);
+      if (!name)
+        return finish(false);
+      if (identifierAppearsInHunkReplacement(*name))
+        return finish(false);
+    }
+
+    for (const auto &group : model_.GetConds()) {
+      if (!group.parentIncludeId)
+        continue;
+      bool ownedByInclude = *group.parentIncludeId == inc.id;
+      if (!ownedByInclude)
+        for (const auto &child : model_.GetIncludes())
+          if (child.id == *group.parentIncludeId &&
+              includeIsDescendantOf(child, inc)) {
+            ownedByInclude = true;
+            break;
+          }
+      if (!ownedByInclude)
+        continue;
+      for (const RefoldModel::CondArm &arm : group.arms)
+        if (arm.span && arm.span->IsValid() && arm.span->begin < arm.span->end)
+          return finish(false);
+    }
+
+    for (const auto &macro : model_.GetMacroInvocations()) {
+      if (!macro.ownerIncludeId)
+        continue;
+      bool ownedByInclude = *macro.ownerIncludeId == inc.id;
+      if (!ownedByInclude)
+        for (const auto &child : model_.GetIncludes())
+          if (child.id == *macro.ownerIncludeId &&
+              includeIsDescendantOf(child, inc)) {
+            ownedByInclude = true;
+            break;
+          }
+      if (!ownedByInclude)
+        continue;
+      if (macro.cover.IsValid())
+        return finish(false);
+      for (const auto &span : macro.stringifySpans)
+        if (span.IsValid())
+          return finish(false);
+      for (const auto &span : macro.pasteSpans)
+        if (span.IsValid())
+          return finish(false);
+    }
+
+    if (inc.resolvedPath)
+      for (const auto &pragma : model_.GetPragmas())
+        if (PathsEqual(pragma.sitePath, *inc.resolvedPath) &&
+            !pragmaIsConsumableIncludeLocalState(pragma))
+          return finish(false);
+
+    return finish(true);
+  };
+
+  auto includeIsPreservableConditionalStateInclude =
+      [&](const RefoldModel::IncludeItem &inc) -> bool {
+    DenseSet<uint64_t> visiting;
+    return includeIsPreservableConditionalStateIncludeImpl(inc, visiting);
+  };
+
   struct MacroDefinitionReplacementList {
     const RefoldModel::MacroDirective *directive = nullptr;
     size_t nameTextBegin = 0;
@@ -4627,7 +4804,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       return PathsEqual(inc.sitePath, tuPath);
     };
     auto includeIsNeutral = [&](const RefoldModel::IncludeItem &inc) {
-      return !inc.cover.IsValid() && !includeHasRecordedSideEffects(inc);
+      return (!inc.cover.IsValid() && !includeHasRecordedSideEffects(inc)) ||
+             includeIsPreservableConditionalStateInclude(inc);
     };
     auto directiveBelongs = [&](const RefoldModel::MacroDirective &directive) {
       return PathsEqual(directive.sitePath, tuPath);
@@ -4738,7 +4916,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       return PathsEqual(inc.sitePath, tuPath);
     };
     auto includeIsNeutral = [&](const RefoldModel::IncludeItem &inc) {
-      return !inc.cover.IsValid() && !includeHasRecordedSideEffects(inc);
+      return (!inc.cover.IsValid() && !includeHasRecordedSideEffects(inc)) ||
+             includeIsPreservableConditionalStateInclude(inc);
     };
     auto directiveBelongs = [&](const RefoldModel::MacroDirective &directive) {
       return PathsEqual(directive.sitePath, tuPath);
@@ -5475,6 +5654,19 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       return true;
     };
 
+    auto includeIsInsidePreservableZeroTokenConditionalGap =
+        [&](const RefoldModel::IncludeItem &inc) -> bool {
+      for (const auto &group : model_.GetConds()) {
+        if (!conditionalGroupIsConsumableZeroTokenGap(group, sourceBegin,
+                                                      sourceEnd))
+          continue;
+        if (group.groupB <= inc.siteB && inc.siteB < inc.siteE &&
+            inc.siteE <= group.groupE)
+          return true;
+      }
+      return false;
+    };
+
     // Do not silently delete any include directive other than the run whose
     // expansion is explicitly part of this closure.  A complete unrelated
     // include with an empty PP cover may be consumed only when it is fully
@@ -5494,6 +5686,9 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
           includeRecordedSideEffectReason(inc);
       if (!inc.cover.IsValid() && !sideEffectReason &&
           sourceBegin <= inc.siteB && inc.siteE <= sourceEnd)
+        continue;
+      if (sideEffectReason &&
+          includeIsInsidePreservableZeroTokenConditionalGap(inc))
         continue;
 
       if (sideEffectReason) {

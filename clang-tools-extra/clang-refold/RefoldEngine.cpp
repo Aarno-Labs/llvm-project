@@ -3498,32 +3498,87 @@ std::string RefoldEngine::RunSinglePassRefold() {
     return outermostOwningIncludeSiteInTU(directive.ownerIncludeId);
   };
 
+  // Return true when a final TU edit carries this include directive forward
+  // instead of deleting it.  Include-owned macro-state directives are consumed
+  // only if the owning include site disappears from the emitted TU stream.
+  //
+  // A TU replacement may cover the include site's original bytes while also
+  // preserving that include directive as part of a source island, for example a
+  // preserved conditional gap.  In that case descendants such as #define/#undef
+  // lines inside the header remain live through the include and must not be
+  // repaired again by hoisting their directive text into the TU.
+  auto includeSitePreservedByFinalTUEdit =
+      [&](const RefoldModel::IncludeItem &inc) {
+    std::optional<size_t> editIndex =
+        finalTUEditContainingInterval(inc.siteB, inc.siteE);
+    if (!editIndex)
+      return false;
+
+    const TextEdit &edit = tuEdits[*editIndex];
+    StringRef directiveText = inc.text;
+    if (directiveText.empty())
+      directiveText = tuBytes.slice(inc.siteB, inc.siteE);
+    if (directiveText.empty())
+      return false;
+
+    // Match a real preserved directive line, not an arbitrary occurrence of the
+    // same bytes in replacement payload text.  The preserved include may be
+    // nested under a carried-forward #if/#endif island, but the directive must
+    // still begin at physical BOL modulo horizontal whitespace.
+    auto atDirectiveLineStart = [](StringRef replacement, size_t pos) {
+      size_t lineBegin = replacement.rfind('\n', pos);
+      lineBegin = lineBegin == StringRef::npos ? 0 : lineBegin + 1;
+      for (size_t i = lineBegin; i < pos; ++i)
+        if (!stringutils::isNonNewlineWs(replacement[i]))
+          return false;
+      return true;
+    };
+
+    StringRef replacement(edit.text);
+    size_t pos = 0;
+    while ((pos = replacement.find(directiveText, pos)) != StringRef::npos) {
+      if (atDirectiveLineStart(replacement, pos))
+        return true;
+      pos += directiveText.size();
+    }
+    return false;
+  };
+
   // Return the final TU edit that fully consumes this macro-state directive.
   // TU-spelled directives are matched by their own byte range.  Include-owned
   // directives are matched by the owning include site, since that is the source
-  // spelling actually removed from the output file.
+  // spelling actually removed from the output file.  If the TU edit preserves
+  // the include directive itself, the header's macro-state transition is still
+  // present and therefore is not consumed.
   auto finalTUEditContainingMacroDirective =
       [&](const RefoldModel::MacroDirective &directive)
           -> std::optional<size_t> {
     if (PathsEqual(directive.sitePath, tuPath))
       return finalTUEditContainingInterval(directive.siteB, directive.siteE);
 
-    if (const RefoldModel::IncludeItem *inc = owningIncludeSiteInTU(directive))
+    if (const RefoldModel::IncludeItem *inc = owningIncludeSiteInTU(directive)) {
+      if (includeSitePreservedByFinalTUEdit(*inc))
+        return std::nullopt;
       return finalTUEditContainingInterval(inc->siteB, inc->siteE);
+    }
 
     return std::nullopt;
   };
 
   // Return true when this macro-state directive is touched by any final TU edit.
-  // For include-owned directives, touching the owning include site is enough to
-  // remove the directive from the refolded TU's preprocessing environment.
+  // For include-owned directives, touching the owning include site consumes the
+  // directive only when that include directive is not itself preserved by the
+  // edit replacement.
   auto macroDirectiveTouchedByTUEdit =
       [&](const RefoldModel::MacroDirective &directive) {
     if (PathsEqual(directive.sitePath, tuPath))
       return intervalOverlapsFinalTUEdit(directive.siteB, directive.siteE);
 
-    if (const RefoldModel::IncludeItem *inc = owningIncludeSiteInTU(directive))
+    if (const RefoldModel::IncludeItem *inc = owningIncludeSiteInTU(directive)) {
+      if (includeSitePreservedByFinalTUEdit(*inc))
+        return false;
       return intervalOverlapsFinalTUEdit(inc->siteB, inc->siteE);
+    }
 
     return false;
   };
