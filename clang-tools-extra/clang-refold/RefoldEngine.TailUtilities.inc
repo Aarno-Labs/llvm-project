@@ -2502,7 +2502,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                         computeSourceLineDirectiveGapResume(
                             StringRef(headerText), gapBegin, gapEnd,
                             sourceEnvelope->end, file,
-                            headerSourceLineDirectiveLineRewriter)) {
+                            headerSourceLineDirectiveLineRewriter, nullptr,
+                            model_.GetSourcePath())) {
                   // Header full-envelope widening uses the same owner-piece gap
                   // proof as TU/include closure.  A source-spelled
                   // line-control gap is not disposable trivia, but it is

@@ -1138,7 +1138,8 @@ computeSourceLineDirectiveGapResume(
     StringRef fileText, uint64_t gapBegin, uint64_t gapEnd,
     uint64_t resumeOffset, StringRef defaultFileSpelling,
     SourceLineDirectiveLogicalLineRewriter logicalLineRewriter = nullptr,
-    SmallVectorImpl<uint64_t> *acceptedMacroInvocationIds = nullptr) {
+    SmallVectorImpl<uint64_t> *acceptedMacroInvocationIds = nullptr,
+    StringRef baseFileSpelling = StringRef()) {
   if (gapBegin >= gapEnd || gapEnd > fileText.size() ||
       resumeOffset < gapEnd || resumeOffset > fileText.size())
     return std::nullopt;
@@ -1292,6 +1293,18 @@ computeSourceLineDirectiveGapResume(
             return std::nullopt;
           return formatLineControlFileOperand(
               sys::path::filename(StringRef(*fileSpelling)));
+        }
+
+        if (macro.name == "__BASE_FILE__") {
+          // __BASE_FILE__ is not affected by prior #line state.  It names the
+          // top-level source file for the preprocessing run, so header closure
+          // callers pass that spelling explicitly instead of deriving it from
+          // the current presumed file.
+          StringRef baseSpelling =
+              baseFileSpelling.empty() ? defaultFileSpelling : baseFileSpelling;
+          if (baseSpelling.empty())
+            return std::nullopt;
+          return formatLineControlFileOperand(baseSpelling);
         }
 
         return std::nullopt;
