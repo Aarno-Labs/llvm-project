@@ -338,7 +338,7 @@ std::pair<size_t, size_t> clampUnorderedRange(StringRef text, size_t begin,
 /// The endpoints are first clamped into [0, text.size()]. If the resulting end
 /// precedes the begin, the bounds are swapped so callers may pass unordered
 /// byte offsets without changing the queried set of bytes.
-inline constexpr bool rangeContainsNewline(StringRef text, size_t begin,
+inline bool rangeContainsNewline(StringRef text, size_t begin,
                                            size_t end) {
   const auto range = clampUnorderedRange(text, begin, end);
   return text.substr(range.first, range.second - range.first).find('\n') !=
@@ -350,7 +350,7 @@ inline constexpr bool rangeContainsNewline(StringRef text, size_t begin,
 /// The accepted whitespace set is the same ASCII set as isWs(): space, HT, LF,
 /// VT, FF, and CR. The endpoints are clamped and unordered bounds are swapped
 /// using the same policy as rangeContainsNewline().
-inline constexpr bool rangeContainsOnlyWs(StringRef text, size_t begin,
+inline bool rangeContainsOnlyWs(StringRef text, size_t begin,
                                           size_t end) {
   const auto range = clampUnorderedRange(text, begin, end);
   return isWs(text.substr(range.first, range.second - range.first));
@@ -381,13 +381,13 @@ inline constexpr size_t lineEndOffset(StringRef text, size_t pos) {
 
 /// True iff only line whitespace appears between the containing line start and
 /// \p offset.
-inline constexpr bool beginsLineAfterWs(StringRef text, size_t offset) {
+inline bool beginsLineAfterWs(StringRef text, size_t offset) {
   return rangeContainsOnlyWs(text, lineStartOffset(text, offset), offset);
 }
 
 /// True iff only line whitespace appears between \p offset and the containing
 /// line end.
-inline constexpr bool endsLineBeforeWs(StringRef text, size_t offset) {
+inline bool endsLineBeforeWs(StringRef text, size_t offset) {
   return rangeContainsOnlyWs(text, offset, lineEndOffset(text, offset));
 }
 
