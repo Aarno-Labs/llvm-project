@@ -4042,10 +4042,110 @@ std::string RefoldEngine::RunSinglePassRefold() {
     return std::nullopt;
   };
 
+  // Find an existing physical line boundary strictly after an observing token
+  // such that no later replacement byte would observe the same definition once
+  // the directive is inserted there.  This lets consumed #define repair restore
+  // the macro before surviving original source, without appending the directive
+  // after an unrelated replacement prefix such as the leading `int` of a kept
+  // function declaration.
+  auto replacementLineStartAfterFinalObservation =
+      [&](const TextEdit &edit, const RefoldModel::MacroDirective &definition,
+          StringRef macroName, size_t firstObservationOffset)
+          -> std::optional<size_t> {
+    StringRef replacement(edit.text);
+    if (firstObservationOffset >= replacement.size())
+      return std::nullopt;
+
+    for (size_t i = firstObservationOffset + 1; i < replacement.size(); ++i) {
+      const size_t nl = i - 1;
+      if (replacement[nl] != '\n')
+        continue;
+      if (stringutils::isLineSplice(replacement, nl))
+        continue;
+
+      // Re-run the ordinary observation proof on the replacement suffix that
+      // would appear after the inserted directive.  If that suffix has no
+      // observing token, every replacement byte that must remain in B's
+      // pre-definition macro state stays before the insertion point, while the
+      // surviving original source after the edit can observe the restored
+      // definition.
+      TextEdit suffixEdit = edit;
+      suffixEdit.text = replacement.drop_front(i).str();
+      if (!firstReplacementObservationOffset(suffixEdit, definition, macroName))
+        return i;
+    }
+
+    return std::nullopt;
+  };
+
+  // Return true when a text slice contains a real preprocessor directive
+  // line.  Macro-state movement may cross ordinary replacement/source bytes
+  // only when those bytes cannot observe the moved transition; crossing an
+  // unrelated directive line is not an ordinary observation problem, because
+  // conditionals, includes, and macro-state transitions can have structural
+  // effects not modeled by token-level macro-name matching.
+  auto containsDirectiveLine = [](StringRef text) {
+    bool atLineStart = true;
+    bool onlyHorizontalWsOnLine = true;
+    for (char c : text) {
+      if (atLineStart) {
+        atLineStart = false;
+        onlyHorizontalWsOnLine = true;
+      }
+      if (c == '\n') {
+        atLineStart = true;
+        onlyHorizontalWsOnLine = true;
+        continue;
+      }
+      if (onlyHorizontalWsOnLine && stringutils::isNonNewlineWs(c))
+        continue;
+      if (onlyHorizontalWsOnLine && c == '#')
+        return true;
+      onlyHorizontalWsOnLine = false;
+    }
+    return false;
+  };
+
+  // Return true when moving `definition` across a source chunk could change how
+  // that chunk preprocesses.  Ordinary replacement/source text observes an
+  // object-like macro by identifier spelling and a function-like macro only by
+  // invocation spelling.  Directive lines are fail-closed hazards because their
+  // effects are not reducible to ordinary macro-name token observation.
+  auto sourceChunkObservesDefinitionWhenCrossed =
+      [&](const RefoldModel::MacroDirective &definition, StringRef macroName,
+          StringRef chunk, StringRef following) {
+        if (chunk.empty())
+          return false;
+        if (containsDirectiveLine(chunk))
+          return true;
+        switch (macroObservationKindForDefinition(definition, macroName)) {
+        case MacroReplacementObservationKind::IdentifierToken:
+          return rawIdentifierAppearsInText(macroName, chunk);
+        case MacroReplacementObservationKind::FunctionLikeInvocation:
+          return firstFunctionLikeInvocationOffsetInReplacement(macroName, chunk,
+                                                                following)
+              .has_value();
+        }
+        return true;
+      };
+
+  auto sourceRangeOverlapsFinalTUEditExcept =
+      [&](uint64_t begin, uint64_t end, size_t exceptEditIndex) {
+        for (size_t editIndex = 0; editIndex < tuEdits.size(); ++editIndex) {
+          if (editIndex == exceptEditIndex)
+            continue;
+          const TextEdit &edit = tuEdits[editIndex];
+          if (sourceIntervalsOverlap(begin, end, edit.start, edit.end))
+            return true;
+        }
+        return false;
+      };
+
   enum class MacroStatePreservationPlacement {
     BeforeReplacement,
     InsideReplacement,
     AfterReplacement,
+    AdvancedBeforeReplacement,
   };
 
   struct MacroStatePreservation {
@@ -4064,6 +4164,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
       return "inside-replacement";
     case MacroStatePreservationPlacement::AfterReplacement:
       return "after-replacement";
+    case MacroStatePreservationPlacement::AdvancedBeforeReplacement:
+      return "advanced-before-replacement";
     }
     return "unknown";
   };
@@ -4110,12 +4212,162 @@ std::string RefoldEngine::RunSinglePassRefold() {
     return !needsLexicalSeparator(*leftTok, *rightTok, lexLang_);
   };
 
-  // Queue a consumed macro-state directive for preservation. Prefer the old
-  // before-replacement placement when the edit begins at physical BOL, but also
-  // allow an after-replacement placement for directives that were swallowed
-  // inside a larger TU edit. The latter keeps the edited replacement payload
-  // in the same macro-state environment as B while restoring the directive
-  // before later preserved source or includes can observe its absence.
+  // Return true when this macro-state directive is owned by the source
+  // structure consumed by `edit`.  TU-spelled directives are proved by their
+  // complete physical directive line; include-owned directives are proved by
+  // the outer TU include site that makes the header directive visible in this
+  // translation unit.
+  auto macroStateDirectiveCanBeDelayedAfterEdit =
+      [&](const TextEdit &edit, const RefoldModel::MacroDirective &directive) {
+        if (PathsEqual(directive.sitePath, tuPath) &&
+            !directive.ownerIncludeId) {
+          std::optional<MacroDirectiveSourceInterval> directiveInterval =
+              macroDirectiveFullSourceInterval(directive);
+          return directiveInterval && edit.start <= directiveInterval->begin &&
+                 directiveInterval->end <= edit.end;
+        }
+
+        const RefoldModel::IncludeItem *inc =
+            owningIncludeSiteInTU(directive);
+        if (!inc)
+          return false;
+        if (inc->siteB < edit.start || edit.end < inc->siteE)
+          return false;
+
+        // If the replacement carries the include directive itself, the header
+        // transition remains available through ordinary source order; hoisting
+        // the header's macro-state directive into the TU would duplicate it.
+        return !includeDirectiveAppearsAtLineStart(edit, *inc);
+      };
+
+  // Return true when a surviving prior #define has already appeared in the
+  // emitted TU stream at `offset`.  Advancing a consumed #undef before an
+  // observing replacement is useful only if the old definition is actually live
+  // at the advanced insertion point; moving the #undef before its defining
+  // transition would leave the replacement under the wrong macro state.
+  auto macroStateDefinitionAvailableBeforeSourceOffset =
+      [&](const RefoldModel::MacroDirective &definition, uint64_t offset) {
+        if (definition.subkind != "#define")
+          return false;
+
+        if (PathsEqual(definition.sitePath, tuPath) &&
+            !definition.ownerIncludeId) {
+          std::optional<MacroDirectiveSourceInterval> interval =
+              macroDirectiveFullSourceInterval(definition);
+          return interval && interval->end <= offset;
+        }
+
+        const RefoldModel::IncludeItem *inc = owningIncludeSiteInTU(definition);
+        return inc && inc->siteE <= offset;
+      };
+
+  // Try the #undef mirror of delayed #define preservation.  If a consumed
+  // #undef is swallowed by a mid-line edit whose replacement observes the
+  // previous live definition, inserting the #undef inside/after the payload is
+  // too late and inserting it at edit.start would split a physical source line.
+  // The complete first-order repair is to advance the zero-token transition to
+  // the start of the same physical source line, but only when every crossed byte
+  // is proof-neutral under the old definition: no other final edit overlaps the
+  // crossed prefix, no directive line is crossed, and the preserved prefix cannot
+  // itself observe the prior definition.
+  auto tryAdvanceConsumedUndefBeforeObservedReplacement =
+      [&](size_t editIndex, const RefoldModel::MacroDirective &undefDirective,
+          StringRef macroName,
+          const RefoldModel::MacroDirective &previousDefinition,
+          size_t firstObservationOffset)
+      -> std::optional<MacroStatePreservationPlacement> {
+    if (editIndex >= tuEdits.size())
+      return std::nullopt;
+
+    TextEdit &edit = tuEdits[editIndex];
+    if (edit.start == 0 || edit.start > tuBytes.size())
+      return std::nullopt;
+
+    const size_t editStart = static_cast<size_t>(edit.start);
+    const size_t lineStart = stringutils::lineStartOffset(tuBytes, editStart);
+    if (lineStart >= editStart)
+      return std::nullopt;
+
+    // A line-spliced newline does not begin a new preprocessing line, so a
+    // directive inserted at `lineStart` would be part of the previous logical
+    // line rather than a standalone macro-state transition.
+    if (lineStart > 0 && stringutils::isLineSplice(tuBytes, lineStart - 1))
+      return std::nullopt;
+
+    if (!macroStateDefinitionAvailableBeforeSourceOffset(previousDefinition,
+                                                         lineStart))
+      return std::nullopt;
+
+    if (sourceRangeOverlapsFinalTUEditExcept(lineStart, edit.start, editIndex))
+      return std::nullopt;
+
+    StringRef replacementText(edit.text);
+    if (firstObservationOffset > replacementText.size())
+      return std::nullopt;
+
+    // Advancing the #undef before the whole edit means even replacement bytes
+    // before the first observing token see the post-undef state.  Those bytes
+    // must therefore be neutral with respect to the old definition; otherwise
+    // the replacement needs a replacement-internal boundary, not a source-line
+    // advance.
+    StringRef replacementPrefix =
+        replacementText.take_front(firstObservationOffset);
+    if (sourceChunkObservesDefinitionWhenCrossed(
+            previousDefinition, macroName, replacementPrefix,
+            replacementText.drop_front(firstObservationOffset)))
+      return std::nullopt;
+
+    StringRef crossedPrefix = tuBytes.slice(lineStart, edit.start);
+    if (sourceChunkObservesDefinitionWhenCrossed(
+            previousDefinition, macroName, crossedPrefix, replacementText))
+      return std::nullopt;
+
+    std::string replacement;
+    const std::string directiveText =
+        directiveTextForPreservation(undefDirective);
+    replacement.reserve(directiveText.size() + crossedPrefix.size() +
+                        replacementText.size());
+    replacement += directiveText;
+    replacement.append(crossedPrefix.begin(), crossedPrefix.end());
+    replacement.append(replacementText.begin(), replacementText.end());
+
+    const uint64_t oldStart = edit.start;
+    ResyncOutcome resync =
+        ApplyResyncOrPend(tuBytes, lineStart, edit.end, replacement, tuPath);
+    edit.start = lineStart;
+    edit.text = std::move(resync.text);
+    edit.pending = std::move(resync.pending);
+    edit.isDirectTUHunkEdit = false;
+    edit.directTUHunkIndex.reset();
+    edit.directTUHunkAStart.reset();
+    edit.directTUHunkAEnd.reset();
+    edit.directTUHunkBStart.reset();
+    edit.directTUHunkBEnd.reset();
+    edit.directTURawStart.reset();
+    edit.directTURawEnd.reset();
+    edit.directTUFinalStart = edit.start;
+    edit.directTUFinalEnd = edit.end;
+
+    AttachAcceptedResultCarrier(
+        edit, BuildAcceptedTUTextEditCandidate(
+                  AcceptedPathKind::TUByteSpanConservativeEdit, edit.start,
+                  edit.end, StringRef(edit.text)));
+
+    warn("macro/liveness",
+         "advancing consumed #undef before observed replacement: macro='{0}' "
+         "undefDirective=#{1} priorDefine=#{2} edit=[{3},{4}) "
+         "widenedStart={5}",
+         macroName, undefDirective.id, previousDefinition.id, oldStart,
+         edit.end, edit.start);
+
+    return MacroStatePreservationPlacement::AdvancedBeforeReplacement;
+  };
+
+  // Queue a consumed macro-state directive for preservation.  The placement is
+  // selected from the first-order macro-state invariant rather than from a BOL
+  // special case: replacement bytes that must remain in B's pre-transition
+  // state get the directive after the replacement, while bytes that may observe
+  // the transition can keep the simpler before-replacement placement.
   auto tryQueueMacroStateDirectivePreservation =
       [&](size_t editIndex, const RefoldModel::MacroDirective &directive,
           StringRef macroName,
@@ -4147,28 +4399,24 @@ std::string RefoldEngine::RunSinglePassRefold() {
 
     const bool editStartsAtPhysicalBOL =
         edit.start == 0 || tuBytes[edit.start - 1] == '\n';
-    if (editStartsAtPhysicalBOL) {
+    const bool beforePlacementWouldExposeDefine =
+        directive.subkind == "#define" && replacementObservesDefinition;
+    if (editStartsAtPhysicalBOL && !beforePlacementWouldExposeDefine) {
       // Before-replacement placement has opposite polarity for #define and
       // #undef. Re-emitting a consumed #define before the payload makes that
-      // definition active for the replacement, so the payload must not observe
-      // it. Re-emitting a consumed #undef before the payload is the repair: it
-      // intentionally removes any prior live definition before the replacement
-      // tokens are preprocessed, matching the B-side macro-state environment
-      // and keeping later surviving source protected by the same transition.
-      if (directive.subkind == "#define" && replacementObservesDefinition)
-        return std::nullopt;
+      // definition active for the replacement, so use it only when the payload
+      // proves it cannot observe that definition. Re-emitting a consumed #undef
+      // before the payload is the repair: it intentionally removes any prior
+      // live definition before replacement tokens are preprocessed, matching
+      // the B-side macro-state environment and keeping later surviving source
+      // protected by the same transition.
       macroStatePreservationsByEdit[editIndex].push_back(
           MacroStatePreservation{
               &directive, MacroStatePreservationPlacement::BeforeReplacement});
       return MacroStatePreservationPlacement::BeforeReplacement;
     }
 
-    std::optional<MacroDirectiveSourceInterval> directiveInterval =
-        macroDirectiveFullSourceInterval(directive);
-    if (!directiveInterval)
-      return std::nullopt;
-    if (directiveInterval->begin < edit.start ||
-        edit.end < directiveInterval->end)
+    if (!macroStateDirectiveCanBeDelayedAfterEdit(edit, directive))
       return std::nullopt;
 
     // A #undef normally cannot be delayed until after a replacement that observes
@@ -4180,26 +4428,57 @@ std::string RefoldEngine::RunSinglePassRefold() {
     // the boundary remain in the old macro state; the observing token and the
     // surviving suffix see the post-undef state, exactly as B requires.
     if (directive.subkind == "#undef" && replacementObservesDefinition) {
-      if (!firstObservationOffset)
+      if (!firstObservationOffset || !definitionObservedByReplacement)
         return std::nullopt;
       std::optional<size_t> insertionOffset =
           replacementLineStartBeforeObservation(StringRef(edit.text),
                                                 *firstObservationOffset);
-      if (!insertionOffset)
-        return std::nullopt;
+      if (insertionOffset) {
+        macroStatePreservationsByEdit[editIndex].push_back(
+            MacroStatePreservation{
+                &directive, MacroStatePreservationPlacement::InsideReplacement,
+                *insertionOffset});
+        return MacroStatePreservationPlacement::InsideReplacement;
+      }
 
-      macroStatePreservationsByEdit[editIndex].push_back(
-          MacroStatePreservation{
-              &directive, MacroStatePreservationPlacement::InsideReplacement,
-              *insertionOffset});
-      return MacroStatePreservationPlacement::InsideReplacement;
+      // No replacement-internal line boundary exists before the observing token.
+      // Try the stronger source-boundary repair: move the zero-token #undef to
+      // the start of the physical source line that contains this mid-line edit,
+      // proving that the crossed preserved prefix has no observations under the
+      // old definition.
+      return tryAdvanceConsumedUndefBeforeObservedReplacement(
+          editIndex, directive, macroName, *definitionObservedByReplacement,
+          *firstObservationOffset);
     }
 
-    // For non-observing #undef payloads and for #define carry, after-replacement
-    // placement restores the directive before later preserved source/includes can
-    // observe its absence.  The replacement/suffix boundary still has to admit a
-    // directive line so the inserted zero-token directive cannot accidentally join
-    // the replacement and suffix into a different token stream.
+    // For an observing #define payload, the definition cannot appear before the
+    // observing replacement bytes.  Prefer a real line boundary inside the
+    // replacement after the final observation when one exists; this preserves the
+    // same macro-state partition while avoiding unnatural output such as
+    // splitting `int main` into `int` / `#define` / `main`.
+    if (directive.subkind == "#define" && replacementObservesDefinition &&
+        definitionObservedByReplacement) {
+      if (!firstObservationOffset)
+        return std::nullopt;
+      std::optional<size_t> insertionOffset =
+          replacementLineStartAfterFinalObservation(
+              edit, *definitionObservedByReplacement, macroName,
+              *firstObservationOffset);
+      if (insertionOffset) {
+        macroStatePreservationsByEdit[editIndex].push_back(
+            MacroStatePreservation{
+                &directive, MacroStatePreservationPlacement::InsideReplacement,
+                *insertionOffset});
+        return MacroStatePreservationPlacement::InsideReplacement;
+      }
+    }
+
+    // For non-observing #undef payloads and for #define carry without a better
+    // internal source boundary, after-replacement placement restores the
+    // directive before later preserved source/includes can observe its absence.
+    // The replacement/suffix boundary still has to admit a directive line so the
+    // inserted zero-token directive cannot accidentally join the replacement and
+    // suffix into a different token stream.
     if (!replacementSuffixBoundaryAllowsDirectiveLine(edit))
       return std::nullopt;
 
@@ -4214,65 +4493,6 @@ std::string RefoldEngine::RunSinglePassRefold() {
     MacroDirectiveSourceInterval interval;
     std::string name;
   };
-
-  auto sourceRangeOverlapsFinalTUEditExcept =
-      [&](uint64_t begin, uint64_t end, size_t exceptEditIndex) {
-        for (size_t editIndex = 0; editIndex < tuEdits.size(); ++editIndex) {
-          if (editIndex == exceptEditIndex)
-            continue;
-          const TextEdit &edit = tuEdits[editIndex];
-          if (sourceIntervalsOverlap(begin, end, edit.start, edit.end))
-            return true;
-        }
-        return false;
-      };
-
-  auto containsDirectiveLine = [](StringRef text) {
-    bool atLineStart = true;
-    bool onlyHorizontalWsOnLine = true;
-    for (char c : text) {
-      if (atLineStart) {
-        atLineStart = false;
-        onlyHorizontalWsOnLine = true;
-      }
-      if (c == '\n') {
-        atLineStart = true;
-        onlyHorizontalWsOnLine = true;
-        continue;
-      }
-      if (onlyHorizontalWsOnLine && stringutils::isNonNewlineWs(c))
-        continue;
-      if (onlyHorizontalWsOnLine && c == '#')
-        return true;
-      onlyHorizontalWsOnLine = false;
-    }
-    return false;
-  };
-
-  // Return true when moving `definition` after a source chunk could change how
-  // that chunk preprocesses. Ordinary replacement/source text observes an
-  // object-like macro by identifier spelling and a function-like macro only by
-  // invocation spelling. Preprocessor directive lines are stricter: includes,
-  // conditionals, and macro-state transitions can have subtree or definedness
-  // effects that are not represented by ordinary raw token observation, so any
-  // non-carried directive line in the crossed range is a hard hazard.
-  auto sourceChunkObservesDefinitionWhenCrossed =
-      [&](const RefoldModel::MacroDirective &definition, StringRef macroName,
-          StringRef chunk, StringRef following) {
-        if (chunk.empty())
-          return false;
-        if (containsDirectiveLine(chunk))
-          return true;
-        switch (macroObservationKindForDefinition(definition, macroName)) {
-        case MacroReplacementObservationKind::IdentifierToken:
-          return rawIdentifierAppearsInText(macroName, chunk);
-        case MacroReplacementObservationKind::FunctionLikeInvocation:
-          return firstFunctionLikeInvocationOffsetInReplacement(macroName, chunk,
-                                                                following)
-              .has_value();
-        }
-        return true;
-      };
 
   auto activeTUDefinitionAtOffset =
       [&](const RefoldModel::MacroDirective &definition, StringRef macroName,
@@ -4725,12 +4945,13 @@ std::string RefoldEngine::RunSinglePassRefold() {
                   m.name, definition->id, m.id);
           }
         } else {
-          // Preserving the directive would either be syntactically invalid or
-          // would expose the replacement payload to a macro definition that was
-          // not visible in B. Header-spelled callsites cannot be patched in the
-          // TU, so such cases remain outside this proof class and fail closed.
+          // Preserving the directive would either be syntactically invalid,
+          // would expose replacement bytes to a macro state that B did not
+          // have, or would break the replacement/suffix lexical boundary.
+          // Header-spelled callsites cannot be patched in the TU, so such cases
+          // remain outside this proof class and fail closed.
           debug("macro/liveness",
-                "cannot preserve consumed #define before surviving macro "
+                "cannot preserve consumed #define for surviving macro "
                 "callsite: macro='{0}' defDirective=#{1} inv=#{2}",
                 m.name, definition->id, m.id);
         }
@@ -4747,8 +4968,9 @@ std::string RefoldEngine::RunSinglePassRefold() {
           llvm::formatv(
               "macro '{0}' invocation #{1} survives inside preserved include "
               "site, but active definition directive #{2} was consumed by a "
-              "TU edit and the directive could not be preserved before the "
-              "surviving include observes macro state",
+              "TU edit and the directive could not be preserved in any "
+              "proved placement before the surviving include observes macro "
+              "state",
               m.name, m.id, definition->id)
               .str());
       continue;
@@ -4764,7 +4986,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
           "macro-definition-liveness",
           llvm::formatv("macro '{0}' invocation #{1} survives but active "
                         "definition directive #{2} was consumed by a TU edit; "
-                        "the #define could not be preserved and no whole-cover "
+                        "the #define could not be preserved in any proved "
+                        "placement and no whole-cover "
                         "realization is available",
                         m.name, m.id, definition->id)
               .str());
@@ -5008,6 +5231,14 @@ std::string RefoldEngine::RunSinglePassRefold() {
       if (preservation.placement ==
           MacroStatePreservationPlacement::BeforeReplacement) {
         prefix += directiveTextForPreservation(*preservation.directive);
+        continue;
+      }
+
+      if (preservation.placement ==
+          MacroStatePreservationPlacement::AdvancedBeforeReplacement) {
+        // Advanced-before-replacement repairs widen and rewrite the owning edit
+        // immediately because they move the directive to a source byte boundary
+        // outside the original edit start, not to a replacement-local offset.
         continue;
       }
 
