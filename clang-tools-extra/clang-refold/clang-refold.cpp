@@ -262,9 +262,15 @@ struct JsonPragmaItem {
   std::optional<uint64_t> ownerIncludeId = std::nullopt;
 };
 
+struct JsonTokenSpanForSideband {
+  uint64_t begin = 0;
+  uint64_t end = 0;
+};
+
 struct JsonIncludeItemForSideband {
   uint64_t id = 0;
   std::string resolvedPath;
+  std::vector<JsonTokenSpanForSideband> spans;
 };
 
 /// Return true iff a physical line is a preserved pragma directive line.
@@ -417,6 +423,105 @@ static void filterSidebandPragmaTokens(ArrayRef<SidebandPragmaLine> lines,
   tokOff = std::move(filteredOffs);
 }
 
+
+static bool tokenOffsetIsInSidebandPragma(ArrayRef<SidebandPragmaLine> lines,
+                                          size_t off) {
+  for (const SidebandPragmaLine &line : lines) {
+    if (off < line.begin)
+      return false;
+    if (line.begin <= off && off < line.end)
+      return true;
+  }
+  return false;
+}
+
+/// Build the normal token stream used to anchor sideband directives.
+///
+/// Sideband pragma lines are deliberately absent from the producer token count,
+/// so sideband matching must reason in the same coordinate space: the sequence
+/// of ordinary preprocessed tokens after those directive lines are ignored.
+static std::vector<StringRef>
+buildNormalTokenRefsExcludingSideband(ArrayRef<SidebandPragmaLine> lines,
+                                      ArrayRef<PPTok> toks,
+                                      ArrayRef<std::size_t> tokOff) {
+  std::vector<StringRef> out;
+  out.reserve(toks.size());
+  for (size_t i = 0; i < toks.size(); ++i) {
+    if (tokenOffsetIsInSidebandPragma(lines, tokOff[i]))
+      continue;
+    out.push_back(toks[i].spelling);
+  }
+  return out;
+}
+
+/// Project an A-side normal-token gap into B through the ordinary-token LCS.
+///
+/// Absolute gaps are not stable under edits that insert or delete normal tokens
+/// before a pragma.  The stable object is the boundary between neighboring
+/// ordinary tokens.  This routine projects that boundary through the LCS and
+/// succeeds only when the boundary has a unique image in B.
+static std::optional<uint64_t> projectAGapToBGap(ArrayRef<int64_t> aToB,
+                                                uint64_t aGap) {
+  std::optional<uint64_t> leftB;
+  std::optional<uint64_t> rightB;
+  for (uint64_t a = 0; a < aToB.size(); ++a) {
+    if (aToB[a] < 0)
+      continue;
+    const uint64_t b = static_cast<uint64_t>(aToB[a]);
+    if (a < aGap) {
+      leftB = b;
+      continue;
+    }
+    rightB = b;
+    break;
+  }
+
+  if (leftB && rightB) {
+    if (*leftB + 1 != *rightB)
+      return std::nullopt;
+    return *rightB;
+  }
+  if (rightB)
+    return *rightB;
+  if (leftB)
+    return *leftB + 1;
+  return 0;
+}
+
+/// Project a B-side normal-token gap back to A through the ordinary-token LCS.
+///
+/// This is used to decide whether a sideband pragma that survived in B is the
+/// same source pragma that appeared in A.  Matching by raw text is insufficient
+/// for duplicate unknown pragmas; matching by absolute B gap is also unstable
+/// when normal-token edits before the pragma changed the token count.
+static std::optional<uint64_t> projectBGapToAGap(ArrayRef<int64_t> aToB,
+                                                uint64_t bGap) {
+  std::optional<uint64_t> leftA;
+  std::optional<uint64_t> rightA;
+  for (uint64_t a = 0; a < aToB.size(); ++a) {
+    if (aToB[a] < 0)
+      continue;
+    const uint64_t b = static_cast<uint64_t>(aToB[a]);
+    if (b < bGap) {
+      leftA = a;
+      continue;
+    }
+    rightA = a;
+    break;
+  }
+
+  if (leftA && rightA) {
+    if (*leftA + 1 != *rightA)
+      return std::nullopt;
+    return *rightA;
+  }
+  if (rightA)
+    return *rightA;
+  if (leftA)
+    return *leftA + 1;
+  return 0;
+}
+
 static std::vector<JsonPragmaItem>
 collectJsonPragmaItems(const json::Object &rootJson) {
   std::vector<JsonPragmaItem> out;
@@ -486,6 +591,19 @@ collectJsonIncludesForSideband(const json::Object &rootJson) {
     JsonIncludeItemForSideband inc;
     inc.id = static_cast<uint64_t>(*id);
     inc.resolvedPath = resolved->str();
+    if (const json::Array *spans = obj->getArray("spans")) {
+      for (const json::Value &spanValue : *spans) {
+        const json::Object *spanObj = spanValue.getAsObject();
+        if (!spanObj)
+          continue;
+        auto begin = spanObj->getInteger("begin");
+        auto end = spanObj->getInteger("end");
+        if (!begin || !end || *begin < 0 || *end < 0 || *begin > *end)
+          continue;
+        inc.spans.push_back(JsonTokenSpanForSideband{
+            static_cast<uint64_t>(*begin), static_cast<uint64_t>(*end)});
+      }
+    }
     out.push_back(std::move(inc));
   }
   return out;
@@ -524,6 +642,43 @@ static void inferUniqueHeaderPragmaOwners(
   }
 }
 
+
+/// Infer the include instance for one header-owned sideband occurrence.
+///
+/// A physical header can be included more than once, so resolved-path uniqueness
+/// is only a fast path.  For a concrete sideband line in A, the normal-token gap
+/// identifies where that directive appeared in the replay stream.  If exactly
+/// one include of the pragma's header owns a token span that begins at, or
+/// strictly contains, that gap, the edit can be routed through that include's
+/// normal materialization path.  Ambiguous endpoint cases still fail closed.
+static std::optional<uint64_t> inferHeaderPragmaOwnerForOccurrence(
+    const JsonPragmaItem &pragma, const SidebandPragmaLine &line,
+    ArrayRef<JsonIncludeItemForSideband> includes) {
+  if (pragma.ownerIncludeId)
+    return pragma.ownerIncludeId;
+  if (pragma.sitePath.empty() || StringRef(pragma.sitePath).starts_with("<"))
+    return std::nullopt;
+
+  std::optional<uint64_t> owner;
+  for (const JsonIncludeItemForSideband &inc : includes) {
+    if (inc.resolvedPath != pragma.sitePath)
+      continue;
+    for (const JsonTokenSpanForSideband &span : inc.spans) {
+      // A sideband directive before the first token of a header appears at the
+      // include span's begin gap.  A directive between header tokens appears
+      // strictly inside the half-open span.  Do not claim span.end here: that
+      // boundary is shared with the following owner and is therefore ambiguous
+      // without additional producer-side sideband byte ranges.
+      if (span.begin <= line.normalTokenGap && line.normalTokenGap < span.end) {
+        if (owner && *owner != inc.id)
+          return std::nullopt;
+        owner = inc.id;
+      }
+    }
+  }
+  return owner;
+}
+
 /// Pair A-side sideband pragma lines with their source `DirectivePragmaItem`.
 ///
 /// Matching is exact on directive text and stable in producer item order.  That
@@ -558,19 +713,26 @@ static std::vector<int64_t> mapSidebandLinesToPragmaItems(
 /// existing fallback path handles that out-of-domain case explicitly.
 static bool buildSidebandPragmaSourceEdits(
     const json::Object &rootJson, ArrayRef<SidebandPragmaLine> aLines,
-    ArrayRef<SidebandPragmaLine> bLines,
-    StringRef bBytes, ArrayRef<PPTok> rawBToks,
-    ArrayRef<std::size_t> rawBTokOff,
+    ArrayRef<SidebandPragmaLine> bLines, ArrayRef<PPTok> rawAToks,
+    ArrayRef<std::size_t> rawATokOff, StringRef bBytes,
+    ArrayRef<PPTok> rawBToks, ArrayRef<std::size_t> rawBTokOff,
     std::vector<RefoldEngine::SidebandPragmaEdit> &edits) {
   edits.clear();
   if (aLines.empty() && bLines.empty())
     return false;
 
   std::vector<JsonPragmaItem> pragmas = collectJsonPragmaItems(rootJson);
-  inferUniqueHeaderPragmaOwners(pragmas,
-                                collectJsonIncludesForSideband(rootJson));
+  std::vector<JsonIncludeItemForSideband> includes =
+      collectJsonIncludesForSideband(rootJson);
+  inferUniqueHeaderPragmaOwners(pragmas, includes);
   std::vector<int64_t> aToPragma =
       mapSidebandLinesToPragmaItems(aLines, pragmas);
+
+  std::vector<StringRef> normalA =
+      buildNormalTokenRefsExcludingSideband(aLines, rawAToks, rawATokOff);
+  std::vector<StringRef> normalB =
+      buildNormalTokenRefsExcludingSideband(bLines, rawBToks, rawBTokOff);
+  std::vector<int64_t> normalA2B = diffutils::lcsMapAB(normalA, normalB);
 
   std::vector<std::string> aKeys;
   std::vector<std::string> bKeys;
@@ -580,10 +742,18 @@ static bool buildSidebandPragmaSourceEdits(
   bKeys.reserve(bLines.size());
   aTextRefs.reserve(aLines.size());
   bTextRefs.reserve(bLines.size());
+
   for (const auto &line : aLines)
     aKeys.push_back(std::to_string(line.normalTokenGap) + "\x1f" + line.text);
-  for (const auto &line : bLines)
-    bKeys.push_back(std::to_string(line.normalTokenGap) + "\x1f" + line.text);
+
+  for (const auto &line : bLines) {
+    std::optional<uint64_t> projectedGap =
+        projectBGapToAGap(normalA2B, line.normalTokenGap);
+    if (!projectedGap)
+      return false;
+    bKeys.push_back(std::to_string(*projectedGap) + "\x1f" + line.text);
+  }
+
   for (const auto &key : aKeys)
     aTextRefs.push_back(key);
   for (const auto &key : bKeys)
@@ -604,7 +774,8 @@ static bool buildSidebandPragmaSourceEdits(
     edit.siteB = pragma.siteB;
     edit.siteE = pragma.siteE;
     edit.replacementText = replacement.str();
-    edit.ownerIncludeId = pragma.ownerIncludeId;
+    edit.ownerIncludeId = inferHeaderPragmaOwnerForOccurrence(
+        pragma, aLines[static_cast<size_t>(aIdx)], includes);
     edit.materializedBByteBegin = bBegin;
     edit.materializedBByteEnd = bEnd;
     edits.push_back(std::move(edit));
@@ -614,9 +785,12 @@ static bool buildSidebandPragmaSourceEdits(
   for (const diffutils::Hunk &h : hunks) {
     if (h.isDeleteOnly()) {
       for (uint64_t a = h.aStart; a < h.aEnd; ++a) {
+        std::optional<uint64_t> bGap = projectAGapToBGap(
+            normalA2B, aLines[static_cast<size_t>(a)].normalTokenGap);
+        if (!bGap)
+          return false;
         const uint64_t bAnchor = byteOffsetForNormalTokenGap(
-            bBytes, bLines, rawBToks, rawBTokOff,
-            aLines[static_cast<size_t>(a)].normalTokenGap);
+            bBytes, bLines, rawBToks, rawBTokOff, *bGap);
         if (!appendEditForA(a, "", bAnchor, bAnchor))
           return false;
       }
@@ -1792,10 +1966,10 @@ int main(int argc, char **argv) {
     annotateSidebandPragmaTokenGaps(bSidebandPragmas, bToks, bTokByteOff);
 
     if (!aSidebandPragmas.empty() || !bSidebandPragmas.empty()) {
-      if (buildSidebandPragmaSourceEdits(rootJson, aSidebandPragmas,
-                                         bSidebandPragmas, bBytes, bToks,
-                                         bTokByteOff,
-                                         sidebandPragmaEdits)) {
+      if (buildSidebandPragmaSourceEdits(
+              rootJson, aSidebandPragmas, bSidebandPragmas, aToks,
+              aTokByteOff, bBytes, bToks, bTokByteOff,
+              sidebandPragmaEdits)) {
         // Keep the raw `.i` byte buffers intact, but remove preserved pragma
         // directive tokens from the sequences fed to the structural diff.  The
         // matching source directive edits are carried separately in
