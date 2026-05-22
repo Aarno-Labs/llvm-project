@@ -1753,14 +1753,24 @@ bool RefoldEngine::AppendSidebandPragmaSourceEdits(
     // edit the wrong owner.  Reject that class explicitly instead of silently
     // preserving or dropping a header pragma.
     if (!PathsEqual(sideband.sitePath, tuPath)) {
-      RequestTerminalFallback(
-          TerminalFallbackKind::UndischargedEmissionArtifact, "pragma/sideband",
-          llvm::formatv(
-              "sideband pragma edit targets non-TU owner path='{0}' "
-              "site=[{1},{2})",
-              sideband.sitePath, sideband.siteB, sideband.siteE)
-              .str());
-      return false;
+      if (!sideband.ownerIncludeId) {
+        RequestTerminalFallback(
+            TerminalFallbackKind::UndischargedEmissionArtifact,
+            "pragma/sideband",
+            llvm::formatv(
+                "sideband pragma edit targets non-TU owner path='{0}' "
+                "site=[{1},{2}) without a unique include owner",
+                sideband.sitePath, sideband.siteB, sideband.siteE)
+                .str());
+        return false;
+      }
+
+      trace("pragma/sideband",
+            "defer header-owned sideband pragma edit path='{0}' site=[{1},{2}) "
+            "to include inc#{3}",
+            sideband.sitePath, sideband.siteB, sideband.siteE,
+            *sideband.ownerIncludeId);
+      continue;
     }
 
     if (sideband.siteB > sideband.siteE || sideband.siteE > tuBytes.size()) {
@@ -1782,6 +1792,8 @@ bool RefoldEngine::AppendSidebandPragmaSourceEdits(
     // and nearby code can stay on the normal structural path.
     TextEdit edit{sideband.siteB, sideband.siteE, sideband.replacementText,
                   std::nullopt, std::nullopt, {}};
+    StampTextEditMaterializedBByteRange(edit, sideband.materializedBByteBegin,
+                                        sideband.materializedBByteEnd);
     AttachAcceptedResultCarrier(
         edit, BuildAcceptedTUTextEditCandidate(
                   AcceptedPathKind::TUByteSpanConservativeEdit, sideband.siteB,
@@ -2433,10 +2445,6 @@ std::string RefoldEngine::RunSinglePassRefold() {
   }
 
   // 4) Classify hunks and collect per-target edits.
-  std::vector<TextEdit> tuEdits;
-  if (!AppendSidebandPragmaSourceEdits(tuPath, tuBytes, tuEdits))
-    return std::string();
-
   // Collect the set of root macro invocation ids that remain expanded in the
   // final chosen refold result. This is populated only by edits that survive
   // into the final applied text so the reported stats reflect the emitted
@@ -2450,6 +2458,10 @@ std::string RefoldEngine::RunSinglePassRefold() {
   // correctly.
   DenseMap<std::optional<uint64_t>, DenseMap<uint64_t, MacroPatch>>
       macroPatchByOwnerByMacroId;
+
+  std::vector<TextEdit> tuEdits;
+  if (!AppendSidebandPragmaSourceEdits(tuPath, tuBytes, tuEdits))
+    return std::string();
 
   // Diagnostic-only helper: derive the B-token envelope that corresponds to an
   // A-token interval by looking only at the final A->B token map.
@@ -5831,6 +5843,16 @@ std::string RefoldEngine::RunSinglePassRefold() {
   auto perIncludeKeys = make_first_range(perInclude);
   seeds.insert(perIncludeKeys.begin(), perIncludeKeys.end());
 
+  // (a.1) Header-owned sideband pragma edits are zero-normal-token source
+  // edits. They do not create an include patch from an A/B hunk, but they still
+  // dirty the include instance whose header text contains the pragma. Seed that
+  // include so the normal owner-polymorphic materialization path applies the
+  // source edit inside the header and then folds the materialized expansion back
+  // through its parent include chain.
+  for (const SidebandPragmaEdit &sideband : sidebandPragmaEdits_)
+    if (sideband.ownerIncludeId)
+      seeds.insert(*sideband.ownerIncludeId);
+
   // (b) Macro-owned work INSIDE headers (ownerIncludeId != null).
   for (auto &kv : macroPatchesByOwner) {
     if (kv.first)
@@ -6157,6 +6179,40 @@ std::string RefoldEngine::RunSinglePassRefold() {
         return true;
       };
 
+  // See the corresponding helper in MaterializeIncludeExpansion: only the
+  // sideband-pragma-only materialization class is allowed to suppress #line
+  // wrappers that ordinary --with-lines include materialization would emit.
+  enum class TUIncludeMaterializationWorkClass { None, SidebandPragmaOnly,
+                                                Ordinary };
+  auto classifyTUIncludeMaterializationWork =
+      [&](auto &&self, uint64_t id) -> TUIncludeMaterializationWorkClass {
+    bool sawSideband = llvm::any_of(
+        sidebandPragmaEdits_, [&](const SidebandPragmaEdit &e) {
+          return e.ownerIncludeId && *e.ownerIncludeId == id;
+        });
+    if (auto it = perInclude.find(id);
+        it != perInclude.end() && !it->second.patches.empty())
+      return TUIncludeMaterializationWorkClass::Ordinary;
+    if (auto it = macroPatchesByOwner.find(std::optional<uint64_t>(id));
+        it != macroPatchesByOwner.end() && !it->second.empty())
+      return TUIncludeMaterializationWorkClass::Ordinary;
+    if (auto it = children.find(id); it != children.end()) {
+      for (const auto *child : it->second) {
+        switch (self(self, child->id)) {
+        case TUIncludeMaterializationWorkClass::Ordinary:
+          return TUIncludeMaterializationWorkClass::Ordinary;
+        case TUIncludeMaterializationWorkClass::SidebandPragmaOnly:
+          sawSideband = true;
+          break;
+        case TUIncludeMaterializationWorkClass::None:
+          break;
+        }
+      }
+    }
+    return sawSideband ? TUIncludeMaterializationWorkClass::SidebandPragmaOnly
+                       : TUIncludeMaterializationWorkClass::None;
+  };
+
   // Apply TU-level include expansions by replacing the original `#include`
   // directive with the realized expansion text. For includes whose site is in
   // the TU itself (no parent include, and sitePath == tuPath), use the
@@ -6208,12 +6264,16 @@ std::string RefoldEngine::RunSinglePassRefold() {
 
       debug("include/tu", "TU include expansion inc#{0} site=[{1},{2}) len={3}",
             inc->id, siteB, siteE, expText.size());
-      std::string headerPath = resolveHeaderPath(*inc);
       LineDirectiveLocation parentResume =
           LineDirectiveInserter::LogicalLocationAtOffset(tuBytes, siteE,
                                                          tuPath);
-      std::string wrapped = lineDirs_.WrapIncludeExpansion(
-          headerPath, parentResume.fileSpelling, parentResume.lineNo, expText);
+      const bool sidebandOnly =
+          classifyTUIncludeMaterializationWork(
+              classifyTUIncludeMaterializationWork, inc->id) ==
+          TUIncludeMaterializationWorkClass::SidebandPragmaOnly;
+      std::string wrapped = WrapIncludeExpansionForMaterialization(
+          *inc, parentResume.fileSpelling, std::nullopt, siteE,
+          parentResume.lineNo, expText, sidebandOnly);
       TextEdit edit{siteB,        siteE,        std::move(wrapped),
                     std::nullopt, std::nullopt, {}};
       auto itAccepted = includeExpansionAcceptedResults.find(incId);

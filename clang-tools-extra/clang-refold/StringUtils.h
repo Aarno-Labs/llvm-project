@@ -127,6 +127,13 @@ inline bool isWs(StringRef s) noexcept {
   return all_of(s, [](char c) { return isWs(c); });
 }
 
+/// Returns true for predefined macros whose expansion can change when inserted
+/// or removed `#line` directives alter the logical source location.
+inline bool isLineDirectiveSensitiveBuiltin(StringRef name) {
+  return name == "__LINE__" || name == "__FILE__" || name == "__FILE_NAME__" ||
+         name == "__BASE_FILE__";
+}
+
 // ---------------------- Index scans (return -1 if none) ----------------------
 
 /// Return the first non-whitespace byte offset, or nullopt for all-whitespace.

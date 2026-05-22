@@ -250,13 +250,21 @@ struct SidebandPragmaLine {
   std::string text;
   uint64_t begin = 0;
   uint64_t end = 0;
+  uint64_t normalTokenGap = 0;
 };
 
 struct JsonPragmaItem {
+  uint64_t id = 0;
   std::string text;
   std::string sitePath;
   uint64_t siteB = 0;
   uint64_t siteE = 0;
+  std::optional<uint64_t> ownerIncludeId = std::nullopt;
+};
+
+struct JsonIncludeItemForSideband {
+  uint64_t id = 0;
+  std::string resolvedPath;
 };
 
 /// Return true iff a physical line is a preserved pragma directive line.
@@ -306,6 +314,70 @@ collectSidebandPragmaLines(StringRef bytes) {
     begin = end;
   }
   return out;
+}
+
+/// Stamp each sideband pragma with the gap in the normal, non-sideband token
+/// stream where the directive line appears.
+///
+/// Unknown pragmas can be textually identical.  Matching only the pragma text
+/// makes deletion of the first `#pragma vendor note` indistinguishable from
+/// deletion of the second.  The normal-token gap is a deterministic structural
+/// anchor: it records whether the sideband directive appeared before token 0,
+/// between tokens 5 and 6, and so on, after ignoring other sideband pragmas.
+static void annotateSidebandPragmaTokenGaps(
+    std::vector<SidebandPragmaLine> &lines, ArrayRef<PPTok> toks,
+    ArrayRef<std::size_t> tokOff) {
+  if (lines.empty())
+    return;
+
+  size_t lineIdx = 0;
+  uint64_t normalTokensSeen = 0;
+  for (size_t i = 0; i < toks.size(); ++i) {
+    const size_t off = tokOff[i];
+    while (lineIdx < lines.size() && off >= lines[lineIdx].end) {
+      lines[lineIdx].normalTokenGap = normalTokensSeen;
+      ++lineIdx;
+    }
+
+    const bool inSideband = lineIdx < lines.size() &&
+                            off >= lines[lineIdx].begin &&
+                            off < lines[lineIdx].end;
+    if (!inSideband)
+      ++normalTokensSeen;
+  }
+
+  while (lineIdx < lines.size()) {
+    lines[lineIdx].normalTokenGap = normalTokensSeen;
+    ++lineIdx;
+  }
+}
+
+/// Return the raw byte offset in `bytes` for a gap in the normal token stream.
+///
+/// Deleting a sideband pragma has no B-side directive bytes.  For edit-map
+/// output we still need a deterministic zero-length B envelope, so use the byte
+/// position of the first normal B token after the sideband's gap, or EOF for the
+/// final gap.  Sideband directive tokens are ignored when counting the gap.
+static uint64_t byteOffsetForNormalTokenGap(
+    StringRef bytes, ArrayRef<SidebandPragmaLine> lines, ArrayRef<PPTok> toks,
+    ArrayRef<std::size_t> tokOff, uint64_t gap) {
+  size_t lineIdx = 0;
+  uint64_t normalTokensSeen = 0;
+  for (size_t i = 0; i < toks.size(); ++i) {
+    const size_t off = tokOff[i];
+    while (lineIdx < lines.size() && off >= lines[lineIdx].end)
+      ++lineIdx;
+    const bool inSideband = lineIdx < lines.size() &&
+                            off >= lines[lineIdx].begin &&
+                            off < lines[lineIdx].end;
+    if (inSideband)
+      continue;
+
+    if (normalTokensSeen == gap)
+      return static_cast<uint64_t>(off);
+    ++normalTokensSeen;
+  }
+  return static_cast<uint64_t>(bytes.size());
 }
 
 /// Remove pragma sideband tokens from an already-lexed raw replay stream.
@@ -361,11 +433,13 @@ collectJsonPragmaItems(const json::Object &rootJson) {
     if (!kind || !subkind || *kind != "directive" || *subkind != "#pragma")
       continue;
 
+    auto id = obj->getInteger("id");
     auto text = obj->getString("text");
     auto path = obj->getString("site_path");
     auto b = obj->getInteger("site_b");
     auto e = obj->getInteger("site_e");
-    if (!text || !path || !b || !e || *b < 0 || *e < 0 || *b > *e)
+    if (!id || !text || !path || !b || !e || *id < 0 || *b < 0 || *e < 0 ||
+        *b > *e)
       continue;
 
     // Built-in pseudo-files can contribute implementation pragmas to the map,
@@ -375,13 +449,79 @@ collectJsonPragmaItems(const json::Object &rootJson) {
       continue;
 
     JsonPragmaItem item;
+    item.id = static_cast<uint64_t>(*id);
     item.text = text->str();
     item.sitePath = path->str();
     item.siteB = static_cast<uint64_t>(*b);
     item.siteE = static_cast<uint64_t>(*e);
+    if (auto owner = obj->getInteger("owner_include_id"))
+      if (*owner >= 0)
+        item.ownerIncludeId = static_cast<uint64_t>(*owner);
     out.push_back(std::move(item));
   }
   return out;
+}
+
+static std::vector<JsonIncludeItemForSideband>
+collectJsonIncludesForSideband(const json::Object &rootJson) {
+  std::vector<JsonIncludeItemForSideband> out;
+  const json::Array *items = rootJson.getArray("items");
+  if (!items)
+    return out;
+
+  for (const json::Value &value : *items) {
+    const json::Object *obj = value.getAsObject();
+    if (!obj)
+      continue;
+    auto kind = obj->getString("kind");
+    auto subkind = obj->getString("subkind");
+    if (!kind || !subkind || *kind != "directive" ||
+        (*subkind != "#include" && *subkind != "#include_next"))
+      continue;
+    auto id = obj->getInteger("id");
+    auto resolved = obj->getString("resolved_path");
+    if (!id || !resolved || *id < 0)
+      continue;
+
+    JsonIncludeItemForSideband inc;
+    inc.id = static_cast<uint64_t>(*id);
+    inc.resolvedPath = resolved->str();
+    out.push_back(std::move(inc));
+  }
+  return out;
+}
+
+/// Attach an owner include id to a header-owned pragma when the map does not
+/// already provide one.
+///
+/// Older producer maps record raw `#pragma` source ranges but not the include
+/// instance that opened the header.  A header sideband edit is still safe to
+/// materialize when the physical header path has exactly one include instance
+/// in the map.  If repeated includes make the owner ambiguous, leave the owner
+/// unset so the consumer fails closed instead of editing the wrong instance.
+static void inferUniqueHeaderPragmaOwners(
+    std::vector<JsonPragmaItem> &pragmas,
+    ArrayRef<JsonIncludeItemForSideband> includes) {
+  for (JsonPragmaItem &pragma : pragmas) {
+    if (pragma.ownerIncludeId || pragma.sitePath.empty() ||
+        StringRef(pragma.sitePath).starts_with("<")) {
+      continue;
+    }
+
+    std::optional<uint64_t> uniqueInclude;
+    bool ambiguous = false;
+    for (const JsonIncludeItemForSideband &inc : includes) {
+      if (inc.resolvedPath != pragma.sitePath)
+        continue;
+      if (uniqueInclude) {
+        ambiguous = true;
+        break;
+      }
+      uniqueInclude = inc.id;
+    }
+    if (uniqueInclude && !ambiguous)
+      pragma.ownerIncludeId = *uniqueInclude;
+  }
 }
 
 /// Pair A-side sideband pragma lines with their source `DirectivePragmaItem`.
@@ -419,29 +559,42 @@ static std::vector<int64_t> mapSidebandLinesToPragmaItems(
 static bool buildSidebandPragmaSourceEdits(
     const json::Object &rootJson, ArrayRef<SidebandPragmaLine> aLines,
     ArrayRef<SidebandPragmaLine> bLines,
+    StringRef bBytes, ArrayRef<PPTok> rawBToks,
+    ArrayRef<std::size_t> rawBTokOff,
     std::vector<RefoldEngine::SidebandPragmaEdit> &edits) {
   edits.clear();
   if (aLines.empty() && bLines.empty())
     return false;
 
   std::vector<JsonPragmaItem> pragmas = collectJsonPragmaItems(rootJson);
+  inferUniqueHeaderPragmaOwners(pragmas,
+                                collectJsonIncludesForSideband(rootJson));
   std::vector<int64_t> aToPragma =
       mapSidebandLinesToPragmaItems(aLines, pragmas);
 
+  std::vector<std::string> aKeys;
+  std::vector<std::string> bKeys;
   std::vector<StringRef> aTextRefs;
   std::vector<StringRef> bTextRefs;
+  aKeys.reserve(aLines.size());
+  bKeys.reserve(bLines.size());
   aTextRefs.reserve(aLines.size());
   bTextRefs.reserve(bLines.size());
   for (const auto &line : aLines)
-    aTextRefs.push_back(line.text);
+    aKeys.push_back(std::to_string(line.normalTokenGap) + "\x1f" + line.text);
   for (const auto &line : bLines)
-    bTextRefs.push_back(line.text);
+    bKeys.push_back(std::to_string(line.normalTokenGap) + "\x1f" + line.text);
+  for (const auto &key : aKeys)
+    aTextRefs.push_back(key);
+  for (const auto &key : bKeys)
+    bTextRefs.push_back(key);
 
   std::vector<int64_t> lcs = diffutils::lcsMapAB(aTextRefs, bTextRefs);
   std::vector<diffutils::Hunk> hunks =
       diffutils::hunksFromMap(lcs, aLines.size(), bLines.size());
 
-  auto appendEditForA = [&](uint64_t aIdx, StringRef replacement) -> bool {
+  auto appendEditForA = [&](uint64_t aIdx, StringRef replacement,
+                            uint64_t bBegin, uint64_t bEnd) -> bool {
     if (aIdx >= aToPragma.size() || aToPragma[static_cast<size_t>(aIdx)] < 0)
       return false;
     const JsonPragmaItem &pragma =
@@ -451,21 +604,30 @@ static bool buildSidebandPragmaSourceEdits(
     edit.siteB = pragma.siteB;
     edit.siteE = pragma.siteE;
     edit.replacementText = replacement.str();
+    edit.ownerIncludeId = pragma.ownerIncludeId;
+    edit.materializedBByteBegin = bBegin;
+    edit.materializedBByteEnd = bEnd;
     edits.push_back(std::move(edit));
     return true;
   };
 
   for (const diffutils::Hunk &h : hunks) {
     if (h.isDeleteOnly()) {
-      for (uint64_t a = h.aStart; a < h.aEnd; ++a)
-        if (!appendEditForA(a, ""))
+      for (uint64_t a = h.aStart; a < h.aEnd; ++a) {
+        const uint64_t bAnchor = byteOffsetForNormalTokenGap(
+            bBytes, bLines, rawBToks, rawBTokOff,
+            aLines[static_cast<size_t>(a)].normalTokenGap);
+        if (!appendEditForA(a, "", bAnchor, bAnchor))
           return false;
+      }
       continue;
     }
 
     if (h.isReplace() && (h.aEnd - h.aStart) == (h.bEnd - h.bStart)) {
       for (uint64_t a = h.aStart, b = h.bStart; a < h.aEnd; ++a, ++b)
-        if (!appendEditForA(a, bLines[static_cast<size_t>(b)].text))
+        if (!appendEditForA(a, bLines[static_cast<size_t>(b)].text,
+                            bLines[static_cast<size_t>(b)].begin,
+                            bLines[static_cast<size_t>(b)].end))
           return false;
       continue;
     }
@@ -762,11 +924,6 @@ Expected<std::string> preprocessToBytes(StringRef inputPath, const PPCtx &ctx) {
   std::string out;
   readFile(tmpPath, out);
   return out;
-}
-
-static bool isLineDirectiveSensitiveBuiltin(StringRef name) {
-  return name == "__LINE__" || name == "__FILE__" ||
-         name == "__FILE_NAME__" || name == "__BASE_FILE__";
 }
 
 static bool canIgnoreNoLinesMismatch(const PPTok &aTok, const PPTok &bTok) {
@@ -1068,7 +1225,7 @@ static void recoverZeroLengthNoLinesBuiltinSpans(
   // Only zero-length sensitive builtins need the caller-body recovery path.
   for (const auto &entry : macrosById) {
     const NoLinesMacroInfo &item = entry.second;
-    if (!isLineDirectiveSensitiveBuiltin(item.name))
+    if (!stringutils::isLineDirectiveSensitiveBuiltin(item.name))
       continue;
     if (spanMarksAnyToken(item.spans, a0Toks.size()))
       continue;
@@ -1228,7 +1385,7 @@ buildNoLinesIgnoreMask(const json::Object &rootJson, const PPCtx &ctx,
       if (!kind || *kind != "macro")
         continue;
       auto name = obj->getString("name");
-      if (!name || !isLineDirectiveSensitiveBuiltin(*name))
+      if (!name || !stringutils::isLineDirectiveSensitiveBuiltin(*name))
         continue;
       auto *spansVal = obj->get("spans");
       if (!spansVal)
@@ -1631,10 +1788,13 @@ int main(int argc, char **argv) {
         collectSidebandPragmaLines(aBytes);
     std::vector<SidebandPragmaLine> bSidebandPragmas =
         collectSidebandPragmaLines(bBytes);
+    annotateSidebandPragmaTokenGaps(aSidebandPragmas, aToks, aTokByteOff);
+    annotateSidebandPragmaTokenGaps(bSidebandPragmas, bToks, bTokByteOff);
 
     if (!aSidebandPragmas.empty() || !bSidebandPragmas.empty()) {
       if (buildSidebandPragmaSourceEdits(rootJson, aSidebandPragmas,
-                                         bSidebandPragmas,
+                                         bSidebandPragmas, bBytes, bToks,
+                                         bTokByteOff,
                                          sidebandPragmaEdits)) {
         // Keep the raw `.i` byte buffers intact, but remove preserved pragma
         // directive tokens from the sequences fed to the structural diff.  The

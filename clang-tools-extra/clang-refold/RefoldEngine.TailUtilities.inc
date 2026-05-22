@@ -143,6 +143,110 @@ std::optional<std::string> RefoldEngine::BuildInlineIncludeRealizationFromB(
 
 // ============ Include processing (normalize, materialize, apply) =============
 
+bool RefoldEngine::IncludeSubtreeHasLineStateSensitiveBuiltin(
+    uint64_t includeId) const {
+  auto isDescendantOrSelf = [&](uint64_t owner) -> bool {
+    uint64_t cur = owner;
+    while (true) {
+      if (cur == includeId)
+        return true;
+      const RefoldModel::IncludeItem *inc = model_.GetIncludeById(cur);
+      if (!inc || !inc->parent)
+        return false;
+      cur = *inc->parent;
+    }
+  };
+
+  for (const auto &macro : model_.GetMacroInvocations()) {
+    if (!stringutils::isLineDirectiveSensitiveBuiltin(macro.name) ||
+        !macro.ownerIncludeId) {
+      continue;
+    }
+    if (isDescendantOrSelf(*macro.ownerIncludeId))
+      return true;
+  }
+  return false;
+}
+
+bool RefoldEngine::OwnerSuffixHasLineStateSensitiveBuiltin(
+    std::optional<uint64_t> ownerIncludeId, StringRef ownerFile,
+    uint64_t offset) const {
+  for (const auto &macro : model_.GetMacroInvocations()) {
+    if (!stringutils::isLineDirectiveSensitiveBuiltin(macro.name))
+      continue;
+    if (macro.ownerIncludeId != ownerIncludeId)
+      continue;
+    if (!macro.invFile || !macro.invB)
+      continue;
+    if (!PathsEqual(*macro.invFile, ownerFile))
+      continue;
+    if (*macro.invB >= offset)
+      return true;
+  }
+  return false;
+}
+
+std::string RefoldEngine::WrapIncludeExpansionForMaterialization(
+    const RefoldModel::IncludeItem &child, StringRef parentFileSpelling,
+    std::optional<uint64_t> parentOwnerIncludeId, uint64_t parentResumeOffset,
+    size_t parentResumeLineNo, StringRef childBody,
+    bool allowUnobservableLineDirectiveSuppression) const {
+  if (!lineDirs_.Enabled())
+    return childBody.str();
+
+  const std::string childFileSpelling = resolveHeaderPath(child);
+
+  if (!allowUnobservableLineDirectiveSuppression) {
+    // In normal --with-lines materialization, a materialized include is a
+    // logical file transition even when no token presently observes that state.
+    // Preserve the historical enter/exit wrapper so diagnostics and future
+    // source-location-sensitive edits see the same owner transition.  Selective
+    // suppression is reserved for the narrow sideband-pragma-only class below.
+    return lineDirs_.WrapIncludeExpansion(childFileSpelling, parentFileSpelling,
+                                          parentResumeLineNo, childBody);
+  }
+
+  const bool childNeedsLineState =
+      IncludeSubtreeHasLineStateSensitiveBuiltin(child.id);
+  const bool parentNeedsLineState =
+      childNeedsLineState ||
+      OwnerSuffixHasLineStateSensitiveBuiltin(parentOwnerIncludeId,
+                                              parentFileSpelling,
+                                              parentResumeOffset);
+
+  if (!childNeedsLineState && !parentNeedsLineState) {
+    trace("linedir/include",
+          "skip sideband-only include #line wrapper inc#{0}: no "
+          "line-sensitive builtins in child subtree or parent suffix",
+          child.id);
+    return childBody.str();
+  }
+
+  std::string result;
+  result.reserve(childBody.size() + 128);
+
+  if (childNeedsLineState)
+    result += lineDirs_.FormatLineDirective(1, childFileSpelling);
+
+  result += childBody.str();
+
+  if (parentNeedsLineState) {
+    // The sideband-only suppression path may still need to repair the parent
+    // logical location if a preserved suffix builtin can observe it.
+    if (!result.empty() && result.back() != '\n')
+      result += '\n';
+    result +=
+        lineDirs_.FormatLineDirective(parentResumeLineNo, parentFileSpelling);
+  }
+
+  trace("linedir/include",
+        "wrap sideband-only include inc#{0}: childLineState={1} "
+        "parentLineState={2}",
+        child.id, childNeedsLineState ? "YES" : "NO",
+        parentNeedsLineState ? "YES" : "NO");
+  return result;
+}
+
 void RefoldEngine::MaterializeIncludeExpansion(
     uint64_t includeId, const DenseMap<uint64_t, IncludeEdits> &perInclude,
     const DenseMap<std::optional<uint64_t>, std::vector<MacroPatch>>
@@ -209,6 +313,55 @@ void RefoldEngine::MaterializeIncludeExpansion(
   // at the end. This lets include edits, macro patches, and child include
   // materializations participate in one overlap/resync pass.
   std::vector<TextEdit> edits;
+
+  // 0) Sideband pragma edits owned by this include.  These pragmas were printed
+  // verbatim in the raw `.i` replay surface but deliberately removed from the
+  // normal A/B token streams before diffing.  When such a pragma lives in a
+  // header, deleting/replacing it is an include-owned source edit, not a TU
+  // edit.  Stage it here so it composes with the same owner-polymorphic header
+  // materialization path used for ordinary include and macro edits.
+  for (const SidebandPragmaEdit &sideband : sidebandPragmaEdits_) {
+    if (!sideband.ownerIncludeId || *sideband.ownerIncludeId != includeId)
+      continue;
+
+    if (sideband.siteB > sideband.siteE || sideband.siteE > bytes.size()) {
+      RequestTerminalFallback(
+          TerminalFallbackKind::UndischargedEmissionArtifact,
+          "pragma/sideband",
+          llvm::formatv("header-owned sideband pragma edit has invalid range "
+                        "inc#{0} path='{1}' site=[{2},{3}) headerSize={4}",
+                        includeId, headerPath, sideband.siteB, sideband.siteE,
+                        bytes.size())
+              .str());
+      includeExpansion[includeId] = std::string();
+      return;
+    }
+
+    // A sideband pragma line is not part of the normal PP token stream.
+    // Deleting or replacing it changes physical line count, but that drift is
+    // token-observable only if a later preserved token in this same header
+    // owner can expand a line/file-sensitive builtin.  Otherwise injecting a
+    // local #line directive merely leaves gratuitous scaffolding in the
+    // materialized header body.
+    ResyncOutcome ro =
+        OwnerSuffixHasLineStateSensitiveBuiltin(includeId, headerPath,
+                                                sideband.siteE)
+            ? ApplyResyncOrPend(bytes, sideband.siteB, sideband.siteE,
+                                sideband.replacementText, headerPath)
+            : ResyncOutcome(sideband.replacementText, std::nullopt);
+    TextEdit edit{sideband.siteB,        sideband.siteE, std::move(ro.text),
+                  std::move(ro.pending), std::nullopt,   {}};
+    AttachAcceptedResultCarrier(
+        edit, BuildAcceptedIncludeRealizationCandidate(
+                  AcceptedPathKind::IncludeMaterializedExpansion, *inc));
+    edits.push_back(std::move(edit));
+
+    trace("pragma/sideband",
+          "staged header-owned sideband pragma edit inc#{0} path='{1}' "
+          "site=[{2},{3}) replacementLen={4}",
+          includeId, headerPath, sideband.siteB, sideband.siteE,
+          sideband.replacementText.size());
+  }
 
   // 1) Macro patches owned by this include. Macro invocation ranges are already
   // recorded in the owner file's byte space, so they can be converted directly
@@ -285,10 +438,48 @@ void RefoldEngine::MaterializeIncludeExpansion(
   // Return true if this include subtree contains any work that requires
   // materialization: local include edits, local macro patches, or descendant
   // includes with work. Clean child subtrees are left as spelled directives.
+  auto includeHasSidebandPragmaWork = [&](uint64_t id) {
+    return llvm::any_of(sidebandPragmaEdits_, [&](const SidebandPragmaEdit &e) {
+      return e.ownerIncludeId && *e.ownerIncludeId == id;
+    });
+  };
+
+  // A sideband-only include materialization is the one class where omitting
+  // otherwise-unobservable #line wrappers is intentional: the include is being
+  // materialized solely to delete/replace preserved unknown pragma text that
+  // was printed in `.i` but excluded from the normal token stream.  Any ordinary
+  // include patch or macro patch re-enters the historical --with-lines policy.
+  enum class MaterializationWorkClass { None, SidebandPragmaOnly, Ordinary };
+  auto classifyMaterializationWork =
+      [&](auto &&self, uint64_t id) -> MaterializationWorkClass {
+    bool sawSideband = includeHasSidebandPragmaWork(id);
+    if (auto it = perInclude.find(id);
+        it != perInclude.end() && !it->second.patches.empty())
+      return MaterializationWorkClass::Ordinary;
+    if (auto it = macroPatchesByOwner.find(std::optional<uint64_t>(id));
+        it != macroPatchesByOwner.end() && !it->second.empty())
+      return MaterializationWorkClass::Ordinary;
+    if (auto it = children.find(id); it != children.end()) {
+      for (const auto *child : it->second) {
+        switch (self(self, child->id)) {
+        case MaterializationWorkClass::Ordinary:
+          return MaterializationWorkClass::Ordinary;
+        case MaterializationWorkClass::SidebandPragmaOnly:
+          sawSideband = true;
+          break;
+        case MaterializationWorkClass::None:
+          break;
+        }
+      }
+    }
+    return sawSideband ? MaterializationWorkClass::SidebandPragmaOnly
+                       : MaterializationWorkClass::None;
+  };
+
   auto hasDescendantWork = [&](auto &&self, uint64_t id) -> bool {
-    bool selfWork = false;
+    bool selfWork = includeHasSidebandPragmaWork(id);
     if (auto it = perInclude.find(id); it != perInclude.end())
-      selfWork = !it->second.patches.empty();
+      selfWork = selfWork || !it->second.patches.empty();
     if (!selfWork) {
       if (auto it = macroPatchesByOwner.find(id);
           it != macroPatchesByOwner.end())
@@ -356,13 +547,13 @@ void RefoldEngine::MaterializeIncludeExpansion(
             child->resolvedPath);
 
       if (siteStart < siteEnd) {
-        // Wrap the materialized child body with #line directives so diagnostics
-        // and line-sensitive builtins resume in the child and then return to
-        // the parent header after the include directive.
-        std::string childHeaderPath = resolveHeaderPath(*child);
-        std::string wrapped = lineDirs_.WrapIncludeExpansion(
-            childHeaderPath, headerPath,
-            stringutils::lineAtOffset(bytes, child->siteE), childText);
+        const bool sidebandOnly =
+            classifyMaterializationWork(classifyMaterializationWork, child->id) ==
+            MaterializationWorkClass::SidebandPragmaOnly;
+        std::string wrapped = WrapIncludeExpansionForMaterialization(
+            *child, headerPath, includeId, child->siteE,
+            stringutils::lineAtOffset(bytes, child->siteE), childText,
+            sidebandOnly);
         TextEdit edit{siteStart,    siteEnd,      std::move(wrapped),
                       std::nullopt, std::nullopt, {}};
 

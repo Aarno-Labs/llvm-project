@@ -199,6 +199,9 @@ public:
     uint64_t siteB = 0;
     uint64_t siteE = 0;
     std::string replacementText;
+    std::optional<uint64_t> ownerIncludeId = std::nullopt;
+    uint64_t materializedBByteBegin = 0;
+    uint64_t materializedBByteEnd = 0;
   };
 
   /// \brief Perform the end-to-end refolding process for a translation unit.
@@ -5015,6 +5018,29 @@ private:
   ResyncOutcome ApplyResyncOrPend(StringRef originalFileText, uint64_t start,
                                   uint64_t end, StringRef replacement,
                                   StringRef fileSpellingForDirective) const;
+
+  /// \brief Return true iff the materialized include subtree contains a
+  /// line-state-sensitive builtin invocation.
+  bool IncludeSubtreeHasLineStateSensitiveBuiltin(uint64_t includeId) const;
+
+  /// \brief Return true iff the untouched suffix of an owner file contains a
+  /// line-state-sensitive builtin invocation.
+  bool OwnerSuffixHasLineStateSensitiveBuiltin(
+      std::optional<uint64_t> ownerIncludeId, StringRef ownerFile,
+      uint64_t offset) const;
+
+  /// \brief Wrap materialized include text with the correct #line policy.
+  ///
+  /// Ordinary include materialization in --with-lines mode preserves the full
+  /// child-enter/parent-resume wrapper. The final boolean enables the narrower
+  /// sideband-pragma-only suppression path, where wrappers are emitted only if
+  /// recorded line/file-sensitive builtins can observe the logical-location
+  /// transition.
+  std::string WrapIncludeExpansionForMaterialization(
+      const RefoldModel::IncludeItem &child, StringRef parentFileSpelling,
+      std::optional<uint64_t> parentOwnerIncludeId, uint64_t parentResumeOffset,
+      size_t parentResumeLineNo, StringRef childBody,
+      bool allowUnobservableLineDirectiveSuppression) const;
 
   /// \brief Applies a set of TextEdits to originalFileText, producing the final
   /// refolded text for a single file (TU or header), while preserving __LINE__
