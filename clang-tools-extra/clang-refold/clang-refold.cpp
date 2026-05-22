@@ -1331,6 +1331,12 @@ int main(int argc, char **argv) {
   assert(!rootJson.empty() && "parsed refold map JSON object is empty");
 
   // Read files and tokenize.
+  //
+  // Refold mode deliberately treats --pp-mod as the raw edited PP replay
+  // surface. That preserves comment/trivia insertions and directive-shaped
+  // edits as source text for the existing owner/proof lattice. Check mode is
+  // different: it preprocesses both the emitted source and --pp-mod because the
+  // final oracle asks whether both replay to the same PP token stream.
   std::string aBytes, bBytes;
   auto ctxOrErr = parsePPCtx(rootJson);
   if (!ctxOrErr) {
@@ -1358,7 +1364,7 @@ int main(int argc, char **argv) {
       aBytes = std::move(*ppOrErr);
     }
 
-    // Preprocess the edited prerpocessed output file:
+    // Preprocess the edited preprocessed replay file.
     {
       auto ppOrErr = preprocessToBytes(PPModPath, ctx);
       if (!ppOrErr) {

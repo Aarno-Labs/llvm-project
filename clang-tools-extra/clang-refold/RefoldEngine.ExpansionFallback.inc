@@ -6405,6 +6405,174 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
           closureSourceEnd, stringutils::showWsWithClip(padded, 120));
   }
 
+  // If this closure deletes the include instance that originally entered a
+  // `#pragma once` header, a later same-header include that was token-empty in
+  // A can become live in the refolded source.  Leaving that later directive in
+  // place would replay declarations/tokens from the header that are not present
+  // in B.  This is a source-order effect of `#pragma once`, not an ordinary
+  // token-cover issue: the skipped include has no A cover, so it will not be
+  // found by the hunk overlap logic above.
+  //
+  // The deterministic repair for this TU include-closure class is to extend the
+  // same TU byte replacement over any immediately-reachable skipped same-header
+  // include directives.  We only cross trivia between the current closure end
+  // and the skipped directive.  If substantive source lies between them, this
+  // proof class cannot decide whether that source observes the moved header
+  // state, so it rejects instead of emitting a refolding that would reactivate
+  // the include.
+  // A consumed include only creates the reactivation hazard when the
+  // physical header is known to carry include-local once state.  We use the
+  // recorded pragma table instead of guessing from include emptiness: an empty
+  // later include can have other causes, but a consumable `#pragma once` in the
+  // resolved header gives the exact source-order state transition we must
+  // preserve.
+  auto pathHasPragmaOnce = [&](StringRef resolvedPath) -> bool {
+    for (const auto &pragma : model_.GetPragmas())
+      if (PathsEqual(pragma.sitePath, resolvedPath) &&
+          pragmaIsConsumableIncludeLocalState(pragma))
+        return true;
+    return false;
+  };
+
+  // Interpret "consumed" in the final widened source interval, not in the
+  // original hunk.  The closure may have already been padded/widened above, and
+  // the reactivation proof must reason about the exact bytes that will be
+  // replaced.
+  auto includeIntervalIsConsumed = [&](const RefoldModel::IncludeItem &inc) {
+    return sourceBegin <= inc.siteB && inc.siteE <= closureSourceEnd;
+  };
+
+  // Collect each resolved `#pragma once` header whose entering include is
+  // removed by this closure.  Later skipped includes are matched by resolved
+  // path, so repeated textual spellings such as "x.h" and "./x.h" collapse
+  // to the same include-once state when the producer resolved them that way.
+  SmallVector<StringRef, 4> consumedPragmaOncePaths;
+  for (const RefoldModel::IncludeItem *inc : touched) {
+    if (!inc->resolvedPath || !includeIntervalIsConsumed(*inc))
+      continue;
+    if (!pathHasPragmaOnce(*inc->resolvedPath))
+      continue;
+    if (!llvm::any_of(consumedPragmaOncePaths, [&](StringRef path) {
+          return PathsEqual(path, *inc->resolvedPath);
+        }))
+      consumedPragmaOncePaths.push_back(*inc->resolvedPath);
+  }
+
+  auto includeMatchesConsumedPragmaOncePath =
+      [&](const RefoldModel::IncludeItem &inc) -> bool {
+    if (!inc.resolvedPath)
+      return false;
+    return llvm::any_of(consumedPragmaOncePaths, [&](StringRef path) {
+      return PathsEqual(path, *inc.resolvedPath);
+    });
+  };
+
+  // A skipped include is only dangerous if removing the closure would make it
+  // the first preserved include of that resolved header.  If some earlier
+  // same-header include remains before the candidate, that prior include still
+  // establishes the `#pragma once` state and the candidate remains skipped.
+  auto hasPreservedPriorSameHeaderInclude =
+      [&](const RefoldModel::IncludeItem &candidate) -> bool {
+    if (!candidate.resolvedPath)
+      return false;
+    for (const auto &prior : model_.GetIncludes()) {
+      if (prior.id == candidate.id || prior.parent ||
+          !PathsEqual(prior.sitePath, tuPath) || !prior.resolvedPath)
+        continue;
+      if (!PathsEqual(*prior.resolvedPath, *candidate.resolvedPath))
+        continue;
+      if (prior.siteE > candidate.siteB)
+        continue;
+      if (!includeIntervalIsConsumed(prior))
+        return true;
+    }
+    return false;
+  };
+
+  auto extendOverReactivatedPragmaOnceIncludes = [&]() -> bool {
+    if (consumedPragmaOncePaths.empty())
+      return true;
+
+    while (true) {
+      const RefoldModel::IncludeItem *next = nullptr;
+
+      // Pick the earliest skipped same-header include that would become live
+      // after the current closure.  The loop repeats because consuming that
+      // directive can expose another immediately-following skipped include of
+      // the same header.  Ties are broken by item id to keep the proof
+      // deterministic for equal byte offsets.
+      for (const auto &inc : model_.GetIncludes()) {
+        if (inc.parent || !PathsEqual(inc.sitePath, tuPath))
+          continue;
+        if (inc.siteB < closureSourceEnd)
+          continue;
+        // Only originally-skipped includes have no A-token cover.  Includes
+        // with a cover already participated in normal token/hunk closure logic.
+        if (inc.cover.IsValid())
+          continue;
+        if (!includeMatchesConsumedPragmaOncePath(inc))
+          continue;
+        if (hasPreservedPriorSameHeaderInclude(inc))
+          continue;
+        // Do not silently erase a skipped include if the map recorded effects
+        // on that include instance.  This repair is only for the pure
+        // `#pragma once` reactivation case where the directive was token-empty
+        // because a prior include had already entered the header.
+        if (includeHasRecordedSideEffects(inc))
+          continue;
+        if (!next || inc.siteB < next->siteB ||
+            (inc.siteB == next->siteB && inc.id < next->id))
+          next = &inc;
+      }
+
+      if (!next)
+        return true;
+
+      if (next->siteB > tuBytes.size() || next->siteE > tuBytes.size() ||
+          next->siteB > next->siteE) {
+        trace("fallback",
+              "TU include-closure rejected: skipped pragma-once include "
+              "inc#{0} has invalid site=[{1},{2})",
+              next->id, next->siteB, next->siteE);
+        return false;
+      }
+
+      // Crossing only trivia is what makes the widened edit local: no
+      // preserved source between the deleted entering include and the skipped
+      // include can observe the header macro state at the old position.
+      StringRef gap = tuBytes.slice(closureSourceEnd, next->siteB);
+      if (!isWsOrCompleteCommentTrivia(gap)) {
+        trace("fallback",
+              "TU include-closure rejected: consuming earlier #pragma once "
+              "include would reactivate skipped include inc#{0}, but gap "
+              "source=[{1},{2}) is not trivia: '{3}'",
+              next->id, closureSourceEnd, next->siteB,
+              stringutils::showWsWithClip(gap, 120));
+        return false;
+      }
+
+      if (sourceTouchesStagedEdit(sourceBegin, next->siteE)) {
+        trace("fallback",
+              "TU include-closure rejected: extending over reactivated "
+              "#pragma once include inc#{0} to sourceEnd={1} would overlap "
+              "an already-staged source edit",
+              next->id, next->siteE);
+        return false;
+      }
+
+      trace("fallback",
+            "TU include-closure extending over skipped #pragma once include "
+            "inc#{0} path='{1}' source=[{2},{3}) after consuming earlier "
+            "include instance",
+            next->id, next->resolvedPath ? *next->resolvedPath : next->target,
+            next->siteB, next->siteE);
+      closureSourceEnd = next->siteE;
+    }
+  };
+
+  if (!extendOverReactivatedPragmaOnceIncludes())
+    return std::nullopt;
+
   debug("fallback",
         "TU include-closure accepted: includes=[{0},{1}] source=[{2},{3}) "
         "A=[{4},{5}) B=[{6},{7}) evidence={8} raw='{9}' padded='{10}'",
