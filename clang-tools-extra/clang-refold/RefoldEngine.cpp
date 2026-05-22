@@ -4227,8 +4227,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
                  directiveInterval->end <= edit.end;
         }
 
-        const RefoldModel::IncludeItem *inc =
-            owningIncludeSiteInTU(directive);
+        const RefoldModel::IncludeItem *inc = owningIncludeSiteInTU(directive);
         if (!inc)
           return false;
         if (inc->siteB < edit.start || edit.end < inc->siteE)
@@ -4260,6 +4259,321 @@ std::string RefoldEngine::RunSinglePassRefold() {
         const RefoldModel::IncludeItem *inc = owningIncludeSiteInTU(definition);
         return inc && inc->siteE <= offset;
       };
+
+  struct MacroStateSourceTransition {
+    MacroDirectiveSourceInterval interval;
+    std::string text;
+  };
+
+  // Return the TU source bytes that carry a macro-state transition in the
+  // emitted translation unit.  TU-spelled #define/#undef directives are moved
+  // by their own physical directive line.  Header-owned transitions are moved
+  // by the outer TU #include directive that makes the header transition
+  // visible; hoisting the raw header directive text into the TU would duplicate
+  // ownership semantics and would bypass the include proof lattice.
+  auto macroStateSourceTransition =
+      [&](const RefoldModel::MacroDirective &directive)
+      -> std::optional<MacroStateSourceTransition> {
+    if (PathsEqual(directive.sitePath, tuPath) && !directive.ownerIncludeId) {
+      std::optional<MacroDirectiveSourceInterval> interval =
+          macroDirectiveFullSourceInterval(directive);
+      if (!interval)
+        return std::nullopt;
+      return MacroStateSourceTransition{
+          *interval, directiveTextForPreservation(directive)};
+    }
+
+    const RefoldModel::IncludeItem *inc = owningIncludeSiteInTU(directive);
+    if (!inc)
+      return std::nullopt;
+    StringRef text = includeDirectiveText(*inc);
+    if (text.empty())
+      return std::nullopt;
+    std::string spelling = text.str();
+    if (spelling.empty() || spelling.back() != '\n')
+      spelling.push_back('\n');
+    return MacroStateSourceTransition{
+        MacroDirectiveSourceInterval{inc->siteB, inc->siteE},
+        std::move(spelling)};
+  };
+
+  // Return the active #define for `macroName` at a TU source offset, considering
+  // both TU-spelled macro-state directives and header-owned directives via their
+  // owning include sites.  This is intentionally source-order based: a header
+  // definition is active in the TU stream after the include line that introduced
+  // it, and it can therefore be moved only by moving that include line.
+  auto activeDefinitionAtSourceOffset =
+      [&](StringRef macroName, uint64_t offset)
+          -> const RefoldModel::MacroDirective * {
+    const RefoldModel::MacroDirective *active = nullptr;
+    uint64_t activeEnd = 0;
+    for (const NamedMacroDirectiveRef &ref : namedMacroDirectives) {
+      const RefoldModel::MacroDirective &candidate = *ref.directive;
+      if (StringRef(ref.name) != macroName)
+        continue;
+      std::optional<MacroStateSourceTransition> transition =
+          macroStateSourceTransition(candidate);
+      if (!transition || transition->interval.end > offset)
+        continue;
+      if (!active || transition->interval.end > activeEnd ||
+          (transition->interval.end == activeEnd && candidate.id > active->id)) {
+        active = &candidate;
+        activeEnd = transition->interval.end;
+      }
+    }
+    return active && active->subkind == "#define" ? active : nullptr;
+  };
+
+  // Return a safe TU boundary at which a delayed macro-state transition may be
+  // emitted after this edit's payload.  If the edit already ends at a boundary
+  // that can host a directive line, use it.  Otherwise, allow the edit to absorb
+  // the untouched remainder of the current physical source line, but only when
+  // that carried suffix is neutral under the definition being moved and no other
+  // final TU edit overlaps the absorbed bytes.
+  auto delayedTransitionBoundaryAfterEdit =
+      [&](size_t editIndex, const RefoldModel::MacroDirective &definition,
+          StringRef macroName) -> std::optional<uint64_t> {
+    if (editIndex >= tuEdits.size())
+      return std::nullopt;
+    const TextEdit &edit = tuEdits[editIndex];
+    if (edit.end > tuBytes.size())
+      return std::nullopt;
+
+    const size_t editEnd = static_cast<size_t>(edit.end);
+    size_t lineEnd = stringutils::lineEndOffset(tuBytes, editEnd);
+
+    // Lexical separability alone is not enough for a natural directive
+    // placement.  Splitting `int x = M + 2;` as `int x = M + 2` / `#define` /
+    // `;` preserves tokens, but it moves a directive into the middle of a
+    // physical declaration.  Only use the edit/suffix boundary directly when it
+    // is already the end of the physical source line; otherwise try to absorb
+    // the remaining same-line suffix and place the directive after that suffix.
+    if (lineEnd == editEnd && replacementSuffixBoundaryAllowsDirectiveLine(edit))
+      return edit.end;
+
+    if (lineEnd <= editEnd)
+      return std::nullopt;
+    if (lineEnd < tuBytes.size()) {
+      if (stringutils::isLineSplice(tuBytes, lineEnd))
+        return std::nullopt;
+      ++lineEnd;
+    }
+
+    if (sourceRangeOverlapsFinalTUEditExcept(edit.end, lineEnd, editIndex))
+      return std::nullopt;
+
+    StringRef carriedSuffix = tuBytes.slice(edit.end, lineEnd);
+    if (sourceChunkObservesDefinitionWhenCrossed(
+            definition, macroName, carriedSuffix, tuBytes.drop_front(lineEnd)))
+      return std::nullopt;
+
+    TextEdit boundaryEdit = edit;
+    boundaryEdit.end = lineEnd;
+    boundaryEdit.text.append(carriedSuffix.begin(), carriedSuffix.end());
+    if (!replacementSuffixBoundaryAllowsDirectiveLine(boundaryEdit))
+      return std::nullopt;
+
+    return static_cast<uint64_t>(lineEnd);
+  };
+
+  // Prefer moving an already-preserved #undef transition before an observing
+  // replacement over delaying the prior #define after that replacement.  Both
+  // can be token-correct in simple cases, but advancing the #undef is the
+  // smaller macro-state proof: it keeps the original definition in source order
+  // and moves the existing transition that makes the replacement's B-side macro
+  // environment undefined.  Header-owned #undefs are advanced by moving the TU
+  // include line that owns the header transition.
+  auto advancePreservedUndefsBeforeObservedReplacements = [&]() {
+    SmallVector<size_t, 16> editOrder;
+    editOrder.reserve(tuEdits.size());
+    for (size_t editIndex = 0; editIndex < tuEdits.size(); ++editIndex)
+      editOrder.push_back(editIndex);
+
+    // Process edits in source order so an advanced transition is claimed by the
+    // earliest replacement that needs it.  This keeps ownership deterministic
+    // when multiple final edits mention the same macro name.
+    llvm::sort(editOrder, [&](size_t lhs, size_t rhs) {
+      if (tuEdits[lhs].start != tuEdits[rhs].start)
+        return tuEdits[lhs].start < tuEdits[rhs].start;
+      return lhs < rhs;
+    });
+
+    DenseSet<uint64_t> advancedDirectiveIds;
+    size_t advancedCount = 0;
+
+    for (size_t editIndex : editOrder) {
+      if (editIndex >= tuEdits.size())
+        continue;
+      TextEdit &edit = tuEdits[editIndex];
+      if (edit.start > edit.end || edit.end > tuBytes.size())
+        continue;
+
+      const size_t editStart = static_cast<size_t>(edit.start);
+      const size_t lineStart = stringutils::lineStartOffset(tuBytes, editStart);
+      if (lineStart > editStart)
+        continue;
+
+      // The advanced #undef must be emitted at a real preprocessing-line
+      // boundary.  Do not split a backslash-spliced logical line, and do not
+      // widen this edit over bytes already owned by another final TU edit.
+      if (lineStart > 0 && stringutils::isLineSplice(tuBytes, lineStart - 1))
+        continue;
+      if (sourceRangeOverlapsFinalTUEditExcept(lineStart, edit.start,
+                                               editIndex))
+        continue;
+
+      StringRef crossedPrefix = tuBytes.slice(lineStart, edit.start);
+      StringRef replacementText(edit.text);
+
+      for (const NamedMacroDirectiveRef &undefRef : namedMacroDirectives) {
+        const RefoldModel::MacroDirective &undefDirective = *undefRef.directive;
+        if (undefDirective.subkind != "#undef")
+          continue;
+        if (advancedDirectiveIds.contains(undefDirective.id))
+          continue;
+
+        // Resolve the source bytes that carry this #undef transition.  For a
+        // TU-spelled #undef this is the directive line itself; for a
+        // header-owned #undef it is the owning TU #include line.
+        std::optional<MacroStateSourceTransition> undefTransition =
+            macroStateSourceTransition(undefDirective);
+        if (!undefTransition)
+          continue;
+
+        // This pass only advances a preserved future transition.  If the
+        // transition begins inside the current edit, it is a consumed-#undef
+        // case handled by the consumed-transition repair instead.
+        if (undefTransition->interval.begin < edit.end)
+          continue;
+
+        // The replacement only needs the #undef if a definition is actually
+        // active at the proposed insertion boundary.
+        const RefoldModel::MacroDirective *previousDefinition =
+            activeDefinitionAtSourceOffset(undefRef.name, lineStart);
+        if (!previousDefinition)
+          continue;
+
+        // Require a real observation in the replacement payload.  If the
+        // replacement does not mention this macro under the active definition,
+        // then advancing the #undef would be unnecessary churn.
+        std::optional<size_t> firstObservationOffset =
+            firstReplacementObservationOffset(edit, *previousDefinition,
+                                              undefRef.name);
+        if (!firstObservationOffset)
+          continue;
+
+        // The widened replacement will cover [lineStart, undefEnd).  Refuse the
+        // rewrite if that would absorb another final TU edit.
+        if (sourceRangeOverlapsFinalTUEditExcept(
+                lineStart, undefTransition->interval.end, editIndex))
+          continue;
+
+        StringRef replacementPrefix =
+            replacementText.take_front(*firstObservationOffset);
+
+        // Everything before the first observing replacement token must be safe
+        // to move across the active definition.  Otherwise advancing the #undef
+        // would silently change macro state for earlier replacement bytes.
+        if (sourceChunkObservesDefinitionWhenCrossed(
+                *previousDefinition, undefRef.name, replacementPrefix,
+                replacementText.drop_front(*firstObservationOffset)))
+          continue;
+
+        // The original same-line prefix that we pull into the edit must also be
+        // neutral with respect to the active definition.  This prevents moving
+        // the #undef before preserved source that was supposed to expand under
+        // the prior #define.
+        if (sourceChunkObservesDefinitionWhenCrossed(
+                *previousDefinition, undefRef.name, crossedPrefix,
+                replacementText))
+          continue;
+
+        StringRef carriedSuffix =
+            tuBytes.slice(edit.end, undefTransition->interval.begin);
+
+        // Preserve the untouched bytes between the original edit end and the
+        // #undef transition only when they do not observe the definition being
+        // killed.  If they do observe it, the #undef cannot be advanced past
+        // them.
+        if (sourceChunkObservesDefinitionWhenCrossed(
+                *previousDefinition, undefRef.name, carriedSuffix,
+                tuBytes.drop_front(undefTransition->interval.begin)))
+          continue;
+
+        // Construct one widened replacement:
+        //
+        //   advanced #undef transition
+        //   original same-line prefix before the edit
+        //   B-side replacement payload
+        //   untouched bytes up to the old #undef/include transition
+        //
+        // This deletes the original later transition and re-emits it at the
+        // proven earlier boundary.
+        std::string replacement;
+        replacement.reserve(undefTransition->text.size() +
+                            crossedPrefix.size() + replacementText.size() +
+                            carriedSuffix.size());
+        replacement += undefTransition->text;
+        replacement.append(crossedPrefix.begin(), crossedPrefix.end());
+        replacement.append(replacementText.begin(), replacementText.end());
+        replacement.append(carriedSuffix.begin(), carriedSuffix.end());
+
+        const uint64_t oldStart = edit.start;
+        const uint64_t oldEnd = edit.end;
+
+        // Widening may change physical line accounting, so recompute line
+        // resync for the widened edit instead of preserving or clearing the old
+        // pending state.
+        ResyncOutcome resync =
+            ApplyResyncOrPend(tuBytes, lineStart, undefTransition->interval.end,
+                              replacement, tuPath);
+        edit.start = lineStart;
+        edit.end = undefTransition->interval.end;
+        edit.text = std::move(resync.text);
+        edit.pending = std::move(resync.pending);
+
+        // This is no longer a direct TU hunk edit: it now carries a macro-state
+        // transition and untouched source bytes around the original
+        // replacement.
+        edit.isDirectTUHunkEdit = false;
+        edit.directTUHunkIndex.reset();
+        edit.directTUHunkAStart.reset();
+        edit.directTUHunkAEnd.reset();
+        edit.directTUHunkBStart.reset();
+        edit.directTUHunkBEnd.reset();
+        edit.directTURawStart.reset();
+        edit.directTURawEnd.reset();
+        edit.directTUFinalStart = edit.start;
+        edit.directTUFinalEnd = edit.end;
+
+        // Attach a conservative byte-span proof for the widened replacement.
+        // The local checks above discharge why the widened span can safely
+        // carry the advanced macro-state transition.
+        AttachAcceptedResultCarrier(
+            edit, BuildAcceptedTUTextEditCandidate(
+                      AcceptedPathKind::TUByteSpanConservativeEdit, edit.start,
+                      edit.end, StringRef(edit.text)));
+
+        advancedDirectiveIds.insert(undefDirective.id);
+        ++advancedCount;
+        warn("macro/liveness",
+             "advancing preserved #undef before observed replacement: "
+             "macro='{0}' "
+             "undefDirective=#{1} priorDefine=#{2} edit=[{3},{4}) "
+             "widened=[{5},{6})",
+             undefRef.name, undefDirective.id, previousDefinition->id, oldStart,
+             oldEnd, edit.start, edit.end);
+        break;
+      }
+    }
+
+    if (advancedCount != 0) {
+      info("macro/liveness",
+           "advanced {0} preserved #undef directive(s) before replacement "
+           "payloads to keep edited tokens in B macro state",
+           advancedCount);
+    }
+  };
 
   // Try the #undef mirror of delayed #define preservation.  If a consumed
   // #undef is swallowed by a mid-line edit whose replacement observes the
@@ -4491,30 +4805,9 @@ std::string RefoldEngine::RunSinglePassRefold() {
   struct MacroStateGapCarryCandidate {
     const RefoldModel::MacroDirective *directive = nullptr;
     MacroDirectiveSourceInterval interval;
+    std::string preservationText;
     std::string name;
   };
-
-  auto activeTUDefinitionAtOffset =
-      [&](const RefoldModel::MacroDirective &definition, StringRef macroName,
-          uint64_t offset) {
-        const RefoldModel::MacroDirective *active = nullptr;
-        uint64_t activeEnd = 0;
-        for (const NamedMacroDirectiveRef &ref : namedMacroDirectives) {
-          const RefoldModel::MacroDirective &candidate = *ref.directive;
-          if (StringRef(ref.name) != macroName)
-            continue;
-          std::optional<MacroDirectiveSourceInterval> interval =
-              macroDirectiveFullSourceInterval(candidate);
-          if (!interval || interval->end > offset)
-            continue;
-          if (!active || interval->end > activeEnd ||
-              (interval->end == activeEnd && candidate.id > active->id)) {
-            active = &candidate;
-            activeEnd = interval->end;
-          }
-        }
-        return active == &definition && definition.subkind == "#define";
-      };
 
   // Carry preserved macro-state definitions out of the gap immediately before a
   // TU edit when leaving them in place would make that edit's replacement
@@ -4562,8 +4855,21 @@ std::string RefoldEngine::RunSinglePassRefold() {
       TextEdit &edit = tuEdits[editIndex];
       if (edit.start > edit.end || edit.end > tuBytes.size())
         continue;
-      if (!replacementSuffixBoundaryAllowsDirectiveLine(edit))
-        continue;
+
+      std::optional<uint64_t> delayedBoundary;
+      auto ensureDelayedBoundary =
+          [&](const RefoldModel::MacroDirective &definition,
+              StringRef macroName) -> std::optional<uint64_t> {
+        std::optional<uint64_t> boundary =
+            delayedTransitionBoundaryAfterEdit(editIndex, definition,
+                                               macroName);
+        if (!boundary)
+          return std::nullopt;
+        if (delayedBoundary && *delayedBoundary != *boundary)
+          return std::nullopt;
+        delayedBoundary = boundary;
+        return delayedBoundary;
+      };
 
       SmallVector<MacroStateGapCarryCandidate, 4> candidates;
       for (const NamedMacroDirectiveRef &ref : namedMacroDirectives) {
@@ -4573,17 +4879,20 @@ std::string RefoldEngine::RunSinglePassRefold() {
         if (carriedDirectiveIds.contains(directive.id))
           continue;
 
-        std::optional<MacroDirectiveSourceInterval> interval =
-            macroDirectiveFullSourceInterval(directive);
-        if (!interval)
+        std::optional<MacroStateSourceTransition> transition =
+            macroStateSourceTransition(directive);
+        if (!transition)
           continue;
-        if (interval->end > edit.start)
+        if (transition->interval.end > edit.start)
           continue;
-        if (intervalOverlapsFinalTUEdit(interval->begin, interval->end))
+        if (intervalOverlapsFinalTUEdit(transition->interval.begin,
+                                        transition->interval.end))
           continue;
-        if (!activeTUDefinitionAtOffset(directive, ref.name, edit.start))
+        if (activeDefinitionAtSourceOffset(ref.name, edit.start) != &directive)
           continue;
         if (!replacementObservesPreservedDefinition(edit, directive, ref.name))
+          continue;
+        if (!ensureDelayedBoundary(directive, ref.name))
           continue;
 
         // Only carry a gap definition when the *new* B-side replacement
@@ -4602,10 +4911,13 @@ std::string RefoldEngine::RunSinglePassRefold() {
           continue;
 
         candidates.push_back(
-            MacroStateGapCarryCandidate{&directive, *interval, ref.name});
+            MacroStateGapCarryCandidate{&directive, transition->interval,
+                                        std::move(transition->text), ref.name});
       }
 
       if (candidates.empty())
+        continue;
+      if (!delayedBoundary)
         continue;
 
       llvm::sort(candidates,
@@ -4652,9 +4964,12 @@ std::string RefoldEngine::RunSinglePassRefold() {
       }
       if (!admissible)
         continue;
+      if (*delayedBoundary < edit.end || *delayedBoundary > tuBytes.size())
+        continue;
 
       std::string replacement;
-      replacement.reserve((edit.start - newStart) + edit.text.size() + 64);
+      replacement.reserve((edit.start - newStart) + edit.text.size() +
+                          (*delayedBoundary - edit.end) + 64);
       uint64_t cursor = newStart;
       for (const MacroStateGapCarryCandidate &candidate : candidates) {
         if (cursor > candidate.interval.begin) {
@@ -4670,17 +4985,24 @@ std::string RefoldEngine::RunSinglePassRefold() {
       replacement.append(tuBytes.begin() + cursor,
                          tuBytes.begin() + edit.start);
       replacement.append(edit.text);
+      replacement.append(tuBytes.begin() + edit.end,
+                         tuBytes.begin() + *delayedBoundary);
       if (!replacement.empty() && replacement.back() == '\\')
         continue;
       if (!replacement.empty() && replacement.back() != '\n')
         replacement.push_back('\n');
       for (const MacroStateGapCarryCandidate &candidate : candidates)
-        replacement += directiveTextForPreservation(*candidate.directive);
+        replacement += candidate.preservationText;
 
       const uint64_t oldStart = edit.start;
+      const uint64_t oldEnd = edit.end;
+      ResyncOutcome resync =
+          ApplyResyncOrPend(tuBytes, newStart, *delayedBoundary, replacement,
+                            tuPath);
       edit.start = newStart;
-      edit.text = std::move(replacement);
-      edit.pending.reset();
+      edit.end = *delayedBoundary;
+      edit.text = std::move(resync.text);
+      edit.pending = std::move(resync.pending);
       edit.isDirectTUHunkEdit = false;
       edit.directTUHunkIndex.reset();
       edit.directTUHunkAStart.reset();
@@ -4701,9 +5023,9 @@ std::string RefoldEngine::RunSinglePassRefold() {
         ++carriedCount;
         warn("macro/liveness",
              "carrying observed gap #define after TU replacement: macro='{0}' "
-             "defDirective=#{1} edit=[{2},{3}) widenedStart={4}",
-             candidate.name, candidate.directive->id, oldStart, edit.end,
-             edit.start);
+             "defDirective=#{1} edit=[{2},{3}) widened=[{4},{5})",
+             candidate.name, candidate.directive->id, oldStart, oldEnd,
+             edit.start, edit.end);
       }
     }
 
@@ -4713,6 +5035,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
            "payloads to keep edited tokens in B macro state", carriedCount);
   };
 
+  advancePreservedUndefsBeforeObservedReplacements();
   carryObservedGapDefinitionsAfterReplacements();
 
   // Return true when a final TU edit consumes bytes from this macro
