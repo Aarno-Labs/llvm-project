@@ -239,6 +239,247 @@ void lexPPTokens(const std::string &bytes, std::vector<PPTok> &out,
   debug("lexer", "done: tokens={0}", out.size());
 }
 
+// --------------------- Sideband pragma normalization -------------------------
+
+/// Raw `-E -P` output can contain preserved pragma directive lines. Those
+/// lines are directive sideband: they are printed in the replay surface but are
+/// not ordinary preprocessor tokens in the producer's refold-map token count.
+/// Keep them separate from the normal token stream so they can be diffed as
+/// zero-token source artifacts rather than forcing whole-file fallback.
+struct SidebandPragmaLine {
+  std::string text;
+  uint64_t begin = 0;
+  uint64_t end = 0;
+};
+
+struct JsonPragmaItem {
+  std::string text;
+  std::string sitePath;
+  uint64_t siteB = 0;
+  uint64_t siteE = 0;
+};
+
+/// Return true iff a physical line is a preserved pragma directive line.
+///
+/// This recognizes only `#pragma` after optional horizontal indentation.  It is
+/// deliberately narrower than a general directive parser: the refold map already
+/// models ordinary PP tokens, while this sideband path exists only for pragma
+/// text that Clang may print verbatim in `.i` output even though it is not part
+/// of the map's normal token count.
+static bool isSidebandPragmaLine(StringRef line) {
+  size_t i = 0;
+  while (i < line.size() && stringutils::isNonNewlineWs(line[i]))
+    ++i;
+  if (i >= line.size() || line[i] != '#')
+    return false;
+  ++i;
+  while (i < line.size() && stringutils::isNonNewlineWs(line[i]))
+    ++i;
+
+  StringRef Pragma("pragma");
+  if (line.size() - i < Pragma.size())
+    return false;
+  if (line.substr(i, Pragma.size()) != Pragma)
+    return false;
+  i += Pragma.size();
+
+  return i >= line.size() || !stringutils::isIdentPart(line[i]);
+}
+
+/// Collect physical `#pragma` lines from a raw `.i` replay surface.
+static std::vector<SidebandPragmaLine>
+collectSidebandPragmaLines(StringRef bytes) {
+  std::vector<SidebandPragmaLine> out;
+  size_t begin = 0;
+  while (begin < bytes.size()) {
+    size_t nl = bytes.find('\n', begin);
+    size_t lineEndNoNL = nl == StringRef::npos ? bytes.size() : nl;
+    size_t end = nl == StringRef::npos ? bytes.size() : nl + 1;
+    StringRef line = bytes.slice(begin, lineEndNoNL);
+    if (isSidebandPragmaLine(line)) {
+      SidebandPragmaLine rec;
+      rec.text = bytes.slice(begin, end).str();
+      rec.begin = static_cast<uint64_t>(begin);
+      rec.end = static_cast<uint64_t>(end);
+      out.push_back(std::move(rec));
+    }
+    begin = end;
+  }
+  return out;
+}
+
+/// Remove pragma sideband tokens from an already-lexed raw replay stream.
+///
+/// The byte buffer itself is left untouched.  Kept token offsets therefore still
+/// point into the original raw `.i` file, preserving correct B-slice materializa-
+/// tion and terminal-fallback behavior while restoring the token sequence that
+/// the refold map actually describes.
+static void filterSidebandPragmaTokens(ArrayRef<SidebandPragmaLine> lines,
+                                       std::vector<PPTok> &toks,
+                                       std::vector<std::size_t> &tokOff,
+                                       size_t sourceSize) {
+  if (lines.empty() || toks.empty())
+    return;
+
+  std::vector<PPTok> filteredToks;
+  std::vector<std::size_t> filteredOffs;
+  filteredToks.reserve(toks.size());
+  filteredOffs.reserve(tokOff.size());
+
+  size_t lineIdx = 0;
+  for (size_t i = 0; i < toks.size(); ++i) {
+    const size_t off = tokOff[i];
+    while (lineIdx < lines.size() && off >= lines[lineIdx].end)
+      ++lineIdx;
+    const bool inSideband = lineIdx < lines.size() &&
+                            off >= lines[lineIdx].begin &&
+                            off < lines[lineIdx].end;
+    if (inSideband)
+      continue;
+    filteredOffs.push_back(off);
+    filteredToks.push_back(std::move(toks[i]));
+  }
+
+  filteredOffs.push_back(sourceSize);
+  toks = std::move(filteredToks);
+  tokOff = std::move(filteredOffs);
+}
+
+static std::vector<JsonPragmaItem>
+collectJsonPragmaItems(const json::Object &rootJson) {
+  std::vector<JsonPragmaItem> out;
+  const json::Array *items = rootJson.getArray("items");
+  if (!items)
+    return out;
+
+  for (const json::Value &value : *items) {
+    const json::Object *obj = value.getAsObject();
+    if (!obj)
+      continue;
+    auto kind = obj->getString("kind");
+    auto subkind = obj->getString("subkind");
+    if (!kind || !subkind || *kind != "directive" || *subkind != "#pragma")
+      continue;
+
+    auto text = obj->getString("text");
+    auto path = obj->getString("site_path");
+    auto b = obj->getInteger("site_b");
+    auto e = obj->getInteger("site_e");
+    if (!text || !path || !b || !e || *b < 0 || *e < 0 || *b > *e)
+      continue;
+
+    // Built-in pseudo-files can contribute implementation pragmas to the map,
+    // but the refolded TU source cannot edit those pseudo-ranges.  They must
+    // not be considered as source targets for sideband pragma deletion.
+    if (path->starts_with("<"))
+      continue;
+
+    JsonPragmaItem item;
+    item.text = text->str();
+    item.sitePath = path->str();
+    item.siteB = static_cast<uint64_t>(*b);
+    item.siteE = static_cast<uint64_t>(*e);
+    out.push_back(std::move(item));
+  }
+  return out;
+}
+
+/// Pair A-side sideband pragma lines with their source `DirectivePragmaItem`.
+///
+/// Matching is exact on directive text and stable in producer item order.  That
+/// is a proof, not a guess: a sideband source edit is emitted only when the raw
+/// `.i` directive text is exactly one of the recorded source pragma items.
+static std::vector<int64_t> mapSidebandLinesToPragmaItems(
+    ArrayRef<SidebandPragmaLine> lines, ArrayRef<JsonPragmaItem> pragmas) {
+  std::vector<int64_t> out(lines.size(), -1);
+  std::vector<uint8_t> used(pragmas.size(), 0);
+  for (size_t i = 0; i < lines.size(); ++i) {
+    for (size_t j = 0; j < pragmas.size(); ++j) {
+      if (used[j] || pragmas[j].text != lines[i].text)
+        continue;
+      used[j] = 1;
+      out[i] = static_cast<int64_t>(j);
+      break;
+    }
+  }
+  return out;
+}
+
+/// Build source edits for sideband pragma changes and report whether the
+/// sideband stream was fully modeled.
+///
+/// Supported structural cases are deliberately closed:
+///   * equal sideband lines: source pragma remains untouched;
+///   * A-only sideband lines: delete the corresponding recorded source pragma;
+///   * one-for-one replacement: replace the recorded source pragma text.
+///
+/// B-only insertions have no source anchor in the current map, so they are not
+/// normalized here; the caller leaves raw sideband tokens in the stream and the
+/// existing fallback path handles that out-of-domain case explicitly.
+static bool buildSidebandPragmaSourceEdits(
+    const json::Object &rootJson, ArrayRef<SidebandPragmaLine> aLines,
+    ArrayRef<SidebandPragmaLine> bLines,
+    std::vector<RefoldEngine::SidebandPragmaEdit> &edits) {
+  edits.clear();
+  if (aLines.empty() && bLines.empty())
+    return false;
+
+  std::vector<JsonPragmaItem> pragmas = collectJsonPragmaItems(rootJson);
+  std::vector<int64_t> aToPragma =
+      mapSidebandLinesToPragmaItems(aLines, pragmas);
+
+  std::vector<StringRef> aTextRefs;
+  std::vector<StringRef> bTextRefs;
+  aTextRefs.reserve(aLines.size());
+  bTextRefs.reserve(bLines.size());
+  for (const auto &line : aLines)
+    aTextRefs.push_back(line.text);
+  for (const auto &line : bLines)
+    bTextRefs.push_back(line.text);
+
+  std::vector<int64_t> lcs = diffutils::lcsMapAB(aTextRefs, bTextRefs);
+  std::vector<diffutils::Hunk> hunks =
+      diffutils::hunksFromMap(lcs, aLines.size(), bLines.size());
+
+  auto appendEditForA = [&](uint64_t aIdx, StringRef replacement) -> bool {
+    if (aIdx >= aToPragma.size() || aToPragma[static_cast<size_t>(aIdx)] < 0)
+      return false;
+    const JsonPragmaItem &pragma =
+        pragmas[static_cast<size_t>(aToPragma[static_cast<size_t>(aIdx)])];
+    RefoldEngine::SidebandPragmaEdit edit;
+    edit.sitePath = pragma.sitePath;
+    edit.siteB = pragma.siteB;
+    edit.siteE = pragma.siteE;
+    edit.replacementText = replacement.str();
+    edits.push_back(std::move(edit));
+    return true;
+  };
+
+  for (const diffutils::Hunk &h : hunks) {
+    if (h.isDeleteOnly()) {
+      for (uint64_t a = h.aStart; a < h.aEnd; ++a)
+        if (!appendEditForA(a, ""))
+          return false;
+      continue;
+    }
+
+    if (h.isReplace() && (h.aEnd - h.aStart) == (h.bEnd - h.bStart)) {
+      for (uint64_t a = h.aStart, b = h.bStart; a < h.aEnd; ++a, ++b)
+        if (!appendEditForA(a, bLines[static_cast<size_t>(b)].text))
+          return false;
+      continue;
+    }
+
+    // Insert-only sideband lines, or many-to-one/one-to-many replacements,
+    // require an insertion/partition anchor that is not present in the current
+    // refold map. Do not normalize those cases; falling back is safer than
+    // manufacturing a source placement.
+    return false;
+  }
+
+  return true;
+}
+
 // ----------------------------- JSON Parser -----------------------------------
 
 /// \brief Parse a JSON value from a file path.
@@ -1381,8 +1622,47 @@ int main(int argc, char **argv) {
 
   std::vector<PPTok> aToks, bToks;
   std::vector<std::size_t> aTokByteOff, bTokByteOff;
+  std::vector<RefoldEngine::SidebandPragmaEdit> sidebandPragmaEdits;
   lexPPTokens(aBytes, aToks, aTokByteOff, lexLang);
   lexPPTokens(bBytes, bToks, bTokByteOff, lexLang);
+
+  if (!onlyCheck) {
+    std::vector<SidebandPragmaLine> aSidebandPragmas =
+        collectSidebandPragmaLines(aBytes);
+    std::vector<SidebandPragmaLine> bSidebandPragmas =
+        collectSidebandPragmaLines(bBytes);
+
+    if (!aSidebandPragmas.empty() || !bSidebandPragmas.empty()) {
+      if (buildSidebandPragmaSourceEdits(rootJson, aSidebandPragmas,
+                                         bSidebandPragmas,
+                                         sidebandPragmaEdits)) {
+        // Keep the raw `.i` byte buffers intact, but remove preserved pragma
+        // directive tokens from the sequences fed to the structural diff.  The
+        // matching source directive edits are carried separately in
+        // sidebandPragmaEdits, so comments/trivia around the original source
+        // pragma stay on the normal TU edit path instead of being lost to
+        // terminal raw-B fallback.
+        filterSidebandPragmaTokens(aSidebandPragmas, aToks, aTokByteOff,
+                                   aBytes.size());
+        filterSidebandPragmaTokens(bSidebandPragmas, bToks, bTokByteOff,
+                                   bBytes.size());
+        debug("pragma/sideband",
+              "normalized sideband pragmas: A={0} B={1} sourceEdits={2}",
+              aSidebandPragmas.size(), bSidebandPragmas.size(),
+              sidebandPragmaEdits.size());
+      } else {
+        // Unsupported sideband forms, such as B-only pragma insertions without
+        // a map-backed source anchor, remain in the token stream.  The existing
+        // token-count/domain checks will route them through the explicit
+        // fallback path rather than guessing a source placement.
+        sidebandPragmaEdits.clear();
+        debug("pragma/sideband",
+              "sideband pragma stream not fully modelled; keeping raw tokens "
+              "for fallback classification");
+      }
+    }
+  }
+
   debug("lex", "{0} tokens={1} {2} tokens={3}", PPPath, aToks.size(), PPModPath,
         bToks.size());
 
@@ -1433,7 +1713,7 @@ int main(int argc, char **argv) {
   std::vector<MaterializedEditMapping> materializedEditMappings;
   auto refoldedOrErr = RefoldEngine::Refold(
       rootJson, aBytes, aToks, aTokByteOff, bBytes, bToks, bTokByteOff,
-      NoLines, StrictMode,
+      NoLines, StrictMode, sidebandPragmaEdits,
       emitEditMap ? &materializedEditMappings : nullptr);
   if (!refoldedOrErr) {
     handleAllErrors(refoldedOrErr.takeError(), [&](const ErrorInfoBase &e) {

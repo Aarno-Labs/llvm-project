@@ -1355,6 +1355,7 @@ RefoldEngine::Refold(const json::Object &rootJson, StringRef aSource,
                      ArrayRef<PPTok> aToks, ArrayRef<size_t> aTokOff,
                      StringRef bSource, ArrayRef<PPTok> bToks,
                      ArrayRef<size_t> bTokOff, bool noLines, bool strict,
+                     ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
                      std::vector<MaterializedEditMapping>
                          *materializedEditMappings) {
   // Build the refold model based on the parsed JSON object.
@@ -1365,7 +1366,7 @@ RefoldEngine::Refold(const json::Object &rootJson, StringRef aSource,
   // Construct an engine and run the instance pipeline.
   RefoldEngine engine(std::move(*mOrErr), aSource, aToks, aTokOff, bSource,
                       bToks, bTokOff, noLines, strict,
-                      materializedEditMappings);
+                      sidebandPragmaEdits, materializedEditMappings);
   return engine.Refold();
 }
 
@@ -1737,6 +1738,64 @@ std::string RefoldEngine::Refold() {
   EmitRefoldStats();
   EmitTheoremAudit();
   return out;
+}
+
+
+bool RefoldEngine::AppendSidebandPragmaSourceEdits(
+    StringRef tuPath, StringRef tuBytes, std::vector<TextEdit> &tuEdits) {
+  if (sidebandPragmaEdits_.empty())
+    return true;
+
+  for (const SidebandPragmaEdit &sideband : sidebandPragmaEdits_) {
+    // The current clang-refold artifact is one emitted TU source file.  A
+    // sideband pragma whose source location is inside a header must be handled
+    // by an include/materialization proof; applying it blindly to the TU would
+    // edit the wrong owner.  Reject that class explicitly instead of silently
+    // preserving or dropping a header pragma.
+    if (!PathsEqual(sideband.sitePath, tuPath)) {
+      RequestTerminalFallback(
+          TerminalFallbackKind::UndischargedEmissionArtifact, "pragma/sideband",
+          llvm::formatv(
+              "sideband pragma edit targets non-TU owner path='{0}' "
+              "site=[{1},{2})",
+              sideband.sitePath, sideband.siteB, sideband.siteE)
+              .str());
+      return false;
+    }
+
+    if (sideband.siteB > sideband.siteE || sideband.siteE > tuBytes.size()) {
+      RequestTerminalFallback(
+          TerminalFallbackKind::UndischargedEmissionArtifact, "pragma/sideband",
+          llvm::formatv(
+              "sideband pragma edit has invalid TU range site=[{0},{1}) "
+              "tuSize={2}",
+              sideband.siteB, sideband.siteE, tuBytes.size())
+              .str());
+      return false;
+    }
+
+    // Sideband pragmas are zero-normal-token artifacts: their raw directive
+    // text appeared in the `.i` replay surface, but the producer deliberately
+    // did not count that directive text as ordinary PP tokens.  Once the driver
+    // removes the sideband directive tokens from A/B before diffing, the source
+    // pragma itself still needs an explicit source edit so preserved comments
+    // and nearby code can stay on the normal structural path.
+    TextEdit edit{sideband.siteB, sideband.siteE, sideband.replacementText,
+                  std::nullopt, std::nullopt, {}};
+    AttachAcceptedResultCarrier(
+        edit, BuildAcceptedTUTextEditCandidate(
+                  AcceptedPathKind::TUByteSpanConservativeEdit, sideband.siteB,
+                  sideband.siteE, sideband.replacementText));
+    tuEdits.push_back(std::move(edit));
+
+    trace("pragma/sideband",
+          "queued sideband pragma source edit path='{0}' site=[{1},{2}) "
+          "replacementLen={3}",
+          sideband.sitePath, sideband.siteB, sideband.siteE,
+          sideband.replacementText.size());
+  }
+
+  return true;
 }
 
 std::string RefoldEngine::RunSinglePassRefold() {
@@ -2375,6 +2434,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
 
   // 4) Classify hunks and collect per-target edits.
   std::vector<TextEdit> tuEdits;
+  if (!AppendSidebandPragmaSourceEdits(tuPath, tuBytes, tuEdits))
+    return std::string();
 
   // Collect the set of root macro invocation ids that remain expanded in the
   // final chosen refold result. This is populated only by edits that survive

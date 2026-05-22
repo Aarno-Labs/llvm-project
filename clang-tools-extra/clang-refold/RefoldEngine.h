@@ -183,6 +183,24 @@ struct MaterializedEditMapping {
 class RefoldEngine {
 struct TextEdit;
 public:
+
+  /// Describes a source-side edit for a preserved sideband `#pragma` line
+  /// printed in the raw `.i` replay surface but excluded from the modeled
+  /// preprocessor-token stream.
+  ///
+  /// Unknown pragmas are special because Clang may preserve their directive
+  /// text in `-E -P` output even though the producer's token count describes
+  /// only ordinary PP tokens. The driver removes such sideband directive tokens
+  /// from the A/B token streams before structural diffing, then passes the
+  /// corresponding source directive edits here so the engine can delete or
+  /// replace the original `DirectivePragmaItem` without falling back to raw B.
+  struct SidebandPragmaEdit {
+    std::string sitePath;
+    uint64_t siteB = 0;
+    uint64_t siteE = 0;
+    std::string replacementText;
+  };
+
   /// \brief Perform the end-to-end refolding process for a translation unit.
   ///
   /// This method takes the original preprocessed text *A* (e.g. `test.c.i`),
@@ -223,6 +241,7 @@ public:
   Refold(const json::Object &rootJson, StringRef aSource, ArrayRef<PPTok> aToks,
          ArrayRef<size_t> aTokOff, StringRef bSource, ArrayRef<PPTok> bToks,
          ArrayRef<size_t> bTokOff, bool noLines, bool strict,
+         ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits = {},
          std::vector<MaterializedEditMapping> *materializedEditMappings =
              nullptr);
 
@@ -238,6 +257,13 @@ private:
   bool strict_;
   LangOptions lexLang_;
   std::vector<MaterializedEditMapping> *materializedEditMappings_ = nullptr;
+
+  /// Source edits for sideband pragma directive lines that were removed from
+  /// the lexed A/B token streams before diffing. These are applied as ordinary
+  /// TU byte edits only when their source path is the emitted TU; non-TU
+  /// occurrences are rejected by the structural pass because this single-file
+  /// output cannot directly edit an arbitrary header.
+  std::vector<SidebandPragmaEdit> sidebandPragmaEdits_;
 
   /// \brief Explicit classification for the remaining terminal fallback exits.
   ///
@@ -821,14 +847,16 @@ private:
   RefoldEngine(RefoldModel model, StringRef aSource, ArrayRef<PPTok> aToks,
                ArrayRef<size_t> aTokOff, StringRef bSource,
                ArrayRef<PPTok> bToks, ArrayRef<size_t> bTokOff, bool noLines,
-               bool strict,
+               bool strict, ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
                std::vector<MaterializedEditMapping> *materializedEditMappings =
                    nullptr)
       : model_(std::move(model)), aSource_(aSource), bSource_(bSource),
         aToks_(aToks), bToks_(bToks), aTokOff_(aTokOff), bTokOff_(bTokOff),
         lineDirs_(!noLines, model_.GetPPCwd()), strict_(strict),
         lexLang_(MakeLexLangOptions(model_.GetPPLang())),
-        materializedEditMappings_(materializedEditMappings) {
+        materializedEditMappings_(materializedEditMappings),
+        sidebandPragmaEdits_(sidebandPragmaEdits.begin(),
+                             sidebandPragmaEdits.end()) {
     BuildMacroInvocationGraph();
   }
 
@@ -858,6 +886,13 @@ private:
   /// The caller reacts to \c RequestTerminalFallback() by selecting the
   /// explicit terminal fallback result.
   std::string RunSinglePassRefold();
+
+  /// Append source edits for sideband pragma directive text that was present in
+  /// the raw `.i` replay surface but removed before token-level diffing.
+  /// Returns false after requesting terminal fallback when an edit targets a
+  /// non-TU owner or has an invalid source range.
+  bool AppendSidebandPragmaSourceEdits(StringRef tuPath, StringRef tuBytes,
+                                       std::vector<TextEdit> &tuEdits);
 
   // ---------------------------- Small Data Records ---------------------------
 
