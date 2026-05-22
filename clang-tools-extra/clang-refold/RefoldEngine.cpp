@@ -1743,10 +1743,21 @@ std::string RefoldEngine::RunSinglePassRefold() {
   // Make sure that when we re-lex the A-stream tokens that it matches the token
   // count as listed in the refold map JSON file.
   if (static_cast<size_t>(model_.GetTokensCountA()) != aToks_.size()) {
-    fatal("tok",
-          "A-stream token count mismatch: model reported {0} tokens, but lexed "
-          "sequence (aToks) has {1} tokens.",
-          model_.GetTokensCountA(), aToks_.size());
+    // A-side token-count disagreement means the refold map and the supplied
+    // `--pp` replay file do not describe the same token stream.  One known
+    // source of this shape is a producer that prints sideband pragma directive
+    // text in the `.i` file while recording only the tokens produced after the
+    // pragma has affected PP state.  There is no deterministic structural proof
+    // we can discharge from that inconsistent A surface, so do not abort the
+    // process.  Escape to the explicit terminal carrier (`--pp-mod`) instead.
+    RequestTerminalFallback(
+        TerminalFallbackKind::UndischargedEmissionArtifact, "tok",
+        llvm::formatv(
+            "A-stream token count mismatch: model reported {0} tokens, but "
+            "lexed sequence (aToks) has {1} tokens",
+            model_.GetTokensCountA(), aToks_.size())
+            .str());
+    return std::string();
   }
 
   StringRef tuPath = model_.GetSourcePath();
@@ -5914,6 +5925,177 @@ std::string RefoldEngine::RunSinglePassRefold() {
     IncludeIds.push_back(kv.first);
   llvm::sort(IncludeIds);
 
+  // Return true when `root`'s include subtree owns `directive`.  This is the
+  // owner-polymorphic analogue of the earlier TU liveness check: the directive
+  // may be physically spelled in a nested header, but replacing the outer TU
+  // include consumes every macro-state transition that was only reachable
+  // through that include subtree.
+  auto materializedIncludeSubtreeOwnsMacroDirective =
+      [&](const RefoldModel::IncludeItem &root,
+          const RefoldModel::MacroDirective &directive) {
+        if (!directive.ownerIncludeId)
+          return false;
+        const RefoldModel::IncludeItem *cur =
+            model_.GetIncludeById(*directive.ownerIncludeId);
+        while (cur) {
+          if (cur->id == root.id)
+            return true;
+          if (!cur->parent)
+            return false;
+          cur = model_.GetIncludeById(*cur->parent);
+        }
+        return false;
+      };
+
+  // Return true when the materialized replacement still contains one of the
+  // include directives on the ancestry from `directive`'s owner back to `root`.
+  // In that case the header macro-state transition remains available through a
+  // preserved source directive and must not also be synthesized as a separate
+  // macro-state repair line.
+  auto materializedReplacementPreservesDirectiveAncestry =
+      [&](const RefoldModel::IncludeItem &root,
+          const RefoldModel::MacroDirective &directive,
+          const TextEdit &replacementEdit) {
+        if (!directive.ownerIncludeId)
+          return false;
+        const RefoldModel::IncludeItem *cur =
+            model_.GetIncludeById(*directive.ownerIncludeId);
+        while (cur) {
+          if (includeDirectiveAppearsAtLineStart(replacementEdit, *cur))
+            return true;
+          if (cur->id == root.id)
+            break;
+          if (!cur->parent)
+            break;
+          cur = model_.GetIncludeById(*cur->parent);
+        }
+        return false;
+      };
+
+  auto invocationSurvivesAfterMaterializedInclude =
+      [&](const RefoldModel::MacroInvocation &m,
+          const RefoldModel::IncludeItem &materializedInclude,
+          uint64_t materializedSiteEnd) {
+        if (invocationCallsiteSurvivesTUEdits(m))
+          return m.invB && *m.invB >= materializedSiteEnd;
+
+        if (!includeOwnedInvocationSurvivesTUEdits(m))
+          return false;
+        const RefoldModel::IncludeItem *owner =
+            owningIncludeSiteForInvocationInTU(m);
+        return owner && owner->siteB >= materializedSiteEnd &&
+               owner->id != materializedInclude.id;
+      };
+
+  auto materializedIncludeNeedsDefinitionAfterward =
+      [&](const RefoldModel::IncludeItem &materializedInclude,
+          uint64_t materializedSiteEnd,
+          const RefoldModel::MacroDirective &definition) {
+        for (const RefoldModel::MacroInvocation &m :
+             model_.GetMacroInvocations()) {
+          if (m.callerMacroId || IsInvocationInsideDefineDirective(m))
+            continue;
+          if (physicalCallsiteAlreadyHasPatch(m))
+            continue;
+          const RefoldModel::MacroDirective *active =
+              activeDefinitionForInvocation(m);
+          if (!active || active->id != definition.id)
+            continue;
+          if (invocationSurvivesAfterMaterializedInclude(
+                  m, materializedInclude, materializedSiteEnd))
+            return true;
+        }
+        return false;
+      };
+
+  // Include materialization is staged after the first macro-liveness pass, so a
+  // definition inside the materialized include subtree can be consumed too late
+  // for that earlier pass to repair surviving suffix callsites.  Repair that
+  // owner-polymorphic gap locally: if the replacement does not itself observe
+  // the definition, prefix the materialized header payload with the consumed
+  // #define so later preserved TU/header source still sees the original macro
+  // state.  If the replacement does observe the definition, this narrow proof
+  // cannot choose a safe insertion point and must fail closed to terminal B.
+  auto repairConsumedDefinitionsForMaterializedInclude =
+      [&](const RefoldModel::IncludeItem &materializedInclude,
+          uint64_t materializedSiteBegin, uint64_t materializedSiteEnd,
+          std::string &replacementText) {
+        TextEdit replacementProbe{materializedSiteBegin, materializedSiteEnd,
+                                  replacementText, std::nullopt,
+                                  std::nullopt, {}};
+        std::string preservedDirectivePrefix;
+
+        for (const NamedMacroDirectiveRef &ref : namedMacroDirectives) {
+          const RefoldModel::MacroDirective &definition = *ref.directive;
+          if (definition.subkind != "#define")
+            continue;
+          if (preservedDefinitionDirectiveIds.contains(definition.id))
+            continue;
+          if (!materializedIncludeSubtreeOwnsMacroDirective(
+                  materializedInclude, definition))
+            continue;
+          if (materializedReplacementPreservesDirectiveAncestry(
+                  materializedInclude, definition, replacementProbe))
+            continue;
+          if (macroStateDirectiveAppearsAtLineStart(replacementProbe,
+                                                    definition))
+            continue;
+          if (!materializedIncludeNeedsDefinitionAfterward(
+                  materializedInclude, materializedSiteEnd, definition))
+            continue;
+
+          if (definitionHasOtherSurvivingSameNameTransition(definition,
+                                                            ref.name)) {
+            RequestTerminalFallback(
+                TerminalFallbackKind::UndischargedEmissionArtifact,
+                "include/materialized-macro-state",
+                llvm::formatv(
+                    "materialized include inc#{0} consumes definition #{1} "
+                    "for macro '{2}', but another same-name transition "
+                    "survives in the suffix",
+                    materializedInclude.id, definition.id, ref.name)
+                    .str());
+            return false;
+          }
+
+          if (firstReplacementObservationOffset(replacementProbe, definition,
+                                                ref.name)) {
+            RequestTerminalFallback(
+                TerminalFallbackKind::UndischargedEmissionArtifact,
+                "include/materialized-macro-state",
+                llvm::formatv(
+                    "materialized include inc#{0} consumes definition #{1} "
+                    "for macro '{2}', but the materialized payload itself "
+                    "observes that macro",
+                    materializedInclude.id, definition.id, ref.name)
+                    .str());
+            return false;
+          }
+
+          std::string directiveText =
+              directiveTextForPreservation(definition);
+          if (directiveText.empty())
+            continue;
+          if (!directiveText.empty() && directiveText.back() != '\n')
+            directiveText.push_back('\n');
+
+          trace("macro/liveness",
+                "preserving include-owned definition #{0} before "
+                "materialized include inc#{1} for surviving suffix macro "
+                "'{2}'",
+                definition.id, materializedInclude.id, ref.name);
+
+          preservedDirectivePrefix += directiveText;
+          preservedDefinitionDirectiveIds.insert(definition.id);
+          ++preservedDefinitionLivenessDirectives;
+        }
+
+        if (!preservedDirectivePrefix.empty())
+          replacementText.insert(0, preservedDirectivePrefix);
+
+        return true;
+      };
+
   // Apply TU-level include expansions by replacing the original `#include`
   // directive with the realized expansion text. For includes whose site is in
   // the TU itself (no parent include, and sitePath == tuPath), use the
@@ -5930,7 +6112,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
     if (!inc)
       continue;
     if (!inc->parent && PathsEqual(inc->sitePath, tuPath)) {
-      const auto &expText = itExp->second;
+      std::string expText = itExp->second;
       // The producer's [siteB, siteE) range is supposed to cover the entire
       // physical `#include` directive in the TU. In some cases involving
       // leading line splices just before the directive, that recorded end can
@@ -5958,6 +6140,11 @@ std::string RefoldEngine::RunSinglePassRefold() {
         }
       }
 
+      if (!repairConsumedDefinitionsForMaterializedInclude(*inc, siteB, siteE,
+                                                           expText)) {
+        return std::string();
+      }
+
       debug("include/tu", "TU include expansion inc#{0} site=[{1},{2}) len={3}",
             inc->id, siteB, siteE, expText.size());
       std::string headerPath = resolveHeaderPath(*inc);
@@ -5966,18 +6153,20 @@ std::string RefoldEngine::RunSinglePassRefold() {
                                                          tuPath);
       std::string wrapped = lineDirs_.WrapIncludeExpansion(
           headerPath, parentResume.fileSpelling, parentResume.lineNo, expText);
-      TextEdit edit{siteB, siteE, std::move(wrapped), std::nullopt,
-                    std::nullopt, {}};
+      TextEdit edit{siteB,        siteE,        std::move(wrapped),
+                    std::nullopt, std::nullopt, {}};
       auto itAccepted = includeExpansionAcceptedResults.find(incId);
       if (auto bEnv = ResolveIncludeRealizationBTokenEnvelope(inc->cover.begin,
-                                                               inc->cover.end))
+                                                              inc->cover.end)) {
         StampTextEditMaterializedBTokenRange(edit, bEnv->first, bEnv->second);
-      if (itAccepted != includeExpansionAcceptedResults.end())
+      }
+      if (itAccepted != includeExpansionAcceptedResults.end()) {
         AttachAcceptedResultCarrier(edit, itAccepted->second);
-      else
+      } else {
         AttachAcceptedResultCarrier(
             edit, BuildAcceptedIncludeRealizationCandidate(
                       AcceptedPathKind::IncludeMaterializedExpansion, *inc));
+      }
       tuEdits.push_back(std::move(edit));
     }
   }

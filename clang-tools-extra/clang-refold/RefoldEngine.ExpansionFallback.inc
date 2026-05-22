@@ -3601,7 +3601,12 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       return false;
 
     stringutils::skipNonNewlineWs(text, pos);
-    return pos == text.size();
+
+    // Treat comments after `once` as directive trivia, not as another pragma
+    // operand.  Clang accepts `#pragma once /* ... */`, and for refolding it
+    // has the same include-local state effect as the bare spelling.  Reuse the
+    // existing trivia recognizer so incomplete comments remain fail-closed.
+    return isWsOrCompleteCommentTrivia(text.drop_front(pos));
   };
 
   // Return true iff the include has structure other than an explicitly
@@ -6350,7 +6355,27 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
         StringRef line = tuBytes.slice(lineBegin, lineEnd);
         StringRef trimmed = line.trim();
         if (!trimmed.empty() && trimmed.front() != '#') {
-          padded.append(line.begin(), line.end());
+          StringRef copiedLine = line;
+
+          // The sink may start in the middle of a physical source line, for
+          // example after the TU/include closure consumed the leading token of
+          // `int between = 0;`.  In that case `padded` already contains the
+          // B-side spelling and any B-side separator after that token, while
+          // `line` begins with the original source separator before the next
+          // token.  Keeping both separators manufactures visible whitespace
+          // such as `int  between`.  Collapse exactly one copied horizontal
+          // source byte only when the sink is a same-line continuation and the
+          // replacement already ends in horizontal whitespace.  Remaining
+          // source whitespace, if any, is preserved byte-for-byte.
+          if (lineBegin > 0 && tuBytes[lineBegin - 1] != '\n' &&
+              tuBytes[lineBegin - 1] != '\r' && !padded.empty() &&
+              stringutils::isNonNewlineWs(padded.back()) &&
+              !copiedLine.empty() &&
+              stringutils::isNonNewlineWs(copiedLine.front())) {
+            copiedLine = copiedLine.drop_front();
+          }
+
+          padded.append(copiedLine.begin(), copiedLine.end());
           closureSourceEnd = lineEnd;
 
           // Re-emitting one untouched trailing line verbatim moves the eventual
@@ -6361,10 +6386,10 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
           // this exact copied-line absorption.
           trace("fallback",
                 "TU include-closure newline sink: absorbed source=[{0},{1}) "
-                "line='{2}' remainingPad={3} (single-line invariant-preserving "
-                "sink)",
+                "line='{2}' copiedLine='{3}' remainingPad={4} "
+                "(single-line invariant-preserving sink)",
                 lineBegin, lineEnd, stringutils::showWsWithClip(line, 120),
-                remainingPadNl);
+                stringutils::showWsWithClip(copiedLine, 120), remainingPadNl);
         }
       }
     }
