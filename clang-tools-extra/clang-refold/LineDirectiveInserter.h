@@ -28,6 +28,18 @@ struct LineDirectiveState {
       : fileSpelling(file.str()), lineAfterDir(line), afterDirIdx(idx) {}
 };
 
+/// \brief Logical source location at a byte offset in an original source file.
+///
+/// This is the location the preprocessor would assign to the next token emitted
+/// from that offset after accounting for preceding `#line` directives.
+struct LineDirectiveLocation {
+  std::string fileSpelling;
+  size_t lineNo;
+
+  LineDirectiveLocation(StringRef file, size_t line)
+      : fileSpelling(file.str()), lineNo(line) {}
+};
+
 /// \brief Inserts #line directives to preserve preprocessor "logical location"
 /// transparency after refolding edits.
 ///
@@ -115,6 +127,25 @@ public:
     result += "\"\n";
     return result;
   }
+
+  /// \brief Computes the logical parent location at `offset` in `src`.
+  ///
+  /// Include materialization needs to restore the includer's logical location
+  /// after replacing an `#include` line with header bytes. The correct resume
+  /// point is not always the physical TU line: a user-spelled `#line` directive
+  /// before the include may have already changed the active logical file/line
+  /// state.
+  ///
+  /// When no previous parseable `#line` directive is visible in the bounded
+  /// lookback window, this falls back to `(defaultFileSpelling, physical line at
+  /// offset)`, which preserves the existing conservative behavior.
+  ///
+  /// \param src original source buffer
+  /// \param offset byte offset at which the next source byte would be emitted
+  /// \param defaultFileSpelling producer spelling for the physical source file
+  /// \return logical file/line state at `offset`
+  static LineDirectiveLocation LogicalLocationAtOffset(
+      StringRef src, uint64_t offset, StringRef defaultFileSpelling);
 
   /// \brief Wraps a realized include expansion so the preprocessor logical
   /// file/line state matches the original header for the duration of the

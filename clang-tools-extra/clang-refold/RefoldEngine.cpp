@@ -4141,6 +4141,36 @@ std::string RefoldEngine::RunSinglePassRefold() {
         return false;
       };
 
+  // Return true when `edit` is a macro-callsite realization whose emitted
+  // replacement surface must be interpreted in B's macro-state environment, not
+  // in the original A-side environment.  This is deliberately narrower than
+  // ordinary InvocationPreserving: an args-only / DAG-lift patch such as
+  // `MIX(5)` is meant to keep using the active definition before the callsite,
+  // so moving that definition after the callsite would be a bogus but
+  // token-valid refolding.
+  //
+  // The case that needs the exception is whole-cover edited-surface realization,
+  // e.g. replacing an expanded token `10` with the literal B-side surface `M()`.
+  // The crossed source slice is the original macro invocation and therefore
+  // necessarily observes the old definition, but the accepted realization proof
+  // says the replacement surface itself is the B artifact.  The separate
+  // replacement-observation check still proves that the emitted payload actually
+  // mentions the carried macro name.
+  auto editHasMacroPatchSurfaceInBMacroState = [](const TextEdit &edit) {
+    for (const auto &carrier : edit.acceptedResults) {
+      if (!carrier || carrier->kind != AcceptedResultCandidateKind::MacroPatch)
+        continue;
+
+      const ProofSummary &summary = carrier->proofSummary;
+      if (summary.acceptedClass == AcceptedProofClass::InvocationRealization &&
+          summary.realizationMode == RealizationMode::RealizeEditedSurface &&
+          summary.surfaceDisposition ==
+              SurfaceDisposition::RealizeWholeCoverMacros)
+        return true;
+    }
+    return false;
+  };
+
   enum class MacroStatePreservationPlacement {
     BeforeReplacement,
     InsideReplacement,
@@ -4895,17 +4925,25 @@ std::string RefoldEngine::RunSinglePassRefold() {
         if (!ensureDelayedBoundary(directive, ref.name))
           continue;
 
-        // Only carry a gap definition when the *new* B-side replacement
-        // payload is the first material that would observe the definition.  A
-        // mixed TU/include closure may intentionally preserve zero-token
-        // source islands inside the edit itself, such as FORWARD(EMPTY),
-        // CAT(,), or #if ENABLE ... #endif.  Those source islands are proved
-        // neutral under the original macro state, so moving the active
-        // definition after them would invalidate the very proof that allowed
-        // them to be preserved.  In that case the correct answer is to leave
-        // the definition in source order and let the existing closure proof
-        // own the zero-token material.
-        if (sourceChunkObservesDefinitionWhenCrossed(
+        // Only carry a gap definition when the B-side replacement is the
+        // first material that would observe the definition.  A mixed TU/include
+        // closure may intentionally preserve zero-token source islands inside
+        // the edit itself, such as FORWARD(EMPTY), CAT(,), or #if ENABLE ...
+        // #endif.  Those source islands are proved neutral under the original
+        // macro state, so moving the active definition after them would
+        // invalidate the very proof that allowed them to be preserved.
+        //
+        // Macro-callsite edits whose emitted surface is kept in B's macro
+        // state are the important exception: the original source slice is
+        // itself the macro invocation, so it necessarily observes the old
+        // definition.  The accepted macro proof says the replacement wants to
+        // keep the emitted callsite surface under B's macro state, so carrying
+        // the definition after the callsite is exactly the liveness repair
+        // needed for this class.  This covers both structure-preserving macro
+        // proofs and whole-cover realizations that reconstruct a literal
+        // invocation spelling such as `M()`.
+        if (!editHasMacroPatchSurfaceInBMacroState(edit) &&
+            sourceChunkObservesDefinitionWhenCrossed(
                 directive, ref.name, tuBytes.slice(edit.start, edit.end),
                 tuBytes.drop_front(edit.end)))
           continue;
@@ -5858,6 +5896,14 @@ std::string RefoldEngine::RunSinglePassRefold() {
     }
   }
 
+  // TU-owned macro patches are converted to byte edits after the first
+  // macro-state liveness pass above.  Run the same preserved-definition carry
+  // proof once more so invocation-preserving macro edits also get the correct
+  // B-side macro environment.  This handles shapes where an include-owned or
+  // TU-spelled `#define` precedes a callsite that the refolding now preserves
+  // literally, while later surviving source still needs that definition.
+  carryObservedGapDefinitionsAfterReplacements();
+
   // 6b) TU include expansions: includes with parent == null and site in TU,
   // only if we realized an expansion.
   //
@@ -5915,9 +5961,11 @@ std::string RefoldEngine::RunSinglePassRefold() {
       debug("include/tu", "TU include expansion inc#{0} site=[{1},{2}) len={3}",
             inc->id, siteB, siteE, expText.size());
       std::string headerPath = resolveHeaderPath(*inc);
+      LineDirectiveLocation parentResume =
+          LineDirectiveInserter::LogicalLocationAtOffset(tuBytes, siteE,
+                                                         tuPath);
       std::string wrapped = lineDirs_.WrapIncludeExpansion(
-          headerPath, tuPath, stringutils::lineAtOffset(tuBytes, siteE),
-          expText);
+          headerPath, parentResume.fileSpelling, parentResume.lineNo, expText);
       TextEdit edit{siteB, siteE, std::move(wrapped), std::nullopt,
                     std::nullopt, {}};
       auto itAccepted = includeExpansionAcceptedResults.find(incId);

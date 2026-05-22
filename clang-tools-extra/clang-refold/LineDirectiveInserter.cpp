@@ -33,6 +33,24 @@ std::string LineDirectiveInserter::ToAbsolutePath(StringRef spelledPath) const {
   return std::string(path.str());
 }
 
+LineDirectiveLocation LineDirectiveInserter::LogicalLocationAtOffset(
+    StringRef src, uint64_t offset, StringRef defaultFileSpelling) {
+  const size_t clampedOffset =
+      static_cast<size_t>(std::min<uint64_t>(offset, src.size()));
+  StringRef prefix = src.take_front(clampedOffset);
+
+  if (std::optional<LineDirectiveState> state =
+          FindLastLineDirectiveState(prefix)) {
+    const size_t delta = stringutils::countNonSplicedNewlines(
+        prefix, state->afterDirIdx, prefix.size());
+    return LineDirectiveLocation(state->fileSpelling,
+                                 state->lineAfterDir + delta);
+  }
+
+  return LineDirectiveLocation(defaultFileSpelling,
+                               stringutils::lineAtOffset(src, clampedOffset));
+}
+
 std::string LineDirectiveInserter::WrapIncludeExpansion(
     StringRef childFileSpelling, StringRef parentFileSpelling,
     size_t parentResumeLineNo, StringRef childBody) const {
