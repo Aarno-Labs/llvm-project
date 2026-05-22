@@ -142,12 +142,65 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
     return replacement.str() + directive;
   }
 
-  // Otherwise, the only remaining safe insertion point is before a trailing
-  // indentation-only suffix inside the replacement. That preserves the suffix
-  // indentation while still placing the directive at BOL.
+  // Otherwise, the remaining safe insertion points are inside the
+  // replacement, immediately before bytes that are proved to be a carried
+  // prefix of the untouched original suffix line, or before a trailing
+  // indentation-only suffix.
   size_t lastNl = replacement.rfind('\n');
   if (lastNl != StringRef::npos) {
     size_t bol = lastNl + 1;
+
+    // Some token-hunk repairs deliberately absorb the first bytes of the
+    // untouched suffix line into the replacement so that lexical adjacency is
+    // preserved.  Example shape:
+    //
+    //     replacement: "...\nint"
+    //     original[e:]: " keep = ..."
+    //
+    // The final "int" is not new edited payload; it is the byte-for-byte
+    // prefix of the original suffix line [lineStart(e), e).  If the edit also
+    // removed physical lines before that suffix, the correct local resync point
+    // is before the carried prefix, not after the entire replacement.  This is
+    // a proof, not a formatting preference: the replacement suffix must exactly
+    // equal the original line prefix that will be rejoined with original[e:].
+    if (e <= originalFileText.size() && bol < replacement.size() &&
+        !stringutils::isLineSplice(replacement, lastNl)) {
+      const size_t resumePrefixBegin = stringutils::lineStartOffset(
+          originalFileText, static_cast<size_t>(e));
+      const bool resumePrefixStartsLogicalLine =
+          resumePrefixBegin == 0 ||
+          !stringutils::isLineSplice(originalFileText, resumePrefixBegin - 1);
+      if (resumePrefixBegin < e && resumePrefixStartsLogicalLine) {
+        StringRef originalResumePrefix =
+            originalFileText.slice(resumePrefixBegin, static_cast<size_t>(e));
+        StringRef replacementResumePrefix = replacement.substr(bol);
+        if (!originalResumePrefix.empty() &&
+            replacementResumePrefix == originalResumePrefix) {
+          trace("linedir/local",
+                "inject (before carried suffix prefix): resumeLine={0} "
+                "file={1} lastNl={2} bol={3} prefix={4}",
+                resumeLine, fileSpellingForDirective, lastNl, bol,
+                stringutils::showWs(stringutils::clip(replacementResumePrefix,
+                                                     80)));
+
+          // Idempotence: if the prefix is already preceded by this exact
+          // directive, do not duplicate it.
+          if (replacement.substr(0, bol).ends_with(directive)) {
+            trace("linedir/local",
+                  "skip (directive already present before carried suffix "
+                  "prefix): resumeLine={0} file={1}",
+                  resumeLine, fileSpellingForDirective);
+            return replacement.str();
+          }
+
+          std::string res = replacement.substr(0, bol).str();
+          res += directive;
+          res += replacement.substr(bol).str();
+          return res;
+        }
+      }
+    }
+
     if (stringutils::isIndentOnly(replacement, bol, replacement.size())) {
       if (!rejoinsUntouchedTailSafelyAtBOL(e)) {
         trace("linedir/local",
