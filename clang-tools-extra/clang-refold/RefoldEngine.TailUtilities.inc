@@ -349,15 +349,65 @@ void RefoldEngine::MaterializeIncludeExpansion(
       return;
     }
 
-    // A sideband pragma line is not part of the normal PP token stream.
-    // Deleting or replacing it changes physical line count, but that drift is
-    // token-observable only if a later preserved token in this same header
-    // owner can expand a line/file-sensitive builtin.  Otherwise injecting a
-    // local #line directive merely leaves gratuitous scaffolding in the
-    // materialized header body.
-    ResyncOutcome ro =
+    auto hasCopiedHeaderSuffixAfterSidebandEdit = [&]() -> bool {
+      // A header-local resync can only protect bytes that remain in this same
+      // materialized header after the sideband edit.  If the sideband edit is
+      // the last visible header-owned replay text, the parent-resume wrapper is
+      // the next meaningful line-state transition and an extra local #line would
+      // be gratuitous.
+      for (uint64_t p = sideband.siteE; p < bytes.size(); ++p)
+        if (!stringutils::isWs(bytes[p]))
+          return true;
+      return false;
+    };
+
+    auto replacementOwnsTrailingReplayBlankLine = [&]() -> bool {
+      // Sideband replacement text always includes the directive line terminator.
+      // A local header resync is needed only when the B-side sideband envelope
+      // also owned extra trailing replay whitespace, such as the blank line in
+      // `#pragma beta\n\nint value`.  A plain insertion/replacement line or a
+      // continued source pragma collapsed to one replay line should not inject a
+      // second header #line before the copied suffix; the include enter wrapper
+      // already establishes the header file context for the materialized body.
+      unsigned trailingLineTerminators = 0;
+      size_t i = sideband.replacementText.size();
+      while (i > 0) {
+        const char c = sideband.replacementText[i - 1];
+        if (stringutils::isNonNewlineWs(c)) {
+          --i;
+          continue;
+        }
+        if (c == '\n') {
+          --i;
+          if (i > 0 && sideband.replacementText[i - 1] == '\r')
+            --i;
+          ++trailingLineTerminators;
+          continue;
+        }
+        if (c == '\r') {
+          --i;
+          ++trailingLineTerminators;
+          continue;
+        }
+        break;
+      }
+      return trailingLineTerminators > 1;
+    };
+
+    // A sideband pragma line is not part of the normal PP token stream, but it
+    // can still be visible header-owned replay text.  The include enter/exit
+    // wrapper handles the owner transition for that visible replay.  Header-local
+    // resync is narrower: emit it only when sideband-owned trailing B whitespace
+    // would otherwise shift copied header suffix bytes, or when the suffix has a
+    // source-location observer such as __LINE__/__FILE__.
+    const bool mustPreserveHeaderLineState =
+        (sideband.forceIncludeLineDirectiveWrappers &&
+         hasCopiedHeaderSuffixAfterSidebandEdit() &&
+         replacementOwnsTrailingReplayBlankLine()) ||
         OwnerSuffixHasLineStateSensitiveBuiltin(includeId, headerPath,
-                                                sideband.siteE)
+                                                sideband.siteE);
+    ResyncOutcome ro =
+        mustPreserveHeaderLineState
             ? ApplyResyncOrPend(bytes, sideband.siteB, sideband.siteE,
                                 sideband.replacementText, headerPath)
             : ResyncOutcome(sideband.replacementText, std::nullopt);

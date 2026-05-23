@@ -1459,12 +1459,25 @@ static bool buildSidebandPragmaSourceEdits(
       return NeighborAnchor{&pragma, binding.ownerIncludeId};
     };
 
+    auto matchedNeighborInInsertionGap = [&](uint64_t bIdx)
+        -> std::optional<NeighborAnchor> {
+      if (bIdx >= bLines.size() || bToA[static_cast<size_t>(bIdx)] < 0)
+        return std::nullopt;
+
+      std::optional<uint64_t> projectedGap = projectedBGapForSidebandLine(
+          normalA2B, bLines[static_cast<size_t>(bIdx)]);
+      if (!projectedGap || *projectedGap != *ownerGap)
+        return std::nullopt;
+
+      return boundNeighbor(bToA[static_cast<size_t>(bIdx)]);
+    };
+
     std::optional<NeighborAnchor> prev;
     std::optional<NeighborAnchor> next;
-    if (bStart > 0 && bToA[static_cast<size_t>(bStart - 1)] >= 0)
-      prev = boundNeighbor(bToA[static_cast<size_t>(bStart - 1)]);
-    if (bEnd < bLines.size() && bToA[static_cast<size_t>(bEnd)] >= 0)
-      next = boundNeighbor(bToA[static_cast<size_t>(bEnd)]);
+    if (bStart > 0)
+      prev = matchedNeighborInInsertionGap(bStart - 1);
+    if (bEnd < bLines.size())
+      next = matchedNeighborInInsertionGap(bEnd);
 
     std::optional<std::string> sitePath;
     std::optional<uint64_t> siteByte;
@@ -1472,12 +1485,13 @@ static bool buildSidebandPragmaSourceEdits(
 
     if (prev || next) {
       // A B-only sideband insertion inside a sideband block is ordered by its
-      // surviving sideband neighbors, not by the normal-token gap alone.  All
-      // sideband lines in the block share one gap; the adjacent matched pragma
-      // occurrence(s) prove the concrete source owner and the exact intra-block
-      // insertion point.  This handles inserting before the first existing
-      // sideband line, between two existing lines, or after the last existing
-      // line in a TU or concrete include replay.
+      // surviving sideband neighbors, not by the normal-token gap alone.  The
+      // normal-token gap only proves the surrounding token interval; it must not
+      // let an adjacent sideband line from a different interval steal the
+      // insertion.  Therefore only matched neighbors whose B-side gap projects
+      // to this insertion gap participate in the intra-block proof.  If no such
+      // neighbor exists, the normal-token-gap anchor below handles the insertion
+      // as a gap-level edit instead.
       const NeighborAnchor &base = next ? *next : *prev;
       if (!base.pragma)
         return false;
@@ -1645,19 +1659,25 @@ static bool buildSidebandPragmaSourceEdits(
       continue;
     }
 
-    if (h.isReplace() && (h.aEnd - h.aStart) == (h.bEnd - h.bStart)) {
-      for (uint64_t a = h.aStart, b = h.bStart; a < h.aEnd; ++a, ++b)
-        if (!appendEditForA(a, bLines[static_cast<size_t>(b)].text,
-                            bLines[static_cast<size_t>(b)].begin,
-                            bLines[static_cast<size_t>(b)].end))
-          return false;
-      continue;
-    }
-
     if (h.isReplace()) {
-      if (!appendBlockEdit(h.aStart, h.aEnd, h.bStart, h.bEnd))
-        return false;
-      continue;
+      // Prefer the owner-local block proof for every replacement hunk, including
+      // equal-arity replacements.  A 1-to-1 pragma spelling change can still own
+      // B-side trivia after the replacement directive, and that trivia can be
+      // necessary both for the most accurate refolding and for the following
+      // #line resynchronization.  If a legacy equal-arity hunk is not a single
+      // owner-local block, fall back to the previous per-line proof so unrelated
+      // independent replacements keep their existing behavior.
+      if (appendBlockEdit(h.aStart, h.aEnd, h.bStart, h.bEnd))
+        continue;
+      if ((h.aEnd - h.aStart) == (h.bEnd - h.bStart)) {
+        for (uint64_t a = h.aStart, b = h.bStart; a < h.aEnd; ++a, ++b)
+          if (!appendEditForA(a, bLines[static_cast<size_t>(b)].text,
+                              bLines[static_cast<size_t>(b)].begin,
+                              bLines[static_cast<size_t>(b)].end))
+            return false;
+        continue;
+      }
+      return false;
     }
 
     // Any remaining sideband shape is outside the current proof domain.  In
