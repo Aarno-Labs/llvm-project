@@ -3,6 +3,7 @@
 #include "StringUtils.h"
 #include <algorithm>
 #include <cctype>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -28,6 +29,17 @@ namespace {
 struct LineControlMacroDefinition {
   bool functionLike = false;
   std::vector<std::string> params;
+
+  // The local evaluator needs to recognize both standard C variadics
+  // (`...` / `__VA_ARGS__`) and GNU named variadics (`args...`) because
+  // either spelling may provide the filename operand of a source-authored
+  // `#line` directive.  The variadic parameter is still stored in `params`
+  // at its normal position; these fields only identify that parameter so call
+  // arguments can be coalesced the same way the preprocessor forms the
+  // variadic argument.
+  bool variadic = false;
+  std::string variadicParam;
+
   std::string replacement;
 };
 
@@ -185,6 +197,72 @@ static std::optional<std::vector<std::string>> parseMacroArguments(
   return std::nullopt;
 }
 
+
+// Parse one balanced parenthesized token sequence without treating top-level
+// commas as separators.  `__VA_OPT__(...)` takes a single token sequence, and
+// that sequence may itself contain commas, nested parentheses, or quoted
+// literals.  This helper returns the raw spelling inside the outer parentheses
+// so the ordinary replacement-list substitution code can evaluate the content
+// if the variadic argument is present.
+static std::optional<std::string> parseBalancedParenthesizedContent(
+    StringRef text, size_t openParen, size_t &afterClose) {
+  if (openParen >= text.size() || text[openParen] != '(')
+    return std::nullopt;
+
+  std::string content;
+  unsigned depth = 0;
+
+  for (size_t i = openParen + 1; i < text.size(); ++i) {
+    char c = text[i];
+
+    if (c == '"' || c == '\'') {
+      size_t literalBegin = i;
+      if (!skipQuotedLiteral(text, i))
+        return std::nullopt;
+      content += text.slice(literalBegin, i).str();
+      --i;
+      continue;
+    }
+
+    if (c == '(') {
+      ++depth;
+      content.push_back(c);
+      continue;
+    }
+
+    if (c == ')') {
+      if (depth == 0) {
+        afterClose = i + 1;
+        return content;
+      }
+      --depth;
+      content.push_back(c);
+      continue;
+    }
+
+    content.push_back(c);
+  }
+
+  return std::nullopt;
+}
+
+static std::string joinRawMacroArguments(ArrayRef<std::string> args,
+                                         size_t begin) {
+  if (begin >= args.size())
+    return "";
+
+  std::string out = args[begin];
+  for (size_t i = begin + 1; i < args.size(); ++i) {
+    // Preserve the comma separators that are part of a variadic argument.  The
+    // exact horizontal whitespace around the comma is not significant for the
+    // line-control operands we later parse, but using a stable spelling keeps
+    // diagnostics and traces deterministic.
+    out += ", ";
+    out += args[i];
+  }
+  return out;
+}
+
 // The #line evaluator only needs the spelling produced by simple token paste in
 // line-control operands.  After parameter substitution, remove `##` and adjacent
 // horizontal padding so pasted numeric/string/file-name fragments can be parsed
@@ -218,10 +296,19 @@ static std::string expandLineControlMacros(
     std::unordered_set<std::string> &disabled, size_t logicalLineAtLineStart,
     StringRef activeFileSpelling);
 
+static std::string substituteLineControlReplacementFragment(
+    StringRef repl, const std::unordered_map<std::string, std::string> &rawByParam,
+    const std::unordered_map<std::string, std::string> &expandedByParam,
+    bool variadicArgumentHasTokens, const LineControlMacroMap &macros,
+    std::unordered_set<std::string> &disabled, size_t logicalLineAtLineStart,
+    StringRef activeFileSpelling);
+
 // Substitute a function-like macro invocation for the line-control evaluator.
 // This mirrors the C preprocessor distinction needed by #line operands:
 //   * `#param` uses the raw argument spelling;
 //   * ordinary `param` uses the macro-expanded argument spelling;
+//   * `__VA_OPT__(tokens)` contributes `tokens` only when the variadic
+//     argument is non-empty;
 //   * `##` is resolved after substitution.
 // The caller maintains the disabled set so recursive macro references are left
 // unexpanded instead of causing unbounded recursion.
@@ -231,17 +318,40 @@ static std::string substituteFunctionLikeLineControlMacro(
     size_t logicalLineAtLineStart, StringRef activeFileSpelling) {
   std::unordered_map<std::string, std::string> rawByParam;
   std::unordered_map<std::string, std::string> expandedByParam;
+  bool variadicArgumentHasTokens = false;
 
   for (size_t i = 0; i < def.params.size(); ++i) {
-    StringRef raw = i < rawArgs.size() ? StringRef(rawArgs[i]) : StringRef();
-    rawByParam[def.params[i]] = raw.str();
+    std::string raw;
+    if (def.variadic && def.params[i] == def.variadicParam) {
+      raw = joinRawMacroArguments(rawArgs, i);
+      variadicArgumentHasTokens = !trimHorizontal(StringRef(raw)).empty();
+    } else {
+      raw = i < rawArgs.size() ? rawArgs[i] : std::string();
+    }
+
+    rawByParam[def.params[i]] = raw;
     expandedByParam[def.params[i]] = expandLineControlMacros(
         raw, macros, disabled, logicalLineAtLineStart, activeFileSpelling);
   }
 
+  std::string substituted = substituteLineControlReplacementFragment(
+      StringRef(def.replacement), rawByParam, expandedByParam,
+      variadicArgumentHasTokens, macros, disabled, logicalLineAtLineStart,
+      activeFileSpelling);
+
+  std::string pasted = removeTokenPasteOperators(StringRef(substituted));
+  return expandLineControlMacros(StringRef(pasted), macros, disabled,
+                                 logicalLineAtLineStart, activeFileSpelling);
+}
+
+static std::string substituteLineControlReplacementFragment(
+    StringRef repl, const std::unordered_map<std::string, std::string> &rawByParam,
+    const std::unordered_map<std::string, std::string> &expandedByParam,
+    bool variadicArgumentHasTokens, const LineControlMacroMap &macros,
+    std::unordered_set<std::string> &disabled, size_t logicalLineAtLineStart,
+    StringRef activeFileSpelling) {
   std::string substituted;
-  substituted.reserve(def.replacement.size());
-  StringRef repl(def.replacement);
+  substituted.reserve(repl.size());
 
   for (size_t i = 0; i < repl.size();) {
     if (copyQuotedLiteral(repl, i, substituted))
@@ -276,6 +386,40 @@ static std::string substituteFunctionLikeLineControlMacro(
       while (i < repl.size() && stringutils::isIdentPart(repl[i]))
         ++i;
       std::string name = repl.slice(nameBegin, i).str();
+
+      // `__VA_OPT__` is a replacement-list operator, not an ordinary macro.
+      // Evaluate it while the raw/expanded parameter bindings are still in
+      // scope.  If the variadic argument is empty, the whole parenthesized token
+      // sequence disappears; otherwise the token sequence is substituted using
+      // the same rules as the surrounding replacement list.  This is the piece
+      // needed for line-control forms such as:
+      //   #define LOC(n, ...) n __VA_OPT__(__VA_ARGS__)
+      //   #define LOC(n, name, ...) n __VA_OPT__(#name)
+      if (name == "__VA_OPT__") {
+        size_t callPos = i;
+        while (callPos < repl.size() && stringutils::isWs(repl[callPos]) &&
+               repl[callPos] != '\n')
+          ++callPos;
+        if (callPos < repl.size() && repl[callPos] == '(') {
+          size_t afterClose = callPos;
+          std::optional<std::string> content =
+              parseBalancedParenthesizedContent(repl, callPos, afterClose);
+          if (content) {
+            if (variadicArgumentHasTokens) {
+              substituted += substituteLineControlReplacementFragment(
+                  StringRef(*content), rawByParam, expandedByParam,
+                  variadicArgumentHasTokens, macros, disabled,
+                  logicalLineAtLineStart, activeFileSpelling);
+            }
+            i = afterClose;
+            continue;
+          }
+        }
+
+        substituted += name;
+        continue;
+      }
+
       auto found = expandedByParam.find(name);
       if (found != expandedByParam.end()) {
         substituted += found->second;
@@ -288,9 +432,7 @@ static std::string substituteFunctionLikeLineControlMacro(
     substituted.push_back(repl[i++]);
   }
 
-  std::string pasted = removeTokenPasteOperators(StringRef(substituted));
-  return expandLineControlMacros(StringRef(pasted), macros, disabled,
-                                 logicalLineAtLineStart, activeFileSpelling);
+  return substituted;
 }
 
 // Expand macro names in the operand portion of a source-authored line-control
@@ -467,7 +609,11 @@ static void updateLineControlMacroEnvironment(StringRef line,
       }
 
       if (p + 3 <= to && line.substr(p, 3) == "...") {
-        def.params.push_back("__VA_ARGS__");
+        // Standard variadic macro spelling.  Inside the replacement list the
+        // variadic argument is addressed as `__VA_ARGS__`.
+        def.variadic = true;
+        def.variadicParam = "__VA_ARGS__";
+        def.params.push_back(def.variadicParam);
         p += 3;
       } else {
         StringRef param;
@@ -475,12 +621,26 @@ static void updateLineControlMacroEnvironment(StringRef line,
           macros.erase(name.str());
           return;
         }
-        def.params.push_back(param.str());
+
+        if (p + 3 <= to && line.substr(p, 3) == "...") {
+          // GNU named variadic spelling, e.g. `#define LOC(args...) args`.
+          // The named parameter receives the complete variadic argument.
+          def.variadic = true;
+          def.variadicParam = param.str();
+          def.params.push_back(def.variadicParam);
+          p += 3;
+        } else {
+          def.params.push_back(param.str());
+        }
       }
 
       while (p < to && stringutils::isWs(line[p]) && line[p] != '\n')
         ++p;
       if (p < to && line[p] == ',') {
+        if (def.variadic) {
+          macros.erase(name.str());
+          return;
+        }
         ++p;
         continue;
       }
