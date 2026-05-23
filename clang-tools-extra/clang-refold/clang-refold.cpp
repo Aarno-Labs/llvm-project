@@ -1386,6 +1386,11 @@ static bool buildSidebandPragmaSourceEdits(
   std::vector<diffutils::Hunk> hunks =
       diffutils::hunksFromMap(lcs, aLines.size(), bLines.size());
 
+  std::vector<int64_t> bToA(bLines.size(), -1);
+  for (size_t a = 0; a < lcs.size(); ++a)
+    if (lcs[a] >= 0 && static_cast<size_t>(lcs[a]) < bToA.size())
+      bToA[static_cast<size_t>(lcs[a])] = static_cast<int64_t>(a);
+
   auto appendEditForA = [&](uint64_t aIdx, StringRef replacement,
                             uint64_t bBegin, uint64_t bEnd) -> bool {
     if (aIdx >= aToPragma.size() ||
@@ -1414,31 +1419,122 @@ static bool buildSidebandPragmaSourceEdits(
     return true;
   };
 
-  auto appendInsertForB = [&](uint64_t bIdx) -> bool {
-    if (bIdx >= bLines.size())
-      return false;
-    const SidebandPragmaLine &line = bLines[static_cast<size_t>(bIdx)];
-    std::optional<uint64_t> aGap =
-        projectBGapToAGap(normalA2B, line.normalTokenGap);
-    if (!aGap)
+  auto appendInsertBlockForB = [&](uint64_t bStart, uint64_t bEnd) -> bool {
+    if (bStart >= bEnd || bEnd > bLines.size())
       return false;
 
-    std::optional<SidebandPragmaInsertionAnchor> anchor =
-        inferSidebandPragmaInsertionAnchor(line, *aGap, *sourcePath, includes,
-                                           tokmap, slots);
-    if (!anchor)
+    std::optional<uint64_t> ownerGap;
+    for (uint64_t b = bStart; b < bEnd; ++b) {
+      std::optional<uint64_t> projectedGap = projectedBGapForSidebandLine(
+          normalA2B, bLines[static_cast<size_t>(b)]);
+      if (!projectedGap)
+        return false;
+      if (ownerGap && *ownerGap != *projectedGap)
+        return false;
+      ownerGap = *projectedGap;
+    }
+    if (!ownerGap)
+      return false;
+
+    const uint64_t bBegin = bLines[static_cast<size_t>(bStart)].begin;
+    const uint64_t bByteEnd = sidebandBlockReplacementBEnd(
+        bBytes, bLines, rawBToks, rawBTokOff, bStart, bEnd);
+    if (bByteEnd < bBegin || bByteEnd > static_cast<uint64_t>(bBytes.size()))
+      return false;
+
+    struct NeighborAnchor {
+      const JsonPragmaItem *pragma = nullptr;
+      std::optional<uint64_t> ownerIncludeId = std::nullopt;
+    };
+
+    auto boundNeighbor = [&](int64_t aIdx) -> std::optional<NeighborAnchor> {
+      if (aIdx < 0 || static_cast<size_t>(aIdx) >= aToPragma.size())
+        return std::nullopt;
+      const SidebandPragmaItemBinding &binding =
+          aToPragma[static_cast<size_t>(aIdx)];
+      if (binding.pragmaIndex < 0)
+        return std::nullopt;
+      const JsonPragmaItem &pragma =
+          pragmas[static_cast<size_t>(binding.pragmaIndex)];
+      return NeighborAnchor{&pragma, binding.ownerIncludeId};
+    };
+
+    std::optional<NeighborAnchor> prev;
+    std::optional<NeighborAnchor> next;
+    if (bStart > 0 && bToA[static_cast<size_t>(bStart - 1)] >= 0)
+      prev = boundNeighbor(bToA[static_cast<size_t>(bStart - 1)]);
+    if (bEnd < bLines.size() && bToA[static_cast<size_t>(bEnd)] >= 0)
+      next = boundNeighbor(bToA[static_cast<size_t>(bEnd)]);
+
+    std::optional<std::string> sitePath;
+    std::optional<uint64_t> siteByte;
+    std::optional<uint64_t> ownerIncludeId;
+
+    if (prev || next) {
+      // A B-only sideband insertion inside a sideband block is ordered by its
+      // surviving sideband neighbors, not by the normal-token gap alone.  All
+      // sideband lines in the block share one gap; the adjacent matched pragma
+      // occurrence(s) prove the concrete source owner and the exact intra-block
+      // insertion point.  This handles inserting before the first existing
+      // sideband line, between two existing lines, or after the last existing
+      // line in a TU or concrete include replay.
+      const NeighborAnchor &base = next ? *next : *prev;
+      if (!base.pragma)
+        return false;
+      sitePath = base.pragma->sitePath;
+      ownerIncludeId = base.ownerIncludeId;
+
+      if (prev && next) {
+        if (!prev->pragma || !next->pragma)
+          return false;
+        if (prev->pragma->sitePath != next->pragma->sitePath ||
+            prev->ownerIncludeId != next->ownerIncludeId)
+          return false;
+        if (prev->pragma->siteE > next->pragma->siteB)
+          return false;
+        if (prev->pragma->siteE < next->pragma->siteB) {
+          std::optional<std::string> sourceBytes = readMappedSourceFileForSideband(
+              next->pragma->sitePath, *sourcePath, refoldMapPath);
+          if (!sourceBytes || next->pragma->siteB > sourceBytes->size() ||
+              prev->pragma->siteE > sourceBytes->size() ||
+              !isOnlyWhitespaceForSidebandBlock(StringRef(*sourceBytes).slice(
+                  prev->pragma->siteE, next->pragma->siteB)))
+            return false;
+        }
+        siteByte = next->pragma->siteB;
+      } else if (next) {
+        siteByte = next->pragma->siteB;
+      } else {
+        siteByte = prev->pragma->siteE;
+      }
+    } else {
+      std::optional<SidebandPragmaInsertionAnchor> anchor =
+          inferSidebandPragmaInsertionAnchor(
+              bLines[static_cast<size_t>(bStart)], *ownerGap, *sourcePath,
+              includes, tokmap, slots);
+      if (!anchor)
+        return false;
+      sitePath = anchor->sitePath;
+      siteByte = anchor->siteByte;
+      ownerIncludeId = anchor->ownerIncludeId;
+    }
+
+    if (!sitePath || !siteByte)
       return false;
 
     RefoldEngine::SidebandPragmaEdit edit;
-    edit.sitePath = anchor->sitePath;
-    edit.siteB = anchor->siteByte;
-    edit.siteE = anchor->siteByte;
-    edit.replacementText = line.text;
-    edit.ownerIncludeId = anchor->ownerIncludeId;
+    edit.sitePath = *sitePath;
+    edit.siteB = *siteByte;
+    edit.siteE = *siteByte;
+    edit.replacementText = bBytes.slice(bBegin, bByteEnd).str();
+    edit.ownerIncludeId = ownerIncludeId;
+    // Visible header-owned insertion text is replay from that header owner, even
+    // when the owner contributes no ordinary tokens.  Keep the normal include
+    // wrapper so --with-lines preserves the logical file transition.
     edit.forceIncludeLineDirectiveWrappers =
-        anchor->forceIncludeLineDirectiveWrappers;
-    edit.materializedBByteBegin = line.begin;
-    edit.materializedBByteEnd = line.end;
+        edit.ownerIncludeId && !edit.replacementText.empty();
+    edit.materializedBByteBegin = bBegin;
+    edit.materializedBByteEnd = bByteEnd;
     edits.push_back(std::move(edit));
     return true;
   };
@@ -1530,9 +1626,8 @@ static bool buildSidebandPragmaSourceEdits(
 
   for (const diffutils::Hunk &h : hunks) {
     if (h.isInsertOnly()) {
-      for (uint64_t b = h.bStart; b < h.bEnd; ++b)
-        if (!appendInsertForB(b))
-          return false;
+      if (!appendInsertBlockForB(h.bStart, h.bEnd))
+        return false;
       continue;
     }
 
