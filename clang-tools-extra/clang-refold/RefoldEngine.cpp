@@ -1790,10 +1790,22 @@ bool RefoldEngine::AppendSidebandPragmaSourceEdits(
     // removes the sideband directive tokens from A/B before diffing, the source
     // pragma itself still needs an explicit source edit so preserved comments
     // and nearby code can stay on the normal structural path.
-    TextEdit edit{sideband.siteB, sideband.siteE, sideband.replacementText,
-                  std::nullopt, std::nullopt, {}};
+    // Apply the same line-state repair used for ordinary TU byte edits.  A
+    // sideband block replacement can change the number of physical directive
+    // lines before preserved TU suffix bytes; in --with-lines mode the suffix
+    // must resume at its original logical TU line instead of drifting with the
+    // replacement's physical line count.  The materialized edit-map range still
+    // describes only the B-side sideband payload, not the synthetic #line
+    // directive that may be appended for resynchronization.
+    ResyncOutcome ro = ApplyResyncOrPend(tuBytes, sideband.siteB,
+                                         sideband.siteE,
+                                         sideband.replacementText, tuPath);
+    TextEdit edit{sideband.siteB, sideband.siteE, std::move(ro.text),
+                  std::move(ro.pending), std::nullopt, {}};
     StampTextEditMaterializedBByteRange(edit, sideband.materializedBByteBegin,
                                         sideband.materializedBByteEnd);
+    StampTextEditMaterializedOutputTextRange(
+        edit, 0, static_cast<uint64_t>(sideband.replacementText.size()));
     AttachAcceptedResultCarrier(
         edit, BuildAcceptedTUTextEditCandidate(
                   AcceptedPathKind::TUByteSpanConservativeEdit, sideband.siteB,
@@ -6199,6 +6211,35 @@ std::string RefoldEngine::RunSinglePassRefold() {
     return false;
   };
 
+  // Return true when an include replacement has no ordinary PP-token envelope
+  // and no non-sideband work, so its edit-map provenance must come from the
+  // sideband pragma B-byte envelope.  This is independent of the #line policy:
+  // visible header-owned sideband replacement text can require normal wrappers
+  // while still having zero normal-token cover.
+  auto includeUsesOnlySidebandReplayEnvelope =
+      [&](auto &&self, uint64_t id) -> bool {
+    bool sawSideband = llvm::any_of(
+        sidebandPragmaEdits_, [&](const SidebandPragmaEdit &e) {
+          return e.ownerIncludeId && *e.ownerIncludeId == id;
+        });
+    if (includeHasOrdinaryReplayTokens(id))
+      return false;
+    if (auto it = perInclude.find(id);
+        it != perInclude.end() && !it->second.patches.empty())
+      return false;
+    if (auto it = macroPatchesByOwner.find(std::optional<uint64_t>(id));
+        it != macroPatchesByOwner.end() && !it->second.empty())
+      return false;
+    if (auto it = children.find(id); it != children.end()) {
+      for (const auto *child : it->second) {
+        if (!self(self, child->id))
+          return false;
+        sawSideband = true;
+      }
+    }
+    return sawSideband;
+  };
+
   // See the corresponding helper in MaterializeIncludeExpansion: only genuinely
   // sideband-only owner replay is allowed to suppress #line wrappers that normal
   // --with-lines include materialization would emit.  If the include contributes
@@ -6309,7 +6350,9 @@ std::string RefoldEngine::RunSinglePassRefold() {
       if (auto bEnv = ResolveIncludeRealizationBTokenEnvelope(inc->cover.begin,
                                                               inc->cover.end)) {
         StampTextEditMaterializedBTokenRange(edit, bEnv->first, bEnv->second);
-      } else if (sidebandOnly) {
+      } else if (sidebandOnly ||
+                 includeUsesOnlySidebandReplayEnvelope(
+                     includeUsesOnlySidebandReplayEnvelope, inc->id)) {
         if (auto sidebandBRange =
                 SidebandPragmaMaterializedBByteRangeForInclude(inc->id))
           StampTextEditMaterializedBByteRange(edit, sidebandBRange->first,

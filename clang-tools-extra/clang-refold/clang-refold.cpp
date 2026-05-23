@@ -802,6 +802,49 @@ static std::optional<uint64_t> projectBGapToAGap(ArrayRef<int64_t> aToB,
   return 0;
 }
 
+
+static bool isOnlyWhitespaceForSidebandBlock(StringRef text) {
+  for (char c : text) {
+    if (!stringutils::isNonNewlineWs(c) && c != '\n' && c != '\r')
+      return false;
+  }
+  return true;
+}
+
+static std::optional<uint64_t> projectedBGapForSidebandLine(
+    ArrayRef<int64_t> normalA2B, const SidebandPragmaLine &line) {
+  return projectBGapToAGap(normalA2B, line.normalTokenGap);
+}
+
+/// Return the B-byte end for a sideband replacement block.
+///
+/// The sideband line records cover only the directive lines themselves.  A
+/// block replacement also owns the raw B trivia between the last replacement
+/// directive and the next replay artifact in the same normal-token gap: for
+/// example, the blank line in `#pragma gamma\n\nint x`.  Include that trivia
+/// when it is purely whitespace, but stop before the next sideband directive or
+/// ordinary token so equal neighboring sideband lines cannot be duplicated.
+static uint64_t sidebandBlockReplacementBEnd(
+    StringRef bBytes, ArrayRef<SidebandPragmaLine> bLines,
+    ArrayRef<PPTok> rawBToks, ArrayRef<std::size_t> rawBTokOff,
+    uint64_t bStart, uint64_t bEnd) {
+  assert(bStart < bEnd && "replacement block must contain B sideband lines");
+  uint64_t end = bLines[static_cast<size_t>(bEnd - 1)].end;
+  const uint64_t gap = bLines[static_cast<size_t>(bStart)].normalTokenGap;
+  uint64_t limit = byteOffsetForNormalTokenGap(bBytes, bLines, rawBToks,
+                                               rawBTokOff, gap);
+  if (bEnd < bLines.size()) {
+    const SidebandPragmaLine &next = bLines[static_cast<size_t>(bEnd)];
+    if (next.normalTokenGap == gap)
+      limit = std::min<uint64_t>(limit, next.begin);
+  }
+
+  if (end < limit && limit <= bBytes.size() &&
+      isOnlyWhitespaceForSidebandBlock(bBytes.slice(end, limit)))
+    end = limit;
+  return end;
+}
+
 static std::vector<JsonPragmaItem>
 collectJsonPragmaItems(const json::Object &rootJson, StringRef refoldMapPath) {
   std::vector<JsonPragmaItem> out;
@@ -1270,13 +1313,18 @@ static std::vector<SidebandPragmaItemBinding> mapSidebandLinesToPragmaItems(
 ///   * equal sideband lines: source pragma remains untouched;
 ///   * A-only sideband lines: delete the corresponding recorded source pragma;
 ///   * one-for-one replacement: replace the recorded source pragma text;
+///   * owner-local block replacement: replace one contiguous A-side directive
+///     run with one contiguous B-side sideband block, even when their arities
+///     differ;
 ///   * B-only insertion: insert at a map-backed normal-token gap in either the
 ///     TU or one concrete include owner.
 ///
 /// Insertions are accepted only when the refold map gives a unique source gap
-/// anchor.  Ambiguous include/TU boundaries and many-to-one/one-to-many changes
-/// remain fail-closed so the caller can route them through the existing fallback
-/// path instead of manufacturing a source placement.
+/// anchor.  Unequal replacement hunks are accepted only when the A-side pragma
+/// lines bind to one owner/replay occurrence and their source ranges form a
+/// whitespace-separated directive run.  Ambiguous include/TU boundaries remain
+/// fail-closed so the caller can route them through the existing fallback path
+/// instead of manufacturing a source placement.
 static bool buildSidebandPragmaSourceEdits(
     const json::Object &rootJson, StringRef refoldMapPath,
     ArrayRef<SidebandPragmaLine> aLines,
@@ -1353,6 +1401,13 @@ static bool buildSidebandPragmaSourceEdits(
     edit.siteE = pragma.siteE;
     edit.replacementText = replacement.str();
     edit.ownerIncludeId = binding.ownerIncludeId;
+    // A visible replacement for a header-owned sideband pragma is still replay
+    // text from that header owner, even when the owner has no ordinary tokens.
+    // Keep the normal include #line wrapper so --with-lines preserves the
+    // logical file transition for the emitted pragma line.  Pure deletions that
+    // emit no header text may still use the zero-token sideband-only policy.
+    edit.forceIncludeLineDirectiveWrappers =
+        edit.ownerIncludeId && !edit.replacementText.empty();
     edit.materializedBByteBegin = bBegin;
     edit.materializedBByteEnd = bEnd;
     edits.push_back(std::move(edit));
@@ -1388,6 +1443,91 @@ static bool buildSidebandPragmaSourceEdits(
     return true;
   };
 
+  auto appendBlockEdit = [&](uint64_t aStart, uint64_t aEnd, uint64_t bStart,
+                             uint64_t bEnd) -> bool {
+    if (aStart >= aEnd || bStart >= bEnd || aEnd > aLines.size() ||
+        bEnd > bLines.size())
+      return false;
+
+    const uint64_t ownerGap = aLines[static_cast<size_t>(aStart)].normalTokenGap;
+    for (uint64_t a = aStart; a < aEnd; ++a)
+      if (aLines[static_cast<size_t>(a)].normalTokenGap != ownerGap)
+        return false;
+
+    for (uint64_t b = bStart; b < bEnd; ++b) {
+      std::optional<uint64_t> projectedGap = projectedBGapForSidebandLine(
+          normalA2B, bLines[static_cast<size_t>(b)]);
+      if (!projectedGap || *projectedGap != ownerGap)
+        return false;
+    }
+
+    if (aToPragma[static_cast<size_t>(aStart)].pragmaIndex < 0)
+      return false;
+    const SidebandPragmaItemBinding &firstBinding =
+        aToPragma[static_cast<size_t>(aStart)];
+    const JsonPragmaItem &firstPragma =
+        pragmas[static_cast<size_t>(firstBinding.pragmaIndex)];
+
+    uint64_t siteB = firstPragma.siteB;
+    uint64_t siteE = firstPragma.siteE;
+
+    // Unequal sideband replacements are safe only when the A-side lines form a
+    // single source-owner directive run.  The run proof is deliberately about
+    // ownership, not spelling: every A-side directive must bind to the same TU
+    // or concrete include replay, and the physical source ranges must be in
+    // order with only whitespace between them.  That prevents a block edit from
+    // silently eating unrelated source comments or non-sideband directives.
+    std::optional<std::string> sourceBytes = readMappedSourceFileForSideband(
+        firstPragma.sitePath, *sourcePath, refoldMapPath);
+    for (uint64_t a = aStart + 1; a < aEnd; ++a) {
+      if (aToPragma[static_cast<size_t>(a)].pragmaIndex < 0)
+        return false;
+      const SidebandPragmaItemBinding &binding =
+          aToPragma[static_cast<size_t>(a)];
+      const JsonPragmaItem &pragma =
+          pragmas[static_cast<size_t>(binding.pragmaIndex)];
+      if (pragma.sitePath != firstPragma.sitePath ||
+          binding.ownerIncludeId != firstBinding.ownerIncludeId)
+        return false;
+      if (pragma.siteB < siteE)
+        return false;
+      if (siteE < pragma.siteB) {
+        if (!sourceBytes || pragma.siteB > sourceBytes->size() ||
+            siteE > sourceBytes->size() ||
+            !isOnlyWhitespaceForSidebandBlock(
+                StringRef(*sourceBytes).slice(siteE, pragma.siteB)))
+          return false;
+      }
+      siteE = pragma.siteE;
+    }
+
+    const uint64_t bBegin = bLines[static_cast<size_t>(bStart)].begin;
+    const uint64_t bByteEnd = sidebandBlockReplacementBEnd(
+        bBytes, bLines, rawBToks, rawBTokOff, bStart, bEnd);
+    if (bByteEnd < bBegin || bByteEnd > static_cast<uint64_t>(bBytes.size()))
+      return false;
+
+    RefoldEngine::SidebandPragmaEdit edit;
+    edit.sitePath = firstPragma.sitePath;
+    edit.siteB = siteB;
+    edit.siteE = siteE;
+    edit.replacementText = bBytes.slice(bBegin, bByteEnd).str();
+    edit.ownerIncludeId = firstBinding.ownerIncludeId;
+    // A non-empty header-owned sideband block replacement emits visible replay
+    // text from the materialized header owner even when that owner has zero
+    // ordinary PP tokens.  In --with-lines mode that visible header replay is
+    // still a logical file transition, so route it through the normal include
+    // enter/exit wrapper instead of the sideband-only no-wrapper suppression
+    // path.  Pure deletions that leave no header text remain eligible for the
+    // zero-token sideband-only policy.
+    edit.forceIncludeLineDirectiveWrappers =
+        edit.ownerIncludeId && !edit.replacementText.empty();
+    edit.materializedBByteBegin = bBegin;
+    edit.materializedBByteEnd = bByteEnd;
+    edits.push_back(std::move(edit));
+    return true;
+  };
+
   for (const diffutils::Hunk &h : hunks) {
     if (h.isInsertOnly()) {
       for (uint64_t b = h.bStart; b < h.bEnd; ++b)
@@ -1419,9 +1559,15 @@ static bool buildSidebandPragmaSourceEdits(
       continue;
     }
 
-    // Many-to-one and one-to-many sideband changes still lack a unique
-    // partition proof.  Leave those cases unnormalized so the regular fallback
-    // machinery handles them instead of manufacturing a source placement.
+    if (h.isReplace()) {
+      if (!appendBlockEdit(h.aStart, h.aEnd, h.bStart, h.bEnd))
+        return false;
+      continue;
+    }
+
+    // Any remaining sideband shape is outside the current proof domain.  In
+    // particular, this rejects malformed empty hunks rather than manufacturing
+    // a source placement.
     return false;
   }
 

@@ -470,6 +470,33 @@ void RefoldEngine::MaterializeIncludeExpansion(
     return false;
   };
 
+  // Return true when the materialized include subtree needs replay provenance
+  // only from sideband pragma edits.  This is intentionally separate from the
+  // #line-wrapper classification below: visible sideband replacement text may
+  // force ordinary enter/exit #line wrappers while the include still has a
+  // zero-token normal PP cover, so its edit-map witness must come from the
+  // sideband B-byte envelope rather than from a nonexistent token envelope.
+  auto includeUsesOnlySidebandReplayEnvelope =
+      [&](auto &&self, uint64_t id) -> bool {
+    bool sawSideband = includeHasSidebandPragmaWork(id);
+    if (includeHasOrdinaryReplayTokens(id))
+      return false;
+    if (auto it = perInclude.find(id);
+        it != perInclude.end() && !it->second.patches.empty())
+      return false;
+    if (auto it = macroPatchesByOwner.find(std::optional<uint64_t>(id));
+        it != macroPatchesByOwner.end() && !it->second.empty())
+      return false;
+    if (auto it = children.find(id); it != children.end()) {
+      for (const auto *child : it->second) {
+        if (!self(self, child->id))
+          return false;
+        sawSideband = true;
+      }
+    }
+    return sawSideband;
+  };
+
   // A sideband-only include materialization is the one class where omitting
   // otherwise-unobservable #line wrappers is intentional.  The invariant is not
   // "materialized because of a sideband edit"; it is stricter: the materialized
@@ -593,7 +620,9 @@ void RefoldEngine::MaterializeIncludeExpansion(
             sidebandOnly);
         TextEdit edit{siteStart,    siteEnd,      std::move(wrapped),
                       std::nullopt, std::nullopt, {}};
-        if (sidebandOnly) {
+        if (sidebandOnly ||
+            includeUsesOnlySidebandReplayEnvelope(
+                includeUsesOnlySidebandReplayEnvelope, child->id)) {
           if (auto sidebandBRange =
                   SidebandPragmaMaterializedBByteRangeForInclude(child->id))
             StampTextEditMaterializedBByteRange(edit, sidebandBRange->first,
