@@ -91,6 +91,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
@@ -271,6 +272,11 @@ struct JsonIncludeItemForSideband {
   uint64_t id = 0;
   std::string resolvedPath;
   std::vector<JsonTokenSpanForSideband> spans;
+};
+
+struct SidebandPragmaItemBinding {
+  int64_t pragmaIndex = -1;
+  std::optional<uint64_t> ownerIncludeId = std::nullopt;
 };
 
 /// Return true iff a physical line is a preserved pragma directive line.
@@ -648,9 +654,13 @@ static void inferUniqueHeaderPragmaOwners(
 /// A physical header can be included more than once, so resolved-path uniqueness
 /// is only a fast path.  For a concrete sideband line in A, the normal-token gap
 /// identifies where that directive appeared in the replay stream.  If exactly
-/// one include of the pragma's header owns a token span that begins at, or
-/// strictly contains, that gap, the edit can be routed through that include's
-/// normal materialization path.  Ambiguous endpoint cases still fail closed.
+/// one include of the pragma's header owns that gap, the edit can be routed
+/// through that include's normal materialization path.
+///
+/// The end boundary is intentionally considered for trailing pragmas: a pragma
+/// after the last ordinary token in a header appears at `span.end`.  If the same
+/// gap is also the start/end of another same-header include span, more than one
+/// include will claim it and the occurrence remains ambiguous/fail-closed.
 static std::optional<uint64_t> inferHeaderPragmaOwnerForOccurrence(
     const JsonPragmaItem &pragma, const SidebandPragmaLine &line,
     ArrayRef<JsonIncludeItemForSideband> includes) {
@@ -664,12 +674,11 @@ static std::optional<uint64_t> inferHeaderPragmaOwnerForOccurrence(
     if (inc.resolvedPath != pragma.sitePath)
       continue;
     for (const JsonTokenSpanForSideband &span : inc.spans) {
-      // A sideband directive before the first token of a header appears at the
-      // include span's begin gap.  A directive between header tokens appears
-      // strictly inside the half-open span.  Do not claim span.end here: that
-      // boundary is shared with the following owner and is therefore ambiguous
-      // without additional producer-side sideband byte ranges.
-      if (span.begin <= line.normalTokenGap && line.normalTokenGap < span.end) {
+      // Leading pragmas live at span.begin, interior pragmas live strictly
+      // inside the half-open span, and trailing pragmas live at span.end.
+      // Endpoint ambiguity is handled by collecting claims from all same-path
+      // include spans and accepting only when a single include id survives.
+      if (span.begin <= line.normalTokenGap && line.normalTokenGap <= span.end) {
         if (owner && *owner != inc.id)
           return std::nullopt;
         owner = inc.id;
@@ -679,23 +688,82 @@ static std::optional<uint64_t> inferHeaderPragmaOwnerForOccurrence(
   return owner;
 }
 
+static bool sitePathHasIncludeInstance(
+    StringRef sitePath, ArrayRef<JsonIncludeItemForSideband> includes) {
+  for (const JsonIncludeItemForSideband &inc : includes)
+    if (inc.resolvedPath == sitePath)
+      return true;
+  return false;
+}
+
 /// Pair A-side sideband pragma lines with their source `DirectivePragmaItem`.
 ///
-/// Matching is exact on directive text and stable in producer item order.  That
-/// is a proof, not a guess: a sideband source edit is emitted only when the raw
-/// `.i` directive text is exactly one of the recorded source pragma items.
-static std::vector<int64_t> mapSidebandLinesToPragmaItems(
-    ArrayRef<SidebandPragmaLine> lines, ArrayRef<JsonPragmaItem> pragmas) {
-  std::vector<int64_t> out(lines.size(), -1);
-  std::vector<uint8_t> used(pragmas.size(), 0);
+/// A physical pragma item may replay multiple times when its header is included
+/// multiple times.  The binding is therefore per replay occurrence, not just
+/// per physical source item: the same `DirectivePragmaItem` can be reused once
+/// for each concrete owner include id.  Within one owner occurrence, duplicate
+/// identical pragma spellings are still consumed in recorded source order.
+///
+/// If the sideband line can be attributed to competing paths/owners, the line is
+/// left unbound so the caller fails closed instead of editing the wrong owner.
+static std::vector<SidebandPragmaItemBinding> mapSidebandLinesToPragmaItems(
+    ArrayRef<SidebandPragmaLine> lines, ArrayRef<JsonPragmaItem> pragmas,
+    ArrayRef<JsonIncludeItemForSideband> includes) {
+  std::vector<SidebandPragmaItemBinding> out(lines.size());
+  std::set<std::pair<size_t, uint64_t>> used;
+  constexpr uint64_t NoOwner = std::numeric_limits<uint64_t>::max();
+
   for (size_t i = 0; i < lines.size(); ++i) {
+    struct Candidate {
+      size_t pragmaIndex = 0;
+      std::optional<uint64_t> ownerIncludeId = std::nullopt;
+    };
+    std::vector<Candidate> candidates;
+
     for (size_t j = 0; j < pragmas.size(); ++j) {
-      if (used[j] || pragmas[j].text != lines[i].text)
+      const JsonPragmaItem &pragma = pragmas[j];
+      if (pragma.text != lines[i].text)
         continue;
-      used[j] = 1;
-      out[i] = static_cast<int64_t>(j);
-      break;
+
+      std::optional<uint64_t> owner = inferHeaderPragmaOwnerForOccurrence(
+          pragma, lines[i], includes);
+      const bool isHeaderPragma = !pragma.sitePath.empty() &&
+                                  !StringRef(pragma.sitePath).starts_with("<") &&
+                                  sitePathHasIncludeInstance(pragma.sitePath,
+                                                             includes);
+      if (isHeaderPragma && !owner)
+        continue;
+
+      const uint64_t ownerKey = owner ? *owner : NoOwner;
+      if (used.find(std::make_pair(j, ownerKey)) != used.end())
+        continue;
+      candidates.push_back(Candidate{j, owner});
     }
+
+    if (candidates.empty())
+      continue;
+
+    bool sameOwnerDomain = true;
+    for (const Candidate &candidate : candidates) {
+      if (pragmas[candidate.pragmaIndex].sitePath !=
+              pragmas[candidates.front().pragmaIndex].sitePath ||
+          candidate.ownerIncludeId != candidates.front().ownerIncludeId) {
+        sameOwnerDomain = false;
+        break;
+      }
+    }
+    if (!sameOwnerDomain)
+      continue;
+
+    // Multiple identical physical pragmas in the same source owner replay in
+    // map order.  This preserves the old TU behavior while allowing a single
+    // header pragma item to bind once per include occurrence.
+    const Candidate chosen = candidates.front();
+    const uint64_t ownerKey = chosen.ownerIncludeId ? *chosen.ownerIncludeId
+                                                    : NoOwner;
+    used.insert(std::make_pair(chosen.pragmaIndex, ownerKey));
+    out[i].pragmaIndex = static_cast<int64_t>(chosen.pragmaIndex);
+    out[i].ownerIncludeId = chosen.ownerIncludeId;
   }
   return out;
 }
@@ -725,8 +793,8 @@ static bool buildSidebandPragmaSourceEdits(
   std::vector<JsonIncludeItemForSideband> includes =
       collectJsonIncludesForSideband(rootJson);
   inferUniqueHeaderPragmaOwners(pragmas, includes);
-  std::vector<int64_t> aToPragma =
-      mapSidebandLinesToPragmaItems(aLines, pragmas);
+  std::vector<SidebandPragmaItemBinding> aToPragma =
+      mapSidebandLinesToPragmaItems(aLines, pragmas, includes);
 
   std::vector<StringRef> normalA =
       buildNormalTokenRefsExcludingSideband(aLines, rawAToks, rawATokOff);
@@ -765,17 +833,19 @@ static bool buildSidebandPragmaSourceEdits(
 
   auto appendEditForA = [&](uint64_t aIdx, StringRef replacement,
                             uint64_t bBegin, uint64_t bEnd) -> bool {
-    if (aIdx >= aToPragma.size() || aToPragma[static_cast<size_t>(aIdx)] < 0)
+    if (aIdx >= aToPragma.size() ||
+        aToPragma[static_cast<size_t>(aIdx)].pragmaIndex < 0)
       return false;
+    const SidebandPragmaItemBinding &binding =
+        aToPragma[static_cast<size_t>(aIdx)];
     const JsonPragmaItem &pragma =
-        pragmas[static_cast<size_t>(aToPragma[static_cast<size_t>(aIdx)])];
+        pragmas[static_cast<size_t>(binding.pragmaIndex)];
     RefoldEngine::SidebandPragmaEdit edit;
     edit.sitePath = pragma.sitePath;
     edit.siteB = pragma.siteB;
     edit.siteE = pragma.siteE;
     edit.replacementText = replacement.str();
-    edit.ownerIncludeId = inferHeaderPragmaOwnerForOccurrence(
-        pragma, aLines[static_cast<size_t>(aIdx)], includes);
+    edit.ownerIncludeId = binding.ownerIncludeId;
     edit.materializedBByteBegin = bBegin;
     edit.materializedBByteEnd = bEnd;
     edits.push_back(std::move(edit));
