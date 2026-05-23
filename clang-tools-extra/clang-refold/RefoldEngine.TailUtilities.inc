@@ -698,11 +698,13 @@ void RefoldEngine::MaterializeIncludeExpansion(
             MaterializationWorkClass::SidebandPragmaOnly;
         const size_t childEntryLineNo =
             includeExpansionStartLineNos.lookup(child->id);
+        LineDirectiveLocation parentResume =
+            LineDirectiveInserter::LogicalLocationAtOffset(bytes, child->siteE,
+                                                           headerPath);
         std::string wrapped = WrapIncludeExpansionForMaterialization(
-            *child, headerPath, includeId, child->siteE,
-            childEntryLineNo ? childEntryLineNo : 1,
-            stringutils::lineAtOffset(bytes, child->siteE), childText,
-            sidebandOnly);
+            *child, parentResume.fileSpelling, includeId, child->siteE,
+            childEntryLineNo ? childEntryLineNo : 1, parentResume.lineNo,
+            childText, sidebandOnly);
         TextEdit edit{siteStart,    siteEnd,      std::move(wrapped),
                       std::nullopt, std::nullopt, {}};
         if (sidebandOnly ||
@@ -4115,23 +4117,27 @@ RefoldEngine::ApplyResyncOrPend(StringRef originalFileText, uint64_t start,
     return ResyncOutcome(replacement.str(), std::nullopt);
 
   // Newline drift means the following untouched source would resume at a
-  // different logical line unless we emit a #line directive. Prefer a local
-  // directive immediately after the replacement when that can be done safely.
-  size_t resumeLine = stringutils::lineAtOffset(originalFileText, end);
+  // different logical location unless we emit a #line directive.  Use the
+  // source-authored line-control state at `end`, not merely the physical line
+  // in this owner file: `#line`, `# line`, and `# <number>` can make a copied
+  // suffix observe a virtual file/line through __LINE__ or __FILE__.
+  LineDirectiveLocation resumeLoc =
+      LineDirectiveInserter::LogicalLocationAtOffset(
+          originalFileText, end, fileSpellingForDirective);
   trace("linedir/resync",
         "drift: span=[{0},{1}) origNl={2} replNl={3} resumeLine={4} file={5} "
         "replTail={6}",
-        start, end, origNl, replNl, resumeLine, fileSpellingForDirective,
-        stringutils::showWsWithClip(replacement, 100));
+        start, end, origNl, replNl, resumeLoc.lineNo,
+        resumeLoc.fileSpelling, stringutils::showWsWithClip(replacement, 100));
 
   std::string injected = lineDirs_.MaybeAppendResyncAfterReplacement(
-      originalFileText, start, end, replacement, fileSpellingForDirective);
+      originalFileText, start, end, replacement, resumeLoc);
 
   // A changed result means the directive was inserted directly into this
   // replacement, so no deferred resync state needs to be carried forward.
   if (injected != replacement) {
     trace("linedir/resync", "local inject succeeded: resumeLine={0} file={1}",
-          resumeLine, fileSpellingForDirective);
+          resumeLoc.lineNo, resumeLoc.fileSpelling);
     return ResyncOutcome(std::move(injected), std::nullopt);
   }
 
@@ -4139,8 +4145,8 @@ RefoldEngine::ApplyResyncOrPend(StringRef originalFileText, uint64_t start,
   // untouched bytes mid-line. Carry a pending resync so the next copied
   // original slice can emit the directive at a valid boundary.
   trace("linedir/resync",
-        "local inject failed -> PENDING: resumeLine={0} file={1}", resumeLine,
-        fileSpellingForDirective);
+        "local inject failed -> PENDING: resumeLine={0} file={1}",
+        resumeLoc.lineNo, resumeLoc.fileSpelling);
 
   return ResyncOutcome{replacement.str(),
                        PendingResync{fileSpellingForDirective}};
@@ -5385,26 +5391,25 @@ RefoldEngine::AppendOriginalSliceWithPending(
   if (stringutils::outAtBOL(StringRef(out.data(), out.size())) &&
       (stringutils::isBOL(original, static_cast<size_t>(from)) ||
        canFlushBeforeUntouchedDirectiveLine(static_cast<size_t>(from)))) {
-    size_t line = stringutils::lineAtOffset(original, from);
+    LineDirectiveLocation loc = LineDirectiveInserter::LogicalLocationAtOffset(
+        original, from, pending->fileSpellingForDir);
     std::string directive =
-        lineDirs_.FormatLineDirective(line, pending->fileSpellingForDir);
+        lineDirs_.FormatLineDirective(loc.lineNo, loc.fileSpelling);
 
     StringRef currentOut(out.data(), out.size());
 
     // Avoid emitting a redundant directive when the current output state
     // already represents the requested file/line location.
     if (LineDirectiveInserter::ShouldEmitLineDirective(
-            currentOut, pending->fileSpellingForDir, line, directive)) {
+            currentOut, loc.fileSpelling, loc.lineNo, directive)) {
       trace("line/pending",
             "flush@slice-begin file={0} line={1} (pending) outTail={2}",
-            pending->fileSpellingForDir, line,
-            stringutils::dbgOutTail(currentOut));
+            loc.fileSpelling, loc.lineNo, stringutils::dbgOutTail(currentOut));
       out.append(directive.begin(), directive.end());
     } else {
       trace("line/pending",
             "SKIP flush@slice-begin (no-op) file={0} line={1} outTail={2}",
-            pending->fileSpellingForDir, line,
-            stringutils::dbgOutTail(currentOut));
+            loc.fileSpelling, loc.lineNo, stringutils::dbgOutTail(currentOut));
     }
 
     auto slice =
@@ -5427,23 +5432,24 @@ RefoldEngine::AppendOriginalSliceWithPending(
     i = nl + 1;
 
     if (!stringutils::isLineSplice(original, nl)) {
-      size_t line = stringutils::lineAtOffset(original, static_cast<size_t>(i));
+      LineDirectiveLocation loc = LineDirectiveInserter::LogicalLocationAtOffset(
+          original, static_cast<size_t>(i), pending->fileSpellingForDir);
       std::string directive =
-          lineDirs_.FormatLineDirective(line, pending->fileSpellingForDir);
+          lineDirs_.FormatLineDirective(loc.lineNo, loc.fileSpelling);
 
       StringRef currentOut(out.data(), out.size());
       if (LineDirectiveInserter::ShouldEmitLineDirective(
-              currentOut, pending->fileSpellingForDir, line, directive)) {
+              currentOut, loc.fileSpelling, loc.lineNo, directive)) {
         trace("line/pending",
               "flush@safe-nl file={0} line={1} atOrig={2} outTail={3}",
-              pending->fileSpellingForDir, line, i,
+              loc.fileSpelling, loc.lineNo, i,
               stringutils::dbgOutTail(currentOut));
         out.append(directive.begin(), directive.end());
       } else {
         trace("line/pending",
               "SKIP flush@safe-nl (no-op) file={0} line={1} atOrig={2} "
               "outTail={3}",
-              pending->fileSpellingForDir, line, i,
+              loc.fileSpelling, loc.lineNo, i,
               stringutils::dbgOutTail(currentOut));
       }
 

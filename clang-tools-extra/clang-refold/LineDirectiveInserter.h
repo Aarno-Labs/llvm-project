@@ -23,9 +23,12 @@ struct LineDirectiveState {
   std::string fileSpelling;
   size_t lineAfterDir;
   size_t afterDirIdx;
+  bool hasFileSpelling;
 
-  LineDirectiveState(StringRef file, size_t line, size_t idx)
-      : fileSpelling(file.str()), lineAfterDir(line), afterDirIdx(idx) {}
+  LineDirectiveState(StringRef file, size_t line, size_t idx,
+                     bool hasFile = true)
+      : fileSpelling(file.str()), lineAfterDir(line), afterDirIdx(idx),
+        hasFileSpelling(hasFile) {}
 };
 
 /// \brief Logical source location at a byte offset in an original source file.
@@ -136,9 +139,11 @@ public:
   /// before the include may have already changed the active logical file/line
   /// state.
   ///
-  /// When no previous parseable `#line` directive is visible in the bounded
-  /// lookback window, this falls back to `(defaultFileSpelling, physical line at
-  /// offset)`, which preserves the existing conservative behavior.
+  /// This scan is intentionally complete for original source buffers: missing a
+  /// source-authored line-control directive can make a later `__LINE__` or
+  /// `__FILE__` expansion unsound. If the active directive has no filename
+  /// operand, the preprocessor preserves the current physical filename, so this
+  /// returns `defaultFileSpelling` with the directive-derived line number.
   ///
   /// \param src original source buffer
   /// \param offset byte offset at which the next source byte would be emitted
@@ -216,14 +221,13 @@ public:
   /// \param s start offset (inclusive) in originalFileText
   /// \param e end offset (exclusive) in originalFileText
   /// \param replacement replacement text to emit for [s,e)
-  /// \param fileSpellingForDirective spelled file path to embed in the
-  ///        directive
+  /// \param resumeLoc logical file/line location to restore before the
+  ///        untouched suffix resumes
   /// \return either replacement unchanged, or replacement with a
   ///         locally-inserted directive
-  std::string
-  MaybeAppendResyncAfterReplacement(StringRef originalFileText, uint64_t s,
-                                    uint64_t e, StringRef replacement,
-                                    StringRef fileSpellingForDirective) const;
+  std::string MaybeAppendResyncAfterReplacement(
+      StringRef originalFileText, uint64_t s, uint64_t e,
+      StringRef replacement, const LineDirectiveLocation &resumeLoc) const;
 
   /// \brief Determines whether a #line directive should be emitted at the
   /// *current output position*.
@@ -298,13 +302,16 @@ private:
 
   /// Parses a single line that is expected to be a #line directive.
   ///
-  /// Expected shape (whitespace tolerant):
+  /// Expected source line-control shapes:
   ///
-  ///     #line <digits> "file"
+  ///     #line <digits> ["file"]
+  ///     # line <digits> ["file"]
+  ///     # <digits> ["file"]
   ///
-  /// This parser is intentionally minimal and only supports the directive forms
-  /// the refolder itself emits. Within the quoted file spelling, it decodes the
-  /// same conservative escape set produced by EscapeForLineDirective().
+  /// Within the quoted file spelling, it decodes the same conservative escape
+  /// set produced by EscapeForLineDirective(). The optional filename operand is
+  /// tracked separately from an explicitly empty filename string so callers can
+  /// model `#line 200` as preserving the current file spelling.
   ///
   /// \param src source buffer
   /// \param from start index (inclusive) of the line

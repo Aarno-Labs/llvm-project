@@ -2,6 +2,7 @@
 #include "RefoldLog.h"
 #include "StringUtils.h"
 #include <algorithm>
+#include <cctype>
 #include <llvm/ADT/SmallString.h>
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Support/FileSystem.h>
@@ -39,12 +40,39 @@ LineDirectiveLocation LineDirectiveInserter::LogicalLocationAtOffset(
       static_cast<size_t>(std::min<uint64_t>(offset, src.size()));
   StringRef prefix = src.take_front(clampedOffset);
 
-  if (std::optional<LineDirectiveState> state =
-          FindLastLineDirectiveState(prefix)) {
+  // Recover the active source-authored line-control state by scanning the
+  // complete source prefix in source order.  A backward search is insufficient
+  // for `#line <n>` with no filename operand, because that directive preserves
+  // the previously active logical file.
+  std::optional<std::string> activeFile;
+  size_t activeLineAfterDirective = 0;
+  size_t activeAfterDirectiveIdx = 0;
+  bool sawLineDirective = false;
+
+  for (size_t lineStart = 0; lineStart < prefix.size();) {
+    size_t lineEnd = prefix.find('\n', lineStart);
+    if (lineEnd == StringRef::npos)
+      lineEnd = prefix.size();
+
+    if (std::optional<LineDirectiveState> state =
+            ParseLineDirective(prefix, lineStart, lineEnd)) {
+      sawLineDirective = true;
+      if (state->hasFileSpelling)
+        activeFile = state->fileSpelling;
+      activeLineAfterDirective = state->lineAfterDir;
+      activeAfterDirectiveIdx = state->afterDirIdx;
+    }
+
+    if (lineEnd == prefix.size())
+      break;
+    lineStart = lineEnd + 1;
+  }
+
+  if (sawLineDirective) {
     const size_t delta = stringutils::countNonSplicedNewlines(
-        prefix, state->afterDirIdx, prefix.size());
-    return LineDirectiveLocation(state->fileSpelling,
-                                 state->lineAfterDir + delta);
+        prefix, activeAfterDirectiveIdx, prefix.size());
+    StringRef file = activeFile ? StringRef(*activeFile) : defaultFileSpelling;
+    return LineDirectiveLocation(file, activeLineAfterDirective + delta);
   }
 
   return LineDirectiveLocation(defaultFileSpelling,
@@ -75,9 +103,12 @@ std::string LineDirectiveInserter::WrapIncludeExpansion(
 
 std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
     StringRef originalFileText, uint64_t s, uint64_t e, StringRef replacement,
-    StringRef fileSpellingForDirective) const {
+    const LineDirectiveLocation &resumeLoc) const {
   if (!enabled_)
     return replacement.str();
+
+  const size_t resumeLine = resumeLoc.lineNo;
+  StringRef fileSpellingForDirective(resumeLoc.fileSpelling);
 
   // A resync directive is safe only if it rejoins the untouched original file
   // at a physical line boundary. We also allow rejoining before indentation-only
@@ -111,9 +142,9 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
     return replacement.str();
   }
 
-  // The resume directive points at the original source line where the untouched
-  // suffix begins after the replacement.
-  size_t resumeLine = stringutils::lineAtOffset(originalFileText, e);
+  // The resume directive points at the logical source location where the
+  // untouched suffix begins after the replacement, not merely at its physical
+  // source line.
   std::string directive =
       FormatLineDirective(resumeLine, fileSpellingForDirective);
 
@@ -280,33 +311,27 @@ LineDirectiveInserter::FindLastLineDirectiveState(StringRef src) {
   if (src.empty())
     return std::nullopt;
 
-  const size_t lookback = 16384;
-  const size_t end = src.size();
-  const size_t min = (end > lookback) ? (end - lookback) : 0;
+  // Scan the full original-prefix text.  This is intentionally not a bounded
+  // lookback: source-authored line-control directives establish semantic
+  // preprocessor state, so missing an old directive can make `__LINE__` or
+  // `__FILE__` replay wrong.
+  size_t scanEnd = src.size();
+  while (scanEnd > 0 && src[scanEnd - 1] == '\n')
+    --scanEnd;
 
-  // Skip trailing newlines at the end of the buffer/range.
-  size_t scanEnd = end;
-  while (scanEnd > min && src[scanEnd - 1] == '\n')
-    scanEnd--;
-
-  while (scanEnd > min) {
-    // Search backward from the character before the current scanEnd.
+  while (scanEnd > 0) {
     size_t prevNl = stringutils::lastIndexOfChar(src, '\n', scanEnd - 1);
     size_t lineStart = (prevNl == StringRef::npos) ? 0 : prevNl + 1;
 
-    if (stringutils::startsWith(src, lineStart, "#line")) {
-      auto st = ParseLineDirective(src, lineStart, scanEnd);
-      if (st)
-        return st;
-    }
+    if (auto st = ParseLineDirective(src, lineStart, scanEnd))
+      return st;
 
     if (prevNl == StringRef::npos)
       break;
 
-    // Move to newline and skip consecutive newlines
     scanEnd = prevNl;
-    while (scanEnd > min && src[scanEnd - 1] == '\n')
-      scanEnd--;
+    while (scanEnd > 0 && src[scanEnd - 1] == '\n')
+      --scanEnd;
   }
   return std::nullopt;
 }
@@ -314,25 +339,37 @@ LineDirectiveInserter::FindLastLineDirectiveState(StringRef src) {
 std::optional<LineDirectiveState>
 LineDirectiveInserter::ParseLineDirective(StringRef src, size_t from,
                                           size_t to) {
-  // 1. Initial Prefix Check
-  if (from + 5 > src.size() || !stringutils::startsWith(src, from, "#line"))
+  if (from > to || to > src.size())
     return std::nullopt;
 
-  size_t p = from + 5;
+  size_t p = from;
 
-  // 2. Strict Whitespace Check (Enforce at least one whitespace char after
-  // #line)
-  if (p >= to || !stringutils::isWs(src[p]))
+  // A preprocessing directive may be preceded by horizontal whitespace.  Do
+  // not cross a physical newline; `from/to` already delimit one source line.
+  while (p < to && stringutils::isWs(src[p]) && src[p] != '\n')
+    ++p;
+
+  if (p >= to || src[p] != '#')
     return std::nullopt;
+  ++p;
 
-  // Skip remaining whitespace
-  while (p < to && stringutils::isWs(src[p]))
-    p++;
+  // Both `#line` and `# line` are accepted spellings.  Clang/GCC also accept
+  // the numeric line-control form `# 123 "file"`, so leave `p` at the digits
+  // when there is no `line` keyword.
+  while (p < to && stringutils::isWs(src[p]) && src[p] != '\n')
+    ++p;
 
-  // 3. Parse Line Number
-  size_t lineStart = p;
-  while (p < to && isdigit(src[p]))
-    p++;
+  if (p + 4 <= to && src.substr(p, 4) == "line") {
+    p += 4;
+    if (p >= to || !stringutils::isWs(src[p]))
+      return std::nullopt;
+    while (p < to && stringutils::isWs(src[p]) && src[p] != '\n')
+      ++p;
+  }
+
+  const size_t lineStart = p;
+  while (p < to && std::isdigit(static_cast<unsigned char>(src[p])))
+    ++p;
 
   if (p == lineStart)
     return std::nullopt;
@@ -341,21 +378,21 @@ LineDirectiveInserter::ParseLineDirective(StringRef src, size_t from,
   if (src.slice(lineStart, p).getAsInteger(10, lineAfter))
     return std::nullopt;
 
-  // 4. Skip Whitespace after number
-  while (p < to && stringutils::isWs(src[p]))
-    p++;
+  while (p < to && stringutils::isWs(src[p]) && src[p] != '\n')
+    ++p;
 
-  // 5. Parse quoted file spelling with the exact escapes this class emits.
-  // This is not a general C string-literal parser; it is only the inverse of
-  // EscapeForLineDirective() so no-op/resync checks can compare the logical
-  // filename state represented by previously emitted local #line directives.
+  // Parse the optional quoted filename operand.  Absence of this operand is
+  // semantically meaningful: `#line 200` changes only the logical line number
+  // and preserves the active logical file.
   llvm::SmallString<64> fileSpelling;
+  bool hasFileSpelling = false;
   if (p < to && src[p] == '"') {
-    p++; // consume opening quote
+    hasFileSpelling = true;
+    ++p; // consume opening quote
     while (p < to) {
       char c = src[p++];
       if (c == '"')
-        break; // closing quote
+        break;
       if (c == '\\' && p < to) {
         char escaped = src[p++];
         switch (escaped) {
@@ -389,9 +426,6 @@ LineDirectiveInserter::ParseLineDirective(StringRef src, size_t from,
           fileSpelling.push_back('\v');
           break;
         default:
-          // Preserve the old parser's conservative behavior for any spelling
-          // not emitted by EscapeForLineDirective(): a backslash protects the
-          // next byte literally.
           fileSpelling.push_back(escaped);
           break;
         }
@@ -401,14 +435,11 @@ LineDirectiveInserter::ParseLineDirective(StringRef src, size_t from,
     }
   }
 
-  // 6. Calculate afterDirectiveIdx (Global context)
-  size_t afterDirectiveIdx = to;
-  if (to < src.size() && src[to] == '\n') {
-    afterDirectiveIdx = to + 1;
-  }
+  const size_t afterDirectiveIdx =
+      (to < src.size() && src[to] == '\n') ? to + 1 : to;
 
   return LineDirectiveState(std::string(fileSpelling.str()), lineAfter,
-                            afterDirectiveIdx);
+                            afterDirectiveIdx, hasFileSpelling);
 }
 
 std::string LineDirectiveInserter::EscapeForLineDirective(StringRef path) {
