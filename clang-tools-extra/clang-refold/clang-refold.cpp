@@ -265,6 +265,13 @@ struct JsonPragmaItem {
   std::optional<uint64_t> ownerIncludeId = std::nullopt;
 };
 
+struct JsonZeroTokenDirectiveForSideband {
+  std::string sitePath;
+  uint64_t lineB = 0;
+  uint64_t lineE = 0;
+  std::optional<uint64_t> ownerIncludeId = std::nullopt;
+};
+
 struct JsonTokenSpanForSideband {
   uint64_t begin = 0;
   uint64_t end = 0;
@@ -899,6 +906,99 @@ collectJsonPragmaItems(const json::Object &rootJson, StringRef refoldMapPath) {
   return out;
 }
 
+static uint64_t lineBeginContainingOffset(StringRef bytes, uint64_t byte) {
+  if (byte > bytes.size())
+    byte = static_cast<uint64_t>(bytes.size());
+  if (byte == 0)
+    return 0;
+  size_t prevNL = bytes.rfind('\n', byte - 1);
+  if (prevNL == StringRef::npos)
+    return 0;
+  return static_cast<uint64_t>(prevNL + 1);
+}
+
+static uint64_t extendDirectiveLineToLogicalDirective(StringRef bytes,
+                                                      uint64_t lineBegin) {
+  if (lineBegin >= bytes.size())
+    return lineBegin;
+
+  uint64_t curBegin = lineBegin;
+  size_t nl = bytes.find('\n', curBegin);
+  uint64_t curEnd = nl == StringRef::npos ? static_cast<uint64_t>(bytes.size())
+                                           : static_cast<uint64_t>(nl + 1);
+
+  while (physicalLineEndsWithSplice(bytes, curBegin, curEnd) &&
+         curEnd < bytes.size()) {
+    curBegin = curEnd;
+    nl = bytes.find('\n', curBegin);
+    curEnd = nl == StringRef::npos ? static_cast<uint64_t>(bytes.size())
+                                    : static_cast<uint64_t>(nl + 1);
+  }
+  return curEnd;
+}
+
+/// Collect owner-local directive lines that are known not to contribute normal
+/// preprocessed tokens.
+///
+/// Sideband insertion anchors may need to look through preserved source-only
+/// state in one normal-token gap: macro definitions, undefs, empty includes, or
+/// other directives that have no ordinary-token span in the refold map.  The
+/// invariant is intentionally owner-polymorphic and fail-closed: only directive
+/// items whose map entry has no spans are accepted, and the physical directive
+/// line is recovered from the real owner bytes instead of trusting the callback
+/// range to cover the leading `#`.
+static std::vector<JsonZeroTokenDirectiveForSideband>
+collectZeroTokenDirectivesForSideband(const json::Object &rootJson,
+                                      StringRef refoldMapPath) {
+  std::vector<JsonZeroTokenDirectiveForSideband> out;
+  const json::Array *items = rootJson.getArray("items");
+  if (!items)
+    return out;
+  StringRef rootSourcePath = rootJson.getString("source").value_or(StringRef());
+
+  for (const json::Value &value : *items) {
+    const json::Object *obj = value.getAsObject();
+    if (!obj)
+      continue;
+    auto kind = obj->getString("kind");
+    if (!kind || *kind != "directive")
+      continue;
+    auto path = obj->getString("site_path");
+    auto b = obj->getInteger("site_b");
+    auto e = obj->getInteger("site_e");
+    if (!path || !b || !e || path->starts_with("<") || *b < 0 || *e < 0 ||
+        *b > *e)
+      continue;
+
+    bool hasNormalTokenSpan = false;
+    if (const json::Array *spans = obj->getArray("spans"))
+      hasNormalTokenSpan = !spans->empty();
+    if (hasNormalTokenSpan)
+      continue;
+
+    std::optional<std::string> sourceBytes =
+        readMappedSourceFileForSideband(*path, rootSourcePath, refoldMapPath);
+    if (!sourceBytes)
+      continue;
+
+    const uint64_t siteB = static_cast<uint64_t>(*b);
+    const uint64_t siteE = static_cast<uint64_t>(*e);
+    if (siteB > sourceBytes->size() || siteE > sourceBytes->size())
+      continue;
+
+    JsonZeroTokenDirectiveForSideband directive;
+    directive.sitePath = path->str();
+    directive.lineB = lineBeginContainingOffset(*sourceBytes, siteB);
+    directive.lineE = extendDirectiveLineToLogicalDirective(
+        *sourceBytes, directive.lineB);
+    if (auto owner = obj->getInteger("owner_include_id"))
+      if (*owner >= 0)
+        directive.ownerIncludeId = static_cast<uint64_t>(*owner);
+    out.push_back(std::move(directive));
+  }
+  return out;
+}
+
 static std::vector<JsonIncludeItemForSideband>
 collectJsonIncludesForSideband(const json::Object &rootJson) {
   std::vector<JsonIncludeItemForSideband> out;
@@ -1069,6 +1169,155 @@ static std::optional<uint64_t> sourceByteForNormalTokenGap(
   }
 
   return std::nullopt;
+}
+
+static bool rangesOverlap(uint64_t lhsB, uint64_t lhsE, uint64_t rhsB,
+                          uint64_t rhsE) {
+  return lhsB < rhsE && rhsB < lhsE;
+}
+
+static bool ownerMatches(std::optional<uint64_t> lhs,
+                         std::optional<uint64_t> rhs) {
+  return lhs == rhs;
+}
+
+static bool tokenMapHasTokenInOwnerRange(
+    StringRef file, uint64_t begin, uint64_t end,
+    ArrayRef<JsonTokMapEntryForSideband> tokmap) {
+  return llvm::any_of(tokmap, [&](const JsonTokMapEntryForSideband &entry) {
+    return StringRef(entry.file) == file && rangesOverlap(entry.b, entry.e,
+                                                          begin, end);
+  });
+}
+
+static bool skipCCommentInSidebandGap(StringRef bytes, uint64_t &p,
+                                      uint64_t end) {
+  if (p + 1 >= end || bytes[p] != '/')
+    return false;
+  if (bytes[p + 1] == '/') {
+    p += 2;
+    while (p < end && bytes[p] != '\n')
+      ++p;
+    return true;
+  }
+  if (bytes[p + 1] == '*') {
+    p += 2;
+    while (p + 1 < end && !(bytes[p] == '*' && bytes[p + 1] == '/'))
+      ++p;
+    if (p + 1 >= end)
+      return false;
+    p += 2;
+    return true;
+  }
+  return false;
+}
+
+static const JsonZeroTokenDirectiveForSideband *findZeroTokenDirectiveAt(
+    StringRef file, std::optional<uint64_t> ownerIncludeId, uint64_t byte,
+    ArrayRef<JsonZeroTokenDirectiveForSideband> directives) {
+  for (const JsonZeroTokenDirectiveForSideband &directive : directives) {
+    if (StringRef(directive.sitePath) == file &&
+        ownerMatches(directive.ownerIncludeId, ownerIncludeId) &&
+        directive.lineB <= byte && byte < directive.lineE)
+      return &directive;
+  }
+  return nullptr;
+}
+
+/// Return true iff an owner-local interval can be preserved while placing a
+/// sideband insertion at one of its boundaries.
+///
+/// This is the small invariant that replaces the whitespace-only neighbor
+/// special case.  The interval is legal gap material only when it contains no
+/// ordinary mapped tokens for the owner and every visible non-comment directive
+/// line is explicitly recorded as a zero-normal-token directive in the refold
+/// map.  That admits preserved macro-state directives such as `#define` and
+/// `#undef` without allowing a sideband insertion to jump over normal source
+/// text, condition bodies, or unmodelled directive state.
+static bool sourceIntervalIsZeroTokenGapMaterial(
+    StringRef file, std::optional<uint64_t> ownerIncludeId, uint64_t begin,
+    uint64_t end, StringRef rootSourcePath, StringRef refoldMapPath,
+    ArrayRef<JsonTokMapEntryForSideband> tokmap,
+    ArrayRef<JsonZeroTokenDirectiveForSideband> zeroTokenDirectives) {
+  if (begin > end)
+    return false;
+  if (begin == end)
+    return true;
+
+  std::optional<std::string> sourceBytes =
+      readMappedSourceFileForSideband(file, rootSourcePath, refoldMapPath);
+  if (!sourceBytes || end > sourceBytes->size())
+    return false;
+
+  if (tokenMapHasTokenInOwnerRange(file, begin, end, tokmap))
+    return false;
+
+  StringRef bytes(*sourceBytes);
+  uint64_t p = begin;
+  while (p < end) {
+    if (stringutils::isNonNewlineWs(bytes[p]) || bytes[p] == '\n' ||
+        bytes[p] == '\r') {
+      ++p;
+      continue;
+    }
+    if (skipCCommentInSidebandGap(bytes, p, end))
+      continue;
+
+    if (bytes[p] == '#') {
+      const JsonZeroTokenDirectiveForSideband *directive =
+          findZeroTokenDirectiveAt(file, ownerIncludeId, p,
+                                   zeroTokenDirectives);
+      if (!directive || directive->lineE > end)
+        return false;
+      p = directive->lineE;
+      continue;
+    }
+
+    return false;
+  }
+  return true;
+}
+
+/// Return true iff the owner-local interval contains a producer-recorded
+/// zero-normal-token directive line.
+///
+/// This is intentionally narrower than `sourceIntervalIsZeroTokenGapMaterial`:
+/// whitespace and comments can be preserved by a plain right-boundary sideband
+/// insertion, while macro-state directives require the special neighbor
+/// coalescing path so that the directive stays outside the consumed edit range.
+static bool sourceIntervalContainsZeroTokenDirective(
+    StringRef file, std::optional<uint64_t> ownerIncludeId, uint64_t begin,
+    uint64_t end, StringRef rootSourcePath, StringRef refoldMapPath,
+    ArrayRef<JsonZeroTokenDirectiveForSideband> zeroTokenDirectives) {
+  if (begin >= end)
+    return false;
+
+  std::optional<std::string> sourceBytes =
+      readMappedSourceFileForSideband(file, rootSourcePath, refoldMapPath);
+  if (!sourceBytes || end > sourceBytes->size())
+    return false;
+
+  StringRef bytes(*sourceBytes);
+  uint64_t p = begin;
+  while (p < end) {
+    if (stringutils::isNonNewlineWs(bytes[p]) || bytes[p] == '\n' ||
+        bytes[p] == '\r') {
+      ++p;
+      continue;
+    }
+    if (skipCCommentInSidebandGap(bytes, p, end))
+      continue;
+
+    if (bytes[p] != '#')
+      return false;
+
+    const JsonZeroTokenDirectiveForSideband *directive =
+        findZeroTokenDirectiveAt(file, ownerIncludeId, p, zeroTokenDirectives);
+    if (!directive || directive->lineE > end)
+      return false;
+    return true;
+  }
+  return false;
 }
 
 static std::optional<SidebandSourceProof>
@@ -1308,12 +1557,16 @@ static std::vector<SidebandPragmaItemBinding> mapSidebandLinesToPragmaItems(
 ///   * B-only insertion: insert at a map-backed normal-token gap in either the
 ///     TU or one concrete include owner.
 ///
-/// Insertions are accepted only when the refold map gives a unique source gap
-/// anchor.  Unequal replacement hunks are accepted only when the A-side pragma
-/// lines bind to one owner/replay occurrence and their source ranges form a
-/// whitespace-separated directive run.  Ambiguous include/TU boundaries remain
-/// fail-closed so the caller can route them through the existing fallback path
-/// instead of manufacturing a source placement.
+/// Insertions are accepted only when the refold map gives a unique owner-local
+/// placement: either a concrete normal-token gap anchor or matched neighboring
+/// sideband atoms that refine order inside that gap.  Unequal replacement hunks
+/// are accepted only when the A-side pragma lines bind to one owner/replay
+/// occurrence and their source ranges form a whitespace-separated directive
+/// run.  Preserved zero-token directives are admitted only as insertion-gap
+/// material, where they remain outside the edited source range.  Ambiguous
+/// include/TU boundaries remain fail-closed so the caller can route them
+/// through the existing fallback path instead of manufacturing a source
+/// placement.
 
 static bool buildSidebandPragmaSourceEdits(
     const json::Object &rootJson, StringRef refoldMapPath,
@@ -1332,6 +1585,8 @@ static bool buildSidebandPragmaSourceEdits(
   std::vector<JsonTokMapEntryForSideband> tokmap =
       collectJsonTokMapForSideband(rootJson);
   std::vector<JsonSlotForSideband> slots = collectJsonSlotsForSideband(rootJson);
+  std::vector<JsonZeroTokenDirectiveForSideband> zeroTokenDirectives =
+      collectZeroTokenDirectivesForSideband(rootJson, refoldMapPath);
   auto sourcePath = rootJson.getString("source");
   if (!sourcePath)
     return false;
@@ -1465,6 +1720,15 @@ static bool buildSidebandPragmaSourceEdits(
                        begin, end));
   };
 
+  auto sourceGapMaterialIsPreservable = [&](StringRef sitePath,
+                                            std::optional<uint64_t> owner,
+                                            uint64_t leftEnd,
+                                            uint64_t rightBegin) -> bool {
+    return sourceIntervalIsZeroTokenGapMaterial(
+        sitePath, owner, leftEnd, rightBegin, *sourcePath, refoldMapPath,
+        tokmap, zeroTokenDirectives);
+  };
+
   auto sourceGapIsWhitespace = [&](StringRef sitePath, uint64_t leftEnd,
                                    uint64_t rightBegin) -> bool {
     if (leftEnd > rightBegin)
@@ -1498,8 +1762,9 @@ static bool buildSidebandPragmaSourceEdits(
 
     // A source-run proof consumes one closed owner-local run.  Every A-side atom
     // must bind to the same physical file and concrete owner occurrence, and
-    // the bytes between adjacent atoms must be whitespace-only unless a future
-    // proof explicitly models that intervening state.
+    // the bytes between adjacent atoms must be whitespace-only.  Source-only
+    // directives in a gap are preservable insertion anchors, not bytes that a
+    // sideband replacement run may silently consume.
     for (uint64_t a = aStart + 1; a < aEnd; ++a) {
       if (ownerGap &&
           aLines[static_cast<size_t>(a)].normalTokenGap != *ownerGap)
@@ -1519,9 +1784,19 @@ static bool buildSidebandPragmaSourceEdits(
     return proof;
   };
 
-  auto proveInsertionAnchor = [&](uint64_t bStart, uint64_t bEnd,
-                                  uint64_t ownerGap)
-      -> std::optional<SidebandSourceProof> {
+  struct ProvedSidebandInsertion {
+    SidebandSourceProof source;
+    SidebandBReplayProof replay;
+  };
+
+  auto proveInsertion = [&](uint64_t bStart, uint64_t bEnd)
+      -> std::optional<ProvedSidebandInsertion> {
+    std::optional<SidebandBReplayBlockProof> insertedBlock =
+        proveBReplayBlock(bStart, bEnd);
+    if (!insertedBlock)
+      return std::nullopt;
+    const uint64_t ownerGap = insertedBlock->OwnerGap();
+
     auto matchedNeighborInInsertionGap = [&](uint64_t bIdx)
         -> std::optional<BoundSidebandSourceAtom> {
       if (bIdx >= bLines.size() || bToA[static_cast<size_t>(bIdx)] < 0)
@@ -1543,46 +1818,119 @@ static bool buildSidebandPragmaSourceEdits(
                              : std::nullopt;
 
     if (prev || next) {
-      // A normal-token gap proves only coarse placement.  A sideband neighbor
-      // proves the intra-gap insertion point only after its own B-side gap has
-      // projected to this insertion gap and its source occurrence has bound to a
-      // concrete owner.  Different-gap neighbors are deliberately ignored above
-      // so they cannot steal the insertion from another replay interval.
-      if (prev && next &&
-          (!prev->pragma || !next->pragma ||
-           prev->pragma->sitePath != next->pragma->sitePath ||
-           prev->ownerIncludeId != next->ownerIncludeId ||
-           !sourceGapIsWhitespace(next->pragma->sitePath,
-                                  prev->pragma->siteE,
-                                  next->pragma->siteB)))
+      // A normal-token gap proves only coarse placement.  Matched sideband
+      // neighbors refine the intra-gap order, but they must not force the new
+      // B-only directive to cross preserved zero-token source state.  The
+      // closed invariant is:
+      //   * insert at the right matched atom when that is the narrowest source
+      //     boundary for the B-only directive;
+      //   * with only a previous atom, insert at the map-backed normal-token
+      //     gap boundary when that boundary is after the previous atom;
+      //   * coalesce a right atom only when a previous atom and the right atom
+      //     enclose an explicitly proved zero-normal-token directive that must
+      //     stay outside the edit range.
+      // This preserves existing sideband lines when they are the first source
+      // line after the insertion, while still handling macro-state sideband
+      // gaps without consuming the preserved directive state.
+      if ((prev && !prev->pragma) || (next && !next->pragma))
         return std::nullopt;
 
-      const BoundSidebandSourceAtom &base = next ? *next : *prev;
-      if (!base.pragma)
-        return std::nullopt;
+      if (next) {
+        // Prefer the narrowest possible insertion point: when the inserted
+        // sideband block is immediately before an already-preserved right
+        // neighbor, a zero-width edit at the neighbor's source byte lets the
+        // normal #line repair land between the new B-only directive and the
+        // existing source directive.  That preserves the right neighbor's
+        // original logical line instead of drifting it and repairing only the
+        // later ordinary token stream.
+        //
+        // The only time we intentionally coalesce the right neighbor into the
+        // sideband edit is the owner-local directive-gap case that motivated
+        // the sideband-gap invariant: a previous matched sideband atom and the
+        // right atom are separated by preserved zero-normal-token directive
+        // state such as `#define`/`#undef`.  In that case the insertion is
+        // ordered by both neighbors around source-only state, and replaying the
+        // right atom keeps the resync after the complete sideband run while
+        // still proving that the preserved directive is not consumed by the
+        // edit.  Comments alone are not enough to trigger coalescing; they do
+        // not carry macro state, so the narrower right-boundary insertion is
+        // still preferred.
+        if (!prev) {
+          return ProvedSidebandInsertion{
+              SidebandSourceProof::ZeroWidthInsertion(
+                  next->pragma->sitePath, next->pragma->siteB,
+                  next->ownerIncludeId),
+              insertedBlock->TakeReplay()};
+        }
 
-      const uint64_t siteByte = next ? base.pragma->siteB : base.pragma->siteE;
-      return SidebandSourceProof::ZeroWidthInsertion(
-          base.pragma->sitePath, siteByte, base.ownerIncludeId);
+        if (prev->pragma->sitePath != next->pragma->sitePath ||
+            prev->ownerIncludeId != next->ownerIncludeId)
+          return std::nullopt;
+
+        const bool neighborGapIsPreservable = sourceGapMaterialIsPreservable(
+            next->pragma->sitePath, next->ownerIncludeId, prev->pragma->siteE,
+            next->pragma->siteB);
+        if (!neighborGapIsPreservable)
+          return std::nullopt;
+
+        const bool neighborGapHasDirective =
+            sourceIntervalContainsZeroTokenDirective(
+                next->pragma->sitePath, next->ownerIncludeId,
+                prev->pragma->siteE, next->pragma->siteB, *sourcePath,
+                refoldMapPath, zeroTokenDirectives);
+        if (!neighborGapHasDirective) {
+          return ProvedSidebandInsertion{
+              SidebandSourceProof::ZeroWidthInsertion(
+                  next->pragma->sitePath, next->pragma->siteB,
+                  next->ownerIncludeId),
+              insertedBlock->TakeReplay()};
+        }
+
+        std::optional<SidebandBReplayBlockProof> replayWithNext =
+            proveBReplayBlock(bStart, bEnd + 1);
+        if (!replayWithNext)
+          return std::nullopt;
+        return ProvedSidebandInsertion{
+            SidebandSourceProof::SourceAtom(
+                next->pragma->sitePath, next->pragma->siteB,
+                next->pragma->siteE, next->ownerIncludeId),
+            replayWithNext->TakeReplay()};
+      }
+
+      const BoundSidebandSourceAtom &base = *prev;
+      uint64_t siteByte = base.pragma->siteE;
+      std::optional<uint64_t> gapByte = sourceByteForNormalTokenGap(
+          base.pragma->sitePath, base.ownerIncludeId, ownerGap, tokmap, slots);
+      if (gapByte && *gapByte >= base.pragma->siteE) {
+        if (!sourceGapMaterialIsPreservable(base.pragma->sitePath,
+                                           base.ownerIncludeId,
+                                           base.pragma->siteE, *gapByte))
+          return std::nullopt;
+        siteByte = *gapByte;
+      }
+      return ProvedSidebandInsertion{
+          SidebandSourceProof::ZeroWidthInsertion(
+              base.pragma->sitePath, siteByte, base.ownerIncludeId),
+          insertedBlock->TakeReplay()};
     }
 
-    std::optional<SidebandSourceProof> anchor =
-        inferSidebandSourceProof(
-            bLines[static_cast<size_t>(bStart)], ownerGap, *sourcePath,
-            includes, tokmap, slots);
-    return anchor;
+    std::optional<SidebandSourceProof> anchor = inferSidebandSourceProof(
+        bLines[static_cast<size_t>(bStart)], ownerGap, *sourcePath, includes,
+        tokmap, slots);
+    if (!anchor)
+      return std::nullopt;
+    return ProvedSidebandInsertion{std::move(*anchor),
+                                   insertedBlock->TakeReplay()};
   };
 
   auto appendOwnerLocalSidebandHunk = [&](const diffutils::Hunk &h) -> bool {
     if (h.isInsertOnly()) {
-      std::optional<SidebandBReplayBlockProof> bBlock =
-          proveBReplayBlock(h.bStart, h.bEnd);
-      if (!bBlock)
+      std::optional<ProvedSidebandInsertion> insertion =
+          proveInsertion(h.bStart, h.bEnd);
+      if (!insertion)
         return false;
-      const uint64_t ownerGap = bBlock->OwnerGap();
-      return appendProvedSidebandEdit(
-          proveInsertionAnchor(h.bStart, h.bEnd, ownerGap),
-          bBlock->TakeReplay());
+      return appendProvedSidebandEdit(std::move(insertion->source),
+                                      std::move(insertion->replay));
     }
 
     if (h.isDeleteOnly()) {
