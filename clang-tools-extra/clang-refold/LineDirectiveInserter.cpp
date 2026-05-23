@@ -303,6 +303,38 @@ static std::string substituteLineControlReplacementFragment(
     std::unordered_set<std::string> &disabled, size_t logicalLineAtLineStart,
     StringRef activeFileSpelling);
 
+static bool isHorizontalWhitespace(char c) {
+  return stringutils::isWs(c) && c != '\n';
+}
+
+// Return true iff the replacement-list token [nameBegin, nameEnd) is an
+// operand of a token-paste operator.  Macro arguments adjacent to `##` are not
+// macro-expanded before substitution; their raw tokens are substituted, the
+// paste is formed, and the pasted token is then rescanned.  This is the critical
+// preprocessor invariant for source line-control macros such as:
+//
+//   #define RAW 4
+//   #define RAW00 910
+//   #define LOC(x) x ## 00 "f.c"
+//   #line LOC(RAW)
+//
+// The argument token `RAW` must paste into `RAW00` and only then expand to
+// `910`; expanding `RAW` first would incorrectly produce line `400`.
+static bool replacementTokenIsAdjacentToPaste(StringRef repl, size_t nameBegin,
+                                              size_t nameEnd) {
+  size_t before = nameBegin;
+  while (before > 0 && isHorizontalWhitespace(repl[before - 1]))
+    --before;
+  if (before >= 2 && repl[before - 2] == '#' && repl[before - 1] == '#')
+    return true;
+
+  size_t after = nameEnd;
+  while (after < repl.size() && isHorizontalWhitespace(repl[after]))
+    ++after;
+  return after + 1 < repl.size() && repl[after] == '#' &&
+         repl[after + 1] == '#';
+}
+
 // Substitute a function-like macro invocation for the line-control evaluator.
 // This mirrors the C preprocessor distinction needed by #line operands:
 //   * `#param` uses the raw argument spelling;
@@ -418,6 +450,19 @@ static std::string substituteLineControlReplacementFragment(
 
         substituted += name;
         continue;
+      }
+
+      // Ordinary parameter substitution uses the macro-expanded argument,
+      // except when the parameter is an operand of `##`.  In the paste case the
+      // C preprocessor substitutes raw argument tokens, forms the pasted token,
+      // and only then rescans that token for further macro expansion.  The
+      // final rescan happens after `removeTokenPasteOperators()` below.
+      if (replacementTokenIsAdjacentToPaste(repl, nameBegin, i)) {
+        auto raw = rawByParam.find(name);
+        if (raw != rawByParam.end()) {
+          substituted += raw->second;
+          continue;
+        }
       }
 
       auto found = expandedByParam.find(name);
