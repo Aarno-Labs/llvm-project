@@ -2747,10 +2747,143 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     uint64_t materialAEnd = p.aEnd;
     uint64_t materialBStart = p.bStart;
     uint64_t materialBEnd = p.bEnd;
+    uint64_t materialInsertPos = p.aStart;
     std::string materialInsertBytes = p.insertBytes;
+
+    // Return true when an owner-local byte gap contains source-authored
+    // line-control state.  This is intentionally a syntactic gap predicate: the
+    // full logical-state evaluator lives in LineDirectiveInserter, but here we
+    // only need to know whether an LCS boundary-token tie would cross a gap that
+    // can change the logical location of the copied suffix.
+    auto sourceIntervalContainsLineControlDirective =
+        [&](uint64_t begin, uint64_t end) -> bool {
+      if (begin >= end || end > headerText.size())
+        return false;
+
+      uint64_t lineBegin = begin;
+      while (lineBegin < end) {
+        std::string logicalLine;
+        uint64_t afterLine = lineBegin;
+        if (!collectPhase2LogicalLine(headerText, lineBegin, end, logicalLine,
+                                      afterLine))
+          return false;
+        if (afterLine <= lineBegin)
+          return false;
+
+        StringRef rest = StringRef(logicalLine).ltrim(" \t\v\f");
+        if (rest.consume_front("#")) {
+          rest = rest.ltrim(" \t\v\f");
+          if (rest.starts_with("line") &&
+              (rest.size() == StringRef("line").size() ||
+               !stringutils::isIdentPart(rest[StringRef("line").size()])))
+            return true;
+          if (!rest.empty() && '0' <= rest.front() && rest.front() <= '9')
+            return true;
+        }
+
+        lineBegin = afterLine;
+      }
+
+      return false;
+    };
+
     if (isInsert) {
+      // Local repair for a duplicated boundary-token LCS tie.
+      //
+      // Shape:
+      //   A:  <owner token T>  <source-only gap>  <next owner token>
+      //   B:  T <inserted payload ending with another T> <next owner token>
+      //
+      // A token-level LCS may match the original source token T to the later B
+      // copy after the insertion island.  For ordinary gaps this is usually just
+      // another valid spelling of the same token edit.  Across a source-only
+      // line-control gap, however, that tie changes where the inserted payload
+      // sits relative to the logical-location state that the copied suffix will
+      // observe.  The source token must remain before the gap; the inserted
+      // payload must be emitted after the gap, followed by normal #line resync.
+      //
+      // This normalization is deliberately local to include-owned insertions and
+      // only fires when the existing A->B token map proves the exact duplicate
+      // boundary-token shape.  It does not mutate the global LCS, owner choice,
+      // or any sideband/macro proof.
+      auto normalizeDuplicatedBoundaryTokenAcrossLineControlGap = [&]() {
+        if (materialAStart >= static_cast<uint64_t>(aToks_.size()))
+          return;
+        if (materialBStart >= materialBEnd ||
+            materialBEnd >= static_cast<uint64_t>(bToks_.size()))
+          return;
+        if (abTokMapA2B_.empty() ||
+            materialAStart >= static_cast<uint64_t>(abTokMapA2B_.size()))
+          return;
+        // The original A boundary token is currently matched to the B token
+        // immediately after the insertion island.  Without this witness, there
+        // is no duplicated-boundary-token tie to normalize.
+        if (abTokMapA2B_[static_cast<size_t>(materialAStart)] !=
+            static_cast<int64_t>(materialBEnd))
+          return;
+        if (aToks_[static_cast<size_t>(materialAStart)].spelling !=
+                bToks_[static_cast<size_t>(materialBStart)].spelling ||
+            aToks_[static_cast<size_t>(materialAStart)].spelling !=
+                bToks_[static_cast<size_t>(materialBEnd)].spelling)
+          return;
+
+        std::optional<uint64_t> nextOwnerPP;
+        for (uint64_t pp = materialAStart + 1; pp < ppHi; ++pp) {
+          auto it = tokmapByPP.find(pp);
+          if (it != tokmapByPP.end() && PathsEqual(it->second.file, file)) {
+            nextOwnerPP = pp;
+            break;
+          }
+        }
+        if (!nextOwnerPP)
+          return;
+
+        // Examine the owner-local source bytes between the retained source
+        // boundary token and the next copied owner token.  Only a source
+        // line-control directive makes this token tie semantically observable
+        // for placement; otherwise the normal token-envelope insertion is fine.
+        std::optional<uint64_t> leftEnd = ByteEndForPPInFile(
+            file, materialAStart, /*fallbackToEOF=*/false, fileLen);
+        std::optional<uint64_t> rightBegin = ByteStartForPPInFile(
+            file, *nextOwnerPP, /*fallbackToEOF=*/false, fileLen);
+        if (!leftEnd || !rightBegin || *rightBegin < *leftEnd)
+          return;
+        if (!sourceIntervalContainsLineControlDirective(*leftEnd, *rightBegin))
+          return;
+
+        const uint64_t normalizedBStart = materialBStart + 1;
+        const uint64_t normalizedBEnd = materialBEnd + 1;
+        if (normalizedBStart >= normalizedBEnd ||
+            normalizedBEnd > static_cast<uint64_t>(bTokOff_.size()))
+          return;
+
+        // Drop the duplicated leading B token from the island and include the
+        // later B token that closed the island.  The insertion point advances to
+        // the next owner token so the source line-control gap remains in place
+        // before the inserted payload.
+        materialBStart = normalizedBStart;
+        materialBEnd = normalizedBEnd;
+        materialInsertPos = *nextOwnerPP;
+        // Use the B token *envelope*, not exact token coverage.  The envelope
+        // preserves the whitespace/newline between the inserted payload and the
+        // copied suffix; losing that newline would concatenate C tokens even
+        // though the token interval proof is otherwise correct.
+        materialInsertBytes =
+            sliceTokenEnvelope(bTokOff_, bSource_, materialBStart,
+                               materialBEnd)
+                .str();
+        trace("include/apply",
+              "file={0} patch[{1}] INSERT: normalized duplicated boundary "
+              "token across source line-control gap bytes=[{2},{3}) "
+              "Apos={4} B=[{5},{6}) insertPos={7}",
+              file, idx, *leftEnd, *rightBegin, materialAStart,
+              materialBStart, materialBEnd, materialInsertPos);
+      };
+
+      normalizeDuplicatedBoundaryTokenAcrossLineControlGap();
+
       std::optional<std::pair<uint64_t, uint64_t>> bBytes =
-          BTokenRangeToByteRange(p.bStart, p.bEnd);
+          BTokenRangeToByteRange(materialBStart, materialBEnd);
       materialInsertBytes = StripSeparatelyOwnedSidebandReplay(
           materialInsertBytes,
           bBytes ? std::optional<uint64_t>(bBytes->first) : std::nullopt,
@@ -2802,8 +2935,12 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     }
 
     if (isInsert) {
-      // INSERT: interpret A-position as "before the next token" in this header.
-      const uint64_t pos = p.aStart;
+      // INSERT: interpret the normalized A-position as "before the next token"
+      // in this header.  Most insertions use the original hunk A gap.  The
+      // duplicate-boundary-token normalization above may advance this position
+      // across a source-only line-control gap while keeping the original token
+      // in place.
+      const uint64_t pos = materialInsertPos;
       auto anchorMatchesCondArmCert = [&](uint64_t anchorByte) -> bool {
         if (!p.ownerHasCondArmCert)
           return true;
