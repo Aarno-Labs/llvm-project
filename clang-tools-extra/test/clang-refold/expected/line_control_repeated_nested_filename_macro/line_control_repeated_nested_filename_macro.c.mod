@@ -1,4 +1,3 @@
-#line 1 "line_control_repeated_nested_filename_macro.c"
 // RUN: %clang-refold-tester-with-lines line_control_repeated_nested_filename_macro
 #define F "gap.c"
 #define FILE_NAME F F

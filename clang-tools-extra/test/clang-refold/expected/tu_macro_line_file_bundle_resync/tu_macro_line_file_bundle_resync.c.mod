@@ -1,4 +1,3 @@
-#line 1 "tu_macro_line_file_bundle_resync.c"
 // RUN: %clang-refold-tester-with-lines tu_macro_line_file_bundle_resync
 #define LOGICAL_LOCATION 800 "bundle_file.c"
 #line LOGICAL_LOCATION

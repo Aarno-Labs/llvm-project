@@ -1,4 +1,3 @@
-#line 1 "include_resume_after_spaced_hash_line_directive.c"
 // RUN: %clang-refold-tester-with-lines include_resume_after_spaced_hash_line_directive
 # line 400 "virtual_spaced.c"
 #line 1 "headers/h_value.h"

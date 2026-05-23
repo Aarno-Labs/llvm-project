@@ -6518,11 +6518,14 @@ std::string RefoldEngine::RunSinglePassRefold() {
 
   // Preserve TU-local __FILE__ / __FILE_NAME__ semantics in checker replay.
   //
-  // If the TU contains an invocation of __FILE__ or __FILE_NAME__, replaying
-  // the refolded output without an initial line directive would make those
-  // builtins see the refolded output path (for example "foo.c.mod") instead of
-  // the TU's original spelled path. To avoid that, prepend a TU-level line
-  // directive that resets the logical file to the original TU path.
+  // If a copied TU suffix contains a bare TU-local __FILE__ or __FILE_NAME__,
+  // replaying the refolded output without an initial line directive would make
+  // those builtins see the refolded output path (for example "foo.c.mod")
+  // instead of the original TU path.  The prologue is only needed for
+  // invocations whose active logical file is still the original TU file at the
+  // invocation site.  When a source-authored #line before the invocation has
+  // already changed the active logical file, an initial TU prologue would be
+  // immediately dominated by that source directive and is only noise.
   //
   // Keep this narrowly scoped: do this only when such a builtin is actually
   // invoked in the TU, line directives are enabled, and the output does not
@@ -6536,11 +6539,26 @@ std::string RefoldEngine::RunSinglePassRefold() {
         continue;
 
       // Compare absolute normalized paths to avoid relative-spelling
-      // mismatches. Producer spelling (tuPath) is preserved in the emitted
-      // directive.
+      // mismatches for the physical invocation owner. Producer spelling
+      // (tuPath) is preserved in the emitted directive.
       if (lineDirs_.ToAbsolutePath(*m.invFile) !=
           lineDirs_.ToAbsolutePath(tuPath))
         continue;
+
+      // The source-authored line-control evaluator tells us what logical file
+      // the builtin observes at its invocation site.  If that logical file has
+      // already been changed away from the TU by a preserved #line directive,
+      // then a synthetic prologue at the top of the refolded file cannot affect
+      // this invocation.  Conservatively keep the prologue when the invocation
+      // offset is unavailable, or when the active logical file is still the TU.
+      if (m.invB) {
+        LineDirectiveLocation loc =
+            LineDirectiveInserter::LogicalLocationAtOffset(tuBytes, *m.invB,
+                                                           tuPath);
+        if (lineDirs_.ToAbsolutePath(loc.fileSpelling) !=
+            lineDirs_.ToAbsolutePath(tuPath))
+          continue;
+      }
 
       needsTUPrologue = true;
       break;

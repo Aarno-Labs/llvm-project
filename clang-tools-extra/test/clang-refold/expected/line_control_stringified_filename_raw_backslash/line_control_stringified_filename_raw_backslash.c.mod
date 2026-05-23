@@ -1,4 +1,3 @@
-#line 1 "line_control_stringified_filename_raw_backslash.c"
 // RUN: %clang-refold-tester-with-lines line_control_stringified_filename_raw_backslash
 #define FILE_NAME(x) #x
 int x =

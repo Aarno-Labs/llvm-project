@@ -497,6 +497,148 @@ static void updateLineControlMacroEnvironment(StringRef line,
   macros[name.str()] = std::move(def);
 }
 
+// Build the preprocessing-logical form of one source line for source-authored
+// line-control recovery.
+//
+// `LogicalLocationAtOffset()` asks a preprocessor question: "after executing
+// all source directives before this byte offset, what logical file/line is
+// active?"  That question must be answered after the early translation phases
+// that affect preprocessing directives.  In particular, phase 2 removes
+// backslash-newline pairs before directive recognition, so both
+//
+//   #define LOC \
+//     930 "f.c"
+//
+// and
+//
+//   #line 950 \
+//   "f.c"
+//
+// are single preprocessing directive lines even though they occupy multiple
+// physical file lines.  This helper removes only complete splice pairs inside
+// the already-bounded owner prefix and returns the raw byte offset immediately
+// after the non-spliced newline that terminates the directive.
+static bool collectLineControlLogicalLine(StringRef src, size_t lineBegin,
+                                          size_t limit,
+                                          std::string &logicalLine,
+                                          size_t &afterLine) {
+  if (lineBegin > limit || limit > src.size())
+    return false;
+
+  logicalLine.clear();
+
+  auto skipPhase2Splice = [&](size_t &pos) -> bool {
+    if (src[pos] != '\\')
+      return false;
+    if (pos + 1 < limit && src[pos + 1] == '\n') {
+      pos += 2;
+      return true;
+    }
+    if (pos + 2 < limit && src[pos + 1] == '\r' && src[pos + 2] == '\n') {
+      pos += 3;
+      return true;
+    }
+    return false;
+  };
+
+  for (size_t pos = lineBegin; pos < limit;) {
+    if (skipPhase2Splice(pos))
+      continue;
+
+    // Comments are not recognized inside string or character literals.  Still
+    // apply phase-2 splicing while copying the literal, because splices are
+    // removed before the preprocessor even sees the directive spelling.
+    if (src[pos] == '"' || src[pos] == '\'') {
+      const char quote = src[pos];
+      logicalLine.push_back(src[pos++]);
+      while (pos < limit) {
+        if (skipPhase2Splice(pos))
+          continue;
+        char c = src[pos++];
+        logicalLine.push_back(c);
+        if (c == '\\' && pos < limit) {
+          if (skipPhase2Splice(pos))
+            continue;
+          logicalLine.push_back(src[pos++]);
+          continue;
+        }
+        if (c == quote)
+          break;
+        if (c == '\n')
+          return false;
+      }
+      continue;
+    }
+
+    // Do not let a physical newline inside a complete block comment terminate
+    // the directive.  Phase 3 replaces the whole comment with one whitespace
+    // character before directive macro expansion/parsing.
+    if (pos + 1 < limit && src[pos] == '/' && src[pos + 1] == '*') {
+      logicalLine.push_back(src[pos++]);
+      logicalLine.push_back(src[pos++]);
+      bool closed = false;
+      while (pos < limit) {
+        if (skipPhase2Splice(pos))
+          continue;
+        if (pos + 1 < limit && src[pos] == '*' && src[pos + 1] == '/') {
+          logicalLine.push_back(src[pos++]);
+          logicalLine.push_back(src[pos++]);
+          closed = true;
+          break;
+        }
+        logicalLine.push_back(src[pos++]);
+      }
+      if (!closed)
+        return false;
+      continue;
+    }
+
+    if (src[pos] == '\n') {
+      afterLine = pos + 1;
+      return true;
+    }
+
+    logicalLine.push_back(src[pos++]);
+  }
+
+  afterLine = limit;
+  return true;
+}
+
+// Apply translation phase 3 to the collected directive line: comments become a
+// single whitespace character.  This is deliberately small and lexical: it is
+// only used before #define/#undef bookkeeping and #line operand parsing.  String
+// and character literals are copied verbatim because comments are not recognized
+// inside them.
+static std::string replaceCommentsWithWhitespaceForLineControl(StringRef text) {
+  std::string out;
+  out.reserve(text.size());
+
+  for (size_t i = 0; i < text.size();) {
+    if (copyQuotedLiteral(text, i, out))
+      continue;
+
+    if (i + 1 < text.size() && text[i] == '/' && text[i + 1] == '/') {
+      out.push_back(' ');
+      break;
+    }
+
+    if (i + 1 < text.size() && text[i] == '/' && text[i + 1] == '*') {
+      out.push_back(' ');
+      i += 2;
+      while (i + 1 < text.size() && !(text[i] == '*' && text[i + 1] == '/'))
+        ++i;
+      if (i + 1 < text.size())
+        i += 2;
+      continue;
+    }
+
+    out.push_back(text[i++]);
+  }
+
+  return out;
+}
+
 // Return the logical line number at the start of a physical source line while
 // scanning the prefix.  If no source-authored line-control directive has been
 // seen, physical and logical lines coincide.  After a directive, the logical
@@ -512,6 +654,28 @@ static size_t logicalLineAtSourceOffset(StringRef prefix, size_t lineStart,
   return activeLineAfterDirective +
          stringutils::countNonSplicedNewlines(prefix, activeAfterDirectiveIdx,
                                              lineStart);
+}
+
+// A source-authored line-control directive is parsed after phase 2/3
+// translation, but the physical lines consumed by its original spelling still
+// affect the logical line number seen by the next source line.  For example:
+//
+//   #line 950 \
+//   "f.c"
+//   int x = __LINE__;
+//
+// parses as `#line 950 "f.c"`, yet Clang assigns the following `int` to
+// logical line 951 because the directive occupied two physical source lines.
+// The parsed operand supplies the base line; every additional physical line
+// consumed by the directive advances the next observable line by one.
+static size_t physicalLineControlDirectiveAdjustment(StringRef src,
+                                                     size_t lineStart,
+                                                     size_t afterLine) {
+  const size_t physicalNewlines =
+      stringutils::countNewlines(src, lineStart, afterLine);
+  if (physicalNewlines == 0)
+    return 0;
+  return physicalNewlines - 1;
 }
 
 // Expand only the operand part of a possible line-control directive.  Non-line
@@ -595,11 +759,20 @@ LineDirectiveLocation LineDirectiveInserter::LogicalLocationAtOffset(
 
   LineControlMacroMap lineControlMacros;
   for (size_t lineStart = 0; lineStart < prefix.size();) {
-    size_t lineEnd = prefix.find('\n', lineStart);
-    if (lineEnd == StringRef::npos)
-      lineEnd = prefix.size();
+    std::string logicalLine;
+    size_t afterLine = lineStart;
+    if (!collectLineControlLogicalLine(prefix, lineStart, prefix.size(),
+                                       logicalLine, afterLine) ||
+        afterLine <= lineStart)
+      break;
 
-    StringRef physicalLine = prefix.slice(lineStart, lineEnd);
+    // Directive recognition, macro replacement in directive operands, and
+    // #define replacement-list capture all occur after phase 2 line splicing and
+    // phase 3 comment replacement.  Reusing this phase-adjusted spelling keeps
+    // the owner-local line-control model aligned with the actual preprocessor
+    // without changing any refolding ownership decisions.
+    std::string phase3Line =
+        replaceCommentsWithWhitespaceForLineControl(StringRef(logicalLine));
 
     // Source line-control directives are interpreted by the preprocessor after
     // macro expansion of their operands.  Recover the deterministic owner-local
@@ -613,7 +786,7 @@ LineDirectiveLocation LineDirectiveInserter::LogicalLocationAtOffset(
     StringRef activeFileForExpansion =
         activeFile ? StringRef(*activeFile) : defaultFileSpelling;
     std::string expandedLine = expandSourceLineControlDirective(
-        physicalLine, lineControlMacros, logicalLineAtLineStart,
+        StringRef(phase3Line), lineControlMacros, logicalLineAtLineStart,
         activeFileForExpansion);
     if (std::optional<LineDirectiveState> state =
             ParseLineDirective(StringRef(expandedLine), 0,
@@ -621,19 +794,28 @@ LineDirectiveLocation LineDirectiveInserter::LogicalLocationAtOffset(
       sawLineDirective = true;
       if (state->hasFileSpelling)
         activeFile = state->fileSpelling;
-      activeLineAfterDirective = state->lineAfterDir;
-      // The active line state starts after the physical directive line, not
-      // after the temporary expanded spelling used only for operand parsing.
-      activeAfterDirectiveIdx =
-          (lineEnd < prefix.size() && prefix[lineEnd] == '\n') ? lineEnd + 1
-                                                               : lineEnd;
+      // ParseLineDirective() sees the phase-adjusted logical directive line,
+      // so `state->lineAfterDir` is the numeric operand after macro expansion.
+      // That operand is not always the line observed by the next physical
+      // source line: if the directive spelling itself consumed extra physical
+      // lines through line splices or block comments, Clang advances the
+      // following source line by that physical span.  Record the adjusted
+      // post-directive line here so all later owner-local resync queries use
+      // the same line-control state the preprocessor would assign.
+      activeLineAfterDirective =
+          state->lineAfterDir +
+          physicalLineControlDirectiveAdjustment(prefix, lineStart, afterLine);
+      // The active line state starts after the whole physical directive,
+      // including any source lines consumed by phase-2 splices, not after the
+      // temporary expanded spelling used only for operand parsing.
+      activeAfterDirectiveIdx = afterLine;
     }
 
-    updateLineControlMacroEnvironment(physicalLine, lineControlMacros);
+    updateLineControlMacroEnvironment(StringRef(phase3Line), lineControlMacros);
 
-    if (lineEnd == prefix.size())
+    if (afterLine >= prefix.size())
       break;
-    lineStart = lineEnd + 1;
+    lineStart = afterLine;
   }
 
   if (sawLineDirective) {
