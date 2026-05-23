@@ -447,7 +447,8 @@ void RefoldEngine::MaterializeIncludeExpansion(
     ResyncOutcome ro =
         mustPreserveHeaderLineState
             ? ApplyResyncOrPend(bytes, sourceRange.first, sourceRange.second,
-                                sideband.ReplacementText(), headerPath)
+                                sideband.ReplacementText(), headerPath,
+                                includeId)
             : ResyncOutcome(sideband.ReplacementText().str(), std::nullopt);
     TextEdit edit{sourceRange.first, sourceRange.second, std::move(ro.text),
                   std::move(ro.pending), std::nullopt, {}};
@@ -483,7 +484,8 @@ void RefoldEngine::MaterializeIncludeExpansion(
       // Apply local line-resync policy before staging the edit, and carry the
       // accepted macro proof metadata to the emitted TextEdit.
       ResyncOutcome ro = ApplyResyncOrPend(bytes, mp.invStart, mpEnd,
-                                           mp.replacement, headerPath);
+                                           mp.replacement, headerPath,
+                                           includeId);
       TextEdit edit{mp.invStart,
                     mpEnd,
                     std::move(ro.text),
@@ -699,8 +701,8 @@ void RefoldEngine::MaterializeIncludeExpansion(
         const size_t childEntryLineNo =
             includeExpansionStartLineNos.lookup(child->id);
         LineDirectiveLocation parentResume =
-            LineDirectiveInserter::LogicalLocationAtOffset(bytes, child->siteE,
-                                                           headerPath);
+            LineDirectiveInserter::LogicalLocationAtOffset(
+                bytes, child->siteE, headerPath, model_, headerPath, includeId);
         std::string wrapped = WrapIncludeExpansionForMaterialization(
             *child, parentResume.fileSpelling, includeId, child->siteE,
             childEntryLineNo ? childEntryLineNo : 1, parentResume.lineNo,
@@ -801,7 +803,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
   // fallback, leave this include empty so callers do not consume a partial
   // materialization.
   std::string applied = ApplyTextEditsWithPendingResync(
-      bytes, edits, appliedExpandedMacroRootIds, headerPath);
+      bytes, edits, appliedExpandedMacroRootIds, headerPath, includeId);
   if (terminalFallbackRequested_) {
     includeExpansion[includeId] = std::string();
     return;
@@ -3122,7 +3124,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         TextEdit edit = needsLocalResync
                             ? MakeTextEditWithResyncOrPending(
                                   headerText, candidate.anchorByte,
-                                  candidate.anchorByte, text, file)
+                                  candidate.anchorByte, text, file, ie.include->id)
                             : TextEdit{candidate.anchorByte,
                                        candidate.anchorByte, std::move(text),
                                        std::nullopt, std::nullopt, {}};
@@ -4108,7 +4110,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                         ? TextEdit{*startByte, *endByte, std::move(replacement),
                                    std::nullopt, std::nullopt, {}}
                         : MakeTextEditWithResyncOrPending(
-                              headerText, *startByte, *endByte, replacement, file);
+                              headerText, *startByte, *endByte, replacement, file,
+                              ie.include->id);
     AttachAcceptedResultCarrier(
         edit, BuildAcceptedIncludeCandidate(
                   AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens, p,
@@ -4242,9 +4245,10 @@ std::optional<uint64_t> RefoldEngine::ComputeChildBoundaryInsertByte(
 }
 
 RefoldEngine::ResyncOutcome
-RefoldEngine::ApplyResyncOrPend(StringRef originalFileText, uint64_t start,
-                                uint64_t end, StringRef replacement,
-                                StringRef fileSpellingForDirective) const {
+RefoldEngine::ApplyResyncOrPend(
+    StringRef originalFileText, uint64_t start, uint64_t end,
+    StringRef replacement, StringRef fileSpellingForDirective,
+    std::optional<uint64_t> ownerIncludeId) const {
   // If the replacement preserves the original newline count, no line-state
   // correction is needed.
   size_t origNl = stringutils::countNewlines(originalFileText, start, end);
@@ -4260,7 +4264,8 @@ RefoldEngine::ApplyResyncOrPend(StringRef originalFileText, uint64_t start,
   // suffix observe a virtual file/line through __LINE__ or __FILE__.
   LineDirectiveLocation resumeLoc =
       LineDirectiveInserter::LogicalLocationAtOffset(
-          originalFileText, end, fileSpellingForDirective);
+          originalFileText, end, fileSpellingForDirective, model_,
+          fileSpellingForDirective, ownerIncludeId);
   trace("linedir/resync",
         "drift: span=[{0},{1}) origNl={2} replNl={3} resumeLine={4} file={5} "
         "replTail={6}",
@@ -4286,7 +4291,7 @@ RefoldEngine::ApplyResyncOrPend(StringRef originalFileText, uint64_t start,
         resumeLoc.lineNo, resumeLoc.fileSpelling);
 
   return ResyncOutcome{replacement.str(),
-                       PendingResync{fileSpellingForDirective}};
+                       PendingResync{fileSpellingForDirective, ownerIncludeId}};
 }
 
 void RefoldEngine::AttachAcceptedResultCarrier(
@@ -4676,7 +4681,7 @@ RefoldEngine::MacroPatchMaterializedBByteRange(const MacroPatch &patch) const {
 std::string RefoldEngine::ApplyTextEditsWithPendingResync(
     StringRef originalFileText, ArrayRef<TextEdit> edits,
     DenseSet<uint64_t> *appliedExpandedMacroRootIds,
-    StringRef emissionOwner,
+    StringRef emissionOwner, std::optional<uint64_t> ownerIncludeId,
     std::vector<MaterializedEditMapping> *materializedEditMappings) const {
   // Source-side ranges are only knowable at this final splice boundary: every
   // earlier candidate still may be merged, dropped, widened, or followed by a
@@ -4873,7 +4878,8 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
         // Apply normal resync handling to the whole duplicate byte span, rather
         // than preserving each fragment's already-conflicting local resync.
         ResyncOutcome ro = ApplyResyncOrPend(originalFileText, s, t,
-                                             replacement, emissionOwner);
+                                             replacement, emissionOwner,
+                                             ownerIncludeId);
         TextEdit merged{s, t, std::move(ro.text), std::move(ro.pending),
                         std::nullopt, {}};
         StampTextEditMaterializedBTokenRange(merged, bBegin, bEnd);
@@ -5292,7 +5298,7 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
                                                     best->bBegin, best->bEnd);
     ResyncOutcome ro =
         ApplyResyncOrPend(originalFileText, best->sourceBegin, best->sourceEnd,
-                          replacement, emissionOwner);
+                          replacement, emissionOwner, ownerIncludeId);
     closure =
         TextEdit{best->sourceBegin,     best->sourceEnd, std::move(ro.text),
                  std::move(ro.pending), std::nullopt,    {}};
@@ -5529,7 +5535,8 @@ RefoldEngine::AppendOriginalSliceWithPending(
       (stringutils::isBOL(original, static_cast<size_t>(from)) ||
        canFlushBeforeUntouchedDirectiveLine(static_cast<size_t>(from)))) {
     LineDirectiveLocation loc = LineDirectiveInserter::LogicalLocationAtOffset(
-        original, from, pending->fileSpellingForDir);
+        original, from, pending->fileSpellingForDir, model_,
+        pending->fileSpellingForDir, pending->ownerIncludeId);
     std::string directive =
         lineDirs_.FormatLineDirective(loc.lineNo, loc.fileSpelling);
 
@@ -5570,7 +5577,8 @@ RefoldEngine::AppendOriginalSliceWithPending(
 
     if (!stringutils::isLineSplice(original, nl)) {
       LineDirectiveLocation loc = LineDirectiveInserter::LogicalLocationAtOffset(
-          original, static_cast<size_t>(i), pending->fileSpellingForDir);
+          original, static_cast<size_t>(i), pending->fileSpellingForDir, model_,
+          pending->fileSpellingForDir, pending->ownerIncludeId);
       std::string directive =
           lineDirs_.FormatLineDirective(loc.lineNo, loc.fileSpelling);
 

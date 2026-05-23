@@ -1222,11 +1222,19 @@ private:
   // ---------------------------- Small Data Records ---------------------------
 
   /// Represents a pending resync that must be flushed at the next safe BOL.
+  ///
+  /// `ownerIncludeId` keeps the deferred query in the same owner domain as the
+  /// edit that created the drift.  Header instances may contain conditionals
+  /// with the same file spelling but different selected arms, so delayed #line
+  /// recovery must carry the include-instance identity through to the eventual
+  /// flush point.
   struct PendingResync {
     std::string fileSpellingForDir;
+    std::optional<uint64_t> ownerIncludeId;
 
-    explicit PendingResync(llvm::StringRef file)
-        : fileSpellingForDir(file.str()) {}
+    explicit PendingResync(llvm::StringRef file,
+                           std::optional<uint64_t> ownerInclude = std::nullopt)
+        : fileSpellingForDir(file.str()), ownerIncludeId(ownerInclude) {}
   };
 
   /// The final text and optional pending state for an edit.
@@ -5308,11 +5316,12 @@ private:
   ///        emitted #line directive.
   /// \return A TextEdit representing the change and (optionally) a pending
   ///         resync to flush later.
-  TextEdit MakeTextEditWithResyncOrPending(StringRef original, uint64_t start,
-                                           uint64_t end, StringRef replacement,
-                                           StringRef fileSpelling) const {
-    ResyncOutcome o =
-        ApplyResyncOrPend(original, start, end, replacement, fileSpelling);
+  TextEdit MakeTextEditWithResyncOrPending(
+      StringRef original, uint64_t start, uint64_t end, StringRef replacement,
+      StringRef fileSpelling,
+      std::optional<uint64_t> ownerIncludeId = std::nullopt) const {
+    ResyncOutcome o = ApplyResyncOrPend(original, start, end, replacement,
+                                        fileSpelling, ownerIncludeId);
     return TextEdit{start, end, std::move(o.text), std::move(o.pending),
                     std::nullopt, {}};
   }
@@ -5342,11 +5351,15 @@ private:
   /// \param end End offset (exclusive) in originalFileText.
   /// \param replacement Replacement text.
   /// \param fileSpellingForDirective Path used in any injected #line.
+  /// \param ownerIncludeId Include-instance owner for \p originalFileText, or
+  ///        std::nullopt for the TU.  This is passed through to the refold-map
+  ///        conditional-activity oracle.
   /// \return A ResyncOutcome containing the emitted text and optional pending
   ///         state.
-  ResyncOutcome ApplyResyncOrPend(StringRef originalFileText, uint64_t start,
-                                  uint64_t end, StringRef replacement,
-                                  StringRef fileSpellingForDirective) const;
+  ResyncOutcome ApplyResyncOrPend(
+      StringRef originalFileText, uint64_t start, uint64_t end,
+      StringRef replacement, StringRef fileSpellingForDirective,
+      std::optional<uint64_t> ownerIncludeId = std::nullopt) const;
 
   /// \brief Return true iff the materialized include subtree contains a
   /// line-state-sensitive builtin invocation.
@@ -5413,12 +5426,16 @@ private:
   ///        records root macro invocation ids for edits whose final applied
   ///        replacement leaves the corresponding macro expanded in the emitted
   ///        text.
+  /// \param ownerIncludeId Include-instance owner for \p originalFileText, or
+  ///        std::nullopt when streaming the TU.  Pending #line recovery uses this
+  ///        to query the correct producer-selected conditional arms.
   /// \return The edited file text with any necessary #line directives emitted
   ///         (locally or deferred).
   std::string ApplyTextEditsWithPendingResync(
       StringRef originalFileText, ArrayRef<TextEdit> edits,
       DenseSet<uint64_t> *appliedExpandedMacroRootIds = nullptr,
       StringRef emissionOwner = StringRef(),
+      std::optional<uint64_t> ownerIncludeId = std::nullopt,
       std::vector<MaterializedEditMapping> *materializedEditMappings =
           nullptr) const;
 
@@ -5543,7 +5560,8 @@ private:
   /// \param original The original file contents we are streaming from.
   /// \param from Start offset (inclusive) of the unchanged slice.
   /// \param to End offset (exclusive) of the unchanged slice.
-  /// \param pending A pending resync to flush.
+  /// \param pending A pending resync to flush.  Its ownerIncludeId is preserved
+  ///        when querying the refold-map conditional activity for the flush site.
   /// \return std::nullopt if the pending resync was flushed; otherwise the
   ///         still-pending resync.
   std::optional<PendingResync>

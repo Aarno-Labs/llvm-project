@@ -1,4 +1,5 @@
 #include "LineDirectiveInserter.h"
+#include "RefoldModel.h"
 #include "RefoldLog.h"
 #include "StringUtils.h"
 #include <algorithm>
@@ -601,742 +602,6 @@ static bool readDirectiveIdentifier(StringRef line, size_t &p, size_t to,
 }
 
 
-struct LineControlConditionalFrame {
-  // Whether the enclosing conditional context was active when this group was
-  // entered.  If the parent is inactive, every arm in this group is inactive,
-  // but nested conditionals must still be tracked so the scanner can find the
-  // matching #endif.
-  bool parentActive = true;
-
-  // Whether the currently selected arm of this conditional group is active.
-  bool active = true;
-
-  // Whether any prior arm in this group has been selected while the parent was
-  // active.  #else/#elif use this to avoid executing multiple arms.
-  bool branchTaken = false;
-
-  bool sawElse = false;
-};
-
-static bool lineControlConditionalStackIsActive(
-    ArrayRef<LineControlConditionalFrame> stack) {
-  return stack.empty() || stack.back().active;
-}
-
-static std::optional<bool> parseSimpleLineControlIfTruth(StringRef expr);
-
-/// Small integer-expression evaluator for conditional-inclusion guards seen
-/// while recovering source-authored line-control state.
-///
-/// This is not a replacement for Clang's preprocessor expression engine.  It is
-/// deliberately local to the `#line` recovery proof and recognizes the stable
-/// arithmetic/relational/logical subset needed to decide whether a preceding
-/// owner-local `#define`, `#undef`, or `#line` directive was actually executed.
-/// If the expression falls outside this subset, the caller treats the arm as
-/// active rather than guessing it inactive.
-class LineControlIfExpressionParser {
-public:
-  explicit LineControlIfExpressionParser(StringRef expr) : expr_(expr) {}
-
-  std::optional<int64_t> parseCompleteExpression() {
-    std::optional<int64_t> value = parseConditional();
-    skipHorizontalWhitespace();
-    if (!value || pos_ != expr_.size())
-      return std::nullopt;
-    return value;
-  }
-
-private:
-  StringRef expr_;
-  size_t pos_ = 0;
-  unsigned discardedEvaluationDepth_ = 0;
-
-  bool shouldEvaluate() const { return discardedEvaluationDepth_ == 0; }
-
-  void skipHorizontalWhitespace() {
-    while (pos_ < expr_.size() && isHorizontalWhitespace(expr_[pos_]))
-      ++pos_;
-  }
-
-  bool startsWith(StringRef op) const {
-    return pos_ + op.size() <= expr_.size() && expr_.substr(pos_, op.size()) == op;
-  }
-
-  bool consume(StringRef op) {
-    skipHorizontalWhitespace();
-    if (!startsWith(op))
-      return false;
-    pos_ += op.size();
-    return true;
-  }
-
-  bool consumeSingleCharOperator(char op, char doubledOp) {
-    skipHorizontalWhitespace();
-    if (pos_ >= expr_.size() || expr_[pos_] != op)
-      return false;
-    // Do not let the bitwise parser steal the first character of `&&` or `||`;
-    // those are handled at the logical-operator precedence levels above it.
-    if (pos_ + 1 < expr_.size() && expr_[pos_ + 1] == doubledOp)
-      return false;
-    ++pos_;
-    return true;
-  }
-
-  std::optional<int64_t> parseDiscardedExpression() {
-    ++discardedEvaluationDepth_;
-    std::optional<int64_t> value = parseExpression();
-    --discardedEvaluationDepth_;
-    if (!value)
-      return std::nullopt;
-    return 0;
-  }
-
-  std::optional<int64_t> parseDiscardedConditional() {
-    ++discardedEvaluationDepth_;
-    std::optional<int64_t> value = parseConditional();
-    --discardedEvaluationDepth_;
-    if (!value)
-      return std::nullopt;
-    return 0;
-  }
-
-  std::optional<int64_t> parseDiscardedLogicalAnd() {
-    ++discardedEvaluationDepth_;
-    std::optional<int64_t> value = parseLogicalAnd();
-    --discardedEvaluationDepth_;
-    if (!value)
-      return std::nullopt;
-    return 0;
-  }
-
-  /// Parse the comma operator at the expression level.  The middle operand of
-  /// the C conditional operator is an expression rather than another
-  /// conditional-expression, so this level is required to model guards such as
-  /// `#if 1 ? 0, 0 : 1` without treating the selected arm as unknown.
-  std::optional<int64_t> parseExpression() {
-    std::optional<int64_t> value = parseConditional();
-    if (!value)
-      return std::nullopt;
-
-    while (consume(",")) {
-      std::optional<int64_t> rhs = parseConditional();
-      if (!rhs)
-        return std::nullopt;
-      value = shouldEvaluate() ? rhs : std::optional<int64_t>(0);
-    }
-    return value;
-  }
-
-  /// Parse the C conditional operator.  Its condition and false arm are
-  /// conditional-expressions, while the true arm is a full expression, and the
-  /// selected arm is the only arm whose value is evaluated.  The parser still
-  /// consumes the skipped arm syntactically, but it disables value evaluation
-  /// while doing so.  This is the line-control proof invariant: an arm-local
-  /// `#define` or `#line` may affect resync only when the active arm was proven
-  /// using the same short-circuit rules as the preprocessor.
-  std::optional<int64_t> parseConditional() {
-    std::optional<int64_t> condition = parseLogicalOr();
-    if (!condition)
-      return std::nullopt;
-
-    skipHorizontalWhitespace();
-    if (pos_ >= expr_.size() || expr_[pos_] != '?')
-      return condition;
-    ++pos_;
-
-    if (!shouldEvaluate()) {
-      if (!parseExpression())
-        return std::nullopt;
-      skipHorizontalWhitespace();
-      if (pos_ >= expr_.size() || expr_[pos_] != ':')
-        return std::nullopt;
-      ++pos_;
-      if (!parseConditional())
-        return std::nullopt;
-      return 0;
-    }
-
-    if (*condition != 0) {
-      std::optional<int64_t> trueValue = parseExpression();
-      if (!trueValue)
-        return std::nullopt;
-
-      skipHorizontalWhitespace();
-      if (pos_ >= expr_.size() || expr_[pos_] != ':')
-        return std::nullopt;
-      ++pos_;
-
-      if (!parseDiscardedConditional())
-        return std::nullopt;
-      return trueValue;
-    }
-
-    if (!parseDiscardedExpression())
-      return std::nullopt;
-
-    skipHorizontalWhitespace();
-    if (pos_ >= expr_.size() || expr_[pos_] != ':')
-      return std::nullopt;
-    ++pos_;
-
-    return parseConditional();
-  }
-
-  std::optional<int64_t> parseLogicalOr() {
-    std::optional<int64_t> lhs = parseLogicalAnd();
-    if (!lhs)
-      return std::nullopt;
-    while (consume("||")) {
-      if (shouldEvaluate() && *lhs != 0) {
-        if (!parseDiscardedLogicalAnd())
-          return std::nullopt;
-        lhs = 1;
-        continue;
-      }
-
-      std::optional<int64_t> rhs = parseLogicalAnd();
-      if (!rhs)
-        return std::nullopt;
-      lhs = shouldEvaluate() ? (((*lhs != 0) || (*rhs != 0)) ? 1 : 0)
-                             : 0;
-    }
-    return lhs;
-  }
-
-  std::optional<int64_t> parseLogicalAnd() {
-    std::optional<int64_t> lhs = parseBitwiseOr();
-    if (!lhs)
-      return std::nullopt;
-    while (consume("&&")) {
-      if (shouldEvaluate() && *lhs == 0) {
-        ++discardedEvaluationDepth_;
-        std::optional<int64_t> rhs = parseBitwiseOr();
-        --discardedEvaluationDepth_;
-        if (!rhs)
-          return std::nullopt;
-        lhs = 0;
-        continue;
-      }
-
-      std::optional<int64_t> rhs = parseBitwiseOr();
-      if (!rhs)
-        return std::nullopt;
-      lhs = shouldEvaluate() ? (((*lhs != 0) && (*rhs != 0)) ? 1 : 0)
-                             : 0;
-    }
-    return lhs;
-  }
-
-  std::optional<int64_t> parseBitwiseOr() {
-    std::optional<int64_t> lhs = parseBitwiseXor();
-    if (!lhs)
-      return std::nullopt;
-    while (consumeSingleCharOperator('|', '|')) {
-      std::optional<int64_t> rhs = parseBitwiseXor();
-      if (!rhs)
-        return std::nullopt;
-      lhs = shouldEvaluate() ? (*lhs | *rhs) : 0;
-    }
-    return lhs;
-  }
-
-  std::optional<int64_t> parseBitwiseXor() {
-    std::optional<int64_t> lhs = parseBitwiseAnd();
-    if (!lhs)
-      return std::nullopt;
-    while (consume("^")) {
-      std::optional<int64_t> rhs = parseBitwiseAnd();
-      if (!rhs)
-        return std::nullopt;
-      lhs = shouldEvaluate() ? (*lhs ^ *rhs) : 0;
-    }
-    return lhs;
-  }
-
-  std::optional<int64_t> parseBitwiseAnd() {
-    std::optional<int64_t> lhs = parseEquality();
-    if (!lhs)
-      return std::nullopt;
-    while (consumeSingleCharOperator('&', '&')) {
-      std::optional<int64_t> rhs = parseEquality();
-      if (!rhs)
-        return std::nullopt;
-      lhs = shouldEvaluate() ? (*lhs & *rhs) : 0;
-    }
-    return lhs;
-  }
-
-  std::optional<int64_t> parseEquality() {
-    std::optional<int64_t> lhs = parseRelational();
-    if (!lhs)
-      return std::nullopt;
-    for (;;) {
-      if (consume("==")) {
-        std::optional<int64_t> rhs = parseRelational();
-        if (!rhs)
-          return std::nullopt;
-        lhs = shouldEvaluate() ? ((*lhs == *rhs) ? 1 : 0) : 0;
-        continue;
-      }
-      if (consume("!=")) {
-        std::optional<int64_t> rhs = parseRelational();
-        if (!rhs)
-          return std::nullopt;
-        lhs = shouldEvaluate() ? ((*lhs != *rhs) ? 1 : 0) : 0;
-        continue;
-      }
-      return lhs;
-    }
-  }
-
-  std::optional<int64_t> parseRelational() {
-    std::optional<int64_t> lhs = parseShift();
-    if (!lhs)
-      return std::nullopt;
-    for (;;) {
-      if (consume("<=")) {
-        std::optional<int64_t> rhs = parseShift();
-        if (!rhs)
-          return std::nullopt;
-        lhs = shouldEvaluate() ? ((*lhs <= *rhs) ? 1 : 0) : 0;
-        continue;
-      }
-      if (consume(">=")) {
-        std::optional<int64_t> rhs = parseShift();
-        if (!rhs)
-          return std::nullopt;
-        lhs = shouldEvaluate() ? ((*lhs >= *rhs) ? 1 : 0) : 0;
-        continue;
-      }
-      if (consume("<")) {
-        std::optional<int64_t> rhs = parseShift();
-        if (!rhs)
-          return std::nullopt;
-        lhs = shouldEvaluate() ? ((*lhs < *rhs) ? 1 : 0) : 0;
-        continue;
-      }
-      if (consume(">")) {
-        std::optional<int64_t> rhs = parseShift();
-        if (!rhs)
-          return std::nullopt;
-        lhs = shouldEvaluate() ? ((*lhs > *rhs) ? 1 : 0) : 0;
-        continue;
-      }
-      return lhs;
-    }
-  }
-
-  std::optional<int64_t> parseShift() {
-    std::optional<int64_t> lhs = parseAdditive();
-    if (!lhs)
-      return std::nullopt;
-    for (;;) {
-      if (consume("<<")) {
-        std::optional<int64_t> rhs = parseAdditive();
-        if (!rhs || (shouldEvaluate() && (*rhs < 0 || *rhs >= 63)))
-          return std::nullopt;
-        lhs = shouldEvaluate() ? (*lhs << *rhs) : 0;
-        continue;
-      }
-      if (consume(">>")) {
-        std::optional<int64_t> rhs = parseAdditive();
-        if (!rhs || (shouldEvaluate() && (*rhs < 0 || *rhs >= 63)))
-          return std::nullopt;
-        lhs = shouldEvaluate() ? (*lhs >> *rhs) : 0;
-        continue;
-      }
-      return lhs;
-    }
-  }
-
-  std::optional<int64_t> parseAdditive() {
-    std::optional<int64_t> lhs = parseMultiplicative();
-    if (!lhs)
-      return std::nullopt;
-    for (;;) {
-      if (consume("+")) {
-        std::optional<int64_t> rhs = parseMultiplicative();
-        if (!rhs)
-          return std::nullopt;
-        lhs = shouldEvaluate() ? (*lhs + *rhs) : 0;
-        continue;
-      }
-      if (consume("-")) {
-        std::optional<int64_t> rhs = parseMultiplicative();
-        if (!rhs)
-          return std::nullopt;
-        lhs = shouldEvaluate() ? (*lhs - *rhs) : 0;
-        continue;
-      }
-      return lhs;
-    }
-  }
-
-  std::optional<int64_t> parseMultiplicative() {
-    std::optional<int64_t> lhs = parseUnary();
-    if (!lhs)
-      return std::nullopt;
-    for (;;) {
-      if (consume("*")) {
-        std::optional<int64_t> rhs = parseUnary();
-        if (!rhs)
-          return std::nullopt;
-        lhs = shouldEvaluate() ? (*lhs * *rhs) : 0;
-        continue;
-      }
-      if (consume("/")) {
-        std::optional<int64_t> rhs = parseUnary();
-        if (!rhs || (shouldEvaluate() && *rhs == 0))
-          return std::nullopt;
-        lhs = shouldEvaluate() ? (*lhs / *rhs) : 0;
-        continue;
-      }
-      if (consume("%")) {
-        std::optional<int64_t> rhs = parseUnary();
-        if (!rhs || (shouldEvaluate() && *rhs == 0))
-          return std::nullopt;
-        lhs = shouldEvaluate() ? (*lhs % *rhs) : 0;
-        continue;
-      }
-      return lhs;
-    }
-  }
-
-  std::optional<int64_t> parseUnary() {
-    skipHorizontalWhitespace();
-    if (consume("+"))
-      return parseUnary();
-    if (consume("-")) {
-      std::optional<int64_t> value = parseUnary();
-      if (!value)
-        return std::nullopt;
-      return shouldEvaluate() ? -*value : 0;
-    }
-    if (consume("!")) {
-      std::optional<int64_t> value = parseUnary();
-      if (!value)
-        return std::nullopt;
-      return shouldEvaluate() ? (*value == 0 ? 1 : 0) : 0;
-    }
-    if (consume("~")) {
-      std::optional<int64_t> value = parseUnary();
-      if (!value)
-        return std::nullopt;
-      return shouldEvaluate() ? ~*value : 0;
-    }
-    return parsePrimary();
-  }
-
-  std::optional<int64_t> parsePrimary() {
-    skipHorizontalWhitespace();
-    if (pos_ >= expr_.size())
-      return std::nullopt;
-
-    if (expr_[pos_] == '(') {
-      ++pos_;
-      std::optional<int64_t> value = parseExpression();
-      skipHorizontalWhitespace();
-      if (pos_ >= expr_.size() || expr_[pos_] != ')')
-        return std::nullopt;
-      ++pos_;
-      return value;
-    }
-
-    if (std::optional<int64_t> charValue = parseCharacterConstant())
-      return charValue;
-
-    if (expr_[pos_] == '"')
-      return std::nullopt;
-
-    if (stringutils::isIdentStart(expr_[pos_])) {
-      // After macro expansion and `defined` handling, remaining identifiers in
-      // #if expressions have preprocessing value zero. Modeling that rule lets
-      // the owner-local scanner prove ordinary guards without importing Clang's
-      // full expression evaluator.
-      ++pos_;
-      while (pos_ < expr_.size() && stringutils::isIdentPart(expr_[pos_]))
-        ++pos_;
-      return 0;
-    }
-
-    return parseIntegerLiteral();
-  }
-
-  std::optional<int64_t> parseCharacterConstant() {
-    skipHorizontalWhitespace();
-    size_t p = pos_;
-
-    // Accept ordinary and prefixed character constants in preprocessing
-    // integer expressions.  Ordinary narrow constants are kept compatible with
-    // the previous deterministic low-byte fold, while single wide / Unicode
-    // character constants preserve the decoded code point.  That gives the
-    // line-control proof the same selected arm for common guards such as
-    // `#if L'\u0100' == 256` without pretending to model every target-specific
-    // multi-character representation.
-    bool preserveSingleCodePoint = false;
-    if (p + 2 < expr_.size() && expr_.substr(p, 2) == "u8" &&
-        expr_[p + 2] == '\'') {
-      p += 2;
-    } else if (p + 1 < expr_.size() &&
-               (expr_[p] == 'L' || expr_[p] == 'u' || expr_[p] == 'U') &&
-               expr_[p + 1] == '\'') {
-      preserveSingleCodePoint = true;
-      ++p;
-    }
-
-    if (p >= expr_.size() || expr_[p] != '\'')
-      return std::nullopt;
-    ++p;
-
-    std::vector<unsigned> elements;
-    while (p < expr_.size() && expr_[p] != '\'') {
-      std::optional<unsigned> c = readCharacterConstantElement(p);
-      if (!c)
-        return std::nullopt;
-      elements.push_back(*c);
-    }
-
-    if (elements.empty() || p >= expr_.size() || expr_[p] != '\'')
-      return std::nullopt;
-    pos_ = p + 1;
-
-    if (elements.size() == 1) {
-      unsigned value = elements.front();
-      if (!preserveSingleCodePoint)
-        value &= 0xffu;
-      return static_cast<int64_t>(value);
-    }
-
-    int64_t value = 0;
-    for (unsigned c : elements)
-      value = (value << 8) | static_cast<int64_t>(c & 0xffu);
-    return value;
-  }
-
-  std::optional<unsigned> readFixedHexEscape(size_t &p, unsigned digits) {
-    unsigned value = 0;
-    for (unsigned i = 0; i < digits; ++i) {
-      if (p >= expr_.size() ||
-          !std::isxdigit(static_cast<unsigned char>(expr_[p])))
-        return std::nullopt;
-      char h = expr_[p++];
-      value *= 16;
-      if ('0' <= h && h <= '9')
-        value += static_cast<unsigned>(h - '0');
-      else if ('a' <= h && h <= 'f')
-        value += static_cast<unsigned>(h - 'a' + 10);
-      else
-        value += static_cast<unsigned>(h - 'A' + 10);
-    }
-    return value;
-  }
-
-  std::optional<unsigned> readCharacterConstantElement(size_t &p) {
-    if (p >= expr_.size())
-      return std::nullopt;
-
-    unsigned char c = static_cast<unsigned char>(expr_[p++]);
-    if (c != '\\')
-      return static_cast<unsigned>(c);
-
-    if (p >= expr_.size())
-      return std::nullopt;
-
-    char esc = expr_[p++];
-    switch (esc) {
-    case '\'':
-      return static_cast<unsigned>('\'');
-    case '"':
-      return static_cast<unsigned>('"');
-    case '?':
-      return static_cast<unsigned>('?');
-    case '\\':
-      return static_cast<unsigned>('\\');
-    case 'a':
-      return 7;
-    case 'b':
-      return 8;
-    case 'f':
-      return 12;
-    case 'n':
-      return 10;
-    case 'r':
-      return 13;
-    case 't':
-      return 9;
-    case 'v':
-      return 11;
-    case 'u':
-      return readFixedHexEscape(p, 4);
-    case 'U':
-      return readFixedHexEscape(p, 8);
-    case 'x': {
-      unsigned value = 0;
-      const size_t digitsBegin = p;
-      while (p < expr_.size() &&
-             std::isxdigit(static_cast<unsigned char>(expr_[p]))) {
-        char h = expr_[p++];
-        value *= 16;
-        if ('0' <= h && h <= '9')
-          value += static_cast<unsigned>(h - '0');
-        else if ('a' <= h && h <= 'f')
-          value += static_cast<unsigned>(h - 'a' + 10);
-        else
-          value += static_cast<unsigned>(h - 'A' + 10);
-      }
-      if (digitsBegin == p)
-        return std::nullopt;
-      return value;
-    }
-    default:
-      if ('0' <= esc && esc <= '7') {
-        unsigned value = static_cast<unsigned>(esc - '0');
-        unsigned count = 1;
-        while (count < 3 && p < expr_.size() && '0' <= expr_[p] &&
-               expr_[p] <= '7') {
-          value = value * 8 + static_cast<unsigned>(expr_[p] - '0');
-          ++p;
-          ++count;
-        }
-        return value;
-      }
-      return static_cast<unsigned>(static_cast<unsigned char>(esc));
-    }
-  }
-
-  std::optional<int64_t> parseIntegerLiteral() {
-    skipHorizontalWhitespace();
-    const size_t literalBegin = pos_;
-    if (pos_ >= expr_.size() ||
-        !std::isdigit(static_cast<unsigned char>(expr_[pos_])))
-      return std::nullopt;
-
-    // Accept the integer spelling forms that commonly appear in preprocessing
-    // guards, then discard integer suffixes. We intentionally do not try to
-    // diagnose overflow exactly as Clang would; overflow or malformed spellings
-    // make the proof fail and leave the conditional conservatively active.
-    if (pos_ + 1 < expr_.size() && expr_[pos_] == '0' &&
-        (expr_[pos_ + 1] == 'x' || expr_[pos_ + 1] == 'X')) {
-      pos_ += 2;
-      const size_t digitsBegin = pos_;
-      while (pos_ < expr_.size() &&
-             std::isxdigit(static_cast<unsigned char>(expr_[pos_])))
-        ++pos_;
-      if (digitsBegin == pos_)
-        return std::nullopt;
-    } else {
-      while (pos_ < expr_.size() &&
-             std::isdigit(static_cast<unsigned char>(expr_[pos_])))
-        ++pos_;
-    }
-
-    const size_t digitEnd = pos_;
-    while (pos_ < expr_.size()) {
-      char c = expr_[pos_];
-      if (c != 'u' && c != 'U' && c != 'l' && c != 'L')
-        break;
-      ++pos_;
-    }
-
-    int64_t value = 0;
-    if (expr_.slice(literalBegin, digitEnd).getAsInteger(0, value))
-      return std::nullopt;
-    return value;
-  }
-};
-
-static std::optional<bool> parseSimpleLineControlIfTruth(StringRef expr) {
-  LineControlIfExpressionParser parser(trimHorizontal(expr));
-  if (std::optional<int64_t> value = parser.parseCompleteExpression())
-    return *value != 0;
-  return std::nullopt;
-}
-
-static std::string replaceDefinedOperatorsInLineControlIf(
-    StringRef expr, const LineControlMacroMap &macros) {
-  std::string out;
-  out.reserve(expr.size());
-
-  for (size_t i = 0; i < expr.size();) {
-    if (copyQuotedLiteral(expr, i, out))
-      continue;
-
-    if (!stringutils::isIdentStart(expr[i])) {
-      out.push_back(expr[i++]);
-      continue;
-    }
-
-    size_t nameBegin = i++;
-    while (i < expr.size() && stringutils::isIdentPart(expr[i]))
-      ++i;
-    StringRef name = expr.slice(nameBegin, i);
-    if (name != "defined") {
-      out += name.str();
-      continue;
-    }
-
-    size_t p = i;
-    while (p < expr.size() && isHorizontalWhitespace(expr[p]))
-      ++p;
-
-    bool parenthesized = false;
-    if (p < expr.size() && expr[p] == '(') {
-      parenthesized = true;
-      ++p;
-      while (p < expr.size() && isHorizontalWhitespace(expr[p]))
-        ++p;
-    }
-
-    StringRef definedName;
-    size_t namePos = p;
-    if (!readDirectiveIdentifier(expr, p, expr.size(), definedName)) {
-      out += name.str();
-      i = namePos;
-      continue;
-    }
-
-    if (parenthesized) {
-      while (p < expr.size() && isHorizontalWhitespace(expr[p]))
-        ++p;
-      if (p >= expr.size() || expr[p] != ')') {
-        out += name.str();
-        i = namePos;
-        continue;
-      }
-      ++p;
-    }
-
-    out += macros.count(definedName.str()) ? "1" : "0";
-    i = p;
-  }
-
-  return out;
-}
-
-static bool evaluateLineControlIfDirective(
-    StringRef expr, const LineControlMacroMap &macros,
-    size_t logicalLineAtLineStart, StringRef activeFileSpelling) {
-  // `defined` is handled before ordinary macro expansion because the operand of
-  // defined is not macro-expanded by the preprocessor.  The remaining tokens are
-  // then expanded by the same owner-local macro evaluator used for #line
-  // operands, and a deliberately small integer truth parser handles the guard
-  // expressions this recovery pass can prove.
-  std::string withDefined =
-      replaceDefinedOperatorsInLineControlIf(expr, macros);
-  std::string expanded = expandLineControlMacros(StringRef(withDefined), macros,
-                                                 logicalLineAtLineStart,
-                                                 activeFileSpelling);
-  if (std::optional<bool> truth = parseSimpleLineControlIfTruth(expanded))
-    return *truth;
-
-  // Unknown conditional expressions are treated as active rather than guessed
-  // inactive.  That preserves the pre-existing conservative behavior for
-  // conditionals this owner-local recovery model cannot prove while still
-  // filtering the common, provable inactive arms (#if 0, #ifdef missing,
-  // #ifndef defined, and simple macro-valued #if expressions).
-  return true;
-}
-
 static bool readLineControlDirectiveAndOperand(StringRef line,
                                                StringRef &directive,
                                                StringRef &operand) {
@@ -1350,92 +615,6 @@ static bool readLineControlDirectiveAndOperand(StringRef line,
   return true;
 }
 
-static bool readFirstDirectiveIdentifierOperand(StringRef operand,
-                                                StringRef &ident) {
-  size_t p = 0;
-  while (p < operand.size() && isHorizontalWhitespace(operand[p]))
-    ++p;
-  return readDirectiveIdentifier(operand, p, operand.size(), ident);
-}
-
-static bool updateLineControlConditionalState(
-    StringRef line, std::vector<LineControlConditionalFrame> &stack,
-    const LineControlMacroMap &macros, size_t logicalLineAtLineStart,
-    StringRef activeFileSpelling) {
-  StringRef directive;
-  StringRef operand;
-  if (!readLineControlDirectiveAndOperand(line, directive, operand))
-    return false;
-
-  auto currentActive = [&]() { return lineControlConditionalStackIsActive(stack); };
-
-  if (directive == "if" || directive == "ifdef" || directive == "ifndef") {
-    const bool parentActive = currentActive();
-    bool condition = false;
-
-    if (parentActive) {
-      if (directive == "if") {
-        condition = evaluateLineControlIfDirective(
-            operand, macros, logicalLineAtLineStart, activeFileSpelling);
-      } else {
-        StringRef name;
-        if (readFirstDirectiveIdentifierOperand(operand, name))
-          condition = macros.count(name.str()) != 0;
-        if (directive == "ifndef")
-          condition = !condition;
-      }
-    }
-
-    LineControlConditionalFrame frame;
-    frame.parentActive = parentActive;
-    frame.active = parentActive && condition;
-    frame.branchTaken = frame.active;
-    stack.push_back(frame);
-    return true;
-  }
-
-  if (directive == "elif" || directive == "elifdef" || directive == "elifndef") {
-    if (stack.empty())
-      return true;
-
-    LineControlConditionalFrame &frame = stack.back();
-    bool condition = false;
-    if (frame.parentActive && !frame.branchTaken && !frame.sawElse) {
-      if (directive == "elif") {
-        condition = evaluateLineControlIfDirective(
-            operand, macros, logicalLineAtLineStart, activeFileSpelling);
-      } else {
-        StringRef name;
-        if (readFirstDirectiveIdentifierOperand(operand, name))
-          condition = macros.count(name.str()) != 0;
-        if (directive == "elifndef")
-          condition = !condition;
-      }
-    }
-    frame.active = frame.parentActive && !frame.branchTaken &&
-                   !frame.sawElse && condition;
-    frame.branchTaken = frame.branchTaken || frame.active;
-    return true;
-  }
-
-  if (directive == "else") {
-    if (stack.empty())
-      return true;
-    LineControlConditionalFrame &frame = stack.back();
-    frame.active = frame.parentActive && !frame.branchTaken && !frame.sawElse;
-    frame.branchTaken = frame.branchTaken || frame.active;
-    frame.sawElse = true;
-    return true;
-  }
-
-  if (directive == "endif") {
-    if (!stack.empty())
-      stack.pop_back();
-    return true;
-  }
-
-  return false;
-}
 
 // Update the owner-local macro environment from source directives that precede
 // the offset being queried.  Only definitions visible in the same source owner
@@ -1721,6 +900,156 @@ static size_t physicalLineControlDirectiveAdjustment(StringRef src,
   return physicalNewlines - 1;
 }
 
+
+// Parse a single logical preprocessing line as a line-control directive.  This
+// namespace-local helper is shared by the member API and the model-backed
+// logical-location scanner below; keeping the parser out of the class member
+// avoids translation-order dependencies when source-prefix recovery runs before
+// the public LineDirectiveInserter methods are defined.
+static std::optional<LineDirectiveState>
+parseLineDirectiveForLineControl(StringRef src, size_t from, size_t to) {
+  if (from > to || to > src.size())
+    return std::nullopt;
+
+  size_t p = from;
+
+  // A preprocessing directive may be preceded by horizontal whitespace.  Do
+  // not cross a physical newline; `from/to` already delimit one source line.
+  while (p < to && stringutils::isWs(src[p]) && src[p] != '\n')
+    ++p;
+
+  if (p >= to || src[p] != '#')
+    return std::nullopt;
+  ++p;
+
+  // Both `#line` and `# line` are accepted spellings.  Clang/GCC also accept
+  // the numeric line-control form `# 123 "file"`, so leave `p` at the digits
+  // when there is no `line` keyword.
+  while (p < to && stringutils::isWs(src[p]) && src[p] != '\n')
+    ++p;
+
+  if (p + 4 <= to && src.substr(p, 4) == "line") {
+    p += 4;
+    if (p >= to || !stringutils::isWs(src[p]))
+      return std::nullopt;
+    while (p < to && stringutils::isWs(src[p]) && src[p] != '\n')
+      ++p;
+  }
+
+  const size_t lineStart = p;
+  while (p < to && std::isdigit(static_cast<unsigned char>(src[p])))
+    ++p;
+
+  if (p == lineStart)
+    return std::nullopt;
+
+  size_t lineAfter;
+  if (src.slice(lineStart, p).getAsInteger(10, lineAfter))
+    return std::nullopt;
+
+  while (p < to && stringutils::isWs(src[p]) && src[p] != '\n')
+    ++p;
+
+  // Parse the optional quoted filename operand.  Absence of this operand is
+  // semantically meaningful: `#line 200` changes only the logical line number
+  // and preserves the active logical file.
+  llvm::SmallString<64> fileSpelling;
+  bool hasFileSpelling = false;
+  if (p < to && src[p] == '"') {
+    hasFileSpelling = true;
+    ++p; // consume opening quote
+    while (p < to) {
+      char c = src[p++];
+      if (c == '"')
+        break;
+      if (c == '\\' && p < to) {
+        char escaped = src[p++];
+        if (escaped == 'x' || escaped == 'X') {
+          // #line filename operands are C string literals after macro
+          // expansion. Decode \x... to the logical filename byte before
+          // formatting a resync directive; otherwise __FILE__ observes the raw
+          // source spelling instead of the preprocessing result.
+          unsigned value = 0;
+          bool sawHex = false;
+          while (p < to && std::isxdigit(static_cast<unsigned char>(src[p]))) {
+            sawHex = true;
+            char h = src[p++];
+            value *= 16;
+            if (h >= '0' && h <= '9')
+              value += static_cast<unsigned>(h - '0');
+            else if (h >= 'a' && h <= 'f')
+              value += static_cast<unsigned>(10 + h - 'a');
+            else if (h >= 'A' && h <= 'F')
+              value += static_cast<unsigned>(10 + h - 'A');
+          }
+          if (sawHex) {
+            fileSpelling.push_back(static_cast<char>(value & 0xff));
+          } else {
+            fileSpelling.push_back(escaped);
+          }
+          continue;
+        }
+
+        if (escaped >= '0' && escaped <= '7') {
+          unsigned value = static_cast<unsigned>(escaped - '0');
+          for (unsigned digits = 1;
+               digits < 3 && p < to && src[p] >= '0' && src[p] <= '7';
+               ++digits) {
+            value = value * 8 + static_cast<unsigned>(src[p++] - '0');
+          }
+          fileSpelling.push_back(static_cast<char>(value & 0xff));
+          continue;
+        }
+
+        switch (escaped) {
+        case '"':
+        case '\\':
+        case '?':
+        case '\'':
+          fileSpelling.push_back(escaped);
+          break;
+        case 'a':
+          fileSpelling.push_back('\a');
+          break;
+        case 'b':
+          fileSpelling.push_back('\b');
+          break;
+        case 'e':
+        case 'E':
+          fileSpelling.push_back(static_cast<char>(0x1b));
+          break;
+        case 'f':
+          fileSpelling.push_back('\f');
+          break;
+        case 'n':
+          fileSpelling.push_back('\n');
+          break;
+        case 'r':
+          fileSpelling.push_back('\r');
+          break;
+        case 't':
+          fileSpelling.push_back('\t');
+          break;
+        case 'v':
+          fileSpelling.push_back('\v');
+          break;
+        default:
+          fileSpelling.push_back(escaped);
+          break;
+        }
+      } else {
+        fileSpelling.push_back(c);
+      }
+    }
+  }
+
+  const size_t afterDirectiveIdx =
+      (to < src.size() && src[to] == '\n') ? to + 1 : to;
+
+  return LineDirectiveState(std::string(fileSpelling.str()), lineAfter,
+                            afterDirectiveIdx, hasFileSpelling);
+}
+
 // Expand only the operand part of a possible line-control directive.  Non-line
 // preprocessor directives are harmless: after expansion, ParseLineDirective()
 // will reject them and the caller will only use them to update the macro
@@ -1761,6 +1090,139 @@ static std::string expandSourceLineControlDirective(
   return expanded;
 }
 
+
+// Return the original-source byte of the directive-introducing '#'.  The
+// logical line scanner has already applied phase-2 splicing for recognition, but
+// the refold map records conditional group boundaries in original byte space.
+// This bridge consumes horizontal whitespace, physical splice pairs, and block
+// comments before the '#', matching the early translation phases used for
+// directive recognition while preserving the original byte coordinate.
+static std::optional<uint64_t>
+findLineControlDirectiveHashOffset(StringRef src, size_t lineStart,
+                                   size_t afterLine) {
+  size_t p = lineStart;
+  while (p < afterLine && p < src.size()) {
+    if (isHorizontalWhitespace(src[p])) {
+      ++p;
+      continue;
+    }
+
+    if (src[p] == '\\') {
+      if (p + 1 < afterLine && src[p + 1] == '\n') {
+        p += 2;
+        continue;
+      }
+      if (p + 2 < afterLine && src[p + 1] == '\r' && src[p + 2] == '\n') {
+        p += 3;
+        continue;
+      }
+    }
+
+    if (p + 1 < afterLine && src[p] == '/' && src[p + 1] == '*') {
+      p += 2;
+      bool closed = false;
+      while (p + 1 < afterLine) {
+        if (src[p] == '\\') {
+          if (p + 1 < afterLine && src[p + 1] == '\n') {
+            p += 2;
+            continue;
+          }
+          if (p + 2 < afterLine && src[p + 1] == '\r' &&
+              src[p + 2] == '\n') {
+            p += 3;
+            continue;
+          }
+        }
+        if (src[p] == '*' && src[p + 1] == '/') {
+          p += 2;
+          closed = true;
+          break;
+        }
+        ++p;
+      }
+      if (!closed)
+        return std::nullopt;
+      continue;
+    }
+
+    if (p + 1 < afterLine && src[p] == '/' && src[p + 1] == '/')
+      return std::nullopt;
+
+    if (src[p] == '#')
+      return static_cast<uint64_t>(p);
+    return std::nullopt;
+  }
+  return std::nullopt;
+}
+
+// Producer-proven conditional activity gate for source line-control effects.
+//
+// A #line directive may affect owner-local line-state recovery only when every
+// conditional group enclosing the directive byte has a selected PP-material arm
+// that contains that byte.  Macro-state directives use the stronger item-level
+// proof below because a branch can be selected solely to execute #define/#undef
+// without contributing A-side PP tokens.  The consumer must not re-evaluate #if
+// expressions here: the producer already ran Clang's preprocessor with the
+// correct macro state, target semantics, feature predicates, include search
+// state, and conditional short-circuit rules.  Unknown/missing ownership fails
+// closed for conditional bytes and leaves top-level bytes effectful.
+static bool lineControlDirectiveIsProducerProvenActive(
+    const RefoldModel &model, StringRef ownerFile,
+    std::optional<uint64_t> ownerIncludeId, uint64_t directiveHashOffset) {
+  for (const RefoldModel::CondGroup &group : model.GetConds()) {
+    if (group.file != ownerFile || group.parentIncludeId != ownerIncludeId)
+      continue;
+    if (!group.ContainsByte(directiveHashOffset))
+      continue;
+
+    bool selectedArmContainsDirective = false;
+    for (const RefoldModel::CondArm &arm : group.arms) {
+      if (arm.selected && arm.ContainsByte(directiveHashOffset)) {
+        selectedArmContainsDirective = true;
+        break;
+      }
+    }
+
+    if (!selectedArmContainsDirective)
+      return false;
+  }
+
+  return true;
+}
+
+/// Return true iff the refold map contains the producer-observed macro-state
+/// directive on this logical source line.
+///
+/// Conditional-arm `selected` metadata is a PP-material witness: it is true
+/// when an arm contributed A-side tokens, not merely when Clang selected that
+/// branch.  A selected arm that only performs `#define`/`#undef` therefore has
+/// no selected-arm PP span, but its macro-state directive is still represented
+/// explicitly in the refold map as a MacroDirective item.  Line-control recovery
+/// must use that item as the activity proof for source-authored macro state;
+/// otherwise live branch-local definitions such as `#define LOC ...` are
+/// suppressed before a later `#line LOC` resync.
+static bool lineControlMacroDirectiveWasProducerObserved(
+    const RefoldModel &model, StringRef ownerFile,
+    std::optional<uint64_t> ownerIncludeId, uint64_t directiveHashOffset,
+    uint64_t afterLine) {
+  for (const RefoldModel::MacroDirective &directive :
+       model.GetMacroDirectives()) {
+    if (directive.sitePath != ownerFile ||
+        directive.ownerIncludeId != ownerIncludeId)
+      continue;
+
+    // MacroDirective::siteB is the macro-name byte for a #define/#undef item,
+    // not necessarily the directive-introducing '#'.  The directive is a match
+    // when its recorded site lies on the same logical directive line whose '#'
+    // the scanner is currently processing.  This keeps the proof
+    // owner-polymorphic and avoids re-evaluating the surrounding #if.
+    if (directiveHashOffset <= directive.siteB && directive.siteB < afterLine)
+      return true;
+  }
+
+  return false;
+}
+
 } // namespace
 
 LineDirectiveInserter::LineDirectiveInserter(bool enabled, StringRef cwd)
@@ -1785,8 +1247,10 @@ std::string LineDirectiveInserter::ToAbsolutePath(StringRef spelledPath) const {
   return std::string(path.str());
 }
 
-LineDirectiveLocation LineDirectiveInserter::LogicalLocationAtOffset(
-    StringRef src, uint64_t offset, StringRef defaultFileSpelling) {
+static LineDirectiveLocation logicalLocationAtOffsetImpl(
+    StringRef src, uint64_t offset, StringRef defaultFileSpelling,
+    const RefoldModel &model, StringRef ownerFile,
+    std::optional<uint64_t> ownerIncludeId) {
   const size_t clampedOffset =
       static_cast<size_t>(std::min<uint64_t>(offset, src.size()));
   StringRef prefix = src.take_front(clampedOffset);
@@ -1801,7 +1265,6 @@ LineDirectiveLocation LineDirectiveInserter::LogicalLocationAtOffset(
   bool sawLineDirective = false;
 
   LineControlMacroMap lineControlMacros;
-  std::vector<LineControlConditionalFrame> lineControlConditionals;
   for (size_t lineStart = 0; lineStart < prefix.size();) {
     std::string logicalLine;
     size_t afterLine = lineStart;
@@ -1819,33 +1282,53 @@ LineDirectiveLocation LineDirectiveInserter::LogicalLocationAtOffset(
         replaceCommentsWithWhitespaceForLineControl(StringRef(logicalLine));
 
     // Source line-control directives are interpreted by the preprocessor after
-    // macro expansion of their operands.  Recover the deterministic owner-local
-    // macro environment from prior source directives before parsing the current
-    // line as `#line ...`.  This evaluator exists only to compute the logical
-    // resume point for emitted #line repair; it must not strengthen ownership,
-    // choose a different edit, or infer macro state outside this source owner.
+    // macro expansion of their operands. Recover the deterministic owner-local
+    // macro environment from producer-observed source directives before parsing
+    // the current line as `#line ...`. This recovery exists only to compute the
+    // logical resume point for emitted #line repair; it must not strengthen
+    // ownership, choose a different edit, or infer macro state outside this
+    // source owner.
     const size_t logicalLineAtLineStart = logicalLineAtSourceOffset(
         prefix, lineStart, sawLineDirective, activeLineAfterDirective,
         activeAfterDirectiveIdx);
     StringRef activeFileForExpansion =
         activeFile ? StringRef(*activeFile) : defaultFileSpelling;
-    const bool isConditionalDirective = updateLineControlConditionalState(
-        StringRef(phase3Line), lineControlConditionals, lineControlMacros,
-        logicalLineAtLineStart, activeFileForExpansion);
 
-    // Inactive conditional arms are still scanned for nesting directives, but
-    // their #define/#undef/#line effects are not executed by the preprocessor.
-    // Applying those directives here would pollute the owner-local macro
-    // environment and recover line-control states that no real preprocessing
-    // execution could observe.
-    if (!isConditionalDirective &&
-        lineControlConditionalStackIsActive(lineControlConditionals)) {
+    std::optional<uint64_t> hashOffset =
+        findLineControlDirectiveHashOffset(src, lineStart, afterLine);
+
+    StringRef directive;
+    StringRef operand;
+    const bool hasNamedDirective = readLineControlDirectiveAndOperand(
+        StringRef(phase3Line), directive, operand);
+    const bool isMacroStateDirective =
+        hasNamedDirective && (directive == "define" || directive == "undef");
+
+    bool directiveEffectsAreActive = false;
+    if (hashOffset) {
+      if (isMacroStateDirective) {
+        directiveEffectsAreActive =
+            lineControlMacroDirectiveWasProducerObserved(
+                model, ownerFile, ownerIncludeId, *hashOffset,
+                static_cast<uint64_t>(afterLine));
+      } else {
+        directiveEffectsAreActive = lineControlDirectiveIsProducerProvenActive(
+            model, ownerFile, ownerIncludeId, *hashOffset);
+      }
+    }
+
+    // Inactive conditional arms are still scanned as text, but their
+    // #define/#undef/#line effects are not executed by the preprocessor. Applying
+    // those directives here would pollute the owner-local macro environment and
+    // recover line-control states that no real preprocessing execution could
+    // observe.
+    if (directiveEffectsAreActive) {
       std::string expandedLine = expandSourceLineControlDirective(
           StringRef(phase3Line), lineControlMacros, logicalLineAtLineStart,
           activeFileForExpansion);
       if (std::optional<LineDirectiveState> state =
-              ParseLineDirective(StringRef(expandedLine), 0,
-                                 expandedLine.size())) {
+              parseLineDirectiveForLineControl(StringRef(expandedLine), 0,
+                                             expandedLine.size())) {
         sawLineDirective = true;
         if (state->hasFileSpelling)
           activeFile = state->fileSpelling;
@@ -1883,6 +1366,14 @@ LineDirectiveLocation LineDirectiveInserter::LogicalLocationAtOffset(
 
   return LineDirectiveLocation(defaultFileSpelling,
                                stringutils::lineAtOffset(src, clampedOffset));
+}
+
+LineDirectiveLocation LineDirectiveInserter::LogicalLocationAtOffset(
+    StringRef src, uint64_t offset, StringRef defaultFileSpelling,
+    const RefoldModel &model, StringRef ownerFile,
+    std::optional<uint64_t> ownerIncludeId) {
+  return logicalLocationAtOffsetImpl(src, offset, defaultFileSpelling, model,
+                                     ownerFile, ownerIncludeId);
 }
 
 std::string LineDirectiveInserter::WrapIncludeExpansion(
@@ -2145,146 +1636,7 @@ LineDirectiveInserter::FindLastLineDirectiveState(StringRef src) {
 std::optional<LineDirectiveState>
 LineDirectiveInserter::ParseLineDirective(StringRef src, size_t from,
                                           size_t to) {
-  if (from > to || to > src.size())
-    return std::nullopt;
-
-  size_t p = from;
-
-  // A preprocessing directive may be preceded by horizontal whitespace.  Do
-  // not cross a physical newline; `from/to` already delimit one source line.
-  while (p < to && stringutils::isWs(src[p]) && src[p] != '\n')
-    ++p;
-
-  if (p >= to || src[p] != '#')
-    return std::nullopt;
-  ++p;
-
-  // Both `#line` and `# line` are accepted spellings.  Clang/GCC also accept
-  // the numeric line-control form `# 123 "file"`, so leave `p` at the digits
-  // when there is no `line` keyword.
-  while (p < to && stringutils::isWs(src[p]) && src[p] != '\n')
-    ++p;
-
-  if (p + 4 <= to && src.substr(p, 4) == "line") {
-    p += 4;
-    if (p >= to || !stringutils::isWs(src[p]))
-      return std::nullopt;
-    while (p < to && stringutils::isWs(src[p]) && src[p] != '\n')
-      ++p;
-  }
-
-  const size_t lineStart = p;
-  while (p < to && std::isdigit(static_cast<unsigned char>(src[p])))
-    ++p;
-
-  if (p == lineStart)
-    return std::nullopt;
-
-  size_t lineAfter;
-  if (src.slice(lineStart, p).getAsInteger(10, lineAfter))
-    return std::nullopt;
-
-  while (p < to && stringutils::isWs(src[p]) && src[p] != '\n')
-    ++p;
-
-  // Parse the optional quoted filename operand.  Absence of this operand is
-  // semantically meaningful: `#line 200` changes only the logical line number
-  // and preserves the active logical file.
-  llvm::SmallString<64> fileSpelling;
-  bool hasFileSpelling = false;
-  if (p < to && src[p] == '"') {
-    hasFileSpelling = true;
-    ++p; // consume opening quote
-    while (p < to) {
-      char c = src[p++];
-      if (c == '"')
-        break;
-      if (c == '\\' && p < to) {
-        char escaped = src[p++];
-        if (escaped == 'x' || escaped == 'X') {
-          // #line filename operands are C string literals after macro
-          // expansion. Decode \x... to the logical filename byte before
-          // formatting a resync directive; otherwise __FILE__ observes the raw
-          // source spelling instead of the preprocessing result.
-          unsigned value = 0;
-          bool sawHex = false;
-          while (p < to && std::isxdigit(static_cast<unsigned char>(src[p]))) {
-            sawHex = true;
-            char h = src[p++];
-            value *= 16;
-            if (h >= '0' && h <= '9')
-              value += static_cast<unsigned>(h - '0');
-            else if (h >= 'a' && h <= 'f')
-              value += static_cast<unsigned>(10 + h - 'a');
-            else if (h >= 'A' && h <= 'F')
-              value += static_cast<unsigned>(10 + h - 'A');
-          }
-          if (sawHex) {
-            fileSpelling.push_back(static_cast<char>(value & 0xff));
-          } else {
-            fileSpelling.push_back(escaped);
-          }
-          continue;
-        }
-
-        if (escaped >= '0' && escaped <= '7') {
-          unsigned value = static_cast<unsigned>(escaped - '0');
-          for (unsigned digits = 1;
-               digits < 3 && p < to && src[p] >= '0' && src[p] <= '7';
-               ++digits) {
-            value = value * 8 + static_cast<unsigned>(src[p++] - '0');
-          }
-          fileSpelling.push_back(static_cast<char>(value & 0xff));
-          continue;
-        }
-
-        switch (escaped) {
-        case '"':
-        case '\\':
-        case '?':
-        case '\'':
-          fileSpelling.push_back(escaped);
-          break;
-        case 'a':
-          fileSpelling.push_back('\a');
-          break;
-        case 'b':
-          fileSpelling.push_back('\b');
-          break;
-        case 'e':
-        case 'E':
-          fileSpelling.push_back(static_cast<char>(0x1b));
-          break;
-        case 'f':
-          fileSpelling.push_back('\f');
-          break;
-        case 'n':
-          fileSpelling.push_back('\n');
-          break;
-        case 'r':
-          fileSpelling.push_back('\r');
-          break;
-        case 't':
-          fileSpelling.push_back('\t');
-          break;
-        case 'v':
-          fileSpelling.push_back('\v');
-          break;
-        default:
-          fileSpelling.push_back(escaped);
-          break;
-        }
-      } else {
-        fileSpelling.push_back(c);
-      }
-    }
-  }
-
-  const size_t afterDirectiveIdx =
-      (to < src.size() && src[to] == '\n') ? to + 1 : to;
-
-  return LineDirectiveState(std::string(fileSpelling.str()), lineAfter,
-                            afterDirectiveIdx, hasFileSpelling);
+  return parseLineDirectiveForLineControl(src, from, to);
 }
 
 std::string LineDirectiveInserter::EscapeForLineDirective(StringRef path) {

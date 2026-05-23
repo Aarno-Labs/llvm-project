@@ -6471,8 +6471,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
       debug("include/tu", "TU include expansion inc#{0} site=[{1},{2}) len={3}",
             inc->id, siteB, siteE, expText.size());
       LineDirectiveLocation parentResume =
-          LineDirectiveInserter::LogicalLocationAtOffset(tuBytes, siteE,
-                                                         tuPath);
+          LineDirectiveInserter::LogicalLocationAtOffset(tuBytes, siteE, tuPath,
+                                                         model_, tuPath);
       const bool sidebandOnly =
           classifyTUIncludeMaterializationWork(
               classifyTUIncludeMaterializationWork, inc->id) ==
@@ -6511,7 +6511,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
   // Apply TU edits in descending order of start offset.
   debug("tu/apply", "applying {0} TU edits", tuEdits.size());
   std::string tuResult = ApplyTextEditsWithPendingResync(
-      tuBytes, tuEdits, &appliedExpandedMacroRootIds, tuPath,
+      tuBytes, tuEdits, &appliedExpandedMacroRootIds, tuPath, std::nullopt,
       materializedEditMappings_);
   if (terminalFallbackRequested_)
     return std::string();
@@ -6554,6 +6554,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
       if (m.invB) {
         LineDirectiveLocation loc =
             LineDirectiveInserter::LogicalLocationAtOffset(tuBytes, *m.invB,
+                                                           tuPath, model_,
                                                            tuPath);
         if (lineDirs_.ToAbsolutePath(loc.fileSpelling) !=
             lineDirs_.ToAbsolutePath(tuPath))

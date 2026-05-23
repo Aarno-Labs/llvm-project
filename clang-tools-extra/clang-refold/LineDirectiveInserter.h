@@ -12,6 +12,8 @@ using namespace llvm;
 namespace clang {
 namespace refold {
 
+class RefoldModel;
+
 /// \brief Parsed state of an emitted #line directive sufficient to reason about
 /// whether a future directive would be a no-op.
 ///
@@ -131,26 +133,23 @@ public:
     return result;
   }
 
-  /// \brief Computes the logical parent location at `offset` in `src`.
+  /// \brief Computes the logical parent location using producer-proven
+  /// conditional activity from the refold map.
   ///
-  /// Include materialization needs to restore the includer's logical location
-  /// after replacing an `#include` line with header bytes. The correct resume
-  /// point is not always the physical TU line: a user-spelled `#line` directive
-  /// before the include may have already changed the active logical file/line
-  /// state.
+  /// Conditional groups are not re-evaluated from source text: a directive
+  /// effect is visible only when the RefoldModel proves that the directive byte
+  /// was executed for the requested owner file/include instance. Macro-state
+  /// directives use producer-observed MacroDirective items; line-control
+  /// directives use producer-proven selected conditional ownership.
   ///
-  /// This scan is intentionally complete for original source buffers: missing a
-  /// source-authored line-control directive can make a later `__LINE__` or
-  /// `__FILE__` expansion unsound. If the active directive has no filename
-  /// operand, the preprocessor preserves the current physical filename, so this
-  /// returns `defaultFileSpelling` with the directive-derived line number.
-  ///
-  /// \param src original source buffer
-  /// \param offset byte offset at which the next source byte would be emitted
-  /// \param defaultFileSpelling producer spelling for the physical source file
-  /// \return logical file/line state at `offset`
+  /// \param model producer refold map model containing conditional arm selection
+  /// \param ownerFile file whose bytes are being scanned
+  /// \param ownerIncludeId include instance that owns \p ownerFile, or
+  ///        std::nullopt for the TU owner
   static LineDirectiveLocation LogicalLocationAtOffset(
-      StringRef src, uint64_t offset, StringRef defaultFileSpelling);
+      StringRef src, uint64_t offset, StringRef defaultFileSpelling,
+      const RefoldModel &model, StringRef ownerFile,
+      std::optional<uint64_t> ownerIncludeId = std::nullopt);
 
   /// \brief Wraps a realized include expansion so the preprocessor logical
   /// file/line state matches the original header for the duration of the
