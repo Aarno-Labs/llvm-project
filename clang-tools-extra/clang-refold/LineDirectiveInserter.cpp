@@ -3,6 +3,7 @@
 #include "StringUtils.h"
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -599,6 +600,307 @@ static bool readDirectiveIdentifier(StringRef line, size_t &p, size_t to,
   return true;
 }
 
+
+struct LineControlConditionalFrame {
+  // Whether the enclosing conditional context was active when this group was
+  // entered.  If the parent is inactive, every arm in this group is inactive,
+  // but nested conditionals must still be tracked so the scanner can find the
+  // matching #endif.
+  bool parentActive = true;
+
+  // Whether the currently selected arm of this conditional group is active.
+  bool active = true;
+
+  // Whether any prior arm in this group has been selected while the parent was
+  // active.  #else/#elif use this to avoid executing multiple arms.
+  bool branchTaken = false;
+
+  bool sawElse = false;
+};
+
+static bool lineControlConditionalStackIsActive(
+    ArrayRef<LineControlConditionalFrame> stack) {
+  return stack.empty() || stack.back().active;
+}
+
+static std::optional<bool> parseSimpleLineControlIfTruth(StringRef expr);
+
+static bool outerParensEncloseWholeExpression(StringRef expr) {
+  if (expr.size() < 2 || expr.front() != '(' || expr.back() != ')')
+    return false;
+
+  unsigned depth = 0;
+  for (size_t i = 0; i < expr.size(); ++i) {
+    if (expr[i] == '(') {
+      ++depth;
+      continue;
+    }
+    if (expr[i] == ')') {
+      if (depth == 0)
+        return false;
+      --depth;
+      if (depth == 0 && i + 1 != expr.size())
+        return false;
+    }
+  }
+  return depth == 0;
+}
+
+static std::optional<size_t> findTopLevelLineControlOperator(StringRef expr,
+                                                             StringRef op) {
+  unsigned depth = 0;
+  for (size_t i = 0; i + op.size() <= expr.size(); ++i) {
+    if (expr[i] == '(') {
+      ++depth;
+      continue;
+    }
+    if (expr[i] == ')') {
+      if (depth > 0)
+        --depth;
+      continue;
+    }
+    if (depth == 0 && expr.substr(i, op.size()) == op)
+      return i;
+  }
+  return std::nullopt;
+}
+
+static std::optional<bool> parseSimpleLineControlIfTruth(StringRef expr) {
+  expr = trimHorizontal(expr);
+  while (outerParensEncloseWholeExpression(expr))
+    expr = trimHorizontal(expr.drop_front().drop_back());
+
+  if (expr.empty())
+    return false;
+
+  if (std::optional<size_t> pos = findTopLevelLineControlOperator(expr, "||")) {
+    std::optional<bool> lhs = parseSimpleLineControlIfTruth(expr.take_front(*pos));
+    std::optional<bool> rhs =
+        parseSimpleLineControlIfTruth(expr.drop_front(*pos + 2));
+    if (!lhs || !rhs)
+      return std::nullopt;
+    return *lhs || *rhs;
+  }
+
+  if (std::optional<size_t> pos = findTopLevelLineControlOperator(expr, "&&")) {
+    std::optional<bool> lhs = parseSimpleLineControlIfTruth(expr.take_front(*pos));
+    std::optional<bool> rhs =
+        parseSimpleLineControlIfTruth(expr.drop_front(*pos + 2));
+    if (!lhs || !rhs)
+      return std::nullopt;
+    return *lhs && *rhs;
+  }
+
+  if (expr.front() == '!') {
+    std::optional<bool> value = parseSimpleLineControlIfTruth(expr.drop_front());
+    if (!value)
+      return std::nullopt;
+    return !*value;
+  }
+
+  // The line-control scanner does not need a full C integer-expression engine.
+  // It only needs deterministic truth for the common directive guards that can
+  // make owner-local #define/#undef/#line directives active or inactive.  After
+  // macro expansion, undefined identifiers in #if expressions behave like 0;
+  // numeric constants use their ordinary base prefixes.
+  int64_t value = 0;
+  if (!expr.getAsInteger(0, value))
+    return value != 0;
+
+  size_t p = 0;
+  StringRef ident;
+  if (readDirectiveIdentifier(expr, p, expr.size(), ident) &&
+      trimHorizontal(expr.drop_front(p)).empty())
+    return false;
+
+  return std::nullopt;
+}
+
+static std::string replaceDefinedOperatorsInLineControlIf(
+    StringRef expr, const LineControlMacroMap &macros) {
+  std::string out;
+  out.reserve(expr.size());
+
+  for (size_t i = 0; i < expr.size();) {
+    if (copyQuotedLiteral(expr, i, out))
+      continue;
+
+    if (!stringutils::isIdentStart(expr[i])) {
+      out.push_back(expr[i++]);
+      continue;
+    }
+
+    size_t nameBegin = i++;
+    while (i < expr.size() && stringutils::isIdentPart(expr[i]))
+      ++i;
+    StringRef name = expr.slice(nameBegin, i);
+    if (name != "defined") {
+      out += name.str();
+      continue;
+    }
+
+    size_t p = i;
+    while (p < expr.size() && isHorizontalWhitespace(expr[p]))
+      ++p;
+
+    bool parenthesized = false;
+    if (p < expr.size() && expr[p] == '(') {
+      parenthesized = true;
+      ++p;
+      while (p < expr.size() && isHorizontalWhitespace(expr[p]))
+        ++p;
+    }
+
+    StringRef definedName;
+    size_t namePos = p;
+    if (!readDirectiveIdentifier(expr, p, expr.size(), definedName)) {
+      out += name.str();
+      i = namePos;
+      continue;
+    }
+
+    if (parenthesized) {
+      while (p < expr.size() && isHorizontalWhitespace(expr[p]))
+        ++p;
+      if (p >= expr.size() || expr[p] != ')') {
+        out += name.str();
+        i = namePos;
+        continue;
+      }
+      ++p;
+    }
+
+    out += macros.count(definedName.str()) ? "1" : "0";
+    i = p;
+  }
+
+  return out;
+}
+
+static bool evaluateLineControlIfDirective(
+    StringRef expr, const LineControlMacroMap &macros,
+    size_t logicalLineAtLineStart, StringRef activeFileSpelling) {
+  // `defined` is handled before ordinary macro expansion because the operand of
+  // defined is not macro-expanded by the preprocessor.  The remaining tokens are
+  // then expanded by the same owner-local macro evaluator used for #line
+  // operands, and a deliberately small integer truth parser handles the guard
+  // expressions this recovery pass can prove.
+  std::string withDefined =
+      replaceDefinedOperatorsInLineControlIf(expr, macros);
+  std::string expanded = expandLineControlMacros(StringRef(withDefined), macros,
+                                                 logicalLineAtLineStart,
+                                                 activeFileSpelling);
+  if (std::optional<bool> truth = parseSimpleLineControlIfTruth(expanded))
+    return *truth;
+
+  // Unknown conditional expressions are treated as active rather than guessed
+  // inactive.  That preserves the pre-existing conservative behavior for
+  // conditionals this owner-local recovery model cannot prove while still
+  // filtering the common, provable inactive arms (#if 0, #ifdef missing,
+  // #ifndef defined, and simple macro-valued #if expressions).
+  return true;
+}
+
+static bool readLineControlDirectiveAndOperand(StringRef line,
+                                               StringRef &directive,
+                                               StringRef &operand) {
+  const size_t to = line.size();
+  size_t p = 0;
+  if (!lineStartsWithHash(line, p, to))
+    return false;
+  if (!readDirectiveIdentifier(line, p, to, directive))
+    return false;
+  operand = line.substr(p);
+  return true;
+}
+
+static bool readFirstDirectiveIdentifierOperand(StringRef operand,
+                                                StringRef &ident) {
+  size_t p = 0;
+  while (p < operand.size() && isHorizontalWhitespace(operand[p]))
+    ++p;
+  return readDirectiveIdentifier(operand, p, operand.size(), ident);
+}
+
+static bool updateLineControlConditionalState(
+    StringRef line, std::vector<LineControlConditionalFrame> &stack,
+    const LineControlMacroMap &macros, size_t logicalLineAtLineStart,
+    StringRef activeFileSpelling) {
+  StringRef directive;
+  StringRef operand;
+  if (!readLineControlDirectiveAndOperand(line, directive, operand))
+    return false;
+
+  auto currentActive = [&]() { return lineControlConditionalStackIsActive(stack); };
+
+  if (directive == "if" || directive == "ifdef" || directive == "ifndef") {
+    const bool parentActive = currentActive();
+    bool condition = false;
+
+    if (parentActive) {
+      if (directive == "if") {
+        condition = evaluateLineControlIfDirective(
+            operand, macros, logicalLineAtLineStart, activeFileSpelling);
+      } else {
+        StringRef name;
+        if (readFirstDirectiveIdentifierOperand(operand, name))
+          condition = macros.count(name.str()) != 0;
+        if (directive == "ifndef")
+          condition = !condition;
+      }
+    }
+
+    LineControlConditionalFrame frame;
+    frame.parentActive = parentActive;
+    frame.active = parentActive && condition;
+    frame.branchTaken = frame.active;
+    stack.push_back(frame);
+    return true;
+  }
+
+  if (directive == "elif" || directive == "elifdef" || directive == "elifndef") {
+    if (stack.empty())
+      return true;
+
+    LineControlConditionalFrame &frame = stack.back();
+    bool condition = false;
+    if (frame.parentActive && !frame.branchTaken && !frame.sawElse) {
+      if (directive == "elif") {
+        condition = evaluateLineControlIfDirective(
+            operand, macros, logicalLineAtLineStart, activeFileSpelling);
+      } else {
+        StringRef name;
+        if (readFirstDirectiveIdentifierOperand(operand, name))
+          condition = macros.count(name.str()) != 0;
+        if (directive == "elifndef")
+          condition = !condition;
+      }
+    }
+    frame.active = frame.parentActive && !frame.branchTaken &&
+                   !frame.sawElse && condition;
+    frame.branchTaken = frame.branchTaken || frame.active;
+    return true;
+  }
+
+  if (directive == "else") {
+    if (stack.empty())
+      return true;
+    LineControlConditionalFrame &frame = stack.back();
+    frame.active = frame.parentActive && !frame.branchTaken && !frame.sawElse;
+    frame.branchTaken = frame.branchTaken || frame.active;
+    frame.sawElse = true;
+    return true;
+  }
+
+  if (directive == "endif") {
+    if (!stack.empty())
+      stack.pop_back();
+    return true;
+  }
+
+  return false;
+}
+
 // Update the owner-local macro environment from source directives that precede
 // the offset being queried.  Only definitions visible in the same source owner
 // are considered; this deliberately avoids importing cross-owner macro state
@@ -963,6 +1265,7 @@ LineDirectiveLocation LineDirectiveInserter::LogicalLocationAtOffset(
   bool sawLineDirective = false;
 
   LineControlMacroMap lineControlMacros;
+  std::vector<LineControlConditionalFrame> lineControlConditionals;
   for (size_t lineStart = 0; lineStart < prefix.size();) {
     std::string logicalLine;
     size_t afterLine = lineStart;
@@ -990,33 +1293,45 @@ LineDirectiveLocation LineDirectiveInserter::LogicalLocationAtOffset(
         activeAfterDirectiveIdx);
     StringRef activeFileForExpansion =
         activeFile ? StringRef(*activeFile) : defaultFileSpelling;
-    std::string expandedLine = expandSourceLineControlDirective(
-        StringRef(phase3Line), lineControlMacros, logicalLineAtLineStart,
-        activeFileForExpansion);
-    if (std::optional<LineDirectiveState> state =
-            ParseLineDirective(StringRef(expandedLine), 0,
-                               expandedLine.size())) {
-      sawLineDirective = true;
-      if (state->hasFileSpelling)
-        activeFile = state->fileSpelling;
-      // ParseLineDirective() sees the phase-adjusted logical directive line,
-      // so `state->lineAfterDir` is the numeric operand after macro expansion.
-      // That operand is not always the line observed by the next physical
-      // source line: if the directive spelling itself consumed extra physical
-      // lines through line splices or block comments, Clang advances the
-      // following source line by that physical span.  Record the adjusted
-      // post-directive line here so all later owner-local resync queries use
-      // the same line-control state the preprocessor would assign.
-      activeLineAfterDirective =
-          state->lineAfterDir +
-          physicalLineControlDirectiveAdjustment(prefix, lineStart, afterLine);
-      // The active line state starts after the whole physical directive,
-      // including any source lines consumed by phase-2 splices, not after the
-      // temporary expanded spelling used only for operand parsing.
-      activeAfterDirectiveIdx = afterLine;
-    }
+    const bool isConditionalDirective = updateLineControlConditionalState(
+        StringRef(phase3Line), lineControlConditionals, lineControlMacros,
+        logicalLineAtLineStart, activeFileForExpansion);
 
-    updateLineControlMacroEnvironment(StringRef(phase3Line), lineControlMacros);
+    // Inactive conditional arms are still scanned for nesting directives, but
+    // their #define/#undef/#line effects are not executed by the preprocessor.
+    // Applying those directives here would pollute the owner-local macro
+    // environment and recover line-control states that no real preprocessing
+    // execution could observe.
+    if (!isConditionalDirective &&
+        lineControlConditionalStackIsActive(lineControlConditionals)) {
+      std::string expandedLine = expandSourceLineControlDirective(
+          StringRef(phase3Line), lineControlMacros, logicalLineAtLineStart,
+          activeFileForExpansion);
+      if (std::optional<LineDirectiveState> state =
+              ParseLineDirective(StringRef(expandedLine), 0,
+                                 expandedLine.size())) {
+        sawLineDirective = true;
+        if (state->hasFileSpelling)
+          activeFile = state->fileSpelling;
+        // ParseLineDirective() sees the phase-adjusted logical directive line,
+        // so `state->lineAfterDir` is the numeric operand after macro expansion.
+        // That operand is not always the line observed by the next physical
+        // source line: if the directive spelling itself consumed extra physical
+        // lines through line splices or block comments, Clang advances the
+        // following source line by that physical span.  Record the adjusted
+        // post-directive line here so all later owner-local resync queries use
+        // the same line-control state the preprocessor would assign.
+        activeLineAfterDirective =
+            state->lineAfterDir +
+            physicalLineControlDirectiveAdjustment(prefix, lineStart, afterLine);
+        // The active line state starts after the whole physical directive,
+        // including any source lines consumed by phase-2 splices, not after the
+        // temporary expanded spelling used only for operand parsing.
+        activeAfterDirectiveIdx = afterLine;
+      }
+
+      updateLineControlMacroEnvironment(StringRef(phase3Line), lineControlMacros);
+    }
 
     if (afterLine >= prefix.size())
       break;
