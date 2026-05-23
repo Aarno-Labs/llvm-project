@@ -326,6 +326,28 @@ void RefoldEngine::MaterializeIncludeExpansion(
   // materializations participate in one overlap/resync pass.
   std::vector<TextEdit> edits;
 
+  auto includeInsertionPatchCarriesSidebandReplay =
+      [&](const SidebandPragmaEdit &sideband) -> bool {
+    if (editsIt == perInclude.end())
+      return false;
+
+    const auto sidebandB = sideband.MaterializedBByteRange();
+    for (const IncludePatch &patch : editsIt->second.patches) {
+      if (patch.aStart != patch.aEnd || patch.bStart >= patch.bEnd)
+        continue;
+      if (patch.bStart >= bTokOff_.size() || patch.bEnd > bTokOff_.size())
+        continue;
+
+      StringRef patchEnvelope =
+          sliceTokenEnvelope(bTokOff_, bSource_, patch.bStart, patch.bEnd);
+      const uint64_t patchB = bTokOff_[static_cast<size_t>(patch.bStart)];
+      const uint64_t patchE = patchB + patchEnvelope.size();
+      if (patchB <= sidebandB.first && sidebandB.second <= patchE)
+        return true;
+    }
+    return false;
+  };
+
   // 0) Sideband pragma edits owned by this include.  These pragmas were printed
   // verbatim in the raw `.i` replay surface but deliberately removed from the
   // normal A/B token streams before diffing.  When such a pragma lives in a
@@ -353,6 +375,23 @@ void RefoldEngine::MaterializeIncludeExpansion(
               .str());
       includeExpansion[includeId] = std::string();
       return;
+    }
+
+    if (includeInsertionPatchCarriesSidebandReplay(sideband)) {
+      // A header-prefix/suffix ordinary insertion patch uses the full B token
+      // envelope.  If that envelope already contains this sideband replay
+      // range, staging a second header-owned sideband edit would duplicate the
+      // pragma in the materialized header.  The sideband proof is still
+      // necessary for owner selection and token-stream normalization, but the
+      // include patch is the unique replay owner for the visible bytes.
+      trace("pragma/sideband",
+            "skip header-owned sideband pragma edit inc#{0} path='{1}' "
+            "site=[{2},{3}) because an include insertion patch already carries "
+            "B replay [{4},{5})",
+            includeId, headerPath, sourceRange.first, sourceRange.second,
+            sideband.MaterializedBByteRange().first,
+            sideband.MaterializedBByteRange().second);
+      continue;
     }
 
     auto hasCopiedHeaderSuffixAfterSidebandEdit = [&]() -> bool {

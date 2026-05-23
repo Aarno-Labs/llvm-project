@@ -893,8 +893,18 @@ collectJsonPragmaItems(const json::Object &rootJson, StringRef refoldMapPath) {
         const uint64_t extendedE = extendPragmaSourceRangeToLogicalDirective(
             StringRef(*sourceBytes), item.siteB, item.siteE);
         item.siteE = extendedE;
-        item.canonicalText = canonicalizeSidebandPragmaText(
+
+        // Prefer the producer-recorded replay text for matching.  A pragma
+        // produced by `_Pragma(...)` has source bytes such as `EMIT_PRAGMA`,
+        // while the replay surface contains `#pragma ...`.  The source range
+        // is still the correct edit target, but replacing the replay canonical
+        // text with the invocation spelling makes the sideband line
+        // unbindable and forces terminal fallback.  Only direct source
+        // `#pragma` directives are allowed to override the producer text.
+        std::string sourceCanonical = canonicalizeSidebandPragmaText(
             StringRef(*sourceBytes).slice(item.siteB, item.siteE));
+        if (StringRef(sourceCanonical).ltrim().starts_with("#pragma"))
+          item.canonicalText = std::move(sourceCanonical);
       }
     }
 
@@ -1544,6 +1554,43 @@ static std::vector<SidebandPragmaItemBinding> mapSidebandLinesToPragmaItems(
   return out;
 }
 
+/// Build the A-side owner-depth profile used by sideband normal-token LCS.
+///
+/// Sideband placement projects each B-side sideband line through the ordinary
+/// token LCS.  A plain token-only LCS is ambiguous when a B-side insertion
+/// introduces tokens that duplicate the first tokens of an included header,
+/// e.g. `int inserted; #pragma beta int value;`.  In that case mapping the
+/// header's original `int` to the inserted declaration's `int` moves the
+/// sideband insertion from the header boundary to the middle of the header.
+///
+/// Reuse the same small invariant as the main refolder: inserting across a
+/// deeper owner boundary is more expensive than inserting at the boundary.
+/// Interior gaps of include spans therefore carry positive depth, while the
+/// include boundary gaps remain zero.  This keeps the LCS deterministic and
+/// owner-polymorphic without peeking at pragma spelling or test-specific names.
+static std::vector<uint32_t> buildSidebandOwnerDepthGaps(
+    uint64_t tokenCount, ArrayRef<JsonIncludeItemForSideband> includes) {
+  std::vector<uint32_t> gaps(static_cast<size_t>(tokenCount + 1), 0);
+
+  for (const JsonIncludeItemForSideband &inc : includes) {
+    for (const JsonTokenSpanForSideband &span : inc.spans) {
+      const uint64_t begin = std::min<uint64_t>(span.begin, tokenCount);
+      const uint64_t end = std::min<uint64_t>(span.end, tokenCount);
+      if (begin >= end)
+        continue;
+
+      // Only gaps strictly inside the include are deeper than the parent
+      // owner.  The boundary gaps are left at the parent depth so a pure
+      // prefix/suffix insertion can remain a boundary insertion instead of
+      // being attracted into the header body by an equal-token tie.
+      for (uint64_t gap = begin + 1; gap < end; ++gap)
+        ++gaps[static_cast<size_t>(gap)];
+    }
+  }
+
+  return gaps;
+}
+
 /// Build source edits for sideband pragma changes and report whether the
 /// sideband stream was fully modeled.
 ///
@@ -1598,7 +1645,42 @@ static bool buildSidebandPragmaSourceEdits(
       buildNormalTokenRefsExcludingSideband(aLines, rawAToks, rawATokOff);
   std::vector<StringRef> normalB =
       buildNormalTokenRefsExcludingSideband(bLines, rawBToks, rawBTokOff);
-  std::vector<int64_t> normalA2B = diffutils::lcsMapAB(normalA, normalB);
+  std::vector<uint32_t> sidebandOwnerDepthGap =
+      buildSidebandOwnerDepthGaps(normalA.size(), includes);
+  std::vector<int64_t> normalA2B =
+      diffutils::lcsMapAB(normalA, normalB, sidebandOwnerDepthGap);
+  std::vector<diffutils::Hunk> normalHunks = diffutils::hunksFromMap(
+      normalA2B, normalA.size(), normalB.size());
+
+  auto sidebandInsertionIsCarriedByOrdinaryInsertion =
+      [&](uint64_t bStart, uint64_t bEnd) -> bool {
+    if (bStart >= bEnd || bEnd > bLines.size())
+      return false;
+
+    // B-only sideband lines can be replayed either by an explicit sideband
+    // source edit or by an ordinary insertion hunk whose token envelope already
+    // contains the raw sideband bytes.  For TU-owned pure insertions, prefer
+    // the ordinary hunk when it owns the same B normal-token gap; otherwise the
+    // same source byte receives two insertion edits with overlapping B replay
+    // witnesses.  Header-owned insertions still need the explicit include
+    // sideband proof so the include materializer can decide whether an
+    // include-local ordinary patch also carries the bytes.
+    for (uint64_t b = bStart; b < bEnd; ++b) {
+      const uint64_t gap = bLines[static_cast<size_t>(b)].normalTokenGap;
+      bool covered = false;
+      for (const diffutils::Hunk &normalHunk : normalHunks) {
+        if (!normalHunk.isInsertOnly() || normalHunk.bStart >= normalHunk.bEnd)
+          continue;
+        if (normalHunk.bStart <= gap && gap <= normalHunk.bEnd) {
+          covered = true;
+          break;
+        }
+      }
+      if (!covered)
+        return false;
+    }
+    return true;
+  };
 
   std::vector<std::string> aKeys;
   std::vector<std::string> bKeys;
@@ -1923,12 +2005,102 @@ static bool buildSidebandPragmaSourceEdits(
                                    insertedBlock->TakeReplay()};
   };
 
+  auto appendBarrierSeparatedReplacement = [&](const diffutils::Hunk &h) -> bool {
+    if (!h.isReplace() || h.aStart >= h.aEnd || h.bStart >= h.bEnd)
+      return false;
+
+    std::optional<SidebandBReplayBlockProof> bBlock =
+        proveBReplayBlock(h.bStart, h.bEnd);
+    if (!bBlock)
+      return false;
+
+    const uint64_t ownerGap = bBlock->OwnerGap();
+    std::vector<BoundSidebandSourceAtom> atoms;
+    atoms.reserve(static_cast<size_t>(h.aEnd - h.aStart));
+
+    bool sawPreservedDirectiveGap = false;
+    for (uint64_t a = h.aStart; a < h.aEnd; ++a) {
+      if (aLines[static_cast<size_t>(a)].normalTokenGap != ownerGap)
+        return false;
+      std::optional<BoundSidebandSourceAtom> atom = bindSourceAtom(a);
+      if (!atom || !atom->pragma)
+        return false;
+
+      if (!atoms.empty()) {
+        const BoundSidebandSourceAtom &prev = atoms.back();
+        if (prev.pragma->sitePath != atom->pragma->sitePath ||
+            prev.ownerIncludeId != atom->ownerIncludeId)
+          return false;
+        if (!sourceGapMaterialIsPreservable(
+                atom->pragma->sitePath, atom->ownerIncludeId,
+                prev.pragma->siteE, atom->pragma->siteB))
+          return false;
+        if (sourceIntervalContainsZeroTokenDirective(
+                atom->pragma->sitePath, atom->ownerIncludeId,
+                prev.pragma->siteE, atom->pragma->siteB, *sourcePath,
+                refoldMapPath, zeroTokenDirectives))
+          sawPreservedDirectiveGap = true;
+      }
+
+      atoms.push_back(*atom);
+    }
+
+    if (!sawPreservedDirectiveGap || atoms.empty())
+      return false;
+
+    // A replacement block cannot consume preserved macro-state directives that
+    // sit between the matched sideband atoms.  Instead, decompose the source
+    // side into atom-local edits: delete all earlier A-side atoms, then replay
+    // the complete B-side sideband block at the last atom.  The preserved
+    // zero-normal-token directive gap remains untouched and the sideband stream
+    // is still modeled as one contiguous B replay witness.
+    const size_t editsBefore = edits.size();
+    const uint64_t emptyBAnchor = bLines[static_cast<size_t>(h.bStart)].begin;
+    for (size_t i = 0; i + 1 < atoms.size(); ++i) {
+      const JsonPragmaItem *pragma = atoms[i].pragma;
+      if (!appendProvedSidebandEdit(
+              SidebandSourceProof::SourceAtom(
+                  pragma->sitePath, pragma->siteB, pragma->siteE,
+                  atoms[i].ownerIncludeId),
+              SidebandBReplayProof::EmptyAt(emptyBAnchor))) {
+        edits.erase(edits.begin() + editsBefore,
+                    edits.end());
+        return false;
+      }
+    }
+
+    const BoundSidebandSourceAtom &last = atoms.back();
+    if (!appendProvedSidebandEdit(
+            SidebandSourceProof::SourceAtom(
+                last.pragma->sitePath, last.pragma->siteB, last.pragma->siteE,
+                last.ownerIncludeId),
+            bBlock->TakeReplay())) {
+      edits.erase(edits.begin() + editsBefore,
+                  edits.end());
+      return false;
+    }
+    return true;
+  };
+
   auto appendOwnerLocalSidebandHunk = [&](const diffutils::Hunk &h) -> bool {
     if (h.isInsertOnly()) {
       std::optional<ProvedSidebandInsertion> insertion =
           proveInsertion(h.bStart, h.bEnd);
       if (!insertion)
         return false;
+
+      if (!insertion->source.OwnerIncludeId() &&
+          sidebandInsertionIsCarriedByOrdinaryInsertion(h.bStart, h.bEnd)) {
+        // The raw B bytes for this TU-owned sideband insertion are already
+        // inside the token envelope of an ordinary insertion hunk.  Emitting a
+        // second sideband edit at the same source byte would duplicate the
+        // directive and usually destroy the edit-map B witness.  Treat this as
+        // a discharged no-op sideband source edit: normalization has removed
+        // the sideband tokens from the token stream, and the ordinary hunk is
+        // now the sole replay owner for the visible bytes.
+        return true;
+      }
+
       return appendProvedSidebandEdit(std::move(insertion->source),
                                       std::move(insertion->replay));
     }
@@ -1959,10 +2131,13 @@ static bool buildSidebandPragmaSourceEdits(
         const uint64_t ownerGap = bBlock->OwnerGap();
         std::optional<SidebandSourceProof> source =
             proveSourceRun(h.aStart, h.aEnd, ownerGap);
-        if (appendProvedSidebandEdit(std::move(source),
+        if (source &&
+            appendProvedSidebandEdit(std::move(source),
                                      bBlock->TakeReplay()))
           return true;
       }
+      if (appendBarrierSeparatedReplacement(h))
+        return true;
       if ((h.aEnd - h.aStart) != (h.bEnd - h.bStart))
         return false;
       for (uint64_t a = h.aStart, b = h.bStart; a < h.aEnd; ++a, ++b) {

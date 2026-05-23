@@ -7459,6 +7459,39 @@ RefoldEngine::ClassifyOwnerWithSegments(StringRef tuPath,
               a0, rightInc, leftInc, rightInc);
         return Owner::Include(*rightInc);
       }
+
+      auto includeHasProvedSidebandInsertion = [&](uint64_t includeId) {
+        return llvm::any_of(sidebandPragmaEdits_,
+                            [&](const SidebandPragmaEdit &sideband) {
+          return sideband.TargetsInclude(includeId);
+        });
+      };
+
+      if (!leftInc && rightInc && includeHasProvedSidebandInsertion(*rightInc)) {
+        // A PP gap exactly at an include boundary is ambiguous in pure token
+        // space: a B-only insertion before the first header token may be a TU
+        // insertion before the #include or a header-prefix insertion that
+        // materializes the include.  When the same boundary also carries a
+        // proved header-owned sideband insertion, choose the include owner so
+        // the ordinary bytes and sideband bytes compose in one owner-local
+        // materialization proof instead of being split across TU and header
+        // surfaces.
+        trace("segments",
+              "    insertion gap PP={0} classified as INCLUDE id={1} "
+              "because a proved header sideband insertion targets the same "
+              "include boundary",
+              a0, *rightInc);
+        return Owner::Include(*rightInc);
+      }
+
+      if (leftInc && !rightInc && includeHasProvedSidebandInsertion(*leftInc)) {
+        trace("segments",
+              "    insertion gap PP={0} classified as INCLUDE id={1} "
+              "because a proved header sideband insertion targets the same "
+              "include boundary",
+              a0, *leftInc);
+        return Owner::Include(*leftInc);
+      }
     }
   }
 
