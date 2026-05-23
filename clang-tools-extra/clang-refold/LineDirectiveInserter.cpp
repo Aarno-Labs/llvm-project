@@ -625,94 +625,363 @@ static bool lineControlConditionalStackIsActive(
 
 static std::optional<bool> parseSimpleLineControlIfTruth(StringRef expr);
 
-static bool outerParensEncloseWholeExpression(StringRef expr) {
-  if (expr.size() < 2 || expr.front() != '(' || expr.back() != ')')
-    return false;
+/// Small integer-expression evaluator for conditional-inclusion guards seen
+/// while recovering source-authored line-control state.
+///
+/// This is not a replacement for Clang's preprocessor expression engine.  It is
+/// deliberately local to the `#line` recovery proof and recognizes the stable
+/// arithmetic/relational/logical subset needed to decide whether a preceding
+/// owner-local `#define`, `#undef`, or `#line` directive was actually executed.
+/// If the expression falls outside this subset, the caller treats the arm as
+/// active rather than guessing it inactive.
+class LineControlIfExpressionParser {
+public:
+  explicit LineControlIfExpressionParser(StringRef expr) : expr_(expr) {}
 
-  unsigned depth = 0;
-  for (size_t i = 0; i < expr.size(); ++i) {
-    if (expr[i] == '(') {
-      ++depth;
-      continue;
+  std::optional<int64_t> parseCompleteExpression() {
+    std::optional<int64_t> value = parseLogicalOr();
+    skipHorizontalWhitespace();
+    if (!value || pos_ != expr_.size())
+      return std::nullopt;
+    return value;
+  }
+
+private:
+  StringRef expr_;
+  size_t pos_ = 0;
+
+  void skipHorizontalWhitespace() {
+    while (pos_ < expr_.size() && isHorizontalWhitespace(expr_[pos_]))
+      ++pos_;
+  }
+
+  bool startsWith(StringRef op) const {
+    return pos_ + op.size() <= expr_.size() && expr_.substr(pos_, op.size()) == op;
+  }
+
+  bool consume(StringRef op) {
+    skipHorizontalWhitespace();
+    if (!startsWith(op))
+      return false;
+    pos_ += op.size();
+    return true;
+  }
+
+  bool consumeSingleCharOperator(char op, char doubledOp) {
+    skipHorizontalWhitespace();
+    if (pos_ >= expr_.size() || expr_[pos_] != op)
+      return false;
+    // Do not let the bitwise parser steal the first character of `&&` or `||`;
+    // those are handled at the logical-operator precedence levels above it.
+    if (pos_ + 1 < expr_.size() && expr_[pos_ + 1] == doubledOp)
+      return false;
+    ++pos_;
+    return true;
+  }
+
+  std::optional<int64_t> parseLogicalOr() {
+    std::optional<int64_t> lhs = parseLogicalAnd();
+    if (!lhs)
+      return std::nullopt;
+    while (consume("||")) {
+      std::optional<int64_t> rhs = parseLogicalAnd();
+      if (!rhs)
+        return std::nullopt;
+      lhs = ((*lhs != 0) || (*rhs != 0)) ? 1 : 0;
     }
-    if (expr[i] == ')') {
-      if (depth == 0)
-        return false;
-      --depth;
-      if (depth == 0 && i + 1 != expr.size())
-        return false;
+    return lhs;
+  }
+
+  std::optional<int64_t> parseLogicalAnd() {
+    std::optional<int64_t> lhs = parseBitwiseOr();
+    if (!lhs)
+      return std::nullopt;
+    while (consume("&&")) {
+      std::optional<int64_t> rhs = parseBitwiseOr();
+      if (!rhs)
+        return std::nullopt;
+      lhs = ((*lhs != 0) && (*rhs != 0)) ? 1 : 0;
+    }
+    return lhs;
+  }
+
+  std::optional<int64_t> parseBitwiseOr() {
+    std::optional<int64_t> lhs = parseBitwiseXor();
+    if (!lhs)
+      return std::nullopt;
+    while (consumeSingleCharOperator('|', '|')) {
+      std::optional<int64_t> rhs = parseBitwiseXor();
+      if (!rhs)
+        return std::nullopt;
+      lhs = *lhs | *rhs;
+    }
+    return lhs;
+  }
+
+  std::optional<int64_t> parseBitwiseXor() {
+    std::optional<int64_t> lhs = parseBitwiseAnd();
+    if (!lhs)
+      return std::nullopt;
+    while (consume("^")) {
+      std::optional<int64_t> rhs = parseBitwiseAnd();
+      if (!rhs)
+        return std::nullopt;
+      lhs = *lhs ^ *rhs;
+    }
+    return lhs;
+  }
+
+  std::optional<int64_t> parseBitwiseAnd() {
+    std::optional<int64_t> lhs = parseEquality();
+    if (!lhs)
+      return std::nullopt;
+    while (consumeSingleCharOperator('&', '&')) {
+      std::optional<int64_t> rhs = parseEquality();
+      if (!rhs)
+        return std::nullopt;
+      lhs = *lhs & *rhs;
+    }
+    return lhs;
+  }
+
+  std::optional<int64_t> parseEquality() {
+    std::optional<int64_t> lhs = parseRelational();
+    if (!lhs)
+      return std::nullopt;
+    for (;;) {
+      if (consume("==")) {
+        std::optional<int64_t> rhs = parseRelational();
+        if (!rhs)
+          return std::nullopt;
+        lhs = (*lhs == *rhs) ? 1 : 0;
+        continue;
+      }
+      if (consume("!=")) {
+        std::optional<int64_t> rhs = parseRelational();
+        if (!rhs)
+          return std::nullopt;
+        lhs = (*lhs != *rhs) ? 1 : 0;
+        continue;
+      }
+      return lhs;
     }
   }
-  return depth == 0;
-}
 
-static std::optional<size_t> findTopLevelLineControlOperator(StringRef expr,
-                                                             StringRef op) {
-  unsigned depth = 0;
-  for (size_t i = 0; i + op.size() <= expr.size(); ++i) {
-    if (expr[i] == '(') {
-      ++depth;
-      continue;
+  std::optional<int64_t> parseRelational() {
+    std::optional<int64_t> lhs = parseShift();
+    if (!lhs)
+      return std::nullopt;
+    for (;;) {
+      if (consume("<=")) {
+        std::optional<int64_t> rhs = parseShift();
+        if (!rhs)
+          return std::nullopt;
+        lhs = (*lhs <= *rhs) ? 1 : 0;
+        continue;
+      }
+      if (consume(">=")) {
+        std::optional<int64_t> rhs = parseShift();
+        if (!rhs)
+          return std::nullopt;
+        lhs = (*lhs >= *rhs) ? 1 : 0;
+        continue;
+      }
+      if (consume("<")) {
+        std::optional<int64_t> rhs = parseShift();
+        if (!rhs)
+          return std::nullopt;
+        lhs = (*lhs < *rhs) ? 1 : 0;
+        continue;
+      }
+      if (consume(">")) {
+        std::optional<int64_t> rhs = parseShift();
+        if (!rhs)
+          return std::nullopt;
+        lhs = (*lhs > *rhs) ? 1 : 0;
+        continue;
+      }
+      return lhs;
     }
-    if (expr[i] == ')') {
-      if (depth > 0)
-        --depth;
-      continue;
-    }
-    if (depth == 0 && expr.substr(i, op.size()) == op)
-      return i;
   }
-  return std::nullopt;
-}
+
+  std::optional<int64_t> parseShift() {
+    std::optional<int64_t> lhs = parseAdditive();
+    if (!lhs)
+      return std::nullopt;
+    for (;;) {
+      if (consume("<<")) {
+        std::optional<int64_t> rhs = parseAdditive();
+        if (!rhs || *rhs < 0 || *rhs >= 63)
+          return std::nullopt;
+        lhs = *lhs << *rhs;
+        continue;
+      }
+      if (consume(">>")) {
+        std::optional<int64_t> rhs = parseAdditive();
+        if (!rhs || *rhs < 0 || *rhs >= 63)
+          return std::nullopt;
+        lhs = *lhs >> *rhs;
+        continue;
+      }
+      return lhs;
+    }
+  }
+
+  std::optional<int64_t> parseAdditive() {
+    std::optional<int64_t> lhs = parseMultiplicative();
+    if (!lhs)
+      return std::nullopt;
+    for (;;) {
+      if (consume("+")) {
+        std::optional<int64_t> rhs = parseMultiplicative();
+        if (!rhs)
+          return std::nullopt;
+        lhs = *lhs + *rhs;
+        continue;
+      }
+      if (consume("-")) {
+        std::optional<int64_t> rhs = parseMultiplicative();
+        if (!rhs)
+          return std::nullopt;
+        lhs = *lhs - *rhs;
+        continue;
+      }
+      return lhs;
+    }
+  }
+
+  std::optional<int64_t> parseMultiplicative() {
+    std::optional<int64_t> lhs = parseUnary();
+    if (!lhs)
+      return std::nullopt;
+    for (;;) {
+      if (consume("*")) {
+        std::optional<int64_t> rhs = parseUnary();
+        if (!rhs)
+          return std::nullopt;
+        lhs = *lhs * *rhs;
+        continue;
+      }
+      if (consume("/")) {
+        std::optional<int64_t> rhs = parseUnary();
+        if (!rhs || *rhs == 0)
+          return std::nullopt;
+        lhs = *lhs / *rhs;
+        continue;
+      }
+      if (consume("%")) {
+        std::optional<int64_t> rhs = parseUnary();
+        if (!rhs || *rhs == 0)
+          return std::nullopt;
+        lhs = *lhs % *rhs;
+        continue;
+      }
+      return lhs;
+    }
+  }
+
+  std::optional<int64_t> parseUnary() {
+    skipHorizontalWhitespace();
+    if (consume("+"))
+      return parseUnary();
+    if (consume("-")) {
+      std::optional<int64_t> value = parseUnary();
+      if (!value)
+        return std::nullopt;
+      return -*value;
+    }
+    if (consume("!")) {
+      std::optional<int64_t> value = parseUnary();
+      if (!value)
+        return std::nullopt;
+      return *value == 0 ? 1 : 0;
+    }
+    if (consume("~")) {
+      std::optional<int64_t> value = parseUnary();
+      if (!value)
+        return std::nullopt;
+      return ~*value;
+    }
+    return parsePrimary();
+  }
+
+  std::optional<int64_t> parsePrimary() {
+    skipHorizontalWhitespace();
+    if (pos_ >= expr_.size())
+      return std::nullopt;
+
+    if (expr_[pos_] == '(') {
+      ++pos_;
+      std::optional<int64_t> value = parseLogicalOr();
+      skipHorizontalWhitespace();
+      if (pos_ >= expr_.size() || expr_[pos_] != ')')
+        return std::nullopt;
+      ++pos_;
+      return value;
+    }
+
+    if (stringutils::isIdentStart(expr_[pos_])) {
+      // After macro expansion and `defined` handling, remaining identifiers in
+      // #if expressions have preprocessing value zero.  Modeling that rule lets
+      // the owner-local scanner prove ordinary guards without importing Clang's
+      // full expression evaluator.
+      ++pos_;
+      while (pos_ < expr_.size() && stringutils::isIdentPart(expr_[pos_]))
+        ++pos_;
+      return 0;
+    }
+
+    if (expr_[pos_] == '\'' || expr_[pos_] == '"')
+      return std::nullopt;
+
+    return parseIntegerLiteral();
+  }
+
+  std::optional<int64_t> parseIntegerLiteral() {
+    skipHorizontalWhitespace();
+    const size_t literalBegin = pos_;
+    if (pos_ >= expr_.size() ||
+        !std::isdigit(static_cast<unsigned char>(expr_[pos_])))
+      return std::nullopt;
+
+    // Accept the integer spelling forms that commonly appear in preprocessing
+    // guards, then discard integer suffixes. We intentionally do not try to
+    // diagnose overflow exactly as Clang would; overflow or malformed spellings
+    // make the proof fail and leave the conditional conservatively active.
+    if (pos_ + 1 < expr_.size() && expr_[pos_] == '0' &&
+        (expr_[pos_ + 1] == 'x' || expr_[pos_ + 1] == 'X')) {
+      pos_ += 2;
+      const size_t digitsBegin = pos_;
+      while (pos_ < expr_.size() &&
+             std::isxdigit(static_cast<unsigned char>(expr_[pos_])))
+        ++pos_;
+      if (digitsBegin == pos_)
+        return std::nullopt;
+    } else {
+      while (pos_ < expr_.size() &&
+             std::isdigit(static_cast<unsigned char>(expr_[pos_])))
+        ++pos_;
+    }
+
+    const size_t digitEnd = pos_;
+    while (pos_ < expr_.size()) {
+      char c = expr_[pos_];
+      if (c != 'u' && c != 'U' && c != 'l' && c != 'L')
+        break;
+      ++pos_;
+    }
+
+    int64_t value = 0;
+    if (expr_.slice(literalBegin, digitEnd).getAsInteger(0, value))
+      return std::nullopt;
+    return value;
+  }
+};
 
 static std::optional<bool> parseSimpleLineControlIfTruth(StringRef expr) {
-  expr = trimHorizontal(expr);
-  while (outerParensEncloseWholeExpression(expr))
-    expr = trimHorizontal(expr.drop_front().drop_back());
-
-  if (expr.empty())
-    return false;
-
-  if (std::optional<size_t> pos = findTopLevelLineControlOperator(expr, "||")) {
-    std::optional<bool> lhs = parseSimpleLineControlIfTruth(expr.take_front(*pos));
-    std::optional<bool> rhs =
-        parseSimpleLineControlIfTruth(expr.drop_front(*pos + 2));
-    if (!lhs || !rhs)
-      return std::nullopt;
-    return *lhs || *rhs;
-  }
-
-  if (std::optional<size_t> pos = findTopLevelLineControlOperator(expr, "&&")) {
-    std::optional<bool> lhs = parseSimpleLineControlIfTruth(expr.take_front(*pos));
-    std::optional<bool> rhs =
-        parseSimpleLineControlIfTruth(expr.drop_front(*pos + 2));
-    if (!lhs || !rhs)
-      return std::nullopt;
-    return *lhs && *rhs;
-  }
-
-  if (expr.front() == '!') {
-    std::optional<bool> value = parseSimpleLineControlIfTruth(expr.drop_front());
-    if (!value)
-      return std::nullopt;
-    return !*value;
-  }
-
-  // The line-control scanner does not need a full C integer-expression engine.
-  // It only needs deterministic truth for the common directive guards that can
-  // make owner-local #define/#undef/#line directives active or inactive.  After
-  // macro expansion, undefined identifiers in #if expressions behave like 0;
-  // numeric constants use their ordinary base prefixes.
-  int64_t value = 0;
-  if (!expr.getAsInteger(0, value))
-    return value != 0;
-
-  size_t p = 0;
-  StringRef ident;
-  if (readDirectiveIdentifier(expr, p, expr.size(), ident) &&
-      trimHorizontal(expr.drop_front(p)).empty())
-    return false;
-
+  LineControlIfExpressionParser parser(trimHorizontal(expr));
+  if (std::optional<int64_t> value = parser.parseCompleteExpression())
+    return *value != 0;
   return std::nullopt;
 }
 
