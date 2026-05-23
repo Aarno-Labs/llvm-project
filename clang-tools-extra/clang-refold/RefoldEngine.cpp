@@ -5831,6 +5831,11 @@ std::string RefoldEngine::RunSinglePassRefold() {
   // Cache for realized expansion text per include id.
   DenseMap<uint64_t, std::string> includeExpansion;
 
+  // Include-enter #line directives must point at the first source line emitted
+  // by a materialized header.  Leading sideband deletions can make that line
+  // greater than one, so cache the line witness next to the materialized bytes.
+  DenseMap<uint64_t, size_t> includeExpansionStartLineNos;
+
   // Every materialized include expansion also carries a normalized
   // accepted-result summary so the later TU/header emission boundary does not
   // have to reconstruct where that emitted non-terminal artifact came from.
@@ -5887,6 +5892,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
     debug("include/mat", "materialize seed include #{0}", incId);
     MaterializeIncludeExpansion(incId, perInclude, macroPatchesByOwner,
                                 children, includeExpansion,
+                                includeExpansionStartLineNos,
                                 includeExpansionAcceptedResults,
                                 &appliedExpandedMacroRootIds);
   }
@@ -6187,9 +6193,17 @@ std::string RefoldEngine::RunSinglePassRefold() {
         });
   };
 
-  // See the corresponding helper in MaterializeIncludeExpansion: only the
-  // sideband-pragma-only materialization class is allowed to suppress #line
-  // wrappers that ordinary --with-lines include materialization would emit.
+  auto includeHasOrdinaryReplayTokens = [&](uint64_t id) {
+    if (const auto *item = model_.GetIncludeById(id))
+      return item->cover.end > item->cover.begin;
+    return false;
+  };
+
+  // See the corresponding helper in MaterializeIncludeExpansion: only genuinely
+  // sideband-only owner replay is allowed to suppress #line wrappers that normal
+  // --with-lines include materialization would emit.  If the include contributes
+  // any ordinary PP tokens, replacing its directive with those header bytes is a
+  // real logical file transition and keeps the historical enter/exit wrapper.
   enum class TUIncludeMaterializationWorkClass { None, SidebandPragmaOnly,
                                                 Ordinary };
   auto classifyTUIncludeMaterializationWork =
@@ -6199,6 +6213,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
           return e.ownerIncludeId && *e.ownerIncludeId == id;
         });
     if (includeHasLineDirectiveForcingSidebandWork(id))
+      return TUIncludeMaterializationWorkClass::Ordinary;
+    if (sawSideband && includeHasOrdinaryReplayTokens(id))
       return TUIncludeMaterializationWorkClass::Ordinary;
     if (auto it = perInclude.find(id);
         it != perInclude.end() && !it->second.patches.empty())
@@ -6281,9 +6297,12 @@ std::string RefoldEngine::RunSinglePassRefold() {
           classifyTUIncludeMaterializationWork(
               classifyTUIncludeMaterializationWork, inc->id) ==
           TUIncludeMaterializationWorkClass::SidebandPragmaOnly;
+      const size_t childEntryLineNo =
+          includeExpansionStartLineNos.lookup(inc->id);
       std::string wrapped = WrapIncludeExpansionForMaterialization(
           *inc, parentResume.fileSpelling, std::nullopt, siteE,
-          parentResume.lineNo, expText, sidebandOnly);
+          childEntryLineNo ? childEntryLineNo : 1, parentResume.lineNo,
+          expText, sidebandOnly);
       TextEdit edit{siteB,        siteE,        std::move(wrapped),
                     std::nullopt, std::nullopt, {}};
       auto itAccepted = includeExpansionAcceptedResults.find(incId);

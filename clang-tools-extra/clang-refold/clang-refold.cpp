@@ -249,6 +249,7 @@ void lexPPTokens(const std::string &bytes, std::vector<PPTok> &out,
 /// zero-token source artifacts rather than forcing whole-file fallback.
 struct SidebandPragmaLine {
   std::string text;
+  std::string canonicalText;
   uint64_t begin = 0;
   uint64_t end = 0;
   uint64_t normalTokenGap = 0;
@@ -257,6 +258,7 @@ struct SidebandPragmaLine {
 struct JsonPragmaItem {
   uint64_t id = 0;
   std::string text;
+  std::string canonicalText;
   std::string sitePath;
   uint64_t siteB = 0;
   uint64_t siteE = 0;
@@ -302,6 +304,254 @@ struct SidebandPragmaItemBinding {
   std::optional<uint64_t> ownerIncludeId = std::nullopt;
 };
 
+
+static bool physicalLineEndsWithSplice(StringRef bytes, uint64_t lineBegin,
+                                       uint64_t lineEnd) {
+  if (lineEnd <= lineBegin)
+    return false;
+
+  uint64_t p = lineEnd;
+  if (p > lineBegin && bytes[p - 1] == '\n')
+    --p;
+  if (p > lineBegin && bytes[p - 1] == '\r')
+    --p;
+  return p > lineBegin && bytes[p - 1] == '\\';
+}
+
+/// Extend a recorded pragma source range to cover the whole physical directive.
+///
+/// Some producer maps record the spelling/range delivered to the pragma callback
+/// rather than the complete source directive after physical line splicing.  A
+/// continued directive such as `#pragma vendor x \\` followed by `y` therefore
+/// needs its edit range extended over the continuation line; otherwise a
+/// sideband deletion would remove only the first physical line and leave a stale
+/// continuation fragment in source.
+static uint64_t extendPragmaSourceRangeToLogicalDirective(StringRef bytes,
+                                                          uint64_t begin,
+                                                          uint64_t end) {
+  if (begin >= bytes.size())
+    return end;
+
+  uint64_t curBegin = begin;
+  uint64_t curEnd = std::min<uint64_t>(end, bytes.size());
+  if (curEnd == begin || (curEnd < bytes.size() && bytes[curEnd - 1] != '\n')) {
+    size_t nl = bytes.find('\n', begin);
+    curEnd = nl == StringRef::npos ? bytes.size() : static_cast<uint64_t>(nl + 1);
+  }
+
+  while (physicalLineEndsWithSplice(bytes, curBegin, curEnd) &&
+         curEnd < bytes.size()) {
+    curBegin = curEnd;
+    size_t nl = bytes.find('\n', curBegin);
+    curEnd = nl == StringRef::npos ? bytes.size() : static_cast<uint64_t>(nl + 1);
+  }
+  return curEnd;
+}
+
+static std::string stripCCommentsForPragmaCanonicalization(StringRef text) {
+  std::string out;
+  out.reserve(text.size());
+  enum class State { Normal, StringLiteral, CharLiteral } state = State::Normal;
+
+  for (size_t i = 0; i < text.size(); ++i) {
+    const char c = text[i];
+    if (state == State::StringLiteral) {
+      out.push_back(c);
+      if (c == '\\' && i + 1 < text.size())
+        out.push_back(text[++i]);
+      else if (c == '"')
+        state = State::Normal;
+      continue;
+    }
+    if (state == State::CharLiteral) {
+      out.push_back(c);
+      if (c == '\\' && i + 1 < text.size())
+        out.push_back(text[++i]);
+      else if (c == '\'')
+        state = State::Normal;
+      continue;
+    }
+
+    if (c == '"') {
+      state = State::StringLiteral;
+      out.push_back(c);
+      continue;
+    }
+    if (c == '\'') {
+      state = State::CharLiteral;
+      out.push_back(c);
+      continue;
+    }
+    if (c == '/' && i + 1 < text.size() && text[i + 1] == '*') {
+      out.push_back(' ');
+      i += 2;
+      while (i + 1 < text.size() && !(text[i] == '*' && text[i + 1] == '/'))
+        ++i;
+      if (i + 1 < text.size())
+        ++i;
+      continue;
+    }
+    if (c == '/' && i + 1 < text.size() && text[i + 1] == '/') {
+      out.push_back(' ');
+      while (i < text.size() && text[i] != '\n')
+        ++i;
+      if (i < text.size())
+        out.push_back('\n');
+      continue;
+    }
+    out.push_back(c);
+  }
+  return out;
+}
+
+static std::string collapsePragmaWhitespacePreservingLiterals(StringRef text) {
+  std::string out;
+  out.reserve(text.size());
+  enum class State { Normal, StringLiteral, CharLiteral } state = State::Normal;
+  bool pendingSpace = false;
+
+  for (size_t i = 0; i < text.size(); ++i) {
+    const char c = text[i];
+    if (state == State::StringLiteral) {
+      if (pendingSpace && !out.empty()) {
+        out.push_back(' ');
+        pendingSpace = false;
+      }
+      out.push_back(c);
+      if (c == '\\' && i + 1 < text.size())
+        out.push_back(text[++i]);
+      else if (c == '"')
+        state = State::Normal;
+      continue;
+    }
+    if (state == State::CharLiteral) {
+      if (pendingSpace && !out.empty()) {
+        out.push_back(' ');
+        pendingSpace = false;
+      }
+      out.push_back(c);
+      if (c == '\\' && i + 1 < text.size())
+        out.push_back(text[++i]);
+      else if (c == '\'')
+        state = State::Normal;
+      continue;
+    }
+
+    if (stringutils::isNonNewlineWs(c) || c == '\n' || c == '\r') {
+      pendingSpace = true;
+      continue;
+    }
+    if (pendingSpace && !out.empty())
+      out.push_back(' ');
+    pendingSpace = false;
+
+    out.push_back(c);
+    if (c == '"')
+      state = State::StringLiteral;
+    else if (c == '\'')
+      state = State::CharLiteral;
+  }
+
+  while (!out.empty() && out.back() == ' ')
+    out.pop_back();
+  return out;
+}
+
+/// Convert a physical or replayed pragma directive spelling to the canonical
+/// sideband identity used for matching.
+///
+/// The source edit range and the replay identity are different facts.  The edit
+/// range must preserve the full physical directive, including comments and line
+/// continuations, but sideband matching must use the canonical spelling printed
+/// in raw `.i`: comments removed, continued physical lines spliced, and ordinary
+/// pragma whitespace normalized.  Keeping those facts separate collapses the
+/// trailing-comment and line-continuation cases into the same invariant as all
+/// other sideband pragma edits.
+static std::string canonicalizeSidebandPragmaText(StringRef text) {
+  std::string spliced;
+  spliced.reserve(text.size());
+  for (size_t i = 0; i < text.size(); ++i) {
+    if (text[i] == '\\') {
+      size_t j = i + 1;
+      if (j < text.size() && text[j] == '\r')
+        ++j;
+      if (j < text.size() && text[j] == '\n') {
+        spliced.push_back(' ');
+        i = j;
+        continue;
+      }
+    }
+    spliced.push_back(text[i]);
+  }
+
+  std::string noComments =
+      stripCCommentsForPragmaCanonicalization(StringRef(spliced));
+  StringRef body(noComments);
+  body = body.trim();
+
+  if (body.empty())
+    return "\n";
+
+  size_t i = 0;
+  while (i < body.size() && stringutils::isNonNewlineWs(body[i]))
+    ++i;
+  if (i < body.size() && body[i] == '#')
+    ++i;
+  while (i < body.size() && stringutils::isNonNewlineWs(body[i]))
+    ++i;
+  StringRef Pragma("pragma");
+  if (body.size() - i >= Pragma.size() &&
+      body.substr(i, Pragma.size()) == Pragma &&
+      (body.size() == i + Pragma.size() ||
+       !stringutils::isIdentPart(body[i + Pragma.size()]))) {
+    i += Pragma.size();
+    while (i < body.size() && stringutils::isNonNewlineWs(body[i]))
+      ++i;
+    std::string rest = collapsePragmaWhitespacePreservingLiterals(body.substr(i));
+    if (rest.empty())
+      return "#pragma\n";
+    return ("#pragma " + rest + "\n");
+  }
+
+  std::string collapsed = collapsePragmaWhitespacePreservingLiterals(body);
+  return collapsed + "\n";
+}
+
+static std::optional<std::string> readFileForSidebandCanonicalization(StringRef path) {
+  auto bufOrErr = MemoryBuffer::getFile(path);
+  if (!bufOrErr)
+    return std::nullopt;
+  return (*bufOrErr)->getBuffer().str();
+}
+
+static std::optional<std::string> readMappedSourceFileForSideband(
+    StringRef sitePath, StringRef rootSourcePath, StringRef refoldMapPath) {
+  if (auto bytes = readFileForSidebandCanonicalization(sitePath))
+    return bytes;
+
+  if (!rootSourcePath.empty()) {
+    SmallString<256> candidate(rootSourcePath);
+    llvm::sys::path::remove_filename(candidate);
+    if (!candidate.empty()) {
+      llvm::sys::path::append(candidate, sitePath);
+      if (auto bytes = readFileForSidebandCanonicalization(candidate))
+        return bytes;
+    }
+  }
+
+  if (!refoldMapPath.empty()) {
+    SmallString<256> candidate(refoldMapPath);
+    llvm::sys::path::remove_filename(candidate);
+    if (!candidate.empty()) {
+      llvm::sys::path::append(candidate, sitePath);
+      if (auto bytes = readFileForSidebandCanonicalization(candidate))
+        return bytes;
+    }
+  }
+
+  return std::nullopt;
+}
+
 /// Return true iff a physical line is a preserved pragma directive line.
 ///
 /// This recognizes only `#pragma` after optional horizontal indentation.  It is
@@ -342,6 +592,7 @@ collectSidebandPragmaLines(StringRef bytes) {
     if (isSidebandPragmaLine(line)) {
       SidebandPragmaLine rec;
       rec.text = bytes.slice(begin, end).str();
+      rec.canonicalText = canonicalizeSidebandPragmaText(rec.text);
       rec.begin = static_cast<uint64_t>(begin);
       rec.end = static_cast<uint64_t>(end);
       out.push_back(std::move(rec));
@@ -552,11 +803,12 @@ static std::optional<uint64_t> projectBGapToAGap(ArrayRef<int64_t> aToB,
 }
 
 static std::vector<JsonPragmaItem>
-collectJsonPragmaItems(const json::Object &rootJson) {
+collectJsonPragmaItems(const json::Object &rootJson, StringRef refoldMapPath) {
   std::vector<JsonPragmaItem> out;
   const json::Array *items = rootJson.getArray("items");
   if (!items)
     return out;
+  StringRef rootSourcePath = rootJson.getString("source").value_or(StringRef());
 
   for (const json::Value &value : *items) {
     const json::Object *obj = value.getAsObject();
@@ -585,9 +837,22 @@ collectJsonPragmaItems(const json::Object &rootJson) {
     JsonPragmaItem item;
     item.id = static_cast<uint64_t>(*id);
     item.text = text->str();
+    item.canonicalText = canonicalizeSidebandPragmaText(item.text);
     item.sitePath = path->str();
     item.siteB = static_cast<uint64_t>(*b);
     item.siteE = static_cast<uint64_t>(*e);
+
+    if (auto sourceBytes = readMappedSourceFileForSideband(
+            item.sitePath, rootSourcePath, refoldMapPath)) {
+      if (item.siteB <= item.siteE && item.siteE <= sourceBytes->size()) {
+        const uint64_t extendedE = extendPragmaSourceRangeToLogicalDirective(
+            StringRef(*sourceBytes), item.siteB, item.siteE);
+        item.siteE = extendedE;
+        item.canonicalText = canonicalizeSidebandPragmaText(
+            StringRef(*sourceBytes).slice(item.siteB, item.siteE));
+      }
+    }
+
     if (auto owner = obj->getInteger("owner_include_id"))
       if (*owner >= 0)
         item.ownerIncludeId = static_cast<uint64_t>(*owner);
@@ -936,7 +1201,7 @@ static std::vector<SidebandPragmaItemBinding> mapSidebandLinesToPragmaItems(
 
     for (size_t j = 0; j < pragmas.size(); ++j) {
       const JsonPragmaItem &pragma = pragmas[j];
-      if (pragma.text != lines[i].text)
+      if (pragma.canonicalText != lines[i].canonicalText)
         continue;
 
       std::optional<uint64_t> owner = inferHeaderPragmaOwnerForOccurrence(
@@ -1013,7 +1278,8 @@ static std::vector<SidebandPragmaItemBinding> mapSidebandLinesToPragmaItems(
 /// remain fail-closed so the caller can route them through the existing fallback
 /// path instead of manufacturing a source placement.
 static bool buildSidebandPragmaSourceEdits(
-    const json::Object &rootJson, ArrayRef<SidebandPragmaLine> aLines,
+    const json::Object &rootJson, StringRef refoldMapPath,
+    ArrayRef<SidebandPragmaLine> aLines,
     ArrayRef<SidebandPragmaLine> bLines, ArrayRef<PPTok> rawAToks,
     ArrayRef<std::size_t> rawATokOff, StringRef bBytes,
     ArrayRef<PPTok> rawBToks, ArrayRef<std::size_t> rawBTokOff,
@@ -1022,7 +1288,7 @@ static bool buildSidebandPragmaSourceEdits(
   if (aLines.empty() && bLines.empty())
     return false;
 
-  std::vector<JsonPragmaItem> pragmas = collectJsonPragmaItems(rootJson);
+  std::vector<JsonPragmaItem> pragmas = collectJsonPragmaItems(rootJson, refoldMapPath);
   std::vector<JsonIncludeItemForSideband> includes =
       collectJsonIncludesForSideband(rootJson);
   std::vector<JsonTokMapEntryForSideband> tokmap =
@@ -1051,14 +1317,16 @@ static bool buildSidebandPragmaSourceEdits(
   bTextRefs.reserve(bLines.size());
 
   for (const auto &line : aLines)
-    aKeys.push_back(std::to_string(line.normalTokenGap) + "\x1f" + line.text);
+    aKeys.push_back(std::to_string(line.normalTokenGap) + "\x1f" +
+                    line.canonicalText);
 
   for (const auto &line : bLines) {
     std::optional<uint64_t> projectedGap =
         projectBGapToAGap(normalA2B, line.normalTokenGap);
     if (!projectedGap)
       return false;
-    bKeys.push_back(std::to_string(*projectedGap) + "\x1f" + line.text);
+    bKeys.push_back(std::to_string(*projectedGap) + "\x1f" +
+                    line.canonicalText);
   }
 
   for (const auto &key : aKeys)
@@ -2311,7 +2579,7 @@ int main(int argc, char **argv) {
 
     if (!aSidebandPragmas.empty() || !bSidebandPragmas.empty()) {
       if (buildSidebandPragmaSourceEdits(
-              rootJson, aSidebandPragmas, bSidebandPragmas, aToks,
+              rootJson, RefoldJSONPath, aSidebandPragmas, bSidebandPragmas, aToks,
               aTokByteOff, bBytes, bToks, bTokByteOff,
               sidebandPragmaEdits)) {
         // Keep the raw `.i` byte buffers intact, but remove preserved pragma

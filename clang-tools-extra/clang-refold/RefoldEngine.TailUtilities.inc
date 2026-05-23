@@ -189,7 +189,7 @@ bool RefoldEngine::OwnerSuffixHasLineStateSensitiveBuiltin(
 std::string RefoldEngine::WrapIncludeExpansionForMaterialization(
     const RefoldModel::IncludeItem &child, StringRef parentFileSpelling,
     std::optional<uint64_t> parentOwnerIncludeId, uint64_t parentResumeOffset,
-    size_t parentResumeLineNo, StringRef childBody,
+    size_t childEntryLineNo, size_t parentResumeLineNo, StringRef childBody,
     bool allowUnobservableLineDirectiveSuppression) const {
   if (!lineDirs_.Enabled())
     return childBody.str();
@@ -202,8 +202,15 @@ std::string RefoldEngine::WrapIncludeExpansionForMaterialization(
     // Preserve the historical enter/exit wrapper so diagnostics and future
     // source-location-sensitive edits see the same owner transition.  Selective
     // suppression is reserved for the narrow sideband-pragma-only class below.
-    return lineDirs_.WrapIncludeExpansion(childFileSpelling, parentFileSpelling,
-                                          parentResumeLineNo, childBody);
+    std::string result;
+    result.reserve(childBody.size() + 128);
+    result += lineDirs_.FormatLineDirective(childEntryLineNo, childFileSpelling);
+    result += childBody.str();
+    if (!childBody.empty() && childBody.back() != '\n')
+      result += '\n';
+    result += lineDirs_.FormatLineDirective(parentResumeLineNo,
+                                            parentFileSpelling);
+    return result;
   }
 
   const bool childNeedsLineState =
@@ -226,7 +233,7 @@ std::string RefoldEngine::WrapIncludeExpansionForMaterialization(
   result.reserve(childBody.size() + 128);
 
   if (childNeedsLineState)
-    result += lineDirs_.FormatLineDirective(1, childFileSpelling);
+    result += lineDirs_.FormatLineDirective(childEntryLineNo, childFileSpelling);
 
   result += childBody.str();
 
@@ -254,6 +261,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
     const DenseMap<uint64_t, std::vector<const RefoldModel::IncludeItem *>>
         &children,
     DenseMap<uint64_t, std::string> &includeExpansion,
+    DenseMap<uint64_t, size_t> &includeExpansionStartLineNos,
     DenseMap<uint64_t, AcceptedResultCandidate>
         &includeExpansionAcceptedResults,
     DenseSet<uint64_t> *appliedExpandedMacroRootIds) const {
@@ -261,6 +269,10 @@ void RefoldEngine::MaterializeIncludeExpansion(
   // same child through recursive expansion, so avoid rebuilding already
   // materialized text.
   if (includeExpansion.count(includeId)) {
+    // Preseeded or previously materialized include bodies that do not carry a
+    // more precise source-line witness still enter at the header start.
+    if (!includeExpansionStartLineNos.count(includeId))
+      includeExpansionStartLineNos[includeId] = 1;
     debug("include/mat", "SKIP inc#{0} (already materialized)", includeId);
     return;
   }
@@ -411,6 +423,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
         if (auto realized = BuildInlineIncludeRealizationFromB(
                 *inc, plan.realizationReason, &realizationCandidate)) {
           includeExpansion[includeId] = std::move(*realized);
+          includeExpansionStartLineNos[includeId] = 1;
           includeExpansionAcceptedResults[includeId] =
               std::move(realizationCandidate);
           return;
@@ -451,16 +464,27 @@ void RefoldEngine::MaterializeIncludeExpansion(
     });
   };
 
+  auto includeHasOrdinaryReplayTokens = [&](uint64_t id) {
+    if (const auto *item = model_.GetIncludeById(id))
+      return item->cover.end > item->cover.begin;
+    return false;
+  };
+
   // A sideband-only include materialization is the one class where omitting
-  // otherwise-unobservable #line wrappers is intentional: the include is being
-  // materialized solely to delete/replace preserved unknown pragma text that
-  // was printed in `.i` but excluded from the normal token stream.  Any ordinary
-  // include patch or macro patch re-enters the historical --with-lines policy.
+  // otherwise-unobservable #line wrappers is intentional.  The invariant is not
+  // "materialized because of a sideband edit"; it is stricter: the materialized
+  // owner must have no ordinary PP-token replay of its own.  Once we emit normal
+  // header tokens while replacing an include directive, --with-lines must preserve
+  // the historical enter/exit file transition even if no current token observes
+  // that state.  Ordinary include patches, macro patches, B-only header sideband
+  // insertions, and non-empty include token covers all re-enter that policy.
   enum class MaterializationWorkClass { None, SidebandPragmaOnly, Ordinary };
   auto classifyMaterializationWork =
       [&](auto &&self, uint64_t id) -> MaterializationWorkClass {
     bool sawSideband = includeHasSidebandPragmaWork(id);
     if (includeHasLineDirectiveForcingSidebandWork(id))
+      return MaterializationWorkClass::Ordinary;
+    if (sawSideband && includeHasOrdinaryReplayTokens(id))
       return MaterializationWorkClass::Ordinary;
     if (auto it = perInclude.find(id);
         it != perInclude.end() && !it->second.patches.empty())
@@ -535,6 +559,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
       // complete before it is wrapped and inserted into the parent header.
       MaterializeIncludeExpansion(child->id, perInclude, macroPatchesByOwner,
                                   children, includeExpansion,
+                                  includeExpansionStartLineNos,
                                   includeExpansionAcceptedResults,
                                   appliedExpandedMacroRootIds);
 
@@ -559,8 +584,11 @@ void RefoldEngine::MaterializeIncludeExpansion(
         const bool sidebandOnly =
             classifyMaterializationWork(classifyMaterializationWork, child->id) ==
             MaterializationWorkClass::SidebandPragmaOnly;
+        const size_t childEntryLineNo =
+            includeExpansionStartLineNos.lookup(child->id);
         std::string wrapped = WrapIncludeExpansionForMaterialization(
             *child, headerPath, includeId, child->siteE,
+            childEntryLineNo ? childEntryLineNo : 1,
             stringutils::lineAtOffset(bytes, child->siteE), childText,
             sidebandOnly);
         TextEdit edit{siteStart,    siteEnd,      std::move(wrapped),
@@ -602,6 +630,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
                     .str(),
                 &realizationCandidate)) {
           includeExpansion[includeId] = std::move(*realized);
+          includeExpansionStartLineNos[includeId] = 1;
           includeExpansionAcceptedResults[includeId] =
               std::move(realizationCandidate);
         } else {
@@ -611,6 +640,43 @@ void RefoldEngine::MaterializeIncludeExpansion(
       }
     }
   }
+
+  auto computeFirstEmittedHeaderLine = [&]() -> size_t {
+    if (edits.empty())
+      return 1;
+
+    SmallVector<const TextEdit *, 8> ordered;
+    ordered.reserve(edits.size());
+    for (const TextEdit &edit : edits)
+      ordered.push_back(&edit);
+    llvm::sort(ordered, [](const TextEdit *lhs, const TextEdit *rhs) {
+      if (lhs->start != rhs->start)
+        return lhs->start < rhs->start;
+      return lhs->end < rhs->end;
+    });
+
+    // Track the first physical line that will actually be emitted from the
+    // materialized header.  A leading sideband deletion consumes the directive
+    // line before wrapping, so the include-enter #line must name the first
+    // surviving source line, not blindly line 1 of the header.  A leading
+    // replacement still occupies the replaced directive's logical line.
+    uint64_t cursor = 0;
+    for (const TextEdit *edit : ordered) {
+      if (cursor < edit->start)
+        return stringutils::lineAtOffset(bytes, cursor);
+      if (cursor > edit->start)
+        continue;
+      if (!edit->text.empty())
+        return stringutils::lineAtOffset(bytes, edit->start);
+      cursor = std::max(cursor, edit->end);
+    }
+
+    if (cursor < bytes.size())
+      return stringutils::lineAtOffset(bytes, cursor);
+    return 1;
+  };
+
+  const size_t firstEmittedHeaderLine = computeFirstEmittedHeaderLine();
 
   debug("include/mat", "inc#{0} applying {1} header TextEdits", inc->id,
         edits.size());
@@ -626,6 +692,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
   }
 
   includeExpansion[includeId] = std::move(applied);
+  includeExpansionStartLineNos[includeId] = firstEmittedHeaderLine;
   includeExpansionAcceptedResults[includeId] =
       BuildAcceptedIncludeRealizationCandidate(
           AcceptedPathKind::IncludeMaterializedExpansion, *inc);

@@ -202,11 +202,11 @@ public:
     std::optional<uint64_t> ownerIncludeId = std::nullopt;
 
     /// True when this sideband edit is a B-only insertion that forces a real
-    /// header expansion.  Deleting or replacing an already-spelled sideband
-    /// pragma can use the sideband-only no-wrapper policy, but inserting a new
-    /// pragma into a header that also contributes ordinary tokens materializes
-    /// those ordinary header tokens as well and should keep the normal
-    /// --with-lines include enter/exit directives.
+    /// header expansion.  B-only header insertions necessarily materialize
+    /// surrounding header text and therefore must keep the normal --with-lines
+    /// include enter/exit directives.  Deletions and replacements are classified
+    /// by the owning include's ordinary-token cover: they may suppress wrappers
+    /// only for genuinely zero-normal-token, sideband-only owner replay.
     bool forceIncludeLineDirectiveWrappers = false;
 
     uint64_t materializedBByteBegin = 0;
@@ -4733,6 +4733,12 @@ private:
   /// \param includeExpansion    Cache/output: include ID → fully materialized
   ///                            header bytes; may be preseeded with raw header
   ///                            text.
+  /// \param includeExpansionStartLineNos
+  ///                            Cache/output: include ID → logical header line
+  ///                            of the first emitted materialized line.  This
+  ///                            can be greater than one when leading sideband
+  ///                            source lines are deleted before wrapping the
+  ///                            include with #line directives.
   /// \param appliedExpandedMacroRootIds Optional output set that, when non-null,
   ///                            records root macro invocation ids for macro
   ///                            patches that remain expanded after being applied
@@ -4744,6 +4750,7 @@ private:
       const DenseMap<uint64_t, std::vector<const RefoldModel::IncludeItem *>>
           &children,
       DenseMap<uint64_t, std::string> &includeExpansion,
+      DenseMap<uint64_t, size_t> &includeExpansionStartLineNos,
       DenseMap<uint64_t, AcceptedResultCandidate>
           &includeExpansionAcceptedResults,
       DenseSet<uint64_t> *appliedExpandedMacroRootIds = nullptr) const;
@@ -5041,14 +5048,17 @@ private:
   /// \brief Wrap materialized include text with the correct #line policy.
   ///
   /// Ordinary include materialization in --with-lines mode preserves the full
-  /// child-enter/parent-resume wrapper. The final boolean enables the narrower
+  /// child-enter/parent-resume wrapper.  The child-enter line is the logical
+  /// source line of the first emitted materialized header line, not blindly line
+  /// one: deleting a leading sideband directive must advance the enter line to
+  /// the first surviving header line.  The final boolean enables the narrower
   /// sideband-pragma-only suppression path, where wrappers are emitted only if
   /// recorded line/file-sensitive builtins can observe the logical-location
   /// transition.
   std::string WrapIncludeExpansionForMaterialization(
       const RefoldModel::IncludeItem &child, StringRef parentFileSpelling,
       std::optional<uint64_t> parentOwnerIncludeId, uint64_t parentResumeOffset,
-      size_t parentResumeLineNo, StringRef childBody,
+      size_t childEntryLineNo, size_t parentResumeLineNo, StringRef childBody,
       bool allowUnobservableLineDirectiveSuppression) const;
 
   /// \brief Applies a set of TextEdits to originalFileText, producing the final
