@@ -16,7 +16,6 @@
 RF_MARK(t25_after)
 
 int __refold_ins__t25_after = 0; /* pure insertion at after boundary for t25_after_marker */
-#line 18 "tu_if_def_cfgB_then_include_h3_elif_arm.c"
 int main(void) {
   return 0;
 }

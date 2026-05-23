@@ -10,7 +10,6 @@
 /*BOUNDARY:T07:INCLUDE-H4:BEGIN*/
 #include "h4_conditional_include.h"
 int __refold_ins__h4_end = 0; /* pure insertion at after boundary for h4_end_marker */
-#line 12 "include_h4_conditional_include_disabled.c"
 /*BOUNDARY:T07:INCLUDE-H4:END*/
 int t07_after_marker = 10;
 

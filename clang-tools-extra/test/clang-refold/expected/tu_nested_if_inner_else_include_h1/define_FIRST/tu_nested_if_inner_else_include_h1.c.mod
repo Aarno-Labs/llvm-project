@@ -13,13 +13,13 @@
 #else
 /*BOUNDARY:T26:INNER-ELSE:INCLUDE-H1:BEGIN*/
 int __refold_ins__h1_begin = 0; /* pure insertion at before boundary for h1_begin_marker */
-#line 15 "tu_nested_if_inner_else_include_h1.c"
 #include "h1.h"
 /*BOUNDARY:T26:INNER-ELSE:INCLUDE-H1:END*/
 #endif
 /*BOUNDARY:T26:INNER-IF:END*/
 #endif
 /*BOUNDARY:T26:OUTER-IF:END*/
+#line 21 "tu_nested_if_inner_else_include_h1.c"
 RF_MARK(t26_after)
 
 int main(void) {

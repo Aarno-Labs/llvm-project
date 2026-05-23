@@ -42,6 +42,7 @@
 //   "tokmap": [ TokMapEntry, ... ],         // A-token -> (file,[b,e)) mapping
 //   "slots":  [ Slot, ... ],                // explicit insertion anchors
 //   "conds":  [ Cond, ... ],                // conditional groups
+//   "line_controls": [ LineControlEvent, ... ] // active #line events
 //   "items":  [ Item, ... ]                 // macros/includes/defs/pragmas/files
 // }
 //
@@ -273,6 +274,13 @@ static constexpr const char *RefoldSchema = R"json(
         "$ref": "#/$defs/Cond"
       },
       "description": "Conditional groups (#if/#elif/#else/#endif) discovered in source files; used to deterministically place edits into the correct arm."
+    },
+    "line_controls": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/LineControlEvent"
+      },
+      "description": "Producer-proven active source #line / GNU line-marker events with post-expansion logical state. Optional for backward compatibility with older refold maps."
     },
     "items": {
       "type": "array",
@@ -1209,6 +1217,74 @@ static constexpr const char *RefoldSchema = R"json(
             "$ref": "#/$defs/PPSpan"
           },
           "description": "A-token spans emitted while the current TU (top-level) was active."
+        }
+      }
+    },
+    "LineControlEvent": {
+      "type": "object",
+      "required": [
+        "id",
+        "physical_file",
+        "site_b",
+        "site_e",
+        "active",
+        "producer_proven",
+        "logical_line_after",
+        "logical_file_after"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Stable line-control event id."
+        },
+        "physical_file": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Physical source file containing the directive site."
+        },
+        "site_b": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "Begin byte offset of the physical directive line, or null when unavailable."
+        },
+        "site_e": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "End byte offset of the physical directive line, or null when unavailable."
+        },
+        "active": {
+          "type": "boolean",
+          "description": "True iff Clang executed this line-control directive for this preprocessing run."
+        },
+        "producer_proven": {
+          "type": "boolean",
+          "description": "True iff the logical effect was recorded after Clang evaluated directive operands and conditional activity."
+        },
+        "logical_line_after": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Logical line number established for the next physical line after the directive."
+        },
+        "logical_file_after": {
+          "type": "string",
+          "description": "Logical file spelling established after the directive."
+        },
+        "owner_include_id": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Include item id that opened the physical file instance containing the directive."
+        },
+        "text": {
+          "type": "string",
+          "description": "Exact source text for the physical directive line when available."
         }
       }
     },

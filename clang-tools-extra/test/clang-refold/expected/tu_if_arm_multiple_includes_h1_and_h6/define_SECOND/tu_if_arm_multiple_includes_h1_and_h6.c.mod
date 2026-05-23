@@ -37,6 +37,7 @@ RF_MARK(t16_inside_if_after_includes)
 RF_PAYLOAD(t16_else)
 #endif
 /*BOUNDARY:T16:IF-GROUP:END*/
+#line 22 "tu_if_arm_multiple_includes_h1_and_h6.c"
 RF_MARK(t16_after)
 
 int main(void) {

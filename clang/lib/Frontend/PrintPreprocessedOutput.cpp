@@ -371,6 +371,9 @@ void PrintPPOutputPPCallbacks::FileChanged(SourceLocation Loc,
     SourceLocation IncludeLoc = UserLoc.getIncludeLoc();
     if (IncludeLoc.isValid())
       MoveToLine(IncludeLoc, /*RequireStartOfLine=*/false);
+  } else if (Reason == PPCallbacks::RenameFile) {
+    if (RefoldRecorder)
+      RefoldRecorder->onLineControlDirective(Loc);
   } else if (Reason == PPCallbacks::SystemHeaderPragma) {
     // `#pragma GCC system_header` is reported as a file-change reason rather
     // than through one of the ordinary pragma callbacks. Record it so the

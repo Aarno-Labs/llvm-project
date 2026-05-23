@@ -12,7 +12,6 @@
 RF_MARK(t12_after)
 
 int __refold_ins__t12_after = 0; /* pure insertion at after boundary for t12_after_marker */
-#line 14 "include_pragma_once_header_with_conditional.c"
 int main(void) {
   return 0;
 }

@@ -12,7 +12,6 @@
 RF_MARK(t21_after)
 
 int __refold_ins__t21_after = 0; /* pure insertion at after boundary for t21_after_marker */
-#line 14 "include_header_choose_include_else_h2a.c"
 int main(void) {
   return 0;
 }

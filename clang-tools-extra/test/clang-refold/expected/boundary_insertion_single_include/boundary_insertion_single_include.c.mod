@@ -3,6 +3,5 @@
 // test80: include boundary insertion (single include).
 #include "h80.h"
 int INS80_BOUNDARY = hdr80_val + 1;
-#line 5 "boundary_insertion_single_include.c"
 int TU80_START = 80;
 int main(){ return hdr80_val + TU80_START; }

@@ -21,7 +21,6 @@ RF_MARK(h4_begin)
 #if RF_ENABLE_EXTRA
   /*BOUNDARY:H4:IF-ARM:INCLUDE-H1:BEGIN*/
   int __refold_ins__h1_begin = 0; /* pure insertion at before boundary for h1_begin_marker */
-#line 11 "headers/h4_conditional_include.h"
 #include "h1.h"
   /*BOUNDARY:H4:IF-ARM:INCLUDE-H1:END*/
 #else
@@ -30,6 +29,7 @@ RF_MARK(h4_begin)
   /*BOUNDARY:H4:ELSE-ARM:PAYLOAD:END*/
 #endif
 
+#line 19 "headers/h4_conditional_include.h"
 RF_MARK(h4_end)
 /*BOUNDARY:H4:END*/
 

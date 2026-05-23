@@ -21,7 +21,6 @@
 RF_MARK(t26_after)
 
 int __refold_ins__t26_after = 0; /* pure insertion at after boundary for t26_after_marker */
-#line 23 "tu_nested_if_inner_else_include_h1.c"
 int main(void) {
   return 0;
 }

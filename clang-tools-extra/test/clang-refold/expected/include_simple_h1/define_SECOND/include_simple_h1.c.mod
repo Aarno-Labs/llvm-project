@@ -13,7 +13,6 @@
 int t01_after_marker = 10;
 
 int __refold_ins__t01_after = 0; /* pure insertion at after boundary for t01_after_marker */
-#line 15 "include_simple_h1.c"
 int main(void) {
   return 0;
 }

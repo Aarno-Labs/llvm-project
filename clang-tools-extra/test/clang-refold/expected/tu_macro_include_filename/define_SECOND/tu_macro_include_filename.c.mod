@@ -12,7 +12,6 @@
 RF_MARK(t18_after)
 
 int __refold_ins__t18_after = 0; /* pure insertion at after boundary for t18_after_marker */
-#line 14 "tu_macro_include_filename.c"
 int main(void) {
   return 0;
 }

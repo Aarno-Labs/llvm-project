@@ -1,5 +1,4 @@
 // RUN: %clang-refold-tester-with-lines header_zero_token_variadic_forward_gap
-#line 1 "headers/forward_gap.h"
 #define EMPTY
 #define FORWARD(...) __VA_ARGS__
 int x =

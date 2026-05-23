@@ -18,7 +18,6 @@
 RF_MARK(t23_after)
 
 int __refold_ins__t23_after = 0; /* pure insertion at after boundary for t23_after_marker */
-#line 20 "tu_if_arm_define_undef_directives.c"
 int main(void) {
   return 0;
 }

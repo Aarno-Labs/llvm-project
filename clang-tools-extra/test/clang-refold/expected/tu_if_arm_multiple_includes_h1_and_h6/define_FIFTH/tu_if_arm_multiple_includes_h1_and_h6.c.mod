@@ -22,7 +22,6 @@ RF_PAYLOAD(t16_else)
 RF_MARK(t16_after)
 
 int __refold_ins__t16_after = 0; /* pure insertion at after boundary for t16_after_marker */
-#line 24 "tu_if_arm_multiple_includes_h1_and_h6.c"
 int main(void) {
   return 0;
 }

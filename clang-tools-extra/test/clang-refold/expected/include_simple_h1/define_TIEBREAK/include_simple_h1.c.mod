@@ -9,7 +9,6 @@
 /*BOUNDARY:T01:INCLUDE-H1:BEGIN*/
 #include "h1.h"
 int __refold_ins__t01_after = 0; /* pure insertion at after boundary for t01_after_marker */
-#line 11 "include_simple_h1.c"
 /*BOUNDARY:T01:INCLUDE-H1:END*/
 
 int t01_after_marker = 10;

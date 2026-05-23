@@ -11,11 +11,11 @@
 /*BOUNDARY:T29:IFDEF:INCLUDE-H1:BEGIN*/
 int __refold_ins__h1_begin = 0; /* pure insertion at before boundary for h1_begin_marker */
 
-#line 12 "header_defines_flag_enables_ifdef_include_h1.c"
 #include "h1.h"
 /*BOUNDARY:T29:IFDEF:INCLUDE-H1:END*/
 #endif
 /*BOUNDARY:T29:IFDEF:END*/
+#line 16 "header_defines_flag_enables_ifdef_include_h1.c"
 RF_MARK(t29_after)
 
 int main(void) {

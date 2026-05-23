@@ -24,7 +24,6 @@ RF_PAYLOAD(t09_outer_else)
 RF_MARK(t09_after)
 
 int __refold_ins__t09_after = 0; /* pure insertion at after boundary for t09_after_marker */
-#line 26 "tu_nested_if_include_in_inner_if.c"
 int main(void) {
   return 0;
 }

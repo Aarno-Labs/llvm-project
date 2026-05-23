@@ -2499,6 +2499,158 @@ Expected<std::string> preprocessToBytes(StringRef inputPath, const PPCtx &ctx) {
   return out;
 }
 
+/// Write \p bytes to \p path as the source text that will be passed to
+/// Clang's preprocessor for final line-control pruning validation.
+static Error writePruneValidationSource(StringRef path, StringRef bytes) {
+  std::error_code ec;
+  raw_fd_ostream os(path, ec, sys::fs::OF_Text);
+  if (ec)
+    return createStringError(
+        ec, formatv("cannot write pruning validation source '{0}'", path));
+  os << bytes;
+  os.close();
+  if (os.has_error())
+    return createStringError(
+        os.error(),
+        formatv("failed to flush pruning validation source '{0}'", path));
+  return Error::success();
+}
+
+/// Return true iff two already-preprocessed `-E -P` byte streams have the same
+/// token sequence.
+///
+/// Final line-control pruning normally requires byte-for-byte preprocessing
+/// equivalence.  That is intentionally stronger than the refolding checker, but
+/// it is too strong for stale `#line` directives whose only remaining effect is
+/// Clang's cosmetic blank-line accounting around zero-token/comment-only source
+/// lines.  In those cases the correct semantic oracle is the same one used by
+/// `--check`: the emitted source must replay to the same preprocessed token
+/// stream, including any materialized `__LINE__`, `__FILE__`, and
+/// `__FILE_NAME__` expansions.
+static bool preprocessedTokensEqualForLinePrune(StringRef currentPP,
+                                                StringRef candidatePP,
+                                                const PPCtx &ctx,
+                                                std::string &reason) {
+  const LangOptions lexLang = RefoldEngine::MakeLexLangOptions(ctx.lang);
+  std::vector<PPTok> currentTokens;
+  std::vector<PPTok> candidateTokens;
+  std::vector<std::size_t> currentOffsets;
+  std::vector<std::size_t> candidateOffsets;
+
+  lexPPTokens(currentPP.str(), currentTokens, currentOffsets, lexLang);
+  lexPPTokens(candidatePP.str(), candidateTokens, candidateOffsets, lexLang);
+
+  const size_t n = std::min(currentTokens.size(), candidateTokens.size());
+  for (size_t i = 0; i < n; ++i) {
+    if (currentTokens[i].spelling == candidateTokens[i].spelling)
+      continue;
+
+    reason = formatv("preprocessed bytes differ and token streams differ at "
+                     "index {0}: current='{1}' candidate='{2}'",
+                     i,
+                     stringutils::showWs(stringutils::clip(
+                         StringRef(currentTokens[i].spelling), 100)),
+                     stringutils::showWs(stringutils::clip(
+                         StringRef(candidateTokens[i].spelling), 100)))
+                 .str();
+    return false;
+  }
+
+  if (currentTokens.size() != candidateTokens.size()) {
+    reason = formatv("preprocessed bytes differ and token counts differ: "
+                     "current={0} candidate={1}",
+                     currentTokens.size(), candidateTokens.size())
+                 .str();
+    return false;
+  }
+
+  reason.clear();
+  return true;
+}
+
+/// Create an internal final-pruning validation callback.
+///
+/// The callback does not implement a user-facing `--check` mode.  It is an
+/// executable guard for one proposed `#line` deletion: preprocess the current
+/// accepted final source and the candidate final source through the same
+/// `clang -E -P` context, using one stable temporary source path located beside
+/// `--out`.  Reusing the same source path for both inputs keeps `__FILE__` and
+/// quoted-include lookup comparable.  Byte-for-byte equality is accepted first;
+/// if the only difference is preprocessing trivia, token-sequence equality is
+/// also accepted because the refolding soundness oracle is token equivalence.
+static FinalLineControlValidationCallback
+buildFinalLineControlValidationCallback(StringRef outputPath,
+                                        const PPCtx &ctx) {
+  SmallString<256> outputDir(outputPath);
+  sys::path::remove_filename(outputDir);
+  if (outputDir.empty())
+    outputDir = ".";
+
+  SmallString<256> model(outputDir);
+  sys::path::append(model, ".clang-refold-line-prune-%%%%%%.c");
+  std::string modelText = model.str().str();
+
+  return [modelText, ctx](StringRef currentOutput, StringRef candidateOutput,
+                          std::string &reason) -> bool {
+    SmallString<256> tmpPath;
+    int tmpFD = -1;
+    if (std::error_code ec =
+            sys::fs::createUniqueFile(modelText, tmpFD, tmpPath)) {
+      reason = formatv("could not create pruning validation source '{0}': {1}",
+                       modelText, ec.message())
+                   .str();
+      return false;
+    }
+
+    {
+      raw_fd_ostream closeStream(tmpFD, /*shouldClose=*/true);
+      closeStream.close();
+    }
+
+    auto cleanup =
+        make_scope_exit([&]() { (void)sys::fs::remove(tmpPath); });
+
+    if (Error err = writePruneValidationSource(tmpPath, currentOutput)) {
+      reason = toString(std::move(err));
+      return false;
+    }
+
+    auto currentPPOrErr = preprocessToBytes(tmpPath, ctx);
+    if (!currentPPOrErr) {
+      reason = formatv("failed to preprocess current final source: {0}",
+                       toString(currentPPOrErr.takeError()))
+                   .str();
+      return false;
+    }
+
+    if (Error err = writePruneValidationSource(tmpPath, candidateOutput)) {
+      reason = toString(std::move(err));
+      return false;
+    }
+
+    auto candidatePPOrErr = preprocessToBytes(tmpPath, ctx);
+    if (!candidatePPOrErr) {
+      reason = formatv("failed to preprocess candidate final source: {0}",
+                       toString(candidatePPOrErr.takeError()))
+                   .str();
+      return false;
+    }
+
+    if (*currentPPOrErr != *candidatePPOrErr) {
+      if (!preprocessedTokensEqualForLinePrune(*currentPPOrErr,
+                                               *candidatePPOrErr, ctx,
+                                               reason))
+        return false;
+      reason.clear();
+      return true;
+    }
+
+    reason.clear();
+    return true;
+  };
+}
+
+
 static bool canIgnoreNoLinesMismatch(const PPTok &aTok, const PPTok &bTok) {
   if (aTok.kind != bTok.kind)
     return false;
@@ -3447,7 +3599,8 @@ int main(int argc, char **argv) {
   auto refoldedOrErr = RefoldEngine::Refold(
       rootJson, aBytes, aToks, aTokByteOff, bBytes, bToks, bTokByteOff,
       NoLines, StrictMode, sidebandPragmaEdits,
-      emitEditMap ? &materializedEditMappings : nullptr);
+      emitEditMap ? &materializedEditMappings : nullptr,
+      buildFinalLineControlValidationCallback(ModifiedSrcPath, ctx));
   if (!refoldedOrErr) {
     handleAllErrors(refoldedOrErr.takeError(), [&](const ErrorInfoBase &e) {
       fatal("model", "failed to parse refold model: {0}", e.message());

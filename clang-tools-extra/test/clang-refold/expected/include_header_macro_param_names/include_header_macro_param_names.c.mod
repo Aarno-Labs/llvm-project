@@ -9,7 +9,6 @@
 RF_MARK(t27_after)
 
 int __refold_ins__t27_after = 0; /* pure insertion at after boundary for t27_after_marker */
-#line 11 "include_header_macro_param_names.c"
 int main(void) {
   return 0;
 }

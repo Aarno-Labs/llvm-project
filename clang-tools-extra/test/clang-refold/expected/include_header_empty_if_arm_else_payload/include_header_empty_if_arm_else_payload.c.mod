@@ -10,7 +10,6 @@
 RF_MARK(t15_after)
 
 int __refold_ins__t15_after = 0; /* pure insertion at after boundary for t15_after_marker */
-#line 12 "include_header_empty_if_arm_else_payload.c"
 int main(void) {
   return 0;
 }

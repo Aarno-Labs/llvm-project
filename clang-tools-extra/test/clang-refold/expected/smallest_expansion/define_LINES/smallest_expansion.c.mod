@@ -1,4 +1,3 @@
-#line 1 "smallest_expansion.c"
 // RUN: %clang-refold-tester-with-lines smallest_expansion LINES
 // RUN: %clang-refold-tester smallest_expansion NOLINES
 #define FOO(x) ((x) * (x) + 2)

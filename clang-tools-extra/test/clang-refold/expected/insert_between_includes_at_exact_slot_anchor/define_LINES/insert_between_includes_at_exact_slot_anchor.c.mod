@@ -1,4 +1,3 @@
-#line 1 "insert_between_includes_at_exact_slot_anchor.c"
 // RUN: %clang-refold-tester-with-lines insert_between_includes_at_exact_slot_anchor LINES
 // RUN: %clang-refold-tester insert_between_includes_at_exact_slot_anchor NOLINES
 const char *s =

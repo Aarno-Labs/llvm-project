@@ -8,5 +8,4 @@ int ARM83_START = 1;
 int ARM83_START = 2;
 #endif
 int INS83_ARM_BOUNDARY = ARM83_START + 1;
-#line 10 "boundary_insertion_conditional_arm.c"
 int main(){ return ARM83_START; }

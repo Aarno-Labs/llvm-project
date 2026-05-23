@@ -12,7 +12,6 @@ int selected_value = __LINE__;
 int selected_value = __LINE__;
 #endif
 int selected_extra = 701;
-#line 702 "live-arm.c"
 
 #line LINE_TOKEN "post-branch.c"
 int post_value = __LINE__;

@@ -15,7 +15,6 @@
 /*BOUNDARY:H2:BEGIN*/
 RF_MARK(h2_begin)
 int __refold_ins__h2a_begin = 0; /* pure insertion at before boundary for h2a_begin_marker */
-#line 7 "headers/h2.h"
 #include "h2a.h"
 RF_PAYLOAD(h2)
 /*BOUNDARY:H2:END*/

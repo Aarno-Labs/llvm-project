@@ -22,7 +22,6 @@ RF_MARK(t22_if_before_include)
 /*BOUNDARY:H2:BEGIN*/
 RF_MARK(h2_begin)
 int __refold_ins__h2a_begin = 0; /* pure insertion at before boundary for h2a_begin_marker */
-#line 7 "headers/h2.h"
 #include "h2a.h"
 RF_PAYLOAD(h2)
 /*BOUNDARY:H2:END*/
@@ -33,6 +32,7 @@ RF_MARK(t22_if_after_include)
 /*BOUNDARY:T22:IF-ARM:END*/
 #endif
 /*BOUNDARY:T22:IF-GROUP:END*/
+#line 22 "tu_if_arm_include_h2_between_markers.c"
 RF_MARK(t22_after)
 
 int main(void) {

@@ -5374,6 +5374,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
 
   std::string mixedPreservedConditionalControlTrivia;
   SmallVector<TUPreservedGapPiece, 8> mixedPreservedZeroTokenGapPieces;
+  SmallVector<std::pair<uint64_t, uint64_t>, 4>
+      mixedPreservedSourceLineDirectiveGapPieces;
   std::optional<SourceLineDirectiveGapResume> mixedSourceLineDirectiveResume;
 
   auto lineDirectiveStartsAtPrefix = [&](uint64_t pos) -> bool {
@@ -5976,18 +5978,30 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
                               },
                               tuBytes))) {
                 // A source-spelled line-control directive contributes no PP
-                // tokens, but it is not disposable trivia: it changes the
-                // presumed file/line state for the untouched suffix.  Admit the
-                // gap only by carrying a replacement-local resync that restores
-                // the state observed after the whole consumed source envelope.
-                mixedSourceLineDirectiveResume = std::move(lineResume);
+                // tokens, but it is not disposable trivia.  If the copied
+                // suffix has no live line-state observer, preserve the original
+                // source directive spelling as source material.  If the suffix
+                // does observe line state, emit a local resume that restores the
+                // net state at the suffix after the consumed envelope.
                 recordSourceLineDirectiveMacroIds(acceptedMacroIds);
-                trace("fallback",
-                      "TU/include closure preserving source #line state from "
-                      "gap=[{0},{1}) resumeLine={2} file={3}",
-                      gapBegin, gapEnd,
-                      mixedSourceLineDirectiveResume->lineAtResume,
-                      mixedSourceLineDirectiveResume->fileSpelling);
+                if (!OwnerSuffixLineStateObserverDemand(std::nullopt, tuPath,
+                                                        sourceEnd)
+                         .Any()) {
+                  mixedPreservedSourceLineDirectiveGapPieces.push_back(
+                      {gapBegin, gapEnd});
+                  trace("fallback",
+                        "TU/include closure preserving source #line spelling "
+                        "from gap=[{0},{1})",
+                        gapBegin, gapEnd);
+                } else {
+                  mixedSourceLineDirectiveResume = std::move(lineResume);
+                  trace("fallback",
+                        "TU/include closure preserving source #line state from "
+                        "gap=[{0},{1}) resumeLine={2} file={3}",
+                        gapBegin, gapEnd,
+                        mixedSourceLineDirectiveResume->lineAtResume,
+                        mixedSourceLineDirectiveResume->fileSpelling);
+                }
                 return true;
               }
 
@@ -6262,6 +6276,35 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     }
   }
 
+  if (!mixedPreservedSourceLineDirectiveGapPieces.empty()) {
+    for (const auto &piece : mixedPreservedSourceLineDirectiveGapPieces) {
+      if (piece.first > piece.second || piece.second > tuBytes.size())
+        continue;
+
+      StringRef pieceText = tuBytes.slice(piece.first, piece.second);
+
+      // The preserved source gap is sliced from the original file bytes.  When
+      // the preceding replacement material already ends at the beginning of a
+      // fresh physical line, a leading line break in the source slice is the
+      // same separator, not an additional intentional blank line.  Drop only
+      // that duplicated separator; any further blank lines remain preserved.
+      if (!replacement.empty() && replacement.back() == '\n') {
+        if (pieceText.starts_with("\r\n"))
+          pieceText = pieceText.drop_front(2);
+        else if (pieceText.starts_with("\n") || pieceText.starts_with("\r"))
+          pieceText = pieceText.drop_front(1);
+      }
+
+      if (!replacement.empty() && replacement.back() != '\n' &&
+          !pieceText.starts_with("\n") && !pieceText.starts_with("\r"))
+        replacement.push_back('\n');
+
+      replacement.append(pieceText.begin(), pieceText.end());
+      if (replacement.empty() || replacement.back() != '\n')
+        replacement.push_back('\n');
+    }
+  }
+
   // The closure begins at the proved source interval.  For a pure include
   // closure that is the include-directive run; for a mixed TU/include closure it
   // also includes the directly consumed TU tokens adjacent to that run.  We may
@@ -6277,6 +6320,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   const bool emitsSourceLineDirectiveResume =
       lineDirs_.Enabled() && mixedSourceLineDirectiveResume &&
       sourceEnd < tuBytes.size();
+  std::vector<FinalLineControlPruneCandidate> sourceLineResumeCandidates;
   if (emitsSourceLineDirectiveResume) {
     // The consumed source envelope contained a source-spelled line-control
     // directive.  Re-emit only its net state, adjusted through the consumed
@@ -6293,8 +6337,12 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       padded.push_back('\n');
     }
 
+    const uint64_t resumeBegin = static_cast<uint64_t>(padded.size());
     padded +=
         formatSourceLineDirectiveGapResume(*mixedSourceLineDirectiveResume);
+    const uint64_t resumeEnd = static_cast<uint64_t>(padded.size());
+    (void)resumeBegin;
+    (void)resumeEnd;
     trace("fallback",
           "TU/include closure emitted source #line resume line={0} file={1}",
           mixedSourceLineDirectiveResume->lineAtResume,
@@ -6611,7 +6659,10 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
                          : ApplyResyncOrPend(tuBytes, sourceBegin,
                                              closureSourceEnd, padded, tuPath);
   TextEdit edit{sourceBegin,           closureSourceEnd, std::move(ro.text),
-                std::move(ro.pending), std::nullopt,     {}};
+                std::move(ro.pending), std::nullopt,     {}, {}, {}};
+  edit.lineControlPruneCandidates = emitsSourceLineDirectiveResume
+                                        ? std::move(sourceLineResumeCandidates)
+                                        : std::move(ro.lineControlPruneCandidates);
   StampTextEditMaterializedBTokenRange(edit, bEnvelope->first,
                                        bEnvelope->second);
 

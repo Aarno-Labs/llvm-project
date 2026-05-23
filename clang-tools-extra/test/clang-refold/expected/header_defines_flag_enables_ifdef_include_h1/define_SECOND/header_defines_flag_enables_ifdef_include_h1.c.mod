@@ -16,7 +16,6 @@
 RF_MARK(t29_after)
 
 int __refold_ins__t29_after = 0; /* pure insertion at after boundary for t29_after_marker */
-#line 18 "header_defines_flag_enables_ifdef_include_h1.c"
 int main(void) {
   return 0;
 }

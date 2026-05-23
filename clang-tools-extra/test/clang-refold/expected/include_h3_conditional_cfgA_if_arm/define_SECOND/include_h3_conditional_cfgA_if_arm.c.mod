@@ -12,7 +12,6 @@
 RF_MARK(t04_after)
 
 int __refold_ins__t04_after = 0; /* pure insertion at after boundary for t04_after_marker */
-#line 14 "include_h3_conditional_cfgA_if_arm.c"
 int main(void) {
   return 0;
 }

@@ -12,7 +12,6 @@
 RF_MARK(t19_after)
 
 int __refold_ins__t19_after = 0; /* pure insertion at after boundary for t19_after_marker */
-#line 14 "include_header_line_splice_and_comments.c"
 int main(void) {
   return 0;
 }

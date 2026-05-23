@@ -11,7 +11,6 @@
 #if 1
 /*BOUNDARY:T09:INNER-IF:INCLUDE-H1:BEGIN*/
 int __refold_ins__h1_begin = 0; /* pure insertion at before boundary for h1_begin_marker */
-#line 13 "tu_nested_if_include_in_inner_if.c"
 #include "h1.h"
 /*BOUNDARY:T09:INNER-IF:INCLUDE-H1:END*/
 #else
@@ -23,6 +22,7 @@ RF_PAYLOAD(t09_outer_else)
 #endif
 /*BOUNDARY:T09:OUTER-IF:END*/
 
+#line 24 "tu_nested_if_include_in_inner_if.c"
 RF_MARK(t09_after)
 
 int main(void) {

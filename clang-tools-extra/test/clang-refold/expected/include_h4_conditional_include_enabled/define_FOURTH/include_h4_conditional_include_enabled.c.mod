@@ -14,7 +14,6 @@
 RF_MARK(t06_after)
 
 int __refold_ins__t06_after = 0; /* pure insertion at after boundary for t06_after_marker */
-#line 16 "include_h4_conditional_include_enabled.c"
 int main(void) {
   return 0;
 }

@@ -15,7 +15,6 @@
 RF_MARK(t10_after)
 
 int __refold_ins__t10_after = 0; /* pure insertion at after boundary for t10_after_marker */
-#line 17 "tu_sequential_includes_h1_then_h2.c"
 int main(void) {
   return 0;
 }

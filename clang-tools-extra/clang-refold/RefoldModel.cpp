@@ -1326,6 +1326,82 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
     }
   }
 
+  // line_controls (optional; maps produced before schema 2.6 do not contain it)
+  if (auto arr = asOptArray(root, "line_controls")) {
+    model.lineControls_.reserve((*arr)->size());
+    for (std::size_t i = 0; i < (*arr)->size(); ++i) {
+      const std::string ctxItem =
+          (Twine("line_controls[") + Twine(i) + "]").str();
+
+      auto objOrErr = arrayObjElemAt(**arr, i, ctxItem);
+      if (!objOrErr)
+        return objOrErr.takeError();
+      const json::Object *obj = *objOrErr;
+
+      LineControlEvent event;
+
+      auto idOrErr = applyToField(asUInt64, *obj, "id", ctxItem);
+      if (!idOrErr)
+        return idOrErr.takeError();
+      event.id = *idOrErr;
+
+      auto fileOrErr = applyToField(asString, *obj, "physical_file", ctxItem);
+      if (!fileOrErr)
+        return fileOrErr.takeError();
+      event.physicalFile = *fileOrErr;
+
+      event.siteB = asOptUInt64(*obj, "site_b", /*canBeNull=*/true);
+      event.siteE = asOptUInt64(*obj, "site_e", /*canBeNull=*/true);
+
+      auto activeOrErr = applyToField(asBool, *obj, "active", ctxItem);
+      if (!activeOrErr)
+        return activeOrErr.takeError();
+      event.active = *activeOrErr;
+
+      auto provenOrErr =
+          applyToField(asBool, *obj, "producer_proven", ctxItem);
+      if (!provenOrErr)
+        return provenOrErr.takeError();
+      event.producerProven = *provenOrErr;
+
+      auto lineOrErr =
+          applyToField(asUInt64, *obj, "logical_line_after", ctxItem);
+      if (!lineOrErr)
+        return lineOrErr.takeError();
+      event.logicalLineAfter = *lineOrErr;
+
+      auto logicalFileOrErr =
+          applyToField(asString, *obj, "logical_file_after", ctxItem);
+      if (!logicalFileOrErr)
+        return logicalFileOrErr.takeError();
+      event.logicalFileAfter = *logicalFileOrErr;
+
+      event.ownerIncludeId = asOptUInt64(*obj, "owner_include_id");
+      if (auto text = asOptString(*obj, "text"))
+        event.text = *text;
+
+      if (event.siteB && event.siteE && *event.siteE < *event.siteB)
+        return createStringError(inconvertibleErrorCode(),
+                                 "Invalid line-control site range at %s",
+                                 ctxItem.c_str());
+
+      model.lineControls_.push_back(std::move(event));
+    }
+
+    std::sort(model.lineControls_.begin(), model.lineControls_.end(),
+              [](const LineControlEvent &A, const LineControlEvent &B) {
+                if (A.physicalFile != B.physicalFile)
+                  return A.physicalFile < B.physicalFile;
+                if (A.ownerIncludeId != B.ownerIncludeId)
+                  return A.ownerIncludeId < B.ownerIncludeId;
+                if (A.siteB != B.siteB)
+                  return A.siteB < B.siteB;
+                if (A.siteE != B.siteE)
+                  return A.siteE < B.siteE;
+                return A.id < B.id;
+              });
+  }
+
   // conds
   {
     auto arrOrErr = applyToField(asArray, root, "conds");

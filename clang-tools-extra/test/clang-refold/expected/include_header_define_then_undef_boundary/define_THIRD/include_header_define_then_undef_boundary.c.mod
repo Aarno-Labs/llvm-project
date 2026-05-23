@@ -12,7 +12,6 @@
 RF_MARK(t13_after)
 
 int __refold_ins__t13_after = 0; /* pure insertion at after boundary for t13_after_marker */
-#line 14 "include_header_define_then_undef_boundary.c"
 int main(void) {
   return 0;
 }

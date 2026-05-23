@@ -41,8 +41,25 @@ struct LineDirectiveLocation {
   std::string fileSpelling;
   size_t lineNo;
 
-  LineDirectiveLocation(StringRef file, size_t line)
-      : fileSpelling(file.str()), lineNo(line) {}
+  /// True only when the logical state was recovered without encountering an
+  /// unmodeled source-authored line-control directive.  The refolder may use
+  /// such a location to emit a synthetic resync directive.  When false, the
+  /// safest source-preserving action is to avoid overriding the still-present
+  /// source line-control stream, because doing so would replace producer-owned
+  /// preprocessing semantics with an inferred physical fallback.
+  bool producerProven = true;
+
+  /// Byte offset of the last source line-control directive before this location
+  /// whose effect could not be proven from the current model-backed owner-local
+  /// scan.  This distinguishes an unmodeled preserved prefix, where suppressing
+  /// an extra synthetic resync leaves the real source directive in force, from a
+  /// consumed unmodeled directive, which must fail closed.
+  std::optional<uint64_t> unprovenLineControlDirectiveOffset;
+
+  LineDirectiveLocation(StringRef file, size_t line, bool proven = true,
+                        std::optional<uint64_t> unprovenOffset = std::nullopt)
+      : fileSpelling(file.str()), lineNo(line), producerProven(proven),
+        unprovenLineControlDirectiveOffset(unprovenOffset) {}
 };
 
 /// \brief Inserts #line directives to preserve preprocessor "logical location"

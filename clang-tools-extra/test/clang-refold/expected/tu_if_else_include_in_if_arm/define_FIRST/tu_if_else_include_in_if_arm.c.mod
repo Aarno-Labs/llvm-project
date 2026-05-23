@@ -9,7 +9,6 @@
 #if 1
 /*BOUNDARY:T03:IF-ARM:INCLUDE-H1:BEGIN*/
 int __refold_ins__h1_begin = 0; /* pure insertion at before boundary for h1_begin_marker */
-#line 11 "tu_if_else_include_in_if_arm.c"
 #include "h1.h"
 /*BOUNDARY:T03:IF-ARM:INCLUDE-H1:END*/
 #else
@@ -19,6 +18,7 @@ RF_PAYLOAD(t03_else)
 #endif
 /*BOUNDARY:T03:IF-GROUP:END*/
 
+#line 20 "tu_if_else_include_in_if_arm.c"
 RF_MARK(t03_after)
 
 int main(void) {

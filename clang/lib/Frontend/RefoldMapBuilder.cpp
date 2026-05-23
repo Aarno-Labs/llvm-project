@@ -153,6 +153,74 @@ static std::pair<size_t, size_t> lineSpanOf(StringRef S, size_t p) {
   return {L, R};
 }
 
+/// Return true iff a raw physical source line looks like a `#line` directive or
+/// GNU line-marker directive.  This is not used to interpret semantics; it only
+/// identifies the physical site corresponding to Clang's producer-proven
+/// RenameFile callback.
+static bool looksLikeLineControlDirectiveLine(StringRef Line) {
+  size_t I = 0;
+  while (I < Line.size() && isSpace<true>(Line[I]))
+    ++I;
+  if (I >= Line.size() || Line[I] != '#')
+    return false;
+
+  ++I;
+  while (I < Line.size() && isSpace<true>(Line[I]))
+    ++I;
+  if (I >= Line.size())
+    return false;
+
+  if (std::isdigit(static_cast<unsigned char>(Line[I])))
+    return true;
+
+  constexpr StringRef LineKeyword("line");
+  if (!Line.substr(I).starts_with(LineKeyword))
+    return false;
+
+  const size_t End = I + LineKeyword.size();
+  if (End >= Line.size())
+    return true;
+  const unsigned char C = static_cast<unsigned char>(Line[End]);
+  return !(std::isalnum(C) || C == '_');
+}
+
+/// Locate the source directive line for a line-control callback.  Depending on
+/// the exact Clang callback location, `Loc` may name the directive line itself
+/// or the first location after the directive has taken effect.  Check the
+/// containing physical line first and then the immediately preceding physical
+/// line before failing closed.
+static std::optional<std::pair<uint64_t, uint64_t>>
+findLineControlDirectiveLineNearLoc(const SourceManager &SM,
+                                    SourceLocation Loc) {
+  SourceLocation FileLoc = SM.getFileLoc(Loc);
+  if (!FileLoc.isValid())
+    return std::nullopt;
+
+  FileID FID = SM.getFileID(FileLoc);
+  bool Invalid = false;
+  StringRef Buf = SM.getBufferData(FID, &Invalid);
+  if (Invalid || Buf.empty())
+    return std::nullopt;
+
+  const size_t Off = std::min<size_t>(SM.getFileOffset(FileLoc), Buf.size() - 1);
+
+  auto lineLooks = [&](std::pair<size_t, size_t> Span) -> bool {
+    return looksLikeLineControlDirectiveLine(Buf.slice(Span.first, Span.second));
+  };
+
+  const std::pair<size_t, size_t> Current = lineSpanOf(Buf, Off);
+  if (lineLooks(Current))
+    return {{Current.first, Current.second}};
+
+  if (Current.first > 0) {
+    const std::pair<size_t, size_t> Previous = lineSpanOf(Buf, Current.first - 1);
+    if (lineLooks(Previous))
+      return {{Previous.first, Previous.second}};
+  }
+
+  return std::nullopt;
+}
+
 /// \brief Scan a source buffer for top-level preprocessor conditional groups.
 ///
 /// This is a lightweight, deterministic line scanner that discovers `#if` /
@@ -2785,6 +2853,40 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
   }
 }
 
+void RefoldMapBuilder::onLineControlDirective(SourceLocation Loc) {
+  if (!enabled())
+    return;
+
+  PresumedLoc PL = SM.getPresumedLoc(Loc);
+  if (PL.isInvalid())
+    return;
+
+  LineControlEvent Ev;
+  Ev.ID = LineControlEvents.size();
+  Ev.Active = true;
+  Ev.ProducerProven = true;
+  Ev.LogicalLineAfter = PL.getLine();
+  Ev.LogicalFileAfter = PL.getFilename();
+  Ev.PhysicalFile = filePathForLocAbs(SM, Loc, EmitAbsPaths);
+
+  if (!IncludeStack.empty() && IncludeStack.back())
+    Ev.OwnerIncludeId = Items[*IncludeStack.back()].ID;
+
+  if (auto Site = findLineControlDirectiveLineNearLoc(SM, Loc)) {
+    Ev.SiteBegin = Site->first;
+    Ev.SiteEnd = Site->second;
+
+    SourceLocation FileLoc = SM.getFileLoc(Loc);
+    FileID FID = SM.getFileID(FileLoc);
+    bool Invalid = false;
+    StringRef Buf = SM.getBufferData(FID, &Invalid);
+    if (!Invalid && *Ev.SiteBegin <= *Ev.SiteEnd && *Ev.SiteEnd <= Buf.size())
+      Ev.Text = Buf.slice(*Ev.SiteBegin, *Ev.SiteEnd).str();
+  }
+
+  LineControlEvents.push_back(std::move(Ev));
+}
+
 void RefoldMapBuilder::onPragma(SourceLocation HashLoc, StringRef FullText) {
   if (!enabled())
     return;
@@ -3853,7 +3955,7 @@ void RefoldMapBuilder::writeJSON() {
   llvm::json::OStream JO(OS, /*Indent=*/2);
 
   JO.object([&] {
-    JO.attribute("version", "2.5");
+    JO.attribute("version", "2.6");
 
     const auto &PPO = PP.getPreprocessorOpts();
     std::string LangStr = computeLangStr(PP.getLangOpts());
@@ -3879,6 +3981,27 @@ void RefoldMapBuilder::writeJSON() {
     });
 
     JO.attribute("source", TUSourcePath);
+
+    JO.attributeArray("line_controls", [&] {
+      for (const LineControlEvent &Ev : LineControlEvents) {
+        JO.object([&] {
+          JO.attribute("id", Ev.ID);
+          JO.attribute("physical_file", Ev.PhysicalFile);
+          JO.attribute("site_b", Ev.SiteBegin ? llvm::json::Value(*Ev.SiteBegin)
+                                               : llvm::json::Value(nullptr));
+          JO.attribute("site_e", Ev.SiteEnd ? llvm::json::Value(*Ev.SiteEnd)
+                                             : llvm::json::Value(nullptr));
+          JO.attribute("active", Ev.Active);
+          JO.attribute("producer_proven", Ev.ProducerProven);
+          JO.attribute("logical_line_after", Ev.LogicalLineAfter);
+          JO.attribute("logical_file_after", Ev.LogicalFileAfter);
+          if (Ev.OwnerIncludeId)
+            JO.attribute("owner_include_id", *Ev.OwnerIncludeId);
+          if (!Ev.Text.empty())
+            JO.attribute("text", Ev.Text);
+        });
+      }
+    });
 
     // tokens...
     JO.attributeObject("tokens", [&] {

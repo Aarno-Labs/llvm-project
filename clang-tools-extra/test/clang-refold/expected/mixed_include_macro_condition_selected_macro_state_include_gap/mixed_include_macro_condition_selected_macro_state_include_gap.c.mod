@@ -6,5 +6,4 @@ int x =
 #include "pragma_once_define_gap.inc"
 #endif
 ;
-#line 10 "mixed_include_macro_condition_selected_macro_state_include_gap.c"
 int y = GAP_VALUE;

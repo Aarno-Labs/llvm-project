@@ -8,5 +8,4 @@ int ARM85_START = 1;
 int ARM85_START = 2;
 #endif
 int INS85_ARM_BOUNDARY = ARM85_START + 1;
-#line 10 "boundary_insertion_macro_generated_predicate.c"
 int main(){ return ARM85_START; }

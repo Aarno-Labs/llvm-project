@@ -536,6 +536,25 @@ public:
     const CondArm *arm;
   };
 
+  /// Producer-proven active source line-control event.
+  ///
+  /// These records are emitted only after Clang has evaluated directive
+  /// operands and conditional activity.  They are therefore model evidence for
+  /// arbitrary source `#line` forms, including macro-expanded operands, without
+  /// requiring the consumer to re-evaluate preprocessor expressions.
+  struct LineControlEvent {
+    uint64_t id = 0;
+    StringRef physicalFile;
+    std::optional<uint64_t> siteB;
+    std::optional<uint64_t> siteE;
+    bool active = false;
+    bool producerProven = false;
+    uint64_t logicalLineAfter = 0;
+    StringRef logicalFileAfter;
+    std::optional<uint64_t> ownerIncludeId;
+    StringRef text;
+  };
+
   /// \brief Constructs a RefoldModel instance from a parsed JSON object.
   ///
   /// This factory method deserializes a validated `clang-refold` map JSON
@@ -571,6 +590,7 @@ public:
   ArrayRef<FileItem> GetFileItems() const { return fileItems_; }
   ArrayRef<Slot> GetSlots() const { return slots_; }
   ArrayRef<CondGroup> GetConds() const { return conds_; }
+  ArrayRef<LineControlEvent> GetLineControls() const { return lineControls_; }
 
   const IncludeItem *GetIncludeById(uint64_t id) const {
     auto it = includeById_.find(id);
@@ -719,6 +739,7 @@ private:
   std::vector<FileItem> fileItems_;
   std::vector<Slot> slots_;
   std::vector<CondGroup> conds_;
+  std::vector<LineControlEvent> lineControls_;
 
   // ============================= Derived indices =============================
 

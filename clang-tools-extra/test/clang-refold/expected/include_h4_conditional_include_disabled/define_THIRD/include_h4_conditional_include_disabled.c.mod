@@ -13,7 +13,6 @@
 RF_MARK(t07_after)
 
 int __refold_ins__t07_after = 0; /* pure insertion at after boundary for t07_after_marker */
-#line 15 "include_h4_conditional_include_disabled.c"
 int main(void) {
   return 0;
 }

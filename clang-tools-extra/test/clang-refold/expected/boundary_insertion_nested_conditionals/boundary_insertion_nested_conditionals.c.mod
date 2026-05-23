@@ -10,7 +10,6 @@
     int ARM84_START = 2;
   #endif
 int INS84_ARM_BOUNDARY = ARM84_START + 1;
-#line 12 "boundary_insertion_nested_conditionals.c"
 #else
   int ARM84_START = 3;
 #endif

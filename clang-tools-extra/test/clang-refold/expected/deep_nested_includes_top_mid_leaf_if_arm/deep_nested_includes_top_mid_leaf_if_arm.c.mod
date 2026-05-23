@@ -11,7 +11,6 @@
 RF_MARK(t24_after)
 
 int __refold_ins__t24_after = 0; /* pure insertion at after boundary for t24_after_marker */
-#line 13 "deep_nested_includes_top_mid_leaf_if_arm.c"
 int main(void) {
   return 0;
 }

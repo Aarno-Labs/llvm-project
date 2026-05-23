@@ -24,7 +24,6 @@ RF_PAYLOAD(t08_elif)
 RF_MARK(t08_after)
 
 int __refold_ins__t08_after = 0; /* pure insertion at after boundary for t08_after_marker */
-#line 26 "tu_if_elif_else_include_in_else_arm.c"
 int main(void) {
   return 0;
 }

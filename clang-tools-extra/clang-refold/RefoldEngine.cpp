@@ -50,6 +50,7 @@
 
 #include "RefoldLog.h"
 #include "RefoldEngine.h"
+#include "FinalLineControlModel.h"
 
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/TokenKinds.h"
@@ -82,6 +83,7 @@
 #include <algorithm>
 #include <array>
 #include <set>
+#include <cctype>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -1357,7 +1359,9 @@ RefoldEngine::Refold(const json::Object &rootJson, StringRef aSource,
                      ArrayRef<size_t> bTokOff, bool noLines, bool strict,
                      ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
                      std::vector<MaterializedEditMapping>
-                         *materializedEditMappings) {
+                         *materializedEditMappings,
+                     FinalLineControlValidationCallback
+                         finalLineControlValidationCallback) {
   // Build the refold model based on the parsed JSON object.
   auto mOrErr = RefoldModel::FromJson(rootJson);
   if (!mOrErr)
@@ -1366,7 +1370,8 @@ RefoldEngine::Refold(const json::Object &rootJson, StringRef aSource,
   // Construct an engine and run the instance pipeline.
   RefoldEngine engine(std::move(*mOrErr), aSource, aToks, aTokOff, bSource,
                       bToks, bTokOff, noLines, strict,
-                      sidebandPragmaEdits, materializedEditMappings);
+                      sidebandPragmaEdits, materializedEditMappings,
+                      std::move(finalLineControlValidationCallback));
   return engine.Refold();
 }
 
@@ -1715,6 +1720,8 @@ RefoldEngine::SliceBSourceClippedAgainstClaims(size_t bTokStart,
 std::string RefoldEngine::Refold() {
   if (materializedEditMappings_)
     materializedEditMappings_->clear();
+  finalLineControlPruneCandidates_.clear();
+  finalLineControlSourceMappings_.clear();
 
   // The engine is single-pass: it first attempts structural refolding, then
   // (if structural proof discharge requests fallback) resolves the post-
@@ -1732,8 +1739,197 @@ std::string RefoldEngine::Refold() {
   // reported.
   EnforceTheoremAuditInvariants();
 
-  if (terminalFallbackRequested_)
+  if (terminalFallbackRequested_) {
     out = ResolvePostStructuralFallback();
+    finalLineControlPruneCandidates_.clear();
+    finalLineControlSourceMappings_.clear();
+  }
+
+  auto normalizeFinalLineControlPhysicalFile = [&](StringRef physicalFile) {
+    if (physicalFile.empty())
+      return std::string();
+
+    // Refold-map owners are producer-spelled paths, while final-source
+    // provenance maps use filesystem-normalized owner keys.  Normalize real
+    // files before matching producer line-control/observer facts to copied
+    // final bytes, but leave pseudo files such as <built-in> unchanged because
+    // they are not filesystem paths.
+    if (physicalFile.starts_with("<") && physicalFile.ends_with(">"))
+      return physicalFile.str();
+
+    return lineDirs_.ToAbsolutePath(physicalFile);
+  };
+
+  std::vector<FinalLineControlProducerEvent> finalLineProducerEvents;
+  finalLineProducerEvents.reserve(model_.GetLineControls().size());
+  for (const RefoldModel::LineControlEvent &event : model_.GetLineControls()) {
+    FinalLineControlProducerEvent finalEvent;
+    finalEvent.id = event.id;
+    finalEvent.physicalFile =
+        normalizeFinalLineControlPhysicalFile(event.physicalFile);
+    finalEvent.siteBegin = event.siteB;
+    finalEvent.siteEnd = event.siteE;
+    finalEvent.active = event.active;
+    finalEvent.producerProven = event.producerProven;
+    finalEvent.logicalLineAfter = event.logicalLineAfter;
+    finalEvent.logicalFileAfter = event.logicalFileAfter.str();
+    finalEvent.ownerIncludeId = event.ownerIncludeId;
+    finalEvent.text = event.text.str();
+    finalLineProducerEvents.push_back(std::move(finalEvent));
+  }
+
+  auto finalObserverKindForBuiltinName =
+      [](StringRef name) -> std::optional<FinalObserver::Kind> {
+    if (name == "__LINE__")
+      return FinalObserver::Kind::Line;
+    if (name == "__FILE__")
+      return FinalObserver::Kind::File;
+    if (name == "__FILE_NAME__")
+      return FinalObserver::Kind::FileName;
+    return std::nullopt;
+  };
+
+  std::vector<FinalLineControlProducerObserver> finalLineProducerObservers;
+
+  auto addProducerObserverForSite =
+      [&](const RefoldModel::MacroInvocation &builtin,
+          const RefoldModel::MacroInvocation &site,
+          FinalObserver::Kind kind) {
+        // A predefined builtin spelled in a macro replacement list is not an
+        // observer at definition time.  It becomes an observer only at a real
+        // expansion/call site.  Record only sites that could survive as emitted
+        // source text; if final-to-source provenance later proves that such a
+        // site was materialized instead of copied, the final scanner simply will
+        // not add the observer.
+        if (IsInvocationInsideDefineDirective(site))
+          return;
+        if (!site.invFile || !site.invB || !site.invE)
+          return;
+        if (*site.invE <= *site.invB)
+          return;
+
+        FinalLineControlProducerObserver observer;
+        observer.id = builtin.id;
+        observer.kind = kind;
+        observer.physicalFile =
+            normalizeFinalLineControlPhysicalFile(*site.invFile);
+        observer.sourceBegin = *site.invB;
+        observer.sourceEnd = *site.invE;
+        observer.ownerIncludeId = site.ownerIncludeId;
+        observer.active = true;
+        observer.producerProven = true;
+        observer.expected = FinalExpectedLineValue::Unknown();
+        if (site.invText)
+          observer.text = site.invText->str();
+        finalLineProducerObservers.push_back(std::move(observer));
+      };
+
+  for (const RefoldModel::MacroInvocation &macro :
+       model_.GetMacroInvocations()) {
+    std::optional<FinalObserver::Kind> kind =
+        finalObserverKindForBuiltinName(macro.name);
+    if (!kind)
+      continue;
+    if (!LineStateBuiltinInvocationIsPreservedObserver(macro))
+      continue;
+
+    // Add every observable site in the caller chain, not just the outermost
+    // one.  Different refolding proofs may preserve a direct builtin spelling,
+    // an intermediate wrapper invocation, or the top-level wrapper.  The final
+    // scanner will activate exactly the site whose bytes are actually copied
+    // into the final source with exact provenance.  Sites spelled inside a
+    // #define replacement list are deliberately skipped because they are macro
+    // definitions, not final-stream observations.
+    const RefoldModel::MacroInvocation *site = &macro;
+    unsigned depth = 0;
+    const unsigned maxDepth =
+        static_cast<unsigned>(model_.GetMacroInvocations().size());
+    while (site && depth++ <= maxDepth) {
+      addProducerObserverForSite(macro, *site, *kind);
+      if (!site->callerMacroId)
+        break;
+      site = FindMacroInvocationById(*site->callerMacroId);
+    }
+  }
+
+  llvm::sort(finalLineProducerObservers,
+             [](const FinalLineControlProducerObserver &lhs,
+                const FinalLineControlProducerObserver &rhs) {
+               if (lhs.physicalFile != rhs.physicalFile)
+                 return lhs.physicalFile < rhs.physicalFile;
+               if (lhs.ownerIncludeId != rhs.ownerIncludeId)
+                 return lhs.ownerIncludeId < rhs.ownerIncludeId;
+               if (lhs.sourceBegin != rhs.sourceBegin)
+                 return lhs.sourceBegin < rhs.sourceBegin;
+               if (lhs.sourceEnd != rhs.sourceEnd)
+                 return lhs.sourceEnd < rhs.sourceEnd;
+               if (lhs.kind != rhs.kind)
+                 return static_cast<unsigned>(lhs.kind) <
+                        static_cast<unsigned>(rhs.kind);
+               return lhs.id < rhs.id;
+             });
+
+  finalLineProducerObservers.erase(
+      std::unique(finalLineProducerObservers.begin(),
+                  finalLineProducerObservers.end(),
+                  [](const FinalLineControlProducerObserver &lhs,
+                     const FinalLineControlProducerObserver &rhs) {
+                    return lhs.physicalFile == rhs.physicalFile &&
+                           lhs.ownerIncludeId == rhs.ownerIncludeId &&
+                           lhs.sourceBegin == rhs.sourceBegin &&
+                           lhs.sourceEnd == rhs.sourceEnd &&
+                           lhs.kind == rhs.kind;
+                  }),
+      finalLineProducerObservers.end());
+
+  FinalLineControlPruneResult finalLinePrune =
+      PruneFinalLineControlDirectives(
+          out, finalLineControlPruneCandidates_,
+          finalLineControlSourceMappings_, finalLineProducerEvents,
+          finalLineProducerObservers, finalLineControlValidationCallback_);
+
+  if (finalLinePrune.changed) {
+    auto mapPointAfterDeletion = [](uint64_t point, uint64_t begin,
+                                    uint64_t end) -> uint64_t {
+      const uint64_t size = end - begin;
+      if (point <= begin)
+        return point;
+      if (point <= end)
+        return begin;
+      return point - size;
+    };
+
+    for (const FinalLineControlPruneDecision &decision :
+         finalLinePrune.decisions) {
+      if (!decision.removed)
+        continue;
+      if (materializedEditMappings_) {
+        for (MaterializedEditMapping &mapping : *materializedEditMappings_) {
+          mapping.refoldedSourceBegin = mapPointAfterDeletion(
+              mapping.refoldedSourceBegin, decision.finalBegin,
+              decision.finalEnd);
+          mapping.refoldedSourceEnd = mapPointAfterDeletion(
+              mapping.refoldedSourceEnd, decision.finalBegin,
+              decision.finalEnd);
+        }
+      }
+
+      AdjustFinalLineControlSourceMappingsAfterDeletion(
+          finalLineControlSourceMappings_, decision.finalBegin,
+          decision.finalEnd);
+    }
+  }
+
+  out = finalLinePrune.output;
+
+  if (inTraceMode()) {
+    TraceFinalLineControlPruneResult(finalLinePrune, "post-structural");
+    FinalLineControlModel finalLineControl =
+        CollectPassiveFinalLineControlModel(
+            out, finalLineControlSourceMappings_, finalLineProducerEvents,
+            finalLineProducerObservers);
+    TraceFinalLineControlModel(finalLineControl, "post-final-prune");
+  }
 
   EmitRefoldStats();
   EmitTheoremAudit();
@@ -1850,7 +2046,8 @@ bool RefoldEngine::AppendSidebandPragmaSourceEdits(
                                          sourceRange.second,
                                          sideband.ReplacementText(), tuPath);
     TextEdit edit{sourceRange.first, sourceRange.second, std::move(ro.text),
-                  std::move(ro.pending), std::nullopt, {}};
+                  std::move(ro.pending), std::nullopt, {}, {}, {}};
+    edit.lineControlPruneCandidates = std::move(ro.lineControlPruneCandidates);
     StampTextEditMaterializedBReplayProof(edit, sideband);
     AttachAcceptedResultCarrier(
         edit,
@@ -3180,6 +3377,28 @@ std::string RefoldEngine::RunSinglePassRefold() {
           }
         }
 
+        bool advancedOverSourceLineControlPrefix = false;
+        if (h.isInsertOnly() && span->first == span->second) {
+          if (!IsPPGapAtSelectedConditionalArmExit(h.aStart)) {
+          if (std::optional<uint64_t> exactAnchor =
+                  AnchorToExactSlotBoundaryFromPPGap(tuPath, h.aStart)) {
+            if (*exactAnchor == span->first) {
+              if (std::optional<uint64_t> advancedAnchor =
+                      AdvanceInsertionAnchorPastSourceLineControlPrefix(
+                          tuPath, std::nullopt, tuBytes, span->first)) {
+                debug("edit/tu",
+                      "TU insertion advances over source line-control prefix "
+                      "[{0},{1}) at PP gap {2}",
+                      span->first, *advancedAnchor, h.aStart);
+                span->first = *advancedAnchor;
+                span->second = *advancedAnchor;
+                advancedOverSourceLineControlPrefix = true;
+              }
+            }
+          }
+        }
+      }
+
         // Is this span replacing a TU "gap" (bytes that are all whitespace)?
         std::string original;
         if (span->second > span->first) {
@@ -3206,6 +3425,9 @@ std::string RefoldEngine::RunSinglePassRefold() {
         //   could duplicate spacing.
         // - On the right, always allow padding if the replacement would
         //   otherwise glue to the following TU text.
+        // Keep a copy for logging; PadAtBoundaries consumes via move.
+        std::string rawRepl = repl;
+
         std::string padded =
             PadAtBoundaries(tuBytes, static_cast<size_t>(span->first),
                             static_cast<size_t>(span->second), std::move(repl),
@@ -3214,10 +3436,47 @@ std::string RefoldEngine::RunSinglePassRefold() {
 
         debug("classify",
               "#{0} -> TU  bytes=[{1},{2}) rawRepl='{3}' paddedRepl='{4}'", i,
-              span->first, span->second, stringutils::showWsWithClip(repl, 160),
+              span->first, span->second, stringutils::showWsWithClip(rawRepl, 160),
               stringutils::showWsWithClip(padded, 160));
 
-        auto insertionBeforeMaterializedInclude = [&]() -> bool {
+        auto insertionCanDeferResyncToConditionalJoin = [&]() -> bool {
+          if (!advancedOverSourceLineControlPrefix || span->first != span->second)
+            return false;
+
+          std::optional<LineStateObserverSite> firstObserver =
+              FirstOwnerSuffixLineStateObserverSite(std::nullopt, tuPath,
+                                                     span->second);
+          if (!firstObserver || !firstObserver->demand.needsLine)
+            return false;
+
+          const RefoldModel::CondGroup *innermost = nullptr;
+          for (const RefoldModel::CondGroup *group :
+               model_.GetCondGroups(tuPath, std::nullopt)) {
+            if (!group || !PathsEqual(group->file, tuPath) ||
+                group->parentIncludeId)
+              continue;
+            if (!group->ContainsByte(span->first))
+              continue;
+            if (!innermost ||
+                (group->groupB >= innermost->groupB &&
+                 group->groupE <= innermost->groupE))
+              innermost = group;
+          }
+
+          if (!innermost || firstObserver->offset < innermost->groupE)
+            return false;
+
+          trace("linedir/resync",
+                "defer local resync after source line-control prefix to "
+                "conditional join repair: anchor={0} group=[{1},{2}) "
+                "observer={3}",
+                span->first, innermost->groupB, innermost->groupE,
+                firstObserver->offset);
+          return true;
+        };
+
+
+      auto insertionBeforeMaterializedInclude = [&]() -> bool {
           if (!h.isInsertOnly() || span->first != span->second)
             return false;
           if (!AnchorToExactSlotBoundaryFromPPGap(tuPath, h.aStart))
@@ -3246,12 +3505,14 @@ std::string RefoldEngine::RunSinglePassRefold() {
         // physical #include directive would only create a gratuitous resume
         // immediately before the child-file #line.
         ResyncOutcome ro =
-            insertionBeforeMaterializedInclude()
+            (insertionBeforeMaterializedInclude() ||
+             insertionCanDeferResyncToConditionalJoin())
                 ? ResyncOutcome(padded, std::nullopt)
                 : ApplyResyncOrPend(tuBytes, span->first, span->second, padded,
                                     tuPath);
         TextEdit edit{span->first, span->second, std::move(ro.text),
-                      std::move(ro.pending), std::nullopt, {}};
+                      std::move(ro.pending), std::nullopt, {}, {}, {}};
+        edit.lineControlPruneCandidates = std::move(ro.lineControlPruneCandidates);
         edit.isDirectTUHunkEdit = true;
         edit.directTUHunkIndex = i;
         edit.directTUHunkAStart = h.aStart;
@@ -3508,6 +3769,28 @@ std::string RefoldEngine::RunSinglePassRefold() {
         }
       }
 
+      bool advancedOverSourceLineControlPrefix = false;
+      if (h.isInsertOnly() && span->first == span->second) {
+        if (!IsPPGapAtSelectedConditionalArmExit(h.aStart)) {
+        if (std::optional<uint64_t> exactAnchor =
+                AnchorToExactSlotBoundaryFromPPGap(tuPath, h.aStart)) {
+          if (*exactAnchor == span->first) {
+            if (std::optional<uint64_t> advancedAnchor =
+                    AdvanceInsertionAnchorPastSourceLineControlPrefix(
+                        tuPath, std::nullopt, tuBytes, span->first)) {
+              debug("edit/tu",
+                    "TU conservative insertion advances over source "
+                    "line-control prefix [{0},{1}) at PP gap {2}",
+                    span->first, *advancedAnchor, h.aStart);
+              span->first = *advancedAnchor;
+              span->second = *advancedAnchor;
+              advancedOverSourceLineControlPrefix = true;
+            }
+          }
+        }
+      }
+    }
+
       // If we are replacing whitespace-only text in the TU, we prefer to
       // preserve the existing TU gap whitespace rather than introducing new
       // whitespace from B.
@@ -3549,6 +3832,42 @@ std::string RefoldEngine::RunSinglePassRefold() {
             stringutils::showWsWithClip(rawRepl, 160),
             stringutils::showWsWithClip(padded, 160));
 
+      auto insertionCanDeferResyncToConditionalJoin = [&]() -> bool {
+        if (!advancedOverSourceLineControlPrefix || span->first != span->second)
+          return false;
+
+        std::optional<LineStateObserverSite> firstObserver =
+            FirstOwnerSuffixLineStateObserverSite(std::nullopt, tuPath,
+                                                   span->second);
+        if (!firstObserver || !firstObserver->demand.needsLine)
+          return false;
+
+        const RefoldModel::CondGroup *innermost = nullptr;
+        for (const RefoldModel::CondGroup *group :
+             model_.GetCondGroups(tuPath, std::nullopt)) {
+          if (!group || !PathsEqual(group->file, tuPath) ||
+              group->parentIncludeId)
+            continue;
+          if (!group->ContainsByte(span->first))
+            continue;
+          if (!innermost ||
+              (group->groupB >= innermost->groupB &&
+               group->groupE <= innermost->groupE))
+            innermost = group;
+        }
+
+        if (!innermost || firstObserver->offset < innermost->groupE)
+          return false;
+
+        trace("linedir/resync",
+              "defer conservative local resync after source line-control "
+              "prefix to conditional join repair: anchor={0} "
+              "group=[{1},{2}) observer={3}",
+              span->first, innermost->groupB, innermost->groupE,
+              firstObserver->offset);
+        return true;
+      };
+
       auto insertionBeforeMaterializedInclude = [&]() -> bool {
         if (!h.isInsertOnly() || span->first != span->second)
           return false;
@@ -3574,12 +3893,14 @@ std::string RefoldEngine::RunSinglePassRefold() {
       // emitted bytes are the include wrapper's child-file `#line`, and that
       // wrapper later performs the parent resume after the include.
       ResyncOutcome ro =
-          insertionBeforeMaterializedInclude()
+          (insertionBeforeMaterializedInclude() ||
+           insertionCanDeferResyncToConditionalJoin())
               ? ResyncOutcome(padded, std::nullopt)
               : ApplyResyncOrPend(tuBytes, span->first, span->second, padded,
                                   tuPath);
       TextEdit edit{span->first, span->second, std::move(ro.text),
-                    std::move(ro.pending), std::nullopt, {}};
+                    std::move(ro.pending), std::nullopt, {}, {}, {}};
+      edit.lineControlPruneCandidates = std::move(ro.lineControlPruneCandidates);
       edit.isDirectTUHunkEdit = true;
       edit.directTUHunkIndex = i;
       edit.directTUHunkAStart = h.aStart;
@@ -4797,6 +5118,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
         edit.end = undefTransition->interval.end;
         edit.text = std::move(resync.text);
         edit.pending = std::move(resync.pending);
+        edit.lineControlPruneCandidates =
+            std::move(resync.lineControlPruneCandidates);
 
         // This is no longer a direct TU hunk edit: it now carries a macro-state
         // transition and untouched source bytes around the original
@@ -4917,6 +5240,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
     edit.start = lineStart;
     edit.text = std::move(resync.text);
     edit.pending = std::move(resync.pending);
+    edit.lineControlPruneCandidates =
+        std::move(resync.lineControlPruneCandidates);
     edit.isDirectTUHunkEdit = false;
     edit.directTUHunkIndex.reset();
     edit.directTUHunkAStart.reset();
@@ -5277,6 +5602,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
       edit.end = *delayedBoundary;
       edit.text = std::move(resync.text);
       edit.pending = std::move(resync.pending);
+      edit.lineControlPruneCandidates =
+          std::move(resync.lineControlPruneCandidates);
       edit.isDirectTUHunkEdit = false;
       edit.directTUHunkIndex.reset();
       edit.directTUHunkAStart.reset();
@@ -5952,6 +6279,11 @@ std::string RefoldEngine::RunSinglePassRefold() {
     }
   }
 
+  if (!AppendLineObserverLayoutRealizationEdits(tuPath, tuBytes, tuEdits))
+    return std::string();
+  if (!AppendIncludeLineObserverLayoutRealizationEdits(perInclude))
+    return std::string();
+
   debug("plan", "perInclude.size={0} macroOwners={1} tuEdits(initial)={2}",
         perInclude.size(), macroPatchesByOwner.size(), tuEdits.size());
 
@@ -5982,6 +6314,16 @@ std::string RefoldEngine::RunSinglePassRefold() {
 
   // Cache for realized expansion text per include id.
   DenseMap<uint64_t, std::string> includeExpansion;
+
+  // Cache for final-line-control pruning candidates carried by each realized
+  // include body, with offsets relative to includeExpansion[id].
+  DenseMap<uint64_t, std::vector<FinalLineControlPruneCandidate>>
+      includeExpansionLineControlPruneCandidates;
+
+  // Cache for final-to-source mappings carried by each realized include body,
+  // with offsets relative to includeExpansion[id].
+  DenseMap<uint64_t, std::vector<FinalLineControlSourceMapping>>
+      includeExpansionLineControlSourceMappings;
 
   // Include-enter #line directives must point at the first source line emitted
   // by a materialized header.  Leading sideband deletions can make that line
@@ -6044,6 +6386,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
     debug("include/mat", "materialize seed include #{0}", incId);
     MaterializeIncludeExpansion(incId, perInclude, macroPatchesByOwner,
                                 children, includeExpansion,
+                                includeExpansionLineControlPruneCandidates,
+                                includeExpansionLineControlSourceMappings,
                                 includeExpansionStartLineNos,
                                 includeExpansionAcceptedResults,
                                 &appliedExpandedMacroRootIds);
@@ -6131,7 +6475,10 @@ std::string RefoldEngine::RunSinglePassRefold() {
                       MacroPatchRemainsExpanded(mp)
                           ? std::make_optional(GetRootMacroId(mp.macroId))
                           : std::nullopt,
+                      {},
+                      {},
                       {}};
+        edit.lineControlPruneCandidates = std::move(ro.lineControlPruneCandidates);
         if (auto bRange = MacroPatchMaterializedBByteRange(mp))
           StampTextEditMaterializedBByteRange(edit, bRange->first,
                                               bRange->second);
@@ -6263,7 +6610,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
           std::string &replacementText) {
         TextEdit replacementProbe{materializedSiteBegin, materializedSiteEnd,
                                   replacementText, std::nullopt,
-                                  std::nullopt, {}};
+                                  std::nullopt, {}, {}, {}};
         std::string preservedDirectivePrefix;
 
         for (const NamedMacroDirectiveRef &ref : namedMacroDirectives) {
@@ -6479,12 +6826,27 @@ std::string RefoldEngine::RunSinglePassRefold() {
           TUIncludeMaterializationWorkClass::SidebandPragmaOnly;
       const size_t childEntryLineNo =
           includeExpansionStartLineNos.lookup(inc->id);
-      std::string wrapped = WrapIncludeExpansionForMaterialization(
-          *inc, parentResume.fileSpelling, std::nullopt, siteE,
+      ArrayRef<FinalLineControlPruneCandidate> includeLineCandidates;
+      if (auto includeCandidatesIt =
+              includeExpansionLineControlPruneCandidates.find(inc->id);
+          includeCandidatesIt != includeExpansionLineControlPruneCandidates.end())
+        includeLineCandidates = includeCandidatesIt->second;
+      ArrayRef<FinalLineControlSourceMapping> includeLineSourceMappings;
+      if (auto includeMappingsIt =
+              includeExpansionLineControlSourceMappings.find(inc->id);
+          includeMappingsIt != includeExpansionLineControlSourceMappings.end())
+        includeLineSourceMappings = includeMappingsIt->second;
+      LineControlWrappedText wrapped = WrapIncludeExpansionForMaterialization(
+          *inc, parentResume.fileSpelling, tuPath, std::nullopt, siteE,
           childEntryLineNo ? childEntryLineNo : 1, parentResume.lineNo,
-          expText, sidebandOnly);
-      TextEdit edit{siteB,        siteE,        std::move(wrapped),
-                    std::nullopt, std::nullopt, {}};
+          expText, includeLineCandidates, includeLineSourceMappings,
+          sidebandOnly);
+      TextEdit edit{siteB,        siteE,        std::move(wrapped.text),
+                    std::nullopt, std::nullopt, {}, {}, {}};
+      edit.lineControlPruneCandidates =
+          std::move(wrapped.lineControlPruneCandidates);
+      edit.lineControlSourceMappings =
+          std::move(wrapped.lineControlSourceMappings);
       auto itAccepted = includeExpansionAcceptedResults.find(incId);
       if (auto bEnv = ResolveIncludeRealizationBTokenEnvelope(inc->cover.begin,
                                                               inc->cover.end)) {
@@ -6512,64 +6874,115 @@ std::string RefoldEngine::RunSinglePassRefold() {
   debug("tu/apply", "applying {0} TU edits", tuEdits.size());
   std::string tuResult = ApplyTextEditsWithPendingResync(
       tuBytes, tuEdits, &appliedExpandedMacroRootIds, tuPath, std::nullopt,
-      materializedEditMappings_);
+      materializedEditMappings_, &finalLineControlPruneCandidates_,
+      &finalLineControlSourceMappings_);
   if (terminalFallbackRequested_)
     return std::string();
 
   // Preserve TU-local __FILE__ / __FILE_NAME__ semantics in checker replay.
   //
-  // If a copied TU suffix contains a bare TU-local __FILE__ or __FILE_NAME__,
-  // replaying the refolded output without an initial line directive would make
-  // those builtins see the refolded output path (for example "foo.c.mod")
-  // instead of the original TU path.  The prologue is only needed for
-  // invocations whose active logical file is still the original TU file at the
-  // invocation site.  When a source-authored #line before the invocation has
-  // already changed the active logical file, an initial TU prologue would be
-  // immediately dominated by that source directive and is only noise.
+  // If a copied TU suffix contains a preserved TU-local __FILE__ or
+  // __FILE_NAME__ observer, replaying the refolded output without an initial
+  // line directive would make that observer see the refolded output path (for
+  // example "foo.c.mod") instead of the original TU path.  This includes
+  // observer uses hidden behind a preserved macro expansion: in
   //
-  // Keep this narrowly scoped: do this only when such a builtin is actually
-  // invoked in the TU, line directives are enabled, and the output does not
-  // already begin with a #line directive.
+  //   #define PRINT(...) printf(__FILE__, __LINE__, __VA_ARGS__)
+  //   PRINT(1)
+  //
+  // the predefined __FILE__ record is physically spelled in the macro
+  // definition header, but the observation occurs at the PRINT(...) callsite in
+  // the TU.  Therefore the prologue test must project a preserved predefined
+  // builtin through its caller_macro_id chain and examine every observable
+  // non-#define site, exactly like the final producer-backed observer model.
+  //
+  // The prologue is only needed for sites whose active logical file is still
+  // the original TU file.  When a source-authored #line before the site has
+  // already changed the active logical file, an initial TU prologue would be
+  // dominated before the observer and would only add noise.
   if (lineDirs_.Enabled() && !tuResult.empty()) {
-    bool needsTUPrologue = false;
-    for (const auto &m : model_.GetMacroInvocations()) {
-      if (m.name != "__FILE__" && m.name != "__FILE_NAME__")
-        continue;
-      if (!m.invFile)
-        continue;
+    auto siteNeedsTUPrologue =
+        [&](const RefoldModel::MacroInvocation &site) -> bool {
+      if (IsInvocationInsideDefineDirective(site))
+        return false;
+      if (site.ownerIncludeId)
+        return false;
+      if (!site.invFile)
+        return false;
 
       // Compare absolute normalized paths to avoid relative-spelling
       // mismatches for the physical invocation owner. Producer spelling
       // (tuPath) is preserved in the emitted directive.
-      if (lineDirs_.ToAbsolutePath(*m.invFile) !=
+      if (lineDirs_.ToAbsolutePath(*site.invFile) !=
           lineDirs_.ToAbsolutePath(tuPath))
-        continue;
+        return false;
 
       // The source-authored line-control evaluator tells us what logical file
-      // the builtin observes at its invocation site.  If that logical file has
+      // the observer sees at its expansion/call site.  If that logical file has
       // already been changed away from the TU by a preserved #line directive,
       // then a synthetic prologue at the top of the refolded file cannot affect
-      // this invocation.  Conservatively keep the prologue when the invocation
+      // this observer.  Conservatively keep the prologue when the invocation
       // offset is unavailable, or when the active logical file is still the TU.
-      if (m.invB) {
+      if (site.invB) {
         LineDirectiveLocation loc =
-            LineDirectiveInserter::LogicalLocationAtOffset(tuBytes, *m.invB,
+            LineDirectiveInserter::LogicalLocationAtOffset(tuBytes, *site.invB,
                                                            tuPath, model_,
                                                            tuPath);
         if (lineDirs_.ToAbsolutePath(loc.fileSpelling) !=
             lineDirs_.ToAbsolutePath(tuPath))
-          continue;
+          return false;
       }
 
-      needsTUPrologue = true;
-      break;
+      return true;
+    };
+
+    bool needsTUPrologue = false;
+    for (const auto &m : model_.GetMacroInvocations()) {
+      if (m.name != "__FILE__" && m.name != "__FILE_NAME__")
+        continue;
+      if (!LineStateBuiltinInvocationIsPreservedObserver(m))
+        continue;
+
+      const RefoldModel::MacroInvocation *site = &m;
+      unsigned depth = 0;
+      const unsigned maxDepth =
+          static_cast<unsigned>(model_.GetMacroInvocations().size());
+      while (site && depth++ <= maxDepth) {
+        if (siteNeedsTUPrologue(*site)) {
+          needsTUPrologue = true;
+          break;
+        }
+        if (!site->callerMacroId)
+          break;
+        site = FindMacroInvocationById(*site->callerMacroId);
+      }
+
+      if (needsTUPrologue)
+        break;
     }
 
     if (needsTUPrologue &&
         !stringutils::startsWithAfterWs(StringRef(tuResult), "#line")) {
       std::string dir = lineDirs_.FormatLineDirective(1, tuPath);
-      if (!dir.empty())
+      if (!dir.empty()) {
+        const uint64_t insertedBytes = static_cast<uint64_t>(dir.size());
         tuResult.insert(0, dir);
+        for (FinalLineControlPruneCandidate &candidate :
+             finalLineControlPruneCandidates_) {
+          candidate.finalBegin += insertedBytes;
+          candidate.finalEnd += insertedBytes;
+        }
+        FinalLineControlPruneCandidate candidate;
+        candidate.finalBegin = 0;
+        candidate.finalEnd = insertedBytes;
+        candidate.origin = FinalLineDirective::Origin::SyntheticTUPrologue;
+        candidate.physicalOwner =
+            FinalLineControlOwnerKey(tuPath.str(), std::nullopt);
+        candidate.producerProven = true;
+        candidate.reason =
+            "synthetic TU prologue candidate with final-stream observer proof";
+        finalLineControlPruneCandidates_.push_back(std::move(candidate));
+      }
     }
   }
 
@@ -8607,6 +9020,85 @@ bool RefoldEngine::HunkMapsToTU(uint64_t a0, uint64_t a1,
   // INSERTION (A gap): classify TU ownership only when we can derive a
   // truthful TU insertion anchor at that exact PP gap.
   return FindProvableTUInsertionAnchor(a0, tuPath).has_value();
+}
+
+std::optional<uint64_t>
+RefoldEngine::AdvanceInsertionAnchorPastSourceLineControlPrefix(
+    StringRef ownerFile, std::optional<uint64_t> ownerIncludeId,
+    StringRef ownerBytes, uint64_t anchor) const {
+  if (anchor > ownerBytes.size())
+    return std::nullopt;
+
+  uint64_t cur = anchor;
+  bool advanced = false;
+
+  while (true) {
+    const RefoldModel::LineControlEvent *best = nullptr;
+
+    for (const RefoldModel::LineControlEvent &event : model_.GetLineControls()) {
+      if (!event.active || !event.producerProven || !event.siteB ||
+          !event.siteE)
+        continue;
+      if (event.ownerIncludeId != ownerIncludeId)
+        continue;
+      if (!PathsEqual(event.physicalFile, ownerFile))
+        continue;
+      if (*event.siteB < cur || *event.siteE <= cur ||
+          *event.siteE > ownerBytes.size())
+        continue;
+
+      // Only slide across zero-token whitespace before the directive.  Comments
+      // or other trivia may be intentionally positioned before the directive and
+      // must not be silently crossed by this source-placement rule.
+      if (!stringutils::isWs(ownerBytes.slice(cur, *event.siteB)))
+        continue;
+
+      if (!best || *event.siteB < *best->siteB ||
+          (*event.siteB == *best->siteB && event.id < best->id))
+        best = &event;
+    }
+
+    if (!best)
+      break;
+
+    cur = *best->siteE;
+    advanced = true;
+  }
+
+  if (!advanced || cur == anchor)
+    return std::nullopt;
+
+  trace("linedir/anchor",
+        "advance insertion anchor past source line-control prefix in {0}: "
+        "{1}->{2}",
+        ownerFile, anchor, cur);
+  return cur;
+}
+
+bool RefoldEngine::IsPPGapAtSelectedConditionalArmExit(uint64_t ppGap) const {
+  if (ppGap == 0)
+    return false;
+
+  std::optional<RefoldModel::ArmRef> leftArm =
+      model_.FindArmRefAtPP(ppGap - 1);
+  if (!leftArm || !leftArm->arm || !leftArm->arm->selected)
+    return false;
+
+  if (leftArm->arm->span && leftArm->arm->span->end != ppGap)
+    return false;
+
+  std::optional<RefoldModel::ArmRef> rightArm;
+  if (ppGap < model_.GetTokensCountA())
+    rightArm = model_.FindArmRefAtPP(ppGap);
+
+  if (rightArm && rightArm->arm && rightArm->arm->id == leftArm->arm->id)
+    return false;
+
+  trace("linedir/anchor",
+        "PP gap {0} exits selected conditional arm {1}; do not advance "
+        "insertion across suffix source line-control",
+        ppGap, leftArm->arm->id);
+  return true;
 }
 
 std::optional<uint64_t> RefoldEngine::AnchorToExactSlotBoundaryFromPPGap(
@@ -24387,7 +24879,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                 for (const auto &te : tokEdits)
                   edits.push_back(TextEdit{te.bAbs - minB, te.eAbs - minB,
                                            te.repl, std::nullopt,
-                                           std::nullopt, {}});
+                                           std::nullopt, {}, {}, {}});
                 llvm::sort(edits, [](const TextEdit &a, const TextEdit &b) {
                   return a.start < b.start;
                 });

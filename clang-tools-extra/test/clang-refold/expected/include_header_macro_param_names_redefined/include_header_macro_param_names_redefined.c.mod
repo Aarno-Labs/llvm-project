@@ -11,7 +11,6 @@
 RF_MARK(t28_after)
 
 int __refold_ins__t28_after = 0; /* pure insertion at after boundary for t28_after_marker */
-#line 13 "include_header_macro_param_names_redefined.c"
 int main(void) {
   return 0;
 }

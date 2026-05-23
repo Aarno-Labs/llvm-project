@@ -22,7 +22,6 @@ RF_MARK(t22_if_after_include)
 RF_MARK(t22_after)
 
 int __refold_ins__t22_after = 0; /* pure insertion at after boundary for t22_after_marker */
-#line 24 "tu_if_arm_include_h2_between_markers.c"
 int main(void) {
   return 0;
 }

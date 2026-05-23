@@ -12,7 +12,6 @@
 RF_MARK(t17_after)
 
 int __refold_ins__t17_after = 0; /* pure insertion at after boundary for t17_after_marker */
-#line 14 "tu_repeat_include_h1_guard_elision.c"
 int main(void) {
   return 0;
 }

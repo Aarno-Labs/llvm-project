@@ -2,7 +2,5 @@
 #define LOGICAL_PARENT_LINE 500
 #define LOGICAL_PARENT_FILE "logical_parent.c"
 #line LOGICAL_PARENT_LINE LOGICAL_PARENT_FILE
-#line 1 "headers/h_replace.h"
 int x = 2;
-#line 501 "logical_parent.c"
 int observed = __LINE__;

@@ -52,6 +52,7 @@
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDENGINE_H
 
 #include "DiffAlgorithms.h"
+#include "FinalLineControlModel.h"
 #include "LineDirectiveInserter.h"
 #include "RefoldModel.h"
 #include "StringUtils.h"
@@ -568,7 +569,9 @@ public:
          ArrayRef<size_t> bTokOff, bool noLines, bool strict,
          ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits = {},
          std::vector<MaterializedEditMapping> *materializedEditMappings =
-             nullptr);
+             nullptr,
+         FinalLineControlValidationCallback finalLineControlValidationCallback =
+             FinalLineControlValidationCallback());
 
   /// Build lexer language options from the producer-captured language name.
   static clang::LangOptions MakeLexLangOptions(llvm::StringRef langName);
@@ -582,6 +585,22 @@ private:
   bool strict_;
   LangOptions lexLang_;
   std::vector<MaterializedEditMapping> *materializedEditMappings_ = nullptr;
+  FinalLineControlValidationCallback finalLineControlValidationCallback_;
+
+  /// Final-output byte ranges for synthetic `#line` directives that the local
+  /// emitters have explicitly made eligible for the final fixed-point pruner.
+  /// The vector is cleared at the start of each top-level refold attempt and is
+  /// passed to the final pruner only after structural emission has selected the
+  /// actual output stream.
+  mutable std::vector<FinalLineControlPruneCandidate>
+      finalLineControlPruneCandidates_;
+
+  /// Final-output byte ranges that were copied byte-for-byte from a physical
+  /// source owner.  The final line-control scanner uses these mappings to bind
+  /// final `#line` directive bytes back to producer-recorded LineControlEvent
+  /// records without guessing through materialized B replay or synthetic text.
+  mutable std::vector<FinalLineControlSourceMapping>
+      finalLineControlSourceMappings_;
 
   /// Source edits for sideband pragma directive lines that were removed from
   /// the lexed A/B token streams before diffing. These are applied as ordinary
@@ -1174,12 +1193,16 @@ private:
                ArrayRef<PPTok> bToks, ArrayRef<size_t> bTokOff, bool noLines,
                bool strict, ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
                std::vector<MaterializedEditMapping> *materializedEditMappings =
-                   nullptr)
+                   nullptr,
+               FinalLineControlValidationCallback finalLineControlValidationCallback =
+                   FinalLineControlValidationCallback())
       : model_(std::move(model)), aSource_(aSource), bSource_(bSource),
         aToks_(aToks), bToks_(bToks), aTokOff_(aTokOff), bTokOff_(bTokOff),
         lineDirs_(!noLines, model_.GetPPCwd()), strict_(strict),
         lexLang_(MakeLexLangOptions(model_.GetPPLang())),
         materializedEditMappings_(materializedEditMappings),
+        finalLineControlValidationCallback_(
+            std::move(finalLineControlValidationCallback)),
         sidebandPragmaEdits_(sidebandPragmaEdits.begin(),
                              sidebandPragmaEdits.end()) {
     BuildMacroInvocationGraph();
@@ -1219,6 +1242,14 @@ private:
   bool AppendSidebandPragmaSourceEdits(StringRef tuPath, StringRef tuBytes,
                                        std::vector<TextEdit> &tuEdits);
 
+  /// Append TU realization edits for preserved source lines containing
+  /// `__LINE__` observers whose B-side preprocessed layout merged that line
+  /// with the previous PP line.  Such an observer cannot remain source-spelled:
+  /// no `#line` directive can be inserted at the required mid-line point, so
+  /// the line must be materialized as the B-side numeric token sequence.
+  bool AppendLineObserverLayoutRealizationEdits(
+      StringRef tuPath, StringRef tuBytes, std::vector<TextEdit> &tuEdits);
+
   // ---------------------------- Small Data Records ---------------------------
 
   /// Represents a pending resync that must be flushed at the next safe BOL.
@@ -1232,18 +1263,55 @@ private:
     std::string fileSpellingForDir;
     std::optional<uint64_t> ownerIncludeId;
 
+    // True when the pending synthetic resync was emitted for a concrete final
+    // observer demand and may therefore enter the fixed-point pruning candidate
+    // set.  The final liveness model now covers both lexical and producer-backed
+    // observers; executable clang -E -P validation remains the final guard.
+    bool finalLineControlPruneEligible = false;
+
+    // Logical state proved at the original source offset where the replacement
+    // rejoins untouched text.  Pending flushes may occur later, after copying a
+    // prefix of that untouched text; in that case the state advances by the
+    // non-spliced newlines copied between resumeOffset and the flush point.
+    std::string resumeFileSpelling;
+    size_t resumeLineNo = 0;
+    uint64_t resumeOffset = 0;
+
+    // True when the pending correction is dominated by a preserved conditional
+    // join rather than by the next textual BOL inside the selected arm.  In
+    // that case the line-state repair must be emitted by the join pass at the
+    // first post-group observer, not before an intervening preprocessor
+    // directive in only the selected arm.
+    bool deferToConditionalJoin = false;
+
     explicit PendingResync(llvm::StringRef file,
-                           std::optional<uint64_t> ownerInclude = std::nullopt)
-        : fileSpellingForDir(file.str()), ownerIncludeId(ownerInclude) {}
+                           std::optional<uint64_t> ownerInclude = std::nullopt,
+                           bool pruneEligible = false,
+                           llvm::StringRef resumeFile = llvm::StringRef(),
+                           size_t resumeLine = 0,
+                           uint64_t resumeAt = 0,
+                           bool deferToJoin = false)
+        : fileSpellingForDir(file.str()), ownerIncludeId(ownerInclude),
+          finalLineControlPruneEligible(pruneEligible),
+          resumeFileSpelling(resumeFile.empty() ? file.str()
+                                                : resumeFile.str()),
+          resumeLineNo(resumeLine), resumeOffset(resumeAt),
+          deferToConditionalJoin(deferToJoin) {}
   };
 
   /// The final text and optional pending state for an edit.
   struct ResyncOutcome {
     std::string text;
     std::optional<PendingResync> pending;
+    std::vector<FinalLineControlPruneCandidate> lineControlPruneCandidates;
 
     ResyncOutcome(std::string t, std::optional<PendingResync> p)
         : text(std::move(t)), pending(std::move(p)) {}
+
+    ResyncOutcome(std::string t, std::optional<PendingResync> p,
+                  std::vector<FinalLineControlPruneCandidate> candidates)
+        : text(std::move(t)), pending(std::move(p)),
+          lineControlPruneCandidates(std::move(candidates)) {}
   };
 
   struct AcceptedResultCandidate;
@@ -1264,6 +1332,19 @@ private:
     // later universal proof gate can reason over the actual emitted surface.
     std::vector<std::shared_ptr<const AcceptedResultCandidate>>
         acceptedResults;
+
+    // Final-output line-control pruning candidates carried by this edit, using
+    // byte offsets relative to `text`.  Only synthetic directives that a local
+    // emitter explicitly proves eligible are listed here; source-authored
+    // directives copied through materialized text remain fail-closed until the
+    // final model has producer-backed source-line-control evidence.
+    std::vector<FinalLineControlPruneCandidate> lineControlPruneCandidates = {};
+
+    // Final-output source mappings carried by replacement text, using byte
+    // offsets relative to `text`.  These are present only for byte-for-byte
+    // source material threaded through a replacement, such as materialized
+    // include bodies.  Replayed B payloads and synthetic text remain unmapped.
+    std::vector<FinalLineControlSourceMapping> lineControlSourceMappings = {};
 
     // Optional provenance for a TextEdit emitted directly from a single
     // token-level TU hunk. This is deliberately not inferred for macro,
@@ -1297,6 +1378,17 @@ private:
     // source surface corresponding to the B-side materialization witness.
     std::optional<uint64_t> materializedOutputTextBegin = std::nullopt;
     std::optional<uint64_t> materializedOutputTextEnd = std::nullopt;
+  };
+
+  /// Replacement text produced while wrapping a materialized include together
+  /// with the synthetic line-control candidates that were inserted by the
+  /// wrapper.  Candidate offsets are relative to `text`; the file-level edit
+  /// applicator translates them to final-output offsets only after all edit
+  /// normalization and pending-resync flushing has been resolved.
+  struct LineControlWrappedText {
+    std::string text;
+    std::vector<FinalLineControlPruneCandidate> lineControlPruneCandidates = {};
+    std::vector<FinalLineControlSourceMapping> lineControlSourceMappings = {};
   };
 
   // Result of planning header-local edits for one include. When
@@ -2647,6 +2739,15 @@ private:
     bool ownerHasCondArmCert = false;
     uint64_t ownerCondArmIdCert = 0;
 
+    /// Some include-local layout repairs are already proved as source-byte edits
+    /// before the generic include patch applicator runs.  Keep the PP-token A/B
+    /// range as the proof envelope, but do not ask the generic mapper to recover
+    /// a different byte range from that envelope: the layout theorem has already
+    /// chosen the exact header bytes that must be replaced.
+    bool hasDirectHeaderByteRange = false;
+    uint64_t directHeaderByteBegin = 0;
+    uint64_t directHeaderByteEnd = 0;
+
     std::string ToString() const {
       // 1. Determine the path (Using StringRef to avoid extra copies)
       StringRef path;
@@ -2669,10 +2770,15 @@ private:
 
       return formatv(
                  "IncludePatch{{incId={0}, path={1}, A=[{2},{3}), B=[{4},{5}), "
-                 "condArm={6}, insert='{7}{8}'}",
+                 "condArm={6}, directBytes={7}, insert='{8}{9}'}",
                  include->id, path, aStart, aEnd, bStart, bEnd,
                  ownerHasCondArmCert
                      ? std::to_string(ownerCondArmIdCert)
+                     : std::string("(none)"),
+                 hasDirectHeaderByteRange
+                     ? formatv("[{0},{1})", directHeaderByteBegin,
+                               directHeaderByteEnd)
+                           .str()
                      : std::string("(none)"),
                  escapedPreview, (truncated ? "..." : ""))
           .str();
@@ -2688,6 +2794,16 @@ private:
 
     void Add(IncludePatch &&P) { patches.push_back(std::move(P)); }
   };
+
+  /// Append include-local realization patches for preserved header-owned
+  /// `__LINE__` observers whose B-side preprocessed layout merged the
+  /// observer's physical source line with the previous PP line.  This is the
+  /// include-owner analogue of AppendLineObserverLayoutRealizationEdits(): no
+  /// legal `#line` directive can repair a source-spelled observer that must
+  /// remain on the merged physical line, so the observer line must be
+  /// materialized as B bytes inside the owning header include.
+  bool AppendIncludeLineObserverLayoutRealizationEdits(
+      DenseMap<uint64_t, IncludeEdits> &perInclude);
 
   // ------------------------------- Core Helpers ------------------------------
 
@@ -3010,6 +3126,36 @@ private:
   std::optional<uint64_t>
   AnchorToExactSlotBoundaryFromPPGap(StringRef tuPath, uint64_t ppGap,
                                      TUAnchorWitness *witness = nullptr) const;
+
+  /// Advance a proved zero-width insertion anchor past a contiguous prefix of
+  /// active, source-authored line-control directives in the same owner.
+  ///
+  /// In PP token space, a source `#line` directive contributes no token, so the
+  /// gap immediately before the directive and the gap immediately before the
+  /// first token governed by that directive collapse to the same PP coordinate.
+  /// When the insertion is anchored at such a zero-token prefix, prefer the
+  /// post-directive byte position so preserved source line-control continues to
+  /// dominate the inserted material rather than forcing a synthetic physical
+  /// resync before the original directive.
+  std::optional<uint64_t> AdvanceInsertionAnchorPastSourceLineControlPrefix(
+      StringRef ownerFile, std::optional<uint64_t> ownerIncludeId,
+      StringRef ownerBytes, uint64_t anchor) const;
+
+  /// Return true iff a pure-insertion PP gap sits immediately after the
+  /// selected arm's last PP token and before the rejoined suffix.  Such a gap
+  /// belongs before suffix-local source line-control, not after it.
+  bool IsPPGapAtSelectedConditionalArmExit(uint64_t ppGap) const;
+
+  /// Return true iff a line-resync created at \p resumeOffset should be
+  /// discharged by the conditional-join repair pass rather than emitted inside
+  /// the selected arm.  This is the dominance counterpart of include-return
+  /// deferral: when the first preserved line-state observer is after the
+  /// conditional group rejoins, an arm-local #line before an intervening
+  /// directive such as #include is valid but over-eager and can suppress the
+  /// canonical post-group repair.
+  bool LineResyncShouldDeferToConditionalJoin(
+      StringRef ownerFile, std::optional<uint64_t> ownerIncludeId,
+      uint64_t resumeOffset) const;
 
   /// \brief Finds the ID of the narrowest include range that covers a given PP
   /// index.
@@ -4940,6 +5086,16 @@ private:
   ///          \p macroId is unknown, returns \p macroId unchanged.
   uint64_t GetRootMacroId(uint64_t macroId) const;
 
+  /// Return the source spelling site that observes a line-state builtin.
+  ///
+  /// For direct uses this is \p macro itself. For builtins expanded from a
+  /// user macro replacement list, this follows callerMacroId links to the
+  /// outermost callsite that remains visible in refolded source. The builtin
+  /// record still supplies the produced-token cover; the returned site supplies
+  /// owner, byte offset, physical line, and conditional-depth placement.
+  const RefoldModel::MacroInvocation *LineStateObservableMacroSite(
+      const RefoldModel::MacroInvocation &macro) const;
+
   /// \brief Return whether a macro patch leaves its owning root callsite
   ///        expanded in the final refolded source.
   ///
@@ -5071,6 +5227,10 @@ private:
       const DenseMap<uint64_t, std::vector<const RefoldModel::IncludeItem *>>
           &children,
       DenseMap<uint64_t, std::string> &includeExpansion,
+      DenseMap<uint64_t, std::vector<FinalLineControlPruneCandidate>>
+          &includeExpansionLineControlPruneCandidates,
+      DenseMap<uint64_t, std::vector<FinalLineControlSourceMapping>>
+          &includeExpansionLineControlSourceMappings,
       DenseMap<uint64_t, size_t> &includeExpansionStartLineNos,
       DenseMap<uint64_t, AcceptedResultCandidate>
           &includeExpansionAcceptedResults,
@@ -5322,8 +5482,10 @@ private:
       std::optional<uint64_t> ownerIncludeId = std::nullopt) const {
     ResyncOutcome o = ApplyResyncOrPend(original, start, end, replacement,
                                         fileSpelling, ownerIncludeId);
-    return TextEdit{start, end, std::move(o.text), std::move(o.pending),
-                    std::nullopt, {}};
+    TextEdit edit{start, end, std::move(o.text), std::move(o.pending),
+                  std::nullopt, {}, {}};
+    edit.lineControlPruneCandidates = std::move(o.lineControlPruneCandidates);
+    return edit;
   }
 
   /// \brief Computes how to preserve __LINE__ after applying replacement to
@@ -5344,7 +5506,9 @@ private:
   ///
   /// Safety note: local injection may fail when inserting a directive would
   /// change token adjacency (e.g., when the replacement ends mid-line, or when
-  /// no safe BOL exists in/around the replacement).
+  /// no safe BOL exists in/around the replacement). In that case, pending
+  /// resync state is carried only because a model-recorded suffix __LINE__
+  /// observer exists; otherwise no synthetic directive is produced.
   ///
   /// \param originalFileText Pre-edit file contents the offsets refer to.
   /// \param start Start offset (inclusive) in originalFileText.
@@ -5365,8 +5529,113 @@ private:
   /// line-state-sensitive builtin invocation.
   bool IncludeSubtreeHasLineStateSensitiveBuiltin(uint64_t includeId) const;
 
+  /// \brief Return true iff a recorded location-sensitive builtin still has a
+  /// token-identical A/B surface and therefore remains a preserved observer.
+  ///
+  /// A source builtin that will be materialized by a later accepted edit is not
+  /// a demand witness for synthetic #line insertion.
+  bool LineStateBuiltinInvocationIsPreservedObserver(
+      const RefoldModel::MacroInvocation &macro) const;
+
+  /// Return true iff a preserved observer represented by \p macro requires
+  /// producer-backed final observer evidence instead of the lexical final-source
+  /// scanner alone.
+  ///
+  /// Direct source-spelled predefined builtins are visible as ordinary final
+  /// tokens when preserved.  Builtins reached through a caller_macro_id chain,
+  /// through incomplete macro metadata, or through missing token-map proof are
+  /// producer-backed observer facts.  The final observer model now consumes that
+  /// producer evidence directly, so this predicate is retained only to describe
+  /// the demand source in traces and audits.
+  bool LineStateBuiltinInvocationNeedsProducerBackedFinalObserver(
+      const RefoldModel::MacroInvocation &macro) const;
+
+  /// Describes which components of the logical location are observed by
+  /// preserved location-sensitive builtins in an owner suffix.
+  struct LineStateObserverDemand {
+    bool needsLine = false;
+    bool needsFile = false;
+
+    // True when at least one demand witness is represented by producer-backed
+    // final observer evidence rather than direct lexical final-source spelling.
+    // This is no longer a pruning veto: Step #3 made those observers visible to
+    // the final liveness model, and Step #6 fail-closes any deletion whose
+    // executable clang -E -P validation cannot be run or does not match.
+    bool hasProducerBackedFinalObserver = false;
+
+    bool Any() const { return needsLine || needsFile; }
+    bool PrunableByCurrentFinalObserverModel() const { return Any(); }
+  };
+
+  /// \brief Return true iff a source-authored line-control directive in the
+  /// same owner is producer-proven active before \p offset.
+  ///
+  /// Include-entry line-control minimization needs to know whether the emitted
+  /// child body will overwrite the synthetic entry state before any preserved
+  /// location-sensitive observer can consume it.  This query is intentionally
+  /// source/model-backed: it recognizes line-control spelling in the owner file
+  /// and uses the producer-recorded conditional arm selection rather than
+  /// re-evaluating #if expressions.
+  bool SourcePrefixHasProducerActiveLineControl(
+      StringRef ownerFile, std::optional<uint64_t> ownerIncludeId,
+      uint64_t offset) const;
+
+  /// \brief Return the logical-location components observed by preserved
+  /// location-sensitive builtins in an include subtree.
+  ///
+  /// This is the child-entry analogue of OwnerSuffixLineStateObserverDemand():
+  /// the query is owner-polymorphic across the include tree and counts only
+  /// builtins whose A-side token surface is still preserved in B. Materialized
+  /// former builtins are ordinary replacement text and therefore do not demand
+  /// a synthetic #line transition.
+  LineStateObserverDemand IncludeSubtreeLineStateObserverDemand(
+      uint64_t includeId) const;
+
+  /// \brief Return true iff an include-entry #line discharges a concrete
+  /// zero-token layout obligation in the parent owner.
+  ///
+  /// If a materialized include is the first token-producing text after
+  /// preserved zero-token parent material, omitting the entry directive can make
+  /// `clang -E -P` reproduce the parent's physical blank line rather than the
+  /// B-side layout. The decision is derived from the producer map and the
+  /// parent source, not from formatting preference.
+  bool IncludeEntryLineDirectiveDischargesLayoutBarrier(
+      const RefoldModel::IncludeItem &child,
+      StringRef parentOwnerFileForDemand) const;
+
+  /// \brief Return the logical-location components observed by the untouched
+  /// suffix of an owner file.
+  ///
+  /// The result is owner-polymorphic and projects nested predefined builtins
+  /// back to their outermost source callsite before comparing byte offsets.
+  /// `__LINE__` observes the logical line component; `__FILE__` and
+  /// `__FILE_NAME__` observe the logical file component. `__BASE_FILE__` is
+  /// intentionally excluded because synthetic #line directives do not affect
+  /// its value.
+  LineStateObserverDemand OwnerSuffixLineStateObserverDemand(
+      std::optional<uint64_t> ownerIncludeId, StringRef ownerFile,
+      uint64_t offset) const;
+
+  /// Earliest preserved line-state observer in an owner suffix.
+  ///
+  /// This is the ordered counterpart of OwnerSuffixLineStateObserverDemand().
+  /// It follows caller_macro_id chains so that a predefined builtin spelled in
+  /// a macro definition is attributed to the observable callsite in the owner
+  /// file.  The returned byte offset is therefore a source byte where a
+  /// dominating #line can be emitted to repair all preserved configurations
+  /// reaching that observer.
+  struct LineStateObserverSite {
+    uint64_t offset = 0;
+    LineStateObserverDemand demand;
+  };
+
+  std::optional<LineStateObserverSite> FirstOwnerSuffixLineStateObserverSite(
+      std::optional<uint64_t> ownerIncludeId, StringRef ownerFile,
+      uint64_t offset) const;
+
   /// \brief Return true iff the untouched suffix of an owner file contains a
-  /// line-state-sensitive builtin invocation.
+  /// location-sensitive builtin invocation that can observe synthetic #line
+  /// repair.
   bool OwnerSuffixHasLineStateSensitiveBuiltin(
       std::optional<uint64_t> ownerIncludeId, StringRef ownerFile,
       uint64_t offset) const;
@@ -5382,18 +5651,21 @@ private:
 
   /// \brief Wrap materialized include text with the correct #line policy.
   ///
-  /// Ordinary include materialization in --with-lines mode preserves the full
-  /// child-enter/parent-resume wrapper.  The child-enter line is the logical
-  /// source line of the first emitted materialized header line, not blindly line
-  /// one: deleting a leading sideband directive must advance the enter line to
-  /// the first surviving header line.  The final boolean enables the narrower
-  /// sideband-pragma-only suppression path; empty sideband-only materializations
-  /// can omit wrappers when unobservable, but non-empty header replay still
-  /// carries a real owner transition in --with-lines output.
-  std::string WrapIncludeExpansionForMaterialization(
+  /// The child-enter line is the logical source line of the first emitted
+  /// materialized header line, not blindly line one: deleting a leading sideband
+  /// directive must advance the enter line to the first surviving header line.
+  /// Entry and return directives are emitted only when they discharge a
+  /// preserved line-state observer or a concrete zero-token layout obligation.
+  /// The final boolean enables the narrower sideband-pragma-only path; it uses
+  /// the same demand proof but may return an empty wrapper immediately when no
+  /// observable bytes remain.
+  LineControlWrappedText WrapIncludeExpansionForMaterialization(
       const RefoldModel::IncludeItem &child, StringRef parentFileSpelling,
+      StringRef parentOwnerFileForDemand,
       std::optional<uint64_t> parentOwnerIncludeId, uint64_t parentResumeOffset,
       size_t childEntryLineNo, size_t parentResumeLineNo, StringRef childBody,
+      ArrayRef<FinalLineControlPruneCandidate> childBodyLineControlCandidates,
+      ArrayRef<FinalLineControlSourceMapping> childBodyLineControlSourceMappings,
       bool allowUnobservableLineDirectiveSuppression) const;
 
   /// \brief Applies a set of TextEdits to originalFileText, producing the final
@@ -5436,8 +5708,11 @@ private:
       DenseSet<uint64_t> *appliedExpandedMacroRootIds = nullptr,
       StringRef emissionOwner = StringRef(),
       std::optional<uint64_t> ownerIncludeId = std::nullopt,
-      std::vector<MaterializedEditMapping> *materializedEditMappings =
-          nullptr) const;
+      std::vector<MaterializedEditMapping> *materializedEditMappings = nullptr,
+      std::vector<FinalLineControlPruneCandidate>
+          *lineControlPruneCandidates = nullptr,
+      std::vector<FinalLineControlSourceMapping>
+          *lineControlSourceMappings = nullptr) const;
 
   /// Convert a B-token range into a half-open B-byte range.
   std::optional<std::pair<uint64_t, uint64_t>>
@@ -5567,7 +5842,13 @@ private:
   std::optional<PendingResync>
   AppendOriginalSliceWithPending(SmallVectorImpl<char> &out, StringRef original,
                                  uint64_t from, uint64_t to,
-                                 std::optional<PendingResync> pending) const;
+                                 std::optional<PendingResync> pending,
+                                 StringRef emissionOwner = StringRef(),
+                                 std::optional<uint64_t> ownerIncludeId = std::nullopt,
+                                 std::vector<FinalLineControlPruneCandidate>
+                                     *lineControlPruneCandidates = nullptr,
+                                 std::vector<FinalLineControlSourceMapping>
+                                     *lineControlSourceMappings = nullptr) const;
 
   // ------------------------ Low-level Mapping & Utils ------------------------
 

@@ -354,6 +354,25 @@ struct CondGroup {
   std::vector<CondArm> Arms;
 };
 
+/// Producer-proven active source line-control event.
+///
+/// Clang has already evaluated any macro operands and conditional activity by
+/// the time this event is recorded.  The consumer therefore does not need to
+/// parse or re-evaluate arbitrary `#line` expressions to recover the logical
+/// state established by this directive.
+struct LineControlEvent {
+  uint64_t ID = 0;
+  std::string PhysicalFile;
+  std::optional<uint64_t> SiteBegin;
+  std::optional<uint64_t> SiteEnd;
+  bool Active = true;
+  bool ProducerProven = true;
+  uint64_t LogicalLineAfter = 0;
+  std::string LogicalFileAfter;
+  std::optional<uint64_t> OwnerIncludeId;
+  std::string Text;
+};
+
 /// Builds a deterministic “refold map” by observing the Clang preprocessor.
 ///
 /// This class hooks into `clang::Preprocessor` callbacks (include directives,
@@ -408,6 +427,7 @@ class RefoldMapBuilder {
   std::optional<size_t> CurrentFileItem;
 
   std::vector<TokMapEntry> TokMap;
+  std::vector<LineControlEvent> LineControlEvents;
 
   std::string OutPath;
   std::string
@@ -565,6 +585,14 @@ public:
   ///  - Token spans contributed by the expansion while it is active.
   void onMacroExpands(const Token &MacroNameTok, const MacroDefinition &MD,
                       SourceRange Range, const MacroArgs *Args);
+
+  /// Callback for an active source `#line` / GNU line-marker directive.
+  ///
+  /// The preprocessor has already evaluated conditional activity and any macro
+  /// operands before this callback is reached, so the recorded logical state is
+  /// producer-proven.  The source-site range is best-effort: it is present when
+  /// the physical directive line can be located deterministically.
+  void onLineControlDirective(SourceLocation Loc);
 
   /// Callback for a raw `#pragma` line.
   ///

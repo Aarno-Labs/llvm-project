@@ -86,6 +86,23 @@ uint64_t RefoldEngine::GetRootMacroId(uint64_t macroId) const {
   return cur->id;
 }
 
+const RefoldModel::MacroInvocation *
+RefoldEngine::LineStateObservableMacroSite(
+    const RefoldModel::MacroInvocation &macro) const {
+  const RefoldModel::MacroInvocation *site = &macro;
+  const unsigned maxDepth =
+      static_cast<unsigned>(model_.GetMacroInvocations().size());
+  unsigned depth = 0;
+  while (site->callerMacroId && depth++ < maxDepth) {
+    const RefoldModel::MacroInvocation *caller =
+        FindMacroInvocationById(*site->callerMacroId);
+    if (!caller)
+      break;
+    site = caller;
+  }
+  return site;
+}
+
 std::optional<std::string> RefoldEngine::BuildInlineIncludeRealizationFromB(
     const RefoldModel::IncludeItem &inc, StringRef reason,
     AcceptedResultCandidate *acceptedCandidate) const {
@@ -143,8 +160,184 @@ std::optional<std::string> RefoldEngine::BuildInlineIncludeRealizationFromB(
 
 // ============ Include processing (normalize, materialize, apply) =============
 
-bool RefoldEngine::IncludeSubtreeHasLineStateSensitiveBuiltin(
-    uint64_t includeId) const {
+/// Return true iff a physical source line is lexically a line-control
+/// directive.  This intentionally recognizes only the directive class, not the
+/// expanded operands: for entry-wrapper minimization it is enough to know that
+/// the emitted child text will overwrite any synthetic entry #line before a
+/// later observer can consume it.
+static bool refoldLineSpellingIsLineControlDirective(StringRef line) {
+  const size_t to = line.size();
+  size_t p = 0;
+  while (p < to && stringutils::isWs(line[p]) && line[p] != '\n')
+    ++p;
+  if (p >= to || line[p] != '#')
+    return false;
+  ++p;
+  while (p < to && stringutils::isWs(line[p]) && line[p] != '\n')
+    ++p;
+
+  if (p + 4 <= to && line.substr(p, 4) == "line" &&
+      (p + 4 == to || stringutils::isWs(line[p + 4])))
+    return true;
+
+  // Clang/GCC numeric line-control spelling: # 123 "file".
+  return p < to && std::isdigit(static_cast<unsigned char>(line[p]));
+}
+
+/// Return the original-source byte offset of the directive-introducing '#'
+/// for a physical source line.  The conditional model is expressed in original
+/// byte coordinates, so the activity query below must use the real source byte
+/// rather than the trimmed line-local position.
+static bool refoldIsHorizontalWhitespace(char c) {
+  return c == ' ' || c == '\t' || c == '\f' || c == '\v' || c == '\r';
+}
+
+static std::optional<uint64_t>
+refoldFindDirectiveHashOffset(StringRef src, uint64_t lineBegin,
+                              uint64_t lineEnd) {
+  uint64_t p = lineBegin;
+  while (p < lineEnd && p < src.size()) {
+    if (refoldIsHorizontalWhitespace(src[p])) {
+      ++p;
+      continue;
+    }
+
+    if (src[p] == '\\') {
+      if (p + 1 < lineEnd && src[p + 1] == '\n') {
+        p += 2;
+        continue;
+      }
+      if (p + 2 < lineEnd && src[p + 1] == '\r' && src[p + 2] == '\n') {
+        p += 3;
+        continue;
+      }
+    }
+
+    if (p + 1 < lineEnd && src[p] == '/' && src[p + 1] == '*') {
+      p += 2;
+      bool closed = false;
+      while (p + 1 < lineEnd) {
+        if (src[p] == '\\') {
+          if (p + 1 < lineEnd && src[p + 1] == '\n') {
+            p += 2;
+            continue;
+          }
+          if (p + 2 < lineEnd && src[p + 1] == '\r' &&
+              src[p + 2] == '\n') {
+            p += 3;
+            continue;
+          }
+        }
+        if (src[p] == '*' && src[p + 1] == '/') {
+          p += 2;
+          closed = true;
+          break;
+        }
+        ++p;
+      }
+      if (!closed)
+        return std::nullopt;
+      continue;
+    }
+
+    if (p + 1 < lineEnd && src[p] == '/' && src[p + 1] == '/')
+      return std::nullopt;
+
+    if (src[p] == '#')
+      return p;
+
+    return std::nullopt;
+  }
+  return std::nullopt;
+}
+
+bool RefoldEngine::SourcePrefixHasProducerActiveLineControl(
+    StringRef ownerFile, std::optional<uint64_t> ownerIncludeId,
+    uint64_t offset) const {
+  auto bufOrErr =
+      MemoryBuffer::getFile(lineDirs_.ToAbsolutePath(ownerFile));
+  if (!bufOrErr) {
+    // This query is used only to suppress an otherwise demanded synthetic
+    // include-entry #line.  If the owner source cannot be read, fail closed and
+    // keep the wrapper rather than inferring that the real line-control stream
+    // will kill it.
+    trace("linedir/include",
+          "keep include-entry #line: unable to read owner '{0}' while "
+          "checking source line-control prefix ({1})",
+          ownerFile, bufOrErr.getError().message());
+    return false;
+  }
+
+  const MemoryBuffer &mb = **bufOrErr;
+  StringRef src(mb.getBufferStart(), mb.getBufferSize());
+  const uint64_t limit = std::min<uint64_t>(offset, src.size());
+
+  auto directiveIsProducerActive = [&](uint64_t hashOffset) -> bool {
+    for (const RefoldModel::CondGroup &group : model_.GetConds()) {
+      if (!PathsEqual(group.file, ownerFile) ||
+          group.parentIncludeId != ownerIncludeId)
+        continue;
+      if (!group.ContainsByte(hashOffset))
+        continue;
+
+      bool sawSelectedArm = false;
+      bool selectedArmContainsDirective = false;
+      for (const RefoldModel::CondArm &arm : group.arms) {
+        if (!arm.selected)
+          continue;
+        sawSelectedArm = true;
+        if (arm.ContainsByte(hashOffset)) {
+          selectedArmContainsDirective = true;
+          break;
+        }
+      }
+
+      if (selectedArmContainsDirective)
+        continue;
+
+      // If a selected material-producing arm exists but does not contain the
+      // directive, the directive is proven inactive.  If no selected arm exists,
+      // the active branch may have produced only directive effects, which is
+      // unproven from CondArm::selected alone; keep the synthetic wrapper in
+      // that case as well.
+      (void)sawSelectedArm;
+      return false;
+    }
+    return true;
+  };
+
+  uint64_t lineBegin = 0;
+  while (lineBegin < limit) {
+    uint64_t lineEnd = lineBegin;
+    while (lineEnd < src.size() && src[lineEnd] != '\n')
+      ++lineEnd;
+
+    const uint64_t clampedEnd = std::min<uint64_t>(lineEnd, limit);
+    if (std::optional<uint64_t> hash =
+            refoldFindDirectiveHashOffset(src, lineBegin, clampedEnd)) {
+      if (refoldLineSpellingIsLineControlDirective(
+              src.slice(*hash, clampedEnd)) &&
+          directiveIsProducerActive(*hash)) {
+        trace("linedir/include",
+              "source line-control prefix in owner '{0}' before byte {1} "
+              "kills synthetic include-entry state at byte {2}",
+              ownerFile, offset, *hash);
+        return true;
+      }
+    }
+
+    if (lineEnd >= limit || lineEnd >= src.size())
+      break;
+    lineBegin = lineEnd + 1;
+  }
+
+  return false;
+}
+
+RefoldEngine::LineStateObserverDemand
+RefoldEngine::IncludeSubtreeLineStateObserverDemand(uint64_t includeId) const {
+  LineStateObserverDemand demand;
+
   auto isDescendantOrSelf = [&](uint64_t owner) -> bool {
     uint64_t cur = owner;
     while (true) {
@@ -158,21 +351,1677 @@ bool RefoldEngine::IncludeSubtreeHasLineStateSensitiveBuiltin(
   };
 
   for (const auto &macro : model_.GetMacroInvocations()) {
-    if (!stringutils::isLineDirectiveSensitiveBuiltin(macro.name) ||
-        !macro.ownerIncludeId) {
+    const bool observesLine = macro.name == "__LINE__";
+    const bool observesFile =
+        macro.name == "__FILE__" || macro.name == "__FILE_NAME__";
+    if (!observesLine && !observesFile)
+      continue;
+
+    // A builtin may be recorded at a macro definition site while the observable
+    // use lives at an outer caller in this include subtree. Follow the same
+    // caller chain used by the owner-suffix demand query so child-entry wrappers
+    // are selected by the site that will remain in emitted source.
+    const RefoldModel::MacroInvocation *site = &macro;
+    unsigned depth = 0;
+    const unsigned maxDepth =
+        static_cast<unsigned>(model_.GetMacroInvocations().size());
+    while (site->callerMacroId && depth++ < maxDepth) {
+      const RefoldModel::MacroInvocation *caller =
+          FindMacroInvocationById(*site->callerMacroId);
+      if (!caller)
+        break;
+      site = caller;
+    }
+
+    std::optional<uint64_t> owner = site->ownerIncludeId;
+    if (!owner)
+      owner = macro.ownerIncludeId;
+    if (!owner || !isDescendantOrSelf(*owner))
+      continue;
+
+    if (!LineStateBuiltinInvocationIsPreservedObserver(macro)) {
+      trace("linedir/include",
+            "skip include-entry demand: builtin {0} macro id={1} is "
+            "materialized or token-changed in B",
+            macro.name, macro.id);
       continue;
     }
-    if (isDescendantOrSelf(*macro.ownerIncludeId))
-      return true;
+
+    if (site->invFile && site->invB &&
+        SourcePrefixHasProducerActiveLineControl(*site->invFile, owner,
+                                                 *site->invB)) {
+      trace("linedir/include",
+            "skip include-entry demand: builtin {0} macro id={1} owner='{2}' "
+            "byte={3} is already dominated by source line-control in the "
+            "materialized child body",
+            macro.name, macro.id, *site->invFile, *site->invB);
+      continue;
+    }
+
+    demand.needsLine |= observesLine;
+    demand.needsFile |= observesFile;
+    demand.hasProducerBackedFinalObserver |=
+        LineStateBuiltinInvocationNeedsProducerBackedFinalObserver(macro);
+    if (demand.needsLine && demand.needsFile &&
+        demand.hasProducerBackedFinalObserver)
+      break;
   }
+
+  return demand;
+}
+
+bool RefoldEngine::IncludeSubtreeHasLineStateSensitiveBuiltin(
+    uint64_t includeId) const {
+  return IncludeSubtreeLineStateObserverDemand(includeId).Any();
+}
+
+bool RefoldEngine::IncludeEntryLineDirectiveDischargesLayoutBarrier(
+    const RefoldModel::IncludeItem &child,
+    StringRef parentOwnerFileForDemand) const {
+  auto bufOrErr =
+      MemoryBuffer::getFile(lineDirs_.ToAbsolutePath(parentOwnerFileForDemand));
+  if (!bufOrErr) {
+    // Failing closed here preserves the old wrapper behavior. The minimization
+    // proof is source-backed; if the parent owner cannot be read, do not infer
+    // that a layout barrier is unneeded.
+    trace("linedir/include",
+          "keep include-entry #line inc#{0}: unable to read parent owner '{1}' "
+          "for layout proof ({2})",
+          child.id, parentOwnerFileForDemand, bufOrErr.getError().message());
+    return true;
+  }
+
+  const MemoryBuffer &mb = **bufOrErr;
+  StringRef parent(mb.getBufferStart(), mb.getBufferSize());
+  const uint64_t includeSite =
+      std::min<uint64_t>(child.siteB, static_cast<uint64_t>(parent.size()));
+  if (includeSite == 0)
+    return false;
+
+  const auto &tokmapByPP = model_.GetTokmapByPP();
+
+  auto ownerLineHasMappedToken = [&](uint64_t lineBegin,
+                                     uint64_t lineEnd) -> bool {
+    for (const auto &it : tokmapByPP) {
+      const RefoldModel::TokMapEntry &tok = it.second;
+      if (!PathsEqual(tok.file, parentOwnerFileForDemand))
+        continue;
+      if (tok.b >= lineBegin && tok.b < lineEnd)
+        return true;
+    }
+    return false;
+  };
+
+  auto lineHasActiveIncludeSite = [&](uint64_t lineBegin,
+                                      uint64_t lineEnd) -> bool {
+    for (const RefoldModel::IncludeItem &inc : model_.GetIncludes()) {
+      if (!PathsEqual(inc.sitePath, parentOwnerFileForDemand))
+        continue;
+      if (inc.siteB >= lineBegin && inc.siteB < lineEnd)
+        return true;
+    }
+    return false;
+  };
+
+  auto lineCanEmitPreprocessedOutput = [&](StringRef line, uint64_t lineBegin,
+                                           uint64_t lineEnd) -> bool {
+    if (ownerLineHasMappedToken(lineBegin, lineEnd))
+      return true;
+    if (lineHasActiveIncludeSite(lineBegin, lineEnd))
+      return true;
+
+    // Pragmas are not part of the ordinary token map, but preserved active
+    // pragmas are visible in `-E -P` output and therefore reset the physical
+    // blank-line run. Other preprocessing directives are treated as zero-token
+    // layout material for this proof; keeping a wrapper in those cases is
+    // conservative and avoids inferring output from directive spelling alone.
+    size_t pos = 0;
+    while (pos < line.size() && stringutils::isNonNewlineWs(line[pos]))
+      ++pos;
+    if (pos >= line.size() || line[pos] != '#')
+      return false;
+    ++pos;
+    while (pos < line.size() && stringutils::isNonNewlineWs(line[pos]))
+      ++pos;
+    const size_t identBegin = pos;
+    auto isIdentBody = [](char c) {
+      return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+             (c >= '0' && c <= '9') || c == '_';
+    };
+    while (pos < line.size() && isIdentBody(line[pos]))
+      ++pos;
+    return line.slice(identBegin, pos) == "pragma";
+  };
+
+  bool sawOutputLine = false;
+  bool sawZeroTokenLineBeforeFirstOutput = false;
+  bool sawZeroTokenLineAfterLastOutput = false;
+
+  uint64_t lineBegin = 0;
+  while (lineBegin < includeSite) {
+    uint64_t lineEnd = lineBegin;
+    while (lineEnd < parent.size() && parent[lineEnd] != '\n')
+      ++lineEnd;
+    if (lineEnd >= includeSite)
+      break; // Ignore indentation/trivia on the current include line.
+
+    StringRef line = parent.slice(lineBegin, lineEnd);
+    const bool canEmit =
+        lineCanEmitPreprocessedOutput(line, lineBegin, lineEnd);
+    if (canEmit) {
+      sawOutputLine = true;
+      sawZeroTokenLineAfterLastOutput = false;
+    } else {
+      if (sawOutputLine)
+        sawZeroTokenLineAfterLastOutput = true;
+      else
+        sawZeroTokenLineBeforeFirstOutput = true;
+    }
+
+    lineBegin = lineEnd + 1;
+  }
+
+
+  const bool needsBarrier =
+      (!sawOutputLine && sawZeroTokenLineBeforeFirstOutput) ||
+      (sawOutputLine && sawZeroTokenLineAfterLastOutput);
+
+  if (needsBarrier && child.resolvedPath) {
+    std::optional<uint64_t> firstChildOutputByte;
+    const auto &tokmapByPP = model_.GetTokmapByPP();
+    for (const RefoldModel::PPArgSpan::PPSpan &span : child.spans) {
+      if (!span.IsValid())
+        continue;
+      for (uint64_t pp = span.begin; pp < span.end; ++pp) {
+        auto it = tokmapByPP.find(pp);
+        if (it == tokmapByPP.end())
+          continue;
+        const RefoldModel::TokMapEntry &tok = it->second;
+        if (!PathsEqual(tok.file, *child.resolvedPath))
+          continue;
+        if (!firstChildOutputByte || tok.b < *firstChildOutputByte)
+          firstChildOutputByte = tok.b;
+      }
+    }
+
+    if (firstChildOutputByte &&
+        SourcePrefixHasProducerActiveLineControl(*child.resolvedPath, child.id,
+                                                 *firstChildOutputByte)) {
+      trace("linedir/include",
+            "skip include-entry layout demand inc#{0}: child source "
+            "line-control before first output byte {1} already normalizes "
+            "the zero-token parent prefix",
+            child.id, *firstChildOutputByte);
+      return false;
+    }
+  }
+
+  trace("linedir/include",
+        "include-entry layout demand inc#{0}: parent='{1}' site={2} "
+        "sawOutput={3} zeroBeforeFirst={4} zeroAfterLast={5} demand={6}",
+        child.id, parentOwnerFileForDemand, child.siteB,
+        sawOutputLine ? "YES" : "NO",
+        sawZeroTokenLineBeforeFirstOutput ? "YES" : "NO",
+        sawZeroTokenLineAfterLastOutput ? "YES" : "NO",
+        needsBarrier ? "YES" : "NO");
+  return needsBarrier;
+}
+
+
+/// Return true iff \p text is only horizontal whitespace or newlines, and it
+/// contains at least one physical newline.  This is used to prove that a source
+/// line containing a line-state observer has been merged left in the edited
+/// preprocessed stream: the original source boundary was a pure line separator,
+/// but the B-side boundary no longer contains a newline.
+static bool isPureWhitespaceContainingNewline(StringRef text) {
+  bool sawNewline = false;
+  for (char c : text) {
+    if (c == '\n' || c == '\r') {
+      sawNewline = true;
+      continue;
+    }
+    if (c == ' ' || c == '\t' || c == '\f' || c == '\v')
+      continue;
+    return false;
+  }
+  return sawNewline;
+}
+
+/// Return the start offset of the physical line containing \p offset.
+static uint64_t physicalLineBegin(StringRef bytes, uint64_t offset) {
+  offset = std::min<uint64_t>(offset, bytes.size());
+  while (offset > 0 && bytes[static_cast<size_t>(offset - 1)] != '\n' &&
+         bytes[static_cast<size_t>(offset - 1)] != '\r')
+    --offset;
+  return offset;
+}
+
+/// Return the end offset, not including the line separator, of the physical line
+/// containing \p offset.
+static uint64_t physicalLineEndNoSeparator(StringRef bytes, uint64_t offset) {
+  offset = std::min<uint64_t>(offset, bytes.size());
+  while (offset < bytes.size() && bytes[static_cast<size_t>(offset)] != '\n' &&
+         bytes[static_cast<size_t>(offset)] != '\r')
+    ++offset;
+  return offset;
+}
+
+/// Return the source-byte construct that must be considered when a line-state
+/// builtin is observed through \p site.
+///
+/// Direct `__LINE__` uses observe the physical line containing the builtin.
+/// When the builtin is reached through a user macro call, however, the visible
+/// source construct is the callsite, not the builtin token in the macro body or
+/// argument.  A function-like callsite may span multiple physical lines (for
+/// example `ID(\n  __LINE__\n)`), so line-layout proofs must cover the first
+/// source line containing the visible invocation through the line containing the
+/// end of that invocation.  The returned end is line-end exclusive and does not
+/// include the trailing newline separator.
+static std::pair<uint64_t, uint64_t> lineObserverConstructSpan(
+    StringRef bytes, const RefoldModel::MacroInvocation &site) {
+  const uint64_t begin = physicalLineBegin(bytes, site.invB.value_or(0));
+  const uint64_t endProbe = site.invE.value_or(site.invB.value_or(0));
+  const uint64_t end = physicalLineEndNoSeparator(bytes, endProbe);
+  return {begin, end};
+}
+
+/// Proven right-extension of a line-observer materialization envelope.
+///
+/// The own-line merge theorem starts from a closed owner-local interval ending
+/// at the physical line that contains the observable line-state construct.  If
+/// B also removed the newline after that construct line, stopping there leaves
+/// a suffix token stranded on its original source line even though B placed it
+/// on the same physical line.  This helper extends the interval across each
+/// immediately following owner-local source line whose separating newline was
+/// removed in B.  Every extended line must be token-mapped, token-contiguous in
+/// B, and contain only whitespace outside the mapped tokens, so the resulting
+/// byte edit is a deterministic closed B-line envelope rather than a heuristic
+/// layout grab.
+struct LineObserverRightClosure {
+  uint64_t sourceEnd = 0;
+  uint64_t bEnd = 0;
+  uint64_t lastATok = 0;
+  size_t lastBTok = 0;
+
+  // Source-spelled text for any right-extension lines appended after the
+  // initial observer construct.  Prefix-collapse repairs preserve the
+  // observer source spelling, so they cannot materialize these right-side
+  // lines from B without replacing `__LINE__` by its numeric expansion.
+  // Instead, each extension records the B inter-token gap that removed the
+  // physical newline, followed by the original source spelling of the next
+  // owner-local line.  Own-line materialization ignores this field because it
+  // emits the whole closed envelope from B.
+  std::string sourceSpelledExtension;
+};
+
+template <typename PathsEqualFn>
+static std::optional<LineObserverRightClosure>
+extendLineObserverRightClosure(
+    StringRef ownerBytes, StringRef ownerFile, StringRef bSource,
+    PathsEqualFn pathsEqual,
+    const DenseMap<uint64_t, RefoldModel::TokMapEntry> &tokmapByPP,
+    ArrayRef<int64_t> abTokMapA2B, ArrayRef<int64_t> abTokMapB2A,
+    ArrayRef<PPTok> bToks, ArrayRef<size_t> bTokOff, uint64_t sourceEnd,
+    uint64_t bEnd, uint64_t lastATok, size_t lastBTok) {
+  LineObserverRightClosure closure{sourceEnd, bEnd, lastATok, lastBTok, {}};
+
+  auto mappedBTok = [&](uint64_t aTok) -> std::optional<size_t> {
+    if (aTok >= static_cast<uint64_t>(abTokMapA2B.size()))
+      return std::nullopt;
+    const int64_t bTokI = abTokMapA2B[static_cast<size_t>(aTok)];
+    if (bTokI < 0 || static_cast<uint64_t>(bTokI) >= abTokMapB2A.size() ||
+        abTokMapB2A[static_cast<size_t>(bTokI)] !=
+            static_cast<int64_t>(aTok))
+      return std::nullopt;
+    const size_t bTok = static_cast<size_t>(bTokI);
+    if (bTok >= bTokOff.size() || bTok >= bToks.size())
+      return std::nullopt;
+    return bTok;
+  };
+
+  auto bTokenEnd = [&](size_t bTok) -> uint64_t {
+    return static_cast<uint64_t>(bTokOff[bTok] + bToks[bTok].spelling.size());
+  };
+
+  while (true) {
+    const uint64_t nextATok = closure.lastATok + 1;
+    auto nextIt = tokmapByPP.find(nextATok);
+    if (nextIt == tokmapByPP.end())
+      return closure;
+    const RefoldModel::TokMapEntry &nextEntry = nextIt->second;
+    if (!pathsEqual(nextEntry.file, ownerFile))
+      return closure;
+    if (nextEntry.b < closure.sourceEnd)
+      return std::nullopt;
+
+    StringRef sourceGap = ownerBytes.slice(closure.sourceEnd, nextEntry.b);
+    if (!isPureWhitespaceContainingNewline(sourceGap))
+      return closure;
+
+    std::optional<size_t> nextBTok = mappedBTok(nextATok);
+    if (!nextBTok)
+      return std::nullopt;
+    const uint64_t nextBBegin = static_cast<uint64_t>(bTokOff[*nextBTok]);
+    if (nextBBegin < closure.bEnd || nextBBegin > bSource.size())
+      return std::nullopt;
+    StringRef bGap = bSource.slice(closure.bEnd, nextBBegin);
+    if (bGap.contains('\n') || bGap.contains('\r'))
+      return closure;
+
+    const uint64_t lineBegin = physicalLineBegin(ownerBytes, nextEntry.b);
+    const uint64_t lineEnd = physicalLineEndNoSeparator(ownerBytes, nextEntry.b);
+    if (lineBegin < closure.sourceEnd || nextEntry.e > lineEnd)
+      return std::nullopt;
+
+    uint64_t cursor = nextEntry.e;
+    uint64_t lineLastATok = nextATok;
+    size_t lineLastBTok = *nextBTok;
+    uint64_t lineBEnd = bTokenEnd(lineLastBTok);
+
+    for (uint64_t aTok = nextATok + 1;; ++aTok) {
+      auto it = tokmapByPP.find(aTok);
+      if (it == tokmapByPP.end())
+        break;
+      const RefoldModel::TokMapEntry &entry = it->second;
+      if (!pathsEqual(entry.file, ownerFile) || entry.b >= lineEnd)
+        break;
+      if (entry.b < cursor || entry.e > lineEnd)
+        return std::nullopt;
+      if (!ownerBytes.slice(cursor, entry.b).trim().empty())
+        return std::nullopt;
+
+      std::optional<size_t> bTok = mappedBTok(aTok);
+      if (!bTok || *bTok != lineLastBTok + 1)
+        return std::nullopt;
+      const uint64_t bBegin = static_cast<uint64_t>(bTokOff[*bTok]);
+      if (bBegin < lineBEnd || bBegin > bSource.size())
+        return std::nullopt;
+      StringRef intraLineBGap = bSource.slice(lineBEnd, bBegin);
+      if (intraLineBGap.contains('\n') || intraLineBGap.contains('\r'))
+        return std::nullopt;
+
+      cursor = entry.e;
+      lineLastATok = aTok;
+      lineLastBTok = *bTok;
+      lineBEnd = bTokenEnd(lineLastBTok);
+    }
+
+    if (!ownerBytes.slice(cursor, lineEnd).trim().empty())
+      return std::nullopt;
+
+    closure.sourceSpelledExtension += bGap.str();
+    closure.sourceSpelledExtension += ownerBytes.slice(nextEntry.b, lineEnd).str();
+    closure.sourceEnd = lineEnd;
+    closure.bEnd = lineBEnd;
+    closure.lastATok = lineLastATok;
+    closure.lastBTok = lineLastBTok;
+  }
+}
+
+
+/// Source-spelled prefix segment for a collapsed pre-observer B line.
+///
+/// Prefix-collapse repairs preserve the line-state observer source spelling and
+/// emit a canonical #line immediately before it.  The prefix before that repair
+/// should therefore be represented as "B layout plus original source
+/// constructs" rather than blindly materializing B bytes.  This keeps
+/// still-valid macro invocations such as `B_STMT` source-spelled while proving
+/// the same B physical-line collapse.
+struct LineObserverSourcePrefix {
+  std::string text;
+  uint64_t sourceEnd = 0;
+  uint64_t lastATok = 0;
+  size_t lastBTok = 0;
+};
+
+/// Return true iff every token in [firstATok,lastATok] maps bijectively to a
+/// contiguous B-token range.  The helper reports that B range so callers can use
+/// B's inter-construct whitespace while preserving the source spelling of the
+/// construct itself.
+static bool lineObserverMappedContiguousBRange(
+    uint64_t firstATok, uint64_t lastATok, ArrayRef<int64_t> abTokMapA2B,
+    ArrayRef<int64_t> abTokMapB2A, ArrayRef<PPTok> bToks,
+    ArrayRef<size_t> bTokOff, size_t &firstBTok, size_t &lastBTok) {
+  if (firstATok > lastATok || lastATok >= abTokMapA2B.size())
+    return false;
+
+  std::optional<size_t> firstB;
+  std::optional<size_t> prevB;
+  for (uint64_t aTok = firstATok; aTok <= lastATok; ++aTok) {
+    const int64_t bTokI = abTokMapA2B[static_cast<size_t>(aTok)];
+    if (bTokI < 0 || static_cast<uint64_t>(bTokI) >= abTokMapB2A.size() ||
+        abTokMapB2A[static_cast<size_t>(bTokI)] !=
+            static_cast<int64_t>(aTok))
+      return false;
+    const size_t bTok = static_cast<size_t>(bTokI);
+    if (bTok >= bTokOff.size() || bTok >= bToks.size())
+      return false;
+    if (prevB && bTok != *prevB + 1)
+      return false;
+    if (!firstB)
+      firstB = bTok;
+    prevB = bTok;
+  }
+
+  if (!firstB || !prevB)
+    return false;
+  firstBTok = *firstB;
+  lastBTok = *prevB;
+  return true;
+}
+
+template <typename PathsEqualFn>
+static const RefoldModel::MacroInvocation *
+lineObserverSourceMacroConstructAt(
+    ArrayRef<RefoldModel::MacroInvocation> macroInvocations, uint64_t aTok,
+    uint64_t limitATok, StringRef ownerFile,
+    std::optional<uint64_t> ownerIncludeId, PathsEqualFn pathsEqual) {
+  const RefoldModel::MacroInvocation *best = nullptr;
+  for (const RefoldModel::MacroInvocation &macro : macroInvocations) {
+    if (!macro.cover.IsValid() || macro.name == "__LINE__")
+      continue;
+    if (macro.ownerIncludeId != ownerIncludeId)
+      continue;
+    if (!macro.invFile || !macro.invB || !macro.invE)
+      continue;
+    if (!pathsEqual(*macro.invFile, ownerFile))
+      continue;
+    if (macro.cover.begin != aTok || macro.cover.end > limitATok)
+      continue;
+    // Prefer the widest source-spelled construct beginning at this token.  This
+    // preserves an outer macro call when nested macro calls share the same first
+    // produced token, and it is deterministic because macro ids are stable.
+    if (!best || macro.cover.end > best->cover.end ||
+        (macro.cover.end == best->cover.end && macro.id < best->id))
+      best = &macro;
+  }
+  return best;
+}
+
+template <typename PathsEqualFn>
+static std::optional<LineObserverSourcePrefix>
+buildLineObserverSourceSpelledPrefix(
+    StringRef ownerBytes, StringRef ownerFile,
+    std::optional<uint64_t> ownerIncludeId, StringRef bSource,
+    PathsEqualFn pathsEqual,
+    const DenseMap<uint64_t, RefoldModel::TokMapEntry> &tokmapByPP,
+    ArrayRef<RefoldModel::MacroInvocation> macroInvocations,
+    ArrayRef<int64_t> abTokMapA2B, ArrayRef<int64_t> abTokMapB2A,
+    ArrayRef<PPTok> bToks, ArrayRef<size_t> bTokOff, uint64_t sourceBegin,
+    uint64_t bBegin, uint64_t firstATok, uint64_t limitATok,
+    uint64_t sourceLimit, uint64_t bLimit) {
+  LineObserverSourcePrefix result;
+  uint64_t cursor = sourceBegin;
+  uint64_t bCursor = bBegin;
+  uint64_t aTok = firstATok;
+
+  while (aTok < limitATok) {
+    uint64_t constructFirstATok = aTok;
+    uint64_t constructLastATok = aTok;
+    uint64_t constructBegin = 0;
+    uint64_t constructEnd = 0;
+
+    if (const RefoldModel::MacroInvocation *macro =
+            lineObserverSourceMacroConstructAt(macroInvocations, aTok,
+                                               limitATok, ownerFile,
+                                               ownerIncludeId, pathsEqual)) {
+      constructFirstATok = macro->cover.begin;
+      constructLastATok = macro->cover.end - 1;
+      constructBegin = *macro->invB;
+      constructEnd = *macro->invE;
+    } else {
+      auto it = tokmapByPP.find(aTok);
+      if (it == tokmapByPP.end())
+        return std::nullopt;
+      const RefoldModel::TokMapEntry &entry = it->second;
+      if (!pathsEqual(entry.file, ownerFile))
+        return std::nullopt;
+      constructBegin = entry.b;
+      constructEnd = entry.e;
+    }
+
+    if (constructBegin < cursor || constructEnd > sourceLimit)
+      return std::nullopt;
+    if (!ownerBytes.slice(cursor, constructBegin).trim().empty())
+      return std::nullopt;
+
+    size_t constructFirstBTok = 0;
+    size_t constructLastBTok = 0;
+    if (!lineObserverMappedContiguousBRange(
+            constructFirstATok, constructLastATok, abTokMapA2B, abTokMapB2A,
+            bToks, bTokOff, constructFirstBTok, constructLastBTok))
+      return std::nullopt;
+
+    const uint64_t constructBBegin =
+        static_cast<uint64_t>(bTokOff[constructFirstBTok]);
+    if (constructBBegin < bCursor || constructBBegin > bSource.size())
+      return std::nullopt;
+    StringRef bGap = bSource.slice(bCursor, constructBBegin);
+    if (bGap.contains('\n') || bGap.contains('\r'))
+      return std::nullopt;
+
+    result.text += bGap.str();
+    result.text += ownerBytes.slice(constructBegin, constructEnd).str();
+    result.sourceEnd = constructEnd;
+    result.lastATok = constructLastATok;
+    result.lastBTok = constructLastBTok;
+
+    cursor = constructEnd;
+    bCursor = static_cast<uint64_t>(
+        bTokOff[constructLastBTok] + bToks[constructLastBTok].spelling.size());
+    aTok = constructLastATok + 1;
+  }
+
+  if (!ownerBytes.slice(cursor, sourceLimit).trim().empty())
+    return std::nullopt;
+  if (bLimit < bCursor || bLimit > bSource.size())
+    return std::nullopt;
+  result.text += bSource.slice(bCursor, bLimit).str();
+  return result;
+}
+
+bool RefoldEngine::AppendLineObserverLayoutRealizationEdits(
+    StringRef tuPath, StringRef tuBytes, std::vector<TextEdit> &tuEdits) {
+  if (abTokMapA2B_.empty() || abTokMapB2A_.empty())
+    return true;
+
+  auto editOverlapsExisting = [&](uint64_t begin, uint64_t end) {
+    for (const TextEdit &edit : tuEdits) {
+      if (begin < edit.end && edit.start < end)
+        return true;
+    }
+    return false;
+  };
+
+  const auto &tokmapByPP = model_.GetTokmapByPP();
+
+  for (const RefoldModel::MacroInvocation &macro :
+       model_.GetMacroInvocations()) {
+    if (macro.name != "__LINE__")
+      continue;
+    const RefoldModel::MacroInvocation *site =
+        LineStateObservableMacroSite(macro);
+    if (!site || site->ownerIncludeId)
+      continue;
+    if (!site->invFile || !site->invB || !site->invE)
+      continue;
+    if (!PathsEqual(*site->invFile, tuPath))
+      continue;
+    if (!macro.cover.IsValid())
+      continue;
+
+    // Only handle the fully token-preserved case.  If the builtin expansion is
+    // already token-changed, ordinary macro materialization owns it.
+    int64_t previousB = -1;
+    bool tokenPreserved = true;
+    for (uint64_t aTok = macro.cover.begin; aTok < macro.cover.end; ++aTok) {
+      if (aTok >= static_cast<uint64_t>(abTokMapA2B_.size()) ||
+          aTok >= static_cast<uint64_t>(aToks_.size())) {
+        tokenPreserved = false;
+        break;
+      }
+      int64_t bTok = abTokMapA2B_[static_cast<size_t>(aTok)];
+      if (bTok < 0 || bTok >= static_cast<int64_t>(bToks_.size()) ||
+          static_cast<uint64_t>(bTok) >= abTokMapB2A_.size() ||
+          abTokMapB2A_[static_cast<size_t>(bTok)] !=
+              static_cast<int64_t>(aTok) ||
+          aToks_[static_cast<size_t>(aTok)].spelling !=
+              bToks_[static_cast<size_t>(bTok)].spelling ||
+          (previousB >= 0 && bTok != previousB + 1)) {
+        tokenPreserved = false;
+        break;
+      }
+      previousB = bTok;
+    }
+    if (!tokenPreserved)
+      continue;
+
+    const auto [sourceLineBegin, sourceLineEnd] =
+        lineObserverConstructSpan(tuBytes, *site);
+    if (sourceLineBegin >= sourceLineEnd)
+      continue;
+
+    std::optional<uint64_t> firstATokOnLine;
+    std::optional<uint64_t> lastATokOnLine;
+    for (uint64_t aTok = 0; aTok < static_cast<uint64_t>(aToks_.size());
+         ++aTok) {
+      auto it = tokmapByPP.find(aTok);
+      if (it == tokmapByPP.end())
+        continue;
+      const RefoldModel::TokMapEntry &entry = it->second;
+      if (!PathsEqual(entry.file, tuPath))
+        continue;
+      if (entry.b < sourceLineBegin || entry.e > sourceLineEnd)
+        continue;
+      if (!firstATokOnLine || aTok < *firstATokOnLine)
+        firstATokOnLine = aTok;
+      if (!lastATokOnLine || aTok > *lastATokOnLine)
+        lastATokOnLine = aTok;
+    }
+
+    if (!firstATokOnLine || !lastATokOnLine)
+      continue;
+    if (macro.cover.begin < *firstATokOnLine ||
+        macro.cover.end - 1 > *lastATokOnLine)
+      continue;
+    if (*firstATokOnLine == 0)
+      continue;
+
+    const uint64_t previousATok = *firstATokOnLine - 1;
+    auto prevIt = tokmapByPP.find(previousATok);
+    if (prevIt == tokmapByPP.end())
+      continue;
+    const RefoldModel::TokMapEntry &prevEntry = prevIt->second;
+    if (!PathsEqual(prevEntry.file, tuPath))
+      continue;
+    if (prevEntry.e > sourceLineBegin)
+      continue;
+
+    StringRef originalSeparator = tuBytes.slice(prevEntry.e, sourceLineBegin);
+    if (!isPureWhitespaceContainingNewline(originalSeparator))
+      continue;
+
+    const int64_t firstBTokI = abTokMapA2B_[static_cast<size_t>(*firstATokOnLine)];
+    const int64_t lastBTokI = abTokMapA2B_[static_cast<size_t>(*lastATokOnLine)];
+    const int64_t prevBTokI = abTokMapA2B_[static_cast<size_t>(previousATok)];
+    if (firstBTokI < 0 || lastBTokI < firstBTokI || prevBTokI < 0)
+      continue;
+    const size_t firstBTok = static_cast<size_t>(firstBTokI);
+    const size_t lastBTok = static_cast<size_t>(lastBTokI);
+    const size_t prevBTok = static_cast<size_t>(prevBTokI);
+    if (firstBTok >= bTokOff_.size() || lastBTok >= bTokOff_.size() ||
+        prevBTok >= bTokOff_.size() || lastBTok >= bToks_.size() ||
+        prevBTok >= bToks_.size())
+      continue;
+
+    const uint64_t prevBEnd = static_cast<uint64_t>(bTokOff_[prevBTok] +
+        bToks_[prevBTok].spelling.size());
+    const uint64_t firstBBegin = static_cast<uint64_t>(bTokOff_[firstBTok]);
+    if (firstBBegin < prevBEnd || firstBBegin > bSource_.size())
+      continue;
+    StringRef bSeparator = bSource_.slice(prevBEnd, firstBBegin);
+
+    // The source line was merged left only when B removed the physical newline
+    // between the previous PP line and the observer's source line.  If B still
+    // has a newline, preserving the source observer plus an ordinary resync is
+    // the right representation.
+    if (bSeparator.contains('\n') || bSeparator.contains('\r'))
+      continue;
+
+    const uint64_t initialBEnd = static_cast<uint64_t>(
+        bTokOff_[lastBTok] + bToks_[lastBTok].spelling.size());
+    if (initialBEnd < prevBEnd || initialBEnd > bSource_.size())
+      continue;
+
+    std::optional<LineObserverRightClosure> closure =
+        extendLineObserverRightClosure(
+            tuBytes, tuPath, bSource_,
+            [&](StringRef lhs, StringRef rhs) { return PathsEqual(lhs, rhs); },
+            tokmapByPP, abTokMapA2B_, abTokMapB2A_, bToks_, bTokOff_,
+            sourceLineEnd, initialBEnd,
+            *lastATokOnLine, lastBTok);
+    if (!closure)
+      continue;
+
+    const uint64_t editBegin = prevEntry.e;
+    const uint64_t editEnd = closure->sourceEnd;
+    if (editBegin >= editEnd)
+      continue;
+    if (editOverlapsExisting(editBegin, editEnd)) {
+      trace("linedir/layout",
+            "skip __LINE__ layout realization at byte {0}: overlaps existing edit",
+            *site->invB);
+      continue;
+    }
+
+    // Materialize only the left/observer part of the B physical-line envelope
+    // from B.  Any proven right-extension line is appended from the original
+    // owner spelling with B's inter-token gap.  This preserves source-spelled
+    // constructs such as object-like macro invocations (`SEMI`) that merely
+    // moved onto the same B line; expanding them to their PP token spelling
+    // would validate, but would be a less faithful refolding.
+    std::string replacement = bSource_.slice(prevBEnd, initialBEnd).str();
+    replacement += closure->sourceSpelledExtension;
+    if (replacement.empty())
+      continue;
+
+    TextEdit edit{editBegin, editEnd, replacement, std::nullopt, std::nullopt,
+                  {}, {}, {}};
+    StampTextEditMaterializedBByteRange(edit, prevBEnd, initialBEnd);
+    AttachAcceptedResultCarrier(
+        edit, BuildAcceptedTUTextEditCandidate(
+                  AcceptedPathKind::TUByteSpanConservativeEdit, editBegin,
+                  editEnd, replacement));
+    tuEdits.push_back(std::move(edit));
+
+    trace("linedir/layout",
+          "realize source line containing __LINE__ after B-side line merge: "
+          "source=[{0},{1}) b=[{2},{3}) repl='{4}'",
+          editBegin, editEnd, prevBEnd, initialBEnd,
+          stringutils::showWsWithClip(replacement, 100));
+  }
+
+  auto sameLineControlPhysicalFile = [&](StringRef lhs, StringRef rhs) {
+    if (lhs == rhs)
+      return true;
+
+    auto isPseudoFile = [](StringRef path) {
+      return path.starts_with("<") && path.ends_with(">");
+    };
+    if (isPseudoFile(lhs) || isPseudoFile(rhs))
+      return false;
+
+    return lineDirs_.ToAbsolutePath(lhs) == lineDirs_.ToAbsolutePath(rhs);
+  };
+
+  auto producerBackedLocationAt = [&](uint64_t offset)
+      -> std::optional<LineDirectiveLocation> {
+    const RefoldModel::LineControlEvent *best = nullptr;
+    for (const RefoldModel::LineControlEvent &event : model_.GetLineControls()) {
+      if (!event.active || !event.producerProven || !event.siteE)
+        continue;
+      if (event.ownerIncludeId)
+        continue;
+      if (!sameLineControlPhysicalFile(event.physicalFile, tuPath))
+        continue;
+      if (*event.siteE > offset)
+        continue;
+      if (!best || *event.siteE > *best->siteE ||
+          (*event.siteE == *best->siteE && event.id > best->id))
+        best = &event;
+    }
+
+    if (!best)
+      return std::nullopt;
+
+    const size_t delta = stringutils::countNonSplicedNewlines(
+        tuBytes, *best->siteE, offset);
+    return LineDirectiveLocation(best->logicalFileAfter,
+                                 best->logicalLineAfter + delta, true);
+  };
+
+  auto logicalLocationAt = [&](uint64_t offset) -> LineDirectiveLocation {
+    LineDirectiveLocation loc = LineDirectiveInserter::LogicalLocationAtOffset(
+        tuBytes, static_cast<size_t>(offset), tuPath, model_, tuPath,
+        std::nullopt);
+    if (loc.producerProven)
+      return loc;
+    if (std::optional<LineDirectiveLocation> producerLoc =
+            producerBackedLocationAt(offset))
+      return *producerLoc;
+    return loc;
+  };
+
+  auto latestProducerLineControlEndBefore = [&](uint64_t offset)
+      -> std::optional<uint64_t> {
+    std::optional<uint64_t> result;
+    for (const RefoldModel::LineControlEvent &event : model_.GetLineControls()) {
+      if (!event.active || !event.producerProven || !event.siteE)
+        continue;
+      if (event.ownerIncludeId)
+        continue;
+      if (!sameLineControlPhysicalFile(event.physicalFile, tuPath))
+        continue;
+      if (*event.siteE > offset)
+        continue;
+      result = result ? std::max(*result, *event.siteE) : *event.siteE;
+    }
+    return result;
+  };
+
+  // A preserved source-spelled __LINE__ observer can remain source-spelled when
+  // B preserves the observer line itself, but only if the copied prefix between
+  // the dominating #line state and that observer preserves the same physical
+  // line count.  A token-identical B edit can still merge two earlier ordinary
+  // source lines, leaving the observer on a fresh B line but one logical line
+  // earlier if we simply copy the original source.  In that case, realize the
+  // collapsed prefix bytes from B and emit a canonical repair immediately before
+  // the preserved observer.
+  for (const RefoldModel::MacroInvocation &macro :
+       model_.GetMacroInvocations()) {
+    if (macro.name != "__LINE__")
+      continue;
+    const RefoldModel::MacroInvocation *site =
+        LineStateObservableMacroSite(macro);
+    if (!site || site->ownerIncludeId)
+      continue;
+    if (!site->invFile || !site->invB || !site->invE)
+      continue;
+    if (!PathsEqual(*site->invFile, tuPath))
+      continue;
+    if (!macro.cover.IsValid())
+      continue;
+
+    int64_t previousB = -1;
+    bool tokenPreserved = true;
+    for (uint64_t aTok = macro.cover.begin; aTok < macro.cover.end; ++aTok) {
+      if (aTok >= static_cast<uint64_t>(abTokMapA2B_.size()) ||
+          aTok >= static_cast<uint64_t>(aToks_.size())) {
+        tokenPreserved = false;
+        break;
+      }
+      int64_t bTok = abTokMapA2B_[static_cast<size_t>(aTok)];
+      if (bTok < 0 || bTok >= static_cast<int64_t>(bToks_.size()) ||
+          static_cast<uint64_t>(bTok) >= abTokMapB2A_.size() ||
+          abTokMapB2A_[static_cast<size_t>(bTok)] !=
+              static_cast<int64_t>(aTok) ||
+          aToks_[static_cast<size_t>(aTok)].spelling !=
+              bToks_[static_cast<size_t>(bTok)].spelling ||
+          (previousB >= 0 && bTok != previousB + 1)) {
+        tokenPreserved = false;
+        break;
+      }
+      previousB = bTok;
+    }
+    if (!tokenPreserved)
+      continue;
+
+    const auto [observerLineBegin, observerConstructEnd] =
+        lineObserverConstructSpan(tuBytes, *site);
+    if (observerLineBegin == 0 || observerLineBegin >= observerConstructEnd)
+      continue;
+
+    std::optional<uint64_t> firstATokOnObserverLine;
+    std::optional<uint64_t> lastATokOnObserverConstruct;
+    for (uint64_t aTok = 0; aTok < static_cast<uint64_t>(aToks_.size());
+         ++aTok) {
+      auto it = tokmapByPP.find(aTok);
+      if (it == tokmapByPP.end())
+        continue;
+      const RefoldModel::TokMapEntry &entry = it->second;
+      if (!PathsEqual(entry.file, tuPath))
+        continue;
+      if (entry.b < observerLineBegin || entry.e > observerConstructEnd)
+        continue;
+      if (!firstATokOnObserverLine || aTok < *firstATokOnObserverLine)
+        firstATokOnObserverLine = aTok;
+      if (!lastATokOnObserverConstruct ||
+          aTok > *lastATokOnObserverConstruct)
+        lastATokOnObserverConstruct = aTok;
+    }
+    if (!firstATokOnObserverLine || !lastATokOnObserverConstruct ||
+        *firstATokOnObserverLine == 0)
+      continue;
+    if (macro.cover.begin < *firstATokOnObserverLine ||
+        macro.cover.end - 1 > *lastATokOnObserverConstruct)
+      continue;
+
+    const int64_t firstObserverBTokI =
+        abTokMapA2B_[static_cast<size_t>(*firstATokOnObserverLine)];
+    const int64_t lastObserverBTokI =
+        abTokMapA2B_[static_cast<size_t>(*lastATokOnObserverConstruct)];
+    if (firstObserverBTokI < 0 || lastObserverBTokI < firstObserverBTokI ||
+        firstObserverBTokI >= static_cast<int64_t>(bTokOff_.size()) ||
+        lastObserverBTokI >= static_cast<int64_t>(bTokOff_.size()) ||
+        lastObserverBTokI >= static_cast<int64_t>(bToks_.size()))
+      continue;
+    const size_t firstObserverBTok = static_cast<size_t>(firstObserverBTokI);
+    const size_t lastObserverBTok = static_cast<size_t>(lastObserverBTokI);
+    const uint64_t firstObserverBBegin =
+        static_cast<uint64_t>(bTokOff_[firstObserverBTok]);
+    const uint64_t observerBEnd = static_cast<uint64_t>(
+        bTokOff_[lastObserverBTok] + bToks_[lastObserverBTok].spelling.size());
+
+    const std::optional<uint64_t> latestLineControlEnd =
+        latestProducerLineControlEndBefore(observerLineBegin);
+    const uint64_t searchBegin = latestLineControlEnd.value_or(0);
+
+    std::optional<uint64_t> editBegin;
+    std::optional<uint64_t> rightATok;
+    std::optional<uint64_t> prevBEndForEdit;
+    for (uint64_t aTok = 1; aTok < *firstATokOnObserverLine; ++aTok) {
+      const uint64_t leftATok = aTok - 1;
+      auto leftIt = tokmapByPP.find(leftATok);
+      auto rightIt = tokmapByPP.find(aTok);
+      if (leftIt == tokmapByPP.end() || rightIt == tokmapByPP.end())
+        continue;
+      const RefoldModel::TokMapEntry &leftEntry = leftIt->second;
+      const RefoldModel::TokMapEntry &rightEntry = rightIt->second;
+      if (!PathsEqual(leftEntry.file, tuPath) ||
+          !PathsEqual(rightEntry.file, tuPath))
+        continue;
+      if (leftEntry.e < searchBegin || rightEntry.b > observerLineBegin)
+        continue;
+      if (leftEntry.e > rightEntry.b)
+        continue;
+      if (aTok >= static_cast<uint64_t>(abTokMapA2B_.size()) ||
+          leftATok >= static_cast<uint64_t>(abTokMapA2B_.size()))
+        continue;
+      const int64_t leftBTokI = abTokMapA2B_[static_cast<size_t>(leftATok)];
+      const int64_t rightBTokI = abTokMapA2B_[static_cast<size_t>(aTok)];
+      if (leftBTokI < 0 || rightBTokI < 0 ||
+          static_cast<uint64_t>(leftBTokI) >= abTokMapB2A_.size() ||
+          static_cast<uint64_t>(rightBTokI) >= abTokMapB2A_.size() ||
+          abTokMapB2A_[static_cast<size_t>(leftBTokI)] !=
+              static_cast<int64_t>(leftATok) ||
+          abTokMapB2A_[static_cast<size_t>(rightBTokI)] !=
+              static_cast<int64_t>(aTok))
+        continue;
+      if (static_cast<size_t>(leftBTokI) >= bTokOff_.size() ||
+          static_cast<size_t>(rightBTokI) >= bTokOff_.size() ||
+          static_cast<size_t>(leftBTokI) >= bToks_.size())
+        continue;
+
+      const uint64_t leftBEnd =
+          static_cast<uint64_t>(bTokOff_[static_cast<size_t>(leftBTokI)] +
+                                bToks_[static_cast<size_t>(leftBTokI)].spelling.size());
+      const uint64_t rightBBegin =
+          static_cast<uint64_t>(bTokOff_[static_cast<size_t>(rightBTokI)]);
+      if (rightBBegin < leftBEnd || rightBBegin > bSource_.size())
+        continue;
+
+      StringRef sourceGap = tuBytes.slice(leftEntry.e, rightEntry.b);
+      StringRef bGap = bSource_.slice(leftBEnd, rightBBegin);
+      if (!isPureWhitespaceContainingNewline(sourceGap))
+        continue;
+      if (bGap.contains('\n') || bGap.contains('\r'))
+        continue;
+
+      editBegin = leftEntry.e;
+      rightATok = aTok;
+      prevBEndForEdit = leftBEnd;
+      break;
+    }
+    if (!editBegin || !rightATok || !prevBEndForEdit)
+      continue;
+
+    if (firstObserverBBegin < *prevBEndForEdit ||
+        firstObserverBBegin > bSource_.size() || observerBEnd > bSource_.size())
+      continue;
+
+    std::optional<LineObserverSourcePrefix> sourcePrefix =
+        buildLineObserverSourceSpelledPrefix(
+            tuBytes, tuPath, std::nullopt, bSource_,
+            [&](StringRef lhs, StringRef rhs) { return PathsEqual(lhs, rhs); },
+            tokmapByPP, model_.GetMacroInvocations(), abTokMapA2B_,
+            abTokMapB2A_, bToks_, bTokOff_, *editBegin, *prevBEndForEdit,
+            *rightATok, *firstATokOnObserverLine, observerLineBegin,
+            firstObserverBBegin);
+    if (!sourcePrefix)
+      continue;
+
+    std::optional<LineObserverRightClosure> closure =
+        extendLineObserverRightClosure(
+            tuBytes, tuPath, bSource_,
+            [&](StringRef lhs, StringRef rhs) { return PathsEqual(lhs, rhs); },
+            tokmapByPP, abTokMapA2B_, abTokMapB2A_, bToks_, bTokOff_,
+            observerConstructEnd, observerBEnd,
+            *lastATokOnObserverConstruct, lastObserverBTok);
+    if (!closure)
+      continue;
+
+    const uint64_t editEnd = closure->sourceEnd;
+    if (*editBegin >= editEnd)
+      continue;
+    if (editOverlapsExisting(*editBegin, editEnd)) {
+      trace("linedir/layout",
+            "skip pre-observer __LINE__ layout realization at byte {0}: "
+            "overlaps existing edit",
+            *site->invB);
+      continue;
+    }
+
+    std::string replacement = sourcePrefix->text;
+    if (replacement.empty())
+      continue;
+    if (!stringutils::outAtBOL(replacement))
+      continue;
+
+    LineDirectiveLocation loc = logicalLocationAt(observerLineBegin);
+    if (!loc.producerProven)
+      continue;
+    replacement += lineDirs_.FormatLineDirective(loc.lineNo, loc.fileSpelling);
+    replacement += tuBytes.slice(observerLineBegin, observerConstructEnd).str();
+    replacement += closure->sourceSpelledExtension;
+
+    TextEdit edit{*editBegin, editEnd, replacement, std::nullopt,
+                  std::nullopt, {}, {}, {}};
+    StampTextEditMaterializedBByteRange(edit, *prevBEndForEdit,
+                                        firstObserverBBegin);
+    AttachAcceptedResultCarrier(
+        edit, BuildAcceptedTUTextEditCandidate(
+                  AcceptedPathKind::TUByteSpanConservativeEdit, *editBegin,
+                  editEnd, replacement));
+    tuEdits.push_back(std::move(edit));
+
+    trace("linedir/layout",
+          "realize pre-observer layout before preserved __LINE__: "
+          "source=[{0},{1}) b-prefix=[{2},{3}) resumeLine={4} file={5} repl='{6}'",
+          *editBegin, editEnd, *prevBEndForEdit, firstObserverBBegin,
+          loc.lineNo, loc.fileSpelling,
+          stringutils::showWsWithClip(replacement, 120));
+  }
+
+  return true;
+}
+
+bool RefoldEngine::AppendIncludeLineObserverLayoutRealizationEdits(
+    DenseMap<uint64_t, IncludeEdits> &perInclude) {
+  if (abTokMapA2B_.empty() || abTokMapB2A_.empty())
+    return true;
+
+  const auto &tokmapByPP = model_.GetTokmapByPP();
+
+  auto patchOverlapsExisting = [&](uint64_t includeId, uint64_t begin,
+                                   uint64_t end) {
+    auto it = perInclude.find(includeId);
+    if (it == perInclude.end())
+      return false;
+    for (const IncludePatch &patch : it->second.patches) {
+      if (begin < patch.aEnd && patch.aStart < end)
+        return true;
+    }
+    return false;
+  };
+
+  for (const RefoldModel::MacroInvocation &macro :
+       model_.GetMacroInvocations()) {
+    if (macro.name != "__LINE__")
+      continue;
+    const RefoldModel::MacroInvocation *site =
+        LineStateObservableMacroSite(macro);
+    if (!site || !site->ownerIncludeId)
+      continue;
+    if (!site->invFile || !site->invB || !site->invE)
+      continue;
+    if (!macro.cover.IsValid())
+      continue;
+
+    const RefoldModel::IncludeItem *include =
+        model_.GetIncludeById(*site->ownerIncludeId);
+    if (!include)
+      continue;
+
+    const std::string ownerFile = resolveHeaderPath(*include);
+    if (!PathsEqual(*site->invFile, ownerFile))
+      continue;
+
+    auto bufOrErr = MemoryBuffer::getFile(lineDirs_.ToAbsolutePath(ownerFile));
+    if (!bufOrErr) {
+      debug("linedir/layout",
+            "skip include-owned __LINE__ layout realization for include #{0}: "
+            "cannot read owner file '{1}'",
+            include->id, ownerFile);
+      continue;
+    }
+    const MemoryBuffer &mb = **bufOrErr;
+    StringRef headerBytes = mb.getBuffer();
+    if (*site->invB >= headerBytes.size())
+      continue;
+
+    // Only handle the fully token-preserved case. If the builtin expansion is
+    // already token-changed, ordinary macro/include materialization owns it.
+    int64_t previousB = -1;
+    bool tokenPreserved = true;
+    for (uint64_t aTok = macro.cover.begin; aTok < macro.cover.end; ++aTok) {
+      if (aTok >= static_cast<uint64_t>(abTokMapA2B_.size()) ||
+          aTok >= static_cast<uint64_t>(aToks_.size())) {
+        tokenPreserved = false;
+        break;
+      }
+      int64_t bTok = abTokMapA2B_[static_cast<size_t>(aTok)];
+      if (bTok < 0 || bTok >= static_cast<int64_t>(bToks_.size()) ||
+          static_cast<uint64_t>(bTok) >= abTokMapB2A_.size() ||
+          abTokMapB2A_[static_cast<size_t>(bTok)] !=
+              static_cast<int64_t>(aTok) ||
+          aToks_[static_cast<size_t>(aTok)].spelling !=
+              bToks_[static_cast<size_t>(bTok)].spelling ||
+          (previousB >= 0 && bTok != previousB + 1)) {
+        tokenPreserved = false;
+        break;
+      }
+      previousB = bTok;
+    }
+    if (!tokenPreserved)
+      continue;
+
+    const auto [sourceLineBegin, sourceLineEnd] =
+        lineObserverConstructSpan(headerBytes, *site);
+    if (sourceLineBegin >= sourceLineEnd)
+      continue;
+
+    std::optional<uint64_t> firstATokOnLine;
+    std::optional<uint64_t> lastATokOnLine;
+    for (uint64_t aTok = 0; aTok < static_cast<uint64_t>(aToks_.size());
+         ++aTok) {
+      auto it = tokmapByPP.find(aTok);
+      if (it == tokmapByPP.end())
+        continue;
+      const RefoldModel::TokMapEntry &entry = it->second;
+      if (!PathsEqual(entry.file, ownerFile))
+        continue;
+      if (entry.b < sourceLineBegin || entry.e > sourceLineEnd)
+        continue;
+      if (!firstATokOnLine || aTok < *firstATokOnLine)
+        firstATokOnLine = aTok;
+      if (!lastATokOnLine || aTok > *lastATokOnLine)
+        lastATokOnLine = aTok;
+    }
+
+    if (!firstATokOnLine || !lastATokOnLine)
+      continue;
+    if (macro.cover.begin < *firstATokOnLine ||
+        macro.cover.end - 1 > *lastATokOnLine)
+      continue;
+    if (*firstATokOnLine == 0)
+      continue;
+
+    const uint64_t previousATok = *firstATokOnLine - 1;
+    auto prevIt = tokmapByPP.find(previousATok);
+    if (prevIt == tokmapByPP.end())
+      continue;
+    const RefoldModel::TokMapEntry &prevEntry = prevIt->second;
+    if (!PathsEqual(prevEntry.file, ownerFile))
+      continue;
+    if (prevEntry.e > sourceLineBegin)
+      continue;
+
+    StringRef originalSeparator =
+        headerBytes.slice(prevEntry.e, sourceLineBegin);
+    if (!isPureWhitespaceContainingNewline(originalSeparator))
+      continue;
+
+    const int64_t firstBTokI =
+        abTokMapA2B_[static_cast<size_t>(*firstATokOnLine)];
+    const int64_t lastBTokI =
+        abTokMapA2B_[static_cast<size_t>(*lastATokOnLine)];
+    const int64_t prevBTokI = abTokMapA2B_[static_cast<size_t>(previousATok)];
+    if (firstBTokI < 0 || lastBTokI < firstBTokI || prevBTokI < 0)
+      continue;
+    const size_t firstBTok = static_cast<size_t>(firstBTokI);
+    const size_t lastBTok = static_cast<size_t>(lastBTokI);
+    const size_t prevBTok = static_cast<size_t>(prevBTokI);
+    if (firstBTok >= bTokOff_.size() || lastBTok >= bTokOff_.size() ||
+        prevBTok >= bTokOff_.size() || lastBTok >= bToks_.size() ||
+        prevBTok >= bToks_.size())
+      continue;
+
+    const uint64_t prevBEnd = static_cast<uint64_t>(
+        bTokOff_[prevBTok] + bToks_[prevBTok].spelling.size());
+    const uint64_t firstBBegin = static_cast<uint64_t>(bTokOff_[firstBTok]);
+    if (firstBBegin < prevBEnd || firstBBegin > bSource_.size())
+      continue;
+    StringRef bSeparator = bSource_.slice(prevBEnd, firstBBegin);
+    if (bSeparator.contains('\n') || bSeparator.contains('\r'))
+      continue;
+
+    const uint64_t initialBEnd = static_cast<uint64_t>(
+        bTokOff_[lastBTok] + bToks_[lastBTok].spelling.size());
+    if (initialBEnd < static_cast<uint64_t>(bTokOff_[prevBTok]) ||
+        initialBEnd > bSource_.size())
+      continue;
+
+    std::optional<LineObserverRightClosure> closure =
+        extendLineObserverRightClosure(
+            headerBytes, ownerFile, bSource_,
+            [&](StringRef lhs, StringRef rhs) { return PathsEqual(lhs, rhs); },
+            tokmapByPP, abTokMapA2B_, abTokMapB2A_, bToks_, bTokOff_,
+            sourceLineEnd, initialBEnd,
+            *lastATokOnLine, lastBTok);
+    if (!closure)
+      continue;
+
+    // Include patches operate in PP-token ranges. Use the previous token as the
+    // left edge so the materialized replacement owns the removed inter-line
+    // separator without requiring a half-token byte edit in the header planner.
+    const uint64_t patchAStart = previousATok;
+    const uint64_t patchAEnd = closure->lastATok + 1;
+    const uint64_t patchBStart = static_cast<uint64_t>(prevBTok);
+    const uint64_t patchBEnd = static_cast<uint64_t>(closure->lastBTok + 1);
+    if (patchOverlapsExisting(include->id, patchAStart, patchAEnd)) {
+      trace("linedir/layout",
+            "skip include-owned __LINE__ layout realization for include #{0} "
+            "A=[{1},{2}): overlaps existing include patch",
+            include->id, patchAStart, patchAEnd);
+      continue;
+    }
+
+    // As in the TU theorem, the left/observer portion is a B materialization,
+    // but any right-extension lines are preserved from the original header
+    // spelling.  This lets an adjacent macro call stay source-spelled while
+    // still closing the full B physical line around the observer.
+    std::string replacement = bSource_.slice(prevBEnd, initialBEnd).str();
+    replacement += closure->sourceSpelledExtension;
+
+    const std::string replacementForTrace = replacement;
+    IncludePatch patch{include, std::move(replacement), patchAStart, patchAEnd,
+                       patchBStart, patchBEnd};
+    patch.hasDirectHeaderByteRange = true;
+    patch.directHeaderByteBegin = prevEntry.e;
+    patch.directHeaderByteEnd = closure->sourceEnd;
+
+    auto [it, _] = perInclude.try_emplace(include->id, include);
+    it->second.Add(std::move(patch));
+
+    trace("linedir/layout",
+          "realize include-owned source line containing __LINE__ after B-side "
+          "line merge: include=#{0} file='{1}' A=[{2},{3}) B=[{4},{5}) "
+          "sourceBytes=[{6},{7}) repl='{8}'",
+          include->id, ownerFile, patchAStart, patchAEnd, patchBStart,
+          patchBEnd, prevEntry.e, closure->sourceEnd,
+          stringutils::showWsWithClip(replacementForTrace, 100));
+  }
+
+  auto sameLineControlPhysicalFile = [&](StringRef lhs, StringRef rhs) {
+    if (lhs == rhs)
+      return true;
+
+    auto isPseudoFile = [](StringRef path) {
+      return path.starts_with("<") && path.ends_with(">");
+    };
+    if (isPseudoFile(lhs) || isPseudoFile(rhs))
+      return false;
+
+    return lineDirs_.ToAbsolutePath(lhs) == lineDirs_.ToAbsolutePath(rhs);
+  };
+
+  // Header-owned analogue of the TU pre-observer layout theorem.  When B
+  // collapses an earlier ordinary source line into the prefix before a
+  // preserved `__LINE__` observer, and the observer itself remains at BOL, the
+  // header must materialize that collapsed prefix and then re-establish the
+  // producer-proven logical state immediately before the observer.  This is
+  // distinct from the own-line-merge theorem above: here a legal directive line
+  // exists, so preserving the source-spelled observer is the stronger refolding.
+  for (const RefoldModel::MacroInvocation &macro :
+       model_.GetMacroInvocations()) {
+    if (macro.name != "__LINE__")
+      continue;
+    const RefoldModel::MacroInvocation *site =
+        LineStateObservableMacroSite(macro);
+    if (!site || !site->ownerIncludeId)
+      continue;
+    if (!site->invFile || !site->invB || !site->invE)
+      continue;
+    if (!macro.cover.IsValid())
+      continue;
+
+    const RefoldModel::IncludeItem *include =
+        model_.GetIncludeById(*site->ownerIncludeId);
+    if (!include)
+      continue;
+
+    const std::string ownerFile = resolveHeaderPath(*include);
+    if (!PathsEqual(*site->invFile, ownerFile))
+      continue;
+
+    auto bufOrErr = MemoryBuffer::getFile(lineDirs_.ToAbsolutePath(ownerFile));
+    if (!bufOrErr) {
+      debug("linedir/layout",
+            "skip include-owned pre-observer __LINE__ layout realization for "
+            "include #{0}: cannot read owner file '{1}'",
+            include->id, ownerFile);
+      continue;
+    }
+    const MemoryBuffer &mb = **bufOrErr;
+    StringRef headerBytes = mb.getBuffer();
+    if (*site->invB >= headerBytes.size())
+      continue;
+
+    int64_t previousB = -1;
+    bool tokenPreserved = true;
+    for (uint64_t aTok = macro.cover.begin; aTok < macro.cover.end; ++aTok) {
+      if (aTok >= static_cast<uint64_t>(abTokMapA2B_.size()) ||
+          aTok >= static_cast<uint64_t>(aToks_.size())) {
+        tokenPreserved = false;
+        break;
+      }
+      int64_t bTok = abTokMapA2B_[static_cast<size_t>(aTok)];
+      if (bTok < 0 || bTok >= static_cast<int64_t>(bToks_.size()) ||
+          static_cast<uint64_t>(bTok) >= abTokMapB2A_.size() ||
+          abTokMapB2A_[static_cast<size_t>(bTok)] !=
+              static_cast<int64_t>(aTok) ||
+          aToks_[static_cast<size_t>(aTok)].spelling !=
+              bToks_[static_cast<size_t>(bTok)].spelling ||
+          (previousB >= 0 && bTok != previousB + 1)) {
+        tokenPreserved = false;
+        break;
+      }
+      previousB = bTok;
+    }
+    if (!tokenPreserved)
+      continue;
+
+    const auto [observerLineBegin, observerConstructEnd] =
+        lineObserverConstructSpan(headerBytes, *site);
+    if (observerLineBegin >= observerConstructEnd)
+      continue;
+
+    std::optional<uint64_t> firstATokOnObserverLine;
+    std::optional<uint64_t> lastATokOnObserverLine;
+    for (uint64_t aTok = 0; aTok < static_cast<uint64_t>(aToks_.size());
+         ++aTok) {
+      auto it = tokmapByPP.find(aTok);
+      if (it == tokmapByPP.end())
+        continue;
+      const RefoldModel::TokMapEntry &entry = it->second;
+      if (!PathsEqual(entry.file, ownerFile))
+        continue;
+      if (entry.b < observerLineBegin || entry.e > observerConstructEnd)
+        continue;
+      if (!firstATokOnObserverLine || aTok < *firstATokOnObserverLine)
+        firstATokOnObserverLine = aTok;
+      if (!lastATokOnObserverLine || aTok > *lastATokOnObserverLine)
+        lastATokOnObserverLine = aTok;
+    }
+
+    if (!firstATokOnObserverLine || !lastATokOnObserverLine)
+      continue;
+    if (macro.cover.begin < *firstATokOnObserverLine ||
+        macro.cover.end - 1 > *lastATokOnObserverLine)
+      continue;
+
+    auto latestProducerLineControlEndBefore = [&](uint64_t offset)
+        -> std::optional<uint64_t> {
+      std::optional<uint64_t> result;
+      for (const RefoldModel::LineControlEvent &event :
+           model_.GetLineControls()) {
+        if (!event.active || !event.producerProven || !event.siteE)
+          continue;
+        if (event.ownerIncludeId != site->ownerIncludeId)
+          continue;
+        if (!sameLineControlPhysicalFile(event.physicalFile, ownerFile))
+          continue;
+        if (*event.siteE > offset)
+          continue;
+        result = result ? std::max(*result, *event.siteE) : *event.siteE;
+      }
+      return result;
+    };
+
+    auto producerBackedLocationAt = [&](uint64_t offset)
+        -> std::optional<LineDirectiveLocation> {
+      const RefoldModel::LineControlEvent *best = nullptr;
+      for (const RefoldModel::LineControlEvent &event :
+           model_.GetLineControls()) {
+        if (!event.active || !event.producerProven || !event.siteE)
+          continue;
+        if (event.ownerIncludeId != site->ownerIncludeId)
+          continue;
+        if (!sameLineControlPhysicalFile(event.physicalFile, ownerFile))
+          continue;
+        if (*event.siteE > offset)
+          continue;
+        if (!best || *event.siteE > *best->siteE ||
+            (*event.siteE == *best->siteE && event.id > best->id))
+          best = &event;
+      }
+      if (!best)
+        return std::nullopt;
+
+      const size_t delta = stringutils::countNonSplicedNewlines(
+          headerBytes, *best->siteE, offset);
+      return LineDirectiveLocation(best->logicalFileAfter,
+                                   best->logicalLineAfter + delta, true);
+    };
+
+    auto logicalLocationAt = [&](uint64_t offset) -> LineDirectiveLocation {
+      LineDirectiveLocation loc =
+          LineDirectiveInserter::LogicalLocationAtOffset(
+              headerBytes, static_cast<size_t>(offset), ownerFile, model_,
+              ownerFile, site->ownerIncludeId);
+      if (loc.producerProven)
+        return loc;
+      if (std::optional<LineDirectiveLocation> producerLoc =
+              producerBackedLocationAt(offset))
+        return *producerLoc;
+      return loc;
+    };
+
+    const std::optional<uint64_t> latestLineControlEnd =
+        latestProducerLineControlEndBefore(observerLineBegin);
+    const uint64_t searchBegin = latestLineControlEnd.value_or(0);
+
+    const int64_t lastObserverBTokI =
+        abTokMapA2B_[static_cast<size_t>(*lastATokOnObserverLine)];
+    if (lastObserverBTokI < 0 ||
+        lastObserverBTokI >= static_cast<int64_t>(bTokOff_.size()) ||
+        lastObserverBTokI >= static_cast<int64_t>(bToks_.size()))
+      continue;
+    const size_t lastObserverBTok = static_cast<size_t>(lastObserverBTokI);
+    const uint64_t observerBEnd = static_cast<uint64_t>(
+        bTokOff_[lastObserverBTok] + bToks_[lastObserverBTok].spelling.size());
+
+    std::optional<uint64_t> leftATokForEdit;
+    std::optional<uint64_t> rightATokAfterCollapsedGap;
+    std::optional<size_t> leftBTokForEdit;
+    std::optional<size_t> firstObserverBTok;
+    for (uint64_t aTok = 1; aTok < *firstATokOnObserverLine; ++aTok) {
+      const uint64_t leftATok = aTok - 1;
+      auto leftIt = tokmapByPP.find(leftATok);
+      auto rightIt = tokmapByPP.find(aTok);
+      if (leftIt == tokmapByPP.end() || rightIt == tokmapByPP.end())
+        continue;
+      const RefoldModel::TokMapEntry &leftEntry = leftIt->second;
+      const RefoldModel::TokMapEntry &rightEntry = rightIt->second;
+      if (!PathsEqual(leftEntry.file, ownerFile) ||
+          !PathsEqual(rightEntry.file, ownerFile))
+        continue;
+      if (leftEntry.e < searchBegin || rightEntry.b > observerLineBegin)
+        continue;
+      if (leftEntry.e > rightEntry.b)
+        continue;
+      if (leftATok >= static_cast<uint64_t>(abTokMapA2B_.size()) ||
+          aTok >= static_cast<uint64_t>(abTokMapA2B_.size()))
+        continue;
+
+      const int64_t leftBTokI = abTokMapA2B_[static_cast<size_t>(leftATok)];
+      const int64_t rightBTokI = abTokMapA2B_[static_cast<size_t>(aTok)];
+      if (leftBTokI < 0 || rightBTokI < 0 ||
+          static_cast<uint64_t>(leftBTokI) >= abTokMapB2A_.size() ||
+          static_cast<uint64_t>(rightBTokI) >= abTokMapB2A_.size() ||
+          abTokMapB2A_[static_cast<size_t>(leftBTokI)] !=
+              static_cast<int64_t>(leftATok) ||
+          abTokMapB2A_[static_cast<size_t>(rightBTokI)] !=
+              static_cast<int64_t>(aTok))
+        continue;
+      if (static_cast<size_t>(leftBTokI) >= bTokOff_.size() ||
+          static_cast<size_t>(rightBTokI) >= bTokOff_.size() ||
+          static_cast<size_t>(leftBTokI) >= bToks_.size())
+        continue;
+
+      const uint64_t leftBEnd = static_cast<uint64_t>(
+          bTokOff_[static_cast<size_t>(leftBTokI)] +
+          bToks_[static_cast<size_t>(leftBTokI)].spelling.size());
+      const uint64_t rightBBegin =
+          static_cast<uint64_t>(bTokOff_[static_cast<size_t>(rightBTokI)]);
+      if (rightBBegin < leftBEnd || rightBBegin > bSource_.size())
+        continue;
+
+      StringRef sourceGap = headerBytes.slice(leftEntry.e, rightEntry.b);
+      StringRef bGap = bSource_.slice(leftBEnd, rightBBegin);
+      if (!isPureWhitespaceContainingNewline(sourceGap))
+        continue;
+      if (bGap.contains('\n') || bGap.contains('\r'))
+        continue;
+
+      const int64_t firstObserverBTokI =
+          abTokMapA2B_[static_cast<size_t>(*firstATokOnObserverLine)];
+      if (firstObserverBTokI < 0 ||
+          static_cast<size_t>(firstObserverBTokI) >= bTokOff_.size())
+        continue;
+
+      leftATokForEdit = leftATok;
+      rightATokAfterCollapsedGap = aTok;
+      leftBTokForEdit = static_cast<size_t>(leftBTokI);
+      firstObserverBTok = static_cast<size_t>(firstObserverBTokI);
+      break;
+    }
+    if (!leftATokForEdit || !rightATokAfterCollapsedGap ||
+        !leftBTokForEdit || !firstObserverBTok)
+      continue;
+
+    auto leftIt = tokmapByPP.find(*leftATokForEdit);
+    if (leftIt == tokmapByPP.end())
+      continue;
+    const RefoldModel::TokMapEntry &leftEntry = leftIt->second;
+    if (!PathsEqual(leftEntry.file, ownerFile))
+      continue;
+
+    const uint64_t firstObserverBBegin =
+        static_cast<uint64_t>(bTokOff_[*firstObserverBTok]);
+    const uint64_t leftBEnd = static_cast<uint64_t>(
+        bTokOff_[*leftBTokForEdit] + bToks_[*leftBTokForEdit].spelling.size());
+    if (firstObserverBBegin < leftBEnd || firstObserverBBegin > bSource_.size())
+      continue;
+
+    if (observerBEnd > bSource_.size())
+      continue;
+
+    std::optional<LineObserverSourcePrefix> sourcePrefix =
+        buildLineObserverSourceSpelledPrefix(
+            headerBytes, ownerFile, site->ownerIncludeId, bSource_,
+            [&](StringRef lhs, StringRef rhs) { return PathsEqual(lhs, rhs); },
+            tokmapByPP, model_.GetMacroInvocations(), abTokMapA2B_,
+            abTokMapB2A_, bToks_, bTokOff_, leftEntry.e, leftBEnd,
+            *rightATokAfterCollapsedGap, *firstATokOnObserverLine,
+            observerLineBegin, firstObserverBBegin);
+    if (!sourcePrefix)
+      continue;
+
+    std::optional<LineObserverRightClosure> closure =
+        extendLineObserverRightClosure(
+            headerBytes, ownerFile, bSource_,
+            [&](StringRef lhs, StringRef rhs) { return PathsEqual(lhs, rhs); },
+            tokmapByPP, abTokMapA2B_, abTokMapB2A_, bToks_, bTokOff_,
+            observerConstructEnd, observerBEnd, *lastATokOnObserverLine,
+            lastObserverBTok);
+    if (!closure)
+      continue;
+
+    std::string replacement = sourcePrefix->text;
+    if (replacement.empty())
+      continue;
+    if (!stringutils::outAtBOL(replacement))
+      continue;
+
+    LineDirectiveLocation loc = logicalLocationAt(observerLineBegin);
+    if (!loc.producerProven)
+      continue;
+    replacement += lineDirs_.FormatLineDirective(loc.lineNo, loc.fileSpelling);
+    replacement += headerBytes.slice(observerLineBegin, observerConstructEnd).str();
+    replacement += closure->sourceSpelledExtension;
+
+    const uint64_t patchAStart = *rightATokAfterCollapsedGap;
+    const uint64_t patchAEnd = closure->lastATok + 1;
+    const uint64_t patchBStart = static_cast<uint64_t>(*leftBTokForEdit);
+    const uint64_t patchBEnd = static_cast<uint64_t>(closure->lastBTok + 1);
+    if (patchOverlapsExisting(include->id, patchAStart, patchAEnd)) {
+      trace("linedir/layout",
+            "skip include-owned pre-observer __LINE__ layout realization for "
+            "include #{0} A=[{1},{2}): overlaps existing include patch",
+            include->id, patchAStart, patchAEnd);
+      continue;
+    }
+
+    const std::string replacementForTrace = replacement;
+    IncludePatch patch{include, std::move(replacement), patchAStart, patchAEnd,
+                       patchBStart, patchBEnd};
+    patch.hasDirectHeaderByteRange = true;
+    patch.directHeaderByteBegin = leftEntry.e;
+    patch.directHeaderByteEnd = closure->sourceEnd;
+
+    auto [it, _] = perInclude.try_emplace(include->id, include);
+    it->second.Add(std::move(patch));
+
+    trace("linedir/layout",
+          "realize include-owned pre-observer layout before preserved "
+          "__LINE__: include=#{0} file='{1}' A=[{2},{3}) B=[{4},{5}) "
+          "sourceBytes=[{6},{7}) resumeLine={8} resumeFile={9} repl='{10}'",
+          include->id, ownerFile, patchAStart, patchAEnd, patchBStart,
+          patchBEnd, leftEntry.e, closure->sourceEnd, loc.lineNo,
+          loc.fileSpelling,
+          stringutils::showWsWithClip(replacementForTrace, 120));
+  }
+
+  return true;
+}
+
+bool RefoldEngine::LineStateBuiltinInvocationIsPreservedObserver(
+    const RefoldModel::MacroInvocation &macro) const {
+  // The demand side of synthetic #line insertion is intentionally about
+  // *preserved observers*, not merely about source spellings that existed in
+  // the original owner. A later accepted macro-realization edit may already
+  // materialize a changed __LINE__ value as an ordinary literal. In that case
+  // inserting a #line before the materialized literal is gratuitous and can
+  // make the refolding less faithful to the B-side edit.
+  //
+  // The producer/LCS token map gives us a deterministic proof for the only case
+  // that should demand resync here: the builtin's realized A-side token surface
+  // survived token-identically into B. If any produced token is unmapped, maps
+  // back to a different A token, or has different spelling in B, the builtin is
+  // not considered a preserved observer for line-resync demand; the ordinary
+  // macro realization machinery is then responsible for materializing it.
+  if (!macro.cover.IsValid())
+    return true;
+
+  if (abTokMapA2B_.empty() || abTokMapB2A_.empty())
+    return true;
+
+  int64_t previousB = -1;
+  for (uint64_t aTok = macro.cover.begin; aTok < macro.cover.end; ++aTok) {
+    if (aTok >= static_cast<uint64_t>(abTokMapA2B_.size()))
+      return false;
+
+    const int64_t bTok = abTokMapA2B_[static_cast<size_t>(aTok)];
+    if (bTok < 0)
+      return false;
+    if (bTok >= static_cast<int64_t>(bToks_.size()) ||
+        aTok >= static_cast<uint64_t>(aToks_.size()))
+      return false;
+    if (static_cast<uint64_t>(bTok) >= abTokMapB2A_.size())
+      return false;
+    if (abTokMapB2A_[static_cast<size_t>(bTok)] !=
+        static_cast<int64_t>(aTok))
+      return false;
+
+    if (previousB >= 0 && bTok != previousB + 1)
+      return false;
+    previousB = bTok;
+
+    if (aToks_[static_cast<size_t>(aTok)].spelling !=
+        bToks_[static_cast<size_t>(bTok)].spelling)
+      return false;
+  }
+
+  return true;
+}
+
+bool RefoldEngine::LineStateBuiltinInvocationNeedsProducerBackedFinalObserver(
+    const RefoldModel::MacroInvocation &macro) const {
+  // Direct lexical builtin tokens that survive into ordinary emitted source are
+  // visible to the scanner without extra model facts.  If a predefined builtin is
+  // reached through a caller macro, the final source normally contains the caller
+  // spelling rather than the builtin token; record that the observer needs the
+  // producer-backed final observer path instead of lexical discovery alone.
+  if (macro.callerMacroId)
+    return true;
+
+  if (!macro.invFile || !macro.invB)
+    return true;
+
+  // Missing cover/map evidence is already treated as preserved by
+  // LineStateBuiltinInvocationIsPreservedObserver() for emission safety.  It also
+  // requires producer-backed final observer evidence rather than direct lexical
+  // discovery.
+  if (!macro.cover.IsValid())
+    return true;
+  if (abTokMapA2B_.empty() || abTokMapB2A_.empty())
+    return true;
+
   return false;
 }
 
-bool RefoldEngine::OwnerSuffixHasLineStateSensitiveBuiltin(
+RefoldEngine::LineStateObserverDemand
+RefoldEngine::OwnerSuffixLineStateObserverDemand(
     std::optional<uint64_t> ownerIncludeId, StringRef ownerFile,
     uint64_t offset) const {
+  LineStateObserverDemand demand;
+
   for (const auto &macro : model_.GetMacroInvocations()) {
-    if (!stringutils::isLineDirectiveSensitiveBuiltin(macro.name))
+    const bool observesLine = macro.name == "__LINE__";
+    const bool observesFile =
+        macro.name == "__FILE__" || macro.name == "__FILE_NAME__";
+    if (!observesLine && !observesFile)
       continue;
     if (macro.ownerIncludeId != ownerIncludeId)
       continue;
@@ -201,81 +2050,450 @@ bool RefoldEngine::OwnerSuffixHasLineStateSensitiveBuiltin(
       continue;
     if (!PathsEqual(*site->invFile, ownerFile))
       continue;
-    if (*site->invB >= offset)
+    if (*site->invB < offset)
+      continue;
+
+    if (!LineStateBuiltinInvocationIsPreservedObserver(macro)) {
+      trace("linedir/resync",
+            "skip {0} resync demand: macro id={1} at byte {2} is "
+            "materialized or token-changed in B",
+            macro.name, macro.id, *site->invB);
+      continue;
+    }
+
+    demand.needsLine |= observesLine;
+    demand.needsFile |= observesFile;
+    demand.hasProducerBackedFinalObserver |=
+        LineStateBuiltinInvocationNeedsProducerBackedFinalObserver(macro);
+    if (demand.needsLine && demand.needsFile &&
+        demand.hasProducerBackedFinalObserver)
+      break;
+  }
+
+  return demand;
+}
+
+std::optional<RefoldEngine::LineStateObserverSite>
+RefoldEngine::FirstOwnerSuffixLineStateObserverSite(
+    std::optional<uint64_t> ownerIncludeId, StringRef ownerFile,
+    uint64_t offset) const {
+  std::optional<LineStateObserverSite> best;
+
+  auto considerSite = [&](const RefoldModel::MacroInvocation &builtin,
+                          const RefoldModel::MacroInvocation &site) {
+    const bool observesLine = builtin.name == "__LINE__";
+    const bool observesFile =
+        builtin.name == "__FILE__" || builtin.name == "__FILE_NAME__";
+    if (!observesLine && !observesFile)
+      return;
+    if (site.ownerIncludeId != ownerIncludeId)
+      return;
+    if (!site.invFile || !site.invB)
+      return;
+    if (!PathsEqual(*site.invFile, ownerFile))
+      return;
+    if (*site.invB < offset)
+      return;
+    if (IsInvocationInsideDefineDirective(site))
+      return;
+    if (!LineStateBuiltinInvocationIsPreservedObserver(builtin))
+      return;
+
+    if (!best || *site.invB < best->offset) {
+      best = LineStateObserverSite{};
+      best->offset = *site.invB;
+    }
+    best->demand.needsLine |= observesLine;
+    best->demand.needsFile |= observesFile;
+    best->demand.hasProducerBackedFinalObserver |=
+        LineStateBuiltinInvocationNeedsProducerBackedFinalObserver(builtin);
+  };
+
+  for (const auto &macro : model_.GetMacroInvocations()) {
+    const bool observesLine = macro.name == "__LINE__";
+    const bool observesFile =
+        macro.name == "__FILE__" || macro.name == "__FILE_NAME__";
+    if (!observesLine && !observesFile)
+      continue;
+
+    const RefoldModel::MacroInvocation *site = &macro;
+    unsigned depth = 0;
+    const unsigned maxDepth =
+        static_cast<unsigned>(model_.GetMacroInvocations().size());
+    while (site && depth++ <= maxDepth) {
+      considerSite(macro, *site);
+      if (!site->callerMacroId)
+        break;
+      site = FindMacroInvocationById(*site->callerMacroId);
+    }
+  }
+
+  return best;
+}
+
+bool RefoldEngine::OwnerSuffixHasLineStateSensitiveBuiltin(
+    std::optional<uint64_t> ownerIncludeId, StringRef ownerFile,
+    uint64_t offset) const {
+  return OwnerSuffixLineStateObserverDemand(ownerIncludeId, ownerFile, offset)
+      .Any();
+}
+
+
+/// Return true iff a physical source line spells one of the line-control
+/// directive forms that can affect the logical file/line state.  This helper is
+/// intentionally syntactic and conservative; it is used only to identify the
+/// concrete previous directive that caused no-op suppression in the already
+/// emitted final stream.
+static bool isPhysicalLineControlDirectiveLine(StringRef line) {
+  line = line.trim();
+  if (!line.starts_with("#"))
+    return false;
+
+  line = line.drop_front().ltrim();
+  if (line.starts_with("line")) {
+    line = line.drop_front(4);
+    return line.empty() || line.front() == '/' || stringutils::isWs(line.front());
+  }
+
+  // Clang/GCC line-marker spelling: `# 42 "file" ...`.
+  return !line.empty() && line.front() >= '0' && line.front() <= '9';
+}
+
+/// Find the last concrete line-control directive line before an insertion point
+/// in an already-emitted output prefix.  The returned range is in final-output
+/// coordinates and includes the trailing newline when present.
+static std::optional<std::pair<uint64_t, uint64_t>>
+findLastLineControlDirectiveRangeBefore(StringRef out, uint64_t insertionOffset) {
+  if (insertionOffset > out.size())
+    insertionOffset = out.size();
+
+  const uint64_t lookbackLimit = insertionOffset > 16 * 1024
+                                     ? insertionOffset - 16 * 1024
+                                     : 0;
+  uint64_t cursor = insertionOffset;
+  while (cursor > lookbackLimit) {
+    uint64_t contentEnd = cursor;
+    uint64_t rangeEnd = cursor;
+    if (contentEnd > lookbackLimit && out[contentEnd - 1] == '\n') {
+      --contentEnd;
+      rangeEnd = cursor;
+    }
+
+    uint64_t lineBegin = contentEnd;
+    while (lineBegin > lookbackLimit && out[lineBegin - 1] != '\n')
+      --lineBegin;
+
+    StringRef line(out.data() + lineBegin,
+                   static_cast<size_t>(contentEnd - lineBegin));
+    if (isPhysicalLineControlDirectiveLine(line))
+      return std::make_pair(lineBegin, rangeEnd);
+
+    if (lineBegin == 0)
+      break;
+    cursor = lineBegin - 1;
+  }
+
+  return std::nullopt;
+}
+
+bool RefoldEngine::LineResyncShouldDeferToConditionalJoin(
+    StringRef ownerFile, std::optional<uint64_t> ownerIncludeId,
+    uint64_t resumeOffset) const {
+  std::optional<LineStateObserverSite> firstObserver =
+      FirstOwnerSuffixLineStateObserverSite(ownerIncludeId, ownerFile,
+                                           resumeOffset);
+  if (!firstObserver || !firstObserver->demand.Any())
+    return false;
+
+  for (const RefoldModel::CondGroup *group :
+       model_.GetCondGroups(ownerFile, ownerIncludeId)) {
+    if (!group || group->file != ownerFile ||
+        group->parentIncludeId != ownerIncludeId)
+      continue;
+
+    // The edit resumes inside a selected arm, but the first preserved
+    // line-state observer is reached only after the conditional island has
+    // rejoined.  A local arm repair is then only configuration-local; the
+    // canonical domination point is the join repair before that observer.
+    if (group->ContainsByte(resumeOffset) &&
+        firstObserver->offset >= group->groupE)
       return true;
   }
+
   return false;
 }
 
-std::string RefoldEngine::WrapIncludeExpansionForMaterialization(
+
+/// Build one explicit final-line-control pruning candidate for a synthetic
+/// directive emitted into an intermediate text buffer.
+///
+/// The offsets are intentionally relative to the buffer that owns the directive
+/// right now.  The edit applicator shifts them exactly once when the buffer is
+/// spliced into its parent output.  This keeps candidate generation deterministic
+/// despite later edit normalization, include nesting, and pending-resync flushes.
+static FinalLineControlPruneCandidate makeSyntheticLineControlPruneCandidate(
+    uint64_t begin, uint64_t end, FinalLineDirective::Origin origin,
+    std::optional<FinalLineControlOwnerKey> owner, StringRef reason) {
+  FinalLineControlPruneCandidate candidate;
+  candidate.finalBegin = begin;
+  candidate.finalEnd = end;
+  candidate.origin = origin;
+  candidate.physicalOwner = std::move(owner);
+  candidate.producerProven = true;
+  candidate.reason = reason.str();
+  return candidate;
+}
+
+/// Append source candidates to destination after shifting their offsets by delta.
+static void appendShiftedLineControlPruneCandidates(
+    std::vector<FinalLineControlPruneCandidate> &dst,
+    ArrayRef<FinalLineControlPruneCandidate> src, uint64_t delta) {
+  dst.reserve(dst.size() + src.size());
+  for (FinalLineControlPruneCandidate candidate : src) {
+    candidate.finalBegin += delta;
+    candidate.finalEnd += delta;
+    dst.push_back(std::move(candidate));
+  }
+}
+
+
+/// Append final-to-source mappings after shifting their final-output offsets by
+/// delta.  Source byte ranges are not changed; only the enclosing final buffer
+/// coordinate changes as materialized source text is nested into a parent.
+static void appendShiftedLineControlSourceMappings(
+    std::vector<FinalLineControlSourceMapping> &dst,
+    ArrayRef<FinalLineControlSourceMapping> src, uint64_t delta) {
+  dst.reserve(dst.size() + src.size());
+  for (FinalLineControlSourceMapping mapping : src) {
+    mapping.finalBegin += delta;
+    mapping.finalEnd += delta;
+    dst.push_back(std::move(mapping));
+  }
+}
+
+static void deduplicateLineControlSourceMappings(
+    std::vector<FinalLineControlSourceMapping> &mappings) {
+  CanonicalizeFinalLineControlSourceMappings(mappings);
+}
+
+/// Build a pruning candidate for a directive that was inserted into a
+/// replacement buffer by LineDirectiveInserter.  The proof is exact: the new
+/// text must be the old text plus one complete directive at a single stable
+/// byte offset.
+static std::optional<FinalLineControlPruneCandidate>
+makeInsertedSyntheticLineControlPruneCandidate(
+    StringRef before, StringRef after, StringRef directive,
+    FinalLineDirective::Origin origin,
+    std::optional<FinalLineControlOwnerKey> owner, StringRef reason) {
+  if (directive.empty())
+    return std::nullopt;
+  if (after.size() != before.size() + directive.size())
+    return std::nullopt;
+
+  size_t prefix = 0;
+  while (prefix < before.size() && before[prefix] == after[prefix])
+    ++prefix;
+
+  if (prefix + directive.size() > after.size())
+    return std::nullopt;
+  if (after.substr(prefix, directive.size()) != directive)
+    return std::nullopt;
+
+  StringRef afterTail = after.substr(prefix + directive.size());
+  StringRef beforeTail = before.substr(prefix);
+  if (afterTail != beforeTail)
+    return std::nullopt;
+
+  return makeSyntheticLineControlPruneCandidate(
+      static_cast<uint64_t>(prefix),
+      static_cast<uint64_t>(prefix + directive.size()), origin,
+      std::move(owner), reason);
+}
+
+/// Remove duplicate candidate records after composition/duplicate-edit merging.
+///
+/// Candidate equality is intentionally byte-range plus origin: the final pruner
+/// only needs to know that the concrete directive range is eligible.  Keeping
+/// one stable record per directive avoids trace noise while preserving the
+/// fail-closed matching rule.
+static void deduplicateLineControlPruneCandidates(
+    std::vector<FinalLineControlPruneCandidate> &candidates) {
+  llvm::sort(candidates, [](const FinalLineControlPruneCandidate &lhs,
+                            const FinalLineControlPruneCandidate &rhs) {
+    if (lhs.finalBegin != rhs.finalBegin)
+      return lhs.finalBegin < rhs.finalBegin;
+    if (lhs.finalEnd != rhs.finalEnd)
+      return lhs.finalEnd < rhs.finalEnd;
+    return static_cast<unsigned>(lhs.origin) < static_cast<unsigned>(rhs.origin);
+  });
+
+  candidates.erase(
+      std::unique(candidates.begin(), candidates.end(),
+                  [](const FinalLineControlPruneCandidate &lhs,
+                     const FinalLineControlPruneCandidate &rhs) {
+                    return lhs.finalBegin == rhs.finalBegin &&
+                           lhs.finalEnd == rhs.finalEnd &&
+                           lhs.origin == rhs.origin;
+                  }),
+      candidates.end());
+}
+
+RefoldEngine::LineControlWrappedText
+RefoldEngine::WrapIncludeExpansionForMaterialization(
     const RefoldModel::IncludeItem &child, StringRef parentFileSpelling,
+    StringRef parentOwnerFileForDemand,
     std::optional<uint64_t> parentOwnerIncludeId, uint64_t parentResumeOffset,
     size_t childEntryLineNo, size_t parentResumeLineNo, StringRef childBody,
+    ArrayRef<FinalLineControlPruneCandidate> childBodyLineControlCandidates,
+    ArrayRef<FinalLineControlSourceMapping> childBodyLineControlSourceMappings,
     bool allowUnobservableLineDirectiveSuppression) const {
-  if (!lineDirs_.Enabled())
-    return childBody.str();
+  LineControlWrappedText wrapped;
+
+  auto appendChildBody = [&]() {
+    const uint64_t bodyBegin = static_cast<uint64_t>(wrapped.text.size());
+    wrapped.text += childBody.str();
+    appendShiftedLineControlPruneCandidates(
+        wrapped.lineControlPruneCandidates, childBodyLineControlCandidates,
+        bodyBegin);
+    appendShiftedLineControlSourceMappings(
+        wrapped.lineControlSourceMappings, childBodyLineControlSourceMappings,
+        bodyBegin);
+  };
+
+  if (!lineDirs_.Enabled()) {
+    appendChildBody();
+    return wrapped;
+  }
 
   const std::string childFileSpelling = resolveHeaderPath(child);
 
+  const LineStateObserverDemand childDemand =
+      IncludeSubtreeLineStateObserverDemand(child.id);
+  const LineStateObserverDemand parentDemand =
+      OwnerSuffixLineStateObserverDemand(parentOwnerIncludeId,
+                                         parentOwnerFileForDemand,
+                                         parentResumeOffset);
+  const bool childNeedsLineState = childDemand.Any();
+  const bool parentNeedsLineState = parentDemand.Any();
+  const bool childNeedsLayoutBarrier =
+      !childBody.empty() &&
+      IncludeEntryLineDirectiveDischargesLayoutBarrier(
+          child, parentOwnerFileForDemand);
+
+  auto parentReturnShouldDeferToConditionalJoin = [&]() -> bool {
+    // If the include is materialized inside one arm of a preserved conditional
+    // group and the first parent observer is after the group rejoins, an
+    // arm-local return #line is insufficient for other build configurations.
+    // The repair must dominate the join instead.  Do not evaluate the #if
+    // expression here; this is a purely structural dominance proof over the
+    // recorded conditional island and the first preserved observer site.
+    return LineResyncShouldDeferToConditionalJoin(
+        parentOwnerFileForDemand, parentOwnerIncludeId, parentResumeOffset);
+  };
+
+  auto appendSyntheticDirective = [&](std::string directive,
+                                      FinalLineDirective::Origin origin,
+                                      std::optional<FinalLineControlOwnerKey> owner,
+                                      StringRef reason,
+                                      bool removableCandidate) {
+    const uint64_t begin = static_cast<uint64_t>(wrapped.text.size());
+    wrapped.text += directive;
+    const uint64_t end = static_cast<uint64_t>(wrapped.text.size());
+    if (removableCandidate) {
+      wrapped.lineControlPruneCandidates.push_back(
+          makeSyntheticLineControlPruneCandidate(begin, end, origin,
+                                                 std::move(owner), reason));
+    }
+  };
+
+  auto appendChildEntryIfDemanded = [&]() {
+    if (childNeedsLineState || childNeedsLayoutBarrier) {
+      appendSyntheticDirective(
+          lineDirs_.FormatLineDirective(childEntryLineNo, childFileSpelling),
+          FinalLineDirective::Origin::SyntheticIncludeEntry,
+          FinalLineControlOwnerKey(childFileSpelling, child.id),
+          "synthetic include-entry candidate with final-stream observer/layout proof",
+          /*removableCandidate=*/true);
+      return;
+    }
+
+    trace("linedir/include",
+          "skip include entry #line inc#{0}: materialized child has no "
+          "preserved line-state observer and no parent layout barrier",
+          child.id);
+  };
+
+  auto appendParentReturnIfDemanded = [&]() {
+    if (parentNeedsLineState) {
+      if (parentReturnShouldDeferToConditionalJoin()) {
+        trace("linedir/include",
+              "defer include return #line inc#{0}: parent observer after "
+              "conditional join must be repaired at the join", child.id);
+        return;
+      }
+      appendSyntheticDirective(
+          lineDirs_.FormatLineDirective(parentResumeLineNo,
+                                        parentFileSpelling),
+          FinalLineDirective::Origin::SyntheticIncludeReturn,
+          FinalLineControlOwnerKey(parentOwnerFileForDemand.str(),
+                                   parentOwnerIncludeId),
+          "synthetic include-return candidate with final-stream observer proof",
+          /*removableCandidate=*/true);
+      return;
+    }
+
+    trace("linedir/include",
+          "skip include return #line inc#{0}: parent suffix has no "
+          "preserved line-state observer after byte {1}",
+          child.id, parentResumeOffset);
+  };
+
   if (!allowUnobservableLineDirectiveSuppression) {
-    // In normal --with-lines materialization, a materialized include is a
-    // logical file transition even when no token presently observes that state.
-    // Preserve the historical enter/exit wrapper so diagnostics and future
-    // source-location-sensitive edits see the same owner transition.  Selective
-    // suppression is reserved for the narrow sideband-pragma-only class below.
-    std::string result;
-    result.reserve(childBody.size() + 128);
-    result += lineDirs_.FormatLineDirective(childEntryLineNo, childFileSpelling);
-    result += childBody.str();
+    // Ordinary include materialization and sideband-driven materialization use
+    // the same proof obligation for synthetic line-control.  The local emission
+    // policy remains conservative, but every synthetic wrapper emitted here is
+    // registered as an explicit removable candidate; final observer/layout
+    // liveness plus executable clang -E -P validation decide whether it survives.
+    wrapped.text.reserve(childBody.size() + 128);
+    appendChildEntryIfDemanded();
+    appendChildBody();
     if (!childBody.empty() && childBody.back() != '\n')
-      result += '\n';
-    result += lineDirs_.FormatLineDirective(parentResumeLineNo,
-                                            parentFileSpelling);
-    return result;
+      wrapped.text += '\n';
+    appendParentReturnIfDemanded();
+    deduplicateLineControlPruneCandidates(wrapped.lineControlPruneCandidates);
+    deduplicateLineControlSourceMappings(wrapped.lineControlSourceMappings);
+    return wrapped;
   }
 
-  const bool childNeedsLineState =
-      IncludeSubtreeHasLineStateSensitiveBuiltin(child.id);
-  const bool parentNeedsLineState =
-      childNeedsLineState ||
-      OwnerSuffixHasLineStateSensitiveBuiltin(parentOwnerIncludeId,
-                                              parentFileSpelling,
-                                              parentResumeOffset);
-
-  if (childBody.empty() && !childNeedsLineState && !parentNeedsLineState) {
+  if (childBody.empty() && !childNeedsLineState && !childNeedsLayoutBarrier &&
+      !parentNeedsLineState) {
     trace("linedir/include",
           "skip empty sideband-only include #line wrapper inc#{0}: no "
-          "line-sensitive builtins in child subtree or parent suffix",
+          "preserved line-state observers and no layout barrier",
           child.id);
-    return childBody.str();
+    appendChildBody();
+    return wrapped;
   }
 
-  std::string result;
-  result.reserve(childBody.size() + 128);
+  wrapped.text.reserve(childBody.size() + 128);
+  appendChildEntryIfDemanded();
+  appendChildBody();
 
-  // A non-empty sideband-only include materialization still emits bytes whose
-  // logical owner is the header.  Preserve that owner transition in --with-lines
-  // output even when no current token observes __LINE__/__FILE__; otherwise a
-  // repeated zero-token include can leave visible header pragmas looking as if
-  // they were spelled in the parent TU.
-  if (!childBody.empty() || childNeedsLineState)
-    result += lineDirs_.FormatLineDirective(childEntryLineNo, childFileSpelling);
-
-  result += childBody.str();
-
-  if (!result.empty() && result.back() != '\n')
-    result += '\n';
-  if (!childBody.empty() || parentNeedsLineState)
-    result += lineDirs_.FormatLineDirective(parentResumeLineNo,
-                                            parentFileSpelling);
+  if (!wrapped.text.empty() && wrapped.text.back() != '\n')
+    wrapped.text += '\n';
+  appendParentReturnIfDemanded();
 
   trace("linedir/include",
         "wrap sideband-only include inc#{0}: childLineState={1} "
-        "parentLineState={2} visibleBody={3}",
+        "childLayout={2} parentLineState={3} visibleBody={4}",
         child.id, childNeedsLineState ? "YES" : "NO",
+        childNeedsLayoutBarrier ? "YES" : "NO",
         parentNeedsLineState ? "YES" : "NO",
         childBody.empty() ? "NO" : "YES");
-  return result;
+  deduplicateLineControlPruneCandidates(wrapped.lineControlPruneCandidates);
+  deduplicateLineControlSourceMappings(wrapped.lineControlSourceMappings);
+  return wrapped;
+
 }
 
 void RefoldEngine::MaterializeIncludeExpansion(
@@ -285,6 +2503,10 @@ void RefoldEngine::MaterializeIncludeExpansion(
     const DenseMap<uint64_t, std::vector<const RefoldModel::IncludeItem *>>
         &children,
     DenseMap<uint64_t, std::string> &includeExpansion,
+    DenseMap<uint64_t, std::vector<FinalLineControlPruneCandidate>>
+        &includeExpansionLineControlPruneCandidates,
+    DenseMap<uint64_t, std::vector<FinalLineControlSourceMapping>>
+        &includeExpansionLineControlSourceMappings,
     DenseMap<uint64_t, size_t> &includeExpansionStartLineNos,
     DenseMap<uint64_t, AcceptedResultCandidate>
         &includeExpansionAcceptedResults,
@@ -451,7 +2673,8 @@ void RefoldEngine::MaterializeIncludeExpansion(
                                 includeId)
             : ResyncOutcome(sideband.ReplacementText().str(), std::nullopt);
     TextEdit edit{sourceRange.first, sourceRange.second, std::move(ro.text),
-                  std::move(ro.pending), std::nullopt, {}};
+                  std::move(ro.pending), std::nullopt, {}, {}, {}};
+    edit.lineControlPruneCandidates = std::move(ro.lineControlPruneCandidates);
     AttachAcceptedResultCarrier(
         edit, BuildAcceptedIncludeRealizationCandidate(
                   AcceptedPathKind::IncludeMaterializedExpansion, *inc));
@@ -493,7 +2716,10 @@ void RefoldEngine::MaterializeIncludeExpansion(
                     MacroPatchRemainsExpanded(mp)
                         ? std::make_optional(GetRootMacroId(mp.macroId))
                         : std::nullopt,
+                    {},
+                    {},
                     {}};
+      edit.lineControlPruneCandidates = std::move(ro.lineControlPruneCandidates);
       AttachAcceptedResultCarrier(edit, BuildAcceptedEmittedMacroCandidate(mp));
       edits.push_back(std::move(edit));
     }
@@ -673,6 +2899,8 @@ void RefoldEngine::MaterializeIncludeExpansion(
       // complete before it is wrapped and inserted into the parent header.
       MaterializeIncludeExpansion(child->id, perInclude, macroPatchesByOwner,
                                   children, includeExpansion,
+                                  includeExpansionLineControlPruneCandidates,
+                                  includeExpansionLineControlSourceMappings,
                                   includeExpansionStartLineNos,
                                   includeExpansionAcceptedResults,
                                   appliedExpandedMacroRootIds);
@@ -703,12 +2931,28 @@ void RefoldEngine::MaterializeIncludeExpansion(
         LineDirectiveLocation parentResume =
             LineDirectiveInserter::LogicalLocationAtOffset(
                 bytes, child->siteE, headerPath, model_, headerPath, includeId);
-        std::string wrapped = WrapIncludeExpansionForMaterialization(
-            *child, parentResume.fileSpelling, includeId, child->siteE,
-            childEntryLineNo ? childEntryLineNo : 1, parentResume.lineNo,
-            childText, sidebandOnly);
-        TextEdit edit{siteStart,    siteEnd,      std::move(wrapped),
-                      std::nullopt, std::nullopt, {}};
+        ArrayRef<FinalLineControlPruneCandidate> childLineCandidates;
+        if (auto childCandidatesIt =
+                includeExpansionLineControlPruneCandidates.find(child->id);
+            childCandidatesIt !=
+            includeExpansionLineControlPruneCandidates.end())
+          childLineCandidates = childCandidatesIt->second;
+        ArrayRef<FinalLineControlSourceMapping> childLineSourceMappings;
+        if (auto childMappingsIt =
+                includeExpansionLineControlSourceMappings.find(child->id);
+            childMappingsIt != includeExpansionLineControlSourceMappings.end())
+          childLineSourceMappings = childMappingsIt->second;
+        LineControlWrappedText wrapped = WrapIncludeExpansionForMaterialization(
+            *child, parentResume.fileSpelling, headerPath, includeId,
+            child->siteE, childEntryLineNo ? childEntryLineNo : 1,
+            parentResume.lineNo, childText, childLineCandidates,
+            childLineSourceMappings, sidebandOnly);
+        TextEdit edit{siteStart,    siteEnd,      std::move(wrapped.text),
+                      std::nullopt, std::nullopt, {}, {}, {}};
+        edit.lineControlPruneCandidates =
+            std::move(wrapped.lineControlPruneCandidates);
+        edit.lineControlSourceMappings =
+            std::move(wrapped.lineControlSourceMappings);
         if (sidebandOnly ||
             includeUsesOnlySidebandReplayEnvelope(
                 includeUsesOnlySidebandReplayEnvelope, child->id)) {
@@ -802,14 +3046,26 @@ void RefoldEngine::MaterializeIncludeExpansion(
   // Apply all staged edits in this header. If application requests terminal
   // fallback, leave this include empty so callers do not consume a partial
   // materialization.
+  std::vector<FinalLineControlPruneCandidate> appliedLineControlCandidates;
+  std::vector<FinalLineControlSourceMapping> appliedLineControlSourceMappings;
   std::string applied = ApplyTextEditsWithPendingResync(
-      bytes, edits, appliedExpandedMacroRootIds, headerPath, includeId);
+      bytes, edits, appliedExpandedMacroRootIds, headerPath, includeId,
+      /*materializedEditMappings=*/nullptr, &appliedLineControlCandidates,
+      &appliedLineControlSourceMappings);
   if (terminalFallbackRequested_) {
     includeExpansion[includeId] = std::string();
+    includeExpansionLineControlPruneCandidates[includeId].clear();
+    includeExpansionLineControlSourceMappings[includeId].clear();
     return;
   }
 
   includeExpansion[includeId] = std::move(applied);
+  deduplicateLineControlPruneCandidates(appliedLineControlCandidates);
+  deduplicateLineControlSourceMappings(appliedLineControlSourceMappings);
+  includeExpansionLineControlPruneCandidates[includeId] =
+      std::move(appliedLineControlCandidates);
+  includeExpansionLineControlSourceMappings[includeId] =
+      std::move(appliedLineControlSourceMappings);
   includeExpansionStartLineNos[includeId] = firstEmittedHeaderLine;
   includeExpansionAcceptedResults[includeId] =
       BuildAcceptedIncludeRealizationCandidate(
@@ -2514,6 +4770,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       return false;
 
     const IncludePatch &first = ie.patches[idx];
+    if (first.hasDirectHeaderByteRange)
+      return false;
     if (first.aStart >= first.aEnd)
       return false;
 
@@ -2585,6 +4843,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
 
     const IncludePatch &first = ie.patches[idx];
     const IncludePatch &second = ie.patches[idx + 1];
+    if (first.hasDirectHeaderByteRange || second.hasDirectHeaderByteRange)
+      return false;
     if (first.include != second.include)
       return false;
     if (first.ownerHasCondArmCert != second.ownerHasCondArmCert)
@@ -2702,6 +4962,51 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       // Ignore empty or malformed patches defensively.
       debug("include/apply",
             "file={0} patch[{1}] ignored (no-op classification)", file, idx);
+      continue;
+    }
+
+    if (p.hasDirectHeaderByteRange) {
+      if (p.directHeaderByteBegin > p.directHeaderByteEnd ||
+          p.directHeaderByteEnd > fileLen) {
+        debug("include/apply",
+              "file={0} patch[{1}] direct header byte range [{2},{3}) is "
+              "outside file length {4}; realizing include",
+              file, idx, p.directHeaderByteBegin, p.directHeaderByteEnd,
+              fileLen);
+        plan.requiresIncludeRealization = true;
+        plan.realizationReason =
+            llvm::formatv("direct include layout patch[{0}] has invalid "
+                          "header byte range [{1},{2}) for file {3}",
+                          idx, p.directHeaderByteBegin, p.directHeaderByteEnd,
+                          file)
+                .str();
+        return plan;
+      }
+
+      IncludeAnchorWitness directWitness;
+      directWitness.evidence = IncludeAnchorEvidenceKind::MappedHeaderTokens;
+      directWitness.hasByteRange = true;
+      directWitness.startByte = p.directHeaderByteBegin;
+      directWitness.endByte = p.directHeaderByteEnd;
+      directWitness.hasFirstPP = p.aStart < p.aEnd;
+      directWitness.firstPP = p.aStart;
+      directWitness.hasLastPP = p.aStart < p.aEnd;
+      directWitness.lastPP = p.aStart < p.aEnd ? p.aEnd - 1 : p.aStart;
+
+      trace("include/apply",
+            "file={0} patch[{1}] direct header layout bytes=[{2},{3}) "
+            "A=[{4},{5}) B=[{6},{7}) repl='{8}'",
+            file, idx, p.directHeaderByteBegin, p.directHeaderByteEnd,
+            p.aStart, p.aEnd, p.bStart, p.bEnd,
+            stringutils::showWsWithClip(p.insertBytes, 120));
+
+      TextEdit edit{p.directHeaderByteBegin, p.directHeaderByteEnd,
+                    p.insertBytes, std::nullopt, std::nullopt, {}, {}, {}};
+      AttachAcceptedResultCarrier(
+          edit, BuildAcceptedIncludeCandidate(
+                    AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens, p,
+                    &directWitness));
+      plan.edits.push_back(std::move(edit));
       continue;
     }
 
@@ -3127,7 +5432,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                                   candidate.anchorByte, text, file, ie.include->id)
                             : TextEdit{candidate.anchorByte,
                                        candidate.anchorByte, std::move(text),
-                                       std::nullopt, std::nullopt, {}};
+                                       std::nullopt, std::nullopt, {}, {}, {}};
         AttachAcceptedResultCarrier(
             edit, BuildAcceptedIncludeCandidate(candidate.path, p,
                                                 &candidate.witness));
@@ -4044,6 +6349,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     const bool emitsHeaderSourceLineDirectiveResume =
         lineDirs_.Enabled() && usedFullHeaderEnvelope &&
         headerSourceLineDirectiveResume && *endByte < fileLen;
+    std::vector<FinalLineControlPruneCandidate> sourceLineResumeCandidates;
     if (emitsHeaderSourceLineDirectiveResume) {
       // A full-envelope delete has no B-derived payload, but the consumed
       // source interval may still have carried a line-control directive whose
@@ -4056,8 +6362,16 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       } else if (replacement.back() != '\n') {
         replacement.push_back('\n');
       }
+      const uint64_t resumeBegin = static_cast<uint64_t>(replacement.size());
       replacement +=
           formatSourceLineDirectiveGapResume(*headerSourceLineDirectiveResume);
+      const uint64_t resumeEnd = static_cast<uint64_t>(replacement.size());
+      sourceLineResumeCandidates.push_back(
+          makeSyntheticLineControlPruneCandidate(
+              resumeBegin, resumeEnd,
+              FinalLineDirective::Origin::SyntheticSourceLineResume,
+              FinalLineControlOwnerKey(file, ie.include->id),
+              "synthetic header source-line resume candidate from consumed #line gap"));
       trace("include/apply",
             "file={0} patch[{1}] emitted source #line resume line={2} "
             "resumeFile={3}",
@@ -4108,10 +6422,13 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     // that records which PP tokens and header bytes justified the edit range.
     TextEdit edit = emitsHeaderSourceLineDirectiveResume
                         ? TextEdit{*startByte, *endByte, std::move(replacement),
-                                   std::nullopt, std::nullopt, {}}
+                                   std::nullopt, std::nullopt, {}, {}, {}}
                         : MakeTextEditWithResyncOrPending(
                               headerText, *startByte, *endByte, replacement, file,
                               ie.include->id);
+    if (emitsHeaderSourceLineDirectiveResume)
+      edit.lineControlPruneCandidates =
+          std::move(sourceLineResumeCandidates);
     AttachAcceptedResultCarrier(
         edit, BuildAcceptedIncludeCandidate(
                   AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens, p,
@@ -4257,30 +6574,168 @@ RefoldEngine::ApplyResyncOrPend(
   if (origNl == replNl)
     return ResyncOutcome(replacement.str(), std::nullopt);
 
-  // Newline drift means the following untouched source would resume at a
-  // different logical location unless we emit a #line directive.  Use the
-  // source-authored line-control state at `end`, not merely the physical line
-  // in this owner file: `#line`, `# line`, and `# <number>` can make a copied
-  // suffix observe a virtual file/line through __LINE__ or __FILE__.
+  // Newline drift is only observable when a preserved suffix builtin depends
+  // on the logical line component. Do not synthesize #line directives merely
+  // because physical newline counts changed: materialized __LINE__ values do
+  // not observe the stream, and preserved __FILE__/__FILE_NAME__ only observe
+  // the file component, which newline drift alone does not change.
+  LineStateObserverDemand demand = OwnerSuffixLineStateObserverDemand(
+      ownerIncludeId, fileSpellingForDirective, end);
+  const bool resyncPruneEligible =
+      demand.PrunableByCurrentFinalObserverModel();
+  if (!demand.needsLine) {
+    trace("linedir/resync",
+          "SKIP synthetic resync: newline drift span=[{0},{1}) has no "
+          "preserved __LINE__ observer in owner suffix (fileObserver={2})",
+          start, end, demand.needsFile ? "YES" : "NO");
+    return ResyncOutcome(replacement.str(), std::nullopt);
+  }
+
+  // A preserved suffix __LINE__ would otherwise resume at a different logical
+  // line. Use the source-authored line-control state at `end`, not merely the
+  // physical line in this owner file: `#line`, `# line`, and `# <number>` can
+  // make a copied suffix observe a virtual file/line.
   LineDirectiveLocation resumeLoc =
       LineDirectiveInserter::LogicalLocationAtOffset(
           originalFileText, end, fileSpellingForDirective, model_,
           fileSpellingForDirective, ownerIncludeId);
+
+  auto sameLineControlPhysicalFile = [&](StringRef lhs, StringRef rhs) {
+    if (lhs == rhs)
+      return true;
+
+    // Pseudo-files such as <built-in> are not filesystem paths.  They must
+    // match by exact producer spelling only.
+    auto isPseudoFile = [](StringRef path) {
+      return path.starts_with("<") && path.ends_with(">");
+    };
+    if (isPseudoFile(lhs) || isPseudoFile(rhs))
+      return false;
+
+    return lineDirs_.ToAbsolutePath(lhs) == lineDirs_.ToAbsolutePath(rhs);
+  };
+
+  auto producerProvenLineControlStateAtOffset = [&]()
+      -> std::optional<LineDirectiveLocation> {
+    const RefoldModel::LineControlEvent *best = nullptr;
+
+    for (const RefoldModel::LineControlEvent &event : model_.GetLineControls()) {
+      if (!event.active || !event.producerProven || !event.siteE)
+        continue;
+      if (event.ownerIncludeId != ownerIncludeId)
+        continue;
+      if (!sameLineControlPhysicalFile(event.physicalFile,
+                                       fileSpellingForDirective))
+        continue;
+
+      // This fallback is only for source line-control that remains in the
+      // preserved prefix.  A directive consumed by the replacement is a
+      // different proof obligation and must still fail closed elsewhere.
+      if (*event.siteE > start)
+        continue;
+
+      if (!best || *event.siteE > *best->siteE ||
+          (*event.siteE == *best->siteE && event.id > best->id))
+        best = &event;
+    }
+
+    if (!best)
+      return std::nullopt;
+
+    const size_t delta = stringutils::countNonSplicedNewlines(
+        originalFileText, *best->siteE, end);
+    return LineDirectiveLocation(best->logicalFileAfter,
+                                 best->logicalLineAfter + delta, true);
+  };
+
   trace("linedir/resync",
         "drift: span=[{0},{1}) origNl={2} replNl={3} resumeLine={4} file={5} "
-        "replTail={6}",
+        "proven={6} replTail={7}",
         start, end, origNl, replNl, resumeLoc.lineNo,
-        resumeLoc.fileSpelling, stringutils::showWsWithClip(replacement, 100));
+        resumeLoc.fileSpelling, resumeLoc.producerProven,
+        stringutils::showWsWithClip(replacement, 100));
+
+  if (!resumeLoc.producerProven) {
+    if (resumeLoc.unprovenLineControlDirectiveOffset &&
+        *resumeLoc.unprovenLineControlDirectiveOffset >= start &&
+        *resumeLoc.unprovenLineControlDirectiveOffset < end) {
+      RequestTerminalFallback(
+          TerminalFallbackKind::UndischargedEmissionArtifact, "linedir/resync",
+          llvm::formatv(
+              "newline-drift replacement consumes unmodeled source #line "
+              "directive at byte {0} in owner '{1}'",
+              *resumeLoc.unprovenLineControlDirectiveOffset,
+              fileSpellingForDirective)
+              .str());
+      return ResyncOutcome(replacement.str(), std::nullopt);
+    }
+
+    if (std::optional<LineDirectiveLocation> producerLoc =
+            producerProvenLineControlStateAtOffset()) {
+      trace("linedir/resync",
+            "producer-backed resync recovery: byte={0} resumeLine={1} "
+            "file={2}",
+            end, producerLoc->lineNo, producerLoc->fileSpelling);
+      resumeLoc = std::move(*producerLoc);
+    } else {
+      trace("linedir/resync",
+            "SKIP synthetic resync: source line-control state before byte {0} "
+            "is not fully model-proven; preserving source #line stream",
+            end);
+      return ResyncOutcome(replacement.str(), std::nullopt);
+    }
+  }
+
+  const bool deferToConditionalJoin =
+      LineResyncShouldDeferToConditionalJoin(fileSpellingForDirective,
+                                             ownerIncludeId, end);
+  if (deferToConditionalJoin) {
+    trace("linedir/resync",
+          "defer newline resync to conditional join: resumeLine={0} file={1} "
+          "at byte={2}",
+          resumeLoc.lineNo, resumeLoc.fileSpelling, end);
+    return ResyncOutcome{
+        replacement.str(),
+        PendingResync{fileSpellingForDirective, ownerIncludeId,
+                      resyncPruneEligible, resumeLoc.fileSpelling,
+                      resumeLoc.lineNo, end,
+                      /*deferToJoin=*/true}};
+  }
 
   std::string injected = lineDirs_.MaybeAppendResyncAfterReplacement(
       originalFileText, start, end, replacement, resumeLoc);
+  const std::string resyncDirective =
+      lineDirs_.FormatLineDirective(resumeLoc.lineNo, resumeLoc.fileSpelling);
 
   // A changed result means the directive was inserted directly into this
   // replacement, so no deferred resync state needs to be carried forward.
   if (injected != replacement) {
     trace("linedir/resync", "local inject succeeded: resumeLine={0} file={1}",
           resumeLoc.lineNo, resumeLoc.fileSpelling);
-    return ResyncOutcome(std::move(injected), std::nullopt);
+
+    std::vector<FinalLineControlPruneCandidate> candidates;
+    if (resyncPruneEligible) {
+      if (std::optional<FinalLineControlPruneCandidate> candidate =
+              makeInsertedSyntheticLineControlPruneCandidate(
+                  replacement, injected, resyncDirective,
+                  FinalLineDirective::Origin::SyntheticNewlineResync,
+                  FinalLineControlOwnerKey(fileSpellingForDirective.str(),
+                                           ownerIncludeId),
+                  "local synthetic newline-resync candidate with final-stream observer proof")) {
+        candidates.push_back(std::move(*candidate));
+      } else {
+        trace("linedir/resync",
+              "local resync was emitted but candidate range could not be "
+              "isolated deterministically; retain fail-closed");
+      }
+    } else {
+      trace("linedir/resync",
+            "local resync retained fail-closed: no final observer/layout demand "
+            "made it eligible for pruning");
+    }
+
+    return ResyncOutcome(std::move(injected), std::nullopt,
+                         std::move(candidates));
   }
 
   // Local injection was not safe, usually because the replacement rejoins
@@ -4290,8 +6745,11 @@ RefoldEngine::ApplyResyncOrPend(
         "local inject failed -> PENDING: resumeLine={0} file={1}",
         resumeLoc.lineNo, resumeLoc.fileSpelling);
 
-  return ResyncOutcome{replacement.str(),
-                       PendingResync{fileSpellingForDirective, ownerIncludeId}};
+  return ResyncOutcome{
+      replacement.str(),
+      PendingResync{fileSpellingForDirective, ownerIncludeId,
+                    resyncPruneEligible, resumeLoc.fileSpelling,
+                    resumeLoc.lineNo, end}};
 }
 
 void RefoldEngine::AttachAcceptedResultCarrier(
@@ -4682,14 +7140,33 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
     StringRef originalFileText, ArrayRef<TextEdit> edits,
     DenseSet<uint64_t> *appliedExpandedMacroRootIds,
     StringRef emissionOwner, std::optional<uint64_t> ownerIncludeId,
-    std::vector<MaterializedEditMapping> *materializedEditMappings) const {
+    std::vector<MaterializedEditMapping> *materializedEditMappings,
+    std::vector<FinalLineControlPruneCandidate>
+        *lineControlPruneCandidates,
+    std::vector<FinalLineControlSourceMapping>
+        *lineControlSourceMappings) const {
   // Source-side ranges are only knowable at this final splice boundary: every
   // earlier candidate still may be merged, dropped, widened, or followed by a
   // pending resync before it becomes physical output.
   if (materializedEditMappings)
     materializedEditMappings->clear();
-  if (edits.empty())
+  if (lineControlPruneCandidates)
+    lineControlPruneCandidates->clear();
+  if (lineControlSourceMappings)
+    lineControlSourceMappings->clear();
+  const std::string sourceMappingOwner =
+      emissionOwner.empty() ? std::string()
+                            : lineDirs_.ToAbsolutePath(emissionOwner);
+  if (edits.empty()) {
+    if (lineControlSourceMappings && !originalFileText.empty() &&
+        !sourceMappingOwner.empty()) {
+      lineControlSourceMappings->push_back(FinalLineControlSourceMapping{
+          0, static_cast<uint64_t>(originalFileText.size()),
+          sourceMappingOwner, 0,
+          static_cast<uint64_t>(originalFileText.size()), ownerIncludeId});
+    }
     return originalFileText.str();
+  }
 
   // Normalize edits by span.
   //
@@ -4765,6 +7242,12 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
         const uint64_t fragmentOutputBase =
             static_cast<uint64_t>(merged.text.size());
         merged.text.append(ordered[k].e->text);
+        appendShiftedLineControlPruneCandidates(
+            merged.lineControlPruneCandidates,
+            ordered[k].e->lineControlPruneCandidates, fragmentOutputBase);
+        appendShiftedLineControlSourceMappings(
+            merged.lineControlSourceMappings,
+            ordered[k].e->lineControlSourceMappings, fragmentOutputBase);
         if (ordered[k].e->pending)
           merged.pending = ordered[k].e->pending;
         merged.acceptedResults.insert(merged.acceptedResults.end(),
@@ -4800,6 +7283,8 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
         StampTextEditMaterializedOutputTextRange(merged, *mergedOutByteBegin,
                                                  *mergedOutByteEnd);
 
+      deduplicateLineControlPruneCandidates(merged.lineControlPruneCandidates);
+      deduplicateLineControlSourceMappings(merged.lineControlSourceMappings);
       trace("edits/apply",
             "merged {0} insertion edits at [{1},{2}) into len={3}", j - i, s, t,
             merged.text.size());
@@ -4881,7 +7366,9 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
                                              replacement, emissionOwner,
                                              ownerIncludeId);
         TextEdit merged{s, t, std::move(ro.text), std::move(ro.pending),
-                        std::nullopt, {}};
+                        std::nullopt, {}, {}, {}};
+        merged.lineControlPruneCandidates =
+            std::move(ro.lineControlPruneCandidates);
         StampTextEditMaterializedBTokenRange(merged, bBegin, bEnd);
 
         // Preserve existing proof carriers from the fragments. If the fragments
@@ -4994,6 +7481,12 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
       // Keep all accepted-result carriers from the equivalent duplicates. The
       // text replacement is shared, but each proof witness still explains one
       // path that contributed to the emitted edit.
+      appendShiftedLineControlPruneCandidates(
+          merged.lineControlPruneCandidates, dup.lineControlPruneCandidates,
+          /*delta=*/0);
+      appendShiftedLineControlSourceMappings(
+          merged.lineControlSourceMappings, dup.lineControlSourceMappings,
+          /*delta=*/0);
       merged.acceptedResults.insert(merged.acceptedResults.end(),
                                     dup.acceptedResults.begin(),
                                     dup.acceptedResults.end());
@@ -5025,6 +7518,8 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
       StampTextEditMaterializedOutputTextRange(merged, mergedOutRange->first,
                                                mergedOutRange->second);
 
+    deduplicateLineControlPruneCandidates(merged.lineControlPruneCandidates);
+    deduplicateLineControlSourceMappings(merged.lineControlSourceMappings);
     trace("edits/apply",
           "merged {0} identical non-zero edits at [{1},{2}) into one edit",
           j - i, s, t);
@@ -5301,7 +7796,9 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
                           replacement, emissionOwner, ownerIncludeId);
     closure =
         TextEdit{best->sourceBegin,     best->sourceEnd, std::move(ro.text),
-                 std::move(ro.pending), std::nullopt,    {}};
+                 std::move(ro.pending), std::nullopt,    {}, {}, {}};
+    closure.lineControlPruneCandidates =
+        std::move(ro.lineControlPruneCandidates);
     StampTextEditMaterializedBTokenRange(closure, best->bBegin, best->bEnd);
     AttachAcceptedResultCarrier(
         closure, BuildAcceptedTUTextEditCandidate(
@@ -5422,8 +7919,10 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
     // Copy the untouched source before this edit. If a previous replacement
     // could not safely emit its #line resync locally, this copy step is also the
     // next opportunity to flush that pending resync at a safe boundary.
-    pending = AppendOriginalSliceWithPending(out, originalFileText, cursor,
-                                             e.start, std::move(pending));
+    pending = AppendOriginalSliceWithPending(
+        out, originalFileText, cursor, e.start, std::move(pending),
+        sourceMappingOwner, ownerIncludeId, lineControlPruneCandidates,
+        lineControlSourceMappings);
 
     // Record expanded macro roots that actually made it into the emitted text.
     // Counter stabilization uses this to force later __COUNTER__-sensitive
@@ -5433,6 +7932,14 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
 
     const uint64_t emittedBegin = static_cast<uint64_t>(out.size());
     out.append(e.text);
+    if (lineControlPruneCandidates)
+      appendShiftedLineControlPruneCandidates(*lineControlPruneCandidates,
+                                              e.lineControlPruneCandidates,
+                                              emittedBegin);
+    if (lineControlSourceMappings)
+      appendShiftedLineControlSourceMappings(*lineControlSourceMappings,
+                                             e.lineControlSourceMappings,
+                                             emittedBegin);
 
     // Record only the replacement bytes written by this edit. Copied original
     // slices and emitted #line/resync material are intentionally outside the
@@ -5478,23 +7985,377 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
 
   // Copy the final untouched tail and flush any pending line resync that
   // survived the last replacement.
-  pending = AppendOriginalSliceWithPending(out, originalFileText, cursor, n,
-                                           std::move(pending));
+  pending = AppendOriginalSliceWithPending(
+      out, originalFileText, cursor, n, std::move(pending), sourceMappingOwner,
+      ownerIncludeId, lineControlPruneCandidates, lineControlSourceMappings);
 
+  auto shiftLineControlMetadataAfterInsertion = [&](uint64_t pos,
+                                                     uint64_t len) {
+    if (len == 0)
+      return;
+
+    if (lineControlPruneCandidates) {
+      for (FinalLineControlPruneCandidate &candidate :
+           *lineControlPruneCandidates) {
+        if (candidate.finalBegin >= pos) {
+          candidate.finalBegin += len;
+          candidate.finalEnd += len;
+        } else if (candidate.finalEnd > pos) {
+          // A synthetic directive should never straddle an independently
+          // inserted repair.  Preserve a conservative range if it does rather
+          // than creating overlapping stale coordinates.
+          candidate.finalEnd += len;
+        }
+      }
+    }
+
+    if (lineControlSourceMappings) {
+      std::vector<FinalLineControlSourceMapping> adjusted;
+      adjusted.reserve(lineControlSourceMappings->size() + 1);
+      for (FinalLineControlSourceMapping mapping : *lineControlSourceMappings) {
+        if (mapping.finalEnd <= pos) {
+          adjusted.push_back(std::move(mapping));
+          continue;
+        }
+        if (mapping.finalBegin >= pos) {
+          mapping.finalBegin += len;
+          mapping.finalEnd += len;
+          adjusted.push_back(std::move(mapping));
+          continue;
+        }
+
+        // The insertion splits a copied source slice.  Keep precise provenance
+        // for the surviving prefix and suffix; the synthetic #line bytes in the
+        // middle intentionally receive no source mapping.
+        const uint64_t sourceSplit =
+            mapping.sourceBegin + (pos - mapping.finalBegin);
+        FinalLineControlSourceMapping prefix = mapping;
+        prefix.finalEnd = pos;
+        prefix.sourceEnd = sourceSplit;
+        if (prefix.finalBegin < prefix.finalEnd)
+          adjusted.push_back(std::move(prefix));
+
+        FinalLineControlSourceMapping suffix = mapping;
+        suffix.finalBegin = pos + len;
+        suffix.finalEnd += len;
+        suffix.sourceBegin = sourceSplit;
+        if (suffix.finalBegin < suffix.finalEnd)
+          adjusted.push_back(std::move(suffix));
+      }
+      *lineControlSourceMappings = std::move(adjusted);
+      deduplicateLineControlSourceMappings(*lineControlSourceMappings);
+    }
+  };
+
+  auto sourceOffsetToFinalOffset = [&](uint64_t sourceOffset)
+      -> std::optional<uint64_t> {
+    if (!lineControlSourceMappings)
+      return std::nullopt;
+    for (const FinalLineControlSourceMapping &mapping :
+         *lineControlSourceMappings) {
+      if (mapping.ownerIncludeId != ownerIncludeId)
+        continue;
+      if (mapping.physicalFile != sourceMappingOwner)
+        continue;
+      if (sourceOffset < mapping.sourceBegin || sourceOffset > mapping.sourceEnd)
+        continue;
+      if (sourceOffset == mapping.sourceEnd)
+        return mapping.finalEnd;
+      return mapping.finalBegin + (sourceOffset - mapping.sourceBegin);
+    }
+    return std::nullopt;
+  };
+
+  struct ConditionalJoinLineRepair {
+    uint64_t sourceOffset = 0;
+    uint64_t finalOffset = 0;
+    std::string directive;
+  };
+
+  std::vector<ConditionalJoinLineRepair> joinRepairs;
+  if (lineDirs_.Enabled() && lineControlSourceMappings &&
+      !sourceMappingOwner.empty()) {
+    for (const RefoldModel::CondGroup *group :
+         model_.GetCondGroups(emissionOwner, ownerIncludeId)) {
+      if (!group || group->file != emissionOwner ||
+          group->parentIncludeId != ownerIncludeId)
+        continue;
+
+      bool groupContainsEdit = false;
+      for (const TextEdit &edit : norm) {
+        const bool zeroWidthInside =
+            edit.start == edit.end && group->ContainsByte(edit.start);
+        const bool overlap = edit.start < group->groupE && edit.end > group->groupB;
+        if (zeroWidthInside || overlap) {
+          groupContainsEdit = true;
+          break;
+        }
+      }
+      if (!groupContainsEdit)
+        continue;
+
+      std::optional<LineStateObserverSite> firstObserver =
+          FirstOwnerSuffixLineStateObserverSite(ownerIncludeId, emissionOwner,
+                                               group->groupE);
+      if (!firstObserver || !firstObserver->demand.Any())
+        continue;
+
+      // If the first observer is still inside the conditional group, an arm-local
+      // repair is the only statement that can dominate it.  The join repair is
+      // required only for observers reached after the group has rejoined.
+      if (firstObserver->offset < group->groupE)
+        continue;
+
+      std::optional<uint64_t> finalOffset =
+          sourceOffsetToFinalOffset(firstObserver->offset);
+      if (!finalOffset) {
+        RequestTerminalFallback(
+            TerminalFallbackKind::UndischargedEmissionArtifact,
+            "linedir/conditional-join",
+            llvm::formatv("cannot map conditional join observer in {0}: "
+                          "group#{1} observerSource={2}",
+                          emissionOwner, group->id, firstObserver->offset)
+                .str());
+        return originalFileText.str();
+      }
+
+      LineDirectiveLocation loc =
+          LineDirectiveInserter::LogicalLocationAtOffset(
+              originalFileText, firstObserver->offset, emissionOwner, model_,
+              emissionOwner, ownerIncludeId);
+
+      // Conditional-join repairs must describe the logical line state that
+      // reaches the first suffix observer after the conditional group rejoins.
+      // The lexical scanner above can reconstruct ordinary source-local
+      // #line state, but it intentionally fails closed when a source-authored
+      // #line operand depends on macro state imported from another owner.  The
+      // producer has already evaluated that directive, so recover the same
+      // owner-local state from the latest active producer-proven line-control
+      // event that precedes the observer.  This is the same proof obligation as
+      // the immediate newline-resync path: preserve the source-authored #line,
+      // then emit a canonical repair at the dominance point that accounts for
+      // any inserted newline drift before the preserved observer.
+      auto sameLineControlPhysicalFile = [&](StringRef lhs, StringRef rhs) {
+        if (lhs == rhs)
+          return true;
+
+        auto isPseudoFile = [](StringRef path) {
+          return path.starts_with("<") && path.ends_with(">");
+        };
+        if (isPseudoFile(lhs) || isPseudoFile(rhs))
+          return false;
+
+        return lineDirs_.ToAbsolutePath(lhs) == lineDirs_.ToAbsolutePath(rhs);
+      };
+
+      auto producerProvenLineControlStateAtOffset = [&]()
+          -> std::optional<LineDirectiveLocation> {
+        const RefoldModel::LineControlEvent *best = nullptr;
+
+        for (const RefoldModel::LineControlEvent &event :
+             model_.GetLineControls()) {
+          if (!event.active || !event.producerProven || !event.siteE)
+            continue;
+          if (event.ownerIncludeId != ownerIncludeId)
+            continue;
+          if (!sameLineControlPhysicalFile(event.physicalFile, emissionOwner))
+            continue;
+
+          // Only a line-control directive that is in the preserved source
+          // prefix of the observer can define the join state.  Directives after
+          // the observer are irrelevant, and consumed directives are handled by
+          // the normal fail-closed resync paths.
+          if (*event.siteE > firstObserver->offset)
+            continue;
+
+          if (!best || *event.siteE > *best->siteE ||
+              (*event.siteE == *best->siteE && event.id > best->id))
+            best = &event;
+        }
+
+        if (!best)
+          return std::nullopt;
+
+        const size_t delta = stringutils::countNonSplicedNewlines(
+            originalFileText, *best->siteE, firstObserver->offset);
+        return LineDirectiveLocation(best->logicalFileAfter,
+                                     best->logicalLineAfter + delta, true);
+      };
+
+      if (!loc.producerProven) {
+        if (std::optional<LineDirectiveLocation> producerLoc =
+                producerProvenLineControlStateAtOffset()) {
+          trace("linedir/conditional-join",
+                "producer-backed post-conditional #line in {0}: "
+                "sourceObserver={1} resumeLine={2} file={3}",
+                emissionOwner, firstObserver->offset, producerLoc->lineNo,
+                producerLoc->fileSpelling);
+          loc = std::move(*producerLoc);
+        }
+      }
+
+      std::string directive =
+          lineDirs_.FormatLineDirective(loc.lineNo, loc.fileSpelling);
+      if (directive.empty())
+        continue;
+
+      auto finalLineBeginForOffset = [&](uint64_t offset) -> uint64_t {
+        const uint64_t boundedOffset =
+            std::min<uint64_t>(offset, static_cast<uint64_t>(out.size()));
+        uint64_t lineBegin = boundedOffset;
+        while (lineBegin > 0 && out[lineBegin - 1] != '\n')
+          --lineBegin;
+        return lineBegin;
+      };
+
+      auto immediatelyPrecededBySameLineDirective =
+          [&](uint64_t insertionOffset, StringRef directiveText) -> bool {
+        if (insertionOffset == 0 || directiveText.empty())
+          return false;
+
+        uint64_t prevLineEnd = insertionOffset;
+        if (prevLineEnd > 0 && out[prevLineEnd - 1] == '\n')
+          --prevLineEnd;
+        uint64_t prevLineBegin = prevLineEnd;
+        while (prevLineBegin > 0 && out[prevLineBegin - 1] != '\n')
+          --prevLineBegin;
+
+        StringRef prevLine(out.data() + prevLineBegin,
+                           static_cast<size_t>(prevLineEnd - prevLineBegin));
+        return prevLine.trim() == directiveText.trim();
+      };
+
+      const uint64_t insertionOffset = finalLineBeginForOffset(*finalOffset);
+      StringRef currentOutAtInsertion(out.data(),
+                                      static_cast<size_t>(insertionOffset));
+
+      auto previousLineControlIsInsideThisConditionalGroup = [&]() -> bool {
+        std::optional<std::pair<uint64_t, uint64_t>> previousDirective =
+            findLastLineControlDirectiveRangeBefore(
+                StringRef(out.data(), out.size()), insertionOffset);
+        if (!previousDirective)
+          return false;
+
+        std::optional<uint64_t> groupFinalBegin =
+            sourceOffsetToFinalOffset(group->groupB);
+        std::optional<uint64_t> groupFinalEnd =
+            sourceOffsetToFinalOffset(group->groupE);
+        if (!groupFinalBegin || !groupFinalEnd)
+          return false;
+
+        return previousDirective->first >= *groupFinalBegin &&
+               previousDirective->second <= *groupFinalEnd;
+      };
+
+      if (!LineDirectiveInserter::ShouldEmitLineDirective(
+              currentOutAtInsertion, loc.fileSpelling, loc.lineNo, directive)) {
+        if (!previousLineControlIsInsideThisConditionalGroup()) {
+          trace("linedir/conditional-join",
+                "skip post-conditional #line in {0}: final={1} "
+                "sourceObserver={2} current stream is already file={3} line={4}",
+                emissionOwner, insertionOffset, firstObserver->offset,
+                loc.fileSpelling, loc.lineNo);
+          continue;
+        }
+
+        trace("linedir/conditional-join",
+              "emit post-conditional #line in {0}: final={1} sourceObserver={2} "
+              "despite no-op stream state because previous #line is conditional-local",
+              emissionOwner, insertionOffset, firstObserver->offset);
+      }
+
+      if (immediatelyPrecededBySameLineDirective(insertionOffset, directive)) {
+        trace("linedir/conditional-join",
+              "skip post-conditional #line in {0}: final={1} "
+              "sourceObserver={2} already dominated by identical directive",
+              emissionOwner, insertionOffset, firstObserver->offset);
+        continue;
+      }
+
+      joinRepairs.push_back(
+          ConditionalJoinLineRepair{firstObserver->offset, insertionOffset,
+                                    std::move(directive)});
+    }
+  }
+
+  if (!joinRepairs.empty()) {
+    llvm::sort(joinRepairs,
+               [](const ConditionalJoinLineRepair &lhs,
+                  const ConditionalJoinLineRepair &rhs) {
+                 if (lhs.finalOffset != rhs.finalOffset)
+                   return lhs.finalOffset > rhs.finalOffset;
+                 if (lhs.sourceOffset != rhs.sourceOffset)
+                   return lhs.sourceOffset > rhs.sourceOffset;
+                 return lhs.directive < rhs.directive;
+               });
+    joinRepairs.erase(
+        std::unique(joinRepairs.begin(), joinRepairs.end(),
+                    [](const ConditionalJoinLineRepair &lhs,
+                       const ConditionalJoinLineRepair &rhs) {
+                      return lhs.finalOffset == rhs.finalOffset &&
+                             lhs.directive == rhs.directive;
+                    }),
+        joinRepairs.end());
+
+    for (const ConditionalJoinLineRepair &repair : joinRepairs) {
+      out.insert(out.begin() + static_cast<size_t>(repair.finalOffset),
+                 repair.directive.begin(), repair.directive.end());
+      shiftLineControlMetadataAfterInsertion(
+          repair.finalOffset, static_cast<uint64_t>(repair.directive.size()));
+      trace("linedir/conditional-join",
+            "insert post-conditional #line in {0}: final={1} sourceObserver={2} "
+            "text='{3}'",
+            emissionOwner, repair.finalOffset, repair.sourceOffset,
+            repair.directive);
+    }
+  }
+
+  if (lineControlPruneCandidates)
+    deduplicateLineControlPruneCandidates(*lineControlPruneCandidates);
+  if (lineControlSourceMappings)
+    deduplicateLineControlSourceMappings(*lineControlSourceMappings);
   return std::string(out.str());
 }
 
 std::optional<RefoldEngine::PendingResync>
 RefoldEngine::AppendOriginalSliceWithPending(
     SmallVectorImpl<char> &out, llvm::StringRef original, uint64_t from,
-    uint64_t to, std::optional<RefoldEngine::PendingResync> pending) const {
+    uint64_t to, std::optional<RefoldEngine::PendingResync> pending,
+    StringRef emissionOwner, std::optional<uint64_t> ownerIncludeId,
+    std::vector<FinalLineControlPruneCandidate>
+        *lineControlPruneCandidates,
+    std::vector<FinalLineControlSourceMapping>
+        *lineControlSourceMappings) const {
+  auto appendMappedOriginalSlice = [&](uint64_t begin, uint64_t end) {
+    if (begin >= end)
+      return;
+    const uint64_t finalBegin = static_cast<uint64_t>(out.size());
+    auto slice = original.slice(static_cast<size_t>(begin),
+                                static_cast<size_t>(end));
+    out.append(slice.begin(), slice.end());
+    const uint64_t finalEnd = static_cast<uint64_t>(out.size());
+    if (lineControlSourceMappings && !emissionOwner.empty()) {
+      lineControlSourceMappings->push_back(FinalLineControlSourceMapping{
+          finalBegin, finalEnd, emissionOwner.str(), begin, end,
+          ownerIncludeId});
+    }
+  };
+
   // Fast path: if there is no pending #line correction, or line directives are
   // disabled, this helper is just a straight copy of the untouched source
   // slice.
   if (!pending || !lineDirs_.Enabled()) {
-    auto slice = original.slice(from, to);
-    out.append(slice.begin(), slice.end());
+    appendMappedOriginalSlice(from, to);
     return std::nullopt;
+  }
+
+  if (pending->deferToConditionalJoin) {
+    trace("line/pending",
+          "carry pending resync to conditional join: file={0} line={1} "
+          "slice=[{2},{3})",
+          pending->resumeFileSpelling, pending->resumeLineNo, from, to);
+    appendMappedOriginalSlice(from, to);
+    return pending;
   }
 
   uint64_t i = from;
@@ -5527,6 +8388,38 @@ RefoldEngine::AppendOriginalSliceWithPending(
     return firstNonWs < lineEnd && original[firstNonWs] == '#';
   };
 
+  auto logicalLocationForPendingFlush = [&](uint64_t pos)
+      -> std::optional<LineDirectiveLocation> {
+    LineDirectiveLocation loc = LineDirectiveInserter::LogicalLocationAtOffset(
+        original, static_cast<size_t>(pos), pending->fileSpellingForDir, model_,
+        pending->fileSpellingForDir, pending->ownerIncludeId);
+    if (loc.producerProven)
+      return loc;
+
+    // If the local scanner found an unmodeled source #line in the bytes copied
+    // after the edit, the pending state can no longer be propagated by counting
+    // newlines: that directive may have overwritten the logical stream state.
+    if (loc.unprovenLineControlDirectiveOffset &&
+        *loc.unprovenLineControlDirectiveOffset >= pending->resumeOffset &&
+        *loc.unprovenLineControlDirectiveOffset < pos)
+      return std::nullopt;
+
+    // The pending object was created only after ApplyResyncOrPend proved the
+    // logical state at resumeOffset.  If the eventual flush point is later in
+    // untouched source, and no intervening unmodeled line-control directive was
+    // found, advance that proved state by the physical non-spliced newlines
+    // copied from the original between resumeOffset and pos.  This handles
+    // source-authored #line directives whose operands used imported macro state:
+    // the local scanner cannot re-evaluate them, but the producer already did.
+    if (pending->resumeLineNo == 0 || pos < pending->resumeOffset)
+      return std::nullopt;
+
+    const size_t delta = stringutils::countNonSplicedNewlines(
+        original, pending->resumeOffset, pos);
+    return LineDirectiveLocation(pending->resumeFileSpelling,
+                                 pending->resumeLineNo + delta, true);
+  };
+
   // Prefer to flush the pending resync before copying this slice when the
   // emitted output is already at BOL and the untouched input also resumes at a
   // safe line boundary. This handles both true BOL and the indentation prefix
@@ -5534,31 +8427,49 @@ RefoldEngine::AppendOriginalSliceWithPending(
   if (stringutils::outAtBOL(StringRef(out.data(), out.size())) &&
       (stringutils::isBOL(original, static_cast<size_t>(from)) ||
        canFlushBeforeUntouchedDirectiveLine(static_cast<size_t>(from)))) {
-    LineDirectiveLocation loc = LineDirectiveInserter::LogicalLocationAtOffset(
-        original, from, pending->fileSpellingForDir, model_,
-        pending->fileSpellingForDir, pending->ownerIncludeId);
+    std::optional<LineDirectiveLocation> loc =
+        logicalLocationForPendingFlush(from);
+    if (!loc) {
+      trace("line/pending",
+            "SKIP pending flush@slice-begin: source line-control state at "
+            "orig={0} is not fully model-proven",
+            from);
+      appendMappedOriginalSlice(from, to);
+      return std::nullopt;
+    }
+
     std::string directive =
-        lineDirs_.FormatLineDirective(loc.lineNo, loc.fileSpelling);
+        lineDirs_.FormatLineDirective(loc->lineNo, loc->fileSpelling);
 
     StringRef currentOut(out.data(), out.size());
 
     // Avoid emitting a redundant directive when the current output state
     // already represents the requested file/line location.
     if (LineDirectiveInserter::ShouldEmitLineDirective(
-            currentOut, loc.fileSpelling, loc.lineNo, directive)) {
+            currentOut, loc->fileSpelling, loc->lineNo, directive)) {
       trace("line/pending",
             "flush@slice-begin file={0} line={1} (pending) outTail={2}",
-            loc.fileSpelling, loc.lineNo, stringutils::dbgOutTail(currentOut));
+            loc->fileSpelling, loc->lineNo, stringutils::dbgOutTail(currentOut));
+      const uint64_t begin = static_cast<uint64_t>(out.size());
       out.append(directive.begin(), directive.end());
+      const uint64_t end = static_cast<uint64_t>(out.size());
+      if (lineControlPruneCandidates &&
+          pending->finalLineControlPruneEligible) {
+        lineControlPruneCandidates->push_back(
+            makeSyntheticLineControlPruneCandidate(
+                begin, end,
+                FinalLineDirective::Origin::SyntheticNewlineResync,
+                FinalLineControlOwnerKey(pending->fileSpellingForDir,
+                                         pending->ownerIncludeId),
+                "pending synthetic newline-resync candidate with final-stream observer proof"));
+      }
     } else {
       trace("line/pending",
             "SKIP flush@slice-begin (no-op) file={0} line={1} outTail={2}",
-            loc.fileSpelling, loc.lineNo, stringutils::dbgOutTail(currentOut));
+            loc->fileSpelling, loc->lineNo, stringutils::dbgOutTail(currentOut));
     }
 
-    auto slice =
-        original.slice(static_cast<size_t>(from), static_cast<size_t>(to));
-    out.append(slice.begin(), slice.end());
+    appendMappedOriginalSlice(from, to);
     return std::nullopt;
   }
 
@@ -5570,31 +8481,50 @@ RefoldEngine::AppendOriginalSliceWithPending(
     if (nl == llvm::StringRef::npos || nl >= static_cast<size_t>(to))
       break;
 
-    auto slice = original.slice(static_cast<size_t>(i), nl + 1);
-    out.append(slice.begin(), slice.end());
+    appendMappedOriginalSlice(i, static_cast<uint64_t>(nl + 1));
 
     i = nl + 1;
 
     if (!stringutils::isLineSplice(original, nl)) {
-      LineDirectiveLocation loc = LineDirectiveInserter::LogicalLocationAtOffset(
-          original, static_cast<size_t>(i), pending->fileSpellingForDir, model_,
-          pending->fileSpellingForDir, pending->ownerIncludeId);
+      std::optional<LineDirectiveLocation> loc =
+          logicalLocationForPendingFlush(i);
+      if (!loc) {
+        trace("line/pending",
+              "SKIP pending flush@safe-nl: source line-control state at "
+              "orig={0} is not fully model-proven",
+              i);
+        pending = std::nullopt;
+        break;
+      }
+
       std::string directive =
-          lineDirs_.FormatLineDirective(loc.lineNo, loc.fileSpelling);
+          lineDirs_.FormatLineDirective(loc->lineNo, loc->fileSpelling);
 
       StringRef currentOut(out.data(), out.size());
       if (LineDirectiveInserter::ShouldEmitLineDirective(
-              currentOut, loc.fileSpelling, loc.lineNo, directive)) {
+              currentOut, loc->fileSpelling, loc->lineNo, directive)) {
         trace("line/pending",
               "flush@safe-nl file={0} line={1} atOrig={2} outTail={3}",
-              loc.fileSpelling, loc.lineNo, i,
+              loc->fileSpelling, loc->lineNo, i,
               stringutils::dbgOutTail(currentOut));
+        const uint64_t begin = static_cast<uint64_t>(out.size());
         out.append(directive.begin(), directive.end());
+        const uint64_t end = static_cast<uint64_t>(out.size());
+        if (lineControlPruneCandidates &&
+            pending->finalLineControlPruneEligible) {
+          lineControlPruneCandidates->push_back(
+              makeSyntheticLineControlPruneCandidate(
+                  begin, end,
+                  FinalLineDirective::Origin::SyntheticNewlineResync,
+                  FinalLineControlOwnerKey(pending->fileSpellingForDir,
+                                           pending->ownerIncludeId),
+                  "pending synthetic newline-resync candidate with final-stream observer proof"));
+        }
       } else {
         trace("line/pending",
               "SKIP flush@safe-nl (no-op) file={0} line={1} atOrig={2} "
               "outTail={3}",
-              loc.fileSpelling, loc.lineNo, i,
+              loc->fileSpelling, loc->lineNo, i,
               stringutils::dbgOutTail(currentOut));
       }
 
@@ -5607,9 +8537,7 @@ RefoldEngine::AppendOriginalSliceWithPending(
   // flush point was found. In the latter case, return the still-pending resync
   // so a later original slice can discharge it.
   if (i < to) {
-    auto remaining =
-        original.slice(static_cast<size_t>(i), static_cast<size_t>(to));
-    out.append(remaining.begin(), remaining.end());
+    appendMappedOriginalSlice(i, to);
   }
   return pending;
 }

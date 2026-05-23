@@ -531,9 +531,20 @@ static std::string expandLineControlMacros(
 
     const LineControlMacroDefinition &def = found->second;
     if (!def.functionLike) {
+      // Object-like replacement lists resolve token-paste before the rescan
+      // that expands the pasted token. Expanding first would turn
+      //
+      //   #define A 7
+      //   #define A00 700
+      //   #define LOC A ## 00
+      //
+      // into the invalid intermediate spelling `7 ## 00`; the preprocessor
+      // instead forms `A00` and only then expands it to `700`.
       disabled.insert(name);
-      out += expandLineControlMacros(StringRef(def.replacement), macros,
-                                     disabled, logicalLineAtLineStart,
+      std::string pasted =
+          removeTokenPasteOperators(StringRef(def.replacement));
+      out += expandLineControlMacros(StringRef(pasted), macros, disabled,
+                                     logicalLineAtLineStart,
                                      activeFileSpelling);
       disabled.erase(name);
       continue;
@@ -613,6 +624,24 @@ static bool readLineControlDirectiveAndOperand(StringRef line,
     return false;
   operand = line.substr(p);
   return true;
+}
+
+static bool lineControlSpellingIsLineDirective(StringRef line) {
+  const size_t to = line.size();
+  size_t p = 0;
+  if (!lineStartsWithHash(line, p, to))
+    return false;
+
+  // Standard spelling: #line <pp-tokens>.  Require a token boundary after
+  // "line" so ordinary directives with longer names are not misclassified.
+  if (p + 4 <= to && line.substr(p, 4) == "line" &&
+      (p + 4 == to || stringutils::isWs(line[p + 4])))
+    return true;
+
+  // GCC/Clang numeric line-control form: # <digits> ["file"].  The actual
+  // numeric operand may be macro-produced, but a digit here is enough to classify
+  // the directive as line-control for proof gating.
+  return p < to && std::isdigit(static_cast<unsigned char>(line[p]));
 }
 
 
@@ -928,7 +957,9 @@ parseLineDirectiveForLineControl(StringRef src, size_t from, size_t to) {
   while (p < to && stringutils::isWs(src[p]) && src[p] != '\n')
     ++p;
 
+  bool usedLineKeyword = false;
   if (p + 4 <= to && src.substr(p, 4) == "line") {
+    usedLineKeyword = true;
     p += 4;
     if (p >= to || !stringutils::isWs(src[p]))
       return std::nullopt;
@@ -957,11 +988,14 @@ parseLineDirectiveForLineControl(StringRef src, size_t from, size_t to) {
   bool hasFileSpelling = false;
   if (p < to && src[p] == '"') {
     hasFileSpelling = true;
+    bool closedFileQuote = false;
     ++p; // consume opening quote
     while (p < to) {
       char c = src[p++];
-      if (c == '"')
+      if (c == '"') {
+        closedFileQuote = true;
         break;
+      }
       if (c == '\\' && p < to) {
         char escaped = src[p++];
         if (escaped == 'x' || escaped == 'X') {
@@ -1041,7 +1075,31 @@ parseLineDirectiveForLineControl(StringRef src, size_t from, size_t to) {
         fileSpelling.push_back(c);
       }
     }
+
+    if (!closedFileQuote)
+      return std::nullopt;
   }
+
+  while (p < to && stringutils::isWs(src[p]) && src[p] != '\n')
+    ++p;
+
+  // GNU/Clang line-marker directives emitted by preprocessors can carry
+  // numeric flags after the optional filename, e.g. `# 1 "file" 2 3`.  Those
+  // flags are not part of standard `#line` and do not change the logical
+  // file/line state modeled here, so accept them only for the numeric form.
+  if (!usedLineKeyword) {
+    while (p < to) {
+      if (!std::isdigit(static_cast<unsigned char>(src[p])))
+        break;
+      while (p < to && std::isdigit(static_cast<unsigned char>(src[p])))
+        ++p;
+      while (p < to && stringutils::isWs(src[p]) && src[p] != '\n')
+        ++p;
+    }
+  }
+
+  if (p != to)
+    return std::nullopt;
 
   const size_t afterDirectiveIdx =
       (to < src.size() && src[to] == '\n') ? to + 1 : to;
@@ -1155,39 +1213,66 @@ findLineControlDirectiveHashOffset(StringRef src, size_t lineStart,
   return std::nullopt;
 }
 
+enum class LineControlDirectiveActivity { Active, Inactive, Unknown };
+
 // Producer-proven conditional activity gate for source line-control effects.
 //
-// A #line directive may affect owner-local line-state recovery only when every
-// conditional group enclosing the directive byte has a selected PP-material arm
-// that contains that byte.  Macro-state directives use the stronger item-level
-// proof below because a branch can be selected solely to execute #define/#undef
-// without contributing A-side PP tokens.  The consumer must not re-evaluate #if
-// expressions here: the producer already ran Clang's preprocessor with the
-// correct macro state, target semantics, feature predicates, include search
-// state, and conditional short-circuit rules.  Unknown/missing ownership fails
-// closed for conditional bytes and leaves top-level bytes effectful.
-static bool lineControlDirectiveIsProducerProvenActive(
+// `CondArm::selected` is a PP-material witness, not a direct directive-effect
+// witness.  That distinction creates three cases for a source-authored #line
+// directive inside a conditional group:
+//
+//   * Active:   every enclosing group has a selected arm, and the directive byte
+//               lies inside that selected arm.
+//   * Inactive: some enclosing group has a selected arm, but the directive byte
+//               lies outside it.  The preprocessor did not execute this
+//               directive, so it must be ignored without poisoning later
+//               resync proof.
+//   * Unknown:  an enclosing group contains the directive, but the refold map has
+//               no selected PP-material arm for that group.  This happens when
+//               the selected branch executed only directive effects such as
+//               #line and produced no PP tokens.  The consumer cannot prove
+//               which #line executed from CondArm::selected alone, so callers
+//               must fail closed or preserve the real source line-control stream
+//               rather than emit an inferred physical fallback.
+//
+// The consumer must not re-evaluate #if expressions here: the producer already
+// ran Clang's preprocessor with the correct macro state, target semantics,
+// feature predicates, include search state, and conditional short-circuit rules.
+static LineControlDirectiveActivity classifyLineControlDirectiveActivity(
     const RefoldModel &model, StringRef ownerFile,
     std::optional<uint64_t> ownerIncludeId, uint64_t directiveHashOffset) {
+  LineControlDirectiveActivity result = LineControlDirectiveActivity::Active;
+
   for (const RefoldModel::CondGroup &group : model.GetConds()) {
     if (group.file != ownerFile || group.parentIncludeId != ownerIncludeId)
       continue;
     if (!group.ContainsByte(directiveHashOffset))
       continue;
 
+    bool sawSelectedArm = false;
     bool selectedArmContainsDirective = false;
     for (const RefoldModel::CondArm &arm : group.arms) {
-      if (arm.selected && arm.ContainsByte(directiveHashOffset)) {
+      if (!arm.selected)
+        continue;
+      sawSelectedArm = true;
+      if (arm.ContainsByte(directiveHashOffset)) {
         selectedArmContainsDirective = true;
         break;
       }
     }
 
-    if (!selectedArmContainsDirective)
-      return false;
+    if (selectedArmContainsDirective)
+      continue;
+
+    if (sawSelectedArm)
+      return LineControlDirectiveActivity::Inactive;
+
+    // The group is known, but no branch has a PP-material selection witness.
+    // Do not infer line-control effects from source text in this case.
+    result = LineControlDirectiveActivity::Unknown;
   }
 
-  return true;
+  return result;
 }
 
 /// Return true iff the refold map contains the producer-observed macro-state
@@ -1263,6 +1348,8 @@ static LineDirectiveLocation logicalLocationAtOffsetImpl(
   size_t activeLineAfterDirective = 0;
   size_t activeAfterDirectiveIdx = 0;
   bool sawLineDirective = false;
+  bool sawUnprovenLineControlDirective = false;
+  std::optional<uint64_t> lastUnprovenLineControlDirectiveOffset;
 
   LineControlMacroMap lineControlMacros;
   for (size_t lineStart = 0; lineStart < prefix.size();) {
@@ -1303,8 +1390,12 @@ static LineDirectiveLocation logicalLocationAtOffsetImpl(
         StringRef(phase3Line), directive, operand);
     const bool isMacroStateDirective =
         hasNamedDirective && (directive == "define" || directive == "undef");
+    const bool isLineControlDirectiveSpelling =
+        lineControlSpellingIsLineDirective(StringRef(phase3Line));
 
     bool directiveEffectsAreActive = false;
+    LineControlDirectiveActivity lineDirectiveActivity =
+        LineControlDirectiveActivity::Inactive;
     if (hashOffset) {
       if (isMacroStateDirective) {
         directiveEffectsAreActive =
@@ -1312,8 +1403,10 @@ static LineDirectiveLocation logicalLocationAtOffsetImpl(
                 model, ownerFile, ownerIncludeId, *hashOffset,
                 static_cast<uint64_t>(afterLine));
       } else {
-        directiveEffectsAreActive = lineControlDirectiveIsProducerProvenActive(
+        lineDirectiveActivity = classifyLineControlDirectiveActivity(
             model, ownerFile, ownerIncludeId, *hashOffset);
+        directiveEffectsAreActive =
+            lineDirectiveActivity == LineControlDirectiveActivity::Active;
       }
     }
 
@@ -1347,9 +1440,29 @@ static LineDirectiveLocation logicalLocationAtOffsetImpl(
         // including any source lines consumed by phase-2 splices, not after the
         // temporary expanded spelling used only for operand parsing.
         activeAfterDirectiveIdx = afterLine;
+      } else if (isLineControlDirectiveSpelling && hashOffset) {
+        // The directive is syntactically line-control and lies on a producer-active
+        // path, but this owner-local scan could not expand/parse its operands.
+        // Typical examples are #line operands that depend on macro state imported
+        // from a prior include.  Do not replace that real source semantics with a
+        // physical fallback #line later; report the recovered location as
+        // unproven so the caller can avoid emitting a synthetic override.
+        sawUnprovenLineControlDirective = true;
+        lastUnprovenLineControlDirectiveOffset = *hashOffset;
       }
 
       updateLineControlMacroEnvironment(StringRef(phase3Line), lineControlMacros);
+    } else if (isLineControlDirectiveSpelling && hashOffset &&
+               lineDirectiveActivity == LineControlDirectiveActivity::Unknown) {
+      // The source prefix contains a line-control directive in a conditional
+      // region whose directive-effect activity is not represented by the
+      // current model facts.  This is distinct from a proven-inactive arm: an
+      // inactive #line must be ignored, while an unknown #line means the active
+      // branch may have produced only line-control effects and no PP tokens.
+      // Mark only the latter unproven so ordinary selected-token arms can still
+      // emit the required synthetic resync for later preserved __LINE__.
+      sawUnprovenLineControlDirective = true;
+      lastUnprovenLineControlDirectiveOffset = *hashOffset;
     }
 
     if (afterLine >= prefix.size())
@@ -1361,11 +1474,16 @@ static LineDirectiveLocation logicalLocationAtOffsetImpl(
     const size_t delta = stringutils::countNonSplicedNewlines(
         prefix, activeAfterDirectiveIdx, prefix.size());
     StringRef file = activeFile ? StringRef(*activeFile) : defaultFileSpelling;
-    return LineDirectiveLocation(file, activeLineAfterDirective + delta);
+    return LineDirectiveLocation(
+        file, activeLineAfterDirective + delta,
+        !sawUnprovenLineControlDirective,
+        lastUnprovenLineControlDirectiveOffset);
   }
 
-  return LineDirectiveLocation(defaultFileSpelling,
-                               stringutils::lineAtOffset(src, clampedOffset));
+  return LineDirectiveLocation(
+      defaultFileSpelling, stringutils::lineAtOffset(src, clampedOffset),
+      !sawUnprovenLineControlDirective,
+      lastUnprovenLineControlDirectiveOffset);
 }
 
 LineDirectiveLocation LineDirectiveInserter::LogicalLocationAtOffset(
@@ -1462,6 +1580,47 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
           "inject (empty replacement): resumeLine={0} file={1}", resumeLine,
           fileSpellingForDirective);
     return directive;
+  }
+
+  // Token-LCS normalization can express a line deletion as replacing the
+  // deleted line plus the first token(s) of the surviving suffix line with the
+  // same suffix-line prefix.  Example shape:
+  //
+  //     original:    old line\nint keep = __LINE__;
+  //     replacement: int
+  //     untouched:       keep = __LINE__;
+  //
+  // There is no newline inside `replacement`, but the replacement is not new
+  // payload: it is exactly the carried prefix of the original suffix line.  If
+  // the edit itself starts at BOL and removes at least one real source line
+  // before that carried prefix, the correct resync point is before the
+  // replacement.  Pending-flush cannot recover this later because the next
+  // untouched slice begins mid-line.
+  if (e <= originalFileText.size()) {
+    const size_t editBegin = static_cast<size_t>(s);
+    const size_t editEnd = static_cast<size_t>(e);
+    const size_t resumePrefixBegin =
+        stringutils::lineStartOffset(originalFileText, editEnd);
+    const bool replacementIsCarriedSuffixPrefix =
+        resumePrefixBegin < editEnd && editBegin <= resumePrefixBegin &&
+        replacement == originalFileText.slice(resumePrefixBegin, editEnd);
+    const bool removedRealLineBeforePrefix =
+        stringutils::countNonSplicedNewlines(originalFileText, editBegin,
+                                            resumePrefixBegin) > 0;
+    const bool prefixStartsLogicalLine =
+        resumePrefixBegin == 0 ||
+        !stringutils::isLineSplice(originalFileText, resumePrefixBegin - 1);
+
+    if (replacementIsCarriedSuffixPrefix && removedRealLineBeforePrefix &&
+        prefixStartsLogicalLine &&
+        stringutils::isBOL(originalFileText, editBegin)) {
+      trace("linedir/local",
+            "inject (before whole carried suffix prefix): resumeLine={0} "
+            "file={1} prefix={2}",
+            resumeLine, fileSpellingForDirective,
+            stringutils::showWs(stringutils::clip(replacement, 80)));
+      return directive + replacement.str();
+    }
   }
 
   // If the replacement already ends at BOL, append the directive after it. The

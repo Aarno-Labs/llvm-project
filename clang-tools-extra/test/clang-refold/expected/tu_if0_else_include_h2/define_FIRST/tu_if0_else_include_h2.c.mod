@@ -14,11 +14,11 @@
 #else
 /*BOUNDARY:T11:ELSE-ARM:INCLUDE-H2:BEGIN*/
 int __refold_ins__h2_begin = 0; /* pure insertion at before boundary for h2_begin_marker */
-#line 16 "tu_if0_else_include_h2.c"
 #include "h2.h"
 /*BOUNDARY:T11:ELSE-ARM:INCLUDE-H2:END*/
 #endif
 /*BOUNDARY:T11:IF-GROUP:END*/
+#line 20 "tu_if0_else_include_h2.c"
 RF_MARK(t11_after)
 
 int main(void) {

@@ -20,7 +20,6 @@ RF_PAYLOAD(t03_else)
 RF_MARK(t03_after)
 
 int __refold_ins__t03_after = 0; /* pure insertion at after boundary for t03_after_marker */
-#line 22 "tu_if_else_include_in_if_arm.c"
 int main(void) {
   return 0;
 }

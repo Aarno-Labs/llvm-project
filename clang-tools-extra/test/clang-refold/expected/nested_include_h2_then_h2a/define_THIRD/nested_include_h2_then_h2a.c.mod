@@ -13,7 +13,6 @@
 RF_MARK(t02_after)
 
 int __refold_ins__t02_after = 0; /* pure insertion at after boundary for t02_after_marker */
-#line 15 "nested_include_h2_then_h2a.c"
 int main(void) {
   return 0;
 }

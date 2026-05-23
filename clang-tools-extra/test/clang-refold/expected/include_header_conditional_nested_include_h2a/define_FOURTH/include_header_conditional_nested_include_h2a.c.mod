@@ -13,7 +13,6 @@
 RF_MARK(t30_after)
 
 int __refold_ins__t30_after = 0; /* pure insertion at after boundary for t30_after_marker */
-#line 15 "include_header_conditional_nested_include_h2a.c"
 int main(void) {
   return 0;
 }

@@ -11,7 +11,6 @@
 RF_MARK(t05_after)
 
 int __refold_ins__t05_after = 0; /* pure insertion at after boundary for t05_after_marker */
-#line 13 "include_h3_conditional_default_else_arm.c"
 int main(void) {
   return 0;
 }
