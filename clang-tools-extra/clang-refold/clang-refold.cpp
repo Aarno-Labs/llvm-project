@@ -292,12 +292,7 @@ struct JsonSlotForSideband {
   std::optional<uint64_t> ownerIncludeId = std::nullopt;
 };
 
-struct SidebandPragmaInsertionAnchor {
-  std::string sitePath;
-  uint64_t siteByte = 0;
-  std::optional<uint64_t> ownerIncludeId = std::nullopt;
-  bool forceIncludeLineDirectiveWrappers = false;
-};
+using SidebandSourceProof = RefoldEngine::OwnerLocalSourceEditProof;
 
 struct SidebandPragmaItemBinding {
   int64_t pragmaIndex = -1;
@@ -1076,8 +1071,8 @@ static std::optional<uint64_t> sourceByteForNormalTokenGap(
   return std::nullopt;
 }
 
-static std::optional<SidebandPragmaInsertionAnchor>
-inferSidebandPragmaInsertionAnchor(
+static std::optional<SidebandSourceProof>
+inferSidebandSourceProof(
     const SidebandPragmaLine &line, uint64_t projectedAGap, StringRef tuPath,
     ArrayRef<JsonIncludeItemForSideband> includes,
     ArrayRef<JsonTokMapEntryForSideband> tokmap,
@@ -1085,7 +1080,6 @@ inferSidebandPragmaInsertionAnchor(
   struct IncludeClaim {
     const JsonIncludeItemForSideband *include = nullptr;
     uint64_t siteByte = 0;
-    bool hasOrdinaryTokens = false;
   };
   std::vector<IncludeClaim> claims;
 
@@ -1110,20 +1104,17 @@ inferSidebandPragmaInsertionAnchor(
           StringRef(inc.resolvedPath), inc.id, projectedAGap, tokmap, slots);
       if (!siteByte)
         continue;
-      claims.push_back(
-          IncludeClaim{&inc, *siteByte, span.begin < span.end});
+      claims.push_back(IncludeClaim{&inc, *siteByte});
     }
   }
 
   if (claims.size() > 1)
     return std::nullopt;
   if (claims.size() == 1) {
-    SidebandPragmaInsertionAnchor anchor;
-    anchor.sitePath = claims.front().include->resolvedPath;
-    anchor.siteByte = claims.front().siteByte;
-    anchor.ownerIncludeId = claims.front().include->id;
-    anchor.forceIncludeLineDirectiveWrappers = claims.front().hasOrdinaryTokens;
-    return anchor;
+    const uint64_t siteByte = claims.front().siteByte;
+    return SidebandSourceProof::ZeroWidthInsertion(
+        claims.front().include->resolvedPath, siteByte,
+        claims.front().include->id);
   }
 
   std::optional<uint64_t> tuByte = sourceByteForNormalTokenGap(
@@ -1131,10 +1122,8 @@ inferSidebandPragmaInsertionAnchor(
   if (!tuByte)
     return std::nullopt;
 
-  SidebandPragmaInsertionAnchor anchor;
-  anchor.sitePath = tuPath.str();
-  anchor.siteByte = *tuByte;
-  return anchor;
+  return SidebandSourceProof::ZeroWidthInsertion(tuPath, *tuByte,
+                                                std::nullopt);
 }
 
 /// Attach an owner include id to a header-owned pragma when the map does not
@@ -1325,6 +1314,7 @@ static std::vector<SidebandPragmaItemBinding> mapSidebandLinesToPragmaItems(
 /// whitespace-separated directive run.  Ambiguous include/TU boundaries remain
 /// fail-closed so the caller can route them through the existing fallback path
 /// instead of manufacturing a source placement.
+
 static bool buildSidebandPragmaSourceEdits(
     const json::Object &rootJson, StringRef refoldMapPath,
     ArrayRef<SidebandPragmaLine> aLines,
@@ -1391,258 +1381,208 @@ static bool buildSidebandPragmaSourceEdits(
     if (lcs[a] >= 0 && static_cast<size_t>(lcs[a]) < bToA.size())
       bToA[static_cast<size_t>(lcs[a])] = static_cast<int64_t>(a);
 
-  auto appendEditForA = [&](uint64_t aIdx, StringRef replacement,
-                            uint64_t bBegin, uint64_t bEnd) -> bool {
-    if (aIdx >= aToPragma.size() ||
-        aToPragma[static_cast<size_t>(aIdx)].pragmaIndex < 0)
+  using SidebandBReplayProof = RefoldEngine::OwnerLocalBReplayProof;
+
+  struct SidebandBReplayBlockProof {
+  private:
+    uint64_t ownerGap = 0;
+    SidebandBReplayProof replay;
+
+    SidebandBReplayBlockProof(uint64_t ownerGap, SidebandBReplayProof replay)
+        : ownerGap(ownerGap), replay(std::move(replay)) {}
+
+  public:
+    /// Build a B-side block proof after all lines in the block have projected
+    /// to one normal-token owner gap and the replay proof has bound the emitted
+    /// text to its raw-B witness range.
+    static SidebandBReplayBlockProof Create(uint64_t ownerGap,
+                                            SidebandBReplayProof replay) {
+      return SidebandBReplayBlockProof(ownerGap, std::move(replay));
+    }
+
+    /// Return the normal-token gap that owns every sideband replay line in the
+    /// block.
+    uint64_t OwnerGap() const { return ownerGap; }
+
+    /// Consume the replay proof carried by this block.
+    SidebandBReplayProof TakeReplay() { return std::move(replay); }
+  };
+
+  auto appendProvedSidebandEdit =
+      [&](std::optional<SidebandSourceProof> source,
+          SidebandBReplayProof replay) -> bool {
+    std::optional<RefoldEngine::SidebandPragmaEdit> edit =
+        RefoldEngine::SidebandPragmaEdit::Create(
+            std::move(source), std::move(replay),
+            static_cast<uint64_t>(bBytes.size()));
+    if (!edit)
       return false;
-    const SidebandPragmaItemBinding &binding =
-        aToPragma[static_cast<size_t>(aIdx)];
-    const JsonPragmaItem &pragma =
-        pragmas[static_cast<size_t>(binding.pragmaIndex)];
-    RefoldEngine::SidebandPragmaEdit edit;
-    edit.sitePath = pragma.sitePath;
-    edit.siteB = pragma.siteB;
-    edit.siteE = pragma.siteE;
-    edit.replacementText = replacement.str();
-    edit.ownerIncludeId = binding.ownerIncludeId;
-    // A visible replacement for a header-owned sideband pragma is still replay
-    // text from that header owner, even when the owner has no ordinary tokens.
-    // Keep the normal include #line wrapper so --with-lines preserves the
-    // logical file transition for the emitted pragma line.  Pure deletions that
-    // emit no header text may still use the zero-token sideband-only policy.
-    edit.forceIncludeLineDirectiveWrappers =
-        edit.ownerIncludeId && !edit.replacementText.empty();
-    edit.materializedBByteBegin = bBegin;
-    edit.materializedBByteEnd = bEnd;
-    edits.push_back(std::move(edit));
+    edits.push_back(std::move(*edit));
     return true;
   };
 
-  auto appendInsertBlockForB = [&](uint64_t bStart, uint64_t bEnd) -> bool {
+  struct BoundSidebandSourceAtom {
+    const JsonPragmaItem *pragma = nullptr;
+    std::optional<uint64_t> ownerIncludeId = std::nullopt;
+  };
+
+  auto bindSourceAtom = [&](uint64_t aIdx)
+      -> std::optional<BoundSidebandSourceAtom> {
+    if (aIdx >= aToPragma.size())
+      return std::nullopt;
+    const SidebandPragmaItemBinding &binding =
+        aToPragma[static_cast<size_t>(aIdx)];
+    if (binding.pragmaIndex < 0)
+      return std::nullopt;
+    const JsonPragmaItem &pragma =
+        pragmas[static_cast<size_t>(binding.pragmaIndex)];
+    return BoundSidebandSourceAtom{&pragma, binding.ownerIncludeId};
+  };
+
+  auto proveBReplayBlock = [&](uint64_t bStart, uint64_t bEnd)
+      -> std::optional<SidebandBReplayBlockProof> {
     if (bStart >= bEnd || bEnd > bLines.size())
-      return false;
+      return std::nullopt;
 
     std::optional<uint64_t> ownerGap;
     for (uint64_t b = bStart; b < bEnd; ++b) {
       std::optional<uint64_t> projectedGap = projectedBGapForSidebandLine(
           normalA2B, bLines[static_cast<size_t>(b)]);
-      if (!projectedGap)
-        return false;
-      if (ownerGap && *ownerGap != *projectedGap)
-        return false;
+      if (!projectedGap || (ownerGap && *ownerGap != *projectedGap))
+        return std::nullopt;
       ownerGap = *projectedGap;
     }
-    if (!ownerGap)
-      return false;
 
-    const uint64_t bBegin = bLines[static_cast<size_t>(bStart)].begin;
-    const uint64_t bByteEnd = sidebandBlockReplacementBEnd(
+    const uint64_t begin = bLines[static_cast<size_t>(bStart)].begin;
+    const uint64_t end = sidebandBlockReplacementBEnd(
         bBytes, bLines, rawBToks, rawBTokOff, bStart, bEnd);
-    if (bByteEnd < bBegin || bByteEnd > static_cast<uint64_t>(bBytes.size()))
+    if (!ownerGap || end < begin ||
+        end > static_cast<uint64_t>(bBytes.size()))
+      return std::nullopt;
+    return SidebandBReplayBlockProof::Create(
+        *ownerGap, SidebandBReplayProof::FromText(
+                       bBytes.slice(begin, end),
+                       begin, end));
+  };
+
+  auto sourceGapIsWhitespace = [&](StringRef sitePath, uint64_t leftEnd,
+                                   uint64_t rightBegin) -> bool {
+    if (leftEnd > rightBegin)
       return false;
+    if (leftEnd == rightBegin)
+      return true;
+    std::optional<std::string> sourceBytes =
+        readMappedSourceFileForSideband(sitePath, *sourcePath, refoldMapPath);
+    if (!sourceBytes || rightBegin > sourceBytes->size() ||
+        leftEnd > sourceBytes->size())
+      return false;
+    return isOnlyWhitespaceForSidebandBlock(
+        StringRef(*sourceBytes).slice(leftEnd, rightBegin));
+  };
 
-    struct NeighborAnchor {
-      const JsonPragmaItem *pragma = nullptr;
-      std::optional<uint64_t> ownerIncludeId = std::nullopt;
-    };
+  auto proveSourceRun = [&](uint64_t aStart, uint64_t aEnd,
+                            std::optional<uint64_t> ownerGap)
+      -> std::optional<SidebandSourceProof> {
+    if (aStart >= aEnd || aEnd > aLines.size())
+      return std::nullopt;
+    std::optional<BoundSidebandSourceAtom> first = bindSourceAtom(aStart);
+    if (!first || !first->pragma)
+      return std::nullopt;
+    if (ownerGap &&
+        aLines[static_cast<size_t>(aStart)].normalTokenGap != *ownerGap)
+      return std::nullopt;
 
-    auto boundNeighbor = [&](int64_t aIdx) -> std::optional<NeighborAnchor> {
-      if (aIdx < 0 || static_cast<size_t>(aIdx) >= aToPragma.size())
+    SidebandSourceProof proof = SidebandSourceProof::ConsumedSourceRun(
+        first->pragma->sitePath, first->pragma->siteB, first->pragma->siteE,
+        first->ownerIncludeId, aEnd - aStart);
+
+    // A source-run proof consumes one closed owner-local run.  Every A-side atom
+    // must bind to the same physical file and concrete owner occurrence, and
+    // the bytes between adjacent atoms must be whitespace-only unless a future
+    // proof explicitly models that intervening state.
+    for (uint64_t a = aStart + 1; a < aEnd; ++a) {
+      if (ownerGap &&
+          aLines[static_cast<size_t>(a)].normalTokenGap != *ownerGap)
         return std::nullopt;
-      const SidebandPragmaItemBinding &binding =
-          aToPragma[static_cast<size_t>(aIdx)];
-      if (binding.pragmaIndex < 0)
+      std::optional<BoundSidebandSourceAtom> atom = bindSourceAtom(a);
+      if (!atom || !atom->pragma ||
+          !proof.CanExtendThroughSourceAtom(
+              atom->pragma->sitePath, atom->pragma->siteB,
+              atom->pragma->siteE, atom->ownerIncludeId) ||
+          !sourceGapIsWhitespace(atom->pragma->sitePath, proof.SourceEnd(),
+                                 atom->pragma->siteB) ||
+          !proof.ExtendThroughSourceAtom(
+              atom->pragma->sitePath, atom->pragma->siteB,
+              atom->pragma->siteE, atom->ownerIncludeId))
         return std::nullopt;
-      const JsonPragmaItem &pragma =
-          pragmas[static_cast<size_t>(binding.pragmaIndex)];
-      return NeighborAnchor{&pragma, binding.ownerIncludeId};
-    };
+    }
+    return proof;
+  };
 
+  auto proveInsertionAnchor = [&](uint64_t bStart, uint64_t bEnd,
+                                  uint64_t ownerGap)
+      -> std::optional<SidebandSourceProof> {
     auto matchedNeighborInInsertionGap = [&](uint64_t bIdx)
-        -> std::optional<NeighborAnchor> {
+        -> std::optional<BoundSidebandSourceAtom> {
       if (bIdx >= bLines.size() || bToA[static_cast<size_t>(bIdx)] < 0)
         return std::nullopt;
 
       std::optional<uint64_t> projectedGap = projectedBGapForSidebandLine(
           normalA2B, bLines[static_cast<size_t>(bIdx)]);
-      if (!projectedGap || *projectedGap != *ownerGap)
+      if (!projectedGap || *projectedGap != ownerGap)
         return std::nullopt;
 
-      return boundNeighbor(bToA[static_cast<size_t>(bIdx)]);
+      return bindSourceAtom(
+          static_cast<uint64_t>(bToA[static_cast<size_t>(bIdx)]));
     };
 
-    std::optional<NeighborAnchor> prev;
-    std::optional<NeighborAnchor> next;
-    if (bStart > 0)
-      prev = matchedNeighborInInsertionGap(bStart - 1);
-    if (bEnd < bLines.size())
-      next = matchedNeighborInInsertionGap(bEnd);
-
-    std::optional<std::string> sitePath;
-    std::optional<uint64_t> siteByte;
-    std::optional<uint64_t> ownerIncludeId;
+    std::optional<BoundSidebandSourceAtom> prev =
+        bStart > 0 ? matchedNeighborInInsertionGap(bStart - 1) : std::nullopt;
+    std::optional<BoundSidebandSourceAtom> next =
+        bEnd < bLines.size() ? matchedNeighborInInsertionGap(bEnd)
+                             : std::nullopt;
 
     if (prev || next) {
-      // A B-only sideband insertion inside a sideband block is ordered by its
-      // surviving sideband neighbors, not by the normal-token gap alone.  The
-      // normal-token gap only proves the surrounding token interval; it must not
-      // let an adjacent sideband line from a different interval steal the
-      // insertion.  Therefore only matched neighbors whose B-side gap projects
-      // to this insertion gap participate in the intra-block proof.  If no such
-      // neighbor exists, the normal-token-gap anchor below handles the insertion
-      // as a gap-level edit instead.
-      const NeighborAnchor &base = next ? *next : *prev;
+      // A normal-token gap proves only coarse placement.  A sideband neighbor
+      // proves the intra-gap insertion point only after its own B-side gap has
+      // projected to this insertion gap and its source occurrence has bound to a
+      // concrete owner.  Different-gap neighbors are deliberately ignored above
+      // so they cannot steal the insertion from another replay interval.
+      if (prev && next &&
+          (!prev->pragma || !next->pragma ||
+           prev->pragma->sitePath != next->pragma->sitePath ||
+           prev->ownerIncludeId != next->ownerIncludeId ||
+           !sourceGapIsWhitespace(next->pragma->sitePath,
+                                  prev->pragma->siteE,
+                                  next->pragma->siteB)))
+        return std::nullopt;
+
+      const BoundSidebandSourceAtom &base = next ? *next : *prev;
       if (!base.pragma)
-        return false;
-      sitePath = base.pragma->sitePath;
-      ownerIncludeId = base.ownerIncludeId;
+        return std::nullopt;
 
-      if (prev && next) {
-        if (!prev->pragma || !next->pragma)
-          return false;
-        if (prev->pragma->sitePath != next->pragma->sitePath ||
-            prev->ownerIncludeId != next->ownerIncludeId)
-          return false;
-        if (prev->pragma->siteE > next->pragma->siteB)
-          return false;
-        if (prev->pragma->siteE < next->pragma->siteB) {
-          std::optional<std::string> sourceBytes = readMappedSourceFileForSideband(
-              next->pragma->sitePath, *sourcePath, refoldMapPath);
-          if (!sourceBytes || next->pragma->siteB > sourceBytes->size() ||
-              prev->pragma->siteE > sourceBytes->size() ||
-              !isOnlyWhitespaceForSidebandBlock(StringRef(*sourceBytes).slice(
-                  prev->pragma->siteE, next->pragma->siteB)))
-            return false;
-        }
-        siteByte = next->pragma->siteB;
-      } else if (next) {
-        siteByte = next->pragma->siteB;
-      } else {
-        siteByte = prev->pragma->siteE;
-      }
-    } else {
-      std::optional<SidebandPragmaInsertionAnchor> anchor =
-          inferSidebandPragmaInsertionAnchor(
-              bLines[static_cast<size_t>(bStart)], *ownerGap, *sourcePath,
-              includes, tokmap, slots);
-      if (!anchor)
-        return false;
-      sitePath = anchor->sitePath;
-      siteByte = anchor->siteByte;
-      ownerIncludeId = anchor->ownerIncludeId;
+      const uint64_t siteByte = next ? base.pragma->siteB : base.pragma->siteE;
+      return SidebandSourceProof::ZeroWidthInsertion(
+          base.pragma->sitePath, siteByte, base.ownerIncludeId);
     }
 
-    if (!sitePath || !siteByte)
-      return false;
-
-    RefoldEngine::SidebandPragmaEdit edit;
-    edit.sitePath = *sitePath;
-    edit.siteB = *siteByte;
-    edit.siteE = *siteByte;
-    edit.replacementText = bBytes.slice(bBegin, bByteEnd).str();
-    edit.ownerIncludeId = ownerIncludeId;
-    // Visible header-owned insertion text is replay from that header owner, even
-    // when the owner contributes no ordinary tokens.  Keep the normal include
-    // wrapper so --with-lines preserves the logical file transition.
-    edit.forceIncludeLineDirectiveWrappers =
-        edit.ownerIncludeId && !edit.replacementText.empty();
-    edit.materializedBByteBegin = bBegin;
-    edit.materializedBByteEnd = bByteEnd;
-    edits.push_back(std::move(edit));
-    return true;
+    std::optional<SidebandSourceProof> anchor =
+        inferSidebandSourceProof(
+            bLines[static_cast<size_t>(bStart)], ownerGap, *sourcePath,
+            includes, tokmap, slots);
+    return anchor;
   };
 
-  auto appendBlockEdit = [&](uint64_t aStart, uint64_t aEnd, uint64_t bStart,
-                             uint64_t bEnd) -> bool {
-    if (aStart >= aEnd || bStart >= bEnd || aEnd > aLines.size() ||
-        bEnd > bLines.size())
-      return false;
-
-    const uint64_t ownerGap = aLines[static_cast<size_t>(aStart)].normalTokenGap;
-    for (uint64_t a = aStart; a < aEnd; ++a)
-      if (aLines[static_cast<size_t>(a)].normalTokenGap != ownerGap)
-        return false;
-
-    for (uint64_t b = bStart; b < bEnd; ++b) {
-      std::optional<uint64_t> projectedGap = projectedBGapForSidebandLine(
-          normalA2B, bLines[static_cast<size_t>(b)]);
-      if (!projectedGap || *projectedGap != ownerGap)
-        return false;
-    }
-
-    if (aToPragma[static_cast<size_t>(aStart)].pragmaIndex < 0)
-      return false;
-    const SidebandPragmaItemBinding &firstBinding =
-        aToPragma[static_cast<size_t>(aStart)];
-    const JsonPragmaItem &firstPragma =
-        pragmas[static_cast<size_t>(firstBinding.pragmaIndex)];
-
-    uint64_t siteB = firstPragma.siteB;
-    uint64_t siteE = firstPragma.siteE;
-
-    // Unequal sideband replacements are safe only when the A-side lines form a
-    // single source-owner directive run.  The run proof is deliberately about
-    // ownership, not spelling: every A-side directive must bind to the same TU
-    // or concrete include replay, and the physical source ranges must be in
-    // order with only whitespace between them.  That prevents a block edit from
-    // silently eating unrelated source comments or non-sideband directives.
-    std::optional<std::string> sourceBytes = readMappedSourceFileForSideband(
-        firstPragma.sitePath, *sourcePath, refoldMapPath);
-    for (uint64_t a = aStart + 1; a < aEnd; ++a) {
-      if (aToPragma[static_cast<size_t>(a)].pragmaIndex < 0)
-        return false;
-      const SidebandPragmaItemBinding &binding =
-          aToPragma[static_cast<size_t>(a)];
-      const JsonPragmaItem &pragma =
-          pragmas[static_cast<size_t>(binding.pragmaIndex)];
-      if (pragma.sitePath != firstPragma.sitePath ||
-          binding.ownerIncludeId != firstBinding.ownerIncludeId)
-        return false;
-      if (pragma.siteB < siteE)
-        return false;
-      if (siteE < pragma.siteB) {
-        if (!sourceBytes || pragma.siteB > sourceBytes->size() ||
-            siteE > sourceBytes->size() ||
-            !isOnlyWhitespaceForSidebandBlock(
-                StringRef(*sourceBytes).slice(siteE, pragma.siteB)))
-          return false;
-      }
-      siteE = pragma.siteE;
-    }
-
-    const uint64_t bBegin = bLines[static_cast<size_t>(bStart)].begin;
-    const uint64_t bByteEnd = sidebandBlockReplacementBEnd(
-        bBytes, bLines, rawBToks, rawBTokOff, bStart, bEnd);
-    if (bByteEnd < bBegin || bByteEnd > static_cast<uint64_t>(bBytes.size()))
-      return false;
-
-    RefoldEngine::SidebandPragmaEdit edit;
-    edit.sitePath = firstPragma.sitePath;
-    edit.siteB = siteB;
-    edit.siteE = siteE;
-    edit.replacementText = bBytes.slice(bBegin, bByteEnd).str();
-    edit.ownerIncludeId = firstBinding.ownerIncludeId;
-    // A non-empty header-owned sideband block replacement emits visible replay
-    // text from the materialized header owner even when that owner has zero
-    // ordinary PP tokens.  In --with-lines mode that visible header replay is
-    // still a logical file transition, so route it through the normal include
-    // enter/exit wrapper instead of the sideband-only no-wrapper suppression
-    // path.  Pure deletions that leave no header text remain eligible for the
-    // zero-token sideband-only policy.
-    edit.forceIncludeLineDirectiveWrappers =
-        edit.ownerIncludeId && !edit.replacementText.empty();
-    edit.materializedBByteBegin = bBegin;
-    edit.materializedBByteEnd = bByteEnd;
-    edits.push_back(std::move(edit));
-    return true;
-  };
-
-  for (const diffutils::Hunk &h : hunks) {
+  auto appendOwnerLocalSidebandHunk = [&](const diffutils::Hunk &h) -> bool {
     if (h.isInsertOnly()) {
-      if (!appendInsertBlockForB(h.bStart, h.bEnd))
+      std::optional<SidebandBReplayBlockProof> bBlock =
+          proveBReplayBlock(h.bStart, h.bEnd);
+      if (!bBlock)
         return false;
-      continue;
+      const uint64_t ownerGap = bBlock->OwnerGap();
+      return appendProvedSidebandEdit(
+          proveInsertionAnchor(h.bStart, h.bEnd, ownerGap),
+          bBlock->TakeReplay());
     }
 
     if (h.isDeleteOnly()) {
@@ -1653,38 +1593,50 @@ static bool buildSidebandPragmaSourceEdits(
           return false;
         const uint64_t bAnchor = byteOffsetForNormalTokenGap(
             bBytes, bLines, rawBToks, rawBTokOff, *bGap);
-        if (!appendEditForA(a, "", bAnchor, bAnchor))
+        if (!appendProvedSidebandEdit(
+                proveSourceRun(a, a + 1, std::nullopt),
+                SidebandBReplayProof::EmptyAt(bAnchor)))
           return false;
       }
-      continue;
+      return true;
     }
 
     if (h.isReplace()) {
-      // Prefer the owner-local block proof for every replacement hunk, including
-      // equal-arity replacements.  A 1-to-1 pragma spelling change can still own
-      // B-side trivia after the replacement directive, and that trivia can be
-      // necessary both for the most accurate refolding and for the following
-      // #line resynchronization.  If a legacy equal-arity hunk is not a single
-      // owner-local block, fall back to the previous per-line proof so unrelated
-      // independent replacements keep their existing behavior.
-      if (appendBlockEdit(h.aStart, h.aEnd, h.bStart, h.bEnd))
-        continue;
-      if ((h.aEnd - h.aStart) == (h.bEnd - h.bStart)) {
-        for (uint64_t a = h.aStart, b = h.bStart; a < h.aEnd; ++a, ++b)
-          if (!appendEditForA(a, bLines[static_cast<size_t>(b)].text,
-                              bLines[static_cast<size_t>(b)].begin,
-                              bLines[static_cast<size_t>(b)].end))
-            return false;
-        continue;
+      // The owner-local block proof is the canonical replacement proof.  Keep
+      // the equal-arity fallback only for legacy independent replacement hunks
+      // that do not form one closed owner-local source run.
+      std::optional<SidebandBReplayBlockProof> bBlock =
+          proveBReplayBlock(h.bStart, h.bEnd);
+      if (bBlock) {
+        const uint64_t ownerGap = bBlock->OwnerGap();
+        std::optional<SidebandSourceProof> source =
+            proveSourceRun(h.aStart, h.aEnd, ownerGap);
+        if (appendProvedSidebandEdit(std::move(source),
+                                     bBlock->TakeReplay()))
+          return true;
       }
-      return false;
+      if ((h.aEnd - h.aStart) != (h.bEnd - h.bStart))
+        return false;
+      for (uint64_t a = h.aStart, b = h.bStart; a < h.aEnd; ++a, ++b) {
+        const SidebandPragmaLine &line = bLines[static_cast<size_t>(b)];
+        if (!appendProvedSidebandEdit(
+                proveSourceRun(a, a + 1, std::nullopt),
+                SidebandBReplayProof::FromText(
+                    line.text, line.begin, line.end)))
+          return false;
+      }
+      return true;
     }
 
     // Any remaining sideband shape is outside the current proof domain.  In
     // particular, this rejects malformed empty hunks rather than manufacturing
     // a source placement.
     return false;
-  }
+  };
+
+  for (const diffutils::Hunk &h : hunks)
+    if (!appendOwnerLocalSidebandHunk(h))
+      return false;
 
   return true;
 }

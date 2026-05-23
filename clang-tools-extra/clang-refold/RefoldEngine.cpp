@@ -1741,26 +1741,74 @@ std::string RefoldEngine::Refold() {
 }
 
 
+
+bool RefoldEngine::ValidateSidebandPragmaEditProof(
+    const SidebandPragmaEdit &edit, StringRef phase) const {
+  const auto sourceRange = edit.SourceByteRange();
+  const auto replayRange = edit.MaterializedBByteRange();
+
+  auto fail = [&](StringRef why) -> bool {
+    RequestTerminalFallback(
+        TerminalFallbackKind::UndischargedEmissionArtifact, phase,
+        llvm::formatv(
+            "sideband owner-local proof invalid path='{0}' site=[{1},{2}) "
+            "b=[{3},{4}): {5}",
+            edit.SourcePath(), sourceRange.first, sourceRange.second,
+            replayRange.first, replayRange.second, why)
+            .str());
+    return false;
+  };
+
+  if (!edit.SourceHasClosureProof())
+    return fail("missing one or more owner-local proof obligations");
+
+  if (!edit.SourceIsValid())
+    return fail("invalid source byte range");
+
+  if (!edit.ReplayIsValid(static_cast<uint64_t>(bSource_.size())))
+    return fail("invalid sideband B-byte envelope");
+
+  // The owner occurrence, source range, B byte envelope, and payload are the
+  // emitted edit facts classified by OwnerLocalSourceEditProof.  Keep the
+  // validation gate focused on non-redundant proof obligations so the proof
+  // record cannot drift out of sync with the edit.
+
+  trace("proof/owner-local",
+        "sideband proof ok phase={0} path='{1}' source=[{2},{3}) b=[{4},{5}) "
+        "owner={6}",
+        phase, edit.SourcePath(), sourceRange.first, sourceRange.second,
+        replayRange.first, replayRange.second,
+        edit.OwnerIncludeId()
+            ? llvm::formatv("inc#{0}", *edit.OwnerIncludeId()).str()
+            : std::string("TU"));
+  return true;
+}
+
 bool RefoldEngine::AppendSidebandPragmaSourceEdits(
     StringRef tuPath, StringRef tuBytes, std::vector<TextEdit> &tuEdits) {
   if (sidebandPragmaEdits_.empty())
     return true;
 
   for (const SidebandPragmaEdit &sideband : sidebandPragmaEdits_) {
+    if (!ValidateSidebandPragmaEditProof(sideband, "pragma/sideband"))
+      return false;
+
+    const auto sourceRange = sideband.SourceByteRange();
+
     // The current clang-refold artifact is one emitted TU source file.  A
     // sideband pragma whose source location is inside a header must be handled
     // by an include/materialization proof; applying it blindly to the TU would
     // edit the wrong owner.  Reject that class explicitly instead of silently
     // preserving or dropping a header pragma.
-    if (!PathsEqual(sideband.sitePath, tuPath)) {
-      if (!sideband.ownerIncludeId) {
+    if (!PathsEqual(sideband.SourcePath(), tuPath)) {
+      if (!sideband.HasConcreteIncludeOwner()) {
         RequestTerminalFallback(
             TerminalFallbackKind::UndischargedEmissionArtifact,
             "pragma/sideband",
             llvm::formatv(
                 "sideband pragma edit targets non-TU owner path='{0}' "
                 "site=[{1},{2}) without a unique include owner",
-                sideband.sitePath, sideband.siteB, sideband.siteE)
+                sideband.SourcePath(), sourceRange.first, sourceRange.second)
                 .str());
         return false;
       }
@@ -1768,18 +1816,19 @@ bool RefoldEngine::AppendSidebandPragmaSourceEdits(
       trace("pragma/sideband",
             "defer header-owned sideband pragma edit path='{0}' site=[{1},{2}) "
             "to include inc#{3}",
-            sideband.sitePath, sideband.siteB, sideband.siteE,
-            *sideband.ownerIncludeId);
+            sideband.SourcePath(), sourceRange.first, sourceRange.second,
+            *sideband.OwnerIncludeId());
       continue;
     }
 
-    if (sideband.siteB > sideband.siteE || sideband.siteE > tuBytes.size()) {
+    if (!sideband.SourceIsWithinOwnerBytes(
+            static_cast<uint64_t>(tuBytes.size()))) {
       RequestTerminalFallback(
           TerminalFallbackKind::UndischargedEmissionArtifact, "pragma/sideband",
           llvm::formatv(
               "sideband pragma edit has invalid TU range site=[{0},{1}) "
               "tuSize={2}",
-              sideband.siteB, sideband.siteE, tuBytes.size())
+              sourceRange.first, sourceRange.second, tuBytes.size())
               .str());
       return false;
     }
@@ -1797,26 +1846,24 @@ bool RefoldEngine::AppendSidebandPragmaSourceEdits(
     // replacement's physical line count.  The materialized edit-map range still
     // describes only the B-side sideband payload, not the synthetic #line
     // directive that may be appended for resynchronization.
-    ResyncOutcome ro = ApplyResyncOrPend(tuBytes, sideband.siteB,
-                                         sideband.siteE,
-                                         sideband.replacementText, tuPath);
-    TextEdit edit{sideband.siteB, sideband.siteE, std::move(ro.text),
+    ResyncOutcome ro = ApplyResyncOrPend(tuBytes, sourceRange.first,
+                                         sourceRange.second,
+                                         sideband.ReplacementText(), tuPath);
+    TextEdit edit{sourceRange.first, sourceRange.second, std::move(ro.text),
                   std::move(ro.pending), std::nullopt, {}};
-    StampTextEditMaterializedBByteRange(edit, sideband.materializedBByteBegin,
-                                        sideband.materializedBByteEnd);
-    StampTextEditMaterializedOutputTextRange(
-        edit, 0, static_cast<uint64_t>(sideband.replacementText.size()));
+    StampTextEditMaterializedBReplayProof(edit, sideband);
     AttachAcceptedResultCarrier(
-        edit, BuildAcceptedTUTextEditCandidate(
-                  AcceptedPathKind::TUByteSpanConservativeEdit, sideband.siteB,
-                  sideband.siteE, sideband.replacementText));
+        edit,
+        BuildAcceptedTUTextEditCandidate(AcceptedPathKind::TUByteSpanConservativeEdit,
+                                         sourceRange.first, sourceRange.second,
+                                         sideband.ReplacementText()));
     tuEdits.push_back(std::move(edit));
 
     trace("pragma/sideband",
           "queued sideband pragma source edit path='{0}' site=[{1},{2}) "
           "replacementLen={3}",
-          sideband.sitePath, sideband.siteB, sideband.siteE,
-          sideband.replacementText.size());
+          sideband.SourcePath(), sourceRange.first, sourceRange.second,
+          sideband.ReplacementTextSize());
   }
 
   return true;
@@ -5867,8 +5914,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
   // source edit inside the header and then folds the materialized expansion back
   // through its parent include chain.
   for (const SidebandPragmaEdit &sideband : sidebandPragmaEdits_)
-    if (sideband.ownerIncludeId)
-      seeds.insert(*sideband.ownerIncludeId);
+    if (std::optional<uint64_t> owner = sideband.OwnerIncludeId())
+      seeds.insert(*owner);
 
   // (b) Macro-owned work INSIDE headers (ownerIncludeId != null).
   for (auto &kv : macroPatchesByOwner) {
@@ -6200,8 +6247,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
   auto includeHasLineDirectiveForcingSidebandWork = [&](uint64_t id) {
     return llvm::any_of(
         sidebandPragmaEdits_, [&](const SidebandPragmaEdit &e) {
-          return e.ownerIncludeId && *e.ownerIncludeId == id &&
-                 e.forceIncludeLineDirectiveWrappers;
+          return e.TargetsInclude(id) && e.ForcesIncludeLineDirectiveWrappers();
         });
   };
 
@@ -6220,7 +6266,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
       [&](auto &&self, uint64_t id) -> bool {
     bool sawSideband = llvm::any_of(
         sidebandPragmaEdits_, [&](const SidebandPragmaEdit &e) {
-          return e.ownerIncludeId && *e.ownerIncludeId == id;
+          return e.TargetsInclude(id);
         });
     if (includeHasOrdinaryReplayTokens(id))
       return false;
@@ -6251,7 +6297,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
       [&](auto &&self, uint64_t id) -> TUIncludeMaterializationWorkClass {
     bool sawSideband = llvm::any_of(
         sidebandPragmaEdits_, [&](const SidebandPragmaEdit &e) {
-          return e.ownerIncludeId && *e.ownerIncludeId == id;
+          return e.TargetsInclude(id);
         });
     if (includeHasLineDirectiveForcingSidebandWork(id))
       return TUIncludeMaterializationWorkClass::Ordinary;

@@ -333,17 +333,23 @@ void RefoldEngine::MaterializeIncludeExpansion(
   // edit.  Stage it here so it composes with the same owner-polymorphic header
   // materialization path used for ordinary include and macro edits.
   for (const SidebandPragmaEdit &sideband : sidebandPragmaEdits_) {
-    if (!sideband.ownerIncludeId || *sideband.ownerIncludeId != includeId)
+    if (!sideband.TargetsInclude(includeId))
       continue;
 
-    if (sideband.siteB > sideband.siteE || sideband.siteE > bytes.size()) {
+    const auto sourceRange = sideband.SourceByteRange();
+    if (!ValidateSidebandPragmaEditProof(sideband, "pragma/sideband/include")) {
+      includeExpansion[includeId] = std::string();
+      return;
+    }
+
+    if (!sideband.SourceIsWithinOwnerBytes(static_cast<uint64_t>(bytes.size()))) {
       RequestTerminalFallback(
           TerminalFallbackKind::UndischargedEmissionArtifact,
           "pragma/sideband",
           llvm::formatv("header-owned sideband pragma edit has invalid range "
                         "inc#{0} path='{1}' site=[{2},{3}) headerSize={4}",
-                        includeId, headerPath, sideband.siteB, sideband.siteE,
-                        bytes.size())
+                        includeId, headerPath, sourceRange.first,
+                        sourceRange.second, bytes.size())
               .str());
       includeExpansion[includeId] = std::string();
       return;
@@ -355,43 +361,10 @@ void RefoldEngine::MaterializeIncludeExpansion(
       // the last visible header-owned replay text, the parent-resume wrapper is
       // the next meaningful line-state transition and an extra local #line would
       // be gratuitous.
-      for (uint64_t p = sideband.siteE; p < bytes.size(); ++p)
+      for (uint64_t p = sourceRange.second; p < bytes.size(); ++p)
         if (!stringutils::isWs(bytes[p]))
           return true;
       return false;
-    };
-
-    auto replacementOwnsTrailingReplayBlankLine = [&]() -> bool {
-      // Sideband replacement text always includes the directive line terminator.
-      // A local header resync is needed only when the B-side sideband envelope
-      // also owned extra trailing replay whitespace, such as the blank line in
-      // `#pragma beta\n\nint value`.  A plain insertion/replacement line or a
-      // continued source pragma collapsed to one replay line should not inject a
-      // second header #line before the copied suffix; the include enter wrapper
-      // already establishes the header file context for the materialized body.
-      unsigned trailingLineTerminators = 0;
-      size_t i = sideband.replacementText.size();
-      while (i > 0) {
-        const char c = sideband.replacementText[i - 1];
-        if (stringutils::isNonNewlineWs(c)) {
-          --i;
-          continue;
-        }
-        if (c == '\n') {
-          --i;
-          if (i > 0 && sideband.replacementText[i - 1] == '\r')
-            --i;
-          ++trailingLineTerminators;
-          continue;
-        }
-        if (c == '\r') {
-          --i;
-          ++trailingLineTerminators;
-          continue;
-        }
-        break;
-      }
-      return trailingLineTerminators > 1;
     };
 
     // A sideband pragma line is not part of the normal PP token stream, but it
@@ -401,18 +374,18 @@ void RefoldEngine::MaterializeIncludeExpansion(
     // would otherwise shift copied header suffix bytes, or when the suffix has a
     // source-location observer such as __LINE__/__FILE__.
     const bool mustPreserveHeaderLineState =
-        (sideband.forceIncludeLineDirectiveWrappers &&
+        (sideband.ForcesIncludeLineDirectiveWrappers() &&
          hasCopiedHeaderSuffixAfterSidebandEdit() &&
-         replacementOwnsTrailingReplayBlankLine()) ||
+         sideband.OwnsTrailingReplayBlankLine()) ||
         OwnerSuffixHasLineStateSensitiveBuiltin(includeId, headerPath,
-                                                sideband.siteE);
+                                                sourceRange.second);
     ResyncOutcome ro =
         mustPreserveHeaderLineState
-            ? ApplyResyncOrPend(bytes, sideband.siteB, sideband.siteE,
-                                sideband.replacementText, headerPath)
-            : ResyncOutcome(sideband.replacementText, std::nullopt);
-    TextEdit edit{sideband.siteB,        sideband.siteE, std::move(ro.text),
-                  std::move(ro.pending), std::nullopt,   {}};
+            ? ApplyResyncOrPend(bytes, sourceRange.first, sourceRange.second,
+                                sideband.ReplacementText(), headerPath)
+            : ResyncOutcome(sideband.ReplacementText().str(), std::nullopt);
+    TextEdit edit{sourceRange.first, sourceRange.second, std::move(ro.text),
+                  std::move(ro.pending), std::nullopt, {}};
     AttachAcceptedResultCarrier(
         edit, BuildAcceptedIncludeRealizationCandidate(
                   AcceptedPathKind::IncludeMaterializedExpansion, *inc));
@@ -421,8 +394,8 @@ void RefoldEngine::MaterializeIncludeExpansion(
     trace("pragma/sideband",
           "staged header-owned sideband pragma edit inc#{0} path='{1}' "
           "site=[{2},{3}) replacementLen={4}",
-          includeId, headerPath, sideband.siteB, sideband.siteE,
-          sideband.replacementText.size());
+          includeId, headerPath, sourceRange.first, sourceRange.second,
+          sideband.ReplacementTextSize());
   }
 
   // 1) Macro patches owned by this include. Macro invocation ranges are already
@@ -503,14 +476,13 @@ void RefoldEngine::MaterializeIncludeExpansion(
   // includes with work. Clean child subtrees are left as spelled directives.
   auto includeHasSidebandPragmaWork = [&](uint64_t id) {
     return llvm::any_of(sidebandPragmaEdits_, [&](const SidebandPragmaEdit &e) {
-      return e.ownerIncludeId && *e.ownerIncludeId == id;
+      return e.TargetsInclude(id);
     });
   };
 
   auto includeHasLineDirectiveForcingSidebandWork = [&](uint64_t id) {
     return llvm::any_of(sidebandPragmaEdits_, [&](const SidebandPragmaEdit &e) {
-      return e.ownerIncludeId && *e.ownerIncludeId == id &&
-             e.forceIncludeLineDirectiveWrappers;
+      return e.TargetsInclude(id) && e.ForcesIncludeLineDirectiveWrappers();
     });
   };
 
@@ -4159,6 +4131,18 @@ void RefoldEngine::StampTextEditMaterializedBTokenRange(
   StampTextEditMaterializedBByteRange(edit, bytes->first, bytes->second);
 }
 
+void RefoldEngine::StampTextEditMaterializedBReplayProof(
+    TextEdit &edit, const SidebandPragmaEdit &sideband) const {
+  const std::pair<uint64_t, uint64_t> bRange =
+      sideband.MaterializedBByteRange();
+  StampTextEditMaterializedBByteRange(edit, bRange.first, bRange.second);
+
+  const std::pair<uint64_t, uint64_t> outputRange =
+      sideband.MaterializedOutputTextRange();
+  StampTextEditMaterializedOutputTextRange(edit, outputRange.first,
+                                           outputRange.second);
+}
+
 std::optional<std::pair<uint64_t, uint64_t>>
 RefoldEngine::SidebandPragmaMaterializedBByteRangeForInclude(
     uint64_t includeId) const {
@@ -4166,7 +4150,7 @@ RefoldEngine::SidebandPragmaMaterializedBByteRangeForInclude(
   std::optional<uint64_t> end;
 
   for (const SidebandPragmaEdit &sideband : sidebandPragmaEdits_) {
-    if (!sideband.ownerIncludeId || *sideband.ownerIncludeId != includeId)
+    if (!sideband.TargetsInclude(includeId))
       continue;
 
     // Sideband-only header materialization can have an empty normal-token
@@ -4175,14 +4159,13 @@ RefoldEngine::SidebandPragmaMaterializedBByteRangeForInclude(
     // carries the exact raw-B byte range that produced its replacement (or the
     // deterministic zero-length B anchor for a deletion).  Union those ranges
     // to make the final include replacement a fully witnessed emitted edit.
-    if (sideband.materializedBByteEnd < sideband.materializedBByteBegin ||
-        sideband.materializedBByteEnd > static_cast<uint64_t>(bSource_.size()))
+    if (!sideband.ReplayIsValid(static_cast<uint64_t>(bSource_.size())))
       return std::nullopt;
 
-    begin = begin ? std::min(*begin, sideband.materializedBByteBegin)
-                  : sideband.materializedBByteBegin;
-    end = end ? std::max(*end, sideband.materializedBByteEnd)
-              : sideband.materializedBByteEnd;
+    const std::pair<uint64_t, uint64_t> bRange =
+        sideband.MaterializedBByteRange();
+    begin = begin ? std::min(*begin, bRange.first) : bRange.first;
+    end = end ? std::max(*end, bRange.second) : bRange.second;
   }
 
   if (!begin || !end)
