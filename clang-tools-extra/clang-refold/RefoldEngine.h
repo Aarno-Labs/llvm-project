@@ -200,6 +200,15 @@ public:
     uint64_t siteE = 0;
     std::string replacementText;
     std::optional<uint64_t> ownerIncludeId = std::nullopt;
+
+    /// True when this sideband edit is a B-only insertion that forces a real
+    /// header expansion.  Deleting or replacing an already-spelled sideband
+    /// pragma can use the sideband-only no-wrapper policy, but inserting a new
+    /// pragma into a header that also contributes ordinary tokens materializes
+    /// those ordinary header tokens as well and should keep the normal
+    /// --with-lines include enter/exit directives.
+    bool forceIncludeLineDirectiveWrappers = false;
+
     uint64_t materializedBByteBegin = 0;
     uint64_t materializedBByteEnd = 0;
   };
@@ -5093,6 +5102,11 @@ private:
   void StampTextEditMaterializedBTokenRange(TextEdit &edit,
                                             uint64_t bTokBegin,
                                             uint64_t bTokEnd) const;
+
+  /// Return the B-byte envelope contributed by sideband pragma edits owned by
+  /// one materialized include, if that sideband stream supplies such a witness.
+  std::optional<std::pair<uint64_t, uint64_t>>
+  SidebandPragmaMaterializedBByteRangeForInclude(uint64_t includeId) const;
 
   /// Stamp a TextEdit with the replacement-text subrange to report on the
   /// refolded-output side of the optional materialized edit map.

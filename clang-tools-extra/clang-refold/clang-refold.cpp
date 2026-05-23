@@ -274,6 +274,29 @@ struct JsonIncludeItemForSideband {
   std::vector<JsonTokenSpanForSideband> spans;
 };
 
+struct JsonTokMapEntryForSideband {
+  std::string file;
+  uint64_t pp = 0;
+  uint64_t b = 0;
+  uint64_t e = 0;
+};
+
+struct JsonSlotForSideband {
+  std::string file;
+  std::string kind;
+  uint64_t b = 0;
+  uint64_t e = 0;
+  std::optional<uint64_t> pp = std::nullopt;
+  std::optional<uint64_t> ownerIncludeId = std::nullopt;
+};
+
+struct SidebandPragmaInsertionAnchor {
+  std::string sitePath;
+  uint64_t siteByte = 0;
+  std::optional<uint64_t> ownerIncludeId = std::nullopt;
+  bool forceIncludeLineDirectiveWrappers = false;
+};
+
 struct SidebandPragmaItemBinding {
   int64_t pragmaIndex = -1;
   std::optional<uint64_t> ownerIncludeId = std::nullopt;
@@ -615,6 +638,197 @@ collectJsonIncludesForSideband(const json::Object &rootJson) {
   return out;
 }
 
+static std::vector<JsonTokMapEntryForSideband>
+collectJsonTokMapForSideband(const json::Object &rootJson) {
+  std::vector<JsonTokMapEntryForSideband> out;
+  const json::Array *tokmap = rootJson.getArray("tokmap");
+  if (!tokmap)
+    return out;
+
+  for (const json::Value &value : *tokmap) {
+    const json::Object *obj = value.getAsObject();
+    if (!obj)
+      continue;
+    auto file = obj->getString("file");
+    auto pp = obj->getInteger("pp");
+    auto b = obj->getInteger("b");
+    auto e = obj->getInteger("e");
+    if (!file || !pp || !b || !e || *pp < 0 || *b < 0 || *e < 0 || *b > *e)
+      continue;
+
+    JsonTokMapEntryForSideband entry;
+    entry.file = file->str();
+    entry.pp = static_cast<uint64_t>(*pp);
+    entry.b = static_cast<uint64_t>(*b);
+    entry.e = static_cast<uint64_t>(*e);
+    out.push_back(std::move(entry));
+  }
+  return out;
+}
+
+static std::vector<JsonSlotForSideband>
+collectJsonSlotsForSideband(const json::Object &rootJson) {
+  std::vector<JsonSlotForSideband> out;
+  const json::Array *slots = rootJson.getArray("slots");
+  if (!slots)
+    return out;
+
+  for (const json::Value &value : *slots) {
+    const json::Object *obj = value.getAsObject();
+    if (!obj)
+      continue;
+    auto file = obj->getString("file");
+    auto kind = obj->getString("kind");
+    auto b = obj->getInteger("b");
+    auto e = obj->getInteger("e");
+    if (!file || !kind || !b || !e || *b < 0 || *e < 0 || *b > *e)
+      continue;
+
+    JsonSlotForSideband slot;
+    slot.file = file->str();
+    slot.kind = kind->str();
+    slot.b = static_cast<uint64_t>(*b);
+    slot.e = static_cast<uint64_t>(*e);
+    if (auto pp = obj->getInteger("pp"))
+      if (*pp >= 0)
+        slot.pp = static_cast<uint64_t>(*pp);
+    if (auto owner = obj->getInteger("owner_include_id"))
+      if (*owner >= 0)
+        slot.ownerIncludeId = static_cast<uint64_t>(*owner);
+    out.push_back(std::move(slot));
+  }
+  return out;
+}
+
+static bool slotOwnerMatches(const JsonSlotForSideband &slot,
+                             std::optional<uint64_t> ownerIncludeId) {
+  if (ownerIncludeId)
+    return slot.ownerIncludeId && *slot.ownerIncludeId == *ownerIncludeId;
+  return !slot.ownerIncludeId;
+}
+
+static bool rightTokenInFileAtGap(StringRef file, uint64_t gap,
+                                  ArrayRef<JsonTokMapEntryForSideband> tokmap) {
+  return llvm::any_of(tokmap, [&](const JsonTokMapEntryForSideband &entry) {
+    return StringRef(entry.file) == file && entry.pp == gap;
+  });
+}
+
+static bool leftTokenInFileAtGap(StringRef file, uint64_t gap,
+                                 ArrayRef<JsonTokMapEntryForSideband> tokmap) {
+  if (gap == 0)
+    return false;
+  return llvm::any_of(tokmap, [&](const JsonTokMapEntryForSideband &entry) {
+    return StringRef(entry.file) == file && entry.pp + 1 == gap;
+  });
+}
+
+/// Return a source byte that realizes a normal-token gap in one concrete owner.
+///
+/// Sideband pragma insertions have no A-side source directive to edit, so the
+/// insertion point must come from explicit producer coordinates: neighboring
+/// tokmap entries first, then file/include slots for zero-token boundaries.
+/// The owner id is part of the key for header slots so repeated includes of the
+/// same physical header do not collapse onto one arbitrary occurrence.
+static std::optional<uint64_t> sourceByteForNormalTokenGap(
+    StringRef file, std::optional<uint64_t> ownerIncludeId, uint64_t gap,
+    ArrayRef<JsonTokMapEntryForSideband> tokmap,
+    ArrayRef<JsonSlotForSideband> slots) {
+  for (const JsonTokMapEntryForSideband &entry : tokmap)
+    if (StringRef(entry.file) == file && entry.pp == gap)
+      return entry.b;
+
+  if (gap > 0)
+    for (const JsonTokMapEntryForSideband &entry : tokmap)
+      if (StringRef(entry.file) == file && entry.pp + 1 == gap)
+        return entry.e;
+
+  for (const JsonSlotForSideband &slot : slots) {
+    if (StringRef(slot.file) != file || !slot.pp || *slot.pp != gap ||
+        !slotOwnerMatches(slot, ownerIncludeId))
+      continue;
+    return slot.b;
+  }
+
+  // A zero-token header has no tokmap entry and its file_begin/file_end slots
+  // may not carry a PP coordinate.  These slots are still explicit producer
+  // anchors, but only when the caller has already selected a concrete include
+  // owner.
+  if (ownerIncludeId) {
+    for (const JsonSlotForSideband &slot : slots) {
+      if (StringRef(slot.file) != file ||
+          !slotOwnerMatches(slot, ownerIncludeId))
+        continue;
+      if (slot.kind == "file_begin" || slot.kind == "after_last_include" ||
+          slot.kind == "file_end")
+        return slot.b;
+    }
+  }
+
+  return std::nullopt;
+}
+
+static std::optional<SidebandPragmaInsertionAnchor>
+inferSidebandPragmaInsertionAnchor(
+    const SidebandPragmaLine &line, uint64_t projectedAGap, StringRef tuPath,
+    ArrayRef<JsonIncludeItemForSideband> includes,
+    ArrayRef<JsonTokMapEntryForSideband> tokmap,
+    ArrayRef<JsonSlotForSideband> slots) {
+  struct IncludeClaim {
+    const JsonIncludeItemForSideband *include = nullptr;
+    uint64_t siteByte = 0;
+    bool hasOrdinaryTokens = false;
+  };
+  std::vector<IncludeClaim> claims;
+
+  for (const JsonIncludeItemForSideband &inc : includes) {
+    for (const JsonTokenSpanForSideband &span : inc.spans) {
+      if (!(span.begin <= projectedAGap && projectedAGap <= span.end))
+        continue;
+
+      // For B-only insertions, prefer a header owner only when the gap is
+      // adjacent to a normal token from that header.  This proves that the
+      // inserted sideband line is being interleaved with that include's replay
+      // rather than merely sitting at a TU boundary around the include.
+      const bool adjacentHeaderToken =
+          rightTokenInFileAtGap(StringRef(inc.resolvedPath), projectedAGap,
+                                tokmap) ||
+          leftTokenInFileAtGap(StringRef(inc.resolvedPath), projectedAGap,
+                               tokmap);
+      if (!adjacentHeaderToken)
+        continue;
+
+      std::optional<uint64_t> siteByte = sourceByteForNormalTokenGap(
+          StringRef(inc.resolvedPath), inc.id, projectedAGap, tokmap, slots);
+      if (!siteByte)
+        continue;
+      claims.push_back(
+          IncludeClaim{&inc, *siteByte, span.begin < span.end});
+    }
+  }
+
+  if (claims.size() > 1)
+    return std::nullopt;
+  if (claims.size() == 1) {
+    SidebandPragmaInsertionAnchor anchor;
+    anchor.sitePath = claims.front().include->resolvedPath;
+    anchor.siteByte = claims.front().siteByte;
+    anchor.ownerIncludeId = claims.front().include->id;
+    anchor.forceIncludeLineDirectiveWrappers = claims.front().hasOrdinaryTokens;
+    return anchor;
+  }
+
+  std::optional<uint64_t> tuByte = sourceByteForNormalTokenGap(
+      tuPath, std::nullopt, projectedAGap, tokmap, slots);
+  if (!tuByte)
+    return std::nullopt;
+
+  SidebandPragmaInsertionAnchor anchor;
+  anchor.sitePath = tuPath.str();
+  anchor.siteByte = *tuByte;
+  return anchor;
+}
+
 /// Attach an owner include id to a header-owned pragma when the map does not
 /// already provide one.
 ///
@@ -731,6 +945,22 @@ static std::vector<SidebandPragmaItemBinding> mapSidebandLinesToPragmaItems(
                                   !StringRef(pragma.sitePath).starts_with("<") &&
                                   sitePathHasIncludeInstance(pragma.sitePath,
                                                              includes);
+      if (isHeaderPragma && !owner) {
+        // A header that produces only sideband directives has no ordinary-token
+        // include span, so every replayed pragma lands at the same normal-token
+        // gap.  The map still gives the concrete include directives in replay
+        // order and the physical pragma items in header source order; bind each
+        // physical pragma once per zero-token include occurrence instead of
+        // treating the shared gap as ambiguous.
+        for (const JsonIncludeItemForSideband &inc : includes) {
+          if (inc.resolvedPath != pragma.sitePath || !inc.spans.empty())
+            continue;
+          if (used.find(std::make_pair(j, inc.id)) != used.end())
+            continue;
+          owner = inc.id;
+          break;
+        }
+      }
       if (isHeaderPragma && !owner)
         continue;
 
@@ -774,11 +1004,14 @@ static std::vector<SidebandPragmaItemBinding> mapSidebandLinesToPragmaItems(
 /// Supported structural cases are deliberately closed:
 ///   * equal sideband lines: source pragma remains untouched;
 ///   * A-only sideband lines: delete the corresponding recorded source pragma;
-///   * one-for-one replacement: replace the recorded source pragma text.
+///   * one-for-one replacement: replace the recorded source pragma text;
+///   * B-only insertion: insert at a map-backed normal-token gap in either the
+///     TU or one concrete include owner.
 ///
-/// B-only insertions have no source anchor in the current map, so they are not
-/// normalized here; the caller leaves raw sideband tokens in the stream and the
-/// existing fallback path handles that out-of-domain case explicitly.
+/// Insertions are accepted only when the refold map gives a unique source gap
+/// anchor.  Ambiguous include/TU boundaries and many-to-one/one-to-many changes
+/// remain fail-closed so the caller can route them through the existing fallback
+/// path instead of manufacturing a source placement.
 static bool buildSidebandPragmaSourceEdits(
     const json::Object &rootJson, ArrayRef<SidebandPragmaLine> aLines,
     ArrayRef<SidebandPragmaLine> bLines, ArrayRef<PPTok> rawAToks,
@@ -792,6 +1025,12 @@ static bool buildSidebandPragmaSourceEdits(
   std::vector<JsonPragmaItem> pragmas = collectJsonPragmaItems(rootJson);
   std::vector<JsonIncludeItemForSideband> includes =
       collectJsonIncludesForSideband(rootJson);
+  std::vector<JsonTokMapEntryForSideband> tokmap =
+      collectJsonTokMapForSideband(rootJson);
+  std::vector<JsonSlotForSideband> slots = collectJsonSlotsForSideband(rootJson);
+  auto sourcePath = rootJson.getString("source");
+  if (!sourcePath)
+    return false;
   inferUniqueHeaderPragmaOwners(pragmas, includes);
   std::vector<SidebandPragmaItemBinding> aToPragma =
       mapSidebandLinesToPragmaItems(aLines, pragmas, includes);
@@ -852,7 +1091,43 @@ static bool buildSidebandPragmaSourceEdits(
     return true;
   };
 
+  auto appendInsertForB = [&](uint64_t bIdx) -> bool {
+    if (bIdx >= bLines.size())
+      return false;
+    const SidebandPragmaLine &line = bLines[static_cast<size_t>(bIdx)];
+    std::optional<uint64_t> aGap =
+        projectBGapToAGap(normalA2B, line.normalTokenGap);
+    if (!aGap)
+      return false;
+
+    std::optional<SidebandPragmaInsertionAnchor> anchor =
+        inferSidebandPragmaInsertionAnchor(line, *aGap, *sourcePath, includes,
+                                           tokmap, slots);
+    if (!anchor)
+      return false;
+
+    RefoldEngine::SidebandPragmaEdit edit;
+    edit.sitePath = anchor->sitePath;
+    edit.siteB = anchor->siteByte;
+    edit.siteE = anchor->siteByte;
+    edit.replacementText = line.text;
+    edit.ownerIncludeId = anchor->ownerIncludeId;
+    edit.forceIncludeLineDirectiveWrappers =
+        anchor->forceIncludeLineDirectiveWrappers;
+    edit.materializedBByteBegin = line.begin;
+    edit.materializedBByteEnd = line.end;
+    edits.push_back(std::move(edit));
+    return true;
+  };
+
   for (const diffutils::Hunk &h : hunks) {
+    if (h.isInsertOnly()) {
+      for (uint64_t b = h.bStart; b < h.bEnd; ++b)
+        if (!appendInsertForB(b))
+          return false;
+      continue;
+    }
+
     if (h.isDeleteOnly()) {
       for (uint64_t a = h.aStart; a < h.aEnd; ++a) {
         std::optional<uint64_t> bGap = projectAGapToBGap(
@@ -876,10 +1151,9 @@ static bool buildSidebandPragmaSourceEdits(
       continue;
     }
 
-    // Insert-only sideband lines, or many-to-one/one-to-many replacements,
-    // require an insertion/partition anchor that is not present in the current
-    // refold map. Do not normalize those cases; falling back is safer than
-    // manufacturing a source placement.
+    // Many-to-one and one-to-many sideband changes still lack a unique
+    // partition proof.  Leave those cases unnormalized so the regular fallback
+    // machinery handles them instead of manufacturing a source placement.
     return false;
   }
 

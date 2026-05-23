@@ -6179,6 +6179,14 @@ std::string RefoldEngine::RunSinglePassRefold() {
         return true;
       };
 
+  auto includeHasLineDirectiveForcingSidebandWork = [&](uint64_t id) {
+    return llvm::any_of(
+        sidebandPragmaEdits_, [&](const SidebandPragmaEdit &e) {
+          return e.ownerIncludeId && *e.ownerIncludeId == id &&
+                 e.forceIncludeLineDirectiveWrappers;
+        });
+  };
+
   // See the corresponding helper in MaterializeIncludeExpansion: only the
   // sideband-pragma-only materialization class is allowed to suppress #line
   // wrappers that ordinary --with-lines include materialization would emit.
@@ -6190,6 +6198,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
         sidebandPragmaEdits_, [&](const SidebandPragmaEdit &e) {
           return e.ownerIncludeId && *e.ownerIncludeId == id;
         });
+    if (includeHasLineDirectiveForcingSidebandWork(id))
+      return TUIncludeMaterializationWorkClass::Ordinary;
     if (auto it = perInclude.find(id);
         it != perInclude.end() && !it->second.patches.empty())
       return TUIncludeMaterializationWorkClass::Ordinary;
@@ -6280,6 +6290,11 @@ std::string RefoldEngine::RunSinglePassRefold() {
       if (auto bEnv = ResolveIncludeRealizationBTokenEnvelope(inc->cover.begin,
                                                               inc->cover.end)) {
         StampTextEditMaterializedBTokenRange(edit, bEnv->first, bEnv->second);
+      } else if (sidebandOnly) {
+        if (auto sidebandBRange =
+                SidebandPragmaMaterializedBByteRangeForInclude(inc->id))
+          StampTextEditMaterializedBByteRange(edit, sidebandBRange->first,
+                                              sidebandBRange->second);
       }
       if (itAccepted != includeExpansionAcceptedResults.end()) {
         AttachAcceptedResultCarrier(edit, itAccepted->second);

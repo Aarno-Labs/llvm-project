@@ -444,6 +444,13 @@ void RefoldEngine::MaterializeIncludeExpansion(
     });
   };
 
+  auto includeHasLineDirectiveForcingSidebandWork = [&](uint64_t id) {
+    return llvm::any_of(sidebandPragmaEdits_, [&](const SidebandPragmaEdit &e) {
+      return e.ownerIncludeId && *e.ownerIncludeId == id &&
+             e.forceIncludeLineDirectiveWrappers;
+    });
+  };
+
   // A sideband-only include materialization is the one class where omitting
   // otherwise-unobservable #line wrappers is intentional: the include is being
   // materialized solely to delete/replace preserved unknown pragma text that
@@ -453,6 +460,8 @@ void RefoldEngine::MaterializeIncludeExpansion(
   auto classifyMaterializationWork =
       [&](auto &&self, uint64_t id) -> MaterializationWorkClass {
     bool sawSideband = includeHasSidebandPragmaWork(id);
+    if (includeHasLineDirectiveForcingSidebandWork(id))
+      return MaterializationWorkClass::Ordinary;
     if (auto it = perInclude.find(id);
         it != perInclude.end() && !it->second.patches.empty())
       return MaterializationWorkClass::Ordinary;
@@ -556,6 +565,12 @@ void RefoldEngine::MaterializeIncludeExpansion(
             sidebandOnly);
         TextEdit edit{siteStart,    siteEnd,      std::move(wrapped),
                       std::nullopt, std::nullopt, {}};
+        if (sidebandOnly) {
+          if (auto sidebandBRange =
+                  SidebandPragmaMaterializedBByteRangeForInclude(child->id))
+            StampTextEditMaterializedBByteRange(edit, sidebandBRange->first,
+                                                sidebandBRange->second);
+        }
 
         // Preserve the child's accepted-result carrier if the child was
         // materialized through a specific realization path; otherwise record
@@ -3996,6 +4011,37 @@ void RefoldEngine::StampTextEditMaterializedBTokenRange(
     fatal("edit-map", "invalid materialized B token range [{0},{1}) bToks={2}",
           bTokBegin, bTokEnd, bToks_.size());
   StampTextEditMaterializedBByteRange(edit, bytes->first, bytes->second);
+}
+
+std::optional<std::pair<uint64_t, uint64_t>>
+RefoldEngine::SidebandPragmaMaterializedBByteRangeForInclude(
+    uint64_t includeId) const {
+  std::optional<uint64_t> begin;
+  std::optional<uint64_t> end;
+
+  for (const SidebandPragmaEdit &sideband : sidebandPragmaEdits_) {
+    if (!sideband.ownerIncludeId || *sideband.ownerIncludeId != includeId)
+      continue;
+
+    // Sideband-only header materialization can have an empty normal-token
+    // cover.  In that case the ordinary include-cover resolver has no B-token
+    // envelope to report to the edit-map writer, but each sideband edit already
+    // carries the exact raw-B byte range that produced its replacement (or the
+    // deterministic zero-length B anchor for a deletion).  Union those ranges
+    // to make the final include replacement a fully witnessed emitted edit.
+    if (sideband.materializedBByteEnd < sideband.materializedBByteBegin ||
+        sideband.materializedBByteEnd > static_cast<uint64_t>(bSource_.size()))
+      return std::nullopt;
+
+    begin = begin ? std::min(*begin, sideband.materializedBByteBegin)
+                  : sideband.materializedBByteBegin;
+    end = end ? std::max(*end, sideband.materializedBByteEnd)
+              : sideband.materializedBByteEnd;
+  }
+
+  if (!begin || !end)
+    return std::nullopt;
+  return std::make_pair(*begin, *end);
 }
 
 void RefoldEngine::StampTextEditMaterializedOutputTextRange(
