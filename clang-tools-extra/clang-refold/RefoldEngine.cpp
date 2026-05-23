@@ -3036,6 +3036,23 @@ std::string RefoldEngine::RunSinglePassRefold() {
                   : sliceExactTokenCoverage(bTokOff_, bToks_, bSource_,
                                             h.bStart, h.bEnd);
           repl.assign(bSlice.data(), bSlice.data() + bSlice.size());
+          if (h.isInsertOnly()) {
+            // Pure insertions use the token envelope, which may include
+            // zero-normal-token sideband directive lines adjacent to the
+            // ordinary inserted tokens.  If a sideband replacement/deletion is
+            // also proved and materialized through its owning include/TU atom,
+            // the ordinary insertion must not replay the same B bytes.
+            std::optional<uint64_t> envelopeBegin;
+            std::optional<uint64_t> envelopeEnd;
+            if (!bSlice.empty()) {
+              envelopeBegin =
+                  static_cast<uint64_t>(bSlice.data() - bSource_.data());
+              envelopeEnd =
+                  *envelopeBegin + static_cast<uint64_t>(bSlice.size());
+            }
+            repl = StripSeparatelyOwnedSidebandReplay(repl, envelopeBegin,
+                                                      envelopeEnd);
+          }
           const size_t b0 = bTokOff_[static_cast<size_t>(h.bStart)];
 
           // Token-envelope byte ranges begin at the first inserted token, so
@@ -3200,8 +3217,39 @@ std::string RefoldEngine::RunSinglePassRefold() {
               span->first, span->second, stringutils::showWsWithClip(repl, 160),
               stringutils::showWsWithClip(padded, 160));
 
-        ResyncOutcome ro = ApplyResyncOrPend(tuBytes, span->first, span->second,
-                                             padded, tuPath);
+        auto insertionBeforeMaterializedInclude = [&]() -> bool {
+          if (!h.isInsertOnly() || span->first != span->second)
+            return false;
+          if (!AnchorToExactSlotBoundaryFromPPGap(tuPath, h.aStart))
+            return false;
+
+          const uint64_t maxPP = model_.GetTokensCountA();
+          std::optional<uint64_t> leftInc =
+              (h.aStart > 0) ? model_.InnermostIncludeAtPP(h.aStart - 1)
+                             : std::nullopt;
+          std::optional<uint64_t> rightInc =
+              h.aStart < maxPP ? model_.InnermostIncludeAtPP(h.aStart)
+                               : std::nullopt;
+          if (leftInc || !rightInc)
+            return false;
+
+          return llvm::any_of(sidebandPragmaEdits_,
+                              [&](const SidebandPragmaEdit &sideband) {
+            return sideband.TargetsInclude(*rightInc) &&
+                   sideband.EmitsVisibleReplayText();
+          });
+        };
+
+        // When a TU-prefix insertion is immediately followed by an include that
+        // will be materialized for proved sideband work, the include wrapper is
+        // the next file-state transition.  Emitting a local TU #line back to the
+        // physical #include directive would only create a gratuitous resume
+        // immediately before the child-file #line.
+        ResyncOutcome ro =
+            insertionBeforeMaterializedInclude()
+                ? ResyncOutcome(padded, std::nullopt)
+                : ApplyResyncOrPend(tuBytes, span->first, span->second, padded,
+                                    tuPath);
         TextEdit edit{span->first, span->second, std::move(ro.text),
                       std::move(ro.pending), std::nullopt, {}};
         edit.isDirectTUHunkEdit = true;
@@ -3316,6 +3364,24 @@ std::string RefoldEngine::RunSinglePassRefold() {
                 : sliceExactTokenCoverage(bTokOff_, bToks_, bSource_, h.bStart,
                                           h.bEnd);
         repl.assign(bSlice.data(), bSlice.data() + bSlice.size());
+        if (h.isInsertOnly()) {
+          // For pure insertions the source slice is the *token envelope*, not
+          // just the exact token byte cover.  Zero-normal-token sideband lines
+          // can live between the inserted ordinary tokens and the next normal
+          // token.  Use the actual envelope bytes when partitioning replay so a
+          // separately materialized sideband replacement/deletion is not also
+          // emitted by this ordinary TU insertion.
+          std::optional<uint64_t> envelopeBegin;
+          std::optional<uint64_t> envelopeEnd;
+          if (!bSlice.empty()) {
+            envelopeBegin = static_cast<uint64_t>(bSlice.data() -
+                                                  bSource_.data());
+            envelopeEnd =
+                *envelopeBegin + static_cast<uint64_t>(bSlice.size());
+          }
+          repl = StripSeparatelyOwnedSidebandReplay(repl, envelopeBegin,
+                                                    envelopeEnd);
+        }
       }
 
       // This patch inserts B text at a zero-width TU site: the TU span is
@@ -3483,8 +3549,35 @@ std::string RefoldEngine::RunSinglePassRefold() {
             stringutils::showWsWithClip(rawRepl, 160),
             stringutils::showWsWithClip(padded, 160));
 
+      auto insertionBeforeMaterializedInclude = [&]() -> bool {
+        if (!h.isInsertOnly() || span->first != span->second)
+          return false;
+        if (!AnchorToExactSlotBoundaryFromPPGap(tuPath, h.aStart))
+          return false;
+        const uint64_t maxPP = model_.GetTokensCountA();
+        std::optional<uint64_t> leftInc =
+            (h.aStart > 0) ? model_.InnermostIncludeAtPP(h.aStart - 1)
+                           : std::nullopt;
+        std::optional<uint64_t> rightInc =
+            h.aStart < maxPP ? model_.InnermostIncludeAtPP(h.aStart)
+                             : std::nullopt;
+        if (leftInc || !rightInc)
+          return false;
+        return llvm::any_of(sidebandPragmaEdits_,
+                            [&](const SidebandPragmaEdit &sideband) {
+          return sideband.TargetsInclude(*rightInc);
+        });
+      };
+
+      // A TU insertion immediately before a materialized include does not need
+      // to resync back to the physical `#include` directive line.  The next
+      // emitted bytes are the include wrapper's child-file `#line`, and that
+      // wrapper later performs the parent resume after the include.
       ResyncOutcome ro =
-          ApplyResyncOrPend(tuBytes, span->first, span->second, padded, tuPath);
+          insertionBeforeMaterializedInclude()
+              ? ResyncOutcome(padded, std::nullopt)
+              : ApplyResyncOrPend(tuBytes, span->first, span->second, padded,
+                                  tuPath);
       TextEdit edit{span->first, span->second, std::move(ro.text),
                     std::move(ro.pending), std::nullopt, {}};
       edit.isDirectTUHunkEdit = true;
@@ -7460,10 +7553,33 @@ RefoldEngine::ClassifyOwnerWithSegments(StringRef tuPath,
         return Owner::Include(*rightInc);
       }
 
-      auto includeHasProvedSidebandInsertion = [&](uint64_t includeId) {
+      auto includeHasSidebandWork = [&](uint64_t includeId) {
         return llvm::any_of(sidebandPragmaEdits_,
                             [&](const SidebandPragmaEdit &sideband) {
           return sideband.TargetsInclude(includeId);
+        });
+      };
+
+      auto findIncludeById = [&](uint64_t includeId)
+          -> const RefoldModel::IncludeItem * {
+        for (const auto &include : model_.GetIncludes())
+          if (include.id == includeId)
+            return &include;
+        return nullptr;
+      };
+
+      auto includeHasProvedSidebandInsertion = [&](uint64_t includeId) {
+        return llvm::any_of(sidebandPragmaEdits_,
+                            [&](const SidebandPragmaEdit &sideband) {
+          // A header-owned sideband replacement/deletion proves that the
+          // header needs sideband work, but it does not prove that an
+          // unrelated ordinary B-token insertion before the include belongs to
+          // that header.  Prefix co-ownership is reserved for visible B-only
+          // sideband insertions, where the ordinary insertion island and the
+          // sideband replay line are the same owner-local boundary payload.
+          return sideband.TargetsInclude(includeId) &&
+                 sideband.SourceIsZeroWidthInsertion() &&
+                 sideband.EmitsVisibleReplayText();
         });
       };
 
@@ -7484,11 +7600,37 @@ RefoldEngine::ClassifyOwnerWithSegments(StringRef tuPath,
         return Owner::Include(*rightInc);
       }
 
-      if (leftInc && !rightInc && includeHasProvedSidebandInsertion(*leftInc)) {
+      if (!leftInc && rightInc && includeHasSidebandWork(*rightInc)) {
+        // If the right owner is a child include with sideband replacement or
+        // deletion work, the collapsed PP gap denotes the boundary in the
+        // parent header before that child include.  Do not pull the ordinary
+        // insertion into the child merely because the child's first ordinary
+        // token is the first PP token in the TU; compose it on the parent
+        // owner surface and let the child sideband edit remain child-owned.
+        if (const auto *rightInclude = findIncludeById(*rightInc)) {
+          if (rightInclude->parent &&
+              !includeHasProvedSidebandInsertion(*rightInc)) {
+            trace("segments",
+                  "    insertion gap PP={0} classified as parent INCLUDE "
+                  "id={1} before sideband-edited child inc#{2}",
+                  a0, *rightInclude->parent, *rightInc);
+            return Owner::Include(*rightInclude->parent);
+          }
+        }
+      }
+
+      if (leftInc && !rightInc && includeHasSidebandWork(*leftInc)) {
+        // A suffix insertion after a header that already has proved sideband
+        // work belongs to the same materialized header surface.  This is the
+        // include-boundary mirror of preserving an untouched `#include`: when
+        // the include is not otherwise materialized, parent source after the
+        // directive is the stable spelling; once the header is being opened for
+        // sideband replacement/deletion/insertion, the after-boundary payload
+        // composes as a header suffix and the include wrapper performs the
+        // return-to-parent line repair.
         trace("segments",
               "    insertion gap PP={0} classified as INCLUDE id={1} "
-              "because a proved header sideband insertion targets the same "
-              "include boundary",
+              "because proved sideband work materializes the include suffix",
               a0, *leftInc);
         return Owner::Include(*leftInc);
       }

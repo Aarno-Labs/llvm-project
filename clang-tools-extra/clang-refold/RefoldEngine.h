@@ -317,6 +317,16 @@ public:
       return closureKind != ClosureKind::Unknown;
     }
 
+    /// Return true when the proof is exactly a zero-width insertion site.
+    ///
+    /// Boundary ownership decisions use this to distinguish a genuine B-only
+    /// sideband insertion from a sideband replacement/deletion that merely
+    /// happens to target the same include owner.  Only the former may pull an
+    /// ordinary B insertion island onto the header surface for joint replay.
+    bool IsZeroWidthInsertion() const {
+      return closureKind == ClosureKind::ZeroWidthInsertion && begin == end;
+    }
+
     bool IsComplete() const { return IsValid() && HasClosureProof(); }
   };
 
@@ -478,6 +488,11 @@ public:
 
     /// Return true when this sideband edit emits visible replay text.
     bool EmitsVisibleReplayText() const { return replay.EmitsVisibleText(); }
+
+    /// Return true when the source-side proof is a zero-width insertion.
+    bool SourceIsZeroWidthInsertion() const {
+      return source.IsZeroWidthInsertion();
+    }
 
     /// Return true when the B replay proof range is valid in the edited
     /// preprocessed B buffer.
@@ -5359,9 +5374,9 @@ private:
   /// source line of the first emitted materialized header line, not blindly line
   /// one: deleting a leading sideband directive must advance the enter line to
   /// the first surviving header line.  The final boolean enables the narrower
-  /// sideband-pragma-only suppression path, where wrappers are emitted only if
-  /// recorded line/file-sensitive builtins can observe the logical-location
-  /// transition.
+  /// sideband-pragma-only suppression path; empty sideband-only materializations
+  /// can omit wrappers when unobservable, but non-empty header replay still
+  /// carries a real owner transition in --with-lines output.
   std::string WrapIncludeExpansionForMaterialization(
       const RefoldModel::IncludeItem &child, StringRef parentFileSpelling,
       std::optional<uint64_t> parentOwnerIncludeId, uint64_t parentResumeOffset,
@@ -5410,6 +5425,17 @@ private:
   /// Convert a B-token range into a half-open B-byte range.
   std::optional<std::pair<uint64_t, uint64_t>>
   BTokenRangeToByteRange(uint64_t bTokBegin, uint64_t bTokEnd) const;
+
+  /// Remove visible sideband replay bytes from an ordinary replay payload when
+  /// those bytes are owned by a separate, non-insertion sideband source edit.
+  ///
+  /// This enforces the replay-partition invariant: B-only sideband insertions
+  /// may be carried by an ordinary insertion island, but sideband replacements
+  /// and deletions have their own source edit and must not be duplicated by the
+  /// ordinary token-envelope replay.
+  std::string StripSeparatelyOwnedSidebandReplay(
+      StringRef replayText, std::optional<uint64_t> replayBByteBegin,
+      std::optional<uint64_t> replayBByteEnd) const;
 
   /// Stamp a TextEdit with the B-byte range of the materialized surface.
   void StampTextEditMaterializedBByteRange(TextEdit &edit, uint64_t begin,

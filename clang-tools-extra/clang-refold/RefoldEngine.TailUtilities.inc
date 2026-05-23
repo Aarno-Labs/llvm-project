@@ -176,11 +176,32 @@ bool RefoldEngine::OwnerSuffixHasLineStateSensitiveBuiltin(
       continue;
     if (macro.ownerIncludeId != ownerIncludeId)
       continue;
-    if (!macro.invFile || !macro.invB)
+
+    // The producer records nested predefined builtins at their definition-site
+    // spelling when they are expanded from another macro replacement list. For
+    // example, RF_MARK(x) may contain __LINE__ in common.h even though the
+    // observable line-state use is the RF_MARK(...) invocation in the current
+    // header.  Line-resync decisions therefore have to project a recorded
+    // builtin use back to its outermost caller before comparing byte offsets in
+    // the owner file.  This is still a deterministic map-backed proof: every
+    // step follows caller_macro_id edges emitted by the producer.
+    const RefoldModel::MacroInvocation *site = &macro;
+    unsigned depth = 0;
+    const unsigned maxDepth =
+        static_cast<unsigned>(model_.GetMacroInvocations().size());
+    while (site->callerMacroId && depth++ < maxDepth) {
+      const RefoldModel::MacroInvocation *caller =
+          FindMacroInvocationById(*site->callerMacroId);
+      if (!caller)
+        break;
+      site = caller;
+    }
+
+    if (!site->invFile || !site->invB)
       continue;
-    if (!PathsEqual(*macro.invFile, ownerFile))
+    if (!PathsEqual(*site->invFile, ownerFile))
       continue;
-    if (*macro.invB >= offset)
+    if (*site->invB >= offset)
       return true;
   }
   return false;
@@ -221,9 +242,9 @@ std::string RefoldEngine::WrapIncludeExpansionForMaterialization(
                                               parentFileSpelling,
                                               parentResumeOffset);
 
-  if (!childNeedsLineState && !parentNeedsLineState) {
+  if (childBody.empty() && !childNeedsLineState && !parentNeedsLineState) {
     trace("linedir/include",
-          "skip sideband-only include #line wrapper inc#{0}: no "
+          "skip empty sideband-only include #line wrapper inc#{0}: no "
           "line-sensitive builtins in child subtree or parent suffix",
           child.id);
     return childBody.str();
@@ -232,25 +253,28 @@ std::string RefoldEngine::WrapIncludeExpansionForMaterialization(
   std::string result;
   result.reserve(childBody.size() + 128);
 
-  if (childNeedsLineState)
+  // A non-empty sideband-only include materialization still emits bytes whose
+  // logical owner is the header.  Preserve that owner transition in --with-lines
+  // output even when no current token observes __LINE__/__FILE__; otherwise a
+  // repeated zero-token include can leave visible header pragmas looking as if
+  // they were spelled in the parent TU.
+  if (!childBody.empty() || childNeedsLineState)
     result += lineDirs_.FormatLineDirective(childEntryLineNo, childFileSpelling);
 
   result += childBody.str();
 
-  if (parentNeedsLineState) {
-    // The sideband-only suppression path may still need to repair the parent
-    // logical location if a preserved suffix builtin can observe it.
-    if (!result.empty() && result.back() != '\n')
-      result += '\n';
-    result +=
-        lineDirs_.FormatLineDirective(parentResumeLineNo, parentFileSpelling);
-  }
+  if (!result.empty() && result.back() != '\n')
+    result += '\n';
+  if (!childBody.empty() || parentNeedsLineState)
+    result += lineDirs_.FormatLineDirective(parentResumeLineNo,
+                                            parentFileSpelling);
 
   trace("linedir/include",
         "wrap sideband-only include inc#{0}: childLineState={1} "
-        "parentLineState={2}",
+        "parentLineState={2} visibleBody={3}",
         child.id, childNeedsLineState ? "YES" : "NO",
-        parentNeedsLineState ? "YES" : "NO");
+        parentNeedsLineState ? "YES" : "NO",
+        childBody.empty() ? "NO" : "YES");
   return result;
 }
 
@@ -329,6 +353,8 @@ void RefoldEngine::MaterializeIncludeExpansion(
   auto includeInsertionPatchCarriesSidebandReplay =
       [&](const SidebandPragmaEdit &sideband) -> bool {
     if (editsIt == perInclude.end())
+      return false;
+    if (!sideband.SourceIsZeroWidthInsertion())
       return false;
 
     const auto sidebandB = sideband.MaterializedBByteRange();
@@ -495,13 +521,11 @@ void RefoldEngine::MaterializeIncludeExpansion(
       }
 
       for (auto &te : plan.edits) {
-        ResyncOutcome ro =
-            ApplyResyncOrPend(bytes, te.start, te.end, te.text, headerPath);
-        TextEdit edit{te.start,           te.end,
-                      std::move(ro.text), std::move(ro.pending),
-                      std::nullopt,       {}};
-        edit.acceptedResults = std::move(te.acceptedResults);
-        edits.push_back(std::move(edit));
+        // ComputeIncludeTextEdits() already applies the owner-local padding and
+        // line-resync proof for each header edit.  Re-running resync here would
+        // treat a deliberately inserted `#line` as fresh newline drift and can
+        // duplicate the same local resume before the copied suffix.
+        edits.push_back(std::move(te));
       }
     } else {
       debug("include/mat", "inc#{0} has no include patches", inc->id);
@@ -2722,6 +2746,14 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     uint64_t materialBStart = p.bStart;
     uint64_t materialBEnd = p.bEnd;
     std::string materialInsertBytes = p.insertBytes;
+    if (isInsert) {
+      std::optional<std::pair<uint64_t, uint64_t>> bBytes =
+          BTokenRangeToByteRange(p.bStart, p.bEnd);
+      materialInsertBytes = StripSeparatelyOwnedSidebandReplay(
+          materialInsertBytes,
+          bBytes ? std::optional<uint64_t>(bBytes->first) : std::nullopt,
+          bBytes ? std::optional<uint64_t>(bBytes->second) : std::nullopt);
+    }
 
     // If a replacement hunk starts by re-emitting the exact tokens of a
     // complete child include, keep that include as the survivor and remove the
@@ -2841,10 +2873,120 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       auto commitInsertCandidate = [&](const InsertAnchorCandidate &candidate) {
         std::string text = PadAtBoundaries(
             headerText, static_cast<size_t>(candidate.anchorByte),
-            static_cast<size_t>(candidate.anchorByte), p.insertBytes,
+            static_cast<size_t>(candidate.anchorByte), materialInsertBytes,
             /* allowLeft */ true, /* allowRight */ true);
-        TextEdit edit = MakeTextEditWithResyncOrPending(
-            headerText, candidate.anchorByte, candidate.anchorByte, text, file);
+
+        auto hasCopiedHeaderSuffix = [&]() -> bool {
+          for (uint64_t byte = candidate.anchorByte; byte < fileLen; ++byte)
+            if (!stringutils::isWs(headerText[static_cast<size_t>(byte)]))
+              return true;
+          return false;
+        };
+
+        auto childIncludeAtBoundaryAnchor =
+            [&]() -> const RefoldModel::IncludeItem * {
+          for (const auto &child : model_.GetIncludes()) {
+            if (!child.parent || *child.parent != ie.include->id ||
+                !PathsEqual(child.sitePath, file))
+              continue;
+            if (child.siteB == candidate.anchorByte ||
+                child.siteE == candidate.anchorByte)
+              return &child;
+          }
+          return nullptr;
+        };
+
+        auto includeHasVisibleSidebandWork = [&](uint64_t includeId) -> bool {
+          return llvm::any_of(sidebandPragmaEdits_,
+                              [&](const SidebandPragmaEdit &sideband) {
+            return sideband.TargetsInclude(includeId) &&
+                   sideband.EmitsVisibleReplayText();
+          });
+        };
+
+        auto suffixBeginsWithPreprocessorDirective = [&]() -> bool {
+          size_t pos = static_cast<size_t>(candidate.anchorByte);
+          if (pos >= headerText.size())
+            return false;
+
+          // Local line resync is still required before a preserved directive
+          // line.  Unlike ordinary suffix tokens, directives such as #include,
+          // #define, #undef, and #line observe their presumed source location
+          // through preprocessing state and diagnostics.  Horizontal
+          // indentation before the '#' belongs to the directive line and is a
+          // valid flush point for the pending #line.
+          size_t lineEnd = headerText.find('\n', pos);
+          if (lineEnd == StringRef::npos)
+            lineEnd = headerText.size();
+          while (pos < lineEnd &&
+                 (headerText[pos] == ' ' || headerText[pos] == '\t'))
+            ++pos;
+          return pos < lineEnd && headerText[pos] == '#';
+        };
+
+        auto replayContainsPreprocessorDirectiveLine =
+            [](StringRef replay) -> bool {
+          size_t lineBegin = 0;
+          while (lineBegin < replay.size()) {
+            size_t lineEnd = replay.find('\n', lineBegin);
+            if (lineEnd == StringRef::npos)
+              lineEnd = replay.size();
+
+            size_t pos = lineBegin;
+            while (pos < lineEnd &&
+                   (replay[pos] == ' ' || replay[pos] == '\t'))
+              ++pos;
+            if (pos < lineEnd && replay[pos] == '#')
+              return true;
+
+            if (lineEnd == replay.size())
+              break;
+            lineBegin = lineEnd + 1;
+          }
+          return false;
+        };
+
+        const bool copiedHeaderSuffix = hasCopiedHeaderSuffix();
+        const RefoldModel::IncludeItem *boundaryChild =
+            childIncludeAtBoundaryAnchor();
+        const bool boundaryChildWillBeMaterialized =
+            boundaryChild && includeHasVisibleSidebandWork(boundaryChild->id);
+        const bool suffixObservesLineState =
+            OwnerSuffixHasLineStateSensitiveBuiltin(ie.include->id, file,
+                                                    candidate.anchorByte);
+        const bool suffixStartsDirective =
+            suffixBeginsWithPreprocessorDirective();
+        const bool replayCarriesDirectiveLine =
+            replayContainsPreprocessorDirectiveLine(text);
+
+        // A pure insertion at physical header EOF has no copied header suffix
+        // whose logical location must be restored inside this owner.  For a
+        // child-include boundary, suppress the local parent resync only when the
+        // child is itself being materialized by a proved sideband replay; the
+        // child wrapper then performs the transition immediately.  If the child
+        // #include remains preserved, or if the next untouched suffix line is
+        // any other preprocessing directive, restore the parent line state
+        // before that directive.
+        //
+        // Two additional map-backed observations also require local resync:
+        //  * a copied suffix macro invocation whose expansion contains
+        //    __LINE__/__FILE__ through caller_macro_id evidence; and
+        //  * an insertion payload that itself carries a preprocessing directive
+        //    line, such as a sideband #pragma co-owned by the ordinary insertion
+        //    island.  In both cases, the following copied header bytes must
+        //    resume in the original owner file/line state.
+        const bool needsLocalResync =
+            copiedHeaderSuffix &&
+            (suffixObservesLineState || suffixStartsDirective ||
+             replayCarriesDirectiveLine) &&
+            !boundaryChildWillBeMaterialized;
+        TextEdit edit = needsLocalResync
+                            ? MakeTextEditWithResyncOrPending(
+                                  headerText, candidate.anchorByte,
+                                  candidate.anchorByte, text, file)
+                            : TextEdit{candidate.anchorByte,
+                                       candidate.anchorByte, std::move(text),
+                                       std::nullopt, std::nullopt, {}};
         AttachAcceptedResultCarrier(
             edit, BuildAcceptedIncludeCandidate(candidate.path, p,
                                                 &candidate.witness));
@@ -3008,20 +3150,26 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       if (leftAnchorPP) {
         const std::optional<uint64_t> leftStartByte =
             ByteEndForPPInFile(file, *leftAnchorPP, false, fileLen);
+        const bool insertionAtIncludeEOF = pos >= ppHi;
+        const std::optional<uint64_t> leftAnchorByte =
+            leftStartByte ? std::optional<uint64_t>(
+                                insertionAtIncludeEOF ? fileLen
+                                                      : *leftStartByte)
+                          : std::nullopt;
         IncludeAnchorWitness leftNeighborWitness;
         leftNeighborWitness.evidence =
             IncludeAnchorEvidenceKind::LeftNeighborPP;
         leftNeighborWitness.hasNeighborPP = true;
         leftNeighborWitness.neighborPP = *leftAnchorPP;
-        leftNeighborWitness.hasAnchorByte = leftStartByte.has_value();
-        leftNeighborWitness.anchorByte = leftStartByte ? *leftStartByte : 0ULL;
+        leftNeighborWitness.hasAnchorByte = leftAnchorByte.has_value();
+        leftNeighborWitness.anchorByte = leftAnchorByte ? *leftAnchorByte : 0ULL;
         trace("include/apply",
               "file={0} patch[{1}] INSERT: left-neighbor anchorPP={2} -> "
-              "startByte={3} inventory={4}",
-              file, idx, leftAnchorPP, leftStartByte,
+              "startByte={3} anchorByte={4} inventory={5}",
+              file, idx, leftAnchorPP, leftStartByte, leftAnchorByte,
               includeInventoryFor(AcceptedPathKind::IncludeInsertLeftNeighborPP,
                                   &leftNeighborWitness));
-        if (!leftStartByte) {
+        if (!leftAnchorByte) {
           plan.requiresIncludeRealization = true;
           plan.realizationReason =
               llvm::formatv("INSERT: failed to map left-neighbor anchorPP={0} "
@@ -3030,10 +3178,10 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                   .str();
           return plan;
         }
-        if (anchorMatchesCondArmCert(*leftStartByte)) {
+        if (anchorMatchesCondArmCert(*leftAnchorByte)) {
           InsertAnchorCandidate candidate;
           candidate.path = AcceptedPathKind::IncludeInsertLeftNeighborPP;
-          candidate.anchorByte = *leftStartByte;
+          candidate.anchorByte = *leftAnchorByte;
           candidate.witness = leftNeighborWitness;
           traceInsertCandidate(candidate, "left-neighbor");
           fallbackCandidates.push_back(std::move(candidate));
@@ -4180,6 +4328,90 @@ void RefoldEngine::StampTextEditMaterializedBReplayProof(
       sideband.MaterializedOutputTextRange();
   StampTextEditMaterializedOutputTextRange(edit, outputRange.first,
                                            outputRange.second);
+}
+
+std::string RefoldEngine::StripSeparatelyOwnedSidebandReplay(
+    StringRef replayText, std::optional<uint64_t> replayBByteBegin,
+    std::optional<uint64_t> replayBByteEnd) const {
+  if (!replayBByteBegin || !replayBByteEnd ||
+      *replayBByteEnd <= *replayBByteBegin || replayText.empty())
+    return replayText.str();
+
+  struct RemovalRange {
+    uint64_t begin;
+    uint64_t end;
+  };
+
+  SmallVector<RemovalRange, 4> removals;
+  for (const SidebandPragmaEdit &sideband : sidebandPragmaEdits_) {
+    // A zero-width source-side pragma insertion is the one sideband class whose
+    // visible B bytes may legitimately be carried by a surrounding ordinary
+    // insertion island.  Non-insertion sideband edits have their own source
+    // atom to replace/delete, so replaying the same raw B bytes through the
+    // ordinary token envelope would duplicate that sideband line.
+    if (sideband.SourceIsZeroWidthInsertion() ||
+        !sideband.EmitsVisibleReplayText())
+      continue;
+
+    const auto sidebandB = sideband.MaterializedBByteRange();
+    if (sidebandB.first < *replayBByteBegin ||
+        *replayBByteEnd < sidebandB.second || sidebandB.first >= sidebandB.second)
+      continue;
+
+    const uint64_t relBegin = sidebandB.first - *replayBByteBegin;
+    const uint64_t relEnd = sidebandB.second - *replayBByteBegin;
+    if (relEnd > replayText.size())
+      continue;
+
+    StringRef replaySlice = replayText.slice(
+        static_cast<size_t>(relBegin), static_cast<size_t>(relEnd));
+    if (replaySlice != sideband.ReplacementText())
+      continue;
+
+    removals.push_back({relBegin, relEnd});
+  }
+
+  if (removals.empty())
+    return replayText.str();
+
+  llvm::sort(removals, [](const RemovalRange &lhs, const RemovalRange &rhs) {
+    if (lhs.begin != rhs.begin)
+      return lhs.begin < rhs.begin;
+    return lhs.end < rhs.end;
+  });
+
+  SmallVector<RemovalRange, 4> merged;
+  for (const RemovalRange &range : removals) {
+    if (range.begin >= range.end)
+      continue;
+    if (!merged.empty() && range.begin < merged.back().end)
+      fatal("pragma/sideband",
+            "overlapping separately-owned sideband replay ranges "
+            "[{0},{1}) and [{2},{3})",
+            merged.back().begin, merged.back().end, range.begin, range.end);
+    if (!merged.empty() && range.begin == merged.back().end) {
+      merged.back().end = range.end;
+      continue;
+    }
+    merged.push_back(range);
+  }
+
+  std::string out;
+  out.reserve(replayText.size());
+  uint64_t cursor = 0;
+  for (const RemovalRange &range : merged) {
+    out.append(replayText.slice(static_cast<size_t>(cursor),
+                                static_cast<size_t>(range.begin))
+                   .str());
+    cursor = range.end;
+  }
+  out.append(replayText.drop_front(static_cast<size_t>(cursor)).str());
+
+  trace("pragma/sideband",
+        "stripped separately-owned sideband replay from ordinary payload "
+        "B=[{0},{1}) beforeLen={2} afterLen={3}",
+        *replayBByteBegin, *replayBByteEnd, replayText.size(), out.size());
+  return out;
 }
 
 std::optional<std::pair<uint64_t, uint64_t>>

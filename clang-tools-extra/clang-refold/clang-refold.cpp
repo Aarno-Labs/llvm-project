@@ -1483,11 +1483,78 @@ static std::vector<SidebandPragmaItemBinding> mapSidebandLinesToPragmaItems(
   std::set<std::pair<size_t, uint64_t>> used;
   constexpr uint64_t NoOwner = std::numeric_limits<uint64_t>::max();
 
+  struct Candidate {
+    size_t pragmaIndex = 0;
+    std::optional<uint64_t> ownerIncludeId = std::nullopt;
+  };
+
+  struct ZeroTokenReplayAtom {
+    size_t pragmaIndex = 0;
+    uint64_t ownerIncludeId = 0;
+  };
+
+  // Headers that emit only sideband pragma lines have no ordinary-token span,
+  // so all of their replayed pragmas share the same normal-token gap.  Binding
+  // those lines by "first unused physical pragma" is not enough for repeated
+  // includes with duplicate pragma spelling: the second replay line could bind
+  // either to the second physical pragma in the first include or the first
+  // physical pragma in the second include.
+  //
+  // The refold map still gives a deterministic replay product:
+  //
+  //   include occurrence order × physical pragma source order
+  //
+  // Build that product once and use it as the binding witness for zero-token
+  // headers.  This is not a preference heuristic; it is the producer's replay
+  // order projected onto concrete include ids and physical pragma ordinals.
+  std::vector<ZeroTokenReplayAtom> zeroTokenReplayOrder;
+  for (const JsonIncludeItemForSideband &inc : includes) {
+    if (!inc.spans.empty())
+      continue;
+
+    std::vector<size_t> physicalPragmas;
+    for (size_t j = 0; j < pragmas.size(); ++j)
+      if (pragmas[j].sitePath == inc.resolvedPath)
+        physicalPragmas.push_back(j);
+
+    std::stable_sort(physicalPragmas.begin(), physicalPragmas.end(),
+                     [&](size_t lhs, size_t rhs) {
+      if (pragmas[lhs].siteB != pragmas[rhs].siteB)
+        return pragmas[lhs].siteB < pragmas[rhs].siteB;
+      return pragmas[lhs].id < pragmas[rhs].id;
+    });
+
+    for (size_t pragmaIndex : physicalPragmas)
+      zeroTokenReplayOrder.push_back(ZeroTokenReplayAtom{pragmaIndex, inc.id});
+  }
+
+  auto tryBindZeroTokenReplayAtom = [&](const SidebandPragmaLine &line)
+      -> std::optional<Candidate> {
+    for (const ZeroTokenReplayAtom &atom : zeroTokenReplayOrder) {
+      const uint64_t ownerKey = atom.ownerIncludeId;
+      if (used.find(std::make_pair(atom.pragmaIndex, ownerKey)) != used.end())
+        continue;
+
+      const JsonPragmaItem &pragma = pragmas[atom.pragmaIndex];
+      if (pragma.canonicalText != line.canonicalText)
+        continue;
+
+      return Candidate{atom.pragmaIndex, atom.ownerIncludeId};
+    }
+    return std::nullopt;
+  };
+
   for (size_t i = 0; i < lines.size(); ++i) {
-    struct Candidate {
-      size_t pragmaIndex = 0;
-      std::optional<uint64_t> ownerIncludeId = std::nullopt;
-    };
+    if (std::optional<Candidate> zeroTokenCandidate =
+            tryBindZeroTokenReplayAtom(lines[i])) {
+      const uint64_t ownerKey = *zeroTokenCandidate->ownerIncludeId;
+      used.insert(std::make_pair(zeroTokenCandidate->pragmaIndex, ownerKey));
+      out[i].pragmaIndex =
+          static_cast<int64_t>(zeroTokenCandidate->pragmaIndex);
+      out[i].ownerIncludeId = zeroTokenCandidate->ownerIncludeId;
+      continue;
+    }
+
     std::vector<Candidate> candidates;
 
     for (size_t j = 0; j < pragmas.size(); ++j) {
@@ -1501,22 +1568,6 @@ static std::vector<SidebandPragmaItemBinding> mapSidebandLinesToPragmaItems(
                                   !StringRef(pragma.sitePath).starts_with("<") &&
                                   sitePathHasIncludeInstance(pragma.sitePath,
                                                              includes);
-      if (isHeaderPragma && !owner) {
-        // A header that produces only sideband directives has no ordinary-token
-        // include span, so every replayed pragma lands at the same normal-token
-        // gap.  The map still gives the concrete include directives in replay
-        // order and the physical pragma items in header source order; bind each
-        // physical pragma once per zero-token include occurrence instead of
-        // treating the shared gap as ambiguous.
-        for (const JsonIncludeItemForSideband &inc : includes) {
-          if (inc.resolvedPath != pragma.sitePath || !inc.spans.empty())
-            continue;
-          if (used.find(std::make_pair(j, inc.id)) != used.end())
-            continue;
-          owner = inc.id;
-          break;
-        }
-      }
       if (isHeaderPragma && !owner)
         continue;
 
@@ -1542,8 +1593,8 @@ static std::vector<SidebandPragmaItemBinding> mapSidebandLinesToPragmaItems(
       continue;
 
     // Multiple identical physical pragmas in the same source owner replay in
-    // map order.  This preserves the old TU behavior while allowing a single
-    // header pragma item to bind once per include occurrence.
+    // map/source order.  Repeated zero-token include occurrences were handled
+    // above by the stronger include-occurrence × physical-ordinal product.
     const Candidate chosen = candidates.front();
     const uint64_t ownerKey = chosen.ownerIncludeId ? *chosen.ownerIncludeId
                                                     : NoOwner;
