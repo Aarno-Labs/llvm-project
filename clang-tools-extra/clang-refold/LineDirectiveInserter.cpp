@@ -639,7 +639,7 @@ public:
   explicit LineControlIfExpressionParser(StringRef expr) : expr_(expr) {}
 
   std::optional<int64_t> parseCompleteExpression() {
-    std::optional<int64_t> value = parseLogicalOr();
+    std::optional<int64_t> value = parseConditional();
     skipHorizontalWhitespace();
     if (!value || pos_ != expr_.size())
       return std::nullopt;
@@ -677,6 +677,38 @@ private:
       return false;
     ++pos_;
     return true;
+  }
+
+  /// Parse the C conditional operator, whose precedence is lower than logical
+  /// OR and whose associativity is right-to-left. This matters for active-arm
+  /// proof of source line-control state because otherwise valid guards such as
+  /// `#if 1 ? (1 ? (1 - 1) : 1) : 0` fall through to the conservative
+  /// unknown-active path and let inactive macro definitions affect later
+  /// `#line MACRO` recovery.
+  std::optional<int64_t> parseConditional() {
+    std::optional<int64_t> condition = parseLogicalOr();
+    if (!condition)
+      return std::nullopt;
+
+    skipHorizontalWhitespace();
+    if (pos_ >= expr_.size() || expr_[pos_] != '?')
+      return condition;
+    ++pos_;
+
+    std::optional<int64_t> trueValue = parseConditional();
+    if (!trueValue)
+      return std::nullopt;
+
+    skipHorizontalWhitespace();
+    if (pos_ >= expr_.size() || expr_[pos_] != ':')
+      return std::nullopt;
+    ++pos_;
+
+    std::optional<int64_t> falseValue = parseConditional();
+    if (!falseValue)
+      return std::nullopt;
+
+    return *condition != 0 ? *trueValue : *falseValue;
   }
 
   std::optional<int64_t> parseLogicalOr() {
@@ -912,7 +944,7 @@ private:
 
     if (expr_[pos_] == '(') {
       ++pos_;
-      std::optional<int64_t> value = parseLogicalOr();
+      std::optional<int64_t> value = parseConditional();
       skipHorizontalWhitespace();
       if (pos_ >= expr_.size() || expr_[pos_] != ')')
         return std::nullopt;
@@ -920,9 +952,15 @@ private:
       return value;
     }
 
+    if (std::optional<int64_t> charValue = parseCharacterConstant())
+      return charValue;
+
+    if (expr_[pos_] == '"')
+      return std::nullopt;
+
     if (stringutils::isIdentStart(expr_[pos_])) {
       // After macro expansion and `defined` handling, remaining identifiers in
-      // #if expressions have preprocessing value zero.  Modeling that rule lets
+      // #if expressions have preprocessing value zero. Modeling that rule lets
       // the owner-local scanner prove ordinary guards without importing Clang's
       // full expression evaluator.
       ++pos_;
@@ -931,10 +969,114 @@ private:
       return 0;
     }
 
-    if (expr_[pos_] == '\'' || expr_[pos_] == '"')
+    return parseIntegerLiteral();
+  }
+
+  std::optional<int64_t> parseCharacterConstant() {
+    skipHorizontalWhitespace();
+    size_t p = pos_;
+
+    // Accept ordinary and prefixed character constants in preprocessing
+    // integer expressions. The exact value of wide and multicharacter
+    // constants is implementation-defined; this owner-local proof only needs
+    // a deterministic value for active-arm recovery, and it must correctly
+    // handle ordinary arithmetic such as `'A' - 'A'`.
+    if (p + 2 < expr_.size() && expr_.substr(p, 2) == "u8" &&
+        expr_[p + 2] == '\'') {
+      p += 2;
+    } else if (p + 1 < expr_.size() &&
+               (expr_[p] == 'L' || expr_[p] == 'u' || expr_[p] == 'U') &&
+               expr_[p + 1] == '\'') {
+      ++p;
+    }
+
+    if (p >= expr_.size() || expr_[p] != '\'')
+      return std::nullopt;
+    ++p;
+
+    bool sawChar = false;
+    int64_t value = 0;
+    while (p < expr_.size() && expr_[p] != '\'') {
+      std::optional<unsigned> c = readCharacterConstantElement(p);
+      if (!c)
+        return std::nullopt;
+      sawChar = true;
+      value = (value << 8) | static_cast<int64_t>(*c & 0xffu);
+    }
+
+    if (!sawChar || p >= expr_.size() || expr_[p] != '\'')
+      return std::nullopt;
+    pos_ = p + 1;
+    return value;
+  }
+
+  std::optional<unsigned> readCharacterConstantElement(size_t &p) {
+    if (p >= expr_.size())
       return std::nullopt;
 
-    return parseIntegerLiteral();
+    unsigned char c = static_cast<unsigned char>(expr_[p++]);
+    if (c != '\\')
+      return static_cast<unsigned>(c);
+
+    if (p >= expr_.size())
+      return std::nullopt;
+
+    char esc = expr_[p++];
+    switch (esc) {
+    case '\'':
+      return static_cast<unsigned>('\'');
+    case '"':
+      return static_cast<unsigned>('"');
+    case '?':
+      return static_cast<unsigned>('?');
+    case '\\':
+      return static_cast<unsigned>('\\');
+    case 'a':
+      return 7;
+    case 'b':
+      return 8;
+    case 'f':
+      return 12;
+    case 'n':
+      return 10;
+    case 'r':
+      return 13;
+    case 't':
+      return 9;
+    case 'v':
+      return 11;
+    case 'x': {
+      unsigned value = 0;
+      const size_t digitsBegin = p;
+      while (p < expr_.size() &&
+             std::isxdigit(static_cast<unsigned char>(expr_[p]))) {
+        char h = expr_[p++];
+        value *= 16;
+        if ('0' <= h && h <= '9')
+          value += static_cast<unsigned>(h - '0');
+        else if ('a' <= h && h <= 'f')
+          value += static_cast<unsigned>(h - 'a' + 10);
+        else
+          value += static_cast<unsigned>(h - 'A' + 10);
+      }
+      if (digitsBegin == p)
+        return std::nullopt;
+      return value;
+    }
+    default:
+      if ('0' <= esc && esc <= '7') {
+        unsigned value = static_cast<unsigned>(esc - '0');
+        unsigned count = 1;
+        while (count < 3 && p < expr_.size() && '0' <= expr_[p] &&
+               expr_[p] <= '7') {
+          value = value * 8 + static_cast<unsigned>(expr_[p] - '0');
+          ++p;
+          ++count;
+        }
+        return value;
+      }
+      return static_cast<unsigned>(static_cast<unsigned char>(esc));
+    }
   }
 
   std::optional<int64_t> parseIntegerLiteral() {
