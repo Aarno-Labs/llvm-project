@@ -3,6 +3,9 @@
 #include "StringUtils.h"
 #include <algorithm>
 #include <cctype>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <llvm/ADT/SmallString.h>
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Support/FileSystem.h>
@@ -11,6 +14,186 @@ using namespace llvm;
 
 namespace clang {
 namespace refold {
+
+namespace {
+
+using LineControlMacroMap = std::unordered_map<std::string, std::string>;
+
+static StringRef trimHorizontal(StringRef text) {
+  size_t begin = 0;
+  while (begin < text.size() && stringutils::isWs(text[begin]) &&
+         text[begin] != '\n')
+    ++begin;
+
+  size_t end = text.size();
+  while (end > begin && stringutils::isWs(text[end - 1]) &&
+         text[end - 1] != '\n')
+    --end;
+  return text.slice(begin, end);
+}
+
+static std::string expandObjectMacrosInLineControlOperand(
+    StringRef text, const LineControlMacroMap &macros,
+    std::unordered_set<std::string> &disabled) {
+  std::string out;
+  out.reserve(text.size());
+
+  for (size_t i = 0; i < text.size();) {
+    char c = text[i];
+
+    // Macro replacement is not performed inside string or character literals.
+    // This matters for filename operands, where the literal spelling is the
+    // operand that line-control parsing must later decode as a C string.
+    if (c == '"' || c == '\'') {
+      const char quote = c;
+      out.push_back(c);
+      ++i;
+      while (i < text.size()) {
+        char q = text[i++];
+        out.push_back(q);
+        if (q == '\\' && i < text.size()) {
+          out.push_back(text[i++]);
+          continue;
+        }
+        if (q == quote)
+          break;
+      }
+      continue;
+    }
+
+    if (!stringutils::isIdentStart(c)) {
+      out.push_back(c);
+      ++i;
+      continue;
+    }
+
+    const size_t nameBegin = i;
+    ++i;
+    while (i < text.size() && stringutils::isIdentPart(text[i]))
+      ++i;
+
+    std::string name = text.slice(nameBegin, i).str();
+    auto found = macros.find(name);
+    if (found == macros.end() || disabled.count(name)) {
+      out += name;
+      continue;
+    }
+
+    // Object-like macro expansion for line-control operands is recursive, but
+    // a macro currently being expanded is disabled. This mirrors the essential
+    // C preprocessor invariant needed here without trying to refold arbitrary
+    // macro programs in the line-directive inserter.
+    disabled.insert(name);
+    out += expandObjectMacrosInLineControlOperand(found->second, macros,
+                                                  disabled);
+    disabled.erase(name);
+  }
+
+  return out;
+}
+
+static std::string expandObjectMacrosInLineControlOperand(
+    StringRef text, const LineControlMacroMap &macros) {
+  std::unordered_set<std::string> disabled;
+  return expandObjectMacrosInLineControlOperand(text, macros, disabled);
+}
+
+static bool lineStartsWithHash(StringRef line, size_t &p, size_t to) {
+  while (p < to && stringutils::isWs(line[p]) && line[p] != '\n')
+    ++p;
+  if (p >= to || line[p] != '#')
+    return false;
+  ++p;
+  while (p < to && stringutils::isWs(line[p]) && line[p] != '\n')
+    ++p;
+  return true;
+}
+
+static bool readDirectiveIdentifier(StringRef line, size_t &p, size_t to,
+                                    StringRef &ident) {
+  if (p >= to || !stringutils::isIdentStart(line[p]))
+    return false;
+  const size_t begin = p;
+  ++p;
+  while (p < to && stringutils::isIdentPart(line[p]))
+    ++p;
+  ident = line.slice(begin, p);
+  return true;
+}
+
+static void updateLineControlMacroEnvironment(StringRef line,
+                                              LineControlMacroMap &macros) {
+  const size_t to = line.size();
+  size_t p = 0;
+  if (!lineStartsWithHash(line, p, to))
+    return;
+
+  StringRef directive;
+  if (!readDirectiveIdentifier(line, p, to, directive))
+    return;
+
+  if (directive == "undef") {
+    while (p < to && stringutils::isWs(line[p]) && line[p] != '\n')
+      ++p;
+    StringRef name;
+    if (readDirectiveIdentifier(line, p, to, name))
+      macros.erase(name.str());
+    return;
+  }
+
+  if (directive != "define")
+    return;
+
+  if (p >= to || !stringutils::isWs(line[p]) || line[p] == '\n')
+    return;
+  while (p < to && stringutils::isWs(line[p]) && line[p] != '\n')
+    ++p;
+
+  StringRef name;
+  const size_t nameBegin = p;
+  if (!readDirectiveIdentifier(line, p, to, name))
+    return;
+
+  // Function-like macros have '(' immediately after the macro name. They are
+  // deliberately not modeled here: line-control recovery only needs a
+  // deterministic object-like macro environment. Unsupported line-control
+  // macro programs remain unexpanded rather than guessed.
+  if (p < to && line[p] == '(') {
+    macros.erase(line.slice(nameBegin, p).str());
+    return;
+  }
+
+  StringRef replacement = trimHorizontal(line.substr(p));
+  macros[name.str()] = replacement.str();
+}
+
+static std::string expandSourceLineControlDirective(
+    StringRef line, const LineControlMacroMap &macros) {
+  const size_t to = line.size();
+  size_t p = 0;
+  if (!lineStartsWithHash(line, p, to))
+    return line.str();
+
+  // Macro expansion in line-control directives happens after the `line`
+  // directive name. The numeric `# 123 "file"` spelling has no directive-name
+  // operand to expand before the required number, so raw parsing is sufficient
+  // for that form.
+  if (p + 4 > to || line.substr(p, 4) != "line")
+    return line.str();
+
+  const size_t afterKeyword = p + 4;
+  if (afterKeyword < to && !stringutils::isWs(line[afterKeyword]))
+    return line.str();
+
+  std::string expanded;
+  expanded.reserve(line.size());
+  expanded += line.substr(0, afterKeyword).str();
+  expanded += expandObjectMacrosInLineControlOperand(line.substr(afterKeyword),
+                                                     macros);
+  return expanded;
+}
+
+} // namespace
 
 LineDirectiveInserter::LineDirectiveInserter(bool enabled, StringRef cwd)
     : enabled_(enabled), cwd_(cwd) {}
@@ -49,19 +232,36 @@ LineDirectiveLocation LineDirectiveInserter::LogicalLocationAtOffset(
   size_t activeAfterDirectiveIdx = 0;
   bool sawLineDirective = false;
 
+  LineControlMacroMap lineControlMacros;
   for (size_t lineStart = 0; lineStart < prefix.size();) {
     size_t lineEnd = prefix.find('\n', lineStart);
     if (lineEnd == StringRef::npos)
       lineEnd = prefix.size();
 
+    StringRef physicalLine = prefix.slice(lineStart, lineEnd);
+
+    // Source line-control directives are interpreted by the preprocessor after
+    // macro expansion of their operands.  Recover the deterministic object-like
+    // macro environment from prior source directives before parsing the current
+    // line as `#line ...`.  This keeps resync proof local to the owner text:
+    // no owner attribution or edit selection changes are made here.
+    std::string expandedLine =
+        expandSourceLineControlDirective(physicalLine, lineControlMacros);
     if (std::optional<LineDirectiveState> state =
-            ParseLineDirective(prefix, lineStart, lineEnd)) {
+            ParseLineDirective(StringRef(expandedLine), 0,
+                               expandedLine.size())) {
       sawLineDirective = true;
       if (state->hasFileSpelling)
         activeFile = state->fileSpelling;
       activeLineAfterDirective = state->lineAfterDir;
-      activeAfterDirectiveIdx = state->afterDirIdx;
+      // The active line state starts after the physical directive line, not
+      // after the temporary expanded spelling used only for operand parsing.
+      activeAfterDirectiveIdx =
+          (lineEnd < prefix.size() && prefix[lineEnd] == '\n') ? lineEnd + 1
+                                                               : lineEnd;
     }
+
+    updateLineControlMacroEnvironment(physicalLine, lineControlMacros);
 
     if (lineEnd == prefix.size())
       break;
@@ -395,9 +595,48 @@ LineDirectiveInserter::ParseLineDirective(StringRef src, size_t from,
         break;
       if (c == '\\' && p < to) {
         char escaped = src[p++];
+        if (escaped == 'x' || escaped == 'X') {
+          // #line filename operands are C string literals after macro
+          // expansion. Decode \x... to the logical filename byte before
+          // formatting a resync directive; otherwise __FILE__ observes the raw
+          // source spelling instead of the preprocessing result.
+          unsigned value = 0;
+          bool sawHex = false;
+          while (p < to && std::isxdigit(static_cast<unsigned char>(src[p]))) {
+            sawHex = true;
+            char h = src[p++];
+            value *= 16;
+            if (h >= '0' && h <= '9')
+              value += static_cast<unsigned>(h - '0');
+            else if (h >= 'a' && h <= 'f')
+              value += static_cast<unsigned>(10 + h - 'a');
+            else if (h >= 'A' && h <= 'F')
+              value += static_cast<unsigned>(10 + h - 'A');
+          }
+          if (sawHex) {
+            fileSpelling.push_back(static_cast<char>(value & 0xff));
+          } else {
+            fileSpelling.push_back(escaped);
+          }
+          continue;
+        }
+
+        if (escaped >= '0' && escaped <= '7') {
+          unsigned value = static_cast<unsigned>(escaped - '0');
+          for (unsigned digits = 1;
+               digits < 3 && p < to && src[p] >= '0' && src[p] <= '7';
+               ++digits) {
+            value = value * 8 + static_cast<unsigned>(src[p++] - '0');
+          }
+          fileSpelling.push_back(static_cast<char>(value & 0xff));
+          continue;
+        }
+
         switch (escaped) {
         case '"':
         case '\\':
+        case '?':
+        case '\'':
           fileSpelling.push_back(escaped);
           break;
         case 'a':

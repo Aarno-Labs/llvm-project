@@ -308,8 +308,8 @@ private:
   ///     # line <digits> ["file"]
   ///     # <digits> ["file"]
   ///
-  /// Within the quoted file spelling, it decodes the same conservative escape
-  /// set produced by EscapeForLineDirective(). The optional filename operand is
+  /// Within the quoted file spelling, it decodes C string-literal escapes used
+  /// by line-control filename operands. The optional filename operand is
   /// tracked separately from an explicitly empty filename string so callers can
   /// model `#line 200` as preserving the current file spelling.
   ///
