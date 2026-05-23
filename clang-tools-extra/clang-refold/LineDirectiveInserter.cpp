@@ -649,6 +649,9 @@ public:
 private:
   StringRef expr_;
   size_t pos_ = 0;
+  unsigned discardedEvaluationDepth_ = 0;
+
+  bool shouldEvaluate() const { return discardedEvaluationDepth_ == 0; }
 
   void skipHorizontalWhitespace() {
     while (pos_ < expr_.size() && isHorizontalWhitespace(expr_[pos_]))
@@ -679,12 +682,58 @@ private:
     return true;
   }
 
-  /// Parse the C conditional operator, whose precedence is lower than logical
-  /// OR and whose associativity is right-to-left. This matters for active-arm
-  /// proof of source line-control state because otherwise valid guards such as
-  /// `#if 1 ? (1 ? (1 - 1) : 1) : 0` fall through to the conservative
-  /// unknown-active path and let inactive macro definitions affect later
-  /// `#line MACRO` recovery.
+  std::optional<int64_t> parseDiscardedExpression() {
+    ++discardedEvaluationDepth_;
+    std::optional<int64_t> value = parseExpression();
+    --discardedEvaluationDepth_;
+    if (!value)
+      return std::nullopt;
+    return 0;
+  }
+
+  std::optional<int64_t> parseDiscardedConditional() {
+    ++discardedEvaluationDepth_;
+    std::optional<int64_t> value = parseConditional();
+    --discardedEvaluationDepth_;
+    if (!value)
+      return std::nullopt;
+    return 0;
+  }
+
+  std::optional<int64_t> parseDiscardedLogicalAnd() {
+    ++discardedEvaluationDepth_;
+    std::optional<int64_t> value = parseLogicalAnd();
+    --discardedEvaluationDepth_;
+    if (!value)
+      return std::nullopt;
+    return 0;
+  }
+
+  /// Parse the comma operator at the expression level.  The middle operand of
+  /// the C conditional operator is an expression rather than another
+  /// conditional-expression, so this level is required to model guards such as
+  /// `#if 1 ? 0, 0 : 1` without treating the selected arm as unknown.
+  std::optional<int64_t> parseExpression() {
+    std::optional<int64_t> value = parseConditional();
+    if (!value)
+      return std::nullopt;
+
+    while (consume(",")) {
+      std::optional<int64_t> rhs = parseConditional();
+      if (!rhs)
+        return std::nullopt;
+      value = shouldEvaluate() ? rhs : std::optional<int64_t>(0);
+    }
+    return value;
+  }
+
+  /// Parse the C conditional operator.  Its condition and false arm are
+  /// conditional-expressions, while the true arm is a full expression, and the
+  /// selected arm is the only arm whose value is evaluated.  The parser still
+  /// consumes the skipped arm syntactically, but it disables value evaluation
+  /// while doing so.  This is the line-control proof invariant: an arm-local
+  /// `#define` or `#line` may affect resync only when the active arm was proven
+  /// using the same short-circuit rules as the preprocessor.
   std::optional<int64_t> parseConditional() {
     std::optional<int64_t> condition = parseLogicalOr();
     if (!condition)
@@ -695,8 +744,34 @@ private:
       return condition;
     ++pos_;
 
-    std::optional<int64_t> trueValue = parseConditional();
-    if (!trueValue)
+    if (!shouldEvaluate()) {
+      if (!parseExpression())
+        return std::nullopt;
+      skipHorizontalWhitespace();
+      if (pos_ >= expr_.size() || expr_[pos_] != ':')
+        return std::nullopt;
+      ++pos_;
+      if (!parseConditional())
+        return std::nullopt;
+      return 0;
+    }
+
+    if (*condition != 0) {
+      std::optional<int64_t> trueValue = parseExpression();
+      if (!trueValue)
+        return std::nullopt;
+
+      skipHorizontalWhitespace();
+      if (pos_ >= expr_.size() || expr_[pos_] != ':')
+        return std::nullopt;
+      ++pos_;
+
+      if (!parseDiscardedConditional())
+        return std::nullopt;
+      return trueValue;
+    }
+
+    if (!parseDiscardedExpression())
       return std::nullopt;
 
     skipHorizontalWhitespace();
@@ -704,11 +779,7 @@ private:
       return std::nullopt;
     ++pos_;
 
-    std::optional<int64_t> falseValue = parseConditional();
-    if (!falseValue)
-      return std::nullopt;
-
-    return *condition != 0 ? *trueValue : *falseValue;
+    return parseConditional();
   }
 
   std::optional<int64_t> parseLogicalOr() {
@@ -716,10 +787,18 @@ private:
     if (!lhs)
       return std::nullopt;
     while (consume("||")) {
+      if (shouldEvaluate() && *lhs != 0) {
+        if (!parseDiscardedLogicalAnd())
+          return std::nullopt;
+        lhs = 1;
+        continue;
+      }
+
       std::optional<int64_t> rhs = parseLogicalAnd();
       if (!rhs)
         return std::nullopt;
-      lhs = ((*lhs != 0) || (*rhs != 0)) ? 1 : 0;
+      lhs = shouldEvaluate() ? (((*lhs != 0) || (*rhs != 0)) ? 1 : 0)
+                             : 0;
     }
     return lhs;
   }
@@ -729,10 +808,21 @@ private:
     if (!lhs)
       return std::nullopt;
     while (consume("&&")) {
+      if (shouldEvaluate() && *lhs == 0) {
+        ++discardedEvaluationDepth_;
+        std::optional<int64_t> rhs = parseBitwiseOr();
+        --discardedEvaluationDepth_;
+        if (!rhs)
+          return std::nullopt;
+        lhs = 0;
+        continue;
+      }
+
       std::optional<int64_t> rhs = parseBitwiseOr();
       if (!rhs)
         return std::nullopt;
-      lhs = ((*lhs != 0) && (*rhs != 0)) ? 1 : 0;
+      lhs = shouldEvaluate() ? (((*lhs != 0) && (*rhs != 0)) ? 1 : 0)
+                             : 0;
     }
     return lhs;
   }
@@ -745,7 +835,7 @@ private:
       std::optional<int64_t> rhs = parseBitwiseXor();
       if (!rhs)
         return std::nullopt;
-      lhs = *lhs | *rhs;
+      lhs = shouldEvaluate() ? (*lhs | *rhs) : 0;
     }
     return lhs;
   }
@@ -758,7 +848,7 @@ private:
       std::optional<int64_t> rhs = parseBitwiseAnd();
       if (!rhs)
         return std::nullopt;
-      lhs = *lhs ^ *rhs;
+      lhs = shouldEvaluate() ? (*lhs ^ *rhs) : 0;
     }
     return lhs;
   }
@@ -771,7 +861,7 @@ private:
       std::optional<int64_t> rhs = parseEquality();
       if (!rhs)
         return std::nullopt;
-      lhs = *lhs & *rhs;
+      lhs = shouldEvaluate() ? (*lhs & *rhs) : 0;
     }
     return lhs;
   }
@@ -785,14 +875,14 @@ private:
         std::optional<int64_t> rhs = parseRelational();
         if (!rhs)
           return std::nullopt;
-        lhs = (*lhs == *rhs) ? 1 : 0;
+        lhs = shouldEvaluate() ? ((*lhs == *rhs) ? 1 : 0) : 0;
         continue;
       }
       if (consume("!=")) {
         std::optional<int64_t> rhs = parseRelational();
         if (!rhs)
           return std::nullopt;
-        lhs = (*lhs != *rhs) ? 1 : 0;
+        lhs = shouldEvaluate() ? ((*lhs != *rhs) ? 1 : 0) : 0;
         continue;
       }
       return lhs;
@@ -808,28 +898,28 @@ private:
         std::optional<int64_t> rhs = parseShift();
         if (!rhs)
           return std::nullopt;
-        lhs = (*lhs <= *rhs) ? 1 : 0;
+        lhs = shouldEvaluate() ? ((*lhs <= *rhs) ? 1 : 0) : 0;
         continue;
       }
       if (consume(">=")) {
         std::optional<int64_t> rhs = parseShift();
         if (!rhs)
           return std::nullopt;
-        lhs = (*lhs >= *rhs) ? 1 : 0;
+        lhs = shouldEvaluate() ? ((*lhs >= *rhs) ? 1 : 0) : 0;
         continue;
       }
       if (consume("<")) {
         std::optional<int64_t> rhs = parseShift();
         if (!rhs)
           return std::nullopt;
-        lhs = (*lhs < *rhs) ? 1 : 0;
+        lhs = shouldEvaluate() ? ((*lhs < *rhs) ? 1 : 0) : 0;
         continue;
       }
       if (consume(">")) {
         std::optional<int64_t> rhs = parseShift();
         if (!rhs)
           return std::nullopt;
-        lhs = (*lhs > *rhs) ? 1 : 0;
+        lhs = shouldEvaluate() ? ((*lhs > *rhs) ? 1 : 0) : 0;
         continue;
       }
       return lhs;
@@ -843,16 +933,16 @@ private:
     for (;;) {
       if (consume("<<")) {
         std::optional<int64_t> rhs = parseAdditive();
-        if (!rhs || *rhs < 0 || *rhs >= 63)
+        if (!rhs || (shouldEvaluate() && (*rhs < 0 || *rhs >= 63)))
           return std::nullopt;
-        lhs = *lhs << *rhs;
+        lhs = shouldEvaluate() ? (*lhs << *rhs) : 0;
         continue;
       }
       if (consume(">>")) {
         std::optional<int64_t> rhs = parseAdditive();
-        if (!rhs || *rhs < 0 || *rhs >= 63)
+        if (!rhs || (shouldEvaluate() && (*rhs < 0 || *rhs >= 63)))
           return std::nullopt;
-        lhs = *lhs >> *rhs;
+        lhs = shouldEvaluate() ? (*lhs >> *rhs) : 0;
         continue;
       }
       return lhs;
@@ -868,14 +958,14 @@ private:
         std::optional<int64_t> rhs = parseMultiplicative();
         if (!rhs)
           return std::nullopt;
-        lhs = *lhs + *rhs;
+        lhs = shouldEvaluate() ? (*lhs + *rhs) : 0;
         continue;
       }
       if (consume("-")) {
         std::optional<int64_t> rhs = parseMultiplicative();
         if (!rhs)
           return std::nullopt;
-        lhs = *lhs - *rhs;
+        lhs = shouldEvaluate() ? (*lhs - *rhs) : 0;
         continue;
       }
       return lhs;
@@ -891,21 +981,21 @@ private:
         std::optional<int64_t> rhs = parseUnary();
         if (!rhs)
           return std::nullopt;
-        lhs = *lhs * *rhs;
+        lhs = shouldEvaluate() ? (*lhs * *rhs) : 0;
         continue;
       }
       if (consume("/")) {
         std::optional<int64_t> rhs = parseUnary();
-        if (!rhs || *rhs == 0)
+        if (!rhs || (shouldEvaluate() && *rhs == 0))
           return std::nullopt;
-        lhs = *lhs / *rhs;
+        lhs = shouldEvaluate() ? (*lhs / *rhs) : 0;
         continue;
       }
       if (consume("%")) {
         std::optional<int64_t> rhs = parseUnary();
-        if (!rhs || *rhs == 0)
+        if (!rhs || (shouldEvaluate() && *rhs == 0))
           return std::nullopt;
-        lhs = *lhs % *rhs;
+        lhs = shouldEvaluate() ? (*lhs % *rhs) : 0;
         continue;
       }
       return lhs;
@@ -920,19 +1010,19 @@ private:
       std::optional<int64_t> value = parseUnary();
       if (!value)
         return std::nullopt;
-      return -*value;
+      return shouldEvaluate() ? -*value : 0;
     }
     if (consume("!")) {
       std::optional<int64_t> value = parseUnary();
       if (!value)
         return std::nullopt;
-      return *value == 0 ? 1 : 0;
+      return shouldEvaluate() ? (*value == 0 ? 1 : 0) : 0;
     }
     if (consume("~")) {
       std::optional<int64_t> value = parseUnary();
       if (!value)
         return std::nullopt;
-      return ~*value;
+      return shouldEvaluate() ? ~*value : 0;
     }
     return parsePrimary();
   }
@@ -944,7 +1034,7 @@ private:
 
     if (expr_[pos_] == '(') {
       ++pos_;
-      std::optional<int64_t> value = parseConditional();
+      std::optional<int64_t> value = parseExpression();
       skipHorizontalWhitespace();
       if (pos_ >= expr_.size() || expr_[pos_] != ')')
         return std::nullopt;
@@ -977,16 +1067,20 @@ private:
     size_t p = pos_;
 
     // Accept ordinary and prefixed character constants in preprocessing
-    // integer expressions. The exact value of wide and multicharacter
-    // constants is implementation-defined; this owner-local proof only needs
-    // a deterministic value for active-arm recovery, and it must correctly
-    // handle ordinary arithmetic such as `'A' - 'A'`.
+    // integer expressions.  Ordinary narrow constants are kept compatible with
+    // the previous deterministic low-byte fold, while single wide / Unicode
+    // character constants preserve the decoded code point.  That gives the
+    // line-control proof the same selected arm for common guards such as
+    // `#if L'\u0100' == 256` without pretending to model every target-specific
+    // multi-character representation.
+    bool preserveSingleCodePoint = false;
     if (p + 2 < expr_.size() && expr_.substr(p, 2) == "u8" &&
         expr_[p + 2] == '\'') {
       p += 2;
     } else if (p + 1 < expr_.size() &&
                (expr_[p] == 'L' || expr_[p] == 'u' || expr_[p] == 'U') &&
                expr_[p + 1] == '\'') {
+      preserveSingleCodePoint = true;
       ++p;
     }
 
@@ -994,19 +1088,46 @@ private:
       return std::nullopt;
     ++p;
 
-    bool sawChar = false;
-    int64_t value = 0;
+    std::vector<unsigned> elements;
     while (p < expr_.size() && expr_[p] != '\'') {
       std::optional<unsigned> c = readCharacterConstantElement(p);
       if (!c)
         return std::nullopt;
-      sawChar = true;
-      value = (value << 8) | static_cast<int64_t>(*c & 0xffu);
+      elements.push_back(*c);
     }
 
-    if (!sawChar || p >= expr_.size() || expr_[p] != '\'')
+    if (elements.empty() || p >= expr_.size() || expr_[p] != '\'')
       return std::nullopt;
     pos_ = p + 1;
+
+    if (elements.size() == 1) {
+      unsigned value = elements.front();
+      if (!preserveSingleCodePoint)
+        value &= 0xffu;
+      return static_cast<int64_t>(value);
+    }
+
+    int64_t value = 0;
+    for (unsigned c : elements)
+      value = (value << 8) | static_cast<int64_t>(c & 0xffu);
+    return value;
+  }
+
+  std::optional<unsigned> readFixedHexEscape(size_t &p, unsigned digits) {
+    unsigned value = 0;
+    for (unsigned i = 0; i < digits; ++i) {
+      if (p >= expr_.size() ||
+          !std::isxdigit(static_cast<unsigned char>(expr_[p])))
+        return std::nullopt;
+      char h = expr_[p++];
+      value *= 16;
+      if ('0' <= h && h <= '9')
+        value += static_cast<unsigned>(h - '0');
+      else if ('a' <= h && h <= 'f')
+        value += static_cast<unsigned>(h - 'a' + 10);
+      else
+        value += static_cast<unsigned>(h - 'A' + 10);
+    }
     return value;
   }
 
@@ -1045,6 +1166,10 @@ private:
       return 9;
     case 'v':
       return 11;
+    case 'u':
+      return readFixedHexEscape(p, 4);
+    case 'U':
+      return readFixedHexEscape(p, 8);
     case 'x': {
       unsigned value = 0;
       const size_t digitsBegin = p;
