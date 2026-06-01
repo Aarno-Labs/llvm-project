@@ -3707,13 +3707,49 @@ private:
     bool Empty() const { return nodes.empty(); }
   };
 
-  /// Cached Phase-4 owner/state-event graph.
+  /// Immutable indexes over producer state facts.
   ///
-  /// The refold model is immutable after construction, so the graph can be
-  /// built lazily once and reused by every suffix-observer query.  This is the
-  /// first step toward making suffix stability a graph query rather than a set
-  /// of owner-specific rescans.
+  /// Owner-state proofs ask the same questions many times while building suffix
+  /// observer graphs and checking edit-boundary transitions: "which producer
+  /// fact has this id?" and "which source-state facts are owned by this TU or
+  /// include instance?"  The model arrays are immutable after construction, so
+  /// we build these pointer indexes once per engine and keep every later query
+  /// linear only in the relevant owner-local bucket.
+  struct OwnerStateFactIndex {
+    llvm::DenseMap<uint64_t, const RefoldModel::MacroDirective *>
+        macroDirectiveById;
+    llvm::DenseMap<uint64_t, const RefoldModel::LineControlEvent *>
+        lineControlById;
+    llvm::DenseMap<uint64_t, const RefoldModel::PragmaDirective *>
+        pragmaById;
+    llvm::DenseMap<uint64_t, const RefoldModel::MacroInvocation *>
+        macroInvocationById;
+
+    llvm::DenseMap<uint64_t, std::vector<const RefoldModel::IncludeItem *>>
+        includesByParentIncludeKey;
+    llvm::DenseMap<uint64_t, std::vector<const RefoldModel::MacroDirective *>>
+        macroDirectivesByOwnerIncludeKey;
+    llvm::DenseMap<uint64_t, std::vector<const RefoldModel::LineControlEvent *>>
+        lineControlsByOwnerIncludeKey;
+    llvm::DenseMap<uint64_t, std::vector<const RefoldModel::PragmaDirective *>>
+        pragmasByOwnerIncludeKey;
+    llvm::DenseMap<uint64_t, std::vector<const RefoldModel::CondGroup *>>
+        condGroupsByParentIncludeKey;
+    llvm::DenseMap<uint64_t, std::vector<const RefoldModel::MacroInvocation *>>
+        macroInvocationsByOwnerIncludeKey;
+  };
+
+  /// Cached owner-state fact indexes and graph.
+  ///
+  /// The refold model is immutable after construction, so these structures can
+  /// be built lazily once and reused by every suffix-observer query.
+  mutable std::optional<OwnerStateFactIndex> ownerStateFactIndexCache_;
   mutable std::optional<OwnerStateGraph> ownerStateGraphCache_;
+
+  /// Non-audit cache for canonical owner deltas.  Audited runs intentionally
+  /// bypass this cache so every proof edge still contributes its diagnostic
+  /// census entry.
+  mutable llvm::StringMap<OwnerStateDelta> ownerStateDeltaCache_;
 
   /// Result of querying the preserved suffix after an edit boundary.
   ///
@@ -3736,6 +3772,25 @@ private:
     }
   };
 
+  /// Build the immutable state-fact index used by owner-state delta queries.
+  OwnerStateFactIndex BuildOwnerStateFactIndex() const;
+
+  /// Return the lazily built state-fact index.
+  const OwnerStateFactIndex &GetOwnerStateFactIndex() const;
+
+  /// Return true for virtual macro-definition streams that seed the initial
+  /// preprocessor environment but are not source-editable suffix graph events.
+  static bool IsVirtualInitialMacroDirectiveSource(StringRef sitePath);
+
+  /// DenseMap bucket key for an optional include-owner id.
+  static uint64_t OwnerIncludeBucketKey(std::optional<uint64_t> includeId);
+
+  /// Source-owner bucket used for TU/include-local fact scans.
+  static std::optional<uint64_t> OwnerSourceBucketKey(const Owner &owner);
+
+  /// Stable cache key for canonical owner-state deltas.
+  static std::string OwnerStateDeltaCacheKey(const Owner &owner);
+
   /// Build the conservative Phase-3 state summary for a concrete owner.
   ///
   /// The result is monotone: missing producer facts or unknown owner identity set
@@ -3743,6 +3798,9 @@ private:
   /// theorem-facing census primitive only; later phases decide how to consume or
   /// enforce the returned obligations.
   OwnerStateDelta BuildOwnerStateDelta(const Owner &owner) const;
+
+  /// Cached wrapper around BuildOwnerStateDelta for non-audit runs.
+  OwnerStateDelta GetOwnerStateDelta(const Owner &owner) const;
 
   /// Project producer-derived builder facts into the theorem-facing delta.
   ///

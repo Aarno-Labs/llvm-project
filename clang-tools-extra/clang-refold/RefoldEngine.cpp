@@ -108,6 +108,7 @@
 #include <optional>
 #include <string>
 #include <tuple>
+#include <type_traits>
 #include <vector>
 
 using namespace llvm;
@@ -10097,9 +10098,139 @@ bool RefoldEngine::OwnerMatchesSourceSite(
   return true;
 }
 
+uint64_t RefoldEngine::OwnerIncludeBucketKey(
+    std::optional<uint64_t> includeId) {
+  // DenseMap has no optional key here.  Reserve bucket 0 for TU/virtual-root
+  // facts and shift concrete include ids by one.  Producer ids are uint64_t, so
+  // the saturated max value is intentionally folded into the root bucket rather
+  // than risking wraparound; such an id would already be outside the normal
+  // producer-id domain.
+  if (!includeId || *includeId == std::numeric_limits<uint64_t>::max())
+    return 0;
+  return *includeId + 1;
+}
+
+std::optional<uint64_t>
+RefoldEngine::OwnerSourceBucketKey(const Owner &owner) {
+  if (owner.IsTU())
+    return OwnerIncludeBucketKey(std::nullopt);
+  if (owner.IsInclude() && owner.includeId)
+    return OwnerIncludeBucketKey(owner.includeId);
+  return std::nullopt;
+}
+
+std::string RefoldEngine::OwnerStateDeltaCacheKey(const Owner &owner) {
+  const uint64_t none = std::numeric_limits<uint64_t>::max();
+  return llvm::formatv("{0}:{1}:{2}:{3}:{4}:{5}:{6}:{7}",
+                       static_cast<unsigned>(owner.kind),
+                       owner.includeId.value_or(none),
+                       owner.macroInvocationId.value_or(none),
+                       owner.macroDirectiveId.value_or(none),
+                       owner.lineControlId.value_or(none),
+                       owner.pragmaId.value_or(none),
+                       owner.condGroupId.value_or(none),
+                       owner.condArmId.value_or(none))
+      .str();
+}
+
+bool RefoldEngine::IsVirtualInitialMacroDirectiveSource(StringRef sitePath) {
+  // Clang serializes its predefined macro environment as #define directives in
+  // the pseudo-file "<built-in>".  Those directives seed the initial macro
+  // state before any source byte in the translation unit exists; they are not
+  // source-editable directive islands and cannot be ordered as suffix observers
+  // after a TU/header edit boundary.  They remain available through the exact
+  // macro-directive index for owner-state accounting, but the graph builder must
+  // not manufacture ordinary source-order nodes for them.
+  return sitePath == "<built-in>";
+}
+
+RefoldEngine::OwnerStateFactIndex
+RefoldEngine::BuildOwnerStateFactIndex() const {
+  OwnerStateFactIndex index;
+
+  for (const RefoldModel::IncludeItem &include : model_.GetIncludes()) {
+    index.includesByParentIncludeKey[OwnerIncludeBucketKey(include.parent)]
+        .push_back(&include);
+  }
+
+  for (const RefoldModel::MacroDirective &directive :
+       model_.GetMacroDirectives()) {
+    index.macroDirectiveById[directive.id] = &directive;
+    index
+        .macroDirectivesByOwnerIncludeKey[
+            OwnerIncludeBucketKey(directive.ownerIncludeId)]
+        .push_back(&directive);
+  }
+
+  for (const RefoldModel::LineControlEvent &event : model_.GetLineControls()) {
+    index.lineControlById[event.id] = &event;
+    index.lineControlsByOwnerIncludeKey[OwnerIncludeBucketKey(event.ownerIncludeId)]
+        .push_back(&event);
+  }
+
+  for (const RefoldModel::PragmaDirective &pragma : model_.GetPragmas()) {
+    index.pragmaById[pragma.id] = &pragma;
+
+    std::optional<uint64_t> ownerIncludeId = pragma.ownerIncludeId;
+    if (!ownerIncludeId) {
+      // Older producer maps did not serialize owner_include_id for pragmas.
+      // Recover the same single-segment owner used by BuildOwnerStateDelta(),
+      // but do it once while constructing the immutable fact index.
+      for (const RefoldModel::Segment &segment :
+           model_.GetSegmentsForFile(pragma.sitePath)) {
+        if (segment.b <= pragma.siteB && pragma.siteE <= segment.e) {
+          ownerIncludeId = segment.ownerIncludeId;
+          break;
+        }
+      }
+    }
+
+    index.pragmasByOwnerIncludeKey[OwnerIncludeBucketKey(ownerIncludeId)]
+        .push_back(&pragma);
+  }
+
+  for (const RefoldModel::CondGroup &group : model_.GetConds()) {
+    index.condGroupsByParentIncludeKey[
+             OwnerIncludeBucketKey(group.parentIncludeId)]
+        .push_back(&group);
+  }
+
+  for (const RefoldModel::MacroInvocation &macro :
+       model_.GetMacroInvocations()) {
+    index.macroInvocationById[macro.id] = &macro;
+    index.macroInvocationsByOwnerIncludeKey[
+             OwnerIncludeBucketKey(macro.ownerIncludeId)]
+        .push_back(&macro);
+  }
+
+  return index;
+}
+
+const RefoldEngine::OwnerStateFactIndex &
+RefoldEngine::GetOwnerStateFactIndex() const {
+  if (!ownerStateFactIndexCache_)
+    ownerStateFactIndexCache_ = BuildOwnerStateFactIndex();
+  return *ownerStateFactIndexCache_;
+}
+
+RefoldEngine::OwnerStateDelta
+RefoldEngine::GetOwnerStateDelta(const Owner &owner) const {
+  if (IsNoLegacyAuditEnabled())
+    return BuildOwnerStateDelta(owner);
+
+  const std::string key = OwnerStateDeltaCacheKey(owner);
+  auto it = ownerStateDeltaCache_.find(key);
+  if (it != ownerStateDeltaCache_.end())
+    return it->second;
+
+  OwnerStateDelta delta = BuildOwnerStateDelta(owner);
+  ownerStateDeltaCache_[key] = delta;
+  return ownerStateDeltaCache_.find(key)->second;
+}
+
 RefoldEngine::OwnerClosure
 RefoldEngine::AttachCanonicalStateSummary(OwnerClosure closure) const {
-  OwnerStateDelta summary = BuildOwnerStateDelta(closure.owner);
+  OwnerStateDelta summary = GetOwnerStateDelta(closure.owner);
   closure.stateIn = summary;
   closure.stateOut = summary;
   closure.observers = OwnerStateDeltaToObserverSummary(summary);
@@ -10714,63 +10845,63 @@ RefoldEngine::BuildOwnerStateDelta(const Owner &owner) const {
       scanPPSpanForBuiltins(span);
   };
 
+  const OwnerStateFactIndex &stateIndex = GetOwnerStateFactIndex();
+
   if (owner.IsMacroDirective()) {
-    bool found = false;
-    for (const RefoldModel::MacroDirective &directive :
-         model_.GetMacroDirectives()) {
-      if (owner.macroDirectiveId && directive.id == *owner.macroDirectiveId) {
-        recordMacroDirective(directive);
-        found = true;
-        break;
-      }
+    const RefoldModel::MacroDirective *directive = nullptr;
+    if (owner.macroDirectiveId) {
+      auto it = stateIndex.macroDirectiveById.find(*owner.macroDirectiveId);
+      if (it != stateIndex.macroDirectiveById.end())
+        directive = it->second;
     }
-    if (!found)
+    if (directive)
+      recordMacroDirective(*directive);
+    else
       markMissingAndUnmodeled(MissingStateFactKind::MissingMacroFacts,
                               "macro directive owner id not found in producer map");
     return finalize();
   }
 
   if (owner.IsLineControlIsland()) {
-    bool found = false;
-    for (const RefoldModel::LineControlEvent &event : model_.GetLineControls()) {
-      if (owner.lineControlId && event.id == *owner.lineControlId) {
-        recordLineControl(event);
-        found = true;
-        break;
-      }
+    const RefoldModel::LineControlEvent *event = nullptr;
+    if (owner.lineControlId) {
+      auto it = stateIndex.lineControlById.find(*owner.lineControlId);
+      if (it != stateIndex.lineControlById.end())
+        event = it->second;
     }
-    if (!found)
+    if (event)
+      recordLineControl(*event);
+    else
       markMissingAndUnmodeled(MissingStateFactKind::MissingLineControlFacts,
                               "line-control owner id not found in producer map");
     return finalize();
   }
 
   if (owner.IsPragmaIsland()) {
-    bool found = false;
-    for (const RefoldModel::PragmaDirective &pragma : model_.GetPragmas()) {
-      if (owner.pragmaId && pragma.id == *owner.pragmaId) {
-        recordPragma(pragma);
-        found = true;
-        break;
-      }
+    const RefoldModel::PragmaDirective *pragma = nullptr;
+    if (owner.pragmaId) {
+      auto it = stateIndex.pragmaById.find(*owner.pragmaId);
+      if (it != stateIndex.pragmaById.end())
+        pragma = it->second;
     }
-    if (!found)
+    if (pragma)
+      recordPragma(*pragma);
+    else
       markMissingAndUnmodeled(MissingStateFactKind::MissingPragmaFacts,
                               "pragma owner id not found in producer map");
     return finalize();
   }
 
   if (owner.IsMacroInvocation()) {
-    bool found = false;
-    for (const RefoldModel::MacroInvocation &macro :
-         model_.GetMacroInvocations()) {
-      if (owner.macroInvocationId && macro.id == *owner.macroInvocationId) {
-        recordMacroInvocation(macro);
-        found = true;
-        break;
-      }
+    const RefoldModel::MacroInvocation *macro = nullptr;
+    if (owner.macroInvocationId) {
+      auto it = stateIndex.macroInvocationById.find(*owner.macroInvocationId);
+      if (it != stateIndex.macroInvocationById.end())
+        macro = it->second;
     }
-    if (!found)
+    if (macro)
+      recordMacroInvocation(*macro);
+    else
       markMissingAndUnmodeled(MissingStateFactKind::MissingMacroFacts,
                               "macro invocation owner id not found in producer map");
     return finalize();
@@ -10807,90 +10938,116 @@ RefoldEngine::BuildOwnerStateDelta(const Owner &owner) const {
   }
 
   bool exactIncludeOwnerFound = false;
-  for (const RefoldModel::IncludeItem &include : model_.GetIncludes()) {
-    if (owner.IsInclude() && owner.includeId && include.id == *owner.includeId) {
-      recordIncludeTransition(include);
+  if (owner.IsInclude() && owner.includeId) {
+    if (const RefoldModel::IncludeItem *include =
+            model_.GetIncludeById(*owner.includeId)) {
+      recordIncludeTransition(*include);
       exactIncludeOwnerFound = true;
     }
+  }
 
-    if (OwnerMatchesSourceSite(owner, include.sitePath, include.parent,
-                               include.siteB, include.siteE))
-      recordIncludeTransition(include);
+  const std::optional<uint64_t> sourceBucket = OwnerSourceBucketKey(owner);
+
+  auto lookupBucket = [](const auto &map, uint64_t key) {
+    using MapT = std::decay_t<decltype(map)>;
+    using BucketT = typename MapT::mapped_type;
+    using ValueT = typename BucketT::value_type;
+    auto it = map.find(key);
+    if (it == map.end())
+      return ArrayRef<ValueT>();
+    return ArrayRef<ValueT>(it->second);
+  };
+
+  if (sourceBucket) {
+    // All following scans are owner-local bucket scans.  The final
+    // OwnerMatchesSourceSite() predicate is intentionally retained as the
+    // theorem-facing admission gate; the index only removes irrelevant producer
+    // facts before applying the existing proof predicate.
+    for (const RefoldModel::IncludeItem *include :
+         lookupBucket(stateIndex.includesByParentIncludeKey, *sourceBucket)) {
+      if (OwnerMatchesSourceSite(owner, include->sitePath, include->parent,
+                                 include->siteB, include->siteE))
+        recordIncludeTransition(*include);
+    }
+
+    for (const RefoldModel::MacroDirective *directive :
+         lookupBucket(stateIndex.macroDirectivesByOwnerIncludeKey,
+                      *sourceBucket)) {
+      if (OwnerMatchesSourceSite(owner, directive->sitePath,
+                                 directive->ownerIncludeId, directive->siteB,
+                                 directive->siteE))
+        recordMacroDirective(*directive);
+    }
+
+    for (const RefoldModel::LineControlEvent *event :
+         lookupBucket(stateIndex.lineControlsByOwnerIncludeKey, *sourceBucket)) {
+      if (event->siteB && event->siteE) {
+        if (OwnerMatchesSourceSite(owner, event->physicalFile,
+                                   event->ownerIncludeId, *event->siteB,
+                                   *event->siteE))
+          recordLineControl(*event);
+        continue;
+      }
+
+      // Older maps may identify only the owning include instance for a line
+      // control event.  The owner-local index already selected the only
+      // candidate include bucket, but keep the original explicit predicate so
+      // missing source spans remain a named conservative fact.
+      const bool ownerMatchesByInclude =
+          (owner.IsTU() && !event->ownerIncludeId) ||
+          (owner.IsInclude() && owner.includeId && event->ownerIncludeId &&
+           *owner.includeId == *event->ownerIncludeId);
+      if (ownerMatchesByInclude) {
+        recordLineControl(*event);
+        markMissingAndUnmodeled(
+            MissingStateFactKind::MissingLineControlFacts,
+            "line-control event matched by owner but lacks source span");
+      }
+    }
+
+    for (const RefoldModel::PragmaDirective *pragma :
+         lookupBucket(stateIndex.pragmasByOwnerIncludeKey, *sourceBucket)) {
+      std::optional<uint64_t> pragmaOwnerIncludeId = pragma->ownerIncludeId;
+      if (!pragmaOwnerIncludeId) {
+        // The index uses this same recovery to choose the bucket.  Recompute the
+        // value here only for the final OwnerMatchesSourceSite() proof predicate
+        // so the delta semantics stay byte-for-byte equivalent to the old scan.
+        for (const RefoldModel::Segment &segment :
+             model_.GetSegmentsForFile(pragma->sitePath)) {
+          if (segment.b <= pragma->siteB && pragma->siteE <= segment.e) {
+            pragmaOwnerIncludeId = segment.ownerIncludeId;
+            break;
+          }
+        }
+      }
+      const bool pragmaBelongs = OwnerMatchesSourceSite(
+          owner, pragma->sitePath, pragmaOwnerIncludeId, pragma->siteB,
+          pragma->siteE);
+      if (pragmaBelongs)
+        recordPragma(*pragma);
+    }
+
+    for (const RefoldModel::CondGroup *group :
+         lookupBucket(stateIndex.condGroupsByParentIncludeKey, *sourceBucket)) {
+      if (!OwnerMatchesSourceSite(owner, group->file, group->parentIncludeId,
+                                  group->groupB, group->groupE))
+        continue;
+      recordConditionalGroup(*group);
+    }
+
+    for (const RefoldModel::MacroInvocation *macro :
+         lookupBucket(stateIndex.macroInvocationsByOwnerIncludeKey,
+                      *sourceBucket)) {
+      if (macro->invFile && macro->invB && macro->invE &&
+          OwnerMatchesSourceSite(owner, *macro->invFile, macro->ownerIncludeId,
+                                 *macro->invB, *macro->invE))
+        recordMacroInvocation(*macro);
+    }
   }
 
   if (owner.IsInclude() && owner.includeId && !exactIncludeOwnerFound)
     markMissingAndUnmodeled(MissingStateFactKind::MissingOwnerOrderingFacts,
                             "include owner id not found in producer map");
-
-  for (const RefoldModel::MacroDirective &directive :
-       model_.GetMacroDirectives()) {
-    if (OwnerMatchesSourceSite(owner, directive.sitePath,
-                               directive.ownerIncludeId, directive.siteB,
-                               directive.siteE))
-      recordMacroDirective(directive);
-  }
-
-  for (const RefoldModel::LineControlEvent &event : model_.GetLineControls()) {
-    if (event.siteB && event.siteE) {
-      if (OwnerMatchesSourceSite(owner, event.physicalFile,
-                                 event.ownerIncludeId, *event.siteB,
-                                 *event.siteE))
-        recordLineControl(event);
-      continue;
-    }
-
-    // Older maps may identify only the owning include instance for a line
-    // control event.  Record the transition when that owner identity is enough,
-    // but keep the unmodeled bit set because no physical source interval is
-    // available for later closure proofs.
-    const bool ownerMatchesByInclude =
-        (owner.IsTU() && !event.ownerIncludeId) ||
-        (owner.IsInclude() && owner.includeId && event.ownerIncludeId &&
-         *owner.includeId == *event.ownerIncludeId);
-    if (ownerMatchesByInclude) {
-      recordLineControl(event);
-      markMissingAndUnmodeled(MissingStateFactKind::MissingLineControlFacts,
-                              "line-control event matched by owner but lacks source span");
-    }
-  }
-
-  for (const RefoldModel::PragmaDirective &pragma : model_.GetPragmas()) {
-    std::optional<uint64_t> pragmaOwnerIncludeId = pragma.ownerIncludeId;
-    if (!pragmaOwnerIncludeId) {
-      // Older maps did not serialize owner_include_id for pragmas.  Recover it
-      // from the slot-derived source segments when the entire pragma directive
-      // is covered by a single include-owner interval.  If that proof is not
-      // available, leave the owner empty; OwnerMatchesSourceSite will then only
-      // match TU-owned consumers instead of guessing a repeated header.
-      for (const RefoldModel::Segment &segment :
-           model_.GetSegmentsForFile(pragma.sitePath)) {
-        if (segment.b <= pragma.siteB && pragma.siteE <= segment.e) {
-          pragmaOwnerIncludeId = segment.ownerIncludeId;
-          break;
-        }
-      }
-    }
-    const bool pragmaBelongs = OwnerMatchesSourceSite(
-        owner, pragma.sitePath, pragmaOwnerIncludeId, pragma.siteB,
-        pragma.siteE);
-    if (pragmaBelongs)
-      recordPragma(pragma);
-  }
-
-  for (const RefoldModel::CondGroup &group : model_.GetConds()) {
-    if (!OwnerMatchesSourceSite(owner, group.file, group.parentIncludeId,
-                                group.groupB, group.groupE))
-      continue;
-    recordConditionalGroup(group);
-  }
-
-  for (const RefoldModel::MacroInvocation &macro :
-       model_.GetMacroInvocations()) {
-    if (macro.invFile && macro.invB && macro.invE &&
-        OwnerMatchesSourceSite(owner, *macro.invFile, macro.ownerIncludeId,
-                               *macro.invB, *macro.invE))
-      recordMacroInvocation(macro);
-  }
 
   return finalize();
 }
@@ -11145,12 +11302,17 @@ RefoldEngine::BuildOwnerStateGraph() const {
 
   for (const RefoldModel::MacroDirective &directive :
        model_.GetMacroDirectives()) {
+    if (IsVirtualInitialMacroDirectiveSource(directive.sitePath))
+      continue;
+
     const std::optional<uint64_t> condArmId = enclosingCondArmId(
         directive.sitePath, directive.ownerIncludeId, directive.siteB,
         directive.siteE);
     // Phase 3D/4C: #define/#undef directives are zero-token macro-state events
-    // even when `spanCover()` is empty.  Their ordering anchor is the physical
-    // directive source interval, not an inferred A-token position.
+    // when they have a real source-order anchor.  Clang's virtual <built-in>
+    // macro definitions seed the initial environment before source processing and
+    // are deliberately skipped above; they cannot be suffix observers after a
+    // source edit boundary.
     addNode(directive.subkind == "#define"
                 ? OwnerStateGraphNodeKind::MacroDefineEvent
                 : directive.subkind == "#undef"
