@@ -6613,6 +6613,32 @@ std::optional<std::string> RefoldEngine::TryExpansionClosureFallback() {
   if (!terminalFallbackRequested_)
     return std::nullopt;
 
+  // Step 6 deletion-readiness guard.  The post-terminal macro expansion
+  // closure path is a legacy safety net, not a first-class proof path.  Keep
+  // its witness builder reachable for one more audit cycle, but do not let it
+  // synthesize source.  In strict mode, discovering a usable witness is a hard
+  // failure: that proves some input still depends on this legacy path, so the
+  // path is not deletion-ready.  In non-strict mode, warn and continue to the
+  // explicit terminal fallback to B.
+  static constexpr bool kEnablePostTerminalExpansionClosureFallback = false;
+  if (!kEnablePostTerminalExpansionClosureFallback) {
+    if (auto witness = BuildMacroOwnerExpansionClosureWitness()) {
+      ++lastTheoremAudit_.expansionFallbackWitnesses;
+      const std::string diagnostic =
+          formatv("post-terminal macro expansion-closure fallback is "
+                  "hard-disabled for Step 6 deletion-readiness: witness={0}",
+                  FormatExpansionClosureWitness(*witness))
+              .str();
+      if (strict_)
+        fatal("fallback/audit", "{0}", diagnostic);
+      warn("fallback/audit", "{0}", diagnostic);
+    } else {
+      debug("fallback", "expansion-closure stage hard-disabled: no proved "
+                        "single-owner macro fallback witness available");
+    }
+    return std::nullopt;
+  }
+
   // Try the post-terminal expansion-closure safety net.
   //
   // This path is still proof-driven, but it is no longer allowed to be an
@@ -6694,10 +6720,11 @@ std::string RefoldEngine::ResolvePostStructuralFallback() {
   if (!terminalFallbackRequested_)
     return std::string();
 
-  // Once structural emission has failed closed, retain the old
-  // expansion-closure safety net before raw-B terminal fallback, but require
-  // any discovered witness to pass the dominance audit in
-  // TryExpansionClosureFallback().
+  // Once structural emission has failed closed, call the Step 6
+  // expansion-closure guard.  The legacy macro-owner safety net is currently
+  // hard-disabled for deletion-readiness: a discovered witness is a strict-mode
+  // failure, and the ordinary result remains the explicit raw-B terminal
+  // fallback.
   if (auto expanded = TryExpansionClosureFallback()) {
     // Count the one case where the proved intermediate expansion stage
     // successfully intercepts a raw-B terminal fallback. This remains coverage

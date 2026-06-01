@@ -713,6 +713,8 @@ RefoldEngine::TerminalFallbackWitness
 RefoldEngine::BuildTerminalFallbackWitness() const {
   TerminalFallbackWitness witness;
   witness.kind = terminalFallbackKind_;
+  witness.proofFailure =
+      ClassifyTerminalFallbackProofFailure(terminalFallbackKind_);
   witness.requestCount = terminalFallbackRequestCount_;
 
   // Preserve the first recorded terminal-fallback reason as the primary audit
@@ -871,8 +873,10 @@ std::string RefoldEngine::FormatGlobalSelectionLattice(
 std::string RefoldEngine::FormatCompletenessContract(
     const CompletenessContract &contract) const {
   if (contract.hasExplicitExclusion) {
-    const TerminalFallbackWitness witness{contract.explicitExclusion, 0, false,
-                                          std::string()};
+    TerminalFallbackWitness witness;
+    witness.kind = contract.explicitExclusion;
+    witness.proofFailure =
+        ClassifyTerminalFallbackProofFailure(contract.explicitExclusion);
     return formatv("coverage={0} expectation={1} declaredTarget={2} counts={3} "
                    "exclusion={4}",
                    contract.coverage, contract.expectation,
@@ -890,8 +894,10 @@ std::string RefoldEngine::FormatCompletenessContract(
 std::string RefoldEngine::FormatTheoremDomainContract(
     const TheoremDomainContract &contract) const {
   if (contract.hasExplicitExclusion) {
-    const TerminalFallbackWitness witness{contract.explicitExclusion, 0, false,
-                                          std::string()};
+    TerminalFallbackWitness witness;
+    witness.kind = contract.explicitExclusion;
+    witness.proofFailure =
+        ClassifyTerminalFallbackProofFailure(contract.explicitExclusion);
     return formatv("kind={0} inDeclaredDomain={1} counts={2} declaredTarget={3}"
                    " exclusion={4}",
                    contract.kind, contract.inDeclaredDomain ? 1 : 0,

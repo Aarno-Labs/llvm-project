@@ -15,6 +15,32 @@
 // TU-owned / include-owned / macro-invocation–owned, and materializes a new
 // TU that incorporates edits while preserving original structure and semantics.
 //
+// Closed-Domain Completeness Contract
+// -----------------------------------
+// clang-refold is intended to be complete for finite owner-closed,
+// state-stable edit tilings.  A refolding is in that strict domain only when
+// each A→B hunk can be partitioned into a deterministic sequence of owners
+// whose source intervals, A-token covers, B-token envelopes, and sideband
+// state transitions are closed under composition.  In that domain, accepted
+// candidates must carry proof that:
+//   • the owner consumes exactly the A tokens it produced and emits exactly
+//     the B tokens assigned to that owner;
+//   • zero-token state transitions (`#define`, `#undef`, `#line`, include
+//     guard effects, conditionals, pragmas, builtin location/counter state,
+//     etc.) are preserved, replayed, proven dead, or observed only inside the
+//     same closure;
+//   • any preserved suffix sees preprocessing state equivalent to the B-side
+//     state at each observer boundary; and
+//   • no upstream source-state mutation is reverse-solved from a downstream
+//     expansion unless the directive itself lies inside the proven edited
+//     source interval.
+//
+// Inputs outside this contract are not completeness failures.  They must be
+// represented by an explicit failed proof obligation, materialized as a
+// closed owner realization when possible, or rejected/fallen back in a way
+// that preserves token soundness rather than emitting a speculative partial
+// refolding.
+//
 // Responsibilities
 // ----------------
 //   • Compute LCS-based A→B anchors and contiguous edit hunks.
@@ -684,10 +710,96 @@ private:
     return "Unknown";
   }
 
+  /// \brief Named proof obligation that forced the terminal raw-B result.
+  ///
+  /// Step 3 of the closed-domain roadmap requires terminal fallback to become a
+  /// proof audit rather than an opaque escape hatch.  These obligations name the
+  /// exact theorem condition that could not be discharged before the engine
+  /// emitted the edited preprocessed stream.
+  enum class TerminalFallbackObligationKind : uint8_t {
+    Unknown,
+    OwnerClosedCover,
+    IncludeRealizationBEnvelopeMapped,
+    EmissionArtifactDischarged,
+    EmissionEditSetComposable,
+    TheoremAuditInvariantSatisfied,
+    SingleTerminalExclusionClassified,
+  };
+
+  friend inline StringRef toString(TerminalFallbackObligationKind obligation) {
+    switch (obligation) {
+    case TerminalFallbackObligationKind::Unknown:
+      return "Unknown";
+    case TerminalFallbackObligationKind::OwnerClosedCover:
+      return "OwnerClosedCover";
+    case TerminalFallbackObligationKind::IncludeRealizationBEnvelopeMapped:
+      return "IncludeRealizationBEnvelopeMapped";
+    case TerminalFallbackObligationKind::EmissionArtifactDischarged:
+      return "EmissionArtifactDischarged";
+    case TerminalFallbackObligationKind::EmissionEditSetComposable:
+      return "EmissionEditSetComposable";
+    case TerminalFallbackObligationKind::TheoremAuditInvariantSatisfied:
+      return "TheoremAuditInvariantSatisfied";
+    case TerminalFallbackObligationKind::SingleTerminalExclusionClassified:
+      return "SingleTerminalExclusionClassified";
+    }
+    return "Unknown";
+  }
+
+  /// \brief Concrete reason the terminal-fallback obligation failed.
+  enum class TerminalFallbackFailureReason : uint8_t {
+    Unknown,
+    NoTUAnchorForUnresolvedOwner,
+    UnmappableIncludeBEnvelope,
+    UndischargedEmissionArtifact,
+    UncomposableEmissionEditSet,
+    TheoremAuditInvariantViolation,
+    MixedExcludedCases,
+    UnclassifiedTerminalFallback,
+  };
+
+  friend inline StringRef toString(TerminalFallbackFailureReason reason) {
+    switch (reason) {
+    case TerminalFallbackFailureReason::Unknown:
+      return "Unknown";
+    case TerminalFallbackFailureReason::NoTUAnchorForUnresolvedOwner:
+      return "NoTUAnchorForUnresolvedOwner";
+    case TerminalFallbackFailureReason::UnmappableIncludeBEnvelope:
+      return "UnmappableIncludeBEnvelope";
+    case TerminalFallbackFailureReason::UndischargedEmissionArtifact:
+      return "UndischargedEmissionArtifact";
+    case TerminalFallbackFailureReason::UncomposableEmissionEditSet:
+      return "UncomposableEmissionEditSet";
+    case TerminalFallbackFailureReason::TheoremAuditInvariantViolation:
+      return "TheoremAuditInvariantViolation";
+    case TerminalFallbackFailureReason::MixedExcludedCases:
+      return "MixedExcludedCases";
+    case TerminalFallbackFailureReason::UnclassifiedTerminalFallback:
+      return "UnclassifiedTerminalFallback";
+    }
+    return "Unknown";
+  }
+
+  /// \brief Normalized proof failure attached to terminal fallback.
+  struct TerminalFallbackProofFailure {
+    TerminalFallbackObligationKind obligation =
+        TerminalFallbackObligationKind::Unknown;
+    TerminalFallbackFailureReason reason = TerminalFallbackFailureReason::Unknown;
+  };
+
+  friend inline std::string
+  toString(const TerminalFallbackProofFailure &failure) {
+    return llvm::formatv("failedObligation={0} failureReason={1}",
+                         toString(failure.obligation),
+                         toString(failure.reason))
+        .str();
+  }
+
   /// \brief Compact witness describing why the single-pass engine fell back to
   /// B.
   struct TerminalFallbackWitness {
     TerminalFallbackKind kind = TerminalFallbackKind::Unknown;
+    TerminalFallbackProofFailure proofFailure;
     uint32_t requestCount = 0;
     bool hasPrimaryReason = false;
     std::string primaryReason;
@@ -695,17 +807,22 @@ private:
 
   friend inline std::string toString(const TerminalFallbackWitness &witness) {
     const StringRef kindName = toString(witness.kind);
+    const std::string proofFailure = toString(witness.proofFailure);
     if (!witness.hasPrimaryReason)
-      return llvm::formatv("kind={0} requestCount={1}", kindName,
-                           witness.requestCount)
+      return llvm::formatv("kind={0} {1} requestCount={2}", kindName,
+                           proofFailure, witness.requestCount)
           .str();
 
     return llvm::formatv(
-               "kind={0} requestCount={1} primaryReason='{2}'", kindName,
-               witness.requestCount,
+               "kind={0} {1} requestCount={2} primaryReason='{3}'", kindName,
+               proofFailure, witness.requestCount,
                stringutils::showWsWithClip(witness.primaryReason, 200))
         .str();
   }
+
+  /// \brief Map a terminal-exclusion class to its theorem obligation.
+  static TerminalFallbackProofFailure
+  ClassifyTerminalFallbackProofFailure(TerminalFallbackKind kind);
 
   /// \brief Declared fallback-closure classes that sit strictly between
   /// structural source emission and terminal fallback to B.
@@ -1567,7 +1684,15 @@ private:
 
   // ---------------------------- Ownership Helpers ----------------------------
 
-  enum class OwnerKind { TU, Include, Unknown };
+  /// Logical owner class used by the theorem-facing closure model.
+  ///
+  /// Existing emission paths still materialize TU and include owners directly,
+  /// while macro and conditional owners are often represented by specialized
+  /// proof carriers.  The closed-domain model treats all of them as instances
+  /// of the same owner identity so future tiling, state-summary composition,
+  /// and terminal out-of-domain diagnostics can reason through one interface
+  /// instead of through owner-specific fallback ladders.
+  enum class OwnerKind { TU, Include, MacroInvocation, ConditionalArm, Unknown };
 
   friend inline StringRef toString(OwnerKind kind) {
     switch (kind) {
@@ -1575,6 +1700,10 @@ private:
       return "TU";
     case OwnerKind::Include:
       return "Include";
+    case OwnerKind::MacroInvocation:
+      return "MacroInvocation";
+    case OwnerKind::ConditionalArm:
+      return "ConditionalArm";
     case OwnerKind::Unknown:
       return "Unknown";
     }
@@ -1584,11 +1713,22 @@ private:
   // Grant access to the specific formatter specialization
   template <typename T, typename Enable> friend struct llvm::format_provider;
 
+  /// Stable identity for one refolding owner.
+  ///
+  /// `Owner` is deliberately small and value-semantic: it names the owner only.
+  /// Source intervals, A/B token envelopes, state summaries, and suffix
+  /// observers live in `OwnerClosure` below.  Keeping identity separate from
+  /// closure facts prevents call sites from accidentally treating a classified
+  /// owner as a discharged proof.
   struct Owner {
     OwnerKind kind = OwnerKind::Unknown;
-    std::optional<uint64_t> includeId; // non-nullopt only when kind == INCLUDE
-    std::optional<uint64_t> condArmId; // nullable; non-nullopt when segment is
-                                       // in a specific arm
+    // non-nullopt only when kind == Include.
+    std::optional<uint64_t> includeId;
+    // non-nullopt only when kind == MacroInvocation.
+    std::optional<uint64_t> macroInvocationId;
+    // nullable; non-nullopt when the owner is in or is a specific conditional
+    // arm.
+    std::optional<uint64_t> condArmId;
 
     static Owner TU(std::optional<uint64_t> condArmId = std::nullopt) {
       Owner o;
@@ -1596,6 +1736,7 @@ private:
       o.condArmId = condArmId;
       return o;
     }
+
     static Owner Include(uint64_t includeId,
                          std::optional<uint64_t> condArmId = std::nullopt) {
       Owner o;
@@ -1604,7 +1745,237 @@ private:
       o.condArmId = condArmId;
       return o;
     }
+
+    static Owner MacroInvocation(
+        uint64_t macroInvocationId,
+        std::optional<uint64_t> condArmId = std::nullopt) {
+      Owner o;
+      o.kind = OwnerKind::MacroInvocation;
+      o.macroInvocationId = macroInvocationId;
+      o.condArmId = condArmId;
+      return o;
+    }
+
+    static Owner ConditionalArm(uint64_t condArmId) {
+      Owner o;
+      o.kind = OwnerKind::ConditionalArm;
+      o.condArmId = condArmId;
+      return o;
+    }
+
     static Owner Unknown() { return Owner(); }
+
+    bool IsKnown() const { return kind != OwnerKind::Unknown; }
+
+    bool IsTU() const { return kind == OwnerKind::TU; }
+
+    bool IsInclude() const { return kind == OwnerKind::Include; }
+
+    bool IsMacroInvocation() const {
+      return kind == OwnerKind::MacroInvocation;
+    }
+
+    bool IsConditionalArm() const {
+      return kind == OwnerKind::ConditionalArm;
+    }
+
+    bool HasSameIdentity(const Owner &other) const {
+      return kind == other.kind && includeId == other.includeId &&
+             macroInvocationId == other.macroInvocationId &&
+             condArmId == other.condArmId;
+    }
+  };
+
+  /// Half-open token interval in either the original preprocessed token stream
+  /// A or the edited preprocessed token stream B.
+  struct OwnerTokenRange {
+    uint64_t begin = 0;
+    uint64_t end = 0;
+
+    static OwnerTokenRange From(uint64_t begin, uint64_t end) {
+      return {begin, end};
+    }
+
+    bool IsValid() const { return begin <= end; }
+
+    bool Empty() const { return begin == end; }
+
+    bool Contains(uint64_t tok) const { return begin <= tok && tok < end; }
+
+    bool Contains(OwnerTokenRange other) const {
+      return IsValid() && other.IsValid() && begin <= other.begin &&
+             other.end <= end;
+    }
+  };
+
+  /// Half-open physical source interval owned by one source surface.
+  ///
+  /// `path` is the owner-local source file, `[begin,end)` is byte-based in that
+  /// file, and `includeId` identifies the concrete include occurrence when the
+  /// source surface is header-owned.  The range is only a candidate source
+  /// fact; `OwnerClosure::IsComplete()` is the theorem-facing gate that also
+  /// requires owner identity and token-envelope validity.
+  struct OwnerSourceRange {
+    std::string path;
+    uint64_t begin = 0;
+    uint64_t end = 0;
+    std::optional<uint64_t> includeId = std::nullopt;
+
+    static OwnerSourceRange From(StringRef path, uint64_t begin, uint64_t end,
+                                 std::optional<uint64_t> includeId =
+                                     std::nullopt) {
+      OwnerSourceRange r;
+      r.path = path.str();
+      r.begin = begin;
+      r.end = end;
+      r.includeId = includeId;
+      return r;
+    }
+
+    bool IsValid() const { return begin <= end; }
+
+    bool Empty() const { return begin == end; }
+
+    bool HasPath() const { return !path.empty(); }
+
+    bool IsComplete() const { return HasPath() && IsValid(); }
+  };
+
+  /// Summary of sideband preprocessing state touched by an owner closure.
+  ///
+  /// This structure intentionally records obligations rather than trying to
+  /// model full preprocessor state.  A set bit means the closure must either
+  /// preserve, replay, prove dead, keep internally observed, or otherwise
+  /// discharge that state component before the closure may compose with a
+  /// preserved suffix.
+  struct OwnerStateSummary {
+    bool touchesMacroDefinitions = false;
+    bool touchesMacroUndefinitions = false;
+    bool touchesLineControl = false;
+    bool touchesIncludeState = false;
+    bool touchesIncludeGuardState = false;
+    bool touchesConditionalState = false;
+    bool touchesPragmaState = false;
+    bool touchesCounterState = false;
+    bool touchesBuiltinLocationState = false;
+
+    bool Empty() const {
+      return !touchesMacroDefinitions && !touchesMacroUndefinitions &&
+             !touchesLineControl && !touchesIncludeState &&
+             !touchesIncludeGuardState && !touchesConditionalState &&
+             !touchesPragmaState && !touchesCounterState &&
+             !touchesBuiltinLocationState;
+    }
+
+    OwnerStateSummary &MergeFrom(const OwnerStateSummary &other) {
+      touchesMacroDefinitions |= other.touchesMacroDefinitions;
+      touchesMacroUndefinitions |= other.touchesMacroUndefinitions;
+      touchesLineControl |= other.touchesLineControl;
+      touchesIncludeState |= other.touchesIncludeState;
+      touchesIncludeGuardState |= other.touchesIncludeGuardState;
+      touchesConditionalState |= other.touchesConditionalState;
+      touchesPragmaState |= other.touchesPragmaState;
+      touchesCounterState |= other.touchesCounterState;
+      touchesBuiltinLocationState |= other.touchesBuiltinLocationState;
+      return *this;
+    }
+  };
+
+  /// Summary of suffix-visible observers that constrain state composition.
+  ///
+  /// These are the observable surfaces for suffix-stability proofs.  The model
+  /// is intentionally selective: a state component only constrains composition
+  /// when a later preserved owner actually observes it.
+  struct OwnerObserverSummary {
+    bool observesMacroExpansion = false;
+    bool observesDefinedOperator = false;
+    bool observesConditionalEvaluation = false;
+    bool observesLineNumber = false;
+    bool observesFileName = false;
+    bool observesCounter = false;
+    bool observesPragmaState = false;
+    bool observesIncludeGuardState = false;
+    bool observesIncludeState = false;
+
+    bool Empty() const {
+      return !observesMacroExpansion && !observesDefinedOperator &&
+             !observesConditionalEvaluation && !observesLineNumber &&
+             !observesFileName && !observesCounter && !observesPragmaState &&
+             !observesIncludeGuardState && !observesIncludeState;
+    }
+
+    OwnerObserverSummary &MergeFrom(const OwnerObserverSummary &other) {
+      observesMacroExpansion |= other.observesMacroExpansion;
+      observesDefinedOperator |= other.observesDefinedOperator;
+      observesConditionalEvaluation |= other.observesConditionalEvaluation;
+      observesLineNumber |= other.observesLineNumber;
+      observesFileName |= other.observesFileName;
+      observesCounter |= other.observesCounter;
+      observesPragmaState |= other.observesPragmaState;
+      observesIncludeGuardState |= other.observesIncludeGuardState;
+      observesIncludeState |= other.observesIncludeState;
+      return *this;
+    }
+  };
+
+  /// Canonical theorem-facing closure record for one owner-local refolding
+  /// candidate.
+  ///
+  /// This is the normalization point for Step 2 of the closed-domain roadmap:
+  /// TU edits, include/header realizations, macro invocation rewrites,
+  /// conditional-arm islands, sideband line/pragmas, and future mixed-owner
+  /// tiling segments should all be expressible as an `OwnerClosure` before they
+  /// are admitted by a proof gate.  The structure is intentionally passive in
+  /// this patch; it gives the existing specialized machinery a common target
+  /// without changing emission behavior.
+  struct OwnerClosure {
+    Owner owner;
+    OwnerSourceRange source;
+    OwnerTokenRange aTokens;
+    OwnerTokenRange bTokens;
+    OwnerStateSummary stateIn;
+    OwnerStateSummary stateOut;
+    OwnerObserverSummary observers;
+
+    static OwnerClosure From(Owner owner, OwnerSourceRange source,
+                             OwnerTokenRange aTokens,
+                             OwnerTokenRange bTokens) {
+      OwnerStateSummary stateIn;
+      OwnerStateSummary stateOut;
+      OwnerObserverSummary observers;
+      return From(std::move(owner), std::move(source), aTokens, bTokens,
+                  stateIn, stateOut, observers);
+    }
+
+    static OwnerClosure From(Owner owner, OwnerSourceRange source,
+                             OwnerTokenRange aTokens,
+                             OwnerTokenRange bTokens,
+                             OwnerStateSummary stateIn,
+                             OwnerStateSummary stateOut,
+                             OwnerObserverSummary observers) {
+      OwnerClosure closure;
+      closure.owner = std::move(owner);
+      closure.source = std::move(source);
+      closure.aTokens = aTokens;
+      closure.bTokens = bTokens;
+      closure.stateIn = stateIn;
+      closure.stateOut = stateOut;
+      closure.observers = observers;
+      return closure;
+    }
+
+    bool IsComplete() const {
+      return owner.IsKnown() && source.IsComplete() && aTokens.IsValid() &&
+             bTokens.IsValid();
+    }
+
+    bool IsStateNeutral() const {
+      return stateIn.Empty() && stateOut.Empty() && observers.Empty();
+    }
+
+    bool HasSameOwner(const OwnerClosure &other) const {
+      return owner.HasSameIdentity(other.owner);
+    }
   };
 
   /// \brief Top-level buckets for the accepted-result proof lattice.
@@ -2901,11 +3272,12 @@ private:
   /// how a region of the preprocessed stream was edited. This method projects
   /// the hunk into TU byte space, finds the smallest matching Segment,
   /// and returns an Owner describing whether the hunk belongs to:
-  ///   - the TU file itself (kind = Owner::Kind::TU),
-  ///   - a particular include (kind = Owner::Kind::INCLUDE}),
-  ///   - a specific conditional arm inside an include
-  ///     (kind = Owner::Kind::COND_ARM), or
-  ///   - a macro expansion or unknown/ambiguous region.
+  ///   - the TU file itself (kind = OwnerKind::TU),
+  ///   - a particular include (kind = OwnerKind::Include),
+  ///   - a specific conditional arm (kind = OwnerKind::ConditionalArm or a
+  ///     TU/include owner with `condArmId`),
+  ///   - a macro invocation (kind = OwnerKind::MacroInvocation), or
+  ///   - an unknown/ambiguous region.
   ///
   /// \headername Algorithm overview
   /// 1. Use tuByteSpan() to map the hunk's A-side token interval [\p a0, \p a1)
@@ -2928,7 +3300,7 @@ private:
   ///        based on ownerIncludeId and ownerCondArmId.
   /// 5. If no segment intersects the TU span, or the hunk falls into a
   ///    macro-expansion / slot boundary that cannot be cleanly attributed to a
-  ///    single segment, the owner is returned as Owner::Kind::UNKNOWN. Callers
+  ///    single segment, the owner is returned as OwnerKind::Unknown. Callers
   ///    must then either (a) expand to a larger structural edit (e.g. realize
   ///    an include/conditional arm) or (b) reject the hunk as not safely
   ///    attributable.

@@ -1962,6 +1962,53 @@ RefoldEngine::Refold(const json::Object &rootJson, StringRef aSource,
   return engine.Refold();
 }
 
+RefoldEngine::TerminalFallbackProofFailure
+RefoldEngine::ClassifyTerminalFallbackProofFailure(
+    TerminalFallbackKind kind) {
+  TerminalFallbackProofFailure failure;
+
+  switch (kind) {
+  case TerminalFallbackKind::OwnerUnresolvedNoTUAnchor:
+    failure.obligation = TerminalFallbackObligationKind::OwnerClosedCover;
+    failure.reason = TerminalFallbackFailureReason::NoTUAnchorForUnresolvedOwner;
+    break;
+  case TerminalFallbackKind::IncludeRealizationUnmappableBCoverEnvelope:
+    failure.obligation =
+        TerminalFallbackObligationKind::IncludeRealizationBEnvelopeMapped;
+    failure.reason = TerminalFallbackFailureReason::UnmappableIncludeBEnvelope;
+    break;
+  case TerminalFallbackKind::UndischargedEmissionArtifact:
+    failure.obligation =
+        TerminalFallbackObligationKind::EmissionArtifactDischarged;
+    failure.reason = TerminalFallbackFailureReason::UndischargedEmissionArtifact;
+    break;
+  case TerminalFallbackKind::UncomposableEmissionEditSet:
+    failure.obligation =
+        TerminalFallbackObligationKind::EmissionEditSetComposable;
+    failure.reason = TerminalFallbackFailureReason::UncomposableEmissionEditSet;
+    break;
+  case TerminalFallbackKind::TheoremAuditInvariantViolation:
+    failure.obligation =
+        TerminalFallbackObligationKind::TheoremAuditInvariantSatisfied;
+    failure.reason =
+        TerminalFallbackFailureReason::TheoremAuditInvariantViolation;
+    break;
+  case TerminalFallbackKind::MixedExcludedCases:
+    failure.obligation =
+        TerminalFallbackObligationKind::SingleTerminalExclusionClassified;
+    failure.reason = TerminalFallbackFailureReason::MixedExcludedCases;
+    break;
+  case TerminalFallbackKind::Unknown:
+    failure.obligation =
+        TerminalFallbackObligationKind::SingleTerminalExclusionClassified;
+    failure.reason =
+        TerminalFallbackFailureReason::UnclassifiedTerminalFallback;
+    break;
+  }
+
+  return failure;
+}
+
 /// Record that the current run escaped the declared proof domain.
 ///
 /// Multiple requests are collapsed into either the first concrete reason or a
@@ -1978,11 +2025,18 @@ void RefoldEngine::RequestTerminalFallback(TerminalFallbackKind kind,
              terminalFallbackKind_ != kind) {
     terminalFallbackKind_ = TerminalFallbackKind::MixedExcludedCases;
   }
+
+  const TerminalFallbackProofFailure requestFailure =
+      ClassifyTerminalFallbackProofFailure(kind);
   if (terminalFallbackReasons_.size() < 64) {
     terminalFallbackReasons_.push_back(
-        llvm::formatv("{0}: {1}", phase, detail).str());
+        llvm::formatv("kind={0} {1} phase={2}: {3}", toString(kind),
+                      toString(requestFailure), phase, detail)
+            .str());
   }
-  debug("fallback", "REQUEST terminal fallback: {0}: {1}", phase, detail);
+  debug("fallback",
+        "REQUEST terminal fallback: kind={0} {1} phase={2}: {3}",
+        toString(kind), toString(requestFailure), phase, detail);
 }
 
 void RefoldEngine::EnforceTheoremAuditInvariants() const {
@@ -3124,12 +3178,17 @@ std::string RefoldEngine::RunSinglePassRefold() {
   //   * every segment has a known TU/include/macro realizer;
   //   * every segment has an A->B token envelope inside the original hunk;
   //   * segment B envelopes are contiguous and exactly tile the original B
-  //     hunk; and
-  //   * the final partition contains at least two different realizers.
+  //     hunk;
+  //   * the final partition contains at least two different realizers; and
+  //   * the minimal tiling is unique. Equal-cost alternatives are rejected
+  //     rather than hidden behind an implementation-order tie-breaker.
   //
   // This remains a normalization-only proof. Each emitted sub-hunk is still
   // validated later by the ordinary macro/include/TU classifier before any
-  // source edit is accepted.
+  // source edit is accepted. Because this pass only emits non-empty token
+  // segments with exact A/B cover, zero-token state transitions are not
+  // silently consumed here; stateful gaps remain the responsibility of the
+  // later state-closure/suffix-stability proof gates.
   if (hunks.size() > 0) {
     enum class HunkRealizerKind {
       Unknown,
@@ -3224,6 +3283,10 @@ std::string RefoldEngine::RunSinglePassRefold() {
       size_t edgeIndex = 0;
       PartitionStateKey prev;
       unsigned cost = 0;
+      // True once the same DP state can be reached by two distinct minimal
+      // parent chains. Step 4 requires a deterministic tiling proof, not merely
+      // a deterministic tie-breaker, so any equal-cost ambiguity is rejected.
+      bool ambiguous = false;
     };
 
     auto tryBuildMixedOwnerPartition =
@@ -3288,7 +3351,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
                                        /*lastRealizer=*/{},
                                        /*mixed=*/false};
       dp[0][startKey] = PartitionParent{/*valid=*/true, /*edgeIndex=*/0,
-                                        /*prev=*/{}, /*cost=*/0};
+                                        /*prev=*/{}, /*cost=*/0,
+                                        /*ambiguous=*/false};
 
       for (uint64_t aOff = 0; aOff < aLen; ++aOff) {
         auto &states = dp[static_cast<size_t>(aOff)];
@@ -3326,7 +3390,13 @@ std::string RefoldEngine::RunSinglePassRefold() {
             auto existing = dst.find(nextKey);
             if (existing == dst.end() || nextCost < existing->second.cost) {
               dst[nextKey] = PartitionParent{/*valid=*/true, edgeIndex,
-                                             /*prev=*/key, nextCost};
+                                             /*prev=*/key, nextCost,
+                                             /*ambiguous=*/state.second.ambiguous};
+            } else if (nextCost == existing->second.cost) {
+              // Two minimal chains prove the same next state. Do not choose
+              // between them by map/edge iteration order; mark the state as
+              // ambiguous so the final tiling proof fails closed.
+              existing->second.ambiguous = true;
             }
           }
         }
@@ -3334,23 +3404,39 @@ std::string RefoldEngine::RunSinglePassRefold() {
 
       const auto &finalStates = dp[static_cast<size_t>(aLen)];
       auto bestFinal = finalStates.end();
+      unsigned bestCost = std::numeric_limits<unsigned>::max();
+      bool ambiguousBest = false;
       for (auto it = finalStates.begin(); it != finalStates.end(); ++it) {
         const PartitionStateKey &key = it->first;
         if (key.bPos != h.bEnd || !key.mixed)
           continue;
-        if (bestFinal == finalStates.end() ||
-            it->second.cost < bestFinal->second.cost) {
+
+        const unsigned candidateCost = it->second.cost;
+        if (candidateCost < bestCost) {
           bestFinal = it;
+          bestCost = candidateCost;
+          ambiguousBest = it->second.ambiguous;
+        } else if (candidateCost == bestCost) {
+          ambiguousBest = true;
         }
       }
       if (bestFinal == finalStates.end())
         return std::nullopt;
 
-      // Reconstruct the lowest-cost mixed-realizer path. The DP tracks mixedness
-      // as part of the state, rather than choosing the cheapest path first and
-      // checking mixedness afterwards. This prevents a coarse TU edge from
-      // swallowing a smaller macro/include segment and suppressing a valid
-      // structure-preserving split.
+      if (ambiguousBest) {
+        trace("hunks/norm",
+              "reject ambiguous mixed-owner tiling A=[{0},{1}) B=[{2},{3}) "
+              "minimalSegments={4}",
+              h.aStart, h.aEnd, h.bStart, h.bEnd, bestCost);
+        return std::nullopt;
+      }
+
+      // Reconstruct the unique lowest-cost mixed-realizer path. The DP tracks
+      // mixedness as part of the state, rather than choosing the cheapest path
+      // first and checking mixedness afterwards. This prevents a coarse TU edge
+      // from swallowing a smaller macro/include segment and suppressing a valid
+      // structure-preserving split. Equal-cost alternatives are rejected above
+      // instead of being hidden behind deterministic map/edge iteration order.
       SmallVector<PartitionEdge, 8> path;
       uint64_t aPos = h.aEnd;
       PartitionStateKey stateKey = bestFinal->first;
@@ -3370,6 +3456,42 @@ std::string RefoldEngine::RunSinglePassRefold() {
 
       if (path.size() < 2)
         return std::nullopt;
+
+      // Re-validate the reconstructed partition as a true mixed-owner tiling.
+      // The dynamic-programming search already found a path, but the proof
+      // obligation is stronger: each edge must start exactly where the previous
+      // edge ended on both A and B, must consume a non-empty token envelope, and
+      // must have a known realizer.  This rejects overlaps, gaps, zero-token
+      // pseudo-edges, and any accidental fallback through an unclassified owner.
+      uint64_t expectedA = h.aStart;
+      uint64_t expectedB = h.bStart;
+      HunkRealizer firstRealizer = path.front().realizer;
+      bool sawDifferentRealizer = false;
+      for (const PartitionEdge &edge : path) {
+        if (edge.aStart != expectedA || edge.bStart != expectedB ||
+            edge.aEnd <= edge.aStart || edge.bEnd <= edge.bStart ||
+            edge.realizer.kind == HunkRealizerKind::Unknown) {
+          trace("hunks/norm",
+                "reject non-exact mixed-owner tiling A=[{0},{1}) B=[{2},{3})",
+                h.aStart, h.aEnd, h.bStart, h.bEnd);
+          return std::nullopt;
+        }
+        sawDifferentRealizer |= edge.realizer != firstRealizer;
+        expectedA = edge.aEnd;
+        expectedB = edge.bEnd;
+      }
+
+      // A mixed-owner tiling is admissible only if the edge sequence covers the
+      // entire original hunk and actually crosses an owner/realizer boundary.
+      // Otherwise this is either an incomplete cover or a single-owner case that
+      // should be handled by the ordinary owner-specific realization machinery.
+      if (expectedA != h.aEnd || expectedB != h.bEnd ||
+          !sawDifferentRealizer) {
+        trace("hunks/norm",
+              "reject incomplete mixed-owner tiling A=[{0},{1}) B=[{2},{3})",
+              h.aStart, h.aEnd, h.bStart, h.bEnd);
+        return std::nullopt;
+      }
 
       return path;
     };
@@ -16533,6 +16655,57 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     }
     if (!targetArgIdx || !targetReplacement)
       return std::nullopt;
+
+    // A generated-leaf rewrite is a source edit to the root invocation
+    // argument.  Therefore every current-level occurrence of that root formal
+    // that still observes the solved old leaf in B would also be rewritten by
+    // the proposed source change.  Reject that shape instead of preserving the
+    // parent callsite: the edited leaf must be materialized or proved by the
+    // DAG path that can account for all child/parent observations together.
+    auto stableRootOccurrenceStillObservesOldLeaf =
+        [&](const RefoldModel::PPArgSpan &span, StringRef observerKind) {
+          if (span.argIdx != *targetArgIdx || span.begin >= span.end)
+            return false;
+
+          StringRef aText = SliceASource(span.begin, span.end).trim();
+          if (aText.find(StringRef(oldLeaf)) == StringRef::npos)
+            return false;
+
+          std::optional<std::pair<size_t, size_t>> bEnv =
+              MapAToBTokenEnvelopeByPPArgSpan(span);
+          if (!bEnv || bEnv->second < bEnv->first) {
+            trace("macro/higher-order",
+                  "whole-cover generated leaf rewrite rejected: root id={0} "
+                  "name={1} argIdx={2} {3} occurrence A=[{4},{5}) still "
+                  "contains old leaf '{6}' but has no provable B envelope",
+                  m.id, m.name, *targetArgIdx, observerKind, span.begin,
+                  span.end, oldLeaf);
+            return true;
+          }
+
+          StringRef bText = SliceBSource(bEnv->first, bEnv->second).trim();
+          if (bText.find(StringRef(oldLeaf)) == StringRef::npos)
+            return false;
+
+          trace("macro/higher-order",
+                "whole-cover generated leaf rewrite rejected: root id={0} "
+                "name={1} argIdx={2} {3} occurrence A=[{4},{5}) B=[{6},{7}) "
+                "still observes old leaf '{8}' aText='{9}' bText='{10}'",
+                m.id, m.name, *targetArgIdx, observerKind, span.begin,
+                span.end, bEnv->first, bEnv->second, oldLeaf,
+                stringutils::showWsWithClip(aText, 120),
+                stringutils::showWsWithClip(bText, 120));
+          return true;
+        };
+
+    for (const RefoldModel::PPArgSpan &span : m.argSpans) {
+      if (stableRootOccurrenceStillObservesOldLeaf(span, "standard"))
+        return std::nullopt;
+    }
+    for (const RefoldModel::PPArgSpan &span : m.stringifySpans) {
+      if (stableRootOccurrenceStillObservesOldLeaf(span, "stringify"))
+        return std::nullopt;
+    }
 
     DenseMap<uint32_t, std::string> replByArgIdx;
     replByArgIdx[*targetArgIdx] = *targetReplacement;
@@ -32879,6 +33052,98 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         return false;
       };
 
+  auto structurePreservingCallsiteHasStableFormalSyntax =
+      [&](const MacroPatch &patch) {
+        // Invocation-preserving macro patches are replayed by the preprocessor
+        // as function-like macro callsites.  Therefore the replacement text
+        // must itself be a complete, well-formed invocation of this macro.  The
+        // proof needed here is intentionally syntactic: it rejects unterminated
+        // argument lists such as `FOO(x, y(()`, but it must not require the
+        // rewritten invocation to preserve the producer's original fixed slot
+        // skeleton.  Valid edits to variadic / __VA_OPT__ calls may add or
+        // remove actual arguments, and physical source spelling such as line
+        // splices inside arguments may differ from the producer spelling while
+        // still being a valid macro invocation.
+        if (!patch.structurePreserving || patch.proofRootMacroId != m.id)
+          return true;
+        if (m.subkind != "func")
+          return true;
+        if (!InvocationSpanMatchesCallsitePrefix(patch.replacement, m)) {
+          trace("macro/proof",
+                "suppress structure-preserving macro replay: inv id={0} "
+                "name={1} replacement no longer has a matching callsite "
+                "prefix",
+                m.id, m.name);
+          return false;
+        }
+
+        auto parsedActuals =
+            ParseMacroInvocationArgContentRanges(patch.replacement);
+        if (!parsedActuals) {
+          trace("macro/proof",
+                "suppress structure-preserving macro replay: inv id={0} "
+                "name={1} replacement is not a complete macro invocation: "
+                "'{2}'",
+                m.id, m.name,
+                stringutils::showWsWithClip(patch.replacement, 220));
+          return false;
+        }
+
+        auto isVariadicFormal = [&](size_t idx) {
+          return idx < m.defParams.size() && m.defParams[idx].variadic;
+        };
+
+        auto trailingFormalsAreVariadic = [&](size_t beginIdx) {
+          for (size_t i = beginIdx; i < m.defParams.size(); ++i) {
+            if (!isVariadicFormal(i))
+              return false;
+          }
+          return true;
+        };
+
+        const size_t formalN = m.defParams.size();
+        size_t actualN = parsedActuals->size();
+        if (actualN == 0 && formalN != 0) {
+          // `M()` is zero actuals for a zero-parameter macro, but for a macro
+          // with parameters it is one empty actual followed by any omitted
+          // variadic tail.  The parser intentionally represents empty lists as
+          // zero ranges so zero-argument call chains remain distinguishable;
+          // this final syntactic gate only needs the arity interpretation.
+          actualN = 1;
+        }
+        bool arityCompatible = false;
+        if (actualN == formalN) {
+          arityCompatible = true;
+        } else if (formalN != 0 && actualN > formalN) {
+          // Surplus actuals are valid only for a final variadic formal; they
+          // collectively form the variadic tail.
+          arityCompatible = isVariadicFormal(formalN - 1);
+        } else if (actualN < formalN) {
+          // Missing actuals are valid only for omitted trailing variadic
+          // formals, e.g. `M(x)` for `M(x, ...)`.
+          arityCompatible = trailingFormalsAreVariadic(actualN);
+        }
+
+        if (!arityCompatible) {
+          trace("macro/proof",
+                "suppress structure-preserving macro replay: inv id={0} "
+                "name={1} replacement actual/formal arity is invalid: "
+                "actuals={2} formals={3} text='{4}'",
+                m.id, m.name, static_cast<unsigned>(actualN),
+                static_cast<unsigned>(formalN),
+                stringutils::showWsWithClip(patch.replacement, 220));
+          return false;
+        }
+
+        return true;
+      };
+
+  auto macroCandidateReplayIsStableForFinalSelection =
+      [&](const MacroPatch &patch) {
+        return structurePreservingCallsiteHasStableFormalSyntax(patch) &&
+               !callsiteReplayObservesActiveHeaderMacroState(patch);
+      };
+
   // Collect all macro-level patch candidates for the shared final selector.
   //
   // Candidate discovery above may produce callsite-preserving patches, DAG
@@ -32894,6 +33159,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   SmallVector<FinalMacroCandidate, 5> finalMacroCandidates;
   auto addFinalMacroCandidate = [&](const MacroPatch &patch,
                                    FinalMacroCandidateOrigin origin) {
+    if (!macroCandidateReplayIsStableForFinalSelection(patch))
+      return;
+
     FinalMacroCandidate entry;
     entry.patch = patch;
     entry.acceptedCandidate = BuildAcceptedMacroCandidate(entry.patch);
@@ -32913,25 +33181,25 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   // never accepts a proof artifact whose emitted callsite would be interpreted
   // under the wrong header macro state.
   if (argsOnlyCandidate &&
-      !callsiteReplayObservesActiveHeaderMacroState(*argsOnlyCandidate)) {
+      macroCandidateReplayIsStableForFinalSelection(*argsOnlyCandidate)) {
     addFinalMacroCandidate(*argsOnlyCandidate,
                            FinalMacroCandidateOrigin::DirectArgsOnly);
   }
 
   if (dagRootCandidate &&
-      !callsiteReplayObservesActiveHeaderMacroState(*dagRootCandidate)) {
+      macroCandidateReplayIsStableForFinalSelection(*dagRootCandidate)) {
     addFinalMacroCandidate(*dagRootCandidate,
                            FinalMacroCandidateOrigin::DagRootReplay);
   }
 
   if (canReuseExistingCallsiteNoOp &&
-      !callsiteReplayObservesActiveHeaderMacroState(*existingPatch)) {
+      macroCandidateReplayIsStableForFinalSelection(*existingPatch)) {
     addFinalMacroCandidate(
         *existingPatch, FinalMacroCandidateOrigin::ReuseExistingCallsiteNoOp);
   }
 
   if (canReuseExistingCallsiteSkipWholeCover &&
-      !callsiteReplayObservesActiveHeaderMacroState(*existingPatch)) {
+      macroCandidateReplayIsStableForFinalSelection(*existingPatch)) {
     addFinalMacroCandidate(
         *existingPatch,
         FinalMacroCandidateOrigin::ReuseExistingCallsiteSkipWholeCover);
@@ -32950,20 +33218,24 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
       [&](const std::optional<MacroPatch> &patch) {
         return patch && patch->structurePreserving &&
                patch->proofRootMacroId == m.id &&
-               !callsiteReplayObservesActiveHeaderMacroState(*patch);
+               macroCandidateReplayIsStableForFinalSelection(*patch);
+      };
+
+  auto stableStructureCandidateCoversCurrentHunk =
+      [&](const MacroPatch *patch) {
+        return structurePreservingCandidateCoversCurrentHunk(patch) &&
+               macroCandidateReplayIsStableForFinalSelection(*patch);
       };
 
   const bool structureCandidateAlreadyCoversHunk =
-      structurePreservingCandidateCoversCurrentHunk(
+      stableStructureCandidateCoversCurrentHunk(
           argsOnlyCandidate ? &*argsOnlyCandidate : nullptr) ||
-      structurePreservingCandidateCoversCurrentHunk(
+      stableStructureCandidateCoversCurrentHunk(
           dagRootCandidate ? &*dagRootCandidate : nullptr) ||
       (canReuseExistingCallsiteNoOp &&
-       structurePreservingCandidateCoversCurrentHunk(existingPatch) &&
-       !callsiteReplayObservesActiveHeaderMacroState(*existingPatch)) ||
+       stableStructureCandidateCoversCurrentHunk(existingPatch)) ||
       (canReuseExistingCallsiteSkipWholeCover &&
-       structurePreservingCandidateCoversCurrentHunk(existingPatch) &&
-       !callsiteReplayObservesActiveHeaderMacroState(*existingPatch));
+       stableStructureCandidateCoversCurrentHunk(existingPatch));
 
   const bool structureCandidateDominatesFallback =
       freshStructureCandidateForCurrentRoot(argsOnlyCandidate) ||
