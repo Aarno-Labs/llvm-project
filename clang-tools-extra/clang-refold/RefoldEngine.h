@@ -1463,292 +1463,215 @@ private:
   /// without changing refolding behavior or
   /// conflating that classification with candidate ranking or the legacy retry
   /// ladder.
+  #define REFOLD_ACCEPTED_PROOF_CLASS_LIST(REFOLD_X) \
+  REFOLD_X(Unknown) \
+  REFOLD_X(InvocationPreserving) \
+  REFOLD_X(InvocationRealization) \
+  REFOLD_X(IncludePreserving) \
+  REFOLD_X(IncludeRealization) \
+  REFOLD_X(TUAnchor) \
+  REFOLD_X(TUTextualEdit)
+
   enum class AcceptedProofClass : uint8_t {
-    Unknown,
-    InvocationPreserving,
-    InvocationRealization,
-    IncludePreserving,
-    IncludeRealization,
-    TUAnchor,
-    TUTextualEdit,
+#define REFOLD_X(name) name,
+    REFOLD_ACCEPTED_PROOF_CLASS_LIST(REFOLD_X)
+#undef REFOLD_X
   };
 
-  friend inline StringRef toString(AcceptedProofClass kind) {
-    switch (kind) {
-    case AcceptedProofClass::Unknown:
-      return "Unknown";
-    case AcceptedProofClass::InvocationPreserving:
-      return "InvocationPreserving";
-    case AcceptedProofClass::InvocationRealization:
-      return "InvocationRealization";
-    case AcceptedProofClass::IncludePreserving:
-      return "IncludePreserving";
-    case AcceptedProofClass::IncludeRealization:
-      return "IncludeRealization";
-    case AcceptedProofClass::TUAnchor:
-      return "TUAnchor";
-    case AcceptedProofClass::TUTextualEdit:
-      return "TUTextualEdit";
+  friend inline StringRef toString(AcceptedProofClass value) {
+    switch (value) {
+#define REFOLD_X(name) case AcceptedProofClass::name: return #name;
+      REFOLD_ACCEPTED_PROOF_CLASS_LIST(REFOLD_X)
+#undef REFOLD_X
     }
     return "Unknown";
   }
+#undef REFOLD_ACCEPTED_PROOF_CLASS_LIST
 
   /// \brief Whether an accepted result preserves original structure or emits
   /// a realized edited surface.
+  #define REFOLD_REALIZATION_MODE_LIST(REFOLD_X) \
+  REFOLD_X(Unknown) \
+  REFOLD_X(PreserveOriginalStructure) \
+  REFOLD_X(RealizeEditedSurface)
+
   enum class RealizationMode : uint8_t {
-    Unknown,
-    PreserveOriginalStructure,
-    RealizeEditedSurface,
+#define REFOLD_X(name) name,
+    REFOLD_REALIZATION_MODE_LIST(REFOLD_X)
+#undef REFOLD_X
   };
 
-  friend inline StringRef toString(RealizationMode mode) {
-    switch (mode) {
-    case RealizationMode::Unknown:
-      return "Unknown";
-    case RealizationMode::PreserveOriginalStructure:
-      return "PreserveOriginalStructure";
-    case RealizationMode::RealizeEditedSurface:
-      return "RealizeEditedSurface";
+  friend inline StringRef toString(RealizationMode value) {
+    switch (value) {
+#define REFOLD_X(name) case RealizationMode::name: return #name;
+      REFOLD_REALIZATION_MODE_LIST(REFOLD_X)
+#undef REFOLD_X
     }
     return "Unknown";
   }
+#undef REFOLD_REALIZATION_MODE_LIST
 
   /// \brief Ranking bucket for choosing among multiple valid candidates.
   ///
   /// Preference is tracked separately from proof validity so ordering policy
   /// remains explicit rather than being hidden in construction order.
+  #define REFOLD_SELECTION_PREFERENCE_LIST(REFOLD_X) \
+  REFOLD_X(Unknown) \
+  REFOLD_X(PreferStructurePreservation) \
+  REFOLD_X(PreferSurfaceRealization) \
+  REFOLD_X(PreferExactAnchoring)
+
   enum class SelectionPreference : uint8_t {
-    Unknown,
-    PreferStructurePreservation,
-    PreferSurfaceRealization,
-    PreferExactAnchoring,
+#define REFOLD_X(name) name,
+    REFOLD_SELECTION_PREFERENCE_LIST(REFOLD_X)
+#undef REFOLD_X
   };
 
-  friend inline StringRef toString(SelectionPreference preference) {
-    switch (preference) {
-    case SelectionPreference::Unknown:
-      return "Unknown";
-    case SelectionPreference::PreferStructurePreservation:
-      return "PreferStructurePreservation";
-    case SelectionPreference::PreferSurfaceRealization:
-      return "PreferSurfaceRealization";
-    case SelectionPreference::PreferExactAnchoring:
-      return "PreferExactAnchoring";
+  friend inline StringRef toString(SelectionPreference value) {
+    switch (value) {
+#define REFOLD_X(name) case SelectionPreference::name: return #name;
+      REFOLD_SELECTION_PREFERENCE_LIST(REFOLD_X)
+#undef REFOLD_X
     }
     return "Unknown";
   }
+#undef REFOLD_SELECTION_PREFERENCE_LIST
 
   /// \brief Surface realization choices kept distinct from proof metadata.
+  #define REFOLD_SURFACE_DISPOSITION_LIST(REFOLD_X) \
+  REFOLD_X(None) \
+  REFOLD_X(RealizeWholeCoverMacros) \
+  REFOLD_X(RealizeInlineTouchedIncludesFromB) \
+  REFOLD_X(RealizeMaterializedIncludeExpansion) \
+  REFOLD_X(RealizeTranslationUnitByteEdit) \
+  REFOLD_X(EmitEditedPreprocessedStream)
+
   enum class SurfaceDisposition : uint8_t {
-    None,
-    RealizeWholeCoverMacros,
-    RealizeInlineTouchedIncludesFromB,
-    RealizeMaterializedIncludeExpansion,
-    RealizeTranslationUnitByteEdit,
-    EmitEditedPreprocessedStream,
+#define REFOLD_X(name) name,
+    REFOLD_SURFACE_DISPOSITION_LIST(REFOLD_X)
+#undef REFOLD_X
   };
 
-  friend inline StringRef toString(SurfaceDisposition disposition) {
-    switch (disposition) {
-    case SurfaceDisposition::None:
-      return "None";
-    case SurfaceDisposition::RealizeWholeCoverMacros:
-      return "RealizeWholeCoverMacros";
-    case SurfaceDisposition::RealizeInlineTouchedIncludesFromB:
-      return "RealizeInlineTouchedIncludesFromB";
-    case SurfaceDisposition::RealizeMaterializedIncludeExpansion:
-      return "RealizeMaterializedIncludeExpansion";
-    case SurfaceDisposition::RealizeTranslationUnitByteEdit:
-      return "RealizeTranslationUnitByteEdit";
-    case SurfaceDisposition::EmitEditedPreprocessedStream:
-      return "EmitEditedPreprocessedStream";
+  friend inline StringRef toString(SurfaceDisposition value) {
+    switch (value) {
+#define REFOLD_X(name) case SurfaceDisposition::name: return #name;
+      REFOLD_SURFACE_DISPOSITION_LIST(REFOLD_X)
+#undef REFOLD_X
     }
     return "None";
   }
+#undef REFOLD_SURFACE_DISPOSITION_LIST
 
   /// \brief Inventory of the currently accepted execution paths.
   ///
   /// This inventory does not change how the engine refolds code. Instead it
   /// names the concrete path that produced an accepted result so we can map that
   /// path onto the future proof lattice one class at a time.
+  #define REFOLD_ACCEPTED_PATH_KIND_LIST(REFOLD_X) \
+  REFOLD_X(Unknown) \
+  REFOLD_X(MacroArgsOnlyStandard) \
+  REFOLD_X(MacroArgsOnlyPasteSingle) \
+  REFOLD_X(MacroArgsOnlyPasteMulti) \
+  REFOLD_X(MacroArgsOnlyPurePasteOnly) \
+  REFOLD_X(MacroArgsOnlyPairedPureInsertion) \
+  REFOLD_X(MacroDagSubtreeRoot) \
+  REFOLD_X(MacroCallChainSuffix) \
+  REFOLD_X(MacroCounterLiteral) \
+  REFOLD_X(MacroWholeCoverRealization) \
+  REFOLD_X(IncludePatchPendingMaterialization) \
+  REFOLD_X(IncludeDeleteReplaceMappedHeaderTokens) \
+  REFOLD_X(IncludeInsertSelectedConditionalBoundary) \
+  REFOLD_X(IncludeInsertChildBoundary) \
+  REFOLD_X(IncludeInsertRightNeighborPP) \
+  REFOLD_X(IncludeInsertLeftNeighborPP) \
+  REFOLD_X(IncludeInsertDeclBoundary) \
+  REFOLD_X(IncludeRealizationInlineFromB) \
+  REFOLD_X(IncludeMaterializedExpansion) \
+  REFOLD_X(TUExactSlotBoundary) \
+  REFOLD_X(TUProvableInsertionAnchor) \
+  REFOLD_X(TUByteSpanMappedEdit) \
+  REFOLD_X(TUByteSpanConservativeEdit) \
+  REFOLD_X(TerminalEmitEditedPreprocessedStream)
+
   enum class AcceptedPathKind : uint8_t {
-    Unknown,
-    MacroArgsOnlyStandard,
-    MacroArgsOnlyPasteSingle,
-    MacroArgsOnlyPasteMulti,
-    MacroArgsOnlyPurePasteOnly,
-    MacroArgsOnlyPairedPureInsertion,
-    MacroDagSubtreeRoot,
-    MacroCallChainSuffix,
-    MacroCounterLiteral,
-    MacroWholeCoverRealization,
-    IncludePatchPendingMaterialization,
-    IncludeDeleteReplaceMappedHeaderTokens,
-    IncludeInsertSelectedConditionalBoundary,
-    IncludeInsertChildBoundary,
-    IncludeInsertRightNeighborPP,
-    IncludeInsertLeftNeighborPP,
-    IncludeInsertDeclBoundary,
-    IncludeRealizationInlineFromB,
-    IncludeMaterializedExpansion,
-    TUExactSlotBoundary,
-    TUProvableInsertionAnchor,
-    TUByteSpanMappedEdit,
-    TUByteSpanConservativeEdit,
-    TerminalEmitEditedPreprocessedStream,
+#define REFOLD_X(name) name,
+    REFOLD_ACCEPTED_PATH_KIND_LIST(REFOLD_X)
+#undef REFOLD_X
   };
 
-  friend inline StringRef toString(AcceptedPathKind kind) {
-    switch (kind) {
-    case AcceptedPathKind::Unknown:
-      return "Unknown";
-    case AcceptedPathKind::MacroArgsOnlyStandard:
-      return "MacroArgsOnlyStandard";
-    case AcceptedPathKind::MacroArgsOnlyPasteSingle:
-      return "MacroArgsOnlyPasteSingle";
-    case AcceptedPathKind::MacroArgsOnlyPasteMulti:
-      return "MacroArgsOnlyPasteMulti";
-    case AcceptedPathKind::MacroArgsOnlyPurePasteOnly:
-      return "MacroArgsOnlyPurePasteOnly";
-    case AcceptedPathKind::MacroArgsOnlyPairedPureInsertion:
-      return "MacroArgsOnlyPairedPureInsertion";
-    case AcceptedPathKind::MacroDagSubtreeRoot:
-      return "MacroDagSubtreeRoot";
-    case AcceptedPathKind::MacroCallChainSuffix:
-      return "MacroCallChainSuffix";
-    case AcceptedPathKind::MacroCounterLiteral:
-      return "MacroCounterLiteral";
-    case AcceptedPathKind::MacroWholeCoverRealization:
-      return "MacroWholeCoverRealization";
-    case AcceptedPathKind::IncludePatchPendingMaterialization:
-      return "IncludePatchPendingMaterialization";
-    case AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens:
-      return "IncludeDeleteReplaceMappedHeaderTokens";
-    case AcceptedPathKind::IncludeInsertSelectedConditionalBoundary:
-      return "IncludeInsertSelectedConditionalBoundary";
-    case AcceptedPathKind::IncludeInsertChildBoundary:
-      return "IncludeInsertChildBoundary";
-    case AcceptedPathKind::IncludeInsertRightNeighborPP:
-      return "IncludeInsertRightNeighborPP";
-    case AcceptedPathKind::IncludeInsertLeftNeighborPP:
-      return "IncludeInsertLeftNeighborPP";
-    case AcceptedPathKind::IncludeInsertDeclBoundary:
-      return "IncludeInsertDeclBoundary";
-    case AcceptedPathKind::IncludeRealizationInlineFromB:
-      return "IncludeRealizationInlineFromB";
-    case AcceptedPathKind::IncludeMaterializedExpansion:
-      return "IncludeMaterializedExpansion";
-    case AcceptedPathKind::TUExactSlotBoundary:
-      return "TUExactSlotBoundary";
-    case AcceptedPathKind::TUProvableInsertionAnchor:
-      return "TUProvableInsertionAnchor";
-    case AcceptedPathKind::TUByteSpanMappedEdit:
-      return "TUByteSpanMappedEdit";
-    case AcceptedPathKind::TUByteSpanConservativeEdit:
-      return "TUByteSpanConservativeEdit";
-    case AcceptedPathKind::TerminalEmitEditedPreprocessedStream:
-      return "TerminalEmitEditedPreprocessedStream";
+  friend inline StringRef toString(AcceptedPathKind value) {
+    switch (value) {
+#define REFOLD_X(name) case AcceptedPathKind::name: return #name;
+      REFOLD_ACCEPTED_PATH_KIND_LIST(REFOLD_X)
+#undef REFOLD_X
     }
     return "Unknown";
   }
+#undef REFOLD_ACCEPTED_PATH_KIND_LIST
 
   /// \brief How mature the current acceptance path is in the migration plan.
+  #define REFOLD_ACCEPTANCE_SUPPORT_KIND_LIST(REFOLD_X) \
+  REFOLD_X(Unknown) \
+  REFOLD_X(ExplicitProofBacked) \
+  REFOLD_X(DeterministicButNotFirstClass) \
+  REFOLD_X(ExplicitOutOfDomainClass)
+
   enum class AcceptanceSupportKind : uint8_t {
-    Unknown,
-    ExplicitProofBacked,
-    DeterministicButNotFirstClass,
-    ExplicitOutOfDomainClass,
+#define REFOLD_X(name) name,
+    REFOLD_ACCEPTANCE_SUPPORT_KIND_LIST(REFOLD_X)
+#undef REFOLD_X
   };
 
-  friend inline StringRef toString(AcceptanceSupportKind support) {
-    switch (support) {
-    case AcceptanceSupportKind::Unknown:
-      return "Unknown";
-    case AcceptanceSupportKind::ExplicitProofBacked:
-      return "ExplicitProofBacked";
-    case AcceptanceSupportKind::DeterministicButNotFirstClass:
-      return "DeterministicButNotFirstClass";
-    case AcceptanceSupportKind::ExplicitOutOfDomainClass:
-      return "ExplicitOutOfDomainClass";
+  friend inline StringRef toString(AcceptanceSupportKind value) {
+    switch (value) {
+#define REFOLD_X(name) case AcceptanceSupportKind::name: return #name;
+      REFOLD_ACCEPTANCE_SUPPORT_KIND_LIST(REFOLD_X)
+#undef REFOLD_X
     }
     return "Unknown";
   }
+#undef REFOLD_ACCEPTANCE_SUPPORT_KIND_LIST
 
   /// \brief Future proof-class placeholder targeted by a current path.
+  #define REFOLD_FUTURE_PROOF_TARGET_LIST(REFOLD_X) \
+  REFOLD_X(Unknown, "Unknown") \
+  REFOLD_X(MacroStandardArgsOnly, "MacroStandardArgsOnly") \
+  REFOLD_X(MacroPasteSingle, "MacroPasteSingle") \
+  REFOLD_X(MacroPasteMultiFixedAnchor, "MacroPasteMultiFixedAnchor") \
+  REFOLD_X(MacroPurePasteOnly, "MacroPurePasteOnly") \
+  REFOLD_X(MacroPairedPureInsertion, "MacroPairedPureInsertion") \
+  REFOLD_X(MacroDagLift, "MacroDagLift") \
+  REFOLD_X(MacroCallChainSuffixPreservation, "MacroCallChainSuffixPreservation") \
+  REFOLD_X(MacroCounterStabilizationRealization, "MacroCounterStabilizationRealization") \
+  REFOLD_X(MacroRealizationWholeCover, "MacroRealizationWholeCover") \
+  REFOLD_X(IncludePatchByMappedHeaderTokens, "IncludePatchByMappedHeaderTokens") \
+  REFOLD_X(IncludeConditionalArmCertifiedInsertion, "IncludeConditionalArmCertifiedInsertion") \
+  REFOLD_X(IncludeInsertionByChildBoundary, "IncludeInsertionByChildBoundary") \
+  REFOLD_X(IncludeInsertionByRightNeighborPP, "IncludeInsertionByRightNeighborPP") \
+  REFOLD_X(IncludeInsertionByLeftNeighborPP, "IncludeInsertionByLeftNeighborPP") \
+  REFOLD_X(IncludeInsertionByDeclBoundary, "IncludeInsertionByDeclBoundary") \
+  REFOLD_X(IncludeRealizationCover, "IncludeRealizationCover") \
+  REFOLD_X(IncludeMaterializedExpansionRealization, "IncludeMaterializedExpansionRealization") \
+  REFOLD_X(TUExactSlotAnchor, "TUExactSlotAnchor") \
+  REFOLD_X(TUProvableInsertionAnchor, "TUProvableInsertionAnchor") \
+  REFOLD_X(TUByteSpanTextualEdit, "TUByteSpanTextualEdit") \
+  REFOLD_X(EditedPreprocessedStreamFallback, "ExplicitOutOfDomainTerminalResult")
+
   enum class FutureProofTarget : uint8_t {
-    Unknown,
-    MacroStandardArgsOnly,
-    MacroPasteSingle,
-    MacroPasteMultiFixedAnchor,
-    MacroPurePasteOnly,
-    MacroPairedPureInsertion,
-    MacroDagLift,
-    MacroCallChainSuffixPreservation,
-    MacroCounterStabilizationRealization,
-    MacroRealizationWholeCover,
-    IncludePatchByMappedHeaderTokens,
-    IncludeConditionalArmCertifiedInsertion,
-    IncludeInsertionByChildBoundary,
-    IncludeInsertionByRightNeighborPP,
-    IncludeInsertionByLeftNeighborPP,
-    IncludeInsertionByDeclBoundary,
-    IncludeRealizationCover,
-    IncludeMaterializedExpansionRealization,
-    TUExactSlotAnchor,
-    TUProvableInsertionAnchor,
-    TUByteSpanTextualEdit,
-    EditedPreprocessedStreamFallback,
+#define REFOLD_X(name, text) name,
+    REFOLD_FUTURE_PROOF_TARGET_LIST(REFOLD_X)
+#undef REFOLD_X
   };
 
-  friend inline StringRef toString(FutureProofTarget target) {
-    switch (target) {
-    case FutureProofTarget::Unknown:
-      return "Unknown";
-    case FutureProofTarget::MacroStandardArgsOnly:
-      return "MacroStandardArgsOnly";
-    case FutureProofTarget::MacroPasteSingle:
-      return "MacroPasteSingle";
-    case FutureProofTarget::MacroPasteMultiFixedAnchor:
-      return "MacroPasteMultiFixedAnchor";
-    case FutureProofTarget::MacroPurePasteOnly:
-      return "MacroPurePasteOnly";
-    case FutureProofTarget::MacroPairedPureInsertion:
-      return "MacroPairedPureInsertion";
-    case FutureProofTarget::MacroDagLift:
-      return "MacroDagLift";
-    case FutureProofTarget::MacroCallChainSuffixPreservation:
-      return "MacroCallChainSuffixPreservation";
-    case FutureProofTarget::MacroCounterStabilizationRealization:
-      return "MacroCounterStabilizationRealization";
-    case FutureProofTarget::MacroRealizationWholeCover:
-      return "MacroRealizationWholeCover";
-    case FutureProofTarget::IncludePatchByMappedHeaderTokens:
-      return "IncludePatchByMappedHeaderTokens";
-    case FutureProofTarget::IncludeConditionalArmCertifiedInsertion:
-      return "IncludeConditionalArmCertifiedInsertion";
-    case FutureProofTarget::IncludeInsertionByChildBoundary:
-      return "IncludeInsertionByChildBoundary";
-    case FutureProofTarget::IncludeInsertionByRightNeighborPP:
-      return "IncludeInsertionByRightNeighborPP";
-    case FutureProofTarget::IncludeInsertionByLeftNeighborPP:
-      return "IncludeInsertionByLeftNeighborPP";
-    case FutureProofTarget::IncludeInsertionByDeclBoundary:
-      return "IncludeInsertionByDeclBoundary";
-    case FutureProofTarget::IncludeRealizationCover:
-      return "IncludeRealizationCover";
-    case FutureProofTarget::IncludeMaterializedExpansionRealization:
-      return "IncludeMaterializedExpansionRealization";
-    case FutureProofTarget::TUExactSlotAnchor:
-      return "TUExactSlotAnchor";
-    case FutureProofTarget::TUProvableInsertionAnchor:
-      return "TUProvableInsertionAnchor";
-    case FutureProofTarget::TUByteSpanTextualEdit:
-      return "TUByteSpanTextualEdit";
-    case FutureProofTarget::EditedPreprocessedStreamFallback:
-      return "ExplicitOutOfDomainTerminalResult";
+  friend inline StringRef toString(FutureProofTarget value) {
+    switch (value) {
+#define REFOLD_X(name, text) case FutureProofTarget::name: return text;
+      REFOLD_FUTURE_PROOF_TARGET_LIST(REFOLD_X)
+#undef REFOLD_X
     }
     return "Unknown";
   }
+#undef REFOLD_FUTURE_PROOF_TARGET_LIST
 
   /// \brief Inventory record that maps a current acceptance path onto the proof
   /// lattice.
@@ -1764,84 +1687,79 @@ private:
   /// domain in which two accepted artifacts may interact so the current global
   /// selection and overlap rules can be described explicitly and audited in one
   /// place.
+  #define REFOLD_LATTICE_CONFLICT_DOMAIN_LIST(REFOLD_X) \
+  REFOLD_X(Unknown) \
+  REFOLD_X(MacroInvocationRootSpan) \
+  REFOLD_X(IncludeOwnerRegion) \
+  REFOLD_X(TUAnchorPoint) \
+  REFOLD_X(WholeTranslationUnit)
+
   enum class LatticeConflictDomain : uint8_t {
-    Unknown,
-    MacroInvocationRootSpan,
-    IncludeOwnerRegion,
-    TUAnchorPoint,
-    WholeTranslationUnit,
+#define REFOLD_X(name) name,
+    REFOLD_LATTICE_CONFLICT_DOMAIN_LIST(REFOLD_X)
+#undef REFOLD_X
   };
 
-  friend inline StringRef toString(LatticeConflictDomain domain) {
-    switch (domain) {
-    case LatticeConflictDomain::Unknown:
-      return "Unknown";
-    case LatticeConflictDomain::MacroInvocationRootSpan:
-      return "MacroInvocationRootSpan";
-    case LatticeConflictDomain::IncludeOwnerRegion:
-      return "IncludeOwnerRegion";
-    case LatticeConflictDomain::TUAnchorPoint:
-      return "TUAnchorPoint";
-    case LatticeConflictDomain::WholeTranslationUnit:
-      return "WholeTranslationUnit";
+  friend inline StringRef toString(LatticeConflictDomain value) {
+    switch (value) {
+#define REFOLD_X(name) case LatticeConflictDomain::name: return #name;
+      REFOLD_LATTICE_CONFLICT_DOMAIN_LIST(REFOLD_X)
+#undef REFOLD_X
     }
     return "Unknown";
   }
+#undef REFOLD_LATTICE_CONFLICT_DOMAIN_LIST
 
   /// \brief Merge law used when two artifacts in the same lattice domain are
   /// compatible.
+  #define REFOLD_LATTICE_MERGE_LAW_LIST(REFOLD_X) \
+  REFOLD_X(Unknown) \
+  REFOLD_X(DisjointCompose) \
+  REFOLD_X(NestedOuterShadowsInner) \
+  REFOLD_X(SelectSingleWitness) \
+  REFOLD_X(TerminalReplacesAll)
+
   enum class LatticeMergeLaw : uint8_t {
-    Unknown,
-    DisjointCompose,
-    NestedOuterShadowsInner,
-    SelectSingleWitness,
-    TerminalReplacesAll,
+#define REFOLD_X(name) name,
+    REFOLD_LATTICE_MERGE_LAW_LIST(REFOLD_X)
+#undef REFOLD_X
   };
 
-  friend inline StringRef toString(LatticeMergeLaw law) {
-    switch (law) {
-    case LatticeMergeLaw::Unknown:
-      return "Unknown";
-    case LatticeMergeLaw::DisjointCompose:
-      return "DisjointCompose";
-    case LatticeMergeLaw::NestedOuterShadowsInner:
-      return "NestedOuterShadowsInner";
-    case LatticeMergeLaw::SelectSingleWitness:
-      return "SelectSingleWitness";
-    case LatticeMergeLaw::TerminalReplacesAll:
-      return "TerminalReplacesAll";
+  friend inline StringRef toString(LatticeMergeLaw value) {
+    switch (value) {
+#define REFOLD_X(name) case LatticeMergeLaw::name: return #name;
+      REFOLD_LATTICE_MERGE_LAW_LIST(REFOLD_X)
+#undef REFOLD_X
     }
     return "Unknown";
   }
+#undef REFOLD_LATTICE_MERGE_LAW_LIST
 
   /// \brief Conflict law used when two artifacts in the same lattice domain
   /// are not simultaneously admissible.
+  #define REFOLD_LATTICE_CONFLICT_LAW_LIST(REFOLD_X) \
+  REFOLD_X(Unknown) \
+  REFOLD_X(RejectPartialOverlap) \
+  REFOLD_X(PreferStructurePreservation) \
+  REFOLD_X(PreferExactAnchorWitness) \
+  REFOLD_X(PreferOwnerPreservingBeforeRealization) \
+  REFOLD_X(ExplicitOutOfDomainTerminalResult)
+
   enum class LatticeConflictLaw : uint8_t {
-    Unknown,
-    RejectPartialOverlap,
-    PreferStructurePreservation,
-    PreferExactAnchorWitness,
-    PreferOwnerPreservingBeforeRealization,
-    ExplicitOutOfDomainTerminalResult,
+#define REFOLD_X(name) name,
+    REFOLD_LATTICE_CONFLICT_LAW_LIST(REFOLD_X)
+#undef REFOLD_X
   };
 
-  friend inline StringRef toString(LatticeConflictLaw law) {
-    switch (law) {
-    case LatticeConflictLaw::Unknown:
-      return "Unknown";
-    case LatticeConflictLaw::RejectPartialOverlap:
-      return "RejectPartialOverlap";
-    case LatticeConflictLaw::PreferStructurePreservation:
-      return "PreferStructurePreservation";
-    case LatticeConflictLaw::PreferExactAnchorWitness:
-      return "PreferExactAnchorWitness";
-    case LatticeConflictLaw::PreferOwnerPreservingBeforeRealization:
-      return "PreferOwnerPreservingBeforeRealization";
-    case LatticeConflictLaw::ExplicitOutOfDomainTerminalResult:
-      return "ExplicitOutOfDomainTerminalResult";
+  friend inline StringRef toString(LatticeConflictLaw value) {
+    switch (value) {
+#define REFOLD_X(name) case LatticeConflictLaw::name: return #name;
+      REFOLD_LATTICE_CONFLICT_LAW_LIST(REFOLD_X)
+#undef REFOLD_X
     }
     return "Unknown";
   }
+#undef REFOLD_LATTICE_CONFLICT_LAW_LIST
 
   /// \brief Normalized description of the current global lattice law.
   struct GlobalSelectionLattice {
@@ -1858,48 +1776,50 @@ private:
   /// already correspond to a declared proof class, remain transitional while a
   /// class is still being closed, or sit outside the declared class set
   /// entirely (for example an explicit terminal out-of-domain result).
+  #define REFOLD_COMPLETENESS_COVERAGE_KIND_LIST(REFOLD_X) \
+  REFOLD_X(Unknown) \
+  REFOLD_X(DeclaredProofClass) \
+  REFOLD_X(TransitionalGap) \
+  REFOLD_X(ExplicitOutOfDomainClass)
+
   enum class CompletenessCoverageKind : uint8_t {
-    Unknown,
-    DeclaredProofClass,
-    TransitionalGap,
-    ExplicitOutOfDomainClass,
+#define REFOLD_X(name) name,
+    REFOLD_COMPLETENESS_COVERAGE_KIND_LIST(REFOLD_X)
+#undef REFOLD_X
   };
 
-  friend inline StringRef toString(CompletenessCoverageKind kind) {
-    switch (kind) {
-    case CompletenessCoverageKind::Unknown:
-      return "Unknown";
-    case CompletenessCoverageKind::DeclaredProofClass:
-      return "DeclaredProofClass";
-    case CompletenessCoverageKind::TransitionalGap:
-      return "TransitionalGap";
-    case CompletenessCoverageKind::ExplicitOutOfDomainClass:
-      return "ExplicitOutOfDomainClass";
+  friend inline StringRef toString(CompletenessCoverageKind value) {
+    switch (value) {
+#define REFOLD_X(name) case CompletenessCoverageKind::name: return #name;
+      REFOLD_COMPLETENESS_COVERAGE_KIND_LIST(REFOLD_X)
+#undef REFOLD_X
     }
     return "Unknown";
   }
+#undef REFOLD_COMPLETENESS_COVERAGE_KIND_LIST
 
   /// \brief What completeness promise the engine makes for a covered path.
+  #define REFOLD_COMPLETENESS_EXPECTATION_KIND_LIST(REFOLD_X) \
+  REFOLD_X(Unknown) \
+  REFOLD_X(MustDiscoverDeclaredOrStrongerCompatible) \
+  REFOLD_X(NoClaimPendingClassClosure) \
+  REFOLD_X(ExplicitlyOutsideDeclaredSet)
+
   enum class CompletenessExpectationKind : uint8_t {
-    Unknown,
-    MustDiscoverDeclaredOrStrongerCompatible,
-    NoClaimPendingClassClosure,
-    ExplicitlyOutsideDeclaredSet,
+#define REFOLD_X(name) name,
+    REFOLD_COMPLETENESS_EXPECTATION_KIND_LIST(REFOLD_X)
+#undef REFOLD_X
   };
 
-  friend inline StringRef toString(CompletenessExpectationKind kind) {
-    switch (kind) {
-    case CompletenessExpectationKind::Unknown:
-      return "Unknown";
-    case CompletenessExpectationKind::MustDiscoverDeclaredOrStrongerCompatible:
-      return "MustDiscoverDeclaredOrStrongerCompatible";
-    case CompletenessExpectationKind::NoClaimPendingClassClosure:
-      return "NoClaimPendingClassClosure";
-    case CompletenessExpectationKind::ExplicitlyOutsideDeclaredSet:
-      return "ExplicitlyOutsideDeclaredSet";
+  friend inline StringRef toString(CompletenessExpectationKind value) {
+    switch (value) {
+#define REFOLD_X(name) case CompletenessExpectationKind::name: return #name;
+      REFOLD_COMPLETENESS_EXPECTATION_KIND_LIST(REFOLD_X)
+#undef REFOLD_X
     }
     return "Unknown";
   }
+#undef REFOLD_COMPLETENESS_EXPECTATION_KIND_LIST
 
   /// \brief Normalized completeness contract for the declared domain above.
   ///
@@ -1923,26 +1843,27 @@ private:
   /// statement: theorem-facing results are either in-domain declared proof
   /// classes or explicit named out-of-domain classes. Transitional states may
   /// still exist internally, but they are not allowed to survive to emission.
+  #define REFOLD_THEOREM_DOMAIN_KIND_LIST(REFOLD_X) \
+  REFOLD_X(Unknown) \
+  REFOLD_X(DeclaredInDomainClass) \
+  REFOLD_X(TransitionalGap) \
+  REFOLD_X(ExplicitOutOfDomainClass)
+
   enum class TheoremDomainKind : uint8_t {
-    Unknown,
-    DeclaredInDomainClass,
-    TransitionalGap,
-    ExplicitOutOfDomainClass,
+#define REFOLD_X(name) name,
+    REFOLD_THEOREM_DOMAIN_KIND_LIST(REFOLD_X)
+#undef REFOLD_X
   };
 
-  friend inline StringRef toString(TheoremDomainKind kind) {
-    switch (kind) {
-    case TheoremDomainKind::Unknown:
-      return "Unknown";
-    case TheoremDomainKind::DeclaredInDomainClass:
-      return "DeclaredInDomainClass";
-    case TheoremDomainKind::TransitionalGap:
-      return "TransitionalGap";
-    case TheoremDomainKind::ExplicitOutOfDomainClass:
-      return "ExplicitOutOfDomainClass";
+  friend inline StringRef toString(TheoremDomainKind value) {
+    switch (value) {
+#define REFOLD_X(name) case TheoremDomainKind::name: return #name;
+      REFOLD_THEOREM_DOMAIN_KIND_LIST(REFOLD_X)
+#undef REFOLD_X
     }
     return "Unknown";
   }
+#undef REFOLD_THEOREM_DOMAIN_KIND_LIST
 
   /// \brief Explicit theorem-domain contract derived from the same statement.
   ///
@@ -1964,38 +1885,31 @@ private:
   /// Deterministic TU anchoring rules are represented as explicit proof
   /// witnesses so accepted TU-owned insertions can explain which anchor source
   /// was used and which non-crossing facts were relied upon.
+  #define REFOLD_TUANCHOR_EVIDENCE_KIND_LIST(REFOLD_X) \
+  REFOLD_X(Unknown) \
+  REFOLD_X(ExactSlotBoundary) \
+  REFOLD_X(ArgLikeBegin) \
+  REFOLD_X(ImmediateRightNeighbor) \
+  REFOLD_X(ImmediateLeftNeighbor) \
+  REFOLD_X(IncludeDirectiveBoundary) \
+  REFOLD_X(CorroboratedRightNeighbor) \
+  REFOLD_X(CorroboratedLeftNeighbor)
+
   enum class TUAnchorEvidenceKind : uint8_t {
-    Unknown,
-    ExactSlotBoundary,
-    ArgLikeBegin,
-    ImmediateRightNeighbor,
-    ImmediateLeftNeighbor,
-    IncludeDirectiveBoundary,
-    CorroboratedRightNeighbor,
-    CorroboratedLeftNeighbor,
+#define REFOLD_X(name) name,
+    REFOLD_TUANCHOR_EVIDENCE_KIND_LIST(REFOLD_X)
+#undef REFOLD_X
   };
 
-  friend inline StringRef toString(TUAnchorEvidenceKind kind) {
-    switch (kind) {
-    case TUAnchorEvidenceKind::Unknown:
-      return "Unknown";
-    case TUAnchorEvidenceKind::ExactSlotBoundary:
-      return "ExactSlotBoundary";
-    case TUAnchorEvidenceKind::ArgLikeBegin:
-      return "ArgLikeBegin";
-    case TUAnchorEvidenceKind::ImmediateRightNeighbor:
-      return "ImmediateRightNeighbor";
-    case TUAnchorEvidenceKind::ImmediateLeftNeighbor:
-      return "ImmediateLeftNeighbor";
-    case TUAnchorEvidenceKind::IncludeDirectiveBoundary:
-      return "IncludeDirectiveBoundary";
-    case TUAnchorEvidenceKind::CorroboratedRightNeighbor:
-      return "CorroboratedRightNeighbor";
-    case TUAnchorEvidenceKind::CorroboratedLeftNeighbor:
-      return "CorroboratedLeftNeighbor";
+  friend inline StringRef toString(TUAnchorEvidenceKind value) {
+    switch (value) {
+#define REFOLD_X(name) case TUAnchorEvidenceKind::name: return #name;
+      REFOLD_TUANCHOR_EVIDENCE_KIND_LIST(REFOLD_X)
+#undef REFOLD_X
     }
     return "Unknown";
   }
+#undef REFOLD_TUANCHOR_EVIDENCE_KIND_LIST
 
   /// \brief Compact witness for an accepted TU anchor.
   struct TUAnchorWitness {
@@ -2030,35 +1944,30 @@ private:
   /// Include-preserving materialization paths use explicit local witnesses so
   /// each accepted include patch can explain which deterministic
   /// anchoring or mapping rule was used.
+  #define REFOLD_INCLUDE_ANCHOR_EVIDENCE_KIND_LIST(REFOLD_X) \
+  REFOLD_X(Unknown) \
+  REFOLD_X(MappedHeaderTokens) \
+  REFOLD_X(SelectedConditionalBoundary) \
+  REFOLD_X(ChildBoundary) \
+  REFOLD_X(RightNeighborPP) \
+  REFOLD_X(LeftNeighborPP) \
+  REFOLD_X(DeclBoundary)
+
   enum class IncludeAnchorEvidenceKind : uint8_t {
-    Unknown,
-    MappedHeaderTokens,
-    SelectedConditionalBoundary,
-    ChildBoundary,
-    RightNeighborPP,
-    LeftNeighborPP,
-    DeclBoundary,
+#define REFOLD_X(name) name,
+    REFOLD_INCLUDE_ANCHOR_EVIDENCE_KIND_LIST(REFOLD_X)
+#undef REFOLD_X
   };
 
-  friend inline StringRef toString(IncludeAnchorEvidenceKind kind) {
-    switch (kind) {
-    case IncludeAnchorEvidenceKind::Unknown:
-      return "Unknown";
-    case IncludeAnchorEvidenceKind::MappedHeaderTokens:
-      return "MappedHeaderTokens";
-    case IncludeAnchorEvidenceKind::SelectedConditionalBoundary:
-      return "SelectedConditionalBoundary";
-    case IncludeAnchorEvidenceKind::ChildBoundary:
-      return "ChildBoundary";
-    case IncludeAnchorEvidenceKind::RightNeighborPP:
-      return "RightNeighborPP";
-    case IncludeAnchorEvidenceKind::LeftNeighborPP:
-      return "LeftNeighborPP";
-    case IncludeAnchorEvidenceKind::DeclBoundary:
-      return "DeclBoundary";
+  friend inline StringRef toString(IncludeAnchorEvidenceKind value) {
+    switch (value) {
+#define REFOLD_X(name) case IncludeAnchorEvidenceKind::name: return #name;
+      REFOLD_INCLUDE_ANCHOR_EVIDENCE_KIND_LIST(REFOLD_X)
+#undef REFOLD_X
     }
     return "Unknown";
   }
+#undef REFOLD_INCLUDE_ANCHOR_EVIDENCE_KIND_LIST
 
   /// \brief Compact witness for an accepted include-preserving path.
   struct IncludeAnchorWitness {
@@ -2101,23 +2010,26 @@ private:
   /// projections. Any include realization that cannot produce one of those two
   /// witnesses remains outside the declared domain and must terminate via the
   /// explicit terminal fallback instead of manufacturing a weaker proof class.
+  #define REFOLD_INCLUDE_REALIZATION_EVIDENCE_KIND_LIST(REFOLD_X) \
+  REFOLD_X(Unknown) \
+  REFOLD_X(CanonicalBCoverEnvelope) \
+  REFOLD_X(ConsensusRescuedBCoverEnvelope)
+
   enum class IncludeRealizationEvidenceKind : uint8_t {
-    Unknown,
-    CanonicalBCoverEnvelope,
-    ConsensusRescuedBCoverEnvelope,
+#define REFOLD_X(name) name,
+    REFOLD_INCLUDE_REALIZATION_EVIDENCE_KIND_LIST(REFOLD_X)
+#undef REFOLD_X
   };
 
-  friend inline StringRef toString(IncludeRealizationEvidenceKind kind) {
-    switch (kind) {
-    case IncludeRealizationEvidenceKind::Unknown:
-      return "Unknown";
-    case IncludeRealizationEvidenceKind::CanonicalBCoverEnvelope:
-      return "CanonicalBCoverEnvelope";
-    case IncludeRealizationEvidenceKind::ConsensusRescuedBCoverEnvelope:
-      return "ConsensusRescuedBCoverEnvelope";
+  friend inline StringRef toString(IncludeRealizationEvidenceKind value) {
+    switch (value) {
+#define REFOLD_X(name) case IncludeRealizationEvidenceKind::name: return #name;
+      REFOLD_INCLUDE_REALIZATION_EVIDENCE_KIND_LIST(REFOLD_X)
+#undef REFOLD_X
     }
     return "Unknown";
   }
+#undef REFOLD_INCLUDE_REALIZATION_EVIDENCE_KIND_LIST
 
   /// \brief Compact witness for an accepted include realization path.
   struct IncludeRealizationWitness {
@@ -2140,298 +2052,153 @@ private:
   /// participation gate, while the remaining construction paths still mirror
   /// their local facts into the same record so the theorem boundary stays
   /// explicit during migration.
+  #define REFOLD_PROOF_DISCHARGE_STATUS_LIST(REFOLD_X) \
+  REFOLD_X(Unknown) \
+  REFOLD_X(PendingMaterialization) \
+  REFOLD_X(Discharged) \
+  REFOLD_X(Rejected)
+
   enum class ProofDischargeStatus : uint8_t {
-    Unknown,
-    PendingMaterialization,
-    Discharged,
-    Rejected,
+#define REFOLD_X(name) name,
+    REFOLD_PROOF_DISCHARGE_STATUS_LIST(REFOLD_X)
+#undef REFOLD_X
   };
 
-  friend inline StringRef toString(ProofDischargeStatus status) {
-    switch (status) {
-    case ProofDischargeStatus::Unknown:
-      return "Unknown";
-    case ProofDischargeStatus::PendingMaterialization:
-      return "PendingMaterialization";
-    case ProofDischargeStatus::Discharged:
-      return "Discharged";
-    case ProofDischargeStatus::Rejected:
-      return "Rejected";
+  friend inline StringRef toString(ProofDischargeStatus value) {
+    switch (value) {
+#define REFOLD_X(name) case ProofDischargeStatus::name: return #name;
+      REFOLD_PROOF_DISCHARGE_STATUS_LIST(REFOLD_X)
+#undef REFOLD_X
     }
     return "Unknown";
   }
+#undef REFOLD_PROOF_DISCHARGE_STATUS_LIST
 
   /// \brief Named local obligations used by proof-discharge records.
+#define REFOLD_PROOF_OBLIGATION_KIND_LIST(REFOLD_X) \
+  REFOLD_X(Unknown) \
+  REFOLD_X(AcceptedPathClassified) \
+  REFOLD_X(FutureTargetMapped) \
+  REFOLD_X(LegacyValidationRecorded) \
+  REFOLD_X(StructureMatchesAcceptedClass) \
+  REFOLD_X(ProofRootTracked) \
+  REFOLD_X(MacroProofRootResolved) \
+  REFOLD_X(MacroProofRootIsTopLevel) \
+  REFOLD_X(MacroPasteWitnessPresent) \
+  REFOLD_X(MacroPasteWitnessWellFormed) \
+  REFOLD_X(MacroPasteFreeSurfaceTracked) \
+  REFOLD_X(MacroSubtreeCertificateTracked) \
+  REFOLD_X(MacroCallChainWitnessTracked) \
+  REFOLD_X(SubtreeAdmissibilityTracked) \
+  REFOLD_X(WholeCoverBoundsTracked) \
+  REFOLD_X(WholeCoverContainmentTracked) \
+  REFOLD_X(WholeCoverBoundaryAccountingTracked) \
+  REFOLD_X(IncludePendingMaterializationClassified) \
+  REFOLD_X(IncludePatchShapeTracked) \
+  REFOLD_X(IncludeAnchorWitnessTracked) \
+  REFOLD_X(IncludeAnchorByteTracked) \
+  REFOLD_X(IncludeConditionalOwnershipTracked) \
+  REFOLD_X(IncludeMappedHeaderRangeTracked) \
+  REFOLD_X(IncludeMappedHeaderByteRangeTracked) \
+  REFOLD_X(IncludeSelectedConditionalBoundaryWitnessTracked) \
+  REFOLD_X(IncludeChildBoundaryWitnessTracked) \
+  REFOLD_X(IncludeRightNeighborWitnessTracked) \
+  REFOLD_X(IncludeLeftNeighborWitnessTracked) \
+  REFOLD_X(IncludeDeclBoundaryWitnessTracked) \
+  REFOLD_X(IncludeRealizationWitnessTracked) \
+  REFOLD_X(IncludeRealizationIncludeTracked) \
+  REFOLD_X(IncludeRealizationCoverTracked) \
+  REFOLD_X(IncludeRealizationBEnvelopeTracked) \
+  REFOLD_X(TUAnchorPathClassified) \
+  REFOLD_X(TUAnchorWitnessTracked) \
+  REFOLD_X(TUAnchorPPGapTracked) \
+  REFOLD_X(TUAnchorByteTracked) \
+  REFOLD_X(TUExactSlotWitnessTracked) \
+  REFOLD_X(TUProvableEvidenceTracked) \
+  REFOLD_X(TUOutsideIncludeCoverageTracked) \
+  REFOLD_X(TUOwnerDepthStableTracked) \
+  REFOLD_X(ExplicitOutOfDomainResultTracked)
+
   enum class ProofObligationKind : uint8_t {
-    Unknown,
-    AcceptedPathClassified,
-    FutureTargetMapped,
-    LegacyValidationRecorded,
-    StructureMatchesAcceptedClass,
-    ProofRootTracked,
-    MacroProofRootResolved,
-    MacroProofRootIsTopLevel,
-    MacroPasteWitnessPresent,
-    MacroPasteWitnessWellFormed,
-    MacroPasteFreeSurfaceTracked,
-    MacroSubtreeCertificateTracked,
-    MacroCallChainWitnessTracked,
-    SubtreeAdmissibilityTracked,
-    WholeCoverBoundsTracked,
-    WholeCoverContainmentTracked,
-    WholeCoverBoundaryAccountingTracked,
-    IncludePendingMaterializationClassified,
-    IncludePatchShapeTracked,
-    IncludeAnchorWitnessTracked,
-    IncludeAnchorByteTracked,
-    IncludeConditionalOwnershipTracked,
-    IncludeMappedHeaderRangeTracked,
-    IncludeMappedHeaderByteRangeTracked,
-    IncludeSelectedConditionalBoundaryWitnessTracked,
-    IncludeChildBoundaryWitnessTracked,
-    IncludeRightNeighborWitnessTracked,
-    IncludeLeftNeighborWitnessTracked,
-    IncludeDeclBoundaryWitnessTracked,
-    IncludeRealizationWitnessTracked,
-    IncludeRealizationIncludeTracked,
-    IncludeRealizationCoverTracked,
-    IncludeRealizationBEnvelopeTracked,
-    TUAnchorPathClassified,
-    TUAnchorWitnessTracked,
-    TUAnchorPPGapTracked,
-    TUAnchorByteTracked,
-    TUExactSlotWitnessTracked,
-    TUProvableEvidenceTracked,
-    TUOutsideIncludeCoverageTracked,
-    TUOwnerDepthStableTracked,
-    ExplicitOutOfDomainResultTracked,
+#define REFOLD_X(name) name,
+    REFOLD_PROOF_OBLIGATION_KIND_LIST(REFOLD_X)
+#undef REFOLD_X
   };
 
   friend inline StringRef toString(ProofObligationKind obligation) {
     switch (obligation) {
-    case ProofObligationKind::Unknown:
-      return "Unknown";
-    case ProofObligationKind::AcceptedPathClassified:
-      return "AcceptedPathClassified";
-    case ProofObligationKind::FutureTargetMapped:
-      return "FutureTargetMapped";
-    case ProofObligationKind::LegacyValidationRecorded:
-      return "LegacyValidationRecorded";
-    case ProofObligationKind::StructureMatchesAcceptedClass:
-      return "StructureMatchesAcceptedClass";
-    case ProofObligationKind::ProofRootTracked:
-      return "ProofRootTracked";
-    case ProofObligationKind::MacroProofRootResolved:
-      return "MacroProofRootResolved";
-    case ProofObligationKind::MacroProofRootIsTopLevel:
-      return "MacroProofRootIsTopLevel";
-    case ProofObligationKind::MacroPasteWitnessPresent:
-      return "MacroPasteWitnessPresent";
-    case ProofObligationKind::MacroPasteWitnessWellFormed:
-      return "MacroPasteWitnessWellFormed";
-    case ProofObligationKind::MacroPasteFreeSurfaceTracked:
-      return "MacroPasteFreeSurfaceTracked";
-    case ProofObligationKind::MacroSubtreeCertificateTracked:
-      return "MacroSubtreeCertificateTracked";
-    case ProofObligationKind::MacroCallChainWitnessTracked:
-      return "MacroCallChainWitnessTracked";
-    case ProofObligationKind::SubtreeAdmissibilityTracked:
-      return "SubtreeAdmissibilityTracked";
-    case ProofObligationKind::WholeCoverBoundsTracked:
-      return "WholeCoverBoundsTracked";
-    case ProofObligationKind::WholeCoverContainmentTracked:
-      return "WholeCoverContainmentTracked";
-    case ProofObligationKind::WholeCoverBoundaryAccountingTracked:
-      return "WholeCoverBoundaryAccountingTracked";
-    case ProofObligationKind::IncludePendingMaterializationClassified:
-      return "IncludePendingMaterializationClassified";
-    case ProofObligationKind::IncludePatchShapeTracked:
-      return "IncludePatchShapeTracked";
-    case ProofObligationKind::IncludeAnchorWitnessTracked:
-      return "IncludeAnchorWitnessTracked";
-    case ProofObligationKind::IncludeAnchorByteTracked:
-      return "IncludeAnchorByteTracked";
-    case ProofObligationKind::IncludeConditionalOwnershipTracked:
-      return "IncludeConditionalOwnershipTracked";
-    case ProofObligationKind::IncludeMappedHeaderRangeTracked:
-      return "IncludeMappedHeaderRangeTracked";
-    case ProofObligationKind::IncludeMappedHeaderByteRangeTracked:
-      return "IncludeMappedHeaderByteRangeTracked";
-    case ProofObligationKind::IncludeSelectedConditionalBoundaryWitnessTracked:
-      return "IncludeSelectedConditionalBoundaryWitnessTracked";
-    case ProofObligationKind::IncludeChildBoundaryWitnessTracked:
-      return "IncludeChildBoundaryWitnessTracked";
-    case ProofObligationKind::IncludeRightNeighborWitnessTracked:
-      return "IncludeRightNeighborWitnessTracked";
-    case ProofObligationKind::IncludeLeftNeighborWitnessTracked:
-      return "IncludeLeftNeighborWitnessTracked";
-    case ProofObligationKind::IncludeDeclBoundaryWitnessTracked:
-      return "IncludeDeclBoundaryWitnessTracked";
-    case ProofObligationKind::IncludeRealizationWitnessTracked:
-      return "IncludeRealizationWitnessTracked";
-    case ProofObligationKind::IncludeRealizationIncludeTracked:
-      return "IncludeRealizationIncludeTracked";
-    case ProofObligationKind::IncludeRealizationCoverTracked:
-      return "IncludeRealizationCoverTracked";
-    case ProofObligationKind::IncludeRealizationBEnvelopeTracked:
-      return "IncludeRealizationBEnvelopeTracked";
-    case ProofObligationKind::TUAnchorPathClassified:
-      return "TUAnchorPathClassified";
-    case ProofObligationKind::TUAnchorWitnessTracked:
-      return "TUAnchorWitnessTracked";
-    case ProofObligationKind::TUAnchorPPGapTracked:
-      return "TUAnchorPPGapTracked";
-    case ProofObligationKind::TUAnchorByteTracked:
-      return "TUAnchorByteTracked";
-    case ProofObligationKind::TUExactSlotWitnessTracked:
-      return "TUExactSlotWitnessTracked";
-    case ProofObligationKind::TUProvableEvidenceTracked:
-      return "TUProvableEvidenceTracked";
-    case ProofObligationKind::TUOutsideIncludeCoverageTracked:
-      return "TUOutsideIncludeCoverageTracked";
-    case ProofObligationKind::TUOwnerDepthStableTracked:
-      return "TUOwnerDepthStableTracked";
-    case ProofObligationKind::ExplicitOutOfDomainResultTracked:
-      return "ExplicitOutOfDomainResultTracked";
+#define REFOLD_X(name)                                                        \
+  case ProofObligationKind::name:                                             \
+    return #name;
+      REFOLD_PROOF_OBLIGATION_KIND_LIST(REFOLD_X)
+#undef REFOLD_X
     }
     return "Unknown";
   }
+#undef REFOLD_PROOF_OBLIGATION_KIND_LIST
 
   /// \brief Why a local proof contract could not be discharged.
+#define REFOLD_PROOF_FAILURE_REASON_LIST(REFOLD_X) \
+  REFOLD_X(None) \
+  REFOLD_X(PendingMaterialization) \
+  REFOLD_X(MissingAcceptedPathClassification) \
+  REFOLD_X(MissingFutureTargetMapping) \
+  REFOLD_X(MissingLegacyValidation) \
+  REFOLD_X(StructuralMismatch) \
+  REFOLD_X(MissingProofRoot) \
+  REFOLD_X(MissingMacroProofRootResolution) \
+  REFOLD_X(NonTopLevelMacroProofRoot) \
+  REFOLD_X(MissingPasteWitness) \
+  REFOLD_X(MalformedPasteWitness) \
+  REFOLD_X(UnexpectedPasteSurface) \
+  REFOLD_X(MissingSubtreeCertificate) \
+  REFOLD_X(MissingCallChainWitness) \
+  REFOLD_X(MissingSubtreeAdmissibility) \
+  REFOLD_X(MissingWholeCoverBounds) \
+  REFOLD_X(MissingWholeCoverContainment) \
+  REFOLD_X(MissingWholeCoverBoundaryAccounting) \
+  REFOLD_X(MissingIncludePatchShape) \
+  REFOLD_X(MissingIncludeAnchorWitness) \
+  REFOLD_X(MissingIncludeAnchorByte) \
+  REFOLD_X(MissingConditionalOwnership) \
+  REFOLD_X(MissingMappedHeaderRange) \
+  REFOLD_X(MissingMappedHeaderByteRange) \
+  REFOLD_X(MissingIncludeSelectedConditionalBoundaryWitness) \
+  REFOLD_X(MissingIncludeChildBoundaryWitness) \
+  REFOLD_X(MissingIncludeRightNeighborWitness) \
+  REFOLD_X(MissingIncludeLeftNeighborWitness) \
+  REFOLD_X(MissingIncludeDeclBoundaryWitness) \
+  REFOLD_X(MissingIncludeRealizationWitness) \
+  REFOLD_X(MissingIncludeRealizationInclude) \
+  REFOLD_X(MissingIncludeRealizationCover) \
+  REFOLD_X(MissingIncludeRealizationBEnvelope) \
+  REFOLD_X(MissingTUAnchorClassification) \
+  REFOLD_X(MissingTUAnchorWitness) \
+  REFOLD_X(MissingTUAnchorGap) \
+  REFOLD_X(MissingTUAnchorByte) \
+  REFOLD_X(MissingTUExactSlotWitness) \
+  REFOLD_X(MissingTUProvableAnchorWitness) \
+  REFOLD_X(MissingTUOutsideIncludeCoverageProof) \
+  REFOLD_X(MissingTUOwnerDepthStability) \
+  REFOLD_X(ExplicitOutOfDomainResult)
+
   enum class ProofFailureReason : uint8_t {
-    None,
-    PendingMaterialization,
-    MissingAcceptedPathClassification,
-    MissingFutureTargetMapping,
-    MissingLegacyValidation,
-    StructuralMismatch,
-    MissingProofRoot,
-    MissingMacroProofRootResolution,
-    NonTopLevelMacroProofRoot,
-    MissingPasteWitness,
-    MalformedPasteWitness,
-    UnexpectedPasteSurface,
-    MissingSubtreeCertificate,
-    MissingCallChainWitness,
-    MissingSubtreeAdmissibility,
-    MissingWholeCoverBounds,
-    MissingWholeCoverContainment,
-    MissingWholeCoverBoundaryAccounting,
-    MissingIncludePatchShape,
-    MissingIncludeAnchorWitness,
-    MissingIncludeAnchorByte,
-    MissingConditionalOwnership,
-    MissingMappedHeaderRange,
-    MissingMappedHeaderByteRange,
-    MissingIncludeSelectedConditionalBoundaryWitness,
-    MissingIncludeChildBoundaryWitness,
-    MissingIncludeRightNeighborWitness,
-    MissingIncludeLeftNeighborWitness,
-    MissingIncludeDeclBoundaryWitness,
-    MissingIncludeRealizationWitness,
-    MissingIncludeRealizationInclude,
-    MissingIncludeRealizationCover,
-    MissingIncludeRealizationBEnvelope,
-    MissingTUAnchorClassification,
-    MissingTUAnchorWitness,
-    MissingTUAnchorGap,
-    MissingTUAnchorByte,
-    MissingTUExactSlotWitness,
-    MissingTUProvableAnchorWitness,
-    MissingTUOutsideIncludeCoverageProof,
-    MissingTUOwnerDepthStability,
-    ExplicitOutOfDomainResult,
+#define REFOLD_X(name) name,
+    REFOLD_PROOF_FAILURE_REASON_LIST(REFOLD_X)
+#undef REFOLD_X
   };
 
   friend inline StringRef toString(ProofFailureReason reason) {
     switch (reason) {
-    case ProofFailureReason::None:
-      return "None";
-    case ProofFailureReason::PendingMaterialization:
-      return "PendingMaterialization";
-    case ProofFailureReason::MissingAcceptedPathClassification:
-      return "MissingAcceptedPathClassification";
-    case ProofFailureReason::MissingFutureTargetMapping:
-      return "MissingFutureTargetMapping";
-    case ProofFailureReason::MissingLegacyValidation:
-      return "MissingLegacyValidation";
-    case ProofFailureReason::StructuralMismatch:
-      return "StructuralMismatch";
-    case ProofFailureReason::MissingProofRoot:
-      return "MissingProofRoot";
-    case ProofFailureReason::MissingMacroProofRootResolution:
-      return "MissingMacroProofRootResolution";
-    case ProofFailureReason::NonTopLevelMacroProofRoot:
-      return "NonTopLevelMacroProofRoot";
-    case ProofFailureReason::MissingPasteWitness:
-      return "MissingPasteWitness";
-    case ProofFailureReason::MalformedPasteWitness:
-      return "MalformedPasteWitness";
-    case ProofFailureReason::UnexpectedPasteSurface:
-      return "UnexpectedPasteSurface";
-    case ProofFailureReason::MissingSubtreeCertificate:
-      return "MissingSubtreeCertificate";
-    case ProofFailureReason::MissingCallChainWitness:
-      return "MissingCallChainWitness";
-    case ProofFailureReason::MissingSubtreeAdmissibility:
-      return "MissingSubtreeAdmissibility";
-    case ProofFailureReason::MissingWholeCoverBounds:
-      return "MissingWholeCoverBounds";
-    case ProofFailureReason::MissingWholeCoverContainment:
-      return "MissingWholeCoverContainment";
-    case ProofFailureReason::MissingWholeCoverBoundaryAccounting:
-      return "MissingWholeCoverBoundaryAccounting";
-    case ProofFailureReason::MissingIncludePatchShape:
-      return "MissingIncludePatchShape";
-    case ProofFailureReason::MissingIncludeAnchorWitness:
-      return "MissingIncludeAnchorWitness";
-    case ProofFailureReason::MissingIncludeAnchorByte:
-      return "MissingIncludeAnchorByte";
-    case ProofFailureReason::MissingConditionalOwnership:
-      return "MissingConditionalOwnership";
-    case ProofFailureReason::MissingMappedHeaderRange:
-      return "MissingMappedHeaderRange";
-    case ProofFailureReason::MissingMappedHeaderByteRange:
-      return "MissingMappedHeaderByteRange";
-    case ProofFailureReason::MissingIncludeSelectedConditionalBoundaryWitness:
-      return "MissingIncludeSelectedConditionalBoundaryWitness";
-    case ProofFailureReason::MissingIncludeChildBoundaryWitness:
-      return "MissingIncludeChildBoundaryWitness";
-    case ProofFailureReason::MissingIncludeRightNeighborWitness:
-      return "MissingIncludeRightNeighborWitness";
-    case ProofFailureReason::MissingIncludeLeftNeighborWitness:
-      return "MissingIncludeLeftNeighborWitness";
-    case ProofFailureReason::MissingIncludeDeclBoundaryWitness:
-      return "MissingIncludeDeclBoundaryWitness";
-    case ProofFailureReason::MissingIncludeRealizationWitness:
-      return "MissingIncludeRealizationWitness";
-    case ProofFailureReason::MissingIncludeRealizationInclude:
-      return "MissingIncludeRealizationInclude";
-    case ProofFailureReason::MissingIncludeRealizationCover:
-      return "MissingIncludeRealizationCover";
-    case ProofFailureReason::MissingIncludeRealizationBEnvelope:
-      return "MissingIncludeRealizationBEnvelope";
-    case ProofFailureReason::MissingTUAnchorClassification:
-      return "MissingTUAnchorClassification";
-    case ProofFailureReason::MissingTUAnchorWitness:
-      return "MissingTUAnchorWitness";
-    case ProofFailureReason::MissingTUAnchorGap:
-      return "MissingTUAnchorGap";
-    case ProofFailureReason::MissingTUAnchorByte:
-      return "MissingTUAnchorByte";
-    case ProofFailureReason::MissingTUExactSlotWitness:
-      return "MissingTUExactSlotWitness";
-    case ProofFailureReason::MissingTUProvableAnchorWitness:
-      return "MissingTUProvableAnchorWitness";
-    case ProofFailureReason::MissingTUOutsideIncludeCoverageProof:
-      return "MissingTUOutsideIncludeCoverageProof";
-    case ProofFailureReason::MissingTUOwnerDepthStability:
-      return "MissingTUOwnerDepthStability";
-    case ProofFailureReason::ExplicitOutOfDomainResult:
-      return "ExplicitOutOfDomainResult";
+#define REFOLD_X(name)                                                        \
+  case ProofFailureReason::name:                                              \
+    return #name;
+      REFOLD_PROOF_FAILURE_REASON_LIST(REFOLD_X)
+#undef REFOLD_X
     }
     return "None";
   }
+#undef REFOLD_PROOF_FAILURE_REASON_LIST
 
   /// \brief Compact record of class-local obligation discharge.
   struct ProofDischargeRecord {
@@ -2450,6 +2217,32 @@ private:
   /// implementation reuse the normalized proof types without widening
   /// RefoldEngine's public API.
   struct ProofDischargeAccumulator;
+  struct ProofSummary;
+  struct IncludePatch;
+
+  void RequireAcceptedPathBaseline(
+      ProofDischargeAccumulator &discharge,
+      const AcceptancePathInventory &inventory) const;
+  ProofDischargeRecord BuildAcceptedPathBaselineDischarge(
+      const AcceptancePathInventory &inventory,
+      bool explicitOutOfDomain = false) const;
+  void ConfigureProofSummary(ProofSummary &summary, AcceptedProofClass acceptedClass,
+                             RealizationMode realizationMode,
+                             SelectionPreference preference,
+                             SurfaceDisposition surfaceDisposition,
+                             bool structurePreserving) const;
+  void FinalizeProofSummary(ProofSummary &summary) const;
+  void RequireIncludeZeroWidthAnchor(
+      ProofDischargeAccumulator &discharge, const IncludePatch &patch,
+      const IncludeAnchorWitness *witness, IncludeAnchorEvidenceKind evidence,
+      ProofObligationKind witnessObligation,
+      ProofFailureReason witnessFailure) const;
+  bool TUAnchorWitnessHasProvableEvidence(
+      const TUAnchorWitness &witness) const;
+  std::string FormatProofSummaryAuditCore(const ProofSummary &summary) const;
+  void AppendProofSummaryWitnessAudit(std::string &artifact,
+                                      const ProofSummary &summary,
+                                      bool firstOnly) const;
 
   /// \brief Common proof-summary carrier used during the proof/lattice model.
   ///
@@ -2489,32 +2282,29 @@ private:
   /// Patch B starts using that shape at selected competition sites, while the
   /// rest of the engine still accepts results through path-specific control
   /// flow until later selector-closure steps land.
+  #define REFOLD_ACCEPTED_RESULT_CANDIDATE_KIND_LIST(REFOLD_X) \
+  REFOLD_X(Unknown) \
+  REFOLD_X(MacroPatch) \
+  REFOLD_X(IncludePatch) \
+  REFOLD_X(TUAnchor) \
+  REFOLD_X(TUTextEdit) \
+  REFOLD_X(TerminalOutOfDomain)
+
   enum class AcceptedResultCandidateKind : uint8_t {
-    Unknown,
-    MacroPatch,
-    IncludePatch,
-    TUAnchor,
-    TUTextEdit,
-    TerminalOutOfDomain,
+#define REFOLD_X(name) name,
+    REFOLD_ACCEPTED_RESULT_CANDIDATE_KIND_LIST(REFOLD_X)
+#undef REFOLD_X
   };
 
-  friend inline StringRef toString(AcceptedResultCandidateKind kind) {
-    switch (kind) {
-    case AcceptedResultCandidateKind::Unknown:
-      return "Unknown";
-    case AcceptedResultCandidateKind::MacroPatch:
-      return "MacroPatch";
-    case AcceptedResultCandidateKind::IncludePatch:
-      return "IncludePatch";
-    case AcceptedResultCandidateKind::TUAnchor:
-      return "TUAnchor";
-    case AcceptedResultCandidateKind::TUTextEdit:
-      return "TUTextEdit";
-    case AcceptedResultCandidateKind::TerminalOutOfDomain:
-      return "TerminalOutOfDomain";
+  friend inline StringRef toString(AcceptedResultCandidateKind value) {
+    switch (value) {
+#define REFOLD_X(name) case AcceptedResultCandidateKind::name: return #name;
+      REFOLD_ACCEPTED_RESULT_CANDIDATE_KIND_LIST(REFOLD_X)
+#undef REFOLD_X
     }
     return "Unknown";
   }
+#undef REFOLD_ACCEPTED_RESULT_CANDIDATE_KIND_LIST
 
   /// \brief Normalized wrapper for a concrete accepted result.
   ///
@@ -2543,44 +2333,33 @@ private:
   };
 
 
+  #define REFOLD_MACRO_PATCH_PROOF_KIND_LIST(REFOLD_X) \
+  REFOLD_X(Unknown) \
+  REFOLD_X(CounterLiteral) \
+  REFOLD_X(ArgsOnlyPasteMulti) \
+  REFOLD_X(ArgsOnlyPasteSingle) \
+  REFOLD_X(ArgsOnlyPurePasteOnly) \
+  REFOLD_X(ArgsOnlyStandard) \
+  REFOLD_X(ArgsOnlyPairedPureInsertion) \
+  REFOLD_X(DagSubtreeRoot) \
+  REFOLD_X(CallChainSuffix) \
+  REFOLD_X(WholeCoverRealization)
+
   enum class MacroPatchProofKind : uint8_t {
-    Unknown,
-    CounterLiteral,
-    ArgsOnlyPasteMulti,
-    ArgsOnlyPasteSingle,
-    ArgsOnlyPurePasteOnly,
-    ArgsOnlyStandard,
-    ArgsOnlyPairedPureInsertion,
-    DagSubtreeRoot,
-    CallChainSuffix,
-    WholeCoverRealization,
+#define REFOLD_X(name) name,
+    REFOLD_MACRO_PATCH_PROOF_KIND_LIST(REFOLD_X)
+#undef REFOLD_X
   };
 
-  friend inline StringRef toString(MacroPatchProofKind kind) {
-    switch (kind) {
-    case MacroPatchProofKind::Unknown:
-      return "Unknown";
-    case MacroPatchProofKind::CounterLiteral:
-      return "CounterLiteral";
-    case MacroPatchProofKind::ArgsOnlyPasteMulti:
-      return "ArgsOnlyPasteMulti";
-    case MacroPatchProofKind::ArgsOnlyPasteSingle:
-      return "ArgsOnlyPasteSingle";
-    case MacroPatchProofKind::ArgsOnlyPurePasteOnly:
-      return "ArgsOnlyPurePasteOnly";
-    case MacroPatchProofKind::ArgsOnlyStandard:
-      return "ArgsOnlyStandard";
-    case MacroPatchProofKind::ArgsOnlyPairedPureInsertion:
-      return "ArgsOnlyPairedPureInsertion";
-    case MacroPatchProofKind::DagSubtreeRoot:
-      return "DagSubtreeRoot";
-    case MacroPatchProofKind::CallChainSuffix:
-      return "CallChainSuffix";
-    case MacroPatchProofKind::WholeCoverRealization:
-      return "WholeCoverRealization";
+  friend inline StringRef toString(MacroPatchProofKind value) {
+    switch (value) {
+#define REFOLD_X(name) case MacroPatchProofKind::name: return #name;
+      REFOLD_MACRO_PATCH_PROOF_KIND_LIST(REFOLD_X)
+#undef REFOLD_X
     }
     return "Unknown";
   }
+#undef REFOLD_MACRO_PATCH_PROOF_KIND_LIST
 
   struct MacroPatch {
     uint64_t invStart = 0, invEnd = 0;
@@ -2866,6 +2645,42 @@ private:
   std::string PadAtBoundaries(StringRef base, size_t start, size_t end,
                               std::string text, bool allowLeft,
                               bool allowRight) const;
+
+  bool MaybeConsumeOrdinarySeparatorGapForPunctuation(
+      StringRef tuPath, StringRef tuBytes, std::pair<uint64_t, uint64_t> &span,
+      StringRef replacement, StringRef tracePrefix) const;
+
+  bool TUReplacementExtensionIsBTokenClosed(uint64_t aTokStart,
+                                            uint64_t oldEnd,
+                                            uint64_t extEnd,
+                                            uint64_t bStart,
+                                            uint64_t bEnd,
+                                            StringRef tuPath) const;
+
+  void MaybeExtendTUSpanOverClosedTrailingCallSuffix(
+      const diffutils::Hunk &h, StringRef tuPath, StringRef tuBytes,
+      StringRef replacement, std::pair<uint64_t, uint64_t> &span) const;
+
+  bool MaybeAdvanceTUInsertionPastSourceLineControlPrefix(
+      const diffutils::Hunk &h, StringRef tuPath, StringRef tuBytes,
+      std::pair<uint64_t, uint64_t> &span, StringRef tracePrefix) const;
+
+  bool TUInsertionCanDeferResyncToConditionalJoin(
+      bool advancedOverSourceLineControlPrefix, StringRef tuPath,
+      uint64_t anchor, StringRef tracePrefix) const;
+
+  bool TUInsertionBeforeMaterializedInclude(
+      const diffutils::Hunk &h, StringRef tuPath,
+      const std::pair<uint64_t, uint64_t> &span,
+      bool requireVisibleReplayText) const;
+
+  TextEdit BuildDirectTUHunkTextEdit(
+      const diffutils::Hunk &h, uint64_t hunkIndex,
+      const std::pair<uint64_t, uint64_t> &span, ResyncOutcome resync,
+      StringRef acceptedPayload, uint64_t rawTUStart, uint64_t rawTUEnd,
+      std::optional<uint64_t> materializedBByteBegin,
+      std::optional<uint64_t> materializedBByteEnd,
+      AcceptedPathKind acceptedPath) const;
 
   /// \brief Computes an "owner depth gap" array used to bias the weighted LCS
   /// anchoring for insertions.
@@ -4291,6 +4106,18 @@ private:
     uint64_t aEnd;
   };
 
+  struct CounterOccurrence {
+    const RefoldModel::MacroInvocation *macro;
+    uint64_t aStart;
+    uint64_t aEnd;
+    std::optional<uint64_t> ownerIncludeId;
+  };
+
+  SmallVector<CounterOccurrence, 32>
+  CollectCounterOccurrences(StringRef tuPath) const;
+
+  void SortCounterOccurrences(SmallVectorImpl<CounterOccurrence> &occs) const;
+
   /// \brief Compute forced expansion patches needed to stabilize __COUNTER__
   /// semantics.
   ///
@@ -4765,6 +4592,9 @@ private:
   /// proof contract until they are moved onto the normalized selector path.
   ProofDischargeRecord
   ValidateInvocationPreservingProof(const MacroPatch &patch) const;
+
+  ProofDischargeRecord ValidateInvocationPreservingProofImpl(
+      const MacroPatch &patch, bool requireTopLevelRoot) const;
 
   /// \brief Validate the emitted semantic proof contract for a preserving
   /// macro patch.
@@ -5615,6 +5445,30 @@ private:
   LineStateObserverDemand OwnerSuffixLineStateObserverDemand(
       std::optional<uint64_t> ownerIncludeId, StringRef ownerFile,
       uint64_t offset) const;
+
+  /// Return true iff two line-control physical-file spellings denote the same
+  /// owner surface for producer-backed line-control recovery. Pseudo files are
+  /// intentionally never canonicalized against real files.
+  bool SameLineControlPhysicalFile(StringRef lhs, StringRef rhs) const;
+
+  /// Return the latest active, producer-proven source line-control directive end
+  /// at or before \p offset in the given owner.
+  std::optional<uint64_t> LatestProducerLineControlEndBefore(
+      std::optional<uint64_t> ownerIncludeId, StringRef ownerFile,
+      uint64_t offset) const;
+
+  /// Recover the producer-backed logical location at \p offset in an owner, when
+  /// the producer recorded an active line-control event dominating that offset.
+  std::optional<LineDirectiveLocation> ProducerBackedLineControlLocationAt(
+      StringRef ownerBytes, StringRef ownerFile,
+      std::optional<uint64_t> ownerIncludeId, uint64_t eventEndLimit,
+      uint64_t locationOffset) const;
+
+  /// Return the logical location at \p offset in an owner, preferring direct
+  /// source recovery and falling back to producer-backed line-control events.
+  LineDirectiveLocation LogicalLocationAtOwnerOffset(
+      StringRef ownerBytes, StringRef ownerFile,
+      std::optional<uint64_t> ownerIncludeId, uint64_t offset) const;
 
   /// Earliest preserved line-state observer in an owner suffix.
   ///

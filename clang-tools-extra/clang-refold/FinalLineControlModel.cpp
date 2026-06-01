@@ -756,25 +756,6 @@ void markProducerProvenSourceLineControlPreserved(
                                                      mapping.ownerIncludeId);
 }
 
-bool isHorizontalWhitespace(char c) {
-  return c == ' ' || c == '\t' || c == '\r' || c == '\f' || c == '\v';
-}
-
-bool isDecimalDigit(char c) { return c >= '0' && c <= '9'; }
-
-bool isIdentifierStart(char c) {
-  return std::isalpha(static_cast<unsigned char>(c)) || c == '_';
-}
-
-bool isIdentifierContinue(char c) {
-  return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
-}
-
-void skipHorizontalWhitespace(StringRef line, size_t &i) {
-  while (i < line.size() && isHorizontalWhitespace(line[i]))
-    ++i;
-}
-
 bool physicalLineContinuesWithBackslash(StringRef line) {
   // The scanner works on physical source lines with the terminating '\n'
   // removed.  For CRLF input, the remaining '\r' is part of the line ending,
@@ -792,7 +773,7 @@ bool physicalLineContinuesWithBackslash(StringRef line) {
 /// block comment leaves the caller with no known following token on this line.
 bool skipDirectiveTokenWhitespace(StringRef line, size_t &i) {
   for (;;) {
-    skipHorizontalWhitespace(line, i);
+    stringutils::skipWsNoLF(line, i, line.size());
     if (i + 1 < line.size() && line[i] == '/' && line[i + 1] == '/') {
       i = line.size();
       return true;
@@ -823,7 +804,7 @@ bool locateDirectiveHash(StringRef line, bool &inBlockComment, size_t &hash) {
       continue;
     }
 
-    skipHorizontalWhitespace(line, i);
+    stringutils::skipWsNoLF(line, i, line.size());
     if (i >= line.size())
       return false;
 
@@ -866,7 +847,7 @@ FinalPhysicalLineKind classifyNonDirectiveLine(StringRef line,
       continue;
     }
 
-    skipHorizontalWhitespace(line, i);
+    stringutils::skipWsNoLF(line, i, line.size());
     if (i >= line.size())
       return sawComment ? FinalPhysicalLineKind::CommentOnly
                         : FinalPhysicalLineKind::Blank;
@@ -890,7 +871,7 @@ FinalPhysicalLineKind classifyNonDirectiveLine(StringRef line,
 DirectiveInfo classifyDirective(StringRef line, size_t hash) {
   DirectiveInfo out;
   size_t i = hash + 1;
-  skipHorizontalWhitespace(line, i);
+  stringutils::skipWsNoLF(line, i, line.size());
 
   if (i >= line.size()) {
     out.kind = DirectiveKind::Other;
@@ -898,20 +879,20 @@ DirectiveInfo classifyDirective(StringRef line, size_t hash) {
     return out;
   }
 
-  if (isDecimalDigit(line[i])) {
+  if (llvm::isDigit(line[i])) {
     out.kind = DirectiveKind::LineControl;
     out.payloadBegin = i;
     return out;
   }
 
-  if (!isIdentifierStart(line[i])) {
+  if (!stringutils::isIdentStart(line[i])) {
     out.kind = DirectiveKind::Other;
     out.payloadBegin = i;
     return out;
   }
 
   const size_t nameBegin = i;
-  while (i < line.size() && isIdentifierContinue(line[i]))
+  while (i < line.size() && stringutils::isIdentPart(line[i]))
     ++i;
   out.name = line.slice(nameBegin, i);
   out.payloadBegin = i;
@@ -933,7 +914,7 @@ DirectiveInfo classifyDirective(StringRef line, size_t hash) {
 
 bool parseUnsignedDecimal(StringRef line, size_t &i, uint64_t &value) {
   skipDirectiveTokenWhitespace(line, i);
-  if (i >= line.size() || !isDecimalDigit(line[i]))
+  if (i >= line.size() || !llvm::isDigit(line[i]))
     return false;
 
   uint64_t result = 0;
@@ -943,7 +924,7 @@ bool parseUnsignedDecimal(StringRef line, size_t &i, uint64_t &value) {
       return false;
     result = result * 10 + digit;
     ++i;
-  } while (i < line.size() && isDecimalDigit(line[i]));
+  } while (i < line.size() && llvm::isDigit(line[i]));
 
   value = result;
   return true;
@@ -988,7 +969,7 @@ bool parseRawOrdinaryStringLiteral(StringRef line, size_t &i,
 
 bool skipTrailingIgnorable(StringRef line, size_t &i) {
   for (;;) {
-    skipHorizontalWhitespace(line, i);
+    stringutils::skipWsNoLF(line, i, line.size());
     if (i >= line.size())
       return true;
     if (i + 1 < line.size() && line[i] == '/' && line[i + 1] == '/') {
@@ -1011,7 +992,7 @@ bool skipHashNumberLineMarkerFlags(StringRef line, size_t &i) {
       return false;
     if (i >= line.size())
       return true;
-    if (!isDecimalDigit(line[i])) {
+    if (!llvm::isDigit(line[i])) {
       i = beforeWhitespace;
       return skipTrailingIgnorable(line, i);
     }
@@ -1136,7 +1117,7 @@ bool skipRawStringLiteral(StringRef line, size_t &i) {
     size_t openParen = delimiterBegin;
     while (openParen < line.size() && line[openParen] != '(') {
       const char c = line[openParen];
-      if (isHorizontalWhitespace(c) || c == ')' || c == '\\')
+      if (stringutils::isWsNoLF(c) || c == ')' || c == '\\')
         return false;
       ++openParen;
     }
@@ -1206,14 +1187,14 @@ void collectLexicalObserverCandidates(FinalLineControlModel &model,
     if (skipStringOrCharLiteral(line, i))
       continue;
 
-    if (!isIdentifierStart(line[i])) {
+    if (!stringutils::isIdentStart(line[i])) {
       ++i;
       continue;
     }
 
     const size_t identBegin = i;
     ++i;
-    while (i < line.size() && isIdentifierContinue(line[i]))
+    while (i < line.size() && stringutils::isIdentPart(line[i]))
       ++i;
 
     const StringRef ident = line.slice(identBegin, i);

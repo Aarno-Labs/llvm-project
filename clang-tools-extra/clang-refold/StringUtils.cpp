@@ -52,6 +52,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "StringUtils.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <cstdio>
@@ -60,6 +61,157 @@
 namespace clang {
 namespace refold {
 namespace stringutils {
+
+bool copyQuotedLiteral(StringRef text, size_t &pos, std::string &out) {
+  if (pos >= text.size() || (text[pos] != '"' && text[pos] != '\''))
+    return false;
+  const char quote = text[pos];
+  out.push_back(text[pos++]);
+  while (pos < text.size()) {
+    char c = text[pos++];
+    out.push_back(c);
+    if (c == '\\' && pos < text.size()) {
+      out.push_back(text[pos++]);
+      continue;
+    }
+    if (c == quote)
+      break;
+  }
+  return true;
+}
+
+std::string replaceCommentsWithWhitespacePreservingLiterals(StringRef text) {
+  std::string out;
+  out.reserve(text.size());
+  for (size_t i = 0; i < text.size();) {
+    if (copyQuotedLiteral(text, i, out))
+      continue;
+    if (i + 1 < text.size() && text[i] == '/' && text[i + 1] == '/') {
+      out.push_back(' ');
+      break;
+    }
+    if (i + 1 < text.size() && text[i] == '/' && text[i + 1] == '*') {
+      out.push_back(' ');
+      i += 2;
+      while (i + 1 < text.size() && !(text[i] == '*' && text[i + 1] == '/'))
+        ++i;
+      if (i + 1 < text.size())
+        i += 2;
+      continue;
+    }
+    out.push_back(text[i++]);
+  }
+  return out;
+}
+
+std::string escapeLineDirectivePath(StringRef path) {
+  if (path.empty())
+    return "";
+  llvm::SmallString<64> escaped;
+  escaped.reserve(path.size());
+  for (char c : path) {
+    switch (c) {
+    case '\\': escaped.append("\\\\"); break;
+    case '\"': escaped.append("\\\""); break;
+    case '\a': escaped.append("\\a"); break;
+    case '\b': escaped.append("\\b"); break;
+    case '\f': escaped.append("\\f"); break;
+    case '\n': escaped.append("\\n"); break;
+    case '\r': escaped.append("\\r"); break;
+    case '\t': escaped.append("\\t"); break;
+    case '\v': escaped.append("\\v"); break;
+    case static_cast<char>(0x1b): escaped.append("\\e"); break;
+    default: escaped.push_back(c); break;
+    }
+  }
+  return std::string(escaped.str());
+}
+
+bool containsAtLineStartAfterIndent(StringRef text, StringRef needle) {
+  if (needle.empty())
+    return false;
+  size_t pos = 0;
+  while ((pos = text.find(needle, pos)) != StringRef::npos) {
+    if (startsAfterLineIndent(text, pos))
+      return true;
+    pos += needle.size();
+  }
+  return false;
+}
+
+bool lineStartsWithDirectiveKeyword(StringRef line, StringRef keyword) {
+  size_t i = 0;
+  while (i < line.size() && isNonNewlineWs(line[i]))
+    ++i;
+  if (i >= line.size() || line[i] != '#')
+    return false;
+  ++i;
+  while (i < line.size() && isNonNewlineWs(line[i]))
+    ++i;
+  if (!line.drop_front(i).starts_with(keyword))
+    return false;
+  i += keyword.size();
+  return i >= line.size() || !isIdentPart(line[i]);
+}
+
+bool physicalLineEndsWithSplice(StringRef bytes, uint64_t lineBegin,
+                                uint64_t lineEnd) {
+  if (lineEnd <= lineBegin)
+    return false;
+  uint64_t p = lineEnd;
+  if (p > lineBegin && bytes[p - 1] == '\n')
+    --p;
+  if (p > lineBegin && bytes[p - 1] == '\r')
+    --p;
+  return p > lineBegin && bytes[p - 1] == '\\';
+}
+
+uint64_t lineBeginContainingOffset(StringRef bytes, uint64_t byte) {
+  if (byte > bytes.size())
+    byte = static_cast<uint64_t>(bytes.size());
+  if (byte == 0)
+    return 0;
+  size_t prevNL = bytes.rfind('\n', byte - 1);
+  return prevNL == StringRef::npos ? 0 : static_cast<uint64_t>(prevNL + 1);
+}
+
+uint64_t extendLineToLogicalDirective(StringRef bytes, uint64_t lineBegin) {
+  if (lineBegin >= bytes.size())
+    return lineBegin;
+  uint64_t curBegin = lineBegin;
+  size_t nl = bytes.find('\n', curBegin);
+  uint64_t curEnd = nl == StringRef::npos ? static_cast<uint64_t>(bytes.size())
+                                           : static_cast<uint64_t>(nl + 1);
+  while (physicalLineEndsWithSplice(bytes, curBegin, curEnd) &&
+         curEnd < bytes.size()) {
+    curBegin = curEnd;
+    nl = bytes.find('\n', curBegin);
+    curEnd = nl == StringRef::npos ? static_cast<uint64_t>(bytes.size())
+                                    : static_cast<uint64_t>(nl + 1);
+  }
+  return curEnd;
+}
+
+uint64_t extendRangeToLogicalDirective(StringRef bytes, uint64_t begin,
+                                       uint64_t end) {
+  if (begin >= bytes.size())
+    return end;
+  uint64_t curBegin = begin;
+  uint64_t curEnd = std::min<uint64_t>(end, static_cast<uint64_t>(bytes.size()));
+  if (curEnd == begin || (curEnd < bytes.size() && bytes[curEnd - 1] != '\n')) {
+    size_t nl = bytes.find('\n', begin);
+    curEnd = nl == StringRef::npos ? static_cast<uint64_t>(bytes.size())
+                                   : static_cast<uint64_t>(nl + 1);
+  }
+  while (physicalLineEndsWithSplice(bytes, curBegin, curEnd) &&
+         curEnd < bytes.size()) {
+    curBegin = curEnd;
+    size_t nl = bytes.find('\n', curBegin);
+    curEnd = nl == StringRef::npos ? static_cast<uint64_t>(bytes.size())
+                                   : static_cast<uint64_t>(nl + 1);
+  }
+  return curEnd;
+}
 
 /// Return true when the trimmed spelling is exactly one ASCII identifier.
 bool isIdentifierOnly(StringRef s) {
@@ -164,23 +316,9 @@ size_t findMatchingRParen(StringRef s, size_t lParenIdx) {
       }
     }
 
-    // Skip string/char literals (simple escape-aware scan).
     if (c == '"' || c == '\'') {
-      const char quote = c;
-      ++i;
-      while (i < n) {
-        char q = s[i];
-        if (q == '\\') {
-          if (i + 1 < n)
-            i += 2;
-          else
-            ++i;
-          continue;
-        }
-        if (q == quote)
-          break;
-        ++i;
-      }
+      if (skipQuotedLiteral(s, i))
+        --i;
       continue;
     }
 

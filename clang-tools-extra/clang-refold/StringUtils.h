@@ -92,6 +92,13 @@ inline constexpr bool isWs(char c) noexcept {
   return c == '\n' || c == '\r' || isNonNewlineWs(c);
 }
 
+/// True for PP whitespace other than a line-feed.  This intentionally keeps
+/// carriage return in the accepted set to preserve existing byte-level scans
+/// that treat LF as the only directive-line terminator.
+inline constexpr bool isWsNoLF(char c) noexcept {
+  return isWs(c) && c != '\n';
+}
+
 /// True for the ASCII start character of an identifier-like spelling.
 inline constexpr bool isIdentStart(char c) noexcept {
   return c == '_' || isAlpha(c);
@@ -160,6 +167,114 @@ inline constexpr void skipNonNewlineWs(StringRef text, size_t &pos) {
   while (pos < text.size() && isNonNewlineWs(text[pos]))
     ++pos;
 }
+
+
+/// Advance over one C translation phase-2 backslash-newline splice at \p pos.
+///
+/// The splice must be fully contained in the half-open byte range
+/// `[0, limit)`.  Both `\\\n` and `\\\r\n` are recognized.  The helper is
+/// deliberately byte-oriented and does not interpret comments or literals; the
+/// caller decides where phase-2 splicing is admissible for its proof domain.
+template <typename OffsetT>
+inline bool skipPhase2LineSplice(StringRef text, OffsetT limit, OffsetT &pos) {
+  const OffsetT size = static_cast<OffsetT>(text.size());
+  if (pos >= limit || pos >= size)
+    return false;
+  if (text[static_cast<size_t>(pos)] != '\\')
+    return false;
+
+  if (pos + 1 < limit && pos + 1 < size &&
+      text[static_cast<size_t>(pos + 1)] == '\n') {
+    pos += 2;
+    return true;
+  }
+  if (pos + 2 < limit && pos + 2 < size &&
+      text[static_cast<size_t>(pos + 1)] == '\r' &&
+      text[static_cast<size_t>(pos + 2)] == '\n') {
+    pos += 3;
+    return true;
+  }
+  return false;
+}
+
+/// Skip horizontal preprocessing whitespace in the half-open range [pos, end).
+inline void skipWsNoLF(StringRef text, size_t &pos, size_t end) {
+  end = std::min(end, text.size());
+  while (pos < end && isWsNoLF(text[pos]))
+    ++pos;
+}
+
+/// Consume one ASCII identifier token from [pos, end).
+inline bool consumeIdentifier(StringRef text, size_t &pos, size_t end,
+                              StringRef &identifier) {
+  end = std::min(end, text.size());
+  if (pos >= end || !isIdentStart(text[pos]))
+    return false;
+  const size_t begin = pos++;
+  while (pos < end && isIdentPart(text[pos]))
+    ++pos;
+  identifier = text.slice(begin, pos);
+  return true;
+}
+
+/// Consume a preprocessing directive introducer and following horizontal space.
+inline bool consumeDirectiveHash(StringRef text, size_t &pos, size_t end) {
+  skipWsNoLF(text, pos, end);
+  if (pos >= end || text[pos] != '#')
+    return false;
+  ++pos;
+  skipWsNoLF(text, pos, end);
+  return true;
+}
+
+
+/// Copy or skip one C/C++ string/character literal at \p pos.
+bool copyQuotedLiteral(StringRef text, size_t &pos, std::string &out);
+inline bool skipQuotedLiteral(StringRef text, size_t &pos) {
+  std::string ignored;
+  return copyQuotedLiteral(text, pos, ignored);
+}
+
+/// Replace each complete comment outside literals with one ASCII space.
+std::string replaceCommentsWithWhitespacePreservingLiterals(StringRef text);
+
+/// Return the basename portion of a slash- or backslash-separated path.
+inline StringRef pathBasename(StringRef path) {
+  const size_t slash = path.find_last_of("/\\");
+  return slash == StringRef::npos ? path : path.drop_front(slash + 1);
+}
+
+/// Escape/quote a logical filename for a #line double-quoted operand.
+std::string escapeLineDirectivePath(StringRef path);
+inline std::string quoteLineDirectivePath(StringRef path) {
+  std::string out;
+  out.reserve(path.size() + 2);
+  out.push_back('"');
+  out += escapeLineDirectivePath(path);
+  out.push_back('"');
+  return out;
+}
+
+/// True iff the bytes before \p pos on the same LF-delimited line are indent.
+inline bool startsAfterLineIndent(StringRef text, size_t pos) {
+  pos = std::min(pos, text.size());
+  size_t lineBegin = pos;
+  while (lineBegin > 0 && text[lineBegin - 1] != '\n')
+    --lineBegin;
+  for (size_t i = lineBegin; i < pos; ++i)
+    if (!isNonNewlineWs(text[i]))
+      return false;
+  return true;
+}
+
+bool containsAtLineStartAfterIndent(StringRef text, StringRef needle);
+bool lineStartsWithDirectiveKeyword(StringRef line, StringRef keyword);
+bool physicalLineEndsWithSplice(StringRef bytes, uint64_t lineBegin,
+                                uint64_t lineEnd);
+uint64_t lineBeginContainingOffset(StringRef bytes, uint64_t byte);
+uint64_t extendLineToLogicalDirective(StringRef bytes, uint64_t lineBegin);
+uint64_t extendRangeToLogicalDirective(StringRef bytes, uint64_t begin,
+                                       uint64_t end);
 
 // --------------------- Diagnostics helpers (pure string) ---------------------
 
@@ -326,19 +441,16 @@ std::vector<StringRef> splitChars(StringRef s);
 /// Returns nullopt when the payload is malformed or outside that domain.
 std::optional<std::string> canonicalizeStringifyInversePayload(StringRef raw);
 
-namespace {
-
 /// Clamp a possibly unordered half-open byte range into \p text.
-std::pair<size_t, size_t> clampUnorderedRange(StringRef text, size_t begin,
-                                             size_t end) {
+inline std::pair<size_t, size_t> clampUnorderedRange(StringRef text,
+                                                    size_t begin,
+                                                    size_t end) {
   begin = std::min(begin, text.size());
   end = std::min(end, text.size());
   if (end < begin)
     std::swap(begin, end);
   return {begin, end};
 }
-
-} // namespace
 
 /// True iff the clamped byte range [begin, end) contains a line-feed.
 ///
@@ -350,6 +462,18 @@ inline bool rangeContainsNewline(StringRef text, size_t begin,
   const auto range = clampUnorderedRange(text, begin, end);
   return text.substr(range.first, range.second - range.first).find('\n') !=
          StringRef::npos;
+}
+
+/// Return a view with leading/trailing PP whitespace other than LF removed.
+inline StringRef trimWsNoLF(StringRef text) {
+  size_t begin = 0;
+  while (begin < text.size() && isWsNoLF(text[begin]))
+    ++begin;
+
+  size_t end = text.size();
+  while (end > begin && isWsNoLF(text[end - 1]))
+    --end;
+  return text.slice(begin, end);
 }
 
 /// True iff the clamped byte range [begin, end) contains only PP whitespace.

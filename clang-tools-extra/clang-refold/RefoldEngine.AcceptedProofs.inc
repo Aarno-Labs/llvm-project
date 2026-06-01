@@ -120,21 +120,13 @@ bool RefoldEngine::MacroInvocationHasWellFormedPasteWitnesses(
 }
 
 RefoldEngine::ProofDischargeRecord
-RefoldEngine::ValidateInvocationPreservingProof(const MacroPatch &patch) const {
+RefoldEngine::ValidateInvocationPreservingProofImpl(
+    const MacroPatch &patch, bool requireTopLevelRoot) const {
   ProofDischargeAccumulator discharge;
   const AcceptancePathInventory inventory =
       InventoryMacroPatchAcceptancePath(patch);
 
-  // First verify that the patch carries the normalized proof metadata required
-  // for any invocation-preserving candidate. These obligations classify the
-  // accepted path, map it to a future proof target, and ensure the legacy patch
-  // flags agree with the structure-preserving proof class.
-  discharge.Require(inventory.currentPath != AcceptedPathKind::Unknown,
-                    ProofObligationKind::AcceptedPathClassified,
-                    ProofFailureReason::MissingAcceptedPathClassification);
-  discharge.Require(inventory.futureTarget != FutureProofTarget::Unknown,
-                    ProofObligationKind::FutureTargetMapped,
-                    ProofFailureReason::MissingFutureTargetMapping);
+  RequireAcceptedPathBaseline(discharge, inventory);
   discharge.Require(patch.proofValidated,
                     ProofObligationKind::LegacyValidationRecorded,
                     ProofFailureReason::MissingLegacyValidation);
@@ -145,16 +137,13 @@ RefoldEngine::ValidateInvocationPreservingProof(const MacroPatch &patch) const {
                     ProofObligationKind::ProofRootTracked,
                     ProofFailureReason::MissingProofRoot);
 
-  // Invocation-preserving macro proofs are anchored at a tracked proof root,
-  // not just at the local patch span. Resolve that root and require it to be
-  // the top-level macro invocation for this proof tree.
   const RefoldModel::MacroInvocation *root =
       patch.proofRootMacroId ? FindMacroInvocationById(patch.proofRootMacroId)
                              : nullptr;
   discharge.Require(root != nullptr,
                     ProofObligationKind::MacroProofRootResolved,
                     ProofFailureReason::MissingMacroProofRootResolution);
-  if (root) {
+  if (requireTopLevelRoot && root) {
     discharge.Require(GetRootMacroId(root->id) == root->id,
                       ProofObligationKind::MacroProofRootIsTopLevel,
                       ProofFailureReason::NonTopLevelMacroProofRoot);
@@ -162,24 +151,11 @@ RefoldEngine::ValidateInvocationPreservingProof(const MacroPatch &patch) const {
 
   switch (patch.proofKind) {
   case MacroPatchProofKind::ArgsOnlyStandard:
-    // Standard args-only rewrites do not rely on producer-side paste
-    // witnesses; the common preserving obligations above are sufficient.
     break;
 
   case MacroPatchProofKind::ArgsOnlyPasteSingle:
   case MacroPatchProofKind::ArgsOnlyPasteMulti:
-  case MacroPatchProofKind::ArgsOnlyPurePasteOnly: {
-    // Paste-preserving args-only classes can be discharged from either of the
-    // two deterministic proof sources the builder already relies on today:
-    //
-    // * a usable producer-side root `paste_tokens` witness stream
-    // * or a direct replay proof recorded on the accepted patch after the
-    //   rewritten invocation arguments were shown to reconstruct the edited
-    //   B-side pasted tokens exactly
-    //
-    // Wrapper/variadic chains such as XSTR(XCAT(...)) legitimately use the
-    // second source when the root invocation carries propagated paste spans
-    // but no standalone root-level `paste_tokens` decomposition.
+  case MacroPatchProofKind::ArgsOnlyPurePasteOnly:
     discharge.Require(root && !root->pasteSpans.empty(),
                       ProofObligationKind::MacroPasteWitnessPresent,
                       ProofFailureReason::MissingPasteWitness);
@@ -191,20 +167,14 @@ RefoldEngine::ValidateInvocationPreservingProof(const MacroPatch &patch) const {
                         ProofFailureReason::MalformedPasteWitness);
     }
     break;
-  }
 
   case MacroPatchProofKind::ArgsOnlyPairedPureInsertion:
-    // Paired pure insertion is only valid on non-paste direct arg/stringify
-    // surfaces. The builder already enforces that; the proof record makes the
-    // requirement explicit.
     discharge.Require(root && root->pasteSpans.empty(),
                       ProofObligationKind::MacroPasteFreeSurfaceTracked,
                       ProofFailureReason::UnexpectedPasteSurface);
     break;
 
   case MacroPatchProofKind::DagSubtreeRoot:
-    // DAG-preserving rewrites must carry the explicit subtree certificate
-    // recorded on accepted root patches.
     discharge.Require(patch.subtreeCertBacked,
                       ProofObligationKind::MacroSubtreeCertificateTracked,
                       ProofFailureReason::MissingSubtreeCertificate);
@@ -216,8 +186,6 @@ RefoldEngine::ValidateInvocationPreservingProof(const MacroPatch &patch) const {
     break;
 
   case MacroPatchProofKind::CallChainSuffix:
-    // Call-chain suffix rewrites are emitted directly on the root callsite
-    // slice, so the patch's owning macro id must already be that root.
     discharge.Require(patch.macroId == patch.proofRootMacroId,
                       ProofObligationKind::MacroCallChainWitnessTracked,
                       ProofFailureReason::MissingCallChainWitness);
@@ -233,100 +201,16 @@ RefoldEngine::ValidateInvocationPreservingProof(const MacroPatch &patch) const {
 }
 
 RefoldEngine::ProofDischargeRecord
+RefoldEngine::ValidateInvocationPreservingProof(const MacroPatch &patch) const {
+  return ValidateInvocationPreservingProofImpl(
+      patch, /*requireTopLevelRoot=*/true);
+}
+
+RefoldEngine::ProofDischargeRecord
 RefoldEngine::ValidateEmittedInvocationPreservingProof(
     const MacroPatch &patch) const {
-  ProofDischargeAccumulator discharge;
-  const AcceptancePathInventory inventory =
-      InventoryMacroPatchAcceptancePath(patch);
-
-  // All emitted invocation-preserving patches must carry the normalized proof
-  // metadata needed by the accepted-result lattice. These checks establish the
-  // common baseline before validating proof-kind-specific witnesses below.
-  discharge.Require(inventory.currentPath != AcceptedPathKind::Unknown,
-                    ProofObligationKind::AcceptedPathClassified,
-                    ProofFailureReason::MissingAcceptedPathClassification);
-  discharge.Require(inventory.futureTarget != FutureProofTarget::Unknown,
-                    ProofObligationKind::FutureTargetMapped,
-                    ProofFailureReason::MissingFutureTargetMapping);
-  discharge.Require(patch.proofValidated,
-                    ProofObligationKind::LegacyValidationRecorded,
-                    ProofFailureReason::MissingLegacyValidation);
-  discharge.Require(patch.structurePreserving,
-                    ProofObligationKind::StructureMatchesAcceptedClass,
-                    ProofFailureReason::StructuralMismatch);
-  discharge.Require(patch.proofRootMacroId != 0,
-                    ProofObligationKind::ProofRootTracked,
-                    ProofFailureReason::MissingProofRoot);
-
-  // Resolve the proof root once so proof-kind-specific checks can validate the
-  // emitted patch against the macro invocation that justified the proof.
-  const RefoldModel::MacroInvocation *root =
-      patch.proofRootMacroId ? FindMacroInvocationById(patch.proofRootMacroId)
-                             : nullptr;
-  discharge.Require(root != nullptr,
-                    ProofObligationKind::MacroProofRootResolved,
-                    ProofFailureReason::MissingMacroProofRootResolution);
-
-  switch (patch.proofKind) {
-  case MacroPatchProofKind::ArgsOnlyStandard:
-    break;
-
-  case MacroPatchProofKind::ArgsOnlyPasteSingle:
-  case MacroPatchProofKind::ArgsOnlyPasteMulti:
-  case MacroPatchProofKind::ArgsOnlyPurePasteOnly: {
-    // Paste-sensitive args-only proofs must be backed by either well-formed
-    // producer paste witnesses on the root invocation or an explicit replay
-    // validation recorded on the emitted patch.
-    discharge.Require(root && !root->pasteSpans.empty(),
-                      ProofObligationKind::MacroPasteWitnessPresent,
-                      ProofFailureReason::MissingPasteWitness);
-    if (root && !root->pasteSpans.empty()) {
-      const bool hasProducerWitness =
-          MacroInvocationHasWellFormedPasteWitnesses(*root);
-      discharge.Require(hasProducerWitness || patch.pasteReplayValidated,
-                        ProofObligationKind::MacroPasteWitnessWellFormed,
-                        ProofFailureReason::MalformedPasteWitness);
-    }
-    break;
-  }
-
-  case MacroPatchProofKind::ArgsOnlyPairedPureInsertion:
-    // Paired pure insertion is only an invocation-preserving proof on a
-    // paste-free root surface; paste-bearing roots need the paste-specific
-    // witness paths above.
-    discharge.Require(root && root->pasteSpans.empty(),
-                      ProofObligationKind::MacroPasteFreeSurfaceTracked,
-                      ProofFailureReason::UnexpectedPasteSurface);
-    break;
-
-  case MacroPatchProofKind::DagSubtreeRoot:
-    // DAG subtree root patches must carry the subtree certificate summary that
-    // proved the leaf-to-root lift and final semantic admissibility.
-    discharge.Require(patch.subtreeCertBacked,
-                      ProofObligationKind::MacroSubtreeCertificateTracked,
-                      ProofFailureReason::MissingSubtreeCertificate);
-    if (patch.subtreeCertBacked) {
-      discharge.Require(patch.subtreeAdmissible,
-                        ProofObligationKind::SubtreeAdmissibilityTracked,
-                        ProofFailureReason::MissingSubtreeAdmissibility);
-    }
-    break;
-
-  case MacroPatchProofKind::CallChainSuffix:
-    // A call-chain suffix patch is tied directly to the root invocation whose
-    // suffix was edited; it is not a detached nested proof-root carrier.
-    discharge.Require(patch.macroId == patch.proofRootMacroId,
-                      ProofObligationKind::MacroCallChainWitnessTracked,
-                      ProofFailureReason::MissingCallChainWitness);
-    break;
-
-  case MacroPatchProofKind::CounterLiteral:
-  case MacroPatchProofKind::WholeCoverRealization:
-  case MacroPatchProofKind::Unknown:
-    break;
-  }
-
-  return discharge.Finish();
+  return ValidateInvocationPreservingProofImpl(
+      patch, /*requireTopLevelRoot=*/false);
 }
 
 RefoldEngine::ProofDischargeRecord
@@ -339,12 +223,7 @@ RefoldEngine::ValidateInvocationRealizationProof(
   // Invocation-realization patches still need the common accepted-path
   // metadata, but unlike invocation-preserving proofs they are expected to
   // realize expansion text rather than preserve source invocation structure.
-  discharge.Require(inventory.currentPath != AcceptedPathKind::Unknown,
-                    ProofObligationKind::AcceptedPathClassified,
-                    ProofFailureReason::MissingAcceptedPathClassification);
-  discharge.Require(inventory.futureTarget != FutureProofTarget::Unknown,
-                    ProofObligationKind::FutureTargetMapped,
-                    ProofFailureReason::MissingFutureTargetMapping);
+  RequireAcceptedPathBaseline(discharge, inventory);
   discharge.Require(patch.proofRootMacroId != 0,
                     ProofObligationKind::ProofRootTracked,
                     ProofFailureReason::MissingProofRoot);
@@ -411,12 +290,7 @@ RefoldEngine::ProofDischargeRecord RefoldEngine::ValidateIncludePreservingProof(
   // Common include-preserving baseline: the accepted path must be classified,
   // mapped to a future proof target, and backed by an actual include patch
   // shape before path-specific witness obligations are checked below.
-  discharge.Require(inventory.currentPath != AcceptedPathKind::Unknown,
-                    ProofObligationKind::AcceptedPathClassified,
-                    ProofFailureReason::MissingAcceptedPathClassification);
-  discharge.Require(inventory.futureTarget != FutureProofTarget::Unknown,
-                    ProofObligationKind::FutureTargetMapped,
-                    ProofFailureReason::MissingFutureTargetMapping);
+  RequireAcceptedPathBaseline(discharge, inventory);
   discharge.Require(patch != nullptr,
                     ProofObligationKind::IncludePatchShapeTracked,
                     ProofFailureReason::MissingIncludePatchShape);
@@ -456,17 +330,11 @@ RefoldEngine::ProofDischargeRecord RefoldEngine::ValidateIncludePreservingProof(
   case AcceptedPathKind::IncludeInsertSelectedConditionalBoundary:
     // Conditional-boundary insertion is zero-width in A and must be anchored to
     // the selected conditional arm boundary byte.
-    discharge.Require(patch->aStart == patch->aEnd,
-                      ProofObligationKind::IncludePatchShapeTracked,
-                      ProofFailureReason::MissingIncludePatchShape);
-    discharge.Require(
-        witness && witness->evidence ==
-                       IncludeAnchorEvidenceKind::SelectedConditionalBoundary,
+    RequireIncludeZeroWidthAnchor(
+        discharge, *patch, witness,
+        IncludeAnchorEvidenceKind::SelectedConditionalBoundary,
         ProofObligationKind::IncludeSelectedConditionalBoundaryWitnessTracked,
         ProofFailureReason::MissingIncludeSelectedConditionalBoundaryWitness);
-    discharge.Require(witness && witness->hasAnchorByte,
-                      ProofObligationKind::IncludeAnchorByteTracked,
-                      ProofFailureReason::MissingIncludeAnchorByte);
     discharge.Require(
         witness && witness->hasCondArmId,
         ProofObligationKind::IncludeSelectedConditionalBoundaryWitnessTracked,
@@ -476,16 +344,10 @@ RefoldEngine::ProofDischargeRecord RefoldEngine::ValidateIncludePreservingProof(
   case AcceptedPathKind::IncludeInsertChildBoundary:
     // Child-boundary insertion is also zero-width, but the witness must name
     // the child include whose boundary supplies the insertion anchor.
-    discharge.Require(patch->aStart == patch->aEnd,
-                      ProofObligationKind::IncludePatchShapeTracked,
-                      ProofFailureReason::MissingIncludePatchShape);
-    discharge.Require(witness && witness->evidence ==
-                                     IncludeAnchorEvidenceKind::ChildBoundary,
-                      ProofObligationKind::IncludeChildBoundaryWitnessTracked,
-                      ProofFailureReason::MissingIncludeChildBoundaryWitness);
-    discharge.Require(witness && witness->hasAnchorByte,
-                      ProofObligationKind::IncludeAnchorByteTracked,
-                      ProofFailureReason::MissingIncludeAnchorByte);
+    RequireIncludeZeroWidthAnchor(
+        discharge, *patch, witness, IncludeAnchorEvidenceKind::ChildBoundary,
+        ProofObligationKind::IncludeChildBoundaryWitnessTracked,
+        ProofFailureReason::MissingIncludeChildBoundaryWitness);
     discharge.Require(witness && witness->hasChildIncludeId,
                       ProofObligationKind::IncludeChildBoundaryWitnessTracked,
                       ProofFailureReason::MissingIncludeChildBoundaryWitness);
@@ -495,16 +357,10 @@ RefoldEngine::ProofDischargeRecord RefoldEngine::ValidateIncludePreservingProof(
     // Right-neighbor insertion anchors before a known preprocessor token. The
     // anchor byte and neighbor PP token together identify the stable insertion
     // point.
-    discharge.Require(patch->aStart == patch->aEnd,
-                      ProofObligationKind::IncludePatchShapeTracked,
-                      ProofFailureReason::MissingIncludePatchShape);
-    discharge.Require(witness && witness->evidence ==
-                                     IncludeAnchorEvidenceKind::RightNeighborPP,
-                      ProofObligationKind::IncludeRightNeighborWitnessTracked,
-                      ProofFailureReason::MissingIncludeRightNeighborWitness);
-    discharge.Require(witness && witness->hasAnchorByte,
-                      ProofObligationKind::IncludeAnchorByteTracked,
-                      ProofFailureReason::MissingIncludeAnchorByte);
+    RequireIncludeZeroWidthAnchor(
+        discharge, *patch, witness, IncludeAnchorEvidenceKind::RightNeighborPP,
+        ProofObligationKind::IncludeRightNeighborWitnessTracked,
+        ProofFailureReason::MissingIncludeRightNeighborWitness);
     discharge.Require(witness && witness->hasNeighborPP,
                       ProofObligationKind::IncludeRightNeighborWitnessTracked,
                       ProofFailureReason::MissingIncludeRightNeighborWitness);
@@ -514,16 +370,10 @@ RefoldEngine::ProofDischargeRecord RefoldEngine::ValidateIncludePreservingProof(
     // Left-neighbor insertion anchors after a known preprocessor token. As with
     // the right-neighbor case, require both the byte anchor and the neighbor PP
     // identity so the insertion point is theorem-facing.
-    discharge.Require(patch->aStart == patch->aEnd,
-                      ProofObligationKind::IncludePatchShapeTracked,
-                      ProofFailureReason::MissingIncludePatchShape);
-    discharge.Require(witness && witness->evidence ==
-                                     IncludeAnchorEvidenceKind::LeftNeighborPP,
-                      ProofObligationKind::IncludeLeftNeighborWitnessTracked,
-                      ProofFailureReason::MissingIncludeLeftNeighborWitness);
-    discharge.Require(witness && witness->hasAnchorByte,
-                      ProofObligationKind::IncludeAnchorByteTracked,
-                      ProofFailureReason::MissingIncludeAnchorByte);
+    RequireIncludeZeroWidthAnchor(
+        discharge, *patch, witness, IncludeAnchorEvidenceKind::LeftNeighborPP,
+        ProofObligationKind::IncludeLeftNeighborWitnessTracked,
+        ProofFailureReason::MissingIncludeLeftNeighborWitness);
     discharge.Require(witness && witness->hasNeighborPP,
                       ProofObligationKind::IncludeLeftNeighborWitnessTracked,
                       ProofFailureReason::MissingIncludeLeftNeighborWitness);
@@ -533,16 +383,10 @@ RefoldEngine::ProofDischargeRecord RefoldEngine::ValidateIncludePreservingProof(
     // Declaration-boundary insertion is anchored at the end of the declaration
     // header range. Requiring anchorByte == declHeaderE prevents a witness from
     // naming the right range but anchoring at a different byte.
-    discharge.Require(patch->aStart == patch->aEnd,
-                      ProofObligationKind::IncludePatchShapeTracked,
-                      ProofFailureReason::MissingIncludePatchShape);
-    discharge.Require(witness && witness->evidence ==
-                                     IncludeAnchorEvidenceKind::DeclBoundary,
-                      ProofObligationKind::IncludeDeclBoundaryWitnessTracked,
-                      ProofFailureReason::MissingIncludeDeclBoundaryWitness);
-    discharge.Require(witness && witness->hasAnchorByte,
-                      ProofObligationKind::IncludeAnchorByteTracked,
-                      ProofFailureReason::MissingIncludeAnchorByte);
+    RequireIncludeZeroWidthAnchor(
+        discharge, *patch, witness, IncludeAnchorEvidenceKind::DeclBoundary,
+        ProofObligationKind::IncludeDeclBoundaryWitnessTracked,
+        ProofFailureReason::MissingIncludeDeclBoundaryWitness);
     discharge.Require(witness && witness->hasDeclHeaderRange &&
                           witness->anchorByte == witness->declHeaderE,
                       ProofObligationKind::IncludeDeclBoundaryWitnessTracked,
@@ -602,12 +446,7 @@ RefoldEngine::ValidateIncludeRealizationProof(
   // Common include-realization baseline: the path must be classified, mapped to
   // a future proof target, and belong to one of the declared include
   // realization proof classes.
-  discharge.Require(inventory.currentPath != AcceptedPathKind::Unknown,
-                    ProofObligationKind::AcceptedPathClassified,
-                    ProofFailureReason::MissingAcceptedPathClassification);
-  discharge.Require(inventory.futureTarget != FutureProofTarget::Unknown,
-                    ProofObligationKind::FutureTargetMapped,
-                    ProofFailureReason::MissingFutureTargetMapping);
+  RequireAcceptedPathBaseline(discharge, inventory);
   discharge.Require(
       currentPath == AcceptedPathKind::IncludeRealizationInlineFromB ||
           currentPath == AcceptedPathKind::IncludeMaterializedExpansion,
@@ -705,30 +544,7 @@ RefoldEngine::ValidateTUAnchorProof(AcceptedPathKind currentPath,
     // Provable insertion anchors are a family of weaker local anchors. Each
     // evidence kind has its own minimal witness fields; the common PP-gap/TU-byte
     // obligations above are not enough by themselves.
-    bool provableWitness = false;
-    switch (witness->evidence) {
-    case TUAnchorEvidenceKind::ArgLikeBegin:
-      provableWitness = (witness->macroId != 0);
-      break;
-    case TUAnchorEvidenceKind::ImmediateRightNeighbor:
-      provableWitness = witness->hasRightNeighbor;
-      break;
-    case TUAnchorEvidenceKind::ImmediateLeftNeighbor:
-      provableWitness = witness->hasLeftNeighbor;
-      break;
-    case TUAnchorEvidenceKind::IncludeDirectiveBoundary:
-      provableWitness = witness->hasLeftNeighbor && witness->hasRightNeighbor;
-      break;
-    case TUAnchorEvidenceKind::CorroboratedRightNeighbor:
-    case TUAnchorEvidenceKind::CorroboratedLeftNeighbor:
-      provableWitness = witness->hasLeftNeighbor && witness->hasRightNeighbor;
-      break;
-    case TUAnchorEvidenceKind::Unknown:
-    case TUAnchorEvidenceKind::ExactSlotBoundary:
-      provableWitness = false;
-      break;
-    }
-    discharge.Require(provableWitness,
+    discharge.Require(TUAnchorWitnessHasProvableEvidence(*witness),
                       ProofObligationKind::TUProvableEvidenceTracked,
                       ProofFailureReason::MissingTUProvableAnchorWitness);
 
@@ -834,6 +650,50 @@ std::string RefoldEngine::FormatIncludeRealizationWitness(
                  witness.bTokBegin, witness.bTokEnd,
                  witness.hasBTokenEnvelope ? "" : "(missing)")
       .str();
+}
+
+std::string
+RefoldEngine::FormatProofSummaryAuditCore(const ProofSummary &summary) const {
+  return formatv("inventory={0} lattice={1} completeness={2} theoremDomain={3} "
+                 "discharge={4}",
+                 FormatAcceptancePathInventory(summary.inventory),
+                 FormatGlobalSelectionLattice(summary.lattice),
+                 FormatCompletenessContract(summary.completeness),
+                 FormatTheoremDomainContract(summary.theoremDomain),
+                 FormatProofDischargeRecord(summary.discharge))
+      .str();
+}
+
+void RefoldEngine::AppendProofSummaryWitnessAudit(
+    std::string &artifact, const ProofSummary &summary, bool firstOnly) const {
+  if (summary.hasTUAnchorWitness) {
+    artifact += formatv(" tuAnchor={0}",
+                        FormatTUAnchorWitness(summary.tuAnchorWitness))
+                    .str();
+    if (firstOnly)
+      return;
+  }
+  if (summary.hasIncludeAnchorWitness) {
+    artifact +=
+        formatv(" includeAnchor={0}",
+                FormatIncludeAnchorWitness(summary.includeAnchorWitness))
+            .str();
+    if (firstOnly)
+      return;
+  }
+  if (summary.hasIncludeRealizationWitness) {
+    artifact +=
+        formatv(" includeRealization={0}",
+                FormatIncludeRealizationWitness(summary.includeRealizationWitness))
+            .str();
+    if (firstOnly)
+      return;
+  }
+  if (summary.hasTerminalFallbackWitness) {
+    artifact += formatv(" terminalOutOfDomain={0}",
+                        summary.terminalFallbackWitness)
+                    .str();
+  }
 }
 
 RefoldEngine::TerminalFallbackWitness
@@ -1042,60 +902,11 @@ std::string RefoldEngine::FormatAcceptedPathAudit(
   const ProofSummary summary = BuildAcceptedPathProofSummary(
       currentPath, patch, tuAnchorWitness, includeAnchorWitness,
       includeRealizationWitness, terminalFallbackWitness);
-  if (summary.hasTUAnchorWitness) {
-    return formatv("inventory={0} lattice={1} completeness={2} "
-                   "theoremDomain={3} discharge={4} tuAnchor={5}",
-                   FormatAcceptancePathInventory(summary.inventory),
-                   FormatGlobalSelectionLattice(summary.lattice),
-                   FormatCompletenessContract(summary.completeness),
-                   FormatTheoremDomainContract(summary.theoremDomain),
-                   FormatProofDischargeRecord(summary.discharge),
-                   FormatTUAnchorWitness(summary.tuAnchorWitness))
-        .str();
-  }
-  if (summary.hasIncludeAnchorWitness) {
-    return formatv("inventory={0} lattice={1} completeness={2} "
-                   "theoremDomain={3} discharge={4} includeAnchor={5}",
-                   FormatAcceptancePathInventory(summary.inventory),
-                   FormatGlobalSelectionLattice(summary.lattice),
-                   FormatCompletenessContract(summary.completeness),
-                   FormatTheoremDomainContract(summary.theoremDomain),
-                   FormatProofDischargeRecord(summary.discharge),
-                   FormatIncludeAnchorWitness(summary.includeAnchorWitness))
-        .str();
-  }
-  if (summary.hasIncludeRealizationWitness) {
-    return formatv("inventory={0} lattice={1} completeness={2} "
-                   "theoremDomain={3} discharge={4} includeRealization={5}",
-                   FormatAcceptancePathInventory(summary.inventory),
-                   FormatGlobalSelectionLattice(summary.lattice),
-                   FormatCompletenessContract(summary.completeness),
-                   FormatTheoremDomainContract(summary.theoremDomain),
-                   FormatProofDischargeRecord(summary.discharge),
-                   FormatIncludeRealizationWitness(
-                       summary.includeRealizationWitness))
-        .str();
-  }
-  if (summary.hasTerminalFallbackWitness) {
-    return formatv("inventory={0} lattice={1} completeness={2} "
-                   "theoremDomain={3} discharge={4} terminalOutOfDomain={5}",
-                   FormatAcceptancePathInventory(summary.inventory),
-                   FormatGlobalSelectionLattice(summary.lattice),
-                   FormatCompletenessContract(summary.completeness),
-                   FormatTheoremDomainContract(summary.theoremDomain),
-                   FormatProofDischargeRecord(summary.discharge),
-                   summary.terminalFallbackWitness)
-        .str();
-  }
-  return formatv("inventory={0} lattice={1} completeness={2} theoremDomain={3} "
-                 "discharge={4}",
-                 FormatAcceptancePathInventory(summary.inventory),
-                 FormatGlobalSelectionLattice(summary.lattice),
-                 FormatCompletenessContract(summary.completeness),
-                 FormatTheoremDomainContract(summary.theoremDomain),
-                 FormatProofDischargeRecord(summary.discharge))
-      .str();
+  std::string audit = FormatProofSummaryAuditCore(summary);
+  AppendProofSummaryWitnessAudit(audit, summary, /*firstOnly=*/true);
+  return audit;
 }
+
 
 std::string RefoldEngine::FormatAcceptedResultCandidate(
     const AcceptedResultCandidate &candidate) const {
@@ -1130,29 +941,8 @@ std::string RefoldEngine::FormatAcceptedResultCandidate(
     break;
   }
 
-  if (candidate.proofSummary.hasTUAnchorWitness) {
-    artifact +=
-        formatv(" tuAnchor={0}",
-                FormatTUAnchorWitness(candidate.proofSummary.tuAnchorWitness))
-            .str();
-  }
-  if (candidate.proofSummary.hasIncludeAnchorWitness) {
-    artifact += formatv(" includeAnchor={0}",
-                        FormatIncludeAnchorWitness(
-                            candidate.proofSummary.includeAnchorWitness))
-                    .str();
-  }
-  if (candidate.proofSummary.hasIncludeRealizationWitness) {
-    artifact += formatv(" includeRealization={0}",
-                        FormatIncludeRealizationWitness(
-                            candidate.proofSummary.includeRealizationWitness))
-                    .str();
-  }
-  if (candidate.proofSummary.hasTerminalFallbackWitness) {
-    artifact += formatv(" terminalOutOfDomain={0}",
-                        candidate.proofSummary.terminalFallbackWitness)
-                    .str();
-  }
+  AppendProofSummaryWitnessAudit(artifact, candidate.proofSummary,
+                                 /*firstOnly=*/false);
   if (candidate.hasPayloadPreview) {
     artifact += formatv(" payload='{0}'", candidate.payloadPreview).str();
   }
@@ -1160,20 +950,14 @@ std::string RefoldEngine::FormatAcceptedResultCandidate(
   const std::string artifactSuffix =
       artifact.empty() ? std::string()
                        : formatv(" artifact={0}", artifact).str();
-  return formatv(
-             "kind={0} class={1} realization={2} preference={3} "
-             "surfaceDisposition={4} inventory={5} lattice={6} "
-             "completeness={7} theoremDomain={8} discharge={9}{10}",
-             candidate.kind, candidate.proofSummary.acceptedClass,
-             candidate.proofSummary.realizationMode,
-             candidate.proofSummary.preference,
-             candidate.proofSummary.surfaceDisposition,
-             FormatAcceptancePathInventory(candidate.proofSummary.inventory),
-             FormatGlobalSelectionLattice(candidate.proofSummary.lattice),
-             FormatCompletenessContract(candidate.proofSummary.completeness),
-             FormatTheoremDomainContract(candidate.proofSummary.theoremDomain),
-             FormatProofDischargeRecord(candidate.proofSummary.discharge),
-             artifactSuffix)
+  return formatv("kind={0} class={1} realization={2} preference={3} "
+                 "surfaceDisposition={4} {5}{6}",
+                 candidate.kind, candidate.proofSummary.acceptedClass,
+                 candidate.proofSummary.realizationMode,
+                 candidate.proofSummary.preference,
+                 candidate.proofSummary.surfaceDisposition,
+                 FormatProofSummaryAuditCore(candidate.proofSummary),
+                 artifactSuffix)
       .str();
 }
 
@@ -1181,34 +965,27 @@ std::string RefoldEngine::FormatMacroPatchAudit(const MacroPatch &patch) const {
   const ProofSummary summary = ClassifyMacroPatchProof(patch);
   return formatv(
              "proofKind={0} topClass={1} realization={2} preference={3} "
-             "surfaceDisposition={4} inventory={5} lattice={6} "
-             "completeness={7} "
-             "theoremDomain={8} discharge={9} validated={10} struct={11} "
-             "proofRoot={12} subtreeCert={13} "
-             "leaf={14} witnesses={15} invCerts={16} formalCerts={17} "
-             "argCerts={18} liftChains={19} liftSteps={20} rootMerges={21} "
-             "lexicalBridge={22} paste={23} wrappers={24} stringify={25} "
-             "wideStringify={26} childSyntax={27} rawInvocation={28} "
-             "passthrough={29} bridgeSensitive={30} "
-             "deferredPasteDischarged={31} admissible={32} "
-             "pasteReplayValidated={33} expRootN={34} "
-             "deferredRootN={35} bridgeFormalN={36} expRoot={37} "
-             "deferredRootArgs={38} bridgeFormals={39} wholeCoverA=[{40},{41}) "
-             "wholeCoverBraw=[{42},{43}) wholeCoverBadj=[{44},{45})",
+             "surfaceDisposition={4} {5} validated={6} struct={7} "
+             "proofRoot={8} subtreeCert={9} "
+             "leaf={10} witnesses={11} invCerts={12} formalCerts={13} "
+             "argCerts={14} liftChains={15} liftSteps={16} rootMerges={17} "
+             "lexicalBridge={18} paste={19} wrappers={20} stringify={21} "
+             "wideStringify={22} childSyntax={23} rawInvocation={24} "
+             "passthrough={25} bridgeSensitive={26} "
+             "deferredPasteDischarged={27} admissible={28} "
+             "pasteReplayValidated={29} expRootN={30} "
+             "deferredRootN={31} bridgeFormalN={32} expRoot={33} "
+             "deferredRootArgs={34} bridgeFormals={35} wholeCoverA=[{36},{37}) "
+             "wholeCoverBraw=[{38},{39}) wholeCoverBadj=[{40},{41})",
              patch.proofKind, summary.acceptedClass, summary.realizationMode,
              summary.preference, summary.surfaceDisposition,
-             FormatAcceptancePathInventory(summary.inventory),
-             FormatGlobalSelectionLattice(summary.lattice),
-             FormatCompletenessContract(summary.completeness),
-             FormatTheoremDomainContract(summary.theoremDomain),
-             FormatProofDischargeRecord(summary.discharge),
-             patch.proofValidated ? 1 : 0, patch.structurePreserving ? 1 : 0,
-             patch.proofRootMacroId, patch.subtreeCertBacked ? 1 : 0,
-             patch.subtreeLeafMacroId, patch.subtreeWitnessCount,
-             patch.subtreeInvocationCertCount, patch.subtreeFormalCertCount,
-             patch.subtreeArgCertCount, patch.subtreeLiftChainCount,
-             patch.subtreeLiftStepCount, patch.subtreeRootMergeCount,
-             patch.subtreeUsesLexicalBridge ? 1 : 0,
+             FormatProofSummaryAuditCore(summary), patch.proofValidated ? 1 : 0,
+             patch.structurePreserving ? 1 : 0, patch.proofRootMacroId,
+             patch.subtreeCertBacked ? 1 : 0, patch.subtreeLeafMacroId,
+             patch.subtreeWitnessCount, patch.subtreeInvocationCertCount,
+             patch.subtreeFormalCertCount, patch.subtreeArgCertCount,
+             patch.subtreeLiftChainCount, patch.subtreeLiftStepCount,
+             patch.subtreeRootMergeCount, patch.subtreeUsesLexicalBridge ? 1 : 0,
              patch.subtreeTouchesPaste ? 1 : 0,
              patch.subtreeHasWrapperSemantics ? 1 : 0,
              patch.subtreeHasStringifySemantics ? 1 : 0,

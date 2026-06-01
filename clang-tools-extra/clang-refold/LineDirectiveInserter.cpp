@@ -48,19 +48,6 @@ struct LineControlMacroDefinition {
 using LineControlMacroMap =
     std::unordered_map<std::string, LineControlMacroDefinition>;
 
-static StringRef trimHorizontal(StringRef text) {
-  size_t begin = 0;
-  while (begin < text.size() && stringutils::isWs(text[begin]) &&
-         text[begin] != '\n')
-    ++begin;
-
-  size_t end = text.size();
-  while (end > begin && stringutils::isWs(text[end - 1]) &&
-         text[end - 1] != '\n')
-    --end;
-  return text.slice(begin, end);
-}
-
 // Implement the whitespace normalization required by macro stringification.
 // `# x` in a replacement list stringifies the *raw* argument after trimming
 // leading/trailing horizontal whitespace and collapsing internal whitespace
@@ -69,7 +56,7 @@ static StringRef trimHorizontal(StringRef text) {
 static std::string collapseWhitespaceForStringification(StringRef text) {
   std::string out;
   bool inWs = false;
-  StringRef trimmed = trimHorizontal(text);
+  StringRef trimmed = stringutils::trimWsNoLF(text);
   for (size_t i = 0; i < trimmed.size(); ++i) {
     char c = trimmed[i];
     if (stringutils::isWs(c)) {
@@ -101,49 +88,6 @@ static std::string spellStringifiedMacroArgument(StringRef arg) {
   return out;
 }
 
-static std::string basenameForLineControlFile(StringRef file) {
-  size_t slash = file.find_last_of("/\\");
-  if (slash == StringRef::npos)
-    return file.str();
-  return file.substr(slash + 1).str();
-}
-
-static std::string quoteLineControlFile(StringRef file) {
-  std::string out;
-  out.reserve(file.size() + 2);
-  out.push_back('"');
-  out += LineDirectiveInserter::EscapeForLineDirective(file);
-  out.push_back('"');
-  return out;
-}
-
-// Copy a string/character literal without interpreting identifiers inside it.
-// Macro replacement does not occur inside quoted literals, and preserving the
-// raw literal spelling is important for #line filename decoding.
-static bool copyQuotedLiteral(StringRef text, size_t &i, std::string &out) {
-  if (i >= text.size() || (text[i] != '"' && text[i] != '\''))
-    return false;
-
-  const char quote = text[i];
-  out.push_back(text[i++]);
-  while (i < text.size()) {
-    char c = text[i++];
-    out.push_back(c);
-    if (c == '\\' && i < text.size()) {
-      out.push_back(text[i++]);
-      continue;
-    }
-    if (c == quote)
-      break;
-  }
-  return true;
-}
-
-static bool skipQuotedLiteral(StringRef text, size_t &i) {
-  std::string ignored;
-  return copyQuotedLiteral(text, i, ignored);
-}
-
 // Parse a function-like macro invocation argument list well enough for #line
 // operands.  Arguments may contain nested parentheses and quoted literals; the
 // result is raw, trimmed argument spelling because stringification must see raw
@@ -162,7 +106,7 @@ static std::optional<std::vector<std::string>> parseMacroArguments(
 
     if (c == '"' || c == '\'') {
       size_t literalBegin = i;
-      if (!skipQuotedLiteral(text, i))
+      if (!stringutils::skipQuotedLiteral(text, i))
         return std::nullopt;
       cur += text.slice(literalBegin, i).str();
       --i;
@@ -177,8 +121,8 @@ static std::optional<std::vector<std::string>> parseMacroArguments(
 
     if (c == ')') {
       if (depth == 0) {
-        if (!args.empty() || !trimHorizontal(StringRef(cur)).empty())
-          args.push_back(trimHorizontal(StringRef(cur)).str());
+        if (!args.empty() || !stringutils::trimWsNoLF(StringRef(cur)).empty())
+          args.push_back(stringutils::trimWsNoLF(StringRef(cur)).str());
         afterClose = i + 1;
         return args;
       }
@@ -188,7 +132,7 @@ static std::optional<std::vector<std::string>> parseMacroArguments(
     }
 
     if (c == ',' && depth == 0) {
-      args.push_back(trimHorizontal(StringRef(cur)).str());
+      args.push_back(stringutils::trimWsNoLF(StringRef(cur)).str());
       cur.clear();
       continue;
     }
@@ -219,7 +163,7 @@ static std::optional<std::string> parseBalancedParenthesizedContent(
 
     if (c == '"' || c == '\'') {
       size_t literalBegin = i;
-      if (!skipQuotedLiteral(text, i))
+      if (!stringutils::skipQuotedLiteral(text, i))
         return std::nullopt;
       content += text.slice(literalBegin, i).str();
       --i;
@@ -275,14 +219,14 @@ static std::string removeTokenPasteOperators(StringRef text) {
   out.reserve(text.size());
 
   for (size_t i = 0; i < text.size();) {
-    if (copyQuotedLiteral(text, i, out))
+    if (stringutils::copyQuotedLiteral(text, i, out))
       continue;
 
     if (i + 1 < text.size() && text[i] == '#' && text[i + 1] == '#') {
-      while (!out.empty() && stringutils::isWs(out.back()) && out.back() != '\n')
+      while (!out.empty() && stringutils::isWsNoLF(out.back()))
         out.pop_back();
       i += 2;
-      while (i < text.size() && stringutils::isWs(text[i]) && text[i] != '\n')
+      while (i < text.size() && stringutils::isWsNoLF(text[i]))
         ++i;
       continue;
     }
@@ -305,10 +249,6 @@ static std::string substituteLineControlReplacementFragment(
     std::unordered_set<std::string> &disabled, size_t logicalLineAtLineStart,
     StringRef activeFileSpelling);
 
-static bool isHorizontalWhitespace(char c) {
-  return stringutils::isWs(c) && c != '\n';
-}
-
 // Return true iff the replacement-list token [nameBegin, nameEnd) is an
 // operand of a token-paste operator.  Macro arguments adjacent to `##` are not
 // macro-expanded before substitution; their raw tokens are substituted, the
@@ -325,13 +265,13 @@ static bool isHorizontalWhitespace(char c) {
 static bool replacementTokenIsAdjacentToPaste(StringRef repl, size_t nameBegin,
                                               size_t nameEnd) {
   size_t before = nameBegin;
-  while (before > 0 && isHorizontalWhitespace(repl[before - 1]))
+  while (before > 0 && stringutils::isWsNoLF(repl[before - 1]))
     --before;
   if (before >= 2 && repl[before - 2] == '#' && repl[before - 1] == '#')
     return true;
 
   size_t after = nameEnd;
-  while (after < repl.size() && isHorizontalWhitespace(repl[after]))
+  while (after < repl.size() && stringutils::isWsNoLF(repl[after]))
     ++after;
   return after + 1 < repl.size() && repl[after] == '#' &&
          repl[after + 1] == '#';
@@ -358,7 +298,7 @@ static std::string substituteFunctionLikeLineControlMacro(
     std::string raw;
     if (def.variadic && def.params[i] == def.variadicParam) {
       raw = joinRawMacroArguments(rawArgs, i);
-      variadicArgumentHasTokens = !trimHorizontal(StringRef(raw)).empty();
+      variadicArgumentHasTokens = !stringutils::trimWsNoLF(StringRef(raw)).empty();
     } else {
       raw = i < rawArgs.size() ? rawArgs[i] : std::string();
     }
@@ -388,7 +328,7 @@ static std::string substituteLineControlReplacementFragment(
   substituted.reserve(repl.size());
 
   for (size_t i = 0; i < repl.size();) {
-    if (copyQuotedLiteral(repl, i, substituted))
+    if (stringutils::copyQuotedLiteral(repl, i, substituted))
       continue;
 
     if (repl[i] == '#') {
@@ -399,7 +339,7 @@ static std::string substituteLineControlReplacementFragment(
       }
 
       size_t j = i + 1;
-      while (j < repl.size() && stringutils::isWs(repl[j]) && repl[j] != '\n')
+      while (j < repl.size() && stringutils::isWsNoLF(repl[j]))
         ++j;
       if (j < repl.size() && stringutils::isIdentStart(repl[j])) {
         size_t nameBegin = j++;
@@ -431,8 +371,7 @@ static std::string substituteLineControlReplacementFragment(
       //   #define LOC(n, name, ...) n __VA_OPT__(#name)
       if (name == "__VA_OPT__") {
         size_t callPos = i;
-        while (callPos < repl.size() && stringutils::isWs(repl[callPos]) &&
-               repl[callPos] != '\n')
+        while (callPos < repl.size() && stringutils::isWsNoLF(repl[callPos]))
           ++callPos;
         if (callPos < repl.size() && repl[callPos] == '(') {
           size_t afterClose = callPos;
@@ -494,7 +433,7 @@ static std::string expandLineControlMacros(
   out.reserve(text.size());
 
   for (size_t i = 0; i < text.size();) {
-    if (copyQuotedLiteral(text, i, out))
+    if (stringutils::copyQuotedLiteral(text, i, out))
       continue;
 
     if (!stringutils::isIdentStart(text[i])) {
@@ -515,11 +454,12 @@ static std::string expandLineControlMacros(
       continue;
     }
     if (name == "__FILE__") {
-      out += quoteLineControlFile(activeFileSpelling);
+      out += stringutils::quoteLineDirectivePath(activeFileSpelling);
       continue;
     }
     if (name == "__FILE_NAME__") {
-      out += quoteLineControlFile(basenameForLineControlFile(activeFileSpelling));
+      out += stringutils::quoteLineDirectivePath(
+          stringutils::pathBasename(activeFileSpelling));
       continue;
     }
 
@@ -554,8 +494,7 @@ static std::string expandLineControlMacros(
     // the argument list.  This differs from definition-site recognition, where
     // `NAME(` must be immediate to define a function-like macro.
     size_t callPos = i;
-    while (callPos < text.size() && stringutils::isWs(text[callPos]) &&
-           text[callPos] != '\n')
+    while (callPos < text.size() && stringutils::isWsNoLF(text[callPos]))
       ++callPos;
     if (callPos >= text.size() || text[callPos] != '(') {
       out += name;
@@ -589,38 +528,19 @@ static std::string expandLineControlMacros(
                                  activeFileSpelling);
 }
 
-static bool lineStartsWithHash(StringRef line, size_t &p, size_t to) {
-  while (p < to && stringutils::isWs(line[p]) && line[p] != '\n')
-    ++p;
-  if (p >= to || line[p] != '#')
-    return false;
-  ++p;
-  while (p < to && stringutils::isWs(line[p]) && line[p] != '\n')
-    ++p;
-  return true;
+static bool lineKeywordAt(StringRef line, size_t pos, size_t to) {
+  return pos + 4 <= to && line.substr(pos, 4) == "line" &&
+         (pos + 4 == to || stringutils::isWs(line[pos + 4]));
 }
-
-static bool readDirectiveIdentifier(StringRef line, size_t &p, size_t to,
-                                    StringRef &ident) {
-  if (p >= to || !stringutils::isIdentStart(line[p]))
-    return false;
-  const size_t begin = p;
-  ++p;
-  while (p < to && stringutils::isIdentPart(line[p]))
-    ++p;
-  ident = line.slice(begin, p);
-  return true;
-}
-
 
 static bool readLineControlDirectiveAndOperand(StringRef line,
                                                StringRef &directive,
                                                StringRef &operand) {
   const size_t to = line.size();
   size_t p = 0;
-  if (!lineStartsWithHash(line, p, to))
+  if (!stringutils::consumeDirectiveHash(line, p, to))
     return false;
-  if (!readDirectiveIdentifier(line, p, to, directive))
+  if (!stringutils::consumeIdentifier(line, p, to, directive))
     return false;
   operand = line.substr(p);
   return true;
@@ -629,13 +549,12 @@ static bool readLineControlDirectiveAndOperand(StringRef line,
 static bool lineControlSpellingIsLineDirective(StringRef line) {
   const size_t to = line.size();
   size_t p = 0;
-  if (!lineStartsWithHash(line, p, to))
+  if (!stringutils::consumeDirectiveHash(line, p, to))
     return false;
 
   // Standard spelling: #line <pp-tokens>.  Require a token boundary after
   // "line" so ordinary directives with longer names are not misclassified.
-  if (p + 4 <= to && line.substr(p, 4) == "line" &&
-      (p + 4 == to || stringutils::isWs(line[p + 4])))
+  if (lineKeywordAt(line, p, to))
     return true;
 
   // GCC/Clang numeric line-control form: # <digits> ["file"].  The actual
@@ -653,18 +572,18 @@ static void updateLineControlMacroEnvironment(StringRef line,
                                               LineControlMacroMap &macros) {
   const size_t to = line.size();
   size_t p = 0;
-  if (!lineStartsWithHash(line, p, to))
+  if (!stringutils::consumeDirectiveHash(line, p, to))
     return;
 
   StringRef directive;
-  if (!readDirectiveIdentifier(line, p, to, directive))
+  if (!stringutils::consumeIdentifier(line, p, to, directive))
     return;
 
   if (directive == "undef") {
-    while (p < to && stringutils::isWs(line[p]) && line[p] != '\n')
+    while (p < to && stringutils::isWsNoLF(line[p]))
       ++p;
     StringRef name;
-    if (readDirectiveIdentifier(line, p, to, name))
+    if (stringutils::consumeIdentifier(line, p, to, name))
       macros.erase(name.str());
     return;
   }
@@ -674,11 +593,10 @@ static void updateLineControlMacroEnvironment(StringRef line,
 
   if (p >= to || !stringutils::isWs(line[p]) || line[p] == '\n')
     return;
-  while (p < to && stringutils::isWs(line[p]) && line[p] != '\n')
-    ++p;
+  stringutils::skipWsNoLF(line, p, to);
 
   StringRef name;
-  if (!readDirectiveIdentifier(line, p, to, name))
+  if (!stringutils::consumeIdentifier(line, p, to, name))
     return;
 
   LineControlMacroDefinition def;
@@ -692,7 +610,7 @@ static void updateLineControlMacroEnvironment(StringRef line,
     def.functionLike = true;
     ++p;
     while (p < to) {
-      while (p < to && stringutils::isWs(line[p]) && line[p] != '\n')
+      while (p < to && stringutils::isWsNoLF(line[p]))
         ++p;
       if (p < to && line[p] == ')') {
         ++p;
@@ -708,7 +626,7 @@ static void updateLineControlMacroEnvironment(StringRef line,
         p += 3;
       } else {
         StringRef param;
-        if (!readDirectiveIdentifier(line, p, to, param)) {
+        if (!stringutils::consumeIdentifier(line, p, to, param)) {
           macros.erase(name.str());
           return;
         }
@@ -725,7 +643,7 @@ static void updateLineControlMacroEnvironment(StringRef line,
         }
       }
 
-      while (p < to && stringutils::isWs(line[p]) && line[p] != '\n')
+      while (p < to && stringutils::isWsNoLF(line[p]))
         ++p;
       if (p < to && line[p] == ',') {
         if (def.variadic) {
@@ -744,7 +662,7 @@ static void updateLineControlMacroEnvironment(StringRef line,
     }
   }
 
-  def.replacement = trimHorizontal(line.substr(p)).str();
+  def.replacement = stringutils::trimWsNoLF(line.substr(p)).str();
   macros[name.str()] = std::move(def);
 }
 
@@ -779,17 +697,7 @@ static bool collectLineControlLogicalLine(StringRef src, size_t lineBegin,
   logicalLine.clear();
 
   auto skipPhase2Splice = [&](size_t &pos) -> bool {
-    if (src[pos] != '\\')
-      return false;
-    if (pos + 1 < limit && src[pos + 1] == '\n') {
-      pos += 2;
-      return true;
-    }
-    if (pos + 2 < limit && src[pos + 1] == '\r' && src[pos + 2] == '\n') {
-      pos += 3;
-      return true;
-    }
-    return false;
+    return stringutils::skipPhase2LineSplice(src, limit, pos);
   };
 
   for (size_t pos = lineBegin; pos < limit;) {
@@ -856,40 +764,6 @@ static bool collectLineControlLogicalLine(StringRef src, size_t lineBegin,
   return true;
 }
 
-// Apply translation phase 3 to the collected directive line: comments become a
-// single whitespace character.  This is deliberately small and lexical: it is
-// only used before #define/#undef bookkeeping and #line operand parsing.  String
-// and character literals are copied verbatim because comments are not recognized
-// inside them.
-static std::string replaceCommentsWithWhitespaceForLineControl(StringRef text) {
-  std::string out;
-  out.reserve(text.size());
-
-  for (size_t i = 0; i < text.size();) {
-    if (copyQuotedLiteral(text, i, out))
-      continue;
-
-    if (i + 1 < text.size() && text[i] == '/' && text[i + 1] == '/') {
-      out.push_back(' ');
-      break;
-    }
-
-    if (i + 1 < text.size() && text[i] == '/' && text[i + 1] == '*') {
-      out.push_back(' ');
-      i += 2;
-      while (i + 1 < text.size() && !(text[i] == '*' && text[i + 1] == '/'))
-        ++i;
-      if (i + 1 < text.size())
-        i += 2;
-      continue;
-    }
-
-    out.push_back(text[i++]);
-  }
-
-  return out;
-}
-
 // Return the logical line number at the start of a physical source line while
 // scanning the prefix.  If no source-authored line-control directive has been
 // seen, physical and logical lines coincide.  After a directive, the logical
@@ -930,6 +804,75 @@ static size_t physicalLineControlDirectiveAdjustment(StringRef src,
 }
 
 
+static void appendDecodedLineControlFilenameEscape(StringRef src, size_t &p,
+                                                     size_t to,
+                                                     SmallString<64> &out) {
+  char escaped = src[p++];
+  if (escaped == 'x' || escaped == 'X') {
+    unsigned value = 0;
+    bool sawHex = false;
+    while (p < to && std::isxdigit(static_cast<unsigned char>(src[p]))) {
+      sawHex = true;
+      char h = src[p++];
+      value *= 16;
+      if (h >= '0' && h <= '9')
+        value += static_cast<unsigned>(h - '0');
+      else if (h >= 'a' && h <= 'f')
+        value += static_cast<unsigned>(10 + h - 'a');
+      else if (h >= 'A' && h <= 'F')
+        value += static_cast<unsigned>(10 + h - 'A');
+    }
+    out.push_back(static_cast<char>((sawHex ? value : escaped) & 0xff));
+    return;
+  }
+
+  if (escaped >= '0' && escaped <= '7') {
+    unsigned value = static_cast<unsigned>(escaped - '0');
+    for (unsigned digits = 1;
+         digits < 3 && p < to && src[p] >= '0' && src[p] <= '7'; ++digits)
+      value = value * 8 + static_cast<unsigned>(src[p++] - '0');
+    out.push_back(static_cast<char>(value & 0xff));
+    return;
+  }
+
+  switch (escaped) {
+  case '"':
+  case '\\':
+  case '?':
+  case '\'':
+    out.push_back(escaped);
+    break;
+  case 'a':
+    out.push_back('\a');
+    break;
+  case 'b':
+    out.push_back('\b');
+    break;
+  case 'e':
+  case 'E':
+    out.push_back(static_cast<char>(0x1b));
+    break;
+  case 'f':
+    out.push_back('\f');
+    break;
+  case 'n':
+    out.push_back('\n');
+    break;
+  case 'r':
+    out.push_back('\r');
+    break;
+  case 't':
+    out.push_back('\t');
+    break;
+  case 'v':
+    out.push_back('\v');
+    break;
+  default:
+    out.push_back(escaped);
+    break;
+  }
+}
+
 // Parse a single logical preprocessing line as a line-control directive.  This
 // namespace-local helper is shared by the member API and the model-backed
 // logical-location scanner below; keeping the parser out of the class member
@@ -944,8 +887,7 @@ parseLineDirectiveForLineControl(StringRef src, size_t from, size_t to) {
 
   // A preprocessing directive may be preceded by horizontal whitespace.  Do
   // not cross a physical newline; `from/to` already delimit one source line.
-  while (p < to && stringutils::isWs(src[p]) && src[p] != '\n')
-    ++p;
+  stringutils::skipWsNoLF(src, p, to);
 
   if (p >= to || src[p] != '#')
     return std::nullopt;
@@ -954,17 +896,13 @@ parseLineDirectiveForLineControl(StringRef src, size_t from, size_t to) {
   // Both `#line` and `# line` are accepted spellings.  Clang/GCC also accept
   // the numeric line-control form `# 123 "file"`, so leave `p` at the digits
   // when there is no `line` keyword.
-  while (p < to && stringutils::isWs(src[p]) && src[p] != '\n')
-    ++p;
+  stringutils::skipWsNoLF(src, p, to);
 
   bool usedLineKeyword = false;
-  if (p + 4 <= to && src.substr(p, 4) == "line") {
+  if (lineKeywordAt(src, p, to)) {
     usedLineKeyword = true;
     p += 4;
-    if (p >= to || !stringutils::isWs(src[p]))
-      return std::nullopt;
-    while (p < to && stringutils::isWs(src[p]) && src[p] != '\n')
-      ++p;
+    stringutils::skipWsNoLF(src, p, to);
   }
 
   const size_t lineStart = p;
@@ -978,8 +916,7 @@ parseLineDirectiveForLineControl(StringRef src, size_t from, size_t to) {
   if (src.slice(lineStart, p).getAsInteger(10, lineAfter))
     return std::nullopt;
 
-  while (p < to && stringutils::isWs(src[p]) && src[p] != '\n')
-    ++p;
+  stringutils::skipWsNoLF(src, p, to);
 
   // Parse the optional quoted filename operand.  Absence of this operand is
   // semantically meaningful: `#line 200` changes only the logical line number
@@ -996,92 +933,17 @@ parseLineDirectiveForLineControl(StringRef src, size_t from, size_t to) {
         closedFileQuote = true;
         break;
       }
-      if (c == '\\' && p < to) {
-        char escaped = src[p++];
-        if (escaped == 'x' || escaped == 'X') {
-          // #line filename operands are C string literals after macro
-          // expansion. Decode \x... to the logical filename byte before
-          // formatting a resync directive; otherwise __FILE__ observes the raw
-          // source spelling instead of the preprocessing result.
-          unsigned value = 0;
-          bool sawHex = false;
-          while (p < to && std::isxdigit(static_cast<unsigned char>(src[p]))) {
-            sawHex = true;
-            char h = src[p++];
-            value *= 16;
-            if (h >= '0' && h <= '9')
-              value += static_cast<unsigned>(h - '0');
-            else if (h >= 'a' && h <= 'f')
-              value += static_cast<unsigned>(10 + h - 'a');
-            else if (h >= 'A' && h <= 'F')
-              value += static_cast<unsigned>(10 + h - 'A');
-          }
-          if (sawHex) {
-            fileSpelling.push_back(static_cast<char>(value & 0xff));
-          } else {
-            fileSpelling.push_back(escaped);
-          }
-          continue;
-        }
-
-        if (escaped >= '0' && escaped <= '7') {
-          unsigned value = static_cast<unsigned>(escaped - '0');
-          for (unsigned digits = 1;
-               digits < 3 && p < to && src[p] >= '0' && src[p] <= '7';
-               ++digits) {
-            value = value * 8 + static_cast<unsigned>(src[p++] - '0');
-          }
-          fileSpelling.push_back(static_cast<char>(value & 0xff));
-          continue;
-        }
-
-        switch (escaped) {
-        case '"':
-        case '\\':
-        case '?':
-        case '\'':
-          fileSpelling.push_back(escaped);
-          break;
-        case 'a':
-          fileSpelling.push_back('\a');
-          break;
-        case 'b':
-          fileSpelling.push_back('\b');
-          break;
-        case 'e':
-        case 'E':
-          fileSpelling.push_back(static_cast<char>(0x1b));
-          break;
-        case 'f':
-          fileSpelling.push_back('\f');
-          break;
-        case 'n':
-          fileSpelling.push_back('\n');
-          break;
-        case 'r':
-          fileSpelling.push_back('\r');
-          break;
-        case 't':
-          fileSpelling.push_back('\t');
-          break;
-        case 'v':
-          fileSpelling.push_back('\v');
-          break;
-        default:
-          fileSpelling.push_back(escaped);
-          break;
-        }
-      } else {
+      if (c == '\\' && p < to)
+        appendDecodedLineControlFilenameEscape(src, p, to, fileSpelling);
+      else
         fileSpelling.push_back(c);
-      }
     }
 
     if (!closedFileQuote)
       return std::nullopt;
   }
 
-  while (p < to && stringutils::isWs(src[p]) && src[p] != '\n')
-    ++p;
+  stringutils::skipWsNoLF(src, p, to);
 
   // GNU/Clang line-marker directives emitted by preprocessors can carry
   // numeric flags after the optional filename, e.g. `# 1 "file" 2 3`.  Those
@@ -1093,7 +955,7 @@ parseLineDirectiveForLineControl(StringRef src, size_t from, size_t to) {
         break;
       while (p < to && std::isdigit(static_cast<unsigned char>(src[p])))
         ++p;
-      while (p < to && stringutils::isWs(src[p]) && src[p] != '\n')
+      while (p < to && stringutils::isWsNoLF(src[p]))
         ++p;
     }
   }
@@ -1117,7 +979,7 @@ static std::string expandSourceLineControlDirective(
     size_t logicalLineAtLineStart, StringRef activeFileSpelling) {
   const size_t to = line.size();
   size_t p = 0;
-  if (!lineStartsWithHash(line, p, to))
+  if (!stringutils::consumeDirectiveHash(line, p, to))
     return line.str();
 
   // Macro expansion in a line-control directive applies to the operands after
@@ -1127,12 +989,8 @@ static std::string expandSourceLineControlDirective(
   // The parser later validates that expansion produced a line number and an
   // optional filename string literal.
   size_t operandBegin = p;
-  bool hasLineKeyword = false;
-  if (p + 4 <= to && line.substr(p, 4) == "line" &&
-      (p + 4 == to || stringutils::isWs(line[p + 4]))) {
+  if (lineKeywordAt(line, p, to))
     operandBegin = p + 4;
-    hasLineKeyword = true;
-  }
 
   std::string expanded;
   expanded.reserve(line.size());
@@ -1144,7 +1002,6 @@ static std::string expandSourceLineControlDirective(
   // Keep non-`#line` directives unchanged.  For `# <tokens>` line-control, the
   // expanded operands are enough; for ordinary directives such as `#define`,
   // parsing will fail and the caller will ignore the result.
-  (void)hasLineKeyword;
   return expanded;
 }
 
@@ -1160,37 +1017,20 @@ findLineControlDirectiveHashOffset(StringRef src, size_t lineStart,
                                    size_t afterLine) {
   size_t p = lineStart;
   while (p < afterLine && p < src.size()) {
-    if (isHorizontalWhitespace(src[p])) {
+    if (stringutils::isWsNoLF(src[p])) {
       ++p;
       continue;
     }
 
-    if (src[p] == '\\') {
-      if (p + 1 < afterLine && src[p + 1] == '\n') {
-        p += 2;
-        continue;
-      }
-      if (p + 2 < afterLine && src[p + 1] == '\r' && src[p + 2] == '\n') {
-        p += 3;
-        continue;
-      }
-    }
+    if (stringutils::skipPhase2LineSplice(src, afterLine, p))
+      continue;
 
     if (p + 1 < afterLine && src[p] == '/' && src[p + 1] == '*') {
       p += 2;
       bool closed = false;
       while (p + 1 < afterLine) {
-        if (src[p] == '\\') {
-          if (p + 1 < afterLine && src[p + 1] == '\n') {
-            p += 2;
-            continue;
-          }
-          if (p + 2 < afterLine && src[p + 1] == '\r' &&
-              src[p + 2] == '\n') {
-            p += 3;
-            continue;
-          }
-        }
+        if (stringutils::skipPhase2LineSplice(src, afterLine, p))
+          continue;
         if (src[p] == '*' && src[p + 1] == '/') {
           p += 2;
           closed = true;
@@ -1366,7 +1206,8 @@ static LineDirectiveLocation logicalLocationAtOffsetImpl(
     // the owner-local line-control model aligned with the actual preprocessor
     // without changing any refolding ownership decisions.
     std::string phase3Line =
-        replaceCommentsWithWhitespaceForLineControl(StringRef(logicalLine));
+        stringutils::replaceCommentsWithWhitespacePreservingLiterals(
+            StringRef(logicalLine));
 
     // Source line-control directives are interpreted by the preprocessor after
     // macro expansion of their operands. Recover the deterministic owner-local
@@ -1516,6 +1357,66 @@ std::string LineDirectiveInserter::WrapIncludeExpansion(
   return result;
 }
 
+static bool rejoinsUntouchedTailSafelyAtBOL(StringRef originalFileText,
+                                             uint64_t editEnd) {
+  const size_t n = originalFileText.size();
+  const size_t pos = (editEnd >= static_cast<uint64_t>(n))
+                         ? n
+                         : static_cast<size_t>(editEnd);
+
+  if (pos == n || stringutils::isBOL(originalFileText, pos))
+    return true;
+
+  size_t nl = originalFileText.find('\n', pos);
+  if (nl == StringRef::npos)
+    nl = n;
+  return stringutils::isIndentOnly(originalFileText, pos, nl);
+}
+
+static std::string insertLineDirectiveAt(StringRef replacement,
+                                         StringRef directive, size_t offset) {
+  std::string res = replacement.substr(0, offset).str();
+  res += directive;
+  res += replacement.substr(offset).str();
+  return res;
+}
+
+static std::optional<size_t> findCarriedSuffixPrefixInsertionOffset(
+    StringRef originalFileText, uint64_t s, uint64_t e, StringRef replacement,
+    size_t replacementPrefixOffset, bool requireDeletedLineFromBOL) {
+  if (e > originalFileText.size() || replacementPrefixOffset >= replacement.size())
+    return std::nullopt;
+
+  const size_t editBegin = static_cast<size_t>(s);
+  const size_t editEnd = static_cast<size_t>(e);
+  const size_t resumePrefixBegin = stringutils::lineStartOffset(originalFileText,
+                                                               editEnd);
+  if (resumePrefixBegin >= editEnd)
+    return std::nullopt;
+
+  if (resumePrefixBegin != 0 &&
+      stringutils::isLineSplice(originalFileText, resumePrefixBegin - 1))
+    return std::nullopt;
+
+  if (requireDeletedLineFromBOL) {
+    if (editBegin > resumePrefixBegin)
+      return std::nullopt;
+    if (!stringutils::isBOL(originalFileText, editBegin))
+      return std::nullopt;
+    if (stringutils::countNonSplicedNewlines(originalFileText, editBegin,
+                                            resumePrefixBegin) == 0)
+      return std::nullopt;
+  }
+
+  StringRef originalResumePrefix = originalFileText.slice(resumePrefixBegin,
+                                                         editEnd);
+  if (originalResumePrefix.empty())
+    return std::nullopt;
+  if (replacement.substr(replacementPrefixOffset) != originalResumePrefix)
+    return std::nullopt;
+  return replacementPrefixOffset;
+}
+
 std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
     StringRef originalFileText, uint64_t s, uint64_t e, StringRef replacement,
     const LineDirectiveLocation &resumeLoc) const {
@@ -1524,26 +1425,6 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
 
   const size_t resumeLine = resumeLoc.lineNo;
   StringRef fileSpellingForDirective(resumeLoc.fileSpelling);
-
-  // A resync directive is safe only if it rejoins the untouched original file
-  // at a physical line boundary. We also allow rejoining before indentation-only
-  // tail bytes, because the directive can be inserted before that indentation
-  // without being stranded in the middle of a source line.
-  auto rejoinsUntouchedTailSafelyAtBOL = [&](uint64_t editEnd) -> bool {
-    const size_t n = originalFileText.size();
-    const size_t pos = (editEnd >= static_cast<uint64_t>(n))
-                           ? n
-                           : static_cast<size_t>(editEnd);
-
-    if (pos == n || stringutils::isBOL(originalFileText, pos))
-      return true;
-
-    size_t nl = originalFileText.find('\n', pos);
-    if (nl == StringRef::npos)
-      nl = n;
-
-    return stringutils::isIndentOnly(originalFileText, pos, nl);
-  };
 
   // No line directive is needed when the replacement preserves the original
   // physical newline count across the edited byte range.
@@ -1568,7 +1449,7 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
   // into the middle of an existing physical line.
   if (replacement.empty()) {
     if (!stringutils::isBOL(originalFileText, static_cast<size_t>(s)) ||
-        !rejoinsUntouchedTailSafelyAtBOL(e)) {
+        !rejoinsUntouchedTailSafelyAtBOL(originalFileText, e)) {
       trace("linedir/local",
             "cannot inject (empty replacement rejoins mid-line original): "
             "resumeLine={0} file={1} start={2} end={3}",
@@ -1584,49 +1465,24 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
 
   // Token-LCS normalization can express a line deletion as replacing the
   // deleted line plus the first token(s) of the surviving suffix line with the
-  // same suffix-line prefix.  Example shape:
-  //
-  //     original:    old line\nint keep = __LINE__;
-  //     replacement: int
-  //     untouched:       keep = __LINE__;
-  //
-  // There is no newline inside `replacement`, but the replacement is not new
-  // payload: it is exactly the carried prefix of the original suffix line.  If
-  // the edit itself starts at BOL and removes at least one real source line
-  // before that carried prefix, the correct resync point is before the
-  // replacement.  Pending-flush cannot recover this later because the next
-  // untouched slice begins mid-line.
-  if (e <= originalFileText.size()) {
-    const size_t editBegin = static_cast<size_t>(s);
-    const size_t editEnd = static_cast<size_t>(e);
-    const size_t resumePrefixBegin =
-        stringutils::lineStartOffset(originalFileText, editEnd);
-    const bool replacementIsCarriedSuffixPrefix =
-        resumePrefixBegin < editEnd && editBegin <= resumePrefixBegin &&
-        replacement == originalFileText.slice(resumePrefixBegin, editEnd);
-    const bool removedRealLineBeforePrefix =
-        stringutils::countNonSplicedNewlines(originalFileText, editBegin,
-                                            resumePrefixBegin) > 0;
-    const bool prefixStartsLogicalLine =
-        resumePrefixBegin == 0 ||
-        !stringutils::isLineSplice(originalFileText, resumePrefixBegin - 1);
-
-    if (replacementIsCarriedSuffixPrefix && removedRealLineBeforePrefix &&
-        prefixStartsLogicalLine &&
-        stringutils::isBOL(originalFileText, editBegin)) {
-      trace("linedir/local",
-            "inject (before whole carried suffix prefix): resumeLine={0} "
-            "file={1} prefix={2}",
-            resumeLine, fileSpellingForDirective,
-            stringutils::showWs(stringutils::clip(replacement, 80)));
-      return directive + replacement.str();
-    }
+  // same suffix-line prefix.  If the replacement is exactly that carried prefix,
+  // the directive belongs before the replacement because the next untouched slice
+  // resumes mid-line.
+  if (std::optional<size_t> offset = findCarriedSuffixPrefixInsertionOffset(
+          originalFileText, s, e, replacement, /*replacementPrefixOffset=*/0,
+          /*requireDeletedLineFromBOL=*/true)) {
+    trace("linedir/local",
+          "inject (before whole carried suffix prefix): resumeLine={0} "
+          "file={1} prefix={2}",
+          resumeLine, fileSpellingForDirective,
+          stringutils::showWs(stringutils::clip(replacement, 80)));
+    return insertLineDirectiveAt(replacement, directive, *offset);
   }
 
   // If the replacement already ends at BOL, append the directive after it. The
   // untouched original tail must also rejoin safely at a line boundary.
   if (replacement.back() == '\n') {
-    if (!rejoinsUntouchedTailSafelyAtBOL(e)) {
+    if (!rejoinsUntouchedTailSafelyAtBOL(originalFileText, e)) {
       trace("linedir/local",
             "cannot inject at end (replacement rejoins mid-line original): "
             "resumeLine={0} file={1} end={2}",
@@ -1647,67 +1503,40 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
     return replacement.str() + directive;
   }
 
-  // Otherwise, the remaining safe insertion points are inside the
-  // replacement, immediately before bytes that are proved to be a carried
-  // prefix of the untouched original suffix line, or before a trailing
-  // indentation-only suffix.
+  // Otherwise, the remaining safe insertion points are inside the replacement,
+  // immediately before bytes that are proved to be a carried prefix of the
+  // untouched original suffix line, or before a trailing indentation-only suffix.
   size_t lastNl = replacement.rfind('\n');
   if (lastNl != StringRef::npos) {
     size_t bol = lastNl + 1;
 
-    // Some token-hunk repairs deliberately absorb the first bytes of the
-    // untouched suffix line into the replacement so that lexical adjacency is
-    // preserved.  Example shape:
-    //
-    //     replacement: "...\nint"
-    //     original[e:]: " keep = ..."
-    //
-    // The final "int" is not new edited payload; it is the byte-for-byte
-    // prefix of the original suffix line [lineStart(e), e).  If the edit also
-    // removed physical lines before that suffix, the correct local resync point
-    // is before the carried prefix, not after the entire replacement.  This is
-    // a proof, not a formatting preference: the replacement suffix must exactly
-    // equal the original line prefix that will be rejoined with original[e:].
-    if (e <= originalFileText.size() && bol < replacement.size() &&
-        !stringutils::isLineSplice(replacement, lastNl)) {
-      const size_t resumePrefixBegin = stringutils::lineStartOffset(
-          originalFileText, static_cast<size_t>(e));
-      const bool resumePrefixStartsLogicalLine =
-          resumePrefixBegin == 0 ||
-          !stringutils::isLineSplice(originalFileText, resumePrefixBegin - 1);
-      if (resumePrefixBegin < e && resumePrefixStartsLogicalLine) {
-        StringRef originalResumePrefix =
-            originalFileText.slice(resumePrefixBegin, static_cast<size_t>(e));
-        StringRef replacementResumePrefix = replacement.substr(bol);
-        if (!originalResumePrefix.empty() &&
-            replacementResumePrefix == originalResumePrefix) {
+    if (!stringutils::isLineSplice(replacement, lastNl)) {
+      if (std::optional<size_t> offset = findCarriedSuffixPrefixInsertionOffset(
+              originalFileText, s, e, replacement, bol,
+              /*requireDeletedLineFromBOL=*/false)) {
+        StringRef replacementResumePrefix = replacement.substr(*offset);
+        trace("linedir/local",
+              "inject (before carried suffix prefix): resumeLine={0} "
+              "file={1} lastNl={2} bol={3} prefix={4}",
+              resumeLine, fileSpellingForDirective, lastNl, bol,
+              stringutils::showWs(stringutils::clip(replacementResumePrefix, 80)));
+
+        // Idempotence: if the prefix is already preceded by this exact
+        // directive, do not duplicate it.
+        if (replacement.substr(0, *offset).ends_with(directive)) {
           trace("linedir/local",
-                "inject (before carried suffix prefix): resumeLine={0} "
-                "file={1} lastNl={2} bol={3} prefix={4}",
-                resumeLine, fileSpellingForDirective, lastNl, bol,
-                stringutils::showWs(stringutils::clip(replacementResumePrefix,
-                                                     80)));
-
-          // Idempotence: if the prefix is already preceded by this exact
-          // directive, do not duplicate it.
-          if (replacement.substr(0, bol).ends_with(directive)) {
-            trace("linedir/local",
-                  "skip (directive already present before carried suffix "
-                  "prefix): resumeLine={0} file={1}",
-                  resumeLine, fileSpellingForDirective);
-            return replacement.str();
-          }
-
-          std::string res = replacement.substr(0, bol).str();
-          res += directive;
-          res += replacement.substr(bol).str();
-          return res;
+                "skip (directive already present before carried suffix "
+                "prefix): resumeLine={0} file={1}",
+                resumeLine, fileSpellingForDirective);
+          return replacement.str();
         }
+
+        return insertLineDirectiveAt(replacement, directive, *offset);
       }
     }
 
     if (stringutils::isIndentOnly(replacement, bol, replacement.size())) {
-      if (!rejoinsUntouchedTailSafelyAtBOL(e)) {
+      if (!rejoinsUntouchedTailSafelyAtBOL(originalFileText, e)) {
         trace("linedir/local",
               "cannot inject before indent-only suffix (replacement rejoins "
               "mid-line original): resumeLine={0} file={1} end={2}",
@@ -1730,10 +1559,7 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
         return replacement.str();
       }
 
-      std::string res = replacement.substr(0, bol).str();
-      res += directive;
-      res += replacement.substr(bol).str();
-      return res;
+      return insertLineDirectiveAt(replacement, directive, bol);
     }
 
     // There is a newline, but the tail after it contains substantive text. A
@@ -1761,6 +1587,7 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
 
   return replacement.str();
 }
+
 
 std::optional<LineDirectiveState>
 LineDirectiveInserter::FindLastLineDirectiveState(StringRef src) {
@@ -1799,58 +1626,7 @@ LineDirectiveInserter::ParseLineDirective(StringRef src, size_t from,
 }
 
 std::string LineDirectiveInserter::EscapeForLineDirective(StringRef path) {
-  if (path.empty())
-    return "";
-
-  llvm::SmallString<64> escaped;
-  escaped.reserve(path.size());
-  for (char c : path) {
-    switch (c) {
-    case '\\':
-      // #line filenames are emitted inside double quotes, so preserve a literal
-      // backslash by escaping it in the directive spelling.
-      escaped.append("\\\\");
-      break;
-    case '\"':
-      // Keep embedded quotes from terminating the quoted filename.
-      escaped.append("\\\"");
-      break;
-    case '\a':
-      escaped.append("\\a");
-      break;
-    case '\b':
-      escaped.append("\\b");
-      break;
-    case '\f':
-      escaped.append("\\f");
-      break;
-    case '\n':
-      // Never place a physical newline inside a #line filename; spell the
-      // logical filename byte as a C escape so the directive remains one
-      // preprocessing line.
-      escaped.append("\\n");
-      break;
-    case '\r':
-      escaped.append("\\r");
-      break;
-    case '\t':
-      escaped.append("\\t");
-      break;
-    case '\v':
-      escaped.append("\\v");
-      break;
-    case static_cast<char>(0x1b):
-      // Clang accepts both \e and \E; use one canonical spelling when replaying
-      // an escape byte recovered from a source-only line-control filename.
-      escaped.append("\\e");
-      break;
-    default:
-      escaped.push_back(c);
-      break;
-    }
-  }
-
-  return std::string(escaped.str());
+  return stringutils::escapeLineDirectivePath(path);
 }
 
 } // namespace refold

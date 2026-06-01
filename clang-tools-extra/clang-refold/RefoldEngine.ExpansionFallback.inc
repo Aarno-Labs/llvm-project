@@ -323,18 +323,7 @@ removePhase2SplicesForLineControl(StringRef text) {
   ScanState state = ScanState::Ordinary;
 
   auto skipSplice = [&](size_t &pos) -> bool {
-    if (text[pos] != '\\')
-      return false;
-    if (pos + 1 < text.size() && text[pos + 1] == '\n') {
-      pos += 2;
-      return true;
-    }
-    if (pos + 2 < text.size() && text[pos + 1] == '\r' &&
-        text[pos + 2] == '\n') {
-      pos += 3;
-      return true;
-    }
-    return false;
+    return stringutils::skipPhase2LineSplice(text, text.size(), pos);
   };
 
   for (size_t pos = 0; pos < text.size();) {
@@ -437,18 +426,7 @@ static bool collectPhase2LogicalLine(
   };
 
   auto skipPhase2Splice = [&](uint64_t &pos) -> bool {
-    if (fileText[pos] != '\\')
-      return false;
-    if (pos + 1 < limit && fileText[pos + 1] == '\n') {
-      pos += 2;
-      return true;
-    }
-    if (pos + 2 < limit && fileText[pos + 1] == '\r' &&
-        fileText[pos + 2] == '\n') {
-      pos += 3;
-      return true;
-    }
-    return false;
+    return stringutils::skipPhase2LineSplice(fileText, limit, pos);
   };
 
   for (uint64_t pos = lineBegin; pos < limit;) {

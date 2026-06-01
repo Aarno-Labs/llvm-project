@@ -307,101 +307,31 @@ struct SidebandPragmaItemBinding {
 };
 
 
-static bool physicalLineEndsWithSplice(StringRef bytes, uint64_t lineBegin,
-                                       uint64_t lineEnd) {
-  if (lineEnd <= lineBegin)
-    return false;
-
-  uint64_t p = lineEnd;
-  if (p > lineBegin && bytes[p - 1] == '\n')
-    --p;
-  if (p > lineBegin && bytes[p - 1] == '\r')
-    --p;
-  return p > lineBegin && bytes[p - 1] == '\\';
-}
-
-/// Extend a recorded pragma source range to cover the whole physical directive.
-///
-/// Some producer maps record the spelling/range delivered to the pragma callback
-/// rather than the complete source directive after physical line splicing.  A
-/// continued directive such as `#pragma vendor x \\` followed by `y` therefore
-/// needs its edit range extended over the continuation line; otherwise a
-/// sideband deletion would remove only the first physical line and leave a stale
-/// continuation fragment in source.
-static uint64_t extendPragmaSourceRangeToLogicalDirective(StringRef bytes,
-                                                          uint64_t begin,
-                                                          uint64_t end) {
-  if (begin >= bytes.size())
-    return end;
-
-  uint64_t curBegin = begin;
-  uint64_t curEnd = std::min<uint64_t>(end, bytes.size());
-  if (curEnd == begin || (curEnd < bytes.size() && bytes[curEnd - 1] != '\n')) {
-    size_t nl = bytes.find('\n', begin);
-    curEnd = nl == StringRef::npos ? bytes.size() : static_cast<uint64_t>(nl + 1);
-  }
-
-  while (physicalLineEndsWithSplice(bytes, curBegin, curEnd) &&
-         curEnd < bytes.size()) {
-    curBegin = curEnd;
-    size_t nl = bytes.find('\n', curBegin);
-    curEnd = nl == StringRef::npos ? bytes.size() : static_cast<uint64_t>(nl + 1);
-  }
-  return curEnd;
-}
 
 static std::string stripCCommentsForPragmaCanonicalization(StringRef text) {
   std::string out;
   out.reserve(text.size());
-  enum class State { Normal, StringLiteral, CharLiteral } state = State::Normal;
-
-  for (size_t i = 0; i < text.size(); ++i) {
-    const char c = text[i];
-    if (state == State::StringLiteral) {
-      out.push_back(c);
-      if (c == '\\' && i + 1 < text.size())
-        out.push_back(text[++i]);
-      else if (c == '"')
-        state = State::Normal;
+  for (size_t i = 0; i < text.size();) {
+    if (stringutils::copyQuotedLiteral(text, i, out))
       continue;
-    }
-    if (state == State::CharLiteral) {
-      out.push_back(c);
-      if (c == '\\' && i + 1 < text.size())
-        out.push_back(text[++i]);
-      else if (c == '\'')
-        state = State::Normal;
-      continue;
-    }
-
-    if (c == '"') {
-      state = State::StringLiteral;
-      out.push_back(c);
-      continue;
-    }
-    if (c == '\'') {
-      state = State::CharLiteral;
-      out.push_back(c);
-      continue;
-    }
-    if (c == '/' && i + 1 < text.size() && text[i + 1] == '*') {
+    if (i + 1 < text.size() && text[i] == '/' && text[i + 1] == '*') {
       out.push_back(' ');
       i += 2;
       while (i + 1 < text.size() && !(text[i] == '*' && text[i + 1] == '/'))
         ++i;
       if (i + 1 < text.size())
-        ++i;
+        i += 2;
       continue;
     }
-    if (c == '/' && i + 1 < text.size() && text[i + 1] == '/') {
+    if (i + 1 < text.size() && text[i] == '/' && text[i + 1] == '/') {
       out.push_back(' ');
       while (i < text.size() && text[i] != '\n')
         ++i;
       if (i < text.size())
-        out.push_back('\n');
+        out.push_back(text[i++]);
       continue;
     }
-    out.push_back(c);
+    out.push_back(text[i++]);
   }
   return out;
 }
@@ -409,49 +339,29 @@ static std::string stripCCommentsForPragmaCanonicalization(StringRef text) {
 static std::string collapsePragmaWhitespacePreservingLiterals(StringRef text) {
   std::string out;
   out.reserve(text.size());
-  enum class State { Normal, StringLiteral, CharLiteral } state = State::Normal;
   bool pendingSpace = false;
 
-  for (size_t i = 0; i < text.size(); ++i) {
-    const char c = text[i];
-    if (state == State::StringLiteral) {
-      if (pendingSpace && !out.empty()) {
-        out.push_back(' ');
-        pendingSpace = false;
-      }
-      out.push_back(c);
-      if (c == '\\' && i + 1 < text.size())
-        out.push_back(text[++i]);
-      else if (c == '"')
-        state = State::Normal;
-      continue;
-    }
-    if (state == State::CharLiteral) {
-      if (pendingSpace && !out.empty()) {
-        out.push_back(' ');
-        pendingSpace = false;
-      }
-      out.push_back(c);
-      if (c == '\\' && i + 1 < text.size())
-        out.push_back(text[++i]);
-      else if (c == '\'')
-        state = State::Normal;
-      continue;
-    }
-
-    if (stringutils::isNonNewlineWs(c) || c == '\n' || c == '\r') {
-      pendingSpace = true;
-      continue;
-    }
+  auto flushPendingSpace = [&]() {
     if (pendingSpace && !out.empty())
       out.push_back(' ');
     pendingSpace = false;
+  };
 
+  for (size_t i = 0; i < text.size();) {
+    if (text[i] == '"' || text[i] == '\'') {
+      flushPendingSpace();
+      if (stringutils::copyQuotedLiteral(text, i, out))
+        continue;
+    }
+
+    const char c = text[i++];
+    if (stringutils::isWs(c)) {
+      pendingSpace = true;
+      continue;
+    }
+
+    flushPendingSpace();
     out.push_back(c);
-    if (c == '"')
-      state = State::StringLiteral;
-    else if (c == '\'')
-      state = State::CharLiteral;
   }
 
   while (!out.empty() && out.back() == ' ')
@@ -554,33 +464,6 @@ static std::optional<std::string> readMappedSourceFileForSideband(
   return std::nullopt;
 }
 
-/// Return true iff a physical line is a preserved pragma directive line.
-///
-/// This recognizes only `#pragma` after optional horizontal indentation.  It is
-/// deliberately narrower than a general directive parser: the refold map already
-/// models ordinary PP tokens, while this sideband path exists only for pragma
-/// text that Clang may print verbatim in `.i` output even though it is not part
-/// of the map's normal token count.
-static bool isSidebandPragmaLine(StringRef line) {
-  size_t i = 0;
-  while (i < line.size() && stringutils::isNonNewlineWs(line[i]))
-    ++i;
-  if (i >= line.size() || line[i] != '#')
-    return false;
-  ++i;
-  while (i < line.size() && stringutils::isNonNewlineWs(line[i]))
-    ++i;
-
-  StringRef Pragma("pragma");
-  if (line.size() - i < Pragma.size())
-    return false;
-  if (line.substr(i, Pragma.size()) != Pragma)
-    return false;
-  i += Pragma.size();
-
-  return i >= line.size() || !stringutils::isIdentPart(line[i]);
-}
-
 /// Collect physical `#pragma` lines from a raw `.i` replay surface.
 static std::vector<SidebandPragmaLine>
 collectSidebandPragmaLines(StringRef bytes) {
@@ -591,7 +474,7 @@ collectSidebandPragmaLines(StringRef bytes) {
     size_t lineEndNoNL = nl == StringRef::npos ? bytes.size() : nl;
     size_t end = nl == StringRef::npos ? bytes.size() : nl + 1;
     StringRef line = bytes.slice(begin, lineEndNoNL);
-    if (isSidebandPragmaLine(line)) {
+    if (stringutils::lineStartsWithDirectiveKeyword(line, "pragma")) {
       SidebandPragmaLine rec;
       rec.text = bytes.slice(begin, end).str();
       rec.canonicalText = canonicalizeSidebandPragmaText(rec.text);
@@ -890,7 +773,7 @@ collectJsonPragmaItems(const json::Object &rootJson, StringRef refoldMapPath) {
     if (auto sourceBytes = readMappedSourceFileForSideband(
             item.sitePath, rootSourcePath, refoldMapPath)) {
       if (item.siteB <= item.siteE && item.siteE <= sourceBytes->size()) {
-        const uint64_t extendedE = extendPragmaSourceRangeToLogicalDirective(
+        const uint64_t extendedE = stringutils::extendRangeToLogicalDirective(
             StringRef(*sourceBytes), item.siteB, item.siteE);
         item.siteE = extendedE;
 
@@ -914,37 +797,6 @@ collectJsonPragmaItems(const json::Object &rootJson, StringRef refoldMapPath) {
     out.push_back(std::move(item));
   }
   return out;
-}
-
-static uint64_t lineBeginContainingOffset(StringRef bytes, uint64_t byte) {
-  if (byte > bytes.size())
-    byte = static_cast<uint64_t>(bytes.size());
-  if (byte == 0)
-    return 0;
-  size_t prevNL = bytes.rfind('\n', byte - 1);
-  if (prevNL == StringRef::npos)
-    return 0;
-  return static_cast<uint64_t>(prevNL + 1);
-}
-
-static uint64_t extendDirectiveLineToLogicalDirective(StringRef bytes,
-                                                      uint64_t lineBegin) {
-  if (lineBegin >= bytes.size())
-    return lineBegin;
-
-  uint64_t curBegin = lineBegin;
-  size_t nl = bytes.find('\n', curBegin);
-  uint64_t curEnd = nl == StringRef::npos ? static_cast<uint64_t>(bytes.size())
-                                           : static_cast<uint64_t>(nl + 1);
-
-  while (physicalLineEndsWithSplice(bytes, curBegin, curEnd) &&
-         curEnd < bytes.size()) {
-    curBegin = curEnd;
-    nl = bytes.find('\n', curBegin);
-    curEnd = nl == StringRef::npos ? static_cast<uint64_t>(bytes.size())
-                                    : static_cast<uint64_t>(nl + 1);
-  }
-  return curEnd;
 }
 
 /// Collect owner-local directive lines that are known not to contribute normal
@@ -998,8 +850,9 @@ collectZeroTokenDirectivesForSideband(const json::Object &rootJson,
 
     JsonZeroTokenDirectiveForSideband directive;
     directive.sitePath = path->str();
-    directive.lineB = lineBeginContainingOffset(*sourceBytes, siteB);
-    directive.lineE = extendDirectiveLineToLogicalDirective(
+    directive.lineB =
+        stringutils::lineBeginContainingOffset(*sourceBytes, siteB);
+    directive.lineE = stringutils::extendLineToLogicalDirective(
         *sourceBytes, directive.lineB);
     if (auto owner = obj->getInteger("owner_include_id"))
       if (*owner >= 0)

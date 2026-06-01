@@ -144,9 +144,9 @@ public:
 
     std::string result = "#line ";
     result += std::to_string(lineNo);
-    result += " \"";
-    result += EscapeForLineDirective(spelledFile);
-    result += "\"\n";
+    result += " ";
+    result += stringutils::quoteLineDirectivePath(spelledFile);
+    result += "\n";
     return result;
   }
 

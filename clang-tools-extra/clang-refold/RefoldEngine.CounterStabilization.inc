@@ -11,61 +11,47 @@
 //
 //===----------------------------------------------------------------------===//
 
-SmallVector<RefoldEngine::ForcedMacroPatchRequest, 32>
-RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
-                                          ArrayRef<int64_t> a2b) const {
-  struct Occ {
-    const RefoldModel::MacroInvocation *m;
-    uint64_t aStart;
-    uint64_t aEnd;
-    std::optional<uint64_t> ownerInc;
-  };
 
-  SmallVector<Occ, 32> occs;
+SmallVector<RefoldEngine::CounterOccurrence, 32>
+RefoldEngine::CollectCounterOccurrences(StringRef tuPath) const {
+  SmallVector<CounterOccurrence, 32> occs;
 
-  // Collect every recorded __COUNTER__ occurrence in PP-token space.
-  //
-  // Normal counter expansions have a non-empty output span. When __COUNTER__ is
-  // consumed by token paste or stringification, however, the producer may record
-  // a zero-length anchor at the affected output token. Treat that anchor as a
-  // one-token occurrence so edits to pasted/stringified counter output still
-  // trigger suffix stabilization.
+  // Record a __COUNTER__ occurrence in PP-token space. Zero-length producer
+  // anchors are widened to one token so pasted/stringified counter output still
+  // participates in stabilization.
   auto addOcc = [&](const RefoldModel::MacroInvocation &mi, uint64_t b,
                     uint64_t e) {
     if (e > b) {
-      occs.push_back(Occ{&mi, b, e, std::nullopt});
+      occs.push_back(CounterOccurrence{&mi, b, e, std::nullopt});
       return;
     }
-    if (e == b && b < aToks_.size()) {
-      occs.push_back(Occ{&mi, b, b + 1, std::nullopt});
-      return;
-    }
+    if (e == b && b < aToks_.size())
+      occs.push_back(CounterOccurrence{&mi, b, b + 1, std::nullopt});
   };
 
+  // Collect all recorded __COUNTER__ outputs. Prefer the most precise producer
+  // ranges first: bodySpans, then explicit spans, then the fallback cover.
   for (const auto &mi : model_.GetMacroInvocations()) {
     if (mi.name != "__COUNTER__")
       continue;
     if (!mi.invB || !mi.invE || !mi.invText)
       continue;
 
-    // Body spans are the most precise description of emitted macro-body output,
-    // so prefer them over generic spans/cover when available.
     if (!mi.bodySpans.empty()) {
       for (const auto &bs : mi.bodySpans)
         addOcc(mi, bs.begin, bs.end);
       continue;
     }
 
-    // Explicit spans are the next-best producer witness, including zero-length
-    // anchors for paste/stringify cases.
     if (!mi.spans.empty()) {
-      for (const auto &s : mi.spans)
-        addOcc(mi, s.begin, s.end);
+      for (const auto &range : mi.spans)
+        addOcc(mi, range.begin, range.end);
       continue;
     }
 
     if (mi.cover.IsValid() && mi.cover.end > mi.cover.begin)
-      occs.push_back(Occ{&mi, mi.cover.begin, mi.cover.end, std::nullopt});
+      occs.push_back(
+          CounterOccurrence{&mi, mi.cover.begin, mi.cover.end, std::nullopt});
   }
 
   if (occs.empty())
@@ -74,12 +60,12 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
   // Determine the actual PP-owner include for each occurrence. This filters out
   // producer-merged duplicate records whose recorded ownerIncludeId does not
   // match the owner inferred from the current TU segmentation.
-  SmallVector<Occ, 32> filtered;
+  SmallVector<CounterOccurrence, 32> filtered;
   filtered.reserve(occs.size());
-  for (const auto &o : occs) {
+  for (const CounterOccurrence &occ : occs) {
     diffutils::Hunk dummy;
-    dummy.aStart = o.aStart;
-    dummy.aEnd = o.aEnd;
+    dummy.aStart = occ.aStart;
+    dummy.aEnd = occ.aEnd;
     dummy.bStart = 0;
     dummy.bEnd = 0;
 
@@ -90,31 +76,45 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
 
     // If the producer says this macro belongs to a specific include instance,
     // require the token occurrence to be owned by that same include instance.
-    if (o.m->ownerIncludeId && ownerInc && *o.m->ownerIncludeId != *ownerInc)
+    if (occ.macro->ownerIncludeId && ownerInc &&
+        *occ.macro->ownerIncludeId != *ownerInc)
       continue;
 
-    filtered.push_back(Occ{o.m, o.aStart, o.aEnd, ownerInc});
+    filtered.push_back(
+        CounterOccurrence{occ.macro, occ.aStart, occ.aEnd, ownerInc});
   }
 
+  SortCounterOccurrences(filtered);
+  return filtered;
+}
+
+void RefoldEngine::SortCounterOccurrences(
+    SmallVectorImpl<RefoldEngine::CounterOccurrence> &occs) const {
+  llvm::sort(occs, [](const CounterOccurrence &lhs,
+                      const CounterOccurrence &rhs) {
+    if (lhs.aStart != rhs.aStart)
+      return lhs.aStart < rhs.aStart;
+    if (lhs.aEnd != rhs.aEnd)
+      return lhs.aEnd < rhs.aEnd;
+    if (lhs.ownerIncludeId != rhs.ownerIncludeId)
+      return lhs.ownerIncludeId < rhs.ownerIncludeId;
+    return lhs.macro->id < rhs.macro->id;
+  });
+}
+
+
+SmallVector<RefoldEngine::ForcedMacroPatchRequest, 32>
+RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
+                                          ArrayRef<int64_t> a2b) const {
+  SmallVector<CounterOccurrence, 32> filtered =
+      CollectCounterOccurrences(tuPath);
   if (filtered.empty())
     return {};
-
-  // Process occurrences in PP-token order so "first edited counter" has the
-  // same meaning as the preprocessor's increasing __COUNTER__ sequence.
-  llvm::sort(filtered, [](const Occ &A, const Occ &B) {
-    if (A.aStart != B.aStart)
-      return A.aStart < B.aStart;
-    if (A.aEnd != B.aEnd)
-      return A.aEnd < B.aEnd;
-    if (A.ownerInc != B.ownerInc)
-      return A.ownerInc < B.ownerInc;
-    return A.m->id < B.m->id;
-  });
 
   // A counter occurrence is considered edited if any A-side token in its
   // occurrence range is unmapped, maps outside B, or maps to a token with a
   // different spelling.
-  auto isEditedOcc = [&](const Occ &o) -> bool {
+  auto isEditedOcc = [&](const CounterOccurrence &o) -> bool {
     for (uint64_t ai = o.aStart; ai < o.aEnd; ++ai) {
       if (static_cast<size_t>(ai) >= a2b.size() ||
           static_cast<size_t>(ai) >= aToks_.size())
@@ -261,10 +261,10 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
       return std::nullopt;
     };
 
-    SmallVector<Occ, 32> lifted;
+    SmallVector<CounterOccurrence, 32> lifted;
     lifted.reserve(filtered.size());
     for (const auto &o : filtered) {
-      const RefoldModel::MacroInvocation *root = findPatchableCaller(*o.m);
+      const RefoldModel::MacroInvocation *root = findPatchableCaller(*o.macro);
       if (!root)
         continue;
 
@@ -272,23 +272,16 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
       if (!r)
         continue;
 
-      lifted.push_back(Occ{root, r->first, r->second, root->ownerIncludeId});
+      lifted.push_back(
+          CounterOccurrence{root, r->first, r->second, root->ownerIncludeId});
     }
 
     if (!lifted.empty()) {
-      llvm::sort(lifted, [](const Occ &A, const Occ &B) {
-        if (A.aStart != B.aStart)
-          return A.aStart < B.aStart;
-        if (A.aEnd != B.aEnd)
-          return A.aEnd < B.aEnd;
-        if (A.ownerInc != B.ownerInc)
-          return A.ownerInc < B.ownerInc;
-        return A.m->id < B.m->id;
-      });
+      SortCounterOccurrences(lifted);
 
       int idx = -1;
       for (size_t i = 0; i < lifted.size(); ++i) {
-        if (isEditedInvocationOutput(*lifted[i].m)) {
+        if (isEditedInvocationOutput(*lifted[i].macro)) {
           idx = static_cast<int>(i);
           break;
         }
@@ -300,7 +293,7 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
               "A=[{1},{2}) root='{3}'",
               idx, lifted[static_cast<size_t>(idx)].aStart,
               lifted[static_cast<size_t>(idx)].aEnd,
-              lifted[static_cast<size_t>(idx)].m->name);
+              lifted[static_cast<size_t>(idx)].macro->name);
         filtered.swap(lifted);
         firstEditedIdx = idx;
       }
@@ -315,12 +308,6 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
   // Unique key for forced patch requests. Counter stabilization may encounter
   // multiple counter occurrences covered by the same patchable macro; emit only
   // one forced request per owner/include + invocation byte range.
-  struct MacroKey {
-    std::optional<uint64_t> ownerId;
-    uint64_t start;
-    uint64_t end;
-  };
-
   SmallVector<ForcedMacroPatchRequest, 32> forced;
   llvm::DenseSet<llvm::hash_code> seen;
 
@@ -328,9 +315,9 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
   // PP order must be forced through macro realization as well. Otherwise the
   // counter sequence after the edit could remain stale relative to the edited
   // preprocessed stream.
-  for (const Occ &o : llvm::drop_begin(filtered, firstEditedIdx)) {
+  for (const CounterOccurrence &o : llvm::drop_begin(filtered, firstEditedIdx)) {
     const auto *root =
-        SmallestCoveringPatchableMacro(o.aStart, o.aEnd, o.ownerInc);
+        SmallestCoveringPatchableMacro(o.aStart, o.aEnd, o.ownerIncludeId);
 
     // Safety: never patch macro definitions.
     if (!root || IsInvocationInsideDefineDirective(*root))
@@ -370,94 +357,10 @@ RefoldEngine::ComputeForcedCounterPatchesFromExpandedMacros(
     StringRef tuPath,
     const DenseMap<std::optional<uint64_t>, DenseMap<uint64_t, MacroPatch>>
         &macroPatchByOwnerByMacroId) const {
-  struct Occ {
-    const RefoldModel::MacroInvocation *m;
-    uint64_t aStart;
-    uint64_t aEnd;
-    std::optional<uint64_t> ownerInc;
-  };
-
-  SmallVector<Occ, 32> occs;
-
-  // Record a __COUNTER__ occurrence in PP-token space. Zero-length producer
-  // anchors are widened to one token so pasted/stringified counter output still
-  // participates in stabilization.
-  auto addOcc = [&](const RefoldModel::MacroInvocation &mi, uint64_t b,
-                    uint64_t e) {
-    if (e > b) {
-      occs.push_back(Occ{&mi, b, e, std::nullopt});
-      return;
-    }
-    if (e == b && b < aToks_.size()) {
-      occs.push_back(Occ{&mi, b, b + 1, std::nullopt});
-      return;
-    }
-  };
-
-  // Collect all recorded __COUNTER__ outputs. Prefer the most precise producer
-  // ranges first: bodySpans, then explicit spans, then the fallback cover.
-  for (const auto &mi : model_.GetMacroInvocations()) {
-    if (mi.name != "__COUNTER__")
-      continue;
-    if (!mi.invB || !mi.invE || !mi.invText)
-      continue;
-
-    if (!mi.bodySpans.empty()) {
-      for (const auto &bs : mi.bodySpans)
-        addOcc(mi, bs.begin, bs.end);
-      continue;
-    }
-
-    if (!mi.spans.empty()) {
-      for (const auto &s : mi.spans)
-        addOcc(mi, s.begin, s.end);
-      continue;
-    }
-
-    if (mi.cover.IsValid() && mi.cover.end > mi.cover.begin)
-      occs.push_back(Occ{&mi, mi.cover.begin, mi.cover.end, std::nullopt});
-  }
-
-  if (occs.empty())
-    return {};
-
-  // Reclassify each occurrence against the current TU segmentation. This drops
-  // producer-merged duplicate records whose recorded include owner does not
-  // match the owner inferred from the actual occurrence range.
-  SmallVector<Occ, 32> filtered;
-  filtered.reserve(occs.size());
-  for (const auto &o : occs) {
-    diffutils::Hunk dummy;
-    dummy.aStart = o.aStart;
-    dummy.aEnd = o.aEnd;
-    dummy.bStart = 0;
-    dummy.bEnd = 0;
-
-    Owner owner = ClassifyOwnerWithSegments(tuPath, dummy);
-    std::optional<uint64_t> ownerInc;
-    if (owner.kind == OwnerKind::Include)
-      ownerInc = owner.includeId;
-
-    if (o.m->ownerIncludeId && ownerInc && *o.m->ownerIncludeId != *ownerInc)
-      continue;
-
-    filtered.push_back(Occ{o.m, o.aStart, o.aEnd, ownerInc});
-  }
-
+  SmallVector<CounterOccurrence, 32> filtered =
+      CollectCounterOccurrences(tuPath);
   if (filtered.empty())
     return {};
-
-  // Stabilization follows PP-token order because later __COUNTER__ values depend
-  // on the sequence established by all earlier counter expansions.
-  llvm::sort(filtered, [](const Occ &A, const Occ &B) {
-    if (A.aStart != B.aStart)
-      return A.aStart < B.aStart;
-    if (A.aEnd != B.aEnd)
-      return A.aEnd < B.aEnd;
-    if (A.ownerInc != B.ownerInc)
-      return A.ownerInc < B.ownerInc;
-    return A.m->id < B.m->id;
-  });
 
   // Return true when the patch already selected for `root` is an expanded
   // realization. Once one counter-bearing macro remains expanded, all following
@@ -490,7 +393,7 @@ RefoldEngine::ComputeForcedCounterPatchesFromExpandedMacros(
   for (size_t i = 0; i < filtered.size(); ++i) {
     const auto *root =
         SmallestCoveringPatchableMacro(filtered[i].aStart, filtered[i].aEnd,
-                                       filtered[i].ownerInc);
+                                       filtered[i].ownerIncludeId);
     if (!root || IsInvocationInsideDefineDirective(*root))
       continue;
     if (hasExpandedPatchFor(*root)) {
@@ -508,9 +411,9 @@ RefoldEngine::ComputeForcedCounterPatchesFromExpandedMacros(
   // Force every counter occurrence from the first expanded one onward. Dedup by
   // owner/include plus invocation byte span because multiple occurrences may be
   // covered by the same patchable macro invocation.
-  for (const Occ &o : llvm::drop_begin(filtered, firstExpandedIdx)) {
+  for (const CounterOccurrence &o : llvm::drop_begin(filtered, firstExpandedIdx)) {
     const auto *root =
-        SmallestCoveringPatchableMacro(o.aStart, o.aEnd, o.ownerInc);
+        SmallestCoveringPatchableMacro(o.aStart, o.aEnd, o.ownerIncludeId);
     if (!root || IsInvocationInsideDefineDirective(*root))
       continue;
     const auto invStart = root->invB;

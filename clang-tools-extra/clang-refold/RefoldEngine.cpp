@@ -2066,6 +2066,248 @@ bool RefoldEngine::AppendSidebandPragmaSourceEdits(
   return true;
 }
 
+bool RefoldEngine::MaybeConsumeOrdinarySeparatorGapForPunctuation(
+    StringRef tuPath, StringRef tuBytes, std::pair<uint64_t, uint64_t> &span,
+    StringRef replacement, StringRef tracePrefix) const {
+  if (span.first != span.second || replacement.empty() ||
+      stringutils::isWs(replacement.front()) || span.first == 0 ||
+      span.first >= tuBytes.size() ||
+      (tuBytes[span.first - 1] != ' ' && tuBytes[span.first - 1] != '\t') ||
+      stringutils::isWs(tuBytes[span.first]))
+    return false;
+
+  auto intervalOverlapsSpelledArtifact = [&](uint64_t begin,
+                                             uint64_t end) -> bool {
+    for (const auto &inc : model_.GetIncludes()) {
+      if (PathsEqual(inc.sitePath, tuPath) && inc.siteB < end && begin < inc.siteE)
+        return true;
+    }
+    for (const auto &m : model_.GetMacroInvocations()) {
+      if (m.invFile && !m.invFile->empty() && !PathsEqual(*m.invFile, tuPath))
+        continue;
+      if (m.invB && m.invE && *m.invB < end && begin < *m.invE)
+        return true;
+    }
+    return false;
+  };
+
+  uint64_t gapBegin = span.first;
+  while (gapBegin > 0 &&
+         (tuBytes[gapBegin - 1] == ' ' || tuBytes[gapBegin - 1] == '\t'))
+    --gapBegin;
+
+  if (gapBegin >= span.first || intervalOverlapsSpelledArtifact(gapBegin, span.first))
+    return false;
+
+  std::optional<LexBoundaryToken> leftTok =
+      lastLexToken(tuBytes.take_front(gapBegin), lexLang_);
+  std::optional<LexBoundaryToken> rightTok =
+      firstLexToken(tuBytes.drop_front(span.first), lexLang_);
+  std::optional<LexBoundaryToken> replFirstTok =
+      firstLexToken(replacement, lexLang_);
+  std::optional<LexBoundaryToken> replLastTok =
+      lastLexToken(replacement, lexLang_);
+
+  if (!leftTok || !rightTok || !replFirstTok || !replLastTok ||
+      leftTok->End != gapBegin || rightTok->Begin != 0 ||
+      !isSeparatorGapReplacementPunctuation(replFirstTok->Kind) ||
+      needsLexicalSeparator(*leftTok, *replFirstTok, lexLang_) ||
+      needsLexicalSeparator(*replLastTok, *rightTok, lexLang_))
+    return false;
+
+  debug("edit/tu",
+        "{0} insertion consumes ordinary separator gap [{1},{2}) for "
+        "punctuation '{3}'",
+        tracePrefix, gapBegin, span.first,
+        stringutils::showWsWithClip(replFirstTok->Spelling, 40));
+  span.first = gapBegin;
+  return true;
+}
+
+bool RefoldEngine::TUReplacementExtensionIsBTokenClosed(
+    uint64_t aTokStart, uint64_t oldEnd, uint64_t extEnd, uint64_t bStart,
+    uint64_t bEnd, StringRef tuPath) const {
+  if (extEnd <= oldEnd)
+    return true;
+  if (abTokMapA2B_.empty())
+    return false;
+
+  const uint64_t tokCount = static_cast<uint64_t>(aToks_.size());
+  for (uint64_t aTok = std::min(aTokStart, tokCount); aTok < tokCount;
+       ++aTok) {
+    std::optional<std::pair<uint64_t, uint64_t>> span =
+        TUByteSpan(aTok, aTok + 1, tuPath);
+    if (!span)
+      continue;
+
+    if (span->second <= oldEnd)
+      continue;
+    if (span->first >= extEnd)
+      break;
+
+    // A partial-token overlap would mean the byte extension cut through an
+    // A token. There is no token-closure proof for that shape, so preserve
+    // the suffix rather than widening the edit.
+    if (span->first < oldEnd || extEnd < span->second) {
+      debug("edit/tu",
+            "preserve trailing call/arg chain [{0},{1}) because extension "
+            "would partially consume A token {2} span=[{3},{4})",
+            oldEnd, extEnd, aTok, span->first, span->second);
+      return false;
+    }
+
+    if (aTok >= static_cast<uint64_t>(abTokMapA2B_.size()))
+      return false;
+
+    const int64_t mappedB = abTokMapA2B_[static_cast<size_t>(aTok)];
+    if (mappedB < 0)
+      continue;
+
+    if (static_cast<uint64_t>(mappedB) < bStart ||
+        static_cast<uint64_t>(mappedB) >= bEnd) {
+      debug("edit/tu",
+            "preserve trailing call/arg chain [{0},{1}) because consumed "
+            "A token {2} maps to B token {3} outside replacement B[{4},{5})",
+            oldEnd, extEnd, aTok, mappedB, bStart, bEnd);
+      return false;
+    }
+  }
+
+  return true;
+}
+
+void RefoldEngine::MaybeExtendTUSpanOverClosedTrailingCallSuffix(
+    const diffutils::Hunk &h, StringRef tuPath, StringRef tuBytes,
+    StringRef replacement, std::pair<uint64_t, uint64_t> &span) const {
+  if (span.first >= span.second)
+    return;
+
+  const uint64_t oldEnd = span.second;
+  const uint64_t extEnd =
+      stringutils::extendChainedCallEnd(tuBytes, oldEnd, replacement);
+  if (extEnd == oldEnd ||
+      !TUReplacementExtensionIsBTokenClosed(h.aEnd, oldEnd, extEnd, h.bStart,
+                                            h.bEnd, tuPath))
+    return;
+
+  debug("edit/tu", "TU extend trailing call/arg chain [{0},{1}) -> [{0},{2})",
+        span.first, oldEnd, extEnd);
+  span.second = extEnd;
+}
+
+bool RefoldEngine::MaybeAdvanceTUInsertionPastSourceLineControlPrefix(
+    const diffutils::Hunk &h, StringRef tuPath, StringRef tuBytes,
+    std::pair<uint64_t, uint64_t> &span, StringRef tracePrefix) const {
+  if (!h.isInsertOnly() || span.first != span.second ||
+      IsPPGapAtSelectedConditionalArmExit(h.aStart))
+    return false;
+
+  std::optional<uint64_t> exactAnchor =
+      AnchorToExactSlotBoundaryFromPPGap(tuPath, h.aStart);
+  if (!exactAnchor || *exactAnchor != span.first)
+    return false;
+
+  std::optional<uint64_t> advancedAnchor =
+      AdvanceInsertionAnchorPastSourceLineControlPrefix(tuPath, std::nullopt,
+                                                        tuBytes, span.first);
+  if (!advancedAnchor)
+    return false;
+
+  debug("edit/tu",
+        "{0} insertion advances over source line-control prefix [{1},{2}) "
+        "at PP gap {3}",
+        tracePrefix, span.first, *advancedAnchor, h.aStart);
+  span.first = *advancedAnchor;
+  span.second = *advancedAnchor;
+  return true;
+}
+
+bool RefoldEngine::TUInsertionCanDeferResyncToConditionalJoin(
+    bool advancedOverSourceLineControlPrefix, StringRef tuPath, uint64_t anchor,
+    StringRef tracePrefix) const {
+  if (!advancedOverSourceLineControlPrefix)
+    return false;
+
+  std::optional<LineStateObserverSite> firstObserver =
+      FirstOwnerSuffixLineStateObserverSite(std::nullopt, tuPath, anchor);
+  if (!firstObserver || !firstObserver->demand.needsLine)
+    return false;
+
+  const RefoldModel::CondGroup *innermost = nullptr;
+  for (const RefoldModel::CondGroup *group :
+       model_.GetCondGroups(tuPath, std::nullopt)) {
+    if (!group || !PathsEqual(group->file, tuPath) || group->parentIncludeId ||
+        !group->ContainsByte(anchor))
+      continue;
+    if (!innermost ||
+        (group->groupB >= innermost->groupB && group->groupE <= innermost->groupE))
+      innermost = group;
+  }
+
+  if (!innermost || firstObserver->offset < innermost->groupE)
+    return false;
+
+  trace("linedir/resync",
+        "defer {0} local resync after source line-control prefix to "
+        "conditional join repair: anchor={1} group=[{2},{3}) observer={4}",
+        tracePrefix, anchor, innermost->groupB, innermost->groupE,
+        firstObserver->offset);
+  return true;
+}
+
+bool RefoldEngine::TUInsertionBeforeMaterializedInclude(
+    const diffutils::Hunk &h, StringRef tuPath,
+    const std::pair<uint64_t, uint64_t> &span,
+    bool requireVisibleReplayText) const {
+  if (!h.isInsertOnly() || span.first != span.second)
+    return false;
+  if (!AnchorToExactSlotBoundaryFromPPGap(tuPath, h.aStart))
+    return false;
+
+  const uint64_t maxPP = model_.GetTokensCountA();
+  std::optional<uint64_t> leftInc =
+      (h.aStart > 0) ? model_.InnermostIncludeAtPP(h.aStart - 1) : std::nullopt;
+  std::optional<uint64_t> rightInc =
+      h.aStart < maxPP ? model_.InnermostIncludeAtPP(h.aStart) : std::nullopt;
+  if (leftInc || !rightInc)
+    return false;
+
+  return llvm::any_of(sidebandPragmaEdits_, [&](const SidebandPragmaEdit &sideband) {
+    return sideband.TargetsInclude(*rightInc) &&
+           (!requireVisibleReplayText || sideband.EmitsVisibleReplayText());
+  });
+}
+
+RefoldEngine::TextEdit RefoldEngine::BuildDirectTUHunkTextEdit(
+    const diffutils::Hunk &h, uint64_t hunkIndex,
+    const std::pair<uint64_t, uint64_t> &span, ResyncOutcome resync,
+    StringRef acceptedPayload, uint64_t rawTUStart, uint64_t rawTUEnd,
+    std::optional<uint64_t> materializedBByteBegin,
+    std::optional<uint64_t> materializedBByteEnd,
+    AcceptedPathKind acceptedPath) const {
+  TextEdit edit{span.first, span.second, std::move(resync.text),
+                std::move(resync.pending), std::nullopt, {}, {}, {}};
+  edit.lineControlPruneCandidates =
+      std::move(resync.lineControlPruneCandidates);
+  edit.isDirectTUHunkEdit = true;
+  edit.directTUHunkIndex = hunkIndex;
+  edit.directTUHunkAStart = h.aStart;
+  edit.directTUHunkAEnd = h.aEnd;
+  edit.directTUHunkBStart = h.bStart;
+  edit.directTUHunkBEnd = h.bEnd;
+  edit.directTURawStart = rawTUStart;
+  edit.directTURawEnd = rawTUEnd;
+  edit.directTUFinalStart = span.first;
+  edit.directTUFinalEnd = span.second;
+  if (materializedBByteBegin && materializedBByteEnd)
+    StampTextEditMaterializedBByteRange(edit, *materializedBByteBegin,
+                                        *materializedBByteEnd);
+  AttachAcceptedResultCarrier(
+      edit, BuildAcceptedTUTextEditCandidate(acceptedPath, span.first,
+                                             span.second, acceptedPayload));
+  return edit;
+}
+
 std::string RefoldEngine::RunSinglePassRefold() {
   // Make sure that when we re-lex the A-stream tokens that it matches the token
   // count as listed in the refold map JSON file.
@@ -2198,70 +2440,6 @@ std::string RefoldEngine::RunSinglePassRefold() {
 
   abTokMapA2B_ = a2b;
   abTokMapB2A_ = b2a;
-
-  /// Return true when extending a TU byte replacement from `oldEnd` to
-  /// `extEnd` would not consume any stable A-token whose selected B-side mate
-  /// remains outside the current hunk's B-token replacement interval.
-  ///
-  /// Chained-call extension is a byte-level convenience: it lets a replacement
-  /// consume a following `(…)` suffix when the replacement itself already owns
-  /// that call surface. It is not allowed to steal original call-argument
-  /// tokens that the A/B LCS still treats as stable outside this hunk. When
-  /// such a stable token exists, the caller must preserve the original suffix
-  /// and let any separate insertion/replacement hunk compose at its own proven
-  /// byte anchor.
-  auto tuExtensionIsBTokenClosed = [&](uint64_t aTokStart, uint64_t oldEnd,
-                                       uint64_t extEnd, uint64_t bStart,
-                                       uint64_t bEnd) -> bool {
-    if (extEnd <= oldEnd)
-      return true;
-    if (abTokMapA2B_.empty())
-      return false;
-
-    const uint64_t tokCount = static_cast<uint64_t>(aToks_.size());
-    for (uint64_t aTok = std::min(aTokStart, tokCount); aTok < tokCount;
-         ++aTok) {
-      std::optional<std::pair<uint64_t, uint64_t>> span =
-          TUByteSpan(aTok, aTok + 1, tuPath);
-      if (!span)
-        continue;
-
-      if (span->second <= oldEnd)
-        continue;
-      if (span->first >= extEnd)
-        break;
-
-      // A partial-token overlap would mean the byte extension cut through an
-      // A token. There is no token-closure proof for that shape, so preserve
-      // the suffix rather than widening the edit.
-      if (span->first < oldEnd || extEnd < span->second) {
-        debug("edit/tu",
-              "preserve trailing call/arg chain [{0},{1}) because extension "
-              "would partially consume A token {2} span=[{3},{4})",
-              oldEnd, extEnd, aTok, span->first, span->second);
-        return false;
-      }
-
-      if (aTok >= static_cast<uint64_t>(abTokMapA2B_.size()))
-        return false;
-
-      const int64_t mappedB = abTokMapA2B_[static_cast<size_t>(aTok)];
-      if (mappedB < 0)
-        continue;
-
-      if (static_cast<uint64_t>(mappedB) < bStart ||
-          static_cast<uint64_t>(mappedB) >= bEnd) {
-        debug("edit/tu",
-              "preserve trailing call/arg chain [{0},{1}) because consumed "
-              "A token {2} maps to B token {3} outside replacement "
-              "B[{4},{5})",
-              oldEnd, extEnd, aTok, mappedB, bStart, bEnd);
-        return false;
-      }
-    }
-
-    return true;
-  };
 
   size_t trimmedEdgeMatched = 0;
   for (auto &h : hunks) {
@@ -3283,121 +3461,16 @@ std::string RefoldEngine::RunSinglePassRefold() {
 
         bool consumedSeparatorGapForPunctuation = false;
 
-        // A zero-width PP insertion can map to the right edge of an existing
-        // whitespace separator in the TU. For separator punctuation such as a
-        // comma, the source edit is not "insert after the old gap"; it is
-        // "replace the old separator gap with the new separator spelling".
-        //
-        // Only perform that span correction when every byte being consumed is
-        // ordinary horizontal TU whitespace between two real tokens. Includes
-        // and macro invocation spellings are excluded so this never steals
-        // whitespace that belongs to a spelled artifact, and the lexer check
-        // proves that attaching the punctuation to the left token preserves
-        // tokenization.
-        if (h.isInsertOnly() && span->first == span->second && !repl.empty() &&
-            !stringutils::isWs(repl.front()) && span->first > 0 &&
-            span->first < tuBytes.size() &&
-            (tuBytes[span->first - 1] == ' ' ||
-             tuBytes[span->first - 1] == '\t') &&
-            !stringutils::isWs(tuBytes[span->first])) {
-          auto intervalOverlapsSpelledArtifact =
-              [&](uint64_t begin, uint64_t end) -> bool {
-            for (const auto &inc : model_.GetIncludes()) {
-              if (!PathsEqual(inc.sitePath, tuPath))
-                continue;
-              if (inc.siteB < end && begin < inc.siteE)
-                return true;
-            }
-            for (const auto &m : model_.GetMacroInvocations()) {
-              if (m.invFile && !m.invFile->empty() &&
-                  !PathsEqual(*m.invFile, tuPath))
-                continue;
-              if (!m.invB || !m.invE)
-                continue;
-              if (*m.invB < end && begin < *m.invE)
-                return true;
-            }
-            return false;
-          };
+        if (h.isInsertOnly())
+          consumedSeparatorGapForPunctuation =
+              MaybeConsumeOrdinarySeparatorGapForPunctuation(
+                  tuPath, tuBytes, *span, StringRef(repl), "TU");
 
-          uint64_t gapBegin = span->first;
-          while (gapBegin > 0 && (tuBytes[gapBegin - 1] == ' ' ||
-                                  tuBytes[gapBegin - 1] == '\t'))
-            --gapBegin;
+        MaybeExtendTUSpanOverClosedTrailingCallSuffix(h, tuPath, tuBytes, repl, *span);
 
-          if (gapBegin < span->first &&
-              !intervalOverlapsSpelledArtifact(gapBegin, span->first)) {
-            std::optional<LexBoundaryToken> leftTok =
-                lastLexToken(tuBytes.take_front(gapBegin), lexLang_);
-            std::optional<LexBoundaryToken> rightTok =
-                firstLexToken(tuBytes.drop_front(span->first), lexLang_);
-            std::optional<LexBoundaryToken> replFirstTok =
-                firstLexToken(StringRef(repl), lexLang_);
-            std::optional<LexBoundaryToken> replLastTok =
-                lastLexToken(StringRef(repl), lexLang_);
-
-            // Consuming the original separator gap is only
-            // whitespace-preserving if the replacement is lexically valid on
-            // both sides of the gap: the inserted punctuation must be able to
-            // attach to the left token, and the replacement text must still
-            // provide any separator required before the original right token.
-            if (leftTok && rightTok && replFirstTok && replLastTok &&
-                leftTok->End == gapBegin && rightTok->Begin == 0 &&
-                isSeparatorGapReplacementPunctuation(replFirstTok->Kind) &&
-                !needsLexicalSeparator(*leftTok, *replFirstTok, lexLang_) &&
-                !needsLexicalSeparator(*replLastTok, *rightTok, lexLang_)) {
-              debug("edit/tu",
-                    "TU insertion consumes ordinary separator gap [{0},{1}) "
-                    "for punctuation '{2}'",
-                    gapBegin, span->first,
-                    stringutils::showWsWithClip(replFirstTok->Spelling, 40));
-              span->first = gapBegin;
-              consumedSeparatorGapForPunctuation = true;
-            }
-          }
-        }
-
-        // If our TU span stops at an identifier and is immediately followed by
-        // a "(...)" chain, consume that suffix only when token provenance
-        // proves the suffix belongs to this hunk's B-side replacement interval.
-        // This prevents a wrapper-name replacement from swallowing the original
-        // argument list while a separate insertion hunk still targets a byte
-        // inside that argument list.
-        if (span->first < span->second) {
-          const uint64_t oldEnd = span->second;
-          const uint64_t extEnd =
-              stringutils::extendChainedCallEnd(tuBytes, oldEnd, repl);
-          if (extEnd != oldEnd &&
-              tuExtensionIsBTokenClosed(h.aEnd, oldEnd, extEnd, h.bStart,
-                                        h.bEnd)) {
-            debug("edit/tu",
-                  "TU extend trailing call/arg chain [{0},{1}) -> [{0},{2})",
-                  span->first, oldEnd, extEnd);
-            span->second = extEnd;
-          }
-        }
-
-        bool advancedOverSourceLineControlPrefix = false;
-        if (h.isInsertOnly() && span->first == span->second) {
-          if (!IsPPGapAtSelectedConditionalArmExit(h.aStart)) {
-          if (std::optional<uint64_t> exactAnchor =
-                  AnchorToExactSlotBoundaryFromPPGap(tuPath, h.aStart)) {
-            if (*exactAnchor == span->first) {
-              if (std::optional<uint64_t> advancedAnchor =
-                      AdvanceInsertionAnchorPastSourceLineControlPrefix(
-                          tuPath, std::nullopt, tuBytes, span->first)) {
-                debug("edit/tu",
-                      "TU insertion advances over source line-control prefix "
-                      "[{0},{1}) at PP gap {2}",
-                      span->first, *advancedAnchor, h.aStart);
-                span->first = *advancedAnchor;
-                span->second = *advancedAnchor;
-                advancedOverSourceLineControlPrefix = true;
-              }
-            }
-          }
-        }
-      }
+        bool advancedOverSourceLineControlPrefix =
+            MaybeAdvanceTUInsertionPastSourceLineControlPrefix(
+                h, tuPath, tuBytes, *span, "TU");
 
         // Is this span replacing a TU "gap" (bytes that are all whitespace)?
         std::string original;
@@ -3439,99 +3512,22 @@ std::string RefoldEngine::RunSinglePassRefold() {
               span->first, span->second, stringutils::showWsWithClip(rawRepl, 160),
               stringutils::showWsWithClip(padded, 160));
 
-        auto insertionCanDeferResyncToConditionalJoin = [&]() -> bool {
-          if (!advancedOverSourceLineControlPrefix || span->first != span->second)
-            return false;
+        const bool skipLocalResync =
+            TUInsertionBeforeMaterializedInclude(
+                h, tuPath, *span, /*requireVisibleReplayText=*/true) ||
+            TUInsertionCanDeferResyncToConditionalJoin(
+                advancedOverSourceLineControlPrefix, tuPath, span->second,
+                "TU");
 
-          std::optional<LineStateObserverSite> firstObserver =
-              FirstOwnerSuffixLineStateObserverSite(std::nullopt, tuPath,
-                                                     span->second);
-          if (!firstObserver || !firstObserver->demand.needsLine)
-            return false;
-
-          const RefoldModel::CondGroup *innermost = nullptr;
-          for (const RefoldModel::CondGroup *group :
-               model_.GetCondGroups(tuPath, std::nullopt)) {
-            if (!group || !PathsEqual(group->file, tuPath) ||
-                group->parentIncludeId)
-              continue;
-            if (!group->ContainsByte(span->first))
-              continue;
-            if (!innermost ||
-                (group->groupB >= innermost->groupB &&
-                 group->groupE <= innermost->groupE))
-              innermost = group;
-          }
-
-          if (!innermost || firstObserver->offset < innermost->groupE)
-            return false;
-
-          trace("linedir/resync",
-                "defer local resync after source line-control prefix to "
-                "conditional join repair: anchor={0} group=[{1},{2}) "
-                "observer={3}",
-                span->first, innermost->groupB, innermost->groupE,
-                firstObserver->offset);
-          return true;
-        };
-
-
-      auto insertionBeforeMaterializedInclude = [&]() -> bool {
-          if (!h.isInsertOnly() || span->first != span->second)
-            return false;
-          if (!AnchorToExactSlotBoundaryFromPPGap(tuPath, h.aStart))
-            return false;
-
-          const uint64_t maxPP = model_.GetTokensCountA();
-          std::optional<uint64_t> leftInc =
-              (h.aStart > 0) ? model_.InnermostIncludeAtPP(h.aStart - 1)
-                             : std::nullopt;
-          std::optional<uint64_t> rightInc =
-              h.aStart < maxPP ? model_.InnermostIncludeAtPP(h.aStart)
-                               : std::nullopt;
-          if (leftInc || !rightInc)
-            return false;
-
-          return llvm::any_of(sidebandPragmaEdits_,
-                              [&](const SidebandPragmaEdit &sideband) {
-            return sideband.TargetsInclude(*rightInc) &&
-                   sideband.EmitsVisibleReplayText();
-          });
-        };
-
-        // When a TU-prefix insertion is immediately followed by an include that
-        // will be materialized for proved sideband work, the include wrapper is
-        // the next file-state transition.  Emitting a local TU #line back to the
-        // physical #include directive would only create a gratuitous resume
-        // immediately before the child-file #line.
         ResyncOutcome ro =
-            (insertionBeforeMaterializedInclude() ||
-             insertionCanDeferResyncToConditionalJoin())
+            skipLocalResync
                 ? ResyncOutcome(padded, std::nullopt)
                 : ApplyResyncOrPend(tuBytes, span->first, span->second, padded,
                                     tuPath);
-        TextEdit edit{span->first, span->second, std::move(ro.text),
-                      std::move(ro.pending), std::nullopt, {}, {}, {}};
-        edit.lineControlPruneCandidates = std::move(ro.lineControlPruneCandidates);
-        edit.isDirectTUHunkEdit = true;
-        edit.directTUHunkIndex = i;
-        edit.directTUHunkAStart = h.aStart;
-        edit.directTUHunkAEnd = h.aEnd;
-        edit.directTUHunkBStart = h.bStart;
-        edit.directTUHunkBEnd = h.bEnd;
-        edit.directTURawStart = rawTUStart;
-        edit.directTURawEnd = rawTUEnd;
-        edit.directTUFinalStart = span->first;
-        edit.directTUFinalEnd = span->second;
-        if (materializedBByteBegin && materializedBByteEnd)
-          StampTextEditMaterializedBByteRange(edit, *materializedBByteBegin,
-                                              *materializedBByteEnd);
-
-        AttachAcceptedResultCarrier(
-            edit, BuildAcceptedTUTextEditCandidate(
-                      AcceptedPathKind::TUByteSpanMappedEdit, span->first,
-                      span->second, StringRef(padded)));
-        tuEdits.push_back(std::move(edit));
+        tuEdits.push_back(BuildDirectTUHunkTextEdit(
+            h, i, *span, std::move(ro), StringRef(padded), rawTUStart, rawTUEnd,
+            materializedBByteBegin, materializedBByteEnd,
+            AcceptedPathKind::TUByteSpanMappedEdit));
         continue;
       } else {
         debug("classify",
@@ -3678,118 +3674,16 @@ std::string RefoldEngine::RunSinglePassRefold() {
 
       bool consumedSeparatorGapForPunctuation = false;
 
-      // A zero-width PP insertion can map to the right edge of an existing
-      // whitespace separator in the TU. For separator punctuation such as a
-      // comma, widen the replacement span over that exact ordinary separator
-      // gap so the edit replaces the gap instead of inserting after it.
-      //
-      // The widening is deliberately narrow: only spaces/tabs immediately to
-      // the left of the anchor may be consumed, the right side must be a real
-      // non-whitespace TU byte, the gap must not overlap include/macro spelling
-      // artifacts, and the lexer must prove the inserted punctuation can attach
-      // to the left token without changing tokenization.
-      if (!isDel && h.isInsertOnly() && span->first == span->second &&
-          !repl.empty() && !stringutils::isWs(repl.front()) &&
-          span->first > 0 && span->first < tuBytes.size() &&
-          (tuBytes[span->first - 1] == ' ' ||
-           tuBytes[span->first - 1] == '\t') &&
-          !stringutils::isWs(tuBytes[span->first])) {
-        auto intervalOverlapsSpelledArtifact =
-            [&](uint64_t begin, uint64_t end) -> bool {
-          for (const auto &inc : model_.GetIncludes()) {
-            if (!PathsEqual(inc.sitePath, tuPath))
-              continue;
-            if (inc.siteB < end && begin < inc.siteE)
-              return true;
-          }
-          for (const auto &m : model_.GetMacroInvocations()) {
-            if (m.invFile && !m.invFile->empty() &&
-                !PathsEqual(*m.invFile, tuPath))
-              continue;
-            if (!m.invB || !m.invE)
-              continue;
-            if (*m.invB < end && begin < *m.invE)
-              return true;
-          }
-          return false;
-        };
+      if (!isDel && h.isInsertOnly())
+        consumedSeparatorGapForPunctuation =
+            MaybeConsumeOrdinarySeparatorGapForPunctuation(
+                tuPath, tuBytes, *span, StringRef(repl), "TU conservative");
 
-        uint64_t gapBegin = span->first;
-        while (gapBegin > 0 && (tuBytes[gapBegin - 1] == ' ' ||
-                                tuBytes[gapBegin - 1] == '\t'))
-          --gapBegin;
+      MaybeExtendTUSpanOverClosedTrailingCallSuffix(h, tuPath, tuBytes, repl, *span);
 
-        if (gapBegin < span->first &&
-            !intervalOverlapsSpelledArtifact(gapBegin, span->first)) {
-          std::optional<LexBoundaryToken> leftTok =
-              lastLexToken(tuBytes.take_front(gapBegin), lexLang_);
-          std::optional<LexBoundaryToken> rightTok =
-              firstLexToken(tuBytes.drop_front(span->first), lexLang_);
-          std::optional<LexBoundaryToken> replFirstTok =
-              firstLexToken(StringRef(repl), lexLang_);
-          std::optional<LexBoundaryToken> replLastTok =
-              lastLexToken(StringRef(repl), lexLang_);
-
-          // Consuming the original separator gap is only whitespace-preserving
-          // if the replacement is lexically valid on both sides of the gap:
-          // the inserted punctuation must be able to attach to the left token,
-          // and the replacement text must still provide any separator required
-          // before the original right token.
-          if (leftTok && rightTok && replFirstTok && replLastTok &&
-              leftTok->End == gapBegin && rightTok->Begin == 0 &&
-              isSeparatorGapReplacementPunctuation(replFirstTok->Kind) &&
-              !needsLexicalSeparator(*leftTok, *replFirstTok, lexLang_) &&
-              !needsLexicalSeparator(*replLastTok, *rightTok, lexLang_)) {
-            debug("edit/tu",
-                  "TU conservative insertion consumes ordinary separator gap "
-                  "[{0},{1}) for punctuation '{2}'",
-                  gapBegin, span->first,
-                  stringutils::showWsWithClip(replFirstTok->Spelling, 40));
-            span->first = gapBegin;
-            consumedSeparatorGapForPunctuation = true;
-          }
-        }
-      }
-
-      // If our TU span stops at an identifier and is immediately followed by a
-      // "(...)" chain, consume that suffix only when token provenance proves
-      // the suffix belongs to this hunk's B-side replacement interval. This is
-      // the conservative-path counterpart of the mapped-TU guard above.
-      if (span->first < span->second) {
-        const uint64_t oldEnd = span->second;
-        const uint64_t extEnd =
-              stringutils::extendChainedCallEnd(tuBytes, oldEnd, repl);
-        if (extEnd != oldEnd &&
-            tuExtensionIsBTokenClosed(h.aEnd, oldEnd, extEnd, h.bStart,
-                                      h.bEnd)) {
-          debug("edit/tu",
-                "TU extend trailing call/arg chain [{0},{1}) -> [{0},{2})",
-                span->first, oldEnd, extEnd);
-          span->second = extEnd;
-        }
-      }
-
-      bool advancedOverSourceLineControlPrefix = false;
-      if (h.isInsertOnly() && span->first == span->second) {
-        if (!IsPPGapAtSelectedConditionalArmExit(h.aStart)) {
-        if (std::optional<uint64_t> exactAnchor =
-                AnchorToExactSlotBoundaryFromPPGap(tuPath, h.aStart)) {
-          if (*exactAnchor == span->first) {
-            if (std::optional<uint64_t> advancedAnchor =
-                    AdvanceInsertionAnchorPastSourceLineControlPrefix(
-                        tuPath, std::nullopt, tuBytes, span->first)) {
-              debug("edit/tu",
-                    "TU conservative insertion advances over source "
-                    "line-control prefix [{0},{1}) at PP gap {2}",
-                    span->first, *advancedAnchor, h.aStart);
-              span->first = *advancedAnchor;
-              span->second = *advancedAnchor;
-              advancedOverSourceLineControlPrefix = true;
-            }
-          }
-        }
-      }
-    }
+      bool advancedOverSourceLineControlPrefix =
+          MaybeAdvanceTUInsertionPastSourceLineControlPrefix(
+              h, tuPath, tuBytes, *span, "TU conservative");
 
       // If we are replacing whitespace-only text in the TU, we prefer to
       // preserve the existing TU gap whitespace rather than introducing new
@@ -3832,94 +3726,22 @@ std::string RefoldEngine::RunSinglePassRefold() {
             stringutils::showWsWithClip(rawRepl, 160),
             stringutils::showWsWithClip(padded, 160));
 
-      auto insertionCanDeferResyncToConditionalJoin = [&]() -> bool {
-        if (!advancedOverSourceLineControlPrefix || span->first != span->second)
-          return false;
+      const bool skipLocalResync =
+          TUInsertionBeforeMaterializedInclude(
+              h, tuPath, *span, /*requireVisibleReplayText=*/false) ||
+          TUInsertionCanDeferResyncToConditionalJoin(
+              advancedOverSourceLineControlPrefix, tuPath, span->second,
+              "TU conservative");
 
-        std::optional<LineStateObserverSite> firstObserver =
-            FirstOwnerSuffixLineStateObserverSite(std::nullopt, tuPath,
-                                                   span->second);
-        if (!firstObserver || !firstObserver->demand.needsLine)
-          return false;
-
-        const RefoldModel::CondGroup *innermost = nullptr;
-        for (const RefoldModel::CondGroup *group :
-             model_.GetCondGroups(tuPath, std::nullopt)) {
-          if (!group || !PathsEqual(group->file, tuPath) ||
-              group->parentIncludeId)
-            continue;
-          if (!group->ContainsByte(span->first))
-            continue;
-          if (!innermost ||
-              (group->groupB >= innermost->groupB &&
-               group->groupE <= innermost->groupE))
-            innermost = group;
-        }
-
-        if (!innermost || firstObserver->offset < innermost->groupE)
-          return false;
-
-        trace("linedir/resync",
-              "defer conservative local resync after source line-control "
-              "prefix to conditional join repair: anchor={0} "
-              "group=[{1},{2}) observer={3}",
-              span->first, innermost->groupB, innermost->groupE,
-              firstObserver->offset);
-        return true;
-      };
-
-      auto insertionBeforeMaterializedInclude = [&]() -> bool {
-        if (!h.isInsertOnly() || span->first != span->second)
-          return false;
-        if (!AnchorToExactSlotBoundaryFromPPGap(tuPath, h.aStart))
-          return false;
-        const uint64_t maxPP = model_.GetTokensCountA();
-        std::optional<uint64_t> leftInc =
-            (h.aStart > 0) ? model_.InnermostIncludeAtPP(h.aStart - 1)
-                           : std::nullopt;
-        std::optional<uint64_t> rightInc =
-            h.aStart < maxPP ? model_.InnermostIncludeAtPP(h.aStart)
-                             : std::nullopt;
-        if (leftInc || !rightInc)
-          return false;
-        return llvm::any_of(sidebandPragmaEdits_,
-                            [&](const SidebandPragmaEdit &sideband) {
-          return sideband.TargetsInclude(*rightInc);
-        });
-      };
-
-      // A TU insertion immediately before a materialized include does not need
-      // to resync back to the physical `#include` directive line.  The next
-      // emitted bytes are the include wrapper's child-file `#line`, and that
-      // wrapper later performs the parent resume after the include.
       ResyncOutcome ro =
-          (insertionBeforeMaterializedInclude() ||
-           insertionCanDeferResyncToConditionalJoin())
+          skipLocalResync
               ? ResyncOutcome(padded, std::nullopt)
               : ApplyResyncOrPend(tuBytes, span->first, span->second, padded,
                                   tuPath);
-      TextEdit edit{span->first, span->second, std::move(ro.text),
-                    std::move(ro.pending), std::nullopt, {}, {}, {}};
-      edit.lineControlPruneCandidates = std::move(ro.lineControlPruneCandidates);
-      edit.isDirectTUHunkEdit = true;
-      edit.directTUHunkIndex = i;
-      edit.directTUHunkAStart = h.aStart;
-      edit.directTUHunkAEnd = h.aEnd;
-      edit.directTUHunkBStart = h.bStart;
-      edit.directTUHunkBEnd = h.bEnd;
-      edit.directTURawStart = rawTUStart;
-      edit.directTURawEnd = rawTUEnd;
-      edit.directTUFinalStart = span->first;
-      edit.directTUFinalEnd = span->second;
-      if (materializedBByteBegin && materializedBByteEnd)
-        StampTextEditMaterializedBByteRange(edit, *materializedBByteBegin,
-                                            *materializedBByteEnd);
-
-      AttachAcceptedResultCarrier(
-          edit, BuildAcceptedTUTextEditCandidate(
-                    AcceptedPathKind::TUByteSpanConservativeEdit, span->first,
-                    span->second, StringRef(padded)));
-      tuEdits.push_back(std::move(edit));
+      tuEdits.push_back(BuildDirectTUHunkTextEdit(
+          h, i, *span, std::move(ro), StringRef(padded), rawTUStart, rawTUEnd,
+          materializedBByteBegin, materializedBByteEnd,
+          AcceptedPathKind::TUByteSpanConservativeEdit));
       continue;
     }
 
@@ -4126,26 +3948,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
   auto includeDirectiveAppearsAtLineStart =
       [&](const TextEdit &edit, const RefoldModel::IncludeItem &inc) {
     StringRef directiveText = includeDirectiveText(inc);
-    if (directiveText.empty())
-      return false;
-
-    auto atDirectiveLineStart = [](StringRef replacement, size_t pos) {
-      size_t lineBegin = replacement.rfind('\n', pos);
-      lineBegin = lineBegin == StringRef::npos ? 0 : lineBegin + 1;
-      for (size_t i = lineBegin; i < pos; ++i)
-        if (!stringutils::isNonNewlineWs(replacement[i]))
-          return false;
-      return true;
-    };
-
-    StringRef replacement(edit.text);
-    size_t pos = 0;
-    while ((pos = replacement.find(directiveText, pos)) != StringRef::npos) {
-      if (atDirectiveLineStart(replacement, pos))
-        return true;
-      pos += directiveText.size();
-    }
-    return false;
+    return !directiveText.empty() &&
+           stringutils::containsAtLineStartAfterIndent(edit.text, directiveText);
   };
 
   // Match a real preserved macro-state directive line, not an arbitrary
@@ -4156,27 +3960,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
   // transition as preserved rather than consumed.
   auto macroStateDirectiveAppearsAtLineStart =
       [&](const TextEdit &edit, const RefoldModel::MacroDirective &directive) {
-    StringRef directiveText = directive.text;
-    if (directiveText.empty())
-      return false;
-
-    auto atDirectiveLineStart = [](StringRef replacement, size_t pos) {
-      size_t lineBegin = replacement.rfind('\n', pos);
-      lineBegin = lineBegin == StringRef::npos ? 0 : lineBegin + 1;
-      for (size_t i = lineBegin; i < pos; ++i)
-        if (!stringutils::isNonNewlineWs(replacement[i]))
-          return false;
-      return true;
-    };
-
-    StringRef replacement(edit.text);
-    size_t pos = 0;
-    while ((pos = replacement.find(directiveText, pos)) != StringRef::npos) {
-      if (atDirectiveLineStart(replacement, pos))
-        return true;
-      pos += directiveText.size();
-    }
-    return false;
+    return !directive.text.empty() &&
+           stringutils::containsAtLineStartAfterIndent(edit.text, directive.text);
   };
 
   // Return true when a final TU edit carries this include directive forward
@@ -14095,6 +13880,81 @@ struct RefoldEngine::ProofDischargeAccumulator {
   }
 };
 
+void RefoldEngine::RequireAcceptedPathBaseline(
+    ProofDischargeAccumulator &discharge,
+    const AcceptancePathInventory &inventory) const {
+  discharge.Require(inventory.currentPath != AcceptedPathKind::Unknown,
+                    ProofObligationKind::AcceptedPathClassified,
+                    ProofFailureReason::MissingAcceptedPathClassification);
+  discharge.Require(inventory.futureTarget != FutureProofTarget::Unknown,
+                    ProofObligationKind::FutureTargetMapped,
+                    ProofFailureReason::MissingFutureTargetMapping);
+}
+
+RefoldEngine::ProofDischargeRecord
+RefoldEngine::BuildAcceptedPathBaselineDischarge(
+    const AcceptancePathInventory &inventory, bool explicitOutOfDomain) const {
+  ProofDischargeAccumulator discharge;
+  RequireAcceptedPathBaseline(discharge, inventory);
+  if (explicitOutOfDomain) {
+    discharge.Fail(ProofObligationKind::ExplicitOutOfDomainResultTracked,
+                   ProofFailureReason::ExplicitOutOfDomainResult);
+  }
+  return discharge.Finish();
+}
+
+void RefoldEngine::ConfigureProofSummary(
+    ProofSummary &summary, AcceptedProofClass acceptedClass,
+    RealizationMode realizationMode, SelectionPreference preference,
+    SurfaceDisposition surfaceDisposition, bool structurePreserving) const {
+  summary.acceptedClass = acceptedClass;
+  summary.realizationMode = realizationMode;
+  summary.preference = preference;
+  summary.surfaceDisposition = surfaceDisposition;
+  summary.structurePreserving = structurePreserving;
+}
+
+void RefoldEngine::FinalizeProofSummary(ProofSummary &summary) const {
+  summary.lattice = BuildGlobalSelectionLattice(summary);
+  summary.completeness = BuildCompletenessContract(summary);
+  summary.theoremDomain = BuildTheoremDomainContract(summary);
+}
+
+void RefoldEngine::RequireIncludeZeroWidthAnchor(
+    ProofDischargeAccumulator &discharge, const IncludePatch &patch,
+    const IncludeAnchorWitness *witness, IncludeAnchorEvidenceKind evidence,
+    ProofObligationKind witnessObligation,
+    ProofFailureReason witnessFailure) const {
+  discharge.Require(patch.aStart == patch.aEnd,
+                    ProofObligationKind::IncludePatchShapeTracked,
+                    ProofFailureReason::MissingIncludePatchShape);
+  discharge.Require(witness && witness->evidence == evidence, witnessObligation,
+                    witnessFailure);
+  discharge.Require(witness && witness->hasAnchorByte,
+                    ProofObligationKind::IncludeAnchorByteTracked,
+                    ProofFailureReason::MissingIncludeAnchorByte);
+}
+
+bool RefoldEngine::TUAnchorWitnessHasProvableEvidence(
+    const TUAnchorWitness &witness) const {
+  switch (witness.evidence) {
+  case TUAnchorEvidenceKind::ArgLikeBegin:
+    return witness.macroId != 0;
+  case TUAnchorEvidenceKind::ImmediateRightNeighbor:
+    return witness.hasRightNeighbor;
+  case TUAnchorEvidenceKind::ImmediateLeftNeighbor:
+    return witness.hasLeftNeighbor;
+  case TUAnchorEvidenceKind::IncludeDirectiveBoundary:
+  case TUAnchorEvidenceKind::CorroboratedRightNeighbor:
+  case TUAnchorEvidenceKind::CorroboratedLeftNeighbor:
+    return witness.hasLeftNeighbor && witness.hasRightNeighbor;
+  case TUAnchorEvidenceKind::Unknown:
+  case TUAnchorEvidenceKind::ExactSlotBoundary:
+    return false;
+  }
+  return false;
+}
+
 RefoldEngine::ProofSummary
 RefoldEngine::ClassifyMacroPatchProof(const MacroPatch &patch) const {
   ProofSummary summary;
@@ -14118,37 +13978,48 @@ RefoldEngine::ClassifyMacroPatchProof(const MacroPatch &patch) const {
   case MacroPatchProofKind::CallChainSuffix:
     // Call-chain suffix rewrites are emitted directly on the root callsite
     // slice, so the patch's owning macro id must already be that root.
-    summary.acceptedClass = AcceptedProofClass::InvocationPreserving;
-    summary.realizationMode = RealizationMode::PreserveOriginalStructure;
-    summary.preference = SelectionPreference::PreferStructurePreservation;
+    ConfigureProofSummary(
+        summary, AcceptedProofClass::InvocationPreserving,
+        RealizationMode::PreserveOriginalStructure,
+        SelectionPreference::PreferStructurePreservation, SurfaceDisposition::None,
+        /*structurePreserving=*/true);
     break;
 
   case MacroPatchProofKind::CounterLiteral:
-    summary.acceptedClass = AcceptedProofClass::InvocationRealization;
-    summary.realizationMode = RealizationMode::RealizeEditedSurface;
-    summary.preference = SelectionPreference::PreferSurfaceRealization;
+    ConfigureProofSummary(
+        summary, AcceptedProofClass::InvocationRealization,
+        RealizationMode::RealizeEditedSurface,
+        SelectionPreference::PreferSurfaceRealization, SurfaceDisposition::None,
+        /*structurePreserving=*/false);
     break;
 
   case MacroPatchProofKind::WholeCoverRealization:
-    summary.acceptedClass = AcceptedProofClass::InvocationRealization;
-    summary.realizationMode = RealizationMode::RealizeEditedSurface;
-    summary.preference = SelectionPreference::PreferSurfaceRealization;
-    summary.surfaceDisposition =
-        SurfaceDisposition::RealizeWholeCoverMacros;
+    ConfigureProofSummary(
+        summary, AcceptedProofClass::InvocationRealization,
+        RealizationMode::RealizeEditedSurface,
+        SelectionPreference::PreferSurfaceRealization,
+        SurfaceDisposition::RealizeWholeCoverMacros,
+        /*structurePreserving=*/false);
     break;
 
   case MacroPatchProofKind::Unknown:
     if (patch.structurePreserving) {
-      summary.acceptedClass = AcceptedProofClass::InvocationPreserving;
-      summary.realizationMode = RealizationMode::PreserveOriginalStructure;
-      summary.preference = SelectionPreference::PreferStructurePreservation;
+      ConfigureProofSummary(
+          summary, AcceptedProofClass::InvocationPreserving,
+          RealizationMode::PreserveOriginalStructure,
+          SelectionPreference::PreferStructurePreservation, SurfaceDisposition::None,
+          /*structurePreserving=*/true);
     } else if (patch.proofValidated || patch.proofRootMacroId) {
-      summary.acceptedClass = AcceptedProofClass::InvocationRealization;
-      summary.realizationMode = RealizationMode::RealizeEditedSurface;
-      summary.preference = SelectionPreference::PreferSurfaceRealization;
+      ConfigureProofSummary(
+          summary, AcceptedProofClass::InvocationRealization,
+          RealizationMode::RealizeEditedSurface,
+          SelectionPreference::PreferSurfaceRealization, SurfaceDisposition::None,
+          /*structurePreserving=*/false);
     }
     break;
   }
+
+  summary.structurePreserving = patch.structurePreserving;
 
   switch (summary.acceptedClass) {
   case AcceptedProofClass::InvocationPreserving:
@@ -14165,9 +14036,7 @@ RefoldEngine::ClassifyMacroPatchProof(const MacroPatch &patch) const {
     break;
   }
 
-  summary.lattice = BuildGlobalSelectionLattice(summary);
-  summary.completeness = BuildCompletenessContract(summary);
-  summary.theoremDomain = BuildTheoremDomainContract(summary);
+  FinalizeProofSummary(summary);
   return summary;
 }
 
@@ -14238,10 +14107,11 @@ RefoldEngine::ProofSummary RefoldEngine::BuildAcceptedPathProofSummary(
   case AcceptedPathKind::IncludeInsertRightNeighborPP:
   case AcceptedPathKind::IncludeInsertLeftNeighborPP:
   case AcceptedPathKind::IncludeInsertDeclBoundary:
-    summary.acceptedClass = AcceptedProofClass::IncludePreserving;
-    summary.realizationMode = RealizationMode::PreserveOriginalStructure;
-    summary.preference = SelectionPreference::PreferStructurePreservation;
-    summary.structurePreserving = true;
+    ConfigureProofSummary(
+        summary, AcceptedProofClass::IncludePreserving,
+        RealizationMode::PreserveOriginalStructure,
+        SelectionPreference::PreferStructurePreservation, SurfaceDisposition::None,
+        /*structurePreserving=*/true);
     if (includeAnchorWitness) {
       summary.hasIncludeAnchorWitness = true;
       summary.includeAnchorWitness = *includeAnchorWitness;
@@ -14251,12 +14121,12 @@ RefoldEngine::ProofSummary RefoldEngine::BuildAcceptedPathProofSummary(
     break;
 
   case AcceptedPathKind::IncludeRealizationInlineFromB:
-    summary.acceptedClass = AcceptedProofClass::IncludeRealization;
-    summary.realizationMode = RealizationMode::RealizeEditedSurface;
-    summary.preference = SelectionPreference::PreferSurfaceRealization;
-    summary.surfaceDisposition =
-        SurfaceDisposition::RealizeInlineTouchedIncludesFromB;
-    summary.structurePreserving = false;
+    ConfigureProofSummary(
+        summary, AcceptedProofClass::IncludeRealization,
+        RealizationMode::RealizeEditedSurface,
+        SelectionPreference::PreferSurfaceRealization,
+        SurfaceDisposition::RealizeInlineTouchedIncludesFromB,
+        /*structurePreserving=*/false);
     if (includeRealizationWitness) {
       summary.hasIncludeRealizationWitness = true;
       summary.includeRealizationWitness = *includeRealizationWitness;
@@ -14266,31 +14136,23 @@ RefoldEngine::ProofSummary RefoldEngine::BuildAcceptedPathProofSummary(
     break;
 
   case AcceptedPathKind::IncludeMaterializedExpansion: {
-    summary.acceptedClass = AcceptedProofClass::IncludeRealization;
-    summary.realizationMode = RealizationMode::RealizeEditedSurface;
-    summary.preference = SelectionPreference::PreferSurfaceRealization;
-    summary.surfaceDisposition =
-        SurfaceDisposition::RealizeMaterializedIncludeExpansion;
-    summary.structurePreserving = false;
-    ProofDischargeAccumulator discharge;
-    discharge.Require(summary.inventory.currentPath !=
-                          AcceptedPathKind::Unknown,
-                      ProofObligationKind::AcceptedPathClassified,
-                      ProofFailureReason::MissingAcceptedPathClassification);
-    discharge.Require(summary.inventory.futureTarget !=
-                          FutureProofTarget::Unknown,
-                      ProofObligationKind::FutureTargetMapped,
-                      ProofFailureReason::MissingFutureTargetMapping);
-    summary.discharge = discharge.Finish();
+    ConfigureProofSummary(
+        summary, AcceptedProofClass::IncludeRealization,
+        RealizationMode::RealizeEditedSurface,
+        SelectionPreference::PreferSurfaceRealization,
+        SurfaceDisposition::RealizeMaterializedIncludeExpansion,
+        /*structurePreserving=*/false);
+    summary.discharge = BuildAcceptedPathBaselineDischarge(summary.inventory);
     break;
   }
 
   case AcceptedPathKind::TUExactSlotBoundary:
   case AcceptedPathKind::TUProvableInsertionAnchor:
-    summary.acceptedClass = AcceptedProofClass::TUAnchor;
-    summary.realizationMode = RealizationMode::PreserveOriginalStructure;
-    summary.preference = SelectionPreference::PreferExactAnchoring;
-    summary.structurePreserving = true;
+    ConfigureProofSummary(
+        summary, AcceptedProofClass::TUAnchor,
+        RealizationMode::PreserveOriginalStructure,
+        SelectionPreference::PreferExactAnchoring, SurfaceDisposition::None,
+        /*structurePreserving=*/true);
     if (tuAnchorWitness) {
       summary.hasTUAnchorWitness = true;
       summary.tuAnchorWitness = *tuAnchorWitness;
@@ -14300,22 +14162,13 @@ RefoldEngine::ProofSummary RefoldEngine::BuildAcceptedPathProofSummary(
 
   case AcceptedPathKind::TUByteSpanMappedEdit:
   case AcceptedPathKind::TUByteSpanConservativeEdit: {
-    summary.acceptedClass = AcceptedProofClass::TUTextualEdit;
-    summary.realizationMode = RealizationMode::RealizeEditedSurface;
-    summary.preference = SelectionPreference::PreferSurfaceRealization;
-    summary.surfaceDisposition =
-        SurfaceDisposition::RealizeTranslationUnitByteEdit;
-    summary.structurePreserving = false;
-    ProofDischargeAccumulator discharge;
-    discharge.Require(summary.inventory.currentPath !=
-                          AcceptedPathKind::Unknown,
-                      ProofObligationKind::AcceptedPathClassified,
-                      ProofFailureReason::MissingAcceptedPathClassification);
-    discharge.Require(summary.inventory.futureTarget !=
-                          FutureProofTarget::Unknown,
-                      ProofObligationKind::FutureTargetMapped,
-                      ProofFailureReason::MissingFutureTargetMapping);
-    summary.discharge = discharge.Finish();
+    ConfigureProofSummary(
+        summary, AcceptedProofClass::TUTextualEdit,
+        RealizationMode::RealizeEditedSurface,
+        SelectionPreference::PreferSurfaceRealization,
+        SurfaceDisposition::RealizeTranslationUnitByteEdit,
+        /*structurePreserving=*/false);
+    summary.discharge = BuildAcceptedPathBaselineDischarge(summary.inventory);
     break;
   }
 
@@ -14324,22 +14177,14 @@ RefoldEngine::ProofSummary RefoldEngine::BuildAcceptedPathProofSummary(
       summary.hasTerminalFallbackWitness = true;
       summary.terminalFallbackWitness = *terminalFallbackWitness;
     }
-    summary.realizationMode = RealizationMode::RealizeEditedSurface;
-    summary.preference = SelectionPreference::PreferSurfaceRealization;
-    summary.surfaceDisposition =
-        SurfaceDisposition::EmitEditedPreprocessedStream;
-    ProofDischargeAccumulator discharge;
-    discharge.Require(summary.inventory.currentPath !=
-                          AcceptedPathKind::Unknown,
-                      ProofObligationKind::AcceptedPathClassified,
-                      ProofFailureReason::MissingAcceptedPathClassification);
-    discharge.Require(summary.inventory.futureTarget !=
-                          FutureProofTarget::Unknown,
-                      ProofObligationKind::FutureTargetMapped,
-                      ProofFailureReason::MissingFutureTargetMapping);
-    discharge.Fail(ProofObligationKind::ExplicitOutOfDomainResultTracked,
-                   ProofFailureReason::ExplicitOutOfDomainResult);
-    summary.discharge = discharge.Finish();
+    ConfigureProofSummary(
+        summary, AcceptedProofClass::Unknown,
+        RealizationMode::RealizeEditedSurface,
+        SelectionPreference::PreferSurfaceRealization,
+        SurfaceDisposition::EmitEditedPreprocessedStream,
+        /*structurePreserving=*/false);
+    summary.discharge = BuildAcceptedPathBaselineDischarge(
+        summary.inventory, /*explicitOutOfDomain=*/true);
     break;
   }
 
@@ -14356,9 +14201,7 @@ RefoldEngine::ProofSummary RefoldEngine::BuildAcceptedPathProofSummary(
     break;
   }
 
-  summary.lattice = BuildGlobalSelectionLattice(summary);
-  summary.completeness = BuildCompletenessContract(summary);
-  summary.theoremDomain = BuildTheoremDomainContract(summary);
+  FinalizeProofSummary(summary);
   return summary;
 }
 
@@ -14747,12 +14590,7 @@ RefoldEngine::BuildAcceptedEmittedMacroCandidate(
           candidate)) {
     candidate.proofSummary.discharge =
         ValidateEmittedInvocationPreservingProof(patch);
-    candidate.proofSummary.lattice =
-        BuildGlobalSelectionLattice(candidate.proofSummary);
-    candidate.proofSummary.completeness =
-        BuildCompletenessContract(candidate.proofSummary);
-    candidate.proofSummary.theoremDomain =
-        BuildTheoremDomainContract(candidate.proofSummary);
+    FinalizeProofSummary(candidate.proofSummary);
   }
 
   return candidate;
