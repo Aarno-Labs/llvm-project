@@ -3000,6 +3000,26 @@ private:
       uint64_t aStart, uint64_t aEnd,
       std::optional<uint64_t> ownerIncludeId = std::nullopt) const;
 
+  /// \brief Return a patchable macro whose expansion ends at a pure insertion
+  ///        gap and whose generated descendant chain contains `__VA_OPT__`.
+  ///
+  /// Ordinary macro ownership deliberately excludes half-open range boundaries:
+  /// a pure insertion at `cover.end` normally belongs to the surrounding TU or
+  /// include, not to the macro.  The only exception currently proved here is an
+  /// activation of an inactive variadic tail, where the inserted B tokens are
+  /// part of the macro's generated replacement-list grammar even though the
+  /// old expansion had no A tokens at that position.
+  ///
+  /// This selector is intentionally narrower than
+  /// SmallestCoveringPatchableMacro(): it does not make all right-boundary
+  /// insertions macro-owned.  It only nominates a real callsite whose expansion
+  /// ends at `aGap` and that has a generated descendant at the same boundary
+  /// whose definition contains `__VA_OPT__`; the macro proof must still replay
+  /// and validate the inserted tail before any patch is accepted.
+  const RefoldModel::MacroInvocation *RightBoundaryVaOptActivationMacro(
+      uint64_t aGap,
+      std::optional<uint64_t> ownerIncludeId = std::nullopt) const;
+
   /// \brief Determine whether an A-token interval is owned by the translation
   ///        unit (TU).
   ///

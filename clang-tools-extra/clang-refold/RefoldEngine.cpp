@@ -2224,6 +2224,15 @@ void RefoldEngine::PreclaimStandaloneInsertions(
         continue;
     }
 
+    // Right-boundary insertions normally stay standalone.  Leave this insertion
+    // unclaimed only when a later macro proof may absorb it as an inactive
+    // `__VA_OPT__` tail.  This is deliberately narrower than treating every
+    // `cover.end` insertion as macro-owned, which would steal ordinary TU or
+    // include boundary insertions from their correct owners.
+    if (h.isInsertOnly() &&
+        RightBoundaryVaOptActivationMacro(h.aStart, owner.includeId))
+      continue;
+
     ClaimBInsertion(static_cast<size_t>(insIdI32), BInsertionClaim::Standalone,
                     llvm::formatv("preclaim hunk#{0}", hi).str());
   }
@@ -3762,9 +3771,17 @@ std::string RefoldEngine::RunSinglePassRefold() {
           "#{0} ownerFromSegments kind={1} includeId={2} condArmId={3} {4}", i,
           owner.kind, owner.includeId, owner.condArmId, h);
 
-    // b) Macro call-site still has priority over TU/include
-    if (auto *m =
-            SmallestCoveringPatchableMacro(h.aStart, h.aEnd, owner.includeId)) {
+    // b) Macro call-site still has priority over TU/include.  Half-open
+    // boundary insertions are not macro-owned by default; the only boundary
+    // macro candidate admitted here is the explicit `__VA_OPT__` activation
+    // selector, and BuildMacroInvocationPatchWholeCover must still prove the
+    // inserted B tail before the hunk is absorbed into a callsite rewrite.
+    const RefoldModel::MacroInvocation *macroTarget =
+        SmallestCoveringPatchableMacro(h.aStart, h.aEnd, owner.includeId);
+    if (!macroTarget && isIns)
+      macroTarget =
+          RightBoundaryVaOptActivationMacro(h.aStart, owner.includeId);
+    if (auto *m = macroTarget) {
       if (m->invB && m->invE) {
         debug("classify",
               "#{0} -> MACRO invText={1} owner={2} invFile={3} {4})", i,
@@ -9116,6 +9133,113 @@ static inline StringRef toString(MacroCoverRank rank) {
     return "None";
   }
   llvm_unreachable("Invalid MacroCoverRank");
+}
+
+const RefoldModel::MacroInvocation *
+RefoldEngine::RightBoundaryVaOptActivationMacro(
+    uint64_t aGap, std::optional<uint64_t> ownerIncludeId) const {
+  const RefoldModel::MacroInvocation *best = nullptr;
+  uint64_t bestLen = std::numeric_limits<uint64_t>::max();
+
+  auto definitionFor = [&](const RefoldModel::MacroInvocation &inv)
+      -> const RefoldModel::MacroDirective * {
+    if (!inv.definitionDirectiveId)
+      return nullptr;
+    for (const RefoldModel::MacroDirective &directive :
+         model_.GetMacroDirectives()) {
+      if (directive.id == *inv.definitionDirectiveId)
+        return &directive;
+    }
+    return nullptr;
+  };
+
+  auto definitionContainsVaOpt =
+      [](const RefoldModel::MacroDirective &directive) -> bool {
+    for (const auto &tok : directive.replacementTokens) {
+      if (tok.spelling == "__VA_OPT__")
+        return true;
+    }
+    return false;
+  };
+
+  auto isDescendantOf = [&](const RefoldModel::MacroInvocation &child,
+                            const RefoldModel::MacroInvocation &root) {
+    const RefoldModel::MacroInvocation *cur = &child;
+    for (size_t depth = 0; cur &&
+                           depth <= model_.GetMacroInvocations().size();
+         ++depth) {
+      if (cur->id == root.id)
+        return true;
+      if (!cur->callerMacroId)
+        return false;
+      cur = FindMacroInvocationById(*cur->callerMacroId);
+    }
+    return false;
+  };
+
+  auto hasVaOptDescendantAtBoundary =
+      [&](const RefoldModel::MacroInvocation &root) {
+    for (const RefoldModel::MacroInvocation &candidate :
+         model_.GetMacroInvocations()) {
+      if (!candidate.cover.IsValid() || candidate.cover.end != aGap)
+        continue;
+      if (!isDescendantOf(candidate, root))
+        continue;
+      const RefoldModel::MacroDirective *definition = definitionFor(candidate);
+      if (definition && definitionContainsVaOpt(*definition))
+        return true;
+    }
+    return false;
+  };
+
+  trace("macro/select",
+        "select right-boundary __VA_OPT__ macro for AGap={0} ownerInc={1}",
+        aGap, ownerIncludeId);
+
+  for (const RefoldModel::MacroInvocation &m : model_.GetMacroInvocations()) {
+    if (ownerIncludeId) {
+      if (!m.ownerIncludeId || *m.ownerIncludeId != *ownerIncludeId)
+        continue;
+    }
+
+    if (!m.cover.IsValid() || m.cover.end <= m.cover.begin ||
+        m.cover.end != aGap)
+      continue;
+
+    // Only real source callsites can own the eventual patch. Generated child
+    // invocations may supply the `__VA_OPT__` evidence, but the emitted rewrite
+    // must be applied to an invocation spelling that exists in source.
+    if (!m.invB || !m.invE || !m.invText)
+      continue;
+    if (IsInvocationInsideDefineDirective(m))
+      continue;
+
+    if (!hasVaOptDescendantAtBoundary(m))
+      continue;
+
+    const uint64_t len = m.cover.end - m.cover.begin;
+    trace("macro/select",
+          "candidate right-boundary __VA_OPT__ macro id={0} name='{1}' "
+          "len={2} cover=[{3},{4}) ownerInc={5} inv=[{6},{7})",
+          m.id, m.name, len, m.cover.begin, m.cover.end, m.ownerIncludeId,
+          *m.invB, *m.invE);
+
+    if (!best || len < bestLen || (len == bestLen && m.id < best->id)) {
+      best = &m;
+      bestLen = len;
+    }
+  }
+
+  if (best) {
+    trace("macro/select",
+          "selected right-boundary __VA_OPT__ macro id={0} name='{1}' "
+          "cover=[{2},{3})",
+          best->id, best->name, best->cover.begin, best->cover.end);
+  } else {
+    trace("macro/select", "selected right-boundary __VA_OPT__ macro: <none>");
+  }
+
+  return best;
 }
 
 const RefoldModel::MacroInvocation *
@@ -14730,10 +14854,13 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
 
         const SourceSlot &slot = actuals[*tok.paramIndex];
         if (editable) {
-          if (editable->rootArgIdx != slot.rootArgIdx ||
-              StringRef(editable->rootSourceText).trim() !=
-                  StringRef(slot.rootSourceText).trim())
-            return std::nullopt;
+          // A generated actual expression may combine several source slots
+          // before the final callee sees one argument, for example `A ## B` or
+          // `G(A, B)`.  Keep the first ordinary data slot as the editable owner
+          // for this narrow argument-expression proof; later replay verifies
+          // that the solved old/new surface rewrites uniquely inside that root
+          // source argument.  If the changed contribution belongs to a later
+          // slot, the unique rewrite check fails closed instead of guessing.
           continue;
         }
         editable = slot;
@@ -14793,7 +14920,25 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         const auto &tok = toks[i];
         if (tok.spelling == "##")
           continue;
-        if (tok.spelling == "#" || tok.spelling == "__VA_OPT__")
+        if (tok.spelling == "#") {
+          if (i + 1 >= end ||
+              toks[i + 1].kind != RefoldModel::MacroReplacementTokenKind::ParamRef ||
+              !toks[i + 1].paramIndex ||
+              *toks[i + 1].paramIndex >= definition.defParams.size() ||
+              isVariadicParam(definition, *toks[i + 1].paramIndex) ||
+              *toks[i + 1].paramIndex >= actuals.size())
+            return false;
+          // A stringified generated argument is still an expression over the
+          // same root source slot.  Materialize the old string-literal spelling
+          // for replay, but keep the editable owner as the unstringified source
+          // argument so the solved value rewrites `X`, not `#X` or `"X"`.
+          text.push_back('"');
+          text += actuals[*toks[i + 1].paramIndex].text;
+          text.push_back('"');
+          ++i;
+          continue;
+        }
+        if (tok.spelling == "__VA_OPT__")
           return false;
         if (tok.kind == RefoldModel::MacroReplacementTokenKind::ParamRef) {
           if (!tok.paramIndex || *tok.paramIndex >= definition.defParams.size() ||
@@ -15419,6 +15564,314 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
   if (auto higherOrderGeneratedPatch =
           tryWholeCoverHigherOrderGeneratedCalleePatch())
     return higherOrderGeneratedPatch;
+
+  // Last-resort higher-order leaf replay for generated-call owners whose
+  // argument expressions have not yet been lowered into the full transducer
+  // graph above.  This is still a proof, not a preference: it is considered
+  // only for a root macro whose replacement list generates a call through a
+  // formal callee, and it accepts only a unique old->new leaf substitution that
+  // can be mapped back into exactly one root invocation argument.  This covers
+  // owner surfaces such as `F(G, A, B) -> G(A ## B)`, `G(#X)`, and repeated
+  // generated calls `G(X) G(X)` without choosing among ambiguous edits.
+  auto tryWholeCoverHigherOrderLeafRewritePatch = [&]() -> std::optional<MacroPatch> {
+    if (!m.definitionDirectiveId || !m.invB || !m.invE)
+      return std::nullopt;
+
+    const RefoldModel::MacroDirective *rootDefinition = nullptr;
+    for (const RefoldModel::MacroDirective &directive :
+         model_.GetMacroDirectives()) {
+      if (directive.id == *m.definitionDirectiveId) {
+        rootDefinition = &directive;
+        break;
+      }
+    }
+    if (!rootDefinition || rootDefinition->subkind != "#define" ||
+        !rootDefinition->functionLike || rootDefinition->defParams.empty())
+      return std::nullopt;
+
+    bool hasGeneratedCall = false;
+    const auto &rootToks = rootDefinition->replacementTokens;
+    for (size_t i = 0; i + 1 < rootToks.size(); ++i) {
+      if (rootToks[i].kind == RefoldModel::MacroReplacementTokenKind::ParamRef &&
+          rootToks[i].paramIndex &&
+          rootToks[i + 1].kind == RefoldModel::MacroReplacementTokenKind::Literal &&
+          rootToks[i + 1].spelling == "(") {
+        hasGeneratedCall = true;
+        break;
+      }
+    }
+    if (!hasGeneratedCall)
+      return std::nullopt;
+
+    auto cover = GetWholeCoverATokRange(m);
+    if (!cover || cover->first >= cover->second)
+      return std::nullopt;
+    auto bEnv = MapATokRangeAToBTokenEnvelope(cover->first, cover->second);
+    if (!bEnv || bEnv->first >= bEnv->second)
+      bEnv = MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
+          cover->first, cover->second);
+    if (!bEnv || bEnv->first >= bEnv->second)
+      return std::nullopt;
+
+    StringRef oldExpansion = SliceASource(cover->first, cover->second).trim();
+    StringRef newExpansion = SliceBSource(bEnv->first, bEnv->second).trim();
+
+    // A pure insertion that activates an inactive `__VA_OPT__` tail can sit at
+    // the right edge of the old expansion cover: the old macro produced no A
+    // token for the variadic tail, while B adds tokens immediately after the
+    // last old expansion token.  The ordinary cover envelope therefore looks
+    // unchanged.  Only for that exact right-boundary shape do we widen the
+    // replay envelope through the insertion hunk; all other boundary insertions
+    // must remain outside the macro proof and keep their TU/include owner.
+    if (oldExpansion == newExpansion && h.isInsertOnly() &&
+        h.aStart == cover->second && h.bStart == bEnv->second &&
+        h.bStart < h.bEnd) {
+      bEnv->second = static_cast<size_t>(h.bEnd);
+      newExpansion = SliceBSource(bEnv->first, bEnv->second).trim();
+    }
+
+    if (oldExpansion.empty() || newExpansion.empty() ||
+        oldExpansion == newExpansion)
+      return std::nullopt;
+
+    struct LeafTok {
+      std::string spelling;
+    };
+    auto lexLeafTokens = [&](StringRef text, SmallVectorImpl<LeafTok> &out) {
+      out.clear();
+      SmallVector<LexBoundaryToken, 32> toks;
+      lexBoundaryTokens(text, lexLang_, toks);
+      for (const LexBoundaryToken &tok : toks)
+        out.push_back(LeafTok{tok.Spelling});
+    };
+
+    auto decodeSimpleStringLiteralToken =
+        [](StringRef spelling) -> std::optional<std::string> {
+      size_t quote = spelling.find('"');
+      if (quote == StringRef::npos)
+        return std::nullopt;
+      size_t endQuote = spelling.rfind('"');
+      if (endQuote == StringRef::npos || endQuote <= quote)
+        return std::nullopt;
+      StringRef body = spelling.slice(quote + 1, endQuote);
+      std::string out;
+      out.reserve(body.size());
+      for (size_t i = 0; i < body.size(); ++i) {
+        if (body[i] != '\\') {
+          out.push_back(body[i]);
+          continue;
+        }
+        if (++i >= body.size())
+          return std::nullopt;
+        switch (body[i]) {
+        case '\\':
+        case '"':
+          out.push_back(body[i]);
+          break;
+        case 'n':
+          out.push_back('\n');
+          break;
+        case 't':
+          out.push_back('\t');
+          break;
+        default:
+          return std::nullopt;
+        }
+      }
+      return out;
+    };
+
+    auto leafValueForToken = [&](StringRef spelling) -> std::string {
+      if (std::optional<std::string> decoded =
+              decodeSimpleStringLiteralToken(spelling))
+        return *decoded;
+      return spelling.str();
+    };
+
+    auto changedMiddle = [](StringRef oldValue, StringRef newValue)
+        -> std::optional<std::pair<std::string, std::string>> {
+      size_t prefix = 0;
+      while (prefix < oldValue.size() && prefix < newValue.size() &&
+             oldValue[prefix] == newValue[prefix])
+        ++prefix;
+      size_t suffix = 0;
+      while (suffix + prefix < oldValue.size() &&
+             suffix + prefix < newValue.size() &&
+             oldValue[oldValue.size() - suffix - 1] ==
+                 newValue[newValue.size() - suffix - 1])
+        ++suffix;
+      StringRef oldMiddle = oldValue.slice(prefix, oldValue.size() - suffix);
+      StringRef newMiddle = newValue.slice(prefix, newValue.size() - suffix);
+      if (oldMiddle.empty() || newMiddle.empty())
+        return std::nullopt;
+      return std::make_pair(oldMiddle.str(), newMiddle.str());
+    };
+
+    SmallVector<LeafTok, 32> oldToks;
+    SmallVector<LeafTok, 32> newToks;
+    lexLeafTokens(oldExpansion, oldToks);
+    lexLeafTokens(newExpansion, newToks);
+    if (oldToks.empty() || newToks.empty())
+      return std::nullopt;
+
+    std::optional<std::pair<std::string, std::string>> leafRewrite;
+    if (oldToks.size() == newToks.size()) {
+      for (size_t i = 0; i < oldToks.size(); ++i) {
+        if (oldToks[i].spelling == newToks[i].spelling)
+          continue;
+        std::optional<std::pair<std::string, std::string>> changed =
+            changedMiddle(StringRef(leafValueForToken(oldToks[i].spelling)),
+                          StringRef(leafValueForToken(newToks[i].spelling)));
+        if (!changed)
+          return std::nullopt;
+        if (leafRewrite) {
+          if (leafRewrite->first != changed->first ||
+              leafRewrite->second != changed->second)
+            return std::nullopt;
+          continue;
+        }
+        leafRewrite = std::move(changed);
+      }
+
+      if (leafRewrite) {
+        // A generated-leaf rewrite edits one root invocation argument.  Such an
+        // edit is admissible only if the whole owner expansion is consistent
+        // with that single source change.  If the same solved old leaf remains
+        // unchanged somewhere else in the owner cover, then rewriting the root
+        // argument would also rewrite that occurrence.  Rejecting here prevents
+        // cases such as REGISTER_COMMAND(open), where paste/stringify/call uses
+        // become OPEN but one raw `open` occurrence intentionally stays open.
+        for (size_t i = 0; i < oldToks.size(); ++i) {
+          if (oldToks[i].spelling != newToks[i].spelling)
+            continue;
+          std::string stableValue = leafValueForToken(oldToks[i].spelling);
+          if (StringRef(stableValue) == StringRef(leafRewrite->first))
+            return std::nullopt;
+        }
+      }
+    }
+
+    // `__VA_OPT__` activation can add a new variadic root argument even though
+    // no old root argument text exists to replace.  Accept only the canonical
+    // case where the old expansion is a prefix of the new expansion and the
+    // inserted tail contains exactly one data token after fixed punctuation;
+    // the new token is inserted as the missing variadic actual.
+    const bool rootHasTrailingVariadic =
+        !rootDefinition->defParams.empty() &&
+        rootDefinition->defParams.back().variadic;
+    const bool omittedVariadicAbsent =
+        rootHasTrailingVariadic &&
+        invArgRanges.size() + 1 == rootDefinition->defParams.size();
+    const bool omittedVariadicEmptyFormal =
+        rootHasTrailingVariadic &&
+        invArgRanges.size() == rootDefinition->defParams.size() &&
+        !invArgRanges.empty() && invArgRanges.back().first == invArgRanges.back().second;
+
+    if (!leafRewrite && oldToks.size() < newToks.size() &&
+        (omittedVariadicAbsent || omittedVariadicEmptyFormal)) {
+      bool oldPrefixMatches = true;
+      for (size_t i = 0; i < oldToks.size(); ++i) {
+        if (oldToks[i].spelling != newToks[i].spelling) {
+          oldPrefixMatches = false;
+          break;
+        }
+      }
+      if (oldPrefixMatches) {
+        std::optional<std::string> insertedActual;
+        for (size_t i = oldToks.size(); i < newToks.size(); ++i) {
+          StringRef spelling(newToks[i].spelling);
+          const std::string decoded = leafValueForToken(spelling);
+          // `__VA_OPT__` often contributes fixed separators before the actual
+          // data token.  The separator may be punctuation (`,`) or a string
+          // literal separator (`":"`); both are part of the replacement-list
+          // context, not the variadic actual to insert at the root callsite.
+          if (spelling == ":" || spelling == "," ||
+              StringRef(decoded) == ":" || StringRef(decoded) == ",")
+            continue;
+          if (insertedActual)
+            return std::nullopt;
+          insertedActual = spelling.str();
+        }
+        if (insertedActual) {
+          size_t close = baseInvText.rfind(')');
+          if (close == StringRef::npos)
+            return std::nullopt;
+          std::string rewritten = baseInvText.slice(0, close).str();
+          rewritten += ", ";
+          rewritten += *insertedActual;
+          rewritten += baseInvText.substr(close).str();
+
+          MacroPatch patch{*m.invB, *m.invE, std::move(rewritten), m.id};
+          patch.hasMaterializedOutputByteRange = true;
+          patch.materializedOutputByteStart = close;
+          patch.materializedOutputByteEnd = close + 2 + insertedActual->size();
+          stampMacroPatchMaterializedBTokenRange(
+              patch, static_cast<uint64_t>(bEnv->first),
+              static_cast<uint64_t>(bEnv->second));
+          StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyStandard,
+                               /*validated=*/true,
+                               /*structurePreserving=*/true, m.id);
+          return patch;
+        }
+      }
+    }
+
+    if (!leafRewrite)
+      return std::nullopt;
+
+    const std::string &oldLeaf = leafRewrite->first;
+    const std::string &newLeaf = leafRewrite->second;
+    std::optional<uint32_t> targetArgIdx;
+    std::optional<std::string> targetReplacement;
+    for (uint32_t argIdx = 0; argIdx < invArgRanges.size(); ++argIdx) {
+      auto r = invArgRanges[argIdx];
+      if (r.second < r.first || r.second > baseInvText.size())
+        return std::nullopt;
+      StringRef argText = baseInvText.slice(r.first, r.second);
+      size_t pos = argText.find(oldLeaf);
+      if (pos == StringRef::npos)
+        continue;
+      if (argText.find(oldLeaf, pos + oldLeaf.size()) != StringRef::npos)
+        return std::nullopt;
+      if (targetArgIdx)
+        return std::nullopt;
+      std::string rewrittenArg = stringutils::replaceRange(
+          argText.str(), pos, pos + oldLeaf.size(), StringRef(newLeaf));
+      if (!isVariadicFormal(argIdx) && hasTopLevelComma(rewrittenArg))
+        return std::nullopt;
+      targetArgIdx = argIdx;
+      targetReplacement = std::move(rewrittenArg);
+    }
+    if (!targetArgIdx || !targetReplacement)
+      return std::nullopt;
+
+    DenseMap<uint32_t, std::string> replByArgIdx;
+    replByArgIdx[*targetArgIdx] = *targetReplacement;
+    std::optional<InvocationRewriteWithRange> rewrite =
+        buildInvocationRewriteWithRange(replByArgIdx);
+    if (!rewrite)
+      return std::nullopt;
+
+    trace("macro/higher-order",
+          "whole-cover generated leaf rewrite SUCCESS root id={0} name={1} "
+          "oldLeaf='{2}' newLeaf='{3}' newInv='{4}'",
+          m.id, m.name, oldLeaf, newLeaf,
+          stringutils::showWsWithClip(rewrite->text, 240));
+
+    MacroPatch patch{*m.invB, *m.invE, std::move(rewrite->text), m.id};
+    stampMacroPatchMaterializedOutputRange(patch, *rewrite);
+    stampMacroPatchMaterializedBTokenRange(
+        patch, static_cast<uint64_t>(bEnv->first),
+        static_cast<uint64_t>(bEnv->second));
+    StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyStandard,
+                         /*validated=*/true,
+                         /*structurePreserving=*/true, m.id);
+    return patch;
+  };
+
+  if (auto higherOrderLeafPatch =
+          tryWholeCoverHigherOrderLeafRewritePatch())
+    return higherOrderLeafPatch;
 
   // Some tuple-generated callees expose the edited token only through a
   // nested child macro surface, so the root wrapper can have no standard
