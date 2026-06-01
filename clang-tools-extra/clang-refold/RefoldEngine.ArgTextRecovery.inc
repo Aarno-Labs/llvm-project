@@ -59,12 +59,12 @@ RefoldEngine::UnstringifyLiteralToArgText(StringRef literalTok,
     out.push_back(c);
   }
 
-  // Safety check: only a *top-level* comma would split a macro argument into
-  // multiple arguments when we synthesize invocation text. Nested commas inside
-  // parentheses, brackets, or braces are still a single argument and must be
-  // preserved (for example: CAT(bill, z)). Allow callers that are only
-  // normalizing for comparison (not re-synthesizing invocation text) to opt
-  // out.
+  // Safety check: only commas inside nested parentheses remain inside one
+  // function-like macro actual when we synthesize invocation text. Brackets and
+  // braces are ordinary preprocessing tokens for argument collection, so a
+  // comma in `arr[1, 2]` or `{1, 2}` would still split the call-site argument
+  // list. Allow callers that are only normalizing for comparison (not
+  // re-synthesizing invocation text) to opt out.
   if (!allowTopLevelComma) {
     const SourceLocation BaseLoc = SourceLocation::getFromRawEncoding(1);
     std::string LexBuf = out;
@@ -74,8 +74,6 @@ RefoldEngine::UnstringifyLiteralToArgText(StringRef literalTok,
     Lexer Lex(BaseLoc, lexLang_, BufStart, BufStart, BufEnd);
 
     int ParenDepth = 0;
-    int BracketDepth = 0;
-    int BraceDepth = 0;
     Token Tok;
 
     while (true) {
@@ -93,22 +91,8 @@ RefoldEngine::UnstringifyLiteralToArgText(StringRef literalTok,
         if (ParenDepth > 0)
           --ParenDepth;
         break;
-      case tok::l_square:
-        ++BracketDepth;
-        break;
-      case tok::r_square:
-        if (BracketDepth > 0)
-          --BracketDepth;
-        break;
-      case tok::l_brace:
-        ++BraceDepth;
-        break;
-      case tok::r_brace:
-        if (BraceDepth > 0)
-          --BraceDepth;
-        break;
       case tok::comma:
-        if (ParenDepth == 0 && BracketDepth == 0 && BraceDepth == 0)
+        if (ParenDepth == 0)
           return std::nullopt;
         break;
       default:
@@ -143,7 +127,14 @@ RefoldEngine::ParseMacroInvocationArgContentRanges(StringRef invText) {
   if (firstTok < n && invText[firstTok] == ')')
     return out;
 
-  uint32_t depth = 0; // Track nested parentheses, brackets, or braces.
+  // Macro argument collection is governed by parenthesis nesting only.  A comma
+  // separates arguments unless it is inside a nested parenthesized token group;
+  // brackets and braces are ordinary preprocessing tokens for this purpose.
+  // This is deliberately different from C expression/list splitting helpers,
+  // where `{...}` and `[...]` may form balanced subexpressions.  For example,
+  // `M(arr[1, 2], 3)` supplies three macro arguments (`arr[1`, `2]`, `3`),
+  // while `M((1, 2), 3)` supplies two.
+  uint32_t parenDepth = 0;
   bool inS = false;   // Inside a single-quoted character literal.
   bool inD = false;   // Inside a double-quoted string literal.
 
@@ -183,26 +174,45 @@ RefoldEngine::ParseMacroInvocationArgContentRanges(StringRef invText) {
       continue;
     }
 
-    // Increment depth for nested groups; commas inside these do not
-    // separate macro arguments.
-    if (c == '(' || c == '[' || c == '{') {
-      depth++;
+    // Comments are opaque preprocessing tokens.  Delimiters and commas inside
+    // them must not affect macro-argument boundaries.
+    if (c == '/' && i + 1 < n) {
+      if (invText[i + 1] == '*') {
+        const size_t close = invText.find("*/", i + 2);
+        if (close == StringRef::npos)
+          return std::nullopt;
+        i = close + 1;
+        continue;
+      }
+      if (invText[i + 1] == '/') {
+        const size_t nl = invText.find('\n', i + 2);
+        if (nl == StringRef::npos)
+          return std::nullopt;
+        i = nl;
+        continue;
+      }
+    }
+
+    // Only nested parentheses protect commas during macro-argument
+    // collection.  Braces and brackets intentionally do not participate here.
+    if (c == '(') {
+      parenDepth++;
       continue;
     }
 
     // Handle the closing of a group or the entire argument list.
     if (c == ')') {
-      if (depth == 0) {
+      if (parenDepth == 0) {
         // Final argument reached at the closing parenthesis of the call.
         out.push_back(stringutils::trimWsRange(invText, argStart, i));
         return out;
       }
-      depth--;
+      parenDepth--;
       continue;
     }
 
     // A comma at depth 0 signifies the end of one macro argument.
-    if (c == ',' && depth == 0) {
+    if (c == ',' && parenDepth == 0) {
       out.push_back(stringutils::trimWsRange(invText, argStart, i));
       argStart = i + 1;
     }

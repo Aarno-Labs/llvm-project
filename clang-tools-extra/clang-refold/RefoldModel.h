@@ -488,6 +488,10 @@ public:
     /// without reparsing raw directive text in the consumer.
     StringRef name;
     StringRef text;
+    /// True iff this #define was function-like in Clang's MacroInfo.
+    /// This is producer-owned macro-state shape data; consumers use it instead
+    /// of reparsing directive text to distinguish NAME from NAME(...).
+    bool functionLike = false;
     StringRef sitePath;
     uint64_t siteB;
     uint64_t siteE;

@@ -84,7 +84,8 @@
 //       - site_path and directive byte range [site_b, site_e) (nullable bounds)
 //       - spans[]: A-token spans this directive contributed to (may be empty)
 //       - optional owner_include_id to disambiguate repeated header instances
-//       - optional #define replay proof data: def_params and replacement_tokens
+//       - function_like for #define shape, plus optional #define replay proof
+//         data: def_params and replacement_tokens
 //
 // * DirectivePragmaItem
 //     A #pragma line with exact text and location (site_path, [site_b, site_e))
@@ -1100,6 +1101,10 @@ static constexpr const char *RefoldSchema = R"json(
           "minLength": 1,
           "description": "Exact directive text (e.g., '#define FOO ...')."
         },
+        "function_like": {
+          "type": "boolean",
+          "description": "For #define directives, true iff the active MacroInfo was function-like. This producer-owned shape bit lets consumers distinguish object-like from function-like macro-state observations without reparsing directive text. Omitted for #undef."
+        },
         "spans": {
           "type": "array",
           "items": {
@@ -1148,6 +1153,32 @@ static constexpr const char *RefoldSchema = R"json(
           "description": "Producer-owned replay tape for the macro replacement list, in definition order. Parameter references point at def_params by param_index; other tokens are fixed literal spellings."
         }
       },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "subkind": {
+                "const": "#define"
+              }
+            },
+            "required": [
+              "subkind"
+            ]
+          },
+          "then": {
+            "required": [
+              "function_like"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "function_like"
+              ]
+            }
+          }
+        }
+      ],
       "description": "Represents #define/#undef lines (definitions), not invocation sites."
     },
     "DirectivePragmaItem": {

@@ -1210,6 +1210,125 @@ private:
   std::string SliceBSourceClippedAgainstClaims(size_t bTokStart,
                                                size_t bTokEnd) const;
 
+  /// True iff \p text contains \p name as a preprocessing identifier token.
+  ///
+  /// This is the shared macro-state observation predicate for object-like
+  /// definitions and #undef transitions.  It intentionally lexes arbitrary
+  /// replacement/source text because that text is not fully represented by the
+  /// producer map once users edit B.
+  bool RawIdentifierAppearsInText(StringRef name, StringRef text) const;
+
+  /// Return the byte offset of the first identifier-token observation of
+  /// \p name in \p text, if any.
+  std::optional<size_t> FirstRawIdentifierObservationOffsetInText(
+      StringRef name, StringRef text) const;
+
+  /// True iff \p text contains a function-like macro observation of \p name.
+  ///
+  /// \p suffix is lexed after \p text so callers can prove NAME followed by `(`
+  /// across a replacement/source boundary while still returning observations only
+  /// whose NAME token starts in \p text.
+  bool FunctionLikeInvocationAppearsInText(StringRef name, StringRef text,
+                                           StringRef suffix = StringRef()) const;
+
+  /// Return the byte offset of the NAME token that starts the first function-like
+  /// invocation observation in \p text, if any.  The following `(` may be in
+  /// \p text or in \p suffix.
+  std::optional<size_t> FirstFunctionLikeInvocationOffsetInText(
+      StringRef name, StringRef text, StringRef suffix = StringRef()) const;
+
+  /// Macro-state observation mode for a moved or preserved #define/#undef.
+  ///
+  /// Object-like definitions and #undef transitions are observed by any real
+  /// preprocessing identifier token with the macro name.  Function-like
+  /// definitions are observed only by NAME followed by `(` as preprocessing
+  /// tokens.  This shared proof primitive replaces the repeated local enums
+  /// previously spread across TU carry, header materialization, include edits,
+  /// and unresolved-expansion fallback.
+  enum class MacroStateObservationKind {
+    IdentifierToken,
+    FunctionLikeInvocation,
+  };
+
+  /// Return the observation mode for \p directive when it controls \p macroName.
+  MacroStateObservationKind MacroStateObservationKindForDirective(
+      const RefoldModel::MacroDirective &directive,
+      StringRef macroName) const;
+
+  /// Return the first token offset in \p text that would observe \p directive,
+  /// or std::nullopt if the bytes cannot observe that macro-state transition.
+  std::optional<size_t> FirstMacroStateObservationOffsetInText(
+      const RefoldModel::MacroDirective &directive, StringRef macroName,
+      StringRef text, StringRef suffix = StringRef()) const;
+
+  /// True iff \p replacement can observe a macro-state directive if that
+  /// directive is active before the replacement payload.  Malformed producer
+  /// proof data is handled by \p unprovenObserves so callers can remain
+  /// fail-closed in their own proof domain.
+  bool ReplacementObservesMacroStateDirective(
+      const RefoldModel::MacroDirective &directive, StringRef replacement,
+      bool unprovenObserves) const;
+
+  /// True iff \p text contains a preprocessing directive line.  Macro-state
+  /// carry proofs treat such chunks as observable side-effect hazards unless a
+  /// more specific proof class owns the intervening directive.
+  bool TextContainsDirectiveLine(StringRef text) const;
+
+  /// True iff moving \p directive across \p chunk could change how those
+  /// original source bytes preprocess.  Ordinary text is checked by macro-name
+  /// observation; directive lines are conservative side-effect hazards.
+  bool SourceChunkObservesMacroStateDirectiveWhenCrossed(
+      const RefoldModel::MacroDirective &directive, StringRef macroName,
+      StringRef chunk, StringRef following = StringRef()) const;
+
+  /// Exact source-line interval for a producer-recorded macro-state directive.
+  ///
+  /// MacroDirective::siteB is anchored at the macro name, not necessarily at the
+  /// beginning of the physical directive line.  This witness records the
+  /// validated full-line interval recovered from the recorded directive text.
+  struct MacroStateDirectiveLineInterval {
+    const RefoldModel::MacroDirective *directive = nullptr;
+    uint64_t begin = 0;
+    uint64_t end = 0;
+    StringRef name;
+  };
+
+  /// Recover and byte-verify the complete physical source line for a recorded
+  /// #define/#undef directive in \p fileBytes.
+  ///
+  /// The helper is the single owner for the repeated proof used by TU carry,
+  /// header materialization, include edits, expansion fallback, and replay
+  /// stability: the directive must match \p expectedPath, match the requested
+  /// include-owner instance, have a producer-recorded macro name, and its
+  /// reconstructed full-line bytes must exactly equal MacroDirective::text.
+  std::optional<MacroStateDirectiveLineInterval>
+  RecoverMacroStateDirectiveLineInterval(
+      const RefoldModel::MacroDirective &directive, StringRef expectedPath,
+      StringRef fileBytes, std::optional<uint64_t> requiredOwnerIncludeId) const;
+
+  /// File-byte interval for the replacement list of the #define that created a
+  /// recorded macro invocation.
+  ///
+  /// The interval is expressed both in directive-text coordinates and in source
+  /// file coordinates.  Source-neutral macro-gap proofs use this to tile only
+  /// the replacement-list body while still translating nested callsite byte
+  /// ranges back through the producer's macro-name source anchor.
+  struct MacroDefinitionReplacementListInterval {
+    const RefoldModel::MacroDirective *directive = nullptr;
+    size_t nameTextBegin = 0;
+    size_t replacementTextBegin = 0;
+    uint64_t fileBase = 0;
+    uint64_t fileBegin = 0;
+    uint64_t fileEnd = 0;
+  };
+
+  /// Recover the source interval for the replacement list of the #define used
+  /// by \p invocation, if the defining directive and invocation shape are
+  /// producer-proven and byte-coordinate translation is well-formed.
+  std::optional<MacroDefinitionReplacementListInterval>
+  RecoverMacroDefinitionReplacementListInterval(
+      const RefoldModel::MacroInvocation &invocation) const;
+
   // Macro invocation graph (derived from RefoldModel) used for structural
   // queries over recorded callerMacroId relationships.
   DenseMap<uint64_t, SmallVector<const RefoldModel::MacroInvocation *, 4>>
@@ -4091,15 +4210,16 @@ private:
   /// \brief Parses the raw text of a function-like macro invocation to identify
   /// the byte ranges of its individual arguments.
   ///
-  /// This method performs a shallow, brace-aware scan of the invocation text
-  /// starting from the opening parenthesis. It correctly handles nested
-  /// parentheses, brackets, and braces, ensuring that commas within nested
-  /// expressions (like function calls or initializer lists) do not prematurely
-  /// terminate an argument.
+  /// This method performs a shallow scan of the invocation text starting from
+  /// the opening parenthesis. It follows macro-argument collection rules rather
+  /// than C expression/list splitting rules: only nested parentheses protect a
+  /// comma from separating arguments. Brackets and braces are ordinary
+  /// preprocessing tokens here, so `M(arr[1, 2], 3)` is parsed as three macro
+  /// arguments while `M((1, 2), 3)` is parsed as two.
   ///
-  /// The parser is also string- and character-literal aware; it skips over
-  /// escaped characters and delimiters within quotes to avoid misinterpreting
-  /// structural C characters as macro argument separators.
+  /// The parser is also comment-, string-, and character-literal aware; it
+  /// skips over escaped characters and delimiters inside opaque tokens to avoid
+  /// misinterpreting their text as macro argument separators.
   ///
   /// \param invText The full source text of the macro invocation
   ///                (e.g., "MY_MACRO(a, f(b, c))").

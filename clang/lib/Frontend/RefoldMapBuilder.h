@@ -212,6 +212,11 @@ struct Item {
   ItemKind Kind = IK_File;
   std::string Subkind; // "#include", "#define", ...
   std::string Name;    // macro invocation or directive macro name
+  // For #define directive items, records MacroInfo::isFunctionLike() directly
+  // so consumers can distinguish object-like and function-like macro state
+  // without reparsing raw directive text.  It is false for #undef and non-macro
+  // directives.
+  bool FunctionLikeDefinition = false;
   std::string Text;    // directive text
   std::string InvText; // macro call text
   std::string InvFile; // file containing the macro invocation

@@ -2512,334 +2512,30 @@ void RefoldEngine::MaterializeIncludeExpansion(
   //
   // This makes replay stability a property of owner materialization itself,
   // rather than a special case of the test that motivated it.
-  struct MaterializedHeaderMacroStateDirectivePiece {
-    // Original macro directive metadata.  This pointer is stable because it
-    // refers into the RefoldModel directive table.
-    const RefoldModel::MacroDirective *directive = nullptr;
+  using MaterializedHeaderMacroStateDirectivePiece = MacroStateDirectiveLineInterval;
 
-    // Exact byte interval of the full directive line in the materialized
-    // header source buffer.
-    uint64_t begin = 0;
-    uint64_t end = 0;
-
-    // Macro identifier controlled by this #define/#undef.  Keeping this with
-    // the interval avoids reparsing directive text during active-state walks.
-    std::string name;
-  };
-
-  // Observation mode for a carried macro-state directive.
-  //
-  // Object-like definitions and #undefs are observed by the macro identifier as
-  // a standalone preprocessing token.  Function-like definitions are observed
-  // only by a NAME immediately followed by '(' as preprocessing tokens; a raw
-  // substring or a whitespace-separated "NAME (" is not the same macro call.
-  enum class MaterializedHeaderMacroObservationKind {
-    IdentifierToken,
-    FunctionLikeInvocation,
-  };
-
-  // Determine whether this directive should be tested as an object-like
-  // identifier observation or as a function-like invocation observation.  The
-  // spelling is re-read from the recorded directive text so the proof follows
-  // C preprocessing syntax instead of a heuristic name search.
-  auto materializedHeaderMacroObservationKindForDirective =
-      [&](const RefoldModel::MacroDirective &directive, StringRef macroName) {
-        if (directive.subkind != "#define")
-          return MaterializedHeaderMacroObservationKind::IdentifierToken;
-
-        StringRef text = directive.text;
-        size_t pos = 0;
-        stringutils::skipNonNewlineWs(text, pos);
-        if (pos >= text.size() || text[pos] != '#')
-          return MaterializedHeaderMacroObservationKind::IdentifierToken;
-        ++pos;
-        stringutils::skipNonNewlineWs(text, pos);
-
-        StringRef keyword = "define";
-        if (!text.substr(pos).starts_with(keyword))
-          return MaterializedHeaderMacroObservationKind::IdentifierToken;
-        pos += keyword.size();
-        if (pos < text.size() && stringutils::isIdentPart(text[pos]))
-          return MaterializedHeaderMacroObservationKind::IdentifierToken;
-        stringutils::skipNonNewlineWs(text, pos);
-
-        const size_t nameBegin = pos;
-        if (pos >= text.size() || !stringutils::isIdentStart(text[pos]))
-          return MaterializedHeaderMacroObservationKind::IdentifierToken;
-        ++pos;
-        while (pos < text.size() && stringutils::isIdentPart(text[pos]))
-          ++pos;
-        if (text.slice(nameBegin, pos) != macroName)
-          return MaterializedHeaderMacroObservationKind::IdentifierToken;
-
-        // Function-like #defines are observed only by a real NAME(...) token
-        // sequence. Whitespace between NAME and '(' means object-like #define.
-        if (pos < text.size() && text[pos] == '(')
-          return MaterializedHeaderMacroObservationKind::FunctionLikeInvocation;
-        return MaterializedHeaderMacroObservationKind::IdentifierToken;
-      };
-
-  // Return true iff `name` appears as an identifier preprocessing token in
-  // `text`.  This uses Clang's raw lexer so comments, substrings, string
-  // literals, and adjacent identifier characters do not produce false macro
-  // observations.
-  auto rawIdentifierAppearsInMaterializedHeaderText = [&](StringRef name,
-                                                         StringRef text) {
-    if (name.empty() || text.empty())
-      return false;
-
-    const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
-    std::string lexBuf = text.str();
-    lexBuf.push_back('\0');
-
-    const char *bufStart = lexBuf.data();
-    const char *bufEnd = bufStart + text.size();
-    Lexer lexer(baseLoc, lexLang_, bufStart, bufStart, bufEnd);
-    lexer.SetCommentRetentionState(true);
-
-    Token token;
-    while (true) {
-      lexer.LexFromRawLexer(token);
-      if (token.is(tok::eof))
-        return false;
-      if (token.is(tok::comment))
-        continue;
-      if (!token.is(tok::raw_identifier) && !token.is(tok::identifier))
-        continue;
-
-      const size_t localBegin = tokenOffsetFromBase(token, baseLoc);
-      const size_t localEnd = tokenEndOffsetFromBase(token, baseLoc);
-      if (localEnd < localBegin || localEnd > text.size())
-        continue;
-      if (text.slice(localBegin, localEnd) == name)
-        return true;
-    }
-  };
-
-  // Return true iff `text` contains a token-level function-like macro call
-  // NAME(.  The pending-name state records that the previous non-comment token
-  // was exactly `name`; only an immediately following l_paren token observes a
-  // function-like definition.
-  auto functionLikeInvocationAppearsInMaterializedHeaderText =
-      [&](StringRef name, StringRef text) {
-        if (name.empty() || text.empty())
-          return false;
-
-        const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
-        std::string lexBuf = text.str();
-        lexBuf.push_back('\0');
-
-        const char *bufStart = lexBuf.data();
-        const char *bufEnd = bufStart + text.size();
-        Lexer lexer(baseLoc, lexLang_, bufStart, bufStart, bufEnd);
-        lexer.SetCommentRetentionState(true);
-
-        bool pendingName = false;
-        Token token;
-        while (true) {
-          lexer.LexFromRawLexer(token);
-          if (token.is(tok::eof))
-            return false;
-          if (token.is(tok::comment))
-            continue;
-
-          if (pendingName) {
-            if (token.is(tok::l_paren))
-              return true;
-            pendingName = false;
-          }
-
-          if (!token.is(tok::raw_identifier) && !token.is(tok::identifier))
-            continue;
-
-          const size_t localBegin = tokenOffsetFromBase(token, baseLoc);
-          const size_t localEnd = tokenEndOffsetFromBase(token, baseLoc);
-          if (localEnd < localBegin || localEnd > text.size())
-            continue;
-          pendingName = text.slice(localBegin, localEnd) == name;
-        }
-      };
-
-  // Decide whether a candidate B replacement would observe a macro-state
-  // directive if replayed before that directive is carried.  `unparseableObserves`
-  // lets callers choose the conservative policy for directives outside this
-  // proof's grammar: discovery may ignore unparseable directives, while a
-  // movement proof must treat them as observing and fail closed.
   auto materializedHeaderReplacementObservesMacroStateDirective =
       [&](const RefoldModel::MacroDirective &directive, StringRef replacement,
           bool unparseableObserves) {
-        if (directive.name.empty())
-          return unparseableObserves;
-
-        switch (materializedHeaderMacroObservationKindForDirective(
-            directive, directive.name)) {
-        case MaterializedHeaderMacroObservationKind::IdentifierToken:
-          return rawIdentifierAppearsInMaterializedHeaderText(directive.name,
-                                                             replacement);
-        case MaterializedHeaderMacroObservationKind::FunctionLikeInvocation:
-          return functionLikeInvocationAppearsInMaterializedHeaderText(
-              directive.name, replacement);
-        }
-        return true;
+        return ReplacementObservesMacroStateDirective(directive, replacement,
+                                                     unparseableObserves);
       };
 
   // Convert a recorded macro directive back to its exact interval in the
-  // materialized header buffer for this include owner.  The model records the
-  // byte of the macro name (`siteB`), not necessarily the start of the line, so
-  // the start is reconstructed from the parsed name offset and then validated
-  // against the actual header bytes.  Without this exact-text validation we
-  // would risk moving the wrong source interval.
+  // materialized header buffer for this include owner. The shared helper owns
+  // the macro-name-anchor reconstruction and exact-byte validation.
   auto materializedHeaderMacroStateDirectiveInterval =
-      [&](const RefoldModel::MacroDirective &directive)
-          -> std::optional<MaterializedHeaderMacroStateDirectivePiece> {
-    if (!PathsEqual(directive.sitePath, headerPath))
-      return std::nullopt;
-    if (!directive.ownerIncludeId || *directive.ownerIncludeId != includeId)
-      return std::nullopt;
-    if (directive.subkind != "#define" && directive.subkind != "#undef")
-      return std::nullopt;
-
-    if (directive.name.empty())
-      return std::nullopt;
-
-    StringRef text = directive.text;
-    size_t pos = 0;
-    stringutils::skipNonNewlineWs(text, pos);
-    if (pos >= text.size() || text[pos] != '#')
-      return std::nullopt;
-    ++pos;
-    stringutils::skipNonNewlineWs(text, pos);
-
-    StringRef keyword = directive.subkind.drop_front();
-    if (!text.substr(pos).starts_with(keyword))
-      return std::nullopt;
-    pos += keyword.size();
-    if (pos < text.size() && stringutils::isIdentPart(text[pos]))
-      return std::nullopt;
-    stringutils::skipNonNewlineWs(text, pos);
-
-    const size_t nameTextBegin = pos;
-    if (pos >= text.size() || !stringutils::isIdentStart(text[pos]))
-      return std::nullopt;
-    ++pos;
-    while (pos < text.size() && stringutils::isIdentPart(text[pos]))
-      ++pos;
-
-    if (directive.siteB < nameTextBegin)
-      return std::nullopt;
-
-    const uint64_t fileBegin = directive.siteB - nameTextBegin;
-    const uint64_t fileEnd = fileBegin + text.size();
-    if (fileBegin >= fileEnd || fileEnd > bytes.size())
-      return std::nullopt;
-    if (StringRef(bytes).slice(fileBegin, fileEnd) != text)
-      return std::nullopt;
-
-    MaterializedHeaderMacroStateDirectivePiece piece;
-    piece.directive = &directive;
-    piece.begin = fileBegin;
-    piece.end = fileEnd;
-    piece.name = directive.name.str();
-    return piece;
-  };
-
-  // Any directive line in crossed source is treated as observing state.  The
-  // repair proof only understands movement of the selected macro-state lines;
-  // crossing arbitrary directives could affect include lookup, macro state,
-  // pragma state, or line-control state, so it is outside this proof class.
-  auto materializedHeaderTextContainsDirectiveLine = [](StringRef text) {
-    bool atLineStart = true;
-    bool onlyHorizontalWsOnLine = true;
-    for (char c : text) {
-      if (atLineStart) {
-        atLineStart = false;
-        onlyHorizontalWsOnLine = true;
-      }
-      if (c == '\n') {
-        atLineStart = true;
-        onlyHorizontalWsOnLine = true;
-        continue;
-      }
-      if (onlyHorizontalWsOnLine && stringutils::isNonNewlineWs(c))
-        continue;
-      if (onlyHorizontalWsOnLine && c == '#')
-        return true;
-      onlyHorizontalWsOnLine = false;
-    }
-    return false;
-  };
-
-  // Test a crossed source chunk for a function-like observation whose name
-  // token starts in `chunk`.  `following` is appended only so a NAME at the end
-  // of the crossed chunk can still be proven to observe a following '(' token;
-  // matches whose name token begins outside `chunk` are deliberately ignored.
-  auto functionLikeInvocationStartsInMaterializedHeaderChunk =
-      [&](StringRef name, StringRef chunk, StringRef following) {
-        if (name.empty() || chunk.empty())
-          return false;
-
-        const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
-        std::string lexBuf;
-        lexBuf.reserve(chunk.size() + following.size() + 1);
-        lexBuf.append(chunk.begin(), chunk.end());
-        lexBuf.append(following.begin(), following.end());
-        lexBuf.push_back('\0');
-
-        const char *bufStart = lexBuf.data();
-        const char *bufEnd = bufStart + chunk.size() + following.size();
-        Lexer lexer(baseLoc, lexLang_, bufStart, bufStart, bufEnd);
-        lexer.SetCommentRetentionState(true);
-
-        bool pendingChunkName = false;
-        Token token;
-        while (true) {
-          lexer.LexFromRawLexer(token);
-          if (token.is(tok::eof))
-            return false;
-          if (token.is(tok::comment))
-            continue;
-
-          if (pendingChunkName) {
-            if (token.is(tok::l_paren))
-              return true;
-            pendingChunkName = false;
-          }
-
-          if (!token.is(tok::raw_identifier) && !token.is(tok::identifier))
-            continue;
-
-          const size_t localBegin = tokenOffsetFromBase(token, baseLoc);
-          const size_t localEnd = tokenEndOffsetFromBase(token, baseLoc);
-          if (localEnd < localBegin || localEnd > chunk.size())
-            continue;
-
-          pendingChunkName =
-              StringRef(lexBuf).slice(localBegin, localEnd) == name;
-        }
+      [&](const RefoldModel::MacroDirective &directive) {
+        return RecoverMacroStateDirectiveLineInterval(
+            directive, headerPath, StringRef(bytes),
+            std::optional<uint64_t>(includeId));
       };
 
-  // Prove whether bytes crossed by a carried definition are non-observing.
-  // If the crossed chunk contains the macro observation form for the definition
-  // being moved, then delaying the definition would change preprocessing and is
-  // rejected.  Directive lines are also rejected because their side effects are
-  // not modeled by this macro-state proof.
   auto materializedHeaderSourceChunkObservesDefinitionWhenCrossed =
       [&](const RefoldModel::MacroDirective &definition, StringRef macroName,
           StringRef chunk, StringRef following) {
-        if (chunk.empty())
-          return false;
-        if (materializedHeaderTextContainsDirectiveLine(chunk))
-          return true;
-
-        switch (materializedHeaderMacroObservationKindForDirective(definition,
-                                                                   macroName)) {
-        case MaterializedHeaderMacroObservationKind::IdentifierToken:
-          return rawIdentifierAppearsInMaterializedHeaderText(macroName, chunk);
-        case MaterializedHeaderMacroObservationKind::FunctionLikeInvocation:
-          return functionLikeInvocationStartsInMaterializedHeaderChunk(
-              macroName, chunk, following);
-        }
-        return true;
+        return SourceChunkObservesMacroStateDirectiveWhenCrossed(
+            definition, macroName, chunk, following);
       };
 
   // Reconstruct the active definition for `macroName` immediately before a
@@ -3645,12 +3341,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
   // remain stable as we mutate the StringBuilder.
   IncludeTextEditPlan plan;
 
-  struct HeaderMacroStateDirectivePiece {
-    const RefoldModel::MacroDirective *directive = nullptr;
-    uint64_t begin = 0;
-    uint64_t end = 0;
-    std::string name;
-  };
+  using HeaderMacroStateDirectivePiece = MacroStateDirectiveLineInterval;
 
   struct HeaderPreservedGapPiece {
     enum class Kind {
@@ -3668,227 +3359,22 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     uint64_t id = 0;
   };
 
-  enum class HeaderMacroReplacementObservationKind {
-    IdentifierToken,
-    FunctionLikeInvocation,
-  };
-
-  // Return the observation shape for a header-owned macro-state directive.
-  // This mirrors the TU macro-liveness proof: object-like definitions and
-  // #undef transitions are conservatively observed by an identifier token,
-  // while function-like #defines are observed only by an actual invocation.
-  auto headerMacroObservationKindForDirective =
-      [&](const RefoldModel::MacroDirective &directive, StringRef macroName) {
-        if (directive.subkind != "#define")
-          return HeaderMacroReplacementObservationKind::IdentifierToken;
-
-        StringRef text = directive.text;
-        size_t pos = 0;
-        stringutils::skipNonNewlineWs(text, pos);
-        if (pos >= text.size() || text[pos] != '#')
-          return HeaderMacroReplacementObservationKind::IdentifierToken;
-        ++pos;
-        stringutils::skipNonNewlineWs(text, pos);
-
-        StringRef keyword = "define";
-        if (!text.substr(pos).starts_with(keyword))
-          return HeaderMacroReplacementObservationKind::IdentifierToken;
-        pos += keyword.size();
-        if (pos < text.size() && stringutils::isIdentPart(text[pos]))
-          return HeaderMacroReplacementObservationKind::IdentifierToken;
-        stringutils::skipNonNewlineWs(text, pos);
-
-        const size_t nameBegin = pos;
-        if (pos >= text.size() || !stringutils::isIdentStart(text[pos]))
-          return HeaderMacroReplacementObservationKind::IdentifierToken;
-        ++pos;
-        while (pos < text.size() && stringutils::isIdentPart(text[pos]))
-          ++pos;
-
-        if (text.slice(nameBegin, pos) != macroName)
-          return HeaderMacroReplacementObservationKind::IdentifierToken;
-
-        // Function-like macro definitions require byte-adjacent `(` after the
-        // macro name. Whitespace/comments mean the #define is object-like, so
-        // fall back to identifier-token observation in that case.
-        if (pos < text.size() && text[pos] == '(')
-          return HeaderMacroReplacementObservationKind::FunctionLikeInvocation;
-
-        return HeaderMacroReplacementObservationKind::IdentifierToken;
-      };
-
-  // Return true if `text` contains `name` as a real raw identifier token.  This
-  // is the observation predicate for object-like macro-state effects.
-  auto rawIdentifierAppearsInHeaderReplacement = [&](StringRef name,
-                                                     StringRef text) {
-    if (name.empty() || text.empty())
-      return false;
-
-    // Use Clang's raw lexer rather than substring matching so comments,
-    // literals, and identifier substrings do not falsely count as macro uses.
-    const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
-    std::string lexBuf = text.str();
-    lexBuf.push_back('\0');
-
-    const char *bufStart = lexBuf.data();
-    const char *bufEnd = bufStart + text.size();
-    Lexer lexer(baseLoc, lexLang_, bufStart, bufStart, bufEnd);
-    lexer.SetCommentRetentionState(true);
-
-    Token token;
-    while (true) {
-      lexer.LexFromRawLexer(token);
-      if (token.is(tok::eof))
-        return false;
-      if (token.is(tok::comment))
-        continue;
-      if (!token.is(tok::raw_identifier) && !token.is(tok::identifier))
-        continue;
-
-      // Compare the original replacement slice for the token.  The lexer token
-      // kind tells us this is an identifier; the slice check proves it is the
-      // specific macro name whose state would be reintroduced.
-      const size_t localBegin = tokenOffsetFromBase(token, baseLoc);
-      const size_t localEnd = tokenEndOffsetFromBase(token, baseLoc);
-      if (localEnd < localBegin || localEnd > text.size())
-        continue;
-      if (text.slice(localBegin, localEnd) == name)
-        return true;
-    }
-  };
-
-  // Return true if `replacement` contains a real function-like invocation of
-  // `name`. A bare occurrence of a function-like macro name is not an
-  // observation of the macro definition, so it must not block preservation.
-  auto functionLikeInvocationAppearsInHeaderReplacement =
-      [&](StringRef name, StringRef replacement) {
-        if (name.empty() || replacement.empty())
-          return false;
-
-        const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
-        std::string lexBuf = replacement.str();
-        lexBuf.push_back('\0');
-
-        const char *bufStart = lexBuf.data();
-        const char *bufEnd = bufStart + replacement.size();
-        Lexer lexer(baseLoc, lexLang_, bufStart, bufStart, bufEnd);
-        lexer.SetCommentRetentionState(true);
-
-        bool pendingName = false;
-        Token token;
-        while (true) {
-          lexer.LexFromRawLexer(token);
-          if (token.is(tok::eof))
-            return false;
-          if (token.is(tok::comment))
-            continue;
-
-          if (pendingName) {
-            if (token.is(tok::l_paren))
-              return true;
-            pendingName = false;
-          }
-
-          if (!token.is(tok::raw_identifier) && !token.is(tok::identifier))
-            continue;
-
-          const size_t localBegin = tokenOffsetFromBase(token, baseLoc);
-          const size_t localEnd = tokenEndOffsetFromBase(token, baseLoc);
-          if (localEnd < localBegin || localEnd > replacement.size())
-            continue;
-          pendingName = replacement.slice(localBegin, localEnd) == name;
-        }
-      };
-
-  // Return true when preserving this macro-state directive could change the
-  // B-derived replacement payload under the owner-polymorphic header gap proof.
   auto headerReplacementObservesMacroStateDirective =
       [&](const RefoldModel::MacroDirective &directive, StringRef replacement,
           bool unparseableObserves) {
-        if (directive.name.empty())
-          return unparseableObserves;
-
-        switch (headerMacroObservationKindForDirective(directive,
-                                                       directive.name)) {
-        case HeaderMacroReplacementObservationKind::IdentifierToken:
-          return rawIdentifierAppearsInHeaderReplacement(directive.name,
-                                                        replacement);
-        case HeaderMacroReplacementObservationKind::FunctionLikeInvocation:
-          return functionLikeInvocationAppearsInHeaderReplacement(
-              directive.name, replacement);
-        }
-        return true;
+        return ReplacementObservesMacroStateDirective(directive, replacement,
+                                                     unparseableObserves);
       };
 
   // Recover the complete physical source line for a macro-state directive that
-  // was spelled in this include expansion.  MacroDirective::siteB is anchored at
-  // the macro name, so translate through the recorded directive text and require
-  // an exact byte match in the header buffer before using the interval.
+  // was spelled in this include expansion. The shared helper owns the
+  // macro-name-anchor reconstruction and exact-byte validation.
   auto headerMacroStateDirectiveInterval =
-      [&](const RefoldModel::MacroDirective &directive)
-          -> std::optional<HeaderMacroStateDirectivePiece> {
-    // Only preserve directives physically spelled by this include expansion.
-    // A same-path directive from a different include instance has a different
-    // macro-state lifetime and cannot be used to tile this header gap.
-    if (!PathsEqual(directive.sitePath, file))
-      return std::nullopt;
-    if (!directive.ownerIncludeId || *directive.ownerIncludeId != ie.include->id)
-      return std::nullopt;
-
-    // This proof class preserves macro state only.  Conditional directives,
-    // includes, pragmas, and other PP structure need their own owners/proofs.
-    if (directive.subkind != "#define" && directive.subkind != "#undef")
-      return std::nullopt;
-
-    if (directive.name.empty())
-      return std::nullopt;
-
-    // Re-scan the recorded directive text to find the byte offset of the macro
-    // name inside that text.  The producer records siteB at the name spelling,
-    // so this offset lets us recover the directive line's start in the header.
-    StringRef text = directive.text;
-    size_t pos = 0;
-    stringutils::skipNonNewlineWs(text, pos);
-    if (pos >= text.size() || text[pos] != '#')
-      return std::nullopt;
-    ++pos;
-    stringutils::skipNonNewlineWs(text, pos);
-
-    StringRef keyword = directive.subkind.drop_front();
-    if (!text.substr(pos).starts_with(keyword))
-      return std::nullopt;
-    pos += keyword.size();
-    if (pos < text.size() && stringutils::isIdentPart(text[pos]))
-      return std::nullopt;
-    stringutils::skipNonNewlineWs(text, pos);
-
-    const size_t nameTextBegin = pos;
-    if (pos >= text.size() || !stringutils::isIdentStart(text[pos]))
-      return std::nullopt;
-    ++pos;
-    while (pos < text.size() && stringutils::isIdentPart(text[pos]))
-      ++pos;
-
-    if (directive.siteB < nameTextBegin)
-      return std::nullopt;
-
-    // Translate from the macro-name anchor back to the full directive interval
-    // and byte-verify it.  This rejects stale metadata, partial lines, and any
-    // directive text that cannot be proven to be exactly the header spelling.
-    const uint64_t fileBegin = directive.siteB - nameTextBegin;
-    const uint64_t fileEnd = fileBegin + text.size();
-    if (fileBegin >= fileEnd || fileEnd > headerText.size())
-      return std::nullopt;
-    if (StringRef(headerText).slice(fileBegin, fileEnd) != text)
-      return std::nullopt;
-
-    HeaderMacroStateDirectivePiece piece;
-    piece.directive = &directive;
-    piece.begin = fileBegin;
-    piece.end = fileEnd;
-    piece.name = directive.name.str();
-    return piece;
-  };
+      [&](const RefoldModel::MacroDirective &directive) {
+        return RecoverMacroStateDirectiveLineInterval(
+            directive, file, StringRef(headerText),
+            std::optional<uint64_t>(ie.include->id));
+      };
 
   std::function<bool(const RefoldModel::MacroInvocation &)>
       headerMacroInvocationIsSourceNeutralZeroToken;
@@ -3967,115 +3453,12 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     return std::string();
   };
 
-  // File-byte interval for the replacement list of the #define that created a
-  // header macro invocation.  The interval starts after the macro name and
-  // parameter list, because only the replacement list must be tiled by nested
-  // zero-token invocations and trivia.
-  struct HeaderMacroReplacementList {
-    const RefoldModel::MacroDirective *directive = nullptr;
-    size_t nameTextBegin = 0;
-    size_t replacementTextBegin = 0;
-    uint64_t fileBase = 0;
-    uint64_t fileBegin = 0;
-    uint64_t fileEnd = 0;
-  };
+  using HeaderMacroReplacementList = MacroDefinitionReplacementListInterval;
 
-  auto findHeaderMacroDefinitionDirective =
-      [&](const RefoldModel::MacroInvocation &m)
-          -> const RefoldModel::MacroDirective * {
-    // The producer records the defining directive id for macro invocations.
-    // Treat a missing/stale reference as unproved instead of guessing by name.
-    if (!m.definitionDirectiveId)
-      return nullptr;
-    for (const auto &directive : model_.GetMacroDirectives())
-      if (directive.id == *m.definitionDirectiveId)
-        return &directive;
-    return nullptr;
-  };
-
-  // Parse the defining #define enough to recover the replacement-list source
-  // interval.  Header zero-token macro gaps use this to prove that a wrapper
-  // invocation's replacement list is tiled only by nested zero-token calls and
-  // trivia, rather than by unrecorded source-bearing replacement text.
   auto headerMacroDefinitionReplacementList =
-      [&](const RefoldModel::MacroInvocation &m)
-          -> std::optional<HeaderMacroReplacementList> {
-    const RefoldModel::MacroDirective *definition =
-        findHeaderMacroDefinitionDirective(m);
-    if (!definition || definition->subkind != "#define")
-      return std::nullopt;
-
-    StringRef text = definition->text;
-    size_t pos = 0;
-
-    // Validate the directive spelling rather than assuming MacroDirective::text
-    // is well-formed.  This keeps the zero-token proof fail-closed if the
-    // producer ever records an unexpected directive form.
-    stringutils::skipNonNewlineWs(text, pos);
-    if (pos >= text.size() || text[pos] != '#')
-      return std::nullopt;
-    ++pos;
-    stringutils::skipNonNewlineWs(text, pos);
-
-    if (!text.substr(pos).starts_with("define"))
-      return std::nullopt;
-    pos += StringRef("define").size();
-    if (pos < text.size() && stringutils::isIdentPart(text[pos]))
-      return std::nullopt;
-    stringutils::skipNonNewlineWs(text, pos);
-
-    // siteB is anchored at the macro name, so remember the name's offset in
-    // directive.text.  That lets us translate replacement-list offsets back to
-    // file bytes and byte-verify nested invocation callsites.
-    const size_t nameTextBegin = pos;
-    if (!text.substr(pos).starts_with(m.name))
-      return std::nullopt;
-    pos += m.name.size();
-    if (pos < text.size() && stringutils::isIdentPart(text[pos]))
-      return std::nullopt;
-
-    if (m.subkind == "func") {
-      // Function-like macros may have parameters between the name and the
-      // replacement list.  Skip the balanced parameter list so fileBegin lands
-      // on the first byte that can contribute replacement-list source.
-      if (pos >= text.size() || text[pos] != '(')
-        return std::nullopt;
-      unsigned depth = 0;
-      while (pos < text.size()) {
-        char ch = text[pos++];
-        if (ch == '(') {
-          ++depth;
-          continue;
-        }
-        if (ch == ')') {
-          if (depth == 0)
-            return std::nullopt;
-          --depth;
-          if (depth == 0)
-            break;
-        }
-      }
-      if (depth != 0)
-        return std::nullopt;
-    }
-
-    if (definition->siteB < nameTextBegin)
-      return std::nullopt;
-
-    HeaderMacroReplacementList result;
-    result.directive = definition;
-    result.nameTextBegin = nameTextBegin;
-    result.replacementTextBegin = pos;
-    // Convert directive.text-local offsets into materialized header bytes.
-    // siteE bounds the complete directive line recorded by the producer.
-    result.fileBase = definition->siteB - nameTextBegin;
-    result.fileBegin = result.fileBase + pos;
-    result.fileEnd = definition->siteE;
-    if (result.fileBegin > result.fileEnd ||
-        result.fileEnd > result.fileBase + text.size())
-      return std::nullopt;
-    return result;
-  };
+      [&](const RefoldModel::MacroInvocation &m) {
+        return RecoverMacroDefinitionReplacementListInterval(m);
+      };
 
   auto headerMacroInvocationHasMaterializedPPTokens =
       [&](const RefoldModel::MacroInvocation &m) -> bool {
@@ -4645,20 +4028,6 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     return false;
   };
 
-  auto macroDirectiveNameFromModel =
-      [&](const RefoldModel::MacroDirective &directive)
-          -> std::optional<std::string> {
-    // Only macro-state transitions matter for replacement-payload exposure.
-    // Other directives in a zero-token include subtree are irrelevant here.
-    // The producer supplies the macro-state key directly; do not rediscover it
-    // from directive text in this consumer-side proof.
-    if (directive.subkind != "#define" && directive.subkind != "#undef")
-      return std::nullopt;
-    if (directive.name.empty())
-      return std::nullopt;
-    return directive.name.str();
-  };
-
   auto headerZeroTokenChildIncludeIsPreservableGap =
       [&](const RefoldModel::IncludeItem &child, uint64_t gapBegin,
           uint64_t gapEnd, StringRef replacement) -> bool {
@@ -4976,103 +4345,11 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     return !needsLexicalSeparator(*leftTok, *rightTok, lexLang_);
   };
 
-  auto headerTextContainsDirectiveLine = [](StringRef text) {
-    // Carrying a macro-state directive across another preprocessing directive
-    // would require proving the intervening directive's own side effects. This
-    // helper is intentionally conservative: any physical line whose first
-    // non-horizontal-whitespace character is '#' makes the crossed header chunk
-    // observable and blocks the carry proof.
-    bool atLineStart = true;
-    bool onlyHorizontalWsOnLine = true;
-    for (char c : text) {
-      if (atLineStart) {
-        atLineStart = false;
-        onlyHorizontalWsOnLine = true;
-      }
-      if (c == '\n') {
-        atLineStart = true;
-        onlyHorizontalWsOnLine = true;
-        continue;
-      }
-      if (onlyHorizontalWsOnLine && stringutils::isNonNewlineWs(c))
-        continue;
-      if (onlyHorizontalWsOnLine && c == '#')
-        return true;
-      onlyHorizontalWsOnLine = false;
-    }
-    return false;
-  };
-
-  auto functionLikeInvocationStartsInHeaderChunk =
-      [&](StringRef name, StringRef chunk, StringRef following) {
-        if (name.empty() || chunk.empty())
-          return false;
-
-        // Lex the crossed chunk together with the immediately-following bytes
-        // so a function-like invocation split at the carry boundary is still
-        // observed. Only identifiers whose spelling starts inside `chunk` can
-        // make the crossed source depend on the carried definition; `following`
-        // exists solely to supply the possible '(' token after a trailing name.
-        const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
-        std::string lexBuf;
-        lexBuf.reserve(chunk.size() + following.size() + 1);
-        lexBuf.append(chunk.begin(), chunk.end());
-        lexBuf.append(following.begin(), following.end());
-        lexBuf.push_back('\0');
-
-        const char *bufStart = lexBuf.data();
-        const char *bufEnd = bufStart + chunk.size() + following.size();
-        Lexer lexer(baseLoc, lexLang_, bufStart, bufStart, bufEnd);
-        lexer.SetCommentRetentionState(true);
-
-        bool pendingChunkName = false;
-        Token token;
-        while (true) {
-          lexer.LexFromRawLexer(token);
-          if (token.is(tok::eof))
-            return false;
-          if (token.is(tok::comment))
-            continue;
-
-          if (pendingChunkName) {
-            if (token.is(tok::l_paren))
-              return true;
-            pendingChunkName = false;
-          }
-
-          if (!token.is(tok::raw_identifier) && !token.is(tok::identifier))
-            continue;
-
-          const size_t localBegin = tokenOffsetFromBase(token, baseLoc);
-          const size_t localEnd = tokenEndOffsetFromBase(token, baseLoc);
-          if (localEnd < localBegin || localEnd > chunk.size())
-            continue;
-
-          pendingChunkName =
-              StringRef(lexBuf).slice(localBegin, localEnd) == name;
-        }
-      };
-
   auto headerSourceChunkObservesDefinitionWhenCrossed =
       [&](const RefoldModel::MacroDirective &definition, StringRef macroName,
           StringRef chunk, StringRef following) {
-        // Return true when moving `definition` from before `chunk` to after the
-        // replacement would change how the original crossed header bytes were
-        // preprocessed. In that case those bytes are part of the old proof
-        // state, so the directive must keep its original source order.
-        if (chunk.empty())
-          return false;
-        if (headerTextContainsDirectiveLine(chunk))
-          return true;
-
-        switch (headerMacroObservationKindForDirective(definition, macroName)) {
-        case HeaderMacroReplacementObservationKind::IdentifierToken:
-          return rawIdentifierAppearsInHeaderReplacement(macroName, chunk);
-        case HeaderMacroReplacementObservationKind::FunctionLikeInvocation:
-          return functionLikeInvocationStartsInHeaderChunk(macroName, chunk,
-                                                          following);
-        }
-        return true;
+        return SourceChunkObservesMacroStateDirectiveWhenCrossed(
+            definition, macroName, chunk, following);
       };
 
   auto activeHeaderDefinitionAtByte =
@@ -5151,44 +4428,15 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     if (!owner)
       return false;
 
-    std::optional<std::string> name =
-        macroDirectiveNameFromModel(directive);
-    if (!name)
-      return false;
-
-    StringRef text = directive.text;
-    size_t pos = 0;
-    stringutils::skipNonNewlineWs(text, pos);
-    if (pos >= text.size() || text[pos] != '#')
-      return false;
-    ++pos;
-    stringutils::skipNonNewlineWs(text, pos);
-
-    StringRef keyword = directive.subkind.drop_front();
-    if (!text.substr(pos).starts_with(keyword))
-      return false;
-    pos += keyword.size();
-    if (pos < text.size() && stringutils::isIdentPart(text[pos]))
-      return false;
-    stringutils::skipNonNewlineWs(text, pos);
-
-    const size_t nameTextBegin = pos;
-    if (!text.substr(pos).starts_with(*name))
-      return false;
-    if (directive.siteB < nameTextBegin)
-      return false;
-
-    const uint64_t fileBegin = directive.siteB - nameTextBegin;
-    const uint64_t fileEnd = fileBegin + text.size();
     const std::string ownerPath = resolveHeaderPath(*owner);
     auto bufOrErr = MemoryBuffer::getFile(lineDirs_.ToAbsolutePath(ownerPath));
     if (!bufOrErr)
       return false;
     const MemoryBuffer &mb = **bufOrErr;
     StringRef ownerBytes(mb.getBufferStart(), mb.getBufferSize());
-    if (fileBegin >= fileEnd || fileEnd > ownerBytes.size())
-      return false;
-    return ownerBytes.slice(fileBegin, fileEnd) == text;
+    return RecoverMacroStateDirectiveLineInterval(
+               directive, ownerPath, ownerBytes, directive.ownerIncludeId)
+        .has_value();
   };
 
   auto collectMacroStatePreservationsFromIncludeSubtree =

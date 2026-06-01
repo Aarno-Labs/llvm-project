@@ -3769,140 +3769,11 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     return includeRecordedSideEffectReason(inc).has_value();
   };
 
-  auto rawIdentifierAppearsInHunkReplacement = [&](StringRef name) -> bool {
-    if (name.empty())
-      return false;
-
-    StringRef text = SliceBSource(h.bStart, h.bEnd);
-    if (text.empty())
-      return false;
-
-    const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
-    std::string lexBuf = text.str();
-    lexBuf.push_back('\0');
-
-    const char *bufStart = lexBuf.data();
-    const char *bufEnd = bufStart + text.size();
-    Lexer lexer(baseLoc, lexLang_, bufStart, bufStart, bufEnd);
-    lexer.SetCommentRetentionState(true);
-
-    Token token;
-    while (true) {
-      lexer.LexFromRawLexer(token);
-      if (token.is(tok::eof))
-        return false;
-      if (token.is(tok::comment))
-        continue;
-      if (!token.is(tok::raw_identifier) && !token.is(tok::identifier))
-        continue;
-
-      const size_t localBegin = tokenOffsetFromBase(token, baseLoc);
-      const size_t localEnd = tokenEndOffsetFromBase(token, baseLoc);
-      if (localEnd < localBegin || localEnd > text.size())
-        continue;
-      if (text.slice(localBegin, localEnd) == name)
-        return true;
-    }
-  };
-
-  auto functionLikeInvocationAppearsInHunkReplacement =
-      [&](StringRef name) -> bool {
-        if (name.empty())
-          return false;
-
-        StringRef text = SliceBSource(h.bStart, h.bEnd);
-        if (text.empty())
-          return false;
-
-        const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
-        std::string lexBuf = text.str();
-        lexBuf.push_back('\0');
-
-        const char *bufStart = lexBuf.data();
-        const char *bufEnd = bufStart + text.size();
-        Lexer lexer(baseLoc, lexLang_, bufStart, bufStart, bufEnd);
-        lexer.SetCommentRetentionState(true);
-
-        bool pendingName = false;
-        Token token;
-        while (true) {
-          lexer.LexFromRawLexer(token);
-          if (token.is(tok::eof))
-            return false;
-          if (token.is(tok::comment))
-            continue;
-
-          if (pendingName) {
-            if (token.is(tok::l_paren))
-              return true;
-            pendingName = false;
-          }
-
-          if (!token.is(tok::raw_identifier) && !token.is(tok::identifier))
-            continue;
-
-          const size_t localBegin = tokenOffsetFromBase(token, baseLoc);
-          const size_t localEnd = tokenEndOffsetFromBase(token, baseLoc);
-          if (localEnd < localBegin || localEnd > text.size())
-            continue;
-          pendingName = text.slice(localBegin, localEnd) == name;
-        }
-      };
-
-  auto macroDirectiveNameFromModel =
-      [&](const RefoldModel::MacroDirective &directive)
-          -> std::optional<StringRef> {
-    if (directive.subkind != "#define" && directive.subkind != "#undef")
-      return std::nullopt;
-    if (directive.name.empty())
-      return std::nullopt;
-    return directive.name;
-  };
-
-  auto macroDirectiveIsFunctionLikeDefinition =
-      [&](const RefoldModel::MacroDirective &directive, StringRef macroName) {
-        if (directive.subkind != "#define")
-          return false;
-
-        StringRef text = directive.text;
-        size_t pos = 0;
-        stringutils::skipNonNewlineWs(text, pos);
-        if (pos >= text.size() || text[pos] != '#')
-          return false;
-        ++pos;
-        stringutils::skipNonNewlineWs(text, pos);
-
-        StringRef keyword = "define";
-        if (!text.substr(pos).starts_with(keyword))
-          return false;
-        pos += keyword.size();
-        if (pos < text.size() && stringutils::isIdentPart(text[pos]))
-          return false;
-        stringutils::skipNonNewlineWs(text, pos);
-
-        const size_t nameBegin = pos;
-        if (pos >= text.size() || !stringutils::isIdentStart(text[pos]))
-          return false;
-        ++pos;
-        while (pos < text.size() && stringutils::isIdentPart(text[pos]))
-          ++pos;
-
-        return text.slice(nameBegin, pos) == macroName && pos < text.size() &&
-               text[pos] == '(';
-      };
-
-  // Return true when the B-side replacement hunk can observe a macro-state
-  // transition preserved after that hunk. Object-like definitions and #undef
-  // transitions are conservatively keyed by identifier occurrence; a
-  // function-like #define is keyed by actual invocation syntax instead.
   auto hunkReplacementObservesMacroStateDirective =
       [&](const RefoldModel::MacroDirective &directive) {
-        std::optional<StringRef> name = macroDirectiveNameFromModel(directive);
-        if (!name)
-          return true;
-        if (macroDirectiveIsFunctionLikeDefinition(directive, *name))
-          return functionLikeInvocationAppearsInHunkReplacement(*name);
-        return rawIdentifierAppearsInHunkReplacement(*name);
+        return ReplacementObservesMacroStateDirective(
+            directive, SliceBSource(h.bStart, h.bEnd),
+            /*unprovenObserves=*/true);
       };
 
   auto includeIsDescendantOf = [&](const RefoldModel::IncludeItem &candidate,
@@ -4034,118 +3905,13 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     return includeIsPreservableConditionalStateIncludeImpl(inc, visiting);
   };
 
-  struct MacroDefinitionReplacementList {
-    const RefoldModel::MacroDirective *directive = nullptr;
-    size_t nameTextBegin = 0;
-    size_t replacementTextBegin = 0;
-    uint64_t fileBase = 0;
-    uint64_t fileBegin = 0;
-    uint64_t fileEnd = 0;
-  };
+  using MacroDefinitionReplacementList =
+      MacroDefinitionReplacementListInterval;
 
-  auto findMacroDefinitionDirective =
-      [&](const RefoldModel::MacroInvocation &m)
-          -> const RefoldModel::MacroDirective * {
-    if (!m.definitionDirectiveId)
-      return nullptr;
-
-    for (const auto &directive : model_.GetMacroDirectives())
-      if (directive.id == *m.definitionDirectiveId)
-        return &directive;
-    return nullptr;
-  };
-
-  // Parse the recorded #define text and return the replacement-list range in
-  // both directive-text coordinates and source-file byte coordinates.
-  //
-  // MacroDirective::text contains the full directive spelling, but siteB/siteE
-  // anchor only the directive payload in the source file: siteB is the byte of
-  // the macro name, not the byte of '#'.  Keep the text offset of the name so
-  // nested macro callsites recorded inside a replacement list can be compared
-  // against the correct source-file byte interval.
   auto macroDefinitionReplacementList =
-      [&](const RefoldModel::MacroInvocation &m)
-          -> std::optional<MacroDefinitionReplacementList> {
-    const RefoldModel::MacroDirective *definition =
-        findMacroDefinitionDirective(m);
-    if (!definition || definition->subkind != "#define")
-      return std::nullopt;
-
-    StringRef text = definition->text;
-    size_t pos = 0;
-
-    // Re-parse only the directive prefix we need: optional horizontal/trivia
-    // whitespace, '#', optional whitespace, and the 'define' directive keyword.
-    stringutils::skipNonNewlineWs(text, pos);
-    if (pos >= text.size() || text[pos] != '#')
-      return std::nullopt;
-    ++pos;
-    stringutils::skipNonNewlineWs(text, pos);
-
-    // Require the exact preprocessing directive keyword, not an identifier that
-    // merely starts with "define".
-    if (!text.substr(pos).starts_with("define"))
-      return std::nullopt;
-    pos += StringRef("define").size();
-    if (pos < text.size() && stringutils::isIdentPart(text[pos]))
-      return std::nullopt;
-    stringutils::skipNonNewlineWs(text, pos);
-
-    // The next token must be the macro name recorded on the invocation.  Record
-    // its directive-text offset so we can translate later replacement-list
-    // offsets back into source-file byte coordinates.
-    const size_t nameTextBegin = pos;
-    if (!text.substr(pos).starts_with(m.name))
-      return std::nullopt;
-    pos += m.name.size();
-
-    // Avoid accepting a prefix of a longer macro identifier.
-    if (pos < text.size() && stringutils::isIdentPart(text[pos]))
-      return std::nullopt;
-
-    if (m.subkind == "func") {
-      // Function-like macro definitions require the parameter list to start
-      // immediately after the name.  Skip the balanced parameter list; the
-      // replacement list begins immediately after the closing paren.
-      if (pos >= text.size() || text[pos] != '(')
-        return std::nullopt;
-      unsigned depth = 0;
-      while (pos < text.size()) {
-        char ch = text[pos++];
-        if (ch == '(') {
-          ++depth;
-          continue;
-        }
-        if (ch == ')') {
-          if (depth == 0)
-            return std::nullopt;
-          --depth;
-          if (depth == 0)
-            break;
-        }
-      }
-      if (depth != 0)
-        return std::nullopt;
-    }
-
-    // `siteB` is expected to be the source byte for the macro name.  If a map
-    // violates that contract, fail closed rather than comparing nested callsite
-    // bytes against a synthetic coordinate system.
-    if (definition->siteB < nameTextBegin)
-      return std::nullopt;
-
-    MacroDefinitionReplacementList result;
-    result.directive = definition;
-    result.nameTextBegin = nameTextBegin;
-    result.replacementTextBegin = pos;
-    result.fileBase = definition->siteB - nameTextBegin;
-    result.fileBegin = result.fileBase + pos;
-    result.fileEnd = definition->siteE;
-    if (result.fileBegin > result.fileEnd ||
-        result.fileEnd > result.fileBase + text.size())
-      return std::nullopt;
-    return result;
-  };
+      [&](const RefoldModel::MacroInvocation &m) {
+        return RecoverMacroDefinitionReplacementListInterval(m);
+      };
 
   // Return true iff this invocation contributed no A-side PP material.  Such a
   // callsite is source structure rather than token material for the current
@@ -4726,69 +4492,16 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     return macroInvocationIsSourceNeutralZeroToken(m);
   };
 
-  struct MacroDirectiveSourceInterval {
-    uint64_t begin = 0;
-    uint64_t end = 0;
-  };
+  using MacroDirectiveSourceInterval = MacroStateDirectiveLineInterval;
 
   // Recover the full physical source interval for a TU-spelled macro-state
-  // directive.  MacroDirective::siteB is anchored at the macro name rather than
-  // at '#', so use the recorded directive spelling to translate the name offset
-  // back to the directive's real source begin.
+  // directive. The shared helper owns the macro-name-anchor reconstruction and
+  // exact-byte validation against the TU source bytes.
   auto macroDirectiveFullSourceInterval =
-      [&](const RefoldModel::MacroDirective &directive)
-          -> std::optional<MacroDirectiveSourceInterval> {
-    if (!PathsEqual(directive.sitePath, tuPath) || directive.ownerIncludeId)
-      return std::nullopt;
-    if (directive.subkind != "#define" && directive.subkind != "#undef")
-      return std::nullopt;
-
-    StringRef text = directive.text;
-    if (text.empty())
-      return std::nullopt;
-
-    size_t pos = 0;
-    stringutils::skipNonNewlineWs(text, pos);
-    if (pos >= text.size() || text[pos] != '#')
-      return std::nullopt;
-    ++pos;
-    stringutils::skipNonNewlineWs(text, pos);
-
-    // Match the recorded directive kind exactly; accepting an identifier prefix
-    // here would make the later byte-coordinate reconstruction unsound.
-    StringRef keyword = directive.subkind.drop_front();
-    if (!text.substr(pos).starts_with(keyword))
-      return std::nullopt;
-    pos += keyword.size();
-    if (pos < text.size() && stringutils::isIdentPart(text[pos]))
-      return std::nullopt;
-    stringutils::skipNonNewlineWs(text, pos);
-
-    // The next token is the macro name.  Its text offset is the bridge between
-    // directive-text coordinates and source-file byte coordinates because the
-    // producer records siteB at this token.
-    const size_t nameTextBegin = pos;
-    if (pos >= text.size() || !stringutils::isIdentStart(text[pos]))
-      return std::nullopt;
-    ++pos;
-    while (pos < text.size() && stringutils::isIdentPart(text[pos]))
-      ++pos;
-
-    if (directive.siteB < nameTextBegin)
-      return std::nullopt;
-
-    const uint64_t fileBegin = directive.siteB - nameTextBegin;
-    const uint64_t fileEnd = fileBegin + text.size();
-    if (fileBegin >= fileEnd || fileEnd > tuBytes.size())
-      return std::nullopt;
-
-    // Require an exact byte match so this proof consumes the directive that the
-    // producer recorded, not a synthetic interval inferred from stale anchors.
-    if (tuBytes.slice(fileBegin, fileEnd) != text)
-      return std::nullopt;
-
-    return MacroDirectiveSourceInterval{fileBegin, fileEnd};
-  };
+      [&](const RefoldModel::MacroDirective &directive) {
+        return RecoverMacroStateDirectiveLineInterval(
+            directive, tuPath, tuBytes, std::nullopt);
+      };
 
   auto macroDirectiveIsConsumableStateGap =
       [&](const RefoldModel::MacroDirective &directive, uint64_t begin,

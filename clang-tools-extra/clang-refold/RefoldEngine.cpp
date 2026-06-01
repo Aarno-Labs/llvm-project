@@ -4625,63 +4625,17 @@ std::string RefoldEngine::RunSinglePassRefold() {
     return false;
   };
 
-  struct MacroDirectiveSourceInterval {
-    uint64_t begin = 0;
-    uint64_t end = 0;
-  };
+  using MacroDirectiveSourceInterval = MacroStateDirectiveLineInterval;
 
   // Recover the complete physical line recorded for a TU-spelled macro-state
-  // directive. MacroDirective::siteB is anchored at the macro name rather than
-  // at '#', so translate through the recorded directive text and require an
-  // exact byte match before using the interval as a preservation witness.
+  // directive. The shared helper owns the byte-coordinate proof: it translates
+  // the producer's macro-name anchor back to the directive line start and
+  // validates the recovered bytes against MacroDirective::text.
   auto macroDirectiveFullSourceInterval =
-      [&](const RefoldModel::MacroDirective &directive)
-          -> std::optional<MacroDirectiveSourceInterval> {
-    if (!PathsEqual(directive.sitePath, tuPath) || directive.ownerIncludeId)
-      return std::nullopt;
-    if (directive.subkind != "#define" && directive.subkind != "#undef")
-      return std::nullopt;
-
-    StringRef text = directive.text;
-    if (text.empty())
-      return std::nullopt;
-
-    size_t pos = 0;
-    stringutils::skipNonNewlineWs(text, pos);
-    if (pos >= text.size() || text[pos] != '#')
-      return std::nullopt;
-    ++pos;
-    stringutils::skipNonNewlineWs(text, pos);
-
-    StringRef keyword = directive.subkind.drop_front();
-    if (!text.substr(pos).starts_with(keyword))
-      return std::nullopt;
-    pos += keyword.size();
-    if (pos < text.size() && stringutils::isIdentPart(text[pos]))
-      return std::nullopt;
-    stringutils::skipNonNewlineWs(text, pos);
-
-    // The producer records siteB at the macro name. Re-parse the directive
-    // prefix just far enough to recover the name's offset in directive text.
-    const size_t nameTextBegin = pos;
-    if (pos >= text.size() || !stringutils::isIdentStart(text[pos]))
-      return std::nullopt;
-    ++pos;
-    while (pos < text.size() && stringutils::isIdentPart(text[pos]))
-      ++pos;
-
-    if (directive.siteB < nameTextBegin)
-      return std::nullopt;
-
-    const uint64_t fileBegin = directive.siteB - nameTextBegin;
-    const uint64_t fileEnd = fileBegin + text.size();
-    if (fileBegin >= fileEnd || fileEnd > tuBytes.size())
-      return std::nullopt;
-    if (tuBytes.slice(fileBegin, fileEnd) != text)
-      return std::nullopt;
-
-    return MacroDirectiveSourceInterval{fileBegin, fileEnd};
-  };
+      [&](const RefoldModel::MacroDirective &directive) {
+        return RecoverMacroStateDirectiveLineInterval(
+            directive, tuPath, tuBytes, std::nullopt);
+      };
 
   // Spell a preserved macro-state directive as a complete physical line.
   auto directiveTextForPreservation =
@@ -4692,215 +4646,16 @@ std::string RefoldEngine::RunSinglePassRefold() {
     return text;
   };
 
-  enum class MacroReplacementObservationKind {
-    IdentifierToken,
-    FunctionLikeInvocation,
-  };
-
-  // Return the observation shape that can make a replacement payload see a
-  // consumed definition if that definition is preserved before the payload.
-  //
-  // Object-like macros are observed by any preprocessing identifier token with
-  // the macro name. Function-like macros are observed only by an invocation: a
-  // macro-name token whose next non-comment preprocessing token is `(`. This is
-  // the first-order invariant for definition preservation; the source spelling
-  // of the name alone is not enough to reject a function-like macro repair.
-  auto macroObservationKindForDefinition =
-      [&](const RefoldModel::MacroDirective &definition, StringRef macroName) {
-        if (definition.subkind != "#define")
-          return MacroReplacementObservationKind::IdentifierToken;
-
-        StringRef text = definition.text;
-        size_t pos = 0;
-        stringutils::skipNonNewlineWs(text, pos);
-        if (pos >= text.size() || text[pos] != '#')
-          return MacroReplacementObservationKind::IdentifierToken;
-        ++pos;
-        stringutils::skipNonNewlineWs(text, pos);
-
-        StringRef keyword = "define";
-        if (!text.substr(pos).starts_with(keyword))
-          return MacroReplacementObservationKind::IdentifierToken;
-        pos += keyword.size();
-        if (pos < text.size() && stringutils::isIdentPart(text[pos]))
-          return MacroReplacementObservationKind::IdentifierToken;
-        stringutils::skipNonNewlineWs(text, pos);
-
-        const size_t nameBegin = pos;
-        if (pos >= text.size() || !stringutils::isIdentStart(text[pos]))
-          return MacroReplacementObservationKind::IdentifierToken;
-        ++pos;
-        while (pos < text.size() && stringutils::isIdentPart(text[pos]))
-          ++pos;
-
-        if (text.slice(nameBegin, pos) != macroName)
-          return MacroReplacementObservationKind::IdentifierToken;
-
-        // In C/C++, a function-like macro definition has the left parenthesis
-        // immediately after the macro name. Whitespace or comments between the
-        // name and `(` make the definition object-like, so only a byte-adjacent
-        // `(` proves the narrower observation class.
-        if (pos < text.size() && text[pos] == '(')
-          return MacroReplacementObservationKind::FunctionLikeInvocation;
-
-        return MacroReplacementObservationKind::IdentifierToken;
-      };
-
-  // Return true if `text` contains `name` as a real raw identifier token.
-  //
-  // This is the observation predicate for object-like macro definitions: once
-  // the definition is active, the identifier token itself is enough to change
-  // how the replacement payload preprocesses.
-  auto rawIdentifierAppearsInText = [&](StringRef name, StringRef text) {
-    if (name.empty() || text.empty())
-      return false;
-
-    const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
-    std::string lexBuf = text.str();
-    lexBuf.push_back('\0');
-
-    const char *bufStart = lexBuf.data();
-    const char *bufEnd = bufStart + text.size();
-    Lexer lexer(baseLoc, lexLang_, bufStart, bufStart, bufEnd);
-    lexer.SetCommentRetentionState(true);
-
-    Token token;
-    while (true) {
-      lexer.LexFromRawLexer(token);
-      if (token.is(tok::eof))
-        return false;
-
-      // Comments are retained so the raw lexer can step over them explicitly,
-      // but macro-state observations inside comments are irrelevant.
-      if (token.is(tok::comment))
-        continue;
-
-      if (!token.is(tok::raw_identifier) && !token.is(tok::identifier))
-        continue;
-
-      const size_t localBegin = tokenOffsetFromBase(token, baseLoc);
-      const size_t localEnd = tokenEndOffsetFromBase(token, baseLoc);
-      if (localEnd < localBegin || localEnd > text.size())
-        continue;
-
-      if (text.slice(localBegin, localEnd) == name)
-        return true;
-    }
-  };
-
-  // Return the replacement-local byte offset of the first identifier token that
-  // would observe an object-like macro definition.  The offset identifies the
-  // start of the token, which lets #undef repair place the undef before the
-  // observing token when an existing physical line boundary makes that legal.
-  auto firstRawIdentifierObservationOffset =
-      [&](StringRef name, StringRef text) -> std::optional<size_t> {
-    if (name.empty() || text.empty())
-      return std::nullopt;
-
-    const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
-    std::string lexBuf = text.str();
-    lexBuf.push_back('\0');
-
-    const char *bufStart = lexBuf.data();
-    const char *bufEnd = bufStart + text.size();
-    Lexer lexer(baseLoc, lexLang_, bufStart, bufStart, bufEnd);
-    lexer.SetCommentRetentionState(true);
-
-    Token token;
-    while (true) {
-      lexer.LexFromRawLexer(token);
-      if (token.is(tok::eof))
-        return std::nullopt;
-
-      // Comments are retained so the raw lexer can step over them explicitly,
-      // but macro-state observations inside comments are irrelevant.
-      if (token.is(tok::comment))
-        continue;
-
-      if (!token.is(tok::raw_identifier) && !token.is(tok::identifier))
-        continue;
-
-      const size_t localBegin = tokenOffsetFromBase(token, baseLoc);
-      const size_t localEnd = tokenEndOffsetFromBase(token, baseLoc);
-      if (localEnd < localBegin || localEnd > text.size())
-        continue;
-
-      if (text.slice(localBegin, localEnd) == name)
-        return localBegin;
-    }
-  };
-
-  // Return the replacement-local byte offset of the macro-name token that starts
-  // the first function-like invocation in `replacement`.  The following `(` may
-  // live either in the replacement itself or across the edit/suffix boundary;
-  // both cases mean the replacement would be preprocessed differently if the
-  // prior function-like definition remained active up to that token.
-  auto firstFunctionLikeInvocationOffsetInReplacement =
-      [&](StringRef name, StringRef replacement, StringRef suffix)
-          -> std::optional<size_t> {
-        if (name.empty() || replacement.empty())
-          return std::nullopt;
-
-        const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
-        std::string lexBuf;
-        lexBuf.reserve(replacement.size() + suffix.size() + 1);
-        lexBuf.append(replacement.begin(), replacement.end());
-        lexBuf.append(suffix.begin(), suffix.end());
-        lexBuf.push_back('\0');
-
-        const char *bufStart = lexBuf.data();
-        const char *bufEnd = bufStart + replacement.size() + suffix.size();
-        Lexer lexer(baseLoc, lexLang_, bufStart, bufStart, bufEnd);
-        lexer.SetCommentRetentionState(true);
-
-        std::optional<size_t> pendingReplacementNameBegin;
-        Token token;
-        while (true) {
-          lexer.LexFromRawLexer(token);
-          if (token.is(tok::eof))
-            return std::nullopt;
-
-          // Whitespace is not returned by the raw lexer and comments are not
-          // preprocessing tokens for function-like invocation adjacency, so a
-          // retained comment does not clear the pending macro-name token.
-          if (token.is(tok::comment))
-            continue;
-
-          if (pendingReplacementNameBegin) {
-            if (token.is(tok::l_paren))
-              return *pendingReplacementNameBegin;
-            pendingReplacementNameBegin.reset();
-          }
-
-          if (!token.is(tok::raw_identifier) && !token.is(tok::identifier))
-            continue;
-
-          const size_t localBegin = tokenOffsetFromBase(token, baseLoc);
-          const size_t localEnd = tokenEndOffsetFromBase(token, baseLoc);
-          if (localEnd < localBegin || localEnd > replacement.size())
-            continue;
-
-          if (StringRef(lexBuf).slice(localBegin, localEnd) == name)
-            pendingReplacementNameBegin = localBegin;
-        }
-      };
-
   // Return the replacement-local byte offset of the first token that would
   // observe `definition` if the definition were active before the replacement.
-  // Object-like definitions are observed by the identifier token itself;
-  // function-like definitions are observed only by a real NAME(...) invocation.
+  // The shared helper applies the same object-like/function-like observation
+  // invariant used by header materialization and fallback proofs.
   auto firstReplacementObservationOffset =
       [&](const TextEdit &edit, const RefoldModel::MacroDirective &definition,
           StringRef macroName) -> std::optional<size_t> {
-        switch (macroObservationKindForDefinition(definition, macroName)) {
-        case MacroReplacementObservationKind::IdentifierToken:
-          return firstRawIdentifierObservationOffset(macroName,
-                                                     StringRef(edit.text));
-        case MacroReplacementObservationKind::FunctionLikeInvocation:
-          return firstFunctionLikeInvocationOffsetInReplacement(
-              macroName, StringRef(edit.text), tuBytes.drop_front(edit.end));
-        }
-        return std::nullopt;
+        return FirstMacroStateObservationOffsetInText(
+            definition, macroName, StringRef(edit.text),
+            tuBytes.drop_front(edit.end));
       };
 
   // Return true when a replacement payload can observe a consumed macro
@@ -4971,34 +4726,6 @@ std::string RefoldEngine::RunSinglePassRefold() {
     return std::nullopt;
   };
 
-  // Return true when a text slice contains a real preprocessor directive
-  // line.  Macro-state movement may cross ordinary replacement/source bytes
-  // only when those bytes cannot observe the moved transition; crossing an
-  // unrelated directive line is not an ordinary observation problem, because
-  // conditionals, includes, and macro-state transitions can have structural
-  // effects not modeled by token-level macro-name matching.
-  auto containsDirectiveLine = [](StringRef text) {
-    bool atLineStart = true;
-    bool onlyHorizontalWsOnLine = true;
-    for (char c : text) {
-      if (atLineStart) {
-        atLineStart = false;
-        onlyHorizontalWsOnLine = true;
-      }
-      if (c == '\n') {
-        atLineStart = true;
-        onlyHorizontalWsOnLine = true;
-        continue;
-      }
-      if (onlyHorizontalWsOnLine && stringutils::isNonNewlineWs(c))
-        continue;
-      if (onlyHorizontalWsOnLine && c == '#')
-        return true;
-      onlyHorizontalWsOnLine = false;
-    }
-    return false;
-  };
-
   // Return true when moving `definition` across a source chunk could change how
   // that chunk preprocesses.  Ordinary replacement/source text observes an
   // object-like macro by identifier spelling and a function-like macro only by
@@ -5007,19 +4734,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
   auto sourceChunkObservesDefinitionWhenCrossed =
       [&](const RefoldModel::MacroDirective &definition, StringRef macroName,
           StringRef chunk, StringRef following) {
-        if (chunk.empty())
-          return false;
-        if (containsDirectiveLine(chunk))
-          return true;
-        switch (macroObservationKindForDefinition(definition, macroName)) {
-        case MacroReplacementObservationKind::IdentifierToken:
-          return rawIdentifierAppearsInText(macroName, chunk);
-        case MacroReplacementObservationKind::FunctionLikeInvocation:
-          return firstFunctionLikeInvocationOffsetInReplacement(macroName, chunk,
-                                                                following)
-              .has_value();
-        }
-        return true;
+        return SourceChunkObservesMacroStateDirectiveWhenCrossed(
+            definition, macroName, chunk, following);
       };
 
   auto sourceRangeOverlapsFinalTUEditExcept =
@@ -5215,9 +4931,10 @@ std::string RefoldEngine::RunSinglePassRefold() {
     std::string spelling = text.str();
     if (spelling.empty() || spelling.back() != '\n')
       spelling.push_back('\n');
-    return MacroStateSourceTransition{
-        MacroDirectiveSourceInterval{inc->siteB, inc->siteE},
-        std::move(spelling)};
+    MacroDirectiveSourceInterval interval;
+    interval.begin = inc->siteB;
+    interval.end = inc->siteE;
+    return MacroStateSourceTransition{interval, std::move(spelling)};
   };
 
   // Return the active #define for `macroName` at a TU source offset, considering
@@ -5635,7 +5352,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
         definitionObservedByReplacement
             ? firstReplacementObservationOffset(edit, *definitionObservedByReplacement,
                                                 macroName)
-            : firstRawIdentifierObservationOffset(macroName, StringRef(edit.text));
+            : FirstRawIdentifierObservationOffsetInText(macroName, StringRef(edit.text));
     const bool replacementObservesDefinition = firstObservationOffset.has_value();
 
     const bool editStartsAtPhysicalBOL =
@@ -8013,6 +7730,7 @@ static void emitByteCutRange(size_t begin, size_t end,
     emitCut(static_cast<unsigned>(cut));
 }
 
+
 /// True for string and character literal tokens whose interior bytes must not
 /// be inspected for delimiters or cut points.
 static bool isOpaqueLiteralToken(tok::TokenKind kind) {
@@ -8100,9 +7818,11 @@ static bool isAtTopLevel(int parenDepth, int bracketDepth, int braceDepth) {
 /// Detect whether `text` contains a comma that would split a single macro
 /// argument if the text were written back into a function-like invocation.
 ///
-/// Raw lexing keeps comments and literals opaque, so only delimiter depth has
-/// to be tracked here. This avoids the duplicated ad hoc string/character
-/// scanner previously used by macro replay validation.
+/// Raw lexing keeps comments and literals opaque.  Macro argument collection
+/// itself only treats nested parentheses as protective; commas inside brackets
+/// or braces still split function-like macro actuals.  Keep this deliberately
+/// separate from the C-expression tuple/cut-point helpers, which do track all
+/// balanced delimiter families.
 static bool hasTopLevelCommaWithLexer(StringRef text,
                                       const LangOptions &lang) {
   // RawLexer needs a stable, nul-terminated scratch buffer and an artificial
@@ -8116,8 +7836,6 @@ static bool hasTopLevelCommaWithLexer(StringRef text,
   lexer.SetCommentRetentionState(true);
 
   int parenDepth = 0;
-  int bracketDepth = 0;
-  int braceDepth = 0;
   Token token;
 
   while (true) {
@@ -8127,14 +7845,22 @@ static bool hasTopLevelCommaWithLexer(StringRef text,
     if (token.is(tok::comment))
       continue;
 
-    if (token.is(tok::comma) &&
-        isAtTopLevel(parenDepth, bracketDepth, braceDepth))
+    if (token.is(tok::comma) && parenDepth == 0)
       return true;
 
     // Delimiter state is updated after the comma test so a comma token is
     // classified using the nesting that was active before it was consumed.
-    updateTopLevelDelimiterDepth(token.getKind(), parenDepth, bracketDepth,
-                                 braceDepth);
+    switch (token.getKind()) {
+    case tok::l_paren:
+      ++parenDepth;
+      break;
+    case tok::r_paren:
+      if (parenDepth > 0)
+        --parenDepth;
+      break;
+    default:
+      break;
+    }
   }
 }
 
@@ -8432,6 +8158,371 @@ static bool isSeparatorGapReplacementPunctuation(tok::TokenKind kind) {
   }
 }
 } // namespace
+
+/// Return the byte offset of the first raw identifier token in `text` whose
+/// spelling is exactly `name`.
+///
+/// This is the object-like macro-state observation primitive.  It intentionally
+/// uses Clang's raw lexer instead of substring search so comments, string
+/// literals, character literals, and identifier prefixes/suffixes do not become
+/// false observations.
+std::optional<size_t> RefoldEngine::FirstRawIdentifierObservationOffsetInText(
+    StringRef name, StringRef text) const {
+  if (name.empty() || text.empty())
+    return std::nullopt;
+
+  const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
+  std::string lexBuf = text.str();
+  lexBuf.push_back('\0');
+
+  const char *bufStart = lexBuf.data();
+  const char *bufEnd = bufStart + text.size();
+  Lexer lexer(baseLoc, lexLang_, bufStart, bufStart, bufEnd);
+  lexer.SetCommentRetentionState(true);
+
+  Token token;
+  while (true) {
+    lexer.LexFromRawLexer(token);
+    if (token.is(tok::eof))
+      return std::nullopt;
+
+    // Comments are retained so the raw lexer can step over them explicitly, but
+    // macro-state observations inside comments are irrelevant.
+    if (token.is(tok::comment))
+      continue;
+
+    if (!token.is(tok::raw_identifier) && !token.is(tok::identifier))
+      continue;
+
+    const size_t localBegin = tokenOffsetFromBase(token, baseLoc);
+    const size_t localEnd = tokenEndOffsetFromBase(token, baseLoc);
+    if (localEnd < localBegin || localEnd > text.size())
+      continue;
+
+    if (text.slice(localBegin, localEnd) == name)
+      return localBegin;
+  }
+}
+
+/// True when `text` contains `name` as a real preprocessing identifier token.
+bool RefoldEngine::RawIdentifierAppearsInText(StringRef name,
+                                              StringRef text) const {
+  return FirstRawIdentifierObservationOffsetInText(name, text).has_value();
+}
+
+/// Return the byte offset of the first `name` token that forms a
+/// function-like macro invocation.
+///
+/// A function-like macro is observed only by a macro-name preprocessing token
+/// followed by `(` after whitespace/comments are skipped.  `suffix` is included
+/// so an edit whose replacement ends at `name` can still detect an invocation
+/// whose opening parenthesis remains in the preserved source suffix.
+std::optional<size_t> RefoldEngine::FirstFunctionLikeInvocationOffsetInText(
+    StringRef name, StringRef text, StringRef suffix) const {
+  if (name.empty() || text.empty())
+    return std::nullopt;
+
+  const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
+  std::string lexBuf;
+  lexBuf.reserve(text.size() + suffix.size() + 1);
+  lexBuf.append(text.begin(), text.end());
+  lexBuf.append(suffix.begin(), suffix.end());
+  lexBuf.push_back('\0');
+
+  const char *bufStart = lexBuf.data();
+  const char *bufEnd = bufStart + text.size() + suffix.size();
+  Lexer lexer(baseLoc, lexLang_, bufStart, bufStart, bufEnd);
+  lexer.SetCommentRetentionState(true);
+
+  std::optional<size_t> pendingNameBegin;
+  Token token;
+  while (true) {
+    lexer.LexFromRawLexer(token);
+    if (token.is(tok::eof))
+      return std::nullopt;
+
+    // Whitespace is not returned by the raw lexer, and comments are not
+    // preprocessing tokens for function-like invocation adjacency.
+    if (token.is(tok::comment))
+      continue;
+
+    if (pendingNameBegin) {
+      if (token.is(tok::l_paren))
+        return *pendingNameBegin;
+      pendingNameBegin.reset();
+    }
+
+    if (!token.is(tok::raw_identifier) && !token.is(tok::identifier))
+      continue;
+
+    const size_t localBegin = tokenOffsetFromBase(token, baseLoc);
+    const size_t localEnd = tokenEndOffsetFromBase(token, baseLoc);
+    if (localEnd < localBegin || localEnd > text.size())
+      continue;
+
+    if (StringRef(lexBuf).slice(localBegin, localEnd) == name)
+      pendingNameBegin = localBegin;
+  }
+}
+
+/// True when `text` plus the optional preserved `suffix` contains a real
+/// function-like invocation of `name`.
+bool RefoldEngine::FunctionLikeInvocationAppearsInText(
+    StringRef name, StringRef text, StringRef suffix) const {
+  return FirstFunctionLikeInvocationOffsetInText(name, text, suffix).has_value();
+}
+
+/// Classify the source observation needed to make `directive` visible.
+///
+/// Object-like definitions and #undef transitions are conservative identifier
+/// observations.  Function-like #defines use the narrower NAME(`...`)
+/// observation class, because a bare identifier spelling does not invoke them.
+RefoldEngine::MacroStateObservationKind
+RefoldEngine::MacroStateObservationKindForDirective(
+    const RefoldModel::MacroDirective &directive, StringRef macroName) const {
+  if (directive.subkind == "#define" && directive.name == macroName &&
+      directive.functionLike)
+    return MacroStateObservationKind::FunctionLikeInvocation;
+  return MacroStateObservationKind::IdentifierToken;
+}
+
+/// Return the first byte offset in `text` that would observe the macro-state
+/// transition represented by `directive`.
+///
+/// This centralizes the object-like/function-like distinction so TU repair,
+/// include materialization, and fallback proofs apply the same observation
+/// invariant.
+std::optional<size_t> RefoldEngine::FirstMacroStateObservationOffsetInText(
+    const RefoldModel::MacroDirective &directive, StringRef macroName,
+    StringRef text, StringRef suffix) const {
+  switch (MacroStateObservationKindForDirective(directive, macroName)) {
+  case MacroStateObservationKind::IdentifierToken:
+    return FirstRawIdentifierObservationOffsetInText(macroName, text);
+  case MacroStateObservationKind::FunctionLikeInvocation:
+    return FirstFunctionLikeInvocationOffsetInText(macroName, text, suffix);
+  }
+  return std::nullopt;
+}
+
+/// True when a replacement payload would be preprocessed differently if
+/// `directive` were active before that payload.
+bool RefoldEngine::ReplacementObservesMacroStateDirective(
+    const RefoldModel::MacroDirective &directive, StringRef replacement,
+    bool unprovenObserves) const {
+  if (directive.subkind != "#define" && directive.subkind != "#undef")
+    return false;
+  if (directive.name.empty())
+    return unprovenObserves;
+  return FirstMacroStateObservationOffsetInText(directive, directive.name,
+                                                replacement)
+      .has_value();
+}
+
+/// True when `text` contains a physical preprocessor directive line.
+///
+/// Macro-state transitions may cross ordinary source bytes only when those bytes
+/// cannot observe the moved transition.  Crossing a directive line is treated as
+/// unsafe by default because conditionals, includes, and macro transitions have
+/// structural effects beyond token-level identifier observation.
+bool RefoldEngine::TextContainsDirectiveLine(StringRef text) const {
+  bool atLineStart = true;
+  bool onlyHorizontalWsOnLine = true;
+  for (char c : text) {
+    if (atLineStart) {
+      atLineStart = false;
+      onlyHorizontalWsOnLine = true;
+    }
+    if (c == '\n') {
+      atLineStart = true;
+      onlyHorizontalWsOnLine = true;
+      continue;
+    }
+    if (onlyHorizontalWsOnLine && stringutils::isNonNewlineWs(c))
+      continue;
+    if (onlyHorizontalWsOnLine && c == '#')
+      return true;
+    onlyHorizontalWsOnLine = false;
+  }
+  return false;
+}
+
+/// True when moving `directive` across `chunk` could change how that chunk
+/// preprocesses.
+///
+/// `following` is part of the proof for function-like definitions: NAME at the
+/// end of `chunk` followed by `(` in the following source still observes the
+/// definition across the movement boundary.
+bool RefoldEngine::SourceChunkObservesMacroStateDirectiveWhenCrossed(
+    const RefoldModel::MacroDirective &directive, StringRef macroName,
+    StringRef chunk, StringRef following) const {
+  if (chunk.empty())
+    return false;
+  if (TextContainsDirectiveLine(chunk))
+    return true;
+  return FirstMacroStateObservationOffsetInText(directive, macroName, chunk,
+                                                following)
+      .has_value();
+}
+
+/// Recover the complete physical source interval for a recorded macro-state
+/// directive line.
+///
+/// The producer anchors MacroDirective::siteB at the macro name, not at the `#`.
+/// This helper reparses the recorded directive spelling to find the name offset,
+/// translates that anchor back to the physical line start, and accepts the
+/// interval only if the recovered file bytes exactly equal MacroDirective::text.
+std::optional<RefoldEngine::MacroStateDirectiveLineInterval>
+RefoldEngine::RecoverMacroStateDirectiveLineInterval(
+    const RefoldModel::MacroDirective &directive, StringRef expectedPath,
+    StringRef fileBytes,
+    std::optional<uint64_t> requiredOwnerIncludeId) const {
+  if (directive.subkind != "#define" && directive.subkind != "#undef")
+    return std::nullopt;
+  if (directive.name.empty() || directive.text.empty())
+    return std::nullopt;
+  if (!PathsEqual(directive.sitePath, expectedPath))
+    return std::nullopt;
+
+  if (requiredOwnerIncludeId) {
+    if (!directive.ownerIncludeId ||
+        *directive.ownerIncludeId != *requiredOwnerIncludeId)
+      return std::nullopt;
+  } else if (directive.ownerIncludeId) {
+    return std::nullopt;
+  }
+
+  StringRef text = directive.text;
+  size_t pos = 0;
+  stringutils::skipNonNewlineWs(text, pos);
+  if (pos >= text.size() || text[pos] != '#')
+    return std::nullopt;
+  ++pos;
+  stringutils::skipNonNewlineWs(text, pos);
+
+  StringRef keyword = directive.subkind.drop_front();
+  if (!text.substr(pos).starts_with(keyword))
+    return std::nullopt;
+  pos += keyword.size();
+  if (pos < text.size() && stringutils::isIdentPart(text[pos]))
+    return std::nullopt;
+  stringutils::skipNonNewlineWs(text, pos);
+
+  const size_t nameTextBegin = pos;
+  if (pos >= text.size() || !stringutils::isIdentStart(text[pos]))
+    return std::nullopt;
+  ++pos;
+  while (pos < text.size() && stringutils::isIdentPart(text[pos]))
+    ++pos;
+  if (text.slice(nameTextBegin, pos) != directive.name)
+    return std::nullopt;
+
+  if (directive.siteB < nameTextBegin)
+    return std::nullopt;
+  const uint64_t fileBegin = directive.siteB - nameTextBegin;
+  const uint64_t fileEnd = fileBegin + text.size();
+  if (fileBegin >= fileEnd || fileEnd > fileBytes.size())
+    return std::nullopt;
+  if (fileBytes.slice(fileBegin, fileEnd) != text)
+    return std::nullopt;
+
+  MacroStateDirectiveLineInterval result;
+  result.directive = &directive;
+  result.begin = fileBegin;
+  result.end = fileEnd;
+  result.name = directive.name;
+  return result;
+}
+
+/// Recover the source interval occupied by the replacement list of the macro
+/// definition used by `invocation`.
+///
+/// The interval is used by directive-repair logic that needs to reason about
+/// preserving or replaying only the definition body, not the `#define NAME(...)`
+/// prefix.  The parse is intentionally shallow and fail-closed: it recognizes
+/// the directive prefix and balanced function-like parameter list, then returns
+/// the remaining replacement-list bytes.
+std::optional<RefoldEngine::MacroDefinitionReplacementListInterval>
+RefoldEngine::RecoverMacroDefinitionReplacementListInterval(
+    const RefoldModel::MacroInvocation &invocation) const {
+  if (!invocation.definitionDirectiveId)
+    return std::nullopt;
+
+  const RefoldModel::MacroDirective *definition = nullptr;
+  for (const auto &directive : model_.GetMacroDirectives())
+    if (directive.id == *invocation.definitionDirectiveId) {
+      definition = &directive;
+      break;
+    }
+
+  if (!definition || definition->subkind != "#define")
+    return std::nullopt;
+  if (definition->name != invocation.name)
+    return std::nullopt;
+
+  StringRef text = definition->text;
+  size_t pos = 0;
+  stringutils::skipNonNewlineWs(text, pos);
+  if (pos >= text.size() || text[pos] != '#')
+    return std::nullopt;
+  ++pos;
+  stringutils::skipNonNewlineWs(text, pos);
+
+  if (!text.substr(pos).starts_with("define"))
+    return std::nullopt;
+  pos += StringRef("define").size();
+  if (pos < text.size() && stringutils::isIdentPart(text[pos]))
+    return std::nullopt;
+  stringutils::skipNonNewlineWs(text, pos);
+
+  const size_t nameTextBegin = pos;
+  if (!text.substr(pos).starts_with(invocation.name))
+    return std::nullopt;
+  pos += invocation.name.size();
+  if (pos < text.size() && stringutils::isIdentPart(text[pos]))
+    return std::nullopt;
+
+  if (invocation.subkind == "func") {
+    if (pos >= text.size() || text[pos] != '(')
+      return std::nullopt;
+
+    // Skip the function-like parameter list using only parenthesis balance.
+    // The macro replacement list begins at the first byte after the matching
+    // `)`, including any horizontal whitespace that the original source kept.
+    unsigned depth = 0;
+    while (pos < text.size()) {
+      char ch = text[pos++];
+      if (ch == '(') {
+        ++depth;
+        continue;
+      }
+      if (ch == ')') {
+        if (depth == 0)
+          return std::nullopt;
+        --depth;
+        if (depth == 0)
+          break;
+      }
+    }
+    if (depth != 0)
+      return std::nullopt;
+  }
+
+  if (definition->siteB < nameTextBegin)
+    return std::nullopt;
+
+  MacroDefinitionReplacementListInterval result;
+  result.directive = definition;
+  result.nameTextBegin = nameTextBegin;
+  result.replacementTextBegin = pos;
+  result.fileBase = definition->siteB - nameTextBegin;
+  result.fileBegin = result.fileBase + pos;
+  result.fileEnd = definition->siteE;
+  if (result.fileBegin > result.fileEnd ||
+      result.fileEnd > result.fileBase + text.size())
+    return std::nullopt;
+  return result;
+}
+
 
 std::string RefoldEngine::PadAtBoundaries(StringRef base, size_t start,
                                           size_t end, std::string text,
@@ -12108,6 +12199,9 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         patch.materializedBTokEnd = bTokEnd;
       };
 
+  // Stamp the B-token envelope corresponding to this invocation's whole A-side
+  // macro cover.  The envelope is proof metadata, not replacement text: later
+  // composition uses it to know which B tokens the macro patch materializes.
   auto stampMacroPatchWholeExpansionBRange = [&](MacroPatch &patch) -> bool {
     std::optional<std::pair<uint64_t, uint64_t>> cover =
         GetWholeCoverATokRange(m);
@@ -12130,63 +12224,134 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     return idx < m.defParams.size() && m.defParams[idx].variadic;
   };
 
-  // Detect a top-level comma in an argument replacement by lexing the
-  // replacement text with Clang's raw lexer and tracking only delimiter depth.
+  // Detect a comma that would split this replacement if it were written as one
+  // non-variadic macro argument.  This uses macro-argument collection rules:
+  // only parentheses protect commas; brackets/braces do not.
   auto hasTopLevelComma = [&](StringRef s) -> bool {
-    const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
-    std::string lexBuf = s.str();
-    lexBuf.push_back('\0');
-    const char *bufStart = lexBuf.data();
-    const char *bufEnd = bufStart + s.size();
-    Lexer lex(baseLoc, lexLang_, bufStart, bufStart, bufEnd);
-
-    int parenDepth = 0;
-    int bracketDepth = 0;
-    int braceDepth = 0;
-    Token tok;
-
-    while (true) {
-      lex.LexFromRawLexer(tok);
-      if (tok.is(tok::eof))
-        return false;
-      if (tok.is(tok::comment))
-        continue;
-
-      switch (tok.getKind()) {
-      case tok::l_paren:
-        ++parenDepth;
-        break;
-      case tok::r_paren:
-        if (parenDepth > 0)
-          --parenDepth;
-        break;
-      case tok::l_square:
-        ++bracketDepth;
-        break;
-      case tok::r_square:
-        if (bracketDepth > 0)
-          --bracketDepth;
-        break;
-      case tok::l_brace:
-        ++braceDepth;
-        break;
-      case tok::r_brace:
-        if (braceDepth > 0)
-          --braceDepth;
-        break;
-      case tok::comma:
-        if (parenDepth == 0 && bracketDepth == 0 && braceDepth == 0)
-          return true;
-        break;
-      default:
-        break;
-      }
-    }
+    return hasTopLevelCommaWithLexer(s, lexLang_);
   };
 
   trace("macro/args", "  invArgRanges({0})={1}", invArgRanges.size(),
         stringutils::rangesToStringWithSlices(baseInvText, invArgRanges));
 
+  // Derive one standard argument span per formal from the invocation spelling
+  // currently being rebuilt.
+  //
+  // Producer arg-span indices can reflect a higher-level source range such as
+  // `arr[1, 2]` or `{1, 2}` even though the preprocessor's argument collector
+  // splits those bytes at the comma for the current macro.  This repair is
+  // accepted only when the maximal standard spans plus body spans exactly tile
+  // the invocation's whole expansion cover; that exact tiling proves we are
+  // merely rebasing formal indices, not inventing a new expansion structure.
+  auto getCurrentLevelStandardArgSpans = [&]()
+      -> std::optional<std::vector<RefoldModel::PPArgSpan>> {
+    auto coverOpt = GetWholeCoverATokRange(m);
+    if (invArgRanges.empty() || !coverOpt ||
+        coverOpt->first >= coverOpt->second)
+      return std::nullopt;
+
+    SmallVector<RefoldModel::PPArgSpan, 16> standard;
+    for (const auto &as : m.argSpans) {
+      if (as.kind == PPArgSpanKind::Standard && as.begin < as.end)
+        standard.push_back(as);
+    }
+    if (standard.empty())
+      return std::nullopt;
+
+    // Drop spans contained in another standard span so nested child-argument
+    // evidence cannot be mistaken for a current invocation formal.
+    SmallVector<RefoldModel::PPArgSpan, 16> maximal;
+    for (const auto &cand : standard) {
+      bool contained = false;
+      for (const auto &other : standard) {
+        if (&cand == &other)
+          continue;
+        if (other.begin <= cand.begin && cand.end <= other.end &&
+            (other.begin < cand.begin || cand.end < other.end)) {
+          contained = true;
+          break;
+        }
+      }
+      if (!contained)
+        maximal.push_back(cand);
+    }
+
+    if (maximal.size() != invArgRanges.size())
+      return std::nullopt;
+
+    llvm::sort(maximal, [](const RefoldModel::PPArgSpan &lhs,
+                           const RefoldModel::PPArgSpan &rhs) {
+      if (lhs.begin != rhs.begin)
+        return lhs.begin < rhs.begin;
+      if (lhs.end != rhs.end)
+        return lhs.end < rhs.end;
+      return lhs.argIdx < rhs.argIdx;
+    });
+
+    for (size_t i = 1; i < maximal.size(); ++i) {
+      if (maximal[i - 1].end > maximal[i].begin)
+        return std::nullopt;
+    }
+
+    // Prove that body spans plus maximal standard spans are an exact, ordered
+    // partition of the macro cover.  Any gap, overlap, or out-of-cover element
+    // means the formal repair is not first-order complete enough to trust.
+    struct CoverElem {
+      uint64_t begin = 0;
+      uint64_t end = 0;
+    };
+    SmallVector<CoverElem, 32> coverElems;
+    for (const auto &bs : m.bodySpans) {
+      if (bs.begin < bs.end)
+        coverElems.push_back({bs.begin, bs.end});
+    }
+    for (const auto &as : maximal)
+      coverElems.push_back({as.begin, as.end});
+
+    llvm::sort(coverElems, [](const CoverElem &lhs, const CoverElem &rhs) {
+      if (lhs.begin != rhs.begin)
+        return lhs.begin < rhs.begin;
+      return lhs.end < rhs.end;
+    });
+
+    uint64_t cursor = coverOpt->first;
+    for (const CoverElem &elem : coverElems) {
+      if (elem.begin != cursor || elem.end < elem.begin ||
+          elem.end > coverOpt->second)
+        return std::nullopt;
+      cursor = elem.end;
+    }
+    if (cursor != coverOpt->second)
+      return std::nullopt;
+
+    std::vector<RefoldModel::PPArgSpan> out;
+    out.reserve(maximal.size());
+    bool changed = false;
+    for (size_t i = 0; i < maximal.size(); ++i) {
+      RefoldModel::PPArgSpan span = maximal[i];
+      if (span.argIdx != i)
+        changed = true;
+      span.argIdx = static_cast<uint32_t>(i);
+      out.push_back(span);
+    }
+
+    if (changed) {
+      trace("macro/args",
+            "  repaired standard arg-span formal indices from current "
+            "invocation parsing: inv id={0} name={1}",
+            m.id, m.name);
+    }
+    return out;
+  };
+
+  // Try a whole-invocation template proof before the ordinary hunk-local
+  // args-only path.
+  //
+  // This handles split current-level arguments where the changed expansion is
+  // distributed across several PPArgSpans and body tokens.  The solver models
+  // the expansion as an ordered tape of fixed macro-body spans plus standard
+  // argument spans, then rebuilds the call only when that tape explains both the
+  // old A-side expansion and the new B-side expansion exactly.
   auto tryTemplateSolvedArgsOnlyPatch = [&]() -> std::optional<MacroPatch> {
     // Treat the whole macro expansion as a deterministic template made of
     // fixed body tokens and argument-occurrence variables. This proves split
@@ -12198,6 +12363,415 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     auto cover = GetWholeCoverATokRange(m);
     if (!cover)
       return std::nullopt;
+
+    // Replace a nested expansion inside one formal only when the old expansion
+    // has a unique trimmed occurrence in that formal's spelling.  Ambiguous
+    // occurrences are rejected so lexical child preservation stays deterministic.
+    auto findUniqueTrimmedSubstring = [](StringRef haystack, StringRef needle)
+        -> std::optional<std::pair<size_t, size_t>> {
+      needle = needle.trim();
+      if (needle.empty())
+        return std::nullopt;
+      size_t pos = haystack.find(needle);
+      if (pos == StringRef::npos)
+        return std::nullopt;
+      if (haystack.find(needle, pos + 1) != StringRef::npos)
+        return std::nullopt;
+      return std::make_pair(pos, pos + needle.size());
+    };
+
+    // A compact proof surface for one macro invocation at the level currently
+    // being reconstructed.  `standardSpans` are rebased to parsed formal slots;
+    // `[coverBegin, coverEnd)` is the exact A-token tape covered by those spans
+    // and fixed body spans.
+    struct CurrentLevelTemplateSurface {
+      std::vector<RefoldModel::PPArgSpan> standardSpans;
+      uint64_t coverBegin = 0;
+      uint64_t coverEnd = 0;
+    };
+
+    // Build the current-level template surface for `inv`.
+    //
+    // Nested child macro spans are intentionally ignored by taking only maximal
+    // standard spans.  The exact-cover check below then proves that the selected
+    // maximal spans and macro body spans form a contiguous expansion tape with no
+    // gaps, overlaps, or hidden side material.
+    auto getCurrentLevelTemplateSurfaceForInvocation =
+        [&](const RefoldModel::MacroInvocation &inv,
+            ArrayRef<std::pair<size_t, size_t>> formalRanges)
+        -> std::optional<CurrentLevelTemplateSurface> {
+      if (formalRanges.empty())
+        return std::nullopt;
+
+      SmallVector<RefoldModel::PPArgSpan, 16> standard;
+      for (const auto &as : inv.argSpans) {
+        if (as.kind == PPArgSpanKind::Standard && as.begin < as.end)
+          standard.push_back(as);
+      }
+      if (standard.empty())
+        return std::nullopt;
+
+      SmallVector<RefoldModel::PPArgSpan, 16> maximal;
+      for (const auto &cand : standard) {
+        bool contained = false;
+        for (const auto &other : standard) {
+          if (&cand == &other)
+            continue;
+          if (other.begin <= cand.begin && cand.end <= other.end &&
+              (other.begin < cand.begin || cand.end < other.end)) {
+            contained = true;
+            break;
+          }
+        }
+        if (!contained)
+          maximal.push_back(cand);
+      }
+
+      if (maximal.size() != formalRanges.size())
+        return std::nullopt;
+
+      llvm::sort(maximal, [](const RefoldModel::PPArgSpan &lhs,
+                             const RefoldModel::PPArgSpan &rhs) {
+        if (lhs.begin != rhs.begin)
+          return lhs.begin < rhs.begin;
+        if (lhs.end != rhs.end)
+          return lhs.end < rhs.end;
+        return lhs.argIdx < rhs.argIdx;
+      });
+
+      struct CoverElem {
+        uint64_t begin = 0;
+        uint64_t end = 0;
+      };
+      SmallVector<CoverElem, 32> coverElems;
+      for (const auto &bs : inv.bodySpans) {
+        if (bs.begin < bs.end)
+          coverElems.push_back({bs.begin, bs.end});
+      }
+      for (const auto &as : maximal)
+        coverElems.push_back({as.begin, as.end});
+      if (coverElems.empty())
+        return std::nullopt;
+
+      llvm::sort(coverElems, [](const CoverElem &lhs, const CoverElem &rhs) {
+        if (lhs.begin != rhs.begin)
+          return lhs.begin < rhs.begin;
+        return lhs.end < rhs.end;
+      });
+
+      const uint64_t coverBegin = coverElems.front().begin;
+      const uint64_t coverEnd = coverElems.back().end;
+      if (coverBegin >= coverEnd)
+        return std::nullopt;
+
+      uint64_t cursor = coverBegin;
+      for (const CoverElem &elem : coverElems) {
+        if (elem.begin != cursor || elem.end < elem.begin ||
+            elem.end > coverEnd)
+          return std::nullopt;
+        cursor = elem.end;
+      }
+      if (cursor != coverEnd)
+        return std::nullopt;
+
+      CurrentLevelTemplateSurface surface;
+      surface.coverBegin = coverBegin;
+      surface.coverEnd = coverEnd;
+      surface.standardSpans.reserve(maximal.size());
+      for (size_t i = 0; i < maximal.size(); ++i) {
+        RefoldModel::PPArgSpan span = maximal[i];
+        span.argIdx = static_cast<uint32_t>(i);
+        surface.standardSpans.push_back(span);
+      }
+      return surface;
+    };
+
+    // Convenience wrapper used by recursive reconstruction when only the
+    // rebased standard spans are needed.
+    auto getCurrentLevelStandardArgSpansForInvocation =
+        [&](const RefoldModel::MacroInvocation &inv,
+            ArrayRef<std::pair<size_t, size_t>> formalRanges)
+        -> std::optional<std::vector<RefoldModel::PPArgSpan>> {
+      auto surface =
+          getCurrentLevelTemplateSurfaceForInvocation(inv, formalRanges);
+      if (!surface)
+        return std::nullopt;
+      return std::move(surface->standardSpans);
+    };
+
+    // Return the old/new expansion text for `inv` using its current-level
+    // template surface rather than the broader producer whole-cover.
+    //
+    // This matters for nested calls inside a split parent argument: the producer
+    // whole-cover may include parent context, while lexical child preservation
+    // needs the child's local expansion surface, e.g. `1 + 2 -> 10 + 20`.
+    auto getCurrentLevelExpansionTextForInvocation =
+        [&](const RefoldModel::MacroInvocation &inv)
+        -> std::optional<std::pair<std::string, std::string>> {
+      if (!inv.invText)
+        return std::nullopt;
+      auto formalRangesOpt =
+          GetMacroInvocationFormalArgContentRanges(inv, *inv.invText);
+      if (!formalRangesOpt)
+        return std::nullopt;
+
+      auto surface =
+          getCurrentLevelTemplateSurfaceForInvocation(inv, *formalRangesOpt);
+      if (!surface || surface->coverBegin >= surface->coverEnd)
+        return std::nullopt;
+
+      auto bEnv = MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
+          surface->coverBegin, surface->coverEnd);
+      if (!bEnv || bEnv->first >= bEnv->second)
+        return std::nullopt;
+
+      return std::make_pair(
+          SliceASource(surface->coverBegin, surface->coverEnd).trim().str(),
+          SliceBSource(bEnv->first, bEnv->second).trim().str());
+    };
+
+    // Recursively rebuild a macro invocation's source spelling from its
+    // current-level template proof.  The recursion is used only to preserve
+    // nested lexical child invocations whose old and new local expansion surfaces
+    // can be proven to bridge the parent argument.
+    std::function<std::optional<std::string>(
+        const RefoldModel::MacroInvocation &, unsigned)>
+        buildInvocationSyntaxFromCurrentLevelTemplate;
+
+    buildInvocationSyntaxFromCurrentLevelTemplate =
+        [&](const RefoldModel::MacroInvocation &inv, unsigned depth)
+        -> std::optional<std::string> {
+      if (depth > 8 || !inv.invText || !inv.invB || !inv.invE ||
+          !inv.stringifySpans.empty() || !inv.pasteSpans.empty())
+        return std::nullopt;
+
+      auto formalRangesOpt =
+          GetMacroInvocationFormalArgContentRanges(inv, *inv.invText);
+      if (!formalRangesOpt)
+        return std::nullopt;
+      const auto &formalRanges = *formalRangesOpt;
+
+      auto standardSpansOpt =
+          getCurrentLevelStandardArgSpansForInvocation(inv, formalRanges);
+      if (!standardSpansOpt)
+        return std::nullopt;
+      const auto &standardSpans = *standardSpansOpt;
+      if (standardSpans.size() != formalRanges.size())
+        return std::nullopt;
+
+      // Accumulate replacements by parsed formal slot.  Each replacement is
+      // derived from one standard span's old expansion and its mapped B-side
+      // expansion, then later applied directly to the invocation spelling.
+      DenseMap<uint32_t, std::string> replByFormal;
+      for (size_t i = 0; i < standardSpans.size(); ++i) {
+        const RefoldModel::PPArgSpan &sp = standardSpans[i];
+        if (sp.argIdx != i || i >= formalRanges.size())
+          return std::nullopt;
+
+        const auto &argRange = formalRanges[i];
+        if (argRange.second < argRange.first ||
+            argRange.second > inv.invText->size())
+          return std::nullopt;
+
+        StringRef rawArg = StringRef(*inv.invText)
+                               .slice(argRange.first, argRange.second);
+        size_t trimLead = 0;
+        size_t trimEnd = rawArg.size();
+        std::tie(trimLead, trimEnd) =
+            stringutils::trimWsRange(rawArg, 0, rawArg.size());
+        StringRef baseTrim = rawArg.slice(trimLead, trimEnd);
+
+        StringRef oldExpansion = SliceASource(sp.begin, sp.end).trim();
+        auto bEnv = MapAToBTokenEnvelopeByPPArgSpan(sp);
+        if (!bEnv)
+          return std::nullopt;
+        StringRef newExpansion = SliceBSource(bEnv->first, bEnv->second).trim();
+        if (oldExpansion.empty() || newExpansion.empty())
+          return std::nullopt;
+
+        std::optional<std::string> replacement;
+        if (oldExpansion == baseTrim) {
+          replacement = newExpansion.str();
+        } else if (auto loc = findUniqueTrimmedSubstring(baseTrim, oldExpansion)) {
+          replacement = stringutils::replaceRange(baseTrim.str(), loc->first,
+                                                 loc->second, newExpansion);
+        } else {
+          // The formal spelling does not directly contain its old expansion; it
+          // may contain a nested macro invocation whose expansion accounts for
+          // that text.  Preserve such a child only if replacing the child
+          // spelling with its proven old expansion reconstructs `oldExpansion`,
+          // and replacing it with its proven new expansion reconstructs
+          // `newExpansion`.
+          if (!inv.invFile)
+            return std::nullopt;
+
+          struct ChildSlotRewrite {
+            size_t relBegin = 0;
+            size_t relEnd = 0;
+            std::string oldExpansion;
+            std::string newExpansion;
+            std::string newSyntax;
+          };
+          SmallVector<ChildSlotRewrite, 4> childSlots;
+
+          const uint64_t absTrimBegin = *inv.invB + argRange.first + trimLead;
+          const uint64_t absTrimEnd = *inv.invB + argRange.first + trimEnd;
+
+          // Search lexical child invocations contained in this formal slot.
+          // `callerMacroId` is honored when present, but absence of that edge is
+          // not enough to accept a child; the file/range containment and the
+          // expansion-bridge proof below still have to succeed.
+          for (const auto &child : model_.GetMacroInvocations()) {
+            if (child.id == inv.id || !child.invFile || !child.invB ||
+                !child.invE || !child.invText)
+              continue;
+            if (*child.invFile != *inv.invFile)
+              continue;
+            if (child.callerMacroId && *child.callerMacroId != inv.id)
+              continue;
+            if (*child.invB < absTrimBegin || *child.invE > absTrimEnd ||
+                *child.invE <= *child.invB)
+              continue;
+
+            auto childExpansion =
+                getCurrentLevelExpansionTextForInvocation(child);
+            if (!childExpansion)
+              continue;
+            auto childNewSyntax =
+                buildInvocationSyntaxFromCurrentLevelTemplate(child, depth + 1);
+            if (!childNewSyntax)
+              continue;
+
+            const uint64_t relB64 = *child.invB - absTrimBegin;
+            const uint64_t relE64 = *child.invE - absTrimBegin;
+            if (relE64 < relB64 || relE64 > baseTrim.size())
+              continue;
+
+            childSlots.push_back(ChildSlotRewrite{
+                static_cast<size_t>(relB64), static_cast<size_t>(relE64),
+                StringRef(childExpansion->first).trim().str(),
+                StringRef(childExpansion->second).trim().str(),
+                StringRef(*childNewSyntax).trim().str()});
+          }
+
+          if (childSlots.empty())
+            return std::nullopt;
+
+          // Apply child replacements from right to left so byte offsets remain
+          // relative to the original formal spelling.  Overlap is rejected by
+          // the monotonic `previousBegin` check in the loop.
+          llvm::sort(childSlots, [](const ChildSlotRewrite &lhs,
+                                    const ChildSlotRewrite &rhs) {
+            if (lhs.relBegin != rhs.relBegin)
+              return lhs.relBegin > rhs.relBegin;
+            return lhs.relEnd > rhs.relEnd;
+          });
+
+          // Maintain three parallel projections of the same formal spelling:
+          //   * oldExpanded: child syntax replaced by old local expansions;
+          //   * newExpanded: child syntax replaced by new local expansions;
+          //   * syntaxExpanded: child syntax replaced by updated child calls.
+          // The first two must exactly equal the parent formal's old/new
+          // expansion slices before the third may be used as source output.
+          std::string oldExpanded = baseTrim.str();
+          std::string newExpanded = baseTrim.str();
+          std::string syntaxExpanded = baseTrim.str();
+          size_t previousBegin = std::numeric_limits<size_t>::max();
+          for (const ChildSlotRewrite &slot : childSlots) {
+            if (slot.relEnd < slot.relBegin || slot.relEnd > baseTrim.size())
+              return std::nullopt;
+            if (previousBegin != std::numeric_limits<size_t>::max() &&
+                slot.relEnd > previousBegin)
+              return std::nullopt;
+            previousBegin = slot.relBegin;
+
+            oldExpanded = stringutils::replaceRange(
+                oldExpanded, slot.relBegin, slot.relEnd, slot.oldExpansion);
+            newExpanded = stringutils::replaceRange(
+                newExpanded, slot.relBegin, slot.relEnd, slot.newExpansion);
+            syntaxExpanded = stringutils::replaceRange(
+                syntaxExpanded, slot.relBegin, slot.relEnd, slot.newSyntax);
+          }
+
+          if (StringRef(oldExpanded).trim() != oldExpansion ||
+              StringRef(newExpanded).trim() != newExpansion)
+            return std::nullopt;
+          replacement = StringRef(syntaxExpanded).trim().str();
+        }
+
+        if (!replacement || StringRef(*replacement).trim().empty())
+          return std::nullopt;
+        // Do not emit a replacement that would change the current invocation's
+        // arity.  Macro argument collection protects commas only with nested
+        // parentheses; brackets and braces deliberately do not suppress this
+        // check for non-variadic formals.
+        const bool allowComma =
+            i < inv.defParams.size() && inv.defParams[i].variadic;
+        if (!allowComma &&
+            hasTopLevelCommaWithLexer(StringRef(*replacement), lexLang_))
+          return std::nullopt;
+
+        if (StringRef(*replacement).trim() != baseTrim)
+          replByFormal[static_cast<uint32_t>(i)] =
+              StringRef(*replacement).trim().str();
+      }
+
+      if (replByFormal.empty())
+        return std::nullopt;
+
+      // Apply formal-slot edits to the invocation spelling right-to-left, again
+      // preserving original byte offsets and avoiding dependence on map order.
+      struct LocalEdit {
+        size_t begin = 0;
+        size_t end = 0;
+        std::string repl;
+      };
+      SmallVector<LocalEdit, 8> edits;
+      for (const auto &entry : replByFormal) {
+        const uint32_t argIdx = entry.first;
+        if (argIdx >= formalRanges.size())
+          return std::nullopt;
+        const auto &range = formalRanges[argIdx];
+        edits.push_back(LocalEdit{range.first, range.second, entry.second});
+      }
+      llvm::sort(edits, [](const LocalEdit &lhs, const LocalEdit &rhs) {
+        return lhs.begin > rhs.begin;
+      });
+
+      std::string rewritten = inv.invText->str();
+      for (const LocalEdit &edit : edits) {
+        if (edit.end < edit.begin || edit.end > rewritten.size())
+          return std::nullopt;
+        rewritten = stringutils::replaceRange(rewritten, edit.begin, edit.end,
+                                              edit.repl);
+      }
+      return StringRef(rewritten).trim().str();
+    };
+
+    // Prefer the current-level template proof when it can rewrite the whole
+    // invocation.  It captures the brace/bracket comma-split cases before the
+    // older hunk-local machinery has a chance to accept a partial patch.
+    if (auto currentLevelRewrite =
+            buildInvocationSyntaxFromCurrentLevelTemplate(m, 0)) {
+      if (StringRef(*currentLevelRewrite).trim() != baseInvText.trim()) {
+        trace("macro/template",
+              "current-level template solver SUCCESS root id={0} name={1} "
+              "coverA=[{2},{3}) newInv='{4}'",
+              m.id, m.name, cover->first, cover->second,
+              stringutils::showWsWithClip(*currentLevelRewrite, 240));
+
+        MacroPatch patch{*m.invB, *m.invE, std::move(*currentLevelRewrite),
+                         m.id};
+        patch.materializedOutputByteStart = 0;
+        patch.materializedOutputByteEnd = patch.replacement.size();
+        patch.hasMaterializedOutputByteRange = true;
+        stampMacroPatchWholeExpansionBRange(patch);
+        StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyStandard,
+                             /*validated=*/true,
+                             /*structurePreserving=*/true, m.id);
+        return patch;
+      }
+    }
 
     struct TemplateElem {
       bool isArg = false;
@@ -12216,8 +12790,17 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         elems.push_back({false, bs.begin, bs.end, 0, 0});
     }
 
+    // Reuse the current-level formal repair in the older template path too.
+    // If exact tiling cannot be proven, leave the producer arg-span indexing
+    // untouched and let the existing checks fail closed as before.
+    std::vector<RefoldModel::PPArgSpan> templateArgSpans;
+    if (auto currentLevelSpans = getCurrentLevelStandardArgSpans())
+      templateArgSpans = std::move(*currentLevelSpans);
+    else
+      templateArgSpans = m.argSpans;
+
     size_t occurrenceCount = 0;
-    for (const auto &as : m.argSpans) {
+    for (const auto &as : templateArgSpans) {
       if (as.kind != PPArgSpanKind::Standard || as.begin >= as.end)
         continue;
       if (static_cast<size_t>(as.argIdx) >= invArgRanges.size())
@@ -12827,14 +13410,133 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
   // Collect arg-span occurrences (and stringify occurrences) and require the
   // entire hunk to be covered by those spans. Then derive per-arg replacements
   // from the B slices.
+  // Resolve the #define that produced this invocation, if the model recorded
+  // one.  The pointer is used only while the immutable model directive list is
+  // alive.
+  auto getDefinitionDirective = [&]() -> const RefoldModel::MacroDirective * {
+    if (!m.definitionDirectiveId)
+      return nullptr;
+    for (const RefoldModel::MacroDirective &directive :
+         model_.GetMacroDirectives()) {
+      if (directive.id == *m.definitionDirectiveId)
+        return &directive;
+    }
+    return nullptr;
+  };
+
+  bool replayedStandardArgSpanFormalIndices = false;
+  auto getDefinitionReplayedStandardArgSpans = [&]() {
+    std::vector<RefoldModel::PPArgSpan> out = m.argSpans;
+
+    // Producer arg indices can be ambiguous when an actual contains a comma
+    // that is not protected by parentheses, e.g. `M(arr[1, 2], 3)`.  Clang's
+    // source range for the first written argument may cover the bracketed text,
+    // while macro replacement still substitutes the comma-separated pieces into
+    // successive formals.  Repair only the fully provable case: the definition
+    // replacement-list tape and the recorded standard spans must replay the
+    // macro's complete A-side cover exactly, with one non-empty standard span
+    // per replacement-list parameter reference.
+    const RefoldModel::MacroDirective *definition = getDefinitionDirective();
+    if (!definition || definition->subkind != "#define" ||
+        !definition->functionLike || definition->name != m.name ||
+        definition->defParams.size() != m.defParams.size() || out.empty() ||
+        !m.stringifySpans.empty() || !m.pasteSpans.empty() ||
+        !m.cover.IsValid() || m.cover.end > aToks_.size())
+      return out;
+
+    // Extract the formal-reference order from the macro replacement-list tape.
+    // Stringify and paste are excluded because their spelling/segmentation rules
+    // are not ordinary standard-argument substitution.
+    SmallVector<uint32_t, 8> formalSeq;
+    formalSeq.reserve(definition->replacementTokens.size());
+    for (const RefoldModel::MacroReplacementToken &token :
+         definition->replacementTokens) {
+      if (token.spelling == "#" || token.spelling == "##")
+        return out;
+      if (token.kind != RefoldModel::MacroReplacementTokenKind::ParamRef)
+        continue;
+      if (!token.paramIndex || *token.paramIndex >= m.defParams.size())
+        return out;
+      formalSeq.push_back(*token.paramIndex);
+    }
+
+    if (formalSeq.size() != out.size())
+      return out;
+
+    llvm::sort(out, [](const RefoldModel::PPArgSpan &lhs,
+                       const RefoldModel::PPArgSpan &rhs) {
+      if (lhs.begin != rhs.begin)
+        return lhs.begin < rhs.begin;
+      if (lhs.end != rhs.end)
+        return lhs.end < rhs.end;
+      return lhs.argIdx < rhs.argIdx;
+    });
+
+    // Replay the definition replacement-list tape over the A-side macro cover.
+    // Literals must match real expanded tokens; each parameter reference must
+    // consume the next recorded standard span exactly at the current cursor.
+    uint64_t tok = m.cover.begin;
+    size_t argSpanIdx = 0;
+    for (const RefoldModel::MacroReplacementToken &repTok :
+         definition->replacementTokens) {
+      switch (repTok.kind) {
+      case RefoldModel::MacroReplacementTokenKind::Literal:
+        if (tok >= m.cover.end || tok >= aToks_.size() ||
+            aToks_[static_cast<size_t>(tok)].spelling != repTok.spelling)
+          return m.argSpans;
+        ++tok;
+        break;
+      case RefoldModel::MacroReplacementTokenKind::ParamRef: {
+        if (argSpanIdx >= out.size())
+          return m.argSpans;
+        const RefoldModel::PPArgSpan &sp = out[argSpanIdx];
+        if (sp.kind != PPArgSpanKind::Standard || sp.begin != tok ||
+            sp.begin >= sp.end || sp.end > m.cover.end || sp.end > aToks_.size())
+          return m.argSpans;
+        tok = sp.end;
+        ++argSpanIdx;
+        break;
+      }
+      }
+    }
+
+    if (tok != m.cover.end || argSpanIdx != out.size())
+      return m.argSpans;
+
+    bool changed = false;
+    for (size_t i = 0; i < out.size(); ++i) {
+      if (out[i].argIdx != formalSeq[i])
+        changed = true;
+      out[i].argIdx = formalSeq[i];
+    }
+    if (changed) {
+      replayedStandardArgSpanFormalIndices = true;
+      trace("macro/args",
+            "  repaired standard arg-span formal indices from definition "
+            "replay: inv id={0} name={1}",
+            m.id, m.name);
+    }
+    return out;
+  };
+
+  // Prefer the direct current-level invocation parse; fall back to definition
+  // replay only for older producer shapes where the replacement-list tape proves
+  // the same reindexing.
+  std::vector<RefoldModel::PPArgSpan> standardArgSpans;
+  if (auto currentLevelSpans = getCurrentLevelStandardArgSpans()) {
+    standardArgSpans = std::move(*currentLevelSpans);
+  } else {
+    standardArgSpans = getDefinitionReplayedStandardArgSpans();
+  }
+
   std::vector<RefoldModel::PPArgSpan> occs;
-  append_range(occs, m.argSpans);
+  append_range(occs, standardArgSpans);
   append_range(occs, m.stringifySpans);
 
   std::vector<char> occIsStringify;
   occIsStringify.resize(occs.size());
-  std::fill_n(occIsStringify.begin(), m.argSpans.size(), false);
-  std::fill_n(occIsStringify.begin() + m.argSpans.size(),
+  std::fill_n(occIsStringify.begin(), standardArgSpans.size(), false);
+  std::fill_n(occIsStringify.begin() + standardArgSpans.size(),
               m.stringifySpans.size(), true);
 
   trace("macro/args", "  occs={0}",
@@ -13754,6 +14456,62 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     return env;
   };
 
+  // Validate a repaired formal replacement against every occurrence whose
+  // argIdx was obtained by current-level/declaration replay.
+  //
+  // This mirrors the normal all-occurrences check, but uses the repaired
+  // `standardArgSpans` collection so stale producer indices cannot validate a
+  // partial rewrite of only the first occurrence.
+  auto standardArgReplacementMatchesAllReplayedOccurrencesInB =
+      [&](uint32_t argIdx, StringRef newArg,
+          ArrayRef<diffutils::Hunk> tokenHunks) -> bool {
+    const uint64_t maxTok = bTokOff_.empty()
+                                ? 0ULL
+                                : static_cast<uint64_t>(bTokOff_.size() - 1);
+    const StringRef expected = newArg.trim();
+    bool sawOccurrence = false;
+
+    for (const RefoldModel::PPArgSpan &s : standardArgSpans) {
+      if (s.argIdx != argIdx || s.kind != PPArgSpanKind::Standard)
+        continue;
+      sawOccurrence = true;
+
+      auto bEnv = MapAToBTokenEnvelopeByPPArgSpan(s);
+      if (!bEnv || bEnv->second < bEnv->first)
+        return false;
+
+      // Grow the mapped B envelope with any owned insertions or overlapping
+      // hunks for this occurrence before comparing the materialized text.
+      size_t lo = bEnv->first;
+      size_t hi = bEnv->second;
+      for (const diffutils::Hunk &hk : tokenHunks) {
+        if (auto owned = GetOwnedPureInsertionBRangeForArgSpan(
+                s, standardArgSpans, *bEnv, hk)) {
+          lo = std::min(lo, owned->first);
+          hi = std::max(hi, owned->second);
+          continue;
+        }
+        if (hk.aStart == hk.aEnd)
+          continue;
+        if (hk.aStart < s.end && hk.aEnd > s.begin && hk.bStart < hk.bEnd) {
+          lo = static_cast<size_t>(std::min<uint64_t>(lo, hk.bStart));
+          hi = static_cast<size_t>(std::max<uint64_t>(hi, hk.bEnd));
+        }
+      }
+
+      lo = static_cast<size_t>(std::clamp<uint64_t>(lo, 0ULL, maxTok));
+      hi = static_cast<size_t>(std::clamp<uint64_t>(hi, lo, maxTok));
+
+      StringRef oldText = SliceASource(s.begin, s.end).trim();
+      auto grownEnv = maybeExtendRightBoundaryClosers(s, {lo, hi}, oldText);
+      StringRef actual = SliceBSource(grownEnv.first, grownEnv.second).trim();
+      if (actual != expected)
+        return false;
+    }
+
+    return sawOccurrence;
+  };
+
   // Compute argument replacements implied by each touched occurrence. Multiple
   // occurrences of the same argIdx must imply the exact same replacement,
   // otherwise the macro cannot be refolded args-only.
@@ -14054,7 +14812,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
 
       // Validate the slice map against every standard occurrence of this formal
       // in B, not only the occurrence that originally triggered the rewrite.
-      for (const auto &s : m.argSpans) {
+      for (const auto &s : standardArgSpans) {
         if (s.argIdx != argIdx || s.kind != PPArgSpanKind::Standard)
           continue;
 
@@ -14074,8 +14832,8 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         // collection, incorporating owned insertions and overlapping token
         // hunks for this occurrence.
         for (const auto &hk : tokenHunks) {
-          if (auto owned = GetOwnedPureInsertionBRangeForArgSpan(s, m.argSpans,
-                                                                 *bEnv, hk)) {
+          if (auto owned = GetOwnedPureInsertionBRangeForArgSpan(
+                  s, standardArgSpans, *bEnv, hk)) {
             lo = std::min(lo, owned->first);
             hi = std::max(hi, owned->second);
             continue;
@@ -14105,10 +14863,16 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       return true;
     };
 
-    if (!(tupleForwarded
-              ? tupleSliceConsistencyMatchesAllOccurrencesInB()
-              : MacroArgReplacementMatchesAllOccurrencesInB(
-                    m, argIdx, baseArgText, finalNewArg, tokenHunks))) {
+    const bool matchesAllOccurrences =
+        tupleForwarded
+            ? tupleSliceConsistencyMatchesAllOccurrencesInB()
+        : replayedStandardArgSpanFormalIndices
+            ? standardArgReplacementMatchesAllReplayedOccurrencesInB(
+                  argIdx, finalNewArg, tokenHunks)
+            : MacroArgReplacementMatchesAllOccurrencesInB(
+                  m, argIdx, baseArgText, finalNewArg, tokenHunks);
+
+    if (!matchesAllOccurrences) {
       // The candidate replacement explained the local observations but failed
       // the global occurrence check. Before returning, gather tuple-specific
       // diagnostics when child tuple metadata exists for this argument.
@@ -14147,7 +14911,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
               stringutils::showWsWithClip(finalNewArg, 200),
               formatHunkList(tokenHunksForTouchedFormals));
 
-        for (const auto &s : m.argSpans) {
+        for (const auto &s : standardArgSpans) {
           if (s.argIdx != argIdx || s.kind != PPArgSpanKind::Standard)
             continue;
 
@@ -14169,7 +14933,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
           // hunks.
           for (const auto &hk : tokenHunks) {
             if (auto owned = GetOwnedPureInsertionBRangeForArgSpan(
-                    s, m.argSpans, *bEnv, hk)) {
+                    s, standardArgSpans, *bEnv, hk)) {
               hunkEffects.push_back(
                   formatv("owned {0} -> [{1},{2}) '{3}'", hk.ToString(),
                           owned->first, owned->second,
@@ -17047,25 +17811,25 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         SmallVector<uint32_t, 2> distinctCallerParams;
       };
 
-      // Return the trimmed raw invocation argument text for `argIdx`,
-      // converting the producer's absolute argument byte range into an offset
-      // relative to `invText`.
+      // Return the trimmed raw invocation argument text for `argIdx` using the
+      // invocation spelling's formal slots.  Producer source ranges can describe a
+      // larger C syntactic surface (for example `arr[1, 2]`) even when the
+      // preprocessor splits that text across multiple macro formals, so wrapper
+      // reconstruction must use the locally parsed macro-argument slots here.
       auto getInvocationArgText =
           [&](const RefoldModel::MacroInvocation &inv,
               uint32_t argIdx) -> std::optional<StringRef> {
-        if (!inv.invText || !inv.invB)
+        if (!inv.invText)
           return std::nullopt;
-        if (argIdx >= inv.invArgRanges.size())
+        auto rangesOpt = GetMacroInvocationFormalArgContentRanges(inv, *inv.invText);
+        if (!rangesOpt || argIdx >= rangesOpt->size())
           return std::nullopt;
-        const auto &rng = inv.invArgRanges[argIdx];
-        if (!rng.first || !rng.second || *rng.second < *rng.first ||
-            *rng.first < *inv.invB)
+        const auto &rng = (*rangesOpt)[argIdx];
+        if (rng.second < rng.first || rng.second > inv.invText->size())
           return std::nullopt;
-        const uint64_t relB = *rng.first - *inv.invB;
-        const uint64_t relE = *rng.second - *inv.invB;
-        if (relE < relB || relE > inv.invText->size())
-          return std::nullopt;
-        return StringRef(*inv.invText).slice((size_t)relB, (size_t)relE).trim();
+        return StringRef(*inv.invText)
+            .slice((size_t)rng.first, (size_t)rng.second)
+            .trim();
       };
 
       // Build an argument-local template for one child invocation argument by
@@ -17388,34 +18152,26 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
       };
 
       // Return the trimmed spelling and absolute byte extent of one invocation
-      // argument. The raw producer range is absolute, so this helper converts
-      // through invocation-relative coordinates before trimming whitespace.
+      // argument. The extent is derived from the invocation's locally parsed
+      // macro-argument slots, not directly from producer source ranges, so commas
+      // inside braces/brackets are assigned to the same formals the preprocessor
+      // actually uses.
       auto getTrimmedInvocationArgInfo =
           [&](const RefoldModel::MacroInvocation &inv,
               uint32_t argIdx) -> std::optional<TrimmedArgInfo> {
         if (!inv.invText || !inv.invB)
           return std::nullopt;
-        if (argIdx >= inv.invArgRanges.size())
+        auto rangesOpt = GetMacroInvocationFormalArgContentRanges(inv, *inv.invText);
+        if (!rangesOpt || argIdx >= rangesOpt->size())
           return std::nullopt;
 
-        const auto &rng = inv.invArgRanges[argIdx];
-        if (!rng.first || !rng.second || *rng.second < *rng.first ||
-            *rng.first < *inv.invB)
-          return std::nullopt;
-
-        // Convert the absolute argument byte range into offsets relative to
-        // `inv.invText`, which is sliced from the invocation start.
-        const uint64_t relB = *rng.first - *inv.invB;
-        const uint64_t relE = *rng.second - *inv.invB;
-        if (relE < relB || relE > inv.invText->size())
+        const auto &rng = (*rangesOpt)[argIdx];
+        if (rng.second < rng.first || rng.second > inv.invText->size())
           return std::nullopt;
 
         StringRef raw =
-            StringRef(*inv.invText).slice((size_t)relB, (size_t)relE);
+            StringRef(*inv.invText).slice((size_t)rng.first, (size_t)rng.second);
 
-        // Trim in argument-local coordinates, but report the resulting extent
-        // back in absolute source bytes so callers can compare it to arg-ref
-        // metadata.
         size_t trimLead = 0;
         size_t trimEnd = raw.size();
         std::tie(trimLead, trimEnd) =
@@ -17423,8 +18179,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
         TrimmedArgInfo out;
         out.text = raw.slice(trimLead, trimEnd).str();
-        out.absTrimBegin = *rng.first + trimLead;
-        out.absTrimEnd = *rng.first + trimEnd;
+        out.absTrimBegin = *inv.invB + rng.first + trimLead;
+        out.absTrimEnd = *inv.invB + rng.first + trimEnd;
         return out;
       };
 
@@ -17513,7 +18269,12 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           -> std::optional<std::string> {
         if (!inv.invText || !inv.invB)
           return std::nullopt;
+        auto rangesOpt = GetMacroInvocationFormalArgContentRanges(inv, *inv.invText);
+        if (!rangesOpt)
+          return std::nullopt;
 
+        // Apply formal-slot edits to the invocation spelling right-to-left so
+        // original byte offsets remain stable while edits are installed.
         struct LocalEdit {
           uint64_t begin = 0;
           uint64_t end = 0;
@@ -17527,17 +18288,14 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           // editing the invocation surface. Non-variadic slots cannot receive a
           // top-level comma because that would change call arity.
           const uint32_t argIdx = KV.first;
-          if (argIdx >= inv.invArgRanges.size())
+          if (argIdx >= rangesOpt->size())
             return std::nullopt;
-          const auto &rng = inv.invArgRanges[argIdx];
-          if (!rng.first || !rng.second || *rng.second < *rng.first ||
-              *rng.first < *inv.invB)
+          const auto &rng = (*rangesOpt)[argIdx];
+          if (rng.second < rng.first || rng.second > inv.invText->size())
             return std::nullopt;
 
-          const uint64_t relB = *rng.first - *inv.invB;
-          const uint64_t relE = *rng.second - *inv.invB;
-          if (relE < relB || relE > inv.invText->size())
-            return std::nullopt;
+          const uint64_t relB = rng.first;
+          const uint64_t relE = rng.second;
 
           StringRef newArg = StringRef(KV.second).trim();
           const bool allowComma =
@@ -25273,6 +26031,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             const uint64_t chainEnd =
                 stringutils::extendChainedCallEnd(fileText, *invEnd, "((x)+1)");
             if (chainEnd > *invEnd && chainEnd <= (uint64_t)fileText.size()) {
+              // Apply call-chain local edits right-to-left so the byte ranges
+              // remain relative to the original invocation spelling.
               struct LocalEdit {
                 uint64_t begin; // relative to invStart
                 uint64_t end;   // relative to invStart
@@ -26919,141 +27679,24 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         if (PathsEqual(*m.invFile, model_.GetSourcePath()))
           return false;
 
-        // Token pattern by which the replacement would observe the active
-        // header definition.
-        enum class HeaderObservationKind {
-          IdentifierToken,
-          FunctionLikeInvocation,
-        };
-
-        // Function-like #defines are observed only by NAME followed
-        // immediately by '('.  All other supported macro-state transitions use
-        // identifier-token observation.
-        auto observationKindForDirective =
-            [&](const RefoldModel::MacroDirective &directive,
-                StringRef macroName) {
-              if (directive.subkind != "#define")
-                return HeaderObservationKind::IdentifierToken;
-              StringRef text = directive.text;
-              size_t pos = 0;
-              stringutils::skipNonNewlineWs(text, pos);
-              if (pos >= text.size() || text[pos] != '#')
-                return HeaderObservationKind::IdentifierToken;
-              ++pos;
-              stringutils::skipNonNewlineWs(text, pos);
-              StringRef keyword = "define";
-              if (!text.substr(pos).starts_with(keyword))
-                return HeaderObservationKind::IdentifierToken;
-              pos += keyword.size();
-              if (pos < text.size() && stringutils::isIdentPart(text[pos]))
-                return HeaderObservationKind::IdentifierToken;
-              stringutils::skipNonNewlineWs(text, pos);
-              const size_t nameBegin = pos;
-              if (pos >= text.size() || !stringutils::isIdentStart(text[pos]))
-                return HeaderObservationKind::IdentifierToken;
-              ++pos;
-              while (pos < text.size() && stringutils::isIdentPart(text[pos]))
-                ++pos;
-              if (text.slice(nameBegin, pos) != macroName)
-                return HeaderObservationKind::IdentifierToken;
-              if (pos < text.size() && text[pos] == '(')
-                return HeaderObservationKind::FunctionLikeInvocation;
-              return HeaderObservationKind::IdentifierToken;
-            };
-
-        // Lex the replacement text and look for `name` as an identifier token,
-        // not as a substring.  This avoids suppressing valid candidates because
-        // of comments, string literals, or larger identifiers.
-        auto rawIdentifierAppears = [&](StringRef name, StringRef text) {
-          if (name.empty() || text.empty())
-            return false;
-          const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
-          std::string lexBuf = text.str();
-          lexBuf.push_back('\0');
-          const char *bufStart = lexBuf.data();
-          const char *bufEnd = bufStart + text.size();
-          Lexer lexer(baseLoc, lexLang_, bufStart, bufStart, bufEnd);
-          lexer.SetCommentRetentionState(true);
-          Token token;
-          while (true) {
-            lexer.LexFromRawLexer(token);
-            if (token.is(tok::eof))
-              return false;
-            if (token.is(tok::comment))
-              continue;
-            if (!token.is(tok::raw_identifier) && !token.is(tok::identifier))
-              continue;
-            const size_t localBegin = tokenOffsetFromBase(token, baseLoc);
-            const size_t localEnd = tokenEndOffsetFromBase(token, baseLoc);
-            if (localEnd < localBegin || localEnd > text.size())
-              continue;
-            if (text.slice(localBegin, localEnd) == name)
-              return true;
-          }
-        };
-
-        // Lex the replacement text and look for a function-like macro
-        // observation: an identifier token `name` immediately followed by a
-        // left-parenthesis token.
-        auto functionLikeInvocationAppears = [&](StringRef name,
-                                                 StringRef text) {
-          if (name.empty() || text.empty())
-            return false;
-          const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
-          std::string lexBuf = text.str();
-          lexBuf.push_back('\0');
-          const char *bufStart = lexBuf.data();
-          const char *bufEnd = bufStart + text.size();
-          Lexer lexer(baseLoc, lexLang_, bufStart, bufStart, bufEnd);
-          lexer.SetCommentRetentionState(true);
-          bool pendingName = false;
-          Token token;
-          while (true) {
-            lexer.LexFromRawLexer(token);
-            if (token.is(tok::eof))
-              return false;
-            if (token.is(tok::comment))
-              continue;
-            if (pendingName) {
-              if (token.is(tok::l_paren))
-                return true;
-              pendingName = false;
-            }
-            if (!token.is(tok::raw_identifier) && !token.is(tok::identifier))
-              continue;
-            const size_t localBegin = tokenOffsetFromBase(token, baseLoc);
-            const size_t localEnd = tokenEndOffsetFromBase(token, baseLoc);
-            if (localEnd < localBegin || localEnd > text.size())
-              continue;
-            pendingName = text.slice(localBegin, localEnd) == name;
-          }
-        };
-
         // Decide whether this structure-preserving candidate would observe a
         // specific active header directive if replayed at the current callsite.
+        // Use the shared macro-state observation proof so this header replay
+        // gate remains aligned with TU carry, include materialization, and
+        // unresolved-expansion fallback.
         auto replacementObservesDirective =
             [&](const RefoldModel::MacroDirective &directive,
                 StringRef macroName) {
-              switch (observationKindForDirective(directive, macroName)) {
-              case HeaderObservationKind::IdentifierToken:
-                return rawIdentifierAppears(macroName, patch.replacement);
-              case HeaderObservationKind::FunctionLikeInvocation:
-                return functionLikeInvocationAppears(macroName,
-                                                     patch.replacement);
-              }
-              return true;
+              return FirstMacroStateObservationOffsetInText(
+                         directive, macroName, patch.replacement)
+                  .has_value();
             };
 
         // Exact source interval for a macro-state directive in the header
         // containing this invocation.  The interval is used only for ordering
         // and active-state reconstruction in this admission check; movement is
         // performed later by the materialization path.
-        struct HeaderDirectivePiece {
-          const RefoldModel::MacroDirective *directive = nullptr;
-          uint64_t begin = 0;
-          uint64_t end = 0;
-          std::string name;
-        };
+        using HeaderDirectivePiece = MacroStateDirectiveLineInterval;
 
         // Lazily read the header bytes so directive intervals can be validated
         // against the real file.  If the file cannot be read, this proof does
@@ -27072,55 +27715,18 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           return StringRef(*headerBytesStorage);
         };
 
-        // Reconstruct the full directive interval from the recorded macro-name
-        // byte and verify that it belongs to the same include owner and header
-        // file as the callsite.  Exact-text validation prevents unrelated
-        // directives with similar metadata from influencing replay admission.
+        // Reconstruct the full directive interval and verify that it belongs to
+        // the same include owner and header file as the callsite. The shared
+        // helper owns macro-name-anchor reconstruction and exact-text
+        // validation against the lazily-read header bytes.
         auto directiveInterval =
             [&](const RefoldModel::MacroDirective &directive)
                 -> std::optional<HeaderDirectivePiece> {
-          if (directive.subkind != "#define" && directive.subkind != "#undef")
-            return std::nullopt;
-          if (!directive.ownerIncludeId ||
-              *directive.ownerIncludeId != *m.ownerIncludeId)
-            return std::nullopt;
-          if (!PathsEqual(directive.sitePath, *m.invFile))
-            return std::nullopt;
-          if (directive.name.empty())
-            return std::nullopt;
-          StringRef text = directive.text;
-          size_t pos = 0;
-          stringutils::skipNonNewlineWs(text, pos);
-          if (pos >= text.size() || text[pos] != '#')
-            return std::nullopt;
-          ++pos;
-          stringutils::skipNonNewlineWs(text, pos);
-          StringRef keyword = directive.subkind.drop_front();
-          if (!text.substr(pos).starts_with(keyword))
-            return std::nullopt;
-          pos += keyword.size();
-          if (pos < text.size() && stringutils::isIdentPart(text[pos]))
-            return std::nullopt;
-          stringutils::skipNonNewlineWs(text, pos);
-          const size_t nameTextBegin = pos;
-          if (pos >= text.size() || !stringutils::isIdentStart(text[pos]))
-            return std::nullopt;
-          if (directive.siteB < nameTextBegin)
-            return std::nullopt;
-          const uint64_t fileBegin = directive.siteB - nameTextBegin;
-          const uint64_t fileEnd = fileBegin + text.size();
           std::optional<StringRef> headerBytes = getHeaderBytes();
-          if (!headerBytes || fileBegin >= fileEnd ||
-              fileEnd > headerBytes->size())
+          if (!headerBytes)
             return std::nullopt;
-          if (headerBytes->slice(fileBegin, fileEnd) != text)
-            return std::nullopt;
-          HeaderDirectivePiece piece;
-          piece.directive = &directive;
-          piece.begin = fileBegin;
-          piece.end = fileEnd;
-          piece.name = directive.name.str();
-          return piece;
+          return RecoverMacroStateDirectiveLineInterval(
+              directive, *m.invFile, *headerBytes, m.ownerIncludeId);
         };
 
         // Determine whether `definition` is the active macro definition for

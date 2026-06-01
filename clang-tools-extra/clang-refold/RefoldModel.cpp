@@ -867,6 +867,14 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
             return textOrErr.takeError();
           md.text = *textOrErr;
 
+          if (skStr == "#define") {
+            auto FunctionLikeOrErr =
+                applyToField(asBool, *obj, "function_like", ctxItem);
+            if (!FunctionLikeOrErr)
+              return FunctionLikeOrErr.takeError();
+            md.functionLike = *FunctionLikeOrErr;
+          }
+
           auto spOrErr = applyToField(asString, *obj, "site_path", ctxItem);
           if (!spOrErr)
             return spOrErr.takeError();

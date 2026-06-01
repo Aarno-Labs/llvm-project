@@ -2305,6 +2305,7 @@ void RefoldMapBuilder::onMacroDefined(const Token &MacroNameTok,
   It.ID = Items.size();
   It.Kind = IK_Directive;
   It.Subkind = "#define";
+  It.FunctionLikeDefinition = MI->isFunctionLike();
 
   // Store the macro-state key explicitly.  Consumers should not have to parse
   // the textual directive spelling merely to determine which macro a #define
@@ -4003,7 +4004,7 @@ void RefoldMapBuilder::writeJSON() {
   llvm::json::OStream JO(OS, /*Indent=*/2);
 
   JO.object([&] {
-    JO.attribute("version", "2.7");
+    JO.attribute("version", "2.8");
 
     const auto &PPO = PP.getPreprocessorOpts();
     std::string LangStr = computeLangStr(PP.getLangOpts());
@@ -5123,6 +5124,8 @@ void RefoldMapBuilder::writeJSON() {
           }
 
           if (It.Kind == IK_Directive && It.Subkind == "#define") {
+            JO.attribute("function_like", It.FunctionLikeDefinition);
+
             // Definition directives now carry a producer-owned replay tape for
             // their replacement list.  This keeps later macro-DAG proofs from
             // rediscovering replacement semantics by parsing directive text in
