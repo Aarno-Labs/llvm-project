@@ -1,6 +1,6 @@
 #include "LineDirectiveInserter.h"
-#include "RefoldModel.h"
 #include "RefoldLog.h"
+#include "RefoldModel.h"
 #include "StringUtils.h"
 #include <algorithm>
 #include <cctype>

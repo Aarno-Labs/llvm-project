@@ -366,7 +366,7 @@ inline std::pair<size_t, size_t> trimWsRange(StringRef s, size_t b, size_t e) {
 /// \returns A StringRef with leading/trailing spaces and tabs removed.
 StringRef trimEdgeSpaces(StringRef s);
 
-StringRef trimHorizontal(StringRef text) {
+inline StringRef trimHorizontal(StringRef text) {
   while (!text.empty() && (text.front() == ' ' || text.front() == '\t' ||
                            text.front() == '\r' || text.front() == '\f' ||
                            text.front() == '\v'))
