@@ -14352,6 +14352,766 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     }
   }
 
+  // Higher-order generated-callee replay for ordinary macro actual slots.
+  //
+  // The tuple-specific proof below handles wrappers such as `WRAP((STR, x))`,
+  // where the source slots to repair are tuple elements inside one formal.  The
+  // same owner-level invariant also applies when those slots are ordinary
+  // invocation actuals:
+  //
+  //   #define APPLY(F, G, X) F(G, X)
+  //   #define FWD(G, X) G(X)
+  //   #define STR(x) #x
+  //   APPLY(FWD, STR, alpha)
+  //
+  // The root expansion surface belongs to APPLY, but the edited token may be
+  // exposed only after following one or more generated calls (`APPLY -> FWD ->
+  // STR`).  This proof follows that generated-call chain through replacement
+  // lists, replays the final callee replacement-list as a token transducer, and
+  // maps the solved final callee actuals back to the original APPLY actual
+  // ranges.  It is owner-polymorphic with respect to the source slots: no tuple
+  // syntax is assumed, and every accepted edit is positional rather than
+  // text-keyed.
+  auto tryWholeCoverHigherOrderGeneratedCalleePatch = [&]() -> std::optional<MacroPatch> {
+    if (!m.definitionDirectiveId || !m.invB || !m.invE ||
+        !m.stringifySpans.empty() || !m.pasteSpans.empty())
+      return std::nullopt;
+
+    auto cover = GetWholeCoverATokRange(m);
+    if (!cover || cover->first >= cover->second)
+      return std::nullopt;
+
+    auto bEnv = MapATokRangeAToBTokenEnvelope(cover->first, cover->second);
+    if (!bEnv || bEnv->first >= bEnv->second)
+      bEnv = MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
+          cover->first, cover->second);
+    if (!bEnv || bEnv->first >= bEnv->second)
+      return std::nullopt;
+
+    const RefoldModel::MacroDirective *rootDefinition = nullptr;
+    for (const RefoldModel::MacroDirective &directive :
+         model_.GetMacroDirectives()) {
+      if (directive.id == *m.definitionDirectiveId) {
+        rootDefinition = &directive;
+        break;
+      }
+    }
+    if (!rootDefinition || rootDefinition->subkind != "#define" ||
+        !rootDefinition->functionLike || rootDefinition->defParams.empty())
+      return std::nullopt;
+
+    struct SourceSlot {
+      std::string text;
+      uint32_t rootArgIdx = 0;
+    };
+
+    SmallVector<SourceSlot, 8> currentActuals;
+    currentActuals.reserve(invArgRanges.size());
+    for (uint32_t i = 0; i < invArgRanges.size(); ++i) {
+      const auto r = invArgRanges[i];
+      if (r.second < r.first || r.second > baseInvText.size())
+        return std::nullopt;
+      SourceSlot slot;
+      slot.text = baseInvText.slice(r.first, r.second).trim().str();
+      slot.rootArgIdx = i;
+      currentActuals.push_back(std::move(slot));
+    }
+    if (currentActuals.size() != rootDefinition->defParams.size())
+      return std::nullopt;
+
+    auto resolveFunctionLikeThroughAliases =
+        [&](StringRef startName) -> const RefoldModel::MacroDirective * {
+      if (startName.empty())
+        return nullptr;
+      SmallVector<std::string, 8> seen;
+      std::string current = startName.trim().str();
+      for (size_t depth = 0; depth <= model_.GetMacroDirectives().size();
+           ++depth) {
+        if (llvm::is_contained(seen, current))
+          return nullptr;
+        seen.push_back(current);
+
+        const RefoldModel::MacroDirective *functionLike = nullptr;
+        const RefoldModel::MacroDirective *alias = nullptr;
+        for (const RefoldModel::MacroDirective &directive :
+             model_.GetMacroDirectives()) {
+          if (directive.subkind != "#define" ||
+              directive.name != StringRef(current))
+            continue;
+          if (directive.functionLike) {
+            if (functionLike)
+              return nullptr;
+            functionLike = &directive;
+            continue;
+          }
+          if (directive.replacementTokens.size() == 1 &&
+              directive.replacementTokens[0].kind ==
+                  RefoldModel::MacroReplacementTokenKind::Literal) {
+            if (alias)
+              return nullptr;
+            alias = &directive;
+          }
+        }
+
+        if (functionLike)
+          return functionLike;
+        if (!alias)
+          return nullptr;
+        current = alias->replacementTokens[0].spelling.str();
+      }
+      return nullptr;
+    };
+
+    struct GeneratedCallShape {
+      uint32_t calleeParamIdx = 0;
+      SmallVector<uint32_t, 8> argParamIdxs;
+      SmallVector<std::string, 8> prefixLiterals;
+      SmallVector<std::string, 8> suffixLiterals;
+    };
+
+    auto findGeneratedCallShape =
+        [&](const RefoldModel::MacroDirective &definition)
+        -> std::optional<GeneratedCallShape> {
+      const auto &toks = definition.replacementTokens;
+      if (toks.empty())
+        return std::nullopt;
+
+      bool found = false;
+      size_t callBegin = toks.size();
+      size_t callOpen = toks.size();
+      size_t callClose = toks.size();
+      uint32_t calleeParamIdx = 0;
+      for (size_t i = 0; i + 1 < toks.size(); ++i) {
+        const auto &calleeTok = toks[i];
+        const auto &openTok = toks[i + 1];
+        if (calleeTok.kind != RefoldModel::MacroReplacementTokenKind::ParamRef ||
+            !calleeTok.paramIndex ||
+            openTok.kind != RefoldModel::MacroReplacementTokenKind::Literal ||
+            openTok.spelling != "(")
+          continue;
+
+        unsigned depth = 1;
+        size_t close = i + 2;
+        for (; close < toks.size(); ++close) {
+          const auto &tok = toks[close];
+          if (tok.kind != RefoldModel::MacroReplacementTokenKind::Literal)
+            continue;
+          if (tok.spelling == "(") {
+            ++depth;
+            continue;
+          }
+          if (tok.spelling == ")") {
+            if (--depth == 0)
+              break;
+          }
+        }
+        if (depth != 0 || close >= toks.size())
+          return std::nullopt;
+        if (found)
+          return std::nullopt;
+        found = true;
+        callBegin = i;
+        callOpen = i + 1;
+        callClose = close;
+        calleeParamIdx = *calleeTok.paramIndex;
+      }
+      if (!found || calleeParamIdx >= definition.defParams.size())
+        return std::nullopt;
+
+      auto collectLiteralContext = [&](size_t begin, size_t end,
+                                       SmallVectorImpl<std::string> &out) {
+        for (size_t i = begin; i < end; ++i) {
+          const auto &tok = toks[i];
+          if (tok.kind != RefoldModel::MacroReplacementTokenKind::Literal ||
+              tok.spelling == "#" || tok.spelling == "##" ||
+              tok.spelling == "__VA_OPT__")
+            return false;
+          out.push_back(tok.spelling.str());
+        }
+        return true;
+      };
+
+      GeneratedCallShape shape;
+      shape.calleeParamIdx = calleeParamIdx;
+      if (!collectLiteralContext(0, callBegin, shape.prefixLiterals) ||
+          !collectLiteralContext(callClose + 1, toks.size(),
+                                 shape.suffixLiterals))
+        return std::nullopt;
+
+      for (size_t i = callOpen + 1; i < callClose; ++i) {
+        const auto &tok = toks[i];
+        if (tok.spelling == "#" || tok.spelling == "##" ||
+            tok.spelling == "__VA_OPT__")
+          return std::nullopt;
+        if (tok.kind != RefoldModel::MacroReplacementTokenKind::ParamRef)
+          continue;
+        if (!tok.paramIndex || *tok.paramIndex >= definition.defParams.size())
+          return std::nullopt;
+        if (*tok.paramIndex == calleeParamIdx)
+          return std::nullopt;
+        shape.argParamIdxs.push_back(*tok.paramIndex);
+      }
+      if (shape.argParamIdxs.empty())
+        return std::nullopt;
+      return shape;
+    };
+
+    SmallVector<std::string, 8> replayPrefixLiterals;
+    SmallVector<SmallVector<std::string, 8>, 8> replaySuffixStack;
+    const RefoldModel::MacroDirective *currentDefinition = rootDefinition;
+    bool followedGeneratedCall = false;
+
+    for (size_t depth = 0; depth <= model_.GetMacroDirectives().size(); ++depth) {
+      auto shape = findGeneratedCallShape(*currentDefinition);
+      if (!shape)
+        break;
+      if (shape->calleeParamIdx >= currentActuals.size())
+        return std::nullopt;
+
+      const RefoldModel::MacroDirective *nextDefinition =
+          resolveFunctionLikeThroughAliases(
+              StringRef(currentActuals[shape->calleeParamIdx].text));
+      if (!nextDefinition || nextDefinition->defParams.empty())
+        return std::nullopt;
+
+      SmallVector<SourceSlot, 8> nextActuals;
+      for (uint32_t paramIdx : shape->argParamIdxs) {
+        if (paramIdx >= currentActuals.size())
+          return std::nullopt;
+        nextActuals.push_back(currentActuals[paramIdx]);
+      }
+
+      const bool nextHasVariadic = !nextDefinition->defParams.empty() &&
+                                   nextDefinition->defParams.back().variadic;
+      const size_t nextFixed = nextHasVariadic
+                                   ? nextDefinition->defParams.size() - 1
+                                   : nextDefinition->defParams.size();
+      if ((!nextHasVariadic &&
+           nextActuals.size() != nextDefinition->defParams.size()) ||
+          (nextHasVariadic && nextActuals.size() < nextFixed))
+        return std::nullopt;
+
+      replayPrefixLiterals.append(shape->prefixLiterals.begin(),
+                                  shape->prefixLiterals.end());
+      replaySuffixStack.push_back(shape->suffixLiterals);
+      currentDefinition = nextDefinition;
+      currentActuals = std::move(nextActuals);
+      followedGeneratedCall = true;
+    }
+
+    if (!followedGeneratedCall || !currentDefinition || currentActuals.empty())
+      return std::nullopt;
+
+    const bool finalHasVariadic = !currentDefinition->defParams.empty() &&
+                                  currentDefinition->defParams.back().variadic;
+    const size_t finalFixed = finalHasVariadic
+                                  ? currentDefinition->defParams.size() - 1
+                                  : currentDefinition->defParams.size();
+    if ((!finalHasVariadic &&
+         currentActuals.size() != currentDefinition->defParams.size()) ||
+        (finalHasVariadic && currentActuals.size() < finalFixed))
+      return std::nullopt;
+
+    SmallVector<std::string, 8> oldActuals;
+    SmallVector<uint32_t, 8> rootSlotByFinalParam;
+    for (size_t i = 0; i < finalFixed; ++i) {
+      oldActuals.push_back(currentActuals[i].text);
+      rootSlotByFinalParam.push_back(currentActuals[i].rootArgIdx);
+    }
+    if (finalHasVariadic) {
+      std::string variadicText;
+      raw_string_ostream os(variadicText);
+      for (size_t i = finalFixed; i < currentActuals.size(); ++i) {
+        if (i != finalFixed)
+          os << ", ";
+        os << StringRef(currentActuals[i].text).trim();
+      }
+      os.flush();
+      oldActuals.push_back(std::move(variadicText));
+      rootSlotByFinalParam.push_back(currentActuals[finalFixed].rootArgIdx);
+    }
+    if (oldActuals.size() != currentDefinition->defParams.size() ||
+        rootSlotByFinalParam.size() != oldActuals.size())
+      return std::nullopt;
+
+    struct ReplayTok {
+      std::string spelling;
+      size_t begin = 0;
+      size_t end = 0;
+    };
+    auto lexReplayTokens = [&](StringRef text, SmallVectorImpl<ReplayTok> &out) {
+      out.clear();
+      SmallVector<LexBoundaryToken, 32> toks;
+      lexBoundaryTokens(text, lexLang_, toks);
+      for (const LexBoundaryToken &tok : toks)
+        out.push_back(ReplayTok{tok.Spelling, tok.Begin, tok.End});
+    };
+
+    auto tokenSpellingsForText = [&](StringRef text) {
+      SmallVector<ReplayTok, 16> toks;
+      lexReplayTokens(text, toks);
+      SmallVector<std::string, 16> out;
+      for (const ReplayTok &tok : toks)
+        out.push_back(tok.spelling);
+      return out;
+    };
+
+    auto textsTokenEquivalent = [&](StringRef lhs, StringRef rhs) {
+      SmallVector<std::string, 16> lhsToks = tokenSpellingsForText(lhs);
+      SmallVector<std::string, 16> rhsToks = tokenSpellingsForText(rhs);
+      if (lhsToks.size() != rhsToks.size())
+        return false;
+      for (size_t i = 0; i < lhsToks.size(); ++i)
+        if (lhsToks[i] != rhsToks[i])
+          return false;
+      return true;
+    };
+
+    auto decodeSimpleStringLiteralToken =
+        [](StringRef spelling) -> std::optional<std::string> {
+      size_t quote = spelling.find('"');
+      if (quote == StringRef::npos)
+        return std::nullopt;
+      size_t endQuote = spelling.rfind('"');
+      if (endQuote == StringRef::npos || endQuote <= quote)
+        return std::nullopt;
+      StringRef body = spelling.slice(quote + 1, endQuote);
+      std::string out;
+      out.reserve(body.size());
+      for (size_t i = 0; i < body.size(); ++i) {
+        if (body[i] != '\\') {
+          out.push_back(body[i]);
+          continue;
+        }
+        if (++i >= body.size())
+          return std::nullopt;
+        switch (body[i]) {
+        case '\\':
+        case '"':
+          out.push_back(body[i]);
+          break;
+        case 'n':
+          out.push_back('\n');
+          break;
+        case 't':
+          out.push_back('\t');
+          break;
+        default:
+          return std::nullopt;
+        }
+      }
+      return out;
+    };
+
+    enum class ReplayKind { Literal, Param, Stringify, Paste };
+    struct PastePiece {
+      bool isParam = false;
+      uint32_t paramIdx = 0;
+      std::string literal;
+    };
+    struct ReplayElem {
+      ReplayKind kind = ReplayKind::Literal;
+      std::string literal;
+      uint32_t paramIdx = 0;
+      std::vector<PastePiece> pastePieces;
+    };
+
+    auto pastePieceFromReplacementToken =
+        [&](const RefoldModel::MacroReplacementToken &tok,
+            PastePiece &piece) -> bool {
+      if (tok.kind == RefoldModel::MacroReplacementTokenKind::ParamRef) {
+        if (!tok.paramIndex || *tok.paramIndex >= oldActuals.size())
+          return false;
+        piece.isParam = true;
+        piece.paramIdx = *tok.paramIndex;
+        return true;
+      }
+      if (tok.spelling == "#" || tok.spelling == "##" ||
+          tok.spelling == "__VA_OPT__")
+        return false;
+      piece.isParam = false;
+      piece.literal = tok.spelling.str();
+      return true;
+    };
+
+    std::function<bool(size_t, size_t, std::vector<ReplayElem> &)>
+        parseReplayRange;
+    parseReplayRange = [&](size_t begin, size_t end,
+                           std::vector<ReplayElem> &out) {
+      const auto &tokens = currentDefinition->replacementTokens;
+      for (size_t i = begin; i < end;) {
+        const auto &tok = tokens[i];
+        if (tok.spelling == "#") {
+          if (i + 1 >= end ||
+              tokens[i + 1].kind != RefoldModel::MacroReplacementTokenKind::ParamRef ||
+              !tokens[i + 1].paramIndex)
+            return false;
+          const uint32_t paramIdx = *tokens[i + 1].paramIndex;
+          if (paramIdx >= oldActuals.size())
+            return false;
+          ReplayElem elem;
+          elem.kind = ReplayKind::Stringify;
+          elem.paramIdx = paramIdx;
+          out.push_back(std::move(elem));
+          i += 2;
+          continue;
+        }
+
+        if (i + 1 < end && tokens[i + 1].spelling == "##") {
+          ReplayElem elem;
+          elem.kind = ReplayKind::Paste;
+          PastePiece first;
+          if (!pastePieceFromReplacementToken(tok, first))
+            return false;
+          elem.pastePieces.push_back(std::move(first));
+          i += 2;
+          while (true) {
+            if (i >= end)
+              return false;
+            PastePiece next;
+            if (!pastePieceFromReplacementToken(tokens[i], next))
+              return false;
+            elem.pastePieces.push_back(std::move(next));
+            ++i;
+            if (i >= end || tokens[i].spelling != "##")
+              break;
+            ++i;
+          }
+          out.push_back(std::move(elem));
+          continue;
+        }
+
+        if (tok.kind == RefoldModel::MacroReplacementTokenKind::ParamRef) {
+          if (!tok.paramIndex || *tok.paramIndex >= oldActuals.size())
+            return false;
+          ReplayElem elem;
+          elem.kind = ReplayKind::Param;
+          elem.paramIdx = *tok.paramIndex;
+          out.push_back(std::move(elem));
+          ++i;
+          continue;
+        }
+        if (tok.spelling == "##" || tok.spelling == "__VA_OPT__")
+          return false;
+        ReplayElem elem;
+        elem.kind = ReplayKind::Literal;
+        elem.literal = tok.spelling.str();
+        out.push_back(std::move(elem));
+        ++i;
+      }
+      return true;
+    };
+
+    std::vector<ReplayElem> finalPattern;
+    if (!parseReplayRange(0, currentDefinition->replacementTokens.size(),
+                          finalPattern) || finalPattern.empty())
+      return std::nullopt;
+
+    std::vector<ReplayElem> replayPattern;
+    for (const std::string &literal : replayPrefixLiterals) {
+      ReplayElem elem;
+      elem.kind = ReplayKind::Literal;
+      elem.literal = literal;
+      replayPattern.push_back(std::move(elem));
+    }
+    replayPattern.insert(replayPattern.end(), finalPattern.begin(),
+                         finalPattern.end());
+    for (auto it = replaySuffixStack.rbegin(); it != replaySuffixStack.rend();
+         ++it) {
+      for (const std::string &literal : *it) {
+        ReplayElem elem;
+        elem.kind = ReplayKind::Literal;
+        elem.literal = literal;
+        replayPattern.push_back(std::move(elem));
+      }
+    }
+
+    using SolvedActuals = SmallVector<std::string, 8>;
+    auto assignSolvedActual = [&](SolvedActuals &actuals, uint32_t paramIdx,
+                                  StringRef value) -> bool {
+      if (paramIdx >= actuals.size())
+        return false;
+      if (!textsTokenEquivalent(actuals[paramIdx], oldActuals[paramIdx]) &&
+          !textsTokenEquivalent(actuals[paramIdx], value))
+        return false;
+      if (textsTokenEquivalent(actuals[paramIdx], oldActuals[paramIdx])) {
+        actuals[paramIdx] = value.trim().str();
+        return true;
+      }
+      return textsTokenEquivalent(actuals[paramIdx], value);
+    };
+
+    auto solvePasteToken = [&](ArrayRef<PastePiece> pieces,
+                               StringRef spelling,
+                               const SolvedActuals &seed)
+        -> SmallVector<SolvedActuals, 4> {
+      SmallVector<SolvedActuals, 4> solutions;
+      const bool hasLiteralAnchor = llvm::any_of(
+          pieces, [](const PastePiece &piece) {
+            return !piece.isParam && !piece.literal.empty();
+          });
+      if (!hasLiteralAnchor) {
+        SolvedActuals cur = seed;
+        size_t cursor = 0;
+        for (const PastePiece &piece : pieces) {
+          if (!piece.isParam) {
+            if (!spelling.substr(cursor).starts_with(piece.literal))
+              return solutions;
+            cursor += piece.literal.size();
+            continue;
+          }
+          if (piece.paramIdx >= oldActuals.size())
+            return solutions;
+          const size_t width = StringRef(oldActuals[piece.paramIdx]).trim().size();
+          if (cursor + width > spelling.size())
+            return solutions;
+          if (!assignSolvedActual(cur, piece.paramIdx,
+                                  spelling.slice(cursor, cursor + width)))
+            return solutions;
+          cursor += width;
+        }
+        if (cursor == spelling.size())
+          solutions.push_back(std::move(cur));
+        return solutions;
+      }
+
+      std::function<void(size_t, size_t, SolvedActuals &)> dfsPaste;
+      dfsPaste = [&](size_t pieceIdx, size_t cursor, SolvedActuals &cur) {
+        if (solutions.size() > 1)
+          return;
+        if (pieceIdx == pieces.size()) {
+          if (cursor == spelling.size())
+            solutions.push_back(cur);
+          return;
+        }
+        const PastePiece &piece = pieces[pieceIdx];
+        if (!piece.isParam) {
+          if (spelling.substr(cursor).starts_with(piece.literal))
+            dfsPaste(pieceIdx + 1, cursor + piece.literal.size(), cur);
+          return;
+        }
+        for (size_t end = cursor; end <= spelling.size(); ++end) {
+          SolvedActuals next = cur;
+          if (!assignSolvedActual(next, piece.paramIdx,
+                                  spelling.slice(cursor, end)))
+            continue;
+          dfsPaste(pieceIdx + 1, end, next);
+          if (solutions.size() > 1)
+            return;
+        }
+      };
+      SolvedActuals start = seed;
+      dfsPaste(0, 0, start);
+      return solutions;
+    };
+
+    auto solveExpansion = [&](StringRef expansion)
+        -> std::optional<SolvedActuals> {
+      SmallVector<ReplayTok, 32> toks;
+      lexReplayTokens(expansion, toks);
+      SmallVector<SolvedActuals, 4> solutions;
+      SolvedActuals seed;
+      for (const std::string &actual : oldActuals)
+        seed.push_back(actual);
+
+      std::function<void(ArrayRef<ReplayElem>, size_t, SolvedActuals &)> dfs;
+      dfs = [&](ArrayRef<ReplayElem> elems, size_t tokPos,
+                SolvedActuals &cur) {
+        if (solutions.size() > 1)
+          return;
+        if (elems.empty()) {
+          if (tokPos == toks.size())
+            solutions.push_back(cur);
+          return;
+        }
+        const ReplayElem &elem = elems.front();
+        ArrayRef<ReplayElem> rest = elems.drop_front();
+        switch (elem.kind) {
+        case ReplayKind::Literal:
+          if (tokPos < toks.size() && toks[tokPos].spelling == elem.literal)
+            dfs(rest, tokPos + 1, cur);
+          return;
+        case ReplayKind::Param: {
+          for (size_t end = tokPos; end <= toks.size(); ++end) {
+            StringRef value;
+            if (end > tokPos) {
+              const size_t byteBegin = toks[tokPos].begin;
+              const size_t byteEnd = toks[end - 1].end;
+              value = expansion.slice(byteBegin, byteEnd);
+            }
+            SolvedActuals next = cur;
+            if (!assignSolvedActual(next, elem.paramIdx, value))
+              continue;
+            dfs(rest, end, next);
+            if (solutions.size() > 1)
+              return;
+          }
+          return;
+        }
+        case ReplayKind::Stringify: {
+          if (tokPos >= toks.size())
+            return;
+          std::optional<std::string> content =
+              decodeSimpleStringLiteralToken(toks[tokPos].spelling);
+          if (!content)
+            return;
+          SolvedActuals next = cur;
+          if (!assignSolvedActual(next, elem.paramIdx, StringRef(*content)))
+            return;
+          dfs(rest, tokPos + 1, next);
+          return;
+        }
+        case ReplayKind::Paste: {
+          if (tokPos >= toks.size())
+            return;
+          SmallVector<SolvedActuals, 4> pasteSolutions =
+              solvePasteToken(elem.pastePieces, toks[tokPos].spelling, cur);
+          for (SolvedActuals &pasteSol : pasteSolutions) {
+            dfs(rest, tokPos + 1, pasteSol);
+            if (solutions.size() > 1)
+              return;
+          }
+          return;
+        }
+        }
+      };
+
+      dfs(replayPattern, 0, seed);
+      if (solutions.size() != 1)
+        return std::nullopt;
+      return solutions.front();
+    };
+
+    StringRef oldExpansion = SliceASource(cover->first, cover->second).trim();
+    StringRef newExpansion = SliceBSource(bEnv->first, bEnv->second).trim();
+    std::optional<SolvedActuals> oldSolved = solveExpansion(oldExpansion);
+    std::optional<SolvedActuals> newSolved = solveExpansion(newExpansion);
+    if (!oldSolved || !newSolved || oldSolved->size() != oldActuals.size() ||
+        newSolved->size() != oldActuals.size())
+      return std::nullopt;
+
+    auto rewriteSourceActualFromSolvedExpansion =
+        [&](StringRef source, StringRef oldText,
+            StringRef newText) -> std::optional<std::string> {
+      oldText = oldText.trim();
+      newText = newText.trim();
+      SmallVector<LexBoundaryToken, 16> sourceToks;
+      SmallVector<LexBoundaryToken, 16> oldToks;
+      SmallVector<LexBoundaryToken, 16> newToks;
+      lexBoundaryTokens(source, lexLang_, sourceToks);
+      lexBoundaryTokens(oldText, lexLang_, oldToks);
+      lexBoundaryTokens(newText, lexLang_, newToks);
+      if (!oldToks.empty() && oldToks.size() == newToks.size() &&
+          sourceToks.size() >= oldToks.size()) {
+        std::optional<size_t> matchBegin;
+        bool ambiguous = false;
+        for (size_t i = 0; i + oldToks.size() <= sourceToks.size(); ++i) {
+          bool same = true;
+          for (size_t j = 0; j < oldToks.size(); ++j) {
+            if (sourceToks[i + j].Spelling != oldToks[j].Spelling) {
+              same = false;
+              break;
+            }
+          }
+          if (!same)
+            continue;
+          if (matchBegin) {
+            ambiguous = true;
+            break;
+          }
+          matchBegin = i;
+        }
+        if (matchBegin && !ambiguous) {
+          std::string rewritten = source.str();
+          for (size_t j = oldToks.size(); j > 0; --j) {
+            const size_t idx = *matchBegin + j - 1;
+            rewritten = stringutils::replaceRange(
+                rewritten, sourceToks[idx].Begin, sourceToks[idx].End,
+                newToks[j - 1].Spelling);
+          }
+          return rewritten;
+        }
+      }
+      if (source.trim() == oldText)
+        return newText.str();
+      size_t pos = source.find(oldText);
+      if (pos == StringRef::npos)
+        return std::nullopt;
+      if (source.find(oldText, pos + 1) != StringRef::npos)
+        return std::nullopt;
+      return stringutils::replaceRange(source.str(), pos, pos + oldText.size(),
+                                       newText);
+    };
+
+    DenseMap<uint32_t, std::string> replByRootArgIdx;
+    for (uint32_t i = 0; i < newSolved->size(); ++i) {
+      if (i >= rootSlotByFinalParam.size())
+        return std::nullopt;
+      const uint32_t rootIdx = rootSlotByFinalParam[i];
+      if (rootIdx >= invArgRanges.size())
+        return std::nullopt;
+      StringRef source = currentActuals.size() > i
+                             ? StringRef(currentActuals[i].text)
+                             : StringRef(oldActuals[i]);
+      const SourceSlot *slot = nullptr;
+      // Find the final source slot carrying this root argument so nested source
+      // spelling such as `ID(alpha)` is preserved when the solved replay value
+      // is only `alpha`.
+      for (const SourceSlot &candidate : currentActuals) {
+        if (candidate.rootArgIdx == rootIdx) {
+          slot = &candidate;
+          break;
+        }
+      }
+      if (slot)
+        source = StringRef(slot->text);
+      auto rewritten = rewriteSourceActualFromSolvedExpansion(
+          source, StringRef((*oldSolved)[i]), StringRef((*newSolved)[i]));
+      if (!rewritten)
+        return std::nullopt;
+      if (!isVariadicFormal(rootIdx) && hasTopLevelComma(*rewritten))
+        return std::nullopt;
+      auto it = replByRootArgIdx.find(rootIdx);
+      if (it != replByRootArgIdx.end()) {
+        if (StringRef(it->second).trim() != StringRef(*rewritten).trim())
+          return std::nullopt;
+        continue;
+      }
+      StringRef original = baseInvText.slice(invArgRanges[rootIdx].first,
+                                             invArgRanges[rootIdx].second).trim();
+      if (StringRef(*rewritten).trim() != original)
+        replByRootArgIdx[rootIdx] = std::move(*rewritten);
+    }
+
+    if (replByRootArgIdx.empty())
+      return std::nullopt;
+
+    std::optional<InvocationRewriteWithRange> rewrite =
+        buildInvocationRewriteWithRange(replByRootArgIdx);
+    if (!rewrite)
+      return std::nullopt;
+
+    trace("macro/higher-order",
+          "whole-cover higher-order generated callee SUCCESS root id={0} "
+          "name={1} coverA=[{2},{3}) coverB=[{4},{5}) newInv='{6}'",
+          m.id, m.name, cover->first, cover->second, bEnv->first, bEnv->second,
+          stringutils::showWsWithClip(rewrite->text, 240));
+
+    MacroPatch patch{*m.invB, *m.invE, std::move(rewrite->text), m.id};
+    stampMacroPatchMaterializedOutputRange(patch, *rewrite);
+    stampMacroPatchMaterializedBTokenRange(
+        patch, static_cast<uint64_t>(bEnv->first),
+        static_cast<uint64_t>(bEnv->second));
+    StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyStandard,
+                         /*validated=*/true,
+                         /*structurePreserving=*/true, m.id);
+    return patch;
+  };
+
+  if (auto higherOrderGeneratedPatch =
+          tryWholeCoverHigherOrderGeneratedCalleePatch())
+    return higherOrderGeneratedPatch;
+
   // Some tuple-generated callees expose the edited token only through a
   // nested child macro surface, so the root wrapper can have no standard
   // PPArgSpan/stringify occurrence at all.  That happens for shapes such as
@@ -15089,10 +15849,15 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     std::optional<SolvedActuals> oldSolved = solveExpansion(oldExpansion);
     if (!oldSolved || oldSolved->size() != oldActuals.size())
       return std::nullopt;
-    for (size_t i = 0; i < oldActuals.size(); ++i) {
-      if (!textsTokenEquivalent((*oldSolved)[i], oldActuals[i]))
-        return std::nullopt;
-    }
+
+    // The replay value observed at the final callee is not always textually the
+    // same as the tuple element that supplied it.  For example, `STR(ID(x))`
+    // stringifies the prescanned value `x`, while the source slot we want to
+    // preserve is still `ID(x)`.  Do not require old replay values to equal the
+    // whole tuple slot here.  The tuple edit step below uses the solved old
+    // value as the replacement key and accepts it only if that token sequence is
+    // uniquely found inside the original tuple element; otherwise the proof
+    // fails closed.
 
     std::optional<SolvedActuals> newSolved = solveExpansion(newExpansion);
     if (!newSolved || newSolved->size() != oldActuals.size())
@@ -15144,9 +15909,11 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
           ref.forwarderParamIdx >= tupleElems.size())
         return std::nullopt;
       const TupleElementSlice &elem = tupleElems[ref.forwarderParamIdx];
-      StringRef oldText = pieceCursor < oldActuals.size()
-                              ? StringRef(oldActuals[pieceCursor]).trim()
-                              : oldGeneratedPieces[pieceCursor].trim();
+      StringRef oldText = pieceCursor < oldSolved->size()
+                              ? StringRef((*oldSolved)[pieceCursor]).trim()
+                              : (pieceCursor < oldActuals.size()
+                                     ? StringRef(oldActuals[pieceCursor]).trim()
+                                     : oldGeneratedPieces[pieceCursor].trim());
       StringRef newText = StringRef(newGeneratedPieces[pieceCursor]).trim();
       if (newText != tuplePayload.slice(elem.trimBegin, elem.trimEnd).trim()) {
         auto rewrittenElem = rewriteTupleElementFromSolvedExpansion(
@@ -30237,13 +31004,36 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     }
 
     if (directRootPreservationInadmissible) {
-      trace("macro/dag",
-            "direct args-only/callsite preservation suppressed for root "
-            "id={0} name='{1}': touched hunk lies in unsupported descendant "
-            "subtree and the root has no direct argument-like replay surface",
-            m.id, m.name);
-      argsOnlyCandidate.reset();
-      reuseExistingCallsitePatch = false;
+      // `directRootPreservationInadmissible` means that the ordinary direct
+      // argument-span proof did not see the edited descendant surface.  That is
+      // not enough to discard a stronger direct candidate that was built by a
+      // whole-cover owner proof, such as higher-order generated-callee replay:
+      // that proof deliberately explains the descendant edit through the root
+      // invocation's replacement-list grammar and records the B-token envelope
+      // it materializes.  Suppress only candidates that do not discharge the
+      // current hunk with such an owner-level witness.
+      const bool directCandidateDischargesDescendantHunk =
+          argsOnlyCandidate && argsOnlyCandidate->structurePreserving &&
+          argsOnlyCandidate->proofRootMacroId == m.id &&
+          argsOnlyCandidate->hasMaterializedBTokenRange &&
+          argsOnlyCandidate->materializedBTokStart <= h.bStart &&
+          h.bEnd <= argsOnlyCandidate->materializedBTokEnd;
+
+      if (!directCandidateDischargesDescendantHunk) {
+        trace("macro/dag",
+              "direct args-only/callsite preservation suppressed for root "
+              "id={0} name='{1}': touched hunk lies in unsupported descendant "
+              "subtree and the root has no direct argument-like replay surface",
+              m.id, m.name);
+        argsOnlyCandidate.reset();
+        reuseExistingCallsitePatch = false;
+      } else {
+        trace("macro/dag",
+              "direct args-only preservation retained for root id={0} "
+              "name='{1}': whole-cover owner proof discharges descendant "
+              "hunk B=[{2},{3})",
+              m.id, m.name, h.bStart, h.bEnd);
+      }
     }
 
     // Try to compose a direct root args-only candidate with an existing

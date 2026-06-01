@@ -6007,17 +6007,55 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         }
 
         if (admissibleCarry) {
+          uint64_t replacementTailEnd = *endByte;
+          if (replacementTailEnd < headerText.size() &&
+              !stringutils::isBOL(StringRef(headerText),
+                                  static_cast<size_t>(replacementTailEnd))) {
+            size_t nl = StringRef(headerText).find('\n', replacementTailEnd);
+            replacementTailEnd =
+                nl == StringRef::npos ? static_cast<uint64_t>(headerText.size())
+                                      : static_cast<uint64_t>(nl + 1);
+          }
+
+          // A carried directive must be re-emitted at a physical line boundary.
+          // If the replacement stops in the middle of an original source line,
+          // appending the directive immediately would split the surviving line
+          // (`USE(3) #define ... ;`).  Carry the non-observing tail of that
+          // physical line into the widened edit before re-emitting directives.
+          // This also consumes a single original newline when the replacement
+          // already ends at the previous line's last token, avoiding a spurious
+          // blank line before the untouched suffix.
+          if (replacementTailEnd > *endByte) {
+            StringRef tail = StringRef(headerText).slice(*endByte,
+                                                         replacementTailEnd);
+            StringRef following =
+                StringRef(headerText).drop_front(replacementTailEnd);
+            for (const HeaderMacroStateCarryCandidate &candidate :
+                 carryCandidates) {
+              if (headerSourceChunkObservesDefinitionWhenCrossed(
+                      *candidate.directive, candidate.piece.name, tail,
+                      following)) {
+                admissibleCarry = false;
+                break;
+              }
+            }
+          }
+
           std::string carriedReplacement;
           carriedReplacement.reserve((*startByte - newStart) +
-                                     replacement.size() + 64);
+                                     replacement.size() +
+                                     (replacementTailEnd - *endByte) + 64);
 
           // Rebuild the widened header edit as:
           //   preserved bytes before carried directives,
           //   B-derived replacement payload,
+          //   non-observing physical line tail after the payload,
           //   carried #define directive lines.
           // The directive bytes are intentionally omitted from their original
-          // locations and appended after the payload so the payload is not
-          // macro-expanded by definitions that B did not have active there.
+          // locations and appended after the completed payload line so the
+          // payload is not macro-expanded by definitions that B did not have
+          // active there, while the surviving suffix still sees the restored
+          // macro state.
           cursor = newStart;
           for (const HeaderMacroStateCarryCandidate &candidate :
                carryCandidates) {
@@ -6034,9 +6072,13 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
             carriedReplacement.append(headerText.begin() + cursor,
                                       headerText.begin() + *startByte);
             carriedReplacement += replacement;
-            if (!carriedReplacement.empty() &&
-                carriedReplacement.back() != '\n')
+            if (replacementTailEnd > *endByte) {
+              carriedReplacement.append(headerText.begin() + *endByte,
+                                        headerText.begin() + replacementTailEnd);
+            } else if (!carriedReplacement.empty() &&
+                       carriedReplacement.back() != '\n') {
               carriedReplacement.push_back('\n');
+            }
             for (const HeaderMacroStateCarryCandidate &candidate :
                  carryCandidates) {
               carriedReplacement.append(candidate.directive->text.begin(),
@@ -6051,9 +6093,10 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                   "directive(s) after replacement bytes=[{3},{4}) -> "
                   "[{5},{6})",
                   file, idx, carryCandidates.size(), *startByte, *endByte,
-                  newStart, *endByte);
+                  newStart, replacementTailEnd);
 
             *startByte = newStart;
+            *endByte = replacementTailEnd;
             replacement = std::move(carriedReplacement);
             mappedHeaderWitness.hasByteRange = true;
             mappedHeaderWitness.startByte = *startByte;
