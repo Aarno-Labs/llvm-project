@@ -424,6 +424,212 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
          "pp byte begin/end spans size does not match the A-side token count");
   }
 
+  auto parseMacroDefParams = [&](const json::Object &ownerObj,
+                                   StringRef fieldName,
+                                   const std::string &ctxItem)
+      -> std::vector<MacroDefParam> {
+    std::vector<MacroDefParam> params;
+    if (auto ParamsArr = asOptArray(ownerObj, fieldName, /*canBeNull=*/true)) {
+      params.reserve((**ParamsArr).size());
+      for (const json::Value &Elem : **ParamsArr) {
+        auto ObjOrErr = asObject(Elem, (Twine(ctxItem) + ": " + fieldName + "[]").str());
+        if (!ObjOrErr)
+          fatal("model", "{0}: {1} element is not an object", ctxItem,
+                fieldName);
+        const json::Object &ParamObj = **ObjOrErr;
+
+        const json::Value *NameVal = ParamObj.get("name");
+        if (!NameVal)
+          fatal("model", "{0}: {1} element missing name", ctxItem,
+                fieldName);
+        auto NameOrErr = asString(*NameVal, (Twine(ctxItem) + ": " + fieldName + ".name").str());
+        if (!NameOrErr)
+          fatal("model", "{0}: {1}.name is not a string", ctxItem,
+                fieldName);
+
+        const json::Value *VarVal = ParamObj.get("variadic");
+        if (!VarVal)
+          fatal("model", "{0}: {1} element missing variadic", ctxItem,
+                fieldName);
+        auto VarOrErr = asBool(*VarVal, (Twine(ctxItem) + ": " + fieldName + ".variadic").str());
+        if (!VarOrErr)
+          fatal("model", "{0}: {1}.variadic is not a bool", ctxItem,
+                fieldName);
+
+        params.emplace_back(*NameOrErr, *VarOrErr);
+      }
+    }
+    return params;
+  };
+
+  auto parseMacroReplacementTokens = [&](const json::Object &ownerObj,
+                                         ArrayRef<MacroDefParam> defParams,
+                                         const std::string &ctxItem)
+      -> std::vector<MacroReplacementToken> {
+    std::vector<MacroReplacementToken> tokens;
+    if (auto TokensArr = asOptArray(ownerObj, "replacement_tokens",
+                                    /*canBeNull=*/true)) {
+      tokens.reserve((**TokensArr).size());
+      for (const json::Value &Elem : **TokensArr) {
+        auto ObjOrErr = asObject(Elem, (Twine(ctxItem) + ": replacement_tokens[]").str());
+        if (!ObjOrErr)
+          fatal("model", "{0}: replacement_tokens element is not an object",
+                ctxItem);
+        const json::Object &TokObj = **ObjOrErr;
+
+        const json::Value *KindVal = TokObj.get("kind");
+        if (!KindVal)
+          fatal("model", "{0}: replacement_tokens element missing kind",
+                ctxItem);
+        auto KindOrErr = asString(*KindVal, (Twine(ctxItem) + ": replacement_tokens.kind").str());
+        if (!KindOrErr)
+          fatal("model", "{0}: replacement_tokens.kind is not a string",
+                ctxItem);
+
+        const json::Value *SpellingVal = TokObj.get("spelling");
+        if (!SpellingVal)
+          fatal("model", "{0}: replacement_tokens element missing spelling",
+                ctxItem);
+        auto SpellingOrErr = asString(*SpellingVal,
+                                      (Twine(ctxItem) + ": replacement_tokens.spelling").str());
+        if (!SpellingOrErr)
+          fatal("model", "{0}: replacement_tokens.spelling is not a string",
+                ctxItem);
+
+        MacroReplacementToken token;
+        token.spelling = *SpellingOrErr;
+        if (*KindOrErr == "literal") {
+          token.kind = MacroReplacementTokenKind::Literal;
+          if (TokObj.get("param_index"))
+            fatal("model",
+                  "{0}: literal replacement_tokens element has param_index",
+                  ctxItem);
+        } else if (*KindOrErr == "param_ref") {
+          token.kind = MacroReplacementTokenKind::ParamRef;
+          const json::Value *ParamVal = TokObj.get("param_index");
+          if (!ParamVal)
+            fatal("model",
+                  "{0}: param_ref replacement_tokens element missing "
+                  "param_index",
+                  ctxItem);
+          auto ParamOrErr = asUInt32(*ParamVal,
+                                     (Twine(ctxItem) + ": replacement_tokens.param_index").str());
+          if (!ParamOrErr)
+            fatal("model", "{0}: replacement_tokens.param_index is invalid",
+                  ctxItem);
+          if (*ParamOrErr >= defParams.size())
+            fatal("model",
+                  "{0}: replacement_tokens.param_index references missing "
+                  "macro formal",
+                  ctxItem);
+          if (defParams[*ParamOrErr].name != token.spelling)
+            fatal("model",
+                  "{0}: replacement_tokens param_ref spelling does not match "
+                  "the referenced macro formal",
+                  ctxItem);
+          token.paramIndex = *ParamOrErr;
+        } else {
+          fatal("model", "{0}: invalid replacement_tokens.kind '{1}'", ctxItem,
+                *KindOrErr);
+        }
+
+        tokens.push_back(std::move(token));
+      }
+    }
+    return tokens;
+  };
+
+  auto parseCalleeOriginParts = [&](const json::Object &originObj,
+                                    StringRef finalSpelling,
+                                    const std::string &ctxItem)
+      -> std::vector<CalleeOriginPart> {
+    std::vector<CalleeOriginPart> parts;
+    auto PartsArr = asOptArray(originObj, "parts", /*canBeNull=*/true);
+    if (!PartsArr)
+      return parts;
+
+    parts.reserve((**PartsArr).size());
+    std::string tiled;
+    for (const json::Value &Elem : **PartsArr) {
+      auto ObjOrErr = asObject(Elem, (Twine(ctxItem) + ": callee_origin.parts[]").str());
+      if (!ObjOrErr)
+        fatal("model", "{0}: callee_origin.parts element is not an object",
+              ctxItem);
+      const json::Object &PartObj = **ObjOrErr;
+
+      const json::Value *KindVal = PartObj.get("kind");
+      if (!KindVal)
+        fatal("model", "{0}: callee_origin.parts element missing kind",
+              ctxItem);
+      auto KindOrErr = asString(*KindVal, (Twine(ctxItem) + ": callee_origin.parts.kind").str());
+      if (!KindOrErr)
+        fatal("model", "{0}: callee_origin.parts.kind is not a string",
+              ctxItem);
+
+      const json::Value *SpellingVal = PartObj.get("spelling");
+      if (!SpellingVal)
+        fatal("model", "{0}: callee_origin.parts element missing spelling",
+              ctxItem);
+      auto SpellingOrErr = asString(*SpellingVal,
+                                    (Twine(ctxItem) + ": callee_origin.parts.spelling").str());
+      if (!SpellingOrErr)
+        fatal("model", "{0}: callee_origin.parts.spelling is not a string",
+              ctxItem);
+
+      CalleeOriginPart part;
+      part.spelling = *SpellingOrErr;
+      if (*KindOrErr == "literal") {
+        part.kind = CalleeOriginPartKind::Literal;
+        if (PartObj.get("root_macro_id") || PartObj.get("root_param_index") ||
+            PartObj.get("byte_begin") || PartObj.get("byte_end"))
+          fatal("model",
+                "{0}: literal callee_origin part carries selector-slice fields",
+                ctxItem);
+      } else if (*KindOrErr == "caller_arg_slice") {
+        part.kind = CalleeOriginPartKind::CallerArgSlice;
+        auto RootOrErr = applyToField(asUInt64, PartObj, "root_macro_id",
+                                      (Twine(ctxItem) + ": callee_origin.parts").str());
+        if (!RootOrErr)
+          fatal("model", "{0}: callee_origin.parts.root_macro_id is invalid",
+                ctxItem);
+        auto ParamOrErr = applyToField(asUInt32, PartObj, "root_param_index",
+                                       (Twine(ctxItem) + ": callee_origin.parts").str());
+        if (!ParamOrErr)
+          fatal("model", "{0}: callee_origin.parts.root_param_index is invalid",
+                ctxItem);
+        auto BeginOrErr = applyToField(asUInt32, PartObj, "byte_begin",
+                                       (Twine(ctxItem) + ": callee_origin.parts").str());
+        if (!BeginOrErr)
+          fatal("model", "{0}: callee_origin.parts.byte_begin is invalid",
+                ctxItem);
+        auto EndOrErr = applyToField(asUInt32, PartObj, "byte_end",
+                                     (Twine(ctxItem) + ": callee_origin.parts").str());
+        if (!EndOrErr)
+          fatal("model", "{0}: callee_origin.parts.byte_end is invalid",
+                ctxItem);
+        if (*EndOrErr < *BeginOrErr)
+          fatal("model", "{0}: callee_origin selector slice range is invalid",
+                ctxItem);
+        part.rootMacroId = *RootOrErr;
+        part.rootParamIndex = *ParamOrErr;
+        part.byteBegin = *BeginOrErr;
+        part.byteEnd = *EndOrErr;
+      } else {
+        fatal("model", "{0}: invalid callee_origin.parts.kind '{1}'", ctxItem,
+              *KindOrErr);
+      }
+
+      tiled.append(part.spelling.begin(), part.spelling.end());
+      parts.push_back(std::move(part));
+    }
+
+    if (tiled != finalSpelling)
+      fatal("model",
+            "{0}: callee_origin.parts do not tile the final callee spelling",
+            ctxItem);
+    return parts;
+  };
+
   // tokmap
   {
     auto arrOrErr = applyToField(asArray, root, "tokmap");
@@ -651,6 +857,11 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
             return idOrErr.takeError();
           md.id = *idOrErr;
 
+          auto nameOrErr = applyToField(asString, *obj, "name", ctxItem);
+          if (!nameOrErr)
+            return nameOrErr.takeError();
+          md.name = *nameOrErr;
+
           auto textOrErr = applyToField(asString, *obj, "text", ctxItem);
           if (!textOrErr)
             return textOrErr.takeError();
@@ -673,6 +884,16 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
           // produce a fatal error)
           md.siteB = *asOptUInt64(*obj, "site_b");
           md.siteE = *asOptUInt64(*obj, "site_e");
+
+          // Optional producer-owned replay data for #define directives.
+          // #undef records intentionally keep these vectors empty: their only
+          // semantic payload is the macro-state transition, not replacement-list
+          // replay.
+          if (skStr == "#define") {
+            md.defParams = parseMacroDefParams(*obj, "def_params", ctxItem);
+            md.replacementTokens =
+                parseMacroReplacementTokens(*obj, md.defParams, ctxItem);
+          }
 
           // optional
           md.ownerIncludeId = asOptUInt64(*obj, "owner_include_id");
@@ -767,34 +988,8 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
         std::optional<uint64_t> definitionDirectiveId =
             asOptUInt64(*obj, "definition_directive_id",
                         /*canBeNull=*/true);
-        std::vector<MacroDefParam> defParams;
-        if (auto ParamsArr =
-                asOptArray(*obj, "def_params", /*allowNull=*/true)) {
-          for (const json::Value &Elem : **ParamsArr) {
-            auto ObjOrErr = asObject(Elem, ctxItem + ": def_params[]");
-            if (!ObjOrErr)
-              fatal("model", "{0}: def_params element is not an object",
-                    ctxItem);
-            const json::Object &ParamObj = **ObjOrErr;
-
-            const json::Value *NameVal = ParamObj.get("name");
-            if (!NameVal)
-              fatal("model", "{0}: def_params element missing name", ctxItem);
-            auto NameOrErr = asString(*NameVal, ctxItem + ": def_params.name");
-            if (!NameOrErr)
-              fatal("model", "{0}: def_params.name is not a string", ctxItem);
-
-            const json::Value *VarVal = ParamObj.get("variadic");
-            if (!VarVal)
-              fatal("model", "{0}: def_params element missing variadic",
-                    ctxItem);
-            auto VarOrErr = asBool(*VarVal, ctxItem + ": def_params.variadic");
-            if (!VarOrErr)
-              fatal("model", "{0}: def_params.variadic is not a bool", ctxItem);
-
-            defParams.emplace_back(*NameOrErr, *VarOrErr);
-          }
-        }
+        std::vector<MacroDefParam> defParams =
+            parseMacroDefParams(*obj, "def_params", ctxItem);
 
         auto parseOptByteRanges = [&](StringRef fieldName,
                                       std::vector<MacroInvocation::OptByteRange>
@@ -1049,6 +1244,26 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
                       ctxItem);
               calleeOrigin.callerParamIndices.push_back(*UOrErr);
             }
+          }
+
+          // New producer maps can carry a direct decomposition of the final
+          // callee token spelling.  Keep this proof material on the origin
+          // record so Step-5 selector substitution can consume producer-owned
+          // paste/caller-slice evidence instead of reconstructing it from raw
+          // source text.
+          calleeOrigin.spelling =
+              asOptString(OriginObj, "spelling", /*canBeNull=*/true);
+          if (calleeOrigin.spelling)
+            calleeOrigin.parts =
+                parseCalleeOriginParts(OriginObj, *calleeOrigin.spelling,
+                                       ctxItem);
+
+          if (calleeOrigin.kind == MacroCalleeOriginKind::Paste &&
+              (!calleeOrigin.spelling || calleeOrigin.parts.empty())) {
+            fatal("model",
+                  "{0}: paste callee_origin is missing producer-owned spelling "
+                  "or parts",
+                  ctxItem);
           }
         } else if (callerMacroId) {
           // Nested invocations from older producer maps lack precise callee
@@ -1837,8 +2052,61 @@ void RefoldModel::SanitizeMacroProofArtifacts() {
              MI.id);
         MI.calleeOrigin.kind = MacroCalleeOriginKind::Opaque;
         MI.calleeOrigin.callerParamIndices.clear();
+        MI.calleeOrigin.spelling.reset();
+        MI.calleeOrigin.parts.clear();
       }
-    } else {
+    }
+
+    // The segmented callee-origin proof names a root invocation argument slice.
+    // Validate that every caller_arg_slice part points at a real invocation and
+    // a real formal parameter before later Step-5 logic treats it as a rewrite
+    // witness.  The model does not attempt to repair malformed producer data; it
+    // simply downgrades the callee origin so existing conservative paths remain
+    // authoritative.
+    bool DropSegmentedOrigin = false;
+    for (const CalleeOriginPart &Part : MI.calleeOrigin.parts) {
+      if (Part.kind != CalleeOriginPartKind::CallerArgSlice)
+        continue;
+      if (!Part.rootMacroId || !Part.rootParamIndex || !Part.byteBegin ||
+          !Part.byteEnd || *Part.byteEnd < *Part.byteBegin ||
+          (*Part.byteEnd - *Part.byteBegin) != Part.spelling.size()) {
+        DropSegmentedOrigin = true;
+        break;
+      }
+
+      auto RootIt = MacroById.find(*Part.rootMacroId);
+      if (RootIt == MacroById.end() ||
+          *Part.rootParamIndex >= RootIt->second->defParams.size()) {
+        DropSegmentedOrigin = true;
+        break;
+      }
+    }
+    if (DropSegmentedOrigin) {
+      warn("model",
+           "downgrading invalid segmented callee_origin proof for macro id={0} "
+           "to opaque",
+           MI.id);
+      MI.calleeOrigin.kind = MacroCalleeOriginKind::Opaque;
+      MI.calleeOrigin.callerParamIndices.clear();
+      MI.calleeOrigin.spelling.reset();
+      MI.calleeOrigin.parts.clear();
+    } else if (MI.calleeOrigin.spelling && !MI.calleeOrigin.parts.empty()) {
+      std::string Tiled;
+      for (const CalleeOriginPart &Part : MI.calleeOrigin.parts)
+        Tiled.append(Part.spelling.begin(), Part.spelling.end());
+      if (Tiled != *MI.calleeOrigin.spelling) {
+        warn("model",
+             "downgrading non-tiling segmented callee_origin proof for macro "
+             "id={0} to opaque",
+             MI.id);
+        MI.calleeOrigin.kind = MacroCalleeOriginKind::Opaque;
+        MI.calleeOrigin.callerParamIndices.clear();
+        MI.calleeOrigin.spelling.reset();
+        MI.calleeOrigin.parts.clear();
+      }
+    }
+
+    if (!Caller) {
       // If the caller is gone, degrade any caller-dependent origin metadata to
       // opaque and drop caller-relative proof that cannot be validated anymore.
       if (!MI.calleeOrigin.callerParamIndices.empty()) {
@@ -1848,6 +2116,18 @@ void RefoldModel::SanitizeMacroProofArtifacts() {
              MI.id);
         MI.calleeOrigin.kind = MacroCalleeOriginKind::Opaque;
         MI.calleeOrigin.callerParamIndices.clear();
+        MI.calleeOrigin.spelling.reset();
+        MI.calleeOrigin.parts.clear();
+      }
+      if (!MI.calleeOrigin.parts.empty() ||
+          MI.calleeOrigin.kind == MacroCalleeOriginKind::Paste) {
+        warn("model",
+             "dropping segmented callee_origin proof for macro id={0}: "
+             "caller invocation is unavailable",
+             MI.id);
+        MI.calleeOrigin.kind = MacroCalleeOriginKind::Opaque;
+        MI.calleeOrigin.spelling.reset();
+        MI.calleeOrigin.parts.clear();
       }
       if (!MI.argDeps.empty() || !MI.argRefs.empty()) {
         warn("model",

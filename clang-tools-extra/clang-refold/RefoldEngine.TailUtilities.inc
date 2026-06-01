@@ -2527,35 +2527,6 @@ void RefoldEngine::MaterializeIncludeExpansion(
     std::string name;
   };
 
-  // Parse the controlled macro name from a recorded #define/#undef spelling.
-  // The parser intentionally recognizes only the directive grammar needed by
-  // this repair proof.  If the directive is malformed, uses an unexpected
-  // subkind, or does not begin with a real directive marker, the caller treats
-  // it as unproven and fails closed rather than moving ambiguous source text.
-  auto parseMaterializedHeaderMacroStateDirectiveName =
-      [](StringRef text,
-         StringRef expectedSubkind) -> std::optional<std::string> {
-    StringRef s = text.ltrim();
-    if (!s.consume_front("#"))
-      return std::nullopt;
-    s = s.ltrim();
-
-    StringRef keyword = expectedSubkind.drop_front();
-    if (!s.consume_front(keyword))
-      return std::nullopt;
-    if (!s.empty() && stringutils::isIdentPart(s.front()))
-      return std::nullopt;
-
-    s = s.ltrim();
-    if (s.empty() || !stringutils::isIdentStart(s.front()))
-      return std::nullopt;
-
-    size_t end = 1;
-    while (end < s.size() && stringutils::isIdentPart(s[end]))
-      ++end;
-    return s.take_front(end).str();
-  };
-
   // Observation mode for a carried macro-state directive.
   //
   // Object-like definitions and #undefs are observed by the macro identifier as
@@ -2697,20 +2668,17 @@ void RefoldEngine::MaterializeIncludeExpansion(
   auto materializedHeaderReplacementObservesMacroStateDirective =
       [&](const RefoldModel::MacroDirective &directive, StringRef replacement,
           bool unparseableObserves) {
-        std::optional<std::string> name =
-            parseMaterializedHeaderMacroStateDirectiveName(directive.text,
-                                                           directive.subkind);
-        if (!name)
+        if (directive.name.empty())
           return unparseableObserves;
 
-        switch (materializedHeaderMacroObservationKindForDirective(directive,
-                                                                   *name)) {
+        switch (materializedHeaderMacroObservationKindForDirective(
+            directive, directive.name)) {
         case MaterializedHeaderMacroObservationKind::IdentifierToken:
-          return rawIdentifierAppearsInMaterializedHeaderText(*name,
+          return rawIdentifierAppearsInMaterializedHeaderText(directive.name,
                                                              replacement);
         case MaterializedHeaderMacroObservationKind::FunctionLikeInvocation:
           return functionLikeInvocationAppearsInMaterializedHeaderText(
-              *name, replacement);
+              directive.name, replacement);
         }
         return true;
       };
@@ -2731,10 +2699,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
     if (directive.subkind != "#define" && directive.subkind != "#undef")
       return std::nullopt;
 
-    std::optional<std::string> name =
-        parseMaterializedHeaderMacroStateDirectiveName(directive.text,
-                                                       directive.subkind);
-    if (!name)
+    if (directive.name.empty())
       return std::nullopt;
 
     StringRef text = directive.text;
@@ -2774,7 +2739,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
     piece.directive = &directive;
     piece.begin = fileBegin;
     piece.end = fileEnd;
-    piece.name = std::move(*name);
+    piece.name = directive.name.str();
     return piece;
   };
 
@@ -3703,41 +3668,6 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     uint64_t id = 0;
   };
 
-  // Recover the macro identifier from a recorded macro-state directive.  Keep
-  // this parser strict: the preservation proof below is only for complete
-  // `#define NAME ...` / `#undef NAME` directive lines recorded by the producer.
-  auto parseHeaderMacroStateDirectiveName =
-      [](StringRef text,
-         StringRef expectedSubkind) -> std::optional<std::string> {
-    // Accept leading indentation, but require the directive spelling itself to
-    // start with a real preprocessor marker from the recorded directive text.
-    StringRef s = text.ltrim();
-    if (!s.consume_front("#"))
-      return std::nullopt;
-    s = s.ltrim();
-
-    // `MacroDirective::subkind` stores the spelling with the leading '#'.
-    // Drop it here and require a standalone directive keyword, not a prefix of
-    // some longer identifier-like token.
-    StringRef keyword = expectedSubkind.drop_front();
-    if (!s.consume_front(keyword))
-      return std::nullopt;
-    if (!s.empty() && stringutils::isIdentPart(s.front()))
-      return std::nullopt;
-
-    // The first identifier after #define/#undef is the macro state key.  For a
-    // function-like define, this stops before the opening paren, which is the
-    // name spelling needed for replacement-payload liveness checks.
-    s = s.ltrim();
-    if (s.empty() || !stringutils::isIdentStart(s.front()))
-      return std::nullopt;
-
-    size_t end = 1;
-    while (end < s.size() && stringutils::isIdentPart(s[end]))
-      ++end;
-    return s.take_front(end).str();
-  };
-
   enum class HeaderMacroReplacementObservationKind {
     IdentifierToken,
     FunctionLikeInvocation,
@@ -3875,18 +3805,17 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
   auto headerReplacementObservesMacroStateDirective =
       [&](const RefoldModel::MacroDirective &directive, StringRef replacement,
           bool unparseableObserves) {
-        std::optional<std::string> name =
-            parseHeaderMacroStateDirectiveName(directive.text,
-                                               directive.subkind);
-        if (!name)
+        if (directive.name.empty())
           return unparseableObserves;
 
-        switch (headerMacroObservationKindForDirective(directive, *name)) {
+        switch (headerMacroObservationKindForDirective(directive,
+                                                       directive.name)) {
         case HeaderMacroReplacementObservationKind::IdentifierToken:
-          return rawIdentifierAppearsInHeaderReplacement(*name, replacement);
+          return rawIdentifierAppearsInHeaderReplacement(directive.name,
+                                                        replacement);
         case HeaderMacroReplacementObservationKind::FunctionLikeInvocation:
-          return functionLikeInvocationAppearsInHeaderReplacement(*name,
-                                                                 replacement);
+          return functionLikeInvocationAppearsInHeaderReplacement(
+              directive.name, replacement);
         }
         return true;
       };
@@ -3911,9 +3840,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     if (directive.subkind != "#define" && directive.subkind != "#undef")
       return std::nullopt;
 
-    std::optional<std::string> name = parseHeaderMacroStateDirectiveName(
-        directive.text, directive.subkind);
-    if (!name)
+    if (directive.name.empty())
       return std::nullopt;
 
     // Re-scan the recorded directive text to find the byte offset of the macro
@@ -3959,7 +3886,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     piece.directive = &directive;
     piece.begin = fileBegin;
     piece.end = fileEnd;
-    piece.name = std::move(*name);
+    piece.name = directive.name.str();
     return piece;
   };
 
@@ -4718,15 +4645,18 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     return false;
   };
 
-  auto macroDirectiveNameFromRecordedText =
+  auto macroDirectiveNameFromModel =
       [&](const RefoldModel::MacroDirective &directive)
           -> std::optional<std::string> {
     // Only macro-state transitions matter for replacement-payload exposure.
     // Other directives in a zero-token include subtree are irrelevant here.
+    // The producer supplies the macro-state key directly; do not rediscover it
+    // from directive text in this consumer-side proof.
     if (directive.subkind != "#define" && directive.subkind != "#undef")
       return std::nullopt;
-    return parseHeaderMacroStateDirectiveName(directive.text,
-                                              directive.subkind);
+    if (directive.name.empty())
+      return std::nullopt;
+    return directive.name.str();
   };
 
   auto headerZeroTokenChildIncludeIsPreservableGap =
@@ -5222,7 +5152,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       return false;
 
     std::optional<std::string> name =
-        macroDirectiveNameFromRecordedText(directive);
+        macroDirectiveNameFromModel(directive);
     if (!name)
       return false;
 

@@ -80,9 +80,11 @@
 //
 // * DirectiveMacroItem
 //     A #define/#undef directive line (definition), with:
+//       - name: the producer-recorded macro-state key for the directive
 //       - site_path and directive byte range [site_b, site_e) (nullable bounds)
 //       - spans[]: A-token spans this directive contributed to (may be empty)
 //       - optional owner_include_id to disambiguate repeated header instances
+//       - optional #define replay proof data: def_params and replacement_tokens
 //
 // * DirectivePragmaItem
 //     A #pragma line with exact text and location (site_path, [site_b, site_e))
@@ -1062,6 +1064,7 @@ static constexpr const char *RefoldSchema = R"json(
         "id",
         "kind",
         "subkind",
+        "name",
         "text",
         "spans",
         "site_path",
@@ -1086,6 +1089,11 @@ static constexpr const char *RefoldSchema = R"json(
             "#undef"
           ],
           "description": "Directive kind (#define or #undef)."
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Macro identifier whose state is changed by this #define/#undef directive. This is producer-owned proof data so consumers do not need to parse directive text for macro-state lookup."
         },
         "text": {
           "type": "string",
@@ -1124,6 +1132,20 @@ static constexpr const char *RefoldSchema = R"json(
           "type": "integer",
           "minimum": 0,
           "description": "Include item id that opened this file instance (disambiguates repeated includes)"
+        },
+        "def_params": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MacroParam"
+          },
+          "description": "Formal parameter list from this #define directive when it is function-like. Omitted for object-like macro definitions."
+        },
+        "replacement_tokens": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MacroReplacementToken"
+          },
+          "description": "Producer-owned replay tape for the macro replacement list, in definition order. Parameter references point at def_params by param_index; other tokens are fixed literal spellings."
         }
       },
       "description": "Represents #define/#undef lines (definitions), not invocation sites."
@@ -1490,9 +1512,152 @@ static constexpr const char *RefoldSchema = R"json(
           },
           "uniqueItems": true,
           "description": "When kind is caller_param, the caller formal parameter indices that directly contributed the callee token spelling at this invocation site. Empty or omitted for literal_macro_name, paste, or opaque."
+        },
+        "spelling": {
+          "type": "string",
+          "description": "For paste-derived or otherwise segmented callees, the exact final callee token spelling."
+        },
+        "parts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CalleeOriginPart"
+          },
+          "description": "Ordered producer-proven decomposition of the callee token spelling. For paste origins, these parts tile spelling and identify the root selector argument slices that contributed to the pasted callee name."
         }
       },
-      "description": "Structural provenance for the invoked macro name itself. The consumer uses this to conservatively disable args-only and DAG-lift refolding for higher-order or otherwise non-literal callee origins."
+      "description": "Structural provenance for the invoked macro name itself. The consumer uses this to conservatively disable args-only and DAG-lift refolding for higher-order or otherwise non-literal callee origins.",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "paste"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "spelling",
+              "parts"
+            ]
+          }
+        }
+      ]
+    },
+    "MacroReplacementToken": {
+      "type": "object",
+      "required": [
+        "kind",
+        "spelling"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "literal",
+            "param_ref"
+          ],
+          "description": "Replacement-list token kind. literal is fixed replacement-list text; param_ref is a reference to a macro formal parameter."
+        },
+        "spelling": {
+          "type": "string",
+          "description": "Exact token spelling recorded by the producer for this replacement-list token."
+        },
+        "param_index": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "For param_ref tokens, the zero-based formal parameter index referenced by this replacement-list token."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "param_ref"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "param_index"
+            ]
+          }
+        }
+      ],
+      "description": "Producer-owned replay token for a macro definition replacement list. This lets the consumer replay simple macro definitions without reparsing #define text."
+    },
+    "CalleeOriginPart": {
+      "type": "object",
+      "required": [
+        "kind",
+        "spelling"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "literal",
+            "caller_arg_slice"
+          ],
+          "description": "Segment kind for a macro callee token. literal is fixed replacement-list text; caller_arg_slice is a slice of a root invocation argument that participated in the callee spelling."
+        },
+        "spelling": {
+          "type": "string",
+          "description": "Exact bytes contributed by this segment to the callee token spelling."
+        },
+        "root_macro_id": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "For caller_arg_slice, the root macro invocation item id whose argument supplied this callee segment."
+        },
+        "root_param_index": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "For caller_arg_slice, the zero-based root invocation formal/argument index containing this selector slice."
+        },
+        "byte_begin": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "For caller_arg_slice, begin byte offset within the trimmed root argument spelling."
+        },
+        "byte_end": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "For caller_arg_slice, end byte offset within the trimmed root argument spelling."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "caller_arg_slice"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "root_macro_id",
+              "root_param_index",
+              "byte_begin",
+              "byte_end"
+            ]
+          }
+        }
+      ],
+      "description": "One producer-proven segment of a macro callee token spelling, used especially for paste-derived callee selector substitution."
     }
   }
 }

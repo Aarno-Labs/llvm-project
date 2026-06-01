@@ -3849,31 +3849,14 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
         }
       };
 
-  auto macroDirectiveNameFromRecordedText =
+  auto macroDirectiveNameFromModel =
       [&](const RefoldModel::MacroDirective &directive)
-          -> std::optional<std::string> {
+          -> std::optional<StringRef> {
     if (directive.subkind != "#define" && directive.subkind != "#undef")
       return std::nullopt;
-
-    StringRef text = directive.text.ltrim();
-    if (!text.consume_front("#"))
+    if (directive.name.empty())
       return std::nullopt;
-    text = text.ltrim();
-
-    StringRef keyword = directive.subkind.drop_front();
-    if (!text.consume_front(keyword))
-      return std::nullopt;
-    if (!text.empty() && stringutils::isIdentPart(text.front()))
-      return std::nullopt;
-
-    text = text.ltrim();
-    if (text.empty() || !stringutils::isIdentStart(text.front()))
-      return std::nullopt;
-
-    size_t end = 1;
-    while (end < text.size() && stringutils::isIdentPart(text[end]))
-      ++end;
-    return text.take_front(end).str();
+    return directive.name;
   };
 
   auto macroDirectiveIsFunctionLikeDefinition =
@@ -3914,8 +3897,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   // function-like #define is keyed by actual invocation syntax instead.
   auto hunkReplacementObservesMacroStateDirective =
       [&](const RefoldModel::MacroDirective &directive) {
-        std::optional<std::string> name =
-            macroDirectiveNameFromRecordedText(directive);
+        std::optional<StringRef> name = macroDirectiveNameFromModel(directive);
         if (!name)
           return true;
         if (macroDirectiveIsFunctionLikeDefinition(directive, *name))

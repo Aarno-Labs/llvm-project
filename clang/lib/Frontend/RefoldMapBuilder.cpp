@@ -2306,6 +2306,12 @@ void RefoldMapBuilder::onMacroDefined(const Token &MacroNameTok,
   It.Kind = IK_Directive;
   It.Subkind = "#define";
 
+  // Store the macro-state key explicitly.  Consumers should not have to parse
+  // the textual directive spelling merely to determine which macro a #define
+  // transitions into the active state.
+  if (const IdentifierInfo *II = MacroNameTok.getIdentifierInfo())
+    It.Name = II->getName().str();
+
   // Use the macro definition location (not the expansion site) so the consumer
   // can map this item back to the defining file/line reliably.
   It.Loc = MI->getDefinitionLoc();
@@ -2318,6 +2324,42 @@ void RefoldMapBuilder::onMacroDefined(const Token &MacroNameTok,
   PrintMacroDefinition(*MacroNameTok.getIdentifierInfo(), *MI, PP, &OS);
   OS << "\n"; // preserve directive line termination for refolding/diffing
   It.Text = OS.str();
+
+  // Emit producer-owned macro-definition replay data alongside the directive
+  // text.  The consumer can use this token tape to replay simple macro bodies
+  // without reparsing the #define spelling.  Parameter references are recorded
+  // by index into the definition-time formal list; all other replacement-list
+  // tokens, including '#' and '##', remain literal tokens.  Consumers that do
+  // not implement the full token semantics for a literal operator can still
+  // fail closed after reading the tape.
+  if (MI->isFunctionLike()) {
+    It.DefParams.reserve(MI->getNumParams());
+    for (unsigned I = 0, E = MI->getNumParams(); I != E; ++I) {
+      MacroParam P;
+      if (const IdentifierInfo *PI = getMacroParamIdentifier(MI, I))
+        P.Name = PI->getName().str();
+      P.Variadic = (MI->isVariadic() && I + 1 == E);
+      It.DefParams.push_back(std::move(P));
+    }
+  }
+
+  for (const Token &RTok : MI->tokens()) {
+    MacroReplacementToken ReplayTok;
+    ReplayTok.Kind = MRT_Literal;
+    ReplayTok.Spelling = PP.getSpelling(RTok);
+
+    if (MI->isFunctionLike() && RTok.is(tok::identifier)) {
+      if (const IdentifierInfo *II = RTok.getIdentifierInfo()) {
+        int ParamIndex = MI->getParameterNum(II);
+        if (ParamIndex >= 0) {
+          ReplayTok.Kind = MRT_ParamRef;
+          ReplayTok.ParamIndex = static_cast<uint32_t>(ParamIndex);
+        }
+      }
+    }
+
+    It.ReplacementTokens.push_back(std::move(ReplayTok));
+  }
 
   // Site info: capture the byte span of the whole directive line in its file,
   // so the consumer can do precise byte-based edits against the original source.
@@ -2357,6 +2399,12 @@ void RefoldMapBuilder::onMacroUndefined(const Token &MacroNameTok,
   It.Kind = IK_Directive;
   It.Subkind = "#undef";
   It.Loc = MacroNameTok.getLocation();
+
+  // Store the macro-state key explicitly for the matching #undef transition.
+  // This keeps macro-liveness and replay proofs model-driven instead of making
+  // the consumer rediscover directive names from raw source text.
+  if (const IdentifierInfo *II = MacroNameTok.getIdentifierInfo())
+    It.Name = II->getName().str();
 
   // Materialize the directive text exactly as it should appear in the refolded
   // source (including newline terminator).
@@ -3955,7 +4003,7 @@ void RefoldMapBuilder::writeJSON() {
   llvm::json::OStream JO(OS, /*Indent=*/2);
 
   JO.object([&] {
-    JO.attribute("version", "2.6");
+    JO.attribute("version", "2.7");
 
     const auto &PPO = PP.getPreprocessorOpts();
     std::string LangStr = computeLangStr(PP.getLangOpts());
@@ -4394,6 +4442,177 @@ void RefoldMapBuilder::writeJSON() {
       auto RIt = ArgRefsByID.find(It.ID);
       if (RIt != ArgRefsByID.end())
         It.InvArgRefs = RIt->second;
+    }
+
+    // Materialize producer-owned paste callee-origin records now that the
+    // sanitized caller graph and arg_refs have been written back to Items.
+    // Earlier callbacks can detect that a callee is nested, but only this late
+    // pass has enough stable provenance to say that a pasted callee substring is
+    // a concrete slice of one root invocation argument.  If that provenance is
+    // absent, multi-source, or ambiguous, we leave the older conservative origin
+    // classification in place rather than guessing.
+    struct RootArgSliceProof {
+      uint64_t RootMacroId = 0;
+      uint32_t RootParamIndex = 0;
+      uint32_t ByteBegin = 0;
+      uint32_t ByteEnd = 0;
+    };
+
+    auto proveRootArgSliceForPastePart =
+        [&](const Item &PasteInvocation, uint32_t ArgIndex,
+            llvm::StringRef Spelling) -> std::optional<RootArgSliceProof> {
+      const Item *Cur = &PasteInvocation;
+      uint32_t Slot = ArgIndex;
+      llvm::SmallDenseSet<uint64_t, 16> Seen;
+
+      while (Cur->CallerMacroId) {
+        if (!Seen.insert(Cur->ID).second)
+          return std::nullopt;
+        if (Slot >= Cur->InvArgRefs.size() || Cur->InvArgRefs[Slot].size() != 1)
+          return std::nullopt;
+
+        const Item::InvArgRef &Ref = Cur->InvArgRefs[Slot].front();
+        const Item *Parent = findItemByID(Items, *Cur->CallerMacroId);
+        if (!Parent)
+          return std::nullopt;
+        Cur = Parent;
+        Slot = Ref.CallerParamIndex;
+      }
+
+      if (Slot >= Cur->InvArgRanges.size() || !Cur->InvBegin ||
+          Cur->InvText.empty())
+        return std::nullopt;
+      const auto &Range = Cur->InvArgRanges[Slot];
+      if (!Range.first || !Range.second || *Range.second < *Range.first ||
+          *Range.first < *Cur->InvBegin)
+        return std::nullopt;
+
+      const uint64_t RelB = *Range.first - *Cur->InvBegin;
+      const uint64_t RelE = *Range.second - *Cur->InvBegin;
+      if (RelE < RelB || RelE > Cur->InvText.size() ||
+          RelE - RelB > std::numeric_limits<uint32_t>::max())
+        return std::nullopt;
+
+      llvm::StringRef ArgText = llvm::StringRef(Cur->InvText)
+                                    .slice(static_cast<size_t>(RelB),
+                                           static_cast<size_t>(RelE));
+      size_t TrimB = 0;
+      while (TrimB < ArgText.size() &&
+             isSpace</*kWithCR=*/true>(ArgText[TrimB]))
+        ++TrimB;
+      size_t TrimE = ArgText.size();
+      while (TrimE > TrimB && isSpace</*kWithCR=*/true>(ArgText[TrimE - 1]))
+        --TrimE;
+
+      // This first producer-side selector record only admits a whole trimmed
+      // root argument as the selector slice.  More complex partial-slice
+      // forwarding should be represented by richer producer metadata later;
+      // accepting it here would force the consumer back into inference.
+      if (ArgText.slice(TrimB, TrimE) != Spelling)
+        return std::nullopt;
+
+      RootArgSliceProof Proof;
+      Proof.RootMacroId = Cur->ID;
+      Proof.RootParamIndex = Slot;
+      Proof.ByteBegin = static_cast<uint32_t>(TrimB);
+      Proof.ByteEnd = static_cast<uint32_t>(TrimE);
+      return Proof;
+    };
+
+    auto buildPasteCalleeOriginFromWitness =
+        [&](const Item &PasteInvocation, const PasteToken &Witness,
+            llvm::StringRef CalleeName) -> std::optional<MacroCalleeOrigin> {
+      if (Witness.Spelling != CalleeName || Witness.Parts.empty())
+        return std::nullopt;
+
+      MacroCalleeOrigin Origin;
+      Origin.Kind = MCO_Paste;
+      Origin.Spelling = Witness.Spelling;
+
+      for (const PastePart &Part : Witness.Parts) {
+        MacroCalleeOriginPart OutPart;
+        OutPart.Spelling = Part.Spelling;
+
+        if (!Part.ArgIndex) {
+          OutPart.Kind = MCOP_Literal;
+          Origin.Parts.push_back(std::move(OutPart));
+          continue;
+        }
+
+        std::optional<RootArgSliceProof> RootSlice =
+            proveRootArgSliceForPastePart(PasteInvocation, *Part.ArgIndex,
+                                          Part.Spelling);
+        if (RootSlice) {
+          OutPart.Kind = MCOP_CallerArgSlice;
+          OutPart.RootMacroId = RootSlice->RootMacroId;
+          OutPart.RootParamIndex = RootSlice->RootParamIndex;
+          OutPart.ByteBegin = RootSlice->ByteBegin;
+          OutPart.ByteEnd = RootSlice->ByteEnd;
+          Origin.Parts.push_back(std::move(OutPart));
+          continue;
+        }
+
+        // If the immediate paste argument has no caller-formal provenance, it is
+        // fixed replacement-list text from the paste helper's caller context
+        // rather than a selector the consumer can rewrite.  Serialize it as a
+        // literal anchor.  Any non-empty or ambiguous provenance remains outside
+        // this proof so selector substitution stays fail-closed.
+        if (PasteInvocation.CallerMacroId &&
+            *Part.ArgIndex < PasteInvocation.InvArgRefs.size() &&
+            PasteInvocation.InvArgRefs[*Part.ArgIndex].empty()) {
+          OutPart.Kind = MCOP_Literal;
+          Origin.Parts.push_back(std::move(OutPart));
+          continue;
+        }
+
+        return std::nullopt;
+      }
+
+      return Origin;
+    };
+
+    for (Item &Callee : Items) {
+      if (Callee.Kind != IK_Macro || Callee.Name.empty())
+        continue;
+
+      std::optional<MacroCalleeOrigin> UniqueOrigin;
+      bool Ambiguous = false;
+
+      const Item *Cur = &Callee;
+      llvm::SmallDenseSet<uint64_t, 16> Seen;
+      while (Cur->CallerMacroId) {
+        if (!Seen.insert(Cur->ID).second)
+          break;
+        const Item *Parent = findItemByID(Items, *Cur->CallerMacroId);
+        if (!Parent)
+          break;
+
+        for (const PasteToken &Witness : Parent->PasteTokens) {
+          if (Witness.Spelling != Callee.Name)
+            continue;
+          std::optional<MacroCalleeOrigin> Candidate =
+              buildPasteCalleeOriginFromWitness(*Parent, Witness, Callee.Name);
+          if (!Candidate)
+            continue;
+          if (UniqueOrigin) {
+            Ambiguous = true;
+            break;
+          }
+          UniqueOrigin = std::move(*Candidate);
+        }
+        if (Ambiguous)
+          break;
+        Cur = Parent;
+      }
+
+      if (Ambiguous) {
+        Callee.CalleeOrigin.Kind = MCO_Opaque;
+        Callee.CalleeOrigin.CallerParamIndices.clear();
+        Callee.CalleeOrigin.Spelling.clear();
+        Callee.CalleeOrigin.Parts.clear();
+      } else if (UniqueOrigin) {
+        Callee.CalleeOrigin = std::move(*UniqueOrigin);
+      }
     }
 
     auto hasRealTokenEnvelope = [](const Item &It) -> bool {
@@ -4903,6 +5122,45 @@ void RefoldMapBuilder::writeJSON() {
             }
           }
 
+          if (It.Kind == IK_Directive && It.Subkind == "#define") {
+            // Definition directives now carry a producer-owned replay tape for
+            // their replacement list.  This keeps later macro-DAG proofs from
+            // rediscovering replacement semantics by parsing directive text in
+            // the consumer.  The textual directive remains serialized above for
+            // byte-for-byte source preservation; this structured tape is proof
+            // material only.
+            if (!It.DefParams.empty()) {
+              JO.attributeArray("def_params", [&] {
+                for (const MacroParam &P : It.DefParams) {
+                  JO.object([&] {
+                    JO.attribute("name", P.Name);
+                    JO.attribute("variadic", P.Variadic);
+                  });
+                }
+              });
+            }
+
+            if (!It.ReplacementTokens.empty()) {
+              JO.attributeArray("replacement_tokens", [&] {
+                for (const MacroReplacementToken &RT : It.ReplacementTokens) {
+                  JO.object([&] {
+                    switch (RT.Kind) {
+                    case MRT_Literal:
+                      JO.attribute("kind", "literal");
+                      break;
+                    case MRT_ParamRef:
+                      JO.attribute("kind", "param_ref");
+                      if (RT.ParamIndex)
+                        JO.attribute("param_index", *RT.ParamIndex);
+                      break;
+                    }
+                    JO.attribute("spelling", RT.Spelling);
+                  });
+                }
+              });
+            }
+          }
+
           // Macro-token origin spans
           if (It.Kind == IK_Macro) {
             if (!It.ArgSpans.empty()) {
@@ -5042,6 +5300,33 @@ void RefoldMapBuilder::writeJSON() {
                 JO.attributeArray("caller_param_indices", [&] {
                   for (uint32_t Idx : It.CalleeOrigin.CallerParamIndices)
                     JO.value(Idx);
+                });
+              }
+              if (!It.CalleeOrigin.Spelling.empty())
+                JO.attribute("spelling", It.CalleeOrigin.Spelling);
+              if (!It.CalleeOrigin.Parts.empty()) {
+                JO.attributeArray("parts", [&] {
+                  for (const MacroCalleeOriginPart &Part :
+                       It.CalleeOrigin.Parts) {
+                    JO.object([&] {
+                      switch (Part.Kind) {
+                      case MCOP_Literal:
+                        JO.attribute("kind", "literal");
+                        break;
+                      case MCOP_CallerArgSlice:
+                        JO.attribute("kind", "caller_arg_slice");
+                        if (Part.RootMacroId)
+                          JO.attribute("root_macro_id", *Part.RootMacroId);
+                        if (Part.RootParamIndex)
+                          JO.attribute("root_param_index",
+                                       *Part.RootParamIndex);
+                        JO.attribute("byte_begin", Part.ByteBegin);
+                        JO.attribute("byte_end", Part.ByteEnd);
+                        break;
+                      }
+                      JO.attribute("spelling", Part.Spelling);
+                    });
+                  }
                 });
               }
             });

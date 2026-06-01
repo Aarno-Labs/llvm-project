@@ -93,6 +93,26 @@ struct MacroParam {
   bool Variadic = false;
 };
 
+enum MacroReplacementTokenKind {
+  MRT_Literal,
+  MRT_ParamRef,
+};
+
+/// One token in a macro definition replacement list, as understood by Clang at
+/// definition time.
+///
+/// The consumer can use this as a producer-owned replay tape for simple macro
+/// expansion proofs instead of reparsing the textual #define directive.  The
+/// tape intentionally records token spellings, not source byte ranges: macro
+/// definition editing is outside clang-refold's core refolding domain, while
+/// deterministic replay only needs to know which replacement-list tokens are
+/// fixed literals and which are formal-parameter references.
+struct MacroReplacementToken {
+  MacroReplacementTokenKind Kind = MRT_Literal;
+  std::string Spelling;
+  std::optional<uint32_t> ParamIndex;
+};
+
 enum MacroCalleeOriginKind {
   MCO_LiteralMacroName,
   MCO_CallerParam,
@@ -100,9 +120,33 @@ enum MacroCalleeOriginKind {
   MCO_Opaque
 };
 
+enum MacroCalleeOriginPartKind {
+  MCOP_Literal,
+  MCOP_CallerArgSlice,
+};
+
+/// One segment of a producer-proven macro callee spelling.
+///
+/// For paste-derived callees, the consumer needs to know whether each substring
+/// of the callee token came from fixed replacement-list text or from a root
+/// invocation argument slice.  Recording that projection here turns Step-5
+/// selector substitution into a mechanical proof over existing macros: the
+/// consumer can rewrite the named root selector argument only when a unique
+/// alternate pasted callee exactly explains the edited B expansion.
+struct MacroCalleeOriginPart {
+  MacroCalleeOriginPartKind Kind = MCOP_Literal;
+  std::string Spelling;
+  std::optional<uint64_t> RootMacroId;
+  std::optional<uint32_t> RootParamIndex;
+  uint32_t ByteBegin = 0;
+  uint32_t ByteEnd = 0;
+};
+
 struct MacroCalleeOrigin {
   MacroCalleeOriginKind Kind = MCO_LiteralMacroName;
   std::vector<uint32_t> CallerParamIndices;
+  std::string Spelling;
+  SmallVector<MacroCalleeOriginPart, 4> Parts;
 };
 
 /// Structural forwarding metadata for a callee argument derived from a slice
@@ -167,7 +211,7 @@ struct Item {
   uint64_t ID = 0;
   ItemKind Kind = IK_File;
   std::string Subkind; // "#include", "#define", ...
-  std::string Name;    // macro name
+  std::string Name;    // macro invocation or directive macro name
   std::string Text;    // directive text
   std::string InvText; // macro call text
   std::string InvFile; // file containing the macro invocation
@@ -209,6 +253,10 @@ struct Item {
 
   // Definition-time macro formal parameters.
   std::vector<MacroParam> DefParams;
+
+  // Producer-owned replacement-list replay tape for #define directive items.
+  // This is populated only for directive records whose Subkind is "#define".
+  std::vector<MacroReplacementToken> ReplacementTokens;
 
   // Invocation-site byte ranges [begin,end) for each actual argument (index
   // matches formal parameter order).

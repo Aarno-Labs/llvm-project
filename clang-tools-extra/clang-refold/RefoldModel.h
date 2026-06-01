@@ -312,6 +312,10 @@ public:
 
   enum class PastePartKind { Arg, Literal };
 
+  enum class MacroReplacementTokenKind { Literal, ParamRef };
+
+  enum class CalleeOriginPartKind { Literal, CallerArgSlice };
+
   /// One contiguous contribution to a pasted token's final spelling.
   ///
   /// `kind` records whether the part came from an invocation argument or from
@@ -344,17 +348,48 @@ public:
     std::vector<PastePart> parts;
   };
 
-  struct MacroCalleeOrigin {
-    MacroCalleeOriginKind kind = MacroCalleeOriginKind::LiteralMacroName;
-    std::vector<uint32_t> callerParamIndices;
-  };
-
   struct MacroDefParam {
     StringRef name;
     bool variadic;
 
     MacroDefParam(StringRef Name, bool Variadic)
         : name(Name), variadic(Variadic) {}
+  };
+
+  /// Producer-owned replay token for a macro definition replacement list.
+  ///
+  /// This is the typed form of DirectiveMacroItem.replacement_tokens.  It lets
+  /// later proof code replay simple macro definitions from producer evidence
+  /// instead of reparsing #define text in the consumer.  `ParamRef` tokens carry
+  /// a formal index into the directive's defParams vector; `Literal` tokens are
+  /// fixed replacement-list spellings.
+  struct MacroReplacementToken {
+    MacroReplacementTokenKind kind = MacroReplacementTokenKind::Literal;
+    StringRef spelling;
+    std::optional<uint32_t> paramIndex;
+  };
+
+  /// One producer-proven segment of a macro callee token spelling.
+  ///
+  /// Literal parts are fixed replacement-list bytes.  CallerArgSlice parts name
+  /// the root invocation and root argument slice that supplied the selector
+  /// text.  This gives the consumer a direct selector-substitution witness for
+  /// paste-derived callees without rediscovering that relationship from raw
+  /// invocation text.
+  struct CalleeOriginPart {
+    CalleeOriginPartKind kind = CalleeOriginPartKind::Literal;
+    StringRef spelling;
+    std::optional<uint64_t> rootMacroId;
+    std::optional<uint32_t> rootParamIndex;
+    std::optional<uint32_t> byteBegin;
+    std::optional<uint32_t> byteEnd;
+  };
+
+  struct MacroCalleeOrigin {
+    MacroCalleeOriginKind kind = MacroCalleeOriginKind::LiteralMacroName;
+    std::vector<uint32_t> callerParamIndices;
+    std::optional<StringRef> spelling;
+    std::vector<CalleeOriginPart> parts;
   };
 
   struct MacroInvocation {
@@ -448,12 +483,18 @@ public:
   struct MacroDirective {
     uint64_t id;
     StringRef subkind; // "#define" | "#undef"
+    /// Producer-recorded macro-state key for this #define/#undef directive.
+    /// Keeping the name in the model lets replay proofs resolve macro state
+    /// without reparsing raw directive text in the consumer.
+    StringRef name;
     StringRef text;
     StringRef sitePath;
     uint64_t siteB;
     uint64_t siteE;
     std::optional<uint64_t> ownerIncludeId;
     std::vector<PPSpan> spans;
+    std::vector<MacroDefParam> defParams;
+    std::vector<MacroReplacementToken> replacementTokens;
   };
 
   struct PragmaDirective {
