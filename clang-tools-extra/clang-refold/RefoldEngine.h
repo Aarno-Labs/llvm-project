@@ -106,6 +106,25 @@ struct MaterializedEditMapping {
   uint64_t refoldedSourceEnd = 0;
 };
 
+/// One modified include owner emitted next to the refolded TU.
+///
+/// The normal clang-refold backend is a single-output backend: dirty include
+/// owners are materialized into the TU.  A strictly narrower proof class can
+/// preserve the include edge when the dirty header's active source `#line`
+/// directive depends on macro state supplied by the immediate includer.  In
+/// that case, materializing the header into the TU is token-sound but loses the
+/// source-graph fact that the edit belongs to the header.  This side channel
+/// writes the modified header bytes under the same quoted relative include path
+/// beside the `.c.mod` output, so replay sees the edited owner while the TU
+/// include spelling remains unchanged.
+struct SourceGraphOutput {
+  uint64_t includeId = 0;
+  std::string relativePath;
+  std::string originalTarget;
+  std::string resolvedPath;
+  std::string bytes;
+};
+
 
 /// \brief Deterministic refolder that projects edits made to raw preprocessed
 /// C back onto the original translation unit (TU) without re-running the
@@ -571,7 +590,8 @@ public:
          std::vector<MaterializedEditMapping> *materializedEditMappings =
              nullptr,
          FinalLineControlValidationCallback finalLineControlValidationCallback =
-             FinalLineControlValidationCallback());
+             FinalLineControlValidationCallback(),
+         std::vector<SourceGraphOutput> *sourceGraphOutputs = nullptr);
 
   /// Build lexer language options from the producer-captured language name.
   static clang::LangOptions MakeLexLangOptions(llvm::StringRef langName);
@@ -585,6 +605,7 @@ private:
   bool strict_;
   LangOptions lexLang_;
   std::vector<MaterializedEditMapping> *materializedEditMappings_ = nullptr;
+  std::vector<SourceGraphOutput> *sourceGraphOutputs_ = nullptr;
   FinalLineControlValidationCallback finalLineControlValidationCallback_;
 
   /// Final-output byte ranges for synthetic `#line` directives that the local
@@ -1195,12 +1216,14 @@ private:
                std::vector<MaterializedEditMapping> *materializedEditMappings =
                    nullptr,
                FinalLineControlValidationCallback finalLineControlValidationCallback =
-                   FinalLineControlValidationCallback())
+                   FinalLineControlValidationCallback(),
+               std::vector<SourceGraphOutput> *sourceGraphOutputs = nullptr)
       : model_(std::move(model)), aSource_(aSource), bSource_(bSource),
         aToks_(aToks), bToks_(bToks), aTokOff_(aTokOff), bTokOff_(bTokOff),
         lineDirs_(!noLines, model_.GetPPCwd()), strict_(strict),
         lexLang_(MakeLexLangOptions(model_.GetPPLang())),
         materializedEditMappings_(materializedEditMappings),
+        sourceGraphOutputs_(sourceGraphOutputs),
         finalLineControlValidationCallback_(
             std::move(finalLineControlValidationCallback)),
         sidebandPragmaEdits_(sidebandPragmaEdits.begin(),

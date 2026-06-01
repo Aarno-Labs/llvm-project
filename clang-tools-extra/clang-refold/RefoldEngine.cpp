@@ -114,6 +114,47 @@ struct LexBoundaryToken {
   size_t End = 0;
 };
 
+static bool isSafeSourceGraphIncludePathChar(char c) {
+  return std::isalnum(static_cast<unsigned char>(c)) || c == '_' ||
+         c == '-' || c == '.' || c == '/';
+}
+
+/// Return the quoted include operand as a safe relative path for automatic
+/// source-graph side output.
+///
+/// The automatic source-graph backend writes files beside `--out` using the
+/// original quoted include spelling.  That is only safe for simple relative
+/// include names.  Angle includes, absolute paths, backslashes, quotes, empty
+/// components, and `.`/`..` components stay in the normal single-output
+/// materialization path.
+static std::optional<std::string>
+safeSourceGraphRelativeIncludePath(const RefoldModel::IncludeItem &inc) {
+  if (inc.angled)
+    return std::nullopt;
+
+  StringRef target = inc.target;
+  if (target.size() < 2 || target.front() != '"' || target.back() != '"')
+    return std::nullopt;
+
+  StringRef path = target.drop_front().drop_back();
+  if (path.empty() || path.contains('\\') || path.contains('"') ||
+      llvm::sys::path::is_absolute(path))
+    return std::nullopt;
+
+  SmallVector<StringRef, 8> components;
+  path.split(components, '/', /*MaxSplit=*/-1, /*KeepEmpty=*/true);
+  for (StringRef component : components)
+    if (component.empty() || component == "." || component == "..")
+      return std::nullopt;
+
+  if (!llvm::all_of(path, [](char c) {
+        return isSafeSourceGraphIncludePathChar(c);
+      }))
+    return std::nullopt;
+
+  return path.str();
+}
+
 /// Return the first non-comment raw token in \p text, if any.
 static std::optional<LexBoundaryToken> firstLexToken(StringRef text,
                                                     const LangOptions &lang);
@@ -1361,7 +1402,8 @@ RefoldEngine::Refold(const json::Object &rootJson, StringRef aSource,
                      std::vector<MaterializedEditMapping>
                          *materializedEditMappings,
                      FinalLineControlValidationCallback
-                         finalLineControlValidationCallback) {
+                         finalLineControlValidationCallback,
+                     std::vector<SourceGraphOutput> *sourceGraphOutputs) {
   // Build the refold model based on the parsed JSON object.
   auto mOrErr = RefoldModel::FromJson(rootJson);
   if (!mOrErr)
@@ -1371,7 +1413,8 @@ RefoldEngine::Refold(const json::Object &rootJson, StringRef aSource,
   RefoldEngine engine(std::move(*mOrErr), aSource, aToks, aTokOff, bSource,
                       bToks, bTokOff, noLines, strict,
                       sidebandPragmaEdits, materializedEditMappings,
-                      std::move(finalLineControlValidationCallback));
+                      std::move(finalLineControlValidationCallback),
+                      sourceGraphOutputs);
   return engine.Refold();
 }
 
@@ -1720,6 +1763,8 @@ RefoldEngine::SliceBSourceClippedAgainstClaims(size_t bTokStart,
 std::string RefoldEngine::Refold() {
   if (materializedEditMappings_)
     materializedEditMappings_->clear();
+  if (sourceGraphOutputs_)
+    sourceGraphOutputs_->clear();
   finalLineControlPruneCandidates_.clear();
   finalLineControlSourceMappings_.clear();
 
@@ -1743,6 +1788,8 @@ std::string RefoldEngine::Refold() {
     out = ResolvePostStructuralFallback();
     finalLineControlPruneCandidates_.clear();
     finalLineControlSourceMappings_.clear();
+    if (sourceGraphOutputs_)
+      sourceGraphOutputs_->clear();
   }
 
   auto normalizeFinalLineControlPhysicalFile = [&](StringRef physicalFile) {
@@ -6551,6 +6598,78 @@ std::string RefoldEngine::RunSinglePassRefold() {
                        : TUIncludeMaterializationWorkClass::None;
   };
 
+  auto findMacroDirectiveById = [&](uint64_t id)
+      -> const RefoldModel::MacroDirective * {
+    for (const RefoldModel::MacroDirective &directive :
+         model_.GetMacroDirectives())
+      if (directive.id == id)
+        return &directive;
+    return nullptr;
+  };
+
+  auto definitionIsSuppliedByImmediateIncluder =
+      [&](const RefoldModel::IncludeItem &inc,
+          const RefoldModel::MacroDirective &definition) {
+        if (definition.subkind != "#define")
+          return false;
+        if (!PathsEqual(definition.sitePath, inc.sitePath))
+          return false;
+        if (definition.siteE > inc.siteB)
+          return false;
+        return definition.ownerIncludeId == inc.parent;
+      };
+
+  auto includeHasIncluderSuppliedLineControlMacroState =
+      [&](const RefoldModel::IncludeItem &inc) {
+        for (const RefoldModel::LineControlEvent &event :
+             model_.GetLineControls()) {
+          if (!event.active || !event.producerProven)
+            continue;
+          if (event.ownerIncludeId != std::optional<uint64_t>(inc.id))
+            continue;
+          if (!event.siteB || !event.siteE)
+            continue;
+
+          for (const RefoldModel::MacroInvocation &macro :
+               model_.GetMacroInvocations()) {
+            if (macro.ownerIncludeId != std::optional<uint64_t>(inc.id))
+              continue;
+            if (!macro.invB || !macro.invE || !macro.definitionDirectiveId)
+              continue;
+            if (*macro.invB < *event.siteB || *macro.invE > *event.siteE)
+              continue;
+
+            const RefoldModel::MacroDirective *definition =
+                findMacroDirectiveById(*macro.definitionDirectiveId);
+            if (!definition)
+              continue;
+            if (definitionIsSuppliedByImmediateIncluder(inc, *definition))
+              return true;
+          }
+        }
+
+        return false;
+      };
+
+  auto shouldPreserveIncludeAsSourceGraphOwner =
+      [&](const RefoldModel::IncludeItem &inc) -> std::optional<std::string> {
+    if (!sourceGraphOutputs_)
+      return std::nullopt;
+
+    // This is intentionally narrower than "dirty header".  Most header edits
+    // in the existing single-output backend are supposed to materialize into
+    // the TU.  The source-graph path is selected only when the modified header
+    // contains producer-proven source line-control state whose operands depend
+    // on macro definitions supplied by the immediate includer.  Materializing
+    // that owner into the TU is token-sound, but it is no longer the most
+    // precise source-graph refolding because the header remains the owner of
+    // the repaired source line-control directive.
+    if (!includeHasIncluderSuppliedLineControlMacroState(inc))
+      return std::nullopt;
+
+    return safeSourceGraphRelativeIncludePath(inc);
+  };
+
   // Apply TU-level include expansions by replacing the original `#include`
   // directive with the realized expansion text. For includes whose site is in
   // the TU itself (no parent include, and sitePath == tuPath), use the
@@ -6593,6 +6712,24 @@ std::string RefoldEngine::RunSinglePassRefold() {
             break;
           }
         }
+      }
+
+      if (std::optional<std::string> sourceGraphPath =
+              shouldPreserveIncludeAsSourceGraphOwner(*inc)) {
+        SourceGraphOutput output;
+        output.includeId = inc->id;
+        output.relativePath = *sourceGraphPath;
+        output.originalTarget = inc->target.str();
+        if (inc->resolvedPath)
+          output.resolvedPath = inc->resolvedPath->str();
+        output.bytes = expText;
+        sourceGraphOutputs_->push_back(std::move(output));
+
+        debug("include/source-graph",
+              "preserve include inc#{0} as edited owner path={1} site=[{2},{3}) "
+              "headerLen={4}",
+              inc->id, *sourceGraphPath, siteB, siteE, expText.size());
+        continue;
       }
 
       if (!repairConsumedDefinitionsForMaterializedInclude(*inc, siteB, siteE,

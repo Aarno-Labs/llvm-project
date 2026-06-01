@@ -3081,6 +3081,76 @@ static Error compareTokensNoLinesAware(ArrayRef<PPTok> aToks,
   return Error::success();
 }
 
+/// Write modified include-owner files required by automatic source-graph
+/// refolding.
+///
+/// The engine only emits relative quoted include paths that were already
+/// lexically validated.  The driver still revalidates before writing.  Existing
+/// files are never silently overwritten with different bytes: if the user asks
+/// for `--out` beside the original sources and the sidecar path would collide
+/// with a different header, we fail closed rather than corrupting input.
+static void writeSourceGraphOutputs(StringRef modifiedSrcPath,
+                                    ArrayRef<SourceGraphOutput> outputs) {
+  if (outputs.empty())
+    return;
+
+  SmallString<256> outputDir(modifiedSrcPath);
+  sys::path::remove_filename(outputDir);
+  if (outputDir.empty())
+    outputDir = ".";
+
+  std::map<std::string, std::string> uniqueOutputs;
+  for (const SourceGraphOutput &output : outputs) {
+    StringRef rel(output.relativePath);
+    SmallVector<StringRef, 8> components;
+    rel.split(components, '/', /*MaxSplit=*/-1, /*KeepEmpty=*/true);
+    const bool hasUnsafeComponent = llvm::any_of(components, [](StringRef c) {
+      return c.empty() || c == "." || c == "..";
+    });
+    if (rel.empty() || sys::path::is_absolute(rel) || hasUnsafeComponent ||
+        rel.contains('\\') || rel.contains('"'))
+      fatal("source-graph/write",
+            "refusing unsafe source-graph output path: {0}",
+            output.relativePath);
+
+    auto [it, inserted] = uniqueOutputs.insert(
+        {output.relativePath, output.bytes});
+    if (!inserted && it->second != output.bytes)
+      fatal("source-graph/write",
+            "conflicting source-graph contents for path: {0}",
+            output.relativePath);
+  }
+
+  for (const auto &entry : uniqueOutputs) {
+    SmallString<256> path(outputDir);
+    sys::path::append(path, entry.first);
+
+    if (auto existingOrErr = MemoryBuffer::getFile(path)) {
+      if ((*existingOrErr)->getBuffer() != entry.second)
+        fatal("source-graph/write",
+              "refusing to overwrite existing different source-graph file: {0}",
+              path);
+      info("finished", "source-graph header already up to date: {0}", path);
+      continue;
+    }
+
+    SmallString<256> parent(path);
+    sys::path::remove_filename(parent);
+    if (std::error_code ec = sys::fs::create_directories(parent))
+      fatal("source-graph/write", "cannot create {0}: {1}", parent,
+            ec.message());
+
+    std::error_code ec;
+    raw_fd_ostream os(path, ec, sys::fs::OF_Text);
+    if (ec)
+      fatal("source-graph/write", "cannot write {0}: {1}", path,
+            ec.message());
+    os << entry.second;
+    os.close();
+    info("finished", "wrote source-graph header: {0}", path);
+  }
+}
+
 /// Write the optional materialized-edit map as stable, human-readable JSON.
 ///
 /// The schema is deliberately small: each entry records one materialized edit
@@ -3449,11 +3519,13 @@ int main(int argc, char **argv) {
 
   // Default behavior: single refold.
   std::vector<MaterializedEditMapping> materializedEditMappings;
+  std::vector<SourceGraphOutput> sourceGraphOutputs;
   auto refoldedOrErr = RefoldEngine::Refold(
       rootJson, aBytes, aToks, aTokByteOff, bBytes, bToks, bTokByteOff,
       NoLines, StrictMode, sidebandPragmaEdits,
       emitEditMap ? &materializedEditMappings : nullptr,
-      buildFinalLineControlValidationCallback(ModifiedSrcPath, ctx));
+      buildFinalLineControlValidationCallback(ModifiedSrcPath, ctx),
+      &sourceGraphOutputs);
   if (!refoldedOrErr) {
     handleAllErrors(refoldedOrErr.takeError(), [&](const ErrorInfoBase &e) {
       fatal("model", "failed to parse refold model: {0}", e.message());
@@ -3469,6 +3541,8 @@ int main(int argc, char **argv) {
   os << *refoldedOrErr;
   os.close();
   info("finished", "wrote refolded C source: {0}", ModifiedSrcPath);
+
+  writeSourceGraphOutputs(ModifiedSrcPath, sourceGraphOutputs);
 
   if (emitEditMap) {
     writeMaterializedEditMap(EmitEditMapPath.getValue(), PPModPath,

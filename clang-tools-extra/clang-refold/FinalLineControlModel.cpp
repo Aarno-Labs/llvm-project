@@ -1670,6 +1670,9 @@ std::optional<size_t> findPhysicalLineForDirective(
   return std::nullopt;
 }
 
+bool syntheticIncludeEntryStateIsDominatedBeforePreservedObservers(
+    const FinalLineControlModel &model, size_t directiveIndex);
+
 /// A local synthetic newline-resync immediately before a preserved `#include`
 /// is often stale: the include pushes its child logical file/line state before
 /// any child token can observe the parent resync, and a later parent-side
@@ -1748,6 +1751,75 @@ bool syntheticNewlineResyncIsStaleBeforeSimpleInclude(
   }
 
   return true;
+}
+
+
+/// Return true iff a synthetic TU prologue is stale because zero-token TU
+/// prefix material is followed by an optional literal include and then by a
+/// line-control chain whose later known-active repair dominates every preserved
+/// location observer.
+///
+/// This is the final-stream version of the same proof used for local
+/// pre-include resyncs, but it is intentionally phrased as dominance rather
+/// than adjacency:
+///
+///   synthetic TU prologue
+///   blank/comment-only TU prefix material
+///   optional simple literal #include
+///   zero or more source-authored #line directives, possibly unknown locally
+///   known-active #line repair for each component observed later
+///   preserved __LINE__ / __FILE__ / __FILE_NAME__ observers
+///
+/// Blank and comment-only prefix lines cannot observe logical location state,
+/// so they are not a reason to keep the prologue.  Other preprocessing
+/// directives before the repair are rejected here instead of guessed about: a
+/// `#define`, conditional directive, pragma, or macro-based include may have
+/// source-state or layout interactions that require a separate proof.  Unknown
+/// source-authored #line directives are allowed only as part of the line-control
+/// chain, and the candidate is still physically deleted only after executable
+/// clang -E -P validation accepts the final stream.
+bool syntheticTUPrologueIsDominatedBeforePreservedObservers(
+    const FinalLineControlModel &model, size_t directiveIndex) {
+  const std::optional<size_t> directiveLineIndex =
+      findPhysicalLineForDirective(model, directiveIndex);
+  if (!directiveLineIndex)
+    return false;
+
+  const ArrayRef<FinalPhysicalLine> lines = model.PhysicalLines();
+  const ArrayRef<FinalLineDirective> directives = model.Directives();
+  const FinalPhysicalLine &directiveLine = lines[*directiveLineIndex];
+  if (directiveLine.finalBegin != 0)
+    return false;
+
+  size_t i = *directiveLineIndex + 1;
+  while (i < lines.size() &&
+         (lines[i].kind == FinalPhysicalLineKind::Blank ||
+          lines[i].kind == FinalPhysicalLineKind::CommentOnly))
+    ++i;
+
+  if (i < lines.size() && isSimpleLiteralIncludeDirectiveLine(lines[i]))
+    ++i;
+
+  bool foundKnownRepair = false;
+  for (; i < lines.size(); ++i) {
+    const FinalPhysicalLine &line = lines[i];
+    if (line.kind != FinalPhysicalLineKind::LineDirective)
+      return false;
+
+    if (!line.directiveIndex || *line.directiveIndex >= directives.size())
+      continue;
+
+    if (directiveKnownActiveWithKnownSemantics(directives[*line.directiveIndex])) {
+      foundKnownRepair = true;
+      break;
+    }
+  }
+
+  if (!foundKnownRepair)
+    return false;
+
+  return syntheticIncludeEntryStateIsDominatedBeforePreservedObservers(
+      model, directiveIndex);
 }
 
 
@@ -2503,6 +2575,24 @@ PruneFinalLineControlDirectives(
                   "stream before any preserved observer; final clang -E -P "
                   "validation may discharge it");
 
+      const bool validationMayDischargeTUPrologueDominatedByRepair =
+          directive.removable &&
+          directive.origin == FinalLineDirective::Origin::SyntheticTUPrologue &&
+          directive.semanticsKnown && validRange && hasObserverRecord &&
+          hasLayoutRecord && !hasConcreteObserverLiveComponent &&
+          syntheticTUPrologueIsDominatedBeforePreservedObservers(model, i);
+      if (validationMayDischargeTUPrologueDominatedByRepair) {
+        if (hasConcreteLayoutLiveComponent)
+          addReason("synthetic TU prologue is followed only by zero-token "
+                    "prefix material before a dominating #line repair; final "
+                    "clang -E -P validation may discharge layout-only "
+                    "liveness");
+        else
+          addReason("synthetic TU prologue is followed only by zero-token "
+                    "prefix material before a dominating #line repair; final "
+                    "clang -E -P validation may discharge it");
+      }
+
       const bool modelProvedCanRemove =
           directive.removable &&
           directive.activity == FinalLineDirectiveActivity::KnownActive &&
@@ -2510,7 +2600,8 @@ PruneFinalLineControlDirectives(
           decision.layoutDead && validRange;
       const bool canRemove =
           modelProvedCanRemove || validationMayDischargeSyntheticIncludeEntry ||
-          validationMayDischargePreIncludeNewlineResync;
+          validationMayDischargePreIncludeNewlineResync ||
+          validationMayDischargeTUPrologueDominatedByRepair;
 
       if (canRemove) {
         const uint64_t removedBegin = directive.finalBegin;
@@ -2558,6 +2649,10 @@ PruneFinalLineControlDirectives(
           addReason("removed as synthetic pre-include newline-resync candidate "
                     "with a downstream parent #line repair and final clang "
                     "-E -P equivalence proof");
+        } else if (validationMayDischargeTUPrologueDominatedByRepair) {
+          addReason("removed as synthetic TU prologue candidate whose "
+                    "downstream #line repair dominates all preserved "
+                    "observers, with final clang -E -P equivalence proof");
         }
         if (recordDecisions)
           result.decisions.push_back(std::move(decision));
