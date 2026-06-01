@@ -675,6 +675,134 @@ private:
   /// output cannot directly edit an arbitrary header.
   std::vector<SidebandPragmaEdit> sidebandPragmaEdits_;
 
+  /// \brief Phase-0A vocabulary for behaviorally legacy emission paths.
+  ///
+  /// A path is legacy only when emitted behavior is justified by one of these
+  /// implementation-local mechanisms instead of by the proof lattice.  This is
+  /// intentionally a definition layer, not an audit: no caller is rejected merely
+  /// by naming a kind here.  Phase 0B audit sites should use this shared
+  /// vocabulary so every diagnostic answers the same question: which old
+  /// behavior must be represented by which proof-lattice invariant before it is
+  /// allowed to survive to selection or emission?
+#define REFOLD_LEGACY_PATH_KIND_LIST(REFOLD_X)                                \
+  REFOLD_X(Unknown)                                                           \
+  REFOLD_X(PathSpecificProofMirror)                                           \
+  REFOLD_X(PostSummaryProofKindDecision)                                      \
+  REFOLD_X(StructurePreservingProofBit)                                       \
+  REFOLD_X(UnclassifiedFallbackBranch)                                       \
+  REFOLD_X(StateCheckOutsideGateway)                                          \
+  REFOLD_X(FinalLineControlLivenessWithoutObligation)
+
+  enum class LegacyPathKind : uint8_t {
+#define REFOLD_X(name) name,
+    REFOLD_LEGACY_PATH_KIND_LIST(REFOLD_X)
+#undef REFOLD_X
+  };
+
+  friend inline StringRef toString(LegacyPathKind value) {
+    switch (value) {
+#define REFOLD_X(name) case LegacyPathKind::name: return #name;
+      REFOLD_LEGACY_PATH_KIND_LIST(REFOLD_X)
+#undef REFOLD_X
+    }
+    return "Unknown";
+  }
+
+  /// \brief Canonical Phase-0A definition for one legacy-path category.
+  ///
+  /// `definition` states the forbidden legacy dependency.  `requiredClosure`
+  /// names the proof-lattice representation that must replace that dependency
+  /// before the path can be theorem-facing.  Keeping the prose centralized keeps
+  /// audit output, comments, and future CI checks synchronized instead of
+  /// allowing six slightly different definitions of "legacy path" to drift.
+  struct LegacyPathDefinition {
+    LegacyPathKind kind = LegacyPathKind::Unknown;
+    StringRef definition;
+    StringRef requiredClosure;
+  };
+
+  static LegacyPathDefinition DescribeLegacyPathKind(LegacyPathKind kind) {
+    switch (kind) {
+    case LegacyPathKind::Unknown:
+      return {kind, "unclassified legacy dependency",
+              "classify the dependency before it can be audited"};
+    case LegacyPathKind::PathSpecificProofMirror:
+      return {kind,
+              "path-specific proof booleans or witness flags mirror "
+              "ProofSummary",
+              "move the fact into ProofSummary / the canonical emitted proof "
+              "carrier"};
+    case LegacyPathKind::PostSummaryProofKindDecision:
+      return {kind,
+              "proofKind or accepted-path provenance decides behavior after "
+              "ProofSummary / TheoremProofClass should dominate",
+              "normalize to exactly one TheoremProofClass before selection or "
+              "emission"};
+    case LegacyPathKind::StructurePreservingProofBit:
+      return {kind,
+              "structurePreserving is treated as proof authority rather than "
+              "construction metadata",
+              "represent preservation with an explicit theorem proof class, "
+              "typed witness, and lattice preference"};
+    case LegacyPathKind::UnclassifiedFallbackBranch:
+      return {kind,
+              "fallback behavior is not represented by a classified "
+              "TerminalFallbackProofFailure",
+              "build a TerminalFallbackProofFailure / TerminalFallbackWitness "
+              "or convert the path to an in-domain lattice proof"};
+    case LegacyPathKind::StateCheckOutsideGateway:
+      return {kind,
+              "preprocessor-state acceptance is checked outside "
+              "OwnerStateDelta, OwnerStateGraph, or the state-transition "
+              "gateway",
+              "route the state fact through OwnerStateDelta / OwnerStateGraph "
+              "/ gateway witnesses"};
+    case LegacyPathKind::FinalLineControlLivenessWithoutObligation:
+      return {kind,
+              "final #line liveness is decided without a compact line-control "
+              "obligation or removal proof",
+              "represent liveness as a typed final-line-control obligation / "
+              "proof before replacing the operational scanner"};
+    }
+    return {LegacyPathKind::Unknown, "unclassified legacy dependency",
+            "classify the dependency before it can be audited"};
+  }
+
+  static bool IsDefinedLegacyPathKind(LegacyPathKind kind) {
+    return kind != LegacyPathKind::Unknown;
+  }
+
+  /// \brief One opt-in Phase-0B no-legacy audit finding.
+  ///
+  /// The audit is intentionally report-only.  It names the legacy category, the
+  /// engine boundary that observed it, and a deterministic detail string, but it
+  /// must never affect candidate construction, selector ordering, terminal
+  /// fallback state, or strict-mode theorem-audit counters.
+  struct LegacyAuditEvidence {
+    LegacyPathKind kind = LegacyPathKind::Unknown;
+    std::string role;
+    std::string detail;
+  };
+
+  /// Return whether the developer-only no-legacy audit is enabled.
+  static bool IsNoLegacyAuditEnabled();
+
+  /// Return whether the developer-only no-legacy audit should fail closed.
+  ///
+  /// Phase 0B made the no-legacy audit report-only.  Phase 3D adds this
+  /// separate opt-in switch so developers can make any emission-boundary legacy
+  /// escape force the same terminal out-of-domain path as other theorem-audit
+  /// failures, without changing ordinary llvm-lit runs.
+  static bool IsNoLegacyAuditStrictEnabled();
+
+  /// Build and emit a deterministic no-legacy audit finding.
+  static LegacyAuditEvidence
+  MakeLegacyAuditEvidence(LegacyPathKind kind, llvm::StringRef role,
+                          llvm::StringRef detail = llvm::StringRef());
+  static void ReportNoLegacyAuditFinding(const LegacyAuditEvidence &evidence);
+
+#undef REFOLD_LEGACY_PATH_KIND_LIST
+
   /// \brief Named proof obligation that forced the terminal raw-B result.
   ///
   /// Terminal fallback is part of the proof system, not a convenience escape.
@@ -1052,32 +1180,62 @@ private:
     return failure;
   }
 
-  /// \brief Compact witness describing why terminal fallback was selected.
+  /// \brief Compact witness describing why terminal raw-B emission was selected.
   ///
-  /// This is the theorem-facing carrier for the raw-B exit.  R4 deliberately
-  /// stores structured proof failures rather than a broad fallback category: the
-  /// primary failure is the first caller-supplied obligation, and secondary
-  /// failures preserve every additional domain wall discovered before raw-B
-  /// emission.  Logs are derived from this carrier, not the other way around.
+  /// This is the theorem-facing carrier for the terminal raw-B exit.  Phase 4D
+  /// deliberately keeps only the ordered structured failures.  There is no
+  /// parallel "primary" scalar, request counter, or branch-local boolean: the
+  /// first element is the primary failed obligation and the remaining elements
+  /// are secondary obligations discovered before terminal emission.
   struct TerminalFallbackWitness {
-    /// Primary failed obligation used by the terminal accepted-result carrier.
-    TerminalFallbackProofFailure proofFailure;
-
-    /// Ordered list of all classified failed obligations recorded before the
-    /// raw-B terminal carrier was selected.  The first element is the primary
-    /// failure above; later elements are secondary obligations.
     std::vector<TerminalFallbackProofFailure> proofFailures;
 
-    uint32_t requestCount = 0;
+    const TerminalFallbackProofFailure *PrimaryFailure() const {
+      return proofFailures.empty() ? nullptr : &proofFailures.front();
+    }
   };
 
   friend inline std::string toString(const TerminalFallbackWitness &witness) {
-    return llvm::formatv("{0} requestCount={1} secondaryFailureCount={2}",
-                         toString(witness.proofFailure),
-                         witness.requestCount,
+    const TerminalFallbackProofFailure *primary = witness.PrimaryFailure();
+    return llvm::formatv("{0} failureCount={1} secondaryFailureCount={2}",
+                         primary ? toString(*primary)
+                                 : StringRef("<missing-terminal-failure>"),
+                         witness.proofFailures.size(),
                          witness.proofFailures.size() > 1
                              ? witness.proofFailures.size() - 1
                              : 0)
+        .str();
+  }
+
+  /// \brief Typed construction request for the terminal raw-B carrier.
+  ///
+  /// Phase 4C makes terminal fallback construction data-first.  The proof
+  /// failure below is the only semantic reason that may justify selecting the
+  /// terminal out-of-domain result; `phase` and `detail` are diagnostic labels
+  /// used to keep traces actionable.  Keeping them in the same carrier prevents
+  /// call sites from smuggling behavior through a free-form reason string while
+  /// preserving the useful human explanation in debug output.
+  struct TerminalFallbackRequest {
+    TerminalFallbackProofFailure failure;
+    std::string phase;
+    std::string detail;
+  };
+
+  static TerminalFallbackRequest
+  MakeTerminalFallbackRequest(TerminalFallbackProofFailure failure,
+                              llvm::StringRef phase,
+                              llvm::StringRef detail) {
+    TerminalFallbackRequest request;
+    request.failure = std::move(failure);
+    request.phase = phase.str();
+    request.detail = detail.str();
+    return request;
+  }
+
+  friend inline std::string toString(const TerminalFallbackRequest &request) {
+    return llvm::formatv("{0} terminalAction=raw-b-emission phase={1}: {2}",
+                         toString(request.failure), request.phase,
+                         request.detail)
         .str();
   }
 
@@ -1086,7 +1244,6 @@ private:
     uint64_t expandedIncludes = 0;
     uint64_t totalMacros = 0;
     uint64_t expandedMacros = 0;
-    bool terminalFallbackToB = false;
   };
 
   /// \brief Declared structural-refolding domain used by the theorem audit.
@@ -1130,6 +1287,14 @@ private:
     uint64_t selectorNoSelectable = 0;
     uint64_t selectorUnresolvedCompetitions = 0;
     uint64_t selectorDirectBypasses = 0;
+
+    // Phase 3D: accepted-result closure is fail-closed only in the opt-in
+    // no-legacy strict audit.  These counters make such failures visible in the
+    // theorem-audit summary without conflating them with ordinary selector
+    // competitions or proof-discharge failures.
+    uint64_t noLegacyEmissionBoundaryViolations = 0;
+    uint64_t noLegacyStrictRejections = 0;
+
     uint64_t explicitTerminalExclusions = 0;
     uint64_t nonExplicitTerminalExclusions = 0;
 
@@ -1161,6 +1326,17 @@ private:
     uint64_t stateTransitionUnknownComponentViolations = 0;
     uint64_t stateTransitionUnknownMutationViolations = 0;
     uint64_t stateTransitionNoneWitnessViolations = 0;
+
+    // Phase 5A: direct state-sensitive handling inventory.  These counters are
+    // populated only by the opt-in no-legacy audit and make the remaining
+    // component-local state checks visible before later phases delete or route
+    // them through the gateway.
+    uint64_t directStateChecksAudited = 0;
+    uint64_t directStateChecksDeltaFacts = 0;
+    uint64_t directStateChecksGraphEdges = 0;
+    uint64_t directStateChecksGatewayWitnesses = 0;
+    uint64_t directStateChecksTerminalFailures = 0;
+    uint64_t directStateChecksUnclosedLocal = 0;
 
     bool theoremSatisfied = true;
     std::string firstViolation;
@@ -1202,31 +1378,29 @@ private:
   /// True once definesByAbsPath_ has been built for this engine instance.
   mutable bool definesIndexBuilt_ = false;
 
-  // Single-pass terminal-fallback scaffold: if any edit/patch cannot be
+  // Single-pass terminal raw-B scaffold: if any edit/patch cannot be
   // discharged into the declared proof/lattice outcomes in the current pass,
-  // record the reason and fall back to emitting the fully expanded edited
-  // preprocessed stream (B). This keeps the engine fail-closed.
+  // record the typed failed obligation and later emit the fully expanded edited
+  // preprocessed stream (B).  Phase 4D intentionally has no separate
+  // "we are in fallback" flag and no duplicate proof-failure mirrors: the
+  // ordered typed requests are the only terminal-state carrier.
   //
-  // Note: the fallback is requested from several helper routines that are
-  // logically "const" (for example include materialization). Treat the
-  // fallback state as diagnostic/side-channel state via `mutable`.
-  mutable bool terminalFallbackRequested_ = false;
-  mutable std::vector<std::string> terminalFallbackReasons_;
+  // Note: terminal requests are recorded from several helper routines that are
+  // logically "const" (for example include materialization). Treat this as
+  // diagnostic/proof side-channel state via `mutable`.
+  mutable std::vector<TerminalFallbackRequest> terminalFallbackRequests_;
 
-  /// Ordered theorem-facing failures that justify the terminal raw-B carrier.
-  /// The string vector above is diagnostic only; this vector is the Phase 2D
-  /// proof data retained when multiple independent obligations fail.
-  mutable std::vector<TerminalFallbackProofFailure>
-      terminalFallbackProofFailures_;
-
-  mutable TerminalFallbackProofFailure terminalFallbackProofFailure_;
-  mutable uint32_t terminalFallbackRequestCount_ = 0;
+  /// Return true once the current pass has at least one typed terminal request.
+  bool HasTerminalFallbackRequest() const {
+    return !terminalFallbackRequests_.empty();
+  }
 
   /// \brief Record that the current pass must fall back to the explicit
   /// terminal edited-preprocessed-stream result.
   ///
   /// Helpers call this when they cannot discharge an edit into one of the
   /// single-pass proof/lattice outcomes.
+  void RequestTerminalFallback(TerminalFallbackRequest request) const;
   void RequestTerminalFallback(TerminalFallbackProofFailure failure,
                                llvm::StringRef phase,
                                llvm::StringRef detail) const;
@@ -1235,11 +1409,7 @@ private:
   ///
   /// This is invoked once before running the single structural pass.
   void ResetTerminalFallbackState() const {
-    terminalFallbackRequested_ = false;
-    terminalFallbackReasons_.clear();
-    terminalFallbackProofFailures_.clear();
-    terminalFallbackProofFailure_ = TerminalFallbackProofFailure();
-    terminalFallbackRequestCount_ = 0;
+    terminalFallbackRequests_.clear();
   }
 
   /// Reset the per-attempt refold statistics to a clean baseline.
@@ -1286,6 +1456,17 @@ private:
   bool AuditTerminalFallbackProofFailure(
       const TerminalFallbackProofFailure &failure, llvm::StringRef role) const;
 
+  /// Report a Phase-3D no-legacy emission-boundary finding and, when strict
+  /// audit mode is enabled, convert it into an explicit terminal proof failure.
+  ///
+  /// This helper is intentionally centralized so emission sites do not each
+  /// invent their own policy for "missing AcceptedResultCandidate".  Normal
+  /// no-legacy audit remains report-only; strict no-legacy audit is the only
+  /// mode that turns the finding itself into a fail-closed result.
+  bool RejectNoLegacyAuditFindingIfStrict(
+      const LegacyAuditEvidence &evidence,
+      const TerminalFallbackProofFailure &failure) const;
+
   /// Validate the Phase-5 state-transition gateway audit before bytes are
   /// emitted.  The gateway is the only place where a state-changing edit may
   /// cross into a preserved suffix; this audit ensures no routed transition was
@@ -1309,18 +1490,19 @@ private:
   /// \brief Resolve the full post-structural fallback result for the current
   /// run.
   ///
-  /// Phase 8 removes the legacy post-terminal macro-expansion rescue seam.  This
-  /// resolver therefore performs no secondary owner search: in-domain macro
-  /// whole-cover edits must have been discharged by OwnerRealizationProof or
-  /// MixedOwnerTilingProof before fallback was requested.  Once structural
-  /// emission fails closed, the only remaining result is the declared raw-B
-  /// TerminalOutOfDomain carrier with its named proof obligation.
+  /// Phase 8 removes the legacy post-terminal macro-expansion proof-bypass
+  /// path.  This resolver therefore performs no secondary owner search:
+  /// in-domain macro whole-cover edits must have been discharged by
+  /// OwnerRealizationProof or MixedOwnerTilingProof before fallback was
+  /// requested.  Once structural emission fails closed, the only remaining
+  /// result is the declared raw-B TerminalOutOfDomain carrier with its named
+  /// proof obligation.
   std::string ResolvePostStructuralFallback();
 
   /// \brief Try to realize one unresolved edit as a declared TU include-closure.
   ///
   /// Phase 8c classifies this path as still uniquely needed, but no longer as a
-  /// legacy fallback/rescue seam. The helper emits the explicit
+  /// legacy fallback branch. The helper emits the explicit
   /// `TUIncludeClosureEdit` carrier when one PP hunk cannot be anchored as an
   /// ordinary macro/include/TU edit but can be proven as one closed replacement
   /// over top-level TU `#include` directives plus the adjacent TU source bytes
@@ -1376,7 +1558,10 @@ private:
          "terminalSecondaryFailures={22} terminalFailureAuditViolations={23} "
          "graphNodes={24} zeroTokenStateNodes={25} graphObservedComponents={26} "
          "graphMutatedComponents={27} graphIncomparableNodes={28} "
-         "graphMissingProducerFacts={29}",
+         "graphMissingProducerFacts={29} directStateChecks={30} "
+         "directStateDeltaFacts={31} directStateGraphEdges={32} "
+         "directStateGatewayWitnesses={33} directStateTerminalFailures={34} "
+         "directStateUnclosed={35}",
          lastTheoremAudit_.theoremSatisfied ? 1 : 0,
          lastTheoremAudit_.emittedNonTerminalEdits,
          lastTheoremAudit_.emittedCarriers,
@@ -1406,7 +1591,13 @@ private:
          lastTheoremAudit_.graphObservedStateComponents,
          lastTheoremAudit_.graphMutatedStateComponents,
          lastTheoremAudit_.graphIncomparableNodes,
-         lastTheoremAudit_.graphMissingProducerFacts);
+         lastTheoremAudit_.graphMissingProducerFacts,
+         lastTheoremAudit_.directStateChecksAudited,
+         lastTheoremAudit_.directStateChecksDeltaFacts,
+         lastTheoremAudit_.directStateChecksGraphEdges,
+         lastTheoremAudit_.directStateChecksGatewayWitnesses,
+         lastTheoremAudit_.directStateChecksTerminalFailures,
+         lastTheoremAudit_.directStateChecksUnclosedLocal);
     if (!lastTheoremAudit_.theoremSatisfied &&
         !lastTheoremAudit_.firstViolation.empty()) {
       info("theorem", "firstViolation={0}",
@@ -1425,7 +1616,7 @@ private:
     info("stats", "includes-expanded={0}/{1} macros-expanded={2}/{3}{4}",
          lastStats_.expandedIncludes, lastStats_.totalIncludes,
          lastStats_.expandedMacros, lastStats_.totalMacros,
-         lastStats_.terminalFallbackToB ? " terminal-fallback=B" : "");
+         HasTerminalFallbackRequest() ? " terminal-raw-b=B" : "");
   }
 
   /// Per-gap ownership depth for insertion before PP token k (k in [0..N]).
@@ -1771,10 +1962,10 @@ private:
     std::string fileSpellingForDir;
     std::optional<uint64_t> ownerIncludeId;
 
-    // True when the pending synthetic resync was emitted for a concrete final
-    // observer demand and may therefore enter the fixed-point pruning candidate
-    // set.  The final liveness model now covers both lexical and producer-backed
-    // observers; executable clang -E -P validation remains the final guard.
+    // True when the pending synthetic resync was emitted for a concrete
+    // line-state demand and may therefore enter the fixed-point pruning
+    // candidate set.  Phase 6F validates exact deletion attempts directly
+    // rather than consulting a late final-stream liveness scanner.
     bool finalLineControlPruneEligible = false;
 
     // Logical state proved at the original source offset where the replacement
@@ -1820,6 +2011,69 @@ private:
                   std::vector<FinalLineControlPruneCandidate> candidates)
         : text(std::move(t)), pending(std::move(p)),
           lineControlPruneCandidates(std::move(candidates)) {}
+  };
+
+
+  /// \brief Closed Phase-3A inventory of concrete emission surfaces.
+  ///
+  /// This enum intentionally does not replace TheoremProofClass.  It answers
+  /// only "which concrete artifact surface can reach emission?" so Phase 3B
+  /// can force every such surface through AcceptedResultCandidate without
+  /// rediscovering path names by grep.  Some entries are primary artifact
+  /// surfaces, while mixed-owner tiling and owner-realization materialization
+  /// are proof overlays that can coexist with a macro/include/TU primary path.
+#define REFOLD_EMISSION_PATH_KIND_LIST(REFOLD_X)                              \
+  REFOLD_X(Unknown)                                                           \
+  REFOLD_X(MacroPatch)                                                        \
+  REFOLD_X(IncludePatch)                                                      \
+  REFOLD_X(TUAnchor)                                                          \
+  REFOLD_X(TUTextEdit)                                                        \
+  REFOLD_X(TerminalOutOfDomain)                                               \
+  REFOLD_X(MixedOwnerTilingSegment)                                           \
+  REFOLD_X(OwnerRealizationMaterialization)
+
+  enum class EmissionPathKind : uint8_t {
+#define REFOLD_X(name) name,
+    REFOLD_EMISSION_PATH_KIND_LIST(REFOLD_X)
+#undef REFOLD_X
+  };
+
+  friend inline StringRef toString(EmissionPathKind value) {
+    switch (value) {
+#define REFOLD_X(name) case EmissionPathKind::name: return #name;
+      REFOLD_EMISSION_PATH_KIND_LIST(REFOLD_X)
+#undef REFOLD_X
+    }
+    return "Unknown";
+  }
+#undef REFOLD_EMISSION_PATH_KIND_LIST
+
+  /// \brief Canonical list of emission paths represented by one candidate.
+  ///
+  /// A normalized candidate always has at most one primary emitted surface
+  /// (`MacroPatch`, `IncludePatch`, `TUAnchor`, `TUTextEdit`, or
+  /// `TerminalOutOfDomain`).  It may also carry proof overlays, such as a
+  /// mixed-owner segment witness or an owner-realization materialization
+  /// witness.  Keeping those overlays in the same deduplicated inventory avoids
+  /// another parallel family of booleans while preserving the distinction
+  /// between construction provenance and theorem proof authority.
+  struct EmissionPathInventory {
+    std::vector<EmissionPathKind> paths;
+
+    bool Contains(EmissionPathKind kind) const {
+      for (EmissionPathKind existing : paths)
+        if (existing == kind)
+          return true;
+      return false;
+    }
+
+    void Add(EmissionPathKind kind) {
+      if (kind == EmissionPathKind::Unknown || Contains(kind))
+        return;
+      paths.push_back(kind);
+    }
+
+    bool empty() const { return paths.empty(); }
   };
 
   struct AcceptedResultCandidate;
@@ -3231,6 +3485,7 @@ private:
     llvm_unreachable("Invalid owner state graph node kind");
   }
 
+
   /// Stable node in the persistent owner/state-event graph.
   ///
   /// Phase 4A--4C require every semantic event to be represented explicitly,
@@ -3565,6 +3820,98 @@ private:
     llvm_unreachable("Invalid state mutation kind");
   }
 
+
+  /// Direct state-sensitive surface currently audited by Phase 5A.
+  ///
+  /// This is an inventory vocabulary, not a selector.  Each entry names one
+  /// class of local source/preprocessor-state handling that must eventually be
+  /// represented by OwnerStateDelta, OwnerStateGraph, the state-transition
+  /// gateway, or a terminal proof failure before it can justify emitted bytes.
+#define REFOLD_DIRECT_STATE_CHECK_KIND_LIST(REFOLD_X)                         \
+  REFOLD_X(Unknown)                                                           \
+  REFOLD_X(MacroDefinitionDirective)                                          \
+  REFOLD_X(MacroUndefDirective)                                               \
+  REFOLD_X(LineControlDirective)                                              \
+  REFOLD_X(BuiltinLineObserver)                                               \
+  REFOLD_X(BuiltinFileObserver)                                               \
+  REFOLD_X(BuiltinFileNameObserver)                                           \
+  REFOLD_X(CounterEvent)                                                      \
+  REFOLD_X(PragmaDirective)                                                   \
+  REFOLD_X(IncludeDirectiveState)                                             \
+  REFOLD_X(IncludeGuardState)                                                 \
+  REFOLD_X(ConditionalDirectiveState)                                         \
+  REFOLD_X(MacroExpansionState)                                               \
+  REFOLD_X(UnmodeledStateFact)
+
+  enum class DirectStateCheckKind : uint8_t {
+#define REFOLD_X(name) name,
+    REFOLD_DIRECT_STATE_CHECK_KIND_LIST(REFOLD_X)
+#undef REFOLD_X
+  };
+
+  friend inline StringRef toString(DirectStateCheckKind kind) {
+    switch (kind) {
+#define REFOLD_X(name) case DirectStateCheckKind::name: return #name;
+      REFOLD_DIRECT_STATE_CHECK_KIND_LIST(REFOLD_X)
+#undef REFOLD_X
+    }
+    return "Unknown";
+  }
+
+#undef REFOLD_DIRECT_STATE_CHECK_KIND_LIST
+
+  /// How a direct state-sensitive local check is already closed.
+  ///
+  /// Phase 5A uses this enum to distinguish legitimate local producer-fact
+  /// collection from legacy emission authority.  Only Unknown and
+  /// ExplicitlyUnclosedLocalCheck are audit findings; the other values document
+  /// the proof surface that now owns the state fact.
+  enum class DirectStateCheckClosureKind : uint8_t {
+    Unknown,
+    OwnerStateDeltaFact,
+    OwnerStateGraphEdge,
+    StateTransitionGatewayWitness,
+    TerminalFallbackProofFailure,
+    ExplicitlyUnclosedLocalCheck
+  };
+
+  friend inline StringRef toString(DirectStateCheckClosureKind kind) {
+    switch (kind) {
+    case DirectStateCheckClosureKind::Unknown:
+      return "Unknown";
+    case DirectStateCheckClosureKind::OwnerStateDeltaFact:
+      return "OwnerStateDeltaFact";
+    case DirectStateCheckClosureKind::OwnerStateGraphEdge:
+      return "OwnerStateGraphEdge";
+    case DirectStateCheckClosureKind::StateTransitionGatewayWitness:
+      return "StateTransitionGatewayWitness";
+    case DirectStateCheckClosureKind::TerminalFallbackProofFailure:
+      return "TerminalFallbackProofFailure";
+    case DirectStateCheckClosureKind::ExplicitlyUnclosedLocalCheck:
+      return "ExplicitlyUnclosedLocalCheck";
+    }
+    llvm_unreachable("Invalid direct state check closure kind");
+  }
+
+  /// Record one Phase-5A direct-state-check inventory item for no-legacy audit.
+  void AuditDirectStateCheckClosure(DirectStateCheckKind checkKind,
+                                    OwnerStateComponent component,
+                                    DirectStateCheckClosureKind closure,
+                                    StateMutationKind mutation,
+                                    llvm::StringRef phase,
+                                    llvm::StringRef detail) const;
+
+  /// Map a state component to the closest direct-state-check inventory key.
+  static DirectStateCheckKind
+  DirectStateCheckKindForComponent(OwnerStateComponent component);
+
+
+  /// Map owner-state graph nodes back to the Phase-5A direct-check inventory.
+  static DirectStateCheckKind
+  DirectStateCheckKindForGraphNode(OwnerStateGraphNodeKind kind);
+  static OwnerStateComponent
+  DirectStateComponentForGraphNode(OwnerStateGraphNodeKind kind);
+
   /// Producer-closure proof for edits that would otherwise reverse-solve an
   /// upstream directive from downstream B-side tokens.
   ///
@@ -3735,12 +4082,33 @@ private:
     }
   };
 
+  /// Canonical theorem-facing result produced by the Phase-5 state gateway.
+  ///
+  /// The gateway now returns this proof directly.  Phase 5C removes the old
+  /// diagnostic scalar result so callers cannot approve state transitions by
+  /// reading component-local booleans beside the typed theorem witness.  The
+  /// carrier records the before/after
+  /// state deltas supplied by the caller, the typed suffix witnesses accepted by
+  /// the gateway, the closure-widening subset needed by theorem consumers, and
+  /// the classified terminal failure when the transition is outside the strict
+  /// domain.  Phase 5C can therefore delete component-local approvals by moving
+  /// them onto this proof instead of introducing another parallel state flag.
+  struct StateTransitionProof {
+    OwnerStateDelta before;
+    OwnerStateDelta after;
+    std::vector<SuffixStabilityWitness> suffixWitnesses;
+    std::vector<ClosureWideningWitness> wideningWitnesses;
+    std::optional<TerminalFallbackProofFailure> failure = std::nullopt;
+  };
+
   /// Request passed through the single Phase-5 state-transition gateway.
   struct StateTransitionGatewayRequest {
     OwnerStateBoundary boundary;
     OwnerStateComponent component = OwnerStateComponent::Unknown;
     StateMutationKind mutation = StateMutationKind::Unknown;
     SuffixStabilityWitness witness;
+    OwnerStateDelta before;
+    OwnerStateDelta after;
     std::string phase;
     std::string detail;
     bool requireKnownObserver = false;
@@ -3755,22 +4123,6 @@ private:
     DirectiveClosureStatus directiveClosureStatus =
         DirectiveClosureStatus::NotADirectiveStateRewrite;
     std::string directiveKind;
-  };
-
-  /// Result of checking one state component against the preserved suffix.
-  ///
-  /// The result is intentionally diagnostic-rich but semantically simple.
-  /// `stable` says the caller discharged the suffix-stability obligation.
-  /// `observerCount` and `hasIncomparableObserver` explain why an undisputed
-  /// terminal fallback was required when `stable` is false.
-  struct SuffixStabilityCheckResult {
-    OwnerStateComponent component = OwnerStateComponent::Unknown;
-    StateMutationKind mutation = StateMutationKind::Unknown;
-    SuffixStabilityWitness witness;
-    bool stable = false;
-    bool hasSuffixObserver = false;
-    bool hasIncomparableObserver = false;
-    size_t observerCount = 0;
   };
 
   /// Return the theorem-facing state components mutated by `delta`.
@@ -3818,7 +4170,7 @@ private:
   /// gateway used for suffix stability.  The request is rejected unless the
   /// caller proves that the directive owner itself is inside the accepted edit
   /// closure.
-  SuffixStabilityCheckResult CheckReverseSolvedDirectiveAcrossEditBoundary(
+  StateTransitionProof CheckReverseSolvedDirectiveAcrossEditBoundary(
       const OwnerStateBoundary &boundary, OwnerStateComponent component,
       StateMutationKind mutation, DirectiveClosureStatus directiveClosureStatus,
       llvm::StringRef directiveKind, llvm::StringRef phase,
@@ -3838,73 +4190,30 @@ private:
   /// Check one state transition through the uniform Phase-5 gateway.
   ///
   /// This is the only decision tree that is allowed to decide whether a changed
-  /// state component can cross into a preserved suffix.  It queries the
-  /// persistent suffix-observer graph, admits an unobserved suffix directly,
-  /// accepts only typed repair/materialization/widening/literalization
-  /// witnesses when observers exist, and otherwise requests a component-specific
-  /// terminal fallback.  Older APIs delegate here and may not bypass it.
-  SuffixStabilityCheckResult CheckStateTransitionAcrossEditBoundary(
+  /// state component can cross into a preserved suffix.  The scalar overload is
+  /// the canonical call-site form for Phase 5C: callers name the component and
+  /// typed witness directly instead of routing through component-specific
+  /// "macro was okay" / "counter was okay" approval wrappers.
+  StateTransitionProof CheckStateTransitionAcrossEditBoundary(
       const StateTransitionGatewayRequest &request) const;
-
-  /// Build a typed macro-state repair witness for the Phase-5 gateway.
-  ///
-  /// Phase 5E uses these helpers to keep all macro-state liveness repairs on the
-  /// same gateway surface.  The local macro code still proves the placement or
-  /// realization mechanics; these helpers make that proof a typed state witness
-  /// rather than a legacy enum label or direct terminal fallback.
-  static SuffixStabilityWitness BuildMacroStateRepairWitness(
-      const OwnerStateBoundary &boundary, llvm::StringRef detail);
-
-  /// Build a typed witness that a macro-state observer was materialized.
-  static SuffixStabilityWitness BuildMacroStateMaterializationWitness(
-      const OwnerStateBoundary &boundary, llvm::StringRef detail);
-
-  /// Build a typed witness that a macro-state closure was widened.
-  static SuffixStabilityWitness BuildMacroStateClosureWideningWitness(
-      const OwnerStateBoundary &boundary, llvm::StringRef detail);
-
-  /// Build a typed fail-closed macro-state terminal witness.
-  static SuffixStabilityWitness BuildMacroStateTerminalFailureWitness(
-      const OwnerStateBoundary &boundary, llvm::StringRef detail);
-
-  /// Route one macro-state transition through the mandatory Phase-5 gateway.
-  ///
-  /// This is the component-specific Phase 5E entry point.  All #define/#undef
-  /// liveness repairs, movements, materializations, and fail-closed macro-state
-  /// cases should use this wrapper instead of calling RequestTerminalFallback()
-  /// or the legacy suffix-stability enum bridge directly.
-  SuffixStabilityCheckResult CheckMacroStateTransitionAcrossEditBoundary(
-      const OwnerStateBoundary &boundary, StateMutationKind mutation,
-      SuffixStabilityWitness witness, llvm::StringRef phase,
-      llvm::StringRef detail, bool requireKnownObserver) const;
-
-  /// Build a typed line-control repair witness for the Phase-5 gateway.
-  ///
-  /// Phase 5F makes source-authored and synthetic #line handling a state proof
-  /// instead of an inserter-local heuristic.  The inserter still proves where a
-  /// directive can be emitted or suppressed; these helpers attach that local
-  /// proof to the uniform state-transition gateway for the exact logical
-  /// location component being changed or observed.
-  static SuffixStabilityWitness BuildLineControlStateRepairWitness(
+  StateTransitionProof CheckStateTransitionAcrossEditBoundary(
       const OwnerStateBoundary &boundary, OwnerStateComponent component,
-      llvm::StringRef detail);
+      StateMutationKind mutation, SuffixStabilityWitness witness,
+      llvm::StringRef phase, llvm::StringRef detail,
+      bool requireKnownObserver) const;
 
-  /// Build a typed witness that line/file observer state was materialized.
-  static SuffixStabilityWitness BuildLineControlStateMaterializationWitness(
-      const OwnerStateBoundary &boundary, OwnerStateComponent component,
-      llvm::StringRef detail);
-
-  /// Build a typed fail-closed line-control terminal witness.
-  static SuffixStabilityWitness BuildLineControlStateTerminalFailureWitness(
-      const OwnerStateBoundary &boundary, OwnerStateComponent component,
-      llvm::StringRef detail);
+  /// Build one typed suffix-stability witness for the uniform state gateway.
+  ///
+  /// Phase 5C deliberately removes the old component-specific witness factories:
+  /// the theorem fact is the component named in the witness, not which helper
+  /// happened to create it.  Terminal witnesses use
+  /// SuffixStabilityTerminalFailureForComponent(component), keeping the
+  /// component-specific failed obligation but eliminating side-approval APIs.
+  static SuffixStabilityWitness BuildStateTransitionWitness(
+      SuffixStabilityWitnessKind kind, OwnerStateComponent component,
+      const OwnerStateBoundary &boundary, llvm::StringRef detail);
 
   /// Return the source/token boundary for one producer-backed counter event.
-  ///
-  /// Counter stabilization should not re-derive event placement at every call
-  /// site.  Phase 5G uses this normalizer so direct __COUNTER__ literalization,
-  /// forced macro materialization, and closure widening all describe the same
-  /// event to the state-transition gateway.
   static OwnerStateBoundary
   CounterStateBoundaryForEvent(const CounterEventIdentity &event);
 
@@ -3912,189 +4221,11 @@ private:
   static std::string
   FormatCounterEventForWitness(const CounterEventIdentity &event);
 
-  /// Build a typed witness that a concrete __COUNTER__ event was literalized.
-  static SuffixStabilityWitness BuildCounterStateLiteralizationWitness(
-      const OwnerStateBoundary &boundary, const CounterEventIdentity &event,
-      llvm::StringRef detail);
-
-  /// Build a typed witness that a counter-observing owner was materialized.
-  static SuffixStabilityWitness BuildCounterStateMaterializationWitness(
-      const OwnerStateBoundary &boundary, const CounterEventIdentity &event,
-      llvm::StringRef detail);
-
-  /// Build a typed witness that the counter-bearing closure was widened.
-  static SuffixStabilityWitness BuildCounterStateClosureWideningWitness(
-      const OwnerStateBoundary &boundary, const CounterEventIdentity &event,
-      llvm::StringRef detail);
-
-  /// Build a typed fail-closed counter-state terminal witness.
-  static SuffixStabilityWitness BuildCounterStateTerminalFailureWitness(
-      const OwnerStateBoundary &boundary, const CounterEventIdentity &event,
-      llvm::StringRef detail);
-
-  /// Route one counter-state transition through the mandatory Phase-5 gateway.
-  ///
-  /// This is the component-specific Phase 5G entry point.  Direct __COUNTER__
-  /// literalization, forced materialization of counter-sensitive invocations,
-  /// and widened counter-bearing owners should use this wrapper rather than the
-  /// legacy suffix-stability enum bridge.
-  SuffixStabilityCheckResult CheckCounterStateTransitionAcrossEditBoundary(
-      const OwnerStateBoundary &boundary, StateMutationKind mutation,
-      SuffixStabilityWitness witness, llvm::StringRef phase,
-      llvm::StringRef detail, bool requireKnownObserver) const;
-
-  /// Build the source boundary for one pragma-state directive without changing
-  /// sideband placement semantics.
-  ///
-  /// Phase 5H intentionally starts as a typed proof surface only.  Existing
-  /// sideband pragma refolding paths are owner-closure/placement proofs, not
-  /// suffix-state decisions by themselves.  They must not be forced through the
-  /// gateway until the caller can prove that the pragma state actually crosses
-  /// an edit boundary with a preserved suffix observer.
-  static OwnerStateBoundary PragmaStateBoundaryForSourceRange(
-      llvm::StringRef path, uint64_t begin, uint64_t end,
-      std::optional<uint64_t> ownerIncludeId);
-
-  /// Build a typed witness that a known local/balanced pragma-state island was
-  /// repaired or preserved without changing the state seen by the suffix.
-  static SuffixStabilityWitness BuildPragmaStateRepairWitness(
-      const OwnerStateBoundary &boundary, llvm::StringRef detail);
-
-  /// Build a typed witness that a pragma-state observer was materialized.
-  static SuffixStabilityWitness BuildPragmaStateMaterializationWitness(
-      const OwnerStateBoundary &boundary, llvm::StringRef detail);
-
-  /// Build a typed witness that the closure was widened across a complete
-  /// pragma-state island.
-  static SuffixStabilityWitness BuildPragmaStateClosureWideningWitness(
-      const OwnerStateBoundary &boundary, llvm::StringRef detail);
-
-  /// Build a typed fail-closed pragma-state terminal witness.
-  static SuffixStabilityWitness BuildPragmaStateTerminalFailureWitness(
-      const OwnerStateBoundary &boundary, llvm::StringRef detail);
-
-  /// Route one proven pragma-state transition through the mandatory Phase-5
-  /// gateway.
-  ///
-  /// Callers should use this only after they have identified a real
-  /// pragma-state transition crossing an edit boundary.  Ordinary sideband
-  /// replay/materialization remains governed by its existing owner-closure and
-  /// byte-placement proofs until it can supply such a boundary proof.
-  SuffixStabilityCheckResult CheckPragmaStateTransitionAcrossEditBoundary(
-      const OwnerStateBoundary &boundary, StateMutationKind mutation,
-      SuffixStabilityWitness witness, llvm::StringRef phase,
-      llvm::StringRef detail, bool requireKnownObserver) const;
 
   /// Build the source/token boundary for one include directive.
-  ///
-  /// Phase 5I treats include identity and include-guard state as semantic state
-  /// transitions.  This helper deliberately uses the producer-recorded include
-  /// site and PP cover; it does not infer header-guard structure from source
-  /// spelling in the consumer.
   static OwnerStateBoundary
   IncludeStateBoundaryForIncludeSite(const RefoldModel::IncludeItem &include);
 
-  /// Build a typed witness that include/include-guard state was repaired or
-  /// preserved equivalently before a suffix observer.
-  static SuffixStabilityWitness BuildIncludeStateRepairWitness(
-      const OwnerStateBoundary &boundary, OwnerStateComponent component,
-      llvm::StringRef detail);
-
-  /// Build a typed witness that an include/include-guard observer was
-  /// materialized by the selected owner realization.
-  static SuffixStabilityWitness BuildIncludeStateMaterializationWitness(
-      const OwnerStateBoundary &boundary, OwnerStateComponent component,
-      llvm::StringRef detail);
-
-  /// Build a typed witness that the closure was widened across a complete
-  /// include/include-guard state transition.
-  static SuffixStabilityWitness BuildIncludeStateClosureWideningWitness(
-      const OwnerStateBoundary &boundary, OwnerStateComponent component,
-      llvm::StringRef detail);
-
-  /// Build a typed fail-closed include/include-guard terminal witness.
-  static SuffixStabilityWitness BuildIncludeStateTerminalFailureWitness(
-      const OwnerStateBoundary &boundary, OwnerStateComponent component,
-      llvm::StringRef detail);
-
-  /// Route one include or include-guard state transition through the mandatory
-  /// Phase-5 gateway.
-  ///
-  /// Phase 5I intentionally keeps ordinary include spelling/materialization
-  /// mechanics unchanged.  Callers use this wrapper only to attach a typed
-  /// state-stability proof to include-state transitions they have already
-  /// identified, such as materializing a header include or widening over a
-  /// skipped/activated include-guard transition.
-  SuffixStabilityCheckResult CheckIncludeStateTransitionAcrossEditBoundary(
-      const OwnerStateBoundary &boundary, OwnerStateComponent component,
-      StateMutationKind mutation, SuffixStabilityWitness witness,
-      llvm::StringRef phase, llvm::StringRef detail,
-      bool requireKnownObserver) const;
-
-  /// Build the source/token boundary for a complete producer-recorded
-  /// conditional group.
-  ///
-  /// Phase 5J treats branch selection as conditional state, but it does not
-  /// infer changed #if truth from B-side tokens.  These helpers are only a
-  /// typed boundary/witness surface for callers that already proved a complete
-  /// conditional group or arm participates in an owner-closed edit.
-  static OwnerStateBoundary
-  ConditionalStateBoundaryForGroup(const RefoldModel::CondGroup &group);
-
-  /// Build the source/token boundary for one producer-recorded conditional arm.
-  static OwnerStateBoundary
-  ConditionalStateBoundaryForArm(const RefoldModel::CondGroup &group,
-                                 const RefoldModel::CondArm &arm);
-
-  /// Build a typed witness that conditional branch-selection state was repaired
-  /// or preserved equivalently before any preserved suffix observer.
-  static SuffixStabilityWitness BuildConditionalStateRepairWitness(
-      const OwnerStateBoundary &boundary, llvm::StringRef detail);
-
-  /// Build a typed witness that a conditional-state observer was materialized.
-  static SuffixStabilityWitness BuildConditionalStateMaterializationWitness(
-      const OwnerStateBoundary &boundary, llvm::StringRef detail);
-
-  /// Build a typed witness that the edit closure was widened across a complete
-  /// conditional group/arm instead of reverse-solving directive truth.
-  static SuffixStabilityWitness BuildConditionalStateClosureWideningWitness(
-      const OwnerStateBoundary &boundary, llvm::StringRef detail);
-
-  /// Build a typed fail-closed conditional-state terminal witness.
-  static SuffixStabilityWitness BuildConditionalStateTerminalFailureWitness(
-      const OwnerStateBoundary &boundary, llvm::StringRef detail);
-
-  /// Build a typed terminal witness for the strict-domain exclusion where the
-  /// only possible refolding would change #if/#elif truth from downstream B
-  /// tokens rather than from an edited conditional directive owner.
-  static SuffixStabilityWitness BuildConditionalReverseSolvedTerminalWitness(
-      const OwnerStateBoundary &boundary, llvm::StringRef detail);
-
-  /// Route one proven conditional-state transition through the mandatory
-  /// Phase-5 gateway.
-  ///
-  /// Ordinary conditional owner selection and materialization are intentionally
-  /// left unchanged by Phase 5J.  Callers should use this wrapper only after
-  /// they have identified a real conditional-state transition crossing an edit
-  /// boundary; otherwise they must keep using the existing owner-closure proof
-  /// rather than inventing a conditional-state suffix proof.
-  SuffixStabilityCheckResult CheckConditionalStateTransitionAcrossEditBoundary(
-      const OwnerStateBoundary &boundary, StateMutationKind mutation,
-      SuffixStabilityWitness witness, llvm::StringRef phase,
-      llvm::StringRef detail, bool requireKnownObserver) const;
-
-  /// Route one line-control state transition through the mandatory Phase-5
-  /// gateway.
-  ///
-  /// This is the component-specific Phase 5F entry point.  Synthetic #line
-  /// insertion, deferred #line movement, source #line consumption, and preserved
-  /// __LINE__/__FILE__/__FILE_NAME__ observers should use this wrapper rather
-  /// than the legacy enum bridge or a direct terminal fallback.
-  SuffixStabilityCheckResult CheckLineControlStateTransitionAcrossEditBoundary(
-      const OwnerStateBoundary &boundary, OwnerStateComponent component,
-      StateMutationKind mutation, SuffixStabilityWitness witness,
-      llvm::StringRef phase, llvm::StringRef detail,
-      bool requireKnownObserver) const;
 
   /// Return the coarse observer kind for a state component.
   static SuffixObservationKind
@@ -4164,8 +4295,8 @@ private:
   ///
   /// These values are intentionally not the final theorem vocabulary.  They are
   /// retained as compact construction metadata so existing builders do not need
-  /// to be renamed en masse, but Phase 1B requires selection and emission to use
-  /// NormalizeAcceptedProof() before treating a candidate as theorem-discharged.
+  /// to be renamed en masse, but Phase 1C requires selection and emission to use
+  /// the summary-owned theorem class before treating a candidate as discharged.
   #define REFOLD_ACCEPTED_PROOF_CLASS_LIST(REFOLD_X) \
   REFOLD_X(Unknown) \
   REFOLD_X(InvocationPreserving) \
@@ -4266,6 +4397,32 @@ private:
   }
 #undef REFOLD_SURFACE_DISPOSITION_LIST
 
+  /// \brief Named theorem-lattice tie-breakers for otherwise local choices.
+  ///
+  /// Phase 3C keeps accepted-result ordering out of path-specific code.  A
+  /// builder may attach one of these names only when it has already proved the
+  /// corresponding witness preconditions; the shared lattice selector then owns
+  /// the actual preference decision.  Unknown means no special tie-breaker.
+  #define REFOLD_THEOREM_SELECTION_TIE_BREAKER_LIST(REFOLD_X) \
+  REFOLD_X(Unknown) \
+  REFOLD_X(ExactTUArgumentEditOverEquivalentMacroArgsOnly)
+
+  enum class TheoremSelectionTieBreakerKind : uint8_t {
+#define REFOLD_X(name) name,
+    REFOLD_THEOREM_SELECTION_TIE_BREAKER_LIST(REFOLD_X)
+#undef REFOLD_X
+  };
+
+  friend inline StringRef toString(TheoremSelectionTieBreakerKind value) {
+    switch (value) {
+#define REFOLD_X(name) case TheoremSelectionTieBreakerKind::name: return #name;
+      REFOLD_THEOREM_SELECTION_TIE_BREAKER_LIST(REFOLD_X)
+#undef REFOLD_X
+    }
+    return "Unknown";
+  }
+#undef REFOLD_THEOREM_SELECTION_TIE_BREAKER_LIST
+
   /// \brief Implementation path that produced an accepted theorem carrier.
   ///
   /// This inventory is intentionally subordinate to TheoremProofClass.  It may
@@ -4316,6 +4473,108 @@ private:
     return "Unknown";
   }
 #undef REFOLD_ACCEPTED_PATH_KIND_LIST
+
+  /// \brief Proof-lattice class assigned to an expansion-fallback branch.
+  ///
+  /// This enum is the Phase-4A inventory for the fallback translation unit.
+  /// It classifies what an expansion-fallback branch is trying to emit before
+  /// that branch is allowed to build an accepted-result carrier.  The names are
+  /// intentionally theorem-facing, not implementation anecdotes: a fallback
+  /// branch may survive only as an in-domain proof class or as the explicit
+  /// terminal out-of-domain carrier.
+#define REFOLD_EXPANSION_FALLBACK_BRANCH_PROOF_CLASS_LIST(REFOLD_X)           \
+  REFOLD_X(Unknown)                                                           \
+  REFOLD_X(OwnerRealizationProof)                                             \
+  REFOLD_X(MixedOwnerTilingProof)                                             \
+  REFOLD_X(DirectivePreservingProof)                                          \
+  REFOLD_X(TUTextualEditProof)                                                \
+  REFOLD_X(TerminalOutOfDomainProof)
+
+  enum class ExpansionFallbackBranchProofClass : uint8_t {
+#define REFOLD_X(name) name,
+    REFOLD_EXPANSION_FALLBACK_BRANCH_PROOF_CLASS_LIST(REFOLD_X)
+#undef REFOLD_X
+  };
+
+  friend inline StringRef toString(ExpansionFallbackBranchProofClass value) {
+    switch (value) {
+#define REFOLD_X(name) case ExpansionFallbackBranchProofClass::name: return #name;
+      REFOLD_EXPANSION_FALLBACK_BRANCH_PROOF_CLASS_LIST(REFOLD_X)
+#undef REFOLD_X
+    }
+    return "Unknown";
+  }
+#undef REFOLD_EXPANSION_FALLBACK_BRANCH_PROOF_CLASS_LIST
+
+  /// \brief Closed inventory of expansion-fallback branches that can emit.
+  ///
+  /// Phase 4A deliberately enumerates emitting fallback branches separately
+  /// from their internal rejection checks.  Rejections do not emit; the emitted
+  /// surfaces that remain in this file are the TU/include source-closure edit
+  /// and the declared raw-B terminal carrier.  Adding another emitting branch
+  /// requires adding it here and assigning exactly one proof class below.
+#define REFOLD_EXPANSION_FALLBACK_BRANCH_KIND_LIST(REFOLD_X)                  \
+  REFOLD_X(Unknown)                                                           \
+  REFOLD_X(TUIncludeClosureEdit)                                              \
+  REFOLD_X(PostStructuralTerminalOutOfDomain)
+
+  enum class ExpansionFallbackBranchKind : uint8_t {
+#define REFOLD_X(name) name,
+    REFOLD_EXPANSION_FALLBACK_BRANCH_KIND_LIST(REFOLD_X)
+#undef REFOLD_X
+  };
+
+  friend inline StringRef toString(ExpansionFallbackBranchKind value) {
+    switch (value) {
+#define REFOLD_X(name) case ExpansionFallbackBranchKind::name: return #name;
+      REFOLD_EXPANSION_FALLBACK_BRANCH_KIND_LIST(REFOLD_X)
+#undef REFOLD_X
+    }
+    return "Unknown";
+  }
+#undef REFOLD_EXPANSION_FALLBACK_BRANCH_KIND_LIST
+
+  /// \brief Canonical Phase-4A classification for one fallback branch.
+  ///
+  /// `branchProofClass` records the fallback-specific proof inventory requested
+  /// by Phase 4A.  `theoremClass` records the current normalized theorem class
+  /// used by ProofSummary / EmittedProof.  They intentionally differ for
+  /// TUTextualEditProof because the current theorem lattice represents TU text
+  /// realizations with the generic OwnerRealizationProof carrier plus an owner
+  /// realization witness; later phases may split that theorem class without
+  /// changing the branch inventory.
+  struct ExpansionFallbackBranchClassification {
+    ExpansionFallbackBranchKind branch = ExpansionFallbackBranchKind::Unknown;
+    ExpansionFallbackBranchProofClass branchProofClass =
+        ExpansionFallbackBranchProofClass::Unknown;
+    TheoremProofClass theoremClass = TheoremProofClass::Unknown;
+    AcceptedPathKind acceptedPath = AcceptedPathKind::Unknown;
+
+    bool IsClassified() const {
+      return branch != ExpansionFallbackBranchKind::Unknown &&
+             branchProofClass != ExpansionFallbackBranchProofClass::Unknown &&
+             theoremClass != TheoremProofClass::Unknown &&
+             acceptedPath != AcceptedPathKind::Unknown;
+    }
+  };
+
+  static ExpansionFallbackBranchClassification
+  ClassifyExpansionFallbackBranch(ExpansionFallbackBranchKind branch) {
+    switch (branch) {
+    case ExpansionFallbackBranchKind::TUIncludeClosureEdit:
+      return {branch, ExpansionFallbackBranchProofClass::TUTextualEditProof,
+              TheoremProofClass::OwnerRealizationProof,
+              AcceptedPathKind::TUIncludeClosureEdit};
+    case ExpansionFallbackBranchKind::PostStructuralTerminalOutOfDomain:
+      return {branch,
+              ExpansionFallbackBranchProofClass::TerminalOutOfDomainProof,
+              TheoremProofClass::TerminalOutOfDomainProof,
+              AcceptedPathKind::TerminalEmitEditedPreprocessedStream};
+    case ExpansionFallbackBranchKind::Unknown:
+      break;
+    }
+    return {};
+  }
 
   /// \brief How mature the current acceptance path is in the migration plan.
   #define REFOLD_ACCEPTANCE_SUPPORT_KIND_LIST(REFOLD_X) \
@@ -4720,7 +4979,7 @@ private:
   /// realization is in-domain only when the include cover admits either the
   /// canonical A-cover -> B-envelope mapping or the Phase-8b
   /// BoundaryStableConsensusBCoverEnvelope proof.  The latter is not a legacy
-  /// rescue path: it is accepted only when all usable non-canonical boundary
+  /// fallback branch: it is accepted only when all usable non-canonical boundary
   /// projections agree on the same non-empty B-token range.  Any include
   /// realization outside those declared witnesses remains an explicit terminal
   /// out-of-domain case instead of manufacturing a weaker proof class.
@@ -4745,20 +5004,7 @@ private:
   }
 #undef REFOLD_INCLUDE_REALIZATION_EVIDENCE_KIND_LIST
 
-  /// \brief Compact witness for an accepted include realization path.
-  struct IncludeRealizationWitness {
-    IncludeRealizationEvidenceKind evidence =
-        IncludeRealizationEvidenceKind::Unknown;
-    bool hasIncludeId = false;
-    uint64_t includeId = 0;
-    bool hasACover = false;
-    uint64_t aCoverBegin = 0;
-    uint64_t aCoverEnd = 0;
-    bool hasBTokenEnvelope = false;
-    uint64_t bTokBegin = 0;
-    uint64_t bTokEnd = 0;
-  };
-
+  using IncludeRealizationBTokenEnvelope = std::pair<size_t, size_t>;
 
   /// Owner-polymorphic evidence kind for realized output.
   ///
@@ -4802,23 +5048,11 @@ private:
     OwnerRealizationEvidenceKind evidence =
         OwnerRealizationEvidenceKind::Unknown;
     OwnerClosure closure;
-    bool hasOwner = false;
-    bool hasSourceInterval = false;
-    bool hasATokenCover = false;
-    bool hasBTokenEnvelope = false;
-    bool hasStateSummary = false;
 
     // Typed Phase-5 state witnesses for the realized owner.  Each witness names
     // the exact state component it discharges, so owner realization no longer
     // stores a coarse legacy enum such as "closure widened" as theorem proof.
-    bool hasStateWitnesses = false;
     std::vector<SuffixStabilityWitness> stateWitnesses;
-
-    // When the shared Phase-6b helper rejects the realization, the failed
-    // obligation is stored here so diagnostics do not have to reverse-engineer
-    // which common proof fact was missing.
-    bool hasFailedObligation = false;
-    TerminalFallbackProofFailure failedObligation;
 
     std::string detail;
   };
@@ -4866,18 +5100,25 @@ private:
   }
 #undef REFOLD_MIXED_OWNER_TILING_EDGE_KIND_LIST
 
-  /// One ordered edge in the theorem-facing mixed-owner tiling proof.
+  /// Durable per-segment proof record for one mixed-owner tiling edge.
   ///
-  /// The edge carries the canonical owner closure computed by the Phase-7 tiler.
-  /// For token segments, the A-token range is non-empty and corresponds to a
-  /// normalized hunk emitted later.  Replace segments also have a non-empty B
-  /// range; delete-only Phase-7g segments deliberately carry an empty B range at
-  /// the deletion boundary.  For state gaps, both token ranges are zero-width
-  /// at the adjacent token boundary while the source range records the
-  /// directive/state island that was proved covered and composable.
-  struct MixedOwnerTilingEdgeWitness {
+  /// Phase 8A makes the split itself theorem-facing instead of treating the
+  /// partition as a transient normalizer detail.  Every emitted token segment
+  /// and every zero-token state gap names the parent tiling proof, its stable
+  /// segment index, the exact A/B token envelope, and the state-transition proof
+  /// supplied by the owner closure for that segment.  State-gap entries have
+  /// zero-width A/B envelopes at the adjoining boundary but still carry the
+  /// source/state closure that made the gap composable.
+  struct MixedOwnerTilingSegmentWitness {
+    uint64_t parentTilingWitnessId = 0;
+    uint32_t segmentIndex = 0;
     MixedOwnerTilingEdgeKind kind = MixedOwnerTilingEdgeKind::Unknown;
-    OwnerClosure closure;
+    uint64_t aStart = 0;
+    uint64_t aEnd = 0;
+    uint64_t bStart = 0;
+    uint64_t bEnd = 0;
+    bool zeroTokenStateGap = false;
+    StateTransitionProof ownerTransitionProof;
   };
 
   /// Persisted proof for a deterministic mixed-owner tiling.
@@ -4887,6 +5128,7 @@ private:
   /// token segment can point back to the full ordered proof path, including the
   /// zero-token state-gap edges that never become token hunks themselves.
   struct MixedOwnerTilingWitness {
+    uint64_t witnessId = 0;
     uint64_t originalAStart = 0;
     uint64_t originalAEnd = 0;
     uint64_t originalBStart = 0;
@@ -4894,7 +5136,7 @@ private:
     uint32_t tokenSegmentCount = 0;
     uint32_t stateGapCount = 0;
     bool stateSummariesComposed = false;
-    std::vector<MixedOwnerTilingEdgeWitness> edges;
+    std::vector<MixedOwnerTilingSegmentWitness> segments;
   };
 
   /// Reverse index from an emitted token segment back to its mixed-owner tiling.
@@ -4909,6 +5151,8 @@ private:
     uint64_t bStart = 0;
     uint64_t bEnd = 0;
     size_t witnessIndex = 0;
+    uint64_t parentTilingWitnessId = 0;
+    uint32_t segmentIndex = 0;
   };
 
   /// \brief Status produced when the engine evaluates a local proof contract.
@@ -5086,7 +5330,9 @@ private:
   ProofDischargeRecord BuildAcceptedPathBaselineDischarge(
       const AcceptancePathInventory &inventory,
       bool explicitOutOfDomain = false) const;
-  void ConfigureProofSummary(ProofSummary &summary, AcceptedProofClass acceptedClass,
+  void ConfigureProofSummary(ProofSummary &summary,
+                             TheoremProofClass theoremClass,
+                             AcceptedProofClass acceptedClass,
                              RealizationMode realizationMode,
                              SelectionPreference preference,
                              SurfaceDisposition surfaceDisposition,
@@ -5114,19 +5360,53 @@ private:
   bool ProofSummaryRequiresOwnerRealizationWitness(
       const ProofSummary &summary) const;
 
+  /// \brief Canonical theorem-facing proof carried by an emitted result.
+  ///
+  /// This is the single object that answers why a selected artifact is
+  /// theorem-admissible.  Construction provenance such as AcceptedPathKind and
+  /// AcceptedProofClass may still exist below this layer, but they are not
+  /// theorem authority: they must first normalize into exactly one
+  /// `theoremClass` plus the typed witnesses copied here.  The carrier is
+  /// intentionally value-only and side-effect-free so ProofSummary can own it
+  /// without changing selector or emission semantics.
+  struct EmittedProof {
+    TheoremProofClass theoremClass = TheoremProofClass::Unknown;
+    ProofDischargeRecord discharge;
+
+    std::optional<OwnerRealizationWitness> ownerRealization;
+    std::optional<MixedOwnerTilingWitness> mixedOwnerTiling;
+    std::optional<TUAnchorWitness> tuAnchor;
+    std::optional<IncludeAnchorWitness> includeAnchor;
+    std::optional<SuffixStabilityWitness> suffixStability;
+    std::optional<TerminalFallbackWitness> terminalFallback;
+
+    bool HasFinalTheoremClass() const {
+      return theoremClass != TheoremProofClass::Unknown;
+    }
+  };
+
   /// \brief Common proof-summary carrier used during the proof/lattice model.
   ///
-  /// The summary packages the accepted-path inventory, local discharge result,
-  /// lattice law, completeness contract, and explicit theorem-domain position
-  /// for one accepted artifact. Converted selector sites already use the
-  /// discharge result and lattice law operationally; the remaining migration
-  /// work is to route every competition site through this same carrier.
+  /// The summary packages the construction inventory, local discharge result,
+  /// lattice law, completeness contract, explicit theorem-domain position, and
+  /// canonical emitted proof for one accepted artifact.  The older construction
+  /// fields remain temporarily so Phase 1C and Phase 2 can migrate their call
+  /// sites deliberately, but theorem-facing code must consume `emittedProof`
+  /// rather than re-deriving proof authority from AcceptedProofClass or local
+  /// side bits.
   struct ProofSummary {
+    /// Final theorem class declared by the builder after construction
+    /// provenance has been normalized.  Phase 1C makes this field, not
+    /// AcceptedProofClass, the summary-local answer to "why is this valid?".
+    TheoremProofClass theoremClass = TheoremProofClass::Unknown;
+
     AcceptedProofClass acceptedClass = AcceptedProofClass::Unknown;
     RealizationMode realizationMode = RealizationMode::Unknown;
     SelectionPreference preference = SelectionPreference::Unknown;
     SurfaceDisposition surfaceDisposition =
         SurfaceDisposition::None;
+    TheoremSelectionTieBreakerKind selectionTieBreaker =
+        TheoremSelectionTieBreakerKind::Unknown;
     AcceptancePathInventory inventory;
     GlobalSelectionLattice lattice;
     CompletenessContract completeness;
@@ -5151,8 +5431,25 @@ private:
     bool hasMixedOwnerTilingWitness = false;
     MixedOwnerTilingWitness mixedOwnerTilingWitness;
 
-    bool hasTerminalFallbackWitness = false;
-    TerminalFallbackWitness terminalFallbackWitness;
+    // State-stabilization witness carried by proof summaries that discharge
+    // a suffix/state theorem directly rather than through owner realization.
+    // Phase 1A exposes the same witness slot on EmittedProof; Phase 2 will move
+    // the remaining MacroPatch mirror fields into one macro-proof carrier.
+    bool hasSuffixStabilityWitness = false;
+    SuffixStabilityWitness suffixStabilityWitness;
+
+    std::optional<TerminalFallbackWitness> terminalFallbackWitness;
+
+    /// Canonical theorem-facing proof produced by FinalizeProofSummary().
+    /// A disengaged optional means the current construction inventory is still
+    /// transitional or failed to discharge the theorem obligations.  Keeping
+    /// this cached in the summary prevents later selector/emission code from
+    /// treating the construction inventory as an independent proof authority.
+    std::optional<EmittedProof> emittedProof;
+
+    bool HasCanonicalEmittedProof() const {
+      return emittedProof && emittedProof->HasFinalTheoremClass();
+    }
 
     /// True when the summary's primary proof class came from a concrete
     /// accepted-path or patch-proof enum rather than from legacy side bits such
@@ -5162,6 +5459,7 @@ private:
     /// only for internal diagnostics and is rejected before emission.
     bool primaryProofClassExplicit = false;
   };
+
 
   /// \brief Normalized accepted-result artifact kind used by Patch A/B.
   ///
@@ -5204,6 +5502,11 @@ private:
     AcceptedResultCandidateKind kind = AcceptedResultCandidateKind::Unknown;
     ProofSummary proofSummary = {};
 
+    // Phase-3A enumeration of the concrete emission surface(s) represented by
+    // this candidate. This is inventory only: proof validity still comes from
+    // ProofSummary::emittedProof / TheoremProofClass.
+    EmissionPathInventory emissionPaths = {};
+
     // Artifact-local span / owner metadata.
     uint64_t begin = 0;
     uint64_t end = 0;
@@ -5218,6 +5521,19 @@ private:
     // never participates in admissibility or ordering.
     bool hasPayloadPreview = false;
     std::string payloadPreview;
+  };
+
+  /// \brief Result returned by the Phase-3B accepted-result selector.
+  ///
+  /// Older callers sometimes selected a path-local object and then rebuilt its
+  /// proof wrapper later.  Phase 3B makes the selector return the normalized
+  /// carrier that won the lattice competition together with the stable index of
+  /// the path-local artifact.  The index preserves existing ownership of the
+  /// concrete patch/edit object; the carrier is the theorem-facing selected
+  /// result and must be the object copied to, or restamped for, emission.
+  struct SelectedAcceptedResultCandidate {
+    AcceptedResultCandidate candidate;
+    size_t index = 0;
   };
 
 
@@ -5250,6 +5566,83 @@ private:
   }
 #undef REFOLD_MACRO_PATCH_PROOF_KIND_LIST
 
+  /// \brief Producer/replay evidence for paste-preserving macro proofs.
+  ///
+  /// Phase 2D keeps paste-specific proof evidence inside the canonical
+  /// MacroPatchProof carrier. This witness is the durable home for the
+  /// paste-specific part of the proof:
+  /// either the producer supplied well-formed paste-token spans, or the engine
+  /// replayed the pasted surface and proved that the edited output is exactly
+  /// reconstructed.
+  struct PasteWitness {
+    uint64_t rootMacroId = 0;
+    bool requiresProducerPasteSpans = false;
+    bool replayValidated = false;
+  };
+
+  /// \brief Durable certificate for DAG/subtree macro preservation proofs.
+  ///
+  /// These fields intentionally summarize the existing subtree audit metadata.
+  /// Centralizing them here lets ClassifyMacroPatchProof() consume one proof
+  /// object instead of a scattered collection of path-local side bits.
+  struct SubtreeCertificate {
+    bool backed = false;
+    uint64_t leafMacroId = 0;
+    uint32_t witnessCount = 0;
+    uint32_t invocationCertCount = 0;
+    uint32_t formalCertCount = 0;
+    uint32_t argCertCount = 0;
+    uint32_t liftChainCount = 0;
+    uint32_t liftStepCount = 0;
+    uint32_t rootMergeCount = 0;
+    bool usesLexicalBridge = false;
+    bool touchesPaste = false;
+    bool hasWrapperSemantics = false;
+    bool hasStringifySemantics = false;
+    bool hasWideStringifySemantics = false;
+    bool hasPreferredChildSyntax = false;
+    bool hasRawInvocationPreservation = false;
+    bool hasPassthroughFlatten = false;
+    bool hasBridgeSensitiveStructuredSemantics = false;
+    bool deferredPasteDischarged = false;
+    bool admissible = false;
+    uint32_t expectedRootFormalCount = 0;
+    uint32_t deferredRootArgCount = 0;
+    uint32_t bridgeSensitiveFormalCount = 0;
+    std::string expectedRootFormalSummary;
+    std::string deferredRootArgSummary;
+    std::string bridgeSensitiveFormalSummary;
+  };
+
+  /// \brief Root/callsite evidence for call-chain suffix preservation.
+  ///
+  /// A call-chain suffix proof is valid only when the emitted patch is tied to
+  /// the same root macro invocation that owns the suffix slice. Keeping the
+  /// relationship in a witness object avoids future proof code having to infer
+  /// that relationship from unrelated MacroPatch scalar fields.
+  struct CallChainWitness {
+    uint64_t rootMacroId = 0;
+    uint64_t callsiteMacroId = 0;
+  };
+
+  /// \brief Canonical MacroPatch-local proof carrier.
+  ///
+  /// Phase 2D makes this object the only MacroPatch-local proof authority.
+  /// SetMacroPatchProof() installs it, SyncMacroPatchProofSummary() refreshes
+  /// derived paste/subtree/call-chain witnesses, and ClassifyMacroPatchProof()
+  /// copies the resulting theorem facts into ProofSummary / EmittedProof.
+  struct MacroPatchProof {
+    MacroPatchProofKind kind = MacroPatchProofKind::Unknown;
+    uint64_t proofRootMacroId = 0;
+    bool preservesInvocationStructure = false;
+
+    std::optional<OwnerRealizationWitness> ownerRealization;
+    std::optional<SuffixStabilityWitness> suffixStability;
+    std::optional<PasteWitness> paste;
+    std::optional<SubtreeCertificate> subtree;
+    std::optional<CallChainWitness> callChain;
+  };
+
   struct MacroPatch {
     uint64_t invStart = 0, invEnd = 0;
     std::string replacement;
@@ -5265,34 +5658,25 @@ private:
     // byte span and owner.
     uint64_t macroId = 0;
 
-    // Proof-lattice migration summary. This mirrors the legacy fields below so
-    // later proof code can reason about proof class, selection
-    // preference, and current acceptance-path inventory without rewriting
-    // macro-patch behavior yet. Default-initialize the normalized proof
-    // summary so aggregate construction of MacroPatch remains warning-free.
+    // Proof-lattice migration summary.  The summary is rebuilt from the
+    // canonical MacroPatchProof carrier, not from path-local mirror fields.
+    // Default-initialize it so aggregate construction of MacroPatch remains
+    // warning-free.
     ProofSummary proofSummary = {};
 
-    // Proof provenance for layer-3 root/callsite admissibility.
-    // The proof kind and normalized proof summary are the theorem-facing
-    // carriers. Construction-time validation no longer appears as a separate
-    // proof obligation or side bit.
-    MacroPatchProofKind proofKind = MacroPatchProofKind::Unknown;
-    bool structurePreserving = false;
-    uint64_t proofRootMacroId = 0;
+    // Canonical MacroPatch-local proof carrier.  Phase 2D deletes the former
+    // scalar/witness mirrors from MacroPatch; all macro-local theorem facts now
+    // live here and are copied into ProofSummary only through
+    // ClassifyMacroPatchProof().
+    MacroPatchProof proof = {};
 
-    // Phase-6 owner-polymorphic realization certificate.  Whole-cover macro
-    // realization still uses macro-specific source spelling mechanics, but the
-    // accepted proof is also exposed as a generic OwnerRealizationProof.
-    bool hasOwnerRealizationWitness = false;
-    OwnerRealizationWitness ownerRealizationWitness;
-
-    // Typed state-stability certificate for macro realization patches whose
-    // correctness depends on stabilizing a preprocessor state event rather than
-    // preserving the original invocation structure. Counter literalization and
-    // forced counter-sensitive materialization use this carrier so theorem
-    // discharge no longer consults a legacy construction-validation bit.
-    bool hasSuffixStabilityWitness = false;
-    SuffixStabilityWitness suffixStabilityWitness;
+    // Phase-3B selected-result bridge.  Macro candidate discovery still returns
+    // a concrete MacroPatch for legacy ownership of the replacement bytes, but
+    // the final macro selector records the exact AcceptedResultCandidate that
+    // won lattice selection here before the patch can be forwarded to emission.
+    // Emission may restamp the carrier onto the emitted-source discharge rule,
+    // but it must not rediscover which path-specific result was selected.
+    std::optional<AcceptedResultCandidate> selectedAcceptedCandidate;
 
     // First-class macro whole-cover realization certificate. These
     // fields record the exact owner cover, containment witness, and B-side
@@ -5832,8 +6216,9 @@ private:
   /// \returns The TU byte offset of the zero-width insertion anchor when a
   ///          truthful TU proof succeeds; otherwise \c std::nullopt.
   std::optional<uint64_t>
-  FindProvableTUInsertionAnchor(uint64_t pp, StringRef tuPath,
-                                TUAnchorWitness *witness = nullptr) const;
+  FindProvableTUInsertionAnchor(
+      uint64_t pp, StringRef tuPath, TUAnchorWitness *witness = nullptr,
+      AcceptedResultCandidate *acceptedCandidate = nullptr) const;
 
   /// Anchors a *pure insertion* (a PP-gap insertion) to a deterministic,
   /// canonical TU byte boundary representing the *same* preprocessed
@@ -5879,8 +6264,9 @@ private:
   ///          `ppGap`, or `std::nullopt` if `ppGap` is not exactly on a known
   ///          boundary (caller should fall back)
   std::optional<uint64_t>
-  AnchorToExactSlotBoundaryFromPPGap(StringRef tuPath, uint64_t ppGap,
-                                     TUAnchorWitness *witness = nullptr) const;
+  AnchorToExactSlotBoundaryFromPPGap(
+      StringRef tuPath, uint64_t ppGap, TUAnchorWitness *witness = nullptr,
+      AcceptedResultCandidate *acceptedCandidate = nullptr) const;
 
   /// Advance a proved zero-width insertion anchor past a contiguous prefix of
   /// active, source-authored line-control directives in the same owner.
@@ -7236,29 +7622,89 @@ private:
   /// chosen patch through this same summary for auditability.
   ProofSummary ClassifyMacroPatchProof(const MacroPatch &patch) const;
 
-  /// \brief Synchronize the normalized proof summary with the legacy macro patch
-  /// proof fields.
+  /// \brief Refresh proof witnesses derived from macro-patch metadata.
   ///
-  /// During the migration, the legacy fields remain the behaviorally
-  /// authoritative source of truth. This helper mirrors them into the generic
-  /// proof summary so later steps can switch over incrementally.
+  /// Phase 2D removes the old proof mirror fields from MacroPatch, but some
+  /// durable witnesses are still backed by richer patch metadata such as paste
+  /// replay status, DAG subtree certificates, and call-chain identity.  This
+  /// helper copies that metadata into MacroPatchProof without changing the
+  /// primary proof kind, root, or invocation-preservation bit.
+  void RefreshMacroPatchDerivedProofWitnesses(MacroPatch &patch) const;
+
+  /// \brief Rebuild the normalized proof summary from MacroPatchProof.
+  ///
+  /// This is now a carrier-only bridge: the canonical MacroPatchProof is first
+  /// refreshed with derived paste/subtree/call-chain witnesses, then classified
+  /// into ProofSummary and its embedded EmittedProof.
   void SyncMacroPatchProofSummary(MacroPatch &patch) const;
 
-  /// \brief Stamp proof metadata onto a macro patch.
+  /// \brief Report-only Phase-0B guard for accepted proof summaries.
   ///
-  /// Centralizes the update of both the legacy proof fields and the normalized
-  /// proof summary used by accepted-result selection and proof discharge. Use
-  /// this helper whenever a macro patch's proof kind, structure-preservation
-  /// class, or proof root is assigned so those views cannot drift apart.
+  /// The no-legacy audit is dormant unless CLANG_REFOLD_NO_LEGACY_AUDIT is set.
+  /// These helpers therefore must not reject, restamp, reorder, or request
+  /// fallback.  They only report places where an accepted artifact is still
+  /// explainable by transitional side data instead of by the final theorem
+  /// carrier.
+  bool AuditProofSummaryForLegacyAuthority(const ProofSummary &summary,
+                                           llvm::StringRef role) const;
+  bool AuditAcceptedResultCandidateForLegacyAuthority(
+      const AcceptedResultCandidate &candidate, llvm::StringRef role) const;
+  bool AuditMacroPatchProofForLegacyAuthority(const MacroPatch &patch,
+                                              llvm::StringRef role) const;
+  bool AuditTerminalFallbackForLegacyAuthority(
+      const TerminalFallbackProofFailure &failure, llvm::StringRef role) const;
+  bool AuditFinalLineControlAuthorityContract(
+      const FinalLineControlAuthorityContract &authority,
+      llvm::StringRef role) const;
+  bool AuditFinalLineControlRemovalProofPopulation(
+      llvm::ArrayRef<FinalLineControlPruneCandidate> candidates,
+      llvm::StringRef role) const;
+
+  /// \brief Report-only Phase-4A guard for expansion-fallback branches.
+  ///
+  /// The fallback fragment now has to name the proof class of every emitted
+  /// branch before it builds an accepted-result carrier.  These helpers do not
+  /// change behavior; they only make the no-legacy audit report an emitting
+  /// fallback branch that has not been classified or whose accepted carrier no
+  /// longer matches the branch's declared proof class.
+  bool AuditExpansionFallbackBranchClassification(
+      const ExpansionFallbackBranchClassification &classification,
+      llvm::StringRef role) const;
+  bool AuditExpansionFallbackAcceptedCandidate(
+      const ExpansionFallbackBranchClassification &classification,
+      const AcceptedResultCandidate &candidate, llvm::StringRef role) const;
+
+  /// \brief Build the canonical proof carrier for a macro patch.
+  ///
+  /// This small factory keeps call sites from open-coding the three primary
+  /// proof facts while Phase 2C flips stamping to be carrier-first.  More
+  /// specialized witnesses are attached to the returned MacroPatchProof before
+  /// SetMacroPatchProof() when the construction site already owns them.
+  MacroPatchProof MakeMacroPatchProof(MacroPatchProofKind kind,
+                                      bool preservesInvocationStructure,
+                                      uint64_t proofRootMacroId) const;
+
+  /// \brief Install the canonical macro proof carrier and refresh summaries.
+  ///
+  /// Phase 2D makes this the only primary stamping API for macro-patch proof
+  /// identity.  The normalized ProofSummary and its canonical EmittedProof are
+  /// rebuilt from MacroPatchProof immediately.
   ///
   /// \param patch The macro patch to annotate.
-  /// \param kind The proof class that justifies the patch.
-  /// \param structurePreserving Whether the proof preserves source invocation
-  ///        structure rather than realizing expansion text.
-  /// \param proofRootMacroId The root macro invocation id for the proof tree.
-  void StampMacroPatchProof(MacroPatch &patch, MacroPatchProofKind kind,
-                            bool structurePreserving,
-                            uint64_t proofRootMacroId) const;
+  /// \param proof The complete canonical macro-local proof carrier.
+  void SetMacroPatchProof(MacroPatch &patch, MacroPatchProof proof) const;
+
+  /// \brief Record the accepted candidate selected for a macro patch.
+  ///
+  /// This is a Phase-3B bridge: macro selection still returns the concrete
+  /// MacroPatch so existing ownership maps remain unchanged, but the selected
+  /// theorem carrier is stored on the patch at the selection boundary.  Later
+  /// emission code may rebuild an emission-specific carrier from the same patch
+  /// proof, yet the fact that this path-local result competed and won is no
+  /// longer implicit in raw MacroPatch control flow.
+  void StampSelectedMacroPatchCandidate(
+      MacroPatch &patch, const AcceptedResultCandidate &candidate,
+      llvm::StringRef role) const;
 
   /// \brief Materialize the explicit whole-cover realization proof.
   ///
@@ -7270,15 +7716,22 @@ private:
       MacroPatch &patch, const WholeCoverPlan &plan,
       const RefoldModel::MacroInvocation &macro) const;
 
-  /// \brief Build the accepted-path inventory for a macro patch.
+  /// \brief Build the accepted-path inventory for a macro proof carrier.
   ///
-  /// Reads the patch's stamped proof metadata and classifies it into the
-  /// normalized accepted path used by the theorem-audit and proof-discharge
-  /// machinery. This is the macro-patch-specific entry point before the generic
-  /// accepted-path inventory mapping is applied.
+  /// MacroPatchProof is the only proof-facing input to macro classification.
+  /// The patch-level overload remains for call-site convenience, but it
+  /// delegates here instead of inspecting unrelated MacroPatch metadata.
   ///
-  /// \param patch The macro patch whose proof metadata should be classified.
-  /// \returns The accepted-path inventory for \p patch.
+  /// \param proof The canonical macro proof carrier to classify.
+  /// \returns The accepted-path inventory for \p proof.
+  AcceptancePathInventory
+  InventoryMacroPatchProofAcceptancePath(const MacroPatchProof &proof) const;
+
+  /// \brief Compatibility wrapper for macro-patch inventory construction.
+  ///
+  /// This overload intentionally reads only MacroPatch::proof.  It exists so
+  /// callers that already own a MacroPatch do not duplicate the proof-kind to
+  /// accepted-path mapping.
   AcceptancePathInventory
   InventoryMacroPatchAcceptancePath(const MacroPatch &patch) const;
 
@@ -7294,6 +7747,16 @@ private:
   ///          proof target.
   AcceptancePathInventory
   BuildAcceptancePathInventory(AcceptedPathKind currentPath) const;
+
+  /// \brief Map construction provenance onto the final theorem proof class.
+  ///
+  /// Phase 1C keeps AcceptedPathKind / AcceptedProofClass as construction
+  /// provenance only.  This helper is the single path-to-theorem bridge used by
+  /// builders before the summary is finalized; selectors and emitters then read
+  /// ProofSummary::theoremClass / ProofSummary::emittedProof instead of
+  /// re-deriving validity from AcceptedProofClass.
+  TheoremProofClass
+  BuildTheoremProofClassForAcceptedPath(AcceptedPathKind currentPath) const;
 
   /// \brief Build a normalized proof summary for a concrete accepted path.
   ///
@@ -7322,15 +7785,36 @@ private:
       AcceptedPathKind currentPath = AcceptedPathKind::Unknown,
       const IncludePatch *patch = nullptr) const;
 
+  /// \brief Build the canonical emitted proof for an accepted candidate.
+  ///
+  /// This is the Phase 1A theorem gate.  It rejects candidates whose proof class
+  /// is missing, transitional, out of sync with its construction path, or
+  /// locally undischarged.  Success returns the final theorem class together
+  /// with every typed witness already present on the proof summary.
+  std::optional<EmittedProof>
+  BuildEmittedProof(const AcceptedResultCandidate &candidate) const;
+
   /// \brief Normalize an accepted candidate to the final theorem vocabulary.
   ///
-  /// This is the Phase 1A--1C theorem gate.  It rejects candidates whose proof
-  /// class is missing, transitional, out of sync with its construction path, or
-  /// locally undischarged.  The returned value is the only theorem-facing proof
-  /// class that selectors and emitted byte edits are allowed to rely on;
-  /// AcceptedPathKind and AcceptedProofClass remain construction provenance.
+  /// Compatibility wrapper for pre-Phase-1C call sites.  The implementation
+  /// delegates to BuildEmittedProof(), so selector/emission code that still asks
+  /// only for a theorem enum is not a second theorem authority.
   std::optional<TheoremProofClass>
   NormalizeAcceptedProof(const AcceptedResultCandidate &candidate) const;
+
+  static EmittedProof
+  BuildEmittedProofFromSummary(TheoremProofClass theoremClass,
+                               const ProofSummary &summary);
+
+  /// \brief Normalize a proof summary into its canonical emitted proof.
+  ///
+  /// This is the Phase 1C summary-owned theorem gate. It intentionally reads
+  /// only the summary's final theorem class, construction inventory, discharge
+  /// record, domain contract, and typed witnesses; AcceptedResultCandidate
+  /// remains construction provenance and is checked only as a compatibility
+  /// wrapper above this layer.
+  std::optional<EmittedProof>
+  BuildCanonicalEmittedProofFromSummary(const ProofSummary &summary) const;
 
   /// \brief Compute the current global lattice law for an accepted summary.
   ///
@@ -7368,6 +7852,25 @@ private:
   /// preserve the existing caller-supplied precedence order.
   bool LatticePrefers(const ProofSummary &lhs, const ProofSummary &rhs) const;
 
+  /// \brief Return the primary emitted surface for a normalized candidate kind.
+  ///
+  /// Phase 3A keeps this mapping centralized so later selector-closure work can
+  /// audit the full emission-path set without duplicating candidate-kind switch
+  /// logic at each builder.  Mixed-owner and owner-realization paths are added
+  /// separately from ProofSummary witnesses because they are proof overlays, not
+  /// primary byte-edit surfaces.
+  static EmissionPathKind PrimaryEmissionPathForCandidateKind(
+      AcceptedResultCandidateKind kind);
+
+  /// \brief Rebuild the Phase-3A emission-path inventory for one candidate.
+  ///
+  /// The function is intentionally deterministic and side-effect free except for
+  /// the candidate's inventory field. It is called after each builder finishes
+  /// mutating ProofSummary so overlay paths cannot go stale when a witness is
+  /// attached late, such as mixed-owner tiling after owner realization.
+  void RefreshAcceptedCandidateEmissionPathInventory(
+      AcceptedResultCandidate &candidate) const;
+
   /// \brief Build an accepted-result candidate for a macro patch.
   ///
   /// Packages an already constructed macro patch with its normalized accepted
@@ -7397,45 +7900,56 @@ private:
   AcceptedResultCandidate
   BuildAcceptedEmittedMacroCandidate(const MacroPatch &patch) const;
 
-  /// \brief Build an accepted-result candidate for an include-preserving or
-  ///        include-realization path.
+  /// \brief Build an accepted-result candidate for an include-preserving path.
   ///
   /// Packages an already constructed include patch with its normalized accepted
-  /// path, proof-discharge inventory, and optional include witnesses. Include
-  /// preserving paths should provide an anchor witness; inline/materialized
-  /// realization paths should provide the corresponding realization witness.
+  /// path, proof-discharge inventory, and optional include-anchor witness.
+  /// Include realization no longer carries a parallel include-specific closure
+  /// witness; realized include output is routed through OwnerRealizationWitness
+  /// by BuildAcceptedIncludeRealizationCandidate().
   ///
   /// \param currentPath The accepted include path represented by \p patch.
   /// \param patch The include patch being wrapped for selection/audit.
   /// \param includeAnchorWitness Optional anchor witness for include-preserving
   ///        paths.
-  /// \param includeRealizationWitness Optional realization witness for include
-  ///        realization paths.
   /// \returns The normalized accepted-result candidate for the include result.
   AcceptedResultCandidate BuildAcceptedIncludeCandidate(
       AcceptedPathKind currentPath, const IncludePatch &patch,
-      const IncludeAnchorWitness *includeAnchorWitness = nullptr,
-      const IncludeRealizationWitness *includeRealizationWitness =
-          nullptr) const;
+      const IncludeAnchorWitness *includeAnchorWitness = nullptr) const;
+
+  /// \brief Build the generic proof summary for realized include/TU output.
+  ///
+  /// Phase 7B separates proof from spelling: include and TU emitters still own
+  /// their materialized surface metadata, while this helper owns only the
+  /// theorem-facing OwnerRealizationWitness installation.  Keeping the helper
+  /// proof-only prevents include/TU spelling fields from becoming a second
+  /// owner-realization proof family.
+  ProofSummary BuildOwnerRealizationProofSummary(
+      AcceptedPathKind currentPath,
+      const OwnerRealizationResult &ownerRealization) const;
 
   /// \brief Build an accepted-result candidate for an emitted include
   ///        realization.
   ///
   /// Used when the engine materializes an include expansion directly rather
-  /// than carrying an `IncludePatch` from the ordinary include-patch path. The
-  /// include item identifies the realized include, while the optional witness
-  /// records the realization envelope or materialization evidence.
+  /// than carrying an `IncludePatch` from the ordinary include-patch path.  The
+  /// optional B-token envelope is owner-realization input, not a separate
+  /// include proof family: TryBuildOwnerRealization() validates the common
+  /// owner/source/A-cover/B-envelope/state obligations.
   ///
   /// \param currentPath The include realization path being emitted.
   /// \param include The include item whose expansion was realized.
-  /// \param includeRealizationWitness Optional witness describing the
-  ///        realization evidence.
+  /// \param evidenceKind The include-envelope producer proof, when one exists.
+  /// \param bTokenEnvelope Optional B-token envelope for inline-from-B
+  ///        realization.
   /// \returns The normalized accepted-result candidate for the emitted include
   ///          realization.
   AcceptedResultCandidate BuildAcceptedIncludeRealizationCandidate(
       AcceptedPathKind currentPath, const RefoldModel::IncludeItem &include,
-      const IncludeRealizationWitness *includeRealizationWitness =
-          nullptr) const;
+      IncludeRealizationEvidenceKind evidenceKind =
+          IncludeRealizationEvidenceKind::Unknown,
+      std::optional<IncludeRealizationBTokenEnvelope> bTokenEnvelope =
+          std::nullopt) const;
 
   /// \brief Build an accepted-result candidate for a TU anchor edit.
   ///
@@ -7516,16 +8030,24 @@ private:
   bool AcceptedResultCandidateHasOnlyNonTopLevelMacroSelectorFailure(
       const AcceptedResultCandidate &candidate) const;
 
-  /// \brief Return the index of the strongest selectable accepted candidate.
+  /// \brief Return the strongest selectable accepted candidate.
   ///
-  /// The returned index always refers to the original \p candidates order so
-  /// callers can keep artifact ownership outside the selector while still
-  /// centralizing the lattice-based comparison logic. When
-  /// \p allowNonTopLevelMacroSelectorFailure is true, the selector also admits
-  /// nested macro-preserving artifacts whose only failed obligation is the
-  /// top-level proof-root rule; this is reserved for the internal non-top-
-  /// level macro construction site that still needs those artifacts as
-  /// intermediate results.
+  /// Phase 3B makes this the selector authority: a selected path-local result is
+  /// not considered selected until its normalized AcceptedResultCandidate has
+  /// survived proof-discharge gating and lattice preference here.  The returned
+  /// index points back into the caller-owned artifact array; the returned
+  /// candidate is the theorem-facing selected result that must be carried to
+  /// emission or explicitly restamped for the emitted-source discharge rule.
+  std::optional<SelectedAcceptedResultCandidate>
+  SelectPreferredAcceptedResultCandidate(
+      ArrayRef<AcceptedResultCandidate> candidates,
+      bool allowNonTopLevelMacroSelectorFailure = false) const;
+
+  /// \brief Compatibility wrapper returning only the selected index.
+  ///
+  /// Existing callers that do not own a concrete artifact can still ask for the
+  /// index, but the implementation delegates to the carrier-returning selector
+  /// above so there is only one selection authority.
   std::optional<size_t> SelectPreferredAcceptedResultCandidateIndex(
       ArrayRef<AcceptedResultCandidate> candidates,
       bool allowNonTopLevelMacroSelectorFailure = false) const;
@@ -7652,7 +8174,10 @@ private:
       const WholeCoverPlan &plan) const;
   OwnerRealizationResult BuildIncludeOwnerRealization(
       const RefoldModel::IncludeItem &include, AcceptedPathKind currentPath,
-      const IncludeRealizationWitness *includeWitness) const;
+      IncludeRealizationEvidenceKind evidenceKind =
+          IncludeRealizationEvidenceKind::Unknown,
+      std::optional<IncludeRealizationBTokenEnvelope> bTokenEnvelope =
+          std::nullopt) const;
   OwnerRealizationResult BuildTUOwnerRealization(
       AcceptedPathKind currentPath, uint64_t begin, uint64_t end) const;
 
@@ -8102,7 +8627,7 @@ private:
   /// 4. **Child-include boundary proof**: prove a stable insertion anchor from
   ///    a direct child `#include` site (via
   ///    `ComputeChildBoundaryInsertByte(...)`). Phase 8d classifies this as a
-  ///    declared include-preserving anchor proof, not as a rescue path: the
+  ///    declared include-preserving anchor proof, not as an unclassified fallback branch: the
   ///    witness must name the child include and the anchor must be exactly that
   ///    child directive's begin or end byte. If no such unique boundary exists,
   ///    the patch is skipped.
@@ -8287,17 +8812,16 @@ private:
   bool LineStateBuiltinInvocationIsPreservedObserver(
       const RefoldModel::MacroInvocation &macro) const;
 
-  /// Return true iff a preserved observer represented by \p macro requires
-  /// producer-backed final observer evidence instead of the lexical final-source
-  /// scanner alone.
+  /// Return true iff a preserved observer represented by \p macro cannot be
+  /// justified solely by direct lexical final-source spelling.
   ///
   /// Direct source-spelled predefined builtins are visible as ordinary final
   /// tokens when preserved.  Builtins reached through a caller_macro_id chain,
-  /// through incomplete macro metadata, or through missing token-map proof are
-  /// producer-backed observer facts.  The final observer model now consumes that
-  /// producer evidence directly, so this predicate is retained only to describe
-  /// the demand source in traces and audits.
-  bool LineStateBuiltinInvocationNeedsProducerBackedFinalObserver(
+  /// through incomplete macro metadata, or through missing token-map proof need
+  /// model-backed line-state demand.  Phase 6F no longer lowers this into a
+  /// separate final observer scanner; it is construction metadata for deciding
+  /// whether a synthetic #line obligation should be emitted.
+  bool LineStateBuiltinInvocationNeedsModelBackedLineStateDemand(
       const RefoldModel::MacroInvocation &macro) const;
 
   /// Describes which components of the logical location are observed by
@@ -8307,15 +8831,13 @@ private:
     bool needsFile = false;
     bool needsFileName = false;
 
-    // True when at least one demand witness is represented by producer-backed
-    // final observer evidence rather than direct lexical final-source spelling.
-    // This is no longer a pruning veto: Step #3 made those observers visible to
-    // the final liveness model, and Step #6 fail-closes any deletion whose
-    // executable clang -E -P validation cannot be run or does not match.
-    bool hasProducerBackedFinalObserver = false;
+    // True when at least one demand witness needs model metadata rather than
+    // direct lexical final-source spelling.  This is construction metadata for
+    // producing a repair obligation, not a late pruning veto.
+    bool hasModelBackedLineStateDemand = false;
 
     bool Any() const { return needsLine || needsFile || needsFileName; }
-    bool PrunableByCurrentFinalObserverModel() const { return Any(); }
+    bool PrunableByCompactFinalLineControl() const { return Any(); }
   };
 
   /// \brief Return true iff a source-authored line-control directive in the
@@ -8714,55 +9236,6 @@ private:
   /// \param b Second path.
   /// \returns `true` if canonical paths are equal; `false` otherwise.
   bool PathsEqual(StringRef a, StringRef b) const;
-
-  // ---------------------- Diagnostics & Debug Utilities ----------------------
-
-  /// \brief Emits a detailed TRACE log line describing how a given hunk maps
-  /// into an include's token/byte space.
-  ///
-  /// This method is purely diagnostic. It computes:
-  /// - A-side byte interval for the hunk using aTokOff (token start offsets in
-  ///   aSource)
-  /// - B-side byte interval for the hunk using bTokOff (token start offsets in
-  ///   bSource)
-  /// - Clipped source slices for both sides (escaped and whitespace-visualized)
-  ///   and logs a single structured line under "include/patch".
-  ///
-  /// The log payload is designed to make it straightforward to validate that
-  /// include-owned edits are using the correct token indices, byte ranges, and
-  /// local context, especially for boundary insertions and for hunks that are
-  /// fully inside header-owned regions.
-  ///
-  /// \param tag a short tag describing the call site / phase (e.g., "before",
-  ///        "after", "emit")
-  /// \param inc the include item that is expected to own the hunk
-  /// \param h the diff hunk being examined (A token range and B token range)
-  void DebugIncludePatch(StringRef tag, const RefoldModel::IncludeItem &inc,
-                         const diffutils::Hunk &h) const;
-
-  /// \brief Serializes a single macro argument span into a diagnostic string
-  /// format.
-  ///
-  /// The output string follows the pattern:
-  /// `{kind=K, A=[begin,end), argIdx=I, [occ=STRINGIFY], [byte=[bBegin,bEnd)]}`
-  ///
-  /// \param sp The span metadata to serialize.
-  /// \param isStringifyOcc Whether this occurrence was produced by a `#`
-  ///                       operator.
-  /// \returns A formatted string representation of the span.
-  static std::string PPArgSpanToString(const RefoldModel::PPArgSpan &sp,
-                                       bool isStringifyOcc);
-
-  /// \brief Serializes a list of macro argument spans into a comma-separated
-  /// bracketed list.
-  ///
-  /// \param spans The list of spans to serialize.
-  /// \param isStringify A parallel array indicating which spans are
-  ///                    stringification occurrences.
-  /// \returns A formatted string representation such as `[{...}, {...}]`.
-  static std::string
-  PPArgSpanListToString(ArrayRef<RefoldModel::PPArgSpan> spans,
-                        ArrayRef<char> isStringify);
 
 };
 

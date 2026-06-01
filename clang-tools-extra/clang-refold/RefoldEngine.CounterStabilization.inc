@@ -127,7 +127,7 @@ RefoldEngine::CollectCounterOccurrences(StringRef tuPath) const {
 
     // Finally fall back to the producer cover.  Phase 8f classifies the
     // former zero-length fallback-cover path as ordinary counter-state
-    // stabilization: a zero-width cover is not a byte-rescue fallback, it is a
+    // stabilization: a zero-width cover is not a byte-recovery fallback, it is a
     // producer anchor for the concrete counter literal token.  Normalize it
     // through addOcc() so the same one-token widening used for body/spans also
     // applies to fallback covers.

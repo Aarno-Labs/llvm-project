@@ -516,14 +516,7 @@ static bool buildBoundaryPureCertifiedMap(
 
   // Defensive monotonicity cleanup: individual admissibility is local to a
   // token pair, so suppress any rare crossing anchors before hunk construction.
-  const size_t suppressedForcedAnchors =
-      suppressOrderConflictingAnchors(outMap);
-  if (suppressedForcedAnchors != 0) {
-    trace("lcs/map",
-          "suppressed {0} order-conflicting individually-admissible anchors "
-          "from forced core map",
-          suppressedForcedAnchors);
-  }
+  suppressOrderConflictingAnchors(outMap);
 
   // Return true when a matching A/B token pair can serve as an ambiguous edge
   // anchor: it must be core-admissible, but not already a unique one-to-one
@@ -591,8 +584,6 @@ static bool buildBoundaryPureCertifiedMap(
   // edges by restoring ambiguous equal-token anchors when the resulting
   // frontier is uniquely certified as a boundary-preserving pure insertion.
   const std::vector<Hunk> forcedHunks = hunksFromMap(outMap, n, m);
-  size_t normalizedHunks = 0;
-  size_t ambiguousHunks = 0;
   for (const Hunk &forced : forcedHunks) {
     const uint64_t maxSharedWidth =
         std::min(hunkAWidth(forced), hunkBWidth(forced));
@@ -731,17 +722,9 @@ static bool buildBoundaryPureCertifiedMap(
       if (!haveSuffixBest)
         continue;
       if (suffixBestCount != 1) {
-        ++ambiguousHunks;
         continue;
       }
 
-      trace("lcs/map",
-            "certified suffix-insertion frontier: hunk=A[{0},{1})/B[{2},{3}) "
-            "left={4} anchor=A{5}->B{6} right={7} boundaryRank={8} "
-            "bPairRank={9}",
-            forced.aStart, forced.aEnd, forced.bStart, forced.bEnd,
-            suffixBest.left, suffixBest.anchorA, suffixBest.anchorB,
-            suffixBest.right, suffixBest.boundaryRank, suffixBest.bPairRank);
 
       // Commit only the anchors proven by the suffix-insertion certificate:
       // unchanged prefix anchors, the moved internal anchor, and unchanged
@@ -758,12 +741,10 @@ static bool buildBoundaryPureCertifiedMap(
             static_cast<int64_t>(forced.bEnd - suffixBest.right + off);
       }
 
-      ++normalizedHunks;
       continue;
     }
 
     if (bestCount != 1) {
-      ++ambiguousHunks;
       continue;
     }
 
@@ -777,7 +758,6 @@ static bool buildBoundaryPureCertifiedMap(
       outMap[static_cast<size_t>(forced.aEnd - best.right + off)] =
           static_cast<int64_t>(forced.bEnd - best.right + off);
     }
-    ++normalizedHunks;
   }
 
   // The final map must remain a strict A→B monotone alignment. If an edge
@@ -789,10 +769,6 @@ static bool buildBoundaryPureCertifiedMap(
     if (bj < 0)
       continue;
     if (bj <= previousB) {
-      trace("lcs/map",
-            "certified boundary-pure map lost monotonicity at A={0} B={1} "
-            "after previous B={2}; returning ambiguity-suppressed map",
-            ai, bj, previousB);
 
       // Rebuild the fallback map from only unique one-to-one token partners.
       // This intentionally drops every ambiguity-restored edge and keeps only
@@ -810,23 +786,12 @@ static bool buildBoundaryPureCertifiedMap(
 
       // Even the unique-partner fallback must be order-clean before it leaves
       // this function.
-      const size_t suppressedFallbackAnchors =
-          suppressOrderConflictingAnchors(outMap);
-      if (suppressedFallbackAnchors != 0) {
-        trace("lcs/map",
-              "suppressed {0} order-conflicting anchors while falling back "
-              "to ambiguity-suppressed core map",
-              suppressedFallbackAnchors);
-      }
+      suppressOrderConflictingAnchors(outMap);
       return true;
     }
     previousB = bj;
   }
 
-  trace("lcs/map",
-        "certified boundary-pure map: forcedHunks={0} normalizedHunks={1} "
-        "ambiguousNormalizationHunks={2}",
-        forcedHunks.size(), normalizedHunks, ambiguousHunks);
   return true;
 }
 

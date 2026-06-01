@@ -2,10 +2,12 @@
 //
 // Final-stream line-control proof scaffolding for clang-refold.
 //
-// This module provides the stable data carriers used by the final-stream
-// pruner: directives, preserved observers, physical layout obligations,
-// logical line/file simulation over the final output stream, observer/layout
-// liveness summaries, and the fail-closed fixed-point pruning boundary.
+// Phase 6F makes compact final-line-control proofs, plus executable
+// validation, the pruning authority.  The old observer/layout/physical-line
+// scanner has been removed from this interface: generation sites now carry the
+// typed obligation that explains why a directive exists, while the fixed-point
+// pruner discharges physical deletion only when validation proves that removing
+// that exact final-stream range preserves the accepted preprocessed output.
 //
 //===----------------------------------------------------------------------===//
 
@@ -44,16 +46,12 @@ struct FinalLineControlOwnerKey {
         ownerIncludeId(ownerIncludeId) {}
 };
 
-
 /// Byte-accurate mapping from a final-output slice back to the physical source
 /// bytes it copied verbatim.
 ///
-/// This is intentionally separate from materialized B edit mappings.  It is
-/// used only by the final line-control scanner to prove that a `#line` directive
-/// in the final stream corresponds to a producer-recorded source directive at a
-/// specific physical source byte range.  Synthetic directives and replayed B
-/// payloads do not receive source mappings unless a caller can prove such a
-/// byte-for-byte source correspondence.
+/// Source mappings are still maintained by the engine so downstream materialized
+/// ranges can be shifted deterministically after a deletion.  They no longer
+/// feed a final-stream observer/layout scanner.
 struct FinalLineControlSourceMapping {
   uint64_t finalBegin = 0;
   uint64_t finalEnd = 0;
@@ -63,155 +61,19 @@ struct FinalLineControlSourceMapping {
   std::optional<uint64_t> ownerIncludeId = std::nullopt;
 };
 
-
 /// Canonicalize final-to-source mapping records in deterministic final-byte
 /// order.
-///
-/// Adjacent records are merged only when both the final byte range and the
-/// physical source byte range are contiguous in the same owner domain.  This
-/// preserves exact byte-for-byte provenance across internal copy-slice
-/// boundaries without inventing provenance across synthetic or materialized
-/// gaps.
 void CanonicalizeFinalLineControlSourceMappings(
     std::vector<FinalLineControlSourceMapping> &mappings);
 
 /// Adjust final-to-source mapping records after deleting a final-output byte
 /// range.
-///
-/// Mappings after the deletion are shifted left.  Mappings strictly containing
-/// the deleted range are split into surviving prefix/suffix records, so a
-/// removed source-authored #line does not destroy provenance for neighboring
-/// copied bytes.  Any mapping portion overlapping the deleted bytes is discarded
-/// fail-closed.
 void AdjustFinalLineControlSourceMappingsAfterDeletion(
     std::vector<FinalLineControlSourceMapping> &mappings, uint64_t removedBegin,
     uint64_t removedEnd);
 
-/// Producer-recorded active source line-control event, lowered into the final
-/// scanner's standalone model types.
-///
-/// These records are trusted only when `producerProven` is true and an exact
-/// final-to-source byte mapping proves that the final directive bytes correspond
-/// to the recorded physical source directive site.  They let the scanner use
-/// Clang's already-evaluated `#line` effect for macro-expanded operands without
-/// re-parsing expressions or evaluating preprocessor conditionals.
-struct FinalLineControlProducerEvent {
-  std::string physicalFile;
-  std::optional<uint64_t> siteBegin = std::nullopt;
-  std::optional<uint64_t> siteEnd = std::nullopt;
-  bool active = false;
-  bool producerProven = false;
-  uint64_t logicalLineAfter = 0;
-  std::string logicalFileAfter;
-  std::optional<uint64_t> ownerIncludeId = std::nullopt;
-  std::string text;
-};
-
-/// Whether the final-stream scanner can prove that a line-control directive is
-/// executed by the final source stream.
-///
-/// Chunk 2 deliberately does not evaluate conditional expressions.  Literal
-/// top-level line-control directives are known-active.  Literal directives that
-/// appear inside an unresolved conditional region are activity-unknown unless a
-/// later producer/model event proves them.
-enum class FinalLineDirectiveActivity : uint8_t {
-  Unknown,
-  KnownInactive,
-  KnownActive,
-};
-
-
-/// Where the logical state associated with a final directive came from.
-///
-/// `LiteralFinalSource` means the scanner parsed a direct literal line-control
-/// spelling in the final emitted source.  It does not imply producer/model
-/// proof about a source-authored directive under arbitrary conditional control.
-enum class FinalLineDirectiveSemanticSource : uint8_t {
-  Unknown,
-  LiteralFinalSource,
-  ProducerModel,
-};
-
-
-/// The scanner's conservative classification of one final physical source line.
-enum class FinalPhysicalLineKind : uint8_t {
-  Blank,
-  CommentOnly,
-  Ordinary,
-  OtherDirective,
-  ConditionalDirective,
-  LineDirective,
-  Unknown,
-};
-
-
-/// Logical preprocessor line/file state at a point in the final source stream.
-///
-/// `logicalLine` is meaningful only when `lineKnown` is true.  `logicalFile` is
-/// meaningful only when `fileKnown` is true.  The initial file is intentionally
-/// unknown in this chunk because the final pruner must ultimately receive it
-/// from the engine/model boundary rather than guess it from the emitted bytes.
-struct FinalLogicalState {
-  bool lineKnown = true;
-  uint64_t logicalLine = 1;
-  bool fileKnown = false;
-  std::string logicalFile;
-
-  static FinalLogicalState Initial() { return FinalLogicalState(); }
-
-  void AdvancePhysicalLine() {
-    if (lineKnown)
-      ++logicalLine;
-  }
-
-  void ApplyKnownLineDirective(uint64_t nextLogicalLine,
-                               std::optional<std::string> nextLogicalFile) {
-    lineKnown = true;
-    logicalLine = nextLogicalLine;
-    if (nextLogicalFile) {
-      fileKnown = true;
-      logicalFile = std::move(*nextLogicalFile);
-    }
-  }
-
-  void MarkLineUnknown() { lineKnown = false; }
-  void MarkFileUnknown() { fileKnown = false; }
-  void MarkUnknown() {
-    MarkLineUnknown();
-    MarkFileUnknown();
-  }
-};
-
-/// One final physical source line with the scanner's pre-line logical state.
-struct FinalPhysicalLine {
-  uint64_t finalBegin = 0;
-  uint64_t finalEnd = 0;
-  uint64_t physicalLine = 1;
-  FinalPhysicalLineKind kind = FinalPhysicalLineKind::Unknown;
-  FinalLogicalState stateBefore;
-  uint32_t conditionalDepthBefore = 0;
-  uint32_t conditionalDepthAfter = 0;
-  std::optional<size_t> directiveIndex = std::nullopt;
-
-  /// Directive identifier spelling for preprocessing-directive physical lines.
-  ///
-  /// For continuation lines this is the identifier from the directive that owns
-  /// the continuation.  The layout proof uses this only to distinguish
-  /// directive lines that are known zero-token material, such as `#define`,
-  /// from directives whose -E -P effect is not locally modeled, such as
-  /// `#include` or `#pragma`.
-  std::string directiveName;
-
-  std::string rawText;
-};
-
 /// One `#line` / line-control directive that exists in the final emitted C
-/// stream.
-///
-/// Offsets are final-output byte offsets using the engine-wide half-open
-/// convention.  `line` and `file` are optional because the final scanner can
-/// only fill them for literal/proven line-control events.  Unknown line-control
-/// stays fail-closed and is never made removable by this chunk.
+/// stream, identified by the construction site that produced it.
 struct FinalLineDirective {
   enum class Origin : uint8_t {
     PreservedSource,
@@ -223,365 +85,218 @@ struct FinalLineDirective {
     SyntheticLayoutBarrier,
     Unknown,
   };
+};
 
-  uint64_t finalBegin = 0;
-  uint64_t finalEnd = 0;
-  Origin origin = Origin::Unknown;
-  std::optional<uint64_t> line = std::nullopt;
-  std::optional<std::string> file = std::nullopt;
+/// Return a stable diagnostic spelling for a final-line-control directive
+/// origin.
+const char *toString(FinalLineDirective::Origin origin);
+
+/// Why a final line-control directive was emitted.
+///
+/// This is intentionally not a deletion proof.  A directive can have a valid
+/// semantic obligation and still be required in the final stream.
+enum class FinalLineControlObligation : uint8_t {
+  SourceStateRepair,
+  IncludeReturnRepair,
+  TUPrologueRepair,
+  HeaderResumeRepair,
+  LayoutBoundaryRepair,
+  BuiltinObserverLive,
+  CosmeticSyntheticResync,
+  DominatedSyntheticDirective,
+};
+
+const char *toString(FinalLineControlObligation obligation);
+
+/// Whether deletion of an exact final-stream directive has been discharged.
+///
+/// `NotProven` is the fail-closed default.  During Phase 6F the pruner may turn
+/// a validation-accepted candidate into `Removable`, but deletion is never
+/// performed solely because an obligation exists.
+enum class FinalLineControlRemovalVerdict : uint8_t {
+  NotProven,
+  Removable,
+  Required,
+};
+
+const char *toString(FinalLineControlRemovalVerdict verdict);
+
+/// The theorem class that discharged physical deletion of a directive.
+///
+/// The legacy observer/layout discharges remain as historical diagnostic values
+/// for already-created artifacts, but Phase 6F uses
+/// `ValidationPreservedEquivalence` as the live authority: after a typed
+/// obligation admits the candidate, executable validation proves the exact
+/// deletion preserves the accepted `-E -P` output.
+enum class FinalLineControlRemovalDischarge : uint8_t {
+  None,
+  ObserverAndLayoutDead,
+  SyntheticIncludeEntryDominated,
+  SyntheticNewlineResyncStaleBeforeInclude,
+  SyntheticTUPrologueDominatedByRepair,
+  ValidationPreservedEquivalence,
+};
+
+const char *toString(FinalLineControlRemovalDischarge discharge);
+
+/// Compact proof/provenance record for why a final-stream line-control
+/// directive exists.
+struct FinalLineControlObligationProof {
+  FinalLineControlObligation obligation =
+      FinalLineControlObligation::DominatedSyntheticDirective;
+  FinalLineDirective::Origin origin = FinalLineDirective::Origin::Unknown;
   std::optional<FinalLineControlOwnerKey> physicalOwner = std::nullopt;
   bool producerProven = false;
-  bool removable = false;
-  FinalLineDirectiveActivity activity = FinalLineDirectiveActivity::Unknown;
-  FinalLineDirectiveSemanticSource semanticSource =
-      FinalLineDirectiveSemanticSource::Unknown;
-  bool semanticsKnown = false;
-  FinalLineDirective() = default;
-
-  FinalLineDirective(uint64_t finalBegin, uint64_t finalEnd, Origin origin)
-      : finalBegin(finalBegin), finalEnd(finalEnd), origin(origin) {}
 };
 
-
-/// Whether a final-stream observer candidate is known to be executed.
-///
-/// Chunk 3 records direct source-spelled observer candidates passively.  It does
-/// not evaluate conditional expressions; candidates inside unresolved
-/// conditional regions are therefore activity-unknown until producer/model
-/// evidence proves the selected arm.
-enum class FinalObserverActivity : uint8_t {
-  Unknown,
-  KnownInactive,
-  KnownActive,
-};
-
-
-/// A preserved final-stream builtin occurrence whose observed value constrains
-/// line-control pruning.
-struct FinalObserver {
-  enum class Kind : uint8_t { Line, File, FileName };
-
-  uint64_t finalOffset = 0;
-  uint64_t finalEnd = 0;
-  uint64_t physicalLine = 1;
-  Kind kind = Kind::Line;
+/// Compact proof/provenance record for whether a final-stream line-control
+/// directive may be physically deleted.
+struct FinalLineControlRemovalProof {
+  FinalLineControlRemovalVerdict verdict =
+      FinalLineControlRemovalVerdict::NotProven;
+  FinalLineDirective::Origin origin = FinalLineDirective::Origin::Unknown;
+  FinalLineControlRemovalDischarge discharge =
+      FinalLineControlRemovalDischarge::None;
   std::optional<FinalLineControlOwnerKey> physicalOwner = std::nullopt;
-  FinalObserverActivity activity = FinalObserverActivity::Unknown;
   bool producerProven = false;
-  bool spellingPreserved = false;
-  FinalLogicalState stateBefore;
 };
 
+bool SameFinalLineControlOwner(
+    const std::optional<FinalLineControlOwnerKey> &lhs,
+    const std::optional<FinalLineControlOwnerKey> &rhs);
 
-/// Producer/model-backed final-stream observer at a macro expansion site.
+bool SameFinalLineControlObligationProof(
+    const std::optional<FinalLineControlObligationProof> &lhs,
+    const std::optional<FinalLineControlObligationProof> &rhs);
+
+bool SameFinalLineControlRemovalProof(
+    const std::optional<FinalLineControlRemovalProof> &lhs,
+    const std::optional<FinalLineControlRemovalProof> &rhs);
+
+FinalLineControlObligationProof MakeFinalLineControlObligationProof(
+    FinalLineControlObligation obligation, FinalLineDirective::Origin origin,
+    std::optional<FinalLineControlOwnerKey> physicalOwner, bool producerProven);
+
+FinalLineControlRemovalProof MakeFinalLineControlRemovalProof(
+    FinalLineControlRemovalVerdict verdict, FinalLineDirective::Origin origin,
+    std::optional<FinalLineControlOwnerKey> physicalOwner, bool producerProven,
+    FinalLineControlRemovalDischarge discharge =
+        FinalLineControlRemovalDischarge::None);
+
+/// Explicit final-line-control pruning candidate.
 ///
-/// The producer records predefined builtin macro invocations such as
-/// `__LINE__`, `__FILE__`, and `__FILE_NAME__` in macro-expansion space.  When
-/// such a builtin is reached through wrapper macros, the final source may
-/// preserve the direct builtin spelling, an intermediate wrapper, or the
-/// outermost callsite.  Each record describes one observable expansion site in
-/// physical source bytes.  The final scanner adds the observer only when the
-/// final emitted bytes map exactly back to that site, so materialized or
-/// rewritten expansions do not become false liveness witnesses.
-struct FinalLineControlProducerObserver {
-  FinalObserver::Kind kind = FinalObserver::Kind::Line;
-  std::string physicalFile;
-  uint64_t sourceBegin = 0;
-  uint64_t sourceEnd = 0;
-  std::optional<uint64_t> ownerIncludeId = std::nullopt;
-  bool active = false;
-  bool producerProven = false;
-  std::string text;
-};
-
-/// Logical-location component controlled by a final-stream line-control
-/// directive and observed by preserved location builtins.
-///
-/// Observer liveness is intentionally component-wise: a directive can be dead
-/// for `__LINE__` while still live for `__FILE__` / `__FILE_NAME__`, or vice
-/// versa.  The final pruner must therefore reason about line, file, and
-/// basename/file-name state independently.
-enum class FinalLineObserverComponent : uint8_t {
-  Line,
-  File,
-  FileName,
-};
-
-
-/// Observer-only liveness proof summary for one final-stream line-control
-/// directive.
-///
-/// This is not the final pruning verdict.  Chunk 4 proves whether a directive
-/// is live with respect to preserved logical-location observers and whether it
-/// is observer-dead after component dominance.  A later layout pass must still
-/// decide whether an observer-dead directive is required as an `-E -P` physical
-/// layout barrier before any emitted bytes may be removed.
-struct FinalLineDirectiveObserverLiveness {
-  size_t directiveIndex = 0;
-  uint64_t finalBegin = 0;
-  uint64_t finalEnd = 0;
-
-  bool lineLive = false;
-  bool fileLive = false;
-  bool fileNameLive = false;
-
-  bool lineUnknownDependence = false;
-  bool fileUnknownDependence = false;
-  bool fileNameUnknownDependence = false;
-
-  /// True iff the directive has no proven observer liveness and no unknown
-  /// observer/dominance dependency.  This says only "dead with respect to
-  /// observer obligations"; it deliberately does not say layout-dead.
-  bool observerDead = false;
-
-  /// True iff observer analysis would permit dropping this directive once a
-  /// separate layout proof also proves that no physical-layout obligation keeps
-  /// it live.
-  bool removableIfLayoutDead = false;
-
-
-  bool HasObserverLiveComponent() const {
-    return lineLive || fileLive || fileNameLive;
-  }
-
-  bool HasUnknownDependence() const {
-    return lineUnknownDependence || fileUnknownDependence ||
-           fileNameUnknownDependence;
-  }
-};
-
-class FinalLineControlModel;
-
-/// Compute deterministic observer/dominance liveness for the final-stream
-/// directives already present in \p model.
-///
-/// This pass never rewrites the output.  It only proves component liveness or
-/// observer-deadness so later chunks can combine it with layout liveness before
-/// performing final fixed-point pruning.
-std::vector<FinalLineDirectiveObserverLiveness>
-ComputeFinalObserverLiveness(const FinalLineControlModel &model);
-
-/// A final-stream physical-layout obligation that may keep a `#line` directive
-/// live even when no preserved logical-location builtin observes it.
-struct FinalLayoutObligation {
-  enum class Kind : uint8_t {
-    ZeroTokenPrefixBarrier,
-    ZeroTokenGapBarrier,
-    FirstVisibleTokenAlignment,
-    BlankLinePreservation,
-  };
-
-  uint64_t finalOffset = 0;
-  Kind kind = Kind::ZeroTokenPrefixBarrier;
-
-  /// The directive currently discharging this obligation in the final stream,
-  /// when the scanner can identify one deterministically.  Unknown or
-  /// ambiguous layout dependencies remain fail-closed in the layout-liveness
-  /// pass instead of being attached to a guessed directive.
-  std::optional<size_t> directiveIndex = std::nullopt;
-
-  std::optional<FinalLineControlOwnerKey> physicalOwner = std::nullopt;
-};
-
-
-/// Layout-only liveness proof summary for one final-stream line-control
-/// directive.
-///
-/// This is intentionally separate from observer liveness.  A directive that is
-/// dead for `__LINE__` / `__FILE__` / `__FILE_NAME__` may still be needed as a
-/// physical-layout barrier under `-E -P`, especially around zero-token prefix
-/// material, directive/comment-only gaps, and first visible token alignment.
-struct FinalLineDirectiveLayoutLiveness {
-  size_t directiveIndex = 0;
-  uint64_t finalBegin = 0;
-  uint64_t finalEnd = 0;
-
-  bool zeroTokenPrefixBarrierLive = false;
-  bool zeroTokenGapBarrierLive = false;
-  bool firstVisibleTokenAlignmentLive = false;
-  bool blankLinePreservationLive = false;
-
-  /// True when final-stream layout may depend on this directive, but the
-  /// current scanner cannot prove the obligation precisely.  Future pruning
-  /// must treat this as live/fail-closed.
-  bool layoutUnknownDependence = false;
-
-  /// True iff no final layout obligation and no unknown layout dependency keeps
-  /// this directive live.  This is not a pruning verdict by itself; the fixed
-  /// point pruner must combine it with observer liveness.
-  bool layoutDead = false;
-
-  /// True iff layout analysis would permit dropping this directive once the
-  /// observer proof also says it is observer-dead.
-  bool removableIfObserverDead = false;
-
-
-  bool HasLayoutLiveComponent() const {
-    return zeroTokenPrefixBarrierLive || zeroTokenGapBarrierLive ||
-           firstVisibleTokenAlignmentLive || blankLinePreservationLive;
-  }
-};
-
-/// Compute deterministic layout liveness for final-stream line-control
-/// directives.
-///
-/// This pass never rewrites output.  It identifies the line directives that
-/// currently discharge final-stream zero-token layout obligations and marks
-/// uncertain dependencies fail-closed so later pruning cannot remove through an
-/// unproved `-E -P` blank-line interaction.
-std::vector<FinalLineDirectiveLayoutLiveness>
-ComputeFinalLayoutLiveness(const FinalLineControlModel &model);
-
-
-/// A final-stream line-control directive that a conservative emitter has
-/// explicitly made eligible for fixed-point pruning.
-///
-/// Scanning a literal `#line` directive proves its syntax/state, but not that
-/// deleting it is safe in the presence of producer-only macro expansion
-/// observers.  This candidate record is therefore the explicit bridge from
-/// candidate-generation code to the physical pruning pass.  Candidates match
-/// scanned directives by exact final byte range.
+/// The byte range is always in the current final-output coordinate space.  A
+/// candidate must carry both compact proof records; otherwise the pruner fails
+/// closed and leaves the directive intact.
 struct FinalLineControlPruneCandidate {
   uint64_t finalBegin = 0;
   uint64_t finalEnd = 0;
   FinalLineDirective::Origin origin = FinalLineDirective::Origin::Unknown;
   std::optional<FinalLineControlOwnerKey> physicalOwner = std::nullopt;
   bool producerProven = false;
+  std::optional<FinalLineControlObligationProof> obligationProof = std::nullopt;
+  std::optional<FinalLineControlRemovalProof> removalProof = std::nullopt;
 };
 
+FinalLineControlPruneCandidate MakeFinalLineControlPruneCandidate(
+    uint64_t finalBegin, uint64_t finalEnd,
+    FinalLineDirective::Origin origin,
+    std::optional<FinalLineControlOwnerKey> physicalOwner, bool producerProven,
+    FinalLineControlObligation obligation,
+    FinalLineControlRemovalVerdict removalVerdict =
+        FinalLineControlRemovalVerdict::NotProven);
 
-/// Byte range removed by deterministic final-stream line-control pruning.
-///
-/// The range is recorded in the pre-deletion coordinate space for the
-/// fixed-point iteration that removed it.  RefoldEngine uses these ranges only
-/// to update downstream source/mapping coordinates after the pruner accepts a
-/// validated deletion.
+bool HasCompleteFinalLineControlProof(
+    const FinalLineControlPruneCandidate &candidate);
+
+bool FinalLineControlProofProvesRemovable(
+    const FinalLineControlPruneCandidate &candidate);
+
+/// Removed final-output range.  Ranges are reported in the coordinate space that
+/// existed when the deletion was performed, matching the engine's existing
+/// source-mapping adjustment convention.
 struct FinalLineControlRemovedRange {
   uint64_t finalBegin = 0;
   uint64_t finalEnd = 0;
 };
 
-/// Result of deterministic final-stream fixed-point line-control pruning.
+/// Phase-6F authority contract.
+///
+/// The legacy observer/layout scanner is no longer authoritative.  Deletion is
+/// driven by compact obligations, fixed-point candidate ordering, and executable
+/// validation of the exact candidate deletion.
+struct FinalLineControlAuthorityContract {
+  bool compactRemovalProofIsAuthoritative = true;
+  bool fixedPointPruningIsAuthoritative = true;
+  bool validationCallbackIsAuthoritative = true;
+
+  bool IsClosedUnderCompactProofs() const {
+    return compactRemovalProofIsAuthoritative &&
+           fixedPointPruningIsAuthoritative &&
+           validationCallbackIsAuthoritative;
+  }
+};
+
+FinalLineControlAuthorityContract GetFinalLineControlAuthorityContract();
+
+/// Diagnostic comparison record retained for opt-in audit output.
+///
+/// After 6F there is no old scanner to compare against.  `oldModelRemovable` is
+/// therefore interpreted as "validation accepted this exact deletion", and
+/// `proofRemovable` means the compact proof was discharged to Removable for the
+/// same deletion.
+struct FinalLineControlShadowAuditMismatch {
+  uint64_t finalBegin = 0;
+  uint64_t finalEnd = 0;
+  FinalLineDirective::Origin origin = FinalLineDirective::Origin::Unknown;
+  bool oldModelRemovable = false;
+  bool proofRemovable = false;
+  bool hasRemovalProof = false;
+  std::optional<FinalLineControlObligation> obligation = std::nullopt;
+  std::optional<FinalLineControlRemovalVerdict> removalVerdict = std::nullopt;
+};
+
+struct FinalLineControlShadowAuditResult {
+  bool enabled = false;
+  uint64_t comparisons = 0;
+  uint64_t matches = 0;
+  uint64_t mismatches = 0;
+  uint64_t missingProofs = 0;
+  uint64_t oldOnly = 0;
+  uint64_t proofOnly = 0;
+  std::vector<FinalLineControlShadowAuditMismatch> mismatchSamples;
+
+  bool Equivalent() const { return mismatches == 0 && missingProofs == 0; }
+};
+
 struct FinalLineControlPruneResult {
   std::string output;
   uint32_t iterations = 0;
   bool changed = false;
   std::vector<FinalLineControlRemovedRange> removedRanges;
+  FinalLineControlAuthorityContract authority;
+  FinalLineControlShadowAuditResult shadowAudit;
 };
 
 /// Optional executable oracle for a proposed final-stream #line deletion.
-///
-/// The callback compares the current accepted emitted source against a
-/// candidate source with one directive removed, normally by preprocessing both
-/// through the same `clang -E -P` context.  Returning false rejects the
-/// deletion fail-closed; `reason` should describe preprocessing failure,
-/// unavailable context, or an output mismatch for trace diagnostics.
 using FinalLineControlValidationCallback = std::function<bool(
     llvm::StringRef currentOutput, llvm::StringRef candidateOutput,
     std::string &reason)>;
 
-/// Run deterministic fixed-point pruning over final-stream line-control
-/// directives.
+/// Run deterministic fixed-point pruning over explicit final-stream
+/// line-control candidates.
 ///
-/// This is the first physical rewrite boundary for the final minimizer, but it
-/// is intentionally fail-closed: a directive is eligible only when it has been
-/// explicitly marked as a removable candidate and the current fixed-point
-/// iteration proves it both observer-dead and layout-dead.  The pass removes at
-/// most one directive per iteration, in stable final-offset order, then rescans
-/// the composed source.  This implements the canonical dominance law that
-/// earlier dominated directives are removed before later directives are
-/// reconsidered.
-FinalLineControlPruneResult
-PruneFinalLineControlDirectives(
+/// Phase 6F deletes the passive final observer/layout scanner.  A candidate is
+/// attempted only when it carries both compact proof records, has a stable
+/// current byte range, and is not explicitly Required.  The pass removes at most
+/// one validation-accepted directive per iteration, then shifts the remaining
+/// candidate ranges and starts over.
+FinalLineControlPruneResult PruneFinalLineControlDirectives(
     llvm::StringRef finalSource,
     llvm::ArrayRef<FinalLineControlPruneCandidate> removableCandidates =
         llvm::ArrayRef<FinalLineControlPruneCandidate>(),
-    llvm::ArrayRef<FinalLineControlSourceMapping> sourceMappings =
-        llvm::ArrayRef<FinalLineControlSourceMapping>(),
-    llvm::ArrayRef<FinalLineControlProducerEvent> producerEvents =
-        llvm::ArrayRef<FinalLineControlProducerEvent>(),
-    llvm::ArrayRef<FinalLineControlProducerObserver> producerObservers =
-        llvm::ArrayRef<FinalLineControlProducerObserver>(),
     FinalLineControlValidationCallback validationCallback =
         FinalLineControlValidationCallback());
-
-
-/// Passive final-stream line-control fact collection.
-///
-/// This container is deliberately behavior-free: adding facts never changes the
-/// emitted source.  The fixed-point pruner consumes this model to prove
-/// liveness; Chunks 1-5 use it for trace visibility and as the shared data
-/// boundary, while Chunk 6 rewrites only directives that are explicit removable
-/// candidates.  Observer-liveness summaries are computed from this model but
-/// are not cached here so the model remains a direct representation of the
-/// scanned final stream.
-class FinalLineControlModel {
-public:
-  size_t AddDirective(FinalLineDirective directive) {
-    directives_.push_back(std::move(directive));
-    return directives_.size() - 1;
-  }
-
-  void AddObserver(FinalObserver observer) {
-    observers_.push_back(std::move(observer));
-  }
-
-  void AddLayoutObligation(FinalLayoutObligation obligation) {
-    layoutObligations_.push_back(std::move(obligation));
-  }
-
-  void AddPhysicalLine(FinalPhysicalLine line) {
-    physicalLines_.push_back(std::move(line));
-  }
-
-  void AddSourceMapping(FinalLineControlSourceMapping mapping) {
-    sourceMappings_.push_back(std::move(mapping));
-  }
-
-  llvm::ArrayRef<FinalLineDirective> Directives() const { return directives_; }
-  llvm::ArrayRef<FinalObserver> Observers() const { return observers_; }
-  llvm::ArrayRef<FinalLayoutObligation> LayoutObligations() const {
-    return layoutObligations_;
-  }
-  llvm::ArrayRef<FinalPhysicalLine> PhysicalLines() const {
-    return physicalLines_;
-  }
-  llvm::ArrayRef<FinalLineControlSourceMapping> SourceMappings() const {
-    return sourceMappings_;
-  }
-
-  bool Empty() const {
-    return directives_.empty() && observers_.empty() &&
-           layoutObligations_.empty() && sourceMappings_.empty();
-  }
-
-private:
-  std::vector<FinalLineDirective> directives_;
-  std::vector<FinalObserver> observers_;
-  std::vector<FinalLayoutObligation> layoutObligations_;
-  std::vector<FinalPhysicalLine> physicalLines_;
-  std::vector<FinalLineControlSourceMapping> sourceMappings_;
-};
-
-/// Build a passive final-stream model by scanning \p finalSource linearly.
-///
-/// Literal top-level line-control directives are parsed and simulated.  Direct
-/// source-spelled `__LINE__`, `__FILE__`, and `__FILE_NAME__` tokens in ordinary
-/// final source lines are recorded as observer candidates.  Unknown
-/// line-control, conditional observer activity, and model-only macro expansion
-/// observers are kept fail-closed for later chunks.  This function does not
-/// prune or rewrite the output.
-FinalLineControlModel CollectFinalLineControlModel(
-    llvm::StringRef finalSource,
-    llvm::ArrayRef<FinalLineControlPruneCandidate> removableCandidates =
-        llvm::ArrayRef<FinalLineControlPruneCandidate>(),
-    llvm::ArrayRef<FinalLineControlSourceMapping> sourceMappings =
-        llvm::ArrayRef<FinalLineControlSourceMapping>(),
-    llvm::ArrayRef<FinalLineControlProducerEvent> producerEvents =
-        llvm::ArrayRef<FinalLineControlProducerEvent>(),
-    llvm::ArrayRef<FinalLineControlProducerObserver> producerObservers =
-        llvm::ArrayRef<FinalLineControlProducerObserver>());
-
 
 } // namespace refold
 } // namespace clang

@@ -1410,9 +1410,6 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
   size_t replNl = stringutils::countNewlines(replacement);
 
   if (origNl == replNl) {
-    trace("linedir/local",
-          "skip (no newline drift): s={0} e={1} origNl={2} replNl={3} file={4}",
-          s, e, origNl, replNl, fileSpellingForDirective);
     return replacement.str();
   }
 
@@ -1428,16 +1425,9 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
   if (replacement.empty()) {
     if (!stringutils::isBOL(originalFileText, static_cast<size_t>(s)) ||
         !rejoinsUntouchedTailSafelyAtBOL(originalFileText, e)) {
-      trace("linedir/local",
-            "cannot inject (empty replacement rejoins mid-line original): "
-            "resumeLine={0} file={1} start={2} end={3}",
-            resumeLine, fileSpellingForDirective, s, e);
       return replacement.str();
     }
 
-    trace("linedir/local",
-          "inject (empty replacement): resumeLine={0} file={1}", resumeLine,
-          fileSpellingForDirective);
     return directive;
   }
 
@@ -1449,11 +1439,6 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
   if (std::optional<size_t> offset = findCarriedSuffixPrefixInsertionOffset(
           originalFileText, s, e, replacement, /*replacementPrefixOffset=*/0,
           /*requireDeletedLineFromBOL=*/true)) {
-    trace("linedir/local",
-          "inject (before whole carried suffix prefix): resumeLine={0} "
-          "file={1} prefix={2}",
-          resumeLine, fileSpellingForDirective,
-          stringutils::showWs(stringutils::clip(replacement, 80)));
     return insertLineDirectiveAt(replacement, directive, *offset);
   }
 
@@ -1461,23 +1446,14 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
   // untouched original tail must also rejoin safely at a line boundary.
   if (replacement.back() == '\n') {
     if (!rejoinsUntouchedTailSafelyAtBOL(originalFileText, e)) {
-      trace("linedir/local",
-            "cannot inject at end (replacement rejoins mid-line original): "
-            "resumeLine={0} file={1} end={2}",
-            resumeLine, fileSpellingForDirective, e);
       return replacement.str();
     }
 
     // Idempotence: avoid appending the same directive twice when this helper is
     // reached repeatedly for an already-resynced replacement.
     if (replacement.ends_with(directive)) {
-      trace("linedir/local",
-            "skip (already endsWith directive): resumeLine={0} file={1}",
-            resumeLine, fileSpellingForDirective);
       return replacement.str();
     }
-    trace("linedir/local", "inject (append at end): resumeLine={0} file={1}",
-          resumeLine, fileSpellingForDirective);
     return replacement.str() + directive;
   }
 
@@ -1492,20 +1468,9 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
       if (std::optional<size_t> offset = findCarriedSuffixPrefixInsertionOffset(
               originalFileText, s, e, replacement, bol,
               /*requireDeletedLineFromBOL=*/false)) {
-        StringRef replacementResumePrefix = replacement.substr(*offset);
-        trace("linedir/local",
-              "inject (before carried suffix prefix): resumeLine={0} "
-              "file={1} lastNl={2} bol={3} prefix={4}",
-              resumeLine, fileSpellingForDirective, lastNl, bol,
-              stringutils::showWs(stringutils::clip(replacementResumePrefix, 80)));
-
         // Idempotence: if the prefix is already preceded by this exact
         // directive, do not duplicate it.
         if (replacement.substr(0, *offset).ends_with(directive)) {
-          trace("linedir/local",
-                "skip (directive already present before carried suffix "
-                "prefix): resumeLine={0} file={1}",
-                resumeLine, fileSpellingForDirective);
           return replacement.str();
         }
 
@@ -1515,25 +1480,13 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
 
     if (stringutils::isIndentOnly(replacement, bol, replacement.size())) {
       if (!rejoinsUntouchedTailSafelyAtBOL(originalFileText, e)) {
-        trace("linedir/local",
-              "cannot inject before indent-only suffix (replacement rejoins "
-              "mid-line original): resumeLine={0} file={1} end={2}",
-              resumeLine, fileSpellingForDirective, e);
         return replacement.str();
       }
 
-      trace("linedir/local",
-            "inject (between last NL and indent-only suffix): resumeLine={0} "
-            "file={1} lastNl={2} bol={3}",
-            resumeLine, fileSpellingForDirective, lastNl, bol);
 
       // Idempotence: if the prior line is already the same directive, do not
       // emit it again before the indentation-only suffix.
       if (replacement.substr(0, bol).ends_with(directive)) {
-        trace("linedir/local",
-              "skip (directive already present immediately before indent-only "
-              "suffix): resumeLine={0} file={1}",
-              resumeLine, fileSpellingForDirective);
         return replacement.str();
       }
 
@@ -1543,24 +1496,9 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
     // There is a newline, but the tail after it contains substantive text. A
     // directive inserted there would split replacement text rather than cleanly
     // resume the original file.
-    if (inTraceMode()) {
-      const size_t start =
-          static_cast<size_t>(std::clamp(bol, size_t(0), replacement.size()));
-      StringRef replFromBol = replacement.substr(start);
-      trace("linedir/local",
-            "cannot inject at tail (non-indent suffix): resumeLine={0} "
-            "file={1} lastNl={2} tail={3}",
-            resumeLine, fileSpellingForDirective, lastNl,
-            stringutils::showWs(stringutils::clip(replFromBol, 80)));
-    }
   } else {
     // With no newline in the replacement, there is no BOL insertion point for
     // the directive.
-    trace("linedir/local",
-          "cannot inject (no newline in replacement): resumeLine={0} file={1} "
-          "replTail={2}",
-          resumeLine, fileSpellingForDirective,
-          stringutils::showWs(stringutils::clip(replacement, 80)));
   }
 
   return replacement.str();

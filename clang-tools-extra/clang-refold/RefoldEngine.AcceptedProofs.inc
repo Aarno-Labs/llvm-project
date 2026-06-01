@@ -123,16 +123,17 @@ RefoldEngine::ProofDischargeRecord
 RefoldEngine::ValidateInvocationPreservingProofImpl(
     const MacroPatch &patch, bool requireTopLevelRoot) const {
   ProofDischargeAccumulator discharge;
+  const MacroPatchProof &proof = patch.proof;
   const AcceptancePathInventory inventory =
-      InventoryMacroPatchAcceptancePath(patch);
+      InventoryMacroPatchProofAcceptancePath(proof);
 
   RequireAcceptedPathBaseline(discharge, inventory);
-  discharge.Require(patch.proofRootMacroId != 0,
+  discharge.Require(proof.proofRootMacroId != 0,
                     ProofObligationKind::ProofRootTracked,
                     ProofFailureReason::MissingProofRoot);
 
   const RefoldModel::MacroInvocation *root =
-      patch.proofRootMacroId ? FindMacroInvocationById(patch.proofRootMacroId)
+      proof.proofRootMacroId ? FindMacroInvocationById(proof.proofRootMacroId)
                              : nullptr;
   discharge.Require(root != nullptr,
                     ProofObligationKind::MacroProofRootResolved,
@@ -143,7 +144,7 @@ RefoldEngine::ValidateInvocationPreservingProofImpl(
                       ProofFailureReason::NonTopLevelMacroProofRoot);
   }
 
-  switch (patch.proofKind) {
+  switch (proof.kind) {
   case MacroPatchProofKind::ArgsOnlyStandard:
     break;
 
@@ -156,7 +157,9 @@ RefoldEngine::ValidateInvocationPreservingProofImpl(
     if (root && !root->pasteSpans.empty()) {
       const bool hasProducerWitness =
           MacroInvocationHasWellFormedPasteWitnesses(*root);
-      discharge.Require(hasProducerWitness || patch.pasteReplayValidated,
+      const bool replayValidated =
+          proof.paste && proof.paste->replayValidated;
+      discharge.Require(hasProducerWitness || replayValidated,
                         ProofObligationKind::MacroPasteWitnessWellFormed,
                         ProofFailureReason::MalformedPasteWitness);
     }
@@ -180,20 +183,24 @@ RefoldEngine::ValidateInvocationPreservingProofImpl(
     break;
 
   case MacroPatchProofKind::DagSubtreeRoot:
-    discharge.Require(patch.subtreeCertBacked,
+    discharge.Require(proof.subtree && proof.subtree->backed,
                       ProofObligationKind::MacroSubtreeCertificateTracked,
                       ProofFailureReason::MissingSubtreeCertificate);
-    if (patch.subtreeCertBacked) {
-      discharge.Require(patch.subtreeAdmissible,
+    if (proof.subtree && proof.subtree->backed) {
+      discharge.Require(proof.subtree->admissible,
                         ProofObligationKind::SubtreeAdmissibilityTracked,
                         ProofFailureReason::MissingSubtreeAdmissibility);
     }
     break;
 
   case MacroPatchProofKind::CallChainSuffix:
-    discharge.Require(patch.macroId == patch.proofRootMacroId,
-                      ProofObligationKind::MacroCallChainWitnessTracked,
-                      ProofFailureReason::MissingCallChainWitness);
+    discharge.Require(
+        proof.callChain &&
+            proof.callChain->rootMacroId == proof.proofRootMacroId &&
+            proof.callChain->callsiteMacroId == patch.macroId &&
+            patch.macroId == proof.proofRootMacroId,
+        ProofObligationKind::MacroCallChainWitnessTracked,
+        ProofFailureReason::MissingCallChainWitness);
     break;
 
   case MacroPatchProofKind::CounterLiteral:
@@ -222,18 +229,19 @@ RefoldEngine::ProofDischargeRecord
 RefoldEngine::ValidateInvocationRealizationProof(
     const MacroPatch &patch) const {
   ProofDischargeAccumulator discharge;
+  const MacroPatchProof &proof = patch.proof;
   const AcceptancePathInventory inventory =
-      InventoryMacroPatchAcceptancePath(patch);
+      InventoryMacroPatchProofAcceptancePath(proof);
 
   // Invocation-realization patches still need the common accepted-path
   // metadata, but unlike invocation-preserving proofs they are expected to
   // realize expansion text rather than preserve source invocation structure.
   RequireAcceptedPathBaseline(discharge, inventory);
-  discharge.Require(patch.proofRootMacroId != 0,
+  discharge.Require(proof.proofRootMacroId != 0,
                     ProofObligationKind::ProofRootTracked,
                     ProofFailureReason::MissingProofRoot);
 
-  if (patch.proofKind == MacroPatchProofKind::WholeCoverRealization) {
+  if (proof.kind == MacroPatchProofKind::WholeCoverRealization) {
     // Whole-cover realization has additional audit obligations: the A/B token
     // envelopes, adjusted B envelope, containment status, and boundary
     // accounting must all be explicitly recorded on the emitted patch.
@@ -258,8 +266,8 @@ RefoldEngine::ValidateInvocationRealizationProof(
                       ProofObligationKind::WholeCoverBoundaryAccountingTracked,
                       ProofFailureReason::MissingWholeCoverBoundaryAccounting);
     discharge.Require(
-        patch.hasOwnerRealizationWitness &&
-            patch.ownerRealizationWitness.evidence ==
+        proof.ownerRealization &&
+            proof.ownerRealization->evidence ==
                 OwnerRealizationEvidenceKind::MacroWholeCover,
         ProofObligationKind::OwnerRealizationWitnessTracked,
         ProofFailureReason::MissingOwnerRealizationWitness);
@@ -268,12 +276,13 @@ RefoldEngine::ValidateInvocationRealizationProof(
     // proof kind plus a typed state-stability witness when the proof depends on
     // stabilizing preprocessor state. There is no separate legacy validation
     // bit in the theorem vocabulary.
-    if (patch.proofKind == MacroPatchProofKind::CounterLiteral) {
+    if (proof.kind == MacroPatchProofKind::CounterLiteral) {
       const SuffixStabilityWitnessKind kind =
-          patch.suffixStabilityWitness.kind;
+          proof.suffixStability ? proof.suffixStability->kind
+                                : SuffixStabilityWitnessKind::None;
       const bool counterWitnessTracked =
-          patch.hasSuffixStabilityWitness &&
-          SuffixStabilityWitnessNamesComponent(patch.suffixStabilityWitness,
+          proof.suffixStability &&
+          SuffixStabilityWitnessNamesComponent(*proof.suffixStability,
                                                OwnerStateComponent::Counter) &&
           (kind == SuffixStabilityWitnessKind::Literalization ||
            kind == SuffixStabilityWitnessKind::OwnerMaterialization ||
@@ -585,35 +594,27 @@ RefoldEngine::ValidateTUAnchorProof(AcceptedPathKind currentPath,
 RefoldEngine::TerminalFallbackWitness
 RefoldEngine::BuildTerminalFallbackWitness() const {
   TerminalFallbackWitness witness;
-  witness.proofFailure = terminalFallbackProofFailure_;
-  if (!IsClassifiedTerminalFallbackProofFailure(witness.proofFailure)) {
+
+  // Phase 4D makes the ordered typed requests the single source of truth.
+  // There is no branch-local fallback boolean, no primary failure scalar, and
+  // no separate proof-failure vector mirror.  The primary failed obligation is
+  // simply the first classified request failure copied into this witness.
+  witness.proofFailures.reserve(terminalFallbackRequests_.size());
+  for (const TerminalFallbackRequest &request : terminalFallbackRequests_) {
+    if (IsClassifiedTerminalFallbackProofFailure(request.failure))
+      witness.proofFailures.push_back(request.failure);
+  }
+
+  if (witness.proofFailures.empty()) {
     // R4 forbids deriving the failed obligation from an aggregate terminal
     // kind.  If this state is ever reached, the bug is the missing
     // caller-supplied proof failure itself, so report a theorem-audit
     // invariant violation rather than inventing an owner/state reason here.
-    witness.proofFailure = MakeTerminalFallbackProofFailure(
+    witness.proofFailures.push_back(MakeTerminalFallbackProofFailure(
         TerminalFallbackObligationKind::TheoremAuditInvariantSatisfied,
         TerminalFallbackFailureReason::TheoremAuditInvariantViolation,
         TerminalFallbackFailureContext::ForStateComponent(
-            "terminalFallbackWitness"));
-  }
-  witness.requestCount = terminalFallbackRequestCount_;
-
-  // Phase 2D/R4 preserves every classified failed obligation that led to the
-  // terminal carrier.  Keep the first failure as the primary field, but also
-  // retain ordered secondary failures so independent theorem obligations are
-  // never collapsed into a lossy aggregate category.
-  witness.proofFailures = terminalFallbackProofFailures_;
-  auto sameClassification = [](const TerminalFallbackProofFailure &lhs,
-                               const TerminalFallbackProofFailure &rhs) {
-    return lhs.obligation == rhs.obligation && lhs.reason == rhs.reason &&
-           lhs.theoremFailure == rhs.theoremFailure;
-  };
-  if (witness.proofFailures.empty() ||
-      !sameClassification(witness.proofFailures.front(),
-                          witness.proofFailure)) {
-    witness.proofFailures.insert(witness.proofFailures.begin(),
-                                 witness.proofFailure);
+            "terminalFallbackWitness")));
   }
 
   return witness;

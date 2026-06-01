@@ -24,7 +24,7 @@ RefoldEngine::ResolveIncludeRealizationBTokenEnvelope(
     return canonical;
   }
 
-  // Phase 8b classification: this is not a fallback/rescue path.  It is a
+  // Phase 8b classification: this is not a fallback branch.  It is a
   // declared include-realization evidence class for the narrow case where the
   // canonical mapper cannot recover an envelope but every usable
   // non-canonical boundary projection proves the same non-empty B-token range.
@@ -54,20 +54,10 @@ RefoldEngine::ResolveIncludeRealizationBTokenEnvelope(
   auto consider = [&](StringRef label,
                       const std::optional<std::pair<size_t, size_t>> &env) {
     if (!isUsableEnvelope(env)) {
-      trace("include/mat",
-            "include-realization boundary-stable envelope unavailable: label={0} "
-            "A-cover=[{1},{2})",
-            label, beginTok, endTok);
       return;
     }
 
     sawUsableBoundaryStableProjection = true;
-    trace("include/mat",
-          "include-realization boundary-stable envelope: label={0} "
-          "A-cover=[{1},{2}) Btok=[{3},{4}) text={5}",
-          label, beginTok, endTok, env->first, env->second,
-          stringutils::showWsWithClip(SliceBSource(env->first, env->second),
-                                      120));
 
     if (!consensus) {
       consensus = *env;
@@ -90,19 +80,12 @@ RefoldEngine::ResolveIncludeRealizationBTokenEnvelope(
   if (evidenceKind)
     *evidenceKind =
         IncludeRealizationEvidenceKind::BoundaryStableConsensusBCoverEnvelope;
-  trace("include/mat",
-        "include-realization boundary-stable consensus envelope: "
-        "A-cover=[{0},{1}) Btok=[{2},{3})",
-        beginTok, endTok, consensus->first, consensus->second);
   return consensus;
 }
 
 RefoldEngine::IncludePatch
 RefoldEngine::BuildIncludeInsertionPatch(const RefoldModel::IncludeItem &inc,
                                          const diffutils::Hunk &h) const {
-  // Extra debug: show the raw PP hunk slices.
-  DebugIncludePatch("pre", inc, h);
-
   std::string insertBytes;
   const size_t numOffsets = bTokOff_.size();
   const size_t uBStart = static_cast<size_t>(h.bStart);
@@ -152,10 +135,6 @@ RefoldEngine::BuildIncludeInsertionPatch(const RefoldModel::IncludeItem &inc,
                                                     AcceptedPathKind::Unknown,
                                                     &patch);
 
-  trace("include/patch",
-        "built inc #{0} patch A[{1},{2})->B[{3},{4}) len(insertBytes)={5}",
-        inc.id, patch.aStart, patch.aEnd, patch.bStart, patch.bEnd,
-        patch.insertBytes.size());
 
   return patch;
 }

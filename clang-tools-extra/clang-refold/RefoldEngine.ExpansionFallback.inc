@@ -5,9 +5,9 @@
 //
 // This fragment contains closure/materialization helpers used near the
 // post-structural fallback boundary.  Phase 8 removes the legacy
-// partial-expansion rescue seam from this file; the remaining terminal resolver
-// only normalizes a failed structural run onto the declared raw-B terminal
-// carrier.
+// partial-expansion proof-bypass path from this file; the remaining terminal
+// resolver only normalizes a failed structural run onto the declared raw-B
+// terminal carrier.
 //
 // This is a physical extraction only:
 //   - the methods remain `RefoldEngine` members
@@ -2773,20 +2773,27 @@ computeSourceLineDirectiveGapResume(
 // Phase 8 deletes the post-terminal macro-expansion fallback audit seam.
 //
 // Earlier migration steps kept a diagnostic-only witness builder here after the
-// synthesis/rescue path was hard-disabled.  That witness described exactly the
-// same owner-closed macro whole-cover surface now represented by the ordinary
-// OwnerRealizationProof / MixedOwnerTilingProof lattice before terminal fallback
-// is requested.  Keeping a second post-terminal proof search would therefore be
-// a legacy rescue path, even if it never materialized bytes.  Terminal fallback
-// now goes directly to the declared TerminalOutOfDomain carrier; any in-domain
-// macro whole-cover case must have been accepted by the normal proof lattice.
+// synthesis proof-bypass path was hard-disabled.  That witness described
+// exactly the same owner-closed macro whole-cover surface now represented by
+// the ordinary OwnerRealizationProof / MixedOwnerTilingProof lattice before
+// terminal fallback is requested.  Keeping a second post-terminal proof search
+// would therefore be a legacy fallback branch, even if it never materialized
+// bytes.  Terminal fallback now goes directly to the declared
+// TerminalOutOfDomain carrier; any in-domain macro whole-cover case must have
+// been accepted by the normal proof lattice.
 
 std::optional<RefoldEngine::TextEdit>
 RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     const diffutils::Hunk &h, StringRef tuPath, StringRef tuBytes,
     ArrayRef<std::pair<uint64_t, uint64_t>> stagedSourceIntervals) const {
+  const ExpansionFallbackBranchClassification fallbackBranch =
+      ClassifyExpansionFallbackBranch(
+          ExpansionFallbackBranchKind::TUIncludeClosureEdit);
+  AuditExpansionFallbackBranchClassification(
+      fallbackBranch, "BuildTUIncludeClosureEditForUnresolvedHunk");
+
   // Phase 8c classification: this source-closure path is still uniquely needed,
-  // but it is no longer a legacy unresolved-hunk rescue.  It is the declared
+  // but it is no longer a legacy unresolved-hunk fallback.  It is the declared
   // TUIncludeClosureEdit proof class: one closed TU source interval may replace
   // top-level include directives plus any adjacent TU-owned tokens consumed by
   // the same hunk, provided all state/layout, B-envelope, and composition
@@ -5870,20 +5877,29 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   // preservable source gaps, canonical-or-consensus B envelope, line-control
   // repair, and pragma-once/include-guard reactivation safety all had to be
   // discharged before this edit was created.
-  AttachAcceptedResultCarrier(
-      edit, BuildAcceptedTUTextEditCandidate(
-                AcceptedPathKind::TUIncludeClosureEdit, sourceBegin,
-                closureSourceEnd, StringRef(rawReplacement)));
+  AcceptedResultCandidate acceptedClosure = BuildAcceptedTUTextEditCandidate(
+      AcceptedPathKind::TUIncludeClosureEdit, sourceBegin, closureSourceEnd,
+      StringRef(rawReplacement));
+  AuditExpansionFallbackAcceptedCandidate(
+      fallbackBranch, acceptedClosure,
+      "BuildTUIncludeClosureEditForUnresolvedHunk/accepted");
+  AttachAcceptedResultCarrier(edit, acceptedClosure);
   return edit;
 }
 
 std::string RefoldEngine::ResolvePostStructuralFallback() {
-  if (!terminalFallbackRequested_)
+  if (!HasTerminalFallbackRequest())
     return std::string();
+
+  const ExpansionFallbackBranchClassification terminalBranch =
+      ClassifyExpansionFallbackBranch(
+          ExpansionFallbackBranchKind::PostStructuralTerminalOutOfDomain);
+  AuditExpansionFallbackBranchClassification(terminalBranch,
+                                             "ResolvePostStructuralFallback");
 
   // Reaching this point means every structural proof lattice candidate has
   // failed closed or has been classified out-of-domain.  Phase 8 removes the
-  // old post-terminal macro-expansion rescue/audit seam entirely: a macro
+  // old post-terminal macro-expansion proof-bypass audit seam entirely: a macro
   // whole-cover case is in-domain only if OwnerRealizationProof or
   // MixedOwnerTilingProof accepted it before fallback was requested.  Do not run
   // a second post-terminal owner search here; normalize directly onto the
@@ -5920,19 +5936,21 @@ std::string RefoldEngine::ResolvePostStructuralFallback() {
   debug("fallback",
         "terminal fallback: emitting fully expanded edited preprocessed "
         "stream (B). reasons={0} proofFailures={1}",
-        terminalFallbackReasons_.size(), terminalWitness.proofFailures.size());
+        terminalFallbackRequests_.size(), terminalWitness.proofFailures.size());
   const AcceptedResultCandidate terminalCandidate =
       BuildAcceptedTerminalCandidate(terminalWitness);
-  for (const auto &r : terminalFallbackReasons_)
-    debug("fallback", "  {0}", r);
+  AuditExpansionFallbackAcceptedCandidate(
+      terminalBranch, terminalCandidate,
+      "ResolvePostStructuralFallback/terminal");
+  for (const TerminalFallbackRequest &request : terminalFallbackRequests_)
+    debug("fallback", "  {0}", toString(request));
 
   // The raw-B terminal carrier is the fully expanded surface, so every include
   // and every top-level macro root remains expanded in the final result.
   ResetAttemptStats();
   lastStats_.expandedIncludes = lastStats_.totalIncludes;
   lastStats_.expandedMacros = lastStats_.totalMacros;
-  lastStats_.terminalFallbackToB = true;
-  if (materializedEditMappings_) {
+    if (materializedEditMappings_) {
     materializedEditMappings_->clear();
     materializedEditMappings_->push_back(MaterializedEditMapping{
         0, static_cast<uint64_t>(bSource_.size()), 0,

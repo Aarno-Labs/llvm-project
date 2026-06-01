@@ -366,6 +366,18 @@ inline std::pair<size_t, size_t> trimWsRange(StringRef s, size_t b, size_t e) {
 /// \returns A StringRef with leading/trailing spaces and tabs removed.
 StringRef trimEdgeSpaces(StringRef s);
 
+StringRef trimHorizontal(StringRef text) {
+  while (!text.empty() && (text.front() == ' ' || text.front() == '\t' ||
+                           text.front() == '\r' || text.front() == '\f' ||
+                           text.front() == '\v'))
+    text = text.drop_front();
+  while (!text.empty() && (text.back() == ' ' || text.back() == '\t' ||
+                           text.back() == '\r' || text.back() == '\f' ||
+                           text.back() == '\v'))
+    text = text.drop_back();
+  return text;
+}
+
 /// \brief Return a view of \p s with any trailing '\n' characters removed.
 ///
 /// Clang's token dump spellings and some macro expansions may include one or

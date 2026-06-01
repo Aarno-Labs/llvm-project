@@ -130,27 +130,14 @@ std::optional<std::string> RefoldEngine::BuildInlineIncludeRealizationFromB(
     return std::nullopt;
   }
 
-  // Record the precise realization witness that will justify slicing B for this
-  // include: which include was realized, which A cover was replaced, and which
-  // B-token envelope supplied the materialized text.
-  IncludeRealizationWitness realizationWitness;
-  realizationWitness.evidence = evidenceKind;
-  realizationWitness.hasIncludeId = true;
-  realizationWitness.includeId = inc.id;
-  realizationWitness.hasACover = true;
-  realizationWitness.aCoverBegin = inc.cover.begin;
-  realizationWitness.aCoverEnd = inc.cover.end;
-  realizationWitness.hasBTokenEnvelope = true;
-  realizationWitness.bTokBegin = bEnvOpt->first;
-  realizationWitness.bTokEnd = bEnvOpt->second;
-
   // Build the normalized accepted-result carrier before returning the sliced
-  // text, so callers that emit this realization can attach the same witness and
-  // proof-discharge metadata to the final edit.
+  // text.  The producer-proven B envelope is passed directly into the shared
+  // owner-realization proof path instead of being copied into a parallel
+  // include-specific closure witness.
   AcceptedResultCandidate realizationCandidate =
       BuildAcceptedIncludeRealizationCandidate(
-          AcceptedPathKind::IncludeRealizationInlineFromB, inc,
-          &realizationWitness);
+          AcceptedPathKind::IncludeRealizationInlineFromB, inc, evidenceKind,
+          *bEnvOpt);
   if (acceptedCandidate)
     *acceptedCandidate = realizationCandidate;
 
@@ -260,10 +247,6 @@ bool RefoldEngine::SourcePrefixHasProducerActiveLineControl(
     // include-entry #line.  If the owner source cannot be read, fail closed and
     // keep the wrapper rather than inferring that the real line-control stream
     // will kill it.
-    trace("linedir/include",
-          "keep include-entry #line: unable to read owner '{0}' while "
-          "checking source line-control prefix ({1})",
-          ownerFile, bufOrErr.getError().message());
     return false;
   }
 
@@ -317,10 +300,6 @@ bool RefoldEngine::SourcePrefixHasProducerActiveLineControl(
       if (refoldLineSpellingIsLineControlDirective(
               src.slice(*hash, clampedEnd)) &&
           directiveIsProducerActive(*hash)) {
-        trace("linedir/include",
-              "source line-control prefix in owner '{0}' before byte {1} "
-              "kills synthetic include-entry state at byte {2}",
-              ownerFile, offset, *hash);
         return true;
       }
     }
@@ -379,31 +358,22 @@ RefoldEngine::IncludeSubtreeLineStateObserverDemand(uint64_t includeId) const {
       continue;
 
     if (!LineStateBuiltinInvocationIsPreservedObserver(macro)) {
-      trace("linedir/include",
-            "skip include-entry demand: builtin {0} macro id={1} is "
-            "materialized or token-changed in B",
-            macro.name, macro.id);
       continue;
     }
 
     if (site->invFile && site->invB &&
         SourcePrefixHasProducerActiveLineControl(*site->invFile, owner,
                                                  *site->invB)) {
-      trace("linedir/include",
-            "skip include-entry demand: builtin {0} macro id={1} owner='{2}' "
-            "byte={3} is already dominated by source line-control in the "
-            "materialized child body",
-            macro.name, macro.id, *site->invFile, *site->invB);
       continue;
     }
 
     demand.needsLine |= observesLine;
     demand.needsFile |= observesFile;
     demand.needsFileName |= observesFileName;
-    demand.hasProducerBackedFinalObserver |=
-        LineStateBuiltinInvocationNeedsProducerBackedFinalObserver(macro);
+    demand.hasModelBackedLineStateDemand |=
+        LineStateBuiltinInvocationNeedsModelBackedLineStateDemand(macro);
     if (demand.needsLine && demand.needsFile && demand.needsFileName &&
-        demand.hasProducerBackedFinalObserver)
+        demand.hasModelBackedLineStateDemand)
       break;
   }
 
@@ -424,10 +394,6 @@ bool RefoldEngine::IncludeEntryLineDirectiveDischargesLayoutBarrier(
     // Failing closed here preserves the old wrapper behavior. The minimization
     // proof is source-backed; if the parent owner cannot be read, do not infer
     // that a layout barrier is unneeded.
-    trace("linedir/include",
-          "keep include-entry #line inc#{0}: unable to read parent owner '{1}' "
-          "for layout proof ({2})",
-          child.id, parentOwnerFileForDemand, bufOrErr.getError().message());
     return true;
   }
 
@@ -532,23 +498,10 @@ bool RefoldEngine::IncludeEntryLineDirectiveDischargesLayoutBarrier(
     if (firstChildOutputByte &&
         SourcePrefixHasProducerActiveLineControl(*child.resolvedPath, child.id,
                                                  *firstChildOutputByte)) {
-      trace("linedir/include",
-            "skip include-entry layout demand inc#{0}: child source "
-            "line-control before first output byte {1} already normalizes "
-            "the zero-token parent prefix",
-            child.id, *firstChildOutputByte);
       return false;
     }
   }
 
-  trace("linedir/include",
-        "include-entry layout demand inc#{0}: parent='{1}' site={2} "
-        "sawOutput={3} zeroBeforeFirst={4} zeroAfterLast={5} demand={6}",
-        child.id, parentOwnerFileForDemand, child.siteB,
-        sawOutputLine ? "YES" : "NO",
-        sawZeroTokenLineBeforeFirstOutput ? "YES" : "NO",
-        sawZeroTokenLineAfterLastOutput ? "YES" : "NO",
-        needsBarrier ? "YES" : "NO");
   return needsBarrier;
 }
 
@@ -1289,9 +1242,6 @@ bool RefoldEngine::AppendLineObserverLayoutRealizationEdits(
     if (editBegin >= editEnd)
       continue;
     if (editOverlapsExisting(editBegin, editEnd)) {
-      trace("linedir/layout",
-            "skip __LINE__ layout realization at byte {0}: overlaps existing edit",
-            *site->invB);
       continue;
     }
 
@@ -1315,11 +1265,6 @@ bool RefoldEngine::AppendLineObserverLayoutRealizationEdits(
                   editEnd, replacement));
     tuEdits.push_back(std::move(edit));
 
-    trace("linedir/layout",
-          "realize source line containing __LINE__ after B-side line merge: "
-          "source=[{0},{1}) b=[{2},{3}) repl='{4}'",
-          editBegin, editEnd, prevBEnd, initialBEnd,
-          stringutils::showWsWithClip(replacement, 100));
   }
 
 
@@ -1411,10 +1356,6 @@ bool RefoldEngine::AppendLineObserverLayoutRealizationEdits(
     if (editBegin >= editEnd)
       continue;
     if (editOverlapsExisting(editBegin, editEnd)) {
-      trace("linedir/layout",
-            "skip pre-observer __LINE__ layout realization at byte {0}: "
-            "overlaps existing edit",
-            *site->invB);
       continue;
     }
 
@@ -1442,12 +1383,6 @@ bool RefoldEngine::AppendLineObserverLayoutRealizationEdits(
                   editEnd, replacement));
     tuEdits.push_back(std::move(edit));
 
-    trace("linedir/layout",
-          "realize pre-observer layout before preserved __LINE__: "
-          "source=[{0},{1}) b-prefix=[{2},{3}) resumeLine={4} file={5} repl='{6}'",
-          editBegin, editEnd, collapsedGap->leftBEnd, firstObserverBBegin,
-          loc.lineNo, loc.fileSpelling,
-          stringutils::showWsWithClip(replacement, 120));
   }
 
   return true;
@@ -1496,10 +1431,6 @@ bool RefoldEngine::AppendIncludeLineObserverLayoutRealizationEdits(
 
     auto bufOrErr = MemoryBuffer::getFile(lineDirs_.ToAbsolutePath(ownerFile));
     if (!bufOrErr) {
-      debug("linedir/layout",
-            "skip include-owned __LINE__ layout realization for include #{0}: "
-            "cannot read owner file '{1}'",
-            include->id, ownerFile);
       continue;
     }
     const MemoryBuffer &mb = **bufOrErr;
@@ -1551,10 +1482,6 @@ bool RefoldEngine::AppendIncludeLineObserverLayoutRealizationEdits(
     const uint64_t patchBStart = static_cast<uint64_t>(prevBTok);
     const uint64_t patchBEnd = static_cast<uint64_t>(ownLineClosure.lastBTok + 1);
     if (patchOverlapsExisting(include->id, patchAStart, patchAEnd)) {
-      trace("linedir/layout",
-            "skip include-owned __LINE__ layout realization for include #{0} "
-            "A=[{1},{2}): overlaps existing include patch",
-            include->id, patchAStart, patchAEnd);
       continue;
     }
 
@@ -1575,13 +1502,6 @@ bool RefoldEngine::AppendIncludeLineObserverLayoutRealizationEdits(
     auto [it, _] = perInclude.try_emplace(include->id, include);
     it->second.Add(std::move(patch));
 
-    trace("linedir/layout",
-          "realize include-owned source line containing __LINE__ after B-side "
-          "line merge: include=#{0} file='{1}' A=[{2},{3}) B=[{4},{5}) "
-          "sourceBytes=[{6},{7}) repl='{8}'",
-          include->id, ownerFile, patchAStart, patchAEnd, patchBStart,
-          patchBEnd, prevEntry.e, ownLineClosure.sourceEnd,
-          stringutils::showWsWithClip(replacementForTrace, 100));
   }
 
 
@@ -1616,10 +1536,6 @@ bool RefoldEngine::AppendIncludeLineObserverLayoutRealizationEdits(
 
     auto bufOrErr = MemoryBuffer::getFile(lineDirs_.ToAbsolutePath(ownerFile));
     if (!bufOrErr) {
-      debug("linedir/layout",
-            "skip include-owned pre-observer __LINE__ layout realization for "
-            "include #{0}: cannot read owner file '{1}'",
-            include->id, ownerFile);
       continue;
     }
     const MemoryBuffer &mb = **bufOrErr;
@@ -1712,10 +1628,6 @@ bool RefoldEngine::AppendIncludeLineObserverLayoutRealizationEdits(
     const uint64_t patchBStart = static_cast<uint64_t>(collapsedGap->leftBTok);
     const uint64_t patchBEnd = static_cast<uint64_t>(closure->lastBTok + 1);
     if (patchOverlapsExisting(include->id, patchAStart, patchAEnd)) {
-      trace("linedir/layout",
-            "skip include-owned pre-observer __LINE__ layout realization for "
-            "include #{0} A=[{1},{2}): overlaps existing include patch",
-            include->id, patchAStart, patchAEnd);
       continue;
     }
 
@@ -1729,14 +1641,6 @@ bool RefoldEngine::AppendIncludeLineObserverLayoutRealizationEdits(
     auto [it, _] = perInclude.try_emplace(include->id, include);
     it->second.Add(std::move(patch));
 
-    trace("linedir/layout",
-          "realize include-owned pre-observer layout before preserved "
-          "__LINE__: include=#{0} file='{1}' A=[{2},{3}) B=[{4},{5}) "
-          "sourceBytes=[{6},{7}) resumeLine={8} resumeFile={9} repl='{10}'",
-          include->id, ownerFile, patchAStart, patchAEnd, patchBStart,
-          patchBEnd, leftEntry.e, closure->sourceEnd, loc.lineNo,
-          loc.fileSpelling,
-          stringutils::showWsWithClip(replacementForTrace, 120));
   }
 
   return true;
@@ -1792,13 +1696,13 @@ bool RefoldEngine::LineStateBuiltinInvocationIsPreservedObserver(
   return true;
 }
 
-bool RefoldEngine::LineStateBuiltinInvocationNeedsProducerBackedFinalObserver(
+bool RefoldEngine::LineStateBuiltinInvocationNeedsModelBackedLineStateDemand(
     const RefoldModel::MacroInvocation &macro) const {
   // Direct lexical builtin tokens that survive into ordinary emitted source are
-  // visible to the scanner without extra model facts.  If a predefined builtin is
+  // visible without extra model facts.  If a predefined builtin is
   // reached through a caller macro, the final source normally contains the caller
-  // spelling rather than the builtin token; record that the observer needs the
-  // producer-backed final observer path instead of lexical discovery alone.
+  // spelling rather than the builtin token; record that the demand needs
+  // model-backed line-state evidence instead of lexical discovery alone.
   if (macro.callerMacroId)
     return true;
 
@@ -1807,7 +1711,7 @@ bool RefoldEngine::LineStateBuiltinInvocationNeedsProducerBackedFinalObserver(
 
   // Missing cover/map evidence is already treated as preserved by
   // LineStateBuiltinInvocationIsPreservedObserver() for emission safety.  It also
-  // requires producer-backed final observer evidence rather than direct lexical
+  // requires model-backed line-state demand rather than direct lexical
   // discovery.
   if (!macro.cover.IsValid())
     return true;
@@ -1860,20 +1764,16 @@ RefoldEngine::OwnerSuffixLineStateObserverDemand(
       continue;
 
     if (!LineStateBuiltinInvocationIsPreservedObserver(macro)) {
-      trace("linedir/resync",
-            "skip {0} resync demand: macro id={1} at byte {2} is "
-            "materialized or token-changed in B",
-            macro.name, macro.id, *site->invB);
       continue;
     }
 
     demand.needsLine |= observesLine;
     demand.needsFile |= observesFile;
     demand.needsFileName |= observesFileName;
-    demand.hasProducerBackedFinalObserver |=
-        LineStateBuiltinInvocationNeedsProducerBackedFinalObserver(macro);
+    demand.hasModelBackedLineStateDemand |=
+        LineStateBuiltinInvocationNeedsModelBackedLineStateDemand(macro);
     if (demand.needsLine && demand.needsFile && demand.needsFileName &&
-        demand.hasProducerBackedFinalObserver)
+        demand.hasModelBackedLineStateDemand)
       break;
   }
 
@@ -1913,8 +1813,8 @@ RefoldEngine::FirstOwnerSuffixLineStateObserverSite(
     best->demand.needsLine |= observesLine;
     best->demand.needsFile |= observesFile;
     best->demand.needsFileName |= observesFileName;
-    best->demand.hasProducerBackedFinalObserver |=
-        LineStateBuiltinInvocationNeedsProducerBackedFinalObserver(builtin);
+    best->demand.hasModelBackedLineStateDemand |=
+        LineStateBuiltinInvocationNeedsModelBackedLineStateDemand(builtin);
   };
 
   for (const auto &macro : model_.GetMacroInvocations()) {
@@ -2041,14 +1941,10 @@ bool RefoldEngine::LineResyncShouldDeferToConditionalJoin(
 /// despite later edit normalization, include nesting, and pending-resync flushes.
 static FinalLineControlPruneCandidate makeSyntheticLineControlPruneCandidate(
     uint64_t begin, uint64_t end, FinalLineDirective::Origin origin,
-    std::optional<FinalLineControlOwnerKey> owner) {
-  FinalLineControlPruneCandidate candidate;
-  candidate.finalBegin = begin;
-  candidate.finalEnd = end;
-  candidate.origin = origin;
-  candidate.physicalOwner = std::move(owner);
-  candidate.producerProven = true;
-  return candidate;
+    std::optional<FinalLineControlOwnerKey> owner,
+    FinalLineControlObligation obligation) {
+  return MakeFinalLineControlPruneCandidate(begin, end, origin, std::move(owner),
+                                            /*producerProven=*/true, obligation);
 }
 
 /// Append source candidates to destination after shifting their offsets by delta.
@@ -2091,7 +1987,8 @@ static std::optional<FinalLineControlPruneCandidate>
 makeInsertedSyntheticLineControlPruneCandidate(
     StringRef before, StringRef after, StringRef directive,
     FinalLineDirective::Origin origin,
-    std::optional<FinalLineControlOwnerKey> owner) {
+    std::optional<FinalLineControlOwnerKey> owner,
+    FinalLineControlObligation obligation) {
   if (directive.empty())
     return std::nullopt;
   if (after.size() != before.size() + directive.size())
@@ -2114,15 +2011,16 @@ makeInsertedSyntheticLineControlPruneCandidate(
   return makeSyntheticLineControlPruneCandidate(
       static_cast<uint64_t>(prefix),
       static_cast<uint64_t>(prefix + directive.size()), origin,
-      std::move(owner));
+      std::move(owner), obligation);
 }
 
 /// Remove duplicate candidate records after composition/duplicate-edit merging.
 ///
-/// Candidate equality is intentionally byte-range plus origin: the final pruner
-/// only needs to know that the concrete directive range is eligible.  Keeping
-/// one stable record per directive avoids trace noise while preserving the
-/// fail-closed matching rule.
+/// Candidate equality is byte-range based because the final pruner matches the
+/// concrete directive bytes.  Phase 6E preserves compact obligation/removal
+/// proofs only when duplicate generation sites agree exactly; conflicting
+/// metadata is discarded fail-closed while leaving the operational candidate
+/// eligible under the existing authoritative final model.
 static void deduplicateLineControlPruneCandidates(
     std::vector<FinalLineControlPruneCandidate> &candidates) {
   llvm::sort(candidates, [](const FinalLineControlPruneCandidate &lhs,
@@ -2134,15 +2032,30 @@ static void deduplicateLineControlPruneCandidates(
     return static_cast<unsigned>(lhs.origin) < static_cast<unsigned>(rhs.origin);
   });
 
-  candidates.erase(
-      std::unique(candidates.begin(), candidates.end(),
-                  [](const FinalLineControlPruneCandidate &lhs,
-                     const FinalLineControlPruneCandidate &rhs) {
-                    return lhs.finalBegin == rhs.finalBegin &&
-                           lhs.finalEnd == rhs.finalEnd &&
-                           lhs.origin == rhs.origin;
-                  }),
-      candidates.end());
+  std::vector<FinalLineControlPruneCandidate> deduped;
+  deduped.reserve(candidates.size());
+  for (FinalLineControlPruneCandidate candidate : candidates) {
+    if (!deduped.empty() && deduped.back().finalBegin == candidate.finalBegin &&
+        deduped.back().finalEnd == candidate.finalEnd &&
+        deduped.back().origin == candidate.origin) {
+      FinalLineControlPruneCandidate &merged = deduped.back();
+      if (!SameFinalLineControlOwner(merged.physicalOwner,
+                                     candidate.physicalOwner))
+        merged.physicalOwner = std::nullopt;
+      if (!SameFinalLineControlObligationProof(merged.obligationProof,
+                                               candidate.obligationProof))
+        merged.obligationProof = std::nullopt;
+      if (!SameFinalLineControlRemovalProof(merged.removalProof,
+                                            candidate.removalProof))
+        merged.removalProof = std::nullopt;
+      merged.producerProven = merged.producerProven || candidate.producerProven;
+      continue;
+    }
+
+    deduped.push_back(std::move(candidate));
+  }
+
+  candidates = std::move(deduped);
 }
 
 RefoldEngine::LineControlWrappedText
@@ -2217,9 +2130,9 @@ RefoldEngine::WrapIncludeExpansionForMaterialization(
       [&](const OwnerStateBoundary &boundary, OwnerStateComponent component,
           StateMutationKind mutation, StringRef phase, StringRef detail,
           bool requireKnownObserver) {
-        return CheckLineControlStateTransitionAcrossEditBoundary(
+        return CheckStateTransitionAcrossEditBoundary(
             boundary, component, mutation,
-            BuildLineControlStateRepairWitness(boundary, component, detail),
+            BuildStateTransitionWitness(SuffixStabilityWitnessKind::StateRepair, component, boundary, detail),
             phase, detail, requireKnownObserver);
       };
 
@@ -2237,14 +2150,15 @@ RefoldEngine::WrapIncludeExpansionForMaterialization(
   auto appendSyntheticDirective = [&](std::string directive,
                                       FinalLineDirective::Origin origin,
                                       std::optional<FinalLineControlOwnerKey> owner,
-                                      bool removableCandidate) {
+                                      bool removableCandidate,
+                                      FinalLineControlObligation obligation) {
     const uint64_t begin = static_cast<uint64_t>(wrapped.text.size());
     wrapped.text += directive;
     const uint64_t end = static_cast<uint64_t>(wrapped.text.size());
     if (removableCandidate) {
       wrapped.lineControlPruneCandidates.push_back(
           makeSyntheticLineControlPruneCandidate(begin, end, origin,
-                                                 std::move(owner)));
+                                                 std::move(owner), obligation));
     }
   };
 
@@ -2269,22 +2183,17 @@ RefoldEngine::WrapIncludeExpansionForMaterialization(
           lineDirs_.FormatLineDirective(childEntryLineNo, childFileSpelling),
           FinalLineDirective::Origin::SyntheticIncludeEntry,
           FinalLineControlOwnerKey(childFileSpelling, child.id),
-          /*removableCandidate=*/true);
+          /*removableCandidate=*/true,
+          childNeedsLineState ? FinalLineControlObligation::SourceStateRepair
+                              : FinalLineControlObligation::LayoutBoundaryRepair);
       return;
     }
 
-    trace("linedir/include",
-          "skip include entry #line inc#{0}: materialized child has no "
-          "preserved line-state observer and no parent layout barrier",
-          child.id);
   };
 
   auto appendParentReturnIfDemanded = [&]() {
     if (parentNeedsLineState) {
       if (parentReturnShouldDeferToConditionalJoin()) {
-        trace("linedir/include",
-              "defer include return #line inc#{0}: parent observer after "
-              "conditional join must be repaired at the join", child.id);
         return;
       }
       const OwnerStateBoundary parentReturnBoundary =
@@ -2311,14 +2220,11 @@ RefoldEngine::WrapIncludeExpansionForMaterialization(
           FinalLineDirective::Origin::SyntheticIncludeReturn,
           FinalLineControlOwnerKey(parentOwnerFileForDemand.str(),
                                    parentOwnerIncludeId),
-          /*removableCandidate=*/true);
+          /*removableCandidate=*/true,
+          FinalLineControlObligation::IncludeReturnRepair);
       return;
     }
 
-    trace("linedir/include",
-          "skip include return #line inc#{0}: parent suffix has no "
-          "preserved line-state observer after byte {1}",
-          child.id, parentResumeOffset);
   };
 
   if (!allowUnobservableLineDirectiveSuppression) {
@@ -2340,10 +2246,6 @@ RefoldEngine::WrapIncludeExpansionForMaterialization(
 
   if (childBody.empty() && !childNeedsLineState && !childNeedsLayoutBarrier &&
       !parentNeedsLineState) {
-    trace("linedir/include",
-          "skip empty sideband-only include #line wrapper inc#{0}: no "
-          "preserved line-state observers and no layout barrier",
-          child.id);
     appendChildBody();
     return wrapped;
   }
@@ -2356,13 +2258,6 @@ RefoldEngine::WrapIncludeExpansionForMaterialization(
     wrapped.text += '\n';
   appendParentReturnIfDemanded();
 
-  trace("linedir/include",
-        "wrap sideband-only include inc#{0}: childLineState={1} "
-        "childLayout={2} parentLineState={3} visibleBody={4}",
-        child.id, childNeedsLineState ? "YES" : "NO",
-        childNeedsLayoutBarrier ? "YES" : "NO",
-        parentNeedsLineState ? "YES" : "NO",
-        childBody.empty() ? "NO" : "YES");
   deduplicateLineControlPruneCandidates(wrapped.lineControlPruneCandidates);
   deduplicateLineControlSourceMappings(wrapped.lineControlSourceMappings);
   return wrapped;
@@ -2392,7 +2287,6 @@ void RefoldEngine::MaterializeIncludeExpansion(
     // more precise source-line witness still enter at the header start.
     if (!includeExpansionStartLineNos.count(includeId))
       includeExpansionStartLineNos[includeId] = 1;
-    debug("include/mat", "SKIP inc#{0} (already materialized)", includeId);
     return;
   }
 
@@ -2400,11 +2294,6 @@ void RefoldEngine::MaterializeIncludeExpansion(
   if (!inc)
     fatal("include/mat", "unknown includeId {0}", includeId);
 
-  debug("include/mat",
-        "ENTER inc#{0} target={1} resolved={2} sitePath={3} site=[{4},{5}) "
-        "cover=[{6},{7})",
-        inc->id, inc->target, inc->resolvedPath, inc->sitePath, inc->siteB,
-        inc->siteE, inc->cover.begin, inc->cover.end);
 
   const std::string headerPath = resolveHeaderPath(*inc);
 
@@ -2423,23 +2312,9 @@ void RefoldEngine::MaterializeIncludeExpansion(
 
     const MemoryBuffer &mb = **bufOrErr;
     bytes.assign(mb.getBufferStart(), mb.getBufferEnd());
-  } else {
-    debug("include/mat", "inc#{0} using preseeded bytes len={1}", inc->id,
-          bytes.size());
   }
 
   auto editsIt = perInclude.find(includeId);
-  auto macroIt = macroPatchesByOwner.find(includeId);
-  auto childIt = children.find(includeId);
-
-  debug(
-      "include/mat",
-      "inc#{0} initialHeaderLen={1} patches={2} macroPatches={3} children={4}",
-      inc->id, bytes.size(),
-      (editsIt != perInclude.end()) ? editsIt->second.patches.size() : 0,
-      (macroIt != macroPatchesByOwner.end()) ? macroIt->second.size() : 0,
-      (childIt != children.end()) ? childIt->second.size() : 0);
-
   // Accumulate all local edits in this header byte space, then apply them once
   // at the end. This lets include edits, macro patches, and child include
   // materializations participate in one overlap/resync pass.
@@ -2507,13 +2382,6 @@ void RefoldEngine::MaterializeIncludeExpansion(
       // pragma in the materialized header.  The sideband proof is still
       // necessary for owner selection and token-stream normalization, but the
       // include patch is the unique replay owner for the visible bytes.
-      trace("pragma/sideband",
-            "skip header-owned sideband pragma edit inc#{0} path='{1}' "
-            "site=[{2},{3}) because an include insertion patch already carries "
-            "B replay [{4},{5})",
-            includeId, headerPath, sourceRange.first, sourceRange.second,
-            sideband.MaterializedBByteRange().first,
-            sideband.MaterializedBByteRange().second);
       continue;
     }
 
@@ -2555,11 +2423,6 @@ void RefoldEngine::MaterializeIncludeExpansion(
                   AcceptedPathKind::IncludeMaterializedExpansion, *inc));
     edits.push_back(std::move(edit));
 
-    trace("pragma/sideband",
-          "staged header-owned sideband pragma edit inc#{0} path='{1}' "
-          "site=[{2},{3}) replacementLen={4}",
-          includeId, headerPath, sourceRange.first, sourceRange.second,
-          sideband.ReplacementTextSize());
   }
 
   // Step 2 replay-context stability, include-owned macro-state repair.
@@ -2593,8 +2456,8 @@ void RefoldEngine::MaterializeIncludeExpansion(
       [&](const OwnerStateBoundary &boundary, StateMutationKind mutation,
           SuffixStabilityWitness witness, StringRef phase, StringRef detail,
           bool requireKnownObserver) {
-        return CheckMacroStateTransitionAcrossEditBoundary(
-            boundary, mutation, std::move(witness), phase, detail,
+        return CheckStateTransitionAcrossEditBoundary(
+            boundary, OwnerStateComponent::MacroState, mutation, std::move(witness), phase, detail,
             requireKnownObserver);
       };
 
@@ -2603,7 +2466,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
           StringRef detail) {
         return checkMaterializedHeaderMacroState(
             boundary, mutation,
-            BuildMacroStateTerminalFailureWitness(boundary, detail),
+            BuildStateTransitionWitness(SuffixStabilityWitnessKind::TerminalStateFailure, OwnerStateComponent::MacroState, boundary, detail),
             "include/materialized-macro-state", detail,
             /*requireKnownObserver=*/true);
       };
@@ -2613,7 +2476,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
           StringRef detail) {
         return checkMaterializedHeaderMacroState(
             boundary, mutation,
-            BuildMacroStateClosureWideningWitness(boundary, detail),
+            BuildStateTransitionWitness(SuffixStabilityWitnessKind::ClosureWidening, OwnerStateComponent::MacroState, boundary, detail),
             "include/materialized-macro-state", detail,
             /*requireKnownObserver=*/false);
       };
@@ -2898,11 +2761,6 @@ void RefoldEngine::MaterializeIncludeExpansion(
               .str());
     }
 
-    trace("include/mat",
-          "inc#{0} stabilized macroPatch [{1},{2}) by carrying {3} "
-          "active header #define directive(s) after replay interval "
-          "[{4},{5})",
-          includeId, mp.invStart, mpEnd, candidates.size(), newStart, newEnd);
 
     StabilizedMaterializedHeaderMacroPatch stabilized;
     stabilized.start = newStart;
@@ -2925,15 +2783,6 @@ void RefoldEngine::MaterializeIncludeExpansion(
     for (const auto &mp : it->second) {
       uint64_t mpEnd = stringutils::extendChainedCallEnd(
           StringRef(bytes), mp.invEnd, mp.replacement);
-      if (mpEnd != mp.invEnd) {
-        debug("macro/chain",
-              "inc#{0} extend chained callsite [{1},{2}) -> [{1},{3})", inc->id,
-              mp.invStart, mp.invEnd, mpEnd);
-      }
-
-      debug("include/mat", "inc#{0} macroPatch inv=[{1},{2}) replLen={3}",
-            inc->id, mp.invStart, mpEnd, mp.replacement.size());
-
       uint64_t editStart = mp.invStart;
       uint64_t editEnd = mpEnd;
       std::string editReplacement = mp.replacement;
@@ -2978,8 +2827,6 @@ void RefoldEngine::MaterializeIncludeExpansion(
   // from B using the include-realization proof path.
   if (auto it = perInclude.find(includeId); it != perInclude.end()) {
     if (!it->second.patches.empty()) {
-      debug("include/mat", "inc#{0} adding {1} include patches as TextEdits",
-            inc->id, it->second.patches.size());
 
       IncludeTextEditPlan plan = ComputeIncludeTextEdits(it->second, bytes);
       if (plan.requiresIncludeRealization) {
@@ -3003,11 +2850,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
         // duplicate the same local resume before the copied suffix.
         edits.push_back(std::move(te));
       }
-    } else {
-      debug("include/mat", "inc#{0} has no include patches", inc->id);
     }
-  } else {
-    debug("include/mat", "inc#{0} has no include patches", inc->id);
   }
 
   // Return true if this include subtree contains any work that requires
@@ -3135,14 +2978,6 @@ void RefoldEngine::MaterializeIncludeExpansion(
           if (PathsEqual(*tuInc.resolvedPath, *child.resolvedPath))
             continue;
 
-          debug("include/tree",
-                "materialize clean child inc#{0}: quoted include path {1} "
-                "resolved to {2} in original child context but same-spelling "
-                "TU inc#{3} resolved to {4}; preserving the child inside "
-                "materialized parent text would replay under the TU lookup "
-                "context",
-                child.id, *childReplayPath, *child.resolvedPath, tuInc.id,
-                *tuInc.resolvedPath);
           return true;
         }
 
@@ -3165,21 +3000,17 @@ void RefoldEngine::MaterializeIncludeExpansion(
     }
 
     if (selfWork) {
-      debug("include/tree", "hasWork inc#{0}: selfWork=YES", id);
       return true;
     }
 
     if (auto it = children.find(id); it != children.end()) {
       for (const auto *child : it->second) {
         if (self(self, child->id)) {
-          debug("include/tree", "hasWork inc#{0}: via child#{1} => YES", id,
-                child->id);
           return true;
         }
       }
     }
 
-    debug("include/tree", "hasWork inc#{0}: NO", id);
     return false;
   };
 
@@ -3189,11 +3020,6 @@ void RefoldEngine::MaterializeIncludeExpansion(
   if (auto it = children.find(includeId); it != children.end()) {
     for (const auto *child : it->second) {
       const bool todo = hasDescendantWork(hasDescendantWork, child->id);
-      debug("include/mat",
-            "inc#{0} -> child#{1} target={2} resolved={3} site=[{4},{5}) "
-            "expand={6}",
-            inc->id, child->id, child->target, child->resolvedPath,
-            child->siteB, child->siteE, todo ? "YES" : "NO");
       if (!todo) {
         // No descendant edits depend on this child, so preserve the original
         // include directive instead of expanding it unnecessarily.
@@ -3215,17 +3041,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
       const uint64_t siteStart = std::clamp<uint64_t>(child->siteB, 0ULL, n);
       const uint64_t siteEnd = std::clamp<uint64_t>(child->siteE, siteStart, n);
 
-      debug("include/mat",
-            "REPLACE in inc#{0}: site=[{1},{2}) len(parent)={3} with child#{4} "
-            "len(childText)={5}",
-            inc->id, siteStart, siteEnd, bytes.size(), child->id,
-            childText.size());
 
-      debug("tu/replace",
-            "TU replace site=[{0},{1}) with inc#{2} len={3} (target={4} "
-            "resolved={5})",
-            siteStart, siteEnd, child->id, childText.size(), child->target,
-            child->resolvedPath);
 
       if (siteStart < siteEnd) {
         const bool sidebandOnly =
@@ -3284,10 +3100,6 @@ void RefoldEngine::MaterializeIncludeExpansion(
         // A degenerate child site cannot discharge an include-preserving edit
         // plan for the parent. Select the explicit include-realization proof
         // class for the whole parent include immediately.
-        debug("include/mat",
-              "inc#{0} child#{1} has degenerate site [start={2},end={3}]; "
-              "realizing parent include from B",
-              inc->id, child->id, siteStart, siteEnd);
         AcceptedResultCandidate realizationCandidate;
         if (auto realized = BuildInlineIncludeRealizationFromB(
                 *inc,
@@ -3345,8 +3157,6 @@ void RefoldEngine::MaterializeIncludeExpansion(
 
   const size_t firstEmittedHeaderLine = computeFirstEmittedHeaderLine();
 
-  debug("include/mat", "inc#{0} applying {1} header TextEdits", inc->id,
-        edits.size());
 
   // Apply all staged edits in this header. If application requests terminal
   // fallback, leave this include empty so callers do not consume a partial
@@ -3357,7 +3167,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
       bytes, edits, appliedExpandedMacroRootIds, headerPath, includeId,
       /*materializedEditMappings=*/nullptr, &appliedLineControlCandidates,
       &appliedLineControlSourceMappings);
-  if (terminalFallbackRequested_) {
+  if (HasTerminalFallbackRequest()) {
     includeExpansion[includeId] = std::string();
     includeExpansionLineControlPruneCandidates[includeId].clear();
     includeExpansionLineControlSourceMappings[includeId].clear();
@@ -3375,8 +3185,6 @@ void RefoldEngine::MaterializeIncludeExpansion(
   includeExpansionAcceptedResults[includeId] =
       BuildAcceptedIncludeRealizationCandidate(
           AcceptedPathKind::IncludeMaterializedExpansion, *inc);
-  debug("include/mat", "EXIT inc#{0} resultLen={1}", inc->id,
-        includeExpansion[includeId].size());
 }
 
 const RefoldModel::HeaderDecl *
@@ -3441,11 +3249,6 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
 
   const size_t fileLen = headerText.size();
 
-  debug("include/apply",
-        "ENTER computeIncludeTextEdits file={0} len={1} patches={2} "
-        "cover=[{3},{4})",
-        file, fileLen, ie.patches.size(), ie.include->cover.begin,
-        ie.include->cover.end);
 
   // PP cover for this include inside the header; if not present, these will
   // already have been derived from spans when building the model.
@@ -4648,11 +4451,6 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                                   coalesced.bEnd)
                                   .str();
       skipThrough = endIdx;
-      trace("include/apply",
-            "file={0} coalesced patch[{1}..{2}] across consumed header "
-            "conditional group: A=[{3},{4}) B=[{5},{6})",
-            file, idx, skipThrough, coalesced.aStart, coalesced.aEnd,
-            coalesced.bStart, coalesced.bEnd);
       return true;
     }
 
@@ -4728,11 +4526,6 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       coalesced.bEnd = second.bEnd;
       coalesced.insertBytes = std::move(newInsert);
       skipThrough = idx + 1;
-      trace("include/apply",
-            "file={0} coalesced patch[{1}..{2}] across material child "
-            "include #{3}: A=[{4},{5}) B=[{6},{7})",
-            file, idx, skipThrough, child.id, coalesced.aStart,
-            coalesced.aEnd, coalesced.bStart, coalesced.bEnd);
       return true;
     }
 
@@ -4758,33 +4551,20 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     }
 
     const IncludePatch &p = *patchPtr;
-    trace("include/patch", "computeIncludeTextEdits: patch={0}", p);
 
     const bool isInsert = (p.aStart == p.aEnd) && (p.bStart < p.bEnd);
     const bool isDelete = (p.aStart < p.aEnd) && (p.bStart == p.bEnd);
     const bool isReplace = (p.aStart < p.aEnd) && (p.bStart < p.bEnd);
 
-    debug("include/apply",
-          "file={0} patch[{1}] raw A=[{2},{3}) B=[{4},{5}) isInsert={6} "
-          "isDelete={7} isReplace={8}",
-          file, idx, p.aStart, p.aEnd, p.bStart, p.bEnd, isInsert, isDelete,
-          isReplace);
 
     if (!isInsert && !isDelete && !isReplace) {
       // Ignore empty or malformed patches defensively.
-      debug("include/apply",
-            "file={0} patch[{1}] ignored (no-op classification)", file, idx);
       continue;
     }
 
     if (p.hasDirectHeaderByteRange) {
       if (p.directHeaderByteBegin > p.directHeaderByteEnd ||
           p.directHeaderByteEnd > fileLen) {
-        debug("include/apply",
-              "file={0} patch[{1}] direct header byte range [{2},{3}) is "
-              "outside file length {4}; realizing include",
-              file, idx, p.directHeaderByteBegin, p.directHeaderByteEnd,
-              fileLen);
         plan.requiresIncludeRealization = true;
         plan.realizationReason =
             llvm::formatv("direct include layout patch[{0}] has invalid "
@@ -4805,12 +4585,6 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       directWitness.hasLastPP = p.aStart < p.aEnd;
       directWitness.lastPP = p.aStart < p.aEnd ? p.aEnd - 1 : p.aStart;
 
-      trace("include/apply",
-            "file={0} patch[{1}] direct header layout bytes=[{2},{3}) "
-            "A=[{4},{5}) B=[{6},{7}) repl='{8}'",
-            file, idx, p.directHeaderByteBegin, p.directHeaderByteEnd,
-            p.aStart, p.aEnd, p.bStart, p.bEnd,
-            stringutils::showWsWithClip(p.insertBytes, 120));
 
       TextEdit edit{p.directHeaderByteBegin, p.directHeaderByteEnd,
                     p.insertBytes, std::nullopt, std::nullopt, {}, {}, {}};
@@ -4824,16 +4598,6 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
 
     // Decide which logical header decl "owns" this patch, if any.
     const auto *decl = FindHeaderDeclForPatch(*ie.include, p);
-
-    if (decl) {
-      debug("include/apply",
-            "file={0} patch[{1}] ownerDecl kind={2} name={3} header=[{4},{5}) "
-            "pp-span=[{6},{7})",
-            file, idx, decl->kind, decl->name, decl->headerB, decl->headerE,
-            decl->span.begin, decl->span.end);
-    } else {
-      debug("include/apply", "file={0} patch[{1}] ownerDecl=<none>", file, idx);
-    }
 
     // Effective PP coverage in this header we're allowed to touch.
     // For INSERTs we deliberately work at include scope so that inserts that
@@ -4849,9 +4613,6 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     }
     ppHi = std::max(ppHi, ppLo);
 
-    trace("include/apply",
-          "file={0} patch[{1}] effectivePP=[{2},{3}) cover=[{4},{5})", file,
-          idx, ppLo, ppHi, coverBegin, coverEnd);
 
     std::optional<uint64_t> startByte;
     std::optional<uint64_t> endByte;
@@ -4991,12 +4752,6 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
             sliceTokenEnvelope(bTokOff_, bSource_, materialBStart,
                                materialBEnd)
                 .str();
-        trace("include/apply",
-              "file={0} patch[{1}] INSERT: normalized duplicated boundary "
-              "token across source line-control gap bytes=[{2},{3}) "
-              "Apos={4} B=[{5},{6}) insertPos={7}",
-              file, idx, *leftEnd, *rightBegin, materialAStart,
-              materialBStart, materialBEnd, materialInsertPos);
       };
 
       normalizeDuplicatedBoundaryTokenAcrossLineControlGap();
@@ -5036,11 +4791,6 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                                            materialBStart + childTokenCount))
             continue;
 
-          trace("include/apply",
-                "file={0} patch[{1}] preserving child include prefix inc#{2} "
-                "A=[{3},{4}) B=[{5},{6})",
-                file, idx, child.id, child.cover.begin, child.cover.end,
-                materialBStart, materialBStart + childTokenCount);
           materialAStart = child.cover.end;
           materialBStart += childTokenCount;
           materialInsertBytes =
@@ -5074,23 +4824,19 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         uint64_t anchorByte = 0;
       };
 
-      // Patch A introduced the normalized include candidate carrier. Patch B
-      // moved this anchor competition onto the shared selector, and Patch C
-      // now requires each wrapped anchor candidate to discharge its local
-      // include-preserving proof obligations before it can participate.
-      auto traceInsertCandidate = [&](const InsertAnchorCandidate &candidate,
-                                      StringRef stage) {
-        const AcceptedResultCandidate acceptedCandidate =
-            BuildAcceptedIncludeCandidate(candidate.path, p,
-                                          &candidate.witness);
+      struct SelectedInsertAnchorCandidate {
+        InsertAnchorCandidate anchor;
+        AcceptedResultCandidate accepted;
       };
 
       // Select the best theorem-facing insertion anchor by wrapping each local
       // anchor candidate in the accepted-result carrier and letting the shared
-      // proof-discharge/lattice selector choose among them.
+      // proof-discharge/lattice selector choose among them.  Phase 3B returns
+      // the accepted carrier together with the path-local anchor, so the commit
+      // path does not have to rediscover or rebuild the proof that won.
       auto selectBestInsertCandidate =
           [&](ArrayRef<InsertAnchorCandidate> candidates)
-          -> std::optional<InsertAnchorCandidate> {
+          -> std::optional<SelectedInsertAnchorCandidate> {
         if (candidates.empty())
           return std::nullopt;
 
@@ -5101,24 +4847,24 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
               candidate.path, p, &candidate.witness));
         }
 
-        const std::optional<size_t> bestIdx =
-            SelectPreferredAcceptedResultCandidateIndex(acceptedCandidates);
-        if (!bestIdx) {
-          trace("include/apply",
-                "file={0} patch[{1}] INSERT: no candidate survived "
-                "proof-discharge "
-                "gating",
-                file, idx);
+        const std::optional<SelectedAcceptedResultCandidate> selected =
+            SelectPreferredAcceptedResultCandidate(acceptedCandidates);
+        if (!selected) {
           return std::nullopt;
         }
 
-        return candidates[*bestIdx];
+        SelectedInsertAnchorCandidate result;
+        result.anchor = candidates[selected->index];
+        result.accepted = selected->candidate;
+        return result;
       };
 
       // Materialize the selected insertion anchor as a header-local TextEdit,
       // applying boundary padding and line-resync handling before attaching the
-      // accepted include-candidate carrier.
-      auto commitInsertCandidate = [&](const InsertAnchorCandidate &candidate) {
+      // exact accepted include-candidate carrier that won selection.
+      auto commitInsertCandidate =
+          [&](const SelectedInsertAnchorCandidate &selected) {
+        const InsertAnchorCandidate &candidate = selected.anchor;
         std::string text = PadAtBoundaries(
             headerText, static_cast<size_t>(candidate.anchorByte),
             static_cast<size_t>(candidate.anchorByte), materialInsertBytes,
@@ -5235,9 +4981,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                             : TextEdit{candidate.anchorByte,
                                        candidate.anchorByte, std::move(text),
                                        std::nullopt, std::nullopt, {}, {}, {}};
-        AttachAcceptedResultCarrier(
-            edit, BuildAcceptedIncludeCandidate(candidate.path, p,
-                                                &candidate.witness));
+        AttachAcceptedResultCarrier(edit, selected.accepted);
         plan.edits.push_back(std::move(edit));
       };
 
@@ -5282,7 +5026,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         // First try the strongest insertion anchors: boundaries already tied to
         // the selected conditional arm or to a child include boundary. Phase 8d
         // classifies the child-boundary case as a declared include-preserving
-        // proof, not as a rescue path: the witness names the direct child
+        // proof, not as an unclassified fallback branch: the witness names the direct child
         // include whose spelled directive supplies the anchor. These anchors
         // preserve include structure without relying on neighboring PP tokens.
         SmallVector<InsertAnchorCandidate, 2> topTierCandidates;
@@ -5303,7 +5047,6 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
               candidate.witness.hasCondArmId = true;
               candidate.witness.condArmId = rightArmRef->arm->id;
             }
-            traceInsertCandidate(candidate, "selected-conditional-boundary");
             topTierCandidates.push_back(std::move(candidate));
           }
         }
@@ -5319,7 +5062,6 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
             candidate.witness = childBoundaryWitness;
             candidate.witness.hasAnchorByte = true;
             candidate.witness.anchorByte = *insertByte;
-            traceInsertCandidate(candidate, "child-boundary");
             topTierCandidates.push_back(std::move(candidate));
           }
         }
@@ -5352,10 +5094,6 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         rightNeighborWitness.hasAnchorByte = rightStartByte.has_value();
         rightNeighborWitness.anchorByte =
             rightStartByte ? *rightStartByte : 0ULL;
-        trace("include/apply",
-              "file={0} patch[{1}] INSERT: right-neighbor anchorPP={2} -> "
-              "startByte={3}",
-              file, idx, rightAnchorPP, rightStartByte);
         if (!rightStartByte) {
           plan.requiresIncludeRealization = true;
           plan.realizationReason =
@@ -5369,9 +5107,12 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
           candidate.path = AcceptedPathKind::IncludeInsertRightNeighborPP;
           candidate.anchorByte = *rightStartByte;
           candidate.witness = rightNeighborWitness;
-          traceInsertCandidate(candidate, "right-neighbor");
-          commitInsertCandidate(candidate);
-          continue;
+          SmallVector<InsertAnchorCandidate, 1> rightCandidates;
+          rightCandidates.push_back(std::move(candidate));
+          if (auto selected = selectBestInsertCandidate(rightCandidates)) {
+            commitInsertCandidate(*selected);
+            continue;
+          }
         }
       }
 
@@ -5417,10 +5158,6 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         leftNeighborWitness.neighborPP = *leftAnchorPP;
         leftNeighborWitness.hasAnchorByte = leftAnchorByte.has_value();
         leftNeighborWitness.anchorByte = leftAnchorByte ? *leftAnchorByte : 0ULL;
-        trace("include/apply",
-              "file={0} patch[{1}] INSERT: left-neighbor anchorPP={2} -> "
-              "startByte={3} anchorByte={4}",
-              file, idx, leftAnchorPP, leftStartByte, leftAnchorByte);
         if (!leftAnchorByte) {
           plan.requiresIncludeRealization = true;
           plan.realizationReason =
@@ -5435,7 +5172,6 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
           candidate.path = AcceptedPathKind::IncludeInsertLeftNeighborPP;
           candidate.anchorByte = *leftAnchorByte;
           candidate.witness = leftNeighborWitness;
-          traceInsertCandidate(candidate, "left-neighbor");
           secondaryCandidates.push_back(std::move(candidate));
         }
       } else if (decl) {
@@ -5452,15 +5188,11 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         declWitness.hasDeclHeaderRange = true;
         declWitness.declHeaderB = decl->headerB;
         declWitness.declHeaderE = decl->headerE;
-        trace("include/apply",
-              "file={0} patch[{1}] INSERT: no neighbors; anchor at declEnd={2}",
-              file, idx, declAnchorByte);
         if (anchorMatchesCondArmCert(declAnchorByte)) {
           InsertAnchorCandidate candidate;
           candidate.path = AcceptedPathKind::IncludeInsertDeclBoundary;
           candidate.anchorByte = declAnchorByte;
           candidate.witness = declWitness;
-          traceInsertCandidate(candidate, "decl-boundary");
           secondaryCandidates.push_back(std::move(candidate));
         }
       }
@@ -5473,10 +5205,6 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       // No include-preserving insertion anchor discharged. Switch to the
       // explicit include-realization path instead of manufacturing a weaker
       // insertion witness.
-      debug("include/apply.",
-            "file={0} patch[{1}] INSERT: no admissible include-preserving "
-            "anchor; realizing include",
-            file, idx);
       plan.requiresIncludeRealization = true;
       plan.realizationReason =
           llvm::formatv("INSERT: cannot anchor include patch in file {0} "
@@ -5492,9 +5220,6 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       uint64_t aHi = std::min(materialAEnd, ppHi);
       if (aHi <= aLo) {
         // Nothing of this patch lies in this header/declaration.
-        debug("include/apply",
-              "file={0} patch[{1}] DELETE/REPLACE: empty intersection; SKIP",
-              file, idx);
         continue;
       }
 
@@ -5515,10 +5240,6 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         // The token intersection exists in PP space, but none of those tokens
         // have a source mapping into this header. Fall back to include
         // realization rather than manufacturing a header byte range.
-        debug("include/apply",
-              "file={0} patch[{1}] DELETE/REPLACE: no mapped PP tokens in "
-              "header; SKIP",
-              file, idx);
         plan.requiresIncludeRealization = true;
         plan.realizationReason =
             llvm::formatv("DELETE/REPLACE: no mapped PP tokens for patch[{0}] "
@@ -5544,10 +5265,6 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
           startByte.has_value() && endByte.has_value();
       mappedHeaderWitness.startByte = startByte ? *startByte : 0ULL;
       mappedHeaderWitness.endByte = endByte ? *endByte : 0ULL;
-      trace("include/apply",
-            "file={0} patch[{1}] DELETE/REPLACE: firstPP={2} lastPP={3} -> "
-            "bytes=[{4},{5})",
-            file, idx, firstPP, lastPP, startByte, endByte);
 
       // If either endpoint cannot be projected into header bytes, this patch
       // cannot be represented as an include-preserving mapped-header edit.
@@ -5944,11 +5661,6 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
             mappedHeaderWitness.endByte = sourceEnvelope->end;
             mappedHeaderWitness.firstPP = hunkSourcePieces.front().ppBegin;
             mappedHeaderWitness.lastPP = hunkSourcePieces.back().ppEnd - 1;
-            trace("include/apply",
-                  "file={0} patch[{1}] DELETE/REPLACE: widened across "
-                  "header source gap bytes=[{2},{3}) preserved={4} pieces={5}",
-                  file, idx, sourceEnvelope->begin, sourceEnvelope->end,
-                  headerGapPreservations.size(), hunkSourcePieces.size());
           }
         }
       }
@@ -6179,12 +5891,6 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                 carriedReplacement.push_back('\n');
             }
 
-            trace("include/apply",
-                  "file={0} patch[{1}] carried {2} active header #define "
-                  "directive(s) after replacement bytes=[{3},{4}) -> "
-                  "[{5},{6})",
-                  file, idx, carryCandidates.size(), *startByte, *endByte,
-                  newStart, replacementTailEnd);
 
             *startByte = newStart;
             *endByte = replacementTailEnd;
@@ -6219,10 +5925,6 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                 HeaderPreservedGapPiece::Kind::BalancedPragmaStateIsland &&
             balancedDiagnosticPragmaStateIslandIsCarriedByReplacement(
                 StringRef(pieceText), StringRef(replacement), lexLang_)) {
-          trace("include/apply",
-                "file={0} patch[{1}] balanced pragma-state island id={2} "
-                "source=[{3},{4}) already carried by B replacement",
-                file, idx, piece.id, piece.begin, piece.end);
           continue;
         }
 
@@ -6261,7 +5963,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
           makeSyntheticLineControlPruneCandidate(
               resumeBegin, resumeEnd,
               FinalLineDirective::Origin::SyntheticSourceLineResume,
-              FinalLineControlOwnerKey(file, ie.include->id)));
+              FinalLineControlOwnerKey(file, ie.include->id),
+              FinalLineControlObligation::HeaderResumeRepair));
 
       const OwnerStateBoundary sourceLineResumeBoundary =
           OwnerStateBoundary::FromSource(OwnerSourceRange::From(
@@ -6273,10 +5976,9 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                           "#{0} patch[{1}] component={2} sourceEnd={3}",
                           ie.include->id, idx, toString(component), *endByte)
                 .str();
-        (void)CheckLineControlStateTransitionAcrossEditBoundary(
+        (void)CheckStateTransitionAcrossEditBoundary(
             sourceLineResumeBoundary, component, StateMutationKind::Replayed,
-            BuildLineControlStateRepairWitness(sourceLineResumeBoundary,
-                                               component, detail),
+            BuildStateTransitionWitness(SuffixStabilityWitnessKind::StateRepair, component, sourceLineResumeBoundary, detail),
             "include/source-line-resume", detail,
             /*requireKnownObserver=*/false);
       };
@@ -6284,51 +5986,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       checkHeaderSourceLineResume(OwnerStateComponent::FileState);
       checkHeaderSourceLineResume(OwnerStateComponent::FileName);
 
-      trace("include/apply",
-            "file={0} patch[{1}] emitted source #line resume line={2} "
-            "resumeFile={3}",
-            file, idx, headerSourceLineDirectiveResume->lineAtResume,
-            headerSourceLineDirectiveResume->fileSpelling);
     }
 
-    if (inTraceMode()) {
-      StringRef opKind =
-          isInsert ? "INSERT" : (isDelete ? "DELETE" : "REPLACE");
-
-      // Log the concrete header slice and replacement payload at the byte range
-      // that will be staged. This is intentionally after all clamping so the
-      // trace reflects the actual emitted edit.
-      const std::string originalSlice =
-          headerText.substr(*startByte, *endByte - *startByte);
-      std::string origDbg = originalSlice;
-      std::string replDbg = replacement;
-      constexpr int MAX_DBG = 120;
-      if (origDbg.size() > MAX_DBG) {
-        origDbg = origDbg.substr(0, MAX_DBG) + "…";
-      }
-      if (replDbg.size() > MAX_DBG) {
-        replDbg = replDbg.substr(0, MAX_DBG) + "…";
-      }
-
-      // Include declaration context when available; it explains why the final
-      // byte range may have been clamped narrower than the raw mapped PP-token
-      // envelope.
-      std::string declInfo = "<none>";
-      if (decl) {
-        declInfo =
-            formatv("kind={0} name={1} header=[{2},{3}) pp-span=[{4},{5})",
-                    decl->kind, decl->name, decl->headerB, decl->headerE,
-                    decl->span.begin, decl->span.end)
-                .str();
-      }
-
-      trace("include/apply",
-            "file={0} patch[{1}] kind={2} A=[{3},{4}) B=[{5},{6}) pp=[{7},{8}) "
-            "bytes=[{9},{10}) decl={11} orig='{12}' repl='{13}'",
-            file, idx, opKind, p.aStart, p.aEnd, p.bStart, p.bEnd, ppLo, ppHi,
-            startByte, endByte, declInfo, stringutils::showWs(origDbg),
-            stringutils::showWs(replDbg));
-    }
 
     // Stage the include-preserving mapped-header edit and attach the witness
     // that records which PP tokens and header bytes justified the edit range.
@@ -6356,13 +6015,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     return lhs.end > rhs.end;
   });
 
-  debug("include/apply", "file={0} computed {1} header TextEdits", file,
-        plan.edits.size());
 
   for (const auto &e : plan.edits) {
-    trace("include/apply",
-          "file={0} header TextEdit bytes=[{1},{2}) replLen={3}", file, e.start,
-          e.end, e.text.size());
 
     if (e.end < e.start || e.end > static_cast<uint64_t>(headerText.size())) {
       fatal("include/apply", "TextEdit out of bounds: bytes=[{0},{1}) size={2}",
@@ -6504,13 +6158,13 @@ RefoldEngine::ApplyResyncOrPend(
       OwnerStateBoundary::FromSource(OwnerSourceRange::From(
           fileSpellingForDirective, end, end, ownerIncludeId));
   const bool resyncPruneEligible =
-      demand.PrunableByCurrentFinalObserverModel();
+      demand.PrunableByCompactFinalLineControl();
 
   auto checkLineControlStateWithWitness =
       [&](OwnerStateComponent component, StateMutationKind mutation,
           SuffixStabilityWitness witness, StringRef detail,
           bool requireKnownObserver) {
-        return CheckLineControlStateTransitionAcrossEditBoundary(
+        return CheckStateTransitionAcrossEditBoundary(
             suffixBoundary, component, mutation, std::move(witness),
             "linedir/resync", detail, requireKnownObserver);
       };
@@ -6520,8 +6174,7 @@ RefoldEngine::ApplyResyncOrPend(
           StringRef detail, bool requireKnownObserver = false) {
         return checkLineControlStateWithWitness(
             component, mutation,
-            BuildLineControlStateRepairWitness(suffixBoundary, component,
-                                               detail),
+            BuildStateTransitionWitness(SuffixStabilityWitnessKind::StateRepair, component, suffixBoundary, detail),
             detail, requireKnownObserver);
       };
 
@@ -6530,18 +6183,11 @@ RefoldEngine::ApplyResyncOrPend(
           StringRef detail, bool requireKnownObserver = true) {
         return checkLineControlStateWithWitness(
             component, mutation,
-            BuildLineControlStateTerminalFailureWitness(suffixBoundary,
-                                                        component, detail),
+            BuildStateTransitionWitness(SuffixStabilityWitnessKind::TerminalStateFailure, component, suffixBoundary, detail),
             detail, requireKnownObserver);
       };
 
   if (!demand.needsLine) {
-    trace("linedir/resync",
-          "SKIP synthetic resync: newline drift span=[{0},{1}) has no "
-          "preserved __LINE__ observer in owner suffix "
-          "(fileObserver={2} fileNameObserver={3})",
-          start, end, demand.needsFile ? "YES" : "NO",
-          demand.needsFileName ? "YES" : "NO");
     return ResyncOutcome(replacement.str(), std::nullopt);
   }
 
@@ -6555,12 +6201,6 @@ RefoldEngine::ApplyResyncOrPend(
           fileSpellingForDirective, ownerIncludeId);
 
 
-  trace("linedir/resync",
-        "drift: span=[{0},{1}) origNl={2} replNl={3} resumeLine={4} file={5} "
-        "proven={6} replTail={7}",
-        start, end, origNl, replNl, resumeLoc.lineNo,
-        resumeLoc.fileSpelling, resumeLoc.producerProven,
-        stringutils::showWsWithClip(replacement, 100));
 
   if (!resumeLoc.producerProven) {
     if (resumeLoc.unprovenLineControlDirectiveOffset &&
@@ -6582,16 +6222,8 @@ RefoldEngine::ApplyResyncOrPend(
             ProducerBackedLineControlLocationAt(originalFileText,
                                                 fileSpellingForDirective,
                                                 ownerIncludeId, start, end)) {
-      trace("linedir/resync",
-            "producer-backed resync recovery: byte={0} resumeLine={1} "
-            "file={2}",
-            end, producerLoc->lineNo, producerLoc->fileSpelling);
       resumeLoc = std::move(*producerLoc);
     } else {
-      trace("linedir/resync",
-            "SKIP synthetic resync: source line-control state before byte {0} "
-            "is not fully model-proven; preserving source #line stream",
-            end);
       return ResyncOutcome(replacement.str(), std::nullopt);
     }
   }
@@ -6600,10 +6232,6 @@ RefoldEngine::ApplyResyncOrPend(
       LineResyncShouldDeferToConditionalJoin(fileSpellingForDirective,
                                              ownerIncludeId, end);
   if (deferToConditionalJoin) {
-    trace("linedir/resync",
-          "defer newline resync to conditional join: resumeLine={0} file={1} "
-          "at byte={2}",
-          resumeLoc.lineNo, resumeLoc.fileSpelling, end);
     (void)checkLineControlStateRepaired(
         OwnerStateComponent::LineNumber, StateMutationKind::MovedLater,
         llvm::formatv("deferred synthetic #line repair for newline drift at "
@@ -6627,8 +6255,6 @@ RefoldEngine::ApplyResyncOrPend(
   // A changed result means the directive was inserted directly into this
   // replacement, so no deferred resync state needs to be carried forward.
   if (injected != replacement) {
-    trace("linedir/resync", "local inject succeeded: resumeLine={0} file={1}",
-          resumeLoc.lineNo, resumeLoc.fileSpelling);
     (void)checkLineControlStateRepaired(
         OwnerStateComponent::LineNumber, StateMutationKind::Replayed,
         llvm::formatv("local synthetic #line repair for newline drift at "
@@ -6644,17 +6270,10 @@ RefoldEngine::ApplyResyncOrPend(
                   replacement, injected, resyncDirective,
                   FinalLineDirective::Origin::SyntheticNewlineResync,
                   FinalLineControlOwnerKey(fileSpellingForDirective.str(),
-                                           ownerIncludeId))) {
+                                           ownerIncludeId),
+                  FinalLineControlObligation::CosmeticSyntheticResync)) {
         candidates.push_back(std::move(*candidate));
-      } else {
-        trace("linedir/resync",
-              "local resync was emitted but candidate range could not be "
-              "isolated deterministically; retain fail-closed");
       }
-    } else {
-      trace("linedir/resync",
-            "local resync retained fail-closed: no final observer/layout demand "
-            "made it eligible for pruning");
     }
 
     return ResyncOutcome(std::move(injected), std::nullopt,
@@ -6664,9 +6283,6 @@ RefoldEngine::ApplyResyncOrPend(
   // Local injection was not safe, usually because the replacement rejoins
   // untouched bytes mid-line. Carry a pending resync so the next copied
   // original slice can emit the directive at a valid boundary.
-  trace("linedir/resync",
-        "local inject failed -> PENDING: resumeLine={0} file={1}",
-        resumeLoc.lineNo, resumeLoc.fileSpelling);
   (void)checkLineControlStateRepaired(
       OwnerStateComponent::LineNumber, StateMutationKind::MovedLater,
       llvm::formatv("pending synthetic #line repair for newline drift at "
@@ -6684,6 +6300,8 @@ RefoldEngine::ApplyResyncOrPend(
 
 void RefoldEngine::AttachAcceptedResultCarrier(
     TextEdit &edit, const AcceptedResultCandidate &candidate) const {
+  AuditAcceptedResultCandidateForLegacyAuthority(
+      candidate, "AttachAcceptedResultCarrier");
   edit.acceptedResults.push_back(
       std::make_shared<AcceptedResultCandidate>(candidate));
 }
@@ -6720,6 +6338,8 @@ bool RefoldEngine::EmittedTextEditHasDischargedAcceptedResults(
   auto carrierIsEmissionDischarged =
       [&](const AcceptedResultCandidate &carrier) -> bool {
     ++lastTheoremAudit_.emittedCarriers;
+    AuditAcceptedResultCandidateForLegacyAuthority(
+        carrier, "EmittedTextEditHasDischargedAcceptedResults");
 
     // Non-terminal byte edits must never carry terminal/out-of-domain results.
     // After these structural exclusions, the single Phase-1C normalizer is the
@@ -6740,11 +6360,10 @@ bool RefoldEngine::EmittedTextEditHasDischargedAcceptedResults(
     const std::optional<TheoremProofClass> theoremProof =
         NormalizeAcceptedProof(carrier);
     if (!theoremProof) {
-      if (carrier.proofSummary.acceptedClass == AcceptedProofClass::Unknown) {
+      if (carrier.proofSummary.theoremClass == TheoremProofClass::Unknown) {
         ++lastTheoremAudit_.emittedUnknownClassCarriers;
         NoteTheoremAuditViolation(
-            "emitted carrier did not normalize to a declared theorem proof "
-            "class");
+            "emitted carrier did not declare a final theorem proof class");
       } else if (carrier.proofSummary.inventory.support !=
                      AcceptanceSupportKind::ExplicitProofBacked ||
                  carrier.proofSummary.theoremDomain.kind ==
@@ -6776,16 +6395,31 @@ bool RefoldEngine::EmittedTextEditHasDischargedAcceptedResults(
   // accepted-result witness. An unannotated edit is an emission artifact, not a
   // theorem-facing refolding result.
   if (edit.acceptedResults.empty()) {
+    const TerminalFallbackProofFailure failure =
+        MakeTerminalFallbackProofFailure(
+            TerminalFallbackObligationKind::EmissionArtifactDischarged,
+            TerminalFallbackFailureReason::UndischargedEmissionArtifact,
+            TerminalFallbackFailureContext::ForStateComponent(
+                "TextEdit.acceptedResults"));
+    const bool strictRejected = RejectNoLegacyAuditFindingIfStrict(
+        MakeLegacyAuditEvidence(
+            LegacyPathKind::PathSpecificProofMirror, emissionPhase,
+            llvm::formatv(
+                "emitted edit bytes=[{0},{1}) in {2} has no "
+                "AcceptedResultCandidate / ProofSummary carrier",
+                edit.start, edit.end, owner)
+                .str()),
+        failure);
     NoteTheoremAuditViolation("emitted edit reached the byte-edit boundary "
                               "without accepted-result carriers");
-    RequestTerminalFallback(
-        MakeTerminalFallbackProofFailure(
-        TerminalFallbackObligationKind::EmissionArtifactDischarged,
-        TerminalFallbackFailureReason::UndischargedEmissionArtifact), emissionPhase,
-        llvm::formatv("emitted edit bytes=[{0},{1}) in {2} has no normalized "
-                      "accepted-result carriers",
-                      edit.start, edit.end, owner)
-            .str());
+    if (!strictRejected) {
+      RequestTerminalFallback(
+          failure, emissionPhase,
+          llvm::formatv("emitted edit bytes=[{0},{1}) in {2} has no "
+                        "normalized accepted-result carriers",
+                        edit.start, edit.end, owner)
+              .str());
+    }
     return false;
   }
 
@@ -6796,16 +6430,31 @@ bool RefoldEngine::EmittedTextEditHasDischargedAcceptedResults(
     const std::shared_ptr<const AcceptedResultCandidate> &carrier =
         edit.acceptedResults[i];
     if (!carrier) {
+      const TerminalFallbackProofFailure failure =
+          MakeTerminalFallbackProofFailure(
+              TerminalFallbackObligationKind::EmissionArtifactDischarged,
+              TerminalFallbackFailureReason::UndischargedEmissionArtifact,
+              TerminalFallbackFailureContext::ForStateComponent(
+                  "TextEdit.acceptedResults.null"));
+      const bool strictRejected = RejectNoLegacyAuditFindingIfStrict(
+          MakeLegacyAuditEvidence(
+              LegacyPathKind::PathSpecificProofMirror, emissionPhase,
+              llvm::formatv(
+                  "emitted edit bytes=[{0},{1}) in {2} has null "
+                  "AcceptedResultCandidate carrier #{3}",
+                  edit.start, edit.end, owner, i)
+                  .str()),
+          failure);
       NoteTheoremAuditViolation(
           "emitted edit carried a null accepted-result carrier");
-      RequestTerminalFallback(
-          MakeTerminalFallbackProofFailure(
-        TerminalFallbackObligationKind::EmissionArtifactDischarged,
-        TerminalFallbackFailureReason::UndischargedEmissionArtifact), emissionPhase,
-          llvm::formatv("emitted edit bytes=[{0},{1}) in {2} has null "
-                        "accepted-result carrier #{3}",
-                        edit.start, edit.end, owner, i)
-              .str());
+      if (!strictRejected) {
+        RequestTerminalFallback(
+            failure, emissionPhase,
+            llvm::formatv("emitted edit bytes=[{0},{1}) in {2} has null "
+                          "accepted-result carrier #{3}",
+                          edit.start, edit.end, owner, i)
+                .str());
+      }
       return false;
     }
 
@@ -7193,10 +6842,6 @@ std::string RefoldEngine::StripSeparatelyOwnedSidebandReplay(
   }
   out.append(replayText.drop_front(static_cast<size_t>(cursor)).str());
 
-  trace("pragma/sideband",
-        "stripped separately-owned sideband replay from ordinary payload "
-        "B=[{0},{1}) beforeLen={2} afterLen={3}",
-        *replayBByteBegin, *replayBByteEnd, replayText.size(), out.size());
   return out;
 }
 
@@ -7297,7 +6942,7 @@ RefoldEngine::MacroPatchMaterializedBByteRange(const MacroPatch &patch) const {
       return bytes;
   }
 
-  uint64_t macroId = patch.proofRootMacroId ? patch.proofRootMacroId
+  uint64_t macroId = patch.proof.proofRootMacroId ? patch.proof.proofRootMacroId
                                             : patch.macroId;
   if (macroId == 0)
     return std::nullopt;
@@ -7465,9 +7110,6 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
 
       deduplicateLineControlPruneCandidates(merged.lineControlPruneCandidates);
       deduplicateLineControlSourceMappings(merged.lineControlSourceMappings);
-      trace("edits/apply",
-            "merged {0} insertion edits at [{1},{2}) into len={3}", j - i, s, t,
-            merged.text.size());
 
       norm.push_back(std::move(merged));
       i = j;
@@ -7572,10 +7214,6 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
                         AcceptedPathKind::TUByteSpanConservativeEdit, s, t,
                         replacement));
 
-        trace("edits/apply",
-              "merged {0} adjacent direct duplicate fragments at [{1},{2}) "
-              "from Btok=[{3},{4}) into len={5}",
-              fragments.size(), s, t, bBegin, bEnd, replacement.size());
         return merged;
       };
 
@@ -7708,9 +7346,6 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
 
     deduplicateLineControlPruneCandidates(merged.lineControlPruneCandidates);
     deduplicateLineControlSourceMappings(merged.lineControlSourceMappings);
-    trace("edits/apply",
-          "merged {0} identical non-zero edits at [{1},{2}) into one edit",
-          j - i, s, t);
 
     norm.push_back(std::move(merged));
     i = j;
@@ -8012,11 +7647,6 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
     sortNormalizedTextEdits(resolved);
     norm = std::move(resolved);
 
-    debug("edits/apply",
-          "resolved uncomposable direct TU hunk run in {0}: hunks=[{1},{2}] "
-          "source=[{3},{4}) Btok=[{5},{6}) replLen={7}",
-          emissionOwner, best->firstHunk, best->lastHunk, best->sourceBegin,
-          best->sourceEnd, best->bBegin, best->bEnd, replacement.size());
     return true;
   };
 
@@ -8325,10 +7955,10 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
                                 emissionOwner, group->id,
                                 firstObserver->offset)
                       .str();
-              (void)CheckLineControlStateTransitionAcrossEditBoundary(
+              (void)CheckStateTransitionAcrossEditBoundary(
                   observerBoundary, component, StateMutationKind::Replayed,
-                  BuildLineControlStateTerminalFailureWitness(
-                      observerBoundary, component, detail),
+                  BuildStateTransitionWitness(SuffixStabilityWitnessKind::TerminalStateFailure, component, 
+                      observerBoundary, detail),
                   "linedir/conditional-join", detail,
                   /*requireKnownObserver=*/true);
             });
@@ -8351,11 +7981,6 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
                 ProducerBackedLineControlLocationAt(
                     originalFileText, emissionOwner, ownerIncludeId,
                     firstObserver->offset, firstObserver->offset)) {
-          trace("linedir/conditional-join",
-                "producer-backed post-conditional #line in {0}: "
-                "sourceObserver={1} resumeLine={2} file={3}",
-                emissionOwner, firstObserver->offset, producerLoc->lineNo,
-                producerLoc->fileSpelling);
           loc = std::move(*producerLoc);
         }
       }
@@ -8416,11 +8041,6 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
       if (!LineDirectiveInserter::ShouldEmitLineDirective(
               currentOutAtInsertion, loc.fileSpelling, loc.lineNo, directive)) {
         if (!previousLineControlIsInsideThisConditionalGroup()) {
-          trace("linedir/conditional-join",
-                "skip post-conditional #line in {0}: final={1} "
-                "sourceObserver={2} current stream is already file={3} line={4}",
-                emissionOwner, insertionOffset, firstObserver->offset,
-                loc.fileSpelling, loc.lineNo);
           forEachLineControlDemandComponent(
               firstObserver->demand, [&](OwnerStateComponent component) {
                 const std::string detail =
@@ -8430,28 +8050,19 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
                                   emissionOwner, group->id,
                                   firstObserver->offset)
                         .str();
-                (void)CheckLineControlStateTransitionAcrossEditBoundary(
+                (void)CheckStateTransitionAcrossEditBoundary(
                     observerBoundary, component,
                     StateMutationKind::PreservedAcrossReplacement,
-                    BuildLineControlStateRepairWitness(observerBoundary,
-                                                       component, detail),
+                    BuildStateTransitionWitness(SuffixStabilityWitnessKind::StateRepair, component, observerBoundary, detail),
                     "linedir/conditional-join", detail,
                     /*requireKnownObserver=*/true);
               });
           continue;
         }
 
-        trace("linedir/conditional-join",
-              "emit post-conditional #line in {0}: final={1} sourceObserver={2} "
-              "despite no-op stream state because previous #line is conditional-local",
-              emissionOwner, insertionOffset, firstObserver->offset);
       }
 
       if (immediatelyPrecededBySameLineDirective(insertionOffset, directive)) {
-        trace("linedir/conditional-join",
-              "skip post-conditional #line in {0}: final={1} "
-              "sourceObserver={2} already dominated by identical directive",
-              emissionOwner, insertionOffset, firstObserver->offset);
         forEachLineControlDemandComponent(
             firstObserver->demand, [&](OwnerStateComponent component) {
               const std::string detail =
@@ -8459,11 +8070,10 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
                                 "{0}: group#{1} observerSource={2}",
                                 emissionOwner, group->id, firstObserver->offset)
                       .str();
-              (void)CheckLineControlStateTransitionAcrossEditBoundary(
+              (void)CheckStateTransitionAcrossEditBoundary(
                   observerBoundary, component,
                   StateMutationKind::PreservedAcrossReplacement,
-                  BuildLineControlStateRepairWitness(observerBoundary, component,
-                                                     detail),
+                  BuildStateTransitionWitness(SuffixStabilityWitnessKind::StateRepair, component, observerBoundary, detail),
                   "linedir/conditional-join", detail,
                   /*requireKnownObserver=*/true);
             });
@@ -8478,10 +8088,9 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
                               emissionOwner, group->id, firstObserver->offset,
                               insertionOffset)
                     .str();
-            (void)CheckLineControlStateTransitionAcrossEditBoundary(
+            (void)CheckStateTransitionAcrossEditBoundary(
                 observerBoundary, component, StateMutationKind::Replayed,
-                BuildLineControlStateRepairWitness(observerBoundary, component,
-                                                   detail),
+                BuildStateTransitionWitness(SuffixStabilityWitnessKind::StateRepair, component, observerBoundary, detail),
                 "linedir/conditional-join", detail,
                 /*requireKnownObserver=*/true);
           });
@@ -8516,11 +8125,6 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
                  repair.directive.begin(), repair.directive.end());
       shiftLineControlMetadataAfterInsertion(
           repair.finalOffset, static_cast<uint64_t>(repair.directive.size()));
-      trace("linedir/conditional-join",
-            "insert post-conditional #line in {0}: final={1} sourceObserver={2} "
-            "text='{3}'",
-            emissionOwner, repair.finalOffset, repair.sourceOffset,
-            repair.directive);
     }
   }
 
@@ -8564,10 +8168,6 @@ RefoldEngine::AppendOriginalSliceWithPending(
   }
 
   if (pending->deferToConditionalJoin) {
-    trace("line/pending",
-          "carry pending resync to conditional join: file={0} line={1} "
-          "slice=[{2},{3})",
-          pending->resumeFileSpelling, pending->resumeLineNo, from, to);
     appendMappedOriginalSlice(from, to);
     return pending;
   }
@@ -8579,10 +8179,10 @@ RefoldEngine::AppendOriginalSliceWithPending(
         OwnerStateBoundary::FromSource(OwnerSourceRange::From(
             pending->fileSpellingForDir, sourceOffset, sourceOffset,
             pending->ownerIncludeId));
-    return CheckLineControlStateTransitionAcrossEditBoundary(
+    return CheckStateTransitionAcrossEditBoundary(
         boundary, OwnerStateComponent::LineNumber, mutation,
-        BuildLineControlStateRepairWitness(
-            boundary, OwnerStateComponent::LineNumber, detail),
+        BuildStateTransitionWitness(SuffixStabilityWitnessKind::StateRepair, OwnerStateComponent::LineNumber, 
+            boundary, detail),
         "line/pending", detail, /*requireKnownObserver=*/false);
   };
 
@@ -8658,10 +8258,6 @@ RefoldEngine::AppendOriginalSliceWithPending(
     std::optional<LineDirectiveLocation> loc =
         logicalLocationForPendingFlush(from);
     if (!loc) {
-      trace("line/pending",
-            "SKIP pending flush@slice-begin: source line-control state at "
-            "orig={0} is not fully model-proven",
-            from);
       appendMappedOriginalSlice(from, to);
       return std::nullopt;
     }
@@ -8675,9 +8271,6 @@ RefoldEngine::AppendOriginalSliceWithPending(
     // already represents the requested file/line location.
     if (LineDirectiveInserter::ShouldEmitLineDirective(
             currentOut, loc->fileSpelling, loc->lineNo, directive)) {
-      trace("line/pending",
-            "flush@slice-begin file={0} line={1} (pending) outTail={2}",
-            loc->fileSpelling, loc->lineNo, stringutils::dbgOutTail(currentOut));
       (void)checkPendingLineControlRepair(
           from, StateMutationKind::MovedLater,
           llvm::formatv("flush pending synthetic #line at slice begin {0}",
@@ -8693,12 +8286,10 @@ RefoldEngine::AppendOriginalSliceWithPending(
                 begin, end,
                 FinalLineDirective::Origin::SyntheticNewlineResync,
                 FinalLineControlOwnerKey(pending->fileSpellingForDir,
-                                         pending->ownerIncludeId)));
+                                         pending->ownerIncludeId),
+                FinalLineControlObligation::CosmeticSyntheticResync));
       }
     } else {
-      trace("line/pending",
-            "SKIP flush@slice-begin (no-op) file={0} line={1} outTail={2}",
-            loc->fileSpelling, loc->lineNo, stringutils::dbgOutTail(currentOut));
       (void)checkPendingLineControlRepair(
           from, StateMutationKind::PreservedAcrossReplacement,
           llvm::formatv("suppress pending #line at slice begin {0}; "
@@ -8727,10 +8318,6 @@ RefoldEngine::AppendOriginalSliceWithPending(
       std::optional<LineDirectiveLocation> loc =
           logicalLocationForPendingFlush(i);
       if (!loc) {
-        trace("line/pending",
-              "SKIP pending flush@safe-nl: source line-control state at "
-              "orig={0} is not fully model-proven",
-              i);
         pending = std::nullopt;
         break;
       }
@@ -8741,10 +8328,6 @@ RefoldEngine::AppendOriginalSliceWithPending(
       StringRef currentOut(out.data(), out.size());
       if (LineDirectiveInserter::ShouldEmitLineDirective(
               currentOut, loc->fileSpelling, loc->lineNo, directive)) {
-        trace("line/pending",
-              "flush@safe-nl file={0} line={1} atOrig={2} outTail={3}",
-              loc->fileSpelling, loc->lineNo, i,
-              stringutils::dbgOutTail(currentOut));
         (void)checkPendingLineControlRepair(
             i, StateMutationKind::MovedLater,
             llvm::formatv("flush pending synthetic #line at safe newline {0}",
@@ -8760,14 +8343,10 @@ RefoldEngine::AppendOriginalSliceWithPending(
                   begin, end,
                   FinalLineDirective::Origin::SyntheticNewlineResync,
                   FinalLineControlOwnerKey(pending->fileSpellingForDir,
-                                           pending->ownerIncludeId)));
+                                           pending->ownerIncludeId),
+                  FinalLineControlObligation::CosmeticSyntheticResync));
         }
       } else {
-        trace("line/pending",
-              "SKIP flush@safe-nl (no-op) file={0} line={1} atOrig={2} "
-              "outTail={3}",
-              loc->fileSpelling, loc->lineNo, i,
-              stringutils::dbgOutTail(currentOut));
         (void)checkPendingLineControlRepair(
             i, StateMutationKind::PreservedAcrossReplacement,
             llvm::formatv("suppress pending #line at safe newline {0}; "
@@ -8817,90 +8396,4 @@ bool RefoldEngine::PathsEqual(StringRef a, StringRef b) const {
 
   return canonicalPathCache_.find(a)->getValue() ==
          canonicalPathCache_.find(b)->getValue();
-}
-
-// ======================= Diagnostics & Debug Utilities =======================
-
-void RefoldEngine::DebugIncludePatch(StringRef tag,
-                                     const RefoldModel::IncludeItem &inc,
-                                     const diffutils::Hunk &h) const {
-  auto getByteOff = [](uint64_t tokenIdx,
-                       ArrayRef<size_t> offsets) -> std::optional<uint64_t> {
-    if (tokenIdx < offsets.size()) {
-      return static_cast<uint64_t>(offsets[static_cast<size_t>(tokenIdx)]);
-    }
-    return std::nullopt;
-  };
-
-  // Convert the token hunk endpoints to byte offsets when the offset tables
-  // have entries for those token boundaries.
-  const std::optional<uint64_t> a0 = getByteOff(h.aStart, aTokOff_);
-  const std::optional<uint64_t> a1 = getByteOff(h.aEnd, aTokOff_);
-  const std::optional<uint64_t> b0 = getByteOff(h.bStart, bTokOff_);
-  const std::optional<uint64_t> b1 = getByteOff(h.bEnd, bTokOff_);
-
-  // Slice previews are diagnostic-only. Leave them empty if the projected byte
-  // range is missing or invalid rather than risking an out-of-range access.
-  StringRef aSlice = "";
-  if (a0 && a1 && *a1 >= *a0 && *a1 <= aSource_.size()) {
-    aSlice = aSource_.substr(static_cast<size_t>(*a0),
-                             static_cast<size_t>(*a1 - *a0));
-  }
-  StringRef bSlice = "";
-  if (b0 && b1 && *b1 >= *b0 && *b1 <= bSource_.size()) {
-    bSlice = bSource_.substr(static_cast<size_t>(*b0),
-                             static_cast<size_t>(*b1 - *b0));
-  }
-
-  trace("include/patch",
-        "{0} inc #{1} hunk A[{2},{3})->B[{4},{5}) Abytes=[{6},{7}) "
-        "Bbytes=[{8},{9}) Aslice='{10}' Bslice='{11}'",
-        tag, inc.id, h.aStart, h.aEnd, h.bStart, h.bEnd, a0, a1, b0, b1,
-        stringutils::showWsWithClip(aSlice, 120),
-        stringutils::showWsWithClip(bSlice, 120));
-}
-
-std::string RefoldEngine::PPArgSpanToString(const RefoldModel::PPArgSpan &sp,
-                                            bool isStringifyOcc) {
-  std::string storage;
-  llvm::raw_string_ostream os(storage);
-
-  // Print the common PP-argument span fields first so all span kinds share a
-  // stable diagnostic shape.
-  os << formatv("{kind='{0}', A=[{1},{2}), argIdx={3}", sp.kind, sp.begin,
-                sp.end, sp.argIdx);
-
-  if (isStringifyOcc) {
-    os << ", occ=STRINGIFY";
-  }
-
-  // Paste spans may describe a byte subrange inside one pasted PP token, so
-  // include that finer-grained range only for paste metadata.
-  if (sp.kind == PPArgSpanKind::Paste) {
-    os << formatv(", byte=[{0},{1})", sp.byteBegin, sp.byteEnd);
-  }
-
-  os << '}';
-  return os.str();
-}
-
-std::string
-RefoldEngine::PPArgSpanListToString(ArrayRef<RefoldModel::PPArgSpan> spans,
-                                    ArrayRef<char> isStringify) {
-  std::string storage;
-  llvm::raw_string_ostream os(storage);
-
-  os << '[';
-  for (size_t i = 0; i < spans.size(); ++i) {
-    if (i > 0)
-      os << ", ";
-
-    // `isStringify` is parallel metadata when available; missing entries mean
-    // the corresponding span is not marked as a stringify occurrence.
-    bool isStr = (i < isStringify.size() && isStringify[i]);
-    os << PPArgSpanToString(spans[i], isStr);
-  }
-  os << ']';
-
-  return os.str();
 }
