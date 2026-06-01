@@ -123,6 +123,14 @@ struct SourceGraphOutput {
   std::string originalTarget;
   std::string resolvedPath;
   std::string bytes;
+
+  /// True when this entry is not an emitted sidecar, but a cleanup proof for a
+  /// stale sidecar from an earlier run.  Source-graph selection is deliberately
+  /// dynamic: a path that was admissible in one run can become inadmissible once
+  /// another same-spelling include survives.  The driver may remove the stale
+  /// file only if its bytes still exactly match \c bytes and it is not the
+  /// producer-resolved input header.
+  bool cleanupOnly = false;
 };
 
 

@@ -2655,6 +2655,58 @@ void RefoldEngine::MaterializeIncludeExpansion(
                        : MaterializationWorkClass::None;
   };
 
+  auto cleanChildIncludeWouldChangeQuoteLookupAfterReplay =
+      [&](const RefoldModel::IncludeItem &child) -> bool {
+        // A clean child include normally stays spelled as an include directive
+        // when its parent header is materialized.  That is only source-accurate
+        // if replaying the directive from the final materialized surface keeps
+        // the same quoted-include lookup result that the producer observed in
+        // the original header context.
+        //
+        // The refold map gives us a concrete, deterministic instability proof:
+        // a TU-level include with the same safe quoted spelling resolved to a
+        // different physical file than this child include.  If we leave the
+        // child directive inside materialized parent text, it is replayed from
+        // the TU/output lookup context and can observe that TU-level target
+        // instead of the child's original header-relative target.  In that
+        // case the child include must be treated as materialization work even
+        // though the child subtree itself is token-clean.
+        if (!child.parent || child.angled || !child.resolvedPath)
+          return false;
+
+        std::optional<std::string> childReplayPath =
+            safeSourceGraphRelativeIncludePath(child);
+        if (!childReplayPath)
+          return false;
+
+        for (const RefoldModel::IncludeItem &tuInc : model_.GetIncludes()) {
+          if (tuInc.id == child.id || tuInc.parent ||
+              !PathsEqual(tuInc.sitePath, model_.GetSourcePath()) ||
+              !tuInc.resolvedPath)
+            continue;
+
+          std::optional<std::string> tuReplayPath =
+              safeSourceGraphRelativeIncludePath(tuInc);
+          if (!tuReplayPath || *tuReplayPath != *childReplayPath)
+            continue;
+
+          if (PathsEqual(*tuInc.resolvedPath, *child.resolvedPath))
+            continue;
+
+          debug("include/tree",
+                "materialize clean child inc#{0}: quoted include path {1} "
+                "resolved to {2} in original child context but same-spelling "
+                "TU inc#{3} resolved to {4}; preserving the child inside "
+                "materialized parent text would replay under the TU lookup "
+                "context",
+                child.id, *childReplayPath, *child.resolvedPath, tuInc.id,
+                *tuInc.resolvedPath);
+          return true;
+        }
+
+        return false;
+      };
+
   auto hasDescendantWork = [&](auto &&self, uint64_t id) -> bool {
     bool selfWork = includeHasSidebandPragmaWork(id);
     if (auto it = perInclude.find(id); it != perInclude.end())
@@ -2663,6 +2715,11 @@ void RefoldEngine::MaterializeIncludeExpansion(
       if (auto it = macroPatchesByOwner.find(id);
           it != macroPatchesByOwner.end())
         selfWork = !it->second.empty();
+    }
+
+    if (!selfWork) {
+      if (const RefoldModel::IncludeItem *item = model_.GetIncludeById(id))
+        selfWork = cleanChildIncludeWouldChangeQuoteLookupAfterReplay(*item);
     }
 
     if (selfWork) {

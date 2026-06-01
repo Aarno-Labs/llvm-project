@@ -155,6 +155,83 @@ safeSourceGraphRelativeIncludePath(const RefoldModel::IncludeItem &inc) {
   return path.str();
 }
 
+static bool isSourceGraphDirectiveHorizontalWhitespace(char c) {
+  return c == ' ' || c == '\t' || c == '\r' || c == '\f' || c == '\v';
+}
+
+static void skipSourceGraphDirectiveHorizontalWhitespace(StringRef line,
+                                                        size_t &pos) {
+  while (pos < line.size() &&
+         isSourceGraphDirectiveHorizontalWhitespace(line[pos]))
+    ++pos;
+}
+
+/// Classify whether a materialized include-owner expansion contains a surviving
+/// preprocessing include directive that could observe a generated source-graph
+/// sidecar written under \p sourceGraphPath.
+///
+/// A generated source-graph header is a path-level edit in the final replay
+/// surface.  If some other include owner is materialized into the TU and its
+/// materialized text still contains `#include "same/path.h"`, that nested
+/// include is no longer resolved relative to the original header's directory;
+/// it is replayed from the refolded TU output directory and will observe the
+/// sidecar.  Likewise, a non-literal include in materialized text cannot be
+/// proven not to expand to the sidecar path, so the source-graph proof must
+/// fail closed.
+enum class MaterializedIncludeReplayAlias {
+  None,
+  SamePath,
+  UnprovenInclude
+};
+
+static MaterializedIncludeReplayAlias classifyMaterializedIncludeReplayAlias(
+    StringRef materializedText, StringRef sourceGraphPath) {
+  size_t lineBegin = 0;
+  while (lineBegin <= materializedText.size()) {
+    size_t lineEnd = materializedText.find('\n', lineBegin);
+    if (lineEnd == StringRef::npos)
+      lineEnd = materializedText.size();
+
+    StringRef line = materializedText.slice(lineBegin, lineEnd);
+    size_t pos = 0;
+    skipSourceGraphDirectiveHorizontalWhitespace(line, pos);
+    if (pos < line.size() && line[pos] == '#') {
+      ++pos;
+      skipSourceGraphDirectiveHorizontalWhitespace(line, pos);
+      const StringRef keyword = "include";
+      if (line.substr(pos, keyword.size()) == keyword &&
+          (pos + keyword.size() == line.size() ||
+           !(std::isalnum(static_cast<unsigned char>(
+                 line[pos + keyword.size()])) ||
+             line[pos + keyword.size()] == '_'))) {
+        pos += keyword.size();
+        skipSourceGraphDirectiveHorizontalWhitespace(line, pos);
+
+        if (pos >= line.size() || line[pos] != '"')
+          return MaterializedIncludeReplayAlias::UnprovenInclude;
+
+        const size_t pathBegin = ++pos;
+        while (pos < line.size() && line[pos] != '"') {
+          if (line[pos] == '\\')
+            return MaterializedIncludeReplayAlias::UnprovenInclude;
+          ++pos;
+        }
+        if (pos >= line.size())
+          return MaterializedIncludeReplayAlias::UnprovenInclude;
+
+        if (line.slice(pathBegin, pos) == sourceGraphPath)
+          return MaterializedIncludeReplayAlias::SamePath;
+      }
+    }
+
+    if (lineEnd == materializedText.size())
+      break;
+    lineBegin = lineEnd + 1;
+  }
+
+  return MaterializedIncludeReplayAlias::None;
+}
+
 /// Return the first non-comment raw token in \p text, if any.
 static std::optional<LexBoundaryToken> firstLexToken(StringRef text,
                                                     const LangOptions &lang);
@@ -6698,7 +6775,88 @@ std::string RefoldEngine::RunSinglePassRefold() {
           }
         }
 
+        for (const RefoldModel::IncludeItem &other : model_.GetIncludes()) {
+          if (other.id == inc.id)
+            continue;
+          if (other.parent || !PathsEqual(other.sitePath, tuPath))
+            continue;
+
+          auto otherExpansionIt = includeExpansion.find(other.id);
+          if (otherExpansionIt == includeExpansion.end())
+            continue;
+
+          const MaterializedIncludeReplayAlias replayAlias =
+              classifyMaterializedIncludeReplayAlias(otherExpansionIt->second,
+                                                     sourceGraphPath);
+          if (replayAlias == MaterializedIncludeReplayAlias::SamePath) {
+            debug("include/source-graph",
+                  "reject source-graph inc#{0} path={1}: materialized "
+                  "top-level inc#{2} would replay a nested same-path include "
+                  "from the refolded TU output directory",
+                  inc.id, sourceGraphPath, other.id);
+            return false;
+          }
+          if (replayAlias == MaterializedIncludeReplayAlias::UnprovenInclude) {
+            debug("include/source-graph",
+                  "reject source-graph inc#{0} path={1}: materialized "
+                  "top-level inc#{2} contains a non-literal include whose "
+                  "final replay path cannot be proven disjoint from the "
+                  "sidecar",
+                  inc.id, sourceGraphPath, other.id);
+            return false;
+          }
+        }
+
+        const MaterializedIncludeReplayAlias candidateReplayAlias =
+            classifyMaterializedIncludeReplayAlias(candidateBytes,
+                                                   sourceGraphPath);
+        if (candidateReplayAlias == MaterializedIncludeReplayAlias::SamePath) {
+          debug("include/source-graph",
+                "reject source-graph inc#{0} path={1}: generated owner bytes "
+                "would replay a nested same-path include from the source-graph "
+                "output directory",
+                inc.id, sourceGraphPath);
+          return false;
+        }
+        if (candidateReplayAlias ==
+            MaterializedIncludeReplayAlias::UnprovenInclude) {
+          debug("include/source-graph",
+                "reject source-graph inc#{0} path={1}: generated owner bytes "
+                "contain a non-literal include whose final replay path cannot "
+                "be proven disjoint from the sidecar",
+                inc.id, sourceGraphPath);
+          return false;
+        }
+
         return true;
+      };
+
+  auto recordRejectedSourceGraphCleanup =
+      [&](const RefoldModel::IncludeItem &inc, StringRef sourceGraphPath,
+          StringRef candidateBytes) {
+        if (!sourceGraphOutputs_)
+          return;
+
+        // Source-graph sidecars are path-level artifacts beside the emitted TU.
+        // A previous run may have written a sidecar for a path that this run no
+        // longer proves admissible, for example after a same-spelling include
+        // becomes a surviving alias.  Leaving that stale file in the output
+        // directory can poison --check because quoted include lookup searches
+        // the refolded TU directory before the captured -I headers.
+        //
+        // Record a cleanup candidate instead of deleting here: the driver owns
+        // the output directory policy and will remove the file only if its
+        // bytes still exactly match this rejected generated body and the file
+        // is not the producer-resolved input header.
+        SourceGraphOutput cleanup;
+        cleanup.includeId = inc.id;
+        cleanup.relativePath = sourceGraphPath.str();
+        cleanup.originalTarget = inc.target.str();
+        if (inc.resolvedPath)
+          cleanup.resolvedPath = inc.resolvedPath->str();
+        cleanup.bytes = candidateBytes.str();
+        cleanup.cleanupOnly = true;
+        sourceGraphOutputs_->push_back(std::move(cleanup));
       };
 
   auto shouldPreserveIncludeAsSourceGraphOwner =
@@ -6724,8 +6882,11 @@ std::string RefoldEngine::RunSinglePassRefold() {
       return std::nullopt;
 
     if (!sourceGraphIncludePathIsUnaliasedOrCoherent(
-            inc, StringRef(*sourceGraphPath), candidateBytes))
+            inc, StringRef(*sourceGraphPath), candidateBytes)) {
+      recordRejectedSourceGraphCleanup(inc, StringRef(*sourceGraphPath),
+                                       candidateBytes);
       return std::nullopt;
+    }
 
     return sourceGraphPath;
   };

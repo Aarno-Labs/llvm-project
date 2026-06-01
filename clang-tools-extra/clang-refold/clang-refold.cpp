@@ -3081,44 +3081,110 @@ static Error compareTokensNoLinesAware(ArrayRef<PPTok> aToks,
   return Error::success();
 }
 
+static bool pathSpellingMatchesAfterAbsolute(StringRef a, StringRef b) {
+  if (a.empty() || b.empty())
+    return false;
+
+  SmallString<256> absA(a);
+  SmallString<256> absB(b);
+  if (std::error_code ec = sys::fs::make_absolute(absA))
+    return false;
+  if (std::error_code ec = sys::fs::make_absolute(absB))
+    return false;
+  sys::path::remove_dots(absA, /*remove_dot_dot=*/true);
+  sys::path::remove_dots(absB, /*remove_dot_dot=*/true);
+  return absA == absB;
+}
+
 /// Write modified include-owner files required by automatic source-graph
-/// refolding.
+/// refolding, and remove stale generated files from paths that this run proved
+/// are no longer admissible.
 ///
-/// The engine only emits relative quoted include paths that were already
-/// lexically validated.  The driver still revalidates before writing.  Existing
-/// files are never silently overwritten with different bytes: if the user asks
-/// for `--out` beside the original sources and the sidecar path would collide
-/// with a different header, we fail closed rather than corrupting input.
+/// Source-graph sidecars are part of the checker-visible replay surface because
+/// quoted include lookup searches the directory containing the emitted `.c.mod`
+/// before the captured `-I` paths.  Therefore a sidecar emitted by an older run
+/// must not be allowed to shadow the original header after the current proof has
+/// fallen back to TU materialization.
+///
+/// Cleanup entries are intentionally conservative: the driver removes a stale
+/// file only when the existing bytes exactly match the rejected generated owner
+/// bytes and the path is not the producer-resolved input header.  This lets the
+/// backend clean up its own obsolete artifacts without deleting arbitrary user
+/// headers that happen to sit beside `--out`.
 static void writeSourceGraphOutputs(StringRef modifiedSrcPath,
                                     ArrayRef<SourceGraphOutput> outputs) {
-  if (outputs.empty())
-    return;
-
   SmallString<256> outputDir(modifiedSrcPath);
   sys::path::remove_filename(outputDir);
   if (outputDir.empty())
     outputDir = ".";
 
-  std::map<std::string, std::string> uniqueOutputs;
-  for (const SourceGraphOutput &output : outputs) {
-    StringRef rel(output.relativePath);
+  auto validateRelativePath = [](StringRef rel) {
     SmallVector<StringRef, 8> components;
     rel.split(components, '/', /*MaxSplit=*/-1, /*KeepEmpty=*/true);
     const bool hasUnsafeComponent = llvm::any_of(components, [](StringRef c) {
       return c.empty() || c == "." || c == "..";
     });
-    if (rel.empty() || sys::path::is_absolute(rel) || hasUnsafeComponent ||
-        rel.contains('\\') || rel.contains('"'))
+    return !rel.empty() && !sys::path::is_absolute(rel) &&
+           !hasUnsafeComponent && !rel.contains('\\') && !rel.contains('"');
+  };
+
+  std::map<std::string, SourceGraphOutput> cleanupOutputs;
+  std::map<std::string, std::string> uniqueOutputs;
+  for (const SourceGraphOutput &output : outputs) {
+    StringRef rel(output.relativePath);
+    if (!validateRelativePath(rel))
       fatal("source-graph/write",
             "refusing unsafe source-graph output path: {0}",
             output.relativePath);
 
-    auto [it, inserted] = uniqueOutputs.insert(
-        {output.relativePath, output.bytes});
+    if (output.cleanupOnly) {
+      // Multiple rejected include sites can point at the same stale sidecar.
+      // Keeping the first candidate is enough: cleanup is byte-exact, so a
+      // nonmatching file is left alone rather than guessed about.
+      cleanupOutputs.insert({output.relativePath, output});
+      continue;
+    }
+
+    auto [it, inserted] = uniqueOutputs.insert({output.relativePath,
+                                                output.bytes});
     if (!inserted && it->second != output.bytes)
       fatal("source-graph/write",
             "conflicting source-graph contents for path: {0}",
             output.relativePath);
+  }
+
+  for (const auto &entry : cleanupOutputs) {
+    if (uniqueOutputs.count(entry.first))
+      continue;
+
+    const SourceGraphOutput &cleanup = entry.second;
+    SmallString<256> path(outputDir);
+    sys::path::append(path, entry.first);
+
+    if (!cleanup.resolvedPath.empty() &&
+        pathSpellingMatchesAfterAbsolute(path, cleanup.resolvedPath)) {
+      debug("source-graph/write",
+            "skip stale cleanup for {0}: output path names producer header {1}",
+            path, cleanup.resolvedPath);
+      continue;
+    }
+
+    auto existingOrErr = MemoryBuffer::getFile(path);
+    if (!existingOrErr)
+      continue;
+
+    if ((*existingOrErr)->getBuffer() != cleanup.bytes) {
+      debug("source-graph/write",
+            "leave possible stale source-graph file {0}: bytes no longer match "
+            "rejected generated body for include #{1}",
+            path, cleanup.includeId);
+      continue;
+    }
+
+    if (std::error_code ec = sys::fs::remove(path))
+      fatal("source-graph/write", "cannot remove stale source-graph file {0}: {1}",
+            path, ec.message());
+    info("finished", "removed stale source-graph header: {0}", path);
   }
 
   for (const auto &entry : uniqueOutputs) {
