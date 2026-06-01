@@ -15488,6 +15488,10 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
                                StringRef((*newSolved)[i])))
         continue;
 
+      if (!isVariadicFormal(rootIdx) &&
+          StringRef((*newSolved)[i]).trim().empty())
+        return std::nullopt;
+
       StringRef originalRoot =
           baseInvText.slice(invArgRanges[rootIdx].first,
                             invArgRanges[rootIdx].second).trim();
@@ -15688,6 +15692,19 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       return spelling.str();
     };
 
+    auto leafTextsTokenEquivalent = [&](StringRef lhs, StringRef rhs) {
+      SmallVector<LeafTok, 16> lhsToks;
+      SmallVector<LeafTok, 16> rhsToks;
+      lexLeafTokens(lhs, lhsToks);
+      lexLeafTokens(rhs, rhsToks);
+      if (lhsToks.size() != rhsToks.size())
+        return false;
+      for (size_t i = 0; i < lhsToks.size(); ++i)
+        if (lhsToks[i].spelling != rhsToks[i].spelling)
+          return false;
+      return true;
+    };
+
     auto changedMiddle = [](StringRef oldValue, StringRef newValue)
         -> std::optional<std::pair<std::string, std::string>> {
       size_t prefix = 0;
@@ -15715,6 +15732,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       return std::nullopt;
 
     std::optional<std::pair<std::string, std::string>> leafRewrite;
+    bool scalarLeafRewriteConflict = false;
     if (oldToks.size() == newToks.size()) {
       for (size_t i = 0; i < oldToks.size(); ++i) {
         if (oldToks[i].spelling == newToks[i].spelling)
@@ -15722,18 +15740,24 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         std::optional<std::pair<std::string, std::string>> changed =
             changedMiddle(StringRef(leafValueForToken(oldToks[i].spelling)),
                           StringRef(leafValueForToken(newToks[i].spelling)));
-        if (!changed)
-          return std::nullopt;
+        if (!changed) {
+          scalarLeafRewriteConflict = true;
+          leafRewrite.reset();
+          break;
+        }
         if (leafRewrite) {
           if (leafRewrite->first != changed->first ||
-              leafRewrite->second != changed->second)
-            return std::nullopt;
+              leafRewrite->second != changed->second) {
+            scalarLeafRewriteConflict = true;
+            leafRewrite.reset();
+            break;
+          }
           continue;
         }
         leafRewrite = std::move(changed);
       }
 
-      if (leafRewrite) {
+      if (leafRewrite && !scalarLeafRewriteConflict) {
         // A generated-leaf rewrite edits one root invocation argument.  Such an
         // edit is admissible only if the whole owner expansion is consistent
         // with that single source change.  If the same solved old leaf remains
@@ -15750,6 +15774,73 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         }
       }
     }
+
+    auto resolveFunctionLikeForLeafProof =
+        [&](StringRef startName) -> const RefoldModel::MacroDirective * {
+      if (startName.empty())
+        return nullptr;
+      SmallVector<std::string, 8> seen;
+      std::string current = startName.trim().str();
+      for (size_t depth = 0; depth <= model_.GetMacroDirectives().size();
+           ++depth) {
+        if (llvm::is_contained(seen, current))
+          return nullptr;
+        seen.push_back(current);
+
+        const RefoldModel::MacroDirective *functionLike = nullptr;
+        const RefoldModel::MacroDirective *alias = nullptr;
+        for (const RefoldModel::MacroDirective &directive :
+             model_.GetMacroDirectives()) {
+          if (directive.subkind != "#define" ||
+              directive.name != StringRef(current))
+            continue;
+          if (directive.functionLike) {
+            if (functionLike)
+              return nullptr;
+            functionLike = &directive;
+            continue;
+          }
+          if (directive.replacementTokens.size() == 1 &&
+              directive.replacementTokens[0].kind ==
+                  RefoldModel::MacroReplacementTokenKind::Literal) {
+            if (alias)
+              return nullptr;
+            alias = &directive;
+          }
+        }
+        if (functionLike)
+          return functionLike;
+        if (!alias)
+          return nullptr;
+        current = alias->replacementTokens[0].spelling.str();
+      }
+      return nullptr;
+    };
+
+    auto trailingVariadicIsStringifiedByAnyRootCallee = [&]() {
+      for (uint32_t argIdx = 0; argIdx < invArgRanges.size(); ++argIdx) {
+        auto r = invArgRanges[argIdx];
+        if (r.second < r.first || r.second > baseInvText.size())
+          return false;
+        const RefoldModel::MacroDirective *callee =
+            resolveFunctionLikeForLeafProof(
+                baseInvText.slice(r.first, r.second).trim());
+        if (!callee || callee->defParams.empty() ||
+            !callee->defParams.back().variadic)
+          continue;
+        const uint32_t variadicIdx =
+            static_cast<uint32_t>(callee->defParams.size() - 1);
+        for (size_t i = 0; i + 1 < callee->replacementTokens.size(); ++i) {
+          if (callee->replacementTokens[i].spelling == "#" &&
+              callee->replacementTokens[i + 1].kind ==
+                  RefoldModel::MacroReplacementTokenKind::ParamRef &&
+              callee->replacementTokens[i + 1].paramIndex &&
+              *callee->replacementTokens[i + 1].paramIndex == variadicIdx)
+            return true;
+        }
+      }
+      return false;
+    };
 
     // `__VA_OPT__` activation can add a new variadic root argument even though
     // no old root argument text exists to replace.  Accept only the canonical
@@ -15790,7 +15881,20 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
             continue;
           if (insertedActual)
             return std::nullopt;
-          insertedActual = spelling.str();
+          // When the final generated callee stringifies the trailing variadic
+          // pack, the B token is a string literal representing the source text
+          // to insert into the root invocation.  Otherwise the token spelling
+          // itself is the variadic actual, e.g. an ordinary string-literal
+          // argument forwarded through `__VA_ARGS__`.
+          if (trailingVariadicIsStringifiedByAnyRootCallee()) {
+            std::optional<std::string> decodedInserted =
+                decodeSimpleStringLiteralToken(spelling);
+            if (!decodedInserted)
+              return std::nullopt;
+            insertedActual = std::move(*decodedInserted);
+          } else {
+            insertedActual = spelling.str();
+          }
         }
         if (insertedActual) {
           size_t close = baseInvText.rfind(')');
@@ -15815,6 +15919,199 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         }
       }
     }
+
+    auto removeTrailingVariadicActual = [&]() -> std::optional<MacroPatch> {
+      if (!rootHasTrailingVariadic || invArgRanges.size() < 2)
+        return std::nullopt;
+      const uint32_t lastIdx = static_cast<uint32_t>(invArgRanges.size() - 1);
+      const auto prev = invArgRanges[lastIdx - 1];
+      const auto last = invArgRanges[lastIdx];
+      if (last.second < last.first || last.second > baseInvText.size() ||
+          last.first == last.second)
+        return std::nullopt;
+
+      // Deactivating a trailing `__VA_OPT__` tail removes the variadic root
+      // actual, not the callee selector or the fixed argument before it.  The
+      // formal range list gives us the exact separator-to-end span for the last
+      // argument: start at the previous argument's end so the separating comma
+      // and whitespace disappear together with the old variadic payload.
+      std::string rewritten = baseInvText.slice(0, prev.second).str();
+      rewritten += baseInvText.substr(last.second).str();
+      MacroPatch patch{*m.invB, *m.invE, std::move(rewritten), m.id};
+      patch.hasMaterializedOutputByteRange = true;
+      patch.materializedOutputByteStart = prev.second;
+      patch.materializedOutputByteEnd = prev.second;
+      stampMacroPatchMaterializedBTokenRange(
+          patch, static_cast<uint64_t>(bEnv->first),
+          static_cast<uint64_t>(bEnv->second));
+      StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyStandard,
+                           /*validated=*/true,
+                           /*structurePreserving=*/true, m.id);
+      return patch;
+    };
+
+    if (!leafRewrite && oldToks.size() > newToks.size() &&
+        rootHasTrailingVariadic) {
+      bool newPrefixMatches = true;
+      for (size_t i = 0; i < newToks.size(); ++i) {
+        if (oldToks[i].spelling != newToks[i].spelling) {
+          newPrefixMatches = false;
+          break;
+        }
+      }
+      if (newPrefixMatches) {
+        bool onlyVaOptTailRemoved = true;
+        for (size_t i = newToks.size(); i < oldToks.size(); ++i) {
+          StringRef spelling(oldToks[i].spelling);
+          const std::string decoded = leafValueForToken(spelling);
+          if (spelling == ":" || spelling == "," ||
+              StringRef(decoded) == ":" || StringRef(decoded) == ",")
+            continue;
+          // The remaining removed token is the old variadic data token.  There
+          // must be exactly one such token for this narrow deactivation proof;
+          // richer pack edits belong in the full generated-argument DAG proof.
+          if (i + 1 != oldToks.size())
+            onlyVaOptTailRemoved = false;
+        }
+        if (onlyVaOptTailRemoved) {
+          if (auto patch = removeTrailingVariadicActual())
+            return patch;
+        }
+      }
+    }
+
+    auto tryMultiLeafPatternRewrite = [&]() -> std::optional<MacroPatch> {
+      if (oldToks.size() != newToks.size())
+        return std::nullopt;
+
+      DenseMap<uint32_t, std::string> replByArgIdx;
+      for (size_t tokIdx = 0; tokIdx < oldToks.size(); ++tokIdx) {
+        if (oldToks[tokIdx].spelling == newToks[tokIdx].spelling)
+          continue;
+
+        std::string oldValueStorage = leafValueForToken(oldToks[tokIdx].spelling);
+        std::string newValueStorage = leafValueForToken(newToks[tokIdx].spelling);
+        StringRef oldValue(oldValueStorage);
+        StringRef newValue(newValueStorage);
+        struct ArgOccurrence {
+          uint32_t argIdx = 0;
+          size_t begin = 0;
+          size_t end = 0;
+          std::string oldText;
+        };
+        SmallVector<ArgOccurrence, 8> occs;
+        for (uint32_t argIdx = 0; argIdx < invArgRanges.size(); ++argIdx) {
+          auto r = invArgRanges[argIdx];
+          if (r.second < r.first || r.second > baseInvText.size())
+            return std::nullopt;
+          StringRef argText = baseInvText.slice(r.first, r.second).trim();
+          if (argText.empty())
+            continue;
+          if (resolveFunctionLikeForLeafProof(argText))
+            continue;
+          SmallVector<StringRef, 2> probes;
+          probes.push_back(argText);
+          if (std::optional<std::string> decodedArg =
+                  decodeSimpleStringLiteralToken(argText))
+            probes.push_back(StringRef(*decodedArg));
+          for (StringRef probe : probes) {
+            if (probe.empty())
+              continue;
+            size_t pos = oldValue.find(probe);
+            if (pos == StringRef::npos)
+              continue;
+            if (oldValue.find(probe, pos + probe.size()) != StringRef::npos)
+              return std::nullopt;
+            occs.push_back(ArgOccurrence{argIdx, pos, pos + probe.size(),
+                                         probe.str()});
+            break;
+          }
+        }
+        if (occs.empty())
+          return std::nullopt;
+        llvm::sort(occs, [](const ArgOccurrence &lhs,
+                            const ArgOccurrence &rhs) {
+          if (lhs.begin != rhs.begin)
+            return lhs.begin < rhs.begin;
+          return lhs.argIdx < rhs.argIdx;
+        });
+        for (size_t i = 1; i < occs.size(); ++i)
+          if (occs[i].begin < occs[i - 1].end)
+            return std::nullopt;
+
+        // Match the literal skeleton around the old root-argument leaves
+        // against the new expansion value.  The leaves themselves may change
+        // length, so only the fixed literal gaps are used as anchors.
+        size_t newCursor = 0;
+        for (size_t i = 0; i < occs.size(); ++i) {
+          StringRef prefix = oldValue.slice(i == 0 ? 0 : occs[i - 1].end,
+                                            occs[i].begin);
+          if (!newValue.substr(newCursor).starts_with(prefix))
+            return std::nullopt;
+          newCursor += prefix.size();
+          StringRef nextLiteral = oldValue.slice(
+              occs[i].end, i + 1 < occs.size() ? occs[i + 1].begin
+                                                : oldValue.size());
+          size_t nextPos = StringRef::npos;
+          if (nextLiteral.empty()) {
+            nextPos = newValue.size();
+          } else {
+            nextPos = newValue.find(nextLiteral, newCursor);
+            if (nextPos == StringRef::npos)
+              return std::nullopt;
+            if (newValue.find(nextLiteral, nextPos + 1) != StringRef::npos)
+              return std::nullopt;
+          }
+          StringRef solved = newValue.slice(newCursor, nextPos).trim();
+          if (solved.empty())
+            return std::nullopt;
+          auto existing = replByArgIdx.find(occs[i].argIdx);
+          if (existing != replByArgIdx.end()) {
+            if (!leafTextsTokenEquivalent(StringRef(existing->second), solved))
+              return std::nullopt;
+          } else {
+            if (!isVariadicFormal(occs[i].argIdx) && hasTopLevelComma(solved))
+              return std::nullopt;
+            replByArgIdx[occs[i].argIdx] = solved.str();
+          }
+          newCursor = nextPos;
+        }
+        // The loop above leaves `newCursor` at the start of the literal
+        // suffix following the last editable leaf.  Intermediate separators are
+        // consumed as the next leaf's prefix, but the final suffix has no next
+        // iteration to consume it.  Consume that trailing literal context here
+        // so decorated multi-leaf expressions such as
+        // `pre_##A##_mid_##B##_suf` are matched as one skeleton rather than
+        // rejected after solving the last source slot.
+        if (!occs.empty()) {
+          StringRef trailingLiteral = oldValue.drop_front(occs.back().end);
+          if (!newValue.substr(newCursor).starts_with(trailingLiteral))
+            return std::nullopt;
+          newCursor += trailingLiteral.size();
+        }
+        if (newCursor != newValue.size())
+          return std::nullopt;
+      }
+
+      if (replByArgIdx.empty())
+        return std::nullopt;
+      std::optional<InvocationRewriteWithRange> rewrite =
+          buildInvocationRewriteWithRange(replByArgIdx);
+      if (!rewrite)
+        return std::nullopt;
+      MacroPatch patch{*m.invB, *m.invE, std::move(rewrite->text), m.id};
+      stampMacroPatchMaterializedOutputRange(patch, *rewrite);
+      stampMacroPatchMaterializedBTokenRange(
+          patch, static_cast<uint64_t>(bEnv->first),
+          static_cast<uint64_t>(bEnv->second));
+      StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyStandard,
+                           /*validated=*/true,
+                           /*structurePreserving=*/true, m.id);
+      return patch;
+    };
+
+    if (auto patch = tryMultiLeafPatternRewrite())
+      return patch;
 
     if (!leafRewrite)
       return std::nullopt;
