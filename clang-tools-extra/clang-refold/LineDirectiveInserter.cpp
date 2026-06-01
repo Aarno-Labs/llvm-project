@@ -1335,28 +1335,6 @@ LineDirectiveLocation LineDirectiveInserter::LogicalLocationAtOffset(
                                      ownerFile, ownerIncludeId);
 }
 
-std::string LineDirectiveInserter::WrapIncludeExpansion(
-    StringRef childFileSpelling, StringRef parentFileSpelling,
-    size_t parentResumeLineNo, StringRef childBody) const {
-  if (!enabled_)
-    return childBody.str();
-
-  std::string result;
-  result.reserve(childBody.size() + 128);
-
-  result += FormatLineDirective(1, childFileSpelling);
-  result += childBody.str();
-
-  // Ensure the resume directive begins on its own line even when the included
-  // body did not end with a newline.
-  if (!childBody.empty() && childBody.back() != '\n') {
-    result += '\n';
-  }
-
-  result += FormatLineDirective(parentResumeLineNo, parentFileSpelling);
-  return result;
-}
-
 static bool rejoinsUntouchedTailSafelyAtBOL(StringRef originalFileText,
                                              uint64_t editEnd) {
   const size_t n = originalFileText.size();

@@ -5903,17 +5903,8 @@ std::string RefoldEngine::ResolvePostStructuralFallback() {
     NoteTheoremAuditViolation(
         "terminal fallback had no structured failed-obligation list");
   }
-  if (terminalWitness.kind == TerminalFallbackKind::MixedExcludedCases &&
-      terminalWitness.proofFailures.size() < 2) {
-    terminalAuditOk = false;
-    ++lastTheoremAudit_.terminalFailureAuditViolations;
-    NoteTheoremAuditViolation(
-        "MixedExcludedCases terminal fallback did not retain secondary "
-        "failed obligations");
-  }
   if (!terminalAuditOk) {
     RequestTerminalFallback(
-        TerminalFallbackKind::TheoremAuditInvariantViolation,
         MakeTerminalFallbackProofFailure(
             TerminalFallbackObligationKind::TheoremAuditInvariantSatisfied,
             TerminalFallbackFailureReason::TheoremAuditInvariantViolation,
@@ -5932,8 +5923,6 @@ std::string RefoldEngine::ResolvePostStructuralFallback() {
         terminalFallbackReasons_.size(), terminalWitness.proofFailures.size());
   const AcceptedResultCandidate terminalCandidate =
       BuildAcceptedTerminalCandidate(terminalWitness);
-  debug("proof/inventory", "terminal result {0}",
-        FormatAcceptedResultCandidate(terminalCandidate));
   for (const auto &r : terminalFallbackReasons_)
     debug("fallback", "  {0}", r);
 

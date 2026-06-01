@@ -2016,59 +2016,21 @@ RefoldEngine::Refold(const json::Object &rootJson, StringRef aSource,
   return engine.Refold();
 }
 
-RefoldEngine::TerminalFallbackProofFailure
-RefoldEngine::ClassifyAggregateTerminalFallbackProofFailure(
-    TerminalFallbackKind kind) {
-  switch (kind) {
-  case TerminalFallbackKind::OwnerUnresolvedNoTUAnchor:
-    return MakeTerminalFallbackProofFailure(
-        TerminalFallbackObligationKind::OwnerClosedCover,
-        TerminalFallbackFailureReason::NoTUAnchorForUnresolvedOwner);
-  case TerminalFallbackKind::IncludeRealizationUnmappableBCoverEnvelope:
-    return MakeTerminalFallbackProofFailure(
-        TerminalFallbackObligationKind::IncludeRealizationBEnvelopeMapped,
-        TerminalFallbackFailureReason::UnmappableIncludeBEnvelope);
-  case TerminalFallbackKind::UndischargedEmissionArtifact:
-    return MakeTerminalFallbackProofFailure(
-        TerminalFallbackObligationKind::EmissionArtifactDischarged,
-        TerminalFallbackFailureReason::UndischargedEmissionArtifact);
-  case TerminalFallbackKind::UncomposableEmissionEditSet:
-    return MakeTerminalFallbackProofFailure(
-        TerminalFallbackObligationKind::EmissionEditSetComposable,
-        TerminalFallbackFailureReason::UncomposableEmissionEditSet);
-  case TerminalFallbackKind::TheoremAuditInvariantViolation:
-    return MakeTerminalFallbackProofFailure(
-        TerminalFallbackObligationKind::TheoremAuditInvariantSatisfied,
-        TerminalFallbackFailureReason::TheoremAuditInvariantViolation);
-  case TerminalFallbackKind::MixedExcludedCases:
-    return MakeTerminalFallbackProofFailure(
-        TerminalFallbackObligationKind::SingleTerminalExclusionClassified,
-        TerminalFallbackFailureReason::MixedExcludedCases);
-  case TerminalFallbackKind::Unknown:
-    return MakeTerminalFallbackProofFailure(
-        TerminalFallbackObligationKind::TheoremAuditInvariantSatisfied,
-        TerminalFallbackFailureReason::TheoremAuditInvariantViolation);
-  }
-  llvm_unreachable("invalid terminal fallback kind");
-}
-
 /// Record that the current run escaped the declared proof domain.
 ///
-/// Phase 2 makes terminal fallback an explicit failed proof obligation.  The
-/// caller must therefore provide both the terminal-exclusion kind and the local
-/// proof failure it could not discharge.  This routine only aggregates multiple
-/// requests and records diagnostics; it must not invent a default `Unknown`
-/// classification for a raw-B escape.
+/// R4 makes the structured proof failure the authoritative terminal carrier.
+/// Callers therefore pass the failed obligation directly; this routine only
+/// normalizes/audits that obligation, preserves all requests in order, and emits
+/// diagnostics derived from the proof data.  It must not derive a theorem
+/// failure from a broad aggregate fallback kind.
 void RefoldEngine::RequestTerminalFallback(
-    TerminalFallbackKind kind, TerminalFallbackProofFailure failure,
-    StringRef phase, StringRef detail) const {
-  if (kind == TerminalFallbackKind::Unknown ||
-      !IsClassifiedTerminalFallbackProofFailure(failure)) {
+    TerminalFallbackProofFailure failure, StringRef phase,
+    StringRef detail) const {
+  if (!IsClassifiedTerminalFallbackProofFailure(failure)) {
     // An unclassified fallback request would be a theorem-audit bug: it would
     // allow raw B without saying which strict-domain obligation failed.  Keep
     // the engine fail-closed by converting the request itself into a classified
     // theorem-audit violation.
-    kind = TerminalFallbackKind::TheoremAuditInvariantViolation;
     failure = MakeTerminalFallbackProofFailure(
         TerminalFallbackObligationKind::TheoremAuditInvariantSatisfied,
         TerminalFallbackFailureReason::TheoremAuditInvariantViolation,
@@ -2087,7 +2049,6 @@ void RefoldEngine::RequestTerminalFallback(
     // structured context names the missing fact.  Preserve the human detail in
     // the diagnostic log, but make the theorem-facing raw-B carrier an explicit
     // audit violation rather than retaining an opaque missing-facts obligation.
-    kind = TerminalFallbackKind::TheoremAuditInvariantViolation;
     failure = MakeTerminalFallbackProofFailure(
         TerminalFallbackObligationKind::TheoremAuditInvariantSatisfied,
         TerminalFallbackFailureReason::TheoremAuditInvariantViolation,
@@ -2104,7 +2065,6 @@ void RefoldEngine::RequestTerminalFallback(
   const std::optional<TheoremFallbackFailureKind> normalizedFailure =
       NormalizeTerminalFallbackFailureReason(failure.reason);
   if (!normalizedFailure || *normalizedFailure != failure.theoremFailure) {
-    kind = TerminalFallbackKind::TheoremAuditInvariantViolation;
     failure = MakeTerminalFallbackProofFailure(
         TerminalFallbackObligationKind::TheoremAuditInvariantSatisfied,
         TerminalFallbackFailureReason::TheoremAuditInvariantViolation,
@@ -2122,29 +2082,19 @@ void RefoldEngine::RequestTerminalFallback(
   if (terminalFallbackProofFailures_.size() < 64)
     terminalFallbackProofFailures_.push_back(failure);
 
-  if (terminalFallbackKind_ == TerminalFallbackKind::Unknown) {
-    terminalFallbackKind_ = kind;
+  if (!IsClassifiedTerminalFallbackProofFailure(terminalFallbackProofFailure_))
     terminalFallbackProofFailure_ = failure;
-  } else if (kind != TerminalFallbackKind::Unknown &&
-             terminalFallbackKind_ != kind) {
-    // Preserve the first caller-supplied failed obligation even when multiple
-    // terminal exclusions are requested.  Phase 2B forbids reconstructing the
-    // proof failure from the aggregate MixedExcludedCases kind because that
-    // would erase the precise local obligation that crossed the domain wall.
-    terminalFallbackKind_ = TerminalFallbackKind::MixedExcludedCases;
-  }
 
   if (terminalFallbackReasons_.size() < 64) {
     terminalFallbackReasons_.push_back(
-        llvm::formatv("kind={0} {1} terminalAction=raw-b-emission "
-                      "phase={2}: {3}",
-                      toString(kind), toString(failure), phase, detail)
+        llvm::formatv("{0} terminalAction=raw-b-emission phase={1}: {2}",
+                      toString(failure), phase, detail)
             .str());
   }
   debug("fallback",
-        "REQUEST terminal fallback: kind={0} {1} "
-        "terminalAction=raw-b-emission phase={2}: {3}",
-        toString(kind), toString(failure), phase, detail);
+        "REQUEST terminal fallback: {0} terminalAction=raw-b-emission "
+        "phase={1}: {2}",
+        toString(failure), phase, detail);
 }
 
 void RefoldEngine::EnforceTheoremAuditInvariants() const {
@@ -2200,8 +2150,7 @@ void RefoldEngine::EnforceTheoremAuditInvariants() const {
     return;
   }
 
-  RequestTerminalFallback(TerminalFallbackKind::TheoremAuditInvariantViolation,
-                          MakeTerminalFallbackProofFailure(
+  RequestTerminalFallback(MakeTerminalFallbackProofFailure(
                               TerminalFallbackObligationKind::TheoremAuditInvariantSatisfied,
                               TerminalFallbackFailureReason::TheoremAuditInvariantViolation),
                           "theorem", BuildTheoremAuditInvariantDetail());
@@ -2267,7 +2216,6 @@ bool RefoldEngine::AuditStateTransitionGatewayProofs(
 
   if (strict_ && !terminalFallbackRequested_) {
     RequestTerminalFallback(
-        TerminalFallbackKind::TheoremAuditInvariantViolation,
         MakeTerminalFallbackProofFailure(
             TerminalFallbackObligationKind::TheoremAuditInvariantSatisfied,
             TerminalFallbackFailureReason::TheoremAuditInvariantViolation,
@@ -2301,10 +2249,6 @@ void RefoldEngine::RecordTerminalFallbackTheoremAudit() const {
   for (const TerminalFallbackProofFailure &failure : witness.proofFailures)
     structuredFailuresClassified &=
         IsClassifiedTerminalFallbackProofFailure(failure);
-  const bool mixedExclusionHasSecondaryObligation =
-      witness.kind != TerminalFallbackKind::MixedExcludedCases ||
-      witness.proofFailures.size() >= 2;
-
   // The terminal exclusion must remain explicit all the way through the
   // normalized proof carrier. Merely requesting fallback is not
   // sufficient; the resulting terminal witness must classify as the named
@@ -2321,11 +2265,12 @@ void RefoldEngine::RecordTerminalFallbackTheoremAudit() const {
           TheoremDomainKind::ExplicitOutOfDomainClass &&
       summary.theoremDomain.hasExplicitExclusion &&
       summary.theoremDomain.explicitExclusion !=
-          TerminalFallbackKind::Unknown &&
-      summary.theoremDomain.explicitExclusion == witness.kind &&
+          TheoremFallbackFailureKind::Unknown &&
+      summary.theoremDomain.explicitExclusion ==
+          witness.proofFailure.theoremFailure &&
       summary.hasTerminalFallbackWitness &&
       IsClassifiedTerminalFallbackProofFailure(witness.proofFailure) &&
-      structuredFailuresClassified && mixedExclusionHasSecondaryObligation &&
+      structuredFailuresClassified &&
       summary.discharge.status == ProofDischargeStatus::Rejected &&
       summary.discharge.failedObligation ==
           ProofObligationKind::ExplicitOutOfDomainResultTracked &&
@@ -2340,8 +2285,8 @@ void RefoldEngine::RecordTerminalFallbackTheoremAudit() const {
   ++lastTheoremAudit_.nonExplicitTerminalExclusions;
   NoteTheoremAuditViolation(
       llvm::formatv("terminal fallback escaped theorem-domain classification: "
-                    "witness={0} candidate={1}",
-                    witness, FormatAcceptedResultCandidate(candidate))
+                    "witness={0} candidateKind={1}",
+                    witness, candidate.kind)
           .str());
 }
 
@@ -2627,7 +2572,6 @@ std::string RefoldEngine::Refold() {
   finalLineProducerEvents.reserve(model_.GetLineControls().size());
   for (const RefoldModel::LineControlEvent &event : model_.GetLineControls()) {
     FinalLineControlProducerEvent finalEvent;
-    finalEvent.id = event.id;
     finalEvent.physicalFile =
         normalizeFinalLineControlPhysicalFile(event.physicalFile);
     finalEvent.siteBegin = event.siteB;
@@ -2672,7 +2616,6 @@ std::string RefoldEngine::Refold() {
           return;
 
         FinalLineControlProducerObserver observer;
-        observer.id = builtin.id;
         observer.kind = kind;
         observer.physicalFile =
             normalizeFinalLineControlPhysicalFile(*site.invFile);
@@ -2681,7 +2624,6 @@ std::string RefoldEngine::Refold() {
         observer.ownerIncludeId = site.ownerIncludeId;
         observer.active = true;
         observer.producerProven = true;
-        observer.expected = FinalExpectedLineValue::Unknown();
         if (site.invText)
           observer.text = site.invText->str();
         finalLineProducerObservers.push_back(std::move(observer));
@@ -2726,10 +2668,8 @@ std::string RefoldEngine::Refold() {
                  return lhs.sourceBegin < rhs.sourceBegin;
                if (lhs.sourceEnd != rhs.sourceEnd)
                  return lhs.sourceEnd < rhs.sourceEnd;
-               if (lhs.kind != rhs.kind)
-                 return static_cast<unsigned>(lhs.kind) <
-                        static_cast<unsigned>(rhs.kind);
-               return lhs.id < rhs.id;
+               return static_cast<unsigned>(lhs.kind) <
+                      static_cast<unsigned>(rhs.kind);
              });
 
   finalLineProducerObservers.erase(
@@ -2762,37 +2702,27 @@ std::string RefoldEngine::Refold() {
       return point - size;
     };
 
-    for (const FinalLineControlPruneDecision &decision :
-         finalLinePrune.decisions) {
-      if (!decision.removed)
-        continue;
+    for (const FinalLineControlRemovedRange &removedRange :
+         finalLinePrune.removedRanges) {
       if (materializedEditMappings_) {
         for (MaterializedEditMapping &mapping : *materializedEditMappings_) {
           mapping.refoldedSourceBegin = mapPointAfterDeletion(
-              mapping.refoldedSourceBegin, decision.finalBegin,
-              decision.finalEnd);
+              mapping.refoldedSourceBegin, removedRange.finalBegin,
+              removedRange.finalEnd);
           mapping.refoldedSourceEnd = mapPointAfterDeletion(
-              mapping.refoldedSourceEnd, decision.finalBegin,
-              decision.finalEnd);
+              mapping.refoldedSourceEnd, removedRange.finalBegin,
+              removedRange.finalEnd);
         }
       }
 
       AdjustFinalLineControlSourceMappingsAfterDeletion(
-          finalLineControlSourceMappings_, decision.finalBegin,
-          decision.finalEnd);
+          finalLineControlSourceMappings_, removedRange.finalBegin,
+          removedRange.finalEnd);
     }
   }
 
   out = finalLinePrune.output;
 
-  if (inTraceMode()) {
-    TraceFinalLineControlPruneResult(finalLinePrune, "post-structural");
-    FinalLineControlModel finalLineControl =
-        CollectPassiveFinalLineControlModel(
-            out, finalLineControlSourceMappings_, finalLineProducerEvents,
-            finalLineProducerObservers);
-    TraceFinalLineControlModel(finalLineControl, "post-final-prune");
-  }
 
   EmitRefoldStats();
   EmitTheoremAudit();
@@ -2808,7 +2738,6 @@ bool RefoldEngine::ValidateSidebandPragmaEditProof(
 
   auto fail = [&](StringRef why) -> bool {
     RequestTerminalFallback(
-        TerminalFallbackKind::UndischargedEmissionArtifact,
         MakeTerminalFallbackProofFailure(
           TerminalFallbackObligationKind::PragmaBoundaryKnown,
           TerminalFallbackFailureReason::UnknownPragmaCrossesBoundary), phase,
@@ -2865,7 +2794,6 @@ bool RefoldEngine::AppendSidebandPragmaSourceEdits(
     if (!PathsEqual(sideband.SourcePath(), tuPath)) {
       if (!sideband.HasConcreteIncludeOwner()) {
         RequestTerminalFallback(
-            TerminalFallbackKind::UndischargedEmissionArtifact,
             MakeTerminalFallbackProofFailure(
           TerminalFallbackObligationKind::PragmaBoundaryKnown,
           TerminalFallbackFailureReason::UnknownPragmaCrossesBoundary),
@@ -2889,7 +2817,6 @@ bool RefoldEngine::AppendSidebandPragmaSourceEdits(
     if (!sideband.SourceIsWithinOwnerBytes(
             static_cast<uint64_t>(tuBytes.size()))) {
       RequestTerminalFallback(
-          TerminalFallbackKind::UndischargedEmissionArtifact,
           MakeTerminalFallbackProofFailure(
           TerminalFallbackObligationKind::PragmaBoundaryKnown,
           TerminalFallbackFailureReason::UnknownPragmaCrossesBoundary), "pragma/sideband",
@@ -3194,7 +3121,6 @@ std::string RefoldEngine::RunSinglePassRefold() {
     // we can discharge from that inconsistent A surface, so do not abort the
     // process.  Escape to the explicit terminal carrier (`--pp-mod`) instead.
     RequestTerminalFallback(
-        TerminalFallbackKind::UndischargedEmissionArtifact,
         MakeTerminalFallbackProofFailure(
             TerminalFallbackObligationKind::ProducerFactsAvailable,
             TerminalFallbackFailureReason::MissingProducerFacts,
@@ -4041,13 +3967,13 @@ std::string RefoldEngine::RunSinglePassRefold() {
         return false;
       }
 
-      const OwnerStateSummary &summary = gap.closure->stateOut;
-      if (summary.HasTheoremUnmodeledState()) {
+      const OwnerStateDelta &summary = gap.closure->stateOut;
+      if (OwnerStateDeltaHasUnmodeledState(summary)) {
         if (reason)
           *reason = "state gap contains unmodeled producer state";
         return false;
       }
-      if (summary.HasTheoremUnknownPragmaState()) {
+      if (OwnerStateDeltaHasUnknownPragmaState(summary)) {
         if (reason)
           *reason = "state gap contains unknown pragma state";
         return false;
@@ -4070,53 +3996,50 @@ std::string RefoldEngine::RunSinglePassRefold() {
         out.push_back(component);
     };
 
-    auto stateComponentsObservedBySummary = [&](const OwnerStateSummary &summary) {
-      // Phase 3O consumes the theorem-facing delta view instead of the flat
-      // compatibility projection.  This keeps mixed-owner composition tied to
-      // precise Entry/Observes/Mutates/Exit facts and explicit missing-fact
-      // markers, not legacy global state poison.
-      const OwnerStateDelta theoremDelta = summary.AsTheoremStateDelta();
+    auto stateComponentsObservedBySummary = [&](const OwnerStateDelta &summary) {
+      // R3 consumes the canonical theorem-facing delta directly.  Mixed-owner
+      // composition is tied to precise Entry/Observes/Mutates/Exit facts and
+      // explicit missing-fact markers, not a flat owner-state projection.
+      const OwnerStateDelta theoremDelta = summary;
       const StateObservations &observations = theoremDelta.Observes;
       SmallVector<OwnerStateComponent, 8> components;
-      if (observations.observesMacroState)
+      if (observations.HasMacroRequirements() ||
+          observations.HasMacroExpansionObservations())
         appendUniqueStateComponent(components, OwnerStateComponent::MacroState);
-      if (observations.observesDefinedOperator)
+      if (observations.HasDefinedOperatorObservations())
         appendUniqueStateComponent(components,
                                    OwnerStateComponent::DefinedOperator);
-      if (observations.dependsOnConditionalState ||
-          observations.observesConditionalState)
+      if (observations.HasConditionalMacroObservations() ||
+          observations.HasConditionalStateEvents())
         appendUniqueStateComponent(components,
                                    OwnerStateComponent::ConditionalState);
-      if (observations.observesLine ||
-          llvm::any_of(observations.builtinLocationObservations,
+      if (llvm::any_of(observations.builtinLocationObservations,
                        [](const BuiltinLocationObservation &obs) {
                          return obs.kind ==
                                 BuiltinLocationObservationKind::LineState;
                        }))
         appendUniqueStateComponent(components, OwnerStateComponent::LineNumber);
-      if (observations.observesFile ||
-          llvm::any_of(observations.builtinLocationObservations,
+      if (llvm::any_of(observations.builtinLocationObservations,
                        [](const BuiltinLocationObservation &obs) {
                          return obs.kind ==
                                 BuiltinLocationObservationKind::FileState;
                        }))
         appendUniqueStateComponent(components, OwnerStateComponent::FileState);
-      if (observations.observesFileName ||
-          llvm::any_of(observations.builtinLocationObservations,
+      if (llvm::any_of(observations.builtinLocationObservations,
                        [](const BuiltinLocationObservation &obs) {
                          return obs.kind ==
                                 BuiltinLocationObservationKind::FileNameState;
                        }))
         appendUniqueStateComponent(components, OwnerStateComponent::FileName);
-      if (observations.observesCounter || observations.HasCounterEvents())
+      if (observations.HasCounterEvents())
         appendUniqueStateComponent(components, OwnerStateComponent::Counter);
-      if (observations.observesPragmaState ||
-          observations.hasUnknownPragmaEffect)
+      if (observations.HasPragmaStateEvents() ||
+          observations.HasTheoremUnknownPragmaState())
         appendUniqueStateComponent(components, OwnerStateComponent::PragmaState);
-      if (observations.dependsOnIncludeGuardState)
+      if (observations.HasIncludeGuardStateEvents())
         appendUniqueStateComponent(components,
                                    OwnerStateComponent::IncludeGuardState);
-      if (observations.observesIncludeState)
+      if (observations.HasIncludeStateEvents())
         appendUniqueStateComponent(components, OwnerStateComponent::IncludeState);
       for (const MissingStateFact &fact : observations.missingStateFacts) {
         if (fact.kind == MissingStateFactKind::MissingLineControlFacts) {
@@ -4128,21 +4051,24 @@ std::string RefoldEngine::RunSinglePassRefold() {
         appendUniqueStateComponent(
             components, StateComponentForMissingStateFact(fact.kind));
       }
-      if (observations.hasUnmodeledState)
+      if (observations.HasMissingFactKind(
+              MissingStateFactKind::MissingOwnerOrderingFacts))
         appendUniqueStateComponent(components,
                                    OwnerStateComponent::UnmodeledState);
       return components;
     };
 
-    auto mergedEdgeStateSummary = [](const PartitionEdge &edge) {
-      OwnerStateSummary summary;
+    auto mergedEdgeStateSummary = [&](const PartitionEdge &edge) {
+      OwnerStateDelta summary;
       if (edge.closure) {
         summary.MergeFrom(edge.closure->stateIn);
         summary.MergeFrom(edge.closure->stateOut);
       } else {
-        summary.AddMissingStateFact(
+        OwnerStateFacts missingFacts;
+        missingFacts.AddMissingStateFact(
             MissingStateFactKind::MissingOwnerOrderingFacts,
             "partition edge has no owner closure");
+        summary = BuildTheoremStateDelta(missingFacts, OwnerStateDelta());
       }
       return summary;
     };
@@ -4167,13 +4093,13 @@ std::string RefoldEngine::RunSinglePassRefold() {
           return false;
         }
 
-        const OwnerStateSummary summary = mergedEdgeStateSummary(edge);
-        if (edge.IsStateGap() && summary.HasTheoremUnmodeledState()) {
+        const OwnerStateDelta summary = mergedEdgeStateSummary(edge);
+        if (edge.IsStateGap() && OwnerStateDeltaHasUnmodeledState(summary)) {
           if (reason)
             *reason = "zero-token state gap contains unmodeled state";
           return false;
         }
-        if (edge.IsStateGap() && summary.HasTheoremUnknownPragmaState()) {
+        if (edge.IsStateGap() && OwnerStateDeltaHasUnknownPragmaState(summary)) {
           if (reason)
             *reason = "zero-token state gap contains unknown pragma state";
           return false;
@@ -4186,7 +4112,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
         }
 
         for (OwnerStateComponent mutated :
-             StateComponentsMutatedBySummary(summary))
+             StateComponentsMutatedByDelta(summary))
           appendUniqueStateComponent(activeMutations, mutated);
       }
 
@@ -4624,8 +4550,9 @@ std::string RefoldEngine::RunSinglePassRefold() {
         for (const PartitionEdge &edge : path) {
           if (!edge.closure)
             return std::nullopt;
-          if (edge.IsStateGap() || edge.closure->stateIn.MutatesAnyState() ||
-              edge.closure->stateOut.MutatesAnyState()) {
+          if (edge.IsStateGap() ||
+              OwnerStateDeltaMutatesAnyState(edge.closure->stateIn) ||
+              OwnerStateDeltaMutatesAnyState(edge.closure->stateOut)) {
             trace("hunks/norm",
                   "classify stateful delete-only mixed hunk as non-tilable by "
                   "token-cover splitter A=[{0},{1}) B=[{2},{3}) edgeKind={4} "
@@ -4927,7 +4854,9 @@ std::string RefoldEngine::RunSinglePassRefold() {
     // macro candidate. Other macro proofs have their own stronger invariants
     // and should not be displaced by this narrow preference.
     if (macroCandidate.proofKind != MacroPatchProofKind::ArgsOnlyStandard ||
-        !macroCandidate.proofValidated || !macroCandidate.structurePreserving)
+        macroCandidate.proofSummary.discharge.status !=
+            ProofDischargeStatus::Discharged ||
+        !macroCandidate.structurePreserving)
       return false;
 
     // This preference rewrites existing source bytes inside an argument. Pure
@@ -5536,7 +5465,6 @@ std::string RefoldEngine::RunSinglePassRefold() {
             "TU/include closure witness; requesting terminal fallback.",
             i);
       RequestTerminalFallback(
-          TerminalFallbackKind::OwnerUnresolvedNoTUAnchor,
           MakeTerminalFallbackProofFailure(
               TerminalFallbackObligationKind::OwnerClosedCover,
               TerminalFallbackFailureReason::NoOwnerClosedCover,
@@ -5727,7 +5655,6 @@ std::string RefoldEngine::RunSinglePassRefold() {
     // success class here; terminate via the named out-of-domain boundary
     // instead.
     RequestTerminalFallback(
-        TerminalFallbackKind::OwnerUnresolvedNoTUAnchor,
         MakeTerminalFallbackProofFailure(
             TerminalFallbackObligationKind::OwnerClosedCover,
             TerminalFallbackFailureReason::NoOwnerClosedCover,
@@ -8748,8 +8675,6 @@ std::string RefoldEngine::RunSinglePassRefold() {
         candidate.physicalOwner =
             FinalLineControlOwnerKey(tuPath.str(), std::nullopt);
         candidate.producerProven = true;
-        candidate.reason =
-            "synthetic TU prologue candidate with final-stream observer proof";
         finalLineControlPruneCandidates_.push_back(std::move(candidate));
       }
     }
@@ -10135,44 +10060,41 @@ bool RefoldEngine::OwnerMatchesSourceSite(
 
 RefoldEngine::OwnerClosure
 RefoldEngine::AttachCanonicalStateSummary(OwnerClosure closure) const {
-  OwnerStateSummary summary = BuildOwnerStateSummary(closure.owner);
+  OwnerStateDelta summary = BuildOwnerStateDelta(closure.owner);
   closure.stateIn = summary;
   closure.stateOut = summary;
-  closure.observers = summary.ToObserverSummary();
+  closure.observers = OwnerStateDeltaToObserverSummary(summary);
   return closure;
 }
 
-RefoldEngine::OwnerStateSummary
-RefoldEngine::BuildOwnerStateSummary(const Owner &owner) const {
-  OwnerStateSummary summary;
+RefoldEngine::OwnerStateDelta
+RefoldEngine::BuildOwnerStateDelta(const Owner &owner) const {
+  OwnerStateFacts facts;
 
   auto markMissing = [&](MissingStateFactKind kind, StringRef detail) {
-    summary.AddMissingStateFact(kind, detail);
+    facts.AddMissingStateFact(kind, detail);
   };
 
   auto markMissingAndUnmodeled = [&](MissingStateFactKind kind,
                                      StringRef detail) {
     markMissing(kind, detail);
-    summary.hasUnmodeledState = true;
   };
 
   auto finalize = [&]() {
-    // Phase 3O: keep the compatibility delta refreshed for legacy/debug users,
-    // but theorem-facing checks consume AsTheoremStateDelta(), which ignores
-    // raw flat booleans and reads precise component facts plus MissingStateFact
-    // markers.  A missing fact must therefore never make the theorem delta look
-    // empty.
-    summary.RefreshDeltaFromFlatFacts();
-    if (summary.HasMissingStateFacts() &&
-        summary.AsTheoremStateDelta().Empty()) {
-      summary.AddMissingStateFact(
+    // R3 has no OwnerStateSummary compatibility bridge.  Build the canonical
+    // theorem delta directly from precise producer facts and explicit
+    // MissingStateFact markers, so missing facts cannot disappear as an empty
+    // flat summary.
+    OwnerStateDelta theoremDelta =
+        BuildTheoremStateDelta(facts, OwnerStateDelta());
+    if (facts.HasMissingStateFacts() && theoremDelta.Empty()) {
+      facts.AddMissingStateFact(
           MissingStateFactKind::MissingOwnerOrderingFacts,
           "missing producer facts failed to project into theorem delta");
-      summary.RefreshDeltaFromFlatFacts();
+      theoremDelta = BuildTheoremStateDelta(facts, OwnerStateDelta());
     }
-    return summary;
+    return theoremDelta;
   };
-
   if (!owner.IsKnown()) {
     markMissingAndUnmodeled(MissingStateFactKind::MissingOwnerOrderingFacts,
                             "unknown owner identity");
@@ -10193,7 +10115,7 @@ RefoldEngine::BuildOwnerStateSummary(const Owner &owner) const {
     observation.sourceEnd = sourceEnd;
     observation.aTokenBegin = aTokenBegin;
     observation.aTokenEnd = aTokenEnd;
-    summary.AddBuiltinLocationObservation(observation);
+    facts.AddBuiltinLocationObservation(observation);
   };
 
   auto scanTextForBuiltins = [&](StringRef text) {
@@ -10214,8 +10136,6 @@ RefoldEngine::BuildOwnerStateSummary(const Owner &owner) const {
       // recorded separately from MacroInvocation records below.  Record the
       // missing event fact explicitly so Phase 5 can fail closed if a proof
       // needs per-event counter identity.
-      summary.observesCounter = true;
-      summary.consumesCounter = true;
       markMissing(MissingStateFactKind::MissingCounterFacts,
                   "textual __COUNTER__ without producer counter event");
     }
@@ -10240,8 +10160,6 @@ RefoldEngine::BuildOwnerStateSummary(const Owner &owner) const {
             BuiltinLocationObservationKind::FileNameState, std::nullopt,
             std::nullopt, std::nullopt, i, i + 1);
       if (RawIdentifierAppearsInText("__COUNTER__", spelling)) {
-        summary.observesCounter = true;
-        summary.consumesCounter = true;
         markMissing(MissingStateFactKind::MissingCounterFacts,
                     "A-token __COUNTER__ without producer counter event");
       }
@@ -10314,7 +10232,7 @@ RefoldEngine::BuildOwnerStateSummary(const Owner &owner) const {
     MacroStateObservation observation;
     observation.kind = kind;
     observation.identity = identity;
-    summary.AddMacroObservation(observation);
+    facts.AddMacroObservation(observation);
   };
 
   auto lineControlIdentityFromEvent = [&](
@@ -10457,7 +10375,7 @@ RefoldEngine::BuildOwnerStateSummary(const Owner &owner) const {
 
     uint64_t ordinal = 0;
     for (const auto &range : CounterOutputRangesForInvocation(macro)) {
-      summary.AddCounterEvent(
+      facts.AddCounterEvent(
           BuildCounterEventIdentity(macro, ordinal++, range.first,
                                     range.second));
     }
@@ -10543,7 +10461,6 @@ RefoldEngine::BuildOwnerStateSummary(const Owner &owner) const {
       }
 
       if (*identifier == "defined") {
-        summary.observesDefinedOperator = true;
         skipSpace();
         const bool parenthesized = i < text.size() && text[i] == '(';
         if (parenthesized) {
@@ -10577,9 +10494,9 @@ RefoldEngine::BuildOwnerStateSummary(const Owner &owner) const {
   auto recordMacroDirective = [&](const RefoldModel::MacroDirective &directive) {
     const MacroStateIdentity identity = identityFromDirective(directive);
     if (directive.subkind == "#define")
-      summary.AddMacroDefinition(identity);
+      facts.AddMacroDefinition(identity);
     else if (directive.subkind == "#undef")
-      summary.AddMacroUndefinition(identity);
+      facts.AddMacroUndefinition(identity);
     else
       markMissingAndUnmodeled(MissingStateFactKind::MissingMacroFacts,
                               "unknown macro directive kind");
@@ -10591,10 +10508,10 @@ RefoldEngine::BuildOwnerStateSummary(const Owner &owner) const {
 
   auto recordPragma = [&](const RefoldModel::PragmaDirective &pragma) {
     // Phase 3J: record a component-specific pragma event.  Unknown pragmas still
-    // fail closed through hasUnknownPragmaEffect, while known diagnostic pragma
-    // state can later be discharged by balanced/local pragma proofs.
+    // fail closed through the event classification, while known diagnostic
+    // pragma state can later be discharged by balanced/local pragma proofs.
     const PragmaStateIdentity identity = pragmaIdentityFromPragma(pragma);
-    summary.AddPragmaStateEvent(identity);
+    facts.AddPragmaStateEvent(identity);
     if (identity.classification == PragmaStateClassification::UnknownPragmaState)
       markMissing(MissingStateFactKind::MissingPragmaFacts,
                   "unknown pragma semantics");
@@ -10602,10 +10519,10 @@ RefoldEngine::BuildOwnerStateSummary(const Owner &owner) const {
 
   auto recordLineControl = [&](const RefoldModel::LineControlEvent &event) {
     // Phase 3E/3F: model #line as a zero-token state mutation whose operands
-    // were evaluated by the producer.  The old `setsLineFile` bit remains a
-    // compatibility projection of this component-specific event identity.
+    // were evaluated by the producer.  The component-specific event identity is
+    // the only line-control mutation fact consumed by theorem-facing code.
     const LineControlStateIdentity identity = lineControlIdentityFromEvent(event);
-    summary.AddLineControlEvent(identity);
+    facts.AddLineControlEvent(identity);
     if (!event.active || !event.producerProven)
       markMissingAndUnmodeled(MissingStateFactKind::MissingLineControlFacts,
                               "line-control event inactive or not producer-proven");
@@ -10619,8 +10536,8 @@ RefoldEngine::BuildOwnerStateSummary(const Owner &owner) const {
     // separate component facts.  The guard macro remains absent unless the
     // producer supplies a dedicated guard oracle; this is deliberately
     // conservative and avoids pattern-matching header guards in the consumer.
-    summary.AddIncludeStateEvent(includeStateIdentityFromInclude(include));
-    summary.AddIncludeGuardStateEvent(includeGuardIdentityFromInclude(include));
+    facts.AddIncludeStateEvent(includeStateIdentityFromInclude(include));
+    facts.AddIncludeGuardStateEvent(includeGuardIdentityFromInclude(include));
     if (!include.resolvedPath)
       markMissing(MissingStateFactKind::MissingOwnerOrderingFacts,
                   "include directive missing resolved file identity");
@@ -10635,10 +10552,9 @@ RefoldEngine::BuildOwnerStateSummary(const Owner &owner) const {
     // just as source text.  The condition text is producer metadata used only
     // to record macro/location observations; this does not authorize changing
     // the directive to reverse-solve B-side tokens.
-    summary.AddConditionalStateEvent(
+    facts.AddConditionalStateEvent(
         conditionalArmIdentityFromArm(group, arm));
     if (arm.cond) {
-      summary.observesMacroState = true;
       scanTextForBuiltins(*arm.cond);
       scanConditionalMacroState(*arm.cond);
     }
@@ -10650,16 +10566,15 @@ RefoldEngine::BuildOwnerStateSummary(const Owner &owner) const {
     // and mutates the conditional-state context seen by nested owners.  Arms
     // remain separate owners for their body intervals; the group owner is used
     // when the Phase-7 tiler must account for #if/#elif/#else/#endif bytes.
-    summary.AddConditionalStateEvent(
+    facts.AddConditionalStateEvent(
         conditionalGroupIdentityFromGroup(group));
     for (const RefoldModel::CondArm &arm : group.arms)
       recordConditionalArm(group, arm);
   };
 
   auto recordMacroInvocation = [&](const RefoldModel::MacroInvocation &macro) {
-    summary.observesMacroState = true;
     const MacroStateIdentity identity = identityFromInvocation(macro);
-    summary.AddMacroRequirement(identity);
+    facts.AddMacroRequirement(identity);
     recordMacroObservation(MacroObservationKind::Expansion, identity);
     recordCounterInvocationEvents(macro);
     if (macro.name.empty() ||
@@ -11058,7 +10973,7 @@ RefoldEngine::BuildOwnerStateGraph() const {
     node.kind = kind;
     node.closure = AttachCanonicalStateSummary(OwnerClosure::From(
         std::move(owner), std::move(source), aTokens, OwnerTokenRange::From(0, 0)));
-    node.state = node.closure.stateOut.AsTheoremStateDelta();
+    node.state = node.closure.stateOut;
     node.source = node.closure.source;
     node.aTokens = node.closure.aTokens;
     node.containingIncludeId = node.source.includeId;
@@ -11471,7 +11386,7 @@ RefoldEngine::BuildOwnerStateGraph() const {
       case OwnerStateComponent::FileName:
         return facts.MutatesLineFileState();
       case OwnerStateComponent::Counter:
-        return facts.consumesCounter || facts.HasCounterEvents();
+        return facts.HasCounterEvents();
       case OwnerStateComponent::PragmaState:
         return facts.MutatesPragmaState();
       case OwnerStateComponent::IncludeGuardState:
@@ -11479,7 +11394,7 @@ RefoldEngine::BuildOwnerStateGraph() const {
       case OwnerStateComponent::IncludeState:
         return facts.MutatesIncludeState();
       case OwnerStateComponent::UnmodeledState:
-        return facts.HasMissingStateFacts() || facts.hasUnmodeledState;
+        return facts.HasMissingFactKind(MissingStateFactKind::MissingOwnerOrderingFacts);
       case OwnerStateComponent::Unknown:
         return false;
       }
@@ -11524,8 +11439,8 @@ RefoldEngine::BuildOwnerStateGraph() const {
         ++graph.audit.observedStateComponents;
       }
 
-      if (closure.stateIn.HasTheoremUnmodeledState() ||
-          closure.stateOut.HasTheoremUnmodeledState()) {
+      if (OwnerStateDeltaHasUnmodeledState(closure.stateIn) ||
+          OwnerStateDeltaHasUnmodeledState(closure.stateOut)) {
         SuffixStateObserverSite site;
         site.nodeId = node.id;
         site.nodeKind = node.kind;
@@ -11554,10 +11469,10 @@ RefoldEngine::BuildOwnerStateGraph() const {
     const OwnerStateGraphNode &node = graph.nodes[nodeIndex];
     const OwnerClosure &closure = node.closure;
     // Phase 4A requires __COUNTER__ to be represented as a semantic state event
-    // in its own right.  BuildOwnerStateSummary() already attaches precise
+    // in its own right.  BuildOwnerStateDelta() already attaches precise
     // CounterEventIdentity values to the macro owner; this loop splits them into
     // explicit graph nodes without inventing new counter facts.
-    const OwnerStateDelta delta = closure.stateOut.AsTheoremStateDelta();
+    const OwnerStateDelta delta = closure.stateOut;
     for (const CounterEventIdentity &counter : delta.Mutates.counterEvents) {
       OwnerSourceRange source = node.source;
       if (!counter.expansionSiteFile.empty() && counter.expansionSiteBegin &&
@@ -11613,17 +11528,6 @@ RefoldEngine::GetOwnerStateGraph() const {
           audit.incomparableNodes, audit.missingProducerFacts);
   }
   return *ownerStateGraphCache_;
-}
-
-RefoldEngine::SuffixObserverGraph
-RefoldEngine::BuildSuffixObserverGraph() const {
-  const OwnerStateGraph &stateGraph = GetOwnerStateGraph();
-  SuffixObserverGraph graph;
-  graph.observerSites = stateGraph.observerSites;
-  graph.orderedOwners.reserve(stateGraph.nodes.size());
-  for (const OwnerStateGraphNode &node : stateGraph.nodes)
-    graph.orderedOwners.push_back(node.closure);
-  return graph;
 }
 
 RefoldEngine::SuffixObserverQueryResult
@@ -11778,9 +11682,9 @@ RefoldEngine::MissingStateFactTerminalFailure(MissingStateFactKind kind,
 }
 
 std::vector<RefoldEngine::OwnerStateComponent>
-RefoldEngine::StateComponentsMutatedBySummary(
-    const OwnerStateSummary &summary) {
-  const OwnerStateDelta theoremDelta = summary.AsTheoremStateDelta();
+RefoldEngine::StateComponentsMutatedByDelta(
+    const OwnerStateDelta &summary) {
+  const OwnerStateDelta theoremDelta = summary;
   const StateMutations &mutations = theoremDelta.Mutates;
   std::vector<OwnerStateComponent> components;
   auto appendUnique = [&](OwnerStateComponent component) {
@@ -11792,22 +11696,22 @@ RefoldEngine::StateComponentsMutatedBySummary(
       components.push_back(component);
   };
 
-  if (mutations.definesMacros || mutations.undefinesMacros)
+  if (mutations.MutatesMacroState())
     appendUnique(OwnerStateComponent::MacroState);
-  if (mutations.mutatesConditionalState)
+  if (mutations.MutatesConditionalState())
     appendUnique(OwnerStateComponent::ConditionalState);
-  if (mutations.setsLineFile || mutations.HasLineControlEvents()) {
+  if (mutations.MutatesLineFileState()) {
     appendUnique(OwnerStateComponent::LineNumber);
     appendUnique(OwnerStateComponent::FileState);
     appendUnique(OwnerStateComponent::FileName);
   }
-  if (mutations.consumesCounter)
+  if (mutations.HasCounterEvents())
     appendUnique(OwnerStateComponent::Counter);
   if (mutations.MutatesPragmaState())
     appendUnique(OwnerStateComponent::PragmaState);
-  if (mutations.mutatesIncludeGuardState)
+  if (mutations.MutatesIncludeGuardState())
     appendUnique(OwnerStateComponent::IncludeGuardState);
-  if (mutations.mutatesIncludeState)
+  if (mutations.MutatesIncludeState())
     appendUnique(OwnerStateComponent::IncludeState);
 
   // Phase 3L/3N: component-specific missing facts are state obligations, not
@@ -11824,7 +11728,8 @@ RefoldEngine::StateComponentsMutatedBySummary(
     appendUnique(StateComponentForMissingStateFact(fact.kind));
   }
 
-  if (mutations.hasUnmodeledState)
+  if (mutations.HasMissingFactKind(
+          MissingStateFactKind::MissingOwnerOrderingFacts))
     appendUnique(OwnerStateComponent::UnmodeledState);
   return components;
 }
@@ -11923,68 +11828,6 @@ RefoldEngine::BuildReverseSolvedDirectiveTerminalWitness(
   return SuffixStabilityWitness::From(std::move(witness));
 }
 
-RefoldEngine::SuffixStabilityWitness
-RefoldEngine::BuildSuffixStabilityWitnessFromDischarge(
-    const OwnerStateBoundary &boundary, OwnerStateComponent component,
-    SuffixStabilityDischargeKind discharge, StringRef detail) {
-  switch (discharge) {
-  case SuffixStabilityDischargeKind::None:
-    return SuffixStabilityWitness::None();
-  case SuffixStabilityDischargeKind::NoSuffixObserver: {
-    SuffixUnobservedWitness witness;
-    witness.component = component;
-    witness.boundary = boundary;
-    witness.detail = detail.str();
-    return SuffixStabilityWitness::From(std::move(witness));
-  }
-  case SuffixStabilityDischargeKind::StateRepaired:
-  case SuffixStabilityDischargeKind::StateEquivalent: {
-    StateRepairWitness witness;
-    witness.component = component;
-    witness.boundary = boundary;
-    witness.detail = detail.str();
-    return SuffixStabilityWitness::From(std::move(witness));
-  }
-  case SuffixStabilityDischargeKind::ObserverMaterialized: {
-    OwnerMaterializationWitness witness;
-    witness.component = component;
-    witness.boundary = boundary;
-    witness.detail = detail.str();
-    return SuffixStabilityWitness::From(std::move(witness));
-  }
-  case SuffixStabilityDischargeKind::ClosureWidened: {
-    ClosureWideningWitness witness;
-    witness.component = component;
-    witness.boundary = boundary;
-    witness.detail = detail.str();
-    return SuffixStabilityWitness::From(std::move(witness));
-  }
-  }
-  llvm_unreachable("Invalid suffix-stability discharge kind");
-}
-
-RefoldEngine::SuffixStabilityDischargeKind
-RefoldEngine::DischargeKindForSuffixStabilityWitness(
-    const SuffixStabilityWitness &witness) {
-  switch (witness.kind) {
-  case SuffixStabilityWitnessKind::None:
-    return SuffixStabilityDischargeKind::None;
-  case SuffixStabilityWitnessKind::SuffixUnobserved:
-    return SuffixStabilityDischargeKind::NoSuffixObserver;
-  case SuffixStabilityWitnessKind::StateRepair:
-    return SuffixStabilityDischargeKind::StateRepaired;
-  case SuffixStabilityWitnessKind::OwnerMaterialization:
-    return SuffixStabilityDischargeKind::ObserverMaterialized;
-  case SuffixStabilityWitnessKind::ClosureWidening:
-    return SuffixStabilityDischargeKind::ClosureWidened;
-  case SuffixStabilityWitnessKind::Literalization:
-    return SuffixStabilityDischargeKind::ObserverMaterialized;
-  case SuffixStabilityWitnessKind::TerminalStateFailure:
-    return SuffixStabilityDischargeKind::None;
-  }
-  llvm_unreachable("Invalid suffix-stability witness kind");
-}
-
 RefoldEngine::OwnerStateComponent
 RefoldEngine::ComponentNamedBySuffixStabilityWitness(
     const SuffixStabilityWitness &witness) {
@@ -12030,8 +11873,6 @@ RefoldEngine::CheckStateTransitionAcrossEditBoundary(
   check.component = request.component;
   check.mutation = request.mutation;
   check.witness = request.witness;
-  check.discharge = DischargeKindForSuffixStabilityWitness(request.witness);
-
   auto noteGatewayViolation = [&](StringRef detail) {
     ++lastTheoremAudit_.stateTransitionAuditViolations;
     NoteTheoremAuditViolation(
@@ -12051,8 +11892,7 @@ RefoldEngine::CheckStateTransitionAcrossEditBoundary(
     if (!AuditTerminalFallbackProofFailure(failure, request.phase))
       noteGatewayViolation("terminal state failure lacked a classified "
                            "component-specific obligation");
-    RequestTerminalFallback(TerminalFallbackKind::UndischargedEmissionArtifact,
-                            std::move(failure), request.phase, message);
+    RequestTerminalFallback(std::move(failure), request.phase, message);
     return check;
   };
 
@@ -12124,8 +11964,6 @@ RefoldEngine::CheckStateTransitionAcrossEditBoundary(
     if (!request.requireKnownObserver) {
       check.stable = true;
       ++lastTheoremAudit_.stateTransitionGatewayStable;
-      ++lastTheoremAudit_.stateTransitionGatewayNoSuffixObserverWitnesses;
-      check.discharge = SuffixStabilityDischargeKind::NoSuffixObserver;
       SuffixUnobservedWitness witness;
       witness.component = request.component;
       witness.boundary = request.boundary;
@@ -12218,9 +12056,7 @@ RefoldEngine::CheckStateTransitionAcrossEditBoundary(
     attachFirstObserverToWitness();
     check.stable = true;
     ++lastTheoremAudit_.stateTransitionGatewayStable;
-    ++lastTheoremAudit_.stateTransitionGatewayTypedWitnesses;
     check.witness = std::move(normalizedWitness);
-    check.discharge = DischargeKindForSuffixStabilityWitness(check.witness);
     trace("state/gateway",
           "state-transition gateway discharged: component={0} mutation={1} "
           "witness={2} orderedObservers={3} incomparable={4} phase={5} "
@@ -12758,22 +12594,6 @@ RefoldEngine::CheckConditionalStateTransitionAcrossEditBoundary(
   return CheckStateTransitionAcrossEditBoundary(request);
 }
 
-RefoldEngine::SuffixStabilityCheckResult
-RefoldEngine::CheckSuffixStabilityForStateMutation(
-    const OwnerStateBoundary &boundary, OwnerStateComponent component,
-    SuffixStabilityDischargeKind discharge, StringRef phase, StringRef detail,
-    bool requireKnownObserver) const {
-  StateTransitionGatewayRequest request;
-  request.boundary = boundary;
-  request.component = component;
-  request.mutation = StateMutationKind::Consumed;
-  request.witness = BuildSuffixStabilityWitnessFromDischarge(
-      boundary, component, discharge, detail);
-  request.phase = phase.str();
-  request.detail = detail.str();
-  request.requireKnownObserver = requireKnownObserver;
-  return CheckStateTransitionAcrossEditBoundary(request);
-}
 
 
 RefoldEngine::Owner
@@ -13627,10 +13447,6 @@ RefoldEngine::FindProvableTUInsertionAnchor(uint64_t pp, StringRef tuPath,
     const AcceptedResultCandidate slotCandidate =
         BuildAcceptedTUAnchorCandidate(AcceptedPathKind::TUExactSlotBoundary,
                                        slotWitness);
-    trace("hunk",
-          "    insertion gap PP={0} mapsToTU via slot boundary TU byte {1} "
-          "candidate={2}",
-          pp, slotAnchor, FormatAcceptedResultCandidate(slotCandidate));
     return slotAnchor;
   }
 
@@ -13696,11 +13512,6 @@ RefoldEngine::FindProvableTUInsertionAnchor(uint64_t pp, StringRef tuPath,
         BuildAcceptedTUAnchorCandidate(
             AcceptedPathKind::TUProvableInsertionAnchor,
             includeBoundaryWitness);
-    trace("tu/anchor",
-          "provable TU insertion anchor: ppGap={0} -> include boundary byte={1}"
-          " leftInclude={2} rightInclude={3} candidate={4}",
-          pp, leftInc->siteE, leftInc->id, rightInc->id,
-          FormatAcceptedResultCandidate(includeBoundaryCandidate));
     return leftInc->siteE;
   };
 
@@ -13815,12 +13626,6 @@ RefoldEngine::FindProvableTUInsertionAnchor(uint64_t pp, StringRef tuPath,
     const AcceptedResultCandidate zeroTokenCandidate =
         BuildAcceptedTUAnchorCandidate(
             AcceptedPathKind::TUProvableInsertionAnchor, zeroTokenWitness);
-    trace("tu/anchor",
-          "provable TU insertion anchor: ppGap={0} -> zero-token include "
-          "boundary byte={1} include={2} beforeSlot={3} afterSlot={4} "
-          "candidate={5}",
-          pp, best.beforeSlot->b, best.include->id, best.beforeSlot->id,
-          best.afterSlot->id, FormatAcceptedResultCandidate(zeroTokenCandidate));
     return best.beforeSlot->b;
   };
 
@@ -13943,11 +13748,6 @@ RefoldEngine::FindProvableTUInsertionAnchor(uint64_t pp, StringRef tuPath,
     const AcceptedResultCandidate argLikeCandidate =
         BuildAcceptedTUAnchorCandidate(
             AcceptedPathKind::TUProvableInsertionAnchor, argLikeWitness);
-    trace("tu/anchor",
-          "pure insertion arg-like begin anchor: ppGap={0} -> macro id={1} "
-          "name='{2}' invB={3} candidate={4}",
-          pp, best->id, best->name, *best->invB,
-          FormatAcceptedResultCandidate(argLikeCandidate));
     return *best->invB;
   };
 
@@ -13982,10 +13782,6 @@ RefoldEngine::FindProvableTUInsertionAnchor(uint64_t pp, StringRef tuPath,
         const AcceptedResultCandidate rightCandidate =
             BuildAcceptedTUAnchorCandidate(
                 AcceptedPathKind::TUProvableInsertionAnchor, rightWitness);
-        trace("tu/anchor",
-              "provable TU insertion anchor: ppGap={0} -> right neighbor "
-              "byte={1} candidate={2}",
-              pp, right.b, FormatAcceptedResultCandidate(rightCandidate));
         return right.b;
       }
       return std::nullopt;
@@ -14014,10 +13810,6 @@ RefoldEngine::FindProvableTUInsertionAnchor(uint64_t pp, StringRef tuPath,
         const AcceptedResultCandidate leftCandidate =
             BuildAcceptedTUAnchorCandidate(
                 AcceptedPathKind::TUProvableInsertionAnchor, leftWitness);
-        trace("tu/anchor",
-              "provable TU insertion anchor: ppGap={0} -> left neighbor "
-              "byte={1} candidate={2}",
-              pp, left.e, FormatAcceptedResultCandidate(leftCandidate));
         return left.e;
       }
       return std::nullopt;
@@ -14108,11 +13900,6 @@ RefoldEngine::FindProvableTUInsertionAnchor(uint64_t pp, StringRef tuPath,
         BuildAcceptedTUAnchorCandidate(
             AcceptedPathKind::TUProvableInsertionAnchor,
             corroboratedRightWitness);
-    trace("tu/anchor",
-          "provable TU insertion anchor: ppGap={0} -> corroborated right "
-          "byte={1} candidate={2}",
-          pp, right->b,
-          FormatAcceptedResultCandidate(corroboratedRightCandidate));
     return right->b;
   }
 
@@ -14136,10 +13923,6 @@ RefoldEngine::FindProvableTUInsertionAnchor(uint64_t pp, StringRef tuPath,
   const AcceptedResultCandidate corroboratedLeftCandidate =
       BuildAcceptedTUAnchorCandidate(
           AcceptedPathKind::TUProvableInsertionAnchor, corroboratedLeftWitness);
-  trace("tu/anchor",
-        "provable TU insertion anchor: ppGap={0} -> corroborated left byte={1} "
-        "candidate={2}",
-        pp, left->e, FormatAcceptedResultCandidate(corroboratedLeftCandidate));
   return left->e;
 }
 
@@ -14423,11 +14206,6 @@ std::optional<uint64_t> RefoldEngine::AnchorToExactSlotBoundaryFromPPGap(
     const AcceptedResultCandidate exactSlotCandidate =
         BuildAcceptedTUAnchorCandidate(AcceptedPathKind::TUExactSlotBoundary,
                                        exactSlotWitness);
-    trace("slots/anchor",
-          "AnchorToExactSlotBoundaryFromPPGap: ppGap={0} -> slotId={1} "
-          "kind={2} tuByte={3} candidate={4}",
-          ppGap, best->slot->id, best->slot->kind, best->b,
-          FormatAcceptedResultCandidate(exactSlotCandidate));
   } else {
     trace("slots/anchor",
           "AnchorToExactSlotBoundaryFromPPGap: ppGap={0} -> <none>", ppGap);
@@ -16603,10 +16381,6 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     return hasTopLevelCommaWithLexer(s, lexLang_);
   };
 
-  trace("macro/args", "  invArgRanges({0})={1}", invArgRanges.size(),
-        stringutils::rangesToStringWithSlices(baseInvText, invArgRanges));
-
-
   // Look up the exact defining directive recorded by the producer.  The replay
   // proof below depends on the directive's replacement-token tape, so guessing
   // by macro name would be unsound when definitions are shadowed or stale.
@@ -17198,7 +16972,6 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         patch, static_cast<uint64_t>(bEnv->first),
         static_cast<uint64_t>(bEnv->second));
     StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyStandard,
-                         /*validated=*/true,
                          /*structurePreserving=*/true, m.id);
     return patch;
   };
@@ -17784,8 +17557,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         patch.hasMaterializedOutputByteRange = true;
         stampMacroPatchWholeExpansionBRange(patch);
         StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyStandard,
-                             /*validated=*/true,
-                             /*structurePreserving=*/true, m.id);
+                         /*structurePreserving=*/true, m.id);
         return patch;
       }
     }
@@ -18238,7 +18010,6 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         patch, static_cast<uint64_t>(bEnv->first),
         static_cast<uint64_t>(bEnv->second));
     StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyStandard,
-                         /*validated=*/true,
                          /*structurePreserving=*/true, m.id);
     return patch;
   };
@@ -18344,8 +18115,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
           // pasted-token hunk.
           stampMacroPatchWholeExpansionBRange(patch);
           StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyPasteMulti,
-                               /*validated=*/true,
-                               /*structurePreserving=*/true, m.id);
+                         /*structurePreserving=*/true, m.id);
           // The builder already proved this rewrite by replaying the rewritten
           // invocation arguments against every pasted token occurrence in B.
           // Carry that proof source onto the accepted patch for Patch C.
@@ -18415,8 +18185,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         // Keep the B-side map anchored to that whole expansion envelope.
         stampMacroPatchWholeExpansionBRange(patch);
         StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyPasteSingle,
-                             /*validated=*/true,
-                             /*structurePreserving=*/true, m.id);
+                         /*structurePreserving=*/true, m.id);
         // Single-segment paste rewrites are admitted only after direct replay
         // validation against all touched occurrences in B. Record that proof
         // source explicitly for the Patch C discharge gate.
@@ -18691,8 +18460,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       // cover reconstructed from the rewritten invocation arguments.
       stampMacroPatchWholeExpansionBRange(patch);
       StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyPurePasteOnly,
-                           /*validated=*/true,
-                           /*structurePreserving=*/true, m.id);
+                         /*structurePreserving=*/true, m.id);
       // Pure-paste-only rewrites have no standard or stringify occurrences to
       // lean on, so successful all-paste replay is the decisive proof source.
       patch.pasteReplayValidated = true;
@@ -19783,7 +19551,6 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         patch, static_cast<uint64_t>(bEnv->first),
         static_cast<uint64_t>(bEnv->second));
     StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyStandard,
-                         /*validated=*/true,
                          /*structurePreserving=*/true, m.id);
     return patch;
   };
@@ -20298,8 +20065,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
           patch, static_cast<uint64_t>(bEnv->first),
           static_cast<uint64_t>(bEnv->second));
       StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyStandard,
-                           /*validated=*/true,
-                           /*structurePreserving=*/true, m.id);
+                         /*structurePreserving=*/true, m.id);
       return patch;
     };
 
@@ -20415,8 +20181,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
               patch, static_cast<uint64_t>(bEnv->first),
               static_cast<uint64_t>(bEnv->second));
           StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyStandard,
-                               /*validated=*/true,
-                               /*structurePreserving=*/true, m.id);
+                         /*structurePreserving=*/true, m.id);
           return patch;
         }
       }
@@ -20447,8 +20212,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
           patch, static_cast<uint64_t>(bEnv->first),
           static_cast<uint64_t>(bEnv->second));
       StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyStandard,
-                           /*validated=*/true,
-                           /*structurePreserving=*/true, m.id);
+                         /*structurePreserving=*/true, m.id);
       return patch;
     };
 
@@ -20633,8 +20397,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
           patch, static_cast<uint64_t>(bEnv->first),
           static_cast<uint64_t>(bEnv->second));
       StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyStandard,
-                           /*validated=*/true,
-                           /*structurePreserving=*/true, m.id);
+                         /*structurePreserving=*/true, m.id);
       return patch;
     };
 
@@ -20740,7 +20503,6 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         patch, static_cast<uint64_t>(bEnv->first),
         static_cast<uint64_t>(bEnv->second));
     StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyStandard,
-                         /*validated=*/true,
                          /*structurePreserving=*/true, m.id);
     return patch;
   };
@@ -21604,7 +21366,6 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         patch, static_cast<uint64_t>(bEnv->first),
         static_cast<uint64_t>(bEnv->second));
     StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyStandard,
-                         /*validated=*/true,
                          /*structurePreserving=*/true, m.id);
     return patch;
   };
@@ -21684,10 +21445,6 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       }
     }
   }
-
-  trace("macro/args", "  touchedOcc={0}",
-        stringutils::boolArrayToString(touchedOcc));
-  trace("macro/args", "  touched={0}", stringutils::boolArrayToString(touched));
 
   auto hunkTouchesTouchedFormal = [&](const diffutils::Hunk &cand) -> bool {
     // Keep only hunks that intersect an occurrence of a formal already touched
@@ -24218,7 +23975,6 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     if (materializedRangeByArgIdx.empty())
       stampMacroPatchWholeExpansionBRange(patch);
     StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyStandard,
-                         /*validated=*/true,
                          /*structurePreserving=*/true, m.id);
     return patch;
   }
@@ -24791,7 +24547,7 @@ void RefoldEngine::ConfigureProofSummary(
   // A configured theorem-facing summary must name its primary proof class
   // directly.  The enum itself gives the "exactly one primary class" property;
   // this flag distinguishes that explicit classification from legacy implicit
-  // classification based on side bits such as `proofValidated`.
+  // classification based on legacy side-bit inference.
   summary.primaryProofClassExplicit = acceptedClass != AcceptedProofClass::Unknown;
 }
 
@@ -24915,7 +24671,6 @@ bool RefoldEngine::TUAnchorWitnessHasProvableEvidence(
 RefoldEngine::ProofSummary
 RefoldEngine::ClassifyMacroPatchProof(const MacroPatch &patch) const {
   ProofSummary summary;
-  summary.validated = patch.proofValidated;
   summary.structurePreserving = patch.structurePreserving;
   summary.proofRootMacroId = patch.proofRootMacroId;
   if (patch.hasOwnerRealizationWitness) {
@@ -24948,7 +24703,7 @@ RefoldEngine::ClassifyMacroPatchProof(const MacroPatch &patch) const {
         summary, AcceptedProofClass::InvocationPreserving,
         RealizationMode::PreserveOriginalStructure,
         SelectionPreference::PreferStructurePreservation, SurfaceDisposition::None,
-        /*structurePreserving=*/true);
+                         /*structurePreserving=*/true);
     break;
 
   case MacroPatchProofKind::CounterLiteral:
@@ -24956,7 +24711,7 @@ RefoldEngine::ClassifyMacroPatchProof(const MacroPatch &patch) const {
         summary, AcceptedProofClass::InvocationRealization,
         RealizationMode::RealizeEditedSurface,
         SelectionPreference::PreferSurfaceRealization, SurfaceDisposition::None,
-        /*structurePreserving=*/false);
+                         /*structurePreserving=*/false);
     break;
 
   case MacroPatchProofKind::WholeCoverRealization:
@@ -24965,7 +24720,7 @@ RefoldEngine::ClassifyMacroPatchProof(const MacroPatch &patch) const {
         RealizationMode::RealizeEditedSurface,
         SelectionPreference::PreferSurfaceRealization,
         SurfaceDisposition::RealizeWholeCoverMacros,
-        /*structurePreserving=*/false);
+                         /*structurePreserving=*/false);
     break;
 
   case MacroPatchProofKind::Unknown:
@@ -25003,68 +24758,14 @@ void RefoldEngine::SyncMacroPatchProofSummary(MacroPatch &patch) const {
 
 void RefoldEngine::StampMacroPatchProof(MacroPatch &patch,
                                         MacroPatchProofKind kind,
-                                        bool validated,
                                         bool structurePreserving,
                                         uint64_t proofRootMacroId) const {
   patch.proofKind = kind;
-  patch.proofValidated = validated;
   patch.structurePreserving = structurePreserving;
   patch.proofRootMacroId = proofRootMacroId;
   SyncMacroPatchProofSummary(patch);
 }
 
-
-std::string RefoldEngine::FormatOwnerRealizationWitness(
-    const OwnerRealizationWitness &witness) const {
-  std::string failureText;
-  if (witness.hasFailedObligation)
-    failureText = formatv(" failure={0}", toString(witness.failedObligation)).str();
-
-  return formatv("kind={0} owner={1} source='{2}'[{3},{4}){5} "
-                 "aTok=[{6},{7}){8} bTok=[{9},{10}){11} state={12} "
-                 "stateDischarge={13}{14} detail='{15}'",
-                 toString(witness.evidence),
-                 toString(witness.closure.owner.kind),
-                 witness.closure.source.path, witness.closure.source.begin,
-                 witness.closure.source.end,
-                 witness.hasSourceInterval ? "" : "(missing)",
-                 witness.closure.aTokens.begin, witness.closure.aTokens.end,
-                 witness.hasATokenCover ? "" : "(missing)",
-                 witness.closure.bTokens.begin, witness.closure.bTokens.end,
-                 witness.hasBTokenEnvelope ? "" : "(missing)",
-                 witness.hasStateSummary ? "tracked" : "missing",
-                 witness.hasStateDischarge
-                     ? toString(witness.stateDischarge)
-                     : StringRef("missing"),
-                 failureText, witness.detail)
-      .str();
-}
-
-
-std::string RefoldEngine::FormatMixedOwnerTilingWitness(
-    const MixedOwnerTilingWitness &witness) const {
-  SmallVector<std::string, 8> edgeTexts;
-  edgeTexts.reserve(witness.edges.size());
-  for (const MixedOwnerTilingEdgeWitness &edge : witness.edges) {
-    const OwnerClosure &closure = edge.closure;
-    edgeTexts.push_back(
-        formatv("{0}:owner={1} source='{2}'[{3},{4}) A=[{5},{6}) B=[{7},{8})",
-                toString(edge.kind), toString(closure.owner.kind),
-                closure.source.path, closure.source.begin, closure.source.end,
-                closure.aTokens.begin, closure.aTokens.end,
-                closure.bTokens.begin, closure.bTokens.end)
-            .str());
-  }
-
-  return formatv("originalA=[{0},{1}) originalB=[{2},{3}) tokenSegments={4} "
-                 "stateGaps={5} stateComposed={6} edges=[{7}]",
-                 witness.originalAStart, witness.originalAEnd,
-                 witness.originalBStart, witness.originalBEnd,
-                 witness.tokenSegmentCount, witness.stateGapCount,
-                 witness.stateSummariesComposed ? 1 : 0,
-                 llvm::join(edgeTexts, "; "))
-      .str();
-}
 
 void RefoldEngine::AttachMixedOwnerTilingWitnessForTokenEnvelope(
     ProofSummary &summary, uint64_t aStart, uint64_t aEnd, uint64_t bStart,
@@ -25089,7 +24790,7 @@ void RefoldEngine::AttachMixedOwnerTilingWitnessForTokenEnvelope(
 
 RefoldEngine::OwnerRealizationResult RefoldEngine::TryBuildOwnerRealization(
     OwnerRealizationEvidenceKind evidence, OwnerClosure closure,
-    SuffixStabilityDischargeKind stateDischarge, StringRef detail) const {
+    StringRef detail) const {
   OwnerRealizationResult result;
   result.witness.evidence = evidence;
   result.witness.closure = AttachCanonicalStateSummary(std::move(closure));
@@ -25105,8 +24806,41 @@ RefoldEngine::OwnerRealizationResult RefoldEngine::TryBuildOwnerRealization(
   result.witness.hasATokenCover = result.witness.closure.aTokens.IsValid();
   result.witness.hasBTokenEnvelope = result.witness.closure.bTokens.IsValid();
   result.witness.hasStateSummary = true;
-  result.witness.hasStateDischarge = stateDischarge != SuffixStabilityDischargeKind::None;
-  result.witness.stateDischarge = stateDischarge;
+
+  auto addUniqueComponent = [](std::vector<OwnerStateComponent> &components,
+                              OwnerStateComponent component) {
+    if (component == OwnerStateComponent::Unknown)
+      return;
+    if (llvm::none_of(components, [&](OwnerStateComponent existing) {
+          return existing == component;
+        }))
+      components.push_back(component);
+  };
+
+  std::vector<OwnerStateComponent> mutatedComponents;
+  for (OwnerStateComponent component :
+       StateComponentsMutatedByDelta(result.witness.closure.stateIn))
+    addUniqueComponent(mutatedComponents, component);
+  for (OwnerStateComponent component :
+       StateComponentsMutatedByDelta(result.witness.closure.stateOut))
+    addUniqueComponent(mutatedComponents, component);
+
+  // Owner realization proves stateful closures by widening the realized owner
+  // through each component it mutates.  Keep those proofs as typed witnesses
+  // instead of projecting the result through the old coarse discharge enum.
+  const OwnerStateBoundary stateBoundary =
+      OwnerStateBoundary::FromSourceAndATokens(result.witness.closure.source,
+                                              result.witness.closure.aTokens);
+  for (OwnerStateComponent component : mutatedComponents) {
+    ClosureWideningWitness stateWitness;
+    stateWitness.component = component;
+    stateWitness.boundary = stateBoundary;
+    stateWitness.detail = detail.str();
+    result.witness.stateWitnesses.push_back(
+        SuffixStabilityWitness::From(std::move(stateWitness)));
+  }
+  result.witness.hasStateWitnesses =
+      !result.witness.stateWitnesses.empty();
 
   auto reject = [&](TerminalFallbackObligationKind obligation,
                     TerminalFallbackFailureReason reason) {
@@ -25151,28 +24885,26 @@ RefoldEngine::OwnerRealizationResult RefoldEngine::TryBuildOwnerRealization(
     return reject(TerminalFallbackObligationKind::ProducerFactsAvailable,
                   TerminalFallbackFailureReason::MissingProducerFacts);
 
-  // A state-neutral owner needs no suffix discharge.  Otherwise the caller must
-  // name the Phase-5 discharge mode it already proved while building the
-  // owner-specific realization.  This keeps Phase 6b from silently accepting a
-  // realized source interval that consumed or replayed sideband state.
+  // A state-neutral owner needs no suffix-stability witness.  Otherwise the
+  // realization gate must have produced at least one typed state witness for
+  // the component-specific mutations carried by the owner closure.
   const bool mutatesOrCarriesUnmodeledState =
-      result.witness.closure.stateIn.MutatesAnyState() ||
-      result.witness.closure.stateOut.MutatesAnyState();
-  if (mutatesOrCarriesUnmodeledState && !result.witness.hasStateDischarge)
+      OwnerStateDeltaMutatesAnyState(result.witness.closure.stateIn) ||
+      OwnerStateDeltaMutatesAnyState(result.witness.closure.stateOut);
+  if (mutatesOrCarriesUnmodeledState && !result.witness.hasStateWitnesses)
     return reject(TerminalFallbackObligationKind::StateTransitionClosure,
                   TerminalFallbackFailureReason::StateTransitionConsumedAndObserved);
 
   result.accepted = true;
   trace("proof/owner-realization",
         "accept owner realization evidence={0} owner={1} source='{2}'[{3},{4}) "
-        "A=[{5},{6}) B=[{7},{8}) stateDischarge={9} detail='{10}'",
+        "A=[{5},{6}) B=[{7},{8}) stateWitnesses={9} detail='{10}'",
         toString(evidence), toString(result.witness.closure.owner.kind),
         result.witness.closure.source.path, result.witness.closure.source.begin,
         result.witness.closure.source.end, result.witness.closure.aTokens.begin,
         result.witness.closure.aTokens.end, result.witness.closure.bTokens.begin,
         result.witness.closure.bTokens.end,
-        result.witness.hasStateDischarge ? toString(result.witness.stateDischarge)
-                                         : StringRef("not-needed"),
+        static_cast<uint64_t>(result.witness.stateWitnesses.size()),
         result.detail);
   return result;
 }
@@ -25232,7 +24964,6 @@ RefoldEngine::BuildMacroWholeCoverOwnerRealization(
   // reached this shared proof gate.
   return TryBuildOwnerRealization(
       OwnerRealizationEvidenceKind::MacroWholeCover, std::move(closure),
-      SuffixStabilityDischargeKind::ClosureWidened,
       formatv("macroId={0} whole-cover", macro.id).str());
 }
 
@@ -25333,9 +25064,7 @@ RefoldEngine::BuildIncludeOwnerRealization(
           includeBoundary, OwnerStateComponent::IncludeGuardState, detail),
       "include-owner-realization", detail, /*requireKnownObserver=*/false);
 
-  return TryBuildOwnerRealization(
-      evidence, std::move(closure), SuffixStabilityDischargeKind::ClosureWidened,
-      detail);
+  return TryBuildOwnerRealization(evidence, std::move(closure), detail);
 }
 
 RefoldEngine::OwnerRealizationResult
@@ -25350,7 +25079,6 @@ RefoldEngine::BuildTUOwnerRealization(AcceptedPathKind currentPath,
   // that the TU owner and byte interval have a closed realization carrier.
   return TryBuildOwnerRealization(
       OwnerRealizationEvidenceKind::TUByteSpan, std::move(closure),
-      SuffixStabilityDischargeKind::ClosureWidened,
       formatv("tu-byte-edit path={0}", currentPath).str());
 }
 
@@ -25362,8 +25090,7 @@ void RefoldEngine::StampMacroWholeCoverRealizationPatch(
   // and containment facts, so stamping it here keeps the accepted patch
   // deterministic and fully described without changing selection behavior.
   StampMacroPatchProof(patch, MacroPatchProofKind::WholeCoverRealization,
-                       /*validated=*/true,
-                       /*structurePreserving=*/false, macro.id);
+                         /*structurePreserving=*/false, macro.id);
   patch.wholeCoverUsedBodyRange = plan.usedBodyRange;
   patch.wholeCoverSelfContained = plan.selfContained;
   patch.wholeCoverAdjustedLeft = plan.adjustedLeft;
@@ -25412,7 +25139,7 @@ RefoldEngine::ProofSummary RefoldEngine::BuildAcceptedPathProofSummary(
         summary, AcceptedProofClass::IncludePreserving,
         RealizationMode::PreserveOriginalStructure,
         SelectionPreference::PreferStructurePreservation, SurfaceDisposition::None,
-        /*structurePreserving=*/true);
+                         /*structurePreserving=*/true);
     if (includeAnchorWitness) {
       summary.hasIncludeAnchorWitness = true;
       summary.includeAnchorWitness = *includeAnchorWitness;
@@ -25427,7 +25154,7 @@ RefoldEngine::ProofSummary RefoldEngine::BuildAcceptedPathProofSummary(
         RealizationMode::RealizeEditedSurface,
         SelectionPreference::PreferSurfaceRealization,
         SurfaceDisposition::RealizeInlineTouchedIncludesFromB,
-        /*structurePreserving=*/false);
+                         /*structurePreserving=*/false);
     // Phase 6e removes the last include-specific realization validator.  The
     // include path itself only needs the generic accepted-path baseline here;
     // BuildIncludeOwnerRealization() and ApplyOwnerRealizationResultToProofSummary()
@@ -25442,7 +25169,7 @@ RefoldEngine::ProofSummary RefoldEngine::BuildAcceptedPathProofSummary(
         RealizationMode::RealizeEditedSurface,
         SelectionPreference::PreferSurfaceRealization,
         SurfaceDisposition::RealizeMaterializedIncludeExpansion,
-        /*structurePreserving=*/false);
+                         /*structurePreserving=*/false);
     summary.discharge = BuildAcceptedPathBaselineDischarge(summary.inventory);
     break;
   }
@@ -25453,7 +25180,7 @@ RefoldEngine::ProofSummary RefoldEngine::BuildAcceptedPathProofSummary(
         summary, AcceptedProofClass::TUAnchor,
         RealizationMode::PreserveOriginalStructure,
         SelectionPreference::PreferExactAnchoring, SurfaceDisposition::None,
-        /*structurePreserving=*/true);
+                         /*structurePreserving=*/true);
     if (tuAnchorWitness) {
       summary.hasTUAnchorWitness = true;
       summary.tuAnchorWitness = *tuAnchorWitness;
@@ -25469,7 +25196,7 @@ RefoldEngine::ProofSummary RefoldEngine::BuildAcceptedPathProofSummary(
         RealizationMode::RealizeEditedSurface,
         SelectionPreference::PreferSurfaceRealization,
         SurfaceDisposition::RealizeTranslationUnitByteEdit,
-        /*structurePreserving=*/false);
+                         /*structurePreserving=*/false);
     summary.discharge = BuildAcceptedPathBaselineDischarge(summary.inventory);
     break;
   }
@@ -25484,7 +25211,7 @@ RefoldEngine::ProofSummary RefoldEngine::BuildAcceptedPathProofSummary(
         RealizationMode::RealizeEditedSurface,
         SelectionPreference::PreferSurfaceRealization,
         SurfaceDisposition::EmitEditedPreprocessedStream,
-        /*structurePreserving=*/false);
+                         /*structurePreserving=*/false);
     summary.discharge = BuildAcceptedPathBaselineDischarge(
         summary.inventory, /*explicitOutOfDomain=*/true);
     break;
@@ -25524,9 +25251,7 @@ RefoldEngine::BuildIncludePatchProofSummary(
   if (currentPath == AcceptedPathKind::Unknown)
     return ProofSummary{};
 
-  ProofSummary summary = BuildAcceptedPathProofSummary(currentPath, patch);
-  summary.validated = false;
-  return summary;
+  return BuildAcceptedPathProofSummary(currentPath, patch);
 }
 
 std::optional<RefoldEngine::TheoremProofClass>
@@ -25575,10 +25300,6 @@ RefoldEngine::NormalizeAcceptedProof(
          summary.terminalFallbackWitness.proofFailures)
       if (!IsClassifiedTerminalFallbackProofFailure(failure))
         return std::nullopt;
-    if (summary.terminalFallbackWitness.kind ==
-            TerminalFallbackKind::MixedExcludedCases &&
-        summary.terminalFallbackWitness.proofFailures.size() < 2)
-      return std::nullopt;
     if (summary.theoremDomain.kind !=
             TheoremDomainKind::ExplicitOutOfDomainClass ||
         summary.completeness.coverage !=
@@ -25736,7 +25457,8 @@ RefoldEngine::BuildCompletenessContract(const ProofSummary &summary) const {
         CompletenessExpectationKind::ExplicitlyOutsideDeclaredSet;
     if (summary.hasTerminalFallbackWitness) {
       contract.hasExplicitExclusion = true;
-      contract.explicitExclusion = summary.terminalFallbackWitness.kind;
+      contract.explicitExclusion =
+          summary.terminalFallbackWitness.proofFailure.theoremFailure;
     }
     return contract;
   }
@@ -26255,6 +25977,7 @@ void RefoldEngine::AddForcedCounterPatches(
           m.id, m.name, m.ownerIncludeId, *invStart, *invEnd,
           stringutils::showWsWithClip(*replOpt, 64), req.aStart, req.aEnd);
 
+    SuffixStabilityWitness counterWitness = SuffixStabilityWitness::None();
     {
       CounterEventIdentity event = req.event;
       if (event.macroInvocationId == 0)
@@ -26267,9 +25990,10 @@ void RefoldEngine::AddForcedCounterPatches(
                         "#{0} after edited counter occurrence A=[{1},{2})",
                         m.id, req.aStart, req.aEnd)
               .str();
+      counterWitness =
+          BuildCounterStateMaterializationWitness(boundary, event, detail);
       (void)CheckCounterStateTransitionAcrossEditBoundary(
-          boundary, StateMutationKind::Materialized,
-          BuildCounterStateMaterializationWitness(boundary, event, detail),
+          boundary, StateMutationKind::Materialized, counterWitness,
           "counter", detail, /*requireKnownObserver=*/false);
     }
 
@@ -26290,9 +26014,10 @@ void RefoldEngine::AddForcedCounterPatches(
     // __COUNTER__).  In both cases the emitted patch is required solely to keep
     // the counter sequence consistent after an earlier counter occurrence was
     // realized, so stamp every forced counter-stabilization patch with the
-    // explicit counter proof class.
+    // explicit counter proof class and its typed state-stability witness.
+    patch.hasSuffixStabilityWitness = true;
+    patch.suffixStabilityWitness = std::move(counterWitness);
     StampMacroPatchProof(patch, MacroPatchProofKind::CounterLiteral,
-                         /*validated=*/true,
                          /*structurePreserving=*/false, m.id);
 
     // Use the coalesced key as the patch macro ID so later owner/macro maps see
@@ -26358,14 +26083,16 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                         "A=[{1},{2})",
                         m.id, h.aStart, h.aEnd)
               .str();
+      SuffixStabilityWitness counterWitness =
+          BuildCounterStateLiteralizationWitness(boundary, event, detail);
       (void)CheckCounterStateTransitionAcrossEditBoundary(
-          boundary, StateMutationKind::Literalized,
-          BuildCounterStateLiteralizationWitness(boundary, event, detail),
+          boundary, StateMutationKind::Literalized, counterWitness,
           "counter", detail, /*requireKnownObserver=*/false);
 
       MacroPatch patch{*invStart, *invEnd, std::move(*repl), m.id};
+      patch.hasSuffixStabilityWitness = true;
+      patch.suffixStabilityWitness = std::move(counterWitness);
       StampMacroPatchProof(patch, MacroPatchProofKind::CounterLiteral,
-                           /*validated=*/true,
                            /*structurePreserving=*/false, m.id);
       return patch;
     }
@@ -26462,14 +26189,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   }
 
   if (existingPatch) {
-    trace("macro/proof",
-          "existing callsite patch audit: inv id={0} name={1} {2}", m.id,
-          m.name, FormatMacroPatchAudit(*existingPatch));
   }
   if (existingExpandedPatch) {
-    trace("macro/proof",
-          "existing expanded patch audit: inv id={0} name={1} {2}", m.id,
-          m.name, FormatMacroPatchAudit(*existingExpandedPatch));
   }
 
   // Trim equal A/B token edges so args-only can run even if the diff hunk spans
@@ -26661,8 +26382,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
       StampMacroPatchProof(*patch,
                            MacroPatchProofKind::ArgsOnlyPairedPureInsertion,
-                           /*validated=*/true,
-                           /*structurePreserving=*/true, m.id);
+                         /*structurePreserving=*/true, m.id);
       return patch;
     }
 
@@ -34856,10 +34576,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             candPatch.proofRootMacroId = m.id;
             SyncMacroPatchProofSummary(candPatch);
           }
-          trace("macro/proof",
-                "DAG candidate accepted as unique root patch: root id={0} "
-                "name={1} stage={2} {3}",
-                m.id, m.name, traceStage, FormatMacroPatchAudit(candPatch));
           uniquePatch = std::move(candPatch);
           uniquePatchBaseText = baseText.str();
           uniquePatchValidation = std::move(candidateValidation);
@@ -34893,11 +34609,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         // validation metadata and replay-validate the unchanged replacement so
         // equivalent subtrees cannot smuggle incompatible semantic obligations.
         if (uniquePatch->replacement == candPatch.replacement) {
-          trace("macro/proof",
-                "DAG equivalent root patch audit: root id={0} name={1} "
-                "stage={2} existing[{3}] candidate[{4}]",
-                m.id, m.name, traceStage, FormatMacroPatchAudit(*uniquePatch),
-                FormatMacroPatchAudit(candPatch));
           auto mergedValidation = mergeDagCandidateValidationMetadata(
               uniquePatchValidation, candidateValidation);
           if (uniquePatch->subtreeCertBacked || candPatch.subtreeCertBacked) {
@@ -34987,11 +34698,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         int preferredStructured = choosePreferredStructuredDagCandidate(
             uniquePatchValidation, candidateValidation);
         if (preferredStructured < 0) {
-          trace("macro/proof",
-                "DAG structured-choice kept existing patch: root id={0} "
-                "name={1} stage={2} existing[{3}] candidate[{4}]",
-                m.id, m.name, traceStage, FormatMacroPatchAudit(*uniquePatch),
-                FormatMacroPatchAudit(candPatch));
           if (uniquePatch->subtreeCertBacked || candPatch.subtreeCertBacked) {
             trace("macro/proof",
                   "DAG structured subtree-choice kept existing: root id={0} "
@@ -35017,11 +34723,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             candPatch.proofRootMacroId = m.id;
             SyncMacroPatchProofSummary(candPatch);
           }
-          trace("macro/proof",
-                "DAG structured-choice replaced existing patch: root id={0} "
-                "name={1} stage={2} existing[{3}] candidate[{4}]",
-                m.id, m.name, traceStage, FormatMacroPatchAudit(*uniquePatch),
-                FormatMacroPatchAudit(candPatch));
           if (uniquePatch->subtreeCertBacked || candPatch.subtreeCertBacked) {
             trace(
                 "macro/proof",
@@ -35049,11 +34750,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         // replacement merging. The text merge and the proof-metadata merge must
         // both succeed, and the merged replacement must replay through the root
         // proof validator.
-        trace("macro/proof",
-              "DAG merge-candidate patch audit: root id={0} name={1} "
-              "stage={2} existing[{3}] candidate[{4}]",
-              m.id, m.name, traceStage, FormatMacroPatchAudit(*uniquePatch),
-              FormatMacroPatchAudit(candPatch));
         SmallVector<StringRef, 2> repls;
         repls.push_back(StringRef(uniquePatch->replacement));
         repls.push_back(StringRef(candPatch.replacement));
@@ -35179,8 +34875,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         MacroPatch splitRootPatch = candidate.patch;
         StampMacroPatchProof(splitRootPatch,
                              MacroPatchProofKind::ArgsOnlyPairedPureInsertion,
-                             /*validated=*/true,
-                             /*structurePreserving=*/true, m.id);
+                         /*structurePreserving=*/true, m.id);
 
         // Feed the candidate through the shared DAG acceptance/merge logic so
         // it is deduplicated and checked for incompatibility exactly the same
@@ -35841,8 +35536,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                 MacroPatch candPatch{*invStart, chainEnd, replText, m.id};
                 StampMacroPatchProof(candPatch,
                                      MacroPatchProofKind::CallChainSuffix,
-                                     /*validated=*/true,
-                                     /*structurePreserving=*/true, m.id);
+                         /*structurePreserving=*/true, m.id);
 
                 auto acceptCert = acceptOrMergeDAGCandidatePatch(
                     std::move(candPatch),
@@ -35960,8 +35654,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         rootPatchCert.patch->macroId = m.id;
         StampMacroPatchProof(*rootPatchCert.patch,
                              MacroPatchProofKind::DagSubtreeRoot,
-                             /*validated=*/true,
-                             /*structurePreserving=*/true, m.id);
+                         /*structurePreserving=*/true, m.id);
         rootPatchCert.patch->subtreeCertBacked = true;
         rootPatchCert.patch->subtreeLeafMacroId = leaf.id;
         rootPatchCert.patch->subtreeWitnessCount = 1;
@@ -36014,9 +35707,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         rootPatchCert.patch->subtreeBridgeSensitiveFormalSummary =
             formatBridgeSensitiveFormalSignatureMap(
                 subtreeValidation.bridgeSensitiveFormalSignatures);
-        trace("macro/proof",
-              "DAG subtree root patch audit: root id={0} leaf id={1} {2}", m.id,
-              leaf.id, FormatMacroPatchAudit(*rootPatchCert.patch));
 
         // Finally, merge this subtree-backed root patch with any previously
         // accepted DAG candidate for the same root invocation.
@@ -36161,8 +35851,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                     MacroPatch patch{minB, maxE, std::move(out), m.id};
                     StampMacroPatchProof(patch,
                                          MacroPatchProofKind::CallChainSuffix,
-                                         /*validated=*/true,
-                                         /*structurePreserving=*/true, m.id);
+                         /*structurePreserving=*/true, m.id);
                     return patch;
                   }
                 }
@@ -36476,11 +36165,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
       // merging text and losing witness continuity.
       if (conflictingConcreteSubtreeWitnesses(*existingPatch, candidate)) {
         conflictingConcreteSubtreeWitnessForcesWholeCover = true;
-        trace("macro/proof",
-              "subtree continuity probe: concrete same-root witness conflict "
-              "forces whole-cover existing[{0}] candidate[{1}]",
-              FormatMacroPatchAudit(*existingPatch),
-              FormatMacroPatchAudit(candidate));
         return;
       }
 
@@ -36499,11 +36183,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               stringutils::showWsWithClip(candidate.replacement, 160));
         if (existingPatch->subtreeCertBacked ||
             candidate.proofKind == MacroPatchProofKind::DagSubtreeRoot) {
-          trace("macro/proof",
-                "subtree continuity probe: merge-rejected existing[{0}] "
-                "candidate[{1}]",
-                FormatMacroPatchAudit(*existingPatch),
-                FormatMacroPatchAudit(candidate));
         }
         return;
       }
@@ -36517,11 +36196,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             stringutils::showWsWithClip(*merged, 160));
       if (existingPatch->subtreeCertBacked ||
           candidate.proofKind == MacroPatchProofKind::DagSubtreeRoot) {
-        trace("macro/proof",
-              "subtree continuity probe: merge-accepted existing[{0}] "
-              "candidate[{1}]",
-              FormatMacroPatchAudit(*existingPatch),
-              FormatMacroPatchAudit(candidate));
       }
 
       // The merged replacement has passed both text compatibility and root
@@ -37048,8 +36722,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                                         candidates.front().newSelectorSize;
       StampMacroPatchProof(patch,
                            MacroPatchProofKind::PasteDerivedCalleeSelector,
-                           /*validated=*/true,
-                           /*structurePreserving=*/true, m.id);
+                         /*structurePreserving=*/true, m.id);
       trace("macro/dag",
             "paste-derived callee selector substitution accepted: root id={0} "
             "name='{1}' leaf id={2} candidateDirective=#{3} replacement='{4}'",
@@ -37229,13 +36902,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         argsOnlyCandidate->invEnd == existingPatch->invEnd &&
         argsOnlyCandidate->replacement != existingPatch->replacement) {
       if (existingPatch->subtreeCertBacked) {
-        trace("macro/proof",
-              "subtree continuity probe: direct root args-only candidate "
-              "examined "
-              "against existing subtree-backed callsite patch existing[{0}] "
-              "candidate[{1}]",
-              FormatMacroPatchAudit(*existingPatch),
-              FormatMacroPatchAudit(*argsOnlyCandidate));
       }
 
       auto replacementCollapsesParenthesizedTupleFormal =
@@ -37463,24 +37129,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         FinalMacroCandidateOrigin::WholeCoverRealization;
   };
 
-  auto formatFinalMacroCandidateOrigin =
-      [](FinalMacroCandidateOrigin origin) -> StringRef {
-    switch (origin) {
-    case FinalMacroCandidateOrigin::DirectArgsOnly:
-      return "direct-args-only";
-    case FinalMacroCandidateOrigin::DagRootReplay:
-      return "dag-root-replay";
-    case FinalMacroCandidateOrigin::ReuseExistingCallsiteNoOp:
-      return "reuse-existing-callsite-no-op";
-    case FinalMacroCandidateOrigin::ReuseExistingCallsiteSkipWholeCover:
-      return "reuse-existing-callsite-skip-whole-cover";
-    case FinalMacroCandidateOrigin::ReuseExistingExpanded:
-      return "reuse-existing-expanded";
-    case FinalMacroCandidateOrigin::WholeCoverRealization:
-      return "whole-cover-realization";
-    }
-    return "unknown";
-  };
 
   // Reject structure-preserving replay when the callsite's final macro
   // environment is not the macro environment that produced B.
@@ -37719,10 +37367,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     entry.patch = patch;
     entry.acceptedCandidate = BuildAcceptedMacroCandidate(entry.patch);
     entry.origin = origin;
-    trace("macro/proof",
-          "final macro candidate: inv id={0} name={1} origin={2} {3}",
-          m.id, m.name, formatFinalMacroCandidateOrigin(origin),
-          FormatAcceptedResultCandidate(entry.acceptedCandidate));
     finalMacroCandidates.push_back(std::move(entry));
   };
 
@@ -37844,35 +37488,17 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   }
 
   const FinalMacroCandidate &selected = finalMacroCandidates[*selectedIdx];
-  trace("macro/proof",
-        "lattice-selected final macro candidate: inv id={0} name={1} "
-        "origin={2} {3}",
-        m.id, m.name, formatFinalMacroCandidateOrigin(selected.origin),
-        FormatAcceptedResultCandidate(selected.acceptedCandidate));
 
   switch (selected.origin) {
   case FinalMacroCandidateOrigin::DirectArgsOnly:
-    trace("macro/proof",
-          "returning direct args-only candidate: inv id={0} name={1} {2}",
-          m.id, m.name,
-          FormatAcceptedResultCandidate(selected.acceptedCandidate));
     break;
 
   case FinalMacroCandidateOrigin::DagRootReplay:
-    trace("macro/proof",
-          "returning DAG root replay candidate through final selector: inv "
-          "id={0} name={1} {2}",
-          m.id, m.name,
-          FormatAcceptedResultCandidate(selected.acceptedCandidate));
     break;
 
   case FinalMacroCandidateOrigin::ReuseExistingCallsiteNoOp:
     trace("macro", "callsite patch reused (args-only no-op) inv id={0}",
           m.id);
-    trace("macro/proof",
-          "reused existing callsite patch audit: inv id={0} name={1} {2}",
-          m.id, m.name,
-          FormatAcceptedResultCandidate(selected.acceptedCandidate));
     if (selected.patch.subtreeCertBacked)
       trace("macro/proof",
             "subtree continuity probe: reused subtree-backed callsite patch "
@@ -37884,10 +37510,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     trace("macro",
           "callsite patch reused (skip whole-cover expansion) inv id={0}",
           m.id);
-    trace("macro/proof",
-          "reused existing callsite patch audit: inv id={0} name={1} {2}",
-          m.id, m.name,
-          FormatAcceptedResultCandidate(selected.acceptedCandidate));
     if (selected.patch.subtreeCertBacked) {
       trace("macro/proof",
             "subtree continuity probe: reused subtree-backed callsite patch "
@@ -37902,18 +37524,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     trace("macro",
           "expanded patch reused after preservation attempts failed inv id={0}",
           m.id);
-    trace("macro/proof",
-          "reused existing expanded patch audit: inv id={0} name={1} {2}",
-          m.id, m.name,
-          FormatAcceptedResultCandidate(selected.acceptedCandidate));
     break;
 
   case FinalMacroCandidateOrigin::WholeCoverRealization:
-    trace("macro/proof",
-          "constructed whole-cover realization patch audit: inv id={0} "
-          "name={1} {2}",
-          m.id, m.name,
-          FormatAcceptedResultCandidate(selected.acceptedCandidate));
     break;
   }
 

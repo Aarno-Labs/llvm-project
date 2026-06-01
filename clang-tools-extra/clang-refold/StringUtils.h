@@ -644,24 +644,8 @@ inline bool isBOL(StringRef text, size_t offset) {
   return (o == 0) || (text[o - 1] == '\n');
 }
 
-// inline bool outEndsWith(StringRef out, StringRef suffix) {
-//   return out.endswith(suffix);
-// }
-
 /// True iff appending at the end of \p s would occur at beginning-of-line.
 inline bool outAtBOL(StringRef s) { return s.empty() || s.back() == '\n'; }
-
-/// True iff \p s has a final LF byte.
-inline bool endsWithLf(StringRef s) { return !s.empty() && s.back() == '\n'; }
-
-/// True iff \p lit appears at byte offset \p offset in \p s.
-inline bool startsWith(StringRef s, size_t offset, StringRef lit) {
-  const size_t n = s.size();
-  const size_t m = lit.size();
-  if (offset + m > n)
-    return false;
-  return s.substr(offset).starts_with(lit);
-}
 
 /// Find the last occurrence of \p ch at or before \p fromInclusive.
 inline size_t lastIndexOfChar(StringRef s, char ch, size_t fromInclusive) {
@@ -730,35 +714,6 @@ inline size_t countNonSplicedNewlines(StringRef s, size_t from, size_t to) {
   return count;
 }
 
-/// Render a boolean/byte array as a compact `0`/`1` string.
-inline std::string boolArrayToString(ArrayRef<char> touched) {
-  std::string res;
-  res.reserve(touched.size());
-  for (char b : touched)
-    res += (b ? '1' : '0');
-  return res;
-}
-
-/// Format byte ranges and their corresponding slices for diagnostics.
-inline std::string
-rangesToStringWithSlices(StringRef invText,
-                         ArrayRef<std::pair<size_t, size_t>> ranges) {
-  std::string sb = "[";
-  for (size_t i = 0; i < ranges.size(); ++i) {
-    if (i > 0)
-      sb += ", ";
-    const auto &r = ranges[i];
-    sb += "[" + std::to_string(r.first) + "," + std::to_string(r.second) + ")";
-    if (!invText.empty() && r.second >= r.first &&
-        static_cast<size_t>(r.second) <= invText.size()) {
-      sb += "='" +
-            showWsWithClip(invText.substr(r.first, r.second - r.first), 200) +
-            "'";
-    }
-  }
-  sb += "]";
-  return sb;
-}
 
 } // namespace stringutils
 } // namespace refold

@@ -168,35 +168,6 @@ public:
       const RefoldModel &model, StringRef ownerFile,
       std::optional<uint64_t> ownerIncludeId = std::nullopt);
 
-  /// \brief Wraps a realized include expansion so the preprocessor logical
-  /// file/line state matches the original header for the duration of the
-  /// expanded body, then resumes the includer's state.
-  ///
-  /// The returned string has the form:
-  ///
-  ///     #line 1 "child"
-  ///     (childBody...)
-  ///     #line resumeLine "parent"
-  ///
-  /// **BOL guarantee for the exit directive:** If `childBody` does not end with
-  /// a newline, this method inserts a single `\n` so that the "exit" #line
-  /// begins at BOL. This is considered safe because:
-  ///
-  /// * it is whitespace-only, and
-  /// * the subsequent #line immediately resets the logical line mapping back to
-  ///   the parent, preventing drift for later slices.
-  ///
-  /// \param childFileSpelling producer spelling for the included header
-  /// \param parentFileSpelling producer spelling for the includer (TU or parent
-  ///        header)
-  /// \param parentResumeLineNo logical line in the parent file to resume at
-  ///        after the include body
-  /// \param childBody realized include body (may be null)
-  /// \return wrapped include body, or childBody unchanged if disabled
-  std::string WrapIncludeExpansion(StringRef childFileSpelling,
-                                   StringRef parentFileSpelling,
-                                   size_t parentResumeLineNo,
-                                   StringRef childBody) const;
 
   /// \brief Attempts a *local* resynchronization by injecting a #line directive
   /// into the replacement text when (and only when) the replacement changes the

@@ -118,7 +118,6 @@ std::optional<std::string> RefoldEngine::BuildInlineIncludeRealizationFromB(
       inc.cover.begin, inc.cover.end, &evidenceKind);
   if (!bEnvOpt) {
     RequestTerminalFallback(
-        TerminalFallbackKind::IncludeRealizationUnmappableBCoverEnvelope,
         MakeTerminalFallbackProofFailure(
         TerminalFallbackObligationKind::IncludeRealizationBEnvelopeMapped,
         TerminalFallbackFailureReason::UnmappableIncludeBEnvelope),
@@ -152,10 +151,6 @@ std::optional<std::string> RefoldEngine::BuildInlineIncludeRealizationFromB(
       BuildAcceptedIncludeRealizationCandidate(
           AcceptedPathKind::IncludeRealizationInlineFromB, inc,
           &realizationWitness);
-  debug("include/mat",
-        "realize from B inc#{0} reason='{1}' bTok=[{2},{3}) candidate={4}",
-        inc.id, reason, bEnvOpt->first, bEnvOpt->second,
-        FormatAcceptedResultCandidate(realizationCandidate));
   if (acceptedCandidate)
     *acceptedCandidate = realizationCandidate;
 
@@ -2046,14 +2041,13 @@ bool RefoldEngine::LineResyncShouldDeferToConditionalJoin(
 /// despite later edit normalization, include nesting, and pending-resync flushes.
 static FinalLineControlPruneCandidate makeSyntheticLineControlPruneCandidate(
     uint64_t begin, uint64_t end, FinalLineDirective::Origin origin,
-    std::optional<FinalLineControlOwnerKey> owner, StringRef reason) {
+    std::optional<FinalLineControlOwnerKey> owner) {
   FinalLineControlPruneCandidate candidate;
   candidate.finalBegin = begin;
   candidate.finalEnd = end;
   candidate.origin = origin;
   candidate.physicalOwner = std::move(owner);
   candidate.producerProven = true;
-  candidate.reason = reason.str();
   return candidate;
 }
 
@@ -2097,7 +2091,7 @@ static std::optional<FinalLineControlPruneCandidate>
 makeInsertedSyntheticLineControlPruneCandidate(
     StringRef before, StringRef after, StringRef directive,
     FinalLineDirective::Origin origin,
-    std::optional<FinalLineControlOwnerKey> owner, StringRef reason) {
+    std::optional<FinalLineControlOwnerKey> owner) {
   if (directive.empty())
     return std::nullopt;
   if (after.size() != before.size() + directive.size())
@@ -2120,7 +2114,7 @@ makeInsertedSyntheticLineControlPruneCandidate(
   return makeSyntheticLineControlPruneCandidate(
       static_cast<uint64_t>(prefix),
       static_cast<uint64_t>(prefix + directive.size()), origin,
-      std::move(owner), reason);
+      std::move(owner));
 }
 
 /// Remove duplicate candidate records after composition/duplicate-edit merging.
@@ -2243,7 +2237,6 @@ RefoldEngine::WrapIncludeExpansionForMaterialization(
   auto appendSyntheticDirective = [&](std::string directive,
                                       FinalLineDirective::Origin origin,
                                       std::optional<FinalLineControlOwnerKey> owner,
-                                      StringRef reason,
                                       bool removableCandidate) {
     const uint64_t begin = static_cast<uint64_t>(wrapped.text.size());
     wrapped.text += directive;
@@ -2251,7 +2244,7 @@ RefoldEngine::WrapIncludeExpansionForMaterialization(
     if (removableCandidate) {
       wrapped.lineControlPruneCandidates.push_back(
           makeSyntheticLineControlPruneCandidate(begin, end, origin,
-                                                 std::move(owner), reason));
+                                                 std::move(owner)));
     }
   };
 
@@ -2276,7 +2269,6 @@ RefoldEngine::WrapIncludeExpansionForMaterialization(
           lineDirs_.FormatLineDirective(childEntryLineNo, childFileSpelling),
           FinalLineDirective::Origin::SyntheticIncludeEntry,
           FinalLineControlOwnerKey(childFileSpelling, child.id),
-          "synthetic include-entry candidate with final-stream observer/layout proof",
           /*removableCandidate=*/true);
       return;
     }
@@ -2319,7 +2311,6 @@ RefoldEngine::WrapIncludeExpansionForMaterialization(
           FinalLineDirective::Origin::SyntheticIncludeReturn,
           FinalLineControlOwnerKey(parentOwnerFileForDemand.str(),
                                    parentOwnerIncludeId),
-          "synthetic include-return candidate with final-stream observer proof",
           /*removableCandidate=*/true);
       return;
     }
@@ -2496,7 +2487,6 @@ void RefoldEngine::MaterializeIncludeExpansion(
 
     if (!sideband.SourceIsWithinOwnerBytes(static_cast<uint64_t>(bytes.size()))) {
       RequestTerminalFallback(
-          TerminalFallbackKind::UndischargedEmissionArtifact,
           MakeTerminalFallbackProofFailure(
           TerminalFallbackObligationKind::PragmaBoundaryKnown,
           TerminalFallbackFailureReason::UnknownPragmaCrossesBoundary),
@@ -4770,17 +4760,6 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
     const IncludePatch &p = *patchPtr;
     trace("include/patch", "computeIncludeTextEdits: patch={0}", p);
 
-    // Record the local obligations discharged by each accepted
-    // include-materialization path. The patch itself provides the class-local
-    // witness data (for example whether the edit is an insertion or is owned
-    // by a selected conditional arm).
-    auto includeInventoryFor = [&](AcceptedPathKind path,
-                                   const IncludeAnchorWitness *witness =
-                                       nullptr) {
-      return FormatAcceptedPathAudit(path, &p, /*tuAnchorWitness=*/nullptr,
-                                     witness);
-    };
-
     const bool isInsert = (p.aStart == p.aEnd) && (p.bStart < p.bEnd);
     const bool isDelete = (p.aStart < p.aEnd) && (p.bStart == p.bEnd);
     const bool isReplace = (p.aStart < p.aEnd) && (p.bStart < p.bEnd);
@@ -5104,11 +5083,6 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         const AcceptedResultCandidate acceptedCandidate =
             BuildAcceptedIncludeCandidate(candidate.path, p,
                                           &candidate.witness);
-        trace("include/apply",
-              "file={0} patch[{1}] INSERT: candidate stage={2} anchorByte={3} "
-              "candidate={4}",
-              file, idx, stage, candidate.anchorByte,
-              FormatAcceptedResultCandidate(acceptedCandidate));
       };
 
       // Select the best theorem-facing insertion anchor by wrapping each local
@@ -5138,11 +5112,6 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
           return std::nullopt;
         }
 
-        trace("include/apply",
-              "file={0} patch[{1}] INSERT: selected candidate anchorByte={2} "
-              "candidate={3}",
-              file, idx, candidates[*bestIdx].anchorByte,
-              FormatAcceptedResultCandidate(acceptedCandidates[*bestIdx]));
         return candidates[*bestIdx];
       };
 
@@ -5383,13 +5352,10 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         rightNeighborWitness.hasAnchorByte = rightStartByte.has_value();
         rightNeighborWitness.anchorByte =
             rightStartByte ? *rightStartByte : 0ULL;
-        trace(
-            "include/apply",
-            "file={0} patch[{1}] INSERT: right-neighbor anchorPP={2} -> "
-            "startByte={3} inventory={4}",
-            file, idx, rightAnchorPP, rightStartByte,
-            includeInventoryFor(AcceptedPathKind::IncludeInsertRightNeighborPP,
-                                &rightNeighborWitness));
+        trace("include/apply",
+              "file={0} patch[{1}] INSERT: right-neighbor anchorPP={2} -> "
+              "startByte={3}",
+              file, idx, rightAnchorPP, rightStartByte);
         if (!rightStartByte) {
           plan.requiresIncludeRealization = true;
           plan.realizationReason =
@@ -5453,10 +5419,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         leftNeighborWitness.anchorByte = leftAnchorByte ? *leftAnchorByte : 0ULL;
         trace("include/apply",
               "file={0} patch[{1}] INSERT: left-neighbor anchorPP={2} -> "
-              "startByte={3} anchorByte={4} inventory={5}",
-              file, idx, leftAnchorPP, leftStartByte, leftAnchorByte,
-              includeInventoryFor(AcceptedPathKind::IncludeInsertLeftNeighborPP,
-                                  &leftNeighborWitness));
+              "startByte={3} anchorByte={4}",
+              file, idx, leftAnchorPP, leftStartByte, leftAnchorByte);
         if (!leftAnchorByte) {
           plan.requiresIncludeRealization = true;
           plan.realizationReason =
@@ -5489,11 +5453,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         declWitness.declHeaderB = decl->headerB;
         declWitness.declHeaderE = decl->headerE;
         trace("include/apply",
-              "file={0} patch[{1}] INSERT: no neighbors; anchor at declEnd={2} "
-              "inventory={3}",
-              file, idx, declAnchorByte,
-              includeInventoryFor(AcceptedPathKind::IncludeInsertDeclBoundary,
-                                  &declWitness));
+              "file={0} patch[{1}] INSERT: no neighbors; anchor at declEnd={2}",
+              file, idx, declAnchorByte);
         if (anchorMatchesCondArmCert(declAnchorByte)) {
           InsertAnchorCandidate candidate;
           candidate.path = AcceptedPathKind::IncludeInsertDeclBoundary;
@@ -5585,11 +5546,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       mappedHeaderWitness.endByte = endByte ? *endByte : 0ULL;
       trace("include/apply",
             "file={0} patch[{1}] DELETE/REPLACE: firstPP={2} lastPP={3} -> "
-            "bytes=[{4},{5}) inventory={6}",
-            file, idx, firstPP, lastPP, startByte, endByte,
-            includeInventoryFor(
-                AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens,
-                &mappedHeaderWitness));
+            "bytes=[{4},{5})",
+            file, idx, firstPP, lastPP, startByte, endByte);
 
       // If either endpoint cannot be projected into header bytes, this patch
       // cannot be represented as an include-preserving mapped-header edit.
@@ -6303,8 +6261,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
           makeSyntheticLineControlPruneCandidate(
               resumeBegin, resumeEnd,
               FinalLineDirective::Origin::SyntheticSourceLineResume,
-              FinalLineControlOwnerKey(file, ie.include->id),
-              "synthetic header source-line resume candidate from consumed #line gap"));
+              FinalLineControlOwnerKey(file, ie.include->id)));
 
       const OwnerStateBoundary sourceLineResumeBoundary =
           OwnerStateBoundary::FromSource(OwnerSourceRange::From(
@@ -6687,8 +6644,7 @@ RefoldEngine::ApplyResyncOrPend(
                   replacement, injected, resyncDirective,
                   FinalLineDirective::Origin::SyntheticNewlineResync,
                   FinalLineControlOwnerKey(fileSpellingForDirective.str(),
-                                           ownerIncludeId),
-                  "local synthetic newline-resync candidate with final-stream observer proof")) {
+                                           ownerIncludeId))) {
         candidates.push_back(std::move(*candidate));
       } else {
         trace("linedir/resync",
@@ -6823,7 +6779,6 @@ bool RefoldEngine::EmittedTextEditHasDischargedAcceptedResults(
     NoteTheoremAuditViolation("emitted edit reached the byte-edit boundary "
                               "without accepted-result carriers");
     RequestTerminalFallback(
-        TerminalFallbackKind::UndischargedEmissionArtifact,
         MakeTerminalFallbackProofFailure(
         TerminalFallbackObligationKind::EmissionArtifactDischarged,
         TerminalFallbackFailureReason::UndischargedEmissionArtifact), emissionPhase,
@@ -6844,7 +6799,6 @@ bool RefoldEngine::EmittedTextEditHasDischargedAcceptedResults(
       NoteTheoremAuditViolation(
           "emitted edit carried a null accepted-result carrier");
       RequestTerminalFallback(
-          TerminalFallbackKind::UndischargedEmissionArtifact,
           MakeTerminalFallbackProofFailure(
         TerminalFallbackObligationKind::EmissionArtifactDischarged,
         TerminalFallbackFailureReason::UndischargedEmissionArtifact), emissionPhase,
@@ -6857,14 +6811,12 @@ bool RefoldEngine::EmittedTextEditHasDischargedAcceptedResults(
 
     if (!carrierIsEmissionDischarged(*carrier)) {
       RequestTerminalFallback(
-          TerminalFallbackKind::UndischargedEmissionArtifact,
           MakeTerminalFallbackProofFailure(
         TerminalFallbackObligationKind::EmissionArtifactDischarged,
         TerminalFallbackFailureReason::UndischargedEmissionArtifact), emissionPhase,
           llvm::formatv("emitted edit bytes=[{0},{1}) in {2} carries "
-                        "non-discharged result #{3}: {4}",
-                        edit.start, edit.end, owner, i,
-                        FormatAcceptedResultCandidate(*carrier))
+                        "non-discharged result #{3} kind={4}",
+                        edit.start, edit.end, owner, i, carrier->kind)
               .str());
       return false;
     }
@@ -6908,7 +6860,6 @@ bool RefoldEngine::EmittedTextEditHasOrderedAcceptedProofComposition(
     ++lastTheoremAudit_.emittedUncomposedCompositeEdits;
     NoteTheoremAuditViolation(detail);
     RequestTerminalFallback(
-        TerminalFallbackKind::UndischargedEmissionArtifact,
         MakeTerminalFallbackProofFailure(
             TerminalFallbackObligationKind::EmissionArtifactDischarged,
             TerminalFallbackFailureReason::UndischargedEmissionArtifact),
@@ -6985,8 +6936,9 @@ bool RefoldEngine::EmittedTextEditHasOrderedAcceptedProofComposition(
         extractSpan(*carrierPtr, i, *theoremProof);
     if (!span)
       return failComposition(
-          llvm::formatv("composite carrier #{0} had no comparable proof span: {1}",
-                        i, FormatAcceptedResultCandidate(*carrierPtr))
+          llvm::formatv("composite carrier #{0} had no comparable proof span "
+                        "kind={1}",
+                        i, carrierPtr->kind)
               .str());
     spans.push_back(*span);
   }
@@ -7641,7 +7593,6 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
       }
 
       RequestTerminalFallback(
-          TerminalFallbackKind::UndischargedEmissionArtifact,
           MakeTerminalFallbackProofFailure(
           TerminalFallbackObligationKind::EmissionEditSetComposable,
           TerminalFallbackFailureReason::UncomposableEmissionEditSet), "edits/apply",
@@ -7674,7 +7625,6 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
       if (merged.expandedMacroRootId && dup.expandedMacroRootId &&
           *merged.expandedMacroRootId != *dup.expandedMacroRootId) {
         RequestTerminalFallback(
-            TerminalFallbackKind::UndischargedEmissionArtifact,
             MakeTerminalFallbackProofFailure(
           TerminalFallbackObligationKind::EmissionEditSetComposable,
           TerminalFallbackFailureReason::UncomposableEmissionEditSet), "edits/apply",
@@ -7728,7 +7678,6 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
 
     if (mergedBRangeAmbiguous && materializedEditMappings) {
       RequestTerminalFallback(
-          TerminalFallbackKind::UndischargedEmissionArtifact,
           MakeTerminalFallbackProofFailure(
         TerminalFallbackObligationKind::EmissionArtifactDischarged,
         TerminalFallbackFailureReason::UndischargedEmissionArtifact), "edit-map",
@@ -7740,7 +7689,6 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
     }
     if (mergedOutRangeAmbiguous && materializedEditMappings) {
       RequestTerminalFallback(
-          TerminalFallbackKind::UndischargedEmissionArtifact,
           MakeTerminalFallbackProofFailure(
         TerminalFallbackObligationKind::EmissionArtifactDischarged,
         TerminalFallbackFailureReason::UndischargedEmissionArtifact), "edit-map",
@@ -8122,7 +8070,6 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
     const TextEdit &e = norm[editIndex];
     if (e.end < e.start || e.end > n) {
       RequestTerminalFallback(
-          TerminalFallbackKind::UncomposableEmissionEditSet,
           MakeTerminalFallbackProofFailure(
           TerminalFallbackObligationKind::EmissionEditSetComposable,
           TerminalFallbackFailureReason::UncomposableEmissionEditSet), "edits/apply",
@@ -8135,7 +8082,6 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
     }
     if (e.start < validatedCursor) {
       RequestTerminalFallback(
-          TerminalFallbackKind::UncomposableEmissionEditSet,
           MakeTerminalFallbackProofFailure(
           TerminalFallbackObligationKind::EmissionEditSetComposable,
           TerminalFallbackFailureReason::UncomposableEmissionEditSet), "edits/apply",
@@ -8192,7 +8138,6 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
           TextEditMaterializedBByteRange(e);
       if (!bRange) {
         RequestTerminalFallback(
-            TerminalFallbackKind::UndischargedEmissionArtifact,
             MakeTerminalFallbackProofFailure(
         TerminalFallbackObligationKind::EmissionArtifactDischarged,
         TerminalFallbackFailureReason::UndischargedEmissionArtifact), "edit-map",
@@ -8207,7 +8152,6 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
           TextEditMaterializedOutputTextRange(e);
       if (!outRange) {
         RequestTerminalFallback(
-            TerminalFallbackKind::UndischargedEmissionArtifact,
             MakeTerminalFallbackProofFailure(
         TerminalFallbackObligationKind::EmissionArtifactDischarged,
         TerminalFallbackFailureReason::UndischargedEmissionArtifact), "edit-map",
@@ -8749,8 +8693,7 @@ RefoldEngine::AppendOriginalSliceWithPending(
                 begin, end,
                 FinalLineDirective::Origin::SyntheticNewlineResync,
                 FinalLineControlOwnerKey(pending->fileSpellingForDir,
-                                         pending->ownerIncludeId),
-                "pending synthetic newline-resync candidate with final-stream observer proof"));
+                                         pending->ownerIncludeId)));
       }
     } else {
       trace("line/pending",
@@ -8817,8 +8760,7 @@ RefoldEngine::AppendOriginalSliceWithPending(
                   begin, end,
                   FinalLineDirective::Origin::SyntheticNewlineResync,
                   FinalLineControlOwnerKey(pending->fileSpellingForDir,
-                                           pending->ownerIncludeId),
-                  "pending synthetic newline-resync candidate with final-stream observer proof"));
+                                           pending->ownerIncludeId)));
         }
       } else {
         trace("line/pending",

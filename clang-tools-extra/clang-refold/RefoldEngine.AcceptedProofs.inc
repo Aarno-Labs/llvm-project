@@ -127,12 +127,6 @@ RefoldEngine::ValidateInvocationPreservingProofImpl(
       InventoryMacroPatchAcceptancePath(patch);
 
   RequireAcceptedPathBaseline(discharge, inventory);
-  discharge.Require(patch.proofValidated,
-                    ProofObligationKind::LegacyValidationRecorded,
-                    ProofFailureReason::MissingLegacyValidation);
-  discharge.Require(patch.structurePreserving,
-                    ProofObligationKind::StructureMatchesAcceptedClass,
-                    ProofFailureReason::StructuralMismatch);
   discharge.Require(patch.proofRootMacroId != 0,
                     ProofObligationKind::ProofRootTracked,
                     ProofFailureReason::MissingProofRoot);
@@ -250,12 +244,6 @@ RefoldEngine::ValidateInvocationRealizationProof(
     const bool boundaryAccountingTracked =
         boundsTracked && patch.wholeCoverBRawLo <= patch.wholeCoverBAdjLo &&
         patch.wholeCoverBAdjHi <= patch.wholeCoverBRawHi;
-    discharge.Require(patch.proofValidated,
-                      ProofObligationKind::LegacyValidationRecorded,
-                      ProofFailureReason::MissingLegacyValidation);
-    discharge.Require(!patch.structurePreserving,
-                      ProofObligationKind::StructureMatchesAcceptedClass,
-                      ProofFailureReason::StructuralMismatch);
     discharge.Require(boundsTracked,
                       ProofObligationKind::WholeCoverBoundsTracked,
                       ProofFailureReason::MissingWholeCoverBounds);
@@ -276,15 +264,24 @@ RefoldEngine::ValidateInvocationRealizationProof(
         ProofObligationKind::OwnerRealizationWitnessTracked,
         ProofFailureReason::MissingOwnerRealizationWitness);
   } else {
-    // Other realization paths currently rely on the common legacy validation
-    // bit plus the non-structure-preserving accepted class. They do not carry
-    // the whole-cover-specific envelope metadata checked above.
-    discharge.Require(patch.proofValidated,
-                      ProofObligationKind::LegacyValidationRecorded,
-                      ProofFailureReason::MissingLegacyValidation);
-    discharge.Require(!patch.structurePreserving,
-                      ProofObligationKind::StructureMatchesAcceptedClass,
-                      ProofFailureReason::StructuralMismatch);
+    // Non-whole-cover realization paths are admitted by their explicit macro
+    // proof kind plus a typed state-stability witness when the proof depends on
+    // stabilizing preprocessor state. There is no separate legacy validation
+    // bit in the theorem vocabulary.
+    if (patch.proofKind == MacroPatchProofKind::CounterLiteral) {
+      const SuffixStabilityWitnessKind kind =
+          patch.suffixStabilityWitness.kind;
+      const bool counterWitnessTracked =
+          patch.hasSuffixStabilityWitness &&
+          SuffixStabilityWitnessNamesComponent(patch.suffixStabilityWitness,
+                                               OwnerStateComponent::Counter) &&
+          (kind == SuffixStabilityWitnessKind::Literalization ||
+           kind == SuffixStabilityWitnessKind::OwnerMaterialization ||
+           kind == SuffixStabilityWitnessKind::ClosureWidening);
+      discharge.Require(counterWitnessTracked,
+                        ProofObligationKind::CounterStateWitnessTracked,
+                        ProofFailureReason::MissingCounterStateWitness);
+    }
   }
 
   return discharge.Finish();
@@ -585,110 +582,15 @@ RefoldEngine::ValidateTUAnchorProof(AcceptedPathKind currentPath,
   return discharge.Finish();
 }
 
-std::string
-RefoldEngine::FormatTUAnchorWitness(const TUAnchorWitness &witness) const {
-  return formatv(
-             "kind={0} ppGap={1}{2} tuByte={3}{4} slotId={5} slotKind={6} "
-             "macroId={7} leftPP={8}{9} rightPP={10}{11} outsideInclude={12} "
-             "ownerDepthStable={13} exactPP={14}",
-             witness.evidence, witness.ppGap,
-             witness.hasPPGap ? "" : "(missing)", witness.tuByte,
-             witness.hasTUByte ? "" : "(missing)", witness.slotId,
-             witness.slotKind.empty() ? StringRef("(none)")
-                                      : StringRef(witness.slotKind),
-             witness.macroId, witness.leftNeighborPP,
-             witness.hasLeftNeighbor ? "" : "(missing)",
-             witness.rightNeighborPP,
-             witness.hasRightNeighbor ? "" : "(missing)",
-             witness.outsideIncludeCoverage ? 1 : 0,
-             witness.ownerDepthStable ? 1 : 0, witness.exactPPMatch ? 1 : 0)
-      .str();
-}
-
-std::string RefoldEngine::FormatIncludeAnchorWitness(
-    const IncludeAnchorWitness &witness) const {
-  return formatv(
-             "kind={0} anchorByte={1}{2} byteRange=[{3},{4}){5} firstPP={6}{7} "
-             "lastPP={8}{9} neighborPP={10}{11} condArm={12}{13} "
-             "childInc={14}{15} "
-             "decl=[{16},{17}){18}",
-             witness.evidence, witness.anchorByte,
-             witness.hasAnchorByte ? "" : "(missing)", witness.startByte,
-             witness.endByte, witness.hasByteRange ? "" : "(missing)",
-             witness.firstPP, witness.hasFirstPP ? "" : "(missing)",
-             witness.lastPP, witness.hasLastPP ? "" : "(missing)",
-             witness.neighborPP, witness.hasNeighborPP ? "" : "(missing)",
-             witness.condArmId, witness.hasCondArmId ? "" : "(missing)",
-             witness.childIncludeId,
-             witness.hasChildIncludeId ? "" : "(missing)", witness.declHeaderB,
-             witness.declHeaderE, witness.hasDeclHeaderRange ? "" : "(missing)")
-      .str();
-}
-
-std::string
-RefoldEngine::FormatProofSummaryAuditCore(const ProofSummary &summary) const {
-  return formatv("inventory={0} lattice={1} completeness={2} theoremDomain={3} "
-                 "discharge={4}",
-                 FormatAcceptancePathInventory(summary.inventory),
-                 FormatGlobalSelectionLattice(summary.lattice),
-                 FormatCompletenessContract(summary.completeness),
-                 FormatTheoremDomainContract(summary.theoremDomain),
-                 FormatProofDischargeRecord(summary.discharge))
-      .str();
-}
-
-void RefoldEngine::AppendProofSummaryWitnessAudit(std::string &artifact,
-                                                  const ProofSummary &summary,
-                                                  bool firstOnly) const {
-  if (summary.hasTUAnchorWitness) {
-    artifact +=
-        formatv(" tuAnchor={0}", FormatTUAnchorWitness(summary.tuAnchorWitness))
-            .str();
-    if (firstOnly)
-      return;
-  }
-  if (summary.hasIncludeAnchorWitness) {
-    artifact +=
-        formatv(" includeAnchor={0}",
-                FormatIncludeAnchorWitness(summary.includeAnchorWitness))
-            .str();
-    if (firstOnly)
-      return;
-  }
-  if (summary.hasOwnerRealizationWitness) {
-    artifact +=
-        formatv(" ownerRealization={0}",
-                FormatOwnerRealizationWitness(summary.ownerRealizationWitness))
-            .str();
-    if (firstOnly)
-      return;
-  }
-  if (summary.hasMixedOwnerTilingWitness) {
-    artifact +=
-        formatv(" mixedOwnerTiling={0}",
-                FormatMixedOwnerTilingWitness(summary.mixedOwnerTilingWitness))
-            .str();
-    if (firstOnly)
-      return;
-  }
-  if (summary.hasTerminalFallbackWitness) {
-    artifact +=
-        formatv(" terminalOutOfDomain={0}", summary.terminalFallbackWitness)
-            .str();
-  }
-}
-
 RefoldEngine::TerminalFallbackWitness
 RefoldEngine::BuildTerminalFallbackWitness() const {
   TerminalFallbackWitness witness;
-  witness.kind = terminalFallbackKind_;
   witness.proofFailure = terminalFallbackProofFailure_;
   if (!IsClassifiedTerminalFallbackProofFailure(witness.proofFailure)) {
-    // Phase 2B forbids deriving the failed obligation from the aggregate
-    // terminal kind.  If this state is ever reached, the bug is the missing
+    // R4 forbids deriving the failed obligation from an aggregate terminal
+    // kind.  If this state is ever reached, the bug is the missing
     // caller-supplied proof failure itself, so report a theorem-audit
     // invariant violation rather than inventing an owner/state reason here.
-    witness.kind = TerminalFallbackKind::TheoremAuditInvariantViolation;
     witness.proofFailure = MakeTerminalFallbackProofFailure(
         TerminalFallbackObligationKind::TheoremAuditInvariantSatisfied,
         TerminalFallbackFailureReason::TheoremAuditInvariantViolation,
@@ -697,10 +599,10 @@ RefoldEngine::BuildTerminalFallbackWitness() const {
   }
   witness.requestCount = terminalFallbackRequestCount_;
 
-  // Phase 2D preserves every classified failed obligation that led to the
-  // terminal carrier.  Keep the first failure as the primary legacy field, but
-  // also retain the ordered secondary failures so MixedExcludedCases does not
-  // erase independent theorem obligations.
+  // Phase 2D/R4 preserves every classified failed obligation that led to the
+  // terminal carrier.  Keep the first failure as the primary field, but also
+  // retain ordered secondary failures so independent theorem obligations are
+  // never collapsed into a lossy aggregate category.
   witness.proofFailures = terminalFallbackProofFailures_;
   auto sameClassification = [](const TerminalFallbackProofFailure &lhs,
                                const TerminalFallbackProofFailure &rhs) {
@@ -714,13 +616,6 @@ RefoldEngine::BuildTerminalFallbackWitness() const {
                                  witness.proofFailure);
   }
 
-  // Preserve the first recorded terminal-fallback reason as the primary audit
-  // witness; the structured `proofFailures` list above carries all theorem
-  // obligations, while the reason strings remain human diagnostics.
-  if (!terminalFallbackReasons_.empty()) {
-    witness.hasPrimaryReason = true;
-    witness.primaryReason = terminalFallbackReasons_.front();
-  }
   return witness;
 }
 
@@ -839,194 +734,6 @@ std::string RefoldEngine::BuildOwnerUnresolvedNoTUAnchorDetail(
                        hasProvableInsertionAnchor ? "yes" : "no",
                        boundaryParent, hasBoundaryInclude ? "yes" : "no",
                        declaredDomainWall ? "yes" : "no")
-      .str();
-}
-
-std::string RefoldEngine::FormatAcceptancePathInventory(
-    const AcceptancePathInventory &inventory) const {
-  return formatv("currentPath={0} support={1} futureTarget={2}",
-                 inventory.currentPath, inventory.support,
-                 inventory.futureTarget)
-      .str();
-}
-
-std::string RefoldEngine::FormatProofDischargeRecord(
-    const ProofDischargeRecord &record) const {
-  return formatv("status={0} evaluated={1} satisfied={2} failedObligation={3} "
-                 "failureReason={4}",
-                 record.status, record.obligationsEvaluated,
-                 record.obligationsSatisfied, record.failedObligation,
-                 record.failureReason)
-      .str();
-}
-
-std::string RefoldEngine::FormatGlobalSelectionLattice(
-    const GlobalSelectionLattice &lattice) const {
-  return formatv("domain={0} mergeLaw={1} conflictLaw={2}", lattice.domain,
-                 lattice.mergeLaw, lattice.conflictLaw)
-      .str();
-}
-
-std::string RefoldEngine::FormatCompletenessContract(
-    const CompletenessContract &contract) const {
-  if (contract.hasExplicitExclusion) {
-    TerminalFallbackWitness witness;
-    witness.kind = contract.explicitExclusion;
-    witness.proofFailure =
-        ClassifyAggregateTerminalFallbackProofFailure(contract.explicitExclusion);
-    return formatv("coverage={0} expectation={1} declaredTarget={2} counts={3} "
-                   "exclusion={4}",
-                   contract.coverage, contract.expectation,
-                   contract.declaredTarget,
-                   contract.countsTowardDeclaredCoverage ? 1 : 0, witness)
-        .str();
-  }
-  return formatv("coverage={0} expectation={1} declaredTarget={2} counts={3}",
-                 contract.coverage, contract.expectation,
-                 contract.declaredTarget,
-                 contract.countsTowardDeclaredCoverage ? 1 : 0)
-      .str();
-}
-
-std::string RefoldEngine::FormatTheoremDomainContract(
-    const TheoremDomainContract &contract) const {
-  if (contract.hasExplicitExclusion) {
-    TerminalFallbackWitness witness;
-    witness.kind = contract.explicitExclusion;
-    witness.proofFailure =
-        ClassifyAggregateTerminalFallbackProofFailure(contract.explicitExclusion);
-    return formatv("kind={0} inDeclaredDomain={1} counts={2} declaredTarget={3}"
-                   " exclusion={4}",
-                   contract.kind, contract.inDeclaredDomain ? 1 : 0,
-                   contract.countsTowardCompleteness ? 1 : 0,
-                   contract.declaredTarget, witness)
-        .str();
-  }
-  return formatv("kind={0} inDeclaredDomain={1} counts={2} declaredTarget={3}",
-                 contract.kind, contract.inDeclaredDomain ? 1 : 0,
-                 contract.countsTowardCompleteness ? 1 : 0,
-                 contract.declaredTarget)
-      .str();
-}
-
-std::string RefoldEngine::FormatAcceptedPathAudit(
-    AcceptedPathKind currentPath, const IncludePatch *patch,
-    const TUAnchorWitness *tuAnchorWitness,
-    const IncludeAnchorWitness *includeAnchorWitness,
-    const TerminalFallbackWitness *terminalFallbackWitness) const {
-  const ProofSummary summary = BuildAcceptedPathProofSummary(
-      currentPath, patch, tuAnchorWitness, includeAnchorWitness,
-      terminalFallbackWitness);
-  std::string audit = FormatProofSummaryAuditCore(summary);
-  AppendProofSummaryWitnessAudit(audit, summary, /*firstOnly=*/true);
-  return audit;
-}
-
-
-std::string RefoldEngine::FormatAcceptedResultCandidate(
-    const AcceptedResultCandidate &candidate) const {
-  std::string artifact;
-  switch (candidate.kind) {
-  case AcceptedResultCandidateKind::MacroPatch:
-    artifact = formatv("span=[{0},{1})", candidate.begin, candidate.end).str();
-    if (candidate.hasRootMacroId) {
-      artifact += formatv(" rootMacro={0}", candidate.rootMacroId).str();
-    }
-    break;
-  case AcceptedResultCandidateKind::IncludePatch:
-    artifact = formatv("aSpan=[{0},{1})", candidate.begin, candidate.end).str();
-    if (candidate.hasOwnerIncludeId) {
-      artifact += formatv(" ownerInclude={0}", candidate.ownerIncludeId).str();
-    }
-    if (candidate.hasAnchorByte) {
-      artifact += formatv(" anchorByte={0}", candidate.anchorByte).str();
-    }
-    break;
-  case AcceptedResultCandidateKind::TUAnchor:
-    artifact = formatv("ppGap={0}", candidate.begin).str();
-    if (candidate.hasAnchorByte) {
-      artifact += formatv(" tuByte={0}", candidate.anchorByte).str();
-    }
-    break;
-  case AcceptedResultCandidateKind::TUTextEdit:
-    artifact = formatv("bytes=[{0},{1})", candidate.begin, candidate.end).str();
-    break;
-  case AcceptedResultCandidateKind::TerminalOutOfDomain:
-  case AcceptedResultCandidateKind::Unknown:
-    break;
-  }
-
-  AppendProofSummaryWitnessAudit(artifact, candidate.proofSummary,
-                                 /*firstOnly=*/false);
-  if (candidate.hasPayloadPreview) {
-    artifact += formatv(" payload='{0}'", candidate.payloadPreview).str();
-  }
-
-  const std::string artifactSuffix =
-      artifact.empty() ? std::string()
-                       : formatv(" artifact={0}", artifact).str();
-  const std::optional<TheoremProofClass> theoremProof =
-      NormalizeAcceptedProof(candidate);
-  return formatv("kind={0} theoremProof={1} class={2} realization={3} "
-                 "preference={4} surfaceDisposition={5} {6}{7}",
-                 candidate.kind, theoremProof,
-                 candidate.proofSummary.acceptedClass,
-                 candidate.proofSummary.realizationMode,
-                 candidate.proofSummary.preference,
-                 candidate.proofSummary.surfaceDisposition,
-                 FormatProofSummaryAuditCore(candidate.proofSummary),
-                 artifactSuffix)
-      .str();
-}
-
-std::string RefoldEngine::FormatMacroPatchAudit(const MacroPatch &patch) const {
-  const ProofSummary summary = ClassifyMacroPatchProof(patch);
-  return formatv(
-             "proofKind={0} topClass={1} realization={2} preference={3} "
-             "surfaceDisposition={4} {5} validated={6} struct={7} "
-             "proofRoot={8} subtreeCert={9} "
-             "leaf={10} witnesses={11} invCerts={12} formalCerts={13} "
-             "argCerts={14} liftChains={15} liftSteps={16} rootMerges={17} "
-             "lexicalBridge={18} paste={19} wrappers={20} stringify={21} "
-             "wideStringify={22} childSyntax={23} rawInvocation={24} "
-             "passthrough={25} bridgeSensitive={26} "
-             "deferredPasteDischarged={27} admissible={28} "
-             "pasteReplayValidated={29} expRootN={30} "
-             "deferredRootN={31} bridgeFormalN={32} expRoot={33} "
-             "deferredRootArgs={34} bridgeFormals={35} wholeCoverA=[{36},{37}) "
-             "wholeCoverBraw=[{38},{39}) wholeCoverBadj=[{40},{41})",
-             patch.proofKind, summary.acceptedClass, summary.realizationMode,
-             summary.preference, summary.surfaceDisposition,
-             FormatProofSummaryAuditCore(summary), patch.proofValidated ? 1 : 0,
-             patch.structurePreserving ? 1 : 0, patch.proofRootMacroId,
-             patch.subtreeCertBacked ? 1 : 0, patch.subtreeLeafMacroId,
-             patch.subtreeWitnessCount, patch.subtreeInvocationCertCount,
-             patch.subtreeFormalCertCount, patch.subtreeArgCertCount,
-             patch.subtreeLiftChainCount, patch.subtreeLiftStepCount,
-             patch.subtreeRootMergeCount, patch.subtreeUsesLexicalBridge ? 1 : 0,
-             patch.subtreeTouchesPaste ? 1 : 0,
-             patch.subtreeHasWrapperSemantics ? 1 : 0,
-             patch.subtreeHasStringifySemantics ? 1 : 0,
-             patch.subtreeHasWideStringifySemantics ? 1 : 0,
-             patch.subtreeHasPreferredChildSyntax ? 1 : 0,
-             patch.subtreeHasRawInvocationPreservation ? 1 : 0,
-             patch.subtreeHasPassthroughFlatten ? 1 : 0,
-             patch.subtreeHasBridgeSensitiveStructuredSemantics ? 1 : 0,
-             patch.subtreeDeferredPasteDischarged ? 1 : 0,
-             patch.subtreeAdmissible ? 1 : 0,
-             patch.pasteReplayValidated ? 1 : 0,
-             patch.subtreeExpectedRootFormalCount,
-             patch.subtreeDeferredRootArgCount,
-             patch.subtreeBridgeSensitiveFormalCount,
-             stringutils::showWsWithClip(patch.subtreeExpectedRootFormalSummary,
-                                         160),
-             stringutils::showWsWithClip(patch.subtreeDeferredRootArgSummary,
-                                         160),
-             stringutils::showWsWithClip(
-                 patch.subtreeBridgeSensitiveFormalSummary, 160),
-             patch.wholeCoverALo, patch.wholeCoverAHi, patch.wholeCoverBRawLo,
-             patch.wholeCoverBRawHi, patch.wholeCoverBAdjLo,
-             patch.wholeCoverBAdjHi)
       .str();
 }
 

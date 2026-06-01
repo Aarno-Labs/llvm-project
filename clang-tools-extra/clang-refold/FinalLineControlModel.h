@@ -42,8 +42,6 @@ struct FinalLineControlOwnerKey {
                            std::optional<uint64_t> ownerIncludeId)
       : physicalFile(std::move(physicalFile)),
         ownerIncludeId(ownerIncludeId) {}
-
-  std::string ToString() const;
 };
 
 
@@ -63,8 +61,6 @@ struct FinalLineControlSourceMapping {
   uint64_t sourceBegin = 0;
   uint64_t sourceEnd = 0;
   std::optional<uint64_t> ownerIncludeId = std::nullopt;
-
-  std::string ToString() const;
 };
 
 
@@ -100,7 +96,6 @@ void AdjustFinalLineControlSourceMappingsAfterDeletion(
 /// Clang's already-evaluated `#line` effect for macro-expanded operands without
 /// re-parsing expressions or evaluating preprocessor conditionals.
 struct FinalLineControlProducerEvent {
-  uint64_t id = 0;
   std::string physicalFile;
   std::optional<uint64_t> siteBegin = std::nullopt;
   std::optional<uint64_t> siteEnd = std::nullopt;
@@ -110,42 +105,7 @@ struct FinalLineControlProducerEvent {
   std::string logicalFileAfter;
   std::optional<uint64_t> ownerIncludeId = std::nullopt;
   std::string text;
-
-  std::string ToString() const;
 };
-
-/// Expected value observed by a preserved logical-location builtin.
-///
-/// Later chunks will populate it from model-backed preserved `__LINE__`,
-/// `__FILE__`, and `__FILE_NAME__` evidence rather than inferring intent from
-/// final source spelling.
-struct FinalExpectedLineValue {
-  enum class Kind : uint8_t { Unknown, Unsigned, String };
-
-  Kind kind = Kind::Unknown;
-  uint64_t unsignedValue = 0;
-  std::string stringValue;
-
-  static FinalExpectedLineValue Unknown() { return FinalExpectedLineValue(); }
-
-  static FinalExpectedLineValue Unsigned(uint64_t value) {
-    FinalExpectedLineValue out;
-    out.kind = Kind::Unsigned;
-    out.unsignedValue = value;
-    return out;
-  }
-
-  static FinalExpectedLineValue String(std::string value) {
-    FinalExpectedLineValue out;
-    out.kind = Kind::String;
-    out.stringValue = std::move(value);
-    return out;
-  }
-
-  std::string ToString() const;
-};
-
-llvm::StringRef toString(FinalExpectedLineValue::Kind kind);
 
 /// Whether the final-stream scanner can prove that a line-control directive is
 /// executed by the final source stream.
@@ -160,7 +120,6 @@ enum class FinalLineDirectiveActivity : uint8_t {
   KnownActive,
 };
 
-llvm::StringRef toString(FinalLineDirectiveActivity activity);
 
 /// Where the logical state associated with a final directive came from.
 ///
@@ -173,7 +132,6 @@ enum class FinalLineDirectiveSemanticSource : uint8_t {
   ProducerModel,
 };
 
-llvm::StringRef toString(FinalLineDirectiveSemanticSource source);
 
 /// The scanner's conservative classification of one final physical source line.
 enum class FinalPhysicalLineKind : uint8_t {
@@ -186,7 +144,6 @@ enum class FinalPhysicalLineKind : uint8_t {
   Unknown,
 };
 
-llvm::StringRef toString(FinalPhysicalLineKind kind);
 
 /// Logical preprocessor line/file state at a point in the final source stream.
 ///
@@ -223,19 +180,15 @@ struct FinalLogicalState {
     MarkLineUnknown();
     MarkFileUnknown();
   }
-
-  std::string ToString() const;
 };
 
-/// One final physical source line with the scanner's before/after logical
-/// state.  This is trace-only infrastructure for the final-stream pruner.
+/// One final physical source line with the scanner's pre-line logical state.
 struct FinalPhysicalLine {
   uint64_t finalBegin = 0;
   uint64_t finalEnd = 0;
   uint64_t physicalLine = 1;
   FinalPhysicalLineKind kind = FinalPhysicalLineKind::Unknown;
   FinalLogicalState stateBefore;
-  FinalLogicalState stateAfter;
   uint32_t conditionalDepthBefore = 0;
   uint32_t conditionalDepthAfter = 0;
   std::optional<size_t> directiveIndex = std::nullopt;
@@ -250,8 +203,6 @@ struct FinalPhysicalLine {
   std::string directiveName;
 
   std::string rawText;
-
-  std::string ToString() const;
 };
 
 /// One `#line` / line-control directive that exists in the final emitted C
@@ -280,25 +231,17 @@ struct FinalLineDirective {
   std::optional<std::string> file = std::nullopt;
   std::optional<FinalLineControlOwnerKey> physicalOwner = std::nullopt;
   bool producerProven = false;
-  std::optional<uint64_t> producerEventId = std::nullopt;
   bool removable = false;
   FinalLineDirectiveActivity activity = FinalLineDirectiveActivity::Unknown;
   FinalLineDirectiveSemanticSource semanticSource =
       FinalLineDirectiveSemanticSource::Unknown;
   bool semanticsKnown = false;
-  std::string rawText;
-
   FinalLineDirective() = default;
 
-  FinalLineDirective(uint64_t finalBegin, uint64_t finalEnd, Origin origin,
-                     std::string rawText = std::string())
-      : finalBegin(finalBegin), finalEnd(finalEnd), origin(origin),
-        rawText(std::move(rawText)) {}
-
-  std::string ToString() const;
+  FinalLineDirective(uint64_t finalBegin, uint64_t finalEnd, Origin origin)
+      : finalBegin(finalBegin), finalEnd(finalEnd), origin(origin) {}
 };
 
-llvm::StringRef toString(FinalLineDirective::Origin origin);
 
 /// Whether a final-stream observer candidate is known to be executed.
 ///
@@ -312,22 +255,6 @@ enum class FinalObserverActivity : uint8_t {
   KnownActive,
 };
 
-llvm::StringRef toString(FinalObserverActivity activity);
-
-/// Where a final-stream observer candidate came from.
-///
-/// `LexicalFinalSource` means the final scanner found a direct builtin token in
-/// ordinary final source text.  It deliberately excludes preprocessing
-/// directives, so macro replacement-list builtins are not mis-modeled as
-/// definition-site observations; those require later producer-model extraction
-/// at the actual expansion site.
-enum class FinalObserverSemanticSource : uint8_t {
-  Unknown,
-  LexicalFinalSource,
-  ProducerModel,
-};
-
-llvm::StringRef toString(FinalObserverSemanticSource source);
 
 /// A preserved final-stream builtin occurrence whose observed value constrains
 /// line-control pruning.
@@ -338,20 +265,13 @@ struct FinalObserver {
   uint64_t finalEnd = 0;
   uint64_t physicalLine = 1;
   Kind kind = Kind::Line;
-  FinalExpectedLineValue expected;
   std::optional<FinalLineControlOwnerKey> physicalOwner = std::nullopt;
   FinalObserverActivity activity = FinalObserverActivity::Unknown;
-  FinalObserverSemanticSource semanticSource =
-      FinalObserverSemanticSource::Unknown;
   bool producerProven = false;
   bool spellingPreserved = false;
   FinalLogicalState stateBefore;
-  std::string rawText;
-
-  std::string ToString() const;
 };
 
-llvm::StringRef toString(FinalObserver::Kind kind);
 
 /// Producer/model-backed final-stream observer at a macro expansion site.
 ///
@@ -364,7 +284,6 @@ llvm::StringRef toString(FinalObserver::Kind kind);
 /// final emitted bytes map exactly back to that site, so materialized or
 /// rewritten expansions do not become false liveness witnesses.
 struct FinalLineControlProducerObserver {
-  uint64_t id = 0;
   FinalObserver::Kind kind = FinalObserver::Kind::Line;
   std::string physicalFile;
   uint64_t sourceBegin = 0;
@@ -372,10 +291,7 @@ struct FinalLineControlProducerObserver {
   std::optional<uint64_t> ownerIncludeId = std::nullopt;
   bool active = false;
   bool producerProven = false;
-  FinalExpectedLineValue expected;
   std::string text;
-
-  std::string ToString() const;
 };
 
 /// Logical-location component controlled by a final-stream line-control
@@ -391,7 +307,6 @@ enum class FinalLineObserverComponent : uint8_t {
   FileName,
 };
 
-llvm::StringRef toString(FinalLineObserverComponent component);
 
 /// Observer-only liveness proof summary for one final-stream line-control
 /// directive.
@@ -424,7 +339,6 @@ struct FinalLineDirectiveObserverLiveness {
   /// it live.
   bool removableIfLayoutDead = false;
 
-  std::vector<std::string> reasons;
 
   bool HasObserverLiveComponent() const {
     return lineLive || fileLive || fileNameLive;
@@ -434,8 +348,6 @@ struct FinalLineDirectiveObserverLiveness {
     return lineUnknownDependence || fileUnknownDependence ||
            fileNameUnknownDependence;
   }
-
-  std::string ToString() const;
 };
 
 class FinalLineControlModel;
@@ -469,12 +381,8 @@ struct FinalLayoutObligation {
   std::optional<size_t> directiveIndex = std::nullopt;
 
   std::optional<FinalLineControlOwnerKey> physicalOwner = std::nullopt;
-  std::string reason;
-
-  std::string ToString() const;
 };
 
-llvm::StringRef toString(FinalLayoutObligation::Kind kind);
 
 /// Layout-only liveness proof summary for one final-stream line-control
 /// directive.
@@ -507,14 +415,11 @@ struct FinalLineDirectiveLayoutLiveness {
   /// observer proof also says it is observer-dead.
   bool removableIfObserverDead = false;
 
-  std::vector<std::string> reasons;
 
   bool HasLayoutLiveComponent() const {
     return zeroTokenPrefixBarrierLive || zeroTokenGapBarrierLive ||
            firstVisibleTokenAlignmentLive || blankLinePreservationLive;
   }
-
-  std::string ToString() const;
 };
 
 /// Compute deterministic layout liveness for final-stream line-control
@@ -526,7 +431,6 @@ struct FinalLineDirectiveLayoutLiveness {
 /// unproved `-E -P` blank-line interaction.
 std::vector<FinalLineDirectiveLayoutLiveness>
 ComputeFinalLayoutLiveness(const FinalLineControlModel &model);
-
 
 
 /// A final-stream line-control directive that a conservative emitter has
@@ -543,35 +447,18 @@ struct FinalLineControlPruneCandidate {
   FinalLineDirective::Origin origin = FinalLineDirective::Origin::Unknown;
   std::optional<FinalLineControlOwnerKey> physicalOwner = std::nullopt;
   bool producerProven = false;
-  std::string reason;
-
-  std::string ToString() const;
 };
 
-/// One deterministic fixed-point pruning decision for a final-stream
-/// line-control directive.
+
+/// Byte range removed by deterministic final-stream line-control pruning.
 ///
-/// Decisions are trace/proof artifacts for the pruning pass.  A directive is
-/// physically removed only when it is an explicit removable candidate and both
-/// observer and layout liveness prove it dead.  Directives that are merely
-/// scanned from the final source stream remain fail-closed unless some emitter
-/// or later candidate-generation step has marked them removable.
-struct FinalLineControlPruneDecision {
-  uint32_t iteration = 0;
-  size_t directiveIndex = 0;
+/// The range is recorded in the pre-deletion coordinate space for the
+/// fixed-point iteration that removed it.  RefoldEngine uses these ranges only
+/// to update downstream source/mapping coordinates after the pruner accepts a
+/// validated deletion.
+struct FinalLineControlRemovedRange {
   uint64_t finalBegin = 0;
   uint64_t finalEnd = 0;
-
-  bool explicitCandidate = false;
-  bool observerDead = false;
-  bool layoutDead = false;
-  bool verificationAttempted = false;
-  bool verificationRejected = false;
-  bool removed = false;
-
-  std::vector<std::string> reasons;
-
-  std::string ToString() const;
 };
 
 /// Result of deterministic final-stream fixed-point line-control pruning.
@@ -579,7 +466,7 @@ struct FinalLineControlPruneResult {
   std::string output;
   uint32_t iterations = 0;
   bool changed = false;
-  std::vector<FinalLineControlPruneDecision> decisions;
+  std::vector<FinalLineControlRemovedRange> removedRanges;
 };
 
 /// Optional executable oracle for a proposed final-stream #line deletion.
@@ -618,9 +505,6 @@ PruneFinalLineControlDirectives(
     FinalLineControlValidationCallback validationCallback =
         FinalLineControlValidationCallback());
 
-/// Emit deterministic trace diagnostics for fixed-point pruning decisions.
-void TraceFinalLineControlPruneResult(
-    const FinalLineControlPruneResult &result, llvm::StringRef phase);
 
 /// Passive final-stream line-control fact collection.
 ///
@@ -698,23 +582,6 @@ FinalLineControlModel CollectFinalLineControlModel(
     llvm::ArrayRef<FinalLineControlProducerObserver> producerObservers =
         llvm::ArrayRef<FinalLineControlProducerObserver>());
 
-/// Backward-compatible name from Chunk 1.  It now returns the Chunk 3 model,
-/// including physical-line scan records, conservative logical-state
-/// simulation, and passive observer candidates, but still has no behavioral
-/// effect on emitted source.
-FinalLineControlModel CollectPassiveFinalLineControlModel(
-    llvm::StringRef finalSource,
-    llvm::ArrayRef<FinalLineControlSourceMapping> sourceMappings =
-        llvm::ArrayRef<FinalLineControlSourceMapping>(),
-    llvm::ArrayRef<FinalLineControlProducerEvent> producerEvents =
-        llvm::ArrayRef<FinalLineControlProducerEvent>(),
-    llvm::ArrayRef<FinalLineControlProducerObserver> producerObservers =
-        llvm::ArrayRef<FinalLineControlProducerObserver>());
-
-/// Emit deterministic trace diagnostics for the final-stream line-control
-/// facts collected so far.
-void TraceFinalLineControlModel(const FinalLineControlModel &model,
-                                llvm::StringRef phase);
 
 } // namespace refold
 } // namespace clang
