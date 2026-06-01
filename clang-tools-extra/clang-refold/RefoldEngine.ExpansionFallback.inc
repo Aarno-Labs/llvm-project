@@ -5260,7 +5260,11 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   };
 
   struct TUPreservedGapPiece {
-    enum class Kind { ZeroTokenMacroInvocation, ZeroTokenConditionalGroup };
+    enum class Kind {
+      ZeroTokenMacroInvocation,
+      ZeroTokenConditionalGroup,
+      BalancedPragmaStateIsland
+    };
 
     Kind kind = Kind::ZeroTokenMacroInvocation;
     uint64_t begin = 0;
@@ -5288,17 +5292,39 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     };
 
     SmallVector<GapPiece, 8> pieces;
-    for (const auto &m : model_.GetMacroInvocations())
-      if (macroInvocationIsConsumableZeroTokenGap(m, gapBegin, gapEnd))
+    for (const auto &m : model_.GetMacroInvocations()) {
+      if (macroInvocationIsConsumableZeroTokenGap(m, gapBegin, gapEnd)) {
         pieces.push_back({*m.invB, *m.invE, m.id,
                           TUPreservedGapPiece::Kind::
                               ZeroTokenMacroInvocation});
+      }
+    }
 
-    for (const auto &group : model_.GetConds())
-      if (conditionalGroupIsConsumableZeroTokenGap(group, gapBegin, gapEnd))
+    for (const auto &group : model_.GetConds()) {
+      if (conditionalGroupIsConsumableZeroTokenGap(group, gapBegin, gapEnd)) {
         pieces.push_back({group.groupB, group.groupE, group.id,
                           TUPreservedGapPiece::Kind::
                               ZeroTokenConditionalGroup});
+      }
+    }
+
+    // Step 3 pragma/state proof: a complete diagnostic push/settings/pop
+    // sequence that is wholly inside this owner gap and crosses only trivia has
+    // identity net state at both boundaries.  Preserve the original pragma
+    // bytes as an explicit gap piece instead of treating the gap as opaque
+    // trivia; unknown or unbalanced pragmas remain non-consumable and will still
+    // force the ordinary fail-closed path below.
+    SmallVector<BalancedDiagnosticPragmaStateIsland, 4> pragmaIslands;
+    collectBalancedDiagnosticPragmaStateIslands(
+        model_, tuBytes, gapBegin, gapEnd,
+        [&](const RefoldModel::PragmaDirective &pragma) {
+          return PathsEqual(pragma.sitePath, tuPath);
+        },
+        pragmaIslands);
+    for (const BalancedDiagnosticPragmaStateIsland &island : pragmaIslands) {
+      pieces.push_back({island.begin, island.end, island.id,
+                        TUPreservedGapPiece::Kind::BalancedPragmaStateIsland});
+    }
 
     if (pieces.empty())
       return false;
@@ -5325,8 +5351,10 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
                 if (outer.kind == TUPreservedGapPiece::Kind::
                                       ZeroTokenConditionalGroup) {
                   // A preserved complete conditional group owns everything in
-                  // its source island, including control-line macro uses and
-                  // nested inactive conditional records.  Those inner records
+                  // its source island, including control-line macro uses,
+                  // nested inactive conditional records, and any balanced
+                  // pragma-state island that the shared conditional proof has
+                  // already accepted as boundary-neutral.  Those inner records
                   // are not independently emitted as gap pieces.
                   return true;
                 }
@@ -6254,21 +6282,42 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     replacement.append(preservedGapTrivia.begin(), preservedGapTrivia.end());
   }
 
-  // Mixed TU/include closures may span source-neutral macro callsites or complete
-  // conditional islands that contributed no PP tokens. These pieces are not
-  // stale source: preserving them keeps the refolded source closer to the
-  // original while the zero-token proof above guarantees that replaying them
-  // cannot change the B token stream. Emit only the normalized top-level gap
-  // pieces, not the surrounding trivia, mirroring the header owner-envelope
-  // preservation path.
+  // Mixed TU/include closures may span source-neutral macro callsites, complete
+  // conditional islands, or balanced pragma-state islands that contributed no
+  // normal PP tokens.  These pieces are not stale source: preserving them keeps
+  // the refolded source closer to the original while the owner-gap proof above
+  // guarantees that replaying them cannot change the B token stream.
+  //
+  // Step 3 has one extra ownership choice.  Preserved pragma directives are
+  // sideband replay bytes: after frontend normalization, the ordinary B hunk may
+  // already contain the exact balanced diagnostic island even though the island
+  // is absent from the structural token diff.  In that case the B surface, not
+  // the source-gap copier, owns the pragma replay.  Appending the source island
+  // here would duplicate the directives and change validation.
   if (!mixedPreservedZeroTokenGapPieces.empty()) {
-    if (!replacement.empty() && replacement.back() != '\n')
-      replacement.push_back('\n');
+    bool insertedSeparator = false;
     for (const TUPreservedGapPiece &piece :
          mixedPreservedZeroTokenGapPieces) {
       std::string pieceText = preservedTUGapPieceText(piece);
       if (pieceText.empty())
         continue;
+
+      if (piece.kind ==
+              TUPreservedGapPiece::Kind::BalancedPragmaStateIsland &&
+          balancedDiagnosticPragmaStateIslandIsCarriedByReplacement(
+              StringRef(pieceText), StringRef(replacement))) {
+        trace("fallback",
+              "TU/include closure: balanced pragma-state island id={0} "
+              "source=[{1},{2}) already carried by B replacement",
+              piece.id, piece.begin, piece.end);
+        continue;
+      }
+
+      if (!insertedSeparator && !replacement.empty() &&
+          replacement.back() != '\n') {
+        replacement.push_back('\n');
+        insertedSeparator = true;
+      }
       replacement += pieceText;
       if (replacement.empty() || replacement.back() != '\n')
         replacement.push_back('\n');

@@ -3692,7 +3692,8 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       MacroStateDirective,
       ZeroTokenConditionalGroup,
       ZeroTokenMacroInvocation,
-      ZeroTokenChildInclude
+      ZeroTokenChildInclude,
+      BalancedPragmaStateIsland
     };
 
     Kind kind = Kind::MacroStateDirective;
@@ -6542,6 +6543,31 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                   gapPieces.push_back(std::move(piece));
                 }
 
+                // Step 3 pragma/state proof for materialized header owners.
+                // A balanced diagnostic pragma island is a source-state atom:
+                // the island may be preserved across a header source gap only
+                // when push/pop depth returns to zero and every byte crossed by
+                // the island is trivia.  This mirrors the TU owner proof while
+                // keeping non-diagnostic or unbalanced pragmas fail-closed.
+                SmallVector<BalancedDiagnosticPragmaStateIsland, 4>
+                    pragmaIslands;
+                collectBalancedDiagnosticPragmaStateIslands(
+                    model_, StringRef(headerText), gapBegin, gapEnd,
+                    [&](const RefoldModel::PragmaDirective &pragma) {
+                      return PathsEqual(pragma.sitePath, file);
+                    },
+                    pragmaIslands);
+                for (const BalancedDiagnosticPragmaStateIsland &island :
+                     pragmaIslands) {
+                  HeaderPreservedGapPiece piece;
+                  piece.kind = HeaderPreservedGapPiece::Kind::
+                      BalancedPragmaStateIsland;
+                  piece.begin = island.begin;
+                  piece.end = island.end;
+                  piece.id = island.id;
+                  gapPieces.push_back(std::move(piece));
+                }
+
                 for (const auto &macro : model_.GetMacroInvocations()) {
                   if (!headerMacroInvocationIsPreservableGap(
                           macro, gapBegin, gapEnd))
@@ -6597,14 +6623,15 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                             // shared conditional-island proof has discharged
                             // those artifacts. This includes nested conditional
                             // records, zero-token macro calls, zero-token or
-                            // state-preserving child includes, and direct
-                            // macro-state directives in selected arms.
+                            // state-preserving child includes, direct
+                            // macro-state directives in selected arms, and
+                            // balanced pragma-state islands.
                             //
                             // Without this ownership rule, the gap tiler would
                             // see both the outer #if/#endif island and its
-                            // already-proved child include/directive pieces as
-                            // overlapping top-level proof pieces, reject the
-                            // header envelope, and fall back to raw B.
+                            // already-proved child include/directive/pragma
+                            // pieces as overlapping top-level proof pieces,
+                            // reject the header envelope, and fall back to raw B.
                             return true;
                           }
 
@@ -6862,12 +6889,36 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       // Emit preserved gap pieces after the B-derived payload. That keeps
       // replacement tokens in the same preprocessing environment as B, while
       // the untouched header suffix sees the restored zero-token structure.
-      if (!replacement.empty() && replacement.back() != '\n')
-        replacement.push_back('\n');
+      //
+      // Balanced diagnostic pragma islands are the one side-effect gap class
+      // that may already be present in the B-derived replay bytes.  Sideband
+      // normalization removes their directive tokens from the structural diff,
+      // but the raw replacement slice still contains the emitted `#pragma`
+      // lines.  When that replay surface canonically carries the same balanced
+      // island, suppress the source-gap copy so the pragma state is represented
+      // exactly once.
+      bool insertedSeparator = false;
       for (const HeaderPreservedGapPiece &piece : headerGapPreservations) {
         std::string pieceText = preservedGapPieceText(piece);
         if (pieceText.empty())
           continue;
+
+        if (piece.kind ==
+                HeaderPreservedGapPiece::Kind::BalancedPragmaStateIsland &&
+            balancedDiagnosticPragmaStateIslandIsCarriedByReplacement(
+                StringRef(pieceText), StringRef(replacement))) {
+          trace("include/apply",
+                "file={0} patch[{1}] balanced pragma-state island id={2} "
+                "source=[{3},{4}) already carried by B replacement",
+                file, idx, piece.id, piece.begin, piece.end);
+          continue;
+        }
+
+        if (!insertedSeparator && !replacement.empty() &&
+            replacement.back() != '\n') {
+          replacement.push_back('\n');
+          insertedSeparator = true;
+        }
         replacement += pieceText;
         if (replacement.empty() || replacement.back() != '\n')
           replacement.push_back('\n');

@@ -282,6 +282,473 @@ inline bool hasLiteralMacroCalleeOrigin(
 /// preserved conditional island to be source-neutral.
 enum class NeutralConditionalArmSpanMode { AllArms, SelectedArmsOnly };
 
+/// One complete locally-neutral diagnostic pragma-state island.
+///
+/// `#pragma clang/GCC diagnostic push/pop` forms a stack discipline: pushes
+/// save the current diagnostic mapping, settings mutate only the top frame, and
+/// pops restore the previous mapping.  A fully balanced island that starts and
+/// ends at stack depth zero, contains only diagnostic settings while depth is
+/// positive, and crosses only trivia has identity net state at its boundaries.
+/// Such an island may be carried through a source gap without changing the
+/// preprocessing token stream or the diagnostic state observed by preserved
+/// suffix source.
+struct BalancedDiagnosticPragmaStateIsland {
+  uint64_t begin = 0;
+  uint64_t end = 0;
+  uint64_t id = 0;
+};
+
+enum class DiagnosticPragmaStateAction { Push, Pop, Setting };
+
+struct ParsedDiagnosticPragmaStateDirective {
+  StringRef namespaceName;
+  StringRef actionName;
+  StringRef optionSpelling;
+  DiagnosticPragmaStateAction action = DiagnosticPragmaStateAction::Setting;
+};
+
+/// Return true iff `text` is only whitespace and complete C/C++ comments.
+///
+/// This duplicate of the fallback-local trivia predicate is intentionally kept
+/// at translation-unit scope because balanced pragma-state proof is shared by
+/// TU and header owner-envelope code.  Incomplete comments or any token spelling
+/// reject the island, forcing the caller back to a wider structural proof or
+/// terminal B.
+static bool sourceTextIsOnlyWhitespaceAndCompleteComments(StringRef text) {
+  size_t i = 0;
+  const size_t n = text.size();
+
+  while (i < n) {
+    if (stringutils::isWs(text[i])) {
+      ++i;
+      continue;
+    }
+
+    if (i + 1 >= n || text[i] != '/')
+      return false;
+
+    if (text[i + 1] == '*') {
+      i += 2;
+      bool closed = false;
+      while (i + 1 < n) {
+        if (text[i] == '*' && text[i + 1] == '/') {
+          i += 2;
+          closed = true;
+          break;
+        }
+        ++i;
+      }
+      if (!closed)
+        return false;
+      continue;
+    }
+
+    if (text[i + 1] == '/') {
+      i += 2;
+      while (i < n && text[i] != '\n')
+        ++i;
+      if (i < n)
+        ++i;
+      continue;
+    }
+
+    return false;
+  }
+
+  return true;
+}
+
+static bool consumePragmaIdentifier(StringRef text, size_t &pos, size_t end,
+                                    StringRef expected) {
+  StringRef actual;
+  if (!stringutils::consumeIdentifier(text, pos, end, actual))
+    return false;
+  return actual == expected;
+}
+
+static bool consumeDiagnosticOptionStringLiteral(StringRef text, size_t &pos,
+                                                 size_t end,
+                                                 StringRef *spelling = nullptr) {
+  stringutils::skipWsNoLF(text, pos, end);
+  if (pos >= end || text[pos] != '"')
+    return false;
+
+  const size_t begin = pos;
+  ++pos;
+  while (pos < end) {
+    const char c = text[pos++];
+    if (c == '\\') {
+      if (pos >= end)
+        return false;
+      ++pos;
+      continue;
+    }
+    if (c == '"') {
+      if (spelling)
+        *spelling = text.slice(begin, pos);
+      return true;
+    }
+    if (c == '\n' || c == '\r')
+      return false;
+  }
+  return false;
+}
+
+static bool diagnosticPragmaSettingAction(StringRef action) {
+  return action == "ignored" || action == "warning" || action == "error" ||
+         action == "fatal" || action == "remark";
+}
+
+/// Strictly parse the diagnostic pragma-state sublanguage admitted by the
+/// balanced-island proof.
+///
+/// The proof does not try to understand arbitrary pragmas.  It accepts only the
+/// two Clang-supported diagnostic namespaces whose state model is a stack
+/// (`clang diagnostic` and `GCC diagnostic`) and only the push/pop/settings
+/// grammar whose net state can be checked locally.  Anything else remains
+/// side-effect-bearing and therefore fail-closed.
+static std::optional<ParsedDiagnosticPragmaStateDirective>
+parseDiagnosticPragmaStateDirective(StringRef text) {
+  const size_t end = text.size();
+  size_t pos = 0;
+
+  if (!stringutils::consumeDirectiveHash(text, pos, end))
+    return std::nullopt;
+  if (!consumePragmaIdentifier(text, pos, end, "pragma"))
+    return std::nullopt;
+
+  stringutils::skipWsNoLF(text, pos, end);
+  StringRef namespaceName;
+  if (!stringutils::consumeIdentifier(text, pos, end, namespaceName))
+    return std::nullopt;
+  if (namespaceName != "clang" && namespaceName != "GCC")
+    return std::nullopt;
+
+  stringutils::skipWsNoLF(text, pos, end);
+  if (!consumePragmaIdentifier(text, pos, end, "diagnostic"))
+    return std::nullopt;
+
+  stringutils::skipWsNoLF(text, pos, end);
+  StringRef action;
+  if (!stringutils::consumeIdentifier(text, pos, end, action))
+    return std::nullopt;
+
+  ParsedDiagnosticPragmaStateDirective parsed;
+  parsed.namespaceName = namespaceName;
+  parsed.actionName = action;
+  if (action == "push") {
+    parsed.action = DiagnosticPragmaStateAction::Push;
+  } else if (action == "pop") {
+    parsed.action = DiagnosticPragmaStateAction::Pop;
+  } else if (diagnosticPragmaSettingAction(action)) {
+    StringRef optionSpelling;
+    if (!consumeDiagnosticOptionStringLiteral(text, pos, end,
+                                              &optionSpelling))
+      return std::nullopt;
+    parsed.action = DiagnosticPragmaStateAction::Setting;
+    parsed.optionSpelling = optionSpelling;
+  } else {
+    return std::nullopt;
+  }
+
+  if (!sourceTextIsOnlyWhitespaceAndCompleteComments(text.drop_front(pos)))
+    return std::nullopt;
+  return parsed;
+}
+
+/// Return the normalized spelling used to compare pragma-state islands across
+/// source and B replay surfaces.
+///
+/// The refolder must decide whether a locally balanced pragma island is already
+/// carried by the B-derived replacement bytes or must be copied from the
+/// original source gap.  Raw text is too strong for that decision because the
+/// preprocessor may normalize harmless spacing around `#pragma`, while arbitrary
+/// token comparison is too weak because unknown pragmas can mutate compiler
+/// state.  Canonicalize only the strictly parsed diagnostic-state sublanguage
+/// admitted by the Step 3 proof.
+static std::optional<std::string>
+canonicalDiagnosticPragmaStateDirectiveText(StringRef text) {
+  std::optional<ParsedDiagnosticPragmaStateDirective> parsed =
+      parseDiagnosticPragmaStateDirective(text);
+  if (!parsed)
+    return std::nullopt;
+
+  std::string out;
+  out += "#pragma ";
+  out += parsed->namespaceName.str();
+  out += " diagnostic ";
+  out += parsed->actionName.str();
+  if (parsed->action == DiagnosticPragmaStateAction::Setting) {
+    out += " ";
+    out += parsed->optionSpelling.str();
+  }
+  out += "\n";
+  return out;
+}
+
+/// Canonicalize `text` iff it is exactly one locally balanced diagnostic
+/// pragma-state island plus trivia.
+///
+/// This function is the replay-side counterpart to
+/// collectBalancedDiagnosticPragmaStateIslands().  The source collector proves
+/// that an island has identity net state; this helper proves that a B replay
+/// surface already contains the same state island, so emission must not append
+/// the original source island a second time.
+static std::optional<std::string>
+canonicalBalancedDiagnosticPragmaStateIslandText(StringRef text) {
+  std::string canonical;
+  std::optional<StringRef> namespaceName;
+  unsigned depth = 0;
+  bool sawDirective = false;
+
+  size_t cursor = 0;
+  while (cursor < text.size()) {
+    size_t lineEnd = cursor;
+    while (lineEnd < text.size() && text[lineEnd] != '\n')
+      ++lineEnd;
+    const size_t next = lineEnd < text.size() ? lineEnd + 1 : lineEnd;
+    StringRef line = text.slice(cursor, next);
+
+    if (!stringutils::lineStartsWithDirectiveKeyword(line, "pragma")) {
+      if (!sourceTextIsOnlyWhitespaceAndCompleteComments(line))
+        return std::nullopt;
+      cursor = next;
+      continue;
+    }
+
+    std::optional<ParsedDiagnosticPragmaStateDirective> parsed =
+        parseDiagnosticPragmaStateDirective(line);
+    if (!parsed)
+      return std::nullopt;
+    if (namespaceName && *namespaceName != parsed->namespaceName)
+      return std::nullopt;
+    namespaceName = parsed->namespaceName;
+
+    switch (parsed->action) {
+    case DiagnosticPragmaStateAction::Push:
+      ++depth;
+      break;
+    case DiagnosticPragmaStateAction::Pop:
+      if (depth == 0)
+        return std::nullopt;
+      --depth;
+      break;
+    case DiagnosticPragmaStateAction::Setting:
+      if (depth == 0)
+        return std::nullopt;
+      break;
+    }
+
+    std::optional<std::string> directiveCanonical =
+        canonicalDiagnosticPragmaStateDirectiveText(line);
+    if (!directiveCanonical)
+      return std::nullopt;
+    canonical += *directiveCanonical;
+    sawDirective = true;
+    cursor = next;
+  }
+
+  if (!sawDirective || depth != 0)
+    return std::nullopt;
+  return canonical;
+}
+
+/// Return true iff `replacement` already contains the same locally balanced
+/// diagnostic pragma-state island as `sourceIslandText`.
+///
+/// Balanced pragma islands are zero-normal-token state artifacts: after sideband
+/// normalization, the ordinary B replacement bytes may still contain their raw
+/// directive spellings even though the structural token diff does not.  When the
+/// B surface carries the island, copying the original source island as a
+/// preserved gap would duplicate `#pragma` directives and change validation.
+/// The proof is deliberately narrow: only a complete canonical island match
+/// suppresses source-gap emission; otherwise the caller preserves the source
+/// island or fails through the existing owner proof.
+static bool balancedDiagnosticPragmaStateIslandIsCarriedByReplacement(
+    StringRef sourceIslandText, StringRef replacement) {
+  std::optional<std::string> sourceCanonical =
+      canonicalBalancedDiagnosticPragmaStateIslandText(sourceIslandText);
+  if (!sourceCanonical)
+    return false;
+
+  std::string currentCanonical;
+  std::optional<StringRef> currentNamespace;
+  unsigned depth = 0;
+
+  auto reset = [&] {
+    currentCanonical.clear();
+    currentNamespace.reset();
+    depth = 0;
+  };
+
+  size_t cursor = 0;
+  while (cursor < replacement.size()) {
+    size_t lineEnd = cursor;
+    while (lineEnd < replacement.size() && replacement[lineEnd] != '\n')
+      ++lineEnd;
+    const size_t next = lineEnd < replacement.size() ? lineEnd + 1 : lineEnd;
+    StringRef line = replacement.slice(cursor, next);
+
+    if (!stringutils::lineStartsWithDirectiveKeyword(line, "pragma")) {
+      if (!sourceTextIsOnlyWhitespaceAndCompleteComments(line))
+        reset();
+      cursor = next;
+      continue;
+    }
+
+    std::optional<ParsedDiagnosticPragmaStateDirective> parsed =
+        parseDiagnosticPragmaStateDirective(line);
+    std::optional<std::string> directiveCanonical =
+        canonicalDiagnosticPragmaStateDirectiveText(line);
+    if (!parsed || !directiveCanonical) {
+      reset();
+      cursor = next;
+      continue;
+    }
+
+    if ((currentNamespace && *currentNamespace != parsed->namespaceName) ||
+        (!currentCanonical.empty() && depth == 0))
+      reset();
+    currentNamespace = parsed->namespaceName;
+
+    bool validAction = true;
+    switch (parsed->action) {
+    case DiagnosticPragmaStateAction::Push:
+      ++depth;
+      break;
+    case DiagnosticPragmaStateAction::Pop:
+      if (depth == 0) {
+        validAction = false;
+        break;
+      }
+      --depth;
+      break;
+    case DiagnosticPragmaStateAction::Setting:
+      if (depth == 0)
+        validAction = false;
+      break;
+    }
+
+    if (!validAction) {
+      reset();
+      cursor = next;
+      continue;
+    }
+
+    currentCanonical += *directiveCanonical;
+    if (depth == 0) {
+      if (currentCanonical == *sourceCanonical)
+        return true;
+      reset();
+    }
+
+    cursor = next;
+  }
+
+  return false;
+}
+
+/// Collect top-level balanced diagnostic pragma-state islands in a source gap.
+///
+/// This is the Step 3 pragma/state-effect invariant in mechanical form.  A
+/// pragma sequence can be treated as source-neutral only when:
+///
+///  * every directive belongs to the caller's current owner surface;
+///  * every directive parses as `#pragma clang/GCC diagnostic ...`;
+///  * all directives in one island use the same diagnostic namespace;
+///  * stack depth never goes negative and returns to zero;
+///  * settings occur only while a pushed frame is active; and
+///  * the bytes crossed between directives are trivia only.
+///
+/// The island is not deleted by this helper; callers preserve the original
+/// source bytes as an explicit gap piece.  The proof is therefore about the net
+/// boundary state, not about reconstructing or normalizing pragma spelling.
+static void collectBalancedDiagnosticPragmaStateIslands(
+    const RefoldModel &model, StringRef ownerBytes, uint64_t gapBegin,
+    uint64_t gapEnd,
+    function_ref<bool(const RefoldModel::PragmaDirective &)> pragmaBelongs,
+    SmallVectorImpl<BalancedDiagnosticPragmaStateIsland> &out) {
+  if (gapBegin >= gapEnd || gapEnd > ownerBytes.size())
+    return;
+
+  SmallVector<const RefoldModel::PragmaDirective *, 8> pragmas;
+  for (const auto &pragma : model.GetPragmas()) {
+    if (!pragmaBelongs(pragma))
+      continue;
+    if (gapBegin <= pragma.siteB && pragma.siteB < pragma.siteE &&
+        pragma.siteE <= gapEnd)
+      pragmas.push_back(&pragma);
+  }
+  if (pragmas.empty())
+    return;
+
+  llvm::sort(pragmas, [](const RefoldModel::PragmaDirective *lhs,
+                         const RefoldModel::PragmaDirective *rhs) {
+    if (lhs->siteB != rhs->siteB)
+      return lhs->siteB < rhs->siteB;
+    if (lhs->siteE != rhs->siteE)
+      return lhs->siteE < rhs->siteE;
+    return lhs->id < rhs->id;
+  });
+
+  for (size_t i = 0; i < pragmas.size(); ++i) {
+    const RefoldModel::PragmaDirective *first = pragmas[i];
+    std::optional<ParsedDiagnosticPragmaStateDirective> firstParsed =
+        parseDiagnosticPragmaStateDirective(first->text);
+    if (!firstParsed || firstParsed->action != DiagnosticPragmaStateAction::Push)
+      continue;
+
+    unsigned depth = 0;
+    uint64_t islandEnd = first->siteB;
+    bool valid = true;
+
+    for (size_t j = i; j < pragmas.size(); ++j) {
+      const RefoldModel::PragmaDirective *cur = pragmas[j];
+      if (cur->siteB < islandEnd ||
+          !sourceTextIsOnlyWhitespaceAndCompleteComments(
+              ownerBytes.slice(islandEnd, cur->siteB))) {
+        valid = false;
+        break;
+      }
+
+      std::optional<ParsedDiagnosticPragmaStateDirective> parsed =
+          parseDiagnosticPragmaStateDirective(cur->text);
+      if (!parsed || parsed->namespaceName != firstParsed->namespaceName) {
+        valid = false;
+        break;
+      }
+
+      switch (parsed->action) {
+      case DiagnosticPragmaStateAction::Push:
+        ++depth;
+        break;
+      case DiagnosticPragmaStateAction::Pop:
+        if (depth == 0) {
+          valid = false;
+          break;
+        }
+        --depth;
+        break;
+      case DiagnosticPragmaStateAction::Setting:
+        if (depth == 0) {
+          valid = false;
+          break;
+        }
+        break;
+      }
+      if (!valid)
+        break;
+
+      islandEnd = cur->siteE;
+      if (depth == 0) {
+        out.push_back({first->siteB, islandEnd, first->id});
+        i = j;
+        break;
+      }
+    }
+  }
+}
+
 /// Owner-specific hooks for the shared neutral conditional-island proof.
 ///
 /// The proof itself is owner-polymorphic: TU gaps, pure include-closure gaps,

@@ -730,6 +730,183 @@ static uint64_t sidebandBlockReplacementBEnd(
   return end;
 }
 
+
+enum class SidebandDiagnosticPragmaAction { Push, Pop, Setting };
+
+struct ParsedSidebandDiagnosticPragma {
+  StringRef namespaceName;
+  SidebandDiagnosticPragmaAction action =
+      SidebandDiagnosticPragmaAction::Setting;
+};
+
+static bool sidebandDiagnosticSettingAction(StringRef action) {
+  return action == "ignored" || action == "warning" || action == "error" ||
+         action == "fatal" || action == "remark";
+}
+
+static bool consumeSidebandDiagnosticOptionString(StringRef text, size_t &pos,
+                                                  size_t end) {
+  stringutils::skipWsNoLF(text, pos, end);
+  if (pos >= end || text[pos] != '"')
+    return false;
+
+  ++pos;
+  while (pos < end) {
+    const char c = text[pos++];
+    if (c == '\\') {
+      if (pos >= end)
+        return false;
+      ++pos;
+      continue;
+    }
+    if (c == '"')
+      return true;
+    if (c == '\n' || c == '\r')
+      return false;
+  }
+  return false;
+}
+
+/// Parse the small pragma-state language that may be carried by an ordinary
+/// token replacement hunk.
+///
+/// Sideband pragma normalization happens before the refold engine has a chance
+/// to prove source-gap ownership.  Therefore the frontend must know exactly
+/// which pragma lines are safe to remove from the structural token stream when
+/// those same raw B bytes are already inside an ordinary replacement payload.
+/// Keep the admitted language identical to the engine-side Step 3 invariant:
+/// only Clang/GCC diagnostic push/pop/settings participate, settings are useful
+/// only while a pushed frame is active, and unknown pragmas remain outside the
+/// sideband carry proof.
+static std::optional<ParsedSidebandDiagnosticPragma>
+parseSidebandDiagnosticPragma(StringRef canonicalText) {
+  const size_t end = canonicalText.size();
+  size_t pos = 0;
+
+  if (!stringutils::consumeDirectiveHash(canonicalText, pos, end))
+    return std::nullopt;
+
+  StringRef word;
+  if (!stringutils::consumeIdentifier(canonicalText, pos, end, word) ||
+      word != "pragma")
+    return std::nullopt;
+
+  stringutils::skipWsNoLF(canonicalText, pos, end);
+  StringRef namespaceName;
+  if (!stringutils::consumeIdentifier(canonicalText, pos, end,
+                                      namespaceName) ||
+      (namespaceName != "clang" && namespaceName != "GCC"))
+    return std::nullopt;
+
+  stringutils::skipWsNoLF(canonicalText, pos, end);
+  if (!stringutils::consumeIdentifier(canonicalText, pos, end, word) ||
+      word != "diagnostic")
+    return std::nullopt;
+
+  stringutils::skipWsNoLF(canonicalText, pos, end);
+  StringRef action;
+  if (!stringutils::consumeIdentifier(canonicalText, pos, end, action))
+    return std::nullopt;
+
+  ParsedSidebandDiagnosticPragma parsed;
+  parsed.namespaceName = namespaceName;
+  if (action == "push") {
+    parsed.action = SidebandDiagnosticPragmaAction::Push;
+  } else if (action == "pop") {
+    parsed.action = SidebandDiagnosticPragmaAction::Pop;
+  } else if (sidebandDiagnosticSettingAction(action)) {
+    if (!consumeSidebandDiagnosticOptionString(canonicalText, pos, end))
+      return std::nullopt;
+    parsed.action = SidebandDiagnosticPragmaAction::Setting;
+  } else {
+    return std::nullopt;
+  }
+
+  if (!isOnlyWhitespaceForSidebandBlock(canonicalText.drop_front(pos)))
+    return std::nullopt;
+  return parsed;
+}
+
+struct BalancedSidebandDiagnosticPragmaIsland {
+  uint64_t begin = 0;
+  uint64_t end = 0;
+  uint64_t normalTokenGap = 0;
+};
+
+/// Find contiguous sideband pragma blocks with identity diagnostic state.
+///
+/// This is intentionally a replay-surface proof, not a source proof.  It only
+/// says that the raw `.i` sideband block may be treated as state-neutral at its
+/// boundaries and therefore may be carried by the ordinary B replacement bytes
+/// if the source owner proof later accepts the matching source gap.  Every line
+/// in the island must live in one normal-token gap; if ordinary tokens separate
+/// two pragma lines, they are not one local state island for this purpose.
+static std::vector<BalancedSidebandDiagnosticPragmaIsland>
+collectBalancedSidebandDiagnosticPragmaIslands(
+    ArrayRef<SidebandPragmaLine> lines) {
+  std::vector<BalancedSidebandDiagnosticPragmaIsland> islands;
+
+  for (uint64_t i = 0; i < lines.size();) {
+    std::optional<ParsedSidebandDiagnosticPragma> first =
+        parseSidebandDiagnosticPragma(
+            lines[static_cast<size_t>(i)].canonicalText);
+    if (!first || first->action != SidebandDiagnosticPragmaAction::Push) {
+      ++i;
+      continue;
+    }
+
+    const uint64_t gap = lines[static_cast<size_t>(i)].normalTokenGap;
+    unsigned depth = 0;
+    bool foundIsland = false;
+
+    for (uint64_t j = i; j < lines.size(); ++j) {
+      const SidebandPragmaLine &line = lines[static_cast<size_t>(j)];
+      if (line.normalTokenGap != gap)
+        break;
+
+      std::optional<ParsedSidebandDiagnosticPragma> parsed =
+          parseSidebandDiagnosticPragma(line.canonicalText);
+      if (!parsed || parsed->namespaceName != first->namespaceName)
+        break;
+
+      bool validAction = true;
+      switch (parsed->action) {
+      case SidebandDiagnosticPragmaAction::Push:
+        ++depth;
+        break;
+      case SidebandDiagnosticPragmaAction::Pop:
+        if (depth == 0) {
+          validAction = false;
+          break;
+        }
+        --depth;
+        break;
+      case SidebandDiagnosticPragmaAction::Setting:
+        if (depth == 0) {
+          validAction = false;
+          break;
+        }
+        break;
+      }
+      if (!validAction)
+        break;
+
+      if (depth == 0) {
+        islands.push_back({i, j + 1, gap});
+        i = j + 1;
+        foundIsland = true;
+        break;
+      }
+    }
+
+    if (!foundIsland)
+      ++i;
+  }
+
+  return islands;
+}
+
+
 static std::vector<JsonPragmaItem>
 collectJsonPragmaItems(const json::Object &rootJson, StringRef refoldMapPath) {
   std::vector<JsonPragmaItem> out;
@@ -1555,6 +1732,128 @@ static bool buildSidebandPragmaSourceEdits(
       diffutils::lcsMapAB(normalA, normalB, sidebandOwnerDepthGap);
   std::vector<diffutils::Hunk> normalHunks = diffutils::hunksFromMap(
       normalA2B, normalA.size(), normalB.size());
+
+  auto sidebandIslandTextMatches = [&](ArrayRef<SidebandPragmaLine> lhsLines,
+                                      uint64_t lhsBegin, uint64_t lhsEnd,
+                                      ArrayRef<SidebandPragmaLine> rhsLines,
+                                      uint64_t rhsBegin, uint64_t rhsEnd) {
+    if (lhsEnd < lhsBegin || rhsEnd < rhsBegin ||
+        lhsEnd - lhsBegin != rhsEnd - rhsBegin)
+      return false;
+    for (uint64_t i = 0; i < lhsEnd - lhsBegin; ++i) {
+      if (lhsLines[static_cast<size_t>(lhsBegin + i)].canonicalText !=
+          rhsLines[static_cast<size_t>(rhsBegin + i)].canonicalText)
+        return false;
+    }
+    return true;
+  };
+
+  auto ordinaryReplacementCarriesSidebandIsland =
+      [&](const BalancedSidebandDiagnosticPragmaIsland &aIsland,
+          const BalancedSidebandDiagnosticPragmaIsland &bIsland) {
+        for (const diffutils::Hunk &normalHunk : normalHunks) {
+          if (!normalHunk.isReplace())
+            continue;
+
+          // The A-side gap must be strictly inside the replaced normal-token
+          // interval: a boundary pragma belongs to neighboring preserved source,
+          // not to the owner envelope consumed by this ordinary hunk.  The
+          // B-side gap must be inside the raw B replacement byte envelope.  A
+          // gap at `bEnd` is still carried, because the emitted byte slice ends
+          // at the next preserved normal token and therefore includes sideband
+          // directive lines immediately before that token.
+          if (normalHunk.aStart < aIsland.normalTokenGap &&
+              aIsland.normalTokenGap < normalHunk.aEnd &&
+              normalHunk.bStart < bIsland.normalTokenGap &&
+              bIsland.normalTokenGap <= normalHunk.bEnd)
+            return true;
+        }
+        return false;
+      };
+
+  std::vector<SidebandPragmaLine> ordinaryCarriedKeptALines;
+  std::vector<SidebandPragmaLine> ordinaryCarriedKeptBLines;
+
+  auto dropOrdinaryCarriedBalancedSidebandIslands = [&]() -> bool {
+    std::vector<BalancedSidebandDiagnosticPragmaIsland> aIslands =
+        collectBalancedSidebandDiagnosticPragmaIslands(aLines);
+    std::vector<BalancedSidebandDiagnosticPragmaIsland> bIslands =
+        collectBalancedSidebandDiagnosticPragmaIslands(bLines);
+    if (aIslands.empty() || bIslands.empty())
+      return false;
+
+    std::vector<bool> dropA(aLines.size(), false);
+    std::vector<bool> dropB(bLines.size(), false);
+    bool changed = false;
+
+    // A balanced diagnostic island that is textually preserved in B and whose
+    // replay bytes are already inside one ordinary replacement hunk should not
+    // participate in the sideband-edit diff.  Its source placement is discharged
+    // later by the owner-gap proof; keeping its directive tokens here would make
+    // the frontend reject the refold map before that proof can run.
+    for (const BalancedSidebandDiagnosticPragmaIsland &aIsland : aIslands) {
+      bool aAlreadyDropped = false;
+      for (uint64_t a = aIsland.begin; a < aIsland.end; ++a)
+        aAlreadyDropped |= dropA[static_cast<size_t>(a)];
+      if (aAlreadyDropped)
+        continue;
+
+      for (const BalancedSidebandDiagnosticPragmaIsland &bIsland : bIslands) {
+        bool bAlreadyDropped = false;
+        for (uint64_t b = bIsland.begin; b < bIsland.end; ++b)
+          bAlreadyDropped |= dropB[static_cast<size_t>(b)];
+        if (bAlreadyDropped)
+          continue;
+
+        if (!sidebandIslandTextMatches(aLines, aIsland.begin, aIsland.end,
+                                       bLines, bIsland.begin, bIsland.end))
+          continue;
+        if (!ordinaryReplacementCarriesSidebandIsland(aIsland, bIsland))
+          continue;
+
+        for (uint64_t a = aIsland.begin; a < aIsland.end; ++a)
+          dropA[static_cast<size_t>(a)] = true;
+        for (uint64_t b = bIsland.begin; b < bIsland.end; ++b)
+          dropB[static_cast<size_t>(b)] = true;
+        changed = true;
+        break;
+      }
+    }
+
+    if (!changed)
+      return false;
+
+    ordinaryCarriedKeptALines.clear();
+    ordinaryCarriedKeptBLines.clear();
+    ordinaryCarriedKeptALines.reserve(aLines.size());
+    ordinaryCarriedKeptBLines.reserve(bLines.size());
+    for (uint64_t a = 0; a < aLines.size(); ++a)
+      if (!dropA[static_cast<size_t>(a)])
+        ordinaryCarriedKeptALines.push_back(aLines[static_cast<size_t>(a)]);
+    for (uint64_t b = 0; b < bLines.size(); ++b)
+      if (!dropB[static_cast<size_t>(b)])
+        ordinaryCarriedKeptBLines.push_back(bLines[static_cast<size_t>(b)]);
+
+    trace("pragma/sideband",
+          "ordinary hunk carries {0} A-side and {1} B-side balanced "
+          "diagnostic pragma line(s); excluding them from sideband diff",
+          aLines.size() - ordinaryCarriedKeptALines.size(),
+          bLines.size() - ordinaryCarriedKeptBLines.size());
+
+    // Re-slice the local ArrayRefs over owner storage that lives until this
+    // function returns.  The caller still filters the original raw token arrays;
+    // these narrowed views are only for deciding which sideband lines require
+    // explicit source edits beyond ordinary-hunk replay.
+    aLines = ArrayRef<SidebandPragmaLine>(ordinaryCarriedKeptALines);
+    bLines = ArrayRef<SidebandPragmaLine>(ordinaryCarriedKeptBLines);
+    return true;
+  };
+
+  if (dropOrdinaryCarriedBalancedSidebandIslands()) {
+    if (aLines.empty() && bLines.empty())
+      return true;
+    aToPragma = mapSidebandLinesToPragmaItems(aLines, pragmas, includes);
+  }
 
   auto sidebandInsertionIsCarriedByOrdinaryInsertion =
       [&](uint64_t bStart, uint64_t bEnd) -> bool {
