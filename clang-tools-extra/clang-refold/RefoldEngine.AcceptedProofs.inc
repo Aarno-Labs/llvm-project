@@ -174,6 +174,17 @@ RefoldEngine::ValidateInvocationPreservingProofImpl(
                       ProofFailureReason::UnexpectedPasteSurface);
     break;
 
+  case MacroPatchProofKind::PasteDerivedCalleeSelector:
+    // The selector-substitution builder validates the hard semantic witness
+    // before stamping the patch: a single existing pasted-callee target must
+    // reproduce the edited B expansion, the original target must reproduce the
+    // A expansion under the same non-selector arguments, and the root edit must
+    // rewrite only the proved selector argument. Keep validation here to the
+    // common invocation-preserving obligations above so compatible same-root
+    // merges do not become invalid merely because their materialized edit-map
+    // subrange is no longer representable as one selector slice.
+    break;
+
   case MacroPatchProofKind::DagSubtreeRoot:
     discharge.Require(patch.subtreeCertBacked,
                       ProofObligationKind::MacroSubtreeCertificateTracked,
@@ -406,6 +417,7 @@ RefoldEngine::ProofDischargeRecord RefoldEngine::ValidateIncludePreservingProof(
   case AcceptedPathKind::MacroCallChainSuffix:
   case AcceptedPathKind::MacroCounterLiteral:
   case AcceptedPathKind::MacroWholeCoverRealization:
+  case AcceptedPathKind::MacroPasteDerivedCalleeSelector:
   case AcceptedPathKind::TUExactSlotBoundary:
   case AcceptedPathKind::TUProvableInsertionAnchor:
   case AcceptedPathKind::TUByteSpanMappedEdit:
@@ -579,6 +591,7 @@ RefoldEngine::ValidateTUAnchorProof(AcceptedPathKind currentPath,
   case AcceptedPathKind::MacroCallChainSuffix:
   case AcceptedPathKind::MacroCounterLiteral:
   case AcceptedPathKind::MacroWholeCoverRealization:
+  case AcceptedPathKind::MacroPasteDerivedCalleeSelector:
   case AcceptedPathKind::IncludePatchPendingMaterialization:
   case AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens:
   case AcceptedPathKind::IncludeInsertSelectedConditionalBoundary:

@@ -1605,6 +1605,7 @@ private:
   REFOLD_X(MacroArgsOnlyPasteMulti) \
   REFOLD_X(MacroArgsOnlyPurePasteOnly) \
   REFOLD_X(MacroArgsOnlyPairedPureInsertion) \
+  REFOLD_X(MacroPasteDerivedCalleeSelector) \
   REFOLD_X(MacroDagSubtreeRoot) \
   REFOLD_X(MacroCallChainSuffix) \
   REFOLD_X(MacroCounterLiteral) \
@@ -1671,6 +1672,7 @@ private:
   REFOLD_X(MacroPasteMultiFixedAnchor, "MacroPasteMultiFixedAnchor") \
   REFOLD_X(MacroPurePasteOnly, "MacroPurePasteOnly") \
   REFOLD_X(MacroPairedPureInsertion, "MacroPairedPureInsertion") \
+  REFOLD_X(MacroPasteDerivedCalleeSelector, "MacroPasteDerivedCalleeSelector") \
   REFOLD_X(MacroDagLift, "MacroDagLift") \
   REFOLD_X(MacroCallChainSuffixPreservation, "MacroCallChainSuffixPreservation") \
   REFOLD_X(MacroCounterStabilizationRealization, "MacroCounterStabilizationRealization") \
@@ -2373,6 +2375,7 @@ private:
   REFOLD_X(ArgsOnlyPurePasteOnly) \
   REFOLD_X(ArgsOnlyStandard) \
   REFOLD_X(ArgsOnlyPairedPureInsertion) \
+  REFOLD_X(PasteDerivedCalleeSelector) \
   REFOLD_X(DagSubtreeRoot) \
   REFOLD_X(CallChainSuffix) \
   REFOLD_X(WholeCoverRealization)

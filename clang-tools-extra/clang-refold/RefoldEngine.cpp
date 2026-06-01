@@ -14640,6 +14640,9 @@ RefoldEngine::InventoryMacroPatchAcceptancePath(const MacroPatch &patch) const {
     // requirement explicit.
     return BuildAcceptancePathInventory(
         AcceptedPathKind::MacroArgsOnlyPairedPureInsertion);
+  case MacroPatchProofKind::PasteDerivedCalleeSelector:
+    return BuildAcceptancePathInventory(
+        AcceptedPathKind::MacroPasteDerivedCalleeSelector);
   case MacroPatchProofKind::DagSubtreeRoot:
     // DAG-preserving rewrites must carry the explicit subtree certificate
     // recorded on accepted root patches.
@@ -14685,6 +14688,10 @@ RefoldEngine::BuildAcceptancePathInventory(AcceptedPathKind currentPath) const {
   case AcceptedPathKind::MacroArgsOnlyPairedPureInsertion:
     inventory.support = AcceptanceSupportKind::ExplicitProofBacked;
     inventory.futureTarget = FutureProofTarget::MacroPairedPureInsertion;
+    break;
+  case AcceptedPathKind::MacroPasteDerivedCalleeSelector:
+    inventory.support = AcceptanceSupportKind::ExplicitProofBacked;
+    inventory.futureTarget = FutureProofTarget::MacroPasteDerivedCalleeSelector;
     break;
   case AcceptedPathKind::MacroDagSubtreeRoot:
     inventory.support = AcceptanceSupportKind::ExplicitProofBacked;
@@ -14929,6 +14936,11 @@ RefoldEngine::ClassifyMacroPatchProof(const MacroPatch &patch) const {
     // Paired pure insertion is only valid on non-paste direct arg/stringify
     // surfaces. The builder already enforces that; the proof record makes the
     // requirement explicit.
+  case MacroPatchProofKind::PasteDerivedCalleeSelector:
+    // Paste-derived callee selector substitution is structure-preserving: the
+    // emitted edit rewrites only a root invocation argument, after proving that
+    // a unique existing pasted callee macro exactly explains the edited B
+    // expansion under the same non-selector arguments.
   case MacroPatchProofKind::DagSubtreeRoot:
     // DAG-preserving rewrites must carry the explicit subtree certificate
     // recorded on accepted root patches.
@@ -15151,6 +15163,7 @@ RefoldEngine::ProofSummary RefoldEngine::BuildAcceptedPathProofSummary(
   case AcceptedPathKind::MacroArgsOnlyPasteMulti:
   case AcceptedPathKind::MacroArgsOnlyPurePasteOnly:
   case AcceptedPathKind::MacroArgsOnlyPairedPureInsertion:
+  case AcceptedPathKind::MacroPasteDerivedCalleeSelector:
   case AcceptedPathKind::MacroDagSubtreeRoot:
   case AcceptedPathKind::MacroCallChainSuffix:
   case AcceptedPathKind::MacroCounterLiteral:
@@ -26072,6 +26085,671 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         candidate.macroId = existingPatch->macroId;
     };
 
+    /// Build a structure-preserving root patch for the Step-5 selector case:
+    /// a descendant macro callee was produced by token pasting, the edited
+    /// surface changes body-owned tokens of the selected callee, and another
+    /// *already-active* macro reachable through the same paste expression
+    /// exactly explains B under the same non-selector arguments.
+    ///
+    /// This is intentionally not a macro-definition rewrite.  The only emitted
+    /// source edit is a root invocation argument replacement, such as
+    /// `DISPATCH(ONE, 10)` -> `DISPATCH(TWO, 10)`.  The proof is fail-closed:
+    /// there must be exactly one active alternate macro target, the original
+    /// target must reproduce the A cover using the same local expansion model,
+    /// the alternate target must reproduce the B cover, and the pasted-name
+    /// witness must identify one unique root selector argument to rewrite.
+    auto tryPasteDerivedCalleeSelectorSubstitution =
+        [&]() -> std::optional<MacroPatch> {
+      StringRef invSpanText = !baseInvText.empty()
+                              ? baseInvText
+                              : (m.invText ? StringRef(*m.invText)
+                                           : StringRef(""));
+      if (m.subkind != "func" || !InvocationSpanMatchesCallsitePrefix(invSpanText, m) ||
+          !m.invB || !m.invE)
+        return std::nullopt;
+
+      auto rootArgRangesOpt = GetMacroInvocationFormalArgContentRanges(m, invSpanText);
+      if (!rootArgRangesOpt)
+        return std::nullopt;
+      const auto &rootArgRanges = *rootArgRangesOpt;
+
+      // This selector proof deliberately parses only the narrow macro
+      // definition grammar it can replay exactly: active function-like
+      // #defines with named formals and a replacement body that can be
+      // checked token-for-token.  Anything outside that grammar is left to the
+      // existing realization/fallback paths instead of being guessed.
+      struct ParsedFunctionMacroDirective {
+        const RefoldModel::MacroDirective *directive = nullptr;
+        std::string name;
+        SmallVector<std::string, 4> params;
+        std::string body;
+      };
+
+      // Macro-state lookup below needs a cheap name parser for both #define
+      // and #undef records.  This helper intentionally returns only the
+      // directive name; the function-like/body parser below is used only after
+      // the active state has been proven to be a #define.
+      auto parseDirectiveNameOnly = [](StringRef text, StringRef expectedSubkind)
+          -> std::optional<std::string> {
+        StringRef s = text.ltrim();
+        if (!s.consume_front("#"))
+          return std::nullopt;
+        s = s.ltrim();
+        StringRef keyword = expectedSubkind.drop_front();
+        if (!s.consume_front(keyword))
+          return std::nullopt;
+        if (!s.empty() && stringutils::isIdentPart(s.front()))
+          return std::nullopt;
+        s = s.ltrim();
+        if (s.empty() || !stringutils::isIdentStart(s.front()))
+          return std::nullopt;
+        size_t end = 1;
+        while (end < s.size() && stringutils::isIdentPart(s[end]))
+          ++end;
+        return s.take_front(end).str();
+      };
+
+      // Parse the active candidate definition into the pieces needed for the
+      // local expansion proof.  The parser is intentionally syntactic and
+      // fail-closed: complex replacement-list behavior is not reinterpreted
+      // unless the later token-by-token replay proof can discharge it.
+      auto parseFunctionMacroDirective =
+          [&](const RefoldModel::MacroDirective &directive)
+          -> std::optional<ParsedFunctionMacroDirective> {
+        if (directive.subkind != "#define")
+          return std::nullopt;
+        StringRef text = directive.text;
+        size_t pos = 0;
+        stringutils::skipNonNewlineWs(text, pos);
+        if (pos >= text.size() || text[pos] != '#')
+          return std::nullopt;
+        ++pos;
+        stringutils::skipNonNewlineWs(text, pos);
+        StringRef keyword = "define";
+        if (!text.substr(pos).starts_with(keyword))
+          return std::nullopt;
+        pos += keyword.size();
+        if (pos < text.size() && stringutils::isIdentPart(text[pos]))
+          return std::nullopt;
+        stringutils::skipNonNewlineWs(text, pos);
+        const size_t nameBegin = pos;
+        if (pos >= text.size() || !stringutils::isIdentStart(text[pos]))
+          return std::nullopt;
+        ++pos;
+        while (pos < text.size() && stringutils::isIdentPart(text[pos]))
+          ++pos;
+        std::string name = text.slice(nameBegin, pos).str();
+
+        // Function-like macro definitions require the opening parenthesis to be
+        // immediately adjacent to the macro name.  If whitespace intervenes,
+        // this is an object-like macro whose replacement text happens to start
+        // with `(`, which is not a valid callee-selector target here.
+        if (pos >= text.size() || text[pos] != '(')
+          return std::nullopt;
+        ++pos;
+
+        SmallVector<std::string, 4> params;
+        while (pos < text.size()) {
+          stringutils::skipNonNewlineWs(text, pos);
+          if (pos < text.size() && text[pos] == ')') {
+            ++pos;
+            break;
+          }
+          if (pos >= text.size() || !stringutils::isIdentStart(text[pos]))
+            return std::nullopt;
+          const size_t paramBegin = pos;
+          ++pos;
+          while (pos < text.size() && stringutils::isIdentPart(text[pos]))
+            ++pos;
+          params.push_back(text.slice(paramBegin, pos).str());
+          stringutils::skipNonNewlineWs(text, pos);
+          if (pos < text.size() && text[pos] == ',') {
+            ++pos;
+            continue;
+          }
+          if (pos < text.size() && text[pos] == ')') {
+            ++pos;
+            break;
+          }
+          return std::nullopt;
+        }
+        if (pos > text.size())
+          return std::nullopt;
+        StringRef body = text.drop_front(pos);
+        if (!body.empty() && body.back() == '\n')
+          body = body.drop_back();
+        ParsedFunctionMacroDirective parsed;
+        parsed.directive = &directive;
+        parsed.name = std::move(name);
+        parsed.params = std::move(params);
+        parsed.body = body.trim().str();
+        return parsed;
+      };
+
+      // Resolve the macro state at a specific producer item id.  The selector
+      // substitution may only reuse an existing macro definition that was
+      // active at the original expansion point; it never edits an inactive or
+      // later definition into existence.
+      auto activeFunctionDefinitionBefore =
+          [&](uint64_t beforeItemId, StringRef name)
+          -> std::optional<ParsedFunctionMacroDirective> {
+        const RefoldModel::MacroDirective *active = nullptr;
+        for (const auto &directive : model_.GetMacroDirectives()) {
+          if (directive.id >= beforeItemId)
+            continue;
+          if (directive.subkind != "#define" && directive.subkind != "#undef")
+            continue;
+          std::optional<std::string> directiveName =
+              parseDirectiveNameOnly(directive.text, directive.subkind);
+          if (!directiveName || StringRef(*directiveName) != name)
+            continue;
+          if (!active || directive.id > active->id)
+            active = &directive;
+        }
+        if (!active || active->subkind != "#define")
+          return std::nullopt;
+        return parseFunctionMacroDirective(*active);
+      };
+
+      // Compare modeled expansions by raw token spelling rather than bytes.
+      // This keeps whitespace/layout differences from driving the proof while
+      // still requiring the preprocessor-visible token sequence to match
+      // exactly.
+      auto lexTokenSpellings = [&](StringRef text)
+          -> std::optional<SmallVector<std::string, 16>> {
+        SmallVector<std::string, 16> out;
+        const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
+        std::string lexBuf = text.str();
+        lexBuf.push_back('\0');
+        const char *bufStart = lexBuf.data();
+        const char *bufEnd = bufStart + text.size();
+        Lexer lexer(baseLoc, lexLang_, bufStart, bufStart, bufEnd);
+        lexer.SetCommentRetentionState(true);
+        Token token;
+        while (true) {
+          lexer.LexFromRawLexer(token);
+          if (token.is(tok::eof))
+            return out;
+          if (token.is(tok::comment))
+            continue;
+          const size_t b = tokenOffsetFromBase(token, baseLoc);
+          const size_t e = tokenEndOffsetFromBase(token, baseLoc);
+          if (e < b || e > text.size())
+            return std::nullopt;
+          out.push_back(text.slice(b, e).str());
+        }
+      };
+
+      auto tokenSpellingsEqual = [&](StringRef lhs, StringRef rhs) -> bool {
+        std::optional<SmallVector<std::string, 16>> lhsToks =
+            lexTokenSpellings(lhs);
+        std::optional<SmallVector<std::string, 16>> rhsToks =
+            lexTokenSpellings(rhs);
+        if (!lhsToks || !rhsToks || lhsToks->size() != rhsToks->size())
+          return false;
+        for (size_t i = 0; i < lhsToks->size(); ++i)
+          if ((*lhsToks)[i] != (*rhsToks)[i])
+            return false;
+        return true;
+      };
+
+      // Replay the restricted function-like macro grammar admitted by this
+      // proof.  Parameters are substituted textually into ordinary body tokens;
+      // '#' and '##' are rejected because those require full preprocessor
+      // semantics and would make selector substitution under-proven here.
+      auto expandSimpleFunctionMacro =
+          [&](const ParsedFunctionMacroDirective &definition,
+              ArrayRef<std::string> actualArgs) -> std::optional<std::string> {
+        if (definition.params.size() != actualArgs.size())
+          return std::nullopt;
+
+        DenseMap<StringRef, uint32_t> paramIndex;
+        for (uint32_t i = 0; i < definition.params.size(); ++i)
+          paramIndex[StringRef(definition.params[i])] = i;
+
+        StringRef body = definition.body;
+        const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
+        std::string lexBuf = body.str();
+        lexBuf.push_back('\0');
+        const char *bufStart = lexBuf.data();
+        const char *bufEnd = bufStart + body.size();
+        Lexer lexer(baseLoc, lexLang_, bufStart, bufStart, bufEnd);
+        lexer.SetCommentRetentionState(true);
+
+        std::string expanded;
+        expanded.reserve(body.size() + 32);
+        size_t cursor = 0;
+        Token token;
+        while (true) {
+          lexer.LexFromRawLexer(token);
+          if (token.is(tok::eof))
+            break;
+          if (token.is(tok::comment))
+            continue;
+          if (token.is(tok::hash) || token.is(tok::hashhash))
+            return std::nullopt;
+          const size_t b = tokenOffsetFromBase(token, baseLoc);
+          const size_t e = tokenEndOffsetFromBase(token, baseLoc);
+          if (e < b || e > body.size() || b < cursor)
+            return std::nullopt;
+          expanded.append(body.begin() + cursor, body.begin() + b);
+          StringRef spelling = body.slice(b, e);
+          if (token.is(tok::raw_identifier) || token.is(tok::identifier)) {
+            auto it = paramIndex.find(spelling);
+            if (it != paramIndex.end())
+              expanded.append(actualArgs[it->second]);
+            else
+              expanded.append(spelling.begin(), spelling.end());
+          } else {
+            expanded.append(spelling.begin(), spelling.end());
+          }
+          cursor = e;
+        }
+        expanded.append(body.begin() + cursor, body.end());
+        return expanded;
+      };
+
+      // The selector rewrite is only for edits to body-owned tokens of the
+      // selected descendant callee.  If the hunk touches argument material or
+      // spans outside recorded body ownership, the existing macro patch classes
+      // remain responsible.
+      auto hunkWithinSpans = [](const diffutils::Hunk &hh,
+                                ArrayRef<RefoldModel::PPSpan> spans) {
+        for (const auto &sp : spans)
+          if (sp.begin <= hh.aStart && hh.aEnd <= sp.end && sp.begin < sp.end)
+            return true;
+        return false;
+      };
+
+      // Recover the selected callee's single ordinary argument from the PP
+      // cover by subtracting recorded body spans.  This deliberately admits the
+      // simple selector case only: every non-body gap must agree on one exact
+      // argument spelling, otherwise the alternate-callee expansion proof has
+      // no unique actual argument vector.
+      auto coverMinusBodySingleArg =
+          [&](const RefoldModel::MacroInvocation &leaf)
+          -> std::optional<SmallVector<std::string, 4>> {
+        if (leaf.defParams.size() != 1 || !leaf.cover.IsValid() ||
+            leaf.cover.begin >= leaf.cover.end)
+          return std::nullopt;
+
+        SmallVector<RefoldModel::PPSpan, 4> body;
+        body.append(leaf.bodySpans.begin(), leaf.bodySpans.end());
+        llvm::sort(body, [](const RefoldModel::PPSpan &lhs,
+                            const RefoldModel::PPSpan &rhs) {
+          if (lhs.begin != rhs.begin)
+            return lhs.begin < rhs.begin;
+          return lhs.end < rhs.end;
+        });
+
+        uint64_t cursor = leaf.cover.begin;
+        std::optional<std::string> argText;
+        for (const auto &sp : body) {
+          if (sp.end <= leaf.cover.begin || sp.begin >= leaf.cover.end)
+            continue;
+          const uint64_t b = std::max(cursor, leaf.cover.begin);
+          const uint64_t e = std::min<uint64_t>(sp.begin, leaf.cover.end);
+          if (b < e) {
+            StringRef gap = SliceASource(b, e).trim();
+            if (!gap.empty()) {
+              if (argText && *argText != gap)
+                return std::nullopt;
+              argText = gap.str();
+            }
+          }
+          cursor = std::max<uint64_t>(cursor, std::min<uint64_t>(sp.end, leaf.cover.end));
+        }
+        if (cursor < leaf.cover.end) {
+          StringRef gap = SliceASource(cursor, leaf.cover.end).trim();
+          if (!gap.empty()) {
+            if (argText && *argText != gap)
+              return std::nullopt;
+            argText = gap.str();
+          }
+        }
+        if (!argText)
+          return std::nullopt;
+        SmallVector<std::string, 4> out;
+        out.push_back(std::move(*argText));
+        return out;
+      };
+
+      // Build an invocation index so provenance walks can climb from the
+      // descendant callee back to the root invocation deterministically by
+      // producer-recorded caller ids.
+      DenseMap<uint64_t, const RefoldModel::MacroInvocation *> invById;
+      for (const auto &mi : model_.GetMacroInvocations())
+        invById[mi.id] = &mi;
+
+      auto depthToRoot = [&](const RefoldModel::MacroInvocation &cand)
+          -> std::optional<unsigned> {
+        unsigned d = 0;
+        std::optional<uint64_t> p = cand.callerMacroId;
+        while (p) {
+          ++d;
+          if (*p == m.id)
+            return d;
+          auto it = invById.find(*p);
+          if (it == invById.end())
+            break;
+          p = it->second->callerMacroId;
+        }
+        return std::nullopt;
+      };
+
+      // Follow a paste helper's argument provenance back to the root invocation
+      // formal.  The rewrite is allowed only when each hop has exactly one
+      // caller-parameter reference; multi-source or opaque provenance would make
+      // the selector byte to rewrite ambiguous.
+      auto resolveInvocationArgToRootFormal =
+          [&](const RefoldModel::MacroInvocation &inv, uint32_t argIdx)
+          -> std::optional<uint32_t> {
+        const RefoldModel::MacroInvocation *cur = &inv;
+        uint32_t slot = argIdx;
+        while (cur->id != m.id) {
+          if (!cur->callerMacroId || slot >= cur->argRefs.size() ||
+              cur->argRefs[slot].size() != 1)
+            return std::nullopt;
+          const RefoldModel::InvArgRef &ref = cur->argRefs[slot].front();
+          auto parentIt = invById.find(*cur->callerMacroId);
+          if (parentIt == invById.end())
+            return std::nullopt;
+          cur = parentIt->second;
+          slot = ref.callerParamIndex;
+        }
+        if (slot >= rootArgRanges.size())
+          return std::nullopt;
+        return slot;
+      };
+
+      // A selector witness identifies the one root argument whose spelling is
+      // responsible for the paste-derived part of the callee name, plus the
+      // replacement spelling that would produce the candidate macro name.
+      struct SelectorRewriteWitness {
+        uint32_t rootArgIdx = 0;
+        std::string oldSelector;
+        std::string newSelector;
+      };
+
+      // Invert the recorded paste expression against a candidate macro name.
+      // Literal paste parts must match exactly; argument-derived parts must map
+      // to the same root selector argument.  If the next literal anchor is
+      // missing or appears more than once, the split is ambiguous and the proof
+      // rejects.
+      auto deriveSelectorRewriteForCandidateName =
+          [&](const RefoldModel::MacroInvocation &pasteInvocation,
+              const RefoldModel::PasteToken &witness, StringRef candidateName)
+          -> std::optional<SelectorRewriteWitness> {
+        if (candidateName.empty())
+          return std::nullopt;
+        size_t candidatePos = 0;
+        std::optional<uint32_t> rootSelectorArg;
+        std::string oldSelector;
+        std::string newSelector;
+
+        for (size_t i = 0; i < witness.parts.size(); ++i) {
+          const RefoldModel::PastePart &part = witness.parts[i];
+          if (part.kind == RefoldModel::PastePartKind::Literal) {
+            StringRef lit = part.spelling;
+            if (!candidateName.substr(candidatePos).starts_with(lit))
+              return std::nullopt;
+            candidatePos += lit.size();
+            continue;
+          }
+
+          if (part.kind != RefoldModel::PastePartKind::Arg || !part.argIndex)
+            return std::nullopt;
+
+          std::optional<uint32_t> rootArg =
+              resolveInvocationArgToRootFormal(pasteInvocation, *part.argIndex);
+          if (!rootArg) {
+            // Some paste parts are argument-derived only from the immediate
+            // paste helper's point of view, but their invocation argument is
+            // fixed replacement-list text in the parent macro rather than a
+            // caller selector.  Treat such parts as literal anchors only when
+            // the producer recorded no caller-parameter refs for that helper
+            // argument; any missing or multi-ref provenance remains outside
+            // this selector-substitution proof.
+            if (*part.argIndex >= pasteInvocation.argRefs.size() ||
+                !pasteInvocation.argRefs[*part.argIndex].empty())
+              return std::nullopt;
+            StringRef fixed = part.spelling;
+            if (!candidateName.substr(candidatePos).starts_with(fixed))
+              return std::nullopt;
+            candidatePos += fixed.size();
+            continue;
+          }
+          if (rootSelectorArg && *rootSelectorArg != *rootArg)
+            return std::nullopt;
+          rootSelectorArg = rootArg;
+
+          StringRef nextLiteral;
+          for (size_t j = i + 1; j < witness.parts.size(); ++j) {
+            if (witness.parts[j].kind == RefoldModel::PastePartKind::Literal) {
+              nextLiteral = witness.parts[j].spelling;
+              break;
+            }
+            if (witness.parts[j].kind == RefoldModel::PastePartKind::Arg)
+              return std::nullopt;
+          }
+
+          StringRef replacementPart;
+          if (nextLiteral.empty()) {
+            replacementPart = candidateName.drop_front(candidatePos);
+            candidatePos = candidateName.size();
+          } else {
+            size_t found = candidateName.find(nextLiteral, candidatePos);
+            if (found == StringRef::npos)
+              return std::nullopt;
+            if (candidateName.find(nextLiteral, found + 1) != StringRef::npos)
+              return std::nullopt;
+            replacementPart = candidateName.slice(candidatePos, found);
+            candidatePos = found;
+          }
+
+          oldSelector.append(part.spelling.begin(), part.spelling.end());
+          newSelector.append(replacementPart.begin(), replacementPart.end());
+        }
+
+        if (candidatePos != candidateName.size() || !rootSelectorArg)
+          return std::nullopt;
+        StringRef rootOld = invSpanText.slice(rootArgRanges[*rootSelectorArg].first,
+                                             rootArgRanges[*rootSelectorArg].second)
+                                .trim();
+        if (rootOld != oldSelector || StringRef(newSelector).empty() ||
+            rootOld == newSelector)
+          return std::nullopt;
+
+        SelectorRewriteWitness out;
+        out.rootArgIdx = *rootSelectorArg;
+        out.oldSelector = std::move(oldSelector);
+        out.newSelector = std::move(newSelector);
+        return out;
+      };
+
+      // Each candidate records one complete explanation of B: which descendant
+      // callee was edited, which active alternate macro definition explains the
+      // B-side cover, and what root invocation text would select that macro.
+      struct SelectorCandidate {
+        uint64_t leafId = 0;
+        uint64_t candidateDirectiveId = 0;
+        uint32_t rootArgIdx = 0;
+        uint64_t bTokStart = 0;
+        uint64_t bTokEnd = 0;
+        uint64_t newSelectorSize = 0;
+        std::string replacement;
+      };
+      SmallVector<SelectorCandidate, 4> candidates;
+
+      // Search descendants of the current root for the selected callee whose
+      // body-owned tokens contain the edited A hunk.  This prevents selector
+      // substitution from firing on unrelated paste tokens in the same root DAG.
+      for (const auto &leaf : model_.GetMacroInvocations()) {
+        if (leaf.id == m.id || leaf.subkind != "func")
+          continue;
+        std::optional<unsigned> depth = depthToRoot(leaf);
+        if (!depth || *depth == 0)
+          continue;
+        if (!leaf.cover.IsValid() || !(leaf.cover.begin <= hEff.aStart &&
+                                       hEff.aEnd <= leaf.cover.end) ||
+            !hunkWithinSpans(hEff, leaf.bodySpans))
+          continue;
+
+        // First prove that the original selected callee definition explains
+        // the A-side cover under the recovered non-selector arguments.  Without
+        // this baseline equality, replacing the selector would be relating B to
+        // a model that did not actually produce A.
+        std::optional<ParsedFunctionMacroDirective> currentDef =
+            activeFunctionDefinitionBefore(leaf.id, leaf.name);
+        if (!currentDef || (leaf.definitionDirectiveId &&
+                            currentDef->directive->id != *leaf.definitionDirectiveId))
+          continue;
+        std::optional<SmallVector<std::string, 4>> actualArgs =
+            coverMinusBodySingleArg(leaf);
+        if (!actualArgs)
+          continue;
+
+        std::optional<std::string> currentExpansion =
+            expandSimpleFunctionMacro(*currentDef, *actualArgs);
+        if (!currentExpansion ||
+            !tokenSpellingsEqual(*currentExpansion,
+                                 SliceASource(leaf.cover.begin, leaf.cover.end)))
+          continue;
+
+        // The alternate macro must explain exactly the B token envelope mapped
+        // from the selected callee's original PP cover.  The selector proof does
+        // not widen the edit or borrow neighboring B tokens.
+        std::optional<std::pair<size_t, size_t>> bEnv =
+            MapATokRangeAToBTokenEnvelope(leaf.cover.begin, leaf.cover.end);
+        if (!bEnv || bEnv->second <= bEnv->first)
+          continue;
+        StringRef bCover = SliceBSource(bEnv->first, bEnv->second);
+
+        // Walk from the edited leaf toward the root and inspect paste witnesses
+        // on each parent invocation.  A candidate is considered only when a
+        // recorded paste witness is the one that produced the selected callee
+        // name.
+        const RefoldModel::MacroInvocation *cur = &leaf;
+        while (cur->callerMacroId) {
+          auto parentIt = invById.find(*cur->callerMacroId);
+          if (parentIt == invById.end())
+            break;
+          const RefoldModel::MacroInvocation *parent = parentIt->second;
+          for (const RefoldModel::PasteToken &witness : parent->pasteTokens) {
+            if (witness.spelling != leaf.name)
+              continue;
+
+            // Enumerate existing macro definitions as possible selector
+            // targets.  This is a finite namespace proof over active definitions
+            // already present in the source; macro definitions are never
+            // modified or synthesized by this path.
+            for (const auto &directive : model_.GetMacroDirectives()) {
+              std::optional<ParsedFunctionMacroDirective> candidateDef =
+                  parseFunctionMacroDirective(directive);
+              if (!candidateDef || candidateDef->name == leaf.name)
+                continue;
+              std::optional<ParsedFunctionMacroDirective> activeCandidate =
+                  activeFunctionDefinitionBefore(m.id, candidateDef->name);
+              if (!activeCandidate ||
+                  activeCandidate->directive->id != candidateDef->directive->id)
+                continue;
+              if (candidateDef->params.size() != currentDef->params.size())
+                continue;
+
+              std::optional<SelectorRewriteWitness> selector =
+                  deriveSelectorRewriteForCandidateName(*parent, witness,
+                                                        candidateDef->name);
+              if (!selector)
+                continue;
+
+              std::optional<std::string> candidateExpansion =
+                  expandSimpleFunctionMacro(*candidateDef, *actualArgs);
+              if (!candidateExpansion ||
+                  !tokenSpellingsEqual(*candidateExpansion, bCover))
+                continue;
+
+              // Build the only source edit admitted by this proof: replace the
+              // selected root argument spelling and leave the rest of the root
+              // invocation unchanged.  The normal root replay validator still
+              // checks that the resulting callsite text is well-formed.
+              std::string replacement = invSpanText.str();
+              const auto &argRange = rootArgRanges[selector->rootArgIdx];
+              replacement.replace(argRange.first, argRange.second - argRange.first,
+                                  selector->newSelector);
+              if (!validateMergedDirectAndDagRootReplacement(invSpanText,
+                                                             replacement))
+                continue;
+
+              candidates.push_back(SelectorCandidate{
+                  leaf.id, candidateDef->directive->id, selector->rootArgIdx,
+                  static_cast<uint64_t>(bEnv->first),
+                  static_cast<uint64_t>(bEnv->second),
+                  static_cast<uint64_t>(selector->newSelector.size()),
+                  std::move(replacement)});
+            }
+          }
+          cur = parent;
+        }
+      }
+
+      if (candidates.empty())
+        return std::nullopt;
+
+      // Sort before uniqueness checking so diagnostics and tie handling are
+      // deterministic.  The proof accepts multiple witnesses only when they all
+      // lead to the exact same root replacement text; distinct selector rewrites
+      // are treated as ambiguous and rejected.
+      llvm::sort(candidates, [](const SelectorCandidate &lhs,
+                                const SelectorCandidate &rhs) {
+        if (lhs.replacement != rhs.replacement)
+          return lhs.replacement < rhs.replacement;
+        if (lhs.leafId != rhs.leafId)
+          return lhs.leafId < rhs.leafId;
+        if (lhs.candidateDirectiveId != rhs.candidateDirectiveId)
+          return lhs.candidateDirectiveId < rhs.candidateDirectiveId;
+        if (lhs.rootArgIdx != rhs.rootArgIdx)
+          return lhs.rootArgIdx < rhs.rootArgIdx;
+        if (lhs.bTokStart != rhs.bTokStart)
+          return lhs.bTokStart < rhs.bTokStart;
+        return lhs.bTokEnd < rhs.bTokEnd;
+      });
+
+      const std::string &chosenReplacement = candidates.front().replacement;
+      for (const SelectorCandidate &candidate : candidates)
+        if (candidate.replacement != chosenReplacement) {
+          trace("macro/dag",
+                "paste-derived callee selector substitution rejected: root "
+                "id={0} name='{1}' has multiple distinct selector rewrites",
+                m.id, m.name);
+          return std::nullopt;
+        }
+
+      // Stamp the accepted selector substitution as a structure-preserving root
+      // macro patch.  The materialized B token range records the descendant
+      // expansion that this selector explains, while the output byte range points
+      // at the rewritten root argument inside the replacement callsite text.
+      MacroPatch patch{*m.invB, *m.invE, chosenReplacement, m.id};
+      const auto &argRange = rootArgRanges[candidates.front().rootArgIdx];
+      patch.hasMaterializedBTokenRange = true;
+      patch.materializedBTokStart = candidates.front().bTokStart;
+      patch.materializedBTokEnd = candidates.front().bTokEnd;
+      patch.hasMaterializedOutputByteRange = true;
+      patch.materializedOutputByteStart = argRange.first;
+      patch.materializedOutputByteEnd = argRange.first +
+                                        candidates.front().newSelectorSize;
+      StampMacroPatchProof(patch,
+                           MacroPatchProofKind::PasteDerivedCalleeSelector,
+                           /*validated=*/true,
+                           /*structurePreserving=*/true, m.id);
+      trace("macro/dag",
+            "paste-derived callee selector substitution accepted: root id={0} "
+            "name='{1}' leaf id={2} candidateDirective=#{3} replacement='{4}'",
+            m.id, m.name, candidates.front().leafId,
+            candidates.front().candidateDirectiveId,
+            stringutils::showWsWithClip(patch.replacement, 160));
+      return patch;
+    };
+
     // Stage the DAG root replay as a final-selection candidate instead of
     // returning it immediately.
     //
@@ -26164,6 +26842,22 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               m.id, m.name);
           argsOnlyCandidate.reset();
           reuseExistingCallsitePatch = false;
+        }
+      }
+    }
+
+    // Try selector substitution only after ordinary DAG replay declined to
+    // produce a root candidate.  When accepted, it enters the same final macro
+    // candidate path as other DAG-root proofs so existing conflict handling and
+    // lattice selection remain authoritative.
+    if (!dagRootCandidate) {
+      if (std::optional<MacroPatch> selectorPatch =
+              tryPasteDerivedCalleeSelectorSubstitution()) {
+        mergeCurrentRootWithExistingCallsitePatch(
+            *selectorPatch, "paste-derived callee selector substitution");
+        if (!conflictingConcreteSubtreeWitnessForcesWholeCover) {
+          dagRootCandidate = std::move(*selectorPatch);
+          argsOnlyCandidate.reset();
         }
       }
     }
