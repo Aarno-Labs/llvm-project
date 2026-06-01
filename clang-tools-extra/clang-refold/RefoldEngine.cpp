@@ -9279,12 +9279,141 @@ RefoldEngine::FindProvableTUInsertionAnchor(uint64_t pp, StringRef tuPath,
     return leftInc->siteE;
   };
 
+  auto zeroTokenIncludeBoundaryAnchor = [&]() -> std::optional<uint64_t> {
+    struct ZeroTokenIncludeBoundaryCandidate {
+      const RefoldModel::IncludeItem *include = nullptr;
+      const RefoldModel::Slot *beforeSlot = nullptr;
+      const RefoldModel::Slot *afterSlot = nullptr;
+      uint64_t inferredPPGap = 0;
+    };
+
+    auto firstExactSlot = [&](StringRef kind, uint64_t includeId)
+        -> const RefoldModel::Slot * {
+      std::vector<const RefoldModel::Slot *> slots =
+          model_.FindSlots(tuPath, kind, includeId, std::nullopt);
+      return slots.empty() ? nullptr : slots.front();
+    };
+
+    auto inferCollapsedPPGap = [&](const RefoldModel::IncludeItem &include)
+        -> std::optional<uint64_t> {
+      // A zero-token include has no PP range of its own.  It can still be tied
+      // to a concrete PP gap when the nearest PP-producing material before and
+      // after the directive agree on the same boundary.  This is a bracketing
+      // proof, not a nearest-neighbor guess: disagreement means the zero-token
+      // owner lies in a PP interval with real material, so the TU anchor is not
+      // uniquely determined here.
+      uint64_t leftGap = 0;
+      uint64_t rightGap = model_.GetTokensCountA();
+
+      for (const auto &entry : model_.GetTokmap()) {
+        if (PathsEqual(entry.file, tuPath)) {
+          if (entry.e <= include.siteB)
+            leftGap = std::max(leftGap, entry.pp + 1);
+          if (entry.b >= include.siteE)
+            rightGap = std::min(rightGap, entry.pp);
+        }
+      }
+
+      for (const auto &other : model_.GetIncludes()) {
+        if (&other == &include || other.parent ||
+            !PathsEqual(other.sitePath, tuPath) || !other.cover.IsValid())
+          continue;
+        if (other.siteE <= include.siteB)
+          leftGap = std::max(leftGap, other.cover.end);
+        if (other.siteB >= include.siteE)
+          rightGap = std::min(rightGap, other.cover.begin);
+      }
+
+      if (leftGap != rightGap)
+        return std::nullopt;
+      return leftGap;
+    };
+
+    SmallVector<ZeroTokenIncludeBoundaryCandidate, 4> candidates;
+    for (const auto &include : model_.GetIncludes()) {
+      // This proof is deliberately limited to top-level TU include directives
+      // whose expansion produced no normal PP tokens.  Non-empty includes have
+      // token/cover evidence and must use the ordinary include/TU ownership
+      // paths; nested zero-token includes need their parent owner to host the
+      // insertion rather than a TU byte edit.
+      if (include.parent || !PathsEqual(include.sitePath, tuPath) ||
+          include.cover.IsValid())
+        continue;
+
+      const RefoldModel::Slot *beforeSlot =
+          firstExactSlot("before_include", include.id);
+      const RefoldModel::Slot *afterSlot = firstExactSlot("after_include",
+                                                          include.id);
+      if (!beforeSlot || !afterSlot)
+        continue;
+
+      // The source slots must name the concrete include directive line.  This
+      // keeps the proof tied to producer-recorded source structure instead of
+      // merely trusting an include item that lacks PP cover.
+      if (beforeSlot->b != include.siteB || afterSlot->b != include.siteE)
+        continue;
+
+      std::optional<uint64_t> inferredPPGap = inferCollapsedPPGap(include);
+      if (!inferredPPGap || *inferredPPGap != pp)
+        continue;
+
+      candidates.push_back(
+          ZeroTokenIncludeBoundaryCandidate{&include, beforeSlot, afterSlot,
+                                            *inferredPPGap});
+    }
+
+    if (candidates.empty())
+      return std::nullopt;
+
+    llvm::sort(candidates,
+               [](const ZeroTokenIncludeBoundaryCandidate &lhs,
+                  const ZeroTokenIncludeBoundaryCandidate &rhs) {
+                 if (lhs.beforeSlot->b != rhs.beforeSlot->b)
+                   return lhs.beforeSlot->b < rhs.beforeSlot->b;
+                 return lhs.include->id < rhs.include->id;
+               });
+
+    const ZeroTokenIncludeBoundaryCandidate &best = candidates.front();
+    TUAnchorWitness zeroTokenWitness;
+    zeroTokenWitness.evidence = TUAnchorEvidenceKind::ZeroTokenIncludeBoundary;
+    zeroTokenWitness.hasPPGap = true;
+    zeroTokenWitness.ppGap = pp;
+    zeroTokenWitness.hasTUByte = true;
+    zeroTokenWitness.tuByte = best.beforeSlot->b;
+    zeroTokenWitness.slotId = best.beforeSlot->id;
+    zeroTokenWitness.slotKind = best.beforeSlot->kind.str();
+    zeroTokenWitness.outsideIncludeCoverage = true;
+    zeroTokenWitness.ownerDepthStable = true;
+    if (witness)
+      *witness = zeroTokenWitness;
+
+    const AcceptedResultCandidate zeroTokenCandidate =
+        BuildAcceptedTUAnchorCandidate(
+            AcceptedPathKind::TUProvableInsertionAnchor, zeroTokenWitness);
+    trace("tu/anchor",
+          "provable TU insertion anchor: ppGap={0} -> zero-token include "
+          "boundary byte={1} include={2} beforeSlot={3} afterSlot={4} "
+          "candidate={5}",
+          pp, best.beforeSlot->b, best.include->id, best.beforeSlot->id,
+          best.afterSlot->id, FormatAcceptedResultCandidate(zeroTokenCandidate));
+    return best.beforeSlot->b;
+  };
+
   // Try the exact include-directive-boundary proof before the generic include
   // coverage wall. The boundary coordinate is allowed to equal the first token
   // of the right include expansion even though that makes
   // IncludeIdCoveringPPIndex report the right include as covering pp.
   if (auto includeAnchor = includeDirectiveBoundaryAnchor())
     return includeAnchor;
+
+  // A zero-token top-level include collapses to an outer TU PP gap.  When the
+  // producer supplied before/after include slots and the neighboring PP-bearing
+  // material brackets the directive at exactly this gap, preserve the include
+  // directive and anchor the insertion at the canonical outer boundary before
+  // the zero-token owner.  This prevents an empty conditional/header from being
+  // materialized merely to host a boundary-inherent insertion.
+  if (auto zeroTokenIncludeAnchor = zeroTokenIncludeBoundaryAnchor())
+    return zeroTokenIncludeAnchor;
 
   // A PP gap that lies inside an include expansion cannot be materialized as a
   // TU insertion. Fail closed before considering weaker local evidence.
@@ -14770,6 +14899,9 @@ bool RefoldEngine::TUAnchorWitnessHasProvableEvidence(
   case TUAnchorEvidenceKind::ImmediateLeftNeighbor:
     return witness.hasLeftNeighbor;
   case TUAnchorEvidenceKind::IncludeDirectiveBoundary:
+    return witness.hasLeftNeighbor && witness.hasRightNeighbor;
+  case TUAnchorEvidenceKind::ZeroTokenIncludeBoundary:
+    return witness.slotId != 0 && !witness.slotKind.empty();
   case TUAnchorEvidenceKind::CorroboratedRightNeighbor:
   case TUAnchorEvidenceKind::CorroboratedLeftNeighbor:
     return witness.hasLeftNeighbor && witness.hasRightNeighbor;

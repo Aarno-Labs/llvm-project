@@ -1923,6 +1923,7 @@ private:
   REFOLD_X(ImmediateRightNeighbor) \
   REFOLD_X(ImmediateLeftNeighbor) \
   REFOLD_X(IncludeDirectiveBoundary) \
+  REFOLD_X(ZeroTokenIncludeBoundary) \
   REFOLD_X(CorroboratedRightNeighbor) \
   REFOLD_X(CorroboratedLeftNeighbor)
 
@@ -2910,7 +2911,9 @@ private:
   ///   - exact TU-side macro "arg-like begin" anchors for wrapper/deferred
   ///     expansion shapes,
   ///   - immediate mapped TU neighbors when the gap is outside include
-  ///     coverage, or
+  ///     coverage,
+  ///   - a zero-token top-level include boundary bracketed by the same PP gap,
+  ///     or
   ///   - in non-strict mode, a bounded whitespace probe whose nearest mapped
   ///     neighbors on both sides agree on TU ownership without crossing an
   ///     owner-depth boundary.
