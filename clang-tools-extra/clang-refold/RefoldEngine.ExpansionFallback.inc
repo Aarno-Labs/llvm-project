@@ -5584,12 +5584,33 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     // Token-level mappings inside macro expansions often point only at the
     // macro name or argument bytes; if we kept only those token pieces, the
     // verifier would later see punctuation from the callsite, such as the
-    // parentheses in KEEP(2), as unexplained interstitial source.  The complete
+    // parentheses in KEEP(2), as unexplained interstitial source. The complete
     // macro callsite is the actual source artifact whose material is consumed,
     // so prove it once and tile the envelope with that whole interval.
-    for (const auto &m : model_.GetMacroInvocations())
-      if (macroInvocationMaterialIsConsumed(m))
-        sourcePieces.push_back({*m.invB, *m.invE});
+    //
+    // A recorded child invocation in a macro replacement list is not such a
+    // source artifact. For example, in `#define M() __COUNTER__`, the
+    // `__COUNTER__` record has consumed PP material when `M()` is replaced, but
+    // its spelling lives inside the preserved #define directive, not at the
+    // source site whose bytes should be overwritten. Treating that definition
+    // text as a required source piece widens the replacement envelope backward
+    // across unrelated TU code and turns a valid owner closure into a terminal
+    // fallback. The invariant is therefore: a macro source piece must be a
+    // complete consumed invocation site that is not inside a macro-state
+    // directive; macro-definition text is preserved or consumed only by the
+    // separate macro-directive/gap proofs.
+    for (const auto &m : model_.GetMacroInvocations()) {
+      if (!macroInvocationMaterialIsConsumed(m))
+        continue;
+      if (IsInvocationInsideDefineDirective(m)) {
+        trace("fallback",
+              "TU/include closure not using macro id={0} name='{1}' as a "
+              "source piece: invocation is inside a #define directive",
+              m.id, m.name);
+        continue;
+      }
+      sourcePieces.push_back({*m.invB, *m.invE});
+    }
 
     // The mixed proof is only for hunks that actually consume ordinary TU
     // spelling.  If no TU token was seen, the pure include-closure path is the
