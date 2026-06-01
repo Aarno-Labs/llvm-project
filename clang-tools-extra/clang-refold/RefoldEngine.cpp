@@ -25778,6 +25778,309 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     return "unknown";
   };
 
+  // Reject structure-preserving replay when the callsite's final macro
+  // environment is not the macro environment that produced B.
+  //
+  // This is the candidate-selection half of the Step 2 invariant.  A preserving
+  // macro patch for a callsite spelled inside a materialized header may replay
+  // B text before an active header-owned #define.  If that B text observes the
+  // definition, preserving the macro callsite would preprocess differently from
+  // B.  In that case this gate suppresses the preserving candidate so the final
+  // selector can choose a whole-cover/materialized candidate whose emission path
+  // is able to carry the macro-state directive to a stable boundary.
+  auto callsiteReplayObservesActiveHeaderMacroState =
+      [&](const MacroPatch &patch) {
+        // Only structure-preserving callsite replay can be unstable in this
+        // way.  Expanded/whole-cover candidates do not replay the callsite as a
+        // macro invocation, and TU-spelled invocations are handled by the TU
+        // macro-state repair paths rather than include-owner replay.
+        if (!patch.structurePreserving || patch.proofRootMacroId != m.id)
+          return false;
+        if (!InvocationSpanMatchesCallsitePrefix(patch.replacement, m))
+          return false;
+        if (!m.ownerIncludeId || !m.invFile)
+          return false;
+        if (PathsEqual(*m.invFile, model_.GetSourcePath()))
+          return false;
+
+        // Parse the macro name controlled by a recorded #define/#undef.  The
+        // replay-stability proof only moves or reasons about directives whose
+        // spelling can be tied back to a precise macro identifier.
+        auto parseMacroStateDirectiveName =
+            [](StringRef text,
+               StringRef expectedSubkind) -> std::optional<std::string> {
+          StringRef s = text.ltrim();
+          if (!s.consume_front("#"))
+            return std::nullopt;
+          s = s.ltrim();
+          StringRef keyword = expectedSubkind.drop_front();
+          if (!s.consume_front(keyword))
+            return std::nullopt;
+          if (!s.empty() && stringutils::isIdentPart(s.front()))
+            return std::nullopt;
+          s = s.ltrim();
+          if (s.empty() || !stringutils::isIdentStart(s.front()))
+            return std::nullopt;
+          size_t end = 1;
+          while (end < s.size() && stringutils::isIdentPart(s[end]))
+            ++end;
+          return s.take_front(end).str();
+        };
+
+        // Token pattern by which the replacement would observe the active
+        // header definition.
+        enum class HeaderObservationKind {
+          IdentifierToken,
+          FunctionLikeInvocation,
+        };
+
+        // Function-like #defines are observed only by NAME followed
+        // immediately by '('.  All other supported macro-state transitions use
+        // identifier-token observation.
+        auto observationKindForDirective =
+            [&](const RefoldModel::MacroDirective &directive,
+                StringRef macroName) {
+              if (directive.subkind != "#define")
+                return HeaderObservationKind::IdentifierToken;
+              StringRef text = directive.text;
+              size_t pos = 0;
+              stringutils::skipNonNewlineWs(text, pos);
+              if (pos >= text.size() || text[pos] != '#')
+                return HeaderObservationKind::IdentifierToken;
+              ++pos;
+              stringutils::skipNonNewlineWs(text, pos);
+              StringRef keyword = "define";
+              if (!text.substr(pos).starts_with(keyword))
+                return HeaderObservationKind::IdentifierToken;
+              pos += keyword.size();
+              if (pos < text.size() && stringutils::isIdentPart(text[pos]))
+                return HeaderObservationKind::IdentifierToken;
+              stringutils::skipNonNewlineWs(text, pos);
+              const size_t nameBegin = pos;
+              if (pos >= text.size() || !stringutils::isIdentStart(text[pos]))
+                return HeaderObservationKind::IdentifierToken;
+              ++pos;
+              while (pos < text.size() && stringutils::isIdentPart(text[pos]))
+                ++pos;
+              if (text.slice(nameBegin, pos) != macroName)
+                return HeaderObservationKind::IdentifierToken;
+              if (pos < text.size() && text[pos] == '(')
+                return HeaderObservationKind::FunctionLikeInvocation;
+              return HeaderObservationKind::IdentifierToken;
+            };
+
+        // Lex the replacement text and look for `name` as an identifier token,
+        // not as a substring.  This avoids suppressing valid candidates because
+        // of comments, string literals, or larger identifiers.
+        auto rawIdentifierAppears = [&](StringRef name, StringRef text) {
+          if (name.empty() || text.empty())
+            return false;
+          const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
+          std::string lexBuf = text.str();
+          lexBuf.push_back('\0');
+          const char *bufStart = lexBuf.data();
+          const char *bufEnd = bufStart + text.size();
+          Lexer lexer(baseLoc, lexLang_, bufStart, bufStart, bufEnd);
+          lexer.SetCommentRetentionState(true);
+          Token token;
+          while (true) {
+            lexer.LexFromRawLexer(token);
+            if (token.is(tok::eof))
+              return false;
+            if (token.is(tok::comment))
+              continue;
+            if (!token.is(tok::raw_identifier) && !token.is(tok::identifier))
+              continue;
+            const size_t localBegin = tokenOffsetFromBase(token, baseLoc);
+            const size_t localEnd = tokenEndOffsetFromBase(token, baseLoc);
+            if (localEnd < localBegin || localEnd > text.size())
+              continue;
+            if (text.slice(localBegin, localEnd) == name)
+              return true;
+          }
+        };
+
+        // Lex the replacement text and look for a function-like macro
+        // observation: an identifier token `name` immediately followed by a
+        // left-parenthesis token.
+        auto functionLikeInvocationAppears = [&](StringRef name,
+                                                 StringRef text) {
+          if (name.empty() || text.empty())
+            return false;
+          const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
+          std::string lexBuf = text.str();
+          lexBuf.push_back('\0');
+          const char *bufStart = lexBuf.data();
+          const char *bufEnd = bufStart + text.size();
+          Lexer lexer(baseLoc, lexLang_, bufStart, bufStart, bufEnd);
+          lexer.SetCommentRetentionState(true);
+          bool pendingName = false;
+          Token token;
+          while (true) {
+            lexer.LexFromRawLexer(token);
+            if (token.is(tok::eof))
+              return false;
+            if (token.is(tok::comment))
+              continue;
+            if (pendingName) {
+              if (token.is(tok::l_paren))
+                return true;
+              pendingName = false;
+            }
+            if (!token.is(tok::raw_identifier) && !token.is(tok::identifier))
+              continue;
+            const size_t localBegin = tokenOffsetFromBase(token, baseLoc);
+            const size_t localEnd = tokenEndOffsetFromBase(token, baseLoc);
+            if (localEnd < localBegin || localEnd > text.size())
+              continue;
+            pendingName = text.slice(localBegin, localEnd) == name;
+          }
+        };
+
+        // Decide whether this structure-preserving candidate would observe a
+        // specific active header directive if replayed at the current callsite.
+        auto replacementObservesDirective =
+            [&](const RefoldModel::MacroDirective &directive,
+                StringRef macroName) {
+              switch (observationKindForDirective(directive, macroName)) {
+              case HeaderObservationKind::IdentifierToken:
+                return rawIdentifierAppears(macroName, patch.replacement);
+              case HeaderObservationKind::FunctionLikeInvocation:
+                return functionLikeInvocationAppears(macroName,
+                                                     patch.replacement);
+              }
+              return true;
+            };
+
+        // Exact source interval for a macro-state directive in the header
+        // containing this invocation.  The interval is used only for ordering
+        // and active-state reconstruction in this admission check; movement is
+        // performed later by the materialization path.
+        struct HeaderDirectivePiece {
+          const RefoldModel::MacroDirective *directive = nullptr;
+          uint64_t begin = 0;
+          uint64_t end = 0;
+          std::string name;
+        };
+
+        // Lazily read the header bytes so directive intervals can be validated
+        // against the real file.  If the file cannot be read, this proof does
+        // not guess; it simply declines to suppress the candidate here and lets
+        // downstream validation/fallback handle the uncertainty.
+        std::optional<std::string> headerBytesStorage;
+        auto getHeaderBytes = [&]() -> std::optional<StringRef> {
+          if (headerBytesStorage)
+            return StringRef(*headerBytesStorage);
+          auto bufOrErr = MemoryBuffer::getFile(
+              lineDirs_.ToAbsolutePath(m.invFile->str()));
+          if (!bufOrErr)
+            return std::nullopt;
+          const MemoryBuffer &mb = **bufOrErr;
+          headerBytesStorage.emplace(mb.getBufferStart(), mb.getBufferEnd());
+          return StringRef(*headerBytesStorage);
+        };
+
+        // Reconstruct the full directive interval from the recorded macro-name
+        // byte and verify that it belongs to the same include owner and header
+        // file as the callsite.  Exact-text validation prevents unrelated
+        // directives with similar metadata from influencing replay admission.
+        auto directiveInterval =
+            [&](const RefoldModel::MacroDirective &directive)
+                -> std::optional<HeaderDirectivePiece> {
+          if (directive.subkind != "#define" && directive.subkind != "#undef")
+            return std::nullopt;
+          if (!directive.ownerIncludeId ||
+              *directive.ownerIncludeId != *m.ownerIncludeId)
+            return std::nullopt;
+          if (!PathsEqual(directive.sitePath, *m.invFile))
+            return std::nullopt;
+          std::optional<std::string> name =
+              parseMacroStateDirectiveName(directive.text, directive.subkind);
+          if (!name)
+            return std::nullopt;
+          StringRef text = directive.text;
+          size_t pos = 0;
+          stringutils::skipNonNewlineWs(text, pos);
+          if (pos >= text.size() || text[pos] != '#')
+            return std::nullopt;
+          ++pos;
+          stringutils::skipNonNewlineWs(text, pos);
+          StringRef keyword = directive.subkind.drop_front();
+          if (!text.substr(pos).starts_with(keyword))
+            return std::nullopt;
+          pos += keyword.size();
+          if (pos < text.size() && stringutils::isIdentPart(text[pos]))
+            return std::nullopt;
+          stringutils::skipNonNewlineWs(text, pos);
+          const size_t nameTextBegin = pos;
+          if (pos >= text.size() || !stringutils::isIdentStart(text[pos]))
+            return std::nullopt;
+          if (directive.siteB < nameTextBegin)
+            return std::nullopt;
+          const uint64_t fileBegin = directive.siteB - nameTextBegin;
+          const uint64_t fileEnd = fileBegin + text.size();
+          std::optional<StringRef> headerBytes = getHeaderBytes();
+          if (!headerBytes || fileBegin >= fileEnd ||
+              fileEnd > headerBytes->size())
+            return std::nullopt;
+          if (headerBytes->slice(fileBegin, fileEnd) != text)
+            return std::nullopt;
+          HeaderDirectivePiece piece;
+          piece.directive = &directive;
+          piece.begin = fileBegin;
+          piece.end = fileEnd;
+          piece.name = std::move(*name);
+          return piece;
+        };
+
+        // Determine whether `definition` is the active macro definition for
+        // `macroName` immediately before the preserved callsite.  A later #undef
+        // or #define for the same name cancels this definition for replay
+        // stability purposes.
+        auto activeDefinitionAtPatch =
+            [&](const RefoldModel::MacroDirective &definition,
+                StringRef macroName) {
+              const RefoldModel::MacroDirective *active = nullptr;
+              uint64_t activeEnd = 0;
+              for (const auto &candidate : model_.GetMacroDirectives()) {
+                std::optional<HeaderDirectivePiece> piece =
+                    directiveInterval(candidate);
+                if (!piece || piece->end > patch.invStart)
+                  continue;
+                if (StringRef(piece->name) != macroName)
+                  continue;
+                if (!active || piece->end > activeEnd ||
+                    (piece->end == activeEnd && candidate.id > active->id)) {
+                  active = &candidate;
+                  activeEnd = piece->end;
+                }
+              }
+              return active == &definition && definition.subkind == "#define";
+            };
+
+        // If any active header-owned definition would be observed by the
+        // replacement, this structure-preserving candidate is inadmissible.  It
+        // is not enough that the rewritten text is token-equivalent somewhere;
+        // it must be token-equivalent under the macro state at its final replay
+        // position.
+        for (const auto &directive : model_.GetMacroDirectives()) {
+          std::optional<HeaderDirectivePiece> piece = directiveInterval(directive);
+          if (!piece || piece->end > patch.invStart)
+            continue;
+          if (!activeDefinitionAtPatch(directive, piece->name))
+            continue;
+          if (replacementObservesDirective(directive, piece->name)) {
+            trace("macro/proof",
+                  "suppress structure-preserving macro replay: inv id={0} "
+                  "name={1} replacement observes active header macro-state "
+                  "directive #{2} '{3}' before callsite",
+                  m.id, m.name, directive.id, piece->name);
+            return true;
+          }
+        }
+        return false;
+      };
+
   // Collect all macro-level patch candidates for the shared final selector.
   //
   // Candidate discovery above may produce callsite-preserving patches, DAG
@@ -25807,23 +26110,30 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   // Register every discovered macro candidate with the common final selector.
   // Candidate discovery is intentionally separated from candidate selection:
   // each path contributes a stamped candidate here, and the selector below
-  // applies the shared lattice/proof-discharge policy.
-  if (argsOnlyCandidate) {
+  // applies the shared lattice/proof-discharge policy.  Structure-preserving
+  // candidates are first filtered by replay-context stability so the selector
+  // never accepts a proof artifact whose emitted callsite would be interpreted
+  // under the wrong header macro state.
+  if (argsOnlyCandidate &&
+      !callsiteReplayObservesActiveHeaderMacroState(*argsOnlyCandidate)) {
     addFinalMacroCandidate(*argsOnlyCandidate,
                            FinalMacroCandidateOrigin::DirectArgsOnly);
   }
 
-  if (dagRootCandidate) {
+  if (dagRootCandidate &&
+      !callsiteReplayObservesActiveHeaderMacroState(*dagRootCandidate)) {
     addFinalMacroCandidate(*dagRootCandidate,
                            FinalMacroCandidateOrigin::DagRootReplay);
   }
 
-  if (canReuseExistingCallsiteNoOp) {
+  if (canReuseExistingCallsiteNoOp &&
+      !callsiteReplayObservesActiveHeaderMacroState(*existingPatch)) {
     addFinalMacroCandidate(
         *existingPatch, FinalMacroCandidateOrigin::ReuseExistingCallsiteNoOp);
   }
 
-  if (canReuseExistingCallsiteSkipWholeCover) {
+  if (canReuseExistingCallsiteSkipWholeCover &&
+      !callsiteReplayObservesActiveHeaderMacroState(*existingPatch)) {
     addFinalMacroCandidate(
         *existingPatch,
         FinalMacroCandidateOrigin::ReuseExistingCallsiteSkipWholeCover);
