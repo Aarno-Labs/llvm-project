@@ -3020,6 +3020,20 @@ private:
       uint64_t aGap,
       std::optional<uint64_t> ownerIncludeId = std::nullopt) const;
 
+  /// \brief Return a patchable macro whose boundary insertion may be part of
+  ///        replacing a generated callee selector.
+  ///
+  /// Selector replacement can change only tokens immediately around the old
+  /// generated callee expansion, for example `STR(x)` -> `WRAP(x)` changes
+  /// `"x"` into `"[" "x" "]"`.  Those prefix/suffix tokens are pure
+  /// insertions at the old owner cover boundaries, but they are not ordinary
+  /// boundary ownership: they are macro-owned only if a generated descendant
+  /// callee came from a caller parameter.  The whole-cover macro proof must
+  /// still replay the candidate selector and validate the full B envelope.
+  const RefoldModel::MacroInvocation *BoundaryGeneratedSelectorMacro(
+      uint64_t aGap,
+      std::optional<uint64_t> ownerIncludeId = std::nullopt) const;
+
   /// \brief Determine whether an A-token interval is owned by the translation
   ///        unit (TU).
   ///

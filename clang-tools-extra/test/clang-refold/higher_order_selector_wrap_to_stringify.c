@@ -1,0 +1,7 @@
+// RUN: %clang-refold-tester-with-lines higher_order_selector_wrap_to_stringify
+#define APPLY(F, G, X) F(G, X)
+#define FWD(G, X) G(X)
+#define STR(x) #x
+#define WRAP(x) "[" #x "]"
+
+const char *s = APPLY(FWD, WRAP, alpha);

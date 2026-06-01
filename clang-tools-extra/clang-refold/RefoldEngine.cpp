@@ -2230,7 +2230,8 @@ void RefoldEngine::PreclaimStandaloneInsertions(
     // `cover.end` insertion as macro-owned, which would steal ordinary TU or
     // include boundary insertions from their correct owners.
     if (h.isInsertOnly() &&
-        RightBoundaryVaOptActivationMacro(h.aStart, owner.includeId))
+        (RightBoundaryVaOptActivationMacro(h.aStart, owner.includeId) ||
+         BoundaryGeneratedSelectorMacro(h.aStart, owner.includeId)))
       continue;
 
     ClaimBInsertion(static_cast<size_t>(insIdI32), BInsertionClaim::Standalone,
@@ -3781,6 +3782,9 @@ std::string RefoldEngine::RunSinglePassRefold() {
     if (!macroTarget && isIns)
       macroTarget =
           RightBoundaryVaOptActivationMacro(h.aStart, owner.includeId);
+    if (!macroTarget && isIns)
+      macroTarget =
+          BoundaryGeneratedSelectorMacro(h.aStart, owner.includeId);
     if (auto *m = macroTarget) {
       if (m->invB && m->invE) {
         debug("classify",
@@ -9181,8 +9185,6 @@ RefoldEngine::RightBoundaryVaOptActivationMacro(
       [&](const RefoldModel::MacroInvocation &root) {
     for (const RefoldModel::MacroInvocation &candidate :
          model_.GetMacroInvocations()) {
-      if (!candidate.cover.IsValid() || candidate.cover.end != aGap)
-        continue;
       if (!isDescendantOf(candidate, root))
         continue;
       const RefoldModel::MacroDirective *definition = definitionFor(candidate);
@@ -9239,6 +9241,92 @@ RefoldEngine::RightBoundaryVaOptActivationMacro(
     trace("macro/select", "selected right-boundary __VA_OPT__ macro: <none>");
   }
 
+
+  return best;
+}
+
+const RefoldModel::MacroInvocation *
+RefoldEngine::BoundaryGeneratedSelectorMacro(
+    uint64_t aGap, std::optional<uint64_t> ownerIncludeId) const {
+  const RefoldModel::MacroInvocation *best = nullptr;
+  uint64_t bestLen = std::numeric_limits<uint64_t>::max();
+
+  auto isDescendantOf = [&](const RefoldModel::MacroInvocation &child,
+                            const RefoldModel::MacroInvocation &root) {
+    const RefoldModel::MacroInvocation *cur = &child;
+    for (size_t depth = 0; cur &&
+                           depth <= model_.GetMacroInvocations().size();
+         ++depth) {
+      if (cur->id == root.id)
+        return true;
+      if (!cur->callerMacroId)
+        return false;
+      cur = FindMacroInvocationById(*cur->callerMacroId);
+    }
+    return false;
+  };
+
+  auto hasGeneratedSelectorDescendant =
+      [&](const RefoldModel::MacroInvocation &root) {
+    for (const RefoldModel::MacroInvocation &candidate :
+         model_.GetMacroInvocations()) {
+      if (!isDescendantOf(candidate, root))
+        continue;
+      if (candidate.calleeOrigin.kind == MacroCalleeOriginKind::CallerParam &&
+          !candidate.calleeOrigin.callerParamIndices.empty())
+        return true;
+    }
+    return false;
+  };
+
+  trace("macro/select",
+        "select boundary generated-selector macro for AGap={0} ownerInc={1}",
+        aGap, ownerIncludeId);
+
+  for (const RefoldModel::MacroInvocation &m : model_.GetMacroInvocations()) {
+    if (ownerIncludeId) {
+      if (!m.ownerIncludeId || *m.ownerIncludeId != *ownerIncludeId)
+        continue;
+    }
+    if (!m.cover.IsValid() || m.cover.end <= m.cover.begin)
+      continue;
+    if (m.cover.begin != aGap && m.cover.end != aGap)
+      continue;
+    if (!m.invB || !m.invE || !m.invText)
+      continue;
+    if (IsInvocationInsideDefineDirective(m))
+      continue;
+
+    // Boundary insertions around a generated selector replacement are safe to
+    // leave for the macro proof only when a descendant callee token actually
+    // came from a caller parameter.  This keeps ordinary expression/include
+    // boundary insertions out of macro ownership while allowing proofs such as
+    // `STR(x)` -> `WRAP(x)`, where the added string-literal context appears on
+    // both sides of the old generated callee expansion.
+    if (!hasGeneratedSelectorDescendant(m))
+      continue;
+
+    const uint64_t len = m.cover.end - m.cover.begin;
+    trace("macro/select",
+          "candidate boundary generated-selector macro id={0} name='{1}' "
+          "len={2} cover=[{3},{4}) ownerInc={5} inv=[{6},{7})",
+          m.id, m.name, len, m.cover.begin, m.cover.end, m.ownerIncludeId,
+          *m.invB, *m.invE);
+    if (!best || len < bestLen || (len == bestLen && m.id < best->id)) {
+      best = &m;
+      bestLen = len;
+    }
+  }
+
+  if (best) {
+    trace("macro/select",
+          "selected boundary generated-selector macro id={0} name='{1}' "
+          "cover=[{2},{3})",
+          best->id, best->name, best->cover.begin, best->cover.end);
+  } else {
+    trace("macro/select",
+          "selected boundary generated-selector macro: <none>");
+  }
   return best;
 }
 
@@ -14854,14 +14942,13 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
 
         const SourceSlot &slot = actuals[*tok.paramIndex];
         if (editable) {
-          // A generated actual expression may combine several source slots
-          // before the final callee sees one argument, for example `A ## B` or
-          // `G(A, B)`.  Keep the first ordinary data slot as the editable owner
-          // for this narrow argument-expression proof; later replay verifies
-          // that the solved old/new surface rewrites uniquely inside that root
-          // source argument.  If the changed contribution belongs to a later
-          // slot, the unique rewrite check fails closed instead of guessing.
-          continue;
+          // A generated actual expression with multiple distinct data leaves
+          // (for example `A ## B` or `G(A, B)`) is not a single final-callee
+          // source slot.  Let the generated-leaf pattern solver below invert
+          // the whole literal skeleton and compose all root leaves together;
+          // accepting it here would greedily rewrite the first leaf to the
+          // complete joined token, e.g. `foo, <empty>` -> `foobar, <empty>`.
+          return std::nullopt;
         }
         editable = slot;
       }
@@ -15634,6 +15721,63 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       newExpansion = SliceBSource(bEnv->first, bEnv->second).trim();
     }
 
+    auto rootHasGeneratedSelectorDescendant = [&]() {
+      for (const RefoldModel::MacroInvocation &candidate :
+           model_.GetMacroInvocations()) {
+        const RefoldModel::MacroInvocation *cur = &candidate;
+        bool isDescendant = false;
+        for (size_t depth = 0; cur &&
+                             depth <= model_.GetMacroInvocations().size();
+             ++depth) {
+          if (cur->id == m.id) {
+            isDescendant = true;
+            break;
+          }
+          if (!cur->callerMacroId)
+            break;
+          cur = FindMacroInvocationById(*cur->callerMacroId);
+        }
+        if (!isDescendant)
+          continue;
+        if (candidate.calleeOrigin.kind == MacroCalleeOriginKind::CallerParam &&
+            !candidate.calleeOrigin.callerParamIndices.empty())
+          return true;
+      }
+      return false;
+    };
+
+    if (h.isInsertOnly() && rootHasGeneratedSelectorDescendant() &&
+        (h.aStart == cover->first || h.aStart == cover->second)) {
+      // Selector replacement can introduce fixed context immediately before
+      // and/or after the old generated callee expansion (`STR(x)` ->
+      // `WRAP(x)` gives `"x"` -> `"[" "x" "]"`).  Those context tokens are
+      // represented as pure insertion hunks at the owner cover boundaries.
+      // They may participate in this proof only if they were deliberately left
+      // unclaimed by the boundary generated-selector selector above; ordinary
+      // standalone insertion claims remain clipped out of macro materialization.
+      while (bEnv->first > 0 && bEnv->first - 1 < bTokToInsertionId_.size()) {
+        int32_t insId = bTokToInsertionId_[bEnv->first - 1];
+        if (insId < 0)
+          break;
+        const BInsertionProv &ins = bInsertions_[static_cast<size_t>(insId)];
+        if (ins.claim == BInsertionClaim::Standalone ||
+            ins.aGap != cover->first || ins.b1 != bEnv->first)
+          break;
+        bEnv->first = ins.b0;
+      }
+      while (bEnv->second < bTokToInsertionId_.size()) {
+        int32_t insId = bTokToInsertionId_[bEnv->second];
+        if (insId < 0)
+          break;
+        const BInsertionProv &ins = bInsertions_[static_cast<size_t>(insId)];
+        if (ins.claim == BInsertionClaim::Standalone ||
+            ins.aGap != cover->second || ins.b0 != bEnv->second)
+          break;
+        bEnv->second = ins.b1;
+      }
+      newExpansion = SliceBSource(bEnv->first, bEnv->second).trim();
+    }
+
     if (oldExpansion.empty() || newExpansion.empty() ||
         oldExpansion == newExpansion)
       return std::nullopt;
@@ -15817,6 +15961,215 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       return nullptr;
     };
 
+    auto tryGeneratedSelectorActualRewrite = [&]() -> std::optional<MacroPatch> {
+      if (oldToks.empty() || newToks.empty())
+        return std::nullopt;
+
+      auto tokenSpellingsEqual = [](ArrayRef<LeafTok> toks,
+                                    ArrayRef<std::string> expected) {
+        if (toks.size() != expected.size())
+          return false;
+        for (size_t i = 0; i < toks.size(); ++i)
+          if (toks[i].spelling != expected[i])
+            return false;
+        return true;
+      };
+
+      auto appendLexedArgumentTokens = [&](StringRef text,
+                                           SmallVectorImpl<std::string> &out) {
+        SmallVector<LexBoundaryToken, 16> toks;
+        lexBoundaryTokens(text, lexLang_, toks);
+        for (const LexBoundaryToken &tok : toks)
+          out.push_back(tok.Spelling);
+      };
+
+      auto stringifyArgumentForReplay = [&](StringRef text) -> std::string {
+        SmallVector<LexBoundaryToken, 16> toks;
+        lexBoundaryTokens(text, lexLang_, toks);
+        std::string body;
+        for (const LexBoundaryToken &tok : toks) {
+          if (!body.empty())
+            body.push_back(' ');
+          body += tok.Spelling;
+        }
+        std::string out = "\"";
+        for (char c : body) {
+          if (c == '\\' || c == '"')
+            out.push_back('\\');
+          out.push_back(c);
+        }
+        out.push_back('"');
+        return out;
+      };
+
+      auto replayFunctionLikeToSpellings = [&](const RefoldModel::MacroDirective &definition,
+                                               ArrayRef<StringRef> actuals)
+          -> std::optional<SmallVector<std::string, 16>> {
+        if (definition.defParams.size() != actuals.size())
+          return std::nullopt;
+        SmallVector<std::string, 16> out;
+        const auto &toks = definition.replacementTokens;
+        for (size_t i = 0; i < toks.size();) {
+          const auto &tok = toks[i];
+          if (tok.spelling == "#") {
+            if (i + 1 >= toks.size() ||
+                toks[i + 1].kind != RefoldModel::MacroReplacementTokenKind::ParamRef ||
+                !toks[i + 1].paramIndex || *toks[i + 1].paramIndex >= actuals.size())
+              return std::nullopt;
+            out.push_back(stringifyArgumentForReplay(actuals[*toks[i + 1].paramIndex]));
+            i += 2;
+            continue;
+          }
+          if (i + 1 < toks.size() && toks[i + 1].spelling == "##") {
+            std::string pasted;
+            auto appendPastePiece = [&](const RefoldModel::MacroReplacementToken &piece) {
+              if (piece.kind == RefoldModel::MacroReplacementTokenKind::ParamRef) {
+                if (!piece.paramIndex || *piece.paramIndex >= actuals.size())
+                  return false;
+                pasted += actuals[*piece.paramIndex].trim().str();
+                return true;
+              }
+              if (piece.spelling == "#" || piece.spelling == "##" ||
+                  piece.spelling == "__VA_OPT__")
+                return false;
+              pasted += piece.spelling.str();
+              return true;
+            };
+            if (!appendPastePiece(tok))
+              return std::nullopt;
+            i += 2;
+            while (true) {
+              if (i >= toks.size() || !appendPastePiece(toks[i]))
+                return std::nullopt;
+              ++i;
+              if (i >= toks.size() || toks[i].spelling != "##")
+                break;
+              ++i;
+            }
+            out.push_back(std::move(pasted));
+            continue;
+          }
+          if (tok.kind == RefoldModel::MacroReplacementTokenKind::ParamRef) {
+            if (!tok.paramIndex || *tok.paramIndex >= actuals.size())
+              return std::nullopt;
+            appendLexedArgumentTokens(actuals[*tok.paramIndex], out);
+            ++i;
+            continue;
+          }
+          if (tok.spelling == "##" || tok.spelling == "__VA_OPT__")
+            return std::nullopt;
+          out.push_back(tok.spelling.str());
+          ++i;
+        }
+        return out;
+      };
+
+      auto isObjectLikeSingleTokenAlias = [&](StringRef name) {
+        for (const RefoldModel::MacroDirective &directive : model_.GetMacroDirectives()) {
+          if (directive.subkind == "#define" && directive.name == name &&
+              !directive.functionLike && directive.replacementTokens.size() == 1 &&
+              directive.replacementTokens[0].kind ==
+                  RefoldModel::MacroReplacementTokenKind::Literal)
+            return true;
+        }
+        return false;
+      };
+
+      struct SelectorCandidate {
+        std::string replacement;
+        uint32_t rootArgIdx = 0;
+        size_t newSelectorSize = 0;
+      };
+      SmallVector<SelectorCandidate, 4> candidates;
+
+      for (uint32_t selectorIdx = 0; selectorIdx < invArgRanges.size(); ++selectorIdx) {
+        auto selectorRange = invArgRanges[selectorIdx];
+        if (selectorRange.second < selectorRange.first ||
+            selectorRange.second > baseInvText.size())
+          return std::nullopt;
+        StringRef selectorText = baseInvText.slice(selectorRange.first,
+                                                   selectorRange.second).trim();
+        const RefoldModel::MacroDirective *oldSelectorDef =
+            resolveFunctionLikeForLeafProof(selectorText);
+        if (!oldSelectorDef || oldSelectorDef->defParams.empty())
+          continue;
+        if (selectorIdx + oldSelectorDef->defParams.size() >= invArgRanges.size() + 1)
+          continue;
+
+        SmallVector<StringRef, 8> actuals;
+        for (size_t i = 0; i < oldSelectorDef->defParams.size(); ++i) {
+          const auto r = invArgRanges[selectorIdx + 1 + i];
+          if (r.second < r.first || r.second > baseInvText.size())
+            return std::nullopt;
+          actuals.push_back(baseInvText.slice(r.first, r.second).trim());
+        }
+        std::optional<SmallVector<std::string, 16>> oldReplay =
+            replayFunctionLikeToSpellings(*oldSelectorDef, actuals);
+        if (!oldReplay || !tokenSpellingsEqual(oldToks, *oldReplay))
+          continue;
+
+        const bool oldSelectorWasAlias = isObjectLikeSingleTokenAlias(selectorText);
+        for (const RefoldModel::MacroDirective &sourceDirective : model_.GetMacroDirectives()) {
+          if (sourceDirective.subkind != "#define" || sourceDirective.name.empty() ||
+              sourceDirective.name == selectorText)
+            continue;
+
+          const bool candidateIsAlias =
+              !sourceDirective.functionLike &&
+              sourceDirective.replacementTokens.size() == 1 &&
+              sourceDirective.replacementTokens[0].kind ==
+                  RefoldModel::MacroReplacementTokenKind::Literal;
+          if (oldSelectorWasAlias != candidateIsAlias)
+            continue;
+          if (!oldSelectorWasAlias && !sourceDirective.functionLike)
+            continue;
+
+          const RefoldModel::MacroDirective *candidateDef =
+              resolveFunctionLikeForLeafProof(sourceDirective.name);
+          if (!candidateDef || candidateDef == oldSelectorDef ||
+              candidateDef->defParams.size() != actuals.size())
+            continue;
+          std::optional<SmallVector<std::string, 16>> candidateReplay =
+              replayFunctionLikeToSpellings(*candidateDef, actuals);
+          if (!candidateReplay || !tokenSpellingsEqual(newToks, *candidateReplay))
+            continue;
+
+          std::string replacement = baseInvText.str();
+          replacement.replace(selectorRange.first,
+                              selectorRange.second - selectorRange.first,
+                              sourceDirective.name.str());
+          candidates.push_back(SelectorCandidate{std::move(replacement), selectorIdx,
+                                                 sourceDirective.name.size()});
+        }
+      }
+
+      if (candidates.empty())
+        return std::nullopt;
+      llvm::sort(candidates, [](const SelectorCandidate &lhs,
+                                const SelectorCandidate &rhs) {
+        return lhs.replacement < rhs.replacement;
+      });
+      for (const SelectorCandidate &candidate : candidates)
+        if (candidate.replacement != candidates.front().replacement)
+          return std::nullopt;
+
+      MacroPatch patch{*m.invB, *m.invE, candidates.front().replacement, m.id};
+      patch.hasMaterializedOutputByteRange = true;
+      patch.materializedOutputByteStart = invArgRanges[candidates.front().rootArgIdx].first;
+      patch.materializedOutputByteEnd = patch.materializedOutputByteStart +
+                                        candidates.front().newSelectorSize;
+      stampMacroPatchMaterializedBTokenRange(
+          patch, static_cast<uint64_t>(bEnv->first),
+          static_cast<uint64_t>(bEnv->second));
+      StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyStandard,
+                           /*validated=*/true,
+                           /*structurePreserving=*/true, m.id);
+      return patch;
+    };
+
+    if (auto selectorPatch = tryGeneratedSelectorActualRewrite())
+      return selectorPatch;
+
     auto trailingVariadicIsStringifiedByAnyRootCallee = [&]() {
       for (uint32_t argIdx = 0; argIdx < invArgRanges.size(); ++argIdx) {
         auto r = invArgRanges[argIdx];
@@ -15868,47 +16221,60 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         }
       }
       if (oldPrefixMatches) {
-        std::optional<std::string> insertedActual;
+        std::string insertedActual;
+        bool sawInsertedData = false;
+        const bool stringifiedTail = trailingVariadicIsStringifiedByAnyRootCallee();
         for (size_t i = oldToks.size(); i < newToks.size(); ++i) {
           StringRef spelling(newToks[i].spelling);
           const std::string decoded = leafValueForToken(spelling);
-          // `__VA_OPT__` often contributes fixed separators before the actual
-          // data token.  The separator may be punctuation (`,`) or a string
-          // literal separator (`":"`); both are part of the replacement-list
-          // context, not the variadic actual to insert at the root callsite.
-          if (spelling == ":" || spelling == "," ||
-              StringRef(decoded) == ":" || StringRef(decoded) == ",")
+          // Leading `__VA_OPT__` separators are replacement-list context, not
+          // source text to insert.  Once actual data has started, commas are
+          // ordinary variadic-pack separators and must be preserved so multi-
+          // actual activations become `, 2, 3` at the root callsite rather than
+          // a single collapsed token.
+          if (!sawInsertedData &&
+              (spelling == ":" || spelling == "," ||
+               StringRef(decoded) == ":" || StringRef(decoded) == ","))
             continue;
-          if (insertedActual)
-            return std::nullopt;
-          // When the final generated callee stringifies the trailing variadic
-          // pack, the B token is a string literal representing the source text
-          // to insert into the root invocation.  Otherwise the token spelling
-          // itself is the variadic actual, e.g. an ordinary string-literal
-          // argument forwarded through `__VA_ARGS__`.
-          if (trailingVariadicIsStringifiedByAnyRootCallee()) {
+          if (stringifiedTail) {
+            if (sawInsertedData)
+              return std::nullopt;
             std::optional<std::string> decodedInserted =
                 decodeSimpleStringLiteralToken(spelling);
             if (!decodedInserted)
               return std::nullopt;
             insertedActual = std::move(*decodedInserted);
-          } else {
-            insertedActual = spelling.str();
+            sawInsertedData = true;
+            continue;
           }
+          if (spelling == "," || StringRef(decoded) == ",") {
+            if (insertedActual.empty() || insertedActual.back() == ' ')
+              insertedActual += ",";
+            else
+              insertedActual += ",";
+            insertedActual += " ";
+          } else {
+            if (!insertedActual.empty() && insertedActual.back() != ' ' &&
+                insertedActual.back() != ',')
+              insertedActual += " ";
+            insertedActual += spelling.str();
+          }
+          sawInsertedData = true;
         }
-        if (insertedActual) {
+        if (sawInsertedData && !StringRef(insertedActual).trim().empty()) {
           size_t close = baseInvText.rfind(')');
           if (close == StringRef::npos)
             return std::nullopt;
           std::string rewritten = baseInvText.slice(0, close).str();
           rewritten += ", ";
-          rewritten += *insertedActual;
+          rewritten += StringRef(insertedActual).trim();
           rewritten += baseInvText.substr(close).str();
 
           MacroPatch patch{*m.invB, *m.invE, std::move(rewritten), m.id};
           patch.hasMaterializedOutputByteRange = true;
           patch.materializedOutputByteStart = close;
-          patch.materializedOutputByteEnd = close + 2 + insertedActual->size();
+          patch.materializedOutputByteEnd = close + 2 +
+                                            StringRef(insertedActual).trim().size();
           stampMacroPatchMaterializedBTokenRange(
               patch, static_cast<uint64_t>(bEnv->first),
               static_cast<uint64_t>(bEnv->second));
@@ -16000,15 +16366,20 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
           std::string oldText;
         };
         SmallVector<ArgOccurrence, 8> occs;
+        std::optional<uint32_t> emptyArgIdx;
         for (uint32_t argIdx = 0; argIdx < invArgRanges.size(); ++argIdx) {
           auto r = invArgRanges[argIdx];
           if (r.second < r.first || r.second > baseInvText.size())
             return std::nullopt;
           StringRef argText = baseInvText.slice(r.first, r.second).trim();
-          if (argText.empty())
-            continue;
           if (resolveFunctionLikeForLeafProof(argText))
             continue;
+          if (argText.empty()) {
+            if (emptyArgIdx)
+              return std::nullopt;
+            emptyArgIdx = argIdx;
+            continue;
+          }
           SmallVector<StringRef, 2> probes;
           probes.push_back(argText);
           if (std::optional<std::string> decodedArg =
@@ -16026,6 +16397,15 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
                                          probe.str()});
             break;
           }
+        }
+        if (emptyArgIdx) {
+          // Empty actuals are real macro arguments even though they have no
+          // spelling to find in the old expansion.  Model the single empty leaf
+          // as a zero-width occurrence at the end of the generated value; the
+          // skeleton matcher below then proves whether B supplies a unique
+          // suffix for that empty source slot or erases an old non-empty slot.
+          occs.push_back(ArgOccurrence{*emptyArgIdx, oldValue.size(),
+                                       oldValue.size(), ""});
         }
         if (occs.empty())
           return std::nullopt;
@@ -16054,7 +16434,21 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
                                                 : oldValue.size());
           size_t nextPos = StringRef::npos;
           if (nextLiteral.empty()) {
-            nextPos = newValue.size();
+            if (i + 1 < occs.size() && occs[i + 1].begin == occs[i].end) {
+              // Adjacent generated leaves come from a paste-like expression
+              // with no literal separator (`A##B`, or `A##<empty>`).  With no
+              // anchor between leaves, use the same deterministic contribution
+              // rule as unanchored paste inversion: every leaf before the next
+              // literal keeps its old contribution width, and the final leaf in
+              // the run consumes the remaining segment.  This prevents greedy
+              // scalar rewrites such as `alpha,beta -> gammabeta,<empty>` while
+              // still failing closed if the old-width cut is impossible.
+              nextPos = newCursor + occs[i].oldText.size();
+              if (nextPos > newValue.size())
+                return std::nullopt;
+            } else {
+              nextPos = newValue.size();
+            }
           } else {
             nextPos = newValue.find(nextLiteral, newCursor);
             if (nextPos == StringRef::npos)
@@ -16063,8 +16457,6 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
               return std::nullopt;
           }
           StringRef solved = newValue.slice(newCursor, nextPos).trim();
-          if (solved.empty())
-            return std::nullopt;
           auto existing = replByArgIdx.find(occs[i].argIdx);
           if (existing != replByArgIdx.end()) {
             if (!leafTextsTokenEquivalent(StringRef(existing->second), solved))
