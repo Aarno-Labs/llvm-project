@@ -14401,7 +14401,14 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       return std::nullopt;
 
     struct SourceSlot {
+      // `text` is the current generated-actual spelling at the replay level we
+      // are following.  `rootSourceText` is the original root invocation
+      // argument that must be edited if replay solves a different value for
+      // this slot.  Keeping both is what lets a generated argument such as
+      // `(X)` or `pre_##X` be inverted back to `X` rather than emitted as the
+      // generated expression itself.
       std::string text;
+      std::string rootSourceText;
       uint32_t rootArgIdx = 0;
     };
 
@@ -14413,10 +14420,21 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         return std::nullopt;
       SourceSlot slot;
       slot.text = baseInvText.slice(r.first, r.second).trim().str();
+      slot.rootSourceText = slot.text;
       slot.rootArgIdx = i;
       currentActuals.push_back(std::move(slot));
     }
-    if (currentActuals.size() != rootDefinition->defParams.size())
+
+    auto definitionAcceptsActualCount =
+        [](const RefoldModel::MacroDirective &definition, size_t count) {
+      const bool hasVariadic = !definition.defParams.empty() &&
+                               definition.defParams.back().variadic;
+      const size_t fixedCount = hasVariadic ? definition.defParams.size() - 1
+                                            : definition.defParams.size();
+      return hasVariadic ? count >= fixedCount : count == fixedCount;
+    };
+
+    if (!definitionAcceptsActualCount(*rootDefinition, currentActuals.size()))
       return std::nullopt;
 
     auto resolveFunctionLikeThroughAliases =
@@ -14464,7 +14482,12 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
 
     struct GeneratedCallShape {
       uint32_t calleeParamIdx = 0;
-      SmallVector<uint32_t, 8> argParamIdxs;
+      // Half-open replacement-token ranges for the generated call's actuals.
+      // The ranges are kept as expressions instead of flattened ParamRef ids so
+      // the replay step can invert argument constructors such as `(X)`,
+      // `pre_##X`, `X##_tail`, `G(X)`, and active `__VA_OPT__` argument tails
+      // back to the original root source slots.
+      SmallVector<std::pair<size_t, size_t>, 8> argTokenRanges;
       SmallVector<std::string, 8> prefixLiterals;
       SmallVector<std::string, 8> suffixLiterals;
     };
@@ -14514,6 +14537,11 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         callOpen = i + 1;
         callClose = close;
         calleeParamIdx = *calleeTok.paramIndex;
+        // Nested generated calls inside this call's arguments are argument
+        // expressions, not competing owner calls.  Skip the body after recording
+        // the outer call so shapes such as `H(G(X))` remain one generated call
+        // whose first actual is the expression `G(X)`.
+        i = close;
       }
       if (!found || calleeParamIdx >= definition.defParams.size())
         return std::nullopt;
@@ -14538,20 +14566,34 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
                                  shape.suffixLiterals))
         return std::nullopt;
 
-      for (size_t i = callOpen + 1; i < callClose; ++i) {
-        const auto &tok = toks[i];
-        if (tok.spelling == "#" || tok.spelling == "##" ||
-            tok.spelling == "__VA_OPT__")
-          return std::nullopt;
-        if (tok.kind != RefoldModel::MacroReplacementTokenKind::ParamRef)
-          continue;
-        if (!tok.paramIndex || *tok.paramIndex >= definition.defParams.size())
-          return std::nullopt;
-        if (*tok.paramIndex == calleeParamIdx)
-          return std::nullopt;
-        shape.argParamIdxs.push_back(*tok.paramIndex);
+      size_t argBegin = callOpen + 1;
+      unsigned argDepth = 0;
+      for (size_t i = callOpen + 1; i <= callClose; ++i) {
+        const bool atEnd = i == callClose;
+        if (!atEnd) {
+          const auto &tok = toks[i];
+          if (tok.kind == RefoldModel::MacroReplacementTokenKind::Literal) {
+            if (tok.spelling == "(") {
+              ++argDepth;
+            } else if (tok.spelling == ")") {
+              if (argDepth == 0)
+                return std::nullopt;
+              --argDepth;
+            }
+          }
+        }
+
+        if (atEnd ||
+            (argDepth == 0 &&
+             toks[i].kind == RefoldModel::MacroReplacementTokenKind::Literal &&
+             toks[i].spelling == ",")) {
+          if (argBegin == i)
+            return std::nullopt;
+          shape.argTokenRanges.push_back({argBegin, i});
+          argBegin = i + 1;
+        }
       }
-      if (shape.argParamIdxs.empty())
+      if (shape.argTokenRanges.empty())
         return std::nullopt;
       return shape;
     };
@@ -14560,6 +14602,217 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     SmallVector<SmallVector<std::string, 8>, 8> replaySuffixStack;
     const RefoldModel::MacroDirective *currentDefinition = rootDefinition;
     bool followedGeneratedCall = false;
+
+    auto isVariadicParam = [](const RefoldModel::MacroDirective &definition,
+                              uint32_t paramIdx) {
+      return paramIdx < definition.defParams.size() &&
+             definition.defParams[paramIdx].variadic;
+    };
+
+    auto splitVariadicPackSourceSlot =
+        [&](const SourceSlot &slot, SmallVectorImpl<SourceSlot> &out) {
+      SmallVector<LexBoundaryToken, 32> toks;
+      lexBoundaryTokens(StringRef(slot.text), lexLang_, toks);
+
+      size_t elemBegin = 0;
+      int parenDepth = 0;
+      bool sawComma = false;
+      SmallVector<std::pair<size_t, size_t>, 8> pieces;
+
+      for (const LexBoundaryToken &tok : toks) {
+        if (tok.Spelling == "(") {
+          ++parenDepth;
+          continue;
+        }
+        if (tok.Spelling == ")") {
+          if (parenDepth > 0)
+            --parenDepth;
+          continue;
+        }
+        if (tok.Spelling != "," || parenDepth != 0)
+          continue;
+
+        sawComma = true;
+        StringRef elem = StringRef(slot.text).slice(elemBegin, tok.Begin).trim();
+        if (elem.empty())
+          return false;
+        pieces.push_back({static_cast<size_t>(elem.data() - slot.text.data()),
+                          static_cast<size_t>(elem.data() - slot.text.data()) +
+                              elem.size()});
+        elemBegin = tok.End;
+      }
+
+      if (!sawComma) {
+        out.push_back(slot);
+        return true;
+      }
+
+      StringRef finalElem = StringRef(slot.text).drop_front(elemBegin).trim();
+      if (finalElem.empty())
+        return false;
+      pieces.push_back({static_cast<size_t>(finalElem.data() - slot.text.data()),
+                        static_cast<size_t>(finalElem.data() - slot.text.data()) +
+                            finalElem.size()});
+
+      // A variadic formal can be forwarded into a fixed-arity generated callee.
+      // The producer records the root variadic tail as one invocation argument
+      // range (`foo, bar, baz`), but substituting `__VA_ARGS__` into a generated
+      // call exposes those comma-separated elements as positional actuals.
+      // Split only at commas that macro argument collection would see: nested
+      // parentheses protect commas, while brackets/braces intentionally do not.
+      // Each piece keeps the whole root variadic source as its rewrite owner so
+      // multiple solved final parameters can be composed back into one root
+      // argument replacement.
+      for (const auto &piece : pieces) {
+        SourceSlot split = slot;
+        split.text = StringRef(slot.text).slice(piece.first, piece.second).str();
+        split.rootSourceText = slot.rootSourceText;
+        split.rootArgIdx = slot.rootArgIdx;
+        out.push_back(std::move(split));
+      }
+      return true;
+    };
+
+    auto appendActualsForParam =
+        [&](const RefoldModel::MacroDirective &definition,
+            ArrayRef<SourceSlot> actuals, uint32_t paramIdx,
+            SmallVectorImpl<SourceSlot> &out) {
+      if (paramIdx >= definition.defParams.size())
+        return false;
+      if (!isVariadicParam(definition, paramIdx)) {
+        if (paramIdx >= actuals.size())
+          return false;
+        out.push_back(actuals[paramIdx]);
+        return true;
+      }
+      if (actuals.size() < paramIdx)
+        return false;
+
+      // If this variadic parameter is still represented by one root invocation
+      // range, distribute the pack now.  If it has already been distributed by
+      // an earlier generated-call step, preserve the existing positional slots.
+      if (actuals.size() == paramIdx + 1)
+        return splitVariadicPackSourceSlot(actuals[paramIdx], out);
+
+      for (size_t i = paramIdx; i < actuals.size(); ++i)
+        out.push_back(actuals[i]);
+      return true;
+    };
+
+    auto findEditableParamInGeneratedArgument =
+        [&](const RefoldModel::MacroDirective &definition,
+            ArrayRef<SourceSlot> actuals, size_t begin, size_t end)
+            -> std::optional<SourceSlot> {
+      std::optional<SourceSlot> editable;
+      const auto &toks = definition.replacementTokens;
+      for (size_t i = begin; i < end; ++i) {
+        const auto &tok = toks[i];
+        if (tok.kind != RefoldModel::MacroReplacementTokenKind::ParamRef)
+          continue;
+        if (!tok.paramIndex || *tok.paramIndex >= definition.defParams.size())
+          return std::nullopt;
+        if (isVariadicParam(definition, *tok.paramIndex))
+          return std::nullopt;
+        if (*tok.paramIndex >= actuals.size())
+          return std::nullopt;
+
+        // A function-like macro actual immediately followed by `(` is a
+        // generated callee selector inside this argument expression, not the
+        // source slot whose value should be edited.  Treat it as fixed proof
+        // context and keep looking for the ordinary data argument.
+        const bool selectorPosition =
+            i + 1 < end &&
+            toks[i + 1].kind == RefoldModel::MacroReplacementTokenKind::Literal &&
+            toks[i + 1].spelling == "(" &&
+            resolveFunctionLikeThroughAliases(StringRef(actuals[*tok.paramIndex].text));
+        if (selectorPosition)
+          continue;
+
+        const SourceSlot &slot = actuals[*tok.paramIndex];
+        if (editable) {
+          if (editable->rootArgIdx != slot.rootArgIdx ||
+              StringRef(editable->rootSourceText).trim() !=
+                  StringRef(slot.rootSourceText).trim())
+            return std::nullopt;
+          continue;
+        }
+        editable = slot;
+      }
+      return editable;
+    };
+
+    auto instantiateGeneratedArgument =
+        [&](const RefoldModel::MacroDirective &definition,
+            ArrayRef<SourceSlot> actuals, size_t begin, size_t end,
+            SmallVectorImpl<SourceSlot> &out) {
+      const auto &toks = definition.replacementTokens;
+      if (begin >= end)
+        return false;
+
+      // `__VA_ARGS__` as a complete generated actual distributes the variadic
+      // pack positionally into the next generated callee.  This is the same
+      // owner proof as ordinary argument replay; the only extra obligation is
+      // that each pack element keeps its own root source slot.
+      if (end == begin + 1 &&
+          toks[begin].kind == RefoldModel::MacroReplacementTokenKind::ParamRef &&
+          toks[begin].paramIndex &&
+          isVariadicParam(definition, *toks[begin].paramIndex))
+        return appendActualsForParam(definition, actuals,
+                                     *toks[begin].paramIndex, out);
+
+      // Active `__VA_OPT__(, __VA_ARGS__)` in a generated-call argument list
+      // contributes additional positional arguments rather than bytes inside
+      // the preceding argument.  Accept only the canonical comma-plus-variadic
+      // form here; anything more complex remains outside this proof.
+      for (size_t i = begin; i < end; ++i) {
+        if (toks[i].spelling != "__VA_OPT__")
+          continue;
+        if (i != begin + 1 || begin >= end ||
+            toks[begin].kind != RefoldModel::MacroReplacementTokenKind::ParamRef ||
+            !toks[begin].paramIndex || i + 5 != end ||
+            toks[i + 1].spelling != "(" || toks[i + 2].spelling != "," ||
+            toks[i + 3].kind != RefoldModel::MacroReplacementTokenKind::ParamRef ||
+            !toks[i + 3].paramIndex ||
+            !isVariadicParam(definition, *toks[i + 3].paramIndex) ||
+            toks[i + 4].spelling != ")")
+          return false;
+        if (!appendActualsForParam(definition, actuals, *toks[begin].paramIndex,
+                                   out))
+          return false;
+        return appendActualsForParam(definition, actuals,
+                                     *toks[i + 3].paramIndex, out);
+      }
+
+      std::optional<SourceSlot> editable =
+          findEditableParamInGeneratedArgument(definition, actuals, begin, end);
+      if (!editable)
+        return false;
+
+      std::string text;
+      for (size_t i = begin; i < end; ++i) {
+        const auto &tok = toks[i];
+        if (tok.spelling == "##")
+          continue;
+        if (tok.spelling == "#" || tok.spelling == "__VA_OPT__")
+          return false;
+        if (tok.kind == RefoldModel::MacroReplacementTokenKind::ParamRef) {
+          if (!tok.paramIndex || *tok.paramIndex >= definition.defParams.size() ||
+              isVariadicParam(definition, *tok.paramIndex) ||
+              *tok.paramIndex >= actuals.size())
+            return false;
+          text += actuals[*tok.paramIndex].text;
+          continue;
+        }
+        text += tok.spelling.str();
+      }
+
+      SourceSlot slot;
+      slot.text = std::move(text);
+      slot.rootSourceText = editable->rootSourceText;
+      slot.rootArgIdx = editable->rootArgIdx;
+      out.push_back(std::move(slot));
+      return true;
+    };
 
     for (size_t depth = 0; depth <= model_.GetMacroDirectives().size(); ++depth) {
       auto shape = findGeneratedCallShape(*currentDefinition);
@@ -14575,20 +14828,14 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         return std::nullopt;
 
       SmallVector<SourceSlot, 8> nextActuals;
-      for (uint32_t paramIdx : shape->argParamIdxs) {
-        if (paramIdx >= currentActuals.size())
+      for (const auto &argRange : shape->argTokenRanges) {
+        if (!instantiateGeneratedArgument(*currentDefinition, currentActuals,
+                                          argRange.first, argRange.second,
+                                          nextActuals))
           return std::nullopt;
-        nextActuals.push_back(currentActuals[paramIdx]);
       }
 
-      const bool nextHasVariadic = !nextDefinition->defParams.empty() &&
-                                   nextDefinition->defParams.back().variadic;
-      const size_t nextFixed = nextHasVariadic
-                                   ? nextDefinition->defParams.size() - 1
-                                   : nextDefinition->defParams.size();
-      if ((!nextHasVariadic &&
-           nextActuals.size() != nextDefinition->defParams.size()) ||
-          (nextHasVariadic && nextActuals.size() < nextFixed))
+      if (!definitionAcceptsActualCount(*nextDefinition, nextActuals.size()))
         return std::nullopt;
 
       replayPrefixLiterals.append(shape->prefixLiterals.begin(),
@@ -14602,21 +14849,22 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     if (!followedGeneratedCall || !currentDefinition || currentActuals.empty())
       return std::nullopt;
 
+    if (!definitionAcceptsActualCount(*currentDefinition, currentActuals.size()))
+      return std::nullopt;
+
     const bool finalHasVariadic = !currentDefinition->defParams.empty() &&
                                   currentDefinition->defParams.back().variadic;
     const size_t finalFixed = finalHasVariadic
                                   ? currentDefinition->defParams.size() - 1
                                   : currentDefinition->defParams.size();
-    if ((!finalHasVariadic &&
-         currentActuals.size() != currentDefinition->defParams.size()) ||
-        (finalHasVariadic && currentActuals.size() < finalFixed))
-      return std::nullopt;
 
     SmallVector<std::string, 8> oldActuals;
     SmallVector<uint32_t, 8> rootSlotByFinalParam;
+    SmallVector<std::string, 8> rootSourceByFinalParam;
     for (size_t i = 0; i < finalFixed; ++i) {
       oldActuals.push_back(currentActuals[i].text);
       rootSlotByFinalParam.push_back(currentActuals[i].rootArgIdx);
+      rootSourceByFinalParam.push_back(currentActuals[i].rootSourceText);
     }
     if (finalHasVariadic) {
       std::string variadicText;
@@ -14629,9 +14877,11 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       os.flush();
       oldActuals.push_back(std::move(variadicText));
       rootSlotByFinalParam.push_back(currentActuals[finalFixed].rootArgIdx);
+      rootSourceByFinalParam.push_back(currentActuals[finalFixed].rootSourceText);
     }
     if (oldActuals.size() != currentDefinition->defParams.size() ||
-        rootSlotByFinalParam.size() != oldActuals.size())
+        rootSlotByFinalParam.size() != oldActuals.size() ||
+        rootSourceByFinalParam.size() != oldActuals.size())
       return std::nullopt;
 
     struct ReplayTok {
@@ -15035,52 +15285,110 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       if (source.trim() == oldText)
         return newText.str();
       size_t pos = source.find(oldText);
-      if (pos == StringRef::npos)
-        return std::nullopt;
-      if (source.find(oldText, pos + 1) != StringRef::npos)
-        return std::nullopt;
-      return stringutils::replaceRange(source.str(), pos, pos + oldText.size(),
-                                       newText);
+      if (pos != StringRef::npos) {
+        if (source.find(oldText, pos + 1) != StringRef::npos)
+          return std::nullopt;
+        return stringutils::replaceRange(source.str(), pos,
+                                         pos + oldText.size(), newText);
+      }
+
+      // The generated actual may wrap or paste the editable root contribution
+      // before the final callee observes it: `(X)` stringified as `(beta)`,
+      // `pre_##X` stringified as `pre_beta`, `G(X)` stringified as `ID(beta)`,
+      // or `X##_tail` pasted before a later callee paste.  When old/new solved
+      // values have a unique common context, invert only the changed middle
+      // slice back into the original root source argument.
+      size_t prefix = 0;
+      while (prefix < oldText.size() && prefix < newText.size() &&
+             oldText[prefix] == newText[prefix])
+        ++prefix;
+      size_t suffix = 0;
+      while (suffix + prefix < oldText.size() &&
+             suffix + prefix < newText.size() &&
+             oldText[oldText.size() - suffix - 1] ==
+                 newText[newText.size() - suffix - 1])
+        ++suffix;
+      if (prefix + suffix < oldText.size()) {
+        StringRef oldMiddle =
+            oldText.slice(prefix, oldText.size() - suffix).trim();
+        StringRef newMiddle =
+            newText.slice(prefix, newText.size() - suffix).trim();
+        if (!oldMiddle.empty()) {
+          size_t middlePos = source.find(oldMiddle);
+          if (middlePos != StringRef::npos &&
+              source.find(oldMiddle, middlePos + 1) == StringRef::npos)
+            return stringutils::replaceRange(
+                source.str(), middlePos, middlePos + oldMiddle.size(),
+                newMiddle);
+        }
+      }
+      return std::nullopt;
     };
 
     DenseMap<uint32_t, std::string> replByRootArgIdx;
+    DenseMap<uint32_t, std::string> workingRootTextByArgIdx;
     for (uint32_t i = 0; i < newSolved->size(); ++i) {
       if (i >= rootSlotByFinalParam.size())
         return std::nullopt;
       const uint32_t rootIdx = rootSlotByFinalParam[i];
       if (rootIdx >= invArgRanges.size())
         return std::nullopt;
-      StringRef source = currentActuals.size() > i
-                             ? StringRef(currentActuals[i].text)
-                             : StringRef(oldActuals[i]);
-      const SourceSlot *slot = nullptr;
-      // Find the final source slot carrying this root argument so nested source
-      // spelling such as `ID(alpha)` is preserved when the solved replay value
-      // is only `alpha`.
-      for (const SourceSlot &candidate : currentActuals) {
-        if (candidate.rootArgIdx == rootIdx) {
-          slot = &candidate;
-          break;
-        }
+
+      // Unchanged final-callee actuals impose no source rewrite obligation.
+      // This is important after variadic-pack distribution: several final
+      // parameters may all point back to one root `__VA_ARGS__` argument, and
+      // unchanged pack elements must not compete with the changed element's
+      // composed replacement for that same root range.
+      if (textsTokenEquivalent(StringRef((*oldSolved)[i]),
+                               StringRef((*newSolved)[i])))
+        continue;
+
+      StringRef originalRoot =
+          baseInvText.slice(invArgRanges[rootIdx].first,
+                            invArgRanges[rootIdx].second).trim();
+      auto workingIt = workingRootTextByArgIdx.find(rootIdx);
+      StringRef source = workingIt != workingRootTextByArgIdx.end()
+                             ? StringRef(workingIt->second)
+                             : (i < rootSourceByFinalParam.size()
+                                    ? StringRef(rootSourceByFinalParam[i])
+                                    : StringRef(oldActuals[i]));
+
+      if (workingIt != workingRootTextByArgIdx.end()) {
+        // Multiple final-callee parameters can impose the same edit on one
+        // root actual.  For example, `FWD_DUP(G, X) -> G(X, X)` followed by
+        // `JOIN(a, b) -> a ## b` solves both final parameters as `aa -> bb`,
+        // but both obligations target the single root argument `X`.  After the
+        // first obligation has rewritten that root text, replay the current
+        // obligation against the original root spelling and accept it as
+        // already discharged only when it yields the exact current root text.
+        // This keeps duplicate-use composition deterministic while still
+        // rejecting genuinely conflicting same-root obligations.
+        auto alreadySatisfied = rewriteSourceActualFromSolvedExpansion(
+            originalRoot, StringRef((*oldSolved)[i]),
+            StringRef((*newSolved)[i]));
+        if (alreadySatisfied &&
+            textsTokenEquivalent(StringRef(*alreadySatisfied), source))
+          continue;
       }
-      if (slot)
-        source = StringRef(slot->text);
+
       auto rewritten = rewriteSourceActualFromSolvedExpansion(
           source, StringRef((*oldSolved)[i]), StringRef((*newSolved)[i]));
       if (!rewritten)
         return std::nullopt;
       if (!isVariadicFormal(rootIdx) && hasTopLevelComma(*rewritten))
         return std::nullopt;
-      auto it = replByRootArgIdx.find(rootIdx);
-      if (it != replByRootArgIdx.end()) {
-        if (StringRef(it->second).trim() != StringRef(*rewritten).trim())
-          return std::nullopt;
-        continue;
-      }
-      StringRef original = baseInvText.slice(invArgRanges[rootIdx].first,
-                                             invArgRanges[rootIdx].second).trim();
-      if (StringRef(*rewritten).trim() != original)
-        replByRootArgIdx[rootIdx] = std::move(*rewritten);
+
+      // Compose multiple solved final parameters that originate from the same
+      // root argument, especially a distributed variadic pack.  Each step is
+      // still uniquely inverted against the current source text; if two solved
+      // obligations cannot be composed into one deterministic root replacement,
+      // the proof fails closed instead of choosing an arbitrary pack rewrite.
+      workingRootTextByArgIdx[rootIdx] = std::move(*rewritten);
+      StringRef finalRoot = StringRef(workingRootTextByArgIdx[rootIdx]).trim();
+      if (finalRoot != originalRoot)
+        replByRootArgIdx[rootIdx] = finalRoot.str();
+      else
+        replByRootArgIdx.erase(rootIdx);
     }
 
     if (replByRootArgIdx.empty())
