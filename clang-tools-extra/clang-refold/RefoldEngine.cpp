@@ -3716,9 +3716,11 @@ std::string RefoldEngine::RunSinglePassRefold() {
     // __VA_OPT__ repairs can move tokens between formals while still preserving
     // the macro call; deferring those patches to a literal TU argument edit
     // produces a validating but less structural result such as
-    // `MAYBE_PLUS(3 + 4)` instead of `MAYBE_PLUS(3, 4)`.  Reconstruct the
-    // direct source edit and require byte-equivalence with the accepted macro
-    // patch before letting the TU edit compete.
+    // `MAYBE_PLUS(3 + 4)` instead of `MAYBE_PLUS(3, 4)`.  Project the TU hunk
+    // back into the original invocation spelling and require byte-equivalence
+    // with the accepted macro patch before letting the TU edit compete.  If the
+    // two spellings differ, the macro proof is carrying structure that the TU
+    // byte edit would erase, so the TU edit is not a harmless substitute.
     if (!macro.invText || !macro.invB || span->second < span->first ||
         span->first < *macro.invB)
       return false;
@@ -12275,9 +12277,11 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
   // only on non-empty PPArgSpan records.  This covers proof surfaces where the
   // producer legitimately has no A-side argument span for a formal: empty
   // actuals, zero-token child actuals, and erased/exposed __VA_OPT__ payloads.
-  // The path is accepted only when the replacement-token tape matches the
-  // original A cover exactly and has a unique best B-side replay under the
-  // declared slot-boundary preference below.
+  // In other words, the proof surface is the definition grammar itself, not a
+  // recorded non-empty argument occurrence.  The path is accepted only when
+  // the replacement-token tape matches the original A cover exactly and when
+  // B-side replay yields a deterministic invocation spelling under the declared
+  // slot-boundary preference below.
   auto tryDefinitionReplayArgsOnlyPatch = [&]() -> std::optional<MacroPatch> {
     const RefoldModel::MacroDirective *definition =
         getDefinitionDirectiveForArgsOnly();
@@ -12523,17 +12527,16 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       return std::nullopt;
 
     // Map the proven A replay cover to the B-side envelope that must be
-    // segmented by the same replacement-list tree.  This solver enumerates
-    // token partitions, so keep the envelope bounded and fail closed on large
-    // surfaces that should be handled by the normal template/DAG machinery.
+    // segmented by the same replacement-list tree.  There is intentionally no
+    // fixed token-count cutoff here: large empty-slot insertions and VA_OPT
+    // flips are still finite replay problems.  Determinism is enforced by the
+    // later solution ranking/ambiguity checks rather than by silently refusing
+    // otherwise provable envelopes.
     auto bEnv = MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
         cover->first, cover->second);
     if (!bEnv || bEnv->first > bEnv->second ||
         bEnv->second > bToks_.size())
       return std::nullopt;
-    if ((bEnv->second - bEnv->first) > 128)
-      return std::nullopt;
-
     // Count the old A-token contribution per formal.  The B replay uses this
     // to distinguish true empty-formal insertions, where a zero-length B range
     // is legal, from ordinary non-empty formals, where assigning no B tokens
@@ -12582,16 +12585,16 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     // Exhaustively segment the B envelope according to the same replay tree.
     // Literal nodes consume fixed tokens, parameter nodes choose a token range
     // for the corresponding formal, and __VA_OPT__ tries both the erased and
-    // exposed branches.  The search is bounded above so ambiguity or explosion
-    // causes a conservative failure rather than a heuristic selection.
+    // exposed branches.  Every recursive step either advances the pattern or
+    // advances the B cursor, so the search is finite for a finite token envelope.
+    // Ambiguity is handled after enumeration by scoring and tie rejection; the
+    // solver must not pick an arbitrary partition just because it is found first.
     std::function<void(ArrayRef<ReplayElem>, size_t, size_t, ReplaySolution &,
                        std::function<void(size_t, ReplaySolution &)>)>
         dfsElems;
     dfsElems = [&](ArrayRef<ReplayElem> elems, size_t elemIdx, size_t bPos,
                    ReplaySolution &sol,
                    std::function<void(size_t, ReplaySolution &)> done) {
-      if (solutions.size() > 128)
-        return;
       if (elemIdx == elems.size()) {
         done(bPos, sol);
         return;
@@ -12617,16 +12620,12 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
           if (!assignFormalRange(next, elem.argIdx, {bPos, end}))
             continue;
           dfsElems(elems, elemIdx + 1, end, next, done);
-          if (solutions.size() > 128)
-            return;
         }
         return;
       }
       case ReplayElem::Kind::VaOpt: {
         // Erased branch.
         dfsElems(elems, elemIdx + 1, bPos, sol, done);
-        if (solutions.size() > 128)
-          return;
 
         // Exposed branch.  The payload must consume at least one B token; an
         // empty exposed payload is indistinguishable from the erased branch here.
@@ -12651,8 +12650,12 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
                  solutions.push_back(sol);
              });
 
-    if (solutions.empty() || solutions.size() > 128)
+    if (solutions.empty())
       return std::nullopt;
+
+    // Multiple raw B partitions may still describe the same semantic replay.
+    // Keep all candidates until the scoring pass can prove one canonical call
+    // spelling; equal-score, different-spelling candidates fail closed below.
 
     // Trimmed source spelling of a formal slot in the original invocation; used
     // only for deterministic scoring and no-op detection after B replay.
@@ -12668,7 +12671,11 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     // Ranking key for otherwise-valid B replays.  Prefer solutions that change
     // existing non-empty formals the least, allocate newly inserted tokens into
     // originally-empty slots, and keep exposed __VA_OPT__ payloads when present.
-    // A final lexical tie-break is allowed only after the semantic scores agree.
+    // These preferences encode the proof obligation: preserve stable source
+    // slots first, then place newly materialized tokens in slots that were
+    // previously unobservable.  A lexical comparison is only a deterministic
+    // ordering after the semantic scores agree; ties with different spellings
+    // are rejected rather than accepted heuristically.
     struct ScoredSolution {
       ReplaySolution sol;
       uint64_t nonEmptyDeviation = 0;
@@ -14748,6 +14755,672 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         return std::nullopt;
       return StringRef(*inv.invText).slice((size_t)relB, (size_t)relE).trim();
     };
+
+    auto tryParentTupleGeneratedCalleeRewrite = [&]() -> bool {
+      // Handle the tuple-generated-callee case before the generic text-keyed
+      // tuple rewrite.  In shapes such as
+      //
+      //   #define WRAP(PAIR) CALL PAIR
+      //   #define CALL(F, X) F(X)
+      //   WRAP((ADD_ONE, 10))
+      //
+      // the parent argument occurrence in PP output is the callee expansion
+      // `((10) + 1)`, not the tuple element `10` by itself.  A whole-argument
+      // replacement would therefore validate but collapse the tuple to
+      // `WRAP(((20) + 1))`.  This proof reconstructs the generated call
+      // positionally: tuple element 0 supplies the callee, later tuple elements
+      // supply the generated actuals, and the callee replacement list is replayed
+      // to determine which tuple slot changed.
+      if (!m.definitionDirectiveId)
+        return false;
+
+      const RefoldModel::MacroDirective *rootDefinition = nullptr;
+      for (const RefoldModel::MacroDirective &directive :
+           model_.GetMacroDirectives()) {
+        if (directive.id == *m.definitionDirectiveId) {
+          rootDefinition = &directive;
+          break;
+        }
+      }
+      if (!rootDefinition || rootDefinition->subkind != "#define" ||
+          !rootDefinition->functionLike)
+        return false;
+
+      // This fallback proves the common tuple-wrapper shape directly from the
+      // parent definition: the wrapper replacement is a literal forwarding macro
+      // followed by exactly the caller tuple formal, e.g. `CALL PAIR`.  Keeping
+      // the shape this narrow prevents the proof from guessing about arbitrary
+      // wrapper bodies.
+      if (rootDefinition->replacementTokens.size() != 2)
+        return false;
+      const auto &rootTok0 = rootDefinition->replacementTokens[0];
+      const auto &rootTok1 = rootDefinition->replacementTokens[1];
+      if (rootTok0.kind != RefoldModel::MacroReplacementTokenKind::Literal ||
+          rootTok1.kind != RefoldModel::MacroReplacementTokenKind::ParamRef ||
+          !rootTok1.paramIndex || *rootTok1.paramIndex != callerArgIdx)
+        return false;
+      const StringRef forwarderName = rootTok0.spelling;
+
+      const RefoldModel::MacroDirective *forwarderDefinition = nullptr;
+      for (const RefoldModel::MacroDirective &directive :
+           model_.GetMacroDirectives()) {
+        if (directive.subkind == "#define" && directive.functionLike &&
+            directive.name == forwarderName) {
+          if (forwarderDefinition)
+            return false;
+          forwarderDefinition = &directive;
+        }
+      }
+      if (!forwarderDefinition || forwarderDefinition->defParams.empty())
+        return false;
+
+      // The forwarded caller argument must be a real parenthesized tuple.  The
+      // byte ranges returned by the splitter are relative to the tuple payload
+      // between the outer parentheses; edits are later applied to that payload
+      // and wrapped back in the original tuple parens.
+      if (!parentTrim.starts_with("(") || !parentTrim.ends_with(")") ||
+          parentTrim.size() < 2)
+        return false;
+      StringRef tuplePayload = parentTrim.drop_front().drop_back();
+      SmallVector<TupleElementSlice, 8> tupleElems;
+      if (!splitTopLevelTupleElementsWithLexer(tuplePayload, lexLang_,
+                                               tupleElems))
+        return false;
+      if (tupleElems.size() < 2)
+        return false;
+
+      // A generated-argument reference maps one forwarder formal to the callee
+      // actual list.  For a fixed formal this is a one-tuple-element mapping;
+      // for a variadic forwarder formal it represents the entire remaining tuple
+      // tail, which is why later edits must be positional rather than keyed by
+      // old text.
+      struct GeneratedArgRef {
+        uint32_t forwarderParamIdx = 0;
+        bool variadicPack = false;
+      };
+
+      const auto &forwarderToks = forwarderDefinition->replacementTokens;
+      if (forwarderToks.size() < 4)
+        return false;
+      if (forwarderToks[0].kind !=
+              RefoldModel::MacroReplacementTokenKind::ParamRef ||
+          !forwarderToks[0].paramIndex)
+        return false;
+      const uint32_t calleeForwarderParam = *forwarderToks[0].paramIndex;
+      if (calleeForwarderParam >= forwarderDefinition->defParams.size() ||
+          calleeForwarderParam >= tupleElems.size())
+        return false;
+      if (forwarderToks[1].kind !=
+              RefoldModel::MacroReplacementTokenKind::Literal ||
+          forwarderToks[1].spelling != "(" ||
+          forwarderToks.back().kind !=
+              RefoldModel::MacroReplacementTokenKind::Literal ||
+          forwarderToks.back().spelling != ")")
+        return false;
+
+      // Accept only a direct generated-call replacement list:
+      //   calleeFormal '(' generatedActualFormals... ')'
+      // The callee formal itself is not rewritten here; it is resolved to a
+      // function-like macro definition below, while the remaining formals become
+      // positional tuple-edit targets.
+      SmallVector<GeneratedArgRef, 8> generatedArgs;
+      for (size_t i = 2, e = forwarderToks.size() - 1; i < e; ++i) {
+        const auto &tok = forwarderToks[i];
+        if (tok.spelling == "#" || tok.spelling == "##" ||
+            tok.spelling == "__VA_OPT__")
+          return false;
+        if (tok.kind != RefoldModel::MacroReplacementTokenKind::ParamRef)
+          continue;
+        if (!tok.paramIndex || *tok.paramIndex >=
+                                   forwarderDefinition->defParams.size())
+          return false;
+        if (*tok.paramIndex == calleeForwarderParam)
+          return false;
+        GeneratedArgRef ref;
+        ref.forwarderParamIdx = *tok.paramIndex;
+        ref.variadicPack = forwarderDefinition->defParams[*tok.paramIndex].variadic;
+        generatedArgs.push_back(ref);
+      }
+      if (generatedArgs.empty())
+        return false;
+
+      auto tupleElementText = [&](size_t elemIdx) -> StringRef {
+        const TupleElementSlice &elem = tupleElems[elemIdx];
+        return tuplePayload.slice(elem.trimBegin, elem.trimEnd).trim();
+      };
+
+      auto resolveFunctionLikeCallee = [&](StringRef calleeSpelling)
+          -> const RefoldModel::MacroDirective * {
+        // Resolve the tuple's callee element to the unique function-like macro
+        // whose replacement list can explain the observed generated expansion.
+        // A direct function-like name is preferred.  A single-token object-like
+        // alias is allowed only as a proof aid, so source text such as `FSEL` is
+        // preserved while the replay uses the aliased function-like definition.
+        const RefoldModel::MacroDirective *direct = nullptr;
+        for (const RefoldModel::MacroDirective &directive :
+             model_.GetMacroDirectives()) {
+          if (directive.subkind == "#define" && directive.functionLike &&
+              directive.name == calleeSpelling) {
+            if (direct)
+              return nullptr;
+            direct = &directive;
+          }
+        }
+        if (direct)
+          return direct;
+
+        // Also accept a single-token object-like alias for the callee name,
+        // e.g. `#define FSEL ADD_ONE` in a tuple element.  The source spelling
+        // remains `FSEL`; the alias is used only to prove the generated callee's
+        // expansion against the observed PP text.
+        const RefoldModel::MacroDirective *alias = nullptr;
+        for (const RefoldModel::MacroDirective &directive :
+             model_.GetMacroDirectives()) {
+          if (directive.subkind == "#define" && !directive.functionLike &&
+              directive.name == calleeSpelling) {
+            if (alias)
+              return nullptr;
+            alias = &directive;
+          }
+        }
+        if (!alias || alias->replacementTokens.size() != 1 ||
+            alias->replacementTokens[0].kind !=
+                RefoldModel::MacroReplacementTokenKind::Literal)
+          return nullptr;
+
+        const StringRef aliasedName = alias->replacementTokens[0].spelling;
+        const RefoldModel::MacroDirective *resolved = nullptr;
+        for (const RefoldModel::MacroDirective &directive :
+             model_.GetMacroDirectives()) {
+          if (directive.subkind == "#define" && directive.functionLike &&
+              directive.name == aliasedName) {
+            if (resolved)
+              return nullptr;
+            resolved = &directive;
+          }
+        }
+        return resolved;
+      };
+
+      const StringRef calleeSourceText =
+          tupleElementText(static_cast<size_t>(calleeForwarderParam));
+      const RefoldModel::MacroDirective *calleeDefinition =
+          resolveFunctionLikeCallee(calleeSourceText);
+      if (!calleeDefinition || calleeDefinition->defParams.empty())
+        return false;
+
+      // Read the generated actuals from the original tuple spelling.  This is
+      // positional, so duplicate spellings like `(ADD2, 10, 10)` remain
+      // distinguishable by tuple slot even though their text is identical.
+      SmallVector<StringRef, 8> oldGeneratedActualPieces;
+      for (const GeneratedArgRef &ref : generatedArgs) {
+        if (ref.variadicPack) {
+          if (ref.forwarderParamIdx >= tupleElems.size())
+            return false;
+          for (size_t i = ref.forwarderParamIdx; i < tupleElems.size(); ++i)
+            oldGeneratedActualPieces.push_back(tupleElementText(i));
+          continue;
+        }
+        if (ref.forwarderParamIdx >= tupleElems.size())
+          return false;
+        oldGeneratedActualPieces.push_back(
+            tupleElementText(ref.forwarderParamIdx));
+      }
+
+      const bool calleeHasVariadic = !calleeDefinition->defParams.empty() &&
+                                     calleeDefinition->defParams.back().variadic;
+      const size_t fixedCalleeActuals = calleeHasVariadic
+                                            ? calleeDefinition->defParams.size() - 1
+                                            : calleeDefinition->defParams.size();
+      if ((!calleeHasVariadic &&
+           oldGeneratedActualPieces.size() != calleeDefinition->defParams.size()) ||
+          (calleeHasVariadic && oldGeneratedActualPieces.size() < fixedCalleeActuals))
+        return false;
+
+      // Repackage the tuple pieces as the actual list of the generated callee.
+      // For a variadic callee, all generated tail pieces are joined into the one
+      // variadic formal spelling; the inverse mapping back to tuple elements is
+      // performed after solving the new expansion.
+      SmallVector<std::string, 8> oldActuals;
+      oldActuals.reserve(calleeDefinition->defParams.size());
+      for (size_t i = 0; i < fixedCalleeActuals; ++i)
+        oldActuals.push_back(oldGeneratedActualPieces[i].str());
+      if (calleeHasVariadic) {
+        std::string variadicText;
+        raw_string_ostream os(variadicText);
+        for (size_t i = fixedCalleeActuals; i < oldGeneratedActualPieces.size();
+             ++i) {
+          if (i != fixedCalleeActuals)
+            os << ", ";
+          os << oldGeneratedActualPieces[i].trim();
+        }
+        os.flush();
+        oldActuals.push_back(std::move(variadicText));
+      }
+      if (oldActuals.size() != calleeDefinition->defParams.size())
+        return false;
+
+      // Token view used for callee replay.  The spelling sequence proves the
+      // replacement-list grammar; the byte offsets let a solved token interval
+      // be converted back to exact text for a tuple slot.
+      struct ReplayTok {
+        std::string spelling;
+        size_t begin = 0;
+        size_t end = 0;
+      };
+      auto lexReplayTokens = [&](StringRef text,
+                                 SmallVectorImpl<ReplayTok> &out) {
+        out.clear();
+        SmallVector<LexBoundaryToken, 32> toks;
+        lexBoundaryTokens(text, lexLang_, toks);
+        for (const LexBoundaryToken &tok : toks)
+          out.push_back(ReplayTok{tok.Spelling, tok.Begin, tok.End});
+      };
+
+      auto tokenSpellingsForText = [&](StringRef text) {
+        SmallVector<ReplayTok, 16> toks;
+        lexReplayTokens(text, toks);
+        SmallVector<std::string, 16> out;
+        for (const ReplayTok &tok : toks)
+          out.push_back(tok.spelling);
+        return out;
+      };
+
+      // Normalized callee replacement-list tree.  This mirrors ReplayElem above
+      // but is local to the generated callee: literals must match exactly,
+      // params become solved callee actual ranges, and VA_OPT recursively models
+      // the erased/exposed payload.
+      enum class CalleeReplayKind { Literal, Param, VaOpt };
+      struct CalleeReplayElem {
+        CalleeReplayKind kind = CalleeReplayKind::Literal;
+        std::string literal;
+        uint32_t paramIdx = 0;
+        std::vector<CalleeReplayElem> children;
+      };
+
+      // Parse the callee replacement list into the replay tree.  Stringification
+      // and paste are rejected because tuple-slot reconstruction would need the
+      // dedicated stringify/paste proofs to invert those transforms.
+      std::function<bool(size_t, size_t, std::vector<CalleeReplayElem> &)>
+          parseCalleeReplayRange;
+      parseCalleeReplayRange = [&](size_t begin, size_t end,
+                                   std::vector<CalleeReplayElem> &out) {
+        for (size_t i = begin; i < end;) {
+          const auto &tok = calleeDefinition->replacementTokens[i];
+          if (tok.kind == RefoldModel::MacroReplacementTokenKind::ParamRef) {
+            if (!tok.paramIndex || *tok.paramIndex >= oldActuals.size())
+              return false;
+            CalleeReplayElem elem;
+            elem.kind = CalleeReplayKind::Param;
+            elem.paramIdx = *tok.paramIndex;
+            out.push_back(std::move(elem));
+            ++i;
+            continue;
+          }
+          if (tok.spelling == "#" || tok.spelling == "##")
+            return false;
+          if (tok.spelling == "__VA_OPT__") {
+            if (i + 1 >= end ||
+                calleeDefinition->replacementTokens[i + 1].kind !=
+                    RefoldModel::MacroReplacementTokenKind::Literal ||
+                calleeDefinition->replacementTokens[i + 1].spelling != "(")
+              return false;
+            unsigned depth = 1;
+            size_t j = i + 2;
+            for (; j < end; ++j) {
+              const auto &inner = calleeDefinition->replacementTokens[j];
+              if (inner.kind != RefoldModel::MacroReplacementTokenKind::Literal)
+                continue;
+              if (inner.spelling == "(") {
+                ++depth;
+                continue;
+              }
+              if (inner.spelling == ")") {
+                if (--depth == 0)
+                  break;
+              }
+            }
+            if (depth != 0 || j >= end)
+              return false;
+            CalleeReplayElem elem;
+            elem.kind = CalleeReplayKind::VaOpt;
+            if (!parseCalleeReplayRange(i + 2, j, elem.children))
+              return false;
+            out.push_back(std::move(elem));
+            i = j + 1;
+            continue;
+          }
+          CalleeReplayElem elem;
+          elem.kind = CalleeReplayKind::Literal;
+          elem.literal = tok.spelling.str();
+          out.push_back(std::move(elem));
+          ++i;
+        }
+        return true;
+      };
+
+      std::vector<CalleeReplayElem> calleePattern;
+      if (!parseCalleeReplayRange(0, calleeDefinition->replacementTokens.size(),
+                                  calleePattern) || calleePattern.empty())
+        return false;
+
+      SmallVector<SmallVector<std::string, 16>, 8> oldActualTokSpellings;
+      for (const std::string &actual : oldActuals)
+        oldActualTokSpellings.push_back(tokenSpellingsForText(actual));
+
+      // Verify that the old generated expansion is actually explained by the
+      // tuple-derived callee actuals.  This is the A-side proof for the tuple
+      // bridge; without it, solving the new text alone could rewrite an
+      // unrelated whole-argument expansion that merely happens to look similar.
+      std::function<void(ArrayRef<CalleeReplayElem>, ArrayRef<ReplayTok>, size_t,
+                         SmallVectorImpl<size_t> &)>
+          matchOldEnds;
+      matchOldEnds = [&](ArrayRef<CalleeReplayElem> elems,
+                         ArrayRef<ReplayTok> toks, size_t pos,
+                         SmallVectorImpl<size_t> &ends) {
+        if (elems.empty()) {
+          ends.push_back(pos);
+          return;
+        }
+        const CalleeReplayElem &elem = elems.front();
+        ArrayRef<CalleeReplayElem> rest = elems.drop_front();
+        switch (elem.kind) {
+        case CalleeReplayKind::Literal:
+          if (pos < toks.size() && toks[pos].spelling == elem.literal)
+            matchOldEnds(rest, toks, pos + 1, ends);
+          return;
+        case CalleeReplayKind::Param: {
+          const auto &expected = oldActualTokSpellings[elem.paramIdx];
+          if (pos + expected.size() > toks.size())
+            return;
+          for (size_t i = 0; i < expected.size(); ++i)
+            if (toks[pos + i].spelling != expected[i])
+              return;
+          matchOldEnds(rest, toks, pos + expected.size(), ends);
+          return;
+        }
+        case CalleeReplayKind::VaOpt: {
+          matchOldEnds(rest, toks, pos, ends);
+          SmallVector<size_t, 4> childEnds;
+          matchOldEnds(elem.children, toks, pos, childEnds);
+          for (size_t childEnd : childEnds)
+            if (childEnd != pos)
+              matchOldEnds(rest, toks, childEnd, ends);
+          return;
+        }
+        }
+      };
+
+      auto matchOldExpansion = [&](StringRef oldExpansion) {
+        SmallVector<ReplayTok, 32> toks;
+        lexReplayTokens(oldExpansion, toks);
+        SmallVector<size_t, 4> ends;
+        matchOldEnds(calleePattern, toks, 0, ends);
+        return llvm::is_contained(ends, toks.size());
+      };
+
+      auto solveNewExpansion = [&](StringRef newExpansion)
+          -> std::optional<SmallVector<std::string, 8>> {
+        // Invert the callee replacement-list grammar over the B-side expansion
+        // and recover the new callee actual text.  Repeated formal references
+        // must bind to identical token spellings, and the result is accepted
+        // only when there is exactly one solution.  This is what makes duplicate
+        // tuple values safe: slots are solved by replay position, not by text.
+        SmallVector<ReplayTok, 32> toks;
+        lexReplayTokens(newExpansion, toks);
+        SmallVector<std::optional<std::pair<size_t, size_t>>, 8> assigned;
+        assigned.resize(calleeDefinition->defParams.size());
+        SmallVector<SmallVector<std::string, 8>, 4> solutions;
+
+        std::function<void(ArrayRef<CalleeReplayElem>, size_t,
+                           SmallVector<std::optional<std::pair<size_t, size_t>>, 8> &)>
+            dfs;
+        dfs = [&](ArrayRef<CalleeReplayElem> elems, size_t tokPos,
+                  SmallVector<std::optional<std::pair<size_t, size_t>>, 8>
+                      &curAssigned) {
+          if (solutions.size() > 1)
+            return;
+          if (elems.empty()) {
+            if (tokPos != toks.size())
+              return;
+            SmallVector<std::string, 8> actuals;
+            for (const auto &range : curAssigned) {
+              if (!range)
+                return;
+              if (range->first == range->second) {
+                actuals.push_back(std::string());
+                continue;
+              }
+              const size_t byteBegin = toks[range->first].begin;
+              const size_t byteEnd = toks[range->second - 1].end;
+              actuals.push_back(newExpansion.slice(byteBegin, byteEnd).str());
+            }
+            solutions.push_back(std::move(actuals));
+            return;
+          }
+
+          const CalleeReplayElem &elem = elems.front();
+          ArrayRef<CalleeReplayElem> rest = elems.drop_front();
+          switch (elem.kind) {
+          case CalleeReplayKind::Literal:
+            if (tokPos < toks.size() && toks[tokPos].spelling == elem.literal)
+              dfs(rest, tokPos + 1, curAssigned);
+            return;
+          case CalleeReplayKind::Param: {
+            if (elem.paramIdx >= curAssigned.size())
+              return;
+            if (curAssigned[elem.paramIdx]) {
+              const auto range = *curAssigned[elem.paramIdx];
+              const size_t width = range.second - range.first;
+              if (tokPos + width <= toks.size()) {
+                bool same = true;
+                for (size_t i = 0; i < width; ++i) {
+                  if (toks[range.first + i].spelling !=
+                      toks[tokPos + i].spelling) {
+                    same = false;
+                    break;
+                  }
+                }
+                if (same)
+                  dfs(rest, tokPos + width, curAssigned);
+              }
+              return;
+            }
+            for (size_t end = tokPos; end <= toks.size(); ++end) {
+              curAssigned[elem.paramIdx] = std::make_pair(tokPos, end);
+              dfs(rest, end, curAssigned);
+              curAssigned[elem.paramIdx].reset();
+              if (solutions.size() > 1)
+                return;
+            }
+            return;
+          }
+          case CalleeReplayKind::VaOpt: {
+            dfs(rest, tokPos, curAssigned);
+            SmallVector<std::optional<std::pair<size_t, size_t>>, 8>
+                withPayload = curAssigned;
+            std::function<void(ArrayRef<CalleeReplayElem>, size_t,
+                               SmallVector<std::optional<std::pair<size_t, size_t>>, 8> &)>
+                dfsChild;
+            dfsChild = [&](ArrayRef<CalleeReplayElem> childElems,
+                           size_t childTokPos,
+                           SmallVector<std::optional<std::pair<size_t, size_t>>, 8>
+                               &childAssigned) {
+              if (childElems.empty()) {
+                if (childTokPos != tokPos)
+                  dfs(rest, childTokPos, childAssigned);
+                return;
+              }
+              const CalleeReplayElem &child = childElems.front();
+              ArrayRef<CalleeReplayElem> childRest = childElems.drop_front();
+              switch (child.kind) {
+              case CalleeReplayKind::Literal:
+                if (childTokPos < toks.size() &&
+                    toks[childTokPos].spelling == child.literal)
+                  dfsChild(childRest, childTokPos + 1, childAssigned);
+                return;
+              case CalleeReplayKind::Param: {
+                if (child.paramIdx >= childAssigned.size())
+                  return;
+                if (childAssigned[child.paramIdx]) {
+                  const auto range = *childAssigned[child.paramIdx];
+                  const size_t width = range.second - range.first;
+                  if (childTokPos + width <= toks.size()) {
+                    bool same = true;
+                    for (size_t i = 0; i < width; ++i) {
+                      if (toks[range.first + i].spelling !=
+                          toks[childTokPos + i].spelling) {
+                        same = false;
+                        break;
+                      }
+                    }
+                    if (same)
+                      dfsChild(childRest, childTokPos + width, childAssigned);
+                  }
+                  return;
+                }
+                for (size_t end = childTokPos; end <= toks.size(); ++end) {
+                  childAssigned[child.paramIdx] =
+                      std::make_pair(childTokPos, end);
+                  dfsChild(childRest, end, childAssigned);
+                  childAssigned[child.paramIdx].reset();
+                  if (solutions.size() > 1)
+                    return;
+                }
+                return;
+              }
+              case CalleeReplayKind::VaOpt:
+                return;
+              }
+            };
+            dfsChild(elem.children, tokPos, withPayload);
+            return;
+          }
+          }
+        };
+
+        dfs(calleePattern, 0, assigned);
+        if (solutions.size() != 1)
+          return std::nullopt;
+        return solutions.front();
+      };
+
+      // Every observed occurrence of the parent argument must agree on the same
+      // solved generated-callee actuals.  If one occurrence cannot be explained
+      // by the old tuple-derived call, or if two occurrences imply different B
+      // actuals, the tuple bridge is unproved.
+      std::optional<SmallVector<std::string, 8>> mergedSolvedActuals;
+      for (const OccObservation &obs : occObservations) {
+        if (!matchOldExpansion(obs.oldText))
+          continue;
+        auto solved = solveNewExpansion(obs.newText);
+        if (!solved || solved->size() != calleeDefinition->defParams.size())
+          return false;
+        if (!mergedSolvedActuals) {
+          mergedSolvedActuals = std::move(*solved);
+          continue;
+        }
+        if (mergedSolvedActuals->size() != solved->size())
+          return false;
+        for (size_t i = 0; i < solved->size(); ++i)
+          if (StringRef((*mergedSolvedActuals)[i]).trim() !=
+              StringRef((*solved)[i]).trim())
+            return false;
+      }
+      if (!mergedSolvedActuals)
+        return false;
+
+      // Split the solved callee actuals back into the generated tuple pieces.
+      // A non-empty variadic tail appends more tuple elements; an empty tail
+      // deletes the old variadic tail slice during the tuple-edit pass below.
+      SmallVector<std::string, 8> newGeneratedPieces;
+      for (size_t i = 0; i < fixedCalleeActuals; ++i)
+        newGeneratedPieces.push_back((*mergedSolvedActuals)[i]);
+      if (calleeHasVariadic) {
+        StringRef tail = StringRef((*mergedSolvedActuals).back()).trim();
+        if (!tail.empty())
+          newGeneratedPieces.push_back(tail.str());
+      }
+
+      // Translate the solved callee actuals back to the tuple elements consumed
+      // by the forwarding macro.  Non-variadic forwarding parameters map to one
+      // tuple element each.  A variadic forwarding parameter maps to the whole
+      // remaining tuple tail, so insertion/removal of callee variadic actuals is
+      // represented by replacing that tail slice.
+      struct TupleEdit {
+        size_t begin = 0;
+        size_t end = 0;
+        std::string text;
+      };
+      SmallVector<TupleEdit, 8> edits;
+      size_t pieceCursor = 0;
+      for (const GeneratedArgRef &ref : generatedArgs) {
+        if (ref.variadicPack) {
+          if (ref.forwarderParamIdx >= tupleElems.size())
+            return false;
+          std::string text;
+          raw_string_ostream os(text);
+          bool first = true;
+          while (pieceCursor < newGeneratedPieces.size()) {
+            if (!first)
+              os << ", ";
+            first = false;
+            os << StringRef(newGeneratedPieces[pieceCursor]).trim();
+            ++pieceCursor;
+          }
+          os.flush();
+          const TupleElementSlice &firstElem = tupleElems[ref.forwarderParamIdx];
+          const TupleElementSlice &lastElem = tupleElems.back();
+          edits.push_back(
+              TupleEdit{firstElem.trimBegin, lastElem.trimEnd, std::move(text)});
+          continue;
+        }
+        if (pieceCursor >= newGeneratedPieces.size() ||
+            ref.forwarderParamIdx >= tupleElems.size())
+          return false;
+        const TupleElementSlice &elem = tupleElems[ref.forwarderParamIdx];
+        StringRef newText = StringRef(newGeneratedPieces[pieceCursor]).trim();
+        if (newText != tuplePayload.slice(elem.trimBegin, elem.trimEnd).trim())
+          edits.push_back(TupleEdit{elem.trimBegin, elem.trimEnd,
+                                    newText.str()});
+        ++pieceCursor;
+      }
+      if (pieceCursor != newGeneratedPieces.size())
+        return false;
+      if (edits.empty())
+        return false;
+
+      llvm::sort(edits, [](const TupleEdit &lhs, const TupleEdit &rhs) {
+        if (lhs.begin != rhs.begin)
+          return lhs.begin > rhs.begin;
+        return lhs.end > rhs.end;
+      });
+
+      std::string rebuiltPayload = tuplePayload.str();
+      size_t previousBegin = std::numeric_limits<size_t>::max();
+      for (const TupleEdit &edit : edits) {
+        if (edit.end < edit.begin || edit.end > rebuiltPayload.size())
+          return false;
+        if (previousBegin != std::numeric_limits<size_t>::max() &&
+            edit.end > previousBegin)
+          return false;
+        previousBegin = edit.begin;
+        rebuiltPayload = stringutils::replaceRange(
+            rebuiltPayload, edit.begin, edit.end, edit.text);
+      }
+
+      outNewArg = ("(" + StringRef(rebuiltPayload).trim().str() + ")");
+      trace("macro/tuple",
+            "tuple-forward rebuilt root id={0} name={1} argIdx={2} "
+            "direct-parent generated callee parentTrim='{3}' rebuilt='{4}'",
+            m.id, m.name, callerArgIdx,
+            stringutils::showWsWithClip(parentTrim, 200),
+            stringutils::showWsWithClip(outNewArg, 200));
+      return true;
+    };
+
+    if (tryParentTupleGeneratedCalleeRewrite())
+      return true;
 
     const RefoldModel::MacroInvocation *tupleChild = nullptr;
     TupleRewriteMode rewriteMode = TupleRewriteMode::None;
