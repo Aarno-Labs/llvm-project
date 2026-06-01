@@ -12,21 +12,97 @@
 //===----------------------------------------------------------------------===//
 
 
+
+std::vector<std::pair<uint64_t, uint64_t>>
+RefoldEngine::CounterOutputRangesForInvocation(
+    const RefoldModel::MacroInvocation &macro) const {
+  std::vector<std::pair<uint64_t, uint64_t>> ranges;
+
+  auto addRange = [&](uint64_t begin, uint64_t end) {
+    if (end >= begin)
+      ranges.emplace_back(begin, end);
+  };
+
+  if (!macro.bodySpans.empty()) {
+    for (const RefoldModel::PPSpan &span : macro.bodySpans)
+      if (span.IsValid())
+        addRange(span.begin, span.end);
+    return ranges;
+  }
+
+  if (!macro.spans.empty()) {
+    for (const RefoldModel::PPSpan &span : macro.spans)
+      if (span.IsValid())
+        addRange(span.begin, span.end);
+    return ranges;
+  }
+
+  if (macro.cover.IsValid())
+    addRange(macro.cover.begin, macro.cover.end);
+  return ranges;
+}
+
+std::string RefoldEngine::CounterValueForTokenRange(uint64_t begin,
+                                                    uint64_t end) const {
+  std::string value;
+  llvm::raw_string_ostream os(value);
+  if (end <= begin || begin >= aToks_.size())
+    return value;
+  const uint64_t clampedEnd = std::min<uint64_t>(end, aToks_.size());
+  for (uint64_t i = begin; i < clampedEnd; ++i) {
+    if (i != begin)
+      os << ' ';
+    os << aToks_[static_cast<size_t>(i)].spelling;
+  }
+  return os.str();
+}
+
+RefoldEngine::CounterEventIdentity RefoldEngine::BuildCounterEventIdentity(
+    const RefoldModel::MacroInvocation &macro, uint64_t occurrenceOrdinal,
+    uint64_t begin, uint64_t end,
+    std::optional<uint64_t> ownerIncludeOverride) const {
+  if (end == begin && begin < aToks_.size())
+    end = begin + 1;
+
+  CounterEventIdentity event;
+  event.macroInvocationId = macro.id;
+  event.occurrenceOrdinal = occurrenceOrdinal;
+  event.ownerIncludeId = ownerIncludeOverride ? ownerIncludeOverride
+                                              : macro.ownerIncludeId;
+  event.callerMacroId = macro.callerMacroId;
+  event.aTokenBegin = begin;
+  event.aTokenEnd = end;
+  if (macro.invFile)
+    event.expansionSiteFile = macro.invFile->str();
+  event.expansionSiteBegin = macro.invB;
+  event.expansionSiteEnd = macro.invE;
+  event.aValue = CounterValueForTokenRange(begin, end);
+  event.canStabilizeByLiteralization = begin < end && end <= aToks_.size();
+  event.canStabilizeByMaterialization = macro.invFile && macro.invB && macro.invE;
+  return event;
+}
+
 SmallVector<RefoldEngine::CounterOccurrence, 32>
 RefoldEngine::CollectCounterOccurrences(StringRef tuPath) const {
   SmallVector<CounterOccurrence, 32> occs;
 
+  uint64_t occurrenceOrdinal = 0;
+
   // Record a __COUNTER__ occurrence in PP-token space. Zero-length producer
   // anchors are widened to one token so pasted/stringified counter output still
-  // participates in stabilization.
+  // participates in stabilization.  Phase 3G also attaches a stable
+  // CounterEventIdentity so the stabilization proof names a concrete counter
+  // event rather than a global textual guess.
   auto addOcc = [&](const RefoldModel::MacroInvocation &mi, uint64_t b,
                     uint64_t e) {
-    if (e > b) {
-      occs.push_back(CounterOccurrence{&mi, b, e, std::nullopt});
-      return;
-    }
     if (e == b && b < aToks_.size())
-      occs.push_back(CounterOccurrence{&mi, b, b + 1, std::nullopt});
+      e = b + 1;
+    if (e <= b)
+      return;
+
+    CounterEventIdentity event =
+        BuildCounterEventIdentity(mi, occurrenceOrdinal++, b, e);
+    occs.push_back(CounterOccurrence{&mi, b, e, std::nullopt, event});
   };
 
   // Collect all recorded __COUNTER__ outputs. Prefer the most precise producer
@@ -49,9 +125,14 @@ RefoldEngine::CollectCounterOccurrences(StringRef tuPath) const {
       continue;
     }
 
-    if (mi.cover.IsValid() && mi.cover.end > mi.cover.begin)
-      occs.push_back(
-          CounterOccurrence{&mi, mi.cover.begin, mi.cover.end, std::nullopt});
+    // Finally fall back to the producer cover.  Phase 8f classifies the
+    // former zero-length fallback-cover path as ordinary counter-state
+    // stabilization: a zero-width cover is not a byte-rescue fallback, it is a
+    // producer anchor for the concrete counter literal token.  Normalize it
+    // through addOcc() so the same one-token widening used for body/spans also
+    // applies to fallback covers.
+    if (mi.cover.IsValid())
+      addOcc(mi, mi.cover.begin, mi.cover.end);
   }
 
   if (occs.empty())
@@ -80,8 +161,10 @@ RefoldEngine::CollectCounterOccurrences(StringRef tuPath) const {
         *occ.macro->ownerIncludeId != *ownerInc)
       continue;
 
-    filtered.push_back(
-        CounterOccurrence{occ.macro, occ.aStart, occ.aEnd, ownerInc});
+    CounterOccurrence normalized = occ;
+    normalized.ownerIncludeId = ownerInc;
+    normalized.event.ownerIncludeId = ownerInc;
+    filtered.push_back(std::move(normalized));
   }
 
   SortCounterOccurrences(filtered);
@@ -176,8 +259,12 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
       return false;
     }
 
-    if (m.cover.IsValid() && m.cover.end > m.cover.begin)
-      return spanEdited(m.cover.begin, m.cover.end);
+    if (m.cover.IsValid()) {
+      if (m.cover.end > m.cover.begin)
+        return spanEdited(m.cover.begin, m.cover.end);
+      if (m.cover.end == m.cover.begin && m.cover.begin < aToks_.size())
+        return spanEdited(m.cover.begin, m.cover.begin + 1);
+    }
 
     return false;
   };
@@ -222,43 +309,21 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
 
     auto computeOccRange = [&](const RefoldModel::MacroInvocation &m)
         -> std::optional<std::pair<uint64_t, uint64_t>> {
-      // Prefer the precise body slice when available.
-      if (!m.bodySpans.empty()) {
-        uint64_t lo = std::numeric_limits<uint64_t>::max();
-        uint64_t hi = 0;
-        for (const auto &s : m.bodySpans) {
-          if (s.begin < s.end) {
-            lo = std::min(lo, s.begin);
-            hi = std::max(hi, s.end);
-          }
-        }
-        if (lo != std::numeric_limits<uint64_t>::max() && lo < hi)
-          return std::make_pair(lo, hi);
+      uint64_t lo = std::numeric_limits<uint64_t>::max();
+      uint64_t hi = 0;
+      for (const auto &range : CounterOutputRangesForInvocation(m)) {
+        uint64_t begin = range.first;
+        uint64_t end = range.second;
+        if (end == begin && begin < aToks_.size())
+          end = begin + 1;
+        if (end <= begin)
+          continue;
+        lo = std::min(lo, begin);
+        hi = std::max(hi, end);
       }
-
-      // Next, use explicit spans. Zero-length anchors are widened to the
-      // anchored token so paste/stringify counter outputs still have a concrete
-      // comparison range.
-      if (!m.spans.empty()) {
-        uint64_t lo = std::numeric_limits<uint64_t>::max();
-        uint64_t hi = 0;
-        for (const auto &s : m.spans) {
-          if (s.begin < s.end) {
-            lo = std::min(lo, s.begin);
-            hi = std::max(hi, s.end);
-          } else if (s.begin == s.end && s.begin < aToks_.size()) {
-            lo = std::min(lo, s.begin);
-            hi = std::max(hi, s.begin + 1);
-          }
-        }
-        if (lo != std::numeric_limits<uint64_t>::max() && lo < hi)
-          return std::make_pair(lo, hi);
-      }
-
-      if (m.cover.IsValid() && m.cover.end > m.cover.begin)
-        return std::make_pair(m.cover.begin, m.cover.end);
-
-      return std::nullopt;
+      if (lo == std::numeric_limits<uint64_t>::max() || lo >= hi)
+        return std::nullopt;
+      return std::make_pair(lo, hi);
     };
 
     SmallVector<CounterOccurrence, 32> lifted;
@@ -272,8 +337,11 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
       if (!r)
         continue;
 
-      lifted.push_back(
-          CounterOccurrence{root, r->first, r->second, root->ownerIncludeId});
+      CounterEventIdentity event = BuildCounterEventIdentity(
+          *root, o.event.occurrenceOrdinal, r->first, r->second,
+          root->ownerIncludeId);
+      lifted.push_back(CounterOccurrence{root, r->first, r->second,
+                                         root->ownerIncludeId, event});
     }
 
     if (!lifted.empty()) {
@@ -333,7 +401,7 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
     if (!seen.insert(key).second)
       continue;
 
-    forced.push_back({root, o.aStart, o.aEnd});
+    forced.push_back({root, o.aStart, o.aEnd, o.event});
 
     trace("counter",
           "__COUNTER__: force root id={0} name='{1}' ownerInc={2} "
@@ -426,7 +494,7 @@ RefoldEngine::ComputeForcedCounterPatchesFromExpandedMacros(
     if (!seen.insert(key).second)
       continue;
 
-    forced.push_back({root, o.aStart, o.aEnd});
+    forced.push_back({root, o.aStart, o.aEnd, o.event});
     trace("counter",
           "__COUNTER__: expanded-macro stabilization firstExpandedIdx={0} "
           "force root id={1} name='{2}' ownerInc={3} inv=[{4},{5}) for occ "

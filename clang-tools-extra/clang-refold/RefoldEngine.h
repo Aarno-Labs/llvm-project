@@ -15,31 +15,40 @@
 // TU-owned / include-owned / macro-invocation–owned, and materializes a new
 // TU that incorporates edits while preserving original structure and semantics.
 //
-// Closed-Domain Completeness Contract
-// -----------------------------------
-// clang-refold is intended to be complete for finite owner-closed,
-// state-stable edit tilings.  A refolding is in that strict domain only when
-// each A→B hunk can be partitioned into a deterministic sequence of owners
-// whose source intervals, A-token covers, B-token envelopes, and sideband
-// state transitions are closed under composition.  In that domain, accepted
-// candidates must carry proof that:
-//   • the owner consumes exactly the A tokens it produced and emits exactly
-//     the B tokens assigned to that owner;
+// Strict-Domain Theorem Contract
+// ------------------------------
+// clang-refold's theorem-facing contract is intentionally narrower than “all
+// possible C preprocessor edits.”  It is complete for finite deterministic
+// owner-closed edit tilings whose state-transition summaries compose and whose
+// preserved suffix observers see preprocessing state equivalent to the edited
+// preprocessed stream B.
+//
+// In that domain, the engine must emit source S' such that preprocessing S'
+// produces exactly B.  It enforces the contract by requiring every emitted
+// accepted edit to normalize to one final TheoremProofClass and every rejected or
+// raw-B result to carry a declared TerminalFallbackProofFailure.
+//
+// A hunk is in-domain only when its proof discharges all of the following:
+//   • each owner consumes a closed source interval and exactly the A-token
+//     envelope it produced;
+//   • the owner emits, preserves, or realizes exactly the B-token envelope
+//     assigned to it;
 //   • zero-token state transitions (`#define`, `#undef`, `#line`, include
 //     guard effects, conditionals, pragmas, builtin location/counter state,
-//     etc.) are preserved, replayed, proven dead, or observed only inside the
-//     same closure;
-//   • any preserved suffix sees preprocessing state equivalent to the B-side
-//     state at each observer boundary; and
+//     etc.) are preserved, repaired, widened into the closure, materialized,
+//     or proven unobserved by the preserved suffix;
+//   • mixed-owner hunks tile deterministically, gap-free, and in source order
+//     over both A tokens and B tokens, including zero-token state gaps; and
 //   • no upstream source-state mutation is reverse-solved from a downstream
 //     expansion unless the directive itself lies inside the proven edited
 //     source interval.
 //
 // Inputs outside this contract are not completeness failures.  They must be
-// represented by an explicit failed proof obligation, materialized as a
-// closed owner realization when possible, or rejected/fallen back in a way
-// that preserves token soundness rather than emitting a speculative partial
-// refolding.
+// represented by an explicit failed proof obligation, materialized as a closed
+// owner realization when possible, or rejected/fallen back in a way that
+// preserves token soundness rather than emitting a speculative partial
+// refolding.  The terminology in comments, theorem-audit logs, proof enums,
+// and tests is expected to match this contract.
 //
 // Responsibilities
 // ----------------
@@ -87,12 +96,14 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/JSON.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -664,13 +675,14 @@ private:
   /// output cannot directly edit an arbitrary header.
   std::vector<SidebandPragmaEdit> sidebandPragmaEdits_;
 
-  /// \brief Explicit classification for the remaining terminal fallback exits.
+  /// \brief Explicit classification for terminal out-of-domain exits.
   ///
-  /// The engine no longer retries under more expanded tiers. If a
-  /// helper still cannot discharge into the declared proof lattice, it requests
-  /// the one explicit terminal fallback. Track which exclusion triggered that
-  /// fallback so the completeness boundary is stated in terms of named
-  /// out-of-domain cases rather than an opaque escape hatch.
+  /// Terminal fallback is a theorem carrier, not a rescue algorithm.  If a
+  /// helper cannot discharge into the declared proof lattice, it requests the
+  /// one explicit terminal result and names the exclusion that made the edit
+  /// leave the strict domain.  This keeps completeness boundaries auditable in
+  /// terms of owner closure, deterministic tiling, state stability, producer
+  /// facts, and final validation rather than opaque implementation phases.
   ///
   /// `OwnerUnresolvedNoTUAnchor` is an explicit theorem boundary rather than a
   /// vague implementation leftover. That exclusion means
@@ -712,13 +724,26 @@ private:
 
   /// \brief Named proof obligation that forced the terminal raw-B result.
   ///
-  /// Step 3 of the closed-domain roadmap requires terminal fallback to become a
-  /// proof audit rather than an opaque escape hatch.  These obligations name the
-  /// exact theorem condition that could not be discharged before the engine
-  /// emitted the edited preprocessed stream.
+  /// Terminal fallback is part of the proof system, not a convenience escape.
+  /// Every request must name the theorem obligation that failed.  Keep these
+  /// obligations close to the closed-domain contract: owner closure,
+  /// deterministic tiling, state stability, producer-fact availability, and
+  /// final validation are the only acceptable reasons to emit raw B.
   enum class TerminalFallbackObligationKind : uint8_t {
     Unknown,
     OwnerClosedCover,
+    DeterministicMixedOwnerTiling,
+    StateTransitionClosure,
+    PragmaBoundaryKnown,
+    LineControlStateProducerProven,
+    CounterStateStabilizable,
+    MacroStateStabilizable,
+    IncludeGuardStateStabilizable,
+    ConditionalStateStabilizable,
+    ReverseSolvedDirectiveForbidden,
+    InvocationPreservationWellFormed,
+    ProducerFactsAvailable,
+    FinalValidationSucceeded,
     IncludeRealizationBEnvelopeMapped,
     EmissionArtifactDischarged,
     EmissionEditSetComposable,
@@ -732,6 +757,30 @@ private:
       return "Unknown";
     case TerminalFallbackObligationKind::OwnerClosedCover:
       return "OwnerClosedCover";
+    case TerminalFallbackObligationKind::DeterministicMixedOwnerTiling:
+      return "DeterministicMixedOwnerTiling";
+    case TerminalFallbackObligationKind::StateTransitionClosure:
+      return "StateTransitionClosure";
+    case TerminalFallbackObligationKind::PragmaBoundaryKnown:
+      return "PragmaBoundaryKnown";
+    case TerminalFallbackObligationKind::LineControlStateProducerProven:
+      return "LineControlStateProducerProven";
+    case TerminalFallbackObligationKind::CounterStateStabilizable:
+      return "CounterStateStabilizable";
+    case TerminalFallbackObligationKind::MacroStateStabilizable:
+      return "MacroStateStabilizable";
+    case TerminalFallbackObligationKind::IncludeGuardStateStabilizable:
+      return "IncludeGuardStateStabilizable";
+    case TerminalFallbackObligationKind::ConditionalStateStabilizable:
+      return "ConditionalStateStabilizable";
+    case TerminalFallbackObligationKind::ReverseSolvedDirectiveForbidden:
+      return "ReverseSolvedDirectiveForbidden";
+    case TerminalFallbackObligationKind::InvocationPreservationWellFormed:
+      return "InvocationPreservationWellFormed";
+    case TerminalFallbackObligationKind::ProducerFactsAvailable:
+      return "ProducerFactsAvailable";
+    case TerminalFallbackObligationKind::FinalValidationSucceeded:
+      return "FinalValidationSucceeded";
     case TerminalFallbackObligationKind::IncludeRealizationBEnvelopeMapped:
       return "IncludeRealizationBEnvelopeMapped";
     case TerminalFallbackObligationKind::EmissionArtifactDischarged:
@@ -747,8 +796,29 @@ private:
   }
 
   /// \brief Concrete reason the terminal-fallback obligation failed.
+  ///
+  /// This implementation-local reason preserves precise diagnostics before
+  /// normalization to the final Phase-2A theorem vocabulary below.  The reason
+  /// names the local domain wall; the obligation names the theorem
+  /// condition.  Keeping both makes terminal fallback auditable without having
+  /// to reverse-engineer the implementation phase that requested it.
   enum class TerminalFallbackFailureReason : uint8_t {
     Unknown,
+    NoOwnerClosedCover,
+    NoDeterministicMixedOwnerTiling,
+    AmbiguousMixedOwnerTiling,
+    StateTransitionConsumedAndObserved,
+    UnknownPragmaCrossesBoundary,
+    LineControlStateNotProducerProven,
+    CounterStateNotStabilizable,
+    MacroStateNotStabilizable,
+    IncludeGuardStateNotStabilizable,
+    ConditionalStateNotStabilizable,
+    ReverseSolvedDirectiveRequired,
+    MalformedInvocationPreservation,
+    MissingProducerFacts,
+    NoCanonicalSuffixOrder,
+    ValidationFailure,
     NoTUAnchorForUnresolvedOwner,
     UnmappableIncludeBEnvelope,
     UndischargedEmissionArtifact,
@@ -762,6 +832,36 @@ private:
     switch (reason) {
     case TerminalFallbackFailureReason::Unknown:
       return "Unknown";
+    case TerminalFallbackFailureReason::NoOwnerClosedCover:
+      return "NoOwnerClosedCover";
+    case TerminalFallbackFailureReason::NoDeterministicMixedOwnerTiling:
+      return "NoDeterministicMixedOwnerTiling";
+    case TerminalFallbackFailureReason::AmbiguousMixedOwnerTiling:
+      return "AmbiguousMixedOwnerTiling";
+    case TerminalFallbackFailureReason::StateTransitionConsumedAndObserved:
+      return "StateTransitionConsumedAndObserved";
+    case TerminalFallbackFailureReason::UnknownPragmaCrossesBoundary:
+      return "UnknownPragmaCrossesBoundary";
+    case TerminalFallbackFailureReason::LineControlStateNotProducerProven:
+      return "LineControlStateNotProducerProven";
+    case TerminalFallbackFailureReason::CounterStateNotStabilizable:
+      return "CounterStateNotStabilizable";
+    case TerminalFallbackFailureReason::MacroStateNotStabilizable:
+      return "MacroStateNotStabilizable";
+    case TerminalFallbackFailureReason::IncludeGuardStateNotStabilizable:
+      return "IncludeGuardStateNotStabilizable";
+    case TerminalFallbackFailureReason::ConditionalStateNotStabilizable:
+      return "ConditionalStateNotStabilizable";
+    case TerminalFallbackFailureReason::ReverseSolvedDirectiveRequired:
+      return "ReverseSolvedDirectiveRequired";
+    case TerminalFallbackFailureReason::MalformedInvocationPreservation:
+      return "MalformedInvocationPreservation";
+    case TerminalFallbackFailureReason::MissingProducerFacts:
+      return "MissingProducerFacts";
+    case TerminalFallbackFailureReason::NoCanonicalSuffixOrder:
+      return "NoCanonicalSuffixOrder";
+    case TerminalFallbackFailureReason::ValidationFailure:
+      return "ValidationFailure";
     case TerminalFallbackFailureReason::NoTUAnchorForUnresolvedOwner:
       return "NoTUAnchorForUnresolvedOwner";
     case TerminalFallbackFailureReason::UnmappableIncludeBEnvelope:
@@ -780,26 +880,290 @@ private:
     return "Unknown";
   }
 
+  /// \brief Final theorem-facing terminal failure vocabulary.
+  ///
+  /// Older/local failure reasons may remain for diagnostics, but every live
+  /// terminal fallback must normalize to one of these Phase-2A failure kinds.
+  /// This is the canonical answer to: "which strict-domain obligation failed
+  /// strongly enough to justify the terminal raw-B carrier?"
+  enum class TheoremFallbackFailureKind : uint8_t {
+    Unknown,
+    NoOwnerClosedCover,
+    NoDeterministicMixedOwnerTiling,
+    AmbiguousMixedOwnerTiling,
+    StateTransitionConsumedAndObserved,
+    UnknownPragmaCrossesBoundary,
+    LineControlStateNotProducerProven,
+    CounterStateNotStabilizable,
+    MacroStateNotStabilizable,
+    IncludeGuardStateNotStabilizable,
+    ConditionalStateNotStabilizable,
+    ReverseSolvedDirectiveRequired,
+    MalformedInvocationPreservation,
+    MissingProducerFacts,
+    ValidationFailure,
+  };
+
+  friend inline StringRef toString(TheoremFallbackFailureKind kind) {
+    switch (kind) {
+    case TheoremFallbackFailureKind::Unknown:
+      return "Unknown";
+    case TheoremFallbackFailureKind::NoOwnerClosedCover:
+      return "NoOwnerClosedCover";
+    case TheoremFallbackFailureKind::NoDeterministicMixedOwnerTiling:
+      return "NoDeterministicMixedOwnerTiling";
+    case TheoremFallbackFailureKind::AmbiguousMixedOwnerTiling:
+      return "AmbiguousMixedOwnerTiling";
+    case TheoremFallbackFailureKind::StateTransitionConsumedAndObserved:
+      return "StateTransitionConsumedAndObserved";
+    case TheoremFallbackFailureKind::UnknownPragmaCrossesBoundary:
+      return "UnknownPragmaCrossesBoundary";
+    case TheoremFallbackFailureKind::LineControlStateNotProducerProven:
+      return "LineControlStateNotProducerProven";
+    case TheoremFallbackFailureKind::CounterStateNotStabilizable:
+      return "CounterStateNotStabilizable";
+    case TheoremFallbackFailureKind::MacroStateNotStabilizable:
+      return "MacroStateNotStabilizable";
+    case TheoremFallbackFailureKind::IncludeGuardStateNotStabilizable:
+      return "IncludeGuardStateNotStabilizable";
+    case TheoremFallbackFailureKind::ConditionalStateNotStabilizable:
+      return "ConditionalStateNotStabilizable";
+    case TheoremFallbackFailureKind::ReverseSolvedDirectiveRequired:
+      return "ReverseSolvedDirectiveRequired";
+    case TheoremFallbackFailureKind::MalformedInvocationPreservation:
+      return "MalformedInvocationPreservation";
+    case TheoremFallbackFailureKind::MissingProducerFacts:
+      return "MissingProducerFacts";
+    case TheoremFallbackFailureKind::ValidationFailure:
+      return "ValidationFailure";
+    }
+    return "Unknown";
+  }
+
+  /// Normalize an implementation-local terminal reason to the frozen theorem
+  /// failure vocabulary.  This is the Phase-2A gate that lets legacy/local
+  /// diagnostics coexist with a small final theorem language.
+  static std::optional<TheoremFallbackFailureKind>
+  NormalizeTerminalFallbackFailureReason(
+      TerminalFallbackFailureReason reason) {
+    switch (reason) {
+    case TerminalFallbackFailureReason::NoOwnerClosedCover:
+    case TerminalFallbackFailureReason::NoTUAnchorForUnresolvedOwner:
+      return TheoremFallbackFailureKind::NoOwnerClosedCover;
+    case TerminalFallbackFailureReason::NoDeterministicMixedOwnerTiling:
+      return TheoremFallbackFailureKind::NoDeterministicMixedOwnerTiling;
+    case TerminalFallbackFailureReason::AmbiguousMixedOwnerTiling:
+      return TheoremFallbackFailureKind::AmbiguousMixedOwnerTiling;
+    case TerminalFallbackFailureReason::StateTransitionConsumedAndObserved:
+      return TheoremFallbackFailureKind::StateTransitionConsumedAndObserved;
+    case TerminalFallbackFailureReason::UnknownPragmaCrossesBoundary:
+      return TheoremFallbackFailureKind::UnknownPragmaCrossesBoundary;
+    case TerminalFallbackFailureReason::LineControlStateNotProducerProven:
+      return TheoremFallbackFailureKind::LineControlStateNotProducerProven;
+    case TerminalFallbackFailureReason::CounterStateNotStabilizable:
+      return TheoremFallbackFailureKind::CounterStateNotStabilizable;
+    case TerminalFallbackFailureReason::MacroStateNotStabilizable:
+      return TheoremFallbackFailureKind::MacroStateNotStabilizable;
+    case TerminalFallbackFailureReason::IncludeGuardStateNotStabilizable:
+      return TheoremFallbackFailureKind::IncludeGuardStateNotStabilizable;
+    case TerminalFallbackFailureReason::ConditionalStateNotStabilizable:
+      return TheoremFallbackFailureKind::ConditionalStateNotStabilizable;
+    case TerminalFallbackFailureReason::ReverseSolvedDirectiveRequired:
+      return TheoremFallbackFailureKind::ReverseSolvedDirectiveRequired;
+    case TerminalFallbackFailureReason::MalformedInvocationPreservation:
+      return TheoremFallbackFailureKind::MalformedInvocationPreservation;
+    case TerminalFallbackFailureReason::MissingProducerFacts:
+    case TerminalFallbackFailureReason::NoCanonicalSuffixOrder:
+    case TerminalFallbackFailureReason::UnmappableIncludeBEnvelope:
+    case TerminalFallbackFailureReason::UndischargedEmissionArtifact:
+    case TerminalFallbackFailureReason::TheoremAuditInvariantViolation:
+      return TheoremFallbackFailureKind::MissingProducerFacts;
+    case TerminalFallbackFailureReason::UncomposableEmissionEditSet:
+    case TerminalFallbackFailureReason::MixedExcludedCases:
+      return TheoremFallbackFailureKind::NoDeterministicMixedOwnerTiling;
+    case TerminalFallbackFailureReason::ValidationFailure:
+      return TheoremFallbackFailureKind::ValidationFailure;
+    case TerminalFallbackFailureReason::Unknown:
+    case TerminalFallbackFailureReason::UnclassifiedTerminalFallback:
+      return std::nullopt;
+    }
+    return std::nullopt;
+  }
+
+  /// \brief Structured local facts attached to a terminal proof failure.
+  ///
+  /// Phase 2C makes terminal fallback context data, not prose.  Most fallback
+  /// sites cannot populate every field yet, but the carrier is intentionally
+  /// stable: later phases can attach owner, hunk, state-component, source-span,
+  /// token-envelope, and first-observer evidence without changing the terminal
+  /// witness format again.  Logs are derived from this structure; callers
+  /// should not encode theorem facts only inside a free-form detail string.
+  struct TerminalFallbackFailureContext {
+    std::optional<std::string> owner;
+    std::optional<uint64_t> hunk;
+    std::optional<std::string> stateComponent;
+
+    std::optional<std::string> sourcePath;
+    std::optional<uint64_t> sourceBegin;
+    std::optional<uint64_t> sourceEnd;
+
+    std::optional<uint64_t> aTokenBegin;
+    std::optional<uint64_t> aTokenEnd;
+    std::optional<uint64_t> bTokenBegin;
+    std::optional<uint64_t> bTokenEnd;
+
+    std::optional<std::string> firstObserver;
+
+    static TerminalFallbackFailureContext ForStateComponent(StringRef name) {
+      TerminalFallbackFailureContext context;
+      context.stateComponent = name.str();
+      return context;
+    }
+
+    static TerminalFallbackFailureContext ForHunkTokenEnvelope(
+        uint64_t hunkIndex, uint64_t aBegin, uint64_t aEnd, uint64_t bBegin,
+        uint64_t bEnd) {
+      TerminalFallbackFailureContext context;
+      context.hunk = hunkIndex;
+      context.aTokenBegin = aBegin;
+      context.aTokenEnd = aEnd;
+      context.bTokenBegin = bBegin;
+      context.bTokenEnd = bEnd;
+      return context;
+    }
+
+    bool Empty() const {
+      return !owner && !hunk && !stateComponent && !sourcePath &&
+             !sourceBegin && !sourceEnd && !aTokenBegin && !aTokenEnd &&
+             !bTokenBegin && !bTokenEnd && !firstObserver;
+    }
+
+    std::string Format() const {
+      std::string text;
+      auto appendField = [&](StringRef name, StringRef value) {
+        if (!text.empty())
+          text += " ";
+        text += llvm::formatv("{0}={1}", name, value).str();
+      };
+      auto appendUInt = [&](StringRef name, std::optional<uint64_t> value) {
+        if (value)
+          appendField(name, llvm::formatv("{0}", *value).str());
+      };
+
+      if (owner)
+        appendField("owner", *owner);
+      appendUInt("hunk", hunk);
+      if (stateComponent)
+        appendField("stateComponent", *stateComponent);
+      if (sourcePath)
+        appendField("sourcePath", *sourcePath);
+      appendUInt("sourceBegin", sourceBegin);
+      appendUInt("sourceEnd", sourceEnd);
+      appendUInt("aTokenBegin", aTokenBegin);
+      appendUInt("aTokenEnd", aTokenEnd);
+      appendUInt("bTokenBegin", bTokenBegin);
+      appendUInt("bTokenEnd", bTokenEnd);
+      if (firstObserver)
+        appendField("firstObserver", *firstObserver);
+      return text;
+    }
+  };
+
   /// \brief Normalized proof failure attached to terminal fallback.
   struct TerminalFallbackProofFailure {
     TerminalFallbackObligationKind obligation =
         TerminalFallbackObligationKind::Unknown;
     TerminalFallbackFailureReason reason = TerminalFallbackFailureReason::Unknown;
+    TheoremFallbackFailureKind theoremFailure =
+        TheoremFallbackFailureKind::Unknown;
+    TerminalFallbackFailureContext context;
   };
 
   friend inline std::string
   toString(const TerminalFallbackProofFailure &failure) {
-    return llvm::formatv("failedObligation={0} failureReason={1}",
-                         toString(failure.obligation),
-                         toString(failure.reason))
-        .str();
+    std::string text =
+        llvm::formatv("failedObligation={0} theoremFailure={1} "
+                      "failureReason={2}",
+                      toString(failure.obligation),
+                      toString(failure.theoremFailure),
+                      toString(failure.reason))
+            .str();
+    if (!failure.context.Empty())
+      text += llvm::formatv(" context=({0})", failure.context.Format()).str();
+    return text;
   }
 
-  /// \brief Compact witness describing why the single-pass engine fell back to
-  /// B.
+  /// \brief Return whether a fallback proof failure is theorem-facing.
+  ///
+  /// Phase 2 forbids terminal fallback whose proof still says `Unknown` or
+  /// `Unclassified`.  The guard is deliberately small and shared by request
+  /// recording, terminal-witness construction, and theorem-audit reporting so a
+  /// new fallback path cannot quietly reintroduce an opaque raw-B escape.
+  static bool
+  IsClassifiedTerminalFallbackProofFailure(
+      const TerminalFallbackProofFailure &failure) {
+    return failure.obligation != TerminalFallbackObligationKind::Unknown &&
+           failure.theoremFailure != TheoremFallbackFailureKind::Unknown &&
+           failure.reason != TerminalFallbackFailureReason::Unknown &&
+           failure.reason !=
+               TerminalFallbackFailureReason::UnclassifiedTerminalFallback;
+  }
+
+  /// \brief Build a classified terminal fallback proof failure.
+  ///
+  /// Use this helper at every terminal fallback request site.  It documents the
+  /// local proof obligation being rejected and prevents call sites from relying
+  /// on terminal-fallback kind alone as an implicit classification.
+  static TerminalFallbackProofFailure
+  MakeTerminalFallbackProofFailure(TerminalFallbackObligationKind obligation,
+                                   TerminalFallbackFailureReason reason) {
+    TerminalFallbackProofFailure failure;
+    failure.obligation = obligation;
+    failure.reason = reason;
+    failure.theoremFailure =
+        NormalizeTerminalFallbackFailureReason(reason).value_or(
+            TheoremFallbackFailureKind::Unknown);
+    return failure;
+  }
+
+  /// Build a classified terminal fallback proof failure with structured local
+  /// context.  This overload keeps Phase 2C context population centralized so
+  /// call sites do not have to duplicate the obligation/reason initialization
+  /// sequence before attaching owner, hunk, state, or span facts.
+  static TerminalFallbackProofFailure MakeTerminalFallbackProofFailure(
+      TerminalFallbackObligationKind obligation,
+      TerminalFallbackFailureReason reason,
+      TerminalFallbackFailureContext context) {
+    TerminalFallbackProofFailure failure =
+        MakeTerminalFallbackProofFailure(obligation, reason);
+    failure.context = std::move(context);
+    return failure;
+  }
+
+  /// \brief Compact witness describing why terminal fallback was selected.
+  ///
+  /// This is the theorem-facing carrier for the raw-B exit.  The `kind` records
+  /// the aggregate terminal exclusion, while `proofFailure` records the precise
+  /// failed obligation/reason that Phase 2 requires at each fallback request
+  /// site.  Keep this witness declared before `ProofSummary` and the terminal
+  /// candidate builders so those carriers never have to fall back to a lossy
+  /// enum-only representation.
   struct TerminalFallbackWitness {
     TerminalFallbackKind kind = TerminalFallbackKind::Unknown;
+
+    /// Primary failed obligation used by legacy summary fields and the
+    /// terminal accepted-result carrier.  Phase 2D keeps this as the first
+    /// caller-supplied obligation, but it is no longer the only obligation
+    /// retained when several independent domain walls are discovered.
     TerminalFallbackProofFailure proofFailure;
+
+    /// Ordered list of all classified failed obligations recorded before the
+    /// raw-B terminal carrier was selected.  The first element is the primary
+    /// failure above; later elements are secondary obligations.  This keeps
+    /// MixedExcludedCases theorem-facing instead of collapsing it to a lossy
+    /// aggregate enum or prose-only diagnostic.
+    std::vector<TerminalFallbackProofFailure> proofFailures;
+
     uint32_t requestCount = 0;
     bool hasPrimaryReason = false;
     std::string primaryReason;
@@ -808,65 +1172,49 @@ private:
   friend inline std::string toString(const TerminalFallbackWitness &witness) {
     const StringRef kindName = toString(witness.kind);
     const std::string proofFailure = toString(witness.proofFailure);
-    if (!witness.hasPrimaryReason)
-      return llvm::formatv("kind={0} {1} requestCount={2}", kindName,
+    std::string text;
+    if (!witness.hasPrimaryReason) {
+      text = llvm::formatv("kind={0} {1} requestCount={2}", kindName,
                            proofFailure, witness.requestCount)
-          .str();
-
-    return llvm::formatv(
-               "kind={0} {1} requestCount={2} primaryReason='{3}'", kindName,
-               proofFailure, witness.requestCount,
-               stringutils::showWsWithClip(witness.primaryReason, 200))
-        .str();
-  }
-
-  /// \brief Map a terminal-exclusion class to its theorem obligation.
-  static TerminalFallbackProofFailure
-  ClassifyTerminalFallbackProofFailure(TerminalFallbackKind kind);
-
-  /// \brief Declared fallback-closure classes that sit strictly between
-  /// structural source emission and terminal fallback to B.
-  ///
-  /// Proved partial-expansion fallback introduces the carrier before any
-  /// behavioral change. The engine may only emit one of
-  /// these fallback-expanded results once a concrete witness builder exists and
-  /// can prove a closed owner set, exact frontier, and valid materialization.
-  enum class ExpansionClosureKind : uint8_t {
-    Unknown,
-    MacroOwnerWholeExpansion,
-  };
-
-  friend inline StringRef toString(ExpansionClosureKind kind) {
-    switch (kind) {
-    case ExpansionClosureKind::Unknown:
-      return "Unknown";
-    case ExpansionClosureKind::MacroOwnerWholeExpansion:
-      return "MacroOwnerWholeExpansion";
+                 .str();
+    } else {
+      text = llvm::formatv(
+                 "kind={0} {1} requestCount={2} primaryReason='{3}'", kindName,
+                 proofFailure, witness.requestCount,
+                 stringutils::showWsWithClip(witness.primaryReason, 200))
+                 .str();
     }
-    return "Unknown";
+
+    if (witness.proofFailures.size() > 1) {
+      text += llvm::formatv(" secondaryFailureCount={0} secondaryFailures=[",
+                            witness.proofFailures.size() - 1)
+                  .str();
+      const size_t limit = std::min<size_t>(witness.proofFailures.size(), 5);
+      for (size_t i = 1; i < limit; ++i) {
+        if (i != 1)
+          text += "; ";
+        text += toString(witness.proofFailures[i]);
+      }
+      if (witness.proofFailures.size() > limit)
+        text += llvm::formatv("; ... +{0} more",
+                              witness.proofFailures.size() - limit)
+                    .str();
+      text += "]";
+    }
+    return text;
   }
 
-  /// \brief Compact witness for a proved partial-expansion fallback region.
+  /// \brief Map an aggregate terminal-exclusion class to documentation-only
+  /// proof-failure text.
   ///
-  /// The first supported domain is planned to be a single macro-owner whole
-  /// expansion closure. The witness shape is introduced now so later patches
-  /// can populate it from existing whole-cover machinery without changing the
-  /// fallback pipeline again.
-  struct ExpansionClosureWitness {
-    ExpansionClosureKind kind = ExpansionClosureKind::Unknown;
-    bool hasRootMacroId = false;
-    uint64_t rootMacroId = 0;
-    bool hasOwnerIncludeId = false;
-    uint64_t ownerIncludeId = 0;
-    uint64_t sourceByteBegin = 0;
-    uint64_t sourceByteEnd = 0;
-    uint64_t coverATokBegin = 0;
-    uint64_t coverATokEnd = 0;
-    size_t bTokBegin = 0;
-    size_t bTokEnd = 0;
-    bool selfContained = false;
-    bool claimsClipped = false;
-  };
+  /// Request sites must pass their local proof failure explicitly with
+  /// \c MakeTerminalFallbackProofFailure().  This helper is deliberately not
+  /// used to classify a live raw-B fallback request: Phase 2B forbids deriving
+  /// the failed obligation from the aggregate fallback kind after the fact.
+  /// The only remaining uses are legacy/domain-contract formatting paths that
+  /// have no active request site.
+  static TerminalFallbackProofFailure
+  ClassifyAggregateTerminalFallbackProofFailure(TerminalFallbackKind kind);
 
   struct RefoldStats {
     uint64_t totalIncludes = 0;
@@ -903,6 +1251,15 @@ private:
     uint64_t emittedUndischargedCarriers = 0;
     uint64_t emittedUnknownClassCarriers = 0;
     uint64_t emittedOutOfDomainCarriers = 0;
+
+    // Phase 1D: composite edits must be proof-composed, not just bags of
+    // individually valid carriers.  These counters distinguish the accepted
+    // composition laws currently enforced at the emission boundary.
+    uint64_t emittedCompositeEdits = 0;
+    uint64_t emittedEquivalentCompositeEdits = 0;
+    uint64_t emittedOrderedCompositeEdits = 0;
+    uint64_t emittedUncomposedCompositeEdits = 0;
+
     uint64_t selectorCompetitions = 0;
     uint64_t selectorResolutions = 0;
     uint64_t selectorNoSelectable = 0;
@@ -910,18 +1267,38 @@ private:
     uint64_t selectorDirectBypasses = 0;
     uint64_t explicitTerminalExclusions = 0;
     uint64_t nonExplicitTerminalExclusions = 0;
-    /// Coverage counters for the non-theorem-facing intermediate expansion
-    /// fallback stage.
-    ///
-    /// The expansion fallback does not mint theorem-facing carriers by itself,
-    /// so it must not perturb the declared-domain counters above. Track it in a
-    /// separate block instead so the theorem audit can still report whether a
-    /// run discovered a witness, rejected synthesis, or used the proved stage
-    /// to intercept a would-be terminal raw-B fallback.
-    uint64_t expansionFallbackWitnesses = 0;
-    uint64_t expansionFallbackSynthesisSuccesses = 0;
-    uint64_t expansionFallbackSynthesisRejections = 0;
-    uint64_t expansionFallbackTerminalRescues = 0;
+
+    // Phase 2D/2E: terminal fallback must retain all failed obligations and
+    // audit them before raw-B emission.
+    uint64_t terminalFailureObligations = 0;
+    uint64_t terminalSecondaryFailureObligations = 0;
+    uint64_t terminalFailureAuditViolations = 0;
+
+    // Phase 4G: persistent owner/state graph census.  These counters are
+    // diagnostic/audit data only; they make it visible whether zero-token state
+    // events and missing producer facts were modeled in the graph.
+    uint64_t graphOwnerNodes = 0;
+    uint64_t graphZeroTokenStateNodes = 0;
+    uint64_t graphObservedStateComponents = 0;
+    uint64_t graphMutatedStateComponents = 0;
+    uint64_t graphIncomparableNodes = 0;
+    uint64_t graphMissingProducerFacts = 0;
+
+    // Phase 5L: state-changing edits must be audited through the
+    // StateTransitionGateway before any non-terminal bytes are emitted.  These
+    // counters are updated by the gateway itself, so the final emission audit
+    // can reject Unknown/None/undischarged state transitions without trying to
+    // rediscover state effects from emitted text.
+    uint64_t stateTransitionGatewayChecks = 0;
+    uint64_t stateTransitionGatewayStable = 0;
+    uint64_t stateTransitionGatewayTerminalFailures = 0;
+    uint64_t stateTransitionGatewayNoSuffixObserverWitnesses = 0;
+    uint64_t stateTransitionGatewayTypedWitnesses = 0;
+    uint64_t stateTransitionAuditViolations = 0;
+    uint64_t stateTransitionUnknownComponentViolations = 0;
+    uint64_t stateTransitionUnknownMutationViolations = 0;
+    uint64_t stateTransitionNoneWitnessViolations = 0;
+
     bool theoremSatisfied = true;
     std::string firstViolation;
   };
@@ -972,8 +1349,16 @@ private:
   // fallback state as diagnostic/side-channel state via `mutable`.
   mutable bool terminalFallbackRequested_ = false;
   mutable std::vector<std::string> terminalFallbackReasons_;
+
+  /// Ordered theorem-facing failures that justify the terminal raw-B carrier.
+  /// The string vector above is diagnostic only; this vector is the Phase 2D
+  /// proof data retained when multiple independent obligations fail.
+  mutable std::vector<TerminalFallbackProofFailure>
+      terminalFallbackProofFailures_;
+
   mutable TerminalFallbackKind terminalFallbackKind_ =
       TerminalFallbackKind::Unknown;
+  mutable TerminalFallbackProofFailure terminalFallbackProofFailure_;
   mutable uint32_t terminalFallbackRequestCount_ = 0;
 
   /// \brief Record that the current pass must fall back to the explicit
@@ -981,7 +1366,9 @@ private:
   ///
   /// Helpers call this when they cannot discharge an edit into one of the
   /// single-pass proof/lattice outcomes.
-  void RequestTerminalFallback(TerminalFallbackKind kind, llvm::StringRef phase,
+  void RequestTerminalFallback(TerminalFallbackKind kind,
+                               TerminalFallbackProofFailure failure,
+                               llvm::StringRef phase,
                                llvm::StringRef detail) const;
 
   /// \brief Clear per-pass terminal-fallback state.
@@ -990,7 +1377,9 @@ private:
   void ResetTerminalFallbackState() const {
     terminalFallbackRequested_ = false;
     terminalFallbackReasons_.clear();
+    terminalFallbackProofFailures_.clear();
     terminalFallbackKind_ = TerminalFallbackKind::Unknown;
+    terminalFallbackProofFailure_ = TerminalFallbackProofFailure();
     terminalFallbackRequestCount_ = 0;
   }
 
@@ -1029,6 +1418,23 @@ private:
   /// result to escape with a violated theorem audit.
   void EnforceTheoremAuditInvariants() const;
 
+  /// Validate that one terminal fallback proof failure is a named, structured
+  /// failed obligation rather than an opaque raw-B escape.
+  ///
+  /// Phase 2E uses this immediately before raw-B emission.  A generic
+  /// MissingProducerFacts reason must identify the missing fact through the
+  /// structured context carrier; implementation-specific reasons such as an
+  /// unmappable include envelope are already self-identifying.
+  bool AuditTerminalFallbackProofFailure(
+      const TerminalFallbackProofFailure &failure, llvm::StringRef role) const;
+
+  /// Validate the Phase-5 state-transition gateway audit before bytes are
+  /// emitted.  The gateway is the only place where a state-changing edit may
+  /// cross into a preserved suffix; this audit ensures no routed transition was
+  /// accepted with Unknown/None state proof data.
+  bool AuditStateTransitionGatewayProofs(llvm::StringRef emissionPhase,
+                                         llvm::StringRef emissionOwner) const;
+
   /// Validate that the terminal fallback state itself still classifies as the
   /// one explicit out-of-domain theorem carrier.
   ///
@@ -1042,30 +1448,25 @@ private:
   /// fallback.
   std::string BuildTheoremAuditInvariantDetail() const;
 
-  /// \brief Attempt the proof-backed intermediate expansion-fallback stage.
-  ///
-  /// This stage sits strictly between structural refolding and the explicit
-  /// terminal fallback to B. It may now derive a concrete single-owner macro
-  /// witness and, when synthesis succeeds, return a source-level
-  /// fallback-expanded TU instead of letting the run proceed to raw B.
-  std::optional<std::string> TryExpansionClosureFallback();
-
   /// \brief Resolve the full post-structural fallback result for the current
   /// run.
   ///
-  /// If terminal fallback was requested, try the legacy proved expansion source
-  /// first, but audit any discovered witness as dominated by the normal macro
-  /// whole-cover candidate path before synthesis. Only record / emit the raw-B
-  /// terminal carrier when that dominated safety net also fails closed.
+  /// Phase 8 removes the legacy post-terminal macro-expansion rescue seam.  This
+  /// resolver therefore performs no secondary owner search: in-domain macro
+  /// whole-cover edits must have been discharged by OwnerRealizationProof or
+  /// MixedOwnerTilingProof before fallback was requested.  Once structural
+  /// emission fails closed, the only remaining result is the declared raw-B
+  /// TerminalOutOfDomain carrier with its named proof obligation.
   std::string ResolvePostStructuralFallback();
 
-  /// \brief Try to realize one unresolved TU-owned edit as a proved source
-  ///        closure over a contiguous run of top-level `#include` directives.
+  /// \brief Try to realize one unresolved edit as a declared TU include-closure.
   ///
-  /// This is the first hybrid fallback/edit-composition helper used to avoid
-  /// discarding already-proved structural artifacts when one PP hunk cannot be
-  /// anchored directly as a macro/include/TU edit. The helper stays
-  /// deliberately narrow:
+  /// Phase 8c classifies this path as still uniquely needed, but no longer as a
+  /// legacy fallback/rescue seam. The helper emits the explicit
+  /// `TUIncludeClosureEdit` carrier when one PP hunk cannot be anchored as an
+  /// ordinary macro/include/TU edit but can be proven as one closed replacement
+  /// over top-level TU `#include` directives plus the adjacent TU source bytes
+  /// that the same hunk consumes. The helper stays deliberately narrow:
   ///
   /// * only non-insertion hunks are eligible,
   /// * only top-level TU `#include` directives are considered,
@@ -1083,64 +1484,16 @@ private:
   ///   envelope for the full source closure.
   ///
   /// When those obligations hold, the result is staged as one explicit TU text
-  /// edit and later composed together with ordinary TU edits and macro callsite
-  /// patches. Otherwise the caller must keep the hunk out-of-domain and retain
-  /// the existing terminal fallback behavior.
+  /// edit carrying the `TUIncludeClosureEdit` proof class and later composed
+  /// with ordinary TU edits and macro callsite patches. Otherwise the caller
+  /// must keep the hunk out-of-domain and retain the existing terminal fallback
+  /// behavior.
   std::optional<TextEdit>
   BuildTUIncludeClosureEditForUnresolvedHunk(
       const diffutils::Hunk &h, llvm::StringRef tuPath,
       llvm::StringRef tuBytes,
       llvm::ArrayRef<std::pair<uint64_t, uint64_t>> stagedSourceIntervals)
       const;
-
-  /// \brief Build the single-owner macro whole-expansion fallback witness.
-  ///
-  /// Build the concrete partial-expansion proof witness. The witness exists
-  /// only when exactly one top-level TU-owned macro callsite has
-  /// a proved whole-cover realization plan, every token-diff hunk lies inside
-  /// that closure, and the source/frontier checks stay inside the explicit
-  /// single-owner domain (no ambiguity, no foreign overlap, no mixed ownership,
-  /// and no non-self-contained splice frontier).
-  std::optional<ExpansionClosureWitness>
-  BuildMacroOwnerExpansionClosureWitness() const;
-
-  /// \brief Verify that a post-terminal macro-owner witness is dominated by the
-  ///        normal macro whole-cover candidate path.
-  ///
-  /// The macro expansion-closure fallback is now a legacy safety net rather
-  /// than an independent completeness mechanism. If it discovers a witness, the
-  /// same root macro should have been visible earlier through
-  /// SmallestCoveringPatchableMacro() and should restamp to the normal
-  /// MacroWholeCoverRealization proof carrier. This audit is intentionally
-  /// side-effect-free: it reconstructs only the selector visibility and proof
-  /// metadata needed to prove dominance, and never stages or emits an edit.
-  bool MacroOwnerExpansionClosureWitnessIsDominated(
-      const ExpansionClosureWitness &witness, std::string &detail) const;
-
-  /// \brief Attempt to synthesize a source-level fallback from one macro-owner
-  /// whole-expansion witness.
-  ///
-  /// Keep this narrower than the witness domain itself. The synthesis class
-  /// emits a direct TU callsite splice only when the
-  /// materialized B-surface is replay-stable as raw source bytes and can be
-  /// embedded back into the TU with the usual line-drift resynchronization
-  /// machinery. Otherwise the stage fails closed and the engine keeps falling
-  /// back to the terminal edited-preprocessed stream result.
-  std::optional<std::string> SynthesizeMacroOwnerExpansionClosureSource(
-      const ExpansionClosureWitness &witness) const;
-
-  /// \brief Return whether a materialized fallback replacement is replay-stable
-  /// as direct source text for the first synthesis class.
-  ///
-  /// The initial synthesis domain deliberately excludes identifiers because the
-  /// source-level replay would otherwise need a stronger proof that rescanning
-  /// the synthesized bytes cannot trigger further macro expansion.
-  bool
-  ExpansionFallbackReplacementIsReplayStable(StringRef replacementText) const;
-
-  /// \brief Render an expansion-closure witness for trace output.
-  std::string
-  FormatExpansionClosureWitness(const ExpansionClosureWitness &witness) const;
 
   /// Emit a compact theorem-audit summary for the current run.
   ///
@@ -1156,14 +1509,16 @@ private:
          "discharged={4} "
          "selectorOnlyExceptions={5} transitional={6} undischarged={7} "
          "unknownClass={8} outOfDomain={9} "
-         "selectorCompetitions={10} selectorResolutions={11} "
-         "selectorNoSelectable={12} selectorUnresolved={13} "
-         "selectorDirectBypasses={14} explicitTerminalExclusions={15} "
-         "nonExplicitTerminalExclusions={16} "
-         "expansionFallbackWitnesses={17} "
-         "expansionFallbackSynthesisSuccesses={18} "
-         "expansionFallbackSynthesisRejections={19} "
-         "expansionFallbackTerminalRescues={20}",
+         "composite={10} equivalentComposite={11} orderedComposite={12} "
+         "uncomposedComposite={13} "
+         "selectorCompetitions={14} selectorResolutions={15} "
+         "selectorNoSelectable={16} selectorUnresolved={17} "
+         "selectorDirectBypasses={18} explicitTerminalExclusions={19} "
+         "nonExplicitTerminalExclusions={20} terminalFailures={21} "
+         "terminalSecondaryFailures={22} terminalFailureAuditViolations={23} "
+         "graphNodes={24} zeroTokenStateNodes={25} graphObservedComponents={26} "
+         "graphMutatedComponents={27} graphIncomparableNodes={28} "
+         "graphMissingProducerFacts={29}",
          lastTheoremAudit_.theoremSatisfied ? 1 : 0,
          lastTheoremAudit_.emittedNonTerminalEdits,
          lastTheoremAudit_.emittedCarriers,
@@ -1174,6 +1529,10 @@ private:
          lastTheoremAudit_.emittedUndischargedCarriers,
          lastTheoremAudit_.emittedUnknownClassCarriers,
          lastTheoremAudit_.emittedOutOfDomainCarriers,
+         lastTheoremAudit_.emittedCompositeEdits,
+         lastTheoremAudit_.emittedEquivalentCompositeEdits,
+         lastTheoremAudit_.emittedOrderedCompositeEdits,
+         lastTheoremAudit_.emittedUncomposedCompositeEdits,
          lastTheoremAudit_.selectorCompetitions,
          lastTheoremAudit_.selectorResolutions,
          lastTheoremAudit_.selectorNoSelectable,
@@ -1181,10 +1540,15 @@ private:
          lastTheoremAudit_.selectorDirectBypasses,
          lastTheoremAudit_.explicitTerminalExclusions,
          lastTheoremAudit_.nonExplicitTerminalExclusions,
-         lastTheoremAudit_.expansionFallbackWitnesses,
-         lastTheoremAudit_.expansionFallbackSynthesisSuccesses,
-         lastTheoremAudit_.expansionFallbackSynthesisRejections,
-         lastTheoremAudit_.expansionFallbackTerminalRescues);
+         lastTheoremAudit_.terminalFailureObligations,
+         lastTheoremAudit_.terminalSecondaryFailureObligations,
+         lastTheoremAudit_.terminalFailureAuditViolations,
+         lastTheoremAudit_.graphOwnerNodes,
+         lastTheoremAudit_.graphZeroTokenStateNodes,
+         lastTheoremAudit_.graphObservedStateComponents,
+         lastTheoremAudit_.graphMutatedStateComponents,
+         lastTheoremAudit_.graphIncomparableNodes,
+         lastTheoremAudit_.graphMissingProducerFacts);
     if (!lastTheoremAudit_.theoremSatisfied &&
         !lastTheoremAudit_.firstViolation.empty()) {
       info("theorem", "firstViolation={0}",
@@ -1217,6 +1581,25 @@ private:
   /// pure-insertion hunks (A-span is empty) that should not be absorbed
   /// into a larger mapped envelope (e.g., macro whole-cover replacement).
   std::vector<diffutils::Hunk> abTokHunks_;
+
+  // Forward declarations for the Phase-7 mixed-owner proof records.
+  //
+  // The persistent side tables below live with the per-run caches, but the full
+  // witness definitions are declared later with the rest of the theorem-facing
+  // proof carriers, after OwnerClosure is available.  Forward declarations keep
+  // the cache layout near the data it annotates without forcing the proof-record
+  // definitions to appear before their owner/source/token-range dependencies.
+  struct MixedOwnerTilingWitness;
+  struct MixedOwnerTilingSegmentBinding;
+
+  /// Persisted Phase-7 mixed-owner tiling witnesses for the current run.
+  ///
+  /// The mixed-owner normalizer still lowers a proved tiling to ordinary token
+  /// hunks so existing macro/include/TU classifiers can operate unchanged.
+  /// These side tables preserve the theorem proof that created those hunks and
+  /// map each emitted token segment back to the full ordered tiling path.
+  std::vector<MixedOwnerTilingWitness> mixedOwnerTilingWitnesses_;
+  std::vector<MixedOwnerTilingSegmentBinding> mixedOwnerTilingSegmentBindings_;
 
   /// Cached token-level A/B maps for the current refold invocation.
   ///
@@ -1692,7 +2075,17 @@ private:
   /// of the same owner identity so future tiling, state-summary composition,
   /// and terminal out-of-domain diagnostics can reason through one interface
   /// instead of through owner-specific fallback ladders.
-  enum class OwnerKind { TU, Include, MacroInvocation, ConditionalArm, Unknown };
+  enum class OwnerKind {
+    TU,
+    Include,
+    MacroInvocation,
+    MacroDirective,
+    LineControlIsland,
+    PragmaIsland,
+    ConditionalGroup,
+    ConditionalArm,
+    Unknown
+  };
 
   friend inline StringRef toString(OwnerKind kind) {
     switch (kind) {
@@ -1702,6 +2095,14 @@ private:
       return "Include";
     case OwnerKind::MacroInvocation:
       return "MacroInvocation";
+    case OwnerKind::MacroDirective:
+      return "MacroDirective";
+    case OwnerKind::LineControlIsland:
+      return "LineControlIsland";
+    case OwnerKind::PragmaIsland:
+      return "PragmaIsland";
+    case OwnerKind::ConditionalGroup:
+      return "ConditionalGroup";
     case OwnerKind::ConditionalArm:
       return "ConditionalArm";
     case OwnerKind::Unknown:
@@ -1726,6 +2127,14 @@ private:
     std::optional<uint64_t> includeId;
     // non-nullopt only when kind == MacroInvocation.
     std::optional<uint64_t> macroInvocationId;
+    // non-nullopt only when kind == MacroDirective.
+    std::optional<uint64_t> macroDirectiveId;
+    // non-nullopt only when kind == LineControlIsland.
+    std::optional<uint64_t> lineControlId;
+    // non-nullopt only when kind == PragmaIsland.
+    std::optional<uint64_t> pragmaId;
+    // non-nullopt only when kind == ConditionalGroup.
+    std::optional<uint64_t> condGroupId;
     // nullable; non-nullopt when the owner is in or is a specific conditional
     // arm.
     std::optional<uint64_t> condArmId;
@@ -1756,6 +2165,43 @@ private:
       return o;
     }
 
+    static Owner MacroDirective(
+        uint64_t macroDirectiveId,
+        std::optional<uint64_t> condArmId = std::nullopt) {
+      Owner o;
+      o.kind = OwnerKind::MacroDirective;
+      o.macroDirectiveId = macroDirectiveId;
+      o.condArmId = condArmId;
+      return o;
+    }
+
+    static Owner LineControlIsland(
+        uint64_t lineControlId,
+        std::optional<uint64_t> condArmId = std::nullopt) {
+      Owner o;
+      o.kind = OwnerKind::LineControlIsland;
+      o.lineControlId = lineControlId;
+      o.condArmId = condArmId;
+      return o;
+    }
+
+    static Owner PragmaIsland(
+        uint64_t pragmaId,
+        std::optional<uint64_t> condArmId = std::nullopt) {
+      Owner o;
+      o.kind = OwnerKind::PragmaIsland;
+      o.pragmaId = pragmaId;
+      o.condArmId = condArmId;
+      return o;
+    }
+
+    static Owner ConditionalGroup(uint64_t condGroupId) {
+      Owner o;
+      o.kind = OwnerKind::ConditionalGroup;
+      o.condGroupId = condGroupId;
+      return o;
+    }
+
     static Owner ConditionalArm(uint64_t condArmId) {
       Owner o;
       o.kind = OwnerKind::ConditionalArm;
@@ -1775,6 +2221,22 @@ private:
       return kind == OwnerKind::MacroInvocation;
     }
 
+    bool IsMacroDirective() const {
+      return kind == OwnerKind::MacroDirective;
+    }
+
+    bool IsLineControlIsland() const {
+      return kind == OwnerKind::LineControlIsland;
+    }
+
+    bool IsPragmaIsland() const {
+      return kind == OwnerKind::PragmaIsland;
+    }
+
+    bool IsConditionalGroup() const {
+      return kind == OwnerKind::ConditionalGroup;
+    }
+
     bool IsConditionalArm() const {
       return kind == OwnerKind::ConditionalArm;
     }
@@ -1782,6 +2244,9 @@ private:
     bool HasSameIdentity(const Owner &other) const {
       return kind == other.kind && includeId == other.includeId &&
              macroInvocationId == other.macroInvocationId &&
+             macroDirectiveId == other.macroDirectiveId &&
+             lineControlId == other.lineControlId &&
+             pragmaId == other.pragmaId && condGroupId == other.condGroupId &&
              condArmId == other.condArmId;
     }
   };
@@ -1841,44 +2306,1030 @@ private:
     bool IsComplete() const { return HasPath() && IsValid(); }
   };
 
-  /// Summary of sideband preprocessing state touched by an owner closure.
-  ///
-  /// This structure intentionally records obligations rather than trying to
-  /// model full preprocessor state.  A set bit means the closure must either
-  /// preserve, replay, prove dead, keep internally observed, or otherwise
-  /// discharge that state component before the closure may compose with a
-  /// preserved suffix.
-  struct OwnerStateSummary {
-    bool touchesMacroDefinitions = false;
-    bool touchesMacroUndefinitions = false;
-    bool touchesLineControl = false;
-    bool touchesIncludeState = false;
-    bool touchesIncludeGuardState = false;
-    bool touchesConditionalState = false;
-    bool touchesPragmaState = false;
-    bool touchesCounterState = false;
-    bool touchesBuiltinLocationState = false;
+  struct OwnerObserverSummary;
 
-    bool Empty() const {
-      return !touchesMacroDefinitions && !touchesMacroUndefinitions &&
-             !touchesLineControl && !touchesIncludeState &&
-             !touchesIncludeGuardState && !touchesConditionalState &&
-             !touchesPragmaState && !touchesCounterState &&
-             !touchesBuiltinLocationState;
+  /// Producer-derived identity for one macro-state fact.
+  ///
+  /// Phase 3B keeps macro state component-specific instead of treating the
+  /// entire macro namespace as one global bit.  The identity deliberately stores
+  /// only producer facts or deterministic projections of those facts; it never
+  /// reparses a directive to infer missing state.  Empty optional fields mean the
+  /// producer did not supply that part of the identity, in which case the owner
+  /// summary also carries the appropriate conservative missing/unmodeled marker.
+  struct MacroStateIdentity {
+    std::string macroName;
+    std::optional<uint64_t> definitionDirectiveId = std::nullopt;
+    std::optional<uint64_t> undefDirectiveId = std::nullopt;
+    bool functionLike = false;
+    std::optional<uint32_t> arity = std::nullopt;
+    bool variadic = false;
+    std::string replacementTokenHash;
+
+    bool operator==(const MacroStateIdentity &other) const {
+      return macroName == other.macroName &&
+             definitionDirectiveId == other.definitionDirectiveId &&
+             undefDirectiveId == other.undefDirectiveId &&
+             functionLike == other.functionLike && arity == other.arity &&
+             variadic == other.variadic &&
+             replacementTokenHash == other.replacementTokenHash;
+    }
+  };
+
+  /// The kind of macro-state observation made by an owner.
+  ///
+  /// Phase 3C separates ordinary macro expansion from `defined(NAME)` queries
+  /// and conditional-expression macro dependencies.  These observations are not
+  /// interchangeable: a suffix may depend only on whether a macro is defined, on
+  /// the replacement tokens used for expansion, or on conditional branch
+  /// selection.
+  enum class MacroObservationKind : uint8_t {
+    Expansion,
+    DefinedOperator,
+    ConditionalEvaluation
+  };
+
+  friend inline StringRef toString(MacroObservationKind kind) {
+    switch (kind) {
+    case MacroObservationKind::Expansion:
+      return "MacroExpansionObservation";
+    case MacroObservationKind::DefinedOperator:
+      return "DefinedOperatorObservation";
+    case MacroObservationKind::ConditionalEvaluation:
+      return "ConditionalMacroObservation";
+    }
+    llvm_unreachable("Invalid macro observation kind");
+  }
+
+  struct MacroStateObservation {
+    MacroObservationKind kind = MacroObservationKind::Expansion;
+    MacroStateIdentity identity;
+
+    bool operator==(const MacroStateObservation &other) const {
+      return kind == other.kind && identity == other.identity;
+    }
+  };
+
+
+  /// Producer provenance for a logical line-control mutation.
+  ///
+  /// Phase 3E makes line/file state component-specific.  A `#line` directive is
+  /// not just textual trivia: it mutates the logical line, file, and basename
+  /// state later observed by `__LINE__`, `__FILE__`, and `__FILE_NAME__`.
+  /// These provenance values say whether the producer, not the consumer,
+  /// evaluated the directive operands and conditional activity.
+  enum class LineDirectiveOperandProvenance : uint8_t {
+    ProducerEvaluatedOperands,
+    InactiveDirective,
+    MissingProducerOperands,
+    Unknown
+  };
+
+  friend inline StringRef toString(LineDirectiveOperandProvenance provenance) {
+    switch (provenance) {
+    case LineDirectiveOperandProvenance::ProducerEvaluatedOperands:
+      return "ProducerEvaluatedOperands";
+    case LineDirectiveOperandProvenance::InactiveDirective:
+      return "InactiveDirective";
+    case LineDirectiveOperandProvenance::MissingProducerOperands:
+      return "MissingProducerOperands";
+    case LineDirectiveOperandProvenance::Unknown:
+      return "Unknown";
+    }
+    llvm_unreachable("Invalid line-directive operand provenance");
+  }
+
+  /// Producer-derived identity for one zero-token line-control state mutation.
+  ///
+  /// The physical directive bytes may produce no ordinary A-side tokens, but the
+  /// event changes the logical source-location state observed by later owners.
+  /// Empty optional fields are conservative missing facts: later theorem checks
+  /// may reject the transition, but they must not infer it from downstream
+  /// `__LINE__`/`__FILE__` values.
+  struct LineControlStateIdentity {
+    uint64_t eventId = 0;
+    std::string physicalFile;
+    std::optional<uint64_t> siteBegin = std::nullopt;
+    std::optional<uint64_t> siteEnd = std::nullopt;
+    bool active = false;
+    bool producerProven = false;
+    uint64_t logicalLineAfter = 0;
+    std::string logicalFileAfter;
+    std::optional<uint64_t> ownerIncludeId = std::nullopt;
+    LineDirectiveOperandProvenance operandProvenance =
+        LineDirectiveOperandProvenance::Unknown;
+
+    bool operator==(const LineControlStateIdentity &other) const {
+      return eventId == other.eventId && physicalFile == other.physicalFile &&
+             siteBegin == other.siteBegin && siteEnd == other.siteEnd &&
+             active == other.active && producerProven == other.producerProven &&
+             logicalLineAfter == other.logicalLineAfter &&
+             logicalFileAfter == other.logicalFileAfter &&
+             ownerIncludeId == other.ownerIncludeId &&
+             operandProvenance == other.operandProvenance;
+    }
+  };
+
+  /// Location-state component observed by a builtin token.
+  enum class BuiltinLocationObservationKind : uint8_t {
+    LineState,
+    FileState,
+    FileNameState
+  };
+
+  friend inline StringRef toString(BuiltinLocationObservationKind kind) {
+    switch (kind) {
+    case BuiltinLocationObservationKind::LineState:
+      return "LineState";
+    case BuiltinLocationObservationKind::FileState:
+      return "FileState";
+    case BuiltinLocationObservationKind::FileNameState:
+      return "FileNameState";
+    }
+    llvm_unreachable("Invalid builtin location observation kind");
+  }
+
+  /// Producer/source-local observation of logical line/file state.
+  ///
+  /// The observation may come from source text, an invocation spelling, or an
+  /// already-expanded PP token.  Optional source/token anchors are evidence only;
+  /// absence keeps the coarse observation bit conservative without fabricating a
+  /// stronger ordering fact.
+  struct BuiltinLocationObservation {
+    BuiltinLocationObservationKind kind =
+        BuiltinLocationObservationKind::LineState;
+    std::optional<uint64_t> ownerIncludeId = std::nullopt;
+    std::optional<uint64_t> sourceBegin = std::nullopt;
+    std::optional<uint64_t> sourceEnd = std::nullopt;
+    std::optional<uint64_t> aTokenBegin = std::nullopt;
+    std::optional<uint64_t> aTokenEnd = std::nullopt;
+
+    bool operator==(const BuiltinLocationObservation &other) const {
+      return kind == other.kind && ownerIncludeId == other.ownerIncludeId &&
+             sourceBegin == other.sourceBegin && sourceEnd == other.sourceEnd &&
+             aTokenBegin == other.aTokenBegin && aTokenEnd == other.aTokenEnd;
+    }
+  };
+
+  /// Producer-derived identity for one `__COUNTER__` event.
+  ///
+  /// Phase 3G makes counter state event-specific.  The identity names the
+  /// producer macro invocation and concrete A-token occurrence that consumed the
+  /// counter stream.  `expectedBValue` is optional because ordinary owner-state
+  /// summaries are edit-independent; later stabilization code can fill or check
+  /// it when an A->B alignment is available.
+  struct CounterEventIdentity {
+    uint64_t macroInvocationId = 0;
+    uint64_t occurrenceOrdinal = 0;
+    std::optional<uint64_t> ownerIncludeId = std::nullopt;
+    std::optional<uint64_t> callerMacroId = std::nullopt;
+    uint64_t aTokenBegin = 0;
+    uint64_t aTokenEnd = 0;
+    std::string expansionSiteFile;
+    std::optional<uint64_t> expansionSiteBegin = std::nullopt;
+    std::optional<uint64_t> expansionSiteEnd = std::nullopt;
+    std::string aValue;
+    std::optional<std::string> expectedBValue = std::nullopt;
+    bool canStabilizeByLiteralization = false;
+    bool canStabilizeByMaterialization = false;
+
+    bool operator==(const CounterEventIdentity &other) const {
+      return macroInvocationId == other.macroInvocationId &&
+             occurrenceOrdinal == other.occurrenceOrdinal &&
+             ownerIncludeId == other.ownerIncludeId &&
+             callerMacroId == other.callerMacroId &&
+             aTokenBegin == other.aTokenBegin && aTokenEnd == other.aTokenEnd &&
+             expansionSiteFile == other.expansionSiteFile &&
+             expansionSiteBegin == other.expansionSiteBegin &&
+             expansionSiteEnd == other.expansionSiteEnd &&
+             aValue == other.aValue && expectedBValue == other.expectedBValue &&
+             canStabilizeByLiteralization ==
+                 other.canStabilizeByLiteralization &&
+             canStabilizeByMaterialization ==
+                 other.canStabilizeByMaterialization;
+    }
+  };
+
+
+  /// Producer-derived identity for a concrete include directive occurrence.
+  ///
+  /// Phase 3I separates include-path resolution, include file identity, include
+  /// token materialization, and include-state effects.  This identity is built
+  /// only from serialized producer facts: the as-written target, the resolved
+  /// path when present, the includer/source site, and the concrete include
+  /// instance id.  It is not an include-path resolver.
+  struct IncludeStateIdentity {
+    uint64_t includeId = 0;
+    std::string directiveKind;
+    std::string sitePath;
+    uint64_t siteBegin = 0;
+    uint64_t siteEnd = 0;
+    std::string target;
+    std::optional<std::string> resolvedPath = std::nullopt;
+    bool angled = false;
+    std::optional<uint64_t> parentIncludeId = std::nullopt;
+    bool hasTokenMaterialization = false;
+
+    bool operator==(const IncludeStateIdentity &other) const {
+      return includeId == other.includeId &&
+             directiveKind == other.directiveKind &&
+             sitePath == other.sitePath && siteBegin == other.siteBegin &&
+             siteEnd == other.siteEnd && target == other.target &&
+             resolvedPath == other.resolvedPath && angled == other.angled &&
+             parentIncludeId == other.parentIncludeId &&
+             hasTokenMaterialization == other.hasTokenMaterialization;
+    }
+  };
+
+  /// The producer-visible include-guard role of one include occurrence.
+  ///
+  /// The current map does not yet serialize a first-class include-guard oracle,
+  /// so `guardMacroName` is optional.  An empty guard macro is still useful: it
+  /// ties the guard-state risk to a concrete header/include identity instead of
+  /// poisoning the whole include-state universe.  Later producer extensions can
+  /// fill the macro name without changing the theorem-facing state shape.
+  enum class IncludeGuardObservationKind : uint8_t {
+    ActiveIncludeMayMutateGuard,
+    SkippedIncludeMayObserveGuard,
+    UnknownGuardEffect
+  };
+
+  friend inline StringRef toString(IncludeGuardObservationKind kind) {
+    switch (kind) {
+    case IncludeGuardObservationKind::ActiveIncludeMayMutateGuard:
+      return "ActiveIncludeMayMutateGuard";
+    case IncludeGuardObservationKind::SkippedIncludeMayObserveGuard:
+      return "SkippedIncludeMayObserveGuard";
+    case IncludeGuardObservationKind::UnknownGuardEffect:
+      return "UnknownGuardEffect";
+    }
+    llvm_unreachable("Invalid include-guard observation kind");
+  }
+
+  struct IncludeGuardStateIdentity {
+    IncludeGuardObservationKind kind =
+        IncludeGuardObservationKind::UnknownGuardEffect;
+    uint64_t includeId = 0;
+    std::string headerPath;
+    std::optional<std::string> guardMacroName = std::nullopt;
+    std::optional<uint64_t> parentIncludeId = std::nullopt;
+    bool producerProvenGuard = false;
+
+    bool operator==(const IncludeGuardStateIdentity &other) const {
+      return kind == other.kind && includeId == other.includeId &&
+             headerPath == other.headerPath &&
+             guardMacroName == other.guardMacroName &&
+             parentIncludeId == other.parentIncludeId &&
+             producerProvenGuard == other.producerProvenGuard;
+    }
+  };
+
+  /// Producer-side pragma classification used by Phase 3J.
+  ///
+  /// Unknown pragmas remain fail-closed.  Known diagnostic pragmas are recorded
+  /// as component-specific state so later suffix-stability code can distinguish
+  /// a balanced/local pragma island from an opaque state transition.
+  enum class PragmaStateClassification : uint8_t {
+    KnownLocalPragmaState,
+    KnownBalancedPragmaState,
+    UnknownPragmaState
+  };
+
+  friend inline StringRef toString(PragmaStateClassification classification) {
+    switch (classification) {
+    case PragmaStateClassification::KnownLocalPragmaState:
+      return "KnownLocalPragmaState";
+    case PragmaStateClassification::KnownBalancedPragmaState:
+      return "KnownBalancedPragmaState";
+    case PragmaStateClassification::UnknownPragmaState:
+      return "UnknownPragmaState";
+    }
+    llvm_unreachable("Invalid pragma-state classification");
+  }
+
+  struct PragmaStateIdentity {
+    uint64_t pragmaId = 0;
+    std::string sitePath;
+    uint64_t siteBegin = 0;
+    uint64_t siteEnd = 0;
+    std::optional<uint64_t> ownerIncludeId = std::nullopt;
+    PragmaStateClassification classification =
+        PragmaStateClassification::UnknownPragmaState;
+    std::string directiveFingerprint;
+
+    bool operator==(const PragmaStateIdentity &other) const {
+      return pragmaId == other.pragmaId && sitePath == other.sitePath &&
+             siteBegin == other.siteBegin && siteEnd == other.siteEnd &&
+             ownerIncludeId == other.ownerIncludeId &&
+             classification == other.classification &&
+             directiveFingerprint == other.directiveFingerprint;
+    }
+  };
+
+  /// Producer-derived branch-selection state for a conditional group or arm.
+  ///
+  /// Phase 3K makes conditionals explicit state rather than treating a selected
+  /// arm as ordinary source text.  The identity records which directive/arm was
+  /// producer-selected and which condition text was observed.  It does not
+  /// reverse-solve a different branch condition from downstream B-side tokens.
+  enum class ConditionalStateRole : uint8_t {
+    ConditionalGroup,
+    ActiveArm,
+    InactiveArm
+  };
+
+  friend inline StringRef toString(ConditionalStateRole role) {
+    switch (role) {
+    case ConditionalStateRole::ConditionalGroup:
+      return "ConditionalGroup";
+    case ConditionalStateRole::ActiveArm:
+      return "ActiveArm";
+    case ConditionalStateRole::InactiveArm:
+      return "InactiveArm";
+    }
+    llvm_unreachable("Invalid conditional-state role");
+  }
+
+  struct ConditionalStateIdentity {
+    ConditionalStateRole role = ConditionalStateRole::ConditionalGroup;
+    uint64_t groupId = 0;
+    std::optional<uint64_t> armId = std::nullopt;
+    std::string file;
+    uint64_t groupBegin = 0;
+    uint64_t groupEnd = 0;
+    std::optional<uint64_t> parentArmId = std::nullopt;
+    std::optional<uint64_t> parentIncludeId = std::nullopt;
+    std::string armKind;
+    std::optional<std::string> conditionText = std::nullopt;
+    bool selected = false;
+    std::optional<uint64_t> aTokenBegin = std::nullopt;
+    std::optional<uint64_t> aTokenEnd = std::nullopt;
+    bool conditionTruthProducerProven = true;
+    bool reverseSolvedDirectiveRequired = false;
+
+    bool operator==(const ConditionalStateIdentity &other) const {
+      return role == other.role && groupId == other.groupId &&
+             armId == other.armId && file == other.file &&
+             groupBegin == other.groupBegin && groupEnd == other.groupEnd &&
+             parentArmId == other.parentArmId &&
+             parentIncludeId == other.parentIncludeId &&
+             armKind == other.armKind &&
+             conditionText == other.conditionText && selected == other.selected &&
+             aTokenBegin == other.aTokenBegin && aTokenEnd == other.aTokenEnd &&
+             conditionTruthProducerProven == other.conditionTruthProducerProven &&
+             reverseSolvedDirectiveRequired ==
+                 other.reverseSolvedDirectiveRequired;
+    }
+  };
+
+
+
+  /// Component-specific producer fact that is missing from the owner-state
+  /// summary.
+  ///
+  /// Phase 3L replaces the old single "unmodeled state" surface with precise
+  /// missing-fact markers.  The legacy hasUnmodeledState bit may still be set as
+  /// a compatibility projection, but theorem-facing code can now distinguish a
+  /// missing macro definition identity from missing line-control operands,
+  /// counter events, pragma classification, include-guard facts, conditional
+  /// branch facts, or owner ordering.
+  enum class MissingStateFactKind : uint8_t {
+    MissingMacroFacts,
+    MissingLineControlFacts,
+    MissingCounterFacts,
+    MissingPragmaFacts,
+    MissingIncludeGuardFacts,
+    MissingConditionalFacts,
+    MissingOwnerOrderingFacts
+  };
+
+  friend inline StringRef toString(MissingStateFactKind kind) {
+    switch (kind) {
+    case MissingStateFactKind::MissingMacroFacts:
+      return "MissingMacroFacts";
+    case MissingStateFactKind::MissingLineControlFacts:
+      return "MissingLineControlFacts";
+    case MissingStateFactKind::MissingCounterFacts:
+      return "MissingCounterFacts";
+    case MissingStateFactKind::MissingPragmaFacts:
+      return "MissingPragmaFacts";
+    case MissingStateFactKind::MissingIncludeGuardFacts:
+      return "MissingIncludeGuardFacts";
+    case MissingStateFactKind::MissingConditionalFacts:
+      return "MissingConditionalFacts";
+    case MissingStateFactKind::MissingOwnerOrderingFacts:
+      return "MissingOwnerOrderingFacts";
+    }
+    llvm_unreachable("Invalid missing state fact kind");
+  }
+
+  struct MissingStateFact {
+    MissingStateFactKind kind = MissingStateFactKind::MissingOwnerOrderingFacts;
+    std::string detail;
+
+    bool operator==(const MissingStateFact &other) const {
+      return kind == other.kind && detail == other.detail;
+    }
+  };
+
+  /// Shared Phase-3 state-fact payload.
+  ///
+  /// The individual booleans remain as conservative compatibility summaries,
+  /// but Phase 3B starts replacing macro-state globality with component-specific
+  /// facts keyed by macro name and producer directive identity.  The same
+  /// payload can appear in Entry, Observes, Mutates, and Exit buckets without
+  /// duplicating field declarations.
+  struct OwnerStateFacts {
+    // Macro-state transitions and observations.
+    bool definesMacros = false;
+    bool undefinesMacros = false;
+    bool observesMacroState = false;
+    bool observesDefinedOperator = false;
+
+    // Phase-3B/3C component-specific macro facts.  These refine the coarse bits
+    // above without weakening them: a non-empty vector also implies the
+    // corresponding coarse transition/observation.
+    std::vector<MacroStateIdentity> macroDefinitions;
+    std::vector<MacroStateIdentity> macroUndefinitions;
+    std::vector<MacroStateIdentity> macroRequirements;
+    std::vector<MacroStateObservation> macroExpansionObservations;
+    std::vector<MacroStateObservation> definedOperatorObservations;
+    std::vector<MacroStateObservation> conditionalMacroObservations;
+
+    // Logical source-location state established by #line / GNU line markers and
+    // observed by builtin location tokens.
+    bool setsLineFile = false;
+    bool observesLine = false;
+    bool observesFile = false;
+    bool observesFileName = false;
+
+    // Phase-3E/3F component-specific line-control facts.  `lineControlEvents`
+    // are zero-token state mutations; `builtinLocationObservations` are reads of
+    // a particular logical-location component.
+    std::vector<LineControlStateIdentity> lineControlEvents;
+    std::vector<BuiltinLocationObservation> builtinLocationObservations;
+
+    // Stateful builtin counter stream.  `__COUNTER__` both observes and mutates
+    // the counter sequence, so construction helpers normally set both bits.
+    bool consumesCounter = false;
+    bool observesCounter = false;
+
+    // Phase-3G component-specific counter events.  Each event names one
+    // producer-proven occurrence instead of treating the counter stream as a
+    // global text scan.
+    std::vector<CounterEventIdentity> counterEvents;
+
+    // Pragma state.  Unknown pragma semantics are deliberately a separate bit:
+    // later phases may allow known local pragmas while still failing closed for
+    // unknown state that crosses an edit boundary.
+    bool entersPragmaState = false;
+    bool exitsPragmaState = false;
+    bool observesPragmaState = false;
+    bool hasUnknownPragmaEffect = false;
+
+    // Phase-3J component-specific pragma facts.  A non-empty unknown pragma
+    // identity sets hasUnknownPragmaEffect; known identities preserve the exact
+    // source state component for later balanced/local pragma proofs.
+    std::vector<PragmaStateIdentity> pragmaStateEvents;
+
+    // Include/include-guard state.  Include guards are modeled by concrete
+    // include/header identities below instead of one global include poison bit.
+    bool dependsOnIncludeGuardState = false;
+    bool mutatesIncludeGuardState = false;
+    bool observesIncludeState = false;
+    bool mutatesIncludeState = false;
+
+    // Phase-3H/3I component-specific include facts.  These keep include path
+    // resolution, file identity, token materialization, and guard effects
+    // separable while preserving the old coarse compatibility bits.
+    std::vector<IncludeStateIdentity> includeStateEvents;
+    std::vector<IncludeGuardStateIdentity> includeGuardStateEvents;
+
+    // Conditional activity/state.  A selected conditional arm depends on macro
+    // state and conditional evaluation; the conditional group itself mutates the
+    // active source surface seen by later owners.
+    bool dependsOnConditionalState = false;
+    bool mutatesConditionalState = false;
+    bool observesConditionalState = false;
+
+    // Phase-3K component-specific conditional facts.  These distinguish the
+    // directive island, active arm, inactive arms, condition-expression macro
+    // dependencies, and reverse-solving boundary explicitly.
+    std::vector<ConditionalStateIdentity> conditionalStateEvents;
+
+    // Conservatism marker for owner kinds or producer records whose state effect
+    // cannot yet be reduced to the bits above.  This preserves monotonicity:
+    // incomplete facts make composition less admissible, never more admissible.
+    bool hasUnmodeledState = false;
+
+    // Phase-3L component-specific missing producer facts.  These are
+    // theorem-facing obligations; the legacy hasUnmodeledState bit is only a
+    // conservative compatibility projection while Phase 3O retires the flat
+    // state surface.
+    std::vector<MissingStateFact> missingStateFacts;
+
+    bool HasMissingStateFacts() const { return !missingStateFacts.empty(); }
+
+    bool HasMissingFactKind(MissingStateFactKind kind) const {
+      return llvm::any_of(missingStateFacts, [&](const MissingStateFact &fact) {
+        return fact.kind == kind;
+      });
     }
 
-    OwnerStateSummary &MergeFrom(const OwnerStateSummary &other) {
-      touchesMacroDefinitions |= other.touchesMacroDefinitions;
-      touchesMacroUndefinitions |= other.touchesMacroUndefinitions;
-      touchesLineControl |= other.touchesLineControl;
-      touchesIncludeState |= other.touchesIncludeState;
-      touchesIncludeGuardState |= other.touchesIncludeGuardState;
-      touchesConditionalState |= other.touchesConditionalState;
-      touchesPragmaState |= other.touchesPragmaState;
-      touchesCounterState |= other.touchesCounterState;
-      touchesBuiltinLocationState |= other.touchesBuiltinLocationState;
+    bool HasMacroDefinitions() const { return !macroDefinitions.empty(); }
+
+    bool HasMacroUndefinitions() const { return !macroUndefinitions.empty(); }
+
+    bool HasMacroRequirements() const { return !macroRequirements.empty(); }
+
+    bool HasMacroExpansionObservations() const {
+      return !macroExpansionObservations.empty();
+    }
+
+    bool HasDefinedOperatorObservations() const {
+      return !definedOperatorObservations.empty();
+    }
+
+    bool HasConditionalMacroObservations() const {
+      return !conditionalMacroObservations.empty();
+    }
+
+    bool HasLineControlEvents() const { return !lineControlEvents.empty(); }
+
+    bool HasBuiltinLocationObservations() const {
+      return !builtinLocationObservations.empty();
+    }
+
+    bool HasCounterEvents() const { return !counterEvents.empty(); }
+
+    bool HasPragmaStateEvents() const { return !pragmaStateEvents.empty(); }
+
+    bool HasIncludeStateEvents() const { return !includeStateEvents.empty(); }
+
+    bool HasIncludeGuardStateEvents() const {
+      return !includeGuardStateEvents.empty();
+    }
+
+    bool HasConditionalStateEvents() const {
+      return !conditionalStateEvents.empty();
+    }
+
+    /// Return true if this bucket contains theorem-facing component facts.
+    ///
+    /// Phase 3O demotes the legacy flat booleans (`definesMacros`,
+    /// `observesMacroState`, `hasUnmodeledState`, etc.) to compatibility/cache
+    /// projections.  This predicate intentionally ignores those flat bits and
+    /// answers only from precise per-component vectors plus explicit missing
+    /// producer facts.
+    bool HasTheoremStateFacts() const {
+      return HasMacroDefinitions() || HasMacroUndefinitions() ||
+             HasMacroRequirements() || HasMacroExpansionObservations() ||
+             HasDefinedOperatorObservations() ||
+             HasConditionalMacroObservations() || HasLineControlEvents() ||
+             HasBuiltinLocationObservations() || HasCounterEvents() ||
+             HasPragmaStateEvents() || HasIncludeStateEvents() ||
+             HasIncludeGuardStateEvents() || HasConditionalStateEvents() ||
+             HasMissingStateFacts();
+    }
+
+    /// Copy only theorem-facing component facts from `other`.
+    ///
+    /// This is the Phase-3O escape hatch from the old flat summary.  The Add*
+    /// helpers still update coarse compatibility booleans in the destination,
+    /// but those booleans are derived from the precise facts being copied here,
+    /// not from legacy global state poison in `other`.
+    OwnerStateFacts &MergeTheoremFactsFrom(const OwnerStateFacts &other) {
+      for (const MacroStateIdentity &identity : other.macroDefinitions)
+        AddMacroDefinition(identity);
+      for (const MacroStateIdentity &identity : other.macroUndefinitions)
+        AddMacroUndefinition(identity);
+      for (const MacroStateIdentity &identity : other.macroRequirements)
+        AddMacroRequirement(identity);
+      for (const MacroStateObservation &observation :
+           other.macroExpansionObservations)
+        AddMacroObservation(observation);
+      for (const MacroStateObservation &observation :
+           other.definedOperatorObservations)
+        AddMacroObservation(observation);
+      for (const MacroStateObservation &observation :
+           other.conditionalMacroObservations)
+        AddMacroObservation(observation);
+      for (const LineControlStateIdentity &identity :
+           other.lineControlEvents)
+        AddLineControlEvent(identity);
+      for (const BuiltinLocationObservation &observation :
+           other.builtinLocationObservations)
+        AddBuiltinLocationObservation(observation);
+      for (const CounterEventIdentity &identity : other.counterEvents)
+        AddCounterEvent(identity);
+      for (const PragmaStateIdentity &identity : other.pragmaStateEvents)
+        AddPragmaStateEvent(identity);
+      for (const IncludeStateIdentity &identity : other.includeStateEvents)
+        AddIncludeStateEvent(identity);
+      for (const IncludeGuardStateIdentity &identity :
+           other.includeGuardStateEvents)
+        AddIncludeGuardStateEvent(identity);
+      for (const ConditionalStateIdentity &identity :
+           other.conditionalStateEvents)
+        AddConditionalStateEvent(identity);
+      for (const MissingStateFact &fact : other.missingStateFacts)
+        AddMissingStateFact(fact.kind, fact.detail);
       return *this;
     }
+
+    bool HasTheoremUnknownPragmaState() const {
+      if (HasMissingFactKind(MissingStateFactKind::MissingPragmaFacts))
+        return true;
+      return llvm::any_of(pragmaStateEvents,
+                          [](const PragmaStateIdentity &identity) {
+                            return identity.classification ==
+                                   PragmaStateClassification::UnknownPragmaState;
+                          });
+    }
+
+    bool MutatesMacroState() const {
+      return definesMacros || undefinesMacros || HasMacroDefinitions() ||
+             HasMacroUndefinitions();
+    }
+
+    bool ObservesBuiltinLocationState() const {
+      return observesLine || observesFile || observesFileName ||
+             HasBuiltinLocationObservations();
+    }
+
+    bool MutatesLineFileState() const {
+      return setsLineFile || HasLineControlEvents();
+    }
+
+    bool MutatesPragmaState() const {
+      return entersPragmaState || exitsPragmaState || hasUnknownPragmaEffect ||
+             HasPragmaStateEvents();
+    }
+
+    bool MutatesIncludeState() const {
+      return mutatesIncludeState || HasIncludeStateEvents();
+    }
+
+    bool ObservesIncludeState() const {
+      return observesIncludeState || HasIncludeStateEvents();
+    }
+
+    bool MutatesIncludeGuardState() const {
+      return mutatesIncludeGuardState || HasIncludeGuardStateEvents();
+    }
+
+    bool ObservesIncludeGuardState() const {
+      return dependsOnIncludeGuardState || HasIncludeGuardStateEvents();
+    }
+
+    bool MutatesConditionalState() const {
+      return mutatesConditionalState || HasConditionalStateEvents();
+    }
+
+    bool ObservesConditionalState() const {
+      return dependsOnConditionalState || observesConditionalState ||
+             HasConditionalStateEvents();
+    }
+
+    bool MutatesAnyState() const {
+      return MutatesMacroState() || MutatesLineFileState() ||
+             consumesCounter || HasCounterEvents() || MutatesPragmaState() ||
+             MutatesIncludeState() || MutatesIncludeGuardState() ||
+             MutatesConditionalState() || HasMissingStateFacts() ||
+             hasUnmodeledState;
+    }
+
+    bool ObservesAnyState() const {
+      return observesMacroState || observesDefinedOperator ||
+             HasMacroRequirements() || HasMacroExpansionObservations() ||
+             HasDefinedOperatorObservations() ||
+             HasConditionalMacroObservations() ||
+             ObservesBuiltinLocationState() || observesCounter ||
+             HasCounterEvents() || observesPragmaState ||
+             ObservesIncludeState() || ObservesIncludeGuardState() ||
+             ObservesConditionalState() || HasMissingStateFacts() ||
+             hasUnmodeledState;
+    }
+
+    bool Empty() const { return !MutatesAnyState() && !ObservesAnyState(); }
+
+    template <typename T>
+    static void AppendUnique(std::vector<T> &dst, ArrayRef<T> src) {
+      for (const T &item : src)
+        AppendUniqueOne(dst, item);
+    }
+
+    template <typename T>
+    static void AppendUniqueOne(std::vector<T> &dst, const T &item) {
+      if (llvm::none_of(dst, [&](const T &existing) {
+            return existing == item;
+          }))
+        dst.push_back(item);
+    }
+
+    void AddMissingStateFact(MissingStateFactKind kind, StringRef detail) {
+      MissingStateFact fact;
+      fact.kind = kind;
+      fact.detail = detail.str();
+      AppendUniqueOne(missingStateFacts, fact);
+      // Missing owner ordering means even the location of the state transition
+      // is not theorem-proven, so preserve the legacy global poison bit until
+      // Phase 3O removes the flat summary as a source of truth.
+      if (kind == MissingStateFactKind::MissingOwnerOrderingFacts)
+        hasUnmodeledState = true;
+    }
+
+    void AddMacroDefinition(const MacroStateIdentity &identity) {
+      AppendUniqueOne(macroDefinitions, identity);
+      definesMacros = true;
+    }
+
+    void AddMacroUndefinition(const MacroStateIdentity &identity) {
+      AppendUniqueOne(macroUndefinitions, identity);
+      undefinesMacros = true;
+    }
+
+    void AddMacroRequirement(const MacroStateIdentity &identity) {
+      AppendUniqueOne(macroRequirements, identity);
+      observesMacroState = true;
+    }
+
+    void AddMacroObservation(const MacroStateObservation &observation) {
+      switch (observation.kind) {
+      case MacroObservationKind::Expansion:
+        AppendUniqueOne(macroExpansionObservations, observation);
+        observesMacroState = true;
+        break;
+      case MacroObservationKind::DefinedOperator:
+        AppendUniqueOne(definedOperatorObservations, observation);
+        observesDefinedOperator = true;
+        break;
+      case MacroObservationKind::ConditionalEvaluation:
+        AppendUniqueOne(conditionalMacroObservations, observation);
+        observesMacroState = true;
+        dependsOnConditionalState = true;
+        observesConditionalState = true;
+        break;
+      }
+    }
+
+
+    void AddLineControlEvent(const LineControlStateIdentity &identity) {
+      AppendUniqueOne(lineControlEvents, identity);
+      setsLineFile = true;
+    }
+
+    void AddBuiltinLocationObservation(
+        const BuiltinLocationObservation &observation) {
+      AppendUniqueOne(builtinLocationObservations, observation);
+      switch (observation.kind) {
+      case BuiltinLocationObservationKind::LineState:
+        observesLine = true;
+        break;
+      case BuiltinLocationObservationKind::FileState:
+        observesFile = true;
+        break;
+      case BuiltinLocationObservationKind::FileNameState:
+        observesFileName = true;
+        break;
+      }
+    }
+
+    void AddCounterObservation(const CounterEventIdentity &identity) {
+      AppendUniqueOne(counterEvents, identity);
+      observesCounter = true;
+    }
+
+    void AddCounterMutation(const CounterEventIdentity &identity) {
+      AppendUniqueOne(counterEvents, identity);
+      consumesCounter = true;
+    }
+
+    void AddCounterEvent(const CounterEventIdentity &identity) {
+      AddCounterObservation(identity);
+      consumesCounter = true;
+    }
+
+    void AddPragmaStateEvent(const PragmaStateIdentity &identity) {
+      AppendUniqueOne(pragmaStateEvents, identity);
+      entersPragmaState = true;
+      exitsPragmaState = true;
+      observesPragmaState = true;
+      if (identity.classification ==
+          PragmaStateClassification::UnknownPragmaState)
+        hasUnknownPragmaEffect = true;
+    }
+
+    void AddIncludeStateEvent(const IncludeStateIdentity &identity) {
+      AppendUniqueOne(includeStateEvents, identity);
+      observesIncludeState = true;
+      mutatesIncludeState = true;
+    }
+
+    void AddIncludeGuardStateEvent(
+        const IncludeGuardStateIdentity &identity) {
+      AppendUniqueOne(includeGuardStateEvents, identity);
+      dependsOnIncludeGuardState = true;
+      switch (identity.kind) {
+      case IncludeGuardObservationKind::ActiveIncludeMayMutateGuard:
+      case IncludeGuardObservationKind::UnknownGuardEffect:
+        mutatesIncludeGuardState = true;
+        break;
+      case IncludeGuardObservationKind::SkippedIncludeMayObserveGuard:
+        break;
+      }
+      // Missing guard-oracle facts are represented in the identity itself.
+      // Phase 3L will convert component-specific missing facts into named
+      // obligations; do not collapse them back into the global unmodeled bit
+      // here, or every include would conservatively poison unrelated state.
+    }
+
+    void AddConditionalStateEvent(
+        const ConditionalStateIdentity &identity) {
+      AppendUniqueOne(conditionalStateEvents, identity);
+      dependsOnConditionalState = true;
+      observesConditionalState = true;
+      mutatesConditionalState = true;
+      if (!identity.conditionTruthProducerProven ||
+          identity.reverseSolvedDirectiveRequired)
+        hasUnmodeledState = true;
+    }
+
+    OwnerStateFacts &MergeFrom(const OwnerStateFacts &other) {
+      definesMacros |= other.definesMacros;
+      undefinesMacros |= other.undefinesMacros;
+      observesMacroState |= other.observesMacroState;
+      observesDefinedOperator |= other.observesDefinedOperator;
+      AppendUnique(macroDefinitions,
+                   ArrayRef<MacroStateIdentity>(other.macroDefinitions));
+      AppendUnique(macroUndefinitions,
+                   ArrayRef<MacroStateIdentity>(other.macroUndefinitions));
+      AppendUnique(macroRequirements,
+                   ArrayRef<MacroStateIdentity>(other.macroRequirements));
+      AppendUnique(macroExpansionObservations,
+                   ArrayRef<MacroStateObservation>(
+                       other.macroExpansionObservations));
+      AppendUnique(definedOperatorObservations,
+                   ArrayRef<MacroStateObservation>(
+                       other.definedOperatorObservations));
+      AppendUnique(conditionalMacroObservations,
+                   ArrayRef<MacroStateObservation>(
+                       other.conditionalMacroObservations));
+      setsLineFile |= other.setsLineFile;
+      observesLine |= other.observesLine;
+      observesFile |= other.observesFile;
+      observesFileName |= other.observesFileName;
+      AppendUnique(lineControlEvents,
+                   ArrayRef<LineControlStateIdentity>(other.lineControlEvents));
+      AppendUnique(builtinLocationObservations,
+                   ArrayRef<BuiltinLocationObservation>(
+                       other.builtinLocationObservations));
+      consumesCounter |= other.consumesCounter;
+      observesCounter |= other.observesCounter;
+      AppendUnique(counterEvents,
+                   ArrayRef<CounterEventIdentity>(other.counterEvents));
+      entersPragmaState |= other.entersPragmaState;
+      exitsPragmaState |= other.exitsPragmaState;
+      observesPragmaState |= other.observesPragmaState;
+      hasUnknownPragmaEffect |= other.hasUnknownPragmaEffect;
+      AppendUnique(pragmaStateEvents,
+                   ArrayRef<PragmaStateIdentity>(other.pragmaStateEvents));
+      dependsOnIncludeGuardState |= other.dependsOnIncludeGuardState;
+      mutatesIncludeGuardState |= other.mutatesIncludeGuardState;
+      observesIncludeState |= other.observesIncludeState;
+      mutatesIncludeState |= other.mutatesIncludeState;
+      AppendUnique(includeStateEvents,
+                   ArrayRef<IncludeStateIdentity>(other.includeStateEvents));
+      AppendUnique(includeGuardStateEvents,
+                   ArrayRef<IncludeGuardStateIdentity>(
+                       other.includeGuardStateEvents));
+      dependsOnConditionalState |= other.dependsOnConditionalState;
+      mutatesConditionalState |= other.mutatesConditionalState;
+      observesConditionalState |= other.observesConditionalState;
+      AppendUnique(conditionalStateEvents,
+                   ArrayRef<ConditionalStateIdentity>(
+                       other.conditionalStateEvents));
+      AppendUnique(missingStateFacts,
+                   ArrayRef<MissingStateFact>(other.missingStateFacts));
+      hasUnmodeledState |= other.hasUnmodeledState;
+      return *this;
+    }
+  };
+
+  /// State required to hold at owner entry before the owner's source bytes are
+  /// replayed or preserved.  Phase 3B+ will make this component-specific; Phase
+  /// 3A uses the existing conservative bits as the seed vocabulary.
+  struct StateRequirements : OwnerStateFacts {};
+
+  /// State actually observed by the owner while producing its A-token envelope.
+  struct StateObservations : OwnerStateFacts {};
+
+  /// State transitions performed by the owner.
+  struct StateMutations : OwnerStateFacts {};
+
+  /// State equivalences the owner requires at exit for a preserved suffix to
+  /// remain valid.  Today this is projected from the mutation surface; later
+  /// phases can record finer post-state guarantees here.
+  struct StateGuarantees : OwnerStateFacts {};
+
+  /// Canonical Phase-3 state-delta model for one owner.
+  ///
+  /// This is the theorem-facing answer to four different questions that the old
+  /// boolean-only summary could not separate:
+  ///
+  ///   * Entry:    what state must already be true before this owner?
+  ///   * Observes: what state does this owner read?
+  ///   * Mutates:  what state does this owner change?
+  ///   * Exit:     what state must be equivalent after this owner?
+  ///
+  /// The buckets are monotone.  A missing producer fact must set the relevant
+  /// unmodeled bit in one or more buckets, never clear an obligation.
+  struct OwnerStateDelta {
+    StateRequirements Entry;
+    StateObservations Observes;
+    StateMutations Mutates;
+    StateGuarantees Exit;
+
+    bool Empty() const {
+      return Entry.Empty() && Observes.Empty() && Mutates.Empty() &&
+             Exit.Empty();
+    }
+
+    OwnerStateDelta &MergeFrom(const OwnerStateDelta &other) {
+      Entry.MergeFrom(other.Entry);
+      Observes.MergeFrom(other.Observes);
+      Mutates.MergeFrom(other.Mutates);
+      Exit.MergeFrom(other.Exit);
+      return *this;
+    }
+
+    /// Merge only theorem-facing component facts from another delta.
+    ///
+    /// Unlike MergeFrom(), this deliberately ignores legacy compatibility
+    /// booleans in the source buckets.  It is used by Phase 3O theorem checks
+    /// so stale coarse bits cannot conservatively poison unrelated components
+    /// once precise per-component facts have been populated.
+    OwnerStateDelta &MergeTheoremFactsFrom(const OwnerStateDelta &other) {
+      Entry.MergeTheoremFactsFrom(other.Entry);
+      Observes.MergeTheoremFactsFrom(other.Observes);
+      Mutates.MergeTheoremFactsFrom(other.Mutates);
+      Exit.MergeTheoremFactsFrom(other.Exit);
+      return *this;
+    }
+  };
+
+  /// Canonical sideband preprocessing-state summary for an owner closure.
+  ///
+  /// Phase 3A keeps the legacy flat bit surface as a compatibility projection,
+  /// but the theorem-facing representation is now `delta`.  Existing proof code
+  /// can continue to query the flat bits while later phases migrate to
+  /// `Entry`/`Observes`/`Mutates`/`Exit` without changing candidate selection.
+  struct OwnerStateSummary : OwnerStateFacts {
+    OwnerStateDelta delta;
+
+    OwnerStateSummary &MergeFrom(const OwnerStateSummary &other) {
+      OwnerStateFacts::MergeFrom(other);
+      delta.MergeFrom(other.delta);
+      return *this;
+    }
+
+    /// Populate `delta` from the current conservative flat facts.
+    ///
+    /// This projection is intentionally monotone and conservative.  Anything
+    /// observed is also treated as an entry requirement for the owner; anything
+    /// mutated is also treated as an exit-equivalence obligation for preserved
+    /// suffixes.  Later Phase-3 substeps will split these buckets into
+    /// component-specific facts rather than weakening this projection.
+    void RefreshDeltaFromFlatFacts();
+
+    /// Return the compatibility delta view for this summary.  The result merges
+    /// the stored Phase-3A delta with a fresh projection from the flat
+    /// compatibility bits, so legacy construction sites that have not yet been
+    /// migrated cannot accidentally hide state by forgetting to refresh `delta`.
+    /// Theorem checks should prefer AsTheoremStateDelta().
+    OwnerStateDelta AsStateDelta() const;
+
+    /// Return the Phase-3O theorem-facing delta view.
+    ///
+    /// This view is reconstructed from precise per-component vectors and
+    /// explicit MissingStateFact markers.  Legacy flat booleans remain available
+    /// through AsStateDelta() for compatibility/debug projections, but they are
+    /// no longer the source of truth for owner-state theorem checks.
+    OwnerStateDelta AsTheoremStateDelta() const;
+
+    bool HasTheoremUnmodeledState() const;
+    bool HasTheoremUnknownPragmaState() const;
+
+    /// Theorem-facing predicates backed by AsTheoremStateDelta().  Coarse flat
+    /// booleans are intentionally excluded unless they were derived from precise
+    /// component facts or explicit missing-fact markers.
+    bool MutatesAnyState() const;
+    bool ObservesAnyState() const;
+    bool Empty() const { return !MutatesAnyState() && !ObservesAnyState(); }
+
+    /// Project this state summary to the suffix-observer surface.  Later phases
+    /// use this to ask only about state components that a preserved suffix can
+    /// actually observe instead of forcing whole-preprocessor equivalence.
+    OwnerObserverSummary ToObserverSummary() const;
   };
 
   /// Summary of suffix-visible observers that constrain state composition.
@@ -1891,6 +3342,7 @@ private:
     bool observesDefinedOperator = false;
     bool observesConditionalEvaluation = false;
     bool observesLineNumber = false;
+    bool observesFileState = false;
     bool observesFileName = false;
     bool observesCounter = false;
     bool observesPragmaState = false;
@@ -1900,7 +3352,8 @@ private:
     bool Empty() const {
       return !observesMacroExpansion && !observesDefinedOperator &&
              !observesConditionalEvaluation && !observesLineNumber &&
-             !observesFileName && !observesCounter && !observesPragmaState &&
+             !observesFileState && !observesFileName && !observesCounter &&
+             !observesPragmaState &&
              !observesIncludeGuardState && !observesIncludeState;
     }
 
@@ -1909,6 +3362,7 @@ private:
       observesDefinedOperator |= other.observesDefinedOperator;
       observesConditionalEvaluation |= other.observesConditionalEvaluation;
       observesLineNumber |= other.observesLineNumber;
+      observesFileState |= other.observesFileState;
       observesFileName |= other.observesFileName;
       observesCounter |= other.observesCounter;
       observesPragmaState |= other.observesPragmaState;
@@ -1978,12 +3432,1156 @@ private:
     }
   };
 
-  /// \brief Top-level buckets for the accepted-result proof lattice.
+  /// State component key used by the Phase-4 suffix-observer graph.
   ///
-  /// These categories let the engine describe what class of result was accepted
-  /// without changing refolding behavior or
-  /// conflating that classification with candidate ranking or the legacy retry
-  /// ladder.
+  /// These components are intentionally coarser than Clang's full preprocessor
+  /// state.  They are the theorem-facing equivalence classes that an edit may
+  /// disturb before a preserved suffix: later Phase-5 enforcement only needs to
+  /// know whether a suffix owner can observe one of these components.
+  enum class OwnerStateComponent : uint8_t {
+    MacroState,
+    DefinedOperator,
+    ConditionalState,
+    LineNumber,
+    FileState,
+    FileName,
+    Counter,
+    PragmaState,
+    IncludeGuardState,
+    IncludeState,
+    UnmodeledState,
+    Unknown
+  };
+
+  friend inline StringRef toString(OwnerStateComponent component) {
+    switch (component) {
+    case OwnerStateComponent::MacroState:
+      return "MacroState";
+    case OwnerStateComponent::DefinedOperator:
+      return "DefinedOperator";
+    case OwnerStateComponent::ConditionalState:
+      return "ConditionalState";
+    case OwnerStateComponent::LineNumber:
+      return "LineNumber";
+    case OwnerStateComponent::FileState:
+      return "FileState";
+    case OwnerStateComponent::FileName:
+      return "FileName";
+    case OwnerStateComponent::Counter:
+      return "Counter";
+    case OwnerStateComponent::PragmaState:
+      return "PragmaState";
+    case OwnerStateComponent::IncludeGuardState:
+      return "IncludeGuardState";
+    case OwnerStateComponent::IncludeState:
+      return "IncludeState";
+    case OwnerStateComponent::UnmodeledState:
+      return "UnmodeledState";
+    case OwnerStateComponent::Unknown:
+      return "Unknown";
+    }
+    llvm_unreachable("Invalid owner state component");
+  }
+
+  /// Boundary before a preserved suffix whose state observers are being queried.
+  ///
+  /// A boundary may be source-based, token-based, or both.  Source boundaries
+  /// are used for owner-local repair decisions (`#define`, `#line`, pragmas,
+  /// etc.); token boundaries let future proof code ask about observers that are
+  /// only comparable through the A-token stream.  Missing comparison facts are
+  /// conservative: the query reports incomparable observers instead of assuming
+  /// there is no suffix dependency.
+  struct OwnerStateBoundary {
+    OwnerSourceRange source;
+    OwnerTokenRange aTokens;
+    bool hasSourceBoundary = false;
+    bool hasTokenBoundary = false;
+
+    static OwnerStateBoundary FromSource(OwnerSourceRange source) {
+      OwnerStateBoundary boundary;
+      boundary.source = std::move(source);
+      boundary.hasSourceBoundary = true;
+      return boundary;
+    }
+
+    static OwnerStateBoundary FromATokens(OwnerTokenRange aTokens) {
+      OwnerStateBoundary boundary;
+      boundary.aTokens = aTokens;
+      boundary.hasTokenBoundary = true;
+      return boundary;
+    }
+
+    static OwnerStateBoundary FromSourceAndATokens(OwnerSourceRange source,
+                                                   OwnerTokenRange aTokens) {
+      OwnerStateBoundary boundary;
+      boundary.source = std::move(source);
+      boundary.aTokens = aTokens;
+      boundary.hasSourceBoundary = true;
+      boundary.hasTokenBoundary = true;
+      return boundary;
+    }
+  };
+
+  /// Canonical preprocessing-order node kinds for the Phase-4 state graph.
+  ///
+  /// These are theorem-facing semantic events, not construction algorithms.
+  /// Ordinary token owners and macro invocations may have non-empty A-token
+  /// ranges; directive/control events often have empty token ranges but still
+  /// mutate or observe preprocessor state and therefore must remain ordered in
+  /// the graph.
+  enum class OwnerStateGraphNodeKind : uint8_t {
+    OrdinaryTokenOwner,
+    MacroInvocation,
+    NestedMacroExpansion,
+    IncludeEntry,
+    IncludeExit,
+    MacroDefineEvent,
+    MacroUndefEvent,
+    LineControlEvent,
+    PragmaEvent,
+    ConditionalEvent,
+    CounterEvent,
+    Unknown
+  };
+
+  friend inline StringRef toString(OwnerStateGraphNodeKind kind) {
+    switch (kind) {
+    case OwnerStateGraphNodeKind::OrdinaryTokenOwner:
+      return "OrdinaryTokenOwner";
+    case OwnerStateGraphNodeKind::MacroInvocation:
+      return "MacroInvocation";
+    case OwnerStateGraphNodeKind::NestedMacroExpansion:
+      return "NestedMacroExpansion";
+    case OwnerStateGraphNodeKind::IncludeEntry:
+      return "IncludeEntry";
+    case OwnerStateGraphNodeKind::IncludeExit:
+      return "IncludeExit";
+    case OwnerStateGraphNodeKind::MacroDefineEvent:
+      return "MacroDefineEvent";
+    case OwnerStateGraphNodeKind::MacroUndefEvent:
+      return "MacroUndefEvent";
+    case OwnerStateGraphNodeKind::LineControlEvent:
+      return "LineControlEvent";
+    case OwnerStateGraphNodeKind::PragmaEvent:
+      return "PragmaEvent";
+    case OwnerStateGraphNodeKind::ConditionalEvent:
+      return "ConditionalEvent";
+    case OwnerStateGraphNodeKind::CounterEvent:
+      return "CounterEvent";
+    case OwnerStateGraphNodeKind::Unknown:
+      return "Unknown";
+    }
+    llvm_unreachable("Invalid owner state graph node kind");
+  }
+
+  /// Stable node in the persistent owner/state-event graph.
+  ///
+  /// Phase 4A--4C require every semantic event to be represented explicitly,
+  /// including zero-token directives such as #define, #undef, #line, #pragma,
+  /// conditional-control islands, include entry/exit markers, and __COUNTER__
+  /// events.  `closure` names the owner and source/token evidence; `state` is
+  /// the precise theorem-facing delta attached to that node.  `predecessor` and
+  /// `successor` are the deterministic total-order neighbors in this graph,
+  /// while later Phase-4/5 code may still reject nodes whose producer facts are
+  /// insufficient to compare against a particular edit boundary.
+  struct OwnerStateGraphNode {
+    uint64_t id = 0;
+    uint64_t order = 0;
+    OwnerStateGraphNodeKind kind = OwnerStateGraphNodeKind::Unknown;
+    OwnerClosure closure;
+    OwnerStateDelta state;
+    OwnerSourceRange source;
+    OwnerTokenRange aTokens;
+    std::optional<uint64_t> predecessor = std::nullopt;
+    std::optional<uint64_t> successor = std::nullopt;
+    std::optional<uint64_t> containingIncludeId = std::nullopt;
+    std::optional<uint64_t> containingMacroInvocationId = std::nullopt;
+    std::optional<uint64_t> containingConditionalArmId = std::nullopt;
+    std::string detail;
+
+    bool HasTokenAnchor() const {
+      return aTokens.IsValid() && !aTokens.Empty();
+    }
+
+    bool IsZeroTokenEvent() const { return !HasTokenAnchor(); }
+  };
+
+  /// Observer kind returned by first-observer suffix queries.
+  ///
+  /// Phase 4D/4E keeps the state component coarse enough for the Phase-5
+  /// gateway, but records the exact observation surface that caused the suffix
+  /// dependency.  This lets repair/materialization code distinguish, for
+  /// example, ordinary macro expansion from defined(NAME), or __FILE__ from
+  /// __FILE_NAME__, without rescanning the owner.
+  enum class SuffixObservationKind : uint8_t {
+    MacroExpansionObservation,
+    DefinedOperatorObservation,
+    ConditionalMacroObservation,
+    LineStateObservation,
+    FileStateObservation,
+    FileNameStateObservation,
+    CounterObservation,
+    PragmaStateObservation,
+    IncludeGuardStateObservation,
+    IncludeStateObservation,
+    UnmodeledStateObservation,
+    Unknown
+  };
+
+  friend inline StringRef toString(SuffixObservationKind kind) {
+    switch (kind) {
+    case SuffixObservationKind::MacroExpansionObservation:
+      return "MacroExpansionObservation";
+    case SuffixObservationKind::DefinedOperatorObservation:
+      return "DefinedOperatorObservation";
+    case SuffixObservationKind::ConditionalMacroObservation:
+      return "ConditionalMacroObservation";
+    case SuffixObservationKind::LineStateObservation:
+      return "LineStateObservation";
+    case SuffixObservationKind::FileStateObservation:
+      return "FileStateObservation";
+    case SuffixObservationKind::FileNameStateObservation:
+      return "FileNameStateObservation";
+    case SuffixObservationKind::CounterObservation:
+      return "CounterObservation";
+    case SuffixObservationKind::PragmaStateObservation:
+      return "PragmaStateObservation";
+    case SuffixObservationKind::IncludeGuardStateObservation:
+      return "IncludeGuardStateObservation";
+    case SuffixObservationKind::IncludeStateObservation:
+      return "IncludeStateObservation";
+    case SuffixObservationKind::UnmodeledStateObservation:
+      return "UnmodeledStateObservation";
+    case SuffixObservationKind::Unknown:
+      return "Unknown";
+    }
+    llvm_unreachable("Invalid suffix observation kind");
+  }
+
+  /// Proof that a suffix observer was ordered relative to an edit boundary.
+  ///
+  /// Incomparable observer order is a named missing-producer-facts condition,
+  /// never absence of observation.  Phase 5 consumes this value to decide
+  /// whether state repair may be inserted before the first observer.
+  enum class SuffixOrderingProofKind : uint8_t {
+    SourceOrder,
+    TokenOrder,
+    SourceAndTokenOrder,
+    IncomparableMissingProducerFacts,
+    Unknown
+  };
+
+  friend inline StringRef toString(SuffixOrderingProofKind kind) {
+    switch (kind) {
+    case SuffixOrderingProofKind::SourceOrder:
+      return "SourceOrder";
+    case SuffixOrderingProofKind::TokenOrder:
+      return "TokenOrder";
+    case SuffixOrderingProofKind::SourceAndTokenOrder:
+      return "SourceAndTokenOrder";
+    case SuffixOrderingProofKind::IncomparableMissingProducerFacts:
+      return "IncomparableMissingProducerFacts";
+    case SuffixOrderingProofKind::Unknown:
+      return "Unknown";
+    }
+    llvm_unreachable("Invalid suffix ordering proof kind");
+  }
+
+  /// One suffix observer discovered by the Phase-4 observer graph.
+  ///
+  /// `owner` identifies the later owner, `source`/`aTokens` give the comparable
+  /// position evidence, and `component` names the state component observed by
+  /// that owner.  The `observations` field preserves the full projected observer
+  /// summary so Phase 5 can make component-specific repair/materialization
+  /// decisions without rebuilding the graph.
+  struct SuffixStateObserverSite {
+    uint64_t nodeId = 0;
+    OwnerStateGraphNodeKind nodeKind = OwnerStateGraphNodeKind::Unknown;
+    Owner owner;
+    OwnerSourceRange source;
+    OwnerTokenRange aTokens;
+    OwnerStateComponent component = OwnerStateComponent::Unknown;
+    SuffixObservationKind observationKind = SuffixObservationKind::Unknown;
+    OwnerObserverSummary observations;
+    uint64_t order = 0;
+    std::string componentKey;
+    std::string detail;
+  };
+
+  /// Indexed observer result returned by Phase-4 first-observer queries.
+  struct SuffixObserverResult {
+    uint64_t observerSiteIndex = 0;
+    uint64_t nodeId = 0;
+    Owner firstObserver;
+    OwnerStateComponent component = OwnerStateComponent::Unknown;
+    SuffixObservationKind observationKind = SuffixObservationKind::Unknown;
+    SuffixOrderingProofKind orderingProof =
+        SuffixOrderingProofKind::Unknown;
+    bool materializable = false;
+    bool repairCanPrecede = false;
+    SuffixStateObserverSite site;
+  };
+
+  /// Component-specific observer indexes for the persistent state graph.
+  ///
+  /// The unkeyed vectors are the Phase-5 gateway surface; keyed maps preserve
+  /// the Phase-3 component identities so later proofs can ask more precise
+  /// questions such as "who observes macro FOO?" without scanning every owner.
+  struct OwnerStateGraphObserverIndex {
+    std::vector<uint64_t> macroStateObservers;
+    std::vector<uint64_t> definedOperatorObservers;
+    std::vector<uint64_t> conditionalStateObservers;
+    std::vector<uint64_t> lineStateObservers;
+    std::vector<uint64_t> fileStateObservers;
+    std::vector<uint64_t> fileNameStateObservers;
+    std::vector<uint64_t> counterObservers;
+    std::vector<uint64_t> pragmaStateObservers;
+    std::vector<uint64_t> includeGuardStateObservers;
+    std::vector<uint64_t> includeStateObservers;
+    std::vector<uint64_t> unmodeledStateObservers;
+
+    llvm::StringMap<std::vector<uint64_t>> observersByMacroName;
+    llvm::StringMap<std::vector<uint64_t>> observersByCounterEvent;
+    llvm::StringMap<std::vector<uint64_t>> observersByPragmaState;
+    llvm::StringMap<std::vector<uint64_t>> observersByIncludeGuard;
+    llvm::StringMap<std::vector<uint64_t>> observersByIncludeState;
+    llvm::StringMap<std::vector<uint64_t>> observersByConditionalState;
+  };
+
+  /// Phase-4 graph census emitted to theorem/debug logs.
+  struct OwnerStateGraphAuditStats {
+    uint64_t ownerNodes = 0;
+    uint64_t zeroTokenStateNodes = 0;
+    uint64_t observedStateComponents = 0;
+    uint64_t mutatedStateComponents = 0;
+    uint64_t incomparableNodes = 0;
+    uint64_t missingProducerFacts = 0;
+  };
+
+
+  /// Persistent Phase-4 owner/state-event graph.
+  ///
+  /// The graph is built once per RefoldEngine instance from producer facts.  It
+  /// is the canonical census used by suffix queries: callers should not perform
+  /// owner-specific scans for macro, include, line-control, pragma, conditional,
+  /// or counter events once this graph is available.
+  struct OwnerStateGraph {
+    std::vector<OwnerStateGraphNode> nodes;
+    std::vector<SuffixStateObserverSite> observerSites;
+    OwnerStateGraphObserverIndex observerIndex;
+    OwnerStateGraphAuditStats audit;
+
+    bool Empty() const { return nodes.empty(); }
+  };
+
+  /// Cached Phase-4 owner/state-event graph.
+  ///
+  /// The refold model is immutable after construction, so the graph can be
+  /// built lazily once and reused by every suffix-observer query.  This is the
+  /// first step toward making suffix stability a graph query rather than a set
+  /// of owner-specific rescans.
+  mutable std::optional<OwnerStateGraph> ownerStateGraphCache_;
+
+  /// Compatibility projection used by older suffix-stability callers.
+  ///
+  /// New Phase-4/5 code should consume `OwnerStateGraph` directly.  This wrapper
+  /// remains so existing code can migrate without duplicating graph construction
+  /// or rebuilding owner summaries.
+  struct SuffixObserverGraph {
+    std::vector<OwnerClosure> orderedOwners;
+    std::vector<SuffixStateObserverSite> observerSites;
+  };
+
+  /// Result of querying the preserved suffix after an edit boundary.
+  ///
+  /// `sites` contains observers that are proven to occur after the boundary.
+  /// `hasIncomparableObserver` is a conservative signal: some owner observes the
+  /// requested component, but the available producer facts were insufficient to
+  /// order it relative to the boundary.  Phase 5 must treat that as an
+  /// undischarged suffix-stability obligation, not as absence of observation.
+  struct SuffixObserverQueryResult {
+    std::vector<SuffixStateObserverSite> sites;
+    std::vector<SuffixObserverResult> orderedObservers;
+    std::vector<SuffixObserverResult> incomparableResults;
+    std::optional<SuffixObserverResult> firstObserver = std::nullopt;
+    bool hasIncomparableObserver = false;
+    bool hasNoCanonicalSuffixOrder = false;
+    OwnerObserverSummary incomparableObservers;
+
+    bool Empty() const {
+      return sites.empty() && !hasIncomparableObserver;
+    }
+  };
+
+  /// Build the conservative Phase-3 state summary for a concrete owner.
+  ///
+  /// The result is monotone: missing producer facts or unknown owner identity set
+  /// `hasUnmodeledState` instead of clearing obligations.  This helper is a
+  /// theorem-facing census primitive only; later phases decide how to consume or
+  /// enforce the returned obligations.
+  OwnerStateSummary BuildOwnerStateSummary(const Owner &owner) const;
+
+  /// Return `closure` with its canonical owner-state facts attached.
+  ///
+  /// Existing callers may still construct passive closures without summaries.
+  /// This helper gives new proof code one normalization point that annotates a
+  /// closure from producer metadata before composing it with neighboring owners.
+  OwnerClosure AttachCanonicalStateSummary(OwnerClosure closure) const;
+
+  /// Build the deterministic persistent Phase-4 owner/state-event graph.
+  ///
+  /// The graph contains ordinary token owners, include entry/exit events, nested
+  /// macro expansion owners, and all zero-token state directives recorded by
+  /// the producer.  It is a census only: suffix-stability enforcement remains a
+  /// Phase-5 responsibility.
+  OwnerStateGraph BuildOwnerStateGraph() const;
+
+  /// Return the cached Phase-4 owner/state-event graph, building it once.
+  const OwnerStateGraph &GetOwnerStateGraph() const;
+
+  /// Build the deterministic Phase-4 suffix-observer compatibility projection.
+  ///
+  /// The projection is derived from the persistent `OwnerStateGraph`; it no
+  /// longer performs independent owner scans or state-summary construction.
+  SuffixObserverGraph BuildSuffixObserverGraph() const;
+
+  /// Return later suffix observers of `component` after `boundary`.
+  ///
+  /// The query is conservative.  If an observer exists but cannot be ordered
+  /// against the boundary using source or token facts, the result marks it as
+  /// incomparable so the caller cannot accidentally discharge the obligation.
+  SuffixObserverQueryResult
+  FindSuffixObservers(const OwnerStateBoundary &boundary,
+                      OwnerStateComponent component) const;
+
+  /// How a state-changing edit discharges preserved suffix observers.
+  ///
+  /// Phase 5 routes every state-transition proof through one decision surface:
+  /// a changed state component is admissible only when the preserved suffix has
+  /// no observer, the edit repairs equivalent state before the first observer,
+  /// the observer is materialized, or the edited closure is widened to include
+  /// the observer.  `None` means the caller has no such discharge and the
+  /// helper must fail closed if the suffix graph finds an observer.
+  enum class SuffixStabilityDischargeKind : uint8_t {
+    None,
+    NoSuffixObserver,
+    StateRepaired,
+    ObserverMaterialized,
+    ClosureWidened,
+    StateEquivalent
+  };
+
+  friend inline StringRef toString(SuffixStabilityDischargeKind kind) {
+    switch (kind) {
+    case SuffixStabilityDischargeKind::None:
+      return "None";
+    case SuffixStabilityDischargeKind::NoSuffixObserver:
+      return "NoSuffixObserver";
+    case SuffixStabilityDischargeKind::StateRepaired:
+      return "StateRepaired";
+    case SuffixStabilityDischargeKind::ObserverMaterialized:
+      return "ObserverMaterialized";
+    case SuffixStabilityDischargeKind::ClosureWidened:
+      return "ClosureWidened";
+    case SuffixStabilityDischargeKind::StateEquivalent:
+      return "StateEquivalent";
+    }
+    llvm_unreachable("Invalid suffix-stability discharge kind");
+  }
+
+  /// How a source edit changes one state component at an edit boundary.
+  ///
+  /// Phase 5B separates the *kind* of state transition from the proof that
+  /// makes that transition safe.  A consumed #define, a replayed #line, and a
+  /// literalized __COUNTER__ occurrence may all affect suffix stability, but
+  /// they have different proof obligations and diagnostics.  The gateway below
+  /// receives one of these mutation kinds before it asks the suffix-observer
+  /// graph whether any preserved owner can observe the changed component.
+  enum class StateMutationKind : uint8_t {
+    Consumed,
+    Deleted,
+    MovedEarlier,
+    MovedLater,
+    Replayed,
+    PreservedAcrossReplacement,
+    Materialized,
+    Literalized,
+    WidenedIntoClosure,
+    Unknown
+  };
+
+  friend inline StringRef toString(StateMutationKind kind) {
+    switch (kind) {
+    case StateMutationKind::Consumed:
+      return "Consumed";
+    case StateMutationKind::Deleted:
+      return "Deleted";
+    case StateMutationKind::MovedEarlier:
+      return "MovedEarlier";
+    case StateMutationKind::MovedLater:
+      return "MovedLater";
+    case StateMutationKind::Replayed:
+      return "Replayed";
+    case StateMutationKind::PreservedAcrossReplacement:
+      return "PreservedAcrossReplacement";
+    case StateMutationKind::Materialized:
+      return "Materialized";
+    case StateMutationKind::Literalized:
+      return "Literalized";
+    case StateMutationKind::WidenedIntoClosure:
+      return "WidenedIntoClosure";
+    case StateMutationKind::Unknown:
+      return "Unknown";
+    }
+    llvm_unreachable("Invalid state mutation kind");
+  }
+
+  /// Producer-closure proof for edits that would otherwise reverse-solve an
+  /// upstream directive from downstream B-side tokens.
+  ///
+  /// Phase 5K makes this a gateway-level invariant: changing macro definitions,
+  /// #line operands, include paths, or conditional truth from the resulting
+  /// expansion is forbidden unless the directive owner itself belongs to the
+  /// accepted owner closure.  Unknown closure proof is also fail-closed because
+  /// absence of a producer fact is not evidence that reverse-solving is safe.
+  enum class DirectiveClosureStatus : uint8_t {
+    NotADirectiveStateRewrite,
+    DirectiveOwnerInsideAcceptedClosure,
+    DirectiveOwnerOutsideAcceptedClosure,
+    Unknown
+  };
+
+  friend inline StringRef toString(DirectiveClosureStatus status) {
+    switch (status) {
+    case DirectiveClosureStatus::NotADirectiveStateRewrite:
+      return "NotADirectiveStateRewrite";
+    case DirectiveClosureStatus::DirectiveOwnerInsideAcceptedClosure:
+      return "DirectiveOwnerInsideAcceptedClosure";
+    case DirectiveClosureStatus::DirectiveOwnerOutsideAcceptedClosure:
+      return "DirectiveOwnerOutsideAcceptedClosure";
+    case DirectiveClosureStatus::Unknown:
+      return "Unknown";
+    }
+    llvm_unreachable("Invalid directive closure status");
+  }
+
+  /// Typed witness that the preserved suffix does not observe the changed state.
+  struct SuffixUnobservedWitness {
+    OwnerStateComponent component = OwnerStateComponent::Unknown;
+    OwnerStateBoundary boundary;
+    std::string detail;
+  };
+
+  /// Typed witness that equivalent state is repaired before the first observer.
+  struct StateRepairWitness {
+    OwnerStateComponent component = OwnerStateComponent::Unknown;
+    OwnerStateBoundary boundary;
+    std::optional<SuffixObserverResult> firstObserver = std::nullopt;
+    std::string detail;
+  };
+
+  /// Typed witness that a suffix observer is materialized and no longer observes
+  /// the changed preprocessor state through preserved source spelling.
+  struct OwnerMaterializationWitness {
+    OwnerStateComponent component = OwnerStateComponent::Unknown;
+    OwnerStateBoundary boundary;
+    std::optional<SuffixObserverResult> materializedObserver = std::nullopt;
+    std::string detail;
+  };
+
+  /// Typed witness that the edit closure was widened to include every relevant
+  /// suffix observer before it could observe the changed state.
+  struct ClosureWideningWitness {
+    OwnerStateComponent component = OwnerStateComponent::Unknown;
+    OwnerStateBoundary boundary;
+    std::optional<SuffixObserverResult> widenedThroughObserver = std::nullopt;
+    std::string detail;
+  };
+
+  /// Typed witness that a stateful builtin event was replaced by a literal whose
+  /// value was derived from the assigned B-side envelope.
+  struct LiteralizationWitness {
+    OwnerStateComponent component = OwnerStateComponent::Unknown;
+    OwnerStateBoundary boundary;
+    std::optional<SuffixObserverResult> literalizedObserver = std::nullopt;
+    std::string detail;
+  };
+
+  /// Typed witness for the fail-closed terminal state-stability case.
+  struct TerminalStateFailureWitness {
+    OwnerStateComponent component = OwnerStateComponent::Unknown;
+    OwnerStateBoundary boundary;
+    TerminalFallbackProofFailure failure;
+    bool hasFailure = false;
+    std::string detail;
+  };
+
+  /// Compact tagged wrapper for Phase-5 suffix-stability witnesses.
+  ///
+  /// The individual witness structs above are the theorem-facing payloads.  This
+  /// wrapper exists only to pass one typed witness through the existing C++17
+  /// code without introducing a second hierarchy or duplicated switch logic.
+  enum class SuffixStabilityWitnessKind : uint8_t {
+    None,
+    SuffixUnobserved,
+    StateRepair,
+    OwnerMaterialization,
+    ClosureWidening,
+    Literalization,
+    TerminalStateFailure
+  };
+
+  friend inline StringRef toString(SuffixStabilityWitnessKind kind) {
+    switch (kind) {
+    case SuffixStabilityWitnessKind::None:
+      return "None";
+    case SuffixStabilityWitnessKind::SuffixUnobserved:
+      return "SuffixUnobserved";
+    case SuffixStabilityWitnessKind::StateRepair:
+      return "StateRepair";
+    case SuffixStabilityWitnessKind::OwnerMaterialization:
+      return "OwnerMaterialization";
+    case SuffixStabilityWitnessKind::ClosureWidening:
+      return "ClosureWidening";
+    case SuffixStabilityWitnessKind::Literalization:
+      return "Literalization";
+    case SuffixStabilityWitnessKind::TerminalStateFailure:
+      return "TerminalStateFailure";
+    }
+    llvm_unreachable("Invalid suffix-stability witness kind");
+  }
+
+  struct SuffixStabilityWitness {
+    SuffixStabilityWitnessKind kind = SuffixStabilityWitnessKind::None;
+    std::optional<SuffixUnobservedWitness> suffixUnobserved = std::nullopt;
+    std::optional<StateRepairWitness> stateRepair = std::nullopt;
+    std::optional<OwnerMaterializationWitness> ownerMaterialization =
+        std::nullopt;
+    std::optional<ClosureWideningWitness> closureWidening = std::nullopt;
+    std::optional<LiteralizationWitness> literalization = std::nullopt;
+    std::optional<TerminalStateFailureWitness> terminalFailure = std::nullopt;
+
+    static SuffixStabilityWitness None() { return SuffixStabilityWitness(); }
+
+    static SuffixStabilityWitness From(SuffixUnobservedWitness witness) {
+      SuffixStabilityWitness out;
+      out.kind = SuffixStabilityWitnessKind::SuffixUnobserved;
+      out.suffixUnobserved = std::move(witness);
+      return out;
+    }
+
+    static SuffixStabilityWitness From(StateRepairWitness witness) {
+      SuffixStabilityWitness out;
+      out.kind = SuffixStabilityWitnessKind::StateRepair;
+      out.stateRepair = std::move(witness);
+      return out;
+    }
+
+    static SuffixStabilityWitness From(OwnerMaterializationWitness witness) {
+      SuffixStabilityWitness out;
+      out.kind = SuffixStabilityWitnessKind::OwnerMaterialization;
+      out.ownerMaterialization = std::move(witness);
+      return out;
+    }
+
+    static SuffixStabilityWitness From(ClosureWideningWitness witness) {
+      SuffixStabilityWitness out;
+      out.kind = SuffixStabilityWitnessKind::ClosureWidening;
+      out.closureWidening = std::move(witness);
+      return out;
+    }
+
+    static SuffixStabilityWitness From(LiteralizationWitness witness) {
+      SuffixStabilityWitness out;
+      out.kind = SuffixStabilityWitnessKind::Literalization;
+      out.literalization = std::move(witness);
+      return out;
+    }
+
+    static SuffixStabilityWitness From(TerminalStateFailureWitness witness) {
+      SuffixStabilityWitness out;
+      out.kind = SuffixStabilityWitnessKind::TerminalStateFailure;
+      out.terminalFailure = std::move(witness);
+      return out;
+    }
+  };
+
+  /// Request passed through the single Phase-5 state-transition gateway.
+  struct StateTransitionGatewayRequest {
+    OwnerStateBoundary boundary;
+    OwnerStateComponent component = OwnerStateComponent::Unknown;
+    StateMutationKind mutation = StateMutationKind::Unknown;
+    SuffixStabilityWitness witness;
+    std::string phase;
+    std::string detail;
+    bool requireKnownObserver = false;
+
+    /// Phase 5K reverse-solving gate.  When true, the request represents a state
+    /// rewrite whose source directive would have to be inferred from downstream
+    /// B-side expansion unless the directive owner is already inside the accepted
+    /// edit closure.  The gateway rejects Outside/Unknown before consulting suffix
+    /// observers, because suffix repair cannot justify changing unedited upstream
+    /// source state.
+    bool requiresDirectiveClosureProof = false;
+    DirectiveClosureStatus directiveClosureStatus =
+        DirectiveClosureStatus::NotADirectiveStateRewrite;
+    std::string directiveKind;
+  };
+
+  /// Result of checking one state component against the preserved suffix.
+  ///
+  /// The result is intentionally diagnostic-rich but semantically simple.
+  /// `stable` says the caller discharged the suffix-stability obligation.
+  /// `observerCount` and `hasIncomparableObserver` explain why an undisputed
+  /// terminal fallback was required when `stable` is false.
+  struct SuffixStabilityCheckResult {
+    OwnerStateComponent component = OwnerStateComponent::Unknown;
+    SuffixStabilityDischargeKind discharge =
+        SuffixStabilityDischargeKind::None;
+    StateMutationKind mutation = StateMutationKind::Unknown;
+    SuffixStabilityWitness witness;
+    bool stable = false;
+    bool hasSuffixObserver = false;
+    bool hasIncomparableObserver = false;
+    size_t observerCount = 0;
+  };
+
+  /// Return the theorem-facing state components mutated by `summary`.
+  ///
+  /// This helper is the Phase-5 bridge from owner summaries to suffix checks:
+  /// callers that consume or move an entire owner can enumerate only the state
+  /// components that owner actually mutates, then query the preserved suffix for
+  /// observers of those components.
+  static std::vector<OwnerStateComponent>
+  StateComponentsMutatedBySummary(const OwnerStateSummary &summary);
+
+  /// Return the theorem state component made uncertain by one component-specific
+  /// missing producer fact.  Phase 3L uses this to convert missing-fact markers
+  /// into precise suffix-stability obligations instead of one global unmodeled
+  /// state surface.
+  static OwnerStateComponent
+  StateComponentForMissingStateFact(MissingStateFactKind kind);
+
+  /// Return the terminal fallback proof failure for a component-specific missing
+  /// producer fact.  The caller supplies the detail recorded when the owner
+  /// summary was built so diagnostics identify the missing fact, not merely the
+  /// fallback algorithm that noticed it.
+  static TerminalFallbackProofFailure
+  MissingStateFactTerminalFailure(MissingStateFactKind kind, StringRef detail);
+
+  /// Return the terminal fallback proof failure for an undischargeable suffix
+  /// observer of `component`.
+  static TerminalFallbackProofFailure
+  SuffixStabilityTerminalFailureForComponent(OwnerStateComponent component);
+
+  /// Return the Phase-5K terminal fallback proof failure for a forbidden
+  /// reverse-solved directive rewrite.
+  static TerminalFallbackProofFailure ReverseSolvedDirectiveTerminalFailure(
+      OwnerStateComponent component, const OwnerStateBoundary &boundary,
+      llvm::StringRef directiveKind, llvm::StringRef detail);
+
+  /// Build a typed terminal witness for a forbidden reverse-solved directive
+  /// rewrite.  Component-specific helpers may wrap this, but the proof failure
+  /// kind is intentionally shared by macro, line-control, include, and
+  /// conditional state.
+  static SuffixStabilityWitness BuildReverseSolvedDirectiveTerminalWitness(
+      const OwnerStateBoundary &boundary, OwnerStateComponent component,
+      llvm::StringRef directiveKind, llvm::StringRef detail);
+
+  /// Route an explicit reverse-solving decision through the same Phase-5 state
+  /// gateway used for suffix stability.  The request is rejected unless the
+  /// caller proves that the directive owner itself is inside the accepted edit
+  /// closure.
+  SuffixStabilityCheckResult CheckReverseSolvedDirectiveAcrossEditBoundary(
+      const OwnerStateBoundary &boundary, OwnerStateComponent component,
+      StateMutationKind mutation, DirectiveClosureStatus directiveClosureStatus,
+      llvm::StringRef directiveKind, llvm::StringRef phase,
+      llvm::StringRef detail) const;
+
+  /// Convert a legacy discharge enum into a typed Phase-5 witness.
+  ///
+  /// Existing call sites are migrated through this bridge so the new gateway is
+  /// mandatory immediately, while later Phase-5E+ patches can replace the
+  /// bridge calls with more precise component-specific witness constructors.
+  static SuffixStabilityWitness BuildSuffixStabilityWitnessFromDischarge(
+      const OwnerStateBoundary &boundary, OwnerStateComponent component,
+      SuffixStabilityDischargeKind discharge, llvm::StringRef detail);
+
+  /// Return the legacy discharge class represented by a typed witness.
+  static SuffixStabilityDischargeKind
+  DischargeKindForSuffixStabilityWitness(const SuffixStabilityWitness &witness);
+
+  /// Return the state component explicitly named by a typed suffix-stability
+  /// witness, or Unknown when the witness is absent/malformed.
+  static OwnerStateComponent
+  ComponentNamedBySuffixStabilityWitness(const SuffixStabilityWitness &witness);
+
+  /// Validate that a typed suffix-stability witness names the exact state
+  /// component that the gateway request is checking.  This is the Phase-5L
+  /// guard against treating a generic enum label as a proof.
+  static bool SuffixStabilityWitnessNamesComponent(
+      const SuffixStabilityWitness &witness, OwnerStateComponent component);
+
+  /// Check one state transition through the uniform Phase-5 gateway.
+  ///
+  /// This is the only decision tree that is allowed to decide whether a changed
+  /// state component can cross into a preserved suffix.  It queries the
+  /// persistent suffix-observer graph, admits an unobserved suffix directly,
+  /// accepts only typed repair/materialization/widening/literalization
+  /// witnesses when observers exist, and otherwise requests a component-specific
+  /// terminal fallback.  Older APIs delegate here and may not bypass it.
+  SuffixStabilityCheckResult CheckStateTransitionAcrossEditBoundary(
+      const StateTransitionGatewayRequest &request) const;
+
+  /// Build a typed macro-state repair witness for the Phase-5 gateway.
+  ///
+  /// Phase 5E uses these helpers to keep all macro-state liveness repairs on the
+  /// same gateway surface.  The local macro code still proves the placement or
+  /// realization mechanics; these helpers make that proof a typed state witness
+  /// rather than a legacy enum label or direct terminal fallback.
+  static SuffixStabilityWitness BuildMacroStateRepairWitness(
+      const OwnerStateBoundary &boundary, llvm::StringRef detail);
+
+  /// Build a typed witness that a macro-state observer was materialized.
+  static SuffixStabilityWitness BuildMacroStateMaterializationWitness(
+      const OwnerStateBoundary &boundary, llvm::StringRef detail);
+
+  /// Build a typed witness that a macro-state closure was widened.
+  static SuffixStabilityWitness BuildMacroStateClosureWideningWitness(
+      const OwnerStateBoundary &boundary, llvm::StringRef detail);
+
+  /// Build a typed fail-closed macro-state terminal witness.
+  static SuffixStabilityWitness BuildMacroStateTerminalFailureWitness(
+      const OwnerStateBoundary &boundary, llvm::StringRef detail);
+
+  /// Route one macro-state transition through the mandatory Phase-5 gateway.
+  ///
+  /// This is the component-specific Phase 5E entry point.  All #define/#undef
+  /// liveness repairs, movements, materializations, and fail-closed macro-state
+  /// cases should use this wrapper instead of calling RequestTerminalFallback()
+  /// or the legacy suffix-stability enum bridge directly.
+  SuffixStabilityCheckResult CheckMacroStateTransitionAcrossEditBoundary(
+      const OwnerStateBoundary &boundary, StateMutationKind mutation,
+      SuffixStabilityWitness witness, llvm::StringRef phase,
+      llvm::StringRef detail, bool requireKnownObserver) const;
+
+  /// Build a typed line-control repair witness for the Phase-5 gateway.
+  ///
+  /// Phase 5F makes source-authored and synthetic #line handling a state proof
+  /// instead of an inserter-local heuristic.  The inserter still proves where a
+  /// directive can be emitted or suppressed; these helpers attach that local
+  /// proof to the uniform state-transition gateway for the exact logical
+  /// location component being changed or observed.
+  static SuffixStabilityWitness BuildLineControlStateRepairWitness(
+      const OwnerStateBoundary &boundary, OwnerStateComponent component,
+      llvm::StringRef detail);
+
+  /// Build a typed witness that line/file observer state was materialized.
+  static SuffixStabilityWitness BuildLineControlStateMaterializationWitness(
+      const OwnerStateBoundary &boundary, OwnerStateComponent component,
+      llvm::StringRef detail);
+
+  /// Build a typed fail-closed line-control terminal witness.
+  static SuffixStabilityWitness BuildLineControlStateTerminalFailureWitness(
+      const OwnerStateBoundary &boundary, OwnerStateComponent component,
+      llvm::StringRef detail);
+
+  /// Return the source/token boundary for one producer-backed counter event.
+  ///
+  /// Counter stabilization should not re-derive event placement at every call
+  /// site.  Phase 5G uses this normalizer so direct __COUNTER__ literalization,
+  /// forced macro materialization, and closure widening all describe the same
+  /// event to the state-transition gateway.
+  static OwnerStateBoundary
+  CounterStateBoundaryForEvent(const CounterEventIdentity &event);
+
+  /// Format one counter event for typed witness diagnostics.
+  static std::string
+  FormatCounterEventForWitness(const CounterEventIdentity &event);
+
+  /// Build a typed witness that a concrete __COUNTER__ event was literalized.
+  static SuffixStabilityWitness BuildCounterStateLiteralizationWitness(
+      const OwnerStateBoundary &boundary, const CounterEventIdentity &event,
+      llvm::StringRef detail);
+
+  /// Build a typed witness that a counter-observing owner was materialized.
+  static SuffixStabilityWitness BuildCounterStateMaterializationWitness(
+      const OwnerStateBoundary &boundary, const CounterEventIdentity &event,
+      llvm::StringRef detail);
+
+  /// Build a typed witness that the counter-bearing closure was widened.
+  static SuffixStabilityWitness BuildCounterStateClosureWideningWitness(
+      const OwnerStateBoundary &boundary, const CounterEventIdentity &event,
+      llvm::StringRef detail);
+
+  /// Build a typed fail-closed counter-state terminal witness.
+  static SuffixStabilityWitness BuildCounterStateTerminalFailureWitness(
+      const OwnerStateBoundary &boundary, const CounterEventIdentity &event,
+      llvm::StringRef detail);
+
+  /// Route one counter-state transition through the mandatory Phase-5 gateway.
+  ///
+  /// This is the component-specific Phase 5G entry point.  Direct __COUNTER__
+  /// literalization, forced materialization of counter-sensitive invocations,
+  /// and widened counter-bearing owners should use this wrapper rather than the
+  /// legacy suffix-stability enum bridge.
+  SuffixStabilityCheckResult CheckCounterStateTransitionAcrossEditBoundary(
+      const OwnerStateBoundary &boundary, StateMutationKind mutation,
+      SuffixStabilityWitness witness, llvm::StringRef phase,
+      llvm::StringRef detail, bool requireKnownObserver) const;
+
+  /// Build the source boundary for one pragma-state directive without changing
+  /// sideband placement semantics.
+  ///
+  /// Phase 5H intentionally starts as a typed proof surface only.  Existing
+  /// sideband pragma refolding paths are owner-closure/placement proofs, not
+  /// suffix-state decisions by themselves.  They must not be forced through the
+  /// gateway until the caller can prove that the pragma state actually crosses
+  /// an edit boundary with a preserved suffix observer.
+  static OwnerStateBoundary PragmaStateBoundaryForSourceRange(
+      llvm::StringRef path, uint64_t begin, uint64_t end,
+      std::optional<uint64_t> ownerIncludeId);
+
+  /// Build a typed witness that a known local/balanced pragma-state island was
+  /// repaired or preserved without changing the state seen by the suffix.
+  static SuffixStabilityWitness BuildPragmaStateRepairWitness(
+      const OwnerStateBoundary &boundary, llvm::StringRef detail);
+
+  /// Build a typed witness that a pragma-state observer was materialized.
+  static SuffixStabilityWitness BuildPragmaStateMaterializationWitness(
+      const OwnerStateBoundary &boundary, llvm::StringRef detail);
+
+  /// Build a typed witness that the closure was widened across a complete
+  /// pragma-state island.
+  static SuffixStabilityWitness BuildPragmaStateClosureWideningWitness(
+      const OwnerStateBoundary &boundary, llvm::StringRef detail);
+
+  /// Build a typed fail-closed pragma-state terminal witness.
+  static SuffixStabilityWitness BuildPragmaStateTerminalFailureWitness(
+      const OwnerStateBoundary &boundary, llvm::StringRef detail);
+
+  /// Route one proven pragma-state transition through the mandatory Phase-5
+  /// gateway.
+  ///
+  /// Callers should use this only after they have identified a real
+  /// pragma-state transition crossing an edit boundary.  Ordinary sideband
+  /// replay/materialization remains governed by its existing owner-closure and
+  /// byte-placement proofs until it can supply such a boundary proof.
+  SuffixStabilityCheckResult CheckPragmaStateTransitionAcrossEditBoundary(
+      const OwnerStateBoundary &boundary, StateMutationKind mutation,
+      SuffixStabilityWitness witness, llvm::StringRef phase,
+      llvm::StringRef detail, bool requireKnownObserver) const;
+
+  /// Build the source/token boundary for one include directive.
+  ///
+  /// Phase 5I treats include identity and include-guard state as semantic state
+  /// transitions.  This helper deliberately uses the producer-recorded include
+  /// site and PP cover; it does not infer header-guard structure from source
+  /// spelling in the consumer.
+  static OwnerStateBoundary
+  IncludeStateBoundaryForIncludeSite(const RefoldModel::IncludeItem &include);
+
+  /// Build a typed witness that include/include-guard state was repaired or
+  /// preserved equivalently before a suffix observer.
+  static SuffixStabilityWitness BuildIncludeStateRepairWitness(
+      const OwnerStateBoundary &boundary, OwnerStateComponent component,
+      llvm::StringRef detail);
+
+  /// Build a typed witness that an include/include-guard observer was
+  /// materialized by the selected owner realization.
+  static SuffixStabilityWitness BuildIncludeStateMaterializationWitness(
+      const OwnerStateBoundary &boundary, OwnerStateComponent component,
+      llvm::StringRef detail);
+
+  /// Build a typed witness that the closure was widened across a complete
+  /// include/include-guard state transition.
+  static SuffixStabilityWitness BuildIncludeStateClosureWideningWitness(
+      const OwnerStateBoundary &boundary, OwnerStateComponent component,
+      llvm::StringRef detail);
+
+  /// Build a typed fail-closed include/include-guard terminal witness.
+  static SuffixStabilityWitness BuildIncludeStateTerminalFailureWitness(
+      const OwnerStateBoundary &boundary, OwnerStateComponent component,
+      llvm::StringRef detail);
+
+  /// Route one include or include-guard state transition through the mandatory
+  /// Phase-5 gateway.
+  ///
+  /// Phase 5I intentionally keeps ordinary include spelling/materialization
+  /// mechanics unchanged.  Callers use this wrapper only to attach a typed
+  /// state-stability proof to include-state transitions they have already
+  /// identified, such as materializing a header include or widening over a
+  /// skipped/activated include-guard transition.
+  SuffixStabilityCheckResult CheckIncludeStateTransitionAcrossEditBoundary(
+      const OwnerStateBoundary &boundary, OwnerStateComponent component,
+      StateMutationKind mutation, SuffixStabilityWitness witness,
+      llvm::StringRef phase, llvm::StringRef detail,
+      bool requireKnownObserver) const;
+
+  /// Build the source/token boundary for a complete producer-recorded
+  /// conditional group.
+  ///
+  /// Phase 5J treats branch selection as conditional state, but it does not
+  /// infer changed #if truth from B-side tokens.  These helpers are only a
+  /// typed boundary/witness surface for callers that already proved a complete
+  /// conditional group or arm participates in an owner-closed edit.
+  static OwnerStateBoundary
+  ConditionalStateBoundaryForGroup(const RefoldModel::CondGroup &group);
+
+  /// Build the source/token boundary for one producer-recorded conditional arm.
+  static OwnerStateBoundary
+  ConditionalStateBoundaryForArm(const RefoldModel::CondGroup &group,
+                                 const RefoldModel::CondArm &arm);
+
+  /// Build a typed witness that conditional branch-selection state was repaired
+  /// or preserved equivalently before any preserved suffix observer.
+  static SuffixStabilityWitness BuildConditionalStateRepairWitness(
+      const OwnerStateBoundary &boundary, llvm::StringRef detail);
+
+  /// Build a typed witness that a conditional-state observer was materialized.
+  static SuffixStabilityWitness BuildConditionalStateMaterializationWitness(
+      const OwnerStateBoundary &boundary, llvm::StringRef detail);
+
+  /// Build a typed witness that the edit closure was widened across a complete
+  /// conditional group/arm instead of reverse-solving directive truth.
+  static SuffixStabilityWitness BuildConditionalStateClosureWideningWitness(
+      const OwnerStateBoundary &boundary, llvm::StringRef detail);
+
+  /// Build a typed fail-closed conditional-state terminal witness.
+  static SuffixStabilityWitness BuildConditionalStateTerminalFailureWitness(
+      const OwnerStateBoundary &boundary, llvm::StringRef detail);
+
+  /// Build a typed terminal witness for the strict-domain exclusion where the
+  /// only possible refolding would change #if/#elif truth from downstream B
+  /// tokens rather than from an edited conditional directive owner.
+  static SuffixStabilityWitness BuildConditionalReverseSolvedTerminalWitness(
+      const OwnerStateBoundary &boundary, llvm::StringRef detail);
+
+  /// Route one proven conditional-state transition through the mandatory
+  /// Phase-5 gateway.
+  ///
+  /// Ordinary conditional owner selection and materialization are intentionally
+  /// left unchanged by Phase 5J.  Callers should use this wrapper only after
+  /// they have identified a real conditional-state transition crossing an edit
+  /// boundary; otherwise they must keep using the existing owner-closure proof
+  /// rather than inventing a conditional-state suffix proof.
+  SuffixStabilityCheckResult CheckConditionalStateTransitionAcrossEditBoundary(
+      const OwnerStateBoundary &boundary, StateMutationKind mutation,
+      SuffixStabilityWitness witness, llvm::StringRef phase,
+      llvm::StringRef detail, bool requireKnownObserver) const;
+
+  /// Route one line-control state transition through the mandatory Phase-5
+  /// gateway.
+  ///
+  /// This is the component-specific Phase 5F entry point.  Synthetic #line
+  /// insertion, deferred #line movement, source #line consumption, and preserved
+  /// __LINE__/__FILE__/__FILE_NAME__ observers should use this wrapper rather
+  /// than the legacy enum bridge or a direct terminal fallback.
+  SuffixStabilityCheckResult CheckLineControlStateTransitionAcrossEditBoundary(
+      const OwnerStateBoundary &boundary, OwnerStateComponent component,
+      StateMutationKind mutation, SuffixStabilityWitness witness,
+      llvm::StringRef phase, llvm::StringRef detail,
+      bool requireKnownObserver) const;
+
+  /// Legacy compatibility wrapper for suffix-stability checks.
+  ///
+  /// The single Phase-5 decision tree lives in
+  /// CheckStateTransitionAcrossEditBoundary().  This wrapper exists so older
+  /// callers that still pass SuffixStabilityDischargeKind are immediately routed
+  /// through typed witnesses instead of bypassing the gateway.  Later Phase
+  /// 5E+ patches should replace wrapper calls with direct StateTransitionGateway
+  /// requests that name the exact mutation kind and component-specific witness.
+  ///
+  /// `requireKnownObserver` is for legacy paths that independently found a
+  /// suffix observer before Phase 4 had enough ordering facts to model it.  In
+  /// that case, an empty graph result is not a proof of stability; it is missing
+  /// producer evidence and therefore fails closed.
+  SuffixStabilityCheckResult CheckSuffixStabilityForStateMutation(
+      const OwnerStateBoundary &boundary, OwnerStateComponent component,
+      SuffixStabilityDischargeKind discharge, llvm::StringRef phase,
+      llvm::StringRef detail, bool requireKnownObserver) const;
+
+  /// Convenience wrapper when the caller only needs the boolean theorem result.
+  bool RequireSuffixStabilityForStateMutation(
+      const OwnerStateBoundary &boundary, OwnerStateComponent component,
+      SuffixStabilityDischargeKind discharge, llvm::StringRef phase,
+      llvm::StringRef detail, bool requireKnownObserver) const {
+    return CheckSuffixStabilityForStateMutation(
+               boundary, component, discharge, phase, detail,
+               requireKnownObserver)
+        .stable;
+  }
+
+  /// Return the coarse observer kind for a state component.
+  static SuffixObservationKind
+  ObservationKindForComponent(OwnerStateComponent component);
+
+  /// Return the component-specific observer-site index for `component`.
+  static ArrayRef<uint64_t> ObserverSiteIndexesForComponent(
+      const OwnerStateGraph &graph, OwnerStateComponent component);
+
+  /// True iff an observer summary contains `component`.
+  static bool OwnerObserverSummaryObservesComponent(
+      const OwnerObserverSummary &summary, OwnerStateComponent component);
+
+  /// True iff a source-site record belongs to `owner`.
+  ///
+  /// `ownerIncludeId` is the producer's current include-instance owner for the
+  /// source bytes.  The optional conditional arm on `owner` is treated as an
+  /// additional restriction: when present, the site must lie inside that arm.
+  bool OwnerMatchesSourceSite(const Owner &owner, StringRef file,
+                              std::optional<uint64_t> ownerIncludeId,
+                              uint64_t begin, uint64_t end) const;
+
+  /// True iff a source byte interval lies wholly inside a producer-recorded
+  /// conditional arm.  Failure to find the arm is treated as not proven; summary
+  /// construction then records unmodeled state instead of accepting the site.
+  bool SourceRangeInsideConditionalArm(uint64_t condArmId, StringRef file,
+                                       std::optional<uint64_t> ownerIncludeId,
+                                       uint64_t begin, uint64_t end) const;
+
+  /// \brief Final theorem-facing proof vocabulary for accepted results.
+  ///
+  /// Phase 1A freezes this enum as the public proof calculus vocabulary used by
+  /// comments, theorem-audit logs, and strict-domain tests.  These values answer
+  /// "what theorem proof discharges this accepted edit?"; they never describe
+  /// which builder happened to construct the candidate.  Implementation-local
+  /// classes and paths may continue to exist below, but every emitted candidate
+  /// must normalize into exactly one of these theorem classes before it can be
+  /// selected or attached to a byte edit.
+  #define REFOLD_THEOREM_PROOF_CLASS_LIST(REFOLD_X) \
+  REFOLD_X(Unknown) \
+  REFOLD_X(IdentityPreservingProof) \
+  REFOLD_X(InvocationPreservingProof) \
+  REFOLD_X(DirectivePreservingProof) \
+  REFOLD_X(StateRepairProof) \
+  REFOLD_X(OwnerRealizationProof) \
+  REFOLD_X(MixedOwnerTilingProof) \
+  REFOLD_X(SuffixStabilizationProof) \
+  REFOLD_X(TerminalOutOfDomainProof)
+
+  enum class TheoremProofClass : uint8_t {
+#define REFOLD_X(name) name,
+    REFOLD_THEOREM_PROOF_CLASS_LIST(REFOLD_X)
+#undef REFOLD_X
+  };
+
+  friend inline StringRef toString(TheoremProofClass value) {
+    switch (value) {
+#define REFOLD_X(name) case TheoremProofClass::name: return #name;
+      REFOLD_THEOREM_PROOF_CLASS_LIST(REFOLD_X)
+#undef REFOLD_X
+    }
+    return "Unknown";
+  }
+#undef REFOLD_THEOREM_PROOF_CLASS_LIST
+
+  /// \brief Implementation-local proof family recorded while candidates are built.
+  ///
+  /// These values are intentionally not the final theorem vocabulary.  They are
+  /// retained as compact construction metadata so existing builders do not need
+  /// to be renamed en masse, but Phase 1B requires selection and emission to use
+  /// NormalizeAcceptedProof() before treating a candidate as theorem-discharged.
   #define REFOLD_ACCEPTED_PROOF_CLASS_LIST(REFOLD_X) \
   REFOLD_X(Unknown) \
   REFOLD_X(InvocationPreserving) \
@@ -1991,7 +4589,8 @@ private:
   REFOLD_X(IncludePreserving) \
   REFOLD_X(IncludeRealization) \
   REFOLD_X(TUAnchor) \
-  REFOLD_X(TUTextualEdit)
+  REFOLD_X(TUTextualEdit) \
+  REFOLD_X(TerminalOutOfDomain)
 
   enum class AcceptedProofClass : uint8_t {
 #define REFOLD_X(name) name,
@@ -2083,11 +4682,13 @@ private:
   }
 #undef REFOLD_SURFACE_DISPOSITION_LIST
 
-  /// \brief Inventory of the currently accepted execution paths.
+  /// \brief Implementation path that produced an accepted theorem carrier.
   ///
-  /// This inventory does not change how the engine refolds code. Instead it
-  /// names the concrete path that produced an accepted result so we can map that
-  /// path onto the future proof lattice one class at a time.
+  /// This inventory is intentionally subordinate to TheoremProofClass.  It may
+  /// say where a result came from, but the emitted result is justified only by
+  /// its normalized theorem proof class and discharged obligations.  New paths should be
+  /// added here only when they also map onto the strict-domain theorem
+  /// vocabulary.
   #define REFOLD_ACCEPTED_PATH_KIND_LIST(REFOLD_X) \
   REFOLD_X(Unknown) \
   REFOLD_X(MacroArgsOnlyStandard) \
@@ -2113,6 +4714,7 @@ private:
   REFOLD_X(TUProvableInsertionAnchor) \
   REFOLD_X(TUByteSpanMappedEdit) \
   REFOLD_X(TUByteSpanConservativeEdit) \
+  REFOLD_X(TUIncludeClosureEdit) \
   REFOLD_X(TerminalEmitEditedPreprocessedStream)
 
   enum class AcceptedPathKind : uint8_t {
@@ -2178,6 +4780,7 @@ private:
   REFOLD_X(TUExactSlotAnchor, "TUExactSlotAnchor") \
   REFOLD_X(TUProvableInsertionAnchor, "TUProvableInsertionAnchor") \
   REFOLD_X(TUByteSpanTextualEdit, "TUByteSpanTextualEdit") \
+  REFOLD_X(TUIncludeClosureEdit, "TUIncludeClosureEdit") \
   REFOLD_X(EditedPreprocessedStreamFallback, "ExplicitOutOfDomainTerminalResult")
 
   enum class FutureProofTarget : uint8_t {
@@ -2528,16 +5131,17 @@ private:
   /// \brief Evidence source used to justify an accepted include realization.
   ///
   /// The include-realization domain boundary is explicit. An inline include
-  /// realization is in-domain only when the include cover admits either
-  /// the canonical A-cover -> B-envelope mapping or one deterministic
-  /// consensus-rescue envelope recovered from the existing non-canonical
-  /// projections. Any include realization that cannot produce one of those two
-  /// witnesses remains outside the declared domain and must terminate via the
-  /// explicit terminal fallback instead of manufacturing a weaker proof class.
+  /// realization is in-domain only when the include cover admits either the
+  /// canonical A-cover -> B-envelope mapping or the Phase-8b
+  /// BoundaryStableConsensusBCoverEnvelope proof.  The latter is not a legacy
+  /// rescue path: it is accepted only when all usable non-canonical boundary
+  /// projections agree on the same non-empty B-token range.  Any include
+  /// realization outside those declared witnesses remains an explicit terminal
+  /// out-of-domain case instead of manufacturing a weaker proof class.
   #define REFOLD_INCLUDE_REALIZATION_EVIDENCE_KIND_LIST(REFOLD_X) \
   REFOLD_X(Unknown) \
   REFOLD_X(CanonicalBCoverEnvelope) \
-  REFOLD_X(ConsensusRescuedBCoverEnvelope)
+  REFOLD_X(BoundaryStableConsensusBCoverEnvelope)
 
   enum class IncludeRealizationEvidenceKind : uint8_t {
 #define REFOLD_X(name) name,
@@ -2567,6 +5171,160 @@ private:
     bool hasBTokenEnvelope = false;
     uint64_t bTokBegin = 0;
     uint64_t bTokEnd = 0;
+  };
+
+
+  /// Owner-polymorphic evidence kind for realized output.
+  ///
+  /// Macro whole-cover realization, include realization, and direct TU byte
+  /// realization still use owner-specific spelling mechanics.  Phase 6 gives
+  /// those paths one shared theorem-facing carrier so the proof lattice can
+  /// audit all realized output as an OwnerRealizationProof.
+#define REFOLD_OWNER_REALIZATION_EVIDENCE_KIND_LIST(REFOLD_X) \
+  REFOLD_X(Unknown) \
+  REFOLD_X(MacroWholeCover) \
+  REFOLD_X(IncludeBEnvelope) \
+  REFOLD_X(IncludeMaterializedExpansion) \
+  REFOLD_X(TUByteSpan)
+
+  enum class OwnerRealizationEvidenceKind : uint8_t {
+#define REFOLD_X(name) name,
+    REFOLD_OWNER_REALIZATION_EVIDENCE_KIND_LIST(REFOLD_X)
+#undef REFOLD_X
+  };
+
+  friend inline StringRef toString(OwnerRealizationEvidenceKind value) {
+    switch (value) {
+#define REFOLD_X(name) case OwnerRealizationEvidenceKind::name: return #name;
+      REFOLD_OWNER_REALIZATION_EVIDENCE_KIND_LIST(REFOLD_X)
+#undef REFOLD_X
+    }
+    return "Unknown";
+  }
+#undef REFOLD_OWNER_REALIZATION_EVIDENCE_KIND_LIST
+
+  /// Canonical Phase-6 witness for owner realization.
+  ///
+  /// This does not replace owner-specific emission code.  It records the common
+  /// proof facts every realized owner must discharge: owner identity, source
+  /// interval, consumed A-token cover, emitted B-token envelope, and the
+  /// canonical state summary attached to that owner.  Phase 6b centralizes those
+  /// checks in \c TryBuildOwnerRealization(); macro/include/TU callers should
+  /// only construct the owner-specific closure and spelling, then delegate the
+  /// shared admissibility proof to that helper.
+  struct OwnerRealizationWitness {
+    OwnerRealizationEvidenceKind evidence =
+        OwnerRealizationEvidenceKind::Unknown;
+    OwnerClosure closure;
+    bool hasOwner = false;
+    bool hasSourceInterval = false;
+    bool hasATokenCover = false;
+    bool hasBTokenEnvelope = false;
+    bool hasStateSummary = false;
+
+    // Declared state discharge for the realized owner.  This is not a full
+    // suffix-stability proof by itself; it records which Phase-5 discharge mode
+    // the caller is relying on after the owner-specific realization path has
+    // already performed its local repair/materialization/widening work.
+    bool hasStateDischarge = false;
+    SuffixStabilityDischargeKind stateDischarge =
+        SuffixStabilityDischargeKind::None;
+
+    // When the shared Phase-6b helper rejects the realization, the failed
+    // obligation is stored here so diagnostics do not have to reverse-engineer
+    // which common proof fact was missing.
+    bool hasFailedObligation = false;
+    TerminalFallbackProofFailure failedObligation;
+
+    std::string detail;
+  };
+
+  /// Result returned by the shared owner-realization proof helper.
+  ///
+  /// Owner-specific code should keep constructing replacement text itself, but it
+  /// should use this result to decide whether the common realization proof was
+  /// discharged.  A rejected result names the failed strict-domain obligation
+  /// without immediately changing emission control flow; callers can either stop
+  /// attaching an OwnerRealizationProof or convert the failure into terminal
+  /// fallback at their own proof boundary.
+  struct OwnerRealizationResult {
+    bool accepted = false;
+    OwnerRealizationWitness witness;
+    TerminalFallbackProofFailure failure;
+    std::string detail;
+  };
+
+
+  /// Edge kind recorded in a persisted mixed-owner tiling witness.
+  ///
+  /// Token segments are the non-empty A/B envelopes that are emitted as ordinary
+  /// normalized hunks.  State gaps are zero-token owners that sit between those
+  /// emitted segments; they do not emit bytes by themselves, but they are part
+  /// of the proof that the source gap was fully covered and state-composable.
+#define REFOLD_MIXED_OWNER_TILING_EDGE_KIND_LIST(REFOLD_X) \
+  REFOLD_X(Unknown) \
+  REFOLD_X(TokenSegment) \
+  REFOLD_X(StateGap)
+
+  enum class MixedOwnerTilingEdgeKind : uint8_t {
+#define REFOLD_X(name) name,
+    REFOLD_MIXED_OWNER_TILING_EDGE_KIND_LIST(REFOLD_X)
+#undef REFOLD_X
+  };
+
+  friend inline StringRef toString(MixedOwnerTilingEdgeKind value) {
+    switch (value) {
+#define REFOLD_X(name) case MixedOwnerTilingEdgeKind::name: return #name;
+      REFOLD_MIXED_OWNER_TILING_EDGE_KIND_LIST(REFOLD_X)
+#undef REFOLD_X
+    }
+    return "Unknown";
+  }
+#undef REFOLD_MIXED_OWNER_TILING_EDGE_KIND_LIST
+
+  /// One ordered edge in the theorem-facing mixed-owner tiling proof.
+  ///
+  /// The edge carries the canonical owner closure computed by the Phase-7 tiler.
+  /// For token segments, the A-token range is non-empty and corresponds to a
+  /// normalized hunk emitted later.  Replace segments also have a non-empty B
+  /// range; delete-only Phase-7g segments deliberately carry an empty B range at
+  /// the deletion boundary.  For state gaps, both token ranges are zero-width
+  /// at the adjacent token boundary while the source range records the
+  /// directive/state island that was proved covered and composable.
+  struct MixedOwnerTilingEdgeWitness {
+    MixedOwnerTilingEdgeKind kind = MixedOwnerTilingEdgeKind::Unknown;
+    OwnerClosure closure;
+  };
+
+  /// Persisted proof for a deterministic mixed-owner tiling.
+  ///
+  /// Earlier Phase-7 patches used the mixed-owner partition only as a
+  /// normalization step.  Phase 7f makes the tiling proof durable: every emitted
+  /// token segment can point back to the full ordered proof path, including the
+  /// zero-token state-gap edges that never become token hunks themselves.
+  struct MixedOwnerTilingWitness {
+    uint64_t originalAStart = 0;
+    uint64_t originalAEnd = 0;
+    uint64_t originalBStart = 0;
+    uint64_t originalBEnd = 0;
+    uint32_t tokenSegmentCount = 0;
+    uint32_t stateGapCount = 0;
+    bool stateSummariesComposed = false;
+    std::vector<MixedOwnerTilingEdgeWitness> edges;
+  };
+
+  /// Reverse index from an emitted token segment back to its mixed-owner tiling.
+  ///
+  /// The normalizer still emits ordinary token hunks for downstream classifiers.
+  /// This binding lets those later accepted candidates recover the full tiling
+  /// witness without changing the hunk type or duplicating state-gap edges in
+  /// the emitted edit stream.
+  struct MixedOwnerTilingSegmentBinding {
+    uint64_t aStart = 0;
+    uint64_t aEnd = 0;
+    uint64_t bStart = 0;
+    uint64_t bEnd = 0;
+    size_t witnessIndex = 0;
   };
 
   /// \brief Status produced when the engine evaluates a local proof contract.
@@ -2629,10 +5387,6 @@ private:
   REFOLD_X(IncludeRightNeighborWitnessTracked) \
   REFOLD_X(IncludeLeftNeighborWitnessTracked) \
   REFOLD_X(IncludeDeclBoundaryWitnessTracked) \
-  REFOLD_X(IncludeRealizationWitnessTracked) \
-  REFOLD_X(IncludeRealizationIncludeTracked) \
-  REFOLD_X(IncludeRealizationCoverTracked) \
-  REFOLD_X(IncludeRealizationBEnvelopeTracked) \
   REFOLD_X(TUAnchorPathClassified) \
   REFOLD_X(TUAnchorWitnessTracked) \
   REFOLD_X(TUAnchorPPGapTracked) \
@@ -2641,7 +5395,9 @@ private:
   REFOLD_X(TUProvableEvidenceTracked) \
   REFOLD_X(TUOutsideIncludeCoverageTracked) \
   REFOLD_X(TUOwnerDepthStableTracked) \
-  REFOLD_X(ExplicitOutOfDomainResultTracked)
+  REFOLD_X(ExplicitOutOfDomainResultTracked) \
+  REFOLD_X(PrimaryProofClassDeclared) \
+  REFOLD_X(OwnerRealizationWitnessTracked)
 
   enum class ProofObligationKind : uint8_t {
 #define REFOLD_X(name) name,
@@ -2692,10 +5448,6 @@ private:
   REFOLD_X(MissingIncludeRightNeighborWitness) \
   REFOLD_X(MissingIncludeLeftNeighborWitness) \
   REFOLD_X(MissingIncludeDeclBoundaryWitness) \
-  REFOLD_X(MissingIncludeRealizationWitness) \
-  REFOLD_X(MissingIncludeRealizationInclude) \
-  REFOLD_X(MissingIncludeRealizationCover) \
-  REFOLD_X(MissingIncludeRealizationBEnvelope) \
   REFOLD_X(MissingTUAnchorClassification) \
   REFOLD_X(MissingTUAnchorWitness) \
   REFOLD_X(MissingTUAnchorGap) \
@@ -2704,7 +5456,9 @@ private:
   REFOLD_X(MissingTUProvableAnchorWitness) \
   REFOLD_X(MissingTUOutsideIncludeCoverageProof) \
   REFOLD_X(MissingTUOwnerDepthStability) \
-  REFOLD_X(ExplicitOutOfDomainResult)
+  REFOLD_X(ExplicitOutOfDomainResult) \
+  REFOLD_X(MissingPrimaryProofClass) \
+  REFOLD_X(MissingOwnerRealizationWitness)
 
   enum class ProofFailureReason : uint8_t {
 #define REFOLD_X(name) name,
@@ -2768,6 +5522,17 @@ private:
                                       const ProofSummary &summary,
                                       bool firstOnly) const;
 
+  /// \brief Return true when the accepted path is an owner-realization proof.
+  ///
+  /// Phase 6f makes the shared \c OwnerRealizationWitness mandatory at the
+  /// theorem boundary for every path whose proof class is now represented by
+  /// the generic owner-realization family.  This helper deliberately keys off
+  /// the normalized accepted path, not just the broad accepted class: e.g.
+  /// counter-literal macro stabilization is an invocation realization, but it
+  /// is not a Phase-6 owner-realization witness.
+  bool ProofSummaryRequiresOwnerRealizationWitness(
+      const ProofSummary &summary) const;
+
   /// \brief Common proof-summary carrier used during the proof/lattice model.
   ///
   /// The summary packages the accepted-path inventory, local discharge result,
@@ -2793,10 +5558,29 @@ private:
     TUAnchorWitness tuAnchorWitness;
     bool hasIncludeAnchorWitness = false;
     IncludeAnchorWitness includeAnchorWitness;
-    bool hasIncludeRealizationWitness = false;
-    IncludeRealizationWitness includeRealizationWitness;
+    // Phase-6 shared owner-realization proof carrier.  Realized macro,
+    // include, and TU paths now surface through this single theorem-facing
+    // witness; owner-specific input metadata remains local to the spelling
+    // machinery instead of appearing as separate proof/audit families.
+    bool hasOwnerRealizationWitness = false;
+    OwnerRealizationWitness ownerRealizationWitness;
+
+    // Phase-7f durable mixed-owner tiling proof.  A candidate that came from a
+    // normalized mixed-owner split can carry the whole ordered path here, not
+    // merely the individual emitted token segment.
+    bool hasMixedOwnerTilingWitness = false;
+    MixedOwnerTilingWitness mixedOwnerTilingWitness;
+
     bool hasTerminalFallbackWitness = false;
     TerminalFallbackWitness terminalFallbackWitness;
+
+    /// True when the summary's primary proof class came from a concrete
+    /// accepted-path or patch-proof enum rather than from legacy side bits such
+    /// as `proofValidated` or `structurePreserving`.  Phase-1 proof closure
+    /// requires theorem-facing emitted results to carry exactly one explicit
+    /// primary proof class; implicit legacy classification is therefore allowed
+    /// only for internal diagnostics and is rejected before emission.
+    bool primaryProofClassExplicit = false;
   };
 
   /// \brief Normalized accepted-result artifact kind used by Patch A/B.
@@ -2914,12 +5698,17 @@ private:
     bool structurePreserving = false;
     uint64_t proofRootMacroId = 0;
 
+    // Phase-6 owner-polymorphic realization certificate.  Whole-cover macro
+    // realization still uses macro-specific source spelling mechanics, but the
+    // accepted proof is also exposed as a generic OwnerRealizationProof.
+    bool hasOwnerRealizationWitness = false;
+    OwnerRealizationWitness ownerRealizationWitness;
+
     // First-class macro whole-cover realization certificate. These
     // fields record the exact owner cover, containment witness, and B-side
     // token-envelope accounting used to justify realized whole-cover output.
     bool wholeCoverUsedBodyRange = false;
     bool wholeCoverSelfContained = false;
-    bool wholeCoverNestedSelfContained = false;
     bool wholeCoverAdjustedLeft = false;
     bool wholeCoverAdjustedRight = false;
     bool wholeCoverClaimsClipped = false;
@@ -3010,7 +5799,6 @@ private:
     uint64_t covHiA = 0;
     bool usedBodyRange = false;
     bool selfContained = false;
-    bool nestedSelfContained = false;
     size_t rawBTokStart = 0;
     size_t rawBTokEnd = 0;
     size_t bTokStart = 0;
@@ -4597,15 +7385,12 @@ private:
   ///
   /// The canonical include-realization path uses
   /// \c MapATokRangeAToBTokenEnvelope to recover the exact B-side token
-  /// envelope for the include cover. The witness search also consults the
-  /// existing deterministic rescue projections when the
-  /// canonical mapping is unavailable.
+  /// envelope for the include cover.  When that mapper cannot prove an
+  /// envelope, Phase 8b permits exactly one additional declared proof:
+  /// BoundaryStableConsensusBCoverEnvelope.
   ///
-  /// To stay fail-closed, this helper only accepts a rescue envelope when the
-  /// available non-canonical projections agree on one non-empty B-token range.
-  /// The returned evidence kind therefore states the full class predicate for
-  /// inline include realization: the witness must be either canonical or a
-  /// deterministic consensus rescue. Any unresolved or conflicting B-envelope
+  /// That proof is deliberately narrow.  The available non-canonical boundary
+  /// projections must agree on one non-empty B-token range; otherwise B-envelope
   /// recovery remains an explicit out-of-domain terminal case rather than a
   /// guessed realization.
   std::optional<std::pair<size_t, size_t>>
@@ -4650,8 +7435,12 @@ private:
   ///   all later __COUNTER__ values.
   ///
   /// The producer emits a MacroInvocation item for each __COUNTER__ expansion
-  /// with A-token coverage (cover.begin/cover.end). We use the A→B alignment
-  /// map \p a2b to detect the first edited occurrence.
+  /// with A-token coverage.  Precise body/spans are preferred, but a fallback
+  /// cover is also a valid producer anchor.  Zero-length anchors are normalized
+  /// to the concrete following A-token before edit detection, so pasted or
+  /// stringified counter literals still participate in stabilization instead of
+  /// escaping through a separate fallback path.  We use the A→B alignment map
+  /// \p a2b to detect the first edited occurrence.
   ///
   /// Important: a __COUNTER__ occurrence may be spelled inside a macro
   /// definition's replacement list (e.g. "#define PRINT(...) __COUNTER__"). In
@@ -4664,9 +7453,10 @@ private:
   /// This function therefore returns the set of covering, patchable macro
   /// invocations that should be whole-cover expanded.
   struct ForcedMacroPatchRequest {
-    const RefoldModel::MacroInvocation *macro;
-    uint64_t aStart;
-    uint64_t aEnd;
+    const RefoldModel::MacroInvocation *macro = nullptr;
+    uint64_t aStart = 0;
+    uint64_t aEnd = 0;
+    CounterEventIdentity event;
   };
 
   struct CounterOccurrence {
@@ -4674,7 +7464,26 @@ private:
     uint64_t aStart;
     uint64_t aEnd;
     std::optional<uint64_t> ownerIncludeId;
+    CounterEventIdentity event;
   };
+
+  /// Return the producer-backed A-token ranges for one `__COUNTER__`
+  /// invocation.  Body spans are preferred over explicit spans, which are
+  /// preferred over the conservative cover.  Zero-width anchors are preserved
+  /// here and widened by BuildCounterEventIdentity() so every caller uses one
+  /// deterministic event normalizer.
+  std::vector<std::pair<uint64_t, uint64_t>>
+  CounterOutputRangesForInvocation(
+      const RefoldModel::MacroInvocation &macro) const;
+
+  /// Format the A-side counter value represented by a normalized token range.
+  std::string CounterValueForTokenRange(uint64_t begin, uint64_t end) const;
+
+  /// Build the Phase-3G identity for one concrete counter event.
+  CounterEventIdentity BuildCounterEventIdentity(
+      const RefoldModel::MacroInvocation &macro, uint64_t occurrenceOrdinal,
+      uint64_t begin, uint64_t end,
+      std::optional<uint64_t> ownerIncludeOverride = std::nullopt) const;
 
   SmallVector<CounterOccurrence, 32>
   CollectCounterOccurrences(StringRef tuPath) const;
@@ -4872,7 +7681,7 @@ private:
   /// ComputeWholeCoverPlan() into the patch-local certificate fields.
   void StampMacroWholeCoverRealizationPatch(
       MacroPatch &patch, const WholeCoverPlan &plan,
-      uint64_t proofRootMacroId) const;
+      const RefoldModel::MacroInvocation &macro) const;
 
   /// \brief Build the accepted-path inventory for a macro patch.
   ///
@@ -4911,7 +7720,6 @@ private:
       AcceptedPathKind currentPath, const IncludePatch *patch = nullptr,
       const TUAnchorWitness *tuAnchorWitness = nullptr,
       const IncludeAnchorWitness *includeAnchorWitness = nullptr,
-      const IncludeRealizationWitness *includeRealizationWitness = nullptr,
       const TerminalFallbackWitness *terminalFallbackWitness = nullptr) const;
 
   /// \brief Build the internal working proof summary for an include patch.
@@ -4926,6 +7734,16 @@ private:
       bool realizedSurface,
       AcceptedPathKind currentPath = AcceptedPathKind::Unknown,
       const IncludePatch *patch = nullptr) const;
+
+  /// \brief Normalize an accepted candidate to the final theorem vocabulary.
+  ///
+  /// This is the Phase 1A--1C theorem gate.  It rejects candidates whose proof
+  /// class is missing, transitional, out of sync with its construction path, or
+  /// locally undischarged.  The returned value is the only theorem-facing proof
+  /// class that selectors and emitted byte edits are allowed to rely on;
+  /// AcceptedPathKind and AcceptedProofClass remain construction provenance.
+  std::optional<TheoremProofClass>
+  NormalizeAcceptedProof(const AcceptedResultCandidate &candidate) const;
 
   /// \brief Compute the current global lattice law for an accepted summary.
   ///
@@ -5204,34 +8022,6 @@ private:
       AcceptedPathKind currentPath, const IncludePatch *patch,
       const IncludeAnchorWitness *witness = nullptr) const;
 
-  /// \brief Return whether an include-realization witness is inside the
-  /// declared include-realization domain.
-  ///
-  /// Inline include realization is first-class only when the witness records a
-  /// canonical B-cover envelope or a deterministic consensus-rescued B-cover
-  /// envelope. Unknown evidence kinds remain outside the declared theorem
-  /// domain and must surface only through the explicit terminal fallback.
-  bool IsAcceptedIncludeRealizationEvidenceKind(
-      IncludeRealizationEvidenceKind kind) const;
-
-  /// \brief Discharge the proof obligations for an include-realization path.
-  ///
-  /// Validates that the accepted path is one of the declared include
-  /// realization classes and is mapped to a future proof target. Inline
-  /// realization from B must additionally carry a realization witness that
-  /// identifies the include, the A-side cover, and the B-token envelope used to
-  /// materialize the replacement.
-  ///
-  /// \param currentPath The include-realization accepted path being validated.
-  /// \param patch Optional include patch associated with the realization path.
-  /// \param witness Optional realization witness for inline/materialized
-  ///        include evidence.
-  /// \returns The proof-discharge record containing all satisfied and failed
-  ///          obligations.
-  ProofDischargeRecord ValidateIncludeRealizationProof(
-      AcceptedPathKind currentPath, const IncludePatch *patch,
-      const IncludeRealizationWitness *witness = nullptr) const;
-
   /// \brief Discharge the proof obligations for a TU anchor path.
   ///
   /// Validates that the accepted path is a TU exact-slot or provable-insertion
@@ -5260,15 +8050,55 @@ private:
   std::string
   FormatIncludeAnchorWitness(const IncludeAnchorWitness &witness) const;
 
-  /// \brief Format a concrete include-realization witness for tracing.
-  ///
-  /// Record the exact deterministic include cover and mapped B-token
-  /// envelope used when the engine realizes an include directly from the
-  /// modified preprocessed surface. This formatter keeps that witness readable
-  /// in the same audit stream as the normalized proof/discharge metadata.
+  /// Include-realization input witnesses are intentionally not formatted as a
+  /// separate theorem-facing proof family anymore.  Phase 6d routes realized
+  /// include, macro, and TU output through \c OwnerRealizationWitness so audit
+  /// logs expose one owner-polymorphic realization proof instead of parallel
+  /// include-specific and owner-specific proof records.
+
+  /// Format the generic Phase-6 owner-realization witness for theorem-audit
+  /// output.  The output is intentionally compact and deterministic because it
+  /// appears alongside accepted-path proof summaries.
   std::string
-  FormatIncludeRealizationWitness(
-      const IncludeRealizationWitness &witness) const;
+  FormatOwnerRealizationWitness(
+      const OwnerRealizationWitness &witness) const;
+  std::string FormatMixedOwnerTilingWitness(
+      const MixedOwnerTilingWitness &witness) const;
+  void AttachMixedOwnerTilingWitnessForTokenEnvelope(
+      ProofSummary &summary, uint64_t aStart, uint64_t aEnd, uint64_t bStart,
+      uint64_t bEnd) const;
+
+  /// Discharge the common owner-realization obligations for a constructed
+  /// closure.  This is the Phase-6b collapse point: macro/include/TU realization
+  /// paths may still have distinct spelling mechanics, but they all prove the
+  /// same owner/source/A-cover/B-envelope/state obligations here.
+  OwnerRealizationResult TryBuildOwnerRealization(
+      OwnerRealizationEvidenceKind evidence, OwnerClosure closure,
+      SuffixStabilityDischargeKind stateDischarge, StringRef detail) const;
+
+  /// Build owner-realization results for the existing realized-output families.
+  /// These helpers do not manufacture replacement text; they only construct the
+  /// owner-specific closure and delegate the shared proof obligations to
+  /// \c TryBuildOwnerRealization().
+  OwnerRealizationResult BuildMacroWholeCoverOwnerRealization(
+      const RefoldModel::MacroInvocation &macro,
+      const WholeCoverPlan &plan) const;
+  OwnerRealizationResult BuildIncludeOwnerRealization(
+      const RefoldModel::IncludeItem &include, AcceptedPathKind currentPath,
+      const IncludeRealizationWitness *includeWitness) const;
+  OwnerRealizationResult BuildTUOwnerRealization(
+      AcceptedPathKind currentPath, uint64_t begin, uint64_t end) const;
+
+  /// Attach the shared owner-realization result to an accepted proof summary.
+  ///
+  /// Phase 6c makes the shared realization gate authoritative: once a macro,
+  /// include, or TU realization path delegates to \c TryBuildOwnerRealization(),
+  /// the caller may not independently declare the realized edit admissible after
+  /// that gate rejects it.  This helper therefore records accepted witnesses and
+  /// converts rejected results into a local proof-discharge failure on the
+  /// candidate that tried to realize the owner.
+  void ApplyOwnerRealizationResultToProofSummary(
+      ProofSummary &summary, const OwnerRealizationResult &result) const;
 
   /// \brief Build the terminal-fallback witness for the current refold pass.
   ///
@@ -5340,7 +8170,6 @@ private:
       AcceptedPathKind currentPath, const IncludePatch *patch = nullptr,
       const TUAnchorWitness *tuAnchorWitness = nullptr,
       const IncludeAnchorWitness *includeAnchorWitness = nullptr,
-      const IncludeRealizationWitness *includeRealizationWitness = nullptr,
       const TerminalFallbackWitness *terminalFallbackWitness = nullptr) const;
 
   /// \brief Format a normalized accepted-result candidate for tracing.
@@ -5386,15 +8215,12 @@ private:
   ///    attempted when the provided invocation text still matches the expected
   ///    callsite prefix for \p m.
   ///
-  /// 3. **Whole-cover fallback:** If args-only patching is not applicable or
-  ///    fails, replace the entire invocation by mapping the A-domain macro cover
-  ///    interval \c [coverBegin, coverEnd) to a B-domain token envelope via \c
-  ///    MapATokRangeAToBTokenEnvelope and slicing the corresponding region from
-  ///    the edited preprocessed output. The B-envelope is then tightened when
-  ///    possible by re-aligning the first/last token to the exact A-boundary
-  ///    tokens (only if the expected token exists as an immediately adjacent
-  ///    neighbor in B). This corrects common alignment drops of low-information
-  ///    punctuation (e.g. leading '(') without scanning or heuristics.
+  /// 3. **Whole-cover realization:** If structure-preserving patching is not
+  ///    applicable, replace the entire invocation only after the selected
+  ///    A-domain cover passes MacroWholeCoverIsSelfContained() and the result is
+  ///    stamped with OwnerRealizationProof. The B-envelope is then tightened
+  ///    only by exact boundary-token accounting, not by nested/coarse-span
+  ///    fallback.
   ///
   /// \param m Metadata for the macro invocation, including callsite byte span
   ///          and A-domain cover.
@@ -5414,21 +8240,14 @@ private:
       const DenseMap<std::optional<uint64_t>, DenseMap<uint64_t, MacroPatch>>
           &patchMap) const;
 
-  /// \brief Return whether a nested macro may use whole-cover fallback at its
-  ///        own callsite.
+  /// \brief Phase-8e note on nested whole-cover realization.
   ///
-  /// Whole-cover replacement of a nested child macro is only safe when the
-  /// child's cover interval is entirely accounted for by tokens owned by that
-  /// child (or its descendants). If the cover includes caller-owned tokens,
-  /// replacing just the child invocation with the child cover would splice a
-  /// partial expanded surface into the parent callsite.
-  ///
-  /// Top-level macros are always eligible. Nested macros are eligible only when
-  /// every token in \c m.cover is covered by authoritative subtree-owned spans
-  /// (body/arg/stringify/paste, with a spans fallback only for nodes that lack
-  /// detailed span metadata).
-  bool NestedWholeCoverIsSelfContained(
-      const RefoldModel::MacroInvocation &m) const;
+  /// Nested macro whole-cover expansion is no longer admitted by aggregating
+  /// descendant or coarse `spans` provenance.  A whole-cover patch must first
+  /// pass MacroWholeCoverIsSelfContained(), and then it is stamped as an
+  /// OwnerRealizationProof.  Nested edits that cannot satisfy that direct owner
+  /// proof must be handled by DAG/call-chain structure-preserving proofs, by a
+  /// wider owner realization, or by terminal fallback.
 
   /// \brief Validates that a raw source span contains a valid macro callsite
   /// prefix matching the invocation metadata.
@@ -5744,14 +8563,20 @@ private:
   /// 1. **Right neighbor**: smallest `pp >= pos` mapping to this header’s file;
   ///    insert immediately *before* that token (use its byte-start).
   /// 2. **Left neighbor**: greatest `pp < pos` mapping to this file; insert
-  ///    immediately *after* that token (use its byte-end).
+  ///    immediately *after* that token (use its byte-end).  If `pos` is exactly
+  ///    the include cover end, this same proof may anchor at physical EOF, but
+  ///    only after the mapped left neighbor proves the insertion belongs to this
+  ///    owner suffix.  Phase 8g classifies that case as an explicit
+  ///    include-anchor proof, not as PP source-mapping fallback-to-EOF.
   /// 3. **Owning decl end**: if an owning decl exists, anchor at
   ///    `decl.headerE`.
-  /// 4. **Child-include boundary fallback**: attempt to synthesize a stable
-  ///    anchor from child `#include` sites (via
-  ///    `computeChildBoundaryInsertByte(...)`). When this path is taken, the
-  ///    inserted text may be padded with `padAtBoundaries(...)`. If no anchor
-  ///    can be found, the patch is skipped.
+  /// 4. **Child-include boundary proof**: prove a stable insertion anchor from
+  ///    a direct child `#include` site (via
+  ///    `ComputeChildBoundaryInsertByte(...)`). Phase 8d classifies this as a
+  ///    declared include-preserving anchor proof, not as a rescue path: the
+  ///    witness must name the child include and the anchor must be exactly that
+  ///    child directive's begin or end byte. If no such unique boundary exists,
+  ///    the patch is skipped.
   ///
   /// ### Mapping for DELETE/REPLACE
   ///
@@ -5777,19 +8602,21 @@ private:
   IncludeTextEditPlan ComputeIncludeTextEdits(const IncludeEdits &ie,
                                               std::string headerText) const;
 
-  /// \brief Computes a deterministic insertion byte offset for a header-scoped
-  /// *pure INSERT* when the normal token-based anchoring mechanisms provide no
-  /// usable neighbor.
+  /// \brief Proves a deterministic child-include boundary insertion anchor.
   ///
-  /// This is a fallback used only in degenerate header cases where:
-  /// - The patch is a pure insertion (`p.aStart == p.aEnd`)
-  /// - There are no mapped tokmap neighbors in `file` near `p.aStart` to anchor
-  ///   on
-  /// - There is no suitable `HeaderDecl` span to provide a declaration-based
-  ///   anchor
+  /// This Phase-8d proof class applies to header-scoped pure INSERT patches
+  /// (`p.aStart == p.aEnd`) whose PP gap coincides exactly with the begin or end
+  /// of a direct child include's expansion cover.  Token-neighbor and
+  /// declaration-boundary anchors remain preferred elsewhere, but this path is
+  /// not a legacy fallback: it is an include-preserving proof backed by an
+  /// `IncludeAnchorWitness` that names the child include and records the exact
+  /// directive byte used as the anchor.
   ///
-  /// In such cases, we attempt to anchor relative to the literal `#include`
-  /// sites that appear inside the same header file.
+  /// The proof is needed because a parent header may contain no ordinary tokens
+  /// at the insertion gap: the adjacent PP material can belong entirely to a
+  /// child include.  In that case, materializing the child merely to host a
+  /// boundary-inherent insertion is less structural than anchoring at the
+  /// preserved child `#include` directive itself.
   ///
   /// ### Approach
   ///
@@ -5803,7 +8630,7 @@ private:
   /// For the insertion PP position `pos = p.aStart`, we consider only
   /// "between-children" positions:
   /// - If `pos` lies *strictly inside* a child’s cover window
-  ///   (`kid.coverBegin < pos && pos < kid.coverEnd`), this fallback does not
+  ///   (`kid.coverBegin < pos && pos < kid.coverEnd`), this proof does not
   ///   apply and returns `std::nullopt` (the insertion should have been owned
   ///   by that child include).
   /// - Boundary positions are allowed (`pos == kid.coverBegin` or
@@ -5822,24 +8649,25 @@ private:
   ///    by returning `right.siteB`.
   /// 2. Else if `left` exists, insert *after* the left child’s `#include` site
   ///    by returning `left.siteE`.
-  /// 3. Otherwise return `std::nullopt` to indicate that no sane anchor could
-  ///    be derived.
+  /// 3. Otherwise return `std::nullopt` to indicate that no child-boundary
+  ///    proof can be derived.
   ///
-  /// This method does not validate that the returned site offsets are within
-  /// the current header text bounds; callers should ensure the returned byte
-  /// offset is usable in the current editing context.
+  /// This method deliberately fails closed on ambiguous boundaries.  If more
+  /// than one direct child include has the same begin or end cover boundary, the
+  /// caller cannot prove a unique source anchor and the edit must be classified
+  /// by another proof path.  The method does not validate that the returned site
+  /// offsets are within the current header text bounds; callers should ensure
+  /// the returned byte offset is usable in the current editing context.
   ///
-  /// \param M The refold model providing include hierarchy, PP cover windows,
-  ///          and include-site byte ranges.
-  /// \param p The include-scoped patch (expected to be a pure insertion) whose
-  ///          PP insertion position is `p.aStart`.
+  /// \param p The include-scoped patch whose PP insertion position is
+  ///          `p.aStart`.
   /// \param file The header file path whose text is being edited; only child
   ///             includes whose `sitePath` equals `file` are considered as
   ///             anchors.
-  /// \param witness Optional witness sink that records which child
-  ///               boundary was chosen when the fallback succeeds.
+  /// \param witness Optional witness sink that records which child include and
+  ///               directive boundary discharged the proof.
   /// \return A byte offset within `file` at which the insertion should be
-  ///         applied, or `std::nullopt` if this fallback does not apply or no
+  ///         applied, or `std::nullopt` if this proof class does not apply or no
   ///         stable anchor can be found.
   std::optional<uint64_t> ComputeChildBoundaryInsertByte(
       const IncludePatch &p, StringRef file,
@@ -5948,6 +8776,7 @@ private:
   struct LineStateObserverDemand {
     bool needsLine = false;
     bool needsFile = false;
+    bool needsFileName = false;
 
     // True when at least one demand witness is represented by producer-backed
     // final observer evidence rather than direct lexical final-source spelling.
@@ -5956,7 +8785,7 @@ private:
     // executable clang -E -P validation cannot be run or does not match.
     bool hasProducerBackedFinalObserver = false;
 
-    bool Any() const { return needsLine || needsFile; }
+    bool Any() const { return needsLine || needsFile || needsFileName; }
     bool PrunableByCurrentFinalObserverModel() const { return Any(); }
   };
 
@@ -6001,8 +8830,9 @@ private:
   ///
   /// The result is owner-polymorphic and projects nested predefined builtins
   /// back to their outermost source callsite before comparing byte offsets.
-  /// `__LINE__` observes the logical line component; `__FILE__` and
-  /// `__FILE_NAME__` observe the logical file component. `__BASE_FILE__` is
+  /// `__LINE__` observes the logical line component; `__FILE__` observes the
+  /// logical file component; and `__FILE_NAME__` observes the logical basename
+  /// component. `__BASE_FILE__` is
   /// intentionally excluded because synthetic #line directives do not affect
   /// its value.
   LineStateObserverDemand OwnerSuffixLineStateObserverDemand(
@@ -6192,6 +9022,16 @@ private:
   std::optional<std::pair<uint64_t, uint64_t>>
   MacroPatchMaterializedBByteRange(const MacroPatch &patch) const;
 
+  /// \brief Audit the complete accepted-proof surface before bytes are emitted.
+  ///
+  /// Phase 1F makes this the last accepted-proof gate before the applicator
+  /// splices replacement text into a source file.  The audit checks every
+  /// normalized edit, every carrier attached to each edit, and the composition
+  /// law for multi-carrier edits.
+  bool AuditAcceptedEditProofs(ArrayRef<TextEdit> edits,
+                               StringRef emissionPhase,
+                               StringRef emissionOwner = StringRef()) const;
+
   /// \brief Return whether an emitted non-terminal byte edit is backed only by
   /// emission-discharged normalized accepted-result carriers.
   ///
@@ -6202,6 +9042,18 @@ private:
   /// appropriate for emitted source text. Terminal out-of-domain results are
   /// never valid carriers for non-terminal emitted edits.
   bool EmittedTextEditHasDischargedAcceptedResults(
+      const TextEdit &edit, StringRef emissionPhase,
+      StringRef emissionOwner = StringRef()) const;
+
+  /// \brief Verify that multiple carriers on one edit compose in source order.
+  ///
+  /// Individual carrier normalization is not enough for a composite `TextEdit`:
+  /// the carriers must either be equivalent witnesses for the same source
+  /// surface or form a deterministic, gap-free ordered segment sequence in one
+  /// comparable coordinate space.  Until later state-gap phases provide typed
+  /// state-closed gap witnesses, non-empty inter-segment gaps are rejected here
+  /// rather than guessed.
+  bool EmittedTextEditHasOrderedAcceptedProofComposition(
       const TextEdit &edit, StringRef emissionPhase,
       StringRef emissionOwner = StringRef()) const;
 
@@ -6276,62 +9128,45 @@ private:
   /// \c tokmapByPP) that allows code working in PP space to locate the
   /// corresponding region in an owning file (TU or header).
   ///
-  /// If \p pp maps to an entry whose \c file matches the requested \p file,
-  /// this returns the mapped begin byte offset (\c b). Otherwise, this returns
-  /// \p fileLen when \p fallbackToEOF is enabled, or `std::nullopt` when
-  /// fallback is disabled.
-  ///
-  /// The \p fallbackToEOF behavior is intended for boundary cases where we want
-  /// a deterministic anchoring point even when a PP position does not directly
-  /// map into the requested file (for example, appending at end-of-file in a
-  /// file-owned segment).
+  /// Phase 8g deliberately makes this helper exact-only.  A PP coordinate that
+  /// does not map into \p file is not silently projected to physical EOF.  EOF
+  /// insertions are admissible only through an explicit include-anchor proof
+  /// (for example a mapped left-neighbor insertion whose zero-width patch is at
+  /// the include cover end), or else the caller must realize the include/fall
+  /// closed to a wider declared proof class.
   ///
   /// \param file the file path whose mapping is being queried (TU or included
   ///        header)
   /// \param pp the PP token index in the A-side preprocessed token stream to
-  /// resolve
-  /// \param fallbackToEOF if true, return \p fileLen when \p pp does not map
-  ///        into \p file
-  /// \param fileLen the length of \p file in bytes (used only when
-  ///        \p fallbackToEOF is true)
-  /// \return the mapped start byte offset in \p file, or \p fileLen when
-  ///         falling back to EOF, or `std::nullopt` if unmapped and fallback is
-  ///         disabled
-  std::optional<uint64_t> ByteStartForPPInFile(StringRef file, uint64_t pp,
-                                               bool fallbackToEOF,
-                                               size_t fileLen) const {
+  ///        resolve
+  /// \return the mapped start byte offset in \p file, or `std::nullopt` if the
+  ///         PP coordinate has no exact source mapping into \p file
+  std::optional<uint64_t> ByteStartForPPInFile(StringRef file,
+                                               uint64_t pp) const {
     auto it = model_.GetTokmapByPP().find(pp);
     if (it != model_.GetTokmapByPP().end() && PathsEqual(it->second.file, file))
       return it->second.b;
-    return fallbackToEOF ? std::optional<uint64_t>(fileLen) : std::nullopt;
+    return std::nullopt;
   }
 
   /// \brief Resolves the TU/file byte end offset corresponding to a PP
   /// coordinate for a specific file.
   ///
   /// Analogous to ByteStartForPPInFile() but returns the mapped end byte offset
-  /// (\c e). If \p pp maps to an entry whose \c file matches the requested \p
-  /// file, this returns \c e. Otherwise, this returns \p fileLen when \p
-  /// fallbackToEOF is enabled, or `std::nullopt` when fallback is disabled.
+  /// (\c e).  This helper is also exact-only: an unmapped PP coordinate must not
+  /// manufacture an EOF byte anchor.
   ///
   /// \param file the file path whose mapping is being queried (TU or included
   ///        header)
   /// \param pp the PP token index in the A-side preprocessed token stream to
   ///        resolve
-  /// \param fallbackToEOF if true, return \p fileLen when \p pp does not map
-  ///        into \p file
-  /// \param fileLen the length of \p file in bytes (used only when
-  ///        \p fallbackToEOF is true)
-  /// \return the mapped end byte offset in \p file, or \p fileLen when falling
-  ///         back to EOF, or `std::nullopt` if unmapped and fallback is
-  ///         disabled
-  std::optional<uint64_t> ByteEndForPPInFile(StringRef file, uint64_t pp,
-                                             bool fallbackToEOF,
-                                             size_t fileLen) const {
+  /// \return the mapped end byte offset in \p file, or `std::nullopt` if the PP
+  ///         coordinate has no exact source mapping into \p file
+  std::optional<uint64_t> ByteEndForPPInFile(StringRef file, uint64_t pp) const {
     auto it = model_.GetTokmapByPP().find(pp);
     if (it != model_.GetTokmapByPP().end() && PathsEqual(it->second.file, file))
       return it->second.e;
-    return fallbackToEOF ? std::optional<uint64_t>(fileLen) : std::nullopt;
+    return std::nullopt;
   }
 
   /// \brief Ensure that \p path has a cached weakly-canonical spelling.
@@ -6401,6 +9236,485 @@ private:
                         ArrayRef<char> isStringify);
 
 };
+
+inline RefoldEngine::OwnerStateDelta
+RefoldEngine::OwnerStateSummary::AsStateDelta() const {
+  OwnerStateDelta projected;
+
+  auto markUnmodeled = [&]() {
+    projected.Entry.hasUnmodeledState = true;
+    projected.Observes.hasUnmodeledState = true;
+    projected.Mutates.hasUnmodeledState = true;
+    projected.Exit.hasUnmodeledState = true;
+  };
+
+  auto requireAndObserve = [&](OwnerStateComponent component) {
+    switch (component) {
+    case OwnerStateComponent::MacroState:
+      projected.Entry.observesMacroState = true;
+      projected.Observes.observesMacroState = true;
+      break;
+    case OwnerStateComponent::DefinedOperator:
+      projected.Entry.observesDefinedOperator = true;
+      projected.Observes.observesDefinedOperator = true;
+      break;
+    case OwnerStateComponent::ConditionalState:
+      projected.Entry.dependsOnConditionalState = true;
+      projected.Observes.dependsOnConditionalState = true;
+      projected.Observes.observesConditionalState = true;
+      break;
+    case OwnerStateComponent::LineNumber:
+      projected.Entry.observesLine = true;
+      projected.Observes.observesLine = true;
+      break;
+    case OwnerStateComponent::FileState:
+      projected.Entry.observesFile = true;
+      projected.Observes.observesFile = true;
+      break;
+    case OwnerStateComponent::FileName:
+      projected.Entry.observesFileName = true;
+      projected.Observes.observesFileName = true;
+      break;
+    case OwnerStateComponent::Counter:
+      projected.Entry.observesCounter = true;
+      projected.Observes.observesCounter = true;
+      break;
+    case OwnerStateComponent::PragmaState:
+      projected.Entry.observesPragmaState = true;
+      projected.Observes.observesPragmaState = true;
+      break;
+    case OwnerStateComponent::IncludeGuardState:
+      projected.Entry.dependsOnIncludeGuardState = true;
+      projected.Observes.dependsOnIncludeGuardState = true;
+      break;
+    case OwnerStateComponent::IncludeState:
+      projected.Entry.observesIncludeState = true;
+      projected.Observes.observesIncludeState = true;
+      break;
+    case OwnerStateComponent::UnmodeledState:
+      markUnmodeled();
+      break;
+    case OwnerStateComponent::Unknown:
+      break;
+    }
+  };
+
+  auto mutateAndRequireExit = [&](OwnerStateComponent component) {
+    switch (component) {
+    case OwnerStateComponent::MacroState:
+      projected.Mutates.definesMacros |= definesMacros;
+      projected.Mutates.undefinesMacros |= undefinesMacros;
+      projected.Exit.definesMacros |= definesMacros;
+      projected.Exit.undefinesMacros |= undefinesMacros;
+      break;
+    case OwnerStateComponent::ConditionalState:
+      projected.Mutates.mutatesConditionalState = true;
+      projected.Exit.mutatesConditionalState = true;
+      break;
+    case OwnerStateComponent::LineNumber:
+    case OwnerStateComponent::FileState:
+    case OwnerStateComponent::FileName:
+      projected.Mutates.setsLineFile = true;
+      projected.Exit.setsLineFile = true;
+      break;
+    case OwnerStateComponent::Counter:
+      projected.Mutates.consumesCounter = true;
+      projected.Exit.consumesCounter = true;
+      break;
+    case OwnerStateComponent::PragmaState:
+      projected.Mutates.entersPragmaState |= entersPragmaState;
+      projected.Mutates.exitsPragmaState |= exitsPragmaState;
+      projected.Mutates.hasUnknownPragmaEffect |= hasUnknownPragmaEffect;
+      projected.Exit.entersPragmaState |= entersPragmaState;
+      projected.Exit.exitsPragmaState |= exitsPragmaState;
+      projected.Exit.hasUnknownPragmaEffect |= hasUnknownPragmaEffect;
+      break;
+    case OwnerStateComponent::IncludeGuardState:
+      projected.Mutates.mutatesIncludeGuardState = true;
+      projected.Exit.mutatesIncludeGuardState = true;
+      break;
+    case OwnerStateComponent::IncludeState:
+      projected.Mutates.mutatesIncludeState = true;
+      projected.Exit.mutatesIncludeState = true;
+      break;
+    case OwnerStateComponent::UnmodeledState:
+      markUnmodeled();
+      break;
+    case OwnerStateComponent::DefinedOperator:
+    case OwnerStateComponent::Unknown:
+      break;
+    }
+  };
+
+  if (observesMacroState)
+    requireAndObserve(OwnerStateComponent::MacroState);
+  if (observesDefinedOperator)
+    requireAndObserve(OwnerStateComponent::DefinedOperator);
+
+  // Phase 3B/3C component-specific macro facts refine the coarse macro-state
+  // bits above.  Requirements and observations are copied into both Entry and
+  // Observes: preserving the owner requires equivalent macro state at entry,
+  // and the owner actually reads that state while producing its A envelope.
+  for (const MacroStateIdentity &identity : macroRequirements) {
+    projected.Entry.AddMacroRequirement(identity);
+    projected.Observes.AddMacroRequirement(identity);
+  }
+  for (const MacroStateObservation &observation :
+       macroExpansionObservations) {
+    projected.Entry.AddMacroObservation(observation);
+    projected.Observes.AddMacroObservation(observation);
+  }
+  for (const MacroStateObservation &observation :
+       definedOperatorObservations) {
+    projected.Entry.AddMacroObservation(observation);
+    projected.Observes.AddMacroObservation(observation);
+  }
+  for (const MacroStateObservation &observation :
+       conditionalMacroObservations) {
+    projected.Entry.AddMacroObservation(observation);
+    projected.Observes.AddMacroObservation(observation);
+  }
+
+  // Phase 3E: builtin location observations are component-specific reads.
+  // Copy them into Entry and Observes so later suffix-stability queries can
+  // distinguish a suffix that reads only line state from one that reads file or
+  // basename state.
+  for (const BuiltinLocationObservation &observation :
+       builtinLocationObservations) {
+    projected.Entry.AddBuiltinLocationObservation(observation);
+    projected.Observes.AddBuiltinLocationObservation(observation);
+  }
+
+  // Phase 3G: counter occurrences are both observations and mutations of the
+  // counter stream, but Entry/Observes record only the read requirement while
+  // Mutates/Exit below record the state transition.
+  for (const CounterEventIdentity &identity : counterEvents) {
+    projected.Entry.AddCounterObservation(identity);
+    projected.Observes.AddCounterObservation(identity);
+  }
+
+  // Phase 3H/3I: include identities and include-guard facts are concrete
+  // owner-entry observations.  Mutates/Exit below record the transition
+  // surface for the include directive and its guard effects.
+  for (const IncludeStateIdentity &identity : includeStateEvents) {
+    projected.Entry.AddIncludeStateEvent(identity);
+    projected.Observes.AddIncludeStateEvent(identity);
+  }
+  for (const IncludeGuardStateIdentity &identity : includeGuardStateEvents) {
+    projected.Entry.AddIncludeGuardStateEvent(identity);
+    projected.Observes.AddIncludeGuardStateEvent(identity);
+  }
+
+  // Phase 3J: pragma state observations retain the precise pragma
+  // classification so suffix-stability can later distinguish known local or
+  // balanced pragma islands from opaque pragmas.
+  for (const PragmaStateIdentity &identity : pragmaStateEvents) {
+    projected.Entry.AddPragmaStateEvent(identity);
+    projected.Observes.AddPragmaStateEvent(identity);
+  }
+
+  // Phase 3K: conditional branch-selection facts are entry observations of the
+  // preprocessor state that chose the active source surface.
+  for (const ConditionalStateIdentity &identity : conditionalStateEvents) {
+    projected.Entry.AddConditionalStateEvent(identity);
+    projected.Observes.AddConditionalStateEvent(identity);
+  }
+
+  if (dependsOnConditionalState || observesConditionalState)
+    requireAndObserve(OwnerStateComponent::ConditionalState);
+  if (observesLine)
+    requireAndObserve(OwnerStateComponent::LineNumber);
+  if (observesFile)
+    requireAndObserve(OwnerStateComponent::FileState);
+  if (observesFileName)
+    requireAndObserve(OwnerStateComponent::FileName);
+  if (observesCounter)
+    requireAndObserve(OwnerStateComponent::Counter);
+  if (observesPragmaState || hasUnknownPragmaEffect)
+    requireAndObserve(OwnerStateComponent::PragmaState);
+  if (dependsOnIncludeGuardState)
+    requireAndObserve(OwnerStateComponent::IncludeGuardState);
+  if (observesIncludeState)
+    requireAndObserve(OwnerStateComponent::IncludeState);
+
+  if (definesMacros || undefinesMacros)
+    mutateAndRequireExit(OwnerStateComponent::MacroState);
+  for (const MacroStateIdentity &identity : macroDefinitions) {
+    projected.Mutates.AddMacroDefinition(identity);
+    projected.Exit.AddMacroDefinition(identity);
+  }
+  for (const MacroStateIdentity &identity : macroUndefinitions) {
+    projected.Mutates.AddMacroUndefinition(identity);
+    projected.Exit.AddMacroUndefinition(identity);
+  }
+
+  // Phase 3F: #line/line-marker directives are zero-token state owners.  They
+  // live in Mutates/Exit even when no ordinary A-token envelope exists.
+  for (const LineControlStateIdentity &identity : lineControlEvents) {
+    projected.Mutates.AddLineControlEvent(identity);
+    projected.Exit.AddLineControlEvent(identity);
+  }
+
+  for (const CounterEventIdentity &identity : counterEvents) {
+    projected.Mutates.AddCounterMutation(identity);
+    projected.Exit.AddCounterMutation(identity);
+  }
+
+  for (const IncludeStateIdentity &identity : includeStateEvents) {
+    projected.Mutates.AddIncludeStateEvent(identity);
+    projected.Exit.AddIncludeStateEvent(identity);
+  }
+  for (const IncludeGuardStateIdentity &identity : includeGuardStateEvents) {
+    projected.Mutates.AddIncludeGuardStateEvent(identity);
+    projected.Exit.AddIncludeGuardStateEvent(identity);
+  }
+  for (const PragmaStateIdentity &identity : pragmaStateEvents) {
+    projected.Mutates.AddPragmaStateEvent(identity);
+    projected.Exit.AddPragmaStateEvent(identity);
+  }
+  for (const ConditionalStateIdentity &identity : conditionalStateEvents) {
+    projected.Mutates.AddConditionalStateEvent(identity);
+    projected.Exit.AddConditionalStateEvent(identity);
+  }
+
+  if (mutatesConditionalState)
+    mutateAndRequireExit(OwnerStateComponent::ConditionalState);
+  if (setsLineFile) {
+    mutateAndRequireExit(OwnerStateComponent::LineNumber);
+    mutateAndRequireExit(OwnerStateComponent::FileState);
+    mutateAndRequireExit(OwnerStateComponent::FileName);
+  }
+  if (consumesCounter)
+    mutateAndRequireExit(OwnerStateComponent::Counter);
+  if (MutatesPragmaState())
+    mutateAndRequireExit(OwnerStateComponent::PragmaState);
+  if (mutatesIncludeGuardState || HasIncludeGuardStateEvents())
+    mutateAndRequireExit(OwnerStateComponent::IncludeGuardState);
+  if (mutatesIncludeState || HasIncludeStateEvents())
+    mutateAndRequireExit(OwnerStateComponent::IncludeState);
+  for (const MissingStateFact &fact : missingStateFacts) {
+    projected.Entry.AddMissingStateFact(fact.kind, fact.detail);
+    projected.Observes.AddMissingStateFact(fact.kind, fact.detail);
+    projected.Mutates.AddMissingStateFact(fact.kind, fact.detail);
+    projected.Exit.AddMissingStateFact(fact.kind, fact.detail);
+  }
+
+  if (hasUnmodeledState)
+    markUnmodeled();
+
+  projected.MergeFrom(delta);
+  return projected;
+}
+
+inline RefoldEngine::OwnerStateDelta
+RefoldEngine::OwnerStateSummary::AsTheoremStateDelta() const {
+  OwnerStateDelta projected;
+
+  auto projectFlatComponentFacts = [&](const OwnerStateFacts &facts) {
+    // Entry/Observes receive state requirements and observations.
+    for (const MacroStateIdentity &identity : facts.macroRequirements) {
+      projected.Entry.AddMacroRequirement(identity);
+      projected.Observes.AddMacroRequirement(identity);
+    }
+    for (const MacroStateObservation &observation :
+         facts.macroExpansionObservations) {
+      projected.Entry.AddMacroObservation(observation);
+      projected.Observes.AddMacroObservation(observation);
+    }
+    for (const MacroStateObservation &observation :
+         facts.definedOperatorObservations) {
+      projected.Entry.AddMacroObservation(observation);
+      projected.Observes.AddMacroObservation(observation);
+    }
+    for (const MacroStateObservation &observation :
+         facts.conditionalMacroObservations) {
+      projected.Entry.AddMacroObservation(observation);
+      projected.Observes.AddMacroObservation(observation);
+    }
+    for (const BuiltinLocationObservation &observation :
+         facts.builtinLocationObservations) {
+      projected.Entry.AddBuiltinLocationObservation(observation);
+      projected.Observes.AddBuiltinLocationObservation(observation);
+    }
+    for (const CounterEventIdentity &identity : facts.counterEvents) {
+      projected.Entry.AddCounterObservation(identity);
+      projected.Observes.AddCounterObservation(identity);
+      projected.Mutates.AddCounterMutation(identity);
+      projected.Exit.AddCounterMutation(identity);
+    }
+    for (const IncludeStateIdentity &identity : facts.includeStateEvents) {
+      projected.Entry.AddIncludeStateEvent(identity);
+      projected.Observes.AddIncludeStateEvent(identity);
+      projected.Mutates.AddIncludeStateEvent(identity);
+      projected.Exit.AddIncludeStateEvent(identity);
+    }
+    for (const IncludeGuardStateIdentity &identity :
+         facts.includeGuardStateEvents) {
+      projected.Entry.AddIncludeGuardStateEvent(identity);
+      projected.Observes.AddIncludeGuardStateEvent(identity);
+      projected.Mutates.AddIncludeGuardStateEvent(identity);
+      projected.Exit.AddIncludeGuardStateEvent(identity);
+    }
+    for (const PragmaStateIdentity &identity : facts.pragmaStateEvents) {
+      projected.Entry.AddPragmaStateEvent(identity);
+      projected.Observes.AddPragmaStateEvent(identity);
+      projected.Mutates.AddPragmaStateEvent(identity);
+      projected.Exit.AddPragmaStateEvent(identity);
+    }
+    for (const ConditionalStateIdentity &identity :
+         facts.conditionalStateEvents) {
+      projected.Entry.AddConditionalStateEvent(identity);
+      projected.Observes.AddConditionalStateEvent(identity);
+      projected.Mutates.AddConditionalStateEvent(identity);
+      projected.Exit.AddConditionalStateEvent(identity);
+    }
+
+    // Mutates/Exit receive state transitions.
+    for (const MacroStateIdentity &identity : facts.macroDefinitions) {
+      projected.Mutates.AddMacroDefinition(identity);
+      projected.Exit.AddMacroDefinition(identity);
+    }
+    for (const MacroStateIdentity &identity : facts.macroUndefinitions) {
+      projected.Mutates.AddMacroUndefinition(identity);
+      projected.Exit.AddMacroUndefinition(identity);
+    }
+    for (const LineControlStateIdentity &identity :
+         facts.lineControlEvents) {
+      projected.Mutates.AddLineControlEvent(identity);
+      projected.Exit.AddLineControlEvent(identity);
+    }
+
+    // Missing facts are theorem obligations, so they remain visible in every
+    // bucket.  MissingOwnerOrderingFacts also set hasUnmodeledState through the
+    // AddMissingStateFact helper, but that bit is derived from the precise
+    // missing-fact marker rather than from the old flat poison bit.
+    for (const MissingStateFact &fact : facts.missingStateFacts) {
+      projected.Entry.AddMissingStateFact(fact.kind, fact.detail);
+      projected.Observes.AddMissingStateFact(fact.kind, fact.detail);
+      projected.Mutates.AddMissingStateFact(fact.kind, fact.detail);
+      projected.Exit.AddMissingStateFact(fact.kind, fact.detail);
+    }
+  };
+
+  // First project precise facts attached to the legacy summary surface, then
+  // merge precise facts that later phases may attach directly to delta buckets.
+  // The merge helper intentionally ignores raw coarse booleans in delta.
+  projectFlatComponentFacts(*this);
+  OwnerStateDelta preciseDelta;
+  preciseDelta.MergeTheoremFactsFrom(delta);
+  projected.MergeFrom(preciseDelta);
+  return projected;
+}
+
+inline bool RefoldEngine::OwnerStateSummary::HasTheoremUnmodeledState() const {
+  const OwnerStateDelta theoremDelta = AsTheoremStateDelta();
+  return theoremDelta.Entry.hasUnmodeledState ||
+         theoremDelta.Observes.hasUnmodeledState ||
+         theoremDelta.Mutates.hasUnmodeledState ||
+         theoremDelta.Exit.hasUnmodeledState;
+}
+
+inline bool
+RefoldEngine::OwnerStateSummary::HasTheoremUnknownPragmaState() const {
+  const OwnerStateDelta theoremDelta = AsTheoremStateDelta();
+  return theoremDelta.Entry.HasTheoremUnknownPragmaState() ||
+         theoremDelta.Observes.HasTheoremUnknownPragmaState() ||
+         theoremDelta.Mutates.HasTheoremUnknownPragmaState() ||
+         theoremDelta.Exit.HasTheoremUnknownPragmaState();
+}
+
+inline void RefoldEngine::OwnerStateSummary::RefreshDeltaFromFlatFacts() {
+  delta = OwnerStateDelta();
+  delta = AsStateDelta();
+}
+
+inline bool RefoldEngine::OwnerStateSummary::MutatesAnyState() const {
+  const OwnerStateDelta theoremDelta = AsTheoremStateDelta();
+  return theoremDelta.Mutates.MutatesAnyState() ||
+         theoremDelta.Exit.MutatesAnyState();
+}
+
+inline bool RefoldEngine::OwnerStateSummary::ObservesAnyState() const {
+  const OwnerStateDelta theoremDelta = AsTheoremStateDelta();
+  return theoremDelta.Entry.ObservesAnyState() ||
+         theoremDelta.Observes.ObservesAnyState();
+}
+
+inline RefoldEngine::OwnerObserverSummary
+RefoldEngine::OwnerStateSummary::ToObserverSummary() const {
+  const OwnerStateDelta theoremDelta = AsTheoremStateDelta();
+  const StateObservations &observations = theoremDelta.Observes;
+  OwnerObserverSummary observers;
+  observers.observesMacroExpansion = observations.observesMacroState;
+  observers.observesDefinedOperator = observations.observesDefinedOperator;
+  observers.observesConditionalEvaluation =
+      observations.dependsOnConditionalState ||
+      observations.observesConditionalState;
+  observers.observesLineNumber = observations.observesLine ||
+                                llvm::any_of(
+                                    observations.builtinLocationObservations,
+                                    [](const BuiltinLocationObservation &obs) {
+                                      return obs.kind ==
+                                             BuiltinLocationObservationKind::LineState;
+                                    });
+  observers.observesFileState = observations.observesFile ||
+                               llvm::any_of(
+                                   observations.builtinLocationObservations,
+                                   [](const BuiltinLocationObservation &obs) {
+                                     return obs.kind ==
+                                            BuiltinLocationObservationKind::FileState;
+                                   });
+  observers.observesFileName = observations.observesFileName ||
+                                llvm::any_of(
+                                    observations.builtinLocationObservations,
+                                    [](const BuiltinLocationObservation &obs) {
+                                      return obs.kind ==
+                                             BuiltinLocationObservationKind::FileNameState;
+                                    });
+  observers.observesCounter = observations.observesCounter ||
+                              observations.HasCounterEvents();
+  observers.observesPragmaState = observations.observesPragmaState ||
+                                  observations.hasUnknownPragmaEffect ||
+                                  observations.HasPragmaStateEvents();
+  observers.observesIncludeGuardState =
+      observations.dependsOnIncludeGuardState ||
+      observations.HasIncludeGuardStateEvents();
+  observers.observesIncludeState = observations.observesIncludeState ||
+                                   observations.HasIncludeStateEvents();
+  for (const MissingStateFact &fact : observations.missingStateFacts) {
+    switch (fact.kind) {
+    case MissingStateFactKind::MissingMacroFacts:
+      observers.observesMacroExpansion = true;
+      observers.observesDefinedOperator = true;
+      observers.observesConditionalEvaluation = true;
+      break;
+    case MissingStateFactKind::MissingLineControlFacts:
+      observers.observesLineNumber = true;
+      observers.observesFileState = true;
+      observers.observesFileName = true;
+      break;
+    case MissingStateFactKind::MissingCounterFacts:
+      observers.observesCounter = true;
+      break;
+    case MissingStateFactKind::MissingPragmaFacts:
+      observers.observesPragmaState = true;
+      break;
+    case MissingStateFactKind::MissingIncludeGuardFacts:
+      observers.observesIncludeGuardState = true;
+      break;
+    case MissingStateFactKind::MissingConditionalFacts:
+      observers.observesConditionalEvaluation = true;
+      break;
+    case MissingStateFactKind::MissingOwnerOrderingFacts:
+      // There is no precise component when the owner/event ordering fact is
+      // absent.  The legacy hasUnmodeledState projection above records that as
+      // an explicit unmodeled observer site until Phase 4/5 can carry a first
+      // class ordering-failure edge.
+      break;
+    }
+  }
+  return observers;
+}
 
 
 } // namespace refold

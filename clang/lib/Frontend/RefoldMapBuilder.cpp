@@ -5112,13 +5112,20 @@ void RefoldMapBuilder::writeJSON() {
               JO.attribute("parent", *It.Parent);
           }
 
-          // owner_include_id only for MACRO items and #define/#undef
-          // directives
+          // Emit owner_include_id for source items whose semantics are tied
+          // to the include occurrence that was active when the item was seen.
+          //
+          // Pragmas are included here even though they have no ordinary PP-token
+          // spans: Phase-7 zero-token state-gap proofs need the concrete include
+          // instance to distinguish repeated inclusions of the same physical
+          // header.  Without this id, the consumer would have to fall back to
+          // path+byte matching and conservatively reject repeated-header gaps.
           if (It.OwnerIncludeId) {
             if (It.Kind == IK_Macro) {
               JO.attribute("owner_include_id", *It.OwnerIncludeId);
             } else if (It.Kind == IK_Directive &&
-                       (It.Subkind == "#define" || It.Subkind == "#undef")) {
+                       (It.Subkind == "#define" || It.Subkind == "#undef" ||
+                        It.Subkind == "#pragma")) {
               JO.attribute("owner_include_id", *It.OwnerIncludeId);
             }
           }

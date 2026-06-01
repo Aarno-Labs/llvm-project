@@ -259,13 +259,22 @@ RefoldEngine::ValidateInvocationRealizationProof(
     discharge.Require(boundsTracked,
                       ProofObligationKind::WholeCoverBoundsTracked,
                       ProofFailureReason::MissingWholeCoverBounds);
-    discharge.Require(patch.wholeCoverSelfContained ||
-                          patch.wholeCoverNestedSelfContained,
+    // Phase 8e deletes the nested/coarse-span whole-cover fallback.  A macro
+    // realization must now carry the direct self-contained owner-cover proof
+    // that was checked before BuildMacroWholeCoverOwnerRealization() stamped the
+    // shared OwnerRealizationProof.
+    discharge.Require(patch.wholeCoverSelfContained,
                       ProofObligationKind::WholeCoverContainmentTracked,
                       ProofFailureReason::MissingWholeCoverContainment);
     discharge.Require(boundaryAccountingTracked,
                       ProofObligationKind::WholeCoverBoundaryAccountingTracked,
                       ProofFailureReason::MissingWholeCoverBoundaryAccounting);
+    discharge.Require(
+        patch.hasOwnerRealizationWitness &&
+            patch.ownerRealizationWitness.evidence ==
+                OwnerRealizationEvidenceKind::MacroWholeCover,
+        ProofObligationKind::OwnerRealizationWitnessTracked,
+        ProofFailureReason::MissingOwnerRealizationWitness);
   } else {
     // Other realization paths currently rely on the common legacy validation
     // bit plus the non-structure-preserving accepted class. They do not carry
@@ -352,17 +361,46 @@ RefoldEngine::ProofDischargeRecord RefoldEngine::ValidateIncludePreservingProof(
         ProofFailureReason::MissingIncludeSelectedConditionalBoundaryWitness);
     break;
 
-  case AcceptedPathKind::IncludeInsertChildBoundary:
-    // Child-boundary insertion is also zero-width, but the witness must name
-    // the child include whose boundary supplies the insertion anchor.
+  case AcceptedPathKind::IncludeInsertChildBoundary: {
+    // Phase 8d classification: IncludeInsertionByChildBoundary is a declared
+    // include-preserving proof, not a legacy fallback.  The accepted patch must
+    // be a zero-width insertion owned by a concrete parent include, and the
+    // witness must name a direct child include whose spelled directive boundary
+    // is exactly the recorded anchor byte.  This keeps the theorem obligation
+    // owner-local and prevents an arbitrary child id from masquerading as a
+    // stable parent-header insertion point.
     RequireIncludeZeroWidthAnchor(
         discharge, *patch, witness, IncludeAnchorEvidenceKind::ChildBoundary,
         ProofObligationKind::IncludeChildBoundaryWitnessTracked,
         ProofFailureReason::MissingIncludeChildBoundaryWitness);
+    discharge.Require(patch->include != nullptr,
+                      ProofObligationKind::IncludeChildBoundaryWitnessTracked,
+                      ProofFailureReason::MissingIncludeChildBoundaryWitness);
     discharge.Require(witness && witness->hasChildIncludeId,
                       ProofObligationKind::IncludeChildBoundaryWitnessTracked,
                       ProofFailureReason::MissingIncludeChildBoundaryWitness);
+
+    bool childBoundaryMatchesParent = false;
+    if (patch->include && witness && witness->hasChildIncludeId &&
+        witness->hasAnchorByte) {
+      for (const auto &child : model_.GetIncludes()) {
+        if (child.id != witness->childIncludeId)
+          continue;
+        const bool directChildOfPatchOwner =
+            child.parent && *child.parent == patch->include->id;
+        const bool anchorIsSpelledChildBoundary =
+            witness->anchorByte == child.siteB ||
+            witness->anchorByte == child.siteE;
+        childBoundaryMatchesParent =
+            directChildOfPatchOwner && anchorIsSpelledChildBoundary;
+        break;
+      }
+    }
+    discharge.Require(childBoundaryMatchesParent,
+                      ProofObligationKind::IncludeChildBoundaryWitnessTracked,
+                      ProofFailureReason::MissingIncludeChildBoundaryWitness);
     break;
+  }
 
   case AcceptedPathKind::IncludeInsertRightNeighborPP:
     // Right-neighbor insertion anchors before a known preprocessor token. The
@@ -422,79 +460,12 @@ RefoldEngine::ProofDischargeRecord RefoldEngine::ValidateIncludePreservingProof(
   case AcceptedPathKind::TUProvableInsertionAnchor:
   case AcceptedPathKind::TUByteSpanMappedEdit:
   case AcceptedPathKind::TUByteSpanConservativeEdit:
+  case AcceptedPathKind::TUIncludeClosureEdit:
   case AcceptedPathKind::TerminalEmitEditedPreprocessedStream:
     // Non-include-preserving paths have no additional obligations in this
     // validator. The common path-classification checks above still record any
     // mismatch if such a path reaches this function unexpectedly.
     break;
-  }
-
-  return discharge.Finish();
-}
-
-bool RefoldEngine::IsAcceptedIncludeRealizationEvidenceKind(
-    IncludeRealizationEvidenceKind kind) const {
-  // Only realized B-cover envelopes are theorem-facing include realization
-  // evidence; Unknown is an undischarched realization witness.
-  switch (kind) {
-  case IncludeRealizationEvidenceKind::CanonicalBCoverEnvelope:
-  case IncludeRealizationEvidenceKind::ConsensusRescuedBCoverEnvelope:
-    return true;
-  case IncludeRealizationEvidenceKind::Unknown:
-    return false;
-  }
-  return false;
-}
-
-RefoldEngine::ProofDischargeRecord
-RefoldEngine::ValidateIncludeRealizationProof(
-    AcceptedPathKind currentPath, const IncludePatch *patch,
-    const IncludeRealizationWitness *witness) const {
-  (void)patch;
-  ProofDischargeAccumulator discharge;
-  const AcceptancePathInventory inventory =
-      BuildAcceptancePathInventory(currentPath);
-
-  // Common include-realization baseline: the path must be classified, mapped to
-  // a future proof target, and belong to one of the declared include
-  // realization proof classes.
-  RequireAcceptedPathBaseline(discharge, inventory);
-  discharge.Require(
-      currentPath == AcceptedPathKind::IncludeRealizationInlineFromB ||
-          currentPath == AcceptedPathKind::IncludeMaterializedExpansion,
-      ProofObligationKind::AcceptedPathClassified,
-      ProofFailureReason::MissingAcceptedPathClassification);
-
-  if (currentPath == AcceptedPathKind::IncludeRealizationInlineFromB) {
-    // Inline include realization is discharged only when the witness records
-    // either the canonical B-envelope mapping or the deterministic
-    // consensus-rescue envelope. Any other evidence kind is outside the
-    // declared domain for this proof class.
-    discharge.Require(
-        witness && IsAcceptedIncludeRealizationEvidenceKind(witness->evidence),
-        ProofObligationKind::IncludeRealizationWitnessTracked,
-        ProofFailureReason::MissingIncludeRealizationWitness);
-
-    // The witness must identify the include being realized, the A-side cover
-    // being replaced, and the B-side token envelope that supplies the
-    // realization text.
-    discharge.Require(witness && witness->hasIncludeId &&
-                          witness->includeId != 0,
-                      ProofObligationKind::IncludeRealizationIncludeTracked,
-                      ProofFailureReason::MissingIncludeRealizationInclude);
-    discharge.Require(witness && witness->hasACover &&
-                          witness->aCoverEnd >= witness->aCoverBegin,
-                      ProofObligationKind::IncludeRealizationCoverTracked,
-                      ProofFailureReason::MissingIncludeRealizationCover);
-    discharge.Require(witness && witness->hasBTokenEnvelope &&
-                          witness->bTokEnd >= witness->bTokBegin,
-                      ProofObligationKind::IncludeRealizationBEnvelopeTracked,
-                      ProofFailureReason::MissingIncludeRealizationBEnvelope);
-  } else {
-    // Materialized include expansion is already represented by the accepted
-    // path classification. It has no inline B-envelope witness obligations.
-    discharge.Require(true, ProofObligationKind::AcceptedPathClassified,
-                      ProofFailureReason::MissingAcceptedPathClassification);
   }
 
   return discharge.Finish();
@@ -603,6 +574,7 @@ RefoldEngine::ValidateTUAnchorProof(AcceptedPathKind currentPath,
   case AcceptedPathKind::IncludeMaterializedExpansion:
   case AcceptedPathKind::TUByteSpanMappedEdit:
   case AcceptedPathKind::TUByteSpanConservativeEdit:
+  case AcceptedPathKind::TUIncludeClosureEdit:
   case AcceptedPathKind::TerminalEmitEditedPreprocessedStream:
     // Non-TU-anchor paths have no path-specific obligations here; the common
     // classification check above records the failure if one reaches this
@@ -653,18 +625,6 @@ std::string RefoldEngine::FormatIncludeAnchorWitness(
       .str();
 }
 
-std::string RefoldEngine::FormatIncludeRealizationWitness(
-    const IncludeRealizationWitness &witness) const {
-  return formatv("kind={0} includeId={1}{2} aCover=[{3},{4}){5} "
-                 "bTokEnvelope=[{6},{7}){8}",
-                 witness.evidence, witness.includeId,
-                 witness.hasIncludeId ? "" : "(missing)", witness.aCoverBegin,
-                 witness.aCoverEnd, witness.hasACover ? "" : "(missing)",
-                 witness.bTokBegin, witness.bTokEnd,
-                 witness.hasBTokenEnvelope ? "" : "(missing)")
-      .str();
-}
-
 std::string
 RefoldEngine::FormatProofSummaryAuditCore(const ProofSummary &summary) const {
   return formatv("inventory={0} lattice={1} completeness={2} theoremDomain={3} "
@@ -677,12 +637,13 @@ RefoldEngine::FormatProofSummaryAuditCore(const ProofSummary &summary) const {
       .str();
 }
 
-void RefoldEngine::AppendProofSummaryWitnessAudit(
-    std::string &artifact, const ProofSummary &summary, bool firstOnly) const {
+void RefoldEngine::AppendProofSummaryWitnessAudit(std::string &artifact,
+                                                  const ProofSummary &summary,
+                                                  bool firstOnly) const {
   if (summary.hasTUAnchorWitness) {
-    artifact += formatv(" tuAnchor={0}",
-                        FormatTUAnchorWitness(summary.tuAnchorWitness))
-                    .str();
+    artifact +=
+        formatv(" tuAnchor={0}", FormatTUAnchorWitness(summary.tuAnchorWitness))
+            .str();
     if (firstOnly)
       return;
   }
@@ -694,18 +655,26 @@ void RefoldEngine::AppendProofSummaryWitnessAudit(
     if (firstOnly)
       return;
   }
-  if (summary.hasIncludeRealizationWitness) {
+  if (summary.hasOwnerRealizationWitness) {
     artifact +=
-        formatv(" includeRealization={0}",
-                FormatIncludeRealizationWitness(summary.includeRealizationWitness))
+        formatv(" ownerRealization={0}",
+                FormatOwnerRealizationWitness(summary.ownerRealizationWitness))
+            .str();
+    if (firstOnly)
+      return;
+  }
+  if (summary.hasMixedOwnerTilingWitness) {
+    artifact +=
+        formatv(" mixedOwnerTiling={0}",
+                FormatMixedOwnerTilingWitness(summary.mixedOwnerTilingWitness))
             .str();
     if (firstOnly)
       return;
   }
   if (summary.hasTerminalFallbackWitness) {
-    artifact += formatv(" terminalOutOfDomain={0}",
-                        summary.terminalFallbackWitness)
-                    .str();
+    artifact +=
+        formatv(" terminalOutOfDomain={0}", summary.terminalFallbackWitness)
+            .str();
   }
 }
 
@@ -713,13 +682,41 @@ RefoldEngine::TerminalFallbackWitness
 RefoldEngine::BuildTerminalFallbackWitness() const {
   TerminalFallbackWitness witness;
   witness.kind = terminalFallbackKind_;
-  witness.proofFailure =
-      ClassifyTerminalFallbackProofFailure(terminalFallbackKind_);
+  witness.proofFailure = terminalFallbackProofFailure_;
+  if (!IsClassifiedTerminalFallbackProofFailure(witness.proofFailure)) {
+    // Phase 2B forbids deriving the failed obligation from the aggregate
+    // terminal kind.  If this state is ever reached, the bug is the missing
+    // caller-supplied proof failure itself, so report a theorem-audit
+    // invariant violation rather than inventing an owner/state reason here.
+    witness.kind = TerminalFallbackKind::TheoremAuditInvariantViolation;
+    witness.proofFailure = MakeTerminalFallbackProofFailure(
+        TerminalFallbackObligationKind::TheoremAuditInvariantSatisfied,
+        TerminalFallbackFailureReason::TheoremAuditInvariantViolation,
+        TerminalFallbackFailureContext::ForStateComponent(
+            "terminalFallbackWitness"));
+  }
   witness.requestCount = terminalFallbackRequestCount_;
 
+  // Phase 2D preserves every classified failed obligation that led to the
+  // terminal carrier.  Keep the first failure as the primary legacy field, but
+  // also retain the ordered secondary failures so MixedExcludedCases does not
+  // erase independent theorem obligations.
+  witness.proofFailures = terminalFallbackProofFailures_;
+  auto sameClassification = [](const TerminalFallbackProofFailure &lhs,
+                               const TerminalFallbackProofFailure &rhs) {
+    return lhs.obligation == rhs.obligation && lhs.reason == rhs.reason &&
+           lhs.theoremFailure == rhs.theoremFailure;
+  };
+  if (witness.proofFailures.empty() ||
+      !sameClassification(witness.proofFailures.front(),
+                          witness.proofFailure)) {
+    witness.proofFailures.insert(witness.proofFailures.begin(),
+                                 witness.proofFailure);
+  }
+
   // Preserve the first recorded terminal-fallback reason as the primary audit
-  // witness; later reasons remain diagnostic context outside this compact
-  // theorem-facing record.
+  // witness; the structured `proofFailures` list above carries all theorem
+  // obligations, while the reason strings remain human diagnostics.
   if (!terminalFallbackReasons_.empty()) {
     witness.hasPrimaryReason = true;
     witness.primaryReason = terminalFallbackReasons_.front();
@@ -876,7 +873,7 @@ std::string RefoldEngine::FormatCompletenessContract(
     TerminalFallbackWitness witness;
     witness.kind = contract.explicitExclusion;
     witness.proofFailure =
-        ClassifyTerminalFallbackProofFailure(contract.explicitExclusion);
+        ClassifyAggregateTerminalFallbackProofFailure(contract.explicitExclusion);
     return formatv("coverage={0} expectation={1} declaredTarget={2} counts={3} "
                    "exclusion={4}",
                    contract.coverage, contract.expectation,
@@ -897,7 +894,7 @@ std::string RefoldEngine::FormatTheoremDomainContract(
     TerminalFallbackWitness witness;
     witness.kind = contract.explicitExclusion;
     witness.proofFailure =
-        ClassifyTerminalFallbackProofFailure(contract.explicitExclusion);
+        ClassifyAggregateTerminalFallbackProofFailure(contract.explicitExclusion);
     return formatv("kind={0} inDeclaredDomain={1} counts={2} declaredTarget={3}"
                    " exclusion={4}",
                    contract.kind, contract.inDeclaredDomain ? 1 : 0,
@@ -916,11 +913,10 @@ std::string RefoldEngine::FormatAcceptedPathAudit(
     AcceptedPathKind currentPath, const IncludePatch *patch,
     const TUAnchorWitness *tuAnchorWitness,
     const IncludeAnchorWitness *includeAnchorWitness,
-    const IncludeRealizationWitness *includeRealizationWitness,
     const TerminalFallbackWitness *terminalFallbackWitness) const {
   const ProofSummary summary = BuildAcceptedPathProofSummary(
       currentPath, patch, tuAnchorWitness, includeAnchorWitness,
-      includeRealizationWitness, terminalFallbackWitness);
+      terminalFallbackWitness);
   std::string audit = FormatProofSummaryAuditCore(summary);
   AppendProofSummaryWitnessAudit(audit, summary, /*firstOnly=*/true);
   return audit;
@@ -969,9 +965,12 @@ std::string RefoldEngine::FormatAcceptedResultCandidate(
   const std::string artifactSuffix =
       artifact.empty() ? std::string()
                        : formatv(" artifact={0}", artifact).str();
-  return formatv("kind={0} class={1} realization={2} preference={3} "
-                 "surfaceDisposition={4} {5}{6}",
-                 candidate.kind, candidate.proofSummary.acceptedClass,
+  const std::optional<TheoremProofClass> theoremProof =
+      NormalizeAcceptedProof(candidate);
+  return formatv("kind={0} theoremProof={1} class={2} realization={3} "
+                 "preference={4} surfaceDisposition={5} {6}{7}",
+                 candidate.kind, theoremProof,
+                 candidate.proofSummary.acceptedClass,
                  candidate.proofSummary.realizationMode,
                  candidate.proofSummary.preference,
                  candidate.proofSummary.surfaceDisposition,

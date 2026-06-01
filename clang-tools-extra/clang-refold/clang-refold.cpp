@@ -1464,15 +1464,15 @@ static void inferUniqueHeaderPragmaOwners(
 static std::optional<uint64_t> inferHeaderPragmaOwnerForOccurrence(
     const JsonPragmaItem &pragma, const SidebandPragmaLine &line,
     ArrayRef<JsonIncludeItemForSideband> includes) {
-  if (pragma.ownerIncludeId)
-    return pragma.ownerIncludeId;
   if (pragma.sitePath.empty() || StringRef(pragma.sitePath).starts_with("<"))
-    return std::nullopt;
+    return pragma.ownerIncludeId;
 
   std::optional<uint64_t> owner;
+  bool sawHeaderInclude = false;
   for (const JsonIncludeItemForSideband &inc : includes) {
     if (inc.resolvedPath != pragma.sitePath)
       continue;
+    sawHeaderInclude = true;
     for (const JsonTokenSpanForSideband &span : inc.spans) {
       // Leading pragmas live at span.begin, interior pragmas live strictly
       // inside the half-open span, and trailing pragmas live at span.end.
@@ -1485,7 +1485,20 @@ static std::optional<uint64_t> inferHeaderPragmaOwnerForOccurrence(
       }
     }
   }
-  return owner;
+
+  if (owner)
+    return owner;
+
+  // `owner_include_id` on a physical header pragma is useful producer
+  // provenance, but it is not by itself the replay occurrence.  A header can be
+  // included more than once, and the same DirectivePragmaItem then replays once
+  // per concrete include span.  Only fall back to the serialized owner when no
+  // repeated-header occurrence inference is required; otherwise fail closed so
+  // we do not bind the second replay to the first include instance.
+  if (!sawHeaderInclude)
+    return pragma.ownerIncludeId;
+
+  return std::nullopt;
 }
 
 static bool sitePathHasIncludeInstance(

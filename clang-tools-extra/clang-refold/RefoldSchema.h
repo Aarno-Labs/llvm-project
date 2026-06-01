@@ -89,7 +89,8 @@
 //
 // * DirectivePragmaItem
 //     A #pragma line with exact text and location (site_path, [site_b, site_e))
-//     (nullable bounds when unavailable).
+//     (nullable bounds when unavailable).  Newer producers may include
+//     owner_include_id to bind repeated header instances deterministically.
 //
 // * FileItem
 //     Represents tokens emitted while the main TU (top-level) was active;
@@ -1232,6 +1233,14 @@ static constexpr const char *RefoldSchema = R"json(
           ],
           "minimum": 0,
           "description": "End byte offset (exclusive) of the #pragma line in 'site_path'."
+        },
+        "owner_include_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "Include item id that opened site_path for this pragma occurrence, when known. Used to disambiguate repeated header instances."
         }
       }
     },

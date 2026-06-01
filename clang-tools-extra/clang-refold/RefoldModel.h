@@ -507,6 +507,11 @@ public:
     StringRef sitePath;
     uint64_t siteB;
     uint64_t siteE;
+    /// Include instance that owned this pragma directive, when the producer
+    /// recorded it.  Older maps omit the field, so consumers must either infer
+    /// the owner from slot/segment facts or reject repeated-header ambiguity
+    /// instead of binding the pragma by physical path alone.
+    std::optional<uint64_t> ownerIncludeId;
   };
 
   struct FileItem {

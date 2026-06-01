@@ -108,9 +108,10 @@ std::optional<std::string> RefoldEngine::BuildInlineIncludeRealizationFromB(
     AcceptedResultCandidate *acceptedCandidate) const {
   // Inline include realization is theorem-facing only when the include's
   // A-cover can be projected to a concrete B-token envelope by an accepted
-  // witness: either the canonical A-cover mapping or a deterministic
-  // consensus-rescued envelope. If no such envelope exists, do not synthesize a
-  // weaker realization; request the explicit terminal fallback instead.
+  // witness: either the canonical A-cover mapping or the Phase-8b
+  // boundary-stable consensus proof.  If no such envelope exists, do not
+  // synthesize a weaker realization; request the explicit terminal fallback
+  // instead.
   IncludeRealizationEvidenceKind evidenceKind =
       IncludeRealizationEvidenceKind::Unknown;
   auto bEnvOpt = ResolveIncludeRealizationBTokenEnvelope(
@@ -118,6 +119,9 @@ std::optional<std::string> RefoldEngine::BuildInlineIncludeRealizationFromB(
   if (!bEnvOpt) {
     RequestTerminalFallback(
         TerminalFallbackKind::IncludeRealizationUnmappableBCoverEnvelope,
+        MakeTerminalFallbackProofFailure(
+        TerminalFallbackObligationKind::IncludeRealizationBEnvelopeMapped,
+        TerminalFallbackFailureReason::UnmappableIncludeBEnvelope),
         "include/mat",
         llvm::formatv("include realization from B failed to resolve a "
                       "canonical-or-consensus-resolvable B envelope for "
@@ -352,9 +356,9 @@ RefoldEngine::IncludeSubtreeLineStateObserverDemand(uint64_t includeId) const {
 
   for (const auto &macro : model_.GetMacroInvocations()) {
     const bool observesLine = macro.name == "__LINE__";
-    const bool observesFile =
-        macro.name == "__FILE__" || macro.name == "__FILE_NAME__";
-    if (!observesLine && !observesFile)
+    const bool observesFile = macro.name == "__FILE__";
+    const bool observesFileName = macro.name == "__FILE_NAME__";
+    if (!observesLine && !observesFile && !observesFileName)
       continue;
 
     // A builtin may be recorded at a macro definition site while the observable
@@ -400,9 +404,10 @@ RefoldEngine::IncludeSubtreeLineStateObserverDemand(uint64_t includeId) const {
 
     demand.needsLine |= observesLine;
     demand.needsFile |= observesFile;
+    demand.needsFileName |= observesFileName;
     demand.hasProducerBackedFinalObserver |=
         LineStateBuiltinInvocationNeedsProducerBackedFinalObserver(macro);
-    if (demand.needsLine && demand.needsFile &&
+    if (demand.needsLine && demand.needsFile && demand.needsFileName &&
         demand.hasProducerBackedFinalObserver)
       break;
   }
@@ -1825,9 +1830,9 @@ RefoldEngine::OwnerSuffixLineStateObserverDemand(
 
   for (const auto &macro : model_.GetMacroInvocations()) {
     const bool observesLine = macro.name == "__LINE__";
-    const bool observesFile =
-        macro.name == "__FILE__" || macro.name == "__FILE_NAME__";
-    if (!observesLine && !observesFile)
+    const bool observesFile = macro.name == "__FILE__";
+    const bool observesFileName = macro.name == "__FILE_NAME__";
+    if (!observesLine && !observesFile && !observesFileName)
       continue;
     if (macro.ownerIncludeId != ownerIncludeId)
       continue;
@@ -1869,9 +1874,10 @@ RefoldEngine::OwnerSuffixLineStateObserverDemand(
 
     demand.needsLine |= observesLine;
     demand.needsFile |= observesFile;
+    demand.needsFileName |= observesFileName;
     demand.hasProducerBackedFinalObserver |=
         LineStateBuiltinInvocationNeedsProducerBackedFinalObserver(macro);
-    if (demand.needsLine && demand.needsFile &&
+    if (demand.needsLine && demand.needsFile && demand.needsFileName &&
         demand.hasProducerBackedFinalObserver)
       break;
   }
@@ -1888,9 +1894,9 @@ RefoldEngine::FirstOwnerSuffixLineStateObserverSite(
   auto considerSite = [&](const RefoldModel::MacroInvocation &builtin,
                           const RefoldModel::MacroInvocation &site) {
     const bool observesLine = builtin.name == "__LINE__";
-    const bool observesFile =
-        builtin.name == "__FILE__" || builtin.name == "__FILE_NAME__";
-    if (!observesLine && !observesFile)
+    const bool observesFile = builtin.name == "__FILE__";
+    const bool observesFileName = builtin.name == "__FILE_NAME__";
+    if (!observesLine && !observesFile && !observesFileName)
       return;
     if (site.ownerIncludeId != ownerIncludeId)
       return;
@@ -1911,15 +1917,16 @@ RefoldEngine::FirstOwnerSuffixLineStateObserverSite(
     }
     best->demand.needsLine |= observesLine;
     best->demand.needsFile |= observesFile;
+    best->demand.needsFileName |= observesFileName;
     best->demand.hasProducerBackedFinalObserver |=
         LineStateBuiltinInvocationNeedsProducerBackedFinalObserver(builtin);
   };
 
   for (const auto &macro : model_.GetMacroInvocations()) {
     const bool observesLine = macro.name == "__LINE__";
-    const bool observesFile =
-        macro.name == "__FILE__" || macro.name == "__FILE_NAME__";
-    if (!observesLine && !observesFile)
+    const bool observesFile = macro.name == "__FILE__";
+    const bool observesFileName = macro.name == "__FILE_NAME__";
+    if (!observesLine && !observesFile && !observesFileName)
       continue;
 
     const RefoldModel::MacroInvocation *site = &macro;
@@ -2186,6 +2193,42 @@ RefoldEngine::WrapIncludeExpansionForMaterialization(
       IncludeEntryLineDirectiveDischargesLayoutBarrier(
           child, parentOwnerFileForDemand);
 
+  auto forEachLineControlDemandComponent =
+      [&](const LineStateObserverDemand &demand, bool includeLayoutLineState,
+          auto &&fn) {
+        bool emittedAny = false;
+        if (demand.needsLine) {
+          fn(OwnerStateComponent::LineNumber);
+          emittedAny = true;
+        }
+        if (demand.needsFile) {
+          fn(OwnerStateComponent::FileState);
+          emittedAny = true;
+        }
+        if (demand.needsFileName) {
+          fn(OwnerStateComponent::FileName);
+          emittedAny = true;
+        }
+
+        // Include-entry wrappers are sometimes required by a -E -P layout
+        // barrier even before a preserved location builtin is known.  Keep that
+        // obligation on the line-control gateway surface as a line-state
+        // transition; the gateway will discharge it as suffix-unobserved if the
+        // persistent observer graph confirms that no suffix owner observes it.
+        if (!emittedAny && includeLayoutLineState)
+          fn(OwnerStateComponent::LineNumber);
+      };
+
+  auto checkLineControlRepair =
+      [&](const OwnerStateBoundary &boundary, OwnerStateComponent component,
+          StateMutationKind mutation, StringRef phase, StringRef detail,
+          bool requireKnownObserver) {
+        return CheckLineControlStateTransitionAcrossEditBoundary(
+            boundary, component, mutation,
+            BuildLineControlStateRepairWitness(boundary, component, detail),
+            phase, detail, requireKnownObserver);
+      };
+
   auto parentReturnShouldDeferToConditionalJoin = [&]() -> bool {
     // If the include is materialized inside one arm of a preserved conditional
     // group and the first parent observer is after the group rejoins, an
@@ -2214,6 +2257,21 @@ RefoldEngine::WrapIncludeExpansionForMaterialization(
 
   auto appendChildEntryIfDemanded = [&]() {
     if (childNeedsLineState || childNeedsLayoutBarrier) {
+      const OwnerStateBoundary childEntryBoundary =
+          OwnerStateBoundary::FromSource(OwnerSourceRange::From(
+              childFileSpelling, 0, 0, std::optional<uint64_t>(child.id)));
+      forEachLineControlDemandComponent(
+          childDemand, childNeedsLayoutBarrier, [&](OwnerStateComponent component) {
+            const std::string detail =
+                llvm::formatv("synthetic include-entry #line for inc#{0} "
+                              "component={1} child='{2}'",
+                              child.id, toString(component), childFileSpelling)
+                    .str();
+            (void)checkLineControlRepair(
+                childEntryBoundary, component, StateMutationKind::Replayed,
+                "linedir/include-entry", detail,
+                /*requireKnownObserver=*/childNeedsLineState);
+          });
       appendSyntheticDirective(
           lineDirs_.FormatLineDirective(childEntryLineNo, childFileSpelling),
           FinalLineDirective::Origin::SyntheticIncludeEntry,
@@ -2237,6 +2295,24 @@ RefoldEngine::WrapIncludeExpansionForMaterialization(
               "conditional join must be repaired at the join", child.id);
         return;
       }
+      const OwnerStateBoundary parentReturnBoundary =
+          OwnerStateBoundary::FromSource(OwnerSourceRange::From(
+              parentOwnerFileForDemand, parentResumeOffset, parentResumeOffset,
+              parentOwnerIncludeId));
+      forEachLineControlDemandComponent(
+          parentDemand, /*includeLayoutLineState=*/false,
+          [&](OwnerStateComponent component) {
+            const std::string detail =
+                llvm::formatv("synthetic include-return #line for inc#{0} "
+                              "component={1} parent='{2}' byte={3}",
+                              child.id, toString(component),
+                              parentOwnerFileForDemand, parentResumeOffset)
+                    .str();
+            (void)checkLineControlRepair(
+                parentReturnBoundary, component, StateMutationKind::Replayed,
+                "linedir/include-return", detail,
+                /*requireKnownObserver=*/true);
+          });
       appendSyntheticDirective(
           lineDirs_.FormatLineDirective(parentResumeLineNo,
                                         parentFileSpelling),
@@ -2421,6 +2497,9 @@ void RefoldEngine::MaterializeIncludeExpansion(
     if (!sideband.SourceIsWithinOwnerBytes(static_cast<uint64_t>(bytes.size()))) {
       RequestTerminalFallback(
           TerminalFallbackKind::UndischargedEmissionArtifact,
+          MakeTerminalFallbackProofFailure(
+          TerminalFallbackObligationKind::PragmaBoundaryKnown,
+          TerminalFallbackFailureReason::UnknownPragmaCrossesBoundary),
           "pragma/sideband",
           llvm::formatv("header-owned sideband pragma edit has invalid range "
                         "inc#{0} path='{1}' site=[{2},{3}) headerSize={4}",
@@ -2513,6 +2592,41 @@ void RefoldEngine::MaterializeIncludeExpansion(
   // This makes replay stability a property of owner materialization itself,
   // rather than a special case of the test that motivated it.
   using MaterializedHeaderMacroStateDirectivePiece = MacroStateDirectiveLineInterval;
+
+  auto materializedHeaderMacroStateBoundary =
+      [&](uint64_t begin, uint64_t end) {
+        return OwnerStateBoundary::FromSource(OwnerSourceRange::From(
+            headerPath, begin, end, std::optional<uint64_t>(includeId)));
+      };
+
+  auto checkMaterializedHeaderMacroState =
+      [&](const OwnerStateBoundary &boundary, StateMutationKind mutation,
+          SuffixStabilityWitness witness, StringRef phase, StringRef detail,
+          bool requireKnownObserver) {
+        return CheckMacroStateTransitionAcrossEditBoundary(
+            boundary, mutation, std::move(witness), phase, detail,
+            requireKnownObserver);
+      };
+
+  auto failMaterializedHeaderMacroState =
+      [&](const OwnerStateBoundary &boundary, StateMutationKind mutation,
+          StringRef detail) {
+        return checkMaterializedHeaderMacroState(
+            boundary, mutation,
+            BuildMacroStateTerminalFailureWitness(boundary, detail),
+            "include/materialized-macro-state", detail,
+            /*requireKnownObserver=*/true);
+      };
+
+  auto widenMaterializedHeaderMacroState =
+      [&](const OwnerStateBoundary &boundary, StateMutationKind mutation,
+          StringRef detail) {
+        return checkMaterializedHeaderMacroState(
+            boundary, mutation,
+            BuildMacroStateClosureWideningWitness(boundary, detail),
+            "include/materialized-macro-state", detail,
+            /*requireKnownObserver=*/false);
+      };
 
   auto materializedHeaderReplacementObservesMacroStateDirective =
       [&](const RefoldModel::MacroDirective &directive, StringRef replacement,
@@ -2648,9 +2762,9 @@ void RefoldEngine::MaterializeIncludeExpansion(
     if (candidates.empty()) {
       if (!observedUncarriedDefinition)
         return std::nullopt;
-      RequestTerminalFallback(
-          TerminalFallbackKind::UndischargedEmissionArtifact,
-          "include/materialized-macro-state",
+      (void)failMaterializedHeaderMacroState(
+          materializedHeaderMacroStateBoundary(mp.invStart, mpEnd),
+          StateMutationKind::Materialized,
           llvm::formatv("include-owned macro patch in {0} observes active "
                         "header macro state before [{1},{2}) but no movable "
                         "definition line was proven",
@@ -2676,9 +2790,9 @@ void RefoldEngine::MaterializeIncludeExpansion(
     const uint64_t newEnd = materializedHeaderLineEndAfter(mpEnd);
     if (newStart > mp.invStart || newEnd < mpEnd || newEnd > bytes.size() ||
         materializedHeaderRangeOverlapsStagedEdit(newStart, newEnd)) {
-      RequestTerminalFallback(
-          TerminalFallbackKind::UndischargedEmissionArtifact,
-          "include/materialized-macro-state",
+      (void)failMaterializedHeaderMacroState(
+          materializedHeaderMacroStateBoundary(newStart, newEnd),
+          StateMutationKind::WidenedIntoClosure,
           llvm::formatv("include-owned macro patch in {0} cannot widen "
                         "macro-state repair interval [{1},{2})",
                         headerPath, newStart, newEnd)
@@ -2729,9 +2843,9 @@ void RefoldEngine::MaterializeIncludeExpansion(
       if (materializedHeaderSourceChunkObservesDefinitionWhenCrossed(
               *candidate.directive, candidate.name, StringRef(crossed),
               following)) {
-        RequestTerminalFallback(
-            TerminalFallbackKind::UndischargedEmissionArtifact,
-            "include/materialized-macro-state",
+        (void)failMaterializedHeaderMacroState(
+            materializedHeaderMacroStateBoundary(candidate.begin, candidate.end),
+            StateMutationKind::MovedLater,
             llvm::formatv("include-owned macro patch in {0} cannot carry "
                           "#{1} for '{2}' across observing header source",
                           headerPath, candidate.directive->id, candidate.name)
@@ -2758,9 +2872,9 @@ void RefoldEngine::MaterializeIncludeExpansion(
     for (const auto &candidate : candidates) {
       if (!isCarriedDirectiveInterval(candidate.begin, candidate.end) ||
           cursor > candidate.begin) {
-        RequestTerminalFallback(
-            TerminalFallbackKind::UndischargedEmissionArtifact,
-            "include/materialized-macro-state",
+        (void)failMaterializedHeaderMacroState(
+            materializedHeaderMacroStateBoundary(newStart, newEnd),
+            StateMutationKind::MovedLater,
             llvm::formatv("include-owned macro patch in {0} found invalid "
                           "carried directive ordering",
                           headerPath)
@@ -2780,6 +2894,18 @@ void RefoldEngine::MaterializeIncludeExpansion(
                          candidate.directive->text.end());
       if (replacement.empty() || replacement.back() != '\n')
         replacement.push_back('\n');
+    }
+
+    for (const auto &candidate : candidates) {
+      (void)widenMaterializedHeaderMacroState(
+          materializedHeaderMacroStateBoundary(candidate.begin, candidate.end),
+          StateMutationKind::MovedLater,
+          llvm::formatv(
+              "include-owned macro patch in {0} carries #define #{1} for "
+              "'{2}' after replay interval [{3},{4})",
+              headerPath, candidate.directive->id, candidate.name, newStart,
+              newEnd)
+              .str());
     }
 
     trace("include/mat",
@@ -4856,10 +4982,10 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         // boundary token and the next copied owner token.  Only a source
         // line-control directive makes this token tie semantically observable
         // for placement; otherwise the normal token-envelope insertion is fine.
-        std::optional<uint64_t> leftEnd = ByteEndForPPInFile(
-            file, materialAStart, /*fallbackToEOF=*/false, fileLen);
-        std::optional<uint64_t> rightBegin = ByteStartForPPInFile(
-            file, *nextOwnerPP, /*fallbackToEOF=*/false, fileLen);
+        std::optional<uint64_t> leftEnd =
+            ByteEndForPPInFile(file, materialAStart);
+        std::optional<uint64_t> rightBegin =
+            ByteStartForPPInFile(file, *nextOwnerPP);
         if (!leftEnd || !rightBegin || *rightBegin < *leftEnd)
           return;
         if (!sourceIntervalContainsLineControlDirective(*leftEnd, *rightBegin))
@@ -5185,9 +5311,11 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
 
       {
         // First try the strongest insertion anchors: boundaries already tied to
-        // the selected conditional arm or to a child include boundary. These
-        // anchors preserve include structure without relying on neighboring PP
-        // tokens.
+        // the selected conditional arm or to a child include boundary. Phase 8d
+        // classifies the child-boundary case as a declared include-preserving
+        // proof, not as a rescue path: the witness names the direct child
+        // include whose spelled directive supplies the anchor. These anchors
+        // preserve include structure without relying on neighboring PP tokens.
         SmallVector<InsertAnchorCandidate, 2> topTierCandidates;
 
         if (const std::optional<uint64_t> insertByte =
@@ -5246,8 +5374,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
 
       if (rightAnchorPP) {
         const std::optional<uint64_t> rightStartByte =
-            ByteStartForPPInFile(file, *rightAnchorPP,
-                                 /* fallbackToEOF */ false, fileLen);
+            ByteStartForPPInFile(file, *rightAnchorPP);
         IncludeAnchorWitness rightNeighborWitness;
         rightNeighborWitness.evidence =
             IncludeAnchorEvidenceKind::RightNeighborPP;
@@ -5283,9 +5410,11 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       }
 
       // Right-neighbor anchoring is preferred because it naturally inserts
-      // before the next stable token. If unavailable, collect weaker fallback
-      // anchors: the nearest mapped left neighbor, or the containing
-      // declaration boundary when no neighbor exists.
+      // before the next stable token. If unavailable, collect secondary
+      // include-preserving anchors: the nearest mapped left neighbor, or the
+      // containing declaration boundary when no neighbor exists. These are not
+      // source-mapping fallbacks; each candidate still needs a concrete witness
+      // before it can be selected.
       std::optional<uint64_t> leftAnchorPP;
       if (pos > ppLo && ppHi > ppLo) {
         for (uint64_t pp = std::min(pos - 1, ppHi - 1);; --pp) {
@@ -5299,11 +5428,17 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         }
       }
 
-      SmallVector<InsertAnchorCandidate, 2> fallbackCandidates;
+      SmallVector<InsertAnchorCandidate, 2> secondaryCandidates;
       if (leftAnchorPP) {
         const std::optional<uint64_t> leftStartByte =
-            ByteEndForPPInFile(file, *leftAnchorPP, false, fileLen);
+            ByteEndForPPInFile(file, *leftAnchorPP);
         const bool insertionAtIncludeEOF = pos >= ppHi;
+        // Phase 8g classification: an insertion at the include cover end is an
+        // explicit left-neighbor EOF anchor, not an unmapped PP->EOF source
+        // projection.  The proof still requires `leftAnchorPP` to map into this
+        // file; only after that mapped neighbor establishes owner-local suffix
+        // placement do we use the physical file length as the concrete byte
+        // anchor for the zero-width EOF insertion.
         const std::optional<uint64_t> leftAnchorByte =
             leftStartByte ? std::optional<uint64_t>(
                                 insertionAtIncludeEOF ? fileLen
@@ -5337,12 +5472,13 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
           candidate.anchorByte = *leftAnchorByte;
           candidate.witness = leftNeighborWitness;
           traceInsertCandidate(candidate, "left-neighbor");
-          fallbackCandidates.push_back(std::move(candidate));
+          secondaryCandidates.push_back(std::move(candidate));
         }
       } else if (decl) {
-        // With no mapped PP neighbor, fall back to the declaration boundary
-        // that owns this patch. This keeps the insertion local to the header
-        // declaration instead of widening immediately to include realization.
+        // With no mapped PP neighbor, use the declaration boundary that owns
+        // this patch. This keeps the insertion local to the header declaration
+        // only when the declaration witness discharges; otherwise the caller
+        // widens to include realization.
         const uint64_t declAnchorByte =
             std::clamp<uint64_t>(decl->headerE, 0ULL, fileLen);
         IncludeAnchorWitness declWitness;
@@ -5364,11 +5500,11 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
           candidate.anchorByte = declAnchorByte;
           candidate.witness = declWitness;
           traceInsertCandidate(candidate, "decl-boundary");
-          fallbackCandidates.push_back(std::move(candidate));
+          secondaryCandidates.push_back(std::move(candidate));
         }
       }
 
-      if (auto selected = selectBestInsertCandidate(fallbackCandidates)) {
+      if (auto selected = selectBestInsertCandidate(secondaryCandidates)) {
         commitInsertCandidate(*selected);
         continue;
       }
@@ -5434,10 +5570,9 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
       // Convert the mapped PP-token endpoints to a closed source byte envelope
       // in the header. The witness records both the PP-token evidence and the
       // resolved byte range so proof discharge can validate this include edit.
-      startByte = ByteStartForPPInFile(file, *firstPP,
-                                       /*fallbackToEOF=*/false, fileLen);
+      startByte = ByteStartForPPInFile(file, *firstPP);
       endByte =
-          ByteEndForPPInFile(file, *lastPP, /*fallbackToEOF=*/false, fileLen);
+          ByteEndForPPInFile(file, *lastPP);
       mappedHeaderWitness.evidence =
           IncludeAnchorEvidenceKind::MappedHeaderTokens;
       mappedHeaderWitness.hasFirstPP = firstPP.has_value();
@@ -5498,12 +5633,10 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         if (it == tokmapByPP.end() || !PathsEqual(it->second.file, file))
           continue;
 
-        // Refuse fallback-to-EOF anchors here: widening across header source
-        // pieces needs precise token byte bounds on both sides of each gap.
-        std::optional<uint64_t> tokBegin = ByteStartForPPInFile(
-            file, pp, /*fallbackToEOF=*/false, fileLen);
-        std::optional<uint64_t> tokEnd = ByteEndForPPInFile(
-            file, pp, /*fallbackToEOF=*/false, fileLen);
+        // Require exact token byte bounds here: widening across header source
+        // pieces needs precise endpoints on both sides of each gap.
+        std::optional<uint64_t> tokBegin = ByteStartForPPInFile(file, pp);
+        std::optional<uint64_t> tokEnd = ByteEndForPPInFile(file, pp);
         if (!tokBegin || !tokEnd || *tokBegin >= *tokEnd) {
           hunkSourcePieces.clear();
           break;
@@ -5734,7 +5867,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                     [&](const RefoldModel::PragmaDirective &pragma) {
                       return PathsEqual(pragma.sitePath, file);
                     },
-                    pragmaIslands);
+                    pragmaIslands, lexLang_);
                 for (const BalancedDiagnosticPragmaStateIsland &island :
                      pragmaIslands) {
                   HeaderPreservedGapPiece piece;
@@ -6127,7 +6260,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         if (piece.kind ==
                 HeaderPreservedGapPiece::Kind::BalancedPragmaStateIsland &&
             balancedDiagnosticPragmaStateIslandIsCarriedByReplacement(
-                StringRef(pieceText), StringRef(replacement))) {
+                StringRef(pieceText), StringRef(replacement), lexLang_)) {
           trace("include/apply",
                 "file={0} patch[{1}] balanced pragma-state island id={2} "
                 "source=[{3},{4}) already carried by B replacement",
@@ -6172,6 +6305,28 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
               FinalLineDirective::Origin::SyntheticSourceLineResume,
               FinalLineControlOwnerKey(file, ie.include->id),
               "synthetic header source-line resume candidate from consumed #line gap"));
+
+      const OwnerStateBoundary sourceLineResumeBoundary =
+          OwnerStateBoundary::FromSource(OwnerSourceRange::From(
+              file, *endByte, *endByte,
+              std::optional<uint64_t>(ie.include->id)));
+      auto checkHeaderSourceLineResume = [&](OwnerStateComponent component) {
+        const std::string detail =
+            llvm::formatv("synthetic header source #line resume for include "
+                          "#{0} patch[{1}] component={2} sourceEnd={3}",
+                          ie.include->id, idx, toString(component), *endByte)
+                .str();
+        (void)CheckLineControlStateTransitionAcrossEditBoundary(
+            sourceLineResumeBoundary, component, StateMutationKind::Replayed,
+            BuildLineControlStateRepairWitness(sourceLineResumeBoundary,
+                                               component, detail),
+            "include/source-line-resume", detail,
+            /*requireKnownObserver=*/false);
+      };
+      checkHeaderSourceLineResume(OwnerStateComponent::LineNumber);
+      checkHeaderSourceLineResume(OwnerStateComponent::FileState);
+      checkHeaderSourceLineResume(OwnerStateComponent::FileName);
+
       trace("include/apply",
             "file={0} patch[{1}] emitted source #line resume line={2} "
             "resumeFile={3}",
@@ -6264,6 +6419,13 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
 std::optional<uint64_t> RefoldEngine::ComputeChildBoundaryInsertByte(
     const IncludePatch &p, StringRef file,
     IncludeAnchorWitness *witness) const {
+  // Phase 8d classification: this is the declared
+  // IncludeInsertionByChildBoundary proof. It is intentionally narrow: a
+  // parent-owned pure insertion may anchor at a preserved direct child include
+  // only when the PP gap equals exactly one child cover boundary. Anything
+  // inside a child cover belongs to the child owner, and any ambiguous sibling
+  // boundary fails closed instead of guessing.
+  //
   // Child-boundary anchoring only applies to patches owned by a concrete parent
   // include. Without that owner, there is no child include set to inspect.
   const RefoldModel::IncludeItem *owner = p.include;
@@ -6381,13 +6543,48 @@ RefoldEngine::ApplyResyncOrPend(
   // the file component, which newline drift alone does not change.
   LineStateObserverDemand demand = OwnerSuffixLineStateObserverDemand(
       ownerIncludeId, fileSpellingForDirective, end);
+  const OwnerStateBoundary suffixBoundary =
+      OwnerStateBoundary::FromSource(OwnerSourceRange::From(
+          fileSpellingForDirective, end, end, ownerIncludeId));
   const bool resyncPruneEligible =
       demand.PrunableByCurrentFinalObserverModel();
+
+  auto checkLineControlStateWithWitness =
+      [&](OwnerStateComponent component, StateMutationKind mutation,
+          SuffixStabilityWitness witness, StringRef detail,
+          bool requireKnownObserver) {
+        return CheckLineControlStateTransitionAcrossEditBoundary(
+            suffixBoundary, component, mutation, std::move(witness),
+            "linedir/resync", detail, requireKnownObserver);
+      };
+
+  auto checkLineControlStateRepaired =
+      [&](OwnerStateComponent component, StateMutationKind mutation,
+          StringRef detail, bool requireKnownObserver = false) {
+        return checkLineControlStateWithWitness(
+            component, mutation,
+            BuildLineControlStateRepairWitness(suffixBoundary, component,
+                                               detail),
+            detail, requireKnownObserver);
+      };
+
+  auto checkLineControlStateTerminal =
+      [&](OwnerStateComponent component, StateMutationKind mutation,
+          StringRef detail, bool requireKnownObserver = true) {
+        return checkLineControlStateWithWitness(
+            component, mutation,
+            BuildLineControlStateTerminalFailureWitness(suffixBoundary,
+                                                        component, detail),
+            detail, requireKnownObserver);
+      };
+
   if (!demand.needsLine) {
     trace("linedir/resync",
           "SKIP synthetic resync: newline drift span=[{0},{1}) has no "
-          "preserved __LINE__ observer in owner suffix (fileObserver={2})",
-          start, end, demand.needsFile ? "YES" : "NO");
+          "preserved __LINE__ observer in owner suffix "
+          "(fileObserver={2} fileNameObserver={3})",
+          start, end, demand.needsFile ? "YES" : "NO",
+          demand.needsFileName ? "YES" : "NO");
     return ResyncOutcome(replacement.str(), std::nullopt);
   }
 
@@ -6412,14 +6609,15 @@ RefoldEngine::ApplyResyncOrPend(
     if (resumeLoc.unprovenLineControlDirectiveOffset &&
         *resumeLoc.unprovenLineControlDirectiveOffset >= start &&
         *resumeLoc.unprovenLineControlDirectiveOffset < end) {
-      RequestTerminalFallback(
-          TerminalFallbackKind::UndischargedEmissionArtifact, "linedir/resync",
+      (void)checkLineControlStateTerminal(
+          OwnerStateComponent::LineNumber, StateMutationKind::Consumed,
           llvm::formatv(
               "newline-drift replacement consumes unmodeled source #line "
               "directive at byte {0} in owner '{1}'",
               *resumeLoc.unprovenLineControlDirectiveOffset,
               fileSpellingForDirective)
-              .str());
+              .str(),
+          /*requireKnownObserver=*/true);
       return ResyncOutcome(replacement.str(), std::nullopt);
     }
 
@@ -6449,6 +6647,13 @@ RefoldEngine::ApplyResyncOrPend(
           "defer newline resync to conditional join: resumeLine={0} file={1} "
           "at byte={2}",
           resumeLoc.lineNo, resumeLoc.fileSpelling, end);
+    (void)checkLineControlStateRepaired(
+        OwnerStateComponent::LineNumber, StateMutationKind::MovedLater,
+        llvm::formatv("deferred synthetic #line repair for newline drift at "
+                      "owner byte {0}",
+                      end)
+            .str(),
+        /*requireKnownObserver=*/false);
     return ResyncOutcome{
         replacement.str(),
         PendingResync{fileSpellingForDirective, ownerIncludeId,
@@ -6467,6 +6672,13 @@ RefoldEngine::ApplyResyncOrPend(
   if (injected != replacement) {
     trace("linedir/resync", "local inject succeeded: resumeLine={0} file={1}",
           resumeLoc.lineNo, resumeLoc.fileSpelling);
+    (void)checkLineControlStateRepaired(
+        OwnerStateComponent::LineNumber, StateMutationKind::Replayed,
+        llvm::formatv("local synthetic #line repair for newline drift at "
+                      "owner byte {0}",
+                      end)
+            .str(),
+        /*requireKnownObserver=*/false);
 
     std::vector<FinalLineControlPruneCandidate> candidates;
     if (resyncPruneEligible) {
@@ -6499,6 +6711,13 @@ RefoldEngine::ApplyResyncOrPend(
   trace("linedir/resync",
         "local inject failed -> PENDING: resumeLine={0} file={1}",
         resumeLoc.lineNo, resumeLoc.fileSpelling);
+  (void)checkLineControlStateRepaired(
+      OwnerStateComponent::LineNumber, StateMutationKind::MovedLater,
+      llvm::formatv("pending synthetic #line repair for newline drift at "
+                    "owner byte {0}",
+                    end)
+          .str(),
+      /*requireKnownObserver=*/false);
 
   return ResyncOutcome{
       replacement.str(),
@@ -6513,6 +6732,28 @@ void RefoldEngine::AttachAcceptedResultCarrier(
       std::make_shared<AcceptedResultCandidate>(candidate));
 }
 
+bool RefoldEngine::AuditAcceptedEditProofs(ArrayRef<TextEdit> edits,
+                                          StringRef emissionPhase,
+                                          StringRef emissionOwner) const {
+  // Phase 1F centralizes the final accepted-proof audit at the last byte-edit
+  // boundary.  Earlier builders may still stage candidates path-by-path, but
+  // once the normalized edit set is known the applicator must see a theorem
+  // carrier for every emitted edit and a composition law for every multi-carrier
+  // edit.  Phase 5L layers the state-transition audit onto the same boundary:
+  // any edit path that already routed state through the gateway must have a
+  // typed, component-named suffix-stability witness or a named terminal failure
+  // before non-terminal bytes can be emitted.
+  if (!AuditStateTransitionGatewayProofs(emissionPhase, emissionOwner))
+    return false;
+
+  for (const TextEdit &edit : edits) {
+    if (!EmittedTextEditHasDischargedAcceptedResults(edit, emissionPhase,
+                                                     emissionOwner))
+      return false;
+  }
+  return true;
+}
+
 bool RefoldEngine::EmittedTextEditHasDischargedAcceptedResults(
     const TextEdit &edit, StringRef emissionPhase,
     StringRef emissionOwner) const {
@@ -6524,9 +6765,10 @@ bool RefoldEngine::EmittedTextEditHasDischargedAcceptedResults(
       [&](const AcceptedResultCandidate &carrier) -> bool {
     ++lastTheoremAudit_.emittedCarriers;
 
-    // Emitted byte edits must be backed by ordinary in-domain accepted results.
-    // Unknown carriers and explicit terminal/out-of-domain carriers are never
-    // valid on a non-terminal edit.
+    // Non-terminal byte edits must never carry terminal/out-of-domain results.
+    // After these structural exclusions, the single Phase-1C normalizer is the
+    // only authority for deciding whether the candidate's construction path and
+    // proof-family metadata discharge one final theorem proof class.
     if (carrier.kind == AcceptedResultCandidateKind::Unknown) {
       ++lastTheoremAudit_.emittedUnknownClassCarriers;
       NoteTheoremAuditViolation("emitted carrier had unknown candidate kind");
@@ -6538,57 +6780,40 @@ bool RefoldEngine::EmittedTextEditHasDischargedAcceptedResults(
           "non-terminal emitted edit carried explicit out-of-domain result");
       return false;
     }
-    if (carrier.proofSummary.acceptedClass == AcceptedProofClass::Unknown) {
-      ++lastTheoremAudit_.emittedUnknownClassCarriers;
-      NoteTheoremAuditViolation(
-          "emitted carrier did not belong to a declared accepted proof class");
-      return false;
-    }
-    ++lastTheoremAudit_.emittedDeclaredClassCarriers;
 
-    // Transitional-gap states must be eliminated before emission. This check
-    // fail-closes any carrier that is not explicitly proof-backed or still
-    // reports a transitional theorem/completeness domain, even if earlier
-    // selection code allowed it to reach the edit boundary.
-    if (carrier.proofSummary.inventory.support !=
-            AcceptanceSupportKind::ExplicitProofBacked ||
-        carrier.proofSummary.theoremDomain.kind ==
-            TheoremDomainKind::TransitionalGap ||
-        carrier.proofSummary.completeness.coverage ==
-            CompletenessCoverageKind::TransitionalGap) {
-      ++lastTheoremAudit_.emittedTransitionalTheoremCarriers;
+    const std::optional<TheoremProofClass> theoremProof =
+        NormalizeAcceptedProof(carrier);
+    if (!theoremProof) {
+      if (carrier.proofSummary.acceptedClass == AcceptedProofClass::Unknown) {
+        ++lastTheoremAudit_.emittedUnknownClassCarriers;
+        NoteTheoremAuditViolation(
+            "emitted carrier did not normalize to a declared theorem proof "
+            "class");
+      } else if (carrier.proofSummary.inventory.support !=
+                     AcceptanceSupportKind::ExplicitProofBacked ||
+                 carrier.proofSummary.theoremDomain.kind ==
+                     TheoremDomainKind::TransitionalGap ||
+                 carrier.proofSummary.completeness.coverage ==
+                     CompletenessCoverageKind::TransitionalGap) {
+        ++lastTheoremAudit_.emittedTransitionalTheoremCarriers;
+        NoteTheoremAuditViolation(
+            "emitted carrier remained transitional at the byte-edit boundary");
+      } else {
+        NoteTheoremAuditViolation(
+            "emitted carrier failed Phase-1 proof normalization at the "
+            "byte-edit boundary");
+      }
       ++lastTheoremAudit_.emittedUndischargedCarriers;
-      NoteTheoremAuditViolation(
-          "emitted carrier remained transitional at the byte-edit boundary");
       return false;
     }
 
-    // The carrier must describe a declared in-domain proof class, not merely a
-    // syntactically classified candidate. This is the theorem-domain gate for
-    // emitted non-terminal edits.
-    if (carrier.proofSummary.theoremDomain.kind !=
-            TheoremDomainKind::DeclaredInDomainClass ||
-        !carrier.proofSummary.theoremDomain.inDeclaredDomain ||
-        carrier.proofSummary.completeness.coverage !=
-            CompletenessCoverageKind::DeclaredProofClass) {
-      ++lastTheoremAudit_.emittedOutOfDomainCarriers;
-      NoteTheoremAuditViolation("emitted carrier was not theorem-domain "
-                                "in-domain at the byte-edit boundary");
-      return false;
-    }
-
-    // Finally require the local validator for this accepted-result class to
-    // have discharged all obligations.
-    if (carrier.proofSummary.discharge.status ==
-        ProofDischargeStatus::Discharged) {
-      ++lastTheoremAudit_.emittedDischargedCarriers;
-      return true;
-    }
-
-    ++lastTheoremAudit_.emittedUndischargedCarriers;
-    NoteTheoremAuditViolation("emitted carrier failed local proof discharge at "
-                              "the byte-edit boundary");
-    return false;
+    ++lastTheoremAudit_.emittedDeclaredClassCarriers;
+    ++lastTheoremAudit_.emittedDischargedCarriers;
+    trace("proof/normalize",
+          "emitted carrier normalized theoremProof={0} kind={1} path={2}",
+          *theoremProof, carrier.kind,
+          carrier.proofSummary.inventory.currentPath);
+    return true;
   };
 
   // Every emitted non-terminal edit must carry at least one selected
@@ -6598,7 +6823,10 @@ bool RefoldEngine::EmittedTextEditHasDischargedAcceptedResults(
     NoteTheoremAuditViolation("emitted edit reached the byte-edit boundary "
                               "without accepted-result carriers");
     RequestTerminalFallback(
-        TerminalFallbackKind::UndischargedEmissionArtifact, emissionPhase,
+        TerminalFallbackKind::UndischargedEmissionArtifact,
+        MakeTerminalFallbackProofFailure(
+        TerminalFallbackObligationKind::EmissionArtifactDischarged,
+        TerminalFallbackFailureReason::UndischargedEmissionArtifact), emissionPhase,
         llvm::formatv("emitted edit bytes=[{0},{1}) in {2} has no normalized "
                       "accepted-result carriers",
                       edit.start, edit.end, owner)
@@ -6616,7 +6844,10 @@ bool RefoldEngine::EmittedTextEditHasDischargedAcceptedResults(
       NoteTheoremAuditViolation(
           "emitted edit carried a null accepted-result carrier");
       RequestTerminalFallback(
-          TerminalFallbackKind::UndischargedEmissionArtifact, emissionPhase,
+          TerminalFallbackKind::UndischargedEmissionArtifact,
+          MakeTerminalFallbackProofFailure(
+        TerminalFallbackObligationKind::EmissionArtifactDischarged,
+        TerminalFallbackFailureReason::UndischargedEmissionArtifact), emissionPhase,
           llvm::formatv("emitted edit bytes=[{0},{1}) in {2} has null "
                         "accepted-result carrier #{3}",
                         edit.start, edit.end, owner, i)
@@ -6626,7 +6857,10 @@ bool RefoldEngine::EmittedTextEditHasDischargedAcceptedResults(
 
     if (!carrierIsEmissionDischarged(*carrier)) {
       RequestTerminalFallback(
-          TerminalFallbackKind::UndischargedEmissionArtifact, emissionPhase,
+          TerminalFallbackKind::UndischargedEmissionArtifact,
+          MakeTerminalFallbackProofFailure(
+        TerminalFallbackObligationKind::EmissionArtifactDischarged,
+        TerminalFallbackFailureReason::UndischargedEmissionArtifact), emissionPhase,
           llvm::formatv("emitted edit bytes=[{0},{1}) in {2} carries "
                         "non-discharged result #{3}: {4}",
                         edit.start, edit.end, owner, i,
@@ -6636,6 +6870,245 @@ bool RefoldEngine::EmittedTextEditHasDischargedAcceptedResults(
     }
   }
 
+  return EmittedTextEditHasOrderedAcceptedProofComposition(
+      edit, emissionPhase, emissionOwner);
+}
+
+bool RefoldEngine::EmittedTextEditHasOrderedAcceptedProofComposition(
+    const TextEdit &edit, StringRef emissionPhase,
+    StringRef emissionOwner) const {
+  if (edit.acceptedResults.size() <= 1)
+    return true;
+
+  ++lastTheoremAudit_.emittedCompositeEdits;
+
+  enum class CarrierSpanDomain : uint8_t { AToken, TUByte };
+  struct CarrierSpan {
+    CarrierSpanDomain domain;
+    uint64_t begin = 0;
+    uint64_t end = 0;
+    size_t carrierIndex = 0;
+    TheoremProofClass theoremProof = TheoremProofClass::Unknown;
+  };
+
+  auto domainName = [](CarrierSpanDomain domain) -> StringRef {
+    switch (domain) {
+    case CarrierSpanDomain::AToken:
+      return "AToken";
+    case CarrierSpanDomain::TUByte:
+      return "TUByte";
+    }
+    return "Unknown";
+  };
+
+  const StringRef owner =
+      emissionOwner.empty() ? StringRef("<unknown>") : emissionOwner;
+
+  auto failComposition = [&](StringRef detail) -> bool {
+    ++lastTheoremAudit_.emittedUncomposedCompositeEdits;
+    NoteTheoremAuditViolation(detail);
+    RequestTerminalFallback(
+        TerminalFallbackKind::UndischargedEmissionArtifact,
+        MakeTerminalFallbackProofFailure(
+            TerminalFallbackObligationKind::EmissionArtifactDischarged,
+            TerminalFallbackFailureReason::UndischargedEmissionArtifact),
+        emissionPhase,
+        llvm::formatv("emitted composite edit bytes=[{0},{1}) in {2}: {3}",
+                      edit.start, edit.end, owner, detail)
+            .str());
+    return false;
+  };
+
+  auto extractSpan = [&](const AcceptedResultCandidate &carrier,
+                         size_t carrierIndex,
+                         TheoremProofClass theoremProof)
+      -> std::optional<CarrierSpan> {
+    CarrierSpan span;
+    span.carrierIndex = carrierIndex;
+    span.theoremProof = theoremProof;
+
+    switch (carrier.kind) {
+    case AcceptedResultCandidateKind::MacroPatch:
+    case AcceptedResultCandidateKind::IncludePatch:
+      // Macro and include carriers record A-side preprocessed-token envelopes.
+      // They are comparable to one another for proof-composition purposes, but
+      // not to the physical byte range of the final TextEdit.
+      span.domain = CarrierSpanDomain::AToken;
+      span.begin = carrier.begin;
+      span.end = carrier.end;
+      break;
+
+    case AcceptedResultCandidateKind::TUAnchor:
+      if (carrier.proofSummary.hasTUAnchorWitness &&
+          carrier.proofSummary.tuAnchorWitness.hasPPGap) {
+        span.domain = CarrierSpanDomain::AToken;
+        span.begin = span.end = carrier.proofSummary.tuAnchorWitness.ppGap;
+      } else if (carrier.hasAnchorByte) {
+        span.domain = CarrierSpanDomain::TUByte;
+        span.begin = span.end = carrier.anchorByte;
+      } else {
+        return std::nullopt;
+      }
+      break;
+
+    case AcceptedResultCandidateKind::TUTextEdit:
+      span.domain = CarrierSpanDomain::TUByte;
+      span.begin = carrier.begin;
+      span.end = carrier.end;
+      break;
+
+    case AcceptedResultCandidateKind::TerminalOutOfDomain:
+    case AcceptedResultCandidateKind::Unknown:
+      return std::nullopt;
+    }
+
+    if (span.end < span.begin)
+      return std::nullopt;
+    return span;
+  };
+
+  SmallVector<CarrierSpan, 8> spans;
+  spans.reserve(edit.acceptedResults.size());
+  for (size_t i = 0; i < edit.acceptedResults.size(); ++i) {
+    const std::shared_ptr<const AcceptedResultCandidate> &carrierPtr =
+        edit.acceptedResults[i];
+    if (!carrierPtr)
+      return failComposition("composite edit carried a null proof segment");
+
+    const std::optional<TheoremProofClass> theoremProof =
+        NormalizeAcceptedProof(*carrierPtr);
+    if (!theoremProof)
+      return failComposition(
+          "composite edit contained a carrier that did not normalize");
+
+    std::optional<CarrierSpan> span =
+        extractSpan(*carrierPtr, i, *theoremProof);
+    if (!span)
+      return failComposition(
+          llvm::formatv("composite carrier #{0} had no comparable proof span: {1}",
+                        i, FormatAcceptedResultCandidate(*carrierPtr))
+              .str());
+    spans.push_back(*span);
+  }
+
+  // Several construction paths can converge on the exact same concrete source
+  // surface.  Those carriers are equivalent witnesses for one segment rather
+  // than a sequence of multiple segments, so no ordering/gap proof is needed.
+  bool sameSurface = true;
+  for (size_t i = 1; i < spans.size(); ++i) {
+    if (spans[i].domain != spans[0].domain ||
+        spans[i].begin != spans[0].begin || spans[i].end != spans[0].end) {
+      sameSurface = false;
+      break;
+    }
+  }
+  if (sameSurface) {
+    ++lastTheoremAudit_.emittedEquivalentCompositeEdits;
+    trace("proof/compose",
+          "composite edit bytes=[{0},{1}) in {2} has {3} equivalent "
+          "proof carriers over {4}[{5},{6})",
+          edit.start, edit.end, owner, spans.size(), domainName(spans[0].domain),
+          spans[0].begin, spans[0].end);
+    return true;
+  }
+
+  // Duplicate physical edits can merge a TU-byte carrier with owner-local
+  // A-token carriers.  When one normalized carrier proves the exact physical
+  // emitted byte surface, the non-TU carriers are redundant witnesses rather
+  // than additional ordered segments.  This preserves existing deterministic
+  // duplicate-edit behavior without treating cross-domain carrier order as a
+  // proof.
+  for (const CarrierSpan &span : spans) {
+    if (span.domain == CarrierSpanDomain::TUByte && span.begin == edit.start &&
+        span.end == edit.end) {
+      ++lastTheoremAudit_.emittedEquivalentCompositeEdits;
+      trace("proof/compose",
+            "composite edit bytes=[{0},{1}) in {2} is dominated by carrier "
+            "#{3} theoremProof={4} over TUByte[{5},{6}); {7} auxiliary "
+            "carriers remain individually discharged",
+            edit.start, edit.end, owner, span.carrierIndex, span.theoremProof,
+            span.begin, span.end, spans.size() - 1);
+      return true;
+    }
+  }
+
+  // Same-point insertion composition consumes no A-side bytes/tokens.  Multiple
+  // zero-width carriers may therefore share one physical insertion edit without
+  // needing an inter-segment source-gap proof; the emitted text order was fixed
+  // by the duplicate-insertion merge that built this TextEdit.
+  const bool allZeroWidth = llvm::all_of(spans, [](const CarrierSpan &span) {
+    return span.begin == span.end;
+  });
+  if (allZeroWidth && edit.start == edit.end) {
+    ++lastTheoremAudit_.emittedEquivalentCompositeEdits;
+    trace("proof/compose",
+          "composite insertion edit bytes=[{0},{1}) in {2} has {3} "
+          "zero-width proof carriers",
+          edit.start, edit.end, owner, spans.size());
+    return true;
+  }
+
+  // Ordered segment composition is only meaningful inside one coordinate space.
+  // Mixing A-token carriers with TU-byte carriers would require a separate
+  // cross-domain owner-closure witness, so Phase 1D rejects that composition
+  // instead of silently treating the carrier vector as an unordered bag.
+  for (size_t i = 1; i < spans.size(); ++i) {
+    if (spans[i].domain != spans[0].domain) {
+      return failComposition(
+          llvm::formatv("carrier #{0} uses {1} coordinates after {2} coordinates; "
+                        "no cross-domain composition witness is attached",
+                        spans[i].carrierIndex, domainName(spans[i].domain),
+                        domainName(spans[0].domain))
+              .str());
+    }
+  }
+
+  // The carrier list itself must be ordered.  Sorting here would hide a missing
+  // construction proof, so the audit checks the preserved order and rejects
+  // overlaps or non-empty source gaps.  Later state-gap phases can relax the
+  // gap rule by attaching typed state-closed gap witnesses.
+  for (size_t i = 1; i < spans.size(); ++i) {
+    const CarrierSpan &prev = spans[i - 1];
+    const CarrierSpan &cur = spans[i];
+    if (cur.begin < prev.end) {
+      return failComposition(
+          llvm::formatv("carrier #{0} span {1}[{2},{3}) overlaps previous "
+                        "carrier #{4} span {1}[{5},{6})",
+                        cur.carrierIndex, domainName(cur.domain), cur.begin,
+                        cur.end, prev.carrierIndex, prev.begin, prev.end)
+              .str());
+    }
+    if (cur.begin > prev.end) {
+      return failComposition(
+          llvm::formatv("carrier #{0} span {1}[{2},{3}) leaves non-empty "
+                        "unproved gap after carrier #{4} span {1}[{5},{6}); "
+                        "Phase 1D admits only empty gaps until state-gap "
+                        "witnesses are available",
+                        cur.carrierIndex, domainName(cur.domain), cur.begin,
+                        cur.end, prev.carrierIndex, prev.begin, prev.end)
+              .str());
+    }
+  }
+
+  // If the carrier coordinates are physical TU bytes, they must tile the actual
+  // source interval being emitted.  A-token carriers prove their own PP envelope
+  // through the normalized per-carrier proof; the final TextEdit byte span is a
+  // separately mapped owner surface and is not directly comparable here.
+  if (spans[0].domain == CarrierSpanDomain::TUByte &&
+      (spans.front().begin != edit.start || spans.back().end != edit.end)) {
+    return failComposition(
+        llvm::formatv("TU-byte composite carriers tile [{0},{1}) but emitted "
+                      "edit covers [{2},{3})",
+                      spans.front().begin, spans.back().end, edit.start,
+                      edit.end)
+            .str());
+  }
+
+  ++lastTheoremAudit_.emittedOrderedCompositeEdits;
+  trace("proof/compose",
+        "composite edit bytes=[{0},{1}) in {2} has {3} ordered contiguous "
+        "proof segments in {4} coordinates",
+        edit.start, edit.end, owner, spans.size(), domainName(spans[0].domain));
   return true;
 }
 
@@ -7168,7 +7641,10 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
       }
 
       RequestTerminalFallback(
-          TerminalFallbackKind::UndischargedEmissionArtifact, "edits/apply",
+          TerminalFallbackKind::UndischargedEmissionArtifact,
+          MakeTerminalFallbackProofFailure(
+          TerminalFallbackObligationKind::EmissionEditSetComposable,
+          TerminalFallbackFailureReason::UncomposableEmissionEditSet), "edits/apply",
           llvm::formatv(
               "conflicting duplicate non-zero edits for span [{0},{1}) in {2}",
               s, t, emissionOwner)
@@ -7198,7 +7674,10 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
       if (merged.expandedMacroRootId && dup.expandedMacroRootId &&
           *merged.expandedMacroRootId != *dup.expandedMacroRootId) {
         RequestTerminalFallback(
-            TerminalFallbackKind::UndischargedEmissionArtifact, "edits/apply",
+            TerminalFallbackKind::UndischargedEmissionArtifact,
+            MakeTerminalFallbackProofFailure(
+          TerminalFallbackObligationKind::EmissionEditSetComposable,
+          TerminalFallbackFailureReason::UncomposableEmissionEditSet), "edits/apply",
             llvm::formatv("duplicate non-zero edits for span [{0},{1}) in {2} "
                           "carry incompatible expanded macro roots {3} and {4}",
                           s, t, emissionOwner, *merged.expandedMacroRootId,
@@ -7249,7 +7728,10 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
 
     if (mergedBRangeAmbiguous && materializedEditMappings) {
       RequestTerminalFallback(
-          TerminalFallbackKind::UndischargedEmissionArtifact, "edit-map",
+          TerminalFallbackKind::UndischargedEmissionArtifact,
+          MakeTerminalFallbackProofFailure(
+        TerminalFallbackObligationKind::EmissionArtifactDischarged,
+        TerminalFallbackFailureReason::UndischargedEmissionArtifact), "edit-map",
           llvm::formatv("duplicate non-zero edits for span [{0},{1}) in {2} "
                         "carry different B-side materialization ranges",
                         s, t, emissionOwner)
@@ -7258,7 +7740,10 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
     }
     if (mergedOutRangeAmbiguous && materializedEditMappings) {
       RequestTerminalFallback(
-          TerminalFallbackKind::UndischargedEmissionArtifact, "edit-map",
+          TerminalFallbackKind::UndischargedEmissionArtifact,
+          MakeTerminalFallbackProofFailure(
+        TerminalFallbackObligationKind::EmissionArtifactDischarged,
+        TerminalFallbackFailureReason::UndischargedEmissionArtifact), "edit-map",
           llvm::formatv("duplicate non-zero edits for span [{0},{1}) in {2} "
                         "carry different refolded-output materialization "
                         "ranges",
@@ -7621,11 +8106,8 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
   // already carry normalized accepted-result carriers that are fully
   // discharged for emitted source text. Do not emit any edit whose carriers
   // are missing or not yet discharged.
-  for (const TextEdit &edit : norm) {
-    if (!EmittedTextEditHasDischargedAcceptedResults(edit, "emit/nonterminal",
-                                                     emissionOwner))
-      return originalFileText.str();
-  }
+  if (!AuditAcceptedEditProofs(norm, "emit/nonterminal", emissionOwner))
+    return originalFileText.str();
 
   const size_t n = originalFileText.size();
 
@@ -7640,7 +8122,10 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
     const TextEdit &e = norm[editIndex];
     if (e.end < e.start || e.end > n) {
       RequestTerminalFallback(
-          TerminalFallbackKind::UncomposableEmissionEditSet, "edits/apply",
+          TerminalFallbackKind::UncomposableEmissionEditSet,
+          MakeTerminalFallbackProofFailure(
+          TerminalFallbackObligationKind::EmissionEditSetComposable,
+          TerminalFallbackFailureReason::UncomposableEmissionEditSet), "edits/apply",
           llvm::formatv(
               "bad normalized edit bounds in {0}: edit#{1}=[{2},{3}) "
               "fileLen={4} textLen={5}",
@@ -7650,7 +8135,10 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
     }
     if (e.start < validatedCursor) {
       RequestTerminalFallback(
-          TerminalFallbackKind::UncomposableEmissionEditSet, "edits/apply",
+          TerminalFallbackKind::UncomposableEmissionEditSet,
+          MakeTerminalFallbackProofFailure(
+          TerminalFallbackObligationKind::EmissionEditSetComposable,
+          TerminalFallbackFailureReason::UncomposableEmissionEditSet), "edits/apply",
           llvm::formatv(
               "overlapping normalized edits in {0}: previousEnd={1} "
               "edit#{2}=[{3},{4}) textLen={5}",
@@ -7704,7 +8192,10 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
           TextEditMaterializedBByteRange(e);
       if (!bRange) {
         RequestTerminalFallback(
-            TerminalFallbackKind::UndischargedEmissionArtifact, "edit-map",
+            TerminalFallbackKind::UndischargedEmissionArtifact,
+            MakeTerminalFallbackProofFailure(
+        TerminalFallbackObligationKind::EmissionArtifactDischarged,
+        TerminalFallbackFailureReason::UndischargedEmissionArtifact), "edit-map",
             llvm::formatv("emitted edit in {0} at source=[{1},{2}) lacks a "
                           "deterministic B-side materialization range",
                           emissionOwner, e.start, e.end)
@@ -7716,7 +8207,10 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
           TextEditMaterializedOutputTextRange(e);
       if (!outRange) {
         RequestTerminalFallback(
-            TerminalFallbackKind::UndischargedEmissionArtifact, "edit-map",
+            TerminalFallbackKind::UndischargedEmissionArtifact,
+            MakeTerminalFallbackProofFailure(
+        TerminalFallbackObligationKind::EmissionArtifactDischarged,
+        TerminalFallbackFailureReason::UndischargedEmissionArtifact), "edit-map",
             llvm::formatv("emitted edit in {0} at source=[{1},{2}) carries "
                           "invalid refolded-output materialization range",
                           emissionOwner, e.start, e.end)
@@ -7863,14 +8357,37 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
 
       std::optional<uint64_t> finalOffset =
           sourceOffsetToFinalOffset(firstObserver->offset);
+      const OwnerStateBoundary observerBoundary =
+          OwnerStateBoundary::FromSource(OwnerSourceRange::From(
+              emissionOwner, firstObserver->offset, firstObserver->offset,
+              ownerIncludeId));
+
+      auto forEachLineControlDemandComponent =
+          [&](const LineStateObserverDemand &componentDemand, auto &&fn) {
+            if (componentDemand.needsLine)
+              fn(OwnerStateComponent::LineNumber);
+            if (componentDemand.needsFile)
+              fn(OwnerStateComponent::FileState);
+            if (componentDemand.needsFileName)
+              fn(OwnerStateComponent::FileName);
+          };
+
       if (!finalOffset) {
-        RequestTerminalFallback(
-            TerminalFallbackKind::UndischargedEmissionArtifact,
-            "linedir/conditional-join",
-            llvm::formatv("cannot map conditional join observer in {0}: "
-                          "group#{1} observerSource={2}",
-                          emissionOwner, group->id, firstObserver->offset)
-                .str());
+        forEachLineControlDemandComponent(
+            firstObserver->demand, [&](OwnerStateComponent component) {
+              const std::string detail =
+                  llvm::formatv("cannot map conditional join observer in {0}: "
+                                "group#{1} observerSource={2}",
+                                emissionOwner, group->id,
+                                firstObserver->offset)
+                      .str();
+              (void)CheckLineControlStateTransitionAcrossEditBoundary(
+                  observerBoundary, component, StateMutationKind::Replayed,
+                  BuildLineControlStateTerminalFailureWitness(
+                      observerBoundary, component, detail),
+                  "linedir/conditional-join", detail,
+                  /*requireKnownObserver=*/true);
+            });
         return originalFileText.str();
       }
 
@@ -7960,6 +8477,23 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
                 "sourceObserver={2} current stream is already file={3} line={4}",
                 emissionOwner, insertionOffset, firstObserver->offset,
                 loc.fileSpelling, loc.lineNo);
+          forEachLineControlDemandComponent(
+              firstObserver->demand, [&](OwnerStateComponent component) {
+                const std::string detail =
+                    llvm::formatv("suppress post-conditional #line in {0}: "
+                                  "group#{1} observerSource={2}; current "
+                                  "stream state is equivalent",
+                                  emissionOwner, group->id,
+                                  firstObserver->offset)
+                        .str();
+                (void)CheckLineControlStateTransitionAcrossEditBoundary(
+                    observerBoundary, component,
+                    StateMutationKind::PreservedAcrossReplacement,
+                    BuildLineControlStateRepairWitness(observerBoundary,
+                                                       component, detail),
+                    "linedir/conditional-join", detail,
+                    /*requireKnownObserver=*/true);
+              });
           continue;
         }
 
@@ -7974,8 +8508,39 @@ std::string RefoldEngine::ApplyTextEditsWithPendingResync(
               "skip post-conditional #line in {0}: final={1} "
               "sourceObserver={2} already dominated by identical directive",
               emissionOwner, insertionOffset, firstObserver->offset);
+        forEachLineControlDemandComponent(
+            firstObserver->demand, [&](OwnerStateComponent component) {
+              const std::string detail =
+                  llvm::formatv("suppress duplicate post-conditional #line in "
+                                "{0}: group#{1} observerSource={2}",
+                                emissionOwner, group->id, firstObserver->offset)
+                      .str();
+              (void)CheckLineControlStateTransitionAcrossEditBoundary(
+                  observerBoundary, component,
+                  StateMutationKind::PreservedAcrossReplacement,
+                  BuildLineControlStateRepairWitness(observerBoundary, component,
+                                                     detail),
+                  "linedir/conditional-join", detail,
+                  /*requireKnownObserver=*/true);
+            });
         continue;
       }
+
+      forEachLineControlDemandComponent(
+          firstObserver->demand, [&](OwnerStateComponent component) {
+            const std::string detail =
+                llvm::formatv("post-conditional synthetic #line repair in {0}: "
+                              "group#{1} observerSource={2} final={3}",
+                              emissionOwner, group->id, firstObserver->offset,
+                              insertionOffset)
+                    .str();
+            (void)CheckLineControlStateTransitionAcrossEditBoundary(
+                observerBoundary, component, StateMutationKind::Replayed,
+                BuildLineControlStateRepairWitness(observerBoundary, component,
+                                                   detail),
+                "linedir/conditional-join", detail,
+                /*requireKnownObserver=*/true);
+          });
 
       joinRepairs.push_back(
           ConditionalJoinLineRepair{firstObserver->offset, insertionOffset,
@@ -8062,6 +8627,20 @@ RefoldEngine::AppendOriginalSliceWithPending(
     appendMappedOriginalSlice(from, to);
     return pending;
   }
+
+  auto checkPendingLineControlRepair = [&](uint64_t sourceOffset,
+                                           StateMutationKind mutation,
+                                           StringRef detail) {
+    const OwnerStateBoundary boundary =
+        OwnerStateBoundary::FromSource(OwnerSourceRange::From(
+            pending->fileSpellingForDir, sourceOffset, sourceOffset,
+            pending->ownerIncludeId));
+    return CheckLineControlStateTransitionAcrossEditBoundary(
+        boundary, OwnerStateComponent::LineNumber, mutation,
+        BuildLineControlStateRepairWitness(
+            boundary, OwnerStateComponent::LineNumber, detail),
+        "line/pending", detail, /*requireKnownObserver=*/false);
+  };
 
   uint64_t i = from;
 
@@ -8155,6 +8734,11 @@ RefoldEngine::AppendOriginalSliceWithPending(
       trace("line/pending",
             "flush@slice-begin file={0} line={1} (pending) outTail={2}",
             loc->fileSpelling, loc->lineNo, stringutils::dbgOutTail(currentOut));
+      (void)checkPendingLineControlRepair(
+          from, StateMutationKind::MovedLater,
+          llvm::formatv("flush pending synthetic #line at slice begin {0}",
+                        from)
+              .str());
       const uint64_t begin = static_cast<uint64_t>(out.size());
       out.append(directive.begin(), directive.end());
       const uint64_t end = static_cast<uint64_t>(out.size());
@@ -8172,6 +8756,12 @@ RefoldEngine::AppendOriginalSliceWithPending(
       trace("line/pending",
             "SKIP flush@slice-begin (no-op) file={0} line={1} outTail={2}",
             loc->fileSpelling, loc->lineNo, stringutils::dbgOutTail(currentOut));
+      (void)checkPendingLineControlRepair(
+          from, StateMutationKind::PreservedAcrossReplacement,
+          llvm::formatv("suppress pending #line at slice begin {0}; "
+                        "current output state is equivalent",
+                        from)
+              .str());
     }
 
     appendMappedOriginalSlice(from, to);
@@ -8212,6 +8802,11 @@ RefoldEngine::AppendOriginalSliceWithPending(
               "flush@safe-nl file={0} line={1} atOrig={2} outTail={3}",
               loc->fileSpelling, loc->lineNo, i,
               stringutils::dbgOutTail(currentOut));
+        (void)checkPendingLineControlRepair(
+            i, StateMutationKind::MovedLater,
+            llvm::formatv("flush pending synthetic #line at safe newline {0}",
+                          i)
+                .str());
         const uint64_t begin = static_cast<uint64_t>(out.size());
         out.append(directive.begin(), directive.end());
         const uint64_t end = static_cast<uint64_t>(out.size());
@@ -8231,6 +8826,12 @@ RefoldEngine::AppendOriginalSliceWithPending(
               "outTail={3}",
               loc->fileSpelling, loc->lineNo, i,
               stringutils::dbgOutTail(currentOut));
+        (void)checkPendingLineControlRepair(
+            i, StateMutationKind::PreservedAcrossReplacement,
+            llvm::formatv("suppress pending #line at safe newline {0}; "
+                          "current output state is equivalent",
+                          i)
+                .str());
       }
 
       pending = std::nullopt;

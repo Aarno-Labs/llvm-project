@@ -20,7 +20,8 @@
 // RefoldMapBuilder listens to:
 //   - File entry/exit (#include nesting) to build a logical include tree.
 //   - Macro define/undef and expansions to capture items and spans.
-//   - Raw #pragma lines (opaque items) with byte anchors only.
+//   - Raw #pragma lines (opaque zero-token state items) with byte anchors
+//     and include-owner provenance when available.
 //   - Every printed preprocessor token to extend half-open token spans and
 //     fill the primary token map.
 //

@@ -935,6 +935,10 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
           pd.siteB = *asOptUInt64(*obj, "site_b");
           pd.siteE = *asOptUInt64(*obj, "site_e");
 
+          // Optional in older maps.  When present, this is the preferred
+          // repeated-header disambiguator for zero-token pragma owners.
+          pd.ownerIncludeId = asOptUInt64(*obj, "owner_include_id");
+
           model.pragmas_.push_back(std::move(pd));
         } else {
           return createStringError(

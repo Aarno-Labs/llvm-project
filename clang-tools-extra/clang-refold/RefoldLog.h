@@ -35,6 +35,9 @@
 //  • Fatal logs end the process deterministically after emitting the message.
 //  • Fatal logs abort the process after printing; non-fatal logs return to the
 //    caller after emission.
+//  • Theorem-audit logs must use the ADL `toString()` names for proof classes,
+//    accepted paths, obligations, and terminal-fallback reasons.  Logs should
+//    not introduce parallel names for the strict-domain vocabulary.
 //
 // Public API (summary)
 // --------------------

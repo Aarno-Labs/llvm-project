@@ -18,17 +18,18 @@ RefoldEngine::ResolveIncludeRealizationBTokenEnvelope(
   if (auto canonical = MapATokRangeAToBTokenEnvelope(beginTok, endTok)) {
     // Prefer the ordinary A-cover -> B-envelope projection. This is the
     // canonical include-realization witness because it follows the same mapping
-    // path used for normal A-token covers and needs no rescue consensus.
+    // path used for normal A-token covers and needs no non-canonical consensus proof.
     if (evidenceKind)
       *evidenceKind = IncludeRealizationEvidenceKind::CanonicalBCoverEnvelope;
     return canonical;
   }
 
-  // If the canonical mapper cannot recover a B envelope, try the deterministic
-  // rescue projections. The include realization is still accepted only when all
-  // usable rescue projections agree on one non-empty B-token envelope. A
-  // missing projection is allowed; conflicting usable projections are a domain
-  // wall.
+  // Phase 8b classification: this is not a fallback/rescue path.  It is a
+  // declared include-realization evidence class for the narrow case where the
+  // canonical mapper cannot recover an envelope but every usable
+  // non-canonical boundary projection proves the same non-empty B-token range.
+  // Missing projections are ignored; conflicting usable projections are a
+  // domain wall.
   auto isUsableEnvelope =
       [&](const std::optional<std::pair<size_t, size_t>> &env) -> bool {
     if (!env || env->second <= env->first)
@@ -44,25 +45,26 @@ RefoldEngine::ResolveIncludeRealizationBTokenEnvelope(
       MapATokRangeAToBTokenEnvelopeTrimEdgeInsertions(beginTok, endTok);
 
   std::optional<std::pair<size_t, size_t>> consensus;
-  bool sawUsableRescue = false;
+  bool sawUsableBoundaryStableProjection = false;
   bool conflict = false;
 
-  // Add one rescue projection to the consensus set. Unusable envelopes are
-  // diagnostic-only; usable envelopes must all equal the first usable envelope.
+  // Add one boundary-stable projection to the consensus set. Unusable
+  // envelopes are diagnostic-only; usable envelopes must all equal the first
+  // usable envelope.
   auto consider = [&](StringRef label,
                       const std::optional<std::pair<size_t, size_t>> &env) {
     if (!isUsableEnvelope(env)) {
       trace("include/mat",
-            "include-realization rescue envelope unavailable: label={0} "
+            "include-realization boundary-stable envelope unavailable: label={0} "
             "A-cover=[{1},{2})",
             label, beginTok, endTok);
       return;
     }
 
-    sawUsableRescue = true;
+    sawUsableBoundaryStableProjection = true;
     trace("include/mat",
-          "include-realization rescue envelope: label={0} A-cover=[{1},{2}) "
-          "Btok=[{3},{4}) text={5}",
+          "include-realization boundary-stable envelope: label={0} "
+          "A-cover=[{1},{2}) Btok=[{3},{4}) text={5}",
           label, beginTok, endTok, env->first, env->second,
           stringutils::showWsWithClip(SliceBSource(env->first, env->second),
                                       120));
@@ -79,17 +81,18 @@ RefoldEngine::ResolveIncludeRealizationBTokenEnvelope(
   consider("preserve-boundary-insertions", preserveBoundary);
   consider("trim-edge-insertions", trimEdge);
 
-  // Fail closed if no deterministic rescue produced material text, or if the
-  // rescue projections disagree about the B-side envelope.
-  if (!sawUsableRescue || conflict || !consensus)
+  // Fail closed if no deterministic boundary-stable proof produced material
+  // text, or if the boundary-stable projections disagree about the B-side
+  // envelope.
+  if (!sawUsableBoundaryStableProjection || conflict || !consensus)
     return std::nullopt;
 
   if (evidenceKind)
     *evidenceKind =
-        IncludeRealizationEvidenceKind::ConsensusRescuedBCoverEnvelope;
+        IncludeRealizationEvidenceKind::BoundaryStableConsensusBCoverEnvelope;
   trace("include/mat",
-        "include-realization rescue envelope consensus: A-cover=[{0},{1}) "
-        "Btok=[{2},{3})",
+        "include-realization boundary-stable consensus envelope: "
+        "A-cover=[{0},{1}) Btok=[{2},{3})",
         beginTok, endTok, consensus->first, consensus->second);
   return consensus;
 }
