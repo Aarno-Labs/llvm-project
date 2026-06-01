@@ -99,7 +99,6 @@
 #include <set>
 #include <cctype>
 #include <cstdint>
-#include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <iterator>
@@ -1221,42 +1220,6 @@ static std::string formatUInt32List(ArrayRef<uint32_t> values) {
   return os.str();
 }
 
-/// Format invocation argument references for proof/debug diagnostics.
-static std::string
-formatInvArgRefList(ArrayRef<RefoldModel::InvArgRef> refs) {
-  std::string out;
-  raw_string_ostream os(out);
-  os << "[";
-  for (size_t i = 0; i < refs.size(); ++i) {
-    if (i)
-      os << ", ";
-    os << "{caller=" << refs[i].callerParamIndex << ", bytes=["
-       << refs[i].byteBegin << "," << refs[i].byteEnd << ")}";
-  }
-  os << "]";
-  return os.str();
-}
-
-/// Format an optional invocation argument byte range as `[begin,end)`, using
-/// `?` for missing producer endpoints.
-static std::string
-formatInvocationArgRange(
-    const RefoldModel::MacroInvocation::OptByteRange &range) {
-  std::string out;
-  raw_string_ostream os(out);
-  os << "[";
-  if (range.first)
-    os << *range.first;
-  else
-    os << "?";
-  os << ",";
-  if (range.second)
-    os << *range.second;
-  else
-    os << "?";
-  os << ")";
-  return os.str();
-}
 
 /// One character-diff hunk derived while composing compatible string rewrites.
 struct CompatibleStringRewriteHunk {
@@ -2017,42 +1980,12 @@ RefoldEngine::Refold(const json::Object &rootJson, StringRef aSource,
   return engine.Refold();
 }
 
-namespace {
-constexpr const char *NoLegacyAuditEnv = "CLANG_REFOLD_NO_LEGACY_AUDIT";
-constexpr const char *NoLegacyAuditStrictEnv =
-    "CLANG_REFOLD_NO_LEGACY_AUDIT_STRICT";
-
-bool refoldEnvFlagEnabled(const char *name) {
-  const char *value = std::getenv(name);
-  if (!value)
-    return false;
-  const StringRef text(value);
-  return !text.empty() && !text.equals_insensitive("0") &&
-         !text.equals_insensitive("false") &&
-         !text.equals_insensitive("off") &&
-         !text.equals_insensitive("no");
-}
-
-bool refoldEnvRequestsStrictNoLegacyAudit() {
-  if (refoldEnvFlagEnabled(NoLegacyAuditStrictEnv))
-    return true;
-  const char *value = std::getenv(NoLegacyAuditEnv);
-  if (!value)
-    return false;
-  const StringRef text(value);
-  return text.equals_insensitive("strict") ||
-         text.equals_insensitive("fail") ||
-         text.equals_insensitive("fail-closed");
-}
-}
-
-bool RefoldEngine::IsNoLegacyAuditEnabled() {
-  return refoldEnvFlagEnabled(NoLegacyAuditEnv) ||
-         IsNoLegacyAuditStrictEnabled();
-}
-
-bool RefoldEngine::IsNoLegacyAuditStrictEnabled() {
-  return refoldEnvRequestsStrictNoLegacyAudit();
+bool RefoldEngine::IsNoLegacyAuditEnabled() const {
+  // Step 6 removes the temporary environment-variable controls.  The
+  // no-legacy audit is now a regular strict/theorem invariant: non-strict runs
+  // do not emit diagnostic-only audit noise, and strict runs always fail closed
+  // if a legacy-authority seam reaches a theorem boundary.
+  return strict_;
 }
 
 RefoldEngine::LegacyAuditEvidence RefoldEngine::MakeLegacyAuditEvidence(
@@ -2065,24 +1998,41 @@ RefoldEngine::LegacyAuditEvidence RefoldEngine::MakeLegacyAuditEvidence(
 }
 
 void RefoldEngine::ReportNoLegacyAuditFinding(
-    const LegacyAuditEvidence &evidence) {
+    const LegacyAuditEvidence &evidence) const {
   if (!IsNoLegacyAuditEnabled())
     return;
+
+  ++lastTheoremAudit_.noLegacyAuditFindings;
 
   const LegacyPathDefinition definition = DescribeLegacyPathKind(evidence.kind);
   const StringRef role = evidence.role.empty() ? StringRef("<unknown>")
                                                : StringRef(evidence.role);
+  const std::string clippedDetail = evidence.detail.empty()
+                                        ? std::string()
+                                        : stringutils::showWsWithClip(
+                                              evidence.detail, 240);
 
   llvm::errs() << "[clang-refold:no-legacy-audit] kind="
                << toString(definition.kind) << " role=" << role
                << " definition=\"" << definition.definition << "\""
                << " required-closure=\"" << definition.requiredClosure
                << "\"";
-  if (!evidence.detail.empty())
-    llvm::errs() << " detail=\""
-                 << stringutils::showWsWithClip(evidence.detail, 240)
-                 << "\"";
+  if (!clippedDetail.empty())
+    llvm::errs() << " detail=\"" << clippedDetail << "\"";
   llvm::errs() << '\n';
+
+  // No-legacy findings are theorem state whenever the strict/theorem guard is
+  // active.  Record the first finding here so every audit site shares one
+  // policy and cannot accidentally remain a stderr-only diagnostic.
+  if (IsNoLegacyAuditEnabled()) {
+    NoteTheoremAuditViolation(
+        llvm::formatv("strict/theorem no-legacy audit reported finding: "
+                      "kind={0} role={1} detail={2}",
+                      toString(definition.kind), role,
+                      clippedDetail.empty() ? StringRef("<none>")
+                                            : StringRef(clippedDetail))
+            .str());
+  }
 }
 
 /// Record that the current run escaped the declared proof domain.
@@ -2216,6 +2166,13 @@ void RefoldEngine::EnforceTheoremAuditInvariants() const {
     NoteTheoremAuditViolation(
         "state-transition gateway audit found an undischarged or malformed "
         "state proof");
+  }
+  if (IsNoLegacyAuditEnabled() &&
+      lastTheoremAudit_.noLegacyAuditFindings != 0) {
+    NoteTheoremAuditViolation(
+        llvm::formatv("strict/theorem no-legacy audit produced {0} finding(s)",
+                      lastTheoremAudit_.noLegacyAuditFindings)
+            .str());
   }
 
   if (!strict_ || HasTerminalFallbackRequest() ||
@@ -2596,10 +2553,6 @@ bool RefoldEngine::RejectNoLegacyAuditFindingIfStrict(
 
   ReportNoLegacyAuditFinding(evidence);
   ++lastTheoremAudit_.noLegacyEmissionBoundaryViolations;
-
-  if (!IsNoLegacyAuditStrictEnabled())
-    return false;
-
   ++lastTheoremAudit_.noLegacyStrictRejections;
   const LegacyPathDefinition definition = DescribeLegacyPathKind(evidence.kind);
   const StringRef role = evidence.role.empty() ? StringRef("<unknown>")
@@ -2609,7 +2562,7 @@ bool RefoldEngine::RejectNoLegacyAuditFindingIfStrict(
                                  : stringutils::showWsWithClip(evidence.detail,
                                                                200);
   NoteTheoremAuditViolation(
-      llvm::formatv("no-legacy strict audit rejected emission boundary: "
+      llvm::formatv("strict/theorem no-legacy audit rejected emission boundary: "
                     "kind={0} role={1} detail={2}",
                     toString(definition.kind), role, detail)
           .str());
@@ -2617,12 +2570,55 @@ bool RefoldEngine::RejectNoLegacyAuditFindingIfStrict(
   if (!HasTerminalFallbackRequest()) {
     RequestTerminalFallback(
         failure, role,
-        llvm::formatv("no-legacy strict audit rejected emission boundary: "
+        llvm::formatv("strict/theorem no-legacy audit rejected emission boundary: "
                       "kind={0} detail={1}",
                       toString(definition.kind), detail)
             .str());
   }
   return true;
+}
+
+RefoldEngine::TerminalFallbackProofFailure
+RefoldEngine::MakeMissingSelectedMacroPatchCarrierFailure() const {
+  return MakeTerminalFallbackProofFailure(
+      TerminalFallbackObligationKind::EmissionArtifactDischarged,
+      TerminalFallbackFailureReason::UndischargedEmissionArtifact,
+      TerminalFallbackFailureContext::ForStateComponent(
+          "MacroPatch.selectedAcceptedCandidate"));
+}
+
+bool RefoldEngine::RejectMissingSelectedMacroPatchCarrier(
+    const MacroPatch &patch, StringRef role, StringRef detail) const {
+  const TerminalFallbackProofFailure failure =
+      MakeMissingSelectedMacroPatchCarrierFailure();
+
+  const bool strictAuditRejected = RejectNoLegacyAuditFindingIfStrict(
+      MakeLegacyAuditEvidence(LegacyPathKind::PathSpecificProofMirror, role,
+                              detail),
+      failure);
+
+  // Missing selectedAcceptedCandidate is no longer recoverable proof state.
+  // Strict engine runs must fail closed instead of rebuilding authority from
+  // the raw MacroPatch.
+  if (!strictAuditRejected) {
+    NoteTheoremAuditViolation(
+        llvm::formatv("macro patch bytes=[{0},{1}) reached emission without "
+                      "MacroPatch.selectedAcceptedCandidate: {2}",
+                      patch.invStart, patch.invEnd,
+                      detail.empty() ? StringRef("<none>") : detail)
+            .str());
+    if (strict_ && !HasTerminalFallbackRequest()) {
+      RequestTerminalFallback(
+          failure, role,
+          llvm::formatv("macro patch bytes=[{0},{1}) reached emission without "
+                        "MacroPatch.selectedAcceptedCandidate: {2}",
+                        patch.invStart, patch.invEnd,
+                        detail.empty() ? StringRef("<none>") : detail)
+              .str());
+    }
+  }
+
+  return strictAuditRejected || strict_;
 }
 
 
@@ -2874,9 +2870,9 @@ std::string RefoldEngine::BuildTheoremAuditInvariantDetail() const {
              "transitional={3} undischarged={4} unknownClass={5} outOfDomain={6} "
              "uncomposedComposite={7} selectorUnresolved={8} "
              "nonExplicitTerminalExclusions={9} terminalFailureAuditViolations={10} "
-             "stateTransitionAuditViolations={11} noLegacyEmissionViolations={12} "
-             "noLegacyStrictRejections={13} directStateChecks={14} "
-             "directStateUnclosed={15}",
+             "stateTransitionAuditViolations={11} noLegacyFindings={12} "
+             "noLegacyEmissionViolations={13} noLegacyStrictRejections={14} "
+             "directStateChecks={15} directStateUnclosed={16}",
              firstViolation, lastTheoremAudit_.selectorDirectBypasses,
              lastTheoremAudit_.emittedSelectorOnlyExceptionCarriers,
              lastTheoremAudit_.emittedTransitionalTheoremCarriers,
@@ -2888,6 +2884,7 @@ std::string RefoldEngine::BuildTheoremAuditInvariantDetail() const {
              lastTheoremAudit_.nonExplicitTerminalExclusions,
              lastTheoremAudit_.terminalFailureAuditViolations,
              lastTheoremAudit_.stateTransitionAuditViolations,
+             lastTheoremAudit_.noLegacyAuditFindings,
              lastTheoremAudit_.noLegacyEmissionBoundaryViolations,
              lastTheoremAudit_.noLegacyStrictRejections,
              lastTheoremAudit_.directStateChecksAudited,
@@ -3141,29 +3138,6 @@ std::string RefoldEngine::Refold() {
                                       finalLineControlValidationCallback_);
   AuditFinalLineControlAuthorityContract(finalLinePrune.authority,
                                          "final-line-control-prune");
-
-  if (finalLinePrune.shadowAudit.enabled) {
-    const FinalLineControlShadowAuditResult &shadow =
-        finalLinePrune.shadowAudit;
-    info("line/shadow",
-         "comparisons={0} matches={1} mismatches={2} missingProofs={3} "
-         "oldOnly={4} proofOnly={5}",
-         shadow.comparisons, shadow.matches, shadow.mismatches,
-         shadow.missingProofs, shadow.oldOnly, shadow.proofOnly);
-    for (const FinalLineControlShadowAuditMismatch &mismatch :
-         shadow.mismatchSamples) {
-      info("line/shadow",
-           "mismatch range=[{0},{1}) origin={2} oldModelRemovable={3} "
-           "proofRemovable={4} proof={5} obligation={6} removalVerdict={7}",
-           mismatch.finalBegin, mismatch.finalEnd, toString(mismatch.origin),
-           mismatch.oldModelRemovable ? 1 : 0,
-           mismatch.proofRemovable ? 1 : 0,
-           mismatch.hasRemovalProof ? "present" : "missing",
-           mismatch.obligation ? toString(*mismatch.obligation) : "none",
-           mismatch.removalVerdict ? toString(*mismatch.removalVerdict)
-                                   : "none");
-    }
-  }
 
   if (finalLinePrune.changed) {
     auto mapPointAfterDeletion = [](uint64_t point, uint64_t begin,
@@ -7858,8 +7832,14 @@ std::string RefoldEngine::RunSinglePassRefold() {
 
     for (uint64_t id : MacroIds) {
       auto it = patchesById.find(id);
-      if (it != patchesById.end())
-        finalPatches.push_back(std::move(it->second));
+      if (it == patchesById.end())
+        continue;
+
+      MacroPatch &patch = it->second;
+      if (!FinalizeSelectedMacroPatchForEmission(
+              patch, "macro/final-emission-bucket"))
+        continue;
+      finalPatches.push_back(std::move(patch));
     }
   }
 
@@ -12863,19 +12843,6 @@ enum class MacroCoverRank : uint8_t {
   None = 3,
 };
 
-static inline StringRef toString(MacroCoverRank rank) {
-  switch (rank) {
-  case MacroCoverRank::Body:
-    return "Body";
-  case MacroCoverRank::ArgLike:
-    return "ArgLike";
-  case MacroCoverRank::Cover:
-    return "Cover";
-  case MacroCoverRank::None:
-    return "None";
-  }
-  llvm_unreachable("Invalid MacroCoverRank");
-}
 
 const RefoldModel::MacroInvocation *
 RefoldEngine::RightBoundaryVaOptActivationMacro(
@@ -25256,36 +25223,25 @@ bool RefoldEngine::AcceptedResultCandidatePrefers(
   return false;
 }
 
-std::optional<RefoldEngine::SelectedAcceptedResultCandidate>
-RefoldEngine::SelectPreferredAcceptedResultCandidate(
-    ArrayRef<AcceptedResultCandidate> candidates,
-    bool allowNonTopLevelMacroSelectorFailure) const {
+std::optional<size_t> RefoldEngine::SelectPreferredCandidateIndex(
+    size_t candidateCount, function_ref<bool(size_t)> isSelectable,
+    function_ref<bool(size_t, size_t)> prefers) const {
   std::optional<size_t> bestIdx;
   uint64_t selectableCount = 0;
 
-  // The caller still controls enumeration order. This selector only filters
-  // that list to candidates whose proof summaries are allowed to participate,
-  // then applies the normalized lattice/tie-break ordering while preserving
-  // stable caller order when the candidates remain indistinguishable. One
-  // internal macro-construction site may additionally admit nested
-  // structure-preserving macro artifacts whose only remaining failed
-  // obligation is the top-level proof-root selector rule; this removes the
-  // last direct selector bypass without relaxing the theorem-facing discharge
-  // gate at any emitted boundary.
-  for (size_t i = 0; i < candidates.size(); ++i) {
-    const bool selectable =
-        IsSelectableAcceptedResultCandidate(candidates[i]) ||
-        (allowNonTopLevelMacroSelectorFailure &&
-         AcceptedResultCandidateHasOnlyNonTopLevelMacroSelectorFailure(
-             candidates[i]));
-    if (!selectable)
+  // Keep all selector flavors on one deterministic loop.  Callers provide only
+  // the admissibility predicate and the strict preference relation, so accepted
+  // emitted artifacts and macro-local selector staging cannot drift in tie
+  // handling or theorem-audit accounting.
+  for (size_t i = 0; i < candidateCount; ++i) {
+    if (!isSelectable(i))
       continue;
     ++selectableCount;
     if (!bestIdx) {
       bestIdx = i;
       continue;
     }
-    if (AcceptedResultCandidatePrefers(candidates[i], candidates[*bestIdx]))
+    if (prefers(i, *bestIdx))
       bestIdx = i;
   }
 
@@ -25293,11 +25249,93 @@ RefoldEngine::SelectPreferredAcceptedResultCandidate(
     ++lastTheoremAudit_.selectorCompetitions;
     if (bestIdx)
       ++lastTheoremAudit_.selectorResolutions;
-  } else if (!bestIdx && !candidates.empty()) {
+  } else if (!bestIdx && candidateCount != 0) {
     ++lastTheoremAudit_.selectorNoSelectable;
-    if (candidates.size() > 1)
+    if (candidateCount > 1)
       ++lastTheoremAudit_.selectorUnresolvedCompetitions;
   }
+
+  return bestIdx;
+}
+
+RefoldEngine::MacroSelectionCandidate
+RefoldEngine::BuildMacroSelectionCandidate(
+    const MacroPatch &patch, bool allowNonTopLevelMacroSelectorFailure) const {
+  MacroSelectionCandidate candidate;
+  candidate.selectorCandidate = BuildAcceptedMacroCandidate(patch);
+
+  // Build the emitted carrier through the emission-specific macro gate, but do
+  // not use it for ranking.  If it is not theorem-normalized, leave the optional
+  // empty so a selected macro patch cannot accidentally stamp a selector-only
+  // proof onto MacroPatch::selectedAcceptedCandidate.
+  AcceptedResultCandidate emittedCandidate =
+      RestampAcceptedMacroCandidateForEmission(
+          patch, candidate.selectorCandidate);
+  if (IsSelectableAcceptedResultCandidate(emittedCandidate))
+    candidate.emittedCandidate = std::move(emittedCandidate);
+
+  candidate.selectorOnly =
+      allowNonTopLevelMacroSelectorFailure &&
+      !IsSelectableAcceptedResultCandidate(candidate.selectorCandidate) &&
+      AcceptedResultCandidateHasOnlyNonTopLevelMacroSelectorFailure(
+          candidate.selectorCandidate);
+  return candidate;
+}
+
+bool RefoldEngine::IsSelectableMacroSelectionCandidate(
+    const MacroSelectionCandidate &candidate) const {
+  if (IsSelectableAcceptedResultCandidate(candidate.selectorCandidate))
+    return true;
+
+  // The only macro-local non-final selector proof admitted by this carrier is
+  // the explicit nested proof-root exception.  The emitted candidate remains a
+  // separate optional and is audited only if it is later stamped for emission.
+  return candidate.selectorOnly &&
+         AcceptedResultCandidateHasOnlyNonTopLevelMacroSelectorFailure(
+             candidate.selectorCandidate);
+}
+
+bool RefoldEngine::MacroSelectionCandidatePrefers(
+    const MacroSelectionCandidate &lhs,
+    const MacroSelectionCandidate &rhs) const {
+  return AcceptedResultCandidatePrefers(lhs.selectorCandidate,
+                                        rhs.selectorCandidate);
+}
+
+std::optional<RefoldEngine::SelectedMacroSelectionCandidate>
+RefoldEngine::SelectPreferredMacroSelectionCandidate(
+    ArrayRef<MacroSelectionCandidate> candidates) const {
+  std::optional<size_t> bestIdx = SelectPreferredCandidateIndex(
+      candidates.size(),
+      [&](size_t idx) {
+        return IsSelectableMacroSelectionCandidate(candidates[idx]);
+      },
+      [&](size_t lhsIdx, size_t rhsIdx) {
+        return MacroSelectionCandidatePrefers(candidates[lhsIdx],
+                                             candidates[rhsIdx]);
+      });
+
+  if (!bestIdx)
+    return std::nullopt;
+
+  SelectedMacroSelectionCandidate selected;
+  selected.candidate = candidates[*bestIdx];
+  selected.index = *bestIdx;
+  return selected;
+}
+
+std::optional<RefoldEngine::SelectedAcceptedResultCandidate>
+RefoldEngine::SelectPreferredAcceptedResultCandidate(
+    ArrayRef<AcceptedResultCandidate> candidates) const {
+  std::optional<size_t> bestIdx = SelectPreferredCandidateIndex(
+      candidates.size(),
+      [&](size_t idx) {
+        return IsSelectableAcceptedResultCandidate(candidates[idx]);
+      },
+      [&](size_t lhsIdx, size_t rhsIdx) {
+        return AcceptedResultCandidatePrefers(candidates[lhsIdx],
+                                             candidates[rhsIdx]);
+      });
 
   if (!bestIdx)
     return std::nullopt;
@@ -25312,11 +25350,9 @@ RefoldEngine::SelectPreferredAcceptedResultCandidate(
 }
 
 std::optional<size_t> RefoldEngine::SelectPreferredAcceptedResultCandidateIndex(
-    ArrayRef<AcceptedResultCandidate> candidates,
-    bool allowNonTopLevelMacroSelectorFailure) const {
+    ArrayRef<AcceptedResultCandidate> candidates) const {
   std::optional<SelectedAcceptedResultCandidate> selected =
-      SelectPreferredAcceptedResultCandidate(candidates,
-                                             allowNonTopLevelMacroSelectorFailure);
+      SelectPreferredAcceptedResultCandidate(candidates);
   if (!selected)
     return std::nullopt;
   return selected->index;
@@ -25395,42 +25431,12 @@ RefoldEngine::BuildAcceptedMacroCandidate(const MacroPatch &patch) const {
 }
 
 RefoldEngine::AcceptedResultCandidate
-RefoldEngine::BuildAcceptedEmittedMacroCandidate(
-    const MacroPatch &patch) const {
-  // Phase 3D requires macro emission to remember the normalized accepted
-  // carrier that won selection.  Normal runs still rebuild the emitted-source
-  // carrier below for compatibility; the opt-in strict no-legacy audit turns a
-  // missing selected carrier into an explicit terminal proof failure.
-  if (!patch.selectedAcceptedCandidate) {
-    const bool strictRejected = RejectNoLegacyAuditFindingIfStrict(
-        MakeLegacyAuditEvidence(
-            LegacyPathKind::PathSpecificProofMirror,
-            "BuildAcceptedEmittedMacroCandidate",
-            llvm::formatv(
-                "emitted macro patch bytes=[{0},{1}) reached emission without "
-                "a selected AcceptedResultCandidate",
-                patch.invStart, patch.invEnd)
-                .str()),
-        MakeTerminalFallbackProofFailure(
-            TerminalFallbackObligationKind::EmissionArtifactDischarged,
-            TerminalFallbackFailureReason::UndischargedEmissionArtifact,
-            TerminalFallbackFailureContext::ForStateComponent(
-                "MacroPatch.selectedAcceptedCandidate")));
-    if (strictRejected)
-      return AcceptedResultCandidate{};
-  } else {
-    AuditAcceptedResultCandidateForLegacyAuthority(
-        *patch.selectedAcceptedCandidate,
-        "BuildAcceptedEmittedMacroCandidate/selected-carrier");
-  }
-
-  AcceptedResultCandidate candidate = BuildAcceptedMacroCandidate(patch);
-
+RefoldEngine::RestampAcceptedMacroCandidateForEmission(
+    const MacroPatch &patch, AcceptedResultCandidate candidate) const {
   // Restamp emitted preserving macro artifacts onto the emission-specific
   // discharge rule, removing the byte-edit boundary's selector-only
-  // nested-macro exception. Selector competition still uses the
-  // stronger top-level proof-root contract through
-  // BuildAcceptedMacroCandidate().
+  // nested-macro exception. Selector competition still uses the stronger
+  // top-level proof-root contract through BuildAcceptedMacroCandidate().
   if (candidate.kind == AcceptedResultCandidateKind::MacroPatch &&
       candidate.proofSummary.theoremClass ==
           TheoremProofClass::InvocationPreservingProof &&
@@ -25442,9 +25448,73 @@ RefoldEngine::BuildAcceptedEmittedMacroCandidate(
     RefreshAcceptedCandidateEmissionPathInventory(candidate);
   }
 
-  AuditAcceptedResultCandidateForLegacyAuthority(
-      candidate, "BuildAcceptedEmittedMacroCandidate");
   return candidate;
+}
+
+RefoldEngine::AcceptedResultCandidate
+RefoldEngine::BuildAcceptedMacroEmissionCandidate(
+    const MacroPatch &patch) const {
+  return RestampAcceptedMacroCandidateForEmission(
+      patch, BuildAcceptedMacroCandidate(patch));
+}
+
+bool RefoldEngine::FinalizeSelectedMacroPatchForEmission(
+    MacroPatch &patch, StringRef role) const {
+  // A patch may be merged or materialized by a path that never participated in
+  // the final macro selector.  Before the owner/macro-id map is flattened into
+  // emission buckets, refresh the canonical proof summary and force every
+  // emission-bound patch through the same theorem-normalized carrier gate.
+  SyncMacroPatchProofSummary(patch);
+
+  if (patch.selectedAcceptedCandidate)
+    return true;
+
+  SmallVector<AcceptedResultCandidate, 1> candidates;
+  candidates.push_back(BuildAcceptedMacroEmissionCandidate(patch));
+
+  const std::optional<SelectedAcceptedResultCandidate> selected =
+      SelectPreferredAcceptedResultCandidate(candidates);
+  if (selected) {
+    StampSelectedMacroPatchCandidate(patch, selected->candidate, role);
+    return true;
+  }
+
+  const bool rejected = RejectMissingSelectedMacroPatchCarrier(
+      patch, role,
+      llvm::formatv(
+          "macro patch bytes=[{0},{1}) was queued for emission but no "
+          "theorem-normalized AcceptedResultCandidate could be selected",
+          patch.invStart, patch.invEnd)
+          .str());
+
+  // Diagnostic-only audit may keep collecting evidence in non-strict runs, but
+  // strict engine runs and strict no-legacy audit runs must not forward an
+  // unstamped MacroPatch into the emitted edit buckets.
+  return !rejected;
+}
+
+RefoldEngine::AcceptedResultCandidate
+RefoldEngine::BuildAcceptedEmittedMacroCandidate(
+    const MacroPatch &patch) const {
+  // Step 3 makes the byte-edit boundary consume only the carrier selected
+  // before emission bucketing.  Rebuilding from MacroPatch here would recreate
+  // the legacy proof-authority escape that the selectedAcceptedCandidate
+  // invariant is meant to eliminate.
+  if (!patch.selectedAcceptedCandidate) {
+    RejectMissingSelectedMacroPatchCarrier(
+        patch, "BuildAcceptedEmittedMacroCandidate",
+        llvm::formatv(
+            "emitted macro patch bytes=[{0},{1}) reached emission without "
+            "a selected AcceptedResultCandidate",
+            patch.invStart, patch.invEnd)
+            .str());
+    return AcceptedResultCandidate{};
+  }
+
+  AuditAcceptedResultCandidateForLegacyAuthority(
+      *patch.selectedAcceptedCandidate,
+      "BuildAcceptedEmittedMacroCandidate/selected-carrier");
+  return *patch.selectedAcceptedCandidate;
 }
 
 RefoldEngine::AcceptedResultCandidate
@@ -35832,7 +35902,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
   struct FinalMacroCandidate {
     MacroPatch patch;
-    AcceptedResultCandidate acceptedCandidate;
+    MacroSelectionCandidate selectionCandidate;
     FinalMacroCandidateOrigin origin =
         FinalMacroCandidateOrigin::WholeCoverRealization;
   };
@@ -36057,9 +36127,10 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   //
   // Candidate discovery above may produce callsite-preserving patches, DAG
   // subtree patches, reusable existing patches, or whole-cover realizations.
-  // Rather than returning from those discovery paths directly, each accepted
-  // patch is converted into an `AcceptedMacroCandidate` and routed through the
-  // same final competition logic.
+  // Rather than returning from those discovery paths directly, each patch is
+  // converted into a MacroSelectionCandidate.  That selector carrier is allowed
+  // to rank macro-local staging proofs, while any eventual emission stamp must
+  // come from its separate emission-normalized AcceptedResultCandidate.
   //
   // The normal participation gate is proof discharge. The only scoped exception
   // is for non-top-level construction sites: they may admit selector-only nested
@@ -36073,7 +36144,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
     FinalMacroCandidate entry;
     entry.patch = patch;
-    entry.acceptedCandidate = BuildAcceptedMacroCandidate(entry.patch);
+    entry.selectionCandidate = BuildMacroSelectionCandidate(
+        entry.patch, allowNonTopLevelMacroSelectorFailure);
     entry.origin = origin;
     finalMacroCandidates.push_back(std::move(entry));
   };
@@ -36126,12 +36198,15 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           if (!candidate.patch.proof.preservesInvocationStructure ||
               candidate.patch.proof.proofRootMacroId != m.id)
             continue;
-          if (!IsSelectableAcceptedResultCandidate(candidate.acceptedCandidate))
+          if (!IsSelectableAcceptedResultCandidate(
+                  candidate.selectionCandidate.selectorCandidate))
             continue;
-          if (LatticePrefers(candidate.acceptedCandidate.proofSummary,
-                             realizationCandidate.proofSummary) &&
+          if (LatticePrefers(
+                  candidate.selectionCandidate.selectorCandidate.proofSummary,
+                  realizationCandidate.proofSummary) &&
               !LatticePrefers(realizationCandidate.proofSummary,
-                              candidate.acceptedCandidate.proofSummary))
+                              candidate.selectionCandidate.selectorCandidate
+                                  .proofSummary))
             return true;
         }
         return false;
@@ -36161,17 +36236,17 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   if (finalMacroCandidates.empty())
     return std::nullopt;
 
-  // The selector operates on normalized accepted-result candidates rather than
-  // raw `MacroPatch` values, so preserve the parallel `finalMacroCandidates`
-  // array for recovering the selected patch afterward.
-  SmallVector<AcceptedResultCandidate, 5> acceptedCandidates;
-  acceptedCandidates.reserve(finalMacroCandidates.size());
+  // The macro selector ranks MacroSelectionCandidate objects, not emitted
+  // AcceptedResultCandidate objects.  This keeps selector-only nested macro
+  // proofs out of the theorem-facing accepted-result selector while preserving
+  // the parallel `finalMacroCandidates` array for recovering the selected patch.
+  SmallVector<MacroSelectionCandidate, 5> selectionCandidates;
+  selectionCandidates.reserve(finalMacroCandidates.size());
   for (const FinalMacroCandidate &candidate : finalMacroCandidates)
-    acceptedCandidates.push_back(candidate.acceptedCandidate);
+    selectionCandidates.push_back(candidate.selectionCandidate);
 
-  const std::optional<SelectedAcceptedResultCandidate> selectedCandidate =
-      SelectPreferredAcceptedResultCandidate(
-          acceptedCandidates, allowNonTopLevelMacroSelectorFailure);
+  const std::optional<SelectedMacroSelectionCandidate> selectedCandidate =
+      SelectPreferredMacroSelectionCandidate(selectionCandidates);
   if (!selectedCandidate) {
     trace(
         "macro/proof",
@@ -36219,8 +36294,22 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   }
 
   MacroPatch selectedPatch = selected.patch;
-  StampSelectedMacroPatchCandidate(
-      selectedPatch, selectedCandidate->candidate, "macro/final-selector");
+  if (selectedCandidate->candidate.emittedCandidate) {
+    StampSelectedMacroPatchCandidate(
+        selectedPatch, *selectedCandidate->candidate.emittedCandidate,
+        "macro/final-selector");
+  } else {
+    // A selector-only macro proof may choose the concrete spelling, but it is
+    // not an emitted accepted artifact.  Leave the patch unstamped so the
+    // final emission-bucket gate must either construct a theorem-normalized
+    // emitted carrier or fail closed under the strict/theorem no-legacy
+    // audit.
+    trace("macro/proof",
+          "selected macro candidate has no emitted accepted carrier: inv "
+          "id={0} name={1} proofKind={2} selectorOnly={3}",
+          m.id, m.name, selectedPatch.proof.kind,
+          selectedCandidate->candidate.selectorOnly ? 1 : 0);
+  }
   return selectedPatch;
 }
 

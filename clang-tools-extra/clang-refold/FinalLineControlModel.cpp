@@ -15,7 +15,6 @@
 #include "llvm/ADT/StringRef.h"
 
 #include <algorithm>
-#include <cstdlib>
 
 using namespace llvm;
 
@@ -282,28 +281,7 @@ bool HasCompleteFinalLineControlProof(
          candidate.removalProof.has_value();
 }
 
-bool FinalLineControlProofProvesRemovable(
-    const FinalLineControlPruneCandidate &candidate) {
-  return candidate.removalProof.has_value() &&
-         candidate.removalProof->verdict ==
-             FinalLineControlRemovalVerdict::Removable;
-}
-
 namespace {
-
-constexpr const char *FinalLineControlShadowAuditEnv =
-    "CLANG_REFOLD_FINAL_LINE_SHADOW_AUDIT";
-
-bool finalLineControlShadowAuditEnabled() {
-  const char *value = std::getenv(FinalLineControlShadowAuditEnv);
-  if (!value)
-    return false;
-  const StringRef text(value);
-  return !text.empty() && !text.equals_insensitive("0") &&
-         !text.equals_insensitive("false") &&
-         !text.equals_insensitive("off") &&
-         !text.equals_insensitive("no");
-}
 
 bool ownerLess(const std::optional<FinalLineControlOwnerKey> &lhs,
                const std::optional<FinalLineControlOwnerKey> &rhs) {
@@ -372,46 +350,6 @@ void CanonicalizeFinalLineControlPruneCandidates(
   }
 
   candidates = std::move(canonical);
-}
-
-void recordFinalLineControlProofAuditComparison(
-    FinalLineControlShadowAuditResult &audit,
-    const FinalLineControlPruneCandidate &candidate,
-    bool validationAcceptedDeletion, bool proofRemovable) {
-  if (!audit.enabled)
-    return;
-
-  const bool hasProof = HasCompleteFinalLineControlProof(candidate);
-  ++audit.comparisons;
-  if (!hasProof)
-    ++audit.missingProofs;
-
-  if (validationAcceptedDeletion == proofRemovable && hasProof) {
-    ++audit.matches;
-    return;
-  }
-
-  ++audit.mismatches;
-  if (validationAcceptedDeletion && !proofRemovable)
-    ++audit.oldOnly;
-  if (!validationAcceptedDeletion && proofRemovable)
-    ++audit.proofOnly;
-
-  if (audit.mismatchSamples.size() >= 32)
-    return;
-
-  FinalLineControlShadowAuditMismatch mismatch;
-  mismatch.finalBegin = candidate.finalBegin;
-  mismatch.finalEnd = candidate.finalEnd;
-  mismatch.origin = candidate.origin;
-  mismatch.oldModelRemovable = validationAcceptedDeletion;
-  mismatch.proofRemovable = proofRemovable;
-  mismatch.hasRemovalProof = hasProof;
-  if (candidate.obligationProof)
-    mismatch.obligation = candidate.obligationProof->obligation;
-  if (candidate.removalProof)
-    mismatch.removalVerdict = candidate.removalProof->verdict;
-  audit.mismatchSamples.push_back(std::move(mismatch));
 }
 
 bool candidateRangeIsValid(const FinalLineControlPruneCandidate &candidate,
@@ -662,7 +600,6 @@ FinalLineControlPruneResult PruneFinalLineControlDirectives(
     FinalLineControlValidationCallback validationCallback) {
   FinalLineControlPruneResult result;
   result.authority = GetFinalLineControlAuthorityContract();
-  result.shadowAudit.enabled = finalLineControlShadowAuditEnabled();
 
   std::string current = finalSource.str();
   std::vector<FinalLineControlPruneCandidate> currentCandidates(
@@ -674,10 +611,6 @@ FinalLineControlPruneResult PruneFinalLineControlDirectives(
 
     for (FinalLineControlPruneCandidate &candidate : currentCandidates) {
       if (!candidateMayBeValidationDischarged(candidate, current)) {
-        recordFinalLineControlProofAuditComparison(
-            result.shadowAudit, candidate,
-            /*validationAcceptedDeletion=*/false,
-            FinalLineControlProofProvesRemovable(candidate));
         continue;
       }
 
@@ -697,23 +630,14 @@ FinalLineControlPruneResult PruneFinalLineControlDirectives(
       }
 
       if (!validationAcceptedDeletion) {
-        recordFinalLineControlProofAuditComparison(
-            result.shadowAudit, candidate,
-            /*validationAcceptedDeletion=*/false,
-            FinalLineControlProofProvesRemovable(candidate));
         continue;
       }
 
       // The exact byte deletion has now been discharged by the executable
-      // oracle.  Store that theorem fact before reporting audit data or
-      // mutating the stream, so every surviving removal is represented by the
-      // compact proof carrier rather than by legacy scanner side state.
+      // oracle. Store that theorem fact before mutating the stream, so every
+      // surviving removal is represented by the compact proof carrier rather
+      // than by legacy scanner side state.
       markCandidateValidationDischarged(candidate);
-      recordFinalLineControlProofAuditComparison(
-          result.shadowAudit, candidate,
-          /*validationAcceptedDeletion=*/true,
-          FinalLineControlProofProvesRemovable(candidate));
-
       result.removedRanges.push_back({removedBegin, removedEnd});
       current = std::move(candidateOutput);
       adjustCandidatesAfterDeletion(currentCandidates, removedBegin, removedEnd);

@@ -209,9 +209,6 @@ FinalLineControlPruneCandidate MakeFinalLineControlPruneCandidate(
 bool HasCompleteFinalLineControlProof(
     const FinalLineControlPruneCandidate &candidate);
 
-bool FinalLineControlProofProvesRemovable(
-    const FinalLineControlPruneCandidate &candidate);
-
 /// Removed final-output range.  Ranges are reported in the coordinate space that
 /// existed when the deletion was performed, matching the engine's existing
 /// source-mapping adjustment convention.
@@ -239,43 +236,12 @@ struct FinalLineControlAuthorityContract {
 
 FinalLineControlAuthorityContract GetFinalLineControlAuthorityContract();
 
-/// Diagnostic comparison record retained for opt-in audit output.
-///
-/// After 6F there is no old scanner to compare against.  `oldModelRemovable` is
-/// therefore interpreted as "validation accepted this exact deletion", and
-/// `proofRemovable` means the compact proof was discharged to Removable for the
-/// same deletion.
-struct FinalLineControlShadowAuditMismatch {
-  uint64_t finalBegin = 0;
-  uint64_t finalEnd = 0;
-  FinalLineDirective::Origin origin = FinalLineDirective::Origin::Unknown;
-  bool oldModelRemovable = false;
-  bool proofRemovable = false;
-  bool hasRemovalProof = false;
-  std::optional<FinalLineControlObligation> obligation = std::nullopt;
-  std::optional<FinalLineControlRemovalVerdict> removalVerdict = std::nullopt;
-};
-
-struct FinalLineControlShadowAuditResult {
-  bool enabled = false;
-  uint64_t comparisons = 0;
-  uint64_t matches = 0;
-  uint64_t mismatches = 0;
-  uint64_t missingProofs = 0;
-  uint64_t oldOnly = 0;
-  uint64_t proofOnly = 0;
-  std::vector<FinalLineControlShadowAuditMismatch> mismatchSamples;
-
-  bool Equivalent() const { return mismatches == 0 && missingProofs == 0; }
-};
-
 struct FinalLineControlPruneResult {
   std::string output;
   uint32_t iterations = 0;
   bool changed = false;
   std::vector<FinalLineControlRemovedRange> removedRanges;
   FinalLineControlAuthorityContract authority;
-  FinalLineControlShadowAuditResult shadowAudit;
 };
 
 /// Optional executable oracle for a proposed final-stream #line deletion.

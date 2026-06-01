@@ -97,6 +97,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
@@ -772,34 +773,38 @@ private:
     return kind != LegacyPathKind::Unknown;
   }
 
-  /// \brief One opt-in Phase-0B no-legacy audit finding.
+  /// \brief One semantic no-legacy audit finding.
   ///
-  /// The audit is intentionally report-only.  It names the legacy category, the
-  /// engine boundary that observed it, and a deterministic detail string, but it
-  /// must never affect candidate construction, selector ordering, terminal
-  /// fallback state, or strict-mode theorem-audit counters.
+  /// The audit names the legacy category, the engine boundary that observed it,
+  /// and a deterministic detail string.  During strict/theorem validation it
+  /// becomes theorem state and may force the same explicit terminal fallback as
+  /// other audit violations.
   struct LegacyAuditEvidence {
     LegacyPathKind kind = LegacyPathKind::Unknown;
     std::string role;
     std::string detail;
   };
 
-  /// Return whether the developer-only no-legacy audit is enabled.
-  static bool IsNoLegacyAuditEnabled();
-
-  /// Return whether the developer-only no-legacy audit should fail closed.
+  /// Return whether semantic no-legacy auditing is active for this run.
   ///
-  /// Phase 0B made the no-legacy audit report-only.  Phase 3D adds this
-  /// separate opt-in switch so developers can make any emission-boundary legacy
-  /// escape force the same terminal out-of-domain path as other theorem-audit
-  /// failures, without changing ordinary llvm-lit runs.
-  static bool IsNoLegacyAuditStrictEnabled();
+  /// Step 6 removes the temporary environment-variable controls.  The audit is
+  /// now tied directly to strict/theorem validation: when this returns true,
+  /// findings are theorem state and may force the same fail-closed terminal
+  /// result as other undischarged emission-boundary obligations.
+  bool IsNoLegacyAuditEnabled() const;
 
   /// Build and emit a deterministic no-legacy audit finding.
   static LegacyAuditEvidence
   MakeLegacyAuditEvidence(LegacyPathKind kind, llvm::StringRef role,
                           llvm::StringRef detail = llvm::StringRef());
-  static void ReportNoLegacyAuditFinding(const LegacyAuditEvidence &evidence);
+
+  /// Emit one no-legacy finding and attach it to the theorem audit.
+  ///
+  /// Step 6 makes no-legacy cleanliness part of the strict/theorem invariant:
+  /// a strict engine run may not merely print findings and still report a
+  /// satisfied theorem audit.  Keeping this as the single reporting entry point
+  /// avoids duplicated counter/violation policy at individual audit sites.
+  void ReportNoLegacyAuditFinding(const LegacyAuditEvidence &evidence) const;
 
 #undef REFOLD_LEGACY_PATH_KIND_LIST
 
@@ -1288,10 +1293,11 @@ private:
     uint64_t selectorUnresolvedCompetitions = 0;
     uint64_t selectorDirectBypasses = 0;
 
-    // Phase 3D: accepted-result closure is fail-closed only in the opt-in
-    // no-legacy strict audit.  These counters make such failures visible in the
-    // theorem-audit summary without conflating them with ordinary selector
-    // competitions or proof-discharge failures.
+    // Phase 3D/Step 4: no-legacy audit findings are theorem-audit data, not
+    // ad hoc stderr-only diagnostics.  The aggregate count covers every
+    // emitted finding; the boundary/rejection counters keep the fail-closed
+    // emission-boundary subset distinct from ordinary proof-discharge failures.
+    uint64_t noLegacyAuditFindings = 0;
     uint64_t noLegacyEmissionBoundaryViolations = 0;
     uint64_t noLegacyStrictRejections = 0;
 
@@ -1327,10 +1333,10 @@ private:
     uint64_t stateTransitionUnknownMutationViolations = 0;
     uint64_t stateTransitionNoneWitnessViolations = 0;
 
-    // Phase 5A: direct state-sensitive handling inventory.  These counters are
-    // populated only by the opt-in no-legacy audit and make the remaining
-    // component-local state checks visible before later phases delete or route
-    // them through the gateway.
+    // Phase 5A: direct state-sensitive handling inventory.  Strict/theorem
+    // validation populates these counters to make the remaining component-local
+    // state checks visible before later phases delete or route them through the
+    // gateway.
     uint64_t directStateChecksAudited = 0;
     uint64_t directStateChecksDeltaFacts = 0;
     uint64_t directStateChecksGraphEdges = 0;
@@ -1456,16 +1462,31 @@ private:
   bool AuditTerminalFallbackProofFailure(
       const TerminalFallbackProofFailure &failure, llvm::StringRef role) const;
 
-  /// Report a Phase-3D no-legacy emission-boundary finding and, when strict
-  /// audit mode is enabled, convert it into an explicit terminal proof failure.
+  struct MacroPatch;
+
+  /// Report a no-legacy emission-boundary finding and, when strict theorem
+  /// validation is active, convert it into an explicit terminal proof failure.
   ///
   /// This helper is intentionally centralized so emission sites do not each
-  /// invent their own policy for "missing AcceptedResultCandidate".  Normal
-  /// no-legacy audit remains report-only; strict no-legacy audit is the only
-  /// mode that turns the finding itself into a fail-closed result.
+  /// invent their own policy for theorem-boundary audit findings.  Non-strict
+  /// diagnostic audit remains report-only; strict engine mode and transitional
+  /// strict audit mode turn the finding into a fail-closed result.
   bool RejectNoLegacyAuditFindingIfStrict(
       const LegacyAuditEvidence &evidence,
       const TerminalFallbackProofFailure &failure) const;
+
+  /// Build the canonical terminal failure used when a MacroPatch reaches an
+  /// emission boundary without the selected accepted-result carrier that Step 1
+  /// requires every emitted MacroPatch to carry.
+  TerminalFallbackProofFailure
+  MakeMissingSelectedMacroPatchCarrierFailure() const;
+
+  /// Enforce the Step 3 emission-boundary invariant for a MacroPatch whose
+  /// selected carrier is missing.  Strict engine runs fail closed immediately
+  /// without manufacturing replacement proof authority from the raw MacroPatch.
+  bool RejectMissingSelectedMacroPatchCarrier(
+      const MacroPatch &patch, llvm::StringRef role,
+      llvm::StringRef detail) const;
 
   /// Validate the Phase-5 state-transition gateway audit before bytes are
   /// emitted.  The gateway is the only place where a state-changing edit may
@@ -5523,16 +5544,40 @@ private:
     std::string payloadPreview;
   };
 
-  /// \brief Result returned by the Phase-3B accepted-result selector.
+  /// \brief Result returned by the accepted-result selector.
   ///
-  /// Older callers sometimes selected a path-local object and then rebuilt its
-  /// proof wrapper later.  Phase 3B makes the selector return the normalized
-  /// carrier that won the lattice competition together with the stable index of
-  /// the path-local artifact.  The index preserves existing ownership of the
-  /// concrete patch/edit object; the carrier is the theorem-facing selected
-  /// result and must be the object copied to, or restamped for, emission.
+  /// This carrier is theorem-facing: the selected candidate must already
+  /// normalize to one final emitted proof class. Selector-only staging objects
+  /// are deliberately kept out of this type so no internal macro-ranking proof
+  /// can be mistaken for an emitted accepted artifact.
   struct SelectedAcceptedResultCandidate {
     AcceptedResultCandidate candidate;
+    size_t index = 0;
+  };
+
+  /// \brief Macro-local selector carrier for internal macro competition.
+  ///
+  /// Macro candidate ranking sometimes needs a staging proof that is valid only
+  /// for choosing among macro spellings, such as a nested subtree/call-chain
+  /// candidate whose remaining obligation is the top-level proof-root rule.
+  /// That selector proof is not an emitted accepted artifact. When the same
+  /// concrete macro patch also has an emission-normalized proof, the emitted
+  /// carrier is stored separately and is the only object allowed to be stamped
+  /// onto MacroPatch::selectedAcceptedCandidate.
+  struct MacroSelectionCandidate {
+    AcceptedResultCandidate selectorCandidate;
+    std::optional<AcceptedResultCandidate> emittedCandidate;
+    bool selectorOnly = false;
+  };
+
+  /// \brief Result returned by the macro-local selector.
+  ///
+  /// The index points back to the caller-owned MacroPatch entry. The selected
+  /// macro carrier may have ranked by a selector-only proof, but callers must
+  /// stamp only emittedCandidate, never selectorCandidate, onto an emitted
+  /// MacroPatch.
+  struct SelectedMacroSelectionCandidate {
+    MacroSelectionCandidate candidate;
     size_t index = 0;
   };
 
@@ -7638,13 +7683,12 @@ private:
   /// into ProofSummary and its embedded EmittedProof.
   void SyncMacroPatchProofSummary(MacroPatch &patch) const;
 
-  /// \brief Report-only Phase-0B guard for accepted proof summaries.
+  /// \brief Strict/theorem guard for accepted proof summaries.
   ///
-  /// The no-legacy audit is dormant unless CLANG_REFOLD_NO_LEGACY_AUDIT is set.
-  /// These helpers therefore must not reject, restamp, reorder, or request
-  /// fallback.  They only report places where an accepted artifact is still
-  /// explainable by transitional side data instead of by the final theorem
-  /// carrier.
+  /// These helpers do not restamp, reorder, or manufacture replacement proof
+  /// authority.  In strict/theorem validation they report places where an
+  /// accepted artifact is still explainable by transitional side data instead
+  /// of by the final theorem carrier.
   bool AuditProofSummaryForLegacyAuthority(const ProofSummary &summary,
                                            llvm::StringRef role) const;
   bool AuditAcceptedResultCandidateForLegacyAuthority(
@@ -7696,12 +7740,11 @@ private:
 
   /// \brief Record the accepted candidate selected for a macro patch.
   ///
-  /// This is a Phase-3B bridge: macro selection still returns the concrete
-  /// MacroPatch so existing ownership maps remain unchanged, but the selected
-  /// theorem carrier is stored on the patch at the selection boundary.  Later
-  /// emission code may rebuild an emission-specific carrier from the same patch
-  /// proof, yet the fact that this path-local result competed and won is no
-  /// longer implicit in raw MacroPatch control flow.
+  /// Macro selection still returns the concrete MacroPatch so existing
+  /// ownership maps remain unchanged, but the selected theorem carrier is
+  /// stored on the patch at the selection boundary.  Later emission code may
+  /// only consume this stamped carrier; the fact that this path-local result
+  /// competed and won is no longer implicit in raw MacroPatch control flow.
   void StampSelectedMacroPatchCandidate(
       MacroPatch &patch, const AcceptedResultCandidate &candidate,
       llvm::StringRef role) const;
@@ -7885,18 +7928,49 @@ private:
   AcceptedResultCandidate
   BuildAcceptedMacroCandidate(const MacroPatch &patch) const;
 
-  /// \brief Wrap a macro patch in the discharged carrier used at the actual
-  /// byte-edit emission boundary.
+  /// \brief Restamp a macro selector carrier for byte-edit emission.
   ///
-  /// Separate selector admissibility from emitted semantic proof for
-  /// nested invocation-preserving macro artifacts. Selector competition still
-  /// uses BuildAcceptedMacroCandidate(), which retains the top-level proof-root
-  /// obligation for final competition. Once a nested preserving artifact has
-  /// already been selected by an internal construction flow and is about to be
-  /// emitted as a concrete TextEdit, this helper rebuilds its normalized proof
-  /// summary with the emission-specific preserving validator so the byte-edit
-  /// boundary sees a fully discharged carrier rather than a selector-only
-  /// exception.
+  /// The input candidate must come from BuildAcceptedMacroCandidate().  This
+  /// helper owns only the selector-to-emission proof transition, so macro
+  /// selection can derive both carriers without rebuilding or reauditing the
+  /// same MacroPatch proof twice.
+  AcceptedResultCandidate RestampAcceptedMacroCandidateForEmission(
+      const MacroPatch &patch, AcceptedResultCandidate candidate) const;
+
+  /// \brief Build the accepted-result carrier used by macro emission.
+  ///
+  /// Final macro selection uses BuildAcceptedMacroCandidate(), because selector
+  /// competition must still enforce selector-only obligations such as the
+  /// top-level proof-root rule.  At the byte-edit emission boundary, however,
+  /// an already accepted nested preserving macro patch is validated with the
+  /// emitted-artifact contract instead of being reclassified as a selector-only
+  /// candidate.  This helper is the single normalization point for that
+  /// emitted macro carrier so selection finalization and TextEdit attachment do
+  /// not duplicate the restamping logic.
+  AcceptedResultCandidate
+  BuildAcceptedMacroEmissionCandidate(const MacroPatch &patch) const;
+
+  /// \brief Ensure a macro patch queued for emission has a selected carrier.
+  ///
+  /// All MacroPatch objects that reach macroPatchesByOwner must cross this
+  /// helper before they can later materialize as TextEdit objects.  It refreshes
+  /// the canonical MacroPatchProof summary, builds the emitted-boundary
+  /// AcceptedResultCandidate through the shared theorem gate, and stamps the
+  /// selected carrier on the patch.  If the patch cannot normalize to one final
+  /// theorem proof, the shared missing-carrier invariant requests terminal
+  /// fallback instead of allowing an unstamped raw MacroPatch to survive to
+  /// emission.
+  bool FinalizeSelectedMacroPatchForEmission(MacroPatch &patch,
+                                             llvm::StringRef role) const;
+
+  /// \brief Return the selected carrier used at the actual macro byte-edit
+  /// emission boundary.
+  ///
+  /// Step 3 makes this helper a pure boundary accessor: proof authority must
+  /// already have been selected and stamped before the MacroPatch entered the
+  /// final emission bucket.  A missing selectedAcceptedCandidate is therefore
+  /// an invariant violation and is never repaired here by rebuilding from the
+  /// raw MacroPatch.
   AcceptedResultCandidate
   BuildAcceptedEmittedMacroCandidate(const MacroPatch &patch) const;
 
@@ -8030,18 +8104,62 @@ private:
   bool AcceptedResultCandidateHasOnlyNonTopLevelMacroSelectorFailure(
       const AcceptedResultCandidate &candidate) const;
 
+  /// \brief Shared deterministic selector loop.
+  ///
+  /// Accepted-result selection and macro-local selection use different
+  /// admissibility predicates, but they must share one stable ranking loop so
+  /// selector accounting and tie behavior cannot drift apart.
+  std::optional<size_t> SelectPreferredCandidateIndex(
+      size_t candidateCount, llvm::function_ref<bool(size_t)> isSelectable,
+      llvm::function_ref<bool(size_t, size_t)> prefers) const;
+
+  /// \brief Build the macro-local selector carrier for one macro patch.
+  ///
+  /// The selector candidate retains macro-ranking obligations. The emitted
+  /// candidate is built through the emission-specific macro proof gate and is
+  /// present only when it normalizes to one final theorem class. This keeps
+  /// selector-only macro proofs useful for deterministic ranking without making
+  /// them acceptable TextEdit carriers.
+  MacroSelectionCandidate BuildMacroSelectionCandidate(
+      const MacroPatch &patch, bool allowNonTopLevelMacroSelectorFailure) const;
+
+  /// \brief Return whether a macro selector carrier may participate in ranking.
+  ///
+  /// A macro candidate may rank either because its selector proof discharged as
+  /// a normal accepted result or because it is the narrow, caller-enabled
+  /// selector-only nested macro case. The latter is still not an emitted
+  /// accepted artifact.
+  bool IsSelectableMacroSelectionCandidate(
+      const MacroSelectionCandidate &candidate) const;
+
+  /// \brief Return whether one macro selector carrier outranks another.
+  ///
+  /// Macro-local ranking is intentionally based on selectorCandidate only. The
+  /// emittedCandidate exists solely for the later emission stamp and must not
+  /// change selector ordering.
+  bool MacroSelectionCandidatePrefers(
+      const MacroSelectionCandidate &lhs,
+      const MacroSelectionCandidate &rhs) const;
+
+  /// \brief Return the strongest selectable macro-local candidate.
+  ///
+  /// This selector is the only place where selector-only macro proofs may
+  /// participate. It never returns an AcceptedResultCandidate directly, which
+  /// prevents non-final selector proofs from reaching the emitted artifact
+  /// boundary.
+  std::optional<SelectedMacroSelectionCandidate>
+  SelectPreferredMacroSelectionCandidate(
+      ArrayRef<MacroSelectionCandidate> candidates) const;
+
   /// \brief Return the strongest selectable accepted candidate.
   ///
-  /// Phase 3B makes this the selector authority: a selected path-local result is
-  /// not considered selected until its normalized AcceptedResultCandidate has
-  /// survived proof-discharge gating and lattice preference here.  The returned
-  /// index points back into the caller-owned artifact array; the returned
-  /// candidate is the theorem-facing selected result that must be carried to
-  /// emission or explicitly restamped for the emitted-source discharge rule.
+  /// Accepted-result selection is reserved for emission-admissible artifacts.
+  /// Every candidate considered here must normalize to one final theorem proof;
+  /// selector-only macro staging objects must use
+  /// SelectPreferredMacroSelectionCandidate().
   std::optional<SelectedAcceptedResultCandidate>
   SelectPreferredAcceptedResultCandidate(
-      ArrayRef<AcceptedResultCandidate> candidates,
-      bool allowNonTopLevelMacroSelectorFailure = false) const;
+      ArrayRef<AcceptedResultCandidate> candidates) const;
 
   /// \brief Compatibility wrapper returning only the selected index.
   ///
@@ -8049,8 +8167,7 @@ private:
   /// index, but the implementation delegates to the carrier-returning selector
   /// above so there is only one selection authority.
   std::optional<size_t> SelectPreferredAcceptedResultCandidateIndex(
-      ArrayRef<AcceptedResultCandidate> candidates,
-      bool allowNonTopLevelMacroSelectorFailure = false) const;
+      ArrayRef<AcceptedResultCandidate> candidates) const;
 
   /// \brief Return whether \p m carries usable producer-side paste witnesses.
   ///
