@@ -3711,6 +3711,28 @@ std::string RefoldEngine::RunSinglePassRefold() {
     if (hasTopLevelCommaInReplacement(replacement))
       return false;
 
+    // This preference is only a tie-breaker for the case where the macro patch
+    // and the direct source edit spell the same invocation.  Empty-slot and
+    // __VA_OPT__ repairs can move tokens between formals while still preserving
+    // the macro call; deferring those patches to a literal TU argument edit
+    // produces a validating but less structural result such as
+    // `MAYBE_PLUS(3 + 4)` instead of `MAYBE_PLUS(3, 4)`.  Reconstruct the
+    // direct source edit and require byte-equivalence with the accepted macro
+    // patch before letting the TU edit compete.
+    if (!macro.invText || !macro.invB || span->second < span->first ||
+        span->first < *macro.invB)
+      return false;
+    const uint64_t relBegin64 = span->first - *macro.invB;
+    const uint64_t relEnd64 = span->second - *macro.invB;
+    if (relEnd64 < relBegin64 || relEnd64 > macro.invText->size())
+      return false;
+    std::string directEditInvocation = stringutils::replaceRange(
+        macro.invText->str(), static_cast<size_t>(relBegin64),
+        static_cast<size_t>(relEnd64), replacement.str());
+    if (StringRef(directEditInvocation).trim() !=
+        StringRef(macroCandidate.replacement).trim())
+      return false;
+
     trace("select/lattice",
           "prefer TU arg edit over macro args-only: macro id={0} name='{1}' "
           "argIdx={2} hunk A=[{3},{4}) B=[{5},{6}) src=[{7},{8})",
@@ -12234,6 +12256,598 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
   trace("macro/args", "  invArgRanges({0})={1}", invArgRanges.size(),
         stringutils::rangesToStringWithSlices(baseInvText, invArgRanges));
 
+
+  // Look up the exact defining directive recorded by the producer.  The replay
+  // proof below depends on the directive's replacement-token tape, so guessing
+  // by macro name would be unsound when definitions are shadowed or stale.
+  auto getDefinitionDirectiveForArgsOnly = [&]() -> const RefoldModel::MacroDirective * {
+    if (!m.definitionDirectiveId)
+      return nullptr;
+    for (const RefoldModel::MacroDirective &directive :
+         model_.GetMacroDirectives()) {
+      if (directive.id == *m.definitionDirectiveId)
+        return &directive;
+    }
+    return nullptr;
+  };
+
+  // Replay the macro definition's replacement-token tape rather than relying
+  // only on non-empty PPArgSpan records.  This covers proof surfaces where the
+  // producer legitimately has no A-side argument span for a formal: empty
+  // actuals, zero-token child actuals, and erased/exposed __VA_OPT__ payloads.
+  // The path is accepted only when the replacement-token tape matches the
+  // original A cover exactly and has a unique best B-side replay under the
+  // declared slot-boundary preference below.
+  auto tryDefinitionReplayArgsOnlyPatch = [&]() -> std::optional<MacroPatch> {
+    const RefoldModel::MacroDirective *definition =
+        getDefinitionDirectiveForArgsOnly();
+    if (!definition || definition->subkind != "#define" ||
+        !definition->functionLike || definition->name != m.name ||
+        definition->defParams.size() != m.defParams.size() ||
+        definition->replacementTokens.empty() || !m.cover.IsValid() ||
+        !m.stringifySpans.empty() || !m.pasteSpans.empty())
+      return std::nullopt;
+
+    auto cover = GetWholeCoverATokRange(m);
+    if (!cover || cover->first >= cover->second)
+      return std::nullopt;
+
+    // Normalized replacement-list node used by the replay solver.  It keeps
+    // literals, formal references, and nested __VA_OPT__ payloads in one small
+    // tree so the same structure can be matched against both the A expansion
+    // and the B expansion envelope.
+    struct ReplayElem {
+      enum class Kind { Literal, Param, VaOpt } kind = Kind::Literal;
+      std::string spelling;
+      uint32_t argIdx = 0;
+      std::vector<ReplayElem> children;
+    };
+
+    // Parse the producer's replacement-token tape into ReplayElem nodes.
+    // Stringification and token-paste are rejected here because they transform
+    // argument spelling before it reaches the PP output; those cases require
+    // the dedicated stringify/paste proof paths rather than raw token replay.
+    std::function<bool(size_t, size_t, std::vector<ReplayElem> &)>
+        parseReplayRange;
+    parseReplayRange = [&](size_t begin, size_t end,
+                           std::vector<ReplayElem> &out) -> bool {
+      for (size_t i = begin; i < end;) {
+        const RefoldModel::MacroReplacementToken &tok =
+            definition->replacementTokens[i];
+        if (tok.kind == RefoldModel::MacroReplacementTokenKind::ParamRef) {
+          if (!tok.paramIndex || *tok.paramIndex >= m.defParams.size())
+            return false;
+          ReplayElem elem;
+          elem.kind = ReplayElem::Kind::Param;
+          elem.argIdx = *tok.paramIndex;
+          out.push_back(std::move(elem));
+          ++i;
+          continue;
+        }
+
+        if (tok.spelling == "#" || tok.spelling == "##")
+          return false;
+
+        if (tok.spelling == "__VA_OPT__") {
+          // __VA_OPT__ contributes either nothing or its parenthesized payload.
+          // Parse the payload recursively so later A/B replay can choose the
+          // erased or exposed branch by matching concrete expansion tokens.
+          if (i + 1 >= end ||
+              definition->replacementTokens[i + 1].kind !=
+                  RefoldModel::MacroReplacementTokenKind::Literal ||
+              definition->replacementTokens[i + 1].spelling != "(")
+            return false;
+
+          unsigned depth = 1;
+          size_t j = i + 2;
+          for (; j < end; ++j) {
+            const auto &inner = definition->replacementTokens[j];
+            if (inner.kind != RefoldModel::MacroReplacementTokenKind::Literal)
+              continue;
+            if (inner.spelling == "(") {
+              ++depth;
+              continue;
+            }
+            if (inner.spelling == ")") {
+              if (--depth == 0)
+                break;
+            }
+          }
+          if (depth != 0 || j >= end)
+            return false;
+
+          ReplayElem elem;
+          elem.kind = ReplayElem::Kind::VaOpt;
+          if (!parseReplayRange(i + 2, j, elem.children))
+            return false;
+          out.push_back(std::move(elem));
+          i = j + 1;
+          continue;
+        }
+
+        ReplayElem elem;
+        elem.kind = ReplayElem::Kind::Literal;
+        elem.spelling = tok.spelling.str();
+        out.push_back(std::move(elem));
+        ++i;
+      }
+      return true;
+    };
+
+    std::vector<ReplayElem> pattern;
+    if (!parseReplayRange(0, definition->replacementTokens.size(), pattern) ||
+        pattern.empty())
+      return std::nullopt;
+
+    // Keep this heavier replay solver out of the ordinary non-empty argument
+    // case.  It exists for missing proof surfaces: a token-empty source slot, a
+    // formal with no recorded expansion span, or a __VA_OPT__ branch flip.
+    bool hasVaOpt = false;
+    std::function<void(ArrayRef<ReplayElem>)> markVaOpt =
+        [&](ArrayRef<ReplayElem> elems) {
+          for (const ReplayElem &elem : elems) {
+            if (elem.kind == ReplayElem::Kind::VaOpt)
+              hasVaOpt = true;
+            markVaOpt(elem.children);
+          }
+        };
+    markVaOpt(pattern);
+
+    bool hasEmptyFormalSourceSlot = false;
+    for (size_t i = 0; i < invArgRanges.size(); ++i) {
+      auto r = invArgRanges[i];
+      if (r.second < r.first || r.second > baseInvText.size())
+        return std::nullopt;
+      if (baseInvText.slice(r.first, r.second).trim().empty())
+        hasEmptyFormalSourceSlot = true;
+    }
+
+    bool hasMissingExpansionFormal = false;
+    for (size_t formalIdx = 0; formalIdx < invArgRanges.size(); ++formalIdx) {
+      bool saw = false;
+      for (const auto &as : m.argSpans) {
+        if (as.kind == PPArgSpanKind::Standard && as.argIdx == formalIdx &&
+            as.begin < as.end) {
+          saw = true;
+          break;
+        }
+      }
+      if (!saw)
+        hasMissingExpansionFormal = true;
+    }
+
+    if (!hasVaOpt && !hasEmptyFormalSourceSlot && !hasMissingExpansionFormal)
+      return std::nullopt;
+
+    // One occurrence of a formal while replaying the definition over the
+    // original A-side expansion.  Empty actuals and erased VA_OPT operands are
+    // represented as zero-width occurrences at the current token cursor, while
+    // ordinary formals carry their recorded PPArgSpan.
+    struct ReplayAOcc {
+      uint32_t argIdx = 0;
+      uint64_t aBegin = 0;
+      uint64_t aEnd = 0;
+      std::optional<RefoldModel::PPArgSpan> span;
+    };
+
+    std::vector<RefoldModel::PPArgSpan> standardSpans;
+    for (const auto &as : m.argSpans) {
+      if (as.kind == PPArgSpanKind::Standard && as.begin < as.end)
+        standardSpans.push_back(as);
+    }
+    llvm::sort(standardSpans, [](const RefoldModel::PPArgSpan &lhs,
+                                 const RefoldModel::PPArgSpan &rhs) {
+      if (lhs.begin != rhs.begin)
+        return lhs.begin < rhs.begin;
+      if (lhs.end != rhs.end)
+        return lhs.end < rhs.end;
+      return lhs.argIdx < rhs.argIdx;
+    });
+
+    auto matchLiteralAToken = [&](uint64_t tok, StringRef spelling) -> bool {
+      return tok < aToks_.size() && aToks_[static_cast<size_t>(tok)].spelling == spelling;
+    };
+
+    // Prove that the normalized replacement-list tree exactly regenerates the
+    // original A expansion cover.  Literal nodes must match one token; formal
+    // nodes either consume the next standard span for that formal or record a
+    // zero-width occurrence; __VA_OPT__ consumes its payload only when the
+    // payload has concrete A-side evidence.
+    std::function<bool(ArrayRef<ReplayElem>, uint64_t &, size_t &,
+                       std::vector<ReplayAOcc> &)>
+        matchAReplay;
+    matchAReplay = [&](ArrayRef<ReplayElem> elems, uint64_t &cursor,
+                       size_t &spanIdx,
+                       std::vector<ReplayAOcc> &occs) -> bool {
+      for (const ReplayElem &elem : elems) {
+        if (spanIdx < standardSpans.size() &&
+            standardSpans[spanIdx].begin < cursor)
+          return false;
+
+        switch (elem.kind) {
+        case ReplayElem::Kind::Literal:
+          if (!matchLiteralAToken(cursor, elem.spelling))
+            return false;
+          ++cursor;
+          break;
+        case ReplayElem::Kind::Param: {
+          ReplayAOcc occ;
+          occ.argIdx = elem.argIdx;
+          // Start as a zero-width occurrence.  A following PPArgSpan for the
+          // same formal turns this into an ordinary token-bearing occurrence;
+          // otherwise the zero-width marker is the proof surface for an empty
+          // source actual or a zero-token child actual.
+          occ.aBegin = cursor;
+          occ.aEnd = cursor;
+          if (spanIdx < standardSpans.size() &&
+              standardSpans[spanIdx].begin == cursor &&
+              standardSpans[spanIdx].argIdx == elem.argIdx) {
+            occ.span = standardSpans[spanIdx];
+            occ.aBegin = standardSpans[spanIdx].begin;
+            occ.aEnd = standardSpans[spanIdx].end;
+            cursor = standardSpans[spanIdx].end;
+            ++spanIdx;
+          }
+          occs.push_back(std::move(occ));
+          break;
+        }
+        case ReplayElem::Kind::VaOpt: {
+          uint64_t includeCursor = cursor;
+          size_t includeSpanIdx = spanIdx;
+          std::vector<ReplayAOcc> includeOccs = occs;
+          const bool includeOK = matchAReplay(elem.children, includeCursor,
+                                             includeSpanIdx, includeOccs);
+
+          // Skipping __VA_OPT__ consumes no A tokens.  If both branches match
+          // without consuming anything, the A-side replay is ambiguous; if the
+          // include branch consumes tokens/spans, prefer it because those tokens
+          // are concrete evidence that the payload was exposed in A.
+          if (includeOK &&
+              (includeCursor != cursor || includeSpanIdx != spanIdx)) {
+            cursor = includeCursor;
+            spanIdx = includeSpanIdx;
+            occs = std::move(includeOccs);
+          }
+          break;
+        }
+        }
+      }
+      return true;
+    };
+
+    uint64_t aCursor = cover->first;
+    size_t spanIdx = 0;
+    std::vector<ReplayAOcc> aOccs;
+    if (!matchAReplay(pattern, aCursor, spanIdx, aOccs) ||
+        aCursor != cover->second || spanIdx != standardSpans.size())
+      return std::nullopt;
+
+    // Map the proven A replay cover to the B-side envelope that must be
+    // segmented by the same replacement-list tree.  This solver enumerates
+    // token partitions, so keep the envelope bounded and fail closed on large
+    // surfaces that should be handled by the normal template/DAG machinery.
+    auto bEnv = MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
+        cover->first, cover->second);
+    if (!bEnv || bEnv->first > bEnv->second ||
+        bEnv->second > bToks_.size())
+      return std::nullopt;
+    if ((bEnv->second - bEnv->first) > 128)
+      return std::nullopt;
+
+    // Count the old A-token contribution per formal.  The B replay uses this
+    // to distinguish true empty-formal insertions, where a zero-length B range
+    // is legal, from ordinary non-empty formals, where assigning no B tokens
+    // would silently erase source structure.
+    std::vector<unsigned> oldTokenCountByFormal(invArgRanges.size(), 0);
+    for (const ReplayAOcc &occ : aOccs) {
+      if (occ.argIdx < oldTokenCountByFormal.size())
+        oldTokenCountByFormal[occ.argIdx] +=
+            static_cast<unsigned>(occ.aEnd - occ.aBegin);
+    }
+
+    // A B-side replay assignment.  `ranges[i]` is the token interval selected
+    // for formal i; `assigned[i]` records whether that formal appeared in the
+    // replay.  Repeated occurrences of the same formal must later agree on
+    // identical B text.
+    struct ReplaySolution {
+      std::vector<std::pair<size_t, size_t>> ranges;
+      std::vector<char> assigned;
+      unsigned vaOptIncludedCount = 0;
+    };
+
+    ReplaySolution seed;
+    seed.ranges.resize(invArgRanges.size(), {0, 0});
+    seed.assigned.resize(invArgRanges.size(), 0);
+    std::vector<ReplaySolution> solutions;
+
+    // Assign a candidate B-token interval to a formal.  If the formal appears
+    // multiple times in the replacement list, every occurrence must spell the
+    // same trimmed B text; otherwise one call-site argument could not satisfy
+    // all replayed occurrences.
+    auto assignFormalRange = [&](ReplaySolution &sol, uint32_t argIdx,
+                                 std::pair<size_t, size_t> range) -> bool {
+      if (argIdx >= sol.ranges.size() || range.second < range.first)
+        return false;
+      if (sol.assigned[argIdx]) {
+        StringRef oldText = SliceBSource(sol.ranges[argIdx].first,
+                                         sol.ranges[argIdx].second).trim();
+        StringRef newText = SliceBSource(range.first, range.second).trim();
+        return oldText == newText;
+      }
+      sol.assigned[argIdx] = 1;
+      sol.ranges[argIdx] = range;
+      return true;
+    };
+
+    // Exhaustively segment the B envelope according to the same replay tree.
+    // Literal nodes consume fixed tokens, parameter nodes choose a token range
+    // for the corresponding formal, and __VA_OPT__ tries both the erased and
+    // exposed branches.  The search is bounded above so ambiguity or explosion
+    // causes a conservative failure rather than a heuristic selection.
+    std::function<void(ArrayRef<ReplayElem>, size_t, size_t, ReplaySolution &,
+                       std::function<void(size_t, ReplaySolution &)>)>
+        dfsElems;
+    dfsElems = [&](ArrayRef<ReplayElem> elems, size_t elemIdx, size_t bPos,
+                   ReplaySolution &sol,
+                   std::function<void(size_t, ReplaySolution &)> done) {
+      if (solutions.size() > 128)
+        return;
+      if (elemIdx == elems.size()) {
+        done(bPos, sol);
+        return;
+      }
+
+      const ReplayElem &elem = elems[elemIdx];
+      switch (elem.kind) {
+      case ReplayElem::Kind::Literal:
+        if (bPos < bEnv->second && bToks_[bPos].spelling == elem.spelling)
+          dfsElems(elems, elemIdx + 1, bPos + 1, sol, done);
+        return;
+      case ReplayElem::Kind::Param: {
+        // Only a formal that contributed no A tokens may be assigned an empty B
+        // interval.  For token-bearing formals, a zero-length assignment would
+        // be deletion, not an args-only preservation proof.
+        const bool oldWasEmpty =
+            elem.argIdx < oldTokenCountByFormal.size() &&
+            oldTokenCountByFormal[elem.argIdx] == 0;
+        for (size_t end = bPos; end <= bEnv->second; ++end) {
+          if (!oldWasEmpty && end == bPos)
+            continue;
+          ReplaySolution next = sol;
+          if (!assignFormalRange(next, elem.argIdx, {bPos, end}))
+            continue;
+          dfsElems(elems, elemIdx + 1, end, next, done);
+          if (solutions.size() > 128)
+            return;
+        }
+        return;
+      }
+      case ReplayElem::Kind::VaOpt: {
+        // Erased branch.
+        dfsElems(elems, elemIdx + 1, bPos, sol, done);
+        if (solutions.size() > 128)
+          return;
+
+        // Exposed branch.  The payload must consume at least one B token; an
+        // empty exposed payload is indistinguishable from the erased branch here.
+        ReplaySolution withPayload = sol;
+        const size_t payloadBegin = bPos;
+        dfsElems(elem.children, 0, bPos, withPayload,
+                 [&](size_t payloadEnd, ReplaySolution &afterPayload) {
+                   if (payloadEnd == payloadBegin)
+                     return;
+                   ReplaySolution cont = afterPayload;
+                   ++cont.vaOptIncludedCount;
+                   dfsElems(elems, elemIdx + 1, payloadEnd, cont, done);
+                 });
+        return;
+      }
+      }
+    };
+
+    dfsElems(pattern, 0, bEnv->first, seed,
+             [&](size_t finalPos, ReplaySolution &sol) {
+               if (finalPos == bEnv->second)
+                 solutions.push_back(sol);
+             });
+
+    if (solutions.empty() || solutions.size() > 128)
+      return std::nullopt;
+
+    // Trimmed source spelling of a formal slot in the original invocation; used
+    // only for deterministic scoring and no-op detection after B replay.
+    auto formalSourceTrim = [&](uint32_t idx) -> StringRef {
+      if (idx >= invArgRanges.size())
+        return StringRef();
+      auto r = invArgRanges[idx];
+      if (r.second < r.first || r.second > baseInvText.size())
+        return StringRef();
+      return baseInvText.slice(r.first, r.second).trim();
+    };
+
+    // Ranking key for otherwise-valid B replays.  Prefer solutions that change
+    // existing non-empty formals the least, allocate newly inserted tokens into
+    // originally-empty slots, and keep exposed __VA_OPT__ payloads when present.
+    // A final lexical tie-break is allowed only after the semantic scores agree.
+    struct ScoredSolution {
+      ReplaySolution sol;
+      uint64_t nonEmptyDeviation = 0;
+      uint64_t emptySlotTokenCount = 0;
+      uint64_t vaOptIncludedCount = 0;
+      std::string rewritten;
+    };
+
+    // Convert a B replay assignment back into concrete call-site text.  This
+    // edits parsed formal slots in the original invocation spelling rather than
+    // emitting expansion text, preserving the macro call when the replay proof
+    // determines a unique replacement for each slot.
+    auto buildReplayInvocation = [&](const ReplaySolution &sol)
+        -> std::optional<std::string> {
+      struct LocalEdit {
+        size_t begin = 0;
+        size_t end = 0;
+        std::string repl;
+      };
+      SmallVector<LocalEdit, 8> edits;
+
+      for (uint32_t i = 0; i < invArgRanges.size(); ++i) {
+        if (i >= sol.assigned.size())
+          return std::nullopt;
+        std::string repl;
+        if (sol.assigned[i])
+          repl = SliceBSource(sol.ranges[i].first, sol.ranges[i].second)
+                     .trim()
+                     .str();
+        else if (i < m.defParams.size() && m.defParams[i].variadic)
+          repl = "";
+        else
+          return std::nullopt;
+
+        auto r = invArgRanges[i];
+        if (r.second < r.first || r.second > baseInvText.size())
+          return std::nullopt;
+
+        if (StringRef(repl).trim() == baseInvText.slice(r.first, r.second).trim())
+          continue;
+        if (i < m.defParams.size() && !m.defParams[i].variadic &&
+            !repl.empty() && hasTopLevelComma(repl))
+          return std::nullopt;
+
+        size_t editBegin = r.first;
+        size_t editEnd = r.second;
+        std::string editText = StringRef(repl).trim().str();
+
+        // Variadic tail edits may need to create or remove the separating comma
+        // in the invocation spelling.  For insertion into an empty tail, add the
+        // comma with the new text; for erasure, widen the edit leftward to the
+        // existing comma so `M(x, y)` becomes `M(x)`, not `M(x, )`.
+        const bool isTrailingVariadic =
+            i + 1 == invArgRanges.size() && i < m.defParams.size() &&
+            m.defParams[i].variadic;
+        if (isTrailingVariadic && r.first == r.second && !editText.empty()) {
+          editText = (", " + editText);
+        } else if (isTrailingVariadic && !baseInvText.slice(r.first, r.second).empty() &&
+                   editText.empty()) {
+          size_t prevEnd = 0;
+          if (i > 0)
+            prevEnd = invArgRanges[i - 1].second;
+          size_t comma = StringRef::npos;
+          for (size_t pos = r.first; pos > prevEnd; --pos) {
+            if (baseInvText[pos - 1] == ',') {
+              comma = pos - 1;
+              break;
+            }
+          }
+          if (comma != StringRef::npos)
+            editBegin = comma;
+        }
+
+        edits.push_back(LocalEdit{editBegin, editEnd, std::move(editText)});
+      }
+
+      if (edits.empty())
+        return std::nullopt;
+      llvm::sort(edits, [](const LocalEdit &lhs, const LocalEdit &rhs) {
+        if (lhs.begin != rhs.begin)
+          return lhs.begin > rhs.begin;
+        return lhs.end > rhs.end;
+      });
+
+      std::string rewritten = baseInvText.str();
+      size_t previousBegin = std::numeric_limits<size_t>::max();
+      for (const LocalEdit &edit : edits) {
+        if (edit.end < edit.begin || edit.end > rewritten.size())
+          return std::nullopt;
+        if (previousBegin != std::numeric_limits<size_t>::max() &&
+            edit.end > previousBegin)
+          return std::nullopt;
+        previousBegin = edit.begin;
+        rewritten = stringutils::replaceRange(rewritten, edit.begin, edit.end,
+                                              edit.repl);
+      }
+      return StringRef(rewritten).trim().str();
+    };
+
+    std::optional<ScoredSolution> best;
+    for (const ReplaySolution &sol : solutions) {
+      auto rewritten = buildReplayInvocation(sol);
+      if (!rewritten)
+        continue;
+
+      ScoredSolution scored;
+      scored.sol = sol;
+      scored.rewritten = std::move(*rewritten);
+      scored.vaOptIncludedCount = sol.vaOptIncludedCount;
+      for (uint32_t i = 0; i < invArgRanges.size(); ++i) {
+        const unsigned oldN = i < oldTokenCountByFormal.size()
+                                  ? oldTokenCountByFormal[i]
+                                  : 0;
+        const unsigned newN = sol.assigned[i]
+                                  ? static_cast<unsigned>(sol.ranges[i].second -
+                                                          sol.ranges[i].first)
+                                  : 0;
+        if (formalSourceTrim(i).empty()) {
+          scored.emptySlotTokenCount += newN;
+        } else if (oldN > newN) {
+          scored.nonEmptyDeviation += oldN - newN;
+        } else {
+          scored.nonEmptyDeviation += newN - oldN;
+        }
+      }
+
+      // Deterministic preference among multiple exact B replays.  The order
+      // encodes the proof intent: preserve stable non-empty slots, fill
+      // originally-empty slots when the edit inserted tokens, prefer exposed
+      // VA_OPT payloads, and only then use spelling order for determinism.
+      auto better = [](const ScoredSolution &lhs,
+                       const ScoredSolution &rhs) {
+        if (lhs.nonEmptyDeviation != rhs.nonEmptyDeviation)
+          return lhs.nonEmptyDeviation < rhs.nonEmptyDeviation;
+        if (lhs.emptySlotTokenCount != rhs.emptySlotTokenCount)
+          return lhs.emptySlotTokenCount > rhs.emptySlotTokenCount;
+        if (lhs.vaOptIncludedCount != rhs.vaOptIncludedCount)
+          return lhs.vaOptIncludedCount > rhs.vaOptIncludedCount;
+        return lhs.rewritten < rhs.rewritten;
+      };
+
+      if (!best || better(scored, *best)) {
+        best = std::move(scored);
+      } else if (best->nonEmptyDeviation == scored.nonEmptyDeviation &&
+                 best->emptySlotTokenCount == scored.emptySlotTokenCount &&
+                 best->vaOptIncludedCount == scored.vaOptIncludedCount &&
+                 best->rewritten != scored.rewritten) {
+        // Same semantic score but different call-site spellings means the B
+        // envelope did not determine a unique source repair.  Fail closed
+        // rather than choosing an arbitrary refolding.
+        return std::nullopt;
+      }
+    }
+
+    if (!best || StringRef(best->rewritten).trim() == baseInvText.trim())
+      return std::nullopt;
+
+    trace("macro/template",
+          "definition replay solver SUCCESS root id={0} name={1} "
+          "coverA=[{2},{3}) coverB=[{4},{5}) newInv='{6}'",
+          m.id, m.name, cover->first, cover->second, bEnv->first, bEnv->second,
+          stringutils::showWsWithClip(best->rewritten, 240));
+
+    MacroPatch patch{*m.invB, *m.invE, std::move(best->rewritten), m.id};
+    // The replacement text is the full rewritten invocation, so the
+    // materialized output range covers the replacement string.  The B-token
+    // proof range remains the mapped expansion envelope stamped below.
+    patch.materializedOutputByteStart = 0;
+    patch.materializedOutputByteEnd = patch.replacement.size();
+    patch.hasMaterializedOutputByteRange = true;
+    stampMacroPatchMaterializedBTokenRange(
+        patch, static_cast<uint64_t>(bEnv->first),
+        static_cast<uint64_t>(bEnv->second));
+    StampMacroPatchProof(patch, MacroPatchProofKind::ArgsOnlyStandard,
+                         /*validated=*/true,
+                         /*structurePreserving=*/true, m.id);
+    return patch;
+  };
+
   // Derive one standard argument span per formal from the invocation spelling
   // currently being rebuilt.
   //
@@ -12243,6 +12857,49 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
   // accepted only when the maximal standard spans plus body spans exactly tile
   // the invocation's whole expansion cover; that exact tiling proves we are
   // merely rebasing formal indices, not inventing a new expansion structure.
+  // Sort standard argument spans into a canonical order and remove exact
+  // duplicates before selecting maximal current-level spans.  The producer can
+  // record the same standard span more than once when a nested identity wrapper
+  // forwards the same expansion token through several macro levels.  Those
+  // duplicates are not distinct occurrences of the current invocation's formal
+  // tape; counting them would make the exact-cover proof reject otherwise
+  // deterministic nested-call reconstruction.  Only byte-for-byte identical
+  // span records are coalesced; same-token spans with different metadata remain
+  // visible and therefore keep the proof fail-closed.
+  auto canonicalizeStandardArgSpans =
+      [](SmallVectorImpl<RefoldModel::PPArgSpan> &spans) {
+        llvm::sort(spans, [](const RefoldModel::PPArgSpan &lhs,
+                             const RefoldModel::PPArgSpan &rhs) {
+          if (lhs.begin != rhs.begin)
+            return lhs.begin < rhs.begin;
+          if (lhs.end != rhs.end)
+            return lhs.end < rhs.end;
+          if (lhs.argIdx != rhs.argIdx)
+            return lhs.argIdx < rhs.argIdx;
+          if (lhs.kind != rhs.kind)
+            return static_cast<unsigned>(lhs.kind) <
+                   static_cast<unsigned>(rhs.kind);
+          if (lhs.byteBegin != rhs.byteBegin)
+            return lhs.byteBegin < rhs.byteBegin;
+          if (lhs.byteEnd != rhs.byteEnd)
+            return lhs.byteEnd < rhs.byteEnd;
+          if (lhs.ppByteBegin != rhs.ppByteBegin)
+            return lhs.ppByteBegin < rhs.ppByteBegin;
+          return lhs.ppByteEnd < rhs.ppByteEnd;
+        });
+
+        auto sameSpan = [](const RefoldModel::PPArgSpan &lhs,
+                           const RefoldModel::PPArgSpan &rhs) {
+          return lhs.begin == rhs.begin && lhs.end == rhs.end &&
+                 lhs.argIdx == rhs.argIdx && lhs.kind == rhs.kind &&
+                 lhs.byteBegin == rhs.byteBegin && lhs.byteEnd == rhs.byteEnd &&
+                 lhs.ppByteBegin == rhs.ppByteBegin &&
+                 lhs.ppByteEnd == rhs.ppByteEnd;
+        };
+        spans.erase(std::unique(spans.begin(), spans.end(), sameSpan),
+                    spans.end());
+      };
+
   auto getCurrentLevelStandardArgSpans = [&]()
       -> std::optional<std::vector<RefoldModel::PPArgSpan>> {
     auto coverOpt = GetWholeCoverATokRange(m);
@@ -12257,6 +12914,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     }
     if (standard.empty())
       return std::nullopt;
+    canonicalizeStandardArgSpans(standard);
 
     // Drop spans contained in another standard span so nested child-argument
     // evidence cannot be mistaken for a current invocation formal.
@@ -12410,6 +13068,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       }
       if (standard.empty())
         return std::nullopt;
+      canonicalizeStandardArgSpans(standard);
 
       SmallVector<RefoldModel::PPArgSpan, 16> maximal;
       for (const auto &cand : standard) {
@@ -12541,7 +13200,10 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     buildInvocationSyntaxFromCurrentLevelTemplate =
         [&](const RefoldModel::MacroInvocation &inv, unsigned depth)
         -> std::optional<std::string> {
-      if (depth > 8 || !inv.invText || !inv.invB || !inv.invE ||
+      // The recursion follows recorded child invocation edges.  A path deeper
+      // than the number of recorded invocations implies a cycle or stale
+      // metadata, so use that structural bound instead of a fixed depth cap.
+      if (depth > model_.GetMacroInvocations().size() || !inv.invText || !inv.invB || !inv.invE ||
           !inv.stringifySpans.empty() || !inv.pasteSpans.empty())
         return std::nullopt;
 
@@ -13225,6 +13887,12 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
                          /*structurePreserving=*/true, m.id);
     return patch;
   };
+
+  // Try definition replay before the ordinary template solver.  Replay is the
+  // only args-only proof that can see empty formal slots and VA_OPT erasure,
+  // while the template solver expects concrete expansion occurrences.
+  if (auto replayPatch = tryDefinitionReplayArgsOnlyPatch())
+    return replayPatch;
 
   if (auto templatePatch = tryTemplateSolvedArgsOnlyPatch())
     return templatePatch;
@@ -14256,6 +14924,290 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
           return false;
       }
 
+      // A tuple-forwarding child can use one tuple element as a callee and a
+      // different tuple element as that callee's argument, e.g.
+      // `WRAP((ADD_ONE, 10))` -> `CALL(ADD_ONE, 10)` -> `ADD_ONE(10)`.
+      // In that shape the only expansion occurrence visible at the WRAP level is
+      // the full callee expansion `((10) + 1)`, so the direct tuple-ref map above
+      // has no key for the tuple element `10`.  Recover that missing element
+      // rewrite by proving the child replacement-list constructs a function-like
+      // invocation from tuple-ref formals and then replaying the callee's own
+      // replacement-token tape against the observed old/new expansion text.
+      auto deriveTupleElementRewritesThroughForwardedCallee = [&]() -> bool {
+        if (!tupleChild || !tupleChild->definitionDirectiveId)
+          return true;
+
+        const RefoldModel::MacroDirective *childDefinition = nullptr;
+        for (const RefoldModel::MacroDirective &directive :
+             model_.GetMacroDirectives()) {
+          if (directive.id == *tupleChild->definitionDirectiveId) {
+            childDefinition = &directive;
+            break;
+          }
+        }
+        if (!childDefinition || childDefinition->subkind != "#define" ||
+            !childDefinition->functionLike)
+          return true;
+
+        // The accepted forwarding shape is a replacement list of the form
+        //   <callee-param> '(' <argument-param/literal tape> ')'
+        // with the callee and each argument coming from direct tuple refs.  This
+        // is a syntactic proof of a generated call, not a name-based heuristic.
+        const auto &repToks = childDefinition->replacementTokens;
+        if (repToks.size() < 4)
+          return true;
+        if (repToks[0].kind != RefoldModel::MacroReplacementTokenKind::ParamRef ||
+            !repToks[0].paramIndex || *repToks[0].paramIndex >= childArgs.size())
+          return true;
+        if (repToks[1].kind != RefoldModel::MacroReplacementTokenKind::Literal ||
+            repToks[1].spelling != "(")
+          return true;
+        if (repToks.back().kind !=
+                RefoldModel::MacroReplacementTokenKind::Literal ||
+            repToks.back().spelling != ")")
+          return true;
+
+        const uint32_t calleeChildArgIdx = *repToks[0].paramIndex;
+        std::optional<StringRef> calleeName;
+        for (const auto &arg : childArgs) {
+          if (arg.first == calleeChildArgIdx) {
+            calleeName = arg.second.trim();
+            break;
+          }
+        }
+        if (!calleeName || calleeName->empty())
+          return true;
+
+        const RefoldModel::MacroDirective *calleeDefinition = nullptr;
+        for (const RefoldModel::MacroDirective &directive :
+             model_.GetMacroDirectives()) {
+          if (directive.subkind == "#define" && directive.functionLike &&
+              directive.name == *calleeName) {
+            if (calleeDefinition)
+              return false;
+            calleeDefinition = &directive;
+          }
+        }
+        if (!calleeDefinition)
+          return true;
+
+        SmallVector<uint32_t, 4> forwardedChildArgs;
+        for (size_t i = 2, e = repToks.size() - 1; i < e; ++i) {
+          const auto &tok = repToks[i];
+          if (tok.spelling == "#" || tok.spelling == "##" ||
+              tok.spelling == "__VA_OPT__")
+            return true;
+          if (tok.kind != RefoldModel::MacroReplacementTokenKind::ParamRef)
+            continue;
+          if (!tok.paramIndex || *tok.paramIndex >= childArgs.size())
+            return true;
+          forwardedChildArgs.push_back(*tok.paramIndex);
+        }
+        if (forwardedChildArgs.empty() ||
+            forwardedChildArgs.size() != calleeDefinition->defParams.size())
+          return true;
+
+        auto childArgText = [&](uint32_t childArgIdx) -> std::optional<StringRef> {
+          for (const auto &arg : childArgs)
+            if (arg.first == childArgIdx)
+              return arg.second.trim();
+          return std::nullopt;
+        };
+
+        SmallVector<std::string, 4> oldActuals;
+        oldActuals.reserve(forwardedChildArgs.size());
+        for (uint32_t childArgIdx : forwardedChildArgs) {
+          auto text = childArgText(childArgIdx);
+          if (!text)
+            return true;
+          oldActuals.push_back(text->str());
+        }
+
+        struct ReplayTok {
+          std::string spelling;
+          size_t begin = 0;
+          size_t end = 0;
+        };
+        auto lexReplayTokens = [&](StringRef text,
+                                   SmallVectorImpl<ReplayTok> &out) {
+          out.clear();
+          SmallVector<LexBoundaryToken, 16> toks;
+          lexBoundaryTokens(text, lexLang_, toks);
+          for (const LexBoundaryToken &tok : toks)
+            out.push_back(ReplayTok{tok.Spelling, tok.Begin, tok.End});
+        };
+
+        auto tokenSpellingsForText = [&](StringRef text) {
+          SmallVector<ReplayTok, 8> toks;
+          lexReplayTokens(text, toks);
+          SmallVector<std::string, 8> out;
+          for (const ReplayTok &tok : toks)
+            out.push_back(tok.spelling);
+          return out;
+        };
+
+        struct CalleeReplayElem {
+          bool isParam = false;
+          std::string literal;
+          uint32_t paramIdx = 0;
+        };
+        SmallVector<CalleeReplayElem, 16> calleePattern;
+        for (const RefoldModel::MacroReplacementToken &tok :
+             calleeDefinition->replacementTokens) {
+          if (tok.spelling == "#" || tok.spelling == "##" ||
+              tok.spelling == "__VA_OPT__")
+            return true;
+          CalleeReplayElem elem;
+          if (tok.kind == RefoldModel::MacroReplacementTokenKind::ParamRef) {
+            if (!tok.paramIndex || *tok.paramIndex >= oldActuals.size())
+              return true;
+            elem.isParam = true;
+            elem.paramIdx = *tok.paramIndex;
+          } else {
+            elem.literal = tok.spelling.str();
+          }
+          calleePattern.push_back(std::move(elem));
+        }
+        if (calleePattern.empty())
+          return true;
+
+        SmallVector<SmallVector<std::string, 8>, 4> oldActualTokSpellings;
+        for (const std::string &actual : oldActuals)
+          oldActualTokSpellings.push_back(tokenSpellingsForText(actual));
+
+        auto tokenRangeEquals = [](ArrayRef<ReplayTok> toks, size_t begin,
+                                   ArrayRef<std::string> expected) {
+          if (begin + expected.size() > toks.size())
+            return false;
+          for (size_t i = 0; i < expected.size(); ++i)
+            if (toks[begin + i].spelling != expected[i])
+              return false;
+          return true;
+        };
+
+        auto matchOldExpansion = [&](StringRef oldExpansion) {
+          SmallVector<ReplayTok, 16> toks;
+          lexReplayTokens(oldExpansion, toks);
+          size_t pos = 0;
+          for (const CalleeReplayElem &elem : calleePattern) {
+            if (!elem.isParam) {
+              if (pos >= toks.size() || toks[pos].spelling != elem.literal)
+                return false;
+              ++pos;
+              continue;
+            }
+            const auto &expected = oldActualTokSpellings[elem.paramIdx];
+            if (!tokenRangeEquals(toks, pos, expected))
+              return false;
+            pos += expected.size();
+          }
+          return pos == toks.size();
+        };
+
+        auto solveNewExpansion = [&](StringRef newExpansion)
+            -> std::optional<SmallVector<std::string, 4>> {
+          SmallVector<ReplayTok, 16> toks;
+          lexReplayTokens(newExpansion, toks);
+          SmallVector<std::optional<std::pair<size_t, size_t>>, 4> assigned;
+          assigned.resize(calleeDefinition->defParams.size());
+          SmallVector<SmallVector<std::string, 4>, 4> solutions;
+
+          std::function<void(size_t, size_t)> dfs = [&](size_t elemIdx,
+                                                        size_t tokPos) {
+            if (solutions.size() > 1)
+              return;
+            if (elemIdx == calleePattern.size()) {
+              if (tokPos != toks.size())
+                return;
+              SmallVector<std::string, 4> actuals;
+              for (const auto &range : assigned) {
+                if (!range)
+                  return;
+                if (range->first == range->second) {
+                  actuals.push_back(std::string());
+                  continue;
+                }
+                const size_t byteBegin = toks[range->first].begin;
+                const size_t byteEnd = toks[range->second - 1].end;
+                actuals.push_back(newExpansion.slice(byteBegin, byteEnd).str());
+              }
+              solutions.push_back(std::move(actuals));
+              return;
+            }
+
+            const CalleeReplayElem &elem = calleePattern[elemIdx];
+            if (!elem.isParam) {
+              if (tokPos < toks.size() && toks[tokPos].spelling == elem.literal)
+                dfs(elemIdx + 1, tokPos + 1);
+              return;
+            }
+
+            if (elem.paramIdx >= assigned.size())
+              return;
+            if (assigned[elem.paramIdx]) {
+              const auto range = *assigned[elem.paramIdx];
+              const size_t width = range.second - range.first;
+              if (tokPos + width <= toks.size()) {
+                bool same = true;
+                for (size_t i = 0; i < width; ++i) {
+                  if (toks[range.first + i].spelling != toks[tokPos + i].spelling) {
+                    same = false;
+                    break;
+                  }
+                }
+                if (same)
+                  dfs(elemIdx + 1, tokPos + width);
+              }
+              return;
+            }
+
+            for (size_t end = tokPos; end <= toks.size(); ++end) {
+              assigned[elem.paramIdx] = std::make_pair(tokPos, end);
+              dfs(elemIdx + 1, end);
+              assigned[elem.paramIdx].reset();
+              if (solutions.size() > 1)
+                return;
+            }
+          };
+
+          dfs(0, 0);
+          if (solutions.size() != 1)
+            return std::nullopt;
+          return solutions.front();
+        };
+
+        for (const OccObservation &obs : occObservations) {
+          if (!matchOldExpansion(obs.oldText))
+            continue;
+          auto solvedActuals = solveNewExpansion(obs.newText);
+          if (!solvedActuals)
+            return false;
+          if (solvedActuals->size() != forwardedChildArgs.size())
+            return false;
+
+          for (size_t i = 0; i < forwardedChildArgs.size(); ++i) {
+            auto oldText = childArgText(forwardedChildArgs[i]);
+            if (!oldText)
+              return false;
+            StringRef oldKey = oldText->trim();
+            StringRef newValue = StringRef((*solvedActuals)[i]).trim();
+            if (oldKey == newValue)
+              continue;
+            auto it = newTextByOld.find(oldKey);
+            if (it == newTextByOld.end()) {
+              newTextByOld[oldKey] = newValue.str();
+              continue;
+            }
+            if (StringRef(it->second).trim() != newValue)
+              return false;
+          }
+        }
+        return true;
+      };
+
+      if (!deriveTupleElementRewritesThroughForwardedCallee())
+        return false;
+
       rebuilt = parentTrim.str();
 
       // Replace parent tuple slices from right to left so tuple-ref byte
@@ -14774,8 +15726,17 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       tupleForwarded = true;
     } else if (unifiedNewArg) {
       // All observed occurrences of this formal agreed on one replacement
-      // spelling.
-      finalNewArg = *unifiedNewArg;
+      // spelling.  Before accepting a whole-argument expansion replacement, give
+      // direct tuple-ref forwarding a chance to prove a more structural edit of a
+      // caller tuple element.  This covers generated-callee shapes such as
+      // `WRAP((ADD_ONE, 10))`, where the root occurrence is the full callee
+      // expansion but the actual source edit belongs to the tuple element `10`.
+      if (tryTupleForwardedCallerTupleRewrite(argIdx, baseArgText,
+                                              occObservations, finalNewArg)) {
+        tupleForwarded = true;
+      } else {
+        finalNewArg = *unifiedNewArg;
+      }
     } else {
       // This formal had no usable observation from the touched hunk set.
       continue;
@@ -16978,9 +17939,15 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           existingPatch->structurePreserving &&
           existingPatch->proofRootMacroId == m.id;
     }
-  } else if (!argLikeSpans.empty() &&
-             InvocationSpanMatchesCallsitePrefix(invSpanText, m)) {
-    argsOnlyCandidate = tryPairedPureInsertionRootArgsOnly();
+  } else if (InvocationSpanMatchesCallsitePrefix(invSpanText, m)) {
+    // The definition-replay proof inside the args-only builder can handle
+    // edits whose token hunk spans both argument substitutions and macro-body
+    // tokens, most importantly __VA_OPT__ erasure/exposure.  Such hunks are not
+    // fully contained in a direct arg-like span, but they can still be proven as
+    // invocation-preserving rewrites by replaying the replacement-token tape.
+    argsOnlyCandidate = BuildMacroInvocationPatchArgsOnly(m, hEff, baseInvText);
+    if (!argsOnlyCandidate && !argLikeSpans.empty())
+      argsOnlyCandidate = tryPairedPureInsertionRootArgsOnly();
   }
 
   // 1b) Conservative DAG chaining: if the edited A-span lies within this
