@@ -6651,8 +6651,59 @@ std::string RefoldEngine::RunSinglePassRefold() {
         return false;
       };
 
+  auto sourceGraphIncludePathIsUnaliasedOrCoherent =
+      [&](const RefoldModel::IncludeItem &inc, StringRef sourceGraphPath,
+          StringRef candidateBytes) {
+        // A source-graph output written under an original quoted include path is
+        // a path-level edit, not an include-site-local edit: every surviving
+        // `#include "that/path.h"` in the emitted TU will read the generated
+        // bytes.  Therefore preserving one include edge is admissible only when
+        // all same-path top-level include sites are either materialized away, or
+        // are themselves source-graph-preserved with exactly the same owner
+        // bytes.  Otherwise the sidecar would either change an untouched alias
+        // or create conflicting bytes for the same generated file.
+        for (const RefoldModel::IncludeItem &other : model_.GetIncludes()) {
+          if (other.id == inc.id)
+            continue;
+          if (other.parent || !PathsEqual(other.sitePath, tuPath))
+            continue;
+
+          std::optional<std::string> otherPath =
+              safeSourceGraphRelativeIncludePath(other);
+          if (!otherPath || StringRef(*otherPath) != sourceGraphPath)
+            continue;
+
+          auto otherExpansionIt = includeExpansion.find(other.id);
+          if (otherExpansionIt == includeExpansion.end()) {
+            debug("include/source-graph",
+                  "reject source-graph inc#{0} path={1}: same-path inc#{2} "
+                  "survives unchanged and would observe the sidecar",
+                  inc.id, sourceGraphPath, other.id);
+            return false;
+          }
+
+          if (!includeHasIncluderSuppliedLineControlMacroState(other)) {
+            // The alias is dirty but does not satisfy the source-graph proof,
+            // so the normal single-output path will materialize it into the TU.
+            // It will not survive as a same-path include edge.
+            continue;
+          }
+
+          if (StringRef(otherExpansionIt->second) != candidateBytes) {
+            debug("include/source-graph",
+                  "reject source-graph inc#{0} path={1}: same-path inc#{2} "
+                  "requires different generated owner bytes",
+                  inc.id, sourceGraphPath, other.id);
+            return false;
+          }
+        }
+
+        return true;
+      };
+
   auto shouldPreserveIncludeAsSourceGraphOwner =
-      [&](const RefoldModel::IncludeItem &inc) -> std::optional<std::string> {
+      [&](const RefoldModel::IncludeItem &inc,
+          StringRef candidateBytes) -> std::optional<std::string> {
     if (!sourceGraphOutputs_)
       return std::nullopt;
 
@@ -6667,7 +6718,16 @@ std::string RefoldEngine::RunSinglePassRefold() {
     if (!includeHasIncluderSuppliedLineControlMacroState(inc))
       return std::nullopt;
 
-    return safeSourceGraphRelativeIncludePath(inc);
+    std::optional<std::string> sourceGraphPath =
+        safeSourceGraphRelativeIncludePath(inc);
+    if (!sourceGraphPath)
+      return std::nullopt;
+
+    if (!sourceGraphIncludePathIsUnaliasedOrCoherent(
+            inc, StringRef(*sourceGraphPath), candidateBytes))
+      return std::nullopt;
+
+    return sourceGraphPath;
   };
 
   // Apply TU-level include expansions by replacing the original `#include`
@@ -6715,7 +6775,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
       }
 
       if (std::optional<std::string> sourceGraphPath =
-              shouldPreserveIncludeAsSourceGraphOwner(*inc)) {
+              shouldPreserveIncludeAsSourceGraphOwner(*inc, expText)) {
         SourceGraphOutput output;
         output.includeId = inc->id;
         output.relativePath = *sourceGraphPath;
