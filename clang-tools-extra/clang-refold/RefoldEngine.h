@@ -5728,6 +5728,22 @@ private:
     uint64_t callsiteMacroId = 0;
   };
 
+  /// \brief Evidence that an invocation-preserving patch replayed the whole
+  /// macro expansion envelope, not merely one local formal span.
+  ///
+  /// Some ArgsOnlyStandard builders solve the complete replacement-list replay
+  /// problem: literals, formals, repeated occurrences, empty slots, VA_OPT, or
+  /// higher-order generated callees are checked together against the edited
+  /// B-side envelope. Those paths may legitimately preserve the source
+  /// invocation even when a naive literal-body comparison would observe changed
+  /// downstream tokens. Keep that fact in the canonical proof carrier so the
+  /// final whole-cover arbitration gate can distinguish complete replay proofs
+  /// from local current-level formal rewrites.
+  struct WholeEnvelopeReplayWitness {
+    uint64_t rootMacroId = 0;
+    bool replayValidated = false;
+  };
+
   /// \brief Canonical MacroPatch-local proof carrier.
   ///
   /// Phase 2D makes this object the only MacroPatch-local proof authority.
@@ -5744,6 +5760,7 @@ private:
     std::optional<PasteWitness> paste;
     std::optional<SubtreeCertificate> subtree;
     std::optional<CallChainWitness> callChain;
+    std::optional<WholeEnvelopeReplayWitness> wholeEnvelopeReplay;
   };
 
   struct MacroPatch {
