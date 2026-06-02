@@ -5742,6 +5742,13 @@ private:
   struct WholeEnvelopeReplayWitness {
     uint64_t rootMacroId = 0;
     bool replayValidated = false;
+
+    // True only for the definition-tape solver, which reparses the recorded
+    // replacement list and matches literals, formals, empty variadic slots, and
+    // __VA_OPT__ branch choices against the edited B envelope as one complete
+    // transducer.  That stronger proof can discharge fixed-body tokens that
+    // have no stable A->B token map after a variadic tail becomes empty.
+    bool definitionTapeReplayValidated = false;
   };
 
   /// \brief Canonical MacroPatch-local proof carrier.

@@ -15999,7 +15999,8 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
   };
 
   auto setArgsOnlyStandardProof =
-      [&](MacroPatch &patch, bool wholeEnvelopeReplayValidated) {
+      [&](MacroPatch &patch, bool wholeEnvelopeReplayValidated,
+          bool definitionTapeReplayValidated = false) {
         MacroPatchProof proof = MakeMacroPatchProof(
             MacroPatchProofKind::ArgsOnlyStandard,
             /*preservesInvocationStructure=*/true, m.id);
@@ -16007,6 +16008,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
           WholeEnvelopeReplayWitness witness;
           witness.rootMacroId = m.id;
           witness.replayValidated = true;
+          witness.definitionTapeReplayValidated = definitionTapeReplayValidated;
           proof.wholeEnvelopeReplay = witness;
         }
         SetMacroPatchProof(patch, std::move(proof));
@@ -16184,7 +16186,28 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         hasMissingExpansionFormal = true;
     }
 
-    if (!hasVaOpt && !hasEmptyFormalSourceSlot && !hasMissingExpansionFormal)
+    // A token-bearing variadic pack can be edited down to an explicit empty
+    // actual: `M(x, a, b)` -> `M(x, )`.  The ordinary local args-only proof can
+    // synthesize that spelling, but the root fixed-body guard cannot prove the
+    // adjacent replacement-list punctuation from a one-token A->B envelope when
+    // the diff coalesces it with the erased pack.  Route this case through the
+    // definition-tape solver so the whole replacement-list transducer, including
+    // fixed punctuation and the zero-token variadic slot, is discharged once.
+    bool hasVariadicFormalErasedInB = false;
+    for (const auto &as : m.argSpans) {
+      if (as.kind != PPArgSpanKind::Standard || as.begin >= as.end ||
+          as.argIdx >= m.defParams.size() || !m.defParams[as.argIdx].variadic)
+        continue;
+      std::optional<std::pair<size_t, size_t>> bArg =
+          MapAToBTokenEnvelopeByPPArgSpan(as);
+      if (bArg && bArg->first == bArg->second) {
+        hasVariadicFormalErasedInB = true;
+        break;
+      }
+    }
+
+    if (!hasVaOpt && !hasEmptyFormalSourceSlot && !hasMissingExpansionFormal &&
+        !hasVariadicFormalErasedInB)
       return std::nullopt;
 
     // One occurrence of a formal while replaying the definition over the
@@ -16371,14 +16394,18 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
           dfsElems(elems, elemIdx + 1, bPos + 1, sol, done);
         return;
       case ReplayElem::Kind::Param: {
-        // Only a formal that contributed no A tokens may be assigned an empty B
-        // interval.  For token-bearing formals, a zero-length assignment would
-        // be deletion, not an args-only preservation proof.
+        // Only empty old formals and variadic formals may be assigned an empty
+        // B interval.  A zero-token assignment for an ordinary non-variadic
+        // formal would silently erase required source structure, but an explicit
+        // empty variadic actual is a valid source spelling (`M(x, )`) whose
+        // surrounding punctuation is replayed by the definition tape.
         const bool oldWasEmpty =
             elem.argIdx < oldTokenCountByFormal.size() &&
             oldTokenCountByFormal[elem.argIdx] == 0;
+        const bool variadicFormal =
+            elem.argIdx < m.defParams.size() && m.defParams[elem.argIdx].variadic;
         for (size_t end = bPos; end <= bEnv->second; ++end) {
-          if (!oldWasEmpty && end == bPos)
+          if (!oldWasEmpty && !variadicFormal && end == bPos)
             continue;
           ReplaySolution next = sol;
           if (!assignFormalRange(next, elem.argIdx, {bPos, end}))
@@ -16495,10 +16522,13 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         const bool isTrailingVariadic =
             i + 1 == invArgRanges.size() && i < m.defParams.size() &&
             m.defParams[i].variadic;
+        const bool assignedExplicitEmptyVariadic =
+            isTrailingVariadic && sol.assigned[i] &&
+            sol.ranges[i].first == sol.ranges[i].second;
         if (isTrailingVariadic && r.first == r.second && !editText.empty()) {
           editText = (", " + editText);
         } else if (isTrailingVariadic && !baseInvText.slice(r.first, r.second).empty() &&
-                   editText.empty()) {
+                   editText.empty() && !assignedExplicitEmptyVariadic) {
           size_t prevEnd = 0;
           if (i > 0)
             prevEnd = invArgRanges[i - 1].second;
@@ -16608,7 +16638,8 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     stampMacroPatchMaterializedBTokenRange(
         patch, static_cast<uint64_t>(bEnv->first),
         static_cast<uint64_t>(bEnv->second));
-    setArgsOnlyStandardProof(patch, /*wholeEnvelopeReplayValidated=*/true);
+    setArgsOnlyStandardProof(patch, /*wholeEnvelopeReplayValidated=*/true,
+                             /*definitionTapeReplayValidated=*/true);
     return patch;
   };
 
@@ -36602,10 +36633,215 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
         return true;
       };
+  // Preserving a source-visible root invocation also preserves every fixed
+  // replacement-list token that belongs to that root macro.  Therefore each
+  // surviving root-owned body token must still replay literally after excluding
+  // surfaces whose values are decided by root actuals or descendant macro calls.
+  //
+  // This is deliberately phrased as a root-body stability invariant rather than
+  // as a proof-kind special case: paste-derived callee selectors, DAG subtree
+  // lifts, and call-chain suffix proofs may all legitimately rewrite a narrow
+  // descendant/argument surface, but none of them may hide an unrelated edit to
+  // fixed root body text such as a trailing literal `100 -> 200`.
+  auto rootPreservingCandidateHasLiteralFixedRootBodyReplay =
+      [&](const MacroPatch &patch) {
+        if (!patch.proof.preservesInvocationStructure ||
+            patch.proof.proofRootMacroId != m.id)
+          return true;
+        if (patch.proof.kind == MacroPatchProofKind::WholeCoverRealization)
+          return true;
+
+        // Most whole-envelope witnesses are selector/template summaries: they
+        // can prove an argument or generated-callee surface without proving
+        // every fixed root-body token that a preserved invocation will
+        // regenerate.  The definition-tape replay solver is stronger: it
+        // replays the recorded replacement list itself against B, including
+        // empty variadic slots and __VA_OPT__ branch choices.  Do not
+        // second-guess that complete transducer proof with per-token A->B
+        // mapping, because variadic erasure can legitimately leave stable
+        // punctuation without a one-token diff envelope.
+        if (patch.proof.wholeEnvelopeReplay &&
+            patch.proof.wholeEnvelopeReplay->definitionTapeReplayValidated &&
+            patch.proof.wholeEnvelopeReplay->rootMacroId ==
+                patch.proof.proofRootMacroId)
+          return true;
+
+        const std::optional<std::pair<uint64_t, uint64_t>> cover =
+            GetWholeCoverATokRange(m);
+        if (!cover || cover->first >= cover->second)
+          return true;
+
+        struct TokenInterval {
+          uint64_t begin = 0;
+          uint64_t end = 0;
+        };
+
+        auto addInterval = [](SmallVectorImpl<TokenInterval> &out,
+                              uint64_t begin, uint64_t end) {
+          if (begin < end)
+            out.push_back({begin, end});
+        };
+
+        auto intervalLess = [](const TokenInterval &lhs,
+                               const TokenInterval &rhs) {
+          if (lhs.begin != rhs.begin)
+            return lhs.begin < rhs.begin;
+          return lhs.end < rhs.end;
+        };
+
+        auto normalizeIntervals = [&](SmallVectorImpl<TokenInterval> &spans) {
+          llvm::sort(spans, intervalLess);
+          SmallVector<TokenInterval, 16> merged;
+          for (const TokenInterval &span : spans) {
+            if (span.begin >= span.end)
+              continue;
+            if (!merged.empty() && span.begin <= merged.back().end) {
+              merged.back().end = std::max(merged.back().end, span.end);
+              continue;
+            }
+            merged.push_back(span);
+          }
+          spans.clear();
+          spans.append(merged.begin(), merged.end());
+        };
+
+        SmallVector<TokenInterval, 32> excludedA;
+        for (const auto &span : m.argSpans) {
+          if (span.kind == PPArgSpanKind::Standard)
+            addInterval(excludedA, span.begin, span.end);
+        }
+        for (const auto &span : m.stringifySpans)
+          addInterval(excludedA, span.begin, span.end);
+        for (const auto &span : m.pasteSpans)
+          addInterval(excludedA, span.begin, span.end);
+
+        // Producer body spans on a root invocation can include tokens emitted by
+        // nested/generated macro calls.  Those tokens are not fixed root body:
+        // they are discharged by the descendant proof that the root candidate
+        // rewrites or by whole-cover realization.  Exclude every descendant
+        // cover before asking whether the remaining root-owned body text is
+        // still literal.
+        DenseMap<uint64_t, const RefoldModel::MacroInvocation *> invById;
+        for (const auto &candidate : model_.GetMacroInvocations())
+          invById[candidate.id] = &candidate;
+
+        auto isDescendantOfCurrentRoot =
+            [&](const RefoldModel::MacroInvocation &candidate) {
+          std::optional<uint64_t> parent = candidate.callerMacroId;
+          while (parent) {
+            if (*parent == m.id)
+              return true;
+            auto it = invById.find(*parent);
+            if (it == invById.end())
+              return false;
+            parent = it->second->callerMacroId;
+          }
+          return false;
+        };
+
+        for (const auto &candidate : model_.GetMacroInvocations()) {
+          if (candidate.id == m.id || !candidate.cover.IsValid() ||
+              candidate.cover.begin >= candidate.cover.end ||
+              !isDescendantOfCurrentRoot(candidate))
+            continue;
+          const uint64_t begin =
+              std::max<uint64_t>(candidate.cover.begin, cover->first);
+          const uint64_t end =
+              std::min<uint64_t>(candidate.cover.end, cover->second);
+          addInterval(excludedA, begin, end);
+        }
+
+        normalizeIntervals(excludedA);
+
+        auto appendFixedPiecesOutsideExcludedSurfaces =
+            [&](SmallVectorImpl<TokenInterval> &fixed, TokenInterval body)
+            -> bool {
+          if (body.begin >= body.end)
+            return true;
+          if (body.begin < cover->first || body.end > cover->second ||
+              body.end < body.begin)
+            return false;
+
+          uint64_t cursor = body.begin;
+          for (const TokenInterval &excluded : excludedA) {
+            if (excluded.end <= cursor)
+              continue;
+            if (excluded.begin >= body.end)
+              break;
+            if (excluded.begin > cursor)
+              fixed.push_back(
+                  {cursor, std::min<uint64_t>(excluded.begin, body.end)});
+            cursor = std::max(
+                cursor, std::min<uint64_t>(excluded.end, body.end));
+          }
+          if (cursor < body.end)
+            fixed.push_back({cursor, body.end});
+          return true;
+        };
+
+        SmallVector<TokenInterval, 32> fixedBodyA;
+        for (const auto &span : m.bodySpans) {
+          const uint64_t begin = std::max<uint64_t>(span.begin, cover->first);
+          const uint64_t end = std::min<uint64_t>(span.end, cover->second);
+          if (!appendFixedPiecesOutsideExcludedSurfaces(fixedBodyA, {begin, end})) {
+            trace("macro/proof",
+                  "suppress structure-preserving macro replay: inv id={0} "
+                  "name={1} fixed root body span escapes whole cover: "
+                  "body=[{2},{3}) cover=[{4},{5}) replacement='{6}'",
+                  m.id, m.name, span.begin, span.end, cover->first,
+                  cover->second,
+                  stringutils::showWsWithClip(patch.replacement, 220));
+            return false;
+          }
+        }
+
+        for (const TokenInterval &fixed : fixedBodyA) {
+          for (uint64_t aTok = fixed.begin; aTok < fixed.end; ++aTok) {
+            if (static_cast<size_t>(aTok) >= aToks_.size())
+              return false;
+
+            std::optional<std::pair<size_t, size_t>> bTok =
+                MapATokRangeAToBTokenEnvelope(aTok, aTok + 1);
+            if (!bTok || bTok->first >= bTok->second) {
+              trace("macro/proof",
+                    "suppress structure-preserving macro replay: inv id={0} "
+                    "name={1} fixed root body token has no B replay "
+                    "envelope: A=[{2},{3}) Atext='{4}' replacement='{5}'",
+                    m.id, m.name, aTok, aTok + 1,
+                    stringutils::showWsWithClip(SliceASource(aTok, aTok + 1),
+                                                120),
+                    stringutils::showWsWithClip(patch.replacement, 220));
+              return false;
+            }
+
+            if (bTok->second != bTok->first + 1 ||
+                bTok->first >= bToks_.size() ||
+                aToks_[static_cast<size_t>(aTok)].spelling !=
+                    bToks_[bTok->first].spelling) {
+              trace("macro/proof",
+                    "suppress structure-preserving macro replay: inv id={0} "
+                    "name={1} fixed root body changed while preserving the "
+                    "root invocation: A=[{2},{3}) B=[{4},{5}) Atext='{6}' "
+                    "Btext='{7}' replacement='{8}'",
+                    m.id, m.name, aTok, aTok + 1, bTok->first, bTok->second,
+                    stringutils::showWsWithClip(SliceASource(aTok, aTok + 1),
+                                                120),
+                    stringutils::showWsWithClip(
+                        SliceBSource(bTok->first, bTok->second), 120),
+                    stringutils::showWsWithClip(patch.replacement, 220));
+              return false;
+            }
+          }
+        }
+
+        return true;
+      };
+
   auto macroCandidateReplayIsStableForFinalSelection =
       [&](const MacroPatch &patch) {
         return structurePreservingCallsiteHasStableFormalSyntax(patch) &&
                argsOnlyWholeEnvelopeCandidateHasLiteralBodyReplay(patch) &&
+               rootPreservingCandidateHasLiteralFixedRootBodyReplay(patch) &&
                !callsiteReplayObservesActiveHeaderMacroState(patch);
       };
 
