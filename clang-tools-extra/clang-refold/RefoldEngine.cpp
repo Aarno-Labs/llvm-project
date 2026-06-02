@@ -36283,13 +36283,32 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   //   a_bias_call(xjg, (&target_xjtr_0), (b))
   //
   // The `target -> target_xjtr_0` part is a valid formal rewrite, but `xjg,`
-  // is fixed macro-body surface.  If an ArgsOnlyStandard candidate claims the
+  // is fixed macro-body surface.  If an args-only candidate claims the
   // entire B envelope while that fixed surface does not replay literally, the
   // candidate is not a complete invocation-preserving proof and must not be
   // allowed to suppress whole-cover realization.
   auto argsOnlyWholeEnvelopeCandidateHasLiteralBodyReplay =
       [&](const MacroPatch &patch) {
-        if (patch.proof.kind != MacroPatchProofKind::ArgsOnlyStandard ||
+        auto isArgsOnlyInvocationPreservingProof = [&]() {
+          switch (patch.proof.kind) {
+          case MacroPatchProofKind::ArgsOnlyStandard:
+          case MacroPatchProofKind::ArgsOnlyPasteSingle:
+          case MacroPatchProofKind::ArgsOnlyPasteMulti:
+          case MacroPatchProofKind::ArgsOnlyPurePasteOnly:
+          case MacroPatchProofKind::ArgsOnlyPairedPureInsertion:
+            return true;
+          case MacroPatchProofKind::PasteDerivedCalleeSelector:
+          case MacroPatchProofKind::DagSubtreeRoot:
+          case MacroPatchProofKind::CallChainSuffix:
+          case MacroPatchProofKind::CounterLiteral:
+          case MacroPatchProofKind::WholeCoverRealization:
+          case MacroPatchProofKind::Unknown:
+            return false;
+          }
+          return false;
+        };
+
+        if (!isArgsOnlyInvocationPreservingProof() ||
             !patch.proof.preservesInvocationStructure ||
             patch.proof.proofRootMacroId != m.id)
           return true;
@@ -36302,19 +36321,12 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         // empty actual slots, VA_OPT transitions, and higher-order generated
         // callees can all produce changed downstream body tokens while still
         // preserving the root invocation soundly.  The literal-body audit below
-        // is only for local formal rewrites that stamp a whole-envelope range
-        // without such a complete replay witness.
+        // is only for local formal/operator rewrites that stamp a whole-envelope
+        // range without such a complete replay witness.
         if (patch.proof.wholeEnvelopeReplay &&
             patch.proof.wholeEnvelopeReplay->replayValidated &&
             patch.proof.wholeEnvelopeReplay->rootMacroId ==
                 patch.proof.proofRootMacroId)
-          return true;
-
-        // Stringification and token-paste have their own replay witnesses: the
-        // fixed replacement-list spelling is not, by itself, the emitted token
-        // surface for those operators.  Leave those candidates on their
-        // existing specialized proof gates.
-        if (!m.stringifySpans.empty() || !m.pasteSpans.empty())
           return true;
 
         const std::optional<std::pair<uint64_t, uint64_t>> cover =
@@ -36333,8 +36345,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         // macro expansion.  Those boundary insertions are not part of the
         // replacement-list replay obligation: they are emitted by the ordinary
         // boundary edit path next to the preserved invocation.  Use the
-        // boundary-trimmed envelope for the literal body/formal replay audit,
-        // while still requiring the candidate to have claimed the wider
+        // boundary-trimmed envelope for the literal body/formal/operator replay
+        // audit, while still requiring the candidate to have claimed the wider
         // whole-cover envelope before this guard applies.
         std::pair<size_t, size_t> replayB = *wholeB;
         if (std::optional<std::pair<size_t, size_t>> trimmedB =
@@ -36353,168 +36365,183 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             patch.materializedBTokEnd != static_cast<uint64_t>(wholeB->second))
           return true;
 
-        auto getLocalCurrentLevelStandardArgSpans = [&]()
-            -> std::optional<std::vector<RefoldModel::PPArgSpan>> {
-          SmallVector<RefoldModel::PPArgSpan, 16> standard;
-          for (const auto &as : m.argSpans) {
-            if (as.kind == PPArgSpanKind::Standard && as.begin < as.end)
-              standard.push_back(as);
-          }
-          if (standard.empty())
-            return std::nullopt;
-
-          llvm::sort(standard, [](const RefoldModel::PPArgSpan &lhs,
-                                  const RefoldModel::PPArgSpan &rhs) {
-            if (lhs.begin != rhs.begin)
-              return lhs.begin < rhs.begin;
-            if (lhs.end != rhs.end)
-              return lhs.end < rhs.end;
-            if (lhs.argIdx != rhs.argIdx)
-              return lhs.argIdx < rhs.argIdx;
-            return static_cast<unsigned>(lhs.kind) <
-                   static_cast<unsigned>(rhs.kind);
-          });
-
-          SmallVector<RefoldModel::PPArgSpan, 16> maximal;
-          for (const auto &cand : standard) {
-            bool contained = false;
-            for (const auto &other : standard) {
-              if (&cand == &other)
-                continue;
-              if (other.begin <= cand.begin && cand.end <= other.end &&
-                  (other.begin < cand.begin || cand.end < other.end)) {
-                contained = true;
-                break;
-              }
-            }
-            if (!contained)
-              maximal.push_back(cand);
-          }
-          if (maximal.empty())
-            return std::nullopt;
-
-          struct CoverElem {
-            uint64_t begin = 0;
-            uint64_t end = 0;
-          };
-          SmallVector<CoverElem, 32> coverElems;
-          for (const auto &bs : m.bodySpans) {
-            if (bs.begin < bs.end)
-              coverElems.push_back({bs.begin, bs.end});
-          }
-          for (const auto &as : maximal)
-            coverElems.push_back({as.begin, as.end});
-
-          llvm::sort(coverElems, [](const CoverElem &lhs,
-                                    const CoverElem &rhs) {
-            if (lhs.begin != rhs.begin)
-              return lhs.begin < rhs.begin;
-            return lhs.end < rhs.end;
-          });
-
-          uint64_t cursor = cover->first;
-          for (const CoverElem &elem : coverElems) {
-            if (elem.begin != cursor || elem.end < elem.begin ||
-                elem.end > cover->second)
-              return std::nullopt;
-            cursor = elem.end;
-          }
-          if (cursor != cover->second)
-            return std::nullopt;
-
-          std::vector<RefoldModel::PPArgSpan> out;
-          out.reserve(maximal.size());
-          for (size_t i = 0; i < maximal.size(); ++i) {
-            RefoldModel::PPArgSpan span = maximal[i];
-            span.argIdx = static_cast<uint32_t>(i);
-            out.push_back(span);
-          }
-          return out;
-        };
-
-        const std::optional<std::vector<RefoldModel::PPArgSpan>> standardSpans =
-            getLocalCurrentLevelStandardArgSpans();
-        if (!standardSpans)
-          return true;
-
         struct ReplayElem {
-          bool isArg = false;
+          bool isArgumentDependent = false;
           uint64_t aBegin = 0;
           uint64_t aEnd = 0;
-          const RefoldModel::PPArgSpan *argSpan = nullptr;
         };
 
-        SmallVector<ReplayElem, 32> elems;
-        for (const auto &bs : m.bodySpans) {
-          if (bs.begin < bs.end)
-            elems.push_back({false, bs.begin, bs.end, nullptr});
-        }
-        for (const auto &as : *standardSpans)
-          elems.push_back({true, as.begin, as.end, &as});
+        struct TokenInterval {
+          uint64_t begin = 0;
+          uint64_t end = 0;
+        };
 
-        if (elems.empty())
+        auto intervalLess = [](const TokenInterval &lhs,
+                               const TokenInterval &rhs) {
+          if (lhs.begin != rhs.begin)
+            return lhs.begin < rhs.begin;
+          return lhs.end < rhs.end;
+        };
+
+        SmallVector<TokenInterval, 32> argumentDependentIntervals;
+        auto addArgumentDependentInterval = [&](uint64_t begin, uint64_t end) {
+          if (begin >= end)
+            return;
+          argumentDependentIntervals.push_back({begin, end});
+        };
+
+        // Standard substitutions, stringification results, and pasted tokens
+        // are all argument-dependent output surfaces: changing the invocation
+        // actual can legitimately change those tokens.  Everything else in the
+        // macro's replacement-list cover is fixed body surface and must replay
+        // literally in B before a structure-preserving candidate may claim the
+        // whole expansion envelope.
+        for (const auto &as : m.argSpans) {
+          if (as.kind == PPArgSpanKind::Standard)
+            addArgumentDependentInterval(as.begin, as.end);
+        }
+        for (const auto &span : m.stringifySpans)
+          addArgumentDependentInterval(span.begin, span.end);
+        for (const auto &span : m.pasteSpans)
+          addArgumentDependentInterval(span.begin, span.end);
+
+        llvm::sort(argumentDependentIntervals, intervalLess);
+        SmallVector<TokenInterval, 32> mergedArgumentIntervals;
+        for (const TokenInterval &raw : argumentDependentIntervals) {
+          if (raw.begin < cover->first || raw.end > cover->second ||
+              raw.end < raw.begin) {
+            trace("macro/proof",
+                  "suppress structure-preserving macro replay: inv id={0} "
+                  "name={1} argument-dependent surface escapes whole cover: "
+                  "surface=[{2},{3}) cover=[{4},{5}) text='{6}'",
+                  m.id, m.name, raw.begin, raw.end, cover->first,
+                  cover->second,
+                  stringutils::showWsWithClip(patch.replacement, 220));
+            return false;
+          }
+
+          if (!mergedArgumentIntervals.empty() &&
+              raw.begin <= mergedArgumentIntervals.back().end) {
+            mergedArgumentIntervals.back().end =
+                std::max(mergedArgumentIntervals.back().end, raw.end);
+            continue;
+          }
+          mergedArgumentIntervals.push_back(raw);
+        }
+
+        SmallVector<TokenInterval, 32> fixedIntervals;
+        auto appendFixedPiecesOutsideArguments = [&](TokenInterval body) {
+          if (body.begin >= body.end)
+            return true;
+          if (body.begin < cover->first || body.end > cover->second ||
+              body.end < body.begin)
+            return false;
+
+          uint64_t cursor = body.begin;
+          for (const TokenInterval &arg : mergedArgumentIntervals) {
+            if (arg.end <= cursor)
+              continue;
+            if (arg.begin >= body.end)
+              break;
+            if (arg.begin > cursor)
+              fixedIntervals.push_back(
+                  {cursor, std::min<uint64_t>(arg.begin, body.end)});
+            cursor = std::max(cursor, std::min<uint64_t>(arg.end, body.end));
+          }
+          if (cursor < body.end)
+            fixedIntervals.push_back({cursor, body.end});
           return true;
+        };
+
+        for (const auto &bs : m.bodySpans) {
+          if (!appendFixedPiecesOutsideArguments({bs.begin, bs.end})) {
+            trace("macro/proof",
+                  "suppress structure-preserving macro replay: inv id={0} "
+                  "name={1} body span escapes whole cover: body=[{2},{3}) "
+                  "cover=[{4},{5}) text='{6}'",
+                  m.id, m.name, bs.begin, bs.end, cover->first, cover->second,
+                  stringutils::showWsWithClip(patch.replacement, 220));
+            return false;
+          }
+        }
+
+        SmallVector<ReplayElem, 64> elems;
+        for (const TokenInterval &fixed : fixedIntervals)
+          elems.push_back({false, fixed.begin, fixed.end});
+        for (const TokenInterval &arg : mergedArgumentIntervals)
+          elems.push_back({true, arg.begin, arg.end});
+
+        if (elems.empty()) {
+          trace("macro/proof",
+                "suppress structure-preserving macro replay: inv id={0} "
+                "name={1} whole-envelope replay has no body or argument "
+                "surface to discharge: cover=[{2},{3}) text='{4}'",
+                m.id, m.name, cover->first, cover->second,
+                stringutils::showWsWithClip(patch.replacement, 220));
+          return false;
+        }
 
         llvm::sort(elems, [](const ReplayElem &lhs, const ReplayElem &rhs) {
           if (lhs.aBegin != rhs.aBegin)
             return lhs.aBegin < rhs.aBegin;
           if (lhs.aEnd != rhs.aEnd)
             return lhs.aEnd < rhs.aEnd;
-          return lhs.isArg < rhs.isArg;
+          return lhs.isArgumentDependent < rhs.isArgumentDependent;
         });
 
-        auto mapStandardArgSpanToReplayBEnvelope =
-            [&](const RefoldModel::PPArgSpan &span)
+        auto mapArgumentDependentSurfaceToReplayBEnvelope =
+            [&](const ReplayElem &elem)
                 -> std::optional<std::pair<size_t, size_t>> {
           std::optional<std::pair<size_t, size_t>> mapped =
-              MapAToBTokenEnvelopeByPPArgSpan(span);
+              MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
+                  elem.aBegin, elem.aEnd);
           if (!mapped)
             return std::nullopt;
-
-          // Pure insertions at an argument boundary can belong to the argument
-          // rather than to fixed body text.  Use the same ownership predicate
-          // as the standard occurrence checker so this whole-envelope audit
-          // agrees with the established per-argument proof rule.
-          size_t lo = mapped->first;
-          size_t hi = mapped->second;
-          if (auto owned = GetOwnedPureInsertionBRangeForArgSpan(
-                  span, m.argSpans, *mapped, h)) {
-            lo = std::min(lo, owned->first);
-            hi = std::max(hi, owned->second);
-          }
-          const uint64_t maxTok = bTokOff_.empty()
-                                      ? 0ULL
-                                      : static_cast<uint64_t>(bTokOff_.size() - 1);
-          lo = static_cast<size_t>(std::clamp<uint64_t>(lo, 0ULL, maxTok));
-          hi = static_cast<size_t>(std::clamp<uint64_t>(hi, lo, maxTok));
-          return std::make_pair(lo, hi);
+          if (mapped->first > mapped->second || mapped->second > replayB.second)
+            return std::nullopt;
+          return mapped;
         };
 
         uint64_t aCursor = cover->first;
         size_t bCursor = replayB.first;
         for (const ReplayElem &elem : elems) {
           if (elem.aBegin != aCursor || elem.aEnd < elem.aBegin ||
-              elem.aEnd > cover->second)
-            return true;
+              elem.aEnd > cover->second) {
+            trace("macro/proof",
+                  "suppress structure-preserving macro replay: inv id={0} "
+                  "name={1} whole-envelope replay is not an exact A tiling: "
+                  "elem=[{2},{3}) cursor={4} cover=[{5},{6}) text='{7}'",
+                  m.id, m.name, elem.aBegin, elem.aEnd, aCursor,
+                  cover->first, cover->second,
+                  stringutils::showWsWithClip(patch.replacement, 220));
+            return false;
+          }
           aCursor = elem.aEnd;
 
-          if (elem.isArg) {
-            if (!elem.argSpan)
-              return true;
+          if (elem.isArgumentDependent) {
             std::optional<std::pair<size_t, size_t>> argB =
-                mapStandardArgSpanToReplayBEnvelope(*elem.argSpan);
-            if (!argB)
-              return true;
+                mapArgumentDependentSurfaceToReplayBEnvelope(elem);
+            if (!argB) {
+              trace("macro/proof",
+                    "suppress structure-preserving macro replay: inv id={0} "
+                    "name={1} argument-dependent surface has no B replay "
+                    "envelope: A=[{2},{3}) replayB=[{4},{5}) wholeB=[{6},{7}) "
+                    "text='{8}'",
+                    m.id, m.name, elem.aBegin, elem.aEnd, replayB.first,
+                    replayB.second, wholeB->first, wholeB->second,
+                    stringutils::showWsWithClip(patch.replacement, 220));
+              return false;
+            }
             if (argB->first != bCursor || argB->second < argB->first ||
                 argB->second > replayB.second) {
               trace("macro/proof",
                     "suppress structure-preserving macro replay: inv id={0} "
-                    "name={1} whole-envelope formal span does not align with "
-                    "the B replay cursor: arg={2} A=[{3},{4}) B=[{5},{6}) "
-                    "cursor={7} replayB=[{8},{9}) wholeB=[{10},{11}) text='{12}'",
-                    m.id, m.name, elem.argSpan->argIdx, elem.aBegin,
-                    elem.aEnd, argB->first, argB->second, bCursor,
-                    replayB.first, replayB.second, wholeB->first, wholeB->second,
+                    "name={1} argument-dependent surface does not align with "
+                    "the B replay cursor: A=[{2},{3}) B=[{4},{5}) "
+                    "cursor={6} replayB=[{7},{8}) wholeB=[{9},{10}) text='{11}'",
+                    m.id, m.name, elem.aBegin, elem.aEnd, argB->first,
+                    argB->second, bCursor, replayB.first, replayB.second,
+                    wholeB->first, wholeB->second,
                     stringutils::showWsWithClip(patch.replacement, 220));
               return false;
             }
@@ -36575,7 +36602,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
         return true;
       };
-
   auto macroCandidateReplayIsStableForFinalSelection =
       [&](const MacroPatch &patch) {
         return structurePreservingCallsiteHasStableFormalSyntax(patch) &&
