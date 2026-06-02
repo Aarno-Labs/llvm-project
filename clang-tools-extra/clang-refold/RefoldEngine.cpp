@@ -19868,6 +19868,14 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
           size_t begin = 0;
           size_t end = 0;
           std::string oldText;
+
+          // The multi-leaf matcher can compare in two different domains:
+          // ordinary source spelling, or the decoded payload of a source string
+          // literal.  The latter is probe evidence only.  If it produces a new
+          // source actual, the solved payload must be re-encoded as a string
+          // literal instead of emitted as a raw identifier/token sequence.
+          bool matchedDecodedSourceStringLiteral = false;
+          std::string sourceText;
         };
         SmallVector<ArgOccurrence, 8> occs;
         std::optional<uint32_t> emptyArgIdx;
@@ -19884,21 +19892,42 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
             emptyArgIdx = argIdx;
             continue;
           }
-          SmallVector<StringRef, 2> probes;
-          probes.push_back(argText);
-          if (std::optional<std::string> decodedArg =
-                  decodeSimpleStringLiteralToken(argText))
-            probes.push_back(StringRef(*decodedArg));
-          for (StringRef probe : probes) {
-            if (probe.empty())
+          struct Probe {
+            StringRef text;
+            bool decodedSourceStringLiteral = false;
+          };
+          SmallVector<Probe, 2> probes;
+          probes.push_back(Probe{argText, false});
+
+          // Keep the decoded spelling alive for the full probe loop.  More
+          // importantly, tag it as decoded evidence so a later source rewrite
+          // re-quotes the solved payload.  Decoding makes `"beta"` comparable
+          // to the generated leaf value `beta`, but it does not prove that the
+          // source actual may be rewritten to the raw identifier `gamma`.
+          std::optional<std::string> decodedArgStorage =
+              decodeSimpleStringLiteralToken(argText);
+          if (decodedArgStorage)
+            probes.push_back(
+                Probe{StringRef(*decodedArgStorage), true});
+
+          for (Probe probe : probes) {
+            if (probe.text.empty())
               continue;
-            size_t pos = oldValue.find(probe);
+            size_t pos = oldValue.find(probe.text);
             if (pos == StringRef::npos)
               continue;
-            if (oldValue.find(probe, pos + probe.size()) != StringRef::npos)
+            if (oldValue.find(probe.text, pos + probe.text.size()) !=
+                StringRef::npos)
               return std::nullopt;
-            occs.push_back(ArgOccurrence{argIdx, pos, pos + probe.size(),
-                                         probe.str()});
+            ArgOccurrence occ;
+            occ.argIdx = argIdx;
+            occ.begin = pos;
+            occ.end = pos + probe.text.size();
+            occ.oldText = probe.text.str();
+            occ.matchedDecodedSourceStringLiteral =
+                probe.decodedSourceStringLiteral;
+            occ.sourceText = argText.str();
+            occs.push_back(std::move(occ));
             break;
           }
         }
@@ -19908,8 +19937,12 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
           // as a zero-width occurrence at the end of the generated value; the
           // skeleton matcher below then proves whether B supplies a unique
           // suffix for that empty source slot or erases an old non-empty slot.
-          occs.push_back(ArgOccurrence{*emptyArgIdx, oldValue.size(),
-                                       oldValue.size(), ""});
+          ArgOccurrence occ;
+          occ.argIdx = *emptyArgIdx;
+          occ.begin = oldValue.size();
+          occ.end = oldValue.size();
+          occ.oldText = "";
+          occs.push_back(std::move(occ));
         }
         if (occs.empty())
           return std::nullopt;
@@ -19922,6 +19955,29 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         for (size_t i = 1; i < occs.size(); ++i)
           if (occs[i].begin < occs[i - 1].end)
             return std::nullopt;
+
+        auto rewriteSolvedLeafAsSource = [&](const ArgOccurrence &occ,
+                                            StringRef solved)
+            -> std::optional<std::string> {
+          if (!occ.matchedDecodedSourceStringLiteral)
+            return solved.str();
+
+          StringRef source = StringRef(occ.sourceText).trim();
+          const size_t quote = source.find('"');
+          const size_t endQuote = source.rfind('"');
+          if (quote == StringRef::npos || endQuote == StringRef::npos ||
+              endQuote <= quote)
+            return std::nullopt;
+
+          // Preserve the source literal prefix (`L`, `u8`, etc.) and any suffix
+          // spelling, but replace the decoded payload with a freshly quoted C
+          // string literal.  This keeps decoded-payload matching from silently
+          // changing an ordinary forwarded string literal into an identifier.
+          std::string rewritten = source.slice(0, quote).str();
+          rewritten += stringutils::quoteCStringLiteral(solved);
+          rewritten += source.substr(endQuote + 1).str();
+          return rewritten;
+        };
 
         // Match the literal skeleton around the old root-argument leaves
         // against the new expansion value.  The leaves themselves may change
@@ -19961,14 +20017,21 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
               return std::nullopt;
           }
           StringRef solved = newValue.slice(newCursor, nextPos).trim();
+          std::optional<std::string> sourceSolved =
+              rewriteSolvedLeafAsSource(occs[i], solved);
+          if (!sourceSolved)
+            return std::nullopt;
+          StringRef sourceSolvedRef(*sourceSolved);
           auto existing = replByArgIdx.find(occs[i].argIdx);
           if (existing != replByArgIdx.end()) {
-            if (!leafTextsTokenEquivalent(StringRef(existing->second), solved))
+            if (!leafTextsTokenEquivalent(StringRef(existing->second),
+                                          sourceSolvedRef))
               return std::nullopt;
           } else {
-            if (!isVariadicFormal(occs[i].argIdx) && hasTopLevelComma(solved))
+            if (!isVariadicFormal(occs[i].argIdx) &&
+                hasTopLevelComma(sourceSolvedRef))
               return std::nullopt;
-            replByArgIdx[occs[i].argIdx] = solved.str();
+            replByArgIdx[occs[i].argIdx] = std::move(*sourceSolved);
           }
           newCursor = nextPos;
         }
