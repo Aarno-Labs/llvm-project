@@ -2366,7 +2366,7 @@ LLVMBool LLVMIsThreadLocal(LLVMValueRef GlobalVar);
 void LLVMSetThreadLocal(LLVMValueRef GlobalVar, LLVMBool IsThreadLocal);
 LLVMBool LLVMIsGlobalConstant(LLVMValueRef GlobalVar);
 void LLVMSetGlobalConstant(LLVMValueRef GlobalVar, LLVMBool IsConstant);
-LLVMThreadLocalMode LLVMGetThreadLocalMode(LLVMValueRef GlobalVar);
+LLVMThreadLocalMode LLVMGetThreadLocalMode(LLVMValueRef GlobalVal);
 void LLVMSetThreadLocalMode(LLVMValueRef GlobalVar, LLVMThreadLocalMode Mode);
 LLVMBool LLVMIsExternallyInitialized(LLVMValueRef GlobalVar);
 void LLVMSetExternallyInitialized(LLVMValueRef GlobalVar, LLVMBool IsExtInit);

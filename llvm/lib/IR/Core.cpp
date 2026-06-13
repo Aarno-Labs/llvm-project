@@ -2226,21 +2226,21 @@ void LLVMSetGlobalConstant(LLVMValueRef GlobalVar, LLVMBool IsConstant) {
   unwrap<GlobalVariable>(GlobalVar)->setConstant(IsConstant != 0);
 }
 
-LLVMThreadLocalMode LLVMGetThreadLocalMode(LLVMValueRef GlobalVar) {
-  switch (unwrap<GlobalVariable>(GlobalVar)->getThreadLocalMode()) {
-  case GlobalVariable::NotThreadLocal:
+LLVMThreadLocalMode LLVMGetThreadLocalMode(LLVMValueRef GlobalVal) {
+  switch (unwrap<GlobalValue>(GlobalVal)->getThreadLocalMode()) {
+  case GlobalValue::NotThreadLocal:
     return LLVMNotThreadLocal;
-  case GlobalVariable::GeneralDynamicTLSModel:
+  case GlobalValue::GeneralDynamicTLSModel:
     return LLVMGeneralDynamicTLSModel;
-  case GlobalVariable::LocalDynamicTLSModel:
+  case GlobalValue::LocalDynamicTLSModel:
     return LLVMLocalDynamicTLSModel;
-  case GlobalVariable::InitialExecTLSModel:
+  case GlobalValue::InitialExecTLSModel:
     return LLVMInitialExecTLSModel;
-  case GlobalVariable::LocalExecTLSModel:
+  case GlobalValue::LocalExecTLSModel:
     return LLVMLocalExecTLSModel;
   }
 
-  llvm_unreachable("Invalid GlobalVariable thread local mode");
+  llvm_unreachable("Invalid GlobalValue thread local mode");
 }
 
 void LLVMSetThreadLocalMode(LLVMValueRef GlobalVar, LLVMThreadLocalMode Mode) {
