@@ -12,7 +12,12 @@ check_include_file(unwind.h HAVE_UNWIND_H)
 
 # Used by sanitizer_common and tests.
 check_include_file(rpc/xdr.h HAVE_RPC_XDR_H)
-if (NOT HAVE_RPC_XDR_H)
+# On Apple, check_include_file succeeds (rpc/xdr.h includes cleanly) but the
+# legacy SunRPC `XDR` type fails to declare under a freshly-built vanilla clang
+# against a newer macOS SDK, breaking sanitizer_platform_limits_posix.cpp.
+# XDR/SunRPC is legacy (upstream LLVM later dropped these checks); disabling it
+# only skips XDR struct-size validation, which is unused for the macOS sanitizer.
+if (NOT HAVE_RPC_XDR_H OR APPLE)
   set(HAVE_RPC_XDR_H 0)
 endif()
 
