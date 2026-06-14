@@ -56,6 +56,19 @@ option(COMPILER_RT_BUILD_GWP_ASAN "Build GWP-ASan, and link it into SCUDO" ON)
 mark_as_advanced(COMPILER_RT_BUILD_GWP_ASAN)
 option(COMPILER_RT_ENABLE_CET "Build Compiler RT with CET enabled" OFF)
 
+# libFuzzer, XRay and ORC are the compiler-rt components that consume the C++
+# standard library (the sanitizers/builtins/profile use -nostdinc++ and their
+# own freestanding headers). When compiler-rt is built by a from-scratch clang
+# against a newer macOS SDK, and without an in-tree libcxx, those components
+# pull in the SDK's libc++ headers, which are too new for the bootstrapped
+# clang to parse (e.g. _LIBCPP_BEGIN_NAMESPACE_STD fails to expand). Disable
+# them on Apple; Linux builds (with a compatible system C++ library) keep them.
+if(APPLE)
+  set(COMPILER_RT_BUILD_LIBFUZZER OFF)
+  set(COMPILER_RT_BUILD_XRAY OFF)
+  set(COMPILER_RT_BUILD_ORC OFF)
+endif()
+
 if(FUCHSIA)
   set(COMPILER_RT_HWASAN_WITH_INTERCEPTORS_DEFAULT OFF)
 else()
