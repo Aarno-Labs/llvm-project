@@ -8,6 +8,20 @@ include(CheckCXXSourceCompiles)
 include(GNUInstallDirs)
 include(ExtendPath)
 
+# A from-scratch clang built against a newer macOS SDK leaves TARGET_OS_OSX
+# undefined: the SDK's TargetConditionals.h only sets it for compilers that
+# support the define_target_os_macros extension or define __APPLE_CC__ (Apple
+# clang), and otherwise defaults it to 0. That makes SDK headers compile out
+# macOS-only declarations -- e.g. OSFifoQueueHead in <libkern/OSAtomicDeprecated.h>,
+# guarded by `#if TARGET_OS_OSX`, breaking tsan_interceptors_mac.cpp -- and
+# mis-computes SANITIZER_OSX (and thus SANITIZER_MMAP_RANGE_SIZE). Force it on
+# for the whole compiler-rt build so system headers see a macOS target. The SDK
+# only sets the default via `#ifndef TARGET_OS_OSX`, so predefining it survives.
+if(APPLE)
+  string(APPEND CMAKE_C_FLAGS " -DTARGET_OS_OSX=1")
+  string(APPEND CMAKE_CXX_FLAGS " -DTARGET_OS_OSX=1")
+endif()
+
 check_include_file(unwind.h HAVE_UNWIND_H)
 
 # Used by sanitizer_common and tests.
