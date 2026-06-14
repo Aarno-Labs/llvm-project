@@ -58,7 +58,13 @@
 #if defined(__APPLE__)
 #  define SANITIZER_MAC 1
 #  include <TargetConditionals.h>
-#  if TARGET_OS_OSX
+// Newer SDKs (e.g. macOS 15) only set TARGET_OS_OSX for compilers that support
+// the define_target_os_macros extension or define __APPLE_CC__ (Apple clang).
+// A vanilla clang (as built here) has neither, leaving TARGET_OS_OSX == 0 for a
+// plain macOS target. Fall back to "Mac and not iPhone" so SANITIZER_OSX, and
+// thus SANITIZER_MMAP_RANGE_SIZE, are computed correctly. See sanitizer_mac.cpp
+// GetMaxUserVirtualAddress().
+#  if TARGET_OS_OSX || (TARGET_OS_MAC && !TARGET_OS_IPHONE)
 #    define SANITIZER_OSX 1
 #  else
 #    define SANITIZER_OSX 0
