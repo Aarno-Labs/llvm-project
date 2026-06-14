@@ -619,9 +619,13 @@ HandleSignalMode GetHandleSignalMode(int signum) {
 // Offset example:
 // XNU 17 -- macOS 10.13 -- iOS 11 -- tvOS 11 -- watchOS 4
 u16 GetOSMajorKernelOffset() {
-  if (TARGET_OS_OSX) return 4;
-  if (TARGET_OS_IOS || TARGET_OS_TV) return 6;
-  if (TARGET_OS_WATCH) return 13;
+  // Use the SANITIZER_* macros rather than raw TARGET_OS_*: under a vanilla
+  // clang built against a newer macOS SDK, the SDK leaves all TARGET_OS_* at 0,
+  // which would make every branch fall through. SANITIZER_OSX is corrected in
+  // sanitizer_platform.h.
+  if (SANITIZER_OSX) return 4;
+  if (SANITIZER_IOS || SANITIZER_TVOS) return 6;
+  if (SANITIZER_WATCHOS) return 13;
   return 4;
 }
 
@@ -634,7 +638,7 @@ static uptr ApproximateOSVersionViaKernelVersion(VersStr vers) {
   u16 os_major = kernel_major - offset;
 
   const char *format = "%d.0";
-  if (TARGET_OS_OSX) {
+  if (SANITIZER_OSX) {
     if (os_major >= 16) {  // macOS 11+
       os_major -= 5;
     } else {  // macOS 10.15 and below
@@ -688,12 +692,12 @@ void ParseVersion(const char *vers, u16 *major, u16 *minor) {
 // Aligned versions example:
 // macOS 10.15 -- iOS 13 -- tvOS 13 -- watchOS 6
 static void MapToMacos(u16 *major, u16 *minor) {
-  if (TARGET_OS_OSX)
+  if (SANITIZER_OSX)
     return;
 
-  if (TARGET_OS_IOS || TARGET_OS_TV)
+  if (SANITIZER_IOS || SANITIZER_TVOS)
     *major += 2;
-  else if (TARGET_OS_WATCH)
+  else if (SANITIZER_WATCHOS)
     *major += 9;
   else
     UNREACHABLE("unsupported platform");
