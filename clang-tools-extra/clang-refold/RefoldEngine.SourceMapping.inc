@@ -588,9 +588,79 @@ RefoldEngine::MapATokRangeAToBTokenEnvelope(uint64_t beginTok,
   const size_t aByteBegin = aTokOff_[static_cast<size_t>(beginTok)];
   const size_t aByteEnd = aTokOff_[idxEnd];
 
-  // Use the standard byte-range mapper, which trims boundary-only insertions
-  // for non-empty A ranges before converting the projected B bytes to tokens.
-  return MapAByteRangeToBTokenEnvelope(aByteBegin, aByteEnd);
+  // Use the standard byte-range mapper first.  That helper trims
+  // boundary-only insertions in byte space, but byte diffs can split a newly
+  // inserted token when the inserted spelling shares characters with the first
+  // preserved A token (for example, an inserted `struct` before an A range
+  // whose first token starts with `typedef`).  Converting such a partially
+  // trimmed byte boundary with BTokIndexFloor would re-admit the whole B-only
+  // token into this A-cover envelope.
+  //
+  // Finish the projection in token space as well: pure B-token insertions
+  // anchored exactly at the left or right A-token boundary are not part of the
+  // image of this non-empty A-token cover.  They must be discharged by their
+  // own insertion owner, or by callers that intentionally request the
+  // preserve-boundary variant below.  This keeps include/macro/TU owners from
+  // materializing the same B-only edge tokens twice.
+  std::pair<size_t, size_t> env =
+      MapAByteRangeToBTokenEnvelope(aByteBegin, aByteEnd);
+
+  if (!abTokHunks_.empty()) {
+    size_t bTokBegin = env.first;
+    size_t bTokEnd = env.second;
+
+    auto trimTokenInsertionAtBoundary = [&](uint64_t aPos, bool isBegin) {
+      for (const diffutils::Hunk &h : abTokHunks_) {
+        // Only pure token insertions at this exact A boundary are edge
+        // material. Replacements and deletions consume covered A tokens and
+        // remain part of the owner envelope.
+        if (h.aStart != aPos || h.aEnd != aPos || h.bEnd <= h.bStart)
+          continue;
+
+        const size_t hb0 = static_cast<size_t>(h.bStart);
+        const size_t hb1 = static_cast<size_t>(h.bEnd);
+
+        // Ignore boundary insertions that the byte projection did not include.
+        if (!(bTokBegin < hb1 && bTokEnd > hb0))
+          continue;
+
+        if (isBegin) {
+          const size_t oldBegin = bTokBegin;
+          bTokBegin = std::max(bTokBegin, hb1);
+          if (inTraceMode() && bTokBegin > oldBegin) {
+            REFOLD_LOG_TRACE(
+                "byte/env",
+                "trimBeginTok: A=[{0},{1}) boundary A@{2} "
+                "hunkBtok=[{3},{4}) BtrimTok=[{5},{6}) text='{7}'",
+                beginTok, endTok, aPos, hb0, hb1, oldBegin, bTokBegin,
+                stringutils::showWsWithClip(
+                    SliceBSource(oldBegin, bTokBegin), 220));
+          }
+        } else {
+          const size_t oldEnd = bTokEnd;
+          bTokEnd = std::min(bTokEnd, hb0);
+          if (inTraceMode() && oldEnd > bTokEnd) {
+            REFOLD_LOG_TRACE(
+                "byte/env",
+                "trimEndTok: A=[{0},{1}) boundary A@{2} "
+                "hunkBtok=[{3},{4}) BtrimTok=[{5},{6}) text='{7}'",
+                beginTok, endTok, aPos, hb0, hb1, bTokEnd, oldEnd,
+                stringutils::showWsWithClip(
+                    SliceBSource(bTokEnd, oldEnd), 220));
+          }
+        }
+      }
+    };
+
+    trimTokenInsertionAtBoundary(beginTok, /*isBegin=*/true);
+    trimTokenInsertionAtBoundary(endTok, /*isBegin=*/false);
+
+    if (bTokBegin > bTokEnd)
+      bTokBegin = bTokEnd;
+    env = std::make_pair(bTokBegin, bTokEnd);
+  }
+
+  return env;
 }
 
 std::optional<std::pair<size_t, size_t>>
