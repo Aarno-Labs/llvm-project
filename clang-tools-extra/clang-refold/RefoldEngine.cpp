@@ -17946,6 +17946,145 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
           SliceBSource(bEnv->first, bEnv->second).trim().str());
     };
 
+    // The theorem-facing whole-envelope stamp added for the current-level
+    // template path is only needed when the preserved invocation subtree
+    // contains a producer-recorded __COUNTER__ expansion.  Non-counter
+    // current-level repairs already flowed through this path with an
+    // unvalidated whole-envelope proof stamp; keeping that behavior avoids
+    // letting an outer split-argument wrapper preempt the deeper nested-call
+    // preservation machinery.
+    auto currentLevelInvocationIsInSubtreeOf = [&](
+        const RefoldModel::MacroInvocation &macro, uint64_t rootId) {
+      uint64_t currentId = macro.id;
+      SmallVector<uint64_t, 8> seen;
+      while (true) {
+        if (currentId == rootId)
+          return true;
+        if (std::find(seen.begin(), seen.end(), currentId) != seen.end())
+          return false;
+        seen.push_back(currentId);
+
+        const RefoldModel::MacroInvocation *current =
+            FindMacroInvocationById(currentId);
+        if (!current || !current->callerMacroId)
+          return false;
+        currentId = *current->callerMacroId;
+      }
+    };
+
+    auto currentLevelSubtreeContainsCounterInvocation =
+        [&](uint64_t rootId) {
+      if (!FindMacroInvocationById(rootId))
+        return false;
+      for (const RefoldModel::MacroInvocation &macro :
+           model_.GetMacroInvocations()) {
+        if (macro.name != "__COUNTER__")
+          continue;
+        if (currentLevelInvocationIsInSubtreeOf(macro, rootId))
+          return true;
+      }
+      return false;
+    };
+
+    // Prove that the current-level template explains the entire edited
+    // expansion envelope, not just the formal slots that changed spelling.
+    //
+    // buildInvocationSyntaxFromCurrentLevelTemplate() derives each rewritten
+    // actual from producer-recorded standard argument spans.  That is enough to
+    // build the source spelling, but a theorem-facing whole-envelope replay also
+    // has to prove that every fixed replacement-list token in the same macro
+    // expansion remains fixed in B.  This is particularly important for
+    // counter-bearing wrappers such as:
+    //
+    //   #define BAR(x) FOO(x, __COUNTER__)
+    //
+    // where the counter literal is producer-owned fixed body material in the
+    // current-level BAR expansion.  If an ordinary actual changes, preserving
+    // BAR(...) is valid only when the fixed body tape, including the counter
+    // output token, still maps unchanged into the B-side expansion envelope.  If
+    // the counter literal itself changes, this check fails and the existing
+    // counter materialization path remains responsible for the repair.
+    auto currentLevelTemplateReplaysWholeEnvelope =
+        [&](const RefoldModel::MacroInvocation &inv,
+            const CurrentLevelTemplateSurface &surface) -> bool {
+      std::optional<std::pair<size_t, size_t>> wholeBEnv =
+          MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
+              surface.coverBegin, surface.coverEnd);
+      if (!wholeBEnv || wholeBEnv->first >= wholeBEnv->second ||
+          wholeBEnv->second > bToks_.size())
+        return false;
+
+      struct ReplayElem {
+        bool isArg = false;
+        uint64_t begin = 0;
+        uint64_t end = 0;
+        const RefoldModel::PPArgSpan *argSpan = nullptr;
+      };
+
+      SmallVector<ReplayElem, 32> elems;
+      for (const auto &bs : inv.bodySpans) {
+        if (bs.begin < bs.end) {
+          ReplayElem elem;
+          elem.isArg = false;
+          elem.begin = bs.begin;
+          elem.end = bs.end;
+          elems.push_back(elem);
+        }
+      }
+      for (const RefoldModel::PPArgSpan &sp : surface.standardSpans) {
+        if (sp.begin < sp.end) {
+          ReplayElem elem;
+          elem.isArg = true;
+          elem.begin = sp.begin;
+          elem.end = sp.end;
+          elem.argSpan = &sp;
+          elems.push_back(elem);
+        }
+      }
+
+      llvm::sort(elems, [](const ReplayElem &lhs, const ReplayElem &rhs) {
+        if (lhs.begin != rhs.begin)
+          return lhs.begin < rhs.begin;
+        if (lhs.end != rhs.end)
+          return lhs.end < rhs.end;
+        return lhs.isArg < rhs.isArg;
+      });
+
+      size_t bCursor = wholeBEnv->first;
+      for (const ReplayElem &elem : elems) {
+        std::optional<std::pair<size_t, size_t>> elemBEnv;
+        if (elem.isArg) {
+          if (!elem.argSpan)
+            return false;
+          elemBEnv = MapAToBTokenEnvelopeByPPArgSpan(*elem.argSpan);
+        } else {
+          elemBEnv = MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
+              elem.begin, elem.end);
+        }
+        if (!elemBEnv || elemBEnv->first != bCursor ||
+            elemBEnv->second < elemBEnv->first ||
+            elemBEnv->second > wholeBEnv->second)
+          return false;
+
+        if (!elem.isArg) {
+          const uint64_t aLen = elem.end - elem.begin;
+          if (elemBEnv->second - elemBEnv->first != aLen)
+            return false;
+          for (uint64_t i = 0; i < aLen; ++i) {
+            const size_t ai = static_cast<size_t>(elem.begin + i);
+            const size_t bi = elemBEnv->first + static_cast<size_t>(i);
+            if (ai >= aToks_.size() || bi >= bToks_.size() ||
+                aToks_[ai].spelling != bToks_[bi].spelling)
+              return false;
+          }
+        }
+
+        bCursor = elemBEnv->second;
+      }
+
+      return bCursor == wholeBEnv->second;
+    };
+
     // Recursively rebuild a macro invocation's source spelling from its
     // current-level template proof.  The recursion is used only to preserve
     // nested lexical child invocations whose old and new local expansion surfaces
@@ -18173,6 +18312,15 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     if (auto currentLevelRewrite =
             buildInvocationSyntaxFromCurrentLevelTemplate(m, 0)) {
       if (StringRef(*currentLevelRewrite).trim() != baseInvText.trim()) {
+        bool counterWholeEnvelopeReplayValidated = false;
+        if (currentLevelSubtreeContainsCounterInvocation(m.id)) {
+          auto currentLevelSurface =
+              getCurrentLevelTemplateSurfaceForInvocation(m, invArgRanges);
+          counterWholeEnvelopeReplayValidated =
+              currentLevelSurface &&
+              currentLevelTemplateReplaysWholeEnvelope(m,
+                                                       *currentLevelSurface);
+        }
 
         MacroPatch patch{*m.invB, *m.invE, std::move(*currentLevelRewrite),
                          m.id};
@@ -18180,7 +18328,9 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         patch.materializedOutputByteEnd = patch.replacement.size();
         patch.hasMaterializedOutputByteRange = true;
         stampMacroPatchWholeExpansionBRange(patch);
-        setArgsOnlyStandardProof(patch, /*wholeEnvelopeReplayValidated=*/false);
+        setArgsOnlyStandardProof(
+            patch, /*wholeEnvelopeReplayValidated=*/
+                       counterWholeEnvelopeReplayValidated);
         return patch;
       }
     }
