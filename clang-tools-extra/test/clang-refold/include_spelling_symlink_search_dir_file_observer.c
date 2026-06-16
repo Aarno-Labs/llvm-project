@@ -1,0 +1,3 @@
+// RUN: %clang-refold-tester-clang-flags-with-lines include_spelling_symlink_search_dir_file_observer -- -I headers/include_spelling_symlink/link
+#include "parent.h"
+int main(void) { return p + q + (v[0] != 0); }

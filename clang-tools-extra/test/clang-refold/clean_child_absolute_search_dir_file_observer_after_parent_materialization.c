@@ -1,0 +1,10 @@
+// RUN: rm -rf %t.dir && mkdir -p %t.dir
+// RUN: cp %s %t.dir/clean_child_absolute_search_dir_file_observer_after_parent_materialization.c
+// RUN: cp -R %S/headers/absolute_search_dir_file_observer_after_parent_materialization %t.dir/headers
+// RUN: cd %t.dir && ABS_HEADERS="$PWD/headers" && clang -E -P -I "$ABS_HEADERS" --refold-map=%t.dir/clean_child_absolute_search_dir_file_observer_after_parent_materialization.c.refold.json clean_child_absolute_search_dir_file_observer_after_parent_materialization.c -o %t.dir/clean_child_absolute_search_dir_file_observer_after_parent_materialization.c.i
+// RUN: diff -u %S/expected/clean_child_absolute_search_dir_file_observer_after_parent_materialization/clean_child_absolute_search_dir_file_observer_after_parent_materialization.c.i %t.dir/clean_child_absolute_search_dir_file_observer_after_parent_materialization.c.i
+// RUN: clang-refold --strict --log-level=trace --pp %t.dir/clean_child_absolute_search_dir_file_observer_after_parent_materialization.c.i --pp-mod %S/expected/clean_child_absolute_search_dir_file_observer_after_parent_materialization/clean_child_absolute_search_dir_file_observer_after_parent_materialization.c.i.mod --refold-map %t.dir/clean_child_absolute_search_dir_file_observer_after_parent_materialization.c.refold.json --out %t.dir/clean_child_absolute_search_dir_file_observer_after_parent_materialization.c.mod
+// RUN: diff -u %S/expected/clean_child_absolute_search_dir_file_observer_after_parent_materialization/clean_child_absolute_search_dir_file_observer_after_parent_materialization.c.mod %t.dir/clean_child_absolute_search_dir_file_observer_after_parent_materialization.c.mod
+// RUN: cd %t.dir && clang-refold --log-level=trace --check %t.dir/clean_child_absolute_search_dir_file_observer_after_parent_materialization.c.mod --pp-mod %S/expected/clean_child_absolute_search_dir_file_observer_after_parent_materialization/clean_child_absolute_search_dir_file_observer_after_parent_materialization.c.i.mod --refold-map %t.dir/clean_child_absolute_search_dir_file_observer_after_parent_materialization.c.refold.json
+#include "headers/parent.h"
+int main(void) { return p + q; }

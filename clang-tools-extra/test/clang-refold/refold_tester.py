@@ -8,6 +8,7 @@ import shutil
 import platform
 from pathlib import Path
 
+
 def run(cmd, output_file=None):
   print('RUN:', cmd)
 
@@ -70,6 +71,62 @@ def get_macos_sdk_flag():
     return ''
 
 
+def make_relative_to(path_text: str, base_dir: str) -> str:
+  path = Path(path_text)
+  if not path.is_absolute():
+    return path_text
+
+  base = Path(base_dir).resolve()
+  normalized = path.resolve()
+  try:
+    return str(normalized.relative_to(base))
+  except ValueError:
+    # Keep SDK/system/external absolute paths absolute.  The harness only
+    # canonicalizes test-local paths so the refold map does not depend on the
+    # build checkout path for %S/... operands.
+    return path_text
+
+
+def relativize_clang_flag_paths(flags, base_dir: str):
+  # Path-bearing clang options accepted either as two argv entries, e.g.
+  #   -I path
+  # or as a single joined argv entry, e.g.
+  #   -Ipath
+  separate_path_opts = {
+      '-I', '-iquote', '-isystem', '-idirafter',
+      '-F', '-iframework',
+      '-include', '-imacros', '-include-pch',
+  }
+  joined_path_prefixes = (
+      '-iquote', '-isystem', '-idirafter',
+      '-iframework', '-I', '-F',
+  )
+
+  out = []
+  i = 0
+  while i < len(flags):
+    flag = flags[i]
+    if flag in separate_path_opts and i + 1 < len(flags):
+      out.append(flag)
+      out.append(make_relative_to(flags[i + 1], base_dir))
+      i += 2
+      continue
+
+    rewritten = False
+    for prefix in joined_path_prefixes:
+      if flag.startswith(prefix) and len(flag) > len(prefix):
+        out.append(prefix + make_relative_to(flag[len(prefix):], base_dir))
+        rewritten = True
+        break
+    if rewritten:
+      i += 1
+      continue
+
+    out.append(flag)
+    i += 1
+  return out
+
+
 def main():
   ap = argparse.ArgumentParser()
   ap.add_argument('--with-lines', action='store_true', required=False)
@@ -80,11 +137,31 @@ def main():
   ap.add_argument('--log', required=True)
   ap.add_argument('--src', required=True)
   ap.add_argument('--tmp', required=True)
+  ap.add_argument(
+      '--clang-flags-mode', action='store_true', required=False,
+      help=('Treat trailing positional arguments as raw clang producer flags '
+            'instead of macro specs. In this mode, no default header -I is '
+            'injected; the RUN line owns the full producer include path.'))
 
-  # Positional: test name + optional macro specs (“NAME” or “NAME=VALUE”).
+  # Positional: test name + optional extras.  In the default mode the extras
+  # are macro specs ("NAME" or "NAME=VALUE").  In --clang-flags-mode they
+  # are passed verbatim to the producer clang command.  A leading "--" is
+  # accepted as a separator and is not forwarded to clang.
   ap.add_argument('testname')
-  ap.add_argument('macros', nargs='*')  # e.g. BOOL_FLAG  or  ARG_FLAG=ARG
+  ap.add_argument('extras', nargs=argparse.REMAINDER)
   args = ap.parse_args()
+
+  extras = list(args.extras)
+  if extras and extras[0] == '--':
+    extras = extras[1:]
+
+  if not args.clang_flags_mode:
+    bad_macro_specs = [m for m in extras if m.startswith('-')]
+    if bad_macro_specs:
+      ap.error(
+          'trailing arguments look like clang flags, but --clang-flags-mode '
+          'was not set.  Use %clang-refold-tester-clang-flags for raw '
+          'producer flags; first suspicious argument: ' + bad_macro_specs[0])
 
   testname = args.testname
   src = args.src
@@ -96,8 +173,10 @@ def main():
   def labelize(m: str) -> str:
     return m.replace('=', '@')
 
-  if args.macros:
-    label = 'define_' + '_'.join(labelize(m) for m in args.macros)
+  if args.clang_flags_mode:
+    exp_base = os.path.join(args.expected, testname)
+  elif extras:
+    label = 'define_' + '_'.join(labelize(m) for m in extras)
     exp_base = os.path.join(args.expected, testname, label)
   else:
     exp_base = os.path.join(args.expected, testname)
@@ -117,12 +196,15 @@ def main():
   exp_i_mod = os.path.join(exp_base, f'{testname}.c.i.mod')
   exp_mod = os.path.join(exp_base, f'{testname}.c.mod')
 
-  # Build -D flags verbatim from macro specs
-  dflags = ' '.join(f'-D{m}' for m in args.macros)
+  if args.clang_flags_mode:
+    producer_flags = relativize_clang_flag_paths(extras, src_dirname)
+  else:
+    header_path = Path(args.headers)
+    header_rel_path = header_path.relative_to(src_dirname)
+    producer_flags = ['-I', str(header_rel_path)]
+    producer_flags.extend(f'-D{m}' for m in extras)
 
-  header_path = Path(args.headers)
-  src_dirname_path = Path(src_dirname)
-  header_rel_path = header_path.relative_to(src_dirname)
+  producer_flags_str = ' '.join(shlex.quote(f) for f in producer_flags)
 
   # 1) Preprocess to .c.i and produce refold map JSON
   clang_cmd = ''
@@ -131,15 +213,15 @@ def main():
     if isysroot:
       clang_cmd = (
           f'{shlex.quote(args.clang)} -E -P {isysroot} '
-          f'-I {shlex.quote(str(header_rel_path))} {dflags} '
+          f'{producer_flags_str} '
           f'--refold-map={shlex.quote(out_json)} '
           f'{shlex.quote(src_basename)} -o {shlex.quote(out_i)}'
       )
   if not clang_cmd:
     clang_cmd = (
         f'{shlex.quote(args.clang)} -E -P '
-        f'-I {shlex.quote(str(header_rel_path))} '
-        f'{dflags} --refold-map={shlex.quote(out_json)} '
+        f'{producer_flags_str} '
+        f'--refold-map={shlex.quote(out_json)} '
         f'{shlex.quote(src_basename)} -o {shlex.quote(out_i)}'
     )
   os.chdir(src_dirname)
