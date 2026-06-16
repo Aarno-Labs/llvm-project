@@ -2417,6 +2417,52 @@ void RefoldEngine::MaterializeIncludeExpansion(
     return;
   }
 
+  auto materializedHeaderHasNoLineRepairableBaseFileObserver = [&]() {
+    // __BASE_FILE__ is part of the line/file observer family when line
+    // directives are available: a source-authored or synthetic #line can keep
+    // the replayed spelling stable without destroying source structure.  In
+    // --no-lines mode, however, a materialized include owner has no way to
+    // repair a preserved source-spelled __BASE_FILE__; replay would observe the
+    // refolded output as the top-level file.  In that mode, realize the include
+    // from the producer-proven B envelope so the recorded literal is emitted.
+    if (lineDirs_.Enabled())
+      return false;
+
+    for (const RefoldModel::MacroInvocation &macro :
+         model_.GetMacroInvocations()) {
+      if (macro.name != "__BASE_FILE__")
+        continue;
+      if (!LineStateBuiltinInvocationIsPreservedObserver(macro))
+        continue;
+
+      const RefoldModel::MacroInvocation *site =
+          LineStateObservableMacroSite(macro);
+      std::optional<uint64_t> owner =
+          site && site->ownerIncludeId ? site->ownerIncludeId
+                                       : macro.ownerIncludeId;
+      if (!owner || *owner != includeId)
+        continue;
+
+      // The owner id is the semantic proof.  The file spelling checks are only
+      // hardening against malformed producer records that accidentally attach a
+      // builtin from another source buffer to this include instance.
+      if (site && site->invFile && !PathsEqual(*site->invFile, headerPath))
+        continue;
+      if (macro.invFile && !PathsEqual(*macro.invFile, headerPath) &&
+          (!site || !site->invFile || !PathsEqual(*site->invFile, headerPath)))
+        continue;
+
+      return true;
+    }
+    return false;
+  };
+
+  if (materializedHeaderHasNoLineRepairableBaseFileObserver()) {
+    (void)realizeMaterializedHeaderFromB(
+        "__BASE_FILE__ observer in materialized header without line repair");
+    return;
+  }
+
   auto includeInsertionPatchCarriesSidebandReplay =
       [&](const SidebandPragmaEdit &sideband) -> bool {
     if (editsIt == perInclude.end())
@@ -3165,24 +3211,6 @@ void RefoldEngine::MaterializeIncludeExpansion(
     return std::nullopt;
   };
 
-  auto replaySurfaceQuotedIncludePreservesResolvedPath =
-      [&](const RefoldModel::IncludeItem &child) -> bool {
-    if (child.subkind != "#include" || child.angled || !child.resolvedPath)
-      return false;
-
-    std::optional<std::string> operand = quotedIncludeReplayLookupOperand(child);
-    if (!operand)
-      return false;
-
-    std::optional<std::filesystem::path> replayResolved =
-        resolveQuotedIncludeFromReplaySurface(*operand);
-    if (!replayResolved)
-      return false;
-
-    const std::string replaySpelling = replayResolved->generic_string();
-    return PathsEqual(replaySpelling, *child.resolvedPath);
-  };
-
   auto synthesizeQuotedIncludeOperandForReplaySurface =
       [&](const RefoldModel::IncludeItem &child) -> std::optional<std::string> {
     if (!child.resolvedPath)
@@ -3215,20 +3243,148 @@ void RefoldEngine::MaterializeIncludeExpansion(
     return operand;
   };
 
+  auto relativeSpellingInPPCwd = [&](const std::filesystem::path &path,
+                                        bool directSourceOperand)
+      -> std::string {
+    // Preserve lexical spelling for __FILE__ proofs.  Canonicalizing here would
+    // erase symlink/alias distinctions that Clang exposes in predefined-file
+    // builtins.  For direct source-relative operands, Clang prefixes a relative
+    // path with "./"; for paths found through -I/-iquote, it uses the search
+    // directory spelling without that synthetic prefix.
+    std::filesystem::path cwd =
+        absolutePathInPPCwd(StringRef(".")).lexically_normal();
+    std::filesystem::path normalized = path.lexically_normal();
+    std::filesystem::path relative = normalized.lexically_relative(cwd);
+    const std::string relativeSpelling = relative.generic_string();
+    if (!relativeSpelling.empty() && relativeSpelling != "." &&
+        relativeSpelling != ".." &&
+        !StringRef(relativeSpelling).starts_with("../")) {
+      return directSourceOperand ? (Twine("./") + relativeSpelling).str()
+                                 : relativeSpelling;
+    }
+
+    return normalized.generic_string();
+  };
+
+  auto replaySurfaceDirectFileSpellingForOperand =
+      [&](StringRef operand) -> std::optional<std::string> {
+    std::optional<std::filesystem::path> sourceDir =
+        sourceDirectoryForReplaySurface();
+    if (!sourceDir)
+      return std::nullopt;
+
+    std::filesystem::path replayPath =
+        (*sourceDir / operand.str()).lexically_normal();
+    if (!pathExists(replayPath))
+      return std::nullopt;
+
+    return relativeSpellingInPPCwd(replayPath, /*directSourceOperand=*/true);
+  };
+
+  auto replaySurfaceQuotedFileSpellingForOperand =
+      [&](StringRef operand) -> std::optional<std::string> {
+    if (std::optional<std::string> direct =
+            replaySurfaceDirectFileSpellingForOperand(operand))
+      return direct;
+
+    for (const std::filesystem::path &dir : recordedQuotedIncludeSearchDirs()) {
+      std::filesystem::path candidate =
+          (dir / operand.str()).lexically_normal();
+      if (pathExists(candidate))
+        return relativeSpellingInPPCwd(candidate,
+                                      /*directSourceOperand=*/false);
+    }
+
+    return std::nullopt;
+  };
+
+  auto fileSpellingEqualModuloLeadingDotSlash = [](StringRef a,
+                                                   StringRef b) {
+    auto drop = [](StringRef s) {
+      while (s.starts_with("./"))
+        s = s.drop_front(2);
+      return s;
+    };
+    return drop(a) == drop(b);
+  };
+
+  auto includeIdIsDescendantOrSelf = [&](uint64_t owner,
+                                         uint64_t root) -> bool {
+    uint64_t cur = owner;
+    while (true) {
+      if (cur == root)
+        return true;
+      const RefoldModel::IncludeItem *inc = model_.GetIncludeById(cur);
+      if (!inc || !inc->parent)
+        return false;
+      cur = *inc->parent;
+    }
+  };
+
+  auto includeSubtreeLineStateCanReplayThroughOperand =
+      [&](uint64_t includeId, StringRef operand,
+          bool requireDirectSourceOperand) -> bool {
+    std::optional<std::string> replayFile;
+
+    for (const auto &macro : model_.GetMacroInvocations()) {
+      const bool observesLine = macro.name == "__LINE__";
+      const bool observesFile = macro.name == "__FILE__";
+      const bool observesFileName = macro.name == "__FILE_NAME__";
+      const bool observesBaseFile = macro.name == "__BASE_FILE__";
+      if (!observesLine && !observesFile && !observesFileName &&
+          !observesBaseFile)
+        continue;
+      if (!LineStateBuiltinInvocationIsPreservedObserver(macro))
+        continue;
+
+      const RefoldModel::MacroInvocation *site =
+          LineStateObservableMacroSite(macro);
+      std::optional<uint64_t> owner =
+          site && site->ownerIncludeId ? site->ownerIncludeId
+                                       : macro.ownerIncludeId;
+      if (!owner || !includeIdIsDescendantOrSelf(*owner, includeId))
+        continue;
+
+      // __BASE_FILE__ observes the top-level replay file, not the entered
+      // header spelling.  Do not use an include operand rewrite as a proof for
+      // it; the line-state/B-realization machinery must handle that observer.
+      if (observesBaseFile)
+        return false;
+
+      // Re-entering the same physical header is enough for __LINE__; no lexical
+      // file-spelling proof is needed for line-only subtrees.  File-valued
+      // builtins additionally require the spelling that Clang will expose
+      // through __FILE__/__FILE_NAME__ to match the producer-observed spelling.
+      if (!observesFile && !observesFileName)
+        continue;
+
+      if (!replayFile) {
+        replayFile = requireDirectSourceOperand
+                         ? replaySurfaceDirectFileSpellingForOperand(operand)
+                         : replaySurfaceQuotedFileSpellingForOperand(operand);
+        if (!replayFile)
+          return false;
+      }
+      if (observesFile) {
+        if (!site || !site->invFile ||
+            !fileSpellingEqualModuloLeadingDotSlash(*site->invFile,
+                                                    *replayFile))
+          return false;
+      }
+      if (observesFileName) {
+        if (!site || !site->invFile)
+          return false;
+        if (llvm::sys::path::filename(*site->invFile) !=
+            llvm::sys::path::filename(*replayFile))
+          return false;
+      }
+    }
+
+    return true;
+  };
+
   auto includeSubtreeHasIncludeLevelSensitiveBuiltin =
       [&](uint64_t includeId) -> bool {
-    auto isDescendantOrSelf = [&](uint64_t owner) -> bool {
-      uint64_t cur = owner;
-      while (true) {
-        if (cur == includeId)
-          return true;
-        const RefoldModel::IncludeItem *inc = model_.GetIncludeById(cur);
-        if (!inc || !inc->parent)
-          return false;
-        cur = *inc->parent;
-      }
-    };
-
     for (const auto &macro : model_.GetMacroInvocations()) {
       if (macro.name != "__INCLUDE_LEVEL__")
         continue;
@@ -3252,7 +3408,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
       std::optional<uint64_t> owner = site->ownerIncludeId;
       if (!owner)
         owner = macro.ownerIncludeId;
-      if (!owner || !isDescendantOrSelf(*owner))
+      if (!owner || !includeIdIsDescendantOrSelf(*owner, includeId))
         continue;
 
       if (!LineStateBuiltinInvocationIsPreservedObserver(macro))
@@ -3298,9 +3454,14 @@ void RefoldEngine::MaterializeIncludeExpansion(
       return plan;
     }
 
-    if (child.subkind == "#include") {
-      if (child.angled || replaySurfaceQuotedIncludePreservesResolvedPath(child))
+    if (child.subkind == "#include" && child.angled) {
+      if (IncludeSubtreeHasLineStateSensitiveBuiltin(child.id)) {
+        plan.action = CleanChildIncludeReplayAction::Materialize;
+        plan.reason = "angled child include observes line/file state across "
+                      "materialized-parent include relocation";
         return plan;
+      }
+      return plan;
     }
 
     bool mayRewriteUnstableOperand = false;
@@ -3325,14 +3486,30 @@ void RefoldEngine::MaterializeIncludeExpansion(
           resolveQuotedIncludeFromReplaySurface(*childReplayOperand);
       if (replayResolved) {
         const std::string replaySpelling = replayResolved->generic_string();
-        if (PathsEqual(replaySpelling, *child.resolvedPath))
-          return plan;
+        if (PathsEqual(replaySpelling, *child.resolvedPath)) {
+          if (!IncludeSubtreeHasLineStateSensitiveBuiltin(child.id) ||
+              includeSubtreeLineStateCanReplayThroughOperand(
+                  child.id, *childReplayOperand,
+                  /*requireDirectSourceOperand=*/false))
+            return plan;
 
-        // A concrete replay-surface hit for the original quoted operand is a
-        // real shadowing conflict.  Rewriting around that shadow would invent a
-        // third lookup event rather than preserving the producer-observed event,
-        // so the owner-closed repair is to materialize the child edge.
-        reason = "quoted operand resolves to a different file at replay surface";
+          // Physical-file equality is not enough for a child subtree that
+          // observes presumed file spelling.  The original operand may replay
+          // through a symlinked or aliased search directory and produce a
+          // different __FILE__ token, so try to rewrite to a direct operand that
+          // names the producer-observed spelling before falling back to
+          // materialization.
+          mayRewriteUnstableOperand = true;
+          reason = "quoted operand resolves to the same physical file but "
+                   "does not prove line/file observer spelling stability";
+        } else {
+          // A concrete replay-surface hit for the original quoted operand is a
+          // real shadowing conflict.  Rewriting around that shadow would invent
+          // a third lookup event rather than preserving the producer-observed
+          // event, so the owner-closed repair is to materialize the child edge.
+          reason = "quoted operand resolves to a different file at replay "
+                   "surface";
+        }
       } else {
         // The original quoted operand has no replay-surface lookup target, so
         // there is no concrete TU-surface shadow to bypass.  Whether the operand
@@ -3351,24 +3528,33 @@ void RefoldEngine::MaterializeIncludeExpansion(
       }
     }
 
-    if (mayRewriteUnstableOperand &&
-        IncludeSubtreeHasLineStateSensitiveBuiltin(child.id)) {
-      // Rewriting the include operand can change the physical/presumed file and
-      // line state observed inside the child.  Without a more specific proof for
-      // those observers, materialize the child text instead.
-      mayRewriteUnstableOperand = false;
-      if (!reason.empty())
-        reason += "; ";
-      reason += "child subtree observes line/file state";
-    }
-
     if (mayRewriteUnstableOperand) {
       if (std::optional<std::string> rewritten =
               synthesizeQuotedIncludeOperandForReplaySurface(child)) {
-        plan.action = CleanChildIncludeReplayAction::RewriteOperand;
-        plan.rewrittenOperand = std::move(*rewritten);
-        plan.reason = std::move(reason);
-        return plan;
+        const bool subtreeNeedsLineState =
+            IncludeSubtreeHasLineStateSensitiveBuiltin(child.id);
+        const bool lineStateReplaySafe =
+            !subtreeNeedsLineState ||
+            includeSubtreeLineStateCanReplayThroughOperand(
+                child.id, *rewritten,
+                /*requireDirectSourceOperand=*/true);
+        if (lineStateReplaySafe) {
+          plan.action = CleanChildIncludeReplayAction::RewriteOperand;
+          plan.rewrittenOperand = std::move(*rewritten);
+          plan.reason = std::move(reason);
+          return plan;
+        }
+
+        // Rewriting the include operand can change the presumed file spelling
+        // observed inside the child even when it names the same physical file.
+        // Only use the include-preserving rewrite when the synthesized direct
+        // operand is proven to replay every preserved line/file observer with
+        // the producer-observed spelling; otherwise stay owner-closed by
+        // materializing the child text and using line-state repair.
+        if (!reason.empty())
+          reason += "; ";
+        reason += "child subtree observes line/file state not proven stable "
+                  "through rewritten operand";
       }
     }
 
