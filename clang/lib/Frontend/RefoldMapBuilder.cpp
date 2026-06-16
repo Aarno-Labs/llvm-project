@@ -654,25 +654,33 @@ std::string joinSpelled(llvm::StringRef DirSpelling, llvm::StringRef Rel) {
 //   - InvBegin:     Absolute byte offset in the file where InvText begins.
 //                   We add relative offsets within InvText to produce absolute
 //                   ranges.
-//   - ExpectedArgs: The number of arguments we expect to find (usually the
-//                   number of formal parameters for the macro).
+//   - Params:       Producer-recorded formal parameter shape for the macro.
+//                   The final parameter owns the variadic tail when marked
+//                   variadic.
 //
 // Output:
-//   - Out[i] = {begin, end} absolute byte offsets into the file for argument i,
-//     using half-open ranges [begin, end). Missing/unknown args remain nullopt.
+//   - Out[i] = {begin, end} absolute byte offsets into the file for formal
+//     parameter i, using half-open ranges [begin, end). Variadic tails span
+//     from the first variadic actual through the last, including separators.
+//     Missing/unknown args remain nullopt only when this routine fails closed
+//     and preserves the caller's pre-sized null output.
 //
 // Return value:
-//   - true if we find a plausible top-level argument list that ends at a
-//     matching ')' for the first '(' in InvText; false otherwise.
+//   - true iff we find a top-level argument list whose actual count maps
+//     exactly onto Params. Non-variadic arity mismatches fail closed; only a
+//     final variadic parameter may absorb an actual tail.
 static bool computeInvArgRangesFromText(
-    llvm::StringRef InvText, uint64_t InvBegin, size_t ExpectedArgs,
-    const LangOptions &Lang,
+    llvm::StringRef InvText, uint64_t InvBegin,
+    llvm::ArrayRef<MacroParam> Params, const LangOptions &Lang,
     std::vector<std::pair<std::optional<uint64_t>, std::optional<uint64_t>>>
         &Out) {
-  // Preserve the caller's current Out state on failure. (Callers may have
-  // pre-sized Out and rely on it retaining its shape when parsing fails.)
-  std::vector<std::pair<std::optional<uint64_t>, std::optional<uint64_t>>> Args;
-  Args.reserve(ExpectedArgs);
+  using ArgRange =
+      std::pair<std::optional<uint64_t>, std::optional<uint64_t>>;
+
+  // Preserve the caller's current Out state on failure. (Callers pre-size Out
+  // with null ranges; leaving that state intact is the fail-closed result.)
+  std::vector<ArgRange> ParsedActuals;
+  ParsedActuals.reserve(Params.size());
 
   // Tokenize the *raw* invocation text with Clang's lexer. This ensures we
   // treat comments as whitespace and do not accidentally split on commas/parens
@@ -692,7 +700,7 @@ static bool computeInvArgRangesFromText(
                                BaseLoc.getRawEncoding());
   };
 
-  auto recordArg = [&](size_t A0, size_t A1) {
+  auto makeRange = [&](size_t A0, size_t A1) -> ArgRange {
     while (A0 < A1 &&
            std::isspace(static_cast<unsigned char>(InvText[A0]))) {
       ++A0;
@@ -701,7 +709,96 @@ static bool computeInvArgRangesFromText(
            std::isspace(static_cast<unsigned char>(InvText[A1 - 1]))) {
       --A1;
     }
-    Args.push_back({InvBegin + A0, InvBegin + A1});
+    return {InvBegin + A0, InvBegin + A1};
+  };
+
+  auto recordArg = [&](size_t A0, size_t A1) {
+    ParsedActuals.push_back(makeRange(A0, A1));
+  };
+
+  auto emptyAt = [&](size_t Off) -> ArgRange {
+    return {InvBegin + Off, InvBegin + Off};
+  };
+
+  auto commitFormalRanges = [&](std::optional<ArgRange> EmptyListArg,
+                                size_t CloseOff) -> bool {
+    const size_t NumParams = Params.size();
+    const bool IsVariadic = NumParams > 0 && Params.back().Variadic;
+    const size_t FixedCount = IsVariadic ? NumParams - 1 : NumParams;
+
+    std::vector<ArgRange> OutTmp(NumParams,
+                                 {std::nullopt, std::nullopt});
+
+    if (!IsVariadic) {
+      if (NumParams == 0) {
+        if (!ParsedActuals.empty())
+          return false;
+        Out = std::move(OutTmp);
+        return true;
+      }
+
+      // With one fixed parameter, F() is one empty argument. With more than one
+      // fixed parameter, that same spelling is an arity error and must not be
+      // papered over by manufacturing missing ranges.
+      if (ParsedActuals.empty()) {
+        if (NumParams != 1 || !EmptyListArg)
+          return false;
+        OutTmp[0] = *EmptyListArg;
+        Out = std::move(OutTmp);
+        return true;
+      }
+
+      if (ParsedActuals.size() != NumParams)
+        return false;
+
+      for (size_t I = 0; I < NumParams; ++I)
+        OutTmp[I] = ParsedActuals[I];
+      Out = std::move(OutTmp);
+      return true;
+    }
+
+    if (ParsedActuals.empty()) {
+      if (!EmptyListArg)
+        return false;
+
+      if (FixedCount == 0) {
+        // A variadic-only macro invoked as F() has an empty variadic tail.
+        OutTmp[0] = *EmptyListArg;
+        Out = std::move(OutTmp);
+        return true;
+      }
+
+      if (FixedCount == 1) {
+        // For F(x, ...) invoked as F(), the empty list supplies the sole fixed
+        // argument and the variadic tail is omitted.
+        OutTmp[0] = *EmptyListArg;
+        OutTmp[NumParams - 1] = emptyAt(CloseOff);
+        Out = std::move(OutTmp);
+        return true;
+      }
+
+      return false;
+    }
+
+    if (ParsedActuals.size() < FixedCount)
+      return false;
+
+    for (size_t I = 0; I < FixedCount; ++I)
+      OutTmp[I] = ParsedActuals[I];
+
+    if (ParsedActuals.size() == FixedCount) {
+      // The invocation omitted the variadic tail, e.g. F(a) for F(x, ...).
+      // Record a proven empty range at the closing parenthesis.
+      OutTmp[NumParams - 1] = emptyAt(CloseOff);
+    } else {
+      // The final formal is variadic and owns the entire tail, including
+      // separators between the first and last variadic actual.
+      OutTmp[NumParams - 1] = {ParsedActuals[FixedCount].first,
+                               ParsedActuals.back().second};
+    }
+
+    Out = std::move(OutTmp);
+    return true;
   };
 
   Token Tok;
@@ -709,11 +806,8 @@ static bool computeInvArgRangesFromText(
   size_t ArgStart = 0;
 
   unsigned ParenDepth = 0;
-
-  // For 0-parameter function-like macros, accept invocations that have no
-  // tokens between '(' and ')'. (Comments are lexed as whitespace unless
-  // explicitly retained, so FOO(/*c*/) behaves like FOO().)
   bool SawAnyTokenBetweenParens = false;
+  bool SawArgumentSeparator = false;
 
   while (true) {
     Lex.LexFromRawLexer(Tok);
@@ -740,37 +834,14 @@ static bool computeInvArgRangesFromText(
     }
     if (Tok.is(tok::r_paren)) {
       if (ParenDepth == 0) {
-        if (ExpectedArgs == 0) {
-          if (!SawAnyTokenBetweenParens) {
-            Out = std::move(Args);
-            return true;
-          }
-          return false;
-        }
-        recordArg(ArgStart, Off);
-
-        // Best-effort: if the parsed argument count does not match the macro's
-        // formal parameter count, keep what we could parse and leave remaining
-        // formals as null. This preserves the historical behavior for macro
-        // dispatcher patterns like: (A,B,C,0)(__VA_ARGS__).
-        std::vector<std::pair<std::optional<uint64_t>, std::optional<uint64_t>>>
-            OutTmp;
-        OutTmp.resize(ExpectedArgs, {std::nullopt, std::nullopt});
-
-        const size_t Fill = std::min(Args.size(), ExpectedArgs);
-        for (size_t I = 0; I < Fill; ++I)
-          OutTmp[I] = Args[I];
-
-        if (Args.size() > ExpectedArgs && ExpectedArgs > 0) {
-          OutTmp[ExpectedArgs - 1] = {Args[ExpectedArgs - 1].first,
-                                      Args.back().second};
-        }
-
-        Out = std::move(OutTmp);
-        return true;
+        std::optional<ArgRange> EmptyListArg;
+        if (SawAnyTokenBetweenParens || SawArgumentSeparator)
+          recordArg(ArgStart, Off);
+        else
+          EmptyListArg = makeRange(ArgStart, Off);
+        return commitFormalRanges(EmptyListArg, Off);
       }
-      if (ParenDepth > 0)
-        --ParenDepth;
+      --ParenDepth;
       SawAnyTokenBetweenParens = true;
       continue;
     }
@@ -781,6 +852,7 @@ static bool computeInvArgRangesFromText(
     if (Tok.is(tok::comma) && ParenDepth == 0) {
       recordArg(ArgStart, Off);
       ArgStart = Off + Tok.getLength();
+      SawArgumentSeparator = true;
       continue;
     }
 
@@ -2500,18 +2572,18 @@ void RefoldMapBuilder::onMacroExpands(const Token &MacroNameTok,
   // inv_b/inv_e). To index into inv_text, subtract inv_b (inv_begin).
   //
   // We derive argument ranges by lexing the spelled invocation text (inv_text)
-  // with Clang's raw lexer so that commas/parens inside comments, string/char
-  // literals, raw strings, etc. are handled correctly. This yields ranges that
-  // are consistent with inv_text and do not depend on SourceLocation mapping
-  // through nested macro expansions.
+  // with Clang's raw lexer, then mapping parsed actuals onto the producer-
+  // recorded formal parameter shape. Non-variadic arity mismatches fail closed;
+  // only the final variadic formal may absorb an actual tail.
   It.InvArgRanges.clear();
   if (MI && MI->isFunctionLike()) {
     const size_t NFormals = MI->getNumParams();
     It.InvArgRanges.resize(NFormals, {std::nullopt, std::nullopt});
 
     if (It.InvBegin && !It.InvText.empty()) {
-      (void)computeInvArgRangesFromText(It.InvText, *It.InvBegin, NFormals,
-                                        PP.getLangOpts(), It.InvArgRanges);
+      (void)computeInvArgRangesFromText(It.InvText, *It.InvBegin,
+                                        It.DefParams, PP.getLangOpts(),
+                                        It.InvArgRanges);
     } else {
       It.InvArgRanges.clear();
     }
