@@ -2170,6 +2170,36 @@ void RefoldEngine::EnforceTheoremAuditInvariants() const {
         "state-transition gateway audit found an undischarged or malformed "
         "state proof");
   }
+  if (GetWitnessResolverMode() == WitnessResolverMode::Strict) {
+    if (lastTheoremAudit_.resolverPotentiallyMissingProof != 0) {
+      NoteTheoremAuditViolation(
+          "strict resolver audit found a potentially in-domain missing proof");
+    }
+    if (lastTheoremAudit_.resolverUnknownDomain != 0) {
+      NoteTheoremAuditViolation(
+          "strict resolver audit found an unclassified domain outcome");
+    }
+    if (lastTheoremAudit_.resolverStrictLegacyFallback != 0) {
+      NoteTheoremAuditViolation(
+          "strict resolver audit found a legacy fallback");
+    }
+    if (lastTheoremAudit_.resolverStrictInvalidFailClosed != 0) {
+      NoteTheoremAuditViolation(
+          "strict resolver audit found a fail-closed outcome that was not "
+          "complete non-equivalent ambiguity");
+    }
+    if (lastTheoremAudit_.resolverDeclaredIncompleteKeys != 0 ||
+        lastTheoremAudit_.resolverDeclaredIncompatibleComposition != 0 ||
+        lastTheoremAudit_.resolverDeclaredUnconvertedWitnesses != 0) {
+      NoteTheoremAuditViolation(
+          "strict resolver audit found a declared in-domain repair without "
+          "complete keys, converted witnesses, and compatible composition");
+    }
+    if (lastTheoremAudit_.resolverClosureLedgerRows != 0) {
+      NoteTheoremAuditViolation(
+          "strict resolver audit emitted missing-proof closure ledger rows");
+    }
+  }
   if (IsNoLegacyAuditEnabled() &&
       lastTheoremAudit_.noLegacyAuditFindings != 0) {
     NoteTheoremAuditViolation(
@@ -2187,6 +2217,115 @@ void RefoldEngine::EnforceTheoremAuditInvariants() const {
                               TerminalFallbackObligationKind::TheoremAuditInvariantSatisfied,
                               TerminalFallbackFailureReason::TheoremAuditInvariantViolation),
                           "theorem", BuildTheoremAuditInvariantDetail());
+}
+
+
+void RefoldEngine::RecordWitnessResolverTheoremAudit(
+    const WitnessResolverDecision &decision) const {
+  using DomainClass = WitnessStrictDomainClass;
+
+  ++lastTheoremAudit_.resolverDomainAudits;
+  lastTheoremAudit_.resolverClosureLedgerRows += decision.closureLedger.size();
+
+  switch (decision.strictDomain.domainClass) {
+  case DomainClass::DeclaredInDomain:
+    ++lastTheoremAudit_.resolverDeclaredInDomain;
+    break;
+  case DomainClass::ExplicitOutOfDomain:
+    ++lastTheoremAudit_.resolverExplicitOutOfDomain;
+    break;
+  case DomainClass::AmbiguousOutOfDomain:
+    ++lastTheoremAudit_.resolverAmbiguousOutOfDomain;
+    break;
+  case DomainClass::PotentiallyInDomainMissingProof:
+    ++lastTheoremAudit_.resolverPotentiallyMissingProof;
+    break;
+  case DomainClass::Unknown:
+    ++lastTheoremAudit_.resolverUnknownDomain;
+    break;
+  }
+
+  if (decision.mode != WitnessResolverMode::Strict)
+    return;
+
+  const bool strictResolverAuthority =
+      decision.strictUseResolver && decision.resolverIndex.has_value();
+  const bool strictLegacyFallback =
+      !strictResolverAuthority && !decision.strictFailClosed;
+
+  if (strictResolverAuthority)
+    ++lastTheoremAudit_.resolverStrictResolverAuthority;
+  if (strictLegacyFallback)
+    ++lastTheoremAudit_.resolverStrictLegacyFallback;
+  if (decision.strictFailClosed)
+    ++lastTheoremAudit_.resolverStrictFailClosed;
+
+  auto reject = [&](StringRef why) {
+    NoteTheoremAuditViolation(
+        llvm::formatv("strict resolver theorem audit rejected role={0}: {1}; "
+                      "domain={2} fallback_class={3} reason={4}",
+                      decision.role, why,
+                      toString(decision.strictDomain.domainClass),
+                      toString(decision.fallbackClass),
+                      decision.failureReason.empty()
+                          ? StringRef("<none>")
+                          : StringRef(decision.failureReason))
+            .str());
+  };
+
+  if (decision.strictDomain.domainClass ==
+      DomainClass::PotentiallyInDomainMissingProof) {
+    reject("resolver still has a potentially in-domain missing proof");
+  }
+
+  if (decision.strictDomain.domainClass == DomainClass::Unknown)
+    reject("resolver outcome has no strict-domain classification");
+
+  if (!decision.closureLedger.empty())
+    reject("resolver emitted missing-proof closure ledger rows");
+
+  if (strictLegacyFallback)
+    reject("strict mode fell back to legacy selection");
+
+  if (decision.strictDomain.domainClass == DomainClass::DeclaredInDomain) {
+    if (!strictResolverAuthority)
+      reject("declared in-domain resolver outcome was not authoritative");
+
+    if (decision.incompleteWitnessCount != 0) {
+      ++lastTheoremAudit_.resolverDeclaredIncompleteKeys;
+      reject("declared in-domain resolver outcome used incomplete witness keys");
+    }
+
+    if (decision.resolverUnconvertedWitnessCount != 0) {
+      ++lastTheoremAudit_.resolverDeclaredUnconvertedWitnesses;
+      reject("declared in-domain resolver outcome used unconverted witnesses");
+    }
+
+    if (!decision.composition.compatible ||
+        decision.composition.incompleteTupleCount != 0 ||
+        decision.composition.incompatibleTupleCount != 0) {
+      ++lastTheoremAudit_.resolverDeclaredIncompatibleComposition;
+      reject("declared in-domain resolver outcome lacked compatible composition");
+    }
+  }
+
+  if (decision.strictFailClosed) {
+    const bool completeNonEquivalentAmbiguity =
+        decision.strictDomain.domainClass == DomainClass::AmbiguousOutOfDomain &&
+        decision.incompleteWitnessCount == 0 &&
+        decision.resolverUnconvertedWitnessCount == 0 &&
+        (decision.fallbackClass ==
+             WitnessFallbackClass::MultipleNonEquivalentWitnessClasses ||
+         (decision.fallbackClass == WitnessFallbackClass::CompositionFailure &&
+          decision.composition.failureIsFatal &&
+          decision.composition.incompleteTupleCount == 0));
+
+    if (!completeNonEquivalentAmbiguity) {
+      ++lastTheoremAudit_.resolverStrictInvalidFailClosed;
+      reject("strict fail-closed outcome was not complete non-equivalent "
+             "ambiguity");
+    }
+  }
 }
 
 bool RefoldEngine::AuditProofSummaryForLegacyAuthority(
@@ -2875,7 +3014,11 @@ std::string RefoldEngine::BuildTheoremAuditInvariantDetail() const {
              "nonExplicitTerminalExclusions={9} terminalFailureAuditViolations={10} "
              "stateTransitionAuditViolations={11} noLegacyFindings={12} "
              "noLegacyEmissionViolations={13} noLegacyStrictRejections={14} "
-             "directStateChecks={15} directStateUnclosed={16}",
+             "directStateChecks={15} directStateUnclosed={16} "
+             "resolverMissingProof={17} resolverUnknownDomain={18} "
+             "strictLegacyFallback={19} strictInvalidFailClosed={20} "
+             "declaredIncompleteKeys={21} declaredIncompatibleComposition={22} "
+             "declaredUnconverted={23} closureLedgerRows={24}",
              firstViolation, lastTheoremAudit_.selectorDirectBypasses,
              lastTheoremAudit_.emittedSelectorOnlyExceptionCarriers,
              lastTheoremAudit_.emittedTransitionalTheoremCarriers,
@@ -2891,7 +3034,15 @@ std::string RefoldEngine::BuildTheoremAuditInvariantDetail() const {
              lastTheoremAudit_.noLegacyEmissionBoundaryViolations,
              lastTheoremAudit_.noLegacyStrictRejections,
              lastTheoremAudit_.directStateChecksAudited,
-             lastTheoremAudit_.directStateChecksUnclosedLocal)
+             lastTheoremAudit_.directStateChecksUnclosedLocal,
+             lastTheoremAudit_.resolverPotentiallyMissingProof,
+             lastTheoremAudit_.resolverUnknownDomain,
+             lastTheoremAudit_.resolverStrictLegacyFallback,
+             lastTheoremAudit_.resolverStrictInvalidFailClosed,
+             lastTheoremAudit_.resolverDeclaredIncompleteKeys,
+             lastTheoremAudit_.resolverDeclaredIncompatibleComposition,
+             lastTheoremAudit_.resolverDeclaredUnconvertedWitnesses,
+             lastTheoremAudit_.resolverClosureLedgerRows)
       .str();
 }
 
@@ -4499,7 +4650,65 @@ std::string RefoldEngine::RunSinglePassRefold() {
       witness.originalBStart = h.bStart;
       witness.originalBEnd = h.bEnd;
       witness.stateSummariesComposed = true;
+      witness.ownerBoundariesComposed = true;
+      witness.targetTokenStreamComposed = true;
+      witness.compositionEdgesProven = true;
+      witness.globalTargetPPTokenSignature =
+          llvm::formatv("B=[{0},{1}):hash={2}", h.bStart, h.bEnd,
+                        FormatWitnessTraceHash(SliceBSource(h.bStart, h.bEnd)))
+              .str();
       witness.segments.reserve(path.size());
+
+      auto formatOptionalId = [](std::optional<uint64_t> value) {
+        return value ? llvm::formatv("{0}", *value).str()
+                     : std::string("none");
+      };
+
+      auto formatOwnerSignature = [&](const Owner &owner) {
+        return llvm::formatv(
+                   "kind={0}:include={1}:macro={2}:macro_directive={3}:"
+                   "line={4}:pragma={5}:cond_group={6}:cond_arm={7}",
+                   toString(owner.kind), formatOptionalId(owner.includeId),
+                   formatOptionalId(owner.macroInvocationId),
+                   formatOptionalId(owner.macroDirectiveId),
+                   formatOptionalId(owner.lineControlId),
+                   formatOptionalId(owner.pragmaId),
+                   formatOptionalId(owner.condGroupId),
+                   formatOptionalId(owner.condArmId))
+            .str();
+      };
+
+      auto formatSourceSignature = [&](const OwnerSourceRange &source) {
+        return llvm::formatv("path={0}:range=[{1},{2}):include={3}",
+                             source.path, source.begin, source.end,
+                             formatOptionalId(source.includeId))
+            .str();
+      };
+
+      auto formatRealizerSignature = [&](const HunkRealizer &realizer) {
+        StringRef kind = "Unknown";
+        switch (realizer.kind) {
+        case HunkRealizerKind::Unknown:
+          kind = "Unknown";
+          break;
+        case HunkRealizerKind::TU:
+          kind = "TU";
+          break;
+        case HunkRealizerKind::Include:
+          kind = "Include";
+          break;
+        case HunkRealizerKind::Macro:
+          kind = "Macro";
+          break;
+        }
+        return llvm::formatv("realizer={0}:{1}", kind, realizer.id).str();
+      };
+
+      auto formatBTokenSignature = [&](uint64_t begin, uint64_t end) {
+        return llvm::formatv("B=[{0},{1}):hash={2}", begin, end,
+                             FormatWitnessTraceHash(SliceBSource(begin, end)))
+            .str();
+      };
 
       auto buildOwnerTransitionProof =
           [](const PartitionEdge &edge) -> StateTransitionProof {
@@ -4512,6 +4721,11 @@ std::string RefoldEngine::RunSinglePassRefold() {
       };
 
       uint32_t segmentIndex = 0;
+      std::string compositionStorage;
+      llvm::raw_string_ostream compositionOS(compositionStorage);
+      compositionOS << "tiling=" << witnessId << ":A=[" << h.aStart << ','
+                    << h.aEnd << "):B=[" << h.bStart << ',' << h.bEnd
+                    << ")";
       for (const PartitionEdge &edge : path) {
         const MixedOwnerTilingEdgeKind edgeKind =
             edge.IsStateGap() ? MixedOwnerTilingEdgeKind::StateGap
@@ -4526,7 +4740,35 @@ std::string RefoldEngine::RunSinglePassRefold() {
         segmentWitness.bStart = edge.bStart;
         segmentWitness.bEnd = edge.bEnd;
         segmentWitness.zeroTokenStateGap = edge.IsStateGap();
+        segmentWitness.allowEmptyBEnvelope = edge.allowEmptyBEnvelope;
         segmentWitness.ownerTransitionProof = buildOwnerTransitionProof(edge);
+        segmentWitness.targetPPTokenSignature =
+            formatBTokenSignature(edge.bStart, edge.bEnd);
+        if (edge.closure) {
+          segmentWitness.ownerClosureComplete = edge.closure->IsComplete();
+          segmentWitness.ownerSignature =
+              formatOwnerSignature(edge.closure->owner);
+          segmentWitness.sourceSignature =
+              formatSourceSignature(edge.closure->source);
+        }
+        segmentWitness.producerPathSignature =
+            edge.IsStateGap()
+                ? llvm::formatv("state_gap:{0}",
+                                segmentWitness.ownerSignature)
+                      .str()
+                : llvm::formatv("{0}:owner={1}",
+                                formatRealizerSignature(edge.realizer),
+                                segmentWitness.ownerSignature)
+                      .str();
+
+        compositionOS << ";seg" << segmentIndex << "{kind=" << toString(edgeKind)
+                      << ":A=[" << edge.aStart << ',' << edge.aEnd
+                      << "):B=[" << edge.bStart << ',' << edge.bEnd
+                      << "):empty_b=" << (edge.allowEmptyBEnvelope ? 1 : 0)
+                      << ":owner=" << segmentWitness.ownerSignature
+                      << ":source=" << segmentWitness.sourceSignature
+                      << ":producer=" << segmentWitness.producerPathSignature
+                      << '}';
 
         if (edge.IsStateGap())
           ++witness.stateGapCount;
@@ -4535,6 +4777,9 @@ std::string RefoldEngine::RunSinglePassRefold() {
         witness.segments.push_back(std::move(segmentWitness));
         ++segmentIndex;
       }
+      compositionOS.flush();
+      witness.globalCompositionSignature =
+          FormatWitnessTraceHash(compositionStorage);
       return witness;
     };
 
@@ -10540,6 +10785,48 @@ RefoldEngine::BuildOwnerStateDelta(const Owner &owner) const {
     return identity;
   };
 
+  auto conditionalSelectedArmCount = [](
+      const RefoldModel::CondGroup &group) -> uint64_t {
+    uint64_t selectedCount = 0;
+    for (const RefoldModel::CondArm &arm : group.arms)
+      if (arm.selected)
+        ++selectedCount;
+    return selectedCount;
+  };
+
+  auto conditionalGroupHasUniqueSelectedArm = [&](
+      const RefoldModel::CondGroup &group) {
+    return conditionalSelectedArmCount(group) == 1;
+  };
+
+  auto conditionalArmConditionWasProducerEvaluated = [](
+      const RefoldModel::CondGroup &group,
+      const RefoldModel::CondArm &queriedArm) {
+    // Only conditions reached by the producer's selected branch path are
+    // semantic observations.  For an #if/#elif/#else chain, conditions are
+    // evaluated until the selected arm is reached.  Later #elif conditions are
+    // source text, but they were not queried by the preprocessor and cannot be
+    // used as suffix-state proof.
+    bool reachedByProducer = true;
+    for (const RefoldModel::CondArm &arm : group.arms) {
+      if (arm.id == queriedArm.id)
+        return reachedByProducer && arm.cond.has_value();
+      if (arm.selected)
+        reachedByProducer = false;
+    }
+    return false;
+  };
+
+  auto conditionalArmSelectionTruthProducerProven = [&](
+      const RefoldModel::CondGroup &group,
+      const RefoldModel::CondArm &arm) {
+    if (!conditionalGroupHasUniqueSelectedArm(group))
+      return false;
+    if (arm.selected)
+      return true;
+    return conditionalArmConditionWasProducerEvaluated(group, arm);
+  };
+
   auto conditionalGroupIdentityFromGroup = [&](
       const RefoldModel::CondGroup &group) -> ConditionalStateIdentity {
     ConditionalStateIdentity identity;
@@ -10550,13 +10837,14 @@ RefoldEngine::BuildOwnerStateDelta(const Owner &owner) const {
     identity.groupEnd = group.groupE;
     identity.parentArmId = group.parentArmId;
     identity.parentIncludeId = group.parentIncludeId;
-    identity.conditionTruthProducerProven = true;
+    identity.conditionTruthProducerProven =
+        conditionalGroupHasUniqueSelectedArm(group);
     return identity;
   };
 
   auto conditionalArmIdentityFromArm = [&](
-      const RefoldModel::CondGroup &group,
-      const RefoldModel::CondArm &arm) -> ConditionalStateIdentity {
+      const RefoldModel::CondGroup &group, const RefoldModel::CondArm &arm,
+      bool reverseSolvedDirectiveRequired) -> ConditionalStateIdentity {
     ConditionalStateIdentity identity;
     identity.role = arm.selected ? ConditionalStateRole::ActiveArm
                                  : ConditionalStateRole::InactiveArm;
@@ -10575,7 +10863,9 @@ RefoldEngine::BuildOwnerStateDelta(const Owner &owner) const {
       identity.aTokenBegin = arm.span->begin;
       identity.aTokenEnd = arm.span->end;
     }
-    identity.conditionTruthProducerProven = true;
+    identity.conditionTruthProducerProven =
+        conditionalArmSelectionTruthProducerProven(group, arm);
+    identity.reverseSolvedDirectiveRequired = reverseSolvedDirectiveRequired;
     return identity;
   };
 
@@ -10786,17 +11076,33 @@ RefoldEngine::BuildOwnerStateDelta(const Owner &owner) const {
   };
 
   auto recordConditionalArm = [&](const RefoldModel::CondGroup &group,
-                                    const RefoldModel::CondArm &arm) {
-    // Phase 3K: record the active/inactive arm as branch-selection state, not
-    // just as source text.  The condition text is producer metadata used only
-    // to record macro/location observations; this does not authorize changing
-    // the directive to reverse-solve B-side tokens.
+                                    const RefoldModel::CondArm &arm,
+                                    bool requireActiveOwner) {
+    // Record branch-selection state from the producer's active path.  A
+    // repair may use a conditional arm as a source witness only when that arm
+    // is the producer-selected arm; inactive-arm repair would reverse-solve
+    // source-only conditional text from downstream B tokens and therefore
+    // remains outside theorem authority.
     auditDeltaFact(DirectStateCheckKind::ConditionalDirectiveState,
                    OwnerStateComponent::ConditionalState,
                    "conditional arm state fact");
-    facts.AddConditionalStateEvent(
-        conditionalArmIdentityFromArm(group, arm));
-    if (arm.cond) {
+
+    const bool reverseSolvedDirectiveRequired = requireActiveOwner &&
+                                                !arm.selected;
+    facts.AddConditionalStateEvent(conditionalArmIdentityFromArm(
+        group, arm, reverseSolvedDirectiveRequired));
+
+    if (!conditionalArmSelectionTruthProducerProven(group, arm))
+      markMissingAndUnmodeled(
+          MissingStateFactKind::MissingConditionalFacts,
+          "conditional arm selection was not producer-proven");
+    if (reverseSolvedDirectiveRequired)
+      markMissingAndUnmodeled(
+          MissingStateFactKind::MissingConditionalFacts,
+          "inactive conditional arm cannot serve as active source witness");
+
+    if (arm.cond &&
+        conditionalArmConditionWasProducerEvaluated(group, arm)) {
       scanTextForBuiltins(*arm.cond);
       scanConditionalMacroState(*arm.cond);
     }
@@ -10805,16 +11111,29 @@ RefoldEngine::BuildOwnerStateDelta(const Owner &owner) const {
   auto recordConditionalGroup = [&](const RefoldModel::CondGroup &group) {
     // A conditional group is the zero-token state owner for branch selection:
     // the directive island observes macro/conditional state, selects one arm,
-    // and mutates the conditional-state context seen by nested owners.  Arms
-    // remain separate owners for their body intervals; the group owner is used
-    // when the Phase-7 tiler must account for #if/#elif/#else/#endif bytes.
+    // and mutates the conditional-state context seen by nested owners. This
+    // records only the arm predicates the producer actually evaluated; #elif
+    // conditions after the selected arm are source text but not state reads.
     auditDeltaFact(DirectStateCheckKind::ConditionalDirectiveState,
                    OwnerStateComponent::ConditionalState,
                    "conditional group state fact");
     facts.AddConditionalStateEvent(
         conditionalGroupIdentityFromGroup(group));
-    for (const RefoldModel::CondArm &arm : group.arms)
-      recordConditionalArm(group, arm);
+
+    const bool uniqueSelectedArm = conditionalGroupHasUniqueSelectedArm(group);
+    if (!uniqueSelectedArm)
+      markMissingAndUnmodeled(
+          MissingStateFactKind::MissingConditionalFacts,
+          "conditional group does not have exactly one producer-selected arm");
+
+    bool reachedSelectedArm = false;
+    for (const RefoldModel::CondArm &arm : group.arms) {
+      const bool reachedByProducer = !reachedSelectedArm;
+      if (!uniqueSelectedArm || reachedByProducer || arm.selected)
+        recordConditionalArm(group, arm, /*requireActiveOwner=*/false);
+      if (arm.selected)
+        reachedSelectedArm = true;
+    }
   };
 
   auto recordMacroInvocation = [&](const RefoldModel::MacroInvocation &macro) {
@@ -10915,7 +11234,8 @@ RefoldEngine::BuildOwnerStateDelta(const Owner &owner) const {
     if (owner.condArmId) {
       if (const std::optional<RefoldModel::ArmRef> armRef =
               model_.GetArmRefById(*owner.condArmId)) {
-        recordConditionalArm(*armRef->group, *armRef->arm);
+        recordConditionalArm(*armRef->group, *armRef->arm,
+                             /*requireActiveOwner=*/true);
       } else {
         markMissingAndUnmodeled(MissingStateFactKind::MissingConditionalFacts,
                                 "conditional arm owner id not found in producer map");
@@ -24055,14 +24375,15 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
   {
     MacroPatch patch{*m.invB, *m.invE, std::move(rewrite->text), m.id};
     stampMacroPatchMaterializedOutputRange(patch, *rewrite);
-    // For ordinary replacements, the invocation argument is the compact source
-    // surface that regenerates the macro's B-side expansion envelope.  Pure
-    // insertion accounting is different: when materializedRangeByArgIdx is
-    // populated, the edit map intentionally stays on the inserted B payload and
-    // the matching inserted output subrange instead of widening to unchanged
-    // macro-body text.
-    if (materializedRangeByArgIdx.empty())
-      stampMacroPatchWholeExpansionBRange(patch);
+    // The materialized output byte range may remain narrowed to an inserted
+    // payload inside one argument, but the target-PP proof for an
+    // invocation-preserving macro repair is the B-side expansion envelope of
+    // the whole macro owner.  Keeping the output byte range narrow is useful
+    // for source-spelling edits; leaving the B-token range unstamped would make
+    // append/pure-insertion repairs look theorem-incomplete even after the
+    // occurrence replay above proved that the rewritten invocation regenerates
+    // the edited expansion.
+    stampMacroPatchWholeExpansionBRange(patch);
     setArgsOnlyStandardProof(patch, /*wholeEnvelopeReplayValidated=*/false);
     return patch;
   }
@@ -25084,12 +25405,6 @@ RefoldEngine::WitnessFamilyForAcceptedPath(AcceptedPathKind path) {
 
 bool RefoldEngine::IsResolverAuthoritativeWitnessFamily(
     WitnessProofFamily family) {
-  // Phase 12 starts making converted proof families authoritative through the
-  // central resolver, but only in strict resolver mode and only after the
-  // already-existing completeness/single-class checks pass.  Families not
-  // listed here remain probe-only even if they happen to carry a complete key;
-  // that keeps the migration one-family-at-a-time instead of letting an
-  // incidental complete trace field change behavior for an unaudited family.
   switch (family) {
   case WitnessProofFamily::MacroActualRepair:
   case WitnessProofFamily::DefinitionTapeReplay:
@@ -25113,6 +25428,31 @@ bool RefoldEngine::IsResolverAuthoritativeWitnessFamily(
     return false;
   }
   return false;
+}
+
+bool RefoldEngine::IsResolverAuthoritativeWitness(
+    const RefoldWitness &witness) {
+  if (IsResolverAuthoritativeWitnessFamily(witness.family))
+    return true;
+
+  // Macro whole-cover realization now carries the same theorem-facing
+  // owner-closure, target-token, suffix-state, observer, counter, diagnostic,
+  // and composition keys as the already converted families.  Keep the authority
+  // gate witness-specific so include/TU realization carriers remain probe-only
+  // until their own families are audited.
+  if (witness.family != WitnessProofFamily::OwnerRealization)
+    return false;
+  if (witness.sourceFamily != "MacroWholeCoverRealization")
+    return false;
+  if (witness.key.boundaryClass != WitnessBoundaryClass::RootInvocation)
+    return false;
+  if (witness.key.compositionClass != WitnessCompositionClass::OwnerClosed)
+    return false;
+  if (witness.key.diagnosticClass !=
+      WitnessDiagnosticClass::RealizesEditedSurface)
+    return false;
+
+  return true;
 }
 
 RefoldEngine::WitnessProducerKind
@@ -25620,6 +25960,694 @@ RefoldEngine::WitnessEquivalenceKey RefoldEngine::BuildWitnessEquivalenceKey(
             .str());
   };
 
+  auto pathIsMacroRepairReplayStateNeutralCandidate = [](AcceptedPathKind path) {
+    switch (path) {
+    case AcceptedPathKind::MacroArgsOnlyStandard:
+    case AcceptedPathKind::MacroDagSubtreeRoot:
+    case AcceptedPathKind::MacroCallChainSuffix:
+    case AcceptedPathKind::MacroPasteDerivedCalleeSelector:
+      return true;
+    case AcceptedPathKind::Unknown:
+    case AcceptedPathKind::MacroArgsOnlyPasteSingle:
+    case AcceptedPathKind::MacroArgsOnlyPasteMulti:
+    case AcceptedPathKind::MacroArgsOnlyPurePasteOnly:
+    case AcceptedPathKind::MacroArgsOnlyPairedPureInsertion:
+    case AcceptedPathKind::MacroCounterLiteral:
+    case AcceptedPathKind::MacroWholeCoverRealization:
+    case AcceptedPathKind::IncludePatchPendingMaterialization:
+    case AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens:
+    case AcceptedPathKind::IncludeInsertSelectedConditionalBoundary:
+    case AcceptedPathKind::IncludeInsertChildBoundary:
+    case AcceptedPathKind::IncludeInsertRightNeighborPP:
+    case AcceptedPathKind::IncludeInsertLeftNeighborPP:
+    case AcceptedPathKind::IncludeInsertDeclBoundary:
+    case AcceptedPathKind::IncludeRealizationInlineFromB:
+    case AcceptedPathKind::IncludeMaterializedExpansion:
+    case AcceptedPathKind::TUExactSlotBoundary:
+    case AcceptedPathKind::TUProvableInsertionAnchor:
+    case AcceptedPathKind::TUByteSpanMappedEdit:
+    case AcceptedPathKind::TUByteSpanConservativeEdit:
+    case AcceptedPathKind::TUIncludeClosureEdit:
+    case AcceptedPathKind::TerminalEmitEditedPreprocessedStream:
+      return false;
+    }
+    return false;
+  };
+
+  auto counterWitnessProvesSuffixCounterStability = [&]() {
+    if (!candidate.hasCounterStateWitness)
+      return false;
+
+    const CounterStateWitness &counter = candidate.counterStateWitness;
+    return counter.suffixStateStable && counter.counterOrderKnown &&
+           !counter.hasMissingExpectedBValues;
+  };
+
+  auto lineControlWitnessIsInvocationNeutral = [&]() {
+    if (!candidate.hasLineControlObserverWitness)
+      return true;
+
+    const LineControlObserverWitness &line =
+        candidate.lineControlObserverWitness;
+
+    // Macro repair/replay witnesses may carry observer/layout neutrality for invocation-preserving macro
+    // repairs, but it must not silently discharge source-authored #line
+    // mutations, producer-emitted resyncs, or unknown directive operands. Those
+    // remain line-control obligations. Builtin-location observations are
+    // allowed because they read the already-proven invocation location; they do
+    // not mutate suffix preprocessing state.
+    if (line.hasSourceLineControlState || line.lineControlEventCount != 0 ||
+        line.sourceAuthoredLineDirectiveCount != 0 ||
+        line.producerEmittedLineDirectiveCount != 0 ||
+        line.includeReturnResyncCount != 0 || line.syntheticResyncCount != 0 ||
+        line.missingOperandLineControlEventCount != 0 ||
+        line.unknownOperandLineControlEventCount != 0)
+      return false;
+
+    if (line.physicalLayoutKnown && !line.physicalLayoutStable)
+      return false;
+
+    return true;
+  };
+
+  auto canUseMacroRepairReplayStateNeutrality = [&]() {
+    if (!pathIsMacroRepairReplayStateNeutralCandidate(path))
+      return false;
+    if (candidate.kind != AcceptedResultCandidateKind::MacroPatch)
+      return false;
+    if (summary.theoremClass != TheoremProofClass::InvocationPreservingProof ||
+        summary.realizationMode != RealizationMode::PreserveOriginalStructure ||
+        !summary.structurePreserving)
+      return false;
+    // Nested macro selector candidates may intentionally carry the one local
+    // discharge failure that final emission later restamps away: the proof root
+    // is producer-proven but not top-level.  That failure is not a suffix-state,
+    // observer, diagnostic, or layout instability; it only says this candidate
+    // is selector-local.  Allow the neutral state key for that exact selector
+    // certificate while continuing to reject every other undischarged proof.
+    const bool proofIsLocallyDischarged =
+        summary.discharge.status == ProofDischargeStatus::Discharged;
+    const bool proofIsSelectorOnlyNestedMacro =
+        AcceptedResultCandidateHasOnlyNonTopLevelMacroSelectorFailure(candidate);
+    if (!proofIsLocallyDischarged && !proofIsSelectorOnlyNestedMacro)
+      return false;
+    if (!candidate.hasTargetBTokenRange ||
+        candidate.targetBTokStart > candidate.targetBTokEnd ||
+        candidate.targetBTokEnd > bToks_.size())
+      return false;
+    if (!counterWitnessProvesSuffixCounterStability())
+      return false;
+    if (!lineControlWitnessIsInvocationNeutral())
+      return false;
+
+    return true;
+  };
+
+  auto macroRepairReplayStateNeutralityValue = [&]() {
+    const uint64_t rootId = candidate.hasRootMacroId
+                                ? candidate.rootMacroId
+                                : summary.proofRootMacroId;
+    const CounterStateWitness &counter = candidate.counterStateWitness;
+    return llvm::formatv(
+               "macro_repair_replay_neutral:path={0}:root={1}:"
+               "target=[{2},{3}):target_hash={4}:"
+               "counter_suffix={5}:counter_order={6}:"
+               "counter_events={7}:counter_suffix_observers={8}:"
+               "line_control_neutral={9}:diagnostics=preserve-invocation",
+               toString(path), rootId, candidate.targetBTokStart,
+               candidate.targetBTokEnd,
+               FormatWitnessTraceHash(SliceBSource(candidate.targetBTokStart,
+                                                   candidate.targetBTokEnd)),
+               counter.suffixStateStable ? 1 : 0,
+               counter.counterOrderKnown ? 1 : 0,
+               counter.counterConsumptionCount,
+               counter.preservedSuffixObserverCount,
+               lineControlWitnessIsInvocationNeutral() ? 1 : 0)
+        .str();
+  };
+
+  // Whole-cover macro realization often observes macro-definition state
+  // without mutating it.  Observing the definition used for expansion is a
+  // producer/provenance fact, not a suffix-state change: if every carried state
+  // fact is a known macro observation/requirement and neither the entry nor exit
+  // delta mutates any state, the suffix state is KnownEqual for the resolver.
+  // Keep the exact producer identities in the key so two observation-only
+  // witnesses with different macro-definition evidence do not collapse through
+  // an undifferentiated "state neutral" bucket.
+  auto formatOptionalU64 = [](std::optional<uint64_t> value) {
+    return value ? llvm::formatv("{0}", *value).str() : std::string("none");
+  };
+  auto formatOptionalU32 = [](std::optional<uint32_t> value) {
+    return value ? llvm::formatv("{0}", *value).str() : std::string("none");
+  };
+  auto appendMacroIdentity = [&](llvm::raw_ostream &os, llvm::StringRef label,
+                                 const MacroStateIdentity &identity) {
+    os << label << "{name=" << identity.macroName
+       << ":def=" << formatOptionalU64(identity.definitionDirectiveId)
+       << ":undef=" << formatOptionalU64(identity.undefDirectiveId)
+       << ":function_like=" << (identity.functionLike ? 1 : 0)
+       << ":arity=" << formatOptionalU32(identity.arity)
+       << ":variadic=" << (identity.variadic ? 1 : 0)
+       << ":replacement="
+       << FormatWitnessTraceHash(identity.replacementTokenHash) << "};";
+  };
+  auto appendMacroObservation = [&](llvm::raw_ostream &os,
+                                    llvm::StringRef label,
+                                    const MacroStateObservation &observation) {
+    os << label << "{kind=" << toString(observation.kind) << ':';
+    appendMacroIdentity(os, "identity=", observation.identity);
+    os << "};";
+  };
+  auto factsAreKnownMacroObservationOnly = [](const OwnerStateFacts &facts) {
+    return !facts.HasMissingStateFacts() && !facts.HasMacroDefinitions() &&
+           !facts.HasMacroUndefinitions() &&
+           !facts.HasLineControlEvents() &&
+           !facts.HasBuiltinLocationObservations() &&
+           !facts.HasCounterEvents() && !facts.HasPragmaStateEvents() &&
+           !facts.HasIncludeStateEvents() &&
+           !facts.HasIncludeGuardStateEvents() &&
+           !facts.HasConditionalStateEvents();
+  };
+  auto factsAreKnownBuiltinLocationObservationOnly = [](
+      const OwnerStateFacts &facts) {
+    // Builtin-location observations read line/file/file-name state but do
+    // not mutate preprocessing state.  They may coexist with producer-proven
+    // macro observations required to explain the macro expansion that produced
+    // the builtin, but they must not be used to discharge source-authored
+    // #line mutations, counters, include/conditional/pragma effects, or any
+    // missing producer fact.
+    return !facts.HasMissingStateFacts() && !facts.HasMacroDefinitions() &&
+           !facts.HasMacroUndefinitions() &&
+           !facts.HasLineControlEvents() && !facts.HasCounterEvents() &&
+           !facts.HasPragmaStateEvents() && !facts.HasIncludeStateEvents() &&
+           !facts.HasIncludeGuardStateEvents() &&
+           !facts.HasConditionalStateEvents();
+  };
+  auto factsHaveBuiltinLocationObservation = [](
+      const OwnerStateFacts &facts) {
+    return facts.HasBuiltinLocationObservations();
+  };
+  auto appendMacroObservationBucket = [&](llvm::raw_ostream &os,
+                                          llvm::StringRef bucket,
+                                          const OwnerStateFacts &facts) {
+    for (const MacroStateIdentity &identity : facts.macroRequirements)
+      appendMacroIdentity(os, llvm::formatv("{0}.requirement=", bucket).str(),
+                          identity);
+    for (const MacroStateObservation &observation :
+         facts.macroExpansionObservations)
+      appendMacroObservation(
+          os, llvm::formatv("{0}.expansion=", bucket).str(), observation);
+    for (const MacroStateObservation &observation :
+         facts.definedOperatorObservations)
+      appendMacroObservation(
+          os, llvm::formatv("{0}.defined=", bucket).str(), observation);
+    for (const MacroStateObservation &observation :
+         facts.conditionalMacroObservations)
+      appendMacroObservation(
+          os, llvm::formatv("{0}.conditional=", bucket).str(), observation);
+  };
+
+  auto formatOptionalString = [](const std::optional<std::string> &value) {
+    return value ? *value : std::string("none");
+  };
+
+  auto appendIncludeIdentity = [&](llvm::raw_ostream &os,
+                                   llvm::StringRef label,
+                                   const IncludeStateIdentity &identity) {
+    os << label << "{id=" << identity.includeId
+       << ":kind=" << identity.directiveKind
+       << ":site=" << identity.sitePath << '[' << identity.siteBegin << ','
+       << identity.siteEnd << ")"
+       << ":target=" << identity.target
+       << ":resolved=" << formatOptionalString(identity.resolvedPath)
+       << ":angled=" << (identity.angled ? 1 : 0)
+       << ":parent=" << formatOptionalU64(identity.parentIncludeId)
+       << ":tokens=" << (identity.hasTokenMaterialization ? 1 : 0)
+       << "};";
+  };
+
+  auto appendIncludeGuardIdentity = [&](
+      llvm::raw_ostream &os, llvm::StringRef label,
+      const IncludeGuardStateIdentity &identity) {
+    os << label << "{kind=" << toString(identity.kind)
+       << ":include=" << identity.includeId
+       << ":header=" << identity.headerPath
+       << ":guard=" << formatOptionalString(identity.guardMacroName)
+       << ":parent=" << formatOptionalU64(identity.parentIncludeId)
+       << ":producer=" << (identity.producerProvenGuard ? 1 : 0)
+       << "};";
+  };
+
+  auto appendLineControlIdentity = [&](
+      llvm::raw_ostream &os, llvm::StringRef label,
+      const LineControlStateIdentity &identity) {
+    os << label << "{id=" << identity.eventId
+       << ":file=" << identity.physicalFile
+       << ":site=[" << formatOptionalU64(identity.siteBegin) << ','
+       << formatOptionalU64(identity.siteEnd) << ')'
+       << ":active=" << (identity.active ? 1 : 0)
+       << ":producer=" << (identity.producerProven ? 1 : 0)
+       << ":line_after=" << identity.logicalLineAfter
+       << ":file_after=" << identity.logicalFileAfter
+       << ":owner_include=" << formatOptionalU64(identity.ownerIncludeId)
+       << ":operands=" << toString(identity.operandProvenance) << "};";
+  };
+
+  auto appendBuiltinLocationObservation = [&](
+      llvm::raw_ostream &os, llvm::StringRef label,
+      const BuiltinLocationObservation &observation) {
+    os << label << "{kind=" << toString(observation.kind)
+       << ":owner_include=" << formatOptionalU64(observation.ownerIncludeId)
+       << ":source=[" << formatOptionalU64(observation.sourceBegin) << ','
+       << formatOptionalU64(observation.sourceEnd) << ')'
+       << ":atok=[" << formatOptionalU64(observation.aTokenBegin) << ','
+       << formatOptionalU64(observation.aTokenEnd) << ")};";
+  };
+
+  auto appendCounterIdentity = [&](llvm::raw_ostream &os,
+                                   llvm::StringRef label,
+                                   const CounterEventIdentity &identity) {
+    os << label << "{macro=" << identity.macroInvocationId
+       << ":ordinal=" << identity.occurrenceOrdinal
+       << ":owner_include=" << formatOptionalU64(identity.ownerIncludeId)
+       << ":caller=" << formatOptionalU64(identity.callerMacroId)
+       << ":atok=[" << identity.aTokenBegin << ',' << identity.aTokenEnd
+       << ')' << ":site=" << identity.expansionSiteFile
+       << '[' << formatOptionalU64(identity.expansionSiteBegin) << ','
+       << formatOptionalU64(identity.expansionSiteEnd) << ')'
+       << ":avalue=" << identity.aValue
+       << ":bvalue="
+       << (identity.expectedBValue ? *identity.expectedBValue
+                                   : std::string("none"))
+       << ":literal=" << (identity.canStabilizeByLiteralization ? 1 : 0)
+       << ":materialize="
+       << (identity.canStabilizeByMaterialization ? 1 : 0) << "};";
+  };
+
+  auto appendPragmaIdentity = [&](llvm::raw_ostream &os,
+                                  llvm::StringRef label,
+                                  const PragmaStateIdentity &identity) {
+    os << label << "{id=" << identity.pragmaId
+       << ":site=" << identity.sitePath << '[' << identity.siteBegin << ','
+       << identity.siteEnd << ')'
+       << ":owner_include=" << formatOptionalU64(identity.ownerIncludeId)
+       << ":class=" << toString(identity.classification)
+       << ":fingerprint="
+       << FormatWitnessTraceHash(identity.directiveFingerprint) << "};";
+  };
+
+  auto appendConditionalIdentity = [&](
+      llvm::raw_ostream &os, llvm::StringRef label,
+      const ConditionalStateIdentity &identity) {
+    os << label << "{role=" << toString(identity.role)
+       << ":group=" << identity.groupId
+       << ":arm=" << formatOptionalU64(identity.armId)
+       << ":file=" << identity.file << '[' << identity.groupBegin << ','
+       << identity.groupEnd << ')'
+       << ":parent_arm=" << formatOptionalU64(identity.parentArmId)
+       << ":parent_include=" << formatOptionalU64(identity.parentIncludeId)
+       << ":arm_kind=" << identity.armKind
+       << ":cond=" << formatOptionalString(identity.conditionText)
+       << ":selected=" << (identity.selected ? 1 : 0)
+       << ":atok=[" << formatOptionalU64(identity.aTokenBegin) << ','
+       << formatOptionalU64(identity.aTokenEnd) << ')'
+       << ":producer_truth="
+       << (identity.conditionTruthProducerProven ? 1 : 0)
+       << ":reverse_solved="
+       << (identity.reverseSolvedDirectiveRequired ? 1 : 0) << "};";
+  };
+
+  auto appendMissingFact = [&](llvm::raw_ostream &os, llvm::StringRef label,
+                               const MissingStateFact &fact) {
+    os << label << "{kind=" << toString(fact.kind)
+       << ":detail=" << FormatWitnessTraceHash(fact.detail) << "};";
+  };
+
+  auto appendFullStateFacts = [&](llvm::raw_ostream &os,
+                                  llvm::StringRef bucket,
+                                  const OwnerStateFacts &facts) {
+    for (const MacroStateIdentity &identity : facts.macroDefinitions)
+      appendMacroIdentity(os, llvm::formatv("{0}.macro_define=", bucket).str(),
+                          identity);
+    for (const MacroStateIdentity &identity : facts.macroUndefinitions)
+      appendMacroIdentity(os, llvm::formatv("{0}.macro_undef=", bucket).str(),
+                          identity);
+    appendMacroObservationBucket(os, bucket, facts);
+    for (const LineControlStateIdentity &identity : facts.lineControlEvents)
+      appendLineControlIdentity(
+          os, llvm::formatv("{0}.line_control=", bucket).str(), identity);
+    for (const BuiltinLocationObservation &observation :
+         facts.builtinLocationObservations)
+      appendBuiltinLocationObservation(
+          os, llvm::formatv("{0}.builtin=", bucket).str(), observation);
+    for (const CounterEventIdentity &identity : facts.counterEvents)
+      appendCounterIdentity(
+          os, llvm::formatv("{0}.counter=", bucket).str(), identity);
+    for (const PragmaStateIdentity &identity : facts.pragmaStateEvents)
+      appendPragmaIdentity(
+          os, llvm::formatv("{0}.pragma=", bucket).str(), identity);
+    for (const IncludeStateIdentity &identity : facts.includeStateEvents)
+      appendIncludeIdentity(
+          os, llvm::formatv("{0}.include=", bucket).str(), identity);
+    for (const IncludeGuardStateIdentity &identity :
+         facts.includeGuardStateEvents)
+      appendIncludeGuardIdentity(
+          os, llvm::formatv("{0}.include_guard=", bucket).str(), identity);
+    for (const ConditionalStateIdentity &identity :
+         facts.conditionalStateEvents)
+      appendConditionalIdentity(
+          os, llvm::formatv("{0}.conditional=", bucket).str(), identity);
+    for (const MissingStateFact &fact : facts.missingStateFacts)
+      appendMissingFact(os, llvm::formatv("{0}.missing=", bucket).str(), fact);
+  };
+
+  auto hasIncludeFacts = [](const OwnerStateFacts &facts) {
+    return facts.HasIncludeStateEvents() || facts.HasIncludeGuardStateEvents();
+  };
+
+  auto hasUnknownIncludeGuardFacts = [](const OwnerStateFacts &facts) {
+    return llvm::any_of(
+        facts.includeGuardStateEvents,
+        [](const IncludeGuardStateIdentity &identity) {
+          return identity.kind == IncludeGuardObservationKind::UnknownGuardEffect;
+        });
+  };
+
+  auto hasConditionalFacts = [](const OwnerStateFacts &facts) {
+    return facts.HasConditionalStateEvents();
+  };
+
+  auto hasUnknownConditionalFacts = [](const OwnerStateFacts &facts) {
+    return llvm::any_of(
+        facts.conditionalStateEvents,
+        [](const ConditionalStateIdentity &identity) {
+          return !identity.conditionTruthProducerProven ||
+                 identity.reverseSolvedDirectiveRequired;
+        });
+  };
+
+  auto factsAreKnownConditionalPathState = [&](
+      const OwnerStateFacts &facts) {
+    // Conditional-state proof may carry producer-selected branch events
+    // and the macro observations needed to evaluate those conditions.  It must
+    // not silently discharge unrelated line/include/counter/pragma effects, and
+    // it must reject inactive-arm reverse solving or unproven branch truth.
+    return !facts.HasMissingStateFacts() && !facts.HasMacroDefinitions() &&
+           !facts.HasMacroUndefinitions() && !facts.HasLineControlEvents() &&
+           !facts.HasBuiltinLocationObservations() &&
+           !facts.HasCounterEvents() && !facts.HasPragmaStateEvents() &&
+           !facts.HasIncludeStateEvents() &&
+           !facts.HasIncludeGuardStateEvents() &&
+           !hasUnknownConditionalFacts(facts);
+  };
+
+  auto deltaHasAnyMissingFacts = [](const OwnerStateDelta &delta) {
+    return delta.Entry.HasMissingStateFacts() ||
+           delta.Observes.HasMissingStateFacts() ||
+           delta.Mutates.HasMissingStateFacts() ||
+           delta.Exit.HasMissingStateFacts();
+  };
+
+  auto deltaHasIncludeFacts = [&](const OwnerStateDelta &delta) {
+    return hasIncludeFacts(delta.Entry) || hasIncludeFacts(delta.Observes) ||
+           hasIncludeFacts(delta.Mutates) || hasIncludeFacts(delta.Exit);
+  };
+
+  auto deltaHasUnknownIncludeGuardFacts = [&](const OwnerStateDelta &delta) {
+    return hasUnknownIncludeGuardFacts(delta.Entry) ||
+           hasUnknownIncludeGuardFacts(delta.Observes) ||
+           hasUnknownIncludeGuardFacts(delta.Mutates) ||
+           hasUnknownIncludeGuardFacts(delta.Exit);
+  };
+
+  auto deltaHasConditionalFacts = [&](const OwnerStateDelta &delta) {
+    return hasConditionalFacts(delta.Entry) ||
+           hasConditionalFacts(delta.Observes) ||
+           hasConditionalFacts(delta.Mutates) ||
+           hasConditionalFacts(delta.Exit);
+  };
+
+  auto deltaHasUnknownConditionalFacts = [&](const OwnerStateDelta &delta) {
+    return hasUnknownConditionalFacts(delta.Entry) ||
+           hasUnknownConditionalFacts(delta.Observes) ||
+           hasUnknownConditionalFacts(delta.Mutates) ||
+           hasUnknownConditionalFacts(delta.Exit);
+  };
+
+  auto appendStateDeltaSignature = [&](llvm::raw_ostream &os,
+                                       llvm::StringRef prefix,
+                                       const OwnerStateDelta &delta) {
+    appendFullStateFacts(os, llvm::formatv("{0}.entry", prefix).str(),
+                         delta.Entry);
+    appendFullStateFacts(os, llvm::formatv("{0}.observes", prefix).str(),
+                         delta.Observes);
+    appendFullStateFacts(os, llvm::formatv("{0}.mutates", prefix).str(),
+                         delta.Mutates);
+    appendFullStateFacts(os, llvm::formatv("{0}.exit", prefix).str(),
+                         delta.Exit);
+  };
+
+  auto ownerStateDeltaSignature = [&](const OwnerRealizationWitness &owner) {
+    std::string storage;
+    llvm::raw_string_ostream os(storage);
+    os << "owner=" << toString(owner.closure.owner.kind)
+       << ":evidence=" << toString(owner.evidence);
+    if (owner.closure.source.HasPath())
+      os << ":source=" << owner.closure.source.path << '['
+         << owner.closure.source.begin << ',' << owner.closure.source.end
+         << ')';
+    if (owner.closure.aTokens.IsValid())
+      os << ":A=[" << owner.closure.aTokens.begin << ','
+         << owner.closure.aTokens.end << ')';
+    if (owner.closure.bTokens.IsValid())
+      os << ":B=[" << owner.closure.bTokens.begin << ','
+         << owner.closure.bTokens.end << ')';
+    appendStateDeltaSignature(os, "in", owner.closure.stateIn);
+    appendStateDeltaSignature(os, "out", owner.closure.stateOut);
+    for (const SuffixStabilityWitness &suffix : owner.stateWitnesses)
+      os << "state_witness{" << toString(suffix.kind) << ':'
+         << toString(ComponentNamedBySuffixStabilityWitness(suffix)) << "};";
+    os.flush();
+    return FormatWitnessTraceHash(storage);
+  };
+
+  auto mixedOwnerTilingSignature = [&](const MixedOwnerTilingWitness &tiling) {
+    std::string storage;
+    llvm::raw_string_ostream os(storage);
+    os << "tiling=" << tiling.witnessId << ":A=["
+       << tiling.originalAStart << ',' << tiling.originalAEnd << ")"
+       << ":B=[" << tiling.originalBStart << ',' << tiling.originalBEnd
+       << "):tokens=" << tiling.tokenSegmentCount
+       << ":state_gaps=" << tiling.stateGapCount
+       << ":state_composed=" << (tiling.stateSummariesComposed ? 1 : 0)
+       << ":owners_composed=" << (tiling.ownerBoundariesComposed ? 1 : 0)
+       << ":target_composed=" << (tiling.targetTokenStreamComposed ? 1 : 0)
+       << ":edges_proven=" << (tiling.compositionEdgesProven ? 1 : 0)
+       << ":target=" << tiling.globalTargetPPTokenSignature
+       << ":composition=" << tiling.globalCompositionSignature;
+    for (const MixedOwnerTilingSegmentWitness &segment : tiling.segments) {
+      os << ";segment" << segment.segmentIndex << "{kind="
+         << toString(segment.kind) << ":A=[" << segment.aStart << ','
+         << segment.aEnd << "):B=[" << segment.bStart << ','
+         << segment.bEnd << "):zero_gap="
+         << (segment.zeroTokenStateGap ? 1 : 0) << ":empty_b="
+         << (segment.allowEmptyBEnvelope ? 1 : 0) << ":closure="
+         << (segment.ownerClosureComplete ? 1 : 0) << ":owner="
+         << segment.ownerSignature << ":source=" << segment.sourceSignature
+         << ":producer=" << segment.producerPathSignature << ":target="
+         << segment.targetPPTokenSignature;
+      appendStateDeltaSignature(os, "before",
+                                segment.ownerTransitionProof.before);
+      appendStateDeltaSignature(os, "after",
+                                segment.ownerTransitionProof.after);
+      for (const SuffixStabilityWitness &suffix :
+           segment.ownerTransitionProof.suffixWitnesses)
+        os << "suffix{" << toString(suffix.kind) << ':'
+           << toString(ComponentNamedBySuffixStabilityWitness(suffix))
+           << "};";
+      os << '}';
+    }
+    os.flush();
+    return FormatWitnessTraceHash(storage);
+  };
+
+  auto stateFactsHaveCounterProofObligation = [](const OwnerStateFacts &facts) {
+    return facts.HasCounterEvents() ||
+           facts.HasMissingFactKind(MissingStateFactKind::MissingCounterFacts);
+  };
+
+  auto deltaHasCounterProofObligation = [&](const OwnerStateDelta &delta) {
+    return stateFactsHaveCounterProofObligation(delta.Entry) ||
+           stateFactsHaveCounterProofObligation(delta.Observes) ||
+           stateFactsHaveCounterProofObligation(delta.Mutates) ||
+           stateFactsHaveCounterProofObligation(delta.Exit);
+  };
+
+  auto deltaHasMissingCounterProof = [](const OwnerStateDelta &delta) {
+    return delta.Entry.HasMissingFactKind(
+               MissingStateFactKind::MissingCounterFacts) ||
+           delta.Observes.HasMissingFactKind(
+               MissingStateFactKind::MissingCounterFacts) ||
+           delta.Mutates.HasMissingFactKind(
+               MissingStateFactKind::MissingCounterFacts) ||
+           delta.Exit.HasMissingFactKind(
+               MissingStateFactKind::MissingCounterFacts);
+  };
+
+  auto transitionHasStableCounterWitness = [](
+      const StateTransitionProof &proof) {
+    return llvm::any_of(
+        proof.suffixWitnesses, [](const SuffixStabilityWitness &suffix) {
+          return RefoldEngine::SuffixStabilityWitnessNamesComponent(
+                     suffix, OwnerStateComponent::Counter) &&
+                 suffix.kind != SuffixStabilityWitnessKind::None &&
+                 suffix.kind !=
+                     SuffixStabilityWitnessKind::TerminalStateFailure;
+        });
+  };
+
+  auto mixedOwnerTilingHasKnownCounterState = [&](
+      const MixedOwnerTilingWitness &tiling) {
+    if (!tiling.stateSummariesComposed || tiling.segments.empty())
+      return false;
+
+    bool sawCounterObligation = false;
+    for (const MixedOwnerTilingSegmentWitness &segment : tiling.segments) {
+      const StateTransitionProof &proof = segment.ownerTransitionProof;
+      if (deltaHasMissingCounterProof(proof.before) ||
+          deltaHasMissingCounterProof(proof.after))
+        return false;
+
+      const bool segmentHasCounterObligation =
+          deltaHasCounterProofObligation(proof.before) ||
+          deltaHasCounterProofObligation(proof.after);
+      if (!segmentHasCounterObligation)
+        continue;
+
+      sawCounterObligation = true;
+      if (!transitionHasStableCounterWitness(proof))
+        return false;
+    }
+
+    return !sawCounterObligation || tiling.compositionEdgesProven;
+  };
+
+  auto ownerRealizationHasKnownIncludeState =
+      [&](const OwnerRealizationWitness &owner) {
+        const bool includeRealization =
+            owner.evidence == OwnerRealizationEvidenceKind::IncludeBEnvelope ||
+            owner.evidence ==
+                OwnerRealizationEvidenceKind::IncludeMaterializedExpansion;
+        if (!includeRealization || !owner.closure.IsComplete())
+          return false;
+
+        // Include-state realization is resolver-comparable only when the
+        // producer supplied complete include/include-guard facts.  Missing
+        // include ordering/guard facts, unknown pragma state, or an unknown
+        // include-guard effect remain fail-closed theorem obligations; this
+        // deliberately does not weaken the existing pragma/include-gap
+        // ExplicitOutOfDomain cases.
+        if (deltaHasAnyMissingFacts(owner.closure.stateIn) ||
+            deltaHasAnyMissingFacts(owner.closure.stateOut) ||
+            OwnerStateDeltaHasUnknownPragmaState(owner.closure.stateIn) ||
+            OwnerStateDeltaHasUnknownPragmaState(owner.closure.stateOut) ||
+            deltaHasUnknownIncludeGuardFacts(owner.closure.stateIn) ||
+            deltaHasUnknownIncludeGuardFacts(owner.closure.stateOut))
+          return false;
+
+        return deltaHasIncludeFacts(owner.closure.stateIn) ||
+               deltaHasIncludeFacts(owner.closure.stateOut);
+      };
+
+  auto ownerRealizationHasKnownConditionalState =
+      [&](const OwnerRealizationWitness &owner) {
+        if (!owner.closure.IsComplete())
+          return false;
+
+        // Active conditional-path state is known only when every carried
+        // conditional event was producer-selected/evaluated and no inactive arm
+        // is being used as a reverse-solved source repair.  This branch is
+        // deliberately limited to conditional + macro-observation facts; line,
+        // counter, include, pragma, and directive mutations remain governed by
+        // their own component-specific proof families.
+        if (deltaHasAnyMissingFacts(owner.closure.stateIn) ||
+            deltaHasAnyMissingFacts(owner.closure.stateOut) ||
+            deltaHasUnknownConditionalFacts(owner.closure.stateIn) ||
+            deltaHasUnknownConditionalFacts(owner.closure.stateOut) ||
+            OwnerStateDeltaHasUnknownPragmaState(owner.closure.stateIn) ||
+            OwnerStateDeltaHasUnknownPragmaState(owner.closure.stateOut))
+          return false;
+
+        return (deltaHasConditionalFacts(owner.closure.stateIn) ||
+                deltaHasConditionalFacts(owner.closure.stateOut)) &&
+               factsAreKnownConditionalPathState(owner.closure.stateIn.Entry) &&
+               factsAreKnownConditionalPathState(
+                   owner.closure.stateIn.Observes) &&
+               factsAreKnownConditionalPathState(
+                   owner.closure.stateIn.Mutates) &&
+               factsAreKnownConditionalPathState(owner.closure.stateIn.Exit) &&
+               factsAreKnownConditionalPathState(owner.closure.stateOut.Entry) &&
+               factsAreKnownConditionalPathState(
+                   owner.closure.stateOut.Observes) &&
+               factsAreKnownConditionalPathState(
+                   owner.closure.stateOut.Mutates) &&
+               factsAreKnownConditionalPathState(owner.closure.stateOut.Exit);
+      };
+  auto ownerRealizationHasKnownMacroObservationOnlyState =
+      [&](const OwnerRealizationWitness &owner) {
+        const OwnerStateDelta &in = owner.closure.stateIn;
+        const OwnerStateDelta &out = owner.closure.stateOut;
+        return !OwnerStateDeltaMutatesAnyState(in) &&
+               !OwnerStateDeltaMutatesAnyState(out) &&
+               factsAreKnownMacroObservationOnly(in.Entry) &&
+               factsAreKnownMacroObservationOnly(in.Observes) &&
+               in.Mutates.Empty() && in.Exit.Empty() &&
+               factsAreKnownMacroObservationOnly(out.Entry) &&
+               factsAreKnownMacroObservationOnly(out.Observes) &&
+               out.Mutates.Empty() && out.Exit.Empty();
+      };
+  auto ownerRealizationHasKnownBuiltinLocationObservationState =
+      [&](const OwnerRealizationWitness &owner) {
+        if (!owner.closure.IsComplete())
+          return false;
+
+        const OwnerStateDelta &in = owner.closure.stateIn;
+        const OwnerStateDelta &out = owner.closure.stateOut;
+        if (OwnerStateDeltaMutatesAnyState(in) ||
+            OwnerStateDeltaMutatesAnyState(out))
+          return false;
+
+        const bool observesBuiltinLocation =
+            factsHaveBuiltinLocationObservation(in.Entry) ||
+            factsHaveBuiltinLocationObservation(in.Observes) ||
+            factsHaveBuiltinLocationObservation(out.Entry) ||
+            factsHaveBuiltinLocationObservation(out.Observes);
+        if (!observesBuiltinLocation)
+          return false;
+
+        return factsAreKnownBuiltinLocationObservationOnly(in.Entry) &&
+               factsAreKnownBuiltinLocationObservationOnly(in.Observes) &&
+               in.Mutates.Empty() && in.Exit.Empty() &&
+               factsAreKnownBuiltinLocationObservationOnly(out.Entry) &&
+               factsAreKnownBuiltinLocationObservationOnly(out.Observes) &&
+               out.Mutates.Empty() && out.Exit.Empty();
+      };
+  auto macroObservationOnlyStateSignature =
+      [&](const OwnerRealizationWitness &owner) {
+        std::string storage;
+        llvm::raw_string_ostream os(storage);
+        appendMacroObservationBucket(os, "in.entry",
+                                     owner.closure.stateIn.Entry);
+        appendMacroObservationBucket(os, "in.observes",
+                                     owner.closure.stateIn.Observes);
+        appendMacroObservationBucket(os, "out.entry",
+                                     owner.closure.stateOut.Entry);
+        appendMacroObservationBucket(os, "out.observes",
+                                     owner.closure.stateOut.Observes);
+        os.flush();
+        return FormatWitnessTraceHash(storage);
+      };
+
   // Phase 1 keeps the target-preprocessed-token dimension conservative.  It is
   // known only when an accepted proof already carries a B-token envelope or a
   // zero-token B anchor.  Source-spelling previews are intentionally not treated
@@ -25648,6 +26676,17 @@ RefoldEngine::WitnessEquivalenceKey RefoldEngine::BuildWitnessEquivalenceKey(
                                                : "candidate_b_tokens")))));
     key.targetPPTokens = knownRangeHash(
         label, candidate.targetBTokStart, candidate.targetBTokEnd);
+  } else if (candidate.hasZeroTokenBoundaryWitness &&
+             candidate.zeroTokenHasBTokenRange &&
+             candidate.zeroTokenBTokStart <= candidate.zeroTokenBTokEnd &&
+             candidate.zeroTokenBTokEnd <= bToks_.size()) {
+    // Zero-token include/boundary witnesses already carry the exact B-token
+    // gap/envelope from the modified preprocessed stream.  Promote that
+    // producer-recorded envelope into the target-PP equivalence dimension
+    // instead of treating the absence of replacement text as unknown output.
+    key.targetPPTokens =
+        knownRangeHash("zero_token_b_tokens", candidate.zeroTokenBTokStart,
+                       candidate.zeroTokenBTokEnd);
   } else if (summary.hasOwnerRealizationWitness &&
       summary.ownerRealizationWitness.closure.IsComplete()) {
     const OwnerTokenRange bTokens =
@@ -25783,6 +26822,9 @@ RefoldEngine::WitnessEquivalenceKey RefoldEngine::BuildWitnessEquivalenceKey(
             candidate.macroActualDefinitionTapeReplayValidated ? 1 : 0,
             candidate.macroActualArityStable ? 1 : 0)
             .str());
+  } else if (canUseMacroRepairReplayStateNeutrality()) {
+    key.suffixState = WitnessEquivalenceDimension::Known(
+        llvm::formatv("macro_repair_replay_state_neutral:{0}", macroRepairReplayStateNeutralityValue()).str());
   } else if (summary.hasSuffixStabilityWitness) {
     const SuffixStabilityWitness &suffix = summary.suffixStabilityWitness;
     key.suffixState = WitnessEquivalenceDimension::Known(
@@ -25797,10 +26839,36 @@ RefoldEngine::WitnessEquivalenceKey RefoldEngine::BuildWitnessEquivalenceKey(
           llvm::formatv("owner_realization:evidence={0}:state_neutral",
                         toString(owner.evidence))
               .str());
+    } else if (ownerRealizationHasKnownMacroObservationOnlyState(owner)) {
+      key.suffixState = WitnessEquivalenceDimension::Known(
+          llvm::formatv(
+              "owner_realization:evidence={0}:macro_observation_only:{1}",
+              toString(owner.evidence),
+              macroObservationOnlyStateSignature(owner))
+              .str());
+    } else if (ownerRealizationHasKnownBuiltinLocationObservationState(owner)) {
+      key.suffixState = WitnessEquivalenceDimension::Known(
+          llvm::formatv(
+              "owner_realization:evidence={0}:builtin_location_observation:{1}",
+              toString(owner.evidence), ownerStateDeltaSignature(owner))
+              .str());
+    } else if (ownerRealizationHasKnownIncludeState(owner)) {
+      key.suffixState = WitnessEquivalenceDimension::Known(
+          llvm::formatv("owner_realization:evidence={0}:include_state:{1}",
+                        toString(owner.evidence),
+                        ownerStateDeltaSignature(owner))
+              .str());
+    } else if (ownerRealizationHasKnownConditionalState(owner)) {
+      key.suffixState = WitnessEquivalenceDimension::Known(
+          llvm::formatv(
+              "owner_realization:evidence={0}:conditional_state:{1}",
+              toString(owner.evidence), ownerStateDeltaSignature(owner))
+              .str());
     } else if (!owner.stateWitnesses.empty()) {
       std::string stateSummary =
-          llvm::formatv("owner_realization:evidence={0}:state_witnesses={1}",
-                        toString(owner.evidence), owner.stateWitnesses.size())
+          llvm::formatv("owner_realization:evidence={0}:state_witnesses={1}:state={2}",
+                        toString(owner.evidence), owner.stateWitnesses.size(),
+                        ownerStateDeltaSignature(owner))
               .str();
       for (const SuffixStabilityWitness &suffix : owner.stateWitnesses)
         stateSummary +=
@@ -25816,9 +26884,11 @@ RefoldEngine::WitnessEquivalenceKey RefoldEngine::BuildWitnessEquivalenceKey(
              summary.mixedOwnerTilingWitness.stateSummariesComposed) {
     const MixedOwnerTilingWitness &tiling = summary.mixedOwnerTilingWitness;
     key.suffixState = WitnessEquivalenceDimension::Known(
-        llvm::formatv("mixed_owner_composed:id={0}:segments={1}:state_gaps={2}",
-                      tiling.witnessId, tiling.tokenSegmentCount,
-                      tiling.stateGapCount)
+        llvm::formatv(
+            "mixed_owner_composed:id={0}:segments={1}:state_gaps={2}:"
+            "state={3}",
+            tiling.witnessId, tiling.tokenSegmentCount, tiling.stateGapCount,
+            mixedOwnerTilingSignature(tiling))
             .str());
   }
 
@@ -25925,6 +26995,11 @@ RefoldEngine::WitnessEquivalenceKey RefoldEngine::BuildWitnessEquivalenceKey(
             candidate.rootMacroId, candidate.targetBTokStart,
             candidate.targetBTokEnd)
             .str());
+  } else if (canUseMacroRepairReplayStateNeutrality()) {
+    key.preservedObservers = WitnessEquivalenceDimension::Known(
+        llvm::formatv("macro_repair_replay_observers_neutral:{0}",
+                      macroRepairReplayStateNeutralityValue())
+            .str());
   } else if (summary.hasTUAnchorWitness) {
     const TUAnchorWitness &w = summary.tuAnchorWitness;
     key.preservedObservers = WitnessEquivalenceDimension::Known(
@@ -25950,6 +27025,16 @@ RefoldEngine::WitnessEquivalenceKey RefoldEngine::BuildWitnessEquivalenceKey(
             w.neighborPP, w.hasCondArmId, w.condArmId,
             w.hasChildIncludeId, w.childIncludeId, w.hasDeclHeaderRange,
             w.declHeaderB, w.declHeaderE)
+            .str());
+  } else if (summary.hasMixedOwnerTilingWitness &&
+             summary.mixedOwnerTilingWitness.stateSummariesComposed) {
+    const MixedOwnerTilingWitness &tiling = summary.mixedOwnerTilingWitness;
+    key.preservedObservers = WitnessEquivalenceDimension::Known(
+        llvm::formatv(
+            "mixed_owner_observers:id={0}:segments={1}:state_gaps={2}:"
+            "state={3}",
+            tiling.witnessId, tiling.tokenSegmentCount, tiling.stateGapCount,
+            mixedOwnerTilingSignature(tiling))
             .str());
   } else if (summary.hasOwnerRealizationWitness) {
     const OwnerObserverSummary &observers =
@@ -26061,6 +27146,17 @@ RefoldEngine::WitnessEquivalenceKey RefoldEngine::BuildWitnessEquivalenceKey(
                                      .str())
                            : WitnessEquivalenceDimension::Unknown(
                                  "zero-token-counter-stability-not-proven");
+  } else if (summary.hasMixedOwnerTilingWitness) {
+    const MixedOwnerTilingWitness &tiling = summary.mixedOwnerTilingWitness;
+    key.counterState = mixedOwnerTilingHasKnownCounterState(tiling)
+                           ? WitnessEquivalenceDimension::Known(
+                                 llvm::formatv(
+                                     "mixed_owner_counter_state:id={0}:state={1}",
+                                     tiling.witnessId,
+                                     mixedOwnerTilingSignature(tiling))
+                                     .str())
+                           : WitnessEquivalenceDimension::Unknown(
+                                 "mixed-owner-counter-state-not-proven");
   } else if (candidate.hasMacroActualRepairWitness) {
     key.counterState = WitnessEquivalenceDimension::Known(
         llvm::formatv("macro_actual_replay:root={0}:counter-stable",
@@ -26256,6 +27352,12 @@ RefoldEngine::RefoldWitness RefoldEngine::BuildRefoldWitness(
         llvm::formatv("range=[{0},{1})", candidate.begin, candidate.end)
             .str();
 
+  witness.selector = role.str();
+  witness.sourceFamily =
+      toString(candidate.proofSummary.inventory.currentPath).str();
+  witness.candidateKind = toString(candidate.kind).str();
+  witness.theoremClass = toString(candidate.proofSummary.theoremClass).str();
+
   witness.detail = llvm::formatv(
                        "role={0} kind={1} path={2} theorem={3}", role,
                        candidate.kind, candidate.proofSummary.inventory.currentPath,
@@ -26351,6 +27453,29 @@ static std::string formatOptionalIndex(std::optional<size_t> index) {
   return llvm::formatv("{0}", *index).str();
 }
 
+static std::string formatWitnessClosureAtom(StringRef value) {
+  if (value.empty())
+    return "<none>";
+
+  std::string out;
+  for (char raw : value) {
+    const unsigned char c = static_cast<unsigned char>(raw);
+    if (std::isalnum(c) || c == '_' || c == '-' || c == '.' ||
+        c == ':' || c == '/' || c == '#' || c == '@' || c == '[' ||
+        c == ']' || c == '(' || c == ')' || c == ',' || c == '=') {
+      out.push_back(static_cast<char>(c));
+      continue;
+    }
+
+    out += "%";
+    const std::string hex = llvm::utohexstr(c, /*LowerCase=*/true);
+    if (hex.size() == 1)
+      out += "0";
+    out += hex;
+  }
+  return out;
+}
+
 RefoldEngine::WitnessFallbackClass
 RefoldEngine::ClassifyTerminalFallbackFailure(
     const TerminalFallbackProofFailure &failure) {
@@ -26443,6 +27568,145 @@ RefoldEngine::WitnessFallbackClass RefoldEngine::ClassifyIncompleteWitnessKeys(
   if (unknownDiagnostics)
     return FallbackClass::ValidationFailure;
   return FallbackClass::IncompleteWitnessKey;
+}
+
+void RefoldEngine::PopulateWitnessClosureLedger(
+    WitnessResolverDecision &decision,
+    ArrayRef<std::pair<size_t, RefoldWitness>> selectableWitnesses) {
+  using DomainClass = WitnessStrictDomainClass;
+  using Obligation = WitnessStrictDomainObligation;
+
+  decision.closureLedger.clear();
+  if (decision.strictDomain.domainClass !=
+      DomainClass::PotentiallyInDomainMissingProof)
+    return;
+
+  auto ownerKindForWitness = [](const RefoldWitness &witness) {
+    StringRef owner(witness.owner);
+    if (owner.starts_with("macro#"))
+      return std::string("macro");
+    if (owner.starts_with("include#"))
+      return std::string("include");
+    if (owner.starts_with("anchor@"))
+      return std::string("anchor");
+    if (owner.starts_with("range="))
+      return std::string("token_range");
+    if (owner.empty())
+      return std::string("unknown");
+    return std::string("other");
+  };
+
+  auto addEntry = [&](const RefoldWitness &witness, size_t candidateIndex,
+                      StringRef missingDimension, StringRef missingReason,
+                      Obligation obligation) {
+    WitnessClosureLedgerEntry entry;
+    entry.selector = decision.role;
+    entry.testRegion = witness.owner.empty() ? std::string("<none>")
+                                             : witness.owner;
+    entry.witnessId = witness.witnessId;
+    entry.candidateIndex = candidateIndex;
+    entry.family = witness.family;
+    entry.sourceFamily = witness.sourceFamily.empty() ? std::string("<none>")
+                                                      : witness.sourceFamily;
+    entry.candidateKind = witness.candidateKind.empty()
+                              ? std::string("<none>")
+                              : witness.candidateKind;
+    entry.theoremClass = witness.theoremClass.empty() ? std::string("<none>")
+                                                      : witness.theoremClass;
+    entry.sourceOwnerKind = ownerKindForWitness(witness);
+    entry.owner = witness.owner.empty() ? std::string("<none>")
+                                        : witness.owner;
+    entry.missingDimension = missingDimension.str();
+    entry.missingReason = missingReason.empty() ? std::string("<none>")
+                                                : missingReason.str();
+    entry.obligation = obligation;
+    entry.fallbackClass = decision.fallbackClass;
+    entry.resolverReason = decision.failureReason.empty()
+                               ? std::string("<none>")
+                               : decision.failureReason;
+    decision.closureLedger.push_back(std::move(entry));
+  };
+
+  auto addUnknownKeyDimensions = [&](const RefoldWitness &witness,
+                                     size_t candidateIndex) {
+    const WitnessEquivalenceKey &key = witness.key;
+    if (!key.targetPPTokens.known)
+      addEntry(witness, candidateIndex, "target_pp",
+               key.targetPPTokens.unknownReason,
+               Obligation::TargetPreprocessedTokens);
+    if (!key.suffixState.known)
+      addEntry(witness, candidateIndex, "suffix_state",
+               key.suffixState.unknownReason, Obligation::StateEquivalence);
+    if (!key.preservedObservers.known)
+      addEntry(witness, candidateIndex, "observers",
+               key.preservedObservers.unknownReason,
+               Obligation::LineControlObserverEquivalence);
+    if (!key.counterState.known)
+      addEntry(witness, candidateIndex, "counter",
+               key.counterState.unknownReason, Obligation::CounterEquivalence);
+    if (!key.producerKinds.known)
+      addEntry(witness, candidateIndex, "producer",
+               key.producerKinds.unknownReason,
+               Obligation::ProducerProvenSourceWitness);
+    if (key.boundaryClass == WitnessBoundaryClass::Unknown)
+      addEntry(witness, candidateIndex, "owner_closure",
+               "boundary-class-unknown", Obligation::OwnerClosure);
+    if (key.diagnosticClass == WitnessDiagnosticClass::Unknown)
+      addEntry(witness, candidateIndex, "diagnostics",
+               "diagnostic-class-unknown", Obligation::FinalValidation);
+    if (key.compositionClass == WitnessCompositionClass::Unknown)
+      addEntry(witness, candidateIndex, "composition",
+               "composition-class-unknown", Obligation::Composition);
+  };
+
+  for (const std::pair<size_t, RefoldWitness> &entry : selectableWitnesses) {
+    const RefoldWitness &witness = entry.second;
+    if (witness.key.HasUnknownDimensions())
+      addUnknownKeyDimensions(witness, entry.first);
+  }
+
+  if (decision.closureLedger.empty() &&
+      decision.fallbackClass == WitnessFallbackClass::UnconvertedProofFamily) {
+    for (const std::pair<size_t, RefoldWitness> &entry : selectableWitnesses) {
+      if (!IsResolverAuthoritativeWitness(entry.second))
+        addEntry(entry.second, entry.first, "converted_family",
+                 "proof-family-not-resolver-authoritative",
+                 Obligation::ConvertedProofFamily);
+    }
+  }
+
+  if (decision.closureLedger.empty() &&
+      decision.fallbackClass == WitnessFallbackClass::CompositionFailure) {
+    const std::string reason = decision.composition.reason.empty()
+                                   ? std::string("composition-not-proven")
+                                   : decision.composition.reason;
+    for (const std::pair<size_t, RefoldWitness> &entry : selectableWitnesses)
+      addEntry(entry.second, entry.first, "composition", reason,
+               Obligation::Composition);
+  }
+
+  if (decision.closureLedger.empty() && selectableWitnesses.empty()) {
+    RefoldWitness synthetic;
+    synthetic.witnessId = 0;
+    synthetic.family = WitnessProofFamily::Unknown;
+    synthetic.owner.clear();
+    synthetic.selector = decision.role;
+    synthetic.sourceFamily = "<none>";
+    synthetic.candidateKind = "<none>";
+    synthetic.theoremClass = "<none>";
+    addEntry(synthetic, 0, "producer",
+             decision.failureReason.empty() ? StringRef("no-selectable-witness")
+                                            : StringRef(decision.failureReason),
+             Obligation::ProducerProvenSourceWitness);
+  }
+
+  if (decision.closureLedger.empty()) {
+    for (const std::pair<size_t, RefoldWitness> &entry : selectableWitnesses)
+      addEntry(entry.second, entry.first, "unknown",
+               decision.failureReason.empty() ? StringRef("missing-proof")
+                                              : StringRef(decision.failureReason),
+               decision.strictDomain.obligation);
+  }
 }
 
 RefoldEngine::WitnessFallbackClass RefoldEngine::ClassifyResolverFallbackReason(
@@ -26665,6 +27929,50 @@ void RefoldEngine::TraceWitnessStrictDomain(
       decision.reason.empty() ? StringRef("<none>") : StringRef(decision.reason));
 }
 
+void RefoldEngine::TraceWitnessClosureLedger(
+    const WitnessResolverDecision &decision) const {
+  if (!IsWitnessTraceEnabled() && decision.mode == WitnessResolverMode::Off)
+    return;
+
+  for (const WitnessClosureLedgerEntry &entry : decision.closureLedger) {
+    errs() << llvm::formatv(
+        "REFOLD-WITNESS-CLOSURE selector={0} family={1} "
+        "test_region={2} missing={3} source_family={4} "
+        "candidate_kind={5} theorem={6} witness_id={7} "
+        "candidate_index={8} candidate_count={9} selectable={10} "
+        "complete={11} incomplete={12} converted={13} unconverted={14} "
+        "classes={15} owner_kind={16} owner={17} fallback_class={18} "
+        "obligation={19} reason={20} missing_reason={21} "
+        "composition={22}:classes={23}:complete={24}:incomplete={25}:"
+        "incompatible={26}:reason={27}\n",
+        formatWitnessClosureAtom(entry.selector), toString(entry.family),
+        formatWitnessClosureAtom(entry.testRegion),
+        formatWitnessClosureAtom(entry.missingDimension),
+        formatWitnessClosureAtom(entry.sourceFamily),
+        formatWitnessClosureAtom(entry.candidateKind),
+        formatWitnessClosureAtom(entry.theoremClass), entry.witnessId,
+        entry.candidateIndex, decision.candidateCount, decision.selectableCount,
+        decision.completeWitnessCount, decision.incompleteWitnessCount,
+        decision.resolverAuthoritativeWitnessCount,
+        decision.resolverUnconvertedWitnessCount,
+        decision.equivalenceClassCount,
+        formatWitnessClosureAtom(entry.sourceOwnerKind),
+        formatWitnessClosureAtom(entry.owner), toString(entry.fallbackClass),
+        toString(entry.obligation),
+        formatWitnessClosureAtom(entry.resolverReason),
+        formatWitnessClosureAtom(entry.missingReason),
+        decision.composition.compatible ? StringRef("compatible")
+                                        : StringRef("not-compatible"),
+        decision.composition.globalClassCount,
+        decision.composition.completeTupleCount,
+        decision.composition.incompleteTupleCount,
+        decision.composition.incompatibleTupleCount,
+        formatWitnessClosureAtom(decision.composition.reason.empty()
+                                     ? StringRef("<none>")
+                                     : StringRef(decision.composition.reason)));
+  }
+}
+
 void RefoldEngine::TraceWitnessResolverDecision(
     const WitnessResolverDecision &decision) const {
   // Resolver mode is itself an audit request.  The detailed witness stream still
@@ -26723,6 +28031,7 @@ void RefoldEngine::TraceWitnessResolverDecision(
                                           : StringRef(decision.composition.reason));
 
   TraceWitnessStrictDomain(decision.role, decision.strictDomain);
+  TraceWitnessClosureLedger(decision);
 }
 
 void RefoldEngine::TraceWitnessCompositionDecision(
@@ -26888,7 +28197,7 @@ RefoldEngine::ResolveWitnessesForSelection(
     else
       ++decision.completeWitnessCount;
 
-    if (IsResolverAuthoritativeWitnessFamily(witness.family))
+    if (IsResolverAuthoritativeWitness(witness))
       ++decision.resolverAuthoritativeWitnessCount;
     else
       ++decision.resolverUnconvertedWitnessCount;
@@ -26903,6 +28212,118 @@ RefoldEngine::ResolveWitnessesForSelection(
       hasConcreteRepairIdentity = true;
     } else if (*commonRepairIdentity != repairIdentity) {
       singleConcreteRepairIdentity = false;
+    }
+  }
+
+  // A whole-cover owner-realization candidate is a materialization fallback for
+  // the same macro root, not a stronger source repair, when a converted
+  // invocation-preserving witness already proves the identical target token
+  // envelope for that root.  Dropping only that dominated realization prevents
+  // an unconverted raw-expansion certificate from manufacturing a second
+  // macro-selection class while keeping owner-realization-only selectors
+  // probe-only until that proof family is explicitly converted.
+  auto convertedInvocationRepairDominatesOwnerRealization =
+      [&](const RefoldWitness &candidate) {
+        if (role != "SelectPreferredMacroSelectionCandidate")
+          return false;
+        if (candidate.family != WitnessProofFamily::OwnerRealization)
+          return false;
+        if (candidate.sourceFamily != "MacroWholeCoverRealization")
+          return false;
+        if (candidate.key.HasUnknownDimensions())
+          return false;
+        if (!candidate.key.targetPPTokens.known)
+          return false;
+        if (candidate.key.boundaryClass != WitnessBoundaryClass::RootInvocation)
+          return false;
+        if (candidate.key.diagnosticClass !=
+            WitnessDiagnosticClass::RealizesEditedSurface)
+          return false;
+
+        for (const std::pair<size_t, RefoldWitness> &entry :
+             selectableWitnesses) {
+          const RefoldWitness &other = entry.second;
+          if (&other == &candidate)
+            continue;
+          if (!IsResolverAuthoritativeWitness(other))
+            continue;
+          if (other.key.HasUnknownDimensions())
+            continue;
+          if (!other.key.targetPPTokens.known)
+            continue;
+          if (other.owner != candidate.owner)
+            continue;
+          if (other.key.targetPPTokens.value !=
+              candidate.key.targetPPTokens.value)
+            continue;
+          if (other.key.boundaryClass != WitnessBoundaryClass::RootInvocation)
+            continue;
+          if (other.key.diagnosticClass !=
+              WitnessDiagnosticClass::PreservesDiagnostics)
+            continue;
+          return true;
+        }
+
+        return false;
+      };
+
+  SmallVector<std::pair<size_t, RefoldWitness>, 8> effectiveWitnesses;
+  SmallVector<size_t, 8> effectiveIndices;
+  bool removedDominatedOwnerRealization = false;
+  for (const std::pair<size_t, RefoldWitness> &entry : selectableWitnesses) {
+    if (convertedInvocationRepairDominatesOwnerRealization(entry.second)) {
+      removedDominatedOwnerRealization = true;
+      ++decision.proofInvalidCount;
+      TraceWitnessRejected(
+          entry.second, WitnessRejectReason::NonEquivalentAmbiguity,
+          "whole-cover owner realization is dominated by a converted "
+          "invocation-preserving witness for the same root and target tokens");
+      continue;
+    }
+
+    effectiveWitnesses.push_back(entry);
+    effectiveIndices.push_back(entry.first);
+  }
+
+  if (removedDominatedOwnerRealization) {
+    selectableWitnesses = effectiveWitnesses;
+    selectableIndices = effectiveIndices;
+    decision.selectableCount = selectableWitnesses.size();
+    decision.equivalenceClassCount = 0;
+    decision.completeWitnessCount = 0;
+    decision.incompleteWitnessCount = 0;
+    decision.resolverAuthoritativeWitnessCount = 0;
+    decision.resolverUnconvertedWitnessCount = 0;
+    classes.clear();
+
+    hasConcreteRepairIdentity = false;
+    singleConcreteRepairIdentity = true;
+    commonRepairIdentity.reset();
+
+    for (const std::pair<size_t, RefoldWitness> &entry : selectableWitnesses) {
+      const RefoldWitness &witness = entry.second;
+      if (witness.key.HasUnknownDimensions())
+        ++decision.incompleteWitnessCount;
+      else
+        ++decision.completeWitnessCount;
+
+      if (IsResolverAuthoritativeWitness(witness))
+        ++decision.resolverAuthoritativeWitnessCount;
+      else
+        ++decision.resolverUnconvertedWitnessCount;
+
+      classes[witness.key.PartitionString(witness.witnessId)].push_back(
+          entry.first);
+
+      const std::string repairIdentity = repairIdentityForWitness(witness);
+      if (repairIdentity.empty()) {
+        singleConcreteRepairIdentity = false;
+      } else if (!hasConcreteRepairIdentity) {
+        commonRepairIdentity = repairIdentity;
+        hasConcreteRepairIdentity = true;
+      } else if (*commonRepairIdentity != repairIdentity) {
+        singleConcreteRepairIdentity = false;
+      }
     }
   }
 
@@ -26930,9 +28351,8 @@ RefoldEngine::ResolveWitnessesForSelection(
     decision.failureReason = "incomplete-witness-key";
     decision.fallbackClass = ClassifyIncompleteWitnessKeys(selectableWitnesses);
   } else if (decision.resolverUnconvertedWitnessCount != 0) {
-    // Phase 12 is an explicit per-family authority migration.  A complete key
-    // is necessary but not sufficient: the witness family must also be listed
-    // in IsResolverAuthoritativeWitnessFamily() so strict mode cannot become
+    // A complete key is necessary but not sufficient: the witness must also be
+    // accepted by the resolver-authority gate so strict mode cannot become
     // authoritative for an unaudited proof family merely because its trace key
     // happened to be complete.
     decision.failureReason = "unconverted-proof-family";
@@ -27008,6 +28428,8 @@ RefoldEngine::ResolveWitnessesForSelection(
     decision.agreement = "neither";
 
   decision.strictDomain = ClassifyStrictDomainForResolver(decision);
+  PopulateWitnessClosureLedger(decision, selectableWitnesses);
+  RecordWitnessResolverTheoremAudit(decision);
 
   TraceWitnessResolverDecision(decision);
   return decision;
@@ -27111,6 +28533,70 @@ void RefoldEngine::TraceWitnessFallback(
                           request.phase,
                           stringutils::showWsWithClip(request.detail, 200));
   TraceWitnessStrictDomain("TerminalFallback", domain);
+
+  if (domain.domainClass ==
+      WitnessStrictDomainClass::PotentiallyInDomainMissingProof) {
+    StringRef missing = "unknown";
+    switch (fallbackClass) {
+    case WitnessFallbackClass::UnknownTargetPreprocessedTokens:
+      missing = "target_pp";
+      break;
+    case WitnessFallbackClass::UnknownSuffixState:
+      missing = "suffix_state";
+      break;
+    case WitnessFallbackClass::UnprovenProducerKind:
+    case WitnessFallbackClass::NoSelectableWitness:
+      missing = "producer";
+      break;
+    case WitnessFallbackClass::CounterStateMismatch:
+      missing = "counter";
+      break;
+    case WitnessFallbackClass::LineControlObserverMismatch:
+      missing = "observers";
+      break;
+    case WitnessFallbackClass::CompositionFailure:
+      missing = "composition";
+      break;
+    case WitnessFallbackClass::UnconvertedProofFamily:
+      missing = "converted_family";
+      break;
+    case WitnessFallbackClass::IncompleteWitnessKey:
+      missing = "complete_key";
+      break;
+    case WitnessFallbackClass::NoOwnerClosedWitness:
+      missing = "owner_closure";
+      break;
+    case WitnessFallbackClass::ValidationFailure:
+      missing = "diagnostics";
+      break;
+    case WitnessFallbackClass::Unknown:
+    case WitnessFallbackClass::MultipleNonEquivalentWitnessClasses:
+    case WitnessFallbackClass::InvalidMacroInvocation:
+    case WitnessFallbackClass::InvalidPasteResult:
+    case WitnessFallbackClass::UnsupportedDirectiveInteraction:
+      break;
+    }
+
+    errs() << llvm::formatv(
+        "REFOLD-WITNESS-CLOSURE selector=TerminalFallback "
+        "family={0} test_region=terminal missing={1} "
+        "source_family=TerminalFallback candidate_kind=TerminalOutOfDomain "
+        "theorem=TerminalFallback witness_id=0 candidate_index=0 "
+        "candidate_count=1 selectable=0 complete=0 incomplete=1 "
+        "converted=0 unconverted=1 classes=0 owner_kind=terminal "
+        "owner=terminal fallback_class={2} obligation={3} reason={4} "
+        "missing_reason={5} "
+        "composition=not-compatible:classes=0:complete=0:incomplete=1:"
+        "incompatible=0:reason={6}\n",
+        toString(WitnessProofFamily::TerminalFallback),
+        formatWitnessClosureAtom(missing), toString(fallbackClass),
+        toString(domain.obligation),
+        formatWitnessClosureAtom(domain.reason.empty() ? StringRef("<none>")
+                                                       : StringRef(domain.reason)),
+        formatWitnessClosureAtom(toString(request.failure)),
+        formatWitnessClosureAtom(request.phase.empty() ? StringRef("<none>")
+                                                       : StringRef(request.phase)));
+  }
 }
 
 
@@ -27721,9 +29207,60 @@ RefoldEngine::BuildCanonicalEmittedProofFromSummary(
     if (!summary.hasMixedOwnerTilingWitness)
       return std::nullopt;
     const MixedOwnerTilingWitness &witness = summary.mixedOwnerTilingWitness;
-    if (!witness.stateSummariesComposed || witness.tokenSegmentCount == 0 ||
-        witness.segments.empty())
+    if (!witness.stateSummariesComposed || !witness.ownerBoundariesComposed ||
+        !witness.targetTokenStreamComposed || !witness.compositionEdgesProven ||
+        witness.tokenSegmentCount == 0 || witness.segments.empty() ||
+        witness.globalTargetPPTokenSignature.empty() ||
+        witness.globalCompositionSignature.empty() ||
+        witness.originalAEnd < witness.originalAStart ||
+        witness.originalBEnd < witness.originalBStart ||
+        witness.originalBEnd > bToks_.size())
       return std::nullopt;
+
+    uint64_t expectedA = witness.originalAStart;
+    uint64_t expectedB = witness.originalBStart;
+    uint32_t tokenSegmentCount = 0;
+    uint32_t stateGapCount = 0;
+    for (size_t i = 0; i < witness.segments.size(); ++i) {
+      const MixedOwnerTilingSegmentWitness &segment = witness.segments[i];
+      if (segment.parentTilingWitnessId != witness.witnessId ||
+          segment.segmentIndex != i || !segment.ownerClosureComplete ||
+          segment.ownerSignature.empty() || segment.sourceSignature.empty() ||
+          segment.producerPathSignature.empty() ||
+          segment.targetPPTokenSignature.empty() ||
+          segment.aEnd < segment.aStart || segment.bEnd < segment.bStart ||
+          segment.bEnd > bToks_.size())
+        return std::nullopt;
+
+      switch (segment.kind) {
+      case MixedOwnerTilingEdgeKind::TokenSegment:
+        if (segment.zeroTokenStateGap || segment.aStart != expectedA ||
+            segment.bStart != expectedB || segment.aEnd <= segment.aStart ||
+            (!segment.allowEmptyBEnvelope && segment.bEnd <= segment.bStart))
+          return std::nullopt;
+        expectedA = segment.aEnd;
+        expectedB = segment.bEnd;
+        ++tokenSegmentCount;
+        break;
+
+      case MixedOwnerTilingEdgeKind::StateGap:
+        if (!segment.zeroTokenStateGap || segment.aStart != expectedA ||
+            segment.aEnd != expectedA || segment.bStart != expectedB ||
+            segment.bEnd != expectedB)
+          return std::nullopt;
+        ++stateGapCount;
+        break;
+
+      case MixedOwnerTilingEdgeKind::Unknown:
+        return std::nullopt;
+      }
+    }
+
+    if (expectedA != witness.originalAEnd || expectedB != witness.originalBEnd ||
+        tokenSegmentCount != witness.tokenSegmentCount ||
+        stateGapCount != witness.stateGapCount)
+      return std::nullopt;
+
     return BuildEmittedProofFromSummary(summary.theoremClass, summary);
   }
 
@@ -28731,6 +30268,90 @@ RefoldEngine::BuildAcceptedMacroCandidate(const MacroPatch &patch) const {
     candidate.counterStateWitness = *patch.proof.counterState;
   }
 
+  // Ordinary macro-repair/replay families may be counter-stable even when
+  // they do not carry a value-specific CounterStateWitness.  The proof is not
+  // textual: it is the producer macro-invocation tree.  If the accepted repair
+  // preserves one macro invocation, the original expansion subtree contains no
+  // producer-recorded __COUNTER__ invocation, and the emitted source repair does
+  // not introduce a raw __COUNTER__ spelling, then this tile has zero counter
+  // consumption delta.  In that case all suffix counter observers are
+  // vacuously preserved by this tile.  Do not use this path for explicit
+  // counter materialization/literalization, which already installed a typed
+  // counter witness above.
+  auto macroProofKindCanBeCounterNeutral = [](MacroPatchProofKind kind) {
+    switch (kind) {
+    case MacroPatchProofKind::ArgsOnlyStandard:
+    case MacroPatchProofKind::DagSubtreeRoot:
+    case MacroPatchProofKind::CallChainSuffix:
+    case MacroPatchProofKind::PasteDerivedCalleeSelector:
+      return true;
+    case MacroPatchProofKind::Unknown:
+    case MacroPatchProofKind::ArgsOnlyPasteSingle:
+    case MacroPatchProofKind::ArgsOnlyPasteMulti:
+    case MacroPatchProofKind::ArgsOnlyPurePasteOnly:
+    case MacroPatchProofKind::ArgsOnlyPairedPureInsertion:
+    case MacroPatchProofKind::CounterLiteral:
+    case MacroPatchProofKind::WholeCoverRealization:
+      return false;
+    }
+    return false;
+  };
+
+  auto macroInvocationIsInSubtreeOf = [&](
+      const RefoldModel::MacroInvocation &macro, uint64_t rootId) {
+    uint64_t currentId = macro.id;
+    SmallVector<uint64_t, 8> seen;
+    while (true) {
+      if (currentId == rootId)
+        return true;
+      if (std::find(seen.begin(), seen.end(), currentId) != seen.end())
+        return false;
+      seen.push_back(currentId);
+
+      const RefoldModel::MacroInvocation *current =
+          FindMacroInvocationById(currentId);
+      if (!current || !current->callerMacroId)
+        return false;
+      currentId = *current->callerMacroId;
+    }
+  };
+
+  auto macroSubtreeContainsCounterInvocation = [&](uint64_t rootId) {
+    if (!FindMacroInvocationById(rootId))
+      return true;
+    for (const RefoldModel::MacroInvocation &macro :
+         model_.GetMacroInvocations()) {
+      if (macro.name != "__COUNTER__")
+        continue;
+      if (macroInvocationIsInSubtreeOf(macro, rootId))
+        return true;
+    }
+    return false;
+  };
+
+  const uint64_t counterNeutralRootId =
+      patch.proof.proofRootMacroId ? patch.proof.proofRootMacroId
+                                   : patch.macroId;
+  if (!candidate.hasCounterStateWitness && counterNeutralRootId != 0 &&
+      macroProofKindCanBeCounterNeutral(patch.proof.kind) &&
+      patch.proof.preservesInvocationStructure &&
+      !RawIdentifierAppearsInText("__COUNTER__", patch.replacement) &&
+      !macroSubtreeContainsCounterInvocation(counterNeutralRootId)) {
+    candidate.hasCounterStateWitness = true;
+    candidate.counterStateWitness = CounterStateWitness{};
+    candidate.counterStateWitness.counterOrderKnown = true;
+    candidate.counterStateWitness.suffixStateStable = true;
+    candidate.counterStateWitness.suffixUnobserved = true;
+    candidate.counterStateWitness.suffixObserverSignature =
+        llvm::formatv(
+            "counter-neutral:path={0}:root={1}:target=[{2},{3}):"
+            "producer_subtree=no-counter:replacement=no-raw-counter",
+            toString(patch.proof.kind), counterNeutralRootId,
+            candidate.hasTargetBTokenRange ? candidate.targetBTokStart : 0,
+            candidate.hasTargetBTokenRange ? candidate.targetBTokEnd : 0)
+            .str();
+  }
+
   // Preserve the proof root separately from the byte span so selector/audit
   // code can reason about macro ancestry without reclassifying the patch.
   if (patch.proof.proofRootMacroId) {
@@ -29102,17 +30723,49 @@ void RefoldEngine::AddForcedCounterPatches(
     ArrayRef<ForcedMacroPatchRequest> forced,
     DenseMap<std::optional<uint64_t>, DenseMap<uint64_t, MacroPatch>>
         &macroPatchByOwnerByMacroId) const {
-  auto buildOccReplacement = [&](uint64_t aStart,
-                                 uint64_t aEnd) -> std::optional<std::string> {
+  struct CounterReplacementSurface {
+    std::string text;
+    uint64_t bTokStart = 0;
+    uint64_t bTokEnd = 0;
+  };
+
+  auto buildOccReplacement = [&](uint64_t aStart, uint64_t aEnd)
+      -> std::optional<CounterReplacementSurface> {
     // For __COUNTER__, the replacement is tied to the specific expanded
     // occurrence, not to reusable macro-body text. Map that occurrence's
-    // A-token range into B and use the resulting B spelling directly.
+    // A-token range into B and use the resulting B spelling directly.  Keep
+    // the B-token envelope together with the text so the accepted witness can
+    // prove target-PP identity without relying on the spelling preview.
     auto bEnv = MapATokRangeAToBTokenEnvelope(aStart, aEnd);
     if (!bEnv)
       return std::nullopt;
     if (bEnv->second <= bEnv->first)
       return std::nullopt;
-    return SliceBSource(bEnv->first, bEnv->second).trim().str();
+
+    CounterReplacementSurface surface;
+    surface.text = SliceBSource(bEnv->first, bEnv->second).trim().str();
+    surface.bTokStart = static_cast<uint64_t>(bEnv->first);
+    surface.bTokEnd = static_cast<uint64_t>(bEnv->second);
+    return surface;
+  };
+
+  auto deriveWholeCoverBTokenRange =
+      [&](const RefoldModel::MacroInvocation &m)
+      -> std::optional<std::pair<uint64_t, uint64_t>> {
+    std::optional<std::pair<uint64_t, uint64_t>> cover =
+        GetWholeCoverATokRange(m);
+    if (!cover)
+      return std::nullopt;
+
+    std::optional<std::pair<size_t, size_t>> bEnv =
+        MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
+            cover->first, cover->second);
+    if (!bEnv || bEnv->second <= bEnv->first ||
+        bEnv->second > bToks_.size())
+      return std::nullopt;
+
+    return std::make_pair(static_cast<uint64_t>(bEnv->first),
+                          static_cast<uint64_t>(bEnv->second));
   };
 
   for (const auto &req : forced) {
@@ -29132,15 +30785,16 @@ void RefoldEngine::AddForcedCounterPatches(
     if (!invStart || !invEnd || *invEnd < *invStart)
       continue;
 
-    std::optional<std::string> replOpt;
+    std::optional<CounterReplacementSurface> counterSurface;
+    std::optional<std::string> nonCounterReplacement;
     if (m.name == "__COUNTER__") {
-      replOpt = buildOccReplacement(req.aStart, req.aEnd);
+      counterSurface = buildOccReplacement(req.aStart, req.aEnd);
     } else {
       // Other forced counter-related requests use the normal whole-cover text
       // builder so they remain aligned with whole macro invocation replay.
-      replOpt = BuildWholeCoverReplacementText(m);
+      nonCounterReplacement = BuildWholeCoverReplacementText(m);
     }
-    if (!replOpt)
+    if (!counterSurface && !nonCounterReplacement)
       continue;
 
     auto &byMacroId = macroPatchByOwnerByMacroId[m.ownerIncludeId];
@@ -29175,8 +30829,12 @@ void RefoldEngine::AddForcedCounterPatches(
         event = BuildCounterEventIdentity(m, /*occurrenceOrdinal=*/0,
                                           req.aStart, req.aEnd,
                                           m.ownerIncludeId);
-      if (!event.expectedBValue && replOpt)
-        event.expectedBValue = *replOpt;
+      if (!event.expectedBValue) {
+        if (counterSurface)
+          event.expectedBValue = counterSurface->text;
+        else if (nonCounterReplacement)
+          event.expectedBValue = *nonCounterReplacement;
+      }
       counterEventForWitness = event;
       const OwnerStateBoundary boundary = CounterStateBoundaryForEvent(event);
       const std::string detail =
@@ -29198,7 +30856,28 @@ void RefoldEngine::AddForcedCounterPatches(
     // Install the forced patch under the coalesced physical-span key. If this
     // replaces a previous call-site-shaped patch, carry its owner certificate
     // forward before stamping the current invocation owner.
-    MacroPatch patch{*invStart, *invEnd, std::move(*replOpt)};
+    std::optional<std::pair<uint64_t, uint64_t>> materializedBTokenRange;
+    if (counterSurface) {
+      materializedBTokenRange =
+          std::make_pair(counterSurface->bTokStart, counterSurface->bTokEnd);
+    } else if (nonCounterReplacement) {
+      // Enclosing macro materializations are whole-cover counter-stabilization
+      // repairs. Their target-PP proof is the exact B-token envelope of the
+      // whole macro expansion, not the replacement string constructed from it.
+      materializedBTokenRange = deriveWholeCoverBTokenRange(m);
+    }
+
+    std::string replacementText = counterSurface
+                                      ? std::move(counterSurface->text)
+                                      : std::move(*nonCounterReplacement);
+    MacroPatch patch{*invStart, *invEnd, std::move(replacementText)};
+    if (materializedBTokenRange &&
+        materializedBTokenRange->first <= materializedBTokenRange->second &&
+        materializedBTokenRange->second <= bToks_.size()) {
+      patch.hasMaterializedBTokenRange = true;
+      patch.materializedBTokStart = materializedBTokenRange->first;
+      patch.materializedBTokEnd = materializedBTokenRange->second;
+    }
     if (it != byMacroId.end())
       CarryMacroPatchOwnerCertificate(patch, it->second);
     StampMacroPatchOwnerWitness(patch, m.ownerIncludeId
@@ -29293,15 +30972,22 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   // multiple times.
   if (m.name == "__COUNTER__") {
     std::optional<std::string> repl;
+    std::optional<std::pair<uint64_t, uint64_t>> counterBTokenRange;
     if (h.bEnd > h.bStart) {
+      counterBTokenRange = std::make_pair(static_cast<uint64_t>(h.bStart),
+                                          static_cast<uint64_t>(h.bEnd));
       repl = SliceBSource(static_cast<size_t>(h.bStart),
                           static_cast<size_t>(h.bEnd))
                  .trim()
                  .str();
     } else {
       auto bEnv = MapATokRangeAToBTokenEnvelope(h.aStart, h.aEnd);
-      if (bEnv && bEnv->second > bEnv->first)
+      if (bEnv && bEnv->second > bEnv->first) {
+        counterBTokenRange =
+            std::make_pair(static_cast<uint64_t>(bEnv->first),
+                           static_cast<uint64_t>(bEnv->second));
         repl = SliceBSource(bEnv->first, bEnv->second).trim().str();
+      }
     }
     if (repl) {
       CounterEventIdentity event = BuildCounterEventIdentity(
@@ -29324,6 +31010,13 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           "counter", detail, /*requireKnownObserver=*/false);
 
       MacroPatch patch{*invStart, *invEnd, std::move(*repl), m.id};
+      if (counterBTokenRange &&
+          counterBTokenRange->first <= counterBTokenRange->second &&
+          counterBTokenRange->second <= bToks_.size()) {
+        patch.hasMaterializedBTokenRange = true;
+        patch.materializedBTokStart = counterBTokenRange->first;
+        patch.materializedBTokEnd = counterBTokenRange->second;
+      }
       MacroPatchProof proof =
           MakeMacroPatchProof(MacroPatchProofKind::CounterLiteral,
                               /*preservesInvocationStructure=*/false, m.id);
@@ -29493,6 +31186,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   // competition block.
   std::optional<MacroPatch> dagRootCandidate;
   bool reuseExistingCallsitePatch = false;
+  bool existingCallsitePatchAbsorbedByDirectCandidate = false;
 
   SmallVector<RefoldModel::PPArgSpan, 16> argLikeSpans;
   argLikeSpans.append(m.argSpans.begin(), m.argSpans.end());
@@ -36412,6 +38106,58 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           patch.materializedOutputByteStart = *materializedOutputBegin;
           patch.materializedOutputByteEnd = *materializedOutputEnd;
         }
+
+        // Target-PP identity for a DAG root replay is the union of the exact
+        // B-token envelopes for the root formal occurrences that the accepted
+        // certificate rewrites.  This is deliberately derived from the
+        // producer-recorded PPArgSpan -> B-token mapping, not from the source
+        // replacement text, so the resolver can distinguish proof of output
+        // identity from a spelling preview.
+        std::optional<std::pair<uint64_t, uint64_t>> materializedBTokenRange;
+        for (const auto &rewrite : rootCert.rewrites) {
+          for (const auto &span : m.argSpans) {
+            if (span.kind != PPArgSpanKind::Standard ||
+                span.argIdx != rewrite.argIdx || span.begin >= span.end)
+              continue;
+
+            std::optional<std::pair<size_t, size_t>> bEnv =
+                MapAToBTokenEnvelopeByPPArgSpan(span);
+            if (!bEnv || bEnv->second <= bEnv->first ||
+                bEnv->second > bToks_.size())
+              continue;
+
+            const uint64_t bBegin = static_cast<uint64_t>(bEnv->first);
+            const uint64_t bEnd = static_cast<uint64_t>(bEnv->second);
+            if (!materializedBTokenRange) {
+              materializedBTokenRange = std::make_pair(bBegin, bEnd);
+            } else {
+              materializedBTokenRange->first =
+                  std::min(materializedBTokenRange->first, bBegin);
+              materializedBTokenRange->second =
+                  std::max(materializedBTokenRange->second, bEnd);
+            }
+          }
+        }
+        if (materializedBTokenRange) {
+          patch.hasMaterializedBTokenRange = true;
+          patch.materializedBTokStart = materializedBTokenRange->first;
+          patch.materializedBTokEnd = materializedBTokenRange->second;
+        } else if (std::optional<WholeCoverPlan> plan =
+                       ComputeWholeCoverPlan(m)) {
+          // A DAG subtree-root repair may rewrite a root actual whose
+          // final B-side tokens are produced only by descendant generated
+          // callee/stringify/paste expansions.  Such roots have no direct
+          // Standard PPArgSpan -> B-token envelope for the rewritten formal,
+          // but the already-validated subtree/root replay proves that the
+          // preserved root invocation materializes this owner-closed macro
+          // expansion.  Use the producer-derived whole-cover B envelope as
+          // target-PP proof; never derive target identity from replacement
+          // source text.
+          patch.hasMaterializedBTokenRange = true;
+          patch.materializedBTokStart = static_cast<uint64_t>(plan->bTokStart);
+          patch.materializedBTokEnd = static_cast<uint64_t>(plan->bTokEnd);
+        }
+
         cert.patch = std::move(patch);
         cert.kind = RootPatchConstructionCertificateKind::Unique;
         cert.detail =
@@ -37102,6 +38848,22 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
       ///
       /// Every acceptance path validates the concrete replacement against the
       /// merged candidate metadata before updating `uniquePatch`.
+      auto unionMaterializedBTokenRange = [](MacroPatch &dst,
+                                              const MacroPatch &src) {
+        if (!src.hasMaterializedBTokenRange)
+          return;
+        if (!dst.hasMaterializedBTokenRange) {
+          dst.hasMaterializedBTokenRange = true;
+          dst.materializedBTokStart = src.materializedBTokStart;
+          dst.materializedBTokEnd = src.materializedBTokEnd;
+          return;
+        }
+        dst.materializedBTokStart =
+            std::min(dst.materializedBTokStart, src.materializedBTokStart);
+        dst.materializedBTokEnd =
+            std::max(dst.materializedBTokEnd, src.materializedBTokEnd);
+      };
+
       auto acceptOrMergeDAGCandidatePatch =
           [&](MacroPatch candPatch, StringRef baseText, StringRef traceStage,
               const DagCandidateValidationMetadata *candValidation =
@@ -37221,6 +38983,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                 formatBridgeSensitiveFormalSignatureMap(
                     mergedValidation->bridgeSensitiveFormalSignatures));
           }
+          unionMaterializedBTokenRange(*uniquePatch, candPatch);
           uniquePatchValidation = std::move(*mergedValidation);
           cert.accepted = true;
           cert.detail =
@@ -37371,6 +39134,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         // accumulated validation metadata for any later candidate.
         uniquePatch->replacement = std::move(*merged);
         uniquePatch->hasMaterializedOutputByteRange = false;
+        unionMaterializedBTokenRange(*uniquePatch, candPatch);
         uniquePatchValidation = std::move(*mergedValidation);
         if (!uniquePatch->macroId)
           uniquePatch->macroId = candPatch.macroId;
@@ -39289,33 +41053,41 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             baseInvText, ArrayRef<StringRef>(repls));
         if (merged && validateMergedDirectAndDagRootReplacement(
                           baseInvText, StringRef(*merged))) {
-        argsOnlyCandidate->replacement = std::move(*merged);
-        argsOnlyCandidate->hasMaterializedOutputByteRange = false;
-        if (!argsOnlyCandidate->macroId)
-          argsOnlyCandidate->macroId = existingPatch->macroId;
-      } else {
-        // If the patches cannot be merged, check whether the direct candidate
-        // is independently valid. An invalid direct replay is discarded so the
-        // existing callsite patch remains available to the final selector.
-        const bool directValid = validateMergedDirectAndDagRootReplacement(
-            baseInvText, StringRef(argsOnlyCandidate->replacement));
-        if (!directValid) {
-          argsOnlyCandidate.reset();
-          reuseExistingCallsitePatch = true;
+          argsOnlyCandidate->replacement = std::move(*merged);
+          argsOnlyCandidate->hasMaterializedOutputByteRange = false;
+          if (!argsOnlyCandidate->macroId)
+            argsOnlyCandidate->macroId = existingPatch->macroId;
+
+          // The merged direct replay is the unique source-level candidate for
+          // this callsite after it absorbs the existing same-root patch. Keeping
+          // the stale pre-merge patch in the final selector would manufacture a
+          // second, non-equivalent witness class for bytes that are already
+          // covered by the merged invocation repair.
+          reuseExistingCallsitePatch = false;
+          existingCallsitePatchAbsorbedByDirectCandidate = true;
         } else {
-          // Both candidates are individually viable but not merge-compatible.
-          // Defer to the proof lattice rather than letting the direct replay
-          // win merely because it was produced in this local path.
-          const bool preferDirect = LatticePrefers(
-              argsOnlyCandidate->proofSummary, existingPatch->proofSummary);
-          const bool preferExisting = LatticePrefers(
-              existingPatch->proofSummary, argsOnlyCandidate->proofSummary);
-          if (preferExisting && !preferDirect) {
+          // If the patches cannot be merged, check whether the direct candidate
+          // is independently valid. An invalid direct replay is discarded so the
+          // existing callsite patch remains available to the final selector.
+          const bool directValid = validateMergedDirectAndDagRootReplacement(
+              baseInvText, StringRef(argsOnlyCandidate->replacement));
+          if (!directValid) {
             argsOnlyCandidate.reset();
             reuseExistingCallsitePatch = true;
+          } else {
+            // Both candidates are individually viable but not merge-compatible.
+            // Defer to the proof lattice rather than letting the direct replay
+            // win merely because it was produced in this local path.
+            const bool preferDirect = LatticePrefers(
+                argsOnlyCandidate->proofSummary, existingPatch->proofSummary);
+            const bool preferExisting = LatticePrefers(
+                existingPatch->proofSummary, argsOnlyCandidate->proofSummary);
+            if (preferExisting && !preferDirect) {
+              argsOnlyCandidate.reset();
+              reuseExistingCallsitePatch = true;
+            }
           }
         }
-      }
       }
     }
   }
@@ -39344,6 +41116,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
       !conflictingConcreteSubtreeWitnessForcesWholeCover && existingPatch;
   const bool canReuseExistingCallsiteSkipWholeCover =
       !canReuseExistingCallsiteNoOp &&
+      !existingCallsitePatchAbsorbedByDirectCandidate &&
       !conflictingConcreteSubtreeWitnessForcesWholeCover && existingPatch &&
       existingIsCallsite && existingPatch->proof.preservesInvocationStructure &&
       existingPatch->proof.proofRootMacroId == m.id && !baseInvText.empty() &&

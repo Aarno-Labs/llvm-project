@@ -1800,6 +1800,14 @@ private:
     WitnessProofFamily family = WitnessProofFamily::Unknown;
     std::string owner;
     std::string detail;
+    // C1 closure-ledger metadata.  These fields are trace-only copies of the
+    // selector/candidate provenance already used to build `detail`; keeping
+    // them structured avoids parsing human-oriented trace text when grouping
+    // missing proof dimensions by family and code path.
+    std::string selector;
+    std::string sourceFamily;
+    std::string candidateKind;
+    std::string theoremClass;
     WitnessEquivalenceKey key;
     WitnessCanonicalCost cost;
     std::string payloadPreview;
@@ -1844,6 +1852,32 @@ private:
     uint64_t incompatibleTupleCount = 0;
     uint64_t globalClassCount = 0;
     std::string reason;
+  };
+
+  /// \brief One machine-readable C1 closure-ledger row.
+  ///
+  /// A row is emitted only for decisions classified as
+  /// PotentiallyInDomainMissingProof.  It records the exact selector, proof
+  /// family, missing equivalence/proof dimension, and theorem obligation that
+  /// prevents resolver authority.  The row is purely diagnostic and must never
+  /// affect candidate ordering, admissibility, or emitted source text.
+  struct WitnessClosureLedgerEntry {
+    std::string selector;
+    std::string testRegion;
+    uint64_t witnessId = 0;
+    uint64_t candidateIndex = 0;
+    WitnessProofFamily family = WitnessProofFamily::Unknown;
+    std::string sourceFamily;
+    std::string candidateKind;
+    std::string theoremClass;
+    std::string sourceOwnerKind;
+    std::string owner;
+    std::string missingDimension;
+    std::string missingReason;
+    WitnessStrictDomainObligation obligation =
+        WitnessStrictDomainObligation::Unknown;
+    WitnessFallbackClass fallbackClass = WitnessFallbackClass::Unknown;
+    std::string resolverReason;
   };
 
 
@@ -1898,6 +1932,7 @@ private:
     std::string failureReason;
     WitnessFallbackClass fallbackClass = WitnessFallbackClass::Unknown;
     WitnessStrictDomainDecision strictDomain;
+    std::vector<WitnessClosureLedgerEntry> closureLedger;
     std::string agreement;
 
     bool ShouldUseResolverIndex() const {
@@ -2010,6 +2045,25 @@ private:
     uint64_t directStateChecksTerminalFailures = 0;
     uint64_t directStateChecksUnclosedLocal = 0;
 
+    // Final strict-domain resolver audit.  These counters make the completion
+    // theorem machine-checkable from one strict trace run: no missing-proof
+    // domain, no strict legacy fallback, declared repairs have complete keys,
+    // and fail-closed resolver outcomes are complete non-equivalent ambiguity.
+    uint64_t resolverDomainAudits = 0;
+    uint64_t resolverDeclaredInDomain = 0;
+    uint64_t resolverExplicitOutOfDomain = 0;
+    uint64_t resolverAmbiguousOutOfDomain = 0;
+    uint64_t resolverPotentiallyMissingProof = 0;
+    uint64_t resolverUnknownDomain = 0;
+    uint64_t resolverStrictResolverAuthority = 0;
+    uint64_t resolverStrictLegacyFallback = 0;
+    uint64_t resolverStrictFailClosed = 0;
+    uint64_t resolverStrictInvalidFailClosed = 0;
+    uint64_t resolverDeclaredIncompleteKeys = 0;
+    uint64_t resolverDeclaredIncompatibleComposition = 0;
+    uint64_t resolverDeclaredUnconvertedWitnesses = 0;
+    uint64_t resolverClosureLedgerRows = 0;
+
     bool theoremSatisfied = true;
     std::string firstViolation;
   };
@@ -2117,6 +2171,10 @@ private:
   /// explicit terminal fallback instead of allowing a structurally-refolded
   /// result to escape with a violated theorem audit.
   void EnforceTheoremAuditInvariants() const;
+
+  /// Record and enforce the final strict-domain resolver completion criteria.
+  void RecordWitnessResolverTheoremAudit(
+      const WitnessResolverDecision &decision) const;
 
   /// Validate that one terminal fallback proof failure is a named, structured
   /// failed obligation rather than an opaque raw-B escape.
@@ -2248,7 +2306,14 @@ private:
          "graphMissingProducerFacts={29} directStateChecks={30} "
          "directStateDeltaFacts={31} directStateGraphEdges={32} "
          "directStateGatewayWitnesses={33} directStateTerminalFailures={34} "
-         "directStateUnclosed={35}",
+         "directStateUnclosed={35} resolverAudits={36} "
+         "resolverDeclared={37} resolverExplicitOutOfDomain={38} "
+         "resolverAmbiguous={39} resolverMissingProof={40} "
+         "resolverUnknownDomain={41} strictResolverAuthority={42} "
+         "strictLegacyFallback={43} strictFailClosed={44} "
+         "strictInvalidFailClosed={45} declaredIncompleteKeys={46} "
+         "declaredIncompatibleComposition={47} declaredUnconverted={48} "
+         "closureLedgerRows={49}",
          lastTheoremAudit_.theoremSatisfied ? 1 : 0,
          lastTheoremAudit_.emittedNonTerminalEdits,
          lastTheoremAudit_.emittedCarriers,
@@ -2284,7 +2349,21 @@ private:
          lastTheoremAudit_.directStateChecksGraphEdges,
          lastTheoremAudit_.directStateChecksGatewayWitnesses,
          lastTheoremAudit_.directStateChecksTerminalFailures,
-         lastTheoremAudit_.directStateChecksUnclosedLocal);
+         lastTheoremAudit_.directStateChecksUnclosedLocal,
+         lastTheoremAudit_.resolverDomainAudits,
+         lastTheoremAudit_.resolverDeclaredInDomain,
+         lastTheoremAudit_.resolverExplicitOutOfDomain,
+         lastTheoremAudit_.resolverAmbiguousOutOfDomain,
+         lastTheoremAudit_.resolverPotentiallyMissingProof,
+         lastTheoremAudit_.resolverUnknownDomain,
+         lastTheoremAudit_.resolverStrictResolverAuthority,
+         lastTheoremAudit_.resolverStrictLegacyFallback,
+         lastTheoremAudit_.resolverStrictFailClosed,
+         lastTheoremAudit_.resolverStrictInvalidFailClosed,
+         lastTheoremAudit_.resolverDeclaredIncompleteKeys,
+         lastTheoremAudit_.resolverDeclaredIncompatibleComposition,
+         lastTheoremAudit_.resolverDeclaredUnconvertedWitnesses,
+         lastTheoremAudit_.resolverClosureLedgerRows);
     if (!lastTheoremAudit_.theoremSatisfied &&
         !lastTheoremAudit_.firstViolation.empty()) {
       info("theorem", "firstViolation={0}",
@@ -5873,6 +5952,12 @@ private:
     uint64_t bStart = 0;
     uint64_t bEnd = 0;
     bool zeroTokenStateGap = false;
+    bool allowEmptyBEnvelope = false;
+    bool ownerClosureComplete = false;
+    std::string ownerSignature;
+    std::string sourceSignature;
+    std::string producerPathSignature;
+    std::string targetPPTokenSignature;
     StateTransitionProof ownerTransitionProof;
   };
 
@@ -5891,6 +5976,11 @@ private:
     uint32_t tokenSegmentCount = 0;
     uint32_t stateGapCount = 0;
     bool stateSummariesComposed = false;
+    bool ownerBoundariesComposed = false;
+    bool targetTokenStreamComposed = false;
+    bool compositionEdgesProven = false;
+    std::string globalTargetPPTokenSignature;
+    std::string globalCompositionSignature;
     std::vector<MixedOwnerTilingSegmentWitness> segments;
   };
 
@@ -6891,15 +6981,15 @@ private:
   static WitnessProducerKind
   WitnessProducerKindForAcceptedPath(AcceptedPathKind path);
 
-  /// Return true when Phase 12 has migrated the witness family to the common
+  /// Return true when the witness family is already handled by the common
   /// resolver authority boundary.
-  ///
-  /// This is deliberately a family-level gate, not a completeness shortcut:
-  /// strict mode may use the resolver only when every selectable candidate is
-  /// both complete and drawn from a converted family.  Unconverted complete
-  /// witnesses remain probe-only and fall back to the legacy selector until
-  /// their proof family has gone through the same audit.
   static bool IsResolverAuthoritativeWitnessFamily(WitnessProofFamily family);
+
+  /// Return true when this concrete witness is allowed to participate in a
+  /// strict resolver decision.  Most proof families are authorized as a whole;
+  /// owner realization is narrower because only macro whole-cover realization
+  /// has complete theorem-facing keys at this point.
+  static bool IsResolverAuthoritativeWitness(const RefoldWitness &witness);
 
   /// Build the trace-only boundary class associated with an accepted result.
   static WitnessBoundaryClass
@@ -6988,6 +7078,13 @@ private:
 
   static WitnessFallbackClass ClassifyIncompleteWitnessKeys(
       ArrayRef<std::pair<size_t, RefoldWitness>> witnesses);
+
+  static void PopulateWitnessClosureLedger(
+      WitnessResolverDecision &decision,
+      ArrayRef<std::pair<size_t, RefoldWitness>> selectableWitnesses);
+
+  void TraceWitnessClosureLedger(
+      const WitnessResolverDecision &decision) const;
 
   static WitnessFallbackClass ClassifyResolverFallbackReason(
       llvm::StringRef reason,
