@@ -384,6 +384,21 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
     return langOrErr.takeError();
   model.ppLang_ = *langOrErr;
 
+  if (const json::Value *argvVal = ppCtxObj.get("argv")) {
+    auto argvOrErr = asArray(*argvVal, "pp_ctx.argv");
+    if (!argvOrErr)
+      return argvOrErr.takeError();
+    const json::Array *argvArr = *argvOrErr;
+    model.ppArgv_.reserve(argvArr->size());
+    for (std::size_t i = 0; i < argvArr->size(); ++i) {
+      auto argOrErr = asString((*argvArr)[i],
+                               (Twine("pp_ctx.argv[") + Twine(i) + "]").str());
+      if (!argOrErr)
+        return argOrErr.takeError();
+      model.ppArgv_.push_back(argOrErr->str());
+    }
+  }
+
   // tokens.count
   auto tokObjOrErr = applyToField(asObject, root, "tokens");
   if (!tokObjOrErr)

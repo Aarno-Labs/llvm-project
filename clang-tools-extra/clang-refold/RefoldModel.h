@@ -626,6 +626,7 @@ public:
   StringRef GetSourcePath() const { return sourcePath_; }
   StringRef GetPPCwd() const { return ppCwd_; }
   StringRef GetPPLang() const { return ppLang_; }
+  ArrayRef<std::string> GetPPArgv() const { return ppArgv_; }
   uint64_t GetTokensCountA() const { return tokensCountA_; }
 
   const DenseMap<uint64_t, TokMapEntry> &GetTokmapByPP() const {
@@ -773,6 +774,7 @@ private:
   StringRef sourcePath_;
   StringRef ppCwd_;
   StringRef ppLang_;
+  std::vector<std::string> ppArgv_;
   uint64_t tokensCountA_ = 0;
 
   /// Optional per-token byte offsets in the preprocessed output (A stream).
