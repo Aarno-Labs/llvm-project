@@ -2973,6 +2973,15 @@ void RefoldEngine::MaterializeIncludeExpansion(
         // instead of the child's original header-relative target.  In that
         // case the child include must be treated as materialization work even
         // though the child subtree itself is token-clean.
+        //
+        // Do not discount a conflicting TU include merely because the current
+        // fixed-point selected it for local materialization.  The safety
+        // question here is whether replaying this child directive from the
+        // materialized parent surface is lookup-equivalent in the final output
+        // directory.  Materialization planning is not a proof that no same-name
+        // sidecar or other output-directory artifact will shadow the original
+        // header-relative lookup; if the spelling would resolve differently,
+        // the owner-closed repair is to materialize the child edge too.
         if (!child.parent || child.angled || !child.resolvedPath)
           return false;
 

@@ -177,11 +177,40 @@ static bool isSourceGraphDirectiveHorizontalWhitespace(char c) {
   return c == ' ' || c == '\t' || c == '\r' || c == '\f' || c == '\v';
 }
 
-static void skipSourceGraphDirectiveHorizontalWhitespace(StringRef line,
-                                                        size_t &pos) {
-  while (pos < line.size() &&
-         isSourceGraphDirectiveHorizontalWhitespace(line[pos]))
-    ++pos;
+/// Skip preprocessing whitespace that can legally precede a directive
+/// introducer on a single physical line.  The preprocessor treats complete
+/// block comments as whitespace before recognizing `#`, so proof code that
+/// guards source-graph sidecars or macro-state motion must not use a raw
+/// horizontal-whitespace-only test.  Line comments are intentionally not
+/// skipped: `//#include` comments out the introducer instead of exposing a
+/// directive.  Unterminated or multi-line block comments are not accepted by
+/// this single-line helper; callers that use it as a safety barrier should
+/// fail closed when they need stronger recovery.
+static bool skipDirectiveLinePrefixWhitespace(StringRef line, size_t &pos) {
+  while (pos < line.size()) {
+    if (isSourceGraphDirectiveHorizontalWhitespace(line[pos])) {
+      ++pos;
+      continue;
+    }
+
+    if (pos + 1 < line.size() && line[pos] == '/' && line[pos + 1] == '*') {
+      const size_t end = line.find("*/", pos + 2);
+      if (end == StringRef::npos)
+        return false;
+      pos = end + 2;
+      continue;
+    }
+
+    break;
+  }
+  return true;
+}
+
+static bool lineHasPreprocessingDirectiveIntroducer(StringRef line) {
+  size_t pos = 0;
+  if (!skipDirectiveLinePrefixWhitespace(line, pos))
+    return false;
+  return pos < line.size() && line[pos] == '#';
 }
 
 /// Classify whether a materialized include-owner expansion contains a surviving
@@ -212,10 +241,10 @@ static MaterializedIncludeReplayAlias classifyMaterializedIncludeReplayAlias(
 
     StringRef line = materializedText.slice(lineBegin, lineEnd);
     size_t pos = 0;
-    skipSourceGraphDirectiveHorizontalWhitespace(line, pos);
+    skipDirectiveLinePrefixWhitespace(line, pos);
     if (pos < line.size() && line[pos] == '#') {
       ++pos;
-      skipSourceGraphDirectiveHorizontalWhitespace(line, pos);
+      skipDirectiveLinePrefixWhitespace(line, pos);
       const StringRef keyword = "include";
       if (line.substr(pos, keyword.size()) == keyword &&
           (pos + keyword.size() == line.size() ||
@@ -223,7 +252,7 @@ static MaterializedIncludeReplayAlias classifyMaterializedIncludeReplayAlias(
                  line[pos + keyword.size()])) ||
              line[pos + keyword.size()] == '_'))) {
         pos += keyword.size();
-        skipSourceGraphDirectiveHorizontalWhitespace(line, pos);
+        skipDirectiveLinePrefixWhitespace(line, pos);
 
         if (pos >= line.size() || line[pos] != '"')
           return MaterializedIncludeReplayAlias::UnprovenInclude;
@@ -7491,6 +7520,202 @@ std::string RefoldEngine::RunSinglePassRefold() {
     std::string name;
   };
 
+  DenseSet<uint64_t> syntheticUndefPartitionedDefinitionIds;
+
+  // Insert a local synthetic #undef before an observing TU replacement when
+  // the active definition must remain visible to preserved source before the
+  // replacement.  This is the source-order partition that is smaller than
+  // terminal materialization and safer than carrying the original #define
+  // after the edit: the prefix/include region keeps the original definition,
+  // while the edited B-side spelling sees the undefined macro state that made
+  // it survive in the modified preprocessed stream.
+  //
+  // The proof is deliberately conservative.  We synthesize the transition only
+  // when the original source between the #define and the edit contains a real
+  // observer/barrier, the same-line prefix before the edit is neutral, and the
+  // untouched suffix does not need the definition restored.  Cases needing a
+  // later restore are left to stronger state-tiling proofs rather than guessing
+  // where a new #define should be emitted.
+  auto synthesizeUndefBeforeObservedGapDefinitions = [&]() {
+    SmallVector<size_t, 16> editOrder;
+    editOrder.reserve(tuEdits.size());
+    for (size_t editIndex = 0; editIndex < tuEdits.size(); ++editIndex)
+      editOrder.push_back(editIndex);
+    llvm::sort(editOrder, [&](size_t lhs, size_t rhs) {
+      if (tuEdits[lhs].start != tuEdits[rhs].start)
+        return tuEdits[lhs].start < tuEdits[rhs].start;
+      return lhs < rhs;
+    });
+
+    size_t synthesizedCount = 0;
+    for (size_t editIndex : editOrder) {
+      if (editIndex >= tuEdits.size())
+        continue;
+      TextEdit &edit = tuEdits[editIndex];
+      if (edit.start > edit.end || edit.end > tuBytes.size())
+        continue;
+
+      const size_t editStart = static_cast<size_t>(edit.start);
+      const size_t lineStart = stringutils::lineStartOffset(tuBytes, editStart);
+      if (lineStart > editStart)
+        continue;
+      if (lineStart > 0 && stringutils::isLineSplice(tuBytes, lineStart - 1))
+        continue;
+      if (sourceRangeOverlapsFinalTUEditExcept(lineStart, edit.start,
+                                               editIndex))
+        continue;
+
+      StringRef sameLinePrefix = tuBytes.slice(lineStart, edit.start);
+      StringRef replacementText(edit.text);
+      StringRef untouchedSuffix = tuBytes.drop_front(edit.end);
+
+      struct SyntheticUndefCandidate {
+        const RefoldModel::MacroDirective *definition = nullptr;
+        MacroDirectiveSourceInterval interval;
+        std::string name;
+      };
+      SmallVector<SyntheticUndefCandidate, 4> candidates;
+
+      for (const NamedMacroDirectiveRef &ref : namedMacroDirectives) {
+        const RefoldModel::MacroDirective &definition = *ref.directive;
+        if (definition.subkind != "#define")
+          continue;
+        if (syntheticUndefPartitionedDefinitionIds.contains(definition.id))
+          continue;
+
+        std::optional<MacroStateSourceTransition> transition =
+            macroStateSourceTransition(definition);
+        if (!transition)
+          continue;
+        if (transition->interval.end > lineStart)
+          continue;
+        if (activeDefinitionAtSourceOffset(ref.name, lineStart) != &definition)
+          continue;
+
+        std::optional<size_t> firstObservationOffset =
+            firstReplacementObservationOffset(edit, definition, ref.name);
+        if (!firstObservationOffset)
+          continue;
+
+        // This synthetic partition is a first-order token repair: it is meant
+        // for replacement payloads such as `M()` that would otherwise be
+        // re-expanded by a live definition.  If the first apparent observation
+        // is on, or after, a preprocessing directive in the replacement text,
+        // the situation is no longer a plain token observation.  The directive
+        // may select a zero-token arm, an inactive arm, or a branch whose
+        // conditional state is itself part of the owner proof.  Inserting an
+        // #undef before that directive would be a gratuitous state mutation in
+        // the common zero-token-gap case, and a stronger conditional-state
+        // tiling proof is needed for the remaining cases.
+        if (TextContainsDirectiveLine(
+                replacementText.take_front(*firstObservationOffset + 1)))
+          continue;
+
+        // If the original same-line prefix needed the definition, placing a
+        // synthetic #undef before the line would change preserved source before
+        // the replacement.
+        if (sourceChunkObservesDefinitionWhenCrossed(
+                definition, ref.name, sameLinePrefix, replacementText))
+          continue;
+
+        // Use this partition only when the crossed pre-edit region really is a
+        // macro-state barrier/observer.  If it is neutral, the existing carry
+        // proof can move the definition after the replacement without adding a
+        // synthetic transition.
+        if (!sourceChunkObservesDefinitionWhenCrossed(
+                definition, ref.name,
+                tuBytes.slice(transition->interval.end, edit.start),
+                replacementText))
+          continue;
+
+        // This minimal partition does not restore the definition after the
+        // replacement.  Do not synthesize it when later preserved source would
+        // observe the old definition; that requires an explicit restore tiling.
+        if (sourceChunkObservesDefinitionWhenCrossed(
+                definition, ref.name, untouchedSuffix, StringRef()))
+          continue;
+
+        candidates.push_back(SyntheticUndefCandidate{
+            &definition, transition->interval, ref.name.str()});
+      }
+
+      if (candidates.empty())
+        continue;
+
+      llvm::sort(candidates, [](const SyntheticUndefCandidate &lhs,
+                                const SyntheticUndefCandidate &rhs) {
+        if (lhs.interval.begin != rhs.interval.begin)
+          return lhs.interval.begin < rhs.interval.begin;
+        return lhs.definition->id < rhs.definition->id;
+      });
+
+      std::string undefPrefix;
+      for (const SyntheticUndefCandidate &candidate : candidates) {
+        undefPrefix += "#undef ";
+        undefPrefix += candidate.name;
+        undefPrefix.push_back('\n');
+      }
+
+      std::string replacement;
+      replacement.reserve(undefPrefix.size() + sameLinePrefix.size() +
+                          replacementText.size());
+      replacement += undefPrefix;
+      replacement.append(sameLinePrefix.begin(), sameLinePrefix.end());
+      replacement.append(replacementText.begin(), replacementText.end());
+
+      const uint64_t oldStart = edit.start;
+      const uint64_t oldEnd = edit.end;
+      ResyncOutcome resync =
+          ApplyResyncOrPend(tuBytes, lineStart, edit.end, replacement, tuPath);
+      edit.start = lineStart;
+      edit.end = oldEnd;
+      edit.text = std::move(resync.text);
+      edit.pending = std::move(resync.pending);
+      edit.lineControlPruneCandidates =
+          std::move(resync.lineControlPruneCandidates);
+      edit.isDirectTUHunkEdit = false;
+      edit.directTUHunkIndex.reset();
+      edit.directTUHunkAStart.reset();
+      edit.directTUHunkAEnd.reset();
+      edit.directTUHunkBStart.reset();
+      edit.directTUHunkBEnd.reset();
+      edit.directTURawStart.reset();
+      edit.directTURawEnd.reset();
+      edit.directTUFinalStart = edit.start;
+      edit.directTUFinalEnd = edit.end;
+      AttachAcceptedResultCarrier(
+          edit, BuildAcceptedTUTextEditCandidate(
+                    AcceptedPathKind::TUByteSpanConservativeEdit, edit.start,
+                    edit.end, StringRef(edit.text)));
+
+      for (const SyntheticUndefCandidate &candidate : candidates) {
+        syntheticUndefPartitionedDefinitionIds.insert(candidate.definition->id);
+        (void)checkMacroStateRepaired(
+            *candidate.definition, StateMutationKind::MovedEarlier,
+            "macro-synthetic-undef-partition",
+            llvm::formatv(
+                "synthesized #undef for active definition #{0} of macro '{1}' "
+                "before observing TU replacement [{2},{3})",
+                candidate.definition->id, candidate.name, oldStart, oldEnd)
+                .str());
+        ++synthesizedCount;
+      }
+
+      REFOLD_LOG_WARN(
+          "macro/liveness",
+          "synthesizing local #undef partition before observed replacement: "
+          "defs={0} edit=[{1},{2}) widened=[{3},{4})",
+          candidates.size(), oldStart, oldEnd, edit.start, edit.end);
+    }
+
+    if (synthesizedCount != 0)
+      REFOLD_LOG_INFO(
+          "macro/liveness",
+          "synthesized {0} local #undef partition(s) before observing "
+          "replacement payloads",
+          synthesizedCount);
+  };
+
   // Carry preserved macro-state definitions out of the gap immediately before a
   // TU edit when leaving them in place would make that edit's replacement
   // observe macro state that is not present in B. This is the source-gap mirror
@@ -7559,6 +7784,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
         if (directive.subkind != "#define")
           continue;
         if (carriedDirectiveIds.contains(directive.id))
+          continue;
+        if (syntheticUndefPartitionedDefinitionIds.contains(directive.id))
           continue;
 
         std::optional<MacroStateSourceTransition> transition =
@@ -7738,6 +7965,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
   };
 
   advancePreservedUndefsBeforeObservedReplacements();
+  synthesizeUndefBeforeObservedGapDefinitions();
   carryObservedGapDefinitionsAfterReplacements();
 
   // Return true when a final TU edit consumes bytes from this macro definition,
@@ -8398,6 +8626,59 @@ std::string RefoldEngine::RunSinglePassRefold() {
   // have to reconstruct where that emitted non-terminal artifact came from.
   DenseMap<uint64_t, AcceptedResultCandidate> includeExpansionAcceptedResults;
 
+  auto findMacroDirectiveById =
+      [&](uint64_t id) -> const RefoldModel::MacroDirective * {
+    for (const RefoldModel::MacroDirective &directive :
+         model_.GetMacroDirectives())
+      if (directive.id == id)
+        return &directive;
+    return nullptr;
+  };
+
+  auto definitionIsSuppliedByImmediateIncluder =
+      [&](const RefoldModel::IncludeItem &inc,
+          const RefoldModel::MacroDirective &definition) {
+        if (definition.subkind != "#define")
+          return false;
+        if (!PathsEqual(definition.sitePath, inc.sitePath))
+          return false;
+        if (definition.siteE > inc.siteB)
+          return false;
+        return definition.ownerIncludeId == inc.parent;
+      };
+
+  auto includeHasIncluderSuppliedLineControlMacroState =
+      [&](const RefoldModel::IncludeItem &inc) {
+        for (const RefoldModel::LineControlEvent &event :
+             model_.GetLineControls()) {
+          if (!event.active || !event.producerProven)
+            continue;
+          if (event.ownerIncludeId != std::optional<uint64_t>(inc.id))
+            continue;
+          if (!event.siteB || !event.siteE)
+            continue;
+
+          for (const RefoldModel::MacroInvocation &macro :
+               model_.GetMacroInvocations()) {
+            if (macro.ownerIncludeId != std::optional<uint64_t>(inc.id))
+              continue;
+            if (!macro.invB || !macro.invE || !macro.definitionDirectiveId)
+              continue;
+            if (*macro.invB < *event.siteB || *macro.invE > *event.siteE)
+              continue;
+
+            const RefoldModel::MacroDirective *definition =
+                findMacroDirectiveById(*macro.definitionDirectiveId);
+            if (!definition)
+              continue;
+            if (definitionIsSuppliedByImmediateIncluder(inc, *definition))
+              return true;
+          }
+        }
+
+        return false;
+      };
+
   // Token diff hunks describe edits to PP-token spellings.  Raw byte hunks
   // additionally expose token-empty layout edits that occur in PP gaps.  A gap
   // can be structurally adjacent to an include edge even when no PP token was
@@ -8511,23 +8792,47 @@ std::string RefoldEngine::RunSinglePassRefold() {
       hunks.empty() && sidebandPragmaEdits_.empty() && tuEdits.empty() &&
       !includeBucketsHavePatches() && !macroBucketsHavePatches();
 
-  if (mayUseByteOnlyIncludeLayoutSeed && abByteHunks_) {
+  if (abByteHunks_) {
     for (const diffutils::Hunk &byteHunk : *abByteHunks_) {
-      if (std::optional<uint64_t> seed =
-              layoutOnlyIncludeSeedForRawByteHunk(byteHunk)) {
-        layoutOnlyIncludeMaterializationSeeds.insert(*seed);
-        REFOLD_LOG_TRACE(
-            "include/layout",
-            "seed include materialization from byte-only raw layout hunk "
-            "A[{0},{1}) -> B[{2},{3}) inc#{4}",
-            byteHunk.aStart, byteHunk.aEnd, byteHunk.bStart, byteHunk.bEnd,
-            *seed);
-      }
+      std::optional<uint64_t> seed =
+          layoutOnlyIncludeSeedForRawByteHunk(byteHunk);
+      if (!seed)
+        continue;
+
+      const RefoldModel::IncludeItem *seedInclude = model_.GetIncludeById(*seed);
+      const bool lineControlIncludeEdge =
+          seedInclude &&
+          includeHasIncluderSuppliedLineControlMacroState(*seedInclude);
+
+      // Ordinary mixed token/layout edits still must not use neighboring
+      // whitespace as a materialization witness: the four lit regressions that
+      // motivated the byte-only gate were exactly incidental `-E -P` newline
+      // drift next to clean includes while some other owner carried the real
+      // edit.  A line-control include edge is different.  Preserving that
+      // directive asks Clang to regenerate caller-edge line-control layout, so
+      // a raw PP byte hunk in the owned gap is itself an include-site-local
+      // obligation even when a sibling or parent token hunk exists.  Keep the
+      // proof deterministic by requiring the producer-proven includer-supplied
+      // line-control state, rather than selecting arbitrary adjacent includes.
+      if (!mayUseByteOnlyIncludeLayoutSeed && !lineControlIncludeEdge)
+        continue;
+
+      layoutOnlyIncludeMaterializationSeeds.insert(*seed);
+      REFOLD_LOG_TRACE(
+          "include/layout",
+          "seed include materialization from raw layout hunk "
+          "A[{0},{1}) -> B[{2},{3}) inc#{4} byteOnly={5} "
+          "lineControlEdge={6}",
+          byteHunk.aStart, byteHunk.aEnd, byteHunk.bStart, byteHunk.bEnd,
+          *seed, mayUseByteOnlyIncludeLayoutSeed, lineControlIncludeEdge);
     }
-  } else if (inTraceMode() && abByteHunks_ && !abByteHunks_->empty()) {
+  }
+
+  if (inTraceMode() && abByteHunks_ && !abByteHunks_->empty() &&
+      layoutOnlyIncludeMaterializationSeeds.empty()) {
     REFOLD_LOG_TRACE(
         "include/layout",
-        "skip byte-only include layout seeding: tokenHunks={0} "
+        "skip include layout seeding: tokenHunks={0} "
         "sidebandPragmas={1} tuEdits={2} includePatchBuckets={3} "
         "macroPatchBuckets={4} rawByteHunks={5}",
         hunks.size(), sidebandPragmaEdits_.size(), tuEdits.size(),
@@ -8970,59 +9275,6 @@ std::string RefoldEngine::RunSinglePassRefold() {
     return sawSideband ? TUIncludeMaterializationWorkClass::SidebandPragmaOnly
                        : TUIncludeMaterializationWorkClass::None;
   };
-
-  auto findMacroDirectiveById =
-      [&](uint64_t id) -> const RefoldModel::MacroDirective * {
-    for (const RefoldModel::MacroDirective &directive :
-         model_.GetMacroDirectives())
-      if (directive.id == id)
-        return &directive;
-    return nullptr;
-  };
-
-  auto definitionIsSuppliedByImmediateIncluder =
-      [&](const RefoldModel::IncludeItem &inc,
-          const RefoldModel::MacroDirective &definition) {
-        if (definition.subkind != "#define")
-          return false;
-        if (!PathsEqual(definition.sitePath, inc.sitePath))
-          return false;
-        if (definition.siteE > inc.siteB)
-          return false;
-        return definition.ownerIncludeId == inc.parent;
-      };
-
-  auto includeHasIncluderSuppliedLineControlMacroState =
-      [&](const RefoldModel::IncludeItem &inc) {
-        for (const RefoldModel::LineControlEvent &event :
-             model_.GetLineControls()) {
-          if (!event.active || !event.producerProven)
-            continue;
-          if (event.ownerIncludeId != std::optional<uint64_t>(inc.id))
-            continue;
-          if (!event.siteB || !event.siteE)
-            continue;
-
-          for (const RefoldModel::MacroInvocation &macro :
-               model_.GetMacroInvocations()) {
-            if (macro.ownerIncludeId != std::optional<uint64_t>(inc.id))
-              continue;
-            if (!macro.invB || !macro.invE || !macro.definitionDirectiveId)
-              continue;
-            if (*macro.invB < *event.siteB || *macro.invE > *event.siteE)
-              continue;
-
-            const RefoldModel::MacroDirective *definition =
-                findMacroDirectiveById(*macro.definitionDirectiveId);
-            if (!definition)
-              continue;
-            if (definitionIsSuppliedByImmediateIncluder(inc, *definition))
-              return true;
-          }
-        }
-
-        return false;
-      };
 
   auto includeSubtreeHasLayoutOnlyMaterializationSeed =
       [&](auto &&self, uint64_t id) -> bool {
@@ -10479,23 +10731,19 @@ bool RefoldEngine::ReplacementObservesMacroStateDirective(
 /// unsafe by default because conditionals, includes, and macro transitions have
 /// structural effects beyond token-level identifier observation.
 bool RefoldEngine::TextContainsDirectiveLine(StringRef text) const {
-  bool atLineStart = true;
-  bool onlyHorizontalWsOnLine = true;
-  for (char c : text) {
-    if (atLineStart) {
-      atLineStart = false;
-      onlyHorizontalWsOnLine = true;
-    }
-    if (c == '\n') {
-      atLineStart = true;
-      onlyHorizontalWsOnLine = true;
-      continue;
-    }
-    if (onlyHorizontalWsOnLine && stringutils::isNonNewlineWs(c))
-      continue;
-    if (onlyHorizontalWsOnLine && c == '#')
+  size_t lineBegin = 0;
+  while (lineBegin <= text.size()) {
+    size_t lineEnd = text.find('\n', lineBegin);
+    if (lineEnd == StringRef::npos)
+      lineEnd = text.size();
+
+    if (lineHasPreprocessingDirectiveIntroducer(
+            text.slice(lineBegin, lineEnd)))
       return true;
-    onlyHorizontalWsOnLine = false;
+
+    if (lineEnd == text.size())
+      break;
+    lineBegin = lineEnd + 1;
   }
   return false;
 }
