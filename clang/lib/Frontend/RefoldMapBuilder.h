@@ -29,8 +29,10 @@
 //   - Token spans per item are contiguous half-open intervals [Begin, End).
 //   - Item “cover” is the minimal A interval covering all spans (may be
 //     absent/empty and represented as [-1,-1) downstream).
-//   - All file paths are canonicalized to absolute paths when available; the
-//     TU path is always absolute if the main file entry is present.
+//   - Path fields used as identity keys may be canonicalized internally; JSON
+//     include `resolved_path` is spelling-preserving while EmitAbsPaths remains
+//     false.  If absolute-path emission is enabled in the future, include file
+//     identity and entered-file spelling should be split into distinct fields.
 //
 // This builder is intentionally serialization-agnostic except for the final
 // `writeJSON()` pass.
@@ -324,7 +326,13 @@ struct Item {
       SiteEnd;                 // one-past-end of the directive line (incl. EOL)
   std::string SitePath;        // file path that contains the directive
   std::string TargetAsWritten; // as-written header token ("e.h" or <vector>)
-  std::string ResolvedPath;    // filesystem path actually opened for include
+  // Historical JSON name `resolved_path`.  With the current producer default
+  // EmitAbsPaths == false, this stores the producer-observed entered-file
+  // spelling for the include edge: the spelling Clang exposes through
+  // `__FILE__` inside the included file.  If absolute-path emission is ever
+  // enabled, split physical identity and entered-file spelling into distinct
+  // map fields instead of overloading this one.
+  std::string ResolvedPath;
   bool IsAngled = false;       // <...> vs "..."
   std::optional<uint64_t>
       Parent; // parent include item id, or nullopt if top-level
@@ -488,7 +496,11 @@ class RefoldMapBuilder {
       Cwd; // Captured working directory (for resolving relative spellings)
 
   std::string TUSourcePath;  // TU path spelling (for JSON 'source')
-  bool EmitAbsPaths = false; // If true, emit canonical absolute paths
+  // Keep JSON spelling-preserving by default.  `resolved_path` is therefore a
+  // historical field name for the producer-observed entered-file spelling.
+  // Turning this on would change that contract and should be paired with a
+  // schema split between physical identity and entered-file spelling.
+  bool EmitAbsPaths = false;
   bool EnableByteSpans;      // If true, then serialize the per-token byte spans
 
   /// Map resolved absolute include directories -> original `-I` spellings.

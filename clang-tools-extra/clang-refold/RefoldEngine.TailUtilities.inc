@@ -477,7 +477,8 @@ bool RefoldEngine::IncludeEntryLineDirectiveDischargesLayoutBarrier(
       (!sawOutputLine && sawZeroTokenLineBeforeFirstOutput) ||
       (sawOutputLine && sawZeroTokenLineAfterLastOutput);
 
-  if (needsBarrier && child.resolvedPath) {
+  StringRef childProducerSpelling = producerEnteredFileSpelling(child);
+  if (needsBarrier && !childProducerSpelling.empty()) {
     std::optional<uint64_t> firstChildOutputByte;
     const auto &tokmapByPP = model_.GetTokmapByPP();
     for (const RefoldModel::PPArgSpan::PPSpan &span : child.spans) {
@@ -488,7 +489,7 @@ bool RefoldEngine::IncludeEntryLineDirectiveDischargesLayoutBarrier(
         if (it == tokmapByPP.end())
           continue;
         const RefoldModel::TokMapEntry &tok = it->second;
-        if (!PathsEqual(tok.file, *child.resolvedPath))
+        if (!samePhysicalIncludeFile(tok.file, child))
           continue;
         if (!firstChildOutputByte || tok.b < *firstChildOutputByte)
           firstChildOutputByte = tok.b;
@@ -496,7 +497,8 @@ bool RefoldEngine::IncludeEntryLineDirectiveDischargesLayoutBarrier(
     }
 
     if (firstChildOutputByte &&
-        SourcePrefixHasProducerActiveLineControl(*child.resolvedPath, child.id,
+        SourcePrefixHasProducerActiveLineControl(childProducerSpelling,
+                                                 child.id,
                                                  *firstChildOutputByte)) {
       return false;
     }
@@ -3105,6 +3107,37 @@ void RefoldEngine::MaterializeIncludeExpansion(
     std::string reason;
   };
 
+  struct IncludeReplayCandidate {
+    std::filesystem::path PhysicalPath;
+    std::string EnteredFileSpelling;
+
+    enum class LookupKind {
+      DirectSourceRelative,
+      QuoteSearchDir,
+      AngleSearchDir,
+      IncludeNext,
+      AbsoluteOperand,
+      Unknown
+    };
+
+    LookupKind Kind = LookupKind::Unknown;
+  };
+
+  struct IncludeReplaySearchDir {
+    std::filesystem::path LookupPath;
+    std::string EnteredSpellingPrefix;
+  };
+
+  struct IncludeReplaySurface {
+    std::filesystem::path SourceDirectoryPath;
+    std::string SourceDirectorySpelling;
+  };
+
+  struct RecordedIncludeSearchDirs {
+    SmallVector<IncludeReplaySearchDir, 16> QuoteDirs;
+    SmallVector<IncludeReplaySearchDir, 32> IncludeDirs;
+  };
+
   auto absolutePathInPPCwd = [&](StringRef path) -> std::filesystem::path {
     std::filesystem::path fsPath(path.str());
     if (fsPath.is_absolute())
@@ -3127,33 +3160,66 @@ void RefoldEngine::MaterializeIncludeExpansion(
     return llvm::sys::fs::exists(StringRef(spelling));
   };
 
-  auto sourceDirectoryForReplaySurface = [&]()
-      -> std::optional<std::filesystem::path> {
+  auto sourceDirectorySpellingForFile = [](StringRef fileSpelling) {
+    SmallString<256> source(fileSpelling);
+    llvm::sys::path::remove_filename(source);
+    if (source.empty())
+      return std::string(".");
+    return source.str().str();
+  };
+
+  auto includeReplaySurfaceForFile =
+      [&](StringRef fileSpelling) -> std::optional<IncludeReplaySurface> {
     std::optional<std::filesystem::path> source =
-        canonicalizeForLookupProof(model_.GetSourcePath());
+        canonicalizeForLookupProof(fileSpelling);
     if (!source)
       return std::nullopt;
-    source->remove_filename();
-    return source;
+
+    IncludeReplaySurface surface;
+    surface.SourceDirectoryPath = *source;
+    surface.SourceDirectoryPath.remove_filename();
+    surface.SourceDirectorySpelling =
+        sourceDirectorySpellingForFile(fileSpelling);
+    return surface;
   };
 
-  auto appendSearchDirIfSafe = [&](SmallVectorImpl<std::filesystem::path> &dirs,
-                                   StringRef path) {
+  auto sourceDirectoryForReplaySurface = [&]()
+      -> std::optional<std::filesystem::path> {
+    std::optional<IncludeReplaySurface> surface =
+        includeReplaySurfaceForFile(model_.GetSourcePath());
+    if (!surface)
+      return std::nullopt;
+    return surface->SourceDirectoryPath;
+  };
+
+  auto makeIncludeReplaySearchDir =
+      [&](StringRef path) -> std::optional<IncludeReplaySearchDir> {
     if (path.empty())
-      return;
-    dirs.push_back(absolutePathInPPCwd(path));
+      return std::nullopt;
+
+    std::filesystem::path spelling(path.str());
+    IncludeReplaySearchDir dir;
+    dir.LookupPath = absolutePathInPPCwd(path);
+    dir.EnteredSpellingPrefix = spelling.generic_string();
+    return dir;
   };
 
-  auto recordedQuotedIncludeSearchDirs = [&]() {
-    SmallVector<std::filesystem::path, 16> quoteDirs;
-    SmallVector<std::filesystem::path, 32> includeDirs;
+  auto appendSearchDirIfSafe =
+      [&](SmallVectorImpl<IncludeReplaySearchDir> &dirs, StringRef path) {
+        if (std::optional<IncludeReplaySearchDir> dir =
+                makeIncludeReplaySearchDir(path))
+          dirs.push_back(std::move(*dir));
+      };
+
+  auto computeRecordedIncludeSearchDirs = [&]() {
+    RecordedIncludeSearchDirs dirs;
     ArrayRef<std::string> argv = model_.GetPPArgv();
 
     for (size_t i = 0; i < argv.size(); ++i) {
       StringRef arg(argv[i]);
-      auto consumeJoinedOrSeparate = [&](StringRef joinedPrefix,
-                                         SmallVectorImpl<std::filesystem::path>
-                                             &out) -> bool {
+      auto consumeJoinedOrSeparate =
+          [&](StringRef joinedPrefix,
+              SmallVectorImpl<IncludeReplaySearchDir> &out) -> bool {
         if (arg == joinedPrefix) {
           if (i + 1 < argv.size())
             appendSearchDirIfSafe(out, argv[++i]);
@@ -3166,146 +3232,205 @@ void RefoldEngine::MaterializeIncludeExpansion(
         return false;
       };
 
-      if (consumeJoinedOrSeparate("-iquote", quoteDirs))
+      if (consumeJoinedOrSeparate("-iquote", dirs.QuoteDirs))
         continue;
-      if (consumeJoinedOrSeparate("-I", includeDirs))
+      if (consumeJoinedOrSeparate("-I", dirs.IncludeDirs))
         continue;
       if ((arg == "-isystem" || arg == "-idirafter") && i + 1 < argv.size()) {
-        appendSearchDirIfSafe(includeDirs, argv[++i]);
+        appendSearchDirIfSafe(dirs.IncludeDirs, argv[++i]);
         continue;
       }
       const StringRef isystemPrefix("-isystem");
       const StringRef idirafterPrefix("-idirafter");
       if (arg.starts_with(isystemPrefix) && arg.size() > isystemPrefix.size()) {
-        appendSearchDirIfSafe(includeDirs, arg.drop_front(isystemPrefix.size()));
+        appendSearchDirIfSafe(dirs.IncludeDirs,
+                              arg.drop_front(isystemPrefix.size()));
         continue;
       }
       if (arg.starts_with(idirafterPrefix) &&
           arg.size() > idirafterPrefix.size()) {
-        appendSearchDirIfSafe(includeDirs, arg.drop_front(idirafterPrefix.size()));
+        appendSearchDirIfSafe(dirs.IncludeDirs,
+                              arg.drop_front(idirafterPrefix.size()));
         continue;
       }
     }
 
-    quoteDirs.append(includeDirs.begin(), includeDirs.end());
-    return quoteDirs;
+    return dirs;
   };
 
-  auto resolveQuotedIncludeFromReplaySurface = [&](StringRef operand)
-      -> std::optional<std::filesystem::path> {
-    std::optional<std::filesystem::path> sourceDir =
-        sourceDirectoryForReplaySurface();
-    if (!sourceDir)
-      return std::nullopt;
-
-    std::filesystem::path direct = *sourceDir / operand.str();
-    if (pathExists(direct))
-      return direct;
-
-    for (const std::filesystem::path &dir : recordedQuotedIncludeSearchDirs()) {
-      std::filesystem::path candidate = dir / operand.str();
-      if (pathExists(candidate))
-        return candidate;
-    }
-
-    return std::nullopt;
+  std::optional<RecordedIncludeSearchDirs> recordedIncludeSearchDirsCache;
+  auto recordedIncludeSearchDirs = [&]() -> const RecordedIncludeSearchDirs & {
+    if (!recordedIncludeSearchDirsCache)
+      recordedIncludeSearchDirsCache = computeRecordedIncludeSearchDirs();
+    return *recordedIncludeSearchDirsCache;
   };
 
-  auto synthesizeQuotedIncludeOperandForReplaySurface =
-      [&](const RefoldModel::IncludeItem &child) -> std::optional<std::string> {
-    if (!child.resolvedPath)
-      return std::nullopt;
-
-    std::optional<std::filesystem::path> sourceDir =
-        sourceDirectoryForReplaySurface();
-    std::optional<std::filesystem::path> resolved =
-        canonicalizeForLookupProof(*child.resolvedPath);
-    if (!sourceDir || !resolved)
-      return std::nullopt;
-
-    std::error_code ec;
-    std::filesystem::path relative = std::filesystem::relative(*resolved,
-                                                               *sourceDir, ec);
-    if (ec || relative.empty())
-      return std::nullopt;
-
-    const std::string operand = relative.generic_string();
-    if (!safeRewrittenQuotedIncludeOperand(operand))
-      return std::nullopt;
-
-    SmallString<256> replayPath(sourceDir->generic_string());
-    llvm::sys::path::append(replayPath, operand);
-    StringRef replayPathRef(replayPath.data(), replayPath.size());
-    if (!llvm::sys::fs::exists(replayPathRef) ||
-        !PathsEqual(replayPathRef, *child.resolvedPath))
-      return std::nullopt;
-
-    return operand;
+  auto appendEnteredFileSpelling = [](StringRef prefix, StringRef operand) {
+    SmallString<256> spelling(prefix);
+    llvm::sys::path::append(spelling, operand);
+    return spelling.str().str();
   };
 
-  auto relativeSpellingInPPCwd = [&](const std::filesystem::path &path,
-                                        bool directSourceOperand)
+  auto directSourceRelativeEnteredFileSpelling =
+      [&](const IncludeReplaySurface &surface, StringRef operand)
       -> std::string {
-    // Preserve lexical spelling for __FILE__ proofs.  Canonicalizing here would
-    // erase symlink/alias distinctions that Clang exposes in predefined-file
-    // builtins.  For direct source-relative operands, Clang prefixes a relative
-    // path with "./"; for paths found through -I/-iquote, it uses the search
-    // directory spelling without that synthetic prefix.
-    std::filesystem::path cwd =
-        absolutePathInPPCwd(StringRef(".")).lexically_normal();
-    std::filesystem::path normalized = path.lexically_normal();
-    std::filesystem::path relative = normalized.lexically_relative(cwd);
-    const std::string relativeSpelling = relative.generic_string();
-    if (!relativeSpelling.empty() && relativeSpelling != "." &&
-        relativeSpelling != ".." &&
-        !StringRef(relativeSpelling).starts_with("../")) {
-      return directSourceOperand ? (Twine("./") + relativeSpelling).str()
-                                 : relativeSpelling;
-    }
-
-    return normalized.generic_string();
+    // Direct quoted lookup preserves the including-file directory spelling and
+    // appends the operand spelling; it is not a cwd-relative normalization of
+    // the physical result.  Examples observed from Clang:
+    //   original.c + "headers/child.h" -> "./headers/child.h"
+    //   ./original.c + "headers/child.h" -> "./headers/child.h"
+    //   sub/original.c + "../leaf.h" -> "sub/../leaf.h"
+    //   /abs/original.c + "leaf.h" -> "/abs/leaf.h"
+    return appendEnteredFileSpelling(surface.SourceDirectorySpelling, operand);
   };
 
-  auto replaySurfaceDirectFileSpellingForOperand =
-      [&](StringRef operand) -> std::optional<std::string> {
-    std::optional<std::filesystem::path> sourceDir =
-        sourceDirectoryForReplaySurface();
-    if (!sourceDir)
+  auto computeAbsoluteIncludeReplayCandidate =
+      [&](StringRef operand) -> std::optional<IncludeReplayCandidate> {
+    std::filesystem::path operandPath(operand.str());
+    if (!operandPath.is_absolute())
+      return std::nullopt;
+    if (!pathExists(operandPath))
       return std::nullopt;
 
-    std::filesystem::path replayPath =
-        (*sourceDir / operand.str()).lexically_normal();
-    if (!pathExists(replayPath))
-      return std::nullopt;
-
-    return relativeSpellingInPPCwd(replayPath, /*directSourceOperand=*/true);
+    IncludeReplayCandidate candidate;
+    candidate.PhysicalPath = operandPath.lexically_normal();
+    candidate.EnteredFileSpelling = operandPath.generic_string();
+    candidate.Kind = IncludeReplayCandidate::LookupKind::AbsoluteOperand;
+    return candidate;
   };
 
-  auto replaySurfaceQuotedFileSpellingForOperand =
-      [&](StringRef operand) -> std::optional<std::string> {
-    if (std::optional<std::string> direct =
-            replaySurfaceDirectFileSpellingForOperand(operand))
-      return direct;
+  auto candidateFromSearchDir =
+      [&](const IncludeReplaySearchDir &dir,
+          IncludeReplayCandidate::LookupKind kind, StringRef operand)
+      -> std::optional<IncludeReplayCandidate> {
+    // Check the exact filesystem path Clang would probe before any lexical
+    // cleanup.  Collapsing `missing/../leaf.h` first is unsound: POSIX path
+    // resolution and Clang header lookup must be able to enter every prefix
+    // component before `..` can escape it.
+    std::filesystem::path physical = dir.LookupPath / operand.str();
+    if (!pathExists(physical))
+      return std::nullopt;
 
-    for (const std::filesystem::path &dir : recordedQuotedIncludeSearchDirs()) {
-      std::filesystem::path candidate =
-          (dir / operand.str()).lexically_normal();
-      if (pathExists(candidate))
-        return relativeSpellingInPPCwd(candidate,
-                                      /*directSourceOperand=*/false);
+    IncludeReplayCandidate candidate;
+    candidate.PhysicalPath = physical.lexically_normal();
+    candidate.EnteredFileSpelling =
+        appendEnteredFileSpelling(dir.EnteredSpellingPrefix, operand);
+    candidate.Kind = kind;
+    return candidate;
+  };
+
+  auto computeQuotedIncludeReplayCandidateOnSurface =
+      [&](StringRef operand, const IncludeReplaySurface &surface)
+      -> std::optional<IncludeReplayCandidate> {
+    if (operand.empty())
+      return std::nullopt;
+    if (std::optional<IncludeReplayCandidate> absolute =
+            computeAbsoluteIncludeReplayCandidate(operand))
+      return absolute;
+
+    // As with search-directory lookup, the existence proof must use the exact
+    // path Clang would probe.  Only the physical-path payload may be lexically
+    // cleaned after the lookup succeeds; the entered spelling remains the
+    // source-directory spelling plus the raw operand.
+    std::filesystem::path direct =
+        surface.SourceDirectoryPath / operand.str();
+    if (pathExists(direct)) {
+      IncludeReplayCandidate candidate;
+      candidate.PhysicalPath = direct.lexically_normal();
+      candidate.EnteredFileSpelling =
+          directSourceRelativeEnteredFileSpelling(surface, operand);
+      candidate.Kind = IncludeReplayCandidate::LookupKind::DirectSourceRelative;
+      return candidate;
     }
+
+    const RecordedIncludeSearchDirs &dirs = recordedIncludeSearchDirs();
+    for (const IncludeReplaySearchDir &dir : dirs.QuoteDirs)
+      if (std::optional<IncludeReplayCandidate> candidate =
+              candidateFromSearchDir(
+                  dir, IncludeReplayCandidate::LookupKind::QuoteSearchDir,
+                  operand))
+        return candidate;
+    for (const IncludeReplaySearchDir &dir : dirs.IncludeDirs)
+      if (std::optional<IncludeReplayCandidate> candidate =
+              candidateFromSearchDir(
+                  dir, IncludeReplayCandidate::LookupKind::QuoteSearchDir,
+                  operand))
+        return candidate;
 
     return std::nullopt;
   };
 
-  auto fileSpellingEqualModuloLeadingDotSlash = [](StringRef a,
-                                                   StringRef b) {
-    auto drop = [](StringRef s) {
-      while (s.starts_with("./"))
-        s = s.drop_front(2);
-      return s;
-    };
-    return drop(a) == drop(b);
+  auto computeQuotedIncludeReplayCandidate =
+      [&](StringRef operand) -> std::optional<IncludeReplayCandidate> {
+    std::optional<IncludeReplaySurface> surface =
+        includeReplaySurfaceForFile(model_.GetSourcePath());
+    if (!surface)
+      return std::nullopt;
+    return computeQuotedIncludeReplayCandidateOnSurface(operand, *surface);
+  };
+
+  [[maybe_unused]] auto computeAngledIncludeReplayCandidate =
+      [&](StringRef operand) -> std::optional<IncludeReplayCandidate> {
+    if (operand.empty())
+      return std::nullopt;
+    if (std::optional<IncludeReplayCandidate> absolute =
+            computeAbsoluteIncludeReplayCandidate(operand))
+      return absolute;
+
+    const RecordedIncludeSearchDirs &dirs = recordedIncludeSearchDirs();
+    for (const IncludeReplaySearchDir &dir : dirs.IncludeDirs)
+      if (std::optional<IncludeReplayCandidate> candidate =
+              candidateFromSearchDir(
+                  dir, IncludeReplayCandidate::LookupKind::AngleSearchDir,
+                  operand))
+        return candidate;
+
+    return std::nullopt;
+  };
+
+  auto angledIncludeReplayLookupOperand =
+      [](const RefoldModel::IncludeItem &child) -> std::optional<std::string> {
+    if (!child.angled)
+      return std::nullopt;
+
+    StringRef target = child.target;
+    if (target.size() < 2 || target.front() != '<' || target.back() != '>')
+      return std::nullopt;
+
+    StringRef path = target.drop_front().drop_back();
+    if (path.empty() || path.contains('\\') || path.contains('"'))
+      return std::nullopt;
+    if (!llvm::all_of(path, [](char c) {
+          return isSafeSourceGraphIncludePathChar(c);
+        }))
+      return std::nullopt;
+
+    return path.str();
+  };
+
+  auto computeProducerIncludeReplayCandidate =
+      [&](const RefoldModel::IncludeItem &include)
+      -> std::optional<IncludeReplayCandidate> {
+    if (include.subkind != "#include")
+      return std::nullopt;
+
+    if (include.angled) {
+      std::optional<std::string> operand =
+          angledIncludeReplayLookupOperand(include);
+      if (!operand)
+        return std::nullopt;
+      return computeAngledIncludeReplayCandidate(*operand);
+    }
+
+    std::optional<std::string> operand =
+        quotedIncludeReplayLookupOperand(include);
+    if (!operand)
+      return std::nullopt;
+    std::optional<IncludeReplaySurface> surface =
+        includeReplaySurfaceForFile(include.sitePath);
+    if (!surface)
+      return std::nullopt;
+    return computeQuotedIncludeReplayCandidateOnSurface(*operand, *surface);
   };
 
   auto includeIdIsDescendantOrSelf = [&](uint64_t owner,
@@ -3321,122 +3446,289 @@ void RefoldEngine::MaterializeIncludeExpansion(
     }
   };
 
-  auto includeSubtreeLineStateCanReplayThroughOperand =
-      [&](uint64_t includeId, StringRef operand,
-          bool requireDirectSourceOperand) -> bool {
-    std::optional<std::string> replayFile;
+  struct CleanChildIncludeReplayDemand {
+    bool observesLine = false;
+    bool observesFile = false;
+    bool observesFileName = false;
+    bool observesBaseFile = false;
+    bool observesIncludeLevel = false;
+
+    // Exact producer-observed payloads of preserved file-spelling observers in
+    // this include subtree.  These come from the macro expansion tokens in the
+    // original preprocessed stream, not from IncludeItem::resolvedPath: current
+    // maps may store an absolute physical-ish path in resolvedPath even when
+    // Clang exposed a direct source-relative spelling such as
+    // "./headers/child.h" through __FILE__.
+    SmallVector<std::string, 4> fileSpellingPayloads;
+    SmallVector<std::string, 4> fileNamePayloads;
+
+    // Producer-side entered spelling for the child edge itself, computed by
+    // replaying the original include directive from its producer-recorded
+    // including-file surface.  This is the fallback proof target for file
+    // observers in descendant includes: the child edge must be re-entered with
+    // the same spelling before descendant quoted lookup can be considered
+    // stable, but the descendant's own __FILE__ payload is not itself the
+    // child's entered spelling.
+    std::optional<std::string> producerChildFileSpelling;
+
+    // A preserved file-spelling observer was present, but its exact expansion
+    // payload could not be recovered from the producer token stream.  Include
+    // replay cannot prove that observer family in that case, so the clean child
+    // must fail closed to materialization/line-state repair.
+    bool hasUnprovenFileSpellingObserver = false;
+
+    bool observesFileSpelling() const {
+      return observesFile || observesFileName ||
+             hasUnprovenFileSpellingObserver;
+    }
+
+    bool requiresReplayCandidateProof() const {
+      return observesLine || observesFileSpelling() || observesBaseFile ||
+             observesIncludeLevel;
+    }
+  };
+
+  auto appendUniqueString = [](SmallVectorImpl<std::string> &values,
+                                StringRef value) {
+    if (!llvm::any_of(values, [&](const std::string &existing) {
+          return StringRef(existing) == value;
+        }))
+      values.push_back(value.str());
+  };
+
+  auto decodeObservedFileStringLiteralPayload = [&](StringRef spelling)
+      -> std::optional<std::string> {
+    StringRef rest = spelling.trim();
+    std::optional<std::string> decoded = parseLineControlFilenameLiteral(rest);
+    if (!decoded || !rest.trim().empty())
+      return std::nullopt;
+    return decoded;
+  };
+
+  auto producerObservedFileSpellingPayload =
+      [&](const RefoldModel::MacroInvocation &macro)
+      -> std::optional<std::string> {
+    if (macro.cover.IsValid()) {
+      if (std::optional<std::string> decoded =
+              decodeObservedFileStringLiteralPayload(
+                  SliceASource(macro.cover.begin, macro.cover.end)))
+        return decoded;
+    }
+
+    if (macro.invPPByteBegin && macro.invPPByteEnd &&
+        *macro.invPPByteBegin <= *macro.invPPByteEnd &&
+        *macro.invPPByteEnd <= aSource_.size()) {
+      if (std::optional<std::string> decoded =
+              decodeObservedFileStringLiteralPayload(aSource_.slice(
+                  static_cast<size_t>(*macro.invPPByteBegin),
+                  static_cast<size_t>(*macro.invPPByteEnd))))
+        return decoded;
+    }
+
+    return std::nullopt;
+  };
+
+  auto observableMacroOwnerInIncludeSubtree =
+      [&](const RefoldModel::MacroInvocation &macro, uint64_t includeId)
+      -> std::optional<uint64_t> {
+    const RefoldModel::MacroInvocation *site =
+        LineStateObservableMacroSite(macro);
+    std::optional<uint64_t> owner =
+        site && site->ownerIncludeId ? site->ownerIncludeId
+                                     : macro.ownerIncludeId;
+    if (!owner || !includeIdIsDescendantOrSelf(*owner, includeId))
+      return std::nullopt;
+    if (!LineStateBuiltinInvocationIsPreservedObserver(macro))
+      return std::nullopt;
+    return owner;
+  };
+
+  auto cleanChildIncludeReplayDemand =
+      [&](uint64_t includeId) -> CleanChildIncludeReplayDemand {
+    CleanChildIncludeReplayDemand demand;
+    if (const RefoldModel::IncludeItem *include =
+            model_.GetIncludeById(includeId))
+      if (std::optional<IncludeReplayCandidate> producerCandidate =
+              computeProducerIncludeReplayCandidate(*include))
+        demand.producerChildFileSpelling =
+            std::move(producerCandidate->EnteredFileSpelling);
+
+    const bool lineSensitiveDemandEnabled = lineDirs_.Enabled();
 
     for (const auto &macro : model_.GetMacroInvocations()) {
       const bool observesLine = macro.name == "__LINE__";
       const bool observesFile = macro.name == "__FILE__";
       const bool observesFileName = macro.name == "__FILE_NAME__";
       const bool observesBaseFile = macro.name == "__BASE_FILE__";
+      const bool observesIncludeLevel = macro.name == "__INCLUDE_LEVEL__";
       if (!observesLine && !observesFile && !observesFileName &&
-          !observesBaseFile)
+          !observesBaseFile && !observesIncludeLevel)
         continue;
-      if (!LineStateBuiltinInvocationIsPreservedObserver(macro))
-        continue;
-
-      const RefoldModel::MacroInvocation *site =
-          LineStateObservableMacroSite(macro);
-      std::optional<uint64_t> owner =
-          site && site->ownerIncludeId ? site->ownerIncludeId
-                                       : macro.ownerIncludeId;
-      if (!owner || !includeIdIsDescendantOrSelf(*owner, includeId))
+      std::optional<uint64_t> observableOwner =
+          observableMacroOwnerInIncludeSubtree(macro, includeId);
+      if (!observableOwner)
         continue;
 
-      // __BASE_FILE__ observes the top-level replay file, not the entered
-      // header spelling.  Do not use an include operand rewrite as a proof for
-      // it; the line-state/B-realization machinery must handle that observer.
-      if (observesBaseFile)
-        return false;
+      // In --no-lines mode the final checker intentionally treats
+      // unmodified line-directive-sensitive builtin payloads as ignorable for
+      // __LINE__, __FILE__, and __FILE_NAME__: those payloads may differ when
+      // the final refolded source is validated from a temporary output path
+      // rather than the original source path.  Do not let those observers force
+      // a clean child include rewrite/materialization under the active no-lines
+      // oracle.
+      //
+      // Keep __BASE_FILE__ and __INCLUDE_LEVEL__ as hard demands.
+      // __BASE_FILE__ observes the top-level preprocessing file, not the child
+      // header's entered spelling, so include operand replay cannot prove it;
+      // preserving the child include would make the observer depend on the
+      // checker/output source rather than the producer top-level source.
+      // __INCLUDE_LEVEL__ likewise observes include-stack depth.
+      demand.observesLine |= lineSensitiveDemandEnabled && observesLine;
+      demand.observesFile |= lineSensitiveDemandEnabled && observesFile;
+      demand.observesFileName |= lineSensitiveDemandEnabled && observesFileName;
+      demand.observesBaseFile |= observesBaseFile;
+      demand.observesIncludeLevel |= observesIncludeLevel;
 
-      // Re-entering the same physical header is enough for __LINE__; no lexical
-      // file-spelling proof is needed for line-only subtrees.  File-valued
-      // builtins additionally require the spelling that Clang will expose
-      // through __FILE__/__FILE_NAME__ to match the producer-observed spelling.
-      if (!observesFile && !observesFileName)
-        continue;
-
-      if (!replayFile) {
-        replayFile = requireDirectSourceOperand
-                         ? replaySurfaceDirectFileSpellingForOperand(operand)
-                         : replaySurfaceQuotedFileSpellingForOperand(operand);
-        if (!replayFile)
-          return false;
+      if (lineSensitiveDemandEnabled && (observesFile || observesFileName) &&
+          *observableOwner == includeId) {
+        if (std::optional<std::string> payload =
+                producerObservedFileSpellingPayload(macro)) {
+          if (observesFile)
+            appendUniqueString(demand.fileSpellingPayloads, *payload);
+          if (observesFileName)
+            appendUniqueString(demand.fileNamePayloads, *payload);
+        } else {
+          demand.hasUnprovenFileSpellingObserver = true;
+        }
       }
-      if (observesFile) {
-        if (!site || !site->invFile ||
-            !fileSpellingEqualModuloLeadingDotSlash(*site->invFile,
-                                                    *replayFile))
-          return false;
-      }
-      if (observesFileName) {
-        if (!site || !site->invFile)
-          return false;
-        if (llvm::sys::path::filename(*site->invFile) !=
-            llvm::sys::path::filename(*replayFile))
-          return false;
-      }
+
+      if (demand.observesLine && demand.observesFile &&
+          demand.observesFileName && demand.observesBaseFile &&
+          demand.observesIncludeLevel &&
+          demand.hasUnprovenFileSpellingObserver)
+        break;
     }
 
-    return true;
+    if (((demand.observesFile && demand.fileSpellingPayloads.empty()) ||
+         (demand.observesFileName && demand.fileNamePayloads.empty())) &&
+        !demand.producerChildFileSpelling)
+      demand.hasUnprovenFileSpellingObserver = true;
+
+    return demand;
   };
 
-  auto includeSubtreeHasIncludeLevelSensitiveBuiltin =
-      [&](uint64_t includeId) -> bool {
-    for (const auto &macro : model_.GetMacroInvocations()) {
-      if (macro.name != "__INCLUDE_LEVEL__")
-        continue;
+  struct IncludeReplayProofResult {
+    bool samePhysicalFile = false;
+    bool sameFileSpelling = true;
 
-      // As with line/file builtins, a predefined builtin may be recorded at a
-      // definition-site spelling while the preserved observable use is an
-      // outer caller.  Attribute the observer to the source site that would
-      // remain spelled in the replayed child subtree.
-      const RefoldModel::MacroInvocation *site = &macro;
-      unsigned depth = 0;
-      const unsigned maxDepth =
-          static_cast<unsigned>(model_.GetMacroInvocations().size());
-      while (site->callerMacroId && depth++ < maxDepth) {
-        const RefoldModel::MacroInvocation *caller =
-            FindMacroInvocationById(*site->callerMacroId);
-        if (!caller)
-          break;
-        site = caller;
-      }
-
-      std::optional<uint64_t> owner = site->ownerIncludeId;
-      if (!owner)
-        owner = macro.ownerIncludeId;
-      if (!owner || !includeIdIsDescendantOrSelf(*owner, includeId))
-        continue;
-
-      if (!LineStateBuiltinInvocationIsPreservedObserver(macro))
-        continue;
-
-      return true;
+    bool proves(const CleanChildIncludeReplayDemand &demand) const {
+      return samePhysicalFile &&
+             (!demand.observesFileSpelling() || sameFileSpelling);
     }
+  };
 
-    return false;
+  auto evaluateIncludeReplayCandidate =
+      [&](const IncludeReplayCandidate &candidate,
+          const RefoldModel::IncludeItem &child,
+          const CleanChildIncludeReplayDemand &demand)
+      -> IncludeReplayProofResult {
+    IncludeReplayProofResult result;
+    const std::string physicalPath = candidate.PhysicalPath.generic_string();
+    result.samePhysicalFile = samePhysicalIncludeFile(physicalPath, child);
+    if (demand.observesFileSpelling()) {
+      result.sameFileSpelling = !demand.hasUnprovenFileSpellingObserver;
+
+      for (const std::string &expected : demand.fileSpellingPayloads)
+        result.sameFileSpelling &=
+            StringRef(candidate.EnteredFileSpelling) == StringRef(expected);
+      if (demand.observesFile && demand.fileSpellingPayloads.empty() &&
+          demand.producerChildFileSpelling)
+        result.sameFileSpelling &=
+            StringRef(candidate.EnteredFileSpelling) ==
+            StringRef(*demand.producerChildFileSpelling);
+
+      const std::string candidateFileName =
+          llvm::sys::path::filename(candidate.EnteredFileSpelling).str();
+      for (const std::string &expected : demand.fileNamePayloads)
+        result.sameFileSpelling &=
+            StringRef(candidateFileName) == StringRef(expected);
+      if (demand.observesFileName && demand.fileNamePayloads.empty() &&
+          demand.producerChildFileSpelling) {
+        const std::string producerChildFileName =
+            llvm::sys::path::filename(*demand.producerChildFileSpelling).str();
+        result.sameFileSpelling &= StringRef(candidateFileName) ==
+                                   StringRef(producerChildFileName);
+      }
+    }
+    return result;
+  };
+
+  struct QuotedIncludeRewriteCandidate {
+    std::string operand;
+    IncludeReplayCandidate replay;
+  };
+
+  auto synthesizeQuotedIncludeRewriteForReplaySurface =
+      [&](const RefoldModel::IncludeItem &child)
+      -> std::optional<QuotedIncludeRewriteCandidate> {
+    StringRef producerSpelling = producerEnteredFileSpelling(child);
+    if (producerSpelling.empty())
+      return std::nullopt;
+
+    std::optional<std::filesystem::path> sourceDir =
+        sourceDirectoryForReplaySurface();
+    std::optional<std::filesystem::path> resolved =
+        canonicalizeForLookupProof(producerSpelling);
+    if (!sourceDir || !resolved)
+      return std::nullopt;
+
+    std::error_code ec;
+    std::filesystem::path relative = std::filesystem::relative(*resolved,
+                                                               *sourceDir, ec);
+    if (ec || relative.empty())
+      return std::nullopt;
+
+    QuotedIncludeRewriteCandidate rewrite;
+    rewrite.operand = relative.generic_string();
+    if (!safeRewrittenQuotedIncludeOperand(rewrite.operand))
+      return std::nullopt;
+
+    std::optional<IncludeReplayCandidate> candidate =
+        computeQuotedIncludeReplayCandidate(rewrite.operand);
+    if (!candidate)
+      return std::nullopt;
+
+    rewrite.replay = std::move(*candidate);
+    return rewrite;
   };
 
   auto planCleanChildIncludeReplayFromMaterializedParent =
       [&](const RefoldModel::IncludeItem &child) -> CleanChildIncludeReplayPlan {
     CleanChildIncludeReplayPlan plan;
 
-    // A clean child include may stay spelled as an include directive only when
-    // replaying that exact directive from the materialized parent surface resolves
-    // to the same physical file the producer recorded and the subtree does not
-    // observe include-entry depth.  Materializing a parent header moves the child
-    // include one level outward; even a lookup-stable directive would make a
-    // preserved __INCLUDE_LEVEL__ expansion observe the replay stack rather than
-    // the producer stack.
-    if (!child.parent || !child.resolvedPath)
+    if (!child.parent || producerEnteredFileSpelling(child).empty())
       return plan;
 
-    if (includeSubtreeHasIncludeLevelSensitiveBuiltin(child.id)) {
+    const CleanChildIncludeReplayDemand demand =
+        cleanChildIncludeReplayDemand(child.id);
+
+    // __INCLUDE_LEVEL__ observes include-stack depth.  Physical identity and
+    // entered-file spelling do not prove that a relocated clean child include
+    // has the same stack depth as the producer run, so the child must be
+    // realized through the existing materialization/line-state repair path.
+    if (demand.observesIncludeLevel) {
       plan.action = CleanChildIncludeReplayAction::Materialize;
       plan.reason = "child subtree observes __INCLUDE_LEVEL__ across "
+                    "materialized-parent include relocation";
+      return plan;
+    }
+
+    // __BASE_FILE__ observes the top-level preprocessing file, not the entered
+    // child header.  Include operand replay can prove only the physical child
+    // file and, for __FILE__/__FILE_NAME__, the child entered-file spelling.
+    if (demand.observesBaseFile) {
+      plan.action = CleanChildIncludeReplayAction::Materialize;
+      plan.reason = "child subtree observes __BASE_FILE__ across "
                     "materialized-parent include relocation";
       return plan;
     }
@@ -3455,12 +3747,40 @@ void RefoldEngine::MaterializeIncludeExpansion(
     }
 
     if (child.subkind == "#include" && child.angled) {
-      if (IncludeSubtreeHasLineStateSensitiveBuiltin(child.id)) {
+      if (!demand.requiresReplayCandidateProof())
+        return plan;
+
+      std::optional<std::string> operand =
+          angledIncludeReplayLookupOperand(child);
+      if (!operand) {
         plan.action = CleanChildIncludeReplayAction::Materialize;
-        plan.reason = "angled child include observes line/file state across "
-                      "materialized-parent include relocation";
+        plan.reason = "angled child include operand is not replay-provable "
+                      "from materialized parent surface";
         return plan;
       }
+
+      std::optional<IncludeReplayCandidate> candidate =
+          computeAngledIncludeReplayCandidate(*operand);
+      if (!candidate) {
+        plan.action = CleanChildIncludeReplayAction::Materialize;
+        plan.reason = "angled child include has no replay-surface lookup "
+                      "target";
+        return plan;
+      }
+
+      IncludeReplayProofResult proof =
+          evaluateIncludeReplayCandidate(*candidate, child, demand);
+      if (proof.proves(demand))
+        return plan;
+
+      plan.action = CleanChildIncludeReplayAction::Materialize;
+      if (!proof.samePhysicalFile)
+        plan.reason = "angled child include resolves to a different file at "
+                      "replay surface";
+      else
+        plan.reason = "angled child include resolves to the same physical "
+                      "file but does not prove file-observer spelling "
+                      "stability";
       return plan;
     }
 
@@ -3471,37 +3791,38 @@ void RefoldEngine::MaterializeIncludeExpansion(
       // `#include_next` is defined by the producer's include-search stack.  Once
       // the directive is copied into a materialized parent surface, that stack is
       // gone.  A deterministic ordinary include naming the recorded resolved file
-      // is therefore the only include-preserving repair, provided the child does
-      // not itself observe line/file state through preserved builtins.
+      // is therefore the only include-preserving repair, provided the synthesized
+      // ordinary include proves the observer family demanded by this child.
       mayRewriteUnstableOperand = true;
       reason = "#include_next cannot be replayed from a materialized parent "
                "surface without the original include-next search stack";
     } else {
       std::optional<std::string> childReplayOperand =
           quotedIncludeReplayLookupOperand(child);
-      if (!childReplayOperand)
+      if (!childReplayOperand) {
+        plan.action = CleanChildIncludeReplayAction::Materialize;
+        plan.reason = "quoted child include operand is not replay-provable "
+                      "from materialized parent surface";
         return plan;
+      }
 
-      std::optional<std::filesystem::path> replayResolved =
-          resolveQuotedIncludeFromReplaySurface(*childReplayOperand);
-      if (replayResolved) {
-        const std::string replaySpelling = replayResolved->generic_string();
-        if (PathsEqual(replaySpelling, *child.resolvedPath)) {
-          if (!IncludeSubtreeHasLineStateSensitiveBuiltin(child.id) ||
-              includeSubtreeLineStateCanReplayThroughOperand(
-                  child.id, *childReplayOperand,
-                  /*requireDirectSourceOperand=*/false))
-            return plan;
+      std::optional<IncludeReplayCandidate> replayCandidate =
+          computeQuotedIncludeReplayCandidate(*childReplayOperand);
+      if (replayCandidate) {
+        IncludeReplayProofResult proof =
+            evaluateIncludeReplayCandidate(*replayCandidate, child, demand);
+        if (proof.proves(demand))
+          return plan;
 
-          // Physical-file equality is not enough for a child subtree that
-          // observes presumed file spelling.  The original operand may replay
-          // through a symlinked or aliased search directory and produce a
-          // different __FILE__ token, so try to rewrite to a direct operand that
-          // names the producer-observed spelling before falling back to
-          // materialization.
+        if (proof.samePhysicalFile) {
+          // Physical-file equality is enough for observer-free and line-only
+          // subtrees, but not for preserved __FILE__/__FILE_NAME__ observers.
+          // Try a direct quoted rewrite that names the producer-observed file
+          // spelling; materialize if that exact candidate replay is still not
+          // observationally equivalent.
           mayRewriteUnstableOperand = true;
           reason = "quoted operand resolves to the same physical file but "
-                   "does not prove line/file observer spelling stability";
+                   "does not prove file-observer spelling stability";
         } else {
           // A concrete replay-surface hit for the original quoted operand is a
           // real shadowing conflict.  Rewriting around that shadow would invent
@@ -3517,9 +3838,9 @@ void RefoldEngine::MaterializeIncludeExpansion(
         // header-relative spelling (`leaf.h`), materializing the parent has
         // removed the original including-header directory from quoted lookup.
         // A deterministic TU-surface operand naming the producer-recorded file
-        // is therefore an owner-closed include-preserving repair.  The line/file
-        // observer guard below still rejects this rewrite when the child subtree
-        // observes replay location.
+        // is therefore an owner-closed include-preserving repair.  The rewrite
+        // validation below still requires the exact synthesized candidate replay
+        // to satisfy the physical and file-spelling observer proofs.
         mayRewriteUnstableOperand = true;
         reason = includeOperandHasParentComponent(*childReplayOperand)
                      ? "parent-directory quoted operand has no direct replay "
@@ -3529,32 +3850,30 @@ void RefoldEngine::MaterializeIncludeExpansion(
     }
 
     if (mayRewriteUnstableOperand) {
-      if (std::optional<std::string> rewritten =
-              synthesizeQuotedIncludeOperandForReplaySurface(child)) {
-        const bool subtreeNeedsLineState =
-            IncludeSubtreeHasLineStateSensitiveBuiltin(child.id);
-        const bool lineStateReplaySafe =
-            !subtreeNeedsLineState ||
-            includeSubtreeLineStateCanReplayThroughOperand(
-                child.id, *rewritten,
-                /*requireDirectSourceOperand=*/true);
-        if (lineStateReplaySafe) {
+      if (std::optional<QuotedIncludeRewriteCandidate> rewrite =
+              synthesizeQuotedIncludeRewriteForReplaySurface(child)) {
+        IncludeReplayProofResult proof =
+            evaluateIncludeReplayCandidate(rewrite->replay, child, demand);
+        if (proof.proves(demand)) {
           plan.action = CleanChildIncludeReplayAction::RewriteOperand;
-          plan.rewrittenOperand = std::move(*rewritten);
+          plan.rewrittenOperand = std::move(rewrite->operand);
           plan.reason = std::move(reason);
           return plan;
         }
 
         // Rewriting the include operand can change the presumed file spelling
         // observed inside the child even when it names the same physical file.
-        // Only use the include-preserving rewrite when the synthesized direct
-        // operand is proven to replay every preserved line/file observer with
-        // the producer-observed spelling; otherwise stay owner-closed by
-        // materializing the child text and using line-state repair.
+        // Only use the include-preserving rewrite when the exact synthesized
+        // candidate replay is proven equivalent under the active observer
+        // family; otherwise stay owner-closed by materializing the child text.
         if (!reason.empty())
           reason += "; ";
-        reason += "child subtree observes line/file state not proven stable "
-                  "through rewritten operand";
+        if (!proof.samePhysicalFile)
+          reason += "rewritten operand does not replay the producer physical "
+                    "child file";
+        else
+          reason += "rewritten operand does not prove file-observer spelling "
+                    "stability";
       }
     }
 
@@ -9145,4 +9464,15 @@ bool RefoldEngine::PathsEqual(StringRef a, StringRef b) const {
 
   return canonicalPathCache_.find(a)->getValue() ==
          canonicalPathCache_.find(b)->getValue();
+}
+
+bool RefoldEngine::samePhysicalIncludeFile(
+    StringRef candidatePath, const RefoldModel::IncludeItem &include) const {
+  std::optional<std::filesystem::path> producerPath =
+      producerPhysicalIncludePath(include);
+  if (!producerPath)
+    return candidatePath.empty();
+
+  const std::string producerPathSpelling = producerPath->string();
+  return PathsEqual(candidatePath, producerPathSpelling);
 }

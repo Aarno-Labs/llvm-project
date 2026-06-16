@@ -1011,7 +1011,7 @@ static constexpr const char *RefoldSchema = R"json(
         "resolved_path": {
           "type": "string",
           "minLength": 1,
-          "description": "Filesystem path actually opened for this include as resolved by the preprocessor."
+          "description": "Legacy include-path spelling for this include edge. This may be used as physical-identity proof input after canonicalization, but consumers must prefer preserved __FILE__ / __FILE_NAME__ expansion payloads for filename-observer proofs when those payloads are available."
         },
         "angled": {
           "type": "boolean",

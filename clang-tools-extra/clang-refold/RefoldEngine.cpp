@@ -138,6 +138,46 @@ static bool isSafeSourceGraphIncludePathChar(char c) {
          c == '-' || c == '.' || c == '/';
 }
 
+/// Return the legacy producer include-path spelling for an include edge.
+///
+/// The map field is historically named resolvedPath.  Current maps do not yet
+/// split physical include identity from observed file-spelling state, and some
+/// maps store an absolute path here even when preserved __FILE__ tokens expose
+/// a direct source-relative spelling.  File-observer proofs must therefore
+/// prefer the preserved macro expansion payload when one is available; this
+/// helper remains the schema-level fallback and the physical-proof input.
+static StringRef
+producerEnteredFileSpelling(const RefoldModel::IncludeItem &include) {
+  return include.resolvedPath ? *include.resolvedPath : StringRef();
+}
+
+/// Return the producer-side path spelling that may be used as input to a
+/// physical identity proof.
+///
+/// This helper intentionally starts from producerEnteredFileSpelling() because
+/// current maps do not yet carry a separate canonical/physical include path.
+/// Callers that compare physical identity must canonicalize only in that proof
+/// path, e.g. through RefoldEngine::PathsEqual().
+static std::optional<std::filesystem::path>
+producerPhysicalIncludePath(const RefoldModel::IncludeItem &include) {
+  StringRef spelling = producerEnteredFileSpelling(include);
+  if (spelling.empty())
+    return std::nullopt;
+  return std::filesystem::path(spelling.str());
+}
+
+/// Exact spelling comparison against the legacy include-path spelling.
+///
+/// Do not canonicalize, relativize, strip leading ./, or collapse symlinks here.
+/// Preserved file-observer proofs should prefer recovered macro expansion
+/// payloads; this helper remains available only for schema-level fallback cases
+/// where resolvedPath is the only producer-side spelling evidence.
+[[maybe_unused]] static bool
+sameEnteredFileSpelling(StringRef candidateEnteredFileSpelling,
+                        const RefoldModel::IncludeItem &include) {
+  return candidateEnteredFileSpelling == producerEnteredFileSpelling(include);
+}
+
 /// Return the quoted include operand as a safe relative path for automatic
 /// source-graph side output.
 ///
@@ -175,10 +215,11 @@ safeSourceGraphRelativeIncludePath(const RefoldModel::IncludeItem &inc) {
 }
 
 /// Return a quoted include operand for lookup analysis, allowing parent
-/// directory components.  This helper never authorizes source-graph side-file
-/// creation and never by itself proves preservation safe; it only gives replay
-/// proof code the exact operand that Clang would look up after a clean child
-/// include is moved onto a materialized parent surface.
+/// directory components and absolute operands.  This helper never authorizes
+/// source-graph side-file creation and never by itself proves preservation
+/// safe; it only gives replay proof code the exact operand that Clang would
+/// look up after a clean child include is moved onto a materialized parent
+/// surface.
 static std::optional<std::string>
 quotedIncludeReplayLookupOperand(const RefoldModel::IncludeItem &inc) {
   if (inc.angled)
@@ -189,20 +230,25 @@ quotedIncludeReplayLookupOperand(const RefoldModel::IncludeItem &inc) {
     return std::nullopt;
 
   StringRef path = target.drop_front().drop_back();
-  if (path.empty() || path.contains('\\') || path.contains('"') ||
-      llvm::sys::path::is_absolute(path))
+  if (path.empty() || path.contains('\\') || path.contains('"'))
     return std::nullopt;
-
-  SmallVector<StringRef, 8> components;
-  path.split(components, '/', /*MaxSplit=*/-1, /*KeepEmpty=*/true);
-  for (StringRef component : components)
-    if (component.empty())
-      return std::nullopt;
 
   if (!llvm::all_of(path, [](char c) {
         return isSafeSourceGraphIncludePathChar(c);
       }))
     return std::nullopt;
+
+  SmallVector<StringRef, 8> components;
+  path.split(components, '/', /*MaxSplit=*/-1, /*KeepEmpty=*/true);
+  const bool isAbsolute = llvm::sys::path::is_absolute(path);
+  for (auto indexed : llvm::enumerate(components)) {
+    StringRef component = indexed.value();
+    if (!component.empty())
+      continue;
+    if (isAbsolute && indexed.index() == 0)
+      continue;
+    return std::nullopt;
+  }
 
   return path.str();
 }
@@ -648,12 +694,13 @@ static size_t tokenEndOffsetFromBase(const Token &token, SourceLocation baseLoc)
 
 /// Return the filesystem path used to load an include item.
 ///
-/// Prefer the producer-resolved path when present; otherwise fall back to the
-/// normalized include target spelling. This is deliberately not a policy for
-/// how to re-spell the include in output.
+/// Current maps use resolvedPath as the best available include-path spelling
+/// for loading the header.  This helper is deliberately not a policy for how to
+/// re-spell the include in output or for proving preserved file observers.
 inline std::string resolveHeaderPath(const RefoldModel::IncludeItem &inc) {
-  return (inc.resolvedPath && !inc.resolvedPath->empty())
-             ? inc.resolvedPath->str()
+  StringRef producerSpelling = producerEnteredFileSpelling(inc);
+  return !producerSpelling.empty()
+             ? producerSpelling.str()
              : stringutils::stripHeaderToken(inc.target).str();
 }
 

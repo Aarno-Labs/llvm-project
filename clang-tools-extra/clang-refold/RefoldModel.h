@@ -273,6 +273,27 @@ public:
     uint64_t siteB;
     uint64_t siteE;
     StringRef target; // as-written (e.g. "\"e.h\"" or "<vector>")
+
+    // Historical field name.
+    //
+    // Current producer maps do not split the include edge's physical identity
+    // from the file spelling observed by preserved __FILE__/__FILE_NAME__
+    // macros.  This field is therefore a legacy include-path spelling that may
+    // be the best available physical-identity input, but it is not an
+    // authoritative file-observer proof when the preprocessed token stream
+    // carries an actual preserved file-observer expansion.
+    //
+    // Consumer-side rule:
+    //   * physical identity proofs may canonicalize/realpath this field only
+    //     inside explicit physical-path helpers;
+    //   * file-spelling observer proofs must prefer the preserved macro
+    //     expansion payload recorded in the preprocessed stream, and may use
+    //     this field only as a schema-level fallback when no such observer
+    //     payload exists.
+    //
+    // Do not derive an observed __FILE__ spelling from filesystem
+    // normalization.  Future producer schemas should split this into separate
+    // physical and entered-spelling fields.
     std::optional<StringRef> resolvedPath;
     bool angled;
     std::optional<uint64_t> parent; // parent include id

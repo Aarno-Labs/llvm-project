@@ -10801,6 +10801,17 @@ private:
   /// \returns `true` if canonical paths are equal; `false` otherwise.
   bool PathsEqual(StringRef a, StringRef b) const;
 
+  /// Compare a candidate include replay path against the producer-side include
+  /// edge by physical identity.
+  ///
+  /// This is the only helper that should canonicalize the current map's
+  /// resolvedPath spelling for include replay decisions.  Preserved
+  /// file-spelling observer checks must compare candidate replay spelling
+  /// against the recovered __FILE__/__FILE_NAME__ expansion payload when one is
+  /// available, not against canonicalized filesystem shape.
+  bool samePhysicalIncludeFile(StringRef candidatePath,
+                               const RefoldModel::IncludeItem &include) const;
+
 };
 
 inline RefoldEngine::OwnerStateDelta

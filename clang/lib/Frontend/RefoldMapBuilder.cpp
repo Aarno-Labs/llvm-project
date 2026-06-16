@@ -28,8 +28,10 @@
 //   - Token spans per item are contiguous half-open intervals [Begin, End).
 //   - Item “cover” is the minimal A interval covering all spans (may be
 //     absent/empty and represented as [-1,-1) downstream).
-//   - All file paths are canonicalized to absolute paths when available; the
-//     TU path is always absolute if the main file entry is present.
+//   - Path fields used as identity keys may be canonicalized internally; JSON
+//     include `resolved_path` is spelling-preserving while EmitAbsPaths remains
+//     false.  If absolute-path emission is enabled in the future, include file
+//     identity and entered-file spelling should be split into distinct fields.
 //
 // This builder is intentionally serialization-agnostic except for the final
 // `writeJSON()` pass.
@@ -2300,7 +2302,13 @@ void RefoldMapBuilder::onIncludeDirective(
   }
   It.SitePath = filePathForLocAbs(SM, HashLoc, EmitAbsPaths);
 
-  // Resolved target path, when available
+  // Producer-observed entered-file spelling, when available.  The JSON field
+  // is historically named `resolved_path`, but with EmitAbsPaths == false it is
+  // intentionally the spelling Clang associates with the included file (the
+  // value observed by __FILE__ inside that header), not a canonical identity
+  // path.  Do not add a duplicate entered-file spelling field while this
+  // spelling-preserving contract remains in force; if EmitAbsPaths is ever
+  // enabled, split spelling and physical identity into distinct schema fields.
   if (File) {
     const std::string Abs = absolutePathFor(*File);
 
@@ -2321,7 +2329,11 @@ void RefoldMapBuilder::onIncludeDirective(
       Spelled = std::string(File->getName());
     }
 
-    // JSON should carry spellings by default; abs emission is optional.
+    // JSON carries include file spellings by default.  `resolved_path` is a
+    // historical name: in the default mode it is the producer-observed entered
+    // spelling, not a canonical physical path.  Absolute emission is retained
+    // only as an explicit opt-in and would require a schema split before being
+    // used by clang-refold proofs that care about both identity and spelling.
     It.ResolvedPath = EmitAbsPaths ? Abs : Spelled;
 
     // Seed abs->spelling mapping for later __FILE__/__LINE__-style emission.
