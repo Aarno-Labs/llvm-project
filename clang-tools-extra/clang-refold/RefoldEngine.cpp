@@ -19359,50 +19359,175 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       if (toks.empty())
         return std::nullopt;
 
+      auto isLiteralToken = [&](size_t idx, StringRef spelling) {
+        return idx < toks.size() &&
+               toks[idx].kind ==
+                   RefoldModel::MacroReplacementTokenKind::Literal &&
+               toks[idx].spelling == spelling;
+      };
+
+      auto findMatchingParen = [&](size_t openIdx,
+                                   size_t limit) -> std::optional<size_t> {
+        if (!isLiteralToken(openIdx, "("))
+          return std::nullopt;
+        unsigned depth = 1;
+        for (size_t i = openIdx + 1; i < limit; ++i) {
+          if (toks[i].kind != RefoldModel::MacroReplacementTokenKind::Literal)
+            continue;
+          if (toks[i].spelling == "(") {
+            ++depth;
+            continue;
+          }
+          if (toks[i].spelling != ")")
+            continue;
+          if (--depth == 0)
+            return i;
+        }
+        return std::nullopt;
+      };
+
+      auto collectTopLevelArgRanges =
+          [&](size_t openIdx, size_t closeIdx,
+              SmallVectorImpl<std::pair<size_t, size_t>> &out) {
+        if (openIdx >= closeIdx)
+          return false;
+        size_t argBegin = openIdx + 1;
+        unsigned argDepth = 0;
+        for (size_t i = openIdx + 1; i <= closeIdx; ++i) {
+          const bool atEnd = i == closeIdx;
+          if (!atEnd) {
+            const auto &tok = toks[i];
+            if (tok.kind == RefoldModel::MacroReplacementTokenKind::Literal) {
+              if (tok.spelling == "(") {
+                ++argDepth;
+              } else if (tok.spelling == ")") {
+                if (argDepth == 0)
+                  return false;
+                --argDepth;
+              }
+            }
+          }
+
+          if (atEnd ||
+              (argDepth == 0 &&
+               toks[i].kind == RefoldModel::MacroReplacementTokenKind::Literal &&
+               toks[i].spelling == ",")) {
+            if (argBegin == i)
+              return false;
+            out.push_back({argBegin, i});
+            argBegin = i + 1;
+          }
+        }
+        return !out.empty();
+      };
+
+      // Resolve the replacement-list expression that supplies the generated
+      // callee to the current macro formal that owns the callee spelling.  The
+      // direct case is the usual `F(...)` shape.  The selector case covers a
+      // producer-proven, deterministic function-like selector such as
+      // `SELECT(F)(x)`, where `SELECT(f)` replays to exactly one of its formals.
+      // This is still a structural proof over replacement-list tokens: the
+      // selector macro must be function-like, arity-compatible, and its whole
+      // replacement list must be the selected formal.  No text-keyed guessing is
+      // used to decide which root argument owns the generated callee.
+      std::function<std::optional<uint32_t>(size_t, size_t, unsigned)>
+          resolveCalleeParamInRange =
+              [&](size_t begin, size_t end,
+                  unsigned depth) -> std::optional<uint32_t> {
+        if (begin >= end || end > toks.size() ||
+            depth > model_.GetMacroDirectives().size())
+          return std::nullopt;
+
+        if (end == begin + 1 &&
+            toks[begin].kind ==
+                RefoldModel::MacroReplacementTokenKind::ParamRef &&
+            toks[begin].paramIndex &&
+            *toks[begin].paramIndex < definition.defParams.size())
+          return *toks[begin].paramIndex;
+
+        if (begin + 3 > end ||
+            toks[begin].kind !=
+                RefoldModel::MacroReplacementTokenKind::Literal ||
+            !isLiteralToken(begin + 1, "("))
+          return std::nullopt;
+
+        auto selectorClose = findMatchingParen(begin + 1, end);
+        if (!selectorClose || *selectorClose + 1 != end)
+          return std::nullopt;
+
+        const RefoldModel::MacroDirective *selectorDefinition =
+            resolveFunctionLikeThroughAliases(StringRef(toks[begin].spelling));
+        if (!selectorDefinition || selectorDefinition->defParams.empty())
+          return std::nullopt;
+
+        SmallVector<std::pair<size_t, size_t>, 8> selectorArgs;
+        if (!collectTopLevelArgRanges(begin + 1, *selectorClose, selectorArgs) ||
+            !definitionAcceptsActualCount(*selectorDefinition,
+                                          selectorArgs.size()))
+          return std::nullopt;
+
+        // A generated-callee selector is deterministic only when the selector's
+        // replacement tape is exactly one non-variadic formal.  Richer selector
+        // expressions can be added later as their own replay proof, but they do
+        // not belong in this single-owner callee-slot inversion.
+        if (selectorDefinition->replacementTokens.size() != 1)
+          return std::nullopt;
+        const RefoldModel::MacroReplacementToken &selected =
+            selectorDefinition->replacementTokens.front();
+        if (selected.kind != RefoldModel::MacroReplacementTokenKind::ParamRef ||
+            !selected.paramIndex ||
+            *selected.paramIndex >= selectorDefinition->defParams.size() ||
+            selectorDefinition->defParams[*selected.paramIndex].variadic ||
+            *selected.paramIndex >= selectorArgs.size())
+          return std::nullopt;
+
+        const auto selectedArg = selectorArgs[*selected.paramIndex];
+        return resolveCalleeParamInRange(selectedArg.first, selectedArg.second,
+                                         depth + 1);
+      };
+
       bool found = false;
       size_t callBegin = toks.size();
       size_t callOpen = toks.size();
       size_t callClose = toks.size();
       uint32_t calleeParamIdx = 0;
-      for (size_t i = 0; i + 1 < toks.size(); ++i) {
-        const auto &calleeTok = toks[i];
-        const auto &openTok = toks[i + 1];
-        if (calleeTok.kind != RefoldModel::MacroReplacementTokenKind::ParamRef ||
-            !calleeTok.paramIndex ||
-            openTok.kind != RefoldModel::MacroReplacementTokenKind::Literal ||
-            openTok.spelling != "(")
+
+      for (size_t open = 1; open < toks.size(); ++open) {
+        if (!isLiteralToken(open, "("))
           continue;
 
-        unsigned depth = 1;
-        size_t close = i + 2;
-        for (; close < toks.size(); ++close) {
-          const auto &tok = toks[close];
-          if (tok.kind != RefoldModel::MacroReplacementTokenKind::Literal)
-            continue;
-          if (tok.spelling == "(") {
-            ++depth;
-            continue;
-          }
-          if (tok.spelling == ")") {
-            if (--depth == 0)
-              break;
-          }
-        }
-        if (depth != 0 || close >= toks.size())
+        auto close = findMatchingParen(open, toks.size());
+        if (!close)
           return std::nullopt;
+
+        std::optional<size_t> matchedBegin;
+        std::optional<uint32_t> matchedParam;
+        for (size_t begin = 0; begin < open; ++begin) {
+          auto resolved = resolveCalleeParamInRange(begin, open, 0);
+          if (!resolved)
+            continue;
+          if (matchedBegin)
+            return std::nullopt;
+          matchedBegin = begin;
+          matchedParam = *resolved;
+        }
+        if (!matchedBegin)
+          continue;
+
         if (found)
           return std::nullopt;
         found = true;
-        callBegin = i;
-        callOpen = i + 1;
-        callClose = close;
-        calleeParamIdx = *calleeTok.paramIndex;
+        callBegin = *matchedBegin;
+        callOpen = open;
+        callClose = *close;
+        calleeParamIdx = *matchedParam;
         // Nested generated calls inside this call's arguments are argument
         // expressions, not competing owner calls.  Skip the body after recording
         // the outer call so shapes such as `H(G(X))` remain one generated call
         // whose first actual is the expression `G(X)`.
-        i = close;
+        open = *close;
       }
+
       if (!found || calleeParamIdx >= definition.defParams.size())
         return std::nullopt;
 
@@ -19426,34 +19551,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
                                  shape.suffixLiterals))
         return std::nullopt;
 
-      size_t argBegin = callOpen + 1;
-      unsigned argDepth = 0;
-      for (size_t i = callOpen + 1; i <= callClose; ++i) {
-        const bool atEnd = i == callClose;
-        if (!atEnd) {
-          const auto &tok = toks[i];
-          if (tok.kind == RefoldModel::MacroReplacementTokenKind::Literal) {
-            if (tok.spelling == "(") {
-              ++argDepth;
-            } else if (tok.spelling == ")") {
-              if (argDepth == 0)
-                return std::nullopt;
-              --argDepth;
-            }
-          }
-        }
-
-        if (atEnd ||
-            (argDepth == 0 &&
-             toks[i].kind == RefoldModel::MacroReplacementTokenKind::Literal &&
-             toks[i].spelling == ",")) {
-          if (argBegin == i)
-            return std::nullopt;
-          shape.argTokenRanges.push_back({argBegin, i});
-          argBegin = i + 1;
-        }
-      }
-      if (shape.argTokenRanges.empty())
+      if (!collectTopLevelArgRanges(callOpen, callClose, shape.argTokenRanges))
         return std::nullopt;
       return shape;
     };
