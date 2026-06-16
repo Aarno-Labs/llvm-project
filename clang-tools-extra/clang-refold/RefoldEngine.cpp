@@ -1962,6 +1962,7 @@ RefoldEngine::Refold(const json::Object &rootJson, StringRef aSource,
                      ArrayRef<PPTok> aToks, ArrayRef<size_t> aTokOff,
                      StringRef bSource, ArrayRef<PPTok> bToks,
                      ArrayRef<size_t> bTokOff, bool noLines, bool strict,
+                     RefoldEngine::ProofAuditMode proofAuditMode,
                      ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
                      std::vector<MaterializedEditMapping>
                          *materializedEditMappings,
@@ -1975,7 +1976,7 @@ RefoldEngine::Refold(const json::Object &rootJson, StringRef aSource,
 
   // Construct an engine and run the instance pipeline.
   RefoldEngine engine(std::move(*mOrErr), aSource, aToks, aTokOff, bSource,
-                      bToks, bTokOff, noLines, strict,
+                      bToks, bTokOff, noLines, strict, proofAuditMode,
                       sidebandPragmaEdits, materializedEditMappings,
                       std::move(finalLineControlValidationCallback),
                       sourceGraphOutputs);
@@ -17503,7 +17504,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     for (const ScoredSolution &scored : validSolutions)
       equivalenceClasses[scored.equivalenceKey].push_back(&scored);
 
-    if (IsWitnessTraceEnabled()) {
+    if (ShouldEmitProofLog()) {
       TraceWitnessAmbiguity("MacroActualDefinitionTapeReplay",
                             solutions.size(), validSolutions.size(),
                             equivalenceClasses.size());
@@ -17519,7 +17520,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         (!hasVariadicFormal && !hasVaOpt) || equivalenceClasses.size() == 1;
     if (definitionTapeEquivalenceAuthoritative &&
         equivalenceClasses.size() != 1) {
-      if (IsWitnessTraceEnabled()) {
+      if (ShouldEmitProofLog()) {
         RefoldWitness witness;
         witness.family = WitnessProofFamily::DefinitionTapeReplay;
         witness.owner = llvm::formatv("macro#{0}", m.id).str();
@@ -24417,8 +24418,8 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
             if (auto owned = GetOwnedPureInsertionBRangeForArgSpan(
                     s, standardArgSpans, *bEnv, hk)) {
               hunkEffects.push_back(
-                  formatv("owned {0} -> [{1},{2}) '{3}'", hk.ToString(),
-                          owned->first, owned->second,
+                  formatv("owned {0} -> [{1},{2}) '{3}'", hk, owned->first,
+                          owned->second,
                           stringutils::showWsWithClip(
                               SliceBSource(owned->first, owned->second), 80))
                       .str());
@@ -24433,7 +24434,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
 
             if (touches && hk.bStart < hk.bEnd) {
               hunkEffects.push_back(
-                  formatv("overlap {0} -> [{1},{2}) '{3}'", hk.ToString(),
+                  formatv("overlap {0} -> [{1},{2}) '{3}'", hk,
                           (uint64_t)hk.bStart, (uint64_t)hk.bEnd,
                           stringutils::showWsWithClip(
                               SliceBSource(hk.bStart, hk.bEnd), 80))
@@ -24444,8 +24445,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
               // This hunk did not contribute to the B envelope for this
               // occurrence; keep it in the diagnostic output so missing/extra
               // hunk effects are visible when debugging tuple-forward failures.
-              hunkEffects.push_back(
-                  formatv("ignored {0}", hk.ToString()).str());
+              hunkEffects.push_back(formatv("ignored {0}", hk).str());
             }
           }
 
@@ -27516,56 +27516,26 @@ RefoldEngine::RefoldWitness RefoldEngine::BuildRefoldWitness(
   return witness;
 }
 
-bool RefoldEngine::IsWitnessTraceEnabled() const {
-  // The witness stream is an explicit proof-audit channel.  It must be silent
-  // during normal refolding, and it must not require the generic --log-level
-  // flag when the audit environment variable is set.  Cache the environment
-  // lookup so hot candidate paths do not repeatedly query process state.
-  static const bool enabled = [] {
-    const char *raw = std::getenv("CLANG_REFOLD_TRACE_WITNESSES");
-    if (raw == nullptr)
-      return false;
-
-    StringRef value(raw);
-    return !(value.empty() || value == "0" ||
-             value.equals_insensitive("false") ||
-             value.equals_insensitive("off") ||
-             value.equals_insensitive("no"));
-  }();
-  return enabled;
-}
-
-
 RefoldEngine::WitnessResolverMode
 RefoldEngine::GetWitnessResolverMode() const {
-  // Phase 11 adds the resolver behind an explicit mode flag.  Leaving the
-  // variable unset, false-like, or unrecognized preserves legacy behavior.
-  // `probe` computes and traces resolver agreement without authority.  `strict`
-  // is authoritative only when ResolveWitnessesForSelection() proves that the
-  // current candidate set is implemented by complete single-class witnesses.
-  static const WitnessResolverMode mode = [] {
-    const char *raw = std::getenv("CLANG_REFOLD_WITNESS_RESOLVER");
-    if (raw == nullptr)
-      return WitnessResolverMode::Off;
+  if (strict_)
+    return WitnessResolverMode::Strict;
 
-    StringRef value(raw);
-    if (value.empty() || value == "0" ||
-        value.equals_insensitive("false") ||
-        value.equals_insensitive("off") ||
-        value.equals_insensitive("no"))
-      return WitnessResolverMode::Off;
-
-    if (value.equals_insensitive("probe") || value == "1" ||
-        value.equals_insensitive("true") ||
-        value.equals_insensitive("yes"))
-      return WitnessResolverMode::Probe;
-
-    if (value.equals_insensitive("strict"))
-      return WitnessResolverMode::Strict;
-
+  switch (proofAuditMode_) {
+  case ProofAuditMode::Default:
+  case ProofAuditMode::Off:
     return WitnessResolverMode::Off;
-  }();
-  return mode;
+  case ProofAuditMode::Probe:
+    return WitnessResolverMode::Probe;
+  case ProofAuditMode::Strict:
+    return WitnessResolverMode::Strict;
+  }
+
+  return WitnessResolverMode::Off;
+}
+
+bool RefoldEngine::ShouldEmitProofLog() const {
+  return GetWitnessResolverMode() != WitnessResolverMode::Off;
 }
 
 static std::string formatOptionalIndex(std::optional<size_t> index) {
@@ -27595,6 +27565,14 @@ static std::string formatWitnessClosureAtom(StringRef value) {
     out += hex;
   }
   return out;
+}
+
+template <typename FormatObject>
+static void LogProofLine(const FormatObject &line) {
+  std::string text = line.str();
+  while (!text.empty() && text.back() == '\n')
+    text.pop_back();
+  info("proof", "{0}", text);
 }
 
 RefoldEngine::WitnessFallbackClass
@@ -28039,24 +28017,24 @@ RefoldEngine::ClassifyStrictDomainForTerminalFallback(
 
 void RefoldEngine::TraceWitnessStrictDomain(
     llvm::StringRef role, const WitnessStrictDomainDecision &decision) const {
-  if (!IsWitnessTraceEnabled() && GetWitnessResolverMode() == WitnessResolverMode::Off)
+  if (!ShouldEmitProofLog() && GetWitnessResolverMode() == WitnessResolverMode::Off)
     return;
 
-  errs() << llvm::formatv(
+  LogProofLine(llvm::formatv(
       "REFOLD-WITNESS-DOMAIN role={0} domain={1} obligation={2} "
       "fallback_class={3} reason={4}\n",
       role, toString(decision.domainClass), toString(decision.obligation),
       toString(decision.fallbackClass),
-      decision.reason.empty() ? StringRef("<none>") : StringRef(decision.reason));
+      decision.reason.empty() ? StringRef("<none>") : StringRef(decision.reason)));
 }
 
 void RefoldEngine::TraceWitnessClosureLedger(
     const WitnessResolverDecision &decision) const {
-  if (!IsWitnessTraceEnabled() && decision.mode == WitnessResolverMode::Off)
+  if (!ShouldEmitProofLog() && decision.mode == WitnessResolverMode::Off)
     return;
 
   for (const WitnessClosureLedgerEntry &entry : decision.closureLedger) {
-    errs() << llvm::formatv(
+    LogProofLine(llvm::formatv(
         "REFOLD-WITNESS-CLOSURE selector={0} family={1} "
         "test_region={2} missing={3} source_family={4} "
         "candidate_kind={5} theorem={6} witness_id={7} "
@@ -28090,16 +28068,14 @@ void RefoldEngine::TraceWitnessClosureLedger(
         decision.composition.incompatibleTupleCount,
         formatWitnessClosureAtom(decision.composition.reason.empty()
                                      ? StringRef("<none>")
-                                     : StringRef(decision.composition.reason)));
+                                     : StringRef(decision.composition.reason))));
   }
 }
 
 void RefoldEngine::TraceWitnessResolverDecision(
     const WitnessResolverDecision &decision) const {
-  // Resolver mode is itself an audit request.  The detailed witness stream still
-  // requires CLANG_REFOLD_TRACE_WITNESSES, but probe/strict mode must always
-  // report the central agreement decision it computed.
-  if (!IsWitnessTraceEnabled() && decision.mode == WitnessResolverMode::Off)
+  // Probe and strict modes use the normal proof log as their audit channel.
+  if (!ShouldEmitProofLog() && decision.mode == WitnessResolverMode::Off)
     return;
 
   StringRef authority = "legacy";
@@ -28114,7 +28090,7 @@ void RefoldEngine::TraceWitnessResolverDecision(
   else if (decision.mode == WitnessResolverMode::Strict)
     authority = "strict-fallback-legacy";
 
-  errs() << llvm::formatv(
+  LogProofLine(llvm::formatv(
       "REFOLD-WITNESS-RESOLVER role={0} mode={1} candidates={2} "
       "selectable={3} proof_invalid={4} classes={5} complete={6} "
       "incomplete={7} converted={8} unconverted={9} computed={10} "
@@ -28149,7 +28125,7 @@ void RefoldEngine::TraceWitnessResolverDecision(
       decision.composition.incompleteTupleCount,
       decision.composition.incompatibleTupleCount,
       decision.composition.reason.empty() ? StringRef("<none>")
-                                          : StringRef(decision.composition.reason));
+                                          : StringRef(decision.composition.reason)));
 
   TraceWitnessStrictDomain(decision.role, decision.strictDomain);
   TraceWitnessClosureLedger(decision);
@@ -28157,10 +28133,10 @@ void RefoldEngine::TraceWitnessResolverDecision(
 
 void RefoldEngine::TraceWitnessCompositionDecision(
     llvm::StringRef role, const WitnessCompositionDecision &decision) const {
-  if (!IsWitnessTraceEnabled() && GetWitnessResolverMode() == WitnessResolverMode::Off)
+  if (!ShouldEmitProofLog() && GetWitnessResolverMode() == WitnessResolverMode::Off)
     return;
 
-  errs() << llvm::formatv(
+  LogProofLine(llvm::formatv(
       "REFOLD-WITNESS-COMPOSITION role={0} computed={1} tuples={2} "
       "complete={3} incomplete={4} incompatible={5} classes={6} "
       "compatible={7} fatal={8} reason={9}\n",
@@ -28169,7 +28145,7 @@ void RefoldEngine::TraceWitnessCompositionDecision(
       decision.incompatibleTupleCount, decision.globalClassCount,
       decision.compatible ? 1 : 0, decision.failureIsFatal ? 1 : 0,
       decision.reason.empty() ? StringRef("<none>")
-                              : StringRef(decision.reason));
+                              : StringRef(decision.reason)));
 }
 
 RefoldEngine::WitnessCompositionDecision
@@ -28221,7 +28197,7 @@ RefoldEngine::ResolveWitnessComposition(
         key.targetPPTokens.value, key.suffixState.value,
         key.preservedObservers.value, key.counterState.value,
         toString(key.boundaryClass), toString(key.diagnosticClass),
-        toString(key.compositionClass), key.producerKinds.ToString())
+        toString(key.compositionClass), key.producerKinds)
         .str();
     ++globalClasses[classKey];
   }
@@ -28262,7 +28238,7 @@ RefoldEngine::ResolveWitnessesForSelection(
   decision.legacyIndex = legacyIndex;
 
   const bool shouldCompute =
-      IsWitnessTraceEnabled() || decision.mode != WitnessResolverMode::Off;
+      ShouldEmitProofLog() || decision.mode != WitnessResolverMode::Off;
   if (!shouldCompute)
     return decision;
 
@@ -28557,43 +28533,43 @@ RefoldEngine::ResolveWitnessesForSelection(
 }
 
 void RefoldEngine::TraceWitnessEmitted(const RefoldWitness &witness) const {
-  if (!IsWitnessTraceEnabled())
+  if (!ShouldEmitProofLog())
     return;
 
-  errs() << llvm::formatv("REFOLD-WITNESS {0}\n", witness.ToString());
-  errs() << llvm::formatv("REFOLD-WITNESS-KEY id={0} {1}\n",
-                          witness.witnessId, witness.key.ToString());
-  errs() << llvm::formatv("REFOLD-WITNESS-COST id={0} {1}\n",
-                          witness.witnessId, witness.cost.ToString());
+  LogProofLine(llvm::formatv("REFOLD-WITNESS {0}\n", witness));
+  LogProofLine(llvm::formatv("REFOLD-WITNESS-KEY id={0} {1}\n",
+                             witness.witnessId, witness.key));
+  LogProofLine(llvm::formatv("REFOLD-WITNESS-COST id={0} {1}\n",
+                             witness.witnessId, witness.cost));
   if (!witness.payloadPreview.empty())
-    errs() << llvm::formatv("REFOLD-WITNESS-PAYLOAD id={0} text={1}\n",
-                            witness.witnessId, witness.payloadPreview);
+    LogProofLine(llvm::formatv("REFOLD-WITNESS-PAYLOAD id={0} text={1}\n",
+                            witness.witnessId, witness.payloadPreview));
 }
 
 void RefoldEngine::TraceWitnessRejected(const RefoldWitness &witness,
                                         WitnessRejectReason reason,
                                         llvm::StringRef detail) const {
-  if (!IsWitnessTraceEnabled())
+  if (!ShouldEmitProofLog())
     return;
 
-  errs() << llvm::formatv("REFOLD-WITNESS-REJECT id={0} family={1} "
+  LogProofLine(llvm::formatv("REFOLD-WITNESS-REJECT id={0} family={1} "
                           "owner={2} reason={3} detail={4}\n",
                           witness.witnessId, witness.family, witness.owner,
                           reason, detail.empty() ? StringRef("<none>")
-                                                 : detail);
+                                                 : detail));
 }
 
 void RefoldEngine::TraceWitnessAmbiguity(llvm::StringRef role,
                                          uint64_t candidateCount,
                                          uint64_t selectableCount,
                                          uint64_t ambiguityClassCount) const {
-  if (!IsWitnessTraceEnabled())
+  if (!ShouldEmitProofLog())
     return;
 
-  errs() << llvm::formatv("REFOLD-WITNESS-AMBIGUITY role={0} "
+  LogProofLine(llvm::formatv("REFOLD-WITNESS-AMBIGUITY role={0} "
                           "candidates={1} selectable={2} classes={3}\n",
                           role, candidateCount, selectableCount,
-                          ambiguityClassCount);
+                          ambiguityClassCount));
 }
 
 void RefoldEngine::TraceWitnessSelectionProbe(
@@ -28601,7 +28577,7 @@ void RefoldEngine::TraceWitnessSelectionProbe(
     uint64_t proofValidCount, uint64_t proofInvalidCount,
     uint64_t equivalenceClassCount, uint64_t completeWitnessCount,
     uint64_t incompleteWitnessCount) const {
-  if (!IsWitnessTraceEnabled())
+  if (!ShouldEmitProofLog())
     return;
 
   StringRef preferenceScope = "no-valid-witness";
@@ -28612,29 +28588,29 @@ void RefoldEngine::TraceWitnessSelectionProbe(
   else if (proofValidCount > 1 && equivalenceClassCount > 1)
     preferenceScope = "multiple-equivalence-classes";
 
-  errs() << llvm::formatv(
+  LogProofLine(llvm::formatv(
       "REFOLD-WITNESS-SELECTION role={0} candidates={1} "
       "proof_valid={2} proof_invalid={3} classes={4} "
       "complete={5} incomplete={6} preference_scope={7}\n",
       role, candidateCount, proofValidCount, proofInvalidCount,
       equivalenceClassCount, completeWitnessCount, incompleteWitnessCount,
-      preferenceScope);
+      preferenceScope));
 }
 
 void RefoldEngine::TraceWitnessChosen(const RefoldWitness &witness,
                                       uint64_t selectedIndex) const {
-  if (!IsWitnessTraceEnabled())
+  if (!ShouldEmitProofLog())
     return;
 
-  errs() << llvm::formatv("REFOLD-WITNESS-CHOOSE index={0} id={1} "
+  LogProofLine(llvm::formatv("REFOLD-WITNESS-CHOOSE index={0} id={1} "
                           "family={2} owner={3} cost={4}\n",
                           selectedIndex, witness.witnessId, witness.family,
-                          witness.owner, witness.cost.ToString());
+                          witness.owner, witness.cost));
 }
 
 void RefoldEngine::TraceWitnessFallback(
     const TerminalFallbackRequest &request) const {
-  if (!IsWitnessTraceEnabled())
+  if (!ShouldEmitProofLog())
     return;
 
   const WitnessFallbackClass fallbackClass =
@@ -28642,7 +28618,7 @@ void RefoldEngine::TraceWitnessFallback(
   const WitnessStrictDomainDecision domain =
       ClassifyStrictDomainForTerminalFallback(request.failure);
 
-  errs() << llvm::formatv("REFOLD-WITNESS-FALLBACK reason={0} "
+  LogProofLine(llvm::formatv("REFOLD-WITNESS-FALLBACK reason={0} "
                           "fallback_class={1} domain={2} obligation={3} "
                           "domain_reason={4} phase={5} detail={6}\n",
                           toString(request.failure),
@@ -28652,7 +28628,7 @@ void RefoldEngine::TraceWitnessFallback(
                           domain.reason.empty() ? StringRef("<none>")
                                                 : StringRef(domain.reason),
                           request.phase,
-                          stringutils::showWsWithClip(request.detail, 200));
+                          stringutils::showWsWithClip(request.detail, 200)));
   TraceWitnessStrictDomain("TerminalFallback", domain);
 
   if (domain.domainClass ==
@@ -28698,7 +28674,7 @@ void RefoldEngine::TraceWitnessFallback(
       break;
     }
 
-    errs() << llvm::formatv(
+    LogProofLine(llvm::formatv(
         "REFOLD-WITNESS-CLOSURE selector=TerminalFallback "
         "family={0} test_region=terminal missing={1} "
         "source_family=TerminalFallback candidate_kind=TerminalOutOfDomain "
@@ -28716,7 +28692,7 @@ void RefoldEngine::TraceWitnessFallback(
                                                        : StringRef(domain.reason)),
         formatWitnessClosureAtom(toString(request.failure)),
         formatWitnessClosureAtom(request.phase.empty() ? StringRef("<none>")
-                                                       : StringRef(request.phase)));
+                                                       : StringRef(request.phase))));
   }
 }
 
@@ -29928,7 +29904,7 @@ RefoldEngine::SelectPreferredMacroSelectionCandidate(
   // Preserve the Phase-2 selector-only diagnostic trace that is not part of
   // the generic resolver validity predicate: a nested selector candidate may
   // be useful for ranking but still lack an emission-normalized carrier.
-  if (IsWitnessTraceEnabled()) {
+  if (ShouldEmitProofLog()) {
     for (size_t i = 0; i < candidates.size(); ++i) {
       if (!isSelectable(i) || !candidates[i].selectorOnly ||
           candidates[i].emittedCandidate)

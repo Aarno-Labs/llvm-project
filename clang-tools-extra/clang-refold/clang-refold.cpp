@@ -3661,13 +3661,19 @@ static cl::alias NoLinesShort("n", cl::desc("Alias for --no-lines"),
 
 static cl::opt<bool> StrictMode(
     "strict",
-    cl::desc("Treat stringified arguments to be significant (off by default)"),
+    cl::desc("Enable strict refolding and authoritative proof audit"),
     cl::init(false), cl::cat(RefoldCategory));
 
 // Short alias: -s (points to --strict)
 static cl::alias StrictModeShort("s", cl::desc("Alias for --strict"),
                                  cl::aliasopt(StrictMode),
                                  cl::cat(RefoldCategory));
+
+static cl::opt<std::string> ProofAuditModeOpt(
+    "proof-audit",
+    cl::desc("Proof-audit mode: off, probe, or strict. Defaults to strict "
+             "with --strict and off otherwise."),
+    cl::value_desc("mode"), cl::init(""), cl::cat(RefoldCategory));
 
 static constexpr char Overview[] = R"(
   Deterministically reconstruct partially expanded C source from edited
@@ -3713,6 +3719,30 @@ int main(int argc, char **argv) {
   // the error message would otherwise be misleading, stating that the option
   // must be specified at least once, which is not the case here.
   const bool onlyCheck = (CheckSrcPath.getNumOccurrences() != 0);
+
+  auto parseProofAuditMode = []() -> RefoldEngine::ProofAuditMode {
+    if (ProofAuditModeOpt.getNumOccurrences() == 0)
+      return RefoldEngine::ProofAuditMode::Default;
+
+    StringRef value(ProofAuditModeOpt.getValue());
+    if (value.equals_insensitive("off"))
+      return RefoldEngine::ProofAuditMode::Off;
+    if (value.equals_insensitive("probe"))
+      return RefoldEngine::ProofAuditMode::Probe;
+    if (value.equals_insensitive("strict"))
+      return RefoldEngine::ProofAuditMode::Strict;
+
+    fatal("options", "invalid --proof-audit value: {0} "
+                     "(expected off, probe, or strict)",
+          ProofAuditModeOpt);
+    return RefoldEngine::ProofAuditMode::Default;
+  };
+
+  RefoldEngine::ProofAuditMode proofAuditMode = parseProofAuditMode();
+  if (StrictMode &&
+      proofAuditMode != RefoldEngine::ProofAuditMode::Default &&
+      proofAuditMode != RefoldEngine::ProofAuditMode::Strict)
+    fatal("options", "--strict requires --proof-audit=strict");
 
   // Enforce exactly one supported invocation mode:
   //   (1) Refold:
@@ -3900,7 +3930,7 @@ int main(int argc, char **argv) {
   std::vector<SourceGraphOutput> sourceGraphOutputs;
   auto refoldedOrErr = RefoldEngine::Refold(
       rootJson, aBytes, aToks, aTokByteOff, bBytes, bToks, bTokByteOff,
-      NoLines, StrictMode, sidebandPragmaEdits,
+      NoLines, StrictMode, proofAuditMode, sidebandPragmaEdits,
       emitEditMap ? &materializedEditMappings : nullptr,
       buildFinalLineControlValidationCallback(ModifiedSrcPath, ctx),
       &sourceGraphOutputs);

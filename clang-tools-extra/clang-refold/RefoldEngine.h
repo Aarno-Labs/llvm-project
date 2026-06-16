@@ -600,6 +600,18 @@ public:
     }
   };
 
+  /// Proof-audit mode for the witness resolver.
+  ///
+  /// Default derives from normal refolding mode: strict refolding enables
+  /// authoritative proof audit, while non-strict refolding leaves the resolver
+  /// off unless the caller explicitly requests probe or strict audit.
+  enum class ProofAuditMode : uint8_t {
+    Default,
+    Off,
+    Probe,
+    Strict
+  };
+
   /// \brief Perform the end-to-end refolding process for a translation unit.
   ///
   /// This method takes the original preprocessed text *A* (e.g. `test.c.i`),
@@ -640,6 +652,7 @@ public:
   Refold(const json::Object &rootJson, StringRef aSource, ArrayRef<PPTok> aToks,
          ArrayRef<size_t> aTokOff, StringRef bSource, ArrayRef<PPTok> bToks,
          ArrayRef<size_t> bTokOff, bool noLines, bool strict,
+         ProofAuditMode proofAuditMode = ProofAuditMode::Default,
          ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits = {},
          std::vector<MaterializedEditMapping> *materializedEditMappings =
              nullptr,
@@ -657,6 +670,7 @@ private:
   ArrayRef<size_t> aTokOff_, bTokOff_;
   LineDirectiveInserter lineDirs_;
   bool strict_;
+  ProofAuditMode proofAuditMode_;
   LangOptions lexLang_;
   std::vector<MaterializedEditMapping> *materializedEditMappings_ = nullptr;
   std::vector<SourceGraphOutput> *sourceGraphOutputs_ = nullptr;
@@ -1904,13 +1918,11 @@ private:
 
   /// \brief Probe/strict decision from the central witness resolver.
   ///
-  /// The resolver is introduced behind CLANG_REFOLD_WITNESS_RESOLVER.  In
-  /// `off` mode this structure is only used by the trace layer.  In `probe`
-  /// mode it reports whether the legacy selector agrees with the canonical
-  /// single-class witness choice.  In `strict` mode it is authoritative only
-  /// when every selectable witness comes from a converted proof family, has a
-  /// complete equivalence key, and the surviving source-repair classes are
-  /// equivalent under the resolver policy.
+  /// In `off` mode the resolver is not run for ordinary non-strict refolding.
+  /// In `probe` mode it computes and logs agreement without authority.  In
+  /// `strict` mode it is authoritative only when every selectable witness comes
+  /// from a converted proof family, has a complete equivalence key, and the
+  /// surviving source-repair classes are equivalent under the resolver policy.
   struct WitnessResolverDecision {
     std::string role;
     WitnessResolverMode mode = WitnessResolverMode::Off;
@@ -2654,7 +2666,8 @@ private:
   RefoldEngine(RefoldModel model, StringRef aSource, ArrayRef<PPTok> aToks,
                ArrayRef<size_t> aTokOff, StringRef bSource,
                ArrayRef<PPTok> bToks, ArrayRef<size_t> bTokOff, bool noLines,
-               bool strict, ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
+               bool strict, ProofAuditMode proofAuditMode,
+               ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
                std::vector<MaterializedEditMapping> *materializedEditMappings =
                    nullptr,
                FinalLineControlValidationCallback finalLineControlValidationCallback =
@@ -2663,6 +2676,7 @@ private:
       : model_(std::move(model)), aSource_(aSource), bSource_(bSource),
         aToks_(aToks), bToks_(bToks), aTokOff_(aTokOff), bTokOff_(bTokOff),
         lineDirs_(!noLines, model_.GetPPCwd()), strict_(strict),
+        proofAuditMode_(proofAuditMode),
         lexLang_(MakeLexLangOptions(model_.GetPPLang())),
         materializedEditMappings_(materializedEditMappings),
         sourceGraphOutputs_(sourceGraphOutputs),
@@ -7020,27 +7034,18 @@ private:
                                    llvm::StringRef role,
                                    uint64_t witnessId = 0) const;
 
-  /// Return true when witness traces are explicitly requested.
-  ///
-  /// Witness traces are intentionally controlled by a dedicated environment
-  /// variable rather than by the generic log level: Phase-0 witness logging is
-  /// an audit stream, not normal refolding diagnostics.  Leaving the variable
-  /// unset must make the scaffold completely silent.
-  bool IsWitnessTraceEnabled() const;
-
-  /// Return the requested global witness resolver mode.
-  ///
-  /// CLANG_REFOLD_WITNESS_RESOLVER is intentionally independent from
-  /// CLANG_REFOLD_TRACE_WITNESSES: probe/strict mode may compute resolver
-  /// decisions even when the trace stream is disabled, while trace mode may
-  /// still report selector classes with the resolver logically off.
+  /// Return the effective proof-audit resolver mode for this run.
   WitnessResolverMode GetWitnessResolverMode() const;
 
-  /// Trace helpers for the global witness-resolution migration.
+  /// Return true when proof-audit records should be emitted through the normal
+  /// logging channel.
+  bool ShouldEmitProofLog() const;
+
+  /// Trace helpers for the global witness-resolution proof audit.
   ///
-  /// These helpers are deliberately side-effect-free except for trace logging.
-  /// They must not participate in candidate admissibility, ordering, or output
-  /// construction during Phase 0.
+  /// These helpers are deliberately side-effect-free except for structured
+  /// proof logging.  They must not participate in candidate admissibility,
+  /// ordering, or output construction.
   void TraceWitnessEmitted(const RefoldWitness &witness) const;
   void TraceWitnessRejected(const RefoldWitness &witness,
                             WitnessRejectReason reason,
