@@ -2741,8 +2741,13 @@ private:
   RecoverMacroDefinitionReplacementListInterval(
       const RefoldModel::MacroInvocation &invocation) const;
 
-  // Macro invocation graph (derived from RefoldModel) used for structural
-  // queries over recorded callerMacroId relationships.
+  // Macro invocation indices derived once from the immutable RefoldModel.
+  // Pointers remain stable because the model-owned invocation vector is never
+  // mutated after engine construction. The id index preserves the
+  // historical first-match behavior of FindMacroInvocationById() even if
+  // malformed input were to contain duplicate ids.
+  DenseMap<uint64_t, const RefoldModel::MacroInvocation *>
+      macroInvocationById_;
   DenseMap<uint64_t, SmallVector<const RefoldModel::MacroInvocation *, 4>>
       macroChildrenById_;
 
@@ -2775,11 +2780,21 @@ private:
   // Build derived macro indices once per run.
   // Note: pointers into model_.GetMacroInvocations() remain stable.
   void BuildMacroInvocationGraph() {
+    macroInvocationById_.clear();
     macroChildrenById_.clear();
-    for (const auto &mi : model_.GetMacroInvocations()) {
-      if (mi.callerMacroId) {
+
+    ArrayRef<RefoldModel::MacroInvocation> macroInvocations =
+        model_.GetMacroInvocations();
+    macroInvocationById_.reserve(macroInvocations.size());
+
+    for (const auto &mi : macroInvocations) {
+      // Preserve the old linear scan's first-match behavior for malformed
+      // producer maps with duplicate invocation ids while making valid-model
+      // lookups constant-time.
+      macroInvocationById_.insert(std::make_pair(mi.id, &mi));
+
+      if (mi.callerMacroId)
         macroChildrenById_[*mi.callerMacroId].push_back(&mi);
-      }
     }
   }
 
@@ -9876,19 +9891,18 @@ private:
   ///
   /// The refold metadata stores each macro invocation with a unique id and may
   /// reference that id from nested invocations, patches, and statistics logic.
-  /// This helper performs a linear scan over the recorded invocation list and
-  /// returns the matching metadata node when present.
+  /// This helper resolves the id through the engine-level invocation index
+  /// built from the immutable model during construction.
   ///
   /// \param macroId Model-assigned macro invocation id to resolve.
   /// \returns The matching \c MacroInvocation, or \c nullptr if the id is not
   ///          present in the loaded model.
   const RefoldModel::MacroInvocation *
   FindMacroInvocationById(uint64_t macroId) const {
-    for (const auto &mi : model_.GetMacroInvocations()) {
-      if (mi.id == macroId)
-        return &mi;
-    }
-    return nullptr;
+    auto it = macroInvocationById_.find(macroId);
+    if (it == macroInvocationById_.end())
+      return nullptr;
+    return it->second;
   }
 
   /// \brief Return the top-level macro invocation that owns \p macroId.
