@@ -2025,26 +2025,29 @@ void RefoldEngine::ReportNoLegacyAuditFinding(
           ? std::string()
           : stringutils::showWsWithClip(evidence.detail, 240);
 
-  llvm::errs() << "[clang-refold:no-legacy-audit] kind="
-               << toString(definition.kind) << " role=" << role
-               << " definition=\"" << definition.definition << "\""
-               << " required-closure=\"" << definition.requiredClosure << "\"";
-  if (!clippedDetail.empty())
-    llvm::errs() << " detail=\"" << clippedDetail << "\"";
-  llvm::errs() << '\n';
+  if (clippedDetail.empty()) {
+    warn("no-legacy-audit",
+         "kind={0} role={1} definition=\"{2}\" required-closure=\"{3}\"",
+         definition.kind, role, definition.definition,
+         definition.requiredClosure);
+  } else {
+    warn("no-legacy-audit",
+         "kind={0} role={1} definition=\"{2}\" required-closure=\"{3}\" "
+         "detail=\"{4}\"",
+         definition.kind, role, definition.definition,
+         definition.requiredClosure, clippedDetail);
+  }
 
   // No-legacy findings are theorem state whenever the strict/theorem guard is
-  // active.  Record the first finding here so every audit site shares one
-  // policy and cannot accidentally remain a stderr-only diagnostic.
-  if (IsNoLegacyAuditEnabled()) {
-    NoteTheoremAuditViolation(
-        llvm::formatv("strict/theorem no-legacy audit reported finding: "
-                      "kind={0} role={1} detail={2}",
-                      definition.kind, role,
-                      clippedDetail.empty() ? StringRef("<none>")
-                                            : StringRef(clippedDetail))
-            .str());
-  }
+  // active. Record the finding here so every audit site shares one policy and
+  // cannot accidentally remain a diagnostic-only report.
+  NoteTheoremAuditViolation(
+      llvm::formatv("strict/theorem no-legacy audit reported finding: "
+                    "kind={0} role={1} detail={2}",
+                    definition.kind, role,
+                    clippedDetail.empty() ? StringRef("<none>")
+                                          : StringRef(clippedDetail))
+          .str());
 }
 
 /// Record that the current run escaped the declared proof domain.
@@ -2130,7 +2133,7 @@ void RefoldEngine::RequestTerminalFallback(
   terminalFallbackRequests_.push_back(request);
 
   TraceWitnessFallback(request);
-  debug("fallback", "REQUEST terminal fallback: {0}", request);
+  debug("fallback", "{0}", request);
 }
 
 void RefoldEngine::EnforceTheoremAuditInvariants() const {
@@ -3740,7 +3743,9 @@ std::string RefoldEngine::RunSinglePassRefold() {
 
   StringRef tuPath = model_.GetSourcePath();
 
-  info("plan", "REFOLD START tuPath={0} aLen={1} bLen={2} aToks={3} bToks={4}",
+  info("plan",
+       "starting refold: tu={0} ppBytes={1} ppModBytes={2} ppTokens={3} "
+       "ppModTokens={4}",
        tuPath, aSource_.size(), bSource_.size(), aToks_.size(), bToks_.size());
 
   abTokHunks_.clear();
@@ -3819,9 +3824,11 @@ std::string RefoldEngine::RunSinglePassRefold() {
   }
 
 
-  info("plan", "TU={0} includes={1} macroInvocations={2} tokmap={3}", tuPath,
-       model_.GetIncludes().size(), model_.GetMacroInvocations().size(),
-       model_.GetTokmapByPP().size());
+  debug("plan",
+        "refold model loaded: tu={0} includes={1} macroInvocations={2} "
+        "ppTokenMapEntries={3}",
+        tuPath, model_.GetIncludes().size(),
+        model_.GetMacroInvocations().size(), model_.GetTokmapByPP().size());
 
   // 3) Diff hunks (changed A-token intervals -> B-token intervals).
   auto hunks = diffutils::hunksFromMap(a2b, aSeq.size(), bSeq.size());
@@ -5260,6 +5267,26 @@ std::string RefoldEngine::RunSinglePassRefold() {
   // Refresh the token-level hunk cache after normalization.
   abTokHunks_ = hunks;
 
+  if (inDebugMode()) {
+    size_t insertOnlyHunks = 0;
+    size_t deleteOnlyHunks = 0;
+    size_t replaceHunks = 0;
+    for (const auto &h : hunks) {
+      if (h.isInsertOnly()) {
+        ++insertOnlyHunks;
+      } else if (h.bStart >= h.bEnd) {
+        ++deleteOnlyHunks;
+      } else {
+        ++replaceHunks;
+      }
+    }
+    debug("diff",
+          "token diff normalized: hunks={0} replacements={1} insertions={2} "
+          "deletions={3} mixedOwnerWitnesses={4}",
+          hunks.size(), replaceHunks, insertOnlyHunks, deleteOnlyHunks,
+          mixedOwnerTilingWitnesses_.size());
+  }
+
   // Build provenance for token-level pure insertions (B-only hunks) and
   // pre-claim standalone insertions before macro patching so whole-cover
   // replacements can deterministically avoid double-emitting insertion
@@ -5267,8 +5294,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
   BuildBInsertionProvenance(hunks);
   PreclaimStandaloneInsertions(tuPath, hunks);
 
-  // DIAGNOSTICS: Output each hunk, when in debug mode, and also perform some
-  // input sanitization.
+  // Validate B-token envelopes for every hunk. In trace mode, also show the
+  // exact B-side fragment that later owner/macro/include proofs must explain.
   for (size_t i = 0; i < hunks.size(); ++i) {
     const auto &h = hunks[i];
 
@@ -5311,8 +5338,13 @@ std::string RefoldEngine::RunSinglePassRefold() {
 
     StringRef bfrag = bSource_.substr(lo, hi - lo);
 
-    // Happy Path: Log the successfully extracted fragment
-    std::string shown = stringutils::showWsWithClip(bfrag, 160);
+    if (inTraceMode()) {
+      trace("diff/hunk",
+            "hunk #{0}: aTokens=[{1},{2}) bTokens=[{3},{4}) "
+            "bBytes=[{5},{6}) bText=\"{7}\"",
+            i, h.aStart, h.aEnd, h.bStart, h.bEnd, lo, hi,
+            stringutils::showWsWithClip(bfrag, 160));
+    }
   }
 
   // 4) Classify hunks and collect per-target edits.
@@ -8254,8 +8286,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
 
   if (undefLivenessHazards != 0) {
     info("macro/liveness",
-         "preserved {0} consumed #undef directive(s) needed by surviving "
-         "macro-state observations",
+         "preserved {0} consumed #undef directive(s) to keep suffix macro "
+         "state equivalent after source replacement",
          undefLivenessHazards);
   }
 
@@ -9103,6 +9135,21 @@ std::string RefoldEngine::RunSinglePassRefold() {
       }
       tuEdits.push_back(std::move(edit));
     }
+  }
+
+  if (inDebugMode()) {
+    size_t tuMacroPatchCount = 0;
+    if (auto it = macroPatchesByOwner.find(std::nullopt);
+        it != macroPatchesByOwner.end())
+      tuMacroPatchCount = it->second.size();
+    size_t includePatchCount = 0;
+    for (const auto &entry : perInclude)
+      includePatchCount += entry.second.patches.size();
+    debug("emit",
+          "emission plan: tuEdits={0} tuMacroPatches={1} "
+          "includePatchBuckets={2} includePatches={3} materializedIncludes={4}",
+          tuEdits.size(), tuMacroPatchCount, perInclude.size(),
+          includePatchCount, includeExpansion.size());
   }
 
   // Apply TU edits in descending order of start offset.
@@ -37070,25 +37117,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                     .str();
             return cert;
           }
-
-#if 0
-          {
-            // Keep bridge diagnostics deterministic and readable. The bridge
-            // result becomes the next hop's `curFormals`.
-            std::string bridgedDesc;
-            raw_string_ostream os(bridgedDesc);
-            os << "{";
-            bool first = true;
-            for (const auto &KV : *bridged) {
-              if (!first)
-                os << ", ";
-              first = false;
-              os << KV.first << ":'" << KV.second.oldText << "'->'"
-                 << KV.second.newText << "'";
-            }
-            os << "}";
-          }
-#endif
 
           // After a lexical bridge, every produced parent formal is marked as
           // bridge-derived. Later structured hops may propagate that provenance

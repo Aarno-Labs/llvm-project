@@ -1141,6 +1141,44 @@ private:
              !bTokenBegin && !bTokenEnd;
     }
 
+    std::string ToString() const {
+      if (Empty())
+        return "<empty>";
+
+      std::string text;
+      llvm::raw_string_ostream os(text);
+      bool first = true;
+      auto add = [&](StringRef key, const auto &value) {
+        if (!first)
+          os << ",";
+        first = false;
+        os << key << "=" << value;
+      };
+
+      if (owner)
+        add("owner", *owner);
+      if (hunk)
+        add("hunk", *hunk);
+      if (stateComponent)
+        add("state", *stateComponent);
+      if (sourcePath)
+        add("source", *sourcePath);
+      if (sourceBegin || sourceEnd)
+        add("sourceBytes",
+            llvm::formatv("[{0},{1})", sourceBegin.value_or(0),
+                          sourceEnd.value_or(0)));
+      if (aTokenBegin || aTokenEnd)
+        add("aTokens",
+            llvm::formatv("[{0},{1})", aTokenBegin.value_or(0),
+                          aTokenEnd.value_or(0)));
+      if (bTokenBegin || bTokenEnd)
+        add("bTokens",
+            llvm::formatv("[{0},{1})", bTokenBegin.value_or(0),
+                          bTokenEnd.value_or(0)));
+      os.flush();
+      return text;
+    }
+
   };
 
   /// \brief Normalized proof failure attached to terminal fallback.
@@ -1154,9 +1192,9 @@ private:
     TerminalFallbackFailureContext context;
 
     std::string ToString() const {
-      return llvm::formatv("failedObligation={0} theoremFailure={1} "
-                           "failureReason={2}",
-                           obligation, theoremFailure, reason)
+      return llvm::formatv("obligation={0} theoremFailure={1} reason={2} "
+                           "context={3}",
+                           obligation, theoremFailure, reason, context)
           .str();
     }
   };
@@ -1248,8 +1286,14 @@ private:
     std::string detail;
 
     std::string ToString() const {
-      return llvm::formatv("{0} terminalAction=raw-b-emission stage={1}: {2}",
-                           failure, stage, detail)
+      return llvm::formatv(
+                 "terminal fallback requested: action=raw-b-emission "
+                 "obligation={0} reason={1} context={2} theoremFailure={3} "
+                 "stage={4} detail={5}",
+                 failure.obligation, failure.reason, failure.context,
+                 failure.theoremFailure,
+                 stage.empty() ? StringRef("<unspecified>") : StringRef(stage),
+                 detail.empty() ? StringRef("<none>") : StringRef(detail))
           .str();
     }
   };
@@ -2291,96 +2335,132 @@ private:
       llvm::ArrayRef<std::pair<uint64_t, uint64_t>> stagedSourceIntervals)
       const;
 
-  /// Emit a compact theorem-audit summary for the current run.
+  /// Emit a readable theorem-audit summary for the current run.
   ///
-  /// The counters summarize the declared-domain statement above rather than an
-  /// independent ad hoc checklist: every emitted non-terminal carrier must be
-  /// declared, discharged, lattice-selected, and in-domain; any transitional
-  /// theorem-facing carrier or unresolved selector competition is a violation;
-  /// and named terminal exclusions remain the only acceptable out-of-domain
-  /// escape.
+  /// The first line answers the operational question: did the emitted result
+  /// satisfy the strict theorem audit?  Follow-up debug lines group the dense
+  /// counters by proof obligation so a failure can be read without decoding one
+  /// very long ledger row.
   void EmitTheoremAudit() const {
-    info(
-        "theorem",
-        "satisfied={0} emittedEdits={1} carriers={2} declared={3} "
-        "discharged={4} "
-        "selectorOnlyExceptions={5} transitional={6} undischarged={7} "
-        "unknownClass={8} outOfDomain={9} "
-        "composite={10} equivalentComposite={11} orderedComposite={12} "
-        "uncomposedComposite={13} "
-        "selectorCompetitions={14} selectorResolutions={15} "
-        "selectorNoSelectable={16} selectorUnresolved={17} "
-        "selectorDirectBypasses={18} explicitTerminalExclusions={19} "
-        "nonExplicitTerminalExclusions={20} terminalFailures={21} "
-        "terminalSecondaryFailures={22} terminalFailureAuditViolations={23} "
-        "graphNodes={24} zeroTokenStateNodes={25} graphObservedComponents={26} "
-        "graphMutatedComponents={27} graphIncomparableNodes={28} "
-        "graphMissingProducerFacts={29} directStateChecks={30} "
-        "directStateDeltaFacts={31} directStateGraphEdges={32} "
-        "directStateGatewayWitnesses={33} directStateTerminalFailures={34} "
-        "directStateUnclosed={35} resolverAudits={36} "
-        "resolverDeclared={37} resolverExplicitOutOfDomain={38} "
-        "resolverAmbiguous={39} resolverMissingProof={40} "
-        "resolverUnknownDomain={41} strictResolverAuthority={42} "
-        "strictLegacyFallback={43} strictFailClosed={44} "
-        "strictInvalidFailClosed={45} declaredIncompleteKeys={46} "
-        "declaredIncompatibleComposition={47} declaredUnconverted={48} "
-        "closureLedgerRows={49}",
-        lastTheoremAudit_.theoremSatisfied ? 1 : 0,
-        lastTheoremAudit_.emittedNonTerminalEdits,
-        lastTheoremAudit_.emittedCarriers,
-        lastTheoremAudit_.emittedDeclaredClassCarriers,
-        lastTheoremAudit_.emittedDischargedCarriers,
-        lastTheoremAudit_.emittedSelectorOnlyExceptionCarriers,
-        lastTheoremAudit_.emittedTransitionalTheoremCarriers,
-        lastTheoremAudit_.emittedUndischargedCarriers,
-        lastTheoremAudit_.emittedUnknownClassCarriers,
-        lastTheoremAudit_.emittedOutOfDomainCarriers,
-        lastTheoremAudit_.emittedCompositeEdits,
-        lastTheoremAudit_.emittedEquivalentCompositeEdits,
-        lastTheoremAudit_.emittedOrderedCompositeEdits,
-        lastTheoremAudit_.emittedUncomposedCompositeEdits,
-        lastTheoremAudit_.selectorCompetitions,
-        lastTheoremAudit_.selectorResolutions,
-        lastTheoremAudit_.selectorNoSelectable,
-        lastTheoremAudit_.selectorUnresolvedCompetitions,
-        lastTheoremAudit_.selectorDirectBypasses,
-        lastTheoremAudit_.explicitTerminalExclusions,
-        lastTheoremAudit_.nonExplicitTerminalExclusions,
-        lastTheoremAudit_.terminalFailureObligations,
-        lastTheoremAudit_.terminalSecondaryFailureObligations,
-        lastTheoremAudit_.terminalFailureAuditViolations,
-        lastTheoremAudit_.graphOwnerNodes,
-        lastTheoremAudit_.graphZeroTokenStateNodes,
-        lastTheoremAudit_.graphObservedStateComponents,
-        lastTheoremAudit_.graphMutatedStateComponents,
-        lastTheoremAudit_.graphIncomparableNodes,
-        lastTheoremAudit_.graphMissingProducerFacts,
-        lastTheoremAudit_.directStateChecksAudited,
-        lastTheoremAudit_.directStateChecksDeltaFacts,
-        lastTheoremAudit_.directStateChecksGraphEdges,
-        lastTheoremAudit_.directStateChecksGatewayWitnesses,
-        lastTheoremAudit_.directStateChecksTerminalFailures,
-        lastTheoremAudit_.directStateChecksUnclosedLocal,
-        lastTheoremAudit_.resolverDomainAudits,
-        lastTheoremAudit_.resolverDeclaredInDomain,
-        lastTheoremAudit_.resolverExplicitOutOfDomain,
-        lastTheoremAudit_.resolverAmbiguousOutOfDomain,
-        lastTheoremAudit_.resolverPotentiallyMissingProof,
-        lastTheoremAudit_.resolverUnknownDomain,
-        lastTheoremAudit_.resolverStrictResolverAuthority,
-        lastTheoremAudit_.resolverStrictLegacyFallback,
-        lastTheoremAudit_.resolverStrictFailClosed,
-        lastTheoremAudit_.resolverStrictInvalidFailClosed,
-        lastTheoremAudit_.resolverDeclaredIncompleteKeys,
-        lastTheoremAudit_.resolverDeclaredIncompatibleComposition,
-        lastTheoremAudit_.resolverDeclaredUnconvertedWitnesses,
-        lastTheoremAudit_.resolverClosureLedgerRows);
-    if (!lastTheoremAudit_.theoremSatisfied &&
-        !lastTheoremAudit_.firstViolation.empty()) {
-      info("theorem", "firstViolation={0}",
-           stringutils::showWsWithClip(lastTheoremAudit_.firstViolation, 220));
+    const bool satisfied = lastTheoremAudit_.theoremSatisfied;
+    const uint64_t unresolvedSelectorWork =
+        lastTheoremAudit_.selectorNoSelectable +
+        lastTheoremAudit_.selectorUnresolvedCompetitions;
+    const uint64_t invalidCarrierCount =
+        lastTheoremAudit_.emittedSelectorOnlyExceptionCarriers +
+        lastTheoremAudit_.emittedTransitionalTheoremCarriers +
+        lastTheoremAudit_.emittedUndischargedCarriers +
+        lastTheoremAudit_.emittedUnknownClassCarriers +
+        lastTheoremAudit_.emittedOutOfDomainCarriers;
+    const uint64_t resolverOpenObligations =
+        lastTheoremAudit_.resolverPotentiallyMissingProof +
+        lastTheoremAudit_.resolverUnknownDomain +
+        lastTheoremAudit_.resolverDeclaredIncompleteKeys +
+        lastTheoremAudit_.resolverDeclaredIncompatibleComposition +
+        lastTheoremAudit_.resolverDeclaredUnconvertedWitnesses;
+    const uint64_t terminalAuditProblems =
+        lastTheoremAudit_.nonExplicitTerminalExclusions +
+        lastTheoremAudit_.terminalFailureAuditViolations;
+
+    if (satisfied) {
+      info("theorem",
+           "audit passed: emittedEdits={0} carriers={1} resolverAudits={2} "
+           "terminalFailures={3} closureLedgerRows={4}",
+           lastTheoremAudit_.emittedNonTerminalEdits,
+           lastTheoremAudit_.emittedCarriers,
+           lastTheoremAudit_.resolverDomainAudits,
+           lastTheoremAudit_.terminalFailureObligations,
+           lastTheoremAudit_.resolverClosureLedgerRows);
+    } else {
+      warn("theorem",
+           "audit failed: invalidCarriers={0} unresolvedSelectors={1} "
+           "resolverOpenObligations={2} terminalAuditProblems={3} "
+           "closureLedgerRows={4}",
+           invalidCarrierCount, unresolvedSelectorWork,
+           resolverOpenObligations, terminalAuditProblems,
+           lastTheoremAudit_.resolverClosureLedgerRows);
+      if (!lastTheoremAudit_.firstViolation.empty()) {
+        warn("theorem",
+             "first theorem-audit violation: {0}",
+             stringutils::showWsWithClip(lastTheoremAudit_.firstViolation,
+                                         220));
+      }
     }
+
+    debug("theorem/carriers",
+          "emitted carriers: total={0} declared={1} discharged={2} "
+          "selectorOnly={3} transitional={4} undischarged={5} "
+          "unknownClass={6} outOfDomain={7}",
+          lastTheoremAudit_.emittedCarriers,
+          lastTheoremAudit_.emittedDeclaredClassCarriers,
+          lastTheoremAudit_.emittedDischargedCarriers,
+          lastTheoremAudit_.emittedSelectorOnlyExceptionCarriers,
+          lastTheoremAudit_.emittedTransitionalTheoremCarriers,
+          lastTheoremAudit_.emittedUndischargedCarriers,
+          lastTheoremAudit_.emittedUnknownClassCarriers,
+          lastTheoremAudit_.emittedOutOfDomainCarriers);
+    debug("theorem/composition",
+          "composite edits: total={0} equivalent={1} ordered={2} "
+          "uncomposed={3}",
+          lastTheoremAudit_.emittedCompositeEdits,
+          lastTheoremAudit_.emittedEquivalentCompositeEdits,
+          lastTheoremAudit_.emittedOrderedCompositeEdits,
+          lastTheoremAudit_.emittedUncomposedCompositeEdits);
+    debug("theorem/selector",
+          "selector resolution: competitions={0} resolved={1} "
+          "noSelectable={2} unresolved={3} directBypass={4}",
+          lastTheoremAudit_.selectorCompetitions,
+          lastTheoremAudit_.selectorResolutions,
+          lastTheoremAudit_.selectorNoSelectable,
+          lastTheoremAudit_.selectorUnresolvedCompetitions,
+          lastTheoremAudit_.selectorDirectBypasses);
+    debug("theorem/terminal",
+          "terminal fallback audit: explicitExclusions={0} "
+          "nonExplicitExclusions={1} primaryFailures={2} secondaryFailures={3} "
+          "auditViolations={4}",
+          lastTheoremAudit_.explicitTerminalExclusions,
+          lastTheoremAudit_.nonExplicitTerminalExclusions,
+          lastTheoremAudit_.terminalFailureObligations,
+          lastTheoremAudit_.terminalSecondaryFailureObligations,
+          lastTheoremAudit_.terminalFailureAuditViolations);
+    debug("theorem/state",
+          "state graph: ownerNodes={0} zeroTokenNodes={1} observedComponents={2} "
+          "mutatedComponents={3} incomparableNodes={4} missingProducerFacts={5} "
+          "directChecks={6} deltaFacts={7} graphEdges={8} gatewayWitnesses={9} "
+          "terminalFailures={10} unclosedLocal={11}",
+          lastTheoremAudit_.graphOwnerNodes,
+          lastTheoremAudit_.graphZeroTokenStateNodes,
+          lastTheoremAudit_.graphObservedStateComponents,
+          lastTheoremAudit_.graphMutatedStateComponents,
+          lastTheoremAudit_.graphIncomparableNodes,
+          lastTheoremAudit_.graphMissingProducerFacts,
+          lastTheoremAudit_.directStateChecksAudited,
+          lastTheoremAudit_.directStateChecksDeltaFacts,
+          lastTheoremAudit_.directStateChecksGraphEdges,
+          lastTheoremAudit_.directStateChecksGatewayWitnesses,
+          lastTheoremAudit_.directStateChecksTerminalFailures,
+          lastTheoremAudit_.directStateChecksUnclosedLocal);
+    debug("theorem/resolver",
+          "witness resolver: audits={0} declaredInDomain={1} "
+          "explicitOutOfDomain={2} ambiguousOutOfDomain={3} "
+          "missingProof={4} unknownDomain={5} strictAuthority={6} "
+          "strictLegacyFallback={7} strictFailClosed={8} invalidFailClosed={9} "
+          "incompleteKeys={10} incompatibleComposition={11} "
+          "unconvertedWitnesses={12} closureLedgerRows={13}",
+          lastTheoremAudit_.resolverDomainAudits,
+          lastTheoremAudit_.resolverDeclaredInDomain,
+          lastTheoremAudit_.resolverExplicitOutOfDomain,
+          lastTheoremAudit_.resolverAmbiguousOutOfDomain,
+          lastTheoremAudit_.resolverPotentiallyMissingProof,
+          lastTheoremAudit_.resolverUnknownDomain,
+          lastTheoremAudit_.resolverStrictResolverAuthority,
+          lastTheoremAudit_.resolverStrictLegacyFallback,
+          lastTheoremAudit_.resolverStrictFailClosed,
+          lastTheoremAudit_.resolverStrictInvalidFailClosed,
+          lastTheoremAudit_.resolverDeclaredIncompleteKeys,
+          lastTheoremAudit_.resolverDeclaredIncompatibleComposition,
+          lastTheoremAudit_.resolverDeclaredUnconvertedWitnesses,
+          lastTheoremAudit_.resolverClosureLedgerRows);
   }
 
   /// Emit a one-line summary of the final refolding statistics.
@@ -2391,10 +2471,12 @@ private:
   /// line is annotated when refolding terminated by falling back to the fully
   /// expanded B-side text.
   void EmitRefoldStats() const {
-    info("stats", "includes-expanded={0}/{1} macros-expanded={2}/{3}{4}",
+    info("stats",
+         "refold summary: expandedIncludes={0}/{1} expandedRootMacros={2}/{3} "
+         "terminalFallback={4}",
          lastStats_.expandedIncludes, lastStats_.totalIncludes,
          lastStats_.expandedMacros, lastStats_.totalMacros,
-         HasTerminalFallbackRequest() ? " terminal-raw-b=B" : "");
+         HasTerminalFallbackRequest() ? "yes(raw-B)" : "no");
   }
 
   /// Per-gap ownership depth for insertion before PP token k (k in [0..N]).
@@ -10909,15 +10991,6 @@ RefoldEngine::OwnerStateDeltaToObserverSummary(const OwnerStateDelta &delta) {
 
 namespace llvm {
 using namespace clang::refold;
-
-#if 0
-template <> struct format_provider<RefoldEngine::TerminalFallbackWitness> {
-  static void format(const RefoldEngine::TerminalFallbackWitness &witness,
-                     raw_ostream &os, StringRef style) {
-    os << witness.ToString();
-  }
-};
-#endif
 
 template <> struct DenseMapInfo<std::optional<uint64_t>> {
   static inline std::optional<uint64_t> getEmptyKey() {
