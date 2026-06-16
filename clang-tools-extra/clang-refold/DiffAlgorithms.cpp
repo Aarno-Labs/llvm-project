@@ -820,9 +820,11 @@ struct SpanView {
   bool rev = false;
 
   size_t size() const { return len; }
+
   StringRef at(size_t i) const {
     return rev ? base[off + (len - 1 - i)] : base[off + i];
   }
+
   size_t absIndex(size_t i) const {
     return rev ? (off + (len - 1 - i)) : (off + i);
   }
@@ -835,6 +837,7 @@ struct GapView {
   bool rev = false;
 
   size_t size() const { return len; }
+
   uint32_t at(size_t i) const {
     return rev ? base[off + (len - 1 - i)] : base[off + i];
   }

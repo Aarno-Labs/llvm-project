@@ -2031,7 +2031,7 @@ void RefoldEngine::ReportNoLegacyAuditFinding(
     NoteTheoremAuditViolation(
         llvm::formatv("strict/theorem no-legacy audit reported finding: "
                       "kind={0} role={1} detail={2}",
-                      toString(definition.kind), role,
+                      definition.kind, role,
                       clippedDetail.empty() ? StringRef("<none>")
                                             : StringRef(clippedDetail))
             .str());
@@ -2121,7 +2121,7 @@ void RefoldEngine::RequestTerminalFallback(
   terminalFallbackRequests_.push_back(request);
 
   TraceWitnessFallback(request);
-  debug("fallback", "REQUEST terminal fallback: {0}", toString(request));
+  debug("fallback", "REQUEST terminal fallback: {0}", request);
 }
 
 void RefoldEngine::EnforceTheoremAuditInvariants() const {
@@ -2266,8 +2266,8 @@ void RefoldEngine::RecordWitnessResolverTheoremAudit(
         llvm::formatv("strict resolver theorem audit rejected role={0}: {1}; "
                       "domain={2} fallback_class={3} reason={4}",
                       decision.role, why,
-                      toString(decision.strictDomain.domainClass),
-                      toString(decision.fallbackClass),
+                      decision.strictDomain.domainClass,
+                      decision.fallbackClass,
                       decision.failureReason.empty()
                           ? StringRef("<none>")
                           : StringRef(decision.failureReason))
@@ -2538,7 +2538,7 @@ bool RefoldEngine::AuditTerminalFallbackForLegacyAuthority(
     ReportNoLegacyAuditFinding(MakeLegacyAuditEvidence(
         LegacyPathKind::UnclassifiedFallbackBranch, role,
         llvm::formatv("terminal fallback lacks classified proof failure: {0}",
-                      toString(failure))
+                      failure)
             .str()));
   }
 
@@ -2660,7 +2660,7 @@ bool RefoldEngine::AuditTerminalFallbackProofFailure(
     NoteTheoremAuditViolation(
         llvm::formatv("terminal fallback proof failure audit rejected {0}: {1}; "
                       "failure={2}",
-                      role, reason, toString(failure))
+                      role, reason, failure)
             .str());
   };
 
@@ -2707,7 +2707,7 @@ bool RefoldEngine::RejectNoLegacyAuditFindingIfStrict(
   NoteTheoremAuditViolation(
       llvm::formatv("strict/theorem no-legacy audit rejected emission boundary: "
                     "kind={0} role={1} detail={2}",
-                    toString(definition.kind), role, detail)
+                    definition.kind, role, detail)
           .str());
 
   if (!HasTerminalFallbackRequest()) {
@@ -2715,7 +2715,7 @@ bool RefoldEngine::RejectNoLegacyAuditFindingIfStrict(
         failure, role,
         llvm::formatv("strict/theorem no-legacy audit rejected emission boundary: "
                       "kind={0} detail={1}",
-                      toString(definition.kind), detail)
+                      definition.kind, detail)
             .str());
   }
   return true;
@@ -2878,8 +2878,8 @@ void RefoldEngine::AuditDirectStateCheckClosure(
         llvm::formatv("direct state check is not routed through a theorem "
                       "closure surface: check={0} component={1} mutation={2} "
                       "closure={3} detail={4}",
-                      toString(checkKind), toString(component),
-                      toString(mutation), toString(closure), detail)
+                      checkKind, component,
+                      mutation, closure, detail)
             .str()));
     break;
   }
@@ -4669,7 +4669,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
         return llvm::formatv(
                    "kind={0}:include={1}:macro={2}:macro_directive={3}:"
                    "line={4}:pragma={5}:cond_group={6}:cond_arm={7}",
-                   toString(owner.kind), formatOptionalId(owner.includeId),
+                   owner.kind, formatOptionalId(owner.includeId),
                    formatOptionalId(owner.macroInvocationId),
                    formatOptionalId(owner.macroDirectiveId),
                    formatOptionalId(owner.lineControlId),
@@ -11958,18 +11958,16 @@ RefoldEngine::BuildOwnerStateGraph() const {
 
   auto pragmaKey = [](const PragmaStateIdentity &identity) {
     return formatv("pragma={0}:class={1}", identity.pragmaId,
-                   toString(identity.classification))
+                   identity.classification)
         .str();
   };
 
   auto conditionalKey = [](const ConditionalStateIdentity &identity) {
     if (identity.armId)
       return formatv("group={0}:arm={1}:role={2}", identity.groupId,
-                     *identity.armId, toString(identity.role))
+                     *identity.armId, identity.role)
           .str();
-    return formatv("group={0}:role={1}", identity.groupId,
-                   toString(identity.role))
-        .str();
+    return formatv("group={0}:role={1}", identity.groupId, identity.role).str();
   };
 
   auto recordComponentIndex = [&](OwnerStateComponent component,
@@ -12176,8 +12174,8 @@ RefoldEngine::BuildOwnerStateGraph() const {
         site.observationKind = ObservationKindForComponent(component);
         site.observations = closure.observers;
         site.order = observerOrder++;
-        site.detail = formatv("{0} node observes {1}", toString(node.kind),
-                              toString(component)).str();
+        site.detail =
+            llvm::formatv("{0} node observes {1}", node.kind, component).str();
         const uint64_t siteIndex = graph.observerSites.size();
         graph.observerSites.push_back(std::move(site));
         recordComponentIndex(component, siteIndex);
@@ -12197,8 +12195,8 @@ RefoldEngine::BuildOwnerStateGraph() const {
         site.observationKind = ObservationKindForComponent(site.component);
         site.observations = closure.observers;
         site.order = observerOrder++;
-        site.detail = formatv("{0} node has unmodeled state",
-                              toString(node.kind)).str();
+        site.detail =
+            llvm::formatv("{0} node has unmodeled state", node.kind).str();
         const uint64_t siteIndex = graph.observerSites.size();
         graph.observerSites.push_back(std::move(site));
         recordComponentIndex(site.component, siteIndex);
@@ -12239,8 +12237,9 @@ RefoldEngine::BuildOwnerStateGraph() const {
       counterNode.containingIncludeId = counter.ownerIncludeId;
       counterNode.containingMacroInvocationId = closure.owner.macroInvocationId;
       counterNode.containingConditionalArmId = closure.owner.condArmId;
-      counterNode.detail = formatv("counter event from owner {0}",
-                                   toString(closure.owner.kind)).str();
+      counterNode.detail =
+          llvm::formatv("counter event from owner {0}", closure.owner.kind)
+              .str();
       if (auditDirectState)
         AuditDirectStateCheckClosure(
             DirectStateCheckKind::CounterEvent, OwnerStateComponent::Counter,
@@ -12421,8 +12420,7 @@ RefoldEngine::MissingStateFactTerminalFailure(MissingStateFactKind kind,
   TerminalFallbackProofFailure failure =
       SuffixStabilityTerminalFailureForComponent(
           StateComponentForMissingStateFact(kind));
-  failure.context.stateComponent =
-      formatv("{0}:{1}", toString(kind), detail).str();
+  failure.context.stateComponent = formatv("{0}:{1}", kind, detail).str();
   if (kind == MissingStateFactKind::MissingOwnerOrderingFacts) {
     failure.obligation = TerminalFallbackObligationKind::ProducerFactsAvailable;
     failure.reason = TerminalFallbackFailureReason::MissingProducerFacts;
@@ -12656,9 +12654,8 @@ RefoldEngine::CheckStateTransitionAcrossEditBoundary(
         llvm::formatv("state-transition gateway audit violation: {0}; "
                       "component={1} mutation={2} witness={3} phase={4} "
                       "detail={5}",
-                      detail, toString(request.component),
-                      toString(request.mutation), toString(request.witness.kind),
-                      request.phase, request.detail)
+                      detail, request.component, request.mutation,
+                      request.witness.kind, request.phase, request.detail)
             .str());
   };
 
@@ -12685,8 +12682,7 @@ RefoldEngine::CheckStateTransitionAcrossEditBoundary(
         SuffixStabilityTerminalFailureForComponent(request.component),
         llvm::formatv("state-transition gateway received unknown component: "
                       "mutation={0} witness={1} detail={2}",
-                      toString(request.mutation),
-                      toString(request.witness.kind), request.detail)
+                      request.mutation, request.witness.kind, request.detail)
             .str());
   }
 
@@ -12701,8 +12697,7 @@ RefoldEngine::CheckStateTransitionAcrossEditBoundary(
                 toString(request.component))),
         llvm::formatv("state-transition gateway received unknown mutation: "
                       "component={0} witness={1} detail={2}",
-                      toString(request.component), toString(request.witness.kind),
-                      request.detail)
+                      request.component, request.witness.kind, request.detail)
             .str());
   }
 
@@ -12719,8 +12714,8 @@ RefoldEngine::CheckStateTransitionAcrossEditBoundary(
           llvm::formatv("state-transition gateway rejected reverse-solved "
                         "directive rewrite: component={0} mutation={1} "
                         "directive={2} closureStatus={3} phase={4} detail={5}",
-                        toString(request.component), toString(request.mutation),
-                        directiveLabel, toString(request.directiveClosureStatus),
+                        request.component, request.mutation,
+                        directiveLabel, request.directiveClosureStatus,
                         request.phase, request.detail)
               .str());
     }
@@ -12729,8 +12724,8 @@ RefoldEngine::CheckStateTransitionAcrossEditBoundary(
           "state-transition gateway accepted directive-closure proof before "
           "suffix query: component={0} mutation={1} directive={2} phase={3} "
           "detail={4}",
-          toString(request.component), toString(request.mutation), directiveLabel,
-          request.phase, request.detail);
+          request.component, request.mutation, directiveLabel, request.phase,
+          request.detail);
   }
 
   const SuffixObserverQueryResult observers =
@@ -12750,8 +12745,7 @@ RefoldEngine::CheckStateTransitionAcrossEditBoundary(
       trace("state/gateway",
             "state-transition gateway discharged: component={0} "
             "mutation={1} no preserved suffix observer phase={2} detail={3}",
-            toString(request.component), toString(request.mutation),
-            request.phase, request.detail);
+            request.component, request.mutation, request.phase, request.detail);
       return finalizeGatewayResult();
     }
 
@@ -12765,8 +12759,8 @@ RefoldEngine::CheckStateTransitionAcrossEditBoundary(
             "state-transition gateway could not model or canonically order the "
             "required observer: component={0} mutation={1} witness={2} "
             "detail={3}",
-            toString(request.component), toString(request.mutation),
-            toString(request.witness.kind), request.detail)
+            request.component, request.mutation, request.witness.kind,
+            request.detail)
             .str());
   }
 
@@ -12817,15 +12811,13 @@ RefoldEngine::CheckStateTransitionAcrossEditBoundary(
                            "state component");
       return requestTerminal(
           SuffixStabilityTerminalFailureForComponent(request.component),
-          llvm::formatv("state-transition gateway rejected mismatched typed "
-                        "witness: component={0} mutation={1} witness={2} "
-                        "witnessComponent={3} detail={4}",
-                        toString(request.component),
-                        toString(request.mutation),
-                        toString(normalizedWitness.kind),
-                        toString(ComponentNamedBySuffixStabilityWitness(
-                            normalizedWitness)),
-                        request.detail)
+          llvm::formatv(
+              "state-transition gateway rejected mismatched typed "
+              "witness: component={0} mutation={1} witness={2} "
+              "witnessComponent={3} detail={4}",
+              request.component, request.mutation, normalizedWitness.kind,
+              ComponentNamedBySuffixStabilityWitness(normalizedWitness),
+              request.detail)
               .str());
     }
     attachFirstObserverToWitness();
@@ -12835,8 +12827,8 @@ RefoldEngine::CheckStateTransitionAcrossEditBoundary(
           "state-transition gateway discharged: component={0} mutation={1} "
           "witness={2} orderedObservers={3} incomparable={4} phase={5} "
           "detail={6}",
-          toString(request.component), toString(request.mutation),
-          toString(acceptedWitness.kind), static_cast<uint64_t>(observerCount),
+          request.component, request.mutation,
+          acceptedWitness.kind, static_cast<uint64_t>(observerCount),
           hasIncomparableObserver ? "YES" : "NO", request.phase,
           request.detail);
     return finalizeGatewayResult();
@@ -12858,7 +12850,7 @@ RefoldEngine::CheckStateTransitionAcrossEditBoundary(
         llvm::formatv("state-transition gateway terminal witness: "
                       "component={0} mutation={1} orderedObservers={2} "
                       "incomparable={3} detail={4}",
-                      toString(request.component), toString(request.mutation),
+                      request.component, request.mutation,
                       static_cast<uint64_t>(observerCount),
                       hasIncomparableObserver ? "YES" : "NO", request.detail)
             .str());
@@ -12889,7 +12881,7 @@ RefoldEngine::CheckStateTransitionAcrossEditBoundary(
                     "preserved suffix observers but no typed "
                     "repair/materialization/widening/literalization witness: "
                     "orderedObservers={2} incomparable={3}; {4}",
-                    toString(request.component), toString(request.mutation),
+                    request.component, request.mutation,
                     static_cast<uint64_t>(observerCount),
                     hasIncomparableObserver ? "YES" : "NO", request.detail)
           .str());
@@ -13064,7 +13056,7 @@ std::string RefoldEngine::FormatLineControlEventForWitness(
              event.ownerIncludeId.has_value() ?
                  llvm::formatv("{0}", *event.ownerIncludeId).str() :
                  std::string("none"),
-             toString(event.operandProvenance))
+             event.operandProvenance)
       .str();
 }
 
@@ -13073,7 +13065,7 @@ std::string RefoldEngine::FormatBuiltinLocationObservationForWitness(
   return llvm::formatv(
              "builtin_location:{0}:owner_include={1}:source={2}:[{3},{4}):"
              "a_tokens={5}:[{6},{7})",
-             toString(observation.kind),
+             observation.kind,
              observation.ownerIncludeId.has_value()
                  ? llvm::formatv("{0}", *observation.ownerIncludeId).str()
                  : std::string("none"),
@@ -25780,11 +25772,11 @@ void RefoldEngine::AttachLineControlObserverWitness(
         witness.hasSuffixLineControlDischarge = true;
         appendSig(witness.stateSignature,
                   llvm::formatv("mixed.segment.suffix:{0}:component={1}",
-                                toString(suffix.kind), toString(component))
+                                suffix.kind, component)
                       .str());
         appendSig(witness.observerSignature,
                   llvm::formatv("mixed.segment.suffix-discharge:{0}:component={1}",
-                                toString(suffix.kind), toString(component))
+                                suffix.kind, component)
                       .str());
       }
     }
@@ -25817,13 +25809,13 @@ void RefoldEngine::AttachLineControlObserverWitness(
       case OwnerStateComponent::Unknown:
         break;
       }
-      appendSig(witness.stateSignature,
-                llvm::formatv("suffix:{0}:component={1}",
-                              toString(suffix.kind), toString(component))
-                    .str());
+      appendSig(
+          witness.stateSignature,
+          llvm::formatv("suffix:{0}:component={1}", suffix.kind, component)
+              .str());
       appendSig(witness.observerSignature,
-                llvm::formatv("suffix-discharge:{0}:component={1}",
-                              toString(suffix.kind), toString(component))
+                llvm::formatv("suffix-discharge:{0}:component={1}", suffix.kind,
+                              component)
                     .str());
     }
   }
@@ -25964,10 +25956,8 @@ void RefoldEngine::AttachCounterStateWitness(
 
     ++witness.preservedSuffixObserverCount;
     appendSig(witness.suffixObserverSignature,
-              llvm::formatv("{0}:suffix={1}:component={2}", bucket,
-                            toString(suffix.kind),
-                            toString(ComponentNamedBySuffixStabilityWitness(
-                                suffix)))
+              llvm::formatv("{0}:suffix={1}:component={2}", bucket, suffix.kind,
+                            ComponentNamedBySuffixStabilityWitness(suffix))
                   .str());
   };
 
@@ -26185,9 +26175,8 @@ RefoldEngine::WitnessEquivalenceKey RefoldEngine::BuildWitnessEquivalenceKey(
   };
 
   auto macroRepairReplayStateNeutralityValue = [&]() {
-    const uint64_t rootId = candidate.hasRootMacroId
-                                ? candidate.rootMacroId
-                                : summary.proofRootMacroId;
+    const uint64_t rootId = candidate.hasRootMacroId ? candidate.rootMacroId
+                                                     : summary.proofRootMacroId;
     const CounterStateWitness &counter = candidate.counterStateWitness;
     return llvm::formatv(
                "macro_repair_replay_neutral:path={0}:root={1}:"
@@ -26195,8 +26184,7 @@ RefoldEngine::WitnessEquivalenceKey RefoldEngine::BuildWitnessEquivalenceKey(
                "counter_suffix={5}:counter_order={6}:"
                "counter_events={7}:counter_suffix_observers={8}:"
                "line_control_neutral={9}:diagnostics=preserve-invocation",
-               toString(path), rootId, candidate.targetBTokStart,
-               candidate.targetBTokEnd,
+               path, rootId, candidate.targetBTokStart, candidate.targetBTokEnd,
                FormatWitnessTraceHash(SliceBSource(candidate.targetBTokStart,
                                                    candidate.targetBTokEnd)),
                counter.suffixStateStable ? 1 : 0,
@@ -26582,10 +26570,10 @@ RefoldEngine::WitnessEquivalenceKey RefoldEngine::BuildWitnessEquivalenceKey(
       appendStateDeltaSignature(os, "after",
                                 segment.ownerTransitionProof.after);
       for (const SuffixStabilityWitness &suffix :
-           segment.ownerTransitionProof.suffixWitnesses)
+           segment.ownerTransitionProof.suffixWitnesses) {
         os << "suffix{" << toString(suffix.kind) << ':'
-           << toString(ComponentNamedBySuffixStabilityWitness(suffix))
-           << "};";
+           << toString(ComponentNamedBySuffixStabilityWitness(suffix)) << "};";
+      }
       os << '}';
     }
     os.flush();
@@ -26949,53 +26937,51 @@ RefoldEngine::WitnessEquivalenceKey RefoldEngine::BuildWitnessEquivalenceKey(
   } else if (summary.hasSuffixStabilityWitness) {
     const SuffixStabilityWitness &suffix = summary.suffixStabilityWitness;
     key.suffixState = WitnessEquivalenceDimension::Known(
-        llvm::formatv("suffix_witness:{0}:component={1}",
-                      toString(suffix.kind),
-                      toString(ComponentNamedBySuffixStabilityWitness(suffix)))
+        llvm::formatv("suffix_witness:{0}:component={1}", suffix.kind,
+                      ComponentNamedBySuffixStabilityWitness(suffix))
             .str());
   } else if (summary.hasOwnerRealizationWitness) {
     const OwnerRealizationWitness &owner = summary.ownerRealizationWitness;
     if (owner.closure.IsStateNeutral()) {
       key.suffixState = WitnessEquivalenceDimension::Known(
           llvm::formatv("owner_realization:evidence={0}:state_neutral",
-                        toString(owner.evidence))
+                        owner.evidence)
               .str());
     } else if (ownerRealizationHasKnownMacroObservationOnlyState(owner)) {
       key.suffixState = WitnessEquivalenceDimension::Known(
           llvm::formatv(
               "owner_realization:evidence={0}:macro_observation_only:{1}",
-              toString(owner.evidence),
-              macroObservationOnlyStateSignature(owner))
+              owner.evidence, macroObservationOnlyStateSignature(owner))
               .str());
     } else if (ownerRealizationHasKnownBuiltinLocationObservationState(owner)) {
       key.suffixState = WitnessEquivalenceDimension::Known(
           llvm::formatv(
               "owner_realization:evidence={0}:builtin_location_observation:{1}",
-              toString(owner.evidence), ownerStateDeltaSignature(owner))
+              owner.evidence, ownerStateDeltaSignature(owner))
               .str());
     } else if (ownerRealizationHasKnownIncludeState(owner)) {
       key.suffixState = WitnessEquivalenceDimension::Known(
           llvm::formatv("owner_realization:evidence={0}:include_state:{1}",
-                        toString(owner.evidence),
-                        ownerStateDeltaSignature(owner))
+                        owner.evidence, ownerStateDeltaSignature(owner))
               .str());
     } else if (ownerRealizationHasKnownConditionalState(owner)) {
       key.suffixState = WitnessEquivalenceDimension::Known(
-          llvm::formatv(
-              "owner_realization:evidence={0}:conditional_state:{1}",
-              toString(owner.evidence), ownerStateDeltaSignature(owner))
+          llvm::formatv("owner_realization:evidence={0}:conditional_state:{1}",
+                        owner.evidence, ownerStateDeltaSignature(owner))
               .str());
     } else if (!owner.stateWitnesses.empty()) {
       std::string stateSummary =
-          llvm::formatv("owner_realization:evidence={0}:state_witnesses={1}:state={2}",
-                        toString(owner.evidence), owner.stateWitnesses.size(),
-                        ownerStateDeltaSignature(owner))
+          llvm::formatv(
+              "owner_realization:evidence={0}:state_witnesses={1}:state={2}",
+              owner.evidence, owner.stateWitnesses.size(),
+              ownerStateDeltaSignature(owner))
               .str();
-      for (const SuffixStabilityWitness &suffix : owner.stateWitnesses)
+      for (const SuffixStabilityWitness &suffix : owner.stateWitnesses) {
         stateSummary +=
-            llvm::formatv(":{0}/{1}", toString(suffix.kind),
-                          toString(ComponentNamedBySuffixStabilityWitness(suffix)))
+            llvm::formatv(":{0}/{1}", suffix.kind,
+                          ComponentNamedBySuffixStabilityWitness(suffix))
                 .str();
+      }
       key.suffixState = WitnessEquivalenceDimension::Known(stateSummary);
     } else {
       key.suffixState = WitnessEquivalenceDimension::Unknown(
@@ -27128,7 +27114,7 @@ RefoldEngine::WitnessEquivalenceKey RefoldEngine::BuildWitnessEquivalenceKey(
             "tu_anchor:evidence={0}:pp_gap={1}:{2}:tu_byte={3}:{4}:"
             "slot={5}:{6}:macro={7}:left={8}:{9}:right={10}:{11}:"
             "outside_include={12}:owner_depth_stable={13}",
-            toString(w.evidence), w.hasPPGap, w.ppGap, w.hasTUByte,
+            w.evidence, w.hasPPGap, w.ppGap, w.hasTUByte,
             w.tuByte, w.slotId, w.slotKind, w.macroId, w.hasLeftNeighbor,
             w.leftNeighborPP, w.hasRightNeighbor, w.rightNeighborPP,
             w.outsideIncludeCoverage, w.ownerDepthStable)
@@ -27140,7 +27126,7 @@ RefoldEngine::WitnessEquivalenceKey RefoldEngine::BuildWitnessEquivalenceKey(
             "include_anchor:evidence={0}:anchor={1}:{2}:range={3}:[{4},{5}):"
             "pp_first={6}:{7}:pp_last={8}:{9}:neighbor={10}:{11}:"
             "cond={12}:{13}:child={14}:{15}:decl={16}:[{17},{18})",
-            toString(w.evidence), w.hasAnchorByte, w.anchorByte,
+            w.evidence, w.hasAnchorByte, w.anchorByte,
             w.hasByteRange, w.startByte, w.endByte, w.hasFirstPP,
             w.firstPP, w.hasLastPP, w.lastPP, w.hasNeighborPP,
             w.neighborPP, w.hasCondArmId, w.condArmId,
@@ -27165,20 +27151,19 @@ RefoldEngine::WitnessEquivalenceKey RefoldEngine::BuildWitnessEquivalenceKey(
             "owner_observers:macro={0}:defined={1}:cond={2}:line={3}:"
             "file={4}:filename={5}:counter={6}:pragma={7}:include_guard={8}:"
             "include={9}",
-            observers.observesMacroExpansion,
-            observers.observesDefinedOperator,
+            observers.observesMacroExpansion, observers.observesDefinedOperator,
             observers.observesConditionalEvaluation,
             observers.observesLineNumber, observers.observesFileState,
             observers.observesFileName, observers.observesCounter,
-            observers.observesPragmaState,
-            observers.observesIncludeGuardState, observers.observesIncludeState)
+            observers.observesPragmaState, observers.observesIncludeGuardState,
+            observers.observesIncludeState)
             .str());
   } else if (summary.hasSuffixStabilityWitness) {
     const SuffixStabilityWitness &suffix = summary.suffixStabilityWitness;
     key.preservedObservers = WitnessEquivalenceDimension::Known(
         llvm::formatv("suffix_observer_discharge:{0}:component={1}",
-                      toString(suffix.kind),
-                      toString(ComponentNamedBySuffixStabilityWitness(suffix)))
+                      suffix.kind,
+                      ComponentNamedBySuffixStabilityWitness(suffix))
             .str());
   }
 
@@ -28020,12 +28005,13 @@ void RefoldEngine::TraceWitnessStrictDomain(
   if (!ShouldEmitProofLog() && GetWitnessResolverMode() == WitnessResolverMode::Off)
     return;
 
-  LogProofLine(llvm::formatv(
-      "REFOLD-WITNESS-DOMAIN role={0} domain={1} obligation={2} "
-      "fallback_class={3} reason={4}\n",
-      role, toString(decision.domainClass), toString(decision.obligation),
-      toString(decision.fallbackClass),
-      decision.reason.empty() ? StringRef("<none>") : StringRef(decision.reason)));
+  LogProofLine(
+      llvm::formatv("REFOLD-WITNESS-DOMAIN role={0} domain={1} obligation={2} "
+                    "fallback_class={3} reason={4}\n",
+                    role, toString(decision.domainClass),
+                    toString(decision.obligation), decision.fallbackClass,
+                    decision.reason.empty() ? StringRef("<none>")
+                                            : StringRef(decision.reason)));
 }
 
 void RefoldEngine::TraceWitnessClosureLedger(
@@ -28044,7 +28030,7 @@ void RefoldEngine::TraceWitnessClosureLedger(
         "obligation={19} reason={20} missing_reason={21} "
         "composition={22}:classes={23}:complete={24}:incomplete={25}:"
         "incompatible={26}:reason={27}\n",
-        formatWitnessClosureAtom(entry.selector), toString(entry.family),
+        formatWitnessClosureAtom(entry.selector), entry.family,
         formatWitnessClosureAtom(entry.testRegion),
         formatWitnessClosureAtom(entry.missingDimension),
         formatWitnessClosureAtom(entry.sourceFamily),
@@ -28056,9 +28042,8 @@ void RefoldEngine::TraceWitnessClosureLedger(
         decision.resolverUnconvertedWitnessCount,
         decision.equivalenceClassCount,
         formatWitnessClosureAtom(entry.sourceOwnerKind),
-        formatWitnessClosureAtom(entry.owner), toString(entry.fallbackClass),
-        toString(entry.obligation),
-        formatWitnessClosureAtom(entry.resolverReason),
+        formatWitnessClosureAtom(entry.owner), entry.fallbackClass,
+        entry.obligation, formatWitnessClosureAtom(entry.resolverReason),
         formatWitnessClosureAtom(entry.missingReason),
         decision.composition.compatible ? StringRef("compatible")
                                         : StringRef("not-compatible"),
@@ -28066,9 +28051,10 @@ void RefoldEngine::TraceWitnessClosureLedger(
         decision.composition.completeTupleCount,
         decision.composition.incompleteTupleCount,
         decision.composition.incompatibleTupleCount,
-        formatWitnessClosureAtom(decision.composition.reason.empty()
-                                     ? StringRef("<none>")
-                                     : StringRef(decision.composition.reason))));
+        formatWitnessClosureAtom(
+            decision.composition.reason.empty()
+                ? StringRef("<none>")
+                : StringRef(decision.composition.reason))));
   }
 }
 
@@ -28099,33 +28085,33 @@ void RefoldEngine::TraceWitnessResolverDecision(
       "fallback_class={17} domain={18}:obligation={19}:reason={20} "
       "composition={21}:classes={22}:complete={23}:"
       "incomplete={24}:incompatible={25}:reason={26}\n",
-      decision.role, toString(decision.mode), decision.candidateCount,
+      decision.role, decision.mode, decision.candidateCount,
       decision.selectableCount, decision.proofInvalidCount,
       decision.equivalenceClassCount, decision.completeWitnessCount,
       decision.incompleteWitnessCount,
       decision.resolverAuthoritativeWitnessCount,
       decision.resolverUnconvertedWitnessCount,
-      decision.resolverComputed ? 1 : 0,
-      decision.resolverImplemented ? 1 : 0, authority,
-      formatOptionalIndex(decision.legacyIndex),
+      decision.resolverComputed ? 1 : 0, decision.resolverImplemented ? 1 : 0,
+      authority, formatOptionalIndex(decision.legacyIndex),
       formatOptionalIndex(decision.resolverIndex),
       decision.agreement.empty() ? StringRef("<none>")
                                  : StringRef(decision.agreement),
       decision.failureReason.empty() ? StringRef("<none>")
                                      : StringRef(decision.failureReason),
-      toString(decision.fallbackClass),
-      toString(decision.strictDomain.domainClass),
-      toString(decision.strictDomain.obligation),
-      decision.strictDomain.reason.empty() ? StringRef("<none>")
-                                          : StringRef(decision.strictDomain.reason),
+      decision.fallbackClass, decision.strictDomain.domainClass,
+      decision.strictDomain.obligation,
+      decision.strictDomain.reason.empty()
+          ? StringRef("<none>")
+          : StringRef(decision.strictDomain.reason),
       decision.composition.compatible ? StringRef("compatible")
                                       : StringRef("not-compatible"),
       decision.composition.globalClassCount,
       decision.composition.completeTupleCount,
       decision.composition.incompleteTupleCount,
       decision.composition.incompatibleTupleCount,
-      decision.composition.reason.empty() ? StringRef("<none>")
-                                          : StringRef(decision.composition.reason)));
+      decision.composition.reason.empty()
+          ? StringRef("<none>")
+          : StringRef(decision.composition.reason)));
 
   TraceWitnessStrictDomain(decision.role, decision.strictDomain);
   TraceWitnessClosureLedger(decision);
@@ -28191,14 +28177,15 @@ RefoldEngine::ResolveWitnessComposition(
     // durable mixed-owner tiling; in both cases the global composition class is
     // the ordered target stream plus the suffix/observer/counter state that the
     // tuple leaves for its neighbors.
-    std::string classKey = llvm::formatv(
-        "target={0}|suffix={1}|observers={2}|counter={3}|boundary={4}|"
-        "diagnostics={5}|composition={6}|producers={7}",
-        key.targetPPTokens.value, key.suffixState.value,
-        key.preservedObservers.value, key.counterState.value,
-        toString(key.boundaryClass), toString(key.diagnosticClass),
-        toString(key.compositionClass), key.producerKinds)
-        .str();
+    std::string classKey =
+        llvm::formatv(
+            "target={0}|suffix={1}|observers={2}|counter={3}|boundary={4}|"
+            "diagnostics={5}|composition={6}|producers={7}",
+            key.targetPPTokens.value, key.suffixState.value,
+            key.preservedObservers.value, key.counterState.value,
+            key.boundaryClass, key.diagnosticClass, key.compositionClass,
+            key.producerKinds)
+            .str();
     ++globalClasses[classKey];
   }
 
@@ -28618,17 +28605,13 @@ void RefoldEngine::TraceWitnessFallback(
   const WitnessStrictDomainDecision domain =
       ClassifyStrictDomainForTerminalFallback(request.failure);
 
-  LogProofLine(llvm::formatv("REFOLD-WITNESS-FALLBACK reason={0} "
-                          "fallback_class={1} domain={2} obligation={3} "
-                          "domain_reason={4} phase={5} detail={6}\n",
-                          toString(request.failure),
-                          toString(fallbackClass),
-                          toString(domain.domainClass),
-                          toString(domain.obligation),
-                          domain.reason.empty() ? StringRef("<none>")
-                                                : StringRef(domain.reason),
-                          request.phase,
-                          stringutils::showWsWithClip(request.detail, 200)));
+  LogProofLine(llvm::formatv(
+      "REFOLD-WITNESS-FALLBACK reason={0} "
+      "fallback_class={1} domain={2} obligation={3} "
+      "domain_reason={4} phase={5} detail={6}\n",
+      request.failure, fallbackClass, domain.domainClass, domain.obligation,
+      domain.reason.empty() ? StringRef("<none>") : StringRef(domain.reason),
+      request.phase, stringutils::showWsWithClip(request.detail, 200)));
   TraceWitnessStrictDomain("TerminalFallback", domain);
 
   if (domain.domainClass ==
@@ -28685,14 +28668,15 @@ void RefoldEngine::TraceWitnessFallback(
         "missing_reason={5} "
         "composition=not-compatible:classes=0:complete=0:incomplete=1:"
         "incompatible=0:reason={6}\n",
-        toString(WitnessProofFamily::TerminalFallback),
-        formatWitnessClosureAtom(missing), toString(fallbackClass),
-        toString(domain.obligation),
-        formatWitnessClosureAtom(domain.reason.empty() ? StringRef("<none>")
-                                                       : StringRef(domain.reason)),
-        formatWitnessClosureAtom(toString(request.failure)),
-        formatWitnessClosureAtom(request.phase.empty() ? StringRef("<none>")
-                                                       : StringRef(request.phase))));
+        WitnessProofFamily::TerminalFallback, formatWitnessClosureAtom(missing),
+        fallbackClass, domain.obligation,
+        formatWitnessClosureAtom(domain.reason.empty()
+                                     ? StringRef("<none>")
+                                     : StringRef(domain.reason)),
+        formatWitnessClosureAtom(request.failure.ToString()),
+        formatWitnessClosureAtom(request.phase.empty()
+                                     ? StringRef("<none>")
+                                     : StringRef(request.phase))));
   }
 }
 
@@ -28821,8 +28805,8 @@ RefoldEngine::OwnerRealizationResult RefoldEngine::TryBuildOwnerRealization(
                                                       std::move(context));
     trace("proof/owner-realization",
           "reject owner realization evidence={0} owner={1}: {2} detail='{3}'",
-          toString(evidence), toString(result.witness.closure.owner.kind),
-          toString(result.failure), result.detail);
+          evidence, result.witness.closure.owner.kind, result.failure,
+          result.detail);
     return result;
   };
 
@@ -28853,10 +28837,11 @@ RefoldEngine::OwnerRealizationResult RefoldEngine::TryBuildOwnerRealization(
   trace("proof/owner-realization",
         "accept owner realization evidence={0} owner={1} source='{2}'[{3},{4}) "
         "A=[{5},{6}) B=[{7},{8}) stateWitnesses={9} detail='{10}'",
-        toString(evidence), toString(result.witness.closure.owner.kind),
+        evidence, result.witness.closure.owner.kind,
         result.witness.closure.source.path, result.witness.closure.source.begin,
         result.witness.closure.source.end, result.witness.closure.aTokens.begin,
-        result.witness.closure.aTokens.end, result.witness.closure.bTokens.begin,
+        result.witness.closure.aTokens.end,
+        result.witness.closure.bTokens.begin,
         result.witness.closure.bTokens.end,
         static_cast<uint64_t>(result.witness.stateWitnesses.size()),
         result.detail);
@@ -28891,7 +28876,7 @@ void RefoldEngine::ApplyOwnerRealizationResultToProofSummary(
   trace("proof/owner-realization",
         "reject accepted candidate after owner-realization gate failed: {0} "
         "detail='{1}'",
-        toString(result.failure), result.detail);
+        result.failure, result.detail);
   FinalizeProofSummary(summary);
 }
 
@@ -28980,8 +28965,8 @@ RefoldEngine::BuildIncludeOwnerRealization(
           : OwnerRealizationEvidenceKind::IncludeBEnvelope;
 
   const std::string detail =
-      formatv("includeId={0} path={1} includeEnvelopeEvidence={2}",
-              include.id, currentPath, toString(evidenceKind))
+      formatv("includeId={0} path={1} includeEnvelopeEvidence={2}", include.id,
+              currentPath, evidenceKind)
           .str();
 
   // Include realization is owner-specific spelling, but include identity and
@@ -30443,7 +30428,7 @@ RefoldEngine::BuildAcceptedMacroCandidate(const MacroPatch &patch) const {
         llvm::formatv(
             "counter-neutral:path={0}:root={1}:target=[{2},{3}):"
             "producer_subtree=no-counter:replacement=no-raw-counter",
-            toString(patch.proof.kind), counterNeutralRootId,
+            patch.proof.kind, counterNeutralRootId,
             candidate.hasTargetBTokenRange ? candidate.targetBTokStart : 0,
             candidate.hasTargetBTokenRange ? candidate.targetBTokEnd : 0)
             .str();
@@ -30619,7 +30604,7 @@ RefoldEngine::BuildAcceptedIncludeCandidate(
         llvm::formatv("include-anchor:evidence={0}:include={1}:pp_gap={2}:"
                       "byte={3}:b=[{4},{5}):cond={6}:{7}:child={8}:{9}:"
                       "neighbor={10}:{11}",
-                      toString(includeAnchorWitness->evidence),
+                      includeAnchorWitness->evidence,
                       candidate.zeroTokenOwnerId, patch.aStart,
                       includeAnchorWitness->anchorByte, patch.bStart, patch.bEnd,
                       includeAnchorWitness->hasCondArmId ? 1 : 0,
@@ -30772,7 +30757,7 @@ RefoldEngine::BuildAcceptedTUAnchorCandidate(
         llvm::formatv("tu-anchor:evidence={0}:slot={1}:{2}:pp_gap={3}:"
                       "byte={4}:left={5}:{6}:right={7}:{8}:outside_include={9}:"
                       "owner_depth={10}",
-                      toString(witness.evidence), witness.slotId,
+                      witness.evidence, witness.slotId,
                       witness.slotKind, witness.ppGap, witness.tuByte,
                       witness.hasLeftNeighbor ? 1 : 0, witness.leftNeighborPP,
                       witness.hasRightNeighbor ? 1 : 0, witness.rightNeighborPP,
@@ -31015,13 +31000,13 @@ void RefoldEngine::AddForcedCounterPatches(
     counterState.consumptionSignature = FormatCounterEventForWitness(counterEventForWitness);
     counterState.orderSignature =
         llvm::formatv("ordinal={0}:macro={1}:A=[{2},{3})",
-                      counterEventForWitness.occurrenceOrdinal, counterEventForWitness.macroInvocationId,
-                      counterEventForWitness.aTokenBegin, counterEventForWitness.aTokenEnd)
+                      counterEventForWitness.occurrenceOrdinal,
+                      counterEventForWitness.macroInvocationId,
+                      counterEventForWitness.aTokenBegin,
+                      counterEventForWitness.aTokenEnd)
             .str();
     counterState.suffixObserverSignature =
-        llvm::formatv("forced-materialization:{0}",
-                      toString(counterWitness.kind))
-            .str();
+        llvm::formatv("forced-materialization:{0}", counterWitness.kind).str();
     proof.suffixStability = std::move(counterWitness);
     proof.counterState = std::move(counterState);
     SetMacroPatchProof(patch, std::move(proof));
@@ -31135,11 +31120,11 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                         event.aTokenBegin, event.aTokenEnd)
               .str();
       counterState.suffixValueSignature =
-          llvm::formatv("expected={0}", FormatWitnessTraceHash(*event.expectedBValue))
+          llvm::formatv("expected={0}",
+                        FormatWitnessTraceHash(*event.expectedBValue))
               .str();
       counterState.suffixObserverSignature =
-          llvm::formatv("literalization:{0}", toString(counterWitness.kind))
-              .str();
+          llvm::formatv("literalization:{0}", counterWitness.kind).str();
       proof.suffixStability = std::move(counterWitness);
       proof.counterState = std::move(counterState);
       SetMacroPatchProof(patch, std::move(proof));

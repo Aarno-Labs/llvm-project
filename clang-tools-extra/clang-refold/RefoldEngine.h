@@ -1144,21 +1144,19 @@ private:
   struct TerminalFallbackProofFailure {
     TerminalFallbackObligationKind obligation =
         TerminalFallbackObligationKind::Unknown;
-    TerminalFallbackFailureReason reason = TerminalFallbackFailureReason::Unknown;
+    TerminalFallbackFailureReason reason =
+        TerminalFallbackFailureReason::Unknown;
     TheoremFallbackFailureKind theoremFailure =
         TheoremFallbackFailureKind::Unknown;
     TerminalFallbackFailureContext context;
-  };
 
-  friend inline std::string
-  toString(const TerminalFallbackProofFailure &failure) {
-    return llvm::formatv("failedObligation={0} theoremFailure={1} "
-                         "failureReason={2}",
-                         toString(failure.obligation),
-                         toString(failure.theoremFailure),
-                         toString(failure.reason))
-        .str();
-  }
+    std::string ToString() const {
+      return llvm::formatv("failedObligation={0} theoremFailure={1} "
+                           "failureReason={2}",
+                           obligation, theoremFailure, reason)
+          .str();
+    }
+  };
 
   /// \brief Return whether a fallback proof failure is theorem-facing.
   ///
@@ -1220,19 +1218,18 @@ private:
     const TerminalFallbackProofFailure *PrimaryFailure() const {
       return proofFailures.empty() ? nullptr : &proofFailures.front();
     }
-  };
 
-  friend inline std::string toString(const TerminalFallbackWitness &witness) {
-    const TerminalFallbackProofFailure *primary = witness.PrimaryFailure();
-    return llvm::formatv("{0} failureCount={1} secondaryFailureCount={2}",
-                         primary ? toString(*primary)
-                                 : StringRef("<missing-terminal-failure>"),
-                         witness.proofFailures.size(),
-                         witness.proofFailures.size() > 1
-                             ? witness.proofFailures.size() - 1
-                             : 0)
-        .str();
-  }
+    std::string ToString() const {
+      const TerminalFallbackProofFailure *primary = PrimaryFailure();
+      return llvm::formatv("{0} failureCount={1} secondaryFailureCount={2}",
+                           primary ? primary->ToString()
+                                   : std::string("<missing-terminal-failure>"),
+                           proofFailures.size(),
+                           proofFailures.size() > 1 ? proofFailures.size() - 1
+                                                    : 0)
+          .str();
+    }
+  };
 
   /// \brief Typed construction request for the terminal raw-B carrier.
   ///
@@ -1246,6 +1243,12 @@ private:
     TerminalFallbackProofFailure failure;
     std::string phase;
     std::string detail;
+
+    std::string ToString() const {
+      return llvm::formatv("{0} terminalAction=raw-b-emission phase={1}: {2}",
+                           failure, phase, detail)
+          .str();
+    }
   };
 
   static TerminalFallbackRequest
@@ -1257,13 +1260,6 @@ private:
     request.phase = phase.str();
     request.detail = detail.str();
     return request;
-  }
-
-  friend inline std::string toString(const TerminalFallbackRequest &request) {
-    return llvm::formatv("{0} terminalAction=raw-b-emission phase={1}: {2}",
-                         toString(request.failure), request.phase,
-                         request.detail)
-        .str();
   }
 
 
@@ -1779,9 +1775,9 @@ private:
                  "target_pp={0} suffix_state={1} observer_state={2} "
                  "counter={3} producers={4} boundary={5} diagnostics={6} "
                  "composition={7} complete={8} unknown_dims={9}",
-                 targetPPTokens.ToString(), suffixState.ToString(),
-                 preservedObservers.ToString(), counterState.ToString(),
-                 producerKinds.ToString(), toString(boundaryClass),
+                 targetPPTokens, suffixState,
+                 preservedObservers, counterState,
+                 producerKinds, toString(boundaryClass),
                  toString(diagnosticClass), toString(compositionClass),
                  HasUnknownDimensions() ? "no" : "yes",
                  UnknownDimensionSummary())
@@ -1841,8 +1837,7 @@ private:
 
     std::string ToString() const {
       return llvm::formatv("class={0} candidates={1} selectable={2} {3}",
-                           classIndex, candidateCount, selectableCount,
-                           key.ToString())
+                           classIndex, candidateCount, selectableCount, key)
           .str();
     }
   };
@@ -10874,12 +10869,14 @@ RefoldEngine::OwnerStateDeltaToObserverSummary(const OwnerStateDelta &delta) {
 namespace llvm {
 using namespace clang::refold;
 
+#if 0
 template <> struct format_provider<RefoldEngine::TerminalFallbackWitness> {
   static void format(const RefoldEngine::TerminalFallbackWitness &witness,
                      raw_ostream &os, StringRef style) {
-    os << toString(witness);
+    os << witness.ToString();
   }
 };
+#endif
 
 template <> struct DenseMapInfo<std::optional<uint64_t>> {
   static inline std::optional<uint64_t> getEmptyKey() {

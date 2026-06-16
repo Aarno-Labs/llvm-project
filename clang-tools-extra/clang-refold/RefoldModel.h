@@ -49,13 +49,6 @@ namespace refold {
 
 enum class PPArgSpanKind { Standard, Stringify, Paste };
 
-enum class MacroCalleeOriginKind {
-  LiteralMacroName,
-  CallerParam,
-  Paste,
-  Opaque
-};
-
 static inline StringRef toString(PPArgSpanKind kind) {
   switch (kind) {
   case PPArgSpanKind::Standard:
@@ -67,6 +60,13 @@ static inline StringRef toString(PPArgSpanKind kind) {
   }
   llvm_unreachable("Invalid PPArgSpanKind");
 }
+
+enum class MacroCalleeOriginKind {
+  LiteralMacroName,
+  CallerParam,
+  Paste,
+  Opaque
+};
 
 static inline StringRef toString(MacroCalleeOriginKind kind) {
   switch (kind) {

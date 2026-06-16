@@ -2168,11 +2168,12 @@ RefoldEngine::WrapIncludeExpansionForMaterialization(
           OwnerStateBoundary::FromSource(OwnerSourceRange::From(
               childFileSpelling, 0, 0, std::optional<uint64_t>(child.id)));
       forEachLineControlDemandComponent(
-          childDemand, childNeedsLayoutBarrier, [&](OwnerStateComponent component) {
+          childDemand, childNeedsLayoutBarrier,
+          [&](OwnerStateComponent component) {
             const std::string detail =
                 llvm::formatv("synthetic include-entry #line for inc#{0} "
                               "component={1} child='{2}'",
-                              child.id, toString(component), childFileSpelling)
+                              child.id, component, childFileSpelling)
                     .str();
             (void)checkLineControlRepair(
                 childEntryBoundary, component, StateMutationKind::Replayed,
@@ -2206,8 +2207,8 @@ RefoldEngine::WrapIncludeExpansionForMaterialization(
             const std::string detail =
                 llvm::formatv("synthetic include-return #line for inc#{0} "
                               "component={1} parent='{2}' byte={3}",
-                              child.id, toString(component),
-                              parentOwnerFileForDemand, parentResumeOffset)
+                              child.id, component, parentOwnerFileForDemand,
+                              parentResumeOffset)
                     .str();
             (void)checkLineControlRepair(
                 parentReturnBoundary, component, StateMutationKind::Replayed,
@@ -5974,7 +5975,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
         const std::string detail =
             llvm::formatv("synthetic header source #line resume for include "
                           "#{0} patch[{1}] component={2} sourceEnd={3}",
-                          ie.include->id, idx, toString(component), *endByte)
+                          ie.include->id, idx, component, *endByte)
                 .str();
         (void)CheckStateTransitionAcrossEditBoundary(
             sourceLineResumeBoundary, component, StateMutationKind::Replayed,

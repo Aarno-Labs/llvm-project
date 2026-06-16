@@ -728,7 +728,7 @@ std::string RefoldEngine::BuildOwnerUnresolvedNoTUAnchorDetail(
                        "boundaryParentInclude={13} hasBoundaryInclude={14} "
                        "declaredDomainWall={15}",
                        hunkIndex, h.aStart, h.aEnd, isInsertion ? "yes" : "no",
-                       toString(owner.kind), macroOwnerExhausted ? "yes" : "no",
+                       owner.kind, macroOwnerExhausted ? "yes" : "no",
                        includeOwnerExhausted ? "yes" : "no",
                        mapsToTU ? "yes" : "no", tuSpanStr,
                        hasTUByteSpan ? "yes" : "no", exactSlot, insertionAnchor,

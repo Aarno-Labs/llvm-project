@@ -5943,7 +5943,7 @@ std::string RefoldEngine::ResolvePostStructuralFallback() {
       terminalBranch, terminalCandidate,
       "ResolvePostStructuralFallback/terminal");
   for (const TerminalFallbackRequest &request : terminalFallbackRequests_)
-    debug("fallback", "  {0}", toString(request));
+    debug("fallback", "  {0}", request);
 
   // The raw-B terminal carrier is the fully expanded surface, so every include
   // and every top-level macro root remains expanded in the final result.
