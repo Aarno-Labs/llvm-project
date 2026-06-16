@@ -97,6 +97,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <set>
 #include <cctype>
 #include <cstdint>
@@ -3807,7 +3808,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
   // include/conditional/macro identity and edited-side line-shape data so the
   // diff layer can suppress ambiguous repeated-token anchors and restore only
   // certified boundary-preserving frontiers.
-  auto gapProvenance = ComputeLcsAGapProvenanceForPP();
+  auto gapProvenance = ComputeLcsAGapProvenanceForPP(ownerDepthGap_);
   auto bGapProvenance = ComputeLcsBGapProvenanceForPP();
   auto a2b = diffutils::lcsMapAB(aSeq, bSeq, gapProvenance, bGapProvenance);
 
@@ -9336,7 +9337,7 @@ std::vector<uint32_t> RefoldEngine::ComputeOwnerDepthGapsForPP() {
 }
 
 std::vector<diffutils::LcsAGapProvenance>
-RefoldEngine::ComputeLcsAGapProvenanceForPP() {
+RefoldEngine::ComputeLcsAGapProvenanceForPP(ArrayRef<uint32_t> ownerDepthGap) {
   using diffutils::LcsAGapProvenance;
 
   // The core LCS still consumes the same scalar owner-depth array as before.
@@ -9346,7 +9347,8 @@ RefoldEngine::ComputeLcsAGapProvenanceForPP() {
 
   const size_t N = aTokOff_.size() - 1;
   std::vector<LcsAGapProvenance> profiles(N + 1);
-  const std::vector<uint32_t> ownerDepthGap = ComputeOwnerDepthGapsForPP();
+  assert(ownerDepthGap.size() == N + 1 &&
+         "A-side LCS provenance requires one owner-depth entry per PP gap");
 
   struct MacroTokenContext {
     uint64_t rootId = LcsAGapProvenance::NoId;

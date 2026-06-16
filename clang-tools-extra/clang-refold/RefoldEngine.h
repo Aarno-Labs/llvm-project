@@ -7493,7 +7493,8 @@ private:
   /// DiffAlgorithms uses these profiles to keep forced anchors and to restore
   /// ambiguous edge anchors only when a unique owner-preserving frontier is
   /// certified.
-  std::vector<diffutils::LcsAGapProvenance> ComputeLcsAGapProvenanceForPP();
+  std::vector<diffutils::LcsAGapProvenance>
+  ComputeLcsAGapProvenanceForPP(ArrayRef<uint32_t> ownerDepthGap);
 
   /// \brief Compute edited-side source-surface profiles for B-side token gaps.
   ///
