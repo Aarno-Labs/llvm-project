@@ -177,40 +177,191 @@ static bool isSourceGraphDirectiveHorizontalWhitespace(char c) {
   return c == ' ' || c == '\t' || c == '\r' || c == '\f' || c == '\v';
 }
 
-/// Skip preprocessing whitespace that can legally precede a directive
-/// introducer on a single physical line.  The preprocessor treats complete
-/// block comments as whitespace before recognizing `#`, so proof code that
-/// guards source-graph sidecars or macro-state motion must not use a raw
-/// horizontal-whitespace-only test.  Line comments are intentionally not
-/// skipped: `//#include` comments out the introducer instead of exposing a
-/// directive.  Unterminated or multi-line block comments are not accepted by
-/// this single-line helper; callers that use it as a safety barrier should
-/// fail closed when they need stronger recovery.
-static bool skipDirectiveLinePrefixWhitespace(StringRef line, size_t &pos) {
-  while (pos < line.size()) {
-    if (isSourceGraphDirectiveHorizontalWhitespace(line[pos])) {
+static bool consumeDirectiveScannerNewline(StringRef text, size_t &pos) {
+  if (pos >= text.size())
+    return false;
+  if (text[pos] == '\r') {
+    ++pos;
+    if (pos < text.size() && text[pos] == '\n')
+      ++pos;
+    return true;
+  }
+  if (text[pos] == '\n') {
+    ++pos;
+    return true;
+  }
+  return false;
+}
+
+static bool consumeDirectiveScannerEscapedNewline(StringRef text,
+                                                  size_t &pos) {
+  if (pos >= text.size() || text[pos] != '\\')
+    return false;
+
+  size_t afterBackslash = pos + 1;
+  if (!consumeDirectiveScannerNewline(text, afterBackslash))
+    return false;
+
+  // Translation phase 2 deletes the backslash-newline pair before directive
+  // recognition.  Keep the caller's current logical-line state unchanged.
+  pos = afterBackslash;
+  return true;
+}
+
+/// Return the byte offset of the next preprocessing directive introducer.
+///
+/// This is intentionally a tiny phase-1/phase-2/phase-3 scanner rather than a
+/// raw physical-line test.  Clang recognizes directives after deleting escaped
+/// newlines and after replacing comments with whitespace.  In particular,
+/// `#\\\ninclude` is `#include`, and a complete block comment may span a
+/// physical newline before the `#` that starts the directive.  Proof code that
+/// guards source-graph sidecars or macro-state motion must see the same
+/// directive boundary; otherwise it can preserve an include in the wrong lookup
+/// context or move macro state across an observing include.
+///
+/// Line comments are different: after phase 2 they consume the rest of the
+/// logical line, so a `#` inside `// ...` is not a directive introducer.  An
+/// unterminated block comment simply prevents later bytes from being observed as
+/// directives by this scanner; callers that need stronger recovery already fail
+/// closed at the proof site.
+static std::optional<size_t>
+findPreprocessingDirectiveIntroducer(StringRef text, size_t start = 0) {
+  bool onlyTriviaOnLogicalLine = true;
+  bool inBlockComment = false;
+  bool blockCommentStartedInDirectivePrefix = false;
+  size_t pos = start;
+
+  while (pos < text.size()) {
+    if (consumeDirectiveScannerEscapedNewline(text, pos))
+      continue;
+
+    if (inBlockComment) {
+      if (pos + 1 < text.size() && text[pos] == '*' && text[pos + 1] == '/') {
+        // A complete block comment is phase-3 preprocessing whitespace.  Once
+        // the terminator is consumed, directive-prefix scanning must resume in
+        // the surrounding logical line; otherwise a real directive such as
+        // `/*\n*/#include` is hidden from macro-state and include-replay
+        // proofs.
+        pos += 2;
+        inBlockComment = false;
+        continue;
+      }
+      if (consumeDirectiveScannerNewline(text, pos)) {
+        // A newline inside a leading block comment still leaves the eventual
+        // comment replacement in directive-prefix trivia.  A newline inside a
+        // block comment that began after real source code does not retroactively
+        // make the following bytes directive-prefix trivia.
+        onlyTriviaOnLogicalLine = blockCommentStartedInDirectivePrefix;
+        continue;
+      }
       ++pos;
       continue;
     }
 
-    if (pos + 1 < line.size() && line[pos] == '/' && line[pos + 1] == '*') {
-      const size_t end = line.find("*/", pos + 2);
-      if (end == StringRef::npos)
-        return false;
-      pos = end + 2;
+    if (pos + 1 < text.size() && text[pos] == '/' && text[pos + 1] == '*') {
+      blockCommentStartedInDirectivePrefix = onlyTriviaOnLogicalLine;
+      pos += 2;
+      inBlockComment = true;
       continue;
     }
 
+    if (pos + 1 < text.size() && text[pos] == '/' && text[pos + 1] == '/') {
+      pos += 2;
+      while (pos < text.size()) {
+        if (consumeDirectiveScannerEscapedNewline(text, pos))
+          continue;
+        if (consumeDirectiveScannerNewline(text, pos))
+          break;
+        ++pos;
+      }
+      onlyTriviaOnLogicalLine = true;
+      continue;
+    }
+
+    if (consumeDirectiveScannerNewline(text, pos)) {
+      onlyTriviaOnLogicalLine = true;
+      continue;
+    }
+
+    if (!onlyTriviaOnLogicalLine) {
+      ++pos;
+      continue;
+    }
+
+    if (isSourceGraphDirectiveHorizontalWhitespace(text[pos])) {
+      ++pos;
+      continue;
+    }
+
+    if (text[pos] == '#')
+      return pos;
+
+    onlyTriviaOnLogicalLine = false;
+    ++pos;
+  }
+
+  return std::nullopt;
+}
+
+/// Skip preprocessing whitespace after a directive introducer or keyword.
+/// Escaped newlines are ignored because phase 2 removes them.  Complete block
+/// comments are skipped as whitespace, including comments that span physical
+/// lines; Clang accepts constructs such as `#/*\n*/include` for the same
+/// reason.  Line comments are not skipped because they terminate the directive
+/// logical line.
+static bool skipDirectiveLogicalWhitespace(StringRef text, size_t &pos) {
+  while (pos < text.size()) {
+    if (isSourceGraphDirectiveHorizontalWhitespace(text[pos])) {
+      ++pos;
+      continue;
+    }
+    if (consumeDirectiveScannerEscapedNewline(text, pos))
+      continue;
+    if (pos + 1 < text.size() && text[pos] == '/' && text[pos + 1] == '*') {
+      pos += 2;
+      while (pos + 1 < text.size() &&
+             !(text[pos] == '*' && text[pos + 1] == '/')) {
+        if (consumeDirectiveScannerEscapedNewline(text, pos))
+          continue;
+        ++pos;
+      }
+      if (pos + 1 >= text.size())
+        return false;
+      pos += 2;
+      continue;
+    }
     break;
   }
   return true;
 }
 
-static bool lineHasPreprocessingDirectiveIntroducer(StringRef line) {
-  size_t pos = 0;
-  if (!skipDirectiveLinePrefixWhitespace(line, pos))
+static bool readDirectiveIdentifier(StringRef text, size_t &pos,
+                                    std::string &identifier) {
+  identifier.clear();
+  while (pos < text.size()) {
+    if (consumeDirectiveScannerEscapedNewline(text, pos))
+      continue;
+    const unsigned char c = static_cast<unsigned char>(text[pos]);
+    if (std::isalpha(c) || text[pos] == '_')
+      break;
     return false;
-  return pos < line.size() && line[pos] == '#';
+  }
+
+  while (pos < text.size()) {
+    if (consumeDirectiveScannerEscapedNewline(text, pos))
+      continue;
+    const unsigned char c = static_cast<unsigned char>(text[pos]);
+    if (!(std::isalnum(c) || text[pos] == '_'))
+      break;
+    identifier.push_back(text[pos]);
+    ++pos;
+  }
+
+  return !identifier.empty();
+}
+
+static bool lineHasPreprocessingDirectiveIntroducer(StringRef text) {
+  return findPreprocessingDirectiveIntroducer(text).has_value();
 }
 
 /// Classify whether a materialized include-owner expansion contains a surviving
@@ -233,47 +384,44 @@ enum class MaterializedIncludeReplayAlias {
 
 static MaterializedIncludeReplayAlias classifyMaterializedIncludeReplayAlias(
     StringRef materializedText, StringRef sourceGraphPath) {
-  size_t lineBegin = 0;
-  while (lineBegin <= materializedText.size()) {
-    size_t lineEnd = materializedText.find('\n', lineBegin);
-    if (lineEnd == StringRef::npos)
-      lineEnd = materializedText.size();
+  size_t searchPos = 0;
+  while (std::optional<size_t> hash =
+             findPreprocessingDirectiveIntroducer(materializedText, searchPos)) {
+    size_t pos = *hash + 1;
+    searchPos = pos;
 
-    StringRef line = materializedText.slice(lineBegin, lineEnd);
-    size_t pos = 0;
-    skipDirectiveLinePrefixWhitespace(line, pos);
-    if (pos < line.size() && line[pos] == '#') {
+    if (!skipDirectiveLogicalWhitespace(materializedText, pos))
+      return MaterializedIncludeReplayAlias::UnprovenInclude;
+
+    std::string keyword;
+    if (!readDirectiveIdentifier(materializedText, pos, keyword))
+      continue;
+    if (keyword != "include")
+      continue;
+
+    if (!skipDirectiveLogicalWhitespace(materializedText, pos))
+      return MaterializedIncludeReplayAlias::UnprovenInclude;
+
+    if (pos >= materializedText.size() || materializedText[pos] != '"')
+      return MaterializedIncludeReplayAlias::UnprovenInclude;
+
+    const size_t pathBegin = ++pos;
+    while (pos < materializedText.size() && materializedText[pos] != '"') {
+      // Keep this classifier conservative.  A quoted include whose operand
+      // itself uses a splice or reaches an unescaped newline is not a simple
+      // path-level equality proof, so source-graph replay must fail closed.
+      if (materializedText[pos] == '\\' || materializedText[pos] == '\n' ||
+          materializedText[pos] == '\r')
+        return MaterializedIncludeReplayAlias::UnprovenInclude;
       ++pos;
-      skipDirectiveLinePrefixWhitespace(line, pos);
-      const StringRef keyword = "include";
-      if (line.substr(pos, keyword.size()) == keyword &&
-          (pos + keyword.size() == line.size() ||
-           !(std::isalnum(static_cast<unsigned char>(
-                 line[pos + keyword.size()])) ||
-             line[pos + keyword.size()] == '_'))) {
-        pos += keyword.size();
-        skipDirectiveLinePrefixWhitespace(line, pos);
-
-        if (pos >= line.size() || line[pos] != '"')
-          return MaterializedIncludeReplayAlias::UnprovenInclude;
-
-        const size_t pathBegin = ++pos;
-        while (pos < line.size() && line[pos] != '"') {
-          if (line[pos] == '\\')
-            return MaterializedIncludeReplayAlias::UnprovenInclude;
-          ++pos;
-        }
-        if (pos >= line.size())
-          return MaterializedIncludeReplayAlias::UnprovenInclude;
-
-        if (line.slice(pathBegin, pos) == sourceGraphPath)
-          return MaterializedIncludeReplayAlias::SamePath;
-      }
     }
+    if (pos >= materializedText.size())
+      return MaterializedIncludeReplayAlias::UnprovenInclude;
 
-    if (lineEnd == materializedText.size())
-      break;
-    lineBegin = lineEnd + 1;
+    if (materializedText.slice(pathBegin, pos) == sourceGraphPath)
+      return MaterializedIncludeReplayAlias::SamePath;
+
+    searchPos = pos + 1;
   }
 
   return MaterializedIncludeReplayAlias::None;
@@ -10731,21 +10879,7 @@ bool RefoldEngine::ReplacementObservesMacroStateDirective(
 /// unsafe by default because conditionals, includes, and macro transitions have
 /// structural effects beyond token-level identifier observation.
 bool RefoldEngine::TextContainsDirectiveLine(StringRef text) const {
-  size_t lineBegin = 0;
-  while (lineBegin <= text.size()) {
-    size_t lineEnd = text.find('\n', lineBegin);
-    if (lineEnd == StringRef::npos)
-      lineEnd = text.size();
-
-    if (lineHasPreprocessingDirectiveIntroducer(
-            text.slice(lineBegin, lineEnd)))
-      return true;
-
-    if (lineEnd == text.size())
-      break;
-    lineBegin = lineEnd + 1;
-  }
-  return false;
+  return lineHasPreprocessingDirectiveIntroducer(text);
 }
 
 /// True when moving `directive` across `chunk` could change how that chunk

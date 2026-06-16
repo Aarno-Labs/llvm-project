@@ -3007,6 +3007,25 @@ void RefoldEngine::MaterializeIncludeExpansion(
           return true;
         }
 
+        // The producer may not contain a TU-level same-spelling include while
+        // the final replay directory still contains a file that would shadow
+        // the child's original header-relative lookup.  This happens whenever a
+        // materialized parent with `#include "leaf.h"` is emitted beside a TU
+        // directory that already has `leaf.h` (including stale/source-graph
+        // side outputs).  Since the engine emits only the refolded TU text here
+        // and cannot rewrite headers, preserving the clean child directive is
+        // safe only when replaying that quoted spelling from the TU directory is
+        // proven to resolve to the same physical file that the producer saw.
+        SmallString<256> replayFromTUDir(model_.GetSourcePath());
+        llvm::sys::path::remove_filename(replayFromTUDir);
+        llvm::sys::path::append(replayFromTUDir, *childReplayPath);
+
+        StringRef replayFromTUDirRef(replayFromTUDir.data(),
+                                      replayFromTUDir.size());
+        if (llvm::sys::fs::exists(replayFromTUDirRef) &&
+            !PathsEqual(replayFromTUDirRef, *child.resolvedPath))
+          return true;
+
         return false;
       };
 
@@ -3065,7 +3084,31 @@ void RefoldEngine::MaterializeIncludeExpansion(
       const auto &childText = includeExpansion[child->id];
       const size_t n = bytes.size();
       const uint64_t siteStart = std::clamp<uint64_t>(child->siteB, 0ULL, n);
-      const uint64_t siteEnd = std::clamp<uint64_t>(child->siteE, siteStart, n);
+      uint64_t siteEnd = std::clamp<uint64_t>(child->siteE, siteStart, n);
+
+      // Producer include ranges are normally the complete directive spelling,
+      // but line-spliced directives can be reported with an end offset that
+      // covers only the first physical line (for example `#\\\n`).  When a
+      // materialized parent replaces a dirty child include, leaving the
+      // continuation line behind turns `#\\\ninclude "h"` into the ordinary
+      // tokens `include "h"`.  Treat the owner interval as the whole physical
+      // directive by extending through escaped-newline continuations, matching
+      // the defensive TU-level include materialization rule below.
+      if (siteStart < static_cast<uint64_t>(bytes.size())) {
+        size_t cursor = static_cast<size_t>(siteStart);
+        while (true) {
+          size_t nl = StringRef(bytes).find('\n', cursor);
+          if (nl == StringRef::npos) {
+            siteEnd = static_cast<uint64_t>(bytes.size());
+            break;
+          }
+          cursor = nl + 1;
+          if (!stringutils::isLineSplice(bytes, nl)) {
+            siteEnd = std::max<uint64_t>(siteEnd, cursor);
+            break;
+          }
+        }
+      }
 
       if (siteStart < siteEnd) {
         const bool sidebandOnly = classifyMaterializationWork(
@@ -3075,7 +3118,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
             includeExpansionStartLineNos.lookup(child->id);
         LineDirectiveLocation parentResume =
             LineDirectiveInserter::LogicalLocationAtOffset(
-                bytes, child->siteE, headerPath, model_, headerPath, includeId);
+                bytes, siteEnd, headerPath, model_, headerPath, includeId);
         ArrayRef<FinalLineControlPruneCandidate> childLineCandidates;
         if (auto childCandidatesIt =
                 includeExpansionLineControlPruneCandidates.find(child->id);
@@ -3089,7 +3132,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
           childLineSourceMappings = childMappingsIt->second;
         LineControlWrappedText wrapped = WrapIncludeExpansionForMaterialization(
             *child, parentResume.fileSpelling, headerPath, includeId,
-            child->siteE, childEntryLineNo ? childEntryLineNo : 1,
+            siteEnd, childEntryLineNo ? childEntryLineNo : 1,
             parentResume.lineNo, childText, childLineCandidates,
             childLineSourceMappings, sidebandOnly);
         TextEdit edit{siteStart,
