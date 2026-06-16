@@ -393,16 +393,31 @@ inline StringRef stripTrailingNewlines(StringRef s) noexcept {
   return s;
 }
 
-/// True iff the newline at \p nlIdx is escaped by a C line splice.
+/// True iff the newline at \p nlIdx is escaped by a line splice.
+///
+/// Clang accepts the common extension where horizontal whitespace separates the
+/// backslash from the physical newline, warning but still deleting the whole
+/// backslash-whitespace-newline sequence before directive recognition.  Refold
+/// proof code must follow that behavior when extending directive source ranges;
+/// otherwise materializing `#\   \ninclude "h"` can replace only the first
+/// physical line and leave `include "h"` behind as ordinary source text.
 inline constexpr bool isLineSplice(StringRef s, size_t nlIdx) {
   if (nlIdx == 0 || nlIdx > s.size())
     return false;
-  char prev = s[nlIdx - 1];
-  if (prev == '\\')
-    return true;
-  // Windows form: "\\\r\n"
-  if (prev == '\r' && nlIdx >= 2 && s[nlIdx - 2] == '\\')
-    return true;
+
+  size_t cursor = nlIdx;
+  if (cursor > 0 && s[cursor - 1] == '\r')
+    --cursor;
+
+  while (cursor > 0) {
+    char prev = s[cursor - 1];
+    if (isNonNewlineWs(prev)) {
+      --cursor;
+      continue;
+    }
+    return prev == '\\';
+  }
+
   return false;
 }
 

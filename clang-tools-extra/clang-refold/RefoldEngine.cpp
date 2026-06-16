@@ -173,8 +173,75 @@ safeSourceGraphRelativeIncludePath(const RefoldModel::IncludeItem &inc) {
   return path.str();
 }
 
+/// Return a quoted include operand that is safe to replay from another
+/// directory for the purpose of checking quote-lookup equivalence.
+///
+/// This is deliberately less restrictive than
+/// `safeSourceGraphRelativeIncludePath()`.  Source-graph side outputs create
+/// files, so they reject `.` components to avoid surprising filesystem writes.
+/// Quote-lookup proof does not write through this path; it asks whether the
+/// exact quoted spelling that would be replayed from a materialized parent
+/// surface would resolve to the same physical file.  Therefore spellings such
+/// as `./leaf.h` must be considered, or a clean child include can be preserved
+/// even though moving it from a header directory to the TU/output directory
+/// changes lookup.
+static std::optional<std::string>
+quotedIncludeReplayLookupPath(const RefoldModel::IncludeItem &inc) {
+  if (inc.angled)
+    return std::nullopt;
+
+  StringRef target = inc.target;
+  if (target.size() < 2 || target.front() != '"' || target.back() != '"')
+    return std::nullopt;
+
+  StringRef path = target.drop_front().drop_back();
+  if (path.empty() || path.contains('\\') || path.contains('"') ||
+      llvm::sys::path::is_absolute(path))
+    return std::nullopt;
+
+  SmallVector<StringRef, 8> components;
+  path.split(components, '/', /*MaxSplit=*/-1, /*KeepEmpty=*/true);
+  for (StringRef component : components)
+    if (component.empty() || component == "..")
+      return std::nullopt;
+
+  if (!llvm::all_of(path, [](char c) {
+        return isSafeSourceGraphIncludePathChar(c);
+      }))
+    return std::nullopt;
+
+  return path.str();
+}
+
+/// Return a lexical key for comparing quoted include operands from the same
+/// directory.  `./leaf.h` and `leaf.h` are the same lookup request, but the
+/// original spelling is still needed when probing the output directory above.
+static std::optional<std::string>
+quotedIncludeReplayLookupKey(const RefoldModel::IncludeItem &inc) {
+  std::optional<std::string> replayPath = quotedIncludeReplayLookupPath(inc);
+  if (!replayPath)
+    return std::nullopt;
+
+  SmallVector<StringRef, 8> components;
+  StringRef(*replayPath).split(components, '/', /*MaxSplit=*/-1,
+                               /*KeepEmpty=*/true);
+
+  SmallString<128> normalized;
+  for (StringRef component : components) {
+    if (component == ".")
+      continue;
+    if (!normalized.empty())
+      normalized.push_back('/');
+    normalized.append(component);
+  }
+
+  if (normalized.empty())
+    return std::nullopt;
+  return normalized.str().str();
+}
+
 static bool isSourceGraphDirectiveHorizontalWhitespace(char c) {
-  return c == ' ' || c == '\t' || c == '\r' || c == '\f' || c == '\v';
+  return c == '\r' || stringutils::isNonNewlineWs(c);
 }
 
 static bool consumeDirectiveScannerNewline(StringRef text, size_t &pos) {
@@ -199,11 +266,17 @@ static bool consumeDirectiveScannerEscapedNewline(StringRef text,
     return false;
 
   size_t afterBackslash = pos + 1;
+  while (afterBackslash < text.size() &&
+         isSourceGraphDirectiveHorizontalWhitespace(text[afterBackslash]))
+    ++afterBackslash;
   if (!consumeDirectiveScannerNewline(text, afterBackslash))
     return false;
 
   // Translation phase 2 deletes the backslash-newline pair before directive
-  // recognition.  Keep the caller's current logical-line state unchanged.
+  // recognition.  Clang also accepts horizontal whitespace before the newline
+  // as an extension, so the directive scanner consumes the same spelling that
+  // source-range extension treats as a splice.  Keep the caller's current
+  // logical-line state unchanged.
   pos = afterBackslash;
   return true;
 }

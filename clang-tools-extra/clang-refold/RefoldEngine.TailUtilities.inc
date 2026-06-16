@@ -2986,9 +2986,12 @@ void RefoldEngine::MaterializeIncludeExpansion(
           return false;
 
         std::optional<std::string> childReplayPath =
-            safeSourceGraphRelativeIncludePath(child);
+            quotedIncludeReplayLookupPath(child);
         if (!childReplayPath)
           return false;
+
+        std::optional<std::string> childReplayKey =
+            quotedIncludeReplayLookupKey(child);
 
         for (const RefoldModel::IncludeItem &tuInc : model_.GetIncludes()) {
           if (tuInc.id == child.id || tuInc.parent ||
@@ -2996,9 +2999,10 @@ void RefoldEngine::MaterializeIncludeExpansion(
               !tuInc.resolvedPath)
             continue;
 
-          std::optional<std::string> tuReplayPath =
-              safeSourceGraphRelativeIncludePath(tuInc);
-          if (!tuReplayPath || *tuReplayPath != *childReplayPath)
+          std::optional<std::string> tuReplayKey =
+              quotedIncludeReplayLookupKey(tuInc);
+          if (!childReplayKey || !tuReplayKey ||
+              *tuReplayKey != *childReplayKey)
             continue;
 
           if (PathsEqual(*tuInc.resolvedPath, *child.resolvedPath))
