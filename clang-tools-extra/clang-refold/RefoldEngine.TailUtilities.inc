@@ -2287,7 +2287,8 @@ void RefoldEngine::MaterializeIncludeExpansion(
     DenseMap<uint64_t, size_t> &includeExpansionStartLineNos,
     DenseMap<uint64_t, AcceptedResultCandidate>
         &includeExpansionAcceptedResults,
-    DenseSet<uint64_t> *appliedExpandedMacroRootIds) const {
+    DenseSet<uint64_t> *appliedExpandedMacroRootIds,
+    bool materializeIncludeNextInThisSubtree) const {
   // Include materialization is memoized by include id. A parent may reach the
   // same child through recursive expansion, so avoid rebuilding already
   // materialized text.
@@ -3105,6 +3106,14 @@ void RefoldEngine::MaterializeIncludeExpansion(
     CleanChildIncludeReplayAction action = CleanChildIncludeReplayAction::None;
     std::string rewrittenOperand;
     std::string reason;
+
+    // Set when the materialization decision was forced by descendant
+    // #include_next state.  The recursive materialization of this child must
+    // realize nested include_next directives as concrete text rather than
+    // rewriting them as ordinary includes; otherwise the final output would
+    // still depend on replaying a search-stack-sensitive directive from a
+    // relocated context.
+    bool forceMaterializeDescendantIncludeNext = false;
   };
 
   struct IncludeReplayCandidate {
@@ -3453,6 +3462,13 @@ void RefoldEngine::MaterializeIncludeExpansion(
     bool observesBaseFile = false;
     bool observesIncludeLevel = false;
 
+    // A descendant #include_next in a clean child subtree observes the
+    // producer include-search stack.  Re-entering the same physical child
+    // header after materializing its parent does not prove that descendant
+    // include-next lookup will resume from the same search position, so clean
+    // child replay must fail closed to materialization when this bit is set.
+    bool hasDescendantIncludeNext = false;
+
     // Exact producer-observed payloads of preserved file-spelling observers in
     // this include subtree.  These come from the macro expansion tokens in the
     // original preprocessed stream, not from IncludeItem::resolvedPath: current
@@ -3484,7 +3500,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
 
     bool requiresReplayCandidateProof() const {
       return observesLine || observesFileSpelling() || observesBaseFile ||
-             observesIncludeLevel;
+             observesIncludeLevel || hasDescendantIncludeNext;
     }
   };
 
@@ -3554,6 +3570,24 @@ void RefoldEngine::MaterializeIncludeExpansion(
             std::move(producerCandidate->EnteredFileSpelling);
 
     const bool lineSensitiveDemandEnabled = lineDirs_.Enabled();
+
+    for (const RefoldModel::IncludeItem &descendant : model_.GetIncludes()) {
+      if (descendant.id == includeId)
+        continue;
+      if (descendant.subkind != "#include_next")
+        continue;
+      if (!includeIdIsDescendantOrSelf(descendant.id, includeId))
+        continue;
+
+      // include_next is not a file-identity observer; it is a search-stack
+      // observer.  A clean child can replay to the same physical file from a
+      // materialized parent surface while a nested include_next in that child
+      // resumes after a different include directory.  Since current maps do
+      // not record enough include-search-stack state to prove equivalence for
+      // descendant include_next, fail closed and materialize the child subtree.
+      demand.hasDescendantIncludeNext = true;
+      break;
+    }
 
     for (const auto &macro : model_.GetMacroInvocations()) {
       const bool observesLine = macro.name == "__LINE__";
@@ -3711,6 +3745,18 @@ void RefoldEngine::MaterializeIncludeExpansion(
 
     const CleanChildIncludeReplayDemand demand =
         cleanChildIncludeReplayDemand(child.id);
+
+    // A descendant include_next observes the original include-search stack.
+    // Moving the clean child include onto a materialized parent surface can
+    // make the descendant resume lookup after a different directory even when
+    // the child itself re-enters the same physical header.
+    if (demand.hasDescendantIncludeNext) {
+      plan.action = CleanChildIncludeReplayAction::Materialize;
+      plan.forceMaterializeDescendantIncludeNext = true;
+      plan.reason = "child subtree contains descendant #include_next across "
+                    "materialized-parent include relocation";
+      return plan;
+    }
 
     // __INCLUDE_LEVEL__ observes include-stack depth.  Physical identity and
     // entered-file spelling do not prove that a relocated clean child include
@@ -4017,10 +4063,13 @@ void RefoldEngine::MaterializeIncludeExpansion(
   // replace the child's include directive in this header.
   if (auto it = children.find(includeId); it != children.end()) {
     for (const auto *child : it->second) {
-      const bool todo = hasDescendantWork(hasDescendantWork, child->id);
+      bool todo = hasDescendantWork(hasDescendantWork, child->id);
+      if (materializeIncludeNextInThisSubtree &&
+          child->subkind == "#include_next")
+        todo = true;
+      CleanChildIncludeReplayPlan replayPlan;
       if (!todo) {
-        CleanChildIncludeReplayPlan replayPlan =
-            planCleanChildIncludeReplayFromMaterializedParent(*child);
+        replayPlan = planCleanChildIncludeReplayFromMaterializedParent(*child);
         if (replayPlan.action == CleanChildIncludeReplayAction::RewriteOperand) {
           if (std::optional<TextEdit> rewrite =
                   makeCleanChildIncludeOperandRewriteEdit(
@@ -4055,6 +4104,10 @@ void RefoldEngine::MaterializeIncludeExpansion(
         }
       }
 
+      const bool forceIncludeNextMaterialization =
+          materializeIncludeNextInThisSubtree ||
+          replayPlan.forceMaterializeDescendantIncludeNext;
+
       // Depth-first materialization ensures the child replacement is already
       // complete before it is wrapped and inserted into the parent header.
       MaterializeIncludeExpansion(child->id, perInclude, macroPatchesByOwner,
@@ -4063,7 +4116,8 @@ void RefoldEngine::MaterializeIncludeExpansion(
                                   includeExpansionLineControlSourceMappings,
                                   includeExpansionStartLineNos,
                                   includeExpansionAcceptedResults,
-                                  appliedExpandedMacroRootIds);
+                                  appliedExpandedMacroRootIds,
+                                  forceIncludeNextMaterialization);
 
       const auto &childText = includeExpansion[child->id];
       const size_t n = bytes.size();

@@ -10048,6 +10048,13 @@ private:
   ///                            records root macro invocation ids for macro
   ///                            patches that remain expanded after being applied
   ///                            while materializing this include subtree.
+  /// \param materializeIncludeNextInThisSubtree
+  ///                            When true, descendant #include_next directives
+  ///                            are realized as materialized text instead of
+  ///                            being rewritten as ordinary includes.  This is
+  ///                            used only after an ancestor clean-child replay
+  ///                            has been rejected because include-next search
+  ///                            stack state cannot be proven stable.
   void MaterializeIncludeExpansion(
       uint64_t includeId, const DenseMap<uint64_t, IncludeEdits> &perInclude,
       const DenseMap<std::optional<uint64_t>, std::vector<MacroPatch>>
@@ -10062,7 +10069,8 @@ private:
       DenseMap<uint64_t, size_t> &includeExpansionStartLineNos,
       DenseMap<uint64_t, AcceptedResultCandidate>
           &includeExpansionAcceptedResults,
-      DenseSet<uint64_t> *appliedExpandedMacroRootIds = nullptr) const;
+      DenseSet<uint64_t> *appliedExpandedMacroRootIds = nullptr,
+      bool materializeIncludeNextInThisSubtree = false) const;
 
   /// \brief Realize an include directly from the edited preprocessed stream B.
   ///
