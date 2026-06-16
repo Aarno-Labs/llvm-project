@@ -5460,6 +5460,124 @@ std::string RefoldEngine::RunSinglePassRefold() {
     return true;
   };
 
+  auto findBoundaryDefinitionTapeReplayMacro =
+      [&](const diffutils::Hunk &hunk,
+          std::optional<uint64_t> ownerIncludeId)
+          -> const RefoldModel::MacroInvocation * {
+    // A pure insertion immediately before or after a macro expansion can still
+    // be macro-owned when the defining replacement-list tape contains a
+    // zero-token proof surface at that boundary.  Example:
+    //
+    //   #define M(A, B, C) B C A
+    //   M(, old, )      // expands to: old
+    //
+    // Inserting `x` after `old` is not strictly inside the non-empty B span,
+    // so ordinary covering-span lookup will not choose the macro.  However,
+    // the producer-proven definition tape has two empty formal occurrences at
+    // that exact expansion boundary.  This finder only exposes such boundary
+    // owners to the existing definition-tape replay validator; it does not
+    // itself prove or construct the repair.
+    if (!hunk.isInsertOnly() || hunk.bStart >= hunk.bEnd)
+      return nullptr;
+
+    const RefoldModel::MacroInvocation *best = nullptr;
+    uint64_t bestLen = std::numeric_limits<uint64_t>::max();
+
+    auto findDefinition = [&](const RefoldModel::MacroInvocation &macro)
+        -> const RefoldModel::MacroDirective * {
+      if (!macro.definitionDirectiveId)
+        return nullptr;
+      for (const RefoldModel::MacroDirective &directive :
+           model_.GetMacroDirectives()) {
+        if (directive.id == *macro.definitionDirectiveId)
+          return &directive;
+      }
+      return nullptr;
+    };
+
+    for (const RefoldModel::MacroInvocation &macro :
+         model_.GetMacroInvocations()) {
+      if (ownerIncludeId) {
+        if (!macro.ownerIncludeId || *macro.ownerIncludeId != *ownerIncludeId)
+          continue;
+      }
+
+      if (macro.subkind != "func" || !macro.cover.IsValid() ||
+          macro.cover.end <= macro.cover.begin)
+        continue;
+      if (hunk.aStart != macro.cover.begin && hunk.aStart != macro.cover.end)
+        continue;
+      if (!macro.invB || !macro.invE || !macro.invText)
+        continue;
+      if (IsInvocationInsideDefineDirective(macro))
+        continue;
+      if (!hasLiteralMacroCalleeOrigin(macro))
+        continue;
+      if (!macro.stringifySpans.empty() || !macro.pasteSpans.empty())
+        continue;
+
+      const RefoldModel::MacroDirective *definition = findDefinition(macro);
+      if (!definition || definition->subkind != "#define" ||
+          !definition->functionLike || definition->name != macro.name ||
+          definition->defParams.size() != macro.defParams.size() ||
+          definition->replacementTokens.empty())
+        continue;
+
+      auto bEnv = MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
+          macro.cover.begin, macro.cover.end);
+      if (!bEnv || bEnv->first > bEnv->second ||
+          bEnv->second > bToks_.size() ||
+          hunk.bStart < static_cast<uint64_t>(bEnv->first) ||
+          hunk.bEnd > static_cast<uint64_t>(bEnv->second))
+        continue;
+
+      auto rangesOpt = GetMacroInvocationFormalArgContentRanges(
+          macro, *macro.invText);
+      if (!rangesOpt)
+        continue;
+
+      bool hasEmptyFormalSourceSlot = false;
+      for (const auto &range : *rangesOpt) {
+        if (range.second < range.first || range.second > macro.invText->size())
+          continue;
+        if (StringRef(*macro.invText)
+                .slice(range.first, range.second)
+                .trim()
+                .empty()) {
+          hasEmptyFormalSourceSlot = true;
+          break;
+        }
+      }
+
+      bool hasMissingExpansionFormal = false;
+      for (size_t formalIdx = 0; formalIdx < rangesOpt->size(); ++formalIdx) {
+        bool sawTokenBearingStandardSpan = false;
+        for (const auto &as : macro.argSpans) {
+          if (as.kind == PPArgSpanKind::Standard &&
+              as.argIdx == formalIdx && as.begin < as.end) {
+            sawTokenBearingStandardSpan = true;
+            break;
+          }
+        }
+        if (!sawTokenBearingStandardSpan) {
+          hasMissingExpansionFormal = true;
+          break;
+        }
+      }
+
+      if (!hasEmptyFormalSourceSlot && !hasMissingExpansionFormal)
+        continue;
+
+      const uint64_t len = macro.cover.end - macro.cover.begin;
+      if (!best || len < bestLen || (len == bestLen && macro.id < best->id)) {
+        best = &macro;
+        bestLen = len;
+      }
+    }
+
+    return best;
+  };
+
   // Iterate over all hunks:
   for (size_t i = 0; i < hunks.size(); ++i) {
     const auto &h = hunks[i];
@@ -5486,6 +5604,9 @@ std::string RefoldEngine::RunSinglePassRefold() {
     if (!macroTarget && isIns)
       macroTarget =
           BoundaryGeneratedSelectorMacro(h.aStart, owner.includeId);
+    if (!macroTarget && isIns)
+      macroTarget =
+          findBoundaryDefinitionTapeReplayMacro(h, owner.includeId);
     if (auto *m = macroTarget) {
       if (m->invB && m->invE) {
         bool appliedMacroPatch = false;
