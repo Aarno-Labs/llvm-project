@@ -7167,6 +7167,71 @@ std::string RefoldEngine::RunSinglePassRefold() {
     return MacroStatePreservationPlacement::AdvancedBeforeReplacement;
   };
 
+  // If a consumed macro-state transition can be delayed until after the rest of
+  // the current physical source line, widen the owning TU edit to carry that
+  // neutral same-line suffix before appending the directive.  This preserves the
+  // natural statement-level shape for repairs such as
+  //
+  //   int x = preM;
+  //   #undef M
+  //
+  // instead of splitting the declaration as `preM` / directive / `;`.  The
+  // delayedTransitionBoundaryAfterEdit() proof is the safety gate: it admits the
+  // widening only when no other edit overlaps the carried suffix, the carried
+  // bytes do not observe the definition whose state is being moved, and the new
+  // replacement/suffix boundary can host a preprocessing directive line.
+  auto tryWidenEditToDelayedMacroStateBoundary =
+      [&](size_t editIndex, const RefoldModel::MacroDirective &definition,
+          StringRef macroName) {
+        if (editIndex >= tuEdits.size())
+          return false;
+
+        TextEdit &edit = tuEdits[editIndex];
+        std::optional<uint64_t> boundary =
+            delayedTransitionBoundaryAfterEdit(editIndex, definition, macroName);
+        if (!boundary)
+          return false;
+        if (*boundary == edit.end)
+          return true;
+        if (*boundary < edit.end || *boundary > tuBytes.size())
+          return false;
+
+        std::string replacement = edit.text;
+        replacement.append(tuBytes.begin() + edit.end,
+                           tuBytes.begin() + *boundary);
+
+        const uint64_t oldEnd = edit.end;
+        ResyncOutcome resync =
+            ApplyResyncOrPend(tuBytes, edit.start, *boundary, replacement,
+                              tuPath);
+        edit.end = *boundary;
+        edit.text = std::move(resync.text);
+        edit.pending = std::move(resync.pending);
+        edit.lineControlPruneCandidates =
+            std::move(resync.lineControlPruneCandidates);
+        edit.isDirectTUHunkEdit = false;
+        edit.directTUHunkIndex.reset();
+        edit.directTUHunkAStart.reset();
+        edit.directTUHunkAEnd.reset();
+        edit.directTUHunkBStart.reset();
+        edit.directTUHunkBEnd.reset();
+        edit.directTURawStart.reset();
+        edit.directTURawEnd.reset();
+        edit.directTUFinalStart = edit.start;
+        edit.directTUFinalEnd = edit.end;
+
+        AttachAcceptedResultCarrier(
+            edit, BuildAcceptedTUTextEditCandidate(
+                      AcceptedPathKind::TUByteSpanConservativeEdit, edit.start,
+                      edit.end, StringRef(edit.text)));
+
+        trace("macro/liveness",
+              "widened TU edit to delayed macro-state boundary: macro='{0}' "
+              "definitionDirective=#{1} oldEnd={2} newEnd={3}",
+              macroName, definition.id, oldEnd, edit.end);
+        return true;
+      };
+
   // Queue a consumed macro-state directive for preservation.  The placement is
   // selected from the first-order macro-state invariant rather than from a BOL
   // special case: replacement bytes that must remain in B's pre-transition
@@ -7275,6 +7340,19 @@ std::string RefoldEngine::RunSinglePassRefold() {
                 *insertionOffset});
         return MacroStatePreservationPlacement::InsideReplacement;
       }
+    }
+
+    // For non-observing #undef payloads, prefer delaying the transition until
+    // after any neutral same-line suffix that belongs to the same physical
+    // statement.  This keeps zero-token state repair from needlessly splitting
+    // constructs such as `preM;` while preserving the stronger invariant that
+    // the consumed #undef still appears before any suffix bytes that could
+    // observe the resurrected prior definition.  If the suffix cannot be
+    // carried safely, fall back to the ordinary edit/suffix boundary below.
+    if (directive.subkind == "#undef" && !replacementObservesDefinition &&
+        definitionObservedByReplacement) {
+      (void)tryWidenEditToDelayedMacroStateBoundary(
+          editIndex, *definitionObservedByReplacement, macroName);
     }
 
     // For non-observing #undef payloads and for #define carry without a better
@@ -7926,55 +8004,6 @@ std::string RefoldEngine::RunSinglePassRefold() {
     return !macroDirectiveTouchedByTUEdit(directive);
   };
 
-  // Return true if a preserved TU byte interval contains `name` as a real
-  // identifier token. Identifiers inside bytes already replaced by final TU
-  // edits are ignored because those source bytes will not survive into the
-  // emitted file.
-  auto rawIdentifierAppearsInPreservedTUBytes =
-      [&](StringRef name, uint64_t begin, uint64_t end) {
-        if (begin >= end || begin >= tuBytes.size())
-          return false;
-        end = std::min<uint64_t>(end, tuBytes.size());
-
-        const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
-        std::string lexBuf = tuBytes.slice(begin, end).str();
-        lexBuf.push_back('\0');
-
-        const char *bufStart = lexBuf.data();
-        const char *bufEnd = bufStart + (end - begin);
-        Lexer lexer(baseLoc, lexLang_, bufStart, bufStart, bufEnd);
-        lexer.SetCommentRetentionState(true);
-
-        Token token;
-        while (true) {
-          lexer.LexFromRawLexer(token);
-          if (token.is(tok::eof))
-            return false;
-
-          // Comments are retained so the raw lexer can skip them explicitly,
-          // but macro-state observations inside comments do not matter.
-          if (token.is(tok::comment))
-            continue;
-
-          if (!token.is(tok::raw_identifier) && !token.is(tok::identifier))
-            continue;
-
-          const size_t localBegin = tokenOffsetFromBase(token, baseLoc);
-          const size_t localEnd = tokenEndOffsetFromBase(token, baseLoc);
-          const uint64_t absBegin = begin + localBegin;
-          const uint64_t absEnd = begin + localEnd;
-
-          // Ignore identifiers in source bytes that a final TU edit replaces.
-          // Those spellings are not part of the preserved suffix/prefix that
-          // can observe repaired macro state.
-          if (intervalOverlapsFinalTUEdit(absBegin, absEnd))
-            continue;
-
-          if (tuBytes.slice(absBegin, absEnd) == name)
-            return true;
-        }
-      };
-
   size_t undefLivenessHazards = 0;
   for (const NamedMacroDirectiveRef &ref : namedMacroDirectives) {
     const RefoldModel::MacroDirective &undefDirective = *ref.directive;
@@ -7997,18 +8026,16 @@ std::string RefoldEngine::RunSinglePassRefold() {
     if (!previousDefinition || !directiveSurvivesTUEdits(*previousDefinition))
       continue;
 
-    const TextEdit &edit = tuEdits[*editIndex];
 
-    // Look only after the consumed #undef/edit frontier. Earlier source either
-    // belongs to the replacement itself or cannot observe the resurrected macro
-    // state caused by removing this #undef.  For include-owned #undef
-    // directives, the header byte offset is unrelated to the TU; the containing
-    // edit end is the only relevant observation frontier.
-    const uint64_t observationBegin = edit.end;
-    if (!rawIdentifierAppearsInPreservedTUBytes(ref.name, observationBegin,
-                                                tuBytes.size()))
-      continue;
-
+    // The original liveness repair only preserved a consumed #undef when later
+    // preserved source visibly observed the resurrected prior definition.  That
+    // was enough for token validation, but not for the theorem-level suffix
+    // macro-state invariant: deleting `#undef NAME` while a previous surviving
+    // `#define NAME` remains live changes the macro environment after the edit
+    // even when the only ordinary spelling of NAME was itself consumed by the
+    // replacement.  Preserve the transition whenever the previous definition
+    // survives; placement below still proves that the replacement bytes and any
+    // carried same-line suffix cannot observe the wrong macro state.
     // Preserve the consumed #undef with the edit that swallowed it.  The
     // shared macro-state preservation helper handles both proof shapes:
     // before-replacement insertion when the edit already starts at physical
@@ -8028,7 +8055,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
                         "without exposing the replacement payload to the "
                         "macro name or breaking the replacement/suffix "
                         "boundary",
-                        undefDirective.id, ref.name, edit.start, edit.end)
+                        undefDirective.id, ref.name, tuEdits[*editIndex].start,
+                        tuEdits[*editIndex].end)
               .str(),
           /*requireKnownObserver=*/true);
       continue;
@@ -8048,8 +8076,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
          "preserving consumed #undef to prevent resurrected macro definition: "
          "macro='{0}' undefDirective=#{1} priorDefine=#{2} edit=[{3},{4}) "
          "placement={5}",
-         ref.name, undefDirective.id, previousDefinition->id, edit.start,
-         edit.end,
+         ref.name, undefDirective.id, previousDefinition->id,
+         tuEdits[*editIndex].start, tuEdits[*editIndex].end,
          macroStatePreservationPlacementName(*placement));
   }
 
