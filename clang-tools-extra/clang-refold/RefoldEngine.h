@@ -8785,6 +8785,29 @@ private:
   std::optional<std::pair<size_t, size_t>>
   MapATokRangeAToBTokenEnvelope(uint64_t beginTok, uint64_t endTok) const;
 
+  /// \brief Trim pure B-token insertions anchored at an A-token cover edge.
+  ///
+  /// Non-empty A-token-cover mapping must not claim pure insertion payloads
+  /// anchored exactly at the cover boundaries.  Those B-only tokens have their
+  /// own insertion owner, or are intentionally requested through a
+  /// boundary-preserving mapper.  This helper applies that token-space rule to
+  /// an already byte-projected B-token envelope and returns true iff the
+  /// envelope was shortened.
+  bool TrimPureBoundaryInsertionsFromTokenEnvelope(
+      uint64_t beginTok, uint64_t endTok, std::pair<size_t, size_t> &env) const;
+
+  /// \brief Recover the exact contiguous B image of an unchanged A-token range.
+  ///
+  /// This is a narrow recovery proof for the case where ordinary byte
+  /// projection plus boundary-insertion trimming leaves an empty envelope even
+  /// though the covered A tokens themselves survived unchanged in B.  It is not
+  /// a general replacement mapper: A-consuming hunks that touch the cover, pure
+  /// insertions strictly inside the cover, non-identical spellings, or
+  /// non-contiguous B images all fail closed.
+  std::optional<std::pair<size_t, size_t>>
+  TryMapUnchangedATokRangeToExactContiguousBImage(uint64_t beginTok,
+                                                  uint64_t endTok) const;
+
   /// \brief Maps an A token range to a B token envelope while preserving
   /// boundary insertions.
   ///

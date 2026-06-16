@@ -562,6 +562,156 @@ RefoldEngine::MapAToBTokenEnvelopeByPPArgSpan(
   return MapAByteRangeToBTokenEnvelope(a0, a1);
 }
 
+bool RefoldEngine::TrimPureBoundaryInsertionsFromTokenEnvelope(
+    uint64_t beginTok, uint64_t endTok, std::pair<size_t, size_t> &env) const {
+  if (abTokHunks_.empty())
+    return false;
+
+  size_t bTokBegin = env.first;
+  size_t bTokEnd = env.second;
+  bool trimmedTokenBoundaryInsertion = false;
+
+  auto trimTokenInsertionAtBoundary = [&](uint64_t aPos, bool isBegin) {
+    for (const diffutils::Hunk &h : abTokHunks_) {
+      // Only pure token insertions at this exact A boundary are edge material.
+      // Replacements and deletions consume covered A tokens and remain part of
+      // the owner envelope.
+      if (h.aStart != aPos || h.aEnd != aPos || h.bEnd <= h.bStart)
+        continue;
+
+      const size_t hb0 = static_cast<size_t>(h.bStart);
+      const size_t hb1 = static_cast<size_t>(h.bEnd);
+
+      // Ignore boundary insertions that the byte projection did not include.
+      if (!(bTokBegin < hb1 && bTokEnd > hb0))
+        continue;
+
+      if (isBegin) {
+        const size_t oldBegin = bTokBegin;
+        bTokBegin = std::max(bTokBegin, hb1);
+        trimmedTokenBoundaryInsertion |= bTokBegin > oldBegin;
+        if (inTraceMode() && bTokBegin > oldBegin) {
+          REFOLD_LOG_TRACE("byte/env",
+                           "trimBeginTok: A=[{0},{1}) boundary A@{2} "
+                           "hunkBtok=[{3},{4}) BtrimTok=[{5},{6}) text='{7}'",
+                           beginTok, endTok, aPos, hb0, hb1, oldBegin,
+                           bTokBegin,
+                           stringutils::showWsWithClip(
+                               SliceBSource(oldBegin, bTokBegin), 220));
+        }
+      } else {
+        const size_t oldEnd = bTokEnd;
+        bTokEnd = std::min(bTokEnd, hb0);
+        trimmedTokenBoundaryInsertion |= oldEnd > bTokEnd;
+        if (inTraceMode() && oldEnd > bTokEnd) {
+          REFOLD_LOG_TRACE(
+              "byte/env",
+              "trimEndTok: A=[{0},{1}) boundary A@{2} "
+              "hunkBtok=[{3},{4}) BtrimTok=[{5},{6}) text='{7}'",
+              beginTok, endTok, aPos, hb0, hb1, bTokEnd, oldEnd,
+              stringutils::showWsWithClip(SliceBSource(bTokEnd, oldEnd), 220));
+        }
+      }
+    }
+  };
+
+  trimTokenInsertionAtBoundary(beginTok, /*isBegin=*/true);
+  trimTokenInsertionAtBoundary(endTok, /*isBegin=*/false);
+
+  if (bTokBegin > bTokEnd)
+    bTokBegin = bTokEnd;
+
+  env = std::make_pair(bTokBegin, bTokEnd);
+  return trimmedTokenBoundaryInsertion;
+}
+
+std::optional<std::pair<size_t, size_t>>
+RefoldEngine::TryMapUnchangedATokRangeToExactContiguousBImage(
+    uint64_t beginTok, uint64_t endTok) const {
+  // The byte mapper can legally collapse a surviving single-token image onto
+  // an adjacent insertion boundary when the edit is represented as pure B-token
+  // insertions around unchanged A tokens. If token-space trimming removes that
+  // adjacent insertion, the normal envelope becomes empty even though every
+  // covered A token still has an exact B-token image.
+  //
+  // Recover only that proof surface: no covered A token may be consumed by a
+  // replacement/deletion hunk, no pure insertion may appear strictly inside the
+  // requested A cover, every projected B token must have the identical
+  // spelling, and the projected B tokens must form one contiguous image. Pure
+  // insertions at the requested begin/end boundaries are used only to locate
+  // the surviving A-token images; they are not included in the returned
+  // envelope, so boundary insertion ownership remains with the ordinary
+  // insertion owners.
+  if (beginTok >= endTok)
+    return std::nullopt;
+
+  size_t firstBTok = 0;
+  size_t lastBTok = 0;
+  size_t prevBTok = 0;
+  bool haveImage = false;
+
+  for (uint64_t aTok = beginTok; aTok < endTok; ++aTok) {
+    if (static_cast<size_t>(aTok) >= aToks_.size())
+      return std::nullopt;
+
+    int64_t delta = 0;
+    for (const diffutils::Hunk &h : abTokHunks_) {
+      const int64_t aLen =
+          static_cast<int64_t>(h.aEnd) - static_cast<int64_t>(h.aStart);
+      const int64_t bLen =
+          static_cast<int64_t>(h.bEnd) - static_cast<int64_t>(h.bStart);
+
+      if (h.aStart < h.aEnd) {
+        // A-consuming hunks mean this A token no longer has an unchanged token
+        // image. Let the ordinary byte-envelope path handle such replacements
+        // and deletions instead of manufacturing an unchanged-image proof.
+        if (h.aStart <= aTok && aTok < h.aEnd)
+          return std::nullopt;
+        if (h.aEnd <= aTok)
+          delta += bLen - aLen;
+        continue;
+      }
+
+      if (h.bEnd <= h.bStart)
+        continue;
+
+      // A pure insertion strictly inside the requested cover would lie between
+      // two recovered token images. Returning the enclosing B range would then
+      // include B-only material that is not part of the exact unchanged image,
+      // so this narrow recovery proof must fail closed.
+      if (beginTok < h.aStart && h.aStart < endTok)
+        return std::nullopt;
+
+      // A pure insertion at A@N precedes the surviving image of A token N. Pure
+      // insertions at beginTok therefore rebase the first covered token image;
+      // pure insertions at endTok do not affect any token inside [begin,end).
+      if (h.aStart <= aTok)
+        delta += bLen;
+    }
+
+    const int64_t mapped = static_cast<int64_t>(aTok) + delta;
+    if (mapped < 0 || static_cast<size_t>(mapped) >= bToks_.size())
+      return std::nullopt;
+
+    const size_t bTok = static_cast<size_t>(mapped);
+    if (aToks_[static_cast<size_t>(aTok)].spelling != bToks_[bTok].spelling)
+      return std::nullopt;
+    if (haveImage && bTok != prevBTok + 1)
+      return std::nullopt;
+
+    if (!haveImage) {
+      firstBTok = bTok;
+      haveImage = true;
+    }
+    prevBTok = bTok;
+    lastBTok = bTok + 1;
+  }
+
+  if (!haveImage)
+    return std::nullopt;
+  return std::make_pair(firstBTok, lastBTok);
+}
+
 std::optional<std::pair<size_t, size_t>>
 RefoldEngine::MapATokRangeAToBTokenEnvelope(uint64_t beginTok,
                                             uint64_t endTok) const {
@@ -605,59 +755,20 @@ RefoldEngine::MapATokRangeAToBTokenEnvelope(uint64_t beginTok,
   std::pair<size_t, size_t> env =
       MapAByteRangeToBTokenEnvelope(aByteBegin, aByteEnd);
 
-  if (!abTokHunks_.empty()) {
-    size_t bTokBegin = env.first;
-    size_t bTokEnd = env.second;
+  const bool trimmedBoundaryInsertion =
+      TrimPureBoundaryInsertionsFromTokenEnvelope(beginTok, endTok, env);
 
-    auto trimTokenInsertionAtBoundary = [&](uint64_t aPos, bool isBegin) {
-      for (const diffutils::Hunk &h : abTokHunks_) {
-        // Only pure token insertions at this exact A boundary are edge
-        // material. Replacements and deletions consume covered A tokens and
-        // remain part of the owner envelope.
-        if (h.aStart != aPos || h.aEnd != aPos || h.bEnd <= h.bStart)
-          continue;
-
-        const size_t hb0 = static_cast<size_t>(h.bStart);
-        const size_t hb1 = static_cast<size_t>(h.bEnd);
-
-        // Ignore boundary insertions that the byte projection did not include.
-        if (!(bTokBegin < hb1 && bTokEnd > hb0))
-          continue;
-
-        if (isBegin) {
-          const size_t oldBegin = bTokBegin;
-          bTokBegin = std::max(bTokBegin, hb1);
-          if (inTraceMode() && bTokBegin > oldBegin) {
-            REFOLD_LOG_TRACE(
-                "byte/env",
-                "trimBeginTok: A=[{0},{1}) boundary A@{2} "
-                "hunkBtok=[{3},{4}) BtrimTok=[{5},{6}) text='{7}'",
-                beginTok, endTok, aPos, hb0, hb1, oldBegin, bTokBegin,
-                stringutils::showWsWithClip(
-                    SliceBSource(oldBegin, bTokBegin), 220));
-          }
-        } else {
-          const size_t oldEnd = bTokEnd;
-          bTokEnd = std::min(bTokEnd, hb0);
-          if (inTraceMode() && oldEnd > bTokEnd) {
-            REFOLD_LOG_TRACE(
-                "byte/env",
-                "trimEndTok: A=[{0},{1}) boundary A@{2} "
-                "hunkBtok=[{3},{4}) BtrimTok=[{5},{6}) text='{7}'",
-                beginTok, endTok, aPos, hb0, hb1, bTokEnd, oldEnd,
-                stringutils::showWsWithClip(
-                    SliceBSource(bTokEnd, oldEnd), 220));
-          }
-        }
-      }
-    };
-
-    trimTokenInsertionAtBoundary(beginTok, /*isBegin=*/true);
-    trimTokenInsertionAtBoundary(endTok, /*isBegin=*/false);
-
-    if (bTokBegin > bTokEnd)
-      bTokBegin = bTokEnd;
-    env = std::make_pair(bTokBegin, bTokEnd);
+  if (trimmedBoundaryInsertion && env.first == env.second) {
+    if (auto exactEnv =
+            TryMapUnchangedATokRangeToExactContiguousBImage(beginTok, endTok)) {
+      REFOLD_LOG_TRACE(
+          "byte/env",
+          "recoverExactTokImage: A=[{0},{1}) Btok=[{2},{3}) text='{4}'",
+          beginTok, endTok, exactEnv->first, exactEnv->second,
+          stringutils::showWsWithClip(
+              SliceBSource(exactEnv->first, exactEnv->second), 220));
+      return exactEnv;
+    }
   }
 
   return env;
