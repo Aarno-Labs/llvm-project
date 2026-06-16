@@ -18,18 +18,18 @@ RefoldEngine::ResolveIncludeRealizationBTokenEnvelope(
   if (auto canonical = MapATokRangeAToBTokenEnvelope(beginTok, endTok)) {
     // Prefer the ordinary A-cover -> B-envelope projection. This is the
     // canonical include-realization witness because it follows the same mapping
-    // path used for normal A-token covers and needs no non-canonical consensus proof.
+    // path used for normal A-token covers and needs no non-canonical consensus
+    // proof.
     if (evidenceKind)
       *evidenceKind = IncludeRealizationEvidenceKind::CanonicalBCoverEnvelope;
     return canonical;
   }
 
-  // Phase 8b classification: this is not a fallback branch.  It is a
-  // declared include-realization evidence class for the narrow case where the
-  // canonical mapper cannot recover an envelope but every usable
-  // non-canonical boundary projection proves the same non-empty B-token range.
-  // Missing projections are ignored; conflicting usable projections are a
-  // domain wall.
+  // This is not a fallback branch.  It is a declared include-realization
+  // evidence class for the narrow case where the canonical mapper cannot
+  // recover an envelope but every usable non-canonical boundary projection
+  // proves the same non-empty B-token range. Missing projections are ignored;
+  // conflicting usable projections are a domain wall.
   auto isUsableEnvelope =
       [&](const std::optional<std::pair<size_t, size_t>> &env) -> bool {
     if (!env || env->second <= env->first)
@@ -48,9 +48,9 @@ RefoldEngine::ResolveIncludeRealizationBTokenEnvelope(
   bool sawUsableBoundaryStableProjection = false;
   bool conflict = false;
 
-  // Add one boundary-stable projection to the consensus set. Unusable
-  // envelopes are diagnostic-only; usable envelopes must all equal the first
-  // usable envelope.
+  // Add one boundary-stable projection to the consensus set. Unusable envelopes
+  // are diagnostic-only; usable envelopes must all equal the first usable
+  // envelope.
   auto consider = [&](StringRef label,
                       const std::optional<std::pair<size_t, size_t>> &env) {
     if (!isUsableEnvelope(env)) {

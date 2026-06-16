@@ -27,7 +27,7 @@
 //   info ("plan",  "includes={0} macros={1}", Incs, Macros);
 //   warn ("io",    "non-UTF8 byte at {0}", pos);
 //   error("map",   "missing field '{0}'", "tokmap");
-//   fatal("abort", "unrecoverable error in phase {0}", phase); // terminates
+//   fatal("abort", "unrecoverable error in stage {0}", stage); // terminates
 //
 // Policy
 // ------

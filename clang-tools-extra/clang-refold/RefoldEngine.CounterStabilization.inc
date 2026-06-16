@@ -67,8 +67,8 @@ RefoldEngine::CounterEventIdentity RefoldEngine::BuildCounterEventIdentity(
   CounterEventIdentity event;
   event.macroInvocationId = macro.id;
   event.occurrenceOrdinal = occurrenceOrdinal;
-  event.ownerIncludeId = ownerIncludeOverride ? ownerIncludeOverride
-                                              : macro.ownerIncludeId;
+  event.ownerIncludeId =
+      ownerIncludeOverride ? ownerIncludeOverride : macro.ownerIncludeId;
   event.callerMacroId = macro.callerMacroId;
   event.aTokenBegin = begin;
   event.aTokenEnd = end;
@@ -78,7 +78,8 @@ RefoldEngine::CounterEventIdentity RefoldEngine::BuildCounterEventIdentity(
   event.expansionSiteEnd = macro.invE;
   event.aValue = CounterValueForTokenRange(begin, end);
   event.canStabilizeByLiteralization = begin < end && end <= aToks_.size();
-  event.canStabilizeByMaterialization = macro.invFile && macro.invB && macro.invE;
+  event.canStabilizeByMaterialization =
+      macro.invFile && macro.invB && macro.invE;
   return event;
 }
 
@@ -90,9 +91,9 @@ RefoldEngine::CollectCounterOccurrences(StringRef tuPath) const {
 
   // Record a __COUNTER__ occurrence in PP-token space. Zero-length producer
   // anchors are widened to one token so pasted/stringified counter output still
-  // participates in stabilization.  Phase 3G also attaches a stable
-  // CounterEventIdentity so the stabilization proof names a concrete counter
-  // event rather than a global textual guess.
+  // participates in stabilization.  A stable CounterEventIdentity lets the
+  // stabilization proof name a concrete counter event rather than a global
+  // textual guess.
   auto addOcc = [&](const RefoldModel::MacroInvocation &mi, uint64_t b,
                     uint64_t e) {
     if (e == b && b < aToks_.size())
@@ -125,10 +126,10 @@ RefoldEngine::CollectCounterOccurrences(StringRef tuPath) const {
       continue;
     }
 
-    // Finally fall back to the producer cover.  Phase 8f classifies the
-    // former zero-length fallback-cover path as ordinary counter-state
-    // stabilization: a zero-width cover is not a byte-recovery fallback, it is a
-    // producer anchor for the concrete counter literal token.  Normalize it
+    // Finally fall back to the producer cover.  The former zero-length
+    // fallback-cover path is classified as ordinary counter-state
+    // stabilization: a zero-width cover is not a byte-recovery fallback, it is
+    // a producer anchor for the concrete counter literal token.  Normalize it
     // through addOcc() so the same one-token widening used for body/spans also
     // applies to fallback covers.
     if (mi.cover.IsValid())
@@ -383,7 +384,8 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
   // PP order must be forced through macro realization as well. Otherwise the
   // counter sequence after the edit could remain stale relative to the edited
   // preprocessed stream.
-  for (const CounterOccurrence &o : llvm::drop_begin(filtered, firstEditedIdx)) {
+  for (const CounterOccurrence &o :
+       llvm::drop_begin(filtered, firstEditedIdx)) {
     const auto *root =
         SmallestCoveringPatchableMacro(o.aStart, o.aEnd, o.ownerIncludeId);
 
@@ -479,7 +481,8 @@ RefoldEngine::ComputeForcedCounterPatchesFromExpandedMacros(
   // Force every counter occurrence from the first expanded one onward. Dedup by
   // owner/include plus invocation byte span because multiple occurrences may be
   // covered by the same patchable macro invocation.
-  for (const CounterOccurrence &o : llvm::drop_begin(filtered, firstExpandedIdx)) {
+  for (const CounterOccurrence &o :
+       llvm::drop_begin(filtered, firstExpandedIdx)) {
     const auto *root =
         SmallestCoveringPatchableMacro(o.aStart, o.aEnd, o.ownerIncludeId);
     if (!root || IsInvocationInsideDefineDirective(*root))

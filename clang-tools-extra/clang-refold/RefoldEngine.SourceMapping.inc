@@ -579,8 +579,8 @@ RefoldEngine::MapATokRangeAToBTokenEnvelope(uint64_t beginTok,
     return std::nullopt;
 
   // Token offsets include a sentinel at the end. `endTok` must therefore be a
-  // valid offset-table index so the exclusive byte end of the token range can be
-  // recovered.
+  // valid offset-table index so the exclusive byte end of the token range can
+  // be recovered.
   size_t idxEnd = static_cast<size_t>(endTok);
   if (idxEnd >= aTokOff_.size())
     return std::nullopt;

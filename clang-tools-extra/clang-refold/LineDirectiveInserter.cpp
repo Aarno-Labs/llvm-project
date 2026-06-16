@@ -143,7 +143,6 @@ static std::optional<std::vector<std::string>> parseMacroArguments(
   return std::nullopt;
 }
 
-
 // Parse one balanced parenthesized token sequence without treating top-level
 // commas as separators.  `__VA_OPT__(...)` takes a single token sequence, and
 // that sequence may itself contain commas, nested parentheses, or quoted
@@ -319,7 +318,8 @@ static std::string substituteFunctionLikeLineControlMacro(
 }
 
 static std::string substituteLineControlReplacementFragment(
-    StringRef repl, const std::unordered_map<std::string, std::string> &rawByParam,
+    StringRef repl,
+    const std::unordered_map<std::string, std::string> &rawByParam,
     const std::unordered_map<std::string, std::string> &expandedByParam,
     bool variadicArgumentHasTokens, const LineControlMacroMap &macros,
     std::unordered_set<std::string> &disabled, size_t logicalLineAtLineStart,
@@ -363,10 +363,10 @@ static std::string substituteLineControlReplacementFragment(
 
       // `__VA_OPT__` is a replacement-list operator, not an ordinary macro.
       // Evaluate it while the raw/expanded parameter bindings are still in
-      // scope.  If the variadic argument is empty, the whole parenthesized token
-      // sequence disappears; otherwise the token sequence is substituted using
-      // the same rules as the surrounding replacement list.  This is the piece
-      // needed for line-control forms such as:
+      // scope.  If the variadic argument is empty, the whole parenthesized
+      // token sequence disappears; otherwise the token sequence is substituted
+      // using the same rules as the surrounding replacement list.  This is the
+      // piece needed for line-control forms such as:
       //   #define LOC(n, ...) n __VA_OPT__(__VA_ARGS__)
       //   #define LOC(n, name, ...) n __VA_OPT__(#name)
       if (name == "__VA_OPT__") {
@@ -563,7 +563,6 @@ static bool lineControlSpellingIsLineDirective(StringRef line) {
   return p < to && std::isdigit(static_cast<unsigned char>(line[p]));
 }
 
-
 // Update the owner-local macro environment from source directives that precede
 // the offset being queried.  Only definitions visible in the same source owner
 // are considered; this deliberately avoids importing cross-owner macro state
@@ -671,9 +670,9 @@ static void updateLineControlMacroEnvironment(StringRef line,
 //
 // `LogicalLocationAtOffset()` asks a preprocessor question: "after executing
 // all source directives before this byte offset, what logical file/line is
-// active?"  That question must be answered after the early translation phases
-// that affect preprocessing directives.  In particular, phase 2 removes
-// backslash-newline pairs before directive recognition, so both
+// active?"  That question must be answered after the early translation steps
+// that affect preprocessing directives.  In particular, backslash-newline
+// pairs are removed before directive recognition, so both
 //
 //   #define LOC \
 //     930 "f.c"
@@ -696,27 +695,28 @@ static bool collectLineControlLogicalLine(StringRef src, size_t lineBegin,
 
   logicalLine.clear();
 
-  auto skipPhase2Splice = [&](size_t &pos) -> bool {
-    return stringutils::skipPhase2LineSplice(src, limit, pos);
+  auto skipLineSplice = [&](size_t &pos) -> bool {
+    return stringutils::skipBackslashNewlineSplice(src, limit, pos);
   };
 
   for (size_t pos = lineBegin; pos < limit;) {
-    if (skipPhase2Splice(pos))
+    if (skipLineSplice(pos))
       continue;
 
     // Comments are not recognized inside string or character literals.  Still
-    // apply phase-2 splicing while copying the literal, because splices are
-    // removed before the preprocessor even sees the directive spelling.
+    // apply backslash-newline splicing while copying the literal, because
+    // splices are removed before the preprocessor even sees the directive
+    // spelling.
     if (src[pos] == '"' || src[pos] == '\'') {
       const char quote = src[pos];
       logicalLine.push_back(src[pos++]);
       while (pos < limit) {
-        if (skipPhase2Splice(pos))
+        if (skipLineSplice(pos))
           continue;
         char c = src[pos++];
         logicalLine.push_back(c);
         if (c == '\\' && pos < limit) {
-          if (skipPhase2Splice(pos))
+          if (skipLineSplice(pos))
             continue;
           logicalLine.push_back(src[pos++]);
           continue;
@@ -730,14 +730,14 @@ static bool collectLineControlLogicalLine(StringRef src, size_t lineBegin,
     }
 
     // Do not let a physical newline inside a complete block comment terminate
-    // the directive.  Phase 3 replaces the whole comment with one whitespace
+    // the directive.  A complete block comment contributes one whitespace
     // character before directive macro expansion/parsing.
     if (pos + 1 < limit && src[pos] == '/' && src[pos + 1] == '*') {
       logicalLine.push_back(src[pos++]);
       logicalLine.push_back(src[pos++]);
       bool closed = false;
       while (pos < limit) {
-        if (skipPhase2Splice(pos))
+        if (skipLineSplice(pos))
           continue;
         if (pos + 1 < limit && src[pos] == '*' && src[pos + 1] == '/') {
           logicalLine.push_back(src[pos++]);
@@ -781,9 +781,10 @@ static size_t logicalLineAtSourceOffset(StringRef prefix, size_t lineStart,
                                              lineStart);
 }
 
-// A source-authored line-control directive is parsed after phase 2/3
-// translation, but the physical lines consumed by its original spelling still
-// affect the logical line number seen by the next source line.  For example:
+// A source-authored line-control directive is parsed after backslash-newline
+// deletion and comment replacement, but the physical lines consumed by its
+// original spelling still affect the logical line number seen by the next
+// source line.  For example:
 //
 //   #line 950 \
 //   "f.c"
@@ -1007,10 +1008,11 @@ static std::string expandSourceLineControlDirective(
 
 
 // Return the original-source byte of the directive-introducing '#'.  The
-// logical line scanner has already applied phase-2 splicing for recognition, but
-// the refold map records conditional group boundaries in original byte space.
+// logical line scanner has already applied backslash-newline splicing for
+// recognition, but the refold map records conditional group boundaries in
+// original byte space.
 // This bridge consumes horizontal whitespace, physical splice pairs, and block
-// comments before the '#', matching the early translation phases used for
+// comments before the '#', matching the early preprocessing steps used for
 // directive recognition while preserving the original byte coordinate.
 static std::optional<uint64_t>
 findLineControlDirectiveHashOffset(StringRef src, size_t lineStart,
@@ -1022,14 +1024,14 @@ findLineControlDirectiveHashOffset(StringRef src, size_t lineStart,
       continue;
     }
 
-    if (stringutils::skipPhase2LineSplice(src, afterLine, p))
+    if (stringutils::skipBackslashNewlineSplice(src, afterLine, p))
       continue;
 
     if (p + 1 < afterLine && src[p] == '/' && src[p + 1] == '*') {
       p += 2;
       bool closed = false;
       while (p + 1 < afterLine) {
-        if (stringutils::skipPhase2LineSplice(src, afterLine, p))
+        if (stringutils::skipBackslashNewlineSplice(src, afterLine, p))
           continue;
         if (src[p] == '*' && src[p + 1] == '/') {
           p += 2;
@@ -1197,20 +1199,21 @@ static LineDirectiveLocation logicalLocationAtOffsetImpl(
     size_t afterLine = lineStart;
     if (!collectLineControlLogicalLine(prefix, lineStart, prefix.size(),
                                        logicalLine, afterLine) ||
-        afterLine <= lineStart)
+        afterLine <= lineStart) {
       break;
+    }
 
     // Directive recognition, macro replacement in directive operands, and
-    // #define replacement-list capture all occur after phase 2 line splicing and
-    // phase 3 comment replacement.  Reusing this phase-adjusted spelling keeps
-    // the owner-local line-control model aligned with the actual preprocessor
-    // without changing any refolding ownership decisions.
-    std::string phase3Line =
+    // #define replacement-list capture all occur after backslash-newline deletion
+    // and comment replacement.  Reusing this directive-logical spelling
+    // keeps the owner-local line-control model aligned with the actual
+    // preprocessor without changing any refolding ownership decisions.
+    std::string directiveLogicalLine =
         stringutils::replaceCommentsWithWhitespacePreservingLiterals(
             StringRef(logicalLine));
 
     // Source line-control directives are interpreted by the preprocessor after
-    // macro expansion of their operands. Recover the deterministic owner-local
+    // macro expansion of their operands.  Recover the deterministic owner-local
     // macro environment from producer-observed source directives before parsing
     // the current line as `#line ...`. This recovery exists only to compute the
     // logical resume point for emitted #line repair; it must not strengthen
@@ -1228,11 +1231,11 @@ static LineDirectiveLocation logicalLocationAtOffsetImpl(
     StringRef directive;
     StringRef operand;
     const bool hasNamedDirective = readLineControlDirectiveAndOperand(
-        StringRef(phase3Line), directive, operand);
+        StringRef(directiveLogicalLine), directive, operand);
     const bool isMacroStateDirective =
         hasNamedDirective && (directive == "define" || directive == "undef");
     const bool isLineControlDirectiveSpelling =
-        lineControlSpellingIsLineDirective(StringRef(phase3Line));
+        lineControlSpellingIsLineDirective(StringRef(directiveLogicalLine));
 
     bool directiveEffectsAreActive = false;
     LineControlDirectiveActivity lineDirectiveActivity =
@@ -1252,47 +1255,49 @@ static LineDirectiveLocation logicalLocationAtOffsetImpl(
     }
 
     // Inactive conditional arms are still scanned as text, but their
-    // #define/#undef/#line effects are not executed by the preprocessor. Applying
-    // those directives here would pollute the owner-local macro environment and
-    // recover line-control states that no real preprocessing execution could
-    // observe.
+    // #define/#undef/#line effects are not executed by the preprocessor.
+    // Applying those directives here would pollute the owner-local macro
+    // environment and recover line-control states that no real preprocessing
+    // execution could observe.
     if (directiveEffectsAreActive) {
       std::string expandedLine = expandSourceLineControlDirective(
-          StringRef(phase3Line), lineControlMacros, logicalLineAtLineStart,
+          StringRef(directiveLogicalLine), lineControlMacros, logicalLineAtLineStart,
           activeFileForExpansion);
       if (std::optional<LineDirectiveState> state =
               parseLineDirectiveForLineControl(StringRef(expandedLine), 0,
-                                             expandedLine.size())) {
+                                               expandedLine.size())) {
         sawLineDirective = true;
         if (state->hasFileSpelling)
           activeFile = state->fileSpelling;
-        // ParseLineDirective() sees the phase-adjusted logical directive line,
-        // so `state->lineAfterDir` is the numeric operand after macro expansion.
-        // That operand is not always the line observed by the next physical
-        // source line: if the directive spelling itself consumed extra physical
-        // lines through line splices or block comments, Clang advances the
-        // following source line by that physical span.  Record the adjusted
+        // ParseLineDirective() sees the directive-logical line,
+        // so `state->lineAfterDir` is the numeric operand after macro
+        // expansion. That operand is not always the line observed by the next
+        // physical source line: if the directive spelling itself consumed extra
+        // physical lines through line splices or block comments, Clang advances
+        // the following source line by that physical span.  Record the adjusted
         // post-directive line here so all later owner-local resync queries use
         // the same line-control state the preprocessor would assign.
         activeLineAfterDirective =
-            state->lineAfterDir +
-            physicalLineControlDirectiveAdjustment(prefix, lineStart, afterLine);
+            state->lineAfterDir + physicalLineControlDirectiveAdjustment(
+                                      prefix, lineStart, afterLine);
         // The active line state starts after the whole physical directive,
-        // including any source lines consumed by phase-2 splices, not after the
+        // including any source lines consumed by backslash-newline splices, not after the
         // temporary expanded spelling used only for operand parsing.
         activeAfterDirectiveIdx = afterLine;
       } else if (isLineControlDirectiveSpelling && hashOffset) {
-        // The directive is syntactically line-control and lies on a producer-active
-        // path, but this owner-local scan could not expand/parse its operands.
-        // Typical examples are #line operands that depend on macro state imported
-        // from a prior include.  Do not replace that real source semantics with a
-        // physical fallback #line later; report the recovered location as
-        // unproven so the caller can avoid emitting a synthetic override.
+        // The directive is syntactically line-control and lies on a
+        // producer-active path, but this owner-local scan could not
+        // expand/parse its operands. Typical examples are #line operands that
+        // depend on macro state imported from a prior include.  Do not replace
+        // that real source semantics with a physical fallback #line later;
+        // report the recovered location as unproven so the caller can avoid
+        // emitting a synthetic override.
         sawUnprovenLineControlDirective = true;
         lastUnprovenLineControlDirectiveOffset = *hashOffset;
       }
 
-      updateLineControlMacroEnvironment(StringRef(phase3Line), lineControlMacros);
+      updateLineControlMacroEnvironment(StringRef(directiveLogicalLine),
+                                        lineControlMacros);
     } else if (isLineControlDirectiveSpelling && hashOffset &&
                lineDirectiveActivity == LineControlDirectiveActivity::Unknown) {
       // The source prefix contains a line-control directive in a conditional
@@ -1315,16 +1320,14 @@ static LineDirectiveLocation logicalLocationAtOffsetImpl(
     const size_t delta = stringutils::countNonSplicedNewlines(
         prefix, activeAfterDirectiveIdx, prefix.size());
     StringRef file = activeFile ? StringRef(*activeFile) : defaultFileSpelling;
-    return LineDirectiveLocation(
-        file, activeLineAfterDirective + delta,
-        !sawUnprovenLineControlDirective,
-        lastUnprovenLineControlDirectiveOffset);
+    return LineDirectiveLocation(file, activeLineAfterDirective + delta,
+                                 !sawUnprovenLineControlDirective,
+                                 lastUnprovenLineControlDirectiveOffset);
   }
 
   return LineDirectiveLocation(
       defaultFileSpelling, stringutils::lineAtOffset(src, clampedOffset),
-      !sawUnprovenLineControlDirective,
-      lastUnprovenLineControlDirectiveOffset);
+      !sawUnprovenLineControlDirective, lastUnprovenLineControlDirectiveOffset);
 }
 
 LineDirectiveLocation LineDirectiveInserter::LogicalLocationAtOffset(
@@ -1362,13 +1365,14 @@ static std::string insertLineDirectiveAt(StringRef replacement,
 static std::optional<size_t> findCarriedSuffixPrefixInsertionOffset(
     StringRef originalFileText, uint64_t s, uint64_t e, StringRef replacement,
     size_t replacementPrefixOffset, bool requireDeletedLineFromBOL) {
-  if (e > originalFileText.size() || replacementPrefixOffset >= replacement.size())
+  if (e > originalFileText.size() ||
+      replacementPrefixOffset >= replacement.size())
     return std::nullopt;
 
   const size_t editBegin = static_cast<size_t>(s);
   const size_t editEnd = static_cast<size_t>(e);
-  const size_t resumePrefixBegin = stringutils::lineStartOffset(originalFileText,
-                                                               editEnd);
+  const size_t resumePrefixBegin =
+      stringutils::lineStartOffset(originalFileText, editEnd);
   if (resumePrefixBegin >= editEnd)
     return std::nullopt;
 
@@ -1382,12 +1386,12 @@ static std::optional<size_t> findCarriedSuffixPrefixInsertionOffset(
     if (!stringutils::isBOL(originalFileText, editBegin))
       return std::nullopt;
     if (stringutils::countNonSplicedNewlines(originalFileText, editBegin,
-                                            resumePrefixBegin) == 0)
+                                             resumePrefixBegin) == 0)
       return std::nullopt;
   }
 
-  StringRef originalResumePrefix = originalFileText.slice(resumePrefixBegin,
-                                                         editEnd);
+  StringRef originalResumePrefix =
+      originalFileText.slice(resumePrefixBegin, editEnd);
   if (originalResumePrefix.empty())
     return std::nullopt;
   if (replacement.substr(replacementPrefixOffset) != originalResumePrefix)
@@ -1433,9 +1437,9 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
 
   // Token-LCS normalization can express a line deletion as replacing the
   // deleted line plus the first token(s) of the surviving suffix line with the
-  // same suffix-line prefix.  If the replacement is exactly that carried prefix,
-  // the directive belongs before the replacement because the next untouched slice
-  // resumes mid-line.
+  // same suffix-line prefix.  If the replacement is exactly that carried
+  // prefix, the directive belongs before the replacement because the next
+  // untouched slice resumes mid-line.
   if (std::optional<size_t> offset = findCarriedSuffixPrefixInsertionOffset(
           originalFileText, s, e, replacement, /*replacementPrefixOffset=*/0,
           /*requireDeletedLineFromBOL=*/true)) {
@@ -1459,7 +1463,8 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
 
   // Otherwise, the remaining safe insertion points are inside the replacement,
   // immediately before bytes that are proved to be a carried prefix of the
-  // untouched original suffix line, or before a trailing indentation-only suffix.
+  // untouched original suffix line, or before a trailing indentation-only
+  // suffix.
   size_t lastNl = replacement.rfind('\n');
   if (lastNl != StringRef::npos) {
     size_t bol = lastNl + 1;
@@ -1482,7 +1487,6 @@ std::string LineDirectiveInserter::MaybeAppendResyncAfterReplacement(
       if (!rejoinsUntouchedTailSafelyAtBOL(originalFileText, e)) {
         return replacement.str();
       }
-
 
       // Idempotence: if the prior line is already the same directive, do not
       // emit it again before the indentation-only suffix.

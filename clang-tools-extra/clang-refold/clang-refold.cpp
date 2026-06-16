@@ -242,10 +242,10 @@ void lexPPTokens(const std::string &bytes, std::vector<PPTok> &out,
 
 // --------------------- Sideband pragma normalization -------------------------
 
-/// Raw `-E -P` output can contain preserved pragma directive lines. Those
-/// lines are directive sideband: they are printed in the replay surface but are
-/// not ordinary preprocessor tokens in the producer's refold-map token count.
-/// Keep them separate from the normal token stream so they can be diffed as
+/// Raw `-E -P` output can contain preserved pragma directive lines. Those lines
+/// are directive sideband: they are printed in the replay surface but are not
+/// ordinary preprocessor tokens in the producer's refold-map token count. Keep
+/// them separate from the normal token stream so they can be diffed as
 /// zero-token source artifacts rather than forcing whole-file fallback.
 struct SidebandPragmaLine {
   std::string text;
@@ -305,8 +305,6 @@ struct SidebandPragmaItemBinding {
   int64_t pragmaIndex = -1;
   std::optional<uint64_t> ownerIncludeId = std::nullopt;
 };
-
-
 
 static std::string stripCCommentsForPragmaCanonicalization(StringRef text) {
   std::string out;
@@ -375,10 +373,10 @@ static std::string collapsePragmaWhitespacePreservingLiterals(StringRef text) {
 /// The source edit range and the replay identity are different facts.  The edit
 /// range must preserve the full physical directive, including comments and line
 /// continuations, but sideband matching must use the canonical spelling printed
-/// in raw `.i`: comments removed, continued physical lines spliced, and ordinary
-/// pragma whitespace normalized.  Keeping those facts separate collapses the
-/// trailing-comment and line-continuation cases into the same invariant as all
-/// other sideband pragma edits.
+/// in raw `.i`: comments removed, continued physical lines spliced, and
+/// ordinary pragma whitespace normalized.  Keeping those facts separate
+/// collapses the trailing-comment and line-continuation cases into the same
+/// invariant as all other sideband pragma edits.
 static std::string canonicalizeSidebandPragmaText(StringRef text) {
   std::string spliced;
   spliced.reserve(text.size());
@@ -419,7 +417,8 @@ static std::string canonicalizeSidebandPragmaText(StringRef text) {
     i += Pragma.size();
     while (i < body.size() && stringutils::isNonNewlineWs(body[i]))
       ++i;
-    std::string rest = collapsePragmaWhitespacePreservingLiterals(body.substr(i));
+    std::string rest =
+        collapsePragmaWhitespacePreservingLiterals(body.substr(i));
     if (rest.empty())
       return "#pragma\n";
     return ("#pragma " + rest + "\n");
@@ -429,15 +428,17 @@ static std::string canonicalizeSidebandPragmaText(StringRef text) {
   return collapsed + "\n";
 }
 
-static std::optional<std::string> readFileForSidebandCanonicalization(StringRef path) {
+static std::optional<std::string>
+readFileForSidebandCanonicalization(StringRef path) {
   auto bufOrErr = MemoryBuffer::getFile(path);
   if (!bufOrErr)
     return std::nullopt;
   return (*bufOrErr)->getBuffer().str();
 }
 
-static std::optional<std::string> readMappedSourceFileForSideband(
-    StringRef sitePath, StringRef rootSourcePath, StringRef refoldMapPath) {
+static std::optional<std::string>
+readMappedSourceFileForSideband(StringRef sitePath, StringRef rootSourcePath,
+                                StringRef refoldMapPath) {
   if (auto bytes = readFileForSidebandCanonicalization(sitePath))
     return bytes;
 
@@ -588,7 +589,6 @@ static void filterSidebandPragmaTokens(ArrayRef<SidebandPragmaLine> lines,
   tokOff = std::move(filteredOffs);
 }
 
-
 static bool tokenOffsetIsInSidebandPragma(ArrayRef<SidebandPragmaLine> lines,
                                           size_t off) {
   for (const SidebandPragmaLine &line : lines) {
@@ -687,7 +687,6 @@ static std::optional<uint64_t> projectBGapToAGap(ArrayRef<int64_t> aToB,
   return 0;
 }
 
-
 static bool isOnlyWhitespaceForSidebandBlock(StringRef text) {
   for (char c : text) {
     if (!stringutils::isNonNewlineWs(c) && c != '\n' && c != '\r')
@@ -729,7 +728,6 @@ static uint64_t sidebandBlockReplacementBEnd(
     end = limit;
   return end;
 }
-
 
 enum class SidebandDiagnosticPragmaAction { Push, Pop, Setting };
 
@@ -774,7 +772,7 @@ static bool consumeSidebandDiagnosticOptionString(StringRef text, size_t &pos,
 /// to prove source-gap ownership.  Therefore the frontend must know exactly
 /// which pragma lines are safe to remove from the structural token stream when
 /// those same raw B bytes are already inside an ordinary replacement payload.
-/// Keep the admitted language identical to the engine-side Step 3 invariant:
+/// Keep the admitted language identical to the engine-side invariant:
 /// only Clang/GCC diagnostic push/pop/settings participate, settings are useful
 /// only while a pushed frame is active, and unknown pragmas remain outside the
 /// sideband carry proof.
@@ -905,7 +903,6 @@ collectBalancedSidebandDiagnosticPragmaIslands(
 
   return islands;
 }
-
 
 static std::vector<JsonPragmaItem>
 collectJsonPragmaItems(const json::Object &rootJson, StringRef refoldMapPath) {
@@ -1448,19 +1445,19 @@ static void inferUniqueHeaderPragmaOwners(
   }
 }
 
-
 /// Infer the include instance for one header-owned sideband occurrence.
 ///
-/// A physical header can be included more than once, so resolved-path uniqueness
-/// is only a fast path.  For a concrete sideband line in A, the normal-token gap
-/// identifies where that directive appeared in the replay stream.  If exactly
-/// one include of the pragma's header owns that gap, the edit can be routed
-/// through that include's normal materialization path.
+/// A physical header can be included more than once, so resolved-path
+/// uniqueness is only a fast path.  For a concrete sideband line in A, the
+/// normal-token gap identifies where that directive appeared in the replay
+/// stream.  If exactly one include of the pragma's header owns that gap, the
+/// edit can be routed through that include's normal materialization path.
 ///
 /// The end boundary is intentionally considered for trailing pragmas: a pragma
-/// after the last ordinary token in a header appears at `span.end`.  If the same
-/// gap is also the start/end of another same-header include span, more than one
-/// include will claim it and the occurrence remains ambiguous/fail-closed.
+/// after the last ordinary token in a header appears at `span.end`.  If the
+/// same gap is also the start/end of another same-header include span, more
+/// than one include will claim it and the occurrence remains
+/// ambiguous/fail-closed.
 static std::optional<uint64_t> inferHeaderPragmaOwnerForOccurrence(
     const JsonPragmaItem &pragma, const SidebandPragmaLine &line,
     ArrayRef<JsonIncludeItemForSideband> includes) {
@@ -1478,7 +1475,8 @@ static std::optional<uint64_t> inferHeaderPragmaOwnerForOccurrence(
       // inside the half-open span, and trailing pragmas live at span.end.
       // Endpoint ambiguity is handled by collecting claims from all same-path
       // include spans and accepting only when a single include id survives.
-      if (span.begin <= line.normalTokenGap && line.normalTokenGap <= span.end) {
+      if (span.begin <= line.normalTokenGap &&
+          line.normalTokenGap <= span.end) {
         if (owner && *owner != inc.id)
           return std::nullopt;
         owner = inc.id;
@@ -1501,8 +1499,9 @@ static std::optional<uint64_t> inferHeaderPragmaOwnerForOccurrence(
   return std::nullopt;
 }
 
-static bool sitePathHasIncludeInstance(
-    StringRef sitePath, ArrayRef<JsonIncludeItemForSideband> includes) {
+static bool
+sitePathHasIncludeInstance(StringRef sitePath,
+                           ArrayRef<JsonIncludeItemForSideband> includes) {
   for (const JsonIncludeItemForSideband &inc : includes)
     if (inc.resolvedPath == sitePath)
       return true;
@@ -1517,11 +1516,13 @@ static bool sitePathHasIncludeInstance(
 /// for each concrete owner include id.  Within one owner occurrence, duplicate
 /// identical pragma spellings are still consumed in recorded source order.
 ///
-/// If the sideband line can be attributed to competing paths/owners, the line is
-/// left unbound so the caller fails closed instead of editing the wrong owner.
-static std::vector<SidebandPragmaItemBinding> mapSidebandLinesToPragmaItems(
-    ArrayRef<SidebandPragmaLine> lines, ArrayRef<JsonPragmaItem> pragmas,
-    ArrayRef<JsonIncludeItemForSideband> includes) {
+/// If the sideband line can be attributed to competing paths/owners, the line
+/// is left unbound so the caller fails closed instead of editing the wrong
+/// owner.
+static std::vector<SidebandPragmaItemBinding>
+mapSidebandLinesToPragmaItems(ArrayRef<SidebandPragmaLine> lines,
+                              ArrayRef<JsonPragmaItem> pragmas,
+                              ArrayRef<JsonIncludeItemForSideband> includes) {
   std::vector<SidebandPragmaItemBinding> out(lines.size());
   std::set<std::pair<size_t, uint64_t>> used;
   constexpr uint64_t NoOwner = std::numeric_limits<uint64_t>::max();
@@ -1562,17 +1563,17 @@ static std::vector<SidebandPragmaItemBinding> mapSidebandLinesToPragmaItems(
 
     std::stable_sort(physicalPragmas.begin(), physicalPragmas.end(),
                      [&](size_t lhs, size_t rhs) {
-      if (pragmas[lhs].siteB != pragmas[rhs].siteB)
-        return pragmas[lhs].siteB < pragmas[rhs].siteB;
-      return pragmas[lhs].id < pragmas[rhs].id;
-    });
+                       if (pragmas[lhs].siteB != pragmas[rhs].siteB)
+                         return pragmas[lhs].siteB < pragmas[rhs].siteB;
+                       return pragmas[lhs].id < pragmas[rhs].id;
+                     });
 
     for (size_t pragmaIndex : physicalPragmas)
       zeroTokenReplayOrder.push_back(ZeroTokenReplayAtom{pragmaIndex, inc.id});
   }
 
-  auto tryBindZeroTokenReplayAtom = [&](const SidebandPragmaLine &line)
-      -> std::optional<Candidate> {
+  auto tryBindZeroTokenReplayAtom =
+      [&](const SidebandPragmaLine &line) -> std::optional<Candidate> {
     for (const ZeroTokenReplayAtom &atom : zeroTokenReplayOrder) {
       const uint64_t ownerKey = atom.ownerIncludeId;
       if (used.find(std::make_pair(atom.pragmaIndex, ownerKey)) != used.end())
@@ -1605,12 +1606,12 @@ static std::vector<SidebandPragmaItemBinding> mapSidebandLinesToPragmaItems(
       if (pragma.canonicalText != lines[i].canonicalText)
         continue;
 
-      std::optional<uint64_t> owner = inferHeaderPragmaOwnerForOccurrence(
-          pragma, lines[i], includes);
-      const bool isHeaderPragma = !pragma.sitePath.empty() &&
-                                  !StringRef(pragma.sitePath).starts_with("<") &&
-                                  sitePathHasIncludeInstance(pragma.sitePath,
-                                                             includes);
+      std::optional<uint64_t> owner =
+          inferHeaderPragmaOwnerForOccurrence(pragma, lines[i], includes);
+      const bool isHeaderPragma =
+          !pragma.sitePath.empty() &&
+          !StringRef(pragma.sitePath).starts_with("<") &&
+          sitePathHasIncludeInstance(pragma.sitePath, includes);
       if (isHeaderPragma && !owner)
         continue;
 
@@ -1639,8 +1640,8 @@ static std::vector<SidebandPragmaItemBinding> mapSidebandLinesToPragmaItems(
     // map/source order.  Repeated zero-token include occurrences were handled
     // above by the stronger include-occurrence × physical-ordinal product.
     const Candidate chosen = candidates.front();
-    const uint64_t ownerKey = chosen.ownerIncludeId ? *chosen.ownerIncludeId
-                                                    : NoOwner;
+    const uint64_t ownerKey =
+        chosen.ownerIncludeId ? *chosen.ownerIncludeId : NoOwner;
     used.insert(std::make_pair(chosen.pragmaIndex, ownerKey));
     out[i].pragmaIndex = static_cast<int64_t>(chosen.pragmaIndex);
     out[i].ownerIncludeId = chosen.ownerIncludeId;
@@ -1708,24 +1709,25 @@ static std::vector<uint32_t> buildSidebandOwnerDepthGaps(
 /// include/TU boundaries remain fail-closed so the caller can route them
 /// through the existing fallback path instead of manufacturing a source
 /// placement.
-
 static bool buildSidebandPragmaSourceEdits(
     const json::Object &rootJson, StringRef refoldMapPath,
-    ArrayRef<SidebandPragmaLine> aLines,
-    ArrayRef<SidebandPragmaLine> bLines, ArrayRef<PPTok> rawAToks,
-    ArrayRef<std::size_t> rawATokOff, StringRef bBytes,
-    ArrayRef<PPTok> rawBToks, ArrayRef<std::size_t> rawBTokOff,
+    ArrayRef<SidebandPragmaLine> aLines, ArrayRef<SidebandPragmaLine> bLines,
+    ArrayRef<PPTok> rawAToks, ArrayRef<std::size_t> rawATokOff,
+    StringRef bBytes, ArrayRef<PPTok> rawBToks,
+    ArrayRef<std::size_t> rawBTokOff,
     std::vector<RefoldEngine::SidebandPragmaEdit> &edits) {
   edits.clear();
   if (aLines.empty() && bLines.empty())
     return false;
 
-  std::vector<JsonPragmaItem> pragmas = collectJsonPragmaItems(rootJson, refoldMapPath);
+  std::vector<JsonPragmaItem> pragmas =
+      collectJsonPragmaItems(rootJson, refoldMapPath);
   std::vector<JsonIncludeItemForSideband> includes =
       collectJsonIncludesForSideband(rootJson);
   std::vector<JsonTokMapEntryForSideband> tokmap =
       collectJsonTokMapForSideband(rootJson);
-  std::vector<JsonSlotForSideband> slots = collectJsonSlotsForSideband(rootJson);
+  std::vector<JsonSlotForSideband> slots =
+      collectJsonSlotsForSideband(rootJson);
   std::vector<JsonZeroTokenDirectiveForSideband> zeroTokenDirectives =
       collectZeroTokenDirectivesForSideband(rootJson, refoldMapPath);
   auto sourcePath = rootJson.getString("source");
@@ -1743,13 +1745,13 @@ static bool buildSidebandPragmaSourceEdits(
       buildSidebandOwnerDepthGaps(normalA.size(), includes);
   std::vector<int64_t> normalA2B =
       diffutils::lcsMapAB(normalA, normalB, sidebandOwnerDepthGap);
-  std::vector<diffutils::Hunk> normalHunks = diffutils::hunksFromMap(
-      normalA2B, normalA.size(), normalB.size());
+  std::vector<diffutils::Hunk> normalHunks =
+      diffutils::hunksFromMap(normalA2B, normalA.size(), normalB.size());
 
   auto sidebandIslandTextMatches = [&](ArrayRef<SidebandPragmaLine> lhsLines,
-                                      uint64_t lhsBegin, uint64_t lhsEnd,
-                                      ArrayRef<SidebandPragmaLine> rhsLines,
-                                      uint64_t rhsBegin, uint64_t rhsEnd) {
+                                       uint64_t lhsBegin, uint64_t lhsEnd,
+                                       ArrayRef<SidebandPragmaLine> rhsLines,
+                                       uint64_t rhsBegin, uint64_t rhsEnd) {
     if (lhsEnd < lhsBegin || rhsEnd < rhsBegin ||
         lhsEnd - lhsBegin != rhsEnd - rhsBegin)
       return false;
@@ -1769,12 +1771,12 @@ static bool buildSidebandPragmaSourceEdits(
             continue;
 
           // The A-side gap must be strictly inside the replaced normal-token
-          // interval: a boundary pragma belongs to neighboring preserved source,
-          // not to the owner envelope consumed by this ordinary hunk.  The
-          // B-side gap must be inside the raw B replacement byte envelope.  A
-          // gap at `bEnd` is still carried, because the emitted byte slice ends
-          // at the next preserved normal token and therefore includes sideband
-          // directive lines immediately before that token.
+          // interval: a boundary pragma belongs to neighboring preserved
+          // source, not to the owner envelope consumed by this ordinary hunk.
+          // The B-side gap must be inside the raw B replacement byte envelope.
+          // A gap at `bEnd` is still carried, because the emitted byte slice
+          // ends at the next preserved normal token and therefore includes
+          // sideband directive lines immediately before that token.
           if (normalHunk.aStart < aIsland.normalTokenGap &&
               aIsland.normalTokenGap < normalHunk.aEnd &&
               normalHunk.bStart < bIsland.normalTokenGap &&
@@ -1801,9 +1803,10 @@ static bool buildSidebandPragmaSourceEdits(
 
     // A balanced diagnostic island that is textually preserved in B and whose
     // replay bytes are already inside one ordinary replacement hunk should not
-    // participate in the sideband-edit diff.  Its source placement is discharged
-    // later by the owner-gap proof; keeping its directive tokens here would make
-    // the frontend reject the refold map before that proof can run.
+    // participate in the sideband-edit diff.  Its source placement is
+    // discharged later by the owner-gap proof; keeping its directive tokens
+    // here would make the frontend reject the refold map before that proof can
+    // run.
     for (const BalancedSidebandDiagnosticPragmaIsland &aIsland : aIslands) {
       bool aAlreadyDropped = false;
       for (uint64_t a = aIsland.begin; a < aIsland.end; ++a)
@@ -1854,9 +1857,9 @@ static bool buildSidebandPragmaSourceEdits(
           bLines.size() - ordinaryCarriedKeptBLines.size());
 
     // Re-slice the local ArrayRefs over owner storage that lives until this
-    // function returns.  The caller still filters the original raw token arrays;
-    // these narrowed views are only for deciding which sideband lines require
-    // explicit source edits beyond ordinary-hunk replay.
+    // function returns.  The caller still filters the original raw token
+    // arrays; these narrowed views are only for deciding which sideband lines
+    // require explicit source edits beyond ordinary-hunk replay.
     aLines = ArrayRef<SidebandPragmaLine>(ordinaryCarriedKeptALines);
     bLines = ArrayRef<SidebandPragmaLine>(ordinaryCarriedKeptBLines);
     return true;
@@ -1961,9 +1964,8 @@ static bool buildSidebandPragmaSourceEdits(
     SidebandBReplayProof TakeReplay() { return std::move(replay); }
   };
 
-  auto appendProvedSidebandEdit =
-      [&](std::optional<SidebandSourceProof> source,
-          SidebandBReplayProof replay) -> bool {
+  auto appendProvedSidebandEdit = [&](std::optional<SidebandSourceProof> source,
+                                      SidebandBReplayProof replay) -> bool {
     std::optional<RefoldEngine::SidebandPragmaEdit> edit =
         RefoldEngine::SidebandPragmaEdit::Create(
             std::move(source), std::move(replay),
@@ -1979,8 +1981,8 @@ static bool buildSidebandPragmaSourceEdits(
     std::optional<uint64_t> ownerIncludeId = std::nullopt;
   };
 
-  auto bindSourceAtom = [&](uint64_t aIdx)
-      -> std::optional<BoundSidebandSourceAtom> {
+  auto bindSourceAtom =
+      [&](uint64_t aIdx) -> std::optional<BoundSidebandSourceAtom> {
     if (aIdx >= aToPragma.size())
       return std::nullopt;
     const SidebandPragmaItemBinding &binding =
@@ -1992,8 +1994,9 @@ static bool buildSidebandPragmaSourceEdits(
     return BoundSidebandSourceAtom{&pragma, binding.ownerIncludeId};
   };
 
-  auto proveBReplayBlock = [&](uint64_t bStart, uint64_t bEnd)
-      -> std::optional<SidebandBReplayBlockProof> {
+  auto proveBReplayBlock =
+      [&](uint64_t bStart,
+          uint64_t bEnd) -> std::optional<SidebandBReplayBlockProof> {
     if (bStart >= bEnd || bEnd > bLines.size())
       return std::nullopt;
 
@@ -2007,21 +2010,18 @@ static bool buildSidebandPragmaSourceEdits(
     }
 
     const uint64_t begin = bLines[static_cast<size_t>(bStart)].begin;
-    const uint64_t end = sidebandBlockReplacementBEnd(
-        bBytes, bLines, rawBToks, rawBTokOff, bStart, bEnd);
-    if (!ownerGap || end < begin ||
-        end > static_cast<uint64_t>(bBytes.size()))
+    const uint64_t end = sidebandBlockReplacementBEnd(bBytes, bLines, rawBToks,
+                                                      rawBTokOff, bStart, bEnd);
+    if (!ownerGap || end < begin || end > static_cast<uint64_t>(bBytes.size()))
       return std::nullopt;
     return SidebandBReplayBlockProof::Create(
-        *ownerGap, SidebandBReplayProof::FromText(
-                       bBytes.slice(begin, end),
-                       begin, end));
+        *ownerGap,
+        SidebandBReplayProof::FromText(bBytes.slice(begin, end), begin, end));
   };
 
-  auto sourceGapMaterialIsPreservable = [&](StringRef sitePath,
-                                            std::optional<uint64_t> owner,
-                                            uint64_t leftEnd,
-                                            uint64_t rightBegin) -> bool {
+  auto sourceGapMaterialIsPreservable =
+      [&](StringRef sitePath, std::optional<uint64_t> owner, uint64_t leftEnd,
+          uint64_t rightBegin) -> bool {
     return sourceIntervalIsZeroTokenGapMaterial(
         sitePath, owner, leftEnd, rightBegin, *sourcePath, refoldMapPath,
         tokmap, zeroTokenDirectives);
@@ -2058,9 +2058,9 @@ static bool buildSidebandPragmaSourceEdits(
         first->pragma->sitePath, first->pragma->siteB, first->pragma->siteE,
         first->ownerIncludeId, aEnd - aStart);
 
-    // A source-run proof consumes one closed owner-local run.  Every A-side atom
-    // must bind to the same physical file and concrete owner occurrence, and
-    // the bytes between adjacent atoms must be whitespace-only.  Source-only
+    // A source-run proof consumes one closed owner-local run.  Every A-side
+    // atom must bind to the same physical file and concrete owner occurrence,
+    // and the bytes between adjacent atoms must be whitespace-only. Source-only
     // directives in a gap are preservable insertion anchors, not bytes that a
     // sideband replacement run may silently consume.
     for (uint64_t a = aStart + 1; a < aEnd; ++a) {
@@ -2070,13 +2070,13 @@ static bool buildSidebandPragmaSourceEdits(
       std::optional<BoundSidebandSourceAtom> atom = bindSourceAtom(a);
       if (!atom || !atom->pragma ||
           !proof.CanExtendThroughSourceAtom(
-              atom->pragma->sitePath, atom->pragma->siteB,
-              atom->pragma->siteE, atom->ownerIncludeId) ||
+              atom->pragma->sitePath, atom->pragma->siteB, atom->pragma->siteE,
+              atom->ownerIncludeId) ||
           !sourceGapIsWhitespace(atom->pragma->sitePath, proof.SourceEnd(),
                                  atom->pragma->siteB) ||
           !proof.ExtendThroughSourceAtom(
-              atom->pragma->sitePath, atom->pragma->siteB,
-              atom->pragma->siteE, atom->ownerIncludeId))
+              atom->pragma->sitePath, atom->pragma->siteB, atom->pragma->siteE,
+              atom->ownerIncludeId))
         return std::nullopt;
     }
     return proof;
@@ -2087,16 +2087,17 @@ static bool buildSidebandPragmaSourceEdits(
     SidebandBReplayProof replay;
   };
 
-  auto proveInsertion = [&](uint64_t bStart, uint64_t bEnd)
-      -> std::optional<ProvedSidebandInsertion> {
+  auto proveInsertion =
+      [&](uint64_t bStart,
+          uint64_t bEnd) -> std::optional<ProvedSidebandInsertion> {
     std::optional<SidebandBReplayBlockProof> insertedBlock =
         proveBReplayBlock(bStart, bEnd);
     if (!insertedBlock)
       return std::nullopt;
     const uint64_t ownerGap = insertedBlock->OwnerGap();
 
-    auto matchedNeighborInInsertionGap = [&](uint64_t bIdx)
-        -> std::optional<BoundSidebandSourceAtom> {
+    auto matchedNeighborInInsertionGap =
+        [&](uint64_t bIdx) -> std::optional<BoundSidebandSourceAtom> {
       if (bIdx >= bLines.size() || bToA[static_cast<size_t>(bIdx)] < 0)
         return std::nullopt;
 
@@ -2155,9 +2156,9 @@ static bool buildSidebandPragmaSourceEdits(
         // still preferred.
         if (!prev) {
           return ProvedSidebandInsertion{
-              SidebandSourceProof::ZeroWidthInsertion(
-                  next->pragma->sitePath, next->pragma->siteB,
-                  next->ownerIncludeId),
+              SidebandSourceProof::ZeroWidthInsertion(next->pragma->sitePath,
+                                                      next->pragma->siteB,
+                                                      next->ownerIncludeId),
               insertedBlock->TakeReplay()};
         }
 
@@ -2178,9 +2179,9 @@ static bool buildSidebandPragmaSourceEdits(
                 refoldMapPath, zeroTokenDirectives);
         if (!neighborGapHasDirective) {
           return ProvedSidebandInsertion{
-              SidebandSourceProof::ZeroWidthInsertion(
-                  next->pragma->sitePath, next->pragma->siteB,
-                  next->ownerIncludeId),
+              SidebandSourceProof::ZeroWidthInsertion(next->pragma->sitePath,
+                                                      next->pragma->siteB,
+                                                      next->ownerIncludeId),
               insertedBlock->TakeReplay()};
         }
 
@@ -2201,8 +2202,8 @@ static bool buildSidebandPragmaSourceEdits(
           base.pragma->sitePath, base.ownerIncludeId, ownerGap, tokmap, slots);
       if (gapByte && *gapByte >= base.pragma->siteE) {
         if (!sourceGapMaterialIsPreservable(base.pragma->sitePath,
-                                           base.ownerIncludeId,
-                                           base.pragma->siteE, *gapByte))
+                                            base.ownerIncludeId,
+                                            base.pragma->siteE, *gapByte))
           return std::nullopt;
         siteByte = *gapByte;
       }
@@ -2212,16 +2213,17 @@ static bool buildSidebandPragmaSourceEdits(
           insertedBlock->TakeReplay()};
     }
 
-    std::optional<SidebandSourceProof> anchor = inferSidebandSourceProof(
-        bLines[static_cast<size_t>(bStart)], ownerGap, *sourcePath, includes,
-        tokmap, slots);
+    std::optional<SidebandSourceProof> anchor =
+        inferSidebandSourceProof(bLines[static_cast<size_t>(bStart)], ownerGap,
+                                 *sourcePath, includes, tokmap, slots);
     if (!anchor)
       return std::nullopt;
     return ProvedSidebandInsertion{std::move(*anchor),
                                    insertedBlock->TakeReplay()};
   };
 
-  auto appendBarrierSeparatedReplacement = [&](const diffutils::Hunk &h) -> bool {
+  auto appendBarrierSeparatedReplacement =
+      [&](const diffutils::Hunk &h) -> bool {
     if (!h.isReplace() || h.aStart >= h.aEnd || h.bStart >= h.bEnd)
       return false;
 
@@ -2275,24 +2277,21 @@ static bool buildSidebandPragmaSourceEdits(
     for (size_t i = 0; i + 1 < atoms.size(); ++i) {
       const JsonPragmaItem *pragma = atoms[i].pragma;
       if (!appendProvedSidebandEdit(
-              SidebandSourceProof::SourceAtom(
-                  pragma->sitePath, pragma->siteB, pragma->siteE,
-                  atoms[i].ownerIncludeId),
+              SidebandSourceProof::SourceAtom(pragma->sitePath, pragma->siteB,
+                                              pragma->siteE,
+                                              atoms[i].ownerIncludeId),
               SidebandBReplayProof::EmptyAt(emptyBAnchor))) {
-        edits.erase(edits.begin() + editsBefore,
-                    edits.end());
+        edits.erase(edits.begin() + editsBefore, edits.end());
         return false;
       }
     }
 
     const BoundSidebandSourceAtom &last = atoms.back();
-    if (!appendProvedSidebandEdit(
-            SidebandSourceProof::SourceAtom(
-                last.pragma->sitePath, last.pragma->siteB, last.pragma->siteE,
-                last.ownerIncludeId),
-            bBlock->TakeReplay())) {
-      edits.erase(edits.begin() + editsBefore,
-                  edits.end());
+    if (!appendProvedSidebandEdit(SidebandSourceProof::SourceAtom(
+                                      last.pragma->sitePath, last.pragma->siteB,
+                                      last.pragma->siteE, last.ownerIncludeId),
+                                  bBlock->TakeReplay())) {
+      edits.erase(edits.begin() + editsBefore, edits.end());
       return false;
     }
     return true;
@@ -2329,9 +2328,8 @@ static bool buildSidebandPragmaSourceEdits(
           return false;
         const uint64_t bAnchor = byteOffsetForNormalTokenGap(
             bBytes, bLines, rawBToks, rawBTokOff, *bGap);
-        if (!appendProvedSidebandEdit(
-                proveSourceRun(a, a + 1, std::nullopt),
-                SidebandBReplayProof::EmptyAt(bAnchor)))
+        if (!appendProvedSidebandEdit(proveSourceRun(a, a + 1, std::nullopt),
+                                      SidebandBReplayProof::EmptyAt(bAnchor)))
           return false;
       }
       return true;
@@ -2348,8 +2346,7 @@ static bool buildSidebandPragmaSourceEdits(
         std::optional<SidebandSourceProof> source =
             proveSourceRun(h.aStart, h.aEnd, ownerGap);
         if (source &&
-            appendProvedSidebandEdit(std::move(source),
-                                     bBlock->TakeReplay()))
+            appendProvedSidebandEdit(std::move(source), bBlock->TakeReplay()))
           return true;
       }
       if (appendBarrierSeparatedReplacement(h))
@@ -2358,10 +2355,9 @@ static bool buildSidebandPragmaSourceEdits(
         return false;
       for (uint64_t a = h.aStart, b = h.bStart; a < h.aEnd; ++a, ++b) {
         const SidebandPragmaLine &line = bLines[static_cast<size_t>(b)];
-        if (!appendProvedSidebandEdit(
-                proveSourceRun(a, a + 1, std::nullopt),
-                SidebandBReplayProof::FromText(
-                    line.text, line.begin, line.end)))
+        if (!appendProvedSidebandEdit(proveSourceRun(a, a + 1, std::nullopt),
+                                      SidebandBReplayProof::FromText(
+                                          line.text, line.begin, line.end)))
           return false;
       }
       return true;
@@ -2772,8 +2768,7 @@ buildFinalLineControlValidationCallback(StringRef outputPath,
       closeStream.close();
     }
 
-    auto cleanup =
-        make_scope_exit([&]() { (void)sys::fs::remove(tmpPath); });
+    auto cleanup = make_scope_exit([&]() { (void)sys::fs::remove(tmpPath); });
 
     if (Error err = writePruneValidationSource(tmpPath, currentOutput)) {
       reason = toString(std::move(err));
@@ -2803,8 +2798,7 @@ buildFinalLineControlValidationCallback(StringRef outputPath,
 
     if (*currentPPOrErr != *candidatePPOrErr) {
       if (!preprocessedTokensEqualForLinePrune(*currentPPOrErr,
-                                               *candidatePPOrErr, ctx,
-                                               reason))
+                                               *candidatePPOrErr, ctx, reason))
         return false;
       reason.clear();
       return true;
@@ -2814,7 +2808,6 @@ buildFinalLineControlValidationCallback(StringRef outputPath,
     return true;
   };
 }
-
 
 static bool canIgnoreNoLinesMismatch(const PPTok &aTok, const PPTok &bTok) {
   if (aTok.kind != bTok.kind)
@@ -2970,9 +2963,10 @@ static void addPathSpellingsForNoLinesBuiltin(
 /// Build the finite set of token spellings that may correspond to a builtin
 /// event under `--no-lines`.
 ///
-/// For path-valued builtins, include the builtin's file, each caller's file, and
-/// the TU source path where applicable. For `__LINE__`, compute exact physical
-/// line numbers from invocation offsets when the source bytes are available.
+/// For path-valued builtins, include the builtin's file, each caller's file,
+/// and the TU source path where applicable. For `__LINE__`, compute exact
+/// physical line numbers from invocation offsets when the source bytes are
+/// available.
 static std::set<std::string> buildAllowedSpellingsForNoLinesBuiltin(
     const NoLinesMacroInfo &item, ArrayRef<const NoLinesMacroInfo *> chain,
     StringRef sourcePath, const PPCtx &ctx,
@@ -3009,8 +3003,9 @@ static std::set<std::string> buildAllowedSpellingsForNoLinesBuiltin(
 
 /// Test whether one original preprocessed token is a plausible expansion of a
 /// particular zero-length builtin event.
-static bool tokenMatchesNoLinesBuiltinEvent(const PPTok &tok,
-                                            const NoLinesSensitiveEvent &event) {
+static bool
+tokenMatchesNoLinesBuiltinEvent(const PPTok &tok,
+                                const NoLinesSensitiveEvent &event) {
   StringRef name(event.item->name);
   if (name == "__LINE__") {
     if (tok.kind != "numeric_constant")
@@ -3415,8 +3410,8 @@ static bool pathSpellingMatchesAfterAbsolute(StringRef a, StringRef b) {
 /// Source-graph sidecars are part of the checker-visible replay surface because
 /// quoted include lookup searches the directory containing the emitted `.c.mod`
 /// before the captured `-I` paths.  Therefore a sidecar emitted by an older run
-/// must not be allowed to shadow the original header after the current proof has
-/// fallen back to TU materialization.
+/// must not be allowed to shadow the original header after the current proof
+/// has fallen back to TU materialization.
 ///
 /// Cleanup entries are intentionally conservative: the driver removes a stale
 /// file only when the existing bytes exactly match the rejected generated owner
@@ -3457,8 +3452,8 @@ static void writeSourceGraphOutputs(StringRef modifiedSrcPath,
       continue;
     }
 
-    auto [it, inserted] = uniqueOutputs.insert({output.relativePath,
-                                                output.bytes});
+    auto [it, inserted] =
+        uniqueOutputs.insert({output.relativePath, output.bytes});
     if (!inserted && it->second != output.bytes)
       fatal("source-graph/write",
             "conflicting source-graph contents for path: {0}",
@@ -3494,8 +3489,9 @@ static void writeSourceGraphOutputs(StringRef modifiedSrcPath,
     }
 
     if (std::error_code ec = sys::fs::remove(path))
-      fatal("source-graph/write", "cannot remove stale source-graph file {0}: {1}",
-            path, ec.message());
+      fatal("source-graph/write",
+            "cannot remove stale source-graph file {0}: {1}", path,
+            ec.message());
     info("finished", "removed stale source-graph header: {0}", path);
   }
 
@@ -3521,8 +3517,7 @@ static void writeSourceGraphOutputs(StringRef modifiedSrcPath,
     std::error_code ec;
     raw_fd_ostream os(path, ec, sys::fs::OF_Text);
     if (ec)
-      fatal("source-graph/write", "cannot write {0}: {1}", path,
-            ec.message());
+      fatal("source-graph/write", "cannot write {0}: {1}", path, ec.message());
     os << entry.second;
     os.close();
     info("finished", "wrote source-graph header: {0}", path);
@@ -3914,8 +3909,8 @@ int main(int argc, char **argv) {
   }
 
   if (onlyCheck) {
-    // Verification mode (normal comparison): compare preprocessed token
-    // streams directly. The --no-lines special-case is handled above.
+    // Verification mode (normal comparison): compare preprocessed token streams
+    // directly. The --no-lines special-case is handled above.
     if (Error err = compareTokens(aToks, bToks)) {
       outs() << toString(std::move(err)) << "\n";
       outs() << "FAILURE!\n";

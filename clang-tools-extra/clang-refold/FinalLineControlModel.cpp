@@ -2,7 +2,8 @@
 //
 // Final-stream line-control proof scaffolding for clang-refold.
 //
-// Phase 6F removes the legacy passive observer/layout/physical-line scanner.
+// Final-line-control pruning is driven by compact proof obligations plus
+// executable validation, not by the removed passive observer/layout scanner.
 // The only live pruning authority in this file is now: explicit compact
 // generation-site proof, deterministic fixed-point candidate ordering, and the
 // executable validation callback for the exact deletion under consideration.
@@ -63,7 +64,8 @@ const char *toString(FinalLineControlRemovalDischarge discharge) {
     return "ObserverAndLayoutDead";
   case FinalLineControlRemovalDischarge::SyntheticIncludeEntryDominated:
     return "SyntheticIncludeEntryDominated";
-  case FinalLineControlRemovalDischarge::SyntheticNewlineResyncStaleBeforeInclude:
+  case FinalLineControlRemovalDischarge::
+      SyntheticNewlineResyncStaleBeforeInclude:
     return "SyntheticNewlineResyncStaleBeforeInclude";
   case FinalLineControlRemovalDischarge::SyntheticTUPrologueDominatedByRepair:
     return "SyntheticTUPrologueDominatedByRepair";
@@ -232,7 +234,8 @@ bool SameFinalLineControlRemovalProof(
 
 FinalLineControlObligationProof MakeFinalLineControlObligationProof(
     FinalLineControlObligation obligation, FinalLineDirective::Origin origin,
-    std::optional<FinalLineControlOwnerKey> physicalOwner, bool producerProven) {
+    std::optional<FinalLineControlOwnerKey> physicalOwner,
+    bool producerProven) {
   FinalLineControlObligationProof proof;
   proof.obligation = obligation;
   proof.origin = origin;
@@ -564,7 +567,8 @@ void adjustCandidatesAfterDeletion(
   adjusted.reserve(candidates.size());
 
   for (FinalLineControlPruneCandidate candidate : candidates) {
-    if (candidate.finalBegin == removedBegin && candidate.finalEnd == removedEnd)
+    if (candidate.finalBegin == removedBegin &&
+        candidate.finalEnd == removedEnd)
       continue;
 
     if (candidate.finalEnd <= removedBegin) {
@@ -581,7 +585,8 @@ void adjustCandidatesAfterDeletion(
 
     // A candidate overlapping a removed directive but not exactly equal to it
     // no longer has a stable final-stream byte range.  Drop it fail-closed
-    // rather than pruning a shifted or partially removed directive by guesswork.
+    // rather than pruning a shifted or partially removed directive by
+    // guesswork.
   }
 
   candidates = std::move(adjusted);
@@ -640,7 +645,8 @@ FinalLineControlPruneResult PruneFinalLineControlDirectives(
       markCandidateValidationDischarged(candidate);
       result.removedRanges.push_back({removedBegin, removedEnd});
       current = std::move(candidateOutput);
-      adjustCandidatesAfterDeletion(currentCandidates, removedBegin, removedEnd);
+      adjustCandidatesAfterDeletion(currentCandidates, removedBegin,
+                                    removedEnd);
 
       result.changed = true;
       removedThisIteration = true;

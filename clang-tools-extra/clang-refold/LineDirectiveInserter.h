@@ -52,8 +52,8 @@ struct LineDirectiveLocation {
   /// Byte offset of the last source line-control directive before this location
   /// whose effect could not be proven from the current model-backed owner-local
   /// scan.  This distinguishes an unmodeled preserved prefix, where suppressing
-  /// an extra synthetic resync leaves the real source directive in force, from a
-  /// consumed unmodeled directive, which must fail closed.
+  /// an extra synthetic resync leaves the real source directive in force, from
+  /// a consumed unmodeled directive, which must fail closed.
   std::optional<uint64_t> unprovenLineControlDirectiveOffset;
 
   LineDirectiveLocation(StringRef file, size_t line, bool proven = true,
@@ -308,8 +308,9 @@ private:
   static std::optional<LineDirectiveState>
   ParseLineDirective(StringRef src, size_t from, size_t to);
 
-  /// \brief Computes whether emitting `#line targetLine "fileSpellingForDir"` at
-  /// the current output position would have no effect on the logical location.
+  /// \brief Computes whether emitting `#line targetLine "fileSpellingForDir"`
+  /// at the current output position would have no effect on the logical
+  /// location.
   ///
   /// Mechanism: find the most recent parseable #line directive in `out`
   /// (bounded lookback), then compute:
@@ -330,8 +331,8 @@ private:
     if (!st || st->fileSpelling != fileSpellingForDir)
       return false;
 
-    size_t delta = stringutils::countNonSplicedNewlines(
-        src, st->afterDirIdx, src.size());
+    size_t delta =
+        stringutils::countNonSplicedNewlines(src, st->afterDirIdx, src.size());
     return (st->lineAfterDir + delta) == targetLine;
   }
 };

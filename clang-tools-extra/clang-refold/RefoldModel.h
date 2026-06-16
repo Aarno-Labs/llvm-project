@@ -360,9 +360,9 @@ public:
   ///
   /// This is the typed form of DirectiveMacroItem.replacement_tokens.  It lets
   /// later proof code replay simple macro definitions from producer evidence
-  /// instead of reparsing #define text in the consumer.  `ParamRef` tokens carry
-  /// a formal index into the directive's defParams vector; `Literal` tokens are
-  /// fixed replacement-list spellings.
+  /// instead of reparsing #define text in the consumer.  `ParamRef` tokens
+  /// carry a formal index into the directive's defParams vector; `Literal`
+  /// tokens are fixed replacement-list spellings.
   struct MacroReplacementToken {
     MacroReplacementTokenKind kind = MacroReplacementTokenKind::Literal;
     StringRef spelling;

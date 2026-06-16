@@ -2,12 +2,12 @@
 //
 // Final-stream line-control proof scaffolding for clang-refold.
 //
-// Phase 6F makes compact final-line-control proofs, plus executable
-// validation, the pruning authority.  The old observer/layout/physical-line
-// scanner has been removed from this interface: generation sites now carry the
-// typed obligation that explains why a directive exists, while the fixed-point
-// pruner discharges physical deletion only when validation proves that removing
-// that exact final-stream range preserves the accepted preprocessed output.
+// Compact final-line-control proofs, plus executable validation, are the
+// pruning authority. The old observer/layout/physical-line scanner has been
+// removed from this interface: generation sites now carry the typed obligation
+// that explains why a directive exists, while the fixed-point pruner discharges
+// physical deletion only when validation proves that removing that exact final-
+// stream range preserves the accepted preprocessed output.
 //
 //===----------------------------------------------------------------------===//
 
@@ -110,9 +110,9 @@ const char *toString(FinalLineControlObligation obligation);
 
 /// Whether deletion of an exact final-stream directive has been discharged.
 ///
-/// `NotProven` is the fail-closed default.  During Phase 6F the pruner may turn
-/// a validation-accepted candidate into `Removable`, but deletion is never
-/// performed solely because an obligation exists.
+/// `NotProven` is the fail-closed default.  The pruner may turn a validation-
+/// accepted candidate into `Removable`, but deletion is never performed solely
+/// because an obligation exists.
 enum class FinalLineControlRemovalVerdict : uint8_t {
   NotProven,
   Removable,
@@ -124,10 +124,9 @@ const char *toString(FinalLineControlRemovalVerdict verdict);
 /// The theorem class that discharged physical deletion of a directive.
 ///
 /// The legacy observer/layout discharges remain as historical diagnostic values
-/// for already-created artifacts, but Phase 6F uses
-/// `ValidationPreservedEquivalence` as the live authority: after a typed
-/// obligation admits the candidate, executable validation proves the exact
-/// deletion preserves the accepted `-E -P` output.
+/// for already-created artifacts, but `ValidationPreservedEquivalence` is the
+/// live authority: after a typed obligation admits the candidate, executable
+/// validation proves the exact deletion preserves the accepted `-E -P` output.
 enum class FinalLineControlRemovalDischarge : uint8_t {
   None,
   ObserverAndLayoutDead,
@@ -209,15 +208,15 @@ FinalLineControlPruneCandidate MakeFinalLineControlPruneCandidate(
 bool HasCompleteFinalLineControlProof(
     const FinalLineControlPruneCandidate &candidate);
 
-/// Removed final-output range.  Ranges are reported in the coordinate space that
-/// existed when the deletion was performed, matching the engine's existing
+/// Removed final-output range.  Ranges are reported in the coordinate space
+/// that existed when the deletion was performed, matching the engine's existing
 /// source-mapping adjustment convention.
 struct FinalLineControlRemovedRange {
   uint64_t finalBegin = 0;
   uint64_t finalEnd = 0;
 };
 
-/// Phase-6F authority contract.
+/// Final-line-control authority contract.
 ///
 /// The legacy observer/layout scanner is no longer authoritative.  Deletion is
 /// driven by compact obligations, fixed-point candidate ordering, and executable
@@ -252,11 +251,11 @@ using FinalLineControlValidationCallback = std::function<bool(
 /// Run deterministic fixed-point pruning over explicit final-stream
 /// line-control candidates.
 ///
-/// Phase 6F deletes the passive final observer/layout scanner.  A candidate is
-/// attempted only when it carries both compact proof records, has a stable
-/// current byte range, and is not explicitly Required.  The pass removes at most
-/// one validation-accepted directive per iteration, then shifts the remaining
-/// candidate ranges and starts over.
+/// This pass replaces the passive final observer/layout scanner.  A candidate
+/// is attempted only when it carries both compact proof records, has a stable
+/// current byte range, and is not explicitly Required.  The pass removes at
+/// most one validation-accepted directive per iteration, then shifts the
+/// remaining candidate ranges and starts over.
 FinalLineControlPruneResult PruneFinalLineControlDirectives(
     llvm::StringRef finalSource,
     llvm::ArrayRef<FinalLineControlPruneCandidate> removableCandidates =

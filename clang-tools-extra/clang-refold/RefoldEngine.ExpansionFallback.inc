@@ -4,10 +4,9 @@
 // `RefoldEngine.cpp` to reduce the size of the main implementation file.
 //
 // This fragment contains closure/materialization helpers used near the
-// post-structural fallback boundary.  Phase 8 removes the legacy
-// partial-expansion proof-bypass path from this file; the remaining terminal
-// resolver only normalizes a failed structural run onto the declared raw-B
-// terminal carrier.
+// post-structural fallback boundary.  The legacy partial-expansion proof-bypass
+// path has been removed from this file; the remaining terminal resolver only
+// normalizes a failed structural run onto the declared raw-B terminal carrier.
 //
 // This is a physical extraction only:
 //   - the methods remain `RefoldEngine` members
@@ -253,14 +252,13 @@ static bool isPreservableIncludeClosureGapTrivia(StringRef text) {
   return sawConditionalDirective && depth == 0;
 }
 
-/// Return true when preserved trivia begins with a preprocessing directive after
-/// optional horizontal whitespace. Such trivia must be placed at the start of a
-/// physical line when appended after materialized B tokens.
+/// Return true when preserved trivia begins with a preprocessing directive
+/// after optional horizontal whitespace. Such trivia must be placed at the
+/// start of a physical line when appended after materialized B tokens.
 static bool startsWithPreprocessorDirectiveTrivia(StringRef text) {
   StringRef rest = text.ltrim(" \t\v\f");
   return rest.starts_with("#");
 }
-
 
 struct SourceLineDirectiveGapResume {
   size_t lineAtResume = 0;
@@ -306,15 +304,16 @@ using SourceLineDirectiveLogicalLineRewriter =
         StringRef, ArrayRef<uint64_t>,
         SourceLineDirectiveBuiltinMacroResolver)>;
 
-/// Return `text` after applying the translation-phase-2 splice deletion rule.
+/// Return `text` after applying the backslash-newline splice deletion rule.
 ///
-/// The owner-envelope line-control proof operates on a phase-2 logical directive
-/// line, while the producer records macro invocation and argument byte ranges in
-/// the original source spelling.  When a recorded invocation crosses a literal
-/// backslash-newline pair, compare and substitute the post-splice spelling rather
-/// than requiring physically contiguous source bytes.
+/// The owner-envelope line-control proof operates on a line-spliced logical
+/// directive line, while the producer records macro invocation and argument
+/// byte ranges in the original source spelling.  When a recorded invocation
+/// crosses a literal backslash-newline pair, compare and substitute the
+/// post-splice spelling rather than requiring physically contiguous source
+/// bytes.
 static std::optional<std::string>
-removePhase2SplicesForLineControl(StringRef text) {
+removeLineSplicesForLineControl(StringRef text) {
   std::string out;
   out.reserve(text.size());
 
@@ -322,7 +321,7 @@ removePhase2SplicesForLineControl(StringRef text) {
   ScanState state = ScanState::Ordinary;
 
   auto skipSplice = [&](size_t &pos) -> bool {
-    return stringutils::skipPhase2LineSplice(text, text.size(), pos);
+    return stringutils::skipBackslashNewlineSplice(text, text.size(), pos);
   };
 
   for (size_t pos = 0; pos < text.size();) {
@@ -352,7 +351,7 @@ removePhase2SplicesForLineControl(StringRef text) {
     }
 
     if (state == ScanState::BlockComment) {
-      // Translation phase 2 removes backslash-newline pairs before phase 3
+      // Backslash-newline pairs are deleted before comment replacement
       // replaces a complete block comment with whitespace.  This local proof
       // therefore may delete splice pairs inside a recorded block comment while
       // still leaving the comment itself for the later stringification helper
@@ -394,20 +393,20 @@ removePhase2SplicesForLineControl(StringRef text) {
   return out;
 }
 
-/// Build the translation-phase-2 logical spelling of one source line.
+/// Build the directive-logical spelling of one source line after splice deletion.
 ///
 /// Source-level `#line` gaps are parsed from raw file bytes because they do not
 /// have ordinary PP tokens in the refold map.  Directive recognition occurs
 /// after C line splicing, so a `#` line whose trailing backslash splices the
 /// following `line 123` text is the same logical directive as `#line 123`.
 /// Block comments inside a directive are recognized before choosing the
-/// terminating newline, because phase 3 replaces a complete comment with one
+/// terminating newline, because comment replacement turns a complete comment into one
 /// whitespace character; physical newlines inside such comments are therefore
 /// part of the directive spelling, not the directive terminator.  This helper
 /// removes only literal backslash-newline and backslash-CRLF pairs that are
 /// fully contained in the proved source gap, then returns the byte just after
 /// the terminating non-spliced newline.
-static bool collectPhase2LogicalLine(
+static bool collectLineSpliceLogicalLine(
     StringRef fileText, uint64_t lineBegin, uint64_t limit,
     std::string &logicalLine, uint64_t &afterLine,
     SmallVectorImpl<uint64_t> *logicalLineSourceOffsets = nullptr) {
@@ -424,32 +423,32 @@ static bool collectPhase2LogicalLine(
       logicalLineSourceOffsets->push_back(pos);
   };
 
-  auto skipPhase2Splice = [&](uint64_t &pos) -> bool {
-    return stringutils::skipPhase2LineSplice(fileText, limit, pos);
+  auto skipLineSplice = [&](uint64_t &pos) -> bool {
+    return stringutils::skipBackslashNewlineSplice(fileText, limit, pos);
   };
 
   for (uint64_t pos = lineBegin; pos < limit;) {
     char ch = fileText[pos];
 
-    // C translation phase 2 deletes backslash-newline pairs before
+    // C backslash-newline splicing deletes splice pairs before
     // preprocessing directives are recognized.  Require the whole pair to be
     // inside the already-proved source gap so the closure does not depend on
     // bytes outside its envelope.
-    if (skipPhase2Splice(pos))
+    if (skipLineSplice(pos))
       continue;
 
     // A block comment that starts on a directive line is translated to one
     // whitespace character before macro expansion.  Newlines inside the
     // complete comment therefore do not terminate the directive.  Keep the raw
     // comment spelling and source-offset map so later stringification proofs
-    // can apply their own phase-3 whitespace normalization to the recorded
+    // can apply their own comment-to-whitespace normalization to the recorded
     // macro argument.
     if (ch == '/' && pos + 1 < limit && fileText[pos + 1] == '*') {
       appendSourceByte(pos++);
       appendSourceByte(pos++);
       bool closed = false;
       while (pos < limit) {
-        if (skipPhase2Splice(pos))
+        if (skipLineSplice(pos))
           continue;
         if (pos + 1 < limit && fileText[pos] == '*' &&
             fileText[pos + 1] == '/') {
@@ -483,7 +482,7 @@ static bool collectPhase2LogicalLine(
 /// Return the raw source offset from which physical newlines inside a proved
 /// line-control directive affect the resumed line state.
 ///
-/// `collectPhase2LogicalLine()` removes backslash-newline splices before the
+/// `collectLineSpliceLogicalLine()` removes backslash-newline splices before the
 /// directive is parsed, but not every removed physical newline advances the
 /// presumed line established by the directive.  Splices that merely form the
 /// directive introducer itself, such as `#\nline 123` or `#li\nne 123`, are
@@ -573,7 +572,7 @@ static bool sourcePrefixMayContainLineControlDirective(StringRef fileText,
   for (uint64_t lineBegin = 0; lineBegin < limit;) {
     std::string logicalLine;
     uint64_t afterLine = lineBegin;
-    if (!collectPhase2LogicalLine(fileText, lineBegin, limit, logicalLine,
+    if (!collectLineSpliceLogicalLine(fileText, lineBegin, limit, logicalLine,
                                   afterLine))
       return true;
 
@@ -991,7 +990,7 @@ parseLineControlFilenameLiteral(StringRef &rest) {
 /// directly from the source bytes when a source-only line-control line lies
 /// between otherwise required owner pieces.
 ///
-/// The input is a translation-phase-2 logical line: any C backslash-newline
+/// The input is a line-spliced logical line: any C backslash-newline
 /// splices have already been removed by the caller.  This parser is still
 /// intentionally stricter than the general preprocessor grammar: it accepts
 /// only source-spelled `#line <digits> ["file"]` and the Clang/GCC numeric
@@ -1208,7 +1207,8 @@ static bool sourceSuffixMayObservePresumedFileSpelling(
     return popAndReturn(false);
   };
 
-  for (const RefoldModel::MacroInvocation &macro : model.GetMacroInvocations()) {
+  for (const RefoldModel::MacroInvocation &macro :
+       model.GetMacroInvocations()) {
     if (macro.name != "__FILE__" && macro.name != "__FILE_NAME__")
       continue;
 
@@ -1362,7 +1362,7 @@ stringifyLineControlMacroArgument(StringRef argument) {
     }
 
     // Comments are replaced by one whitespace character before macro
-    // stringification.  Because collectPhase2LogicalLine has already proved
+    // stringification.  Because collectLineSpliceLogicalLine has already proved
     // that a block comment in a directive gap is complete and wholly inside the
     // logical directive, it is safe to model the whole comment as one pending
     // inter-token space and normalize it with adjacent whitespace below.  Line
@@ -1399,9 +1399,10 @@ stringifyLineControlMacroArgument(StringRef argument) {
 
       appendPendingSpace();
       // Outside a literal, macro stringification copies this backslash into the
-      // generated filename string literal rather than doubling it.  Preserve the
-      // whole admitted raw escape spelling and let the strict filename-literal
-      // parser decode the same bounded subset that was proved above.
+      // generated filename string literal rather than doubling it.  Preserve
+      // the whole admitted raw escape spelling and let the strict
+      // filename-literal parser decode the same bounded subset that was proved
+      // above.
       stringified.append(trimmed.begin() + pos, trimmed.begin() + *escapeEnd);
       hasPayload = true;
       pos = *escapeEnd;
@@ -1449,8 +1450,8 @@ stringifyLineControlMacroArgument(StringRef argument) {
   return stringified;
 }
 
-/// Return true iff a recorded macro argument contains at least one preprocessing
-/// token after the local phase-3 comment-to-whitespace rule.
+/// Return true iff a recorded macro argument contains at least one
+/// preprocessing token after the local comment-to-whitespace rule.
 ///
 /// `__VA_OPT__` is controlled by whether the variadic tail contains any
 /// preprocessing tokens, not by whether the raw argument spelling is non-empty.
@@ -1680,12 +1681,12 @@ static std::optional<std::string> expandLineControlVaOptOperators(
 /// list used inside a source-only line-control directive.
 ///
 /// This is intentionally a token-spelling substitution, not a general macro
-/// expander.  The caller supplies exact source spellings for complete invocation
-/// arguments that are wholly inside the already-proved logical directive line.
-/// Direct formal substitution is supported, and `# formal` is supported through
-/// the conservative line-control stringification helper above.  The resulting
-/// replacement text is still parsed by the strict line-control parser, so any
-/// unsupported macro semantics remain fail-closed.
+/// expander.  The caller supplies exact source spellings for complete
+/// invocation arguments that are wholly inside the already-proved logical
+/// directive line. Direct formal substitution is supported, and `# formal` is
+/// supported through the conservative line-control stringification helper
+/// above.  The resulting replacement text is still parsed by the strict
+/// line-control parser, so any unsupported macro semantics remain fail-closed.
 static std::optional<std::string> substituteLineControlMacroParameters(
     StringRef replacement, ArrayRef<RefoldModel::MacroDefParam> params,
     ArrayRef<StringRef> invocationArgTexts,
@@ -1962,11 +1963,13 @@ static std::optional<std::string> simpleLineControlMacroReplacementText(
     return std::nullopt;
 
   const RefoldModel::MacroDirective *definition = nullptr;
-  for (const RefoldModel::MacroDirective &directive : model.GetMacroDirectives())
+  for (const RefoldModel::MacroDirective &directive :
+       model.GetMacroDirectives()) {
     if (directive.id == *macro.definitionDirectiveId) {
       definition = &directive;
       break;
     }
+  }
   if (!definition || definition->subkind != "#define")
     return std::nullopt;
 
@@ -2033,10 +2036,11 @@ static std::optional<std::string> simpleLineControlMacroReplacementText(
     return std::nullopt;
 
   if ((macro.subkind == "func" && !macro.defParams.empty()) ||
-      !macro.pasteTokens.empty())
+      !macro.pasteTokens.empty()) {
     return substituteLineControlMacroParameters(replacement, macro.defParams,
                                                 invocationArgTexts,
                                                 macro.pasteTokens);
+  }
 
   if (!invocationArgTexts.empty())
     return std::nullopt;
@@ -2081,12 +2085,12 @@ findLineControlMacroNameOccurrences(StringRef text, StringRef name) {
 /// The earlier proof required the child invocation spelling to occur exactly
 /// once in the parent's recovered replacement text.  That was sound but too
 /// narrow for definitions such as `#define FILE_NAME F F`: the refold map
-/// records both child invocations, and their source byte order disambiguates the
-/// two identical `F` spellings deterministically.  When repeated spellings are
-/// present, require a one-to-one correspondence between recorded same-spelling
-/// children and textual whole-token occurrences, then match them by source order
-/// and occurrence order.  Any unrecorded extra occurrence, missing source range,
-/// or ordering ambiguity still fails closed.
+/// records both child invocations, and their source byte order disambiguates
+/// the two identical `F` spellings deterministically.  When repeated spellings
+/// are present, require a one-to-one correspondence between recorded
+/// same-spelling children and textual whole-token occurrences, then match them
+/// by source order and occurrence order.  Any unrecorded extra occurrence,
+/// missing source range, or ordering ambiguity still fails closed.
 static std::optional<std::pair<size_t, size_t>>
 findLineControlMacroOccurrenceForChild(
     const RefoldModel &model, const RefoldModel::MacroInvocation &parent,
@@ -2294,7 +2298,7 @@ expandLineControlMacroReplacementText(
 ///
 /// The substitution is used only as a precursor to the strict line-control
 /// parser.  It accepts complete callsites whose recorded source spelling maps
-/// into the phase-2 logical line after deleting literal backslash-newline
+/// into the line-spliced logical line after deleting literal backslash-newline
 /// splices, and whose replacement text is recovered from a simple recorded
 /// #define.  Partial callsites, nested/overlapping source ranges, unsupported
 /// parameterized replacement semantics, and unrecorded expansions all fail
@@ -2345,14 +2349,16 @@ rewriteSourceLineDirectiveLogicalLineMacros(
     return static_cast<size_t>(it - logicalLineSourceOffsets.begin());
   };
 
-  auto findLogicalEndIndex = [&](uint64_t sourceOffset) -> std::optional<size_t> {
+  auto findLogicalEndIndex =
+      [&](uint64_t sourceOffset) -> std::optional<size_t> {
     auto it = std::lower_bound(logicalLineSourceOffsets.begin(),
                                logicalLineSourceOffsets.end(), sourceOffset);
     return static_cast<size_t>(it - logicalLineSourceOffsets.begin());
   };
 
   SmallVector<ReplacementPiece, 4> pieces;
-  for (const RefoldModel::MacroInvocation &macro : model.GetMacroInvocations()) {
+  for (const RefoldModel::MacroInvocation &macro :
+       model.GetMacroInvocations()) {
     // Replacement pieces for nested macro invocations are produced by walking
     // the recorded expansion DAG from their source-spelled root.  Adding them
     // again as independent logical-line pieces would create overlapping edits
@@ -2386,9 +2392,9 @@ rewriteSourceLineDirectiveLogicalLineMacros(
             : nullptr;
     if (!macro.invText)
       continue;
-    std::optional<std::string> phase2Invocation =
-        removePhase2SplicesForLineControl(*macro.invText);
-    if (!phase2Invocation || logicalInvocation != *phase2Invocation)
+    std::optional<std::string> splicedInvocation =
+        removeLineSplicesForLineControl(*macro.invText);
+    if (!splicedInvocation || logicalInvocation != *splicedInvocation)
       continue;
 
     SmallVector<StringRef, 4> invocationArgTexts;
@@ -2402,8 +2408,7 @@ rewriteSourceLineDirectiveLogicalLineMacros(
             *argRange.first > *argRange.second)
           return std::nullopt;
 
-        std::optional<size_t> argBeginIndex =
-            findLogicalIndex(*argRange.first);
+        std::optional<size_t> argBeginIndex = findLogicalIndex(*argRange.first);
         std::optional<size_t> argEndIndex =
             findLogicalEndIndex(*argRange.second);
         if (!argBeginIndex || !argEndIndex || *argBeginIndex > *argEndIndex ||
@@ -2414,20 +2419,21 @@ rewriteSourceLineDirectiveLogicalLineMacros(
             logicalLine.substr(*argBeginIndex, *argEndIndex - *argBeginIndex);
 
         // Macro argument ranges are recorded in the physical source spelling,
-        // while this proof substitutes from the phase-2 logical directive line.
+        // while this proof substitutes from the line-spliced directive-logical
+        // line.
         // A backslash-newline inside the argument is therefore safe only when
-        // the recorded invocation text, after phase-2 splice deletion, matches
-        // the exact logical slice we are about to substitute.
+        // the recorded invocation text after backslash-newline splice deletion
+        // matches the exact logical slice we are about to substitute.
         const uint64_t relativeArgBegin = *argRange.first - *macro.invB;
         const uint64_t relativeArgEnd = *argRange.second - *macro.invB;
         if (relativeArgBegin > relativeArgEnd ||
             relativeArgEnd > macro.invText->size())
           return std::nullopt;
-        std::optional<std::string> phase2Arg =
-            removePhase2SplicesForLineControl(macro.invText->slice(
-                static_cast<size_t>(relativeArgBegin),
-                static_cast<size_t>(relativeArgEnd)));
-        if (!phase2Arg || logicalArg != *phase2Arg)
+        std::optional<std::string> splicedArg =
+            removeLineSplicesForLineControl(
+                macro.invText->slice(static_cast<size_t>(relativeArgBegin),
+                                     static_cast<size_t>(relativeArgEnd)));
+        if (!splicedArg || logicalArg != *splicedArg)
           return std::nullopt;
 
         invocationArgTexts.push_back(logicalArg);
@@ -2498,7 +2504,8 @@ rewriteSourceLineDirectiveLogicalLineMacros(
 
 /// Format the local resume directive for a consumed source-only line-control
 /// gap.  Canonical #line spelling is used unless the consumed state carries
-/// numeric line-marker flags that must be replayed to preserve the suffix state.
+/// numeric line-marker flags that must be replayed to preserve the suffix
+/// state.
 static std::string
 formatSourceLineDirectiveGapResume(const SourceLineDirectiveGapResume &resume) {
   if (resume.lineMarkerFlags.empty())
@@ -2516,13 +2523,15 @@ formatSourceLineDirectiveGapResume(const SourceLineDirectiveGapResume &resume) {
 }
 
 /// Prove that a source gap is made only of trivia plus complete source-spelled
-/// `#line` directives, and compute the logical file/line state at `resumeOffset`.
+/// `#line` directives, and compute the logical file/line state at
+/// `resumeOffset`.
 ///
 /// The returned directive state is the state that must be re-established before
-/// the untouched suffix beginning at `resumeOffset` is copied.  Counting continues
-/// from the last accepted `#line` directive through the consumed source interval,
-/// so a directive before a consumed include line is rewritten to the line that the
-/// suffix would have observed after that include line had executed.
+/// the untouched suffix beginning at `resumeOffset` is copied.  Counting
+/// continues from the last accepted `#line` directive through the consumed
+/// source interval, so a directive before a consumed include line is rewritten
+/// to the line that the suffix would have observed after that include line had
+/// executed.
 static std::optional<SourceLineDirectiveGapResume>
 computeSourceLineDirectiveGapResume(
     StringRef fileText, uint64_t gapBegin, uint64_t gapEnd,
@@ -2531,8 +2540,8 @@ computeSourceLineDirectiveGapResume(
     SmallVectorImpl<uint64_t> *acceptedMacroInvocationIds = nullptr,
     StringRef baseFileSpelling = StringRef(),
     bool allowUnknownFilenameOperand = false) {
-  if (gapBegin >= gapEnd || gapEnd > fileText.size() ||
-      resumeOffset < gapEnd || resumeOffset > fileText.size())
+  if (gapBegin >= gapEnd || gapEnd > fileText.size() || resumeOffset < gapEnd ||
+      resumeOffset > fileText.size())
     return std::nullopt;
 
   uint64_t cursor = gapBegin;
@@ -2604,7 +2613,7 @@ computeSourceLineDirectiveGapResume(
     std::string logicalLine;
     SmallVector<uint64_t, 64> logicalLineSourceOffsets;
     uint64_t afterLine = cursor;
-    if (!collectPhase2LogicalLine(fileText, cursor, gapEnd, logicalLine,
+    if (!collectLineSpliceLogicalLine(fileText, cursor, gapEnd, logicalLine,
                                   afterLine, &logicalLineSourceOffsets))
       return std::nullopt;
 
@@ -2719,7 +2728,7 @@ computeSourceLineDirectiveGapResume(
                                     builtinMacroResolver);
       if (rewrite)
         state = parseSourceLineDirectiveLogicalLine(rewrite->line,
-                                                   currentFileSpelling);
+                                                    currentFileSpelling);
     }
     if (!state)
       return std::nullopt;
@@ -2737,7 +2746,7 @@ computeSourceLineDirectiveGapResume(
     // spans multiple physical source lines after the line operand field begins,
     // those physical newlines still advance the presumed line counter before
     // the following source line.  That applies both to newlines inside complete
-    // block comments, which phase 3 replaces with whitespace, and to phase-2
+    // block comments, which comment replacement turns into whitespace, and to
     // backslash-newline splices inside directive operands.
     //
     // Do not simply count every newline from the initial `#`: splices that form
@@ -2752,8 +2761,7 @@ computeSourceLineDirectiveGapResume(
     const size_t directiveBodyNewlines =
         countLineControlDirectiveBodyPhysicalNewlines(
             fileText, *directiveCountBegin, afterLine);
-    lastLineAfterDirective =
-        state->lineAfterDirective + directiveBodyNewlines;
+    lastLineAfterDirective = state->lineAfterDirective + directiveBodyNewlines;
     lastAfterDirectiveOffset = afterLine;
     cursor = afterLine;
     atLineStart = true;
@@ -2770,17 +2778,17 @@ computeSourceLineDirectiveGapResume(
                                       std::move(currentLineMarkerFlags)};
 }
 
-// Phase 8 deletes the post-terminal macro-expansion fallback audit seam.
+// Post-terminal macro expansion is classified through terminal carriers.
 //
-// Earlier migration steps kept a diagnostic-only witness builder here after the
-// synthesis proof-bypass path was hard-disabled.  That witness described
-// exactly the same owner-closed macro whole-cover surface now represented by
-// the ordinary OwnerRealizationProof / MixedOwnerTilingProof lattice before
-// terminal fallback is requested.  Keeping a second post-terminal proof search
-// would therefore be a legacy fallback branch, even if it never materialized
-// bytes.  Terminal fallback now goes directly to the declared
-// TerminalOutOfDomain carrier; any in-domain macro whole-cover case must have
-// been accepted by the normal proof lattice.
+// A diagnostic-only witness builder used to live here after the synthesis
+// proof-bypass path was disabled.  That witness described exactly the same
+// owner-closed macro whole-cover surface now represented by the ordinary
+// OwnerRealizationProof / MixedOwnerTilingProof lattice before terminal
+// fallback is requested.  Keeping a second post-terminal proof search would
+// therefore reintroduce a fallback branch, even if it never materialized bytes.
+// Terminal fallback now goes directly to the declared TerminalOutOfDomain
+// carrier; any in-domain macro whole-cover case must have been accepted by the
+// normal proof lattice.
 
 std::optional<RefoldEngine::TextEdit>
 RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
@@ -2792,13 +2800,13 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   AuditExpansionFallbackBranchClassification(
       fallbackBranch, "BuildTUIncludeClosureEditForUnresolvedHunk");
 
-  // Phase 8c classification: this source-closure path is still uniquely needed,
-  // but it is no longer a legacy unresolved-hunk fallback.  It is the declared
-  // TUIncludeClosureEdit proof class: one closed TU source interval may replace
-  // top-level include directives plus any adjacent TU-owned tokens consumed by
-  // the same hunk, provided all state/layout, B-envelope, and composition
-  // obligations below are discharged.  Stay fail-closed unless the closure is
-  // exact or can be widened without absorbing any independent token diff.
+  // This source-closure path is still uniquely needed, but it is no longer a
+  // legacy unresolved-hunk fallback.  It is the declared TUIncludeClosureEdit
+  // proof class: one closed TU source interval may replace top-level include
+  // directives plus any adjacent TU-owned tokens consumed by the same hunk,
+  // provided all state/layout, B-envelope, and composition obligations below
+  // are discharged.  Stay fail-closed unless the closure is exact or can be
+  // widened without absorbing any independent token diff.
   if (h.isInsertOnly()) {
     trace("fallback",
           "TU include-closure rejected: insert-only hunk A=[{0},{1}) "
@@ -2888,14 +2896,15 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
 
   // `exactCover` means the edit already matches the include closure. The
   // wider `hunkInsideCover` case is a controlled widening: the hunk may be
-  // absorbed only if later checks prove the wider include closure is safe. Split
-  // include runs are always mixed, even when the hunk lies inside the min/max
-  // include cover, because the intervening TU-owned material must be consumed by
-  // the whole-envelope proof rather than by pure include projection.
-  const bool exactCover = includeCoversContiguous && coverBegin == h.aStart &&
-                          coverEnd == h.aEnd;
-  const bool hunkInsideCover = includeCoversContiguous &&
-                               coverBegin <= h.aStart && h.aEnd <= coverEnd;
+  // absorbed only if later checks prove the wider include closure is safe.
+  // Split include runs are always mixed, even when the hunk lies inside the
+  // min/max include cover, because the intervening TU-owned material must be
+  // consumed by the whole-envelope proof rather than by pure include
+  // projection.
+  const bool exactCover =
+      includeCoversContiguous && coverBegin == h.aStart && coverEnd == h.aEnd;
+  const bool hunkInsideCover =
+      includeCoversContiguous && coverBegin <= h.aStart && h.aEnd <= coverEnd;
 
   // Return true when `cand` would be absorbed by the closed A-side range
   // [begin, end]. Token-consuming edits use interval overlap; pure insertions
@@ -2984,10 +2993,10 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   //   #define HDR "two.inc"
   //   #include HDR
   //
-  // are control spelling for the include directive, not independent TU material.
-  // When the closure consumes the touched include site, complete macro calls
-  // wholly inside that site are consumed with it.  Partial overlaps remain
-  // rejected by the ordinary macro-overlap guard below.
+  // are control spelling for the include directive, not independent TU
+  // material. When the closure consumes the touched include site, complete
+  // macro calls wholly inside that site are consumed with it.  Partial overlaps
+  // remain rejected by the ordinary macro-overlap guard below.
   auto macroInvocationIsInsideTouchedIncludeDirective =
       [&](const RefoldModel::MacroInvocation &m) -> bool {
     if (!m.invFile || m.invFile->empty() || !PathsEqual(*m.invFile, tuPath))
@@ -3086,9 +3095,9 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   //
   // The predicate is intentionally transitive: a top-level zero-token include
   // may contain nested zero-token includes, and the outer directive is still
-  // safe to consume when every descendant is itself source-neutral.  Returning a
-  // concrete reason keeps the later terminal-fallback trace actionable instead
-  // of merely saying that an unrelated include was absorbed.
+  // safe to consume when every descendant is itself source-neutral.  Returning
+  // a concrete reason keeps the later terminal-fallback trace actionable
+  // instead of merely saying that an unrelated include was absorbed.
   std::function<std::optional<std::string>(const RefoldModel::IncludeItem &,
                                            DenseSet<uint64_t> &)>
       includeRecordedSideEffectReasonImpl;
@@ -3367,8 +3376,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     return includeIsPreservableConditionalStateIncludeImpl(inc, visiting);
   };
 
-  using MacroDefinitionReplacementList =
-      MacroDefinitionReplacementListInterval;
+  using MacroDefinitionReplacementList = MacroDefinitionReplacementListInterval;
 
   auto macroDefinitionReplacementList =
       [&](const RefoldModel::MacroInvocation &m) {
@@ -3479,11 +3487,12 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
         return false;
 
       // The definition replacement list and the invocation argument can be
-      // spelled in the same physical TU file.  Keep the source surface explicit:
-      // replacement-list tiling slices the producer-recorded directive text,
-      // while invocation-argument tiling slices the materialized TU source.
-      auto sliceTrivia = [&](uint64_t sliceBegin, uint64_t sliceEnd)
-          -> std::optional<StringRef> {
+      // spelled in the same physical TU file.  Keep the source surface
+      // explicit: replacement-list tiling slices the producer-recorded
+      // directive text, while invocation-argument tiling slices the
+      // materialized TU source.
+      auto sliceTrivia = [&](uint64_t sliceBegin,
+                             uint64_t sliceEnd) -> std::optional<StringRef> {
         if (sliceEnd < sliceBegin)
           return std::nullopt;
 
@@ -3543,7 +3552,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
         if (!gap || !isWsOrCompleteCommentTrivia(*gap))
           return false;
 
-        if (!macroInvocationIsSourceNeutralZeroTokenImpl(*piece.child, visiting))
+        if (!macroInvocationIsSourceNeutralZeroTokenImpl(*piece.child,
+                                                         visiting))
           return false;
 
         cursor = piece.end;
@@ -3595,7 +3605,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       auto proveVariadicTailNeutral = [&]() -> bool {
         if (variadicTailIsNeutral)
           return *variadicTailIsNeutral;
-        if (!variadicParamIndex || *variadicParamIndex >= m.invArgRanges.size()) {
+        if (!variadicParamIndex ||
+            *variadicParamIndex >= m.invArgRanges.size()) {
           variadicTailIsNeutral = false;
           return false;
         }
@@ -3603,7 +3614,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
         return *variadicTailIsNeutral;
       };
 
-      auto parseVaOptPayloadEnd = [&](size_t openParen) -> std::optional<size_t> {
+      auto parseVaOptPayloadEnd =
+          [&](size_t openParen) -> std::optional<size_t> {
         StringRef text = replacement->directive->text;
         if (openParen >= text.size() || text[openParen] != '(')
           return std::nullopt;
@@ -3689,8 +3701,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
             ZeroTokenRangeSurface::DefinitionReplacementList);
       };
 
-      auto skipReplacementTriviaUntil = [&](size_t &pos,
-                                            size_t limit) -> bool {
+      auto skipReplacementTriviaUntil = [&](size_t &pos, size_t limit) -> bool {
         if (limit > text.size())
           return false;
         while (pos < limit) {
@@ -3961,8 +3972,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   // exact-byte validation against the TU source bytes.
   auto macroDirectiveFullSourceInterval =
       [&](const RefoldModel::MacroDirective &directive) {
-        return RecoverMacroStateDirectiveLineInterval(
-            directive, tuPath, tuBytes, std::nullopt);
+        return RecoverMacroStateDirectiveLineInterval(directive, tuPath,
+                                                      tuBytes, std::nullopt);
       };
 
   auto macroDirectiveIsConsumableStateGap =
@@ -3984,11 +3995,12 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   // source-neutral artifacts here.  A pragma may mutate compiler state without
   // producing PP tokens, and the refold map currently records only its spelling
   // and source anchors, not the state region needed to prove deletion safe.
-  // This helper is therefore diagnostic-only: it lets the rejection log name the
-  // exact pragma that blocked the closure instead of reporting an opaque
+  // This helper is therefore diagnostic-only: it lets the rejection log name
+  // the exact pragma that blocked the closure instead of reporting an opaque
   // non-trivia gap.
-  auto findTUPragmaOnSourceLine = [&](uint64_t lineBegin, uint64_t lineEnd)
-      -> const RefoldModel::PragmaDirective * {
+  auto findTUPragmaOnSourceLine =
+      [&](uint64_t lineBegin,
+          uint64_t lineEnd) -> const RefoldModel::PragmaDirective * {
     for (const auto &pragma : model_.GetPragmas()) {
       if (!PathsEqual(pragma.sitePath, tuPath))
         continue;
@@ -4004,9 +4016,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   // the line scanner, because a pragma-only gap has no consumable recorded
   // pieces; without this fast path the scanner is never entered and the user
   // only sees a generic "non-trivia gap" rejection.
-  auto nonConsumableTUPragmaGapReason = [&](uint64_t gapBegin,
-                                            uint64_t gapEnd)
-      -> std::optional<std::string> {
+  auto nonConsumableTUPragmaGapReason =
+      [&](uint64_t gapBegin, uint64_t gapEnd) -> std::optional<std::string> {
     for (const auto &pragma : model_.GetPragmas()) {
       if (!PathsEqual(pragma.sitePath, tuPath))
         continue;
@@ -4037,9 +4048,10 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   // include material into B and carries source-neutral inter-include control
   // structure forward verbatim.  Therefore a recorded conditional group is
   // preservable when it is complete, TU-spelled, wholly inside the gap, and no
-  // arm materialized PP tokens in A.  Active source-bearing artifacts inside the
-  // group remain outside this proof; they require their own preservation/repair
-  // model rather than being hidden inside an opaque conditional gap.
+  // arm materialized PP tokens in A.  Active source-bearing artifacts inside
+  // the group remain outside this proof; they require their own
+  // preservation/repair model rather than being hidden inside an opaque
+  // conditional gap.
   auto conditionalGroupIsPreservableIncludeClosureGap =
       [&](const RefoldModel::CondGroup &group, uint64_t gapBegin,
           uint64_t gapEnd) -> bool {
@@ -4106,7 +4118,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     SmallVector<ConditionalPiece, 8> pieces;
     for (const auto &group : model_.GetConds())
       if (conditionalGroupIsPreservableIncludeClosureGap(group, gapBegin,
-                                                        gapEnd))
+                                                         gapEnd))
         pieces.push_back({group.groupB, group.groupE, group.id});
 
     if (pieces.empty())
@@ -4150,8 +4162,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   // the complete group verbatim is a neutral source gap.  Macro invocations in
   // conditional-control lines are therefore allowed because they remain inside
   // the preserved group.  Recorded artifacts in arm bodies still fail closed:
-  // those may carry source tokens, macro state, include effects, or pragmas that
-  // require their own proof.
+  // those may carry source tokens, macro state, include effects, or pragmas
+  // that require their own proof.
   auto conditionalGroupIsConsumableZeroTokenGap =
       [&](const RefoldModel::CondGroup &group, uint64_t begin,
           uint64_t end) -> bool {
@@ -4228,8 +4240,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
         continue;
       if (inc.cover.IsValid() || includeHasRecordedSideEffects(inc))
         continue;
-      if (gapBegin <= inc.siteB && inc.siteE <= gapEnd &&
-          inc.siteB < inc.siteE)
+      if (gapBegin <= inc.siteB && inc.siteE <= gapEnd && inc.siteB < inc.siteE)
         pieces.push_back({inc.siteB, inc.siteE, inc.id, "include"});
     }
 
@@ -4240,14 +4251,14 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     for (const auto &directive : model_.GetMacroDirectives())
       if (std::optional<MacroDirectiveSourceInterval> interval =
               macroDirectiveIsConsumableStateGap(directive, gapBegin, gapEnd))
-        pieces.push_back({interval->begin, interval->end, directive.id,
-                          "macro-directive"});
+        pieces.push_back(
+            {interval->begin, interval->end, directive.id, "macro-directive"});
 
     if (allowTUConditionalControl)
       for (const auto &group : model_.GetConds())
         if (conditionalGroupIsConsumableZeroTokenGap(group, gapBegin, gapEnd))
-          pieces.push_back({group.groupB, group.groupE, group.id,
-                            "conditional"});
+          pieces.push_back(
+              {group.groupB, group.groupE, group.id, "conditional"});
 
     uint64_t scanCursor = gapBegin;
     uint64_t includeCount = 0;
@@ -4268,7 +4279,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     //
     // when the #define line is itself a proved consumable macro-state artifact.
     bool atLineStart = stringutils::beginsLineAfterWs(tuBytes, gapBegin);
-    auto scanNeutralControlTrivia = [&](uint64_t begin, uint64_t limit) -> bool {
+    auto scanNeutralControlTrivia = [&](uint64_t begin,
+                                        uint64_t limit) -> bool {
       scanCursor = begin;
       while (scanCursor < limit) {
         char ch = tuBytes[scanCursor];
@@ -4285,7 +4297,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
             scanCursor += 2;
             bool closed = false;
             while (scanCursor + 1 < limit) {
-              if (tuBytes[scanCursor] == '*' && tuBytes[scanCursor + 1] == '/') {
+              if (tuBytes[scanCursor] == '*' &&
+                  tuBytes[scanCursor + 1] == '/') {
                 scanCursor += 2;
                 closed = true;
                 break;
@@ -4307,8 +4320,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
 
             // A line comment may end at the end of the whole gap, but it may
             // not run into a following recorded artifact.  In that case the
-            // artifact's spelling would be inside the comment, contradicting the
-            // proof that it is an independently recorded source artifact.
+            // artifact's spelling would be inside the comment, contradicting
+            // the proof that it is an independently recorded source artifact.
             if (scanCursor >= limit)
               return limit == gapEnd;
 
@@ -4319,8 +4332,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
         }
 
         // Literal conditional-control directives are source-neutral only at a
-        // physical directive boundary.  Any other directive or token spelling is
-        // real source that this closure has not proved safe to erase.
+        // physical directive boundary.  Any other directive or token spelling
+        // is real source that this closure has not proved safe to erase.
         if (ch != '#' || !atLineStart)
           return false;
 
@@ -4465,12 +4478,12 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       }
     }
 
-    // Step 3 pragma/state proof: a complete diagnostic push/settings/pop
-    // sequence that is wholly inside this owner gap and crosses only trivia has
-    // identity net state at both boundaries.  Preserve the original pragma
-    // bytes as an explicit gap piece instead of treating the gap as opaque
-    // trivia; unknown or unbalanced pragmas remain non-consumable and will still
-    // force the ordinary fail-closed path below.
+    // Pragma/state proof: a complete diagnostic push/settings/pop sequence that
+    // is wholly inside this owner gap and crosses only trivia has identity net
+    // state at both boundaries.  Preserve the original pragma bytes as an
+    // explicit gap piece instead of treating the gap as opaque trivia; unknown
+    // or unbalanced pragmas remain non-consumable and will still force the
+    // ordinary fail-closed path below.
     SmallVector<BalancedDiagnosticPragmaStateIsland, 4> pragmaIslands;
     collectBalancedDiagnosticPragmaStateIslands(
         model_, tuBytes, gapBegin, gapEnd,
@@ -4705,9 +4718,10 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       // A source-bearing macro call may be consumed by this replacement only
       // when every PP span the producer attributes to that invocation is wholly
       // inside the A-side material being replaced. Then the callsite is not an
-      // unrelated artifact: it is one of the source pieces whose produced tokens
-      // are removed by the hunk. Any span escaping the material range means
-      // deleting the call would also delete surviving PP tokens, so reject.
+      // unrelated artifact: it is one of the source pieces whose produced
+      // tokens are removed by the hunk. Any span escaping the material range
+      // means deleting the call would also delete surviving PP tokens, so
+      // reject.
       for (const auto &span : m.spans)
         if (!checkSpan(span))
           return false;
@@ -4734,9 +4748,9 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     // #if in one inter-piece gap against a closing #endif after a real source
     // piece.  A selected arm whose complete PP span is inside the replacement
     // material is different: its directive wrapper is part of the same source
-    // interval whose produced tokens are being replaced, so the whole group must
-    // be considered a required piece of the closure rather than trivia around
-    // neighboring token pieces.
+    // interval whose produced tokens are being replaced, so the whole group
+    // must be considered a required piece of the closure rather than trivia
+    // around neighboring token pieces.
     for (const auto &group : model_.GetConds()) {
       if (!PathsEqual(group.file, tuPath) || group.parentIncludeId)
         continue;
@@ -4844,8 +4858,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     sourceBegin = mergedPieces.front().first;
     sourceEnd = mergedPieces.back().second;
 
-    auto gapHasMappedTUToken = [&](uint64_t gapBegin,
-                                   uint64_t gapEnd) -> bool {
+    auto gapHasMappedTUToken = [&](uint64_t gapBegin, uint64_t gapEnd) -> bool {
       for (const auto &entry : model_.GetTokmap()) {
         if (!PathsEqual(entry.file, tuPath))
           continue;
@@ -4862,7 +4875,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       };
 
       for (const auto &inc : model_.GetIncludes())
-        if (PathsEqual(inc.sitePath, tuPath) && overlapsGap(inc.siteB, inc.siteE))
+        if (PathsEqual(inc.sitePath, tuPath) &&
+            overlapsGap(inc.siteB, inc.siteE))
           return true;
       for (const auto &m : model_.GetMacroInvocations())
         if (m.invFile && PathsEqual(*m.invFile, tuPath) && m.invB && m.invE &&
@@ -5087,8 +5101,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     //     already inside this hunk's A-side replacement range.
     //
     // The last case is the source-bearing analogue of the zero-token gap: the
-    // macro invocation is not being preserved or moved, it is part of the source
-    // interval whose materialized tokens the user replaced.
+    // macro invocation is not being preserved or moved, it is part of the
+    // source interval whose materialized tokens the user replaced.
     for (const auto &m : model_.GetMacroInvocations()) {
       if (m.invFile && !m.invFile->empty() && !PathsEqual(*m.invFile, tuPath))
         continue;
@@ -5097,7 +5111,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       if (*m.invB < sourceEnd && sourceBegin < *m.invE) {
         if (macroInvocationIsInsideTouchedIncludeDirective(m) ||
             macroInvocationIsConsumableZeroTokenGap(m, sourceBegin,
-                                                   sourceEnd) ||
+                                                    sourceEnd) ||
             macroInvocationMaterialIsConsumed(m, sourceBegin, sourceEnd) ||
             mixedSourceLineDirectiveMacroIds.contains(m.id) ||
             macroInvocationIsInsideConsumableSourceLineDirectiveGap(m) ||
@@ -5122,86 +5136,85 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     // The source envelope was already computed from the normalized piece list
     // above.  At this point the only remaining common owner-proof step is the
     // inter-piece gap proof; avoid recomputing the same envelope here.
-    if (!proveOwnerSourceEnvelopeGaps(
-            mergedPieces, [&](uint64_t gapBegin, uint64_t gapEnd) {
-              StringRef gap = tuBytes.slice(gapBegin, gapEnd);
-              const bool preserveConditionalControlTail =
-                  gapIsRecordedConditionalControlTail(gapBegin, gapEnd);
-              if (preserveConditionalControlTail) {
-                mixedPreservedConditionalControlTrivia.append(gap.begin(),
-                                                             gap.end());
-                return true;
-              }
-              if (isPreservableIncludeClosureGapTrivia(gap))
-                return true;
+    if (!proveOwnerSourceEnvelopeGaps(mergedPieces, [&](uint64_t gapBegin,
+                                                        uint64_t gapEnd) {
+          StringRef gap = tuBytes.slice(gapBegin, gapEnd);
+          const bool preserveConditionalControlTail =
+              gapIsRecordedConditionalControlTail(gapBegin, gapEnd);
+          if (preserveConditionalControlTail) {
+            mixedPreservedConditionalControlTrivia.append(gap.begin(),
+                                                          gap.end());
+            return true;
+          }
+          if (isPreservableIncludeClosureGapTrivia(gap))
+            return true;
 
-              SmallVector<TUPreservedGapPiece, 4> preservedZeroTokenPieces;
-              if (collectPreservableZeroTokenGapPieces(
-                      gapBegin, gapEnd, preservedZeroTokenPieces)) {
-                mixedPreservedZeroTokenGapPieces.append(
-                    preservedZeroTokenPieces.begin(),
-                    preservedZeroTokenPieces.end());
-                return true;
-              }
+          SmallVector<TUPreservedGapPiece, 4> preservedZeroTokenPieces;
+          if (collectPreservableZeroTokenGapPieces(gapBegin, gapEnd,
+                                                   preservedZeroTokenPieces)) {
+            mixedPreservedZeroTokenGapPieces.append(
+                preservedZeroTokenPieces.begin(),
+                preservedZeroTokenPieces.end());
+            return true;
+          }
 
-              if (gapIsConsumableZeroTokenSourceClosure(
-                      gapBegin, gapEnd,
-                      /*allowTUConditionalControl=*/true))
-                return true;
+          if (gapIsConsumableZeroTokenSourceClosure(
+                  gapBegin, gapEnd,
+                  /*allowTUConditionalControl=*/true))
+            return true;
 
-              SmallVector<uint64_t, 4> acceptedMacroIds;
-              if (std::optional<SourceLineDirectiveGapResume> lineResume =
-                      computeSourceLineDirectiveGapResume(
-                          tuBytes, gapBegin, gapEnd, sourceEnd, tuPath,
-                          sourceLineDirectiveLineRewriter, &acceptedMacroIds,
-                          StringRef(),
-                          !sourceSuffixMayObservePresumedFileSpelling(
-                              model_, tuPath, sourceEnd,
-                              [&](StringRef lhs, StringRef rhs) {
-                                return PathsEqual(lhs, rhs);
-                              },
-                              tuBytes))) {
-                // A source-spelled line-control directive contributes no PP
-                // tokens, but it is not disposable trivia.  If the copied
-                // suffix has no live line-state observer, preserve the original
-                // source directive spelling as source material.  If the suffix
-                // does observe line state, emit a local resume that restores the
-                // net state at the suffix after the consumed envelope.
-                recordSourceLineDirectiveMacroIds(acceptedMacroIds);
-                if (!OwnerSuffixLineStateObserverDemand(std::nullopt, tuPath,
-                                                        sourceEnd)
-                         .Any()) {
-                  mixedPreservedSourceLineDirectiveGapPieces.push_back(
-                      {gapBegin, gapEnd});
-                  trace("fallback",
-                        "TU/include closure preserving source #line spelling "
-                        "from gap=[{0},{1})",
-                        gapBegin, gapEnd);
-                } else {
-                  mixedSourceLineDirectiveResume = std::move(lineResume);
-                  trace("fallback",
-                        "TU/include closure preserving source #line state from "
-                        "gap=[{0},{1}) resumeLine={2} file={3}",
-                        gapBegin, gapEnd,
-                        mixedSourceLineDirectiveResume->lineAtResume,
-                        mixedSourceLineDirectiveResume->fileSpelling);
-                }
-                return true;
-              }
+          SmallVector<uint64_t, 4> acceptedMacroIds;
+          if (std::optional<SourceLineDirectiveGapResume> lineResume =
+                  computeSourceLineDirectiveGapResume(
+                      tuBytes, gapBegin, gapEnd, sourceEnd, tuPath,
+                      sourceLineDirectiveLineRewriter, &acceptedMacroIds,
+                      StringRef(),
+                      !sourceSuffixMayObservePresumedFileSpelling(
+                          model_, tuPath, sourceEnd,
+                          [&](StringRef lhs, StringRef rhs) {
+                            return PathsEqual(lhs, rhs);
+                          },
+                          tuBytes))) {
+            // A source-spelled line-control directive contributes no PP
+            // tokens, but it is not disposable trivia.  If the copied
+            // suffix has no live line-state observer, preserve the original
+            // source directive spelling as source material.  If the suffix
+            // does observe line state, emit a local resume that restores the
+            // net state at the suffix after the consumed envelope.
+            recordSourceLineDirectiveMacroIds(acceptedMacroIds);
+            if (!OwnerSuffixLineStateObserverDemand(std::nullopt, tuPath,
+                                                    sourceEnd)
+                     .Any()) {
+              mixedPreservedSourceLineDirectiveGapPieces.push_back(
+                  {gapBegin, gapEnd});
+              trace("fallback",
+                    "TU/include closure preserving source #line spelling "
+                    "from gap=[{0},{1})",
+                    gapBegin, gapEnd);
+            } else {
+              mixedSourceLineDirectiveResume = std::move(lineResume);
+              trace("fallback",
+                    "TU/include closure preserving source #line state from "
+                    "gap=[{0},{1}) resumeLine={2} file={3}",
+                    gapBegin, gapEnd,
+                    mixedSourceLineDirectiveResume->lineAtResume,
+                    mixedSourceLineDirectiveResume->fileSpelling);
+            }
+            return true;
+          }
 
-              if (std::optional<std::string> pragmaReason =
-                      nonConsumableTUPragmaGapReason(gapBegin, gapEnd)) {
-                trace("fallback", "TU/include closure rejected: {0}",
-                      *pragmaReason);
-              } else {
-                trace("fallback",
-                      "TU/include closure rejected: non-trivia TU gap inside "
-                      "mixed source interval [{0},{1}) gap='{2}'",
-                      gapBegin, gapEnd,
-                      stringutils::showWsWithClip(gap, 120));
-              }
-              return false;
-            }))
+          if (std::optional<std::string> pragmaReason =
+                  nonConsumableTUPragmaGapReason(gapBegin, gapEnd)) {
+            trace("fallback", "TU/include closure rejected: {0}",
+                  *pragmaReason);
+          } else {
+            trace("fallback",
+                  "TU/include closure rejected: non-trivia TU gap inside "
+                  "mixed source interval [{0},{1}) gap='{2}'",
+                  gapBegin, gapEnd, stringutils::showWsWithClip(gap, 120));
+          }
+          return false;
+        }))
       return std::nullopt;
 
     if (mixedSourceLineDirectiveResume && !lineDirs_.Enabled() &&
@@ -5301,13 +5314,13 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
 
     // Inter-include source bytes are handled differently for pure and mixed
     // closures.  In a pure include closure, the source edit starts at the first
-    // include directive and projects include material only, so inert comments or
-    // directive-control trivia between adjacent include directives may need to
-    // be preserved verbatim.  In a mixed TU/include closure, the earlier
+    // include directive and projects include material only, so inert comments
+    // or directive-control trivia between adjacent include directives may need
+    // to be preserved verbatim.  In a mixed TU/include closure, the earlier
     // whole-envelope verifier has already proved every gap between required
-    // source pieces, including bytes between split include runs, and those bytes
-    // are consumed by the B-side replacement.  Revalidating or preserving them
-    // here would reintroduce the old contiguous-include assumption.
+    // source pieces, including bytes between split include runs, and those
+    // bytes are consumed by the B-side replacement.  Revalidating or preserving
+    // them here would reintroduce the old contiguous-include assumption.
     if (!mixedTUIncludeClosure && inc->siteB > sourceCursor) {
       StringRef gap = tuBytes.slice(sourceCursor, inc->siteB);
       if (!gap.empty() && !stringutils::isWs(gap)) {
@@ -5341,9 +5354,8 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
 
   IncludeRealizationEvidenceKind evidenceKind =
       IncludeRealizationEvidenceKind::Unknown;
-  auto bEnvelope = ResolveIncludeRealizationBTokenEnvelope(materialBeginA,
-                                                           materialEndA,
-                                                           &evidenceKind);
+  auto bEnvelope = ResolveIncludeRealizationBTokenEnvelope(
+      materialBeginA, materialEndA, &evidenceKind);
   if (h.isDeleteOnly() && materialBeginA == h.aStart &&
       materialEndA == h.aEnd) {
     // A delete-only exact closure has no edited B material by definition.  Do
@@ -5429,9 +5441,9 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   }
 
   // Preserve legacy inert trivia between touched include directives.  Empty
-  // includes admitted by the gap proof above are deliberately not appended here:
-  // they lie inside the source envelope replaced by this closure, so the B-side
-  // material consumes them along with the adjacent TU/include tokens.
+  // includes admitted by the gap proof above are deliberately not appended
+  // here: they lie inside the source envelope replaced by this closure, so the
+  // B-side material consumes them along with the adjacent TU/include tokens.
   if (!preservedGapTrivia.empty()) {
     if (startsWithPreprocessorDirectiveTrivia(preservedGapTrivia) &&
         !replacement.empty() && replacement.back() != '\n')
@@ -5445,22 +5457,20 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   // the refolded source closer to the original while the owner-gap proof above
   // guarantees that replaying them cannot change the B token stream.
   //
-  // Step 3 has one extra ownership choice.  Preserved pragma directives are
-  // sideband replay bytes: after frontend normalization, the ordinary B hunk may
-  // already contain the exact balanced diagnostic island even though the island
-  // is absent from the structural token diff.  In that case the B surface, not
-  // the source-gap copier, owns the pragma replay.  Appending the source island
-  // here would duplicate the directives and change validation.
+  // Preserved pragma directives add one extra ownership choice: they are
+  // sideband replay bytes: after frontend normalization, the ordinary B hunk
+  // may already contain the exact balanced diagnostic island even though the
+  // island is absent from the structural token diff.  In that case the B
+  // surface, not the source-gap copier, owns the pragma replay.  Appending the
+  // source island here would duplicate the directives and change validation.
   if (!mixedPreservedZeroTokenGapPieces.empty()) {
     bool insertedSeparator = false;
-    for (const TUPreservedGapPiece &piece :
-         mixedPreservedZeroTokenGapPieces) {
+    for (const TUPreservedGapPiece &piece : mixedPreservedZeroTokenGapPieces) {
       std::string pieceText = preservedTUGapPieceText(piece);
       if (pieceText.empty())
         continue;
 
-      if (piece.kind ==
-              TUPreservedGapPiece::Kind::BalancedPragmaStateIsland &&
+      if (piece.kind == TUPreservedGapPiece::Kind::BalancedPragmaStateIsland &&
           balancedDiagnosticPragmaStateIslandIsCarriedByReplacement(
               StringRef(pieceText), StringRef(replacement), lexLang_)) {
         trace("fallback",
@@ -5511,20 +5521,21 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   }
 
   // The closure begins at the proved source interval.  For a pure include
-  // closure that is the include-directive run; for a mixed TU/include closure it
-  // also includes the directly consumed TU tokens adjacent to that run.  We may
-  // later extend the right edge over immediately following untouched TU line(s)
-  // so any required physical-line compensation lands after copied suffix lines
-  // such as `};` instead of inside the realized replacement itself.
+  // closure that is the include-directive run; for a mixed TU/include closure
+  // it also includes the directly consumed TU tokens adjacent to that run.  We
+  // may later extend the right edge over immediately following untouched TU
+  // line(s) so any required physical-line compensation lands after copied
+  // suffix lines such as `};` instead of inside the realized replacement
+  // itself.
   uint64_t closureSourceEnd = sourceEnd;
   std::string padded = PadAtBoundaries(
       tuBytes, static_cast<size_t>(sourceBegin),
       static_cast<size_t>(closureSourceEnd), std::move(replacement),
       /*allowLeft=*/true, /*allowRight=*/true);
 
-  const bool emitsSourceLineDirectiveResume =
-      lineDirs_.Enabled() && mixedSourceLineDirectiveResume &&
-      sourceEnd < tuBytes.size();
+  const bool emitsSourceLineDirectiveResume = lineDirs_.Enabled() &&
+                                              mixedSourceLineDirectiveResume &&
+                                              sourceEnd < tuBytes.size();
   std::vector<FinalLineControlPruneCandidate> sourceLineResumeCandidates;
   if (emitsSourceLineDirectiveResume) {
     // The consumed source envelope contained a source-spelled line-control
@@ -5863,17 +5874,23 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
                          ? ResyncOutcome(padded, std::nullopt)
                          : ApplyResyncOrPend(tuBytes, sourceBegin,
                                              closureSourceEnd, padded, tuPath);
-  TextEdit edit{sourceBegin,           closureSourceEnd, std::move(ro.text),
-                std::move(ro.pending), std::nullopt,     {}, {}, {}};
-  edit.lineControlPruneCandidates = emitsSourceLineDirectiveResume
-                                        ? std::move(sourceLineResumeCandidates)
-                                        : std::move(ro.lineControlPruneCandidates);
+  TextEdit edit{sourceBegin,
+                closureSourceEnd,
+                std::move(ro.text),
+                std::move(ro.pending),
+                std::nullopt,
+                {},
+                {},
+                {}};
+  edit.lineControlPruneCandidates =
+      emitsSourceLineDirectiveResume ? std::move(sourceLineResumeCandidates)
+                                     : std::move(ro.lineControlPruneCandidates);
   StampTextEditMaterializedBTokenRange(edit, bEnvelope->first,
                                        bEnvelope->second);
 
-  // Phase 8c: emit a first-class TU include-closure carrier instead of hiding
-  // this hybrid proof behind the ordinary conservative TU byte-span class.  The
-  // local checks above are the closure witness: exact/widened include cover,
+  // Emit a first-class TU include-closure carrier instead of hiding this hybrid
+  // proof behind the ordinary conservative TU byte-span class.  The local
+  // checks above are the closure witness: exact/widened include cover,
   // preservable source gaps, canonical-or-consensus B envelope, line-control
   // repair, and pragma-once/include-guard reactivation safety all had to be
   // discharged before this edit was created.
@@ -5898,20 +5915,19 @@ std::string RefoldEngine::ResolvePostStructuralFallback() {
                                              "ResolvePostStructuralFallback");
 
   // Reaching this point means every structural proof lattice candidate has
-  // failed closed or has been classified out-of-domain.  Phase 8 removes the
-  // old post-terminal macro-expansion proof-bypass audit seam entirely: a macro
-  // whole-cover case is in-domain only if OwnerRealizationProof or
-  // MixedOwnerTilingProof accepted it before fallback was requested.  Do not run
-  // a second post-terminal owner search here; normalize directly onto the
-  // declared TerminalOutOfDomain carrier.
+  // failed closed or has been classified out-of-domain.  The old post-terminal
+  // macro-expansion proof-bypass audit seam is gone: a macro whole-cover case
+  // is in-domain only if OwnerRealizationProof or MixedOwnerTilingProof
+  // accepted it before fallback was requested.  Do not run a second
+  // post-terminal owner search here; normalize directly onto the declared
+  // TerminalOutOfDomain carrier.
   TerminalFallbackWitness terminalWitness = BuildTerminalFallbackWitness();
   bool terminalAuditOk = true;
   for (size_t i = 0; i < terminalWitness.proofFailures.size(); ++i) {
-    const llvm::StringRef role = i == 0 ? llvm::StringRef("primary")
-                                        : llvm::StringRef("secondary");
-    terminalAuditOk &=
-        AuditTerminalFallbackProofFailure(terminalWitness.proofFailures[i],
-                                          role);
+    const llvm::StringRef role =
+        i == 0 ? llvm::StringRef("primary") : llvm::StringRef("secondary");
+    terminalAuditOk &= AuditTerminalFallbackProofFailure(
+        terminalWitness.proofFailures[i], role);
   }
   if (terminalWitness.proofFailures.empty()) {
     terminalAuditOk = false;
@@ -5950,11 +5966,11 @@ std::string RefoldEngine::ResolvePostStructuralFallback() {
   ResetAttemptStats();
   lastStats_.expandedIncludes = lastStats_.totalIncludes;
   lastStats_.expandedMacros = lastStats_.totalMacros;
-    if (materializedEditMappings_) {
+  if (materializedEditMappings_) {
     materializedEditMappings_->clear();
-    materializedEditMappings_->push_back(MaterializedEditMapping{
-        0, static_cast<uint64_t>(bSource_.size()), 0,
-        static_cast<uint64_t>(bSource_.size())});
+    materializedEditMappings_->push_back(
+        MaterializedEditMapping{0, static_cast<uint64_t>(bSource_.size()), 0,
+                                static_cast<uint64_t>(bSource_.size())});
   }
   return bSource_.str();
 }

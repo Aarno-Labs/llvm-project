@@ -125,13 +125,14 @@ static std::string keyForLoc(const SourceManager &SM, SourceLocation Loc) {
 
 // Macro keys must NOT normalize through getFileLoc() or getSpellingLoc(): in
 // nested expansions those can collapse distinct invocation sites onto the same
-// key, causing MacroKey2Item collisions (e.g., __FILE__ overwriting PRINT_FILE).
-// As in the example:
+// key, causing MacroKey2Item collisions (e.g., __FILE__ overwriting
+// PRINT_FILE). As in the example:
 //
 //   #define PRINT_FILE(FMT) printf(FMT, __FILE__, __LINE__)
 //   PRINT_FILE("Error on file (%s) and line (%d)\n");
 //
-// Use the SourceLocation raw encoding directly (keeps MacroID locations distinct).
+// Use the SourceLocation raw encoding directly (keeps MacroID locations
+// distinct).
 static std::string keyForMacroLoc(SourceLocation Loc) {
   if (Loc.isInvalid())
     return "0";
@@ -202,10 +203,12 @@ findLineControlDirectiveLineNearLoc(const SourceManager &SM,
   if (Invalid || Buf.empty())
     return std::nullopt;
 
-  const size_t Off = std::min<size_t>(SM.getFileOffset(FileLoc), Buf.size() - 1);
+  const size_t Off =
+      std::min<size_t>(SM.getFileOffset(FileLoc), Buf.size() - 1);
 
   auto lineLooks = [&](std::pair<size_t, size_t> Span) -> bool {
-    return looksLikeLineControlDirectiveLine(Buf.slice(Span.first, Span.second));
+    return looksLikeLineControlDirectiveLine(
+        Buf.slice(Span.first, Span.second));
   };
 
   const std::pair<size_t, size_t> Current = lineSpanOf(Buf, Off);
@@ -213,7 +216,8 @@ findLineControlDirectiveLineNearLoc(const SourceManager &SM,
     return {{Current.first, Current.second}};
 
   if (Current.first > 0) {
-    const std::pair<size_t, size_t> Previous = lineSpanOf(Buf, Current.first - 1);
+    const std::pair<size_t, size_t> Previous =
+        lineSpanOf(Buf, Current.first - 1);
     if (lineLooks(Previous))
       return {{Previous.first, Previous.second}};
   }
@@ -1449,8 +1453,9 @@ static const Item *findUniqueWholeArgNestedChild(const Item &Parent,
 }
 
 static bool isWholeArgNestedChild(const Item &Parent, const Item &Child,
-                                 llvm::ArrayRef<Item> Items) {
-  for (uint32_t ArgIdx = 0, E = static_cast<uint32_t>(Parent.InvArgRanges.size());
+                                  llvm::ArrayRef<Item> Items) {
+  for (uint32_t ArgIdx = 0,
+                E = static_cast<uint32_t>(Parent.InvArgRanges.size());
        ArgIdx < E; ++ArgIdx) {
     if (findUniqueWholeArgNestedChild(Parent, ArgIdx, Items) == &Child)
       return true;
@@ -2363,7 +2368,8 @@ void RefoldMapBuilder::onMacroDefined(const Token &MacroNameTok,
   }
 
   // Site info: capture the byte span of the whole directive line in its file,
-  // so the consumer can do precise byte-based edits against the original source.
+  // so the consumer can do precise byte-based edits against the original
+  // source.
   auto Line = computeDirectiveLine(MI->getDefinitionLoc());
   if (Line) {
     It.SiteBegin = Line->first;
@@ -4448,10 +4454,10 @@ void RefoldMapBuilder::writeJSON() {
     // Materialize producer-owned paste callee-origin records now that the
     // sanitized caller graph and arg_refs have been written back to Items.
     // Earlier callbacks can detect that a callee is nested, but only this late
-    // pass has enough stable provenance to say that a pasted callee substring is
-    // a concrete slice of one root invocation argument.  If that provenance is
-    // absent, multi-source, or ambiguous, we leave the older conservative origin
-    // classification in place rather than guessing.
+    // pass has enough stable provenance to say that a pasted callee substring
+    // is a concrete slice of one root invocation argument.  If that provenance
+    // is absent, multi-source, or ambiguous, we leave the older conservative
+    // origin classification in place rather than guessing.
     struct RootArgSliceProof {
       uint64_t RootMacroId = 0;
       uint32_t RootParamIndex = 0;
@@ -4553,11 +4559,11 @@ void RefoldMapBuilder::writeJSON() {
           continue;
         }
 
-        // If the immediate paste argument has no caller-formal provenance, it is
-        // fixed replacement-list text from the paste helper's caller context
+        // If the immediate paste argument has no caller-formal provenance, it
+        // is fixed replacement-list text from the paste helper's caller context
         // rather than a selector the consumer can rewrite.  Serialize it as a
-        // literal anchor.  Any non-empty or ambiguous provenance remains outside
-        // this proof so selector substitution stays fail-closed.
+        // literal anchor.  Any non-empty or ambiguous provenance remains
+        // outside this proof so selector substitution stays fail-closed.
         if (PasteInvocation.CallerMacroId &&
             *Part.ArgIndex < PasteInvocation.InvArgRefs.size() &&
             PasteInvocation.InvArgRefs[*Part.ArgIndex].empty()) {
@@ -5115,11 +5121,12 @@ void RefoldMapBuilder::writeJSON() {
           // Emit owner_include_id for source items whose semantics are tied
           // to the include occurrence that was active when the item was seen.
           //
-          // Pragmas are included here even though they have no ordinary PP-token
-          // spans: Phase-7 zero-token state-gap proofs need the concrete include
-          // instance to distinguish repeated inclusions of the same physical
-          // header.  Without this id, the consumer would have to fall back to
-          // path+byte matching and conservatively reject repeated-header gaps.
+          // Pragmas are included here even though they have no ordinary
+          // PP-token spans: Phase-7 zero-token state-gap proofs need the
+          // concrete include instance to distinguish repeated inclusions of the
+          // same physical header.  Without this id, the consumer would have to
+          // fall back to path+byte matching and conservatively reject
+          // repeated-header gaps.
           if (It.OwnerIncludeId) {
             if (It.Kind == IK_Macro) {
               JO.attribute("owner_include_id", *It.OwnerIncludeId);

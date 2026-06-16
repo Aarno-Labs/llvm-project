@@ -197,7 +197,8 @@ uint64_t extendRangeToLogicalDirective(StringRef bytes, uint64_t begin,
   if (begin >= bytes.size())
     return end;
   uint64_t curBegin = begin;
-  uint64_t curEnd = std::min<uint64_t>(end, static_cast<uint64_t>(bytes.size()));
+  uint64_t curEnd =
+      std::min<uint64_t>(end, static_cast<uint64_t>(bytes.size()));
   if (curEnd == begin || (curEnd < bytes.size() && bytes[curEnd - 1] != '\n')) {
     size_t nl = bytes.find('\n', begin);
     curEnd = nl == StringRef::npos ? static_cast<uint64_t>(bytes.size())
@@ -286,7 +287,8 @@ size_t skipWsAndComments(StringRef s, size_t i) {
   return i;
 }
 
-/// Find the matching ')' for a '(' while treating comments and literals as opaque.
+/// Find the matching ')' for a '(' while treating comments and literals as
+/// opaque.
 size_t findMatchingRParen(StringRef s, size_t lParenIdx) {
   const size_t n = s.size();
   if (lParenIdx >= n || s[lParenIdx] != '(')
@@ -383,7 +385,8 @@ std::optional<std::string> canonicalizeStringifyInversePayload(StringRef raw0) {
   out.reserve(raw.size());
 
   // Outside literals, stringify collapses each run of whitespace to one space
-  // between tokens. Delay emission until the next real byte proves it is needed.
+  // between tokens. Delay emission until the next real byte proves it is
+  // needed.
   bool pendingSpace = false;
   auto flushPendingSpace = [&]() {
     if (pendingSpace && !out.empty())
@@ -418,8 +421,8 @@ std::optional<std::string> canonicalizeStringifyInversePayload(StringRef raw0) {
       continue;
 
     case LexState::String:
-      // Literal bodies are preserved byte-for-byte except that a dangling escape
-      // makes the inverse witness invalid.
+      // Literal bodies are preserved byte-for-byte except that a dangling
+      // escape makes the inverse witness invalid.
       out.push_back(c);
       if (c == '\\') {
         if (i + 1 >= raw.size())

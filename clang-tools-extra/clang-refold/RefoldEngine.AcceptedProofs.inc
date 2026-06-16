@@ -255,10 +255,10 @@ RefoldEngine::ValidateInvocationRealizationProof(
     discharge.Require(boundsTracked,
                       ProofObligationKind::WholeCoverBoundsTracked,
                       ProofFailureReason::MissingWholeCoverBounds);
-    // Phase 8e deletes the nested/coarse-span whole-cover fallback.  A macro
-    // realization must now carry the direct self-contained owner-cover proof
-    // that was checked before BuildMacroWholeCoverOwnerRealization() stamped the
-    // shared OwnerRealizationProof.
+    // Nested/coarse-span whole-cover fallback is gone.  A macro realization
+    // must now carry the direct self-contained owner-cover proof that was
+    // checked before BuildMacroWholeCoverOwnerRealization() stamped the shared
+    // OwnerRealizationProof.
     discharge.Require(patch.wholeCoverSelfContained,
                       ProofObligationKind::WholeCoverContainmentTracked,
                       ProofFailureReason::MissingWholeCoverContainment);
@@ -368,13 +368,13 @@ RefoldEngine::ProofDischargeRecord RefoldEngine::ValidateIncludePreservingProof(
     break;
 
   case AcceptedPathKind::IncludeInsertChildBoundary: {
-    // Phase 8d classification: IncludeInsertionByChildBoundary is a declared
-    // include-preserving proof, not a legacy fallback.  The accepted patch must
-    // be a zero-width insertion owned by a concrete parent include, and the
-    // witness must name a direct child include whose spelled directive boundary
-    // is exactly the recorded anchor byte.  This keeps the theorem obligation
-    // owner-local and prevents an arbitrary child id from masquerading as a
-    // stable parent-header insertion point.
+    // IncludeInsertionByChildBoundary is a declared include-preserving proof,
+    // not a legacy fallback.  The accepted patch must be a zero-width insertion
+    // owned by a concrete parent include, and the witness must name a direct
+    // child include whose spelled directive boundary is exactly the recorded
+    // anchor byte.  This keeps the theorem obligation owner-local and prevents
+    // an arbitrary child id from masquerading as a stable parent-header
+    // insertion point.
     RequireIncludeZeroWidthAnchor(
         discharge, *patch, witness, IncludeAnchorEvidenceKind::ChildBoundary,
         ProofObligationKind::IncludeChildBoundaryWitnessTracked,
@@ -531,8 +531,8 @@ RefoldEngine::ValidateTUAnchorProof(AcceptedPathKind currentPath,
 
   case AcceptedPathKind::TUProvableInsertionAnchor: {
     // Provable insertion anchors are a family of weaker local anchors. Each
-    // evidence kind has its own minimal witness fields; the common PP-gap/TU-byte
-    // obligations above are not enough by themselves.
+    // evidence kind has its own minimal witness fields; the common
+    // PP-gap/TU-byte obligations above are not enough by themselves.
     discharge.Require(TUAnchorWitnessHasProvableEvidence(*witness),
                       ProofObligationKind::TUProvableEvidenceTracked,
                       ProofFailureReason::MissingTUProvableAnchorWitness);
@@ -595,10 +595,10 @@ RefoldEngine::TerminalFallbackWitness
 RefoldEngine::BuildTerminalFallbackWitness() const {
   TerminalFallbackWitness witness;
 
-  // Phase 4D makes the ordered typed requests the single source of truth.
-  // There is no branch-local fallback boolean, no primary failure scalar, and
-  // no separate proof-failure vector mirror.  The primary failed obligation is
-  // simply the first classified request failure copied into this witness.
+  // Ordered typed requests are the single source of truth.  There is no
+  // branch-local fallback boolean, no primary failure scalar, and no separate
+  // proof-failure vector mirror.  The primary failed obligation is simply the
+  // first classified request failure copied into this witness.
   witness.proofFailures.reserve(terminalFallbackRequests_.size());
   for (const TerminalFallbackRequest &request : terminalFallbackRequests_) {
     if (IsClassifiedTerminalFallbackProofFailure(request.failure))
@@ -606,10 +606,10 @@ RefoldEngine::BuildTerminalFallbackWitness() const {
   }
 
   if (witness.proofFailures.empty()) {
-    // R4 forbids deriving the failed obligation from an aggregate terminal
-    // kind.  If this state is ever reached, the bug is the missing
-    // caller-supplied proof failure itself, so report a theorem-audit
-    // invariant violation rather than inventing an owner/state reason here.
+    // Do not derive the failed obligation from an aggregate terminal kind.  If
+    // this state is ever reached, the bug is the missing caller-supplied proof
+    // failure itself, so report a theorem-audit invariant violation rather than
+    // inventing an owner/state reason here.
     witness.proofFailures.push_back(MakeTerminalFallbackProofFailure(
         TerminalFallbackObligationKind::TheoremAuditInvariantSatisfied,
         TerminalFallbackFailureReason::TheoremAuditInvariantViolation,

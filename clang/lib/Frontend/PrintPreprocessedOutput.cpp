@@ -1309,7 +1309,8 @@ void clang::DoPrintPreprocessedInput(Preprocessor &PP, raw_ostream *OS,
   } while (true);
 
   // Read all the preprocessed tokens, printing them out to the stream.
-  PrintPreprocessedTokens(PP, Tok, Callbacks, RefoldRecorder.get(), CountingOS.get());
+  PrintPreprocessedTokens(PP, Tok, Callbacks, RefoldRecorder.get(),
+                          CountingOS.get());
   *OutOS << '\n';
 
   // Remove the handlers we just added to leave the preprocessor in a sane state

@@ -169,14 +169,15 @@ inline constexpr void skipNonNewlineWs(StringRef text, size_t &pos) {
 }
 
 
-/// Advance over one C translation phase-2 backslash-newline splice at \p pos.
+/// Advance over one C backslash-newline splice at \p pos.
 ///
 /// The splice must be fully contained in the half-open byte range
 /// `[0, limit)`.  Both `\\\n` and `\\\r\n` are recognized.  The helper is
 /// deliberately byte-oriented and does not interpret comments or literals; the
-/// caller decides where phase-2 splicing is admissible for its proof domain.
+/// caller decides where backslash-newline splicing is admissible for its
+/// proof domain.
 template <typename OffsetT>
-inline bool skipPhase2LineSplice(StringRef text, OffsetT limit, OffsetT &pos) {
+inline bool skipBackslashNewlineSplice(StringRef text, OffsetT limit, OffsetT &pos) {
   const OffsetT size = static_cast<OffsetT>(text.size());
   if (pos >= limit || pos >= size)
     return false;

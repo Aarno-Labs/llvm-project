@@ -725,7 +725,6 @@ static bool buildBoundaryPureCertifiedMap(
         continue;
       }
 
-
       // Commit only the anchors proven by the suffix-insertion certificate:
       // unchanged prefix anchors, the moved internal anchor, and unchanged
       // suffix anchors. The B-only interval between anchorB and the right edge
