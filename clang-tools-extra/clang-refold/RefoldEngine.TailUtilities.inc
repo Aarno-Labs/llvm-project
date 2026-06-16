@@ -329,7 +329,8 @@ RefoldEngine::IncludeSubtreeLineStateObserverDemand(uint64_t includeId) const {
 
   for (const auto &macro : model_.GetMacroInvocations()) {
     const bool observesLine = macro.name == "__LINE__";
-    const bool observesFile = macro.name == "__FILE__";
+    const bool observesFile = macro.name == "__FILE__" ||
+                              macro.name == "__BASE_FILE__";
     const bool observesFileName = macro.name == "__FILE_NAME__";
     if (!observesLine && !observesFile && !observesFileName)
       continue;
@@ -1730,7 +1731,8 @@ RefoldEngine::OwnerSuffixLineStateObserverDemand(
 
   for (const auto &macro : model_.GetMacroInvocations()) {
     const bool observesLine = macro.name == "__LINE__";
-    const bool observesFile = macro.name == "__FILE__";
+    const bool observesFile = macro.name == "__FILE__" ||
+                              macro.name == "__BASE_FILE__";
     const bool observesFileName = macro.name == "__FILE_NAME__";
     if (!observesLine && !observesFile && !observesFileName)
       continue;
@@ -1790,7 +1792,8 @@ RefoldEngine::FirstOwnerSuffixLineStateObserverSite(
   auto considerSite = [&](const RefoldModel::MacroInvocation &builtin,
                           const RefoldModel::MacroInvocation &site) {
     const bool observesLine = builtin.name == "__LINE__";
-    const bool observesFile = builtin.name == "__FILE__";
+    const bool observesFile = builtin.name == "__FILE__" ||
+                              builtin.name == "__BASE_FILE__";
     const bool observesFileName = builtin.name == "__FILE_NAME__";
     if (!observesLine && !observesFile && !observesFileName)
       return;
@@ -1820,7 +1823,8 @@ RefoldEngine::FirstOwnerSuffixLineStateObserverSite(
 
   for (const auto &macro : model_.GetMacroInvocations()) {
     const bool observesLine = macro.name == "__LINE__";
-    const bool observesFile = macro.name == "__FILE__";
+    const bool observesFile = macro.name == "__FILE__" ||
+                              macro.name == "__BASE_FILE__";
     const bool observesFileName = macro.name == "__FILE_NAME__";
     if (!observesLine && !observesFile && !observesFileName)
       continue;

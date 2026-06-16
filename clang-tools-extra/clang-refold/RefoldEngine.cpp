@@ -8871,6 +8871,163 @@ std::string RefoldEngine::RunSinglePassRefold() {
   if (!forcedCounters.empty())
     AddForcedCounterPatches(forcedCounters, macroPatchByOwnerByMacroId);
 
+  auto sourceAuthoredLineControlDominatesSite =
+      [&](const RefoldModel::MacroInvocation &site) -> bool {
+    if (!site.invB || !site.invFile)
+      return false;
+
+    for (const RefoldModel::LineControlEvent &event :
+         model_.GetLineControls()) {
+      if (!event.active || !event.producerProven)
+        continue;
+      if (event.ownerIncludeId != site.ownerIncludeId)
+        continue;
+      if (!event.siteE || *event.siteE > *site.invB)
+        continue;
+      if (event.physicalFile.empty() || event.physicalFile.starts_with("<"))
+        continue;
+      if (!PathsEqual(event.physicalFile, *site.invFile))
+        continue;
+
+      // Only real source line controls discharge this source-preservation
+      // case.  Built-in command-line line markers are recorded in the same
+      // stream, but replaying them as source would not be a user-authored
+      // repair dominating the surviving builtin spelling.
+      StringRef text(event.text);
+      text = text.ltrim();
+      if (text.starts_with("#line") ||
+          (text.size() >= 2 && text[0] == '#' &&
+           stringutils::isNonNewlineWs(text[1])))
+        return true;
+    }
+
+    return false;
+  };
+
+  auto replayContextSensitivePredefinedBuiltin =
+      [&](StringRef name, const RefoldModel::MacroInvocation &site) {
+    // These builtins produce replay-time or physical-file-timestamp literals
+    // that cannot be repaired by synthetic #line state.
+    if (name == "__TIMESTAMP__" || name == "__DATE__" ||
+        name == "__TIME__")
+      return true;
+
+    if (name != "__BASE_FILE__")
+      return false;
+
+    // __BASE_FILE__ is normally part of the line/file observer model: a
+    // preserved source-authored #line can make the spelling replay to the same
+    // producer-observed value, and forcing B realization in those cases destroys
+    // better source-preserving refoldings.  The remaining unsafe case is a
+    // value-producing TU-local spelling that would otherwise require a synthetic
+    // prologue solely to hide the checker output path.  Prefer the local
+    // producer-proven literal for that single observer instead of adding a
+    // global line directive at the top of the refolded file.
+    if (site.ownerIncludeId)
+      return false;
+    if (!site.invFile || !PathsEqual(*site.invFile, tuPath))
+      return false;
+    if (sourceAuthoredLineControlDominatesSite(site))
+      return false;
+    return true;
+  };
+
+  auto forceReplayContextSensitivePredefinedBuiltinPatches = [&]() {
+    size_t forcedPredefinedObserverPatches = 0;
+
+    for (const RefoldModel::MacroInvocation &builtin :
+         model_.GetMacroInvocations()) {
+      // Only value-producing builtin expansions need literalization here.
+      // Builtins used as source #line operands normally have no preprocessed
+      // token cover of their own; they are consumed while computing line/file
+      // state.  Forcing a whole-cover patch for such zero-token operands either
+      // has no valid B envelope or unnecessarily destroys the source #line
+      // structure that already repairs downstream observers.
+      if (!builtin.cover.IsValid())
+        continue;
+      if (!LineStateBuiltinInvocationIsPreservedObserver(builtin))
+        continue;
+
+      const RefoldModel::MacroInvocation *site =
+          LineStateObservableMacroSite(builtin);
+      if (!site)
+        continue;
+      if (IsInvocationInsideDefineDirective(*site))
+        continue;
+      if (!replayContextSensitivePredefinedBuiltin(builtin.name, *site))
+        continue;
+
+      // These predefined macros observe replay context that should not survive
+      // as source spelling in the final output:
+      //   * __TIMESTAMP__ names the timestamp of the physical file containing
+      //     the spelling.
+      //   * __DATE__ and __TIME__ name the time of the replay run itself.
+      //   * A TU-local __BASE_FILE__ with no dominating source-authored #line
+      //     would otherwise need a synthetic prologue to mask the checker output
+      //     path.
+      // Force a whole-cover macro realization so the emitted source carries the
+      // producer-proven literal from B instead of depending on volatile replay
+      // context or a gratuitous global line directive.
+      const auto invStart = site->invB;
+      const auto invEnd = site->invE;
+      if (!invStart || !invEnd || *invEnd < *invStart)
+        continue;
+
+      std::optional<WholeCoverPlan> plan = ComputeWholeCoverPlan(*site);
+      if (!plan) {
+        RequestTerminalFallback(
+            MakeTerminalFallbackProofFailure(
+                TerminalFallbackObligationKind::ProducerFactsAvailable,
+                TerminalFallbackFailureReason::MissingProducerFacts),
+            "macro/predefined",
+            llvm::formatv("replay-context-sensitive predefined macro '{0}' "
+                          "invocation #{1} survived as source spelling, but "
+                          "no whole-cover B realization plan is available",
+                          builtin.name, site->id)
+                .str());
+        continue;
+      }
+
+      auto &byMacroId = macroPatchByOwnerByMacroId[site->ownerIncludeId];
+
+      // Coalesce by physical invocation span, matching normal macro hunk
+      // attribution.  Multiple volatile predefined builtins inside the same
+      // enclosing macro callsite should force one deterministic whole-cover
+      // realization for that callsite, not competing overlapping edits.
+      std::optional<uint64_t> existingKey;
+      for (const auto &kv : byMacroId) {
+        const MacroPatch &existing = kv.second;
+        if (existing.invStart == *invStart && existing.invEnd == *invEnd) {
+          if (!existingKey || kv.first < *existingKey)
+            existingKey = kv.first;
+        }
+      }
+      const uint64_t patchKey = existingKey.value_or(site->id);
+      auto existingIt = byMacroId.find(patchKey);
+
+      MacroPatch patch{*invStart, *invEnd, plan->clippedText, site->id};
+      if (existingIt != byMacroId.end())
+        CarryMacroPatchOwnerCertificate(patch, existingIt->second);
+      StampMacroWholeCoverRealizationPatch(patch, *plan, *site);
+      StampMacroPatchOwnerWitness(patch, site->ownerIncludeId
+                                             ? Owner::Include(*site->ownerIncludeId)
+                                             : Owner::TU());
+      patch.macroId = patchKey;
+      byMacroId[patchKey] = std::move(patch);
+      ++forcedPredefinedObserverPatches;
+    }
+
+    if (forcedPredefinedObserverPatches != 0) {
+      REFOLD_LOG_TRACE(
+          "macro/predefined",
+          "forced {0} replay-context-sensitive predefined macro invocation(s) "
+          "to B-surface realization",
+          forcedPredefinedObserverPatches);
+    }
+  };
+
+  forceReplayContextSensitivePredefinedBuiltinPatches();
+
   // Materialize merged macro patches into the list buckets expected by later
   // planning passes.
   //
@@ -9918,12 +10075,13 @@ std::string RefoldEngine::RunSinglePassRefold() {
   if (HasTerminalFallbackRequest())
     return std::string();
 
-  // Preserve TU-local __FILE__ / __FILE_NAME__ semantics in checker replay.
+  // Preserve TU-local file-observer semantics in checker replay.
   //
-  // If a copied TU suffix contains a preserved TU-local __FILE__ or
-  // __FILE_NAME__ observer, replaying the refolded output without an initial
-  // line directive would make that observer see the refolded output path (for
-  // example "foo.c.mod") instead of the original TU path.  This includes
+  // If a copied TU suffix contains a preserved TU-local __FILE__,
+  // __FILE_NAME__, or __BASE_FILE__ observer, replaying the refolded output
+  // without an initial line directive would make that observer see the refolded
+  // output path (for example "foo.c.mod") instead of the original TU path.
+  // This includes
   // observer uses hidden behind a preserved macro expansion: in
   //
   //   #define PRINT(...) printf(__FILE__, __LINE__, __VA_ARGS__)
@@ -9940,9 +10098,25 @@ std::string RefoldEngine::RunSinglePassRefold() {
   // already changed the active logical file, an initial TU prologue would be
   // dominated before the observer and would only add noise.
   if (lineDirs_.Enabled() && !tuResult.empty()) {
+    auto siteHasMaterializedMacroPatch =
+        [&](const RefoldModel::MacroInvocation &site) -> bool {
+      if (!site.invB || !site.invE)
+        return false;
+      auto it = macroPatchesByOwner.find(site.ownerIncludeId);
+      if (it == macroPatchesByOwner.end())
+        return false;
+      for (const MacroPatch &patch : it->second) {
+        if (patch.invStart <= *site.invB && *site.invE <= patch.invEnd)
+          return true;
+      }
+      return false;
+    };
+
     auto siteNeedsTUPrologue =
         [&](const RefoldModel::MacroInvocation &site) -> bool {
       if (IsInvocationInsideDefineDirective(site))
+        return false;
+      if (siteHasMaterializedMacroPatch(site))
         return false;
       if (site.ownerIncludeId)
         return false;
@@ -9977,7 +10151,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
 
     bool needsTUPrologue = false;
     for (const auto &m : model_.GetMacroInvocations()) {
-      if (m.name != "__FILE__" && m.name != "__FILE_NAME__")
+      if (m.name != "__FILE__" && m.name != "__FILE_NAME__" &&
+          m.name != "__BASE_FILE__")
         continue;
       if (!LineStateBuiltinInvocationIsPreservedObserver(m))
         continue;

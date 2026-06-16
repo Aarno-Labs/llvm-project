@@ -10444,11 +10444,9 @@ private:
   ///
   /// The result is owner-polymorphic and projects nested predefined builtins
   /// back to their outermost source callsite before comparing byte offsets.
-  /// `__LINE__` observes the logical line component; `__FILE__` observes the
-  /// logical file component; and `__FILE_NAME__` observes the logical basename
-  /// component. `__BASE_FILE__` is
-  /// intentionally excluded because synthetic #line directives do not affect
-  /// its value.
+  /// `__LINE__` observes the logical line component; `__FILE__` and
+  /// `__BASE_FILE__` observe the logical file component; and `__FILE_NAME__`
+  /// observes the logical basename component.
   LineStateObserverDemand
   OwnerSuffixLineStateObserverDemand(std::optional<uint64_t> ownerIncludeId,
                                      StringRef ownerFile,
