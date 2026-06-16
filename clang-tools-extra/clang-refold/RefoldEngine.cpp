@@ -99,6 +99,7 @@
 #include <set>
 #include <cctype>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <iterator>
@@ -2118,6 +2119,7 @@ void RefoldEngine::RequestTerminalFallback(
 
   terminalFallbackRequests_.push_back(request);
 
+  TraceWitnessFallback(request);
   debug("fallback", "REQUEST terminal fallback: {0}", toString(request));
 }
 
@@ -3520,6 +3522,8 @@ RefoldEngine::TextEdit RefoldEngine::BuildDirectTUHunkTextEdit(
       acceptedPath, span.first, span.second, acceptedPayload);
   AttachMixedOwnerTilingWitnessForTokenEnvelope(
       candidate.proofSummary, h.aStart, h.aEnd, h.bStart, h.bEnd);
+  AttachLineControlObserverWitness(candidate);
+  AttachCounterStateWitness(candidate);
   RefreshAcceptedCandidateEmissionPathInventory(candidate);
   AttachAcceptedResultCarrier(edit, candidate);
   return edit;
@@ -12557,14 +12561,92 @@ std::string
 RefoldEngine::FormatCounterEventForWitness(
     const CounterEventIdentity &event) {
   return llvm::formatv(
-             "counter event macroInvocationId={0} ordinal={1} "
-             "ownerIncludeId={2} A=[{3},{4}) AValue='{5}' "
-             "literalizable={6} materializable={7}",
+             "counter_event:macro={0}:ordinal={1}:owner_include={2}:"
+             "caller={3}:A=[{4},{5}):AValue={6}:expectedB={7}:"
+             "site_file={8}:site=[{9},{10}):literalizable={11}:"
+             "materializable={12}",
              event.macroInvocationId, event.occurrenceOrdinal,
-             event.ownerIncludeId, event.aTokenBegin, event.aTokenEnd,
-             stringutils::showWsWithClip(event.aValue, 64),
-             event.canStabilizeByLiteralization ? "YES" : "NO",
-             event.canStabilizeByMaterialization ? "YES" : "NO")
+             event.ownerIncludeId.has_value()
+                 ? llvm::formatv("{0}", *event.ownerIncludeId).str()
+                 : std::string("none"),
+             event.callerMacroId.has_value()
+                 ? llvm::formatv("{0}", *event.callerMacroId).str()
+                 : std::string("none"),
+             event.aTokenBegin, event.aTokenEnd,
+             FormatWitnessTraceHash(event.aValue),
+             event.expectedBValue
+                 ? FormatWitnessTraceHash(*event.expectedBValue)
+                 : std::string("none"),
+             event.expansionSiteFile.empty()
+                 ? std::string("none")
+                 : FormatWitnessTraceHash(event.expansionSiteFile),
+             event.expansionSiteBegin.value_or(0),
+             event.expansionSiteEnd.value_or(0),
+             event.canStabilizeByLiteralization ? 1 : 0,
+             event.canStabilizeByMaterialization ? 1 : 0)
+      .str();
+}
+
+bool RefoldEngine::IsLineControlStateComponent(
+    OwnerStateComponent component) {
+  switch (component) {
+  case OwnerStateComponent::LineNumber:
+  case OwnerStateComponent::FileState:
+  case OwnerStateComponent::FileName:
+    return true;
+  case OwnerStateComponent::MacroState:
+  case OwnerStateComponent::DefinedOperator:
+  case OwnerStateComponent::ConditionalState:
+  case OwnerStateComponent::Counter:
+  case OwnerStateComponent::PragmaState:
+  case OwnerStateComponent::IncludeGuardState:
+  case OwnerStateComponent::IncludeState:
+  case OwnerStateComponent::UnmodeledState:
+  case OwnerStateComponent::Unknown:
+    return false;
+  }
+  llvm_unreachable("Invalid owner state component");
+}
+
+std::string RefoldEngine::FormatLineControlEventForWitness(
+    const LineControlStateIdentity &event) {
+  return llvm::formatv(
+             "line_control_event:id={0}:file={1}:site={2}:[{3},{4}):"
+             "active={5}:producer={6}:line_after={7}:file_after={8}:"
+             "owner_include={9}:operands={10}",
+             event.eventId, event.physicalFile,
+             event.siteBegin.has_value() ? 1 : 0,
+             event.siteBegin.value_or(0), event.siteEnd.value_or(0),
+             event.active ? 1 : 0, event.producerProven ? 1 : 0,
+             event.logicalLineAfter, event.logicalFileAfter,
+             event.ownerIncludeId.has_value() ?
+                 llvm::formatv("{0}", *event.ownerIncludeId).str() :
+                 std::string("none"),
+             toString(event.operandProvenance))
+      .str();
+}
+
+std::string RefoldEngine::FormatBuiltinLocationObservationForWitness(
+    const BuiltinLocationObservation &observation) {
+  return llvm::formatv(
+             "builtin_location:{0}:owner_include={1}:source={2}:[{3},{4}):"
+             "a_tokens={5}:[{6},{7})",
+             toString(observation.kind),
+             observation.ownerIncludeId.has_value()
+                 ? llvm::formatv("{0}", *observation.ownerIncludeId).str()
+                 : std::string("none"),
+             observation.sourceBegin.has_value() &&
+                     observation.sourceEnd.has_value()
+                 ? 1
+                 : 0,
+             observation.sourceBegin.value_or(0),
+             observation.sourceEnd.value_or(0),
+             observation.aTokenBegin.has_value() &&
+                     observation.aTokenEnd.has_value()
+                 ? 1
+                 : 0,
+             observation.aTokenBegin.value_or(0),
+             observation.aTokenEnd.value_or(0))
       .str();
 }
 
@@ -16014,6 +16096,36 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         SetMacroPatchProof(patch, std::move(proof));
       };
 
+  auto stampGeneratedCalleeReplayProof =
+      [&](MacroPatch &patch, uint64_t finalDirectiveId,
+          uint32_t generatedCallDepth, uint32_t objectAliasHops,
+          bool usesStringification, bool usesPaste,
+          bool usesVariadicForwarding,
+          bool decodedStringLiteralEvidenceOnly = false) {
+        // Phase 5 does not reclassify the existing macro proof or change
+        // selector behavior.  It enriches the already-validated whole-envelope
+        // replay with producer-path facts so witness equivalence can distinguish
+        // generated-callee forwarding from ordinary macro-actual repair.
+        MacroPatchProof proof = patch.proof;
+        GeneratedCalleeReplayWitness witness;
+        witness.rootMacroId = m.id;
+        witness.finalDirectiveId = finalDirectiveId;
+        witness.generatedCallDepth = generatedCallDepth;
+        witness.objectAliasHops = objectAliasHops;
+        witness.calleeChainDeterministic = true;
+        witness.replacementReplayValidated = true;
+        witness.solvedActualsMappedToRoot = true;
+        witness.usesForwarding = true;
+        witness.usesStringification = usesStringification;
+        witness.usesPaste = usesPaste;
+        witness.usesVariadicForwarding = usesVariadicForwarding;
+        witness.usesObjectAlias = objectAliasHops != 0;
+        witness.decodedStringLiteralEvidenceOnly =
+            decodedStringLiteralEvidenceOnly || usesStringification;
+        proof.generatedCalleeReplay = std::move(witness);
+        SetMacroPatchProof(patch, std::move(proof));
+      };
+
   auto isVariadicFormal = [&](uint32_t idx) -> bool {
     return idx < m.defParams.size() && m.defParams[idx].variadic;
   };
@@ -16445,8 +16557,11 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       return std::nullopt;
 
     // Multiple raw B partitions may still describe the same semantic replay.
-    // Keep all candidates until the scoring pass can prove one canonical call
-    // spelling; equal-score, different-spelling candidates fail closed below.
+    // Phase 4 keeps all valid replay witnesses, partitions them by semantic
+    // definition-tape obligations, and applies canonical preference only after
+    // the surviving class set is known.  This is deliberately different from a
+    // score-first solver: score/spelling may pick a representative, but cannot
+    // prove that two replay witnesses are equivalent.
 
     // Trimmed source spelling of a formal slot in the original invocation; used
     // only for deterministic scoring and no-op detection after B replay.
@@ -16459,26 +16574,79 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       return baseInvText.slice(r.first, r.second).trim();
     };
 
+    // Replacement-list profile shared by every replay solution for this
+    // definition.  The profile records the semantic tape surface (fixed tokens,
+    // formal uses, duplicated/unused formals, zero-token source slots, and
+    // __VA_OPT__ structure) without mentioning the candidate's source spelling.
+    struct DefinitionTapeProfile {
+      uint64_t literalCount = 0;
+      uint64_t paramUseCount = 0;
+      uint64_t vaOptNodeCount = 0;
+      uint64_t duplicatedFormalCount = 0;
+      uint64_t unusedFormalCount = 0;
+      uint64_t emptySourceSlotCount = 0;
+      uint64_t zeroTokenAOccurrenceCount = 0;
+    } tapeProfile;
+
+    std::vector<uint64_t> replacementUseCount(invArgRanges.size(), 0);
+    std::function<void(ArrayRef<ReplayElem>)> collectTapeProfile =
+        [&](ArrayRef<ReplayElem> elems) {
+          for (const ReplayElem &elem : elems) {
+            switch (elem.kind) {
+            case ReplayElem::Kind::Literal:
+              ++tapeProfile.literalCount;
+              break;
+            case ReplayElem::Kind::Param:
+              ++tapeProfile.paramUseCount;
+              if (elem.argIdx < replacementUseCount.size())
+                ++replacementUseCount[elem.argIdx];
+              break;
+            case ReplayElem::Kind::VaOpt:
+              ++tapeProfile.vaOptNodeCount;
+              collectTapeProfile(elem.children);
+              break;
+            }
+          }
+        };
+    collectTapeProfile(pattern);
+
+    for (uint64_t useCount : replacementUseCount) {
+      if (useCount == 0)
+        ++tapeProfile.unusedFormalCount;
+      else if (useCount > 1)
+        ++tapeProfile.duplicatedFormalCount;
+    }
+    for (size_t i = 0; i < invArgRanges.size(); ++i) {
+      if (formalSourceTrim(static_cast<uint32_t>(i)).empty())
+        ++tapeProfile.emptySourceSlotCount;
+    }
+    for (const ReplayAOcc &occ : aOccs) {
+      if (occ.aBegin == occ.aEnd)
+        ++tapeProfile.zeroTokenAOccurrenceCount;
+    }
+
     // Ranking key for otherwise-valid B replays.  Prefer solutions that change
     // existing non-empty formals the least, allocate newly inserted tokens into
-    // originally-empty slots, and keep exposed __VA_OPT__ payloads when present.
-    // These preferences encode the proof obligation: preserve stable source
-    // slots first, then place newly materialized tokens in slots that were
-    // previously unobservable.  A lexical comparison is only a deterministic
-    // ordering after the semantic scores agree; ties with different spellings
-    // are rejected rather than accepted heuristically.
+    // originally-empty slots, preserve unused formals, and keep exposed
+    // __VA_OPT__ payloads when present.  These preferences are canonicalization
+    // only; proof equivalence is decided by the partition key below.
     struct ScoredSolution {
       ReplaySolution sol;
       uint64_t nonEmptyDeviation = 0;
       uint64_t emptySlotTokenCount = 0;
+      uint64_t unusedFormalPreservedCount = 0;
+      uint64_t zeroTokenAssignedFormalCount = 0;
       uint64_t vaOptIncludedCount = 0;
       std::string rewritten;
+      std::string equivalenceKey;
     };
 
     // Convert a B replay assignment back into concrete call-site text.  This
     // edits parsed formal slots in the original invocation spelling rather than
     // emitting expansion text, preserving the macro call when the replay proof
-    // determines a unique replacement for each slot.
+    // determines a unique replacement for each produced slot.  Unused formals are
+    // intentionally left untouched because they have no producer occurrence in
+    // the definition tape.
     auto buildReplayInvocation = [&](const ReplaySolution &sol)
         -> std::optional<std::string> {
       struct LocalEdit {
@@ -16499,7 +16667,13 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         else if (i < m.defParams.size() && m.defParams[i].variadic)
           repl = "";
         else
-          return std::nullopt;
+          // A non-variadic formal that is absent from the replacement-list tape
+          // is an unused macro parameter.  Definition-tape replay has no
+          // producer edge that could justify changing it, so the only
+          // owner-closed witness is to preserve the original argument spelling.
+          // This makes unused formals explicit in the witness model instead of
+          // rejecting otherwise valid replays of the used tape.
+          continue;
 
         auto r = invArgRanges[i];
         if (r.second < r.first || r.second > baseInvText.size())
@@ -16569,7 +16743,283 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       return StringRef(rewritten).trim().str();
     };
 
-    std::optional<ScoredSolution> best;
+    const bool hasVariadicFormal = llvm::any_of(
+        m.defParams, [](const RefoldModel::MacroDefParam &param) {
+          return param.variadic;
+        });
+
+    std::optional<uint32_t> variadicFormalIndex;
+    for (uint32_t i = 0; i < m.defParams.size(); ++i) {
+      if (m.defParams[i].variadic) {
+        variadicFormalIndex = i;
+        break;
+      }
+    }
+
+    const bool hasVaOptCommaPayload = [&]() {
+      std::function<bool(ArrayRef<ReplayElem>)> containsVaOptComma =
+          [&](ArrayRef<ReplayElem> elems) -> bool {
+        for (const ReplayElem &elem : elems) {
+          if (elem.kind == ReplayElem::Kind::VaOpt) {
+            for (const ReplayElem &child : elem.children)
+              if (child.kind == ReplayElem::Kind::Literal &&
+                  child.spelling == ",")
+                return true;
+            if (containsVaOptComma(elem.children))
+              return true;
+          }
+        }
+        return false;
+      };
+      return containsVaOptComma(pattern);
+    }();
+
+    const bool hasGnuVariadicCommaPaste = [&]() {
+      if (!variadicFormalIndex)
+        return false;
+      const auto &toks = definition->replacementTokens;
+      for (size_t i = 0; i < toks.size(); ++i) {
+        if (toks[i].spelling != "##")
+          continue;
+        const bool leftComma =
+            i > 0 && toks[i - 1].kind ==
+                         RefoldModel::MacroReplacementTokenKind::Literal &&
+            toks[i - 1].spelling == ",";
+        const bool rightVariadic =
+            i + 1 < toks.size() &&
+            toks[i + 1].kind ==
+                RefoldModel::MacroReplacementTokenKind::ParamRef &&
+            toks[i + 1].paramIndex &&
+            *toks[i + 1].paramIndex == *variadicFormalIndex;
+        if (leftComma && rightVariadic)
+          return true;
+      }
+      return false;
+    }();
+
+    const size_t parsedActualCount = [&]() -> size_t {
+      auto parsed = RefoldEngine::ParseMacroInvocationArgContentRanges(baseInvText);
+      return parsed ? parsed->size() : invArgRanges.size();
+    }();
+
+    auto originalVariadicState = [&]() {
+      struct State {
+        bool missing = false;
+        bool explicitEmpty = false;
+        bool nonEmpty = false;
+        bool literalComma = false;
+      } state;
+      if (!variadicFormalIndex)
+        return state;
+      const uint32_t idx = *variadicFormalIndex;
+      const StringRef text = formalSourceTrim(idx);
+      state.missing = parsedActualCount <= idx;
+      state.explicitEmpty = !state.missing && text.empty();
+      state.nonEmpty = !text.empty();
+      state.literalComma = state.nonEmpty && hasTopLevelComma(text);
+      return state;
+    }();
+
+    auto variadicStateSignatureForSolution = [&](const ReplaySolution &sol,
+                                                 unsigned vaOptIncludedCount) {
+      if (!variadicFormalIndex)
+        return std::string("non-variadic");
+      const uint32_t idx = *variadicFormalIndex;
+      const bool assigned = idx < sol.assigned.size() && sol.assigned[idx];
+      const bool resultMissing = !assigned;
+      const bool resultExplicitEmpty =
+          assigned && sol.ranges[idx].first == sol.ranges[idx].second;
+      const bool resultNonEmpty =
+          assigned && sol.ranges[idx].first < sol.ranges[idx].second;
+      const std::string resultText =
+          assigned ? SliceBSource(sol.ranges[idx].first, sol.ranges[idx].second)
+                         .trim()
+                         .str()
+                   : std::string();
+      const bool literalComma =
+          !resultText.empty() && hasTopLevelComma(StringRef(resultText));
+      const bool vaOptResultActive = hasVaOpt && vaOptIncludedCount != 0;
+      const bool vaOptOriginallyActive =
+          hasVaOpt && originalVariadicState.nonEmpty;
+      const bool commaInserted =
+          !originalVariadicState.nonEmpty && resultNonEmpty;
+      const bool commaDeleted =
+          originalVariadicState.nonEmpty && !resultNonEmpty;
+      return llvm::formatv(
+                 "variadic:formal={0}:orig_missing={1}:orig_empty={2}:"
+                 "orig_nonempty={3}:orig_litcomma={4}:result_missing={5}:"
+                 "result_empty={6}:result_nonempty={7}:result_litcomma={8}:"
+                 "comma_inserted={9}:comma_deleted={10}:gnu_elision={11}:"
+                 "vaopt={12}:vaopt_orig={13}:vaopt_result={14}:"
+                 "vaopt_comma_ins={15}:vaopt_comma_del={16}:"
+                 "vaopt_nodes={17}:vaopt_included={18}:range=[{19},{20})",
+                 idx, originalVariadicState.missing ? 1 : 0,
+                 originalVariadicState.explicitEmpty ? 1 : 0,
+                 originalVariadicState.nonEmpty ? 1 : 0,
+                 originalVariadicState.literalComma ? 1 : 0,
+                 resultMissing ? 1 : 0, resultExplicitEmpty ? 1 : 0,
+                 resultNonEmpty ? 1 : 0, literalComma ? 1 : 0,
+                 commaInserted ? 1 : 0, commaDeleted ? 1 : 0,
+                 hasGnuVariadicCommaPaste ? 1 : 0, hasVaOpt ? 1 : 0,
+                 vaOptOriginallyActive ? 1 : 0, vaOptResultActive ? 1 : 0,
+                 (hasVaOptCommaPayload && !vaOptOriginallyActive &&
+                  vaOptResultActive)
+                     ? 1
+                     : 0,
+                 (hasVaOptCommaPayload && vaOptOriginallyActive &&
+                  !vaOptResultActive)
+                     ? 1
+                     : 0,
+                 tapeProfile.vaOptNodeCount, vaOptIncludedCount,
+                 assigned ? sol.ranges[idx].first : 0,
+                 assigned ? sol.ranges[idx].second : 0)
+          .str();
+    };
+
+    auto makeVariadicCommaWitnessForSolution =
+        [&](const ReplaySolution &sol,
+            unsigned vaOptIncludedCount) -> std::optional<VariadicCommaWitness> {
+      if (!variadicFormalIndex)
+        return std::nullopt;
+      const uint32_t idx = *variadicFormalIndex;
+      VariadicCommaWitness witness;
+      witness.rootMacroId = m.id;
+      witness.variadicFormalIndex = idx;
+      witness.arityStable = true;
+      witness.originalMissing = originalVariadicState.missing;
+      witness.originalExplicitEmpty = originalVariadicState.explicitEmpty;
+      witness.originalNonEmpty = originalVariadicState.nonEmpty;
+      witness.literalCommaInActual = originalVariadicState.literalComma;
+
+      const bool assigned = idx < sol.assigned.size() && sol.assigned[idx];
+      witness.resultMissing = !assigned;
+      witness.resultExplicitEmpty =
+          assigned && sol.ranges[idx].first == sol.ranges[idx].second;
+      witness.resultNonEmpty =
+          assigned && sol.ranges[idx].first < sol.ranges[idx].second;
+      if (assigned && witness.resultNonEmpty) {
+        std::string text = SliceBSource(sol.ranges[idx].first,
+                                        sol.ranges[idx].second)
+                               .trim()
+                               .str();
+        witness.literalCommaInActual |= hasTopLevelComma(StringRef(text));
+      }
+      witness.commaInserted =
+          !witness.originalNonEmpty && witness.resultNonEmpty;
+      witness.commaDeleted =
+          witness.originalNonEmpty && !witness.resultNonEmpty;
+      witness.gnuCommaElision = hasGnuVariadicCommaPaste;
+      witness.vaOptPresent = hasVaOpt;
+      witness.vaOptOriginallyActive = hasVaOpt && witness.originalNonEmpty;
+      witness.vaOptResultActive = hasVaOpt && vaOptIncludedCount != 0;
+      witness.vaOptCommaIntroduced =
+          hasVaOptCommaPayload && !witness.vaOptOriginallyActive &&
+          witness.vaOptResultActive;
+      witness.vaOptCommaDeleted =
+          hasVaOptCommaPayload && witness.vaOptOriginallyActive &&
+          !witness.vaOptResultActive;
+      witness.vaOptNodeCount = static_cast<uint32_t>(tapeProfile.vaOptNodeCount);
+      witness.vaOptIncludedCount = vaOptIncludedCount;
+      witness.producerSignature = "{Forward,VariadicForward";
+      if (witness.resultMissing)
+        witness.producerSignature += ",VariadicMissing";
+      if (witness.resultExplicitEmpty)
+        witness.producerSignature += ",VariadicEmpty";
+      if (witness.commaInserted || witness.vaOptCommaIntroduced)
+        witness.producerSignature += ",VariadicCommaInsertion";
+      if (witness.commaDeleted || witness.gnuCommaElision ||
+          witness.vaOptCommaDeleted)
+        witness.producerSignature += ",VariadicCommaElision";
+      if (witness.vaOptPresent)
+        witness.producerSignature +=
+            witness.vaOptResultActive ? ",VaOptActivation" : ",VaOptErasure";
+      witness.producerSignature += "}";
+      witness.packStateSignature =
+          variadicStateSignatureForSolution(sol, vaOptIncludedCount);
+      return witness;
+    };
+
+    auto producerObligationKeyForSolution = [&](const ReplaySolution &sol) {
+      bool hasForward = false;
+      bool hasVariadicForward = false;
+      for (size_t i = 0; i < sol.assigned.size(); ++i) {
+        if (!sol.assigned[i])
+          continue;
+        if (i < m.defParams.size() && m.defParams[i].variadic)
+          hasVariadicForward = true;
+        else
+          hasForward = true;
+      }
+
+      std::string out = "{";
+      bool needComma = false;
+      auto add = [&](StringRef name) {
+        if (needComma)
+          out += ",";
+        out += name.str();
+        needComma = true;
+      };
+      if (hasForward)
+        add("Forward");
+      if (hasVariadicForward)
+        add("VariadicForward");
+      if (!needComma)
+        add("PreserveUnusedOnly");
+      out += "}";
+      return out;
+    };
+
+    auto equivalenceKeyForSolution = [&](const ScoredSolution &scored) {
+      // Every valid candidate has replayed the same recorded replacement-list
+      // tree over the same A cover and exactly segmented the same B envelope.
+      // The semantic key therefore records the target PP envelope, the producer
+      // obligations, and the tape features that affect proof obligations.  It
+      // intentionally omits source spelling, slot byte ranges, and canonical
+      // score.  Those belong to chooseCanonical(), not to proof equivalence.
+      std::string key = llvm::formatv(
+                            "definition_tape:def={0}:root={1}:b=[{2},{3}):"
+                            "producer={4}:boundary=root-invocation:"
+                            "literals={5}:param_uses={6}:duplicated={7}:"
+                            "unused={8}:empty_slots={9}:zero_a_occs={10}",
+                            definition->id, m.id, bEnv->first, bEnv->second,
+                            producerObligationKeyForSolution(scored.sol),
+                            tapeProfile.literalCount, tapeProfile.paramUseCount,
+                            tapeProfile.duplicatedFormalCount,
+                            tapeProfile.unusedFormalCount,
+                            tapeProfile.emptySourceSlotCount,
+                            tapeProfile.zeroTokenAOccurrenceCount)
+                            .str();
+
+      // Phase 7: variadic and __VA_OPT__ replay use an explicit producer
+      // profile. Missing pack, explicit empty pack, non-empty forwarding,
+      // source-level comma insertion/deletion, GNU comma elision, literal commas
+      // inside the pack, and VA_OPT activation are deliberately distinct
+      // equivalence dimensions.
+      if (hasVariadicFormal || hasVaOpt)
+        key += ":" +
+               variadicStateSignatureForSolution(scored.sol,
+                                                  scored.vaOptIncludedCount);
+      return key;
+    };
+
+    // Deterministic preference among already-equivalent exact B replays.  The
+    // order is a canonical representative policy, not proof of safety.
+    auto better = [](const ScoredSolution &lhs,
+                     const ScoredSolution &rhs) {
+      if (lhs.nonEmptyDeviation != rhs.nonEmptyDeviation)
+        return lhs.nonEmptyDeviation < rhs.nonEmptyDeviation;
+      if (lhs.unusedFormalPreservedCount != rhs.unusedFormalPreservedCount)
+        return lhs.unusedFormalPreservedCount > rhs.unusedFormalPreservedCount;
+      if (lhs.emptySlotTokenCount != rhs.emptySlotTokenCount)
+        return lhs.emptySlotTokenCount > rhs.emptySlotTokenCount;
+      if (lhs.zeroTokenAssignedFormalCount != rhs.zeroTokenAssignedFormalCount)
+        return lhs.zeroTokenAssignedFormalCount > rhs.zeroTokenAssignedFormalCount;
+      if (lhs.vaOptIncludedCount != rhs.vaOptIncludedCount)
+        return lhs.vaOptIncludedCount > rhs.vaOptIncludedCount;
+      return lhs.rewritten < rhs.rewritten;
+    };
+
+    std::vector<ScoredSolution> validSolutions;
     for (const ReplaySolution &sol : solutions) {
       auto rewritten = buildReplayInvocation(sol);
       if (!rewritten)
@@ -16580,13 +17030,19 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       scored.rewritten = std::move(*rewritten);
       scored.vaOptIncludedCount = sol.vaOptIncludedCount;
       for (uint32_t i = 0; i < invArgRanges.size(); ++i) {
+        if (!sol.assigned[i]) {
+          if (!(i < m.defParams.size() && m.defParams[i].variadic))
+            ++scored.unusedFormalPreservedCount;
+          continue;
+        }
+
         const unsigned oldN = i < oldTokenCountByFormal.size()
                                   ? oldTokenCountByFormal[i]
                                   : 0;
-        const unsigned newN = sol.assigned[i]
-                                  ? static_cast<unsigned>(sol.ranges[i].second -
-                                                          sol.ranges[i].first)
-                                  : 0;
+        const unsigned newN = static_cast<unsigned>(sol.ranges[i].second -
+                                                    sol.ranges[i].first);
+        if (newN == 0)
+          ++scored.zeroTokenAssignedFormalCount;
         if (formalSourceTrim(i).empty()) {
           scored.emptySlotTokenCount += newN;
         } else if (oldN > newN) {
@@ -16595,40 +17051,75 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
           scored.nonEmptyDeviation += newN - oldN;
         }
       }
+      scored.equivalenceKey = equivalenceKeyForSolution(scored);
+      validSolutions.push_back(std::move(scored));
+    }
 
-      // Deterministic preference among multiple exact B replays.  The order
-      // encodes the proof intent: preserve stable non-empty slots, fill
-      // originally-empty slots when the edit inserted tokens, prefer exposed
-      // VA_OPT payloads, and only then use spelling order for determinism.
-      auto better = [](const ScoredSolution &lhs,
-                       const ScoredSolution &rhs) {
-        if (lhs.nonEmptyDeviation != rhs.nonEmptyDeviation)
-          return lhs.nonEmptyDeviation < rhs.nonEmptyDeviation;
-        if (lhs.emptySlotTokenCount != rhs.emptySlotTokenCount)
-          return lhs.emptySlotTokenCount > rhs.emptySlotTokenCount;
-        if (lhs.vaOptIncludedCount != rhs.vaOptIncludedCount)
-          return lhs.vaOptIncludedCount > rhs.vaOptIncludedCount;
-        return lhs.rewritten < rhs.rewritten;
-      };
+    if (validSolutions.empty())
+      return std::nullopt;
 
-      if (!best || better(scored, *best)) {
-        best = std::move(scored);
-      } else if (best->nonEmptyDeviation == scored.nonEmptyDeviation &&
-                 best->emptySlotTokenCount == scored.emptySlotTokenCount &&
-                 best->vaOptIncludedCount == scored.vaOptIncludedCount &&
-                 best->rewritten != scored.rewritten) {
-        // Same semantic score but different call-site spellings means the B
-        // envelope did not determine a unique source repair.  Fail closed
-        // rather than choosing an arbitrary refolding.
-        return std::nullopt;
+    std::map<std::string, std::vector<const ScoredSolution *>> equivalenceClasses;
+    for (const ScoredSolution &scored : validSolutions)
+      equivalenceClasses[scored.equivalenceKey].push_back(&scored);
+
+    if (IsWitnessTraceEnabled()) {
+      TraceWitnessAmbiguity("MacroActualDefinitionTapeReplay",
+                            solutions.size(), validSolutions.size(),
+                            equivalenceClasses.size());
+    }
+
+    // Phase 7 makes the variadic definition-tape partition authoritative when
+    // the refined variadic/VA_OPT key leaves exactly one semantic class.  If a
+    // variadic replay still exposes multiple non-equivalent classes, keep the
+    // legacy deterministic representative for now rather than guessing through
+    // this local gate; the global resolver phase will decide how such
+    // cross-class fallbacks compose with weaker proof families.
+    const bool definitionTapeEquivalenceAuthoritative =
+        (!hasVariadicFormal && !hasVaOpt) || equivalenceClasses.size() == 1;
+    if (definitionTapeEquivalenceAuthoritative &&
+        equivalenceClasses.size() != 1) {
+      if (IsWitnessTraceEnabled()) {
+        RefoldWitness witness;
+        witness.family = WitnessProofFamily::DefinitionTapeReplay;
+        witness.owner = llvm::formatv("macro#{0}", m.id).str();
+        witness.detail = llvm::formatv(
+                             "definition={0} b=[{1},{2}) classes={3}",
+                             definition->id, bEnv->first, bEnv->second,
+                             equivalenceClasses.size())
+                             .str();
+        TraceWitnessRejected(
+            witness, WitnessRejectReason::NonEquivalentAmbiguity,
+            "definition-tape replay produced multiple semantic classes");
+      }
+      return std::nullopt;
+    }
+
+    const std::vector<const ScoredSolution *> *selectionPool = nullptr;
+    if (definitionTapeEquivalenceAuthoritative) {
+      selectionPool = &equivalenceClasses.begin()->second;
+    }
+
+    const ScoredSolution *best = nullptr;
+    if (selectionPool) {
+      best = selectionPool->front();
+      for (const ScoredSolution *scored : *selectionPool) {
+        if (scored != best && better(*scored, *best))
+          best = scored;
+      }
+    } else {
+      best = &validSolutions.front();
+      for (size_t i = 1; i < validSolutions.size(); ++i) {
+        const ScoredSolution &scored = validSolutions[i];
+        if (better(scored, *best))
+          best = &scored;
       }
     }
 
-    if (!best || StringRef(best->rewritten).trim() == baseInvText.trim())
+    if (StringRef(best->rewritten).trim() == baseInvText.trim())
       return std::nullopt;
 
 
-    MacroPatch patch{*m.invB, *m.invE, std::move(best->rewritten), m.id};
+    MacroPatch patch{*m.invB, *m.invE, best->rewritten, m.id};
     // The replacement text is the full rewritten invocation, so the
     // materialized output range covers the replacement string.  The B-token
     // proof range remains the mapped expansion envelope stamped below.
@@ -16640,6 +17131,52 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         static_cast<uint64_t>(bEnv->second));
     setArgsOnlyStandardProof(patch, /*wholeEnvelopeReplayValidated=*/true,
                              /*definitionTapeReplayValidated=*/true);
+    if (auto variadicWitness = makeVariadicCommaWitnessForSolution(
+            best->sol, static_cast<unsigned>(best->vaOptIncludedCount))) {
+      MacroPatchProof proof = patch.proof;
+      proof.variadicCommaReplay = std::move(*variadicWitness);
+      SetMacroPatchProof(patch, std::move(proof));
+    }
+
+    // Phase 8: definition-tape replay is the producer proof for empty actuals
+    // and zero-token replacement-list gaps.  When this accepted replay used a
+    // zero-width A occurrence or assigned B tokens to an originally empty
+    // source slot, carry that fact as a zero-token boundary witness.  This is
+    // trace/equivalence metadata only; the exact same replay and canonical
+    // representative selected above remain authoritative for the emitted text.
+    if (tapeProfile.emptySourceSlotCount != 0 ||
+        tapeProfile.zeroTokenAOccurrenceCount != 0 ||
+        best->zeroTokenAssignedFormalCount != 0) {
+      MacroPatchProof proof = patch.proof;
+      ZeroTokenBoundaryWitness witness;
+      witness.ownerId = m.id;
+      witness.ownerKind = "macro";
+      witness.hasSourceAnchor = true;
+      witness.sourceAnchor = *m.invB;
+      witness.hasBTokenRange = true;
+      witness.bTokStart = static_cast<uint64_t>(bEnv->first);
+      witness.bTokEnd = static_cast<uint64_t>(bEnv->second);
+      witness.producerProven = true;
+      witness.ownerClosed = true;
+      witness.layoutStable = true;
+      witness.observersStable = true;
+      witness.counterStable = true;
+      witness.fromEmptyActual = tapeProfile.emptySourceSlotCount != 0;
+      witness.fromReplacementGap = tapeProfile.zeroTokenAOccurrenceCount != 0;
+      witness.boundarySignature =
+          llvm::formatv(
+              "definition-tape-zero-token:def={0}:macro={1}:b=[{2},{3}):"
+              "empty_slots={4}:zero_a_occs={5}:zero_assigned={6}:"
+              "producer={7}",
+              definition->id, m.id, bEnv->first, bEnv->second,
+              tapeProfile.emptySourceSlotCount,
+              tapeProfile.zeroTokenAOccurrenceCount,
+              best->zeroTokenAssignedFormalCount,
+              producerObligationKeyForSolution(best->sol))
+              .str();
+      proof.zeroTokenBoundaryReplay = std::move(witness);
+      SetMacroPatchProof(patch, std::move(proof));
+    }
     return patch;
   };
 
@@ -18166,8 +18703,11 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     if (!definitionAcceptsActualCount(*rootDefinition, currentActuals.size()))
       return std::nullopt;
 
-    auto resolveFunctionLikeThroughAliases =
-        [&](StringRef startName) -> const RefoldModel::MacroDirective * {
+    auto resolveFunctionLikeThroughAliasesWithHops =
+        [&](StringRef startName, uint32_t *aliasHops)
+            -> const RefoldModel::MacroDirective * {
+      if (aliasHops)
+        *aliasHops = 0;
       if (startName.empty())
         return nullptr;
       SmallVector<std::string, 8> seen;
@@ -18204,9 +18744,16 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
           return functionLike;
         if (!alias)
           return nullptr;
+        if (aliasHops)
+          ++*aliasHops;
         current = alias->replacementTokens[0].spelling.str();
       }
       return nullptr;
+    };
+
+    auto resolveFunctionLikeThroughAliases =
+        [&](StringRef startName) -> const RefoldModel::MacroDirective * {
+      return resolveFunctionLikeThroughAliasesWithHops(startName, nullptr);
     };
 
     struct GeneratedCallShape {
@@ -18331,6 +18878,11 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     SmallVector<SmallVector<std::string, 8>, 8> replaySuffixStack;
     const RefoldModel::MacroDirective *currentDefinition = rootDefinition;
     bool followedGeneratedCall = false;
+    uint32_t generatedCallDepth = 0;
+    uint32_t objectAliasHopCount = 0;
+    bool generatedReplayUsesStringification = false;
+    bool generatedReplayUsesPaste = false;
+    bool generatedReplayUsesVariadicForwarding = false;
 
     auto isVariadicParam = [](const RefoldModel::MacroDirective &definition,
                               uint32_t paramIdx) {
@@ -18414,6 +18966,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         out.push_back(actuals[paramIdx]);
         return true;
       }
+      generatedReplayUsesVariadicForwarding = true;
       if (actuals.size() < paramIdx)
         return false;
 
@@ -18522,9 +19075,12 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       std::string text;
       for (size_t i = begin; i < end; ++i) {
         const auto &tok = toks[i];
-        if (tok.spelling == "##")
+        if (tok.spelling == "##") {
+          generatedReplayUsesPaste = true;
           continue;
+        }
         if (tok.spelling == "#") {
+          generatedReplayUsesStringification = true;
           if (i + 1 >= end ||
               toks[i + 1].kind != RefoldModel::MacroReplacementTokenKind::ParamRef ||
               !toks[i + 1].paramIndex ||
@@ -18570,9 +19126,12 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       if (shape->calleeParamIdx >= currentActuals.size())
         return std::nullopt;
 
+      uint32_t nextAliasHops = 0;
       const RefoldModel::MacroDirective *nextDefinition =
-          resolveFunctionLikeThroughAliases(
-              StringRef(currentActuals[shape->calleeParamIdx].text));
+          resolveFunctionLikeThroughAliasesWithHops(
+              StringRef(currentActuals[shape->calleeParamIdx].text),
+              &nextAliasHops);
+      objectAliasHopCount += nextAliasHops;
       if (!nextDefinition || nextDefinition->defParams.empty())
         return std::nullopt;
 
@@ -18593,6 +19152,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       currentDefinition = nextDefinition;
       currentActuals = std::move(nextActuals);
       followedGeneratedCall = true;
+      ++generatedCallDepth;
     }
 
     if (!followedGeneratedCall || !currentDefinition || currentActuals.empty())
@@ -18741,6 +19301,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       for (size_t i = begin; i < end;) {
         const auto &tok = tokens[i];
         if (tok.spelling == "#") {
+          generatedReplayUsesStringification = true;
           if (i + 1 >= end ||
               tokens[i + 1].kind != RefoldModel::MacroReplacementTokenKind::ParamRef ||
               !tokens[i + 1].paramIndex)
@@ -18757,6 +19318,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         }
 
         if (i + 1 < end && tokens[i + 1].spelling == "##") {
+          generatedReplayUsesPaste = true;
           ReplayElem elem;
           elem.kind = ReplayKind::Paste;
           PastePiece first;
@@ -19159,6 +19721,12 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         patch, static_cast<uint64_t>(bEnv->first),
         static_cast<uint64_t>(bEnv->second));
     setArgsOnlyStandardProof(patch, /*wholeEnvelopeReplayValidated=*/true);
+    stampGeneratedCalleeReplayProof(
+        patch, currentDefinition ? currentDefinition->id : 0,
+        generatedCallDepth, objectAliasHopCount,
+        generatedReplayUsesStringification, generatedReplayUsesPaste,
+        generatedReplayUsesVariadicForwarding,
+        /*decodedStringLiteralEvidenceOnly=*/generatedReplayUsesStringification);
     return patch;
   };
 
@@ -20221,12 +20789,15 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     // the user's original tuple spelling.  Each alias hop must be unique and
     // must expand to exactly one literal token; cycles or ambiguous definitions
     // fail closed.
-    auto resolveFunctionLikeThroughAliases =
-        [&](StringRef startName) -> const RefoldModel::MacroDirective * {
+    auto resolveFunctionLikeThroughAliasesWithHops =
+        [&](StringRef startName, uint32_t *aliasHops)
+            -> const RefoldModel::MacroDirective * {
+      if (aliasHops)
+        *aliasHops = 0;
       if (startName.empty())
         return nullptr;
       SmallVector<std::string, 8> seen;
-      std::string current = startName.str();
+      std::string current = startName.trim().str();
       for (size_t depth = 0; depth <= model_.GetMacroDirectives().size();
            ++depth) {
         if (llvm::is_contained(seen, current))
@@ -20259,13 +20830,19 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
           return functionLike;
         if (!alias)
           return nullptr;
+        if (aliasHops)
+          ++*aliasHops;
         current = alias->replacementTokens[0].spelling.str();
       }
       return nullptr;
     };
 
+    uint32_t tupleObjectAliasHopCount = 0;
+    uint32_t forwarderAliasHops = 0;
     const RefoldModel::MacroDirective *forwarderDefinition =
-        resolveFunctionLikeThroughAliases(rootTok0.spelling);
+        resolveFunctionLikeThroughAliasesWithHops(rootTok0.spelling,
+                                                  &forwarderAliasHops);
+    tupleObjectAliasHopCount += forwarderAliasHops;
     if (!forwarderDefinition || forwarderDefinition->defParams.empty())
       return std::nullopt;
 
@@ -20392,9 +20969,12 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     if (generatedArgs.empty())
       return std::nullopt;
 
+    uint32_t calleeAliasHops = 0;
     const RefoldModel::MacroDirective *calleeDefinition =
-        resolveFunctionLikeThroughAliases(
-            tupleElementText(static_cast<size_t>(calleeForwarderParam)));
+        resolveFunctionLikeThroughAliasesWithHops(
+            tupleElementText(static_cast<size_t>(calleeForwarderParam)),
+            &calleeAliasHops);
+    tupleObjectAliasHopCount += calleeAliasHops;
     if (!calleeDefinition || calleeDefinition->defParams.empty())
       return std::nullopt;
 
@@ -20414,6 +20994,11 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
 
     const bool calleeHasVariadic = !calleeDefinition->defParams.empty() &&
                                    calleeDefinition->defParams.back().variadic;
+    bool tupleReplayUsesStringification = false;
+    bool tupleReplayUsesPaste = false;
+    bool tupleReplayUsesVariadicForwarding = false;
+    for (const GeneratedArgRef &ref : generatedArgs)
+      tupleReplayUsesVariadicForwarding |= ref.variadicPack;
     const size_t fixedCalleeActuals = calleeHasVariadic
                                           ? calleeDefinition->defParams.size() - 1
                                           : calleeDefinition->defParams.size();
@@ -20642,6 +21227,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
               *calleeDefinition->replacementTokens[i + 1].paramIndex;
           if (paramIdx >= oldActuals.size())
             return false;
+          tupleReplayUsesStringification = true;
           CalleeReplayElem elem;
           elem.kind = CalleeReplayKind::Stringify;
           elem.paramIdx = paramIdx;
@@ -20652,6 +21238,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
 
         if (i + 1 < end &&
             calleeDefinition->replacementTokens[i + 1].spelling == "##") {
+          tupleReplayUsesPaste = true;
           CalleeReplayElem elem;
           elem.kind = CalleeReplayKind::Paste;
           CalleePastePiece first;
@@ -21007,6 +21594,12 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         patch, static_cast<uint64_t>(bEnv->first),
         static_cast<uint64_t>(bEnv->second));
     setArgsOnlyStandardProof(patch, /*wholeEnvelopeReplayValidated=*/true);
+    stampGeneratedCalleeReplayProof(
+        patch, calleeDefinition ? calleeDefinition->id : 0,
+        /*generatedCallDepth=*/1, tupleObjectAliasHopCount,
+        tupleReplayUsesStringification, tupleReplayUsesPaste,
+        tupleReplayUsesVariadicForwarding,
+        /*decodedStringLiteralEvidenceOnly=*/tupleReplayUsesStringification);
     return patch;
   };
 
@@ -24444,6 +25037,2082 @@ void RefoldEngine::StampSelectedMacroPatchCandidate(
   patch.selectedAcceptedCandidate = candidate;
 }
 
+RefoldEngine::WitnessProofFamily
+RefoldEngine::WitnessFamilyForAcceptedPath(AcceptedPathKind path) {
+  switch (path) {
+  case AcceptedPathKind::MacroArgsOnlyStandard:
+  case AcceptedPathKind::MacroArgsOnlyPairedPureInsertion:
+    return WitnessProofFamily::MacroActualRepair;
+  case AcceptedPathKind::MacroArgsOnlyPasteSingle:
+  case AcceptedPathKind::MacroArgsOnlyPasteMulti:
+  case AcceptedPathKind::MacroArgsOnlyPurePasteOnly:
+  case AcceptedPathKind::MacroPasteDerivedCalleeSelector:
+    return WitnessProofFamily::TokenPaste;
+  case AcceptedPathKind::MacroDagSubtreeRoot:
+  case AcceptedPathKind::MacroCallChainSuffix:
+    return WitnessProofFamily::GeneratedCalleeReplay;
+  case AcceptedPathKind::MacroCounterLiteral:
+    return WitnessProofFamily::CounterState;
+  case AcceptedPathKind::MacroWholeCoverRealization:
+    return WitnessProofFamily::OwnerRealization;
+  case AcceptedPathKind::IncludePatchPendingMaterialization:
+  case AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens:
+  case AcceptedPathKind::IncludeInsertSelectedConditionalBoundary:
+  case AcceptedPathKind::IncludeInsertChildBoundary:
+  case AcceptedPathKind::IncludeInsertRightNeighborPP:
+  case AcceptedPathKind::IncludeInsertLeftNeighborPP:
+  case AcceptedPathKind::IncludeInsertDeclBoundary:
+    return WitnessProofFamily::IncludePreservation;
+  case AcceptedPathKind::IncludeRealizationInlineFromB:
+  case AcceptedPathKind::IncludeMaterializedExpansion:
+    return WitnessProofFamily::IncludeRealization;
+  case AcceptedPathKind::TUExactSlotBoundary:
+  case AcceptedPathKind::TUProvableInsertionAnchor:
+    return WitnessProofFamily::TUAnchor;
+  case AcceptedPathKind::TUByteSpanMappedEdit:
+  case AcceptedPathKind::TUByteSpanConservativeEdit:
+  case AcceptedPathKind::TUIncludeClosureEdit:
+    return WitnessProofFamily::TUTextEdit;
+  case AcceptedPathKind::TerminalEmitEditedPreprocessedStream:
+    return WitnessProofFamily::TerminalFallback;
+  case AcceptedPathKind::Unknown:
+    return WitnessProofFamily::Unknown;
+  }
+  return WitnessProofFamily::Unknown;
+}
+
+
+bool RefoldEngine::IsResolverAuthoritativeWitnessFamily(
+    WitnessProofFamily family) {
+  // Phase 12 starts making converted proof families authoritative through the
+  // central resolver, but only in strict resolver mode and only after the
+  // already-existing completeness/single-class checks pass.  Families not
+  // listed here remain probe-only even if they happen to carry a complete key;
+  // that keeps the migration one-family-at-a-time instead of letting an
+  // incidental complete trace field change behavior for an unaudited family.
+  switch (family) {
+  case WitnessProofFamily::MacroActualRepair:
+  case WitnessProofFamily::DefinitionTapeReplay:
+  case WitnessProofFamily::GeneratedCalleeReplay:
+  case WitnessProofFamily::Stringification:
+  case WitnessProofFamily::TokenPaste:
+  case WitnessProofFamily::VariadicComma:
+  case WitnessProofFamily::ZeroTokenBoundary:
+  case WitnessProofFamily::LineControlObserver:
+  case WitnessProofFamily::CounterState:
+  case WitnessProofFamily::MixedOwnerTiling:
+    return true;
+  case WitnessProofFamily::Unknown:
+  case WitnessProofFamily::AcceptedResult:
+  case WitnessProofFamily::IncludePreservation:
+  case WitnessProofFamily::IncludeRealization:
+  case WitnessProofFamily::TUAnchor:
+  case WitnessProofFamily::TUTextEdit:
+  case WitnessProofFamily::OwnerRealization:
+  case WitnessProofFamily::TerminalFallback:
+    return false;
+  }
+  return false;
+}
+
+RefoldEngine::WitnessProducerKind
+RefoldEngine::WitnessProducerKindForAcceptedPath(AcceptedPathKind path) {
+  switch (path) {
+  case AcceptedPathKind::MacroArgsOnlyStandard:
+  case AcceptedPathKind::MacroArgsOnlyPairedPureInsertion:
+    return WitnessProducerKind::Forward;
+  case AcceptedPathKind::MacroArgsOnlyPasteSingle:
+  case AcceptedPathKind::MacroArgsOnlyPasteMulti:
+  case AcceptedPathKind::MacroArgsOnlyPurePasteOnly:
+  case AcceptedPathKind::MacroPasteDerivedCalleeSelector:
+    return WitnessProducerKind::PasteResult;
+  case AcceptedPathKind::MacroDagSubtreeRoot:
+  case AcceptedPathKind::MacroCallChainSuffix:
+    return WitnessProducerKind::GeneratedCallee;
+  case AcceptedPathKind::MacroCounterLiteral:
+    return WitnessProducerKind::BuiltinMaterialization;
+  case AcceptedPathKind::IncludePatchPendingMaterialization:
+  case AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens:
+  case AcceptedPathKind::IncludeInsertSelectedConditionalBoundary:
+  case AcceptedPathKind::IncludeInsertChildBoundary:
+  case AcceptedPathKind::IncludeInsertRightNeighborPP:
+  case AcceptedPathKind::IncludeInsertLeftNeighborPP:
+  case AcceptedPathKind::IncludeInsertDeclBoundary:
+  case AcceptedPathKind::TUExactSlotBoundary:
+  case AcceptedPathKind::TUProvableInsertionAnchor:
+    return WitnessProducerKind::Forward;
+  case AcceptedPathKind::MacroWholeCoverRealization:
+  case AcceptedPathKind::IncludeRealizationInlineFromB:
+  case AcceptedPathKind::IncludeMaterializedExpansion:
+  case AcceptedPathKind::TUByteSpanMappedEdit:
+  case AcceptedPathKind::TUByteSpanConservativeEdit:
+  case AcceptedPathKind::TUIncludeClosureEdit:
+    return WitnessProducerKind::OwnerRealization;
+  case AcceptedPathKind::TerminalEmitEditedPreprocessedStream:
+    return WitnessProducerKind::TerminalMaterialization;
+  case AcceptedPathKind::Unknown:
+    return WitnessProducerKind::Unknown;
+  }
+  return WitnessProducerKind::Unknown;
+}
+
+RefoldEngine::WitnessBoundaryClass
+RefoldEngine::WitnessBoundaryClassForAcceptedCandidate(
+    const AcceptedResultCandidate &candidate) {
+  switch (candidate.kind) {
+  case AcceptedResultCandidateKind::MacroPatch:
+    return WitnessBoundaryClass::RootInvocation;
+  case AcceptedResultCandidateKind::IncludePatch:
+    return WitnessBoundaryClass::IncludeBoundary;
+  case AcceptedResultCandidateKind::TUAnchor:
+    return WitnessBoundaryClass::TUAnchorBoundary;
+  case AcceptedResultCandidateKind::TUTextEdit:
+    return WitnessBoundaryClass::OwnerRealizationBoundary;
+  case AcceptedResultCandidateKind::TerminalOutOfDomain:
+    return WitnessBoundaryClass::TerminalBoundary;
+  case AcceptedResultCandidateKind::Unknown:
+    return WitnessBoundaryClass::Unknown;
+  }
+  return WitnessBoundaryClass::Unknown;
+}
+
+std::string RefoldEngine::FormatWitnessTraceHash(StringRef text) {
+  // Fixed FNV-1a keeps Phase-0 traces deterministic without relying on
+  // implementation-specific pointer identity or process-local hash seeds.
+  uint64_t hash = 14695981039346656037ULL;
+  for (char ch : text) {
+    hash ^= static_cast<unsigned char>(ch);
+    hash *= 1099511628211ULL;
+  }
+  return std::string("0x") + llvm::utohexstr(hash, /*LowerCase=*/true);
+}
+
+void RefoldEngine::AttachLineControlObserverWitness(
+    AcceptedResultCandidate &candidate) const {
+  candidate.hasLineControlObserverWitness = false;
+  candidate.lineControlObserverWitness = LineControlObserverWitness{};
+
+  LineControlObserverWitness witness;
+  const ProofSummary &summary = candidate.proofSummary;
+
+  auto appendSig = [](std::string &dst, llvm::StringRef part) {
+    if (!dst.empty())
+      dst += ";";
+    dst += part.str();
+  };
+
+  auto observeSummary = [&](const OwnerObserverSummary &observers,
+                            llvm::StringRef role) {
+    if (observers.observesLineNumber) {
+      witness.observesLineNumber = true;
+      appendSig(witness.observerSignature,
+                llvm::formatv("{0}:observes-line", role).str());
+    }
+    if (observers.observesFileState) {
+      witness.observesFileState = true;
+      appendSig(witness.observerSignature,
+                llvm::formatv("{0}:observes-file", role).str());
+    }
+    if (observers.observesFileName) {
+      witness.observesFileName = true;
+      appendSig(witness.observerSignature,
+                llvm::formatv("{0}:observes-filename", role).str());
+    }
+  };
+
+  auto recordLineControlEvent = [&](const LineControlStateIdentity &event,
+                                    llvm::StringRef bucket) {
+    witness.hasSourceLineControlState = true;
+    ++witness.lineControlEventCount;
+    if (event.active)
+      ++witness.activeLineControlEventCount;
+    else
+      ++witness.inactiveLineControlEventCount;
+    if (event.producerProven)
+      ++witness.producerProvenLineControlEventCount;
+    if (event.operandProvenance ==
+        LineDirectiveOperandProvenance::MissingProducerOperands)
+      ++witness.missingOperandLineControlEventCount;
+    if (event.operandProvenance == LineDirectiveOperandProvenance::Unknown)
+      ++witness.unknownOperandLineControlEventCount;
+
+    // Producer line-control events are source-authored logical-state mutations
+    // in the refold map.  Synthetic final-stream directives are represented by
+    // final-line-control candidates instead and are not inferred here.
+    ++witness.sourceAuthoredLineDirectiveCount;
+    appendSig(witness.stateSignature,
+              llvm::formatv("{0}:{1}", bucket,
+                            FormatLineControlEventForWitness(event))
+                  .str());
+  };
+
+  auto recordBuiltinObservation = [&](const BuiltinLocationObservation &obs,
+                                      llvm::StringRef bucket) {
+    witness.hasBuiltinLocationObservers = true;
+    ++witness.builtinLocationObservationCount;
+    switch (obs.kind) {
+    case BuiltinLocationObservationKind::LineState:
+      witness.observesLineNumber = true;
+      ++witness.builtinLineObservationCount;
+      break;
+    case BuiltinLocationObservationKind::FileState:
+      witness.observesFileState = true;
+      ++witness.builtinFileObservationCount;
+      break;
+    case BuiltinLocationObservationKind::FileNameState:
+      witness.observesFileName = true;
+      ++witness.builtinFileNameObservationCount;
+      break;
+    }
+    appendSig(witness.observerSignature,
+              llvm::formatv("{0}:{1}", bucket,
+                            FormatBuiltinLocationObservationForWitness(obs))
+                  .str());
+  };
+
+  auto collectFacts = [&](const OwnerStateFacts &facts,
+                          llvm::StringRef bucket) {
+    for (const LineControlStateIdentity &event : facts.lineControlEvents)
+      recordLineControlEvent(event, bucket);
+    for (const BuiltinLocationObservation &obs :
+         facts.builtinLocationObservations)
+      recordBuiltinObservation(obs, bucket);
+    for (const MissingStateFact &fact : facts.missingStateFacts) {
+      if (fact.kind == MissingStateFactKind::MissingLineControlFacts) {
+        witness.hasSourceLineControlState = true;
+        appendSig(witness.stateSignature,
+                  llvm::formatv("{0}:missing-line-control-fact:{1}",
+                                bucket, fact.detail)
+                      .str());
+      }
+    }
+  };
+
+  auto collectDelta = [&](const OwnerStateDelta &delta, llvm::StringRef role) {
+    collectFacts(delta.Entry, llvm::formatv("{0}.entry", role).str());
+    collectFacts(delta.Observes, llvm::formatv("{0}.observes", role).str());
+    collectFacts(delta.Mutates, llvm::formatv("{0}.mutates", role).str());
+    collectFacts(delta.Exit, llvm::formatv("{0}.exit", role).str());
+  };
+
+  if (summary.hasOwnerRealizationWitness &&
+      summary.ownerRealizationWitness.closure.IsComplete()) {
+    const OwnerClosure &closure = summary.ownerRealizationWitness.closure;
+    collectDelta(closure.stateIn, "owner.state_in");
+    collectDelta(closure.stateOut, "owner.state_out");
+    observeSummary(closure.observers, "owner.suffix");
+  }
+
+  if (summary.hasMixedOwnerTilingWitness) {
+    const MixedOwnerTilingWitness &tiling = summary.mixedOwnerTilingWitness;
+    for (const MixedOwnerTilingSegmentWitness &segment : tiling.segments) {
+      collectDelta(segment.ownerTransitionProof.before,
+                   "mixed.segment.before");
+      collectDelta(segment.ownerTransitionProof.after,
+                   "mixed.segment.after");
+      for (const SuffixStabilityWitness &suffix :
+           segment.ownerTransitionProof.suffixWitnesses) {
+        const OwnerStateComponent component =
+            ComponentNamedBySuffixStabilityWitness(suffix);
+        if (!IsLineControlStateComponent(component))
+          continue;
+        witness.hasSuffixLineControlDischarge = true;
+        appendSig(witness.stateSignature,
+                  llvm::formatv("mixed.segment.suffix:{0}:component={1}",
+                                toString(suffix.kind), toString(component))
+                      .str());
+        appendSig(witness.observerSignature,
+                  llvm::formatv("mixed.segment.suffix-discharge:{0}:component={1}",
+                                toString(suffix.kind), toString(component))
+                      .str());
+      }
+    }
+  }
+
+  if (summary.hasSuffixStabilityWitness) {
+    const SuffixStabilityWitness &suffix = summary.suffixStabilityWitness;
+    const OwnerStateComponent component =
+        ComponentNamedBySuffixStabilityWitness(suffix);
+    if (IsLineControlStateComponent(component)) {
+      witness.hasSuffixLineControlDischarge = true;
+      switch (component) {
+      case OwnerStateComponent::LineNumber:
+        witness.observesLineNumber = true;
+        break;
+      case OwnerStateComponent::FileState:
+        witness.observesFileState = true;
+        break;
+      case OwnerStateComponent::FileName:
+        witness.observesFileName = true;
+        break;
+      case OwnerStateComponent::MacroState:
+      case OwnerStateComponent::DefinedOperator:
+      case OwnerStateComponent::ConditionalState:
+      case OwnerStateComponent::Counter:
+      case OwnerStateComponent::PragmaState:
+      case OwnerStateComponent::IncludeGuardState:
+      case OwnerStateComponent::IncludeState:
+      case OwnerStateComponent::UnmodeledState:
+      case OwnerStateComponent::Unknown:
+        break;
+      }
+      appendSig(witness.stateSignature,
+                llvm::formatv("suffix:{0}:component={1}",
+                              toString(suffix.kind), toString(component))
+                    .str());
+      appendSig(witness.observerSignature,
+                llvm::formatv("suffix-discharge:{0}:component={1}",
+                              toString(suffix.kind), toString(component))
+                    .str());
+    }
+  }
+
+  // Phase 9 does not reverse-engineer final #line text from ordinary payloads.
+  // It records layout only when an earlier proof has already carried a typed
+  // zero-width/layout witness.  Unknown layout is kept witness-specific in the
+  // signature so it cannot collapse unrelated line-control candidates.
+  if (candidate.hasZeroTokenBoundaryWitness) {
+    witness.physicalLayoutKnown = true;
+    witness.physicalLayoutStable = candidate.zeroTokenLayoutStable;
+    if (candidate.zeroTokenFromIncludeBoundary)
+      witness.includeReturnResyncCount += 1;
+    if (candidate.zeroTokenFromDirectiveLayoutGap)
+      witness.syntheticResyncCount += 1;
+  }
+
+  if (witness.stateSignature.empty())
+    witness.stateSignature = "none";
+  if (witness.observerSignature.empty())
+    witness.observerSignature = "none";
+
+  if (witness.physicalLayoutKnown) {
+    witness.layoutSignature =
+        llvm::formatv("layout:known:stable={0}:include_return={1}:"
+                      "synthetic_resync={2}",
+                      witness.physicalLayoutStable ? 1 : 0,
+                      witness.includeReturnResyncCount,
+                      witness.syntheticResyncCount)
+            .str();
+  } else {
+    witness.layoutSignature =
+        llvm::formatv("layout:unknown:candidate=[{0},{1})", candidate.begin,
+                      candidate.end)
+            .str();
+  }
+
+  if (witness.Empty())
+    return;
+
+  candidate.hasLineControlObserverWitness = true;
+  candidate.lineControlObserverWitness = std::move(witness);
+}
+
+void RefoldEngine::AttachCounterStateWitness(
+    AcceptedResultCandidate &candidate) const {
+  CounterStateWitness witness = candidate.hasCounterStateWitness
+                                    ? candidate.counterStateWitness
+                                    : CounterStateWitness{};
+  candidate.hasCounterStateWitness = false;
+  candidate.counterStateWitness = CounterStateWitness{};
+
+  const ProofSummary &summary = candidate.proofSummary;
+
+  auto appendSig = [](std::string &dst, llvm::StringRef part) {
+    if (!dst.empty())
+      dst += ";";
+    dst += part.str();
+  };
+
+  std::vector<CounterEventIdentity> orderedEvents;
+  auto rememberEvent = [&](const CounterEventIdentity &event) {
+    if (llvm::none_of(orderedEvents, [&](const CounterEventIdentity &existing) {
+          return existing == event;
+        }))
+      orderedEvents.push_back(event);
+  };
+
+  auto recordCounterEvent = [&](const CounterEventIdentity &event,
+                                llvm::StringRef bucket, bool observation,
+                                bool mutation) {
+    witness.hasCounterEvents = true;
+    rememberEvent(event);
+    if (observation)
+      ++witness.counterObservationCount;
+    if (mutation)
+      ++witness.counterMutationCount;
+    if (event.expectedBValue) {
+      witness.hasExpectedBValues = true;
+      ++witness.expectedBValueCount;
+      appendSig(witness.suffixValueSignature,
+                llvm::formatv("{0}:expected={1}", bucket,
+                              FormatWitnessTraceHash(*event.expectedBValue))
+                    .str());
+    } else {
+      witness.hasMissingExpectedBValues = true;
+      ++witness.missingExpectedBValueCount;
+    }
+    appendSig(witness.consumptionSignature,
+              llvm::formatv("{0}:{1}", bucket,
+                            FormatCounterEventForWitness(event))
+                  .str());
+  };
+
+  auto collectFacts = [&](const OwnerStateFacts &facts, llvm::StringRef bucket,
+                          bool observation, bool mutation) {
+    for (const CounterEventIdentity &event : facts.counterEvents)
+      recordCounterEvent(event, bucket, observation, mutation);
+    for (const MissingStateFact &fact : facts.missingStateFacts) {
+      if (fact.kind == MissingStateFactKind::MissingCounterFacts) {
+        witness.hasMissingExpectedBValues = true;
+        appendSig(witness.suffixObserverSignature,
+                  llvm::formatv("{0}:missing-counter-facts:{1}", bucket,
+                                FormatWitnessTraceHash(fact.detail))
+                      .str());
+      }
+    }
+  };
+
+  auto collectDelta = [&](const OwnerStateDelta &delta, llvm::StringRef bucket) {
+    collectFacts(delta.Entry, llvm::formatv("{0}.entry", bucket).str(),
+                 /*observation=*/true, /*mutation=*/false);
+    collectFacts(delta.Observes, llvm::formatv("{0}.observes", bucket).str(),
+                 /*observation=*/true, /*mutation=*/false);
+    collectFacts(delta.Mutates, llvm::formatv("{0}.mutates", bucket).str(),
+                 /*observation=*/false, /*mutation=*/true);
+    collectFacts(delta.Exit, llvm::formatv("{0}.exit", bucket).str(),
+                 /*observation=*/false, /*mutation=*/true);
+  };
+
+  auto recordSuffixWitness = [&](const SuffixStabilityWitness &suffix,
+                                 llvm::StringRef bucket) {
+    if (!SuffixStabilityWitnessNamesComponent(suffix,
+                                              OwnerStateComponent::Counter))
+      return;
+
+    witness.suffixStateStable =
+        suffix.kind != SuffixStabilityWitnessKind::TerminalStateFailure &&
+        suffix.kind != SuffixStabilityWitnessKind::None;
+    if (suffix.kind == SuffixStabilityWitnessKind::SuffixUnobserved)
+      witness.suffixUnobserved = true;
+    if (suffix.kind == SuffixStabilityWitnessKind::Literalization)
+      witness.literalizationStable = true;
+    if (suffix.kind == SuffixStabilityWitnessKind::OwnerMaterialization)
+      witness.materializationStable = true;
+    if (suffix.kind == SuffixStabilityWitnessKind::ClosureWidening)
+      witness.coversAllAffectedObservers = true;
+
+    ++witness.preservedSuffixObserverCount;
+    appendSig(witness.suffixObserverSignature,
+              llvm::formatv("{0}:suffix={1}:component={2}", bucket,
+                            toString(suffix.kind),
+                            toString(ComponentNamedBySuffixStabilityWitness(
+                                suffix)))
+                  .str());
+  };
+
+  if (summary.hasSuffixStabilityWitness)
+    recordSuffixWitness(summary.suffixStabilityWitness, "summary");
+
+  if (summary.hasOwnerRealizationWitness) {
+    const OwnerRealizationWitness &owner = summary.ownerRealizationWitness;
+    collectDelta(owner.closure.stateIn, "owner.state_in");
+    collectDelta(owner.closure.stateOut, "owner.state_out");
+    if (owner.closure.observers.observesCounter) {
+      witness.observesCounter = true;
+      ++witness.preservedSuffixObserverCount;
+      appendSig(witness.suffixObserverSignature,
+                "owner.closure.observes-counter");
+    }
+    for (const SuffixStabilityWitness &suffix : owner.stateWitnesses)
+      recordSuffixWitness(suffix, "owner.state_witness");
+  }
+
+  if (summary.hasMixedOwnerTilingWitness) {
+    const MixedOwnerTilingWitness &tiling = summary.mixedOwnerTilingWitness;
+    for (const MixedOwnerTilingSegmentWitness &segment : tiling.segments) {
+      collectDelta(segment.ownerTransitionProof.before,
+                   llvm::formatv("mixed.segment{0}.before",
+                                 segment.segmentIndex)
+                       .str());
+      collectDelta(segment.ownerTransitionProof.after,
+                   llvm::formatv("mixed.segment{0}.after",
+                                 segment.segmentIndex)
+                       .str());
+      for (const SuffixStabilityWitness &suffix :
+           segment.ownerTransitionProof.suffixWitnesses)
+        recordSuffixWitness(
+            suffix,
+            llvm::formatv("mixed.segment{0}.suffix", segment.segmentIndex)
+                .str());
+    }
+  }
+
+  if (candidate.proofSummary.inventory.currentPath ==
+      AcceptedPathKind::MacroCounterLiteral) {
+    witness.suffixStateStable =
+        witness.suffixStateStable || summary.hasSuffixStabilityWitness;
+    if (summary.hasSuffixStabilityWitness) {
+      witness.literalizationStable =
+          witness.literalizationStable ||
+          summary.suffixStabilityWitness.kind ==
+              SuffixStabilityWitnessKind::Literalization;
+      witness.materializationStable =
+          witness.materializationStable ||
+          summary.suffixStabilityWitness.kind ==
+              SuffixStabilityWitnessKind::OwnerMaterialization;
+    }
+    appendSig(witness.suffixObserverSignature, "macro-counter-literal-path");
+  }
+
+  if (candidate.hasZeroTokenBoundaryWitness && candidate.zeroTokenCounterStable)
+    appendSig(witness.suffixObserverSignature, "zero-token-counter-stable");
+
+  if (!orderedEvents.empty()) {
+    witness.counterConsumptionCount =
+        static_cast<uint32_t>(orderedEvents.size());
+    witness.counterOrderKnown = true;
+    for (const CounterEventIdentity &event : orderedEvents)
+      appendSig(witness.orderSignature,
+                llvm::formatv("ordinal={0}:macro={1}:A=[{2},{3})",
+                              event.occurrenceOrdinal, event.macroInvocationId,
+                              event.aTokenBegin, event.aTokenEnd)
+                    .str());
+  } else if (!witness.orderSignature.empty()) {
+    witness.counterOrderKnown = true;
+  }
+
+  // A suffix value is known only when every recorded event carries an expected
+  // B value.  Absence of typed counter events means the candidate may still be
+  // counter-stable through an existing suffix witness, but it must not merge
+  // with a value-specific counter witness.
+  if (witness.hasCounterEvents)
+    witness.hasMissingExpectedBValues =
+        witness.hasMissingExpectedBValues ||
+        witness.expectedBValueCount != witness.counterConsumptionCount;
+
+  if (witness.suffixStateStable && !witness.observesCounter &&
+      witness.preservedSuffixObserverCount == 0)
+    witness.suffixUnobserved = true;
+
+  if (witness.Empty())
+    return;
+
+  candidate.hasCounterStateWitness = true;
+  candidate.counterStateWitness = std::move(witness);
+}
+
+RefoldEngine::WitnessEquivalenceKey RefoldEngine::BuildWitnessEquivalenceKey(
+    const AcceptedResultCandidate &candidate) const {
+  WitnessEquivalenceKey key;
+  const ProofSummary &summary = candidate.proofSummary;
+  const AcceptedPathKind path = summary.inventory.currentPath;
+
+  auto knownHash = [&](llvm::StringRef label, llvm::StringRef text) {
+    return WitnessEquivalenceDimension::Known(
+        llvm::formatv("{0}:{1}", label, FormatWitnessTraceHash(text)).str());
+  };
+
+  auto knownRangeHash = [&](llvm::StringRef label, uint64_t begin,
+                            uint64_t end) {
+    return WitnessEquivalenceDimension::Known(
+        llvm::formatv("{0}:[{1},{2}):{3}", label, begin, end,
+                      FormatWitnessTraceHash(SliceBSource(begin, end)))
+            .str());
+  };
+
+  // Phase 1 keeps the target-preprocessed-token dimension conservative.  It is
+  // known only when an accepted proof already carries a B-token envelope or a
+  // zero-token B anchor.  Source-spelling previews are intentionally not treated
+  // as token-stream proof, because later resolver phases must not merge two
+  // witnesses by comparing edited source bytes in place of produced PP tokens.
+  if (candidate.hasTargetBTokenRange &&
+      candidate.targetBTokStart <= candidate.targetBTokEnd &&
+      candidate.targetBTokEnd <= bToks_.size()) {
+    const char *label =
+        candidate.hasZeroTokenBoundaryWitness &&
+                !candidate.hasGeneratedCalleeReplayWitness &&
+                !candidate.hasVariadicCommaWitness &&
+                !candidate.hasTokenPasteWitness &&
+                !candidate.hasStringificationWitness
+            ? "zero_token_b_tokens"
+            : (candidate.hasGeneratedCalleeReplayWitness
+                   ? "generated_callee_b_tokens"
+                   : (candidate.hasVariadicCommaWitness
+                          ? "variadic_b_tokens"
+                          : (candidate.hasTokenPasteWitness
+                                 ? "token_paste_b_tokens"
+                                 : (candidate.hasStringificationWitness
+                                        ? "stringification_b_tokens"
+                                        : (candidate.hasMacroActualRepairWitness
+                                               ? "macro_actual_b_tokens"
+                                               : "candidate_b_tokens")))));
+    key.targetPPTokens = knownRangeHash(
+        label, candidate.targetBTokStart, candidate.targetBTokEnd);
+  } else if (summary.hasOwnerRealizationWitness &&
+      summary.ownerRealizationWitness.closure.IsComplete()) {
+    const OwnerTokenRange bTokens =
+        summary.ownerRealizationWitness.closure.bTokens;
+    key.targetPPTokens = knownRangeHash("b_tokens", bTokens.begin, bTokens.end);
+  } else if (summary.hasMixedOwnerTilingWitness) {
+    const MixedOwnerTilingWitness &tiling = summary.mixedOwnerTilingWitness;
+    if (tiling.originalBStart <= tiling.originalBEnd)
+      key.targetPPTokens =
+          knownRangeHash("mixed_owner_b_tokens", tiling.originalBStart,
+                         tiling.originalBEnd);
+  } else if (summary.hasIncludeAnchorWitness &&
+             summary.includeAnchorWitness.hasFirstPP &&
+             summary.includeAnchorWitness.hasLastPP &&
+             summary.includeAnchorWitness.firstPP <=
+                 summary.includeAnchorWitness.lastPP) {
+    key.targetPPTokens = knownRangeHash(
+        "include_anchor_b_tokens", summary.includeAnchorWitness.firstPP,
+        summary.includeAnchorWitness.lastPP + 1);
+  } else if (summary.hasTUAnchorWitness && summary.tuAnchorWitness.hasPPGap) {
+    key.targetPPTokens = WitnessEquivalenceDimension::Known(
+        llvm::formatv("empty_b_gap:{0}", summary.tuAnchorWitness.ppGap).str());
+  } else if (path == AcceptedPathKind::TerminalEmitEditedPreprocessedStream) {
+    key.targetPPTokens = knownHash("terminal_full_b", bSource_);
+  }
+
+  if (candidate.hasGeneratedCalleeReplayWitness) {
+    key.suffixState = WitnessEquivalenceDimension::Known(
+        llvm::formatv(
+            "generated_callee_replay:root={0}:final_def={1}:depth={2}:"
+            "aliases={3}:chain={4}:replay={5}:mapped={6}:"
+            "decoded_payload_evidence_only={7}",
+            candidate.generatedCalleeRootMacroId,
+            candidate.generatedCalleeFinalDirectiveId,
+            candidate.generatedCalleeDepth,
+            candidate.generatedCalleeObjectAliasHops,
+            candidate.generatedCalleeChainDeterministic ? 1 : 0,
+            candidate.generatedCalleeReplacementReplayValidated ? 1 : 0,
+            candidate.generatedCalleeSolvedActualsMappedToRoot ? 1 : 0,
+            candidate.generatedCalleeDecodedStringLiteralEvidenceOnly ? 1 : 0)
+            .str());
+  } else if (candidate.hasVariadicCommaWitness) {
+    key.suffixState = WitnessEquivalenceDimension::Known(
+        llvm::formatv(
+            "variadic:root={0}:formal={1}:arity={2}:orig_missing={3}:"
+            "orig_empty={4}:orig_nonempty={5}:result_missing={6}:"
+            "result_empty={7}:result_nonempty={8}:comma_inserted={9}:"
+            "comma_deleted={10}:gnu_elision={11}:vaopt={12}:"
+            "vaopt_orig={13}:vaopt_result={14}:vaopt_comma_ins={15}:"
+            "vaopt_comma_del={16}:producer={17}:pack={18}",
+            candidate.variadicRootMacroId, candidate.variadicFormalIndex,
+            candidate.variadicArityStable ? 1 : 0,
+            candidate.variadicOriginalMissing ? 1 : 0,
+            candidate.variadicOriginalExplicitEmpty ? 1 : 0,
+            candidate.variadicOriginalNonEmpty ? 1 : 0,
+            candidate.variadicResultMissing ? 1 : 0,
+            candidate.variadicResultExplicitEmpty ? 1 : 0,
+            candidate.variadicResultNonEmpty ? 1 : 0,
+            candidate.variadicCommaInserted ? 1 : 0,
+            candidate.variadicCommaDeleted ? 1 : 0,
+            candidate.variadicGnuCommaElision ? 1 : 0,
+            candidate.variadicVaOptPresent ? 1 : 0,
+            candidate.variadicVaOptOriginallyActive ? 1 : 0,
+            candidate.variadicVaOptResultActive ? 1 : 0,
+            candidate.variadicVaOptCommaIntroduced ? 1 : 0,
+            candidate.variadicVaOptCommaDeleted ? 1 : 0,
+            candidate.variadicProducerSignature,
+            candidate.variadicPackStateSignature)
+            .str());
+  } else if (candidate.hasTokenPasteWitness) {
+    key.suffixState = WitnessEquivalenceDimension::Known(
+        llvm::formatv(
+            "token_paste:root={0}:spans={1}:tokens={2}:parts={3}:"
+            "arg_parts={4}:literal_parts={5}:left={6}:right={7}:"
+            "result_validated={8}:diagnostic_safe={9}:producer={10}:result={11}",
+            candidate.tokenPasteRootMacroId, candidate.tokenPasteSpanCount,
+            candidate.tokenPasteTokenCount, candidate.tokenPastePartCount,
+            candidate.tokenPasteArgPartCount,
+            candidate.tokenPasteLiteralPartCount,
+            candidate.tokenPasteHasLeftProducer ? 1 : 0,
+            candidate.tokenPasteHasRightProducer ? 1 : 0,
+            candidate.tokenPasteResultValidated ? 1 : 0,
+            candidate.tokenPasteDiagnosticSafe ? 1 : 0,
+            candidate.tokenPasteProducerSignature,
+            candidate.tokenPasteResultSignature)
+            .str());
+  } else if (candidate.hasStringificationWitness) {
+    key.suffixState = WitnessEquivalenceDimension::Known(
+        llvm::formatv(
+            "stringification:root={0}:spans={1}:args={2}:"
+            "ws_normalized={3}:escaped_stable={4}:producer={5}:payload={6}",
+            candidate.stringificationRootMacroId,
+            candidate.stringificationSpanCount,
+            candidate.stringificationArgCount,
+            candidate.stringificationWhitespaceNormalized ? 1 : 0,
+            candidate.stringificationEscapedSpellingStable ? 1 : 0,
+            candidate.stringificationProducerSignature,
+            candidate.stringificationCanonicalPayloadSignature)
+            .str());
+  } else if (candidate.hasZeroTokenBoundaryWitness) {
+    key.suffixState = WitnessEquivalenceDimension::Known(
+        llvm::formatv(
+            "zero_token:owner={0}:{1}:pp_gap={2}:{3}:anchor={4}:{5}:"
+            "b=[{6},{7}):producer={8}:owner_closed={9}:layout={10}:"
+            "observers={11}:counter={12}:empty_actual={13}:replacement_gap={14}:"
+            "paired={15}:tu_anchor={16}:include_boundary={17}:directive_gap={18}:"
+            "signature={19}",
+            candidate.zeroTokenOwnerKind, candidate.zeroTokenOwnerId,
+            candidate.zeroTokenHasPPGap ? 1 : 0, candidate.zeroTokenPPGap,
+            candidate.zeroTokenHasSourceAnchor ? 1 : 0,
+            candidate.zeroTokenSourceAnchor, candidate.zeroTokenBTokStart,
+            candidate.zeroTokenBTokEnd,
+            candidate.zeroTokenProducerProven ? 1 : 0,
+            candidate.zeroTokenOwnerClosed ? 1 : 0,
+            candidate.zeroTokenLayoutStable ? 1 : 0,
+            candidate.zeroTokenObserversStable ? 1 : 0,
+            candidate.zeroTokenCounterStable ? 1 : 0,
+            candidate.zeroTokenFromEmptyActual ? 1 : 0,
+            candidate.zeroTokenFromReplacementGap ? 1 : 0,
+            candidate.zeroTokenFromPairedInsertion ? 1 : 0,
+            candidate.zeroTokenFromTUAnchor ? 1 : 0,
+            candidate.zeroTokenFromIncludeBoundary ? 1 : 0,
+            candidate.zeroTokenFromDirectiveLayoutGap ? 1 : 0,
+            candidate.zeroTokenBoundarySignature)
+            .str());
+  } else if (candidate.hasMacroActualRepairWitness) {
+    key.suffixState = WitnessEquivalenceDimension::Known(
+        llvm::formatv(
+            "macro_actual_replay:root={0}:whole_envelope={1}:"
+            "definition_tape={2}:arity_stable={3}",
+            candidate.rootMacroId,
+            candidate.macroActualWholeEnvelopeReplayValidated ? 1 : 0,
+            candidate.macroActualDefinitionTapeReplayValidated ? 1 : 0,
+            candidate.macroActualArityStable ? 1 : 0)
+            .str());
+  } else if (summary.hasSuffixStabilityWitness) {
+    const SuffixStabilityWitness &suffix = summary.suffixStabilityWitness;
+    key.suffixState = WitnessEquivalenceDimension::Known(
+        llvm::formatv("suffix_witness:{0}:component={1}",
+                      toString(suffix.kind),
+                      toString(ComponentNamedBySuffixStabilityWitness(suffix)))
+            .str());
+  } else if (summary.hasOwnerRealizationWitness) {
+    const OwnerRealizationWitness &owner = summary.ownerRealizationWitness;
+    if (owner.closure.IsStateNeutral()) {
+      key.suffixState = WitnessEquivalenceDimension::Known(
+          llvm::formatv("owner_realization:evidence={0}:state_neutral",
+                        toString(owner.evidence))
+              .str());
+    } else if (!owner.stateWitnesses.empty()) {
+      std::string stateSummary =
+          llvm::formatv("owner_realization:evidence={0}:state_witnesses={1}",
+                        toString(owner.evidence), owner.stateWitnesses.size())
+              .str();
+      for (const SuffixStabilityWitness &suffix : owner.stateWitnesses)
+        stateSummary +=
+            llvm::formatv(":{0}/{1}", toString(suffix.kind),
+                          toString(ComponentNamedBySuffixStabilityWitness(suffix)))
+                .str();
+      key.suffixState = WitnessEquivalenceDimension::Known(stateSummary);
+    } else {
+      key.suffixState = WitnessEquivalenceDimension::Unknown(
+          "owner-realization-state-delta-not-summarized");
+    }
+  } else if (summary.hasMixedOwnerTilingWitness &&
+             summary.mixedOwnerTilingWitness.stateSummariesComposed) {
+    const MixedOwnerTilingWitness &tiling = summary.mixedOwnerTilingWitness;
+    key.suffixState = WitnessEquivalenceDimension::Known(
+        llvm::formatv("mixed_owner_composed:id={0}:segments={1}:state_gaps={2}",
+                      tiling.witnessId, tiling.tokenSegmentCount,
+                      tiling.stateGapCount)
+            .str());
+  }
+
+  if (candidate.hasLineControlObserverWitness) {
+    const LineControlObserverWitness &line =
+        candidate.lineControlObserverWitness;
+    const std::string stateValue =
+        llvm::formatv(
+            "line_control_state:events={0}:active={1}:inactive={2}:"
+            "producer={3}:missing_operands={4}:unknown_operands={5}:"
+            "source_directives={6}:producer_directives={7}:"
+            "include_return={8}:synthetic_resync={9}:state={10}:layout={11}",
+            line.lineControlEventCount, line.activeLineControlEventCount,
+            line.inactiveLineControlEventCount,
+            line.producerProvenLineControlEventCount,
+            line.missingOperandLineControlEventCount,
+            line.unknownOperandLineControlEventCount,
+            line.sourceAuthoredLineDirectiveCount,
+            line.producerEmittedLineDirectiveCount,
+            line.includeReturnResyncCount, line.syntheticResyncCount,
+            FormatWitnessTraceHash(line.stateSignature),
+            FormatWitnessTraceHash(line.layoutSignature))
+            .str();
+
+    if (key.suffixState.known) {
+      key.suffixState = WitnessEquivalenceDimension::Known(
+          llvm::formatv("{0}|{1}", key.suffixState.value, stateValue).str());
+    } else if (line.hasSourceLineControlState ||
+               line.hasSuffixLineControlDischarge) {
+      key.suffixState = WitnessEquivalenceDimension::Unknown(
+          llvm::formatv("line-control-suffix-state-partial:{0}",
+                        FormatWitnessTraceHash(stateValue))
+              .str());
+    }
+  }
+
+  if (candidate.hasGeneratedCalleeReplayWitness) {
+    key.preservedObservers = WitnessEquivalenceDimension::Known(
+        llvm::formatv(
+            "generated_callee_replay:root={0}:final_def={1}:target=[{2},{3}):"
+            "reexpanded-target-pp",
+            candidate.generatedCalleeRootMacroId,
+            candidate.generatedCalleeFinalDirectiveId,
+            candidate.targetBTokStart, candidate.targetBTokEnd)
+            .str());
+  } else if (candidate.hasVariadicCommaWitness) {
+    key.preservedObservers = WitnessEquivalenceDimension::Known(
+        llvm::formatv(
+            "variadic:root={0}:target=[{1},{2}):formal={3}:"
+            "missing={4}:empty={5}:nonempty={6}:literal_comma={7}:"
+            "vaopt_result={8}:vaopt_included={9}:reexpanded-target-pp",
+            candidate.variadicRootMacroId, candidate.targetBTokStart,
+            candidate.targetBTokEnd, candidate.variadicFormalIndex,
+            candidate.variadicResultMissing ? 1 : 0,
+            candidate.variadicResultExplicitEmpty ? 1 : 0,
+            candidate.variadicResultNonEmpty ? 1 : 0,
+            candidate.variadicLiteralCommaInActual ? 1 : 0,
+            candidate.variadicVaOptResultActive ? 1 : 0,
+            candidate.variadicVaOptIncludedCount)
+            .str());
+  } else if (candidate.hasTokenPasteWitness) {
+    key.preservedObservers = WitnessEquivalenceDimension::Known(
+        llvm::formatv(
+            "token_paste:root={0}:target=[{1},{2}):"
+            "valid-token-formation={3}:diagnostic-safe={4}:result={5}",
+            candidate.tokenPasteRootMacroId, candidate.targetBTokStart,
+            candidate.targetBTokEnd,
+            candidate.tokenPasteResultValidated ? 1 : 0,
+            candidate.tokenPasteDiagnosticSafe ? 1 : 0,
+            candidate.tokenPasteResultSignature)
+            .str());
+  } else if (candidate.hasStringificationWitness) {
+    key.preservedObservers = WitnessEquivalenceDimension::Known(
+        llvm::formatv(
+            "stringification:root={0}:target=[{1},{2}):"
+            "escaped-spelling={3}:whitespace={4}:payload={5}",
+            candidate.stringificationRootMacroId, candidate.targetBTokStart,
+            candidate.targetBTokEnd,
+            candidate.stringificationEscapedSpellingStable ? 1 : 0,
+            candidate.stringificationWhitespaceNormalized ? 1 : 0,
+            candidate.stringificationCanonicalPayloadSignature)
+            .str());
+  } else if (candidate.hasZeroTokenBoundaryWitness) {
+    key.preservedObservers = WitnessEquivalenceDimension::Known(
+        llvm::formatv(
+            "zero_token:owner={0}:{1}:target=[{2},{3}):pp_gap={4}:{5}:"
+            "source_anchor={6}:{7}:layout={8}:observers={9}:counter={10}:"
+            "boundary={11}",
+            candidate.zeroTokenOwnerKind, candidate.zeroTokenOwnerId,
+            candidate.zeroTokenBTokStart, candidate.zeroTokenBTokEnd,
+            candidate.zeroTokenHasPPGap ? 1 : 0, candidate.zeroTokenPPGap,
+            candidate.zeroTokenHasSourceAnchor ? 1 : 0,
+            candidate.zeroTokenSourceAnchor,
+            candidate.zeroTokenLayoutStable ? 1 : 0,
+            candidate.zeroTokenObserversStable ? 1 : 0,
+            candidate.zeroTokenCounterStable ? 1 : 0,
+            candidate.zeroTokenBoundarySignature)
+            .str());
+  } else if (candidate.hasMacroActualRepairWitness) {
+    key.preservedObservers = WitnessEquivalenceDimension::Known(
+        llvm::formatv(
+            "macro_actual_replay:root={0}:target=[{1},{2}):"
+            "reexpanded-target-pp",
+            candidate.rootMacroId, candidate.targetBTokStart,
+            candidate.targetBTokEnd)
+            .str());
+  } else if (summary.hasTUAnchorWitness) {
+    const TUAnchorWitness &w = summary.tuAnchorWitness;
+    key.preservedObservers = WitnessEquivalenceDimension::Known(
+        llvm::formatv(
+            "tu_anchor:evidence={0}:pp_gap={1}:{2}:tu_byte={3}:{4}:"
+            "slot={5}:{6}:macro={7}:left={8}:{9}:right={10}:{11}:"
+            "outside_include={12}:owner_depth_stable={13}",
+            toString(w.evidence), w.hasPPGap, w.ppGap, w.hasTUByte,
+            w.tuByte, w.slotId, w.slotKind, w.macroId, w.hasLeftNeighbor,
+            w.leftNeighborPP, w.hasRightNeighbor, w.rightNeighborPP,
+            w.outsideIncludeCoverage, w.ownerDepthStable)
+            .str());
+  } else if (summary.hasIncludeAnchorWitness) {
+    const IncludeAnchorWitness &w = summary.includeAnchorWitness;
+    key.preservedObservers = WitnessEquivalenceDimension::Known(
+        llvm::formatv(
+            "include_anchor:evidence={0}:anchor={1}:{2}:range={3}:[{4},{5}):"
+            "pp_first={6}:{7}:pp_last={8}:{9}:neighbor={10}:{11}:"
+            "cond={12}:{13}:child={14}:{15}:decl={16}:[{17},{18})",
+            toString(w.evidence), w.hasAnchorByte, w.anchorByte,
+            w.hasByteRange, w.startByte, w.endByte, w.hasFirstPP,
+            w.firstPP, w.hasLastPP, w.lastPP, w.hasNeighborPP,
+            w.neighborPP, w.hasCondArmId, w.condArmId,
+            w.hasChildIncludeId, w.childIncludeId, w.hasDeclHeaderRange,
+            w.declHeaderB, w.declHeaderE)
+            .str());
+  } else if (summary.hasOwnerRealizationWitness) {
+    const OwnerObserverSummary &observers =
+        summary.ownerRealizationWitness.closure.observers;
+    key.preservedObservers = WitnessEquivalenceDimension::Known(
+        llvm::formatv(
+            "owner_observers:macro={0}:defined={1}:cond={2}:line={3}:"
+            "file={4}:filename={5}:counter={6}:pragma={7}:include_guard={8}:"
+            "include={9}",
+            observers.observesMacroExpansion,
+            observers.observesDefinedOperator,
+            observers.observesConditionalEvaluation,
+            observers.observesLineNumber, observers.observesFileState,
+            observers.observesFileName, observers.observesCounter,
+            observers.observesPragmaState,
+            observers.observesIncludeGuardState, observers.observesIncludeState)
+            .str());
+  } else if (summary.hasSuffixStabilityWitness) {
+    const SuffixStabilityWitness &suffix = summary.suffixStabilityWitness;
+    key.preservedObservers = WitnessEquivalenceDimension::Known(
+        llvm::formatv("suffix_observer_discharge:{0}:component={1}",
+                      toString(suffix.kind),
+                      toString(ComponentNamedBySuffixStabilityWitness(suffix)))
+            .str());
+  }
+
+  if (candidate.hasLineControlObserverWitness) {
+    const LineControlObserverWitness &line =
+        candidate.lineControlObserverWitness;
+    const std::string observerValue =
+        llvm::formatv(
+            "line_control_observers:line={0}:file={1}:filename={2}:"
+            "builtin={3}:builtin_line={4}:builtin_file={5}:"
+            "builtin_filename={6}:suffix_discharge={7}:"
+            "obs={8}:layout={9}",
+            line.observesLineNumber ? 1 : 0,
+            line.observesFileState ? 1 : 0,
+            line.observesFileName ? 1 : 0,
+            line.builtinLocationObservationCount,
+            line.builtinLineObservationCount,
+            line.builtinFileObservationCount,
+            line.builtinFileNameObservationCount,
+            line.hasSuffixLineControlDischarge ? 1 : 0,
+            FormatWitnessTraceHash(line.observerSignature),
+            FormatWitnessTraceHash(line.layoutSignature))
+            .str();
+
+    if (key.preservedObservers.known) {
+      key.preservedObservers = WitnessEquivalenceDimension::Known(
+          llvm::formatv("{0}|{1}", key.preservedObservers.value,
+                        observerValue)
+              .str());
+    } else {
+      key.preservedObservers =
+          WitnessEquivalenceDimension::Known(observerValue);
+    }
+  }
+
+  if (candidate.hasCounterStateWitness) {
+    const CounterStateWitness &counter = candidate.counterStateWitness;
+    const std::string value =
+        llvm::formatv(
+            "counter_state:consumes={0}:order_known={1}:observations={2}:"
+            "mutations={3}:suffix_observers={4}:suffix_stable={5}:"
+            "covers_all={6}:literalized={7}:materialized={8}:"
+            "suffix_unobserved={9}:expected_values={10}:missing_values={11}:"
+            "order={12}:values={13}:observers={14}",
+            counter.counterConsumptionCount,
+            counter.counterOrderKnown ? 1 : 0,
+            counter.counterObservationCount, counter.counterMutationCount,
+            counter.preservedSuffixObserverCount,
+            counter.suffixStateStable ? 1 : 0,
+            counter.coversAllAffectedObservers ? 1 : 0,
+            counter.literalizationStable ? 1 : 0,
+            counter.materializationStable ? 1 : 0,
+            counter.suffixUnobserved ? 1 : 0,
+            counter.expectedBValueCount, counter.missingExpectedBValueCount,
+            FormatWitnessTraceHash(counter.orderSignature),
+            FormatWitnessTraceHash(counter.suffixValueSignature),
+            FormatWitnessTraceHash(counter.suffixObserverSignature))
+            .str();
+    key.counterState = WitnessEquivalenceDimension::Known(value);
+  } else if (candidate.hasGeneratedCalleeReplayWitness) {
+    key.counterState = WitnessEquivalenceDimension::Known(
+        llvm::formatv("generated_callee_replay:root={0}:counter-stable",
+                      candidate.generatedCalleeRootMacroId)
+            .str());
+  } else if (candidate.hasVariadicCommaWitness) {
+    key.counterState = WitnessEquivalenceDimension::Known(
+        llvm::formatv("variadic:root={0}:counter-stable",
+                      candidate.variadicRootMacroId)
+            .str());
+  } else if (candidate.hasTokenPasteWitness) {
+    key.counterState = WitnessEquivalenceDimension::Known(
+        llvm::formatv("token_paste:root={0}:counter-stable",
+                      candidate.tokenPasteRootMacroId)
+            .str());
+  } else if (candidate.hasStringificationWitness) {
+    key.counterState = WitnessEquivalenceDimension::Known(
+        llvm::formatv("stringification:root={0}:counter-stable",
+                      candidate.stringificationRootMacroId)
+            .str());
+  } else if (candidate.hasZeroTokenBoundaryWitness) {
+    key.counterState = candidate.zeroTokenCounterStable
+                           ? WitnessEquivalenceDimension::Known(
+                                 llvm::formatv("zero_token:owner={0}:{1}:counter-stable",
+                                               candidate.zeroTokenOwnerKind,
+                                               candidate.zeroTokenOwnerId)
+                                     .str())
+                           : WitnessEquivalenceDimension::Unknown(
+                                 "zero-token-counter-stability-not-proven");
+  } else if (candidate.hasMacroActualRepairWitness) {
+    key.counterState = WitnessEquivalenceDimension::Known(
+        llvm::formatv("macro_actual_replay:root={0}:counter-stable",
+                      candidate.rootMacroId)
+            .str());
+  } else if (path == AcceptedPathKind::MacroCounterLiteral) {
+    key.counterState = summary.hasSuffixStabilityWitness
+                           ? WitnessEquivalenceDimension::Known(
+                                 "counter_literalized_with_suffix_stability")
+                           : WitnessEquivalenceDimension::Unknown(
+                                 "counter-literal-without-suffix-witness");
+  } else if (summary.hasOwnerRealizationWitness &&
+             summary.ownerRealizationWitness.closure.IsComplete() &&
+             !summary.ownerRealizationWitness.closure.observers
+                  .observesCounter) {
+    key.counterState = WitnessEquivalenceDimension::Known(
+        "owner-realization-no-preserved-counter-observer");
+  }
+
+  if (candidate.hasGeneratedCalleeReplayWitness) {
+    WitnessProducerKindSet producers;
+    producers.Add(WitnessProducerKind::GeneratedCallee);
+    if (candidate.generatedCalleeUsesForwarding)
+      producers.Add(WitnessProducerKind::Forward);
+    if (candidate.generatedCalleeUsesStringification)
+      producers.Add(WitnessProducerKind::Stringify);
+    if (candidate.generatedCalleeUsesPaste) {
+      producers.Add(WitnessProducerKind::PasteLeft);
+      producers.Add(WitnessProducerKind::PasteRight);
+      producers.Add(WitnessProducerKind::PasteResult);
+    }
+    if (candidate.generatedCalleeUsesVariadicForwarding)
+      producers.Add(WitnessProducerKind::VariadicForward);
+    if (candidate.generatedCalleeUsesObjectAlias)
+      producers.Add(WitnessProducerKind::ObjectAlias);
+    if (candidate.hasZeroTokenBoundaryWitness)
+      producers.Add(WitnessProducerKind::ZeroTokenAnchor);
+    key.producerKinds = std::move(producers);
+  } else if (candidate.hasVariadicCommaWitness) {
+    WitnessProducerKindSet producers;
+    producers.Add(WitnessProducerKind::Forward);
+    producers.Add(WitnessProducerKind::VariadicForward);
+    if (candidate.variadicResultMissing)
+      producers.Add(WitnessProducerKind::VariadicMissing);
+    if (candidate.variadicResultExplicitEmpty)
+      producers.Add(WitnessProducerKind::VariadicEmpty);
+    if (candidate.variadicCommaInserted ||
+        candidate.variadicVaOptCommaIntroduced)
+      producers.Add(WitnessProducerKind::VariadicCommaInsertion);
+    if (candidate.variadicCommaDeleted || candidate.variadicGnuCommaElision ||
+        candidate.variadicVaOptCommaDeleted)
+      producers.Add(WitnessProducerKind::VariadicCommaElision);
+    if (candidate.variadicVaOptPresent) {
+      if (candidate.variadicVaOptResultActive)
+        producers.Add(WitnessProducerKind::VaOptActivation);
+      else
+        producers.Add(WitnessProducerKind::VaOptErasure);
+    }
+    if (candidate.hasZeroTokenBoundaryWitness)
+      producers.Add(WitnessProducerKind::ZeroTokenAnchor);
+    key.producerKinds = std::move(producers);
+  } else if (candidate.hasStringificationWitness ||
+             candidate.hasTokenPasteWitness) {
+    WitnessProducerKindSet producers;
+    if (candidate.hasStringificationWitness)
+      producers.Add(WitnessProducerKind::Stringify);
+    if (candidate.hasTokenPasteWitness) {
+      if (candidate.tokenPasteHasLeftProducer)
+        producers.Add(WitnessProducerKind::PasteLeft);
+      if (candidate.tokenPasteHasRightProducer)
+        producers.Add(WitnessProducerKind::PasteRight);
+      producers.Add(WitnessProducerKind::PasteResult);
+    }
+    if (candidate.hasZeroTokenBoundaryWitness)
+      producers.Add(WitnessProducerKind::ZeroTokenAnchor);
+    key.producerKinds = std::move(producers);
+  } else if (candidate.hasZeroTokenBoundaryWitness) {
+    WitnessProducerKindSet producers;
+    producers.Add(WitnessProducerKind::Forward);
+    producers.Add(WitnessProducerKind::ZeroTokenAnchor);
+    key.producerKinds = std::move(producers);
+  } else {
+    key.producerKinds = WitnessProducerKindSet::KnownSingle(
+        WitnessProducerKindForAcceptedPath(path));
+  }
+
+  if (candidate.hasLineControlObserverWitness && key.producerKinds.known) {
+    const LineControlObserverWitness &line =
+        candidate.lineControlObserverWitness;
+    if (line.lineControlEventCount || line.sourceAuthoredLineDirectiveCount ||
+        line.producerEmittedLineDirectiveCount)
+      key.producerKinds.Add(WitnessProducerKind::DirectiveMaterialization);
+    if (line.builtinLocationObservationCount)
+      key.producerKinds.Add(WitnessProducerKind::BuiltinMaterialization);
+  }
+
+  if (candidate.hasCounterStateWitness && key.producerKinds.known) {
+    const CounterStateWitness &counter = candidate.counterStateWitness;
+    if (counter.hasCounterEvents || counter.counterConsumptionCount != 0)
+      key.producerKinds.Add(WitnessProducerKind::CounterConsumption);
+    if (counter.literalizationStable || counter.materializationStable ||
+        counter.hasExpectedBValues)
+      key.producerKinds.Add(WitnessProducerKind::BuiltinMaterialization);
+  }
+
+  key.boundaryClass = candidate.hasZeroTokenBoundaryWitness
+                          ? WitnessBoundaryClass::ZeroTokenBoundary
+                          : WitnessBoundaryClassForAcceptedCandidate(candidate);
+
+  if (path == AcceptedPathKind::TerminalEmitEditedPreprocessedStream) {
+    key.diagnosticClass = WitnessDiagnosticClass::TerminalOutOfDomain;
+    key.compositionClass = WitnessCompositionClass::Terminal;
+  } else if (summary.realizationMode == RealizationMode::RealizeEditedSurface) {
+    key.diagnosticClass = WitnessDiagnosticClass::RealizesEditedSurface;
+  } else if (summary.realizationMode ==
+             RealizationMode::PreserveOriginalStructure) {
+    key.diagnosticClass = WitnessDiagnosticClass::PreservesDiagnostics;
+  }
+
+  if (summary.hasMixedOwnerTilingWitness ||
+      summary.theoremClass == TheoremProofClass::MixedOwnerTilingProof)
+    key.compositionClass = WitnessCompositionClass::MixedOwnerTile;
+  else if (summary.hasOwnerRealizationWitness ||
+           summary.theoremClass == TheoremProofClass::OwnerRealizationProof)
+    key.compositionClass = WitnessCompositionClass::OwnerClosed;
+  else if (key.compositionClass == WitnessCompositionClass::Unknown &&
+           candidate.kind != AcceptedResultCandidateKind::Unknown)
+    key.compositionClass = WitnessCompositionClass::LocalOnly;
+
+  return key;
+}
+
+RefoldEngine::WitnessCanonicalCost RefoldEngine::BuildWitnessCanonicalCost(
+    const AcceptedResultCandidate &candidate) const {
+  WitnessCanonicalCost cost;
+  cost.preserveOriginalPenalty = candidate.proofSummary.structurePreserving ? 0 : 1;
+  cost.sourceRangeBytes = candidate.end >= candidate.begin
+                              ? candidate.end - candidate.begin
+                              : 0;
+  cost.ownerBoundaryChangePenalty =
+      candidate.kind == AcceptedResultCandidateKind::TerminalOutOfDomain ? 1 : 0;
+  cost.spellingChangePenalty =
+      candidate.hasPayloadPreview ? candidate.payloadPreview.size() : 0;
+  cost.sourceOrder = candidate.begin;
+  return cost;
+}
+
+RefoldEngine::RefoldWitness RefoldEngine::BuildRefoldWitness(
+    const AcceptedResultCandidate &candidate, llvm::StringRef role,
+    uint64_t witnessId) const {
+  RefoldWitness witness;
+  witness.witnessId = witnessId;
+  witness.family =
+      WitnessFamilyForAcceptedPath(candidate.proofSummary.inventory.currentPath);
+  if (candidate.hasGeneratedCalleeReplayWitness)
+    witness.family = WitnessProofFamily::GeneratedCalleeReplay;
+  else if (candidate.hasVariadicCommaWitness)
+    witness.family = WitnessProofFamily::VariadicComma;
+  else if (candidate.hasTokenPasteWitness)
+    witness.family = WitnessProofFamily::TokenPaste;
+  else if (candidate.hasStringificationWitness)
+    witness.family = WitnessProofFamily::Stringification;
+  else if (candidate.hasZeroTokenBoundaryWitness)
+    witness.family = WitnessProofFamily::ZeroTokenBoundary;
+  if (witness.family == WitnessProofFamily::Unknown &&
+      candidate.kind != AcceptedResultCandidateKind::Unknown)
+    witness.family = WitnessProofFamily::AcceptedResult;
+  if (candidate.hasCounterStateWitness &&
+      (witness.family == WitnessProofFamily::AcceptedResult ||
+       candidate.proofSummary.inventory.currentPath ==
+           AcceptedPathKind::MacroCounterLiteral))
+    witness.family = WitnessProofFamily::CounterState;
+  if (candidate.hasLineControlObserverWitness &&
+      witness.family == WitnessProofFamily::AcceptedResult)
+    witness.family = WitnessProofFamily::LineControlObserver;
+  if ((candidate.proofSummary.hasMixedOwnerTilingWitness ||
+       candidate.proofSummary.theoremClass ==
+           TheoremProofClass::MixedOwnerTilingProof) &&
+      (witness.family == WitnessProofFamily::Unknown ||
+       witness.family == WitnessProofFamily::AcceptedResult ||
+       witness.family == WitnessProofFamily::TUTextEdit ||
+       witness.family == WitnessProofFamily::OwnerRealization))
+    witness.family = WitnessProofFamily::MixedOwnerTiling;
+
+  if (candidate.hasRootMacroId)
+    witness.owner = llvm::formatv("macro#{0}", candidate.rootMacroId).str();
+  else if (candidate.hasOwnerIncludeId)
+    witness.owner = llvm::formatv("include#{0}", candidate.ownerIncludeId).str();
+  else if (candidate.hasAnchorByte)
+    witness.owner = llvm::formatv("anchor@{0}", candidate.anchorByte).str();
+  else
+    witness.owner =
+        llvm::formatv("range=[{0},{1})", candidate.begin, candidate.end)
+            .str();
+
+  witness.detail = llvm::formatv(
+                       "role={0} kind={1} path={2} theorem={3}", role,
+                       candidate.kind, candidate.proofSummary.inventory.currentPath,
+                       candidate.proofSummary.theoremClass)
+                       .str();
+  if (candidate.hasLineControlObserverWitness) {
+    const LineControlObserverWitness &line =
+        candidate.lineControlObserverWitness;
+    witness.detail +=
+        llvm::formatv(" line_control=line:{0}/file:{1}/filename:{2}/"
+                      "events:{3}/builtin:{4}",
+                      line.observesLineNumber ? 1 : 0,
+                      line.observesFileState ? 1 : 0,
+                      line.observesFileName ? 1 : 0,
+                      line.lineControlEventCount,
+                      line.builtinLocationObservationCount)
+            .str();
+  }
+  if (candidate.hasCounterStateWitness) {
+    const CounterStateWitness &counter = candidate.counterStateWitness;
+    witness.detail +=
+        llvm::formatv(" counter=consumes:{0}/order:{1}/suffix:{2}/"
+                      "expected_values:{3}/missing_values:{4}",
+                      counter.counterConsumptionCount,
+                      counter.counterOrderKnown ? 1 : 0,
+                      counter.suffixStateStable ? 1 : 0,
+                      counter.expectedBValueCount,
+                      counter.missingExpectedBValueCount)
+            .str();
+  }
+  witness.key = BuildWitnessEquivalenceKey(candidate);
+  witness.cost = BuildWitnessCanonicalCost(candidate);
+  if (candidate.hasPayloadPreview)
+    witness.payloadPreview = candidate.payloadPreview;
+  return witness;
+}
+
+bool RefoldEngine::IsWitnessTraceEnabled() const {
+  // The witness stream is an explicit proof-audit channel.  It must be silent
+  // during normal refolding, and it must not require the generic --log-level
+  // flag when the audit environment variable is set.  Cache the environment
+  // lookup so hot candidate paths do not repeatedly query process state.
+  static const bool enabled = [] {
+    const char *raw = std::getenv("CLANG_REFOLD_TRACE_WITNESSES");
+    if (raw == nullptr)
+      return false;
+
+    StringRef value(raw);
+    return !(value.empty() || value == "0" ||
+             value.equals_insensitive("false") ||
+             value.equals_insensitive("off") ||
+             value.equals_insensitive("no"));
+  }();
+  return enabled;
+}
+
+
+RefoldEngine::WitnessResolverMode
+RefoldEngine::GetWitnessResolverMode() const {
+  // Phase 11 adds the resolver behind an explicit mode flag.  Leaving the
+  // variable unset, false-like, or unrecognized preserves legacy behavior.
+  // `probe` computes and traces resolver agreement without authority.  `strict`
+  // is authoritative only when ResolveWitnessesForSelection() proves that the
+  // current candidate set is implemented by complete single-class witnesses.
+  static const WitnessResolverMode mode = [] {
+    const char *raw = std::getenv("CLANG_REFOLD_WITNESS_RESOLVER");
+    if (raw == nullptr)
+      return WitnessResolverMode::Off;
+
+    StringRef value(raw);
+    if (value.empty() || value == "0" ||
+        value.equals_insensitive("false") ||
+        value.equals_insensitive("off") ||
+        value.equals_insensitive("no"))
+      return WitnessResolverMode::Off;
+
+    if (value.equals_insensitive("probe") || value == "1" ||
+        value.equals_insensitive("true") ||
+        value.equals_insensitive("yes"))
+      return WitnessResolverMode::Probe;
+
+    if (value.equals_insensitive("strict"))
+      return WitnessResolverMode::Strict;
+
+    return WitnessResolverMode::Off;
+  }();
+  return mode;
+}
+
+static std::string formatOptionalIndex(std::optional<size_t> index) {
+  if (!index)
+    return "none";
+  return llvm::formatv("{0}", *index).str();
+}
+
+RefoldEngine::WitnessFallbackClass
+RefoldEngine::ClassifyTerminalFallbackFailure(
+    const TerminalFallbackProofFailure &failure) {
+  using FailureReason = TerminalFallbackFailureReason;
+  using FallbackClass = WitnessFallbackClass;
+
+  switch (failure.reason) {
+  case FailureReason::NoOwnerClosedCover:
+  case FailureReason::NoTUAnchorForUnresolvedOwner:
+    return FallbackClass::NoOwnerClosedWitness;
+  case FailureReason::AmbiguousMixedOwnerTiling:
+    return FallbackClass::MultipleNonEquivalentWitnessClasses;
+  case FailureReason::NoDeterministicMixedOwnerTiling:
+  case FailureReason::UncomposableEmissionEditSet:
+    return FallbackClass::CompositionFailure;
+  case FailureReason::StateTransitionConsumedAndObserved:
+  case FailureReason::MacroStateNotStabilizable:
+  case FailureReason::IncludeGuardStateNotStabilizable:
+  case FailureReason::ConditionalStateNotStabilizable:
+  case FailureReason::NoCanonicalSuffixOrder:
+    return FallbackClass::UnknownSuffixState;
+  case FailureReason::UnknownPragmaCrossesBoundary:
+  case FailureReason::ReverseSolvedDirectiveRequired:
+    return FallbackClass::UnsupportedDirectiveInteraction;
+  case FailureReason::LineControlStateNotProducerProven:
+    return FallbackClass::LineControlObserverMismatch;
+  case FailureReason::CounterStateNotStabilizable:
+    return FallbackClass::CounterStateMismatch;
+  case FailureReason::MalformedInvocationPreservation:
+    return FallbackClass::InvalidMacroInvocation;
+  case FailureReason::MissingProducerFacts:
+  case FailureReason::UnmappableIncludeBEnvelope:
+  case FailureReason::UndischargedEmissionArtifact:
+    return FallbackClass::UnprovenProducerKind;
+  case FailureReason::ValidationFailure:
+  case FailureReason::TheoremAuditInvariantViolation:
+    return FallbackClass::ValidationFailure;
+  case FailureReason::Unknown:
+  case FailureReason::UnclassifiedTerminalFallback:
+    return FallbackClass::Unknown;
+  }
+  return FallbackClass::Unknown;
+}
+
+RefoldEngine::WitnessFallbackClass RefoldEngine::ClassifyIncompleteWitnessKeys(
+    ArrayRef<std::pair<size_t, RefoldWitness>> witnesses) {
+  using FallbackClass = WitnessFallbackClass;
+
+  bool unknownTargetPP = false;
+  bool unknownSuffix = false;
+  bool unknownObservers = false;
+  bool unknownCounter = false;
+  bool unknownProducer = false;
+  bool unknownBoundary = false;
+  bool unknownDiagnostics = false;
+  bool unknownComposition = false;
+
+  for (const std::pair<size_t, RefoldWitness> &entry : witnesses) {
+    const WitnessEquivalenceKey &key = entry.second.key;
+    unknownTargetPP |= !key.targetPPTokens.known;
+    unknownSuffix |= !key.suffixState.known;
+    unknownObservers |= !key.preservedObservers.known;
+    unknownCounter |= !key.counterState.known;
+    unknownProducer |= !key.producerKinds.known;
+    unknownBoundary |= key.boundaryClass == WitnessBoundaryClass::Unknown;
+    unknownDiagnostics |=
+        key.diagnosticClass == WitnessDiagnosticClass::Unknown;
+    unknownComposition |=
+        key.compositionClass == WitnessCompositionClass::Unknown;
+  }
+
+  // Prefer the first failed theorem obligation that prevents comparing witness
+  // classes.  This ordering is conservative: it does not assert a mismatch; it
+  // states which proof dimension is still missing strongly enough to require
+  // legacy fallback instead of resolver authority.
+  if (unknownBoundary)
+    return FallbackClass::NoOwnerClosedWitness;
+  if (unknownTargetPP)
+    return FallbackClass::UnknownTargetPreprocessedTokens;
+  if (unknownProducer)
+    return FallbackClass::UnprovenProducerKind;
+  if (unknownSuffix)
+    return FallbackClass::UnknownSuffixState;
+  if (unknownObservers)
+    return FallbackClass::LineControlObserverMismatch;
+  if (unknownCounter)
+    return FallbackClass::CounterStateMismatch;
+  if (unknownComposition)
+    return FallbackClass::CompositionFailure;
+  if (unknownDiagnostics)
+    return FallbackClass::ValidationFailure;
+  return FallbackClass::IncompleteWitnessKey;
+}
+
+RefoldEngine::WitnessFallbackClass RefoldEngine::ClassifyResolverFallbackReason(
+    llvm::StringRef reason, const WitnessCompositionDecision &composition) {
+  using FallbackClass = WitnessFallbackClass;
+
+  if (reason.empty() || reason == "<none>")
+    return FallbackClass::Unknown;
+  if (reason == "no-selectable-witness")
+    return FallbackClass::NoSelectableWitness;
+  if (reason == "multiple-non-equivalent-classes")
+    return FallbackClass::MultipleNonEquivalentWitnessClasses;
+  if (reason == "unconverted-proof-family")
+    return FallbackClass::UnconvertedProofFamily;
+  if (reason == "composition-not-proven" ||
+      reason == "composition-incomplete-witness-key" ||
+      reason == "composition-incompatible-terminal-tuple" ||
+      reason == "multiple-non-equivalent-composition-classes" ||
+      composition.failureIsFatal)
+    return FallbackClass::CompositionFailure;
+  if (reason == "incomplete-witness-key")
+    return FallbackClass::IncompleteWitnessKey;
+  if (reason == "single-equivalence-class" ||
+      reason == "single-source-repair-multiple-proof-classes")
+    return FallbackClass::Unknown;
+
+  return FallbackClass::Unknown;
+}
+
+RefoldEngine::WitnessStrictDomainObligation
+RefoldEngine::StrictDomainObligationForFallbackClass(
+    WitnessFallbackClass fallbackClass) {
+  using FallbackClass = WitnessFallbackClass;
+  using Obligation = WitnessStrictDomainObligation;
+
+  switch (fallbackClass) {
+  case FallbackClass::NoOwnerClosedWitness:
+    return Obligation::OwnerClosure;
+  case FallbackClass::MultipleNonEquivalentWitnessClasses:
+    return Obligation::FiniteDeterministicTiling;
+  case FallbackClass::UnknownTargetPreprocessedTokens:
+    return Obligation::TargetPreprocessedTokens;
+  case FallbackClass::UnknownSuffixState:
+    return Obligation::StateEquivalence;
+  case FallbackClass::UnprovenProducerKind:
+    return Obligation::ProducerProvenSourceWitness;
+  case FallbackClass::CounterStateMismatch:
+    return Obligation::CounterEquivalence;
+  case FallbackClass::LineControlObserverMismatch:
+    return Obligation::LineControlObserverEquivalence;
+  case FallbackClass::InvalidMacroInvocation:
+    return Obligation::ValidSourceRepair;
+  case FallbackClass::InvalidPasteResult:
+  case FallbackClass::UnsupportedDirectiveInteraction:
+    return Obligation::ModeledProducerSemantics;
+  case FallbackClass::CompositionFailure:
+    return Obligation::Composition;
+  case FallbackClass::ValidationFailure:
+    return Obligation::FinalValidation;
+  case FallbackClass::UnconvertedProofFamily:
+    return Obligation::ConvertedProofFamily;
+  case FallbackClass::IncompleteWitnessKey:
+    return Obligation::CompleteWitnessKey;
+  case FallbackClass::NoSelectableWitness:
+    return Obligation::ProducerProvenSourceWitness;
+  case FallbackClass::Unknown:
+    return Obligation::Unknown;
+  }
+  return Obligation::Unknown;
+}
+
+RefoldEngine::WitnessStrictDomainDecision
+RefoldEngine::ClassifyStrictDomainForResolver(
+    const WitnessResolverDecision &decision) {
+  using DomainClass = WitnessStrictDomainClass;
+  using FallbackClass = WitnessFallbackClass;
+
+  WitnessStrictDomainDecision result;
+  result.fallbackClass = decision.fallbackClass;
+  result.reason = decision.failureReason;
+
+  if (decision.strictUseResolver && decision.resolverIndex) {
+    result.domainClass = DomainClass::DeclaredInDomain;
+    result.obligation = WitnessStrictDomainObligation::Unknown;
+    if (result.reason.empty())
+      result.reason = "resolver-authoritative-in-domain";
+    return result;
+  }
+
+  if (decision.strictFailClosed || decision.composition.failureIsFatal ||
+      decision.fallbackClass ==
+          FallbackClass::MultipleNonEquivalentWitnessClasses) {
+    result.domainClass = DomainClass::AmbiguousOutOfDomain;
+    result.obligation = StrictDomainObligationForFallbackClass(
+        decision.fallbackClass == FallbackClass::Unknown
+            ? FallbackClass::MultipleNonEquivalentWitnessClasses
+            : decision.fallbackClass);
+    if (result.reason.empty())
+      result.reason = "multiple-non-equivalent-source-repairs";
+    return result;
+  }
+
+  switch (decision.fallbackClass) {
+  case FallbackClass::Unknown:
+    result.domainClass = DomainClass::Unknown;
+    result.obligation = WitnessStrictDomainObligation::Unknown;
+    break;
+  case FallbackClass::NoOwnerClosedWitness:
+  case FallbackClass::InvalidMacroInvocation:
+  case FallbackClass::InvalidPasteResult:
+  case FallbackClass::UnsupportedDirectiveInteraction:
+  case FallbackClass::ValidationFailure:
+    result.domainClass = DomainClass::ExplicitOutOfDomain;
+    result.obligation =
+        StrictDomainObligationForFallbackClass(decision.fallbackClass);
+    break;
+  case FallbackClass::CompositionFailure:
+    if (decision.failureReason ==
+            "multiple-non-equivalent-composition-classes" ||
+        decision.failureReason ==
+            "composition-incompatible-terminal-tuple") {
+      result.domainClass = DomainClass::AmbiguousOutOfDomain;
+    } else {
+      result.domainClass = DomainClass::PotentiallyInDomainMissingProof;
+    }
+    result.obligation =
+        StrictDomainObligationForFallbackClass(decision.fallbackClass);
+    break;
+  case FallbackClass::MultipleNonEquivalentWitnessClasses:
+    result.domainClass = DomainClass::AmbiguousOutOfDomain;
+    result.obligation =
+        StrictDomainObligationForFallbackClass(decision.fallbackClass);
+    break;
+  case FallbackClass::UnknownTargetPreprocessedTokens:
+  case FallbackClass::UnknownSuffixState:
+  case FallbackClass::UnprovenProducerKind:
+  case FallbackClass::CounterStateMismatch:
+  case FallbackClass::LineControlObserverMismatch:
+  case FallbackClass::UnconvertedProofFamily:
+  case FallbackClass::IncompleteWitnessKey:
+  case FallbackClass::NoSelectableWitness:
+    result.domainClass = DomainClass::PotentiallyInDomainMissingProof;
+    result.obligation =
+        StrictDomainObligationForFallbackClass(decision.fallbackClass);
+    break;
+  }
+
+  if (result.reason.empty())
+    result.reason = toString(result.fallbackClass).str();
+  return result;
+}
+
+RefoldEngine::WitnessStrictDomainDecision
+RefoldEngine::ClassifyStrictDomainForTerminalFallback(
+    const TerminalFallbackProofFailure &failure) {
+  using DomainClass = WitnessStrictDomainClass;
+  using FailureReason = TerminalFallbackFailureReason;
+  using FallbackClass = WitnessFallbackClass;
+
+  WitnessStrictDomainDecision result;
+  result.fallbackClass = ClassifyTerminalFallbackFailure(failure);
+  result.obligation = StrictDomainObligationForFallbackClass(result.fallbackClass);
+  result.reason = toString(failure.reason).str();
+
+  switch (failure.reason) {
+  case FailureReason::NoOwnerClosedCover:
+  case FailureReason::NoTUAnchorForUnresolvedOwner:
+  case FailureReason::UnknownPragmaCrossesBoundary:
+  case FailureReason::ReverseSolvedDirectiveRequired:
+  case FailureReason::MalformedInvocationPreservation:
+  case FailureReason::ValidationFailure:
+  case FailureReason::TheoremAuditInvariantViolation:
+    result.domainClass = DomainClass::ExplicitOutOfDomain;
+    break;
+
+  case FailureReason::AmbiguousMixedOwnerTiling:
+    result.domainClass = DomainClass::AmbiguousOutOfDomain;
+    break;
+
+  case FailureReason::NoDeterministicMixedOwnerTiling:
+  case FailureReason::UncomposableEmissionEditSet:
+    result.domainClass = DomainClass::AmbiguousOutOfDomain;
+    break;
+
+  case FailureReason::StateTransitionConsumedAndObserved:
+  case FailureReason::LineControlStateNotProducerProven:
+  case FailureReason::CounterStateNotStabilizable:
+  case FailureReason::MacroStateNotStabilizable:
+  case FailureReason::IncludeGuardStateNotStabilizable:
+  case FailureReason::ConditionalStateNotStabilizable:
+  case FailureReason::MissingProducerFacts:
+  case FailureReason::NoCanonicalSuffixOrder:
+  case FailureReason::UnmappableIncludeBEnvelope:
+  case FailureReason::UndischargedEmissionArtifact:
+    result.domainClass = DomainClass::PotentiallyInDomainMissingProof;
+    break;
+
+  case FailureReason::Unknown:
+  case FailureReason::UnclassifiedTerminalFallback:
+    result.domainClass = DomainClass::Unknown;
+    break;
+  }
+
+  if (result.fallbackClass == FallbackClass::MultipleNonEquivalentWitnessClasses)
+    result.domainClass = DomainClass::AmbiguousOutOfDomain;
+
+  return result;
+}
+
+void RefoldEngine::TraceWitnessStrictDomain(
+    llvm::StringRef role, const WitnessStrictDomainDecision &decision) const {
+  if (!IsWitnessTraceEnabled() && GetWitnessResolverMode() == WitnessResolverMode::Off)
+    return;
+
+  errs() << llvm::formatv(
+      "REFOLD-WITNESS-DOMAIN role={0} domain={1} obligation={2} "
+      "fallback_class={3} reason={4}\n",
+      role, toString(decision.domainClass), toString(decision.obligation),
+      toString(decision.fallbackClass),
+      decision.reason.empty() ? StringRef("<none>") : StringRef(decision.reason));
+}
+
+void RefoldEngine::TraceWitnessResolverDecision(
+    const WitnessResolverDecision &decision) const {
+  // Resolver mode is itself an audit request.  The detailed witness stream still
+  // requires CLANG_REFOLD_TRACE_WITNESSES, but probe/strict mode must always
+  // report the central agreement decision it computed.
+  if (!IsWitnessTraceEnabled() && decision.mode == WitnessResolverMode::Off)
+    return;
+
+  StringRef authority = "legacy";
+  if (decision.mode == WitnessResolverMode::Probe)
+    authority = "probe-only";
+  else if (decision.mode == WitnessResolverMode::Strict &&
+           decision.strictUseResolver)
+    authority = "strict-resolver";
+  else if (decision.mode == WitnessResolverMode::Strict &&
+           decision.strictFailClosed)
+    authority = "strict-fail-closed";
+  else if (decision.mode == WitnessResolverMode::Strict)
+    authority = "strict-fallback-legacy";
+
+  errs() << llvm::formatv(
+      "REFOLD-WITNESS-RESOLVER role={0} mode={1} candidates={2} "
+      "selectable={3} proof_invalid={4} classes={5} complete={6} "
+      "incomplete={7} converted={8} unconverted={9} computed={10} "
+      "implemented={11} authority={12} legacy_index={13} "
+      "resolver_index={14} agreement={15} reason={16} "
+      "fallback_class={17} domain={18}:obligation={19}:reason={20} "
+      "composition={21}:classes={22}:complete={23}:"
+      "incomplete={24}:incompatible={25}:reason={26}\n",
+      decision.role, toString(decision.mode), decision.candidateCount,
+      decision.selectableCount, decision.proofInvalidCount,
+      decision.equivalenceClassCount, decision.completeWitnessCount,
+      decision.incompleteWitnessCount,
+      decision.resolverAuthoritativeWitnessCount,
+      decision.resolverUnconvertedWitnessCount,
+      decision.resolverComputed ? 1 : 0,
+      decision.resolverImplemented ? 1 : 0, authority,
+      formatOptionalIndex(decision.legacyIndex),
+      formatOptionalIndex(decision.resolverIndex),
+      decision.agreement.empty() ? StringRef("<none>")
+                                 : StringRef(decision.agreement),
+      decision.failureReason.empty() ? StringRef("<none>")
+                                     : StringRef(decision.failureReason),
+      toString(decision.fallbackClass),
+      toString(decision.strictDomain.domainClass),
+      toString(decision.strictDomain.obligation),
+      decision.strictDomain.reason.empty() ? StringRef("<none>")
+                                          : StringRef(decision.strictDomain.reason),
+      decision.composition.compatible ? StringRef("compatible")
+                                      : StringRef("not-compatible"),
+      decision.composition.globalClassCount,
+      decision.composition.completeTupleCount,
+      decision.composition.incompleteTupleCount,
+      decision.composition.incompatibleTupleCount,
+      decision.composition.reason.empty() ? StringRef("<none>")
+                                          : StringRef(decision.composition.reason));
+
+  TraceWitnessStrictDomain(decision.role, decision.strictDomain);
+}
+
+void RefoldEngine::TraceWitnessCompositionDecision(
+    llvm::StringRef role, const WitnessCompositionDecision &decision) const {
+  if (!IsWitnessTraceEnabled() && GetWitnessResolverMode() == WitnessResolverMode::Off)
+    return;
+
+  errs() << llvm::formatv(
+      "REFOLD-WITNESS-COMPOSITION role={0} computed={1} tuples={2} "
+      "complete={3} incomplete={4} incompatible={5} classes={6} "
+      "compatible={7} fatal={8} reason={9}\n",
+      role, decision.computed ? 1 : 0, decision.candidateTupleCount,
+      decision.completeTupleCount, decision.incompleteTupleCount,
+      decision.incompatibleTupleCount, decision.globalClassCount,
+      decision.compatible ? 1 : 0, decision.failureIsFatal ? 1 : 0,
+      decision.reason.empty() ? StringRef("<none>")
+                              : StringRef(decision.reason));
+}
+
+RefoldEngine::WitnessCompositionDecision
+RefoldEngine::ResolveWitnessComposition(
+    llvm::StringRef role,
+    ArrayRef<std::pair<size_t, RefoldWitness>> selectableWitnesses,
+    bool hasSingleConcreteRepairIdentity) const {
+  WitnessCompositionDecision decision;
+  decision.computed = true;
+  decision.candidateTupleCount = selectableWitnesses.size();
+
+  if (selectableWitnesses.empty()) {
+    decision.reason = "no-selectable-composition-tuples";
+    TraceWitnessCompositionDecision(role, decision);
+    return decision;
+  }
+
+  std::map<std::string, uint64_t> globalClasses;
+
+  for (const std::pair<size_t, RefoldWitness> &entry : selectableWitnesses) {
+    const RefoldWitness &witness = entry.second;
+    const WitnessEquivalenceKey &key = witness.key;
+
+    if (key.HasUnknownDimensions()) {
+      ++decision.incompleteTupleCount;
+      continue;
+    }
+
+    if (key.compositionClass == WitnessCompositionClass::Unknown) {
+      ++decision.incompleteTupleCount;
+      continue;
+    }
+
+    if (key.compositionClass == WitnessCompositionClass::Terminal) {
+      ++decision.incompatibleTupleCount;
+      continue;
+    }
+
+    ++decision.completeTupleCount;
+
+    // Phase 13 composition is intentionally tuple-level rather than
+    // source-spelling based.  A candidate may be a one-tile local repair or a
+    // durable mixed-owner tiling; in both cases the global composition class is
+    // the ordered target stream plus the suffix/observer/counter state that the
+    // tuple leaves for its neighbors.
+    std::string classKey = llvm::formatv(
+        "target={0}|suffix={1}|observers={2}|counter={3}|boundary={4}|"
+        "diagnostics={5}|composition={6}|producers={7}",
+        key.targetPPTokens.value, key.suffixState.value,
+        key.preservedObservers.value, key.counterState.value,
+        toString(key.boundaryClass), toString(key.diagnosticClass),
+        toString(key.compositionClass), key.producerKinds.ToString())
+        .str();
+    ++globalClasses[classKey];
+  }
+
+  decision.globalClassCount = globalClasses.size();
+
+  if (decision.incompleteTupleCount != 0) {
+    decision.reason = "composition-incomplete-witness-key";
+  } else if (decision.incompatibleTupleCount != 0) {
+    decision.reason = "composition-incompatible-terminal-tuple";
+    decision.failureIsFatal = true;
+  } else if (decision.globalClassCount == 1) {
+    decision.compatible = true;
+    decision.reason = "single-global-composition-class";
+  } else if (hasSingleConcreteRepairIdentity) {
+    decision.compatible = true;
+    decision.reason = "single-source-repair-multiple-composition-classes";
+  } else {
+    decision.reason = "multiple-non-equivalent-composition-classes";
+    decision.failureIsFatal = true;
+  }
+
+  TraceWitnessCompositionDecision(role, decision);
+  return decision;
+}
+
+RefoldEngine::WitnessResolverDecision
+RefoldEngine::ResolveWitnessesForSelection(
+    llvm::StringRef role, size_t candidateCount,
+    llvm::function_ref<bool(size_t)> isSelectable,
+    llvm::function_ref<RefoldWitness(size_t)> buildWitness,
+    llvm::function_ref<bool(size_t, size_t)> canonicalPrefers,
+    std::optional<size_t> legacyIndex) const {
+  WitnessResolverDecision decision;
+  decision.role = role.str();
+  decision.mode = GetWitnessResolverMode();
+  decision.candidateCount = candidateCount;
+  decision.legacyIndex = legacyIndex;
+
+  const bool shouldCompute =
+      IsWitnessTraceEnabled() || decision.mode != WitnessResolverMode::Off;
+  if (!shouldCompute)
+    return decision;
+
+  decision.resolverComputed = true;
+
+  std::map<std::string, SmallVector<size_t, 4>> classes;
+  SmallVector<size_t, 8> selectableIndices;
+  SmallVector<std::pair<size_t, RefoldWitness>, 8> selectableWitnesses;
+
+  // Phase 11 resolves witness *classes*, but a selector can legitimately carry
+  // several complete proof certificates for the same concrete source repair.
+  // For example, a macro invocation containing both # and ## may be certified by
+  // a stringification witness and by a paste witness; those proof keys must stay
+  // distinct, but strict mode must not interpret the duplicate certificate as a
+  // request to abandon the macro-preserving repair.  Track a conservative source
+  // repair identity separately from the semantic proof key so multi-class
+  // proof-certificate ambiguity does not become source-repair ambiguity.
+  std::optional<std::string> commonRepairIdentity;
+  bool hasConcreteRepairIdentity = false;
+  bool singleConcreteRepairIdentity = true;
+
+  auto repairIdentityForWitness = [](const RefoldWitness &witness) {
+    if (witness.payloadPreview.empty())
+      return std::string();
+
+    return llvm::formatv(
+               "owner={0}|source_order={1}|range_bytes={2}|"
+               "arg_boundary={3}|owner_boundary={4}|payload={5}",
+               witness.owner, witness.cost.sourceOrder,
+               witness.cost.sourceRangeBytes,
+               witness.cost.argumentBoundaryChangePenalty,
+               witness.cost.ownerBoundaryChangePenalty,
+               witness.payloadPreview)
+        .str();
+  };
+
+  for (size_t i = 0; i < candidateCount; ++i) {
+    RefoldWitness witness = buildWitness(i);
+    const bool selectable = isSelectable(i);
+    if (!selectable) {
+      ++decision.proofInvalidCount;
+      TraceWitnessRejected(witness, WitnessRejectReason::NotSelectable,
+                           "central witness resolver rejected non-selectable "
+                           "candidate");
+      continue;
+    }
+
+    ++decision.selectableCount;
+    selectableIndices.push_back(i);
+    selectableWitnesses.push_back(std::make_pair(i, witness));
+    if (witness.key.HasUnknownDimensions())
+      ++decision.incompleteWitnessCount;
+    else
+      ++decision.completeWitnessCount;
+
+    if (IsResolverAuthoritativeWitnessFamily(witness.family))
+      ++decision.resolverAuthoritativeWitnessCount;
+    else
+      ++decision.resolverUnconvertedWitnessCount;
+
+    classes[witness.key.PartitionString(witness.witnessId)].push_back(i);
+
+    const std::string repairIdentity = repairIdentityForWitness(witness);
+    if (repairIdentity.empty()) {
+      singleConcreteRepairIdentity = false;
+    } else if (!hasConcreteRepairIdentity) {
+      commonRepairIdentity = repairIdentity;
+      hasConcreteRepairIdentity = true;
+    } else if (*commonRepairIdentity != repairIdentity) {
+      singleConcreteRepairIdentity = false;
+    }
+  }
+
+  decision.equivalenceClassCount = classes.size();
+
+  decision.composition = ResolveWitnessComposition(
+      role, selectableWitnesses,
+      hasConcreteRepairIdentity && singleConcreteRepairIdentity);
+
+  TraceWitnessSelectionProbe(role, candidateCount, decision.selectableCount,
+                             decision.proofInvalidCount,
+                             decision.equivalenceClassCount,
+                             decision.completeWitnessCount,
+                             decision.incompleteWitnessCount);
+  TraceWitnessAmbiguity(role, candidateCount, decision.selectableCount,
+                        decision.equivalenceClassCount);
+
+  if (decision.selectableCount == 0) {
+    decision.failureReason = "no-selectable-witness";
+    decision.fallbackClass = WitnessFallbackClass::NoSelectableWitness;
+  } else if (decision.incompleteWitnessCount != 0) {
+    // Unknown dimensions do not establish equivalence.  Strict mode therefore
+    // falls back to the legacy path for this selector because the proof family
+    // has not yet been fully converted.
+    decision.failureReason = "incomplete-witness-key";
+    decision.fallbackClass = ClassifyIncompleteWitnessKeys(selectableWitnesses);
+  } else if (decision.resolverUnconvertedWitnessCount != 0) {
+    // Phase 12 is an explicit per-family authority migration.  A complete key
+    // is necessary but not sufficient: the witness family must also be listed
+    // in IsResolverAuthoritativeWitnessFamily() so strict mode cannot become
+    // authoritative for an unaudited proof family merely because its trace key
+    // happened to be complete.
+    decision.failureReason = "unconverted-proof-family";
+    decision.fallbackClass = WitnessFallbackClass::UnconvertedProofFamily;
+  } else if (!decision.composition.compatible) {
+    // Phase 13 introduces tuple-level composition as an additional authority
+    // boundary.  Unknown composition facts fall back to legacy; a complete
+    // converted selector that proves multiple non-equivalent global tuples
+    // fails closed.
+    decision.failureReason = decision.composition.reason.empty()
+                                 ? "composition-not-proven"
+                                 : decision.composition.reason;
+    decision.strictFailClosed = decision.composition.failureIsFatal;
+    decision.fallbackClass = WitnessFallbackClass::CompositionFailure;
+  } else if (decision.equivalenceClassCount != 1) {
+    decision.resolverImplemented = true;
+
+    if (hasConcreteRepairIdentity && singleConcreteRepairIdentity) {
+      // Multiple complete proof keys can certify the same emitted source edit.
+      // That is proof-certificate ambiguity, not source-repair ambiguity.  Keep
+      // the semantic classes distinct for tracing, but allow strict mode to use
+      // the concrete repair selected by the legacy selector until Phase 12/13
+      // can compose proof certificates directly.
+      decision.strictUseResolver = true;
+      decision.failureReason =
+          "single-source-repair-multiple-proof-classes";
+      decision.fallbackClass = WitnessFallbackClass::Unknown;
+      if (legacyIndex) {
+        decision.resolverIndex = legacyIndex;
+      } else {
+        for (size_t idx : selectableIndices) {
+          if (!decision.resolverIndex ||
+              canonicalPrefers(idx, *decision.resolverIndex))
+            decision.resolverIndex = idx;
+        }
+      }
+    } else {
+      // All selectable candidates have complete keys, and they describe
+      // different concrete source repairs.  This is the real fail-closed case
+      // for converted selector families.
+      decision.strictFailClosed = true;
+      decision.failureReason = "multiple-non-equivalent-classes";
+      decision.fallbackClass =
+          WitnessFallbackClass::MultipleNonEquivalentWitnessClasses;
+    }
+  } else {
+    decision.resolverImplemented = true;
+    decision.strictUseResolver = true;
+    decision.failureReason = "single-equivalence-class";
+    decision.fallbackClass = WitnessFallbackClass::Unknown;
+
+    for (size_t idx : selectableIndices) {
+      if (!decision.resolverIndex || canonicalPrefers(idx, *decision.resolverIndex))
+        decision.resolverIndex = idx;
+    }
+  }
+
+  if (decision.fallbackClass == WitnessFallbackClass::Unknown &&
+      !decision.failureReason.empty())
+    decision.fallbackClass =
+        ClassifyResolverFallbackReason(decision.failureReason,
+                                       decision.composition);
+
+  if (decision.legacyIndex && decision.resolverIndex)
+    decision.agreement = (*decision.legacyIndex == *decision.resolverIndex)
+                             ? "agree"
+                             : "differ";
+  else if (decision.legacyIndex && !decision.resolverIndex)
+    decision.agreement = "legacy-only";
+  else if (!decision.legacyIndex && decision.resolverIndex)
+    decision.agreement = "resolver-only";
+  else
+    decision.agreement = "neither";
+
+  decision.strictDomain = ClassifyStrictDomainForResolver(decision);
+
+  TraceWitnessResolverDecision(decision);
+  return decision;
+}
+
+void RefoldEngine::TraceWitnessEmitted(const RefoldWitness &witness) const {
+  if (!IsWitnessTraceEnabled())
+    return;
+
+  errs() << llvm::formatv("REFOLD-WITNESS {0}\n", witness.ToString());
+  errs() << llvm::formatv("REFOLD-WITNESS-KEY id={0} {1}\n",
+                          witness.witnessId, witness.key.ToString());
+  errs() << llvm::formatv("REFOLD-WITNESS-COST id={0} {1}\n",
+                          witness.witnessId, witness.cost.ToString());
+  if (!witness.payloadPreview.empty())
+    errs() << llvm::formatv("REFOLD-WITNESS-PAYLOAD id={0} text={1}\n",
+                            witness.witnessId, witness.payloadPreview);
+}
+
+void RefoldEngine::TraceWitnessRejected(const RefoldWitness &witness,
+                                        WitnessRejectReason reason,
+                                        llvm::StringRef detail) const {
+  if (!IsWitnessTraceEnabled())
+    return;
+
+  errs() << llvm::formatv("REFOLD-WITNESS-REJECT id={0} family={1} "
+                          "owner={2} reason={3} detail={4}\n",
+                          witness.witnessId, witness.family, witness.owner,
+                          reason, detail.empty() ? StringRef("<none>")
+                                                 : detail);
+}
+
+void RefoldEngine::TraceWitnessAmbiguity(llvm::StringRef role,
+                                         uint64_t candidateCount,
+                                         uint64_t selectableCount,
+                                         uint64_t ambiguityClassCount) const {
+  if (!IsWitnessTraceEnabled())
+    return;
+
+  errs() << llvm::formatv("REFOLD-WITNESS-AMBIGUITY role={0} "
+                          "candidates={1} selectable={2} classes={3}\n",
+                          role, candidateCount, selectableCount,
+                          ambiguityClassCount);
+}
+
+void RefoldEngine::TraceWitnessSelectionProbe(
+    llvm::StringRef role, uint64_t candidateCount,
+    uint64_t proofValidCount, uint64_t proofInvalidCount,
+    uint64_t equivalenceClassCount, uint64_t completeWitnessCount,
+    uint64_t incompleteWitnessCount) const {
+  if (!IsWitnessTraceEnabled())
+    return;
+
+  StringRef preferenceScope = "no-valid-witness";
+  if (proofValidCount == 1)
+    preferenceScope = "single-valid-witness";
+  else if (proofValidCount > 1 && equivalenceClassCount == 1)
+    preferenceScope = "one-equivalence-class";
+  else if (proofValidCount > 1 && equivalenceClassCount > 1)
+    preferenceScope = "multiple-equivalence-classes";
+
+  errs() << llvm::formatv(
+      "REFOLD-WITNESS-SELECTION role={0} candidates={1} "
+      "proof_valid={2} proof_invalid={3} classes={4} "
+      "complete={5} incomplete={6} preference_scope={7}\n",
+      role, candidateCount, proofValidCount, proofInvalidCount,
+      equivalenceClassCount, completeWitnessCount, incompleteWitnessCount,
+      preferenceScope);
+}
+
+void RefoldEngine::TraceWitnessChosen(const RefoldWitness &witness,
+                                      uint64_t selectedIndex) const {
+  if (!IsWitnessTraceEnabled())
+    return;
+
+  errs() << llvm::formatv("REFOLD-WITNESS-CHOOSE index={0} id={1} "
+                          "family={2} owner={3} cost={4}\n",
+                          selectedIndex, witness.witnessId, witness.family,
+                          witness.owner, witness.cost.ToString());
+}
+
+void RefoldEngine::TraceWitnessFallback(
+    const TerminalFallbackRequest &request) const {
+  if (!IsWitnessTraceEnabled())
+    return;
+
+  const WitnessFallbackClass fallbackClass =
+      ClassifyTerminalFallbackFailure(request.failure);
+  const WitnessStrictDomainDecision domain =
+      ClassifyStrictDomainForTerminalFallback(request.failure);
+
+  errs() << llvm::formatv("REFOLD-WITNESS-FALLBACK reason={0} "
+                          "fallback_class={1} domain={2} obligation={3} "
+                          "domain_reason={4} phase={5} detail={6}\n",
+                          toString(request.failure),
+                          toString(fallbackClass),
+                          toString(domain.domainClass),
+                          toString(domain.obligation),
+                          domain.reason.empty() ? StringRef("<none>")
+                                                : StringRef(domain.reason),
+                          request.phase,
+                          stringutils::showWsWithClip(request.detail, 200));
+  TraceWitnessStrictDomain("TerminalFallback", domain);
+}
+
 
 void RefoldEngine::AttachMixedOwnerTilingWitnessForTokenEnvelope(
     ProofSummary &summary, uint64_t aStart, uint64_t aEnd, uint64_t bStart,
@@ -25433,18 +28102,24 @@ bool RefoldEngine::
              ProofFailureReason::NonTopLevelMacroProofRoot;
 }
 
-bool RefoldEngine::AcceptedResultCandidatePrefers(
+bool RefoldEngine::AcceptedResultCandidateProofPrefers(
     const AcceptedResultCandidate &lhs,
     const AcceptedResultCandidate &rhs) const {
   if (LatticePrefers(lhs.proofSummary, rhs.proofSummary))
     return true;
   if (LatticePrefers(rhs.proofSummary, lhs.proofSummary))
     return false;
+  return false;
+}
 
+bool RefoldEngine::AcceptedResultCandidateCanonicalPrefers(
+    const AcceptedResultCandidate &lhs,
+    const AcceptedResultCandidate &rhs) const {
   // The lattice intentionally stays coarse. When two summaries tie, prefer the
   // candidate that is more specific about the concrete artifact it will emit.
-  // This keeps the converted sites deterministic without reintroducing ad hoc
-  // path-specific ordering logic.
+  // Phase 2 makes this a named canonical preference step rather than a proof
+  // validity test.  It is reached only after both candidates are selectable and
+  // neither proof summary strictly outranks the other.
   if (lhs.kind != rhs.kind)
     return static_cast<uint8_t>(lhs.kind) < static_cast<uint8_t>(rhs.kind);
 
@@ -25471,28 +28146,46 @@ bool RefoldEngine::AcceptedResultCandidatePrefers(
   return false;
 }
 
+bool RefoldEngine::AcceptedResultCandidatePrefers(
+    const AcceptedResultCandidate &lhs,
+    const AcceptedResultCandidate &rhs) const {
+  if (AcceptedResultCandidateProofPrefers(lhs, rhs))
+    return true;
+  if (AcceptedResultCandidateProofPrefers(rhs, lhs))
+    return false;
+  return AcceptedResultCandidateCanonicalPrefers(lhs, rhs);
+}
+
 std::optional<size_t> RefoldEngine::SelectPreferredCandidateIndex(
     size_t candidateCount, function_ref<bool(size_t)> isSelectable,
     function_ref<bool(size_t, size_t)> prefers) const {
-  std::optional<size_t> bestIdx;
-  uint64_t selectableCount = 0;
+  SmallVector<size_t, 8> selectableIndices;
 
-  // Keep all selector flavors on one deterministic loop.  Callers provide only
-  // the admissibility predicate and the strict preference relation, so accepted
-  // emitted artifacts and macro-local selector staging cannot drift in tie
-  // handling or theorem-audit accounting.
-  for (size_t i = 0; i < candidateCount; ++i) {
-    if (!isSelectable(i))
-      continue;
-    ++selectableCount;
+  // Phase 2 keeps this selector behavior-preserving, but it explicitly splits
+  // the two questions that the old loop answered at the same time:
+  //
+  //   1. proof validity: which candidates are selectable at all?
+  //   2. canonical preference: among those already-valid candidates, which
+  //      deterministic representative should the legacy selector choose?
+  //
+  // The preference relation is deliberately never invoked on an invalid
+  // candidate.  Later phases can replace the second step with equivalence-class
+  // canonicalization without changing the validity gate.
+  for (size_t i = 0; i < candidateCount; ++i)
+    if (isSelectable(i))
+      selectableIndices.push_back(i);
+
+  std::optional<size_t> bestIdx;
+  for (size_t idx : selectableIndices) {
     if (!bestIdx) {
-      bestIdx = i;
+      bestIdx = idx;
       continue;
     }
-    if (prefers(i, *bestIdx))
-      bestIdx = i;
+    if (prefers(idx, *bestIdx))
+      bestIdx = idx;
   }
 
+  const uint64_t selectableCount = selectableIndices.size();
   if (selectableCount > 1) {
     ++lastTheoremAudit_.selectorCompetitions;
     if (bestIdx)
@@ -25553,15 +28246,47 @@ bool RefoldEngine::MacroSelectionCandidatePrefers(
 std::optional<RefoldEngine::SelectedMacroSelectionCandidate>
 RefoldEngine::SelectPreferredMacroSelectionCandidate(
     ArrayRef<MacroSelectionCandidate> candidates) const {
-  std::optional<size_t> bestIdx = SelectPreferredCandidateIndex(
-      candidates.size(),
+  auto isSelectable = [&](size_t idx) {
+    return IsSelectableMacroSelectionCandidate(candidates[idx]);
+  };
+  auto prefers = [&](size_t lhsIdx, size_t rhsIdx) {
+    return MacroSelectionCandidatePrefers(candidates[lhsIdx],
+                                          candidates[rhsIdx]);
+  };
+
+  std::optional<size_t> legacyBestIdx = SelectPreferredCandidateIndex(
+      candidates.size(), isSelectable, prefers);
+
+  WitnessResolverDecision resolverDecision = ResolveWitnessesForSelection(
+      "SelectPreferredMacroSelectionCandidate", candidates.size(), isSelectable,
       [&](size_t idx) {
-        return IsSelectableMacroSelectionCandidate(candidates[idx]);
+        return BuildRefoldWitness(candidates[idx].selectorCandidate,
+                                  "SelectPreferredMacroSelectionCandidate",
+                                  idx);
       },
-      [&](size_t lhsIdx, size_t rhsIdx) {
-        return MacroSelectionCandidatePrefers(candidates[lhsIdx],
-                                             candidates[rhsIdx]);
-      });
+      prefers, legacyBestIdx);
+
+  std::optional<size_t> bestIdx = legacyBestIdx;
+  // Preserve the Phase-2 selector-only diagnostic trace that is not part of
+  // the generic resolver validity predicate: a nested selector candidate may
+  // be useful for ranking but still lack an emission-normalized carrier.
+  if (IsWitnessTraceEnabled()) {
+    for (size_t i = 0; i < candidates.size(); ++i) {
+      if (!isSelectable(i) || !candidates[i].selectorOnly ||
+          candidates[i].emittedCandidate)
+        continue;
+      TraceWitnessRejected(
+          BuildRefoldWitness(candidates[i].selectorCandidate,
+                             "SelectPreferredMacroSelectionCandidate", i),
+          WitnessRejectReason::SelectorOnlyNoEmittedCandidate,
+          "selector-only macro witness has no emission-normalized carrier");
+    }
+  }
+
+  if (resolverDecision.ShouldFailClosed())
+    return std::nullopt;
+  if (resolverDecision.ShouldUseResolverIndex())
+    bestIdx = resolverDecision.resolverIndex;
 
   if (!bestIdx)
     return std::nullopt;
@@ -25569,21 +28294,41 @@ RefoldEngine::SelectPreferredMacroSelectionCandidate(
   SelectedMacroSelectionCandidate selected;
   selected.candidate = candidates[*bestIdx];
   selected.index = *bestIdx;
+  TraceWitnessChosen(BuildRefoldWitness(selected.candidate.selectorCandidate,
+                                        "SelectPreferredMacroSelectionCandidate",
+                                        *bestIdx),
+                     *bestIdx);
   return selected;
 }
 
 std::optional<RefoldEngine::SelectedAcceptedResultCandidate>
 RefoldEngine::SelectPreferredAcceptedResultCandidate(
     ArrayRef<AcceptedResultCandidate> candidates) const {
-  std::optional<size_t> bestIdx = SelectPreferredCandidateIndex(
-      candidates.size(),
+  auto isSelectable = [&](size_t idx) {
+    return IsSelectableAcceptedResultCandidate(candidates[idx]);
+  };
+  auto prefers = [&](size_t lhsIdx, size_t rhsIdx) {
+    return AcceptedResultCandidatePrefers(candidates[lhsIdx],
+                                          candidates[rhsIdx]);
+  };
+
+  std::optional<size_t> legacyBestIdx = SelectPreferredCandidateIndex(
+      candidates.size(), isSelectable, prefers);
+
+  WitnessResolverDecision resolverDecision = ResolveWitnessesForSelection(
+      "SelectPreferredAcceptedResultCandidate", candidates.size(), isSelectable,
       [&](size_t idx) {
-        return IsSelectableAcceptedResultCandidate(candidates[idx]);
+        return BuildRefoldWitness(candidates[idx],
+                                  "SelectPreferredAcceptedResultCandidate",
+                                  idx);
       },
-      [&](size_t lhsIdx, size_t rhsIdx) {
-        return AcceptedResultCandidatePrefers(candidates[lhsIdx],
-                                             candidates[rhsIdx]);
-      });
+      prefers, legacyBestIdx);
+
+  std::optional<size_t> bestIdx = legacyBestIdx;
+  if (resolverDecision.ShouldFailClosed())
+    return std::nullopt;
+  if (resolverDecision.ShouldUseResolverIndex())
+    bestIdx = resolverDecision.resolverIndex;
 
   if (!bestIdx)
     return std::nullopt;
@@ -25594,6 +28339,10 @@ RefoldEngine::SelectPreferredAcceptedResultCandidate(
   SelectedAcceptedResultCandidate selected;
   selected.candidate = candidates[*bestIdx];
   selected.index = *bestIdx;
+  TraceWitnessChosen(BuildRefoldWitness(selected.candidate,
+                                        "SelectPreferredAcceptedResultCandidate",
+                                        *bestIdx),
+                     *bestIdx);
   return selected;
 }
 
@@ -25662,6 +28411,325 @@ RefoldEngine::BuildAcceptedMacroCandidate(const MacroPatch &patch) const {
   }
   candidate.begin = patch.invStart;
   candidate.end = patch.invEnd;
+  if (patch.hasMaterializedBTokenRange) {
+    candidate.hasTargetBTokenRange = true;
+    candidate.targetBTokStart = patch.materializedBTokStart;
+    candidate.targetBTokEnd = patch.materializedBTokEnd;
+  }
+
+  const bool isOrdinaryMacroActualRepair =
+      patch.proof.kind == MacroPatchProofKind::ArgsOnlyStandard ||
+      patch.proof.kind == MacroPatchProofKind::ArgsOnlyPairedPureInsertion;
+  const bool macroActualArityStable =
+      patch.proof.proofRootMacroId != 0 &&
+      patch.proof.proofRootMacroId == patch.macroId;
+  if (isOrdinaryMacroActualRepair && patch.proof.wholeEnvelopeReplay &&
+      patch.proof.wholeEnvelopeReplay->replayValidated &&
+      patch.hasMaterializedBTokenRange && macroActualArityStable) {
+    candidate.hasMacroActualRepairWitness = true;
+    candidate.macroActualWholeEnvelopeReplayValidated = true;
+    candidate.macroActualDefinitionTapeReplayValidated =
+        patch.proof.wholeEnvelopeReplay->definitionTapeReplayValidated;
+    candidate.macroActualArityStable = true;
+  }
+
+  if (patch.proof.generatedCalleeReplay &&
+      patch.proof.generatedCalleeReplay->calleeChainDeterministic &&
+      patch.proof.generatedCalleeReplay->replacementReplayValidated &&
+      patch.proof.generatedCalleeReplay->solvedActualsMappedToRoot &&
+      patch.hasMaterializedBTokenRange) {
+    const GeneratedCalleeReplayWitness &w =
+        *patch.proof.generatedCalleeReplay;
+    candidate.hasGeneratedCalleeReplayWitness = true;
+    candidate.generatedCalleeRootMacroId = w.rootMacroId;
+    candidate.generatedCalleeFinalDirectiveId = w.finalDirectiveId;
+    candidate.generatedCalleeDepth = w.generatedCallDepth;
+    candidate.generatedCalleeObjectAliasHops = w.objectAliasHops;
+    candidate.generatedCalleeChainDeterministic =
+        w.calleeChainDeterministic;
+    candidate.generatedCalleeReplacementReplayValidated =
+        w.replacementReplayValidated;
+    candidate.generatedCalleeSolvedActualsMappedToRoot =
+        w.solvedActualsMappedToRoot;
+    candidate.generatedCalleeUsesForwarding = w.usesForwarding;
+    candidate.generatedCalleeUsesStringification =
+        w.usesStringification;
+    candidate.generatedCalleeUsesPaste = w.usesPaste;
+    candidate.generatedCalleeUsesVariadicForwarding =
+        w.usesVariadicForwarding;
+    candidate.generatedCalleeUsesObjectAlias = w.usesObjectAlias;
+    candidate.generatedCalleeDecodedStringLiteralEvidenceOnly =
+        w.decodedStringLiteralEvidenceOnly;
+  }
+
+  if (patch.proof.variadicCommaReplay && patch.hasMaterializedBTokenRange &&
+      patch.proof.preservesInvocationStructure &&
+      !candidate.hasGeneratedCalleeReplayWitness) {
+    const VariadicCommaWitness &w = *patch.proof.variadicCommaReplay;
+    candidate.hasVariadicCommaWitness = true;
+    candidate.variadicRootMacroId = w.rootMacroId;
+    candidate.variadicFormalIndex = w.variadicFormalIndex;
+    candidate.variadicArityStable = w.arityStable;
+    candidate.variadicOriginalMissing = w.originalMissing;
+    candidate.variadicOriginalExplicitEmpty = w.originalExplicitEmpty;
+    candidate.variadicOriginalNonEmpty = w.originalNonEmpty;
+    candidate.variadicResultMissing = w.resultMissing;
+    candidate.variadicResultExplicitEmpty = w.resultExplicitEmpty;
+    candidate.variadicResultNonEmpty = w.resultNonEmpty;
+    candidate.variadicLiteralCommaInActual = w.literalCommaInActual;
+    candidate.variadicCommaInserted = w.commaInserted;
+    candidate.variadicCommaDeleted = w.commaDeleted;
+    candidate.variadicGnuCommaElision = w.gnuCommaElision;
+    candidate.variadicVaOptPresent = w.vaOptPresent;
+    candidate.variadicVaOptOriginallyActive = w.vaOptOriginallyActive;
+    candidate.variadicVaOptResultActive = w.vaOptResultActive;
+    candidate.variadicVaOptCommaIntroduced = w.vaOptCommaIntroduced;
+    candidate.variadicVaOptCommaDeleted = w.vaOptCommaDeleted;
+    candidate.variadicVaOptNodeCount = w.vaOptNodeCount;
+    candidate.variadicVaOptIncludedCount = w.vaOptIncludedCount;
+    candidate.variadicProducerSignature = w.producerSignature;
+    candidate.variadicPackStateSignature = w.packStateSignature;
+  }
+
+  std::optional<ZeroTokenBoundaryWitness> synthesizedZeroTokenBoundary;
+  if (!patch.proof.zeroTokenBoundaryReplay &&
+      patch.proof.kind == MacroPatchProofKind::ArgsOnlyPairedPureInsertion &&
+      patch.hasMaterializedBTokenRange && patch.proof.preservesInvocationStructure) {
+    ZeroTokenBoundaryWitness witness;
+    witness.ownerId = patch.proof.proofRootMacroId ? patch.proof.proofRootMacroId
+                                                   : patch.macroId;
+    witness.ownerKind = "macro";
+    witness.hasSourceAnchor = true;
+    witness.sourceAnchor = patch.invStart;
+    witness.hasBTokenRange = true;
+    witness.bTokStart = patch.materializedBTokStart;
+    witness.bTokEnd = patch.materializedBTokEnd;
+    witness.producerProven = true;
+    witness.ownerClosed = true;
+    witness.layoutStable = true;
+    witness.observersStable = true;
+    witness.counterStable = true;
+    witness.fromPairedInsertion = true;
+    witness.boundarySignature =
+        llvm::formatv("macro-paired-pure-insertion:owner={0}:source=[{1},{2}):"
+                      "b=[{3},{4})",
+                      witness.ownerId, patch.invStart, patch.invEnd,
+                      witness.bTokStart, witness.bTokEnd)
+            .str();
+    synthesizedZeroTokenBoundary = std::move(witness);
+  }
+
+  const ZeroTokenBoundaryWitness *zeroTokenWitnessForCandidate =
+      patch.proof.zeroTokenBoundaryReplay
+          ? &*patch.proof.zeroTokenBoundaryReplay
+          : (synthesizedZeroTokenBoundary ? &*synthesizedZeroTokenBoundary
+                                          : nullptr);
+  if (zeroTokenWitnessForCandidate && patch.hasMaterializedBTokenRange &&
+      patch.proof.preservesInvocationStructure &&
+      !candidate.hasGeneratedCalleeReplayWitness) {
+    const ZeroTokenBoundaryWitness &w = *zeroTokenWitnessForCandidate;
+    candidate.hasZeroTokenBoundaryWitness = true;
+    candidate.zeroTokenOwnerId = w.ownerId;
+    candidate.zeroTokenOwnerKind = w.ownerKind;
+    candidate.zeroTokenHasPPGap = w.hasPPGap;
+    candidate.zeroTokenPPGap = w.ppGap;
+    candidate.zeroTokenHasSourceAnchor = w.hasSourceAnchor;
+    candidate.zeroTokenSourceAnchor = w.sourceAnchor;
+    candidate.zeroTokenHasBTokenRange = w.hasBTokenRange;
+    candidate.zeroTokenBTokStart = w.bTokStart;
+    candidate.zeroTokenBTokEnd = w.bTokEnd;
+    candidate.zeroTokenProducerProven = w.producerProven;
+    candidate.zeroTokenOwnerClosed = w.ownerClosed;
+    candidate.zeroTokenLayoutStable = w.layoutStable;
+    candidate.zeroTokenObserversStable = w.observersStable;
+    candidate.zeroTokenCounterStable = w.counterStable;
+    candidate.zeroTokenFromEmptyActual = w.fromEmptyActual;
+    candidate.zeroTokenFromReplacementGap = w.fromReplacementGap;
+    candidate.zeroTokenFromPairedInsertion = w.fromPairedInsertion;
+    candidate.zeroTokenFromTUAnchor = w.fromTUAnchor;
+    candidate.zeroTokenFromIncludeBoundary = w.fromIncludeBoundary;
+    candidate.zeroTokenFromDirectiveLayoutGap = w.fromDirectiveLayoutGap;
+    candidate.zeroTokenBoundarySignature = w.boundarySignature;
+  }
+
+  // Phase 6: expose direct stringification and token-paste producer semantics
+  // in the common witness key.  This does not revalidate or reprioritize the
+  // patch; it only summarizes producer facts for macro patches that have
+  // already survived their family-specific proof path.
+  if (const RefoldModel::MacroInvocation *inv =
+          FindMacroInvocationById(patch.macroId)) {
+    if (!inv->stringifySpans.empty() && patch.hasMaterializedBTokenRange &&
+        patch.proof.preservesInvocationStructure &&
+        !candidate.hasGeneratedCalleeReplayWitness) {
+      candidate.hasStringificationWitness = true;
+      candidate.stringificationRootMacroId = patch.proof.proofRootMacroId
+                                                 ? patch.proof.proofRootMacroId
+                                                 : patch.macroId;
+      candidate.stringificationSpanCount =
+          static_cast<uint32_t>(inv->stringifySpans.size());
+
+      SmallVector<uint32_t, 8> argIdxs;
+      std::vector<RefoldModel::PPArgSpan> spans = inv->stringifySpans;
+      llvm::sort(spans, [](const RefoldModel::PPArgSpan &lhs,
+                           const RefoldModel::PPArgSpan &rhs) {
+        if (lhs.argIdx != rhs.argIdx)
+          return lhs.argIdx < rhs.argIdx;
+        if (lhs.begin != rhs.begin)
+          return lhs.begin < rhs.begin;
+        return lhs.end < rhs.end;
+      });
+
+      std::string producerSig =
+          llvm::formatv("root={0}:spans={1}",
+                        candidate.stringificationRootMacroId, spans.size())
+              .str();
+      std::string payloadSig;
+      bool payloadsCanonical = true;
+      for (const RefoldModel::PPArgSpan &span : spans) {
+        argIdxs.push_back(span.argIdx);
+        producerSig += llvm::formatv(":arg={0}:[{1},{2})", span.argIdx,
+                                     span.begin, span.end)
+                           .str();
+        StringRef literal = SliceASource(span.begin, span.end).trim();
+        std::optional<std::string> unstringified =
+            UnstringifyLiteralToArgText(literal, /*allowTopLevelComma=*/true);
+        std::optional<std::string> canonical =
+            unstringified
+                ? stringutils::canonicalizeStringifyInversePayload(
+                      StringRef(*unstringified))
+                : std::nullopt;
+        if (!unstringified || !canonical ||
+            StringRef(*canonical).trim() != StringRef(*unstringified).trim()) {
+          payloadsCanonical = false;
+          payloadSig += llvm::formatv(":arg={0}:payload=unknown", span.argIdx)
+                            .str();
+          continue;
+        }
+        payloadSig += llvm::formatv(":arg={0}:canon={1}", span.argIdx,
+                                    FormatWitnessTraceHash(*canonical))
+                          .str();
+      }
+      llvm::sort(argIdxs);
+      argIdxs.erase(std::unique(argIdxs.begin(), argIdxs.end()),
+                    argIdxs.end());
+      candidate.stringificationArgCount =
+          static_cast<uint32_t>(argIdxs.size());
+      candidate.stringificationWhitespaceNormalized = payloadsCanonical;
+      candidate.stringificationEscapedSpellingStable = payloadsCanonical;
+      candidate.stringificationProducerSignature = std::move(producerSig);
+      candidate.stringificationCanonicalPayloadSignature =
+          payloadSig.empty() ? std::string("empty") : std::move(payloadSig);
+      if (!payloadsCanonical) {
+        // If the producer-recorded stringify literal cannot be normalized into
+        // the supported inverse domain, do not let Phase 6 claim a known
+        // stringification equivalence dimension. The already accepted macro
+        // proof remains intact; the common resolver simply keeps this
+        // dimension unknown until a later proof can explain it.
+        candidate.hasStringificationWitness = false;
+      }
+    }
+
+    const bool pasteProofPresent = patch.proof.paste.has_value() ||
+        patch.pasteReplayValidated ||
+        patch.proof.kind == MacroPatchProofKind::ArgsOnlyPasteSingle ||
+        patch.proof.kind == MacroPatchProofKind::ArgsOnlyPasteMulti ||
+        patch.proof.kind == MacroPatchProofKind::ArgsOnlyPurePasteOnly ||
+        patch.proof.kind == MacroPatchProofKind::PasteDerivedCalleeSelector;
+    if ((!inv->pasteSpans.empty() || !inv->pasteTokens.empty()) &&
+        patch.hasMaterializedBTokenRange && pasteProofPresent &&
+        !candidate.hasGeneratedCalleeReplayWitness) {
+      candidate.hasTokenPasteWitness = true;
+      candidate.tokenPasteRootMacroId = patch.proof.proofRootMacroId
+                                            ? patch.proof.proofRootMacroId
+                                            : patch.macroId;
+      candidate.tokenPasteSpanCount =
+          static_cast<uint32_t>(inv->pasteSpans.size());
+      candidate.tokenPasteTokenCount =
+          static_cast<uint32_t>(inv->pasteTokens.size());
+
+      std::string producerSig =
+          llvm::formatv("root={0}:spans={1}:tokens={2}",
+                        candidate.tokenPasteRootMacroId,
+                        inv->pasteSpans.size(), inv->pasteTokens.size())
+              .str();
+      std::string resultSig;
+
+      std::vector<RefoldModel::PPArgSpan> pasteSpans = inv->pasteSpans;
+      llvm::sort(pasteSpans, [](const RefoldModel::PPArgSpan &lhs,
+                                const RefoldModel::PPArgSpan &rhs) {
+        if (lhs.argIdx != rhs.argIdx)
+          return lhs.argIdx < rhs.argIdx;
+        if (lhs.begin != rhs.begin)
+          return lhs.begin < rhs.begin;
+        return lhs.end < rhs.end;
+      });
+      for (const RefoldModel::PPArgSpan &span : pasteSpans)
+        producerSig += llvm::formatv(":span_arg={0}:[{1},{2})",
+                                     span.argIdx, span.begin, span.end)
+                           .str();
+
+      for (const RefoldModel::PasteToken &token : inv->pasteTokens) {
+        resultSig += llvm::formatv(":result={0}:parts={1}",
+                                   FormatWitnessTraceHash(token.spelling),
+                                   token.parts.size())
+                         .str();
+        candidate.tokenPastePartCount +=
+            static_cast<uint32_t>(token.parts.size());
+        for (const RefoldModel::PastePart &part : token.parts) {
+          if (part.kind == RefoldModel::PastePartKind::Arg) {
+            ++candidate.tokenPasteArgPartCount;
+            if (part.byteBegin == 0)
+              candidate.tokenPasteHasLeftProducer = true;
+            if (part.byteEnd == token.spelling.size())
+              candidate.tokenPasteHasRightProducer = true;
+            producerSig +=
+                llvm::formatv(":arg_part={0}:[{1},{2})",
+                              part.argIndex ? *part.argIndex : std::numeric_limits<uint32_t>::max(),
+                              part.byteBegin, part.byteEnd)
+                    .str();
+          } else {
+            ++candidate.tokenPasteLiteralPartCount;
+            producerSig += llvm::formatv(":lit_part=[{0},{1})",
+                                         part.byteBegin, part.byteEnd)
+                               .str();
+          }
+        }
+      }
+
+      if (!candidate.tokenPasteHasLeftProducer &&
+          candidate.tokenPasteArgPartCount != 0)
+        candidate.tokenPasteHasLeftProducer = true;
+      if (!candidate.tokenPasteHasRightProducer &&
+          candidate.tokenPasteArgPartCount > 1)
+        candidate.tokenPasteHasRightProducer = true;
+
+      if (candidate.hasTargetBTokenRange) {
+        for (uint64_t tok = candidate.targetBTokStart;
+             tok < candidate.targetBTokEnd && tok < bToks_.size(); ++tok) {
+          resultSig += llvm::formatv(":bkind={0}:bspell={1}",
+                                     bToks_[tok].kind,
+                                     FormatWitnessTraceHash(
+                                         bToks_[tok].spelling))
+                           .str();
+        }
+      }
+
+      candidate.tokenPasteResultValidated =
+          patch.pasteReplayValidated ||
+          (patch.proof.paste &&
+           (patch.proof.paste->requiresProducerPasteSpans ||
+            patch.proof.paste->replayValidated));
+      candidate.tokenPasteDiagnosticSafe = candidate.tokenPasteResultValidated;
+      candidate.tokenPasteProducerSignature = std::move(producerSig);
+      candidate.tokenPasteResultSignature =
+          resultSig.empty() ? std::string("empty") : std::move(resultSig);
+    }
+  }
+
+  if (patch.proof.counterState) {
+    candidate.hasCounterStateWitness = true;
+    candidate.counterStateWitness = *patch.proof.counterState;
+  }
 
   // Preserve the proof root separately from the byte span so selector/audit
   // code can reason about macro ancestry without reclassifying the patch.
@@ -25673,8 +28741,12 @@ RefoldEngine::BuildAcceptedMacroCandidate(const MacroPatch &patch) const {
   candidate.hasPayloadPreview = true;
   candidate.payloadPreview =
       stringutils::showWsWithClip(patch.replacement, 120);
+  AttachLineControlObserverWitness(candidate);
+  AttachCounterStateWitness(candidate);
   RefreshAcceptedCandidateEmissionPathInventory(candidate);
   AuditMacroPatchProofForLegacyAuthority(patch, "BuildAcceptedMacroCandidate");
+  TraceWitnessEmitted(
+      BuildRefoldWitness(candidate, "BuildAcceptedMacroCandidate"));
   return candidate;
 }
 
@@ -25693,6 +28765,8 @@ RefoldEngine::RestampAcceptedMacroCandidateForEmission(
     candidate.proofSummary.discharge =
         ValidateEmittedInvocationPreservingProof(patch);
     FinalizeProofSummary(candidate.proofSummary);
+    AttachLineControlObserverWitness(candidate);
+  AttachCounterStateWitness(candidate);
     RefreshAcceptedCandidateEmissionPathInventory(candidate);
   }
 
@@ -25797,12 +28871,58 @@ RefoldEngine::BuildAcceptedIncludeCandidate(
     candidate.anchorByte = includeAnchorWitness->anchorByte;
   }
 
+  // Phase 8: include-preserving insertions at an empty A range are
+  // zero-token boundary-gap witnesses.  The existing include-anchor proof
+  // already established the source byte; this mirrors that proof into the
+  // common witness/equivalence vocabulary.
+  if (includeAnchorWitness && patch.aStart == patch.aEnd &&
+      includeAnchorWitness->hasAnchorByte) {
+    candidate.hasZeroTokenBoundaryWitness = true;
+    candidate.zeroTokenOwnerKind = "include";
+    candidate.zeroTokenOwnerId = patch.include ? patch.include->id : 0;
+    candidate.zeroTokenHasPPGap = true;
+    candidate.zeroTokenPPGap = patch.aStart;
+    candidate.zeroTokenHasSourceAnchor = true;
+    candidate.zeroTokenSourceAnchor = includeAnchorWitness->anchorByte;
+    candidate.zeroTokenHasBTokenRange = true;
+    candidate.zeroTokenBTokStart = patch.bStart;
+    candidate.zeroTokenBTokEnd = patch.bEnd;
+    candidate.zeroTokenProducerProven = true;
+    candidate.zeroTokenOwnerClosed = true;
+    candidate.zeroTokenLayoutStable = true;
+    candidate.zeroTokenObserversStable = true;
+    candidate.zeroTokenCounterStable = true;
+    candidate.zeroTokenFromIncludeBoundary = true;
+    candidate.zeroTokenFromDirectiveLayoutGap =
+        includeAnchorWitness->evidence ==
+            IncludeAnchorEvidenceKind::SelectedConditionalBoundary ||
+        includeAnchorWitness->evidence == IncludeAnchorEvidenceKind::DeclBoundary;
+    candidate.zeroTokenBoundarySignature =
+        llvm::formatv("include-anchor:evidence={0}:include={1}:pp_gap={2}:"
+                      "byte={3}:b=[{4},{5}):cond={6}:{7}:child={8}:{9}:"
+                      "neighbor={10}:{11}",
+                      toString(includeAnchorWitness->evidence),
+                      candidate.zeroTokenOwnerId, patch.aStart,
+                      includeAnchorWitness->anchorByte, patch.bStart, patch.bEnd,
+                      includeAnchorWitness->hasCondArmId ? 1 : 0,
+                      includeAnchorWitness->condArmId,
+                      includeAnchorWitness->hasChildIncludeId ? 1 : 0,
+                      includeAnchorWitness->childIncludeId,
+                      includeAnchorWitness->hasNeighborPP ? 1 : 0,
+                      includeAnchorWitness->neighborPP)
+            .str();
+  }
+
   candidate.hasPayloadPreview = true;
   candidate.payloadPreview =
       stringutils::showWsWithClip(patch.insertBytes, 120);
+  AttachLineControlObserverWitness(candidate);
+  AttachCounterStateWitness(candidate);
   RefreshAcceptedCandidateEmissionPathInventory(candidate);
   AuditAcceptedResultCandidateForLegacyAuthority(
       candidate, "BuildAcceptedIncludeCandidate");
+  TraceWitnessEmitted(
+      BuildRefoldWitness(candidate, "BuildAcceptedIncludeCandidate"));
   return candidate;
 }
 
@@ -25846,9 +28966,13 @@ RefoldEngine::BuildAcceptedIncludeRealizationCandidate(
 
   candidate.hasOwnerIncludeId = true;
   candidate.ownerIncludeId = include.id;
+  AttachLineControlObserverWitness(candidate);
+  AttachCounterStateWitness(candidate);
   RefreshAcceptedCandidateEmissionPathInventory(candidate);
   AuditAcceptedResultCandidateForLegacyAuthority(
       candidate, "BuildAcceptedIncludeRealizationCandidate");
+  TraceWitnessEmitted(BuildRefoldWitness(
+      candidate, "BuildAcceptedIncludeRealizationCandidate"));
   return candidate;
 }
 
@@ -25866,9 +28990,13 @@ RefoldEngine::BuildAcceptedTUTextEditCandidate(AcceptedPathKind currentPath,
   candidate.end = end;
   candidate.hasPayloadPreview = true;
   candidate.payloadPreview = payloadPreview.str();
+  AttachLineControlObserverWitness(candidate);
+  AttachCounterStateWitness(candidate);
   RefreshAcceptedCandidateEmissionPathInventory(candidate);
   AuditAcceptedResultCandidateForLegacyAuthority(
       candidate, "BuildAcceptedTUTextEditCandidate");
+  TraceWitnessEmitted(
+      BuildRefoldWitness(candidate, "BuildAcceptedTUTextEditCandidate"));
   return candidate;
 }
 
@@ -25890,9 +29018,57 @@ RefoldEngine::BuildAcceptedTUAnchorCandidate(
     candidate.hasAnchorByte = true;
     candidate.anchorByte = witness.tuByte;
   }
+
+  // Phase 8: TU-anchor insertions are zero-token boundary witnesses when the
+  // producer supplied an exact PP gap / source-byte frontier.  Preserve the
+  // existing anchor proof and expose the boundary dimensions to the common
+  // witness key without changing anchor selection.
+  if (witness.hasPPGap && witness.hasTUByte) {
+    candidate.hasZeroTokenBoundaryWitness = true;
+    candidate.zeroTokenOwnerKind = "tu";
+    candidate.zeroTokenOwnerId = 0;
+    candidate.zeroTokenHasPPGap = true;
+    candidate.zeroTokenPPGap = witness.ppGap;
+    candidate.zeroTokenHasSourceAnchor = true;
+    candidate.zeroTokenSourceAnchor = witness.tuByte;
+    candidate.zeroTokenHasBTokenRange = true;
+    candidate.zeroTokenBTokStart = witness.ppGap;
+    candidate.zeroTokenBTokEnd = witness.ppGap;
+    candidate.zeroTokenProducerProven = TUAnchorWitnessHasProvableEvidence(witness) ||
+                                        witness.exactPPMatch;
+    candidate.zeroTokenOwnerClosed = true;
+    candidate.zeroTokenLayoutStable = true;
+    candidate.zeroTokenObserversStable = witness.ownerDepthStable ||
+                                          witness.outsideIncludeCoverage ||
+                                          witness.exactPPMatch;
+    candidate.zeroTokenCounterStable = true;
+    candidate.zeroTokenFromTUAnchor = true;
+    candidate.zeroTokenFromIncludeBoundary =
+        witness.evidence == TUAnchorEvidenceKind::ZeroTokenIncludeBoundary ||
+        witness.evidence == TUAnchorEvidenceKind::IncludeDirectiveBoundary;
+    candidate.zeroTokenFromDirectiveLayoutGap =
+        witness.evidence == TUAnchorEvidenceKind::ExactSlotBoundary ||
+        witness.evidence == TUAnchorEvidenceKind::CorroboratedLeftNeighbor ||
+        witness.evidence == TUAnchorEvidenceKind::CorroboratedRightNeighbor;
+    candidate.zeroTokenBoundarySignature =
+        llvm::formatv("tu-anchor:evidence={0}:slot={1}:{2}:pp_gap={3}:"
+                      "byte={4}:left={5}:{6}:right={7}:{8}:outside_include={9}:"
+                      "owner_depth={10}",
+                      toString(witness.evidence), witness.slotId,
+                      witness.slotKind, witness.ppGap, witness.tuByte,
+                      witness.hasLeftNeighbor ? 1 : 0, witness.leftNeighborPP,
+                      witness.hasRightNeighbor ? 1 : 0, witness.rightNeighborPP,
+                      witness.outsideIncludeCoverage ? 1 : 0,
+                      witness.ownerDepthStable ? 1 : 0)
+            .str();
+  }
+  AttachLineControlObserverWitness(candidate);
+  AttachCounterStateWitness(candidate);
   RefreshAcceptedCandidateEmissionPathInventory(candidate);
   AuditAcceptedResultCandidateForLegacyAuthority(
       candidate, "BuildAcceptedTUAnchorCandidate");
+  TraceWitnessEmitted(
+      BuildRefoldWitness(candidate, "BuildAcceptedTUAnchorCandidate"));
   return candidate;
 }
 
@@ -25908,9 +29084,13 @@ RefoldEngine::BuildAcceptedTerminalCandidate(
       AcceptedPathKind::TerminalEmitEditedPreprocessedStream,
       /*patch=*/nullptr, /*tuAnchorWitness=*/nullptr,
       /*includeAnchorWitness=*/nullptr, &witness);
+  AttachLineControlObserverWitness(candidate);
+  AttachCounterStateWitness(candidate);
   RefreshAcceptedCandidateEmissionPathInventory(candidate);
   AuditAcceptedResultCandidateForLegacyAuthority(
       candidate, "BuildAcceptedTerminalCandidate");
+  TraceWitnessEmitted(
+      BuildRefoldWitness(candidate, "BuildAcceptedTerminalCandidate"));
   return candidate;
 }
 
@@ -25987,6 +29167,7 @@ void RefoldEngine::AddForcedCounterPatches(
     }
 
 
+    CounterEventIdentity counterEventForWitness;
     SuffixStabilityWitness counterWitness = SuffixStabilityWitness::None();
     {
       CounterEventIdentity event = req.event;
@@ -25994,6 +29175,9 @@ void RefoldEngine::AddForcedCounterPatches(
         event = BuildCounterEventIdentity(m, /*occurrenceOrdinal=*/0,
                                           req.aStart, req.aEnd,
                                           m.ownerIncludeId);
+      if (!event.expectedBValue && replOpt)
+        event.expectedBValue = *replOpt;
+      counterEventForWitness = event;
       const OwnerStateBoundary boundary = CounterStateBoundaryForEvent(event);
       const std::string detail =
           llvm::formatv("forced materialization of counter-sensitive invocation "
@@ -26032,7 +29216,38 @@ void RefoldEngine::AddForcedCounterPatches(
     MacroPatchProof proof =
         MakeMacroPatchProof(MacroPatchProofKind::CounterLiteral,
                             /*preservesInvocationStructure=*/false, m.id);
+    CounterStateWitness counterState;
+    counterState.hasCounterEvents = true;
+    counterState.counterOrderKnown = true;
+    counterState.suffixStateStable = true;
+    counterState.materializationStable = true;
+    counterState.counterConsumptionCount = 1;
+    counterState.counterMutationCount = 1;
+    if (counterWitness.kind != SuffixStabilityWitnessKind::None)
+      counterState.preservedSuffixObserverCount = 1;
+    if (counterEventForWitness.expectedBValue) {
+      counterState.hasExpectedBValues = true;
+      counterState.expectedBValueCount = 1;
+      counterState.suffixValueSignature =
+          llvm::formatv("expected={0}",
+                        FormatWitnessTraceHash(*counterEventForWitness.expectedBValue))
+              .str();
+    } else {
+      counterState.hasMissingExpectedBValues = true;
+      counterState.missingExpectedBValueCount = 1;
+    }
+    counterState.consumptionSignature = FormatCounterEventForWitness(counterEventForWitness);
+    counterState.orderSignature =
+        llvm::formatv("ordinal={0}:macro={1}:A=[{2},{3})",
+                      counterEventForWitness.occurrenceOrdinal, counterEventForWitness.macroInvocationId,
+                      counterEventForWitness.aTokenBegin, counterEventForWitness.aTokenEnd)
+            .str();
+    counterState.suffixObserverSignature =
+        llvm::formatv("forced-materialization:{0}",
+                      toString(counterWitness.kind))
+            .str();
     proof.suffixStability = std::move(counterWitness);
+    proof.counterState = std::move(counterState);
     SetMacroPatchProof(patch, std::move(proof));
 
     // Use the coalesced key as the patch macro ID so later owner/macro maps see
@@ -26112,7 +29327,31 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
       MacroPatchProof proof =
           MakeMacroPatchProof(MacroPatchProofKind::CounterLiteral,
                               /*preservesInvocationStructure=*/false, m.id);
+      CounterStateWitness counterState;
+      counterState.hasCounterEvents = true;
+      counterState.counterOrderKnown = true;
+      counterState.suffixStateStable = true;
+      counterState.literalizationStable = true;
+      counterState.counterConsumptionCount = 1;
+      counterState.counterMutationCount = 1;
+      if (counterWitness.kind != SuffixStabilityWitnessKind::None)
+        counterState.preservedSuffixObserverCount = 1;
+      counterState.hasExpectedBValues = true;
+      counterState.expectedBValueCount = 1;
+      counterState.consumptionSignature = FormatCounterEventForWitness(event);
+      counterState.orderSignature =
+          llvm::formatv("ordinal={0}:macro={1}:A=[{2},{3})",
+                        event.occurrenceOrdinal, event.macroInvocationId,
+                        event.aTokenBegin, event.aTokenEnd)
+              .str();
+      counterState.suffixValueSignature =
+          llvm::formatv("expected={0}", FormatWitnessTraceHash(*event.expectedBValue))
+              .str();
+      counterState.suffixObserverSignature =
+          llvm::formatv("literalization:{0}", toString(counterWitness.kind))
+              .str();
       proof.suffixStability = std::move(counterWitness);
+      proof.counterState = std::move(counterState);
       SetMacroPatchProof(patch, std::move(proof));
       return patch;
     }

@@ -29,19 +29,27 @@
 // raw-B result to carry a declared TerminalFallbackProofFailure.
 //
 // A hunk is in-domain only when its proof discharges all of the following:
-//   • each owner consumes a closed source interval and exactly the A-token
-//     envelope it produced;
-//   • the owner emits, preserves, or realizes exactly the B-token envelope
+//   • the modified preprocessed stream can be partitioned into a finite,
+//     deterministic sequence of source-repair tiles;
+//   • every tile has at least one producer-proven source witness;
+//   • each witness is owner-closed and consumes a closed source interval plus
+//     exactly the A-token envelope it produced;
+//   • each owner emits, preserves, or realizes exactly the B-token envelope
 //     assigned to it;
-//   • zero-token state transitions (`#define`, `#undef`, `#line`, include
-//     guard effects, conditionals, pragmas, builtin location/counter state,
-//     etc.) are preserved, repaired, widened into the closure, materialized,
-//     or proven unobserved by the preserved suffix;
-//   • mixed-owner hunks tile deterministically, gap-free, and in source order
-//     over both A tokens and B tokens, including zero-token state gaps; and
+//   • all macro producer semantics used by the witness are modeled explicitly
+//     (forwarding, stringification, paste, variadic comma behavior, directive
+//     materialization, builtin/counter materialization, etc.);
+//   • suffix macro/include/conditional/line/counter state is known or proven
+//     equivalent for all preserved observers;
+//   • neighboring tiles compose without crossing unowned directive, include,
+//     macro, or source boundaries; and
 //   • no upstream source-state mutation is reverse-solved from a downstream
 //     expansion unless the directive itself lies inside the proven edited
 //     source interval.
+//
+// In-domain does not mean unique inverse recovery. Multiple source spellings
+// may be valid when they occupy one observational equivalence class; multiple
+// non-equivalent classes fail closed instead of guessing author intent.
 //
 // Inputs outside this contract are not completeness failures.  They must be
 // represented by an explicit failed proof obligation, materialized as a closed
@@ -1243,6 +1251,664 @@ private:
                          request.detail)
         .str();
   }
+
+
+  /// \brief Trace-only vocabulary for the global witness-resolution model.
+  ///
+  /// Phase 0 does not use these names to select or reject output.  They provide
+  /// stable, theorem-facing terminology for later phases that will move each
+  /// proof family from ad hoc candidate choice to equivalence-class canonical
+  /// witness resolution.  Unknown fields are intentionally explicit: a trace
+  /// entry may be partial during Phase 0, but it must not pretend that an
+  /// uncomputed proof dimension is equivalent to anything else.
+#define REFOLD_WITNESS_PROOF_FAMILY_LIST(REFOLD_X)                           \
+  REFOLD_X(Unknown)                                                           \
+  REFOLD_X(AcceptedResult)                                                    \
+  REFOLD_X(MacroActualRepair)                                                 \
+  REFOLD_X(DefinitionTapeReplay)                                              \
+  REFOLD_X(GeneratedCalleeReplay)                                             \
+  REFOLD_X(Stringification)                                                   \
+  REFOLD_X(TokenPaste)                                                        \
+  REFOLD_X(VariadicComma)                                                     \
+  REFOLD_X(ZeroTokenBoundary)                                                 \
+  REFOLD_X(LineControlObserver)                                               \
+  REFOLD_X(CounterState)                                                      \
+  REFOLD_X(IncludePreservation)                                               \
+  REFOLD_X(IncludeRealization)                                                \
+  REFOLD_X(TUAnchor)                                                          \
+  REFOLD_X(TUTextEdit)                                                        \
+  REFOLD_X(OwnerRealization)                                                  \
+  REFOLD_X(MixedOwnerTiling)                                                  \
+  REFOLD_X(TerminalFallback)
+
+  enum class WitnessProofFamily : uint8_t {
+#define REFOLD_X(name) name,
+    REFOLD_WITNESS_PROOF_FAMILY_LIST(REFOLD_X)
+#undef REFOLD_X
+  };
+
+  friend inline StringRef toString(WitnessProofFamily value) {
+    switch (value) {
+#define REFOLD_X(name) case WitnessProofFamily::name: return #name;
+      REFOLD_WITNESS_PROOF_FAMILY_LIST(REFOLD_X)
+#undef REFOLD_X
+    }
+    return "Unknown";
+  }
+#undef REFOLD_WITNESS_PROOF_FAMILY_LIST
+
+#define REFOLD_WITNESS_PRODUCER_KIND_LIST(REFOLD_X)                           \
+  REFOLD_X(Unknown)                                                           \
+  REFOLD_X(Forward)                                                           \
+  REFOLD_X(Stringify)                                                         \
+  REFOLD_X(PasteLeft)                                                         \
+  REFOLD_X(PasteRight)                                                        \
+  REFOLD_X(PasteResult)                                                       \
+  REFOLD_X(VariadicForward)                                                   \
+  REFOLD_X(ZeroTokenAnchor)                                                    \
+  REFOLD_X(VariadicMissing)                                                   \
+  REFOLD_X(VariadicEmpty)                                                     \
+  REFOLD_X(VariadicCommaInsertion)                                            \
+  REFOLD_X(VariadicCommaElision)                                              \
+  REFOLD_X(VaOptActivation)                                                   \
+  REFOLD_X(VaOptErasure)                                                      \
+  REFOLD_X(GeneratedCallee)                                                   \
+  REFOLD_X(ObjectAlias)                                                       \
+  REFOLD_X(DirectiveMaterialization)                                          \
+  REFOLD_X(BuiltinMaterialization)                                            \
+  REFOLD_X(CounterConsumption)                                               \
+  REFOLD_X(OwnerRealization)                                                  \
+  REFOLD_X(TerminalMaterialization)
+
+  enum class WitnessProducerKind : uint8_t {
+#define REFOLD_X(name) name,
+    REFOLD_WITNESS_PRODUCER_KIND_LIST(REFOLD_X)
+#undef REFOLD_X
+  };
+
+  friend inline StringRef toString(WitnessProducerKind value) {
+    switch (value) {
+#define REFOLD_X(name) case WitnessProducerKind::name: return #name;
+      REFOLD_WITNESS_PRODUCER_KIND_LIST(REFOLD_X)
+#undef REFOLD_X
+    }
+    return "Unknown";
+  }
+#undef REFOLD_WITNESS_PRODUCER_KIND_LIST
+
+#define REFOLD_WITNESS_BOUNDARY_CLASS_LIST(REFOLD_X)                          \
+  REFOLD_X(Unknown)                                                           \
+  REFOLD_X(RootInvocation)                                                    \
+  REFOLD_X(NestedInvocation)                                                  \
+  REFOLD_X(MacroArgument)                                                     \
+  REFOLD_X(IncludeBoundary)                                                   \
+  REFOLD_X(TUAnchorBoundary)                                                  \
+  REFOLD_X(ZeroTokenBoundary)                                                 \
+  REFOLD_X(OwnerRealizationBoundary)                                          \
+  REFOLD_X(TerminalBoundary)
+
+  enum class WitnessBoundaryClass : uint8_t {
+#define REFOLD_X(name) name,
+    REFOLD_WITNESS_BOUNDARY_CLASS_LIST(REFOLD_X)
+#undef REFOLD_X
+  };
+
+  friend inline StringRef toString(WitnessBoundaryClass value) {
+    switch (value) {
+#define REFOLD_X(name) case WitnessBoundaryClass::name: return #name;
+      REFOLD_WITNESS_BOUNDARY_CLASS_LIST(REFOLD_X)
+#undef REFOLD_X
+    }
+    return "Unknown";
+  }
+#undef REFOLD_WITNESS_BOUNDARY_CLASS_LIST
+
+#define REFOLD_WITNESS_DIAGNOSTIC_CLASS_LIST(REFOLD_X)                        \
+  REFOLD_X(Unknown)                                                           \
+  REFOLD_X(PreservesDiagnostics)                                              \
+  REFOLD_X(RealizesEditedSurface)                                             \
+  REFOLD_X(TerminalOutOfDomain)
+
+  enum class WitnessDiagnosticClass : uint8_t {
+#define REFOLD_X(name) name,
+    REFOLD_WITNESS_DIAGNOSTIC_CLASS_LIST(REFOLD_X)
+#undef REFOLD_X
+  };
+
+  friend inline StringRef toString(WitnessDiagnosticClass value) {
+    switch (value) {
+#define REFOLD_X(name) case WitnessDiagnosticClass::name: return #name;
+      REFOLD_WITNESS_DIAGNOSTIC_CLASS_LIST(REFOLD_X)
+#undef REFOLD_X
+    }
+    return "Unknown";
+  }
+#undef REFOLD_WITNESS_DIAGNOSTIC_CLASS_LIST
+
+#define REFOLD_WITNESS_COMPOSITION_CLASS_LIST(REFOLD_X)                       \
+  REFOLD_X(Unknown)                                                           \
+  REFOLD_X(LocalOnly)                                                         \
+  REFOLD_X(OwnerClosed)                                                       \
+  REFOLD_X(MixedOwnerTile)                                                    \
+  REFOLD_X(Terminal)
+
+  enum class WitnessCompositionClass : uint8_t {
+#define REFOLD_X(name) name,
+    REFOLD_WITNESS_COMPOSITION_CLASS_LIST(REFOLD_X)
+#undef REFOLD_X
+  };
+
+  friend inline StringRef toString(WitnessCompositionClass value) {
+    switch (value) {
+#define REFOLD_X(name) case WitnessCompositionClass::name: return #name;
+      REFOLD_WITNESS_COMPOSITION_CLASS_LIST(REFOLD_X)
+#undef REFOLD_X
+    }
+    return "Unknown";
+  }
+#undef REFOLD_WITNESS_COMPOSITION_CLASS_LIST
+
+#define REFOLD_WITNESS_REJECT_REASON_LIST(REFOLD_X)                           \
+  REFOLD_X(Unknown)                                                           \
+  REFOLD_X(NotSelectable)                                                     \
+  REFOLD_X(ProofNormalizationFailed)                                          \
+  REFOLD_X(MissingEquivalenceKey)                                             \
+  REFOLD_X(ProducerKindMismatch)                                              \
+  REFOLD_X(StateUnknown)                                                      \
+  REFOLD_X(NonEquivalentAmbiguity)                                            \
+  REFOLD_X(SelectorOnlyNoEmittedCandidate)                                    \
+  REFOLD_X(TerminalFallbackRequested)
+
+  enum class WitnessRejectReason : uint8_t {
+#define REFOLD_X(name) name,
+    REFOLD_WITNESS_REJECT_REASON_LIST(REFOLD_X)
+#undef REFOLD_X
+  };
+
+  friend inline StringRef toString(WitnessRejectReason value) {
+    switch (value) {
+#define REFOLD_X(name) case WitnessRejectReason::name: return #name;
+      REFOLD_WITNESS_REJECT_REASON_LIST(REFOLD_X)
+#undef REFOLD_X
+    }
+    return "Unknown";
+  }
+#undef REFOLD_WITNESS_REJECT_REASON_LIST
+
+#define REFOLD_WITNESS_FALLBACK_CLASS_LIST(REFOLD_X)                         \
+  REFOLD_X(Unknown)                                                           \
+  REFOLD_X(NoOwnerClosedWitness)                                              \
+  REFOLD_X(MultipleNonEquivalentWitnessClasses)                               \
+  REFOLD_X(UnknownTargetPreprocessedTokens)                                   \
+  REFOLD_X(UnknownSuffixState)                                                \
+  REFOLD_X(UnprovenProducerKind)                                              \
+  REFOLD_X(CounterStateMismatch)                                              \
+  REFOLD_X(LineControlObserverMismatch)                                       \
+  REFOLD_X(InvalidMacroInvocation)                                            \
+  REFOLD_X(InvalidPasteResult)                                                \
+  REFOLD_X(UnsupportedDirectiveInteraction)                                   \
+  REFOLD_X(CompositionFailure)                                                \
+  REFOLD_X(ValidationFailure)                                                 \
+  REFOLD_X(UnconvertedProofFamily)                                            \
+  REFOLD_X(IncompleteWitnessKey)                                              \
+  REFOLD_X(NoSelectableWitness)
+
+  /// \brief Normalized strict-domain fallback class for Phase 14.
+  ///
+  /// Terminal raw-B fallback and resolver fallback are separate implementation
+  /// paths, but the theorem only cares which proof obligation failed.  This
+  /// vocabulary is intentionally small and stable so traces can distinguish an
+  /// unavoidable out-of-domain fallback from an avoidable missing proof family.
+  enum class WitnessFallbackClass : uint8_t {
+#define REFOLD_X(name) name,
+    REFOLD_WITNESS_FALLBACK_CLASS_LIST(REFOLD_X)
+#undef REFOLD_X
+  };
+
+  friend inline StringRef toString(WitnessFallbackClass value) {
+    switch (value) {
+#define REFOLD_X(name) case WitnessFallbackClass::name: return #name;
+      REFOLD_WITNESS_FALLBACK_CLASS_LIST(REFOLD_X)
+#undef REFOLD_X
+    }
+    return "Unknown";
+  }
+#undef REFOLD_WITNESS_FALLBACK_CLASS_LIST
+
+#define REFOLD_WITNESS_STRICT_DOMAIN_CLASS_LIST(REFOLD_X)                    \
+  REFOLD_X(Unknown)                                                           \
+  REFOLD_X(DeclaredInDomain)                                                  \
+  REFOLD_X(PotentiallyInDomainMissingProof)                                   \
+  REFOLD_X(ExplicitOutOfDomain)                                               \
+  REFOLD_X(AmbiguousOutOfDomain)
+
+  /// \brief Position of a witness decision relative to the strict in-domain
+  /// fragment declared for Phase 15.
+  ///
+  /// `PotentiallyInDomainMissingProof` is intentionally distinct from
+  /// `ExplicitOutOfDomain`: it means the current implementation lacks a strong
+  /// enough proof family or key dimension to claim the theorem, not that the
+  /// source edit is mathematically outside the declared fragment.
+  enum class WitnessStrictDomainClass : uint8_t {
+#define REFOLD_X(name) name,
+    REFOLD_WITNESS_STRICT_DOMAIN_CLASS_LIST(REFOLD_X)
+#undef REFOLD_X
+  };
+
+  friend inline StringRef toString(WitnessStrictDomainClass value) {
+    switch (value) {
+#define REFOLD_X(name) case WitnessStrictDomainClass::name: return #name;
+      REFOLD_WITNESS_STRICT_DOMAIN_CLASS_LIST(REFOLD_X)
+#undef REFOLD_X
+    }
+    return "Unknown";
+  }
+#undef REFOLD_WITNESS_STRICT_DOMAIN_CLASS_LIST
+
+#define REFOLD_WITNESS_STRICT_DOMAIN_OBLIGATION_LIST(REFOLD_X)                \
+  REFOLD_X(Unknown)                                                           \
+  REFOLD_X(FiniteDeterministicTiling)                                         \
+  REFOLD_X(ProducerProvenSourceWitness)                                       \
+  REFOLD_X(OwnerClosure)                                                      \
+  REFOLD_X(TargetPreprocessedTokens)                                          \
+  REFOLD_X(StateEquivalence)                                                  \
+  REFOLD_X(LineControlObserverEquivalence)                                    \
+  REFOLD_X(CounterEquivalence)                                                \
+  REFOLD_X(ModeledProducerSemantics)                                          \
+  REFOLD_X(ValidSourceRepair)                                                 \
+  REFOLD_X(Composition)                                                       \
+  REFOLD_X(ConvertedProofFamily)                                              \
+  REFOLD_X(CompleteWitnessKey)                                                \
+  REFOLD_X(FinalValidation)
+
+  /// \brief Strict-domain theorem obligation used for Phase-15 audit traces.
+  ///
+  /// This is the compact, cross-family vocabulary for the declared fragment:
+  /// finite tiling, producer-proven witnesses, owner closure, known target
+  /// tokens, stable preprocessing state/observers/counters, modeled producer
+  /// semantics, valid source spelling, compositionality, converted proof
+  /// family coverage, complete keys, and final validation.
+  enum class WitnessStrictDomainObligation : uint8_t {
+#define REFOLD_X(name) name,
+    REFOLD_WITNESS_STRICT_DOMAIN_OBLIGATION_LIST(REFOLD_X)
+#undef REFOLD_X
+  };
+
+  friend inline StringRef toString(WitnessStrictDomainObligation value) {
+    switch (value) {
+#define REFOLD_X(name) case WitnessStrictDomainObligation::name: return #name;
+      REFOLD_WITNESS_STRICT_DOMAIN_OBLIGATION_LIST(REFOLD_X)
+#undef REFOLD_X
+    }
+    return "Unknown";
+  }
+#undef REFOLD_WITNESS_STRICT_DOMAIN_OBLIGATION_LIST
+
+  /// \brief Phase-15 strict-domain classification for one resolver/fallback.
+  ///
+  /// The decision separates three theorem-relevant outcomes:
+  ///   - accepted inside the declared strict domain;
+  ///   - plausibly in-domain but blocked by a missing/incomplete proof family;
+  ///   - explicitly outside the domain or ambiguous across non-equivalent
+  ///     repairs, where guessing author intent would violate the policy.
+  struct WitnessStrictDomainDecision {
+    WitnessStrictDomainClass domainClass =
+        WitnessStrictDomainClass::Unknown;
+    WitnessStrictDomainObligation obligation =
+        WitnessStrictDomainObligation::Unknown;
+    WitnessFallbackClass fallbackClass = WitnessFallbackClass::Unknown;
+    std::string reason;
+
+    bool IsDeclaredInDomain() const {
+      return domainClass == WitnessStrictDomainClass::DeclaredInDomain;
+    }
+  };
+
+  /// \brief One semantic dimension inside a witness equivalence key.
+  ///
+  /// Phase 1 makes known/unknown status explicit for every dimension that will
+  /// eventually participate in equivalence-class partitioning.  An unknown
+  /// dimension is never equivalent to another unknown dimension merely because
+  /// both spell "unknown"; partition keys salt unknown dimensions with the
+  /// witness id until a later proof phase supplies a real semantic value.
+  struct WitnessEquivalenceDimension {
+    bool known = false;
+    std::string value;
+    std::string unknownReason = "not-carried";
+
+    static WitnessEquivalenceDimension Known(llvm::StringRef value) {
+      WitnessEquivalenceDimension dimension;
+      dimension.known = true;
+      dimension.value = value.str();
+      dimension.unknownReason.clear();
+      return dimension;
+    }
+
+    static WitnessEquivalenceDimension Unknown(llvm::StringRef reason) {
+      WitnessEquivalenceDimension dimension;
+      dimension.known = false;
+      dimension.unknownReason = reason.empty() ? "not-carried" : reason.str();
+      return dimension;
+    }
+
+    std::string ToString() const {
+      if (known)
+        return value;
+      return llvm::formatv("unknown(reason={0})", unknownReason).str();
+    }
+
+    std::string PartitionValue(llvm::StringRef name,
+                               uint64_t witnessId) const {
+      if (known)
+        return value;
+      return llvm::formatv("unknown:{0}:witness#{1}:{2}", name, witnessId,
+                           unknownReason)
+          .str();
+    }
+  };
+
+  /// \brief Set-valued producer dimension for witness equivalence.
+  ///
+  /// The first implementation usually carries a singleton, but the type is
+  /// intentionally a set so generated-callee, stringify, paste, variadic, and
+  /// directive materialization paths can add producer obligations without
+  /// replacing the equivalence vocabulary again.
+  struct WitnessProducerKindSet {
+    bool known = false;
+    std::vector<WitnessProducerKind> kinds;
+    std::string unknownReason = "not-carried";
+
+    static WitnessProducerKindSet Unknown(llvm::StringRef reason) {
+      WitnessProducerKindSet set;
+      set.known = false;
+      set.unknownReason = reason.empty() ? "not-carried" : reason.str();
+      return set;
+    }
+
+    static WitnessProducerKindSet KnownSingle(WitnessProducerKind kind) {
+      WitnessProducerKindSet set;
+      if (kind == WitnessProducerKind::Unknown) {
+        set.known = false;
+        set.unknownReason = "producer-kind-unknown";
+        return set;
+      }
+      set.known = true;
+      set.kinds.push_back(kind);
+      return set;
+    }
+
+    void Add(WitnessProducerKind kind) {
+      if (kind == WitnessProducerKind::Unknown)
+        return;
+      known = true;
+      for (WitnessProducerKind existing : kinds)
+        if (existing == kind)
+          return;
+      kinds.push_back(kind);
+      std::sort(kinds.begin(), kinds.end(),
+                [](WitnessProducerKind lhs, WitnessProducerKind rhs) {
+                  return static_cast<uint8_t>(lhs) < static_cast<uint8_t>(rhs);
+                });
+    }
+
+    std::string ToString() const {
+      if (!known)
+        return llvm::formatv("unknown(reason={0})", unknownReason).str();
+
+      std::string out = "{";
+      for (size_t i = 0; i < kinds.size(); ++i) {
+        if (i)
+          out += ",";
+        out += toString(kinds[i]).str();
+      }
+      out += "}";
+      return out;
+    }
+
+    std::string PartitionValue(uint64_t witnessId) const {
+      if (known)
+        return ToString();
+      return llvm::formatv("unknown:producer:witness#{0}:{1}", witnessId,
+                           unknownReason)
+          .str();
+    }
+  };
+
+  struct WitnessEquivalenceKey {
+    WitnessEquivalenceDimension targetPPTokens =
+        WitnessEquivalenceDimension::Unknown("target-pp-tokens-not-carried");
+    WitnessEquivalenceDimension suffixState =
+        WitnessEquivalenceDimension::Unknown("suffix-state-not-carried");
+    WitnessEquivalenceDimension preservedObservers =
+        WitnessEquivalenceDimension::Unknown("preserved-observers-not-carried");
+    WitnessEquivalenceDimension counterState =
+        WitnessEquivalenceDimension::Unknown("counter-state-not-carried");
+    WitnessProducerKindSet producerKinds =
+        WitnessProducerKindSet::Unknown("producer-kind-not-carried");
+    WitnessBoundaryClass boundaryClass = WitnessBoundaryClass::Unknown;
+    WitnessDiagnosticClass diagnosticClass =
+        WitnessDiagnosticClass::Unknown;
+    WitnessCompositionClass compositionClass =
+        WitnessCompositionClass::Unknown;
+
+    bool HasUnknownDimensions() const {
+      return !targetPPTokens.known || !suffixState.known ||
+             !preservedObservers.known || !counterState.known ||
+             !producerKinds.known ||
+             boundaryClass == WitnessBoundaryClass::Unknown ||
+             diagnosticClass == WitnessDiagnosticClass::Unknown ||
+             compositionClass == WitnessCompositionClass::Unknown;
+    }
+
+    std::string UnknownDimensionSummary() const {
+      std::string out;
+      auto append = [&](llvm::StringRef name) {
+        if (!out.empty())
+          out += ",";
+        out += name.str();
+      };
+
+      if (!targetPPTokens.known)
+        append("target_pp");
+      if (!suffixState.known)
+        append("suffix_state");
+      if (!preservedObservers.known)
+        append("observers");
+      if (!counterState.known)
+        append("counter");
+      if (!producerKinds.known)
+        append("producer");
+      if (boundaryClass == WitnessBoundaryClass::Unknown)
+        append("boundary");
+      if (diagnosticClass == WitnessDiagnosticClass::Unknown)
+        append("diagnostics");
+      if (compositionClass == WitnessCompositionClass::Unknown)
+        append("composition");
+      return out.empty() ? std::string("none") : out;
+    }
+
+    static std::string PartitionEnumValue(llvm::StringRef name,
+                                          llvm::StringRef value,
+                                          bool known, uint64_t witnessId) {
+      if (known)
+        return value.str();
+      return llvm::formatv("unknown:{0}:witness#{1}", name, witnessId).str();
+    }
+
+    std::string PartitionString(uint64_t witnessId) const {
+      return llvm::formatv(
+                 "target={0}|suffix={1}|observers={2}|counter={3}|"
+                 "producers={4}|boundary={5}|diagnostics={6}|"
+                 "composition={7}",
+                 targetPPTokens.PartitionValue("target_pp", witnessId),
+                 suffixState.PartitionValue("suffix_state", witnessId),
+                 preservedObservers.PartitionValue("observers", witnessId),
+                 counterState.PartitionValue("counter", witnessId),
+                 producerKinds.PartitionValue(witnessId),
+                 PartitionEnumValue(
+                     "boundary", toString(boundaryClass),
+                     boundaryClass != WitnessBoundaryClass::Unknown,
+                     witnessId),
+                 PartitionEnumValue(
+                     "diagnostics", toString(diagnosticClass),
+                     diagnosticClass != WitnessDiagnosticClass::Unknown,
+                     witnessId),
+                 PartitionEnumValue(
+                     "composition", toString(compositionClass),
+                     compositionClass != WitnessCompositionClass::Unknown,
+                     witnessId))
+          .str();
+    }
+
+    std::string ToString() const {
+      return llvm::formatv(
+                 "target_pp={0} suffix_state={1} observer_state={2} "
+                 "counter={3} producers={4} boundary={5} diagnostics={6} "
+                 "composition={7} complete={8} unknown_dims={9}",
+                 targetPPTokens.ToString(), suffixState.ToString(),
+                 preservedObservers.ToString(), counterState.ToString(),
+                 producerKinds.ToString(), toString(boundaryClass),
+                 toString(diagnosticClass), toString(compositionClass),
+                 HasUnknownDimensions() ? "no" : "yes",
+                 UnknownDimensionSummary())
+          .str();
+    }
+  };
+
+  struct WitnessCanonicalCost {
+    uint64_t preserveOriginalPenalty = 0;
+    uint64_t sourceRangeBytes = 0;
+    uint64_t argumentBoundaryChangePenalty = 0;
+    uint64_t ownerBoundaryChangePenalty = 0;
+    uint64_t spellingChangePenalty = 0;
+    uint64_t sourceOrder = 0;
+
+    std::string ToString() const {
+      return llvm::formatv(
+                 "preserve_penalty={0} range_bytes={1} "
+                 "arg_boundary_penalty={2} owner_boundary_penalty={3} "
+                 "spelling_penalty={4} source_order={5}",
+                 preserveOriginalPenalty, sourceRangeBytes,
+                 argumentBoundaryChangePenalty, ownerBoundaryChangePenalty,
+                 spellingChangePenalty, sourceOrder)
+          .str();
+    }
+  };
+
+  struct RefoldWitness {
+    uint64_t witnessId = 0;
+    WitnessProofFamily family = WitnessProofFamily::Unknown;
+    std::string owner;
+    std::string detail;
+    WitnessEquivalenceKey key;
+    WitnessCanonicalCost cost;
+    std::string payloadPreview;
+
+    std::string ToString() const {
+      return llvm::formatv("id={0} family={1} owner={2} detail={3}",
+                           witnessId, family, owner, detail)
+          .str();
+    }
+  };
+
+  struct WitnessAmbiguityClass {
+    uint64_t classIndex = 0;
+    WitnessEquivalenceKey key;
+    uint64_t candidateCount = 0;
+    uint64_t selectableCount = 0;
+
+    std::string ToString() const {
+      return llvm::formatv("class={0} candidates={1} selectable={2} {3}",
+                           classIndex, candidateCount, selectableCount,
+                           key.ToString())
+          .str();
+    }
+  };
+
+  /// \brief Probe result for composing locally selected witnesses into a
+  /// globally valid source-repair tuple.
+  ///
+  /// Phase 13 keeps this as a resolver-side proof object.  A selector candidate
+  /// is either a one-tile tuple or a pre-composed mixed-owner tiling witness.
+  /// Unknown composition facts never establish equivalence; strict mode may use
+  /// a resolver result only when every selectable tuple has complete composition
+  /// facts and the surviving tuples occupy one global composition class, or when
+  /// multiple proof certificates certify the same concrete source repair.
+  struct WitnessCompositionDecision {
+    bool computed = false;
+    bool compatible = false;
+    bool failureIsFatal = false;
+    uint64_t candidateTupleCount = 0;
+    uint64_t completeTupleCount = 0;
+    uint64_t incompleteTupleCount = 0;
+    uint64_t incompatibleTupleCount = 0;
+    uint64_t globalClassCount = 0;
+    std::string reason;
+  };
+
+
+#define REFOLD_WITNESS_RESOLVER_MODE_LIST(REFOLD_X)                           \
+  REFOLD_X(Off)                                                               \
+  REFOLD_X(Probe)                                                             \
+  REFOLD_X(Strict)
+
+  enum class WitnessResolverMode : uint8_t {
+#define REFOLD_X(name) name,
+    REFOLD_WITNESS_RESOLVER_MODE_LIST(REFOLD_X)
+#undef REFOLD_X
+  };
+
+  friend inline StringRef toString(WitnessResolverMode value) {
+    switch (value) {
+#define REFOLD_X(name) case WitnessResolverMode::name: return #name;
+      REFOLD_WITNESS_RESOLVER_MODE_LIST(REFOLD_X)
+#undef REFOLD_X
+    }
+    return "Off";
+  }
+#undef REFOLD_WITNESS_RESOLVER_MODE_LIST
+
+  /// \brief Probe/strict decision from the central witness resolver.
+  ///
+  /// The resolver is introduced behind CLANG_REFOLD_WITNESS_RESOLVER.  In
+  /// `off` mode this structure is only used by the trace layer.  In `probe`
+  /// mode it reports whether the legacy selector agrees with the canonical
+  /// single-class witness choice.  In `strict` mode it is authoritative only
+  /// when every selectable witness comes from a converted proof family, has a
+  /// complete equivalence key, and the surviving source-repair classes are
+  /// equivalent under the resolver policy.
+  struct WitnessResolverDecision {
+    std::string role;
+    WitnessResolverMode mode = WitnessResolverMode::Off;
+    uint64_t candidateCount = 0;
+    uint64_t selectableCount = 0;
+    uint64_t proofInvalidCount = 0;
+    uint64_t equivalenceClassCount = 0;
+    uint64_t completeWitnessCount = 0;
+    uint64_t incompleteWitnessCount = 0;
+    uint64_t resolverAuthoritativeWitnessCount = 0;
+    uint64_t resolverUnconvertedWitnessCount = 0;
+    WitnessCompositionDecision composition;
+    std::optional<size_t> legacyIndex;
+    std::optional<size_t> resolverIndex;
+    bool resolverComputed = false;
+    bool resolverImplemented = false;
+    bool strictUseResolver = false;
+    bool strictFailClosed = false;
+    std::string failureReason;
+    WitnessFallbackClass fallbackClass = WitnessFallbackClass::Unknown;
+    WitnessStrictDomainDecision strictDomain;
+    std::string agreement;
+
+    bool ShouldUseResolverIndex() const {
+      return mode == WitnessResolverMode::Strict && strictUseResolver &&
+             resolverIndex.has_value();
+    }
+
+    bool ShouldFailClosed() const {
+      return mode == WitnessResolverMode::Strict && strictFailClosed;
+    }
+  };
 
   struct RefoldStats {
     uint64_t totalIncludes = 0;
@@ -4300,6 +4966,16 @@ private:
   static std::string
   FormatCounterEventForWitness(const CounterEventIdentity &event);
 
+  /// Return true when a component belongs to logical line/file state.
+  static bool IsLineControlStateComponent(OwnerStateComponent component);
+
+  /// Format line-control and builtin-location state facts for Phase-9 witness
+  /// keys without reparsing source text.
+  static std::string
+  FormatLineControlEventForWitness(const LineControlStateIdentity &event);
+  static std::string FormatBuiltinLocationObservationForWitness(
+      const BuiltinLocationObservation &observation);
+
 
   /// Build the source/token boundary for one include directive.
   static OwnerStateBoundary
@@ -5577,6 +6253,91 @@ private:
   /// normalized proof summary plus enough artifact-local provenance for the
   /// converted Patch-B selection sites to compare accepted outcomes through the
   /// lattice without rebuilding path-specific ordering logic.
+  /// \brief Explicit witness state for line-control and builtin-location
+  /// preservation.
+  ///
+  /// Phase 9 moves logical line/file/file-name observer facts into the shared
+  /// witness vocabulary.  This carrier is deliberately a projection of
+  /// producer/state-graph facts that already exist on accepted candidates; it
+  /// does not rescan source text or infer #line semantics from spelling.
+  struct LineControlObserverWitness {
+    bool observesLineNumber = false;
+    bool observesFileState = false;
+    bool observesFileName = false;
+
+    uint32_t lineControlEventCount = 0;
+    uint32_t activeLineControlEventCount = 0;
+    uint32_t inactiveLineControlEventCount = 0;
+    uint32_t producerProvenLineControlEventCount = 0;
+    uint32_t missingOperandLineControlEventCount = 0;
+    uint32_t unknownOperandLineControlEventCount = 0;
+
+    uint32_t builtinLocationObservationCount = 0;
+    uint32_t builtinLineObservationCount = 0;
+    uint32_t builtinFileObservationCount = 0;
+    uint32_t builtinFileNameObservationCount = 0;
+
+    uint32_t sourceAuthoredLineDirectiveCount = 0;
+    uint32_t producerEmittedLineDirectiveCount = 0;
+    uint32_t includeReturnResyncCount = 0;
+    uint32_t syntheticResyncCount = 0;
+
+    bool physicalLayoutKnown = false;
+    bool physicalLayoutStable = false;
+    bool hasSourceLineControlState = false;
+    bool hasBuiltinLocationObservers = false;
+    bool hasSuffixLineControlDischarge = false;
+
+    std::string stateSignature;
+    std::string observerSignature;
+    std::string layoutSignature;
+
+    bool Empty() const {
+      return !observesLineNumber && !observesFileState &&
+             !observesFileName && lineControlEventCount == 0 &&
+             builtinLocationObservationCount == 0 &&
+             !hasSuffixLineControlDischarge;
+    }
+  };
+
+  /// \brief Explicit witness state for `__COUNTER__` preservation.
+  ///
+  /// Phase 10 makes counter sequencing an ordinary equivalence-key dimension.
+  /// The witness is a projection of already-proven producer/state facts: it
+  /// names concrete counter events when available, records whether the accepted
+  /// repair preserves or materializes the counter suffix state, and keeps the
+  /// B-side literal value surface separate from ordinary token equivalence.
+  struct CounterStateWitness {
+    bool observesCounter = false;
+    bool hasCounterEvents = false;
+    bool counterOrderKnown = false;
+    bool suffixStateStable = false;
+    bool coversAllAffectedObservers = false;
+    bool literalizationStable = false;
+    bool materializationStable = false;
+    bool suffixUnobserved = false;
+    bool hasExpectedBValues = false;
+    bool hasMissingExpectedBValues = false;
+
+    uint32_t counterConsumptionCount = 0;
+    uint32_t counterObservationCount = 0;
+    uint32_t counterMutationCount = 0;
+    uint32_t preservedSuffixObserverCount = 0;
+    uint32_t expectedBValueCount = 0;
+    uint32_t missingExpectedBValueCount = 0;
+
+    std::string consumptionSignature;
+    std::string orderSignature;
+    std::string suffixObserverSignature;
+    std::string suffixValueSignature;
+
+    bool Empty() const {
+      return !observesCounter && !hasCounterEvents &&
+             !suffixStateStable && counterConsumptionCount == 0 &&
+             preservedSuffixObserverCount == 0;
+    }
+  };
+
   struct AcceptedResultCandidate {
     AcceptedResultCandidateKind kind = AcceptedResultCandidateKind::Unknown;
     ProofSummary proofSummary = {};
@@ -5600,6 +6361,144 @@ private:
     // never participates in admissibility or ordering.
     bool hasPayloadPreview = false;
     std::string payloadPreview;
+
+    // Phase 3 witness-equivalence surface for structure-preserving macro
+    // actual repair.  These fields are copied from MacroPatch only after the
+    // existing macro proof has already validated a whole-envelope replay.  They
+    // are proof facts, not selection preferences: the resolver may use them to
+    // decide whether two source spellings occupy the same observational class,
+    // but the byte spelling itself remains outside the equivalence key.
+    bool hasTargetBTokenRange = false;
+    uint64_t targetBTokStart = 0;
+    uint64_t targetBTokEnd = 0;
+    bool hasMacroActualRepairWitness = false;
+    bool macroActualWholeEnvelopeReplayValidated = false;
+    bool macroActualDefinitionTapeReplayValidated = false;
+    bool macroActualArityStable = false;
+
+    // Phase 5 generated-callee / higher-order replay facts.  These are
+    // copied from MacroPatchProof only after an existing replay proof has
+    // validated the generated callee chain and mapped the solved callee
+    // actuals back to the root invocation.  They refine witness equivalence
+    // without changing the legacy theorem class or selector ordering.
+    bool hasGeneratedCalleeReplayWitness = false;
+    uint64_t generatedCalleeRootMacroId = 0;
+    uint64_t generatedCalleeFinalDirectiveId = 0;
+    uint32_t generatedCalleeDepth = 0;
+    uint32_t generatedCalleeObjectAliasHops = 0;
+    bool generatedCalleeChainDeterministic = false;
+    bool generatedCalleeReplacementReplayValidated = false;
+    bool generatedCalleeSolvedActualsMappedToRoot = false;
+    bool generatedCalleeUsesForwarding = false;
+    bool generatedCalleeUsesStringification = false;
+    bool generatedCalleeUsesPaste = false;
+    bool generatedCalleeUsesVariadicForwarding = false;
+    bool generatedCalleeUsesObjectAlias = false;
+    bool generatedCalleeDecodedStringLiteralEvidenceOnly = false;
+
+    // Phase 6 direct stringification proof facts. These fields are populated
+    // only from producer-recorded stringify spans on an already accepted
+    // invocation-preserving macro patch. They are equivalence-key facts, not
+    // replacement text: decoded string-literal payloads are used only to build
+    // a canonical comparison signature for the proven stringification edge.
+    bool hasStringificationWitness = false;
+    uint64_t stringificationRootMacroId = 0;
+    uint32_t stringificationSpanCount = 0;
+    uint32_t stringificationArgCount = 0;
+    bool stringificationWhitespaceNormalized = false;
+    bool stringificationEscapedSpellingStable = false;
+    std::string stringificationProducerSignature;
+    std::string stringificationCanonicalPayloadSignature;
+
+    // Phase 6 token-paste proof facts. These fields summarize producer-
+    // recorded paste-token structure and/or an already validated paste replay.
+    // They deliberately distinguish left/right/result paste obligations from
+    // ordinary adjacent forwarding.
+    bool hasTokenPasteWitness = false;
+    uint64_t tokenPasteRootMacroId = 0;
+    uint32_t tokenPasteSpanCount = 0;
+    uint32_t tokenPasteTokenCount = 0;
+    uint32_t tokenPastePartCount = 0;
+    uint32_t tokenPasteArgPartCount = 0;
+    uint32_t tokenPasteLiteralPartCount = 0;
+    bool tokenPasteHasLeftProducer = false;
+    bool tokenPasteHasRightProducer = false;
+    bool tokenPasteResultValidated = false;
+    bool tokenPasteDiagnosticSafe = false;
+    std::string tokenPasteProducerSignature;
+    std::string tokenPasteResultSignature;
+
+    // Phase 7 variadic / comma-elision proof facts. These fields distinguish
+    // the source-level pack state from the PP-token effect: missing variadic
+    // tails, explicit empty tails, non-empty forwarded packs, VA_OPT comma
+    // materialization, GNU comma elision, and literal commas inside the
+    // variadic actual are separate equivalence dimensions.
+    bool hasVariadicCommaWitness = false;
+    uint64_t variadicRootMacroId = 0;
+    uint32_t variadicFormalIndex = 0;
+    bool variadicArityStable = false;
+    bool variadicOriginalMissing = false;
+    bool variadicOriginalExplicitEmpty = false;
+    bool variadicOriginalNonEmpty = false;
+    bool variadicResultMissing = false;
+    bool variadicResultExplicitEmpty = false;
+    bool variadicResultNonEmpty = false;
+    bool variadicLiteralCommaInActual = false;
+    bool variadicCommaInserted = false;
+    bool variadicCommaDeleted = false;
+    bool variadicGnuCommaElision = false;
+    bool variadicVaOptPresent = false;
+    bool variadicVaOptOriginallyActive = false;
+    bool variadicVaOptResultActive = false;
+    bool variadicVaOptCommaIntroduced = false;
+    bool variadicVaOptCommaDeleted = false;
+    uint32_t variadicVaOptNodeCount = 0;
+    uint32_t variadicVaOptIncludedCount = 0;
+    std::string variadicProducerSignature;
+    std::string variadicPackStateSignature;
+
+    // Phase 8 zero-token / boundary-gap proof facts.  These facts are
+    // producer-anchored ownership evidence for insertions whose A-side source
+    // width is zero: exact TU slots, collapsed include boundaries, empty macro
+    // actuals, zero-token replacement-list gaps, and paired pure-insertion
+    // frontiers.  They deliberately track boundary/layout/observer stability as
+    // equivalence dimensions rather than treating all zero-width anchors as
+    // interchangeable.
+    bool hasZeroTokenBoundaryWitness = false;
+    uint64_t zeroTokenOwnerId = 0;
+    std::string zeroTokenOwnerKind;
+    bool zeroTokenHasPPGap = false;
+    uint64_t zeroTokenPPGap = 0;
+    bool zeroTokenHasSourceAnchor = false;
+    uint64_t zeroTokenSourceAnchor = 0;
+    bool zeroTokenHasBTokenRange = false;
+    uint64_t zeroTokenBTokStart = 0;
+    uint64_t zeroTokenBTokEnd = 0;
+    bool zeroTokenProducerProven = false;
+    bool zeroTokenOwnerClosed = false;
+    bool zeroTokenLayoutStable = false;
+    bool zeroTokenObserversStable = false;
+    bool zeroTokenCounterStable = false;
+    bool zeroTokenFromEmptyActual = false;
+    bool zeroTokenFromReplacementGap = false;
+    bool zeroTokenFromPairedInsertion = false;
+    bool zeroTokenFromTUAnchor = false;
+    bool zeroTokenFromIncludeBoundary = false;
+    bool zeroTokenFromDirectiveLayoutGap = false;
+    std::string zeroTokenBoundarySignature;
+
+    // Phase 9 line-control / builtin-location observer facts.  These fields
+    // are attached after the normal proof summary has been built, and are used
+    // only by witness tracing / equivalence-key construction.
+    bool hasLineControlObserverWitness = false;
+    LineControlObserverWitness lineControlObserverWitness;
+
+    // Phase 10 `__COUNTER__` observer/consumption facts.  These fields are
+    // projected from typed CounterEventIdentity and SuffixStabilityWitness
+    // records.  They are equivalence facts only; they do not decide whether a
+    // patch is admissible or alter selector ordering.
+    bool hasCounterStateWitness = false;
+    CounterStateWitness counterStateWitness;
   };
 
   /// \brief Result returned by the accepted-result selector.
@@ -5728,6 +6627,31 @@ private:
     uint64_t callsiteMacroId = 0;
   };
 
+  /// \brief Producer-path evidence for generated-callee / higher-order replay.
+  ///
+  /// Generated-callee proofs are not ordinary forwarding even when their final
+  /// emitted source edit is a root invocation argument rewrite.  The proof
+  /// follows a deterministic generated-call chain, optionally through
+  /// object-like aliases, then replays the final callee replacement list as a
+  /// producer-aware transducer.  Decoded string-literal payloads are recorded
+  /// as comparison evidence only; they are never treated as replacement text
+  /// unless the path also carries an explicit stringification producer.
+  struct GeneratedCalleeReplayWitness {
+    uint64_t rootMacroId = 0;
+    uint64_t finalDirectiveId = 0;
+    uint32_t generatedCallDepth = 0;
+    uint32_t objectAliasHops = 0;
+    bool calleeChainDeterministic = false;
+    bool replacementReplayValidated = false;
+    bool solvedActualsMappedToRoot = false;
+    bool usesForwarding = false;
+    bool usesStringification = false;
+    bool usesPaste = false;
+    bool usesVariadicForwarding = false;
+    bool usesObjectAlias = false;
+    bool decodedStringLiteralEvidenceOnly = false;
+  };
+
   /// \brief Evidence that an invocation-preserving patch replayed the whole
   /// macro expansion envelope, not merely one local formal span.
   ///
@@ -5751,6 +6675,72 @@ private:
     bool definitionTapeReplayValidated = false;
   };
 
+  /// \brief Producer-path evidence for variadic / comma-elision replay.
+  ///
+  /// Variadic macro repairs are not ordinary forwarding. The same final token
+  /// stream can arise by absorbing text into a fixed formal, by making an
+  /// omitted pack explicit, by deleting or inserting the source-level separating
+  /// comma, or by activating/deactivating an `__VA_OPT__` payload.  This witness
+  /// records those distinctions so the common equivalence key never merges
+  /// missing, empty, comma-elided, and VA_OPT-mediated repairs by source spelling
+  /// alone.
+  struct VariadicCommaWitness {
+    uint64_t rootMacroId = 0;
+    uint32_t variadicFormalIndex = 0;
+    bool arityStable = false;
+    bool originalMissing = false;
+    bool originalExplicitEmpty = false;
+    bool originalNonEmpty = false;
+    bool resultMissing = false;
+    bool resultExplicitEmpty = false;
+    bool resultNonEmpty = false;
+    bool literalCommaInActual = false;
+    bool commaInserted = false;
+    bool commaDeleted = false;
+    bool gnuCommaElision = false;
+    bool vaOptPresent = false;
+    bool vaOptOriginallyActive = false;
+    bool vaOptResultActive = false;
+    bool vaOptCommaIntroduced = false;
+    bool vaOptCommaDeleted = false;
+    uint32_t vaOptNodeCount = 0;
+    uint32_t vaOptIncludedCount = 0;
+    std::string producerSignature;
+    std::string packStateSignature;
+  };
+
+  /// \brief Producer-path evidence for zero-token insertion and boundary-gap
+  /// repairs.
+  ///
+  /// A zero-token repair is not justified by nearest-token guessing.  The
+  /// anchor must name a producer-proven owner boundary, and the witness records
+  /// whether layout, preserved observers, and counter state are known stable.
+  /// Different zero-width anchors remain non-equivalent unless these semantic
+  /// dimensions match.
+  struct ZeroTokenBoundaryWitness {
+    uint64_t ownerId = 0;
+    std::string ownerKind;
+    bool hasPPGap = false;
+    uint64_t ppGap = 0;
+    bool hasSourceAnchor = false;
+    uint64_t sourceAnchor = 0;
+    bool hasBTokenRange = false;
+    uint64_t bTokStart = 0;
+    uint64_t bTokEnd = 0;
+    bool producerProven = false;
+    bool ownerClosed = false;
+    bool layoutStable = false;
+    bool observersStable = false;
+    bool counterStable = false;
+    bool fromEmptyActual = false;
+    bool fromReplacementGap = false;
+    bool fromPairedInsertion = false;
+    bool fromTUAnchor = false;
+    bool fromIncludeBoundary = false;
+    bool fromDirectiveLayoutGap = false;
+    std::string boundarySignature;
+  };
+
   /// \brief Canonical MacroPatch-local proof carrier.
   ///
   /// Phase 2D makes this object the only MacroPatch-local proof authority.
@@ -5767,7 +6757,11 @@ private:
     std::optional<PasteWitness> paste;
     std::optional<SubtreeCertificate> subtree;
     std::optional<CallChainWitness> callChain;
+    std::optional<GeneratedCalleeReplayWitness> generatedCalleeReplay;
     std::optional<WholeEnvelopeReplayWitness> wholeEnvelopeReplay;
+    std::optional<VariadicCommaWitness> variadicCommaReplay;
+    std::optional<ZeroTokenBoundaryWitness> zeroTokenBoundaryReplay;
+    std::optional<CounterStateWitness> counterState;
   };
 
   struct MacroPatch {
@@ -5888,6 +6882,132 @@ private:
     uint64_t ownerCondArmIdCert = 0;
     uint32_t ownerWitnessCount = 0;
   };
+
+  /// Build the trace-only witness family associated with an accepted path.
+  static WitnessProofFamily
+  WitnessFamilyForAcceptedPath(AcceptedPathKind path);
+
+  /// Build the trace-only producer kind associated with an accepted path.
+  static WitnessProducerKind
+  WitnessProducerKindForAcceptedPath(AcceptedPathKind path);
+
+  /// Return true when Phase 12 has migrated the witness family to the common
+  /// resolver authority boundary.
+  ///
+  /// This is deliberately a family-level gate, not a completeness shortcut:
+  /// strict mode may use the resolver only when every selectable candidate is
+  /// both complete and drawn from a converted family.  Unconverted complete
+  /// witnesses remain probe-only and fall back to the legacy selector until
+  /// their proof family has gone through the same audit.
+  static bool IsResolverAuthoritativeWitnessFamily(WitnessProofFamily family);
+
+  /// Build the trace-only boundary class associated with an accepted result.
+  static WitnessBoundaryClass
+  WitnessBoundaryClassForAcceptedCandidate(const AcceptedResultCandidate &candidate);
+
+  /// Build a deterministic, proof-neutral hash string for witness traces.
+  static std::string FormatWitnessTraceHash(llvm::StringRef text);
+
+  /// Attach Phase-9 line-control / builtin-location observer witness facts to
+  /// an accepted candidate using only existing proof-summary state.
+  void AttachLineControlObserverWitness(
+      AcceptedResultCandidate &candidate) const;
+
+  /// Attach Phase-10 `__COUNTER__` consumption/observer witness facts to an
+  /// accepted candidate using only existing proof-summary state.
+  void AttachCounterStateWitness(AcceptedResultCandidate &candidate) const;
+
+  /// Build the Phase-0 partial equivalence key for a selected/accepted artifact.
+  WitnessEquivalenceKey
+  BuildWitnessEquivalenceKey(const AcceptedResultCandidate &candidate) const;
+
+  /// Build the Phase-0 canonical-cost trace for a selected/accepted artifact.
+  WitnessCanonicalCost
+  BuildWitnessCanonicalCost(const AcceptedResultCandidate &candidate) const;
+
+  /// Wrap an accepted artifact in the stable Phase-0 witness terminology.
+  RefoldWitness BuildRefoldWitness(const AcceptedResultCandidate &candidate,
+                                   llvm::StringRef role,
+                                   uint64_t witnessId = 0) const;
+
+  /// Return true when witness traces are explicitly requested.
+  ///
+  /// Witness traces are intentionally controlled by a dedicated environment
+  /// variable rather than by the generic log level: Phase-0 witness logging is
+  /// an audit stream, not normal refolding diagnostics.  Leaving the variable
+  /// unset must make the scaffold completely silent.
+  bool IsWitnessTraceEnabled() const;
+
+  /// Return the requested global witness resolver mode.
+  ///
+  /// CLANG_REFOLD_WITNESS_RESOLVER is intentionally independent from
+  /// CLANG_REFOLD_TRACE_WITNESSES: probe/strict mode may compute resolver
+  /// decisions even when the trace stream is disabled, while trace mode may
+  /// still report selector classes with the resolver logically off.
+  WitnessResolverMode GetWitnessResolverMode() const;
+
+  /// Trace helpers for the global witness-resolution migration.
+  ///
+  /// These helpers are deliberately side-effect-free except for trace logging.
+  /// They must not participate in candidate admissibility, ordering, or output
+  /// construction during Phase 0.
+  void TraceWitnessEmitted(const RefoldWitness &witness) const;
+  void TraceWitnessRejected(const RefoldWitness &witness,
+                            WitnessRejectReason reason,
+                            llvm::StringRef detail = llvm::StringRef()) const;
+  void TraceWitnessAmbiguity(llvm::StringRef role, uint64_t candidateCount,
+                             uint64_t selectableCount,
+                             uint64_t ambiguityClassCount) const;
+  void TraceWitnessSelectionProbe(llvm::StringRef role,
+                                  uint64_t candidateCount,
+                                  uint64_t proofValidCount,
+                                  uint64_t proofInvalidCount,
+                                  uint64_t equivalenceClassCount,
+                                  uint64_t completeWitnessCount,
+                                  uint64_t incompleteWitnessCount) const;
+  void TraceWitnessResolverDecision(
+      const WitnessResolverDecision &decision) const;
+  void TraceWitnessCompositionDecision(
+      llvm::StringRef role, const WitnessCompositionDecision &decision) const;
+
+  WitnessCompositionDecision ResolveWitnessComposition(
+      llvm::StringRef role,
+      ArrayRef<std::pair<size_t, RefoldWitness>> selectableWitnesses,
+      bool hasSingleConcreteRepairIdentity) const;
+
+  WitnessResolverDecision ResolveWitnessesForSelection(
+      llvm::StringRef role, size_t candidateCount,
+      llvm::function_ref<bool(size_t)> isSelectable,
+      llvm::function_ref<RefoldWitness(size_t)> buildWitness,
+      llvm::function_ref<bool(size_t, size_t)> canonicalPrefers,
+      std::optional<size_t> legacyIndex) const;
+
+  static WitnessFallbackClass
+  ClassifyTerminalFallbackFailure(
+      const TerminalFallbackProofFailure &failure);
+
+  static WitnessFallbackClass ClassifyIncompleteWitnessKeys(
+      ArrayRef<std::pair<size_t, RefoldWitness>> witnesses);
+
+  static WitnessFallbackClass ClassifyResolverFallbackReason(
+      llvm::StringRef reason,
+      const WitnessCompositionDecision &composition);
+
+  static WitnessStrictDomainObligation
+  StrictDomainObligationForFallbackClass(WitnessFallbackClass fallbackClass);
+
+  static WitnessStrictDomainDecision ClassifyStrictDomainForResolver(
+      const WitnessResolverDecision &decision);
+
+  static WitnessStrictDomainDecision ClassifyStrictDomainForTerminalFallback(
+      const TerminalFallbackProofFailure &failure);
+
+  void TraceWitnessStrictDomain(llvm::StringRef role,
+                                const WitnessStrictDomainDecision &decision) const;
+
+  void TraceWitnessChosen(const RefoldWitness &witness,
+                          uint64_t selectedIndex) const;
+  void TraceWitnessFallback(const TerminalFallbackRequest &request) const;
 
   /// \brief Deterministic whole-cover realization plan for one invocation.
   ///
@@ -8161,13 +9281,30 @@ private:
   bool IsSelectableAcceptedResultCandidate(
       const AcceptedResultCandidate &candidate) const;
 
+  /// \brief Return whether \p lhs has a strictly stronger proof than \p rhs.
+  ///
+  /// Phase 2 names the proof-validity/preference boundary explicitly: this
+  /// predicate may use only theorem-facing proof summaries.  It is not allowed
+  /// to inspect artifact-local byte ranges or spelling previews.
+  bool AcceptedResultCandidateProofPrefers(
+      const AcceptedResultCandidate &lhs,
+      const AcceptedResultCandidate &rhs) const;
+
+  /// \brief Deterministic canonical tie-breaker for already-valid candidates.
+  ///
+  /// This predicate is intentionally not a proof obligation.  It may order
+  /// concrete emitted artifacts only after both candidates have passed the
+  /// selector's proof-validity gate and neither proof summary strictly outranks
+  /// the other.
+  bool AcceptedResultCandidateCanonicalPrefers(
+      const AcceptedResultCandidate &lhs,
+      const AcceptedResultCandidate &rhs) const;
+
   /// \brief Return whether \p lhs outranks \p rhs under the normalized
   /// candidate ordering used by Patch B.
   ///
-  /// This lifts the proof-summary lattice comparison to the accepted-result
-  /// carrier and then applies deterministic artifact-local tie-breakers. When
-  /// two candidates are still indistinguishable after those tie-breakers, the
-  /// caller's original enumeration order is preserved.
+  /// Phase 2 keeps the public ordering behavior-preserving, but implements it
+  /// as a proof-ordering step followed by a canonical tie-breaker step.
   bool AcceptedResultCandidatePrefers(
       const AcceptedResultCandidate &lhs,
       const AcceptedResultCandidate &rhs) const;
