@@ -8375,10 +8375,6 @@ std::string RefoldEngine::RunSinglePassRefold() {
       children[*ii.parent].push_back(&ii);
   }
 
-  for (const auto &[parentId, items] : children) {
-    std::string pName = "#" + std::to_string(parentId);
-  }
-
   // Cache for realized expansion text per include id.
   DenseMap<uint64_t, std::string> includeExpansion;
 
@@ -16166,13 +16162,6 @@ bool RefoldEngine::PasteArgReplacementsMatchAllPasteTokensInB(
     // token spelling. Apply edits in descending byteBegin so earlier rewrites
     // do not shift later offsets.
     std::vector<RefoldModel::PPArgSpan> &spans = spansByTok[key];
-
-    SmallVector<uint32_t, 8> carriedArgIdxs =
-        collectSortedUInt32Keys(replByArgIdx);
-    SmallVector<uint32_t, 8> directPasteArgIdxs =
-        collectSortedUniquePasteArgIdxs(spans);
-    SmallVector<uint32_t, 8> carriedButDirectMissingArgIdxs =
-        computeSortedMissingUInt32s(carriedArgIdxs, directPasteArgIdxs);
 
     // Apply in descending byteBegin so replacements cannot shift the offsets
     // of later spans.
@@ -32368,13 +32357,10 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
       };
 
       if (hEff.aStart == hEff.aEnd && !abTokHunks_.empty()) {
-        // Record whether the current hunk is already fully argument-like, then
-        // collect sibling pure-insertion hunks inside the same macro cover.
+        // Collect sibling pure-insertion hunks inside the same macro cover.
         // Those partner insertions are later used to synthesize a wider
         // envelope for split insertion edits that are not explainable from the
         // current hunk alone.
-        SmallVector<char, 16> curRootTouched(argLikeSpans.size(), 0);
-
         SmallVector<diffutils::Hunk, 8> partnerInsertions;
         for (const auto &hh : abTokHunks_) {
           // Only pure insertions can serve as the second frontier of a
@@ -32392,17 +32378,14 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           partnerInsertions.push_back(hh);
         }
 
-
         for (const auto &partner : partnerInsertions) {
           // Combine the current insertion with its partner to see whether the
-          // pair exposes an argument-local edit envelope. The untrimmed
-          // envelope is kept for diagnostics, while the trimmed envelope is the
-          // proof candidate passed to the args-only builder.
+          // pair exposes an argument-local edit envelope. The trimmed envelope is
+          // the proof candidate passed to the args-only builder.
           const diffutils::Hunk env =
               buildCombinedInsertionEnvelope(hEff, partner);
           const diffutils::Hunk envTrim = trimCommonEdgeTokens(env);
 
-          SmallVector<char, 16> envRootTouched(argLikeSpans.size(), 0);
           SmallVector<char, 16> envTrimRootTouched(argLikeSpans.size(), 0);
           const bool envTrimRootWithinArgLike =
               !argLikeSpans.empty() &&
@@ -32418,7 +32401,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             pairRootPatch =
                 BuildMacroInvocationPatchArgsOnly(m, envTrim, baseInvText);
           }
-
 
           if (pairRootPatch) {
             SplitInsertionRootCandidate candidate;
@@ -32451,44 +32433,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             // validation and tracing do not depend on discovery order.
             llvm::sort(candidate.deferOccurrenceArgIdxs);
             splitInsertionRootCandidates.push_back(std::move(candidate));
-          }
-
-          for (const auto &cand : model_.GetMacroInvocations()) {
-            // Probe only proper descendants of the current root invocation.
-            // Depth zero is the root itself; unresolved depth means this
-            // invocation is not on the root-owned expansion chain being
-            // diagnosed.
-            auto d = depthToRoot(cand);
-            if (!d || *d == 0)
-              continue;
-
-            // The paired insertion envelope must fit inside the descendant
-            // cover before that descendant can plausibly explain the split
-            // insertion.
-            if (!(cand.cover.begin <= env.aStart && env.aEnd <= cand.cover.end))
-              continue;
-
-            // Build the descendant's argument-like ownership set using the same
-            // sanitized span rules as the root probe, then test the current
-            // hunk, combined envelope, and trimmed envelope against it.
-            SmallVector<RefoldModel::PPArgSpan, 8> candArgLikeProbe;
-            gatherArgLike(cand, candArgLikeProbe);
-            sanitizeArgLikeSpans(candArgLikeProbe);
-
-            SmallVector<char, 8> candCurTouchedBySpan(candArgLikeProbe.size(),
-                                                      0);
-            SmallVector<char, 8> candEnvTouchedBySpan(candArgLikeProbe.size(),
-                                                      0);
-            SmallVector<char, 8> candEnvTrimTouchedBySpan(
-                candArgLikeProbe.size(), 0);
-
-            // Also test body-span containment. A split insertion may fail the
-            // root args-only explanation but still be diagnosable as body-local
-            // to a nested macro invocation.
-            SmallVector<uint32_t, 8> curBodyTouched;
-            SmallVector<uint32_t, 8> envBodyTouched;
-            SmallVector<uint32_t, 8> envTrimBodyTouched;
-
           }
         }
       }
@@ -35574,18 +35518,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         };
         splitCore(splitCore, 0, core);
 
-        if (!splitSolutions.empty()) {
-          std::string splitOut;
-          raw_string_ostream os(splitOut);
-          os << "[";
-          for (size_t i = 0; i < splitSolutions[0].size(); ++i) {
-            if (i)
-              os << ", ";
-            os << "'" << splitSolutions[0][i] << "'";
-          }
-          os << "]";
-        }
-
         // Accept only a unique split with one new segment for each old paste
         // contribution. Anything else is ambiguous or structurally incomplete.
         if (splitSolutions.size() != 1 ||
@@ -35625,19 +35557,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         });
         if (cert.derivedConstraints.empty())
           return std::nullopt;
-        {
-          std::string dc;
-          raw_string_ostream os(dc);
-          os << "{";
-          for (size_t i = 0; i < cert.derivedConstraints.size(); ++i) {
-            if (i)
-              os << ", ";
-            os << cert.derivedConstraints[i].first << ":'"
-               << cert.derivedConstraints[i].second.oldText << "'->'"
-               << cert.derivedConstraints[i].second.newText << "'";
-          }
-          os << "}";
-        }
         cert.valid = true;
         return cert;
       };
@@ -35932,64 +35851,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           return std::nullopt;
         }
 
-        {
-          SmallVector<std::string, 4> siblingOldExpansionCandidates =
-              expansionTextCandidates(*matchedSibling, /*fromB=*/false);
-          std::string expansionList;
-          raw_string_ostream os(expansionList);
-          os << "[";
-          for (size_t i = 0; i < siblingOldExpansionCandidates.size(); ++i) {
-            if (i)
-              os << ", ";
-            os << "'" << siblingOldExpansionCandidates[i] << "'";
-          }
-          os << "]";
-
-          // Diagnostic-only counterfactual: if the current child formal depends
-          // on two parent formals, check whether the sibling's old expansion
-          // would have supported a two-parent delimited split. This does not
-          // accept the lift; it only explains why the sibling reroot may or may
-          // not have a plausible parent-level factorization.
-          if (curFormal < cur.argDeps.size() &&
-              cur.argDeps[curFormal].size() == 2 &&
-              siblingOldExpansionCandidates.size() == 1) {
-            ArrayRef<uint32_t> deps = cur.argDeps[curFormal];
-            auto oldAOpt = getInvocationArgText(parent, deps[0]);
-            auto oldBOpt = getInvocationArgText(parent, deps[1]);
-            if (oldAOpt && oldBOpt) {
-              StringRef oldExp =
-                  StringRef(siblingOldExpansionCandidates[0]).trim();
-              StringRef oldA = oldAOpt->trim();
-              StringRef oldB = oldBOpt->trim();
-              bool factors = oldExp.starts_with(oldA) &&
-                             oldExp.ends_with(oldB) &&
-                             oldExp.size() >= oldA.size() + oldB.size();
-              std::string midStr;
-              if (factors) {
-                StringRef mid =
-                    oldExp.slice(oldA.size(), oldExp.size() - oldB.size());
-                midStr = mid.str();
-                if (!mid.empty()) {
-                  const uint64_t needA = countSubstr(oldA, mid);
-                  const uint64_t needB = countSubstr(oldB, mid);
-                  for (size_t pos = 0;
-                       (pos = newTrim.find(mid, pos)) != StringRef::npos;
-                       ++pos) {
-                    StringRef newA = newTrim.slice(0, pos);
-                    StringRef newB = newTrim.drop_front(pos + mid.size());
-                    if (countSubstr(newA, mid) < needA ||
-                        countSubstr(newB, mid) < needB)
-                      continue;
-                  }
-                }
-              }
-            }
-          }
-        }
-
         std::optional<StructuredLiftCertificate> uniqueLift;
         std::optional<uint32_t> uniqueSiblingFormal;
-        std::string uniqueSiblingOld;
 
         auto sameNextFormals =
             [&](const DenseMap<uint32_t, FormalTextPair> &lhs,
@@ -36189,7 +36052,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           }
 
           uniqueSiblingFormal = siblingFormal;
-          uniqueSiblingOld = siblingOldTrim.str();
           uniqueLift = std::move(siblingLift);
         }
 

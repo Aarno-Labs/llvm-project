@@ -1495,7 +1495,6 @@ bool RefoldEngine::AppendIncludeLineObserverLayoutRealizationEdits(
     std::string replacement = bSource_.slice(prevBEnd, initialBEnd).str();
     replacement += ownLineClosure.sourceSpelledExtension;
 
-    const std::string replacementForTrace = replacement;
     IncludePatch patch{include, std::move(replacement), patchAStart, patchAEnd,
                        patchBStart, patchBEnd};
     patch.hasDirectHeaderByteRange = true;
@@ -1635,7 +1634,6 @@ bool RefoldEngine::AppendIncludeLineObserverLayoutRealizationEdits(
       continue;
     }
 
-    const std::string replacementForTrace = replacement;
     IncludePatch patch{include, std::move(replacement), patchAStart, patchAEnd,
                        patchBStart, patchBEnd};
     patch.hasDirectHeaderByteRange = true;
