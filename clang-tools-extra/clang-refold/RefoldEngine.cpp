@@ -8398,12 +8398,154 @@ std::string RefoldEngine::RunSinglePassRefold() {
   // have to reconstruct where that emitted non-terminal artifact came from.
   DenseMap<uint64_t, AcceptedResultCandidate> includeExpansionAcceptedResults;
 
+  // Token diff hunks describe edits to PP-token spellings.  Raw byte hunks
+  // additionally expose token-empty layout edits that occur in PP gaps.  A gap
+  // can be structurally adjacent to an include edge even when no PP token was
+  // edited.  In the byte-only case, preserving the `#include` directive may
+  // force Clang to regenerate caller-edge `-E -P` layout that the modified PP
+  // stream has explicitly removed, while materializing that include site emits
+  // the selected header bytes directly.
+  //
+  // The important proof boundary is "byte-only".  Once a normal token hunk, a
+  // sideband pragma edit, a TU text edit, an include patch, or a macro patch
+  // already explains part of the modified stream, an adjacent whitespace hunk is
+  // not by itself an owner witness for a clean neighboring include.  Treating
+  // it as one would be a non-minimal heuristic: leading/trailing `-E -P`
+  // newline drift commonly appears around otherwise valid repairs and does not
+  // prove that the first or last include must be opened.  Composite layout
+  // edits need a real tiling proof before they may force extra materialization;
+  // this fallback handles only the fully byte-only surface where no stronger
+  // structural repair exists.
+  DenseSet<uint64_t> layoutOnlyIncludeMaterializationSeeds;
+
+  auto tokenEndOffset = [](ArrayRef<PPTok> toks, ArrayRef<size_t> tokOff,
+                           size_t index) -> uint64_t {
+    return static_cast<uint64_t>(tokOff[index] + toks[index].spelling.size());
+  };
+
+  auto findTokenGapContainingByteRange =
+      [&](StringRef source, ArrayRef<PPTok> toks, ArrayRef<size_t> tokOff,
+          uint64_t begin, uint64_t end) -> std::optional<uint64_t> {
+    if (begin > end || end > source.size())
+      return std::nullopt;
+
+    const size_t n = toks.size();
+    if (tokOff.size() < n + 1)
+      return std::nullopt;
+
+    size_t gap = 0;
+    while (gap < n && static_cast<uint64_t>(tokOff[gap]) < end)
+      ++gap;
+
+    const uint64_t gapBegin =
+        gap == 0 ? 0 : tokenEndOffset(toks, tokOff, gap - 1);
+    const uint64_t gapEnd =
+        gap == n ? static_cast<uint64_t>(source.size())
+                 : static_cast<uint64_t>(tokOff[gap]);
+
+    if (begin < gapBegin || end > gapEnd)
+      return std::nullopt;
+    return static_cast<uint64_t>(gap);
+  };
+
+  auto layoutOnlyIncludeSeedForRawByteHunk =
+      [&](const diffutils::Hunk &h) -> std::optional<uint64_t> {
+    if (h.aStart > h.aEnd || h.bStart > h.bEnd ||
+        h.aEnd > aSource_.size() || h.bEnd > bSource_.size())
+      return std::nullopt;
+
+    StringRef aSlice = aSource_.slice(static_cast<size_t>(h.aStart),
+                                      static_cast<size_t>(h.aEnd));
+    StringRef bSlice = bSource_.slice(static_cast<size_t>(h.bStart),
+                                      static_cast<size_t>(h.bEnd));
+    if (!aSlice.trim().empty() || !bSlice.trim().empty())
+      return std::nullopt;
+
+    std::optional<uint64_t> aGap = findTokenGapContainingByteRange(
+        aSource_, aToks_, aTokOff_, h.aStart, h.aEnd);
+    std::optional<uint64_t> bGap = findTokenGapContainingByteRange(
+        bSource_, bToks_, bTokOff_, h.bStart, h.bEnd);
+    if (!aGap || !bGap)
+      return std::nullopt;
+
+    const uint64_t tokenCount = static_cast<uint64_t>(aToks_.size());
+    std::optional<uint64_t> leftInc =
+        *aGap > 0 ? model_.InnermostIncludeAtPP(*aGap - 1) : std::nullopt;
+    std::optional<uint64_t> rightInc =
+        *aGap < tokenCount ? model_.InnermostIncludeAtPP(*aGap)
+                           : std::nullopt;
+
+    // Prefix/suffix gaps with a single include neighbor are include-edge
+    // layout.  Interior gaps whose two sides share the same include are
+    // include-local layout.  For nested include boundaries, use the LCA owner
+    // so the child edge is repaired on the enclosing materialized surface.  If
+    // the only common owner is the TU, leave the hunk unclaimed; choosing left
+    // or right would be an implementation-order heuristic.
+    if (leftInc && rightInc) {
+      if (*leftInc == *rightInc)
+        return leftInc;
+      return model_.LeastCommonAncestorInclude(leftInc, rightInc);
+    }
+    if (leftInc)
+      return leftInc;
+    if (rightInc)
+      return rightInc;
+    return std::nullopt;
+  };
+
+  auto includeBucketsHavePatches = [&]() {
+    for (const auto &entry : perInclude)
+      if (!entry.second.patches.empty())
+        return true;
+    return false;
+  };
+
+  auto macroBucketsHavePatches = [&]() {
+    for (const auto &entry : macroPatchesByOwner)
+      if (!entry.second.empty())
+        return true;
+    return false;
+  };
+
+  const bool mayUseByteOnlyIncludeLayoutSeed =
+      hunks.empty() && sidebandPragmaEdits_.empty() && tuEdits.empty() &&
+      !includeBucketsHavePatches() && !macroBucketsHavePatches();
+
+  if (mayUseByteOnlyIncludeLayoutSeed && abByteHunks_) {
+    for (const diffutils::Hunk &byteHunk : *abByteHunks_) {
+      if (std::optional<uint64_t> seed =
+              layoutOnlyIncludeSeedForRawByteHunk(byteHunk)) {
+        layoutOnlyIncludeMaterializationSeeds.insert(*seed);
+        REFOLD_LOG_TRACE(
+            "include/layout",
+            "seed include materialization from byte-only raw layout hunk "
+            "A[{0},{1}) -> B[{2},{3}) inc#{4}",
+            byteHunk.aStart, byteHunk.aEnd, byteHunk.bStart, byteHunk.bEnd,
+            *seed);
+      }
+    }
+  } else if (inTraceMode() && abByteHunks_ && !abByteHunks_->empty()) {
+    REFOLD_LOG_TRACE(
+        "include/layout",
+        "skip byte-only include layout seeding: tokenHunks={0} "
+        "sidebandPragmas={1} tuEdits={2} includePatchBuckets={3} "
+        "macroPatchBuckets={4} rawByteHunks={5}",
+        hunks.size(), sidebandPragmaEdits_.size(), tuEdits.size(),
+        perInclude.size(), macroPatchesByOwner.size(), abByteHunks_->size());
+  }
+
   // Build the set of include-ids that must be realized.
   DenseSet<uint64_t> seeds;
 
   // (a) Direct include edits.
   auto perIncludeKeys = make_first_range(perInclude);
   seeds.insert(perIncludeKeys.begin(), perIncludeKeys.end());
+
+  // (a.0) Byte-only layout edits at include-owned PP gaps have no token hunk,
+  // but can still require the include site to be opened so the final `-E -P`
+  // byte stream realizes the selected caller-edge layout.
+  seeds.insert(layoutOnlyIncludeMaterializationSeeds.begin(),
+               layoutOnlyIncludeMaterializationSeeds.end());
 
   // (a.1) Header-owned sideband pragma edits are zero-normal-token source
   // edits. They do not create an include patch from an A/B hunk, but they still
@@ -8793,6 +8935,9 @@ std::string RefoldEngine::RunSinglePassRefold() {
   };
   auto classifyTUIncludeMaterializationWork =
       [&](auto &&self, uint64_t id) -> TUIncludeMaterializationWorkClass {
+    if (layoutOnlyIncludeMaterializationSeeds.contains(id))
+      return TUIncludeMaterializationWorkClass::Ordinary;
+
     bool sawSideband = llvm::any_of(
         sidebandPragmaEdits_, [&](const SidebandPragmaEdit &e) {
           return e.TargetsInclude(id);
@@ -8878,6 +9023,18 @@ std::string RefoldEngine::RunSinglePassRefold() {
 
         return false;
       };
+
+  auto includeSubtreeHasLayoutOnlyMaterializationSeed =
+      [&](auto &&self, uint64_t id) -> bool {
+    if (layoutOnlyIncludeMaterializationSeeds.contains(id))
+      return true;
+    if (auto it = children.find(id); it != children.end()) {
+      for (const RefoldModel::IncludeItem *child : it->second)
+        if (child && self(self, child->id))
+          return true;
+    }
+    return false;
+  };
 
   auto sourceGraphIncludePathIsUnaliasedOrCoherent =
       [&](const RefoldModel::IncludeItem &inc, StringRef sourceGraphPath,
@@ -9002,6 +9159,20 @@ std::string RefoldEngine::RunSinglePassRefold() {
         safeSourceGraphRelativeIncludePath(inc);
     if (!sourceGraphPath)
       return std::nullopt;
+
+    if (includeSubtreeHasLayoutOnlyMaterializationSeed(
+            includeSubtreeHasLayoutOnlyMaterializationSeed, inc.id)) {
+      // Source-graph sidecars are path-level artifacts.  They can replace the
+      // bytes read from a header path, but they cannot realize an edit to the
+      // caller's PP layout at this particular include edge.  A byte-only raw
+      // layout hunk seeded from an include boundary is therefore an
+      // include-site-local obligation and must be emitted by replacing the
+      // include directive in the owner surface, not by writing a sidecar that
+      // every surviving same-path include would observe.
+      recordRejectedSourceGraphCleanup(inc, StringRef(*sourceGraphPath),
+                                       candidateBytes);
+      return std::nullopt;
+    }
 
     if (!sourceGraphIncludePathIsUnaliasedOrCoherent(
             inc, StringRef(*sourceGraphPath), candidateBytes)) {
