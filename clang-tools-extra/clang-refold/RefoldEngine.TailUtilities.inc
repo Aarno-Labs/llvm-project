@@ -2957,81 +2957,260 @@ void RefoldEngine::MaterializeIncludeExpansion(
                        : MaterializationWorkClass::None;
   };
 
-  auto cleanChildIncludeWouldChangeQuoteLookupAfterReplay =
-      [&](const RefoldModel::IncludeItem &child) -> bool {
-        // A clean child include normally stays spelled as an include directive
-        // when its parent header is materialized.  That is only source-accurate
-        // if replaying the directive from the final materialized surface keeps
-        // the same quoted-include lookup result that the producer observed in
-        // the original header context.
-        //
-        // The refold map gives us a concrete, deterministic instability proof:
-        // a TU-level include with the same safe quoted spelling resolved to a
-        // different physical file than this child include.  If we leave the
-        // child directive inside materialized parent text, it is replayed from
-        // the TU/output lookup context and can observe that TU-level target
-        // instead of the child's original header-relative target.  In that
-        // case the child include must be treated as materialization work even
-        // though the child subtree itself is token-clean.
-        //
-        // Do not discount a conflicting TU include merely because the current
-        // fixed-point selected it for local materialization.  The safety
-        // question here is whether replaying this child directive from the
-        // materialized parent surface is lookup-equivalent in the final output
-        // directory.  Materialization planning is not a proof that no same-name
-        // sidecar or other output-directory artifact will shadow the original
-        // header-relative lookup; if the spelling would resolve differently,
-        // the owner-closed repair is to materialize the child edge too.
-        if (!child.parent || child.angled || !child.resolvedPath)
-          return false;
+  enum class CleanChildIncludeReplayAction { None, RewriteOperand, Materialize };
 
-        std::optional<std::string> childReplayPath =
-            quotedIncludeReplayLookupPath(child);
-        if (!childReplayPath)
-          return false;
+  struct CleanChildIncludeReplayPlan {
+    CleanChildIncludeReplayAction action = CleanChildIncludeReplayAction::None;
+    std::string rewrittenOperand;
+    std::string reason;
+  };
 
-        std::optional<std::string> childReplayKey =
-            quotedIncludeReplayLookupKey(child);
+  auto absolutePathInPPCwd = [&](StringRef path) -> std::filesystem::path {
+    std::filesystem::path fsPath(path.str());
+    if (fsPath.is_absolute())
+      return fsPath;
+    return std::filesystem::path(model_.GetPPCwd().str()) / fsPath;
+  };
 
-        for (const RefoldModel::IncludeItem &tuInc : model_.GetIncludes()) {
-          if (tuInc.id == child.id || tuInc.parent ||
-              !PathsEqual(tuInc.sitePath, model_.GetSourcePath()) ||
-              !tuInc.resolvedPath)
-            continue;
+  auto canonicalizeForLookupProof = [&](StringRef path)
+      -> std::optional<std::filesystem::path> {
+    std::error_code ec;
+    std::filesystem::path canonical =
+        std::filesystem::weakly_canonical(absolutePathInPPCwd(path), ec);
+    if (ec)
+      return std::nullopt;
+    return canonical;
+  };
 
-          std::optional<std::string> tuReplayKey =
-              quotedIncludeReplayLookupKey(tuInc);
-          if (!childReplayKey || !tuReplayKey ||
-              *tuReplayKey != *childReplayKey)
-            continue;
+  auto sourceDirectoryForReplaySurface = [&]()
+      -> std::optional<std::filesystem::path> {
+    std::optional<std::filesystem::path> source =
+        canonicalizeForLookupProof(model_.GetSourcePath());
+    if (!source)
+      return std::nullopt;
+    source->remove_filename();
+    return source;
+  };
 
-          if (PathsEqual(*tuInc.resolvedPath, *child.resolvedPath))
-            continue;
+  auto synthesizeQuotedIncludeOperandForReplaySurface =
+      [&](const RefoldModel::IncludeItem &child) -> std::optional<std::string> {
+    if (!child.resolvedPath)
+      return std::nullopt;
 
-          return true;
+    std::optional<std::filesystem::path> sourceDir =
+        sourceDirectoryForReplaySurface();
+    std::optional<std::filesystem::path> resolved =
+        canonicalizeForLookupProof(*child.resolvedPath);
+    if (!sourceDir || !resolved)
+      return std::nullopt;
+
+    std::error_code ec;
+    std::filesystem::path relative = std::filesystem::relative(*resolved,
+                                                               *sourceDir, ec);
+    if (ec || relative.empty())
+      return std::nullopt;
+
+    const std::string operand = relative.generic_string();
+    if (!safeRewrittenQuotedIncludeOperand(operand))
+      return std::nullopt;
+
+    SmallString<256> replayPath(sourceDir->generic_string());
+    llvm::sys::path::append(replayPath, operand);
+    StringRef replayPathRef(replayPath.data(), replayPath.size());
+    if (!llvm::sys::fs::exists(replayPathRef) ||
+        !PathsEqual(replayPathRef, *child.resolvedPath))
+      return std::nullopt;
+
+    return operand;
+  };
+
+  auto planCleanChildIncludeReplayFromMaterializedParent =
+      [&](const RefoldModel::IncludeItem &child) -> CleanChildIncludeReplayPlan {
+    CleanChildIncludeReplayPlan plan;
+
+    // A clean child include normally stays spelled as an include directive when
+    // its parent header is materialized.  That is only source-accurate if
+    // replaying the directive from the new materialized surface preserves the
+    // same quote-lookup result that the producer observed in the original
+    // header context.  If the original operand is unstable, prefer a local
+    // operand rewrite that names the same physical file from the replay surface;
+    // only materialize the child expansion when no deterministic safe operand
+    // can be proven.
+    if (!child.parent || child.angled || !child.resolvedPath)
+      return plan;
+
+    std::optional<std::string> childReplayOperand =
+        quotedIncludeReplayLookupOperand(child);
+    if (!childReplayOperand)
+      return plan;
+
+    std::optional<std::string> childReplayKey =
+        quotedIncludeReplayLookupKey(child);
+
+    bool unstable = false;
+    bool mayRewriteUnstableOperand = false;
+    std::string reason;
+
+    for (const RefoldModel::IncludeItem &tuInc : model_.GetIncludes()) {
+      if (tuInc.id == child.id || tuInc.parent ||
+          !PathsEqual(tuInc.sitePath, model_.GetSourcePath()) ||
+          !tuInc.resolvedPath)
+        continue;
+
+      std::optional<std::string> tuReplayKey =
+          quotedIncludeReplayLookupKey(tuInc);
+      if (!childReplayKey || !tuReplayKey || *tuReplayKey != *childReplayKey)
+        continue;
+
+      if (PathsEqual(*tuInc.resolvedPath, *child.resolvedPath))
+        continue;
+
+      // A surviving TU-surface include with the same lexical lookup key but a
+      // different producer-resolved file is a real shadowing conflict in the
+      // replay context.  Do not synthesize a third spelling that bypasses that
+      // conflict: the owner-closed repair is to materialize this child edge,
+      // because preserving an include would no longer be the same lookup event
+      // the producer observed.
+      unstable = true;
+      mayRewriteUnstableOperand = false;
+      reason = "same lookup key resolves differently at TU surface";
+      break;
+    }
+
+    if (!unstable) {
+      std::optional<std::filesystem::path> sourceDir =
+          sourceDirectoryForReplaySurface();
+      if (!sourceDir)
+        return plan;
+
+      SmallString<256> replayFromSourceDir(sourceDir->generic_string());
+      llvm::sys::path::append(replayFromSourceDir, *childReplayOperand);
+
+      StringRef replayFromSourceDirRef(replayFromSourceDir.data(),
+                                       replayFromSourceDir.size());
+      if (llvm::sys::fs::exists(replayFromSourceDirRef)) {
+        if (!PathsEqual(replayFromSourceDirRef, *child.resolvedPath)) {
+          // The original quoted operand already resolves to a concrete but
+          // different file from the materialized replay surface.  This applies
+          // even to simple spellings such as "leaf.h": once a child include is
+          // copied out of its header directory, the TU/output directory is the
+          // first quote-lookup directory and can shadow the producer's original
+          // header-relative target.  Rewriting around that shadow would invent
+          // a new lookup event instead of preserving the one the producer saw,
+          // so the owner-closed repair is to materialize the child edge.
+          unstable = true;
+          mayRewriteUnstableOperand = false;
+          reason = "quoted operand resolves to a different file at replay "
+                   "surface";
         }
+      } else if (includeOperandHasParentComponent(*childReplayOperand)) {
+        // A parent-directory operand such as "../leaf.h" is meaningful only
+        // relative to the including header's directory.  Once the directive is
+        // copied into a materialized parent surface, a missing direct replay
+        // target is proof that the original spelling is not stable; preserving
+        // it would either fail preprocessing or let later include-search state
+        // choose a file not proven to be the producer's original target.  This
+        // is the one safe rewrite case: there is no concrete replay-surface
+        // shadow to bypass, so a deterministic TU-surface operand that resolves
+        // to the producer's original file preserves the include as an include.
+        unstable = true;
+        mayRewriteUnstableOperand = true;
+        reason = "parent-directory quoted operand has no direct replay target";
+      }
+    }
 
-        // The producer may not contain a TU-level same-spelling include while
-        // the final replay directory still contains a file that would shadow
-        // the child's original header-relative lookup.  This happens whenever a
-        // materialized parent with `#include "leaf.h"` is emitted beside a TU
-        // directory that already has `leaf.h` (including stale/source-graph
-        // side outputs).  Since the engine emits only the refolded TU text here
-        // and cannot rewrite headers, preserving the clean child directive is
-        // safe only when replaying that quoted spelling from the TU directory is
-        // proven to resolve to the same physical file that the producer saw.
-        SmallString<256> replayFromTUDir(model_.GetSourcePath());
-        llvm::sys::path::remove_filename(replayFromTUDir);
-        llvm::sys::path::append(replayFromTUDir, *childReplayPath);
+    if (!unstable)
+      return plan;
 
-        StringRef replayFromTUDirRef(replayFromTUDir.data(),
-                                      replayFromTUDir.size());
-        if (llvm::sys::fs::exists(replayFromTUDirRef) &&
-            !PathsEqual(replayFromTUDirRef, *child.resolvedPath))
-          return true;
+    if (mayRewriteUnstableOperand) {
+      if (std::optional<std::string> rewritten =
+              synthesizeQuotedIncludeOperandForReplaySurface(child)) {
+        plan.action = CleanChildIncludeReplayAction::RewriteOperand;
+        plan.rewrittenOperand = std::move(*rewritten);
+        plan.reason = std::move(reason);
+        return plan;
+      }
+    }
 
-        return false;
-      };
+    plan.action = CleanChildIncludeReplayAction::Materialize;
+    plan.reason = std::move(reason);
+    return plan;
+  };
+
+  auto extendIncludeDirectiveEnd = [&](const RefoldModel::IncludeItem &item,
+                                       StringRef ownerBytes,
+                                       uint64_t siteStart) -> uint64_t {
+    uint64_t siteEnd = std::clamp<uint64_t>(item.siteE, siteStart,
+                                            ownerBytes.size());
+    if (siteStart >= static_cast<uint64_t>(ownerBytes.size()))
+      return siteEnd;
+
+    size_t cursor = static_cast<size_t>(siteStart);
+    while (true) {
+      size_t nl = ownerBytes.find('\n', cursor);
+      if (nl == StringRef::npos)
+        return static_cast<uint64_t>(ownerBytes.size());
+      cursor = nl + 1;
+      if (!stringutils::isLineSplice(ownerBytes, nl))
+        return std::max<uint64_t>(siteEnd, cursor);
+    }
+  };
+
+  auto makeCleanChildIncludeOperandRewriteEdit =
+      [&](const RefoldModel::IncludeItem &child, const std::string &operand,
+          StringRef ownerBytes) -> std::optional<TextEdit> {
+    const size_t targetPos = child.text.find(child.target);
+    if (targetPos == StringRef::npos)
+      return std::nullopt;
+
+    const size_t n = ownerBytes.size();
+    const uint64_t siteStart = std::clamp<uint64_t>(child.siteB, 0ULL, n);
+    const uint64_t siteEnd = extendIncludeDirectiveEnd(child, ownerBytes,
+                                                       siteStart);
+    if (siteStart >= siteEnd)
+      return std::nullopt;
+    if (!child.cover.IsValid() || child.cover.begin >= child.cover.end)
+      return std::nullopt;
+
+    std::string replacement = child.text.str();
+    replacement.replace(targetPos, child.target.size(),
+                        (Twine("\"") + operand + "\"").str());
+
+    // Rewriting a clean child include operand is a parent-surface source edit,
+    // not child expansion.  The proof witness is the child's own mapped token
+    // envelope: the rewritten directive is accepted only because it is proven to
+    // resolve to the same physical file and therefore to reproduce the same
+    // child PP-token range.  Stamping a normal include-preserving carrier keeps
+    // strict theorem/audit mode from treating this deterministic closure repair
+    // as an unproven emission artifact.
+    IncludePatch patch{&child,
+                       replacement,
+                       child.cover.begin,
+                       child.cover.end,
+                       child.cover.begin,
+                       child.cover.end};
+    patch.hasDirectHeaderByteRange = true;
+    patch.directHeaderByteBegin = siteStart;
+    patch.directHeaderByteEnd = siteEnd;
+
+    IncludeAnchorWitness witness;
+    witness.evidence = IncludeAnchorEvidenceKind::MappedHeaderTokens;
+    witness.hasByteRange = true;
+    witness.startByte = siteStart;
+    witness.endByte = siteEnd;
+    witness.hasFirstPP = true;
+    witness.firstPP = child.cover.begin;
+    witness.hasLastPP = true;
+    witness.lastPP = child.cover.end - 1;
+
+    TextEdit edit{siteStart, siteEnd, replacement, std::nullopt, std::nullopt,
+                  {}, {}, {}};
+    AttachAcceptedResultCarrier(
+        edit, BuildAcceptedIncludeCandidate(
+                  AcceptedPathKind::IncludeDeleteReplaceMappedHeaderTokens,
+                  patch, &witness));
+    return edit;
+  };
 
   auto hasDescendantWork = [&](auto &&self, uint64_t id) -> bool {
     bool selfWork = includeHasSidebandPragmaWork(id);
@@ -3044,8 +3223,16 @@ void RefoldEngine::MaterializeIncludeExpansion(
     }
 
     if (!selfWork) {
-      if (const RefoldModel::IncludeItem *item = model_.GetIncludeById(id))
-        selfWork = cleanChildIncludeWouldChangeQuoteLookupAfterReplay(*item);
+      if (const RefoldModel::IncludeItem *item = model_.GetIncludeById(id)) {
+        CleanChildIncludeReplayPlan replayPlan =
+            planCleanChildIncludeReplayFromMaterializedParent(*item);
+        // A clean-child operand rewrite is discharged as a local edit in the
+        // parent surface, so it is not descendant materialization work.  Only
+        // an unstable include with no safe rewritten operand forces recursive
+        // child materialization.
+        selfWork = replayPlan.action ==
+                   CleanChildIncludeReplayAction::Materialize;
+      }
     }
 
     if (selfWork) {
@@ -3070,9 +3257,40 @@ void RefoldEngine::MaterializeIncludeExpansion(
     for (const auto *child : it->second) {
       const bool todo = hasDescendantWork(hasDescendantWork, child->id);
       if (!todo) {
-        // No descendant edits depend on this child, so preserve the original
-        // include directive instead of expanding it unnecessarily.
-        continue;
+        CleanChildIncludeReplayPlan replayPlan =
+            planCleanChildIncludeReplayFromMaterializedParent(*child);
+        if (replayPlan.action == CleanChildIncludeReplayAction::RewriteOperand) {
+          if (std::optional<TextEdit> rewrite =
+                  makeCleanChildIncludeOperandRewriteEdit(
+                      *child, replayPlan.rewrittenOperand, bytes)) {
+            REFOLD_LOG_TRACE(
+                "include/lookup",
+                "rewrite clean child include #{0} for materialized-parent "
+                "quote lookup: target={1} rewritten=\"{2}\" reason={3}",
+                child->id, child->target, replayPlan.rewrittenOperand,
+                replayPlan.reason);
+            edits.push_back(std::move(*rewrite));
+          } else {
+            // The lookup proof showed that preserving the original operand is
+            // unsafe, but the source spelling was not rewriteable as a bounded
+            // parent-surface edit.  Fall back to owner-closed child
+            // materialization rather than silently preserving an unstable
+            // directive.
+            REFOLD_LOG_TRACE(
+                "include/lookup",
+                "failed to rewrite clean child include #{0}; materializing "
+                "child edge instead",
+                child->id);
+            replayPlan.action = CleanChildIncludeReplayAction::Materialize;
+          }
+        }
+
+        if (replayPlan.action != CleanChildIncludeReplayAction::Materialize) {
+          // No descendant edits depend on this child.  Either the original
+          // directive was lookup-stable and can stay as-is, or we staged a
+          // local operand rewrite above.
+          continue;
+        }
       }
 
       // Depth-first materialization ensures the child replacement is already
@@ -3088,31 +3306,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
       const auto &childText = includeExpansion[child->id];
       const size_t n = bytes.size();
       const uint64_t siteStart = std::clamp<uint64_t>(child->siteB, 0ULL, n);
-      uint64_t siteEnd = std::clamp<uint64_t>(child->siteE, siteStart, n);
-
-      // Producer include ranges are normally the complete directive spelling,
-      // but line-spliced directives can be reported with an end offset that
-      // covers only the first physical line (for example `#\\\n`).  When a
-      // materialized parent replaces a dirty child include, leaving the
-      // continuation line behind turns `#\\\ninclude "h"` into the ordinary
-      // tokens `include "h"`.  Treat the owner interval as the whole physical
-      // directive by extending through escaped-newline continuations, matching
-      // the defensive TU-level include materialization rule below.
-      if (siteStart < static_cast<uint64_t>(bytes.size())) {
-        size_t cursor = static_cast<size_t>(siteStart);
-        while (true) {
-          size_t nl = StringRef(bytes).find('\n', cursor);
-          if (nl == StringRef::npos) {
-            siteEnd = static_cast<uint64_t>(bytes.size());
-            break;
-          }
-          cursor = nl + 1;
-          if (!stringutils::isLineSplice(bytes, nl)) {
-            siteEnd = std::max<uint64_t>(siteEnd, cursor);
-            break;
-          }
-        }
-      }
+      uint64_t siteEnd = extendIncludeDirectiveEnd(*child, bytes, siteStart);
 
       if (siteStart < siteEnd) {
         const bool sidebandOnly = classifyMaterializationWork(

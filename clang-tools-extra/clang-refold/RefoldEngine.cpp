@@ -213,6 +213,61 @@ quotedIncludeReplayLookupPath(const RefoldModel::IncludeItem &inc) {
   return path.str();
 }
 
+/// Return a quoted include operand for lookup analysis, allowing parent
+/// directory components.  This helper never authorizes source-graph side-file
+/// creation and never by itself proves preservation safe; it only gives replay
+/// proof code the exact operand that Clang would look up after a clean child
+/// include is moved onto a materialized parent surface.
+static std::optional<std::string>
+quotedIncludeReplayLookupOperand(const RefoldModel::IncludeItem &inc) {
+  if (inc.angled)
+    return std::nullopt;
+
+  StringRef target = inc.target;
+  if (target.size() < 2 || target.front() != '"' || target.back() != '"')
+    return std::nullopt;
+
+  StringRef path = target.drop_front().drop_back();
+  if (path.empty() || path.contains('\\') || path.contains('"') ||
+      llvm::sys::path::is_absolute(path))
+    return std::nullopt;
+
+  SmallVector<StringRef, 8> components;
+  path.split(components, '/', /*MaxSplit=*/-1, /*KeepEmpty=*/true);
+  for (StringRef component : components)
+    if (component.empty())
+      return std::nullopt;
+
+  if (!llvm::all_of(path, [](char c) {
+        return isSafeSourceGraphIncludePathChar(c);
+      }))
+    return std::nullopt;
+
+  return path.str();
+}
+
+static bool includeOperandHasParentComponent(StringRef path) {
+  SmallVector<StringRef, 8> components;
+  path.split(components, '/', /*MaxSplit=*/-1, /*KeepEmpty=*/true);
+  return llvm::is_contained(components, StringRef(".."));
+}
+
+static bool safeRewrittenQuotedIncludeOperand(StringRef path) {
+  if (path.empty() || path.contains('\\') || path.contains('"') ||
+      llvm::sys::path::is_absolute(path))
+    return false;
+
+  SmallVector<StringRef, 8> components;
+  path.split(components, '/', /*MaxSplit=*/-1, /*KeepEmpty=*/true);
+  for (StringRef component : components)
+    if (component.empty() || component == "." || component == "..")
+      return false;
+
+  return llvm::all_of(path, [](char c) {
+    return isSafeSourceGraphIncludePathChar(c);
+  });
+}
+
 /// Return a lexical key for comparing quoted include operands from the same
 /// directory.  `./leaf.h` and `leaf.h` are the same lookup request, but the
 /// original spelling is still needed when probing the output directory above.
