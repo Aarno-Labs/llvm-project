@@ -112,6 +112,7 @@
 #include <string>
 #include <tuple>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 using namespace llvm;
@@ -230,6 +231,135 @@ static bool safeRewrittenQuotedIncludeOperand(StringRef path) {
 
 static bool isSourceGraphDirectiveHorizontalWhitespace(char c) {
   return c == '\r' || stringutils::isNonNewlineWs(c);
+}
+
+struct IncludeDirectiveHeaderOperandRange {
+  size_t Begin = 0;
+  size_t End = 0;
+};
+
+// Locate pieces of a source-spelled include directive without rebuilding the
+// directive from the normalized JSON spelling.  Comments are phase-3 trivia for
+// directive recognition, so they must be skipped while finding the syntactic
+// header-name token, but preserved verbatim in the replacement text.
+static bool consumeIncludeDirectiveEscapedNewline(StringRef text,
+                                                  size_t &pos) {
+  if (pos >= text.size() || text[pos] != '\\')
+    return false;
+
+  size_t cursor = pos + 1;
+  while (cursor < text.size() &&
+         isSourceGraphDirectiveHorizontalWhitespace(text[cursor]))
+    ++cursor;
+  if (cursor >= text.size())
+    return false;
+  if (text[cursor] == '\r') {
+    ++cursor;
+    if (cursor < text.size() && text[cursor] == '\n')
+      ++cursor;
+  } else if (text[cursor] == '\n') {
+    ++cursor;
+  } else {
+    return false;
+  }
+
+  pos = cursor;
+  return true;
+}
+
+static bool skipIncludeDirectiveHorizontalTrivia(StringRef text, size_t &pos) {
+  while (pos < text.size()) {
+    if (isSourceGraphDirectiveHorizontalWhitespace(text[pos])) {
+      ++pos;
+      continue;
+    }
+    if (consumeIncludeDirectiveEscapedNewline(text, pos))
+      continue;
+    if (pos + 1 < text.size() && text[pos] == '/' && text[pos + 1] == '*') {
+      pos += 2;
+      bool closed = false;
+      while (pos + 1 < text.size()) {
+        if (consumeIncludeDirectiveEscapedNewline(text, pos))
+          continue;
+        if (text[pos] == '*' && text[pos + 1] == '/') {
+          pos += 2;
+          closed = true;
+          break;
+        }
+        ++pos;
+      }
+      if (!closed)
+        return false;
+      continue;
+    }
+    if (pos + 1 < text.size() && text[pos] == '/' && text[pos + 1] == '/')
+      return false;
+    break;
+  }
+  return true;
+}
+
+static bool consumeIncludeDirectiveKeyword(StringRef text, size_t &pos,
+                                           StringRef keyword) {
+  if (!text.substr(pos).starts_with(keyword))
+    return false;
+  const size_t end = pos + keyword.size();
+  if (end < text.size() &&
+      (stringutils::isIdentPart(text[end]) || text[end] == '_'))
+    return false;
+  pos = end;
+  return true;
+}
+
+static std::optional<std::pair<size_t, size_t>>
+findIncludeDirectiveKeywordRange(StringRef directive) {
+  size_t pos = 0;
+  if (!skipIncludeDirectiveHorizontalTrivia(directive, pos))
+    return std::nullopt;
+  if (pos >= directive.size() || directive[pos] != '#')
+    return std::nullopt;
+  ++pos;
+  if (!skipIncludeDirectiveHorizontalTrivia(directive, pos))
+    return std::nullopt;
+
+  const size_t keywordBegin = pos;
+  if (consumeIncludeDirectiveKeyword(directive, pos, "include_next"))
+    return std::make_pair(keywordBegin, pos);
+  pos = keywordBegin;
+  if (consumeIncludeDirectiveKeyword(directive, pos, "include"))
+    return std::make_pair(keywordBegin, pos);
+  return std::nullopt;
+}
+
+// Return the exact byte range of the directive's syntactic header-name token.
+// `expectedTarget` includes its delimiters, e.g. `"leaf.h"` or `<leaf.h>`.
+// If the source uses a macro operand or any spelling the local proof does not
+// model exactly, the caller fails closed and materializes the child instead.
+static std::optional<IncludeDirectiveHeaderOperandRange>
+findIncludeDirectiveHeaderOperandRange(StringRef directive,
+                                       StringRef expectedTarget) {
+  size_t pos = 0;
+  if (!skipIncludeDirectiveHorizontalTrivia(directive, pos))
+    return std::nullopt;
+  if (pos >= directive.size() || directive[pos] != '#')
+    return std::nullopt;
+  ++pos;
+  if (!skipIncludeDirectiveHorizontalTrivia(directive, pos))
+    return std::nullopt;
+
+  if (!consumeIncludeDirectiveKeyword(directive, pos, "include_next")) {
+    if (!consumeIncludeDirectiveKeyword(directive, pos, "include"))
+      return std::nullopt;
+  }
+
+  if (!skipIncludeDirectiveHorizontalTrivia(directive, pos))
+    return std::nullopt;
+  if (expectedTarget.empty())
+    return std::nullopt;
+  if (!directive.substr(pos).starts_with(expectedTarget))
+    return std::nullopt;
+
+  return IncludeDirectiveHeaderOperandRange{pos, pos + expectedTarget.size()};
 }
 
 static bool consumeDirectiveScannerNewline(StringRef text, size_t &pos) {

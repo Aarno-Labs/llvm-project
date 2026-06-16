@@ -3177,17 +3177,26 @@ void RefoldEngine::MaterializeIncludeExpansion(
     // ordinary headers found through -I/-iquote remain stable, while headers that
     // relied on the original parent directory or #include_next stack must be
     // rewritten or materialized.
-    if (!child.parent || child.angled || !child.resolvedPath)
+    if (!child.parent || !child.resolvedPath)
       return plan;
 
-    if (child.subkind == "#include" &&
-        replaySurfaceQuotedIncludePreservesResolvedPath(child))
+    if (child.subkind == "#include_next" && child.angled) {
+      // An angled include-next has no quoted operand to replay from the
+      // materialized surface, and copying it into the primary source restarts
+      // the include search from the beginning.  Materialize the clean child
+      // owner rather than preserving a directive whose search-stack semantics
+      // are no longer reproducible.
+      plan.action = CleanChildIncludeReplayAction::Materialize;
+      plan.reason = "angled #include_next cannot be replayed from a "
+                    "materialized parent surface without the original "
+                    "include-next search stack";
       return plan;
+    }
 
-    std::optional<std::string> childReplayOperand =
-        quotedIncludeReplayLookupOperand(child);
-    if (!childReplayOperand)
-      return plan;
+    if (child.subkind == "#include") {
+      if (child.angled || replaySurfaceQuotedIncludePreservesResolvedPath(child))
+        return plan;
+    }
 
     bool mayRewriteUnstableOperand = false;
     std::string reason;
@@ -3202,6 +3211,11 @@ void RefoldEngine::MaterializeIncludeExpansion(
       reason = "#include_next cannot be replayed from a materialized parent "
                "surface without the original include-next search stack";
     } else {
+      std::optional<std::string> childReplayOperand =
+          quotedIncludeReplayLookupOperand(child);
+      if (!childReplayOperand)
+        return plan;
+
       std::optional<std::filesystem::path> replayResolved =
           resolveQuotedIncludeFromReplaySurface(*childReplayOperand);
       if (replayResolved) {
@@ -3280,34 +3294,23 @@ void RefoldEngine::MaterializeIncludeExpansion(
   auto rewriteIncludeNextDirectiveAsOrdinaryInclude =
       [](std::string &replacement) -> bool {
     StringRef text(replacement);
-    size_t pos = 0;
-    while (pos < text.size() && stringutils::isNonNewlineWs(text[pos]))
-      ++pos;
-    if (pos >= text.size() || text[pos] != '#')
-      return false;
-    ++pos;
-    while (pos < text.size() && stringutils::isNonNewlineWs(text[pos]))
-      ++pos;
-
-    const StringRef includeNextKeyword("include_next");
-    if (!text.substr(pos).starts_with(includeNextKeyword))
-      return false;
-    const size_t keywordEnd = pos + includeNextKeyword.size();
-    if (keywordEnd < text.size() &&
-        (stringutils::isIdentPart(text[keywordEnd]) || text[keywordEnd] == '_'))
+    std::optional<std::pair<size_t, size_t>> keyword =
+        findIncludeDirectiveKeywordRange(text);
+    if (!keyword)
       return false;
 
-    replacement.replace(pos, includeNextKeyword.size(), "include");
+    StringRef spelling = text.slice(keyword->first, keyword->second);
+    if (spelling != "include_next")
+      return false;
+
+    replacement.replace(keyword->first, keyword->second - keyword->first,
+                        "include");
     return true;
   };
 
   auto makeCleanChildIncludeOperandRewriteEdit =
       [&](const RefoldModel::IncludeItem &child, const std::string &operand,
           StringRef ownerBytes) -> std::optional<TextEdit> {
-    const size_t targetPos = child.text.find(child.target);
-    if (targetPos == StringRef::npos)
-      return std::nullopt;
-
     const size_t n = ownerBytes.size();
     const uint64_t siteStart = std::clamp<uint64_t>(child.siteB, 0ULL, n);
     const uint64_t siteEnd = extendIncludeDirectiveEnd(child, ownerBytes,
@@ -3317,8 +3320,15 @@ void RefoldEngine::MaterializeIncludeExpansion(
     if (!child.cover.IsValid() || child.cover.begin >= child.cover.end)
       return std::nullopt;
 
-    std::string replacement = child.text.str();
-    replacement.replace(targetPos, child.target.size(),
+    StringRef directiveBytes = ownerBytes.slice(siteStart, siteEnd);
+    std::optional<IncludeDirectiveHeaderOperandRange> targetRange =
+        findIncludeDirectiveHeaderOperandRange(directiveBytes, child.target);
+    if (!targetRange)
+      return std::nullopt;
+
+    std::string replacement = directiveBytes.str();
+    replacement.replace(targetRange->Begin,
+                        targetRange->End - targetRange->Begin,
                         (Twine("\"") + operand + "\"").str());
     if (child.subkind == "#include_next" &&
         !rewriteIncludeNextDirectiveAsOrdinaryInclude(replacement))
