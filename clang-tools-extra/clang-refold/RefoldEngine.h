@@ -8477,9 +8477,9 @@ private:
   ///
   /// Returns `std::nullopt` if the invocation cannot be parsed or if required
   /// anchoring information (e.g. `m.invB`) is unavailable.
-  static std::optional<std::vector<std::pair<size_t, size_t>>>
+  std::optional<std::vector<std::pair<size_t, size_t>>>
   GetMacroInvocationFormalArgContentRanges(
-      const RefoldModel::MacroInvocation &m, StringRef invText);
+      const RefoldModel::MacroInvocation &m, StringRef invText) const;
 
   /// \brief Attempts to build an *args-only* macro invocation patch for a hunk
   /// attributed to a macro invocation.
@@ -8851,27 +8851,22 @@ private:
       uint64_t beginTok, uint64_t endTok,
       IncludeRealizationEvidenceKind *evidenceKind = nullptr) const;
 
-  /// \brief Parses the raw text of a function-like macro invocation to identify
-  /// the byte ranges of its individual arguments.
+  /// \brief Lexes a function-like macro invocation spelling and returns the
+  /// byte ranges of its actual argument contents.
   ///
-  /// This method performs a shallow scan of the invocation text starting from
-  /// the opening parenthesis. It follows macro-argument collection rules rather
-  /// than C expression/list splitting rules: only nested parentheses protect a
-  /// comma from separating arguments. Brackets and braces are ordinary
-  /// preprocessing tokens here, so `M(arr[1, 2], 3)` is parsed as three macro
-  /// arguments while `M((1, 2), 3)` is parsed as two.
+  /// This helper is for text that is not already represented by producer-owned
+  /// model ranges, such as edited candidate invocation text.  When a
+  /// `RefoldModel::MacroInvocation` is available, callers should normally use
+  /// `GetMacroInvocationFormalArgContentRanges()` so schema-provided
+  /// `inv_arg_ranges` remain the source of truth for original call sites.
   ///
-  /// The parser is also comment-, string-, and character-literal aware; it
-  /// skips over escaped characters and delimiters inside opaque tokens to avoid
-  /// misinterpreting their text as macro argument separators.
-  ///
-  /// \param invText The full source text of the macro invocation
-  ///                (e.g., "MY_MACRO(a, f(b, c))").
-  /// \return A list of `[start, end]` byte ranges for each argument, with
-  ///         leading and trailing whitespace trimmed; returns `std::nullopt` if
-  ///         the text is malformed or the closing parenthesis is missing.
+  /// Argument splitting follows preprocessor macro-call collection rules:
+  /// only nested parentheses protect commas.  Brackets and braces are ordinary
+  /// preprocessing tokens here, so `M(arr[1, 2], 3)` is parsed as three actuals
+  /// while `M((1, 2), 3)` is parsed as two.
   static std::optional<std::vector<std::pair<size_t, size_t>>>
-  ParseMacroInvocationArgContentRanges(StringRef invText);
+  LexMacroInvocationActualContentRanges(StringRef invText,
+                                        const LangOptions &lang);
 
   // ------------------------- __COUNTER__ stabilization -----------------------
 

@@ -709,8 +709,6 @@ static bool computeInvArgRangesFromText(
   size_t ArgStart = 0;
 
   unsigned ParenDepth = 0;
-  unsigned BracketDepth = 0;
-  unsigned BraceDepth = 0;
 
   // For 0-parameter function-like macros, accept invocations that have no
   // tokens between '(' and ')'. (Comments are lexed as whitespace unless
@@ -741,7 +739,7 @@ static bool computeInvArgRangesFromText(
       continue;
     }
     if (Tok.is(tok::r_paren)) {
-      if (ParenDepth == 0 && BracketDepth == 0 && BraceDepth == 0) {
+      if (ParenDepth == 0) {
         if (ExpectedArgs == 0) {
           if (!SawAnyTokenBetweenParens) {
             Out = std::move(Args);
@@ -777,32 +775,10 @@ static bool computeInvArgRangesFromText(
       continue;
     }
 
-    if (Tok.is(tok::l_square)) {
-      ++BracketDepth;
-      SawAnyTokenBetweenParens = true;
-      continue;
-    }
-    if (Tok.is(tok::r_square)) {
-      if (BracketDepth > 0)
-        --BracketDepth;
-      SawAnyTokenBetweenParens = true;
-      continue;
-    }
-
-    if (Tok.is(tok::l_brace)) {
-      ++BraceDepth;
-      SawAnyTokenBetweenParens = true;
-      continue;
-    }
-    if (Tok.is(tok::r_brace)) {
-      if (BraceDepth > 0)
-        --BraceDepth;
-      SawAnyTokenBetweenParens = true;
-      continue;
-    }
-
-    if (Tok.is(tok::comma) && ParenDepth == 0 && BracketDepth == 0 &&
-        BraceDepth == 0) {
+    // Macro argument collection is governed by nested parentheses only.
+    // Brackets and braces are ordinary preprocessing tokens here, so commas
+    // inside `[]` or `{}` still separate actual arguments.
+    if (Tok.is(tok::comma) && ParenDepth == 0) {
       recordArg(ArgStart, Off);
       ArgStart = Off + Tok.getLength();
       continue;
@@ -817,8 +793,8 @@ static bool computeInvArgRangesFromText(
 // Parse a parenthesized tuple/signature text such as "(1, (4 + 1))" into
 // per-element byte ranges relative to the provided text. The returned ranges
 // exclude the outer parentheses and trim surrounding whitespace on each
-// element. Nested parentheses/brackets/braces, string literals, and comments
-// are handled by the raw lexer in the same way as computeInvArgRangesFromText.
+// element. Unlike macro-argument collection, tuple splitting treats nested
+// parentheses, brackets, and braces as balanced subexpressions.
 static bool computeTupleElementRangesFromText(
     llvm::StringRef Text, const LangOptions &Lang,
     std::vector<std::pair<std::optional<uint32_t>, std::optional<uint32_t>>>

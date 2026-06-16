@@ -16037,42 +16037,21 @@ bool RefoldEngine::PasteArgReplacementsMatchAllPasteTokensInB(
   if (m.pasteSpans.empty())
     return true;
 
-  // Prefer producer-provided argument byte ranges for the raw invocation text,
-  // but fall back to syntactic parsing when those ranges are absent. This is
-  // required for idempotent args-only refolds where the *current* base
-  // invocation already reflects earlier hunks (e.g. "int" -> "float").
-  // In that case we still need a stable "original arg spelling" to recognize
-  // that a paste-segment edit is equivalent to a whole-argument replacement.
-  std::optional<std::vector<std::pair<size_t, size_t>>> parsedOrigArgRanges;
+  // Recover original formal ranges through the model-aware helper.  It prefers
+  // producer-owned inv_arg_ranges and uses lexical parsing only as a legacy or
+  // edited-text fallback, so paste validation does not maintain a separate raw
+  // invocation parser path.
+  std::optional<std::vector<std::pair<size_t, size_t>>> origFormalRanges;
   if (m.invText)
-    parsedOrigArgRanges = ParseMacroInvocationArgContentRanges(*m.invText);
+    origFormalRanges = GetMacroInvocationFormalArgContentRanges(m, *m.invText);
 
-  // Return the trimmed original spelling of invocation argument `argIdx`.
-  // Prefer producer-provided byte ranges, and fall back to locally parsed
-  // invocation-argument ranges when producer metadata is unavailable.
   auto getOrigArgTrim = [&](uint32_t argIdx) -> StringRef {
-    if (!m.invText)
+    if (!m.invText || !origFormalRanges || argIdx >= origFormalRanges->size())
       return StringRef();
 
     StringRef invText = *m.invText;
-
-    // Producer-provided ranges (if present).
-    if (argIdx < m.invArgRanges.size()) {
-      const RefoldModel::MacroInvocation::OptByteRange &r =
-          m.invArgRanges[argIdx];
-      if (r.first && r.second) {
-        uint64_t b = *r.first;
-        uint64_t e = *r.second;
-        if (b <= e && e <= invText.size())
-          return invText.slice(b, e).trim();
-      }
-    }
-
-    // Syntactic fallback (independent of the producer).
-    if (!parsedOrigArgRanges || argIdx >= parsedOrigArgRanges->size())
-      return StringRef();
-    size_t b = (*parsedOrigArgRanges)[argIdx].first;
-    size_t e = (*parsedOrigArgRanges)[argIdx].second;
+    size_t b = (*origFormalRanges)[argIdx].first;
+    size_t e = (*origFormalRanges)[argIdx].second;
     if (b > e || e > invText.size())
       return StringRef();
     return invText.slice(b, e).trim();
@@ -16352,7 +16331,7 @@ std::string RefoldEngine::SplicePasteSegmentIntoSpellingArgExact(
 
 std::optional<std::vector<std::pair<size_t, size_t>>>
 RefoldEngine::GetMacroInvocationFormalArgContentRanges(
-    const RefoldModel::MacroInvocation &m, StringRef invText) {
+    const RefoldModel::MacroInvocation &m, StringRef invText) const {
   // Synthesize an empty argument range at the closing parenthesis. This is used
   // for omitted trailing variadic formals so callers still receive one range
   // per formal parameter.
@@ -16429,10 +16408,29 @@ RefoldEngine::GetMacroInvocationFormalArgContentRanges(
       -> std::optional<std::vector<std::pair<size_t, size_t>>> {
     // Parse actual argument content ranges syntactically, then normalize the
     // actual list into one range per formal parameter.
-    auto parsedOpt = RefoldEngine::ParseMacroInvocationArgContentRanges(text);
+    auto parsedOpt =
+        RefoldEngine::LexMacroInvocationActualContentRanges(text, lexLang_);
     if (!parsedOpt)
       return std::nullopt;
     return mapParsedActualsToFormalRanges(text, *parsedOpt);
+  };
+
+  auto tryNormalizedInvocationRanges = [&]()
+      -> std::optional<std::vector<std::pair<size_t, size_t>>> {
+    if (!m.normalizedInvText || invText != *m.normalizedInvText ||
+        m.normalizedInvArgTextRanges.empty())
+      return std::nullopt;
+
+    std::vector<std::pair<size_t, size_t>> out;
+    out.reserve(m.normalizedInvArgTextRanges.size());
+    for (const auto &R : m.normalizedInvArgTextRanges) {
+      if (!R.first || !R.second || *R.second < *R.first ||
+          *R.second > invText.size())
+        return std::nullopt;
+      out.emplace_back(static_cast<size_t>(*R.first),
+                       static_cast<size_t>(*R.second));
+    }
+    return out;
   };
 
   auto tryProducerRelativeRanges = [&]()
@@ -16508,6 +16506,9 @@ RefoldEngine::GetMacroInvocationFormalArgContentRanges(
     rebuilt.append(producerText.substr(cur));
     return rebuilt == currentText;
   };
+
+  if (auto normalizedRanges = tryNormalizedInvocationRanges())
+    return normalizedRanges;
 
   if (m.invText) {
     // Prefer producer-provided ranges for the original invocation spelling.
@@ -17417,7 +17418,8 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
 
     const size_t parsedActualCount = [&]() -> size_t {
       auto parsed =
-          RefoldEngine::ParseMacroInvocationArgContentRanges(baseInvText);
+          RefoldEngine::LexMacroInvocationActualContentRanges(baseInvText,
+                                                                lexLang_);
       return parsed ? parsed->size() : invArgRanges.size();
     }();
 
@@ -38768,7 +38770,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
       auto getInvocationHeadShape =
           [&](StringRef text) -> std::optional<InvocationHeadShape> {
         StringRef trimmed = text.trim();
-        auto argRangesOpt = ParseMacroInvocationArgContentRanges(trimmed);
+        auto argRangesOpt =
+            LexMacroInvocationActualContentRanges(trimmed, lexLang_);
         if (!argRangesOpt)
           return std::nullopt;
 
@@ -38819,9 +38822,9 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           return 0;
 
         auto oldArgRangesOpt =
-            ParseMacroInvocationArgContentRanges(oldText.trim());
+            LexMacroInvocationActualContentRanges(oldText.trim(), lexLang_);
         auto newArgRangesOpt =
-            ParseMacroInvocationArgContentRanges(newText.trim());
+            LexMacroInvocationActualContentRanges(newText.trim(), lexLang_);
         if (!oldArgRangesOpt || !newArgRangesOpt ||
             oldArgRangesOpt->size() != newArgRangesOpt->size())
           return 0;
@@ -41821,7 +41824,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         }
 
         auto parsedActuals =
-            ParseMacroInvocationArgContentRanges(patch.replacement);
+            LexMacroInvocationActualContentRanges(patch.replacement, lexLang_);
         if (!parsedActuals) {
           REFOLD_LOG_TRACE("macro/proof",
                 "suppress structure-preserving macro replay: inv id={0} "
