@@ -1455,126 +1455,115 @@ stringifyLineControlMacroArgument(StringRef argument) {
 ///
 /// `__VA_OPT__` is controlled by whether the variadic tail contains any
 /// preprocessing tokens, not by whether the raw argument spelling is non-empty.
-/// The line-control proof only has source slices, so it accepts the bounded
-/// subset it already knows how to reason about: whitespace plus complete block
-/// comments are token-empty, a line comment or malformed comment fails closed,
-/// and any other byte proves that at least one token-like spelling is present.
+/// Use Clang's raw lexer for token recognition so comments, escaped-newline
+/// trivia, and string/character/raw literals follow the same lexical rules as
+/// the rest of the refold proof.  Line comments and malformed block comments
+/// still fail closed because they are not local token-empty trivia inside this
+/// single-line replacement-list proof.
 static std::optional<bool>
-lineControlArgumentContainsPPTokens(StringRef argument) {
-  for (size_t pos = 0; pos < argument.size();) {
-    if (stringutils::isWs(argument[pos])) {
-      ++pos;
-      continue;
-    }
+lineControlArgumentContainsPPTokens(StringRef argument,
+                                    const LangOptions &lang) {
+  const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
+  std::string lexBuf = argument.str();
+  lexBuf.push_back('\0');
+  const char *bufStart = lexBuf.data();
+  const char *bufEnd = bufStart + argument.size();
+  Lexer lexer(baseLoc, lang, bufStart, bufStart, bufEnd);
+  lexer.SetCommentRetentionState(true);
 
-    if (pos + 1 < argument.size() && argument[pos] == '/') {
-      if (argument[pos + 1] == '*') {
-        pos += 2;
-        bool closed = false;
-        while (pos + 1 < argument.size()) {
-          if (argument[pos] == '*' && argument[pos + 1] == '/') {
-            pos += 2;
-            closed = true;
-            break;
-          }
-          ++pos;
-        }
-        if (!closed)
-          return std::nullopt;
-        continue;
-      }
-      if (argument[pos + 1] == '/')
-        return std::nullopt;
-    }
+  Token token;
+  while (true) {
+    lexer.LexFromRawLexer(token);
+    if (token.is(tok::eof))
+      return false;
 
-    return true;
+    if (!token.is(tok::comment))
+      return true;
+
+    const size_t tokenBegin = std::min(tokenOffsetFromBase(token, baseLoc),
+                                       argument.size());
+    const size_t tokenEnd = std::min(tokenEndOffsetFromBase(token, baseLoc),
+                                     argument.size());
+    StringRef spelling = argument.slice(tokenBegin, tokenEnd);
+    if (spelling.starts_with("//") ||
+        !rawLexerCommentTokenIsComplete(spelling))
+      return std::nullopt;
   }
-
-  return false;
 }
 
 /// Return the raw payload inside one `__VA_OPT__(...)` occurrence.
 ///
-/// This scans only enough replacement-list structure to find the matching
-/// close-paren without being confused by parentheses inside string/character
-/// literals or complete block comments.  The payload is not interpreted here;
-/// after `__VA_OPT__` is erased or exposed, the normal bounded line-control
-/// replacement-list evaluator still performs argument substitution,
-/// stringification, paste-witness replay, and final strict #line parsing.
+/// Clang's raw lexer owns the delimiter and literal/comment boundaries here.
+/// The helper only verifies that `openParen` starts the operator argument list
+/// and then tracks nested parentheses until the matching close-paren.  The
+/// payload is not interpreted here; after `__VA_OPT__` is erased or exposed,
+/// the normal bounded line-control replacement-list evaluator still performs
+/// argument substitution, stringification, paste-witness replay, and final
+/// strict #line parsing.
 static std::optional<std::pair<StringRef, size_t>>
-parseLineControlVaOptPayload(StringRef replacement, size_t openParen) {
-  if (openParen >= replacement.size() || replacement[openParen] != '(')
+parseLineControlVaOptPayload(StringRef replacement, size_t openParen,
+                             const LangOptions &lang) {
+  if (openParen >= replacement.size() || replacement[openParen] != '(' ||
+      replacement.contains('\n') || replacement.contains('\r'))
     return std::nullopt;
 
-  const size_t payloadBegin = openParen + 1;
-  unsigned depth = 1;
-  for (size_t pos = payloadBegin; pos < replacement.size();) {
-    char ch = replacement[pos];
+  const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
+  std::string lexBuf = replacement.str();
+  lexBuf.push_back('\0');
+  const char *bufStart = lexBuf.data();
+  const char *bufEnd = bufStart + replacement.size();
+  Lexer lexer(baseLoc, lang, bufStart, bufStart, bufEnd);
+  lexer.SetCommentRetentionState(true);
 
-    if (ch == '\n' || ch == '\r')
+  bool sawOpenParen = false;
+  unsigned depth = 0;
+  const size_t payloadBegin = openParen + 1;
+
+  Token token;
+  while (true) {
+    lexer.LexFromRawLexer(token);
+    if (token.is(tok::eof))
       return std::nullopt;
 
-    if (ch == '"' || ch == '\'') {
-      const char quote = ch;
-      ++pos;
-      bool closed = false;
-      while (pos < replacement.size()) {
-        char litCh = replacement[pos++];
-        if (litCh == '\n' || litCh == '\r')
-          return std::nullopt;
-        if (litCh == '\\') {
-          if (pos >= replacement.size())
-            return std::nullopt;
-          ++pos;
-          continue;
-        }
-        if (litCh == quote) {
-          closed = true;
-          break;
-        }
-      }
-      if (!closed)
+    const size_t tokenBegin = std::min(tokenOffsetFromBase(token, baseLoc),
+                                       replacement.size());
+    const size_t tokenEnd = std::min(tokenEndOffsetFromBase(token, baseLoc),
+                                     replacement.size());
+
+    if (tokenEnd <= openParen)
+      continue;
+    if (tokenBegin < openParen)
+      return std::nullopt;
+
+    if (!sawOpenParen) {
+      if (tokenBegin != openParen || token.isNot(tok::l_paren))
+        return std::nullopt;
+      sawOpenParen = true;
+      depth = 1;
+      continue;
+    }
+
+    if (token.is(tok::comment)) {
+      StringRef spelling = replacement.slice(tokenBegin, tokenEnd);
+      if (spelling.starts_with("//") ||
+          !rawLexerCommentTokenIsComplete(spelling))
         return std::nullopt;
       continue;
     }
 
-    if (pos + 1 < replacement.size() && ch == '/') {
-      if (replacement[pos + 1] == '*') {
-        pos += 2;
-        bool closed = false;
-        while (pos + 1 < replacement.size()) {
-          if (replacement[pos] == '*' && replacement[pos + 1] == '/') {
-            pos += 2;
-            closed = true;
-            break;
-          }
-          ++pos;
-        }
-        if (!closed)
-          return std::nullopt;
-        continue;
-      }
-      if (replacement[pos + 1] == '/')
-        return std::nullopt;
-    }
-
-    if (ch == '(') {
+    if (token.is(tok::l_paren)) {
       ++depth;
-      ++pos;
       continue;
     }
-    if (ch == ')') {
+    if (token.is(tok::r_paren)) {
+      if (depth == 0)
+        return std::nullopt;
       --depth;
       if (depth == 0)
-        return std::make_pair(replacement.slice(payloadBegin, pos), pos + 1);
-      ++pos;
-      continue;
+        return std::make_pair(replacement.slice(payloadBegin, tokenBegin),
+                              tokenEnd);
     }
-
-    ++pos;
   }
-
-  return std::nullopt;
 }
 
 /// Expand top-level `__VA_OPT__(...)` operators in a recorded replacement list.
@@ -1587,7 +1576,7 @@ parseLineControlVaOptPayload(StringRef replacement, size_t openParen) {
 /// substitution, paste-witness replay, or the final strict line-control parse.
 static std::optional<std::string> expandLineControlVaOptOperators(
     StringRef replacement, ArrayRef<RefoldModel::MacroDefParam> params,
-    ArrayRef<StringRef> invocationArgTexts) {
+    ArrayRef<StringRef> invocationArgTexts, const LangOptions &lang) {
   if (params.size() != invocationArgTexts.size())
     return std::nullopt;
 
@@ -1598,7 +1587,7 @@ static std::optional<std::string> expandLineControlVaOptOperators(
     if (variadicTailHasTokens)
       return std::nullopt;
     std::optional<bool> hasTokens =
-        lineControlArgumentContainsPPTokens(invocationArgTexts[i]);
+        lineControlArgumentContainsPPTokens(invocationArgTexts[i], lang);
     if (!hasTokens)
       return std::nullopt;
     variadicTailHasTokens = *hasTokens;
@@ -1657,7 +1646,7 @@ static std::optional<std::string> expandLineControlVaOptOperators(
       size_t openParen = identEnd;
       stringutils::skipNonNewlineWs(replacement, openParen);
       std::optional<std::pair<StringRef, size_t>> payload =
-          parseLineControlVaOptPayload(replacement, openParen);
+          parseLineControlVaOptPayload(replacement, openParen, lang);
       if (!payload)
         return std::nullopt;
 
@@ -1690,7 +1679,7 @@ static std::optional<std::string> expandLineControlVaOptOperators(
 static std::optional<std::string> substituteLineControlMacroParameters(
     StringRef replacement, ArrayRef<RefoldModel::MacroDefParam> params,
     ArrayRef<StringRef> invocationArgTexts,
-    ArrayRef<RefoldModel::PasteToken> pasteTokens) {
+    ArrayRef<RefoldModel::PasteToken> pasteTokens, const LangOptions &lang) {
   if (params.size() != invocationArgTexts.size())
     return std::nullopt;
 
@@ -1702,12 +1691,12 @@ static std::optional<std::string> substituteLineControlMacroParameters(
   if (replacement.contains("__VA_OPT__")) {
     std::optional<std::string> expandedVaOpt =
         expandLineControlVaOptOperators(replacement, params,
-                                        invocationArgTexts);
+                                        invocationArgTexts, lang);
     if (!expandedVaOpt)
       return std::nullopt;
     return substituteLineControlMacroParameters(*expandedVaOpt, params,
                                                 invocationArgTexts,
-                                                pasteTokens);
+                                                pasteTokens, lang);
   }
 
   // Variadic formals are safe to substitute in this bounded proof when the
@@ -1955,7 +1944,7 @@ static std::optional<std::string> substituteLineControlMacroParameters(
 /// when the strict parser is re-run on the rewritten directive line.
 static std::optional<std::string> simpleLineControlMacroReplacementText(
     const RefoldModel &model, const RefoldModel::MacroInvocation &macro,
-    ArrayRef<StringRef> invocationArgTexts) {
+    ArrayRef<StringRef> invocationArgTexts, const LangOptions &lang) {
   if (macro.subkind != "obj" && macro.subkind != "func")
     return std::nullopt;
   if (!macro.definitionDirectiveId ||
@@ -2039,7 +2028,7 @@ static std::optional<std::string> simpleLineControlMacroReplacementText(
       !macro.pasteTokens.empty()) {
     return substituteLineControlMacroParameters(replacement, macro.defParams,
                                                 invocationArgTexts,
-                                                macro.pasteTokens);
+                                                macro.pasteTokens, lang);
   }
 
   if (!invocationArgTexts.empty())
@@ -2191,7 +2180,7 @@ static std::optional<SourceLineDirectiveMacroReplacement>
 expandLineControlMacroReplacementText(
     const RefoldModel &model, const RefoldModel::MacroInvocation &macro,
     ArrayRef<StringRef> invocationArgTexts,
-    SmallVectorImpl<uint64_t> &activeMacroIds,
+    SmallVectorImpl<uint64_t> &activeMacroIds, const LangOptions &lang,
     SourceLineDirectiveBuiltinMacroResolver builtinMacroResolver = nullptr) {
   if (activeMacroIds.size() > 32)
     return std::nullopt;
@@ -2200,7 +2189,7 @@ expandLineControlMacroReplacementText(
     return std::nullopt;
 
   std::optional<std::string> replacement =
-      simpleLineControlMacroReplacementText(model, macro, invocationArgTexts);
+      simpleLineControlMacroReplacementText(model, macro, invocationArgTexts, lang);
   if (!replacement) {
     if (!builtinMacroResolver)
       return std::nullopt;
@@ -2252,7 +2241,7 @@ expandLineControlMacroReplacementText(
 
     std::optional<SourceLineDirectiveMacroReplacement> childReplacement =
         expandLineControlMacroReplacementText(
-            model, child, *childArgTexts, activeMacroIds,
+            model, child, *childArgTexts, activeMacroIds, lang,
             builtinMacroResolver);
     if (!childReplacement) {
       activeMacroIds.pop_back();
@@ -2311,6 +2300,7 @@ rewriteSourceLineDirectiveLogicalLineMacros(
     const RefoldModel &model, StringRef file, StringRef logicalLine,
     ArrayRef<uint64_t> logicalLineSourceOffsets,
     const std::function<bool(StringRef, StringRef)> &pathsEqual,
+    const LangOptions &lang,
     std::optional<uint64_t> ownerIncludeId = std::nullopt,
     SourceLineDirectiveBuiltinMacroResolver builtinMacroResolver = nullptr) {
   if (logicalLineSourceOffsets.size() != logicalLine.size())
@@ -2463,7 +2453,7 @@ rewriteSourceLineDirectiveLogicalLineMacros(
     if (!replacement) {
       SmallVector<uint64_t, 8> activeMacroIds;
       replacement = expandLineControlMacroReplacementText(
-          model, macro, invocationArgTexts, activeMacroIds,
+          model, macro, invocationArgTexts, activeMacroIds, lang,
           macroBuiltinMacroResolver);
     }
     if (!replacement)
@@ -5026,7 +5016,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       return rewriteSourceLineDirectiveLogicalLineMacros(
           model_, tuPath, logicalLine, sourceOffsets,
           [&](StringRef lhs, StringRef rhs) { return PathsEqual(lhs, rhs); },
-          std::nullopt, std::move(builtinMacroResolver));
+          lexLang_, std::nullopt, std::move(builtinMacroResolver));
     };
 
     DenseSet<uint64_t> mixedSourceLineDirectiveMacroIds;

@@ -5493,7 +5493,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
                 [&](StringRef lhs, StringRef rhs) {
                   return PathsEqual(lhs, rhs);
                 },
-                ie.include->id, std::move(builtinMacroResolver));
+                lexLang_, ie.include->id, std::move(builtinMacroResolver));
           };
 
           if (!proveOwnerSourceEnvelopeGaps(hunkSourcePieces, [&](uint64_t
