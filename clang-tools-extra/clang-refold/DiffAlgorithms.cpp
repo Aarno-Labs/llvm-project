@@ -90,7 +90,7 @@ bool shouldUseGreedyApproach(unsigned long long n, unsigned long long m,
                              unsigned long long maxCells) {
   if (n >= std::numeric_limits<unsigned long long>::max() - 1ULL ||
       m >= std::numeric_limits<unsigned long long>::max() - 1ULL) {
-    warn("lcs/map",
+    REFOLD_LOG_WARN("lcs/map",
          "hirschberg fallback: (n+1) or (m+1) would overflow unsigned long long"
          " (n={0}, m={1})",
          n, m);
@@ -102,7 +102,7 @@ bool shouldUseGreedyApproach(unsigned long long n, unsigned long long m,
     // Product check via division to avoid overflow: n1 * m1 > maxCells ?
     const unsigned long long maxN1 = maxCells / m1; // m1 >= 1 always
     if (n1 > maxN1) {
-      warn(
+      REFOLD_LOG_WARN(
           "lcs/map",
           "hirschberg fallback: DP cell budget exceeded: (n+1)*(m+1) > maxCells "
           "(n={0}, m={1}, n1={2}, m1={3}, maxCells={4}, maxAllowedN1ForM1={5})",
@@ -118,7 +118,7 @@ bool shouldUseGreedyApproach(unsigned long long n, unsigned long long m,
           std::numeric_limits<size_t>::max() / sizeof(unsigned));
 
       if (cells > cellLimit) {
-        warn("lcs/map",
+        REFOLD_LOG_WARN("lcs/map",
              "hirschberg fallback: DP allocation would overflow size_t for "
              "unsigned table "
              "(cells={0} > size_t/sizeof(unsigned)={1}; n={2}, m={3})",
@@ -849,7 +849,7 @@ computeRowWeighted(const SpanView &aV, const SpanView &bV,
   const size_t n = aV.size();
   const size_t m = bV.size();
   if (gapV.size() != n + 1)
-    fatal("lcs/map", "internal: gap view length must be A.len+1");
+    REFOLD_LOG_FATAL("lcs/map", "internal: gap view length must be A.len+1");
 
   std::vector<Score> dp(m + 1);
   std::vector<Score> ndp(m + 1);
@@ -914,7 +914,7 @@ static void solveSmallWeightedDP(const SpanView &aV, const SpanView &bV,
   const size_t n = aV.size();
   const size_t m = bV.size();
   if (gapV.size() != n + 1)
-    fatal("lcs/map", "internal: gap view length must be A.len+1");
+    REFOLD_LOG_FATAL("lcs/map", "internal: gap view length must be A.len+1");
 
   const size_t stride = m + 1;
   const size_t cells = (n + 1) * (m + 1);
@@ -1252,13 +1252,13 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
 
   // Validate ownerDepthGap shape.
   if (ownerDepthGap.size() != n + 1) {
-    fatal("lcs/map", "ownerDepthGap length must be A.size() + 1");
+    REFOLD_LOG_FATAL("lcs/map", "ownerDepthGap length must be A.size() + 1");
   }
 
   // Indices are stored in int64_t; extremely large B streams are not
   // representable.
   if (m > MAX)
-    fatal("lcs/map", "B.size() exceeds int64_t index range");
+    REFOLD_LOG_FATAL("lcs/map", "B.size() exceeds int64_t index range");
 
   // DP table guard: if the full (n+1)*(m+1) table is too large, use Hirschberg
   // to remain exact while using only O(n+m) memory.
@@ -1386,7 +1386,7 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
                               ArrayRef<LcsAGapProvenance> gapProvenance,
                               unsigned long long maxCells) {
   if (gapProvenance.size() != a.size() + 1)
-    fatal("lcs/map", "gapProvenance length must be A.size() + 1");
+    REFOLD_LOG_FATAL("lcs/map", "gapProvenance length must be A.size() + 1");
 
   std::vector<uint32_t> ownerDepthGap;
   ownerDepthGap.reserve(gapProvenance.size());
@@ -1416,10 +1416,10 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
                               ArrayRef<LcsBGapProvenance> bGapProvenance,
                               unsigned long long maxCells) {
   if (bGapProvenance.size() != b.size() + 1)
-    fatal("lcs/map", "bGapProvenance length must be B.size() + 1");
+    REFOLD_LOG_FATAL("lcs/map", "bGapProvenance length must be B.size() + 1");
 
   if (gapProvenance.size() != a.size() + 1)
-    fatal("lcs/map", "gapProvenance length must be A.size() + 1");
+    REFOLD_LOG_FATAL("lcs/map", "gapProvenance length must be A.size() + 1");
 
   std::vector<uint32_t> ownerDepthGap;
   ownerDepthGap.reserve(gapProvenance.size());
@@ -1451,7 +1451,7 @@ std::vector<int64_t> lcsMapAB(ArrayRef<StringRef> a, ArrayRef<StringRef> b,
   // Indices are stored in int64_t; extremely large B streams are not
   // representable.
   if (m > MAX)
-    fatal("lcs/map", "B.size() exceeds int64_t index range");
+    REFOLD_LOG_FATAL("lcs/map", "B.size() exceeds int64_t index range");
 
   // DP table guard: if the full table is too large, use Hirschberg (exact,
   // linear space).
@@ -1659,7 +1659,7 @@ static MiddleSnake findMiddleSnake(ArrayRef<StringRef> a, int64_t aLo,
     }
   }
 
-  fatal("diff/myers", "internal: failed to find middle snake");
+  REFOLD_LOG_FATAL("diff/myers", "internal: failed to find middle snake");
 }
 
 /// Emit a shortest edit script for one Myers divide-and-conquer subproblem.
@@ -1746,7 +1746,7 @@ static void diffLinearRec(ArrayRef<StringRef> a, int64_t aLo, int64_t aHi,
 std::vector<Step> diff(ArrayRef<StringRef> a, ArrayRef<StringRef> b) {
   if (a.size() > static_cast<size_t>(std::numeric_limits<int64_t>::max()) ||
       b.size() > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
-    fatal("diff/myers", "input size exceeds int64_t range");
+    REFOLD_LOG_FATAL("diff/myers", "input size exceeds int64_t range");
   }
 
   std::vector<Step> out;

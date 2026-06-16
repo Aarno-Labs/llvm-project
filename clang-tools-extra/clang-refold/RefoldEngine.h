@@ -2363,7 +2363,7 @@ private:
         lastTheoremAudit_.terminalFailureAuditViolations;
 
     if (satisfied) {
-      info("theorem",
+      REFOLD_LOG_INFO("theorem",
            "audit passed: emittedEdits={0} carriers={1} resolverAudits={2} "
            "terminalFailures={3} closureLedgerRows={4}",
            lastTheoremAudit_.emittedNonTerminalEdits,
@@ -2372,7 +2372,7 @@ private:
            lastTheoremAudit_.terminalFailureObligations,
            lastTheoremAudit_.resolverClosureLedgerRows);
     } else {
-      warn("theorem",
+      REFOLD_LOG_WARN("theorem",
            "audit failed: invalidCarriers={0} unresolvedSelectors={1} "
            "resolverOpenObligations={2} terminalAuditProblems={3} "
            "closureLedgerRows={4}",
@@ -2380,14 +2380,14 @@ private:
            resolverOpenObligations, terminalAuditProblems,
            lastTheoremAudit_.resolverClosureLedgerRows);
       if (!lastTheoremAudit_.firstViolation.empty()) {
-        warn("theorem",
+        REFOLD_LOG_WARN("theorem",
              "first theorem-audit violation: {0}",
              stringutils::showWsWithClip(lastTheoremAudit_.firstViolation,
                                          220));
       }
     }
 
-    debug("theorem/carriers",
+    REFOLD_LOG_DEBUG("theorem/carriers",
           "emitted carriers: total={0} declared={1} discharged={2} "
           "selectorOnly={3} transitional={4} undischarged={5} "
           "unknownClass={6} outOfDomain={7}",
@@ -2399,14 +2399,14 @@ private:
           lastTheoremAudit_.emittedUndischargedCarriers,
           lastTheoremAudit_.emittedUnknownClassCarriers,
           lastTheoremAudit_.emittedOutOfDomainCarriers);
-    debug("theorem/composition",
+    REFOLD_LOG_DEBUG("theorem/composition",
           "composite edits: total={0} equivalent={1} ordered={2} "
           "uncomposed={3}",
           lastTheoremAudit_.emittedCompositeEdits,
           lastTheoremAudit_.emittedEquivalentCompositeEdits,
           lastTheoremAudit_.emittedOrderedCompositeEdits,
           lastTheoremAudit_.emittedUncomposedCompositeEdits);
-    debug("theorem/selector",
+    REFOLD_LOG_DEBUG("theorem/selector",
           "selector resolution: competitions={0} resolved={1} "
           "noSelectable={2} unresolved={3} directBypass={4}",
           lastTheoremAudit_.selectorCompetitions,
@@ -2414,7 +2414,7 @@ private:
           lastTheoremAudit_.selectorNoSelectable,
           lastTheoremAudit_.selectorUnresolvedCompetitions,
           lastTheoremAudit_.selectorDirectBypasses);
-    debug("theorem/terminal",
+    REFOLD_LOG_DEBUG("theorem/terminal",
           "terminal fallback audit: explicitExclusions={0} "
           "nonExplicitExclusions={1} primaryFailures={2} secondaryFailures={3} "
           "auditViolations={4}",
@@ -2423,7 +2423,7 @@ private:
           lastTheoremAudit_.terminalFailureObligations,
           lastTheoremAudit_.terminalSecondaryFailureObligations,
           lastTheoremAudit_.terminalFailureAuditViolations);
-    debug("theorem/state",
+    REFOLD_LOG_DEBUG("theorem/state",
           "state graph: ownerNodes={0} zeroTokenNodes={1} observedComponents={2} "
           "mutatedComponents={3} incomparableNodes={4} missingProducerFacts={5} "
           "directChecks={6} deltaFacts={7} graphEdges={8} gatewayWitnesses={9} "
@@ -2440,7 +2440,7 @@ private:
           lastTheoremAudit_.directStateChecksGatewayWitnesses,
           lastTheoremAudit_.directStateChecksTerminalFailures,
           lastTheoremAudit_.directStateChecksUnclosedLocal);
-    debug("theorem/resolver",
+    REFOLD_LOG_DEBUG("theorem/resolver",
           "witness resolver: audits={0} declaredInDomain={1} "
           "explicitOutOfDomain={2} ambiguousOutOfDomain={3} "
           "missingProof={4} unknownDomain={5} strictAuthority={6} "
@@ -2471,7 +2471,7 @@ private:
   /// line is annotated when refolding terminated by falling back to the fully
   /// expanded B-side text.
   void EmitRefoldStats() const {
-    info("stats",
+    REFOLD_LOG_INFO("stats",
          "refold summary: expandedIncludes={0}/{1} expandedRootMacros={2}/{3} "
          "terminalFallback={4}",
          lastStats_.expandedIncludes, lastStats_.totalIncludes,

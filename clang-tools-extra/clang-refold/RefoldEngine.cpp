@@ -2026,12 +2026,12 @@ void RefoldEngine::ReportNoLegacyAuditFinding(
           : stringutils::showWsWithClip(evidence.detail, 240);
 
   if (clippedDetail.empty()) {
-    warn("no-legacy-audit",
+    REFOLD_LOG_WARN("no-legacy-audit",
          "kind={0} role={1} definition=\"{2}\" required-closure=\"{3}\"",
          definition.kind, role, definition.definition,
          definition.requiredClosure);
   } else {
-    warn("no-legacy-audit",
+    REFOLD_LOG_WARN("no-legacy-audit",
          "kind={0} role={1} definition=\"{2}\" required-closure=\"{3}\" "
          "detail=\"{4}\"",
          definition.kind, role, definition.definition,
@@ -2133,7 +2133,7 @@ void RefoldEngine::RequestTerminalFallback(
   terminalFallbackRequests_.push_back(request);
 
   TraceWitnessFallback(request);
-  debug("fallback", "{0}", request);
+  REFOLD_LOG_DEBUG("fallback", "{0}", request);
 }
 
 void RefoldEngine::EnforceTheoremAuditInvariants() const {
@@ -3099,7 +3099,7 @@ void RefoldEngine::BuildBInsertionProvenance(ArrayRef<diffutils::Hunk> hunks) {
     if (b1 > bToks_.size()) {
       // A refold map / token diff invariant violation: a hunk must never refer
       // to B token indices outside the lexed B stream.
-      fatal("prov/ins",
+      REFOLD_LOG_FATAL("prov/ins",
             "insertion hunk out of B bounds: hunk#{0} b=[{1},{2}) bToks={3}",
             hi, b0, b1, bToks_.size());
     }
@@ -3117,7 +3117,7 @@ void RefoldEngine::BuildBInsertionProvenance(ArrayRef<diffutils::Hunk> hunks) {
       if (bTokToInsertionId_[bj] != -1) {
         // Pure insertion hunks must form a disjoint partition of B-token
         // subranges. Any overlap indicates a diff/instrumentation bug.
-        fatal("prov/ins",
+        REFOLD_LOG_FATAL("prov/ins",
               "overlapping insertion hunks at B tok {0}: existingIns={1} "
               "newIns={2}",
               bj, bTokToInsertionId_[bj], static_cast<int32_t>(insId));
@@ -3148,7 +3148,7 @@ void RefoldEngine::ClaimBInsertion(size_t insId, BInsertionClaim c,
   }
   if (ins.claim != c) {
     // Conflicting claims indicate a logic error (double-emission risk).
-    fatal("prov/claim",
+    REFOLD_LOG_FATAL("prov/claim",
           "double-claim insertion ins#{0} hunk#{1} AGap={2} B=[{3},{4}) "
           "existing={5} new={6} why={7}",
           insId, ins.hunkIndex, ins.aGap, ins.b0, ins.b1,
@@ -3383,7 +3383,7 @@ bool RefoldEngine::ValidateSidebandPragmaEditProof(
   // validation gate focused on non-redundant proof obligations so the proof
   // record cannot drift out of sync with the edit.
 
-  trace("proof/owner-local",
+  REFOLD_LOG_TRACE("proof/owner-local",
         "sideband proof ok stage={0} path='{1}' source=[{2},{3}) b=[{4},{5}) "
         "owner={6}",
         stage, edit.SourcePath(), sourceRange.first, sourceRange.second,
@@ -3743,7 +3743,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
 
   StringRef tuPath = model_.GetSourcePath();
 
-  info("plan",
+  REFOLD_LOG_INFO("plan",
        "starting refold: tu={0} ppBytes={1} ppModBytes={2} ppTokens={3} "
        "ppModTokens={4}",
        tuPath, aSource_.size(), bSource_.size(), aToks_.size(), bToks_.size());
@@ -3759,7 +3759,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
     auto bufOrErr = MemoryBuffer::getFile(fullTuPath);
     if (!bufOrErr) {
       // Fatal and stop: unreachable past this point.
-      fatal("src/load", "failed to read C source: {0} ({1})", fullTuPath,
+      REFOLD_LOG_FATAL("src/load", "failed to read C source: {0} ({1})", fullTuPath,
             bufOrErr.getError().message());
     }
 
@@ -3818,13 +3818,13 @@ std::string RefoldEngine::RunSinglePassRefold() {
     if (j < 0)
       continue;
     if (j < last) {
-      fatal("lcs/map", "non-monotone map at A[{0}]={1} after {2}", i, j, last);
+      REFOLD_LOG_FATAL("lcs/map", "non-monotone map at A[{0}]={1} after {2}", i, j, last);
     }
     last = j;
   }
 
 
-  debug("plan",
+  REFOLD_LOG_DEBUG("plan",
         "refold model loaded: tu={0} includes={1} macroInvocations={2} "
         "ppTokenMapEntries={3}",
         tuPath, model_.GetIncludes().size(),
@@ -5306,7 +5306,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
 
     // Case B: Hunk indices are out of bounds for the token-to-byte map
     if (h.bEnd >= bTokOff_.size()) {
-      fatal("hunks",
+      REFOLD_LOG_FATAL("hunks",
             "#{0} {1:verbose} B=OUT-OF-BOUNDS: h.bEnd={2} map.size={3}", i, h,
             h.bEnd, bTokOff_.size());
       continue;
@@ -5318,7 +5318,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
     // Case C: The token-to-byte map contains sentinels (virtual/synthetic
     // tokens)
     if (b0 == StringRef::npos || b1 == StringRef::npos) {
-      fatal("hunks", "#{0} {1:verbose} B=SENTINEL: b0={2} b1={3}", i, h,
+      REFOLD_LOG_FATAL("hunks", "#{0} {1:verbose} B=SENTINEL: b0={2} b1={3}", i, h,
             (b0 == StringRef::npos ? "npos" : "valid"),
             (b1 == StringRef::npos ? "npos" : "valid"));
       continue;
@@ -5326,7 +5326,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
 
     // Case D: Byte offsets are inverted (corrupt map or out-of-order tokens)
     if (b1 < b0) {
-      fatal("hunks", "#{0} {1:verbose} B=INVERTED-OFFSETS: b0={2} b1={3}", i, h,
+      REFOLD_LOG_FATAL("hunks", "#{0} {1:verbose} B=INVERTED-OFFSETS: b0={2} b1={3}", i, h,
             b0, b1);
       continue;
     }
@@ -5336,12 +5336,11 @@ std::string RefoldEngine::RunSinglePassRefold() {
     const size_t lo = std::min(b0, bSource_.size());
     const size_t hi = std::min(b1, bSource_.size());
 
-    StringRef bfrag = bSource_.substr(lo, hi - lo);
-
     if (inTraceMode()) {
+      StringRef bfrag = bSource_.substr(lo, hi - lo);
       trace("diff/hunk",
-            "hunk #{0}: aTokens=[{1},{2}) bTokens=[{3},{4}) "
-            "bBytes=[{5},{6}) bText=\"{7}\"",
+            "hunk #{0}: aTokens=[{1},{2}) bTokens=[{3},{4}) bBytes=[{5},{6}) "
+            "bText=\"{7}\"",
             i, h.aStart, h.aEnd, h.bStart, h.bEnd, lo, hi,
             stringutils::showWsWithClip(bfrag, 160));
     }
@@ -5955,7 +5954,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
           original.assign(tuBytes.data() + span->first,
                           tuBytes.data() + span->second);
         } else if (span->second < span->first) {
-          fatal("tu/span", "invalid TU byte span: [{0},{1})", span->first,
+          REFOLD_LOG_FATAL("tu/span", "invalid TU byte span: [{0},{1})", span->first,
                 span->second);
         }
 
@@ -6162,7 +6161,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
           repl = std::move(original);
         }
       } else if (span->second < span->first) {
-        fatal("tu/span", "invalid TU byte span: [{0},{1})", span->first,
+        REFOLD_LOG_FATAL("tu/span", "invalid TU byte span: [{0},{1})", span->first,
               span->second);
       }
 
@@ -6249,7 +6248,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
   // artifacts. The outer driver will discard the current attempt and emit B
   // directly.
   if (HasTerminalFallbackRequest()) {
-    debug("fallback", "single-pass refold aborted after classification; "
+    REFOLD_LOG_DEBUG("fallback", "single-pass refold aborted after classification; "
                       "terminal fallback will be emitted");
     return std::string();
   }
@@ -7157,7 +7156,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
 
         advancedDirectiveIds.insert(undefDirective.id);
         ++advancedCount;
-        warn("macro/liveness",
+        REFOLD_LOG_WARN("macro/liveness",
              "advancing preserved #undef before observed replacement: "
              "macro='{0}' "
              "undefDirective=#{1} priorDefine=#{2} edit=[{3},{4}) "
@@ -7169,7 +7168,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
     }
 
     if (advancedCount != 0) {
-      info("macro/liveness",
+      REFOLD_LOG_INFO("macro/liveness",
            "advanced {0} preserved #undef directive(s) before replacement "
            "payloads to keep edited tokens in B macro state",
            advancedCount);
@@ -7270,7 +7269,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
                   AcceptedPathKind::TUByteSpanConservativeEdit, edit.start,
                   edit.end, StringRef(edit.text)));
 
-    warn("macro/liveness",
+    REFOLD_LOG_WARN("macro/liveness",
          "advancing consumed #undef before observed replacement: macro='{0}' "
          "undefDirective=#{1} priorDefine=#{2} edit=[{3},{4}) "
          "widenedStart={5}",
@@ -7338,7 +7337,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
                       AcceptedPathKind::TUByteSpanConservativeEdit, edit.start,
                       edit.end, StringRef(edit.text)));
 
-        trace("macro/liveness",
+        REFOLD_LOG_TRACE("macro/liveness",
               "widened TU edit to delayed macro-state boundary: macro='{0}' "
               "definitionDirective=#{1} oldEnd={2} newEnd={3}",
               macroName, definition.id, oldEnd, edit.end);
@@ -7723,7 +7722,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
 
         carriedDirectiveIds.insert(candidate.directive->id);
         ++carriedCount;
-        warn("macro/liveness",
+        REFOLD_LOG_WARN("macro/liveness",
              "carrying observed gap #define after TU replacement: macro='{0}' "
              "defDirective=#{1} edit=[{2},{3}) widened=[{4},{5})",
              candidate.name, candidate.directive->id, oldStart, oldEnd,
@@ -7732,7 +7731,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
     }
 
     if (carriedCount != 0)
-      info("macro/liveness",
+      REFOLD_LOG_INFO("macro/liveness",
            "carried {0} preserved #define directive(s) after replacement "
            "payloads to keep edited tokens in B macro state", carriedCount);
   };
@@ -7956,7 +7955,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
           if (!preservedDefinitionDirectiveIds.contains(definition->id)) {
             preservedDefinitionDirectiveIds.insert(definition->id);
             ++preservedDefinitionLivenessDirectives;
-            warn("macro/liveness",
+            REFOLD_LOG_WARN("macro/liveness",
                  "preserving consumed #define for surviving macro callsite: "
                  "macro='{0}' defDirective=#{1} inv=#{2} edit=[{3},{4}) "
                  "placement={5}",
@@ -8054,7 +8053,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
     byMacroId[patchKey] = std::move(patch);
     ++forcedDefinitionLivenessPatches;
 
-    warn("macro/liveness",
+    REFOLD_LOG_WARN("macro/liveness",
          "forced whole-cover macro realization because active definition was "
          "consumed by TU edit and could not be preserved: macro='{0}' "
          "defDirective=#{1} inv=#{2} invBytes=[{3},{4})",
@@ -8062,20 +8061,20 @@ std::string RefoldEngine::RunSinglePassRefold() {
   }
 
   if (HasTerminalFallbackRequest()) {
-    debug("fallback", "single-pass refold aborted after macro-definition "
+    REFOLD_LOG_DEBUG("fallback", "single-pass refold aborted after macro-definition "
                       "liveness repair; terminal fallback will be emitted");
     return std::string();
   }
 
   if (preservedDefinitionLivenessDirectives != 0) {
-    info("macro/liveness",
+    REFOLD_LOG_INFO("macro/liveness",
          "preserved {0} consumed #define directive(s) needed by surviving "
          "macro callsite(s)",
          preservedDefinitionLivenessDirectives);
   }
 
   if (forcedDefinitionLivenessPatches != 0) {
-    info("macro/liveness",
+    REFOLD_LOG_INFO("macro/liveness",
          "forced {0} macro callsite(s) to whole-cover realization after "
          "definition-removing TU edits",
          forcedDefinitionLivenessPatches);
@@ -8185,7 +8184,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
             .str());
 
     ++undefLivenessHazards;
-    warn("macro/liveness",
+    REFOLD_LOG_WARN("macro/liveness",
          "preserving consumed #undef to prevent resurrected macro definition: "
          "macro='{0}' undefDirective=#{1} priorDefine=#{2} edit=[{3},{4}) "
          "placement={5}",
@@ -8195,7 +8194,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
   }
 
   if (HasTerminalFallbackRequest()) {
-    debug("fallback", "single-pass refold aborted after macro-undef "
+    REFOLD_LOG_DEBUG("fallback", "single-pass refold aborted after macro-undef "
                       "liveness repair; terminal fallback will be emitted");
     return std::string();
   }
@@ -8285,7 +8284,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
   }
 
   if (undefLivenessHazards != 0) {
-    info("macro/liveness",
+    REFOLD_LOG_INFO("macro/liveness",
          "preserved {0} consumed #undef directive(s) to keep suffix macro "
          "state equivalent after source replacement",
          undefLivenessHazards);
@@ -8452,7 +8451,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
   // terminal fallback in this single pass, stop here rather than continuing to
   // compose or return mixed structural artifacts.
   if (HasTerminalFallbackRequest()) {
-    debug("fallback", "single-pass refold aborted after include "
+    REFOLD_LOG_DEBUG("fallback", "single-pass refold aborted after include "
                       "materialization; terminal fallback will be emitted");
     return std::string();
   }
@@ -8506,7 +8505,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
         // either disjoint or nested). If they do, fail fast rather than
         // producing order-dependent behavior.
         if (mp.invStart < acc.second && acc.first < mpEnd) {
-          fatal("macro/tu",
+          REFOLD_LOG_FATAL("macro/tu",
                 "overlapping TU macro patches: mp=[{0},{1}) acc=[{2},{3})",
                 mp.invStart, mpEnd, acc.first, acc.second);
         }
@@ -9283,7 +9282,7 @@ std::vector<StringRef> RefoldEngine::MapLexemes(ArrayRef<PPTok> toks,
     const auto &s = toks[i].spelling;
     if (stringutils::isWs(s)) {
       // We should never encounter a whitespace token
-      fatal("map/lexemes", "token at index {0} is whitespace", i);
+      REFOLD_LOG_FATAL("map/lexemes", "token at index {0} is whitespace", i);
     } else {
       out.emplace_back(StringRef(s));
     }
@@ -12466,7 +12465,7 @@ RefoldEngine::GetOwnerStateGraph() const {
     lastTheoremAudit_.graphIncomparableNodes = audit.incomparableNodes;
     lastTheoremAudit_.graphMissingProducerFacts =
         audit.missingProducerFacts;
-    trace("state/graph",
+    REFOLD_LOG_TRACE("state/graph",
           "owner-state graph: nodes={0} zeroTokenStateNodes={1} "
           "observedComponents={2} mutatedComponents={3} "
           "incomparableNodes={4} missingProducerFacts={5}",
@@ -12922,7 +12921,7 @@ RefoldEngine::CheckStateTransitionAcrossEditBoundary(
               .str());
     }
 
-    trace("state/gateway",
+    REFOLD_LOG_TRACE("state/gateway",
           "state-transition gateway accepted directive-closure proof before "
           "suffix query: component={0} mutation={1} directive={2} stage={3} "
           "detail={4}",
@@ -12944,7 +12943,7 @@ RefoldEngine::CheckStateTransitionAcrossEditBoundary(
       witness.boundary = request.boundary;
       witness.detail = request.detail;
       acceptedWitness = SuffixStabilityWitness::From(std::move(witness));
-      trace("state/gateway",
+      REFOLD_LOG_TRACE("state/gateway",
             "state-transition gateway discharged: component={0} "
             "mutation={1} no preserved suffix observer stage={2} detail={3}",
             request.component, request.mutation, request.stage, request.detail);
@@ -13025,7 +13024,7 @@ RefoldEngine::CheckStateTransitionAcrossEditBoundary(
     attachFirstObserverToWitness();
     ++lastTheoremAudit_.stateTransitionGatewayStable;
     acceptedWitness = std::move(normalizedWitness);
-    trace("state/gateway",
+    REFOLD_LOG_TRACE("state/gateway",
           "state-transition gateway discharged: component={0} mutation={1} "
           "witness={2} orderedObservers={3} incomparable={4} stage={5} "
           "detail={6}",
@@ -14620,7 +14619,7 @@ std::optional<uint64_t> RefoldEngine::AnchorToExactSlotBoundaryFromPPGap(
   // Read TU text for newline-aware slot adjustment
   auto bufOrErr = MemoryBuffer::getFile(lineDirs_.ToAbsolutePath(tuPath));
   if (!bufOrErr) {
-    fatal("slot/anchor", "unable to read TU: {0}", tuPath);
+    REFOLD_LOG_FATAL("slot/anchor", "unable to read TU: {0}", tuPath);
     // Should be unreachable!
   }
   StringRef tuText = bufOrErr.get()->getBuffer();
@@ -28070,7 +28069,7 @@ static void LogProofLine(const FormatObject &line) {
   std::string text = line.str();
   while (!text.empty() && text.back() == '\n')
     text.pop_back();
-  info("proof", "{0}", text);
+  REFOLD_LOG_INFO("proof", "{0}", text);
 }
 
 RefoldEngine::WitnessFallbackClass
@@ -29322,7 +29321,7 @@ RefoldEngine::TryBuildOwnerRealization(OwnerRealizationEvidenceKind evidence,
     }
     result.failure = MakeTerminalFallbackProofFailure(obligation, reason,
                                                       std::move(context));
-    trace("proof/owner-realization",
+    REFOLD_LOG_TRACE("proof/owner-realization",
           "reject owner realization evidence={0} owner={1}: {2} detail='{3}'",
           evidence, result.witness.closure.owner.kind, result.failure,
           result.detail);
@@ -29353,7 +29352,7 @@ RefoldEngine::TryBuildOwnerRealization(OwnerRealizationEvidenceKind evidence,
         TerminalFallbackFailureReason::StateTransitionConsumedAndObserved);
 
   result.accepted = true;
-  trace("proof/owner-realization",
+  REFOLD_LOG_TRACE("proof/owner-realization",
         "accept owner realization evidence={0} owner={1} source='{2}'[{3},{4}) "
         "A=[{5},{6}) B=[{7},{8}) stateWitnesses={9} detail='{10}'",
         evidence, result.witness.closure.owner.kind,
@@ -29392,7 +29391,7 @@ void RefoldEngine::ApplyOwnerRealizationResultToProofSummary(
     summary.discharge.failureReason =
         ProofFailureReason::MissingOwnerRealizationWitness;
 
-  trace("proof/owner-realization",
+  REFOLD_LOG_TRACE("proof/owner-realization",
         "reject accepted candidate after owner-realization gate failed: {0} "
         "detail='{1}'",
         result.failure, result.detail);
@@ -35012,47 +35011,52 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               CertifiedFormalRewrite{argIdx, oldText.str(), newText.str()});
         }
 
-        // Build a support ledger for diagnostics and paste replay: provided
-        // formals, actually changed formals, carried formals, and
-        // paste-required formals that still lack replacement support.
-        auto providedArgIdxs = argOrder;
-        auto carriedArgIdxs = collectSortedUInt32Keys(cert.replacementByArgIdx);
+        auto logInvocationSupportLedger = [&](StringRef ledgerState) {
+          if (!inTraceMode())
+            return;
+          // Build the support ledger only when trace logging will consume it:
+          // provided formals, actually changed formals, carried formals, and
+          // paste-required formals that still lack replacement support.
+          auto providedArgIdxs = argOrder;
+          auto carriedArgIdxs =
+              collectSortedUInt32Keys(cert.replacementByArgIdx);
 
-        SmallVector<uint32_t, 8> changedArgIdxs;
-        changedArgIdxs.reserve(cert.rewrites.size());
-        for (const auto &rewrite : cert.rewrites)
-          changedArgIdxs.push_back(rewrite.argIdx);
-        llvm::sort(changedArgIdxs);
+          SmallVector<uint32_t, 8> changedArgIdxs;
+          changedArgIdxs.reserve(cert.rewrites.size());
+          for (const auto &rewrite : cert.rewrites)
+            changedArgIdxs.push_back(rewrite.argIdx);
+          llvm::sort(changedArgIdxs);
 
-        auto requiredPasteArgIdxs =
-            collectSortedUniquePasteArgIdxs(inv.pasteSpans);
-        auto missingSupportArgIdxs =
-            computeSortedMissingUInt32s(requiredPasteArgIdxs, carriedArgIdxs);
+          auto requiredPasteArgIdxs =
+              collectSortedUniquePasteArgIdxs(inv.pasteSpans);
+          auto missingSupportArgIdxs =
+              computeSortedMissingUInt32s(requiredPasteArgIdxs, carriedArgIdxs);
 
-        trace("macro/proof",
-              "{0}: invocation support ledger enter inv id={1} name={2} "
-              "provided={3} changed={4} carried={5} requiredPaste={6} "
-              "missingSupport={7} deferredArgs={8}",
-              traceStage, inv.id, inv.name, formatUInt32List(providedArgIdxs),
-              formatUInt32List(changedArgIdxs),
-              formatUInt32List(carriedArgIdxs),
-              formatUInt32List(requiredPasteArgIdxs),
-              formatUInt32List(missingSupportArgIdxs),
-              formatUInt32List(deferOccurrenceArgIdxs));
+          trace("macro/proof",
+                "{0}: invocation support ledger {1} inv id={2} name={3} "
+                "provided={4} changed={5} carried={6} requiredPaste={7} "
+                "missingSupport={8} deferredArgs={9} pasteRequired={10} "
+                "pasteValid={11} pasteDeferred={12}",
+                traceStage, ledgerState, inv.id, inv.name,
+                formatUInt32List(providedArgIdxs),
+                formatUInt32List(changedArgIdxs),
+                formatUInt32List(carriedArgIdxs),
+                formatUInt32List(requiredPasteArgIdxs),
+                formatUInt32List(missingSupportArgIdxs),
+                formatUInt32List(deferOccurrenceArgIdxs),
+                cert.pasteValidation.required ? 1 : 0,
+                cert.pasteValidation.valid ? 1 : 0,
+                cert.pasteValidation.deferred ? 1 : 0);
+        };
+
+        logInvocationSupportLedger("enter");
 
         // If every validated formal collapsed to its original text, the
         // invocation has no rewrite to materialize. Still return a certificate
         // so callers can report the no-change proof path deterministically.
         if (cert.rewrites.empty()) {
           cert.kind = InvocationRewriteCertificateKind::NoChange;
-          trace("macro/proof",
-                "{0}: invocation support ledger no-change inv id={1} "
-                "name={2} provided={3} carried={4} requiredPaste={5} "
-                "missingSupport={6}",
-                traceStage, inv.id, inv.name, formatUInt32List(providedArgIdxs),
-                formatUInt32List(carriedArgIdxs),
-                formatUInt32List(requiredPasteArgIdxs),
-                formatUInt32List(missingSupportArgIdxs));
+          logInvocationSupportLedger("no-change");
           return cert;
         }
 
@@ -35064,19 +35068,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             callsiteArgRangesOverride);
         cert.touchesPaste = cert.pasteValidation.required;
 
-        trace("macro/proof",
-              "{0}: invocation support ledger replay inv id={1} name={2} "
-              "provided={3} changed={4} carried={5} requiredPaste={6} "
-              "missingSupport={7} pasteRequired={8} pasteValid={9} "
-              "pasteDeferred={10}",
-              traceStage, inv.id, inv.name, formatUInt32List(providedArgIdxs),
-              formatUInt32List(changedArgIdxs),
-              formatUInt32List(carriedArgIdxs),
-              formatUInt32List(requiredPasteArgIdxs),
-              formatUInt32List(missingSupportArgIdxs),
-              cert.pasteValidation.required ? 1 : 0,
-              cert.pasteValidation.valid ? 1 : 0,
-              cert.pasteValidation.deferred ? 1 : 0);
+        logInvocationSupportLedger("replay");
 
         if (!cert.pasteValidation.valid) {
           switch (cert.pasteValidation.failure) {
@@ -35371,14 +35363,15 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           if (StringRef(*cand->invText).trim() != argText->trim())
             continue;
           nestedMatches.push_back(cand->id);
-          if (nested)
-            return (trace("macro/dag",
-                          "{0}: nested pasted-chain derivation ambiguous "
-                          "nested child matches parent child id={1} name={2} "
-                          "argIdx={3} matches={4}",
-                          traceStage, cur.id, cur.name, curFormal,
-                          formatUInt32List(nestedMatches)),
-                    std::nullopt);
+          if (nested) {
+            REFOLD_LOG_TRACE("macro/dag",
+                             "{0}: nested pasted-chain derivation ambiguous "
+                             "nested child matches parent child id={1} name={2} "
+                             "argIdx={3} matches={4}",
+                             traceStage, cur.id, cur.name, curFormal,
+                             formatUInt32List(nestedMatches));
+            return std::nullopt;
+          }
           nested = cand;
         }
         if (!nested) {
@@ -36664,20 +36657,22 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           preferredChildSyntax[cur.id] = cert.rewrittenChildSyntax;
 
 
-        // Proof-ledger logging separates three sets that are easy to conflate:
-        // observed parent arguments, paste arguments required by the parent,
-        // and child formals that still need a non-direct discharge.
-        auto observedParentArgIdxs = collectSortedUInt32Keys(parentObserved);
-        auto requiredParentPasteArgIdxs =
-            collectSortedUniquePasteArgIdxs(parent->pasteSpans);
-        trace("macro/proof",
-              "DAG per-hop proof ledger observed: child id={0} name={1} "
-              "parent id={2} name={3} observedParentArgs={4} "
-              "requiredParentPasteArgs={5} unresolvedChildFormals={6}",
-              cur.id, cur.name, parent->id, parent->name,
-              formatUInt32List(observedParentArgIdxs),
-              formatUInt32List(requiredParentPasteArgIdxs),
-              formatUInt32List(unresolvedChildFormals));
+        if (inTraceMode()) {
+          // Proof-ledger logging separates the sets that are easy to conflate:
+          // observed parent arguments, paste arguments required by the parent,
+          // and child formals that still need a non-direct discharge.
+          auto observedParentArgIdxs = collectSortedUInt32Keys(parentObserved);
+          auto requiredParentPasteArgIdxs =
+              collectSortedUniquePasteArgIdxs(parent->pasteSpans);
+          trace("macro/proof",
+                "DAG per-hop proof ledger observed: child id={0} name={1} "
+                "parent id={2} name={3} observedParentArgs={4} "
+                "requiredParentPasteArgs={5} unresolvedChildFormals={6}",
+                cur.id, cur.name, parent->id, parent->name,
+                formatUInt32List(observedParentArgIdxs),
+                formatUInt32List(requiredParentPasteArgIdxs),
+                formatUInt32List(unresolvedChildFormals));
+        }
 
         // Convert the observed parent-formal constraints into concrete parent
         // formal rewrites. This is the main consistency gate for the parent
@@ -36728,25 +36723,29 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
               FormalTextPair{formalCert.oldText, formalCert.newText};
         }
 
-        // After formal certification, compare the parent arguments we actually
-        // carry with the paste arguments that the parent may need to preserve.
-        // Missing paste support is only safe if discharged by a later
-        // body-space proof; otherwise the hop must bridge lexically.
-        auto carriedParentArgIdxs = collectSortedUInt32Keys(parentFormals);
-        auto missingParentSupportArgIdxs = computeSortedMissingUInt32s(
-            requiredParentPasteArgIdxs, carriedParentArgIdxs);
-        trace("macro/proof",
-              "DAG per-hop proof ledger carried: child id={0} name={1} "
-              "parent id={2} name={3} observedParentArgs={4} "
-              "carriedParentArgs={5} "
-              "requiredParentPasteArgs={6} missingSupport={7} "
-              "unresolvedChildFormals={8}",
-              cur.id, cur.name, parent->id, parent->name,
-              formatUInt32List(observedParentArgIdxs),
-              formatUInt32List(carriedParentArgIdxs),
-              formatUInt32List(requiredParentPasteArgIdxs),
-              formatUInt32List(missingParentSupportArgIdxs),
-              formatUInt32List(unresolvedChildFormals));
+        if (inTraceMode()) {
+          // After formal certification, compare the parent arguments we
+          // actually carry with the paste arguments that the parent may need to
+          // preserve. This is diagnostic-only: the later body-space gate owns
+          // the semantic discharge.
+          auto observedParentArgIdxs = collectSortedUInt32Keys(parentObserved);
+          auto carriedParentArgIdxs = collectSortedUInt32Keys(parentFormals);
+          auto requiredParentPasteArgIdxs =
+              collectSortedUniquePasteArgIdxs(parent->pasteSpans);
+          auto missingParentSupportArgIdxs = computeSortedMissingUInt32s(
+              requiredParentPasteArgIdxs, carriedParentArgIdxs);
+          trace("macro/proof",
+                "DAG per-hop proof ledger carried: child id={0} name={1} "
+                "parent id={2} name={3} observedParentArgs={4} "
+                "carriedParentArgs={5} requiredParentPasteArgs={6} "
+                "missingSupport={7} unresolvedChildFormals={8}",
+                cur.id, cur.name, parent->id, parent->name,
+                formatUInt32List(observedParentArgIdxs),
+                formatUInt32List(carriedParentArgIdxs),
+                formatUInt32List(requiredParentPasteArgIdxs),
+                formatUInt32List(missingParentSupportArgIdxs),
+                formatUInt32List(unresolvedChildFormals));
+        }
 
         // Unresolved child-formal inversions are allowed only when a parent
         // formal certificate has proven that the parent body itself preserves
@@ -38735,7 +38734,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           if (!mergedArgText)
             return std::nullopt;
           if (StringRef(*mergedArgText).trim() == baseArgText) {
-            trace("macro/proof",
+            REFOLD_LOG_TRACE("macro/proof",
                   "merge DAG validation metadata root id={0} name={1} "
                   "argIdx={2} collapsed to base text base='{3}' variants={4}",
                   m.id, m.name, argIdx,
@@ -39009,6 +39008,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           };
 
           SmallVector<uint32_t, 8> replayAugmentedSupportOnlyArgIdxs;
+          const bool traceRootProofValidation = inTraceMode();
           for (const auto &KV : *expectedRootFormals) {
             if (replayRootFormals->contains(KV.first))
               continue;
@@ -39018,107 +39018,110 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             if (!concreteArgMatchesExpectedUnchanged(KV.first, KV.second))
               continue;
             (*replayRootFormals)[KV.first] = KV.second;
-            replayAugmentedSupportOnlyArgIdxs.push_back(KV.first);
+            if (traceRootProofValidation)
+              replayAugmentedSupportOnlyArgIdxs.push_back(KV.first);
           }
-          llvm::sort(replayAugmentedSupportOnlyArgIdxs);
 
-          trace("macro/proof",
-                "{0}: root proof replay-vs-expected root id={1} name={2} "
-                "replay={3} expected={4} augmentedSupportOnly={5}",
-                traceStage, m.id, m.name,
-                formatFormalTextPairMap(*replayRootFormals),
-                formatFormalTextPairMap(*expectedRootFormals),
-                formatUInt32List(replayAugmentedSupportOnlyArgIdxs));
+          if (traceRootProofValidation) {
+            llvm::sort(replayAugmentedSupportOnlyArgIdxs);
+            trace("macro/proof",
+                  "{0}: root proof replay-vs-expected root id={1} name={2} "
+                  "replay={3} expected={4} augmentedSupportOnly={5}",
+                  traceStage, m.id, m.name,
+                  formatFormalTextPairMap(*replayRootFormals),
+                  formatFormalTextPairMap(*expectedRootFormals),
+                  formatUInt32List(replayAugmentedSupportOnlyArgIdxs));
 
-          auto newRangesOpt =
-              GetMacroInvocationFormalArgContentRanges(m, newText);
-          SmallVector<uint32_t, 8> missingExpectedArgIdxs;
-          SmallVector<uint32_t, 8> unchangedConcreteMissingArgIdxs;
-          SmallVector<uint32_t, 8> supportOnlyMissingArgIdxs;
-          SmallVector<uint32_t, 8> mismatchedExpectedArgIdxs;
-          SmallVector<uint32_t, 8> unexpectedReplayArgIdxs;
+            auto newRangesOpt =
+                GetMacroInvocationFormalArgContentRanges(m, newText);
+            SmallVector<uint32_t, 8> missingExpectedArgIdxs;
+            SmallVector<uint32_t, 8> unchangedConcreteMissingArgIdxs;
+            SmallVector<uint32_t, 8> supportOnlyMissingArgIdxs;
+            SmallVector<uint32_t, 8> mismatchedExpectedArgIdxs;
+            SmallVector<uint32_t, 8> unexpectedReplayArgIdxs;
 
-          // Build a detailed mismatch ledger before the hard equality checks.
-          // These traces make it clear whether failure came from missing
-          // support-only formals, actual rewrite mismatches, or unexpected
-          // replay-derived formals.
-          for (const auto &KV : *expectedRootFormals) {
-            auto it = replayRootFormals->find(KV.first);
-            if (it == replayRootFormals->end()) {
-              missingExpectedArgIdxs.push_back(KV.first);
-              if (KV.second.oldText == KV.second.newText)
-                supportOnlyMissingArgIdxs.push_back(KV.first);
+            // Build a detailed mismatch ledger before the hard equality checks.
+            // These traces make it clear whether failure came from missing
+            // support-only formals, actual rewrite mismatches, or unexpected
+            // replay-derived formals.
+            for (const auto &KV : *expectedRootFormals) {
+              auto it = replayRootFormals->find(KV.first);
+              if (it == replayRootFormals->end()) {
+                missingExpectedArgIdxs.push_back(KV.first);
+                if (KV.second.oldText == KV.second.newText)
+                  supportOnlyMissingArgIdxs.push_back(KV.first);
 
-              if (newRangesOpt && KV.first < invArgRanges.size() &&
-                  KV.first < newRangesOpt->size()) {
-                const auto &oldR = invArgRanges[KV.first];
-                const auto &newR = (*newRangesOpt)[KV.first];
-                if (oldR.first <= oldR.second &&
-                    oldR.second <= baseText.size() &&
-                    newR.first <= newR.second &&
-                    newR.second <= newText.size()) {
-                  StringRef concreteOld =
-                      baseText.slice((size_t)oldR.first, (size_t)oldR.second)
-                          .trim();
-                  StringRef concreteNew =
-                      newText.slice((size_t)newR.first, (size_t)newR.second)
-                          .trim();
-                  if (concreteOld == concreteNew &&
-                      concreteOld == StringRef(KV.second.oldText).trim() &&
-                      concreteNew == StringRef(KV.second.newText).trim()) {
-                    unchangedConcreteMissingArgIdxs.push_back(KV.first);
+                if (newRangesOpt && KV.first < invArgRanges.size() &&
+                    KV.first < newRangesOpt->size()) {
+                  const auto &oldR = invArgRanges[KV.first];
+                  const auto &newR = (*newRangesOpt)[KV.first];
+                  if (oldR.first <= oldR.second &&
+                      oldR.second <= baseText.size() &&
+                      newR.first <= newR.second &&
+                      newR.second <= newText.size()) {
+                    StringRef concreteOld =
+                        baseText.slice((size_t)oldR.first, (size_t)oldR.second)
+                            .trim();
+                    StringRef concreteNew =
+                        newText.slice((size_t)newR.first, (size_t)newR.second)
+                            .trim();
+                    if (concreteOld == concreteNew &&
+                        concreteOld == StringRef(KV.second.oldText).trim() &&
+                        concreteNew == StringRef(KV.second.newText).trim()) {
+                      unchangedConcreteMissingArgIdxs.push_back(KV.first);
+                    }
+                    trace("macro/proof",
+                          "{0}: root proof missing expected arg root id={1} "
+                          "name={2} argIdx={3} concreteOld='{4}' "
+                          "concreteNew='{5}' expectedOld='{6}' "
+                          "expectedNew='{7}'",
+                          traceStage, m.id, m.name, KV.first,
+                          stringutils::showWsWithClip(concreteOld, 120),
+                          stringutils::showWsWithClip(concreteNew, 120),
+                          stringutils::showWsWithClip(KV.second.oldText, 120),
+                          stringutils::showWsWithClip(KV.second.newText, 120));
                   }
-                  trace(
-                      "macro/proof",
-                      "{0}: root proof missing expected arg root id={1} "
-                      "name={2} argIdx={3} concreteOld='{4}' concreteNew='{5}' "
+                }
+                continue;
+              }
+
+              if (it->second.oldText != KV.second.oldText ||
+                  it->second.newText != KV.second.newText) {
+                mismatchedExpectedArgIdxs.push_back(KV.first);
+                trace("macro/proof",
+                      "{0}: root proof mismatched expected arg root id={1} "
+                      "name={2} argIdx={3} derivedOld='{4}' derivedNew='{5}' "
                       "expectedOld='{6}' expectedNew='{7}'",
                       traceStage, m.id, m.name, KV.first,
-                      stringutils::showWsWithClip(concreteOld, 120),
-                      stringutils::showWsWithClip(concreteNew, 120),
+                      stringutils::showWsWithClip(it->second.oldText, 120),
+                      stringutils::showWsWithClip(it->second.newText, 120),
                       stringutils::showWsWithClip(KV.second.oldText, 120),
                       stringutils::showWsWithClip(KV.second.newText, 120));
-                }
               }
-              continue;
             }
 
-            if (it->second.oldText != KV.second.oldText ||
-                it->second.newText != KV.second.newText) {
-              mismatchedExpectedArgIdxs.push_back(KV.first);
-              trace("macro/proof",
-                    "{0}: root proof mismatched expected arg root id={1} "
-                    "name={2} argIdx={3} derivedOld='{4}' derivedNew='{5}' "
-                    "expectedOld='{6}' expectedNew='{7}'",
-                    traceStage, m.id, m.name, KV.first,
-                    stringutils::showWsWithClip(it->second.oldText, 120),
-                    stringutils::showWsWithClip(it->second.newText, 120),
-                    stringutils::showWsWithClip(KV.second.oldText, 120),
-                    stringutils::showWsWithClip(KV.second.newText, 120));
+            for (const auto &KV : *replayRootFormals) {
+              if (!expectedRootFormals->contains(KV.first))
+                unexpectedReplayArgIdxs.push_back(KV.first);
             }
-          }
 
-          for (const auto &KV : *replayRootFormals) {
-            if (!expectedRootFormals->contains(KV.first))
-              unexpectedReplayArgIdxs.push_back(KV.first);
+            llvm::sort(missingExpectedArgIdxs);
+            llvm::sort(unchangedConcreteMissingArgIdxs);
+            llvm::sort(supportOnlyMissingArgIdxs);
+            llvm::sort(mismatchedExpectedArgIdxs);
+            llvm::sort(unexpectedReplayArgIdxs);
+            trace("macro/proof",
+                  "{0}: root proof mismatch analysis root id={1} name={2} "
+                  "missingExpectedArgs={3} unchangedConcreteMissingArgs={4} "
+                  "supportOnlyMissingArgs={5} mismatchedExpectedArgs={6} "
+                  "unexpectedReplayArgs={7}",
+                  traceStage, m.id, m.name,
+                  formatUInt32List(missingExpectedArgIdxs),
+                  formatUInt32List(unchangedConcreteMissingArgIdxs),
+                  formatUInt32List(supportOnlyMissingArgIdxs),
+                  formatUInt32List(mismatchedExpectedArgIdxs),
+                  formatUInt32List(unexpectedReplayArgIdxs));
           }
-
-          llvm::sort(missingExpectedArgIdxs);
-          llvm::sort(unchangedConcreteMissingArgIdxs);
-          llvm::sort(supportOnlyMissingArgIdxs);
-          llvm::sort(mismatchedExpectedArgIdxs);
-          llvm::sort(unexpectedReplayArgIdxs);
-          trace("macro/proof",
-                "{0}: root proof mismatch analysis root id={1} name={2} "
-                "missingExpectedArgs={3} unchangedConcreteMissingArgs={4} "
-                "supportOnlyMissingArgs={5} mismatchedExpectedArgs={6} "
-                "unexpectedReplayArgs={7}",
-                traceStage, m.id, m.name,
-                formatUInt32List(missingExpectedArgIdxs),
-                formatUInt32List(unchangedConcreteMissingArgIdxs),
-                formatUInt32List(supportOnlyMissingArgIdxs),
-                formatUInt32List(mismatchedExpectedArgIdxs),
-                formatUInt32List(unexpectedReplayArgIdxs));
 
           // From this point on, replay and expected metadata must be exactly
           // the same root-formal proof set. The diagnostics above explain any
@@ -39181,7 +39184,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                 !wrapperReplayCert.rewrittenInvocationSyntax.empty() &&
                 StringRef(wrapperReplayCert.rewrittenInvocationSyntax).trim() ==
                     newText.trim()) {
-              trace("macro/proof",
+              REFOLD_LOG_TRACE("macro/proof",
                     "{0}: root proof validation accepted wrapper replay "
                     "candidate root id={1} name={2} syntax='{3}' "
                     "pasteDeferred={4}",
@@ -39225,25 +39228,27 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           [&](const DagCandidateValidationMetadata &validation,
               StringRef baseText, StringRef newText,
               StringRef traceStage) -> bool {
-        // Emit a stable proof ledger before any rejection so failed composed
-        // candidates can be diagnosed against the expected root-formal set and
-        // deferred occurrence arguments.
-        SmallVector<uint32_t, 8> expectedRootArgIdxs;
-        expectedRootArgIdxs.reserve(validation.expectedRootFormals.size());
-        for (const auto &KV : validation.expectedRootFormals)
-          expectedRootArgIdxs.push_back(KV.first);
-        llvm::sort(expectedRootArgIdxs);
-        SmallVector<uint32_t, 8> deferredArgs =
-            validation.deferOccurrenceArgIdxs;
-        llvm::sort(deferredArgs);
-        trace("macro/proof",
-              "{0}: DAG candidate proof ledger enter root id={1} name={2} "
-              "expectedRootArgs={3} deferredArgs={4} bridgeSensitive={5} "
-              "mixed={6}",
-              traceStage, m.id, m.name, formatUInt32List(expectedRootArgIdxs),
-              formatUInt32List(deferredArgs),
-              validation.hasBridgeSensitiveStructuredSemantics ? 1 : 0,
-              validation.hasMixedSemanticInteractions ? 1 : 0);
+        if (inTraceMode()) {
+          // Emit a stable proof ledger before any rejection so failed composed
+          // candidates can be diagnosed against the expected root-formal set
+          // and deferred occurrence arguments.
+          SmallVector<uint32_t, 8> expectedRootArgIdxs;
+          expectedRootArgIdxs.reserve(validation.expectedRootFormals.size());
+          for (const auto &KV : validation.expectedRootFormals)
+            expectedRootArgIdxs.push_back(KV.first);
+          llvm::sort(expectedRootArgIdxs);
+          SmallVector<uint32_t, 8> deferredArgs =
+              validation.deferOccurrenceArgIdxs;
+          llvm::sort(deferredArgs);
+          trace("macro/proof",
+                "{0}: DAG candidate proof ledger enter root id={1} name={2} "
+                "expectedRootArgs={3} deferredArgs={4} bridgeSensitive={5} "
+                "mixed={6}",
+                traceStage, m.id, m.name, formatUInt32List(expectedRootArgIdxs),
+                formatUInt32List(deferredArgs),
+                validation.hasBridgeSensitiveStructuredSemantics ? 1 : 0,
+                validation.hasMixedSemanticInteractions ? 1 : 0);
+        }
 
         // These semantic hazards are not repaired by root replay. If they
         // survived candidate metadata merging, the composed candidate is
@@ -39407,7 +39412,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           auto mergedValidation = mergeDagCandidateValidationMetadata(
               uniquePatchValidation, candidateValidation);
           if (uniquePatch->subtreeCertBacked || candPatch.subtreeCertBacked) {
-            trace("macro/proof",
+            REFOLD_LOG_TRACE("macro/proof",
                   "DAG equivalent subtree-plan probe: root id={0} name={1} "
                   "stage={2} existingExpRoot={3} candidateExpRoot={4} "
                   "mergedExpRoot(pending) currentDeferredArgs={5} "
@@ -39449,7 +39454,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           }
 
           if (uniquePatch->subtreeCertBacked || candPatch.subtreeCertBacked) {
-            trace(
+            REFOLD_LOG_TRACE(
                 "macro/proof",
                 "DAG equivalent subtree-plan merged: root id={0} name={1} "
                 "stage={2} mergedExpRoot={3} mergedDeferredArgs={4} "
@@ -39495,7 +39500,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             uniquePatchValidation, candidateValidation);
         if (preferredStructured < 0) {
           if (uniquePatch->subtreeCertBacked || candPatch.subtreeCertBacked) {
-            trace("macro/proof",
+            REFOLD_LOG_TRACE("macro/proof",
                   "DAG structured subtree-choice kept existing: root id={0} "
                   "name={1} stage={2} existingExpRoot={3} candidateExpRoot={4}",
                   m.id, m.name, traceStage,
@@ -39520,7 +39525,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             SyncMacroPatchProofSummary(candPatch);
           }
           if (uniquePatch->subtreeCertBacked || candPatch.subtreeCertBacked) {
-            trace(
+            REFOLD_LOG_TRACE(
                 "macro/proof",
                 "DAG structured subtree-choice replaced existing: root id={0} "
                 "name={1} stage={2} existingExpRoot={3} candidateExpRoot={4}",
@@ -39563,7 +39568,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         auto mergedValidation = mergeDagCandidateValidationMetadata(
             uniquePatchValidation, candidateValidation);
         if (uniquePatch->subtreeCertBacked || candPatch.subtreeCertBacked) {
-          trace("macro/proof",
+          REFOLD_LOG_TRACE("macro/proof",
                 "DAG merge subtree-plan probe: root id={0} name={1} stage={2} "
                 "existingExpRoot={3} candidateExpRoot={4}",
                 m.id, m.name, traceStage,
@@ -39584,7 +39589,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         }
 
         if (uniquePatch->subtreeCertBacked || candPatch.subtreeCertBacked) {
-          trace("macro/proof",
+          REFOLD_LOG_TRACE("macro/proof",
                 "DAG merge subtree-plan merged: root id={0} name={1} stage={2} "
                 "mergedExpRoot={3} mergedDeferredArgs={4} "
                 "mergedBridgeFormals={5}",
@@ -41777,7 +41782,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
       if (!activeDefinitionAtPatch(directive, piece->name))
         continue;
       if (replacementObservesDirective(directive, piece->name)) {
-        trace("macro/proof",
+        REFOLD_LOG_TRACE("macro/proof",
               "suppress structure-preserving macro replay: inv id={0} "
               "name={1} replacement observes active header macro-state "
               "directive #{2} '{3}' before callsite",
@@ -41805,7 +41810,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         if (m.subkind != "func")
           return true;
         if (!InvocationSpanMatchesCallsitePrefix(patch.replacement, m)) {
-          trace("macro/proof",
+          REFOLD_LOG_TRACE("macro/proof",
                 "suppress structure-preserving macro replay: inv id={0} "
                 "name={1} replacement no longer has a matching callsite "
                 "prefix",
@@ -41816,7 +41821,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         auto parsedActuals =
             ParseMacroInvocationArgContentRanges(patch.replacement);
         if (!parsedActuals) {
-          trace("macro/proof",
+          REFOLD_LOG_TRACE("macro/proof",
                 "suppress structure-preserving macro replay: inv id={0} "
                 "name={1} replacement is not a complete macro invocation: "
                 "'{2}'",
@@ -41861,7 +41866,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         }
 
         if (!arityCompatible) {
-          trace("macro/proof",
+          REFOLD_LOG_TRACE("macro/proof",
                 "suppress structure-preserving macro replay: inv id={0} "
                 "name={1} replacement actual/formal arity is invalid: "
                 "actuals={2} formals={3} text='{4}'",
@@ -42011,7 +42016,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     for (const TokenInterval &raw : argumentDependentIntervals) {
       if (raw.begin < cover->first || raw.end > cover->second ||
           raw.end < raw.begin) {
-        trace("macro/proof",
+        REFOLD_LOG_TRACE("macro/proof",
               "suppress structure-preserving macro replay: inv id={0} "
               "name={1} argument-dependent surface escapes whole cover: "
               "surface=[{2},{3}) cover=[{4},{5}) text='{6}'",
@@ -42055,7 +42060,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
     for (const auto &bs : m.bodySpans) {
       if (!appendFixedPiecesOutsideArguments({bs.begin, bs.end})) {
-        trace("macro/proof",
+        REFOLD_LOG_TRACE("macro/proof",
               "suppress structure-preserving macro replay: inv id={0} "
               "name={1} body span escapes whole cover: body=[{2},{3}) "
               "cover=[{4},{5}) text='{6}'",
@@ -42072,7 +42077,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
       elems.push_back({true, arg.begin, arg.end});
 
     if (elems.empty()) {
-      trace("macro/proof",
+      REFOLD_LOG_TRACE("macro/proof",
             "suppress structure-preserving macro replay: inv id={0} "
             "name={1} whole-envelope replay has no body or argument "
             "surface to discharge: cover=[{2},{3}) text='{4}'",
@@ -42107,7 +42112,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     for (const ReplayElem &elem : elems) {
       if (elem.aBegin != aCursor || elem.aEnd < elem.aBegin ||
           elem.aEnd > cover->second) {
-        trace("macro/proof",
+        REFOLD_LOG_TRACE("macro/proof",
               "suppress structure-preserving macro replay: inv id={0} "
               "name={1} whole-envelope replay is not an exact A tiling: "
               "elem=[{2},{3}) cursor={4} cover=[{5},{6}) text='{7}'",
@@ -42122,7 +42127,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         std::optional<std::pair<size_t, size_t>> argB =
             mapArgumentDependentSurfaceToReplayBEnvelope(elem);
         if (!argB) {
-          trace("macro/proof",
+          REFOLD_LOG_TRACE("macro/proof",
                 "suppress structure-preserving macro replay: inv id={0} "
                 "name={1} argument-dependent surface has no B replay "
                 "envelope: A=[{2},{3}) replayB=[{4},{5}) wholeB=[{6},{7}) "
@@ -42134,7 +42139,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         }
         if (argB->first != bCursor || argB->second < argB->first ||
             argB->second > replayB.second) {
-          trace("macro/proof",
+          REFOLD_LOG_TRACE("macro/proof",
                 "suppress structure-preserving macro replay: inv id={0} "
                 "name={1} argument-dependent surface does not align with "
                 "the B replay cursor: A=[{2},{3}) B=[{4},{5}) "
@@ -42151,7 +42156,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
       const size_t len = static_cast<size_t>(elem.aEnd - elem.aBegin);
       if (bCursor + len > replayB.second) {
-        trace("macro/proof",
+        REFOLD_LOG_TRACE("macro/proof",
               "suppress structure-preserving macro replay: inv id={0} "
               "name={1} fixed body span overruns replay B envelope: "
               "A=[{2},{3}) cursor={4} len={5} replayB=[{6},{7}) "
@@ -42171,7 +42176,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         }
       }
       if (!fixedMatches) {
-        trace("macro/proof",
+        REFOLD_LOG_TRACE("macro/proof",
               "suppress structure-preserving macro replay: inv id={0} "
               "name={1} fixed replacement-list body changed inside a "
               "claimed whole B envelope: A=[{2},{3}) B=[{4},{5}) "
@@ -42188,7 +42193,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     }
 
     if (aCursor != cover->second || bCursor != replayB.second) {
-      trace("macro/proof",
+      REFOLD_LOG_TRACE("macro/proof",
             "suppress structure-preserving macro replay: inv id={0} "
             "name={1} whole-envelope replay did not consume exact cover: "
             "Acur={2} Aend={3} Bcur={4} Bend={5} wholeB=[{6},{7}) "
@@ -42354,7 +42359,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           const uint64_t end = std::min<uint64_t>(span.end, cover->second);
           if (!appendFixedPiecesOutsideExcludedSurfaces(fixedBodyA,
                                                         {begin, end})) {
-            trace("macro/proof",
+            REFOLD_LOG_TRACE("macro/proof",
                   "suppress structure-preserving macro replay: inv id={0} "
                   "name={1} fixed root body span escapes whole cover: "
                   "body=[{2},{3}) cover=[{4},{5}) replacement='{6}'",
@@ -42373,7 +42378,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
             std::optional<std::pair<size_t, size_t>> bTok =
                 MapATokRangeAToBTokenEnvelope(aTok, aTok + 1);
             if (!bTok || bTok->first >= bTok->second) {
-              trace("macro/proof",
+              REFOLD_LOG_TRACE("macro/proof",
                     "suppress structure-preserving macro replay: inv id={0} "
                     "name={1} fixed root body token has no B replay "
                     "envelope: A=[{2},{3}) Atext='{4}' replacement='{5}'",
@@ -42388,7 +42393,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                 bTok->first >= bToks_.size() ||
                 aToks_[static_cast<size_t>(aTok)].spelling !=
                     bToks_[bTok->first].spelling) {
-              trace("macro/proof",
+              REFOLD_LOG_TRACE("macro/proof",
                     "suppress structure-preserving macro replay: inv id={0} "
                     "name={1} fixed root body changed while preserving the "
                     "root invocation: A=[{2},{3}) B=[{4},{5}) Atext='{6}' "
@@ -42541,7 +42546,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
   const std::optional<SelectedMacroSelectionCandidate> selectedCandidate =
       SelectPreferredMacroSelectionCandidate(selectionCandidates);
   if (!selectedCandidate) {
-    trace(
+    REFOLD_LOG_TRACE(
         "macro/proof",
         "no final macro candidate survived proof-discharge gating: inv id={0} "
         "name={1} candidates={2} allowNestedSelectorOnly={3}",
@@ -42562,7 +42567,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
   case FinalMacroCandidateOrigin::ReuseExistingCallsiteNoOp:
     if (selected.patch.subtreeCertBacked)
-      trace("macro/proof",
+      REFOLD_LOG_TRACE("macro/proof",
             "subtree continuity probe: reused subtree-backed callsite patch "
             "without a fresh subtree winner in this pass inv id={0} name={1}",
             m.id, m.name);
@@ -42570,7 +42575,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
   case FinalMacroCandidateOrigin::ReuseExistingCallsiteSkipWholeCover:
     if (selected.patch.subtreeCertBacked) {
-      trace("macro/proof",
+      REFOLD_LOG_TRACE("macro/proof",
             "subtree continuity probe: reused subtree-backed callsite patch "
             "from skip-whole-cover path without a fresh subtree winner inv "
             "id={0} "
@@ -42597,7 +42602,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     // final emission-bucket gate must either construct a theorem-normalized
     // emitted carrier or fail closed under the strict/theorem no-legacy
     // audit.
-    trace("macro/proof",
+    REFOLD_LOG_TRACE("macro/proof",
           "selected macro candidate has no emitted accepted carrier: inv "
           "id={0} name={1} proofKind={2} selectorOnly={3}",
           m.id, m.name, selectedPatch.proof.kind,

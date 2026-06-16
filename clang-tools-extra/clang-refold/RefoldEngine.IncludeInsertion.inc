@@ -118,7 +118,7 @@ RefoldEngine::BuildIncludeInsertionPatch(const RefoldModel::IncludeItem &inc,
   } else {
     // Hardening: Log an error or assert if we get a hunk that points outside
     // our known token universe.
-    fatal("include/patch",
+    REFOLD_LOG_FATAL("include/patch",
           "hunk bounds exceed token offset table for inc #{0}: "
           "B[{1},{2}) requested, but bTokOff only has {3} entries",
           inc.id, uBStart, uBEnd, numOffsets);

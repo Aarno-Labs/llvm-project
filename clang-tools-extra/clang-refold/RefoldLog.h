@@ -22,12 +22,12 @@
 // Usage
 // -----
 //   // Emit messages:
-//   trace("lexer", "token={0} off={1}", tok, off);
-//   debug("json",  "validated {0} entries", N);
-//   info ("plan",  "includes={0} macros={1}", Incs, Macros);
-//   warn ("io",    "non-UTF8 byte at {0}", pos);
-//   error("map",   "missing field '{0}'", "tokmap");
-//   fatal("abort", "unrecoverable error in stage {0}", stage); // terminates
+//   REFOLD_LOG_TRACE("lexer", "token={0} off={1}", tok, off);
+//   REFOLD_LOG_DEBUG("json",  "validated {0} entries", N);
+//   REFOLD_LOG_INFO ("plan",  "includes={0} macros={1}", Incs, Macros);
+//   REFOLD_LOG_WARN ("io",    "non-UTF8 byte at {0}", pos);
+//   REFOLD_LOG_ERROR("map",   "missing field '{0}'", "tokmap");
+//   REFOLD_LOG_FATAL("abort", "unrecoverable error in stage {0}", stage);
 //
 // Policy
 // ------
@@ -76,6 +76,58 @@
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/WithColor.h"
 #include "llvm/Support/raw_ostream.h"
+
+// Guarded logging macros. These macros avoid evaluating formatting arguments
+// when the requested log level is disabled. Keep any expensive diagnostic
+// preparation outside these macros under an explicit in*Mode() guard.
+#ifndef REFOLD_LOG_FATAL
+#define REFOLD_LOG_FATAL(...)                                                  \
+  do {                                                                         \
+    if (::clang::refold::inFatalMode())                                        \
+      ::clang::refold::fatal(__VA_ARGS__);                                     \
+    llvm_unreachable("fatal logging unexpectedly disabled");                  \
+  } while (false)
+#endif
+
+#ifndef REFOLD_LOG_ERROR
+#define REFOLD_LOG_ERROR(...)                                                  \
+  do {                                                                         \
+    if (::clang::refold::inErrorMode())                                        \
+      ::clang::refold::error(__VA_ARGS__);                                     \
+  } while (false)
+#endif
+
+#ifndef REFOLD_LOG_WARN
+#define REFOLD_LOG_WARN(...)                                                   \
+  do {                                                                         \
+    if (::clang::refold::inWarnMode())                                         \
+      ::clang::refold::warn(__VA_ARGS__);                                      \
+  } while (false)
+#endif
+
+#ifndef REFOLD_LOG_INFO
+#define REFOLD_LOG_INFO(...)                                                   \
+  do {                                                                         \
+    if (::clang::refold::inInfoMode())                                         \
+      ::clang::refold::info(__VA_ARGS__);                                      \
+  } while (false)
+#endif
+
+#ifndef REFOLD_LOG_DEBUG
+#define REFOLD_LOG_DEBUG(...)                                                  \
+  do {                                                                         \
+    if (::clang::refold::inDebugMode())                                        \
+      ::clang::refold::debug(__VA_ARGS__);                                     \
+  } while (false)
+#endif
+
+#ifndef REFOLD_LOG_TRACE
+#define REFOLD_LOG_TRACE(...)                                                  \
+  do {                                                                         \
+    if (::clang::refold::inTraceMode())                                        \
+      ::clang::refold::trace(__VA_ARGS__);                                     \
+  } while (false)
+#endif
 
 namespace llvm {
 // General provider for `std::optional<>`

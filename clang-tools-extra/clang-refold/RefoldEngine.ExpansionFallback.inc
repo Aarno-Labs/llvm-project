@@ -2808,7 +2808,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   // are discharged.  Stay fail-closed unless the closure is exact or can be
   // widened without absorbing any independent token diff.
   if (h.isInsertOnly()) {
-    trace("fallback",
+    REFOLD_LOG_TRACE("fallback",
           "TU include-closure rejected: insert-only hunk A=[{0},{1}) "
           "B=[{2},{3}) is outside the first closure-edit domain",
           h.aStart, h.aEnd, h.bStart, h.bEnd);
@@ -2829,7 +2829,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   }
 
   if (touched.empty()) {
-    trace("fallback",
+    REFOLD_LOG_TRACE("fallback",
           "TU include-closure rejected: no top-level TU include touches hunk "
           "A=[{0},{1})",
           h.aStart, h.aEnd);
@@ -2852,7 +2852,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   uint64_t coverEnd = 0;
   for (const RefoldModel::IncludeItem *inc : touched) {
     if (inc->cover.end <= inc->cover.begin) {
-      trace("fallback",
+      REFOLD_LOG_TRACE("fallback",
             "TU include-closure rejected: touched include inc#{0} has empty "
             "or invalid A-cover [{1},{2})",
             inc->id, inc->cover.begin, inc->cover.end);
@@ -2885,7 +2885,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   for (const RefoldModel::IncludeItem *inc : coverOrdered) {
     if (inc->cover.begin != expectedCoverBegin) {
       includeCoversContiguous = false;
-      trace("fallback",
+      REFOLD_LOG_TRACE("fallback",
             "TU include-closure treating touched includes as mixed: split "
             "A-cover at inc#{0} cover=[{1},{2}) expectedBegin={3}",
             inc->id, inc->cover.begin, inc->cover.end, expectedCoverBegin);
@@ -4145,7 +4145,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
             [](const ConditionalPiece &) {}))
       return false;
 
-    trace("fallback",
+    REFOLD_LOG_TRACE("fallback",
           "TU include-closure preserving recorded conditional gap "
           "source=[{0},{1}) conditionalGroups={2}",
           gapBegin, gapEnd, pieces.size());
@@ -4348,7 +4348,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
                 tuBytes.slice(scanCursor, lineEnd), conditionalDepth)) {
           if (const RefoldModel::PragmaDirective *pragma =
                   findTUPragmaOnSourceLine(scanCursor, lineEnd)) {
-            trace("fallback",
+            REFOLD_LOG_TRACE("fallback",
                   "TU/include closure rejected: source gap [{0},{1}) contains "
                   "non-consumable TU pragma id={2} site=[{3},{4}) text='{5}'",
                   gapBegin, gapEnd, pragma->id, pragma->siteB, pragma->siteE,
@@ -4420,7 +4420,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
         conditionalDepth != 0)
       return false;
 
-    trace("fallback",
+    REFOLD_LOG_TRACE("fallback",
           "TU/include closure consuming zero-token source gap "
           "source=[{0},{1}) includes={2} macros={3} macroDirectives={4} "
           "conditionalGroups={5} conditionalDirectives={6}",
@@ -4541,7 +4541,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       return false;
 
     out.append(accepted.begin(), accepted.end());
-    trace("fallback",
+    REFOLD_LOG_TRACE("fallback",
           "TU/include closure preserving zero-token source gap "
           "source=[{0},{1}) pieces={2}",
           gapBegin, gapEnd, accepted.size());
@@ -4632,7 +4632,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       // be a mixed-owner edit involving some third artifact that this proof
       // does not know how to realize soundly.
       if (!tokenCoveredByTouchedInclude(pp)) {
-        trace("fallback",
+        REFOLD_LOG_TRACE("fallback",
               "TU/include closure rejected: A token {0} maps to file={1} "
               "outside the touched include run A=[{2},{3})",
               pp, entry.file, coverBegin, coverEnd);
@@ -4768,7 +4768,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       if (!consumesSelectedArm)
         continue;
       if (group.groupB >= group.groupE || group.groupE > tuBytes.size()) {
-        trace("fallback",
+        REFOLD_LOG_TRACE("fallback",
               "TU/include closure rejected: invalid consumed conditional "
               "group id={0} source=[{1},{2}) fileLen={3}",
               group.id, group.groupB, group.groupE, tuBytes.size());
@@ -4802,7 +4802,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       if (!macroInvocationMaterialIsConsumed(m))
         continue;
       if (IsInvocationInsideDefineDirective(m)) {
-        trace("fallback",
+        REFOLD_LOG_TRACE("fallback",
               "TU/include closure not using macro id={0} name='{1}' as a "
               "source piece: invocation is inside a #define directive",
               m.id, m.name);
@@ -4815,7 +4815,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     // spelling.  If no TU token was seen, the pure include-closure path is the
     // appropriate proof shape instead.
     if (!sawTUToken) {
-      trace("fallback",
+      REFOLD_LOG_TRACE("fallback",
             "TU/include closure rejected: mixed closure A=[{0},{1}) has no "
             "TU-owned source token",
             closureBegin, closureEnd);
@@ -4833,7 +4833,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     SmallVector<std::pair<uint64_t, uint64_t>, 16> mergedPieces;
     for (const auto &piece : sourcePieces) {
       if (piece.first >= piece.second || piece.second > tuBytes.size()) {
-        trace("fallback",
+        REFOLD_LOG_TRACE("fallback",
               "TU/include closure rejected: invalid source piece [{0},{1}) "
               "fileLen={2}",
               piece.first, piece.second, tuBytes.size());
@@ -4851,7 +4851,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     // required source piece through the last. `mergedPieces` is already sorted,
     // non-empty, and coalesced by source interval.
     if (mergedPieces.empty()) {
-      trace("fallback",
+      REFOLD_LOG_TRACE("fallback",
             "TU/include closure rejected: no normalized source envelope");
       return std::nullopt;
     }
@@ -4958,7 +4958,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       if (!sawEndif)
         return false;
 
-      trace("fallback",
+      REFOLD_LOG_TRACE("fallback",
             "TU/include closure preserving conditional-control tail "
             "source=[{0},{1}) group={2}",
             gapBegin, gapEnd, owningGroup->id);
@@ -5003,14 +5003,14 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
         continue;
 
       if (sideEffectReason) {
-        trace("fallback",
+        REFOLD_LOG_TRACE("fallback",
               "TU/include closure rejected: source interval [{0},{1}) would "
               "absorb unrelated include id={2} site=[{3},{4}) cover=[{5},{6}): "
               "{7}",
               sourceBegin, sourceEnd, inc.id, inc.siteB, inc.siteE,
               inc.cover.begin, inc.cover.end, *sideEffectReason);
       } else {
-        trace("fallback",
+        REFOLD_LOG_TRACE("fallback",
               "TU/include closure rejected: source interval [{0},{1}) would "
               "absorb unrelated include id={2} site=[{3},{4}) cover=[{5},{6})",
               sourceBegin, sourceEnd, inc.id, inc.siteB, inc.siteE,
@@ -5117,7 +5117,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
             macroInvocationIsInsideConsumableSourceLineDirectiveGap(m) ||
             macroInvocationIsInsidePreservableZeroTokenConditionalGap(m))
           continue;
-        trace("fallback",
+        REFOLD_LOG_TRACE("fallback",
               "TU/include closure rejected: source interval [{0},{1}) would "
               "absorb macro invocation id={2} name='{3}' site=[{4},{5})",
               sourceBegin, sourceEnd, m.id, m.name, *m.invB, *m.invE);
@@ -5187,13 +5187,13 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
                      .Any()) {
               mixedPreservedSourceLineDirectiveGapPieces.push_back(
                   {gapBegin, gapEnd});
-              trace("fallback",
+              REFOLD_LOG_TRACE("fallback",
                     "TU/include closure preserving source #line spelling "
                     "from gap=[{0},{1})",
                     gapBegin, gapEnd);
             } else {
               mixedSourceLineDirectiveResume = std::move(lineResume);
-              trace("fallback",
+              REFOLD_LOG_TRACE("fallback",
                     "TU/include closure preserving source #line state from "
                     "gap=[{0},{1}) resumeLine={2} file={3}",
                     gapBegin, gapEnd,
@@ -5205,10 +5205,10 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
 
           if (std::optional<std::string> pragmaReason =
                   nonConsumableTUPragmaGapReason(gapBegin, gapEnd)) {
-            trace("fallback", "TU/include closure rejected: {0}",
+            REFOLD_LOG_TRACE("fallback", "TU/include closure rejected: {0}",
                   *pragmaReason);
           } else {
-            trace("fallback",
+            REFOLD_LOG_TRACE("fallback",
                   "TU/include closure rejected: non-trivia TU gap inside "
                   "mixed source interval [{0},{1}) gap='{2}'",
                   gapBegin, gapEnd, stringutils::showWsWithClip(gap, 120));
@@ -5219,7 +5219,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
 
     if (mixedSourceLineDirectiveResume && !lineDirs_.Enabled() &&
         sourceEnd < tuBytes.size()) {
-      trace("fallback",
+      REFOLD_LOG_TRACE("fallback",
             "TU/include closure rejected: source #line gap needs enabled "
             "line directives to preserve the untouched suffix");
       return std::nullopt;
@@ -5227,7 +5227,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
 
     if (lineDirs_.Enabled() && mixedSourceLineDirectiveResume &&
         !lineDirectiveStartsAtPrefix(sourceEnd)) {
-      trace("fallback",
+      REFOLD_LOG_TRACE("fallback",
             "TU/include closure rejected: source #line state from consumed "
             "gap cannot be restored before non-BOL suffix at source={0}",
             sourceEnd);
@@ -5237,14 +5237,14 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     if (lineDirs_.Enabled() && mixedSourceLineDirectiveResume &&
         h.isDeleteOnly() &&
         !canStartLineDirectiveWithOptionalLeadingNewline(sourceBegin)) {
-      trace("fallback",
+      REFOLD_LOG_TRACE("fallback",
             "TU/include closure rejected: delete-only source #line resume "
             "would be line-spliced at source={0}",
             sourceBegin);
       return std::nullopt;
     }
 
-    trace("fallback",
+    REFOLD_LOG_TRACE("fallback",
           "TU/include closure source interval accepted: source=[{0},{1}) "
           "A=[{2},{3}) includeCover=[{4},{5})",
           sourceBegin, sourceEnd, materialBeginA, materialEndA, coverBegin,
@@ -5253,7 +5253,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
 
   if (!exactCover) {
     if (!hunkInsideCover && !mixedTUIncludeClosure) {
-      trace("fallback",
+      REFOLD_LOG_TRACE("fallback",
             "TU include-closure rejected: touched include cover A=[{0},{1}) "
             "does not contain hunk A=[{2},{3})",
             coverBegin, coverEnd, h.aStart, h.aEnd);
@@ -5268,7 +5268,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     const bool prefixClean = !rangeHasForeignTokenDiff(materialBeginA, h.aStart);
     const bool suffixClean = !rangeHasForeignTokenDiff(h.aEnd, materialEndA);
     if (!prefixClean || !suffixClean) {
-      trace("fallback",
+      REFOLD_LOG_TRACE("fallback",
             "TU include-closure rejected: widening A=[{0},{1}) around hunk "
             "A=[{2},{3}) would absorb foreign token edits prefixClean={4} "
             "suffixClean={5}",
@@ -5278,14 +5278,14 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     }
 
     if (sourceTouchesStagedEdit(sourceBegin, sourceEnd)) {
-      trace("fallback",
+      REFOLD_LOG_TRACE("fallback",
             "TU include-closure rejected: widened source interval [{0},{1}) "
             "would absorb an already-staged source edit",
             sourceBegin, sourceEnd);
       return std::nullopt;
     }
 
-    trace("fallback",
+    REFOLD_LOG_TRACE("fallback",
           "TU include-closure widening accepted: hunk A=[{0},{1}) widened to "
           "closure A=[{2},{3}) source=[{4},{5})",
           h.aStart, h.aEnd, materialBeginA, materialEndA, sourceBegin,
@@ -5293,7 +5293,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   }
 
   if (sourceBegin >= sourceEnd || sourceEnd > tuBytes.size()) {
-    trace("fallback",
+    REFOLD_LOG_TRACE("fallback",
           "TU include-closure rejected: invalid TU source interval [{0},{1}) "
           "fileLen={2}",
           sourceBegin, sourceEnd, tuBytes.size());
@@ -5305,7 +5305,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   for (const RefoldModel::IncludeItem *inc : touched) {
     if (inc->siteB < sourceCursor || inc->siteE > tuBytes.size() ||
         inc->siteB >= inc->siteE) {
-      trace("fallback",
+      REFOLD_LOG_TRACE("fallback",
             "TU include-closure rejected: invalid include site for inc#{0} "
             "site=[{1},{2}) cursor={3} fileLen={4}",
             inc->id, inc->siteB, inc->siteE, sourceCursor, tuBytes.size());
@@ -5327,21 +5327,21 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
         if (gapIsConsumableZeroTokenSourceClosure(
                 sourceCursor, inc->siteB,
                 /*allowTUConditionalControl=*/false)) {
-          trace("fallback",
+          REFOLD_LOG_TRACE("fallback",
                 "TU include-closure consuming zero-token source gap before "
                 "inc#{0} gap='{1}'",
                 inc->id, stringutils::showWsWithClip(gap, 120));
         } else if (!isPreservableIncludeClosureGapTrivia(gap) &&
                    !gapIsPreservableRecordedConditionalIncludeClosure(
                        sourceCursor, inc->siteB)) {
-          trace("fallback",
+          REFOLD_LOG_TRACE("fallback",
                 "TU include-closure rejected: non-trivia TU gap between "
                 "include directives before inc#{0} gap='{1}'",
                 inc->id, stringutils::showWsWithClip(gap, 120));
           return std::nullopt;
         } else {
           preservedGapTrivia.append(gap.begin(), gap.end());
-          trace("fallback",
+          REFOLD_LOG_TRACE("fallback",
                 "TU include-closure preserving inert trivia/control gap before "
                 "inc#{0} gap='{1}'",
                 inc->id, stringutils::showWsWithClip(gap, 120));
@@ -5365,7 +5365,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     bEnvelope = std::make_pair(static_cast<size_t>(h.bStart),
                                static_cast<size_t>(h.bEnd));
     evidenceKind = IncludeRealizationEvidenceKind::CanonicalBCoverEnvelope;
-    trace("fallback",
+    REFOLD_LOG_TRACE("fallback",
           "TU/include closure using exact delete hunk B envelope: "
           "A=[{0},{1}) B=[{2},{3})",
           materialBeginA, materialEndA, h.bStart, h.bEnd);
@@ -5374,13 +5374,13 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     bEnvelope = std::make_pair(static_cast<size_t>(h.bStart),
                                static_cast<size_t>(h.bEnd));
     evidenceKind = IncludeRealizationEvidenceKind::CanonicalBCoverEnvelope;
-    trace("fallback",
+    REFOLD_LOG_TRACE("fallback",
           "TU/include closure using exact diff hunk B envelope: "
           "A=[{0},{1}) B=[{2},{3})",
           materialBeginA, materialEndA, h.bStart, h.bEnd);
   }
   if (!bEnvelope) {
-    trace("fallback",
+    REFOLD_LOG_TRACE("fallback",
           "TU include-closure rejected: no canonical-or-consensus B envelope "
           "for A-cover [{0},{1})",
           materialBeginA, materialEndA);
@@ -5416,7 +5416,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   }
 
   if (h.bStart < bMaterialBegin || h.bEnd > bMaterialEnd) {
-    trace("fallback",
+    REFOLD_LOG_TRACE("fallback",
           "TU include-closure rejected: hunk B=[{0},{1}) is outside trimmed "
           "closure B material [{2},{3}) from envelope [{4},{5})",
           h.bStart, h.bEnd, bMaterialBegin, bMaterialEnd, bEnvelope->first,
@@ -5473,7 +5473,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       if (piece.kind == TUPreservedGapPiece::Kind::BalancedPragmaStateIsland &&
           balancedDiagnosticPragmaStateIslandIsCarriedByReplacement(
               StringRef(pieceText), StringRef(replacement), lexLang_)) {
-        trace("fallback",
+        REFOLD_LOG_TRACE("fallback",
               "TU/include closure: balanced pragma-state island id={0} "
               "source=[{1},{2}) already carried by B replacement",
               piece.id, piece.begin, piece.end);
@@ -5559,7 +5559,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     const uint64_t resumeEnd = static_cast<uint64_t>(padded.size());
     (void)resumeBegin;
     (void)resumeEnd;
-    trace("fallback",
+    REFOLD_LOG_TRACE("fallback",
           "TU/include closure emitted source #line resume line={0} file={1}",
           mixedSourceLineDirectiveResume->lineAtResume,
           mixedSourceLineDirectiveResume->fileSpelling);
@@ -5648,7 +5648,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
           // original source span grows by the same newline count as the
           // replacement text, so the difference between them is invariant under
           // this exact copied-line absorption.
-          trace("fallback",
+          REFOLD_LOG_TRACE("fallback",
                 "TU include-closure newline sink: absorbed source=[{0},{1}) "
                 "line='{2}' copiedLine='{3}' remainingPad={4} "
                 "(single-line invariant-preserving sink)",
@@ -5665,7 +5665,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
         // observe the unchanged newline deficit over the final edit span. If a
         // resync is needed, it will be emitted as a #line directive after any
         // copied suffix line absorbed above.
-        trace("fallback",
+        REFOLD_LOG_TRACE("fallback",
               "TU include-closure physical newline pad deferred to #line "
               "resync: source=[{0},{1}) suppressedNl={2}",
               sourceBegin, closureSourceEnd, remainingPadNl);
@@ -5676,7 +5676,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
         // newline-deficit padding would only manufacture visible blank lines in
         // the refolded source. Boundary padding above is still responsible for
         // lexical separation; this padding is solely for physical line count.
-        trace("fallback",
+        REFOLD_LOG_TRACE("fallback",
               "TU include-closure physical newline pad suppressed by "
               "--no-lines: source=[{0},{1}) suppressedNl={2}",
               sourceBegin, closureSourceEnd, remainingPadNl);
@@ -5687,7 +5687,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
     if (remainingPadNl > 0)
       padded.append(remainingPadNl, '\n');
 
-    trace("fallback",
+    REFOLD_LOG_TRACE("fallback",
           "TU include-closure newline pad: source=[{0},{1}) origNl={2} "
           "replNl={3} physicalPadNl={4} finalSourceEnd={5} result='{6}'",
           sourceBegin, sourceEnd, origNl, initialReplNl, remainingPadNl,
@@ -5819,7 +5819,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
 
       if (next->siteB > tuBytes.size() || next->siteE > tuBytes.size() ||
           next->siteB > next->siteE) {
-        trace("fallback",
+        REFOLD_LOG_TRACE("fallback",
               "TU include-closure rejected: skipped pragma-once include "
               "inc#{0} has invalid site=[{1},{2})",
               next->id, next->siteB, next->siteE);
@@ -5831,7 +5831,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       // include can observe the header macro state at the old position.
       StringRef gap = tuBytes.slice(closureSourceEnd, next->siteB);
       if (!isWsOrCompleteCommentTrivia(gap)) {
-        trace("fallback",
+        REFOLD_LOG_TRACE("fallback",
               "TU include-closure rejected: consuming earlier #pragma once "
               "include would reactivate skipped include inc#{0}, but gap "
               "source=[{1},{2}) is not trivia: '{3}'",
@@ -5841,7 +5841,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
       }
 
       if (sourceTouchesStagedEdit(sourceBegin, next->siteE)) {
-        trace("fallback",
+        REFOLD_LOG_TRACE("fallback",
               "TU include-closure rejected: extending over reactivated "
               "#pragma once include inc#{0} to sourceEnd={1} would overlap "
               "an already-staged source edit",
@@ -5849,7 +5849,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
         return false;
       }
 
-      trace("fallback",
+      REFOLD_LOG_TRACE("fallback",
             "TU include-closure extending over skipped #pragma once include "
             "inc#{0} path='{1}' source=[{2},{3}) after consuming earlier "
             "include instance",
@@ -5862,7 +5862,7 @@ RefoldEngine::BuildTUIncludeClosureEditForUnresolvedHunk(
   if (!extendOverReactivatedPragmaOnceIncludes())
     return std::nullopt;
 
-  debug("fallback",
+  REFOLD_LOG_DEBUG("fallback",
         "TU include-closure accepted: includes=[{0},{1}] source=[{2},{3}) "
         "A=[{4},{5}) B=[{6},{7}) evidence={8} raw='{9}' padded='{10}'",
         first->id, last->id, sourceBegin, closureSourceEnd, materialBeginA,
@@ -5949,7 +5949,7 @@ std::string RefoldEngine::ResolvePostStructuralFallback() {
 
   RecordTerminalFallbackTheoremAudit();
 
-  debug("fallback",
+  REFOLD_LOG_DEBUG("fallback",
         "terminal fallback: emitting fully expanded edited preprocessed "
         "stream (B). reasons={0} proofFailures={1}",
         terminalFallbackRequests_.size(), terminalWitness.proofFailures.size());
@@ -5959,7 +5959,7 @@ std::string RefoldEngine::ResolvePostStructuralFallback() {
       terminalBranch, terminalCandidate,
       "ResolvePostStructuralFallback/terminal");
   for (const TerminalFallbackRequest &request : terminalFallbackRequests_)
-    debug("fallback", "  {0}", request);
+    REFOLD_LOG_DEBUG("fallback", "  {0}", request);
 
   // The raw-B terminal carrier is the fully expanded surface, so every include
   // and every top-level macro root remains expanded in the final result.

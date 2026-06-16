@@ -357,7 +357,7 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
       }
 
       if (idx >= 0) {
-        trace("counter",
+        REFOLD_LOG_TRACE("counter",
               "__COUNTER__: lifted edit detection found firstEditedIdx={0} at "
               "A=[{1},{2}) root='{3}'",
               idx, lifted[static_cast<size_t>(idx)].aStart,
@@ -370,7 +370,7 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
   }
 
   if (firstEditedIdx < 0) {
-    trace("counter", "__COUNTER__: no edited occurrences; no forced expansion");
+    REFOLD_LOG_TRACE("counter", "__COUNTER__: no edited occurrences; no forced expansion");
     return {};
   }
 
@@ -405,14 +405,14 @@ RefoldEngine::ComputeForcedCounterPatches(StringRef tuPath,
 
     forced.push_back({root, o.aStart, o.aEnd, o.event});
 
-    trace("counter",
+    REFOLD_LOG_TRACE("counter",
           "__COUNTER__: force root id={0} name='{1}' ownerInc={2} "
           "inv=[{3},{4}) for occ A=[{5},{6})",
           root->id, root->name, root->ownerIncludeId, *invStart, *invEnd,
           o.aStart, o.aEnd);
   }
 
-  debug("counter",
+  REFOLD_LOG_DEBUG("counter",
         "__COUNTER__: occurrences={0} firstEditedIdx={1} forced={2} "
         "firstOccA=[{3},{4})",
         filtered.size(), firstEditedIdx, forced.size(),
@@ -498,7 +498,7 @@ RefoldEngine::ComputeForcedCounterPatchesFromExpandedMacros(
       continue;
 
     forced.push_back({root, o.aStart, o.aEnd, o.event});
-    trace("counter",
+    REFOLD_LOG_TRACE("counter",
           "__COUNTER__: expanded-macro stabilization firstExpandedIdx={0} "
           "force root id={1} name='{2}' ownerInc={3} inv=[{4},{5}) for occ "
           "A=[{6},{7})",

@@ -157,7 +157,7 @@ void lexPPTokens(const std::string &bytes, std::vector<PPTok> &out,
     addedNL = true;
   }
 
-  debug("lexer", "entered: bytes={0} (addedNL={1})", buf.size(),
+  REFOLD_LOG_DEBUG("lexer", "entered: bytes={0} (addedNL={1})", buf.size(),
         addedNL ? "YES" : "NO");
 
   using namespace clang;
@@ -182,7 +182,7 @@ void lexPPTokens(const std::string &bytes, std::vector<PPTok> &out,
   bool invalid = false;
   StringRef data = sm.getBufferData(fid, &invalid);
   if (invalid) {
-    fatal("lexer", "getBufferData returned Invalid");
+    REFOLD_LOG_FATAL("lexer", "getBufferData returned Invalid");
   }
 
   const char *b = data.begin();
@@ -210,22 +210,26 @@ void lexPPTokens(const std::string &bytes, std::vector<PPTok> &out,
       ppt.spelling.clear(); // defensive
     }
 
-    // Debug: kind, spelled (with visible WS), and location.
     const char *kindName = tok::getTokenName(tkn.getKind());
     ppt.kind = kindName;
-    PresumedLoc pl = sm.getPresumedLoc(tkn.getLocation());
 
-    std::optional<unsigned> line;
-    std::optional<unsigned> col;
-    if (pl.isValid()) {
-      line = pl.getLine();
-      col = pl.getColumn();
+    if (inTraceMode()) {
+      // Presumed location recovery and visible-whitespace spelling are only
+      // used by the per-token lexer trace. Keep them out of the hot lexing path
+      // when trace logging is disabled.
+      PresumedLoc pl = sm.getPresumedLoc(tkn.getLocation());
+      std::optional<unsigned> line;
+      std::optional<unsigned> col;
+      if (pl.isValid()) {
+        line = pl.getLine();
+        col = pl.getColumn();
+      }
+
+      trace("lexer/parsed",
+            "kind={0} spelled={1} off={2} len={3} li={4} co={5}", kindName,
+            stringutils::showWs(stringutils::clip(StringRef(ppt.spelling), 80)),
+            off, len, line, col);
     }
-
-    trace("lexer/parsed", "kind={0} spelled={1} off={2} len={3} li={4} co={5}",
-          kindName,
-          stringutils::showWs(stringutils::clip(StringRef(ppt.spelling), 80)),
-          off, len, line, col);
 
     out.push_back(std::move(ppt));
     startOffs.push_back(off);
@@ -237,7 +241,7 @@ void lexPPTokens(const std::string &bytes, std::vector<PPTok> &out,
   assert(startOffs.size() == out.size() + 1 && "need sentinel in startOffs");
   assert(std::is_sorted(startOffs.begin(), startOffs.end()));
 
-  debug("lexer", "done: tokens={0}", out.size());
+  REFOLD_LOG_DEBUG("lexer", "done: tokens={0}", out.size());
 }
 
 // --------------------- Sideband pragma normalization -------------------------
@@ -1850,7 +1854,7 @@ static bool buildSidebandPragmaSourceEdits(
       if (!dropB[static_cast<size_t>(b)])
         ordinaryCarriedKeptBLines.push_back(bLines[static_cast<size_t>(b)]);
 
-    trace("pragma/sideband",
+    REFOLD_LOG_TRACE("pragma/sideband",
           "ordinary hunk carries {0} A-side and {1} B-side balanced "
           "diagnostic pragma line(s); excluding them from sideband diff",
           aLines.size() - ordinaryCarriedKeptALines.size(),
@@ -2469,7 +2473,7 @@ Expected<json::Object> parseAndValidateJSON(StringRef jsonPath,
 void readFile(StringRef path, std::string &out) {
   auto bufOrErr = MemoryBuffer::getFile(path);
   if (!bufOrErr) {
-    fatal("file/load", "cannot read file: {0} ({1})", path,
+    REFOLD_LOG_FATAL("file/load", "cannot read file: {0} ({1})", path,
           bufOrErr.getError().message());
   }
   out.assign(bufOrErr->get()->getBufferStart(),
@@ -2486,7 +2490,7 @@ void readFile(StringRef path, std::string &out) {
 /// \param opt  Parsed option to check.
 void requireExactlyOnce(StringRef flag, const cl::Option &opt) {
   if (opt.getNumOccurrences() != 1)
-    fatal("cli", "option '{0}' must be specified exactly once", flag);
+    REFOLD_LOG_FATAL("cli", "option '{0}' must be specified exactly once", flag);
 }
 
 // ------------------------------ PP Context ----------------------------------
@@ -2888,7 +2892,7 @@ readSourceForNoLines(StringRef path, const PPCtx &ctx,
 
   auto bufOrErr = MemoryBuffer::getFile(resolved);
   if (!bufOrErr) {
-    debug("check",
+    REFOLD_LOG_DEBUG("check",
           "--no-lines: could not read source '{0}' while recovering builtin "
           "location token spans",
           path);
@@ -3129,7 +3133,7 @@ static void recoverZeroLengthNoLinesBuiltinSpans(
       }
     }
     if (!anchor) {
-      debug("check",
+      REFOLD_LOG_DEBUG("check",
             "--no-lines: no body-span anchor for zero-length builtin {0}#{1}",
             item.name, item.id);
       continue;
@@ -3193,7 +3197,7 @@ static void recoverZeroLengthNoLinesBuiltinSpans(
     // Ambiguity is not repaired heuristically: if more than one token sequence
     // satisfies the metadata constraints, leave the ignore mask unchanged.
     if (ways[0][0] != 1) {
-      debug("check",
+      REFOLD_LOG_DEBUG("check",
             "--no-lines: refusing ambiguous zero-length builtin recovery for "
             "anchor macro #{0}: events={1} candidates={2} assignments={3}",
             anchor->id, eCount, cCount, ways[0][0]);
@@ -3210,7 +3214,7 @@ static void recoverZeroLengthNoLinesBuiltinSpans(
         size_t tokIndex = candidates[ci++];
         if (tokIndex < a0Sensitive.size()) {
           a0Sensitive[tokIndex] = 1;
-          debug("check",
+          REFOLD_LOG_DEBUG("check",
                 "--no-lines: recovered zero-length builtin {0}#{1} at "
                 "original token index {2} under anchor macro #{3}",
                 events[ei].item->name, events[ei].item->id, tokIndex,
@@ -3324,18 +3328,25 @@ static Error compareTokens(ArrayRef<PPTok> aToks, ArrayRef<PPTok> bToks) {
   // Compare token spellings up to the min length first.
   const size_t n = std::min(aToks.size(), bToks.size());
   for (size_t i = 0; i < n; ++i) {
-    const std::string aDbg = stringutils::showWs(
-        stringutils::clip(StringRef(aToks[i].spelling), 100));
-    const std::string bDbg = stringutils::showWs(
-        stringutils::clip(StringRef(bToks[i].spelling), 180));
     if (aToks[i].spelling != bToks[i].spelling) {
+      const std::string aDbg = stringutils::showWs(
+          stringutils::clip(StringRef(aToks[i].spelling), 100));
+      const std::string bDbg = stringutils::showWs(
+          stringutils::clip(StringRef(bToks[i].spelling), 180));
       return createStringError(
           inconvertibleErrorCode(),
-          formatv("token mismatch at index {0}: A='{1}' B='{2}'", i, aDbg, bDbg)
+          formatv("token mismatch at index {0}: A='{1}' B='{2}'", i, aDbg,
+                  bDbg)
               .str());
     }
-    debug("compare", "token match at index {0}: A='{1}' B='{2}'", i, aDbg,
-          bDbg);
+    if (inDebugMode()) {
+      const std::string aDbg = stringutils::showWs(
+          stringutils::clip(StringRef(aToks[i].spelling), 100));
+      const std::string bDbg = stringutils::showWs(
+          stringutils::clip(StringRef(bToks[i].spelling), 180));
+      debug("compare", "token match at index {0}: A='{1}' B='{2}'", i, aDbg,
+            bDbg);
+    }
   }
 
   if (aToks.size() != bToks.size()) {
@@ -3353,30 +3364,42 @@ static Error compareTokensNoLinesAware(ArrayRef<PPTok> aToks,
   // Compare token spellings up to the min length first.
   const size_t n = std::min(aToks.size(), bToks.size());
   for (size_t i = 0; i < n; ++i) {
-    const std::string aDbg = stringutils::showWs(
-        stringutils::clip(StringRef(aToks[i].spelling), 100));
-    const std::string bDbg = stringutils::showWs(
-        stringutils::clip(StringRef(bToks[i].spelling), 180));
-
     if (aToks[i].spelling != bToks[i].spelling) {
       const bool ign = (i < ignoreMask.size()) && ignoreMask[i] &&
                        canIgnoreNoLinesMismatch(aToks[i], bToks[i]);
       if (ign) {
-        debug("compare",
-              "--no-lines: ignoring builtin loc macro mismatch at index {0}: "
-              "A='{1}' B='{2}'",
-              i, aDbg, bDbg);
+        if (inDebugMode()) {
+          const std::string aDbg = stringutils::showWs(
+              stringutils::clip(StringRef(aToks[i].spelling), 100));
+          const std::string bDbg = stringutils::showWs(
+              stringutils::clip(StringRef(bToks[i].spelling), 180));
+          debug("compare",
+                "--no-lines: ignoring builtin loc macro mismatch at index {0}: "
+                "A='{1}' B='{2}'",
+                i, aDbg, bDbg);
+        }
         continue;
       }
 
+      const std::string aDbg = stringutils::showWs(
+          stringutils::clip(StringRef(aToks[i].spelling), 100));
+      const std::string bDbg = stringutils::showWs(
+          stringutils::clip(StringRef(bToks[i].spelling), 180));
       return createStringError(
           inconvertibleErrorCode(),
-          formatv("token mismatch at index {0}: A='{1}' B='{2}'", i, aDbg, bDbg)
+          formatv("token mismatch at index {0}: A='{1}' B='{2}'", i, aDbg,
+                  bDbg)
               .str());
     }
 
-    debug("compare", "token match at index {0}: A='{1}' B='{2}'", i, aDbg,
-          bDbg);
+    if (inDebugMode()) {
+      const std::string aDbg = stringutils::showWs(
+          stringutils::clip(StringRef(aToks[i].spelling), 100));
+      const std::string bDbg = stringutils::showWs(
+          stringutils::clip(StringRef(bToks[i].spelling), 180));
+      debug("compare", "token match at index {0}: A='{1}' B='{2}'", i, aDbg,
+            bDbg);
+    }
   }
 
   if (aToks.size() != bToks.size()) {
@@ -3440,7 +3463,7 @@ static void writeSourceGraphOutputs(StringRef modifiedSrcPath,
   for (const SourceGraphOutput &output : outputs) {
     StringRef rel(output.relativePath);
     if (!validateRelativePath(rel))
-      fatal("source-graph/write",
+      REFOLD_LOG_FATAL("source-graph/write",
             "refusing unsafe source-graph output path: {0}",
             output.relativePath);
 
@@ -3455,7 +3478,7 @@ static void writeSourceGraphOutputs(StringRef modifiedSrcPath,
     auto [it, inserted] =
         uniqueOutputs.insert({output.relativePath, output.bytes});
     if (!inserted && it->second != output.bytes)
-      fatal("source-graph/write",
+      REFOLD_LOG_FATAL("source-graph/write",
             "conflicting source-graph contents for path: {0}",
             output.relativePath);
   }
@@ -3470,7 +3493,7 @@ static void writeSourceGraphOutputs(StringRef modifiedSrcPath,
 
     if (!cleanup.resolvedPath.empty() &&
         pathSpellingMatchesAfterAbsolute(path, cleanup.resolvedPath)) {
-      debug("source-graph/write",
+      REFOLD_LOG_DEBUG("source-graph/write",
             "skip stale cleanup for {0}: output path names producer header {1}",
             path, cleanup.resolvedPath);
       continue;
@@ -3481,7 +3504,7 @@ static void writeSourceGraphOutputs(StringRef modifiedSrcPath,
       continue;
 
     if ((*existingOrErr)->getBuffer() != cleanup.bytes) {
-      debug("source-graph/write",
+      REFOLD_LOG_DEBUG("source-graph/write",
             "leave possible stale source-graph file {0}: bytes no longer match "
             "rejected generated body for include #{1}",
             path, cleanup.includeId);
@@ -3489,10 +3512,10 @@ static void writeSourceGraphOutputs(StringRef modifiedSrcPath,
     }
 
     if (std::error_code ec = sys::fs::remove(path))
-      fatal("source-graph/write",
+      REFOLD_LOG_FATAL("source-graph/write",
             "cannot remove stale source-graph file {0}: {1}", path,
             ec.message());
-    info("finished", "removed stale source-graph header: {0}", path);
+    REFOLD_LOG_INFO("finished", "removed stale source-graph header: {0}", path);
   }
 
   for (const auto &entry : uniqueOutputs) {
@@ -3501,26 +3524,26 @@ static void writeSourceGraphOutputs(StringRef modifiedSrcPath,
 
     if (auto existingOrErr = MemoryBuffer::getFile(path)) {
       if ((*existingOrErr)->getBuffer() != entry.second)
-        fatal("source-graph/write",
+        REFOLD_LOG_FATAL("source-graph/write",
               "refusing to overwrite existing different source-graph file: {0}",
               path);
-      info("finished", "source-graph header already up to date: {0}", path);
+      REFOLD_LOG_INFO("finished", "source-graph header already up to date: {0}", path);
       continue;
     }
 
     SmallString<256> parent(path);
     sys::path::remove_filename(parent);
     if (std::error_code ec = sys::fs::create_directories(parent))
-      fatal("source-graph/write", "cannot create {0}: {1}", parent,
+      REFOLD_LOG_FATAL("source-graph/write", "cannot create {0}: {1}", parent,
             ec.message());
 
     std::error_code ec;
     raw_fd_ostream os(path, ec, sys::fs::OF_Text);
     if (ec)
-      fatal("source-graph/write", "cannot write {0}: {1}", path, ec.message());
+      REFOLD_LOG_FATAL("source-graph/write", "cannot write {0}: {1}", path, ec.message());
     os << entry.second;
     os.close();
-    info("finished", "wrote source-graph header: {0}", path);
+    REFOLD_LOG_INFO("finished", "wrote source-graph header: {0}", path);
   }
 }
 
@@ -3538,7 +3561,7 @@ writeMaterializedEditMap(StringRef path, StringRef ppModPath,
   std::error_code ec;
   raw_fd_ostream os(path, ec, sys::fs::OF_Text);
   if (ec)
-    fatal("edit-map/write", "cannot write {0}: {1}", path, ec.message());
+    REFOLD_LOG_FATAL("edit-map/write", "cannot write {0}: {1}", path, ec.message());
 
   // Keep the range shape identical for both sides of every edit.  The
   // surrounding object names say which file the range belongs to.
@@ -3707,7 +3730,7 @@ int main(int argc, char **argv) {
   cl::HideUnrelatedOptions(RefoldCategory);
   cl::ParseCommandLineOptions(argc, argv, Overview);
 
-  info("log", "log level set to {0}", LogLevelOpt);
+  REFOLD_LOG_INFO("log", "log level set to {0}", LogLevelOpt);
 
   // We output a custom error message if the following flags appear more than
   // once and remove cl::Required from the relevant cl::opt's. This is because
@@ -3727,7 +3750,7 @@ int main(int argc, char **argv) {
     if (value.equals_insensitive("strict"))
       return RefoldEngine::ProofAuditMode::Strict;
 
-    fatal("options", "invalid --proof-audit value: {0} "
+    REFOLD_LOG_FATAL("options", "invalid --proof-audit value: {0} "
                      "(expected off, probe, or strict)",
           ProofAuditModeOpt);
     return RefoldEngine::ProofAuditMode::Default;
@@ -3737,7 +3760,7 @@ int main(int argc, char **argv) {
   if (StrictMode &&
       proofAuditMode != RefoldEngine::ProofAuditMode::Default &&
       proofAuditMode != RefoldEngine::ProofAuditMode::Strict)
-    fatal("options", "--strict requires --proof-audit=strict");
+    REFOLD_LOG_FATAL("options", "--strict requires --proof-audit=strict");
 
   // Enforce exactly one supported invocation mode:
   //   (1) Refold:
@@ -3755,7 +3778,7 @@ int main(int argc, char **argv) {
     // Verify mode.
     if (PPPath.getNumOccurrences() != 0 ||
         ModifiedSrcPath.getNumOccurrences() != 0 || emitEditMap) {
-      fatal("cli", "invalid option combination: --check cannot be used with "
+      REFOLD_LOG_FATAL("cli", "invalid option combination: --check cannot be used with "
                    "--pp, --out, or --emit-edit-map");
     }
   } else {
@@ -3763,18 +3786,18 @@ int main(int argc, char **argv) {
     requireExactlyOnce("--pp", PPPath);
     requireExactlyOnce("--out", ModifiedSrcPath);
     if (emitEditMap && EmitEditMapPath.getValue().empty())
-      fatal("cli", "--emit-edit-map requires a non-empty output path");
+      REFOLD_LOG_FATAL("cli", "--emit-edit-map requires a non-empty output path");
   }
 
   // Parse and validate the refold map JSON file.
   auto parsedObjOrErr = parseAndValidateJSON(RefoldJSONPath, RefoldSchema);
   if (!parsedObjOrErr) {
     handleAllErrors(parsedObjOrErr.takeError(), [&](const ErrorInfoBase &e) {
-      fatal("json", "failed to parse refold '{0}' JSON file: {1}",
+      REFOLD_LOG_FATAL("json", "failed to parse refold '{0}' JSON file: {1}",
             RefoldJSONPath, e.message());
     });
   } else {
-    info("json", "refold JSON file '{0}' validated", RefoldJSONPath);
+    REFOLD_LOG_INFO("json", "refold JSON file '{0}' validated", RefoldJSONPath);
   }
   const json::Object &rootJson = *parsedObjOrErr;
   assert(!rootJson.empty() && "parsed refold map JSON object is empty");
@@ -3790,7 +3813,7 @@ int main(int argc, char **argv) {
   auto ctxOrErr = parsePPCtx(rootJson);
   if (!ctxOrErr) {
     handleAllErrors(ctxOrErr.takeError(), [&](const ErrorInfoBase &e) {
-      fatal("model", "failed to parse pp_ctx from refold map: {0}",
+      REFOLD_LOG_FATAL("model", "failed to parse pp_ctx from refold map: {0}",
             e.message());
     });
   }
@@ -3807,7 +3830,7 @@ int main(int argc, char **argv) {
       auto ppOrErr = preprocessToBytes(CheckSrcPath, ctx);
       if (!ppOrErr) {
         handleAllErrors(ppOrErr.takeError(), [&](const ErrorInfoBase &e) {
-          fatal("pp", "failed to preprocess --check input: {0}", e.message());
+          REFOLD_LOG_FATAL("pp", "failed to preprocess --check input: {0}", e.message());
         });
       }
       aBytes = std::move(*ppOrErr);
@@ -3818,7 +3841,7 @@ int main(int argc, char **argv) {
       auto ppOrErr = preprocessToBytes(PPModPath, ctx);
       if (!ppOrErr) {
         handleAllErrors(ppOrErr.takeError(), [&](const ErrorInfoBase &e) {
-          fatal("pp", "failed to preprocess --pp-mod input: {0}", e.message());
+          REFOLD_LOG_FATAL("pp", "failed to preprocess --pp-mod input: {0}", e.message());
         });
       }
       bBytes = std::move(*ppOrErr);
@@ -3857,7 +3880,7 @@ int main(int argc, char **argv) {
                                    aBytes.size());
         filterSidebandPragmaTokens(bSidebandPragmas, bToks, bTokByteOff,
                                    bBytes.size());
-        debug("pragma/sideband",
+        REFOLD_LOG_DEBUG("pragma/sideband",
               "normalized sideband pragmas: A={0} B={1} sourceEdits={2}",
               aSidebandPragmas.size(), bSidebandPragmas.size(),
               sidebandPragmaEdits.size());
@@ -3867,14 +3890,14 @@ int main(int argc, char **argv) {
         // token-count/domain checks will route them through the explicit
         // fallback path rather than guessing a source placement.
         sidebandPragmaEdits.clear();
-        debug("pragma/sideband",
+        REFOLD_LOG_DEBUG("pragma/sideband",
               "sideband pragma stream not fully modelled; keeping raw tokens "
               "for fallback classification");
       }
     }
   }
 
-  debug("lex", "{0} tokens={1} {2} tokens={3}", PPPath, aToks.size(), PPModPath,
+  REFOLD_LOG_DEBUG("lex", "{0} tokens={1} {2} tokens={3}", PPPath, aToks.size(), PPModPath,
         bToks.size());
 
   // Append the sentinel to both source offsets.
@@ -3891,11 +3914,11 @@ int main(int argc, char **argv) {
     // Relax token comparison for location-sensitive predefined macros when
     // verifying a refolding produced with --no-lines.
     if (!checkCtx)
-      fatal("cli", "internal error: missing pp_ctx in --check mode");
+      REFOLD_LOG_FATAL("cli", "internal error: missing pp_ctx in --check mode");
     auto maskOrErr = buildNoLinesIgnoreMask(rootJson, *checkCtx, bToks);
     if (!maskOrErr) {
       handleAllErrors(maskOrErr.takeError(), [&](const ErrorInfoBase &e) {
-        fatal("check", "failed to build --no-lines ignore mask: {0}",
+        REFOLD_LOG_FATAL("check", "failed to build --no-lines ignore mask: {0}",
               e.message());
       });
     }
@@ -3931,7 +3954,7 @@ int main(int argc, char **argv) {
       &sourceGraphOutputs);
   if (!refoldedOrErr) {
     handleAllErrors(refoldedOrErr.takeError(), [&](const ErrorInfoBase &e) {
-      fatal("model", "failed to parse refold model: {0}", e.message());
+      REFOLD_LOG_FATAL("model", "failed to parse refold model: {0}", e.message());
     });
   }
 
@@ -3939,18 +3962,18 @@ int main(int argc, char **argv) {
   std::error_code ec;
   raw_fd_ostream os(ModifiedSrcPath, ec, sys::fs::OF_Text);
   if (ec) {
-    fatal("src/write", "cannot write {0}: {1}", ModifiedSrcPath, ec.message());
+    REFOLD_LOG_FATAL("src/write", "cannot write {0}: {1}", ModifiedSrcPath, ec.message());
   }
   os << *refoldedOrErr;
   os.close();
-  info("finished", "wrote refolded C source: {0}", ModifiedSrcPath);
+  REFOLD_LOG_INFO("finished", "wrote refolded C source: {0}", ModifiedSrcPath);
 
   writeSourceGraphOutputs(ModifiedSrcPath, sourceGraphOutputs);
 
   if (emitEditMap) {
     writeMaterializedEditMap(EmitEditMapPath.getValue(), PPModPath,
                              ModifiedSrcPath, materializedEditMappings);
-    info("finished", "wrote materialized edit map: {0}",
+    REFOLD_LOG_INFO("finished", "wrote materialized edit map: {0}",
          EmitEditMapPath.getValue());
   }
   return 0;

@@ -380,7 +380,7 @@ RefoldEngine::MapAByteRangeToBTokenEnvelope(size_t aByteBegin,
             if (inTraceMode() && oldEnd > bByteEnd) {
               StringRef trimmed =
                   bSource_.slice(bByteEnd, std::min(bByteEnd + 200, oldEnd));
-              trace("byte/env",
+              REFOLD_LOG_TRACE("byte/env",
                     "trimEnd: Abytes=[{0},{1}) hunkBbytes=[{2},{3}) "
                     "Btrim=[{4},{5}) text='{6}'",
                     aByteBegin, aByteEnd, cur->bStart, cur->bEnd, bByteEnd,
@@ -520,7 +520,7 @@ RefoldEngine::MapAToBTokenEnvelopeByPPArgSpan(
   // edited B token stream.
   if (sp.ppByteBegin && sp.ppByteEnd) {
     if (auto exactTokEnv = tryMapSingleStandardTokenExactly(sp.begin)) {
-      trace("byte/env",
+      REFOLD_LOG_TRACE("byte/env",
             "PPArgSpan['{0}' arg={1} Aidx={2} single-token exact map -> "
             "Btok=[{3},{4}) tok='{5}'",
             sp.kind, sp.argIdx, sp.begin, exactTokEnv->first,
@@ -531,7 +531,7 @@ RefoldEngine::MapAToBTokenEnvelopeByPPArgSpan(
     size_t pp0 = static_cast<size_t>(*sp.ppByteBegin);
     size_t pp1 = static_cast<size_t>(*sp.ppByteEnd);
     auto env = MapAByteRangeToBTokenEnvelope(pp0, pp1);
-    trace("byte/env",
+    REFOLD_LOG_TRACE("byte/env",
           "PPArgSpan['{0}' arg={1} Aidx={2} PPbytes=[{3},{4})] -> "
           "Btok=[{5},{6})",
           sp.kind, sp.argIdx, sp.begin, pp0, pp1, env.first, env.second);
@@ -542,7 +542,7 @@ RefoldEngine::MapAToBTokenEnvelopeByPPArgSpan(
   // not silently snap token offsets in strict mode because that would downgrade
   // a producer-backed witness into a consumer-side approximation.
   if (strict_) {
-    fatal("macro/pparg/span",
+    REFOLD_LOG_FATAL("macro/pparg/span",
           "PPArgSpan missing producer ppByte span (kind='{0}' argIdx={1} "
           "A=[{2},{3}) ppByte=[4},{5}]) - cannot map without snapping",
           sp.kind, sp.argIdx, sp.begin, sp.end, sp.ppByteBegin, sp.ppByteEnd);

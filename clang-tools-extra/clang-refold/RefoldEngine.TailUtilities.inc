@@ -2295,7 +2295,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
 
   const RefoldModel::IncludeItem *inc = model_.GetIncludeById(includeId);
   if (!inc)
-    fatal("include/mat", "unknown includeId {0}", includeId);
+    REFOLD_LOG_FATAL("include/mat", "unknown includeId {0}", includeId);
 
 
   const std::string headerPath = resolveHeaderPath(*inc);
@@ -2309,7 +2309,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
   if (bytes.empty()) {
     auto bufOrErr = MemoryBuffer::getFile(lineDirs_.ToAbsolutePath(headerPath));
     if (!bufOrErr) {
-      fatal("include/mat", "failed to read header: {0} ({1})", headerPath,
+      REFOLD_LOG_FATAL("include/mat", "failed to read header: {0} ({1})", headerPath,
             bufOrErr.getError().message());
     }
 
@@ -6058,7 +6058,7 @@ RefoldEngine::ComputeIncludeTextEdits(const IncludeEdits &ie,
   for (const auto &e : plan.edits) {
 
     if (e.end < e.start || e.end > static_cast<uint64_t>(headerText.size())) {
-      fatal("include/apply", "TextEdit out of bounds: bytes=[{0},{1}) size={2}",
+      REFOLD_LOG_FATAL("include/apply", "TextEdit out of bounds: bytes=[{0},{1}) size={2}",
             e.start, e.end, headerText.size());
     }
   }
@@ -6135,7 +6135,7 @@ std::optional<uint64_t> RefoldEngine::ComputeChildBoundaryInsertByte(
   // directive.
   if (!beginMatches.empty()) {
     if (beginMatches.size() != 1) {
-      fatal("include/boundary",
+      REFOLD_LOG_FATAL("include/boundary",
             "ambiguous child include boundary: {0} children have cover.begin "
             "== {1} in file={2}; candidates: {3}",
             beginMatches.size(), pos, file, dump(beginMatches));
@@ -6154,7 +6154,7 @@ std::optional<uint64_t> RefoldEngine::ComputeChildBoundaryInsertByte(
   // gap. The returned byte is the end of the child's spelled include directive.
   if (!endMatches.empty()) {
     if (endMatches.size() != 1) {
-      fatal("include/boundary",
+      REFOLD_LOG_FATAL("include/boundary",
             "ambiguous child include boundary: {0} children have cover.end == "
             "{1} in file={2}; candidates: {3}",
             endMatches.size(), pos, file, dump(endMatches));
@@ -6421,7 +6421,7 @@ bool RefoldEngine::EmittedTextEditHasDischargedAcceptedResults(
 
     ++lastTheoremAudit_.emittedDeclaredClassCarriers;
     ++lastTheoremAudit_.emittedDischargedCarriers;
-    trace("proof/normalize",
+    REFOLD_LOG_TRACE("proof/normalize",
           "emitted carrier normalized theoremProof={0} kind={1} path={2}",
           *theoremProof, carrier.kind,
           carrier.proofSummary.inventory.currentPath);
@@ -6643,7 +6643,7 @@ bool RefoldEngine::EmittedTextEditHasOrderedAcceptedProofComposition(
   }
   if (sameSurface) {
     ++lastTheoremAudit_.emittedEquivalentCompositeEdits;
-    trace("proof/compose",
+    REFOLD_LOG_TRACE("proof/compose",
           "composite edit bytes=[{0},{1}) in {2} has {3} equivalent "
           "proof carriers over {4}[{5},{6})",
           edit.start, edit.end, owner, spans.size(),
@@ -6661,7 +6661,7 @@ bool RefoldEngine::EmittedTextEditHasOrderedAcceptedProofComposition(
     if (span.domain == CarrierSpanDomain::TUByte && span.begin == edit.start &&
         span.end == edit.end) {
       ++lastTheoremAudit_.emittedEquivalentCompositeEdits;
-      trace("proof/compose",
+      REFOLD_LOG_TRACE("proof/compose",
             "composite edit bytes=[{0},{1}) in {2} is dominated by carrier "
             "#{3} theoremProof={4} over TUByte[{5},{6}); {7} auxiliary "
             "carriers remain individually discharged",
@@ -6680,7 +6680,7 @@ bool RefoldEngine::EmittedTextEditHasOrderedAcceptedProofComposition(
   });
   if (allZeroWidth && edit.start == edit.end) {
     ++lastTheoremAudit_.emittedEquivalentCompositeEdits;
-    trace("proof/compose",
+    REFOLD_LOG_TRACE("proof/compose",
           "composite insertion edit bytes=[{0},{1}) in {2} has {3} "
           "zero-width proof carriers",
           edit.start, edit.end, owner, spans.size());
@@ -6747,7 +6747,7 @@ bool RefoldEngine::EmittedTextEditHasOrderedAcceptedProofComposition(
   }
 
   ++lastTheoremAudit_.emittedOrderedCompositeEdits;
-  trace("proof/compose",
+  REFOLD_LOG_TRACE("proof/compose",
         "composite edit bytes=[{0},{1}) in {2} has {3} ordered contiguous "
         "proof segments in {4} coordinates",
         edit.start, edit.end, owner, spans.size(), domainName(spans[0].domain));
@@ -6778,7 +6778,7 @@ void RefoldEngine::StampTextEditMaterializedBByteRange(TextEdit &edit,
                                                        uint64_t begin,
                                                        uint64_t end) const {
   if (end < begin || end > static_cast<uint64_t>(bSource_.size()))
-    fatal("edit-map", "invalid materialized B byte range [{0},{1}) bLen={2}",
+    REFOLD_LOG_FATAL("edit-map", "invalid materialized B byte range [{0},{1}) bLen={2}",
           begin, end, bSource_.size());
   edit.materializedBByteBegin = begin;
   edit.materializedBByteEnd = end;
@@ -6789,7 +6789,7 @@ void RefoldEngine::StampTextEditMaterializedBTokenRange(
   std::optional<std::pair<uint64_t, uint64_t>> bytes =
       BTokenRangeToByteRange(bTokBegin, bTokEnd);
   if (!bytes)
-    fatal("edit-map", "invalid materialized B token range [{0},{1}) bToks={2}",
+    REFOLD_LOG_FATAL("edit-map", "invalid materialized B token range [{0},{1}) bToks={2}",
           bTokBegin, bTokEnd, bToks_.size());
   StampTextEditMaterializedBByteRange(edit, bytes->first, bytes->second);
 }
@@ -6863,7 +6863,7 @@ std::string RefoldEngine::StripSeparatelyOwnedSidebandReplay(
     if (range.begin >= range.end)
       continue;
     if (!merged.empty() && range.begin < merged.back().end)
-      fatal("pragma/sideband",
+      REFOLD_LOG_FATAL("pragma/sideband",
             "overlapping separately-owned sideband replay ranges "
             "[{0},{1}) and [{2},{3})",
             merged.back().begin, merged.back().end, range.begin, range.end);
@@ -6921,7 +6921,7 @@ RefoldEngine::SidebandPragmaMaterializedBByteRangeForInclude(
 void RefoldEngine::StampTextEditMaterializedOutputTextRange(
     TextEdit &edit, uint64_t begin, uint64_t end) const {
   if (end < begin || end > static_cast<uint64_t>(edit.text.size()))
-    fatal("edit-map",
+    REFOLD_LOG_FATAL("edit-map",
           "invalid materialized output byte range [{0},{1}) textLen={2}",
           begin, end, edit.text.size());
   edit.materializedOutputTextBegin = begin;
@@ -8436,7 +8436,7 @@ void RefoldEngine::CacheCanonicalPath(StringRef path) const {
   const auto canonical = std::filesystem::weakly_canonical(
       std::filesystem::path(path.str()), ec);
   if (ec) {
-    fatal("path/canon", "failed to canonicalize '{0}': {1}", path,
+    REFOLD_LOG_FATAL("path/canon", "failed to canonicalize '{0}': {1}", path,
           ec.message());
   }
 
