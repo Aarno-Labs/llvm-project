@@ -2346,25 +2346,70 @@ void RefoldEngine::MaterializeIncludeExpansion(
     return false;
   };
 
-  if (materializedHeaderHasReplayContextSensitiveConditionalControl()) {
+  auto materializedHeaderHasIncludeLevelObserver = [&]() {
+    // __INCLUDE_LEVEL__ observes include-stack depth, not line/file state.
+    // Once an include owner is materialized, the source-spelled header bytes are
+    // replayed from the flattened parent/TU surface instead of being entered by
+    // an actual #include edge.  Leaving a preserved __INCLUDE_LEVEL__ spelling
+    // in that materialized text would therefore expand at the replay depth
+    // rather than at the producer-observed depth.  Treat any observable
+    // __INCLUDE_LEVEL__ in this owner as a request for producer-proven B-surface
+    // realization, which literalizes the recorded expansion value and avoids
+    // fabricating an include-stack transition that no longer exists.
+    for (const RefoldModel::MacroInvocation &macro :
+         model_.GetMacroInvocations()) {
+      if (macro.name != "__INCLUDE_LEVEL__")
+        continue;
+
+      const RefoldModel::MacroInvocation *site =
+          LineStateObservableMacroSite(macro);
+      std::optional<uint64_t> owner =
+          site && site->ownerIncludeId ? site->ownerIncludeId
+                                       : macro.ownerIncludeId;
+      if (!owner || *owner != includeId)
+        continue;
+
+      // The owner id is the semantic proof; the optional invocation file is a
+      // hardening check against malformed producer records that accidentally
+      // attach a builtin from another source buffer to this include instance.
+      if (site && site->invFile && !PathsEqual(*site->invFile, headerPath))
+        continue;
+      if (macro.invFile && !PathsEqual(*macro.invFile, headerPath) &&
+          (!site || !site->invFile || !PathsEqual(*site->invFile, headerPath)))
+        continue;
+
+      return true;
+    }
+    return false;
+  };
+
+  auto realizeMaterializedHeaderFromB = [&](StringRef reason) -> bool {
     AcceptedResultCandidate realizationCandidate;
-    if (auto realized = BuildInlineIncludeRealizationFromB(
-            *inc, "replay-context-sensitive conditional control in "
-                  "materialized header",
-            &realizationCandidate)) {
+    if (auto realized =
+            BuildInlineIncludeRealizationFromB(*inc, reason,
+                                               &realizationCandidate)) {
       includeExpansion[includeId] = std::move(*realized);
       includeExpansionStartLineNos[includeId] = 1;
       includeExpansionAcceptedResults[includeId] =
           std::move(realizationCandidate);
-      REFOLD_LOG_TRACE(
-          "include/mat",
-          "realize include #{0} from B: replay-context-sensitive "
-          "conditional control in materialized header",
-          includeId);
-      return;
+      REFOLD_LOG_TRACE("include/mat", "realize include #{0} from B: {1}",
+                       includeId, reason);
+      return true;
     }
 
     includeExpansion[includeId] = std::string();
+    return false;
+  };
+
+  if (materializedHeaderHasReplayContextSensitiveConditionalControl()) {
+    (void)realizeMaterializedHeaderFromB(
+        "replay-context-sensitive conditional control in materialized header");
+    return;
+  }
+
+  if (materializedHeaderHasIncludeLevelObserver()) {
+    (void)realizeMaterializedHeaderFromB(
+        "__INCLUDE_LEVEL__ observer in materialized header");
     return;
   }
 
@@ -3166,19 +3211,75 @@ void RefoldEngine::MaterializeIncludeExpansion(
     return operand;
   };
 
+  auto includeSubtreeHasIncludeLevelSensitiveBuiltin =
+      [&](uint64_t includeId) -> bool {
+    auto isDescendantOrSelf = [&](uint64_t owner) -> bool {
+      uint64_t cur = owner;
+      while (true) {
+        if (cur == includeId)
+          return true;
+        const RefoldModel::IncludeItem *inc = model_.GetIncludeById(cur);
+        if (!inc || !inc->parent)
+          return false;
+        cur = *inc->parent;
+      }
+    };
+
+    for (const auto &macro : model_.GetMacroInvocations()) {
+      if (macro.name != "__INCLUDE_LEVEL__")
+        continue;
+
+      // As with line/file builtins, a predefined builtin may be recorded at a
+      // definition-site spelling while the preserved observable use is an
+      // outer caller.  Attribute the observer to the source site that would
+      // remain spelled in the replayed child subtree.
+      const RefoldModel::MacroInvocation *site = &macro;
+      unsigned depth = 0;
+      const unsigned maxDepth =
+          static_cast<unsigned>(model_.GetMacroInvocations().size());
+      while (site->callerMacroId && depth++ < maxDepth) {
+        const RefoldModel::MacroInvocation *caller =
+            FindMacroInvocationById(*site->callerMacroId);
+        if (!caller)
+          break;
+        site = caller;
+      }
+
+      std::optional<uint64_t> owner = site->ownerIncludeId;
+      if (!owner)
+        owner = macro.ownerIncludeId;
+      if (!owner || !isDescendantOrSelf(*owner))
+        continue;
+
+      if (!LineStateBuiltinInvocationIsPreservedObserver(macro))
+        continue;
+
+      return true;
+    }
+
+    return false;
+  };
+
   auto planCleanChildIncludeReplayFromMaterializedParent =
       [&](const RefoldModel::IncludeItem &child) -> CleanChildIncludeReplayPlan {
     CleanChildIncludeReplayPlan plan;
 
     // A clean child include may stay spelled as an include directive only when
     // replaying that exact directive from the materialized parent surface resolves
-    // to the same physical file the producer recorded.  The proof must model the
-    // recorded clang search path, not merely direct files beside the output TU:
-    // ordinary headers found through -I/-iquote remain stable, while headers that
-    // relied on the original parent directory or #include_next stack must be
-    // rewritten or materialized.
+    // to the same physical file the producer recorded and the subtree does not
+    // observe include-entry depth.  Materializing a parent header moves the child
+    // include one level outward; even a lookup-stable directive would make a
+    // preserved __INCLUDE_LEVEL__ expansion observe the replay stack rather than
+    // the producer stack.
     if (!child.parent || !child.resolvedPath)
       return plan;
+
+    if (includeSubtreeHasIncludeLevelSensitiveBuiltin(child.id)) {
+      plan.action = CleanChildIncludeReplayAction::Materialize;
+      plan.reason = "child subtree observes __INCLUDE_LEVEL__ across "
+                    "materialized-parent include relocation";
+      return plan;
+    }
 
     if (child.subkind == "#include_next" && child.angled) {
       // An angled include-next has no quoted operand to replay from the
