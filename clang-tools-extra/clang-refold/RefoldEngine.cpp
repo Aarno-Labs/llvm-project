@@ -6011,7 +6011,21 @@ std::string RefoldEngine::RunSinglePassRefold() {
       if (macro.subkind != "func" || !macro.cover.IsValid() ||
           macro.cover.end <= macro.cover.begin)
         continue;
-      if (hunk.aStart != macro.cover.begin && hunk.aStart != macro.cover.end)
+
+      const bool atRecordedCoverBoundary =
+          hunk.aStart == macro.cover.begin || hunk.aStart == macro.cover.end;
+      // Also admit the one-token-left frontier when producer PP-byte expansion
+      // bounds are available.  Repeated fixed literals at the start of a macro
+      // replacement list can make token LCS slide an inserted actual token just
+      // before the recorded token cover, even though the byte-level macro
+      // expansion still starts at the first replacement-list token.  The actual
+      // proof is discharged later by definition-tape replay against that
+      // recorded PP-byte envelope; this finder only exposes the candidate owner
+      // so the insertion is not prematurely emitted as a standalone TU edit.
+      const bool immediatelyBeforeRecordedCover =
+          macro.cover.begin > 0 && hunk.aStart + 1 == macro.cover.begin &&
+          macro.invPPByteBegin && macro.invPPByteEnd;
+      if (!atRecordedCoverBoundary && !immediatelyBeforeRecordedCover)
         continue;
       if (!macro.invB || !macro.invE || !macro.invText)
         continue;
@@ -6032,9 +6046,22 @@ std::string RefoldEngine::RunSinglePassRefold() {
       auto bEnv = MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
           macro.cover.begin, macro.cover.end);
       if (!bEnv || bEnv->first > bEnv->second ||
-          bEnv->second > bToks_.size() ||
-          hunk.bStart < static_cast<uint64_t>(bEnv->first) ||
-          hunk.bEnd > static_cast<uint64_t>(bEnv->second))
+          bEnv->second > bToks_.size())
+        continue;
+
+      // Ordinary empty-slot boundary repairs are real B-token insertions at the
+      // recorded macro-cover frontier, so the inserted B range must lie inside
+      // the cover envelope.  The one-token-left case is different: it is an
+      // LCS placement artifact caused by identical fixed replacement-list
+      // literals near the macro start.  The inserted token may be reported just
+      // before the cover envelope even though definition replay can re-anchor
+      // the semantic edit inside the producer-recorded PP-byte expansion
+      // envelope.  Do not reject that candidate here; the replay solver below
+      // must still prove a concrete invocation rewrite before the hunk is
+      // absorbed.
+      if (!immediatelyBeforeRecordedCover &&
+          (hunk.bStart < static_cast<uint64_t>(bEnv->first) ||
+           hunk.bEnd > static_cast<uint64_t>(bEnv->second)))
         continue;
 
       auto rangesOpt = GetMacroInvocationFormalArgContentRanges(
@@ -6071,7 +6098,8 @@ std::string RefoldEngine::RunSinglePassRefold() {
         }
       }
 
-      if (!hasEmptyFormalSourceSlot && !hasMissingExpansionFormal)
+      if (!hasEmptyFormalSourceSlot && !hasMissingExpansionFormal &&
+          !immediatelyBeforeRecordedCover)
         continue;
 
       const uint64_t len = macro.cover.end - macro.cover.begin;
@@ -17900,8 +17928,23 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       }
     }
 
+    // Token LCS may slide an inserted token left across identical fixed
+    // replacement-list literals.  For example, with
+    //
+    //   #define M(x) ((x) >= 0)
+    //
+    // changing `x` to `(y).field` can appear as a pure insertion immediately
+    // before the recorded macro cover, even though the inserted `(` is
+    // semantically the first token of the rewritten actual.  When the producer
+    // recorded the exact PP-byte expansion envelope, definition-tape replay can
+    // re-anchor the fixed macro-body literals against that byte envelope and
+    // recover the actual without emitting a separate TU insertion.
+    const bool hasLeftBoundaryDefinitionTapeSlide =
+        h.isInsertOnly() && h.bStart < h.bEnd && cover->first > 0 &&
+        h.aStart + 1 == cover->first && m.invPPByteBegin && m.invPPByteEnd;
+
     if (!hasVaOpt && !hasEmptyFormalSourceSlot && !hasMissingExpansionFormal &&
-        !hasVariadicFormalErasedInB)
+        !hasVariadicFormalErasedInB && !hasLeftBoundaryDefinitionTapeSlide)
       return std::nullopt;
 
     // One occurrence of a formal while replaying the definition over the
@@ -18012,8 +18055,30 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     // flips are still finite replay problems.  Determinism is enforced by the
     // later solution ranking/ambiguity checks rather than by silently refusing
     // otherwise provable envelopes.
-    auto bEnv = MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
-        cover->first, cover->second);
+    std::optional<std::pair<size_t, size_t>> bEnv;
+    if (hasLeftBoundaryDefinitionTapeSlide) {
+      // Use the producer-recorded macro expansion byte envelope, not the
+      // token-cover envelope.  The token-cover mapper sees the LCS-selected
+      // pure insertion before the cover; the PP-byte envelope begins at the
+      // first token produced by this macro invocation and therefore lets the
+      // definition tape decide which identical boundary literal is fixed macro
+      // body and which token belongs to the rewritten formal.
+      bEnv = MapAByteRangeToBTokenEnvelope(
+          static_cast<size_t>(*m.invPPByteBegin),
+          static_cast<size_t>(*m.invPPByteEnd));
+      if (inTraceMode() && bEnv) {
+        REFOLD_LOG_TRACE(
+            "macro/template",
+            "definition replay left-boundary slide: macro id={0} name={1} "
+            "hunkA=[{2},{3}) hunkB=[{4},{5}) ppBytes=[{6},{7}) "
+            "Btok=[{8},{9})",
+            m.id, m.name, h.aStart, h.aEnd, h.bStart, h.bEnd,
+            *m.invPPByteBegin, *m.invPPByteEnd, bEnv->first, bEnv->second);
+      }
+    } else {
+      bEnv = MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
+          cover->first, cover->second);
+    }
     if (!bEnv || bEnv->first > bEnv->second ||
         bEnv->second > bToks_.size())
       return std::nullopt;
