@@ -43733,11 +43733,228 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         return true;
       };
 
+  // A subtree-root DAG proof is local to the descendant macro that
+  // produced the edited surface.  It must not be promoted to an owner-wide
+  // invocation replay when that replay would contradict a sibling direct
+  // stringification surface in the same root expansion.
+  //
+  // Example:
+  //
+  //   #define NAME(prefix, suffix) ...
+  //     STR(CAT(prefix, suffix)) ...
+  //     CAT(prefix, suffix)
+  //
+  // A patch discovered from the second CAT may prove the pasted identifier
+  // `jilly`, but replaying `NAME(jill, y)` also determines the first STR
+  // payload as `CAT(jill, y)`.  If B requires `CAT(bill, z)`, the subtree
+  // proof is not owner-closed and must fail closed.  Pure forwarding stringify
+  // wrappers such as XSTR(x) -> STR(x) are deliberately left alone here: their
+  // stringified payload may be produced by macro expansion of the forwarded
+  // argument, which this local replay check is not trying to model.
+  auto dagSubtreeRootPreservesNonForwardedStringifySurfaces =
+      [&](const MacroPatch &patch) {
+        if (patch.proof.kind != MacroPatchProofKind::DagSubtreeRoot ||
+            !patch.subtreeCertBacked ||
+            patch.proof.proofRootMacroId != m.id ||
+            !patch.proof.preservesInvocationStructure)
+          return true;
+        if (!InvocationSpanMatchesCallsitePrefix(patch.replacement, m))
+          return true;
+
+        auto rootRangesOpt =
+            GetMacroInvocationFormalArgContentRanges(m, patch.replacement);
+        if (!rootRangesOpt)
+          return true;
+
+        SmallVector<std::string, 8> rootActuals;
+        rootActuals.reserve(rootRangesOpt->size());
+        for (const auto &R : *rootRangesOpt)
+          rootActuals.push_back(
+              StringRef(patch.replacement).slice(R.first, R.second).str());
+
+        auto hunkTouchesASpan = [&](uint64_t begin, uint64_t end) {
+          for (const diffutils::Hunk &hunk : abTokHunks_) {
+            if (hunk.aStart < end && begin < hunk.aEnd)
+              return true;
+          }
+          return false;
+        };
+
+        auto hasNonForwardedSyntaxOutsideRefs =
+            [&](StringRef argText,
+                ArrayRef<RefoldModel::InvArgRef> refs,
+                size_t argAbsBegin) {
+              SmallVector<std::pair<size_t, size_t>, 4> ranges;
+              for (const RefoldModel::InvArgRef &ref : refs) {
+                if (ref.byteBegin < argAbsBegin || ref.byteEnd < ref.byteBegin)
+                  continue;
+                const size_t relBegin =
+                    static_cast<size_t>(ref.byteBegin - argAbsBegin);
+                const size_t relEnd =
+                    static_cast<size_t>(ref.byteEnd - argAbsBegin);
+                if (relEnd > argText.size())
+                  continue;
+                ranges.push_back({relBegin, relEnd});
+              }
+              llvm::sort(ranges);
+
+              size_t cursor = 0;
+              for (const auto &R : ranges) {
+                if (R.first > cursor &&
+                    !argText.slice(cursor, R.first).trim().empty())
+                  return true;
+                cursor = std::max(cursor, R.second);
+              }
+              return cursor < argText.size() &&
+                     !argText.drop_front(cursor).trim().empty();
+            };
+
+        auto directlyStringifiesFormal =
+            [&](const RefoldModel::MacroInvocation &inv, uint32_t argIdx) {
+              if (!inv.definitionDirectiveId)
+                return false;
+              const RefoldModel::MacroDirective *definition = nullptr;
+              for (const RefoldModel::MacroDirective &directive :
+                   model_.GetMacroDirectives()) {
+                if (directive.id == *inv.definitionDirectiveId) {
+                  definition = &directive;
+                  break;
+                }
+              }
+              if (!definition || argIdx >= definition->defParams.size())
+                return false;
+
+              // PPArgSpan::stringifySpans is an output-observation surface.
+              // It can be carried by wrapper macros whose own replacement list
+              // does not contain a `#` operator, for example
+              //
+              //   WSTR(X)  -> WIDEN(STR(X))
+              //   WIDEN(x) -> WIDEN2(x)
+              //
+              // The WIDEN invocation may still report the final widened string
+              // as a stringify-related output span, but WIDEN is not the macro
+              // that directly stringifies its argument.  This owner-closure
+              // check is intentionally limited to direct stringification
+              // operands; treating inherited wrapper observations as direct
+              // stringification would incorrectly reject valid wrappers such as
+              // WSTR(goodbye).
+              for (size_t i = 0; i + 1 < definition->replacementTokens.size();
+                   ++i) {
+                const auto &hash = definition->replacementTokens[i];
+                const auto &formal = definition->replacementTokens[i + 1];
+                if (hash.spelling == "#" &&
+                    formal.kind ==
+                        RefoldModel::MacroReplacementTokenKind::ParamRef &&
+                    formal.paramIndex && *formal.paramIndex == argIdx)
+                  return true;
+              }
+              return false;
+            };
+
+        auto replayStringifyArgumentThroughRoot =
+            [&](const RefoldModel::MacroInvocation &inv, uint32_t argIdx)
+            -> std::optional<std::string> {
+          if (!directlyStringifiesFormal(inv, argIdx))
+            return std::nullopt;
+          if (!inv.invText || argIdx >= inv.argRefs.size())
+            return std::nullopt;
+          auto rangesOpt =
+              GetMacroInvocationFormalArgContentRanges(inv, *inv.invText);
+          if (!rangesOpt || argIdx >= rangesOpt->size())
+            return std::nullopt;
+
+          const auto argRange = (*rangesOpt)[argIdx];
+          StringRef invText = *inv.invText;
+          if (argRange.second > invText.size() || argRange.second < argRange.first)
+            return std::nullopt;
+
+          StringRef oldArgText = invText.slice(argRange.first, argRange.second);
+          const auto &refs = inv.argRefs[argIdx];
+          if (!hasNonForwardedSyntaxOutsideRefs(oldArgText, refs, argRange.first))
+            return std::nullopt;
+
+          std::string replayed = oldArgText.str();
+          SmallVector<RefoldModel::InvArgRef, 4> sortedRefs;
+          sortedRefs.append(refs.begin(), refs.end());
+          llvm::sort(sortedRefs, [](const RefoldModel::InvArgRef &lhs,
+                                    const RefoldModel::InvArgRef &rhs) {
+            if (lhs.byteBegin != rhs.byteBegin)
+              return lhs.byteBegin > rhs.byteBegin;
+            return lhs.byteEnd > rhs.byteEnd;
+          });
+
+          for (const RefoldModel::InvArgRef &ref : sortedRefs) {
+            if (ref.callerParamIndex >= rootActuals.size())
+              return std::nullopt;
+            if (ref.byteBegin < argRange.first || ref.byteEnd < ref.byteBegin)
+              return std::nullopt;
+            const size_t relBegin =
+                static_cast<size_t>(ref.byteBegin - argRange.first);
+            const size_t relEnd = static_cast<size_t>(ref.byteEnd - argRange.first);
+            if (relEnd > replayed.size())
+              return std::nullopt;
+            replayed.replace(relBegin, relEnd - relBegin,
+                             rootActuals[ref.callerParamIndex]);
+          }
+
+          return stringutils::canonicalizeStringifyInversePayload(replayed);
+        };
+
+        for (const RefoldModel::MacroInvocation &inv :
+             model_.GetMacroInvocations()) {
+          if (GetRootMacroId(inv.id) != m.id)
+            continue;
+          for (const RefoldModel::PPArgSpan &span : inv.stringifySpans) {
+            if (!hunkTouchesASpan(span.begin, span.end))
+              continue;
+
+            std::optional<std::pair<size_t, size_t>> bEnv =
+                MapATokRangeAToBTokenEnvelopePreserveBoundaryInsertions(
+                    span.begin, span.end);
+            if (!bEnv || bEnv->second <= bEnv->first)
+              continue;
+
+            std::optional<std::string> bPayload = UnstringifyLiteralToArgText(
+                SliceBSource(bEnv->first, bEnv->second),
+                /*allowTopLevelComma=*/true);
+            if (!bPayload)
+              continue;
+            std::optional<std::string> canonicalB =
+                stringutils::canonicalizeStringifyInversePayload(*bPayload);
+            if (!canonicalB)
+              continue;
+
+            std::optional<std::string> replayed =
+                replayStringifyArgumentThroughRoot(inv, span.argIdx);
+            if (!replayed)
+              continue;
+
+            if (*replayed != *canonicalB) {
+              REFOLD_LOG_TRACE(
+                  "macro/proof",
+                  "suppress DAG subtree root replay: sibling direct "
+                  "stringify surface would change under candidate root "
+                  "invocation inv id={0} name={1} stringifyMacro={2} "
+                  "stringifyName={3} span=[{4},{5}) replayed='{6}' "
+                  "bPayload='{7}' replacement='{8}'",
+                  m.id, m.name, inv.id, inv.name, span.begin, span.end,
+                  stringutils::showWsWithClip(*replayed, 160),
+                  stringutils::showWsWithClip(*canonicalB, 160),
+                  stringutils::showWsWithClip(patch.replacement, 220));
+              return false;
+            }
+          }
+        }
+
+        return true;
+      };
+
   auto macroCandidateReplayIsStableForFinalSelection =
       [&](const MacroPatch &patch) {
         return structurePreservingCallsiteHasStableFormalSyntax(patch) &&
                argsOnlyWholeEnvelopeCandidateHasLiteralBodyReplay(patch) &&
                rootPreservingCandidateHasLiteralFixedRootBodyReplay(patch) &&
+               dagSubtreeRootPreservesNonForwardedStringifySurfaces(patch) &&
                !callsiteReplayObservesActiveHeaderMacroState(patch);
       };
 
