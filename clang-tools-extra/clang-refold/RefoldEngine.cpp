@@ -88,6 +88,7 @@
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/FormatVariadic.h"
@@ -40035,6 +40036,214 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         std::string detail;
       };
 
+      // Wrapper-placeholder replay is used only after ordinary paste replay has
+      // failed.  In that mode the candidate text proves that one observed paste
+      // chain can be reconstructed, but it does not by itself prove that changing
+      // the root formal is safe for every other descendant use of that formal.
+      //
+      // A root formal may feed several pasted selectors below the same macro
+      // invocation.  Some of those pasted tokens are emitted directly and have
+      // paste spans; others are immediately consumed as macro names and therefore
+      // have only paste-token witnesses plus the expansion span of the selected
+      // macro.  If such an untargeted selector would change under replay, the
+      // refolded source can preprocess to a different program even though the
+      // single edited pasted token was explained.  Reject the deferred wrapper
+      // replay unless every descendant output range controlled
+      // by each changed root formal is covered by the current token diff.
+      // Hidden paste-derived macro selectors are rejected because the current
+      // map only observed the old selected macro body.
+      auto rootDeferredPasteReplayHasOnlyProvenDependentUses =
+          [&](const DenseMap<uint32_t, FormalTextPair> &rootFormals,
+              StringRef traceStage, std::string &failureDetail) -> bool {
+        struct DependentUse {
+          const RefoldModel::MacroInvocation *inv = nullptr;
+          uint32_t argIdx = 0;
+          const char *kind = "";
+          uint64_t begin = 0;
+          uint64_t end = 0;
+          bool hiddenPasteSelector = false;
+        };
+
+        auto tokenRangeTouchesCurrentDiff = [&](uint64_t begin,
+                                                uint64_t end) -> bool {
+          if (begin >= end)
+            return false;
+          for (const auto &h : tokenHunksForCheck) {
+            if (h.aStart == h.aEnd) {
+              // Pure insertions belong to the adjacent dependent surface when
+              // the insertion point is exactly inside or on either boundary.
+              if (h.aStart >= begin && h.aStart <= end)
+                return true;
+              continue;
+            }
+            if (h.aStart < end && h.aEnd > begin)
+              return true;
+          }
+          return false;
+        };
+
+        auto addArgSpanUses = [&](SmallVectorImpl<DependentUse> &uses,
+                                  const RefoldModel::MacroInvocation &inv,
+                                  uint32_t argIdx, const char *kind,
+                                  ArrayRef<RefoldModel::PPArgSpan> spans) {
+          for (const auto &sp : spans) {
+            if (sp.argIdx != argIdx || !sp.IsValid())
+              continue;
+            uses.push_back(
+                DependentUse{&inv, argIdx, kind, sp.begin, sp.end, false});
+          }
+        };
+
+        auto pasteTokenUsesFormal =
+            [&](const RefoldModel::MacroInvocation &inv, uint32_t argIdx) {
+          for (const auto &tok : inv.pasteTokens) {
+            for (const auto &part : tok.parts) {
+              if (part.kind == RefoldModel::PastePartKind::Arg &&
+                  part.argIndex && *part.argIndex == argIdx)
+                return true;
+            }
+          }
+          return false;
+        };
+
+        auto hasFinalPasteSpanForRange =
+            [&](const RefoldModel::MacroInvocation &inv, uint32_t argIdx,
+                uint64_t begin, uint64_t end) {
+          for (const auto &ps : inv.pasteSpans) {
+            if (ps.argIdx == argIdx && ps.begin == begin && ps.end == end)
+              return true;
+          }
+          return false;
+        };
+
+        auto addPasteTokenUses =
+            [&](SmallVectorImpl<DependentUse> &uses,
+                const RefoldModel::MacroInvocation &inv, uint32_t argIdx) {
+          auto addOne = [&](const RefoldModel::PPSpan &sp) {
+            if (!sp.IsValid())
+              return;
+            const bool hasFinalPasteSpan =
+                hasFinalPasteSpanForRange(inv, argIdx, sp.begin, sp.end);
+            uses.push_back(DependentUse{&inv, argIdx,
+                                        hasFinalPasteSpan
+                                            ? "paste-token"
+                                            : "hidden-paste-selector",
+                                        sp.begin, sp.end, !hasFinalPasteSpan});
+          };
+
+          if (!inv.spans.empty()) {
+            for (const auto &sp : inv.spans)
+              addOne(sp);
+          } else {
+            for (const auto &sp : inv.bodySpans)
+              addOne(sp);
+          }
+        };
+
+        auto formatDependentUse = [&](const DependentUse &use) {
+          return formatv("{{id={0},name={1},arg={2},kind={3},A=[{4},{5}),"
+                         "touched={6},hiddenSelector={7}}}",
+                         use.inv ? use.inv->id : 0,
+                         use.inv ? use.inv->name : StringRef(""), use.argIdx,
+                         use.kind, use.begin, use.end,
+                         tokenRangeTouchesCurrentDiff(use.begin, use.end) ? 1
+                                                                         : 0,
+                         use.hiddenPasteSelector ? 1 : 0)
+              .str();
+        };
+
+        for (const auto &KV : rootFormals) {
+          StringRef oldText = StringRef(KV.second.oldText).trim();
+          StringRef newText = StringRef(KV.second.newText).trim();
+          if (oldText == newText)
+            continue;
+
+          SmallVector<DependentUse, 32> uses;
+          std::set<std::pair<uint64_t, uint32_t>> visited;
+          SmallVector<std::pair<const RefoldModel::MacroInvocation *, uint32_t>,
+                      32>
+              work;
+          work.push_back({&m, KV.first});
+
+          while (!work.empty()) {
+            auto [cur, curFormal] = work.pop_back_val();
+            if (!cur)
+              continue;
+            if (!visited.insert({cur->id, curFormal}).second)
+              continue;
+
+            // Direct final-output occurrences of this formal must be covered by
+            // the same diff that justified the root rewrite.
+            addArgSpanUses(uses, *cur, curFormal, "standard", cur->argSpans);
+            addArgSpanUses(uses, *cur, curFormal, "stringify",
+                           cur->stringifySpans);
+            addArgSpanUses(uses, *cur, curFormal, "paste-span",
+                           cur->pasteSpans);
+
+            if (pasteTokenUsesFormal(*cur, curFormal)) {
+              // A paste token may be consumed immediately as a macro selector.
+              // Such hidden selectors have no final paste span, so replaying a
+              // different root formal would select a macro body that this map did
+              // not observe.  Record them distinctly and reject below rather
+              // than pretending the wrapper replay proved their expansion.
+              addPasteTokenUses(uses, *cur, curFormal);
+            }
+
+            auto childIt = macroChildrenById_.find(cur->id);
+            if (childIt == macroChildrenById_.end())
+              continue;
+
+            for (const auto *child : childIt->second) {
+              if (!child)
+                continue;
+              for (uint32_t childFormal = 0;
+                   childFormal < child->argDeps.size(); ++childFormal) {
+                if (llvm::is_contained(child->argDeps[childFormal],
+                                       curFormal))
+                  work.push_back({child, childFormal});
+              }
+            }
+          }
+
+          SmallVector<std::string, 16> rejectedUses;
+          for (const auto &use : uses) {
+            if (use.hiddenPasteSelector ||
+                !tokenRangeTouchesCurrentDiff(use.begin, use.end))
+              rejectedUses.push_back(formatDependentUse(use));
+          }
+
+          if (inTraceMode()) {
+            SmallVector<std::string, 16> formattedUses;
+            formattedUses.reserve(uses.size());
+            for (const auto &use : uses)
+              formattedUses.push_back(formatDependentUse(use));
+            trace("macro/proof",
+                  "{0}: root deferred paste replay dependent-use coverage "
+                  "root id={1} name={2} argIdx={3} old='{4}' new='{5}' "
+                  "uses={6} rejected={7}",
+                  traceStage, m.id, m.name, KV.first,
+                  stringutils::showWsWithClip(oldText, 120),
+                  stringutils::showWsWithClip(newText, 120),
+                  llvm::join(formattedUses, ", "),
+                  llvm::join(rejectedUses, ", "));
+          }
+
+          if (!rejectedUses.empty()) {
+            failureDetail =
+                formatv("{0}: root proof validation rejected deferred paste "
+                        "wrapper replay root id={1} name='{2}' argIdx={3} "
+                        "because changed root formal has unproven "
+                        "dependent output uses: {4}",
+                        traceStage, m.id, m.name, KV.first,
+                        llvm::join(rejectedUses, ", "))
+                    .str();
+            return false;
+          }
+        }
+
+        return true;
+      };
+
       /// Re-validate a constructed root replacement against the root-invocation
       /// proof machinery.
       ///
@@ -40288,20 +40497,28 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
                 !wrapperReplayCert.rewrittenInvocationSyntax.empty() &&
                 StringRef(wrapperReplayCert.rewrittenInvocationSyntax).trim() ==
                     newText.trim()) {
-              REFOLD_LOG_TRACE("macro/proof",
-                    "{0}: root proof validation accepted wrapper replay "
-                    "candidate root id={1} name={2} syntax='{3}' "
-                    "pasteDeferred={4}",
-                    traceStage, m.id, m.name,
-                    wrapperReplayCert.rewrittenInvocationSyntax,
-                    wrapperReplayCert.pasteValidation.deferred ? 1 : 0);
-              cert.replayInvocationCertificate = std::move(wrapperReplayCert);
+              std::string deferredPasteDetail;
+              if (rootDeferredPasteReplayHasOnlyProvenDependentUses(
+                      *replayRootFormals, traceStage, deferredPasteDetail)) {
+                REFOLD_LOG_TRACE("macro/proof",
+                      "{0}: root proof validation accepted wrapper replay "
+                      "candidate root id={1} name={2} syntax='{3}' "
+                      "pasteDeferred={4}",
+                      traceStage, m.id, m.name,
+                      wrapperReplayCert.rewrittenInvocationSyntax,
+                      wrapperReplayCert.pasteValidation.deferred ? 1 : 0);
+                cert.replayInvocationCertificate = std::move(wrapperReplayCert);
+              } else {
+                REFOLD_LOG_TRACE("macro/proof", "{0}", deferredPasteDetail);
+                cert.detail = deferredPasteDetail;
+              }
             }
           }
         }
         if (cert.replayInvocationCertificate.kind ==
             InvocationRewriteCertificateKind::Invalid) {
-          cert.detail = cert.replayInvocationCertificate.detail;
+          if (cert.detail.empty())
+            cert.detail = cert.replayInvocationCertificate.detail;
           return cert;
         }
 
