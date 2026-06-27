@@ -211,6 +211,13 @@ static constexpr const char *RefoldSchema = R"json(
           "type": "string",
           "minLength": 1,
           "description": "High-level source language for the preprocessing invocation (e.g. 'c', 'c++', 'objc', 'objc++')."
+        },
+        "include_search_chain": {
+          "type": "array",
+          "description": "Producer-normalized effective include search chain in the exact order Clang used for header lookup. Entries are indexed by 'index'. This is optional for backward compatibility; when present, consumers should prefer it over reconstructing include lookup order from argv.",
+          "items": {
+            "$ref": "#/$defs/IncludeSearchEntry"
+          }
         }
       }
     },
@@ -701,7 +708,7 @@ static constexpr const char *RefoldSchema = R"json(
             "file": {
               "type": "string",
               "minLength": 1,
-              "description": "Header file path containing this declaration. If omitted, it is implied by the enclosing include's resolved_path."
+              "description": "Header file path containing this declaration. If omitted, it is implied by the enclosing include's opened_path when present, otherwise by legacy resolved_path."
             },
             "b": {
               "type": "integer",
@@ -960,6 +967,258 @@ static constexpr const char *RefoldSchema = R"json(
       },
       "description": "inv_b/inv_e are BYTES in the main source, not token indices."
     },
+    "IncludeLookupKind": {
+      "type": "string",
+      "enum": [
+        "source_relative",
+        "quote_dir",
+        "user_I",
+        "system",
+        "idirafter",
+        "framework",
+        "builtin",
+        "absolute_operand",
+        "unknown"
+      ],
+      "description": "Producer-owned classification for how an include edge was resolved. source_relative and absolute_operand are not entries in pp_ctx.include_search_chain. quote_dir, user_I, system, idirafter, framework, and builtin identify effective search-chain entries."
+    },
+    "IncludeSearchEntryKind": {
+      "type": "string",
+      "enum": [
+        "quote_dir",
+        "user_I",
+        "system",
+        "idirafter",
+        "framework",
+        "builtin",
+        "unknown"
+      ],
+      "description": "Kind of an effective include search-chain entry. source_relative and absolute_operand are per-edge lookup kinds, not global search-chain entries."
+    },
+    "IncludeSearchEntry": {
+      "type": "object",
+      "required": [
+        "index",
+        "kind",
+        "spelling",
+        "path"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "index": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Stable zero-based effective search-chain index used by include lookup provenance."
+        },
+        "kind": {
+          "$ref": "#/$defs/IncludeSearchEntryKind",
+          "description": "Search-chain entry kind."
+        },
+        "spelling": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Directory spelling as supplied/observed by Clang for this search entry, preserving relative/symlink spelling when available."
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Physical or FileManager path for this search entry, suitable for filesystem identity checks after canonicalization."
+        }
+      },
+      "description": "One producer-normalized effective header-search entry. Indices are referenced by include.lookup.search_chain_index and include_next.resume_search_chain_index."
+    },
+    "IncludeLookupProvenance": {
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/IncludeLookupKind",
+          "description": "How this include edge was found."
+        },
+        "search_chain_index": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Effective pp_ctx.include_search_chain index that selected this include edge. Required for search-chain lookup kinds and omitted for source_relative, absolute_operand, and unknown."
+        },
+        "directory_spelling": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Spelling of the directory that selected this include edge. For source_relative, this is the including file's directory spelling. For search-chain hits, this matches the referenced search-chain entry spelling when available."
+        },
+        "directory_path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Physical/FileManager path of the directory that selected this include edge, suitable for path identity checks."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "quote_dir",
+                  "user_I",
+                  "system",
+                  "idirafter",
+                  "framework",
+                  "builtin"
+                ]
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "search_chain_index",
+              "directory_spelling",
+              "directory_path"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "source_relative",
+                  "absolute_operand"
+                ]
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "directory_spelling",
+              "directory_path"
+            ],
+            "not": {
+              "required": [
+                "search_chain_index"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "unknown"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "search_chain_index"
+                  ]
+                },
+                {
+                  "required": [
+                    "directory_spelling"
+                  ]
+                },
+                {
+                  "required": [
+                    "directory_path"
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "description": "Producer-owned lookup provenance for one include edge. This lets consumers compare replayed include resolution against producer facts instead of reconstructing Clang's lookup decision from argv."
+    },
+    "IncludeNextProvenance": {
+      "type": "object",
+      "required": [
+        "provenance"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "provenance": {
+          "type": "string",
+          "enum": [
+            "known",
+            "unknown"
+          ],
+          "description": "known means Clang's include-next resume cursor was represented in this object. unknown means the consumer must fail closed for general include_next preservation/replay proof."
+        },
+        "containing_file_include_id": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Include item id for the file containing this #include_next directive. The containing file's selected lookup index is derived from that include's lookup.search_chain_index when needed."
+        },
+        "resume_search_chain_index": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Effective pp_ctx.include_search_chain index where #include_next lookup resumed in the producer run. This is the non-redundant cursor needed to replay #include_next."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "provenance": {
+                "const": "known"
+              }
+            },
+            "required": [
+              "provenance"
+            ]
+          },
+          "then": {
+            "required": [
+              "containing_file_include_id",
+              "resume_search_chain_index"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "provenance": {
+                "const": "unknown"
+              }
+            },
+            "required": [
+              "provenance"
+            ]
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "containing_file_include_id"
+                  ]
+                },
+                {
+                  "required": [
+                    "resume_search_chain_index"
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "description": "Producer-owned #include_next resume provenance. The selected target is not duplicated here; it is represented by the include edge's opened_path, entered_file_spelling, and lookup.search_chain_index."
+    },
     "DirectiveIncludeItem": {
       "type": "object",
       "required": [
@@ -1011,7 +1270,30 @@ static constexpr const char *RefoldSchema = R"json(
         "resolved_path": {
           "type": "string",
           "minLength": 1,
-          "description": "Legacy include-path spelling for this include edge. This may be used as physical-identity proof input after canonicalization, but consumers must prefer preserved __FILE__ / __FILE_NAME__ expansion payloads for filename-observer proofs when those payloads are available."
+          "description": "Legacy include-path spelling for this include edge. This field is retained for backward compatibility only. Consumers should prefer opened_path for physical identity proof and entered_file_spelling for __FILE__ / __FILE_NAME__ observer proof when those fields are present."
+        },
+        "opened_path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Producer-owned physical/FileManager path for the file opened by this include edge. This is the preferred input to physical identity proof; consumers should compare replayed candidates against it with path-equivalence logic rather than using filename-observer spelling."
+        },
+        "entered_file_spelling": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Exact file spelling Clang exposed through __FILE__ while preprocessing this include instance. This is the preferred proof source for filename observers and intentionally preserves relative, symlink, search-directory, or absolute spelling."
+        },
+        "entered_file_name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Exact unescaped file-name spelling Clang would expose through __FILE_NAME__ at the start of this include instance, before later #line / linemarker changes. Optional audit metadata; consumers may compute this from entered_file_spelling when absent."
+        },
+        "lookup": {
+          "$ref": "#/$defs/IncludeLookupProvenance",
+          "description": "Producer-owned lookup provenance for this include edge. When present, consumers should use it to prove ordinary include replay and #include_next selected-target equivalence."
+        },
+        "include_next": {
+          "$ref": "#/$defs/IncludeNextProvenance",
+          "description": "Additional non-redundant resume provenance for #include_next directives. Omitted for ordinary #include and optional for backward compatibility with older maps."
         },
         "angled": {
           "type": "boolean",
@@ -1054,11 +1336,44 @@ static constexpr const char *RefoldSchema = R"json(
           "description": "Logical header-level declarations for this include instance, in source order."
         }
       },
-      "dependentRequired": {
-        "decls": [
-          "resolved_path"
-        ]
-      }
+      "dependentSchemas": {
+        "decls": {
+          "anyOf": [
+            {
+              "required": [
+                "opened_path"
+              ]
+            },
+            {
+              "required": [
+                "resolved_path"
+              ]
+            }
+          ],
+          "description": "Header declarations need a header-file identity source: opened_path in the new schema or legacy resolved_path."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "subkind": {
+                "const": "#include"
+              }
+            },
+            "required": [
+              "subkind"
+            ]
+          },
+          "then": {
+            "not": {
+              "required": [
+                "include_next"
+              ]
+            }
+          }
+        }
+      ]
     },
     "DirectiveMacroItem": {
       "type": "object",

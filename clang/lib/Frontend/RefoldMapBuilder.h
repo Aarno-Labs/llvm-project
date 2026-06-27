@@ -29,10 +29,10 @@
 //   - Token spans per item are contiguous half-open intervals [Begin, End).
 //   - Item “cover” is the minimal A interval covering all spans (may be
 //     absent/empty and represented as [-1,-1) downstream).
-//   - Path fields used as identity keys may be canonicalized internally; JSON
-//     include `resolved_path` is spelling-preserving while EmitAbsPaths remains
-//     false.  If absolute-path emission is enabled in the future, include file
-//     identity and entered-file spelling should be split into distinct fields.
+//   - Path fields used as identity keys may be canonicalized internally. For
+//     include edges, JSON `resolved_path` is retained as a legacy
+//     spelling-preserving alias; new maps emit `opened_path` for physical
+//     identity and `entered_file_spelling` for filename-observer proofs.
 //
 // This builder is intentionally serialization-agnostic except for the final
 // `writeJSON()` pass.
@@ -333,6 +333,21 @@ struct Item {
   // enabled, split physical identity and entered-file spelling into distinct
   // map fields instead of overloading this one.
   std::string ResolvedPath;
+
+  // New include-resolution metadata.  These fields split the legacy
+  // resolved_path spelling into explicit physical identity, filename-observer
+  // spelling, and HeaderSearch lookup provenance.
+  std::string OpenedPath;
+  std::string EnteredFileSpelling;
+  std::string EnteredFileName;
+  std::string LookupKind;
+  std::optional<unsigned> LookupSearchChainIndex;
+  std::string LookupDirectorySpelling;
+  std::string LookupDirectoryPath;
+  bool IncludeNextProvenanceKnown = false;
+  std::optional<uint64_t> IncludeNextContainingFileIncludeId;
+  std::optional<unsigned> IncludeNextResumeSearchChainIndex;
+
   bool IsAngled = false;       // <...> vs "..."
   std::optional<uint64_t>
       Parent; // parent include item id, or nullopt if top-level
@@ -496,15 +511,19 @@ class RefoldMapBuilder {
       Cwd; // Captured working directory (for resolving relative spellings)
 
   std::string TUSourcePath;  // TU path spelling (for JSON 'source')
-  // Keep JSON spelling-preserving by default.  `resolved_path` is therefore a
-  // historical field name for the producer-observed entered-file spelling.
-  // Turning this on would change that contract and should be paired with a
-  // schema split between physical identity and entered-file spelling.
+  // Keep legacy `resolved_path` spelling-preserving by default.  New include
+  // maps always carry the split fields: `opened_path` for physical identity and
+  // `entered_file_spelling` for filename-observer proof.
   bool EmitAbsPaths = false;
   bool EnableByteSpans;      // If true, then serialize the per-token byte spans
 
-  /// Map resolved absolute include directories -> original `-I` spellings.
+  /// Map resolved absolute include directories -> unique original include-dir
+  /// spelling. Ambiguous entries are erased rather than guessed.
   llvm::StringMap<std::string> IncludeDirAbs2Spelling;
+  /// Map resolved absolute include directories -> unique producer-known search
+  /// class from HeaderSearchOptions. Ambiguous entries are erased rather than
+  /// guessed; HeaderSearch public range checks still classify quote/user dirs.
+  llvm::StringMap<std::string> IncludeDirAbs2Kind;
   /// Map resolved absolute file paths -> chosen spelling (TU/header).
   llvm::StringMap<std::string> FileAbs2Spelling;
 
@@ -628,7 +647,8 @@ public:
                           StringRef FileName, bool IsAngled,
                           CharSourceRange FilenameRange,
                           OptionalFileEntryRef File, StringRef SearchPath,
-                          StringRef RelativePath);
+                          StringRef RelativePath,
+                          const IncludeLookupProvenance &LookupProvenance);
 
   /// Callback for `#define`.
   ///
@@ -670,7 +690,7 @@ public:
   ///
   /// Pushes a new include context on the include stack and creates/updates
   /// the current file item for span attribution.
-  void onEnterFile(SourceLocation IncludeLoc);
+  void onEnterFile(SourceLocation IncludeLoc, SourceLocation EnterLoc);
 
   /// Entering a file (either TU or an included header).
   ///

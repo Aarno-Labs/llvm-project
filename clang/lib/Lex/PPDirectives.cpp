@@ -981,9 +981,12 @@ OptionalFileEntryRef Preprocessor::LookupFile(
     ConstSearchDirIterator *CurDirArg, SmallVectorImpl<char> *SearchPath,
     SmallVectorImpl<char> *RelativePath,
     ModuleMap::KnownHeader *SuggestedModule, bool *IsMapped,
-    bool *IsFrameworkFound, bool SkipCache, bool OpenFile, bool CacheFailures) {
+    bool *IsFrameworkFound, bool SkipCache, bool OpenFile, bool CacheFailures,
+    ConstSearchDirIterator *ResolvedFromDir) {
   ConstSearchDirIterator CurDirLocal = nullptr;
   ConstSearchDirIterator &CurDir = CurDirArg ? *CurDirArg : CurDirLocal;
+  if (ResolvedFromDir)
+    *ResolvedFromDir = FromDir;
 
   Module *RequestingModule = getModuleForLocation(
       FilenameLoc, LangOpts.ModulesValidateTextualHeaderIncludes);
@@ -1057,6 +1060,8 @@ OptionalFileEntryRef Preprocessor::LookupFile(
         // Found it.
         FromDir = TmpFromDir;
         CurDir = TmpCurDir;
+        if (ResolvedFromDir)
+          *ResolvedFromDir = FromDir;
         break;
       }
     }
@@ -2071,6 +2076,13 @@ void Preprocessor::HandleIncludeDirective(SourceLocation HashLoc,
                                           Token &IncludeTok,
                                           ConstSearchDirIterator LookupFrom,
                                           const FileEntry *LookupFromFile) {
+  // Clear include-lookup provenance at the start of every include-like
+  // directive.  The side channel is populated immediately before the
+  // synchronous InclusionDirective callback for successfully resolved include
+  // edges, so early exits and failed lookups must not expose stale state from
+  // a prior directive.
+  LastIncludeLookupProvenance = IncludeLookupProvenance{};
+
   Token FilenameTok;
   if (LexHeaderName(FilenameTok))
     return;
@@ -2133,7 +2145,11 @@ OptionalFileEntryRef Preprocessor::LookupHeaderIncludeOrImport(
     bool &IsMapped, ConstSearchDirIterator LookupFrom,
     const FileEntry *LookupFromFile, StringRef &LookupFilename,
     SmallVectorImpl<char> &RelativePath, SmallVectorImpl<char> &SearchPath,
-    ModuleMap::KnownHeader &SuggestedModule, bool isAngled) {
+    ModuleMap::KnownHeader &SuggestedModule, bool isAngled,
+    ConstSearchDirIterator *ResolvedLookupFrom) {
+  if (ResolvedLookupFrom)
+    *ResolvedLookupFrom = LookupFrom;
+
   auto DiagnoseHeaderInclusion = [&](FileEntryRef FE) {
     if (LangOpts.AsmPreprocessor)
       return;
@@ -2151,7 +2167,9 @@ OptionalFileEntryRef Preprocessor::LookupHeaderIncludeOrImport(
   OptionalFileEntryRef File = LookupFile(
       FilenameLoc, LookupFilename, isAngled, LookupFrom, LookupFromFile, CurDir,
       Callbacks ? &SearchPath : nullptr, Callbacks ? &RelativePath : nullptr,
-      &SuggestedModule, &IsMapped, &IsFrameworkFound);
+      &SuggestedModule, &IsMapped, &IsFrameworkFound,
+      /*SkipCache=*/false, /*OpenFile=*/true, /*CacheFailures=*/true,
+      ResolvedLookupFrom);
   if (File) {
     DiagnoseHeaderInclusion(*File);
     return File;
@@ -2172,7 +2190,8 @@ OptionalFileEntryRef Preprocessor::LookupHeaderIncludeOrImport(
         FilenameLoc, LookupFilename, false, LookupFrom, LookupFromFile, CurDir,
         Callbacks ? &SearchPath : nullptr, Callbacks ? &RelativePath : nullptr,
         &SuggestedModule, &IsMapped,
-        /*IsFrameworkFound=*/nullptr);
+        /*IsFrameworkFound=*/nullptr, /*SkipCache=*/false,
+        /*OpenFile=*/true, /*CacheFailures=*/true, ResolvedLookupFrom);
     if (File) {
       DiagnoseHeaderInclusion(*File);
       Diag(FilenameTok, diag::err_pp_file_not_found_angled_include_not_fatal)
@@ -2203,7 +2222,8 @@ OptionalFileEntryRef Preprocessor::LookupHeaderIncludeOrImport(
         FilenameLoc, TypoCorrectionLookupName, isAngled, LookupFrom,
         LookupFromFile, CurDir, Callbacks ? &SearchPath : nullptr,
         Callbacks ? &RelativePath : nullptr, &SuggestedModule, &IsMapped,
-        /*IsFrameworkFound=*/nullptr);
+        /*IsFrameworkFound=*/nullptr, /*SkipCache=*/false,
+        /*OpenFile=*/true, /*CacheFailures=*/true, ResolvedLookupFrom);
     if (File) {
       DiagnoseHeaderInclusion(*File);
       auto Hint =
@@ -2306,6 +2326,7 @@ Preprocessor::ImportAction Preprocessor::HandleHeaderIncludeOrImport(
   bool IsMapped = false;
   bool IsFrameworkFound = false;
   ConstSearchDirIterator CurDir = nullptr;
+  ConstSearchDirIterator ResolvedLookupFrom = LookupFrom;
   SmallString<1024> SearchPath;
   SmallString<1024> RelativePath;
   // We get the raw path only if we have 'Callbacks' to which we later pass
@@ -2328,7 +2349,8 @@ Preprocessor::ImportAction Preprocessor::HandleHeaderIncludeOrImport(
   OptionalFileEntryRef File = LookupHeaderIncludeOrImport(
       &CurDir, Filename, FilenameLoc, FilenameRange, FilenameTok,
       IsFrameworkFound, IsImportDecl, IsMapped, LookupFrom, LookupFromFile,
-      LookupFilename, RelativePath, SearchPath, SuggestedModule, isAngled);
+      LookupFilename, RelativePath, SearchPath, SuggestedModule, isAngled,
+      &ResolvedLookupFrom);
 
   if (usingPCHWithThroughHeader() && SkippingUntilPCHThroughHeader) {
     if (File && isPCHThroughHeader(&File->getFileEntry()))
@@ -2509,6 +2531,19 @@ Preprocessor::ImportAction Preprocessor::HandleHeaderIncludeOrImport(
   if (Callbacks && !IsImportDecl) {
     // Notify the callback object that we've seen an inclusion directive.
     // FIXME: Use a different callback for a pp-import?
+    auto SearchDirIndex = [this](ConstSearchDirIterator It)
+        -> std::optional<unsigned> {
+      if (!It || It == HeaderInfo.search_dir_end())
+        return std::nullopt;
+      return HeaderInfo.searchDirIdx(*It);
+    };
+
+    if (File) {
+      LastIncludeLookupProvenance.FromSearchDirIndex =
+          SearchDirIndex(ResolvedLookupFrom);
+      LastIncludeLookupProvenance.CurSearchDirIndex = SearchDirIndex(CurDir);
+    }
+
     Callbacks->InclusionDirective(HashLoc, IncludeTok, LookupFilename, isAngled,
                                   FilenameRange, File, SearchPath, RelativePath,
                                   SuggestedModule.getModule(), Action == Import,

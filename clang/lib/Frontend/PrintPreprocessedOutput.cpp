@@ -1244,7 +1244,8 @@ void clang::DoPrintPreprocessedInput(Preprocessor &PP, raw_ostream *OS,
         (void)ModuleImported;
         (void)FileType;
         R->onIncludeDirective(HashLoc, IncludeTok, FileName, IsAngled,
-                              FilenameRange, File, SearchPath, RelativePath);
+                              FilenameRange, File, SearchPath, RelativePath,
+                              PP.getLastIncludeLookupProvenance());
       }
 
       void MacroDefined(const Token &MacroNameTok,
@@ -1269,7 +1270,7 @@ void clang::DoPrintPreprocessedInput(Preprocessor &PP, raw_ostream *OS,
           FileID F = SM.getFileID(Loc);
           SourceLocation Inc = SM.getIncludeLoc(F); // invalid for main file
           Inc = SM.getFileLoc(Inc);
-          R->onEnterFile(Inc);
+          R->onEnterFile(Inc, SM.getFileLoc(Loc));
         } else if (Reason == PPCallbacks::ExitFile) {
           R->onExitFile();
         }

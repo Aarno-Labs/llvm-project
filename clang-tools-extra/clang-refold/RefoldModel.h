@@ -68,6 +68,70 @@ enum class MacroCalleeOriginKind {
   Opaque
 };
 
+/// Producer-owned include lookup classification.
+///
+/// Search-chain kinds correspond to entries in pp_ctx.include_search_chain.
+/// SourceRelative and AbsoluteOperand are per-edge lookup kinds and are never
+/// global search-chain entries. Unknown is the fail-closed representation used
+/// when the producer cannot represent Clang's lookup decision without guessing.
+enum class IncludeLookupKind {
+  SourceRelative,
+  QuoteDir,
+  UserI,
+  System,
+  IdirAfter,
+  Framework,
+  Builtin,
+  AbsoluteOperand,
+  Unknown
+};
+
+static inline StringRef toString(IncludeLookupKind kind) {
+  switch (kind) {
+  case IncludeLookupKind::SourceRelative:
+    return "source_relative";
+  case IncludeLookupKind::QuoteDir:
+    return "quote_dir";
+  case IncludeLookupKind::UserI:
+    return "user_I";
+  case IncludeLookupKind::System:
+    return "system";
+  case IncludeLookupKind::IdirAfter:
+    return "idirafter";
+  case IncludeLookupKind::Framework:
+    return "framework";
+  case IncludeLookupKind::Builtin:
+    return "builtin";
+  case IncludeLookupKind::AbsoluteOperand:
+    return "absolute_operand";
+  case IncludeLookupKind::Unknown:
+    return "unknown";
+  }
+  llvm_unreachable("Invalid IncludeLookupKind");
+}
+
+static inline bool isSearchChainIncludeLookupKind(IncludeLookupKind kind) {
+  switch (kind) {
+  case IncludeLookupKind::QuoteDir:
+  case IncludeLookupKind::UserI:
+  case IncludeLookupKind::System:
+  case IncludeLookupKind::IdirAfter:
+  case IncludeLookupKind::Framework:
+  case IncludeLookupKind::Builtin:
+    return true;
+  case IncludeLookupKind::SourceRelative:
+  case IncludeLookupKind::AbsoluteOperand:
+  case IncludeLookupKind::Unknown:
+    return false;
+  }
+  llvm_unreachable("Invalid IncludeLookupKind");
+}
+
+static inline bool isPerEdgeIncludeLookupKind(IncludeLookupKind kind) {
+  return kind == IncludeLookupKind::SourceRelative ||
+         kind == IncludeLookupKind::AbsoluteOperand;
+}
+
 static inline StringRef toString(MacroCalleeOriginKind kind) {
   switch (kind) {
   case MacroCalleeOriginKind::LiteralMacroName:
@@ -119,7 +183,9 @@ static inline StringRef toString(MacroCalleeOriginKind kind) {
 ///   `"#include_next"`):
 ///   - Directive site (`site_path`, `site_b/e`)
 ///   - Textual target (`target`)
-///   - Resolved file (`resolved_path`)
+///   - Legacy resolved spelling (`resolved_path`)
+///   - Optional opened file identity (`opened_path`)
+///   - Optional entered filename spelling (`entered_file_spelling`)
 ///   - A-token spans contributed by the included file
 ///   - Optional `parent` for nested includes.
 /// * **MacroItem** (`kind="macro"`): a single macro invocation site and
@@ -265,6 +331,59 @@ public:
     PPSpan span;
   };
 
+  /// One producer-normalized effective include-search entry.
+  ///
+  /// Entries are stored in the exact zero-based order emitted under
+  /// pp_ctx.include_search_chain. Include lookup provenance references these
+  /// entries by index; consumers must not reconstruct this order from argv when
+  /// the producer provided it.
+  struct IncludeSearchEntry {
+    uint32_t index = 0;
+    IncludeLookupKind kind = IncludeLookupKind::Unknown;
+    StringRef spelling;
+    StringRef path;
+  };
+
+  /// Producer-owned lookup provenance for one include edge.
+  ///
+  /// Search-chain hits carry a search_chain_index that selects an entry in
+  /// pp_ctx.include_search_chain. Source-relative and absolute-operand hits
+  /// carry only their selecting directory spelling/path. Unknown carries no
+  /// directory or cursor data and therefore cannot satisfy replay proof.
+  struct IncludeLookupProvenance {
+    IncludeLookupKind kind = IncludeLookupKind::Unknown;
+    std::optional<uint32_t> searchChainIndex;
+    std::optional<StringRef> directorySpelling;
+    std::optional<StringRef> directoryPath;
+  };
+
+  /// Producer-owned #include_next resume provenance.
+  ///
+  /// The JSON schema intentionally stores only the non-redundant facts: the
+  /// containing include id and the resume cursor.  The selected target's
+  /// search-chain index lives on this include edge's lookup object, and the
+  /// containing file's selected index lives on the referenced containing include
+  /// edge.  During model finalization we copy those two indices into the
+  /// optional derived fields below so replay proof code can consume a single
+  /// self-contained obligation without re-performing id lookups on every test.
+  ///
+  /// For old maps, missing or unknown provenance remains represented by
+  /// known=false with all cursor fields absent; consumers must keep the existing
+  /// conservative #include_next fallback in that case.
+  struct IncludeNextProvenance {
+    bool known = false;
+    std::optional<uint64_t> containingFileIncludeId;
+    std::optional<uint32_t> resumeSearchChainIndex;
+
+    /// Derived from the containing include edge's lookup.search_chain_index
+    /// when known provenance is structurally valid. Not serialized.
+    std::optional<uint32_t> containingFileSearchChainIndex;
+
+    /// Derived from this include edge's lookup.search_chain_index when known
+    /// provenance is structurally valid. Not serialized.
+    std::optional<uint32_t> selectedSearchChainIndex;
+  };
+
   struct IncludeItem {
     uint64_t id;
     StringRef subkind;  // "#include" | "#include_next"
@@ -274,27 +393,20 @@ public:
     uint64_t siteE;
     StringRef target; // as-written (e.g. "\"e.h\"" or "<vector>")
 
-    // Historical field name.
-    //
-    // Current producer maps do not split the include edge's physical identity
-    // from the file spelling observed by preserved __FILE__/__FILE_NAME__
-    // macros.  This field is therefore a legacy include-path spelling that may
-    // be the best available physical-identity input, but it is not an
-    // authoritative file-observer proof when the preprocessed token stream
-    // carries an actual preserved file-observer expansion.
-    //
-    // Consumer-side rule:
-    //   * physical identity proofs may canonicalize/realpath this field only
-    //     inside explicit physical-path helpers;
-    //   * file-spelling observer proofs must prefer the preserved macro
-    //     expansion payload recorded in the preprocessed stream, and may use
-    //     this field only as a schema-level fallback when no such observer
-    //     payload exists.
-    //
-    // Do not derive an observed __FILE__ spelling from filesystem
-    // normalization.  Future producer schemas should split this into separate
-    // physical and entered-spelling fields.
+    // Historical field name. Retained for backward compatibility only. New
+    // producer maps split this old overloaded value into openedPath for
+    // physical identity and enteredFileSpelling for filename observers.
     std::optional<StringRef> resolvedPath;
+
+    // New normalized include-resolution metadata. All fields are optional so
+    // old maps remain loadable. When present, consumers should prefer them over
+    // legacy resolved_path and argv-derived lookup reconstruction.
+    std::optional<StringRef> openedPath;
+    std::optional<StringRef> enteredFileSpelling;
+    std::optional<StringRef> enteredFileName;
+    std::optional<IncludeLookupProvenance> lookup;
+    std::optional<IncludeNextProvenance> includeNext;
+
     bool angled;
     std::optional<uint64_t> parent; // parent include id
     std::vector<PPSpan> spans;
@@ -304,12 +416,20 @@ public:
     IncludeItem(uint64_t id, StringRef subkind, StringRef text,
                 StringRef sitePath, uint64_t siteB, uint64_t siteE,
                 StringRef target, std::optional<StringRef> resolvedPath,
+                std::optional<StringRef> openedPath,
+                std::optional<StringRef> enteredFileSpelling,
+                std::optional<StringRef> enteredFileName,
+                std::optional<IncludeLookupProvenance> lookup,
+                std::optional<IncludeNextProvenance> includeNext,
                 bool angled, std::optional<uint64_t> parent,
                 std::vector<PPSpan> spans,
                 std::vector<HeaderDecl> decls) noexcept
         : id(id), subkind(subkind), text(text), sitePath(sitePath),
           siteB(siteB), siteE(siteE), target(target),
-          resolvedPath(resolvedPath), angled(angled), parent(parent),
+          resolvedPath(resolvedPath), openedPath(openedPath),
+          enteredFileSpelling(enteredFileSpelling),
+          enteredFileName(enteredFileName), lookup(std::move(lookup)),
+          includeNext(std::move(includeNext)), angled(angled), parent(parent),
           spans(std::move(spans)), decls(std::move(decls)) {
       cover.Init(this->spans);
     }
@@ -648,6 +768,9 @@ public:
   StringRef GetPPCwd() const { return ppCwd_; }
   StringRef GetPPLang() const { return ppLang_; }
   ArrayRef<std::string> GetPPArgv() const { return ppArgv_; }
+  ArrayRef<IncludeSearchEntry> GetIncludeSearchChain() const {
+    return includeSearchChain_;
+  }
   uint64_t GetTokensCountA() const { return tokensCountA_; }
 
   const DenseMap<uint64_t, TokMapEntry> &GetTokmapByPP() const {
@@ -796,6 +919,7 @@ private:
   StringRef ppCwd_;
   StringRef ppLang_;
   std::vector<std::string> ppArgv_;
+  std::vector<IncludeSearchEntry> includeSearchChain_;
   uint64_t tokensCountA_ = 0;
 
   /// Optional per-token byte offsets in the preprocessed output (A stream).
@@ -836,6 +960,12 @@ private:
 
   // Internal helper to finalize indices and perform deterministic ordering.
   void BuildIndicesAndSort();
+
+  /// Populate derived include_next cursor fields after include ids and lookup
+  /// metadata have been indexed.  This is a model-finalization step, not JSON
+  /// parsing: the schema deliberately stores non-redundant producer facts while
+  /// the consumer keeps derived indices ready for include-next replay proofs.
+  void CompleteIncludeNextDerivedProvenance();
 
   /// Remove invalid caller_macro_id edges so upward caller walks remain
   /// acyclic and terminate deterministically.

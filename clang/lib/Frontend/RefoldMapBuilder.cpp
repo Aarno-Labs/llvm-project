@@ -28,10 +28,10 @@
 //   - Token spans per item are contiguous half-open intervals [Begin, End).
 //   - Item “cover” is the minimal A interval covering all spans (may be
 //     absent/empty and represented as [-1,-1) downstream).
-//   - Path fields used as identity keys may be canonicalized internally; JSON
-//     include `resolved_path` is spelling-preserving while EmitAbsPaths remains
-//     false.  If absolute-path emission is enabled in the future, include file
-//     identity and entered-file spelling should be split into distinct fields.
+//   - Path fields used as identity keys may be canonicalized internally.  For
+//     include edges, JSON `resolved_path` is retained as a legacy
+//     spelling-preserving alias; new maps emit `opened_path` for physical
+//     identity and `entered_file_spelling` for filename-observer proofs.
 //
 // This builder is intentionally serialization-agnostic except for the final
 // `writeJSON()` pass.
@@ -47,6 +47,7 @@
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/SourceManager.h"
 #include "clang/Lex/MacroArgs.h"
+#include "clang/Lex/HeaderSearchOptions.h"
 #include "clang/Lex/Preprocessor.h"
 #include "clang/Lex/Lexer.h"
 #include "clang/Lex/PreprocessorOptions.h"
@@ -637,6 +638,214 @@ std::string joinSpelled(llvm::StringRef DirSpelling, llvm::StringRef Rel) {
 
   Out.append(Rel.data(), Rel.size());
   return Out;
+}
+
+static bool canPrefixSysroot(llvm::StringRef Path) {
+#if defined(_WIN32)
+  return !Path.empty() && llvm::sys::path::is_separator(Path.front());
+#else
+  return llvm::sys::path::is_absolute(Path);
+#endif
+}
+
+static std::string includeKindForHeaderSearchGroup(
+    frontend::IncludeDirGroup Group, bool IsFramework) {
+  if (IsFramework)
+    return "framework";
+
+  switch (Group) {
+  case frontend::Quoted:
+    return "quote_dir";
+  case frontend::Angled:
+    return "user_I";
+  case frontend::System:
+  case frontend::ExternCSystem:
+  case frontend::CSystem:
+  case frontend::CXXSystem:
+  case frontend::ObjCSystem:
+  case frontend::ObjCXXSystem:
+    return "system";
+  case frontend::After:
+    return "idirafter";
+  }
+
+  llvm_unreachable("Unhandled include directory group");
+}
+
+static std::string builtinIncludePathForHeaderSearch(const HeaderSearch &HS) {
+  llvm::StringRef ResourceDir = HS.getHeaderSearchOpts().ResourceDir;
+  if (ResourceDir.empty())
+    return std::string();
+
+  llvm::SmallString<256> Builtin(ResourceDir);
+  llvm::sys::path::append(Builtin, "include");
+  return Builtin.str().str();
+}
+
+static constexpr const char *AmbiguousIncludeDirSentinel =
+    "<refold-ambiguous-include-dir>";
+
+static std::string lookupIncludeDirMapValue(
+    llvm::StringRef Path, llvm::StringRef Cwd,
+    const llvm::StringMap<std::string> &Map) {
+  const std::string Key = normalizePathKey(Path, Cwd, /*IsDir=*/true);
+  if (Key.empty())
+    return std::string();
+
+  auto It = Map.find(Key);
+  if (It == Map.end() || It->second == AmbiguousIncludeDirSentinel)
+    return std::string();
+  return It->second;
+}
+
+static bool includeDirMapValueIsAmbiguous(
+    llvm::StringRef Path, llvm::StringRef Cwd,
+    const llvm::StringMap<std::string> &Map) {
+  const std::string Key = normalizePathKey(Path, Cwd, /*IsDir=*/true);
+  if (Key.empty())
+    return false;
+
+  auto It = Map.find(Key);
+  return It != Map.end() && It->second == AmbiguousIncludeDirSentinel;
+}
+
+static const DirectoryLookup *searchDirByIndex(const HeaderSearch &HS,
+                                               unsigned Index) {
+  if (Index >= HS.search_dir_size())
+    return nullptr;
+  return &*HS.search_dir_nth(Index);
+}
+
+static bool searchDirIndexInRange(const HeaderSearch &HS, unsigned Index,
+                                  ConstSearchDirIterator Begin,
+                                  ConstSearchDirIterator End) {
+  for (ConstSearchDirIterator It = Begin; It != End; ++It)
+    if (HS.searchDirIdx(*It) == Index)
+      return true;
+  return false;
+}
+
+static std::string includeSearchEntryKind(
+    const HeaderSearch &HS, unsigned Index, llvm::StringRef Cwd,
+    const llvm::StringMap<std::string> &IncludeDirAbs2Kind) {
+  const DirectoryLookup *DL = searchDirByIndex(HS, Index);
+  if (!DL)
+    return "unknown";
+  if (DL->isHeaderMap())
+    return "unknown";
+
+  if (includeDirMapValueIsAmbiguous(DL->getName(), Cwd, IncludeDirAbs2Kind))
+    return "unknown";
+  if (const std::string KnownKind =
+          lookupIncludeDirMapValue(DL->getName(), Cwd, IncludeDirAbs2Kind);
+      !KnownKind.empty())
+    return KnownKind;
+
+  if (DL->isFramework())
+    return "framework";
+  if (searchDirIndexInRange(HS, Index, HS.quoted_dir_begin(),
+                            HS.quoted_dir_end()))
+    return "quote_dir";
+  if (searchDirIndexInRange(HS, Index, HS.angled_dir_begin(),
+                            HS.system_dir_begin()))
+    return "user_I";
+
+  // HeaderSearch exposes the system tail as one range.  User-provided
+  // -idirafter entries are recovered above from HeaderSearchOptions when the
+  // mapping is unique; builtin/resource includes are recognized here.  Any
+  // other entry in the public system range is the effective Clang system search
+  // class for the current invocation.
+  if (searchDirIndexInRange(HS, Index, HS.system_dir_begin(),
+                            HS.system_dir_end())) {
+    const std::string BuiltinPath = builtinIncludePathForHeaderSearch(HS);
+    if (!BuiltinPath.empty() &&
+        normalizePathKey(DL->getName(), Cwd, /*IsDir=*/true) ==
+            normalizePathKey(BuiltinPath, Cwd, /*IsDir=*/true))
+      return "builtin";
+    return "system";
+  }
+
+  return "unknown";
+}
+
+static std::string includeSearchEntrySpelling(
+    const DirectoryLookup &DL, llvm::StringRef Cwd,
+    const llvm::StringMap<std::string> &IncludeDirAbs2Spelling) {
+  if (const std::string Spelling =
+          lookupIncludeDirMapValue(DL.getName(), Cwd, IncludeDirAbs2Spelling);
+      !Spelling.empty())
+    return Spelling;
+  return DL.getName().str();
+}
+
+static std::string includeSearchEntryPath(const DirectoryLookup &DL,
+                                          llvm::StringRef Cwd) {
+  return normalizePathKey(DL.getName(), Cwd,
+                          /*IsDir=*/DL.isNormalDir() || DL.isFramework());
+}
+
+static std::string
+    directorySpellingForFileSpelling(llvm::StringRef FileSpelling) {
+  if (FileSpelling.empty())
+    return std::string();
+  if (FileSpelling.starts_with("<"))
+    return std::string();
+
+  llvm::StringRef Parent = llvm::sys::path::parent_path(FileSpelling);
+  if (Parent.empty())
+    return ".";
+  return Parent.str();
+}
+
+static std::string
+    directorySpellingForAbsoluteOperand(llvm::StringRef Operand) {
+  if (Operand.empty())
+    return std::string();
+
+  llvm::StringRef Parent = llvm::sys::path::parent_path(Operand);
+  if (Parent.empty())
+    return std::string();
+  return Parent.str();
+}
+
+static std::optional<std::string> containingFileDirectorySpelling(
+    const std::vector<Item> &Items,
+    std::optional<uint64_t> OwnerIncludeId, llvm::StringRef TUSourcePath) {
+  llvm::StringRef FileSpelling;
+
+  if (OwnerIncludeId) {
+    if (*OwnerIncludeId >= Items.size())
+      return std::nullopt;
+
+    const Item &Owner = Items[static_cast<size_t>(*OwnerIncludeId)];
+    if (Owner.ID != *OwnerIncludeId || Owner.Kind != IK_Directive ||
+        (Owner.Subkind != "#include" && Owner.Subkind != "#include_next"))
+      return std::nullopt;
+
+    if (!Owner.EnteredFileSpelling.empty())
+      FileSpelling = Owner.EnteredFileSpelling;
+    else
+      return std::nullopt;
+  } else {
+    FileSpelling = TUSourcePath;
+  }
+
+  const std::string DirSpelling =
+      directorySpellingForFileSpelling(FileSpelling);
+  if (DirSpelling.empty())
+    return std::nullopt;
+  return DirSpelling;
+}
+
+static std::string computeEnteredFileNameForPresumedLoc(
+    const Preprocessor &PP, const PresumedLoc &PLoc) {
+  if (!PLoc.isValid())
+    return std::string();
+
+  llvm::SmallString<256> FileName;
+  Preprocessor::processPathToFileName(FileName, PLoc, PP.getLangOpts(),
+                                      PP.getTargetInfo());
+  return FileName.str().str();
 }
 
 // Sanity-check helper: ensure any recorded invocation-argument byte ranges
@@ -1957,34 +2166,74 @@ RefoldMapBuilder::RefoldMapBuilder(Preprocessor &PP, llvm::StringRef OutputPath,
 
   EmitAbsPaths = false; // Prefer spellings; the consumer can resolve via cwd.
 
-  // Parse include search spellings from the driver argv so we can reconstruct
-  // include paths relative to the *spelled* `-I` entries.
-  auto addIncludeDirSpelling = [&](llvm::StringRef DirSpelling) {
-    if (DirSpelling.empty())
+  // Record producer-known include-search directory spellings and classes from
+  // HeaderSearchOptions. HeaderSearch itself is the authority for effective
+  // order; these maps are only used to annotate each public search-directory
+  // entry with the user spelling/group when that mapping is unique. Ambiguous
+  // normalized directory keys are marked with a private sentinel and ignored by
+  // lookup helpers instead of guessed.
+  auto recordUniqueIncludeDirValue = [](llvm::StringMap<std::string> &Map,
+                                        llvm::StringRef Key,
+                                        llvm::StringRef Value) {
+    if (Key.empty() || Value.empty())
       return;
 
-    std::string AbsKey = normalizePathKey(DirSpelling, Cwd, /*IsDir=*/true);
-    if (!AbsKey.empty() &&
-        IncludeDirAbs2Spelling.find(AbsKey) == IncludeDirAbs2Spelling.end()) {
-      IncludeDirAbs2Spelling[AbsKey] = DirSpelling.str();
+    const std::string ValueStr = Value.str();
+    auto It = Map.find(Key);
+    if (It == Map.end()) {
+      Map[Key] = ValueStr;
+      return;
     }
+    if (It->second != ValueStr)
+      It->second = std::string(AmbiguousIncludeDirSentinel);
+  };
+
+  auto addIncludeDirMetadata = [&](llvm::StringRef LookupPath,
+                                   llvm::StringRef Spelling,
+                                   llvm::StringRef Kind) {
+    const std::string AbsKey =
+        normalizePathKey(LookupPath, Cwd, /*IsDir=*/true);
+    recordUniqueIncludeDirValue(IncludeDirAbs2Spelling, AbsKey, Spelling);
+    recordUniqueIncludeDirValue(IncludeDirAbs2Kind, AbsKey, Kind);
+  };
+
+  const HeaderSearchOptions &HSOpts =
+      PP.getHeaderSearchInfo().getHeaderSearchOpts();
+  for (const HeaderSearchOptions::Entry &Entry : HSOpts.UserEntries) {
+    const std::string Kind =
+        includeKindForHeaderSearchGroup(Entry.Group, Entry.IsFramework);
+    addIncludeDirMetadata(Entry.Path, Entry.Path, Kind);
+
+    // Mirror InitHeaderSearch::AddPath sysroot remapping for absolute include
+    // paths when the entry did not opt out. The mapped path is the effective
+    // HeaderSearch entry spelling in this case, so use it for both lookup and
+    // chain-spelling annotation.
+    if (!Entry.IgnoreSysRoot && !HSOpts.Sysroot.empty() &&
+        HSOpts.Sysroot != "/" && canPrefixSysroot(Entry.Path)) {
+      const std::string Mapped = HSOpts.Sysroot + Entry.Path;
+      addIncludeDirMetadata(Mapped, Mapped, Kind);
+    }
+  }
+
+  // Keep a small legacy fallback for older invocations whose RefoldPPArgv was
+  // populated but whose HeaderSearchOptions user-entry list is unavailable or
+  // incomplete. This fallback only records -I spellings; public HeaderSearch
+  // range checks still provide the user_I kind.
+  auto addLegacyIncludeDirSpelling = [&](llvm::StringRef DirSpelling) {
+    const std::string AbsKey =
+        normalizePathKey(DirSpelling, Cwd, /*IsDir=*/true);
+    recordUniqueIncludeDirValue(IncludeDirAbs2Spelling, AbsKey, DirSpelling);
   };
 
   for (size_t i = 0; i < PPO.RefoldPPArgv.size(); ++i) {
     llvm::StringRef A(PPO.RefoldPPArgv[i]);
-
-    // Separate include-dir form: `-I <dir>`. Consume the following argv element
-    // as the spelled directory and record only that directory text.
     if (A == "-I") {
       if (i + 1 < PPO.RefoldPPArgv.size())
-        addIncludeDirSpelling(PPO.RefoldPPArgv[++i]);
+        addLegacyIncludeDirSpelling(PPO.RefoldPPArgv[++i]);
       continue;
     }
-
-    // Joined include-dir form: `-I<dir>`. Strip the `-I` prefix and record the
-    // remaining spelling as the include-search directory text.
     if (A.starts_with("-I") && A.size() > 2) {
-      addIncludeDirSpelling(A.drop_front(2));
+      addLegacyIncludeDirSpelling(A.drop_front(2));
       continue;
     }
   }
@@ -2262,7 +2511,8 @@ std::optional<uint32_t> RefoldMapBuilder::argIndexForSpellingLoc(
 void RefoldMapBuilder::onIncludeDirective(
     SourceLocation HashLoc, const Token &IncludeTok, StringRef FileName,
     bool IsAngled, CharSourceRange FilenameRange, OptionalFileEntryRef File,
-    StringRef SearchPath, StringRef RelativePath) {
+    StringRef SearchPath, StringRef RelativePath,
+    const IncludeLookupProvenance &LookupProvenance) {
   if (!enabled())
     return;
 
@@ -2302,13 +2552,10 @@ void RefoldMapBuilder::onIncludeDirective(
   }
   It.SitePath = filePathForLocAbs(SM, HashLoc, EmitAbsPaths);
 
-  // Producer-observed entered-file spelling, when available.  The JSON field
-  // is historically named `resolved_path`, but with EmitAbsPaths == false it is
-  // intentionally the spelling Clang associates with the included file (the
-  // value observed by __FILE__ inside that header), not a canonical identity
-  // path.  Do not add a duplicate entered-file spelling field while this
-  // spelling-preserving contract remains in force; if EmitAbsPaths is ever
-  // enabled, split spelling and physical identity into distinct schema fields.
+  // Producer-owned include identity/spelling data, when available.
+  // `resolved_path` is retained only as a legacy spelling-preserving alias.
+  // New maps also emit `opened_path` and `entered_file_spelling`, which are the
+  // authoritative fields for physical identity and filename-observer proofs.
   if (File) {
     const std::string Abs = absolutePathFor(*File);
 
@@ -2329,12 +2576,14 @@ void RefoldMapBuilder::onIncludeDirective(
       Spelled = std::string(File->getName());
     }
 
-    // JSON carries include file spellings by default.  `resolved_path` is a
-    // historical name: in the default mode it is the producer-observed entered
-    // spelling, not a canonical physical path.  Absolute emission is retained
-    // only as an explicit opt-in and would require a schema split before being
-    // used by clang-refold proofs that care about both identity and spelling.
-    It.ResolvedPath = EmitAbsPaths ? Abs : Spelled;
+    // Preserve the old spelling-oriented `resolved_path` contract for legacy
+    // consumers.  New consumers must use `opened_path` for physical identity
+    // and `entered_file_spelling` for __FILE__/__FILE_NAME__ observer proof;
+    // do not let the global EmitAbsPaths mode repurpose this legacy field into
+    // a physical-path proof source.
+    It.ResolvedPath = Spelled;
+    It.OpenedPath = Abs;
+    It.EnteredFileSpelling = Spelled;
 
     // Seed abs->spelling mapping for later __FILE__/__LINE__-style emission.
     if (!Abs.empty() && !Spelled.empty())
@@ -2345,6 +2594,132 @@ void RefoldMapBuilder::onIncludeDirective(
   if (!IncludeStack.empty() && IncludeStack.back())
     Items.back().OwnerIncludeId = static_cast<uint64_t>(*IncludeStack.back());
   size_t ThisIdx = Items.size() - 1;
+
+  auto setLookupUnknown = [&] {
+    if (Items[ThisIdx].LookupKind.empty())
+      Items[ThisIdx].LookupKind = "unknown";
+  };
+
+  auto setAbsoluteOperandLookup = [&]() -> bool {
+    if (!File || !llvm::sys::path::is_absolute(FileName))
+      return false;
+
+    const std::string DirSpelling =
+        directorySpellingForAbsoluteOperand(FileName);
+    if (DirSpelling.empty())
+      return false;
+
+    Items[ThisIdx].LookupKind = "absolute_operand";
+    Items[ThisIdx].LookupDirectorySpelling = DirSpelling;
+    Items[ThisIdx].LookupDirectoryPath =
+        normalizePathKey(File->getDir().getName(), Cwd, /*IsDir=*/true);
+    return true;
+  };
+
+  auto setSourceRelativeLookupIfProven = [&]() -> bool {
+    if (!File || IsAngled || FileName.empty() ||
+        llvm::sys::path::is_absolute(FileName))
+      return false;
+
+    SourceLocation SiteFileLoc = SM.getFileLoc(HashLoc);
+    if (!SiteFileLoc.isValid())
+      return false;
+
+    FileID SiteFID = SM.getFileID(SiteFileLoc);
+    OptionalFileEntryRef SiteFER = SM.getFileEntryRefForID(SiteFID);
+    if (!SiteFER)
+      return false;
+
+    const std::string SiteDirPath =
+        normalizePathKey(SiteFER->getDir().getName(), Cwd, /*IsDir=*/true);
+    if (SiteDirPath.empty())
+      return false;
+
+    if (!SearchPath.empty() &&
+        normalizePathKey(SearchPath, Cwd, /*IsDir=*/true) != SiteDirPath)
+      return false;
+
+    llvm::SmallString<256> SourceRelativeCandidate(SiteDirPath);
+    llvm::sys::path::append(SourceRelativeCandidate, FileName);
+    const std::string CandidatePath =
+        normalizePathKey(SourceRelativeCandidate, Cwd, /*IsDir=*/false);
+    if (CandidatePath.empty() || CandidatePath != Items[ThisIdx].OpenedPath)
+      return false;
+
+    const std::optional<std::string> SiteDirSpelling =
+        containingFileDirectorySpelling(Items, Items[ThisIdx].OwnerIncludeId,
+                                        TUSourcePath);
+    if (!SiteDirSpelling || SiteDirSpelling->empty())
+      return false;
+
+    Items[ThisIdx].LookupKind = "source_relative";
+    Items[ThisIdx].LookupDirectorySpelling = *SiteDirSpelling;
+    Items[ThisIdx].LookupDirectoryPath = SiteDirPath;
+    return true;
+  };
+
+  HeaderSearch &HS = PP.getHeaderSearchInfo();
+  if (File) {
+    if (LookupProvenance.CurSearchDirIndex) {
+      const unsigned Index = *LookupProvenance.CurSearchDirIndex;
+      if (const DirectoryLookup *DL = searchDirByIndex(HS, Index)) {
+        const std::string Kind =
+            includeSearchEntryKind(HS, Index, Cwd, IncludeDirAbs2Kind);
+        Items[ThisIdx].LookupKind = Kind;
+        if (Kind != "unknown") {
+          Items[ThisIdx].LookupSearchChainIndex = Index;
+          Items[ThisIdx].LookupDirectorySpelling =
+              includeSearchEntrySpelling(*DL, Cwd, IncludeDirAbs2Spelling);
+          Items[ThisIdx].LookupDirectoryPath = includeSearchEntryPath(*DL, Cwd);
+        }
+      } else {
+        setLookupUnknown();
+      }
+    } else if (!setAbsoluteOperandLookup() &&
+               !setSourceRelativeLookupIfProven()) {
+      setLookupUnknown();
+    }
+
+    if (IsIncludeNext) {
+      // A #include_next proof is useful to the consumer only when the producer
+      // can represent the complete search-chain cursor relationship:
+      //
+      //   containing include selected chain index K
+      //   #include_next resumed at K + 1
+      //   selected target was found at some represented index >= K + 1
+      //
+      // If any of those facts is absent or incoherent, emit explicit unknown
+      // provenance so the consumer fails closed instead of guessing from
+      // physical file identity.
+      Items[ThisIdx].IncludeNextProvenanceKnown = false;
+
+      if (Items[ThisIdx].OwnerIncludeId &&
+          *Items[ThisIdx].OwnerIncludeId < Items.size() &&
+          LookupProvenance.FromSearchDirIndex &&
+          Items[ThisIdx].LookupSearchChainIndex) {
+        const Item &Owner =
+            Items[static_cast<size_t>(*Items[ThisIdx].OwnerIncludeId)];
+        const unsigned ResumeIndex = *LookupProvenance.FromSearchDirIndex;
+        const unsigned SelectedIndex = *Items[ThisIdx].LookupSearchChainIndex;
+
+        if (Owner.ID == *Items[ThisIdx].OwnerIncludeId &&
+            Owner.Kind == IK_Directive &&
+            (Owner.Subkind == "#include" ||
+             Owner.Subkind == "#include_next") &&
+            Owner.LookupSearchChainIndex &&
+            ResumeIndex > *Owner.LookupSearchChainIndex &&
+            ResumeIndex - *Owner.LookupSearchChainIndex == 1 &&
+            ResumeIndex <= SelectedIndex) {
+          Items[ThisIdx].IncludeNextProvenanceKnown = true;
+          Items[ThisIdx].IncludeNextContainingFileIncludeId =
+              Items[ThisIdx].OwnerIncludeId;
+          Items[ThisIdx].IncludeNextResumeSearchChainIndex = ResumeIndex;
+        }
+      }
+    }
+  } else {
+    setLookupUnknown();
+  }
 
   // Remember multiple anchors for robustness.
   IncludeKey2Item[keyForLoc(SM, HashLoc)] = ThisIdx;
@@ -3099,7 +3474,8 @@ void RefoldMapBuilder::onPragma(SourceLocation HashLoc, StringRef FullText) {
     Items.back().OwnerIncludeId = static_cast<uint64_t>(*IncludeStack.back());
 }
 
-void RefoldMapBuilder::onEnterFile(SourceLocation IncludeLoc) {
+void RefoldMapBuilder::onEnterFile(SourceLocation IncludeLoc,
+                                   SourceLocation EnterLoc) {
   if (!enabled())
     return;
 
@@ -3108,6 +3484,33 @@ void RefoldMapBuilder::onEnterFile(SourceLocation IncludeLoc) {
     auto It = IncludeKey2Item.find(keyForLoc(SM, IncludeLoc));
     if (It != IncludeKey2Item.end())
       Idx = It->second;
+  }
+
+  if (Idx && EnterLoc.isValid()) {
+    // The IncludeDirective callback provides SearchPath/RelativePath, which is
+    // useful but still reconstructed.  Once Clang actually enters the file,
+    // SourceManager owns the presumed filename that builtin __FILE__ observes
+    // at the start of this include instance.  Prefer that exact value for the
+    // new spelling field and keep legacy resolved_path as the same
+    // spelling-preserving alias.
+    PresumedLoc PLoc = SM.getPresumedLoc(EnterLoc);
+    if (PLoc.isValid() && PLoc.getFilename() && PLoc.getFilename()[0] != '\0') {
+      std::string EnteredSpelling = PLoc.getFilename();
+      Items[*Idx].EnteredFileSpelling = EnteredSpelling;
+      Items[*Idx].ResolvedPath = EnteredSpelling;
+
+      // Record the exact unescaped payload Clang would use for __FILE_NAME__
+      // at the start of this include instance.  Use Clang's own helper instead
+      // of deriving a basename in clang-refold, so target path separator and
+      // -fmacro-prefix-map / related path remapping semantics stay identical
+      // to builtin macro expansion.  Later #line events remain represented by
+      // line_controls rather than this include-entry field.
+      Items[*Idx].EnteredFileName =
+          computeEnteredFileNameForPresumedLoc(PP, PLoc);
+
+      if (!Items[*Idx].OpenedPath.empty())
+        FileAbs2Spelling[Items[*Idx].OpenedPath] = std::move(EnteredSpelling);
+    }
   }
 
   // Set parent relationship: the include we are about to enter is
@@ -4093,6 +4496,21 @@ void RefoldMapBuilder::writeJSON() {
           JO.value(Arg);
       });
       JO.attribute("lang", LangStr);
+      JO.attributeArray("include_search_chain", [&] {
+        const HeaderSearch &HS = PP.getHeaderSearchInfo();
+        for (ConstSearchDirIterator It = HS.search_dir_begin();
+             It != HS.search_dir_end(); ++It) {
+          const unsigned Index = HS.searchDirIdx(*It);
+          JO.object([&] {
+            JO.attribute("index", Index);
+            JO.attribute("kind", includeSearchEntryKind(HS, Index, CwdStr,
+                                                         IncludeDirAbs2Kind));
+            JO.attribute("spelling", includeSearchEntrySpelling(
+                                         *It, CwdStr, IncludeDirAbs2Spelling));
+            JO.attribute("path", includeSearchEntryPath(*It, CwdStr));
+          });
+        }
+      });
     });
 
     JO.attribute("source", TUSourcePath);
@@ -5151,9 +5569,10 @@ void RefoldMapBuilder::writeJSON() {
                       JO.attribute("kind", D.Kind);
                       JO.attribute("name", D.Name);
                       JO.attributeObject("header_span", [&] {
-                        // Header file path is implied by the include's
-                        // resolved_path. Omitting it here significantly reduces
-                        // map size for large headers.
+                        // Header file path is implied by the enclosing include:
+                        // opened_path in the new schema, otherwise legacy
+                        // resolved_path. Omitting it here significantly
+                        // reduces map size for large headers.
                         JO.attribute("b", D.HeaderB);
                         JO.attribute("e", D.HeaderE);
                       });
@@ -5173,6 +5592,40 @@ void RefoldMapBuilder::writeJSON() {
             JO.attribute("target", It.TargetAsWritten); // can't be empty
             if (!It.ResolvedPath.empty())
               JO.attribute("resolved_path", It.ResolvedPath);
+            if (!It.OpenedPath.empty())
+              JO.attribute("opened_path", It.OpenedPath);
+            if (!It.EnteredFileSpelling.empty())
+              JO.attribute("entered_file_spelling", It.EnteredFileSpelling);
+            if (!It.EnteredFileName.empty())
+              JO.attribute("entered_file_name", It.EnteredFileName);
+            if (!It.LookupKind.empty()) {
+              JO.attributeObject("lookup", [&] {
+                JO.attribute("kind", It.LookupKind);
+                if (It.LookupKind != "unknown") {
+                  if (It.LookupSearchChainIndex)
+                    JO.attribute("search_chain_index",
+                                 *It.LookupSearchChainIndex);
+                  if (!It.LookupDirectorySpelling.empty())
+                    JO.attribute("directory_spelling",
+                                 It.LookupDirectorySpelling);
+                  if (!It.LookupDirectoryPath.empty())
+                    JO.attribute("directory_path", It.LookupDirectoryPath);
+                }
+              });
+            }
+            if (It.Subkind == "#include_next") {
+              JO.attributeObject("include_next", [&] {
+                JO.attribute("provenance",
+                             It.IncludeNextProvenanceKnown ? "known"
+                                                           : "unknown");
+                if (It.IncludeNextProvenanceKnown) {
+                  JO.attribute("containing_file_include_id",
+                               *It.IncludeNextContainingFileIncludeId);
+                  JO.attribute("resume_search_chain_index",
+                               *It.IncludeNextResumeSearchChainIndex);
+                }
+              });
+            }
             JO.attribute("angled", It.IsAngled);
             if (It.Parent)
               JO.attribute("parent", *It.Parent);
@@ -5182,8 +5635,8 @@ void RefoldMapBuilder::writeJSON() {
           // to the include occurrence that was active when the item was seen.
           //
           // Pragmas are included here even though they have no ordinary
-          // PP-token spans: Phase-7 zero-token state-gap proofs need the
-          // concrete include instance to distinguish repeated inclusions of the
+          // PP-token spans: zero-token state-gap proofs need the concrete
+          // include instance to distinguish repeated inclusions of the
           // same physical header.  Without this id, the consumer would have to
           // fall back to path+byte matching and conservatively reject
           // repeated-header gaps.

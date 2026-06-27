@@ -23,6 +23,7 @@
 #include "RefoldLog.h"
 #include "RefoldModel.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
@@ -238,6 +239,325 @@ readUint64Array(const json::Object &parent, StringRef field) {
   }
   return out;
 }
+
+Expected<IncludeLookupKind> parseIncludeLookupKind(StringRef name,
+                                                   StringRef ctx) {
+  if (name == "source_relative")
+    return IncludeLookupKind::SourceRelative;
+  if (name == "quote_dir")
+    return IncludeLookupKind::QuoteDir;
+  if (name == "user_I")
+    return IncludeLookupKind::UserI;
+  if (name == "system")
+    return IncludeLookupKind::System;
+  if (name == "idirafter")
+    return IncludeLookupKind::IdirAfter;
+  if (name == "framework")
+    return IncludeLookupKind::Framework;
+  if (name == "builtin")
+    return IncludeLookupKind::Builtin;
+  if (name == "absolute_operand")
+    return IncludeLookupKind::AbsoluteOperand;
+  if (name == "unknown")
+    return IncludeLookupKind::Unknown;
+  return createStringError(inconvertibleErrorCode(),
+                           "Invalid include lookup kind '%s' at %s",
+                           name.str().c_str(), ctx.str().c_str());
+}
+
+Expected<RefoldModel::IncludeSearchEntry>
+parseIncludeSearchEntry(const json::Object &obj, uint32_t expectedIndex,
+                        StringRef ctx) {
+  RefoldModel::IncludeSearchEntry entry;
+
+  auto indexOrErr = applyToField(asUInt32, obj, "index", ctx);
+  if (!indexOrErr)
+    return indexOrErr.takeError();
+  entry.index = *indexOrErr;
+  if (entry.index != expectedIndex)
+    return createStringError(
+        inconvertibleErrorCode(),
+        "Non-dense include_search_chain index at %s: expected %u, got %u",
+        ctx.str().c_str(), expectedIndex, entry.index);
+
+  auto kindOrErr = applyToField(asString, obj, "kind", ctx);
+  if (!kindOrErr)
+    return kindOrErr.takeError();
+  auto parsedKind = parseIncludeLookupKind(*kindOrErr, ctx);
+  if (!parsedKind)
+    return parsedKind.takeError();
+  entry.kind = *parsedKind;
+  if (!isSearchChainIncludeLookupKind(entry.kind) &&
+      entry.kind != IncludeLookupKind::Unknown)
+    return createStringError(
+        inconvertibleErrorCode(),
+        "Invalid per-edge include lookup kind '%s' in include_search_chain at %s",
+        kindOrErr->str().c_str(), ctx.str().c_str());
+
+  auto spellingOrErr = applyToField(asString, obj, "spelling", ctx);
+  if (!spellingOrErr)
+    return spellingOrErr.takeError();
+  entry.spelling = *spellingOrErr;
+
+  auto pathOrErr = applyToField(asString, obj, "path", ctx);
+  if (!pathOrErr)
+    return pathOrErr.takeError();
+  entry.path = *pathOrErr;
+
+  return entry;
+}
+
+Expected<std::optional<RefoldModel::IncludeLookupProvenance>>
+parseOptionalIncludeLookupProvenance(
+    const json::Object &obj, StringRef fieldName, StringRef ctx,
+    ArrayRef<RefoldModel::IncludeSearchEntry> includeSearchChain) {
+  const json::Value *lookupVal = obj.get(fieldName);
+  if (!lookupVal)
+    return std::optional<RefoldModel::IncludeLookupProvenance>();
+  if (lookupVal->getAsNull())
+    return createStringError(inconvertibleErrorCode(),
+                             "Unexpected null include lookup at %s.%s",
+                             ctx.str().c_str(), fieldName.str().c_str());
+
+  auto lookupObjOrErr =
+      asObject(*lookupVal, (Twine(ctx) + "." + fieldName).str());
+  if (!lookupObjOrErr)
+    return lookupObjOrErr.takeError();
+  const json::Object &lookupObj = **lookupObjOrErr;
+
+  auto kindStrOrErr =
+      applyToField(asString, lookupObj, "kind", (Twine(ctx) + ".lookup").str());
+  if (!kindStrOrErr)
+    return kindStrOrErr.takeError();
+  auto kindOrErr = parseIncludeLookupKind(
+      *kindStrOrErr, (Twine(ctx) + ".lookup.kind").str());
+  if (!kindOrErr)
+    return kindOrErr.takeError();
+
+  RefoldModel::IncludeLookupProvenance lookup;
+  lookup.kind = *kindOrErr;
+  lookup.searchChainIndex = asOptUInt32(lookupObj, "search_chain_index");
+  lookup.directorySpelling = asOptString(lookupObj, "directory_spelling");
+  lookup.directoryPath = asOptString(lookupObj, "directory_path");
+
+  if (isSearchChainIncludeLookupKind(lookup.kind)) {
+    if (!lookup.searchChainIndex || !lookup.directorySpelling ||
+        !lookup.directoryPath)
+      return createStringError(
+          inconvertibleErrorCode(),
+          "%s.lookup search-chain kind '%s' requires search_chain_index, "
+          "directory_spelling, and directory_path",
+          ctx.str().c_str(), toString(lookup.kind).str().c_str());
+    if (!includeSearchChain.empty()) {
+      if (*lookup.searchChainIndex >= includeSearchChain.size())
+        return createStringError(
+            inconvertibleErrorCode(),
+            "%s.lookup.search_chain_index %u is outside "
+            "pp_ctx.include_search_chain",
+            ctx.str().c_str(), *lookup.searchChainIndex);
+      const auto &entry = includeSearchChain[*lookup.searchChainIndex];
+      if (entry.kind != lookup.kind)
+        return createStringError(
+            inconvertibleErrorCode(),
+            "%s.lookup kind '%s' disagrees with include_search_chain[%u] "
+            "kind '%s'",
+            ctx.str().c_str(), toString(lookup.kind).str().c_str(),
+            *lookup.searchChainIndex, toString(entry.kind).str().c_str());
+    }
+  } else if (isPerEdgeIncludeLookupKind(lookup.kind)) {
+    if (lookup.searchChainIndex)
+      return createStringError(
+          inconvertibleErrorCode(),
+          "%s.lookup per-edge kind '%s' must not carry search_chain_index",
+          ctx.str().c_str(), toString(lookup.kind).str().c_str());
+    if (!lookup.directorySpelling || !lookup.directoryPath)
+      return createStringError(
+          inconvertibleErrorCode(),
+          "%s.lookup per-edge kind '%s' requires directory_spelling and "
+          "directory_path",
+          ctx.str().c_str(), toString(lookup.kind).str().c_str());
+  } else {
+    assert(lookup.kind == IncludeLookupKind::Unknown &&
+           "unhandled include lookup kind");
+    if (lookup.searchChainIndex || lookup.directorySpelling ||
+        lookup.directoryPath)
+      return createStringError(
+          inconvertibleErrorCode(),
+          "%s.lookup unknown provenance must not carry directory/cursor fields",
+          ctx.str().c_str());
+  }
+
+  return std::optional<RefoldModel::IncludeLookupProvenance>(std::move(lookup));
+}
+
+Expected<std::optional<RefoldModel::IncludeNextProvenance>>
+parseOptionalIncludeNextProvenance(
+    const json::Object &obj, StringRef subkind, StringRef ctx,
+    ArrayRef<RefoldModel::IncludeSearchEntry> includeSearchChain) {
+  const json::Value *nextVal = obj.get("include_next");
+  if (!nextVal)
+    return std::optional<RefoldModel::IncludeNextProvenance>();
+  if (subkind != "#include_next")
+    return createStringError(
+        inconvertibleErrorCode(),
+        "%s carries include_next provenance but subkind is '%s'",
+        ctx.str().c_str(), subkind.str().c_str());
+  if (nextVal->getAsNull())
+    return createStringError(inconvertibleErrorCode(),
+                             "Unexpected null include_next provenance at %s",
+                             ctx.str().c_str());
+
+  auto nextObjOrErr = asObject(*nextVal, (Twine(ctx) + ".include_next").str());
+  if (!nextObjOrErr)
+    return nextObjOrErr.takeError();
+  const json::Object &nextObj = **nextObjOrErr;
+
+  auto provenanceOrErr =
+      applyToField(asString, nextObj, "provenance",
+                   (Twine(ctx) + ".include_next").str());
+  if (!provenanceOrErr)
+    return provenanceOrErr.takeError();
+
+  RefoldModel::IncludeNextProvenance provenance;
+  if (*provenanceOrErr == "known") {
+    provenance.known = true;
+    auto containingOrErr = applyToField(
+        asUInt64, nextObj, "containing_file_include_id",
+        (Twine(ctx) + ".include_next").str());
+    if (!containingOrErr)
+      return containingOrErr.takeError();
+    provenance.containingFileIncludeId = *containingOrErr;
+
+    auto resumeOrErr = applyToField(
+        asUInt32, nextObj, "resume_search_chain_index",
+        (Twine(ctx) + ".include_next").str());
+    if (!resumeOrErr)
+      return resumeOrErr.takeError();
+    provenance.resumeSearchChainIndex = *resumeOrErr;
+
+    if (!includeSearchChain.empty() &&
+        *provenance.resumeSearchChainIndex >= includeSearchChain.size())
+      return createStringError(
+          inconvertibleErrorCode(),
+          "%s.include_next.resume_search_chain_index %u is outside "
+          "pp_ctx.include_search_chain",
+          ctx.str().c_str(), *provenance.resumeSearchChainIndex);
+  } else if (*provenanceOrErr == "unknown") {
+    provenance.known = false;
+    if (nextObj.get("containing_file_include_id") ||
+        nextObj.get("resume_search_chain_index"))
+      return createStringError(
+          inconvertibleErrorCode(),
+          "%s.include_next unknown provenance must not carry cursor fields",
+          ctx.str().c_str());
+  } else {
+    return createStringError(inconvertibleErrorCode(),
+                             "Invalid include_next provenance '%s' at %s",
+                             provenanceOrErr->str().c_str(),
+                             ctx.str().c_str());
+  }
+
+  return std::optional<RefoldModel::IncludeNextProvenance>(
+      std::move(provenance));
+}
+
+static Error validateIncludeMetadataAudit(const RefoldModel &model) {
+  DenseMap<uint64_t, const RefoldModel::IncludeItem *> includeById;
+  for (const RefoldModel::IncludeItem &include : model.GetIncludes()) {
+    auto inserted = includeById.try_emplace(include.id, &include);
+    if (!inserted.second)
+      return createStringError(inconvertibleErrorCode(),
+                               "Duplicate include item id %llu",
+                               static_cast<unsigned long long>(include.id));
+
+    if (include.enteredFileName && !include.enteredFileSpelling)
+      return createStringError(
+          inconvertibleErrorCode(),
+          "include item %llu carries entered_file_name without "
+          "entered_file_spelling",
+          static_cast<unsigned long long>(include.id));
+
+    if (!include.lookup)
+      continue;
+
+    const IncludeLookupKind kind = include.lookup->kind;
+    if (isSearchChainIncludeLookupKind(kind)) {
+      if (model.GetIncludeSearchChain().empty())
+        return createStringError(
+            inconvertibleErrorCode(),
+            "include item %llu has search-chain lookup kind '%s' but "
+            "pp_ctx.include_search_chain is absent or empty",
+            static_cast<unsigned long long>(include.id),
+            toString(kind).str().c_str());
+      // parseOptionalIncludeLookupProvenance has already checked field
+      // presence, index range, and kind equality against the search-chain
+      // entry.  Keep this cross-entry audit here so the producer metadata
+      // contract remains enforced after model construction.
+      assert(include.lookup->searchChainIndex &&
+             "search-chain lookup parsed without an index");
+    }
+  }
+
+  for (const RefoldModel::IncludeItem &include : model.GetIncludes()) {
+    if (include.subkind != "#include_next" || !include.includeNext ||
+        !include.includeNext->known)
+      continue;
+
+    if (model.GetIncludeSearchChain().empty())
+      return createStringError(
+          inconvertibleErrorCode(),
+          "#include_next item %llu has known provenance but no "
+          "pp_ctx.include_search_chain",
+          static_cast<unsigned long long>(include.id));
+
+    if (!include.lookup || !include.lookup->searchChainIndex)
+      return createStringError(
+          inconvertibleErrorCode(),
+          "#include_next item %llu has known provenance but its selected "
+          "target lookup has no search_chain_index",
+          static_cast<unsigned long long>(include.id));
+
+    const unsigned selectedIndex = *include.lookup->searchChainIndex;
+    const unsigned resumeIndex = *include.includeNext->resumeSearchChainIndex;
+    if (selectedIndex < resumeIndex)
+      return createStringError(
+          inconvertibleErrorCode(),
+          "#include_next item %llu selected search_chain_index %u before "
+          "resume_search_chain_index %u",
+          static_cast<unsigned long long>(include.id), selectedIndex,
+          resumeIndex);
+
+    const uint64_t containingId = *include.includeNext->containingFileIncludeId;
+    auto ownerIt = includeById.find(containingId);
+    if (ownerIt == includeById.end())
+      return createStringError(
+          inconvertibleErrorCode(),
+          "#include_next item %llu references missing containing include "
+          "item %llu",
+          static_cast<unsigned long long>(include.id),
+          static_cast<unsigned long long>(containingId));
+
+    const RefoldModel::IncludeItem &owner = *ownerIt->second;
+    if (!owner.lookup || !owner.lookup->searchChainIndex)
+      return createStringError(
+          inconvertibleErrorCode(),
+          "#include_next item %llu has known provenance but containing "
+          "include item %llu has no search_chain_index",
+          static_cast<unsigned long long>(include.id),
+          static_cast<unsigned long long>(containingId));
+
+    const unsigned containingIndex = *owner.lookup->searchChainIndex;
+    if (resumeIndex != containingIndex + 1)
+      return createStringError(
+          inconvertibleErrorCode(),
+          "#include_next item %llu resume_search_chain_index %u does not "
+          "immediately follow containing include item %llu selected index %u",
+          static_cast<unsigned long long>(include.id), resumeIndex,
+          static_cast<unsigned long long>(containingId), containingIndex);
+  }
+
+  return Error::success();
+}
 } // namespace
 
 namespace clang {
@@ -396,6 +716,26 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
       if (!argOrErr)
         return argOrErr.takeError();
       model.ppArgv_.push_back(argOrErr->str());
+    }
+  }
+
+  if (const json::Value *chainVal = ppCtxObj.get("include_search_chain")) {
+    auto chainOrErr = asArray(*chainVal, "pp_ctx.include_search_chain");
+    if (!chainOrErr)
+      return chainOrErr.takeError();
+    const json::Array *chainArr = *chainOrErr;
+    model.includeSearchChain_.reserve(chainArr->size());
+    for (std::size_t i = 0; i < chainArr->size(); ++i) {
+      const std::string ctxItem =
+          (Twine("pp_ctx.include_search_chain[") + Twine(i) + "]").str();
+      auto entryObjOrErr = arrayObjElemAt(*chainArr, i, ctxItem);
+      if (!entryObjOrErr)
+        return entryObjOrErr.takeError();
+      auto entryOrErr = parseIncludeSearchEntry(
+          **entryObjOrErr, static_cast<uint32_t>(i), ctxItem);
+      if (!entryOrErr)
+        return entryOrErr.takeError();
+      model.includeSearchChain_.push_back(*entryOrErr);
     }
   }
 
@@ -767,6 +1107,27 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
           // optional
           std::optional<StringRef> resolved =
               asOptString(*obj, "resolved_path");
+          std::optional<StringRef> openedPath =
+              asOptString(*obj, "opened_path");
+          std::optional<StringRef> enteredFileSpelling =
+              asOptString(*obj, "entered_file_spelling");
+          std::optional<StringRef> enteredFileName =
+              asOptString(*obj, "entered_file_name");
+
+          auto lookupOrErr = parseOptionalIncludeLookupProvenance(
+              *obj, "lookup", ctxItem, model.includeSearchChain_);
+          if (!lookupOrErr)
+            return lookupOrErr.takeError();
+          std::optional<IncludeLookupProvenance> lookup =
+              std::move(*lookupOrErr);
+
+          auto includeNextOrErr = parseOptionalIncludeNextProvenance(
+              *obj, skStr, ctxItem, model.includeSearchChain_);
+          if (!includeNextOrErr)
+            return includeNextOrErr.takeError();
+          std::optional<IncludeNextProvenance> includeNext =
+              std::move(*includeNextOrErr);
+
           std::optional<uint64_t> parent = asOptUInt64(*obj, "parent");
 
           std::vector<PPSpan> spans;
@@ -805,20 +1166,23 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
               const json::Object &hsObj = **hsObjOrErr;
 
               // header_span.file is optional; when omitted, the header file is
-              // implied by the enclosing include's resolved_path. This avoids
-              // repeating the same (often long) path string for every decl and
-              // significantly reduces refold map size for large headers.
+              // implied by the enclosing include's new opened_path when
+              // present, otherwise by legacy resolved_path. This avoids
+              // repeating the same path string for every decl while preserving
+              // old-map compatibility.
               std::optional<StringRef> hsFileOpt = asOptString(hsObj, "file");
               StringRef hsFile;
               if (hsFileOpt) {
                 hsFile = *hsFileOpt;
+              } else if (openedPath) {
+                hsFile = *openedPath;
               } else if (resolved) {
                 hsFile = *resolved;
               } else {
                 return createStringError(
                     inconvertibleErrorCode(),
                     "Missing required field 'header_span.file' at %s (and "
-                    "include has no resolved_path)",
+                    "include has neither opened_path nor resolved_path)",
                     headerCtxDecl.c_str());
               }
 
@@ -862,6 +1226,11 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
                           /*siteE*/ siteE,
                           /*target*/ target,
                           /*resolvedPath*/ resolved,
+                          /*openedPath*/ openedPath,
+                          /*enteredFileSpelling*/ enteredFileSpelling,
+                          /*enteredFileName*/ enteredFileName,
+                          /*lookup*/ std::move(lookup),
+                          /*includeNext*/ std::move(includeNext),
                           /*angled*/ angled,
                           /*parent*/ parent,
                           /*spans*/ std::move(spans),
@@ -1773,7 +2142,47 @@ Expected<RefoldModel> RefoldModel::FromJson(const json::Object &root) {
   model.SanitizeMacroCallerGraph();
   model.SanitizeMacroProofArtifacts();
   model.BuildIndicesAndSort();
+  if (Error auditErr = validateIncludeMetadataAudit(model))
+    return std::move(auditErr);
+  model.CompleteIncludeNextDerivedProvenance();
   return model;
+}
+
+void RefoldModel::CompleteIncludeNextDerivedProvenance() {
+  // The producer schema stores #include_next provenance in normalized form:
+  //   * include_next.containing_file_include_id names the containing edge;
+  //   * include_next.resume_search_chain_index stores the resume cursor;
+  //   * this edge's lookup.search_chain_index stores the selected target;
+  //   * the containing edge's lookup.search_chain_index stores the containing
+  //     file's selected search position.
+  //
+  // Include-next replay proofs need all four values together.  Materializing
+  // the two derived indices here avoids repeating id lookups and, more
+  // importantly, preserves the old-map contract: absent or unknown provenance
+  // stays empty and must be handled by the conservative include_next fallback.
+  for (IncludeItem &include : includes_) {
+    if (!include.includeNext)
+      continue;
+
+    include.includeNext->containingFileSearchChainIndex.reset();
+    include.includeNext->selectedSearchChainIndex.reset();
+
+    if (include.subkind != "#include_next" || !include.includeNext->known)
+      continue;
+
+    if (include.lookup)
+      include.includeNext->selectedSearchChainIndex =
+          include.lookup->searchChainIndex;
+
+    if (!include.includeNext->containingFileIncludeId)
+      continue;
+
+    const IncludeItem *containing =
+        GetIncludeById(*include.includeNext->containingFileIncludeId);
+    if (containing && containing->lookup)
+      include.includeNext->containingFileSearchChainIndex =
+          containing->lookup->searchChainIndex;
+  }
 }
 
 void RefoldModel::SanitizeMacroCallerGraph() {
@@ -2241,6 +2650,41 @@ void RefoldModel::BuildIndicesAndSort() {
   includeById_.clear();
   for (const auto &inc : includes_)
     includeById_[inc.id] = &inc;
+
+  for (const auto &inc : includes_) {
+    if (inc.subkind == "#include" && inc.includeNext)
+      REFOLD_LOG_FATAL("model",
+                       "ordinary #include item id={0} carries include_next "
+                       "provenance",
+                       inc.id);
+
+    if (!inc.includeNext || !inc.includeNext->known)
+      continue;
+
+    if (!inc.includeNext->containingFileIncludeId ||
+        !inc.includeNext->resumeSearchChainIndex)
+      REFOLD_LOG_FATAL(
+          "model",
+          "#include_next item id={0} has known provenance without containing "
+          "include id and resume cursor",
+          inc.id);
+
+    if (!includeById_.count(*inc.includeNext->containingFileIncludeId))
+      REFOLD_LOG_FATAL(
+          "model",
+          "#include_next item id={0} references missing containing include "
+          "id={1}",
+          inc.id, *inc.includeNext->containingFileIncludeId);
+
+    if (inc.lookup && inc.lookup->searchChainIndex &&
+        *inc.lookup->searchChainIndex < *inc.includeNext->resumeSearchChainIndex)
+      REFOLD_LOG_FATAL(
+          "model",
+          "#include_next item id={0} selected search-chain index {1} before "
+          "producer resume index {2}",
+          inc.id, *inc.lookup->searchChainIndex,
+          *inc.includeNext->resumeSearchChainIndex);
+  }
 
   // condsByFile / condsByFileByOwner
   condsByFile_.clear();

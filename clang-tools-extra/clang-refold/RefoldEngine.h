@@ -115,6 +115,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -648,12 +649,18 @@ public:
   /// \param bTokOff    Byte offsets for B tokens (size = |B| + 1).
   /// \param noLines    If true, then do not inject #line.
   /// \param strict     If true, then make stringified args significant.
+  /// \param finalOutputPath
+  ///                  Path of the source file that will be emitted to `--out`
+  ///                  and later passed to `--check`. Include replay proofs use
+  ///                  this path, not the producer TU path, as their direct
+  ///                  quoted-lookup surface.
   /// \returns          The refolded, partially expanded C source.
   static Expected<std::string>
   Refold(const json::Object &rootJson, StringRef aSource, ArrayRef<PPTok> aToks,
          ArrayRef<size_t> aTokOff, StringRef bSource, ArrayRef<PPTok> bToks,
          ArrayRef<size_t> bTokOff, bool noLines, bool strict,
          ProofAuditMode proofAuditMode = ProofAuditMode::Default,
+         StringRef finalOutputPath = StringRef(),
          ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits = {},
          std::vector<MaterializedEditMapping> *materializedEditMappings =
              nullptr,
@@ -665,6 +672,24 @@ public:
   static clang::LangOptions MakeLexLangOptions(llvm::StringRef langName);
 
 private:
+  /// Final source location used by include replay proofs.
+  ///
+  /// This models the source file that the driver will write to `--out` and
+  /// subsequently pass to `--check`.  Direct quoted include lookup starts from
+  /// this directory.  It must not silently fall back to the producer TU path:
+  /// the producer source location and the emitted `.c.mod` location can differ,
+  /// and proving an operand from the wrong directory is precisely the class of
+  /// relocation bug this surface prevents.
+  struct FinalReplaySurface {
+    std::filesystem::path OutputPath;
+    std::filesystem::path OutputDirectory;
+    std::filesystem::path OriginalWorkingDirectory;
+    std::string OutputDirectorySpelling;
+  };
+
+  static std::optional<FinalReplaySurface>
+  BuildFinalReplaySurface(const RefoldModel &model, StringRef finalOutputPath);
+
   const RefoldModel model_;
   StringRef aSource_, bSource_;
   ArrayRef<PPTok> aToks_, bToks_;
@@ -673,6 +698,7 @@ private:
   bool strict_;
   ProofAuditMode proofAuditMode_;
   LangOptions lexLang_;
+  std::optional<FinalReplaySurface> finalReplaySurface_;
   std::vector<MaterializedEditMapping> *materializedEditMappings_ = nullptr;
   std::vector<SourceGraphOutput> *sourceGraphOutputs_ = nullptr;
   FinalLineControlValidationCallback finalLineControlValidationCallback_;
@@ -2757,6 +2783,7 @@ private:
                ArrayRef<size_t> aTokOff, StringRef bSource,
                ArrayRef<PPTok> bToks, ArrayRef<size_t> bTokOff, bool noLines,
                bool strict, ProofAuditMode proofAuditMode,
+               StringRef finalOutputPath,
                ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
                std::vector<MaterializedEditMapping> *materializedEditMappings =
                    nullptr,
@@ -2768,6 +2795,7 @@ private:
         lineDirs_(!noLines, model_.GetPPCwd()), strict_(strict),
         proofAuditMode_(proofAuditMode),
         lexLang_(MakeLexLangOptions(model_.GetPPLang())),
+        finalReplaySurface_(BuildFinalReplaySurface(model_, finalOutputPath)),
         materializedEditMappings_(materializedEditMappings),
         sourceGraphOutputs_(sourceGraphOutputs),
         finalLineControlValidationCallback_(
@@ -10835,11 +10863,12 @@ private:
   /// Compare a candidate include replay path against the producer-side include
   /// edge by physical identity.
   ///
-  /// This is the only helper that should canonicalize the current map's
-  /// resolvedPath spelling for include replay decisions.  Preserved
-  /// file-spelling observer checks must compare candidate replay spelling
-  /// against the recovered __FILE__/__FILE_NAME__ expansion payload when one is
-  /// available, not against canonicalized filesystem shape.
+  /// New maps compare against opened_path; legacy maps fall back to
+  /// resolved_path only inside this physical proof path.  Preserved
+  /// file-spelling observer checks are separate and must compare candidate
+  /// entered spelling against entered_file_spelling, recovered observer
+  /// payloads, replay witnesses, or legacy resolved_path according to the
+  /// include file-spelling proof hierarchy.
   bool samePhysicalIncludeFile(StringRef candidatePath,
                                const RefoldModel::IncludeItem &include) const;
 

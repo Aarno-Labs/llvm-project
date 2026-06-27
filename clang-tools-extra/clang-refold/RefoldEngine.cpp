@@ -139,40 +139,144 @@ static bool isSafeSourceGraphIncludePathChar(char c) {
          c == '-' || c == '.' || c == '/';
 }
 
-/// Return the legacy producer include-path spelling for an include edge.
+/// Return true when \p path uses only the restricted ASCII include-path
+/// spelling alphabet that the refolder is willing to synthesize or replay.
 ///
-/// The map field is historically named resolvedPath.  Current maps do not yet
-/// split physical include identity from observed file-spelling state, and some
-/// maps store an absolute path here even when preserved __FILE__ tokens expose
-/// a direct source-relative spelling.  File-observer proofs must therefore
-/// prefer the preserved macro expansion payload when one is available; this
-/// helper remains the schema-level fallback and the physical-proof input.
+/// This is intentionally a spelling-level predicate, not a filesystem proof:
+/// callers still have to replay the operand from the final source surface and
+/// compare the selected physical file / observer spelling against producer
+/// metadata.  Keeping the low-level spelling check in one helper prevents the
+/// include-replay and source-graph paths from drifting apart as new candidate
+/// classes are added.
+static bool hasSafeIncludePathSpelling(StringRef path) {
+  return !path.empty() && !path.contains('\\') && !path.contains('"') &&
+         llvm::all_of(path, [](char c) {
+           return isSafeSourceGraphIncludePathChar(c);
+         });
+}
+
+/// Validate slash-separated include operand components under the exact policy
+/// requested by the caller.
+///
+/// * \p allowAbsolute permits the leading empty component of an absolute path.
+/// * \p allowDotComponents permits `.` and `..` components for replay-only
+///   operands.  Synthesized relative rewrite operands keep this disabled so
+///   emitted includes cannot escape the final surface by construction.
+static bool hasValidIncludePathComponents(StringRef path, bool allowAbsolute,
+                                          bool allowDotComponents) {
+  SmallVector<StringRef, 8> components;
+  path.split(components, '/', /*MaxSplit=*/-1, /*KeepEmpty=*/true);
+  const bool isAbsolute = llvm::sys::path::is_absolute(path);
+  if (isAbsolute && !allowAbsolute)
+    return false;
+
+  for (auto indexed : llvm::enumerate(components)) {
+    StringRef component = indexed.value();
+    if (component.empty()) {
+      if (allowAbsolute && isAbsolute && indexed.index() == 0)
+        continue;
+      return false;
+    }
+    if (!allowDotComponents && (component == "." || component == ".."))
+      return false;
+  }
+  return true;
+}
+
+/// Path-only predicate for operands that may be replayed through Clang lookup.
+/// It accepts absolute operands and `.`/`..` components because replay proof,
+/// not appearance, decides whether such an operand actually names the producer
+/// target.
+static bool safeReplayIncludeLookupOperandPath(StringRef path) {
+  return hasSafeIncludePathSpelling(path) &&
+         hasValidIncludePathComponents(path, /*allowAbsolute=*/true,
+                                       /*allowDotComponents=*/true);
+}
+
+/// Path-only predicate for relative operands the refolder may emit as a
+/// synthetic quoted include rewrite.  These are stricter than replay operands:
+/// no absolute path, empty component, `.`, or `..` is accepted.
+static bool safeSynthesizedRelativeIncludeOperandPath(StringRef path) {
+  return hasSafeIncludePathSpelling(path) &&
+         hasValidIncludePathComponents(path, /*allowAbsolute=*/false,
+                                       /*allowDotComponents=*/false);
+}
+
+/// Return the explicit producer-entered filename spelling for an include edge.
+///
+/// New-schema maps carry this exact `__FILE__` entry spelling in
+/// entered_file_spelling.  This helper intentionally does not fall back to
+/// resolved_path: file-spelling proofs need to distinguish an explicit
+/// producer fact from legacy spelling data and from independently recovered
+/// observer payloads.
+static StringRef explicitProducerEnteredFileSpelling(
+    const RefoldModel::IncludeItem &include) {
+  return include.enteredFileSpelling ? *include.enteredFileSpelling
+                                     : StringRef();
+}
+
+/// Return the legacy spelling-oriented include path, if present.
+///
+/// Older maps only had resolved_path, whose meaning drifted between physical
+/// identity and entered-file spelling.  New proof code should consult this
+/// helper only after exhausting stronger new-schema metadata and recovered
+/// observer/replay witnesses.
 static StringRef
-producerEnteredFileSpelling(const RefoldModel::IncludeItem &include) {
+legacyResolvedIncludePath(const RefoldModel::IncludeItem &include) {
   return include.resolvedPath ? *include.resolvedPath : StringRef();
 }
 
-/// Return the producer-side path spelling that may be used as input to a
-/// physical identity proof.
+/// Return the best available producer-entered filename spelling for an include.
 ///
-/// This helper intentionally starts from producerEnteredFileSpelling() because
-/// current maps do not yet carry a separate canonical/physical include path.
-/// Callers that compare physical identity must canonicalize only in that proof
-/// path, e.g. through RefoldEngine::PathsEqual().
-static std::optional<std::filesystem::path>
-producerPhysicalIncludePath(const RefoldModel::IncludeItem &include) {
-  StringRef spelling = producerEnteredFileSpelling(include);
-  if (spelling.empty())
-    return std::nullopt;
-  return std::filesystem::path(spelling.str());
+/// This is a convenience for legacy-neutral callers that only need a spelling
+/// anchor.  Proof-sensitive code that implements the full file-spelling
+/// fallback hierarchy should prefer explicitProducerEnteredFileSpelling(),
+/// then any context-specific observer/replay witnesses, and only then
+/// legacyResolvedIncludePath().
+static StringRef
+producerEnteredFileSpelling(const RefoldModel::IncludeItem &include) {
+  StringRef explicitSpelling = explicitProducerEnteredFileSpelling(include);
+  return !explicitSpelling.empty() ? explicitSpelling
+                                   : legacyResolvedIncludePath(include);
 }
 
-/// Exact spelling comparison against the legacy include-path spelling.
+/// Return the exact producer `__FILE_NAME__` entry spelling when available.
 ///
-/// Do not canonicalize, relativize, strip leading ./, or collapse symlinks here.
-/// Preserved file-observer proofs should prefer recovered macro expansion
-/// payloads; this helper remains available only for schema-level fallback cases
-/// where resolvedPath is the only producer-side spelling evidence.
+/// entered_file_name is emitted by the producer using Clang's own
+/// processPathToFileName() logic.  If an old/new map lacks it, fall back to the
+/// deterministic refolder basename helper over entered_file_spelling / legacy
+/// resolved_path.  This fallback is compatibility-only; new maps should carry
+/// entered_file_name whenever the include was actually entered.
+static StringRef
+producerEnteredFileName(const RefoldModel::IncludeItem &include) {
+  if (include.enteredFileName)
+    return *include.enteredFileName;
+  StringRef fileSpelling = producerEnteredFileSpelling(include);
+  return fileSpelling.empty() ? StringRef()
+                              : stringutils::pathBasename(fileSpelling);
+}
+
+/// Return the producer-side path spelling used as input to physical identity.
+///
+/// New maps carry opened_path for physical/FileEntry identity.  Legacy maps
+/// fall back to resolved_path, and callers must canonicalize only inside the
+/// physical proof path, e.g. through RefoldEngine::PathsEqual().  Never use
+/// entered_file_spelling here: observer spelling and filesystem identity are
+/// intentionally separate proof domains.
+static std::optional<std::filesystem::path>
+producerPhysicalIncludePath(const RefoldModel::IncludeItem &include) {
+  StringRef path = include.openedPath ? *include.openedPath
+                                      : legacyResolvedIncludePath(include);
+  if (path.empty())
+    return std::nullopt;
+  return std::filesystem::path(path.str());
+}
+
+/// Exact spelling comparison against the producer-entered filename spelling.
+///
+/// Do not canonicalize, relativize, strip leading ./, or collapse symlinks
+/// here. New maps use entered_file_spelling as the primary schema proof target;
+/// legacy maps fall back to resolved_path.
 [[maybe_unused]] static bool
 sameEnteredFileSpelling(StringRef candidateEnteredFileSpelling,
                         const RefoldModel::IncludeItem &include) {
@@ -197,19 +301,7 @@ safeSourceGraphRelativeIncludePath(const RefoldModel::IncludeItem &inc) {
     return std::nullopt;
 
   StringRef path = target.drop_front().drop_back();
-  if (path.empty() || path.contains('\\') || path.contains('"') ||
-      llvm::sys::path::is_absolute(path))
-    return std::nullopt;
-
-  SmallVector<StringRef, 8> components;
-  path.split(components, '/', /*MaxSplit=*/-1, /*KeepEmpty=*/true);
-  for (StringRef component : components)
-    if (component.empty() || component == "." || component == "..")
-      return std::nullopt;
-
-  if (!llvm::all_of(path, [](char c) {
-        return isSafeSourceGraphIncludePathChar(c);
-      }))
+  if (!safeSynthesizedRelativeIncludeOperandPath(path))
     return std::nullopt;
 
   return path.str();
@@ -231,25 +323,8 @@ quotedIncludeReplayLookupOperand(const RefoldModel::IncludeItem &inc) {
     return std::nullopt;
 
   StringRef path = target.drop_front().drop_back();
-  if (path.empty() || path.contains('\\') || path.contains('"'))
+  if (!safeReplayIncludeLookupOperandPath(path))
     return std::nullopt;
-
-  if (!llvm::all_of(path, [](char c) {
-        return isSafeSourceGraphIncludePathChar(c);
-      }))
-    return std::nullopt;
-
-  SmallVector<StringRef, 8> components;
-  path.split(components, '/', /*MaxSplit=*/-1, /*KeepEmpty=*/true);
-  const bool isAbsolute = llvm::sys::path::is_absolute(path);
-  for (auto indexed : llvm::enumerate(components)) {
-    StringRef component = indexed.value();
-    if (!component.empty())
-      continue;
-    if (isAbsolute && indexed.index() == 0)
-      continue;
-    return std::nullopt;
-  }
 
   return path.str();
 }
@@ -261,19 +336,7 @@ static bool includeOperandHasParentComponent(StringRef path) {
 }
 
 static bool safeRewrittenQuotedIncludeOperand(StringRef path) {
-  if (path.empty() || path.contains('\\') || path.contains('"') ||
-      llvm::sys::path::is_absolute(path))
-    return false;
-
-  SmallVector<StringRef, 8> components;
-  path.split(components, '/', /*MaxSplit=*/-1, /*KeepEmpty=*/true);
-  for (StringRef component : components)
-    if (component.empty() || component == "." || component == "..")
-      return false;
-
-  return llvm::all_of(path, [](char c) {
-    return isSafeSourceGraphIncludePathChar(c);
-  });
+  return safeSynthesizedRelativeIncludeOperandPath(path);
 }
 
 static bool isSourceGraphDirectiveHorizontalWhitespace(char c) {
@@ -286,9 +349,10 @@ struct IncludeDirectiveHeaderOperandRange {
 };
 
 // Locate pieces of a source-spelled include directive without rebuilding the
-// directive from the normalized JSON spelling.  Comments are phase-3 trivia for
-// directive recognition, so they must be skipped while finding the syntactic
-// header-name token, but preserved verbatim in the replacement text.
+// directive from the normalized JSON spelling.  Comments are preprocessing
+// whitespace for directive recognition, so they must be skipped while finding
+// the syntactic header-name token, but preserved verbatim in the replacement
+// text.
 static bool consumeIncludeDirectiveEscapedNewline(StringRef text,
                                                   size_t &pos) {
   if (pos >= text.size() || text[pos] != '\\')
@@ -437,19 +501,19 @@ static bool consumeDirectiveScannerEscapedNewline(StringRef text,
   if (!consumeDirectiveScannerNewline(text, afterBackslash))
     return false;
 
-  // Translation phase 2 deletes the backslash-newline pair before directive
-  // recognition.  Clang also accepts horizontal whitespace before the newline
-  // as an extension, so the directive scanner consumes the same spelling that
-  // source-range extension treats as a splice.  Keep the caller's current
-  // logical-line state unchanged.
+  // Escaped-newline deletion removes the backslash-newline pair before
+  // directive recognition.  Clang also accepts horizontal whitespace before
+  // the newline as an extension, so the directive scanner consumes the same
+  // spelling that source-range extension treats as a splice.  Keep the caller's
+  // current logical-line state unchanged.
   pos = afterBackslash;
   return true;
 }
 
 /// Return the byte offset of the next preprocessing directive introducer.
 ///
-/// This is intentionally a tiny phase-1/phase-2/phase-3 scanner rather than a
-/// raw physical-line test.  Clang recognizes directives after deleting escaped
+/// This is intentionally a tiny preprocessing-aware scanner rather than a raw
+/// physical-line test.  Clang recognizes directives after deleting escaped
 /// newlines and after replacing comments with whitespace.  In particular,
 /// `#\\\ninclude` is `#include`, and a complete block comment may span a
 /// physical newline before the `#` that starts the directive.  Proof code that
@@ -457,8 +521,9 @@ static bool consumeDirectiveScannerEscapedNewline(StringRef text,
 /// directive boundary; otherwise it can preserve an include in the wrong lookup
 /// context or move macro state across an observing include.
 ///
-/// Line comments are different: after phase 2 they consume the rest of the
-/// logical line, so a `#` inside `// ...` is not a directive introducer.  An
+/// Line comments are different: after escaped-newline deletion they consume the
+/// rest of the logical line, so a `#` inside `// ...` is not a directive
+/// introducer.  An
 /// unterminated block comment simply prevents later bytes from being observed as
 /// directives by this scanner; callers that need stronger recovery already fail
 /// closed at the proof site.
@@ -475,8 +540,8 @@ findPreprocessingDirectiveIntroducer(StringRef text, size_t start = 0) {
 
     if (inBlockComment) {
       if (pos + 1 < text.size() && text[pos] == '*' && text[pos + 1] == '/') {
-        // A complete block comment is phase-3 preprocessing whitespace.  Once
-        // the terminator is consumed, directive-prefix scanning must resume in
+        // A complete block comment is preprocessing whitespace.  Once the
+        // terminator is consumed, directive-prefix scanning must resume in
         // the surrounding logical line; otherwise a real directive such as
         // `/*\n*/#include` is hidden from macro-state and include-replay
         // proofs.
@@ -542,8 +607,9 @@ findPreprocessingDirectiveIntroducer(StringRef text, size_t start = 0) {
 }
 
 /// Skip preprocessing whitespace after a directive introducer or keyword.
-/// Escaped newlines are ignored because phase 2 removes them.  Complete block
-/// comments are skipped as whitespace, including comments that span physical
+/// Escaped newlines are ignored because preprocessing removes them before
+/// directive recognition.  Complete block comments are skipped as whitespace,
+/// including comments that span physical
 /// lines; Clang accepts constructs such as `#/*\n*/include` for the same
 /// reason.  Line comments are not skipped because they terminate the directive
 /// logical line.
@@ -693,16 +759,34 @@ static size_t tokenOffsetFromBase(const Token &token, SourceLocation baseLoc);
 /// buffer.
 static size_t tokenEndOffsetFromBase(const Token &token, SourceLocation baseLoc);
 
-/// Return the filesystem path used to load an include item.
+/// Return the logical filename spelling to restore when an include expansion is
+/// replayed as materialized source.
 ///
-/// Current maps use resolvedPath as the best available include-path spelling
-/// for loading the header.  This helper is deliberately not a policy for how to
-/// re-spell the include in output or for proving preserved file observers.
+/// This spelling is part of the semantic source state: a preserved `__FILE__` or
+/// `__FILE_NAME__` in the materialized body observes the filename established by
+/// the surrounding line-control wrapper, not the filesystem path used to read the
+/// header bytes.  Prefer the producer-entered spelling and retain the old
+/// resolved_path/target fallbacks only for legacy maps that lack split metadata.
 inline std::string resolveHeaderPath(const RefoldModel::IncludeItem &inc) {
   StringRef producerSpelling = producerEnteredFileSpelling(inc);
   return !producerSpelling.empty()
              ? producerSpelling.str()
              : stringutils::stripHeaderToken(inc.target).str();
+}
+
+/// Return the physical-ish path used to load a materialized include body.
+///
+/// Do not use this value as a `#line` filename or file-observer proof target.
+/// New maps deliberately split physical identity (`opened_path`) from the
+/// producer-entered filename spelling (`entered_file_spelling`); conflating the
+/// two would either make `__FILE__` observe a canonicalized path or fail to read
+/// headers whose entered spelling was only meaningful inside Clang's search
+/// context.
+inline std::string resolveHeaderLoadPath(const RefoldModel::IncludeItem &inc) {
+  if (std::optional<std::filesystem::path> physical =
+          producerPhysicalIncludePath(inc))
+    return physical->string();
+  return resolveHeaderPath(inc);
 }
 
 /// True iff the producer proved the invocation callee comes from a literal
@@ -1594,7 +1678,7 @@ tryGetInvocationArgText(const RefoldModel::MacroInvocation &mi,
       .slice(static_cast<size_t>(byteBegin), static_cast<size_t>(byteEnd));
 }
 
-/// Return true only for the narrowly proved chunk-5 higher-order case:
+/// Return true only for the narrowly proved higher-order callee-closure case:
 ///
 ///   * the callee of a descendant invocation comes from exactly one caller
 ///     formal slot in `parent`
@@ -2391,6 +2475,7 @@ Expected<std::string> RefoldEngine::Refold(
     ArrayRef<size_t> aTokOff, StringRef bSource, ArrayRef<PPTok> bToks,
     ArrayRef<size_t> bTokOff, bool noLines, bool strict,
     RefoldEngine::ProofAuditMode proofAuditMode,
+    StringRef finalOutputPath,
     ArrayRef<SidebandPragmaEdit> sidebandPragmaEdits,
     std::vector<MaterializedEditMapping> *materializedEditMappings,
     FinalLineControlValidationCallback finalLineControlValidationCallback,
@@ -2403,10 +2488,85 @@ Expected<std::string> RefoldEngine::Refold(
   // Construct an engine and run the instance pipeline.
   RefoldEngine engine(std::move(*mOrErr), aSource, aToks, aTokOff, bSource,
                       bToks, bTokOff, noLines, strict, proofAuditMode,
-                      sidebandPragmaEdits, materializedEditMappings,
+                      finalOutputPath, sidebandPragmaEdits,
+                      materializedEditMappings,
                       std::move(finalLineControlValidationCallback),
                       sourceGraphOutputs);
   return engine.Refold();
+}
+
+std::optional<RefoldEngine::FinalReplaySurface>
+RefoldEngine::BuildFinalReplaySurface(const RefoldModel &model,
+                                      StringRef finalOutputPath) {
+  if (finalOutputPath.empty())
+    return std::nullopt;
+
+  // Match the driver-side --check oracle: preprocessToBytes() first resolves
+  // the check input against the process working directory and then invokes
+  // Clang with that absolute input while restoring pp_ctx.cwd as the compiler
+  // working directory.  Direct quoted include lookup therefore starts beside
+  // the absolute emitted source path, not beside the producer TU path recorded
+  // in the map.
+  SmallString<256> absoluteOutputPath(finalOutputPath);
+  if (std::error_code ec = sys::fs::make_absolute(absoluteOutputPath)) {
+    REFOLD_LOG_DEBUG("include/replay",
+                     "final replay surface unavailable for output '{0}': {1}",
+                     finalOutputPath, ec.message());
+    return std::nullopt;
+  }
+
+  std::filesystem::path outputPath(absoluteOutputPath.str().str());
+  FinalReplaySurface surface;
+  surface.OutputPath = outputPath.lexically_normal();
+  surface.OutputDirectory = surface.OutputPath.parent_path();
+  surface.OriginalWorkingDirectory =
+      std::filesystem::path(model.GetPPCwd().str());
+
+  // Preserve the spelling Clang will use to derive direct quoted child header
+  // names from the emitted source file.  The checker feeds Clang an absolute
+  // input path, but also restores pp_ctx.cwd as FileSystemOpts::WorkingDir.
+  // When the emitted source directory is the working directory, Clang reports
+  // direct quoted children with the usual cwd-relative "./child.h" spelling,
+  // not with the absolute directory prefix.  Model that spelling explicitly;
+  // otherwise replay proofs for valid final-surface includes such as
+  //   #include "headers/child.h"
+  // would incorrectly fail a __FILE__ observer proof and force materialization.
+  std::error_code relativeEC;
+  std::filesystem::path relativeOutputDirectory =
+      std::filesystem::relative(surface.OutputDirectory,
+                                surface.OriginalWorkingDirectory, relativeEC);
+  if (!relativeEC && !relativeOutputDirectory.empty() &&
+      !relativeOutputDirectory.is_absolute()) {
+    bool escapesWorkingDirectory = false;
+    for (const auto &component : relativeOutputDirectory) {
+      if (component == std::filesystem::path("..")) {
+        escapesWorkingDirectory = true;
+        break;
+      }
+    }
+    if (!escapesWorkingDirectory) {
+      surface.OutputDirectorySpelling =
+          relativeOutputDirectory == std::filesystem::path(".")
+              ? std::string(".")
+              : relativeOutputDirectory.generic_string();
+    }
+  }
+
+  if (surface.OutputDirectorySpelling.empty()) {
+    SmallString<256> outputDirectorySpelling(
+        surface.OutputPath.generic_string());
+    llvm::sys::path::remove_filename(outputDirectorySpelling);
+    surface.OutputDirectorySpelling =
+        outputDirectorySpelling.empty() ? std::string(".")
+                                        : outputDirectorySpelling.str().str();
+  }
+
+  REFOLD_LOG_DEBUG("include/replay",
+                   "final replay surface: output='{0}' dir='{1}' cwd='{2}'",
+                   surface.OutputPath.generic_string(),
+                   surface.OutputDirectory.generic_string(),
+                   surface.OriginalWorkingDirectory.generic_string());
+  return surface;
 }
 
 bool RefoldEngine::IsNoLegacyAuditEnabled() const {
@@ -9456,8 +9616,35 @@ std::string RefoldEngine::RunSinglePassRefold() {
   }
 
   // (d) Realize each include once (memoization lives inside
-  // MaterializeIncludeExpansion).
-  for (uint64_t incId : seeds) {
+  // MaterializeIncludeExpansion).  Process ancestors before descendants rather
+  // than iterating the DenseSet directly.  This ordering matters for
+  // include-next repair: when an ancestor materialization fails to prove a
+  // descendant #include_next replay obligation, the recursive call must be the
+  // first one to build/cache that descendant so the forced materialization mode
+  // is not bypassed by an earlier child-seed realization.
+  auto includeMaterializationDepth = [&](uint64_t includeId) -> unsigned {
+    unsigned depth = 0;
+    DenseSet<uint64_t> seen;
+    const RefoldModel::IncludeItem *cur = model_.GetIncludeById(includeId);
+    while (cur && cur->parent) {
+      if (!seen.insert(cur->id).second)
+        break;
+      ++depth;
+      cur = model_.GetIncludeById(*cur->parent);
+    }
+    return depth;
+  };
+
+  llvm::SmallVector<uint64_t, 32> orderedSeeds(seeds.begin(), seeds.end());
+  llvm::sort(orderedSeeds, [&](uint64_t lhs, uint64_t rhs) {
+    const unsigned lhsDepth = includeMaterializationDepth(lhs);
+    const unsigned rhsDepth = includeMaterializationDepth(rhs);
+    if (lhsDepth != rhsDepth)
+      return lhsDepth < rhsDepth;
+    return lhs < rhs;
+  });
+
+  for (uint64_t incId : orderedSeeds) {
     MaterializeIncludeExpansion(incId, perInclude, macroPatchesByOwner,
                                 children, includeExpansion,
                                 includeExpansionLineControlPruneCandidates,
@@ -33151,8 +33338,8 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
       // Accept descendant leaves whose callee ancestry is either fully literal
       // or closes transitively through the proved whole-formal
-      // caller-forwarding rule above. This is the chunk-5 boundary for the
-      // current contract: anything outside that proof surface remains
+      // caller-forwarding rule above.  This is the boundary of the current
+      // callee-closure contract: anything outside that proof surface remains
       // conservatively rejected.
       auto pathHasProvableCalleeClosure =
           [&](const RefoldModel::MacroInvocation &cand) -> bool {

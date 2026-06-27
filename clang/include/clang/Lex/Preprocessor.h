@@ -84,6 +84,23 @@ class ScratchBuffer;
 class TargetInfo;
 class NoTrivialPPDirectiveTracer;
 
+/// Producer-visible lookup provenance for the most recently processed
+/// inclusion directive.
+///
+/// This is intentionally a tiny, index-only side channel rather than an
+/// extension of PPCallbacks::InclusionDirective: clang-refold needs the exact
+/// HeaderSearch cursor state, while existing callback clients should not need
+/// to learn about DirectoryLookup internals.
+struct IncludeLookupProvenance {
+  /// Effective HeaderSearch search-directory index where lookup resumed for
+  /// #include_next, if lookup was represented by the global search chain.
+  std::optional<unsigned> FromSearchDirIndex;
+
+  /// Effective HeaderSearch search-directory index that selected the include
+  /// target, if lookup was represented by the global search chain.
+  std::optional<unsigned> CurSearchDirIndex;
+};
+
 namespace Builtin {
 class Context;
 }
@@ -792,6 +809,11 @@ private:
   /// properties.
   ConstSearchDirIterator CurDirLookup = nullptr;
 
+  /// Lookup provenance for the inclusion directive currently being reported to
+  /// PPCallbacks. It is valid synchronously during InclusionDirective
+  /// callbacks and remains best-effort afterward for diagnostics/debugging.
+  IncludeLookupProvenance LastIncludeLookupProvenance;
+
   /// The current macro we are expanding, if we are expanding a macro.
   ///
   /// One of CurLexer and CurTokenLexer must be null.
@@ -1232,6 +1254,10 @@ public:
   FileManager &getFileManager() const { return FileMgr; }
   SourceManager &getSourceManager() const { return SourceMgr; }
   HeaderSearch &getHeaderSearchInfo() const { return HeaderInfo; }
+
+  const IncludeLookupProvenance &getLastIncludeLookupProvenance() const {
+    return LastIncludeLookupProvenance;
+  }
 
   IdentifierTable &getIdentifierTable() { return Identifiers; }
   const IdentifierTable &getIdentifierTable() const { return Identifiers; }
@@ -2527,7 +2553,8 @@ public:
              SmallVectorImpl<char> *RelativePath,
              ModuleMap::KnownHeader *SuggestedModule, bool *IsMapped,
              bool *IsFrameworkFound, bool SkipCache = false,
-             bool OpenFile = true, bool CacheFailures = true);
+             bool OpenFile = true, bool CacheFailures = true,
+             ConstSearchDirIterator *ResolvedFromDir = nullptr);
 
   /// Given a "Filename" or \<Filename> reference, look up the indicated embed
   /// resource. \p isAngled indicates whether the file reference is for
@@ -2845,7 +2872,8 @@ private:
       bool &IsMapped, ConstSearchDirIterator LookupFrom,
       const FileEntry *LookupFromFile, StringRef &LookupFilename,
       SmallVectorImpl<char> &RelativePath, SmallVectorImpl<char> &SearchPath,
-      ModuleMap::KnownHeader &SuggestedModule, bool isAngled);
+      ModuleMap::KnownHeader &SuggestedModule, bool isAngled,
+      ConstSearchDirIterator *ResolvedLookupFrom = nullptr);
   // Binary data inclusion
   void HandleEmbedDirective(SourceLocation HashLoc, Token &Tok,
                             const FileEntry *LookupFromFile = nullptr);

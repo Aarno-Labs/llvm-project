@@ -3948,7 +3948,7 @@ int main(int argc, char **argv) {
   std::vector<SourceGraphOutput> sourceGraphOutputs;
   auto refoldedOrErr = RefoldEngine::Refold(
       rootJson, aBytes, aToks, aTokByteOff, bBytes, bToks, bTokByteOff,
-      NoLines, StrictMode, proofAuditMode, sidebandPragmaEdits,
+      NoLines, StrictMode, proofAuditMode, ModifiedSrcPath, sidebandPragmaEdits,
       emitEditMap ? &materializedEditMappings : nullptr,
       buildFinalLineControlValidationCallback(ModifiedSrcPath, ctx),
       &sourceGraphOutputs);
