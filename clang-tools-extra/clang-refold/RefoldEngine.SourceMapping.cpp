@@ -1,16 +1,27 @@
-//===--- RefoldEngine.SourceMapping.inc ----------------------*- C++ -*-===//
+//===--- RefoldEngine.SourceMapping.cpp -----------------------------*- C++ -*-===//
 //
-// `RefoldEngine` members physically split out of `RefoldEngine.cpp`.
-//
-// This fragment groups methods that translate between source, byte, and token
-// coordinate systems, recover token envelopes from edited regions, and answer
-// "where does this region live in A/B token space?" for later proof and patch
-// construction.
-//
-// This file is included directly by `RefoldEngine.cpp`, so this is only a
-// physical file split. No ownership, access, or behavioral semantics change.
+// This file contains RefoldEngine member functions for source/byte/token
+// coordinate mapping.  The implementation used to live in the
+// RefoldEngine.SourceMapping.inc include fragment; keeping it in a real
+// translation unit avoids hidden textual-include dependencies while preserving
+// the existing RefoldEngine API and behavior.
 //
 //===----------------------------------------------------------------------===//
+
+#include "RefoldEngine.h"
+#include "RefoldLog.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+using namespace llvm;
+
+namespace clang {
+namespace refold {
 
 StringRef RefoldEngine::SliceSource(ArrayRef<size_t> tokOff, StringRef source,
                                     uint64_t startTok, uint64_t endTok) {
@@ -878,3 +889,6 @@ RefoldEngine::MapATokRangeAToBTokenEnvelopeTrimEdgeInsertions(
 
   return std::make_pair(bBegin, bEnd);
 }
+
+} // namespace refold
+} // namespace clang

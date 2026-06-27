@@ -1,15 +1,27 @@
-//===--- RefoldEngine.ArgTextRecovery.inc -------------------*- C++ -*-===//
+//===--- RefoldEngine.ArgTextRecovery.cpp --------------------------*- C++ -*-===//
 //
-// `RefoldEngine` members physically split out of `RefoldEngine.cpp`.
-//
-// This fragment groups methods that recover or normalize raw macro argument
-// text from textual spellings. These helpers answer "what is the raw argument
-// content represented by this invocation text or stringified literal?"
-//
-// This file is included directly by `RefoldEngine.cpp`, so this is only a
-// physical file split. No ownership, access, or behavioral semantics change.
+// This file contains RefoldEngine member functions that recover or normalize
+// raw macro-argument text from invocation spellings and stringified literals.
+// The implementation used to live in RefoldEngine.ArgTextRecovery.inc; moving
+// it to a real translation unit is a physical organization change only.
 //
 //===----------------------------------------------------------------------===//
+
+#include "RefoldEngine.h"
+
+#include "clang/Basic/SourceLocation.h"
+#include "clang/Basic/TokenKinds.h"
+#include "clang/Lex/Lexer.h"
+
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+using namespace llvm;
+
+namespace clang {
+namespace refold {
 
 std::optional<std::string>
 RefoldEngine::UnstringifyLiteralToArgText(StringRef literalTok,
@@ -190,3 +202,6 @@ RefoldEngine::LexMacroInvocationActualContentRanges(StringRef invText,
 
   return std::nullopt;
 }
+
+} // namespace refold
+} // namespace clang

@@ -5,7 +5,18 @@ add_clang_tool(clang-refold
   DiffAlgorithms.cpp
   FinalLineControlModel.cpp
   LineDirectiveInserter.cpp
+  RefoldLineControlFilename.cpp
+  RefoldLineControlRewrite.cpp
+  RefoldExpansionFallback.cpp
   RefoldEngine.cpp
+  RefoldEngine.LineObserverLayout.cpp
+  RefoldEngine.IncludeMaterialization.cpp
+  RefoldEngine.TextEditAssembly.cpp
+  RefoldEngine.PathIdentity.cpp
+  RefoldEngine.SourceMapping.cpp
+  RefoldEngine.ArgTextRecovery.cpp
+  RefoldEngine.IncludeInsertion.cpp
+  RefoldEngine.CounterStabilization.cpp
   RefoldIncludePathProof.cpp
   RefoldIncludeReplayProof.cpp
   RefoldProofLattice.cpp

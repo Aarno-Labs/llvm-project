@@ -249,6 +249,13 @@ private:
     SmallVector<IncludeReplaySearchDir, 32> AngledLookupDirs;
   };
 
+  /// Convert producer lookup provenance to the ordinary directory replay kinds
+  /// modeled by include replay proof.  Keeping this as a private member avoids
+  /// exposing the private IncludeReplayCandidate carrier outside this proof
+  /// context while still sharing the conversion across ordinary include and
+  /// include-next replay checks.
+  static std::optional<IncludeReplayCandidate::LookupKind>
+  replayableDirectoryLookupKind(IncludeLookupKind kind);
 
   mutable std::optional<RecordedIncludeSearchDirs>
       recordedIncludeSearchDirsCache_;

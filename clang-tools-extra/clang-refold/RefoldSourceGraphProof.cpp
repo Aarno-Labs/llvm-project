@@ -342,6 +342,21 @@ bool sourceGraphIncludePathIsUnaliasedOrCoherent(
   return true;
 }
 
+
+SourceGraphOutput makeSourceGraphOutput(
+    const RefoldModel::IncludeItem &Include, llvm::StringRef RelativePath,
+    llvm::StringRef Bytes, bool CleanupOnly) {
+  SourceGraphOutput Output;
+  Output.includeId = Include.id;
+  Output.relativePath = RelativePath.str();
+  Output.originalTarget = Include.target.str();
+  if (Include.resolvedPath)
+    Output.resolvedPath = Include.resolvedPath->str();
+  Output.bytes = Bytes.str();
+  Output.cleanupOnly = CleanupOnly;
+  return Output;
+}
+
 SourceGraphOwnerPreservationPlan planSourceGraphOwnerPreservation(
     const SourceGraphProofInputs &Inputs,
     const RefoldModel::IncludeItem &Include, llvm::StringRef CandidateBytes,
@@ -384,6 +399,36 @@ SourceGraphOwnerPreservationPlan planSourceGraphOwnerPreservation(
 
   Plan.PreservedRelativePath = *SourceGraphPath;
   return Plan;
+}
+
+
+SourceGraphOwnerPreservationOutputPlan planSourceGraphOwnerPreservationOutput(
+    const SourceGraphProofInputs &Inputs,
+    const RefoldModel::IncludeItem &Include, llvm::StringRef CandidateBytes,
+    const SourceGraphProofServices &Services) {
+  SourceGraphOwnerPreservationOutputPlan OutputPlan;
+  SourceGraphOwnerPreservationPlan Plan =
+      planSourceGraphOwnerPreservation(Inputs, Include, CandidateBytes, Services);
+
+  if (Plan.RejectedCleanupRelativePath) {
+    // Source-graph sidecars are path-level artifacts beside the emitted TU.  A
+    // previous run may have written a sidecar for a path that this run no
+    // longer proves admissible, for example after a same-spelling include
+    // becomes a surviving alias.  The driver may remove the stale file only if
+    // its bytes still exactly match this rejected generated body and the file
+    // is not the producer-resolved input header.
+    OutputPlan.RejectedCleanupOutput = makeSourceGraphOutput(
+        Include, *Plan.RejectedCleanupRelativePath, CandidateBytes,
+        /*CleanupOnly=*/true);
+  }
+
+  if (Plan.PreservedRelativePath) {
+    OutputPlan.PreservedOutput = makeSourceGraphOutput(
+        Include, *Plan.PreservedRelativePath, CandidateBytes,
+        /*CleanupOnly=*/false);
+  }
+
+  return OutputPlan;
 }
 
 } // namespace source_graph

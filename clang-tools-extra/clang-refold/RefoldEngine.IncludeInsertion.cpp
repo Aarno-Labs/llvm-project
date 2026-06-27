@@ -1,16 +1,26 @@
-//===--- RefoldEngine.IncludeInsertion.inc ------------------*- C++ -*-===//
+//===--- RefoldEngine.IncludeInsertion.cpp -------------------------*- C++ -*-===//
 //
-// `RefoldEngine` members physically split out of `RefoldEngine.cpp`.
-//
-// This fragment groups methods that support include realization and include
-// patch materialization. These helpers answer "where can an include-backed
-// edit be realized in B, and what concrete insertion bytes should be staged?"
-//
-// This file is included directly by `RefoldEngine.cpp`, so this is only a
-// physical file split. No ownership, access, or behavioral semantics change.
+// This file contains RefoldEngine member functions for pre-materialization
+// include insertion patch construction.  The implementation used to live in
+// RefoldEngine.IncludeInsertion.inc; moving it to a real translation unit keeps
+// the engine-owned API intact while removing one textual include fragment.
 //
 //===----------------------------------------------------------------------===//
 
+#include "RefoldEngine.h"
+#include "TokenTextHelpers.h"
+#include "RefoldLog.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <utility>
+
+using namespace llvm;
+
+namespace clang {
+namespace refold {
 std::optional<std::pair<size_t, size_t>>
 RefoldEngine::ResolveIncludeRealizationBTokenEnvelope(
     uint64_t beginTok, uint64_t endTok,
@@ -109,11 +119,10 @@ RefoldEngine::BuildIncludeInsertionPatch(const RefoldModel::IncludeItem &inc,
     // surrounding whitespace can be retained, so keep the full token envelope
     // to preserve the inserted B-side payload.
     StringRef bSlice = h.isInsertOnly()
-                           ? sliceTokenEnvelope(bTokOff_, bSource_, h.bStart,
-                                                h.bEnd)
-                           : sliceExactTokenCoverage(bTokOff_, bToks_,
-                                                     bSource_, h.bStart,
-                                                     h.bEnd);
+                           ? refoldSliceTokenEnvelope(bTokOff_, bSource_,
+                                                      h.bStart, h.bEnd)
+                           : refoldSliceExactTokenCoverage(
+                                 bTokOff_, bToks_, bSource_, h.bStart, h.bEnd);
     insertBytes = bSlice.str();
   } else {
     // Hardening: Log an error or assert if we get a hunk that points outside
@@ -138,3 +147,6 @@ RefoldEngine::BuildIncludeInsertionPatch(const RefoldModel::IncludeItem &inc,
 
   return patch;
 }
+
+} // namespace refold
+} // namespace clang

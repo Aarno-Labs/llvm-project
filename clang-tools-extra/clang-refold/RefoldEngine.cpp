@@ -72,6 +72,8 @@
 #include "RefoldMacroStateProof.h"
 #include "RefoldSourceGraphProof.h"
 #include "FinalLineControlModel.h"
+#include "TokenTextHelpers.h"
+#include "NeutralSourceIslandProof.h"
 
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/TokenKinds.h"
@@ -128,163 +130,10 @@ namespace clang {
 namespace refold {
 
 namespace {
-/// Minimal raw-lexer token record used only for boundary hygiene checks.
-///
-/// `Begin` and `End` are byte offsets into the caller-provided snippet; the
-/// spelling is copied so snippets can be concatenated and re-lexed without
-/// depending on the original buffer lifetime.
-struct LexBoundaryToken {
-  tok::TokenKind Kind = tok::unknown;
-  std::string Spelling;
-  size_t Begin = 0;
-  size_t End = 0;
-};
+// Include-directive source-spelling helpers moved to
+// RefoldEngine.IncludeMaterialization.cpp with the include-materialization
+// routines that use them.
 
-static bool isIncludeDirectiveHorizontalWhitespace(char c) {
-  return c == '\r' || stringutils::isNonNewlineWs(c);
-}
-
-struct IncludeDirectiveHeaderOperandRange {
-  size_t Begin = 0;
-  size_t End = 0;
-};
-
-// Locate pieces of a source-spelled include directive without rebuilding the
-// directive from the normalized JSON spelling.  Comments are preprocessing
-// whitespace for directive recognition, so they must be skipped while finding
-// the syntactic header-name token, but preserved verbatim in the replacement
-// text.
-static bool consumeIncludeDirectiveEscapedNewline(StringRef text,
-                                                  size_t &pos) {
-  if (pos >= text.size() || text[pos] != '\\')
-    return false;
-
-  size_t cursor = pos + 1;
-  while (cursor < text.size() &&
-         isIncludeDirectiveHorizontalWhitespace(text[cursor]))
-    ++cursor;
-  if (cursor >= text.size())
-    return false;
-  if (text[cursor] == '\r') {
-    ++cursor;
-    if (cursor < text.size() && text[cursor] == '\n')
-      ++cursor;
-  } else if (text[cursor] == '\n') {
-    ++cursor;
-  } else {
-    return false;
-  }
-
-  pos = cursor;
-  return true;
-}
-
-static bool skipIncludeDirectiveHorizontalTrivia(StringRef text, size_t &pos) {
-  while (pos < text.size()) {
-    if (isIncludeDirectiveHorizontalWhitespace(text[pos])) {
-      ++pos;
-      continue;
-    }
-    if (consumeIncludeDirectiveEscapedNewline(text, pos))
-      continue;
-    if (pos + 1 < text.size() && text[pos] == '/' && text[pos + 1] == '*') {
-      pos += 2;
-      bool closed = false;
-      while (pos + 1 < text.size()) {
-        if (consumeIncludeDirectiveEscapedNewline(text, pos))
-          continue;
-        if (text[pos] == '*' && text[pos + 1] == '/') {
-          pos += 2;
-          closed = true;
-          break;
-        }
-        ++pos;
-      }
-      if (!closed)
-        return false;
-      continue;
-    }
-    if (pos + 1 < text.size() && text[pos] == '/' && text[pos + 1] == '/')
-      return false;
-    break;
-  }
-  return true;
-}
-
-static bool consumeIncludeDirectiveKeyword(StringRef text, size_t &pos,
-                                           StringRef keyword) {
-  if (!text.substr(pos).starts_with(keyword))
-    return false;
-  const size_t end = pos + keyword.size();
-  if (end < text.size() &&
-      (stringutils::isIdentPart(text[end]) || text[end] == '_'))
-    return false;
-  pos = end;
-  return true;
-}
-
-static std::optional<std::pair<size_t, size_t>>
-findIncludeDirectiveKeywordRange(StringRef directive) {
-  size_t pos = 0;
-  if (!skipIncludeDirectiveHorizontalTrivia(directive, pos))
-    return std::nullopt;
-  if (pos >= directive.size() || directive[pos] != '#')
-    return std::nullopt;
-  ++pos;
-  if (!skipIncludeDirectiveHorizontalTrivia(directive, pos))
-    return std::nullopt;
-
-  const size_t keywordBegin = pos;
-  if (consumeIncludeDirectiveKeyword(directive, pos, "include_next"))
-    return std::make_pair(keywordBegin, pos);
-  pos = keywordBegin;
-  if (consumeIncludeDirectiveKeyword(directive, pos, "include"))
-    return std::make_pair(keywordBegin, pos);
-  return std::nullopt;
-}
-
-// Return the exact byte range of the directive's syntactic header-name token.
-// `expectedTarget` includes its delimiters, e.g. `"leaf.h"` or `<leaf.h>`.
-// If the source uses a macro operand or any spelling the local proof does not
-// model exactly, the caller fails closed and materializes the child instead.
-static std::optional<IncludeDirectiveHeaderOperandRange>
-findIncludeDirectiveHeaderOperandRange(StringRef directive,
-                                       StringRef expectedTarget) {
-  size_t pos = 0;
-  if (!skipIncludeDirectiveHorizontalTrivia(directive, pos))
-    return std::nullopt;
-  if (pos >= directive.size() || directive[pos] != '#')
-    return std::nullopt;
-  ++pos;
-  if (!skipIncludeDirectiveHorizontalTrivia(directive, pos))
-    return std::nullopt;
-
-  if (!consumeIncludeDirectiveKeyword(directive, pos, "include_next")) {
-    if (!consumeIncludeDirectiveKeyword(directive, pos, "include"))
-      return std::nullopt;
-  }
-
-  if (!skipIncludeDirectiveHorizontalTrivia(directive, pos))
-    return std::nullopt;
-  if (expectedTarget.empty())
-    return std::nullopt;
-  if (!directive.substr(pos).starts_with(expectedTarget))
-    return std::nullopt;
-
-  return IncludeDirectiveHeaderOperandRange{pos, pos + expectedTarget.size()};
-}
-
-/// Return the first non-comment raw token in \p text, if any.
-static std::optional<LexBoundaryToken> firstLexToken(StringRef text,
-                                                    const LangOptions &lang);
-/// Return the last non-comment raw token in \p text, if any.
-static std::optional<LexBoundaryToken> lastLexToken(StringRef text,
-                                                   const LangOptions &lang);
-/// True when adjacent spellings would lex differently without a separating
-/// space.
-static bool needsLexicalSeparator(const LexBoundaryToken &left,
-                                  const LexBoundaryToken &right,
-                                  const LangOptions &lang);
 /// True for the narrow punctuation set that may replace a horizontal source
 /// gap after lexical-separation proof.
 static bool isSeparatorGapReplacementPunctuation(tok::TokenKind kind);
@@ -295,42 +144,8 @@ static bool hasTopLevelCommaWithLexer(StringRef text, const LangOptions &lang);
 static void enumerateTopLevelBalancedCutPointsWithLexer(
     StringRef text, const LangOptions &lang,
     function_ref<void(unsigned)> emitCut);
-/// Convert a raw-lexer token location into an offset relative to its scratch
-/// buffer's artificial base location.
-static size_t tokenOffsetFromBase(const Token &token, SourceLocation baseLoc);
-/// Return the one-past-end byte offset for a raw-lexer token in its scratch
-/// buffer.
-static size_t tokenEndOffsetFromBase(const Token &token, SourceLocation baseLoc);
-
-/// Return the logical filename spelling to restore when an include expansion is
-/// replayed as materialized source.
-///
-/// This spelling is part of the semantic source state: a preserved `__FILE__` or
-/// `__FILE_NAME__` in the materialized body observes the filename established by
-/// the surrounding line-control wrapper, not the filesystem path used to read the
-/// header bytes.  Prefer the producer-entered spelling and retain the old
-/// resolved_path/target fallbacks only for legacy maps that lack split metadata.
-inline std::string resolveHeaderPath(const RefoldModel::IncludeItem &inc) {
-  StringRef producerSpelling = producerEnteredFileSpelling(inc);
-  return !producerSpelling.empty()
-             ? producerSpelling.str()
-             : stringutils::stripHeaderToken(inc.target).str();
-}
-
-/// Return the physical-ish path used to load a materialized include body.
-///
-/// Do not use this value as a `#line` filename or file-observer proof target.
-/// New maps deliberately split physical identity (`opened_path`) from the
-/// producer-entered filename spelling (`entered_file_spelling`); conflating the
-/// two would either make `__FILE__` observe a canonicalized path or fail to read
-/// headers whose entered spelling was only meaningful inside Clang's search
-/// context.
-inline std::string resolveHeaderLoadPath(const RefoldModel::IncludeItem &inc) {
-  if (std::optional<std::filesystem::path> physical =
-          producerPhysicalIncludePath(inc))
-    return physical->string();
-  return resolveHeaderPath(inc);
-}
+// Include materialization path/load helpers now live with the include
+// materialization implementation.
 
 /// True iff the producer proved the invocation callee comes from a literal
 /// macro name rather than from a formal/argument-derived callee position.
@@ -339,652 +154,97 @@ inline bool hasLiteralMacroCalleeOrigin(
   return mi.calleeOrigin.kind == MacroCalleeOriginKind::LiteralMacroName;
 }
 
-/// Controls which conditional arms must have no materialized PP tokens for a
-/// preserved conditional island to be source-neutral.
-enum class NeutralConditionalArmSpanMode { AllArms, SelectedArmsOnly };
-
-/// One complete locally-neutral diagnostic pragma-state island.
-///
-/// `#pragma clang/GCC diagnostic push/pop` forms a stack discipline: pushes
-/// save the current diagnostic mapping, settings mutate only the top frame, and
-/// pops restore the previous mapping.  A fully balanced island that starts and
-/// ends at stack depth zero, contains only diagnostic settings while depth is
-/// positive, and crosses only trivia has identity net state at its boundaries.
-/// Such an island may be carried through a source gap without changing the
-/// preprocessing token stream or the diagnostic state observed by preserved
-/// suffix source.
-struct BalancedDiagnosticPragmaStateIsland {
-  uint64_t begin = 0;
-  uint64_t end = 0;
-  uint64_t id = 0;
-};
-
-/// Return true iff a source-gap byte slice is ignorable preprocessing trivia.
-///
-/// mixed-owner tiling uses this predicate only for bytes that sit
-/// between modeled zero-token state owners.  The owner-state proof module owns
-/// the shared raw-lexer trivia theorem; this engine-local wrapper preserves the
-/// existing call boundary for mixed-owner tiling without duplicating the lexer
-/// implementation.
-static bool sourceTextIsOnlyIgnorableGapTrivia(StringRef text,
-                                               const LangOptions &lang) {
-  return sourceTextIsOnlyWhitespaceAndCompleteComments(text, lang);
-}
-
-/// Return the normalized spelling used to compare pragma-state islands across
-/// source and B replay surfaces.
+/// Decode the restricted string-literal payloads that macro stringification
+/// proofs can invert without changing the existing fail-closed policy.
 static std::optional<std::string>
-canonicalDiagnosticPragmaStateDirectiveText(StringRef text,
-                                            const LangOptions &lang) {
-  std::optional<ParsedDiagnosticPragmaStateDirective> parsed =
-      parseDiagnosticPragmaStateDirective(text, lang);
-  if (!parsed)
+decodeSimpleStringLiteralToken(StringRef spelling) {
+  size_t quote = spelling.find('"');
+  if (quote == StringRef::npos)
     return std::nullopt;
-
+  size_t endQuote = spelling.rfind('"');
+  if (endQuote == StringRef::npos || endQuote <= quote)
+    return std::nullopt;
+  StringRef body = spelling.slice(quote + 1, endQuote);
   std::string out;
-  out += "#pragma ";
-  out += parsed->namespaceName.str();
-  out += " diagnostic ";
-  out += parsed->actionName.str();
-  if (parsed->action == DiagnosticPragmaStateAction::Setting) {
-    out += " ";
-    out += parsed->optionSpelling.str();
+  out.reserve(body.size());
+  for (size_t i = 0; i < body.size(); ++i) {
+    if (body[i] != '\\') {
+      out.push_back(body[i]);
+      continue;
+    }
+    if (++i >= body.size())
+      return std::nullopt;
+    // This generated-callee proof only inverts the ordinary escapes that
+    // stringification introduces for spelling preservation. Numeric and
+    // line-continuation escapes are left to the existing realization paths.
+    switch (body[i]) {
+    case '\\':
+    case '"':
+      out.push_back(body[i]);
+      break;
+    case 'n':
+      out.push_back('\n');
+      break;
+    case 't':
+      out.push_back('\t');
+      break;
+    default:
+      return std::nullopt;
+    }
   }
-  out += "\n";
   return out;
 }
 
-/// Canonicalize `text` iff it is exactly one locally balanced diagnostic
-/// pragma-state island plus trivia.
-///
-/// This function is the replay-side counterpart to
-/// collectBalancedDiagnosticPragmaStateIslands().  The source collector proves
-/// that an island has identity net state; this helper proves that a B replay
-/// surface already contains the same state island, so emission must not append
-/// the original source island a second time.
-static std::optional<std::string>
-canonicalBalancedDiagnosticPragmaStateIslandText(StringRef text,
-                                                 const LangOptions &lang) {
-  std::string canonical;
-  std::optional<StringRef> namespaceName;
-  unsigned depth = 0;
-  bool sawDirective = false;
-
-  size_t cursor = 0;
-  while (cursor < text.size()) {
-    size_t lineEnd = cursor;
-    while (lineEnd < text.size() && text[lineEnd] != '\n')
-      ++lineEnd;
-    const size_t next = lineEnd < text.size() ? lineEnd + 1 : lineEnd;
-    StringRef line = text.slice(cursor, next);
-
-    if (!stringutils::lineStartsWithDirectiveKeyword(line, "pragma")) {
-      if (!sourceTextIsOnlyWhitespaceAndCompleteComments(line, lang))
-        return std::nullopt;
-      cursor = next;
-      continue;
-    }
-
-    std::optional<ParsedDiagnosticPragmaStateDirective> parsed =
-        parseDiagnosticPragmaStateDirective(line, lang);
-    if (!parsed)
-      return std::nullopt;
-    if (namespaceName && *namespaceName != parsed->namespaceName)
-      return std::nullopt;
-    namespaceName = parsed->namespaceName;
-
-    switch (parsed->action) {
-    case DiagnosticPragmaStateAction::Push:
-      ++depth;
-      break;
-    case DiagnosticPragmaStateAction::Pop:
-      if (depth == 0)
-        return std::nullopt;
-      --depth;
-      break;
-    case DiagnosticPragmaStateAction::Setting:
-      if (depth == 0)
-        return std::nullopt;
-      break;
-    }
-
-    std::optional<std::string> directiveCanonical =
-        canonicalDiagnosticPragmaStateDirectiveText(line, lang);
-    if (!directiveCanonical)
-      return std::nullopt;
-    canonical += *directiveCanonical;
-    sawDirective = true;
-    cursor = next;
-  }
-
-  if (!sawDirective || depth != 0)
+/// Return the unique trimmed occurrence of \p needle in \p haystack.
+static std::optional<std::pair<size_t, size_t>>
+findUniqueTrimmedSubstring(StringRef haystack, StringRef needle) {
+  needle = needle.trim();
+  if (needle.empty())
     return std::nullopt;
-  return canonical;
+  size_t pos = haystack.find(needle);
+  if (pos == StringRef::npos)
+    return std::nullopt;
+  if (haystack.find(needle, pos + 1) != StringRef::npos)
+    return std::nullopt;
+  return std::make_pair(pos, pos + needle.size());
 }
 
-/// Return true iff `replacement` already contains the same locally balanced
-/// diagnostic pragma-state island as `sourceIslandText`.
-///
-/// Balanced pragma islands are zero-normal-token state artifacts: after
-/// sideband normalization, the ordinary B replacement bytes may still contain
-/// their raw directive spellings even though the structural token diff does
-/// not.  When the B surface carries the island, copying the original source
-/// island as a preserved gap would duplicate `#pragma` directives and change
-/// validation. The proof is deliberately narrow: only a complete canonical
-/// island match suppresses source-gap emission; otherwise the caller preserves
-/// the source island or fails through the existing owner proof.
-static bool balancedDiagnosticPragmaStateIslandIsCarriedByReplacement(
-    StringRef sourceIslandText, StringRef replacement,
-    const LangOptions &lang) {
-  std::optional<std::string> sourceCanonical =
-      canonicalBalancedDiagnosticPragmaStateIslandText(sourceIslandText, lang);
-  if (!sourceCanonical)
-    return false;
+/// Build the minimal token-edit envelope spanning two pure-insertion frontiers.
+static diffutils::Hunk buildCombinedInsertionEnvelope(
+    const diffutils::Hunk &left, const diffutils::Hunk &right) {
+  diffutils::Hunk env;
+  env.aStart = std::min(left.aStart, right.aStart);
+  env.aEnd = std::max(left.aStart, right.aStart);
+  env.bStart = std::min(left.bStart, right.bStart);
+  env.bEnd = std::max(left.bEnd, right.bEnd);
+  return env;
+}
 
-  std::string currentCanonical;
-  std::optional<StringRef> currentNamespace;
-  unsigned depth = 0;
-
-  auto reset = [&] {
-    currentCanonical.clear();
-    currentNamespace.reset();
-    depth = 0;
-  };
-
-  size_t cursor = 0;
-  while (cursor < replacement.size()) {
-    size_t lineEnd = cursor;
-    while (lineEnd < replacement.size() && replacement[lineEnd] != '\n')
-      ++lineEnd;
-    const size_t next = lineEnd < replacement.size() ? lineEnd + 1 : lineEnd;
-    StringRef line = replacement.slice(cursor, next);
-
-    if (!stringutils::lineStartsWithDirectiveKeyword(line, "pragma")) {
-      if (!sourceTextIsOnlyWhitespaceAndCompleteComments(line, lang))
-        reset();
-      cursor = next;
-      continue;
-    }
-
-    std::optional<ParsedDiagnosticPragmaStateDirective> parsed =
-        parseDiagnosticPragmaStateDirective(line, lang);
-    std::optional<std::string> directiveCanonical =
-        canonicalDiagnosticPragmaStateDirectiveText(line, lang);
-    if (!parsed || !directiveCanonical) {
-      reset();
-      cursor = next;
-      continue;
-    }
-
-    if ((currentNamespace && *currentNamespace != parsed->namespaceName) ||
-        (!currentCanonical.empty() && depth == 0))
-      reset();
-    currentNamespace = parsed->namespaceName;
-
-    bool validAction = true;
-    switch (parsed->action) {
-    case DiagnosticPragmaStateAction::Push:
-      ++depth;
+/// Remove identical A/B token spelling at both edges of a candidate hunk.
+static diffutils::Hunk trimCommonEdgeTokens(diffutils::Hunk hunk,
+                                            ArrayRef<PPTok> aToks,
+                                            ArrayRef<PPTok> bToks) {
+  while (hunk.aStart < hunk.aEnd && hunk.bStart < hunk.bEnd) {
+    size_t aIdx = static_cast<size_t>(hunk.aStart);
+    size_t bIdx = static_cast<size_t>(hunk.bStart);
+    if (aIdx >= aToks.size() || bIdx >= bToks.size())
       break;
-    case DiagnosticPragmaStateAction::Pop:
-      if (depth == 0) {
-        validAction = false;
-        break;
-      }
-      --depth;
+    if (aToks[aIdx].spelling != bToks[bIdx].spelling)
       break;
-    case DiagnosticPragmaStateAction::Setting:
-      if (depth == 0)
-        validAction = false;
+    ++hunk.aStart;
+    ++hunk.bStart;
+  }
+  while (hunk.aEnd > hunk.aStart && hunk.bEnd > hunk.bStart) {
+    size_t aIdx = static_cast<size_t>(hunk.aEnd - 1);
+    size_t bIdx = static_cast<size_t>(hunk.bEnd - 1);
+    if (aIdx >= aToks.size() || bIdx >= bToks.size())
       break;
-    }
-
-    if (!validAction) {
-      reset();
-      cursor = next;
-      continue;
-    }
-
-    currentCanonical += *directiveCanonical;
-    if (depth == 0) {
-      if (currentCanonical == *sourceCanonical)
-        return true;
-      reset();
-    }
-
-    cursor = next;
+    if (aToks[aIdx].spelling != bToks[bIdx].spelling)
+      break;
+    --hunk.aEnd;
+    --hunk.bEnd;
   }
-
-  return false;
-}
-
-/// Collect top-level balanced diagnostic pragma-state islands in a source gap.
-///
-/// This is the pragma/state-effect invariant in mechanical form.  A
-/// pragma sequence can be treated as source-neutral only when:
-///
-///  * every directive belongs to the caller's current owner surface;
-///  * every directive parses as `#pragma clang/GCC diagnostic ...`;
-///  * all directives in one island use the same diagnostic namespace;
-///  * stack depth never goes negative and returns to zero;
-///  * settings occur only while a pushed frame is active; and
-///  * the bytes crossed between directives are trivia only.
-///
-/// The island is not deleted by this helper; callers preserve the original
-/// source bytes as an explicit gap piece.  The proof is therefore about the net
-/// boundary state, not about reconstructing or normalizing pragma spelling.
-static void collectBalancedDiagnosticPragmaStateIslands(
-    const RefoldModel &model, StringRef ownerBytes, uint64_t gapBegin,
-    uint64_t gapEnd,
-    function_ref<bool(const RefoldModel::PragmaDirective &)> pragmaBelongs,
-    SmallVectorImpl<BalancedDiagnosticPragmaStateIsland> &out,
-    const LangOptions &lang) {
-  if (gapBegin >= gapEnd || gapEnd > ownerBytes.size())
-    return;
-
-  SmallVector<const RefoldModel::PragmaDirective *, 8> pragmas;
-  for (const auto &pragma : model.GetPragmas()) {
-    if (!pragmaBelongs(pragma))
-      continue;
-    if (gapBegin <= pragma.siteB && pragma.siteB < pragma.siteE &&
-        pragma.siteE <= gapEnd)
-      pragmas.push_back(&pragma);
-  }
-  if (pragmas.empty())
-    return;
-
-  llvm::sort(pragmas, [](const RefoldModel::PragmaDirective *lhs,
-                         const RefoldModel::PragmaDirective *rhs) {
-    if (lhs->siteB != rhs->siteB)
-      return lhs->siteB < rhs->siteB;
-    if (lhs->siteE != rhs->siteE)
-      return lhs->siteE < rhs->siteE;
-    return lhs->id < rhs->id;
-  });
-
-  for (size_t i = 0; i < pragmas.size(); ++i) {
-    const RefoldModel::PragmaDirective *first = pragmas[i];
-    std::optional<ParsedDiagnosticPragmaStateDirective> firstParsed =
-        parseDiagnosticPragmaStateDirective(first->text, lang);
-    if (!firstParsed ||
-        firstParsed->action != DiagnosticPragmaStateAction::Push) {
-      continue;
-    }
-
-    unsigned depth = 0;
-    uint64_t islandEnd = first->siteB;
-    bool valid = true;
-
-    for (size_t j = i; j < pragmas.size(); ++j) {
-      const RefoldModel::PragmaDirective *cur = pragmas[j];
-      if (cur->siteB < islandEnd ||
-          !sourceTextIsOnlyWhitespaceAndCompleteComments(
-              ownerBytes.slice(islandEnd, cur->siteB), lang)) {
-        valid = false;
-        break;
-      }
-
-      std::optional<ParsedDiagnosticPragmaStateDirective> parsed =
-          parseDiagnosticPragmaStateDirective(cur->text, lang);
-      if (!parsed || parsed->namespaceName != firstParsed->namespaceName) {
-        valid = false;
-        break;
-      }
-
-      switch (parsed->action) {
-      case DiagnosticPragmaStateAction::Push:
-        ++depth;
-        break;
-      case DiagnosticPragmaStateAction::Pop:
-        if (depth == 0) {
-          valid = false;
-          break;
-        }
-        --depth;
-        break;
-      case DiagnosticPragmaStateAction::Setting:
-        if (depth == 0) {
-          valid = false;
-          break;
-        }
-        break;
-      }
-      if (!valid)
-        break;
-
-      islandEnd = cur->siteE;
-      if (depth == 0) {
-        out.push_back({first->siteB, islandEnd, first->id});
-        i = j;
-        break;
-      }
-    }
-  }
-}
-
-/// Owner-specific hooks for the shared neutral conditional-island proof.
-///
-/// The proof itself is owner-polymorphic: TU gaps, pure include-closure gaps,
-/// and header-owned gaps have the same first-order invariant, but differ in how
-/// model records are associated with the current owner surface and how neutral
-/// include/macro artifacts are discharged.
-struct NeutralConditionalIslandPolicy {
-  StringRef sourceText;
-  bool requireGroupBeginAtLineStart = false;
-  NeutralConditionalArmSpanMode armSpanMode =
-      NeutralConditionalArmSpanMode::SelectedArmsOnly;
-
-  function_ref<bool(const RefoldModel::CondGroup &)> groupBelongs;
-  function_ref<bool(const RefoldModel::IncludeItem &)> includeBelongs;
-  function_ref<bool(const RefoldModel::IncludeItem &)> includeIsNeutral;
-  function_ref<bool(const RefoldModel::MacroDirective &)> directiveBelongs;
-  function_ref<bool(const RefoldModel::PragmaDirective &)> pragmaBelongs;
-  function_ref<bool(const RefoldModel::MacroInvocation &)> macroBelongs;
-  function_ref<bool(const RefoldModel::MacroInvocation &)> macroIsNeutral;
-};
-
-/// Return true iff \p arm has A-side PP material that would make a preserved
-/// conditional island source-bearing under \p mode.
-static bool neutralConditionalArmHasMaterializedTokens(
-    const RefoldModel::CondArm &arm, NeutralConditionalArmSpanMode mode) {
-  if (mode == NeutralConditionalArmSpanMode::SelectedArmsOnly &&
-      !arm.selected)
-    return false;
-  return arm.span && arm.span->IsValid() && arm.span->begin < arm.span->end;
-}
-
-/// Recursive implementation for neutral conditional-island proof.
-///
-/// A complete conditional group may be preserved as neutral source iff it is
-/// wholly inside the source gap, has no materialized PP tokens under the
-/// caller-selected arm policy, and every recorded arm-body artifact is either
-/// owned by a recursively neutral nested conditional island or independently
-/// discharges the appropriate neutral macro/include proof.
-static bool conditionalGroupIsNeutralIslandImpl(
-    const RefoldModel &model, const RefoldModel::CondGroup &group,
-    uint64_t gapBegin, uint64_t gapEnd,
-    const NeutralConditionalIslandPolicy &policy,
-    SmallVectorImpl<uint64_t> &recursionStack) {
-  if (!policy.groupBelongs(group))
-    return false;
-  if (group.groupB >= group.groupE ||
-      group.groupE > policy.sourceText.size())
-    return false;
-  if (group.groupB < gapBegin || gapEnd < group.groupE)
-    return false;
-  if (policy.requireGroupBeginAtLineStart &&
-      !stringutils::beginsLineAfterWs(policy.sourceText, group.groupB))
-    return false;
-
-  for (uint64_t activeId : recursionStack)
-    if (activeId == group.id)
-      return false;
-
-  for (const RefoldModel::CondArm &arm : group.arms)
-    if (neutralConditionalArmHasMaterializedTokens(arm, policy.armSpanMode))
-      return false;
-
-  recursionStack.push_back(group.id);
-  auto popStack = llvm::make_scope_exit([&] { recursionStack.pop_back(); });
-
-  auto insideGroup = [&](uint64_t b, uint64_t e) {
-    return group.groupB <= b && b < e && e <= group.groupE;
-  };
-
-  auto insideAnyArmBody = [&](uint64_t b, uint64_t e) {
-    for (const RefoldModel::CondArm &arm : group.arms)
-      if (arm.bodyB <= b && b < e && e <= arm.bodyE)
-        return true;
-    return false;
-  };
-
-  auto insideNeutralNestedConditional = [&](uint64_t b, uint64_t e) {
-    for (const auto &nested : model.GetConds()) {
-      if (nested.id == group.id)
-        continue;
-      if (!policy.groupBelongs(nested))
-        continue;
-      if (nested.groupB < group.groupB || group.groupE < nested.groupE)
-        continue;
-      if (!(nested.groupB <= b && b < e && e <= nested.groupE))
-        continue;
-      if (!insideAnyArmBody(nested.groupB, nested.groupE))
-        continue;
-      if (conditionalGroupIsNeutralIslandImpl(
-              model, nested, group.groupB, group.groupE, policy,
-              recursionStack))
-        return true;
-    }
-    return false;
-  };
-
-  for (const auto &inc : model.GetIncludes()) {
-    if (!policy.includeBelongs(inc) || !insideGroup(inc.siteB, inc.siteE))
-      continue;
-    if (insideNeutralNestedConditional(inc.siteB, inc.siteE))
-      continue;
-    if (insideAnyArmBody(inc.siteB, inc.siteE) && policy.includeIsNeutral(inc))
-      continue;
-    return false;
-  }
-
-  // Macro-state directives inside the preserved group are allowed.  Unlike a
-  // consumed opaque gap, a preserved complete conditional island carries the
-  // directive spelling forward in source order, so active #define/#undef state
-  // transitions remain visible to the suffix exactly through the source text
-  // that originally produced them.  Nested conditional islands already own
-  // their inner directives recursively, so there is no separate directive
-  // rejection here.  Pragmas remain fail-closed below because the refold map
-  // does not currently model their state domain precisely enough to prove that
-  // preserving the surrounding island preserves every relevant compiler state
-  // interaction.
-
-  for (const auto &pragma : model.GetPragmas()) {
-    if (policy.pragmaBelongs(pragma) &&
-        insideGroup(pragma.siteB, pragma.siteE) &&
-        !insideNeutralNestedConditional(pragma.siteB, pragma.siteE))
-      return false;
-  }
-
-  // Macro invocations in #if/#elif control lines are allowed because the
-  // complete conditional group is preserved verbatim.  Arm-body macro
-  // invocations must either belong to a neutral nested conditional island or
-  // independently prove source-neutral zero-token behavior.
-  for (const auto &macro : model.GetMacroInvocations()) {
-    if (!policy.macroBelongs(macro) || !macro.invB || !macro.invE ||
-        !insideGroup(*macro.invB, *macro.invE) ||
-        !insideAnyArmBody(*macro.invB, *macro.invE))
-      continue;
-    if (insideNeutralNestedConditional(*macro.invB, *macro.invE))
-      continue;
-    if (policy.macroIsNeutral(macro))
-      continue;
-    return false;
-  }
-
-  return true;
-}
-
-/// Return true iff \p group discharges the shared neutral conditional-island
-/// proof under the caller-provided owner policy.
-static bool conditionalGroupIsNeutralIsland(
-    const RefoldModel &model, const RefoldModel::CondGroup &group,
-    uint64_t gapBegin, uint64_t gapEnd,
-    const NeutralConditionalIslandPolicy &policy) {
-  SmallVector<uint64_t, 8> recursionStack;
-  return conditionalGroupIsNeutralIslandImpl(model, group, gapBegin, gapEnd,
-                                             policy, recursionStack);
-}
-
-/// Consume a token-paste chain only in the placemarker domain.
-///
-/// This helper is shared by the TU mixed-closure and header include-envelope
-/// zero-token macro proofs.  A paste chain is neutral only when every operand
-/// is a formal parameter and every corresponding invocation argument has
-/// already discharged the caller's token-empty argument proof.  That admits
-/// forms such as `#define CAT(a,b) a ## b` with `CAT(,)`, while still rejecting
-/// literals, non-empty operands, unrecorded identifiers, and paste chains that
-/// synthesize real PP-token material.
-static bool consumeNeutralPlacemarkerPasteChain(
-    StringRef text, size_t &pos, size_t end, unsigned firstParam,
-    const DenseMap<StringRef, unsigned> &paramIndexByName,
-    function_ref<bool(size_t &, size_t)> skipReplacementTriviaUntil,
-    function_ref<bool(unsigned)> argumentRangeIsNeutral,
-    SmallVectorImpl<unsigned> &usedParams) {
-  size_t cursor = pos;
-  if (!skipReplacementTriviaUntil(cursor, end))
-    return false;
-  if (cursor + 1 >= end || text[cursor] != '#' || text[cursor + 1] != '#')
-    return false;
-
-  if (!argumentRangeIsNeutral(firstParam))
-    return false;
-  usedParams.push_back(firstParam);
-
-  while (cursor + 1 < end && text[cursor] == '#' && text[cursor + 1] == '#') {
-    cursor += 2;
-    if (!skipReplacementTriviaUntil(cursor, end))
-      return false;
-    if (cursor >= end || !stringutils::isIdentStart(text[cursor]))
-      return false;
-
-    const size_t operandBegin = cursor++;
-    while (cursor < end && stringutils::isIdentPart(text[cursor]))
-      ++cursor;
-    StringRef operand = text.slice(operandBegin, cursor);
-
-    auto paramIt = paramIndexByName.find(operand);
-    if (paramIt == paramIndexByName.end())
-      return false;
-    if (!argumentRangeIsNeutral(paramIt->second))
-      return false;
-    usedParams.push_back(paramIt->second);
-
-    if (!skipReplacementTriviaUntil(cursor, end))
-      return false;
-  }
-
-  pos = cursor;
-  return true;
-}
-
-/// Byte envelope covered by normalized owner-proof source pieces.
-struct OwnerProofSourceEnvelope { uint64_t begin = 0, end = 0; };
-
-/// Owner-proof interval accessors. Structural pieces expose begin/end; merged
-/// TU byte ranges are represented as plain pairs.
-template <typename PieceT>
-static uint64_t ownerProofPieceBegin(const PieceT &piece) {
-  return piece.begin;
-}
-
-template <typename PieceT>
-static uint64_t ownerProofPieceEnd(const PieceT &piece) {
-  return piece.end;
-}
-
-static uint64_t
-ownerProofPieceBegin(const std::pair<uint64_t, uint64_t> &piece) {
-  return piece.first;
-}
-
-static uint64_t ownerProofPieceEnd(const std::pair<uint64_t, uint64_t> &piece) {
-  return piece.second;
-}
-
-/// Sort by source interval, absorb caller-approved nested pieces, and reject
-/// every other overlap as ambiguous.
-template <typename PieceT, typename KindLess, typename NestedCovered>
-static bool normalizeOwnerProofPieces(SmallVectorImpl<PieceT> &pieces,
-                                      KindLess kindLess,
-                                      NestedCovered nestedCovered) {
-  llvm::sort(pieces, [&](const PieceT &lhs, const PieceT &rhs) {
-    const uint64_t lhsBegin = ownerProofPieceBegin(lhs);
-    const uint64_t rhsBegin = ownerProofPieceBegin(rhs);
-    if (lhsBegin != rhsBegin)
-      return lhsBegin < rhsBegin;
-
-    const uint64_t lhsEnd = ownerProofPieceEnd(lhs);
-    const uint64_t rhsEnd = ownerProofPieceEnd(rhs);
-    if (lhsEnd != rhsEnd)
-      return lhsEnd > rhsEnd;
-
-    if (kindLess(lhs, rhs))
-      return true;
-    if (kindLess(rhs, lhs))
-      return false;
-    return lhs.id < rhs.id;
-  });
-
-  SmallVector<PieceT, 8> outerPieces;
-  for (const PieceT &piece : pieces) {
-    const uint64_t pieceBegin = ownerProofPieceBegin(piece);
-    const uint64_t pieceEnd = ownerProofPieceEnd(piece);
-    if (outerPieces.empty() ||
-        pieceBegin >= ownerProofPieceEnd(outerPieces.back())) {
-      outerPieces.push_back(piece);
-      continue;
-    }
-
-    const PieceT &outer = outerPieces.back();
-    if (ownerProofPieceBegin(outer) <= pieceBegin &&
-        pieceEnd <= ownerProofPieceEnd(outer) && nestedCovered(outer, piece)) {
-      continue;
-    }
-
-    return false;
-  }
-
-  pieces.clear();
-  pieces.append(outerPieces.begin(), outerPieces.end());
-  return true;
-}
-
-/// Prove every physical gap between normalized source-envelope pieces.
-template <typename PieceT, typename ProveGap>
-static bool proveOwnerSourceEnvelopeGaps(
-    const SmallVectorImpl<PieceT> &pieces, ProveGap proveGap) {
-  if (pieces.empty())
-    return true;
-
-  uint64_t cursor = ownerProofPieceEnd(pieces.front());
-  for (size_t idx = 1; idx < pieces.size(); ++idx) {
-    const PieceT &piece = pieces[idx];
-    const uint64_t pieceBegin = ownerProofPieceBegin(piece);
-    const uint64_t pieceEnd = ownerProofPieceEnd(piece);
-    if (pieceBegin < cursor)
-      return false;
-    if (pieceBegin > cursor && !proveGap(cursor, pieceBegin))
-      return false;
-    cursor = pieceEnd;
-  }
-
-  return true;
-}
-
-/// Normalize and tile one owner-local source gap.
-template <typename PieceT, typename KindLess, typename NestedCovered,
-          typename NeutralRange, typename ConsumePiece>
-static bool proveOwnerProofGap(SmallVectorImpl<PieceT> &pieces,
-                               uint64_t gapBegin, uint64_t gapEnd,
-                               KindLess kindLess, NestedCovered nestedCovered,
-                               NeutralRange neutralRange,
-                               ConsumePiece consumePiece) {
-  if (!normalizeOwnerProofPieces(pieces, kindLess, nestedCovered))
-    return false;
-
-  uint64_t cursor = gapBegin;
-  for (const PieceT &piece : pieces) {
-    const uint64_t pieceBegin = ownerProofPieceBegin(piece);
-    const uint64_t pieceEnd = ownerProofPieceEnd(piece);
-    if (pieceBegin < cursor)
-      return false;
-    if (!neutralRange(cursor, pieceBegin))
-      return false;
-    consumePiece(piece);
-    cursor = pieceEnd;
-  }
-  return neutralRange(cursor, gapEnd);
+  return hunk;
 }
 
 /// Recover the spelled text of one invocation argument from the producer-side
@@ -1748,57 +1008,6 @@ static PasteReplaySegmentationResult segmentPastedTokenByReplayWitness(
   return solve(solve, /*partIdx=*/0, /*posB=*/0);
 }
 
-/// Slice the exact byte coverage of tokens [startTok,endTok).
-///
-/// The returned range begins at the first token's byte offset and ends at the
-/// last token's spelling end, excluding trailing inter-token whitespace that
-/// belongs to later untouched text.
-static StringRef sliceExactTokenCoverage(ArrayRef<size_t> tokOff,
-                                         ArrayRef<PPTok> toks, StringRef source,
-                                         uint64_t startTok, uint64_t endTok) {
-  if (tokOff.empty() || toks.empty() || source.empty() || endTok <= startTok)
-    return "";
-
-  const uint64_t tokCount = static_cast<uint64_t>(toks.size());
-  uint64_t loTok = std::clamp(startTok, static_cast<uint64_t>(0), tokCount);
-  uint64_t hiTok = std::clamp(endTok, loTok, tokCount);
-  if (hiTok <= loTok || loTok >= tokCount)
-    return "";
-
-  size_t lo = tokOff[static_cast<size_t>(loTok)];
-  const size_t lastTok = static_cast<size_t>(hiTok - 1);
-  size_t hi = tokOff[lastTok] + toks[lastTok].spelling.size();
-
-  const size_t sourceLen = source.size();
-  lo = std::clamp(lo, size_t(0), sourceLen);
-  hi = std::clamp(hi, lo, sourceLen);
-  return source.substr(lo, hi - lo);
-}
-
-/// Slice the full byte envelope of tokens [startTok,endTok).
-///
-/// Unlike sliceExactTokenCoverage(), this preserves trailing whitespace or
-/// newlines up to the next token boundary because B-side insertion payloads may
-/// rely on that trivia for stable physical layout.
-static StringRef sliceTokenEnvelope(ArrayRef<size_t> tokOff, StringRef source,
-                                    uint64_t startTok, uint64_t endTok) {
-  if (tokOff.empty() || source.empty() || endTok <= startTok)
-    return "";
-
-  const uint64_t tokCount = static_cast<uint64_t>(tokOff.size());
-  uint64_t loTok = std::clamp(startTok, static_cast<uint64_t>(0), tokCount);
-  uint64_t hiTok = std::clamp(endTok, loTok, tokCount);
-  if (hiTok <= loTok || loTok >= tokCount)
-    return "";
-
-  const size_t sourceLen = source.size();
-  size_t lo =
-      std::clamp(tokOff[static_cast<size_t>(loTok)], size_t(0), sourceLen);
-  size_t hi = sourceLen;
-  if (hiTok < tokCount)
-    hi = std::clamp(tokOff[static_cast<size_t>(hiTok)], lo, sourceLen);
-  return source.substr(lo, hi - lo);
-}
 } // namespace
 
 /// Construct the LangOptions used by all raw-lexer helper paths.
@@ -3204,20 +2413,20 @@ bool RefoldEngine::MaybeConsumeOrdinarySeparatorGapForPunctuation(
       intervalOverlapsSpelledArtifact(gapBegin, span.first))
     return false;
 
-  std::optional<LexBoundaryToken> leftTok =
-      lastLexToken(tuBytes.take_front(gapBegin), lexLang_);
-  std::optional<LexBoundaryToken> rightTok =
-      firstLexToken(tuBytes.drop_front(span.first), lexLang_);
-  std::optional<LexBoundaryToken> replFirstTok =
-      firstLexToken(replacement, lexLang_);
-  std::optional<LexBoundaryToken> replLastTok =
-      lastLexToken(replacement, lexLang_);
+  std::optional<RefoldLexBoundaryToken> leftTok =
+      refoldLastLexToken(tuBytes.take_front(gapBegin), lexLang_);
+  std::optional<RefoldLexBoundaryToken> rightTok =
+      refoldFirstLexToken(tuBytes.drop_front(span.first), lexLang_);
+  std::optional<RefoldLexBoundaryToken> replFirstTok =
+      refoldFirstLexToken(replacement, lexLang_);
+  std::optional<RefoldLexBoundaryToken> replLastTok =
+      refoldLastLexToken(replacement, lexLang_);
 
   if (!leftTok || !rightTok || !replFirstTok || !replLastTok ||
       leftTok->End != gapBegin || rightTok->Begin != 0 ||
       !isSeparatorGapReplacementPunctuation(replFirstTok->Kind) ||
-      needsLexicalSeparator(*leftTok, *replFirstTok, lexLang_) ||
-      needsLexicalSeparator(*replLastTok, *rightTok, lexLang_))
+      refoldNeedsLexicalSeparator(*leftTok, *replFirstTok, lexLang_) ||
+      refoldNeedsLexicalSeparator(*replLastTok, *rightTok, lexLang_))
     return false;
 
   span.first = gapBegin;
@@ -5133,7 +4342,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
     if (span->first < *argRange.first || span->second > *argRange.second)
       return false;
 
-    StringRef replacement = sliceExactTokenCoverage(
+    StringRef replacement = refoldSliceExactTokenCoverage(
         bTokOff_, bToks_, bSource_, hunk.bStart, hunk.bEnd);
 
     // Replacing an argument subrange with a top-level comma would split the
@@ -5544,9 +4753,10 @@ std::string RefoldEngine::RunSinglePassRefold() {
         if (h.bStart < h.bEnd) {
           StringRef bSlice =
               h.isInsertOnly()
-                  ? sliceTokenEnvelope(bTokOff_, bSource_, h.bStart, h.bEnd)
-                  : sliceExactTokenCoverage(bTokOff_, bToks_, bSource_,
-                                            h.bStart, h.bEnd);
+                  ? refoldSliceTokenEnvelope(bTokOff_, bSource_, h.bStart,
+                                             h.bEnd)
+                  : refoldSliceExactTokenCoverage(bTokOff_, bToks_, bSource_,
+                                                  h.bStart, h.bEnd);
           repl.assign(bSlice.data(), bSlice.data() + bSlice.size());
           if (h.isInsertOnly()) {
             // Pure insertions use the token envelope, which may include
@@ -5741,9 +4951,9 @@ std::string RefoldEngine::RunSinglePassRefold() {
       } else {
         StringRef bSlice =
             h.isInsertOnly()
-                ? sliceTokenEnvelope(bTokOff_, bSource_, h.bStart, h.bEnd)
-                : sliceExactTokenCoverage(bTokOff_, bToks_, bSource_, h.bStart,
-                                          h.bEnd);
+                ? refoldSliceTokenEnvelope(bTokOff_, bSource_, h.bStart, h.bEnd)
+                : refoldSliceExactTokenCoverage(bTokOff_, bToks_, bSource_,
+                                                h.bStart, h.bEnd);
         repl.assign(bSlice.data(), bSlice.data() + bSlice.size());
         if (h.isInsertOnly()) {
           // For pure insertions the source slice is the *token envelope*, not
@@ -6258,18 +5468,6 @@ std::string RefoldEngine::RunSinglePassRefold() {
     return std::nullopt;
   };
 
-  // Return true when moving `definition` across a source chunk could change how
-  // that chunk preprocesses.  Ordinary replacement/source text observes an
-  // object-like macro by identifier spelling and a function-like macro only by
-  // invocation spelling.  Directive lines are fail-closed hazards because their
-  // effects are not reducible to ordinary macro-name token observation.
-  auto sourceChunkObservesDefinitionWhenCrossed =
-      [&](const RefoldModel::MacroDirective &definition, StringRef macroName,
-          StringRef chunk, StringRef following) {
-        return SourceChunkObservesMacroStateDirectiveWhenCrossed(
-            definition, macroName, chunk, following);
-      };
-
   auto sourceRangeOverlapsFinalTUEditExcept = [&](uint64_t begin, uint64_t end,
                                                   size_t exceptEditIndex) {
     for (size_t editIndex = 0; editIndex < tuEdits.size(); ++editIndex) {
@@ -6377,13 +5575,14 @@ std::string RefoldEngine::RunSinglePassRefold() {
     if (edit.end >= tuBytes.size() || stringutils::isWs(tuBytes[edit.end]))
       return true;
 
-    std::optional<LexBoundaryToken> leftTok = lastLexToken(text, lexLang_);
-    std::optional<LexBoundaryToken> rightTok =
-        firstLexToken(tuBytes.drop_front(edit.end), lexLang_);
+    std::optional<RefoldLexBoundaryToken> leftTok =
+        refoldLastLexToken(text, lexLang_);
+    std::optional<RefoldLexBoundaryToken> rightTok =
+        refoldFirstLexToken(tuBytes.drop_front(edit.end), lexLang_);
     if (!leftTok || !rightTok)
       return true;
 
-    return !needsLexicalSeparator(*leftTok, *rightTok, lexLang_);
+    return !refoldNeedsLexicalSeparator(*leftTok, *rightTok, lexLang_);
   };
 
   // Return true when this macro-state directive is owned by the source
@@ -6613,7 +5812,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
       return std::nullopt;
 
     StringRef carriedSuffix = tuBytes.slice(edit.end, lineEnd);
-    if (sourceChunkObservesDefinitionWhenCrossed(definition, macroName,
+    if (SourceChunkObservesMacroStateDirectiveWhenCrossed(definition, macroName,
                                                  carriedSuffix,
                                                  tuBytes.drop_front(lineEnd))) {
       return std::nullopt;
@@ -6726,7 +5925,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
         // Everything before the first observing replacement token must be safe
         // to move across the active definition.  Otherwise advancing the #undef
         // would silently change macro state for earlier replacement bytes.
-        if (sourceChunkObservesDefinitionWhenCrossed(
+        if (SourceChunkObservesMacroStateDirectiveWhenCrossed(
                 *previousDefinition, undefRef.name, replacementPrefix,
                 replacementText.drop_front(*firstObservationOffset)))
           continue;
@@ -6735,7 +5934,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
         // neutral with respect to the active definition.  This prevents moving
         // the #undef before preserved source that was supposed to expand under
         // the prior #define.
-        if (sourceChunkObservesDefinitionWhenCrossed(
+        if (SourceChunkObservesMacroStateDirectiveWhenCrossed(
                 *previousDefinition, undefRef.name, crossedPrefix,
                 replacementText))
           continue;
@@ -6747,7 +5946,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
         // #undef transition only when they do not observe the definition being
         // killed.  If they do observe it, the #undef cannot be advanced past
         // them.
-        if (sourceChunkObservesDefinitionWhenCrossed(
+        if (SourceChunkObservesMacroStateDirectiveWhenCrossed(
                 *previousDefinition, undefRef.name, carriedSuffix,
                 tuBytes.drop_front(undefTransition->interval.begin)))
           continue;
@@ -6889,13 +6088,13 @@ std::string RefoldEngine::RunSinglePassRefold() {
     // advance.
     StringRef replacementPrefix =
         replacementText.take_front(firstObservationOffset);
-    if (sourceChunkObservesDefinitionWhenCrossed(
+    if (SourceChunkObservesMacroStateDirectiveWhenCrossed(
             previousDefinition, macroName, replacementPrefix,
             replacementText.drop_front(firstObservationOffset)))
       return std::nullopt;
 
     StringRef crossedPrefix = tuBytes.slice(lineStart, edit.start);
-    if (sourceChunkObservesDefinitionWhenCrossed(
+    if (SourceChunkObservesMacroStateDirectiveWhenCrossed(
             previousDefinition, macroName, crossedPrefix, replacementText))
       return std::nullopt;
 
@@ -7247,7 +6446,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
         // If the original same-line prefix needed the definition, placing a
         // synthetic #undef before the line would change preserved source before
         // the replacement.
-        if (sourceChunkObservesDefinitionWhenCrossed(
+        if (SourceChunkObservesMacroStateDirectiveWhenCrossed(
                 definition, ref.name, sameLinePrefix, replacementText))
           continue;
 
@@ -7255,7 +6454,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
         // macro-state barrier/observer.  If it is neutral, the existing carry
         // proof can move the definition after the replacement without adding a
         // synthetic transition.
-        if (!sourceChunkObservesDefinitionWhenCrossed(
+        if (!SourceChunkObservesMacroStateDirectiveWhenCrossed(
                 definition, ref.name,
                 tuBytes.slice(transition->interval.end, edit.start),
                 replacementText))
@@ -7264,7 +6463,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
         // This minimal partition does not restore the definition after the
         // replacement.  Do not synthesize it when later preserved source would
         // observe the old definition; that requires an explicit restore tiling.
-        if (sourceChunkObservesDefinitionWhenCrossed(
+        if (SourceChunkObservesMacroStateDirectiveWhenCrossed(
                 definition, ref.name, untouchedSuffix, StringRef()))
           continue;
 
@@ -7455,7 +6654,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
         // proofs and whole-cover realizations that reconstruct a literal
         // invocation spelling such as `M()`.
         if (!editHasMacroPatchSurfaceInBMacroState(edit) &&
-            sourceChunkObservesDefinitionWhenCrossed(
+            SourceChunkObservesMacroStateDirectiveWhenCrossed(
                 directive, ref.name, tuBytes.slice(edit.start, edit.end),
                 tuBytes.drop_front(edit.end))) {
           continue;
@@ -7494,7 +6693,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
             break;
           StringRef chunk = tuBytes.slice(cursor, other.interval.begin);
           StringRef following = tuBytes.slice(other.interval.begin, edit.start);
-          if (sourceChunkObservesDefinitionWhenCrossed(
+          if (SourceChunkObservesMacroStateDirectiveWhenCrossed(
                   *candidate.directive, candidate.name, chunk, following)) {
             admissible = false;
             break;
@@ -7505,7 +6704,7 @@ std::string RefoldEngine::RunSinglePassRefold() {
           break;
         if (cursor < edit.start) {
           StringRef chunk = tuBytes.slice(cursor, edit.start);
-          if (sourceChunkObservesDefinitionWhenCrossed(*candidate.directive,
+          if (SourceChunkObservesMacroStateDirectiveWhenCrossed(*candidate.directive,
                                                        candidate.name, chunk,
                                                        StringRef(edit.text))) {
             admissible = false;
@@ -9124,51 +8323,6 @@ std::string RefoldEngine::RunSinglePassRefold() {
       sourceGraphIncludeHasIncluderSuppliedLineControlMacroState,
       sourceGraphSubtreeHasLayoutOnlyMaterializationSeed};
 
-  auto recordRejectedSourceGraphCleanup =
-      [&](const RefoldModel::IncludeItem &inc, StringRef sourceGraphPath,
-          StringRef candidateBytes) {
-        if (!sourceGraphOutputs_)
-          return;
-
-        // Source-graph sidecars are path-level artifacts beside the emitted TU.
-        // A previous run may have written a sidecar for a path that this run no
-        // longer proves admissible, for example after a same-spelling include
-        // becomes a surviving alias.  Leaving that stale file in the output
-        // directory can poison --check because quoted include lookup searches
-        // the refolded TU directory before the captured -I headers.
-        //
-        // Record a cleanup candidate instead of deleting here: the driver owns
-        // the output directory policy and will remove the file only if its
-        // bytes still exactly match this rejected generated body and the file
-        // is not the producer-resolved input header.
-        SourceGraphOutput cleanup;
-        cleanup.includeId = inc.id;
-        cleanup.relativePath = sourceGraphPath.str();
-        cleanup.originalTarget = inc.target.str();
-        if (inc.resolvedPath)
-          cleanup.resolvedPath = inc.resolvedPath->str();
-        cleanup.bytes = candidateBytes.str();
-        cleanup.cleanupOnly = true;
-        sourceGraphOutputs_->push_back(std::move(cleanup));
-      };
-
-  auto shouldPreserveIncludeAsSourceGraphOwner =
-      [&](const RefoldModel::IncludeItem &inc,
-          StringRef candidateBytes) -> std::optional<std::string> {
-    if (!sourceGraphOutputs_)
-      return std::nullopt;
-
-    source_graph::SourceGraphOwnerPreservationPlan plan =
-        source_graph::planSourceGraphOwnerPreservation(
-            sourceGraphProofInputs, inc, candidateBytes,
-            sourceGraphProofServices);
-    if (plan.RejectedCleanupRelativePath) {
-      recordRejectedSourceGraphCleanup(inc, *plan.RejectedCleanupRelativePath,
-                                       candidateBytes);
-    }
-    return plan.PreservedRelativePath;
-  };
-
   // Apply TU-level include expansions by replacing the original `#include`
   // directive with the realized expansion text. For includes whose site is in
   // the TU itself (no parent include, and sitePath == tuPath), use the
@@ -9214,18 +8368,18 @@ std::string RefoldEngine::RunSinglePassRefold() {
         }
       }
 
-      if (std::optional<std::string> sourceGraphPath =
-              shouldPreserveIncludeAsSourceGraphOwner(*inc, expText)) {
-        SourceGraphOutput output;
-        output.includeId = inc->id;
-        output.relativePath = *sourceGraphPath;
-        output.originalTarget = inc->target.str();
-        if (inc->resolvedPath)
-          output.resolvedPath = inc->resolvedPath->str();
-        output.bytes = expText;
-        sourceGraphOutputs_->push_back(std::move(output));
-
-        continue;
+      if (sourceGraphOutputs_) {
+        source_graph::SourceGraphOwnerPreservationOutputPlan sourceGraphPlan =
+            source_graph::planSourceGraphOwnerPreservationOutput(
+                sourceGraphProofInputs, *inc, expText, sourceGraphProofServices);
+        if (sourceGraphPlan.RejectedCleanupOutput)
+          sourceGraphOutputs_->push_back(
+              std::move(*sourceGraphPlan.RejectedCleanupOutput));
+        if (sourceGraphPlan.PreservedOutput) {
+          sourceGraphOutputs_->push_back(
+              std::move(*sourceGraphPlan.PreservedOutput));
+          continue;
+        }
       }
 
       if (!repairConsumedDefinitionsForMaterializedInclude(*inc, siteB, siteE,
@@ -9863,20 +9017,6 @@ static bool computeTrimmedTupleElement(StringRef text, size_t begin, size_t end,
   return out.trimBegin != out.trimEnd;
 }
 
-/// Convert a raw-lexer token location into an offset relative to the scratch
-/// buffer's artificial base location.
-static size_t tokenOffsetFromBase(const Token &token,
-                                  SourceLocation baseLoc) {
-  return token.getLocation().getRawEncoding() - baseLoc.getRawEncoding();
-}
-
-/// Return the one-past-end byte offset for a raw-lexer token in the scratch
-/// buffer.
-static size_t tokenEndOffsetFromBase(const Token &token,
-                                     SourceLocation baseLoc) {
-  return tokenOffsetFromBase(token, baseLoc) + token.getLength();
-}
-
 /// Emit every byte boundary in the half-open range `(begin,end]`.
 ///
 /// The caller decides that the entire byte span is safe; this helper preserves
@@ -10053,9 +9193,9 @@ static void enumerateTopLevelBalancedCutPointsWithLexer(
     if (token.is(tok::eof))
       break;
 
-    const size_t tokenBegin = std::min(tokenOffsetFromBase(token, baseLoc),
+    const size_t tokenBegin = std::min(refoldTokenOffsetFromBase(token, baseLoc),
                                        text.size());
-    const size_t tokenEnd = std::min(tokenEndOffsetFromBase(token, baseLoc),
+    const size_t tokenEnd = std::min(refoldTokenEndOffsetFromBase(token, baseLoc),
                                      text.size());
 
     // Whitespace and other bytes skipped by raw lexing remain valid cut points
@@ -10217,92 +9357,14 @@ static bool splitTopLevelTupleElementsWithLexer(
   return true;
 }
 
-/// Lex a snippet into non-comment boundary tokens for maximal-munch checks.
-///
-/// The helper records only token kind, spelling, and byte extent, which is
-/// enough to compare the token stream before and after inserting a single
-/// space.
-static void lexBoundaryTokens(StringRef text, const LangOptions &lang,
-                              SmallVectorImpl<LexBoundaryToken> &out) {
-  out.clear();
-  if (text.empty())
-    return;
-
-  const SourceLocation baseLoc = SourceLocation::getFromRawEncoding(1);
-  std::string lexBuf = text.str();
-  lexBuf.push_back('\0');
-  const char *bufStart = lexBuf.data();
-  const char *bufEnd = bufStart + text.size();
-  Lexer lexer(baseLoc, lang, bufStart, bufStart, bufEnd);
-  Token token;
-
-  while (true) {
-    lexer.LexFromRawLexer(token);
-    if (token.is(tok::eof))
-      break;
-    if (token.is(tok::comment))
-      continue;
-
-    const unsigned offset =
-        token.getLocation().getRawEncoding() - baseLoc.getRawEncoding();
-    out.push_back({token.getKind(),
-                   std::string(text.substr(offset, token.getLength())), offset,
-                   offset + token.getLength()});
-  }
-}
-
-/// Return the first lexer-visible boundary token in `text`, if any.
-static std::optional<LexBoundaryToken> firstLexToken(StringRef text,
-                                                     const LangOptions &lang) {
-  SmallVector<LexBoundaryToken, 8> toks;
-  lexBoundaryTokens(text, lang, toks);
-  if (toks.empty())
-    return std::nullopt;
-  return toks.front();
-}
-
-/// Return the last lexer-visible boundary token in `text`, if any.
-static std::optional<LexBoundaryToken> lastLexToken(StringRef text,
-                                                    const LangOptions &lang) {
-  SmallVector<LexBoundaryToken, 16> toks;
-  lexBoundaryTokens(text, lang, toks);
-  if (toks.empty())
-    return std::nullopt;
-  return toks.back();
-}
-
-/// Return true iff placing `left` and `right` adjacent with no separating
-/// whitespace would change lexical tokenization compared to placing a space
-/// between them.
-static bool needsLexicalSeparator(const LexBoundaryToken &left,
-                                  const LexBoundaryToken &right,
-                                  const LangOptions &lang) {
-  const std::string noSpace = left.Spelling + right.Spelling;
-  const std::string withSpace = left.Spelling + " " + right.Spelling;
-
-  SmallVector<LexBoundaryToken, 8> noSpaceToks;
-  SmallVector<LexBoundaryToken, 8> withSpaceToks;
-  lexBoundaryTokens(noSpace, lang, noSpaceToks);
-  lexBoundaryTokens(withSpace, lang, withSpaceToks);
-
-  if (noSpaceToks.size() != withSpaceToks.size())
-    return true;
-  for (size_t i = 0; i < noSpaceToks.size(); ++i) {
-    if (noSpaceToks[i].Kind != withSpaceToks[i].Kind ||
-        noSpaceToks[i].Spelling != withSpaceToks[i].Spelling)
-      return true;
-  }
-  return false;
-}
-
 /// Return true iff \p kind is separator punctuation that may legitimately
 /// replace a horizontal source gap between two tokens.
 ///
 /// This is intentionally narrower than "left-attachable punctuation": closing
 /// delimiters and operators can carry context-sensitive spacing conventions, so
 /// they are not treated as gap replacements here. Callers must still prove with
-/// `needsLexicalSeparator()` that attaching the punctuation to the token on its
-/// left preserves lexical tokenization.
+/// `refoldNeedsLexicalSeparator()` that attaching the punctuation to the
+/// token on its left preserves lexical tokenization.
 static bool isSeparatorGapReplacementPunctuation(tok::TokenKind kind) {
   switch (kind) {
   case tok::comma:
@@ -10350,8 +9412,8 @@ std::optional<size_t> RefoldEngine::FirstRawIdentifierObservationOffsetInText(
     if (!token.is(tok::raw_identifier) && !token.is(tok::identifier))
       continue;
 
-    const size_t localBegin = tokenOffsetFromBase(token, baseLoc);
-    const size_t localEnd = tokenEndOffsetFromBase(token, baseLoc);
+    const size_t localBegin = refoldTokenOffsetFromBase(token, baseLoc);
+    const size_t localEnd = refoldTokenEndOffsetFromBase(token, baseLoc);
     if (localEnd < localBegin || localEnd > text.size())
       continue;
 
@@ -10411,8 +9473,8 @@ std::optional<size_t> RefoldEngine::FirstFunctionLikeInvocationOffsetInText(
     if (!token.is(tok::raw_identifier) && !token.is(tok::identifier))
       continue;
 
-    const size_t localBegin = tokenOffsetFromBase(token, baseLoc);
-    const size_t localEnd = tokenEndOffsetFromBase(token, baseLoc);
+    const size_t localBegin = refoldTokenOffsetFromBase(token, baseLoc);
+    const size_t localEnd = refoldTokenEndOffsetFromBase(token, baseLoc);
     if (localEnd < localBegin || localEnd > text.size())
       continue;
 
@@ -10455,10 +9517,10 @@ std::string RefoldEngine::PadAtBoundaries(StringRef base, size_t start,
   const bool hasLeadingWs = (*f > 0);
   const bool hasTrailingWs = (*l + 1 < text.size());
 
-  std::optional<LexBoundaryToken> textFirstTok =
-      firstLexToken(StringRef(text), lexLang_);
-  std::optional<LexBoundaryToken> textLastTok =
-      lastLexToken(StringRef(text), lexLang_);
+  std::optional<RefoldLexBoundaryToken> textFirstTok =
+      refoldFirstLexToken(StringRef(text), lexLang_);
+  std::optional<RefoldLexBoundaryToken> textLastTok =
+      refoldLastLexToken(StringRef(text), lexLang_);
 
   const std::optional<char> leftChar =
       (start > 0 && start <= base.size()) ? std::optional<char>(base[start - 1])
@@ -10476,9 +9538,10 @@ std::string RefoldEngine::PadAtBoundaries(StringRef base, size_t start,
   //     would change lexical tokenization.
   if (allowLeft && !hasLeadingWs && start > 0 && start <= base.size() &&
       textFirstTok && (!leftChar || !stringutils::isWs(*leftChar))) {
-    if (std::optional<LexBoundaryToken> leftTok =
-            lastLexToken(base.take_front(start), lexLang_)) {
-      addLeftSpace = needsLexicalSeparator(*leftTok, *textFirstTok, lexLang_);
+    if (std::optional<RefoldLexBoundaryToken> leftTok =
+            refoldLastLexToken(base.take_front(start), lexLang_)) {
+      addLeftSpace =
+          refoldNeedsLexicalSeparator(*leftTok, *textFirstTok, lexLang_);
     }
   }
 
@@ -10492,9 +9555,10 @@ std::string RefoldEngine::PadAtBoundaries(StringRef base, size_t start,
   //     would change lexical tokenization.
   if (allowRight && !hasTrailingWs && end < base.size() && textLastTok &&
       (!rightChar || !stringutils::isWs(*rightChar))) {
-    if (std::optional<LexBoundaryToken> rightTok =
-            firstLexToken(base.drop_front(end), lexLang_)) {
-      addRightSpace = needsLexicalSeparator(*textLastTok, *rightTok, lexLang_);
+    if (std::optional<RefoldLexBoundaryToken> rightTok =
+            refoldFirstLexToken(base.drop_front(end), lexLang_)) {
+      addRightSpace =
+          refoldNeedsLexicalSeparator(*textLastTok, *rightTok, lexLang_);
     }
   }
 
@@ -15263,20 +14327,6 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     // has a unique trimmed occurrence in that formal's spelling.  Ambiguous
     // occurrences are rejected so lexical child preservation stays
     // deterministic.
-    auto findUniqueTrimmedSubstring =
-        [](StringRef haystack,
-           StringRef needle) -> std::optional<std::pair<size_t, size_t>> {
-      needle = needle.trim();
-      if (needle.empty())
-        return std::nullopt;
-      size_t pos = haystack.find(needle);
-      if (pos == StringRef::npos)
-        return std::nullopt;
-      if (haystack.find(needle, pos + 1) != StringRef::npos)
-        return std::nullopt;
-      return std::make_pair(pos, pos + needle.size());
-    };
-
     // A compact proof surface for one macro invocation at the level currently
     // being reconstructed.  `standardSpans` are rebased to parsed formal slots;
     // `[coverBegin, coverEnd)` is the exact A-token tape covered by those spans
@@ -17069,15 +16119,15 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
 
     auto splitVariadicPackSourceSlot = [&](const SourceSlot &slot,
                                            SmallVectorImpl<SourceSlot> &out) {
-      SmallVector<LexBoundaryToken, 32> toks;
-      lexBoundaryTokens(StringRef(slot.text), lexLang_, toks);
+      SmallVector<RefoldLexBoundaryToken, 32> toks;
+      refoldLexBoundaryTokens(StringRef(slot.text), lexLang_, toks);
 
       size_t elemBegin = 0;
       int parenDepth = 0;
       bool sawComma = false;
       SmallVector<std::pair<size_t, size_t>, 8> pieces;
 
-      for (const LexBoundaryToken &tok : toks) {
+      for (const RefoldLexBoundaryToken &tok : toks) {
         if (tok.Spelling == "(") {
           ++parenDepth;
           continue;
@@ -17396,9 +16446,9 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     auto lexReplayTokens = [&](StringRef text,
                                SmallVectorImpl<ReplayTok> &out) {
       out.clear();
-      SmallVector<LexBoundaryToken, 32> toks;
-      lexBoundaryTokens(text, lexLang_, toks);
-      for (const LexBoundaryToken &tok : toks)
+      SmallVector<RefoldLexBoundaryToken, 32> toks;
+      refoldLexBoundaryTokens(text, lexLang_, toks);
+      for (const RefoldLexBoundaryToken &tok : toks)
         out.push_back(ReplayTok{tok.Spelling, tok.Begin, tok.End});
     };
 
@@ -17421,43 +16471,6 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
           return false;
       return true;
     };
-
-    auto decodeSimpleStringLiteralToken =
-        [](StringRef spelling) -> std::optional<std::string> {
-      size_t quote = spelling.find('"');
-      if (quote == StringRef::npos)
-        return std::nullopt;
-      size_t endQuote = spelling.rfind('"');
-      if (endQuote == StringRef::npos || endQuote <= quote)
-        return std::nullopt;
-      StringRef body = spelling.slice(quote + 1, endQuote);
-      std::string out;
-      out.reserve(body.size());
-      for (size_t i = 0; i < body.size(); ++i) {
-        if (body[i] != '\\') {
-          out.push_back(body[i]);
-          continue;
-        }
-        if (++i >= body.size())
-          return std::nullopt;
-        switch (body[i]) {
-        case '\\':
-        case '"':
-          out.push_back(body[i]);
-          break;
-        case 'n':
-          out.push_back('\n');
-          break;
-        case 't':
-          out.push_back('\t');
-          break;
-        default:
-          return std::nullopt;
-        }
-      }
-      return out;
-    };
-
     enum class ReplayKind { Literal, Param, Stringify, Paste };
     struct PastePiece {
       bool isParam = false;
@@ -17755,12 +16768,12 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
             StringRef newText) -> std::optional<std::string> {
       oldText = oldText.trim();
       newText = newText.trim();
-      SmallVector<LexBoundaryToken, 16> sourceToks;
-      SmallVector<LexBoundaryToken, 16> oldToks;
-      SmallVector<LexBoundaryToken, 16> newToks;
-      lexBoundaryTokens(source, lexLang_, sourceToks);
-      lexBoundaryTokens(oldText, lexLang_, oldToks);
-      lexBoundaryTokens(newText, lexLang_, newToks);
+      SmallVector<RefoldLexBoundaryToken, 16> sourceToks;
+      SmallVector<RefoldLexBoundaryToken, 16> oldToks;
+      SmallVector<RefoldLexBoundaryToken, 16> newToks;
+      refoldLexBoundaryTokens(source, lexLang_, sourceToks);
+      refoldLexBoundaryTokens(oldText, lexLang_, oldToks);
+      refoldLexBoundaryTokens(newText, lexLang_, newToks);
       if (!oldToks.empty() && oldToks.size() == newToks.size() &&
           sourceToks.size() >= oldToks.size()) {
         std::optional<size_t> matchBegin;
@@ -18067,48 +17080,11 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     };
     auto lexLeafTokens = [&](StringRef text, SmallVectorImpl<LeafTok> &out) {
       out.clear();
-      SmallVector<LexBoundaryToken, 32> toks;
-      lexBoundaryTokens(text, lexLang_, toks);
-      for (const LexBoundaryToken &tok : toks)
+      SmallVector<RefoldLexBoundaryToken, 32> toks;
+      refoldLexBoundaryTokens(text, lexLang_, toks);
+      for (const RefoldLexBoundaryToken &tok : toks)
         out.push_back(LeafTok{tok.Spelling});
     };
-
-    auto decodeSimpleStringLiteralToken =
-        [](StringRef spelling) -> std::optional<std::string> {
-      size_t quote = spelling.find('"');
-      if (quote == StringRef::npos)
-        return std::nullopt;
-      size_t endQuote = spelling.rfind('"');
-      if (endQuote == StringRef::npos || endQuote <= quote)
-        return std::nullopt;
-      StringRef body = spelling.slice(quote + 1, endQuote);
-      std::string out;
-      out.reserve(body.size());
-      for (size_t i = 0; i < body.size(); ++i) {
-        if (body[i] != '\\') {
-          out.push_back(body[i]);
-          continue;
-        }
-        if (++i >= body.size())
-          return std::nullopt;
-        switch (body[i]) {
-        case '\\':
-        case '"':
-          out.push_back(body[i]);
-          break;
-        case 'n':
-          out.push_back('\n');
-          break;
-        case 't':
-          out.push_back('\t');
-          break;
-        default:
-          return std::nullopt;
-        }
-      }
-      return out;
-    };
-
     auto leafValueForToken = [&](StringRef spelling) -> std::string {
       if (std::optional<std::string> decoded =
               decodeSimpleStringLiteralToken(spelling))
@@ -18258,17 +17234,17 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
 
       auto appendLexedArgumentTokens = [&](StringRef text,
                                            SmallVectorImpl<std::string> &out) {
-        SmallVector<LexBoundaryToken, 16> toks;
-        lexBoundaryTokens(text, lexLang_, toks);
-        for (const LexBoundaryToken &tok : toks)
+        SmallVector<RefoldLexBoundaryToken, 16> toks;
+        refoldLexBoundaryTokens(text, lexLang_, toks);
+        for (const RefoldLexBoundaryToken &tok : toks)
           out.push_back(tok.Spelling);
       };
 
       auto stringifyArgumentForReplay = [&](StringRef text) -> std::string {
-        SmallVector<LexBoundaryToken, 16> toks;
-        lexBoundaryTokens(text, lexLang_, toks);
+        SmallVector<RefoldLexBoundaryToken, 16> toks;
+        refoldLexBoundaryTokens(text, lexLang_, toks);
         std::string body;
-        for (const LexBoundaryToken &tok : toks) {
+        for (const RefoldLexBoundaryToken &tok : toks) {
           if (!body.empty())
             body.push_back(' ');
           body += tok.Spelling;
@@ -19273,9 +18249,9 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     auto lexReplayTokens = [&](StringRef text,
                                SmallVectorImpl<ReplayTok> &out) {
       out.clear();
-      SmallVector<LexBoundaryToken, 32> toks;
-      lexBoundaryTokens(text, lexLang_, toks);
-      for (const LexBoundaryToken &tok : toks)
+      SmallVector<RefoldLexBoundaryToken, 32> toks;
+      refoldLexBoundaryTokens(text, lexLang_, toks);
+      for (const RefoldLexBoundaryToken &tok : toks)
         out.push_back(ReplayTok{tok.Spelling, tok.Begin, tok.End});
     };
 
@@ -19299,20 +18275,6 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       return true;
     };
 
-    auto findUniqueTrimmedSubstring =
-        [](StringRef haystack,
-           StringRef needle) -> std::optional<std::pair<size_t, size_t>> {
-      needle = needle.trim();
-      if (needle.empty())
-        return std::nullopt;
-      size_t pos = haystack.find(needle);
-      if (pos == StringRef::npos)
-        return std::nullopt;
-      if (haystack.find(needle, pos + 1) != StringRef::npos)
-        return std::nullopt;
-      return std::make_pair(pos, pos + needle.size());
-    };
-
     auto rewriteTupleElementFromSolvedExpansion =
         [&](size_t elemIdx, StringRef oldText,
             StringRef newText) -> std::optional<std::string> {
@@ -19326,12 +18288,12 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       // may be `alpha   +   beta`.  If the old solved token sequence appears
       // once in the source slot, replace just those token spellings and leave
       // the original inter-token trivia untouched.
-      SmallVector<LexBoundaryToken, 16> sourceToks;
-      SmallVector<LexBoundaryToken, 16> oldToks;
-      SmallVector<LexBoundaryToken, 16> newToks;
-      lexBoundaryTokens(source, lexLang_, sourceToks);
-      lexBoundaryTokens(oldText, lexLang_, oldToks);
-      lexBoundaryTokens(newText, lexLang_, newToks);
+      SmallVector<RefoldLexBoundaryToken, 16> sourceToks;
+      SmallVector<RefoldLexBoundaryToken, 16> oldToks;
+      SmallVector<RefoldLexBoundaryToken, 16> newToks;
+      refoldLexBoundaryTokens(source, lexLang_, sourceToks);
+      refoldLexBoundaryTokens(oldText, lexLang_, oldToks);
+      refoldLexBoundaryTokens(newText, lexLang_, newToks);
       if (!oldToks.empty() && oldToks.size() == newToks.size() &&
           sourceToks.size() >= oldToks.size()) {
         std::optional<size_t> matchBegin;
@@ -19371,43 +18333,6 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
                                          newText);
       return std::nullopt;
     };
-
-    auto decodeSimpleStringLiteralToken =
-        [](StringRef spelling) -> std::optional<std::string> {
-      size_t quote = spelling.find('"');
-      if (quote == StringRef::npos)
-        return std::nullopt;
-      size_t endQuote = spelling.rfind('"');
-      if (endQuote == StringRef::npos || endQuote <= quote)
-        return std::nullopt;
-      StringRef body = spelling.slice(quote + 1, endQuote);
-      std::string out;
-      out.reserve(body.size());
-      for (size_t i = 0; i < body.size(); ++i) {
-        if (body[i] != '\\') {
-          out.push_back(body[i]);
-          continue;
-        }
-        if (++i >= body.size())
-          return std::nullopt;
-        switch (body[i]) {
-        case '\\':
-        case '"':
-          out.push_back(body[i]);
-          break;
-        case 'n':
-          out.push_back('\n');
-          break;
-        case 't':
-          out.push_back('\t');
-          break;
-        default:
-          return std::nullopt;
-        }
-      }
-      return out;
-    };
-
     enum class CalleeReplayKind { Literal, Param, Stringify, Paste, VaOpt };
     struct CalleePastePiece {
       bool isParam = false;
@@ -19936,46 +18861,6 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
     tokenHunksForTouchedFormals.push_back(cand);
   }
 
-  auto buildCombinedInsertionEnvelope = [&](const diffutils::Hunk &left,
-                                            const diffutils::Hunk &right) {
-    // Two zero-width A-side insertion hunks can bracket the real affected token
-    // interval. Build the minimal token envelope spanning their A/B frontiers
-    // so trimming can expose the underlying argument occurrence.
-    diffutils::Hunk env;
-    env.aStart = std::min(left.aStart, right.aStart);
-    env.aEnd = std::max(left.aStart, right.aStart);
-    env.bStart = std::min(left.bStart, right.bStart);
-    env.bEnd = std::max(left.bEnd, right.bEnd);
-    return env;
-  };
-
-  auto trimCommonEdgeTokensLocal = [&](diffutils::Hunk hh) {
-    // Remove unchanged matching tokens from both ends of the synthetic
-    // envelope. The remaining core is the candidate edited interval that must
-    // fit entirely inside one argument occurrence.
-    while (hh.aStart < hh.aEnd && hh.bStart < hh.bEnd) {
-      size_t aIdx = static_cast<size_t>(hh.aStart);
-      size_t bIdx = static_cast<size_t>(hh.bStart);
-      if (aIdx >= aToks_.size() || bIdx >= bToks_.size())
-        break;
-      if (aToks_[aIdx].spelling != bToks_[bIdx].spelling)
-        break;
-      ++hh.aStart;
-      ++hh.bStart;
-    }
-    while (hh.aEnd > hh.aStart && hh.bEnd > hh.bStart) {
-      size_t aIdx = static_cast<size_t>(hh.aEnd - 1);
-      size_t bIdx = static_cast<size_t>(hh.bEnd - 1);
-      if (aIdx >= aToks_.size() || bIdx >= bToks_.size())
-        break;
-      if (aToks_[aIdx].spelling != bToks_[bIdx].spelling)
-        break;
-      --hh.aEnd;
-      --hh.bEnd;
-    }
-    return hh;
-  };
-
   auto sameTokHunk = [](const diffutils::Hunk &lhs,
                         const diffutils::Hunk &rhs) {
     return lhs.aStart == rhs.aStart && lhs.aEnd == rhs.aEnd &&
@@ -20006,7 +18891,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
 
           const diffutils::Hunk env =
               buildCombinedInsertionEnvelope(anchor, partner);
-          const diffutils::Hunk envTrim = trimCommonEdgeTokensLocal(env);
+          const diffutils::Hunk envTrim = trimCommonEdgeTokens(env, aToks_, bToks_);
 
           // The trimmed synthetic envelope must expose a real A-side token
           // range.
@@ -20442,9 +19327,9 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       auto lexReplayTokens = [&](StringRef text,
                                  SmallVectorImpl<ReplayTok> &out) {
         out.clear();
-        SmallVector<LexBoundaryToken, 32> toks;
-        lexBoundaryTokens(text, lexLang_, toks);
-        for (const LexBoundaryToken &tok : toks)
+        SmallVector<RefoldLexBoundaryToken, 32> toks;
+        refoldLexBoundaryTokens(text, lexLang_, toks);
+        for (const RefoldLexBoundaryToken &tok : toks)
           out.push_back(ReplayTok{tok.Spelling, tok.Begin, tok.End});
       };
 
@@ -20612,47 +19497,6 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
       SmallVector<SmallVector<std::string, 16>, 8> oldActualTokSpellings;
       for (const std::string &actual : oldActuals)
         oldActualTokSpellings.push_back(tokenSpellingsForText(actual));
-
-      auto decodeSimpleStringLiteralToken =
-          [](StringRef spelling) -> std::optional<std::string> {
-        size_t quote = spelling.find('"');
-        if (quote == StringRef::npos)
-          return std::nullopt;
-        size_t endQuote = spelling.rfind('"');
-        if (endQuote == StringRef::npos || endQuote <= quote)
-          return std::nullopt;
-        StringRef body = spelling.slice(quote + 1, endQuote);
-        std::string out;
-        out.reserve(body.size());
-        for (size_t i = 0; i < body.size(); ++i) {
-          if (body[i] != '\\') {
-            out.push_back(body[i]);
-            continue;
-          }
-          if (++i >= body.size())
-            return std::nullopt;
-          // This generated-callee proof only inverts the ordinary escapes that
-          // stringification introduces for spelling preservation.  Numeric and
-          // line-continuation escapes are left to the existing realization
-          // paths.
-          switch (body[i]) {
-          case '\\':
-          case '"':
-            out.push_back(body[i]);
-            break;
-          case 'n':
-            out.push_back('\n');
-            break;
-          case 't':
-            out.push_back('\t');
-            break;
-          default:
-            return std::nullopt;
-          }
-        }
-        return out;
-      };
-
       auto singleTokenSpelling =
           [&](StringRef text) -> std::optional<std::string> {
         SmallVector<ReplayTok, 4> toks;
@@ -20660,20 +19504,6 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         if (toks.size() != 1)
           return std::nullopt;
         return toks.front().spelling;
-      };
-
-      auto findUniqueTrimmedSubstringInTupleElement =
-          [](StringRef haystack,
-             StringRef needle) -> std::optional<std::pair<size_t, size_t>> {
-        needle = needle.trim();
-        if (needle.empty())
-          return std::nullopt;
-        size_t pos = haystack.find(needle);
-        if (pos == StringRef::npos)
-          return std::nullopt;
-        if (haystack.find(needle, pos + 1) != StringRef::npos)
-          return std::nullopt;
-        return std::make_pair(pos, pos + needle.size());
       };
 
       auto rewriteTupleElementFromSolvedExpansion =
@@ -20685,7 +19515,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         if (source == oldExpansion)
           return newExpansion.str();
         if (auto loc =
-                findUniqueTrimmedSubstringInTupleElement(source, oldExpansion))
+                findUniqueTrimmedSubstring(source, oldExpansion))
           return stringutils::replaceRange(source.str(), loc->first,
                                            loc->second, newExpansion);
         return std::nullopt;
@@ -20731,8 +19561,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
             return;
           StringRef oldActual = StringRef(oldActuals[elem.paramIdx]).trim();
           if (StringRef(*content).trim() != oldActual) {
-            auto loc = findUniqueTrimmedSubstringInTupleElement(
-                oldActual, StringRef(*content));
+            auto loc = findUniqueTrimmedSubstring(oldActual, StringRef(*content));
             if (!loc)
               return;
           }
@@ -21038,7 +19867,7 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
             StringRef sourcePiece =
                 StringRef(oldGeneratedPiecesForRewrite[paramIdx]);
             if (sourcePiece == StringRef(*content) ||
-                findUniqueTrimmedSubstringInTupleElement(sourcePiece,
+                findUniqueTrimmedSubstring(sourcePiece,
                                                          StringRef(*content))) {
               oldGeneratedPiecesForRewrite[paramIdx] = std::move(*content);
               break;
@@ -21432,9 +20261,9 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
         auto lexReplayTokens = [&](StringRef text,
                                    SmallVectorImpl<ReplayTok> &out) {
           out.clear();
-          SmallVector<LexBoundaryToken, 16> toks;
-          lexBoundaryTokens(text, lexLang_, toks);
-          for (const LexBoundaryToken &tok : toks)
+          SmallVector<RefoldLexBoundaryToken, 16> toks;
+          refoldLexBoundaryTokens(text, lexLang_, toks);
+          for (const RefoldLexBoundaryToken &tok : toks)
             out.push_back(ReplayTok{tok.Spelling, tok.Begin, tok.End});
         };
 
@@ -22325,11 +21154,6 @@ RefoldEngine::BuildMacroInvocationPatchArgsOnly(
   }
 }
 
-#include "RefoldEngine.SourceMapping.inc"
-#include "RefoldEngine.ArgTextRecovery.inc"
-#include "RefoldEngine.IncludeInsertion.inc"
-#include "RefoldEngine.CounterStabilization.inc"
-#include "RefoldEngine.ExpansionFallback.inc"
 
 std::optional<std::pair<uint64_t, uint64_t>>
 RefoldEngine::GetWholeCoverATokRange(
@@ -23034,33 +21858,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     }
   }
 
-  // Trim equal A/B token edges so args-only can run even if the diff hunk spans
-  // unchanged punctuation/whitespace around the actual argument-produced
-  // change.
-  auto trimCommonEdgeTokens = [&](diffutils::Hunk hh) {
-    while (hh.aStart < hh.aEnd && hh.bStart < hh.bEnd) {
-      size_t aIdx = static_cast<size_t>(hh.aStart);
-      size_t bIdx = static_cast<size_t>(hh.bStart);
-      if (aIdx >= aToks_.size() || bIdx >= bToks_.size())
-        break;
-      if (aToks_[aIdx].spelling != bToks_[bIdx].spelling)
-        break;
-      ++hh.aStart;
-      ++hh.bStart;
-    }
-    while (hh.aEnd > hh.aStart && hh.bEnd > hh.bStart) {
-      size_t aIdx = static_cast<size_t>(hh.aEnd - 1);
-      size_t bIdx = static_cast<size_t>(hh.bEnd - 1);
-      if (aIdx >= aToks_.size() || bIdx >= bToks_.size())
-        break;
-      if (aToks_[aIdx].spelling != bToks_[bIdx].spelling)
-        break;
-      --hh.aEnd;
-      --hh.bEnd;
-    }
-    return hh;
-  };
-  const diffutils::Hunk hEff = trimCommonEdgeTokens(h);
+  const diffutils::Hunk hEff = trimCommonEdgeTokens(h, aToks_, bToks_);
 
   // 1) Prefer args-only patching when safe and fully validated. Treat normal
   //    arg spans, stringify spans, and paste spans as "argument-like"
@@ -23133,20 +21931,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
     if (occs.empty())
       return std::nullopt;
 
-    auto buildCombinedInsertionEnvelope =
-        [&](const diffutils::Hunk &left,
-            const diffutils::Hunk &right) -> diffutils::Hunk {
-      // Build the minimal token envelope spanning the two insertion frontiers.
-      // Because both hunks are zero-width on A, the A interval comes from the
-      // distance between their insertion points.
-      diffutils::Hunk env;
-      env.aStart = std::min(left.aStart, right.aStart);
-      env.aEnd = std::max(left.aStart, right.aStart);
-      env.bStart = std::min(left.bStart, right.bStart);
-      env.bEnd = std::max(left.bEnd, right.bEnd);
-      return env;
-    };
-
     for (const auto &partner : abTokHunks_) {
       // Pair only with another pure B insertion. Replacement/deletion hunks are
       // outside this split-insertion recovery proof.
@@ -23180,7 +21964,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
       // Remove unchanged matching edge tokens so the synthetic envelope exposes
       // only the edited core between the paired insertion frontiers.
-      const diffutils::Hunk envTrim = trimCommonEdgeTokens(env);
+      const diffutils::Hunk envTrim = trimCommonEdgeTokens(env, aToks_, bToks_);
 
       // The trimmed synthetic envelope must be fully explainable by argument
       // occurrences. Otherwise the paired insertions are not an args-only
@@ -23588,17 +22372,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
         return any;
       };
 
-      auto buildCombinedInsertionEnvelope =
-          [&](const diffutils::Hunk &left,
-              const diffutils::Hunk &right) -> diffutils::Hunk {
-        diffutils::Hunk env;
-        env.aStart = std::min(left.aStart, right.aStart);
-        env.aEnd = std::max(left.aStart, right.aStart);
-        env.bStart = std::min(left.bStart, right.bStart);
-        env.bEnd = std::max(left.bEnd, right.bEnd);
-        return env;
-      };
-
       // --- Stage 2: Find leaf candidates touched by this hunk ----------------
       //
       // We search for descendant invocations whose *argument-like spans* are
@@ -23661,7 +22434,7 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
           // the proof candidate passed to the args-only builder.
           const diffutils::Hunk env =
               buildCombinedInsertionEnvelope(hEff, partner);
-          const diffutils::Hunk envTrim = trimCommonEdgeTokens(env);
+          const diffutils::Hunk envTrim = trimCommonEdgeTokens(env, aToks_, bToks_);
 
           SmallVector<char, 16> envTrimRootTouched(argLikeSpans.size(), 0);
           const bool envTrimRootWithinArgLike =
@@ -34325,7 +33098,6 @@ RefoldEngine::BuildMacroInvocationPatchWholeCover(
 
 // Implementation extracted verbatim to keep `RefoldEngine.cpp`
 // physically smaller without changing ownership or semantics.
-#include "RefoldEngine.TailUtilities.inc"
 
 } // namespace refold
 } // namespace clang

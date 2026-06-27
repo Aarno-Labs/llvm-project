@@ -14,6 +14,7 @@
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_REFOLD_REFOLDSOURCEGRAPHPROOF_H
 
 #include "RefoldModel.h"
+#include "RefoldSourceGraphTypes.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
@@ -87,6 +88,15 @@ struct SourceGraphOwnerPreservationPlan {
   std::optional<std::string> RejectedCleanupRelativePath;
 };
 
+/// Ready-to-append output records derived from a source-graph preservation
+/// decision.  This keeps the carrier construction policy with the source-graph
+/// proof layer while leaving ownership of the destination vector and filesystem
+/// writes with RefoldEngine/RefoldSourceGraphWriter.
+struct SourceGraphOwnerPreservationOutputPlan {
+  std::optional<SourceGraphOutput> PreservedOutput;
+  std::optional<SourceGraphOutput> RejectedCleanupOutput;
+};
+
 /// Return the quoted include operand as a safe relative path for automatic
 /// source-graph side output, if the include spelling satisfies the narrow
 /// no-escape path policy.
@@ -113,11 +123,25 @@ bool sourceGraphIncludePathIsUnaliasedOrCoherent(
     llvm::StringRef SourceGraphPath, llvm::StringRef CandidateBytes,
     const SourceGraphProofServices &Services);
 
+/// Build a source-graph output carrier for Include without mutating the
+/// caller's output vector.
+SourceGraphOutput makeSourceGraphOutput(
+    const RefoldModel::IncludeItem &Include, llvm::StringRef RelativePath,
+    llvm::StringRef Bytes, bool CleanupOnly = false);
+
 /// Decide whether Include may remain a source-graph owner.  The returned plan
 /// contains either an emitted sidecar path, a cleanup-only rejected sidecar
 /// path, or neither.  This is a pure planning helper; the caller owns all state
 /// mutation and filesystem policy.
 SourceGraphOwnerPreservationPlan planSourceGraphOwnerPreservation(
+    const SourceGraphProofInputs &Inputs,
+    const RefoldModel::IncludeItem &Include, llvm::StringRef CandidateBytes,
+    const SourceGraphProofServices &Services);
+
+/// Decide whether Include may remain a source-graph owner and construct the
+/// corresponding output carriers.  The helper is still side-effect-free: it
+/// does not append to RefoldEngine storage and does not write or delete files.
+SourceGraphOwnerPreservationOutputPlan planSourceGraphOwnerPreservationOutput(
     const SourceGraphProofInputs &Inputs,
     const RefoldModel::IncludeItem &Include, llvm::StringRef CandidateBytes,
     const SourceGraphProofServices &Services);

@@ -1,17 +1,34 @@
-//===--- RefoldEngine.CounterStabilization.inc --------------*- C++ -*-===//
+//===--- RefoldEngine.CounterStabilization.cpp ---------------------*- C++ -*-===//
 //
-// `RefoldEngine` members physically split out of `RefoldEngine.cpp`.
-//
-// This fragment groups methods that preserve `__COUNTER__` semantics when
-// edits would otherwise force later counter observations to shift. These
-// helpers determine which surrounding macro invocations must be stabilized.
-//
-// This file is included directly by `RefoldEngine.cpp`, so this is only a
-// physical file split. No ownership, access, or behavioral semantics change.
+// This file contains RefoldEngine member functions that preserve __COUNTER__
+// sequencing when edits force expanded macro surfaces to remain materialized.
+// The implementation used to live in RefoldEngine.CounterStabilization.inc;
+// moving it to a real translation unit is a physical organization change only.
 //
 //===----------------------------------------------------------------------===//
 
+#include "RefoldEngine.h"
+#include "RefoldLog.h"
 
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/Hashing.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/raw_ostream.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <limits>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+using namespace llvm;
+
+namespace clang {
+namespace refold {
 
 std::vector<std::pair<uint64_t, uint64_t>>
 RefoldEngine::CounterOutputRangesForInvocation(
@@ -508,3 +525,6 @@ RefoldEngine::ComputeForcedCounterPatchesFromExpandedMacros(
 
   return forced;
 }
+
+} // namespace refold
+} // namespace clang
