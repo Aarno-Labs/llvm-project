@@ -687,6 +687,11 @@ private:
     std::string OutputDirectorySpelling;
   };
 
+  /// Private include/include_next replay proof context used by include
+  /// materialization.  The definition lives with the materialization helpers so
+  /// replay proof policy stays separate from edit emission.
+  class IncludeReplayProofContext;
+
   static std::optional<FinalReplaySurface>
   BuildFinalReplaySurface(const RefoldModel &model, StringRef finalOutputPath);
 

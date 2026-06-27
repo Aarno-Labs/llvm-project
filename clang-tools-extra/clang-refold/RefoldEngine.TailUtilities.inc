@@ -2273,938 +2273,15 @@ RefoldEngine::WrapIncludeExpansionForMaterialization(
 
 }
 
-void RefoldEngine::MaterializeIncludeExpansion(
-    uint64_t includeId, const DenseMap<uint64_t, IncludeEdits> &perInclude,
-    const DenseMap<std::optional<uint64_t>, std::vector<MacroPatch>>
-        &macroPatchesByOwner,
-    const DenseMap<uint64_t, std::vector<const RefoldModel::IncludeItem *>>
-        &children,
-    DenseMap<uint64_t, std::string> &includeExpansion,
-    DenseMap<uint64_t, std::vector<FinalLineControlPruneCandidate>>
-        &includeExpansionLineControlPruneCandidates,
-    DenseMap<uint64_t, std::vector<FinalLineControlSourceMapping>>
-        &includeExpansionLineControlSourceMappings,
-    DenseMap<uint64_t, size_t> &includeExpansionStartLineNos,
-    DenseMap<uint64_t, AcceptedResultCandidate>
-        &includeExpansionAcceptedResults,
-    DenseSet<uint64_t> *appliedExpandedMacroRootIds,
-    bool materializeIncludeNextInThisSubtree) const {
-  // Include materialization is memoized by include id. A parent may reach the
-  // same child through recursive expansion, so avoid rebuilding already
-  // materialized text.
-  if (includeExpansion.count(includeId)) {
-    // Preseeded or previously materialized include bodies that do not carry a
-    // more precise source-line witness still enter at the header start.
-    if (!includeExpansionStartLineNos.count(includeId))
-      includeExpansionStartLineNos[includeId] = 1;
-    return;
-  }
 
-  const RefoldModel::IncludeItem *inc = model_.GetIncludeById(includeId);
-  if (!inc)
-    REFOLD_LOG_FATAL("include/mat", "unknown includeId {0}", includeId);
-
-
-  const std::string headerPath = resolveHeaderPath(*inc);
-  const std::string headerLoadPath = resolveHeaderLoadPath(*inc);
-
-  auto pathNamesThisMaterializedHeader = [&](StringRef path) -> bool {
-    if (path.empty())
-      return false;
-    if (path == StringRef(headerPath) || path == StringRef(headerLoadPath))
-      return true;
-
-    // Header-owner checks are hardening predicates, not the semantic filename
-    // proof itself.  Use the non-fatal line-control path normalizer here rather
-    // than canonicalizing the logical spelling: producer-entered spellings such
-    // as `leaf.h` may only be meaningful inside Clang's search context, while
-    // opened_path is the separately recorded readable file.
-    if (!headerLoadPath.empty() &&
-        SameLineControlPhysicalFile(path, headerLoadPath))
-      return true;
-    return SameLineControlPhysicalFile(path, headerPath);
-  };
-
-  // Start from the header's original source bytes. Some callers preseed
-  // `includeExpansion` with raw header text; otherwise load it deterministically
-  // from the producer-selected physical file.  The logical headerPath above is
-  // reserved for owner matching and `#line` spelling repair.
-  std::string bytes;
-  if (auto it = includeExpansion.find(includeId); it != includeExpansion.end())
-    bytes = it->second;
-  if (bytes.empty()) {
-    auto bufOrErr =
-        MemoryBuffer::getFile(lineDirs_.ToAbsolutePath(headerLoadPath));
-    if (!bufOrErr) {
-      REFOLD_LOG_FATAL("include/mat",
-                       "failed to read header: {0} (load path {1}) ({2})",
-                       headerPath, headerLoadPath,
-                       bufOrErr.getError().message());
-    }
-
-    const MemoryBuffer &mb = **bufOrErr;
-    bytes.assign(mb.getBufferStart(), mb.getBufferEnd());
-  }
-
-  auto editsIt = perInclude.find(includeId);
-  // Accumulate all local edits in this header byte space, then apply them once
-  // at the end. This lets include edits, macro patches, and child include
-  // materializations participate in one overlap/resync pass.
-  std::vector<TextEdit> edits;
-
-  auto materializedHeaderHasReplayContextSensitiveConditionalControl = [&]() {
-    // A materialized header is replayed from the including surface, not from
-    // the header's original file.  Conditional operators such as
-    // __has_include perform quoted-header lookup relative to the file that
-    // contains the directive; moving that directive out of its original header
-    // can therefore flip the selected preprocessor branch even when ordinary
-    // macro state is otherwise closed.  When such conditional control is part
-    // of a materialized include, use the producer-proven B-token envelope for
-    // the include realization instead of copying the directive text verbatim.
-    for (const RefoldModel::CondGroup *group :
-         model_.GetCondGroups(headerPath, includeId)) {
-      if (!group)
-        continue;
-      for (const RefoldModel::CondArm &arm : group->arms) {
-        if (!arm.cond)
-          continue;
-        if (arm.cond->contains("__has_include"))
-          return true;
-      }
-    }
-    return false;
-  };
-
-  auto materializedHeaderHasIncludeLevelObserver = [&]() {
-    // __INCLUDE_LEVEL__ observes include-stack depth, not line/file state.
-    // Once an include owner is materialized, the source-spelled header bytes are
-    // replayed from the flattened parent/TU surface instead of being entered by
-    // an actual #include edge.  Leaving a preserved __INCLUDE_LEVEL__ spelling
-    // in that materialized text would therefore expand at the replay depth
-    // rather than at the producer-observed depth.  Treat any observable
-    // __INCLUDE_LEVEL__ in this owner as a request for producer-proven B-surface
-    // realization, which literalizes the recorded expansion value and avoids
-    // fabricating an include-stack transition that no longer exists.
-    for (const RefoldModel::MacroInvocation &macro :
-         model_.GetMacroInvocations()) {
-      if (macro.name != "__INCLUDE_LEVEL__")
-        continue;
-
-      const RefoldModel::MacroInvocation *site =
-          LineStateObservableMacroSite(macro);
-      std::optional<uint64_t> owner =
-          site && site->ownerIncludeId ? site->ownerIncludeId
-                                       : macro.ownerIncludeId;
-      if (!owner || *owner != includeId)
-        continue;
-
-      // The owner id is the semantic proof; the optional invocation file is a
-      // hardening check against malformed producer records that accidentally
-      // attach a builtin from another source buffer to this include instance.
-      if (site && site->invFile &&
-          !pathNamesThisMaterializedHeader(*site->invFile))
-        continue;
-      if (macro.invFile && !pathNamesThisMaterializedHeader(*macro.invFile) &&
-          (!site || !site->invFile ||
-           !pathNamesThisMaterializedHeader(*site->invFile)))
-        continue;
-
-      return true;
-    }
-    return false;
-  };
-
-  auto realizeMaterializedHeaderFromB = [&](StringRef reason) -> bool {
-    AcceptedResultCandidate realizationCandidate;
-    if (auto realized =
-            BuildInlineIncludeRealizationFromB(*inc, reason,
-                                               &realizationCandidate)) {
-      includeExpansion[includeId] = std::move(*realized);
-      includeExpansionStartLineNos[includeId] = 1;
-      includeExpansionAcceptedResults[includeId] =
-          std::move(realizationCandidate);
-      REFOLD_LOG_TRACE("include/mat", "realize include #{0} from B: {1}",
-                       includeId, reason);
-      return true;
-    }
-
-    includeExpansion[includeId] = std::string();
-    return false;
-  };
-
-  if (materializedHeaderHasReplayContextSensitiveConditionalControl()) {
-    (void)realizeMaterializedHeaderFromB(
-        "replay-context-sensitive conditional control in materialized header");
-    return;
-  }
-
-  if (materializedHeaderHasIncludeLevelObserver()) {
-    (void)realizeMaterializedHeaderFromB(
-        "__INCLUDE_LEVEL__ observer in materialized header");
-    return;
-  }
-
-  auto materializedHeaderHasNoLineRepairableFileObserver = [&]() {
-    // `__FILE__` and `__FILE_NAME__` observe the current logical filename.  If
-    // line directives are disabled, a materialized header body is replayed as
-    // ordinary text in the flattened parent/output source, so preserving a naked
-    // builtin would make it observe the emitted `.c.mod` context rather than the
-    // producer-selected header.  The only deterministic no-lines repair is the
-    // already-preprocessed B realization, which literalizes the producer value.
-    if (lineDirs_.Enabled())
-      return false;
-
-    for (const RefoldModel::MacroInvocation &macro :
-         model_.GetMacroInvocations()) {
-      if (macro.name != "__FILE__" && macro.name != "__FILE_NAME__")
-        continue;
-      if (!LineStateBuiltinInvocationIsPreservedObserver(macro))
-        continue;
-
-      const RefoldModel::MacroInvocation *site =
-          LineStateObservableMacroSite(macro);
-      std::optional<uint64_t> owner =
-          site && site->ownerIncludeId ? site->ownerIncludeId
-                                       : macro.ownerIncludeId;
-      if (!owner || *owner != includeId)
-        continue;
-
-      // The owner id is the semantic proof.  The file checks only reject
-      // malformed records that accidentally attach a preserved builtin from some
-      // other source buffer to this include instance.
-      if (site && site->invFile &&
-          !pathNamesThisMaterializedHeader(*site->invFile))
-        continue;
-      if (macro.invFile && !pathNamesThisMaterializedHeader(*macro.invFile) &&
-          (!site || !site->invFile ||
-           !pathNamesThisMaterializedHeader(*site->invFile)))
-        continue;
-
-      return true;
-    }
-    return false;
-  };
-
-  auto materializedHeaderHasUnrepairableFileSpellingObserver = [&]() {
-    // With line directives enabled, materialization can preserve source-spelled
-    // `__FILE__` / `__FILE_NAME__` only if the include edge has a producer
-    // filename spelling to install before the copied body.  If the map lacks any
-    // entered-file witness, do not invent one from the target token; literalize
-    // the already-preprocessed value instead.
-    if (!lineDirs_.Enabled())
-      return false;
-
-    const LineStateObserverDemand demand =
-        IncludeSubtreeLineStateObserverDemand(includeId);
-    if (!demand.needsFile && !demand.needsFileName)
-      return false;
-
-    StringRef producerSpelling = producerEnteredFileSpelling(*inc);
-    if (producerSpelling.empty())
-      return true;
-
-    if (demand.needsFileName && producerEnteredFileName(*inc).empty())
-      return true;
-
-    return false;
-  };
-
-  if (materializedHeaderHasNoLineRepairableFileObserver()) {
-    (void)realizeMaterializedHeaderFromB(
-        "__FILE__/__FILE_NAME__ observer in materialized header without "
-        "line repair");
-    return;
-  }
-
-  if (materializedHeaderHasUnrepairableFileSpellingObserver()) {
-    (void)realizeMaterializedHeaderFromB(
-        "__FILE__/__FILE_NAME__ observer in materialized header without "
-        "producer entered-file spelling");
-    return;
-  }
-
-  auto materializedHeaderHasNoLineRepairableBaseFileObserver = [&]() {
-    // __BASE_FILE__ is part of the line/file observer family when line
-    // directives are available: a source-authored or synthetic #line can keep
-    // the replayed spelling stable without destroying source structure.  In
-    // --no-lines mode, however, a materialized include owner has no way to
-    // repair a preserved source-spelled __BASE_FILE__; replay would observe the
-    // refolded output as the top-level file.  In that mode, realize the include
-    // from the producer-proven B envelope so the recorded literal is emitted.
-    if (lineDirs_.Enabled())
-      return false;
-
-    for (const RefoldModel::MacroInvocation &macro :
-         model_.GetMacroInvocations()) {
-      if (macro.name != "__BASE_FILE__")
-        continue;
-      if (!LineStateBuiltinInvocationIsPreservedObserver(macro))
-        continue;
-
-      const RefoldModel::MacroInvocation *site =
-          LineStateObservableMacroSite(macro);
-      std::optional<uint64_t> owner =
-          site && site->ownerIncludeId ? site->ownerIncludeId
-                                       : macro.ownerIncludeId;
-      if (!owner || *owner != includeId)
-        continue;
-
-      // The owner id is the semantic proof.  The file spelling checks are only
-      // hardening against malformed producer records that accidentally attach a
-      // builtin from another source buffer to this include instance.
-      if (site && site->invFile &&
-          !pathNamesThisMaterializedHeader(*site->invFile))
-        continue;
-      if (macro.invFile && !pathNamesThisMaterializedHeader(*macro.invFile) &&
-          (!site || !site->invFile ||
-           !pathNamesThisMaterializedHeader(*site->invFile)))
-        continue;
-
-      return true;
-    }
-    return false;
-  };
-
-  if (materializedHeaderHasNoLineRepairableBaseFileObserver()) {
-    (void)realizeMaterializedHeaderFromB(
-        "__BASE_FILE__ observer in materialized header without line repair");
-    return;
-  }
-
-  auto includeInsertionPatchCarriesSidebandReplay =
-      [&](const SidebandPragmaEdit &sideband) -> bool {
-    if (editsIt == perInclude.end())
-      return false;
-    if (!sideband.SourceIsZeroWidthInsertion())
-      return false;
-
-    const auto sidebandB = sideband.MaterializedBByteRange();
-    for (const IncludePatch &patch : editsIt->second.patches) {
-      if (patch.aStart != patch.aEnd || patch.bStart >= patch.bEnd)
-        continue;
-      if (patch.bStart >= bTokOff_.size() || patch.bEnd > bTokOff_.size())
-        continue;
-
-      StringRef patchEnvelope =
-          sliceTokenEnvelope(bTokOff_, bSource_, patch.bStart, patch.bEnd);
-      const uint64_t patchB = bTokOff_[static_cast<size_t>(patch.bStart)];
-      const uint64_t patchE = patchB + patchEnvelope.size();
-      if (patchB <= sidebandB.first && sidebandB.second <= patchE)
-        return true;
-    }
-    return false;
-  };
-
-  // 0) Sideband pragma edits owned by this include.  These pragmas were printed
-  // verbatim in the raw `.i` replay surface but deliberately removed from the
-  // normal A/B token streams before diffing.  When such a pragma lives in a
-  // header, deleting/replacing it is an include-owned source edit, not a TU
-  // edit.  Stage it here so it composes with the same owner-polymorphic header
-  // materialization path used for ordinary include and macro edits.
-  for (const SidebandPragmaEdit &sideband : sidebandPragmaEdits_) {
-    if (!sideband.TargetsInclude(includeId))
-      continue;
-
-    const auto sourceRange = sideband.SourceByteRange();
-    if (!ValidateSidebandPragmaEditProof(sideband, "pragma/sideband/include")) {
-      includeExpansion[includeId] = std::string();
-      return;
-    }
-
-    if (!sideband.SourceIsWithinOwnerBytes(static_cast<uint64_t>(bytes.size()))) {
-      RequestTerminalFallback(
-          MakeTerminalFallbackProofFailure(
-          TerminalFallbackObligationKind::PragmaBoundaryKnown,
-          TerminalFallbackFailureReason::UnknownPragmaCrossesBoundary),
-          "pragma/sideband",
-          llvm::formatv("header-owned sideband pragma edit has invalid range "
-                        "inc#{0} path='{1}' site=[{2},{3}) headerSize={4}",
-                        includeId, headerPath, sourceRange.first,
-                        sourceRange.second, bytes.size())
-              .str());
-      includeExpansion[includeId] = std::string();
-      return;
-    }
-
-    if (includeInsertionPatchCarriesSidebandReplay(sideband)) {
-      // A header-prefix/suffix ordinary insertion patch uses the full B token
-      // envelope.  If that envelope already contains this sideband replay
-      // range, staging a second header-owned sideband edit would duplicate the
-      // pragma in the materialized header.  The sideband proof is still
-      // necessary for owner selection and token-stream normalization, but the
-      // include patch is the unique replay owner for the visible bytes.
-      continue;
-    }
-
-    auto hasCopiedHeaderSuffixAfterSidebandEdit = [&]() -> bool {
-      // A header-local resync can only protect bytes that remain in this same
-      // materialized header after the sideband edit.  If the sideband edit is
-      // the last visible header-owned replay text, the parent-resume wrapper is
-      // the next meaningful line-state transition and an extra local #line
-      // would be gratuitous.
-      for (uint64_t p = sourceRange.second; p < bytes.size(); ++p)
-        if (!stringutils::isWs(bytes[p]))
-          return true;
-      return false;
-    };
-
-    // A sideband pragma line is not part of the normal PP token stream, but it
-    // can still be visible header-owned replay text.  The include enter/exit
-    // wrapper handles the owner transition for that visible replay.
-    // Header-local resync is narrower: emit it only when sideband-owned
-    // trailing B whitespace would otherwise shift copied header suffix bytes,
-    // or when the suffix has a source-location observer such as
-    // __LINE__/__FILE__.
-    const bool mustPreserveHeaderLineState =
-        (sideband.ForcesIncludeLineDirectiveWrappers() &&
-         hasCopiedHeaderSuffixAfterSidebandEdit() &&
-         sideband.OwnsTrailingReplayBlankLine()) ||
-        OwnerSuffixHasLineStateSensitiveBuiltin(includeId, headerPath,
-                                                sourceRange.second);
-    ResyncOutcome ro =
-        mustPreserveHeaderLineState
-            ? ApplyResyncOrPend(bytes, sourceRange.first, sourceRange.second,
-                                sideband.ReplacementText(), headerPath,
-                                includeId)
-            : ResyncOutcome(sideband.ReplacementText().str(), std::nullopt);
-    TextEdit edit{sourceRange.first,
-                  sourceRange.second,
-                  std::move(ro.text),
-                  std::move(ro.pending),
-                  std::nullopt,
-                  {},
-                  {},
-                  {}};
-    edit.lineControlPruneCandidates = std::move(ro.lineControlPruneCandidates);
-    AttachAcceptedResultCarrier(
-        edit, BuildAcceptedIncludeRealizationCandidate(
-                  AcceptedPathKind::IncludeMaterializedExpansion, *inc));
-    edits.push_back(std::move(edit));
-  }
-
-  // Replay-context stability, include-owned macro-state repair.
-  //
-  // A macro patch inside a materialized header is emitted as B-surface source
-  // text in the header file's byte space.  That replay is only sound if the
-  // text sees the same macro environment that produced B.  When the original
-  // header contains an active #define before the patched invocation, the B text
-  // might accidentally expand under that preserved A-side definition.  The
-  // finite invariant enforced below is:
-  //
-  //   * identify active header-owned macro-state directives that the B text
-  //     would observe at the current replay site;
-  //   * carry only whole directive lines, never partial directive spellings;
-  //   * move those directive lines after the completed replacement interval
-  //     only across source proven not to observe them; and
-  //   * fail closed if the directive cannot be parsed, located, moved, or kept
-  //     on a real directive line.
-  //
-  // This makes replay stability a property of owner materialization itself,
-  // rather than a special case of the test that motivated it.
-  using MaterializedHeaderMacroStateDirectivePiece =
-      MacroStateDirectiveLineInterval;
-
-  auto materializedHeaderMacroStateBoundary = [&](uint64_t begin,
-                                                  uint64_t end) {
-    return OwnerStateBoundary::FromSource(OwnerSourceRange::From(
-        headerPath, begin, end, std::optional<uint64_t>(includeId)));
-  };
-
-  auto checkMaterializedHeaderMacroState =
-      [&](const OwnerStateBoundary &boundary, StateMutationKind mutation,
-          SuffixStabilityWitness witness, StringRef stage, StringRef detail,
-          bool requireKnownObserver) {
-        return CheckStateTransitionAcrossEditBoundary(
-            boundary, OwnerStateComponent::MacroState, mutation,
-            std::move(witness), stage, detail, requireKnownObserver);
-      };
-
-  auto failMaterializedHeaderMacroState =
-      [&](const OwnerStateBoundary &boundary, StateMutationKind mutation,
-          StringRef detail) {
-        return checkMaterializedHeaderMacroState(
-            boundary, mutation,
-            BuildStateTransitionWitness(
-                SuffixStabilityWitnessKind::TerminalStateFailure,
-                OwnerStateComponent::MacroState, boundary, detail),
-            "include/materialized-macro-state", detail,
-            /*requireKnownObserver=*/true);
-      };
-
-  auto widenMaterializedHeaderMacroState =
-      [&](const OwnerStateBoundary &boundary, StateMutationKind mutation,
-          StringRef detail) {
-        return checkMaterializedHeaderMacroState(
-            boundary, mutation,
-            BuildStateTransitionWitness(
-                SuffixStabilityWitnessKind::ClosureWidening,
-                OwnerStateComponent::MacroState, boundary, detail),
-            "include/materialized-macro-state", detail,
-            /*requireKnownObserver=*/false);
-      };
-
-  auto materializedHeaderReplacementObservesMacroStateDirective =
-      [&](const RefoldModel::MacroDirective &directive, StringRef replacement,
-          bool unparseableObserves) {
-        return ReplacementObservesMacroStateDirective(directive, replacement,
-                                                      unparseableObserves);
-      };
-
-  // Convert a recorded macro directive back to its exact interval in the
-  // materialized header buffer for this include owner. The shared helper owns
-  // the macro-name-anchor reconstruction and exact-byte validation.
-  auto materializedHeaderMacroStateDirectiveInterval =
-      [&](const RefoldModel::MacroDirective &directive) {
-        return RecoverMacroStateDirectiveLineInterval(
-            directive, headerPath, StringRef(bytes),
-            std::optional<uint64_t>(includeId));
-      };
-
-  auto materializedHeaderSourceChunkObservesDefinitionWhenCrossed =
-      [&](const RefoldModel::MacroDirective &definition, StringRef macroName,
-          StringRef chunk, StringRef following) {
-        return SourceChunkObservesMacroStateDirectiveWhenCrossed(
-            definition, macroName, chunk, following);
-      };
-
-  // Reconstruct the active definition for `macroName` immediately before a
-  // header byte offset using only directives owned by this materialized include.
-  // The last matching #define/#undef before the offset wins, with directive id
-  // as a deterministic tie-breaker for equal byte endpoints.
-  auto activeMaterializedHeaderDefinitionAtByte =
-      [&](const RefoldModel::MacroDirective &definition, StringRef macroName,
-          uint64_t offset) {
-        const RefoldModel::MacroDirective *active = nullptr;
-        uint64_t activeEnd = 0;
-        for (const auto &candidate : model_.GetMacroDirectives()) {
-          std::optional<MaterializedHeaderMacroStateDirectivePiece> piece =
-              materializedHeaderMacroStateDirectiveInterval(candidate);
-          if (!piece || piece->end > offset)
-            continue;
-          if (StringRef(piece->name) != macroName)
-            continue;
-          if (!active || piece->end > activeEnd ||
-              (piece->end == activeEnd && candidate.id > active->id)) {
-            active = &candidate;
-            activeEnd = piece->end;
-          }
-        }
-        return active == &definition && definition.subkind == "#define";
-      };
-
-  // A macro-state repair interval must not overlap an edit already staged
-  // for this materialized header.  Overlap would require composing two proof
-  // artifacts, which belongs to the global edit-composition layer rather than
-  // this local replay-stability repair.
-  auto materializedHeaderRangeOverlapsStagedEdit = [&](uint64_t begin,
-                                                       uint64_t end) {
-    for (const TextEdit &edit : edits)
-      if (begin < edit.end && end > edit.start)
-        return true;
-    return false;
-  };
-
-  // Extend a macro patch to the end of its physical line before appending
-  // carried directive lines.  This guarantees that moved #define lines remain
-  // real preprocessing directives, not tokens pasted onto the invocation line.
-  auto materializedHeaderLineEndAfter = [&](uint64_t offset) {
-    uint64_t p = std::min<uint64_t>(offset, bytes.size());
-    while (p < bytes.size() && bytes[static_cast<size_t>(p)] != '\n')
-      ++p;
-    if (p < bytes.size())
-      ++p;
-    return p;
-  };
-
-  // Replacement interval produced by replay stabilization.  The interval may
-  // be wider than the original macro invocation because it can consume earlier
-  // #define lines and the invocation's physical-line suffix, then re-emit the
-  // carried definitions after the replacement payload.
-  struct StabilizedMaterializedHeaderMacroPatch {
-    uint64_t start = 0;
-    uint64_t end = 0;
-    std::string replacement;
-  };
-
-  // Stabilize an include-owned macro patch against the macro state at its
-  // final replay position.
-  //
-  // Return value protocol:
-  //   * std::nullopt: no active header definition is observed by the B text, so
-  //     the original patch can be staged unchanged;
-  //   * non-empty StabilizedMaterializedHeaderMacroPatch: stage the widened,
-  //     replay-stable repair interval returned here; and
-  //   * empty {0,0,""}: terminal fallback was requested and materialization of
-  //     this include must stop.
-  //
-  // This keeps candidate selection deterministic: the function either proves a
-  // concrete source rewrite that restores B's macro context, proves that no
-  // rewrite is needed, or records the missing proof obligation.
-  auto stabilizeMaterializedHeaderMacroPatchReplay =
-      [&](const MacroPatch &mp, uint64_t mpEnd)
-          -> std::optional<StabilizedMaterializedHeaderMacroPatch> {
-    if (mp.invStart > mp.invEnd || mp.invEnd > bytes.size() ||
-        mpEnd < mp.invEnd || mpEnd > bytes.size())
-      return std::nullopt;
-
-    // Collect active #define lines that the B replacement would observe if
-    // emitted at the original invocation site.  Only movable whole directives
-    // become candidates; if an observed definition exists but cannot be moved,
-    // the proof fails closed below.
-    SmallVector<MaterializedHeaderMacroStateDirectivePiece, 4> candidates;
-    bool observedUncarriedDefinition = false;
-    for (const auto &directive : model_.GetMacroDirectives()) {
-      if (directive.subkind != "#define")
-        continue;
-      std::optional<MaterializedHeaderMacroStateDirectivePiece> piece =
-          materializedHeaderMacroStateDirectiveInterval(directive);
-      if (!piece || piece->end > mp.invStart)
-        continue;
-      if (!activeMaterializedHeaderDefinitionAtByte(directive, piece->name,
-                                                    mp.invStart))
-        continue;
-      if (!materializedHeaderReplacementObservesMacroStateDirective(
-              directive, StringRef(mp.replacement),
-              /*unparseableObserves=*/false))
-        continue;
-
-      observedUncarriedDefinition = true;
-      if (materializedHeaderRangeOverlapsStagedEdit(piece->begin, piece->end))
-        continue;
-      candidates.push_back(std::move(*piece));
-    }
-
-    if (candidates.empty()) {
-      if (!observedUncarriedDefinition)
-        return std::nullopt;
-      (void)failMaterializedHeaderMacroState(
-          materializedHeaderMacroStateBoundary(mp.invStart, mpEnd),
-          StateMutationKind::Materialized,
-          llvm::formatv("include-owned macro patch in {0} observes active "
-                        "header macro state before [{1},{2}) but no movable "
-                        "definition line was proven",
-                        headerPath, mp.invStart, mpEnd)
-              .str());
-      return StabilizedMaterializedHeaderMacroPatch{};
-    }
-
-    // Emit carried directives in source order so the relative macro-state
-    // transition order among multiple carried definitions is preserved.
-    llvm::sort(candidates,
-               [](const MaterializedHeaderMacroStateDirectivePiece &lhs,
-                  const MaterializedHeaderMacroStateDirectivePiece &rhs) {
-                 if (lhs.begin != rhs.begin)
-                   return lhs.begin < rhs.begin;
-                 return lhs.directive->id < rhs.directive->id;
-               });
-
-    // Widen from the first carried directive through the completed invocation
-    // line.  The suffix after the invocation is consumed and replayed before
-    // the carried directives, which keeps the directives line-started after
-    // repair.
-    const uint64_t newStart = candidates.front().begin;
-    const uint64_t newEnd = materializedHeaderLineEndAfter(mpEnd);
-    if (newStart > mp.invStart || newEnd < mpEnd || newEnd > bytes.size() ||
-        materializedHeaderRangeOverlapsStagedEdit(newStart, newEnd)) {
-      (void)failMaterializedHeaderMacroState(
-          materializedHeaderMacroStateBoundary(newStart, newEnd),
-          StateMutationKind::WidenedIntoClosure,
-          llvm::formatv("include-owned macro patch in {0} cannot widen "
-                        "macro-state repair interval [{1},{2})",
-                        headerPath, newStart, newEnd)
-              .str());
-      return StabilizedMaterializedHeaderMacroPatch{};
-    }
-
-    // Helper used while rebuilding the replacement to distinguish directive
-    // bytes intentionally moved to the end from ordinary source bytes that must
-    // remain in their original relative order.
-    auto isCarriedDirectiveInterval = [&](uint64_t begin, uint64_t end) {
-      for (const auto &candidate : candidates)
-        if (candidate.begin == begin && candidate.end == end)
-          return true;
-      return false;
-    };
-
-    // Build the source text that a carried directive crosses, excluding the
-    // carried directive lines themselves.  That text is the proof obligation
-    // for non-observation: if it observes the definition being delayed,
-    // movement is not semantics-preserving.
-    auto appendCrossedSourceExcludingCarried = [&](std::string &out,
-                                                   uint64_t begin,
-                                                   uint64_t end) {
-      uint64_t cursor = begin;
-      for (const auto &candidate : candidates) {
-        if (candidate.end <= cursor || candidate.begin >= end)
-          continue;
-        if (cursor < candidate.begin)
-          out.append(bytes.begin() + cursor, bytes.begin() + candidate.begin);
-        cursor = std::max(cursor, candidate.end);
-      }
-      if (cursor < end)
-        out.append(bytes.begin() + cursor, bytes.begin() + end);
-    };
-
-    // The replacement payload will be emitted before each carried definition,
-    // and the original line suffix after the macro invocation must also remain
-    // before those definitions so the directives still start on real directive
-    // lines.  Therefore every byte crossed by each carried definition must be
-    // proven non-observing for that definition.  Otherwise the macro-state move
-    // would change how preserved header source preprocesses.
-    for (const auto &candidate : candidates) {
-      std::string crossed;
-      appendCrossedSourceExcludingCarried(crossed, candidate.end, mp.invStart);
-      appendCrossedSourceExcludingCarried(crossed, mpEnd, newEnd);
-      StringRef following = StringRef(bytes).slice(mp.invStart, mpEnd);
-      if (materializedHeaderSourceChunkObservesDefinitionWhenCrossed(
-              *candidate.directive, candidate.name, StringRef(crossed),
-              following)) {
-        (void)failMaterializedHeaderMacroState(
-            materializedHeaderMacroStateBoundary(candidate.begin,
-                                                 candidate.end),
-            StateMutationKind::MovedLater,
-            llvm::formatv("include-owned macro patch in {0} cannot carry "
-                          "#{1} for '{2}' across observing header source",
-                          headerPath, candidate.directive->id, candidate.name)
-                .str());
-        return StabilizedMaterializedHeaderMacroPatch{};
-      }
-    }
-
-    // Rebuild the widened interval in the only order that preserves B's
-    // replay context and the surviving suffix context:
-    //
-    //   1. original source before each carried definition,
-    //   2. original source between the last carried definition and callsite,
-    //   3. the B replacement text,
-    //   4. the original physical-line suffix after the callsite, and
-    //   5. the carried #define lines.
-    //
-    // Thus the B replacement is evaluated before the carried definitions, while
-    // later surviving source sees those definitions restored.
-    std::string replacement;
-    replacement.reserve((mp.invStart - newStart) + mp.replacement.size() +
-                        (newEnd - mpEnd) + candidates.size() * 32);
-    uint64_t cursor = newStart;
-    for (const auto &candidate : candidates) {
-      if (!isCarriedDirectiveInterval(candidate.begin, candidate.end) ||
-          cursor > candidate.begin) {
-        (void)failMaterializedHeaderMacroState(
-            materializedHeaderMacroStateBoundary(newStart, newEnd),
-            StateMutationKind::MovedLater,
-            llvm::formatv("include-owned macro patch in {0} found invalid "
-                          "carried directive ordering",
-                          headerPath)
-                .str());
-        return StabilizedMaterializedHeaderMacroPatch{};
-      }
-      replacement.append(bytes.begin() + cursor,
-                         bytes.begin() + candidate.begin);
-      cursor = candidate.end;
-    }
-    replacement.append(bytes.begin() + cursor, bytes.begin() + mp.invStart);
-    replacement += mp.replacement;
-    replacement.append(bytes.begin() + mpEnd, bytes.begin() + newEnd);
-    if (!replacement.empty() && replacement.back() != '\n')
-      replacement.push_back('\n');
-    for (const auto &candidate : candidates) {
-      replacement.append(candidate.directive->text.begin(),
-                         candidate.directive->text.end());
-      if (replacement.empty() || replacement.back() != '\n')
-        replacement.push_back('\n');
-    }
-
-    for (const auto &candidate : candidates) {
-      (void)widenMaterializedHeaderMacroState(
-          materializedHeaderMacroStateBoundary(candidate.begin, candidate.end),
-          StateMutationKind::MovedLater,
-          llvm::formatv(
-              "include-owned macro patch in {0} carries #define #{1} for "
-              "'{2}' after replay interval [{3},{4})",
-              headerPath, candidate.directive->id, candidate.name, newStart,
-              newEnd)
-              .str());
-    }
-
-    StabilizedMaterializedHeaderMacroPatch stabilized;
-    stabilized.start = newStart;
-    stabilized.end = newEnd;
-    stabilized.replacement = std::move(replacement);
-    return stabilized;
-  };
-
-  // 1) Macro patches owned by this include. Macro invocation ranges are already
-  // recorded in the owner file's byte space, so they can be converted directly
-  // into local header TextEdits.  Before staging the TextEdit, prove replay
-  // context stability for the B-surface text: if the replacement would observe
-  // an active header-owned #define that B did not have active, move that
-  // definition after the completed replacement line.  Macro-state movement is
-  // admitted only when every crossed source byte is proven non-observing;
-  // otherwise materialization fails closed instead of emitting a refolding that
-  // preprocesses under the wrong macro environment.
-  if (auto it = macroPatchesByOwner.find(includeId);
-      it != macroPatchesByOwner.end()) {
-    for (const auto &mp : it->second) {
-      uint64_t mpEnd = stringutils::extendChainedCallEnd(
-          StringRef(bytes), mp.invEnd, mp.replacement);
-      uint64_t editStart = mp.invStart;
-      uint64_t editEnd = mpEnd;
-      std::string editReplacement = mp.replacement;
-      if (std::optional<StabilizedMaterializedHeaderMacroPatch> stabilized =
-              stabilizeMaterializedHeaderMacroPatchReplay(mp, mpEnd)) {
-        // Empty {0,0,""} is the local sentinel used by the stabilizer after
-        // it has requested terminal fallback.  Stop materializing this include
-        // so no partially proven header edit is emitted.
-        if (stabilized->replacement.empty() && stabilized->start == 0 &&
-            stabilized->end == 0) {
-          includeExpansion[includeId] = std::string();
-          return;
-        }
-        editStart = stabilized->start;
-        editEnd = stabilized->end;
-        editReplacement = std::move(stabilized->replacement);
-      }
-
-      // Apply local line-resync policy before staging the edit, and carry the
-      // accepted macro proof metadata to the emitted TextEdit.
-      ResyncOutcome ro = ApplyResyncOrPend(
-          bytes, editStart, editEnd, editReplacement, headerPath, includeId);
-      TextEdit edit{editStart,
-                    editEnd,
-                    std::move(ro.text),
-                    std::move(ro.pending),
-                    MacroPatchRemainsExpanded(mp)
-                        ? std::make_optional(GetRootMacroId(mp.macroId))
-                        : std::nullopt,
-                    {},
-                    {},
-                    {}};
-      edit.lineControlPruneCandidates =
-          std::move(ro.lineControlPruneCandidates);
-      AttachAcceptedResultCarrier(edit, BuildAcceptedEmittedMacroCandidate(mp));
-      edits.push_back(std::move(edit));
-    }
-  }
-
-  // 2) Include-preserving edits owned by this include. If those edits cannot be
-  // discharged as local anchored edits, materialize the whole include directly
-  // from B using the include-realization proof path.
-  if (auto it = perInclude.find(includeId); it != perInclude.end()) {
-    if (!it->second.patches.empty()) {
-
-      IncludeTextEditPlan plan = ComputeIncludeTextEdits(it->second, bytes);
-      if (plan.requiresIncludeRealization) {
-        AcceptedResultCandidate realizationCandidate;
-        if (auto realized = BuildInlineIncludeRealizationFromB(
-                *inc, plan.realizationReason, &realizationCandidate)) {
-          includeExpansion[includeId] = std::move(*realized);
-          includeExpansionStartLineNos[includeId] = 1;
-          includeExpansionAcceptedResults[includeId] =
-              std::move(realizationCandidate);
-          return;
-        }
-        includeExpansion[includeId] = std::string();
-        return;
-      }
-
-      for (auto &te : plan.edits) {
-        // ComputeIncludeTextEdits() already applies the owner-local padding and
-        // line-resync proof for each header edit.  Re-running resync here would
-        // treat a deliberately inserted `#line` as fresh newline drift and can
-        // duplicate the same local resume before the copied suffix.
-        edits.push_back(std::move(te));
-      }
-    }
-  }
-
-  // Return true if this include subtree contains any work that requires
-  // materialization: local include edits, local macro patches, or descendant
-  // includes with work. Clean child subtrees are left as spelled directives.
-  auto includeHasSidebandPragmaWork = [&](uint64_t id) {
-    return llvm::any_of(sidebandPragmaEdits_, [&](const SidebandPragmaEdit &e) {
-      return e.TargetsInclude(id);
-    });
-  };
-
-  auto includeHasLineDirectiveForcingSidebandWork = [&](uint64_t id) {
-    return llvm::any_of(sidebandPragmaEdits_, [&](const SidebandPragmaEdit &e) {
-      return e.TargetsInclude(id) && e.ForcesIncludeLineDirectiveWrappers();
-    });
-  };
-
-  auto includeHasOrdinaryReplayTokens = [&](uint64_t id) {
-    if (const auto *item = model_.GetIncludeById(id))
-      return item->cover.end > item->cover.begin;
-    return false;
-  };
-
-  // Return true when the materialized include subtree needs replay provenance
-  // only from sideband pragma edits.  This is intentionally separate from the
-  // #line-wrapper classification below: visible sideband replacement text may
-  // force ordinary enter/exit #line wrappers while the include still has a
-  // zero-token normal PP cover, so its edit-map witness must come from the
-  // sideband B-byte envelope rather than from a nonexistent token envelope.
-  auto includeUsesOnlySidebandReplayEnvelope =
-      [&](auto &&self, uint64_t id) -> bool {
-    bool sawSideband = includeHasSidebandPragmaWork(id);
-    if (includeHasOrdinaryReplayTokens(id))
-      return false;
-    if (auto it = perInclude.find(id);
-        it != perInclude.end() && !it->second.patches.empty())
-      return false;
-    if (auto it = macroPatchesByOwner.find(std::optional<uint64_t>(id));
-        it != macroPatchesByOwner.end() && !it->second.empty())
-      return false;
-    if (auto it = children.find(id); it != children.end()) {
-      for (const auto *child : it->second) {
-        if (!self(self, child->id))
-          return false;
-        sawSideband = true;
-      }
-    }
-    return sawSideband;
-  };
-
-  // A sideband-only include materialization is the one class where omitting
-  // otherwise-unobservable #line wrappers is intentional.  The invariant is not
-  // "materialized because of a sideband edit"; it is stricter: the materialized
-  // owner must have no ordinary PP-token replay of its own.  Once we emit
-  // normal header tokens while replacing an include directive, --with-lines
-  // must preserve the historical enter/exit file transition even if no current
-  // token observes that state.  Ordinary include patches, macro patches, B-only
-  // header sideband insertions, and non-empty include token covers all re-enter
-  // that policy.
-  enum class MaterializationWorkClass { None, SidebandPragmaOnly, Ordinary };
-  auto classifyMaterializationWork =
-      [&](auto &&self, uint64_t id) -> MaterializationWorkClass {
-    bool sawSideband = includeHasSidebandPragmaWork(id);
-    if (includeHasLineDirectiveForcingSidebandWork(id))
-      return MaterializationWorkClass::Ordinary;
-    if (sawSideband && includeHasOrdinaryReplayTokens(id))
-      return MaterializationWorkClass::Ordinary;
-    if (auto it = perInclude.find(id);
-        it != perInclude.end() && !it->second.patches.empty())
-      return MaterializationWorkClass::Ordinary;
-    if (auto it = macroPatchesByOwner.find(std::optional<uint64_t>(id));
-        it != macroPatchesByOwner.end() && !it->second.empty())
-      return MaterializationWorkClass::Ordinary;
-    if (auto it = children.find(id); it != children.end()) {
-      for (const auto *child : it->second) {
-        switch (self(self, child->id)) {
-        case MaterializationWorkClass::Ordinary:
-          return MaterializationWorkClass::Ordinary;
-        case MaterializationWorkClass::SidebandPragmaOnly:
-          sawSideband = true;
-          break;
-        case MaterializationWorkClass::None:
-          break;
-        }
-      }
-    }
-    return sawSideband ? MaterializationWorkClass::SidebandPragmaOnly
-                       : MaterializationWorkClass::None;
-  };
-
+// Include replay proof is intentionally isolated from header materialization
+// editing.  The context is constructed per materialized include expansion and
+// owns no cross-include mutable state: all caches remain local to one proof
+// request exactly as they did when these helpers were lambdas in
+// MaterializeIncludeExpansion().  This keeps the extraction mechanical while
+// making the cursor/observer proof code auditable as a separate subsystem.
+class RefoldEngine::IncludeReplayProofContext {
+public:
   enum class OrdinaryIncludeDelimiterKind { Quoted, Angled };
 
   enum class CleanChildIncludeReplayAction { None, RewriteOperand, Materialize };
@@ -3230,6 +2307,46 @@ void RefoldEngine::MaterializeIncludeExpansion(
     bool forceMaterializeDescendantIncludeNext = false;
   };
 
+  explicit IncludeReplayProofContext(const RefoldEngine &engine)
+      : Engine(engine), model_(engine.model_), aSource_(engine.aSource_),
+        lineDirs_(engine.lineDirs_),
+        finalReplaySurface_(engine.finalReplaySurface_) {}
+
+  CleanChildIncludeReplayPlan planCleanChildIncludeReplayFromMaterializedParent(
+      const RefoldModel::IncludeItem &child) const;
+
+  static const char *ordinaryIncludeDelimiterName(
+      OrdinaryIncludeDelimiterKind kind) {
+    switch (kind) {
+    case OrdinaryIncludeDelimiterKind::Quoted:
+      return "quote";
+    case OrdinaryIncludeDelimiterKind::Angled:
+      return "angle";
+    }
+    llvm_unreachable("Invalid OrdinaryIncludeDelimiterKind");
+  }
+
+  static char ordinaryIncludeDelimiterOpen(OrdinaryIncludeDelimiterKind kind) {
+    switch (kind) {
+    case OrdinaryIncludeDelimiterKind::Quoted:
+      return '"';
+    case OrdinaryIncludeDelimiterKind::Angled:
+      return '<';
+    }
+    llvm_unreachable("Invalid OrdinaryIncludeDelimiterKind");
+  }
+
+  static char ordinaryIncludeDelimiterClose(OrdinaryIncludeDelimiterKind kind) {
+    switch (kind) {
+    case OrdinaryIncludeDelimiterKind::Quoted:
+      return '"';
+    case OrdinaryIncludeDelimiterKind::Angled:
+      return '>';
+    }
+    llvm_unreachable("Invalid OrdinaryIncludeDelimiterKind");
+  }
+
+private:
   struct IncludeReplayCandidate {
     std::filesystem::path PhysicalPath;
     std::string EnteredFileSpelling;
@@ -3339,6 +2456,45 @@ void RefoldEngine::MaterializeIncludeExpansion(
     SmallVector<IncludeReplaySearchDir, 32> AngledLookupDirs;
   };
 
+
+  mutable std::optional<RecordedIncludeSearchDirs>
+      recordedIncludeSearchDirsCache_;
+
+  const RefoldEngine &Engine;
+  const RefoldModel &model_;
+  StringRef aSource_;
+  const LineDirectiveInserter &lineDirs_;
+  const std::optional<FinalReplaySurface> &finalReplaySurface_;
+
+  StringRef SliceASource(uint64_t begin, uint64_t end) const {
+    return Engine.SliceASource(begin, end);
+  }
+
+  const RefoldModel::MacroInvocation *LineStateObservableMacroSite(
+      const RefoldModel::MacroInvocation &macro) const {
+    return Engine.LineStateObservableMacroSite(macro);
+  }
+
+  bool LineStateBuiltinInvocationIsPreservedObserver(
+      const RefoldModel::MacroInvocation &macro) const {
+    return Engine.LineStateBuiltinInvocationIsPreservedObserver(macro);
+  }
+
+  LineStateObserverDemand
+  IncludeSubtreeLineStateObserverDemand(uint64_t includeId) const {
+    return Engine.IncludeSubtreeLineStateObserverDemand(includeId);
+  }
+
+  bool samePhysicalIncludeFile(
+      StringRef candidatePath, const RefoldModel::IncludeItem &include) const {
+    return Engine.samePhysicalIncludeFile(candidatePath, include);
+  }
+};
+
+RefoldEngine::IncludeReplayProofContext::CleanChildIncludeReplayPlan
+RefoldEngine::IncludeReplayProofContext::
+planCleanChildIncludeReplayFromMaterializedParent(
+    const RefoldModel::IncludeItem &child) const {
   auto absolutePathInPPCwd = [&](StringRef path) -> std::filesystem::path {
     std::filesystem::path fsPath(path.str());
     if (fsPath.is_absolute())
@@ -3646,11 +2802,10 @@ void RefoldEngine::MaterializeIncludeExpansion(
     return computeLegacyArgvIncludeSearchDirs();
   };
 
-  std::optional<RecordedIncludeSearchDirs> recordedIncludeSearchDirsCache;
   auto recordedIncludeSearchDirs = [&]() -> const RecordedIncludeSearchDirs & {
-    if (!recordedIncludeSearchDirsCache)
-      recordedIncludeSearchDirsCache = computeRecordedIncludeSearchDirs();
-    return *recordedIncludeSearchDirsCache;
+    if (!recordedIncludeSearchDirsCache_)
+      recordedIncludeSearchDirsCache_ = computeRecordedIncludeSearchDirs();
+    return *recordedIncludeSearchDirsCache_;
   };
 
   auto appendEnteredFileSpelling = [](StringRef prefix, StringRef operand) {
@@ -4844,18 +3999,6 @@ void RefoldEngine::MaterializeIncludeExpansion(
     std::string origin;
   };
 
-  auto ordinaryIncludeDelimiterName =
-      [](OrdinaryIncludeDelimiterKind kind) -> const char * {
-    switch (kind) {
-    case OrdinaryIncludeDelimiterKind::Quoted:
-      return "quote";
-    case OrdinaryIncludeDelimiterKind::Angled:
-      return "angle";
-    }
-    llvm_unreachable("Invalid OrdinaryIncludeDelimiterKind");
-  };
-
-
   auto ordinaryIncludeReplayFailureReasonName =
       [](OrdinaryIncludeReplayFailureKind kind) -> const char * {
     switch (kind) {
@@ -4899,16 +4042,6 @@ void RefoldEngine::MaterializeIncludeExpansion(
     if (!index)
       return "(none)";
     return std::to_string(*index);
-  };
-
-  auto ordinaryIncludeDelimiterOpen =
-      [](OrdinaryIncludeDelimiterKind kind) -> char {
-    return kind == OrdinaryIncludeDelimiterKind::Quoted ? '"' : '<';
-  };
-
-  auto ordinaryIncludeDelimiterClose =
-      [](OrdinaryIncludeDelimiterKind kind) -> char {
-    return kind == OrdinaryIncludeDelimiterKind::Quoted ? '"' : '>';
   };
 
   auto safeOrdinaryIncludeRewriteOperand = [](StringRef path) {
@@ -5287,10 +4420,14 @@ void RefoldEngine::MaterializeIncludeExpansion(
         "observers(file={13}, file_name={14}, unproven_file={15}) "
         "descendant_include_next(count={16}, result={17}) "
         "selected_target_proven={18} decision={19}",
-        child.id, rewrite.origin, ordinaryIncludeDelimiterName(
-                                      rewrite.delimiterKind),
-        ordinaryIncludeDelimiterOpen(rewrite.delimiterKind), rewrite.operand,
-        ordinaryIncludeDelimiterClose(rewrite.delimiterKind),
+        child.id, rewrite.origin,
+        IncludeReplayProofContext::ordinaryIncludeDelimiterName(
+            rewrite.delimiterKind),
+        IncludeReplayProofContext::ordinaryIncludeDelimiterOpen(
+            rewrite.delimiterKind),
+        rewrite.operand,
+        IncludeReplayProofContext::ordinaryIncludeDelimiterClose(
+            rewrite.delimiterKind),
         replayPhysicalPath, producerPhysicalPath, replayLookupKind,
         replaySearchChainIndex, producerLookupKind, producerSearchChainIndex,
         producerIncludeNextSelectedIndex, demand.observesFile,
@@ -5299,8 +4436,6 @@ void RefoldEngine::MaterializeIncludeExpansion(
         selectedTargetProven, decisionReason);
   };
 
-  auto planCleanChildIncludeReplayFromMaterializedParent =
-      [&](const RefoldModel::IncludeItem &child) -> CleanChildIncludeReplayPlan {
     CleanChildIncludeReplayPlan plan;
 
     if (!child.parent)
@@ -5334,7 +4469,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
     };
 
     if (isDirectIncludeNext && !producerPhysicalIncludePath(child)) {
-      plan.action = CleanChildIncludeReplayAction::Materialize;
+      plan.action = IncludeReplayProofContext::CleanChildIncludeReplayAction::Materialize;
       plan.reason = "#include_next has no producer physical target for "
                     "ordinary-include rewrite proof";
       markMaterializationIfIncludeNextObligationsRemain();
@@ -5343,7 +4478,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
 
     if (isDirectIncludeNext &&
         !directIncludeNextHasProducerSelectionProvenance(child)) {
-      plan.action = CleanChildIncludeReplayAction::Materialize;
+      plan.action = IncludeReplayProofContext::CleanChildIncludeReplayAction::Materialize;
       plan.reason = "#include_next has no complete producer search-chain "
                     "selection proof for ordinary-include rewrite";
       markMaterializationIfIncludeNextObligationsRemain();
@@ -5355,7 +4490,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
     // has the same stack depth as the producer run, so the child must be
     // realized through the existing materialization/line-state repair path.
     if (demand.observesIncludeLevel) {
-      plan.action = CleanChildIncludeReplayAction::Materialize;
+      plan.action = IncludeReplayProofContext::CleanChildIncludeReplayAction::Materialize;
       plan.reason = "child subtree observes __INCLUDE_LEVEL__ across "
                     "materialized-parent include relocation";
       markMaterializationIfIncludeNextObligationsRemain();
@@ -5366,7 +4501,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
     // child header.  Include operand replay can prove only the physical child
     // file and, for __FILE__/__FILE_NAME__, the child entered-file spelling.
     if (demand.observesBaseFile) {
-      plan.action = CleanChildIncludeReplayAction::Materialize;
+      plan.action = IncludeReplayProofContext::CleanChildIncludeReplayAction::Materialize;
       plan.reason = "child subtree observes __BASE_FILE__ across "
                     "materialized-parent include relocation";
       markMaterializationIfIncludeNextObligationsRemain();
@@ -5388,7 +4523,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
       std::optional<std::string> operand =
           angledIncludeReplayLookupOperand(child);
       if (!operand) {
-        plan.action = CleanChildIncludeReplayAction::Materialize;
+        plan.action = IncludeReplayProofContext::CleanChildIncludeReplayAction::Materialize;
         plan.reason = "angled child include operand is not replay-provable "
                       "from materialized parent surface";
         markMaterializationIfIncludeNextObligationsRemain();
@@ -5398,7 +4533,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
       std::optional<IncludeReplayCandidate> candidate =
           computeAngledIncludeReplayCandidate(*operand);
       if (!candidate) {
-        plan.action = CleanChildIncludeReplayAction::Materialize;
+        plan.action = IncludeReplayProofContext::CleanChildIncludeReplayAction::Materialize;
         plan.reason = "angled child include has no replay-surface lookup "
                       "target";
         markMaterializationIfIncludeNextObligationsRemain();
@@ -5410,7 +4545,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
       if (proof.proves(demand))
         return plan;
 
-      plan.action = CleanChildIncludeReplayAction::Materialize;
+      plan.action = IncludeReplayProofContext::CleanChildIncludeReplayAction::Materialize;
       if (!proof.samePhysicalFile)
         plan.reason = "angled child include resolves to a different file at "
                       "replay surface";
@@ -5463,7 +4598,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
             traceDirectIncludeNextOrdinaryRewriteCandidate(
                 rewrite, child, demand, &*proof, selectedTargetProven,
                 "accepted");
-            plan.action = CleanChildIncludeReplayAction::RewriteOperand;
+            plan.action = IncludeReplayProofContext::CleanChildIncludeReplayAction::RewriteOperand;
             plan.rewrittenOperand = rewrite.operand;
             plan.rewrittenDelimiterKind = rewrite.delimiterKind;
             plan.reason = std::move(reason);
@@ -5484,13 +4619,13 @@ void RefoldEngine::MaterializeIncludeExpansion(
         // level so normal diagnostics do not become enormous.
         if (firstRejectedCandidateReason.empty()) {
           firstRejectedCandidateReason = "; first ordinary include candidate ";
-          firstRejectedCandidateReason += ordinaryIncludeDelimiterName(
+          firstRejectedCandidateReason += IncludeReplayProofContext::ordinaryIncludeDelimiterName(
               rewrite.delimiterKind);
           firstRejectedCandidateReason += " ";
-          firstRejectedCandidateReason += ordinaryIncludeDelimiterOpen(
+          firstRejectedCandidateReason += IncludeReplayProofContext::ordinaryIncludeDelimiterOpen(
               rewrite.delimiterKind);
           firstRejectedCandidateReason += rewrite.operand;
-          firstRejectedCandidateReason += ordinaryIncludeDelimiterClose(
+          firstRejectedCandidateReason += IncludeReplayProofContext::ordinaryIncludeDelimiterClose(
               rewrite.delimiterKind);
           firstRejectedCandidateReason += " from ";
           firstRejectedCandidateReason += rewrite.origin;
@@ -5505,7 +4640,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
       else
         reason += firstRejectedCandidateReason;
 
-      plan.action = CleanChildIncludeReplayAction::Materialize;
+      plan.action = IncludeReplayProofContext::CleanChildIncludeReplayAction::Materialize;
       plan.reason = std::move(reason);
       markMaterializationIfIncludeNextObligationsRemain();
       return plan;
@@ -5517,7 +4652,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
     std::optional<std::string> childReplayOperand =
         quotedIncludeReplayLookupOperand(child);
     if (!childReplayOperand) {
-      plan.action = CleanChildIncludeReplayAction::Materialize;
+      plan.action = IncludeReplayProofContext::CleanChildIncludeReplayAction::Materialize;
       plan.reason = "quoted child include operand is not replay-provable "
                     "from materialized parent surface";
       markMaterializationIfIncludeNextObligationsRemain();
@@ -5581,7 +4716,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
         IncludeReplayProofResult proof =
             evaluateIncludeReplayCandidate(rewrite.replay, child, demand);
         if (proof.proves(demand)) {
-          plan.action = CleanChildIncludeReplayAction::RewriteOperand;
+          plan.action = IncludeReplayProofContext::CleanChildIncludeReplayAction::RewriteOperand;
           plan.rewrittenOperand = std::move(rewrite.operand);
           plan.reason = std::move(reason);
           return plan;
@@ -5619,11 +4754,946 @@ void RefoldEngine::MaterializeIncludeExpansion(
         reason += firstRewriteFailure;
     }
 
-    plan.action = CleanChildIncludeReplayAction::Materialize;
+    plan.action = IncludeReplayProofContext::CleanChildIncludeReplayAction::Materialize;
     plan.reason = std::move(reason);
     markMaterializationIfIncludeNextObligationsRemain();
     return plan;
+
+}
+
+void RefoldEngine::MaterializeIncludeExpansion(
+    uint64_t includeId, const DenseMap<uint64_t, IncludeEdits> &perInclude,
+    const DenseMap<std::optional<uint64_t>, std::vector<MacroPatch>>
+        &macroPatchesByOwner,
+    const DenseMap<uint64_t, std::vector<const RefoldModel::IncludeItem *>>
+        &children,
+    DenseMap<uint64_t, std::string> &includeExpansion,
+    DenseMap<uint64_t, std::vector<FinalLineControlPruneCandidate>>
+        &includeExpansionLineControlPruneCandidates,
+    DenseMap<uint64_t, std::vector<FinalLineControlSourceMapping>>
+        &includeExpansionLineControlSourceMappings,
+    DenseMap<uint64_t, size_t> &includeExpansionStartLineNos,
+    DenseMap<uint64_t, AcceptedResultCandidate>
+        &includeExpansionAcceptedResults,
+    DenseSet<uint64_t> *appliedExpandedMacroRootIds,
+    bool materializeIncludeNextInThisSubtree) const {
+  // Include materialization is memoized by include id. A parent may reach the
+  // same child through recursive expansion, so avoid rebuilding already
+  // materialized text.
+  if (includeExpansion.count(includeId)) {
+    // Preseeded or previously materialized include bodies that do not carry a
+    // more precise source-line witness still enter at the header start.
+    if (!includeExpansionStartLineNos.count(includeId))
+      includeExpansionStartLineNos[includeId] = 1;
+    return;
+  }
+
+  const RefoldModel::IncludeItem *inc = model_.GetIncludeById(includeId);
+  if (!inc)
+    REFOLD_LOG_FATAL("include/mat", "unknown includeId {0}", includeId);
+
+
+  const std::string headerPath = resolveHeaderPath(*inc);
+  const std::string headerLoadPath = resolveHeaderLoadPath(*inc);
+
+  auto pathNamesThisMaterializedHeader = [&](StringRef path) -> bool {
+    if (path.empty())
+      return false;
+    if (path == StringRef(headerPath) || path == StringRef(headerLoadPath))
+      return true;
+
+    // Header-owner checks are hardening predicates, not the semantic filename
+    // proof itself.  Use the non-fatal line-control path normalizer here rather
+    // than canonicalizing the logical spelling: producer-entered spellings such
+    // as `leaf.h` may only be meaningful inside Clang's search context, while
+    // opened_path is the separately recorded readable file.
+    if (!headerLoadPath.empty() &&
+        SameLineControlPhysicalFile(path, headerLoadPath))
+      return true;
+    return SameLineControlPhysicalFile(path, headerPath);
   };
+
+  // Start from the header's original source bytes. Some callers preseed
+  // `includeExpansion` with raw header text; otherwise load it deterministically
+  // from the producer-selected physical file.  The logical headerPath above is
+  // reserved for owner matching and `#line` spelling repair.
+  std::string bytes;
+  if (auto it = includeExpansion.find(includeId); it != includeExpansion.end())
+    bytes = it->second;
+  if (bytes.empty()) {
+    auto bufOrErr =
+        MemoryBuffer::getFile(lineDirs_.ToAbsolutePath(headerLoadPath));
+    if (!bufOrErr) {
+      REFOLD_LOG_FATAL("include/mat",
+                       "failed to read header: {0} (load path {1}) ({2})",
+                       headerPath, headerLoadPath,
+                       bufOrErr.getError().message());
+    }
+
+    const MemoryBuffer &mb = **bufOrErr;
+    bytes.assign(mb.getBufferStart(), mb.getBufferEnd());
+  }
+
+  auto editsIt = perInclude.find(includeId);
+  // Accumulate all local edits in this header byte space, then apply them once
+  // at the end. This lets include edits, macro patches, and child include
+  // materializations participate in one overlap/resync pass.
+  std::vector<TextEdit> edits;
+
+  auto materializedHeaderHasReplayContextSensitiveConditionalControl = [&]() {
+    // A materialized header is replayed from the including surface, not from
+    // the header's original file.  Conditional operators such as
+    // __has_include perform quoted-header lookup relative to the file that
+    // contains the directive; moving that directive out of its original header
+    // can therefore flip the selected preprocessor branch even when ordinary
+    // macro state is otherwise closed.  When such conditional control is part
+    // of a materialized include, use the producer-proven B-token envelope for
+    // the include realization instead of copying the directive text verbatim.
+    for (const RefoldModel::CondGroup *group :
+         model_.GetCondGroups(headerPath, includeId)) {
+      if (!group)
+        continue;
+      for (const RefoldModel::CondArm &arm : group->arms) {
+        if (!arm.cond)
+          continue;
+        if (arm.cond->contains("__has_include"))
+          return true;
+      }
+    }
+    return false;
+  };
+
+  auto materializedHeaderHasIncludeLevelObserver = [&]() {
+    // __INCLUDE_LEVEL__ observes include-stack depth, not line/file state.
+    // Once an include owner is materialized, the source-spelled header bytes are
+    // replayed from the flattened parent/TU surface instead of being entered by
+    // an actual #include edge.  Leaving a preserved __INCLUDE_LEVEL__ spelling
+    // in that materialized text would therefore expand at the replay depth
+    // rather than at the producer-observed depth.  Treat any observable
+    // __INCLUDE_LEVEL__ in this owner as a request for producer-proven B-surface
+    // realization, which literalizes the recorded expansion value and avoids
+    // fabricating an include-stack transition that no longer exists.
+    for (const RefoldModel::MacroInvocation &macro :
+         model_.GetMacroInvocations()) {
+      if (macro.name != "__INCLUDE_LEVEL__")
+        continue;
+
+      const RefoldModel::MacroInvocation *site =
+          LineStateObservableMacroSite(macro);
+      std::optional<uint64_t> owner =
+          site && site->ownerIncludeId ? site->ownerIncludeId
+                                       : macro.ownerIncludeId;
+      if (!owner || *owner != includeId)
+        continue;
+
+      // The owner id is the semantic proof; the optional invocation file is a
+      // hardening check against malformed producer records that accidentally
+      // attach a builtin from another source buffer to this include instance.
+      if (site && site->invFile &&
+          !pathNamesThisMaterializedHeader(*site->invFile))
+        continue;
+      if (macro.invFile && !pathNamesThisMaterializedHeader(*macro.invFile) &&
+          (!site || !site->invFile ||
+           !pathNamesThisMaterializedHeader(*site->invFile)))
+        continue;
+
+      return true;
+    }
+    return false;
+  };
+
+  auto realizeMaterializedHeaderFromB = [&](StringRef reason) -> bool {
+    AcceptedResultCandidate realizationCandidate;
+    if (auto realized =
+            BuildInlineIncludeRealizationFromB(*inc, reason,
+                                               &realizationCandidate)) {
+      includeExpansion[includeId] = std::move(*realized);
+      includeExpansionStartLineNos[includeId] = 1;
+      includeExpansionAcceptedResults[includeId] =
+          std::move(realizationCandidate);
+      REFOLD_LOG_TRACE("include/mat", "realize include #{0} from B: {1}",
+                       includeId, reason);
+      return true;
+    }
+
+    includeExpansion[includeId] = std::string();
+    return false;
+  };
+
+  if (materializedHeaderHasReplayContextSensitiveConditionalControl()) {
+    (void)realizeMaterializedHeaderFromB(
+        "replay-context-sensitive conditional control in materialized header");
+    return;
+  }
+
+  if (materializedHeaderHasIncludeLevelObserver()) {
+    (void)realizeMaterializedHeaderFromB(
+        "__INCLUDE_LEVEL__ observer in materialized header");
+    return;
+  }
+
+  auto materializedHeaderHasNoLineRepairableFileObserver = [&]() {
+    // `__FILE__` and `__FILE_NAME__` observe the current logical filename.  If
+    // line directives are disabled, a materialized header body is replayed as
+    // ordinary text in the flattened parent/output source, so preserving a naked
+    // builtin would make it observe the emitted `.c.mod` context rather than the
+    // producer-selected header.  The only deterministic no-lines repair is the
+    // already-preprocessed B realization, which literalizes the producer value.
+    if (lineDirs_.Enabled())
+      return false;
+
+    for (const RefoldModel::MacroInvocation &macro :
+         model_.GetMacroInvocations()) {
+      if (macro.name != "__FILE__" && macro.name != "__FILE_NAME__")
+        continue;
+      if (!LineStateBuiltinInvocationIsPreservedObserver(macro))
+        continue;
+
+      const RefoldModel::MacroInvocation *site =
+          LineStateObservableMacroSite(macro);
+      std::optional<uint64_t> owner =
+          site && site->ownerIncludeId ? site->ownerIncludeId
+                                       : macro.ownerIncludeId;
+      if (!owner || *owner != includeId)
+        continue;
+
+      // The owner id is the semantic proof.  The file checks only reject
+      // malformed records that accidentally attach a preserved builtin from some
+      // other source buffer to this include instance.
+      if (site && site->invFile &&
+          !pathNamesThisMaterializedHeader(*site->invFile))
+        continue;
+      if (macro.invFile && !pathNamesThisMaterializedHeader(*macro.invFile) &&
+          (!site || !site->invFile ||
+           !pathNamesThisMaterializedHeader(*site->invFile)))
+        continue;
+
+      return true;
+    }
+    return false;
+  };
+
+  auto materializedHeaderHasUnrepairableFileSpellingObserver = [&]() {
+    // With line directives enabled, materialization can preserve source-spelled
+    // `__FILE__` / `__FILE_NAME__` only if the include edge has a producer
+    // filename spelling to install before the copied body.  If the map lacks any
+    // entered-file witness, do not invent one from the target token; literalize
+    // the already-preprocessed value instead.
+    if (!lineDirs_.Enabled())
+      return false;
+
+    const LineStateObserverDemand demand =
+        IncludeSubtreeLineStateObserverDemand(includeId);
+    if (!demand.needsFile && !demand.needsFileName)
+      return false;
+
+    StringRef producerSpelling = producerEnteredFileSpelling(*inc);
+    if (producerSpelling.empty())
+      return true;
+
+    if (demand.needsFileName && producerEnteredFileName(*inc).empty())
+      return true;
+
+    return false;
+  };
+
+  if (materializedHeaderHasNoLineRepairableFileObserver()) {
+    (void)realizeMaterializedHeaderFromB(
+        "__FILE__/__FILE_NAME__ observer in materialized header without "
+        "line repair");
+    return;
+  }
+
+  if (materializedHeaderHasUnrepairableFileSpellingObserver()) {
+    (void)realizeMaterializedHeaderFromB(
+        "__FILE__/__FILE_NAME__ observer in materialized header without "
+        "producer entered-file spelling");
+    return;
+  }
+
+  auto materializedHeaderHasNoLineRepairableBaseFileObserver = [&]() {
+    // __BASE_FILE__ is part of the line/file observer family when line
+    // directives are available: a source-authored or synthetic #line can keep
+    // the replayed spelling stable without destroying source structure.  In
+    // --no-lines mode, however, a materialized include owner has no way to
+    // repair a preserved source-spelled __BASE_FILE__; replay would observe the
+    // refolded output as the top-level file.  In that mode, realize the include
+    // from the producer-proven B envelope so the recorded literal is emitted.
+    if (lineDirs_.Enabled())
+      return false;
+
+    for (const RefoldModel::MacroInvocation &macro :
+         model_.GetMacroInvocations()) {
+      if (macro.name != "__BASE_FILE__")
+        continue;
+      if (!LineStateBuiltinInvocationIsPreservedObserver(macro))
+        continue;
+
+      const RefoldModel::MacroInvocation *site =
+          LineStateObservableMacroSite(macro);
+      std::optional<uint64_t> owner =
+          site && site->ownerIncludeId ? site->ownerIncludeId
+                                       : macro.ownerIncludeId;
+      if (!owner || *owner != includeId)
+        continue;
+
+      // The owner id is the semantic proof.  The file spelling checks are only
+      // hardening against malformed producer records that accidentally attach a
+      // builtin from another source buffer to this include instance.
+      if (site && site->invFile &&
+          !pathNamesThisMaterializedHeader(*site->invFile))
+        continue;
+      if (macro.invFile && !pathNamesThisMaterializedHeader(*macro.invFile) &&
+          (!site || !site->invFile ||
+           !pathNamesThisMaterializedHeader(*site->invFile)))
+        continue;
+
+      return true;
+    }
+    return false;
+  };
+
+  if (materializedHeaderHasNoLineRepairableBaseFileObserver()) {
+    (void)realizeMaterializedHeaderFromB(
+        "__BASE_FILE__ observer in materialized header without line repair");
+    return;
+  }
+
+  auto includeInsertionPatchCarriesSidebandReplay =
+      [&](const SidebandPragmaEdit &sideband) -> bool {
+    if (editsIt == perInclude.end())
+      return false;
+    if (!sideband.SourceIsZeroWidthInsertion())
+      return false;
+
+    const auto sidebandB = sideband.MaterializedBByteRange();
+    for (const IncludePatch &patch : editsIt->second.patches) {
+      if (patch.aStart != patch.aEnd || patch.bStart >= patch.bEnd)
+        continue;
+      if (patch.bStart >= bTokOff_.size() || patch.bEnd > bTokOff_.size())
+        continue;
+
+      StringRef patchEnvelope =
+          sliceTokenEnvelope(bTokOff_, bSource_, patch.bStart, patch.bEnd);
+      const uint64_t patchB = bTokOff_[static_cast<size_t>(patch.bStart)];
+      const uint64_t patchE = patchB + patchEnvelope.size();
+      if (patchB <= sidebandB.first && sidebandB.second <= patchE)
+        return true;
+    }
+    return false;
+  };
+
+  // 0) Sideband pragma edits owned by this include.  These pragmas were printed
+  // verbatim in the raw `.i` replay surface but deliberately removed from the
+  // normal A/B token streams before diffing.  When such a pragma lives in a
+  // header, deleting/replacing it is an include-owned source edit, not a TU
+  // edit.  Stage it here so it composes with the same owner-polymorphic header
+  // materialization path used for ordinary include and macro edits.
+  for (const SidebandPragmaEdit &sideband : sidebandPragmaEdits_) {
+    if (!sideband.TargetsInclude(includeId))
+      continue;
+
+    const auto sourceRange = sideband.SourceByteRange();
+    if (!ValidateSidebandPragmaEditProof(sideband, "pragma/sideband/include")) {
+      includeExpansion[includeId] = std::string();
+      return;
+    }
+
+    if (!sideband.SourceIsWithinOwnerBytes(static_cast<uint64_t>(bytes.size()))) {
+      RequestTerminalFallback(
+          MakeTerminalFallbackProofFailure(
+          TerminalFallbackObligationKind::PragmaBoundaryKnown,
+          TerminalFallbackFailureReason::UnknownPragmaCrossesBoundary),
+          "pragma/sideband",
+          llvm::formatv("header-owned sideband pragma edit has invalid range "
+                        "inc#{0} path='{1}' site=[{2},{3}) headerSize={4}",
+                        includeId, headerPath, sourceRange.first,
+                        sourceRange.second, bytes.size())
+              .str());
+      includeExpansion[includeId] = std::string();
+      return;
+    }
+
+    if (includeInsertionPatchCarriesSidebandReplay(sideband)) {
+      // A header-prefix/suffix ordinary insertion patch uses the full B token
+      // envelope.  If that envelope already contains this sideband replay
+      // range, staging a second header-owned sideband edit would duplicate the
+      // pragma in the materialized header.  The sideband proof is still
+      // necessary for owner selection and token-stream normalization, but the
+      // include patch is the unique replay owner for the visible bytes.
+      continue;
+    }
+
+    auto hasCopiedHeaderSuffixAfterSidebandEdit = [&]() -> bool {
+      // A header-local resync can only protect bytes that remain in this same
+      // materialized header after the sideband edit.  If the sideband edit is
+      // the last visible header-owned replay text, the parent-resume wrapper is
+      // the next meaningful line-state transition and an extra local #line
+      // would be gratuitous.
+      for (uint64_t p = sourceRange.second; p < bytes.size(); ++p)
+        if (!stringutils::isWs(bytes[p]))
+          return true;
+      return false;
+    };
+
+    // A sideband pragma line is not part of the normal PP token stream, but it
+    // can still be visible header-owned replay text.  The include enter/exit
+    // wrapper handles the owner transition for that visible replay.
+    // Header-local resync is narrower: emit it only when sideband-owned
+    // trailing B whitespace would otherwise shift copied header suffix bytes,
+    // or when the suffix has a source-location observer such as
+    // __LINE__/__FILE__.
+    const bool mustPreserveHeaderLineState =
+        (sideband.ForcesIncludeLineDirectiveWrappers() &&
+         hasCopiedHeaderSuffixAfterSidebandEdit() &&
+         sideband.OwnsTrailingReplayBlankLine()) ||
+        OwnerSuffixHasLineStateSensitiveBuiltin(includeId, headerPath,
+                                                sourceRange.second);
+    ResyncOutcome ro =
+        mustPreserveHeaderLineState
+            ? ApplyResyncOrPend(bytes, sourceRange.first, sourceRange.second,
+                                sideband.ReplacementText(), headerPath,
+                                includeId)
+            : ResyncOutcome(sideband.ReplacementText().str(), std::nullopt);
+    TextEdit edit{sourceRange.first,
+                  sourceRange.second,
+                  std::move(ro.text),
+                  std::move(ro.pending),
+                  std::nullopt,
+                  {},
+                  {},
+                  {}};
+    edit.lineControlPruneCandidates = std::move(ro.lineControlPruneCandidates);
+    AttachAcceptedResultCarrier(
+        edit, BuildAcceptedIncludeRealizationCandidate(
+                  AcceptedPathKind::IncludeMaterializedExpansion, *inc));
+    edits.push_back(std::move(edit));
+  }
+
+  // Replay-context stability, include-owned macro-state repair.
+  //
+  // A macro patch inside a materialized header is emitted as B-surface source
+  // text in the header file's byte space.  That replay is only sound if the
+  // text sees the same macro environment that produced B.  When the original
+  // header contains an active #define before the patched invocation, the B text
+  // might accidentally expand under that preserved A-side definition.  The
+  // finite invariant enforced below is:
+  //
+  //   * identify active header-owned macro-state directives that the B text
+  //     would observe at the current replay site;
+  //   * carry only whole directive lines, never partial directive spellings;
+  //   * move those directive lines after the completed replacement interval
+  //     only across source proven not to observe them; and
+  //   * fail closed if the directive cannot be parsed, located, moved, or kept
+  //     on a real directive line.
+  //
+  // This makes replay stability a property of owner materialization itself,
+  // rather than a special case of the test that motivated it.
+  using MaterializedHeaderMacroStateDirectivePiece =
+      MacroStateDirectiveLineInterval;
+
+  auto materializedHeaderMacroStateBoundary = [&](uint64_t begin,
+                                                  uint64_t end) {
+    return OwnerStateBoundary::FromSource(OwnerSourceRange::From(
+        headerPath, begin, end, std::optional<uint64_t>(includeId)));
+  };
+
+  auto checkMaterializedHeaderMacroState =
+      [&](const OwnerStateBoundary &boundary, StateMutationKind mutation,
+          SuffixStabilityWitness witness, StringRef stage, StringRef detail,
+          bool requireKnownObserver) {
+        return CheckStateTransitionAcrossEditBoundary(
+            boundary, OwnerStateComponent::MacroState, mutation,
+            std::move(witness), stage, detail, requireKnownObserver);
+      };
+
+  auto failMaterializedHeaderMacroState =
+      [&](const OwnerStateBoundary &boundary, StateMutationKind mutation,
+          StringRef detail) {
+        return checkMaterializedHeaderMacroState(
+            boundary, mutation,
+            BuildStateTransitionWitness(
+                SuffixStabilityWitnessKind::TerminalStateFailure,
+                OwnerStateComponent::MacroState, boundary, detail),
+            "include/materialized-macro-state", detail,
+            /*requireKnownObserver=*/true);
+      };
+
+  auto widenMaterializedHeaderMacroState =
+      [&](const OwnerStateBoundary &boundary, StateMutationKind mutation,
+          StringRef detail) {
+        return checkMaterializedHeaderMacroState(
+            boundary, mutation,
+            BuildStateTransitionWitness(
+                SuffixStabilityWitnessKind::ClosureWidening,
+                OwnerStateComponent::MacroState, boundary, detail),
+            "include/materialized-macro-state", detail,
+            /*requireKnownObserver=*/false);
+      };
+
+  auto materializedHeaderReplacementObservesMacroStateDirective =
+      [&](const RefoldModel::MacroDirective &directive, StringRef replacement,
+          bool unparseableObserves) {
+        return ReplacementObservesMacroStateDirective(directive, replacement,
+                                                      unparseableObserves);
+      };
+
+  // Convert a recorded macro directive back to its exact interval in the
+  // materialized header buffer for this include owner. The shared helper owns
+  // the macro-name-anchor reconstruction and exact-byte validation.
+  auto materializedHeaderMacroStateDirectiveInterval =
+      [&](const RefoldModel::MacroDirective &directive) {
+        return RecoverMacroStateDirectiveLineInterval(
+            directive, headerPath, StringRef(bytes),
+            std::optional<uint64_t>(includeId));
+      };
+
+  auto materializedHeaderSourceChunkObservesDefinitionWhenCrossed =
+      [&](const RefoldModel::MacroDirective &definition, StringRef macroName,
+          StringRef chunk, StringRef following) {
+        return SourceChunkObservesMacroStateDirectiveWhenCrossed(
+            definition, macroName, chunk, following);
+      };
+
+  // Reconstruct the active definition for `macroName` immediately before a
+  // header byte offset using only directives owned by this materialized include.
+  // The last matching #define/#undef before the offset wins, with directive id
+  // as a deterministic tie-breaker for equal byte endpoints.
+  auto activeMaterializedHeaderDefinitionAtByte =
+      [&](const RefoldModel::MacroDirective &definition, StringRef macroName,
+          uint64_t offset) {
+        const RefoldModel::MacroDirective *active = nullptr;
+        uint64_t activeEnd = 0;
+        for (const auto &candidate : model_.GetMacroDirectives()) {
+          std::optional<MaterializedHeaderMacroStateDirectivePiece> piece =
+              materializedHeaderMacroStateDirectiveInterval(candidate);
+          if (!piece || piece->end > offset)
+            continue;
+          if (StringRef(piece->name) != macroName)
+            continue;
+          if (!active || piece->end > activeEnd ||
+              (piece->end == activeEnd && candidate.id > active->id)) {
+            active = &candidate;
+            activeEnd = piece->end;
+          }
+        }
+        return active == &definition && definition.subkind == "#define";
+      };
+
+  // A macro-state repair interval must not overlap an edit already staged
+  // for this materialized header.  Overlap would require composing two proof
+  // artifacts, which belongs to the global edit-composition layer rather than
+  // this local replay-stability repair.
+  auto materializedHeaderRangeOverlapsStagedEdit = [&](uint64_t begin,
+                                                       uint64_t end) {
+    for (const TextEdit &edit : edits)
+      if (begin < edit.end && end > edit.start)
+        return true;
+    return false;
+  };
+
+  // Extend a macro patch to the end of its physical line before appending
+  // carried directive lines.  This guarantees that moved #define lines remain
+  // real preprocessing directives, not tokens pasted onto the invocation line.
+  auto materializedHeaderLineEndAfter = [&](uint64_t offset) {
+    uint64_t p = std::min<uint64_t>(offset, bytes.size());
+    while (p < bytes.size() && bytes[static_cast<size_t>(p)] != '\n')
+      ++p;
+    if (p < bytes.size())
+      ++p;
+    return p;
+  };
+
+  // Replacement interval produced by replay stabilization.  The interval may
+  // be wider than the original macro invocation because it can consume earlier
+  // #define lines and the invocation's physical-line suffix, then re-emit the
+  // carried definitions after the replacement payload.
+  struct StabilizedMaterializedHeaderMacroPatch {
+    uint64_t start = 0;
+    uint64_t end = 0;
+    std::string replacement;
+  };
+
+  // Stabilize an include-owned macro patch against the macro state at its
+  // final replay position.
+  //
+  // Return value protocol:
+  //   * std::nullopt: no active header definition is observed by the B text, so
+  //     the original patch can be staged unchanged;
+  //   * non-empty StabilizedMaterializedHeaderMacroPatch: stage the widened,
+  //     replay-stable repair interval returned here; and
+  //   * empty {0,0,""}: terminal fallback was requested and materialization of
+  //     this include must stop.
+  //
+  // This keeps candidate selection deterministic: the function either proves a
+  // concrete source rewrite that restores B's macro context, proves that no
+  // rewrite is needed, or records the missing proof obligation.
+  auto stabilizeMaterializedHeaderMacroPatchReplay =
+      [&](const MacroPatch &mp, uint64_t mpEnd)
+          -> std::optional<StabilizedMaterializedHeaderMacroPatch> {
+    if (mp.invStart > mp.invEnd || mp.invEnd > bytes.size() ||
+        mpEnd < mp.invEnd || mpEnd > bytes.size())
+      return std::nullopt;
+
+    // Collect active #define lines that the B replacement would observe if
+    // emitted at the original invocation site.  Only movable whole directives
+    // become candidates; if an observed definition exists but cannot be moved,
+    // the proof fails closed below.
+    SmallVector<MaterializedHeaderMacroStateDirectivePiece, 4> candidates;
+    bool observedUncarriedDefinition = false;
+    for (const auto &directive : model_.GetMacroDirectives()) {
+      if (directive.subkind != "#define")
+        continue;
+      std::optional<MaterializedHeaderMacroStateDirectivePiece> piece =
+          materializedHeaderMacroStateDirectiveInterval(directive);
+      if (!piece || piece->end > mp.invStart)
+        continue;
+      if (!activeMaterializedHeaderDefinitionAtByte(directive, piece->name,
+                                                    mp.invStart))
+        continue;
+      if (!materializedHeaderReplacementObservesMacroStateDirective(
+              directive, StringRef(mp.replacement),
+              /*unparseableObserves=*/false))
+        continue;
+
+      observedUncarriedDefinition = true;
+      if (materializedHeaderRangeOverlapsStagedEdit(piece->begin, piece->end))
+        continue;
+      candidates.push_back(std::move(*piece));
+    }
+
+    if (candidates.empty()) {
+      if (!observedUncarriedDefinition)
+        return std::nullopt;
+      (void)failMaterializedHeaderMacroState(
+          materializedHeaderMacroStateBoundary(mp.invStart, mpEnd),
+          StateMutationKind::Materialized,
+          llvm::formatv("include-owned macro patch in {0} observes active "
+                        "header macro state before [{1},{2}) but no movable "
+                        "definition line was proven",
+                        headerPath, mp.invStart, mpEnd)
+              .str());
+      return StabilizedMaterializedHeaderMacroPatch{};
+    }
+
+    // Emit carried directives in source order so the relative macro-state
+    // transition order among multiple carried definitions is preserved.
+    llvm::sort(candidates,
+               [](const MaterializedHeaderMacroStateDirectivePiece &lhs,
+                  const MaterializedHeaderMacroStateDirectivePiece &rhs) {
+                 if (lhs.begin != rhs.begin)
+                   return lhs.begin < rhs.begin;
+                 return lhs.directive->id < rhs.directive->id;
+               });
+
+    // Widen from the first carried directive through the completed invocation
+    // line.  The suffix after the invocation is consumed and replayed before
+    // the carried directives, which keeps the directives line-started after
+    // repair.
+    const uint64_t newStart = candidates.front().begin;
+    const uint64_t newEnd = materializedHeaderLineEndAfter(mpEnd);
+    if (newStart > mp.invStart || newEnd < mpEnd || newEnd > bytes.size() ||
+        materializedHeaderRangeOverlapsStagedEdit(newStart, newEnd)) {
+      (void)failMaterializedHeaderMacroState(
+          materializedHeaderMacroStateBoundary(newStart, newEnd),
+          StateMutationKind::WidenedIntoClosure,
+          llvm::formatv("include-owned macro patch in {0} cannot widen "
+                        "macro-state repair interval [{1},{2})",
+                        headerPath, newStart, newEnd)
+              .str());
+      return StabilizedMaterializedHeaderMacroPatch{};
+    }
+
+    // Helper used while rebuilding the replacement to distinguish directive
+    // bytes intentionally moved to the end from ordinary source bytes that must
+    // remain in their original relative order.
+    auto isCarriedDirectiveInterval = [&](uint64_t begin, uint64_t end) {
+      for (const auto &candidate : candidates)
+        if (candidate.begin == begin && candidate.end == end)
+          return true;
+      return false;
+    };
+
+    // Build the source text that a carried directive crosses, excluding the
+    // carried directive lines themselves.  That text is the proof obligation
+    // for non-observation: if it observes the definition being delayed,
+    // movement is not semantics-preserving.
+    auto appendCrossedSourceExcludingCarried = [&](std::string &out,
+                                                   uint64_t begin,
+                                                   uint64_t end) {
+      uint64_t cursor = begin;
+      for (const auto &candidate : candidates) {
+        if (candidate.end <= cursor || candidate.begin >= end)
+          continue;
+        if (cursor < candidate.begin)
+          out.append(bytes.begin() + cursor, bytes.begin() + candidate.begin);
+        cursor = std::max(cursor, candidate.end);
+      }
+      if (cursor < end)
+        out.append(bytes.begin() + cursor, bytes.begin() + end);
+    };
+
+    // The replacement payload will be emitted before each carried definition,
+    // and the original line suffix after the macro invocation must also remain
+    // before those definitions so the directives still start on real directive
+    // lines.  Therefore every byte crossed by each carried definition must be
+    // proven non-observing for that definition.  Otherwise the macro-state move
+    // would change how preserved header source preprocesses.
+    for (const auto &candidate : candidates) {
+      std::string crossed;
+      appendCrossedSourceExcludingCarried(crossed, candidate.end, mp.invStart);
+      appendCrossedSourceExcludingCarried(crossed, mpEnd, newEnd);
+      StringRef following = StringRef(bytes).slice(mp.invStart, mpEnd);
+      if (materializedHeaderSourceChunkObservesDefinitionWhenCrossed(
+              *candidate.directive, candidate.name, StringRef(crossed),
+              following)) {
+        (void)failMaterializedHeaderMacroState(
+            materializedHeaderMacroStateBoundary(candidate.begin,
+                                                 candidate.end),
+            StateMutationKind::MovedLater,
+            llvm::formatv("include-owned macro patch in {0} cannot carry "
+                          "#{1} for '{2}' across observing header source",
+                          headerPath, candidate.directive->id, candidate.name)
+                .str());
+        return StabilizedMaterializedHeaderMacroPatch{};
+      }
+    }
+
+    // Rebuild the widened interval in the only order that preserves B's
+    // replay context and the surviving suffix context:
+    //
+    //   1. original source before each carried definition,
+    //   2. original source between the last carried definition and callsite,
+    //   3. the B replacement text,
+    //   4. the original physical-line suffix after the callsite, and
+    //   5. the carried #define lines.
+    //
+    // Thus the B replacement is evaluated before the carried definitions, while
+    // later surviving source sees those definitions restored.
+    std::string replacement;
+    replacement.reserve((mp.invStart - newStart) + mp.replacement.size() +
+                        (newEnd - mpEnd) + candidates.size() * 32);
+    uint64_t cursor = newStart;
+    for (const auto &candidate : candidates) {
+      if (!isCarriedDirectiveInterval(candidate.begin, candidate.end) ||
+          cursor > candidate.begin) {
+        (void)failMaterializedHeaderMacroState(
+            materializedHeaderMacroStateBoundary(newStart, newEnd),
+            StateMutationKind::MovedLater,
+            llvm::formatv("include-owned macro patch in {0} found invalid "
+                          "carried directive ordering",
+                          headerPath)
+                .str());
+        return StabilizedMaterializedHeaderMacroPatch{};
+      }
+      replacement.append(bytes.begin() + cursor,
+                         bytes.begin() + candidate.begin);
+      cursor = candidate.end;
+    }
+    replacement.append(bytes.begin() + cursor, bytes.begin() + mp.invStart);
+    replacement += mp.replacement;
+    replacement.append(bytes.begin() + mpEnd, bytes.begin() + newEnd);
+    if (!replacement.empty() && replacement.back() != '\n')
+      replacement.push_back('\n');
+    for (const auto &candidate : candidates) {
+      replacement.append(candidate.directive->text.begin(),
+                         candidate.directive->text.end());
+      if (replacement.empty() || replacement.back() != '\n')
+        replacement.push_back('\n');
+    }
+
+    for (const auto &candidate : candidates) {
+      (void)widenMaterializedHeaderMacroState(
+          materializedHeaderMacroStateBoundary(candidate.begin, candidate.end),
+          StateMutationKind::MovedLater,
+          llvm::formatv(
+              "include-owned macro patch in {0} carries #define #{1} for "
+              "'{2}' after replay interval [{3},{4})",
+              headerPath, candidate.directive->id, candidate.name, newStart,
+              newEnd)
+              .str());
+    }
+
+    StabilizedMaterializedHeaderMacroPatch stabilized;
+    stabilized.start = newStart;
+    stabilized.end = newEnd;
+    stabilized.replacement = std::move(replacement);
+    return stabilized;
+  };
+
+  // 1) Macro patches owned by this include. Macro invocation ranges are already
+  // recorded in the owner file's byte space, so they can be converted directly
+  // into local header TextEdits.  Before staging the TextEdit, prove replay
+  // context stability for the B-surface text: if the replacement would observe
+  // an active header-owned #define that B did not have active, move that
+  // definition after the completed replacement line.  Macro-state movement is
+  // admitted only when every crossed source byte is proven non-observing;
+  // otherwise materialization fails closed instead of emitting a refolding that
+  // preprocesses under the wrong macro environment.
+  if (auto it = macroPatchesByOwner.find(includeId);
+      it != macroPatchesByOwner.end()) {
+    for (const auto &mp : it->second) {
+      uint64_t mpEnd = stringutils::extendChainedCallEnd(
+          StringRef(bytes), mp.invEnd, mp.replacement);
+      uint64_t editStart = mp.invStart;
+      uint64_t editEnd = mpEnd;
+      std::string editReplacement = mp.replacement;
+      if (std::optional<StabilizedMaterializedHeaderMacroPatch> stabilized =
+              stabilizeMaterializedHeaderMacroPatchReplay(mp, mpEnd)) {
+        // Empty {0,0,""} is the local sentinel used by the stabilizer after
+        // it has requested terminal fallback.  Stop materializing this include
+        // so no partially proven header edit is emitted.
+        if (stabilized->replacement.empty() && stabilized->start == 0 &&
+            stabilized->end == 0) {
+          includeExpansion[includeId] = std::string();
+          return;
+        }
+        editStart = stabilized->start;
+        editEnd = stabilized->end;
+        editReplacement = std::move(stabilized->replacement);
+      }
+
+      // Apply local line-resync policy before staging the edit, and carry the
+      // accepted macro proof metadata to the emitted TextEdit.
+      ResyncOutcome ro = ApplyResyncOrPend(
+          bytes, editStart, editEnd, editReplacement, headerPath, includeId);
+      TextEdit edit{editStart,
+                    editEnd,
+                    std::move(ro.text),
+                    std::move(ro.pending),
+                    MacroPatchRemainsExpanded(mp)
+                        ? std::make_optional(GetRootMacroId(mp.macroId))
+                        : std::nullopt,
+                    {},
+                    {},
+                    {}};
+      edit.lineControlPruneCandidates =
+          std::move(ro.lineControlPruneCandidates);
+      AttachAcceptedResultCarrier(edit, BuildAcceptedEmittedMacroCandidate(mp));
+      edits.push_back(std::move(edit));
+    }
+  }
+
+  // 2) Include-preserving edits owned by this include. If those edits cannot be
+  // discharged as local anchored edits, materialize the whole include directly
+  // from B using the include-realization proof path.
+  if (auto it = perInclude.find(includeId); it != perInclude.end()) {
+    if (!it->second.patches.empty()) {
+
+      IncludeTextEditPlan plan = ComputeIncludeTextEdits(it->second, bytes);
+      if (plan.requiresIncludeRealization) {
+        AcceptedResultCandidate realizationCandidate;
+        if (auto realized = BuildInlineIncludeRealizationFromB(
+                *inc, plan.realizationReason, &realizationCandidate)) {
+          includeExpansion[includeId] = std::move(*realized);
+          includeExpansionStartLineNos[includeId] = 1;
+          includeExpansionAcceptedResults[includeId] =
+              std::move(realizationCandidate);
+          return;
+        }
+        includeExpansion[includeId] = std::string();
+        return;
+      }
+
+      for (auto &te : plan.edits) {
+        // ComputeIncludeTextEdits() already applies the owner-local padding and
+        // line-resync proof for each header edit.  Re-running resync here would
+        // treat a deliberately inserted `#line` as fresh newline drift and can
+        // duplicate the same local resume before the copied suffix.
+        edits.push_back(std::move(te));
+      }
+    }
+  }
+
+  // Return true if this include subtree contains any work that requires
+  // materialization: local include edits, local macro patches, or descendant
+  // includes with work. Clean child subtrees are left as spelled directives.
+  auto includeHasSidebandPragmaWork = [&](uint64_t id) {
+    return llvm::any_of(sidebandPragmaEdits_, [&](const SidebandPragmaEdit &e) {
+      return e.TargetsInclude(id);
+    });
+  };
+
+  auto includeHasLineDirectiveForcingSidebandWork = [&](uint64_t id) {
+    return llvm::any_of(sidebandPragmaEdits_, [&](const SidebandPragmaEdit &e) {
+      return e.TargetsInclude(id) && e.ForcesIncludeLineDirectiveWrappers();
+    });
+  };
+
+  auto includeHasOrdinaryReplayTokens = [&](uint64_t id) {
+    if (const auto *item = model_.GetIncludeById(id))
+      return item->cover.end > item->cover.begin;
+    return false;
+  };
+
+  // Return true when the materialized include subtree needs replay provenance
+  // only from sideband pragma edits.  This is intentionally separate from the
+  // #line-wrapper classification below: visible sideband replacement text may
+  // force ordinary enter/exit #line wrappers while the include still has a
+  // zero-token normal PP cover, so its edit-map witness must come from the
+  // sideband B-byte envelope rather than from a nonexistent token envelope.
+  auto includeUsesOnlySidebandReplayEnvelope =
+      [&](auto &&self, uint64_t id) -> bool {
+    bool sawSideband = includeHasSidebandPragmaWork(id);
+    if (includeHasOrdinaryReplayTokens(id))
+      return false;
+    if (auto it = perInclude.find(id);
+        it != perInclude.end() && !it->second.patches.empty())
+      return false;
+    if (auto it = macroPatchesByOwner.find(std::optional<uint64_t>(id));
+        it != macroPatchesByOwner.end() && !it->second.empty())
+      return false;
+    if (auto it = children.find(id); it != children.end()) {
+      for (const auto *child : it->second) {
+        if (!self(self, child->id))
+          return false;
+        sawSideband = true;
+      }
+    }
+    return sawSideband;
+  };
+
+  // A sideband-only include materialization is the one class where omitting
+  // otherwise-unobservable #line wrappers is intentional.  The invariant is not
+  // "materialized because of a sideband edit"; it is stricter: the materialized
+  // owner must have no ordinary PP-token replay of its own.  Once we emit
+  // normal header tokens while replacing an include directive, --with-lines
+  // must preserve the historical enter/exit file transition even if no current
+  // token observes that state.  Ordinary include patches, macro patches, B-only
+  // header sideband insertions, and non-empty include token covers all re-enter
+  // that policy.
+  enum class MaterializationWorkClass { None, SidebandPragmaOnly, Ordinary };
+  auto classifyMaterializationWork =
+      [&](auto &&self, uint64_t id) -> MaterializationWorkClass {
+    bool sawSideband = includeHasSidebandPragmaWork(id);
+    if (includeHasLineDirectiveForcingSidebandWork(id))
+      return MaterializationWorkClass::Ordinary;
+    if (sawSideband && includeHasOrdinaryReplayTokens(id))
+      return MaterializationWorkClass::Ordinary;
+    if (auto it = perInclude.find(id);
+        it != perInclude.end() && !it->second.patches.empty())
+      return MaterializationWorkClass::Ordinary;
+    if (auto it = macroPatchesByOwner.find(std::optional<uint64_t>(id));
+        it != macroPatchesByOwner.end() && !it->second.empty())
+      return MaterializationWorkClass::Ordinary;
+    if (auto it = children.find(id); it != children.end()) {
+      for (const auto *child : it->second) {
+        switch (self(self, child->id)) {
+        case MaterializationWorkClass::Ordinary:
+          return MaterializationWorkClass::Ordinary;
+        case MaterializationWorkClass::SidebandPragmaOnly:
+          sawSideband = true;
+          break;
+        case MaterializationWorkClass::None:
+          break;
+        }
+      }
+    }
+    return sawSideband ? MaterializationWorkClass::SidebandPragmaOnly
+                       : MaterializationWorkClass::None;
+  };
+
+  IncludeReplayProofContext includeReplayProof(*this);
 
   auto extendIncludeDirectiveEnd = [&](const RefoldModel::IncludeItem &item,
                                        StringRef ownerBytes,
@@ -5663,7 +5733,7 @@ void RefoldEngine::MaterializeIncludeExpansion(
 
   auto makeCleanChildIncludeOperandRewriteEdit =
       [&](const RefoldModel::IncludeItem &child, const std::string &operand,
-          OrdinaryIncludeDelimiterKind delimiterKind,
+          IncludeReplayProofContext::OrdinaryIncludeDelimiterKind delimiterKind,
           StringRef ownerBytes) -> std::optional<TextEdit> {
     const size_t n = ownerBytes.size();
     const uint64_t siteStart = std::clamp<uint64_t>(child.siteB, 0ULL, n);
@@ -5682,9 +5752,11 @@ void RefoldEngine::MaterializeIncludeExpansion(
 
     std::string replacement = directiveBytes.str();
     std::string headerOperand;
-    headerOperand.push_back(ordinaryIncludeDelimiterOpen(delimiterKind));
+    headerOperand.push_back(
+        IncludeReplayProofContext::ordinaryIncludeDelimiterOpen(delimiterKind));
     headerOperand += operand;
-    headerOperand.push_back(ordinaryIncludeDelimiterClose(delimiterKind));
+    headerOperand.push_back(
+        IncludeReplayProofContext::ordinaryIncludeDelimiterClose(delimiterKind));
     replacement.replace(targetRange->Begin,
                         targetRange->End - targetRange->Begin, headerOperand);
     if (child.subkind == "#include_next" &&
@@ -5807,10 +5879,14 @@ void RefoldEngine::MaterializeIncludeExpansion(
           subtreeContainsIncludeNext(subtreeContainsIncludeNext, child->id))
         todo = true;
 
-      CleanChildIncludeReplayPlan replayPlan;
+      IncludeReplayProofContext::CleanChildIncludeReplayPlan replayPlan;
       if (!todo) {
-        replayPlan = planCleanChildIncludeReplayFromMaterializedParent(*child);
-        if (replayPlan.action == CleanChildIncludeReplayAction::RewriteOperand) {
+        replayPlan =
+            includeReplayProof.planCleanChildIncludeReplayFromMaterializedParent(
+                *child);
+        if (replayPlan.action ==
+            IncludeReplayProofContext::CleanChildIncludeReplayAction::
+                RewriteOperand) {
           if (std::optional<TextEdit> rewrite =
                   makeCleanChildIncludeOperandRewriteEdit(
                       *child, replayPlan.rewrittenOperand,
@@ -5821,12 +5897,12 @@ void RefoldEngine::MaterializeIncludeExpansion(
                 "lookup: target={1} delimiter={2} rewritten={3}{4}{5} "
                 "reason={6}",
                 child->id, child->target,
-                ordinaryIncludeDelimiterName(
+                IncludeReplayProofContext::ordinaryIncludeDelimiterName(
                     replayPlan.rewrittenDelimiterKind),
-                ordinaryIncludeDelimiterOpen(
+                IncludeReplayProofContext::ordinaryIncludeDelimiterOpen(
                     replayPlan.rewrittenDelimiterKind),
                 replayPlan.rewrittenOperand,
-                ordinaryIncludeDelimiterClose(
+                IncludeReplayProofContext::ordinaryIncludeDelimiterClose(
                     replayPlan.rewrittenDelimiterKind),
                 replayPlan.reason);
             edits.push_back(std::move(*rewrite));
@@ -5844,14 +5920,18 @@ void RefoldEngine::MaterializeIncludeExpansion(
                 "failed to rewrite clean child include #{0}; materializing "
                 "child edge instead",
                 child->id);
-            replayPlan.action = CleanChildIncludeReplayAction::Materialize;
+            replayPlan.action =
+                IncludeReplayProofContext::CleanChildIncludeReplayAction::
+                    Materialize;
             if (subtreeContainsIncludeNext(subtreeContainsIncludeNext,
                                            child->id))
               replayPlan.forceMaterializeDescendantIncludeNext = true;
           }
         }
 
-        if (replayPlan.action != CleanChildIncludeReplayAction::Materialize) {
+        if (replayPlan.action !=
+            IncludeReplayProofContext::CleanChildIncludeReplayAction::
+                Materialize) {
           // No descendant edits depend on this child.  Either the original
           // directive was lookup-stable and can stay as-is, or we staged a
           // local operand rewrite above.
