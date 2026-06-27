@@ -59,12 +59,12 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "RefoldLog.h"
-#include "RefoldEngine.h"
-#include "RefoldSchema.h"
-#include "RefoldSourceGraphWriter.h"
-#include "StringUtils.h"
-#include "DiffAlgorithms.h"
+#include "core/RefoldLog.h"
+#include "core/RefoldEngine.h"
+#include "core/RefoldSchema.h"
+#include "include/RefoldSourceGraphWriter.h"
+#include "source/DiffAlgorithms.h"
+#include "util/StringUtils.h"
 
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/DiagnosticOptions.h"
@@ -304,7 +304,7 @@ struct JsonSlotForSideband {
   std::optional<uint64_t> ownerIncludeId = std::nullopt;
 };
 
-using SidebandSourceProof = RefoldEngine::OwnerLocalSourceEditProof;
+using SidebandSourceProof = OwnerLocalSourceEditProof;
 
 struct SidebandPragmaItemBinding {
   int64_t pragmaIndex = -1;
@@ -1720,7 +1720,7 @@ static bool buildSidebandPragmaSourceEdits(
     ArrayRef<PPTok> rawAToks, ArrayRef<std::size_t> rawATokOff,
     StringRef bBytes, ArrayRef<PPTok> rawBToks,
     ArrayRef<std::size_t> rawBTokOff,
-    std::vector<RefoldEngine::SidebandPragmaEdit> &edits) {
+    std::vector<SidebandPragmaEdit> &edits) {
   edits.clear();
   if (aLines.empty() && bLines.empty())
     return false;
@@ -1942,7 +1942,7 @@ static bool buildSidebandPragmaSourceEdits(
     if (lcs[a] >= 0 && static_cast<size_t>(lcs[a]) < bToA.size())
       bToA[static_cast<size_t>(lcs[a])] = static_cast<int64_t>(a);
 
-  using SidebandBReplayProof = RefoldEngine::OwnerLocalBReplayProof;
+  using SidebandBReplayProof = OwnerLocalBReplayProof;
 
   struct SidebandBReplayBlockProof {
   private:
@@ -1971,8 +1971,8 @@ static bool buildSidebandPragmaSourceEdits(
 
   auto appendProvedSidebandEdit = [&](std::optional<SidebandSourceProof> source,
                                       SidebandBReplayProof replay) -> bool {
-    std::optional<RefoldEngine::SidebandPragmaEdit> edit =
-        RefoldEngine::SidebandPragmaEdit::Create(
+    std::optional<SidebandPragmaEdit> edit =
+        SidebandPragmaEdit::Create(
             std::move(source), std::move(replay),
             static_cast<uint64_t>(bBytes.size()));
     if (!edit)
@@ -3603,28 +3603,28 @@ int main(int argc, char **argv) {
   // must be specified at least once, which is not the case here.
   const bool onlyCheck = (CheckSrcPath.getNumOccurrences() != 0);
 
-  auto parseProofAuditMode = []() -> RefoldEngine::ProofAuditMode {
+  auto parseProofAuditMode = []() -> ProofAuditMode {
     if (ProofAuditModeOpt.getNumOccurrences() == 0)
-      return RefoldEngine::ProofAuditMode::Default;
+      return ProofAuditMode::Default;
 
     StringRef value(ProofAuditModeOpt.getValue());
     if (value.equals_insensitive("off"))
-      return RefoldEngine::ProofAuditMode::Off;
+      return ProofAuditMode::Off;
     if (value.equals_insensitive("probe"))
-      return RefoldEngine::ProofAuditMode::Probe;
+      return ProofAuditMode::Probe;
     if (value.equals_insensitive("strict"))
-      return RefoldEngine::ProofAuditMode::Strict;
+      return ProofAuditMode::Strict;
 
     REFOLD_LOG_FATAL("options", "invalid --proof-audit value: {0} "
                      "(expected off, probe, or strict)",
           ProofAuditModeOpt);
-    return RefoldEngine::ProofAuditMode::Default;
+    return ProofAuditMode::Default;
   };
 
-  RefoldEngine::ProofAuditMode proofAuditMode = parseProofAuditMode();
+  ProofAuditMode proofAuditMode = parseProofAuditMode();
   if (StrictMode &&
-      proofAuditMode != RefoldEngine::ProofAuditMode::Default &&
-      proofAuditMode != RefoldEngine::ProofAuditMode::Strict)
+      proofAuditMode != ProofAuditMode::Default &&
+      proofAuditMode != ProofAuditMode::Strict)
     REFOLD_LOG_FATAL("options", "--strict requires --proof-audit=strict");
 
   // Enforce exactly one supported invocation mode:
@@ -3718,7 +3718,7 @@ int main(int argc, char **argv) {
 
   std::vector<PPTok> aToks, bToks;
   std::vector<std::size_t> aTokByteOff, bTokByteOff;
-  std::vector<RefoldEngine::SidebandPragmaEdit> sidebandPragmaEdits;
+  std::vector<SidebandPragmaEdit> sidebandPragmaEdits;
   lexPPTokens(aBytes, aToks, aTokByteOff, lexLang);
   lexPPTokens(bBytes, bToks, bTokByteOff, lexLang);
 
